@@ -383,6 +383,7 @@ const TABS: &[(Group, &[&str])] = &[
         Group::Plugins,
         &[
             "wasm_call_timeout_secs",
+            "wasm_call_grace_secs",
             "wasm_memory_limit_mb",
             "wasm_event_queue_capacity",
             "wasm_private_http_allow",

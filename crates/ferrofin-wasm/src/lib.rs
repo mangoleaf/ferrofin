@@ -90,6 +90,12 @@ pub struct WasmSettings {
     /// Per-guest-call deadline in seconds (`FERROFIN_WASM_CALL_TIMEOUT_SECS`,
     /// default 30 — confirmed 2026-08-07).
     pub call_timeout_secs: u32,
+    /// How long past a call's deadline its caller waits before the call is
+    /// lost and the plugin disabled until restart, in seconds
+    /// (`FERROFIN_WASM_CALL_GRACE_SECS`, default 10 — owner decision on
+    /// gl-600, 2026-10-31). More than one epoch tick, so a guest within its
+    /// budget is never declared lost.
+    pub call_grace_secs: u32,
     /// Per-plugin linear-memory cap in MiB (`FERROFIN_WASM_MEMORY_LIMIT_MB`,
     /// default 128 — confirmed 2026-08-13 after the measured ~6–7 MiB
     /// marginal RSS per plugin; a `memory.grow` ceiling, never a reservation).
@@ -136,6 +142,7 @@ impl Default for WasmSettings {
     fn default() -> Self {
         Self {
             call_timeout_secs: 30,
+            call_grace_secs: 10,
             memory_limit_mb: 128,
             event_queue_capacity: 256,
             state_limit_mb: 8,
@@ -156,6 +163,24 @@ impl WasmSettings {
     pub fn with_reserved_ids(mut self, ids: impl IntoIterator<Item = Uuid>) -> Self {
         self.reserved_ids = ids.into_iter().collect();
         self
+    }
+
+    /// Overrides the grace past a call's deadline
+    /// (`FERROFIN_WASM_CALL_GRACE_SECS`; `None`/zero keeps the default).
+    #[must_use]
+    pub fn with_call_grace_secs(mut self, secs: Option<u32>) -> Self {
+        if let Some(secs) = secs.filter(|&v| v > 0) {
+            self.call_grace_secs = secs;
+        }
+        self
+    }
+
+    /// A fresh watch for one plugin's guest calls under these settings.
+    fn call_watch(&self) -> Arc<runtime::CallWatch> {
+        Arc::new(runtime::CallWatch::new(
+            std::time::Duration::from_secs(u64::from(self.call_timeout_secs)),
+            std::time::Duration::from_secs(u64::from(self.call_grace_secs)),
+        ))
     }
 
     /// Overrides the per-plugin total state cap
@@ -813,8 +838,11 @@ fn interrogate(
     })
 }
 
-/// [`load_one`], logging why a file is skipped. A panic while loading one
-/// file skips that file, never the batch: the runtime thread is spawned
+/// [`load_one`] on a thread of its own under a [`runtime::CallWatch`],
+/// logging why a file is skipped. A guest call that outlives its deadline
+/// plus the grace (stuck in a host function) skips that file and abandons
+/// its thread, so one plugin can never hold up boot. A panic while loading
+/// one file skips that file, never the batch: the runtime thread is spawned
 /// last, so a panic leaves nothing running, and load-time guest calls cannot
 /// fetch or reach the collaborators, so no shared lock is held mid-panic.
 /// (The panic hook logs the panic itself.)
@@ -826,9 +854,23 @@ fn load_one_guarded(
     http: &Arc<capabilities::GuestHttp>,
     collaborators: &Arc<std::sync::OnceLock<capabilities::Collaborators>>,
 ) -> Option<LoadedPlugin> {
-    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        load_one(engine, linker, path, settings, http, collaborators)
-    }));
+    let watch = settings.call_watch();
+    let outcome = runtime::run_watched(&watch, {
+        let (engine, linker, path) = (engine.clone(), Arc::clone(linker), path.to_path_buf());
+        let (settings, http) = (settings.clone(), Arc::clone(http));
+        let (collaborators, watch) = (Arc::clone(collaborators), Arc::clone(&watch));
+        move || {
+            load_one(
+                &engine,
+                &linker,
+                &path,
+                &settings,
+                &http,
+                &collaborators,
+                watch,
+            )
+        }
+    });
     match outcome {
         Ok(Ok(loaded)) => Some(loaded),
         Ok(Err(err)) => {
@@ -840,10 +882,27 @@ fn load_one_guarded(
             );
             None
         }
-        Err(_) => {
+        Err(runtime::Unwatched::Lost) => {
+            error!(
+                path = %path.display(),
+                grace_secs = settings.call_grace_secs,
+                "wasm plugin did not finish loading within its call deadline plus the \
+                 grace; skipping this file and abandoning its thread"
+            );
+            None
+        }
+        Err(runtime::Unwatched::Panicked) => {
             error!(
                 path = %path.display(),
                 "loading this wasm plugin panicked; skipping this file"
+            );
+            None
+        }
+        Err(runtime::Unwatched::NoThread(err)) => {
+            error!(
+                path = %path.display(),
+                error = %err,
+                "no thread to load this wasm plugin on; skipping this file"
             );
             None
         }
@@ -858,6 +917,7 @@ fn load_one(
     settings: &WasmSettings,
     http: &Arc<capabilities::GuestHttp>,
     collaborators: &Arc<std::sync::OnceLock<capabilities::Collaborators>>,
+    watch: Arc<runtime::CallWatch>,
 ) -> Result<LoadedPlugin, wasmtime::Error> {
     let component = Component::from_file(engine, path)?;
     let spec = InstanceSpec {
@@ -871,6 +931,7 @@ fn load_one(
         plugin_id: String::new(), // filled from the descriptor below
         memory_limit_bytes: settings.memory_limit_mb as usize * 1024 * 1024,
         timeout_ticks: u64::from(settings.call_timeout_secs),
+        watch,
         http: Arc::clone(http),
         // Loading calls (`descriptor` etc.) run before the id is known, so
         // the safe default applies; the real grant is applied below.
@@ -1224,74 +1285,116 @@ impl ferrofin_traits::plugins::PluginArtifactValidator for WasmArtifactValidator
         let settings = self.settings.clone();
         let bytes = bytes.to_vec();
         // Compilation + the descriptor call are CPU-bound guest work — off
-        // the async workers, exactly like the plugin runtime threads.
+        // the async workers, exactly like the plugin runtime threads. They
+        // run on a watched thread of their own, so an artifact stuck in a
+        // host function is rejected instead of holding the install forever.
         tokio::task::spawn_blocking(move || {
-            // Blocking thread: safe place to build the blocking client.
-            let http = if let Some(client) = http_cell.get() {
-                Arc::clone(client)
-            } else {
-                let client = build_guest_http_client(&settings)?;
-                let _ = http_cell.set(Arc::clone(&client));
-                client
-            };
-            let component = Component::new(&engine, &bytes).map_err(|e| {
-                ServiceError::invalid_input(format!(
-                    "artifact is not a valid WebAssembly component for {PLUGIN_ABI}: {e:#}"
-                ))
-            })?;
-            let spec = InstanceSpec {
-                engine,
-                component,
-                linker,
-                plugin_name: "install-validation".to_owned(),
-                plugin_id: String::new(),
-                memory_limit_bytes: settings.memory_limit_mb as usize * 1024 * 1024,
-                timeout_ticks: u64::from(settings.call_timeout_secs),
-                http,
-                private_http_allowed: false,
-                state_path: None, // validation is throwaway — no persistence
-                egress: Arc::new(capabilities::EgressPolicy::default()),
-                state_total_cap: settings.state_limit_mb as usize * 1024 * 1024,
-                write_content_cap: settings.write_content_mb as usize * 1024 * 1024,
-                subtitle_extract_cap: settings.subtitle_extract_mb as usize * 1024 * 1024,
-                // Never armed: query-items/write-media-segments/http-fetch
-                // all refuse during validation.
-                collaborators: Arc::new(std::sync::OnceLock::new()),
-            };
-            let (mut store, instance) = spec.instantiate(String::from("{}")).map_err(|e| {
-                ServiceError::invalid_input(format!(
-                    "artifact does not instantiate as a {PLUGIN_ABI} plugin: {e:#}"
-                ))
-            })?;
-            let Interrogated {
-                id,
-                declared_egress,
-                provider_info,
-                ..
-            } = interrogate(&mut store, &instance, None).map_err(|e| {
-                ServiceError::invalid_input(format!("artifact interrogation failed: {e:#}"))
-            })?;
-            // Refuse an unacceptable provider name AT INSTALL, not at the
-            // next boot — otherwise the admin sees "installed" and then a
-            // silently absent provider. (The "taken by another loaded
-            // plugin" half can only be checked at load; this covers the
-            // reserved/empty/oversized violations.)
-            if let Some(info) = &provider_info
-                && let Some(why) = provider_name_violation(info.name.trim())
-            {
-                return Err(ServiceError::invalid_input(format!(
-                    "artifact declares provider name `{}`, which {why}",
-                    info.name.trim()
-                )));
-            }
-            Ok(ferrofin_traits::plugins::ValidatedArtifact {
-                id,
-                declared_egress,
+            let watch = settings.call_watch();
+            let grace = settings.call_grace_secs;
+            runtime::run_watched(&watch, {
+                let watch = Arc::clone(&watch);
+                move || {
+                    validate_on_this_thread(&engine, linker, &http_cell, &settings, &bytes, watch)
+                }
+            })
+            .unwrap_or_else(|why| match why {
+                runtime::Unwatched::Lost => {
+                    warn!(
+                        grace_secs = grace,
+                        "wasm artifact validation outlived its call deadline plus the grace; \
+                         artifact refused and its thread abandoned"
+                    );
+                    Err(ServiceError::invalid_input(format!(
+                        "artifact did not answer within the plugin call deadline plus the \
+                         {grace} s grace"
+                    )))
+                }
+                runtime::Unwatched::Panicked => {
+                    Err(ServiceError::backend("validation task failed: it panicked"))
+                }
+                runtime::Unwatched::NoThread(e) => Err(ServiceError::backend(format!(
+                    "validation task failed: {e}"
+                ))),
             })
         })
         .await
         .map_err(|e| ServiceError::backend(format!("validation task failed: {e}")))?
     }
+}
+
+/// [`WasmArtifactValidator::validate`]'s work, on the thread
+/// [`runtime::run_watched`] gives it.
+fn validate_on_this_thread(
+    engine: &Engine,
+    linker: Arc<Linker<HostState>>,
+    http_cell: &std::sync::OnceLock<Arc<capabilities::GuestHttp>>,
+    settings: &WasmSettings,
+    bytes: &[u8],
+    watch: Arc<runtime::CallWatch>,
+) -> Result<ferrofin_traits::plugins::ValidatedArtifact, ServiceError> {
+    // Blocking thread: safe place to build the blocking client.
+    let http = if let Some(client) = http_cell.get() {
+        Arc::clone(client)
+    } else {
+        let client = build_guest_http_client(settings)?;
+        let _ = http_cell.set(Arc::clone(&client));
+        client
+    };
+    let component = Component::new(engine, bytes).map_err(|e| {
+        ServiceError::invalid_input(format!(
+            "artifact is not a valid WebAssembly component for {PLUGIN_ABI}: {e:#}"
+        ))
+    })?;
+    let spec = InstanceSpec {
+        engine: engine.clone(),
+        component,
+        linker,
+        plugin_name: "install-validation".to_owned(),
+        plugin_id: String::new(),
+        memory_limit_bytes: settings.memory_limit_mb as usize * 1024 * 1024,
+        timeout_ticks: u64::from(settings.call_timeout_secs),
+        watch,
+        http,
+        private_http_allowed: false,
+        state_path: None, // validation is throwaway — no persistence
+        egress: Arc::new(capabilities::EgressPolicy::default()),
+        state_total_cap: settings.state_limit_mb as usize * 1024 * 1024,
+        write_content_cap: settings.write_content_mb as usize * 1024 * 1024,
+        subtitle_extract_cap: settings.subtitle_extract_mb as usize * 1024 * 1024,
+        // Never armed: query-items/write-media-segments/http-fetch
+        // all refuse during validation.
+        collaborators: Arc::new(std::sync::OnceLock::new()),
+    };
+    let (mut store, instance) = spec.instantiate(String::from("{}")).map_err(|e| {
+        ServiceError::invalid_input(format!(
+            "artifact does not instantiate as a {PLUGIN_ABI} plugin: {e:#}"
+        ))
+    })?;
+    let Interrogated {
+        id,
+        declared_egress,
+        provider_info,
+        ..
+    } = interrogate(&mut store, &instance, None).map_err(|e| {
+        ServiceError::invalid_input(format!("artifact interrogation failed: {e:#}"))
+    })?;
+    // Refuse an unacceptable provider name AT INSTALL, not at the
+    // next boot — otherwise the admin sees "installed" and then a
+    // silently absent provider. (The "taken by another loaded
+    // plugin" half can only be checked at load; this covers the
+    // reserved/empty/oversized violations.)
+    if let Some(info) = &provider_info
+        && let Some(why) = provider_name_violation(info.name.trim())
+    {
+        return Err(ServiceError::invalid_input(format!(
+            "artifact declares provider name `{}`, which {why}",
+            info.name.trim()
+        )));
+    }
+    Ok(ferrofin_traits::plugins::ValidatedArtifact {
+        id,
+        declared_egress,
+    })
 }
 
 /// The [`DynamicMetadataProvider`] adapter for one loaded plugin: converts
@@ -1987,7 +2090,8 @@ impl WasmMediaAnalysisTask {
                     }
                     outcome.offered += 1;
                 }
-                // The runtime refused the call (breaker open, runtime gone):
+                // The runtime refused the call (breaker open, a lost call,
+                // runtime gone):
                 // the guest did not analyze it, and nothing after it is
                 // offered. Unrecorded, they are offered after the restart.
                 Err(error) => {
@@ -2284,11 +2388,13 @@ mod tests {
         let base = WasmSettings::default();
         let tuned = base
             .clone()
+            .with_call_grace_secs(Some(20))
             .with_state_limit_mb(Some(64))
             .with_image_download_mb(Some(40))
             .with_image_timeout_secs(Some(60))
             .with_write_content_mb(Some(4))
             .with_subtitle_extract_mb(Some(20));
+        assert_eq!(tuned.call_grace_secs, 20);
         assert_eq!(tuned.state_limit_mb, 64);
         assert_eq!(tuned.image_download_mb, 40);
         assert_eq!(tuned.image_timeout_secs, 60);
@@ -2298,11 +2404,13 @@ mod tests {
         // Zero and None both fall back to the defaults.
         let untuned = base
             .clone()
+            .with_call_grace_secs(Some(0))
             .with_state_limit_mb(Some(0))
             .with_image_download_mb(None)
             .with_image_timeout_secs(Some(0))
             .with_write_content_mb(None)
             .with_subtitle_extract_mb(Some(0));
+        assert_eq!(untuned.call_grace_secs, base.call_grace_secs);
         assert_eq!(untuned.state_limit_mb, base.state_limit_mb);
         assert_eq!(untuned.image_download_mb, base.image_download_mb);
         assert_eq!(untuned.image_timeout_secs, base.image_timeout_secs);

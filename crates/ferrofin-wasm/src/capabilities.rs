@@ -29,6 +29,35 @@ use crate::bindings::types::{HttpRequest, HttpResponse, ItemQuery, ItemSummary, 
 /// Self-protective cap, not a tuning knob.
 pub const MAX_QUERY_ROWS: u32 = 1000;
 
+/// What a host function answers once the guest call it serves has no time
+/// left. The guest's epoch deadline falls at or before that moment, so the
+/// guest is interrupted at its next check and the call fails as an overrun;
+/// only a guest that returns without one sees this text.
+pub const OUT_OF_TIME: &str = "the plugin call is out of time";
+
+/// `cx.handle.block_on(work)`, held to the guest call's `deadline`, so a host
+/// wait never outlives the call it serves (and never trips the runtime's
+/// watchdog). Past the deadline `work` is
+/// dropped: a permit wait is abandoned, an ffmpeg child is killed. For reads
+/// only: a write cancelled half-way is worse than one that runs over, so
+/// writes keep their own bound and the runtime's watchdog covers them.
+///
+/// # Errors
+/// [`OUT_OF_TIME`] once the deadline passes.
+fn block_on_until<T>(
+    cx: &Collaborators,
+    deadline: std::time::Instant,
+    work: impl std::future::Future<Output = T>,
+) -> Result<T, String> {
+    if deadline <= std::time::Instant::now() {
+        return Err(OUT_OF_TIME.to_owned());
+    }
+    // The timer is made inside the runtime: the plugin thread has no context.
+    cx.handle
+        .block_on(async { tokio::time::timeout_at(deadline.into(), work).await })
+        .map_err(|_| OUT_OF_TIME.to_owned())
+}
+
 /// The manager handles a plugin's host functions call into. Installed once
 /// by the composition root after the managers exist (plugin **loading**
 /// happens earlier, so a guest calling these during its own load gets a
@@ -194,6 +223,9 @@ impl GuestHttp {
 fn check_destination(url: &reqwest::Url, plugin_name: &str) -> Result<std::net::IpAddr, String> {
     let host = url.host_str().ok_or("url has no host")?;
     let port = url.port_or_known_default().unwrap_or(443);
+    // shortcut: this lookup is bounded by the system resolver, not by the
+    // guest call's deadline (http-fetch's request is); resolve under the
+    // deadline if a slow resolver behind a proxy ever trips the watchdog.
     let addrs: Vec<std::net::IpAddr> = std::net::ToSocketAddrs::to_socket_addrs(&(host, port))
         .map_err(|e| format!("could not resolve `{host}`: {e}"))?
         .map(|sa| sa.ip())
@@ -418,10 +450,16 @@ pub fn download_image(
 /// Executes `query-items` for a guest: filters → `InternalItemsQuery`,
 /// entities → the small stable [`ItemSummary`] projection.
 ///
+/// The reads are held to `deadline`, the guest call's.
+///
 /// # Errors
-/// Unknown kind names, an unparsable parent id, or a repository failure —
-/// as the guest-visible error string.
-pub fn query_items(cx: &Collaborators, query: &ItemQuery) -> Result<Vec<ItemSummary>, String> {
+/// Unknown kind names, an unparsable parent id, a repository failure, or
+/// [`OUT_OF_TIME`] — as the guest-visible error string.
+pub fn query_items(
+    cx: &Collaborators,
+    deadline: std::time::Instant,
+    query: &ItemQuery,
+) -> Result<Vec<ItemSummary>, String> {
     let mut internal = InternalItemsQuery::default();
     for kind in &query.kinds {
         let parsed: BaseItemKind = serde_json::from_value(serde_json::Value::String(kind.clone()))
@@ -462,9 +500,7 @@ pub fn query_items(cx: &Collaborators, query: &ItemQuery) -> Result<Vec<ItemSumm
             let uid: Uuid = raw
                 .parse()
                 .map_err(|_| format!("user-id `{raw}` is not a valid UUID"))?;
-            let user = cx
-                .handle
-                .block_on(cx.users.get_user_by_id(uid))
+            let user = block_on_until(cx, deadline, cx.users.get_user_by_id(uid))?
                 .map_err(|e| format!("user lookup failed: {e}"))?
                 .ok_or_else(|| format!("no such user {uid}"))?;
             internal.set_user(Arc::new(user));
@@ -473,9 +509,7 @@ pub fn query_items(cx: &Collaborators, query: &ItemQuery) -> Result<Vec<ItemSumm
         None => None,
     };
 
-    let entities = cx
-        .handle
-        .block_on(cx.library.get_item_list(&internal))
+    let entities = block_on_until(cx, deadline, cx.library.get_item_list(&internal))?
         .map_err(|e| format!("item query failed: {e}"))?;
 
     // Per-user enrichment: one batch read for all returned items.
@@ -485,8 +519,7 @@ pub fn query_items(cx: &Collaborators, query: &ItemQuery) -> Result<Vec<ItemSumm
                 .iter()
                 .filter_map(|e| Uuid::parse_str(&e.id).ok())
                 .collect();
-            cx.handle
-                .block_on(cx.user_data.get_user_data_batch(&ids, uid))
+            block_on_until(cx, deadline, cx.user_data.get_user_data_batch(&ids, uid))?
                 .map_err(|e| format!("user data read failed: {e}"))?
         }
         None => std::collections::HashMap::new(),
@@ -555,9 +588,17 @@ pub(crate) fn summarize(
 
 /// Executes `next-up` for a guest: the user's next episodes, in order.
 ///
+/// The reads are held to `deadline`, the guest call's.
+///
 /// # Errors
-/// Invalid user id, or a manager failure — as the guest-visible string.
-pub fn next_up(cx: &Collaborators, user_id: &str, limit: u32) -> Result<Vec<ItemSummary>, String> {
+/// Invalid user id, a manager failure, or [`OUT_OF_TIME`] — as the
+/// guest-visible string.
+pub fn next_up(
+    cx: &Collaborators,
+    deadline: std::time::Instant,
+    user_id: &str,
+    limit: u32,
+) -> Result<Vec<ItemSummary>, String> {
     let uid: Uuid = user_id
         .parse()
         .map_err(|_| format!("user-id `{user_id}` is not a valid UUID"))?;
@@ -566,13 +607,13 @@ pub fn next_up(cx: &Collaborators, user_id: &str, limit: u32) -> Result<Vec<Item
         limit: Some(i32::try_from(limit.min(MAX_QUERY_ROWS)).unwrap_or(i32::MAX)),
         ..Default::default()
     };
-    let result = cx
-        .handle
-        .block_on(
-            cx.tv
-                .get_next_up(&query, &ferrofin_traits::options::DtoOptions::default()),
-        )
-        .map_err(|e| format!("next-up failed: {e}"))?;
+    let result = block_on_until(
+        cx,
+        deadline,
+        cx.tv
+            .get_next_up(&query, &ferrofin_traits::options::DtoOptions::default()),
+    )?
+    .map_err(|e| format!("next-up failed: {e}"))?;
     // The NextUp trait returns wire DTOs; re-fetch the entities by id so the
     // projection stays entity-based (one code path for summaries).
     let ids: Vec<String> = result.items.iter().map(|d| d.id.to_string()).collect();
@@ -581,6 +622,7 @@ pub fn next_up(cx: &Collaborators, user_id: &str, limit: u32) -> Result<Vec<Item
     }
     let ordered = query_items(
         cx,
+        deadline,
         &ItemQuery {
             kinds: Vec::new(),
             parent_id: None,
@@ -774,13 +816,15 @@ const TICKS_PER_SEC: f64 = 10_000_000.0;
 
 /// Resolves a guest-named library item to its filesystem path — the ONLY
 /// way media bytes are ever addressed (a guest never supplies paths).
-fn resolve_media_path(cx: &Collaborators, item_id: &str) -> Result<String, String> {
+fn resolve_media_path(
+    cx: &Collaborators,
+    deadline: std::time::Instant,
+    item_id: &str,
+) -> Result<String, String> {
     let id: Uuid = item_id
         .parse()
         .map_err(|_| format!("item-id `{item_id}` is not a valid UUID"))?;
-    let entity = cx
-        .handle
-        .block_on(cx.library.get_item_by_id(id))
+    let entity = block_on_until(cx, deadline, cx.library.get_item_by_id(id))?
         .map_err(|e| format!("item lookup failed: {e}"))?
         .ok_or_else(|| format!("no such library item {id}"))?;
     let path = entity
@@ -792,30 +836,33 @@ fn resolve_media_path(cx: &Collaborators, item_id: &str) -> Result<String, Strin
 
 /// Executes `media-info` for a guest.
 ///
+/// The reads are held to `deadline`, the guest call's.
+///
 /// # Errors
-/// Unknown/pathless item or repository failure, as the guest-visible string.
+/// Unknown/pathless item, repository failure, or [`OUT_OF_TIME`], as the
+/// guest-visible string.
 pub fn media_info(
     cx: &Collaborators,
+    deadline: std::time::Instant,
     item_id: &str,
 ) -> Result<crate::bindings::types::MediaTechnicalInfo, String> {
     let id: Uuid = item_id
         .parse()
         .map_err(|_| format!("item-id `{item_id}` is not a valid UUID"))?;
-    let entity = cx
-        .handle
-        .block_on(cx.library.get_item_by_id(id))
+    let entity = block_on_until(cx, deadline, cx.library.get_item_by_id(id))?
         .map_err(|e| format!("item lookup failed: {e}"))?
         .ok_or_else(|| format!("no such library item {id}"))?;
-    let streams = cx
-        .handle
-        .block_on(cx.media_streams.get_media_streams(
-            &ferrofin_traits::persistence::MediaStreamQuery {
+    let streams = block_on_until(
+        cx,
+        deadline,
+        cx.media_streams
+            .get_media_streams(&ferrofin_traits::persistence::MediaStreamQuery {
                 item_id: id,
                 stream_type: None,
                 index: None,
-            },
-        ))
-        .map_err(|e| format!("stream lookup failed: {e}"))?;
+            }),
+    )?
+    .map_err(|e| format!("stream lookup failed: {e}"))?;
     // Stream-type discriminants per the DB mapping: 0 = Audio, 1 = Video.
     Ok(crate::bindings::types::MediaTechnicalInfo {
         duration_ticks: entity.run_time_ticks.unwrap_or(0),
@@ -834,8 +881,10 @@ pub fn media_info(
 /// Executes `extract-audio` for a guest: caps the window, clamps the spec,
 /// resolves the item, and decodes under the global analysis budget.
 ///
+/// The permit wait and the decode are held to `deadline`, the guest call's.
+///
 /// # Errors
-/// Cap violations, unknown items, or decode failures.
+/// Cap violations, unknown items, decode failures, or [`OUT_OF_TIME`].
 #[allow(
     clippy::cast_precision_loss,
     clippy::cast_possible_truncation,
@@ -844,6 +893,7 @@ pub fn media_info(
 // any cast, so precision/truncation cannot bite.
 pub fn extract_audio(
     cx: &Collaborators,
+    deadline: std::time::Instant,
     memory_limit_bytes: usize,
     window: &crate::bindings::types::AudioWindow,
 ) -> Result<crate::bindings::types::AudioChunk, String> {
@@ -867,17 +917,15 @@ pub fn extract_audio(
             "decoded window (~{decoded_bytes} bytes) exceeds the plugin's analysis budget ({bytes_cap} bytes) — request a shorter window or lower rate"
         ));
     }
-    let path = resolve_media_path(cx, &window.item_id)?;
+    let path = resolve_media_path(cx, deadline, &window.item_id)?;
     let start_secs = (window.start_ticks.max(0)) as f64 / TICKS_PER_SEC;
-    let samples = cx
-        .handle
-        .block_on(async {
-            let _permit = cx.analysis.acquire().await;
-            cx.extractor
-                .extract_audio(&path, start_secs, duration_secs, spec)
-                .await
-        })
-        .map_err(|e| format!("audio extraction failed: {e}"))?;
+    let samples = block_on_until(cx, deadline, async {
+        let _permit = cx.analysis.acquire().await;
+        cx.extractor
+            .extract_audio(&path, start_secs, duration_secs, spec)
+            .await
+    })?
+    .map_err(|e| format!("audio extraction failed: {e}"))?;
     Ok(crate::bindings::types::AudioChunk {
         spec: crate::bindings::types::AudioSpec {
             sample_rate: spec.sample_rate,
@@ -888,14 +936,16 @@ pub fn extract_audio(
     })
 }
 
-/// Executes `extract-frames` for a guest.
+/// Executes `extract-frames` for a guest. The permit wait and the decode
+/// are held to `deadline`, the guest call's.
 ///
 /// # Errors
-/// Cap violations, unknown items, or decode failures.
+/// Cap violations, unknown items, decode failures, or [`OUT_OF_TIME`].
 #[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
 // tick↔second conversions on bounded timestamps.
 pub fn extract_frames(
     cx: &Collaborators,
+    deadline: std::time::Instant,
     request: &crate::bindings::types::FrameRequest,
 ) -> Result<Vec<crate::bindings::types::VideoFrame>, String> {
     if request.timestamps_ticks.is_empty() {
@@ -909,21 +959,19 @@ pub fn extract_frames(
     }
     let max_dimension = request.max_dimension.clamp(16, FRAME_DIMENSION_MAX);
     let jpeg = matches!(request.format, crate::bindings::types::FrameFormat::Jpeg);
-    let path = resolve_media_path(cx, &request.item_id)?;
+    let path = resolve_media_path(cx, deadline, &request.item_id)?;
     let timestamps: Vec<f64> = request
         .timestamps_ticks
         .iter()
         .map(|t| (*t).max(0) as f64 / TICKS_PER_SEC)
         .collect();
-    let frames = cx
-        .handle
-        .block_on(async {
-            let _permit = cx.analysis.acquire().await;
-            cx.extractor
-                .extract_frames(&path, &timestamps, max_dimension, jpeg)
-                .await
-        })
-        .map_err(|e| format!("frame extraction failed: {e}"))?;
+    let frames = block_on_until(cx, deadline, async {
+        let _permit = cx.analysis.acquire().await;
+        cx.extractor
+            .extract_frames(&path, &timestamps, max_dimension, jpeg)
+            .await
+    })?
+    .map_err(|e| format!("frame extraction failed: {e}"))?;
     Ok(frames
         .into_iter()
         .map(|f| crate::bindings::types::VideoFrame {
@@ -941,24 +989,24 @@ pub fn extract_frames(
 }
 
 /// Executes `extract-subtitle-track`. `size_cap` bounds the extracted
-/// track (`FERROFIN_WASM_SUBTITLE_EXTRACT_MB`).
+/// track (`FERROFIN_WASM_SUBTITLE_EXTRACT_MB`); the permit wait and the
+/// decode are held to `deadline`, the guest call's.
 ///
 /// # Errors
-/// Unknown item, decode failure, or an over-cap track.
+/// Unknown item, decode failure, an over-cap track, or [`OUT_OF_TIME`].
 pub fn extract_subtitle_track(
     cx: &Collaborators,
+    deadline: std::time::Instant,
     size_cap: usize,
     item_id: &str,
     stream_index: u32,
 ) -> Result<Vec<u8>, String> {
-    let path = resolve_media_path(cx, item_id)?;
-    let bytes = cx
-        .handle
-        .block_on(async {
-            let _permit = cx.analysis.acquire().await;
-            cx.extractor.extract_subtitle(&path, stream_index).await
-        })
-        .map_err(|e| format!("subtitle extraction failed: {e}"))?;
+    let path = resolve_media_path(cx, deadline, item_id)?;
+    let bytes = block_on_until(cx, deadline, async {
+        let _permit = cx.analysis.acquire().await;
+        cx.extractor.extract_subtitle(&path, stream_index).await
+    })?
+    .map_err(|e| format!("subtitle extraction failed: {e}"))?;
     if bytes.len() > size_cap {
         return Err(format!("extracted track exceeds the {size_cap}-byte cap"));
     }

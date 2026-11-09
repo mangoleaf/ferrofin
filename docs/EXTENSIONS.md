@@ -316,8 +316,8 @@ date says, so media moved or copied in with old file times, unpacked from an arc
 or a photo with an old EXIF date is offered like any other. An item is left for a later
 pass while its library turns the plugin's segments off (Media segment providers in the
 library's settings), or when the server refused the plugin's segment write for it. When
-the plugin's circuit breaker stops a pass, the items it did not reach are offered after
-the restart. Offers are recorded a page of items at a time, so a server that stops
+the plugin's circuit breaker or a lost call stops a pass, the items it did not reach are
+offered after the restart. Offers are recorded a page of items at a time, so a server that stops
 partway through a page offers that page's items again: analysis must be idempotent.
 Uninstalling a plugin forgets what it was offered, so installed again it is offered the
 whole library. Servers before this record kept a watermark instead, the newest creation
@@ -503,9 +503,15 @@ Each plugin runs on its own runtime thread under an enforced
 per-call deadline (`FERROFIN_WASM_CALL_TIMEOUT_SECS`, default 30 s) and linear-memory cap
 (`FERROFIN_WASM_MEMORY_LIMIT_MB`, default 128 MiB). The deadline also holds while the guest
 waits on a WASI clock (`std::thread::sleep`, `poll`): the wait is cut to the time the call
-has left. A trap or overrun fails that one call
+has left. So do `http-fetch`, the extraction functions and the library reads: one still
+waiting when the call's time is up is cut there, and the call fails as an overrun. A trap or
+overrun fails that one call
 and the instance is rebuilt; three consecutive failures trip a circuit breaker that
-sidelines the plugin until restart. The server never goes down with a plugin.
+sidelines the plugin until restart. A call still stuck in a host function
+`FERROFIN_WASM_CALL_GRACE_SECS` (default 10 s) past its deadline disables the plugin until
+restart at once, and its thread is abandoned; the same watch skips a plugin stuck while
+loading at startup and refuses one stuck during install validation. The server never goes
+down with a plugin.
 
 ### What the sandbox does — and does not — protect against
 

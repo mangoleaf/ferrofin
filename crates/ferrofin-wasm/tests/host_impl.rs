@@ -34,7 +34,8 @@ fn state(collaborators: Arc<std::sync::OnceLock<Collaborators>>) -> HostState {
         ])),
         collaborators,
         private_http_allowed: true, // tests hit a loopback listener
-        call_deadline: std::time::Instant::now(),
+        // Time left for the capability calls these tests make.
+        call_deadline: std::time::Instant::now() + std::time::Duration::from_secs(600),
         wasi: HostState::empty_wasi(),
         table: wasmtime::component::ResourceTable::new(),
     }
@@ -135,6 +136,51 @@ fn clock_waits_are_clamped_to_the_call_deadline_then_trap() {
     }
 }
 
+/// gl-600: a fetch gets the call timeout, cut to the time left in the call,
+/// and none at all once the time is up.
+#[test]
+fn a_fetch_is_held_to_the_time_left_in_the_call() {
+    use ferrofin_wasm::bindings::fetch_timeout;
+    use std::time::{Duration, Instant};
+
+    let call = Duration::from_secs(30);
+    let plenty = Instant::now() + Duration::from_secs(600);
+    assert_eq!(fetch_timeout(call, plenty).unwrap(), call);
+    let left = fetch_timeout(call, Instant::now() + Duration::from_secs(5)).unwrap();
+    assert!(
+        left <= Duration::from_secs(5) && left > Duration::from_secs(4),
+        "{left:?}"
+    );
+    assert_eq!(
+        fetch_timeout(call, Instant::now()).unwrap_err(),
+        ferrofin_wasm::capabilities::OUT_OF_TIME
+    );
+}
+
+/// gl-600: an `http-fetch` made with no time left in the call is refused
+/// with the out-of-time error, before any request is sent.
+#[tokio::test(flavor = "multi_thread")]
+async fn http_fetch_with_no_time_left_is_out_of_time() {
+    let cell = Arc::new(std::sync::OnceLock::new());
+    let _ = cell.set(armed(tokio::runtime::Handle::current()));
+    // The blocking HTTP client is built and dropped off the runtime, as on
+    // the plugin thread.
+    let err = tokio::task::spawn_blocking(move || {
+        let mut s = state(cell);
+        s.call_deadline = std::time::Instant::now();
+        s.http_fetch(types::HttpRequest {
+            method: "GET".to_owned(),
+            url: "http://127.0.0.1:9/never".to_owned(),
+            headers: Vec::new(),
+            body: None,
+        })
+    })
+    .await
+    .unwrap()
+    .unwrap_err();
+    assert_eq!(err, ferrofin_wasm::capabilities::OUT_OF_TIME);
+}
+
 #[test]
 fn capability_calls_fail_cleanly_before_collaborators_are_armed() {
     let mut s = state(Arc::new(std::sync::OnceLock::new()));
@@ -182,11 +228,9 @@ fn http_fetch_is_denied_during_plugin_load() {
     assert!(err.contains("not available during plugin load"), "{err}");
 }
 
-#[tokio::test(flavor = "multi_thread")]
-async fn http_fetch_round_trips_once_collaborators_are_armed() {
-    let (url, server) = one_shot_http("204 No Content", b"");
-    let cell = Arc::new(std::sync::OnceLock::new());
-    cell.set(Collaborators {
+/// Collaborators of stubs, on `handle`.
+fn armed(handle: tokio::runtime::Handle) -> Collaborators {
+    Collaborators {
         lyrics: std::sync::Arc::new(common::StubLyrics::default()),
         subtitles: std::sync::Arc::new(common::StubSubtitles::default()),
         collections: std::sync::Arc::new(common::StubCollections::default()),
@@ -198,15 +242,22 @@ async fn http_fetch_round_trips_once_collaborators_are_armed() {
         users: std::sync::Arc::new(common::StubUsers),
         user_data: std::sync::Arc::new(common::StubUserData),
         tv: std::sync::Arc::new(common::StubTv),
-        handle: tokio::runtime::Handle::current(),
+        handle,
         library: Arc::new(OneMovieLibrary {
             seen: std::sync::Mutex::new(None),
         }),
         media_segments: Arc::new(RecordingSegments::default()),
         plugins: Arc::new(EnabledStub(b"{}".to_vec())),
-    })
-    .ok()
-    .expect("fresh cell");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn http_fetch_round_trips_once_collaborators_are_armed() {
+    let (url, server) = one_shot_http("204 No Content", b"");
+    let cell = Arc::new(std::sync::OnceLock::new());
+    cell.set(armed(tokio::runtime::Handle::current()))
+        .ok()
+        .expect("fresh cell");
     // http-fetch uses a blocking client, so drive it off-runtime like the
     // plugin thread does.
     let response = tokio::task::spawn_blocking(move || {
