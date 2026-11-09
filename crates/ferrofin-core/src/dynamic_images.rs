@@ -379,7 +379,8 @@ impl DynamicImageProviders {
     ///
     /// # Errors
     ///
-    /// As [`refresh_all_between`](Self::refresh_all_between).
+    /// Only when the user root's row cannot be read or its refresh date
+    /// cannot be stamped; a failure drawing its image is logged.
     pub async fn refresh_user_root_between<'b>(
         &self,
         options: &MetadataRefreshOptions,
