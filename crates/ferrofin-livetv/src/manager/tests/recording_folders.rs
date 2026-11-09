@@ -32,6 +32,8 @@ struct FakeLibrary {
     scans: AtomicUsize,
     /// The paths refreshed, in order.
     refreshed: Mutex<Vec<String>>,
+    /// A post-processing fixture must replace the file before its refresh.
+    expect_processed: AtomicBool,
     /// When set, `add_virtual_folder` waits here before it adds anything.
     add_gate: Mutex<Option<Arc<tokio::sync::Notify>>>,
 }
@@ -126,6 +128,9 @@ impl RecordingLibrary for FakeLibrary {
     }
 
     async fn refresh_path(&self, path: &str) -> Result<(), ServiceError> {
+        if self.expect_processed.load(Ordering::SeqCst) {
+            assert_eq!(std::fs::read(path).expect("processed file"), b"processed");
+        }
         self.refreshed.lock().unwrap().push(path.to_owned());
         Ok(())
     }
@@ -900,5 +905,68 @@ async fn a_library_delete_forgets_the_recording_at_its_file() {
             .await
             .expect("read")
             .is_none()
+    );
+}
+
+/// A post-processor can change codecs or duration with real-time monitoring
+/// disabled. Queue a fresh scan after it exits, including a nonzero exit when
+/// it may already have changed the file.
+#[cfg(unix)]
+#[rstest::rstest]
+#[case(0)]
+#[case(37)]
+#[tokio::test]
+async fn recording_postprocess_refreshes_the_processed_file(#[case] exit_code: i32) {
+    use chrono::Utc;
+    use ferrofin_model::live_tv::{BaseTimerInfoDto, RecordingStatus, TimerInfoDto};
+
+    let dir = tempfile::tempdir().expect("directory");
+    let library = FakeLibrary::with(Vec::new());
+    library.expect_processed.store(true, Ordering::SeqCst);
+    let mgr = manager(dir.path(), &library).await;
+    let target = dir.path().join("capture.ts");
+    let script = dir.path().join("processor.sh");
+    std::fs::write(&target, b"original").expect("capture");
+    std::fs::write(
+        &script,
+        format!("printf processed > \"$1\"\nexit {exit_code}\n"),
+    )
+    .expect("script");
+    write_options(
+        dir.path(),
+        &LiveTvOptions {
+            recording_post_processor: Some("/bin/sh".to_owned()),
+            recording_post_processor_arguments: Some(format!("{} \"{{path}}\"", script.display())),
+            ..LiveTvOptions::default()
+        },
+    );
+    let info = crate::dvr::TimerRecordingInfo {
+        id: "postprocess-refresh".to_owned(),
+        ..crate::dvr::TimerRecordingInfo::default()
+    };
+    let timer = TimerInfoDto {
+        base: BaseTimerInfoDto {
+            id: Some(info.id.clone()),
+            ..BaseTimerInfoDto::default()
+        },
+        status: RecordingStatus::InProgress,
+        ..TimerInfoDto::default()
+    };
+    mgr.persist_timer(&timer).await.expect("timer");
+    let recording_id = Uuid::new_v4();
+    crate::dvr_repository::insert_recording(&mgr.db, recording_id, &info, &target, Utc::now())
+        .await
+        .expect("recording");
+    mgr.settle_timer(timer, &info, Some(recording_id), &target, true, Ok(()))
+        .await
+        .expect("settled");
+    assert_eq!(library.refreshed(), [target.display().to_string()]);
+    assert_eq!(
+        mgr.get_timer(&info.id)
+            .await
+            .expect("timer")
+            .expect("completed")
+            .status,
+        RecordingStatus::Completed
     );
 }
