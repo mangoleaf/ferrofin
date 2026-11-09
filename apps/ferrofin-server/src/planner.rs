@@ -6800,6 +6800,39 @@ mod tests {
         }
     }
 
+    /// `-hls_flags temp_file` on every HLS job: TS and fMP4, audio and video,
+    /// VOD and event, from the start and seeked. The serve path takes a
+    /// segment file's existence as its completeness, which only the rename
+    /// makes true (gl-759).
+    #[tokio::test]
+    async fn every_hls_job_writes_its_segments_through_temp_file() {
+        let p = planner(vec![source(
+            "abc",
+            vec![video_stream("h264"), audio_stream("aac")],
+        )]);
+        for container in ["ts", "mp4"] {
+            for (is_audio, kind) in [
+                (false, PlaylistKind::Vod),
+                (false, PlaylistKind::Event),
+                (true, PlaylistKind::Vod),
+            ] {
+                for segment in [0_i32, 3] {
+                    let mut req = at_segment(request("abc"), segment.into());
+                    req.segment_container = Some(container.to_owned());
+                    let args = p
+                        .plan(&req, is_audio, Some(segment), kind)
+                        .await
+                        .unwrap()
+                        .arguments;
+                    assert!(
+                        args.windows(2).any(|w| w == ["-hls_flags", "temp_file"]),
+                        "{container} {is_audio} {kind:?} {segment}: {args:?}"
+                    );
+                }
+            }
+        }
+    }
+
     #[tokio::test]
     async fn plan_builds_hls_muxer_args() {
         let src = source("abc", vec![video_stream("h264"), audio_stream("aac")]);
