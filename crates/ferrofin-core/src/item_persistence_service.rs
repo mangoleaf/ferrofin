@@ -4011,14 +4011,19 @@ impl ItemPersistenceService for FerrofinItemPersistenceService {
         Ok(written)
     }
 
-    async fn clear_date_last_refreshed(&self, item_id: Uuid) -> Result<bool, ServiceError> {
-        let cleared =
-            sqlx::query(r#"UPDATE "BaseItems" SET "DateLastRefreshed" = NULL WHERE "Id" = ?1"#)
+    async fn set_date_last_refreshed(
+        &self,
+        item_id: Uuid,
+        at: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> Result<bool, ServiceError> {
+        let written =
+            sqlx::query(r#"UPDATE "BaseItems" SET "DateLastRefreshed" = ?2 WHERE "Id" = ?1"#)
                 .bind(guid_to_db(item_id))
+                .bind(opt_datetime_to_db(at))
                 .execute(self.db.writer())
                 .await
                 .map_err(db_err)?;
-        Ok(cleared.rows_affected() > 0)
+        Ok(written.rows_affected() > 0)
     }
 
     async fn presentation_unique_key(&self, item_id: Uuid) -> Result<Option<String>, ServiceError> {
@@ -12861,7 +12866,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn clearing_the_refresh_stamp_moves_nothing_else() {
+    async fn setting_the_refresh_stamp_moves_nothing_else() {
         let db = test_db().await;
         let service = FerrofinItemPersistenceService::new(db.clone());
         let item = Uuid::new_v4();
@@ -12874,14 +12879,26 @@ mod tests {
         let stamped = crate::test_support::fetch_item(&db, item).await;
         assert!(stamped.date_last_refreshed.is_some());
 
-        assert!(service.clear_date_last_refreshed(item).await.unwrap());
+        assert!(service.set_date_last_refreshed(item, None).await.unwrap());
 
         let row = crate::test_support::fetch_item(&db, item).await;
         assert_eq!(row.date_last_refreshed, None);
         assert_eq!(row.date_last_saved, stamped.date_last_saved);
+
+        // At the stored precision, as a stamp the scan read back is.
+        let earlier = stamped.date_last_refreshed.unwrap() - chrono::TimeDelta::days(3);
+        assert!(
+            service
+                .set_date_last_refreshed(item, Some(earlier))
+                .await
+                .unwrap()
+        );
+        let row = crate::test_support::fetch_item(&db, item).await;
+        assert_eq!(row.date_last_refreshed, Some(earlier), "put back");
+        assert_eq!(row.date_last_saved, stamped.date_last_saved);
         assert!(
             !service
-                .clear_date_last_refreshed(Uuid::new_v4())
+                .set_date_last_refreshed(Uuid::new_v4(), None)
                 .await
                 .unwrap(),
             "no such row"

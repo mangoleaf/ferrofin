@@ -165,14 +165,8 @@ async fn get_playlist(
         .playlists
         .get_playlist_access(playlist_id, user_id)
         .await?;
-    let items = state
-        .playlists
-        .get_playlist_items(playlist_id, user_id)
-        .await?;
-    let item_ids = items
-        .iter()
-        .filter_map(|i| Uuid::parse_str(&i.id).ok())
-        .collect();
+    // `GetManageableItems().Select(t => t.Item2.Id)`: the ids alone, no row.
+    let item_ids = state.playlists.get_playlist_item_ids(playlist_id).await?;
     Ok(Json(PlaylistDto {
         open_access: access.open_access,
         shares: state.playlists.get_playlist_shares(playlist_id).await?,
@@ -291,22 +285,16 @@ async fn get_playlist_items(
         .get_playlist_items(playlist_id, calling_user_id)
         .await?;
     // `GetManageableItems().Where(i => i.Item2.IsVisible(user))`: a member
-    // the caller may not see is out of the page and the count. Divergence
-    // (gl-1092): the standalone check, which also walks the member's
-    // library, where upstream's `IsVisible` reads only its rating and tags,
-    // so a member from a library the caller was not granted is dropped too.
+    // the caller may not see is out of the page and the count, checked on the
+    // rows just read. Divergence (gl-1092): the standalone check, which also
+    // walks the member's library, where upstream's `IsVisible` reads only its
+    // rating and tags, so a member from a library the caller was not granted
+    // is dropped too.
     if let Some(user) = &user {
-        let ids: Vec<Uuid> = items
-            .iter()
-            .filter_map(|item| Uuid::parse_str(&item.id).ok())
-            .collect();
-        let visible: std::collections::HashSet<Uuid> = state
+        items = state
             .library
-            .get_visible_item_ids(&ids, user)
-            .await?
-            .into_iter()
-            .collect();
-        items.retain(|item| Uuid::parse_str(&item.id).is_ok_and(|id| visible.contains(&id)));
+            .filter_visible_items_standalone(items, user)
+            .await?;
     }
     let total = i32::try_from(items.len()).unwrap_or(i32::MAX);
 

@@ -998,7 +998,9 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
                    library_scan.rs run_scan (the item's error is counted in \
                    ScanOutcome::skipped, the walk goes on, a saved row loses its \
                    DateLastRefreshed, a new item with no row takes its descendants along, a \
-                   refresh of an item or folder ends with that item's own failure) \
+                   refresh of an item or folder ends with that item's own failure) and \
+                   scan_item (the row is saved unstamped, and its stamp written after what \
+                   hangs off it, unless a cancel cut that short) \
                    ← parent_row (a failed read counts as \
                    no row, once per pass) ← sync_series_name (FindSeriesName), \
                    sync_season_name, remember_series_folder, locale_parent (GetParents, \
@@ -1016,7 +1018,7 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
                    MediaBrowser.Controller/Entities/TV/Season.cs (FindSeriesName), \
                    MediaBrowser.Controller/Entities/BaseItem.cs (GetParentalRatingScore) and \
                    MediaBrowser.Providers/TV/EpisodeMetadataService.cs (BeforeSaveInternal)",
-        date: "2026-11-06",
+        date: "2026-11-09",
         divergences: &[
             "An item whose parent chain cannot be read is scored from its own rating and \
              country, an ancestor's custom rating not counting, else takes the score stored on \
@@ -1029,11 +1031,13 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
              the server, so an override on the unreadable row or above it goes unused and the \
              child is fetched, and stamped, in that locale, where upstream's read of such a \
              row would throw into the per-child catch and the item would not refresh.",
-            "A stored item that fails after its row was saved has its DateLastRefreshed \
-             cleared, so the next scan retries it as a first refresh where upstream, which \
-             saves the row after the providers and the probe, retries it because the row kept \
-             its old DateModified; the rows a save hangs off it by foreign key are why \
-             Ferrofin saves first, and the retry is the same but runs every provider.",
+            "A stored item whose refresh stops after its row was saved (a failed write, a \
+             cancel, a crash) is left with no DateLastRefreshed, which the scan clears for the \
+             save and writes back last, so the next scan retries it as a first refresh where \
+             upstream, which saves the row after the providers and the probe, retries it \
+             because the row kept its old DateModified; the rows a save hangs off it by \
+             foreign key are why Ferrofin saves first, and the retry is the same but runs \
+             every provider.",
             "A new item that fails before its first save has no row until the next scan, \
              where upstream's CreateItems and first-refresh save keep one, so a new folder \
              that fails takes its descendants with it for this scan.",
@@ -3365,6 +3369,27 @@ pub const VERIFIED: &[Verified] = &[
         refs: &[],
     },
     Verified {
+        method: "get",
+        path: "/Playlists/{itemId}",
+        upstream_file: "Jellyfin.Api/Controllers/PlaylistsController.cs",
+        upstream_method: "GetPlaylist",
+        ferrofin: "handlers/playlists.rs get_playlist (User.GetUserId: a nil id, an API key \
+               naming no user, is a 400 as GetUserById(Guid.Empty) throws) → ferrofin-core \
+               collection_manager.rs FerrofinPlaylistManager::get_playlist_access \
+               (GetPlaylistForUser: GetPlaylists(userId).Where(IsVisible), else 404), \
+               get_playlist_shares (Playlist.Shares) and get_playlist_item_ids \
+               (GetManageableItems().Select(t => t.Item2.Id): the manual links in SortOrder, \
+               repeats kept, every member listed whoever may see it, read as ids alone)",
+        date: "2026-11-09",
+        divergences: &[
+            "A user named twice in the shares is listed once, with the combined CanEdit; \
+         upstream's Shares lists every stored entry. Fix path: gl-949.",
+            "The 404 (no playlist the caller can see) body is Ferrofin's error shape, not \
+         upstream's \"Playlist not found\" string. Fix path: gl-666.",
+        ],
+        refs: &[],
+    },
+    Verified {
         method: "post",
         path: "/Playlists/{itemId}",
         upstream_file: "Jellyfin.Api/Controllers/PlaylistsController.cs",
@@ -3420,10 +3445,11 @@ pub const VERIFIED: &[Verified] = &[
                RequestHelpers.GetUserId) → ferrofin-core collection_manager.rs \
                FerrofinPlaylistManager::get_playlist_items (GetPlaylistForUser and \
                GetManageableItems: manual links, in order, missing items out), then \
-               LibraryManager::get_visible_item_ids before the paging, as upstream filters \
-               before Skip and Take, and tv_shows::build_dto_options + get_linked_children_dtos \
-               + the PlaylistItemId tag",
-        date: "2026-11-01",
+               LibraryManager::filter_visible_items_standalone over the rows just read \
+               (ItemVisibility::visible, one answer per distinct id) before the paging, as \
+               upstream filters before Skip and Take, and tv_shows::build_dto_options + \
+               get_linked_children_dtos + the PlaylistItemId tag",
+        date: "2026-11-09",
         divergences: &[
             "A member the caller may not open is left out with the standalone check, which also \
          walks its library, where upstream's IsVisible reads only its rating and tags and \

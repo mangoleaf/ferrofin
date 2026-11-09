@@ -1232,7 +1232,7 @@ fn apply_probed_media_info(
 
 /// Materializes the `MediaStream` members C# computes in getters
 /// (`DisplayTitle`, `MediaStream.cs:265-331`; `VideoRange`/`VideoRangeType`/
-/// `AudioSpatialFormat`/`IsTextSubtitleStream`/`ReferenceFrameRate`) for
+/// `VideoDoViTitle`/`AudioSpatialFormat`/`IsTextSubtitleStream`/`ReferenceFrameRate`) for
 /// streams that are served without passing through [`stream_to_dto`] — probe
 /// output and tuner info for unopened Live TV channels, recordings and opened
 /// live streams.
@@ -1383,6 +1383,7 @@ pub(crate) fn stream_to_dto(row: MediaStreamInfoEntity) -> MediaStream {
         ref_frames: row.ref_frames.and_then(|v| i32::try_from(v).ok()),
         height: row.height.and_then(|v| i32::try_from(v).ok()),
         width: row.width.and_then(|v| i32::try_from(v).ok()),
+        rotation: row.rotation.and_then(|v| i32::try_from(v).ok()),
         level: row.level,
         // Frame rates are stored as f64 but the wire DTO is f32; the precision
         // loss on a frame-rate value (e.g. 23.976) is immaterial.
@@ -1411,7 +1412,7 @@ pub(crate) fn stream_to_dto(row: MediaStreamInfoEntity) -> MediaStream {
     // fields so clients don't fall back to "Undefined".
     stream.display_title = stream.display_title();
     // Materialize the computed-property fields (VideoRange/VideoRangeType/
-    // AudioSpatialFormat/IsTextSubtitleStream/ReferenceFrameRate) Jellyfin serializes
+    // VideoDoViTitle/AudioSpatialFormat/IsTextSubtitleStream/ReferenceFrameRate) Jellyfin serializes
     // as getters — derived on every load, not persisted.
     stream.populate_computed_fields();
     // Port of `MediaSourceManager.StreamSupportsExternalStream`: stamp whether a
@@ -2112,6 +2113,22 @@ mod tests {
         assert_eq!(back.color_primaries.as_deref(), Some("bt2020"));
     }
 
+    /// The rotation a phone video's display matrix records survives the
+    /// database, as `MediaStreamRepository.Map` copies it both ways: the
+    /// transcode scales and burns subtitles into the rotated frame.
+    #[test]
+    fn rotation_round_trips_through_entity() {
+        let dto = MediaStream {
+            stream_type: ferrofin_model::entities::MediaStreamType::Video,
+            codec: Some("h264".to_owned()),
+            rotation: Some(-90),
+            ..MediaStream::default()
+        };
+        let entity = stream_dto_to_entity("item-1", &dto);
+        assert_eq!(entity.rotation, Some(-90));
+        assert_eq!(stream_to_dto(entity).rotation, Some(-90));
+    }
+
     #[test]
     fn dv_metadata_round_trips_through_entity() {
         use ferrofin_model::data::VideoRangeType;
@@ -2148,6 +2165,11 @@ mod tests {
         assert_eq!(back.el_present_flag, Some(0));
         // The point of persisting DV: the derived range is DOVI, not plain HDR10.
         assert_eq!(back.video_range_type(), VideoRangeType::DoviWithHdr10);
+        // ...and the wire DTO carries the getter Jellyfin serializes.
+        assert_eq!(
+            back.video_dovi_title.as_deref(),
+            Some("Dolby Vision Profile 8.1 (HDR10)")
+        );
     }
 
     /// `MediaStreamRepository.Map` re-stamps the `Localized*` labels on every
