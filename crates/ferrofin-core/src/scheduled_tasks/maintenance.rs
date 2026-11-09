@@ -66,8 +66,11 @@ fn startup() -> TaskTriggerInfo {
 // file-sweep helpers (the C# FileSystemHelper used by the cleanup tasks)
 // ---------------------------------------------------------------------------
 
-/// Recursively collects every file under `dir` (missing dir = empty).
-fn files_under(dir: &Path) -> Vec<PathBuf> {
+/// Recursively collects the files under `dir` that `wanted` accepts (missing
+/// dir = empty). The filter runs during the walk, so a sweep holds only the
+/// paths it acts on, not one per file in the tree (upstream's lazy
+/// `GetFiles(…).Where(…).ToList()`).
+fn files_under(dir: &Path, wanted: &dyn Fn(&Path) -> bool) -> Vec<PathBuf> {
     let mut files = Vec::new();
     let mut stack = vec![dir.to_path_buf()];
     while let Some(current) = stack.pop() {
@@ -78,7 +81,7 @@ fn files_under(dir: &Path) -> Vec<PathBuf> {
             let path = entry.path();
             match entry.file_type() {
                 Ok(t) if t.is_dir() => stack.push(path),
-                Ok(t) if t.is_file() => files.push(path),
+                Ok(t) if t.is_file() && wanted(&path) => files.push(path),
                 _ => {}
             }
         }
@@ -106,7 +109,7 @@ pub fn delete_encoded_media_cache(paths: &dyn ServerApplicationPaths) -> u64 {
         }
     };
     let mut deleted = 0;
-    for file in files_under(&dir) {
+    for file in files_under(&dir, &|_| true) {
         match std::fs::remove_file(&file) {
             Ok(()) => deleted += 1,
             Err(e) => tracing::warn!(path = %file.display(), error = %e, "failed to delete file"),
@@ -127,15 +130,12 @@ fn delete_files_older_than(
     progress_span: f64,
     keep: &dyn Fn(&Path) -> bool,
 ) -> u64 {
-    let candidates: Vec<PathBuf> = files_under(dir)
-        .into_iter()
-        .filter(|f| !keep(f))
-        .filter(|f| {
-            std::fs::metadata(f)
+    let candidates = files_under(dir, &|f| {
+        !keep(f)
+            && std::fs::metadata(f)
                 .and_then(|m| m.modified())
                 .is_ok_and(|modified| modified < cutoff)
-        })
-        .collect();
+    });
     let total = candidates.len();
     let mut deleted = 0u64;
     for (index, file) in candidates.iter().enumerate() {
@@ -1113,6 +1113,36 @@ mod tests {
             "emptied subdir should be pruned"
         );
         assert!(cache.exists(), "cache root should remain");
+    }
+
+    /// The walk lists only the files its filter accepts, so a sweep over a
+    /// large cache holds the paths it deletes, not one per file in the tree:
+    /// neither a younger file nor a keep-listed old one is listed.
+    #[test]
+    fn files_under_lists_only_the_wanted_files() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let old = touch(dir.path(), "images/ab/old.webp");
+        backdate(&old, 31);
+        let kept = touch(dir.path(), "temp/old.tmp");
+        backdate(&kept, 31);
+        for rel in ["images/ab/fresh.webp", "images/cd/fresh.webp", "top.bin"] {
+            touch(dir.path(), rel);
+        }
+        let cutoff = SystemTime::now() - CACHE_FILE_MAX_AGE;
+        let temp = dir.path().join("temp");
+        let wanted = |f: &Path| {
+            !f.starts_with(&temp)
+                && std::fs::metadata(f)
+                    .and_then(|m| m.modified())
+                    .is_ok_and(|modified| modified < cutoff)
+        };
+
+        assert_eq!(files_under(dir.path(), &wanted), vec![old]);
+        assert_eq!(files_under(dir.path(), &|_| true).len(), 5);
+        assert_eq!(
+            files_under(&dir.path().join("missing"), &|_| true),
+            Vec::<PathBuf>::new()
+        );
     }
 
     #[tokio::test]
