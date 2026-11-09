@@ -414,9 +414,9 @@ dependencies:
     - if: '$CI_COMMIT_TAG =~ /^v\d+\.\d+\.\d+(-rc\.\d+)?$/'
 
 # cargo-vet, the same check as the `vet` job in .github/workflows/ci.yml: every crate in Cargo.lock
-# needs an audit or an exemption in supply-chain/ (CONTRIBUTING.md, "Dependencies"). --locked reads
-# the committed supply-chain/imports.lock instead of fetching the imports, so the result changes only
-# with the branch. create-release needs it.
+# needs an audit or an exemption in gates/supply-chain/ (CONTRIBUTING.md, "Dependencies"). --locked
+# reads the committed gates/supply-chain/imports.lock instead of fetching the imports, so the result
+# changes only with the branch. create-release needs it.
 vet:
   stage: test
   image: $CI_REGISTRY_IMAGE/ci:rust-1.99.1   # cargo-vet baked in (ci/Dockerfile)

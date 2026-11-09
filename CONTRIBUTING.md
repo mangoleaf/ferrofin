@@ -30,7 +30,7 @@ cargo deny --locked check              # advisories, licenses, bans, sources (de
 cargo deny --manifest-path examples/wasm-hello/Cargo.toml --locked check   # the same for the WASM guest
 cargo machete apps crates              # declared but unused dependencies
 scripts/check-workspace-deps.py        # every dependency through [workspace.dependencies]
-cargo vet --locked                     # every crate audited or exempted (supply-chain/)
+cargo vet --locked                     # every crate audited or exempted (gates/supply-chain/)
 ```
 
 Every `pub` item needs a `///` doc and pedantic clippy must pass (warnings are
@@ -68,18 +68,21 @@ A new license is a compatibility decision against GPL-3.0-only, not a fix.
 
 **Audits (cargo-vet).** `cargo vet --locked` blocks merging (it is part of GitHub's required
 `lint` check, and GitLab's `vet` job): every crate in `Cargo.lock` needs an audit or an
-exemption in `supply-chain/`. Normal and build dependencies need `safe-to-deploy`, dev-only
-ones `safe-to-run` (cargo-vet's defaults). Audits are imported from the organisations
-`supply-chain/config.toml` names, or are Ferrofin's own in `supply-chain/audits.toml`. When
-your change adds a crate, moves one to a version nothing covers, or makes a dev-only crate a
-normal dependency (it then needs `safe-to-deploy`), `cargo vet` names it:
+exemption in `gates/supply-chain/`. Normal and build dependencies need `safe-to-deploy`, dev-only
+ones `safe-to-run` (cargo-vet's defaults). Run `cargo vet` from the repository root: the store's
+path (`[workspace.metadata.vet]` in the root `Cargo.toml`) is relative, so from a crate directory it
+fails with "store not found at gates/supply-chain". Audits are imported from the organisations
+`gates/supply-chain/config.toml` names, or are Ferrofin's own in
+`gates/supply-chain/audits.toml`. When your change adds a crate, moves one to a version nothing
+covers, or makes a dev-only crate a normal dependency (it then needs `safe-to-deploy`), `cargo vet`
+names it:
 
 1. Run `cargo vet` without `--locked`. It fetches the imports again. When one of them now
-   covers the version, commit the updated `supply-chain/imports.lock`, after `cargo vet prune`
+   covers the version, commit the updated `gates/supply-chain/imports.lock`, after `cargo vet prune`
    has dropped any exemption the import replaces.
 2. Otherwise audit it. A full audit reads `cargo vet inspect <crate> <version>` and is
    recorded with `cargo vet certify <crate> <version>`, which writes it to
-   `supply-chain/audits.toml`; `cargo vet prune` then drops the exemption it replaces. A delta
+   `gates/supply-chain/audits.toml`; `cargo vet prune` then drops the exemption it replaces. A delta
    audit reads `cargo vet diff <crate> <old> <new>` and is recorded with
    `cargo vet certify <crate> <old> <new>`. It builds on whatever covers `<old>`: when that
    is an exemption, the exemption stays as the delta's base (`prune` keeps it, and deleting it
@@ -93,7 +96,7 @@ normal dependency (it then needs `safe-to-deploy`), `cargo vet` names it:
    cargo vet add-exemption <crate> <version> --criteria safe-to-deploy \
      --notes "2026-11-20: <why it has no audit>; lifted by <the audit or release that replaces it>"
    ```
-   `--locked` also refuses `supply-chain/` files that are not in cargo-vet's own format: after
+   `--locked` also refuses `gates/supply-chain/` files that are not in cargo-vet's own format: after
    a hand edit, run `cargo vet fmt`.
 
 Never run `cargo vet regenerate exemptions` to make a change pass: it exempts whatever is
@@ -102,7 +105,7 @@ Ferrofin adopted cargo-vet (2026-11); that list only shrinks. An advisory with n
 release stays a `deny.toml` ignore (above): it needs no vet entry unless the version changes
 too. The vendored `vendor/icu_collator` (a `[patch.crates-io]` copy, `PATCHED.md`) is
 audited as crates.io `icu_collator` at its version (`audit-as-crates-io` in
-`supply-chain/config.toml`): an audit or exemption covers the upstream code, and the patch
+`gates/supply-chain/config.toml`): an audit or exemption covers the upstream code, and the patch
 is Ferrofin's own code, reviewed in its PR.
 
 **Coverage gate — ≥80% line coverage, per crate:**

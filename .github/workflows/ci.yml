@@ -218,12 +218,12 @@ jobs:
       - if: ${{ !cancelled() }}
         run: scripts/check-workspace-deps.py
 
-  # cargo-vet: every crate in Cargo.lock needs an audit (supply-chain/audits.toml, or one imported
-  # from the organisations supply-chain/config.toml names) or an exemption there, so a PR that adds
-  # an unaudited crate, or moves one to an unaudited version, fails here naming it (CONTRIBUTING.md,
-  # "Dependencies"). Its result changes only with the branch, never with the date (--locked reads
-  # the committed supply-chain/imports.lock instead of fetching the imports), so unlike
-  # `dependencies` it is part of `lint` and blocks merging.
+  # cargo-vet: every crate in Cargo.lock needs an audit (gates/supply-chain/audits.toml, or one
+  # imported from the organisations gates/supply-chain/config.toml names) or an exemption there, so
+  # a PR that adds an unaudited crate, or moves one to an unaudited version, fails here naming it
+  # (CONTRIBUTING.md, "Dependencies"). Its result changes only with the branch, never with the date
+  # (--locked reads the committed gates/supply-chain/imports.lock instead of fetching the imports),
+  # so unlike `dependencies` it is part of `lint` and blocks merging.
   vet:
     if: *not-release-pr
     runs-on: ubuntu-latest
