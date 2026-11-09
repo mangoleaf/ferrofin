@@ -1020,8 +1020,8 @@ async fn agent_origin() -> String {
 }
 
 /// The `User-Agent` the relay names the server with when a source requires
-/// none (`NamedClient.Default`).
-const SERVER_AGENT: &str = concat!("Ferrofin/", env!("CARGO_PKG_VERSION"));
+/// none (`NamedClient.Default`): the release, never the crate's placeholder version.
+const SERVER_AGENT: &str = ferrofin_health::USER_AGENT;
 
 /// `GetStaticRemoteStreamResult`: a remote target that requires no
 /// `User-Agent` is relayed under the server's own, never with none at all

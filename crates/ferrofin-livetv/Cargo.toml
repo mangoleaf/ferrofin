@@ -17,6 +17,7 @@ ferrofin-traits.workspace = true
 ferrofin-model.workspace = true
 ferrofin-common.workspace = true
 ferrofin-db.workspace = true
+ferrofin-health.workspace = true
 async-trait.workspace = true
 crc32fast.workspace = true
 icu_collator.workspace = true

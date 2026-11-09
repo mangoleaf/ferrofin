@@ -131,8 +131,9 @@ const PACKAGE_NAME: &str = "ferrofin-server";
 /// The **Jellyfin server version Ferrofin reports** in `SystemInfo`/`PublicSystemInfo`
 /// (`Version`): the newest Jellyfin release Ferrofin adopts (12.4.0, whose database
 /// carries 12.2's migration-id set and adopts as generation `12.2.0`; handlers are
-/// ported from `UPSTREAM_TAG`) — NOT Ferrofin's own crate version (`CARGO_PKG_VERSION`, used only for
-/// build/log lines). Clients gate on it: jellyfin-web's SDK refuses any server below
+/// ported from `UPSTREAM_TAG`) — NOT Ferrofin's own release version
+/// (`ferrofin_health::RELEASE_VERSION`, sent in User-Agents and backups).
+/// Clients gate on it: jellyfin-web's SDK refuses any server below
 /// `MINIMUM_VERSION = 10.10.0` with an "Update Required" screen, and jellyfin-sdk-kotlin
 /// (Android TV and friends) flags anything below `Jellyfin.minimumVersion = 12.0.0`
 /// as unsupported. The route gate stays pinned to the 10.11.8 contract, which covers
@@ -674,7 +675,7 @@ pub async fn build_app_state(
     // MusicAlbum/MusicArtist "Identify" providers.
     let musicbrainz_client = Arc::new(ferrofin_providers::MusicBrainzClient::new(
         &config.musicbrainz_base_url,
-        env!("CARGO_PKG_VERSION"),
+        ferrofin_health::RELEASE_VERSION,
     ));
     // TheAudioDb — artist bio/genre + artist/album artwork by MusicBrainz id
     // (built-in free key). Shared by the scan and the "Choose Image" methods.
