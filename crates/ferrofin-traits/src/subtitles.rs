@@ -48,6 +48,10 @@ pub struct SubtitleSearchRequest {
     pub item_id: Uuid,
     /// The desired subtitle language (a three-letter ISO code).
     pub language: String,
+    /// The ISO 639-1 code of the culture `language` names, which the
+    /// [`SubtitleManager`] fills in (C# `TwoLetterISOLanguageName`): empty for
+    /// a culture with no such code (`und`), `None` when no culture matches.
+    pub two_letter_iso_language_name: Option<String>,
     /// When set, require a perfect match; when `None`, accept any match.
     pub is_perfect_match: Option<bool>,
     /// Whether the request was triggered automatically (vs. user-initiated).

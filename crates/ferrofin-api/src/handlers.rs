@@ -3623,6 +3623,39 @@ pub const VERIFIED: &[Verified] = &[
     },
     Verified {
         method: "get",
+        path: "/Items/{itemId}/RemoteSearch/Subtitles/{language}",
+        upstream_file: "Jellyfin.Api/Controllers/SubtitleController.cs",
+        upstream_method: "SearchRemoteSubtitles",
+        ferrofin: "handlers/subtitles.rs search_remote_subtitles (RequireSubtitleManagement, the \
+               SubtitleManagement policy's UserPermissionRequirement; require_video, \
+               GetItemById<Video>(itemId, User.GetUserId()): a missing, hidden or non-video \
+               item is a 404; isPerfectMatch) → ferrofin-core subtitle_manager.rs \
+               search_subtitles and enrich (SubtitleManager.SearchSubtitles, both overloads: \
+               the language's two-letter code from FindLanguageInfo, the request filled from \
+               a Movie or an Episode and [] for any other kind; every provider that supports \
+               the content type searched, results in provider order, a failing provider \
+               contributing none; Normalize's MD5 provider-name prefix on each id; \
+               isPerfectMatch's hash-match filter applied to every provider's results, \
+               where upstream leaves it to the provider, as the plugin's MatchFilter does) → \
+               ferrofin-providers opensubtitles.rs search (the OpenSubtitles plugin's Search, \
+               v25, compared for the code it derives: GetLanguage's zh-CN and pt-PT, and no \
+               search for a language without a two-letter code)",
+        date: "2026-11-09",
+        divergences: &[
+            "A DVD or Blu-ray rip or an ISO is searched; upstream returns [] unless the \
+         video's VideoType is VideoFile. Fix path: gl-1524.",
+            "The built-in OpenSubtitles provider matches the plugin it ports only in the \
+         language code it derives (GetLanguage's zh and pt rewrites and its refusal of a \
+         language with no code), not in GetLanguage's check against the API's language list; \
+         its parameters, early returns, filters, ordering and result fields differ from \
+         OpenSubtitleDownloader.Search. Fix path: gl-1525.",
+            "The 401 (no or bad token), 403 (no subtitle management) and 404 bodies are \
+         Ferrofin's error shape, not upstream's. Fix path: gl-666.",
+        ],
+        refs: &["access-filtering"],
+    },
+    Verified {
+        method: "get",
         path: "/Items/Latest",
         upstream_file: "Jellyfin.Api/Controllers/UserLibraryController.cs",
         upstream_method: "GetLatestMedia",
