@@ -434,6 +434,7 @@ impl VersionRows {
 
     /// The ids of `video`'s local alternate versions, in their link order
     /// (`LibraryManager.GetLocalAlternateVersionIds`).
+    #[cfg(test)]
     #[must_use]
     pub fn local_version_ids(&self, video: &BaseItemEntity) -> Vec<Uuid> {
         self.local_alternates(video, video)

@@ -111,6 +111,7 @@ pub enum IdDerivation {
 
 impl IdDerivation {
     /// The `FerrofinMeta.item_id_derivation` value naming this mode.
+    #[cfg(test)]
     #[must_use]
     pub fn meta_value(&self) -> &'static str {
         match self {

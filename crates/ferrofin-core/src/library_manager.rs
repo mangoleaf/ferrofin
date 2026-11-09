@@ -2812,7 +2812,6 @@ impl LibraryManager for FerrofinLibraryManager {
         &self,
         ids: &[Uuid],
         user: &ferrofin_db::entities::users::UserEntity,
-        skip_allowed_tags: bool,
     ) -> Result<Vec<Uuid>, ServiceError> {
         if ids.is_empty() {
             return Ok(Vec::new());
@@ -2824,11 +2823,7 @@ impl LibraryManager for FerrofinLibraryManager {
         let rows = self.items.retrieve_items(ids).await?;
         let allowed: std::collections::HashSet<Uuid> = rows
             .iter()
-            .zip(
-                service
-                    .parentally_allowed(&rows, user, skip_allowed_tags)
-                    .await?,
-            )
+            .zip(service.parentally_allowed(&rows, user, true).await?)
             .filter(|(_, allowed)| *allowed)
             .filter_map(|(row, _)| Uuid::parse_str(&row.id).ok())
             .collect();
@@ -6154,7 +6149,7 @@ mod tests {
         .await
         .unwrap();
         assert!(
-            base.get_parentally_allowed_item_ids(&[shown], &user, true)
+            base.get_parentally_allowed_item_ids(&[shown], &user)
                 .await
                 .is_err(),
             "no visibility service"
@@ -6169,13 +6164,13 @@ mod tests {
         let library = base.with_visibility(visibility);
         assert_eq!(
             library
-                .get_parentally_allowed_item_ids(&[hidden, missing, shown], &user, true)
+                .get_parentally_allowed_item_ids(&[hidden, missing, shown], &user)
                 .await
                 .unwrap(),
             [shown]
         );
         let parentally_allowed_item_ids = library
-            .get_parentally_allowed_item_ids(&[], &user, true)
+            .get_parentally_allowed_item_ids(&[], &user)
             .await
             .unwrap();
         assert!(
