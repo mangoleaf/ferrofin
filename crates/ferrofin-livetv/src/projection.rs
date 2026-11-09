@@ -60,7 +60,7 @@ pub struct ChannelRow {
     /// `LiveTvChannel.IsMovie`, aggregated from the programmes at refresh).
     ///
     /// This and the two kinds below are derived only by
-    /// [`crate::guide_repository::channel_rows`], and only for the kinds its
+    /// `guide_repository::channel_rows`, and only for the kinds its
     /// query filters on; everywhere else they read `false`.
     #[sqlx(default)]
     pub is_movie: bool,
