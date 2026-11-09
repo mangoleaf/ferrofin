@@ -94,7 +94,7 @@ not changed or used by these server processes.
   Both pass. Tests cover every extra discriminant, Unknown, theme exclusions,
   NULL/invalid types, zero counts, repeated owners, independent field selection,
   omitted JSON fields, chunk boundaries, query errors, and indexed access.
-- Independent review using `.claude/skills/review-loop/SKILL.md`: no findings.
+- Independent review: no findings.
 - Movie audit: `/tmp/ferrofin-extras-doc-audit.py jellyfin` and `ferrofin`.
   Add `--tv` for the series/season cases or `--browser` for the Ferrofin web test.
 - Audit artifacts: `/tmp/ferrofin-extras-doc-audit/{jellyfin,ferrofin}.json`,

@@ -62,8 +62,7 @@ implementation targets Jellyfin runtime behavior where documentation differs.
 
 ## Review and validation
 
-Each implementation phase received independent review through the repository's
-[review-loop skill](../../.claude/skills/review-loop/SKILL.md). The TV review
+Each implementation phase received an independent review loop. The TV review
 continued past three rounds with explicit user approval. All findings were
 resolved; final reviews approved the changes.
 
