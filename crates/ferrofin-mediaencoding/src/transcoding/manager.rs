@@ -307,8 +307,6 @@ struct RunningJob {
     segment_cleaner: Option<super::segment_cleaner::SegmentCleanerTask>,
     /// Dashboard details updated by stderr statistics.
     info: TranscodingInfo,
-    /// Dynamic segment paths waiting for response completion.
-    segment_endings: std::collections::HashMap<PathBuf, i64>,
     /// Per-segment end-position tracking for the segment cleaner (replaces the
     /// old division-by-segment-length estimate that deleted ahead on MKV remux).
     served_segments: std::sync::Arc<Mutex<std::collections::HashMap<i64, i64>>>,
@@ -356,7 +354,6 @@ impl RunningJob {
             start_time_ticks: state.base_request.start_time_ticks,
             segment_cleaner: None,
             info: transcoding_info(state, hardware_acceleration_type),
-            segment_endings: std::collections::HashMap::new(),
             served_segments: std::sync::Arc::new(Mutex::new(std::collections::HashMap::new())),
             output_dir,
             playlist_path,
@@ -685,30 +682,8 @@ impl<S: SessionReporter, C: FileCleaner> TranscodeManagerImpl<S, C> {
         self.pause_keys.clone()
     }
 
-    /// Associates a dynamic segment with its exact ending position.
-    ///
-    /// Resolution alone does not advance progress: the HTTP response must terminate (including cancellation).
-    ///
-    /// # Panics
-    ///
-    /// Panics if the registry lock is poisoned.
-    pub fn track_segment_download(&self, playlist: &str, file: &Path, ending_ticks: i64) {
-        let mut jobs = self.jobs.lock().expect("jobs lock poisoned");
-        if let Some(running) = jobs
-            .iter_mut()
-            .find(|job| {
-                job.handle.job_type == TranscodingJobType::Hls
-                    && job.handle.path.eq_ignore_ascii_case(playlist)
-            })
-            .and_then(|job| job.running.as_mut())
-        {
-            running
-                .segment_endings
-                .insert(file.to_path_buf(), ending_ticks);
-        }
-    }
-
-    /// Tracks reads and completion of a response produced by a registered job.
+    /// Tracks reads and completion of a progressive job's output response.
+    /// Dynamic HLS segments bind through [`Self::segment_progress`] instead.
     ///
     /// The observer releases its consumer mark on drop, including disconnects.
     ///
@@ -727,11 +702,11 @@ impl<S: SessionReporter, C: FileCleaner> TranscodeManagerImpl<S, C> {
         let file = Path::new(file);
         let mut jobs = self.jobs.lock().expect("jobs lock poisoned");
         let job = jobs.iter_mut().find(|job| {
-            job.running.as_ref().is_some_and(|running| {
-                (job.handle.job_type == TranscodingJobType::Progressive
-                    && running.playlist_path == file)
-                    || running.segment_endings.contains_key(file)
-            })
+            job.handle.job_type == TranscodingJobType::Progressive
+                && job
+                    .running
+                    .as_ref()
+                    .is_some_and(|running| running.playlist_path == file)
         })?;
         let running = job.running.as_ref()?;
         let observer = DownloadObserver {
@@ -739,7 +714,7 @@ impl<S: SessionReporter, C: FileCleaner> TranscodeManagerImpl<S, C> {
             handle: job.handle.clone(),
             child: std::sync::Arc::clone(&running.child),
             progress: std::sync::Arc::clone(&running.progress),
-            ending_ticks: running.segment_endings.get(file).copied(),
+            ending_ticks: None,
             segment_index: None,
             served_segments: std::sync::Arc::clone(&running.served_segments),
             completed: std::sync::atomic::AtomicBool::new(false),
@@ -3867,10 +3842,8 @@ pub(super) mod throttle_tests {
 
     #[tokio::test]
     async fn first_timer_waits_and_completed_download_controls_live_pause_resume() {
-        let (directory, manager, child, handle) = fixture(Some(PauseKeys::Patched)).await;
+        let (_directory, manager, child, handle) = fixture(Some(PauseKeys::Patched)).await;
         encoded(&child, 200);
-        let segment = directory.path().join("out0.ts");
-        manager.track_segment_download(&handle.path, &segment, 6 * TICKS_PER_SECOND);
         manager
             .update_transcoding_jobs_with_options(Some(&options(60)))
             .await;
@@ -3878,7 +3851,9 @@ pub(super) mod throttle_tests {
             child.events.lock().unwrap().is_empty(),
             "the initial five seconds have not elapsed"
         );
-        let observer = manager.stream_progress(segment.to_str().unwrap()).unwrap();
+        let observer = manager
+            .segment_progress(&handle.path, 6 * TICKS_PER_SECOND, 0)
+            .unwrap();
         due(&manager, &handle).await;
         manager
             .update_transcoding_jobs_with_options(Some(&options(60)))
@@ -4203,10 +4178,10 @@ pub(super) mod throttle_tests {
             .update_transcoding_jobs_with_options(Some(&options(60)))
             .await;
         assert!(child.events.lock().unwrap().is_empty());
-        let segment = directory.path().join("out0.ts");
-        manager.track_segment_download(&handle.path, &segment, 6 * TICKS_PER_SECOND);
         let old_progress = progress(&manager, &handle);
-        let observer = manager.stream_progress(segment.to_str().unwrap()).unwrap();
+        let observer = manager
+            .segment_progress(&handle.path, 6 * TICKS_PER_SECOND, 0)
+            .unwrap();
         assert_eq!(manager.jobs.lock().unwrap()[0].active_request_count, 1);
         manager.kill_and_remove(&handle, false, false).await;
         let state = state(Path::new(&handle.path));
@@ -4228,8 +4203,9 @@ pub(super) mod throttle_tests {
             )
             .await
             .unwrap();
-        manager.track_segment_download(&replacement.path, &segment, 100 * TICKS_PER_SECOND);
-        let new_observer = manager.stream_progress(segment.to_str().unwrap()).unwrap();
+        let new_observer = manager
+            .segment_progress(&replacement.path, 100 * TICKS_PER_SECOND, 0)
+            .unwrap();
         observer.complete();
         drop(observer);
         assert_eq!(
@@ -4256,13 +4232,12 @@ pub(super) mod throttle_tests {
     }
 
     #[tokio::test]
-    async fn repeated_and_out_of_order_completions_are_monotonic_and_missing_markers_are_untracked()
-    {
-        let (directory, manager, _child, handle) = fixture(None).await;
+    async fn repeated_and_out_of_order_completions_are_monotonic() {
+        let (_directory, manager, _child, handle) = fixture(None).await;
         for (index, ending) in [(9, 62), (0, 3), (4, 30)] {
-            let path = directory.path().join(format!("out{index}.ts"));
-            manager.track_segment_download(&handle.path, &path, ending * TICKS_PER_SECOND);
-            let observer = manager.stream_progress(path.to_str().unwrap()).unwrap();
+            let observer = manager
+                .segment_progress(&handle.path, ending * TICKS_PER_SECOND, index)
+                .unwrap();
             observer.complete();
             observer.complete();
         }
@@ -4274,18 +4249,8 @@ pub(super) mod throttle_tests {
             Some(62 * TICKS_PER_SECOND)
         );
         assert!(
-            manager
-                .stream_progress(directory.path().join("out99.ts").to_str().unwrap())
-                .is_none()
-        );
-        assert!(
-            manager
-                .stream_progress(directory.path().join("other/out9.ts").to_str().unwrap())
-                .is_none()
-        );
-        assert!(
             manager.stream_progress(handle.path.as_str()).is_none(),
-            "playlist fetches are not segment download progress"
+            "an HLS job's files bind through segment_progress only"
         );
     }
 

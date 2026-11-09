@@ -526,7 +526,8 @@ impl FfmpegCapabilitiesBuilder {
     }
 
     /// Sets every filter option to `supported` — the shorthand a test uses when
-    /// the options are not what it is exercising.
+    /// the options are not what it is exercising. Not `#[cfg(test)]` like its
+    /// siblings: `ferrofin-server`'s planner tests call it.
     #[must_use]
     pub fn all_filter_options(mut self, supported: bool) -> Self {
         self.caps.filter_options = [supported; FilterOption::ALL.len()];
@@ -534,6 +535,7 @@ impl FfmpegCapabilitiesBuilder {
     }
 
     /// Sets every bitstream-filter option to `supported`.
+    #[cfg(test)]
     #[must_use]
     pub fn all_bsf_options(mut self, supported: bool) -> Self {
         self.caps.bsf_options = [supported; BsfOption::ALL.len()];
@@ -570,6 +572,7 @@ impl FfmpegCapabilitiesBuilder {
     }
 
     /// Sets the three VAAPI driver-detection flags at once.
+    #[cfg(test)]
     #[must_use]
     pub fn vaapi_driver(mut self, amd: bool, intel_ihd: bool, intel_i965: bool) -> Self {
         self.caps.is_vaapi_device_amd = amd;
@@ -579,6 +582,7 @@ impl FfmpegCapabilitiesBuilder {
     }
 
     /// Sets the two VAAPI/Vulkan interop probe results.
+    #[cfg(test)]
     #[must_use]
     pub fn vaapi_vulkan(mut self, drm_modifier: bool, drm_interop: bool) -> Self {
         self.caps.vaapi_vulkan_drm_modifier = drm_modifier;
@@ -587,6 +591,7 @@ impl FfmpegCapabilitiesBuilder {
     }
 
     /// Sets whether this Mac can decode AV1 in hardware.
+    #[cfg(test)]
     #[must_use]
     pub fn videotoolbox_av1_decode(mut self, available: bool) -> Self {
         self.caps.is_videotoolbox_av1_decode = available;
