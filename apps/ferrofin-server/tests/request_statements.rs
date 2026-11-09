@@ -66,6 +66,11 @@
 //!   as upstream holds them in memory: a warm listing reads none of those rows.
 //!   With no set live, as after its TTL, a listing reads the set and caches it,
 //!   so the next listing reads none of them either (gl-1399).
+//! - `GET /Playlists/{id}/Items` and `GET /Playlists/{id}` on a playlist naming
+//!   a movie twice (gl-1492). The listing's standalone visibility check runs
+//!   over the member rows the listing read, as upstream's `IsVisible` runs
+//!   over the `GetManageableItems()` it holds, so no member row is read again
+//!   by id; the playlist's `ItemIds` come from its links, with no member row.
 
 use std::sync::Mutex;
 
@@ -119,6 +124,9 @@ const SERIES_PROVIDERS_SPAN: &str = "gl1390_series_provider_ids_request";
 /// The span the recorded unscoped listing runs in.
 const UNSCOPED_SPAN: &str = "gl1283_unscoped_listing_request";
 
+/// The span the recorded playlist reads run in.
+const PLAYLIST_SPAN: &str = "gl1492_playlist_read";
+
 /// The statements recorded inside each test's span, in order, tagged with the
 /// span: `cargo test` runs a binary's tests on threads of one process.
 static STATEMENTS: Mutex<Vec<(&'static str, String)>> = Mutex::new(Vec::new());
@@ -149,6 +157,7 @@ where
                     PLAYBACK_INFO_SPAN,
                     SERIES_PROVIDERS_SPAN,
                     UNSCOPED_SPAN,
+                    PLAYLIST_SPAN,
                 ]
                 .into_iter()
                 .find(|name| span.name() == *name)
@@ -1660,4 +1669,85 @@ async fn an_episode_page_reads_its_series_provider_ids_with_its_own() {
             "{uri} runs one BaseItemProviders IN-query: {statements:#?}"
         );
     }
+}
+
+/// A playlist's listing reads its member rows once, and the playlist itself
+/// reads none (gl-1492). The listing used to read every member's row a second
+/// time, by id, for its visibility check, and `ItemIds` read whole rows for
+/// their ids.
+#[tokio::test]
+async fn a_playlist_read_reads_its_member_rows_once() {
+    record_statements();
+    let harness = boot(&[
+        "Film Alpha (1999)/Film Alpha (1999).mkv",
+        "Film Beta (2000)/Film Beta (2000).mkv",
+    ])
+    .await;
+    let router = ferrofin_api::create_router(harness.wired.state.clone());
+    let (auth_header, user_id) = sign_in_and_scan(&harness, &router).await;
+    let (status, films) = send(
+        &router,
+        &auth_header,
+        "GET",
+        &format!(
+            "/Items?userId={user_id}&recursive=true&includeItemTypes=Movie&sortBy=ProductionYear"
+        ),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "films: {films}");
+    let [alpha, beta] =
+        [0, 1].map(|i| films["Items"][i]["Id"].as_str().expect("a film").to_owned());
+    let (status, created) = send(
+        &router,
+        &auth_header,
+        "POST",
+        "/Playlists",
+        Some(
+            serde_json::json!({ "Name": "Twice", "Ids": [alpha, beta, alpha], "UserId": user_id }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "playlist created: {created}");
+    let playlist = created["Id"].as_str().expect("playlist id");
+
+    let read = async |uri: String| {
+        clear_statements(PLAYLIST_SPAN);
+        let (status, body) = send(&router, &auth_header, "GET", &uri, None)
+            .instrument(tracing::info_span!(PLAYLIST_SPAN))
+            .await;
+        assert_eq!(status, StatusCode::OK, "{uri}: {body}");
+        (body, statements_in(PLAYLIST_SPAN))
+    };
+    let member_rows = |statements: &[String]| {
+        statements
+            .iter()
+            .filter(|s| s.starts_with("SELECT ch.*"))
+            .count()
+    };
+    // `retrieve_items`' `IN (?, …)`, not the hierarchy walk's `IN (SELECT …)`.
+    let rows_by_id = |statements: &[String]| {
+        statements
+            .iter()
+            .filter(|s| s.contains(r#"SELECT * FROM "BaseItems" WHERE "Id" IN (?"#))
+            .count()
+    };
+
+    let (page, statements) =
+        read(format!("/Playlists/{playlist}/Items?startIndex=1&limit=1")).await;
+    assert_eq!(page["TotalRecordCount"], 3, "{page}");
+    assert_eq!(page["StartIndex"], 1, "{page}");
+    assert_eq!(page["Items"][0]["Id"], beta.as_str(), "{page}");
+    assert_eq!(page["Items"][0]["PlaylistItemId"], beta.as_str(), "{page}");
+    assert_eq!(member_rows(&statements), 1, "{statements:#?}");
+    assert_eq!(rows_by_id(&statements), 0, "{statements:#?}");
+
+    let (dto, statements) = read(format!("/Playlists/{playlist}")).await;
+    assert_eq!(
+        dto["ItemIds"],
+        serde_json::json!([alpha, beta, alpha]),
+        "{dto}"
+    );
+    assert_eq!(member_rows(&statements), 0, "{statements:#?}");
+    assert_eq!(rows_by_id(&statements), 0, "{statements:#?}");
 }
