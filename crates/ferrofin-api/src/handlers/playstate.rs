@@ -18,7 +18,7 @@
 //!   downgrades it to `DirectPlay` otherwise.
 //! - `PingPlaybackSession`, the progress report's keep-alive and the stop
 //!   report's kill go to the same runtime (`PingTranscodingJob`,
-//!   `KillTranscodingJobs`) before the report reaches the [`SessionManager`].
+//!   `KillTranscodingJobs`) before the report reaches the `SessionManager`.
 
 use axum::extract::{Path, State};
 use axum::http::StatusCode;

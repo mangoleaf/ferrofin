@@ -4,7 +4,7 @@
 //! SubtitleEncoder` that the `SubtitleController` (and the streaming pipeline)
 //! call: resolve the media source for `(item, mediaSourceId)`, locate the
 //! subtitle stream by index, then delegate to the pure
-//! [`SubtitleEncoder`](super::encoder::SubtitleEncoder) for the readable-file
+//! [`SubtitleEncoder`] for the readable-file
 //! resolution, charset normalization, and format conversion.
 //!
 //! The concrete encoder is generic over its [`SubtitleParser`] and

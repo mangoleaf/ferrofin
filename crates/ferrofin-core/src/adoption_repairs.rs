@@ -666,7 +666,7 @@ async fn fold_into(
 /// [`fix_owner_id_relationships`] keeps whichever row is newer and step 2
 /// detaches the survivor, so the version vanishes from its movie until the
 /// next scan rebuilds it. Instead the standalone row is kept, the `Video`
-/// row folds into it ([`fold_into`]: both rows' user data survive) and the
+/// row folds into it (`fold_into`: both rows' user data survive) and the
 /// primary lists the path again, which is the group
 /// [`rehome_local_versions`] then completes at boot (owner, pointer, link)
 /// and the shape a 12.x scan ends at (`LibraryManager.ResolveAlternateVersion`,
@@ -754,7 +754,7 @@ pub async fn reunite_split_versions(db: &Database) -> Result<usize, ServiceError
 /// versions from `LinkedChildren`. Write the missing rows for every existing
 /// group: local (2) for a version owned by its primary (how upstream's
 /// scanner stores one), linked (3) — a merge, wherever the files are —
-/// otherwise ([`alternate_version_child_type`]). Rows already present (an
+/// otherwise (`alternate_version_child_type`). Rows already present (an
 /// adopted 12.0 database) are left alone.
 ///
 /// # Errors
@@ -1123,7 +1123,7 @@ struct GroupRow {
 ///   type derives for its path (the scan's re-key, with what is keyed by its
 ///   id and its folders; a 10.11 `Video` keeps its refresh stamp, and its
 ///   provider ids until its primary's copy replaces them — it is the same
-///   title, [`RekeyKind::Represented`]); then
+///   title, `RekeyKind::Represented`); then
 ///   it takes the primary as `OwnerId` and `PrimaryVersionId`, the
 ///   primary's `PresentationUniqueKey` (its N-format id), `ParentId`,
 ///   `TopParentId`, `IsInMixedFolder` and ancestors, and is linked under it
@@ -1145,14 +1145,14 @@ struct GroupRow {
 ///   that stops before it, is made by the next boot.
 /// - a stacked part — a row at a path in a video's `AdditionalParts` — of
 ///   another type moves to its `Video` id as the scan's re-key does
-///   ([`RekeyKind::Changed`]); then it takes the video as `OwnerId`, and the
+///   (`RekeyKind::Changed`); then it takes the video as `OwnerId`, and the
 ///   video's `ParentId`, `TopParentId` and ancestors — and its
 ///   `IsInMixedFolder` when 10.11 stored it without a parent or it was just
 ///   moved (what upstream's re-created part starts with; a 12.x part keeps
 ///   the flag it was created with, `Video.cs:690`).
 ///
 /// A row already stored at the new id is folded by the scan's rule
-/// ([`rekey_source`]). Before it changes anything on a file-backed
+/// (`rekey_source`). Before it changes anything on a file-backed
 /// database, the file is copied once to `<db>.pre-rehome` (as a
 /// table-rebuilding migration snapshots it). A batch of moves that fails is
 /// undone with its folders, its rows left for the scan, and the repair is
@@ -1354,11 +1354,11 @@ const SEASON_SNAPSHOT_EXTENSION: &str = "db.pre-season-ids";
 /// series, number and name ([`virtual_season_id`],
 /// `SeriesMetadataService.CreateSeasonAsync`, `SeriesMetadataService.cs:
 /// 449-453`), which the scan now plans for it. The scan's re-key moves it
-/// ([`rekey_rows`]): its user data, images, provider ids and locked fields,
+/// (`rekey_rows`): its user data, images, provider ids and locked fields,
 /// its episodes' `ParentId` and `SeasonId`, the ancestors naming it and the
 /// Intro Skipper's season state follow, and so do its folders named after
-/// the id ([`move_item_folders`]). Only its id changes, not what it is
-/// ([`RekeyKind::Represented`]: its refresh stamp stays).
+/// the id (`move_item_folders`). Only its id changes, not what it is
+/// (`RekeyKind::Represented`: its refresh stamp stays).
 ///
 /// A season stored under any other id — Jellyfin's own, whatever name it
 /// was created with — is left alone, as is one whose new id is already
@@ -1488,12 +1488,12 @@ const PLAYLIST_SNAPSHOT_EXTENSION: &str = "db.pre-playlist-folders";
 /// Gives each playlist an older Ferrofin created with no folder the one
 /// `PlaylistManager.CreatePlaylist` makes in `playlists`, and moves it to
 /// the id `Folder.AddChild` derives from that path
-/// ([`crate::collection_manager::new_playlist_folder_and_id`], gl-597).
+/// (`crate::collection_manager::new_playlist_folder_and_id`, gl-597).
 ///
 /// Jellyfin's rescan resolves every folder in the playlists folder to that
 /// id and deletes a playlist row it finds no folder for
 /// (`Folder.ValidateChildrenInternal`), so the path and the new id are
-/// written together, in the move's own savepoint ([`rekey_rows_at`]). The
+/// written together, in the move's own savepoint (`rekey_rows_at`). The
 /// entries, owner and shares, user data and images move with it. An upload
 /// an older Ferrofin stored in the playlist's metadata folder stays there:
 /// nothing tells it from a generated image.
@@ -1649,7 +1649,7 @@ pub struct MergedCollectionsLibrary {
 /// Upstream's library is a real one (`AddVirtualFolder` in
 /// `CollectionManager.EnsureLibraryFolder`), and a box set's parent is the
 /// plain `Folder` for that directory, a child of the aggregate root
-/// ([`crate::collections_library`]). A database whose row is the old one has
+/// (`crate::collections_library`). A database whose row is the old one has
 /// no such library, or, where an older build ran on a database adopted from
 /// Jellyfin, has both, with the box sets split between them. Either way this
 /// leaves one library: the one that lists the directory if there is one (under
@@ -1667,7 +1667,7 @@ pub struct MergedCollectionsLibrary {
 ///    brings this repair back, so a stop here is finished by the next boot,
 ///    where a row gone first would leave users naming an id nothing retries.
 /// 4. In one transaction, what hangs off the old row moves and the row goes
-///    ([`merge_into_location`](crate::library_structure_repository::merge_into_location)).
+///    (`merge_into_location`).
 ///
 /// # Errors
 /// Returns [`ServiceError`] if a step fails. The old row stays, and with it every
@@ -3436,7 +3436,7 @@ const CONFLICTING_GROUPS: &str = r#"SELECT "ItemId", "UserId" FROM "UserData"
 /// With no conflict it only marks itself done. Otherwise a file-backed
 /// database is first copied once to `<db>.pre-harmonize` (owner decision D5;
 /// upstream backs up before the routine unconditionally). The groups are then
-/// harmonized in keyset order, [`REPAIR_PARTITION`] groups per write
+/// harmonized in keyset order, `REPAIR_PARTITION` groups per write
 /// transaction (upstream: 500 per `SaveChanges`). The `FerrofinMeta` key is
 /// set only after the last partition, so a boot that dies mid-way finishes on
 /// the next one; the groups already harmonized no longer conflict and drop
@@ -3447,7 +3447,7 @@ const CONFLICTING_GROUPS: &str = r#"SELECT "ItemId", "UserId" FROM "UserData"
 /// into agreement, as upstream's `SaveUserData` does
 /// (`FerrofinUserDataManager::mutate_row`). The scanner's and the runtime's
 /// folds (`rekey_items`, `merge_one`), and the boot repair that folds after
-/// [`run_all`] (`run_rehome_local_versions`, through [`rekey_rows`]; the other
+/// [`run_all`] (`run_rehome_local_versions`, through `rekey_rows`; the other
 /// re-keying repairs only move items, which leaves their rows as they were),
 /// resolve history per key and then bring each user's rows of the kept item
 /// into agreement with the row its DTO reads (`agree_user_data`). That
@@ -7048,7 +7048,7 @@ pub struct Rebased {
 ///
 /// The previous directories come from rows whose ids survive a move and whose
 /// paths have a fixed place under program data
-/// ([`previous_program_data_dirs`]). Each path in [`PATH_COLUMNS`] under one of
+/// (`previous_program_data_dirs`). Each path in `PATH_COLUMNS` under one of
 /// them is rewritten once, from its stored value, to the same place under the
 /// matching directory of `dirs` (`{old}/root`, `{old}/metadata`, `{old}/data`,
 /// `{old}/config`), and a profile image `…/users/<name>/<file>` to

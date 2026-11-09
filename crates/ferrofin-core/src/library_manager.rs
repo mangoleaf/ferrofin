@@ -24,7 +24,7 @@
 //!   promoted in its place) or an alternate version's references moved to
 //!   its primary, then the item's (and a folder's children's) internal
 //!   metadata, then — with `delete_file_location` — its files
-//!   ([`crate::item_deletion`]; the first path's failure stops the delete
+//!   (`crate::item_deletion`; the first path's failure stops the delete
 //!   with every row in place), then the extracted data, then the rows and
 //!   everything the persistence delete takes with them (`ParentId`
 //!   descendants, the extras and stacked parts it owns).
@@ -2624,7 +2624,7 @@ impl LibraryManager for FerrofinLibraryManager {
     }
 
     /// The trait's lookup-then-check, with the item and its chain read together
-    /// ([`ItemVisibility::visible_item`]).
+    /// (`ItemVisibility::visible_item`).
     async fn get_item_by_id_for_user(
         &self,
         id: Uuid,

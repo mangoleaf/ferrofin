@@ -1,6 +1,6 @@
 //! Port of `Emby.Naming.Video.Format3DResult`.
 
-/// Helper object returned from [`crate::video::Format3DParser`].
+/// Helper object returned from `crate::video::Format3DParser`.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Format3DResult {
     /// Whether the parsed string contains 3D tokens.

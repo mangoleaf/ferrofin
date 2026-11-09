@@ -3,11 +3,11 @@
 //!
 //! Port of `Emby.Server.Implementations.Chapters.ChapterManager`. This is a thin
 //! unit-8 manager: it delegates row access to the injected
-//! [`ChapterRepository`](ferrofin_traits::persistence::ChapterRepository) and
+//! [`ChapterRepository`] and
 //! resolves an item's kind through the injected
-//! [`LibraryManager`](ferrofin_traits::library::LibraryManager) to answer
+//! [`LibraryManager`] to answer
 //! [`ChapterManager::supports`]. It converts between the persistence
-//! [`ChapterEntity`](ferrofin_db::entities::base_items::ChapterEntity) and the wire
+//! [`ChapterEntity`] and the wire
 //! [`ChapterInfo`] the trait speaks.
 //!
 //! Chapter-image reconciliation and extraction are shared by scans and the

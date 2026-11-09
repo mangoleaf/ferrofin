@@ -4,7 +4,7 @@
 //!
 //! - `GET /UserViews` — resolves the target user, fetches their views via the
 //!   [`UserViewManager`](ferrofin_traits::library::UserViewManager), projects each
-//!   to a [`BaseItemDto`] with the [`DtoService`], and returns them as a
+//!   to a [`BaseItemDto`] with the `DtoService`, and returns them as a
 //!   [`QueryResult`].
 //! - `GET /UserViews/GroupingOptions` — the user's grouping-eligible library
 //!   folders as [`SpecialViewOptionDto`] `{ Name, Id }` pairs, name-sorted.

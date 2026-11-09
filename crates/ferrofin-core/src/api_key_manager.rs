@@ -9,7 +9,7 @@
 //! - `CreateApiKey` builds a C# `ApiKey(name)`, whose constructor sets
 //!   `AccessToken = Guid.NewGuid().ToString("N")` (32 lowercase hex digits, no
 //!   hyphens) and `DateCreated = DateTime.UtcNow`. This port mirrors that exactly
-//!   ([`Uuid::new_v4().simple()`]), and also seeds `DateLastActivity` (a
+//!   (`Uuid::new_v4().simple()`), and also seeds `DateLastActivity` (a
 //!   `NOT NULL` column the EF default leaves at `now`).
 //! - `GetApiKeys` projects each row into an [`AuthenticationInfo`] with
 //!   `AppName`/`AccessToken`/`DateCreated` from the key and empty device fields,

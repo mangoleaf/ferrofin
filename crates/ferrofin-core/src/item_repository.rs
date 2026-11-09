@@ -141,7 +141,7 @@ pub type ActiveRecordingSlot = Arc<std::sync::OnceLock<ActiveRecordingSource>>;
 /// A late-bound [`ItemVisibility`]: the evaluator is built over the repository,
 /// so the repository holds it weakly (an `Arc` would be a cycle) and the
 /// composition root fills the slot once. The query scope needs it for
-/// `GetUserViews`' playlists and box-set gate (see [`scope_to_user_libraries`]).
+/// `GetUserViews`' playlists and box-set gate (see `scope_to_user_libraries`).
 pub type VisibilitySlot = Arc<std::sync::OnceLock<std::sync::Weak<ItemVisibility>>>;
 
 /// The evaluator in `slot`, while the server holds it. An empty slot (a
@@ -4646,7 +4646,7 @@ impl ItemRepository for FerrofinItemRepository {
     }
 }
 
-/// The parental half of [`append_predicates`], for the Live TV guide.
+/// The parental half of `append_predicates`, for the Live TV guide.
 #[async_trait]
 impl ParentalRestrictions for FerrofinItemRepository {
     async fn resolve(

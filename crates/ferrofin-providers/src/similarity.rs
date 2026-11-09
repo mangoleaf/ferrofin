@@ -3,7 +3,7 @@
 //! `ListenBrainzSimilarArtistProvider`.
 //!
 //! Each returns lightweight
-//! [`SimilarItemReference`](ferrofin_traits::library::SimilarItemReference)s
+//! [`SimilarItemReference`]s
 //! keyed by an external provider id; the similar-items manager resolves them
 //! against the library and merges them with the local scorer's results. A
 //! provider a library has not ticked never runs.

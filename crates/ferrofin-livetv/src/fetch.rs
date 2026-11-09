@@ -496,7 +496,7 @@ impl Default for ReqwestFetcher {
 
 impl ReqwestFetcher {
     /// Creates a fetcher over a fresh `reqwest` client presenting the
-    /// [`USER_AGENT`] product header.
+    /// `USER_AGENT` product header.
     #[must_use]
     pub fn new() -> Self {
         let client = reqwest::Client::builder()

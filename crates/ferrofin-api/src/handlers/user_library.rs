@@ -23,7 +23,7 @@
 //!
 //! The `UserData` reads and writes check `AssertCanUpdateUser` with the
 //! user-preference restriction, as `ItemsController` does
-//! ([`super::users::assert_can_update_user`]). The person on-demand metadata
+//! (`super::users::assert_can_update_user`). The person on-demand metadata
 //! refresh (`RefreshOnDemandIfNeeded`) runs in `items::get_item`, which both
 //! item routes reach. `GET /Items/Latest` ports `GetLatestMedia` (the grouping
 //! lives in the [`UserViewManager`](ferrofin_traits::library::UserViewManager)).

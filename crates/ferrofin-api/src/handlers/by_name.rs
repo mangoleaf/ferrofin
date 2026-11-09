@@ -8,7 +8,7 @@
 //!   folding the aggregated counts onto each DTO when the caller asked to filter
 //!   by item type (Jellyfin's `RequestHelpers.CreateQueryResult`).
 //! - A **single** endpoint resolving one by-name item by its route name and
-//!   projecting it with [`DtoService::get_base_item_dto`].
+//!   projecting it with `DtoService::get_base_item_dto`.
 //!
 //! This module holds the pieces those handlers share so each controller file is
 //! just its route wiring plus the manager call that differs — extracting the

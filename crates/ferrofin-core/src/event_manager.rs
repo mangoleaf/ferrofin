@@ -5,7 +5,7 @@
 //! runtime type and awaits each in turn, swallowing (logging) any consumer
 //! exception so one bad subscriber never breaks publication.
 //!
-//! The [`EventManager`](ferrofin_traits::events::EventManager) trait collapses the
+//! The [`EventManager`] trait collapses the
 //! generic `Publish<T>` / `PublishAsync<T>` to a single non-generic
 //! `publish(event_type, payload)` (see the trait docs). This port mirrors the
 //! C# fan-out with a name-keyed subscriber registry: consumers register a

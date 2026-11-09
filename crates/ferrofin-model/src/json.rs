@@ -205,7 +205,7 @@ pub mod datetime {
         WireText::new(value).as_str().into_owned()
     }
 
-    /// Writes [`format`]'s text, from a stack buffer: nothing is allocated.
+    /// Writes [`format()`]'s text, from a stack buffer: nothing is allocated.
     ///
     /// # Errors
     ///

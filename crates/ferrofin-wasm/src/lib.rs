@@ -266,7 +266,7 @@ pub struct LoadedPlugin {
     pub tasks: Vec<bindings::types::TaskDescriptor>,
     /// The guest's authored dashboard settings pages (may be empty — the
     /// host synthesizes a generic JSON editor in that case; see
-    /// [`fallback_config_page`]).
+    /// `fallback_config_page`).
     pub config_pages: Vec<bindings::types::ConfigPage>,
     /// The guest's declared web-file transformations (applied by the host
     /// while the plugin is enabled; see the WIT trust note).
@@ -614,7 +614,7 @@ impl WasmPluginHost {
 
     /// Subscribes every loaded plugin to the [`FORWARDED_EVENTS`] on the
     /// event manager (`LibraryChanged` from the notifier's batches, see
-    /// [`bus_event`]). Delivery follows the composition root's established
+    /// `bus_event`). Delivery follows the composition root's established
     /// non-blocking pattern: the consumer spawns, checks the enabled flag,
     /// and `try_send`s into the plugin's bounded queue — publication never
     /// waits on a guest.
@@ -2041,7 +2041,7 @@ impl WasmPluginHost {
     }
 }
 
-/// The [`PluginRequestHandler`] implementation: routes requests from
+/// The `PluginRequestHandler` implementation: routes requests from
 /// `/Plugins/{id}/web/…` to the owning plugin's `handle-request` export.
 /// Unknown or DISABLED plugins yield `Ok(None)` (the transport 404s) — the
 /// kill switch disarms this surface exactly like settings pages.

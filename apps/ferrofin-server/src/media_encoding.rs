@@ -8,7 +8,7 @@
 //! [`StreamStatePlanner`](ferrofin_hls::StreamStatePlanner) seam
 //! (`TokioSegmentTranscoder` → `TranscodeManagerImpl` → `HlsStreamManagerImpl`)
 //! is already ported in `ferrofin-mediaencoding`/`ferrofin-hls`; this unit builds the
-//! concrete [`FerrofinStreamStatePlanner`](crate::planner::FerrofinStreamStatePlanner)
+//! concrete [`FerrofinStreamStatePlanner`]
 //! that feeds it and the two small server-local adapters the attachment extractor
 //! needs (a [`MediaSourceResolver`] over the [`MediaSourceManager`] and a real
 //! ffmpeg/filesystem [`AttachmentIo`]).
@@ -276,7 +276,7 @@ fn spawn_pause_key_probe(
 ///
 /// Returns `(hls, attachments)`:
 /// - `hls` — the [`HlsStreamManagerImpl`] wiring the
-///   [`FerrofinStreamStatePlanner`](crate::planner::FerrofinStreamStatePlanner) →
+///   [`FerrofinStreamStatePlanner`] →
 ///   [`TokioSegmentTranscoder`] → [`TranscodeManagerImpl`] →
 ///   [`DynamicHlsPlaylistGenerator`] chain (the real transcode runtime, not the
 ///   `DisabledHlsStreamManager` stub);
@@ -285,7 +285,7 @@ fn spawn_pause_key_probe(
 ///   [`MediaSourceManager`] (not the `DisabledAttachmentExtractor` stub).
 ///
 /// The `NoopSessionReporter` stands in only when no session manager was
-/// injected. With one, [`LiveStreamReleasingReporter`] publishes a starting
+/// injected. With one, `LiveStreamReleasingReporter` publishes a starting
 /// job to the session layer and releases its live stream on teardown;
 /// killed-job partial-file cleanup is the manager's `FsFileCleaner`.
 ///

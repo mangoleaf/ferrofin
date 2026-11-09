@@ -6,7 +6,7 @@
 //! credits windows, compare them within the season via [`ferrofin_chromaprint`],
 //! and store the shared regions in the plugin's own segment tier
 //! ([`ferrofin_traits::intro_skipper`]), publishing them as `Intro`/`Outro`
-//! [`MediaSegmentDto`](ferrofin_model::media_segments::MediaSegmentDto)s — which is
+//! [`MediaSegmentDto`]s — which is
 //! what makes jellyfin-web show the "Skip Intro" / "Skip Credits" button.
 //!
 //! It surfaces on `/Plugins` as "Intro Skipper"; its analysis runs as the

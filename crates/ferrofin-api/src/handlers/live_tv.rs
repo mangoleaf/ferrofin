@@ -1,7 +1,7 @@
 //! `LiveTvController` — Ferrofin's M3U-tuner + XMLTV-guide Live TV.
 //!
 //! The read/query surface (info, channels, programs, recommended) is served from
-//! the real [`LiveTvManager`] when the composition root has wired it; until then
+//! the real `LiveTvManager` when the composition root has wired it; until then
 //! (or when nothing is configured) it returns the honest empty/disabled state so
 //! the web UI still works. The configuration surface — add/delete a tuner host or
 //! listing provider — and the single-resource `{id}` lookups are backed by the
@@ -17,7 +17,7 @@
 //! `/LiveTv/Programs/Recommended`) bind the contract's whole filter set — channel
 //! ids, the start/end date window, the airing/kind flags, genres, paging and
 //! sort — and carry it into the `InternalItemsQuery` the manager seam takes; see
-//! [`query_programs`]. Three divergences are deliberate and documented at their
+//! `query_programs`. Three divergences are deliberate and documented at their
 //! handlers: `GET /LiveTv/Channels` cannot page (its seam method takes no
 //! query), `Programs/Recommended` does not apply upstream's per-user
 //! recommendation *score* re-ordering (it needs channel user-data the seam does

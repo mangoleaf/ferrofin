@@ -41,7 +41,7 @@
 //! `DisableLiveTvChannelUserDataName` is false. It defaults to **true**
 //! (`ServerConfiguration.cs:91`), so a stock server keys a channel by its id
 //! alone. The configuration manager publishes the setting
-//! ([`set_live_tv_channel_user_data_name_disabled`]) when it loads and on every
+//! (`set_live_tv_channel_user_data_name_disabled`) when it loads and on every
 //! save, as upstream reads it live, and callers carry it on
 //! [`KeySource::channel_name_key`].
 //!

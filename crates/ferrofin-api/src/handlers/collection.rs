@@ -13,7 +13,7 @@
 //! `401`, a caller without the permission `403`). Item id
 //! lists arrive as the comma-delimited `ids` query parameter (Jellyfin's
 //! `CommaDelimitedCollectionModelBinder`) and are split via
-//! [`parse_csv_uuids`](crate::handlers::query_parse::parse_csv_uuids). The work
+//! `parse_csv_uuids`. The work
 //! is delegated to the [`CollectionManager`](ferrofin_traits::collections::CollectionManager)
 //! seam on [`AppState`].
 

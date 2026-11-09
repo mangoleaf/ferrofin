@@ -198,8 +198,8 @@ impl<F: FileMeta> ImageProcessor<F> {
         self
     }
 
-    /// Overrides the [`cache_version`](DEFAULT_CACHE_VERSION) stamped into cache
-    /// keys. Bumping it invalidates every previously-cached resized image.
+    /// Overrides the `cache_version` (default `DEFAULT_CACHE_VERSION`) stamped
+    /// into cache keys. Bumping it invalidates every previously-cached resized image.
     #[must_use]
     pub fn with_cache_version(mut self, version: char) -> Self {
         self.cache_version = version;

@@ -6,7 +6,7 @@
 //!   [`QueryResult<BaseItemDto>`].
 //! - `GET /Years/{year}` — a single year by value.
 //!
-//! Each year is projected through [`DtoService::get_item_by_name_dto`] like the
+//! Each year is projected through `DtoService::get_item_by_name_dto` like the
 //! other by-name browses; the year rows come from
 //! [`LibraryManager::get_years`](ferrofin_traits::library::LibraryManager::get_years).
 

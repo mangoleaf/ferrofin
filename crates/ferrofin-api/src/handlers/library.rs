@@ -12,7 +12,7 @@
 //!   the item (Jellyfin 12.1, outside the 10.11.8 contract).
 //! - `POST /Library/Refresh` — queues a full library scan.
 //! - `GET /Library/MediaFolders` — the server's media (collection) folders,
-//!   name-sorted, projected to [`BaseItemDto`](ferrofin_model::dto::BaseItemDto).
+//!   name-sorted, projected to [`BaseItemDto`].
 //! - `GET /Library/PhysicalPaths` — the physical on-disk locations of every
 //!   virtual folder, from the
 //!   [`VirtualFolderManager`](ferrofin_traits::library::VirtualFolderManager) seam

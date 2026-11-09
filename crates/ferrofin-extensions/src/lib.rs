@@ -4,7 +4,7 @@
 //!
 //! An [`Extension`] is a repo-curated capability that **surfaces as a plugin** on
 //! the frozen `/Plugins` API (enable/disable toggle, config page) via the
-//! existing [`PluginManager`](ferrofin_traits::plugins::PluginManager), and can
+//! existing [`PluginManager`], and can
 //! contribute background [`ScheduledTask`]s. The set is static —
 //! [`builtin_extensions`] — but each is enable/disable-able at runtime; a task
 //! self-gates on its plugin's enabled flag, so toggling needs no restart.

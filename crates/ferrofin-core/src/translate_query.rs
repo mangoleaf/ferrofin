@@ -139,7 +139,7 @@ pub enum QueryShape {
     /// Select `bi."Type", COUNT(*)` grouped by type — the per-type counts in one
     /// query, without materializing every matching row. No `ORDER BY` / paging.
     TypeCounts,
-    /// Select the columns of [`EPISODE_ORDER_SELECT`]: the rows and order of
+    /// Select the columns of `EPISODE_ORDER_SELECT`: the rows and order of
     /// [`QueryShape::FullRows`], with only the columns a season's episode
     /// filter and the aired-order sort read.
     EpisodeOrder,

@@ -2,13 +2,13 @@
 //!
 //! Ports Jellyfin's `SyncPlayController`. Group lifecycle (`New`/`Join`/`Leave`/
 //! `List`/`{id}`) and the 17 playback requests all resolve the caller's session
-//! ([`sync_play_session`]) and drive the real [`SyncPlayManager`], which mutates
+//! (`sync_play_session`) and drive the real [`SyncPlayManager`], which mutates
 //! live group state and pushes `SyncPlayCommand`/`SyncPlayGroupUpdate` messages
 //! to member sockets via the session message bus.
 //!
 //! Every route is gated by the user's `SyncPlayAccess` policy first — the C#
 //! `[Authorize(Policy = Policies.SyncPlay*)]` attributes, which land here as
-//! [`require_access`] because Ferrofin has no attribute-driven policy layer.
+//! `require_access` because Ferrofin has no attribute-driven policy layer.
 //!
 //! The manager is wired at the composition root
 //! ([`AppState::with_sync_play`](crate::state::AppState::with_sync_play)); until

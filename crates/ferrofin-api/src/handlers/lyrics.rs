@@ -15,7 +15,7 @@
 //! administrator or an API key passes without it, so this is what stops any
 //! other account overwriting or deleting another user's lyrics.
 //!
-//! Every route is backed by the [`LyricManager`] (the item's `Lyric` streams,
+//! Every route is backed by the `LyricManager` (the item's `Lyric` streams,
 //! which the audio probe records from its `.lrc`/`.txt` sidecars, plus the
 //! registered remote providers such as LrcLib). After a write the track's
 //! metadata refresh re-probes its lyric streams, as the C# flow does: upload

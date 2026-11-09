@@ -15,7 +15,7 @@
 //! - The `HttpContext` argument becomes the transport-agnostic
 //!   [`RequestContext`]; the connection is a `&dyn `[`WebSocketConnection`]. On
 //!   connect, the token/device/endpoint are read from the connection's captured
-//!   [`AuthorizationInfo`], the session is resolved via
+//!   `AuthorizationInfo`, the session is resolved via
 //!   [`SessionManager::get_session_by_authentication_token`], and the connection
 //!   is attached through
 //!   [`FerrofinSessionManager::add_web_socket`](crate::session_manager::FerrofinSessionManager::add_web_socket)

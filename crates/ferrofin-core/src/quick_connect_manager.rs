@@ -7,16 +7,16 @@
 //! This unit-8 impl keeps the two C# `ConcurrentDictionary`s (pending requests
 //! keyed by code, authorized sessions keyed by secret) behind a [`Mutex`], gates
 //! everything on the injected
-//! [`ServerConfigurationManager`](ferrofin_traits::configuration::ServerConfigurationManager)'s
+//! [`ServerConfigurationManager`]'s
 //! `quick_connect_available` flag, and delegates the actual session creation to
-//! the injected [`SessionManager`](ferrofin_traits::session::SessionManager)'s
+//! the injected [`SessionManager`]'s
 //! `authenticate_direct` (as the C# manager delegates to `AuthenticateDirect`).
 //!
 //! The trait's [`QuickConnect::get_authorized_request`] returns the
 //! [`AuthenticationResultData`] minted at authorization (the C#
 //! `AuthenticationResult`, whose `User`/`ServerId` the API layer adds).
 //!
-//! Expiry uses the same [`REQUEST_TIMEOUT_MINUTES`] window as C# (`Timeout = 10`);
+//! Expiry uses the same `REQUEST_TIMEOUT_MINUTES` window as C# (`Timeout = 10`);
 //! stale requests and secrets are swept lazily on each state-changing call.
 //!
 //! Two accepted divergences harden the anonymous `POST /QuickConnect/Initiate`.

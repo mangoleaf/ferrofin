@@ -15,7 +15,7 @@ use crate::media_info::TransportStreamTimestamp;
 
 /// Parses a [`VideoRangeType`] from its wire name, case-insensitively.
 ///
-/// Public wrapper over [`parse_video_range_type`] for reuse by `StreamInfo`.
+/// Public wrapper over `parse_video_range_type` for reuse by `StreamInfo`.
 #[must_use]
 pub fn parse_video_range_type_pub(value: &str) -> Option<VideoRangeType> {
     parse_video_range_type(value)

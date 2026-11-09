@@ -14,7 +14,7 @@
 //!   gated, behind the [`DirectoryService`] seam.
 //! - [`fetch`](PhotoProvider::fetch) → the `FetchAsync` body: set the Primary
 //!   image path, then backfill zero/negative width/height from the
-//!   [`ImageProcessor`](ferrofin_traits::drawing::ImageProcessor).
+//!   [`ImageProcessor`].
 //!
 //! # Always-on vs. conditional
 //!
@@ -251,7 +251,7 @@ fn last_write_time(path: &str) -> DateTime<Utc> {
 /// Metadata provider for photos — the embedded-information provider.
 ///
 /// Port of `Emby.Photos.PhotoProvider`. Holds the shared
-/// [`ImageProcessor`](ferrofin_traits::drawing::ImageProcessor) used to probe
+/// [`ImageProcessor`] used to probe
 /// image dimensions when the item's stored width/height are unknown.
 pub struct PhotoProvider {
     /// The image processor used for dimension probing. Port of the injected
@@ -302,7 +302,7 @@ impl PhotoProvider {
     /// item's file, dated by its last write time and with an existing image's
     /// size reset, then — when the stored width or height is `<= 0` — probe the
     /// primary image's dimensions through the
-    /// [`ImageProcessor`](ferrofin_traits::drawing::ImageProcessor) and write back
+    /// [`ImageProcessor`] and write back
     /// any positive result. A "format not supported" probe error
     /// ([`ServiceError::invalid_input`], the analogue of the C# `catch
     /// (ArgumentException)`) is swallowed, leaving the dimensions untouched;
@@ -310,7 +310,7 @@ impl PhotoProvider {
     ///
     /// The C# `ImageUpdate | MetadataImport` combined result collapses to
     /// [`ItemUpdateType::ImageUpdate`] — the non-`[Flags]`
-    /// [`ItemUpdateType`](ferrofin_traits::providers::ItemUpdateType) port has no
+    /// [`ItemUpdateType`] port has no
     /// combined variant.
     ///
     /// # Errors
@@ -371,7 +371,7 @@ impl PhotoProvider {
 
 /// The EXIF fields read off one file, plus the image dimensions the tags carry.
 ///
-/// A flat intermediate so the tag→item mapping ([`apply_exif`]) stays pure and
+/// A flat intermediate so the tag→item mapping (`apply_exif`) stays pure and
 /// unit-testable without a file on disk.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct ExifTags {

@@ -1026,7 +1026,7 @@ impl FerrofinItemPersistenceService {
 
     /// Installs the server's [`VirtualPathExpander`], so a save keeps the
     /// `%MetadataPath%`/`%AppDataPath%` form an adopted row stores while the
-    /// saved path is still its expansion ([`Self::upsert_item`]). Called once
+    /// saved path is still its expansion (`Self::upsert_item`). Called once
     /// by the composition root; without it every save writes the path it is
     /// given.
     ///
@@ -1083,7 +1083,7 @@ impl FerrofinItemPersistenceService {
     /// Rewrites `BaseItems.CleanName` from `Name` (rows with a non-empty
     /// name, `Id` order) and then `ItemValues.CleanValue` from `Value`
     /// (non-empty values, `ItemValueId` order) with [`get_clean_value`], in
-    /// partitions of [`REPAIR_PARTITION`] rows, writing only the rows whose
+    /// partitions of `REPAIR_PARTITION` rows, writing only the rows whose
     /// stored column disagrees — exactly the routine's loop, with each
     /// partition's updates committed as one transaction where EF's
     /// `SaveChangesAsync` runs per partition upstream. A whitespace-only source
@@ -1232,7 +1232,7 @@ impl FerrofinItemPersistenceService {
     /// (`Jellyfin.Server/Migrations/Routines/20260722120000_RefreshForcedSortNames.cs`).
     ///
     /// For every `BaseItems` row with a non-empty `ForcedSortName` (`Id`
-    /// order, partitions of [`REPAIR_PARTITION`]) recomputes `SortName` as
+    /// order, partitions of `REPAIR_PARTITION`) recomputes `SortName` as
     /// `GetSortName(ForcedSortName, Type != Person)` —
     /// [`crate::kinds::forced_sort_name_for`] — and writes it only when it
     /// differs from the stored value. 10.11.8 derived a forced sort name with

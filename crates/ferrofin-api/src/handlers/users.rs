@@ -21,7 +21,7 @@
 //!
 //! Port notes:
 //! - `AuthenticateNewSession` returns an [`AuthenticationResult`] in C#; the
-//!   ported [`SessionManager::authenticate_new_session`] returns an
+//!   ported `SessionManager::authenticate_new_session` returns an
 //!   [`AuthenticationResultData`] (session DTO + minted access token), which the
 //!   handler assembles into the wire [`AuthenticationResult`] — the client gets a
 //!   real `AccessToken` to present on subsequent requests.
@@ -37,7 +37,7 @@
 //!   `UserDto` it builds, and the authentication result takes it from the
 //!   session.
 //! - A refused login answers as upstream's `ExceptionMiddleware` does, with no
-//!   reason in the body ([`login_failure`]).
+//!   reason in the body (`login_failure`).
 
 use axum::extract::{Path, State};
 use axum::http::request::Parts;

@@ -52,7 +52,7 @@ use ferrofin_providers::FileSystemMetadata;
 use ferrofin_traits::error::ServiceError;
 use ferrofin_traits::filesystem::{FileMetadata, FileSystem, OpenedFile};
 
-/// The bounds of a [`DirectoryCache`] (`DirectoryService`'s
+/// The bounds of a `DirectoryCache` (`DirectoryService`'s
 /// `MaxCachedRecords` and `IdleTimeoutMs`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DirectoryCacheLimits {

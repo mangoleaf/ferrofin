@@ -23,7 +23,7 @@ use crate::encoding_helper::hw::{BsfOption, FilterOption};
 
 /// The minimum recommended ffmpeg version (`4.4`).
 ///
-/// When changing this, also change [`FFMPEG_MINIMUM_LIBRARY_VERSIONS`].
+/// When changing this, also change `FFMPEG_MINIMUM_LIBRARY_VERSIONS`.
 pub const MIN_VERSION: FfmpegVersion = FfmpegVersion::new(4, 4);
 
 /// The maximum recommended ffmpeg version (unbounded — C# `MaxVersion` is `null`).
@@ -342,7 +342,7 @@ impl EncoderValidator {
     ///
     /// For pre-built binaries the version is at the very start of the output and
     /// is parsed directly. Otherwise the library versions are matched against
-    /// [`FFMPEG_MINIMUM_LIBRARY_VERSIONS`]; if every required library is present
+    /// `FFMPEG_MINIMUM_LIBRARY_VERSIONS`; if every required library is present
     /// and at least its minimum, [`MIN_VERSION`] is returned, else `None`.
     /// Mirrors C# `GetFFmpegVersionInternal`.
     #[must_use]

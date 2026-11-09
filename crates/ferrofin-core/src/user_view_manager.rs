@@ -16,7 +16,7 @@
 //!
 //! The views follow the user's display preferences: libraries the user grouped
 //! (`GroupedFolders`) become one Movies and one TV Shows view
-//! ([`FerrofinUserViewManager::with_grouped_views`]), hidden views
+//! (`FerrofinUserViewManager::with_grouped_views`), hidden views
 //! (`MyMediaExcludes`) are left out, and the saved order (`OrderedViews`) is
 //! kept.
 //!

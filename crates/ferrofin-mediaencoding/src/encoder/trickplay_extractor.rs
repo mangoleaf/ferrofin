@@ -432,7 +432,7 @@ impl<T: Transcoder> TrickplayFrameExtractorImpl<T> {
 /// Mirrors the software branch of the C# `ExtractVideoImagesOnIntervalInternal`
 /// format string: `-loglevel error {input} -an -sn {filter} -threads {t}
 /// -c:v mjpeg -qscale:v {q}{sync} -f image2 "{out}"`, where `{sync}` is the
-/// version-gated [`video_sync_option`]. The `fps` rate is the
+/// version-gated `video_sync_option`. The `fps` rate is the
 /// exact rational `1000/interval_ms`; the `scale` expression is Jellyfin's
 /// width-bounded software scaler (`trunc(min(max(iw,ih*dar),W)/2)*2` by
 /// `trunc(ow/dar/2)*2`), which keeps both dimensions even and honours
@@ -440,9 +440,9 @@ impl<T: Transcoder> TrickplayFrameExtractorImpl<T> {
 /// JPEG's BT.601 matrix on ffmpeg 5.1 and later (the module's departures).
 ///
 /// `pts_frame_rate` is `Some` when the timestamps are rebuilt in front of the
-/// sampler (keyframe-only extraction configured off; see [`pts_normalizer`]).
+/// sampler (keyframe-only extraction configured off; see `pts_normalizer`).
 /// `map_index` is the video stream's ffmpeg index, mapped right after the
-/// input (` -map 0:N`, [`map_argument`]).
+/// input (` -map 0:N`, `map_argument`).
 ///
 /// `deinterlace` is the software deinterlacer for an interlaced source
 /// (`GetSwDeinterlaceFilter`, which `GetSwVidFilterChain` adds whenever
@@ -662,11 +662,11 @@ pub struct TrickplayJob<'a> {
     /// `false` and retry, as upstream does.
     pub keyframe_only: bool,
     /// `Some(rate)` when the timestamps are rebuilt in front of the `fps=`
-    /// sampler ([`pts_normalizer`]). Decided by the CONFIGURED keyframe-only
+    /// sampler (`pts_normalizer`). Decided by the CONFIGURED keyframe-only
     /// flag, not by `keyframe_only`: upstream builds the filter once, so the
     /// standard-way retry of a keyframe-only job carries none.
     pub pts_frame_rate: Option<f32>,
-    /// The video stream's ffmpeg input index ([`map_argument`]).
+    /// The video stream's ffmpeg input index (`map_argument`).
     pub map_index: Option<i32>,
 }
 
@@ -1169,7 +1169,7 @@ impl<T: Transcoder> TrickplayFrameExtractor for TrickplayFrameExtractorImpl<T> {
     }
 
     /// Makes every width from one decode when their runs can share it
-    /// ([`combined_args`]; the module's departures), and each width with a
+    /// (`combined_args`; the module's departures), and each width with a
     /// run of its own otherwise, or when the shared run fails.
     async fn extract_trickplay_frame_sets(
         &self,

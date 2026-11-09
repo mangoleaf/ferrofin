@@ -2,9 +2,9 @@
 //! `TrickplayInfos` table **plus** real tile generation.
 //!
 //! Port of `Jellyfin.Server.Implementations.Trickplay.TrickplayManager`. The
-//! metadata rows ([`TrickplayInfoEntity`](ferrofin_db::entities::playback::TrickplayInfoEntity))
+//! metadata rows ([`TrickplayInfoEntity`])
 //! are stored/listed/deleted directly over `ferrofin-db` (there is no separate
-//! repository trait for this leaf table); [`Self::refresh_trickplay_data`] is
+//! repository trait for this leaf table); `Self::refresh_trickplay_data` is
 //! the real `RefreshTrickplayDataAsync` port: extract thumbnails through the
 //! [`TrickplayFrameExtractor`] seam (ffmpeg in production), pack them into tile
 //! grids through the [`ImageEncoder`] seam (`CreateTrickplayTile`), write them

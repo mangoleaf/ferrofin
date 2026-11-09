@@ -213,7 +213,7 @@ pub fn try_parse_to_subnet(value: &str, negated: bool) -> Option<IpData> {
 /// polarity (`NetworkUtils.TryParseToSubnets`).
 ///
 /// Off-polarity entries are skipped silently; entries matching this pass that
-/// fail to parse are reported through `logger` (see [`log_invalid_subnet`]).
+/// fail to parse are reported through `logger` (see `log_invalid_subnet`).
 /// Returns `None` when nothing parsed (mirroring the C# `NotNullWhen` contract).
 #[must_use]
 pub fn try_parse_to_subnets(

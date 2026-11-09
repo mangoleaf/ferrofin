@@ -23,7 +23,7 @@
 //! - `GetImageSize` returns [`ImageDimensions::default`] (`0×0`) on a zero-byte or
 //!   undecodable file, exactly like the Skia `return default;` fallbacks.
 //! - `CreateSplashscreen` builds `{DataPath}/splashscreen.png` (see
-//!   [`crate::splashscreen`]). `GetImageBlurHash` is implemented (decode → 128x128 resize → BlurHash-encode);
+//!   `crate::splashscreen`). `GetImageBlurHash` is implemented (decode → 128x128 resize → BlurHash-encode);
 //!   its output is valid but not byte-identical to Skia's (see the method doc).
 //! - A JPEG headed for a blur hash, a smaller `EncodeImage` output, a collage
 //!   cell or a splashscreen tile is decoded at the smallest DCT scale (1/8,
@@ -36,7 +36,7 @@
 //!   which upstream has no counterpart for. An image they refuse is
 //!   [`ServiceError::InvalidInput`], and the processor serves the original.
 //! - `EncodeImage`'s background colour, blur and foreground layer are drawn
-//!   after the resize ([`composite`]); its unplayed/percent-played indicators
+//!   after the resize (`composite`); its unplayed/percent-played indicators
 //!   are not (gl-806), so a request for one alone is resized and re-encoded
 //!   undecorated.
 
@@ -1279,11 +1279,11 @@ impl ImageEncoder for ImageCrateEncoder {
     /// upright size. `orientation` is unused: Skia falls back to it only when
     /// the codec cannot open the file, and then has no bitmap to draw either.
     /// The background colour, blur and foreground layer are drawn after the
-    /// resize ([`composite`]); the played/unplayed indicators are not (gl-806).
+    /// resize (`composite`); the played/unplayed indicators are not (gl-806).
     ///
     /// A JPEG is sized from its header and decoded only once the target is
     /// known, at the smallest DCT scale still covering twice it
-    /// ([`THUMBNAIL_DECODE_FACTOR`]); the resize after it is the same Lanczos3
+    /// (`THUMBNAIL_DECODE_FACTOR`); the resize after it is the same Lanczos3
     /// shrink. Upstream decodes in full here
     /// (`SkiaEncoder.Decode`); the output size is the same either way.
     async fn encode_image(
@@ -1338,7 +1338,7 @@ impl ImageEncoder for ImageCrateEncoder {
     /// Port of `CreateImageCollage`. Dispatches on the width/height ratio: a
     /// `>= 1.4` ratio builds a horizontal thumb strip, anything else a `2×2`
     /// square collage. The thumb strip's library-name text is not drawn yet
-    /// (see [`build_thumb_collage`]).
+    /// (see `build_thumb_collage`).
     async fn create_image_collage(
         &self,
         options: &ImageCollageOptions,
@@ -1365,8 +1365,8 @@ impl ImageEncoder for ImageCrateEncoder {
     }
 
     /// Port of `CreateSplashscreen`: builds `{DataPath}/splashscreen.png`
-    /// ([`crate::splashscreen`]) when there is at least one poster and one
-    /// backdrop, and does nothing otherwise. [`Self::write`] lands it whole, so
+    /// (`crate::splashscreen`) when there is at least one poster and one
+    /// backdrop, and does nothing otherwise. `Self::write` lands it whole, so
     /// a reader never sees half a PNG.
     async fn create_splashscreen(
         &self,

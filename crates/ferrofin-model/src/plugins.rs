@@ -26,7 +26,7 @@ pub enum PluginStatus {
     Deleted,
     /// This plugin has been superseded by another version.
     Superseded,
-    /// [DEPRECATED] See [`PluginStatus::Superseded`].
+    /// `DEPRECATED` See [`PluginStatus::Superseded`].
     Superceded,
     /// This plugin caused an error when instantiated.
     Malfunctioned,

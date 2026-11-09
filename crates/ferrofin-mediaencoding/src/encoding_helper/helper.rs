@@ -346,7 +346,7 @@ impl<C: EncoderCapabilities> EncodingHelper<C> {
     ///
     /// Port of `GetVideoBitrateParamValue`: caps a requested bitrate to the
     /// source bitrate unless upscaling, applies the codec-efficiency scale
-    /// factor, and clamps to [`MAX_SANE_BITRATE`].
+    /// factor, and clamps to `MAX_SANE_BITRATE`.
     #[must_use]
     pub fn video_bitrate_param_value(
         &self,

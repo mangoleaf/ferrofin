@@ -1,7 +1,7 @@
 //! Real ported handlers for the First-Light routes.
 //!
 //! Each submodule mirrors one `Jellyfin.Api` controller and holds axum handlers
-//! that call the [`AppState`](crate::state::AppState) manager traits, project
+//! that call the [`AppState`] manager traits, project
 //! results through [`DtoService`](ferrofin_traits::dto::DtoService), and return
 //! the wire DTOs from `ferrofin-model`. These are the routes with *real* behaviour
 //! (the rest of the contract stays on the shared `not_implemented` `501` stub);

@@ -1,4 +1,4 @@
-//! [`FerrofinDtoService`] — the concrete [`DtoService`] (entity → `BaseItemDto`).
+//! [`FerrofinDtoService`] — the concrete `DtoService` (entity → `BaseItemDto`).
 //!
 //! Port of `Emby.Server.Implementations.Dto.DtoService`. This is the presentation
 //! seam: it turns a persisted [`BaseItemEntity`] row into the wire-shaped
@@ -42,7 +42,7 @@
 //! which `CanDelete` already reads), the rewrite is not applied yet. LiveTV
 //! channel/programme enrichment runs through the late-bound Live TV manager,
 //! and `CanDelete` is upstream's `CanDelete(user)` in full
-//! ([`crate::item_deletion::can_delete`]). Everything else — the full
+//! (`crate::item_deletion::can_delete`). Everything else — the full
 //! field/image/user-data/people/media-source/chapter/trickplay mapping — is
 //! ported.
 

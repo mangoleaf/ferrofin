@@ -780,7 +780,7 @@ pub fn read_book_cover(path: &str) -> Option<(String, Vec<u8>)> {
 }
 
 /// A comic archive's cover (`ComicImageProvider`): an entry named
-/// `cover.<ext>`, else its first page in key order ([`pick_cover`]). The
+/// `cover.<ext>`, else its first page in key order (`pick_cover`). The
 /// archive is opened as what its content is — ZIP, 7z or tar — whatever its
 /// comic extension says. `None` for anything else, a RAR archive included,
 /// or an archive with no image.

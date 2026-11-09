@@ -1,4 +1,4 @@
-//! [`FerrofinSystemManager`] — the concrete [`SystemManager`].
+//! [`FerrofinSystemManager`] — the concrete `SystemManager`.
 //!
 //! Port of `Emby.Server.Implementations.SystemManager`. Assembles the
 //! [`SystemInfo`]/[`PublicSystemInfo`] responses, reports storage usage, and
@@ -10,7 +10,7 @@
 //! - `IServerConfigurationManager` → the injected [`ServerConfigurationManager`]
 //!   (startup-wizard flag, cast-receiver apps, transcode temp path).
 //! - `IServerApplicationPaths` → the concrete
-//!   [`FerrofinServerApplicationPaths`](crate::app_paths::FerrofinServerApplicationPaths)
+//!   [`FerrofinServerApplicationPaths`]
 //!   (program-data/web/log/cache/metadata folders for storage info).
 //! - `IHostApplicationLifetime` → the injected [`LifecycleController`] seam
 //!   (`StopApplication`, restart flag). Not a ferrofin-traits trait — the C#

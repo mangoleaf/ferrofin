@@ -75,7 +75,7 @@ impl SeedOutcome {
 ///    ready-to-use admin. Otherwise leave the admin **passwordless** (Jellyfin's
 ///    default) so the web setup wizard sets it; `change_password` rejects an empty
 ///    admin password, so the passwordless path simply skips it.
-/// 4. Grant it the administrator [`UserPolicy`] (`update_policy` does not require a
+/// 4. Grant it the administrator `UserPolicy` (`update_policy` does not require a
 ///    password, so a passwordless admin is valid until the wizard sets one).
 ///
 /// Returns the [`SeedOutcome`] so the caller can log the result and, for a
@@ -162,7 +162,7 @@ pub async fn seed_default_admin(
 ///
 /// Each root becomes a library through
 /// [`VirtualFolderManager::add_virtual_folder`], the call
-/// `POST /Library/VirtualFolders` makes (see [`add_root_libraries`] for the
+/// `POST /Library/VirtualFolders` makes (see `add_root_libraries` for the
 /// name, the options and the roots it skips). When at least one was added, the
 /// library monitor restarts so it watches the new locations and one full scan
 /// is queued, as a library added with `refreshLibrary=true` gets; the scan runs

@@ -16,7 +16,7 @@
 //!   pre-loaded domain object.
 //!
 //! Every read-modify-write of a row runs under the writer
-//! ([`FerrofinUserDataManager::mutate_row`]), so two saves of an item that
+//! (`FerrofinUserDataManager::mutate_row`), so two saves of an item that
 //! overlap both land. That goes past upstream, whose `GetUserData` hands each
 //! caller a copy of the row and whose `SaveUserData` writes every column back.
 //!
@@ -233,7 +233,7 @@ impl FerrofinUserDataManager {
 
     /// Sets where the user data this manager saves is announced, as
     /// upstream's `UserDataChangeNotifier` does: every save but a playback
-    /// progress report, gathered per user for [`USER_DATA_CHANGE_WINDOW`],
+    /// progress report, gathered per user for `USER_DATA_CHANGE_WINDOW`,
     /// each item with its owner or parent, so a season's or series' unplayed
     /// count refreshes too. The first call wins; it closes the session
     /// manager ↔ user-data manager cycle after both exist.

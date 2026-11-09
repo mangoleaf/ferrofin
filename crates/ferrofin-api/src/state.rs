@@ -299,7 +299,7 @@ pub struct Inner {
 }
 
 /// How many [`FileSystem`] calls handlers may have on the blocking pool at once
-/// ([`AppState::blocking_file_system`]). Well above the few a browse click or a
+/// (`AppState::blocking_file_system`). Well above the few a browse click or a
 /// font takes, and well below the pool's 512. A candidate setting, recorded
 /// with the owner on gl-26.
 pub const MAX_BLOCKING_FILE_SYSTEM_CALLS: usize = 32;

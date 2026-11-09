@@ -559,7 +559,7 @@ impl FerrofinPluginManager {
 
     /// Sets the application version used for the `targetAbi` compatibility
     /// filter. Called once by the composition root with the same version
-    /// `/System/Info` reports; defaults to [`DEFAULT_APPLICATION_VERSION`].
+    /// `/System/Info` reports; defaults to `DEFAULT_APPLICATION_VERSION`.
     #[must_use]
     pub fn with_application_version(mut self, version: impl Into<String>) -> Self {
         self.application_version = version.into();
@@ -583,7 +583,7 @@ impl FerrofinPluginManager {
     }
 
     /// Overrides the plugin-download size cap, in MiB. `None`/zero keeps the
-    /// default ([`DEFAULT_PLUGIN_DOWNLOAD_MB`]).
+    /// default (`DEFAULT_PLUGIN_DOWNLOAD_MB`).
     #[must_use]
     pub fn with_download_cap_mb(mut self, mb: Option<u32>) -> Self {
         if let Some(mb) = mb.filter(|mb| *mb > 0) {

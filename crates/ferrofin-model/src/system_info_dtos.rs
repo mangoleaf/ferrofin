@@ -2,9 +2,9 @@
 //!
 //! These are the API-facing storage DTOs the `SystemController.GetSystemStorage`
 //! action returns. They are a thin re-projection of the domain
-//! [`SystemStorageInfo`](crate::system::SystemStorageInfo) /
-//! [`FolderStorageInfo`](crate::system::FolderStorageInfo) /
-//! [`LibraryStorageInfo`](crate::system::LibraryStorageInfo) types, dropping the
+//! [`SystemStorageInfo`] /
+//! [`FolderStorageInfo`] /
+//! [`LibraryStorageInfo`] types, dropping the
 //! `ResolvedPath` field the DTO does not expose.
 
 use serde::{Deserialize, Serialize};

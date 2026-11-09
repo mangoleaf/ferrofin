@@ -3,8 +3,8 @@
 //! Ports the *read* surface of Jellyfin's `ImageController`: resolve an item (or
 //! a by-name genre/studio/person/artist, or a user profile), find the requested
 //! [`ItemImageInfo`] by type (and optional index), and serve its file. The image
-//! rows come from [`LibraryManager::get_item_images`] /
-//! [`UserManager::get_profile_image`], both backed by real `ferrofin-db` reads.
+//! rows come from `LibraryManager::get_item_images` /
+//! `UserManager::get_profile_image`, both backed by real `ferrofin-db` reads.
 //!
 //! ## Port scope — processed serving
 //!
@@ -23,13 +23,13 @@
 //!
 //! TODO(overlays, gl-806): the `percentPlayed`/`unplayedCount` parameters bind
 //! and are validated, but their overlays are not drawn — see the TODO on
-//! [`get_item_image_parametrized`] for the port path.
+//! `get_item_image_parametrized` for the port path.
 //!
 //! A missing item (or by-name item, or user), or an item with no image of the
 //! requested type/index, or an image whose file is remote/absent, is a `404` —
 //! exactly the contract's not-found outcome. So is a Live TV item's row that is
 //! neither a URL nor a file in the internal metadata directory
-//! ([`live_tv_image_is_servable`]). `HEAD` shares each handler with `GET` (the
+//! (`live_tv_image_is_servable`). `HEAD` shares each handler with `GET` (the
 //! file service is `HEAD`-aware).
 //!
 //! ## Write side
@@ -38,8 +38,8 @@
 //! `POST`/`DELETE /Items/{itemId}/Images/{imageType}[/{imageIndex}]`. The upload
 //! body is base64-encoded image bytes with the MIME type in the `Content-Type`
 //! header (Jellyfin's `[AcceptsImageFile]`), decoded via the shared
-//! [`image_upload`](crate::handlers::image_upload) helpers and handed to
-//! [`ProviderManager::save_image`]/[`ProviderManager::delete_image`]. These call
+//! `image_upload` helpers and handed to
+//! `ProviderManager::save_image`/`ProviderManager::delete_image`. These call
 //! through to the image-store seam; the concrete shell manager reports the image
 //! pipeline as deferred (as it does for `queue_refresh`), so the request shape,
 //! `400`/`404` validation, and the `save_image`/`delete_image` contract here are

@@ -7,9 +7,9 @@
 //! inserts a minimal `BaseItems` row (of the `BoxSet`/`Playlist` stored type)
 //! through `ferrofin-db`, and membership is recorded as manual **linked children**
 //! via the injected
-//! [`LinkedChildrenService`](ferrofin_traits::persistence::LinkedChildrenService).
+//! [`LinkedChildrenService`].
 //! Reads go through the injected
-//! [`LibraryManager`](ferrofin_traits::library::LibraryManager) so the same
+//! [`LibraryManager`] so the same
 //! persistence seam backs everything.
 //!
 //! Playlist **ownership and access** are real: the `FerrofinPlaylists` table records the

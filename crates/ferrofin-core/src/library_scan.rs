@@ -10,7 +10,7 @@
 //! (and untyped) libraries flatten every video file to a `Movie`; `tvshows` build
 //! the Series→Season→Episode hierarchy; `music` builds MusicAlbum→Audio. After
 //! the walk, items whose files vanished from disk are pruned
-//! ([`prune_deleted`](LibraryScanner::prune_deleted)), so deleted media stops
+//! (`prune_deleted`), so deleted media stops
 //! being served after the next scan.
 //!
 //! Two passes: a **synchronous plan** (walk + filename resolution by the shared
@@ -1389,7 +1389,7 @@ fn parse_art_file_stem(path: &Path) -> Option<ImageType> {
 /// Still deliberately modest rather than core-count-wide. The win is close to
 /// linear on a local SSD, but a library on a spinning disk or a network mount
 /// turns a wide window into seek thrash, and a scan must never starve playback.
-/// Note what bounds the risk: [`default_probe_concurrency`] clamps this to the
+/// Note what bounds the risk: `default_probe_concurrency` clamps this to the
 /// visible cores, so raising it from 4 to 8 changes NOTHING on a 1-, 2- or
 /// 4-core NAS — the machines the conservative value was protecting. It only
 /// widens the window where there are already 8+ cores to fill.
@@ -4800,7 +4800,7 @@ impl LibraryScanner {
 
     /// Attaches the reader of the `metadata` named configuration, whose
     /// "Date added behavior for new content" dates every new item
-    /// ([`DateAdded`]) — upstream reads it on every resolve
+    /// (`DateAdded`) — upstream reads it on every resolve
     /// (`ResolverHelper.SetDateCreated`). Read once per plan pass, so a
     /// changed setting applies from the next scan or watcher event without a
     /// restart. Without a reader every scan uses upstream's default, the file
@@ -5212,7 +5212,7 @@ impl LibraryScanner {
     }
 
     /// Attaches the MusicBrainz client + the item repository the music pass
-    /// ([`music`]) needs, so a new or changed album or artist gets its
+    /// (`music`) needs, so a new or changed album or artist gets its
     /// `MusicBrainz*` ids and data resolved. Both are required for the pass
     /// to run.
     #[must_use]
@@ -5826,9 +5826,9 @@ impl LibraryScanner {
     /// with the `MetadataRefreshOptions` constructor defaults (the monitor's
     /// `ChangedExternally` refresh) and validates that item's subtree — new
     /// items are created, gone ones pruned — as
-    /// [`changed_roots`](Self::changed_roots) resolves them; the walk
+    /// `changed_roots` resolves them; the walk
     /// descends only the directories leading to those items and their
-    /// subtrees ([`plan_paths`](Self::plan_paths)), never the rest of the
+    /// subtrees (`plan_paths`), never the rest of the
     /// library. The folders above them are carried for context only, and
     /// only the touched items' closing passes run ([`ScanPasses::Touched`]).
     /// Paths outside every library are ignored.
