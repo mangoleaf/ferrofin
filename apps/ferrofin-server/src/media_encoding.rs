@@ -446,10 +446,8 @@ struct FfmpegSubtitleIo {
 
 #[async_trait]
 impl SubtitleIo for FfmpegSubtitleIo {
-    async fn read_file(&self, path: &str) -> Result<Vec<u8>, String> {
-        tokio::fs::read(path)
-            .await
-            .map_err(|e| format!("read {path}: {e}"))
+    async fn read_file(&self, path: &str) -> std::io::Result<Vec<u8>> {
+        tokio::fs::read(path).await
     }
 
     async fn http_get(&self, url: &str) -> Result<Vec<u8>, String> {
@@ -1728,6 +1726,33 @@ mod tests {
             config: Arc::new(FakeConfig(paths, options)),
             encoding_reader: EncodingOptionsReader::new("subtitle extraction"),
         }
+    }
+
+    /// A sidecar gone from disk keeps its I/O kind through the real read, so the
+    /// encoder answers the `404` upstream's `FileNotFoundException` is, not a 500.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_missing_sidecar_reads_as_not_found() {
+        let tmp = tempfile::tempdir().unwrap();
+        let io = subtitle_io(tmp.path(), "ffmpeg".to_owned(), 1);
+        let mut stream = MediaStream {
+            stream_type: MediaStreamType::Subtitle,
+            ..MediaStream::default()
+        };
+        stream.is_external = true;
+        stream.codec = Some("srt".to_owned());
+        stream.path = Some(
+            tmp.path()
+                .join("gone.en.srt")
+                .to_string_lossy()
+                .into_owned(),
+        );
+        let error = PureSubtitleEncoder::new(SubtitleEditParser::new(), io)
+            .get_subtitles(&MediaSourceInfo::default(), &stream, "vtt", 0, 0, false)
+            .await
+            .unwrap_err();
+        let error = ServiceError::from(error);
+        assert!(matches!(error, ServiceError::NotFound(_)), "{error:?}");
     }
 
     /// A configured timeout of zero minutes expires at once: the still-running
