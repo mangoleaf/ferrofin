@@ -1510,6 +1510,7 @@ dependencies = [
  "rstest",
  "serde",
  "serde_json",
+ "shlex",
  "sqlx",
  "tempfile",
  "thiserror",
