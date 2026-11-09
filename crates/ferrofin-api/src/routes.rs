@@ -16,9 +16,9 @@ use crate::error::ApiError;
 
 /// The shared handler for every contract route that has no ported handler yet.
 ///
-/// Returns `501 Not Implemented`. As First-Light and later waves port real
-/// handlers, their routes are registered over this stub; the rest keep returning
-/// `501` so a known route never surprises a client with a `404`.
+/// Returns `501 Not Implemented`, so a known route never surprises a client
+/// with a `404`. Every operation in today's contract has a real handler, so no
+/// route serves this; it covers a contract route added without one.
 ///
 pub async fn not_implemented() -> impl IntoResponse {
     ApiError::NotImplemented

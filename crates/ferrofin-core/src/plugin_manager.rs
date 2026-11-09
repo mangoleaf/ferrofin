@@ -979,6 +979,7 @@ impl PluginManager for FerrofinPluginManager {
                 // config dir + enabled override; the artifact removal above is
                 // the load-bearing part.
                 let _ = std::fs::remove_file(wasm_dir.join(format!("{id}.state.json")));
+                let _ = std::fs::remove_file(wasm_dir.join(format!("{id}.state.lock")));
                 let _ = std::fs::remove_file(wasm_dir.join(format!("{id}.segments")));
                 let _ = std::fs::remove_dir_all(self.plugins_dir.join(id.to_string()));
                 // The items the analysis pass offered it go with its state,
@@ -2835,6 +2836,8 @@ mod tests {
         let rig = update_rig("0.9.0", true, false).await;
         let segments = rig.wasm_dir.join(format!("{PKG_ID}.segments"));
         std::fs::write(&segments, b"{}").unwrap();
+        let state_lock = rig.wasm_dir.join(format!("{PKG_ID}.state.lock"));
+        std::fs::write(&state_lock, b"").unwrap();
         let listed = |plugins: Vec<PluginDescriptor>| plugins.iter().any(|d| d.id == PKG_ID);
         assert!(listed(rig.mgr.list_plugins().await.unwrap()));
 
@@ -2845,6 +2848,7 @@ mod tests {
         );
         assert!(!listed(rig.mgr.list_plugins().await.unwrap()));
         assert!(!segments.exists(), "segment cache removed");
+        assert!(!state_lock.exists(), "state lock file removed");
         assert!(rig.lifecycle.has_pending_restart());
         // The disable is forgotten with it: a reinstall starts at its default.
         let persisted: serde_json::Value = serde_json::from_slice(

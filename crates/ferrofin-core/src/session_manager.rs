@@ -5,7 +5,7 @@
 //! implementation in the crate, ~81K of C#). It owns the **in-memory**
 //! `SessionInfo` table (the C# `_activeConnections` `ConcurrentDictionary`),
 //! reports playback through the injected [`UserDataManager`], and broadcasts
-//! server → client messages to each session's live WebSocket controllers.
+//! server → client messages to each session's client (see below).
 //!
 //! ## Port rules applied
 //! - **Sibling managers are injected** (`Arc<dyn _>`): [`UserManager`],
@@ -20,11 +20,13 @@
 //!   (whose reads surface the [`SessionInfoDto`] wire type). It is a private
 //!   in-memory struct; `session_info_to_dto` maps it to the DTO on read.
 //! - **Message broadcast collapses to pre-serialized JSON** (the trait takes a
-//!   `&str` payload). Each session holds its live
-//!   `Arc<dyn `[`WebSocketConnection`]`>` controllers; a broadcast serializes a
-//!   small `{ MessageType, Data }` envelope once and `send`s the bytes to every
-//!   controller. The `SessionControllers`/`WebSocketController` indirection of
-//!   the C# collapses into "the session's connection handles".
+//!   `&str` payload). A broadcast serializes a small `{ MessageType, Data }`
+//!   envelope once and `send`s the bytes to each session's directly attached
+//!   `Arc<dyn `[`WebSocketConnection`]`>` controllers, else to its sink on the
+//!   `SessionMessageBus`. In production the sink is the path: `ferrofin-api`'s
+//!   `/socket` handler registers it, and only tests attach a connection
+//!   directly (gl-248). The `SessionControllers`/`WebSocketController`
+//!   indirection of the C# collapses into "the session's connection handles".
 //! - **`AuthenticationResult`** now lands in `ferrofin-model`; the authenticate
 //!   methods return an [`AuthenticationResultData`] (the [`SessionInfoDto`] plus
 //!   the minted access token) from which the API layer assembles the wire
@@ -658,10 +660,11 @@ impl FerrofinSessionManager {
     /// Attaches a live WebSocket connection to the session identified by
     /// `session_id`, so subsequent broadcasts reach that client.
     ///
-    /// This is the seam the [`WebSocketListener`](ferrofin_traits::net::WebSocketListener)
-    /// (`SessionWebSocketListener`) calls on connect — the C#
-    /// `EnsureController` + `OnSessionControllerConnected`. Beyond the trait
-    /// surface because the trait models no connection type.
+    /// The attach seam of the C# `EnsureController` +
+    /// `OnSessionControllerConnected`. Only tests call it: the
+    /// [`WebSocketListener`](ferrofin_traits::net::WebSocketListener) attaches
+    /// nothing, and `/socket` registers on the session bus instead (gl-248).
+    /// Beyond the trait surface because the trait models no connection type.
     ///
     /// # Errors
     /// Returns [`ServiceError::NotFound`] when no session has that id.

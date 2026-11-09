@@ -34,8 +34,9 @@ use crate::options::{DtoOptions, InternalItemsQuery};
 ///
 /// Port of `MediaBrowser.Model.LiveTv.LiveTvChannelQuery`, with the C# `UserId`
 /// resolved to the requesting user's row (the crate-wide `User` → [`UserEntity`]
-/// rule) — the user drives the favorite/like filters, favorite-first sorting and
-/// the projected `UserData`.
+/// rule) — the user drives the favorite/like filters, favorite-first sorting,
+/// the projected `UserData` and the parental restrictions that filter the
+/// lineup.
 #[derive(Debug, Clone, Default)]
 #[allow(clippy::struct_excessive_bools)] // one field per upstream query property
 pub struct LiveTvChannelQuery {

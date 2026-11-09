@@ -172,7 +172,10 @@ impl GuestHttp {
             builder
                 .timeout(call_timeout)
                 .redirect(reqwest::redirect::Policy::none())
-                .user_agent(concat!("ferrofin-wasm/", env!("CARGO_PKG_VERSION")))
+                .user_agent(format!(
+                    "ferrofin-wasm/{}",
+                    ferrofin_health::RELEASE_VERSION
+                ))
                 .build()
                 .map_err(|e| format!("building the guest http client: {e}"))
         };
@@ -217,7 +220,10 @@ fn pinned_client(
     reqwest::blocking::Client::builder()
         .timeout(call_timeout)
         .redirect(reqwest::redirect::Policy::none())
-        .user_agent(concat!("ferrofin-wasm/", env!("CARGO_PKG_VERSION")))
+        .user_agent(format!(
+            "ferrofin-wasm/{}",
+            ferrofin_health::RELEASE_VERSION
+        ))
         // Port 0 = "keep the URL's port"; only the address pins.
         .resolve(host, std::net::SocketAddr::new(vetted, 0))
         .build()
@@ -1061,7 +1067,9 @@ pub fn get_state(path: Option<&std::path::Path>, key: &str) -> Option<Vec<u8>> {
 }
 
 /// Executes `set-state` for a guest: `None` deletes; writes are atomic
-/// (temp + rename) and capped (key/value/total).
+/// (a temporary file of their own, renamed in), serialised with another
+/// server on the same data directory (a lock file), and capped
+/// (key/value/total).
 ///
 /// # Errors
 /// Cap violations or I/O failures, as the guest-visible string.
@@ -1143,20 +1151,65 @@ pub fn set_state_capped(
     let mut kept = slot
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
+    // The slot serialises this process's writers; the lock file, another
+    // server's on the same data directory too (a rolling update runs two).
+    let _other_servers = lock_state_file(path);
     let map = state_after_set(path, &mut kept, key, value, total_cap)?;
     let bytes = serde_json::to_vec(&map).map_err(|e| format!("serialize state: {e}"))?;
     let crc = crc32fast::hash(&bytes);
-    let tmp = path.with_extension("tmp");
-    std::fs::write(&tmp, bytes).map_err(|e| format!("write state: {e}"))?;
-    // Stamped before the rename, which keeps length, modified time and
-    // inode: the stamp is this write's file even if another server renames
-    // its own over it straight after.
-    let stamp = state_stamp(&tmp);
-    std::fs::rename(&tmp, path).map_err(|e| format!("commit state: {e}"))?;
+    let mut written = None;
+    // A temporary file of this write's own, renamed over the state file.
+    ferrofin_util::file_helper::atomic_write_with(path, |file| {
+        use std::io::Write as _;
+        file.write_all(&bytes)?;
+        // Stamped before the rename, which keeps length, modified time and
+        // inode: the stamp is this write's file even if a server without the
+        // lock file (an older version) renames its own over it straight after.
+        written = file.metadata().ok();
+        Ok(())
+    })
+    .map_err(|e| format!("write state: {e}"))?;
     // Keep what was just written: the next read or write needs no parse, and a
     // rewrite inside one modified-time tick cannot pass for the old file.
-    *kept = stamp.map(|stamp| KeptState { stamp, crc, map });
+    *kept = written
+        .filter(|meta| meta.modified().is_ok())
+        .map(|meta| KeptState {
+            stamp: FileStamp::of(&meta),
+            crc,
+            map,
+        });
     Ok(())
+}
+
+/// Locks `{id}.state.lock` beside the state file at `path` for one write,
+/// released when the returned file drops. `None` when the lock cannot be
+/// taken (a filesystem without `flock`): the write goes ahead under the
+/// in-process lock alone, so a plugin's state never stops saving over it.
+fn lock_state_file(path: &Path) -> Option<std::fs::File> {
+    static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    let lock = path.with_extension("lock");
+    let taken = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&lock)
+        .and_then(|file| file.lock().map(|()| file));
+    match taken {
+        Ok(file) => Some(file),
+        Err(error) if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) => {
+            tracing::warn!(
+                path = %lock.display(),
+                %error,
+                "cannot lock a plugin state file; its writes are not serialised with \
+                 another server sharing this data directory"
+            );
+            None
+        }
+        Err(error) => {
+            debug!(path = %lock.display(), %error, "cannot lock a plugin state file");
+            None
+        }
+    }
 }
 
 /// The would-be state map after setting `key` to `value`, refused at the
@@ -1590,5 +1643,79 @@ mod tests {
         std::fs::remove_file(&path).expect("remove");
         super::set_state(Some(&path), "e", Some(b"5".to_vec())).expect("set e");
         assert_eq!(read(&path), r#"{"e":"35"}"#);
+    }
+
+    /// gl-1155: two servers on one data directory (a rolling update) write
+    /// one plugin's state under two per-process locks. The second spelling
+    /// of the path, through a symlinked directory, gets a lock of its own as
+    /// the other server's process would, while naming the same files. Every
+    /// write lands, none tears the file, and no temporary file is left.
+    #[cfg(unix)]
+    #[test]
+    fn set_state_holds_between_two_servers_writing_one_file() {
+        const WRITES: usize = 100;
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::os::unix::fs::symlink(dir.path(), dir.path().join("other")).expect("symlink");
+        let paths = [
+            dir.path().join("plugin.state.json"),
+            dir.path().join("other").join("plugin.state.json"),
+        ];
+        std::thread::scope(|scope| {
+            for (server, path) in paths.iter().enumerate() {
+                scope.spawn(move || {
+                    for write in 0..WRITES {
+                        super::set_state(Some(path), &format!("{server}-{write}"), Some(vec![1]))
+                            .expect("set");
+                    }
+                });
+            }
+        });
+        let map: std::collections::BTreeMap<String, String> =
+            serde_json::from_str(&read(&paths[0])).expect("a whole file");
+        assert_eq!(map.len(), 2 * WRITES, "every write kept");
+        let mut names: Vec<_> = std::fs::read_dir(dir.path())
+            .expect("dir")
+            .map(|entry| entry.expect("entry").file_name())
+            .collect();
+        names.sort();
+        assert_eq!(names, ["other", "plugin.state.json", "plugin.state.lock"]);
+    }
+
+    /// gl-1155: a lock file that cannot be taken (here a directory, which no
+    /// open for writing gets) leaves each write to its process's own lock, as
+    /// an older server without the lock file writes. Two such writers may
+    /// drop each other's updates, but every write succeeds, the file stays
+    /// whole, and no temporary file is left: each write has a temporary file
+    /// of its own.
+    #[cfg(unix)]
+    #[test]
+    fn set_state_stays_whole_without_the_lock_file() {
+        const WRITES: usize = 100;
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::os::unix::fs::symlink(dir.path(), dir.path().join("other")).expect("symlink");
+        std::fs::create_dir(dir.path().join("plugin.state.lock")).expect("unlockable");
+        let paths = [
+            dir.path().join("plugin.state.json"),
+            dir.path().join("other").join("plugin.state.json"),
+        ];
+        std::thread::scope(|scope| {
+            for (server, path) in paths.iter().enumerate() {
+                scope.spawn(move || {
+                    for write in 0..WRITES {
+                        super::set_state(Some(path), &format!("{server}-{write}"), Some(vec![1]))
+                            .expect("set");
+                    }
+                });
+            }
+        });
+        let map: std::collections::BTreeMap<String, String> =
+            serde_json::from_str(&read(&paths[0])).expect("a whole file");
+        assert!(!map.is_empty());
+        let mut names: Vec<_> = std::fs::read_dir(dir.path())
+            .expect("dir")
+            .map(|entry| entry.expect("entry").file_name())
+            .collect();
+        names.sort();
+        assert_eq!(names, ["other", "plugin.state.json", "plugin.state.lock"]);
     }
 }

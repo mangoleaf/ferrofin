@@ -610,7 +610,11 @@ where
             // The handler names a parameter its route does not have. That is
             // a bug in the route table, not a bad request.
             tracing::error!(parameter = P::NAME, "route has no such parameter");
-            return Err(StatusCode::INTERNAL_SERVER_ERROR.into_response());
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                axum::Extension(crate::error::FailureLogged),
+            )
+                .into_response());
         };
         if value.trim().is_empty() {
             return Err(ProblemDetails::member_validation(
@@ -861,6 +865,16 @@ mod tests {
     /// [`RequiredRouteString<Name>`]: `/named/{name}` has the parameter, and
     /// `/other/{other}` does not.
     async fn bind_route_string(uri: &str) -> (StatusCode, String) {
+        let response = route_string_response(uri).await;
+        let status = response.status();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        (status, String::from_utf8_lossy(&body).into_owned())
+    }
+
+    /// The whole response [`bind_route_string`] reads.
+    async fn route_string_response(uri: &str) -> axum::response::Response {
         use tower::ServiceExt as _;
         async fn echo(RequiredRouteString(value, _): RequiredRouteString<Name>) -> String {
             format!("[{value}]")
@@ -868,19 +882,13 @@ mod tests {
         let app = axum::Router::new()
             .route("/named/{name}", axum::routing::get(echo))
             .route("/other/{other}", axum::routing::get(echo));
-        let response = app
-            .oneshot(
-                Request::get(uri)
-                    .body(axum::body::Body::empty())
-                    .expect("request"),
-            )
-            .await
-            .expect("response");
-        let status = response.status();
-        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
-            .await
-            .expect("body");
-        (status, String::from_utf8_lossy(&body).into_owned())
+        app.oneshot(
+            Request::get(uri)
+                .body(axum::body::Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response")
     }
 
     #[rstest::rstest]
@@ -920,7 +928,14 @@ mod tests {
 
     #[tokio::test]
     async fn a_required_route_string_its_route_lacks_is_a_500() {
-        let (status, _) = bind_route_string("/other/abc").await;
-        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        let response = route_string_response("/other/abc").await;
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        // Logged where it is found, so the request span does not log it again.
+        assert!(
+            response
+                .extensions()
+                .get::<crate::error::FailureLogged>()
+                .is_some()
+        );
     }
 }

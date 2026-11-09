@@ -487,8 +487,9 @@ const SLUG_CHAR: char = '-';
 /// stops after `'?'`), and "Ferrofin matches neither tree" is the definition of
 /// the bug, not of a capability worth keeping — nothing shipped before this
 /// batch reached that row either, since the pre-existing behaviour here was the
-/// create-on-GET defect this batch removed. The upstream quirk itself is
-/// recorded, with the evidence, in `suite/parity/classifications.json`.
+/// create-on-GET defect this batch removed. The test
+/// `a_hyphenated_name_is_only_ever_read_as_a_slug` (`tests/by_name_browse.rs`)
+/// pins the upstream quirk.
 ///
 /// Returns [`None`] when nothing matches; the caller substitutes
 /// [`LibraryManager::empty_by_name_item`], which is upstream's `item ??= new

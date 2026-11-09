@@ -53,7 +53,7 @@ const PROVIDER_NAME: &str = "Embedded Information";
 const EXIF_INCLUDE_EXTENSIONS: [&str; 7] =
     [".jpg", ".jpeg", ".png", ".tiff", ".cr2", ".webp", ".avif"];
 
-/// Whether `path`'s extension is one the (deferred) EXIF branch would open.
+/// Whether `path`'s extension is one the EXIF branch opens.
 ///
 /// Port of the C# `_includeExtensions.Contains(Path.GetExtension(path),
 /// StringComparison.OrdinalIgnoreCase)` gate. Matched case-insensitively; a

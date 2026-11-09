@@ -10,8 +10,8 @@
 //!
 //! The DVR surface (recordings, timers, series timers) is backed by the manager
 //! too: timers and series timers persist and list/get/update/cancel, and
-//! recordings list/get/delete. The recording *capture* engine (a scheduler that
-//! records a channel to disk when a timer fires) is a further increment.
+//! recordings list/get/delete. When a timer fires, the DVR (`ferrofin-livetv`)
+//! records the channel to a file under the recordings directory.
 //!
 //! The three program queries (`GET`/`POST /LiveTv/Programs` and
 //! `/LiveTv/Programs/Recommended`) bind the contract's whole filter set — channel

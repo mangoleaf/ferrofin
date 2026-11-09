@@ -58,7 +58,7 @@ const API_BASE: &str = "https://api.opensubtitles.com/api/v1";
 const DEFAULT_API_KEY: &str = "gUCLWGoAg2PmyseoTM0INFFVPcDCeDlT";
 
 /// The `User-Agent` OpenSubtitles requires (they reject generic agents).
-const USER_AGENT: &str = concat!("Ferrofin/", env!("CARGO_PKG_VERSION"));
+const USER_AGENT: &str = ferrofin_health::USER_AGENT;
 
 /// The download link's fetch, for its limiter and log lines.
 static LINK_FETCH: FetchKind = FetchKind::new(

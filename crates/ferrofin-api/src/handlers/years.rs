@@ -6,9 +6,11 @@
 //!   [`QueryResult<BaseItemDto>`].
 //! - `GET /Years/{year}` — a single year by value.
 //!
-//! Each year is projected through `DtoService::get_item_by_name_dto` like the
-//! other by-name browses; the year rows come from
-//! [`LibraryManager::get_years`](ferrofin_traits::library::LibraryManager::get_years).
+//! `GET /Years` reads the year rows from
+//! [`LibraryManager::get_years`](ferrofin_traits::library::LibraryManager::get_years)
+//! and projects them like the other by-name lists (`by_name::project_item_rows`,
+//! over `DtoService::get_base_item_dtos`); `GET /Years/{year}` projects its
+//! year with `DtoService::get_base_item_dto`, as upstream's `GetYear` does.
 
 use axum::extract::{Path, State};
 use axum::routing::get;

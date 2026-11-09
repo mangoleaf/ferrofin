@@ -3,16 +3,18 @@
 //! cooperatively — between two items, between its closing passes, out of
 //! a wait that comes before an item writes anything (its probe, its
 //! provider requests), or out of its artwork fetches, the item then saved
-//! with exactly the artwork on disk. An item is written whole or not at all, never
-//! half-written (a row stamped as refreshed without the streams its probe
-//! measured, which `IsMissingMediaInfo` would then never re-probe), and a
-//! hung ffprobe cannot keep a cancelled scan alive. The next scan picks up
-//! where it stopped.
+//! with exactly the artwork on disk. An item is never left stamped as
+//! refreshed without what its refresh owed (the streams or chapters its probe
+//! measured, which an unchanged file would never have probed again): a cancel,
+//! a crash or a kill that cuts one short leaves its row unstamped. A hung
+//! ffprobe cannot keep a cancelled scan alive. The next scan picks up where it
+//! stopped.
 //!
 //! The same stopping points serve the scan queue's priority lane: an item
 //! refresh waiting there runs between two closing passes too, and an item
 //! refresh runs none of the library-wide ones.
 
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
@@ -25,17 +27,21 @@ use ferrofin_core::{
     ScanOutcome, ScanProgress, ScanRun,
 };
 use ferrofin_db::Database;
-use ferrofin_model::configuration::{LibraryOptions, MediaPathInfo};
+use ferrofin_db::entities::base_items::MediaStreamInfoEntity;
+use ferrofin_db::entities::playback::TrickplayInfoEntity;
+use ferrofin_model::configuration::{LibraryOptions, MediaPathInfo, TrickplayScanBehavior};
 use ferrofin_model::dto::MediaSourceInfo;
 use ferrofin_model::entities::{CollectionTypeOptions, ImageType, MediaStreamType, Video3DFormat};
-use ferrofin_model::entities_media::MediaStream;
+use ferrofin_model::entities_media::{ChapterInfo, MediaStream};
 use ferrofin_traits::error::ServiceError;
 use ferrofin_traits::library::{ScanTarget, VirtualFolderManager};
 use ferrofin_traits::media_encoding::{MediaEncoder, MediaInfoRequest};
-use ferrofin_traits::persistence::{ItemRepository, MediaStreamRepository};
+use ferrofin_traits::persistence::{ItemRepository, MediaStreamQuery, MediaStreamRepository};
 use ferrofin_traits::providers::{
-    DynamicMetadataLookup, DynamicMetadataProvider, DynamicMetadataResult, MetadataRefreshOptions,
+    DynamicMetadataLookup, DynamicMetadataProvider, DynamicMetadataResult, MetadataRefreshMode,
+    MetadataRefreshOptions,
 };
+use ferrofin_traits::trickplay::TrickplayManager;
 
 /// An ffprobe stand-in that holds the FIRST probe it is asked for until
 /// released (never, unless a test releases it: a hung ffprobe on a cold
@@ -109,6 +115,16 @@ impl MediaEncoder for HeldProbe {
                 height: Some(1080),
                 ..MediaStream::default()
             }],
+            chapters: [0, 12_000_000_000, 24_000_000_000]
+                .into_iter()
+                .map(|start_position_ticks| ChapterInfo {
+                    start_position_ticks,
+                    name: Some("Chapter".to_owned()),
+                    image_path: None,
+                    image_date_modified: chrono::DateTime::UNIX_EPOCH,
+                    image_tag: None,
+                })
+                .collect(),
             ..MediaSourceInfo::default()
         })
     }
@@ -160,13 +176,136 @@ async fn movies(db: &Database) -> Vec<(String, bool, i64)> {
     .expect("movies")
 }
 
+/// The chapter rows of the movie `name`.
+async fn chapters(db: &Database, name: &str) -> i64 {
+    sqlx::query_scalar(
+        r#"SELECT COUNT(*) FROM "Chapters" c JOIN "BaseItems" b ON b."Id" = c."ItemId"
+           WHERE b."Name" = ?1"#,
+    )
+    .bind(name)
+    .fetch_one(db.pool())
+    .await
+    .expect("chapters")
+}
+
+/// The `DateLastRefreshed` of the movie `name`, `None` without a row.
+async fn stamp(db: &Database, name: &str) -> Option<String> {
+    sqlx::query_scalar(r#"SELECT "DateLastRefreshed" FROM "BaseItems" WHERE "Name" = ?1"#)
+        .bind(name)
+        .fetch_optional(db.pool())
+        .await
+        .expect("stamp")
+        .flatten()
+}
+
+/// The stream store, cancelling `cancel` as it writes an item's streams: after
+/// the item's row was saved, before its chapters.
+struct CancelOnStreams {
+    inner: FerrofinMediaStreamRepository,
+    cancel: ScanCancel,
+}
+
+#[async_trait]
+impl MediaStreamRepository for CancelOnStreams {
+    async fn get_media_streams(
+        &self,
+        filter: &MediaStreamQuery,
+    ) -> Result<Vec<MediaStreamInfoEntity>, ServiceError> {
+        self.inner.get_media_streams(filter).await
+    }
+    async fn get_media_stream_languages(
+        &self,
+        stream_type: MediaStreamType,
+    ) -> Result<Vec<String>, ServiceError> {
+        self.inner.get_media_stream_languages(stream_type).await
+    }
+    async fn save_media_streams(
+        &self,
+        item_id: uuid::Uuid,
+        streams: &[MediaStreamInfoEntity],
+    ) -> Result<(), ServiceError> {
+        self.cancel.cancel();
+        self.inner.save_media_streams(item_id, streams).await
+    }
+}
+
+/// The trickplay manager of a library that extracts during the scan, which
+/// cancels `cancel` in its first refresh and then waits there (a new video's
+/// refresh runs after its row was saved). Later refreshes have nothing to do.
+struct CancelInTrickplay {
+    cancel: Mutex<Option<ScanCancel>>,
+}
+
+#[async_trait]
+impl TrickplayManager for CancelInTrickplay {
+    async fn refresh_trickplay_data(
+        &self,
+        _item_id: uuid::Uuid,
+        _replace: bool,
+        _library_options: &LibraryOptions,
+    ) -> Result<(), ServiceError> {
+        let first = self.cancel.lock().expect("cancel").take();
+        if let Some(cancel) = first {
+            cancel.cancel();
+            return std::future::pending().await;
+        }
+        Ok(())
+    }
+    async fn get_trickplay_resolutions(
+        &self,
+        _item_id: uuid::Uuid,
+    ) -> Result<HashMap<i32, TrickplayInfoEntity>, ServiceError> {
+        Ok(HashMap::new())
+    }
+    async fn get_trickplay_items(
+        &self,
+        _limit: i32,
+        _offset: i32,
+    ) -> Result<Vec<TrickplayInfoEntity>, ServiceError> {
+        Ok(Vec::new())
+    }
+    async fn save_trickplay_info(&self, _info: &TrickplayInfoEntity) -> Result<(), ServiceError> {
+        Ok(())
+    }
+    async fn delete_trickplay_data(&self, _item_id: uuid::Uuid) -> Result<(), ServiceError> {
+        Ok(())
+    }
+    async fn get_hls_playlist(
+        &self,
+        _item_id: uuid::Uuid,
+        _width: i32,
+        _api_key: Option<&str>,
+    ) -> Result<Option<String>, ServiceError> {
+        Ok(None)
+    }
+    async fn get_trickplay_tile_path(
+        &self,
+        _item_id: uuid::Uuid,
+        _width: i32,
+        _index: i32,
+    ) -> Result<Option<String>, ServiceError> {
+        Ok(None)
+    }
+}
+
+/// Where [`movie_library`]'s scanner cancels a scan of its own accord.
+#[derive(Clone, Copy)]
+enum CancelAt<'a> {
+    Nowhere,
+    /// As it writes an item's streams ([`CancelOnStreams`]).
+    Streams(&'a ScanCancel),
+    /// In a new video's trickplay refresh ([`CancelInTrickplay`]).
+    Trickplay(&'a ScanCancel),
+}
+
 /// A movie library of three titles on a fresh database, scanned by a
 /// scanner whose probe is `probe` (one probe at a time) and whose plugin
-/// artwork sources are `art`.
+/// artwork sources are `art`, cancelling at `cancel_at`.
 async fn movie_library(
     root: &Path,
     probe: &Arc<HeldProbe>,
     art: Vec<Arc<dyn DynamicMetadataProvider>>,
+    cancel_at: CancelAt<'_>,
 ) -> (Database, Arc<LibraryScanner>) {
     let media = root.join("movies");
     for name in ["Alien (1979)", "Blade Runner (1982)", "Heat (1995)"] {
@@ -187,6 +326,10 @@ async fn movie_library(
             path_infos: vec![MediaPathInfo {
                 path: media.to_string_lossy().into_owned(),
             }],
+            extract_trickplay_images_during_library_scan: matches!(
+                cancel_at,
+                CancelAt::Trickplay(_)
+            ),
             ..LibraryOptions::default()
         },
     )
@@ -203,13 +346,20 @@ async fn movie_library(
         },
         root.join("metadata/Year"),
     );
-    let scanner = LibraryScanner::new(vf, Arc::new(FerrofinFileSystem::new()), persistence)
+    let streams = FerrofinMediaStreamRepository::new(db.clone());
+    let streams: Arc<dyn MediaStreamRepository> = match cancel_at {
+        CancelAt::Streams(cancel) => Arc::new(CancelOnStreams {
+            inner: streams,
+            cancel: cancel.clone(),
+        }),
+        _ => Arc::new(streams),
+    };
+    let mut scanner = LibraryScanner::new(vf, Arc::new(FerrofinFileSystem::new()), persistence)
         .with_items(items)
         .with_years(years)
         .with_probe(
             Arc::clone(probe) as Arc<dyn MediaEncoder>,
-            Arc::new(FerrofinMediaStreamRepository::new(db.clone()))
-                as Arc<dyn MediaStreamRepository>,
+            streams,
             Arc::new(FerrofinChapterRepository::new(db.clone())),
         )
         // One probe at a time, so no later movie's is already done.
@@ -217,6 +367,12 @@ async fn movie_library(
         .with_progress_every(0)
         .with_metadata_dir(root.join("metadata/library"))
         .with_dynamic_providers(art);
+    if let CancelAt::Trickplay(cancel) = cancel_at {
+        let manager = CancelInTrickplay {
+            cancel: Mutex::new(Some(cancel.clone())),
+        };
+        scanner = scanner.with_trickplay(Arc::new(manager), || TrickplayScanBehavior::Blocking);
+    }
     (db, Arc::new(scanner))
 }
 
@@ -256,7 +412,7 @@ async fn years(db: &Database) -> i64 {
 async fn a_hung_probe_cannot_keep_a_cancelled_scan_alive() {
     let tmp = tempfile::tempdir().expect("tmp");
     let probe = HeldProbe::new();
-    let (db, scanner) = movie_library(tmp.path(), &probe, Vec::new()).await;
+    let (db, scanner) = movie_library(tmp.path(), &probe, Vec::new(), CancelAt::Nowhere).await;
 
     let cancel = ScanCancel::new();
     let running = tokio::spawn({
@@ -303,6 +459,141 @@ async fn a_hung_probe_cannot_keep_a_cancelled_scan_alive() {
     );
 }
 
+/// A cancellation that lands after an item's row was saved (here: as its
+/// streams are written, before its chapters) leaves the row unstamped. A
+/// stamped row whose file did not change is never probed again, so the
+/// chapters the cancel skipped would stay lost; the next scan writes them.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_cancel_after_the_row_is_saved_leaves_the_item_to_refresh() {
+    let tmp = tempfile::tempdir().expect("tmp");
+    let probe = HeldProbe::new();
+    probe.release.add_permits(1);
+    let cancel = ScanCancel::new();
+    let (db, scanner) =
+        movie_library(tmp.path(), &probe, Vec::new(), CancelAt::Streams(&cancel)).await;
+
+    let outcome = scan(&scanner, &cancel, None).await;
+
+    assert!(outcome.stopped, "{outcome:?}");
+    let saved = movies(&db).await;
+    let [(name, false, 1)] = saved.as_slice() else {
+        panic!("one movie saved as far as it got, without the stamp: {saved:?}");
+    };
+    assert_eq!(chapters(&db, name).await, 0);
+
+    scanner.scan_all().await.expect("rescan");
+    assert_eq!(
+        movies(&db).await,
+        vec![
+            ("Alien (1979)".to_owned(), true, 1),
+            ("Blade Runner (1982)".to_owned(), true, 1),
+            ("Heat (1995)".to_owned(), true, 1),
+        ]
+    );
+    assert_eq!(chapters(&db, name).await, 3, "what the cancel skipped");
+}
+
+/// A new video's trickplay refresh runs after its first save, which its rows
+/// need. A cancel there leaves the saved row unstamped, and the item counts as
+/// created (and is announced), since its row is there.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_cancel_in_a_new_videos_trickplay_counts_it_created_and_unstamped() {
+    let tmp = tempfile::tempdir().expect("tmp");
+    let probe = HeldProbe::new();
+    probe.release.add_permits(1);
+    let cancel = ScanCancel::new();
+    let (db, scanner) =
+        movie_library(tmp.path(), &probe, Vec::new(), CancelAt::Trickplay(&cancel)).await;
+
+    let outcome = scan(&scanner, &cancel, None).await;
+
+    assert!(outcome.stopped, "{outcome:?}");
+    assert_eq!(outcome.created, 1, "{outcome:?}");
+    let saved = movies(&db).await;
+    assert!(
+        matches!(saved.as_slice(), [(_, false, 1)]),
+        "saved, without the stamp: {saved:?}"
+    );
+
+    scanner.scan_all().await.expect("rescan");
+    assert!(
+        movies(&db).await.iter().all(|(_, stamped, _)| *stamped),
+        "{:?}",
+        movies(&db).await
+    );
+}
+
+/// What a crash or a kill leaves while an item's streams are written: its row
+/// must not carry the refresh stamp yet, or the next scan, seeing the file
+/// unchanged, would never write them. A trigger records the row's stamp at
+/// that moment, for new items and for a stored one whose file changed. The
+/// stamp lands once the item is done; a validation-only pass, which earns
+/// none, puts the stored one back.
+#[rstest::rstest]
+#[case::new_items(true, MetadataRefreshMode::Default)]
+#[case::changed_file(false, MetadataRefreshMode::Default)]
+#[case::validation_only(false, MetadataRefreshMode::ValidationOnly)]
+#[tokio::test(flavor = "multi_thread")]
+async fn no_row_is_stamped_while_its_streams_are_written(
+    #[case] new: bool,
+    #[case] mode: MetadataRefreshMode,
+) {
+    let tmp = tempfile::tempdir().expect("tmp");
+    let probe = HeldProbe::new();
+    probe.release.add_permits(1);
+    let (db, scanner) = movie_library(tmp.path(), &probe, Vec::new(), CancelAt::Nowhere).await;
+    if !new {
+        scanner.scan_all().await.expect("first scan");
+        std::fs::File::options()
+            .write(true)
+            .open(tmp.path().join("movies/Heat (1995)/Heat (1995).mkv"))
+            .expect("open")
+            .set_modified(std::time::SystemTime::now() + std::time::Duration::from_hours(1))
+            .expect("touch");
+    }
+    let before = stamp(&db, "Heat (1995)").await;
+    for sql in [
+        r#"CREATE TABLE "StampsSeen" ("Stamp" TEXT)"#,
+        r#"CREATE TRIGGER "stamp_seen" AFTER INSERT ON "MediaStreamInfos"
+           BEGIN INSERT INTO "StampsSeen"
+                 SELECT "DateLastRefreshed" FROM "BaseItems" WHERE "Id" = NEW."ItemId";
+           END"#,
+    ] {
+        sqlx::query(sql).execute(db.writer()).await.expect(sql);
+    }
+    let options = MetadataRefreshOptions {
+        metadata_refresh_mode: mode,
+        image_refresh_mode: mode,
+        ..MetadataRefreshOptions::default()
+    };
+
+    scanner
+        .scan_target(
+            &ScanTarget::All,
+            ScanRun::new(&options, &options, &ScanCancel::new()),
+        )
+        .await
+        .expect("scan");
+
+    let seen: Vec<Option<String>> = sqlx::query_scalar(r#"SELECT "Stamp" FROM "StampsSeen""#)
+        .fetch_all(db.pool())
+        .await
+        .expect("seen");
+    assert_eq!(seen, vec![None; if new { 3 } else { 1 }]);
+    let after = stamp(&db, "Heat (1995)").await;
+    if mode == MetadataRefreshMode::ValidationOnly {
+        assert!(before.is_some());
+        assert_eq!(after, before, "the stored stamp is put back");
+    } else {
+        assert!(after.is_some() && after > before, "{before:?} -> {after:?}");
+        assert!(
+            movies(&db).await.iter().all(|(_, stamped, _)| *stamped),
+            "{:?}",
+            movies(&db).await
+        );
+    }
+}
+
 /// A cancellation that lands during the last item (here: when the item walk
 /// reports its 96 %) skips the pruning and the closing passes: a vanished
 /// movie's row stays until the next scan, which prunes it.
@@ -311,7 +602,7 @@ async fn a_cancel_after_the_last_item_skips_the_pruning() {
     let tmp = tempfile::tempdir().expect("tmp");
     let probe = HeldProbe::new();
     probe.release.add_permits(1);
-    let (db, scanner) = movie_library(tmp.path(), &probe, Vec::new()).await;
+    let (db, scanner) = movie_library(tmp.path(), &probe, Vec::new(), CancelAt::Nowhere).await;
     scanner.scan_all().await.expect("first scan");
     std::fs::remove_dir_all(tmp.path().join("movies/Heat (1995)")).expect("remove");
 
@@ -346,7 +637,7 @@ async fn a_cancel_between_closing_passes_skips_the_rest() {
     let tmp = tempfile::tempdir().expect("tmp");
     let probe = HeldProbe::new();
     probe.release.add_permits(1);
-    let (db, scanner) = movie_library(tmp.path(), &probe, Vec::new()).await;
+    let (db, scanner) = movie_library(tmp.path(), &probe, Vec::new(), CancelAt::Nowhere).await;
 
     let cancel = ScanCancel::new();
     let reported = Arc::new(Mutex::new(Vec::new()));
@@ -385,7 +676,7 @@ async fn an_item_refresh_runs_no_library_wide_closing_pass() {
     let tmp = tempfile::tempdir().expect("tmp");
     let probe = HeldProbe::new();
     probe.release.add_permits(1);
-    let (db, scanner) = movie_library(tmp.path(), &probe, Vec::new()).await;
+    let (db, scanner) = movie_library(tmp.path(), &probe, Vec::new(), CancelAt::Nowhere).await;
     let heat = tmp.path().join("movies/Heat (1995)/Heat (1995).mkv");
     let options = MetadataRefreshOptions::default();
     let outcome = scanner
@@ -436,7 +727,7 @@ async fn an_item_refresh_is_served_between_closing_passes() {
     let tmp = tempfile::tempdir().expect("tmp");
     let probe = HeldProbe::new();
     probe.release.add_permits(1);
-    let (db, scanner) = movie_library(tmp.path(), &probe, Vec::new()).await;
+    let (db, scanner) = movie_library(tmp.path(), &probe, Vec::new(), CancelAt::Nowhere).await;
     let heat = tmp.path().join("movies/Heat (1995)/Heat (1995).mkv");
     let options = MetadataRefreshOptions::default();
     let lane = Arc::new(ReadyLane {
@@ -563,7 +854,7 @@ async fn a_hung_image_provider_cannot_keep_a_cancelled_scan_alive() {
         PluginArt::new("quick-art", false),
         Arc::clone(&hung) as Arc<dyn DynamicMetadataProvider>,
     ];
-    let (db, scanner) = movie_library(tmp.path(), &probe, art).await;
+    let (db, scanner) = movie_library(tmp.path(), &probe, art, CancelAt::Nowhere).await;
 
     let cancel = ScanCancel::new();
     let running = tokio::spawn({

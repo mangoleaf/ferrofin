@@ -15,7 +15,8 @@
 //!   unreleased migrations move above `main`'s last migration, keeping their order.
 //!
 //! Update every reference to a moved number (`REBUILD_MIGRATIONS`, `.pre-00NN` snapshot names,
-//! docs) and regenerate its checksum line (`migration_immutability.rs`).
+//! docs), delete its old checksum line by hand, then regenerate the checksums
+//! (`migration_immutability.rs`).
 
 use std::collections::BTreeMap;
 
@@ -44,8 +45,8 @@ fn no_two_migrations_share_a_version() {
                  every open pull request's into that base; when main merges into a release branch, main's \
                  keeps its number and the release branch's unreleased migrations move above main's last \
                  migration, in order. Update every reference to a moved number (REBUILD_MIGRATIONS, \
-                 .pre-00NN snapshot names, docs) and regenerate each moved migration's checksum line \
-                 (migration_immutability.rs; crates/ferrofin-db/tests/migration_versions.rs explains).",
+                 .pre-00NN snapshot names, docs), delete each moved migration's old checksum line by hand and \
+                 regenerate the checksums (migration_immutability.rs; crates/ferrofin-db/tests/migration_versions.rs explains).",
                 names.len(),
                 names.join(", ")
             )

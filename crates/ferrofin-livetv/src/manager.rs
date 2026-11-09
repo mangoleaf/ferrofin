@@ -51,7 +51,7 @@ use serde::de::DeserializeOwned;
 use crate::dvr::{ActiveRecording, RecorderKind, RecordingInput, TimerRecordingInfo};
 use crate::error::LiveTvError;
 use crate::fetch::SourceFetcher;
-use crate::guide_repository::PROGRAM_SELECT;
+use crate::guide_repository::{PROGRAM_SELECT, UserRestrictions};
 use crate::mapping::{
     EpgChannel, EpgChannelData, TunerChannel, epg_channel_for_tuner_channel,
     eq_ordinal_ignore_case, is_listing_provider_enabled_for_tuner, m3u_channel_id,
@@ -1609,7 +1609,8 @@ impl FerrofinLiveTvManager {
         };
         let view_id = self.live_tv_view_id().await;
         let rows =
-            crate::guide_repository::channel_rows(&self.db, &LiveTvChannelQuery::default()).await?;
+            crate::guide_repository::channel_rows(&self.db, &LiveTvChannelQuery::default(), None)
+                .await?;
         // The channel items already stored, read ONCE: the merge below needs
         // them (the C# loads each item before assigning to it) and so does
         // `CleanDatabase`.
@@ -3373,8 +3374,16 @@ impl LiveTvManager for FerrofinLiveTvManager {
         // Ferrofin filters and sorts the loaded lineup instead — identical
         // results, one query. An IPTV lineup can run to thousands of channels,
         // so the read derives only the guide kinds this query filters on.
+        // The user's parental restrictions apply in the read, before the page
+        // is cut, as `new InternalItemsQuery(user)` applies them upstream.
+        let restrictions = self
+            .user_restrictions(&InternalItemsQuery {
+                user: query.user.clone(),
+                ..InternalItemsQuery::default()
+            })
+            .await?;
         let mut rows: Vec<ChannelRow> =
-            crate::guide_repository::channel_rows(&self.db, query).await?;
+            crate::guide_repository::channel_rows(&self.db, query, restrictions.as_ref()).await?;
 
         // Favourite/like filters and favourite-first sorting read the user's
         // channel user-data (C# pushes the same predicates into SQL).
@@ -3491,7 +3500,7 @@ impl LiveTvManager for FerrofinLiveTvManager {
         // between them and report a total the page cannot contain.
         let now = Utc::now();
         let start_index = query.start_index.unwrap_or(0);
-        let restrictions = self.program_restrictions(query).await?;
+        let restrictions = self.user_restrictions(query).await?;
         let restrictions = restrictions.as_ref();
         let rows: Vec<GuideProgramRow> = program_rows_query(query, now, restrictions)
             .build_query_as()
@@ -4874,7 +4883,7 @@ impl FerrofinLiveTvManager {
         query: &InternalItemsQuery,
         now: DateTime<Utc>,
     ) -> Result<Vec<GuideProgramRow>, ServiceError> {
-        let restrictions = self.program_restrictions(query).await?;
+        let restrictions = self.user_restrictions(query).await?;
         program_rows_query(query, now, restrictions.as_ref())
             .build_query_as()
             .fetch_all(self.db.pool())
@@ -4883,10 +4892,12 @@ impl FerrofinLiveTvManager {
     }
 
     /// The parental restrictions of `query`'s user, which a guide read applies
-    /// over the programme items, as upstream's `new InternalItemsQuery(user)`
-    /// in `GetPrograms`, `GetRecommendedProgramsInternal` and `AddChannelInfo`
-    /// does; `None` without a user, a user nothing restricts, or an item layer.
-    async fn program_restrictions(
+    /// over the programme or channel items, as upstream's
+    /// `new InternalItemsQuery(user)` in `GetPrograms`,
+    /// `GetRecommendedProgramsInternal`, `AddChannelInfo` and
+    /// `GetInternalChannels` does; `None` without a user, a user nothing
+    /// restricts, or an item layer.
+    async fn user_restrictions(
         &self,
         query: &InternalItemsQuery,
     ) -> Result<Option<(&dyn ParentalRestrictions, InternalItemsQuery)>, ServiceError> {
@@ -6960,7 +6971,7 @@ fn series_programs_query(stored: &StoredSeriesTimer, now: DateTime<Utc>) -> Inte
 fn program_rows_query(
     query: &InternalItemsQuery,
     now: DateTime<Utc>,
-    restrictions: ProgramRestrictions<'_>,
+    restrictions: UserRestrictions<'_>,
 ) -> QueryBuilder<Sqlite> {
     let mut qb = QueryBuilder::new(PROGRAM_SELECT);
     push_program_filters(&mut qb, query, now, restrictions);
@@ -6992,12 +7003,12 @@ fn push_separator(qb: &mut QueryBuilder<Sqlite>, first: &mut bool) {
 /// series-timer scope cannot be built.
 ///
 /// `restrictions` are the user's parental restrictions, from
-/// [`FerrofinLiveTvManager::program_restrictions`].
+/// [`FerrofinLiveTvManager::user_restrictions`].
 fn push_program_filters(
     qb: &mut QueryBuilder<Sqlite>,
     query: &InternalItemsQuery,
     now: DateTime<Utc>,
-    restrictions: ProgramRestrictions<'_>,
+    restrictions: UserRestrictions<'_>,
 ) {
     let mut first = true;
     let now_db = datetime_to_db(now);
@@ -7117,28 +7128,11 @@ fn push_program_filters(
         qb.push("))");
     }
 
-    push_program_restrictions(qb, &mut first, restrictions);
-}
-
-/// The user's maximum rating, blocked unrated kinds and inherited tags, as
-/// `TranslateQuery` applies them to the programme items upstream lists. An
-/// airing whose item is not stored yet is not shown to such a user.
-fn push_program_restrictions(
-    qb: &mut QueryBuilder<Sqlite>,
-    first: &mut bool,
-    restrictions: ProgramRestrictions<'_>,
-) {
-    if let Some((filter, user)) = restrictions {
-        push_separator(qb, first);
-        qb.push(r#"EXISTS (SELECT 1 FROM "BaseItems" bi WHERE bi."Id" = p."Id""#);
-        filter.push_restrictions(qb, user, "bi");
-        qb.push(")");
+    if let Some(restrictions) = restrictions {
+        push_separator(qb, &mut first);
+        crate::guide_repository::push_item_restrictions(qb, r#"p."Id""#, restrictions);
     }
 }
-
-/// A user's parental restrictions for a guide read: the item layer's
-/// predicate and the query its user's preferences were loaded onto.
-type ProgramRestrictions<'a> = Option<&'a (&'a dyn ParentalRestrictions, InternalItemsQuery)>;
 
 /// The guide column a sort key reads, or `None` when the guide cache holds
 /// nothing to sort by (those keys are skipped rather than faked).
@@ -8358,9 +8352,10 @@ mod tests {
         // Read back through the repository, not inline SQL (the SQL-boundary
         // ratchet): `channel_rows` is the lineup in stored order, and
         // `channel_stream_source` is the per-channel tuner facts.
-        let rows = crate::guide_repository::channel_rows(&mgr.db, &LiveTvChannelQuery::default())
-            .await
-            .expect("channels");
+        let rows =
+            crate::guide_repository::channel_rows(&mgr.db, &LiveTvChannelQuery::default(), None)
+                .await
+                .expect("channels");
         // The DRM row is dropped, and the identity is `hdhr_{GuideNumber}` —
         // NOT the M3U `m3u_{md5}{md5}` shape.
         assert_eq!(rows.len(), 2);
@@ -10176,7 +10171,7 @@ mod tests {
             order_by: vec![(ItemSortBy::StartDate, SortOrder::Ascending)],
             ..InternalItemsQuery::default()
         };
-        let restrictions = mgr.program_restrictions(&query).await.expect("resolve");
+        let restrictions = mgr.user_restrictions(&query).await.expect("resolve");
         let restrictions = restrictions.expect("a restricted user");
         let count = |restrictions| {
             let mut qb = sqlx::QueryBuilder::new(super::PROGRAM_COUNT);
@@ -15211,7 +15206,7 @@ mod tests {
             .expect("ids");
         assert!(found.is_empty(), "{found:?}");
         assert_eq!(
-            crate::guide_repository::channel_rows(&mgr.db, &LiveTvChannelQuery::default())
+            crate::guide_repository::channel_rows(&mgr.db, &LiveTvChannelQuery::default(), None)
                 .await
                 .expect("channels")
                 .len(),
@@ -15263,9 +15258,10 @@ mod tests {
         .await
         .expect("provider");
         mgr.refresh_guide().await.expect("refresh");
-        let before = crate::guide_repository::channel_rows(&mgr.db, &LiveTvChannelQuery::default())
-            .await
-            .expect("channels");
+        let before =
+            crate::guide_repository::channel_rows(&mgr.db, &LiveTvChannelQuery::default(), None)
+                .await
+                .expect("channels");
         assert_eq!(before.len(), 2);
         let kept_id = before[0].id.clone();
         let found = crate::guide_repository::all_program_ids(&mgr.db)
@@ -15281,9 +15277,10 @@ mod tests {
         );
         mgr.refresh_guide().await.expect("refresh2");
 
-        let after = crate::guide_repository::channel_rows(&mgr.db, &LiveTvChannelQuery::default())
-            .await
-            .expect("channels2");
+        let after =
+            crate::guide_repository::channel_rows(&mgr.db, &LiveTvChannelQuery::default(), None)
+                .await
+                .expect("channels2");
         assert_eq!(after.len(), 1);
         assert_eq!(after[0].id, kept_id, "the surviving channel keeps its id");
     }
@@ -15366,7 +15363,7 @@ mod tests {
         mgr.refresh_guide().await.expect("refresh2");
         assert_eq!(count().await, programs_after);
         assert_eq!(
-            crate::guide_repository::channel_rows(&mgr.db, &LiveTvChannelQuery::default())
+            crate::guide_repository::channel_rows(&mgr.db, &LiveTvChannelQuery::default(), None)
                 .await
                 .expect("channels")
                 .len(),

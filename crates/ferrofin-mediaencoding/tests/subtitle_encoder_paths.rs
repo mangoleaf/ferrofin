@@ -14,6 +14,7 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 
 use async_trait::async_trait;
+use ferrofin_mediaencoding::MediaEncodingError;
 use ferrofin_mediaencoding::subtitles::encoder::filter_events;
 use ferrofin_mediaencoding::subtitles::model::{Paragraph, Subtitle, TimeCode};
 use ferrofin_mediaencoding::subtitles::{
@@ -47,17 +48,17 @@ impl RecordingIo {
 
 #[async_trait]
 impl SubtitleIo for RecordingIo {
-    async fn read_file(&self, path: &str) -> Result<Vec<u8>, String> {
+    async fn read_file(&self, path: &str) -> std::io::Result<Vec<u8>> {
         self.files
             .lock()
             .unwrap()
             .get(path)
             .cloned()
-            .ok_or_else(|| format!("no such file: {path}"))
+            .ok_or_else(|| std::io::ErrorKind::NotFound.into())
     }
 
     async fn http_get(&self, url: &str) -> Result<Vec<u8>, String> {
-        self.read_file(url).await
+        self.read_file(url).await.map_err(|e| e.to_string())
     }
 
     fn path_protocol(&self, path: &str) -> MediaProtocol {
@@ -205,7 +206,8 @@ async fn readable_file_no_cache_errors_for_non_guid_source() {
         .get_readable_file(&source, &stream)
         .await
         .unwrap_err();
-    assert!(err.contains("no subtitle cache"));
+    assert!(matches!(err, MediaEncodingError::NotFound(_)), "{err:?}");
+    assert!(err.to_string().contains("no subtitle cache"));
 }
 
 // -- get_readable_file: external PGS passthrough ---------------------------
@@ -441,7 +443,7 @@ struct ArcIo(std::sync::Arc<RecordingIo>);
 
 #[async_trait]
 impl SubtitleIo for ArcIo {
-    async fn read_file(&self, path: &str) -> Result<Vec<u8>, String> {
+    async fn read_file(&self, path: &str) -> std::io::Result<Vec<u8>> {
         self.0.read_file(path).await
     }
     async fn http_get(&self, url: &str) -> Result<Vec<u8>, String> {
@@ -484,7 +486,7 @@ impl SubtitleIo for ArcIo {
 const SAMPLE_SRT: &[u8] =
     b"1\r\n00:00:01,000 --> 00:00:02,000\r\nfirst\r\n\r\n2\r\n00:00:05,000 --> 00:00:06,000\r\nsecond\r\n\r\n";
 
-async fn convert_to(format: &str) -> Result<Vec<u8>, String> {
+async fn convert_to(format: &str) -> Result<Vec<u8>, MediaEncodingError> {
     let encoder = SubtitleEncoder::new(SubtitleEditParser::new(), RecordingIo::default());
     let info = SubtitleInfo {
         path: "t.srt".to_owned(),
@@ -513,7 +515,11 @@ async fn convert_subtitles_selects_each_writer() {
 #[tokio::test]
 async fn convert_subtitles_unsupported_format_errors() {
     let err = convert_to("microdvd").await.unwrap_err();
-    assert!(err.contains("Unsupported format"));
+    assert!(
+        matches!(err, MediaEncodingError::InvalidInput(_)),
+        "{err:?}"
+    );
+    assert!(err.to_string().contains("Unsupported format"));
 }
 
 #[tokio::test]
@@ -846,7 +852,7 @@ async fn get_trimmed_subtitles_refuses_a_bitmap_sidecar() {
         .await
         .unwrap_err();
 
-    assert!(error.contains("Unsupported format"), "{error}");
+    assert!(error.to_string().contains("Unsupported format"), "{error}");
 }
 
 // -- extract_all_extractable_subtitles: failure handling --------------------
@@ -864,7 +870,7 @@ struct FailableIo {
 
 #[async_trait]
 impl SubtitleIo for FailableIo {
-    async fn read_file(&self, path: &str) -> Result<Vec<u8>, String> {
+    async fn read_file(&self, path: &str) -> std::io::Result<Vec<u8>> {
         self.inner.read_file(path).await
     }
     async fn http_get(&self, url: &str) -> Result<Vec<u8>, String> {
@@ -921,7 +927,7 @@ struct ArcFailable(std::sync::Arc<FailableIo>);
 
 #[async_trait]
 impl SubtitleIo for ArcFailable {
-    async fn read_file(&self, p: &str) -> Result<Vec<u8>, String> {
+    async fn read_file(&self, p: &str) -> std::io::Result<Vec<u8>> {
         self.0.read_file(p).await
     }
     async fn http_get(&self, u: &str) -> Result<Vec<u8>, String> {
@@ -959,7 +965,7 @@ struct ContentIo {
 
 #[async_trait]
 impl SubtitleIo for ContentIo {
-    async fn read_file(&self, p: &str) -> Result<Vec<u8>, String> {
+    async fn read_file(&self, p: &str) -> std::io::Result<Vec<u8>> {
         self.inner.read_file(p).await
     }
     async fn http_get(&self, u: &str) -> Result<Vec<u8>, String> {

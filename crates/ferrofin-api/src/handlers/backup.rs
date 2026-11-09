@@ -330,9 +330,9 @@ fn restorable(manifest: &BackupManifest) -> bool {
 
 /// Why `archive` cannot be restored, or `None` when it can: a foreign or
 /// unreadable archive, or one written by a newer Ferrofin. Upstream refuses a
-/// newer `ServerVersion`; every Ferrofin build writes the same crate version,
-/// so the newer-build test compares the recorded schema head (its database
-/// would not open here) instead.
+/// newer `ServerVersion`; a Ferrofin build's is a release or `git describe`
+/// string, which does not order, so the newer-build test compares the recorded
+/// schema head (its database would not open here) instead.
 fn restore_refusal(archive: &Path) -> Option<String> {
     let name = archive.file_name().map_or_else(
         || archive.display().to_string(),
@@ -753,7 +753,7 @@ fn write_backup(
     }
     let archive_path = backups_dir.join(&file_name);
     let manifest = BackupManifest {
-        server_version: env!("CARGO_PKG_VERSION").to_owned(),
+        server_version: ferrofin_health::RELEASE_VERSION.to_owned(),
         backup_engine_version: BACKUP_ENGINE_VERSION.to_owned(),
         date_created: now,
         path: archive_path.to_string_lossy().into_owned(),
@@ -1506,8 +1506,9 @@ mod tests {
     /// An archive from a newer Ferrofin, whose database is migrated past this
     /// binary's last migration, is refused before anything is touched: the
     /// next boot could not open that database. Upstream refuses an archive
-    /// whose `ServerVersion` is newer than the running one; every Ferrofin
-    /// build writes the same crate version, so the schema head stands in.
+    /// whose `ServerVersion` is newer than the running one; a Ferrofin
+    /// build's is a release or `git describe` string, which does not order,
+    /// so the schema head stands in.
     #[test]
     fn an_archive_from_a_newer_schema_is_refused_untouched() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1678,6 +1679,8 @@ mod tests {
         );
         assert!(archive.is_file());
         assert_eq!(manifest.backup_engine_version, super::BACKUP_ENGINE_VERSION);
+        // The release that wrote it, not the crate's placeholder version (gl-235).
+        assert_eq!(manifest.server_version, ferrofin_health::RELEASE_VERSION);
 
         // Restore over a fresh root (a stale WAL sidecar beside the DB is dropped).
         let restore_root = tmp.path().join("restored");

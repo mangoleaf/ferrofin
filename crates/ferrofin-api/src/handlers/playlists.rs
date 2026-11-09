@@ -17,7 +17,7 @@
 //! Every route is behind `[Authorize]`, so it takes the [`RequireAuth`]
 //! extractor (a missing/invalid token is `401`). The `404 Playlist not found`
 //! path is faithful (it flows from
-//! [`PlaylistManager::get_playlist_for_user`](ferrofin_traits::collections::PlaylistManager)).
+//! [`PlaylistManager::get_playlist_access`](ferrofin_traits::collections::PlaylistManager::get_playlist_access)).
 //!
 //! Ownership and shares are persisted and **enforced**: the `Playlists` table
 //! records the owner + open-access flag and `PlaylistShares` the per-user
@@ -165,14 +165,8 @@ async fn get_playlist(
         .playlists
         .get_playlist_access(playlist_id, user_id)
         .await?;
-    let items = state
-        .playlists
-        .get_playlist_items(playlist_id, user_id)
-        .await?;
-    let item_ids = items
-        .iter()
-        .filter_map(|i| Uuid::parse_str(&i.id).ok())
-        .collect();
+    // `GetManageableItems().Select(t => t.Item2.Id)`: the ids alone, no row.
+    let item_ids = state.playlists.get_playlist_item_ids(playlist_id).await?;
     Ok(Json(PlaylistDto {
         open_access: access.open_access,
         shares: state.playlists.get_playlist_shares(playlist_id).await?,
@@ -257,9 +251,9 @@ struct GetPlaylistItemsQuery {
 /// `GET /Playlists/{playlistId}/Items` — the playlist's member items, paged.
 ///
 /// Port of `PlaylistsController.GetPlaylistItems`. Each returned DTO carries its
-/// `PlaylistItemId` (the member item id, matching the minimal port's entry-id
-/// approximation). An invisible playlist is `404`; the separate C# `Forbid()`
-/// branch is unreachable here because visible ⇔ permitted-to-read.
+/// `PlaylistItemId`: the member item id, as upstream's
+/// `Item1.ItemId?.ToString("N")`. An invisible playlist is `404`; the separate
+/// C# `Forbid()` branch is unreachable here because visible ⇔ permitted-to-read.
 #[utoipa::path(
     get,
     path = "/Playlists/{playlistId}/Items",
@@ -291,22 +285,16 @@ async fn get_playlist_items(
         .get_playlist_items(playlist_id, calling_user_id)
         .await?;
     // `GetManageableItems().Where(i => i.Item2.IsVisible(user))`: a member
-    // the caller may not see is out of the page and the count. Divergence
-    // (gl-1092): the standalone check, which also walks the member's
-    // library, where upstream's `IsVisible` reads only its rating and tags,
-    // so a member from a library the caller was not granted is dropped too.
+    // the caller may not see is out of the page and the count, checked on the
+    // rows just read. Divergence (gl-1092): the standalone check, which also
+    // walks the member's library, where upstream's `IsVisible` reads only its
+    // rating and tags, so a member from a library the caller was not granted
+    // is dropped too.
     if let Some(user) = &user {
-        let ids: Vec<Uuid> = items
-            .iter()
-            .filter_map(|item| Uuid::parse_str(&item.id).ok())
-            .collect();
-        let visible: std::collections::HashSet<Uuid> = state
+        items = state
             .library
-            .get_visible_item_ids(&ids, user)
-            .await?
-            .into_iter()
-            .collect();
-        items.retain(|item| Uuid::parse_str(&item.id).is_ok_and(|id| visible.contains(&id)));
+            .filter_visible_items_standalone(items, user)
+            .await?;
     }
     let total = i32::try_from(items.len()).unwrap_or(i32::MAX);
 

@@ -1140,7 +1140,7 @@ impl FerrofinVirtualFolderManager {
     }
 
     /// Reads the [`LibraryOptions`] stored in a folder's `options.json`, or the
-    /// default when the file is absent or unreadable (matching C#
+    /// default when the file is absent or unusable (matching C#
     /// `LoadLibraryOptions`, which falls back to `new LibraryOptions()`).
     ///
     /// An adopted Jellyfin library folder has no `options.json` but does have
@@ -1149,33 +1149,82 @@ impl FerrofinVirtualFolderManager {
     /// `options.json`, so the library keeps its metadata downloaders, image
     /// fetchers and path settings instead of silently reverting to defaults.
     /// The XML is never touched again, and an `options.json` that exists always
-    /// wins.
+    /// wins, even one that cannot be read or parsed ([`Self::stored_options`]).
     ///
     /// Every `PathInfos[].Path` is expanded as `CollectionFolder.LoadLibraryOptions`
     /// expands it, so a media path Jellyfin stored as `%AppDataPath%/…` or
     /// `%MetadataPath%/…` is served and compared as the real path, including
     /// from an `options.json` an earlier adoption persisted with the tokens.
     async fn load_options(&self, folder_path: &Path) -> LibraryOptions {
-        let options_path = folder_path.join(OPTIONS_FILE);
-        let mut options = match tokio::fs::read(&options_path).await {
-            Ok(bytes) => serde_json::from_slice(&bytes).unwrap_or_default(),
-            Err(_) => Self::adopt_jellyfin_options(folder_path, &self.virtual_paths)
+        let mut options = if let Some(options) = Self::stored_options(folder_path).await {
+            options
+        } else {
+            // Persisted only while no structure change runs: the save would
+            // recreate a folder a removal or rename just moved away. A change
+            // reading the options saves them itself.
+            let no_change = self.structure_change.try_read();
+            Self::adopt_jellyfin_options(folder_path, &self.virtual_paths, no_change.is_ok())
                 .await
-                .unwrap_or_default(),
+                .unwrap_or_default()
         };
         expand_path_infos(&mut options, &self.virtual_paths);
         options
     }
 
+    /// The options in a folder's `options.json`: `None` when there is none, and
+    /// the defaults when it cannot be read or parsed, which is logged as
+    /// `LoadLibraryOptions` logs "Error loading library options": at error the
+    /// first time, at debug while it stays unusable, since the dashboard's
+    /// listing reads it on every load.
+    async fn stored_options(folder_path: &Path) -> Option<LibraryOptions> {
+        /// The `options.json` files last found unusable.
+        static UNUSABLE: std::sync::Mutex<std::collections::BTreeSet<PathBuf>> =
+            std::sync::Mutex::new(std::collections::BTreeSet::new());
+        let path = folder_path.join(OPTIONS_FILE);
+        let error = match tokio::fs::read(&path).await {
+            Ok(bytes) => match serde_json::from_slice(&bytes) {
+                Ok(options) => {
+                    UNUSABLE
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .remove(&path);
+                    return Some(options);
+                }
+                Err(error) => error.to_string(),
+            },
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return None,
+            Err(error) => error.to_string(),
+        };
+        let first = UNUSABLE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(path.clone());
+        if first {
+            tracing::error!(
+                path = %path.display(),
+                error,
+                "could not load the library options; the library runs on the default options \
+                 until they are saved again, which replaces the file"
+            );
+        } else {
+            tracing::debug!(
+                path = %path.display(),
+                error,
+                "library options still unusable; serving the defaults"
+            );
+        }
+        Some(LibraryOptions::default())
+    }
+
     /// Reads options for access checks without writing an adoption sidecar or
-    /// provisioning library rows. Missing/unreadable options use upstream defaults.
+    /// provisioning library rows. Missing/unusable options use upstream defaults.
     /// `PathInfos` are expanded through `paths`, as [`Self::load_options`] does.
     pub(crate) async fn read_options(
         folder_path: &Path,
         paths: &crate::virtual_paths::VirtualPathExpander,
     ) -> LibraryOptions {
-        let mut options = if let Ok(bytes) = tokio::fs::read(folder_path.join(OPTIONS_FILE)).await {
-            serde_json::from_slice(&bytes).unwrap_or_default()
+        let mut options = if let Some(options) = Self::stored_options(folder_path).await {
+            options
         } else if let Ok(xml) =
             tokio::fs::read_to_string(folder_path.join(JELLYFIN_OPTIONS_FILE)).await
         {
@@ -1193,14 +1242,16 @@ impl FerrofinVirtualFolderManager {
         options
     }
 
-    /// Imports a Jellyfin `options.xml` beside a missing `options.json` and
-    /// persists the result as `options.json`, its `PathInfos` expanded through
-    /// `paths` first so the persisted file holds real paths. `None` when there
-    /// is no XML; the default (and a warning) when the XML cannot be read or
-    /// converted, so one damaged file never blocks listing the library.
+    /// Imports a Jellyfin `options.xml` beside a missing `options.json` and,
+    /// when `persist`, persists the result as `options.json`, its `PathInfos`
+    /// expanded through `paths` first so the persisted file holds real paths.
+    /// `None` when there is no XML; the default (and a warning) when the XML
+    /// cannot be read or converted, so one damaged file never blocks listing
+    /// the library.
     async fn adopt_jellyfin_options(
         folder_path: &Path,
         paths: &crate::virtual_paths::VirtualPathExpander,
+        persist: bool,
     ) -> Option<LibraryOptions> {
         let xml_path = folder_path.join(JELLYFIN_OPTIONS_FILE);
         let xml = tokio::fs::read_to_string(&xml_path).await.ok()?;
@@ -1223,6 +1274,9 @@ impl FerrofinVirtualFolderManager {
                 return Some(LibraryOptions::default());
             }
         };
+        if !persist {
+            return Some(imported);
+        }
         if let Err(err) = Self::save_options(folder_path, &imported).await {
             tracing::warn!(
                 path = %folder_path.join(OPTIONS_FILE).display(),
@@ -1256,7 +1310,9 @@ impl FerrofinVirtualFolderManager {
         Ok(())
     }
 
-    /// Writes `options` to a folder's `options.json` (C# `SaveLibraryOptions`).
+    /// Writes `options` to a folder's `options.json` (C# `SaveLibraryOptions`),
+    /// replacing it whole, so a crash or a full disk mid-save leaves the
+    /// previous file in place rather than a truncated one.
     async fn save_options(
         folder_path: &Path,
         options: &LibraryOptions,
@@ -1264,9 +1320,12 @@ impl FerrofinVirtualFolderManager {
         let options_path = folder_path.join(OPTIONS_FILE);
         let json = serde_json::to_vec_pretty(options)
             .map_err(|e| ServiceError::backend(format!("serialize library options: {e}")))?;
-        tokio::fs::write(&options_path, json)
-            .await
-            .map_err(|e| Self::io_err("write options.json", &e))
+        tokio::task::spawn_blocking(move || {
+            ferrofin_util::file_helper::atomic_write(&options_path, &json)
+        })
+        .await
+        .map_err(|e| ServiceError::backend(format!("options writer: {e}")))?
+        .map_err(|e| Self::io_err("write options.json", &e))
     }
 
     /// Lists the resolved `.mblink` shortcut targets in a folder, expanded,
@@ -3052,6 +3111,138 @@ mod tests {
             "unreadable XML falls back to defaults"
         );
         assert!(!folder.join(super::OPTIONS_FILE).exists());
+    }
+
+    /// gl-271: an `options.json` that does not parse (a save torn by a crash)
+    /// serves the defaults, as `LoadLibraryOptions` does, logged at error the
+    /// first time and at debug while it stays so, and an `options.xml` beside
+    /// it is not imported over it. A save replaces the file whole: a new file
+    /// renamed in, never the old one truncated and rewritten.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_unparseable_options_json_is_logged_once_and_a_save_replaces_it() {
+        use std::os::unix::fs::MetadataExt as _;
+        let (tmp, mgr) = manager();
+        let folder = tmp.path().join("default").join("Torn");
+        std::fs::create_dir_all(&folder).expect("folder");
+        let json_path = folder.join(super::OPTIONS_FILE);
+        let torn = br#"{"EnableRealtimeMonitor":tr"#;
+        std::fs::write(&json_path, torn).expect("torn json");
+        std::fs::write(
+            folder.join(super::JELLYFIN_OPTIONS_FILE),
+            JELLYFIN_OPTIONS_XML,
+        )
+        .expect("xml");
+
+        let logs = crate::test_support::CapturedLogs::default();
+        let count = |level: &str| {
+            logs.text()
+                .lines()
+                .filter(|line| line.contains(level) && line.contains("Torn/options.json"))
+                .count()
+        };
+        {
+            let _guard = tracing::subscriber::set_default(
+                tracing_subscriber::fmt()
+                    .with_writer(logs.clone())
+                    .with_ansi(false)
+                    .with_max_level(tracing::Level::DEBUG)
+                    .finish(),
+            );
+            for _ in 0..3 {
+                let folders = mgr.get_virtual_folders().await.expect("list");
+                assert_eq!(folders[0].library_options, Some(LibraryOptions::default()));
+            }
+            assert_eq!(
+                FerrofinVirtualFolderManager::read_options(&folder, &mgr.virtual_paths).await,
+                LibraryOptions::default(),
+                "the access checks read the same defaults"
+            );
+        }
+        assert_eq!(count(" ERROR "), 1, "{}", logs.text());
+        assert_eq!(count(" DEBUG "), 3, "{}", logs.text());
+        assert_eq!(
+            std::fs::read(&json_path).expect("json"),
+            torn,
+            "not replaced"
+        );
+
+        let before = std::fs::metadata(&json_path).expect("meta").ino();
+        let saved = LibraryOptions {
+            season_zero_display_name: "Extras".to_owned(),
+            ..LibraryOptions::default()
+        };
+        mgr.update_library_options("Torn", &saved)
+            .await
+            .expect("save");
+        assert_ne!(
+            std::fs::metadata(&json_path).expect("meta").ino(),
+            before,
+            "a new file renamed in"
+        );
+        let mut names: Vec<_> = std::fs::read_dir(&folder)
+            .expect("dir")
+            .map(|entry| entry.expect("entry").file_name())
+            .collect();
+        names.sort();
+        assert_eq!(
+            names,
+            ["options.json", "options.xml"],
+            "no temporary file left"
+        );
+        let folders = mgr.get_virtual_folders().await.expect("list");
+        assert_eq!(folders[0].library_options, Some(saved));
+    }
+
+    /// gl-271: an `options.json` that cannot be read (here a directory, which
+    /// fails as an unreadable file would, even for root) serves the defaults,
+    /// never the `options.xml` beside it.
+    #[tokio::test]
+    async fn an_unreadable_options_json_serves_the_defaults_not_the_xml() {
+        let (tmp, mgr) = manager();
+        let folder = tmp.path().join("default").join("Locked");
+        std::fs::create_dir_all(folder.join(super::OPTIONS_FILE)).expect("unreadable");
+        std::fs::write(
+            folder.join(super::JELLYFIN_OPTIONS_FILE),
+            JELLYFIN_OPTIONS_XML,
+        )
+        .expect("xml");
+        assert_eq!(mgr.load_options(&folder).await, LibraryOptions::default());
+        assert_eq!(
+            FerrofinVirtualFolderManager::read_options(&folder, &mgr.virtual_paths).await,
+            LibraryOptions::default()
+        );
+        assert!(folder.join(super::OPTIONS_FILE).is_dir(), "left alone");
+    }
+
+    /// gl-271: a listing during a structure change serves an adopted library's
+    /// `options.xml` without persisting it, since the save would recreate a
+    /// folder the change removed or renamed; the next listing persists it.
+    #[tokio::test]
+    async fn adopted_options_are_persisted_only_outside_a_structure_change() {
+        let (tmp, mgr) = manager();
+        let folder = tmp.path().join("default").join("Shows");
+        std::fs::create_dir_all(&folder).expect("folder");
+        std::fs::write(
+            folder.join(super::JELLYFIN_OPTIONS_FILE),
+            JELLYFIN_OPTIONS_XML,
+        )
+        .expect("xml");
+        let json_path = folder.join(super::OPTIONS_FILE);
+
+        let change = mgr.structure_change.write().await;
+        let listed = mgr.get_virtual_folders().await.expect("list");
+        let options = listed[0].library_options.as_ref().expect("options");
+        assert_eq!(
+            options.preferred_metadata_language.as_deref(),
+            Some("en"),
+            "the XML served"
+        );
+        assert!(!json_path.exists(), "nothing persisted mid-change");
+
+        drop(change);
+        mgr.get_virtual_folders().await.expect("list");
+        assert!(json_path.exists(), "the next listing persists it");
     }
 
     #[tokio::test]

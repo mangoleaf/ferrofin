@@ -155,8 +155,7 @@ Conventions:
   `LocationsExcluded` config + inactive-library eligibility filters, the two
   24-hour dashboard tasks, and the vendored settings page. Routes and tasks
   self-gate on the plugin's enabled flag (disabled → routes 404, tasks no-op).
-- Divergence PENDING OWNER DECISION (D10 in
-  `brain/plans/PLAN_ITEM_FILE_DELETION.md`): the pinned plugin (`e6f58d6`,
+- Divergence PENDING OWNER DECISION: the pinned plugin (`e6f58d6`,
   `MergeVersionsManager.cs:211-233`) writes a merge as OWNED local versions —
   each alternate gets `OwnerId` = the primary and the primary's
   `LocalAlternateVersions` lists it, so the save writes `ChildType` 2 rows —

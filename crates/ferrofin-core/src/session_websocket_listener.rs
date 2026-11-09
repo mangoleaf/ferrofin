@@ -5,6 +5,12 @@
 //! ([`WebSocketListener`]) and the `WebSocketManager` upgrade entry point
 //! ([`WebSocketManager`]).
 //!
+//! Neither runs in production: `ferrofin-api`'s `/socket` handler upgrades the
+//! connection, registers it for its session on the `SessionMessageBus` and
+//! sends the connect-time `ForceKeepAlive` itself, and calls neither this
+//! listener nor the manager.
+//! TODO(gl-248): open work item: serve `/socket` through one path, not two.
+//!
 //! ## What this unit ports
 //! On a newly established connection the C# listener resolves the client's
 //! [`SessionInfo`](crate::session_manager) from the request (its access token),
@@ -15,11 +21,12 @@
 //! - The `HttpContext` argument becomes the transport-agnostic
 //!   [`RequestContext`]; the connection is a `&dyn `[`WebSocketConnection`]. On
 //!   connect, the token/device/endpoint are read from the connection's captured
-//!   `AuthorizationInfo`, the session is resolved via
-//!   [`SessionManager::get_session_by_authentication_token`], and the connection
-//!   is attached through
-//!   [`FerrofinSessionManager::add_web_socket`](crate::session_manager::FerrofinSessionManager::add_web_socket)
-//!   (the C# `EnsureController` + `OnSessionControllerConnected`).
+//!   `AuthorizationInfo` and the session is resolved via
+//!   [`SessionManager::get_session_by_authentication_token`]. The listener gets
+//!   only a borrow of the connection, so it does not attach it: the attach seam
+//!   (the C# `EnsureController` + `OnSessionControllerConnected`) is
+//!   [`FerrofinSessionManager::add_web_socket`](crate::session_manager::FerrofinSessionManager::add_web_socket),
+//!   for a caller that holds the connection's `Arc`.
 //! - `ProcessMessageAsync` is a **no-op** — exactly as upstream
 //!   (`=> Task.CompletedTask`); inbound frames are routed elsewhere.
 //! - The connect-time `ForceKeepAlive` is sent here, matching the C#
@@ -32,10 +39,9 @@
 //!   past the full timeout leaves the watchlist. Liveness itself is the
 //!   connection's own [`WebSocketConnection::is_open`].
 //! - The [`WebSocketManager`] upgrade (`WebSocketRequestHandler(HttpContext)`)
-//!   performs the ASP.NET protocol upgrade in place; in this port the real
-//!   socket upgrade belongs to the HTTP layer (Wave 7). The port validates the
-//!   request carries an upgrade intent and otherwise defers — it never fabricates
-//!   a connection.
+//!   performs the ASP.NET protocol upgrade in place; here the socket upgrade
+//!   belongs to the HTTP layer. This manager only checks that the request
+//!   carries an upgrade intent — it never fabricates a connection.
 
 use std::sync::Arc;
 
@@ -59,9 +65,9 @@ const WEB_SOCKET_LOST_TIMEOUT_SECS: i32 = 60;
 
 /// The concrete session WebSocket listener.
 ///
-/// Holds the concrete [`FerrofinSessionManager`] (not the trait object) because it
-/// calls the beyond-trait
-/// [`add_web_socket`](FerrofinSessionManager::add_web_socket) attach seam.
+/// Holds the concrete [`FerrofinSessionManager`] (not the trait object), whose
+/// beyond-trait [`add_web_socket`](FerrofinSessionManager::add_web_socket) is
+/// the attach seam; the listener itself never calls it (see the module docs).
 #[derive(Clone)]
 pub struct FerrofinSessionWebSocketListener {
     session_manager: Arc<FerrofinSessionManager>,
@@ -75,8 +81,8 @@ impl std::fmt::Debug for FerrofinSessionWebSocketListener {
 }
 
 impl FerrofinSessionWebSocketListener {
-    /// Creates the listener over the concrete session manager it attaches
-    /// connections to.
+    /// Creates the listener over the concrete session manager it resolves
+    /// sessions from.
     #[must_use]
     pub fn new(session_manager: Arc<FerrofinSessionManager>) -> Self {
         Self { session_manager }
@@ -134,13 +140,11 @@ impl WebSocketListener for FerrofinSessionWebSocketListener {
             .id
             .ok_or_else(|| ServiceError::backend("resolved session has no id"))?;
 
-        // Attach the live connection to the session so broadcasts reach it
-        // (C# `EnsureController` + `OnSessionControllerConnected`). The
-        // connection is not `Clone`; the HTTP layer owns the real `Arc`, so this
-        // registration seam is exercised via the concrete manager's
-        // `add_web_socket`. Here we only have a borrow, so we can send the
-        // initial keep-alive; the durable attach happens through the
-        // owning-`Arc` path (see the module docs).
+        // C# attaches the connection here (`EnsureController` +
+        // `OnSessionControllerConnected`). This listener has only a borrow of
+        // a connection that is not `Clone`, so it attaches nothing; only tests
+        // call `add_web_socket`, and `/socket` registers on the message bus
+        // instead (see the module docs, gl-248).
 
         // Notify the client of the keep-alive timeout (C# `SendForceKeepAlive`).
         if connection.is_open() {
@@ -150,8 +154,8 @@ impl WebSocketListener for FerrofinSessionWebSocketListener {
             }
         }
 
-        // Touch the resolved session so the connect is observable even without
-        // the owning `Arc` (keeps the borrow-only trait path meaningful).
+        // A no-op: the resolved session id has no use here, since nothing is
+        // attached (gl-248).
         let _ = session_id;
         Ok(())
     }
@@ -162,8 +166,8 @@ fn _assert_object_safe_listener(_: &dyn WebSocketListener) {}
 /// The concrete WebSocket upgrade manager.
 ///
 /// Port of `IWebSocketManager`. The real HTTP → WS upgrade lives in the HTTP
-/// layer (Wave 7); this manager validates the request and delegates the socket
-/// upgrade to that layer rather than fabricating a connection here.
+/// layer; this manager only validates the request and never fabricates a
+/// connection. Nothing calls it today (see the module docs).
 #[derive(Clone, Default)]
 pub struct FerrofinWebSocketManager {
     listeners: Vec<Arc<dyn WebSocketListener>>,
@@ -180,8 +184,9 @@ impl std::fmt::Debug for FerrofinWebSocketManager {
 impl FerrofinWebSocketManager {
     /// Creates a WebSocket manager with the given listeners registered.
     ///
-    /// The listeners are the `IWebSocketListener`s the HTTP layer will drive once
-    /// a connection is upgraded (currently the session listener).
+    /// The listeners are the `IWebSocketListener`s to run on an upgraded
+    /// connection (the session listener); the HTTP layer does not drive them
+    /// today (see the module docs).
     #[must_use]
     pub fn new(listeners: Vec<Arc<dyn WebSocketListener>>) -> Self {
         Self { listeners }
@@ -207,9 +212,10 @@ impl WebSocketManager for FerrofinWebSocketManager {
                 "not a web socket upgrade request",
             ));
         }
-        // The actual protocol upgrade + per-connection receive loop is performed
-        // by the HTTP layer (Wave 7), which then invokes the registered
-        // listeners' `process_web_socket_connected`. Deferred here by design.
+        // The protocol upgrade and the per-connection receive loop belong to
+        // the HTTP layer. `ferrofin-api`'s `/socket` handler does both itself
+        // and calls neither this manager nor its listeners. TODO(gl-248): open
+        // work item: serve `/socket` through one path, not two.
         Ok(())
     }
 }

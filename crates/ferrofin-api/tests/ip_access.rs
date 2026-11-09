@@ -68,6 +68,51 @@ async fn a_remote_ip_allowlist_admits_only_what_it_names() {
     );
 }
 
+/// Everything logged while a test runs.
+#[derive(Clone, Default)]
+struct Captured(Arc<std::sync::Mutex<Vec<u8>>>);
+
+impl std::io::Write for Captured {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().expect("log").extend_from_slice(buf);
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// A refused request is logged once, at `warn`, by the gate, and never at
+/// `error`: the request span does not repeat it, so a refused client's every
+/// retry is not an error line (gl-904).
+#[tokio::test]
+async fn a_refusal_is_logged_once_at_warn() {
+    let captured = Captured::default();
+    let writer = captured.clone();
+    let subscriber = tracing_subscriber::fmt()
+        .with_ansi(false)
+        .with_writer(move || writer.clone())
+        .finish();
+    let _guard = tracing::subscriber::set_default(subscriber);
+    let config = NetworkConfiguration {
+        remote_ip_filter: vec!["198.51.100.0/24".to_owned()],
+        is_remote_ip_filter_blacklist: true,
+        ..NetworkConfiguration::default()
+    };
+    assert_eq!(
+        public_info_from(state_with_network(config), "198.51.100.4:5000").await,
+        StatusCode::SERVICE_UNAVAILABLE
+    );
+    let log = String::from_utf8(captured.0.lock().expect("log").clone()).expect("utf-8");
+    let refusals: Vec<&str> = log
+        .lines()
+        .filter(|line| line.contains("blocking request due to an IP filtering rule"))
+        .collect();
+    assert_eq!(refusals.len(), 1, "{log}");
+    assert!(refusals[0].contains(" WARN "), "{log}");
+    assert!(!log.contains(" ERROR "), "{log}");
+}
+
 /// A blocklist is the same rule inverted.
 #[tokio::test]
 async fn a_remote_ip_blocklist_refuses_only_what_it_names() {

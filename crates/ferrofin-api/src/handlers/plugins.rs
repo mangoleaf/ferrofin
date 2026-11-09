@@ -55,11 +55,12 @@ use crate::state::AppState;
 /// Without this gate, any authenticated account (a guest profile, a stolen
 /// playback token) could stage arbitrary code for the next boot.
 ///
-/// Deliberate posture divergence: other admin controllers note that
-/// elevation is "deferred to the composition root", but this controller
-/// gates **in-handler** — staging executable code is not mutating metadata,
-/// and the gate must hold even if the composition changes. Don't "fix" this
-/// back for consistency.
+/// Deliberate: this controller gates **in-handler**. Most of its routes take
+/// [`RequireAuth`] and call this check, and the mutating routes that take
+/// [`RequireAdmin`] call it too (the read-only ones rely on the extractor, as
+/// other admin controllers do) — staging executable code is not mutating
+/// metadata, and the gate must hold even if a route's extractor changes.
+/// Don't drop it for consistency.
 async fn require_admin(
     state: &AppState,
     auth: &ferrofin_traits::options::AuthorizationInfo,

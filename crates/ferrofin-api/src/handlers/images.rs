@@ -39,11 +39,11 @@
 //! body is base64-encoded image bytes with the MIME type in the `Content-Type`
 //! header (Jellyfin's `[AcceptsImageFile]`), decoded via the shared
 //! `image_upload` helpers and handed to
-//! `ProviderManager::save_image`/`ProviderManager::delete_image`. These call
-//! through to the image-store seam; the concrete shell manager reports the image
-//! pipeline as deferred (as it does for `queue_refresh`), so the request shape,
-//! `400`/`404` validation, and the `save_image`/`delete_image` contract here are
-//! final while the on-disk pipeline is a later wave.
+//! `ProviderManager::save_image`/`ProviderManager::delete_image`. The
+//! provider manager writes the file into the item's metadata folder (the image
+//! saver moves it beside the media when the library saves artwork there),
+//! records the image row and saves the item; a delete removes the rows, then
+//! their local files.
 
 use std::borrow::Cow;
 
