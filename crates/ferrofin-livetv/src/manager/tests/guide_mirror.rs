@@ -385,7 +385,7 @@ async fn a_logo_that_is_no_url_leaves_no_row_and_takes_the_stored_one(
     .await;
     lab.mgr.refresh_guide().await.expect("first refresh");
     let channels =
-        crate::guide_repository::channel_rows(&lab.mgr.db, &LiveTvChannelQuery::default())
+        crate::guide_repository::channel_rows(&lab.mgr.db, &LiveTvChannelQuery::default(), None)
             .await
             .expect("channels");
     assert_eq!(channels.len(), 1);

@@ -10,9 +10,33 @@ use sqlx::Row as _;
 use uuid::Uuid;
 
 use ferrofin_traits::error::{ServiceError, db_err};
+use ferrofin_traits::options::InternalItemsQuery;
+use ferrofin_traits::persistence::ParentalRestrictions;
 use ferrofin_traits::stubs::LiveTvChannelQuery;
 
 use crate::projection::{ChannelRow, ChannelUserData, ProgramRow};
+
+/// A user's parental restrictions for a guide read: the item layer's
+/// predicate and the query its user's preferences were loaded onto.
+pub(crate) type UserRestrictions<'a> =
+    Option<&'a (&'a dyn ParentalRestrictions, InternalItemsQuery)>;
+
+/// Pushes the user's maximum rating, blocked unrated kinds and inherited
+/// tags, as `TranslateQuery` applies them to the programme or channel items
+/// upstream lists: an `EXISTS` over the `BaseItems` row whose id is
+/// `id_column`, a trusted column expression (never a value). A guide row whose
+/// item is not stored yet is not shown to such a user.
+pub(crate) fn push_item_restrictions(
+    qb: &mut sqlx::QueryBuilder<sqlx::Sqlite>,
+    id_column: &str,
+    (filter, user): &(&dyn ParentalRestrictions, InternalItemsQuery),
+) {
+    qb.push(format_args!(
+        r#"EXISTS (SELECT 1 FROM "BaseItems" bi WHERE bi."Id" = {id_column}"#
+    ));
+    filter.push_restrictions(qb, user, "bi");
+    qb.push(")");
+}
 
 /// The columns a guide list read returns, joined to the owning channel for
 /// `ChannelName`. Held apart from the filters so the `WHERE`/`ORDER`/`LIMIT`
@@ -34,14 +58,18 @@ pub(crate) const PROGRAM_SELECT: &str = r#"SELECT p."Id",p."ChannelId",p."StartD
 /// tag). The kinds it does not filter on read as `false`: only the channel
 /// kind filters read them, and each one costs a pass over the airings.
 ///
+/// `restrictions` are the user's parental restrictions, which keep only the
+/// channels whose item that user may list.
+///
 /// # Errors
 ///
 /// Fails when the database read fails.
-pub async fn channel_rows(
+pub(crate) async fn channel_rows(
     db: &Database,
     query: &LiveTvChannelQuery,
+    restrictions: UserRestrictions<'_>,
 ) -> Result<Vec<ChannelRow>, ServiceError> {
-    channel_rows_query(query)
+    channel_rows_query(query, restrictions)
         .build_query_as()
         .fetch_all(db.pool())
         .await
@@ -49,7 +77,10 @@ pub async fn channel_rows(
 }
 
 /// [`channel_rows`]' statement, shared with its plan pin.
-fn channel_rows_query(query: &LiveTvChannelQuery) -> sqlx::QueryBuilder<sqlx::Sqlite> {
+fn channel_rows_query(
+    query: &LiveTvChannelQuery,
+    restrictions: UserRestrictions<'_>,
+) -> sqlx::QueryBuilder<sqlx::Sqlite> {
     let mut qb = sqlx::QueryBuilder::new(
         r#"SELECT "Id","TvgId","ExternalId","Name","Number","ChannelType","DateCreated","ImageUrl""#,
     );
@@ -66,7 +97,12 @@ fn channel_rows_query(query: &LiveTvChannelQuery) -> sqlx::QueryBuilder<sqlx::Sq
             ));
         }
     }
-    qb.push(r#" FROM "FerrofinLiveTvChannels" ORDER BY "SortIndex", "Name""#);
+    qb.push(r#" FROM "FerrofinLiveTvChannels""#);
+    if let Some(restrictions) = restrictions {
+        qb.push(" WHERE ");
+        push_item_restrictions(&mut qb, r#""FerrofinLiveTvChannels"."Id""#, restrictions);
+    }
+    qb.push(r#" ORDER BY "SortIndex", "Name""#);
     qb
 }
 
@@ -768,12 +804,13 @@ pub mod test_support {
     }
 
     /// The `EXPLAIN QUERY PLAN` details of [`super::channel_rows`]' statement
-    /// for `query`, in plan order.
-    pub async fn channel_rows_plan(
+    /// for `query` and `restrictions`, in plan order.
+    pub(crate) async fn channel_rows_plan(
         db: &Database,
         query: &super::LiveTvChannelQuery,
+        restrictions: super::UserRestrictions<'_>,
     ) -> Result<Vec<String>, ServiceError> {
-        plan(db, super::channel_rows_query(query)).await
+        plan(db, super::channel_rows_query(query, restrictions)).await
     }
 
     /// The `EXPLAIN QUERY PLAN` details of `qb`'s statement, in plan order.

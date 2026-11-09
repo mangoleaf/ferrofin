@@ -16,11 +16,16 @@
 //! Artwork is the other way round: upstream validates a locked item's local
 //! images like any other's (`CanRefreshImages` enables `ILocalImageProvider`
 //! before its `IsLocked` check), so the scan rediscovers them.
+//!
+//! A lock or an edit made while the scan runs (`PriorityLane::edited`) is
+//! seen by the walk before it reaches the item: upstream's metadata editor
+//! changes the cached item the refresh merges onto.
 
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use ferrofin_core::item_type_lookup::ItemTypeLookup;
+use ferrofin_core::library_scan::{LaneRefresh, PriorityLane, ScanCancel, ScanOutcome, ScanRun};
 use ferrofin_core::{
     FerrofinItemPersistenceService, FerrofinItemRepository, FerrofinVirtualFolderManager,
     LibraryScanner,
@@ -28,8 +33,11 @@ use ferrofin_core::{
 use ferrofin_db::Database;
 use ferrofin_model::configuration::{LibraryOptions, MediaPathInfo};
 use ferrofin_model::entities::CollectionTypeOptions;
-use ferrofin_traits::library::VirtualFolderManager;
+use ferrofin_traits::error::ServiceError;
+use ferrofin_traits::library::{ScanTarget, VirtualFolderManager};
 use ferrofin_traits::persistence::ItemRepository;
+use ferrofin_traits::providers::{MetadataRefreshMode, MetadataRefreshOptions};
+use uuid::Uuid;
 
 /// Builds a one-movie library (media file + a poster beside it) and wires a
 /// scanner over an in-memory database.
@@ -187,4 +195,178 @@ async fn the_scan_reads_the_locked_set_from_the_repository() {
         1,
         "the locked movie is the one row the scan's per-scan read returns"
     );
+}
+
+/// Adds a second movie to [`one_movie_library`]'s library.
+fn add_second_movie(root: &Path) {
+    let folder = root.join("movies").join("Movie 0002 (2020)");
+    std::fs::create_dir_all(&folder).expect("fixture dirs");
+    std::fs::write(folder.join("Movie 0002 (2020).mkv"), b"").expect("media file");
+}
+
+/// A priority lane with no refresh to serve. At its first call once the
+/// walk is past its first item, and so past the read of the stored-row window
+/// holding the movies, it runs `edit` on the movie rows as the metadata
+/// editor would, and reports the movies it edited as edited outside the scan.
+struct EditingLane {
+    db: Database,
+    /// The edit: an `UPDATE` of the movie rows `RETURNING "Id"`.
+    edit: &'static str,
+    /// The walk's last reported percent: below 96 while it walks.
+    percent: Arc<Mutex<Option<f64>>>,
+    /// The edited movies, once the edit landed.
+    edited: Mutex<Option<Vec<Uuid>>>,
+    /// The edited movies the scan has not taken yet.
+    unread: Mutex<Vec<Uuid>>,
+}
+
+impl PriorityLane for EditingLane {
+    fn next(&self) -> Option<LaneRefresh> {
+        // The walk reports `scanned * 96 / total` before each item, and
+        // nothing reports a percent in (0, 96) before it: the first one is
+        // at its second item, after its first window read. Were the
+        // planning to report one, the edit would land before that read and
+        // the tests would pass without the re-read.
+        let walking = self
+            .percent
+            .lock()
+            .expect("percent")
+            .is_some_and(|p| p > 0.0 && p < 96.0);
+        let mut edited = self.edited.lock().expect("edited");
+        if walking && edited.is_none() {
+            let ids: Vec<String> = tokio::task::block_in_place(|| {
+                tokio::runtime::Handle::current()
+                    .block_on(sqlx::query_scalar(self.edit).fetch_all(self.db.writer()))
+            })
+            .expect("edit");
+            let ids: Vec<Uuid> = ids.iter().map(|id| id.parse().expect("id")).collect();
+            self.unread.lock().expect("unread").extend(&ids);
+            *edited = Some(ids);
+        }
+        None
+    }
+
+    fn done(&self, _refresh: LaneRefresh, _outcome: &Result<ScanOutcome, ServiceError>) {}
+
+    fn edited(&self) -> Vec<Uuid> {
+        std::mem::take(&mut *self.unread.lock().expect("unread"))
+    }
+}
+
+/// Rescans every library with `options` while `edit` of the movies lands
+/// mid-walk, after their stored rows were read.
+async fn rescan_with_edit_mid_walk(
+    scanner: &LibraryScanner,
+    db: &Database,
+    options: &MetadataRefreshOptions,
+    edit: &'static str,
+) {
+    let percent = Arc::new(Mutex::new(None));
+    let report = {
+        let percent = Arc::clone(&percent);
+        move |p: f64| *percent.lock().expect("percent") = Some(p)
+    };
+    let lane = EditingLane {
+        db: db.clone(),
+        edit,
+        percent,
+        edited: Mutex::new(None),
+        unread: Mutex::new(Vec::new()),
+    };
+    let cancel = ScanCancel::new();
+    scanner
+        .scan_target(
+            &ScanTarget::All,
+            ScanRun::new(options, options, &cancel)
+                .with_progress(&report)
+                .with_lane(&lane),
+        )
+        .await
+        .expect("rescan");
+    let edited = lane.edited.lock().expect("edited").clone();
+    assert_eq!(
+        edited.map(|ids| ids.len()),
+        Some(2),
+        "the edit landed while the walk was between items"
+    );
+}
+
+/// An edit made over the API while a saving scan runs, to an item the scan
+/// has read but not reached yet, survives the scan's save of that item: the
+/// walk reads the item again before it merges onto it.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_edit_made_mid_scan_survives_the_scan_saving_the_item() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (scanner, db) = one_movie_library(tmp.path()).await;
+    add_second_movie(tmp.path());
+    scanner.scan_all().await.expect("first scan");
+
+    // A full refresh saves every item.
+    let options = MetadataRefreshOptions {
+        metadata_refresh_mode: MetadataRefreshMode::FullRefresh,
+        ..MetadataRefreshOptions::default()
+    };
+    rescan_with_edit_mid_walk(
+        &scanner,
+        &db,
+        &options,
+        r#"UPDATE "BaseItems" SET "Overview" = 'Typed mid-scan'
+           WHERE "Type" LIKE '%Movies.Movie' RETURNING "Id""#,
+    )
+    .await;
+    let overviews: Vec<Option<String>> = sqlx::query_scalar(
+        r#"SELECT "Overview" FROM "BaseItems" WHERE "Type" LIKE '%Movies.Movie' ORDER BY "Name""#,
+    )
+    .fetch_all(db.pool())
+    .await
+    .expect("overviews");
+    assert_eq!(
+        overviews,
+        [
+            Some("Typed mid-scan".to_owned()),
+            Some("Typed mid-scan".to_owned())
+        ]
+    );
+}
+
+/// A lock applied over the API while a scan runs is honoured for the item
+/// the scan has not reached yet: its changed NFO is not read. The walk takes
+/// the movies in listing order, so which one it reached before the lock
+/// varies; only that one reads its NFO.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_lock_applied_mid_scan_keeps_the_nfo_from_the_item_not_reached_yet() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (scanner, db) = one_movie_library(tmp.path()).await;
+    add_second_movie(tmp.path());
+    scanner.scan_all().await.expect("first scan");
+
+    for (movie, id) in [("Movie 0001 (2020)", 601), ("Movie 0002 (2020)", 602)] {
+        let nfo = tmp
+            .path()
+            .join("movies")
+            .join(movie)
+            .join(format!("{movie}.nfo"));
+        std::fs::write(&nfo, format!("<movie><tmdbid>{id}</tmdbid></movie>")).expect("nfo");
+        touch_ahead(&nfo);
+    }
+    rescan_with_edit_mid_walk(
+        &scanner,
+        &db,
+        &MetadataRefreshOptions::default(),
+        r#"UPDATE "BaseItems" SET "IsLocked" = 1
+           WHERE "Type" LIKE '%Movies.Movie' RETURNING "Id""#,
+    )
+    .await;
+    assert_eq!(
+        tmdb_ids(&db).await.len(),
+        1,
+        "only the movie reached before the lock read its NFO"
+    );
+
+    // Control: unlocked, the same (changed) NFOs are read.
+    set_locked(&db, 0).await;
+    scanner.scan_all().await.expect("rescan while unlocked");
+    let mut ids = tmdb_ids(&db).await;
+    ids.sort();
+    assert_eq!(ids, ["601", "602"]);
 }
