@@ -326,56 +326,6 @@ db_enum! {
     }
 }
 
-db_enum! {
-    /// The image kind stored on a `BaseItemImageInfos` row (`ImageType`).
-    pub enum ImageInfoImageType {
-        /// The primary image.
-        Primary = 0,
-        /// The art.
-        Art = 1,
-        /// The backdrop.
-        Backdrop = 2,
-        /// The banner.
-        Banner = 3,
-        /// The logo.
-        Logo = 4,
-        /// The thumb.
-        Thumb = 5,
-        /// The disc.
-        Disc = 6,
-        /// The box.
-        Box = 7,
-        /// The screenshot (obsolete upstream).
-        Screenshot = 8,
-        /// The menu.
-        Menu = 9,
-        /// The chapter image.
-        Chapter = 10,
-        /// The box rear.
-        BoxRear = 11,
-        /// The user profile image.
-        Profile = 12,
-    }
-}
-
-db_enum! {
-    /// The audio layout of a program (`ProgramAudio`).
-    pub enum ProgramAudioEntity {
-        /// Mono.
-        Mono = 0,
-        /// Stereo.
-        Stereo = 1,
-        /// Dolby.
-        Dolby = 2,
-        /// Dolby Digital.
-        DolbyDigital = 3,
-        /// THX.
-        Thx = 4,
-        /// Atmos.
-        Atmos = 5,
-    }
-}
-
 /// `i32` mapping helpers for [`ferrofin_model::entities::MetadataField`].
 ///
 /// `MetadataField` is reused from `ferrofin-model` (identical discriminants);
