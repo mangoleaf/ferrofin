@@ -19,30 +19,6 @@ pub struct ConfigurationStore {
     pub type_key: String,
 }
 
-/// Payload for the "configuration updated" event.
-///
-/// Port of `ConfigurationUpdateEventArgs`. The C# `object NewConfiguration`
-/// becomes a `type_key` plus the serialized configuration body, keeping the
-/// struct free of a runtime `Type` while still identifying what changed.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct ConfigurationUpdateEventArgs {
-    /// The configuration key that changed.
-    pub key: String,
-    /// A key identifying the type of the new configuration.
-    pub type_key: String,
-}
-
-impl ConfigurationUpdateEventArgs {
-    /// Creates a new event payload for `key`.
-    #[must_use]
-    pub fn new(key: impl Into<String>, type_key: impl Into<String>) -> Self {
-        Self {
-            key: key.into(),
-            type_key: type_key.into(),
-        }
-    }
-}
-
 /// Provides a set of configuration stores for a module or plugin.
 ///
 /// Port of `IConfigurationFactory`. Scanned at startup to dynamically register

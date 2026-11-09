@@ -301,14 +301,6 @@ impl PlaylistUserPermissions {
     }
 }
 
-/// Interface for access to shares.
-pub trait IHasShares {
-    /// Gets the shares.
-    fn shares(&self) -> &[PlaylistUserPermissions];
-    /// Sets the shares.
-    fn set_shares(&mut self, shares: Vec<PlaylistUserPermissions>);
-}
-
 /// Class `LibraryUpdateInfo`.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "PascalCase")]

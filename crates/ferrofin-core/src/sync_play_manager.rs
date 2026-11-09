@@ -29,7 +29,7 @@ use ferrofin_model::sync_play::{
     GroupRepeatMode, GroupShuffleMode, GroupStateType, GroupStateUpdate, GroupUpdate,
     LibraryAccessDeniedUpdate, NotInGroupUpdate, PlayQueueGroupUpdate, PlayQueueUpdate,
     PlayQueueUpdateReason, PlaybackRequestType, SendCommand, SendCommandType, StateUpdate,
-    SyncPlayQueueItem, UserJoinedUpdate, UserLeftUpdate,
+    SyncPlayBroadcastType as Target, SyncPlayQueueItem, UserJoinedUpdate, UserLeftUpdate,
 };
 use ferrofin_traits::error::ServiceError;
 use ferrofin_traits::library::{LibraryManager, UserManager};
@@ -114,23 +114,6 @@ const NO_PLAYING_ITEM_INDEX: i32 = -1;
 /// The two server→client WebSocket message types SyncPlay uses.
 const MSG_COMMAND: &str = "SyncPlayCommand";
 const MSG_GROUP_UPDATE: &str = "SyncPlayGroupUpdate";
-
-/// Who a produced message is addressed to — port of [`SyncPlayBroadcastType`]
-/// and of the `Group.FilterSessions` switch that resolves it (Group.cs:171-189).
-///
-/// [`SyncPlayBroadcastType`]: ferrofin_model::sync_play::SyncPlayBroadcastType
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Target {
-    /// Every member.
-    AllGroup,
-    /// Only the requesting session (a corrective resync of one lagging client).
-    CurrentSession,
-    /// Every member EXCEPT the requesting session — used when the client that
-    /// was buffering is already playing and only the others need to resume.
-    AllExceptCurrentSession,
-    /// Only members that are not buffering (tell the ready ones to wait).
-    AllReady,
-}
 
 /// The four fields a `ReadyGroupRequest` carries, grouped so the reconciliation
 /// arm keeps a readable signature.
@@ -2007,8 +1990,10 @@ fn lock_registry(registry: &Mutex<Registry>) -> std::sync::MutexGuard<'_, Regist
     })
 }
 
-/// Delivers `outbound` to the resolved target sessions. Called after the
-/// registry lock is released (delivery is a non-blocking sink invocation).
+/// Delivers `outbound` to the sessions each message's `SyncPlayBroadcastType`
+/// names, as `Group.FilterSessions` resolves it (Group.cs:171-189). Called
+/// after the registry lock is released (delivery is a non-blocking sink
+/// invocation).
 fn deliver_to(
     bus: &dyn SessionMessageBus,
     members: &[(String, bool)],

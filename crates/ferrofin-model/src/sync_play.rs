@@ -121,23 +121,6 @@ pub enum GroupUpdateType {
     LibraryAccessDenied,
 }
 
-/// The type of a `SyncPlay` request.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize, ToSchema)]
-#[serde(rename_all = "PascalCase")]
-pub enum RequestType {
-    /// A user is requesting to create a new group.
-    #[default]
-    NewGroup = 0,
-    /// A user is requesting to join a group.
-    JoinGroup = 1,
-    /// A user is requesting to leave a group.
-    LeaveGroup = 2,
-    /// A user is requesting the list of available groups.
-    ListGroups = 3,
-    /// A user is sending a playback command to a group.
-    Playback = 4,
-}
-
 /// The type of a command sent to group members.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "PascalCase")]

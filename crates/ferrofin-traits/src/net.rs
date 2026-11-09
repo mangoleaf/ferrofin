@@ -2,8 +2,8 @@
 //!
 //! Port of the `MediaBrowser.Controller.Net` interfaces:
 //! `IAuthorizationContext`, `IAuthService`, `IWebSocketConnection`,
-//! `IWebSocketListener`, `IWebSocketManager`, plus the `WebSocketListenerState`
-//! value type.
+//! `IWebSocketListener`, `IWebSocketManager`. `WebSocketListenerState`'s timing
+//! lives with the push loops, in `ferrofin-api`'s WebSocket handler.
 //!
 //! Port rules applied throughout:
 //! - The C# methods take `HttpContext`/`HttpRequest` (ASP.NET Core). To keep this
@@ -177,22 +177,6 @@ pub trait WebSocketManager: Send + Sync {
 }
 
 fn _assert_object_safe_web_socket_manager(_: &dyn WebSocketManager) {}
-
-/// Per-listener timing state for periodic WebSocket push loops.
-///
-/// Port of `WebSocketListenerState`. The C# `DateTime`/`long` fields map to
-/// [`chrono::DateTime<Utc>`](chrono::DateTime) and [`i64`] millisecond delays.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct WebSocketListenerState {
-    /// UTC timestamp of the last send in this loop.
-    pub date_last_send_utc: chrono::DateTime<chrono::Utc>,
-
-    /// The initial delay before the first send, in milliseconds.
-    pub initial_delay_ms: i64,
-
-    /// The interval between subsequent sends, in milliseconds.
-    pub interval_ms: i64,
-}
 
 #[cfg(test)]
 mod tests {

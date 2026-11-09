@@ -34,7 +34,6 @@ pub mod lyrics;
 pub mod media_info;
 pub mod media_segments;
 pub mod net;
-pub mod notifications;
 pub mod playlists;
 pub mod plugins;
 pub mod providers;
