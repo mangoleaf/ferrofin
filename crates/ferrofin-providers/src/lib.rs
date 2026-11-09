@@ -95,8 +95,7 @@ pub use tvdb::{
 };
 
 pub use container_types::{
-    FileSystemMetadata, ItemInfo, LocalImageInfo, MetadataResult, NfoItem, PersonInfo,
-    RefreshResult, add_person, set_provider_id,
+    FileSystemMetadata, LocalImageInfo, MetadataResult, PersonInfo, add_person, set_provider_id,
 };
 pub use local_images::{
     CollectionFolderLocalImageProvider, DirectoryService, EpisodeLocalImageProvider,

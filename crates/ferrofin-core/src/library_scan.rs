@@ -12278,7 +12278,7 @@ impl LibraryScanner {
     /// season's episodes cost one request between them — the same request the
     /// image pass already makes for the season poster and episode stills.
     /// Its external ids, trailers and credits — the episode's own — come
-    /// from one episode request ([`TmdbClient::episode_extras`]).
+    /// from one episode request ([`TmdbClient::episode_extras_for_language`]).
     ///
     /// `None` when TMDB has nothing for this episode: no series id to look
     /// it up under, no such season, or no such episode in it.

@@ -6,18 +6,12 @@
 //! - [`MetadataResult`] — `MediaBrowser.Controller.Providers.MetadataResult<T>`.
 //! - [`PersonInfo`] — `MediaBrowser.Controller.Entities.PersonInfo` (the small
 //!   person stub attached to library items).
-//! - [`ItemInfo`] — `MediaBrowser.Controller.Providers.ItemInfo` (the save-path
-//!   resolution wrapper handed to providers).
 //! - [`LocalImageInfo`] — `MediaBrowser.Controller.Providers.LocalImageInfo`.
 //! - [`FileSystemMetadata`] — `MediaBrowser.Model.IO.FileSystemMetadata`
 //!   (deliberately dropped from `ferrofin-model` as server-side plumbing, so it is
 //!   re-created locally here for [`LocalImageInfo`]).
-//! - [`NfoItem`] — the union field-bag the NFO parsers populate, with
-//!   [`NfoItem::set_provider_id`] applying the parser's provider-id
-//!   normalization (`SetProviderId`).
-//! - [`RefreshResult`] — `MediaBrowser.Providers.Manager.RefreshResult`.
 //!
-//! `PersonInfo`/`ItemInfo`/`LocalImageInfo`/`MetadataResult` are
+//! `PersonInfo`/`LocalImageInfo`/`MetadataResult` are
 //! `MediaBrowser.Controller.Providers` types **not** present in `ferrofin-model`,
 //! so they are created locally here. The person-add merge/normalize logic is
 //! ported as [`add_person`] (C# `PeopleHelper.AddPerson`).
@@ -26,14 +20,9 @@ use std::collections::HashMap;
 use std::hash::BuildHasher;
 
 use ferrofin_model::data::PersonKind;
-use ferrofin_model::entities::{ImageType, VideoType};
+use ferrofin_model::entities::ImageType;
 use ferrofin_model::entities_media::MetadataProvider;
 use uuid::Uuid;
-
-/// The default result language upstream `MetadataResult` initializes to.
-///
-/// Port of the `ResultLanguage = "en"` set in the C# constructor.
-const DEFAULT_RESULT_LANGUAGE: &str = "en";
 
 /// A person stub attached to a library item.
 ///
@@ -126,14 +115,8 @@ pub struct MetadataResult<T> {
     pub remote_images: Vec<(String, ImageType)>,
     /// Local images discovered on disk (`Images`).
     pub images: Vec<LocalImageInfo>,
-    /// The language of the result (`ResultLanguage`; defaults to `"en"`).
-    pub result_language: String,
     /// The provider that produced the result (`Provider`).
     pub provider: Option<String>,
-    /// Whether the item was queried by id (`QueriedById`).
-    pub queried_by_id: bool,
-    /// Whether any metadata was found (`HasMetadata`).
-    pub has_metadata: bool,
 }
 
 impl<T: Default> Default for MetadataResult<T> {
@@ -144,7 +127,13 @@ impl<T: Default> Default for MetadataResult<T> {
 
 impl<T> MetadataResult<T> {
     /// Creates a result wrapping `item` with upstream constructor defaults
-    /// (`ResultLanguage = "en"`, no people, no metadata).
+    /// (no people, no images).
+    ///
+    /// Upstream's `ResultLanguage`, `QueriedById` and `HasMetadata` are not
+    /// carried: nothing reads them on the local NFO path this type serves (a
+    /// parsed NFO is applied, a failed one skipped, which is `HasMetadata`'s
+    /// job upstream), and the remote path keeps the answer's language beside
+    /// its result ([`crate::episode::EpisodeAnswer::language`]).
     #[must_use]
     pub fn new(item: T) -> Self {
         Self {
@@ -152,10 +141,7 @@ impl<T> MetadataResult<T> {
             people: None,
             remote_images: Vec::new(),
             images: Vec::new(),
-            result_language: DEFAULT_RESULT_LANGUAGE.to_owned(),
             provider: None,
-            queried_by_id: false,
-            has_metadata: false,
         }
     }
 
@@ -179,53 +165,14 @@ impl<T> MetadataResult<T> {
     }
 }
 
-/// A lightweight, item-shape-agnostic view used to resolve save paths.
-///
-/// Port of `MediaBrowser.Controller.Providers.ItemInfo`. The C# constructor
-/// copies these fields off a `BaseItem` (and, for `Video`, its `VideoType` /
-/// `IsPlaceHolder`); the `ItemType` reflection field is dropped as it has no
-/// Rust analogue.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ItemInfo {
-    /// The item's path.
-    pub path: Option<String>,
-    /// The parent item id.
-    pub parent_id: Uuid,
-    /// The episode/track index number, when applicable.
-    pub index_number: Option<i32>,
-    /// The folder that contains the item.
-    pub containing_folder_path: Option<String>,
-    /// The video type (defaults to [`VideoType::VideoFile`] for non-videos).
-    pub video_type: VideoType,
-    /// Whether the item lives in a folder mixed with other content.
-    pub is_in_mixed_folder: bool,
-    /// Whether the item is a placeholder (e.g. an ISO stub).
-    pub is_placeholder: bool,
-}
-
-impl Default for ItemInfo {
-    fn default() -> Self {
-        // `VideoType` has no `Default` in `ferrofin-model`; the C# enum default is
-        // value 0 (`VideoFile`), which is what a non-video item resolves to.
-        Self {
-            path: None,
-            parent_id: Uuid::nil(),
-            index_number: None,
-            containing_folder_path: None,
-            video_type: VideoType::VideoFile,
-            is_in_mixed_folder: false,
-            is_placeholder: false,
-        }
-    }
-}
-
 /// Metadata about a single file-system entry.
 ///
 /// Port of `MediaBrowser.Model.IO.FileSystemMetadata`. This namespace is
 /// server-side filesystem plumbing dropped from `ferrofin-model`, so it is
-/// re-created here for [`LocalImageInfo`]. `LastWriteTimeUtc` / `CreationTimeUtc`
-/// are carried as RFC-3339 strings to avoid a chrono dependency in this
-/// pure-data unit.
+/// re-created here for [`LocalImageInfo`]. `LastWriteTimeUtc` is carried as an
+/// RFC-3339 string to avoid a chrono dependency in this pure-data unit.
+/// `CreationTimeUtc` is not: upstream reads it for `UseFileCreationTimeForDateAdded`,
+/// which the library scan takes from its own `stat` of the media file.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct FileSystemMetadata {
     /// Whether the entry exists (`Exists`).
@@ -240,8 +187,6 @@ pub struct FileSystemMetadata {
     pub length: i64,
     /// The last write time, UTC, RFC-3339 (`LastWriteTimeUtc`).
     pub last_write_time_utc: Option<String>,
-    /// The creation time, UTC, RFC-3339 (`CreationTimeUtc`).
-    pub creation_time_utc: Option<String>,
     /// Whether the entry is a directory (`IsDirectory`).
     pub is_directory: bool,
 }
@@ -255,70 +200,6 @@ pub struct LocalImageInfo {
     pub file_info: FileSystemMetadata,
     /// The kind of image (`Type`).
     pub type_: ImageType,
-}
-
-/// The outcome of a single refresh pass.
-///
-/// Port of `MediaBrowser.Providers.Manager.RefreshResult`.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub struct RefreshResult {
-    /// What parts of the item changed (`UpdateType`).
-    pub update_type: ferrofin_traits::providers::ItemUpdateType,
-    /// A human-readable error message, if the refresh failed (`ErrorMessage`).
-    pub error_message: Option<String>,
-    /// The number of provider failures encountered (`Failures`).
-    pub failures: i32,
-}
-
-/// The union field-bag the NFO parsers populate.
-///
-/// The XbmcMetadata NFO parsers write into a heterogeneous set of item fields; a
-/// faithful port keeps them in one bag here (a later unit drives the parse/write
-/// over it). [`NfoItem::set_provider_id`] applies the parser's provider-id
-/// normalization: the additional mappings `collectionnumber` / `tmdbcolid` /
-/// `tmdbcol` → `TmdbCollection` and `imdb_id` → `Imdb`, layered on top of the
-/// canonical [`MetadataProvider`] case-insensitive matching.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub struct NfoItem {
-    /// External provider ids keyed by (normalized) provider name.
-    pub provider_ids: HashMap<String, String>,
-}
-
-impl NfoItem {
-    /// Creates an empty NFO item.
-    #[must_use]
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// Sets a provider id, applying the NFO parser's normalization.
-    ///
-    /// First maps the parser's additional aliases to their canonical provider
-    /// name (`collectionnumber`/`tmdbcolid`/`tmdbcol` → `TmdbCollection`,
-    /// `imdb_id` → `Imdb`), then delegates to the canonical
-    /// [`set_provider_id`] which case-insensitively matches [`MetadataProvider`]
-    /// spellings. Empty/whitespace keys or values are ignored.
-    pub fn set_provider_id(&mut self, name: &str, value: &str) {
-        let normalized = normalize_nfo_provider_key(name);
-        set_provider_id(&mut self.provider_ids, normalized, value);
-    }
-}
-
-/// Maps an NFO parser provider-id alias to its canonical provider name.
-///
-/// Port of the "Additional Mappings" registered in
-/// `BaseNfoParser` (`_validProviderIds`). Matching is case-insensitive.
-fn normalize_nfo_provider_key(name: &str) -> &str {
-    if name.eq_ignore_ascii_case("collectionnumber")
-        || name.eq_ignore_ascii_case("tmdbcolid")
-        || name.eq_ignore_ascii_case("tmdbcol")
-    {
-        "TmdbCollection"
-    } else if name.eq_ignore_ascii_case("imdb_id") {
-        "Imdb"
-    } else {
-        name
-    }
 }
 
 /// Sets a provider id in `provider_ids`, normalizing the key to the canonical
@@ -474,10 +355,7 @@ mod tests {
     #[test]
     fn metadata_result_defaults_match_csharp_constructor() {
         let result = MetadataResult::new(0_u32);
-        assert_eq!(result.result_language, "en");
         assert!(result.people.is_none());
-        assert!(!result.has_metadata);
-        assert!(!result.queried_by_id);
         assert!(
             result.remote_images.is_empty(),
             "{:?}",
@@ -526,21 +404,6 @@ mod tests {
         set_provider_id(&mut ids, "myprovider", "2");
         assert_eq!(ids.len(), 1);
         assert_eq!(ids.get("myprovider"), Some(&"2".to_owned()));
-    }
-
-    #[test]
-    fn nfo_set_provider_id_applies_additional_mappings() {
-        let mut item = NfoItem::new();
-        item.set_provider_id("collectionnumber", "10");
-        item.set_provider_id("imdb_id", "tt99");
-        item.set_provider_id("tmdbcolid", "20");
-        assert_eq!(
-            item.provider_ids.get("TmdbCollection"),
-            Some(&"20".to_owned())
-        );
-        assert_eq!(item.provider_ids.get("Imdb"), Some(&"tt99".to_owned()));
-        // collectionnumber and tmdbcolid both map to TmdbCollection (last wins).
-        assert_eq!(item.provider_ids.len(), 2);
     }
 
     #[test]
