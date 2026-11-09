@@ -723,6 +723,10 @@ pub struct MediaStream {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub video_range_type: Option<VideoRangeType>,
+    /// The Dolby Vision title ("Dolby Vision Profile 8.1 (HDR10)"), from
+    /// [`video_dovi_title`](Self::video_dovi_title). Populated when the DTO is built.
+    #[serde(rename = "VideoDoViTitle", skip_serializing_if = "Option::is_none")]
+    pub video_dovi_title: Option<String>,
     /// The spatial audio format (Dolby Atmos / DTS:X), from
     /// [`audio_spatial_format`](Self::audio_spatial_format). Populated when the DTO is built.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -816,12 +820,13 @@ impl MediaStream {
         }
     }
 
-    /// Materializes the computed-property fields (video range, spatial audio,
-    /// text-subtitle flag, reference frame rate) into their DTO slots, matching
+    /// Materializes the computed-property fields (video range, Dolby Vision title,
+    /// spatial audio, text-subtitle flag, reference frame rate) into their DTO slots, matching
     /// Jellyfin, which serializes these as getters. Call when building a wire DTO.
     pub fn populate_computed_fields(&mut self) {
         self.video_range = Some(self.video_range());
         self.video_range_type = Some(self.video_range_type());
+        self.video_dovi_title = self.video_dovi_title();
         self.audio_spatial_format = Some(self.audio_spatial_format());
         self.is_text_subtitle_stream = Some(self.is_text_subtitle_stream());
         self.reference_frame_rate = self.reference_frame_rate();
@@ -2371,6 +2376,35 @@ mod tests {
         assert_eq!(json["AudioSpatialFormat"], "DolbyAtmos");
         assert_eq!(json["IsTextSubtitleStream"], false);
         assert!(json.get("VideoRange").is_some() && json.get("ReferenceFrameRate").is_some());
+    }
+
+    #[rstest::rstest]
+    #[case("mkv-dvhe.05-eac3-28000k")]
+    #[case("mkv-dvhe.08-eac3-15200k")]
+    #[case("mp4-dvh1.05-eac3-15200k")]
+    #[case("mp4-dvhe.08-eac3-15200k")]
+    #[case("mkv-h264-hi10p-aac-5000k-brokenfps")]
+    fn populated_video_dovi_title_matches_jellyfin_output(#[case] source: &str) {
+        // Oracle: Jellyfin's own MediaSourceInfo output, read with the getter's key removed.
+        let path = format!(
+            "{}/tests/data/MediaSourceInfo-{source}.json",
+            env!("CARGO_MANIFEST_DIR")
+        );
+        let info: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+        for wire in info["MediaStreams"].as_array().unwrap() {
+            let mut input = wire.clone();
+            input.as_object_mut().unwrap().remove("VideoDoViTitle");
+            let mut stream: MediaStream = serde_json::from_value(input).unwrap();
+            stream.populate_computed_fields();
+            let json = serde_json::to_value(&stream).unwrap();
+            assert_eq!(
+                json.get("VideoDoViTitle"),
+                wire.get("VideoDoViTitle"),
+                "{source} stream {}",
+                wire["Index"]
+            );
+        }
     }
 
     #[test]
