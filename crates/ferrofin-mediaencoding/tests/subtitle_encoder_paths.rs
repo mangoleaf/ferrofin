@@ -38,17 +38,24 @@ struct RecordingIo {
     /// The `(size, .NET ticks)` stamp of each source path; a path not here
     /// does not exist as a source.
     stamps: Mutex<HashMap<String, (u64, i64)>>,
+    /// Every path `read_file` was asked for, in order.
+    reads: Mutex<Vec<String>>,
 }
 
 impl RecordingIo {
     fn calls(&self) -> Vec<(String, Vec<String>)> {
         self.extract_calls.lock().unwrap().clone()
     }
+
+    fn reads(&self) -> Vec<String> {
+        self.reads.lock().unwrap().clone()
+    }
 }
 
 #[async_trait]
 impl SubtitleIo for RecordingIo {
     async fn read_file(&self, path: &str) -> std::io::Result<Vec<u8>> {
+        self.reads.lock().unwrap().push(path.to_owned());
         self.files
             .lock()
             .unwrap()
@@ -121,6 +128,14 @@ impl SubtitleIo for RecordingIo {
             self.files.lock().unwrap().contains_key(path)
         } else {
             std::path::Path::new(path).is_file()
+        }
+    }
+
+    async fn open_file(&self, path: &str) -> std::io::Result<()> {
+        if self.files.lock().unwrap().contains_key(path) {
+            Ok(())
+        } else {
+            Err(std::io::ErrorKind::NotFound.into())
         }
     }
 
@@ -475,6 +490,9 @@ impl SubtitleIo for ArcIo {
     }
     fn file_exists(&self, path: &str) -> bool {
         self.0.file_exists(path)
+    }
+    async fn open_file(&self, path: &str) -> std::io::Result<()> {
+        self.0.open_file(path).await
     }
     fn file_stamp(&self, path: &str) -> Option<(u64, i64)> {
         self.0.file_stamp(path)
@@ -853,6 +871,110 @@ async fn get_trimmed_subtitles_refuses_a_bitmap_sidecar() {
         .unwrap_err();
 
     assert!(error.to_string().contains("Unsupported format"), "{error}");
+}
+
+// -- get_subtitles: what it reads -------------------------------------------
+
+/// A track no parser reads (a PGS `.sup` or VobSub `.mks`, megabytes) asked
+/// for in another format is refused with `Parse`'s error without its file
+/// being read (gl-1495). A text track is still read and parsed (these bytes
+/// hold no cue, so its parse fails), and a bitmap track asked for in its own
+/// format still comes back whole. No other format reaches this point:
+/// `get_readable_file` converts external text the parser cannot read to SubRip,
+/// and extracts embedded tracks only as SubRip, ASS, SSA, PGS or VobSub.
+#[rstest::rstest]
+#[case::subrip(
+    sidecar("subrip", "/m/a.srt"),
+    "/m/a.srt",
+    "vtt",
+    true,
+    Err("Unsupported format: srt")
+)]
+#[case::ass(
+    sidecar("ass", "/m/a.ass"),
+    "/m/a.ass",
+    "srt",
+    true,
+    Err("Unsupported format: ass")
+)]
+#[case::ssa(
+    sidecar("ssa", "/m/a.ssa"),
+    "/m/a.ssa",
+    "vtt",
+    true,
+    Err("Unsupported format: ssa")
+)]
+#[case::webvtt(
+    sidecar("webvtt", "/m/a.vtt"),
+    "/m/a.vtt",
+    "srt",
+    true,
+    Err("Unsupported format: vtt")
+)]
+#[case::pgs_as_itself(sidecar("pgssub", "/m/a.sup"), "/m/a.sup", "pgssub", true, Ok(()))]
+#[case::pgs_sidecar(
+    sidecar("pgssub", "/m/a.sup"),
+    "/m/a.sup",
+    "vtt",
+    false,
+    Err("Unsupported file extension: pgssub")
+)]
+#[case::embedded_pgs(
+    sub_stream(2, "PGSSUB", None, false),
+    "/cache/msrc/2.sup",
+    "srt",
+    false,
+    Err("Unsupported file extension: PGSSUB")
+)]
+#[case::embedded_vobsub(
+    sub_stream(2, "dvdsub", None, false),
+    "/cache/msrc/2.mks",
+    "ass",
+    false,
+    Err("Unsupported file extension: mks")
+)]
+#[tokio::test]
+async fn get_subtitles_reads_only_a_track_it_can_parse_or_return_as_is(
+    #[case] stream: MediaStream,
+    #[case] file: &str,
+    #[case] format: &str,
+    #[case] read: bool,
+    #[case] expected: Result<(), &str>,
+) {
+    const BYTES: &[u8] = b"no cue here\n";
+    let recorder = std::sync::Arc::new(RecordingIo {
+        files_exist: true,
+        ..RecordingIo::default()
+    });
+    recorder
+        .files
+        .lock()
+        .unwrap()
+        .insert(file.to_owned(), BYTES.to_vec());
+    let encoder = SubtitleEncoder::new(SubtitleEditParser::new(), ArcIo(recorder.clone()));
+    let source = source_with("msrc", "/m/movie.mkv", vec![stream.clone()]);
+
+    let result = encoder
+        .get_subtitles(&source, &stream, format, 0, 0, false)
+        .await;
+
+    match expected {
+        Ok(()) => assert_eq!(result.unwrap(), BYTES),
+        Err(message) => {
+            let error = result.unwrap_err();
+            assert!(
+                matches!(error, MediaEncodingError::InvalidInput(_)),
+                "{error:?}"
+            );
+            assert!(error.to_string().contains(message), "{error}");
+        }
+    }
+    assert_eq!(
+        recorder.reads().contains(&file.to_owned()),
+        read,
+        "reads: {:?}",
+        recorder.reads()
+    );
 }
 
 // -- extract_all_extractable_subtitles: failure handling --------------------

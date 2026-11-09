@@ -458,8 +458,8 @@ numbers with a flag in full reports; flagged cells and their ratios are withheld
 the generated root README. Historical logs retain their original, limited shape evidence.
 Their timing repetition count defaults to the original five unless recorded explicitly.
 
-Needs `docker`, `k6`, `jq`, `taskset`, `python3`, `curl`, `sha256sum`, `timeout` and
-`setsid` on PATH, plus `ffprobe` when selecting TTFS; `run.sh` checks before starting.
+Needs `docker`, `k6`, `jq`, `taskset`, `python3`, `curl`, `sha256sum`, `timeout`, `setsid` and
+`flock` on PATH, plus `ffprobe` when selecting TTFS; `run.sh` checks before starting.
 Building the test data additionally needs `ffmpeg` (with libx264 and libx265), `ffprobe`
 and Python `Pillow`.
 

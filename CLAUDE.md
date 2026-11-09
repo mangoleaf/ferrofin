@@ -332,7 +332,7 @@ Jellyfin. Read [`gates/bench/README.md`](gates/bench/README.md) first — it def
 sentence.
 
 ```bash
-# needs docker, k6, jq, taskset, curl, python3, sha256sum, timeout, setsid; ffprobe for TTFS
+# needs docker, k6, jq, taskset, curl, python3, sha256sum, timeout, setsid, flock; ffprobe for TTFS
 # plus ffmpeg (libx264 + libx265) and Python Pillow to build the test data
 export FERROFIN_GATES_DIR=/srv/gates           # output root: absolute, local disk, outside the repo (gates/lib.sh)
 docker pull jellyfin/jellyfin:10.11.8
