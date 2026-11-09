@@ -352,6 +352,7 @@ impl RunningJob {
                 stopped: false,
                 last_progress: None,
                 size_failure: None,
+                panicked: false,
             })),
             run_time_ticks: state.run_time_ticks,
             start_time_ticks: state.base_request.start_time_ticks,
@@ -380,6 +381,7 @@ fn hls_start_number(arguments: &[String]) -> i32 {
 }
 
 /// Per-job control state, serialized with teardown.
+#[allow(clippy::struct_excessive_bools)] // independent flags, not one state machine
 struct ThrottleController {
     keys: Option<super::throttler::PauseKeys>,
     /// Whether this job was eligible and live when its timer was armed. Only
@@ -392,6 +394,9 @@ struct ThrottleController {
     /// The progressive output-size failure last logged at `warn`; cleared by a
     /// successful read.
     size_failure: Option<String>,
+    /// Whether this job's controls step has panicked before, so a repeat
+    /// logs at `debug`.
+    panicked: bool,
 }
 
 impl ThrottleController {
@@ -824,9 +829,13 @@ impl<S: SessionReporter, C: FileCleaner> TranscodeManagerImpl<S, C> {
     /// Configuration read failures are logged and resume a paused encoder; they
     /// cannot leave playback stalled behind an unreadable settings document.
     ///
+    /// A job whose step panics is logged with its path and session, at
+    /// `error` the first time and at `debug` after that; the jobs after it
+    /// still get their steps, and its own is retried at the next pass.
+    ///
     /// # Panics
     ///
-    /// Panics if the registry or progress mutex has been poisoned.
+    /// Panics if the registry mutex has been poisoned.
     pub async fn update_transcoding_jobs(&self) {
         self.update_transcoding_jobs_with_options(None).await;
     }
@@ -855,70 +864,87 @@ impl<S: SessionReporter, C: FileCleaner> TranscodeManagerImpl<S, C> {
         };
         for (handle, child, controller, progress, runtime, start, mut info) in running {
             let mut controller = controller.lock().await;
-            if controller.stopped {
-                continue;
-            }
-            if child.has_exited() {
-                controller.stopped = true;
-                continue;
-            }
-            if let Some(report) = child.progress()
-                && controller.last_progress != Some(report)
-            {
-                controller.last_progress = Some(report);
-                if let Some(encoded) = report.for_job(runtime, start) {
-                    progress.lock().expect("progress lock poisoned").encoded = encoded;
-                    info.framerate = encoded.framerate;
-                    info.completion_percentage = encoded.percent_complete;
-                    info.bitrate = encoded.bit_rate.or(info.bitrate);
-                    self.reporter.report_progress(&handle, encoded).await;
-                    if handle
-                        .device_id
-                        .as_deref()
-                        .is_some_and(|device| !device.trim().is_empty())
-                    {
-                        self.reporter.report_started(&handle, info).await;
+            // One job's panic ends its own step, not the pass: the jobs after
+            // it still get theirs (gl-1412), as upstream's per-job timers do.
+            let step = async {
+                if controller.stopped {
+                    return;
+                }
+                if child.has_exited() {
+                    controller.stopped = true;
+                    return;
+                }
+                if let Some(report) = child.progress()
+                    && controller.last_progress != Some(report)
+                {
+                    controller.last_progress = Some(report);
+                    if let Some(encoded) = report.for_job(runtime, start) {
+                        progress.lock().expect("progress lock poisoned").encoded = encoded;
+                        info.framerate = encoded.framerate;
+                        info.completion_percentage = encoded.percent_complete;
+                        info.bitrate = encoded.bit_rate.or(info.bitrate);
+                        self.reporter.report_progress(&handle, encoded).await;
+                        if handle
+                            .device_id
+                            .as_deref()
+                            .is_some_and(|device| !device.trim().is_empty())
+                        {
+                            self.reporter.report_started(&handle, info).await;
+                        }
                     }
                 }
-            }
-            let Some(keys) = controller.keys_now(&self.pause_keys) else {
-                continue;
-            };
-            if Instant::now() < controller.next_tick {
-                continue;
-            }
-            controller.next_tick = Instant::now() + super::throttler::THROTTLE_INTERVAL;
-            // Each due timer reads the live document once. The 500ms stderr
-            // pump never performs settings reads for jobs with no due timer.
-            let options = if let Some(options) = override_options {
-                options.clone()
-            } else if let Some(config) = &self.encoding_config {
-                self.throttle_options.read(config.as_ref()).await
-            } else {
-                ferrofin_model::configuration::EncodingOptions::default()
-            };
-            let progress = *progress.lock().expect("progress lock poisoned");
-            let output_length = if options.enable_throttling
-                && progress.download_position_ticks.unwrap_or(0) <= 0
-                && progress.encoded.bytes_transcoded.is_none()
-                && progress.bytes_downloaded > 0
-                && progress.encoded.position_ticks.unwrap_or(0) > 0
-            {
-                controller.output_length(&handle.path)
-            } else {
-                None
-            };
-            let paused = super::throttler::should_pause(&options, progress, output_length);
-            if paused != controller.paused {
-                let key = if paused { keys.pause() } else { keys.resume() };
-                match child.write_stdin(key).await {
-                    Ok(()) => {
-                        controller.paused = paused;
-                        tracing::debug!(path = %handle.path, paused, "transcode throttle state changed");
+                let Some(keys) = controller.keys_now(&self.pause_keys) else {
+                    return;
+                };
+                if Instant::now() < controller.next_tick {
+                    return;
+                }
+                controller.next_tick = Instant::now() + super::throttler::THROTTLE_INTERVAL;
+                // Each due timer reads the live document once. The 500ms stderr
+                // pump never performs settings reads for jobs with no due timer.
+                let options = if let Some(options) = override_options {
+                    options.clone()
+                } else if let Some(config) = &self.encoding_config {
+                    self.throttle_options.read(config.as_ref()).await
+                } else {
+                    ferrofin_model::configuration::EncodingOptions::default()
+                };
+                let progress = *progress.lock().expect("progress lock poisoned");
+                let output_length = if options.enable_throttling
+                    && progress.download_position_ticks.unwrap_or(0) <= 0
+                    && progress.encoded.bytes_transcoded.is_none()
+                    && progress.bytes_downloaded > 0
+                    && progress.encoded.position_ticks.unwrap_or(0) > 0
+                {
+                    controller.output_length(&handle.path)
+                } else {
+                    None
+                };
+                let paused = super::throttler::should_pause(&options, progress, output_length);
+                if paused != controller.paused {
+                    let key = if paused { keys.pause() } else { keys.resume() };
+                    match child.write_stdin(key).await {
+                        Ok(()) => {
+                            controller.paused = paused;
+                            tracing::debug!(path = %handle.path, paused, "transcode throttle state changed");
+                        }
+                        Err(error) => {
+                            tracing::error!(path = %handle.path, %error, paused, "controlling transcode throttle failed");
+                        }
                     }
-                    Err(error) => {
-                        tracing::error!(path = %handle.path, %error, paused, "controlling transcode throttle failed");
-                    }
+                }
+            };
+            let outcome =
+                futures_util::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(step)).await;
+            if let Err(payload) = outcome {
+                let panic = ferrofin_util::panic::message(payload.as_ref());
+                let play_session_id = handle.play_session_id.as_deref().unwrap_or("");
+                // Once per job: a step that panics on every pass would
+                // otherwise repeat it each tick, beside the panic hook's line.
+                if std::mem::replace(&mut controller.panicked, true) {
+                    tracing::debug!(task = "transcode_controls", path = %handle.path, play_session_id, panic, "transcode job's controls step panicked again");
+                } else {
+                    tracing::error!(task = "transcode_controls", path = %handle.path, play_session_id, panic, "transcode job's controls step panicked; the other jobs go on, and this one is retried each tick");
                 }
             }
         }
@@ -928,7 +954,8 @@ impl<S: SessionReporter, C: FileCleaner> TranscodeManagerImpl<S, C> {
     ///
     /// A weak reference prevents this composition task from retaining all jobs
     /// after server shutdown. A tick that panics is logged and ends alone
-    /// (`survive_panic`): the next tick runs as usual.
+    /// (`survive_panic`): the next tick runs as usual. One job's panicking
+    /// step ends only that step ([`Self::update_transcoding_jobs`]).
     pub async fn run_transcode_controls(manager: std::sync::Weak<Self>) {
         let mut failing = false;
         loop {
@@ -3770,9 +3797,17 @@ pub(super) mod throttle_tests {
         Arc<ChildState>,
         TranscodingJobHandle,
     ) {
+        let manager = Arc::new(manager);
+        let (directory, child, handle) = start_job(&manager, is_input_video).await;
+        (directory, manager, child, handle)
+    }
+    /// Starts one more job on `manager`, in a directory of its own.
+    async fn start_job<S: SessionReporter>(
+        manager: &TranscodeManagerImpl<S>,
+        is_input_video: bool,
+    ) -> (tempfile::TempDir, Arc<ChildState>, TranscodingJobHandle) {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("out.m3u8");
-        let manager = Arc::new(manager);
         let child = Arc::new(ChildState::default());
         let mut state = state(&path);
         state.is_input_video = is_input_video;
@@ -3793,7 +3828,7 @@ pub(super) mod throttle_tests {
             )
             .await
             .unwrap();
-        (directory, manager, child, handle)
+        (directory, child, handle)
     }
     async fn due(
         manager: &TranscodeManagerImpl<NoopSessionReporter>,
@@ -4291,8 +4326,8 @@ pub(super) mod throttle_tests {
         );
     }
 
-    /// A tick that panics ends that tick only: the controls loop logs it with
-    /// its `task` and pumps the job's progress at the next one.
+    /// A job's step that panics ends that step only: the controls loop logs
+    /// it with its `task` and pumps the job's progress at the next tick.
     #[tokio::test]
     async fn a_panicking_tick_is_logged_and_the_controls_loop_carries_on() {
         use crate::configuration::reader::tests::CapturedLogs;
@@ -4341,6 +4376,62 @@ pub(super) mod throttle_tests {
         assert!(
             errors.len() == 1 && errors[0].contains("reading ffmpeg progress failed"),
             "{errors:#?}"
+        );
+    }
+
+    /// gl-1412: a job whose step panics on every pass ends only its own step,
+    /// so the job after it in the registry still gets its progress pumped. The
+    /// panic is logged with the job, at `error` once and then at `debug`.
+    #[tokio::test]
+    async fn a_job_that_panics_every_pass_does_not_starve_the_jobs_after_it() {
+        use crate::configuration::reader::tests::CapturedLogs;
+        let (_broken_directory, manager, broken, broken_handle) = fixture(None).await;
+        let (_directory, healthy, handle) = start_job(&manager, true).await;
+        encoded(&broken, 200);
+        encoded(&healthy, 200);
+        broken.panics.store(usize::MAX, Ordering::SeqCst);
+        tokio::time::pause();
+
+        let logs = CapturedLogs::default();
+        let guard = logs.install();
+        let controls = tokio::spawn(TranscodeManagerImpl::run_transcode_controls(
+            Arc::downgrade(&manager),
+        ));
+        // Three passes, each reaching the broken job first.
+        tokio::time::sleep(Duration::from_millis(1600)).await;
+        drop(guard);
+        controls.abort();
+
+        assert_eq!(
+            progress(&manager, &handle)
+                .lock()
+                .unwrap()
+                .encoded
+                .framerate,
+            Some(25.0),
+            "the job after the broken one starved"
+        );
+        let broken_lines = |level| -> Vec<String> {
+            logs.lines_at(level)
+                .into_iter()
+                .filter(|line| {
+                    line.contains("task=\"transcode_controls\"")
+                        && line.contains(&broken_handle.path)
+                })
+                .collect()
+        };
+        let errors = broken_lines("ERROR");
+        assert!(
+            errors.len() == 1
+                && errors[0].contains("reading ffmpeg progress failed")
+                && errors[0].contains("throttle-session"),
+            "{errors:#?}"
+        );
+        assert_eq!(
+            broken_lines("DEBUG").len(),
+            2,
+            "{:#?}",
+            logs.lines_at("DEBUG")
         );
     }
 
