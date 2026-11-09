@@ -10,6 +10,7 @@ pub mod segment_transcoder;
 pub mod throttler;
 pub mod tokio_segment_transcoder;
 
+pub(crate) use ffmpeg_log::shown_argument_line;
 pub use fs_wait::FsWaiter;
 pub use limits::{StartFfmpegError, TRANSCODE_RETRY_AFTER_SECS, TranscodeLimits, TranscodeRefused};
 pub use manager::{
