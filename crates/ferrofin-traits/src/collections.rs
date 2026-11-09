@@ -23,8 +23,6 @@
 //!
 //! Both traits are object-safe and carry `_assert_object_safe_*` assertions.
 
-use std::collections::HashMap;
-
 use async_trait::async_trait;
 use ferrofin_db::entities::base_items::BaseItemEntity;
 use ferrofin_db::entities::users::UserEntity;
@@ -41,20 +39,22 @@ use crate::error::ServiceError;
 ///
 /// Port of `MediaBrowser.Controller.Collections.CollectionCreationOptions`; the
 /// nullable `Guid ParentId` becomes `Option<Uuid>` and the item/user id lists
-/// become `Vec<Uuid>`.
+/// become `Vec<Uuid>`. `ProviderIds` is left out: `CreateCollectionAsync` copies
+/// it onto the box set, but no caller sets it, upstream or here.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct CollectionCreationOptions {
     /// The display name of the new collection.
     pub name: String,
-    /// The parent folder the collection is created under, if any.
+    /// The parent folder the client named. Unread: upstream's
+    /// `CreateCollectionAsync` ignores `ParentId` too and always creates the box
+    /// set in the Collections folder.
     pub parent_id: Option<Uuid>,
     /// Whether the collection's metadata is locked against refresh.
     pub is_locked: bool,
-    /// External provider ids to seed on the collection.
-    pub provider_ids: HashMap<String, String>,
     /// The ids of the items to seed the collection with.
     pub item_id_list: Vec<Uuid>,
-    /// The ids of users granted access to the collection.
+    /// The creating user, as `CollectionController` passes it. Unread:
+    /// upstream's `CreateCollectionAsync` ignores `UserIds` too.
     pub user_ids: Vec<Uuid>,
 }
 
@@ -288,7 +288,6 @@ mod tests {
         assert_eq!(o.name, "");
         assert!(o.parent_id.is_none());
         assert!(!o.is_locked);
-        assert!(o.provider_ids.is_empty());
         assert!(o.item_id_list.is_empty(), "{:?}", o.item_id_list);
         assert!(o.user_ids.is_empty(), "{:?}", o.user_ids);
     }

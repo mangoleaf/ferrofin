@@ -1396,7 +1396,6 @@ pub fn create_collection(
         name: name.to_owned(),
         parent_id: None,
         is_locked: false,
-        provider_ids: std::collections::HashMap::new(),
         item_id_list: ids,
         user_ids: Vec::new(),
     };

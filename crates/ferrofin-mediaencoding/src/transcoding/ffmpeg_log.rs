@@ -58,6 +58,35 @@ pub(super) fn shown_arguments(arguments: &[String]) -> Cow<'_, [String]> {
     Cow::Owned(shown.collect())
 }
 
+/// An argument line, as a process runner's error shows it: [`shown_arguments`]
+/// once it splits, nothing after the first header flag when its quoting does
+/// not balance, and unchanged for an ordinary file probe.
+pub(crate) fn shown_argument_line(arguments: &str) -> Cow<'_, str> {
+    let Some(tokens) = shlex::split(arguments) else {
+        // Unbalanced quoting leaves no telling where a header value ends, so
+        // nothing after the first header flag is shown.
+        let header_end = HEADER_FLAGS
+            .iter()
+            .filter_map(|flag| arguments.find(flag).map(|at| at + flag.len()))
+            .min();
+        return match header_end {
+            Some(end) => Cow::Owned(format!(
+                "{} {HIDDEN_VALUE}",
+                redact_urls_in(&arguments[..end])
+            )),
+            None => redact_urls_in(arguments),
+        };
+    };
+    if tokens
+        .iter()
+        .any(|token| HEADER_FLAGS.contains(&token.as_str()))
+    {
+        Cow::Owned(shown_arguments(&tokens).join(" "))
+    } else {
+        redact_urls_in(arguments)
+    }
+}
+
 /// Scrubs ffmpeg's stderr lines for a job reading a remote source.
 #[derive(Debug)]
 struct LineFilter {
@@ -170,7 +199,7 @@ impl StderrPump {
 mod tests {
     use rstest::rstest;
 
-    use super::{StderrPump, shown_arguments};
+    use super::{StderrPump, shown_argument_line, shown_arguments};
 
     const SOURCE: &str = "http://USER:SECRET@127.0.0.1:18275/live/USER/SECRET/1.m3u8?token=SECRET";
     const SHOWN: &str = "http://127.0.0.1:18275";
@@ -237,6 +266,18 @@ mod tests {
                 "{shown}"
             );
         }
+    }
+
+    /// A process runner's error line keeps an ordinary probe as it is, and a
+    /// remote one without header flags as `redact_urls_in` shows it (gl-1407).
+    #[rstest]
+    #[case::file(
+        r#"-i file:"/media/a b.mkv" -f null -"#,
+        r#"-i file:"/media/a b.mkv" -f null -"#
+    )]
+    #[case::url(&format!(r#"-i "{SOURCE}" -f null -"#), &format!(r#"-i "{SHOWN}" -f null -"#))]
+    fn a_line_without_header_flags_keeps_its_text(#[case] line: &str, #[case] shown: &str) {
+        assert_eq!(shown_argument_line(line), shown);
     }
 
     /// A URL inside a longer argument goes too (`movie=` in a filter graph).

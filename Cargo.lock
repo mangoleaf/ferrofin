@@ -1569,7 +1569,6 @@ dependencies = [
  "rstest",
  "serde",
  "serde_json",
- "thiserror",
  "tokio",
  "tracing",
  "windows-sys 0.61.2",

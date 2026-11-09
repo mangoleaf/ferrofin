@@ -10,12 +10,6 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 use ferrofin_model::net::IpNetwork;
 
-/// IPv4 mask bytes.
-pub const IPV4_MASK_BYTES: usize = 4;
-
-/// IPv6 mask bytes.
-pub const IPV6_MASK_BYTES: usize = 16;
-
 /// Minimum IPv4 prefix size (a host route: `/32`).
 pub const MINIMUM_IPV4_PREFIX_SIZE: u8 = 32;
 
