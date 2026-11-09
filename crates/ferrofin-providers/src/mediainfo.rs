@@ -2,11 +2,11 @@
 //! `MediaBrowser.Providers.MediaInfo.FFProbeVideoInfo` (and the entry-point role
 //! of `ProbeProvider`).
 //!
-//! Scope note (First-Light): the full C# `FFProbeVideoInfo` couples the probe to
-//! ~13 collaborators (media-source / subtitle / chapter / attachment / stream
+//! Scope note: the full C# `FFProbeVideoInfo` couples the probe to ~13
+//! collaborators (media-source / subtitle / chapter / attachment / stream
 //! repositories, the Blu-ray/DVD examiners, the localization manager, and the
-//! library store). None of those are ported in this wave, so this port keeps the
-//! two pieces that are pure and testable and that only need the ffprobe seam:
+//! library store). This module keeps the pieces that are pure and testable and
+//! that only need the ffprobe seam:
 //!
 //! - [`FFProbeVideoInfo::get_media_info`] — builds a [`MediaInfoRequest`] from a
 //!   [`VideoProbeInput`] and drives it through a borrowed
@@ -50,8 +50,8 @@ const MAX_VALID_RUNTIME_TICKS: i64 = 12 * 60 * 60 * TICKS_PER_SECOND;
 /// touch.
 ///
 /// The full C# `Video` is a large library-item aggregate; this carries only the
-/// probe-relevant surface so the provider stays decoupled from the (not-yet
-/// ported) item store.
+/// probe-relevant surface so the provider stays decoupled from the item store
+/// (`ferrofin-core`'s item repository).
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct VideoProbeInput {
     /// The item name (`Name`) — used only for the invalid-runtime error message.

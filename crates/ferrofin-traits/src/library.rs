@@ -419,6 +419,27 @@ pub trait LibraryManager: Send + Sync {
         Ok(visible)
     }
 
+    /// [`Self::get_visible_item_ids`] over rows the caller already holds:
+    /// the standalone-visible ones, in input order, repeats kept. Concrete
+    /// managers check the rows given instead of reading them again by id.
+    async fn filter_visible_items_standalone(
+        &self,
+        mut items: Vec<BaseItemEntity>,
+        user: &UserEntity,
+    ) -> Result<Vec<BaseItemEntity>, ServiceError> {
+        let ids: Vec<Uuid> = items
+            .iter()
+            .filter_map(|item| Uuid::parse_str(&item.id).ok())
+            .collect();
+        let visible: std::collections::HashSet<Uuid> = self
+            .get_visible_item_ids(&ids, user)
+            .await?
+            .into_iter()
+            .collect();
+        items.retain(|item| Uuid::parse_str(&item.id).is_ok_and(|id| visible.contains(&id)));
+        Ok(items)
+    }
+
     /// The ids of `ids` that pass the parental check for `user`, in input
     /// order: C# `BaseItem.IsParentalAllowed(user, skipAllowedTagsCheck)`, the
     /// rating, unrated and tag rules with no folder or library access check.
@@ -1092,7 +1113,7 @@ pub trait LibraryManager: Send + Sync {
     /// out-param of `Folder.GetRecursiveChildren(user, query, out totalCount)`,
     /// which counts the underlying *media* items (559 for a 3-year fixture).
     /// That is an upstream bug — a paging total unrelated to the page — and is
-    /// not ported; see `suite/parity/classifications.json`.
+    /// not ported.
     ///
     /// Port of `YearsController.GetYears`: Jellyfin walks the (localized) item
     /// tree, collects each item's distinct `ProductionYear`, and resolves each
@@ -1123,10 +1144,10 @@ pub trait LibraryManager: Send + Sync {
         // enumeration order in place; it does not produce a sorted list.
         // Reproducing it would mean reproducing Jellyfin's BaseItem tree walk,
         // which Ferrofin does not have (see "There is no domain-object
-        // hierarchy" in CLAUDE.md), so a deterministic ascending order is the
-        // chosen behaviour and the divergence is recorded on the `GET /Years`
-        // row of `suite/parity/classifications.json`. Every probe leg pins
-        // `sortBy=SortName`, where the two agree exactly, including under paging.
+        // hierarchy" in CLAUDE.md), so the order is a deterministic ascending
+        // one. With `sortBy=SortName` the two agree exactly, including under
+        // paging. TODO(parity, gl-970): open work item: order the years as
+        // `LibraryManager.Sort` orders `Year` items, for every `sortBy` key.
         years.sort_unstable();
         years.dedup();
         sort_years(&mut years, &query.order_by);
@@ -1737,8 +1758,8 @@ pub trait UserManager: Send + Sync {
     /// [`UserConfiguration`] and
     /// [`UserPolicy`] from the `Users` row plus
     /// its `Permissions`/`Preferences`/`AccessSchedules`. `server_id` is the
-    /// hosting application's system id; `remote_endpoint` is accepted for parity
-    /// (the profile-image cache tag it feeds is not yet ported).
+    /// hosting application's system id. Upstream's optional `remoteEndPoint`
+    /// argument is unused there, so it has no counterpart here.
     async fn get_user_dto(
         &self,
         user: &UserEntity,

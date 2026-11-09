@@ -1,17 +1,17 @@
 //! The utoipa OpenAPI document for `ferrofin-api`'s **real** handlers.
 //!
-//! This spec describes only the routes with ported handlers (plus the shared
-//! health endpoints, merged in at the router). It is *not* the client contract —
-//! that is the vendored Jellyfin spec, of which the registered route table is a
-//! superset (enforced by `tests/contract_superset.rs`). As waves port handlers,
-//! their `#[utoipa::path]` annotations are added to [`ApiDoc`]'s `paths(...)`.
+//! This spec describes the handlers listed in [`ApiDoc`]'s `paths(...)` (plus
+//! the shared health endpoints, merged in at the router), a subset of the
+//! routes: a handler's `#[utoipa::path]` annotation shows here only once it is
+//! added to that list. It is *not* the client contract — that is the vendored
+//! Jellyfin spec, of which the registered route table is a superset (enforced
+//! by `tests/contract_superset.rs`).
 
 use utoipa::OpenApi;
 
 /// OpenAPI document for `ferrofin-api`'s ported handlers.
 ///
-/// Unit 1 (INFRA) registers every contract route to the shared
-/// `not_implemented` stub, so no handler paths are documented yet. Merge
+/// It documents the handlers listed in `paths(...)` below. Merge
 /// [`ferrofin_health::HealthApi`] into this document to include the probe
 /// endpoints in the published spec.
 #[derive(OpenApi)]

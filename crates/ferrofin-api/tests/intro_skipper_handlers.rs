@@ -568,6 +568,10 @@ async fn plugin_metadata_and_support_bundle() {
     // The analysis reports the rest (the detached seam says it is absent).
     assert!(body.contains("Jellyfin version: "), "{body}");
     assert!(
+        body.contains(&format!("(Ferrofin {})", ferrofin_health::RELEASE_VERSION)),
+        "{body}"
+    );
+    assert!(
         body.ends_with("* The intro skipper extension is not attached\n"),
         "{body}"
     );

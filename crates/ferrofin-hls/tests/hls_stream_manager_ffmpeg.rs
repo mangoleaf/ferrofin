@@ -6,10 +6,11 @@
 //! manager for the master playlist, the variant `main.m3u8`, and then a dynamic
 //! segment — exactly what the `ferrofin-api` `handlers::hls` routes forward — and
 //! asserts the returned [`ServedFile`] points at a real, non-empty `.ts` segment
-//! that a live ffmpeg produced. The un-ported request→plan glue
-//! ([`StreamStatePlanner`]) is supplied here by a test planner that generates a
-//! tiny clip and emits real HLS ffmpeg args; everything below it is production
-//! code (`HlsStreamManagerImpl` + `TranscodeManagerImpl` + `TokioSegmentTranscoder`).
+//! that a live ffmpeg produced. The request→plan glue ([`StreamStatePlanner`],
+//! whose real implementation lives in the server binary) is supplied here by a
+//! test planner that generates a tiny clip and emits real HLS ffmpeg args;
+//! everything below it is production code (`HlsStreamManagerImpl` +
+//! `TranscodeManagerImpl` + `TokioSegmentTranscoder`).
 //!
 //! Excluded from the unit-coverage gate (integration `tests/` never count toward
 //! `cargo llvm-cov -p ferrofin-hls`) and gated on `FERROFIN_FFMPEG_TESTS` + `ffmpeg`
@@ -153,8 +154,9 @@ impl ServerApplicationPaths for TempPaths {
     }
 }
 
-/// A real [`StreamStatePlanner`] that stands in for the un-ported
-/// `GetStreamingState` + `GetCommandLineArguments`: it points every plan at a
+/// A real [`StreamStatePlanner`] that stands in for the server's
+/// `FerrofinStreamStatePlanner` (`GetStreamingState` +
+/// `GetCommandLineArguments`): it points every plan at a
 /// pre-generated clip and emits real mpegts-HLS ffmpeg args writing
 /// `out%d.ts` + `out.m3u8` into the transcode cache directory.
 struct FfmpegPlanner {

@@ -132,18 +132,34 @@ impl ItemVisibility {
             return Ok(Vec::new());
         }
         let libraries = self.rating_libraries().await?;
-        let context = self.load(items, Some(user), &libraries.set).await?;
-        items
+        // A repeated id is one context row (`Context::row`: the last copy, as the
+        // map keeps it), so it takes no slot of the context and one answer.
+        let mut seen = HashSet::new();
+        let distinct: Vec<&BaseItemEntity> = items
+            .iter()
+            .rev()
+            .filter(|item| seen.insert(row_id(item)))
+            .collect();
+        let context = self
+            .load_known(distinct.iter().copied(), &[], Some(user), &libraries.set)
+            .await?;
+        let answers = distinct
             .iter()
             .map(|item| {
+                let id = row_id(item);
                 let item = context.row(item);
-                if standalone {
-                    context.standalone(item)
+                let answer = if standalone {
+                    context.standalone(item)?
                 } else {
-                    context.visible(item, false)
-                }
+                    context.visible(item, false)?
+                };
+                Ok((id, answer))
             })
-            .collect()
+            .collect::<Result<HashMap<_, _>, ServiceError>>()?;
+        Ok(items
+            .iter()
+            .map(|item| answers.get(&row_id(item)).copied().unwrap_or(false))
+            .collect())
     }
 
     /// `LibraryManager.GetItemById(id, user)`: the item when `user` may see it standalone, else
@@ -1621,6 +1637,59 @@ mod tests {
                 .expect("lookup")
                 .is_none()
         );
+    }
+
+    /// A row passed more than once, as a playlist lists a repeated member, is
+    /// answered in each place it holds (gl-1492).
+    #[tokio::test]
+    async fn a_repeated_row_is_answered_in_each_place() {
+        let f = Fixture::new().await;
+        let allowed = f
+            .item(
+                40,
+                BaseItemKind::CollectionFolder,
+                Some("/views/allowed"),
+                None,
+            )
+            .await;
+        let hidden = f
+            .item(
+                41,
+                BaseItemKind::CollectionFolder,
+                Some("/views/hidden"),
+                None,
+            )
+            .await;
+        let folder = f
+            .item(42, BaseItemKind::Folder, Some("/media/a"), Some(&allowed))
+            .await;
+        let seen = f
+            .item(
+                43,
+                BaseItemKind::Movie,
+                Some("/media/a/seen.mkv"),
+                Some(&folder),
+            )
+            .await;
+        let unseen = f
+            .item(
+                44,
+                BaseItemKind::Movie,
+                Some("/media/b/unseen.mkv"),
+                Some(&hidden),
+            )
+            .await;
+        set_permission(&f.db, &f.user.id, PermissionKind::EnableAllFolders, false)
+            .await
+            .expect("permission");
+        f.pref(PreferenceKind::EnabledFolders, &[&allowed.id]).await;
+        let rows = [&seen, &unseen, &seen, &unseen, &seen].map(Clone::clone);
+        let answers = f
+            .service
+            .visible(&rows, &f.user, true)
+            .await
+            .expect("visibility");
+        assert_eq!(answers, [true, false, true, false, true]);
     }
 
     /// `visible_item_with_chain` answers as `visible_item` does and hands back the rows its

@@ -1957,6 +1957,9 @@ impl PlaylistManager for FakePlaylists {
     ) -> Result<Vec<BaseItemEntity>, ServiceError> {
         unimplemented!("fake")
     }
+    async fn get_playlist_item_ids(&self, _playlist_id: Uuid) -> Result<Vec<Uuid>, ServiceError> {
+        unimplemented!("fake")
+    }
     async fn add_user_to_shares(
         &self,
         _request: &PlaylistUserUpdateRequest,

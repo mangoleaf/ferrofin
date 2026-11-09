@@ -4794,8 +4794,8 @@ mod tests {
         .expect("the test finishes");
     }
 
-    /// The per-user named-view id, pinned against the owner's real 12.0
-    /// database: user `mango`, the `PlaylistsFolder`, and the Playlists view
+    /// The per-user named-view id, pinned against a real Jellyfin 12.0
+    /// database: one user, the `PlaylistsFolder`, and the Playlists view
     /// Jellyfin 12.0.0 created on its first boot (the 10.11 row beside it,
     /// `AA9A5206-…`, is the name-keyed one 12.0 ignores).
     #[tokio::test]

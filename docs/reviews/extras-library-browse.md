@@ -136,8 +136,8 @@ migration or file deletion is involved.
 Production changes end at `892fa79f`; `3568e5b1` corrects two old repository test
 fixtures that omitted the scanner's `TopParentId` relationship. The recursive
 fixture now checks both native-library scope and ordinary-folder ancestry.
-Each phase and the complete production diff passed independent review using
-`.claude/skills/review-loop/SKILL.md`; the test corrections were reviewed too.
+Each phase and the complete production diff passed independent review; the test
+corrections were reviewed too.
 
 Automated checks:
 

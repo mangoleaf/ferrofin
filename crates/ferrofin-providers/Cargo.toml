@@ -35,6 +35,7 @@ ferrofin-naming.workspace = true
 ferrofin-util = { workspace = true, features = ["tokio"] }
 ferrofin-common.workspace = true
 ferrofin-db.workspace = true
+ferrofin-health.workspace = true
 # The CIDR parsing and matching of the image downloads' private allow-list
 # (`destination::PrivateAllowList`).
 ferrofin-networking.workspace = true

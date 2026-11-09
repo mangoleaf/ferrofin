@@ -15,6 +15,7 @@ ferrofin-core.workspace = true
 ferrofin-db.workspace = true
 ferrofin-providers.workspace = true
 ferrofin-util.workspace = true
+ferrofin-health.workspace = true
 chrono.workspace = true
 ferrofin-model.workspace = true
 async-trait.workspace = true

@@ -10,8 +10,8 @@
 //! - The C# constructor eagerly loads every device into concurrent maps; this
 //!   port queries the tables on demand instead (no cache-coherency window).
 //! - The `DeviceOptionsUpdated` event is dropped (event wiring is out of scope).
-//! - `GetDeviceOptions` returns the [`DeviceOptionsEntity`] row (the trait's
-//!   documented stopgap pending a ported `DeviceOptionsDto`).
+//! - `GetDeviceOptions` returns the [`DeviceOptionsEntity`] row; the API layer
+//!   maps it to the `DeviceOptionsDto` upstream returns.
 
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
@@ -108,9 +108,10 @@ impl FerrofinDeviceManager {
             .unwrap_or_default()
     }
 
-    /// Looks up a device by its (unique) session access token — the lookup
-    /// `AuthorizationContext` performs. Beyond the trait surface because the
-    /// trait's [`DeviceQuery`] has no token filter.
+    /// Looks up a device by its (unique) session access token. Beyond the trait
+    /// surface because the trait's [`DeviceQuery`] has no token filter. The
+    /// request path does not use it: `AuthorizationContext` reads the device
+    /// with its own query (its private `device_by_token`).
     ///
     /// # Errors
     /// Returns [`ServiceError::Db`] if the query fails.
