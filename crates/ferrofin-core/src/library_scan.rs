@@ -2159,6 +2159,16 @@ pub trait PriorityLane: Send + Sync {
     fn next(&self) -> Option<LaneRefresh>;
     /// Hands back how `refresh` ended, for whoever waits for it.
     fn done(&self, refresh: LaneRefresh, outcome: &Result<ScanOutcome, ServiceError>);
+    /// Takes the ids of the items edited outside the scan since the last
+    /// call (a metadata edit over the API writes the row directly). The
+    /// walk reads them again before it reaches them, as it does what a lane
+    /// refresh touched: upstream's edit changes the cached item the refresh
+    /// merges onto, so its later save keeps the edit. The walk takes them
+    /// between two items only, so an edit that lands after the walk took
+    /// them for an item and before it saved that item is still saved over.
+    fn edited(&self) -> Vec<Uuid> {
+        Vec::new()
+    }
 }
 
 /// One item refresh taken off a [`PriorityLane`].
@@ -7104,7 +7114,10 @@ impl LibraryScanner {
             // `IsLocked` guard backstops the metadata columns; file-derived
             // facts (the probe) still update, and its local images are still
             // validated and discovered.
-            let locked = locked_items.contains(&item.id);
+            // The stored row is the later read: a lock applied since the
+            // scan began is in it ([`PriorityLane::edited`]).
+            let locked =
+                locked_items.contains(&item.id) || stored.row().is_some_and(|row| row.is_locked);
             let policy = refresh.policy_for(item);
             // An album or artist whose refresh the music pass completes
             // after the walk leaves it the triggers of that refresh.
@@ -7633,8 +7646,12 @@ impl LibraryScanner {
     /// — the stored rows from item `scanned` on (the window restarts there,
     /// and its provider ids and image probes with it), and the series' ids
     /// and keys this scan cached for them
-    /// ([`reread_touched`](Self::reread_touched)). Returns the ids they
-    /// touched.
+    /// ([`reread_touched`](Self::reread_touched)). The items edited outside
+    /// the scan since ([`PriorityLane::edited`]) are read again the same way,
+    /// but keep their probes (an edit leaves the file alone), and restart the
+    /// window only when the walk has read one of them ahead: one it has not
+    /// read yet is read fresh when it gets there. Returns the ids the
+    /// refreshes touched.
     async fn serve_lane_between_items(
         &self,
         run: ScanRun<'_>,
@@ -7645,16 +7662,31 @@ impl LibraryScanner {
         series_keys: &mut HashMap<Uuid, String>,
     ) -> Vec<(Uuid, RefreshReach)> {
         let touched = Box::pin(self.serve_lane_reach(run)).await;
-        if touched.is_empty() {
+        let edited = run.lane.map_or_else(Vec::new, PriorityLane::edited);
+        if touched.is_empty() && edited.is_empty() {
             return touched;
         }
-        let ids: Vec<Uuid> = touched.iter().map(|(id, _)| *id).collect();
-        probes.forget(&ids.iter().copied().collect());
-        *stored_rows = StoredRows {
-            start: scanned,
-            end: scanned,
-            ..StoredRows::default()
+        let read_end = stored_rows
+            .ahead
+            .as_ref()
+            .map_or(stored_rows.end, |ahead| ahead.end);
+        let edited_read = {
+            let edited: std::collections::HashSet<Uuid> = edited.iter().copied().collect();
+            probes
+                .planned
+                .get(scanned..read_end)
+                .is_some_and(|read| read.iter().any(|item| edited.contains(&item.id)))
         };
+        let mut ids: Vec<Uuid> = touched.iter().map(|(id, _)| *id).collect();
+        if !touched.is_empty() || edited_read {
+            probes.forget(&ids.iter().copied().collect());
+            *stored_rows = StoredRows {
+                start: scanned,
+                end: scanned,
+                ..StoredRows::default()
+            };
+        }
+        ids.extend(edited);
         Box::pin(self.reread_touched(&ids, cache, series_keys)).await;
         touched
     }
@@ -14377,11 +14409,12 @@ impl LibraryScanner {
     /// not on `scan_paths`, the library-monitor path that runs for one or two
     /// items on every filesystem event.
     ///
-    /// A lock applied *while* this scan is running is not seen by it, exactly
-    /// as a lock applied one item too late was never seen before. The locked
-    /// item's stored metadata is protected regardless: the scan upsert guards
-    /// every user-owned column with `CASE WHEN "IsLocked" = 1 THEN "<col>"`,
-    /// evaluated against the row's committed value at write time.
+    /// A lock applied *while* this scan is running is seen through the item's
+    /// stored row instead, read again before the walk reaches the item
+    /// ([`PriorityLane::edited`]). The locked item's stored metadata is
+    /// protected a second time: the scan upsert guards every user-owned
+    /// column with `CASE WHEN "IsLocked" = 1 THEN "<col>"`, evaluated against
+    /// the row's committed value at write time.
     async fn locked_items(&self, planned: &[Planned]) -> std::collections::HashSet<Uuid> {
         // Nothing to scan, nothing to look up. `run_scan` is shared with
         // `scan_paths`, and a noisy directory (`.partial` files, stray
