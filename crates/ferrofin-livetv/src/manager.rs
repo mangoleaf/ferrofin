@@ -11738,9 +11738,16 @@ mod tests {
         .await
         .expect("a capture is in progress");
         let nfo = std::path::Path::new(&path).with_extension("nfo");
-        let body = wait_for(|| async { tokio::fs::read_to_string(&nfo).await.ok() })
-            .await
-            .expect("the recording's NFO");
+        // The recorder creates the NFO before writing it, as upstream's
+        // `FileMode.CreateNew` does, so wait for the whole document.
+        let body = wait_for(|| async {
+            tokio::fs::read_to_string(&nfo)
+                .await
+                .ok()
+                .filter(|body| body.ends_with("</movie>"))
+        })
+        .await
+        .expect("the recording's complete NFO");
         let after = chrono::Utc::now() + chrono::Duration::seconds(2);
         mgr.cancel_timer(&timer_id).await.expect("cancel");
 
