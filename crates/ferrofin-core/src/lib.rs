@@ -10,7 +10,7 @@
 //! Sibling managers (MediaEncoder, ImageProcessor, ProviderManager, …) are taken
 //! as `Arc<dyn Trait>` and injected at the composition root (`ferrofin-server`,
 //! Wave 8) — this crate depends only on `ferrofin-traits` for them, not on the
-//! impl crates. Peripheral + deferred-subsystem managers are minimal/stub.
+//! impl crates.
 //!
 //! ## Unit 1 — item repository + query translation (First-Light core)
 //!
@@ -110,7 +110,9 @@
 //!   in-memory `SessionInfo` table (the C# `_activeConnections`), reports
 //!   playback through the injected [`UserDataManager`](ferrofin_traits::library::UserDataManager),
 //!   and broadcasts server → client messages as pre-serialized JSON to each
-//!   session's attached WebSocket connections. Sibling managers (user/device/
+//!   session's sink on the `SessionMessageBus` (which `ferrofin-api`'s
+//!   `/socket` handler registers), or to a directly attached connection, which
+//!   only tests attach (gl-248). Sibling managers (user/device/
 //!   user-data/library/DTO) plus the [`EventManager`](ferrofin_traits::events::EventManager)
 //!   are injected. It also runs the idle-playback and inactive-session checks
 //!   (`StartCheckTimers`) and counts live-stream consumers per session.
@@ -124,38 +126,42 @@
 //!   diagnostic documents under the injected paths' log directory with a
 //!   traversal-safe file name.
 //! - [`session_websocket_listener`] — [`FerrofinSessionWebSocketListener`]
-//!   ([`ferrofin_traits::net::WebSocketListener`]) resolving+attaching a
-//!   connection to its session on connect, and [`FerrofinWebSocketManager`]
+//!   ([`ferrofin_traits::net::WebSocketListener`]) resolving a connection's
+//!   session on connect, and [`FerrofinWebSocketManager`]
 //!   ([`ferrofin_traits::net::WebSocketManager`]) validating the upgrade request.
 //!   The actual HTTP → WS upgrade and per-connection receive loop belong to the
-//!   HTTP layer (Wave 7); the injected `WebSocketConnection` does the I/O.
+//!   HTTP layer, and `ferrofin-api`'s `/socket` handler does that work without
+//!   calling either (TODO(gl-248): open work item: one path, not two).
 //!
 //! The session-id derivation reuses [`ferrofin_common::extensions::get_md5`] (the
 //! C# `key.GetMD5().ToString("N")`), not a re-implemented hash.
 //!
-//! ## Unit 9 — deferred-subsystem stubs + scheduled-task registry
+//! ## Unit 9 — channels, SyncPlay, plugins, lyrics, subtitles + scheduled tasks
 //!
-//! The deferred subsystems and the scheduler-less task registry:
 //! - [`channel_manager`] — [`FerrofinChannelManager`]
-//!   ([`ferrofin_traits::stubs::ChannelManager`]), empty channel results;
+//!   ([`ferrofin_traits::stubs::ChannelManager`]): no channel backend can be
+//!   registered, so every channel query is empty (TODO(parity, gl-298): open
+//!   work item: give channels an extension seam);
 //! - [`sync_play_manager`] — [`FerrofinSyncPlayManager`]
-//!   ([`ferrofin_traits::stubs::SyncPlayManager`]), a no-op group coordinator;
+//!   ([`ferrofin_traits::stubs::SyncPlayManager`]), the group registry and the
+//!   per-group playback state machine;
 //! - [`plugin_manager`] — [`FerrofinPluginManager`]
-//!   ([`ferrofin_traits::plugins::PluginManager`]), the Tier-1 registry-backed
-//!   manager over compiled-in plugins (empty until the composition root registers
-//!   any);
+//!   ([`ferrofin_traits::plugins::PluginManager`]), the registry of the
+//!   compiled-in (Tier 1a) and WASM (Tier 1b) plugins, and the WASM installer;
 //! - [`lyric_manager`] — [`FerrofinLyricManager`]
-//!   ([`ferrofin_traits::stubs::LyricManager`]), empty lyrics;
+//!   ([`ferrofin_traits::stubs::LyricManager`]), local `.lrc`/`.elrc`/`.txt`
+//!   lyrics plus remote search and download through the registered providers;
 //! - [`subtitle_manager`] — [`FerrofinSubtitleManager`]
-//!   ([`ferrofin_traits::subtitles::SubtitleManager`]), the portable
-//!   stored-external-subtitle slice (delete a stream + its sidecar); the
-//!   provider fan-out (search/download/upload) is a documented deferral;
+//!   ([`ferrofin_traits::subtitles::SubtitleManager`]), search, download and
+//!   upload of external subtitles over the registered providers, and delete;
 //! - [`scheduled_tasks`] — [`FerrofinTaskManager`] + the local [`ScheduledTask`]
 //!   trait: the task registry over the `ferrofin-model` task DTOs, plus the
 //!   trigger scheduler ([`start_scheduler`](FerrofinTaskManager::start_scheduler)
 //!   fires daily/weekly/interval/startup triggers), live progress reporting,
 //!   abortable queued runs, and on-disk trigger-override persistence.
-//!   `FullSystemBackup`/`BackupService` is deferred entirely.
+//!
+//! Backup and restore (`BackupService`) live in `ferrofin-api`'s `Backup`
+//! handlers.
 
 pub mod access_schedule_repository;
 pub mod activity_manager;

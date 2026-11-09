@@ -3,9 +3,9 @@
 //! Jellyfin registers a set of *configuration stores* at startup, each keyed by
 //! a name and a .NET `Type`. Rust has no runtime `Type`, so the store's type is
 //! represented as a `type_key` string (e.g. the fully-qualified config type
-//! name) that the host resolves. The DI/runtime `IConfigurationManager` and the
-//! `IApplicationHost`-bound pieces are deferred; the portable value/interface
-//! shapes live here.
+//! name) that the host resolves. Only the portable value/interface shapes live
+//! here: the runtime `IConfigurationManager` is the `ServerConfigurationManager`
+//! trait in `ferrofin-traits`, implemented in `ferrofin-core`.
 
 /// Describes a single entry in the application configuration.
 ///

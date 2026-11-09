@@ -1,10 +1,10 @@
-//! [`FerrofinCollectionManager`] + [`FerrofinPlaylistManager`] — **minimal**
+//! [`FerrofinCollectionManager`] + [`FerrofinPlaylistManager`] — the
 //! [`CollectionManager`]/[`PlaylistManager`] impls.
 //!
 //! Ports of `Emby.Server.Implementations.Collections.CollectionManager` and
-//! `Emby.Server.Implementations.Playlists.PlaylistManager`. Both are thin unit-8
-//! managers: a box set and a playlist are both `BaseItem` rows, so creating one
-//! inserts a minimal `BaseItems` row (of the `BoxSet`/`Playlist` stored type)
+//! `Emby.Server.Implementations.Playlists.PlaylistManager`. A box set and a
+//! playlist are both `BaseItem` rows, so creating one inserts a minimal
+//! `BaseItems` row (of the `BoxSet`/`Playlist` stored type)
 //! through `ferrofin-db`, and membership is recorded as manual **linked children**
 //! via the injected
 //! [`LinkedChildrenService`](ferrofin_traits::persistence::LinkedChildrenService).

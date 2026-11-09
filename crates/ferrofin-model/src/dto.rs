@@ -6,10 +6,9 @@
 //! vendored OpenAPI spec.
 //!
 //! A handful of small enums referenced by [`BaseItemDto`] belong to
-//! `MediaBrowser.Model.Library`/`MediaBrowser.Model.LiveTv` (later port units).
-//! They are stubbed here (see [`PlayAccess`], [`ChannelType`], [`ProgramAudio`])
-//! so the contract-complete DTO can be expressed now; when those namespaces are
-//! ported the definitions should move and these re-exports be removed.
+//! `MediaBrowser.Model.Library`/`MediaBrowser.Model.LiveTv`. They live in
+//! [`crate::library`] and [`crate::live_tv`] and are re-exported here (see
+//! [`PlayAccess`], [`ChannelType`], [`ProgramAudio`]).
 
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;

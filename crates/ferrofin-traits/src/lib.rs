@@ -9,9 +9,9 @@
 //! **Not ported:** the C# `BaseItem`/`Folder`/`Video` OOP hierarchy (a service
 //! layer in inheritance disguise). Trait signatures instead use `ferrofin-db`
 //! entities (persistence), `ferrofin-model` DTOs (presentation), and
-//! [`uuid::Uuid`] (identity). Marker/mixin interfaces (`IHas*`) are dropped;
-//! deferred subsystems (Live TV, SyncPlay, plugins, channels, lyrics) get one
-//! minimal stub trait each.
+//! [`uuid::Uuid`] (identity). Marker/mixin interfaces (`IHas*`) are dropped.
+//! The Live TV, SyncPlay, lyrics and channels traits live in [`stubs`], beside
+//! the no-op defaults `AppState` starts with (see its module docs).
 //!
 //! **Coverage:** this is a definitions crate (trait bodies live in `ferrofin-core`),
 //! so it is exempt from the 80% line-coverage gate; the `options` module (real

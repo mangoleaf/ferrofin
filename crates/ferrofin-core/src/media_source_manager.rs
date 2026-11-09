@@ -248,9 +248,9 @@ impl FerrofinMediaSourceManager {
         allow_media_probe: bool,
         enable_path_substitution: bool,
     ) -> Result<Vec<MediaSourceInfo>, ServiceError> {
-        // Playback sources build on the static sources; the per-user bitrate/profile
-        // negotiation (MediaStreamSelector) is deferred, so the static set is the
-        // playback set for v1.
+        // Playback sources build on the user's static sources, which already
+        // carry the per-user stream defaults (`SetDefaultAudioAndSubtitleStreamIndices`,
+        // over `MediaStreamSelector`) and the playback permissions.
         let mut sources = self
             .static_sources(
                 item_id,

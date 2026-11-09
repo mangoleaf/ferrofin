@@ -10172,7 +10172,7 @@ impl LibraryScanner {
     /// refreshed BEFORE its tracks were probed, so the identical C# summed a set
     /// of `NULL`s, while the album — same code, refreshed after — got the right
     /// number. Ferrofin sums the probed ticks, so an artist reports its real
-    /// runtime; the divergence is recorded in `suite/parity/classifications.json`.
+    /// runtime rather than reproducing that race.
     ///
     /// `Playlist` is the third `SupportsCumulativeRunTimeTicks` kind
     /// (`Playlist.cs:79`); its children are `LinkedChildren`, not scanned

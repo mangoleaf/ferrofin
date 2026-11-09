@@ -1108,7 +1108,7 @@ pub async fn build_app_state(
             .with_metadata_root(metadata_root.clone()),
     );
     // Kept concrete so the "Migrate Trickplay Image Location" task can call the
-    // inherent `move_generated_trickplay_data` helper.
+    // inherent `move_generated_library_trickplay_data` helper.
     let trickplay_impl = Arc::new(
         FerrofinTrickplayManager::new(
             db.clone(),

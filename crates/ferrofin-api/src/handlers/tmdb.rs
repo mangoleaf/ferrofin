@@ -3,18 +3,15 @@
 //! Ports `GET /Tmdb/ClientConfiguration`, which surfaces the image portion of
 //! TMDb's `/configuration` response so a client can construct TMDb image URLs.
 //!
-//! ## Port scope — static configuration
+//! ## Fixed values, not the live fetch
 //!
 //! In Jellyfin this endpoint proxies a *live* call to TMDb
-//! (`TmdbClientManager.GetClientConfiguration` → `TMDbClient.GetConfigAsync`),
-//! which needs a configured TMDb API key. The remote TMDb provider is **deferred**
-//! in this wave (feature-gated, needs API keys — see the provider-manager port),
-//! so no live fetch is made. This handler instead returns TMDb's well-known,
-//! publicly documented image configuration — the same static bucket set the
-//! client would receive — so the endpoint's shape and payload are faithful. These
-//! are canonical configuration values, not fabricated remote *results*; when the
-//! TMDb provider lands with a key, this handler swaps the constants for the live
-//! fetch and the request/response contract is unchanged.
+//! (`TmdbClientManager.GetClientConfiguration` → `TMDbClient.GetConfigAsync`).
+//! This handler makes no call: it returns a fixed copy of TMDb's published
+//! image configuration (the base URLs and size buckets below), so the shape is
+//! upstream's but the values do not follow later changes TMDb makes.
+//! TODO(parity, gl-1508): open work item, not an accepted divergence: port the
+//! live `GetConfigAsync` fetch over the TMDb client in `ferrofin-providers`.
 
 use axum::routing::get;
 use axum::{Json, Router};
@@ -31,8 +28,7 @@ fn sizes(labels: &[&str]) -> Vec<String> {
 /// Returns TMDb's canonical image configuration.
 ///
 /// The base URLs and per-kind size buckets TMDb publishes at
-/// `/3/configuration`; stable, public values baked in while the live TMDb
-/// provider is deferred (see the module docs).
+/// `/3/configuration`, as fixed values (see the module docs).
 fn tmdb_image_config() -> ConfigImageTypes {
     ConfigImageTypes {
         base_url: Some("http://image.tmdb.org/t/p/".to_owned()),
@@ -52,8 +48,8 @@ fn tmdb_image_config() -> ConfigImageTypes {
 /// `GET /Tmdb/ClientConfiguration` — the TMDb image configuration options.
 ///
 /// Port of `TmdbController.TmdbClientConfiguration`, returning the `Images`
-/// portion of TMDb's client configuration. Serves the canonical static bucket
-/// set while the live TMDb provider is deferred (see the module docs).
+/// portion of TMDb's client configuration, from fixed values rather than
+/// upstream's live fetch (see the module docs).
 #[utoipa::path(
     get,
     path = "/Tmdb/ClientConfiguration",

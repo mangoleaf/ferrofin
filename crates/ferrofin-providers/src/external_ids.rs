@@ -28,8 +28,7 @@
 //! Two deliberate Ferrofin additions, both backed by code that reads the id:
 //! `jellyfin-plugin-tvdb`'s `TvdbSeriesExternalId` (TVDB ships compiled into
 //! Ferrofin) and `Books/{ComicVine,GoogleBooks,Isbn}` (Ferrofin has a books
-//! provider, and [`external_urls`] renders all three as "Links"). Both are
-//! recorded as accepted divergences in `suite/parity/classifications.json`.
+//! provider, and [`external_urls`] renders all three as "Links").
 //!
 //! ORDER IS PART OF THE CONTRACT. `ProviderManager.AddParts` stores
 //! `externalIds.OrderBy(i => i.ProviderName)`, and LINQ `OrderBy` is a STABLE
