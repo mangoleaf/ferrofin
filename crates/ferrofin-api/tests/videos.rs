@@ -924,11 +924,18 @@ async fn a_static_stream_of_another_protocol_is_refused_and_a_dead_origin_fails(
         .unwrap();
     assert_eq!(rtsp.status(), StatusCode::BAD_REQUEST);
 
-    // Nothing listens on this port any more.
-    let dead = {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        format!("http://{}/movie.mkv", listener.local_addr().unwrap())
-    };
+    // Bound for the rest of the test and never listening, so the fetch is
+    // refused. A port bound then dropped is free for another test process's
+    // listener, which could answer it. The hold is exclusive only without
+    // `SO_REUSEADDR`, as the assert checks.
+    let held = tokio::net::TcpSocket::new_v4().unwrap();
+    held.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+    let held_addr = held.local_addr().unwrap();
+    assert!(
+        std::net::TcpListener::bind(held_addr).is_err(),
+        "port is held"
+    );
+    let dead = format!("http://{held_addr}/movie.mkv");
     let down = create_router(state(&dead, no_subtitles()).app)
         .oneshot(authed(
             "GET",

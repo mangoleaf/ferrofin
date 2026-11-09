@@ -192,11 +192,19 @@ fn spawn_providers(answers: Answers) -> (String, Arc<Mutex<Vec<String>>>) {
 
 /// A base URL nothing listens on: every request to it fails to connect, as
 /// the adoption gates' unreachable proxy makes every provider request fail.
-fn unreachable_base() -> String {
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
-    let addr = listener.local_addr().expect("addr");
-    drop(listener);
-    format!("http://{addr}")
+/// Keep the socket for the whole test: it is bound and never listening, so
+/// connecting is refused. A port bound then dropped is free for another test
+/// process's fake provider, whose answers the scan would then read. The hold
+/// is exclusive only while this socket does not set `SO_REUSEADDR`, as the
+/// assert checks.
+fn unreachable_base() -> (String, tokio::net::TcpSocket) {
+    let socket = tokio::net::TcpSocket::new_v4().expect("socket");
+    socket
+        .bind("127.0.0.1:0".parse().expect("addr"))
+        .expect("bind");
+    let addr = socket.local_addr().expect("addr");
+    assert!(std::net::TcpListener::bind(addr).is_err(), "port is held");
+    (format!("http://{addr}"), socket)
 }
 
 /// A one-series TV library over an in-memory database.
@@ -739,8 +747,9 @@ async fn a_failing_season_provider_never_clears_the_stored_season(#[case] choice
     let cast = library.cast().await;
     assert!(before.overview.is_some() && !ids.is_empty() && !cast.is_empty());
 
+    let (offline, _held) = unreachable_base();
     library
-        .scanner(&unreachable_base())
+        .scanner(&offline)
         .scan_with(None, &dashboard(choice))
         .await
         .expect("scan during the outage");
@@ -771,9 +780,10 @@ async fn a_season_tvdb_fails_for_takes_tmdbs_answer_unstamped() {
     let tmp = tempfile::tempdir().expect("tmp");
     let library = Library::new(tmp.path(), LibraryOptions::default()).await;
     let (base, _log) = spawn_providers(DEFAULT_ANSWERS);
+    let (offline, _held) = unreachable_base();
 
     library
-        .scanner_with(&base, &unreachable_base())
+        .scanner_with(&base, &offline)
         .scan_all()
         .await
         .expect("scan");
