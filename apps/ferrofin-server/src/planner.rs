@@ -3031,6 +3031,13 @@ mod tests {
         }
     }
 
+    /// A joined argument line without the temporary directory its paths sit
+    /// in. A gate run puts that directory under the checkout, so a check for
+    /// a filter or flag word would also match the checkout's name.
+    fn without_temp_dir(args: &str) -> String {
+        args.replace(&*std::env::temp_dir().to_string_lossy(), "")
+    }
+
     fn planner(sources: Vec<MediaSourceInfo>) -> FerrofinStreamStatePlanner {
         planner_full(sources, false, &[])
     }
@@ -3639,7 +3646,7 @@ mod tests {
         assert!(args.contains("-c:a libmp3lame"), "{args}");
         assert!(args.contains("-b:a 128000"), "{args}");
         // `GetProgressiveAudioFullCommandLine` keeps the source's tags.
-        assert!(!args.contains("-map_metadata"), "{args}");
+        assert!(!without_temp_dir(&args).contains("-map_metadata"), "{args}");
 
         // The audio HLS segments of the same request encode to the same cap.
         let hls = p.plan(&req, true, None, PlaylistKind::Vod).await.unwrap();
@@ -4454,7 +4461,10 @@ mod tests {
                 args.contains("subtitles=f='/media/movie.mkv':si=0"),
                 "{codec}: {args}"
             );
-            assert!(!args.contains("overlay"), "{codec}: {args}");
+            assert!(
+                !without_temp_dir(&args).contains("overlay"),
+                "{codec}: {args}"
+            );
             assert!(!args.contains("-map [v]"), "{codec}: {args}");
             assert_eq!(args.matches(" -vf ").count(), 1, "{codec}: {args}");
         }
@@ -6452,7 +6462,7 @@ mod tests {
         let expected = "-async 1 -vsync -1 -re -fflags +igndts -stream_loop -1 \
             -reconnect_at_eof 1 -reconnect_streamed 1 -reconnect_delay_max 2";
         assert!(before.contains(expected), "{before}");
-        let after = plan.arguments[input + 1..].join(" ");
+        let after = without_temp_dir(&plan.arguments[input + 1..].join(" "));
         assert!(
             !after.contains("igndts") && !after.contains("stream_loop"),
             "{after}"
@@ -7382,7 +7392,7 @@ mod tests {
         // Exactly once: `video_quality_param` already carries the bitrate pair,
         // and a second `video_bitrate_param` push used to duplicate it.
         assert_eq!(
-            args.matches("-maxrate").count(),
+            without_temp_dir(&args).matches("-maxrate").count(),
             1,
             "bitrate cap emitted exactly once: {args}"
         );
@@ -7404,7 +7414,6 @@ mod tests {
         req.max_width = Some(1920);
         req.max_height = Some(1080);
         let plan = p.plan(&req, false, None, PlaylistKind::Vod).await.unwrap();
-        let args = plan.arguments.join(" ");
         let vf = plan
             .arguments
             .iter()
@@ -7417,6 +7426,7 @@ mod tests {
              scale=1920:1080,\
              tonemapx=tonemap=bt2390:desat=0:peak=100:t=bt709:m=bt709:p=bt709:format=yuv420p",
         );
+        let args = without_temp_dir(&plan.arguments.join(" "));
         assert!(!args.contains("zscale"), "no zscale fallback: {args}");
     }
 
@@ -7439,7 +7449,10 @@ mod tests {
             !args.contains("-vf scale="),
             "no downscale without caps: {args}"
         );
-        assert!(!args.contains("-maxrate"), "no bitrate cap: {args}");
+        assert!(
+            !without_temp_dir(&args).contains("-maxrate"),
+            "no bitrate cap: {args}"
+        );
         assert!(
             args.contains("tonemap=tonemap=hable"),
             "tonemap still applies: {args}"
@@ -7459,12 +7472,15 @@ mod tests {
         let mut req = request("abc");
         req.video_codec = Some("h264".to_owned());
         let plan = p.plan(&req, false, None, PlaylistKind::Vod).await.unwrap();
-        let args = plan.arguments.join(" ");
-        assert!(
-            args.contains("-vf format=yuv420p"),
-            "8-bit down-convert: {args}"
-        );
-        assert!(!args.contains("tonemap"), "SDR source: no tonemap: {args}");
+        // The filter argument alone: the whole line holds the transcode paths,
+        // and a checkout named after a tone-mapping change puts "tonemap" there.
+        let vf = plan
+            .arguments
+            .iter()
+            .position(|a| a == "-vf")
+            .map(|i| plan.arguments[i + 1].as_str())
+            .expect("-vf expected");
+        assert_eq!(vf, "format=yuv420p", "8-bit down-convert, no tonemap");
     }
 
     #[tokio::test]
@@ -7593,7 +7609,7 @@ mod tests {
         // The CUDA scaler, not the software one.
         assert!(args.contains("-vf setparams="), "{args}");
         assert!(args.contains("scale_cuda=format=yuv420p"), "{args}");
-        assert!(!args.contains("hwdownload"), "{args}");
+        assert!(!without_temp_dir(&args).contains("hwdownload"), "{args}");
         // NVENC's own preset ladder: p4 for `medium`, not an x264 name.
         assert!(args.contains("-preset p4"), "{args}");
         // The generic bitrate shape — targeted, not merely capped.
@@ -7602,8 +7618,8 @@ mod tests {
             "{args}"
         );
         // Gone with the bolt-on: the fixed constant-quality target and `-crf`.
-        assert!(!args.contains("-cq"), "{args}");
-        assert!(!args.contains("-crf"), "{args}");
+        assert!(!without_temp_dir(&args).contains("-cq"), "{args}");
+        assert!(!without_temp_dir(&args).contains("-crf"), "{args}");
         // NVENC's forced keyframes cut segments once they are IDR frames, and
         // need no frame rate: this source has none.
         assert!(
@@ -7666,9 +7682,12 @@ mod tests {
         assert!(args.contains("-c:v h264_nvenc -preset p4"), "{args}");
         // ...but nothing is asked of a device that cannot do the filtering:
         // no device graph, no hardware decode, no CUDA filter.
-        assert!(!args.contains("-init_hw_device"), "{args}");
-        assert!(!args.contains("-hwaccel"), "{args}");
-        assert!(!args.contains("_cuda"), "{args}");
+        assert!(
+            !without_temp_dir(&args).contains("-init_hw_device"),
+            "{args}"
+        );
+        assert!(!without_temp_dir(&args).contains("-hwaccel"), "{args}");
+        assert!(!without_temp_dir(&args).contains("_cuda"), "{args}");
         assert!(args.contains("-vf setparams="), "{args}");
         assert!(args.contains("format=yuv420p"), "{args}");
     }
@@ -7792,8 +7811,14 @@ mod tests {
             // The bound the client asked for still reaches the scaler...
             assert!(args.contains("scale="), "{accel:?}: {args}");
             // ...and no half-wired device pipeline is emitted.
-            assert!(!args.contains("-init_hw_device"), "{accel:?}: {args}");
-            assert!(!args.contains("-hwaccel"), "{accel:?}: {args}");
+            assert!(
+                !without_temp_dir(&args).contains("-init_hw_device"),
+                "{accel:?}: {args}"
+            );
+            assert!(
+                !without_temp_dir(&args).contains("-hwaccel"),
+                "{accel:?}: {args}"
+            );
         }
     }
 
@@ -8034,7 +8059,7 @@ mod tests {
         let plan = p.plan(&req, false, None, PlaylistKind::Vod).await.unwrap();
         let args = plan.arguments.join(" ");
         assert!(!args.contains("driver=iHD"), "{args}");
-        assert!(!args.contains("-low_power"), "{args}");
+        assert!(!without_temp_dir(&args).contains("-low_power"), "{args}");
         // ...but the VAAPI pipeline itself still runs.
         assert!(args.contains("-c:v h264_vaapi"), "{args}");
         assert!(args.contains("scale_vaapi="), "{args}");
@@ -8263,7 +8288,10 @@ mod tests {
 
         // Without the tonemap there is nothing to work around.
         let plain = qsv_plan(Platform::Linux, false).await;
-        assert!(!plain.contains("-async_depth"), "{plain}");
+        assert!(
+            !without_temp_dir(&plain).contains("-async_depth"),
+            "{plain}"
+        );
     }
 
     #[tokio::test]
@@ -8282,7 +8310,7 @@ mod tests {
             "{args}"
         );
         // No VAAPI anywhere on this platform.
-        assert!(!args.contains("vaapi"), "{args}");
+        assert!(!without_temp_dir(&args).contains("vaapi"), "{args}");
     }
 
     #[tokio::test]
@@ -8519,8 +8547,14 @@ mod tests {
                 args.contains("-bsf:v hevc_mp4toannexb "),
                 "{ranges}: {args}"
             );
-            assert!(!args.contains("remove_dovi"), "{ranges}: {args}");
-            assert!(!args.contains("dovi_rpu"), "{ranges}: {args}");
+            assert!(
+                !without_temp_dir(&args).contains("remove_dovi"),
+                "{ranges}: {args}"
+            );
+            assert!(
+                !without_temp_dir(&args).contains("dovi_rpu"),
+                "{ranges}: {args}"
+            );
             assert!(!plan.is_dovi_removed, "{ranges}");
         }
         // The fMP4 Dolby Vision branch follows upstream's `DOVI` check.
@@ -8579,7 +8613,7 @@ mod tests {
             "{args}"
         );
         // ...and NOT with the premultiplied option, which is text-only.
-        assert!(!args.contains("alpha_format"), "{args}");
+        assert!(!without_temp_dir(&args).contains("alpha_format"), "{args}");
     }
 
     /// The hardware chains' subtitle pad is the ffmpeg index too: a Blu-ray
@@ -8668,7 +8702,7 @@ mod tests {
 
         // Segment 0 needs no shift at all.
         let plan = p.plan(&req, false, None, PlaylistKind::Vod).await.unwrap();
-        assert!(!plan.arguments.join(" ").contains("setpts"));
+        assert!(!without_temp_dir(&plan.arguments.join(" ")).contains("setpts"));
     }
 
     /// A 1080i H.264 source at `rate` fps, re-encoded under `options` with a
@@ -8756,7 +8790,8 @@ mod tests {
     /// A progressive source is not deinterlaced.
     #[tokio::test]
     async fn a_progressive_source_is_not_deinterlaced_in_software() {
-        let args = software_args(false, 25.0, EncodingOptions::default(), None).await;
+        let args =
+            without_temp_dir(&software_args(false, 25.0, EncodingOptions::default(), None).await);
         assert!(!args.contains("yadif") && !args.contains("bwdif"), "{args}");
     }
 
@@ -9087,7 +9122,7 @@ mod tests {
              [main][sub]overlay_cuda=eof_action=pass:repeatlast=0:\
              alpha_format=premultiplied"
         );
-        assert!(!args.contains("hwdownload"), "{args}");
+        assert!(!without_temp_dir(&args).contains("hwdownload"), "{args}");
         // The old bolt-on emitted a separate `-vf` here; the two cannot coexist.
         assert!(!args.contains("-vf "), "{args}");
     }
@@ -9200,7 +9235,7 @@ mod tests {
         assert_eq!(plan.state.output_audio_bitrate, Some(128_000));
         let args = plan.arguments.join(" ");
         assert!(
-            !args.contains("-maxrate"),
+            !without_temp_dir(&args).contains("-maxrate"),
             "copy has no bitrate args: {args}"
         );
         assert!(!args.contains("-b:a"), "copy has no audio bitrate: {args}");
@@ -9407,8 +9442,11 @@ mod tests {
             .unwrap();
         let args = plan.arguments.join(" ");
         assert!(args.contains("-hls_playlist_type vod"), "{args}");
-        assert!(!args.contains("-hls_base_url"), "{args}");
-        assert!(!args.contains("-global_header"), "{args}");
+        assert!(!without_temp_dir(&args).contains("-hls_base_url"), "{args}");
+        assert!(
+            !without_temp_dir(&args).contains("-global_header"),
+            "{args}"
+        );
         assert!(args.contains("-preset veryfast"), "{args}");
 
         // fMP4 event segments keep the global header (the flag is mpegts-only).
@@ -9420,7 +9458,10 @@ mod tests {
             .unwrap();
         let args = plan.arguments.join(" ");
         assert!(args.contains("-hls_playlist_type event"), "{args}");
-        assert!(!args.contains("-global_header"), "{args}");
+        assert!(
+            !without_temp_dir(&args).contains("-global_header"),
+            "{args}"
+        );
     }
 
     /// No selected subtitle: the delivery method is the DTO default
