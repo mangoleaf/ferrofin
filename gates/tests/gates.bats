@@ -339,3 +339,41 @@ SH
     [ -z "$(session_pids "$worker")" ] || { echo "$how: the worker's session outlived it" >&2; cat out/err >&2; return 1; }
   done
 }
+
+@test "gates_supervise: a TERM it sends again as the teardown acks never reaches the teardown after its ack (gl-1131)" {
+  # The worker takes its TERM only once its foreground command ends, 1.5 s after the signal, so the supervisor
+  # finds no ack at its re-send a second in; its kill (slowed here by a second) then lands after the teardown
+  # has acked and set a TERM trap of its own, as scan-behaviour.sh's cleanup does for a second Ctrl-C.
+  mkdir -p out acks
+  cat > slow-ack.sh <<'SH'
+#!/usr/bin/env bash
+set -uo pipefail
+. "$GATES/lib.sh"
+kill() { if [ "$#" = 2 ] && [ "$1" = -TERM ]; then sleep 1; fi; builtin kill "$@"; }   # only a re-send's form
+gates_supervise "$PWD" "$0" "$@"
+OUT=$1
+teardown() {
+  gates_ack
+  trap 'echo second >> "$OUT/log"; exit 143' TERM
+  echo acked >> "$OUT/log"
+  sleep 2
+  echo done >> "$OUT/log"
+  exit 143
+}
+trap teardown TERM
+echo "$BASHPID" > "$OUT/worker"
+while :; do (trap '' TERM; sleep 1.5); done
+SH
+  export GATES
+  TMPDIR=$TMP/acks bash slow-ack.sh "$TMP/out" & leader=$!
+  for _ in $(seq 1 100); do [ ! -s out/worker ] || break; sleep 0.05; done
+  kill -TERM "$leader"
+  for _ in $(seq 1 80); do kill -0 "$leader" 2>/dev/null || break; sleep 0.1; done
+  if kill -0 "$leader" 2>/dev/null; then
+    kill -KILL "$leader" "$(cat out/worker)" 2>/dev/null; echo "still running 8 s after the TERM" >&2; return 1
+  fi
+  status=0; wait "$leader" || status=$?
+  [ "$status" -eq 143 ]
+  [ "$(cat out/log)" = "$(printf 'acked\ndone')" ] || { cat out/log >&2; return 1; }
+  [ -z "$(ls -A acks)" ]
+}
