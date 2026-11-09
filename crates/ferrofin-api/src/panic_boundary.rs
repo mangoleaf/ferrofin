@@ -55,12 +55,16 @@ pub async fn panic_boundary_layer(request: Request, next: Next) -> Response {
                 panic = %ferrofin_util::panic::message(panic.as_ref()),
                 "Error processing request"
             );
-            (
+            let mut response = (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 [(header::CONTENT_TYPE, "text/plain")],
                 ERROR_BODY,
             )
-                .into_response()
+                .into_response();
+            response
+                .extensions_mut()
+                .insert(crate::error::FailureLogged);
+            response
         }
     }
 }

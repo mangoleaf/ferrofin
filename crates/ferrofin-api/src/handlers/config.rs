@@ -16,8 +16,11 @@
 //! read-only. They bind through typed JsonDefaults converters before
 //! persistence and return typed documents on reads.
 //!
-//! Every route is `[Authorize]` (writes additionally `RequiresElevation`), which
-//! collapses to authentication at this layer via [`RequireAuth`].
+//! Every route is `[Authorize]`. The writes and
+//! `GET /System/Configuration/MetadataOptions/Default` are also
+//! `RequiresElevation` and take [`RequireAdminWithDefault`] (administrator,
+//! plus the default policy's user checks, remote access included); the other
+//! reads take [`RequireAuth`].
 
 use axum::extract::{Path, State};
 use axum::http::StatusCode;

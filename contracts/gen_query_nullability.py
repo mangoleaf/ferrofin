@@ -22,7 +22,7 @@ included — so obsolete actions the OpenAPI document omits (`/Users/{userId}/
 Items`) are covered too. Each release's controllers are read with `git show`,
 so the output is reproducible; the newer release wins:
 
-    contracts/gen_query_nullability.py ~/dev/3rdparty/jellyfin
+    contracts/gen_query_nullability.py /path/to/jellyfin
 
 Keys are `METHOD /Path/{param}` as upstream writes them; the server compares
 them with parameters erased and literals case-folded.

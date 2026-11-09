@@ -260,7 +260,8 @@ async fn refreshing_a_pathless_season_rederives_its_stored_parental_score() {
     );
     let refreshed = wait_for("the season's refresh to be saved", async || {
         let row = h.items.retrieve_item(id).await.ok()??;
-        (row.date_last_refreshed != before).then_some(row)
+        // The stamp is cleared before the save and written after it.
+        (row.date_last_refreshed > before).then_some(row)
     })
     .await;
     assert_eq!(

@@ -1154,8 +1154,8 @@ reason = "Owner decision 2026-10-24: a Ferrofin backup keeps its own engine vers
 request = "CreateBackup"
 path = "ServerVersion"
 kind = "value"
-issue = 235
-reason = "The backup manifest carries the stale crate version 0.4.1 (gl-235); once fixed it is Ferrofin's own version, an owner decision of 2026-10-24 (gl-862)."
+issue = 862
+reason = "Owner decision 2026-10-24: a Ferrofin backup records Ferrofin's own release version, not Jellyfin's."
 
 # Cancelling a package installation always answers 404.
 [[entry]]

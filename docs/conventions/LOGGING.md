@@ -36,7 +36,12 @@ At the **outermost layer that still has context** — never also at the origin.
   (`ferrofin-api/src/error.rs`) logs 5xx once. Do **not** add origin logging on request
   paths — that double-logs. A handler panic is logged once by the panic boundary
   (`ferrofin-api/src/panic_boundary.rs`) that answers it `500`, beside the panic hook's
-  own line (rule 7).
+  own line (rule 7). Both mark their responses `FailureLogged`, as do the IP filter's
+  `503` and `RequiredRouteString`'s `500` (`ferrofin-api/src/extract.rs`), and the
+  request span (`record_status` in `ferrofin-api/src/router.rs`) logs `response failed`
+  only for a 5xx without that mark: one passed through from a relayed origin, a plugin
+  or a health check. A new 5xx path that logs its own failure marks its response the
+  same way.
 - **Background paths** (spawned tasks, samplers, schedulers): at the task's own top
   level, with the span active.
 - `let _ =` / `.ok()` on a fallible call is allowed **only** when failure is truly

@@ -208,6 +208,12 @@ pub trait PlaylistManager: Send + Sync {
         user_id: Uuid,
     ) -> Result<Vec<BaseItemEntity>, ServiceError>;
 
+    /// The ids of the members [`get_playlist_items`](Self::get_playlist_items)
+    /// lists, in playlist order, repeats kept, without its access check: the
+    /// caller resolves access first ([`get_playlist_access`](Self::get_playlist_access)),
+    /// as for [`get_playlist_shares`](Self::get_playlist_shares).
+    async fn get_playlist_item_ids(&self, playlist_id: Uuid) -> Result<Vec<Uuid>, ServiceError>;
+
     /// Adds a user share to a playlist.
     async fn add_user_to_shares(
         &self,

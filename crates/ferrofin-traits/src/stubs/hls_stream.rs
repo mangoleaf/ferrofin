@@ -1,10 +1,10 @@
 //! A disabled [`HlsStreamManager`] for hosts without a transcode runtime.
 //!
-//! The [`HlsStreamManager`] seam belongs to the (real) `ferrofin-mediaencoding`
-//! transcode runtime, not a deferred subsystem — but `AppState` must name a
-//! non-optional `Arc<dyn HlsStreamManager>` and every existing test constructor
-//! predates the seam. This stub lets those callers (and any host that ships
-//! without ffmpeg) satisfy the field: every method reports the flow as
+//! The [`HlsStreamManager`] seam belongs to the transcode runtime (`ferrofin-hls`
+//! over `ferrofin-mediaencoding`), but `AppState` must name a non-optional
+//! `Arc<dyn HlsStreamManager>` and every existing test constructor predates the
+//! seam. This stub lets those callers (and any host that ships without ffmpeg)
+//! satisfy the field: every method reports the flow as
 //! unavailable ([`ServiceError::NotFound`]), which the streaming handlers map to
 //! their `404`/`501`-shaped responses. The composition root replaces it with the
 //! concrete `HlsStreamManagerImpl` when a transcode runtime is present.

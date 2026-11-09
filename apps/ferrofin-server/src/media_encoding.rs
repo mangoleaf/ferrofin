@@ -354,7 +354,6 @@ pub fn build_media_encoding(
         Arc::clone(&config),
         Arc::clone(&paths),
         Arc::clone(&subtitles),
-        ffmpeg.supports_filter("tonemapx"),
     )
     .with_attachments(Arc::clone(&attachments), path_manager);
     let planner = match library {
@@ -446,10 +445,8 @@ struct FfmpegSubtitleIo {
 
 #[async_trait]
 impl SubtitleIo for FfmpegSubtitleIo {
-    async fn read_file(&self, path: &str) -> Result<Vec<u8>, String> {
-        tokio::fs::read(path)
-            .await
-            .map_err(|e| format!("read {path}: {e}"))
+    async fn read_file(&self, path: &str) -> std::io::Result<Vec<u8>> {
+        tokio::fs::read(path).await
     }
 
     async fn http_get(&self, url: &str) -> Result<Vec<u8>, String> {
@@ -1727,6 +1724,75 @@ mod tests {
             ffmpeg_path,
             config: Arc::new(FakeConfig(paths, options)),
             encoding_reader: EncodingOptionsReader::new("subtitle extraction"),
+        }
+    }
+
+    /// A sidecar gone from disk keeps its I/O kind through the real read, so the
+    /// encoder answers the `404` upstream's `FileNotFoundException` is, not a 500.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_missing_sidecar_reads_as_not_found() {
+        let tmp = tempfile::tempdir().unwrap();
+        let io = subtitle_io(tmp.path(), "ffmpeg".to_owned(), 1);
+        let mut stream = MediaStream {
+            stream_type: MediaStreamType::Subtitle,
+            ..MediaStream::default()
+        };
+        stream.is_external = true;
+        stream.codec = Some("srt".to_owned());
+        stream.path = Some(
+            tmp.path()
+                .join("gone.en.srt")
+                .to_string_lossy()
+                .into_owned(),
+        );
+        let error = PureSubtitleEncoder::new(SubtitleEditParser::new(), io)
+            .get_subtitles(&MediaSourceInfo::default(), &stream, "vtt", 0, 0, false)
+            .await
+            .unwrap_err();
+        let error = ServiceError::from(error);
+        assert!(matches!(error, ServiceError::NotFound(_)), "{error:?}");
+    }
+
+    /// A PGS sidecar asked for as text is refused unread, after the real
+    /// I/O opens it as `AsyncFile.OpenRead` does: a missing file is the `404`,
+    /// a directory in its place the `500` .NET's open throws for one, and a
+    /// file the parser has no reader for the `400`.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_pgs_sidecar_asked_for_as_text_is_opened_before_it_is_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = |name: &str| tmp.path().join(name).to_string_lossy().into_owned();
+        std::fs::write(tmp.path().join("movie.en.sup"), b"PG").unwrap();
+        std::fs::create_dir(tmp.path().join("folder.en.sup")).unwrap();
+        let encoder = PureSubtitleEncoder::new(
+            SubtitleEditParser::new(),
+            subtitle_io(tmp.path(), "ffmpeg".to_owned(), 1),
+        );
+        for (name, expected) in [
+            ("gone.en.sup", "not found"),
+            ("folder.en.sup", "backend source"),
+            ("movie.en.sup", "invalid input"),
+        ] {
+            let stream = MediaStream {
+                stream_type: MediaStreamType::Subtitle,
+                is_external: true,
+                codec: Some("pgssub".to_owned()),
+                path: Some(path(name)),
+                ..MediaStream::default()
+            };
+            let error = encoder
+                .get_subtitles(&MediaSourceInfo::default(), &stream, "vtt", 0, 0, false)
+                .await
+                .unwrap_err();
+            let error = ServiceError::from(error);
+            let kind = match &error {
+                ServiceError::NotFound(_) => "not found",
+                ServiceError::BackendSource(_) => "backend source",
+                ServiceError::InvalidInput(_) => "invalid input",
+                _ => "other",
+            };
+            assert_eq!(kind, expected, "{name}: {error:?}");
         }
     }
 

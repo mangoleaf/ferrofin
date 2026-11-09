@@ -112,8 +112,9 @@ pub struct TranscodingProgress {
 /// Wraps the ffmpeg/ffprobe subprocess: probing, frame and image extraction.
 ///
 /// Port of the object-safe, domain-tree-free subset of `IMediaEncoder`. The
-/// hardware-capability probes and `EncodingJobInfo`-coupled command builders are
-/// deferred to the Wave 6 implementation (see the module docs).
+/// hardware-capability probes and `EncodingJobInfo`-coupled command builders
+/// live with the encoder implementation in `ferrofin-mediaencoding`, not on
+/// this seam (see the module docs).
 #[async_trait]
 pub trait MediaEncoder: Send + Sync {
     /// The resolved path to the `ffmpeg` binary. Port of the `EncoderPath`
@@ -129,8 +130,9 @@ pub trait MediaEncoder: Send + Sync {
     async fn set_ffmpeg_path(&self) -> Result<bool, ServiceError>;
 
     /// Probes a media source, returning its container/stream information. Port
-    /// of `GetMediaInfo(MediaInfoRequest, …)`; returns [`MediaSourceInfo`]
-    /// pending a ported `MediaInfo` (see the module docs).
+    /// of `GetMediaInfo(MediaInfoRequest, …)`; returns the narrower
+    /// [`MediaSourceInfo`], and [`Self::get_media_info_full`] the full
+    /// [`MediaInfo`] (see the module docs).
     async fn get_media_info(
         &self,
         request: &MediaInfoRequest,
@@ -242,14 +244,12 @@ impl EncoderSupport for NoEncoders {
 
 /// Extracts evenly spaced trickplay thumbnail frames from a video file.
 ///
-/// Port of the software path of
-/// `IMediaEncoder.ExtractVideoImagesOnIntervalAccelerated`: one ffmpeg run with
-/// an `fps=1/interval` + width-bounded `scale` filter chain writing numbered
-/// JPEG thumbnails into a directory. The hardware-acceleration and
-/// keyframe-only variants ride the deferred hw-accel matrix (see the
-/// `ferrofin-mediaencoding` crate docs) and are not modeled at this seam; the
-/// trickplay manager's `EnableHwAcceleration`/`EnableHwEncoding`/
-/// `EnableKeyFrameOnlyExtraction` options therefore select the software path.
+/// Port of `IMediaEncoder.ExtractVideoImagesOnIntervalAccelerated`: one ffmpeg
+/// run with an `fps=1/interval` + width-bounded `scale` filter chain writing
+/// numbered JPEG thumbnails into a directory. The [`TrickplayExtraction`]
+/// request carries the trickplay options `EnableHwAcceleration` (the hardware
+/// path), `EnableHwEncoding` (a hardware MJPEG encoder) and
+/// `EnableKeyFrameOnlyExtraction` (decode keyframes only).
 ///
 /// This is a separate small trait (rather than a `MediaEncoder` method) so the
 /// trickplay manager in `ferrofin-core` can depend on exactly this capability.
@@ -406,9 +406,11 @@ fn _assert_object_safe_keyframe_extractor(_: &dyn KeyframeExtractor) {}
 
 /// Manages live transcode jobs: lookup, keep-alive pings, progress, teardown.
 ///
-/// Port of the object-safe subset of `ITranscodeManager`. `StartFfMpeg` (which
-/// takes an un-ported `StreamState` + `CancellationTokenSource`) and the
-/// `LockAsync` disposable are deferred to the Wave 6 implementation.
+/// Port of the object-safe subset of `ITranscodeManager`. `StartFfMpeg` and
+/// `LockAsync` are not on this seam: `ferrofin-mediaencoding`'s
+/// `TranscodeManagerImpl::start_ffmpeg` starts a job from a
+/// `StartFfMpegRequest`, and the HLS stream manager holds the per-playlist lock
+/// `LockAsync` takes upstream.
 #[async_trait]
 pub trait TranscodeManager: Send + Sync {
     /// Looks up a running job by its playback-session id. Port of the
