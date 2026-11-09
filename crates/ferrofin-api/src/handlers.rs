@@ -3659,6 +3659,48 @@ pub const VERIFIED: &[Verified] = &[
     },
     Verified {
         method: "get",
+        path: "/Videos/{itemId}/{container}/Attachments/{index}",
+        upstream_file: "Jellyfin.Api/Controllers/VideoAttachmentsController.cs",
+        upstream_method: "GetAttachment",
+        ferrofin: "handlers/hls.rs get_video_attachment → ferrofin-mediaencoding \
+               attachments/extractor.rs get_attachment, extract_attachment \
+               (AttachmentExtractor.GetAttachment, GetAttachmentStream, ExtractAttachment, \
+               ExtractAttachmentInternal) → apps/ferrofin-server media_encoding.rs \
+               MediaSourceManagerResolver, FfmpegAttachmentIo open_file, run_ffmpeg → \
+               handlers/streaming.rs opened_file_response (FileStreamResult)",
+        date: "2026-11-09",
+        divergences: &[
+            "The media source comes from GetStaticMediaSources: upstream's \
+         GetPlaybackMediaSources(item, null, true, false) first re-probes a .strm item (and \
+         one with no main stream), so a .strm whose target changed serves its last probe's \
+         attachments here. Fix path: gl-1519. Its dynamic sources, a channel's tuner \
+         streams, are in the static list here, and list no attachments on either side (a \
+         404).",
+            "A dropped request kills a running extraction and deletes its output (gl-283); \
+         upstream's action passes CancellationToken.None, so its extraction runs to the end \
+         and the next request is served from the cache. Fix path: gl-1517.",
+            "A whitespace-only mediaSourceId is the 400 only once the item is found: upstream's \
+         model validation refuses it before the item is read, so for a missing or hidden \
+         item it is a 400 there and a 404 here. Fix path: gl-1518.",
+            "A nil videoId is a 404, not GetItemById's 400. Fix path: gl-1034.",
+            "A mediaSourceId selects its source in any GUID spelling; upstream compares the N \
+         form, ignoring case. Clients echo the id they were given, and an adopted database \
+         may hold the hyphenated form.",
+            "An attachment MIME type that MediaTypeHeaderValue.Parse refuses (FileStreamResult \
+         parses it) is a 500 upstream. Here it is sent as stored, or as \
+         application/octet-stream, as a missing one is, when no header can carry it (a \
+         control or non-ASCII character). Jellyfin bug not ported.",
+            "An item that cannot have media sources (a series, a box set) is a 404 (no \
+         attachment with that index); upstream's GetStaticMediaSources throws \
+         ArgumentException, a 400. Fix path: gl-397.",
+            "The 400, 404 and 500 bodies have Ferrofin's error shape, not upstream's: a missing \
+         item is NotFound()'s problem details there, a cached file gone before it is opened \
+         the exception middleware's text. Fix path: gl-666.",
+        ],
+        refs: &["access-filtering"],
+    },
+    Verified {
+        method: "get",
         path: "/Items/Latest",
         upstream_file: "Jellyfin.Api/Controllers/UserLibraryController.cs",
         upstream_method: "GetLatestMedia",

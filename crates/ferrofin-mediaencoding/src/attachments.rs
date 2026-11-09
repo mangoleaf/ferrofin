@@ -4,7 +4,7 @@
 //! pure orchestration — resolve the source, reject `mjpeg`/missing attachments,
 //! build the per-attachment output path, and serialize extraction per output
 //! folder with a keyed lock (C# `AsyncKeyedLocker<string>`) — is ported here.
-//! The ffmpeg `-dump_attachment` spawn, the on-disk cache reads, and the
+//! The ffmpeg `-dump_attachment` spawn, opening the cached file, and the
 //! item→media-source lookup sit behind the [`AttachmentIo`] and
 //! [`MediaSourceResolver`] seams so unit tests inject fakes.
 
