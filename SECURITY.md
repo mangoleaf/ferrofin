@@ -29,8 +29,9 @@ From v1.5.1, every `ferrofin-server` binary a release ships carries the exact li
 crates it was built from, embedded by [cargo-auditable](https://github.com/rust-secure-code/cargo-auditable).
 That covers the one in the container image, the one in the `.deb` and the ones in the
 release archives. The release workflow checks each binary against the RustSec advisory
-database and does not publish one with a known vulnerability. To check an installed
-binary against advisories published since:
+database and does not publish one with a known vulnerability that [`deny.toml`](deny.toml)
+has not accepted (see below). To check an installed binary against advisories published
+since:
 
 ```sh
 cargo install --locked cargo-audit   # once; --max-binary-size needs 0.22.2 or later
@@ -48,6 +49,8 @@ docker cp ferrofin-audit:/usr/local/bin/ferrofin-server . && docker rm ferrofin-
 cargo audit bin --max-binary-size "$(stat -c %s ferrofin-server)" ./ferrofin-server
 ```
 
-A warning for an advisory in [`deny.toml`](deny.toml)'s `ignore` list is expected: the
-release check accepts those, each for the reason given there. Container scanners that read
-cargo-auditable data (Trivy, Grype/Syft, osv-scanner) find the same list in the image.
+An advisory in [`deny.toml`](deny.toml)'s `ignore` list is expected in the output:
+unmaintained and unsound notices appear as warnings, a vulnerability as an error that
+makes the command exit 1. The release check accepts those, each for the reason given
+there. Container scanners that read cargo-auditable data (Trivy, Grype/Syft, osv-scanner)
+find the same list in the image.
