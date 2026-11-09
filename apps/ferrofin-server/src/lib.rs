@@ -1453,13 +1453,40 @@ async fn transform_web_file(
         && let Ok(text) = String::from_utf8(bytes)
     {
         let transformed = transformations.run_transformation(rel, text).await;
+        // The plugin's validator (`FileTransformationMiddleware` @ 0900de8f1,
+        // ahead of the ported rev): an `ETag` over the transformed bytes and
+        // `no-cache`, and no `Last-Modified` (so no `If-Modified-Since` to
+        // answer). A changed transform revalidates to a `200`, never stale.
+        let etag = transformed_etag(&transformed);
+        let validators = [
+            (axum::http::header::ETAG, etag.as_str()),
+            (axum::http::header::CACHE_CONTROL, "no-cache"),
+        ];
+        if req
+            .headers()
+            .get(axum::http::header::IF_NONE_MATCH)
+            .is_some_and(|v| v.as_bytes() == etag.as_bytes())
+        {
+            return (axum::http::StatusCode::NOT_MODIFIED, validators).into_response();
+        }
         return (
             [(axum::http::header::CONTENT_TYPE, web_file_mime(rel))],
+            validators,
             transformed,
         )
             .into_response();
     }
     next.run(req).await
+}
+
+/// The plugin's `ETag` for a transformed file: the first 8 bytes of the
+/// SHA-256 of its contents, as quoted lowercase hex.
+fn transformed_etag(contents: &str) -> String {
+    use sha2::Digest as _;
+    let digest = sha2::Sha256::digest(contents.as_bytes());
+    let mut first = [0u8; 8];
+    first.copy_from_slice(&digest[..8]);
+    format!("\"{:016x}\"", u64::from_be_bytes(first))
 }
 
 /// The MIME type for a transformed web file, from its extension (the plain
@@ -1920,6 +1947,8 @@ mod tests {
             .unwrap();
         assert_eq!(gz.status(), StatusCode::OK);
         assert_eq!(gz.headers()["content-encoding"], "gzip");
+        // The compression layer keeps the transformed file's strong `ETag`.
+        assert!(gz.headers()["etag"].to_str().unwrap().starts_with('"'));
         let gz_body = axum::body::to_bytes(gz.into_body(), usize::MAX)
             .await
             .unwrap();
@@ -2084,6 +2113,57 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(&body[..], b"<!doctype html>ferrofin");
+    }
+
+    /// A transformed file carries an `ETag` over its transformed bytes and
+    /// `Cache-Control: no-cache`, revalidates to a `304`, and gets a new
+    /// `ETag` (a `200`, never a stale `304`) once the transform set changes
+    /// its output, as the File Transformation plugin's middleware does.
+    #[tokio::test]
+    async fn transformed_web_file_revalidates_until_its_output_changes() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("index.html"), "<!doctype html>ferrofin").unwrap();
+        std::fs::write(dir.path().join("a.js"), "hello world").unwrap();
+        let service = transformations(dir.path());
+        service
+            .add_transformation(uuid::Uuid::from_u128(13), "a.js", Arc::new(Identity))
+            .await;
+        let app = mount_web(Router::new(), dir.path(), Arc::clone(&service));
+        let get = |if_none_match: Option<&str>| {
+            let mut request = Request::builder().uri("/web/a.js");
+            if let Some(etag) = if_none_match {
+                request = request.header("if-none-match", etag);
+            }
+            app.clone().oneshot(request.body(Body::empty()).unwrap())
+        };
+
+        let first = get(None).await.unwrap();
+        assert_eq!(first.status(), StatusCode::OK);
+        assert_eq!(first.headers()["cache-control"], "no-cache");
+        assert!(first.headers().get("last-modified").is_none());
+        let etag = first.headers()["etag"].to_str().unwrap().to_owned();
+        // The plugin's format: SHA-256("hello world") starts b94d27b9934d3e08.
+        assert_eq!(etag, "\"b94d27b9934d3e08\"");
+
+        let revalidated = get(Some(&etag)).await.unwrap();
+        assert_eq!(revalidated.status(), StatusCode::NOT_MODIFIED);
+        assert_eq!(revalidated.headers()["etag"], etag.as_str());
+        assert_eq!(revalidated.headers()["cache-control"], "no-cache");
+        let body = axum::body::to_bytes(revalidated.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert!(body.is_empty());
+
+        service
+            .add_transformation(uuid::Uuid::from_u128(14), "a.js", Arc::new(Upper))
+            .await;
+        let changed = get(Some(&etag)).await.unwrap();
+        assert_eq!(changed.status(), StatusCode::OK);
+        assert_ne!(changed.headers()["etag"], etag.as_str());
+        let body = axum::body::to_bytes(changed.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(&body[..], b"HELLO WORLD");
     }
 
     #[tokio::test]

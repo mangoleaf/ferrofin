@@ -58,6 +58,7 @@ config.workspace = true
 toml_edit.workspace = true      # the settings page's save edits config.toml keeping its comments
 serde.workspace = true
 serde_json.workspace = true   # best-effort system.json pre-read for log retention
+sha2.workspace = true         # the `ETag` of a File Transformation-rewritten /web file
 tracing.workspace = true
 tracing-subscriber.workspace = true
 tracing-appender.workspace = true
