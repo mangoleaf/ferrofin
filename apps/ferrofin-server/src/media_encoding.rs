@@ -35,6 +35,7 @@ use ferrofin_model::entities_media::MediaStream;
 use ferrofin_model::media_info::MediaProtocol;
 use ferrofin_traits::configuration::ServerConfigurationManager;
 use ferrofin_traits::error::ServiceError;
+use ferrofin_traits::filesystem::OpenedFile;
 use ferrofin_traits::library::MediaSourceManager;
 use ferrofin_traits::media_encoding::SubtitleEncoder;
 use ferrofin_traits::media_encoding::{
@@ -672,7 +673,7 @@ impl MediaSourceResolver for MediaSourceManagerResolver {
 /// Port of the `Process`/`File`/`Directory` calls in the C# extractor: the cache
 /// folder/file paths come from the injected [`PathManager`]
 /// (`IPathManager.GetAttachmentFolderPath`/`GetAttachmentPath`), the file checks/
-/// reads use `tokio::fs`, and `-dump_attachment` runs through `tokio::process`.
+/// opens use `tokio::fs`, and `-dump_attachment` runs through `tokio::process`.
 struct FfmpegAttachmentIo {
     path_manager: Arc<dyn PathManager>,
 }
@@ -710,10 +711,18 @@ impl AttachmentIo for FfmpegAttachmentIo {
             .map_err(|e| format!("create {path}: {e}"))
     }
 
-    async fn read_file(&self, path: &str) -> Result<Vec<u8>, String> {
-        tokio::fs::read(path)
-            .await
-            .map_err(|e| format!("read {path}: {e}"))
+    async fn open_file(&self, path: &str) -> std::io::Result<OpenedFile> {
+        let file = tokio::fs::File::open(path).await?;
+        let meta = file.metadata().await?;
+        // A directory opens fine and fails on the first read, after the headers.
+        if meta.is_dir() {
+            return Err(std::io::ErrorKind::IsADirectory.into());
+        }
+        Ok(OpenedFile {
+            path: path.to_owned(),
+            length: meta.len(),
+            reader: Box::new(file.into_std().await),
+        })
     }
 
     async fn run_ffmpeg(
@@ -2094,16 +2103,23 @@ mod tests {
                 .is_some_and(|path| path.ends_with("/src/font.ttf"))
         );
 
-        // file_exists + read_file + remove_file over a real temp file.
+        // file_exists + open_file + remove_file over a real temp file.
         let file = tmp.path().join("data.bin");
         assert!(!io.file_exists(&file.to_string_lossy()));
         std::fs::write(&file, b"hello").unwrap();
         assert!(io.file_exists(&file.to_string_lossy()));
-        assert_eq!(
-            io.read_file(&file.to_string_lossy()).await.unwrap(),
-            b"hello"
-        );
-        assert!(io.read_file("/no/such/file").await.is_err());
+        let mut opened = io.open_file(&file.to_string_lossy()).await.unwrap();
+        let mut data = Vec::new();
+        std::io::Read::read_to_end(&mut opened.reader, &mut data).unwrap();
+        assert_eq!((opened.length, data.as_slice()), (5, &b"hello"[..]));
+        // A missing file keeps its kind: the extractor answers it `404`.
+        let missing = io.open_file("/no/such/file").await.unwrap_err();
+        assert_eq!(missing.kind(), std::io::ErrorKind::NotFound);
+        let folder = io
+            .open_file(&tmp.path().to_string_lossy())
+            .await
+            .unwrap_err();
+        assert_eq!(folder.kind(), std::io::ErrorKind::IsADirectory);
         io.remove_file(&file.to_string_lossy()).await.unwrap();
         assert!(!io.file_exists(&file.to_string_lossy()));
         // Already gone is not an error: the failed run may never have

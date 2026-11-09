@@ -12,6 +12,7 @@ use ferrofin_model::entities::MediaStreamType;
 use ferrofin_model::entities_media::MediaAttachment;
 use ferrofin_model::media_info::MediaProtocol;
 use ferrofin_traits::error::ServiceError;
+use ferrofin_traits::filesystem::OpenedFile;
 use ferrofin_traits::media_encoding::{
     AttachmentExtractor, ExtractedAttachment, MediaEncoder, MediaInfoRequest,
 };
@@ -75,12 +76,13 @@ pub trait AttachmentIo: Send + Sync {
     /// Returns an error string when the directory cannot be created.
     async fn create_directory(&self, path: &str) -> Result<(), String>;
 
-    /// Reads the bytes of `path`.
+    /// Opens `path` to stream it — `AsyncFile.OpenRead`.
     ///
     /// # Errors
     ///
-    /// Returns an error string when the file cannot be read.
-    async fn read_file(&self, path: &str) -> Result<Vec<u8>, String>;
+    /// The I/O error, its kind intact: a missing file is the `404` upstream's
+    /// `FileNotFoundException` is.
+    async fn open_file(&self, path: &str) -> std::io::Result<OpenedFile>;
 
     /// Runs ffmpeg with `args` (using the resolved `ffmpeg_path`) to extract
     /// attachments, returning the process exit code. `working_dir` is the
@@ -133,8 +135,12 @@ impl AttachmentIo for NoopAttachmentIo {
         Ok(())
     }
 
-    async fn read_file(&self, _path: &str) -> Result<Vec<u8>, String> {
-        Ok(Vec::new())
+    async fn open_file(&self, path: &str) -> std::io::Result<OpenedFile> {
+        Ok(OpenedFile {
+            path: path.to_owned(),
+            length: 0,
+            reader: Box::new(std::io::empty()),
+        })
     }
 
     async fn run_ffmpeg(
@@ -517,13 +523,22 @@ where
         let attachment_path = self
             .extract_attachment(&input_file, &media_source, &attachment)
             .await?;
-        let data = self
-            .io
-            .read_file(&attachment_path)
-            .await
-            .map_err(MediaEncodingError::process)?;
+        // `GetAttachmentStream`'s `AsyncFile.OpenRead`: a file gone since the
+        // extraction throws `FileNotFoundException` or
+        // `DirectoryNotFoundException` (`ENOENT`, `ENOTDIR`), which upstream's
+        // exception middleware answers `404`. The message names no path: it
+        // reaches the client, and the route takes anonymous callers.
+        let file = self.io.open_file(&attachment_path).await.map_err(|error| {
+            match error.kind() {
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory => {
+                    tracing::debug!(path = attachment_path, %error, "attachment file not found");
+                    ServiceError::not_found("attachment file not found")
+                }
+                _ => MediaEncodingError::io(format!("open {attachment_path}"), error).into(),
+            }
+        })?;
 
-        Ok(ExtractedAttachment { attachment, data })
+        Ok(ExtractedAttachment { attachment, file })
     }
 
     async fn extract_all_attachments(
@@ -616,6 +631,7 @@ where
 #[cfg(test)]
 mod tests {
     use std::collections::HashSet;
+    use std::io::Read as _;
     use std::sync::Arc;
     use std::sync::Mutex;
 
@@ -712,10 +728,12 @@ mod tests {
     /// args it was asked to run. A run writes every output it names
     /// (`-dump_attachment:N <path>`) unless `writes` is off, whatever its
     /// exit code, the way a failing ffmpeg can leave a partial file behind.
+    /// Opening a file answers `FONT`, or fails with `open_error`.
     struct FakeIo {
         folder: Option<String>,
         exit_code: i32,
         writes: bool,
+        open_error: Option<std::io::ErrorKind>,
         files: Mutex<HashSet<String>>,
         removed: Mutex<Vec<String>>,
         last_args: Mutex<Option<String>>,
@@ -730,6 +748,7 @@ mod tests {
                 folder: folder.map(str::to_owned),
                 exit_code,
                 writes: true,
+                open_error: None,
                 files: Mutex::new(HashSet::new()),
                 removed: Mutex::new(Vec::new()),
                 last_args: Mutex::new(None),
@@ -779,8 +798,15 @@ mod tests {
             *self.created_dir.lock().unwrap() = Some(path.to_owned());
             Ok(())
         }
-        async fn read_file(&self, _path: &str) -> Result<Vec<u8>, String> {
-            Ok(b"FONT".to_vec())
+        async fn open_file(&self, path: &str) -> std::io::Result<super::OpenedFile> {
+            if let Some(kind) = self.open_error {
+                return Err(kind.into());
+            }
+            Ok(super::OpenedFile {
+                path: path.to_owned(),
+                length: 4,
+                reader: Box::new(&b"FONT"[..]),
+            })
         }
         async fn run_ffmpeg(
             &self,
@@ -855,14 +881,20 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn get_attachment_extracts_and_returns_bytes() {
+    async fn get_attachment_extracts_and_returns_the_opened_file() {
         let io = FakeIo::new(Some("/cache"), 0);
         let ex = extractor(Some(source_with_attachment()), io);
-        let out = ex
+        let mut out = ex
             .get_attachment(Uuid::nil(), "0f2c8d1e-1111-2222-3333-444455556666", 3)
             .await
             .unwrap();
-        assert_eq!(out.data, b"FONT");
+        let mut data = Vec::new();
+        out.file.reader.read_to_end(&mut data).unwrap();
+        assert_eq!(
+            (out.file.path.as_str(), out.file.length),
+            ("/cache/font.ttf", 4)
+        );
+        assert_eq!(data, b"FONT");
         assert_eq!(out.attachment.index, 3);
         // The cache folder is created before ffmpeg writes into it
         // (`Directory.CreateDirectory`); the single dump names its full output
@@ -871,6 +903,34 @@ mod tests {
         assert_eq!(ex.io.working_dir.lock().unwrap().as_deref(), None);
         // A cancelled run deletes the file it was writing.
         assert_eq!(ex.io.outputs(), ["/cache/font.ttf"]);
+    }
+
+    /// A cached file gone before it is opened is upstream's
+    /// `FileNotFoundException`/`DirectoryNotFoundException`, a `404`; any other
+    /// failure to open it is a `500`.
+    #[rstest::rstest]
+    #[case(std::io::ErrorKind::NotFound, true)]
+    #[case(std::io::ErrorKind::NotADirectory, true)]
+    #[case(std::io::ErrorKind::PermissionDenied, false)]
+    #[tokio::test]
+    async fn get_attachment_maps_a_failed_open(
+        #[case] kind: std::io::ErrorKind,
+        #[case] not_found: bool,
+    ) {
+        let mut io = FakeIo::new(Some("/cache"), 0);
+        io.open_error = Some(kind);
+        let error = extractor(Some(source_with_attachment()), io)
+            .get_attachment(Uuid::nil(), "0f2c8d1e-1111-2222-3333-444455556666", 3)
+            .await
+            .unwrap_err();
+        if not_found {
+            assert!(
+                matches!(&error, ServiceError::NotFound(m) if !m.contains("/cache")),
+                "{error:?}"
+            );
+        } else {
+            assert!(matches!(error, ServiceError::BackendSource(_)), "{error:?}");
+        }
     }
 
     #[tokio::test]
