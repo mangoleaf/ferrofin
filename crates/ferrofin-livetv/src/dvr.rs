@@ -155,13 +155,6 @@ impl TimerRecordingInfo {
     pub fn recording_end_date(&self) -> DateTime<Utc> {
         self.end_date + chrono::Duration::seconds(i64::from(self.post_padding_seconds))
     }
-
-    /// The instant the capture starts: the programme's start minus its
-    /// pre-padding (C# `item.StartDate.AddSeconds(-item.PrePaddingSeconds)`).
-    #[must_use]
-    pub fn recording_start_date(&self) -> DateTime<Utc> {
-        self.start_date - chrono::Duration::seconds(i64::from(self.pre_padding_seconds))
-    }
 }
 
 /// A recording currently being captured.
@@ -172,8 +165,6 @@ impl TimerRecordingInfo {
 pub struct ActiveRecording {
     /// The firing timer's id — the key both upstream and Ferrofin use.
     pub timer_id: String,
-    /// The `FerrofinLiveTvRecordings` row this capture is filling.
-    pub recording_id: Uuid,
     /// The file being written.
     pub path: PathBuf,
     /// When the capture started.
@@ -185,10 +176,9 @@ pub struct ActiveRecording {
 impl ActiveRecording {
     /// Registers a new capture with a fresh cancellation flag.
     #[must_use]
-    pub fn new(timer_id: String, recording_id: Uuid, path: PathBuf) -> Self {
+    pub fn new(timer_id: String, path: PathBuf) -> Self {
         Self {
             timer_id,
-            recording_id,
             path,
             started_at: Utc::now(),
             cancel: Arc::new(AtomicBool::new(false)),
@@ -951,17 +941,13 @@ mod tests {
         );
         // Another timer already recording to it counts too; this timer's own
         // in-flight path does not.
-        let taken = ActiveRecording::new("t2".to_owned(), uuid::Uuid::nil(), path);
+        let taken = ActiveRecording::new("t2".to_owned(), path);
         let free = dir.path().join("Other.ts");
         assert_eq!(
             ensure_file_unique(
                 &free,
                 "t1",
-                &[ActiveRecording::new(
-                    "t2".to_owned(),
-                    uuid::Uuid::nil(),
-                    free.clone()
-                )]
+                &[ActiveRecording::new("t2".to_owned(), free.clone())]
             ),
             dir.path().join("Other - 1.ts")
         );

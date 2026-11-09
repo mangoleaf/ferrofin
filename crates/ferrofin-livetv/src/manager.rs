@@ -1343,6 +1343,7 @@ impl FerrofinLiveTvManager {
     }
 
     /// Replaces the tuner HTTP seam (tests serve an in-memory broadcast).
+    #[cfg(test)]
     #[must_use]
     pub fn with_tuner_source(mut self, source: Arc<dyn TunerStreamSource>) -> Self {
         self.tuner_source = source;
@@ -1383,7 +1384,8 @@ impl FerrofinLiveTvManager {
     }
 
     /// Attaches the DTO service the channel/programme projections run through
-    /// (builder form, for tests and simple wiring).
+    /// (builder form, for tests; the composition root uses `set_dto`).
+    #[cfg(test)]
     #[must_use]
     pub fn with_dto(self, dto: Arc<dyn DtoService>) -> Self {
         let _ = self.dto.set(dto);
@@ -6275,7 +6277,7 @@ impl FerrofinLiveTvManager {
     ) -> Result<(Uuid, Arc<std::sync::atomic::AtomicBool>), ServiceError> {
         let _ = opened;
         let recording_id = Uuid::new_v4();
-        let recording = ActiveRecording::new(info.id.clone(), recording_id, target.to_path_buf());
+        let recording = ActiveRecording::new(info.id.clone(), target.to_path_buf());
         let cancel = recording.cancellation();
         crate::dvr_repository::insert_recording(
             &self.db,
@@ -11226,7 +11228,7 @@ mod tests {
             let path = dir.path().join(format!("{id}.ts"));
             mgr.active_recordings_lock().insert(
                 id.to_owned(),
-                crate::dvr::ActiveRecording::new(id.to_owned(), Uuid::new_v4(), path),
+                crate::dvr::ActiveRecording::new(id.to_owned(), path),
             );
         }
         mgr.cancel_recording("stopping");
@@ -12795,11 +12797,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tmp");
         mgr.active_recordings_lock().insert(
             recording.clone(),
-            crate::dvr::ActiveRecording::new(
-                recording.clone(),
-                Uuid::new_v4(),
-                dir.path().join("recording.ts"),
-            ),
+            crate::dvr::ActiveRecording::new(recording.clone(), dir.path().join("recording.ts")),
         );
 
         mgr.refresh_guide().await.expect("refresh");

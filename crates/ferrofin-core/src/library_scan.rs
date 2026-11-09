@@ -11957,7 +11957,6 @@ impl LibraryScanner {
         let mut photo = ferrofin_drawing::photo_provider::PhotoItem {
             id: item_id,
             path,
-            is_file_protocol: true,
             width: entity
                 .width
                 .and_then(|w| i32::try_from(w).ok())
