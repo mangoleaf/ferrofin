@@ -93,7 +93,11 @@ async fn boot_https_server_with(settings: serde_json::Value) -> HttpsServer {
         admin_user: ADMIN_USER.to_owned(),
         admin_password: ADMIN_PASSWORD.to_owned(),
         port,
-        https_port: boot::free_port(),
+        // A second probe can hand back the HTTP port, and the server then
+        // serves plain HTTP only (`tls.rs`).
+        https_port: std::iter::repeat_with(boot::free_port)
+            .find(|&https_port| https_port != port)
+            .expect("a free port other than the HTTP port"),
         ..Config::test_stub(&root)
     })
     .await;

@@ -1189,7 +1189,10 @@ pub trait ItemPersistenceService: Send + Sync {
     async fn set_ancestors(&self, item_id: Uuid, ancestor_ids: &[Uuid])
     -> Result<(), ServiceError>;
 
-    /// Persists the image info attached to an item.
+    /// Persists the image info attached to an item. The `ferrofin-core`
+    /// implementation only confirms the item exists: image rows are written by
+    /// [`Self::save_item_images`] and the `set_item_image*` methods, and nothing
+    /// calls this one. TODO(gl-211): open work item: remove it from the trait.
     async fn save_images(&self, item: &BaseItemEntity) -> Result<(), ServiceError>;
 
     /// Replaces the item's stored image rows (`BaseItemImageInfos`) with
@@ -1829,19 +1832,24 @@ pub trait ItemPersistenceService: Send + Sync {
         Ok(0)
     }
 
-    /// Clears `item_id`'s `DateLastRefreshed`, so the next scan takes it as
-    /// never refreshed: its refresh failed after the row was saved, and the
-    /// saved row no longer shows what is left to do. Nothing else on the row
-    /// moves. Returns whether there is such a row.
+    /// Sets `item_id`'s `DateLastRefreshed` to `at`, and nothing else on the
+    /// row. `None` clears it, so the next scan takes the item as never
+    /// refreshed: the scan saves an item's row before what hangs off it, and
+    /// the row carries no stamp until those writes are done, so a refresh
+    /// cut short there is redone. Returns whether there is such a row.
     ///
-    /// The default clears nothing and answers `false` (for stub/fake
+    /// The default writes nothing and answers `false` (for stub/fake
     /// services).
     ///
     /// # Errors
     ///
     /// [`ServiceError::Backend`] on a storage failure.
-    async fn clear_date_last_refreshed(&self, item_id: Uuid) -> Result<bool, ServiceError> {
-        let _ = item_id;
+    async fn set_date_last_refreshed(
+        &self,
+        item_id: Uuid,
+        at: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> Result<bool, ServiceError> {
+        let _ = (item_id, at);
         Ok(false)
     }
 
@@ -2073,7 +2081,11 @@ pub trait ItemPersistenceService: Send + Sync {
         Ok(None)
     }
 
-    /// Recomputes and persists inherited values across the item tree.
+    /// Port of `UpdateInheritedValues`, which upstream runs at the end of the
+    /// post-scan tasks (`RunPostScanTasks`) to delete the `ItemValuesMap` rows
+    /// of type `InheritedTags`.
+    /// The `ferrofin-core` implementation is a no-op, and nothing calls it.
+    /// TODO(gl-211): open work item: port it and call it, or remove it.
     async fn update_inherited_values(&self) -> Result<(), ServiceError>;
 }
 

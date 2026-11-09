@@ -248,9 +248,9 @@ impl FerrofinMediaSourceManager {
         allow_media_probe: bool,
         enable_path_substitution: bool,
     ) -> Result<Vec<MediaSourceInfo>, ServiceError> {
-        // Playback sources build on the static sources; the per-user bitrate/profile
-        // negotiation (MediaStreamSelector) is deferred, so the static set is the
-        // playback set for v1.
+        // Playback sources build on the user's static sources, which already
+        // carry the per-user stream defaults (`SetDefaultAudioAndSubtitleStreamIndices`,
+        // over `MediaStreamSelector`) and the playback permissions.
         let mut sources = self
             .static_sources(
                 item_id,
@@ -1383,6 +1383,7 @@ pub(crate) fn stream_to_dto(row: MediaStreamInfoEntity) -> MediaStream {
         ref_frames: row.ref_frames.and_then(|v| i32::try_from(v).ok()),
         height: row.height.and_then(|v| i32::try_from(v).ok()),
         width: row.width.and_then(|v| i32::try_from(v).ok()),
+        rotation: row.rotation.and_then(|v| i32::try_from(v).ok()),
         level: row.level,
         // Frame rates are stored as f64 but the wire DTO is f32; the precision
         // loss on a frame-rate value (e.g. 23.976) is immaterial.
@@ -2110,6 +2111,22 @@ mod tests {
         assert_eq!(back.color_space.as_deref(), Some("bt2020nc"));
         assert_eq!(back.color_transfer.as_deref(), Some("smpte2084"));
         assert_eq!(back.color_primaries.as_deref(), Some("bt2020"));
+    }
+
+    /// The rotation a phone video's display matrix records survives the
+    /// database, as `MediaStreamRepository.Map` copies it both ways: the
+    /// transcode scales and burns subtitles into the rotated frame.
+    #[test]
+    fn rotation_round_trips_through_entity() {
+        let dto = MediaStream {
+            stream_type: ferrofin_model::entities::MediaStreamType::Video,
+            codec: Some("h264".to_owned()),
+            rotation: Some(-90),
+            ..MediaStream::default()
+        };
+        let entity = stream_dto_to_entity("item-1", &dto);
+        assert_eq!(entity.rotation, Some(-90));
+        assert_eq!(stream_to_dto(entity).rotation, Some(-90));
     }
 
     #[test]

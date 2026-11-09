@@ -6,7 +6,7 @@
 //! - `GET /Studios/{name}` — a single studio by name.
 //!
 //! The per-name image routes (`/Studios/{name}/Images/{imageType}`) are
-//! registered by the image controller and probed by `suite/parity/assets.py`.
+//! registered by the image controller ([`images`](super::images)).
 
 use axum::extract::{Path, State};
 use axum::routing::get;

@@ -793,25 +793,8 @@ async fn download_images(
     item_id: &str,
     images: Vec<RemoteImage>,
 ) -> Vec<ItemImageInfo> {
-    fetch_image_files(tmdb, item_dir, item_id, images, false).await
-}
-
-/// The download loop of [`download_images`]; `replace` re-downloads a type
-/// whose file is already on disk (keeping it when the download fails).
-async fn fetch_image_files(
-    tmdb: &TmdbClient,
-    item_dir: &Path,
-    item_id: &str,
-    images: Vec<RemoteImage>,
-    replace: bool,
-) -> Vec<ItemImageInfo> {
     let mut infos: Vec<ItemImageInfo> = Vec::new();
     let mut satisfied = std::collections::HashSet::new();
-    // The stems this pass has written. Several types share one stem (every
-    // type `image_type_file_stem` does not name lands on `primary`), and a
-    // replace must not overwrite the file an earlier type of this same pass
-    // just wrote — the poster would end up holding the disc art.
-    let mut written: Vec<&str> = Vec::new();
     for image in images {
         if satisfied.contains(&image.image_type) {
             continue;
@@ -819,48 +802,23 @@ async fn fetch_image_files(
         let stem = image_type_file_stem(image.image_type);
         // Reuse any on-disk file of this stem regardless of extension — it is
         // either this download from an earlier scan or a user upload (which
-        // must win over a re-download) — unless replacing.
-        let existing = existing_art_file(item_dir, stem);
-        let reuse = !replace || written.contains(&stem);
-        let dest = match existing {
-            Some(existing) if reuse => existing,
-            existing => {
-                let dest = item_dir.join(format!("{stem}.jpg"));
-                let Some(bytes) = tmdb.download(&image.url).await else {
-                    // A failed replacement keeps the image the item had.
-                    if let Some(existing) = existing
-                        && !infos.iter().any(|i| i.image_type == image.image_type)
-                    {
-                        infos.push(ItemImageInfo {
-                            date_modified: file_date_modified(&existing),
-                            path: existing.to_string_lossy().into_owned(),
-                            image_type: image.image_type,
-                            width: 0,
-                            height: 0,
-                            blur_hash: None,
-                        });
-                    }
-                    continue;
-                };
-                // A replaced file of another extension would leave two
-                // files of one type in the folder.
-                if let Some(old) = existing.filter(|old| *old != dest)
-                    && let Err(err) = std::fs::remove_file(&old)
-                {
-                    tracing::warn!(%err, item = %item_id, "failed to remove replaced artwork");
-                }
-                if let Err(err) =
-                    std::fs::create_dir_all(item_dir).and_then(|()| std::fs::write(&dest, &bytes))
-                {
-                    tracing::warn!(%err, item = %item_id, "failed to write downloaded artwork");
-                    continue;
-                }
-                written.push(stem);
-                dest
+        // must win over a re-download).
+        let dest = if let Some(existing) = existing_art_file(item_dir, stem) {
+            existing
+        } else {
+            let dest = item_dir.join(format!("{stem}.jpg"));
+            let Some(bytes) = tmdb.download(&image.url).await else {
+                continue;
+            };
+            if let Err(err) =
+                off_runtime(|| ferrofin_util::file_helper::atomic_write_media(&dest, &bytes))
+            {
+                tracing::warn!(%err, item = %item_id, "failed to write downloaded artwork");
+                continue;
             }
+            dest
         };
         satisfied.insert(image.image_type);
-        infos.retain(|i| i.image_type != image.image_type);
         infos.push(ItemImageInfo {
             path: dest.to_string_lossy().into_owned(),
             image_type: image.image_type,
@@ -1334,7 +1292,7 @@ async fn studio_thumb(
         };
     };
     let dest = dir.join(format!("{stem}.jpg"));
-    match std::fs::create_dir_all(dir).and_then(|()| std::fs::write(&dest, &bytes)) {
+    match off_runtime(|| ferrofin_util::file_helper::atomic_write_media(&dest, &bytes)) {
         Ok(()) => StudioThumb::Found(dest),
         Err(err) => StudioThumb::Failed(Some(ServiceError::backend(format!(
             "write studio thumb: {err}"
@@ -2066,9 +2024,10 @@ fn dynamic_answer(
 /// ones before anything is written (its probe, its metadata providers) end
 /// the item unwritten, and a cancel inside its artwork pass (image
 /// providers, cover extraction) stops the fetches where they stand and
-/// saves the item with the artwork already on disk. So an item is written
-/// whole or not at all, and a hung ffprobe or provider cannot keep a
-/// cancelled scan alive.
+/// saves the item with the artwork already on disk. A cancel after the
+/// item's row was saved leaves the row without its refresh stamp, so an item
+/// is written whole, not at all, or as far as it got for the next scan to
+/// redo; and a hung ffprobe or provider cannot keep a cancelled scan alive.
 #[derive(Debug, Clone)]
 pub struct ScanCancel(Arc<tokio::sync::watch::Sender<bool>>);
 
@@ -2317,7 +2276,9 @@ impl SkippedItems {
     }
 
     /// Records that `id` failed after its save and its refresh stamp could
-    /// not be cleared over `err`, so the next scan may not retry it.
+    /// not be cleared over `err`. Only a row the scan could not read still
+    /// carries one then (every other is saved unstamped), so the next scan
+    /// may not retry it.
     fn note_stamp_kept(&mut self, id: Uuid, err: &ServiceError) {
         tracing::debug!(item_id = %id, %err, "refresh stamp not cleared");
         self.stamps_kept += 1;
@@ -3054,9 +3015,10 @@ struct ItemState<'s, 'a> {
     /// persisted one, whatever a local reader then makes of it.
     renamed_extra: bool,
     /// Set by [`LibraryScanner::scan_item`] just before it saves the item's
-    /// row: from then on a failure may leave the row carrying this refresh's
-    /// stamp, even a failure of the save itself, which writes the row before
-    /// the names it pushes to its children.
+    /// row: from then on a failure may leave the row behind, even a failure
+    /// of the save itself, which writes the row before the names it pushes to
+    /// its children. Its stamp is withheld until the end, except a stamp the
+    /// scan could not read, which the save keeps.
     save_attempted: bool,
 }
 
@@ -5403,8 +5365,10 @@ impl LibraryScanner {
     /// at or under some paths, or what the library monitor's changed paths
     /// belong to ([`scan_paths`](Self::scan_paths)), refreshing
     /// them with `run.options`, and stopping between two items once
-    /// `run.cancel` is cancelled (the item in progress always finishes, and
-    /// the rest of the pass — pruning, the post-scan passes — is skipped).
+    /// `run.cancel` is cancelled (the item in progress finishes, or stops
+    /// where the cancel found it and is left unstamped for the next scan,
+    /// and the rest of the pass — pruning, the post-scan passes — is
+    /// skipped).
     ///
     /// # Errors
     /// See [`scan`](Self::scan).
@@ -6746,19 +6710,21 @@ impl LibraryScanner {
     /// around them for context take `run.ancestors`, and pruning is limited
     /// to the rows under `scope.roots`.
     ///
-    /// Cancellation is cooperative and item-atomic: `run.cancel` is checked
-    /// between items and around each window read (see [`ScanCancel`]), so
-    /// the item in progress is written whole (its row, ids, cast, streams,
-    /// chapters and images) or not at all, and a cancelled scan skips the
-    /// pruning and the post-scan passes, as upstream's
-    /// `ThrowIfCancellationRequested` between children does.
+    /// Cancellation is cooperative: `run.cancel` is checked between items
+    /// and around each window read (see [`ScanCancel`]). The item in
+    /// progress is written whole (its row, ids, cast, streams, chapters and
+    /// images) or not at all, or, when the cancel lands after its row was
+    /// saved, as far as it got and without its refresh stamp, so the next
+    /// scan refreshes it again. A cancelled scan skips the pruning and the
+    /// post-scan passes, as upstream's `ThrowIfCancellationRequested` between
+    /// children does.
     ///
     /// One item's failure is that item's alone
     /// (`LimitedConcurrencyLibraryScheduler.ProcessItem`, which logs what a
     /// child threw and goes on): it is counted in [`ScanOutcome::skipped`],
     /// stays out of the prune (it is planned), and the walk, the prune and
     /// the closing passes run on. A row saved before the failure loses its
-    /// refresh stamp ([`ItemPersistenceService::clear_date_last_refreshed`]),
+    /// refresh stamp ([`ItemPersistenceService::set_date_last_refreshed`]),
     /// so the next scan refreshes it whatever its file did. A new item that
     /// left no row takes what is planned below it along
     /// (`Folder.RefreshChildMetadata` recurses only into a child that
@@ -7021,7 +6987,8 @@ impl LibraryScanner {
             ))
             .await;
             probes.begin_item(scanned);
-            // Between two items (the one before was written whole), and
+            // Between two items (the one before was written whole, or left
+            // unstamped where the cancel cut it short), and
             // after the window read, whose planning stops at a cancel: a
             // read that takes seconds never delays the stop by an item.
             if run.cancel.is_cancelled() {
@@ -7168,7 +7135,11 @@ impl LibraryScanner {
                     // the next scan refreshes it either way.
                     let mut row_stands = false;
                     if save_attempted {
-                        match self.persistence.clear_date_last_refreshed(item.id).await {
+                        match self
+                            .persistence
+                            .set_date_last_refreshed(item.id, None)
+                            .await
+                        {
                             Ok(found) => row_stands = found,
                             Err(err) => art_cache.skipped.note_stamp_kept(item.id, &err),
                         }
@@ -8767,16 +8738,30 @@ impl LibraryScanner {
         // Both stamps are this item's own `DateTime.UtcNow`, as upstream's;
         // the scan start would give every item of a scan the same
         // `DateLastSaved`, and so the same Etag.
+        //
+        // The row is saved before what hangs off it (its ids, cast, streams,
+        // chapters), and the stamp is written only after those, as upstream's
+        // stamped save comes after the probe wrote its streams and chapters
+        // (`MetadataService.RefreshMetadata`): until then the row carries
+        // none, so a refresh cut short (a failed write, a cancel, a crash)
+        // is redone by the next scan whatever its file did. (A row the scan
+        // could not read keeps its stamp through the save, which is not given
+        // one to clear.)
         let now = Utc::now();
-        if decision.stamp_refreshed && !music_pending && !new_trickplay {
-            entity.date_last_refreshed = Some(now);
-        }
+        let kept_stamp = entity.date_last_refreshed.take();
         // A new item's first refresh saves it right after creating it
         // (`MetadataService.RefreshMetadata`: `SaveItemAsync` when
         // `isFirstRefresh`), which stamps `DateLastSaved`; the insert stores
         // the row's own value, so it is set here. An update stamps it in SQL.
         if stored_row.is_none() {
             entity.date_last_saved = Some(now);
+        }
+        // The stored stamp is cleared first: the save keeps one it is not
+        // given.
+        if kept_stamp.is_some() {
+            self.persistence
+                .set_date_last_refreshed(item.id, None)
+                .await?;
         }
         // Scan-variant save: its SQL guards back the merge above up for a
         // row it could not read (and for a writer that raced this scan):
@@ -8865,12 +8850,13 @@ impl LibraryScanner {
         .await?;
         self.persist_audiobook_chapters(&entity, &rows, cancel)
             .await?;
-        // A new video needs its first item save for the trickplay FK. Finish
-        // its metadata refresh stamp only after the custom provider returns;
-        // ordinary custom-provider errors still complete; cancellation stops it.
+        // A new video needs its first item save for the trickplay FK, so its
+        // custom provider runs here, before the stamp; ordinary
+        // custom-provider errors still complete, and a cancel (its only
+        // `false`) withholds the stamp below.
         if new_trickplay && let (Some(provider), Some(library)) = (&self.trickplay, policy.options)
         {
-            let finished = provider
+            provider
                 .refresh(
                     item.id,
                     &entity,
@@ -8880,20 +8866,27 @@ impl LibraryScanner {
                     cancel,
                 )
                 .await;
-            if !finished || cancel.is_cancelled() {
-                return Ok(ItemSaved::Cancelled);
-            }
-            if decision.stamp_refreshed && !music_pending {
-                entity.date_last_refreshed = Some(Utc::now());
-                self.persistence
-                    .save_scanned_items(std::slice::from_ref(&entity))
-                    .await?;
-            }
         }
         if let Some(images) = artwork.filter(|_| images_changed)
             && let Err(err) = self.persistence.save_item_images(item.id, &images).await
         {
             tracing::warn!(%err, item = %item.id, "failed to persist discovered artwork");
+        }
+        // A cancel may have cut the chapters, the subtitle downloads or the
+        // trickplay short, so it leaves the row unstamped. Otherwise the
+        // stamp this refresh earned is written, or the stored one is put
+        // back: a refresh with a failed provider keeps it, and an album's or
+        // artist's is the music pass's to write. Only that column: the row's
+        // save moved `DateLastSaved`, and so the Etag, once.
+        let stamp = if decision.stamp_refreshed && !music_pending {
+            Some(Utc::now())
+        } else {
+            kept_stamp
+        };
+        if !cancel.is_cancelled() && stamp.is_some() {
+            self.persistence
+                .set_date_last_refreshed(item.id, stamp)
+                .await?;
         }
         self.save_metadata_sidecars(
             item.id,
@@ -10204,7 +10197,7 @@ impl LibraryScanner {
     /// refreshed BEFORE its tracks were probed, so the identical C# summed a set
     /// of `NULL`s, while the album — same code, refreshed after — got the right
     /// number. Ferrofin sums the probed ticks, so an artist reports its real
-    /// runtime; the divergence is recorded in `suite/parity/classifications.json`.
+    /// runtime rather than reproducing that race.
     ///
     /// `Playlist` is the third `SupportsCumulativeRunTimeTicks` kind
     /// (`Playlist.cs:79`); its children are `LinkedChildren`, not scanned
@@ -11067,10 +11060,9 @@ impl LibraryScanner {
         }
     }
 
-    /// The scan's backfill heuristics (owner decision D2 of
-    /// `PLAN_SCAN_CHANGE_DETECTION`, recorded in
-    /// `brain/concerns/CONCERN_SCAN_BACKFILL_HEURISTICS.md`) as a trigger for
-    /// the remote metadata providers, evaluated on the STORED row: the
+    /// The scan's backfill heuristics (D2: kept by an owner decision of
+    /// 2026-09-24 until the side effects of removing them are understood) as
+    /// a trigger for the remote metadata providers, evaluated on the STORED row: the
     /// fetcher that would answer first is asked again only when its own
     /// "already enriched" gate is not met.
     ///
@@ -14032,7 +14024,7 @@ impl LibraryScanner {
                 let previous = existing_art_file(&item_dir, stem);
                 let dest = item_dir.join(format!("{stem}.{ext}"));
                 if let Err(err) =
-                    std::fs::create_dir_all(&item_dir).and_then(|()| std::fs::write(&dest, &bytes))
+                    off_runtime(|| ferrofin_util::file_helper::atomic_write_media(&dest, &bytes))
                 {
                     tracing::warn!(%err, item = %entity.id, "failed to write plugin artwork");
                     continue;
@@ -23809,7 +23801,7 @@ fn ordered_remote_images(
 }
 
 /// Keeps the first image of each type (the preferred provider's, then others'
-/// best per type after its sort) — the choice `fetch_image_files` makes when
+/// best per type after its sort) — the choice `artwork::acquire_images` makes when
 /// every download succeeds, which the ranking tests read.
 #[cfg(test)]
 fn dedup_images_by_type(images: Vec<RemoteImage>) -> Vec<RemoteImage> {
@@ -29512,9 +29504,18 @@ mod tests {
             .find(|s| s.item.name.as_deref() == Some("Lenfilm"))
             .map(|s| uuid::Uuid::parse_str(&s.item.id).unwrap())
             .expect("Lenfilm");
-        let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let dead = format!("http://{}", closed.local_addr().unwrap());
-        drop(closed);
+        // Bound for the rest of the test and never listening, so the lookup is
+        // refused. A port bound then dropped is free for another test
+        // process's fake, which could answer it. The hold is exclusive only
+        // without `SO_REUSEADDR`, as the assert checks.
+        let closed = tokio::net::TcpSocket::new_v4().unwrap();
+        closed.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        let closed_addr = closed.local_addr().unwrap();
+        assert!(
+            std::net::TcpListener::bind(closed_addr).is_err(),
+            "port is held"
+        );
+        let dead = format!("http://{closed_addr}");
         let vf: Arc<dyn VirtualFolderManager> = Arc::new(
             FerrofinVirtualFolderManager::new(tmp.path().join("default"))
                 .with_item_store(persistence.clone()),
@@ -36868,6 +36869,57 @@ mod tests {
         assert_eq!(images.len(), usize::try_from(limit).unwrap());
     }
 
+    /// A full image replacement swaps plugin artwork in whole: a reader that
+    /// opened the old file still reads the old bytes, so the old file was
+    /// never truncated and rewritten in place, and a failed write cannot
+    /// leave half an image (gl-254).
+    #[tokio::test]
+    async fn replaced_plugin_artwork_never_rewrites_the_old_file_in_place() {
+        use std::io::Read as _;
+        let tmp = tempfile::tempdir().unwrap();
+        let (scanner, _) = artwork_fixture("http://127.0.0.1:1", tmp.path(), &[], false).await;
+        let scanner = scanner.with_dynamic_providers(vec![Arc::new(OrderingArtwork)]);
+        let row = BaseItemEntity {
+            id: SERIES.to_owned(),
+            type_: "MediaBrowser.Controller.Entities.Movies.Movie".to_owned(),
+            ..Default::default()
+        };
+        let options = LibraryOptions {
+            type_options: vec![ferrofin_model::configuration::TypeOptions {
+                type_: Some("Movie".to_owned()),
+                image_fetchers: vec!["ArtworkPlugin".to_owned()],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let fetch = |replace_images| super::FetcherPolicy {
+            options: Some(&options),
+            replace_images,
+            ..Default::default()
+        };
+        let mut images = Vec::new();
+        scanner
+            .apply_dynamic_images(&row, &mut images, fetch(false))
+            .await;
+        let [image] = images.as_slice() else {
+            panic!("{images:?}");
+        };
+        let path = std::path::PathBuf::from(&image.path);
+        std::fs::write(&path, b"old artwork").unwrap();
+        let mut reader = std::fs::File::open(&path).unwrap();
+
+        let mut replaced = Vec::new();
+        scanner
+            .apply_dynamic_images(&row, &mut replaced, fetch(true))
+            .await;
+
+        assert_eq!(replaced.len(), 1, "{replaced:?}");
+        assert_eq!(std::fs::read(&path).unwrap(), b"\x89PNG\r\n\x1a\nplugin");
+        let mut seen = Vec::new();
+        reader.read_to_end(&mut seen).unwrap();
+        assert_eq!(seen, b"old artwork");
+    }
+
     #[rstest::rstest]
     #[case::embedded_first(["Image Extractor", "ArtworkPlugin"], false)]
     #[case::plugin_first(["ArtworkPlugin", "Image Extractor"], true)]
@@ -37290,7 +37342,7 @@ mod tests {
 
     /// A TheTVDB still ranked first that fails to download gives way to
     /// TheMovieDb's, as a failed preferred download does for series artwork
-    /// (`fetch_image_files`).
+    /// (`artwork::acquire_images`).
     #[tokio::test]
     async fn a_failed_episode_still_download_falls_back_to_the_next_provider() {
         use ferrofin_providers::library_options::fetcher_names::{TMDB, TVDB};

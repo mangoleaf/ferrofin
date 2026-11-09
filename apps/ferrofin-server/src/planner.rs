@@ -163,10 +163,6 @@ pub struct FerrofinStreamStatePlanner {
     /// extracted/external file (cached across requests), so the `subtitles`
     /// filter doesn't re-demux the whole media file on every ffmpeg (re)start.
     subtitles: Arc<dyn SubtitleEncoder>,
-    /// Whether the discovered ffmpeg reports the `tonemapx` filter
-    /// (jellyfin-ffmpeg builds only). Selects the fast single-pass software
-    /// HDR→SDR tonemap over the vanilla zscale chain; probed once at startup.
-    supports_tonemapx: bool,
     /// Resolves the VAAPI device's driver and Vulkan interop on first use.
     ///
     /// Built here rather than injected because everything it needs — the
@@ -198,8 +194,6 @@ impl FerrofinStreamStatePlanner {
     /// * `config` — the server configuration (persisted encoding options).
     /// * `paths` — the application paths (the transcode cache root).
     /// * `subtitles` — resolves a burned text subtitle to its cached file.
-    /// * `supports_tonemapx` — whether the discovered ffmpeg has `tonemapx`
-    ///   (from the startup `-filters` probe).
     #[must_use]
     pub fn new(
         media_sources: Arc<dyn MediaSourceManager>,
@@ -208,7 +202,6 @@ impl FerrofinStreamStatePlanner {
         config: Arc<dyn ServerConfigurationManager>,
         paths: Arc<FerrofinServerApplicationPaths>,
         subtitles: Arc<dyn SubtitleEncoder>,
-        supports_tonemapx: bool,
     ) -> Self {
         Self {
             vaapi_prober: crate::vaapi_probe::VaapiProber::new(
@@ -222,7 +215,6 @@ impl FerrofinStreamStatePlanner {
             encoding_reader: EncodingOptionsReader::new("transcode planner"),
             paths,
             subtitles,
-            supports_tonemapx,
             library: None,
             virtual_folders: None,
             attachments: None,
@@ -1209,12 +1201,21 @@ impl StreamStatePlanner for FerrofinStreamStatePlanner {
             let req = &mut probe_state.base_request;
             if req.max_width.is_none() && req.max_height.is_none() && requested_not_reducing {
                 // Not reducing bitrate and no explicit bound: pin to the source
-                // dimensions rather than downscaling.
+                // dimensions rather than downscaling. The software chain, and a
+                // vendor chain that transposes, bound the frame already rotated,
+                // so a 90-degree rotation pins the transposed size (as
+                // `output_dimensions` reports it). Upstream pins the stored size,
+                // and its `GetSwScaleFilter` then shrinks a portrait phone video
+                // to fit the landscape box (1080x1920 to 606x1080): a Jellyfin
+                // bug, deliberately not ported.
                 if let Some(video) = probe_state.video_stream.as_ref()
                     && (video.width.is_some() || video.height.is_some())
                 {
-                    req.max_width = video.width;
-                    req.max_height = video.height;
+                    (req.max_width, req.max_height) = if video.rotation.unwrap_or(0).abs() == 90 {
+                        (video.height, video.width)
+                    } else {
+                        (video.width, video.height)
+                    };
                 }
             } else {
                 let output_codec = output_video_codec.as_deref().unwrap_or(DEFAULT_VIDEO_CODEC);
@@ -1724,14 +1725,63 @@ impl FerrofinStreamStatePlanner {
         let burn_text = burns_text_subtitle(state);
         let burn_sub = burn_graphical || burn_text;
 
-        // The software re-encode's video filters, in `GetSwVidFilterChain`'s
-        // order: the HDR `setparams` (upstream also tags SDR frames; this list
-        // does only for tonemapx), the deinterlacer, the bounded downscale
-        // (tonemap/burn-in then run on fewer pixels), then the HDR→SDR tonemap
-        // chain — or a bare 8-bit down-convert for 10-bit SDR sources (libx264
-        // would otherwise emit High10, undecodable in browser MSE). This is the
-        // software path only — a job the hardware matrix claimed builds its
-        // whole graph above.
+        // Everything the filter chains read about the job, for the software
+        // chain below and the vendor chains alike. The hardware graph sets its
+        // subtitle where it is assembled; the software burn-in branches add
+        // theirs to the main list.
+        let video_stream = state.video_stream.as_ref();
+        let chain_input = hw::sw_chain::ChainInput {
+            caps,
+            options,
+            video_encoder: &video_encoder,
+            video_decoder: &video_decoder,
+            video_width: video_stream.and_then(|v| v.width),
+            video_height: video_stream.and_then(|v| v.height),
+            requested,
+            three_d_format: state.media_source.video3d_format,
+            rotation: video_stream.and_then(|v| v.rotation),
+            color_transfer: video_stream.and_then(|v| v.color_transfer.as_deref()),
+            reference_frame_rate: video_stream.and_then(MediaStream::reference_frame_rate),
+            real_frame_rate: video_stream.and_then(|v| v.real_frame_rate),
+            // Zero, NOT the seek position — see `text_subtitle_filter`.
+            // Upstream can start `alphasrc` at the seek because its HLS
+            // copies timestamps, so its decoded frames keep absolute PTS.
+            // Ferrofin seeks per segment without `-copyts`, so decoded
+            // frames restart at ~0 (verified: `-ss 3` gives pts_time 0,
+            // and 3 only with `-copyts`). Starting the generated source at
+            // the seek would put it in a time range the video never
+            // reaches, and nothing would be drawn at all.
+            start_time_ticks: 0,
+            deinterlace: state.is_deinterlace_available(),
+            // Computed, not assumed: the vendor chain falls back to the
+            // software chain on a build without the vendor's tonemap
+            // filter, and that fallback is the only tonemap an HDR source
+            // gets there.
+            do_sw_tonemap: hw::tonemap::is_sw_tonemap_available(caps, video_stream),
+            do_hw_tonemap: hw::input_args::is_hw_tonemap_available(&decode_ctx, &video_decoder),
+            // Read by the VAAPI chain only, which prefers Intel's VPP
+            // tonemap and falls back to the OpenCL one.
+            vulkan_tonemap_available: hw::tonemap::is_vulkan_hw_tonemap_available(
+                options,
+                video_stream,
+            ),
+            vpp_tonemap_available: hw::tonemap::is_intel_vpp_tonemap_available(
+                caps,
+                options,
+                video_stream,
+            ),
+            source_codec: video_stream.and_then(|v| v.codec.as_deref()),
+            requires_dovi_reshaping: hw::tonemap::requires_dovi_reshaping(video_stream),
+            is_hevc_rext: hw::decoder::is_video_stream_hevc_rext(video_stream),
+            subtitle: hw::sw_chain::SubtitleOverlay::None,
+        };
+
+        // The software re-encode's video filters: `GetSwVidFilterChain`'s main
+        // list, which `GetVideoProcessingFilterParam` builds for every
+        // accelerator without a vendor chain here (none, and the AMF,
+        // VideoToolbox, RKMPP and V4L2M2M jobs that transcode in software).
+        // The burn-in branches below add the subtitle; a job the hardware
+        // matrix claimed builds its whole graph there instead.
         let sw_deinterlace = !copying_video && !hw_filters && state.is_deinterlace_available();
         // `GetVideoProcessingFilterParam`'s frame-rate cap on the software
         // chain, placed by [`with_frame_rate_cap`] where each graph below is
@@ -1743,60 +1793,32 @@ impl FerrofinStreamStatePlanner {
             .flatten()
             .map(|rate| format!("fps={}", f64::from(rate)));
         let sw_filters: Vec<String> = if !copying_video && !hw_filters {
-            let mut filters = Vec::new();
-            let tonemap =
-                ferrofin_mediaencoding::encoding_helper::helper::requires_software_tonemap(
-                    state.video_stream.as_ref(),
+            // Ferrofin's own addition: on an ffmpeg without `tonemapx`, where
+            // upstream leaves an HDR source untonemapped (only `format=`), the
+            // vanilla zscale/hable chain tonemaps it in tonemapx's place.
+            let zscale_tonemap = !caps.supports_filter("tonemapx")
+                && ferrofin_mediaencoding::encoding_helper::helper::requires_software_tonemap(
+                    video_stream,
                 );
-            // The fast tonemapx path tags the input frames' HDR colour metadata
-            // ahead of the downscale (upstream's filter order), so untagged
-            // streams still tonemap correctly.
-            if tonemap && self.supports_tonemapx {
-                filters.push(
-                    ferrofin_mediaencoding::encoding_helper::helper::input_hdr_setparams(
-                        state
-                            .video_stream
-                            .as_ref()
-                            .and_then(|s| s.color_transfer.as_deref()),
-                    )
-                    .to_owned(),
-                );
-            }
-            // `GetSwDeinterlaceFilter` whenever `IsDeinterlaceAvailable`: an
-            // interlaced source is deinterlaced before anything resizes it.
-            if sw_deinterlace {
-                filters.push(hw::filters::sw_deinterlace_filter(
-                    options,
-                    state
-                        .video_stream
-                        .as_ref()
-                        .and_then(MediaStream::reference_frame_rate),
-                ));
-            }
-            if let Some(scale) = ferrofin_mediaencoding::encoding_helper::helper::scale_filter(
-                state.video_stream.as_ref(),
-                state.base_request.max_width,
-                state.base_request.max_height,
-            ) {
-                filters.push(scale);
-            }
-            if tonemap {
-                // jellyfin-ffmpeg's single-pass SIMD `tonemapx` when available;
-                // else the vanilla zscale/hable chain (~3× slower per frame).
-                filters.push(
-                    if self.supports_tonemapx {
-                        ferrofin_mediaencoding::encoding_helper::helper::SOFTWARE_TONEMAPX_FILTER
-                    } else {
+            let mut chain = hw::sw_chain::sw_vid_filter_chain(&hw::sw_chain::ChainInput {
+                // No device arguments on this path: the frames are decoded in
+                // software, whatever decoder the accelerator would choose.
+                video_decoder: "",
+                do_sw_tonemap: chain_input.do_sw_tonemap || zscale_tonemap,
+                ..chain_input
+            });
+            if zscale_tonemap {
+                for filter in &mut chain.main {
+                    if filter.starts_with("tonemapx=") {
                         ferrofin_mediaencoding::encoding_helper::helper::SOFTWARE_TONEMAP_FILTER
+                            .clone_into(filter);
                     }
-                    .to_owned(),
-                );
-            } else if ferrofin_mediaencoding::encoding_helper::helper::requires_8bit_downconvert(
-                state.video_stream.as_ref(),
-            ) {
-                filters.push("format=yuv420p".to_owned());
+                }
             }
-            filters
+            // `RemoveAll(string.IsNullOrEmpty)`: the scale is empty when the
+            // client asked for no size.
+            chain.main.retain(|filter| !filter.is_empty());
+            chain.main
         } else {
             Vec::new()
         };
@@ -1990,52 +2012,9 @@ impl FerrofinStreamStatePlanner {
             } else {
                 hw::sw_chain::SubtitleOverlay::None
             };
-            let video_stream = state.video_stream.as_ref();
             let chain_input = hw::sw_chain::ChainInput {
-                caps,
-                options,
-                video_encoder: &video_encoder,
-                video_decoder: &video_decoder,
-                video_width: video_stream.and_then(|v| v.width),
-                video_height: video_stream.and_then(|v| v.height),
-                requested,
-                three_d_format: state.media_source.video3d_format,
-                rotation: video_stream.and_then(|v| v.rotation),
-                color_transfer: video_stream.and_then(|v| v.color_transfer.as_deref()),
-                reference_frame_rate: video_stream.and_then(MediaStream::reference_frame_rate),
-                real_frame_rate: video_stream.and_then(|v| v.real_frame_rate),
-                // Zero, NOT the seek position — see `text_subtitle_filter`.
-                // Upstream can start `alphasrc` at the seek because its HLS
-                // copies timestamps, so its decoded frames keep absolute PTS.
-                // Ferrofin seeks per segment without `-copyts`, so decoded
-                // frames restart at ~0 (verified: `-ss 3` gives pts_time 0,
-                // and 3 only with `-copyts`). Starting the generated source at
-                // the seek would put it in a time range the video never
-                // reaches, and nothing would be drawn at all.
-                start_time_ticks: 0,
-                deinterlace: state.is_deinterlace_available(),
-                // Computed, not assumed: the vendor chain falls back to the
-                // software chain on a build without the vendor's tonemap
-                // filter, and that fallback is the only tonemap an HDR source
-                // gets there — the planner's own software tonemap block is
-                // skipped for a job the matrix claimed.
-                do_sw_tonemap: hw::tonemap::is_sw_tonemap_available(caps, video_stream),
-                do_hw_tonemap: hw::input_args::is_hw_tonemap_available(&decode_ctx, &video_decoder),
-                // Read by the VAAPI chain only, which prefers Intel's VPP
-                // tonemap and falls back to the OpenCL one.
-                vulkan_tonemap_available: hw::tonemap::is_vulkan_hw_tonemap_available(
-                    options,
-                    video_stream,
-                ),
-                vpp_tonemap_available: hw::tonemap::is_intel_vpp_tonemap_available(
-                    caps,
-                    options,
-                    video_stream,
-                ),
-                source_codec: video_stream.and_then(|v| v.codec.as_deref()),
-                requires_dovi_reshaping: hw::tonemap::requires_dovi_reshaping(video_stream),
-                is_hevc_rext: hw::decoder::is_video_stream_hevc_rext(video_stream),
                 subtitle,
+                ..chain_input
             };
             let pads = stream_pads(&state.media_source, sub_stream, video_stream);
             // Upstream dispatches `GetVideoProcessingFilterParam` on the
@@ -3031,6 +3010,13 @@ mod tests {
         }
     }
 
+    /// A joined argument line without the temporary directory its paths sit
+    /// in. A gate run puts that directory under the checkout, so a check for
+    /// a filter or flag word would also match the checkout's name.
+    fn without_temp_dir(args: &str) -> String {
+        args.replace(&*std::env::temp_dir().to_string_lossy(), "")
+    }
+
     fn planner(sources: Vec<MediaSourceInfo>) -> FerrofinStreamStatePlanner {
         planner_full(sources, false, &[])
     }
@@ -3101,9 +3087,9 @@ mod tests {
     ) -> FerrofinStreamStatePlanner {
         planner_over_caps(
             media_sources,
-            supports_tonemapx,
             FfmpegCapabilities::builder()
                 .encoders(encoders.iter().copied())
+                .filters(supports_tonemapx.then_some("tonemapx"))
                 .build(),
             options,
         )
@@ -3113,7 +3099,6 @@ mod tests {
     /// the hardware path depends on more than the encoder list.
     fn planner_over_caps(
         media_sources: Arc<dyn MediaSourceManager>,
-        supports_tonemapx: bool,
         caps: FfmpegCapabilities,
         options: EncodingOptions,
     ) -> FerrofinStreamStatePlanner {
@@ -3132,15 +3117,7 @@ mod tests {
         // The disabled stub always errors, exercising the `si=` burn fallback.
         let subtitles: Arc<dyn SubtitleEncoder> =
             Arc::new(ferrofin_traits::stubs::DisabledSubtitleEncoder);
-        FerrofinStreamStatePlanner::new(
-            media_sources,
-            encoder,
-            helper,
-            config,
-            paths,
-            subtitles,
-            supports_tonemapx,
-        )
+        FerrofinStreamStatePlanner::new(media_sources, encoder, helper, config, paths, subtitles)
     }
 
     /// A fake [`ServerConfigurationManager`] exposing only the application paths.
@@ -3639,7 +3616,7 @@ mod tests {
         assert!(args.contains("-c:a libmp3lame"), "{args}");
         assert!(args.contains("-b:a 128000"), "{args}");
         // `GetProgressiveAudioFullCommandLine` keeps the source's tags.
-        assert!(!args.contains("-map_metadata"), "{args}");
+        assert!(!without_temp_dir(&args).contains("-map_metadata"), "{args}");
 
         // The audio HLS segments of the same request encode to the same cap.
         let hls = p.plan(&req, true, None, PlaylistKind::Vod).await.unwrap();
@@ -4422,7 +4399,10 @@ mod tests {
             .unwrap();
         let args = plan.arguments.join(" ");
         assert!(
-            args.contains("-vf subtitles=f='/media/movie.mkv':si=0"),
+            args.contains(
+                "-vf setparams=color_primaries=bt709:color_trc=bt709:colorspace=bt709,\
+                 format=yuv420p,subtitles=f='/media/movie.mkv':si=0"
+            ),
             "expected embedded si= burn filter, got: {args}"
         );
         assert!(!args.contains("-c:v copy"), "must not stream-copy: {args}");
@@ -4454,7 +4434,10 @@ mod tests {
                 args.contains("subtitles=f='/media/movie.mkv':si=0"),
                 "{codec}: {args}"
             );
-            assert!(!args.contains("overlay"), "{codec}: {args}");
+            assert!(
+                !without_temp_dir(&args).contains("overlay"),
+                "{codec}: {args}"
+            );
             assert!(!args.contains("-map [v]"), "{codec}: {args}");
             assert_eq!(args.matches(" -vf ").count(), 1, "{codec}: {args}");
         }
@@ -4490,7 +4473,10 @@ mod tests {
             .expect("-vf present");
         // 3 segments * 3 s = 9 s shift.
         assert!(
-            vf.starts_with("setpts=PTS+9/TB,subtitles=") && vf.contains(",setpts=PTS-9/TB"),
+            vf.starts_with(
+                "setparams=color_primaries=bt709:color_trc=bt709:colorspace=bt709,\
+                 format=yuv420p,setpts=PTS+9/TB,subtitles="
+            ) && vf.ends_with(",setpts=PTS-9/TB"),
             "expected setpts sandwich, got: {vf}"
         );
     }
@@ -5371,7 +5357,6 @@ mod tests {
                 )],
                 live_streams: HashMap::new(),
             }),
-            false,
             capabilities.build(),
             EncodingOptions::default(),
         );
@@ -5458,7 +5443,6 @@ mod tests {
                 )],
                 live_streams: HashMap::new(),
             }),
-            false,
             capabilities.build(),
             EncodingOptions::default(),
         );
@@ -5574,7 +5558,6 @@ mod tests {
                 )],
                 live_streams: HashMap::new(),
             }),
-            false,
             capabilities.build(),
             EncodingOptions::default(),
         );
@@ -6153,7 +6136,6 @@ mod tests {
                 sources: vec![source("abc", streams)],
                 live_streams: HashMap::new(),
             }),
-            false,
             capabilities.build(),
             EncodingOptions::default(),
         );
@@ -6434,7 +6416,6 @@ mod tests {
                 sources: vec![src],
                 live_streams: HashMap::new(),
             }),
-            false,
             capabilities,
             EncodingOptions::default(),
         );
@@ -6452,7 +6433,7 @@ mod tests {
         let expected = "-async 1 -vsync -1 -re -fflags +igndts -stream_loop -1 \
             -reconnect_at_eof 1 -reconnect_streamed 1 -reconnect_delay_max 2";
         assert!(before.contains(expected), "{before}");
-        let after = plan.arguments[input + 1..].join(" ");
+        let after = without_temp_dir(&plan.arguments[input + 1..].join(" "));
         assert!(
             !after.contains("igndts") && !after.contains("stream_loop"),
             "{after}"
@@ -6500,7 +6481,6 @@ mod tests {
                 )],
                 live_streams: HashMap::new(),
             }),
-            false,
             capabilities.build(),
             EncodingOptions::default(),
         );
@@ -6540,7 +6520,6 @@ mod tests {
                 )],
                 live_streams: HashMap::new(),
             }),
-            false,
             FfmpegCapabilities::builder()
                 .ffmpeg_version(FfmpegVersion::new(6, 1))
                 .build(),
@@ -6602,7 +6581,6 @@ mod tests {
                     sources: vec![src],
                     live_streams: HashMap::new(),
                 }),
-                false,
                 capabilities.build(),
                 EncodingOptions {
                     enable_segment_deletion: enabled,
@@ -7053,7 +7031,10 @@ mod tests {
                 .map(|i| args[i + 1].as_str())
                 .expect("-vf present");
             assert!(
-                vf.starts_with("setpts=PTS+5395/TB,") && vf.ends_with(",setpts=PTS-5395/TB"),
+                vf.starts_with(
+                    "setparams=color_primaries=bt709:color_trc=bt709:colorspace=bt709,\
+                     format=yuv420p,setpts=PTS+5395/TB,"
+                ) && vf.ends_with(",setpts=PTS-5395/TB"),
                 "{vf}"
             );
         }
@@ -7082,7 +7063,6 @@ mod tests {
                 sources: vec![src],
                 live_streams: HashMap::new(),
             }),
-            false,
             FfmpegCapabilities::builder()
                 .ffmpeg_version(FfmpegVersion::new(5, 0))
                 .build(),
@@ -7368,7 +7348,10 @@ mod tests {
             "segment-boundary keyframes expected: {args}"
         );
         assert!(
-            args.contains("scale=1920:1080"),
+            args.contains(
+                "scale=trunc(min(max(iw\\,ih*a)\\,min(1920\\,1080*a))/2)*2:\
+                 trunc(min(max(iw/a\\,ih)\\,min(1920/a\\,1080))/2)*2"
+            ),
             "bounded downscale expected: {args}"
         );
         assert!(
@@ -7382,7 +7365,7 @@ mod tests {
         // Exactly once: `video_quality_param` already carries the bitrate pair,
         // and a second `video_bitrate_param` push used to duplicate it.
         assert_eq!(
-            args.matches("-maxrate").count(),
+            without_temp_dir(&args).matches("-maxrate").count(),
             1,
             "bitrate cap emitted exactly once: {args}"
         );
@@ -7404,7 +7387,6 @@ mod tests {
         req.max_width = Some(1920);
         req.max_height = Some(1080);
         let plan = p.plan(&req, false, None, PlaylistKind::Vod).await.unwrap();
-        let args = plan.arguments.join(" ");
         let vf = plan
             .arguments
             .iter()
@@ -7414,16 +7396,69 @@ mod tests {
         assert_eq!(
             vf,
             "setparams=color_primaries=bt2020:color_trc=smpte2084:colorspace=bt2020nc,\
-             scale=1920:1080,\
+             scale=trunc(min(max(iw\\,ih*a)\\,min(1920\\,1080*a))/2)*2:\
+             trunc(min(max(iw/a\\,ih)\\,min(1920/a\\,1080))/2)*2,\
              tonemapx=tonemap=bt2390:desat=0:peak=100:t=bt709:m=bt709:p=bt709:format=yuv420p",
         );
+        let args = without_temp_dir(&plan.arguments.join(" "));
         assert!(!args.contains("zscale"), "no zscale fallback: {args}");
+    }
+
+    /// A software HDR transcode tonemaps with the Dashboard's settings, as
+    /// upstream's `GetSwVidFilterChain` does, on the default install (no
+    /// accelerator) and on an accelerator Ferrofin transcodes in software.
+    #[rstest]
+    #[case::no_accelerator(HardwareAccelerationType::none)]
+    #[case::unsupported_accelerator(HardwareAccelerationType::amf)]
+    #[tokio::test]
+    async fn a_software_hdr_transcode_reads_the_tonemapping_settings(
+        #[case] accelerator: HardwareAccelerationType,
+    ) {
+        let options = EncodingOptions {
+            hardware_acceleration_type: accelerator,
+            tonemapping_algorithm: ferrofin_model::entities::TonemappingAlgorithm::hable,
+            tonemapping_desat: 0.5,
+            tonemapping_peak: 400.0,
+            tonemapping_param: 0.3,
+            tonemapping_range: ferrofin_model::entities::TonemappingRange::tv,
+            ..EncodingOptions::default()
+        };
+        let p = planner_over_caps(
+            Arc::new(FakeMediaSources {
+                sources: vec![source(
+                    "abc",
+                    vec![hdr_4k_video_stream("hevc"), audio_stream("aac")],
+                )],
+                live_streams: HashMap::new(),
+            }),
+            FfmpegCapabilities::builder().filters(["tonemapx"]).build(),
+            options,
+        );
+        let mut req = request("abc");
+        req.video_codec = Some("h264".to_owned());
+        let plan = p.plan(&req, false, None, PlaylistKind::Vod).await.unwrap();
+        let vf = plan
+            .arguments
+            .iter()
+            .position(|a| a == "-vf")
+            .map(|i| plan.arguments[i + 1].as_str());
+        assert_eq!(
+            vf,
+            Some(
+                "setparams=color_primaries=bt2020:color_trc=smpte2084:colorspace=bt2020nc,\
+                 tonemapx=tonemap=hable:desat=0.5:peak=400:t=bt709:m=bt709:p=bt709:\
+                 format=yuv420p:param=0.3:range=tv"
+            ),
+        );
     }
 
     #[tokio::test]
     async fn plan_without_caps_keeps_source_resolution_but_still_tonemaps() {
         // No negotiated caps: no scale filter and no -maxrate, but an HDR
-        // source re-encoded to (SDR) h264 still needs the tonemap chain.
+        // source re-encoded to (SDR) h264 still needs the tonemap chain. This
+        // ffmpeg has no `tonemapx`, so the zscale chain takes its place, behind
+        // the same HDR `setparams` tag: zscale reads the transfer it linearizes
+        // from the frames, and the SDR tag would make it read BT.709.
         let src = source(
             "abc",
             vec![hdr_4k_video_stream("hevc"), audio_stream("aac")],
@@ -7433,16 +7468,23 @@ mod tests {
         req.video_codec = Some("h264".to_owned());
         let plan = p.plan(&req, false, None, PlaylistKind::Vod).await.unwrap();
         let args = plan.arguments.join(" ");
-        // (`zscale=` from the tonemap chain is expected; a downscale would
-        // prefix the chain as `-vf scale=…`.)
-        assert!(
-            !args.contains("-vf scale="),
-            "no downscale without caps: {args}"
+        let vf = plan
+            .arguments
+            .iter()
+            .position(|a| a == "-vf")
+            .map(|i| plan.arguments[i + 1].as_str())
+            .expect("-vf expected");
+        assert_eq!(
+            vf,
+            format!(
+                "setparams=color_primaries=bt2020:color_trc=smpte2084:colorspace=bt2020nc,{}",
+                ferrofin_mediaencoding::encoding_helper::helper::SOFTWARE_TONEMAP_FILTER
+            ),
+            "no downscale without caps, and the zscale tonemap"
         );
-        assert!(!args.contains("-maxrate"), "no bitrate cap: {args}");
         assert!(
-            args.contains("tonemap=tonemap=hable"),
-            "tonemap still applies: {args}"
+            !without_temp_dir(&args).contains("-maxrate"),
+            "no bitrate cap: {args}"
         );
     }
 
@@ -7459,12 +7501,18 @@ mod tests {
         let mut req = request("abc");
         req.video_codec = Some("h264".to_owned());
         let plan = p.plan(&req, false, None, PlaylistKind::Vod).await.unwrap();
-        let args = plan.arguments.join(" ");
-        assert!(
-            args.contains("-vf format=yuv420p"),
-            "8-bit down-convert: {args}"
+        // The filter argument alone: the whole line holds the transcode paths,
+        // and a checkout named after a tone-mapping change puts "tonemap" there.
+        let vf = plan
+            .arguments
+            .iter()
+            .position(|a| a == "-vf")
+            .map(|i| plan.arguments[i + 1].as_str())
+            .expect("-vf expected");
+        assert_eq!(
+            vf, "setparams=color_primaries=bt709:color_trc=bt709:colorspace=bt709,format=yuv420p",
+            "SDR tag and 8-bit down-convert, no tonemap"
         );
-        assert!(!args.contains("tonemap"), "SDR source: no tonemap: {args}");
     }
 
     #[tokio::test]
@@ -7510,10 +7558,38 @@ mod tests {
         let plan = p.plan(&req, false, None, PlaylistKind::Vod).await.unwrap();
         let args = plan.arguments.join(" ");
         assert!(
-            args.contains("scale=1920:1080"),
+            args.contains("scale=trunc(min(max(iw\\,ih*a)\\,1920)/2)*2:trunc(ow/a/2)*2"),
             "bitrate-driven downscale expected: {args}"
         );
         assert!(args.contains("-maxrate 8000000"), "cap expected: {args}");
+    }
+
+    /// A bitrate at or above the source's, with no size asked for, pins the
+    /// bounds to the source, transposed for a 90-degree rotation: ffmpeg
+    /// scales the rotated frame, and the stored landscape size would shrink a
+    /// portrait video to fit it.
+    #[rstest]
+    #[case::landscape(None, (Some(1920), Some(1080)))]
+    #[case::rotated(Some(90), (Some(1080), Some(1920)))]
+    #[case::rotated_the_other_way(Some(-90), (Some(1080), Some(1920)))]
+    #[case::upside_down(Some(180), (Some(1920), Some(1080)))]
+    #[tokio::test]
+    async fn a_bitrate_above_the_sources_pins_the_displayed_size(
+        #[case] rotation: Option<i32>,
+        #[case] bounds: (Option<i32>, Option<i32>),
+    ) {
+        let mut video = video_stream("hevc");
+        video.width = Some(1920);
+        video.height = Some(1080);
+        video.bit_rate = Some(8_000_000);
+        video.rotation = rotation;
+        let p = planner(vec![source("abc", vec![video, audio_stream("aac")])]);
+        let mut req = request("abc");
+        req.video_codec = Some("h264".to_owned());
+        req.video_bitrate = Some(20_000_000);
+        let plan = p.plan(&req, false, None, PlaylistKind::Vod).await.unwrap();
+        let request = &plan.state.base_request;
+        assert_eq!((request.max_width, request.max_height), bounds);
     }
 
     /// An 8-bit 1080p H.264 source. The pixel format is load-bearing: NVDEC is
@@ -7550,7 +7626,6 @@ mod tests {
                 sources,
                 live_streams: HashMap::new(),
             }),
-            false,
             nvenc_caps_full(),
             EncodingOptions {
                 enable_hardware_encoding: true,
@@ -7593,7 +7668,7 @@ mod tests {
         // The CUDA scaler, not the software one.
         assert!(args.contains("-vf setparams="), "{args}");
         assert!(args.contains("scale_cuda=format=yuv420p"), "{args}");
-        assert!(!args.contains("hwdownload"), "{args}");
+        assert!(!without_temp_dir(&args).contains("hwdownload"), "{args}");
         // NVENC's own preset ladder: p4 for `medium`, not an x264 name.
         assert!(args.contains("-preset p4"), "{args}");
         // The generic bitrate shape — targeted, not merely capped.
@@ -7602,8 +7677,8 @@ mod tests {
             "{args}"
         );
         // Gone with the bolt-on: the fixed constant-quality target and `-crf`.
-        assert!(!args.contains("-cq"), "{args}");
-        assert!(!args.contains("-crf"), "{args}");
+        assert!(!without_temp_dir(&args).contains("-cq"), "{args}");
+        assert!(!without_temp_dir(&args).contains("-crf"), "{args}");
         // NVENC's forced keyframes cut segments once they are IDR frames, and
         // need no frame rate: this source has none.
         assert!(
@@ -7647,7 +7722,6 @@ mod tests {
                 )],
                 live_streams: HashMap::new(),
             }),
-            false,
             stock,
             EncodingOptions {
                 enable_hardware_encoding: true,
@@ -7666,9 +7740,12 @@ mod tests {
         assert!(args.contains("-c:v h264_nvenc -preset p4"), "{args}");
         // ...but nothing is asked of a device that cannot do the filtering:
         // no device graph, no hardware decode, no CUDA filter.
-        assert!(!args.contains("-init_hw_device"), "{args}");
-        assert!(!args.contains("-hwaccel"), "{args}");
-        assert!(!args.contains("_cuda"), "{args}");
+        assert!(
+            !without_temp_dir(&args).contains("-init_hw_device"),
+            "{args}"
+        );
+        assert!(!without_temp_dir(&args).contains("-hwaccel"), "{args}");
+        assert!(!without_temp_dir(&args).contains("_cuda"), "{args}");
         assert!(args.contains("-vf setparams="), "{args}");
         assert!(args.contains("format=yuv420p"), "{args}");
     }
@@ -7697,7 +7774,10 @@ mod tests {
         assert!(args.contains("-map [v]"), "{args}");
         assert!(args.contains("[0:2]scale,"), "{args}");
         assert!(
-            args.contains("[sub];[0:0][sub]overlay=eof_action=pass:repeatlast=0[v]"),
+            args.contains(
+                "[sub];[0:0]setparams=color_primaries=bt709:color_trc=bt709:colorspace=bt709,\
+                 format=yuv420p[main];[main][sub]overlay=eof_action=pass:repeatlast=0[v]"
+            ),
             "{args}"
         );
         // ...and no negative map, because this graph's output IS labelled.
@@ -7738,20 +7818,26 @@ mod tests {
 
     #[tokio::test]
     async fn an_unsupported_accelerator_keeps_the_software_transcode() {
+        use ferrofin_mediaencoding::encoding_helper::hw::Platform;
         // The accelerators Ferrofin does not support. Naming a vendor encoder
         // without its chain gives no preset, no rate control, no scaler and a
         // silently dropped subtitle — strictly worse than the software
         // transcode these servers get instead. Unsupported by decision, not by
         // omission: without the hardware to verify them on, an unverified
         // hardware pipeline is how you ship silent green frames.
-        for accel in [
-            HardwareAccelerationType::amf,
-            HardwareAccelerationType::videotoolbox,
-            HardwareAccelerationType::rkmpp,
-            HardwareAccelerationType::v4l2m2m,
+        //
+        // AMF on Windows would also pick a d3d11va decoder for the source; with
+        // no device arguments the frames still decode in software, so the
+        // software chain ends in `yuv420p`, never a hardware decoder's `nv12`.
+        for (accel, platform) in [
+            (HardwareAccelerationType::amf, Platform::Linux),
+            (HardwareAccelerationType::amf, Platform::Windows),
+            (HardwareAccelerationType::videotoolbox, Platform::Linux),
+            (HardwareAccelerationType::rkmpp, Platform::Linux),
+            (HardwareAccelerationType::v4l2m2m, Platform::Linux),
         ] {
             let caps = FfmpegCapabilities::builder()
-                .platform(ferrofin_mediaencoding::encoding_helper::hw::Platform::Linux)
+                .platform(platform)
                 .encoders([
                     "libx264",
                     "h264_vaapi",
@@ -7774,7 +7860,6 @@ mod tests {
                     )],
                     live_streams: HashMap::new(),
                 }),
-                false,
                 caps,
                 EncodingOptions {
                     enable_hardware_encoding: true,
@@ -7791,9 +7876,19 @@ mod tests {
             assert!(args.contains("-c:v libx264"), "{accel:?}: {args}");
             // The bound the client asked for still reaches the scaler...
             assert!(args.contains("scale="), "{accel:?}: {args}");
+            assert!(
+                args.contains(",format=yuv420p ") && !args.contains("nv12"),
+                "{accel:?} {platform:?}: {args}"
+            );
             // ...and no half-wired device pipeline is emitted.
-            assert!(!args.contains("-init_hw_device"), "{accel:?}: {args}");
-            assert!(!args.contains("-hwaccel"), "{accel:?}: {args}");
+            assert!(
+                !without_temp_dir(&args).contains("-init_hw_device"),
+                "{accel:?}: {args}"
+            );
+            assert!(
+                !without_temp_dir(&args).contains("-hwaccel"),
+                "{accel:?}: {args}"
+            );
         }
     }
 
@@ -7863,7 +7958,6 @@ mod tests {
                 )],
                 live_streams: HashMap::new(),
             }),
-            false,
             caps,
             EncodingOptions {
                 allow_av1_encoding: allow_av1,
@@ -7916,7 +8010,6 @@ mod tests {
                 )],
                 live_streams: HashMap::new(),
             }),
-            false,
             vaapi_caps(),
             EncodingOptions {
                 encoder_preset: EncoderPreset::slow,
@@ -7949,7 +8042,6 @@ mod tests {
                 )],
                 live_streams: HashMap::new(),
             }),
-            false,
             vaapi_caps(),
             vaapi_options(),
         );
@@ -7989,7 +8081,6 @@ mod tests {
                 sources: vec![source("abc", vec![video, audio_stream("aac")])],
                 live_streams: HashMap::new(),
             }),
-            false,
             vaapi_caps(),
             EncodingOptions {
                 enable_tonemapping: true,
@@ -8024,7 +8115,6 @@ mod tests {
                 )],
                 live_streams: HashMap::new(),
             }),
-            false,
             vaapi_caps(),
             vaapi_options(),
         );
@@ -8034,7 +8124,7 @@ mod tests {
         let plan = p.plan(&req, false, None, PlaylistKind::Vod).await.unwrap();
         let args = plan.arguments.join(" ");
         assert!(!args.contains("driver=iHD"), "{args}");
-        assert!(!args.contains("-low_power"), "{args}");
+        assert!(!without_temp_dir(&args).contains("-low_power"), "{args}");
         // ...but the VAAPI pipeline itself still runs.
         assert!(args.contains("-c:v h264_vaapi"), "{args}");
         assert!(args.contains("scale_vaapi="), "{args}");
@@ -8063,7 +8153,6 @@ mod tests {
                     )],
                     live_streams: HashMap::new(),
                 }),
-                false,
                 vaapi_caps(),
                 EncodingOptions {
                     allow_hevc_encoding: true,
@@ -8119,7 +8208,6 @@ mod tests {
                 sources: vec![source("abc", vec![video, audio_stream("aac")])],
                 live_streams: HashMap::new(),
             }),
-            false,
             qsv_caps(platform),
             EncodingOptions {
                 enable_hardware_encoding: true,
@@ -8217,7 +8305,6 @@ mod tests {
                     sources: vec![source("abc", vec![video, audio_stream("aac")])],
                     live_streams: HashMap::new(),
                 }),
-                false,
                 FfmpegCapabilities::builder()
                     .encoders(["libx264", "libsvtav1"])
                     .build(),
@@ -8263,7 +8350,10 @@ mod tests {
 
         // Without the tonemap there is nothing to work around.
         let plain = qsv_plan(Platform::Linux, false).await;
-        assert!(!plain.contains("-async_depth"), "{plain}");
+        assert!(
+            !without_temp_dir(&plain).contains("-async_depth"),
+            "{plain}"
+        );
     }
 
     #[tokio::test]
@@ -8282,7 +8372,7 @@ mod tests {
             "{args}"
         );
         // No VAAPI anywhere on this platform.
-        assert!(!args.contains("vaapi"), "{args}");
+        assert!(!without_temp_dir(&args).contains("vaapi"), "{args}");
     }
 
     #[tokio::test]
@@ -8330,7 +8420,6 @@ mod tests {
                     sources: vec![source("abc", vec![video.clone(), audio_stream("aac")])],
                     live_streams: HashMap::new(),
                 }),
-                false,
                 FfmpegCapabilities::builder()
                     .bsf_option(BsfOption::DoviRpuStrip, supports_strip)
                     .build(),
@@ -8365,7 +8454,6 @@ mod tests {
                 sources: vec![source("abc", vec![both, audio_stream("aac")])],
                 live_streams: HashMap::new(),
             }),
-            false,
             FfmpegCapabilities::builder()
                 .bsf_option(BsfOption::HevcMetadataRemoveHdr10Plus, true)
                 .build(),
@@ -8432,7 +8520,6 @@ mod tests {
                 sources: vec![source("abc", vec![dovi_p8_1(codec), audio_stream("aac")])],
                 live_streams: HashMap::new(),
             }),
-            false,
             FfmpegCapabilities::builder()
                 .bsf_option(BsfOption::HevcMetadataRemoveDovi, strip)
                 .bsf_option(BsfOption::Av1MetadataRemoveDovi, strip)
@@ -8519,8 +8606,14 @@ mod tests {
                 args.contains("-bsf:v hevc_mp4toannexb "),
                 "{ranges}: {args}"
             );
-            assert!(!args.contains("remove_dovi"), "{ranges}: {args}");
-            assert!(!args.contains("dovi_rpu"), "{ranges}: {args}");
+            assert!(
+                !without_temp_dir(&args).contains("remove_dovi"),
+                "{ranges}: {args}"
+            );
+            assert!(
+                !without_temp_dir(&args).contains("dovi_rpu"),
+                "{ranges}: {args}"
+            );
             assert!(!plan.is_dovi_removed, "{ranges}");
         }
         // The fMP4 Dolby Vision branch follows upstream's `DOVI` check.
@@ -8579,7 +8672,7 @@ mod tests {
             "{args}"
         );
         // ...and NOT with the premultiplied option, which is text-only.
-        assert!(!args.contains("alpha_format"), "{args}");
+        assert!(!without_temp_dir(&args).contains("alpha_format"), "{args}");
     }
 
     /// The hardware chains' subtitle pad is the ffmpeg index too: a Blu-ray
@@ -8668,7 +8761,7 @@ mod tests {
 
         // Segment 0 needs no shift at all.
         let plan = p.plan(&req, false, None, PlaylistKind::Vod).await.unwrap();
-        assert!(!plan.arguments.join(" ").contains("setpts"));
+        assert!(!without_temp_dir(&plan.arguments.join(" ")).contains("setpts"));
     }
 
     /// A 1080i H.264 source at `rate` fps, re-encoded under `options` with a
@@ -8711,31 +8804,32 @@ mod tests {
     /// in software, as upstream's `GetSwVidFilterChain` does whenever
     /// `IsDeinterlaceAvailable`: `yadif` or `bwdif` per "Deinterlacing
     /// method", at field rate (`=1`) with "Double the frame rate when
-    /// deinterlacing" on and a source of 30 fps or less, ahead of the scale.
+    /// deinterlacing" on and a source of 30 fps or less, behind the SDR
+    /// `setparams` tag and ahead of the scale.
     #[rstest]
     #[case::yadif(
         ferrofin_model::entities::DeinterlaceMethod::yadif,
         false,
         25.0,
-        "-vf yadif=0:-1:0,scale="
+        "colorspace=bt709,yadif=0:-1:0,scale="
     )]
     #[case::bwdif(
         ferrofin_model::entities::DeinterlaceMethod::bwdif,
         false,
         25.0,
-        "-vf bwdif=0:-1:0,scale="
+        "colorspace=bt709,bwdif=0:-1:0,scale="
     )]
     #[case::double_rate(
         ferrofin_model::entities::DeinterlaceMethod::yadif,
         true,
         25.0,
-        "-vf yadif=1:-1:0,scale="
+        "colorspace=bt709,yadif=1:-1:0,scale="
     )]
     #[case::double_rate_above_30_fps(
         ferrofin_model::entities::DeinterlaceMethod::yadif,
         true,
         59.94,
-        "-vf yadif=0:-1:0,scale="
+        "colorspace=bt709,yadif=0:-1:0,scale="
     )]
     #[tokio::test]
     async fn an_interlaced_source_deinterlaces_in_software(
@@ -8756,7 +8850,8 @@ mod tests {
     /// A progressive source is not deinterlaced.
     #[tokio::test]
     async fn a_progressive_source_is_not_deinterlaced_in_software() {
-        let args = software_args(false, 25.0, EncodingOptions::default(), None).await;
+        let args =
+            without_temp_dir(&software_args(false, 25.0, EncodingOptions::default(), None).await);
         assert!(!args.contains("yadif") && !args.contains("bwdif"), "{args}");
     }
 
@@ -8766,9 +8861,26 @@ mod tests {
     /// chain filters only the frames kept. The rate prints as upstream's: the
     /// request's `float` widened to the `double?` `GetFramerateParam` returns.
     #[rstest]
-    #[case::interlaced(true, 24.0, "-vf yadif=0:-1:0,scale=1280:720,fps=24 ")]
-    #[case::progressive(false, 24.0, "-vf fps=24,scale=1280:720 ")]
-    #[case::fractional(false, 23.976, "-vf fps=23.97599983215332,scale=1280:720 ")]
+    #[case::interlaced(
+        true,
+        24.0,
+        concat!(
+            "-vf setparams=color_primaries=bt709:color_trc=bt709:colorspace=bt709,",
+            "yadif=0:-1:0,",
+            r"scale=trunc(min(max(iw\,ih*a)\,1280)/2)*2:trunc(ow/a/2)*2,",
+            "format=yuv420p,fps=24 ",
+        )
+    )]
+    #[case::progressive(
+        false,
+        24.0,
+        concat!(
+            "-vf fps=24,setparams=color_primaries=bt709:color_trc=bt709:colorspace=bt709,",
+            r"scale=trunc(min(max(iw\,ih*a)\,1280)/2)*2:trunc(ow/a/2)*2,",
+            "format=yuv420p ",
+        )
+    )]
+    #[case::fractional(false, 23.976, "-vf fps=23.97599983215332,setparams=")]
     #[tokio::test]
     async fn a_frame_rate_cap_joins_the_software_chain(
         #[case] interlaced: bool,
@@ -8950,8 +9062,11 @@ mod tests {
             .unwrap_or_else(|| panic!("no {flag}: {arguments:?}"));
         if flag == "-vf" {
             assert!(
-                graph.starts_with("yadif=0:-1:0,scale=1280:720,subtitles=")
-                    && graph.ends_with(",fps=24"),
+                graph.starts_with(
+                    "setparams=color_primaries=bt709:color_trc=bt709:colorspace=bt709,\
+                     yadif=0:-1:0,scale=trunc(min(max(iw\\,ih*a)\\,1280)/2)*2:trunc(ow/a/2)*2,\
+                     format=yuv420p,subtitles="
+                ) && graph.ends_with(",fps=24"),
                 "{graph}"
             );
         } else {
@@ -8959,7 +9074,9 @@ mod tests {
                 graph,
                 "[0:2]scale,scale=-1:720:fast_bilinear,crop,pad=max(1280\\,iw):max(720\\,ih):\
                  (ow-iw)/2:(oh-ih)/2:black@0,crop=1280:720[sub];\
-                 [0:0]yadif=0:-1:0,scale=1280:720,fps=24[main];\
+                 [0:0]setparams=color_primaries=bt709:color_trc=bt709:colorspace=bt709,\
+                 yadif=0:-1:0,scale=trunc(min(max(iw\\,ih*a)\\,1280)/2)*2:trunc(ow/a/2)*2,\
+                 format=yuv420p,fps=24[main];\
                  [main][sub]overlay=eof_action=pass:repeatlast=0[v]"
             );
         }
@@ -9015,7 +9132,6 @@ mod tests {
                 sources: vec![source("abc", vec![video, audio_stream("aac")])],
                 live_streams: HashMap::new(),
             }),
-            false,
             nvenc_caps_full(),
             EncodingOptions {
                 enable_hardware_encoding: true,
@@ -9087,7 +9203,7 @@ mod tests {
              [main][sub]overlay_cuda=eof_action=pass:repeatlast=0:\
              alpha_format=premultiplied"
         );
-        assert!(!args.contains("hwdownload"), "{args}");
+        assert!(!without_temp_dir(&args).contains("hwdownload"), "{args}");
         // The old bolt-on emitted a separate `-vf` here; the two cannot coexist.
         assert!(!args.contains("-vf "), "{args}");
     }
@@ -9119,7 +9235,6 @@ mod tests {
                 sources: vec![src],
                 live_streams: HashMap::new(),
             }),
-            false,
             caps,
             EncodingOptions {
                 enable_hardware_encoding: true,
@@ -9200,7 +9315,7 @@ mod tests {
         assert_eq!(plan.state.output_audio_bitrate, Some(128_000));
         let args = plan.arguments.join(" ");
         assert!(
-            !args.contains("-maxrate"),
+            !without_temp_dir(&args).contains("-maxrate"),
             "copy has no bitrate args: {args}"
         );
         assert!(!args.contains("-b:a"), "copy has no audio bitrate: {args}");
@@ -9407,8 +9522,11 @@ mod tests {
             .unwrap();
         let args = plan.arguments.join(" ");
         assert!(args.contains("-hls_playlist_type vod"), "{args}");
-        assert!(!args.contains("-hls_base_url"), "{args}");
-        assert!(!args.contains("-global_header"), "{args}");
+        assert!(!without_temp_dir(&args).contains("-hls_base_url"), "{args}");
+        assert!(
+            !without_temp_dir(&args).contains("-global_header"),
+            "{args}"
+        );
         assert!(args.contains("-preset veryfast"), "{args}");
 
         // fMP4 event segments keep the global header (the flag is mpegts-only).
@@ -9420,7 +9538,10 @@ mod tests {
             .unwrap();
         let args = plan.arguments.join(" ");
         assert!(args.contains("-hls_playlist_type event"), "{args}");
-        assert!(!args.contains("-global_header"), "{args}");
+        assert!(
+            !without_temp_dir(&args).contains("-global_header"),
+            "{args}"
+        );
     }
 
     /// No selected subtitle: the delivery method is the DTO default

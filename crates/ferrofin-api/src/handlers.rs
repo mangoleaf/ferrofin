@@ -1,11 +1,12 @@
-//! Real ported handlers for the First-Light routes.
+//! Real ported handlers for the contract routes.
 //!
 //! Each submodule mirrors one `Jellyfin.Api` controller and holds axum handlers
 //! that call the [`AppState`](crate::state::AppState) manager traits, project
 //! results through [`DtoService`](ferrofin_traits::dto::DtoService), and return
-//! the wire DTOs from `ferrofin-model`. These are the routes with *real* behaviour
-//! (the rest of the contract stays on the shared `not_implemented` `501` stub);
-//! [`register`] mounts them over their stub entries.
+//! the wire DTOs from `ferrofin-model`. Every operation in the vendored contract
+//! is served by a real handler, listed in [`REAL_ROUTES`], and [`register`]
+//! mounts them. A contract route missing from that list would get the shared
+//! `not_implemented` `501` stub, never a `404`.
 //!
 //! Handlers behind Jellyfin's `[Authorize]` policy take the
 //! [`RequireAuth`](crate::auth::RequireAuth) extractor (a missing/invalid token
@@ -412,7 +413,9 @@ pub const REAL_ROUTES: &[(&str, &str)] = &[
     ("get", "/Items/{itemId}/RemoteImages/Providers"),
     ("post", "/Items/{itemId}/RemoteImages/Download"),
     // Batch 10 — Videos + Audio direct streaming, Universal, MediaInfo.
-    // Direct-play (static) file serving; transcoding/HLS stay on the 501 stub.
+    // Progressive streams: `Static=true` is served from the source it names;
+    // anything else, and a disc folder, is transcoded
+    // (`streaming::static_or_transcode`). The HLS routes follow.
     // The vendored `stream.{container}` segment normalizes to `{container}` — a
     // single param capture at that position (see `routes::normalize_contract_path`).
     ("get", "/Videos/{itemId}/{container}"),
@@ -540,7 +543,7 @@ pub const REAL_ROUTES: &[(&str, &str)] = &[
     ("post", "/System/Configuration/{key}"),
     // Activity log.
     ("get", "/System/ActivityLog/Entries"),
-    // Branding reads (Splashscreen GET/POST/DELETE are real in Batch 16).
+    // Branding reads (the Splashscreen GET/POST/DELETE rows are further down).
     ("get", "/Branding/Configuration"),
     ("get", "/Branding/Css"),
     ("get", "/Branding/Css.css"),
@@ -601,15 +604,13 @@ pub const REAL_ROUTES: &[(&str, &str)] = &[
     ("post", "/Library/Movies/Updated"),
     ("post", "/Library/Media/Updated"),
     // Batch 15 — ScheduledTasks read/run.
-    // List, fetch-by-id, and manual run-now. The scheduler-cron machinery stays
-    // on the 501 stub: `DELETE /ScheduledTasks/Running/{taskId}` (cancel — no
-    // background run to cancel) and `POST /ScheduledTasks/{taskId}/Triggers`
-    // (trigger-config persistence). Channels (`ChannelsController`) stays fully
-    // on the 501 stub as a deferred Live-TV/channels subsystem.
+    // List, fetch-by-id, and manual run-now. Cancel and the trigger config are
+    // listed further down.
     ("get", "/ScheduledTasks"),
     ("get", "/ScheduledTasks/{taskId}"),
     ("post", "/ScheduledTasks/Running/{taskId}"),
-    // Batch 16 — the last portable stubs.
+    // Batch 16 — similar items, image writes, task cancel and triggers, the
+    // metadata editor and view grouping options.
     // Similar-items aliases (`LibraryController.GetSimilarItems`); the
     // `Shows/…/Similar` row sits in Batch 8, though `handlers::similar` serves it.
     ("get", "/Albums/{itemId}/Similar"),
@@ -638,7 +639,9 @@ pub const REAL_ROUTES: &[(&str, &str)] = &[
     ("get", "/Items/{itemId}/MetadataEditor"),
     ("get", "/UserViews/GroupingOptions"),
     // Batch 6 — portable extras: TMDb client image configuration
-    // (`TmdbController`); served static while the live TMDb provider is deferred.
+    // (`TmdbController`), answered from fixed TMDb values.
+    // TODO(parity, gl-1508): open work item, not an accepted divergence: port
+    // upstream's live `GetConfigAsync` fetch.
     ("get", "/Tmdb/ClientConfiguration"),
     // MergeVersions plugin — bulk merge/split of duplicate versions across the
     // whole library, ported onto the core `PrimaryVersionId` version-group seam
@@ -657,9 +660,9 @@ pub const REAL_ROUTES: &[(&str, &str)] = &[
     // Batch 1 (this unit) — Library admin / virtual folders. The
     // filesystem-backed `LibraryStructureController` CRUD + the two
     // `LibraryController` structure reads, over the `VirtualFolderManager` seam
-    // (see `handlers::library_structure` / `handlers::library`). No route here
-    // stays on the 501 stub; `AvailableOptions` returns empty provider lists
-    // faithfully (no metadata plugins registered at this seam).
+    // (see `handlers::library_structure` / `handlers::library`).
+    // `AvailableOptions` lists the registered metadata, image, subtitle, lyric
+    // and media-segment providers.
     ("get", "/Library/VirtualFolders"),
     ("post", "/Library/VirtualFolders"),
     ("delete", "/Library/VirtualFolders"),
@@ -695,7 +698,9 @@ pub const REAL_ROUTES: &[(&str, &str)] = &[
     ("get", "/Packages/{name}"),
     ("post", "/Packages/Installed/{name}"),
     ("delete", "/Packages/Installing/{packageId}"),
-    // Live TV read surface (empty/disabled state; mutations stay on the 501 stub).
+    // Live TV (`LiveTvController`): reads, tuner and listing-provider
+    // configuration, and the DVR timers, over the `LiveTvManager` (see
+    // `handlers::live_tv`).
     ("get", "/LiveTv/Info"),
     ("get", "/LiveTv/GuideInfo"),
     ("get", "/LiveTv/Channels"),
@@ -998,7 +1003,9 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
                    library_scan.rs run_scan (the item's error is counted in \
                    ScanOutcome::skipped, the walk goes on, a saved row loses its \
                    DateLastRefreshed, a new item with no row takes its descendants along, a \
-                   refresh of an item or folder ends with that item's own failure) \
+                   refresh of an item or folder ends with that item's own failure) and \
+                   scan_item (the row is saved unstamped, and its stamp written after what \
+                   hangs off it, unless a cancel cut that short) \
                    ← parent_row (a failed read counts as \
                    no row, once per pass) ← sync_series_name (FindSeriesName), \
                    sync_season_name, remember_series_folder, locale_parent (GetParents, \
@@ -1016,7 +1023,7 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
                    MediaBrowser.Controller/Entities/TV/Season.cs (FindSeriesName), \
                    MediaBrowser.Controller/Entities/BaseItem.cs (GetParentalRatingScore) and \
                    MediaBrowser.Providers/TV/EpisodeMetadataService.cs (BeforeSaveInternal)",
-        date: "2026-11-06",
+        date: "2026-11-09",
         divergences: &[
             "An item whose parent chain cannot be read is scored from its own rating and \
              country, an ancestor's custom rating not counting, else takes the score stored on \
@@ -1029,11 +1036,13 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
              the server, so an override on the unreadable row or above it goes unused and the \
              child is fetched, and stamped, in that locale, where upstream's read of such a \
              row would throw into the per-child catch and the item would not refresh.",
-            "A stored item that fails after its row was saved has its DateLastRefreshed \
-             cleared, so the next scan retries it as a first refresh where upstream, which \
-             saves the row after the providers and the probe, retries it because the row kept \
-             its old DateModified; the rows a save hangs off it by foreign key are why \
-             Ferrofin saves first, and the retry is the same but runs every provider.",
+            "A stored item whose refresh stops after its row was saved (a failed write, a \
+             cancel, a crash) is left with no DateLastRefreshed, which the scan clears for the \
+             save and writes back last, so the next scan retries it as a first refresh where \
+             upstream, which saves the row after the providers and the probe, retries it \
+             because the row kept its old DateModified; the rows a save hangs off it by \
+             foreign key are why Ferrofin saves first, and the retry is the same but runs \
+             every provider.",
             "A new item that fails before its first save has no row until the next scan, \
              where upstream's CreateItems and first-refresh save keep one, so a new folder \
              that fails takes its descendants with it for this scan.",
@@ -3006,12 +3015,13 @@ pub const VERIFIED: &[Verified] = &[
                (LibraryManager.GetVirtualFolders(true) and GetVirtualFolderInfo: \
                is_directory for Directory.EnumerateDirectories, resolve_locations and \
                resolve_shortcut for the Locations and their culture sort, \
-               read_collection_type, load_options for CollectionFolder.GetLibraryOptions \
-               and LoadLibraryOptions' ExpandVirtualPath, scan_progress for \
+               read_collection_type, load_options and stored_options for \
+               CollectionFolder.GetLibraryOptions and LoadLibraryOptions (its defaults, \
+               its error log, its ExpandVirtualPath), scan_progress for \
                RefreshProgress and RefreshStatus) → ferrofin-model entities_media.rs \
                VirtualFolderInfo, configuration.rs LibraryOptions, TypeOptions, \
                ImageOption, MediaPathInfo",
-        date: "2026-10-28",
+        date: "2026-11-09",
         divergences: &[
             "An unreadable shortcut is logged at error the first time a listing meets it and \
          at debug while it stays unreadable; upstream logs it at error on every listing. \
@@ -3028,9 +3038,13 @@ pub const VERIFIED: &[Verified] = &[
          library's locations, and a later listing writes any other row.",
             "An empty .mblink is dropped; upstream filters only nulls, so it lists an empty \
          location, which names no folder. Jellyfin bug not ported.",
-            "An options.json that does not parse serves the defaults without a log entry; \
-         upstream also serves the defaults for a bad options.xml but logs it at error. Fix \
-         path: gl-271.",
+            "An options.json that cannot be read or parsed serves the defaults, logged at \
+         error the first time a read meets it and at debug while it stays so. Upstream \
+         caches the options per library and logs a parse or permission failure at error \
+         once per cache fill (a library-structure change clears it), and any other I/O \
+         failure (an IOException) not at all. The listing reads the file on every \
+         dashboard load, and docs/conventions/LOGGING.md rule 1 keeps a level whose \
+         volume scales with the request rate out of error.",
             "The 401 and 403 bodies are Ferrofin's error shape, not upstream's. Fix path: \
          gl-666.",
         ],
@@ -3896,11 +3910,11 @@ const _: () = assert!(
     "EXTENSION_ROUTES contains an entry that is not in REAL_ROUTES"
 );
 
-/// Mounts every real First-Light handler onto `router`, overriding the matching
-/// `501` stub entries registered from the vendored contract table.
+/// Mounts every real handler onto `router`.
 ///
-/// Called by [`create_router`](crate::router::create_router) after the stub loop
-/// so a `(method, path)` with a real handler wins over its stub.
+/// Called by [`create_router`](crate::router::create_router) after its stub
+/// loop, which skips the `501` stub for each [`REAL_ROUTES`] row, so a real
+/// handler is the sole route for its `(method, path)`.
 pub fn register(router: Router<AppState>) -> Router<AppState> {
     let router = users::register(router);
     let router = user_views::register(router);
@@ -3962,7 +3976,7 @@ pub fn register(router: Router<AppState>) -> Router<AppState> {
     let router = scheduled_tasks::register(router);
     // Batch 6 — portable extras: TMDb client config (TmdbController).
     let router = tmdb::register(router);
-    // Batch 16 — the last portable stubs.
+    // Similar items (`LibraryController.GetSimilarItems` and its aliases).
     let router = similar::register(router);
     // MergeVersions plugin — bulk merge/split of duplicate versions.
     let router = merge_versions::register(router);
@@ -3974,8 +3988,8 @@ pub fn register(router: Router<AppState>) -> Router<AppState> {
     // The LDAP-Auth plugin's own controller — not a contract operation, so
     // listed in PLUGIN_ROUTES.
     let router = ldap::register(router);
-    // Live TV read surface — empty/disabled state so the web UI treats Live TV
-    // as "not configured" instead of erroring on 501 (mutations stay stubbed).
+    // Live TV over the `LiveTvManager`; with nothing configured the reads answer
+    // the empty state jellyfin-web shows as "not configured".
     let router = live_tv::register(router);
     // SyncPlay — synchronized group playback over the session WebSocket.
     let router = sync_play::register(router);
