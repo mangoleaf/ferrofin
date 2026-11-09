@@ -419,6 +419,27 @@ pub trait LibraryManager: Send + Sync {
         Ok(visible)
     }
 
+    /// [`Self::get_visible_item_ids`] over rows the caller already holds:
+    /// the standalone-visible ones, in input order, repeats kept. Concrete
+    /// managers check the rows given instead of reading them again by id.
+    async fn filter_visible_items_standalone(
+        &self,
+        mut items: Vec<BaseItemEntity>,
+        user: &UserEntity,
+    ) -> Result<Vec<BaseItemEntity>, ServiceError> {
+        let ids: Vec<Uuid> = items
+            .iter()
+            .filter_map(|item| Uuid::parse_str(&item.id).ok())
+            .collect();
+        let visible: std::collections::HashSet<Uuid> = self
+            .get_visible_item_ids(&ids, user)
+            .await?
+            .into_iter()
+            .collect();
+        items.retain(|item| Uuid::parse_str(&item.id).is_ok_and(|id| visible.contains(&id)));
+        Ok(items)
+    }
+
     /// The ids of `ids` that pass the parental check for `user`, in input
     /// order: C# `BaseItem.IsParentalAllowed(user, skipAllowedTagsCheck)`, the
     /// rating, unrated and tag rules with no folder or library access check.

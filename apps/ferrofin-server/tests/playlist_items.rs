@@ -663,6 +663,98 @@ async fn an_add_keeps_to_what_its_user_may_see() {
     );
 }
 
+/// `GET /Playlists/{id}/Items` lists what its reader may open, repeats and
+/// all, and pages that list (`GetManageableItems().Where(IsVisible)` before
+/// `Skip`/`Take`); `GET /Playlists/{id}` names every entry, whoever reads it.
+/// A rating limit hides the R-rated track, and a reader granted no library
+/// sees none of them (gl-1092's standalone check).
+#[tokio::test]
+async fn a_listing_keeps_to_what_its_reader_may_see_before_the_paging() {
+    let fx = fixture().await;
+    let music = seed_music(&fx).await;
+    let (status, created) = fx
+        .call(
+            "POST",
+            "/Playlists",
+            Some(json!({"Name": "Mix", "Ids": [music.album, music.artist, music.album]})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{created}");
+    let id = created["Id"].as_str().unwrap().to_owned();
+    let all = [
+        "Zulu", "Alpha", "Zulu", "Alpha", "Beta", "Omega", "Zulu", "Alpha",
+    ];
+    assert_eq!(fx.stored(&id).await, all);
+
+    let mut readers = Vec::new();
+    for (name, rule) in [
+        ("kid", json!({"MaxParentalRating": 13})),
+        (
+            "guest",
+            json!({"EnableAllFolders": false, "EnabledFolders": []}),
+        ),
+    ] {
+        let (status, user) = fx
+            .call(
+                "POST",
+                "/Users/New",
+                Some(json!({"Name": name, "Password": "pw"})),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{user}");
+        let mut policy = user["Policy"].clone();
+        for (key, value) in rule.as_object().unwrap() {
+            policy[key] = value.clone();
+        }
+        let (status, body) = fx
+            .call(
+                "POST",
+                &format!("/Users/{}/Policy", user["Id"].as_str().unwrap()),
+                Some(policy),
+            )
+            .await;
+        assert!(status.is_success(), "{status} {body}");
+        readers.push(Fixture {
+            token: fx.login(name, "pw").await,
+            ..fx.clone()
+        });
+    }
+    let page = async |reader: &Fixture, query: &str| {
+        let (status, body) = reader
+            .call("GET", &format!("/Playlists/{id}/Items{query}"), None)
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let names: Vec<&str> = body["Items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|item| item["Name"].as_str().unwrap())
+            .collect();
+        let (total, start) = (&body["TotalRecordCount"], &body["StartIndex"]);
+        format!("{total} from {start}: {}", names.join(" "))
+    };
+    let item_ids = async |reader: &Fixture| {
+        let (status, body) = reader.call("GET", &format!("/Playlists/{id}"), None).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        body["ItemIds"].as_array().unwrap().len()
+    };
+
+    let [kid, guest] = [&readers[0], &readers[1]];
+    assert_eq!(page(&fx, "").await, format!("8 from 0: {}", all.join(" ")));
+    assert_eq!(
+        page(kid, "").await,
+        "7 from 0: Zulu Alpha Zulu Alpha Beta Zulu Alpha"
+    );
+    assert_eq!(
+        page(kid, "?startIndex=3&limit=3").await,
+        "7 from 3: Alpha Beta Zulu"
+    );
+    assert_eq!(page(guest, "?limit=2").await, "0 from 0: ");
+    for reader in [&fx, kid, guest] {
+        assert_eq!(item_ids(reader).await, all.len());
+    }
+}
+
 /// A create naming no media type takes it from the first item that answers:
 /// a series answers with its first episode's.
 #[tokio::test]

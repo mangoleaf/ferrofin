@@ -452,6 +452,9 @@ impl PlaylistManager for RecordingPlaylists {
             })
             .into())
     }
+    async fn get_playlist_item_ids(&self, _playlist_id: Uuid) -> Result<Vec<Uuid>, ServiceError> {
+        Ok(vec![ITEM_A, ITEM_B])
+    }
     async fn add_user_to_shares(
         &self,
         _request: &ferrofin_model::playlists::PlaylistUserUpdateRequest,
