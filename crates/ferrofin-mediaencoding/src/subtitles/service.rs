@@ -381,6 +381,9 @@ mod tests {
         fn file_exists(&self, _path: &str) -> bool {
             false
         }
+        async fn open_file(&self, _path: &str) -> std::io::Result<()> {
+            Err(self.0.into())
+        }
         fn file_size(&self, _path: &str) -> Option<u64> {
             None
         }
@@ -395,9 +398,17 @@ mod tests {
         }
     }
 
+    /// An external PGS track at `path`.
+    fn pgs_stream(path: &str) -> MediaStream {
+        let mut stream = srt_stream(0, path);
+        stream.codec = Some("pgssub".to_owned());
+        stream
+    }
+
     /// A sidecar gone since the scan is the `404` of upstream's
     /// `FileNotFoundException`, and its message, which reaches the client of an
-    /// anonymous route, names no path.
+    /// anonymous route, names no path. A PGS track, refused unread as text,
+    /// still opens its file first, so it is the `404` too.
     #[tokio::test]
     async fn a_missing_sidecar_is_not_found_without_its_path() {
         // ENOTDIR (a path through a file) is .NET's `DirectoryNotFoundException`.
@@ -405,17 +416,19 @@ mod tests {
             std::io::ErrorKind::NotFound,
             std::io::ErrorKind::NotADirectory,
         ] {
-            let enc = failing(kind, srt_stream(0, "/subs/a.srt"));
-            for format in ["vtt", "srt"] {
-                let err = enc
-                    .get_subtitles(Uuid::nil(), "msrc", 0, format, 0, 0, false)
-                    .await
-                    .expect_err("sidecar gone");
-                assert!(
-                    matches!(err, ServiceError::NotFound(_)),
-                    "{kind:?} {format}: {err:?}"
-                );
-                assert!(!err.to_string().contains("/subs"), "{err}");
+            for stream in [srt_stream(0, "/subs/a.srt"), pgs_stream("/subs/a.sup")] {
+                let enc = failing(kind, stream);
+                for format in ["vtt", "srt"] {
+                    let err = enc
+                        .get_subtitles(Uuid::nil(), "msrc", 0, format, 0, 0, false)
+                        .await
+                        .expect_err("sidecar gone");
+                    assert!(
+                        matches!(err, ServiceError::NotFound(_)),
+                        "{kind:?} {format}: {err:?}"
+                    );
+                    assert!(!err.to_string().contains("/subs"), "{err}");
+                }
             }
         }
     }
@@ -435,18 +448,21 @@ mod tests {
     }
 
     /// Any other failed read stays the `500` (`UnauthorizedAccessException`,
-    /// `IOException` upstream), its path kept for the server log.
+    /// `IOException` upstream), its path kept for the server log, a PGS
+    /// track's failed open included.
     #[tokio::test]
     async fn an_unreadable_sidecar_stays_a_backend_error() {
-        let err = failing(
-            std::io::ErrorKind::PermissionDenied,
-            srt_stream(0, "/subs/a.srt"),
-        )
-        .get_subtitles(Uuid::nil(), "msrc", 0, "vtt", 0, 0, false)
-        .await
-        .expect_err("sidecar unreadable");
-        assert!(matches!(err, ServiceError::BackendSource(_)), "{err:?}");
-        assert!(err.to_string().contains("read /subs/a.srt"), "{err}");
+        for (stream, path) in [
+            (srt_stream(0, "/subs/a.srt"), "/subs/a.srt"),
+            (pgs_stream("/subs/a.sup"), "/subs/a.sup"),
+        ] {
+            let err = failing(std::io::ErrorKind::PermissionDenied, stream)
+                .get_subtitles(Uuid::nil(), "msrc", 0, "vtt", 0, 0, false)
+                .await
+                .expect_err("sidecar unreadable");
+            assert!(matches!(err, ServiceError::BackendSource(_)), "{err:?}");
+            assert!(err.to_string().contains(&format!("read {path}")), "{err}");
+        }
     }
 
     /// An embedded track whose extraction left no cache file: upstream swallows
