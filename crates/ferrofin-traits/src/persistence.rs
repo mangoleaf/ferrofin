@@ -1829,19 +1829,24 @@ pub trait ItemPersistenceService: Send + Sync {
         Ok(0)
     }
 
-    /// Clears `item_id`'s `DateLastRefreshed`, so the next scan takes it as
-    /// never refreshed: its refresh failed after the row was saved, and the
-    /// saved row no longer shows what is left to do. Nothing else on the row
-    /// moves. Returns whether there is such a row.
+    /// Sets `item_id`'s `DateLastRefreshed` to `at`, and nothing else on the
+    /// row. `None` clears it, so the next scan takes the item as never
+    /// refreshed: the scan saves an item's row before what hangs off it, and
+    /// the row carries no stamp until those writes are done, so a refresh
+    /// cut short there is redone. Returns whether there is such a row.
     ///
-    /// The default clears nothing and answers `false` (for stub/fake
+    /// The default writes nothing and answers `false` (for stub/fake
     /// services).
     ///
     /// # Errors
     ///
     /// [`ServiceError::Backend`] on a storage failure.
-    async fn clear_date_last_refreshed(&self, item_id: Uuid) -> Result<bool, ServiceError> {
-        let _ = item_id;
+    async fn set_date_last_refreshed(
+        &self,
+        item_id: Uuid,
+        at: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> Result<bool, ServiceError> {
+        let _ = (item_id, at);
         Ok(false)
     }
 

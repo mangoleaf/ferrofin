@@ -2066,9 +2066,10 @@ fn dynamic_answer(
 /// ones before anything is written (its probe, its metadata providers) end
 /// the item unwritten, and a cancel inside its artwork pass (image
 /// providers, cover extraction) stops the fetches where they stand and
-/// saves the item with the artwork already on disk. So an item is written
-/// whole or not at all, and a hung ffprobe or provider cannot keep a
-/// cancelled scan alive.
+/// saves the item with the artwork already on disk. A cancel after the
+/// item's row was saved leaves the row without its refresh stamp, so an item
+/// is written whole, not at all, or as far as it got for the next scan to
+/// redo; and a hung ffprobe or provider cannot keep a cancelled scan alive.
 #[derive(Debug, Clone)]
 pub struct ScanCancel(Arc<tokio::sync::watch::Sender<bool>>);
 
@@ -2317,7 +2318,9 @@ impl SkippedItems {
     }
 
     /// Records that `id` failed after its save and its refresh stamp could
-    /// not be cleared over `err`, so the next scan may not retry it.
+    /// not be cleared over `err`. Only a row the scan could not read still
+    /// carries one then (every other is saved unstamped), so the next scan
+    /// may not retry it.
     fn note_stamp_kept(&mut self, id: Uuid, err: &ServiceError) {
         tracing::debug!(item_id = %id, %err, "refresh stamp not cleared");
         self.stamps_kept += 1;
@@ -3054,9 +3057,10 @@ struct ItemState<'s, 'a> {
     /// persisted one, whatever a local reader then makes of it.
     renamed_extra: bool,
     /// Set by [`LibraryScanner::scan_item`] just before it saves the item's
-    /// row: from then on a failure may leave the row carrying this refresh's
-    /// stamp, even a failure of the save itself, which writes the row before
-    /// the names it pushes to its children.
+    /// row: from then on a failure may leave the row behind, even a failure
+    /// of the save itself, which writes the row before the names it pushes to
+    /// its children. Its stamp is withheld until the end, except a stamp the
+    /// scan could not read, which the save keeps.
     save_attempted: bool,
 }
 
@@ -5403,8 +5407,10 @@ impl LibraryScanner {
     /// at or under some paths, or what the library monitor's changed paths
     /// belong to ([`scan_paths`](Self::scan_paths)), refreshing
     /// them with `run.options`, and stopping between two items once
-    /// `run.cancel` is cancelled (the item in progress always finishes, and
-    /// the rest of the pass — pruning, the post-scan passes — is skipped).
+    /// `run.cancel` is cancelled (the item in progress finishes, or stops
+    /// where the cancel found it and is left unstamped for the next scan,
+    /// and the rest of the pass — pruning, the post-scan passes — is
+    /// skipped).
     ///
     /// # Errors
     /// See [`scan`](Self::scan).
@@ -6746,19 +6752,21 @@ impl LibraryScanner {
     /// around them for context take `run.ancestors`, and pruning is limited
     /// to the rows under `scope.roots`.
     ///
-    /// Cancellation is cooperative and item-atomic: `run.cancel` is checked
-    /// between items and around each window read (see [`ScanCancel`]), so
-    /// the item in progress is written whole (its row, ids, cast, streams,
-    /// chapters and images) or not at all, and a cancelled scan skips the
-    /// pruning and the post-scan passes, as upstream's
-    /// `ThrowIfCancellationRequested` between children does.
+    /// Cancellation is cooperative: `run.cancel` is checked between items
+    /// and around each window read (see [`ScanCancel`]). The item in
+    /// progress is written whole (its row, ids, cast, streams, chapters and
+    /// images) or not at all, or, when the cancel lands after its row was
+    /// saved, as far as it got and without its refresh stamp, so the next
+    /// scan refreshes it again. A cancelled scan skips the pruning and the
+    /// post-scan passes, as upstream's `ThrowIfCancellationRequested` between
+    /// children does.
     ///
     /// One item's failure is that item's alone
     /// (`LimitedConcurrencyLibraryScheduler.ProcessItem`, which logs what a
     /// child threw and goes on): it is counted in [`ScanOutcome::skipped`],
     /// stays out of the prune (it is planned), and the walk, the prune and
     /// the closing passes run on. A row saved before the failure loses its
-    /// refresh stamp ([`ItemPersistenceService::clear_date_last_refreshed`]),
+    /// refresh stamp ([`ItemPersistenceService::set_date_last_refreshed`]),
     /// so the next scan refreshes it whatever its file did. A new item that
     /// left no row takes what is planned below it along
     /// (`Folder.RefreshChildMetadata` recurses only into a child that
@@ -7021,7 +7029,8 @@ impl LibraryScanner {
             ))
             .await;
             probes.begin_item(scanned);
-            // Between two items (the one before was written whole), and
+            // Between two items (the one before was written whole, or left
+            // unstamped where the cancel cut it short), and
             // after the window read, whose planning stops at a cancel: a
             // read that takes seconds never delays the stop by an item.
             if run.cancel.is_cancelled() {
@@ -7168,7 +7177,11 @@ impl LibraryScanner {
                     // the next scan refreshes it either way.
                     let mut row_stands = false;
                     if save_attempted {
-                        match self.persistence.clear_date_last_refreshed(item.id).await {
+                        match self
+                            .persistence
+                            .set_date_last_refreshed(item.id, None)
+                            .await
+                        {
                             Ok(found) => row_stands = found,
                             Err(err) => art_cache.skipped.note_stamp_kept(item.id, &err),
                         }
@@ -8767,16 +8780,30 @@ impl LibraryScanner {
         // Both stamps are this item's own `DateTime.UtcNow`, as upstream's;
         // the scan start would give every item of a scan the same
         // `DateLastSaved`, and so the same Etag.
+        //
+        // The row is saved before what hangs off it (its ids, cast, streams,
+        // chapters), and the stamp is written only after those, as upstream's
+        // stamped save comes after the probe wrote its streams and chapters
+        // (`MetadataService.RefreshMetadata`): until then the row carries
+        // none, so a refresh cut short (a failed write, a cancel, a crash)
+        // is redone by the next scan whatever its file did. (A row the scan
+        // could not read keeps its stamp through the save, which is not given
+        // one to clear.)
         let now = Utc::now();
-        if decision.stamp_refreshed && !music_pending && !new_trickplay {
-            entity.date_last_refreshed = Some(now);
-        }
+        let kept_stamp = entity.date_last_refreshed.take();
         // A new item's first refresh saves it right after creating it
         // (`MetadataService.RefreshMetadata`: `SaveItemAsync` when
         // `isFirstRefresh`), which stamps `DateLastSaved`; the insert stores
         // the row's own value, so it is set here. An update stamps it in SQL.
         if stored_row.is_none() {
             entity.date_last_saved = Some(now);
+        }
+        // The stored stamp is cleared first: the save keeps one it is not
+        // given.
+        if kept_stamp.is_some() {
+            self.persistence
+                .set_date_last_refreshed(item.id, None)
+                .await?;
         }
         // Scan-variant save: its SQL guards back the merge above up for a
         // row it could not read (and for a writer that raced this scan):
@@ -8865,12 +8892,13 @@ impl LibraryScanner {
         .await?;
         self.persist_audiobook_chapters(&entity, &rows, cancel)
             .await?;
-        // A new video needs its first item save for the trickplay FK. Finish
-        // its metadata refresh stamp only after the custom provider returns;
-        // ordinary custom-provider errors still complete; cancellation stops it.
+        // A new video needs its first item save for the trickplay FK, so its
+        // custom provider runs here, before the stamp; ordinary
+        // custom-provider errors still complete, and a cancel (its only
+        // `false`) withholds the stamp below.
         if new_trickplay && let (Some(provider), Some(library)) = (&self.trickplay, policy.options)
         {
-            let finished = provider
+            provider
                 .refresh(
                     item.id,
                     &entity,
@@ -8880,20 +8908,27 @@ impl LibraryScanner {
                     cancel,
                 )
                 .await;
-            if !finished || cancel.is_cancelled() {
-                return Ok(ItemSaved::Cancelled);
-            }
-            if decision.stamp_refreshed && !music_pending {
-                entity.date_last_refreshed = Some(Utc::now());
-                self.persistence
-                    .save_scanned_items(std::slice::from_ref(&entity))
-                    .await?;
-            }
         }
         if let Some(images) = artwork.filter(|_| images_changed)
             && let Err(err) = self.persistence.save_item_images(item.id, &images).await
         {
             tracing::warn!(%err, item = %item.id, "failed to persist discovered artwork");
+        }
+        // A cancel may have cut the chapters, the subtitle downloads or the
+        // trickplay short, so it leaves the row unstamped. Otherwise the
+        // stamp this refresh earned is written, or the stored one is put
+        // back: a refresh with a failed provider keeps it, and an album's or
+        // artist's is the music pass's to write. Only that column: the row's
+        // save moved `DateLastSaved`, and so the Etag, once.
+        let stamp = if decision.stamp_refreshed && !music_pending {
+            Some(Utc::now())
+        } else {
+            kept_stamp
+        };
+        if !cancel.is_cancelled() && stamp.is_some() {
+            self.persistence
+                .set_date_last_refreshed(item.id, stamp)
+                .await?;
         }
         self.save_metadata_sidecars(
             item.id,
