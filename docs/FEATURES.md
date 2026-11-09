@@ -103,6 +103,11 @@ Checked against a real Jellyfin server by the retired v2 runtime diff:
     bracket (`scale=(iw*2):ih)`), which ffmpeg's expression parser rejects, so the
     transcode never starts. Ferrofin emits the balanced form, which Jellyfin's own image
     extraction has used since 12.3.
+  - **Accepted divergence (a fix, not a gap):** a video rotated by 90 degrees (a portrait
+    phone video) is sized at its displayed size. Jellyfin sizes it at its stored, landscape
+    size: asked for a bitrate at or above the source's with no size, it shrinks a
+    1080x1920 video to 606x1080, and its playlist `RESOLUTION` reads landscape (720x405
+    for a 720x1280 encode). Ferrofin keeps the 1080x1920 and reports the size it encodes.
 - **Hardware transcoding** — **NVENC, VAAPI and QSV**. Decode, scale, deinterlace, rotate,
   HDR→SDR tonemap and subtitle compositing all run on the GPU where the driver supports
   it, with the pipeline chosen from a runtime probe of the device rather than from

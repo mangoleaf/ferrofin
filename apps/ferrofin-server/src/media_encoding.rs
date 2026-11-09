@@ -354,7 +354,6 @@ pub fn build_media_encoding(
         Arc::clone(&config),
         Arc::clone(&paths),
         Arc::clone(&subtitles),
-        ffmpeg.supports_filter("tonemapx"),
     )
     .with_attachments(Arc::clone(&attachments), path_manager);
     let planner = match library {
