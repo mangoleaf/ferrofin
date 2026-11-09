@@ -399,7 +399,7 @@ fn tracer_provider_for(
 
     let resource = Resource::builder()
         .with_service_name("ferrofin")
-        .with_attribute(KeyValue::new("service.version", env!("CARGO_PKG_VERSION")))
+        .with_attribute(KeyValue::new("service.version", crate::service_version()))
         .build();
 
     // ParentBased(TraceIdRatioBased): honour an upstream sampling decision when

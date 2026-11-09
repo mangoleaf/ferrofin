@@ -172,7 +172,10 @@ impl GuestHttp {
             builder
                 .timeout(call_timeout)
                 .redirect(reqwest::redirect::Policy::none())
-                .user_agent(concat!("ferrofin-wasm/", env!("CARGO_PKG_VERSION")))
+                .user_agent(format!(
+                    "ferrofin-wasm/{}",
+                    ferrofin_health::RELEASE_VERSION
+                ))
                 .build()
                 .map_err(|e| format!("building the guest http client: {e}"))
         };
@@ -217,7 +220,10 @@ fn pinned_client(
     reqwest::blocking::Client::builder()
         .timeout(call_timeout)
         .redirect(reqwest::redirect::Policy::none())
-        .user_agent(concat!("ferrofin-wasm/", env!("CARGO_PKG_VERSION")))
+        .user_agent(format!(
+            "ferrofin-wasm/{}",
+            ferrofin_health::RELEASE_VERSION
+        ))
         // Port 0 = "keep the URL's port"; only the address pins.
         .resolve(host, std::net::SocketAddr::new(vetted, 0))
         .build()
