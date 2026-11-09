@@ -3014,12 +3014,13 @@ pub const VERIFIED: &[Verified] = &[
                (LibraryManager.GetVirtualFolders(true) and GetVirtualFolderInfo: \
                is_directory for Directory.EnumerateDirectories, resolve_locations and \
                resolve_shortcut for the Locations and their culture sort, \
-               read_collection_type, load_options for CollectionFolder.GetLibraryOptions \
-               and LoadLibraryOptions' ExpandVirtualPath, scan_progress for \
+               read_collection_type, load_options and stored_options for \
+               CollectionFolder.GetLibraryOptions and LoadLibraryOptions (its defaults, \
+               its error log, its ExpandVirtualPath), scan_progress for \
                RefreshProgress and RefreshStatus) → ferrofin-model entities_media.rs \
                VirtualFolderInfo, configuration.rs LibraryOptions, TypeOptions, \
                ImageOption, MediaPathInfo",
-        date: "2026-10-28",
+        date: "2026-11-09",
         divergences: &[
             "An unreadable shortcut is logged at error the first time a listing meets it and \
          at debug while it stays unreadable; upstream logs it at error on every listing. \
@@ -3036,9 +3037,13 @@ pub const VERIFIED: &[Verified] = &[
          library's locations, and a later listing writes any other row.",
             "An empty .mblink is dropped; upstream filters only nulls, so it lists an empty \
          location, which names no folder. Jellyfin bug not ported.",
-            "An options.json that does not parse serves the defaults without a log entry; \
-         upstream also serves the defaults for a bad options.xml but logs it at error. Fix \
-         path: gl-271.",
+            "An options.json that cannot be read or parsed serves the defaults, logged at \
+         error the first time a read meets it and at debug while it stays so. Upstream \
+         caches the options per library and logs a parse or permission failure at error \
+         once per cache fill (a library-structure change clears it), and any other I/O \
+         failure (an IOException) not at all. The listing reads the file on every \
+         dashboard load, and docs/conventions/LOGGING.md rule 1 keeps a level whose \
+         volume scales with the request rate out of error.",
             "The 401 and 403 bodies are Ferrofin's error shape, not upstream's. Fix path: \
          gl-666.",
         ],
