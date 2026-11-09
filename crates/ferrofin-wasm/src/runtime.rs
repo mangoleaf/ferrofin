@@ -23,20 +23,30 @@
 //! queue full and stall a `run-task` call or a scan's per-item
 //! `metadata-lookup` until it drains. That is bounded in practice by the
 //! per-call deadline (each queued call still trips it, driving the
-//! breaker; [`arm_deadline`] holds WASI clock waits to it as well as wasm
-//! code, though not a host function with no bound of its own), but a
-//! genuinely slow-not-failing metadata plugin can drag a scan. If that ever
-//! bites, give lookups a `try_send` + "plugin busy — skip this item" fast
-//! path rather than making them wait.
+//! breaker; [`InstanceSpec::arm_deadline`] holds wasm code, WASI clock
+//! waits and the bounded host waits to it), but a genuinely
+//! slow-not-failing metadata plugin can drag a scan. If that ever bites,
+//! give lookups a `try_send` + "plugin busy — skip this item" fast path
+//! rather than making them wait.
 //!
 //! **Containment:** a trap, deadline overrun, or memory-cap hit fails only
 //! the one call; the actor rebuilds a fresh instance for the next call. After
 //! [`BREAKER_LIMIT`] consecutive failures the plugin is declared dead for the
 //! rest of the process (commands are refused, events discarded) — the same
 //! circuit-breaker shape as the HLS transcode restart breaker.
+//!
+//! **The watchdog:** a host function that blocks past the deadline (one with
+//! no bound of its own, such as a database write) parks the thread where the
+//! deadline cannot reach it. So every caller waits under a [`CallWatch`]: once
+//! the call the thread is running outlives its deadline by the grace
+//! (`FERROFIN_WASM_CALL_GRACE_SECS`), the call is lost, the plugin is
+//! declared dead and its thread and store are abandoned until restart. The
+//! watch times a call from when it starts running, never from when it was
+//! queued.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 
 use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::mpsc::{Receiver, Sender};
@@ -84,6 +94,118 @@ pub const EPOCH_TICK: std::time::Duration = std::time::Duration::from_secs(1);
 #[must_use]
 pub fn web_request_slots(queue_capacity: usize) -> usize {
     (queue_capacity / 2).max(1)
+}
+
+/// The deadline of the guest call a plugin's thread is running, shared with
+/// everyone waiting on that thread: the caller-side watchdog.
+///
+/// [`InstanceSpec::arm_deadline`] sets it as each guest call (or
+/// instantiation) starts; the runtime thread clears it between calls. A
+/// waiter declares the call lost once it outlives that deadline by the grace,
+/// which must exceed one [`EPOCH_TICK`]: a guest within its budget is
+/// interrupted within a tick of its deadline and every bounded host wait is
+/// held to the deadline, so only a wait that ignores it is ever declared lost.
+#[derive(Debug)]
+pub struct CallWatch {
+    deadline: std::sync::Mutex<Option<Instant>>,
+    budget: Duration,
+    grace: Duration,
+}
+
+impl CallWatch {
+    /// A watch for calls of `budget` (the per-call timeout) that are lost
+    /// `grace` past their deadline.
+    #[must_use]
+    pub fn new(budget: Duration, grace: Duration) -> Self {
+        Self {
+            deadline: std::sync::Mutex::new(None),
+            budget,
+            grace,
+        }
+    }
+
+    /// The grace a call gets past its deadline.
+    #[must_use]
+    pub fn grace(&self) -> Duration {
+        self.grace
+    }
+
+    fn set(&self, deadline: Option<Instant>) {
+        *self
+            .deadline
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = deadline;
+    }
+
+    /// When the running call counts as lost; `None` between calls.
+    fn lost_at(&self) -> Option<Instant> {
+        let deadline = *self
+            .deadline
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        deadline.and_then(|deadline| deadline.checked_add(self.grace))
+    }
+
+    /// When a waiter looks again: when the running call would be lost, or,
+    /// between calls, one whole budget and grace from now (a call that starts
+    /// meanwhile cannot be lost any sooner).
+    fn next_check(&self) -> Instant {
+        self.lost_at()
+            .unwrap_or_else(|| Instant::now() + self.budget + self.grace)
+    }
+
+    /// Whether the running call has outlived its deadline by the grace.
+    #[must_use]
+    pub fn is_lost(&self) -> bool {
+        self.lost_at().is_some_and(|at| Instant::now() >= at)
+    }
+}
+
+/// Why [`run_watched`] has no result.
+#[derive(Debug)]
+pub(crate) enum Unwatched {
+    /// The guest call outlived its deadline by the grace; the thread was
+    /// abandoned.
+    Lost,
+    /// The work panicked (the panic hook logged it).
+    Panicked,
+    /// The OS refused a thread.
+    NoThread(std::io::Error),
+}
+
+/// Runs `work` (loading or validating one plugin) on a thread of its own and
+/// waits while the guest calls it makes, stamped on `watch`, keep within
+/// their deadline plus the grace. A lost call abandons the thread with
+/// whatever store it holds, so the caller never waits on it again. The time
+/// before the first guest call (compiling the component) is not watched.
+///
+/// # Errors
+/// [`Unwatched`]: the call was lost, the work panicked, or no thread could
+/// be spawned.
+pub(crate) fn run_watched<T: Send + 'static>(
+    watch: &CallWatch,
+    work: impl FnOnce() -> T + Send + 'static,
+) -> Result<T, Unwatched> {
+    let (tx, rx) = std::sync::mpsc::sync_channel(1);
+    std::thread::Builder::new()
+        .name("wasm-plugin-load".to_owned())
+        .spawn(move || {
+            let _ = tx.send(work());
+        })
+        .map_err(Unwatched::NoThread)?;
+    loop {
+        let wait = watch.next_check().saturating_duration_since(Instant::now());
+        match rx.recv_timeout(wait) {
+            Ok(out) => return Ok(out),
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                return Err(Unwatched::Panicked);
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) if watch.is_lost() => {
+                return Err(Unwatched::Lost);
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+        }
+    }
 }
 
 /// Why [`RuntimeHandle::handle_request`] produced no guest response.
@@ -196,6 +318,8 @@ pub struct InstanceSpec {
     pub memory_limit_bytes: usize,
     /// Guest-call deadline in epoch ticks (1 tick = [`EPOCH_TICK`]).
     pub timeout_ticks: u64,
+    /// Where each guest call's deadline is published for the watchdog.
+    pub watch: Arc<CallWatch>,
     /// The shared blocking HTTP client behind `http-fetch`.
     pub http: Arc<crate::capabilities::GuestHttp>,
     /// Whether this plugin may reach private/loopback HTTP destinations.
@@ -254,68 +378,137 @@ impl InstanceSpec {
         store.limiter(|state| &mut state.limits);
         // Instantiation itself runs guest code (start sections, allocators),
         // so it gets a deadline too. Loading's identity calls share it.
-        arm_deadline(&mut store, self.timeout_ticks);
+        self.arm_deadline(&mut store);
         let plugin = Plugin::instantiate(&mut store, &self.component, &self.linker)?;
         Ok((store, plugin))
     }
-}
 
-/// Starts a guest call's time budget of `ticks` [`EPOCH_TICK`]s: the epoch
-/// deadline that interrupts wasm code (to within one tick), and the
-/// wall-clock instant that caps the guest's WASI clock waits (host code,
-/// which epochs never interrupt; see
-/// [`DeadlineClocks`](crate::bindings::DeadlineClocks)).
-pub fn arm_deadline(store: &mut Store<HostState>, ticks: u64) {
-    store.set_epoch_deadline(ticks);
-    let budget = EPOCH_TICK.saturating_mul(u32::try_from(ticks).unwrap_or(u32::MAX));
-    let now = std::time::Instant::now();
-    // Unrepresentable only for a budget of centuries; fail closed (no waits).
-    store.data_mut().call_deadline = now.checked_add(budget).unwrap_or(now);
+    /// Starts a guest call's time budget of [`timeout_ticks`](Self::timeout_ticks)
+    /// [`EPOCH_TICK`]s: the epoch deadline that interrupts wasm code (to
+    /// within one tick), and the wall-clock instant that caps the guest's
+    /// WASI clock waits and bounded host waits (host code, which epochs never
+    /// interrupt; see [`DeadlineClocks`](crate::bindings::DeadlineClocks)).
+    /// The instant is also published on the [`watch`](Self::watch).
+    pub fn arm_deadline(&self, store: &mut Store<HostState>) {
+        store.set_epoch_deadline(self.timeout_ticks);
+        let budget =
+            EPOCH_TICK.saturating_mul(u32::try_from(self.timeout_ticks).unwrap_or(u32::MAX));
+        let now = Instant::now();
+        // Unrepresentable only for a budget of centuries; fail closed (no waits).
+        let deadline = now.checked_add(budget).unwrap_or(now);
+        store.data_mut().call_deadline = deadline;
+        self.watch.set(Some(deadline));
+    }
 }
 
 /// The sending half owned by the host: a bounded queue into the plugin's
-/// runtime thread plus the shared dead flag.
+/// runtime thread plus the shared dead flag and call watch.
 pub struct RuntimeHandle {
     sender: Sender<Command>,
     dead: Arc<AtomicBool>,
+    /// The deadline of the call the thread is running (the watchdog).
+    watch: Arc<CallWatch>,
     /// The [`web_request_slots`] that web requests take before queueing.
     web_slots: Arc<tokio::sync::Semaphore>,
     plugin_name: String,
+    plugin_id: String,
 }
 
 impl RuntimeHandle {
-    /// Whether the breaker has permanently tripped for this plugin.
+    /// Whether the plugin is disabled until restart: the breaker tripped, or
+    /// a call was lost. Asking is enough to find a lost call, so no reader
+    /// (event delivery, the analysis pass) takes a stuck plugin for alive
+    /// just because no caller is waiting on it.
     #[must_use]
     pub fn is_dead(&self) -> bool {
-        self.dead.load(Ordering::Relaxed)
+        self.dead.load(Ordering::Relaxed) || self.lost()
+    }
+
+    /// Whether the call the thread is running is lost; the first to find it
+    /// disables the plugin and says so.
+    fn lost(&self) -> bool {
+        if !self.watch.is_lost() {
+            return false;
+        }
+        if !self.dead.swap(true, Ordering::Relaxed) {
+            warn!(
+                plugin = self.plugin_name,
+                plugin_id = self.plugin_id,
+                grace_secs = self.watch.grace().as_secs(),
+                "wasm plugin call outlived its deadline plus the grace; \
+                 plugin disabled until restart and its thread abandoned"
+            );
+        }
+        true
+    }
+
+    /// The error every call to a disabled plugin gets.
+    fn disabled(&self) -> String {
+        format!("plugin `{}` is disabled until restart", self.plugin_name)
+    }
+
+    /// Awaits `step` (room in the queue, or a reply) while the call the
+    /// plugin's thread is running stays within its deadline plus the grace.
+    /// Past that the call is lost: the plugin is disabled until restart and
+    /// its thread, stuck in host code, is abandoned with its store. Every
+    /// other waiter fails at the same moment, so nothing queued behind the
+    /// stuck call waits forever either.
+    async fn watched<T>(&self, step: impl std::future::Future<Output = T>) -> Result<T, String> {
+        let mut step = std::pin::pin!(step);
+        loop {
+            tokio::select! {
+                biased;
+                out = &mut step => return Ok(out),
+                () = tokio::time::sleep_until(self.watch.next_check().into()) => {}
+            }
+            if self.lost() {
+                return Err(format!(
+                    "plugin `{}` did not finish a call within its deadline plus the {} s \
+                     grace; it is disabled until restart",
+                    self.plugin_name,
+                    self.watch.grace().as_secs()
+                ));
+            }
+            // Lost by another waiter: the thread may never answer.
+            if self.is_dead() {
+                return Err(self.disabled());
+            }
+        }
+    }
+
+    /// Queues `command` and awaits `rx`, both under the watchdog.
+    async fn call<T>(
+        &self,
+        command: Command,
+        rx: tokio::sync::oneshot::Receiver<Result<T, String>>,
+        what: &str,
+    ) -> Result<T, String> {
+        if self.is_dead() {
+            return Err(self.disabled());
+        }
+        // Async send: a queue full of pending events suspends this future —
+        // it never parks the tokio worker the way a blocking send would.
+        self.watched(self.sender.send(command))
+            .await?
+            .map_err(|_| "plugin runtime thread has exited".to_owned())?;
+        self.watched(rx)
+            .await?
+            .map_err(|_| format!("plugin runtime dropped the {what} reply"))?
     }
 
     /// Queues a task run and awaits its outcome.
     ///
     /// # Errors
-    /// The guest's error text, the breaker being open, or the runtime thread
-    /// being gone.
+    /// The guest's error text, the plugin being disabled, a lost call, or the
+    /// runtime thread being gone.
     pub async fn run_task(&self, task_id: String, config: String) -> Result<(), String> {
-        if self.is_dead() {
-            return Err(format!(
-                "plugin `{}` is disabled until restart after {BREAKER_LIMIT} consecutive failures",
-                self.plugin_name
-            ));
-        }
         let (reply, rx) = tokio::sync::oneshot::channel();
-        // Async send: a queue full of pending events suspends this future
-        // (bounded wait, the actor is draining) — it never parks the tokio
-        // worker the way a blocking send would.
-        self.sender
-            .send(Command::RunTask {
-                task_id,
-                config,
-                reply,
-            })
-            .await
-            .map_err(|_| "plugin runtime thread has exited".to_owned())?;
-        rx.await
-            .map_err(|_| "plugin runtime dropped the task reply".to_owned())?
+        let command = Command::RunTask {
+            task_id,
+            config,
+            reply,
+        };
+        self.call(command, rx, "task").await
     }
 
     /// Routes one HTTP request to the guest and awaits its response.
@@ -328,18 +521,15 @@ impl RuntimeHandle {
     ///
     /// # Errors
     /// [`RequestError::Busy`] when the plugin has no room for the request;
-    /// [`RequestError::Failed`] with the guest/host error text, the breaker
-    /// being open, or the runtime thread being gone.
+    /// [`RequestError::Failed`] with the guest/host error text, the plugin
+    /// being disabled, a lost call, or the runtime thread being gone.
     pub async fn handle_request(
         &self,
         request: crate::bindings::types::PluginRequest,
         config: String,
     ) -> Result<crate::bindings::types::PluginResponse, RequestError> {
         if self.is_dead() {
-            return Err(RequestError::Failed(format!(
-                "plugin `{}` is disabled until restart after {BREAKER_LIMIT} consecutive failures",
-                self.plugin_name
-            )));
+            return Err(RequestError::Failed(self.disabled()));
         }
         let busy = || {
             RequestError::Busy(format!(
@@ -365,7 +555,9 @@ impl RuntimeHandle {
                 ));
             }
         }
-        rx.await
+        self.watched(rx)
+            .await
+            .map_err(RequestError::Failed)?
             .map_err(|_| {
                 RequestError::Failed("plugin runtime dropped the request reply".to_owned())
             })?
@@ -375,90 +567,60 @@ impl RuntimeHandle {
     /// Offers the guest one item for media analysis and awaits its outcome.
     ///
     /// # Errors
-    /// The guest's error text, the breaker being open, or the runtime
-    /// thread being gone.
+    /// The guest's error text, the plugin being disabled, a lost call, or the
+    /// runtime thread being gone.
     pub async fn scan_media(
         &self,
         item: crate::bindings::types::ItemSummary,
         config: String,
     ) -> Result<ScanMediaOutcome, String> {
-        if self.is_dead() {
-            return Err(format!(
-                "plugin `{}` is disabled until restart after {BREAKER_LIMIT} consecutive failures",
-                self.plugin_name
-            ));
-        }
         let (reply, rx) = tokio::sync::oneshot::channel();
-        self.sender
-            .send(Command::ScanMedia {
-                item,
-                config,
-                reply,
-            })
-            .await
-            .map_err(|_| "plugin runtime thread has exited".to_owned())?;
-        rx.await
-            .map_err(|_| "plugin runtime dropped the scan reply".to_owned())?
+        let command = Command::ScanMedia {
+            item,
+            config,
+            reply,
+        };
+        self.call(command, rx, "scan").await
     }
 
     /// Asks the guest for artwork candidates and awaits them.
     ///
     /// # Errors
-    /// The guest's error text, the breaker being open, or the runtime
-    /// thread being gone.
+    /// The guest's error text, the plugin being disabled, a lost call, or the
+    /// runtime thread being gone.
     pub async fn remote_images(
         &self,
         item: crate::bindings::types::ItemSummary,
         config: String,
     ) -> Result<Vec<crate::bindings::types::ImageCandidate>, String> {
-        if self.is_dead() {
-            return Err(format!(
-                "plugin `{}` is disabled until restart after {BREAKER_LIMIT} consecutive failures",
-                self.plugin_name
-            ));
-        }
         let (reply, rx) = tokio::sync::oneshot::channel();
-        self.sender
-            .send(Command::RemoteImages {
-                item,
-                config,
-                reply,
-            })
-            .await
-            .map_err(|_| "plugin runtime thread has exited".to_owned())?;
-        rx.await
-            .map_err(|_| "plugin runtime dropped the images reply".to_owned())?
+        let command = Command::RemoteImages {
+            item,
+            config,
+            reply,
+        };
+        self.call(command, rx, "images").await
     }
 
     /// Asks the guest for metadata on one item and awaits its offer.
     ///
     /// # Errors
-    /// The guest's error text, the breaker being open, or the runtime thread
-    /// being gone.
+    /// The guest's error text, the plugin being disabled, a lost call, or the
+    /// runtime thread being gone.
     pub async fn metadata_lookup(
         &self,
         item: crate::bindings::types::ItemSummary,
         provider_ids: Vec<(String, String)>,
         config: String,
     ) -> Result<Option<crate::bindings::types::MetadataResult>, String> {
-        if self.is_dead() {
-            return Err(format!(
-                "plugin `{}` is disabled until restart after {BREAKER_LIMIT} consecutive failures",
-                self.plugin_name
-            ));
-        }
         let (reply, rx) = tokio::sync::oneshot::channel();
-        self.sender
-            .send(Command::MetadataLookup {
-                item,
-                provider_ids,
-                config,
-                reply,
-            })
-            .await
-            .map_err(|_| "plugin runtime thread has exited".to_owned())?;
-        rx.await
-            .map_err(|_| "plugin runtime dropped the lookup reply".to_owned())?
+        let command = Command::MetadataLookup {
+            item,
+            provider_ids,
+            config,
+            reply,
+        };
+        self.call(command, rx, "lookup").await
     }
 
     /// Delivers an event without waiting. A full queue or dead plugin drops
@@ -505,10 +667,12 @@ pub fn spawn(
     let handle = RuntimeHandle {
         sender,
         dead: Arc::clone(&dead),
+        watch: Arc::clone(&spec.watch),
         web_slots: Arc::new(tokio::sync::Semaphore::new(web_request_slots(
             queue_capacity,
         ))),
         plugin_name: spec.plugin_name.clone(),
+        plugin_id: spec.plugin_id.clone(),
     };
     // Named from the validated id: the descriptor name is guest-controlled,
     // and an interior NUL in a thread name panics `spawn`.
@@ -536,7 +700,12 @@ fn run_loop(
     let mut live = Some((store, plugin));
     let mut consecutive_failures: u32 = 0;
 
-    while let Some(command) = receiver.blocking_recv() {
+    loop {
+        // Between calls nothing runs, so there is no deadline to watch.
+        spec.watch.set(None);
+        let Some(command) = receiver.blocking_recv() else {
+            break;
+        };
         if dead.load(Ordering::Relaxed) {
             refuse(command, &spec.plugin_name);
             continue;
@@ -568,7 +737,7 @@ fn run_loop(
                 reply,
             } => {
                 store.data_mut().config_json = config;
-                arm_deadline(store, spec.timeout_ticks);
+                spec.arm_deadline(store);
                 match instance.call_run_task(&mut *store, &task_id) {
                     // Guest-reported failure: an orderly `err(string)`, not a
                     // trap — the instance is still healthy.
@@ -598,7 +767,7 @@ fn run_loop(
                 reply,
             } => {
                 store.data_mut().config_json = config;
-                arm_deadline(store, spec.timeout_ticks);
+                spec.arm_deadline(store);
                 match instance.call_remote_images(&mut *store, &item) {
                     Ok(outcome) => {
                         let _ = reply.send(outcome);
@@ -622,7 +791,7 @@ fn run_loop(
                 reply,
             } => {
                 store.data_mut().config_json = config;
-                arm_deadline(store, spec.timeout_ticks);
+                spec.arm_deadline(store);
                 match instance.call_metadata_lookup(&mut *store, &item, &provider_ids) {
                     // An orderly guest err(string) leaves the instance healthy.
                     Ok(outcome) => {
@@ -636,7 +805,7 @@ fn run_loop(
                 }
             }
             Command::OnEvent { name, json } => {
-                arm_deadline(store, spec.timeout_ticks);
+                spec.arm_deadline(store);
                 match instance.call_on_event(&mut *store, &name, &json) {
                     Ok(()) => false,
                     Err(trap) => {
@@ -680,7 +849,7 @@ fn trip_if_due(spec: &InstanceSpec, dead: &AtomicBool, consecutive_failures: u32
 /// Answers a command that will not be executed (dead plugin / broken state).
 #[allow(clippy::match_same_arms)] // arms differ by reply TYPE, not intent
 fn refuse(command: Command, plugin_name: &str) {
-    let message = format!("plugin `{plugin_name}` is disabled until restart (circuit breaker)");
+    let message = format!("plugin `{plugin_name}` is disabled until restart");
     match command {
         Command::RunTask { reply, .. } => {
             let _ = reply.send(Err(message));
@@ -714,7 +883,7 @@ fn dispatch_request(
     slot: tokio::sync::OwnedSemaphorePermit,
 ) -> bool {
     store.data_mut().config_json = config;
-    arm_deadline(store, spec.timeout_ticks);
+    spec.arm_deadline(store);
     let outcome = instance.call_handle_request(&mut *store, request);
     // Free the web slot before answering, so the caller's next request never
     // finds it still taken.
@@ -744,7 +913,7 @@ fn dispatch_scan(
 ) -> bool {
     store.data_mut().config_json = config;
     store.data_mut().segment_policy_skipped = false;
-    arm_deadline(store, spec.timeout_ticks);
+    spec.arm_deadline(store);
     match instance.call_scan_media(&mut *store, item) {
         Ok(outcome) => {
             let _ = reply.send(Ok(ScanMediaOutcome {
@@ -765,9 +934,70 @@ fn dispatch_scan(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
     use rstest::rstest;
 
-    use super::web_request_slots;
+    use super::{CallWatch, Unwatched, run_watched, web_request_slots};
+
+    const BUDGET: Duration = Duration::from_millis(200);
+    const GRACE: Duration = Duration::from_millis(800);
+
+    /// Work that starts a guest call (publishes its deadline) and then
+    /// blocks for `blocked`, the way a guest stuck in a host function does.
+    fn call_blocking_for(
+        watch: &Arc<CallWatch>,
+        blocked: Duration,
+    ) -> impl FnOnce() -> &'static str + Send + 'static {
+        let watch = Arc::clone(watch);
+        move || {
+            watch.set(Some(Instant::now() + BUDGET));
+            std::thread::sleep(blocked);
+            "done"
+        }
+    }
+
+    #[test]
+    fn a_call_within_its_deadline_plus_grace_finishes() {
+        let watch = Arc::new(CallWatch::new(BUDGET, GRACE));
+        // Past the deadline, well inside the grace.
+        let work = call_blocking_for(&watch, BUDGET + GRACE / 4);
+        assert_eq!(run_watched(&watch, work).unwrap(), "done");
+    }
+
+    #[test]
+    fn a_call_past_its_deadline_plus_grace_is_lost_and_abandoned() {
+        let watch = Arc::new(CallWatch::new(BUDGET, GRACE));
+        let started = Instant::now();
+        let work = call_blocking_for(&watch, Duration::from_secs(30));
+        assert!(matches!(run_watched(&watch, work), Err(Unwatched::Lost)));
+        let waited = started.elapsed();
+        assert!(waited >= BUDGET + GRACE, "{waited:?}");
+        assert!(waited < Duration::from_secs(5), "{waited:?}");
+    }
+
+    #[test]
+    fn work_before_the_first_guest_call_is_not_timed() {
+        // Compiling a component publishes no deadline: however long it
+        // takes, nothing is lost.
+        let watch = Arc::new(CallWatch::new(BUDGET, GRACE));
+        let work = || {
+            std::thread::sleep(BUDGET + GRACE * 2);
+            "compiled"
+        };
+        assert_eq!(run_watched(&watch, work).unwrap(), "compiled");
+    }
+
+    #[test]
+    fn panicking_work_is_reported() {
+        let watch = CallWatch::new(BUDGET, GRACE);
+        let work = || -> u8 { panic!("load blew up") };
+        assert!(matches!(
+            run_watched(&watch, work),
+            Err(Unwatched::Panicked)
+        ));
+    }
 
     #[rstest]
     #[case::default_queue(256, 128)]

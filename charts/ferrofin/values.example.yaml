@@ -262,6 +262,7 @@ ferrofin:
     # plugin uses a few MiB (the memory limit is a ceiling, never a
     # reservation). Zero = unset.
     # FERROFIN_WASM_CALL_TIMEOUT_SECS: "30"     # per-call deadline for a plugin
+    # FERROFIN_WASM_CALL_GRACE_SECS: "10"       # wait past it before a stuck plugin is disabled
     # FERROFIN_WASM_MEMORY_LIMIT_MB: "128"      # per-plugin memory cap
     # FERROFIN_WASM_EVENT_QUEUE_CAPACITY: "256" # per-plugin event queue depth
     # FERROFIN_MAX_PLUGIN_DOWNLOAD_MB: "128"    # repository-install artifact size cap

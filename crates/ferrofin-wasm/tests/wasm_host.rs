@@ -98,11 +98,13 @@ fn manager() -> Arc<dyn PluginManager> {
     Arc::new(EnabledStub)
 }
 
-/// Small settings so the containment tests run fast: 1 s deadline, 2 MiB
-/// memory cap (32 pages — the fixture's +96-page grow must be denied).
+/// Small settings so the containment tests run fast: 1 s deadline and the
+/// least grace (2 s), 2 MiB memory cap (32 pages — the fixture's +96-page
+/// grow must be denied).
 fn tight_settings() -> WasmSettings {
     WasmSettings {
         call_timeout_secs: 1,
+        call_grace_secs: 2,
         memory_limit_mb: 2,
         event_queue_capacity: 8,
         state_limit_mb: 8,
@@ -710,6 +712,303 @@ fn a_descriptor_waiting_on_a_wasi_clock_cannot_hang_loading() {
     );
 }
 
+/// The fixture plus two real `ferrofin:plugin/host` imports. Extra
+/// `run-task` ids: `hold` reads a state key (`get-state`, a file read with no
+/// bound of its own) and succeeds; `xsub` extracts a subtitle track
+/// (`extract-subtitle-track`, a bounded host wait) and answers with its
+/// error, if any.
+fn host_caller_wat() -> String {
+    let prelude = r#"
+  (type $host-interface (instance
+    (type $get-state (func (param "key" string) (result (option (list u8)))))
+    (export "get-state" (func (type $get-state)))
+    (type $extract (func (param "item-id" string) (param "stream-index" u32) (result (result (list u8) (error string)))))
+    (export "extract-subtitle-track" (func (type $extract)))
+  ))
+  (import "ferrofin:plugin/host@0.5.0" (instance $host (type $host-interface)))
+  (alias export $host "get-state" (func $get-state))
+  (alias export $host "extract-subtitle-track" (func $extract))
+  (core module $mem
+    (memory (export "memory") 1)
+    (global $bump (mut i32) (i32.const 32768))
+    (func (export "realloc") (param i32 i32 i32 i32) (result i32)
+      (local $ret i32)
+      (local.set $ret (global.get $bump))
+      (global.set $bump (i32.add (global.get $bump) (local.get 3)))
+      (local.get $ret)))
+  (core instance $mem (instantiate $mem))
+  (core func $get-state (canon lower (func $get-state) (memory (core memory $mem "memory")) (realloc (core func $mem "realloc")) string-encoding=utf8))
+  (core func $extract (canon lower (func $extract) (memory (core memory $mem "memory")) (realloc (core func $mem "realloc")) string-encoding=utf8))
+  (core instance $host-lowered (export "get-state" (func $get-state)) (export "extract" (func $extract)))
+"#;
+    let imports = r#"(core module $m
+    (import "host" "get-state" (func $get-state (param i32 i32 i32)))
+    (import "host" "extract" (func $extract (param i32 i32 i32 i32)))"#;
+    let tasks = r#";; 'h'old: read state key "k", then ok
+      (if (i32.eq (i32.load8_u (local.get $ptr)) (i32.const 104))
+        (then
+          (call $get-state (i32.const 2112) (i32.const 1) (i32.const 2176))
+          (i32.store (i32.const 768) (i32.const 0))
+          (i32.store (i32.const 772) (i32.const 0))
+          (i32.store (i32.const 776) (i32.const 0))
+          (return (i32.const 768))))
+      ;; 'x'sub: extract stream 0 of the canned movie; its result tag and
+      ;; error string become the task's
+      (if (i32.eq (i32.load8_u (local.get $ptr)) (i32.const 120))
+        (then
+          (call $extract (i32.const 2048) (i32.const 36) (i32.const 0) (i32.const 2176))
+          (i32.store (i32.const 768) (i32.load8_u (i32.const 2176)))
+          (i32.store (i32.const 772) (i32.load (i32.const 2180)))
+          (i32.store (i32.const 776) (i32.load (i32.const 2184)))
+          (return (i32.const 768))))
+      ;; len-4 ids dispatch on the first byte"#;
+    FIXTURE_WAT
+        .replace(
+            "(memory (export \"memory\") 1)",
+            "(import \"mem\" \"memory\" (memory 1)) (export \"memory\" (memory 0))
+    (data (i32.const 2048) \"aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeff01\")
+    (data (i32.const 2112) \"k\")",
+        )
+        .replace("(core module $m", imports)
+        .replace(";; len-4 ids dispatch on the first byte", tasks)
+        .replace(
+            "(core instance $i (instantiate $m))",
+            "(core instance $i (instantiate $m (with \"mem\" (instance $mem)) (with \"host\" (instance $host-lowered))))",
+        )
+        .replace("(component", &format!("(component{prelude}"))
+}
+
+/// Makes `path` a FIFO no one writes to: opening it to read blocks forever,
+/// a host wait with no bound of its own.
+#[cfg(unix)]
+fn fifo(path: &std::path::Path) {
+    let status = std::process::Command::new("mkfifo")
+        .arg(path)
+        .status()
+        .expect("mkfifo runs");
+    assert!(status.success(), "mkfifo {}", path.display());
+}
+
+/// The fixture's state file, where `get-state` reads.
+fn fixture_state_file(dir: &std::path::Path) -> PathBuf {
+    dir.join("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeffff.state.json")
+}
+
+/// gl-600: a host wait with a bound of its own (here the analysis permit,
+/// which nothing frees) is cut at the call's deadline. The guest's epoch
+/// deadline has passed by then, so the call fails as an overrun: one breaker
+/// failure, never a lost call, and the plugin stays healthy.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_host_wait_cut_at_the_deadline_fails_the_call_as_an_overrun() {
+    init_test_logging();
+    let dir = tempfile::tempdir().unwrap();
+    write_fixture(dir.path(), "caller", &host_caller_wat());
+    let host = tokio::task::spawn_blocking({
+        let dir = dir.path().to_path_buf();
+        move || WasmPluginHost::load(&dir, &tight_settings())
+    })
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(host.plugins().len(), 1, "the caller fixture must load");
+    host.set_runtime_collaborators(ferrofin_wasm::capabilities::Collaborators {
+        lyrics: Arc::new(common::StubLyrics::default()),
+        subtitles: Arc::new(common::StubSubtitles::default()),
+        collections: Arc::new(common::StubCollections::default()),
+        media_streams: Arc::new(common::StubStreams),
+        extractor: Arc::new(common::StubExtractor::default()),
+        // No analysis permit is ever free.
+        analysis: Arc::new(tokio::sync::Semaphore::new(0)),
+        users: Arc::new(common::StubUsers),
+        user_data: Arc::new(common::StubUserData),
+        tv: Arc::new(common::StubTv),
+        handle: tokio::runtime::Handle::current(),
+        library: Arc::new(common::OneMovieLibrary {
+            seen: std::sync::Mutex::new(None),
+        }),
+        media_segments: Arc::new(common::RecordingSegments::default()),
+        plugins: manager(),
+    });
+    let plugin = &host.plugins()[0];
+
+    let started = std::time::Instant::now();
+    let err = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        plugin.run_task_for_test("xsub".to_owned()),
+    )
+    .await
+    .expect("the permit wait outlived the call deadline")
+    .unwrap_err();
+    // The guest is interrupted at its next check; only a late epoch ticker
+    // lets it return the host's error first.
+    assert!(
+        err.contains("wasm trap: interrupt") || err == ferrofin_wasm::capabilities::OUT_OF_TIME,
+        "{err}"
+    );
+    // Well before the 1 s deadline + 2 s grace that would lose the call.
+    assert!(
+        started.elapsed() < std::time::Duration::from_millis(2500),
+        "{:?}",
+        started.elapsed()
+    );
+    plugin.run_task_for_test("ok".to_owned()).await.unwrap();
+}
+
+/// gl-600: a call stuck in a host function with no bound of its own is lost
+/// at its deadline plus the grace: its caller and the call queued behind it
+/// fail, the plugin is disabled until restart, and its thread is abandoned.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_call_stuck_in_a_host_function_is_lost_and_disables_the_plugin() {
+    init_test_logging();
+    let dir = tempfile::tempdir().unwrap();
+    write_fixture(dir.path(), "caller", &host_caller_wat());
+    let host = tokio::task::spawn_blocking({
+        let dir = dir.path().to_path_buf();
+        move || WasmPluginHost::load(&dir, &tight_settings())
+    })
+    .await
+    .unwrap()
+    .unwrap();
+    let plugin = Arc::clone(&host.plugins()[0]);
+    fifo(&fixture_state_file(dir.path()));
+
+    let started = std::time::Instant::now();
+    let stuck = tokio::spawn({
+        let plugin = Arc::clone(&plugin);
+        async move { plugin.run_task_for_test("hold".to_owned()).await }
+    });
+    // Queued behind the stuck call; it must not wait forever either.
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    let queued = tokio::spawn({
+        let plugin = Arc::clone(&plugin);
+        async move { plugin.run_task_for_test("ok".to_owned()).await }
+    });
+    // A web request takes a slot without waiting for room, then waits too.
+    let web = tokio::spawn({
+        let plugin = Arc::clone(&plugin);
+        async move {
+            plugin
+                .handle_request_for_test(ferrofin_wasm::bindings::types::PluginRequest {
+                    method: "GET".to_owned(),
+                    path: "/ping".to_owned(),
+                    query: String::new(),
+                    headers: vec![],
+                    body: None,
+                    user_id: None,
+                    is_admin: false,
+                    is_authenticated: false,
+                })
+                .await
+        }
+    });
+    let bound = std::time::Duration::from_secs(10);
+    let err = tokio::time::timeout(bound, stuck)
+        .await
+        .expect("the stuck call was never declared lost")
+        .unwrap()
+        .unwrap_err();
+    // 1 s deadline + 2 s grace, timed from when the call started running.
+    assert!(
+        started.elapsed() >= std::time::Duration::from_secs(3),
+        "lost before deadline + grace: {:?}",
+        started.elapsed()
+    );
+    assert!(
+        err.contains("deadline plus the 2 s grace"),
+        "unexpected error: {err}"
+    );
+    let err = tokio::time::timeout(bound, queued)
+        .await
+        .expect("the queued call waited on the stuck thread")
+        .unwrap()
+        .unwrap_err();
+    assert!(err.contains("disabled until restart"), "{err}");
+    let err = tokio::time::timeout(bound, web)
+        .await
+        .expect("the web request waited on the stuck thread")
+        .unwrap()
+        .unwrap_err();
+    assert!(err.contains("disabled until restart"), "{err}");
+
+    // Disabled until restart: the next call fails at once.
+    let again = std::time::Instant::now();
+    let err = plugin.run_task_for_test("ok".to_owned()).await.unwrap_err();
+    assert!(err.contains("disabled until restart"), "{err}");
+    assert!(again.elapsed() < std::time::Duration::from_secs(1));
+}
+
+/// gl-600: the watch times a call from when it starts running, not from when
+/// it was queued: calls each well inside their budget, queued behind one
+/// another for longer than deadline plus grace, all succeed.
+#[tokio::test(flavor = "multi_thread")]
+async fn queued_calls_are_timed_from_when_they_start_running() {
+    let dir = tempfile::tempdir().unwrap();
+    // `nap!` sleeps 900 ms on a WASI clock, inside a 2 s budget.
+    let wat = clock_sleeper_wat().replace("(i64.const 10000000)", "(i64.const 900000000)");
+    write_fixture(dir.path(), "napper", &wat);
+    let settings = WasmSettings {
+        call_timeout_secs: 2,
+        ..tight_settings()
+    };
+    let host = tokio::task::spawn_blocking({
+        let dir = dir.path().to_path_buf();
+        move || WasmPluginHost::load(&dir, &settings)
+    })
+    .await
+    .unwrap()
+    .unwrap();
+    let plugin = Arc::clone(&host.plugins()[0]);
+
+    // Six naps: the last is queued about 4.5 s, past the 4 s deadline + grace.
+    let mut naps = tokio::task::JoinSet::new();
+    for _ in 0..6 {
+        let plugin = Arc::clone(&plugin);
+        naps.spawn(async move { plugin.run_task_for_test("nap!".to_owned()).await });
+    }
+    while let Some(outcome) = naps.join_next().await {
+        outcome.unwrap().unwrap();
+    }
+    plugin.run_task_for_test("ok".to_owned()).await.unwrap();
+}
+
+/// gl-600: boot loads each plugin under the watch, so a guest stuck in a
+/// host function while loading is skipped instead of holding up boot.
+#[cfg(unix)]
+#[test]
+fn a_plugin_stuck_in_a_host_function_while_loading_is_skipped() {
+    init_test_logging();
+    let dir = tempfile::tempdir().unwrap();
+    let wat = host_caller_wat().replace(
+        "(func (export \"default-config\") (result i32)",
+        "(func (export \"default-config\") (result i32)
+      (call $get-state (i32.const 2112) (i32.const 1) (i32.const 2176))",
+    );
+    write_fixture(dir.path(), "caller", &wat);
+    fifo(&fixture_state_file(dir.path()));
+    // A plain thread, not spawn_blocking: if load hangs, the test must fail
+    // rather than wait on the blocking pool's shutdown forever.
+    let (tx, rx) = std::sync::mpsc::channel();
+    let path = dir.path().to_path_buf();
+    let started = std::time::Instant::now();
+    std::thread::spawn(move || {
+        let _ = tx.send(WasmPluginHost::load(&path, &tight_settings()));
+    });
+    let host = rx
+        .recv_timeout(std::time::Duration::from_secs(10))
+        .expect("boot waited on a plugin stuck in a host function")
+        .unwrap();
+    assert!(
+        host.plugins().is_empty(),
+        "the stuck plugin must be skipped"
+    );
+    assert!(
+        started.elapsed() >= std::time::Duration::from_secs(3),
+        "skipped before deadline + grace: {:?}",
+        started.elapsed()
+    );
+}
+
 #[tokio::test]
 async fn metadata_lookup_flows_through_the_adapter_and_caches_the_gate() {
     let dir = tempfile::tempdir().unwrap();
@@ -771,6 +1070,7 @@ async fn metadata_lookup_flows_through_the_adapter_and_caches_the_gate() {
 fn settings_resolve_applies_defaults_and_ignores_zero() {
     let s = WasmSettings::resolve(None, None, None, None);
     assert_eq!(s.call_timeout_secs, 30);
+    assert_eq!(s.call_grace_secs, 10);
     assert_eq!(s.memory_limit_mb, 128);
     assert_eq!(s.event_queue_capacity, 256);
 
