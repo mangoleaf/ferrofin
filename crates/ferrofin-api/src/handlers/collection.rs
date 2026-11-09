@@ -87,7 +87,6 @@ async fn create_collection(
         name: query.name.unwrap_or_default(),
         parent_id: query.parent_id,
         is_locked: query.is_locked,
-        provider_ids: std::collections::HashMap::new(),
         item_id_list,
         user_ids,
     };
