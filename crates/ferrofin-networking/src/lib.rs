@@ -4,9 +4,9 @@
 //!
 //! - [`net_constants`] / [`net_utils`] — `MediaBrowser.Common.Net`
 //!   (`NetworkConstants` / `NetworkUtils`): RFC address ranges and the pure
-//!   IP/subnet math (CIDR parsing, containment, mask↔CIDR, FQDN/host parsing).
+//!   IP/subnet math (CIDR parsing, containment, FQDN/host parsing).
 //! - [`network_configuration`] — `MediaBrowser.Common.Net.NetworkConfiguration`
-//!   (the settings DTO, plus its store key).
+//!   (the settings DTO).
 //! - [`remote_access_policy_result`] —
 //!   `MediaBrowser.Common.Net.RemoteAccessPolicyResult`.
 //! - [`manager`] — `Jellyfin.Networking.Manager.NetworkManager`, the
@@ -14,7 +14,7 @@
 //! - [`network_change`] — the OS network-change notifications
 //!   (`System.Net.NetworkInformation.NetworkChange`) and the monitor that
 //!   refreshes the manager after them (`HandleNetworkChange`).
-//! - [`config_keys`] — the two startup keys inlined from
+//! - [`config_keys`] — the startup key inlined from
 //!   `MediaBrowser.Controller.Extensions.ConfigurationExtensions`.
 //! - [`logger`] — a minimal `ILogger` seam so the ported warning-substring
 //!   tests stay deterministic without pulling in `tracing`.
@@ -26,7 +26,6 @@
 //! `ferrofin-core`. HTTP connection racing is handled by reqwest.
 
 pub mod config_keys;
-pub mod error;
 mod interfaces;
 pub mod known_proxies;
 pub mod logger;
@@ -39,7 +38,6 @@ pub mod network_change;
 pub mod network_configuration;
 pub mod remote_access_policy_result;
 
-pub use error::NetworkingError;
 pub use known_proxies::KnownProxies;
 pub use logger::{Logger, NullLogger};
 pub use manager::{
