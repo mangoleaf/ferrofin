@@ -356,6 +356,8 @@ lint:
     # Debuginfo is useless in CI and is what blows the runner pod's 12Gi memory
     # limit: `--all-targets` links every test binary, 16 concurrent rust-lld's
     # OOM-kill the job mid-link (same rationale as the GitHub workflow).
+    # Cargo.toml's [profile.dev] already leaves dependencies without debuginfo;
+    # this also drops the workspace's line tables.
     CARGO_PROFILE_DEV_DEBUG: "0"
     # Cap parallel rustc/linker processes: the workspace has enough crates that
     # unrestricted parallelism peaks above 12Gi during the link phase.
@@ -472,7 +474,7 @@ coverage:
       - SHARD: [core, heavy, rest]
   variables:
     CARGO_HOME: $CI_PROJECT_DIR/.cargo
-    # Same 12Gi OOM as `lint` (see its variables): full-debuginfo links of the
+    # Same 12Gi OOM as `lint` (see its variables): debuginfo links of the
     # instrumented test binaries, many at once. Line coverage reads the coverage
     # mapping sections, not DWARF, so dropping debuginfo changes no percentage.
     CARGO_PROFILE_DEV_DEBUG: "0"
