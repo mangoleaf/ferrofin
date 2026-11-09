@@ -1232,7 +1232,7 @@ fn apply_probed_media_info(
 
 /// Materializes the `MediaStream` members C# computes in getters
 /// (`DisplayTitle`, `MediaStream.cs:265-331`; `VideoRange`/`VideoRangeType`/
-/// `AudioSpatialFormat`/`IsTextSubtitleStream`/`ReferenceFrameRate`) for
+/// `VideoDoViTitle`/`AudioSpatialFormat`/`IsTextSubtitleStream`/`ReferenceFrameRate`) for
 /// streams that are served without passing through [`stream_to_dto`] — probe
 /// output and tuner info for unopened Live TV channels, recordings and opened
 /// live streams.
@@ -1411,7 +1411,7 @@ pub(crate) fn stream_to_dto(row: MediaStreamInfoEntity) -> MediaStream {
     // fields so clients don't fall back to "Undefined".
     stream.display_title = stream.display_title();
     // Materialize the computed-property fields (VideoRange/VideoRangeType/
-    // AudioSpatialFormat/IsTextSubtitleStream/ReferenceFrameRate) Jellyfin serializes
+    // VideoDoViTitle/AudioSpatialFormat/IsTextSubtitleStream/ReferenceFrameRate) Jellyfin serializes
     // as getters — derived on every load, not persisted.
     stream.populate_computed_fields();
     // Port of `MediaSourceManager.StreamSupportsExternalStream`: stamp whether a
@@ -2148,6 +2148,11 @@ mod tests {
         assert_eq!(back.el_present_flag, Some(0));
         // The point of persisting DV: the derived range is DOVI, not plain HDR10.
         assert_eq!(back.video_range_type(), VideoRangeType::DoviWithHdr10);
+        // ...and the wire DTO carries the getter Jellyfin serializes.
+        assert_eq!(
+            back.video_dovi_title.as_deref(),
+            Some("Dolby Vision Profile 8.1 (HDR10)")
+        );
     }
 
     /// `MediaStreamRepository.Map` re-stamps the `Localized*` labels on every
