@@ -351,6 +351,7 @@ impl RunningJob {
                 paused: false,
                 stopped: false,
                 last_progress: None,
+                size_failure: None,
             })),
             run_time_ticks: state.run_time_ticks,
             start_time_ticks: state.base_request.start_time_ticks,
@@ -388,9 +389,38 @@ struct ThrottleController {
     paused: bool,
     stopped: bool,
     last_progress: Option<super::progress::FfmpegProgress>,
+    /// The progressive output-size failure last logged at `warn`; cleared by a
+    /// successful read.
+    size_failure: Option<String>,
 }
 
 impl ThrottleController {
+    /// The progressive output's size on disk, or `None` when it cannot be read,
+    /// which stops throttling the job (a paused job resumes).
+    ///
+    /// Every due timer reads it, so a failure is logged at `warn` the first time
+    /// it is seen and at `debug` while it repeats (LOGGING.md §1), as
+    /// [`EncodingOptionsReader`](crate::configuration::reader::EncodingOptionsReader)
+    /// does for the settings read. A successful read re-arms the warning.
+    fn output_length(&mut self, path: &str) -> Option<i64> {
+        match std::fs::metadata(path) {
+            Ok(metadata) => {
+                self.size_failure = None;
+                Some(i64::try_from(metadata.len()).unwrap_or(i64::MAX))
+            }
+            Err(error) => {
+                let error = error.to_string();
+                if self.size_failure.as_ref() == Some(&error) {
+                    tracing::debug!(path, %error, "cannot read the progressive transcode's output size");
+                } else {
+                    tracing::warn!(path, %error, "cannot read the progressive transcode's output size; not throttling it until it can be read");
+                    self.size_failure = Some(error);
+                }
+                None
+            }
+        }
+    }
+
     /// The job's pause keys, adopting ones the startup probe published after
     /// its timer was armed. A job that never got a timer (ineligible) never
     /// adopts keys.
@@ -874,13 +904,7 @@ impl<S: SessionReporter, C: FileCleaner> TranscodeManagerImpl<S, C> {
                 && progress.bytes_downloaded > 0
                 && progress.encoded.position_ticks.unwrap_or(0) > 0
             {
-                match std::fs::metadata(&handle.path) {
-                    Ok(metadata) => Some(i64::try_from(metadata.len()).unwrap_or(i64::MAX)),
-                    Err(error) => {
-                        tracing::error!(path = %handle.path, %error, "reading progressive transcode size failed");
-                        None
-                    }
-                }
+                controller.output_length(&handle.path)
             } else {
                 None
             };
@@ -4134,6 +4158,81 @@ pub(super) mod throttle_tests {
             .filter(|line| line.contains("cannot read the encoding configuration"))
             .count();
         assert_eq!(repeats, 2);
+    }
+
+    /// A progressive output the throttle cannot size is reported once at
+    /// `warn`, then at `debug` while it stays unreadable: the job carries on
+    /// unthrottled, as upstream's does, so an `error` per due timer would flood
+    /// the log (LOGGING.md §1). A successful read re-arms the warning.
+    #[tokio::test]
+    async fn an_unreadable_progressive_output_is_warned_about_once_not_every_tick() {
+        use crate::configuration::reader::tests::CapturedLogs;
+        async fn tick(
+            manager: &TranscodeManagerImpl<NoopSessionReporter>,
+            handle: &TranscodingJobHandle,
+        ) {
+            due(manager, handle).await;
+            manager
+                .update_transcoding_jobs_with_options(Some(&options(60)))
+                .await;
+        }
+        let (_directory, manager, child, handle) = fixture(Some(PauseKeys::Patched)).await;
+        // ffmpeg reports a position but no byte count and the client has
+        // downloaded bytes, so the tick sizes the output file (the progressive
+        // branch; the fixture's job type does not enter into it).
+        *child.progress.lock().unwrap() = Some(FfmpegProgress {
+            elapsed_ticks: Some(200 * TICKS_PER_SECOND),
+            framerate: Some(25.0),
+            bytes_transcoded: None,
+            bit_rate: None,
+        });
+        progress(&manager, &handle).lock().unwrap().bytes_downloaded = 100;
+        // The fixture's transcoder wrote the output; it disappears mid-job.
+        std::fs::remove_file(&handle.path).unwrap();
+        let warned = |logs: &CapturedLogs| {
+            logs.lines_at("WARN")
+                .into_iter()
+                .filter(|line| line.contains("progressive transcode"))
+                .count()
+        };
+
+        let logs = CapturedLogs::default();
+        let guard = logs.install();
+        for _ in 0..3 {
+            tick(&manager, &handle).await;
+        }
+        assert!(
+            logs.lines_at("ERROR").is_empty(),
+            "{:#?}",
+            logs.lines_at("ERROR")
+        );
+        assert_eq!(warned(&logs), 1, "{:#?}", logs.lines_at("WARN"));
+        let repeats = logs
+            .lines_at("DEBUG")
+            .into_iter()
+            .filter(|line| line.contains("progressive transcode"))
+            .count();
+        assert_eq!(repeats, 2);
+        assert!(child.events.lock().unwrap().is_empty(), "no size, no pause");
+
+        // 10000 bytes encoded against 100 downloaded is past the 60 s gap at
+        // 200 s encoded, so a good read pauses the job; losing the file again
+        // resumes it and warns again.
+        std::fs::write(&handle.path, [0u8; 10_000]).unwrap();
+        tick(&manager, &handle).await;
+        std::fs::remove_file(&handle.path).unwrap();
+        tick(&manager, &handle).await;
+        drop(guard);
+        assert_eq!(
+            *child.events.lock().unwrap(),
+            vec![b"p".to_vec(), b"u".to_vec()]
+        );
+        assert_eq!(
+            warned(&logs),
+            2,
+            "a good read re-arms the warning: {:#?}",
+            logs.lines_at("WARN")
+        );
     }
 
     /// A tick that panics ends that tick only: the controls loop logs it with
