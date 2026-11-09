@@ -108,26 +108,6 @@ impl FerrofinDeviceManager {
             .unwrap_or_default()
     }
 
-    /// Looks up a device by its (unique) session access token. Beyond the trait
-    /// surface because the trait's [`DeviceQuery`] has no token filter. The
-    /// request path does not use it: `AuthorizationContext` reads the device
-    /// with its own query (its private `device_by_token`).
-    ///
-    /// # Errors
-    /// Returns [`ServiceError::Db`] if the query fails.
-    pub async fn get_device_by_access_token(
-        &self,
-        token: &str,
-    ) -> Result<Option<DeviceEntity>, ServiceError> {
-        sqlx::query_as::<_, DeviceEntity>(
-            r#"SELECT * FROM "Devices" WHERE "AccessToken" = ?1 ORDER BY "Id" LIMIT 1"#,
-        )
-        .bind(token)
-        .fetch_optional(self.db.pool())
-        .await
-        .map_err(db_err)
-    }
-
     /// Reads a device options row by device id.
     async fn options_row(
         &self,
@@ -254,9 +234,9 @@ impl FerrofinDeviceManager {
     /// Applies a resolved [`DeviceAccess`] to one device id — the per-device
     /// half of `can_access_device`, with every query hoisted out of it.
     ///
-    /// The membership test matches `preference_contains` (ASCII
-    /// case-insensitive), and the empty-id rejection stays per device so a
-    /// listing still fails the way the per-device call failed.
+    /// The membership test is ASCII case-insensitive (C# `CanAccessDevice`),
+    /// and the empty-id rejection stays per device so a listing still fails
+    /// the way the per-device call failed.
     fn access_allows(&self, access: &DeviceAccess, device_id: &str) -> Result<bool, ServiceError> {
         if matches!(access, DeviceAccess::Unfiltered) {
             return Ok(true);
@@ -615,7 +595,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn create_then_query_and_token_lookup() {
+    async fn create_then_query() {
         let db = test_db().await;
         let uid = Uuid::from_u128(1);
         seed_user(&db, uid).await;
@@ -627,13 +607,6 @@ mod tests {
             .expect("create");
         assert!(created.id > 0);
 
-        let by_token = mgr
-            .get_device_by_access_token("tok-1")
-            .await
-            .expect("token lookup")
-            .expect("device found");
-        assert_eq!(by_token.device_id, "dev-1");
-
         let page = mgr
             .get_devices(&DeviceQuery {
                 user_id: Some(uid),
@@ -643,6 +616,8 @@ mod tests {
             .expect("query");
         assert_eq!(page.total_record_count, 1);
         assert_eq!(page.items.len(), 1);
+        assert_eq!(page.items[0].device_id, "dev-1");
+        assert_eq!(page.items[0].access_token, "tok-1");
     }
 
     #[tokio::test]

@@ -232,7 +232,7 @@ pub type BetweenFuture<'a> = std::pin::Pin<Box<dyn std::future::Future<Output = 
 
 /// The dynamic image providers over the item repository + persistence seams.
 ///
-/// One value serves every kind; [`refresh_all`](Self::refresh_all) is the
+/// One value serves every kind; [`refresh_all_between`](Self::refresh_all_between) is the
 /// scan-time pass and [`refresh_item`](Self::refresh_item) the single-item
 /// `FetchAsync`.
 pub struct DynamicImageProviders {
@@ -288,8 +288,23 @@ impl DynamicImageProviders {
         }
     }
 
+    /// [`refresh_all_between`](Self::refresh_all_between) with nothing left
+    /// out and no pause between rows.
+    ///
+    /// # Errors
+    ///
+    /// As [`refresh_all_between`](Self::refresh_all_between).
+    #[cfg(test)]
+    pub async fn refresh_all(&self) -> Result<DynamicImageReport, ServiceError> {
+        let nothing = || -> BetweenFuture<'_> { Box::pin(async {}) };
+        self.refresh_all_between(&std::collections::HashSet::new(), &nothing)
+            .await
+    }
+
     /// The scan-time pass: evaluates every supported row and (re)generates
-    /// the Primaries whose `HasChanged` gate opens.
+    /// the Primaries whose `HasChanged` gate opens, awaiting `between` before
+    /// each row — the library scan serves its priority lane there — and
+    /// leaving out the rows in `done` (the ones a forced pass already drew).
     ///
     /// Cost is bounded by the gate: a row with a current generated image costs
     /// one image-row read and one `stat`; only rows without a Primary run their
@@ -302,20 +317,6 @@ impl DynamicImageProviders {
     /// so a name used by both a movie and an album has two rows and two
     /// Primaries. An adopted database's rows keep Jellyfin's ids.
     ///
-    /// # Errors
-    ///
-    /// Only when a supported kind's id list, or a window of its rows, cannot
-    /// be read; a failure on one row is logged and the pass continues.
-    pub async fn refresh_all(&self) -> Result<DynamicImageReport, ServiceError> {
-        let nothing = || -> BetweenFuture<'_> { Box::pin(async {}) };
-        self.refresh_all_between(&std::collections::HashSet::new(), &nothing)
-            .await
-    }
-
-    /// [`refresh_all`](Self::refresh_all), awaiting `between` before each
-    /// row — the library scan serves its priority lane there — and leaving
-    /// out the rows in `done` (the ones a forced pass already drew).
-    ///
     /// TODO(parity, open work item — NOT an accepted divergence; gl-950): the
     /// user root is drawn here behind its gate and its refresh is never
     /// recorded, where upstream's `ValidateTopLibraryFolders` refreshes it on
@@ -326,7 +327,8 @@ impl DynamicImageProviders {
     ///
     /// # Errors
     ///
-    /// As [`refresh_all`](Self::refresh_all).
+    /// Only when a supported kind's id list, or a window of its rows, cannot
+    /// be read; a failure on one row is logged and the pass continues.
     pub async fn refresh_all_between<'b>(
         &self,
         done: &std::collections::HashSet<Uuid>,
@@ -377,7 +379,7 @@ impl DynamicImageProviders {
     ///
     /// # Errors
     ///
-    /// As [`refresh_all`](Self::refresh_all).
+    /// As [`refresh_all_between`](Self::refresh_all_between).
     pub async fn refresh_user_root_between<'b>(
         &self,
         options: &MetadataRefreshOptions,
