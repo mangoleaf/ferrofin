@@ -38,6 +38,7 @@ use ferrofin_model::media_info::MediaInfo;
 use uuid::Uuid;
 
 use crate::error::ServiceError;
+use crate::filesystem::OpenedFile;
 
 /// A parked media-probe request: which file to probe and how.
 ///
@@ -553,16 +554,17 @@ pub struct TrimmedSubtitle {
     pub data: Vec<u8>,
 }
 
-/// An extracted attachment: its metadata plus the extracted bytes.
+/// An extracted attachment: its metadata plus the extracted file, opened.
 ///
 /// Port of the C# `(MediaAttachment Attachment, Stream Stream)` tuple returned
-/// by `IAttachmentExtractor.GetAttachment`; the `Stream` becomes the bytes.
-#[derive(Debug, Clone, PartialEq)]
+/// by `IAttachmentExtractor.GetAttachment`; the `Stream` (`AsyncFile.OpenRead`
+/// of the cached file) becomes an [`OpenedFile`], streamed, never read whole.
+#[derive(Debug)]
 pub struct ExtractedAttachment {
     /// The attachment's stream metadata.
     pub attachment: MediaAttachment,
-    /// The extracted attachment bytes.
-    pub data: Vec<u8>,
+    /// The extracted attachment file, open from its start.
+    pub file: OpenedFile,
 }
 
 /// Extracts embedded font/cover attachments from media containers.
@@ -571,7 +573,8 @@ pub struct ExtractedAttachment {
 /// `GetAttachment` becomes an [`item_id`](Uuid).
 #[async_trait]
 pub trait AttachmentExtractor: Send + Sync {
-    /// Extracts one attachment (by index) from an item's media source. Port of
+    /// Extracts one attachment (by index) from an item's media source into the
+    /// cache and opens the cached file. Port of
     /// `GetAttachment(item, mediaSourceId, attachmentStreamIndex, …)`.
     async fn get_attachment(
         &self,

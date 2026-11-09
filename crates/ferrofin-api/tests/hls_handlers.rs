@@ -20,6 +20,7 @@ use ferrofin_db::entities::base_items::BaseItemEntity;
 use ferrofin_model::entities_media::MediaAttachment;
 use ferrofin_model::querying::QueryResult;
 use ferrofin_traits::error::ServiceError;
+use ferrofin_traits::filesystem::OpenedFile;
 use ferrofin_traits::library::LibraryManager;
 use ferrofin_traits::media_encoding::{
     AttachmentExtractor, ExtractedAttachment, HlsStreamManager, HlsStreamRequest, ServedFile,
@@ -199,7 +200,7 @@ impl HlsStreamManager for FakeHls {
     }
 }
 
-/// A fake [`AttachmentExtractor`] returning fixed bytes + MIME.
+/// A fake [`AttachmentExtractor`] returning a file of fixed bytes + MIME.
 struct FakeAttachments {
     mime: Option<String>,
     data: Vec<u8>,
@@ -223,7 +224,11 @@ impl AttachmentExtractor for FakeAttachments {
                 mime_type: self.mime.clone(),
                 delivery_url: None,
             },
-            data: self.data.clone(),
+            file: OpenedFile {
+                path: "font.ttf".to_owned(),
+                length: self.data.len() as u64,
+                reader: Box::new(std::io::Cursor::new(self.data.clone())),
+            },
         })
     }
 
@@ -1350,14 +1355,17 @@ async fn stop_encoding_returns_204_and_records() {
     );
 }
 
+/// The file streams in chunks, whole and in order, with `FileStreamResult`'s
+/// headers: its `Content-Length` and no `Accept-Ranges`.
 #[tokio::test]
-async fn attachment_serves_bytes_with_mime() {
+async fn attachment_streams_the_file_with_mime() {
+    let data: Vec<u8> = (0..200_000_u32).map(|i| (i % 251) as u8).collect();
     let rec = Arc::new(Recorded::default());
     let router = router_with(
         ok_hls("/nope", rec),
         Arc::new(FakeAttachments {
             mime: Some("font/ttf".to_owned()),
-            data: b"FONTDATA".to_vec(),
+            data: data.clone(),
         }),
         Arc::new(ItemLibrary { present: true }),
     );
@@ -1370,7 +1378,38 @@ async fn attachment_serves_bytes_with_mime() {
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
     assert_eq!(resp.headers().get("content-type").unwrap(), "font/ttf");
-    assert_eq!(body_string(resp).await, "FONTDATA");
+    assert_eq!(resp.headers().get("content-length").unwrap(), "200000");
+    assert!(resp.headers().get("accept-ranges").is_none());
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    assert_eq!(body.as_ref(), data.as_slice());
+}
+
+/// A MIME type no header can carry is sent as a missing one is.
+#[tokio::test]
+async fn attachment_with_an_unusable_mime_is_octet_stream() {
+    let rec = Arc::new(Recorded::default());
+    let router = router_with(
+        ok_hls("/nope", rec),
+        Arc::new(FakeAttachments {
+            mime: Some("font/ttf\n".to_owned()),
+            data: b"X".to_vec(),
+        }),
+        Arc::new(ItemLibrary { present: true }),
+    );
+    let resp = router
+        .oneshot(authed(
+            "GET",
+            &format!("/Videos/{ITEM_ID}/src1/Attachments/0"),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(
+        resp.headers().get("content-type").unwrap(),
+        "application/octet-stream"
+    );
 }
 
 #[tokio::test]
