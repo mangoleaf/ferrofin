@@ -2789,22 +2789,45 @@ impl LibraryManager for FerrofinLibraryManager {
         if ids.is_empty() {
             return Ok(Vec::new());
         }
-        let service = self
-            .visibility
-            .as_ref()
-            .ok_or_else(|| ServiceError::backend("item visibility is not configured"))?;
+        if self.visibility.is_none() {
+            return Err(ServiceError::backend("item visibility is not configured"));
+        }
         let rows = self.items.retrieve_items(ids).await?;
-        let visible: std::collections::HashSet<_> = rows
+        let visible: std::collections::HashSet<_> = self
+            .filter_visible_items_standalone(rows, user)
+            .await?
             .iter()
-            .zip(service.visible(&rows, user, true).await?)
-            .filter(|(_, visible)| *visible)
-            .filter_map(|(row, _)| Uuid::parse_str(&row.id).ok())
-            .filter(|id| !id.is_nil() && *id != PLACEHOLDER_ITEM_ID)
+            .filter_map(|row| Uuid::parse_str(&row.id).ok())
             .collect();
         Ok(ids
             .iter()
             .copied()
             .filter(|id| visible.contains(id))
+            .collect())
+    }
+
+    async fn filter_visible_items_standalone(
+        &self,
+        items: Vec<BaseItemEntity>,
+        user: &ferrofin_db::entities::users::UserEntity,
+    ) -> Result<Vec<BaseItemEntity>, ServiceError> {
+        if items.is_empty() {
+            return Ok(items);
+        }
+        let service = self
+            .visibility
+            .as_ref()
+            .ok_or_else(|| ServiceError::backend("item visibility is not configured"))?;
+        let visible = service.visible(&items, user, true).await?;
+        Ok(items
+            .into_iter()
+            .zip(visible)
+            .filter(|(row, visible)| {
+                *visible
+                    && Uuid::parse_str(&row.id)
+                        .is_ok_and(|id| !id.is_nil() && id != PLACEHOLDER_ITEM_ID)
+            })
+            .map(|(row, _)| row)
             .collect())
     }
 

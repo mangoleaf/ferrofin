@@ -3365,6 +3365,27 @@ pub const VERIFIED: &[Verified] = &[
         refs: &[],
     },
     Verified {
+        method: "get",
+        path: "/Playlists/{itemId}",
+        upstream_file: "Jellyfin.Api/Controllers/PlaylistsController.cs",
+        upstream_method: "GetPlaylist",
+        ferrofin: "handlers/playlists.rs get_playlist (User.GetUserId: a nil id, an API key \
+               naming no user, is a 400 as GetUserById(Guid.Empty) throws) → ferrofin-core \
+               collection_manager.rs FerrofinPlaylistManager::get_playlist_access \
+               (GetPlaylistForUser: GetPlaylists(userId).Where(IsVisible), else 404), \
+               get_playlist_shares (Playlist.Shares) and get_playlist_item_ids \
+               (GetManageableItems().Select(t => t.Item2.Id): the manual links in SortOrder, \
+               repeats kept, every member listed whoever may see it, read as ids alone)",
+        date: "2026-11-09",
+        divergences: &[
+            "A user named twice in the shares is listed once, with the combined CanEdit; \
+         upstream's Shares lists every stored entry. Fix path: gl-949.",
+            "The 404 (no playlist the caller can see) body is Ferrofin's error shape, not \
+         upstream's \"Playlist not found\" string. Fix path: gl-666.",
+        ],
+        refs: &[],
+    },
+    Verified {
         method: "post",
         path: "/Playlists/{itemId}",
         upstream_file: "Jellyfin.Api/Controllers/PlaylistsController.cs",
@@ -3420,10 +3441,11 @@ pub const VERIFIED: &[Verified] = &[
                RequestHelpers.GetUserId) → ferrofin-core collection_manager.rs \
                FerrofinPlaylistManager::get_playlist_items (GetPlaylistForUser and \
                GetManageableItems: manual links, in order, missing items out), then \
-               LibraryManager::get_visible_item_ids before the paging, as upstream filters \
-               before Skip and Take, and tv_shows::build_dto_options + get_linked_children_dtos \
-               + the PlaylistItemId tag",
-        date: "2026-11-01",
+               LibraryManager::filter_visible_items_standalone over the rows just read \
+               (ItemVisibility::visible, one answer per distinct id) before the paging, as \
+               upstream filters before Skip and Take, and tv_shows::build_dto_options + \
+               get_linked_children_dtos + the PlaylistItemId tag",
+        date: "2026-11-09",
         divergences: &[
             "A member the caller may not open is left out with the standalone check, which also \
          walks its library, where upstream's IsVisible reads only its rating and tags and \
