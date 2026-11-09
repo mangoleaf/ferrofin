@@ -36,7 +36,7 @@
 #                       {"rows": [{"row", "scenario", "result", "detail", "checks"}…], "summary": {"pass", "fail", "skip"}}
 #                       where checks is every check the row made, [{"what", "observed", "op", "expected", "ok"}…]
 #
-# Needs curl and jq. The server must run with /metrics on (FERROFIN_ENABLE_METRICS=true), and
+# Needs curl, jq, setsid and flock. The server must run with /metrics on (FERROFIN_ENABLE_METRICS=true), and
 # the library with real-time monitoring off (the watcher would process the scratch changes
 # before the scans the rows time). The script writes nothing but its own scratch files under
 # SCRATCH_DIR, edits the metadata of its own scratch items only, and deletes every file it
