@@ -1,4 +1,4 @@
-//! Port of `MediaBrowser.Common.Net.NetworkConfiguration` and its store key.
+//! Port of `MediaBrowser.Common.Net.NetworkConfiguration`.
 //!
 //! This is the settings DTO the network manager reads. `BaseUrl` carries the
 //! leading/trailing slash normalization from the C# property setter.
@@ -41,10 +41,6 @@
 //! there is nothing here to warn about.
 
 use serde::{Deserialize, Serialize};
-
-/// Configuration store key for the network configuration
-/// (`NetworkConfigurationStore.StoreKey`).
-pub const STORE_KEY: &str = "network";
 
 /// The default value for the internal/public HTTP port.
 pub const DEFAULT_HTTP_PORT: u16 = 8096;

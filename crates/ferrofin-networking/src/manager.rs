@@ -889,32 +889,6 @@ impl NetworkManager {
         }
     }
 
-    /// The loopback interfaces for the enabled families (`GetLoopbacks`).
-    #[must_use]
-    pub fn get_loopbacks(&self) -> Vec<IpData> {
-        let mut loopbacks = Vec::new();
-        if !self.is_ipv4_enabled() && !self.is_ipv6_enabled() {
-            return loopbacks;
-        }
-
-        if self.is_ipv4_enabled() {
-            loopbacks.push(IpData::new(
-                IPV4_LOOPBACK,
-                Some(net_constants::ipv4_rfc5735_loopback()),
-                "lo",
-            ));
-        }
-        if self.is_ipv6_enabled() {
-            loopbacks.push(IpData::new(
-                IPV6_LOOPBACK,
-                Some(net_constants::ipv6_rfc4291_loopback()),
-                "lo",
-            ));
-        }
-
-        loopbacks
-    }
-
     /// Produces the list of interfaces the server should bind to
     /// (`GetAllBindInterfaces`).
     #[must_use]
@@ -960,6 +934,11 @@ impl NetworkManager {
     ///
     /// Returns the bind address string and, via the tuple, an optional port
     /// parsed out of a matching published-server override.
+    ///
+    /// Only tests call it, chiefly the transliterated `NetworkParseTests`.
+    /// Upstream's callers, `GetSmartApiUrl(string)` and
+    /// `GetBindAddress(HttpRequest)`, have no production caller either. Requests
+    /// resolve through [`Self::get_bind_address_for_peer`].
     #[must_use]
     pub fn get_bind_address(&self, source: &str) -> (String, Option<u16>) {
         let addresses = net_utils::try_parse_host_with(
@@ -970,7 +949,7 @@ impl NetworkManager {
         )
         .unwrap_or_default();
         let resolved = self.get_bind_address_for_ip(addresses.first().copied(), false);
-        // Per-request published-URL resolution → debug (RULES_LOGGING volume rule);
+        // Bind-address resolution → debug (RULES_LOGGING volume rule);
         // the startup banner already logs the configured result at info. This
         // answers "why this address for this client" when a published URL looks off.
         tracing::debug!(source, address = %resolved.0, port = ?resolved.1, "resolved bind address");

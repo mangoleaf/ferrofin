@@ -8,21 +8,50 @@
 
 #![cfg(test)]
 
+use std::net::Ipv6Addr;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
-use tokio::net::TcpListener;
+use tokio::net::{TcpListener, TcpSocket};
 use tokio::sync::watch;
 
-/// A loopback listener for a mock server. Image downloads refuse loopback
-/// unless the server's policy lets them reach it (gl-1096), so binding one
-/// lets them: a test serving images here needs nothing else. A test of the
-/// refusal itself gives its client its own policy
-/// (`guarded_http::GuardedHttp::new`).
-async fn bind() -> TcpListener {
+/// A loopback listener for a mock server, with its port's hold on `::1`
+/// ([`loopback_listener`]). Image downloads refuse loopback unless the
+/// server's policy lets them reach it (gl-1096), so binding one lets them: a
+/// test serving images here needs nothing else. A test of the refusal itself
+/// gives its client its own policy (`guarded_http::GuardedHttp::new`).
+async fn bind() -> (TcpListener, Option<TcpSocket>) {
     crate::destination::test_support::allow_loopback_images();
-    TcpListener::bind("127.0.0.1:0").await.expect("bind mock")
+    loopback_listener().await
+}
+
+/// A listener on `127.0.0.1`, and a socket that holds the same port on `::1`
+/// (gl-1387). Keep the socket as long as the listener.
+///
+/// A client given `localhost` tries `::1` first. The held port is bound and
+/// never listening, so it refuses that connection at once, and the client
+/// goes on to `127.0.0.1`. A free port there could be another test process's
+/// listener, or a host service that listens on IPv6 only, and that one would
+/// get the request instead.
+///
+/// The hold is exclusive only while its socket does not set `SO_REUSEADDR`,
+/// which a `TcpSocket` does not. The socket is `None` on a host with no IPv6
+/// loopback, where no listener can take the port either.
+pub(crate) async fn loopback_listener() -> (TcpListener, Option<TcpSocket>) {
+    loop {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind mock");
+        let port = listener.local_addr().expect("addr").port();
+        let Ok(held) = TcpSocket::new_v6() else {
+            return (listener, None);
+        };
+        match held.bind((Ipv6Addr::LOCALHOST, port).into()) {
+            Ok(()) => return (listener, Some(held)),
+            // Already taken on `::1`: take another port.
+            Err(error) if error.kind() == std::io::ErrorKind::AddrInUse => {}
+            Err(_) => return (listener, None),
+        }
+    }
 }
 
 /// A running mock server; its [`base_url`](Self::base_url) is handed to a client.
@@ -33,6 +62,8 @@ pub struct MockServer {
     handle: tokio::task::JoinHandle<()>,
     requests: Arc<AtomicUsize>,
     targets: Arc<Mutex<Vec<String>>>,
+    /// The port held on `::1` ([`loopback_listener`]).
+    _ipv6: Option<TcpSocket>,
 }
 
 impl Drop for MockServer {
@@ -68,7 +99,7 @@ impl MockServer {
     ) -> Self {
         let routes = Arc::new(routes);
         let targets = Arc::new(Mutex::new(Vec::new()));
-        let listener = bind().await;
+        let (listener, ipv6) = bind().await;
         let port = listener.local_addr().expect("addr").port();
         let handle = tokio::spawn({
             let targets = Arc::clone(&targets);
@@ -109,6 +140,7 @@ impl MockServer {
             handle,
             requests: Arc::default(),
             targets,
+            _ipv6: ipv6,
         }
     }
 
@@ -123,7 +155,7 @@ impl MockServer {
     /// suffix. An unmatched request gets `404`.
     pub async fn start_typed(routes: Vec<(&'static str, &'static str, Vec<u8>)>) -> Self {
         let routes = Arc::new(routes);
-        let listener = bind().await;
+        let (listener, ipv6) = bind().await;
         let port = listener.local_addr().expect("addr").port();
         let handle = tokio::spawn(async move {
             while let Ok((mut sock, _)) = listener.accept().await {
@@ -158,6 +190,7 @@ impl MockServer {
             handle,
             requests: Arc::default(),
             targets: Arc::default(),
+            _ipv6: ipv6,
         }
     }
 
@@ -167,7 +200,7 @@ impl MockServer {
     async fn start_raw_inner(responses: Vec<Vec<u8>>, stall: bool) -> Self {
         let responses = Arc::new(responses);
         let requests = Arc::new(AtomicUsize::new(0));
-        let listener = bind().await;
+        let (listener, ipv6) = bind().await;
         let port = listener.local_addr().expect("addr").port();
         let handle = tokio::spawn({
             let requests = Arc::clone(&requests);
@@ -193,6 +226,7 @@ impl MockServer {
             handle,
             requests,
             targets: Arc::default(),
+            _ipv6: ipv6,
         }
     }
 
@@ -239,5 +273,42 @@ impl MockServer {
     /// A raw response with no body, of `status`.
     pub fn raw_status(status: &str) -> Vec<u8> {
         format!("HTTP/1.1 {status}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").into_bytes()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::ErrorKind;
+
+    /// gl-1387: every kind of mock holds its port on `::1`, which a client
+    /// given `localhost` tries first. No other listener can take it, and a
+    /// connection there is refused at once, so the client goes on to
+    /// `127.0.0.1`. (A host with no IPv6 loopback has nothing to hold.)
+    #[tokio::test]
+    async fn a_mock_holds_its_port_on_ipv6_loopback() {
+        if std::net::TcpListener::bind("[::1]:0").is_err() {
+            return;
+        }
+        let mocks = [
+            MockServer::always("{}").await,
+            MockServer::start_typed(vec![("/", "image/png", vec![1])]).await,
+            MockServer::start_raw(vec![MockServer::raw_ok("", b"ok")]).await,
+        ];
+        for mock in &mocks {
+            let port: u16 = mock
+                .base_url
+                .rsplit(':')
+                .next()
+                .and_then(|port| port.parse().ok())
+                .expect("a port");
+            let taken =
+                std::net::TcpListener::bind((Ipv6Addr::LOCALHOST, port)).expect_err("port is held");
+            assert_eq!(taken.kind(), ErrorKind::AddrInUse, "{}", mock.base_url);
+            let refused = tokio::net::TcpStream::connect((Ipv6Addr::LOCALHOST, port))
+                .await
+                .expect_err("nothing answers on ::1");
+            assert_eq!(refused.kind(), ErrorKind::ConnectionRefused);
+        }
     }
 }

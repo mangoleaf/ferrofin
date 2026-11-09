@@ -17,11 +17,11 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use async_trait::async_trait;
 use ferrofin_model::configuration::ProcessPriorityClass;
 use ferrofin_util::process_priority::{ProcessPriority, set_process_priority};
-use ferrofin_util::source_url::redact_urls_in;
 use tokio::io::AsyncWriteExt as _;
 
 use super::encoding_utils::split_args;
 use super::transcoder::{ProcessOutput, Transcoder};
+use crate::transcoding::shown_argument_line;
 
 /// The production [`Transcoder`]: spawns ffmpeg/ffprobe with `tokio::process`.
 ///
@@ -131,7 +131,7 @@ impl TokioTranscoder {
         let mut child = command.spawn().map_err(|e| {
             format!(
                 "failed to spawn `{path} {}`: {e}",
-                redact_urls_in(arguments)
+                shown_argument_line(arguments)
             )
         })?;
         lower_priority(&child, path);
@@ -148,10 +148,12 @@ impl TokioTranscoder {
                 .map_err(|e| format!("failed to write test key to `{path}`: {e}"))?;
         }
 
-        let output = child
-            .wait_with_output()
-            .await
-            .map_err(|e| format!("failed to run `{path} {}`: {e}", redact_urls_in(arguments)))?;
+        let output = child.wait_with_output().await.map_err(|e| {
+            format!(
+                "failed to run `{path} {}`: {e}",
+                shown_argument_line(arguments)
+            )
+        })?;
 
         let bytes = if read_stderr {
             &output.stderr
@@ -474,6 +476,28 @@ mod tests {
             .expect_err("no such program");
         assert!(err.contains("http://origin.example"), "{err}");
         for secret in ["acct-user", "info-secret", "path-secret", "query-secret"] {
+            assert!(!err.contains(secret), "{secret} shown in: {err}");
+        }
+    }
+
+    /// A probe that cannot start hides the values of its header flags as the
+    /// transcode log does: a tuner's `User-Agent` can be its credential
+    /// (gl-1407).
+    #[tokio::test]
+    async fn a_failed_start_hides_header_flag_values() {
+        use crate::encoder::Transcoder as _;
+
+        let arguments = r#"-user_agent "Box/1.0 token=ua-secret" -headers "Cookie: hdr-secret" -i "http://origin.example/live/1.ts" -f null -"#;
+        let err = super::TokioTranscoder
+            .get_process_output("/nonexistent/ffprobe", arguments, false, None, &[])
+            .await
+            .expect_err("no such program");
+        assert!(
+            err.contains("-user_agent <redacted> -headers <redacted>"),
+            "{err}"
+        );
+        assert!(err.contains("http://origin.example"), "{err}");
+        for secret in ["ua-secret", "hdr-secret"] {
             assert!(!err.contains(secret), "{secret} shown in: {err}");
         }
     }

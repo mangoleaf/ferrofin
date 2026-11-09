@@ -1502,6 +1502,10 @@ impl ScheduledTask for TmdbUpcomingEpisodesTask {
                 ..InternalItemsQuery::default()
             })
             .await?;
+        // Only the id (for the log) and the path (the refresh's target) are
+        // kept, not the rows: the refresh loop below runs for hours. The list
+        // itself stays one query, as upstream's: its `SortName` order is not
+        // total, so `OFFSET` pages could skip or repeat a tied series.
         let mut series = Vec::new();
         for row in candidates {
             let Ok(id) = Uuid::parse_str(&row.id) else {
@@ -1511,7 +1515,7 @@ impl ScheduledTask for TmdbUpcomingEpisodesTask {
             let ended = crate::item_data::read_series_status(row.data.as_deref())
                 .is_some_and(|status| status.eq_ignore_ascii_case("Ended"));
             if !ended || !self.library_enabled(id, &settings).await? {
-                series.push(row);
+                series.push((row.id, row.path));
             }
         }
         if series.is_empty() {
@@ -1523,8 +1527,8 @@ impl ScheduledTask for TmdbUpcomingEpisodesTask {
             image_refresh_mode: ferrofin_traits::providers::MetadataRefreshMode::ValidationOnly,
             ..MetadataRefreshOptions::default()
         };
-        for (i, row) in series.iter().enumerate() {
-            if let Some(path) = row.path.clone().filter(|p| !p.is_empty()) {
+        for (i, (id, path)) in series.iter().enumerate() {
+            if let Some(path) = path.clone().filter(|p| !p.is_empty()) {
                 match self
                     .library
                     .run_refresh_scan(
@@ -1540,7 +1544,7 @@ impl ScheduledTask for TmdbUpcomingEpisodesTask {
                         return Ok(());
                     }
                     Err(err) => tracing::warn!(
-                        item_id = %row.id,
+                        item_id = %id,
                         %err,
                         "could not refresh the series' upcoming episodes"
                     ),
