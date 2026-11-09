@@ -12,12 +12,13 @@
 //! not Rust allocations, so the in-memory database is not counted.
 
 use std::alloc::{GlobalAlloc, Layout, System};
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use ferrofin_core::FerrofinItemPersistenceService;
 use ferrofin_core::FerrofinItemRepository;
-use ferrofin_core::dynamic_images::DynamicImageProviders;
+use ferrofin_core::dynamic_images::{BetweenFuture, DynamicImageProviders};
 use ferrofin_core::item_type_lookup::ItemTypeLookup;
 use ferrofin_db::entities::base_items::BaseItemEntity;
 use ferrofin_db::store::guid_to_db;
@@ -87,7 +88,11 @@ async fn seed(persistence: &FerrofinItemPersistenceService, range: std::ops::Ran
 async fn pass_peak(providers: &DynamicImageProviders) -> (usize, usize) {
     let before = LIVE.load(Ordering::Relaxed);
     PEAK.store(before, Ordering::Relaxed);
-    let report = providers.refresh_all().await.expect("pass");
+    let nothing = || -> BetweenFuture<'_> { Box::pin(async {}) };
+    let report = providers
+        .refresh_all_between(&HashSet::new(), &nothing)
+        .await
+        .expect("pass");
     let added = PEAK.load(Ordering::Relaxed).saturating_sub(before);
     (report.examined, added)
 }
