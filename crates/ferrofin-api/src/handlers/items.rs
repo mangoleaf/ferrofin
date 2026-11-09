@@ -13,10 +13,9 @@
 //! - `GET  /Items/Counts` — per-kind item counts for a (favourite-filtered) query.
 //! - `GET  /Items/{itemId}/Ancestors` — the item's parents, nearest first.
 //!
-//! The remote/metadata-provider slices of these controllers (search providers,
-//! box-set collapsing that needs the un-ported `Folder` OOP tree) are applied by
-//! the persistence layer where portable and otherwise left to later waves; the
-//! handler maps the request faithfully onto the query struct.
+//! The handler maps the request faithfully onto the query struct. Box-set
+//! collapsing (`collapseBoxSetItems`, `Folder.CollapseBoxSetItems`) is decided
+//! by the library manager before the query reaches the persistence layer.
 
 use std::collections::BTreeSet;
 use std::sync::{Arc, Mutex, PoisonError};
