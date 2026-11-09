@@ -166,15 +166,14 @@ pub(crate) async fn recording_access(
         return Ok(Some(true));
     };
     let loaded;
-    let policy = match policy {
-        Some(policy) => policy,
-        None => {
-            loaded = super::users::user_policy(state, user).await?;
-            let Some(policy) = loaded.as_ref() else {
-                return Ok(Some(false));
-            };
-            policy
-        }
+    let policy = if let Some(policy) = policy {
+        policy
+    } else {
+        loaded = super::users::user_policy(state, user).await?;
+        let Some(policy) = loaded.as_ref() else {
+            return Ok(Some(false));
+        };
+        policy
     };
     if !policy.is_administrator && !policy.enable_live_tv_access {
         return Ok(Some(false));
