@@ -1,8 +1,9 @@
 //! Port of `MediaBrowser.Model.Querying`.
 //!
-//! `LatestItemsQuery` and `NextUpQuery` are deferred: they carry a server-side
-//! `User` entity (`Jellyfin.Database.Implementations.Entities.User`), which is
-//! not part of this port unit. Port them alongside that entity.
+//! Upstream's `LatestItemsQuery` and `NextUpQuery` carry a server-side `User`
+//! entity (`Jellyfin.Database.Implementations.Entities.User`), so their ports
+//! live in `ferrofin-traits` (`options::LatestItemsQuery`, which holds the user
+//! row, and `tv::NextUpQuery`, which takes a user id), not here.
 
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;

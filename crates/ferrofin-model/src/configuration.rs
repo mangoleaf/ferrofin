@@ -395,9 +395,10 @@ pub struct LibraryTypeOptionsDto {
 /// providers plus the per-item-type options assembled from the metadata-plugin
 /// registry.
 ///
-/// Port of `Jellyfin.Api.Models.LibraryDtos.LibraryOptionsResultDto`. At this
-/// seam no metadata plugins are registered, so every collection is empty — a
-/// faithful projection (Jellyfin returns empty arrays when no plugin matches).
+/// Port of `Jellyfin.Api.Models.LibraryDtos.LibraryOptionsResultDto`. The
+/// provider manager fills it from the registered providers, and the handler
+/// adds the registered media-segment providers. A list stays empty only when
+/// no registered provider matches, as in Jellyfin.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "PascalCase")]
 pub struct LibraryOptionsResultDto {

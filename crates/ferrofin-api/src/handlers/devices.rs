@@ -124,8 +124,8 @@ async fn get_device_info(
 ///
 /// Port of `DevicesController.GetDeviceOptions`: returns the device's stored
 /// options (`404` when the device has none). The manager returns the persisted
-/// `DeviceOptionsEntity` row (its documented stopgap); this handler projects it
-/// to the [`DeviceOptionsDto`] wire shape.
+/// `DeviceOptionsEntity` row; this handler projects it to the
+/// [`DeviceOptionsDto`] wire shape upstream's `GetDeviceOptions` returns.
 #[utoipa::path(
     get,
     path = "/Devices/Options",

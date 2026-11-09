@@ -972,8 +972,10 @@ impl FerrofinTrickplayManager {
     /// current extraction flag and destination on every task invocation.
     /// Moves either way and removes the emptied source container.
     ///
-    /// This is an inherent method (not on the [`TrickplayManager`] trait),
-    /// consumed by the "Migrate Trickplay Image Location" scheduled task.
+    /// This is an inherent method (not on the [`TrickplayManager`] trait). The
+    /// "Migrate Trickplay Image Location" scheduled task calls its crate-private
+    /// sibling `move_generated_library_trickplay_data`, which also skips an
+    /// item that is not a library video.
     ///
     /// # Errors
     ///

@@ -17,7 +17,7 @@
 //! Every route is behind `[Authorize]`, so it takes the [`RequireAuth`]
 //! extractor (a missing/invalid token is `401`). The `404 Playlist not found`
 //! path is faithful (it flows from
-//! [`PlaylistManager::get_playlist_for_user`](ferrofin_traits::collections::PlaylistManager)).
+//! [`PlaylistManager::get_playlist_access`](ferrofin_traits::collections::PlaylistManager::get_playlist_access)).
 //!
 //! Ownership and shares are persisted and **enforced**: the `Playlists` table
 //! records the owner + open-access flag and `PlaylistShares` the per-user
@@ -251,9 +251,9 @@ struct GetPlaylistItemsQuery {
 /// `GET /Playlists/{playlistId}/Items` — the playlist's member items, paged.
 ///
 /// Port of `PlaylistsController.GetPlaylistItems`. Each returned DTO carries its
-/// `PlaylistItemId` (the member item id, matching the minimal port's entry-id
-/// approximation). An invisible playlist is `404`; the separate C# `Forbid()`
-/// branch is unreachable here because visible ⇔ permitted-to-read.
+/// `PlaylistItemId`: the member item id, as upstream's
+/// `Item1.ItemId?.ToString("N")`. An invisible playlist is `404`; the separate
+/// C# `Forbid()` branch is unreachable here because visible ⇔ permitted-to-read.
 #[utoipa::path(
     get,
     path = "/Playlists/{playlistId}/Items",

@@ -1,12 +1,13 @@
 //! [`create_router`] — assembles the full `ferrofin-api` [`axum::Router`].
 //!
 //! Every path+method in the vendored Jellyfin contract is registered so a known
-//! route never 404s. Unit 1 (INFRA) points them all at the shared
-//! `not_implemented` stub (`501`); later waves register real handlers over the
-//! matching entries. The router also mounts the health probes, the OpenAPI spec,
-//! the auth-context middleware, the panic boundary
-//! ([`crate::panic_boundary`]), CORS from the configured `CorsHosts`
-//! ([`crate::cors`]) and tracing.
+//! route never 404s: [`handlers::register`] mounts the real handlers, and a
+//! contract route missing from [`handlers::REAL_ROUTES`] gets the shared
+//! `not_implemented` stub (`501`). Every contract operation has a real handler
+//! today, so the stub only guards a route a future contract adds. The router
+//! also mounts the health probes, the OpenAPI spec, the auth-context
+//! middleware, the panic boundary ([`crate::panic_boundary`]), CORS from the
+//! configured `CorsHosts` ([`crate::cors`]) and tracing.
 
 use axum::extract::{MatchedPath, Request};
 use axum::response::Response;
@@ -39,9 +40,10 @@ fn stub_for(method: &str) -> Option<MethodRouter<AppState>> {
 
 /// Assembles the complete `ferrofin-api` router over the injected [`AppState`].
 ///
-/// Registers all vendored contract routes (as `501` stubs in this unit), merges
-/// the health-probe router and the OpenAPI spec, and layers the auth-context
-/// middleware, the panic boundary, CORS, and HTTP tracing.
+/// Registers all vendored contract routes (each its real handler, or the `501`
+/// stub for one that has none), merges the health-probe router and the OpenAPI
+/// spec, and layers the auth-context middleware, the panic boundary, CORS, and
+/// HTTP tracing.
 ///
 /// # Panics
 ///
@@ -67,7 +69,7 @@ pub fn create_router(state: AppState) -> Router {
             .unwrap_or_else(|| panic!("vendored contract uses unsupported method {method:?}"));
         api = api.route(&path, stub);
     }
-    // Mount the real First-Light handlers over the (now-skipped) stub slots.
+    // Mount the real handlers in the slots the loop skipped.
     api = handlers::register(api);
 
     // `/health` is behind the IP filter, as `MapHealthChecks` is upstream. The

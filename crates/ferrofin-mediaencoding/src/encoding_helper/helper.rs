@@ -5,15 +5,12 @@
 //! bitrate/quality/thread params, and the `CanStreamCopy{Video,Audio}`
 //! direct-play-vs-transcode decision.
 //!
-//! **Not yet ported here:** the hardware-acceleration matrix
-//! (nvenc/qsv/vaapi/videotoolbox/rkmpp/amf), tonemapping/HDR filters, and
-//! hardware scale/filter chains — the work items of
-//! the hardware-transcoding roadmap, whose foundation (the probed environment and
-//! the version gates) already lives in [`hw`](super::hw). Where a software-path
-//! branch would consult one of those hardware helpers (e.g. the DOVI
-//! dynamic-metadata-removal check in `CanStreamCopyVideo`, which that plan's
-//! phase 8 completes), this port takes the conservative branch and documents
-//! the omission inline.
+//! It also holds the hardware encoders' bitrate and encoder-parameter arms.
+//! The rest of the hardware-acceleration half (device setup, decoder and
+//! encoder selection, the NVENC, QSV and VAAPI filter chains, and tonemapping)
+//! lives in [`hw`](super::hw). `CanStreamCopyVideo`'s check that ffmpeg can strip a
+//! copy's dynamic HDR metadata asks this helper's `EncoderCapabilities` (see
+//! `can_stream_copy_video`).
 //!
 //! There is **no parity oracle in this test project** — the upstream
 //! `EncodingHelper` xUnit tests live in the out-of-scope `Jellyfin.Controller`
@@ -280,9 +277,10 @@ impl<C: EncoderCapabilities> EncodingHelper<C> {
     /// `-bufsize`) and `libsvtav1` (`-b:v`/`-bufsize`) arms, plus the generic
     /// fallback every encoder with no arm of its own takes — NVENC among them —
     /// and the QSV arm. `-mbbrc` is not here: v12.2 moved it into
-    /// `GetEncoderParam`. The VAAPI rate-control shapes
-    /// are not ported yet; AMF and VideoToolbox are out of scope. Returns empty
-    /// when no output bitrate is set.
+    /// `GetEncoderParam`. The VAAPI encoders take the generic fallback, without
+    /// upstream's `-rc_mode VBR` (`CBR` on i965); TODO(parity, gl-1516): open
+    /// work item: port that arm. AMF and VideoToolbox are not supported.
+    /// Returns empty when no output bitrate is set.
     #[must_use]
     pub fn video_bitrate_param(&self, state: &EncodingJobInfo, video_codec: &str) -> String {
         let Some(mut bitrate) = state.output_video_bitrate else {

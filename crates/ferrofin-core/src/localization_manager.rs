@@ -913,20 +913,19 @@ fn build_parental_ratings_from(table: Option<&RatingTable>) -> Vec<ParentalRatin
 /// An item's parental rating score — `BaseItem.GetParentalRatingScore`
 /// (`BaseItem.cs:1916-1931`) over the item's OWN ratings: its custom rating
 /// when it has one, else its official rating, scored by the localization
-/// tables against the server's metadata country; `None` when it has neither
-/// or the rating is unknown.
+/// tables against the item's own metadata country, else the server's; `None`
+/// when it has neither or the rating is unknown.
 ///
-/// TODO(parity, open work item): upstream reads `CustomRatingForComparison`
-/// and `OfficialRatingForComparison`, which fall back to the item's
-/// `DisplayParent` (an episode or season with no rating of its own takes its
-/// series'), and scores against `GetPreferredMetadataCountryCode()` (the
-/// item's, else its library's, else the server's country). Here only the
-/// item's own ratings count and the server's country is used. Un-defer path:
-/// pass the display parent's ratings (one batched read of the series per
-/// scan pass, as the series-key read) and the library's preferred country
-/// into this function, and apply it in the scan, the owned-video copy and
-/// the boot repair (`repair_rating_levels`) together, so no writer disagrees
-/// with another.
+/// TODO(parity, gl-194): open work item: upstream reads
+/// `CustomRatingForComparison` and `OfficialRatingForComparison`, which fall
+/// back to the item's `DisplayParent` (an episode or season with no rating of
+/// its own takes its series'), and scores against
+/// `GetPreferredMetadataCountryCode()` (the item's, else its library's, else
+/// the server's country). The library scan scores that way
+/// (`ItemVisibility::update_rating_scores`); this function, which the
+/// owned-video copy (`settle_rating_score`) uses, reads only the item's own
+/// ratings and country. Un-defer path: score the owned-video copy the way the
+/// scan does, so no writer disagrees with another.
 #[must_use]
 pub fn parental_rating_score(
     item: &ferrofin_db::entities::base_items::BaseItemEntity,
