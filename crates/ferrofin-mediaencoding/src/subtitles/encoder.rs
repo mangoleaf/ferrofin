@@ -29,7 +29,7 @@ use crate::error::MediaEncodingError;
 use crate::keyed_locks::KeyedLocks;
 
 use super::model::{Paragraph, Subtitle, TimeCode};
-use super::parser::{SubtitleEditParser, SubtitleParser};
+use super::parser::{SubtitleEditParser, SubtitleParser, unsupported_extension};
 use super::{json_writer, srt, ssa, ttml, vtt};
 
 /// The output format a [`GetWriter`](write)-selected writer emits.
@@ -201,6 +201,25 @@ pub trait SubtitleIo: Send + Sync {
         std::path::Path::new(path).is_file()
     }
 
+    /// Opens the local file at `path` and reads at most one byte: the
+    /// failures [`read_file`](Self::read_file) would have opening it, without
+    /// the file in memory. Port of the `AsyncFile.OpenRead` that upstream's
+    /// `GetSubtitleStream` returns, which opens the file without reading it;
+    /// the one-byte read refuses a directory, as .NET's open does.
+    ///
+    /// # Errors
+    ///
+    /// The I/O error, its kind intact, as [`read_file`](Self::read_file)
+    /// returns it.
+    async fn open_file(&self, path: &str) -> std::io::Result<()> {
+        use tokio::io::AsyncReadExt as _;
+        tokio::fs::File::open(path)
+            .await?
+            .read(&mut [0; 1])
+            .await
+            .map(drop)
+    }
+
     /// Returns the size in bytes of the file at `path`, or `None` if the file
     /// does not exist or its metadata cannot be read.
     ///
@@ -337,8 +356,10 @@ impl<P: SubtitleParser, I: SubtitleIo> SubtitleEncoder<P, I> {
     /// it ([`get_subtitle_stream`](Self::get_subtitle_stream)), then — unless the
     /// stream is already in the requested format (ASS being a superset of SSA) —
     /// re-parse and re-emit it ([`convert_subtitles`](Self::convert_subtitles))
-    /// over `[start, end]`. The caller resolves the [`MediaSourceInfo`] and the
-    /// target subtitle stream from the item + media-source id.
+    /// over `[start, end]`. A file in a format the parser has no reader for is
+    /// refused after it is opened, before it is read. The caller resolves the
+    /// [`MediaSourceInfo`] and the target subtitle stream from the item +
+    /// media-source id.
     ///
     /// # Errors
     ///
@@ -358,16 +379,28 @@ impl<P: SubtitleParser, I: SubtitleIo> SubtitleEncoder<P, I> {
         let info = self
             .get_readable_file(media_source, subtitle_stream)
             .await?;
-        let stream = self.get_subtitle_stream(&info).await?;
 
         // Return the original when the same format is requested. ASS is a
         // superset of SSA, so an SSA source satisfies an ASS request verbatim
         // (styles preserved). Character encoding was handled in
         // `get_subtitle_stream`.
-        if info.format.eq_ignore_ascii_case(output_format)
+        let same_format = info.format.eq_ignore_ascii_case(output_format)
             || (info.format.eq_ignore_ascii_case(subtitle_format::SSA)
-                && output_format.eq_ignore_ascii_case(subtitle_format::ASS))
-        {
+                && output_format.eq_ignore_ascii_case(subtitle_format::ASS));
+
+        // `Parse` refuses a format it has no parser for whatever the file
+        // holds, so a bitmap track (megabytes of PGS or VobSub) is opened, as
+        // upstream opens it, but not read into memory (gl-1495).
+        if !same_format && !self.parser.supports_file_extension(&info.format) {
+            self.io
+                .open_file(&info.path)
+                .await
+                .map_err(|e| read_error(&info.path, e))?;
+            return Err(unsupported_extension(&info.format));
+        }
+
+        let stream = self.get_subtitle_stream(&info).await?;
+        if same_format {
             return Ok(stream.into_bytes());
         }
 
@@ -1117,6 +1150,10 @@ pub struct NoopSubtitleIo;
 #[async_trait]
 impl SubtitleIo for NoopSubtitleIo {
     async fn read_file(&self, _path: &str) -> std::io::Result<Vec<u8>> {
+        Err(std::io::Error::other("no subtitle I/O configured"))
+    }
+
+    async fn open_file(&self, _path: &str) -> std::io::Result<()> {
         Err(std::io::Error::other("no subtitle I/O configured"))
     }
 

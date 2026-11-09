@@ -1,8 +1,8 @@
 //! Port of `MediaBrowser.Model.Extensions` — `ContainerHelper`, `StringHelper`
 //! and `EnumerableExtensions`.
 //!
-//! `LibraryOptionsExtension` depends on `LibraryOptions`
-//! (`MediaBrowser.Model.Configuration`, a later port unit) and is deferred.
+//! `LibraryOptionsExtension.GetCustomTagDelimiters`, its one method, is ported
+//! beside the audio-tag reader that uses it (`ferrofin-core`'s `audio_tags`).
 
 use ferrofin_util::split_string_extensions::span_split;
 

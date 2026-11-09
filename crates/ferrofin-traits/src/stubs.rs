@@ -1,18 +1,22 @@
-//! Minimal manager traits for **deferred** subsystems.
+//! Manager traits for Live TV, SyncPlay, lyrics and channels, and the disabled
+//! or no-op implementations `AppState` starts with.
 //!
-//! Live TV, channels, SyncPlay, plugins and lyrics are not part of the Ferrofin
-//! v1 feature set. Rather than port their large C# interface surfaces (and the
-//! per-strategy sub-interfaces behind them), each gets a single, minimal
-//! manager trait here so the DI seam and `AppState` can name a
-//! `Arc<dyn _Manager>` and be satisfied later by a disabled/stub implementation
-//! in `ferrofin-core`.
+//! The module name is historical: these seams were first ported as minimal
+//! stubs. The traits now back real subsystems:
+//! - [`LiveTvManager`] — the tuners, guide and DVR (`ferrofin-livetv`);
+//! - [`SyncPlayManager`] — synchronized group playback (`ferrofin-core`);
+//! - [`LyricManager`] and the [`LyricProvider`] strategy — local and remote
+//!   lyrics (`ferrofin-core`);
+//! - [`ChannelManager`] — channels. No channel backend (`IChannel`) can be
+//!   registered, so every channel query is empty. TODO(parity, gl-298): open
+//!   work item: give channels an extension seam.
 //!
-//! Each trait ports only a representative slice of its C# interface — enough to
-//! establish the seam and exercise object safety — and omits the sub-strategy
-//! interfaces (`ILiveTvService`, `IChannel`, `IGroupPlaybackRequest`, …)
-//! entirely, per the port plan's SKIP list. Lyrics have since grown real: the
-//! [`lyrics`] module now also carries the ported `ILyricProvider` strategy
-//! seam ([`LyricProvider`]) backing remote lyric search/download.
+//! The rest are defaults for an `AppState` built without the real subsystem
+//! (test constructors, a host without ffmpeg): [`NoopLibraryMonitor`],
+//! [`DisabledVirtualFolderManager`], and the disabled HLS stream manager,
+//! subtitle encoder and attachment extractor in [`hls_stream`]. The composition
+//! root replaces each with the real one. The chapter-less [`chapters`] manager
+//! is for extension contexts built without the database (extension tests).
 //!
 //! Every trait is object-safe and carries a `_assert_object_safe_*` assertion.
 

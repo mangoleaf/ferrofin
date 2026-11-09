@@ -6,8 +6,8 @@
 //! - Persisted devices are the [`DeviceEntity`] / [`DeviceOptionsEntity`]
 //!   `ferrofin-db` rows; API-facing reads surface the [`DeviceInfoDto`] /
 //!   [`DeviceInfo`] wire DTOs. The C# `GetDeviceOptions` returns a
-//!   `DeviceOptionsDto` (not yet ported to `ferrofin-model`); until then it returns
-//!   the [`DeviceOptionsEntity`] row (flagged in the port report).
+//!   `DeviceOptionsDto`; here it returns the [`DeviceOptionsEntity`] row, and
+//!   the API layer maps it to `ferrofin_model::dto::DeviceOptionsDto`.
 //! - The `CanAccessDevice(User, …)` domain-`User` argument becomes a
 //!   [`UserEntity`] row; identity arguments become [`uuid::Uuid`].
 //! - `Jellyfin.Data.Queries.DeviceQuery` is ported as [`DeviceQuery`] (a small
@@ -127,8 +127,8 @@ pub trait DeviceManager: Send + Sync {
 
     /// Gets a device's options row, or `None`.
     ///
-    /// Returns the [`DeviceOptionsEntity`] row pending a ported
-    /// `DeviceOptionsDto` (see the module docs).
+    /// Returns the [`DeviceOptionsEntity`] row; the API layer maps it to the
+    /// `DeviceOptionsDto` upstream returns (see the module docs).
     async fn get_device_options(
         &self,
         device_id: &str,

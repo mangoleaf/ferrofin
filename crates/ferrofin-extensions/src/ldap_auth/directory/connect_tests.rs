@@ -400,9 +400,17 @@ async fn certificate_files_that_cannot_be_read_fail_the_connect_step() {
 
 #[tokio::test]
 async fn a_closed_port_or_a_bad_port_fails_the_connect_step() {
-    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
-    let port = listener.local_addr().expect("addr").port();
-    drop(listener);
+    // Bound for the whole test and never listening, so connecting is refused.
+    // A port bound then dropped is free for another test process's listener.
+    // The hold is exclusive only without `SO_REUSEADDR`, as the assert checks.
+    let held = tokio::net::TcpSocket::new_v4().expect("socket");
+    held.bind("127.0.0.1:0".parse().expect("addr"))
+        .expect("bind");
+    let port = held.local_addr().expect("addr").port();
+    assert!(
+        std::net::TcpListener::bind(("127.0.0.1", port)).is_err(),
+        "port is held"
+    );
     let mut options = ldaps("127.0.0.1", port, CertificateVerification::None);
     options.use_ssl = false;
 

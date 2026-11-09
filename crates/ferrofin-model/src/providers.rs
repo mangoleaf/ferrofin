@@ -1,8 +1,9 @@
 //! Port of the portable DTOs in `MediaBrowser.Model.Providers`.
 //!
 //! Serde casing matches the Jellyfin JSON contract (PascalCase properties).
-//! `RemoteLyricInfo` is deferred — it depends on `MediaBrowser.Model.Lyrics`
-//! (`LyricMetadata`/`LyricResponse`), a namespace not yet ported.
+//! `RemoteLyricInfo` lives with the lyric seam
+//! (`ferrofin_traits::stubs::RemoteLyricInfo`); its wire form is
+//! [`RemoteLyricInfoDto`](crate::lyrics::RemoteLyricInfoDto).
 
 mod external_id_info;
 mod external_url;

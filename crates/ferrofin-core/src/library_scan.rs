@@ -10197,7 +10197,7 @@ impl LibraryScanner {
     /// refreshed BEFORE its tracks were probed, so the identical C# summed a set
     /// of `NULL`s, while the album — same code, refreshed after — got the right
     /// number. Ferrofin sums the probed ticks, so an artist reports its real
-    /// runtime; the divergence is recorded in `suite/parity/classifications.json`.
+    /// runtime rather than reproducing that race.
     ///
     /// `Playlist` is the third `SupportsCumulativeRunTimeTicks` kind
     /// (`Playlist.cs:79`); its children are `LinkedChildren`, not scanned
@@ -29504,9 +29504,18 @@ mod tests {
             .find(|s| s.item.name.as_deref() == Some("Lenfilm"))
             .map(|s| uuid::Uuid::parse_str(&s.item.id).unwrap())
             .expect("Lenfilm");
-        let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let dead = format!("http://{}", closed.local_addr().unwrap());
-        drop(closed);
+        // Bound for the rest of the test and never listening, so the lookup is
+        // refused. A port bound then dropped is free for another test
+        // process's fake, which could answer it. The hold is exclusive only
+        // without `SO_REUSEADDR`, as the assert checks.
+        let closed = tokio::net::TcpSocket::new_v4().unwrap();
+        closed.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        let closed_addr = closed.local_addr().unwrap();
+        assert!(
+            std::net::TcpListener::bind(closed_addr).is_err(),
+            "port is held"
+        );
+        let dead = format!("http://{closed_addr}");
         let vf: Arc<dyn VirtualFolderManager> = Arc::new(
             FerrofinVirtualFolderManager::new(tmp.path().join("default"))
                 .with_item_store(persistence.clone()),

@@ -2,9 +2,9 @@
 //!
 //! The concrete monitor (`ferrofin-core`'s `FerrofinLibraryMonitor`) wraps a real
 //! filesystem watcher, but `AppState` must name a non-optional
-//! `Arc<dyn LibraryMonitor>` and the filesystem-watcher composition wiring is a
-//! later-wave subsystem. This stub satisfies the field so the external-source
-//! change-report webhooks (`/Library/Movies/*`, `/Library/Series/*`,
+//! `Arc<dyn LibraryMonitor>`, and an `AppState` built without a watcher (the
+//! test constructors) still needs one. This stub satisfies the field so the
+//! external-source change-report webhooks (`/Library/Movies/*`, `/Library/Series/*`,
 //! `/Library/Media/Updated`) behave correctly out of the box: each reported
 //! path is validated and logged, and the call succeeds — exactly the observable
 //! contract Jellyfin gives when no watcher redraw is pending. The composition

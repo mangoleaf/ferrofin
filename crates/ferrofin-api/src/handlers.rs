@@ -543,7 +543,7 @@ pub const REAL_ROUTES: &[(&str, &str)] = &[
     ("post", "/System/Configuration/{key}"),
     // Activity log.
     ("get", "/System/ActivityLog/Entries"),
-    // Branding reads (Splashscreen GET/POST/DELETE are real in Batch 16).
+    // Branding reads (the Splashscreen GET/POST/DELETE rows are further down).
     ("get", "/Branding/Configuration"),
     ("get", "/Branding/Css"),
     ("get", "/Branding/Css.css"),
@@ -609,7 +609,8 @@ pub const REAL_ROUTES: &[(&str, &str)] = &[
     ("get", "/ScheduledTasks"),
     ("get", "/ScheduledTasks/{taskId}"),
     ("post", "/ScheduledTasks/Running/{taskId}"),
-    // Batch 16 — the last portable stubs.
+    // Batch 16 — similar items, image writes, task cancel and triggers, the
+    // metadata editor and view grouping options.
     // Similar-items aliases (`LibraryController.GetSimilarItems`); the
     // `Shows/…/Similar` row sits in Batch 8, though `handlers::similar` serves it.
     ("get", "/Albums/{itemId}/Similar"),
@@ -3975,7 +3976,7 @@ pub fn register(router: Router<AppState>) -> Router<AppState> {
     let router = scheduled_tasks::register(router);
     // Batch 6 — portable extras: TMDb client config (TmdbController).
     let router = tmdb::register(router);
-    // Batch 16 — the last portable stubs.
+    // Similar items (`LibraryController.GetSimilarItems` and its aliases).
     let router = similar::register(router);
     // MergeVersions plugin — bulk merge/split of duplicate versions.
     let router = merge_versions::register(router);

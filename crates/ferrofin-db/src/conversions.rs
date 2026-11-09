@@ -1,9 +1,9 @@
 //! `TryFrom<entity>` conversions from the [`crate::entities`] row structs into
 //! their matching `ferrofin-model` DTOs.
 //!
-//! Only entities with a clean 1:1 `ferrofin-model` target are converted here;
-//! richer types (`BaseItem`, `User`, `MediaStream`) that need joins or lack a
-//! target DTO are deferred to a later port unit.
+//! Only entities with a clean 1:1 `ferrofin-model` target are converted here.
+//! Richer types (`BaseItem`, `User`, `MediaStream`) need joins or other
+//! services, so `ferrofin-core` builds their DTOs.
 //!
 //! ## Why `TryFrom`, not `From`
 //! The storage shape keeps `Guid` columns as their hyphenated [`String`] form

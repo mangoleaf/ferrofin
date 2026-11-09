@@ -320,8 +320,8 @@ async fn items_root_ancestors_and_years_over_real_http() {
     // than against Jellyfin because Jellyfin's value is its own bug: it reports
     // the out-param of `folder.GetRecursiveChildren(user, query, out totalCount)`
     // (v10.11.8 Folder.cs:1450-1458) — the count of the underlying MEDIA items,
-    // not of the years — so a 3-year fixture answers 559 there. Recorded as an
-    // accepted jellyfin-bug divergence in suite/parity/classifications.json.
+    // not of the years — so a 3-year fixture answers 559 there. That Jellyfin bug
+    // is not ported.
     assert_eq!(years["TotalRecordCount"], 2, "{years}");
     for uri in [
         "/Years?limit=1",
