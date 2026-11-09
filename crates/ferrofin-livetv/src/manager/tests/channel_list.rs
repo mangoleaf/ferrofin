@@ -1,4 +1,5 @@
-//! `GET /LiveTv/Channels` reads the guide only for the kinds it filters on.
+//! `GET /LiveTv/Channels` reads the guide only for the kinds it filters on,
+//! and lists only the channels the user's parental restrictions allow.
 //!
 //! The movie/series/kids kinds are derived from the airings, one correlated
 //! pass over each channel's programmes per kind, and only the channel kind
@@ -22,7 +23,7 @@ const KIND_PASS: &str =
 async fn plan(query: &LiveTvChannelQuery) -> Vec<String> {
     let db = Database::connect_in_memory().await.expect("db");
     db.run_migrations().await.expect("migrate");
-    crate::guide_repository::test_support::channel_rows_plan(&db, query)
+    crate::guide_repository::test_support::channel_rows_plan(&db, query, None)
         .await
         .expect("plan")
 }
@@ -132,4 +133,136 @@ async fn several_kind_filters_must_all_match(
         .filter_map(|c| c.name)
         .collect();
     assert_eq!(names, expected);
+}
+
+/// The names `GET /LiveTv/Channels` lists to `user` with `limit`, and the
+/// total it reports.
+async fn lineup(
+    mgr: &crate::manager::FerrofinLiveTvManager,
+    user: &std::sync::Arc<ferrofin_db::entities::users::UserEntity>,
+    limit: Option<i32>,
+) -> (Vec<String>, i32) {
+    let page = mgr
+        .get_channels(
+            &LiveTvChannelQuery {
+                user: Some(std::sync::Arc::clone(user)),
+                limit,
+                ..LiveTvChannelQuery::default()
+            },
+            &DtoOptions::default(),
+        )
+        .await
+        .expect("channels");
+    let names = page.items.into_iter().filter_map(|c| c.name).collect();
+    (names, page.total_record_count)
+}
+
+/// Upstream's `GetInternalChannels` lists the channel items through
+/// `new InternalItemsQuery(user)`, so the user's blocked unrated kinds,
+/// maximum rating and blocked and allowed tags filter the lineup before its
+/// page is cut: the first row and the total are the visible ones.
+#[tokio::test]
+async fn the_lineup_hides_what_a_users_parental_restrictions_hide() {
+    use ferrofin_db::entities::base_items::BaseItemEntity;
+    use ferrofin_db::enums::{ItemValueType, PreferenceKind};
+    let (lab, kid) = super::rated_guide_lab().await;
+    let mgr = &lab.mgr;
+    let both = vec!["Channel One".to_owned(), "Channel Two".to_owned()];
+    assert_eq!(lineup(mgr, &kid, None).await, (both, 2));
+    let [one, two] = super::channel_ids(mgr).await[..] else {
+        panic!("two channels");
+    };
+
+    // No channel carries a rating.
+    let unrated = ["LiveTvChannel"];
+    super::set_preference(mgr, &kid, PreferenceKind::BlockUnratedItems, &unrated).await;
+    assert_eq!(lineup(mgr, &kid, None).await, (vec![], 0));
+    super::set_preference(mgr, &kid, PreferenceKind::BlockUnratedItems, &[]).await;
+
+    // A rating the metadata editor gave Channel One, above a TV-PG limit.
+    let rated = BaseItemEntity {
+        official_rating: Some("TV-MA".to_owned()),
+        inherited_parental_rating_value: Some(super::us_score("TV-MA")),
+        ..super::channel_item(&lab.items, one).await
+    };
+    lab.persistence.save_items(&[rated]).await.expect("rated");
+    let limited = super::tv_pg(&kid);
+    let two_only = (vec!["Channel Two".to_owned()], 1);
+    assert_eq!(lineup(mgr, &limited, Some(1)).await, two_only);
+
+    // A tag on Channel Two: blocked, it hides the channel; allowed, it keeps
+    // only the channels that carry it.
+    let tag = vec![(i32::from(ItemValueType::Tags), "Sports".to_owned())];
+    let values = [(two, tag)];
+    lab.persistence
+        .save_item_values_for_items(&values)
+        .await
+        .expect("tag");
+    super::set_preference(mgr, &kid, PreferenceKind::BlockedTags, &["Sports"]).await;
+    let one_only = (vec!["Channel One".to_owned()], 1);
+    assert_eq!(lineup(mgr, &kid, None).await, one_only);
+    super::set_preference(mgr, &kid, PreferenceKind::BlockedTags, &[]).await;
+    super::set_preference(mgr, &kid, PreferenceKind::AllowedTags, &["Sports"]).await;
+    assert_eq!(lineup(mgr, &kid, None).await, two_only);
+
+    // A channel whose item is not stored is listed only to a user nothing
+    // restricts.
+    super::set_preference(mgr, &kid, PreferenceKind::AllowedTags, &[]).await;
+    lab.persistence.delete_items(&[one]).await.expect("delete");
+    let free = (vec!["Channel One".to_owned(), "Channel Two".to_owned()], 2);
+    assert_eq!(lineup(mgr, &kid, None).await, free);
+    assert_eq!(lineup(mgr, &limited, None).await, two_only);
+}
+
+/// A restricted lineup read, with every rule on (a maximum rating, a blocked
+/// unrated kind, a blocked tag) and with a kind filter or without, probes each
+/// channel's item by its key and keeps every step of the unrestricted plan:
+/// the restriction is a correlated `EXISTS`, never a scan.
+#[tokio::test]
+async fn a_restricted_lineup_read_probes_the_channel_item_by_key() {
+    use crate::guide_repository::test_support::channel_rows_plan;
+    use ferrofin_db::enums::PreferenceKind;
+    use ferrofin_traits::options::InternalItemsQuery;
+    let (lab, kid) = super::rated_guide_lab().await;
+    let mgr = &lab.mgr;
+    let unrated = ["LiveTvChannel"];
+    super::set_preference(mgr, &kid, PreferenceKind::BlockUnratedItems, &unrated).await;
+    super::set_preference(mgr, &kid, PreferenceKind::BlockedTags, &["News"]).await;
+    let user = InternalItemsQuery {
+        user: Some(super::tv_pg(&kid)),
+        ..InternalItemsQuery::default()
+    };
+    let restrictions = mgr.user_restrictions(&user).await.expect("resolve");
+    let restrictions = restrictions.expect("a restricted user");
+    for query in [
+        LiveTvChannelQuery::default(),
+        LiveTvChannelQuery {
+            is_kids: Some(true),
+            ..LiveTvChannelQuery::default()
+        },
+    ] {
+        let restricted = channel_rows_plan(&mgr.db, &query, Some(&restrictions))
+            .await
+            .expect("plan");
+        let unrestricted = channel_rows_plan(&mgr.db, &query, None)
+            .await
+            .expect("plan");
+        for step in &unrestricted {
+            assert!(restricted.contains(step), "{step} kept: {restricted:?}");
+        }
+        assert!(
+            restricted
+                .iter()
+                .any(|d| d == "SEARCH bi EXISTS USING INDEX sqlite_autoindex_BaseItems_1 (Id=?)"),
+            "{restricted:?}"
+        );
+        // The channel table's own scan is the only one.
+        assert!(
+            restricted
+                .iter()
+                .filter(|d| d.starts_with("SCAN"))
+                .all(|d| unrestricted.contains(d)),
+            "{restricted:?}"
+        );
+    }
 }
