@@ -3890,7 +3890,8 @@ impl FerrofinLibraryManager {
     /// dashboard's stop button — withdraws only this caller's request: still
     /// queued, it is dropped unless a fire-and-forget request or another
     /// caller shares it; running, it stops cooperatively once nobody else
-    /// wants it, with the item in progress written whole or not at all. Only
+    /// wants it, with the item in progress written whole, not at all, or as
+    /// far as it got and left unstamped for the next scan to redo. Only
     /// then does the next queued scan start, so a refresh's replacement task
     /// waits for the cancelled scan to end: at most one item — plus, when
     /// the scan is serving a priority-lane item refresh at that moment, the

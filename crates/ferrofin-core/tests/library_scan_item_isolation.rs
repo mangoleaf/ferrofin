@@ -736,8 +736,8 @@ async fn children_of_a_series_that_failed_to_save_keep_its_stored_key() {
 }
 
 // A series' save writes its row and then pushes its name to its children. When
-// the push fails the row already carries this refresh's stamp and file facts,
-// so the stamp goes even though the save itself reported the failure.
+// the push fails the row already carries this refresh's file facts, so it must
+// be left unstamped even though the save itself reported the failure.
 #[tokio::test]
 async fn a_save_that_fails_after_writing_the_row_leaves_it_to_retry() {
     let fx = Fixture::new().await;
