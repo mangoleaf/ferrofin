@@ -61,6 +61,11 @@ redundant_clone = "warn"
 needless_collect = "warn"
 or_fun_call = "warn"
 
+# cargo-vet's store. A configured path is used as written, so it resolves against the directory
+# `cargo vet` runs in: run it from the repository root (CONTRIBUTING.md, "Dependencies").
+[workspace.metadata.vet]
+store = { path = "gates/supply-chain" }
+
 [workspace.dependencies]
 if-addrs = { version = "0.15.0", features = ["link-local"] }
 # ── intra-workspace (path deps added as crates land) ───────────────

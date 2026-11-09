@@ -240,7 +240,7 @@ cargo deny --locked check              # advisories, licenses, bans, sources (de
 cargo deny --manifest-path examples/wasm-hello/Cargo.toml --locked check   # the same for the WASM guest
 cargo machete apps crates              # declared but unused dependencies
 scripts/check-workspace-deps.py        # every dependency through [workspace.dependencies]
-cargo vet --locked                     # every crate audited or exempted (supply-chain/; CONTRIBUTING.md "Dependencies")
+cargo vet --locked                     # every crate audited or exempted (gates/supply-chain/; CONTRIBUTING.md "Dependencies")
 ```
 
 **Coverage gate — ≥80% line coverage, enforced per-crate:**

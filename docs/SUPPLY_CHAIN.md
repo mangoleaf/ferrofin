@@ -5,7 +5,7 @@ inside Ferrofin, what untrusted input reaches it, how well it is maintained, and
 version in `Cargo.lock`. The records are grouped by exposure; this file holds the network and TLS path.
 
 The rows are facts read from tools and from the published source, dated below. They are not audits. An audit is
-a `cargo-vet` entry (`supply-chain/`; [CONTRIBUTING.md](../CONTRIBUTING.md), "Dependencies", "Audits
+a `cargo-vet` entry (`gates/supply-chain/`; [CONTRIBUTING.md](../CONTRIBUTING.md), "Dependencies", "Audits
 (cargo-vet)"), and the last column says which one covers each crate.
 
 ## How to read a row
@@ -21,9 +21,9 @@ a `cargo-vet` entry (`supply-chain/`; [CONTRIBUTING.md](../CONTRIBUTING.md), "De
 | Maintenance | Whether the locked version is the latest release (`cargo upgrade --dry-run --incompatible allow`, 2026-11-08), the publish date of the matching GitHub release in parentheses where the upstream makes one, when the upstream repository was last pushed to, and whether it is archived (GitHub, 2026-11-08). A push date is repo-wide: where several crates share a repository it is the latest push to any of them. |
 | RustSec | Every advisory in the RustSec database (the advisory-db commit of 2026-11-06) filed against the crate, and whether the locked version has the fix. |
 | cargo-crev | The result of `cargo crev crate verify` (cargo-crev 0.27.1): N/A on every row. The environment this was run in had no trusted reviewer, so crev prints "There are no trusted Ids. There is nothing to verify against." and shows no review counts. The workspace-wide table leaves out the two dev-only crates (`rcgen`, `tokio-tungstenite` 0.30.0); run on them by name it gives the same result. Ferrofin publishes no crev proofs and gates nothing on crev. |
-| Audit | `Imported` names the organisation whose `cargo-vet` audit chain covers the locked version (`cargo vet explain-audit`). `Exempted, not audited` means the version sits under `[[exemptions]]` in `supply-chain/config.toml`: no organisation Ferrofin imports has audited it and Ferrofin has written no audit of its own. |
+| Audit | `Imported` names the organisation whose `cargo-vet` audit chain covers the locked version (`cargo vet explain-audit`). `Exempted, not audited` means the version sits under `[[exemptions]]` in `gates/supply-chain/config.toml`: no organisation Ferrofin imports has audited it and Ferrofin has written no audit of its own. |
 
-An exemption leaves `supply-chain/config.toml` when an imported audit covers the version: run `cargo vet` without
+An exemption leaves `gates/supply-chain/config.toml` when an imported audit covers the version: run `cargo vet` without
 `--locked` to fetch the imports again, then `cargo vet prune`. Ferrofin imports the Bytecode Alliance, Embark
 Studios, Google, ISRG, Mozilla and Zcash. The `cargo-vet` public registry also lists Actix, Ariel OS and Fermyon;
 none of the three audits any crate in this group at any version, apart from two Ariel OS deltas (`futures-core`
@@ -100,7 +100,7 @@ Crates on the path of a client request, a TLS handshake, or a request Ferrofin m
   dev-dependency, so its row is about the test client, not the shipped server.
 - **The certificate verifier.** `rustls` verifies through `rustls-webpki`, a transitive dependency. The locked
   0.103.16 is the first release with the fix for RUSTSEC-2026-0382 (distrusted intermediates accepted), and 0.103.10
-  to 0.103.13 carry the earlier 2026 fixes. The crate stays covered by the exemption list in `supply-chain/`, not
+  to 0.103.13 carry the earlier 2026 fixes. The crate stays covered by the exemption list in `gates/supply-chain/`, not
   by a row here.
 - **Native code.** The only separately built C or assembly in this group is AWS-LC (`aws-lc-sys` 0.47.0, the
   AWS-LC source vendored in the crate and built by its build script). In the shipped binary it sits below
