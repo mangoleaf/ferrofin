@@ -304,8 +304,8 @@ impl DynamicImageProviders {
     ///
     /// # Errors
     ///
-    /// Only when a supported kind's row list cannot be read; a failure on one
-    /// row is logged and the pass continues.
+    /// Only when a supported kind's id list, or a window of its rows, cannot
+    /// be read; a failure on one row is logged and the pass continues.
     pub async fn refresh_all(&self) -> Result<DynamicImageReport, ServiceError> {
         let nothing = || -> BetweenFuture<'_> { Box::pin(async {}) };
         self.refresh_all_between(&std::collections::HashSet::new(), &nothing)
@@ -423,7 +423,9 @@ impl DynamicImageProviders {
     }
 
     /// Every row of `kinds` but those in `skip`, in that order, each behind
-    /// its gate.
+    /// its gate. A kind's ids are listed whole and its rows read a window at
+    /// a time: a home-video or photo library makes a `Folder` or `PhotoAlbum`
+    /// row of every directory (gl-1482).
     async fn refresh_kinds_between<'b>(
         &self,
         kinds: &[BaseItemKind],
@@ -435,20 +437,18 @@ impl DynamicImageProviders {
             return Ok(report);
         }
         for &kind in kinds {
-            let rows = self
+            // The row list's statement and plan, selecting only the id, so
+            // the order is unchanged, ties included
+            // (`ids_list_kinds_in_the_row_order` pins it).
+            let rows: Vec<(Uuid, bool)> = self
                 .items
-                .get_item_list(&InternalItemsQuery {
-                    include_item_types: vec![kind],
-                    ..InternalItemsQuery::default()
-                })
-                .await?;
-            for row in rows {
-                if Uuid::parse_str(&row.id).is_ok_and(|id| skip.contains(&id)) {
-                    continue;
-                }
-                between().await;
-                self.refresh_tallied(&row, false, &mut report).await;
-            }
+                .get_item_ids(&kind_query(kind))
+                .await?
+                .into_iter()
+                .filter(|id| !skip.contains(id))
+                .map(|id| (id, false))
+                .collect();
+            self.refresh_windows(&rows, between, &mut report).await?;
         }
         Ok(report)
     }
@@ -487,8 +487,21 @@ impl DynamicImageProviders {
                 }
             }
         }
-        // Whole rows: read a bind-sized chunk at a time.
-        for chunk in order.chunks(ferrofin_db::BATCH_BIND_CHUNK) {
+        self.refresh_windows(&order, between, &mut report).await?;
+        Ok(report)
+    }
+
+    /// `rows` in order, each behind its gate and forced as listed, tallied
+    /// into `report`. Whole rows are read a bind-sized window at a time, so a
+    /// pass holds one window however many rows it draws; an id with no row
+    /// is skipped.
+    async fn refresh_windows<'b>(
+        &self,
+        rows: &[(Uuid, bool)],
+        between: &'b (dyn Fn() -> BetweenFuture<'b> + Send + Sync),
+        report: &mut DynamicImageReport,
+    ) -> Result<(), ServiceError> {
+        for chunk in rows.chunks(ferrofin_db::BATCH_BIND_CHUNK) {
             let ids: Vec<Uuid> = chunk.iter().map(|&(id, _)| id).collect();
             let mut found: std::collections::HashMap<Uuid, BaseItemEntity> = self
                 .items
@@ -502,10 +515,10 @@ impl DynamicImageProviders {
                     continue;
                 };
                 between().await;
-                self.refresh_tallied(&row, force, &mut report).await;
+                self.refresh_tallied(&row, force, report).await;
             }
         }
-        Ok(report)
+        Ok(())
     }
 
     /// One row of a pass, tallied into `report`; a failure is logged and the
@@ -891,6 +904,14 @@ impl DynamicImageProviders {
             .await?
             .iter()
             .any(|i| i.image_type == ImageType::Primary))
+    }
+}
+
+/// Every row of `kind`, for the closing pass.
+fn kind_query(kind: BaseItemKind) -> InternalItemsQuery {
+    InternalItemsQuery {
+        include_item_types: vec![kind],
+        ..InternalItemsQuery::default()
     }
 }
 
@@ -2051,5 +2072,22 @@ mod tests {
             plan.starts_with("SEARCH bi USING INDEX sqlite_autoindex_BaseItems_1 (Id=?)"),
             "{plan}"
         );
+    }
+
+    /// gl-1482: the closing pass lists a kind's ids, not its rows, and reads
+    /// the rows a window at a time. Only the projection may change: the same
+    /// plan keeps the rows' order, ties included, so the pass draws them in
+    /// the order it did.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn ids_list_kinds_in_the_row_order() {
+        use crate::latest_tv_repository::explain;
+        use crate::translate_query::{QueryShape, build_query};
+
+        let db = test_db().await;
+        for kind in [BaseItemKind::Folder, BaseItemKind::PhotoAlbum] {
+            let ids = explain(&db, build_query(&kind_query(kind), QueryShape::IdsOnly)).await;
+            let rows = explain(&db, build_query(&kind_query(kind), QueryShape::FullRows)).await;
+            assert_eq!(ids, rows, "{kind:?}");
+        }
     }
 }
