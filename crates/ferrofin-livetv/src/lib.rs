@@ -35,6 +35,7 @@ pub mod mapping;
 pub mod projection;
 mod recording_folders;
 pub mod recording_metadata;
+mod recording_postprocess;
 pub mod schedules_direct;
 pub mod stream;
 pub mod tuner_host;
