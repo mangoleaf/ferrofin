@@ -74,6 +74,30 @@ pub enum DbError {
         source: std::io::Error,
     },
 
+    /// An export of a data directory (`ferrofin-server export-jellyfin`) could
+    /// not read a source file or write its copy.
+    #[error("export failed at `{path}`: {source}")]
+    Export {
+        /// The file or directory being read or written.
+        path: String,
+        /// The underlying filesystem failure.
+        source: std::io::Error,
+    },
+
+    /// The source data directory was not the same after an export as before
+    /// it, so the export cannot vouch for having left it untouched, nor for its
+    /// output being a copy of one state of it.
+    #[error(
+        "the source data directory changed during the export, so its output cannot be trusted; changed: {}",
+        .changed.join(", ")
+    )]
+    ExportSourceChanged {
+        /// Each path that was added, removed or changed: relative to the
+        /// source, or absolute for a file SQLite keeps beside a database
+        /// that a link puts outside it.
+        changed: Vec<String>,
+    },
+
     /// A stored `Guid` column did not parse as a hyphenated UUID.
     #[error("invalid guid in column `{column}`: {source}")]
     InvalidGuid {
