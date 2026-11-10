@@ -105,18 +105,6 @@ pub struct LyricDto {
     pub lyrics: Vec<LyricLine>,
 }
 
-/// The information for a raw lyrics file before parsing.
-#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize, ToSchema)]
-#[serde(rename_all = "PascalCase")]
-pub struct LyricFile {
-    /// Gets or sets the name of the lyrics file. This must include the file
-    /// extension.
-    pub name: String,
-
-    /// Gets or sets the contents of the file.
-    pub content: String,
-}
-
 /// Lyric search request.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "PascalCase")]

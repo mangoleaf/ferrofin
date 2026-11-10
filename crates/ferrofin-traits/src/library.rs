@@ -179,18 +179,6 @@ pub struct SearchResult {
     pub score: f32,
 }
 
-/// A search hint (an item row) with the term that matched it.
-///
-/// Port of `MediaBrowser.Controller.Library.SearchHintInfo`; the domain
-/// `BaseItem Item` becomes a [`BaseItemEntity`] row.
-#[derive(Debug, Clone)]
-pub struct SearchHintInfo {
-    /// The matched item row.
-    pub item: BaseItemEntity,
-    /// The term that matched.
-    pub matched_term: String,
-}
-
 /// A recommendation category derived from a baseline item.
 ///
 /// Port of `MediaBrowser.Controller.Library.SimilarItemsRecommendation`; the

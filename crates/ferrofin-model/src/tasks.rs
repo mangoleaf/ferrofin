@@ -68,16 +68,6 @@ crate::json::enums::wire_enum! {
     }
 }
 
-/// Options for tasks.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, ToSchema)]
-#[serde(rename_all = "PascalCase")]
-pub struct TaskOptions {
-    /// Gets or sets the maximum runtime in ticks.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    #[serde(default, deserialize_with = "crate::json::value::nullable")]
-    pub max_runtime_ticks: Option<i64>,
-}
-
 /// Configuration for a task trigger.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "PascalCase")]

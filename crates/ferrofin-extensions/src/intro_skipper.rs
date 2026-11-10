@@ -1793,7 +1793,7 @@ mod tests {
                 running: runtime.running.clone(),
                 runtime: Arc::clone(&runtime),
                 virtual_folders: Arc::new(MediaLibrary(media.to_string_lossy().into_owned())),
-                chapters: Arc::new(ferrofin_traits::stubs::chapters::NoChapters),
+                chapters: Arc::new(crate::tests::NoChapters),
                 actions: Arc::clone(&actions)
                     as Arc<dyn ferrofin_traits::intro_skipper::IntroSkipperStore>,
             },
