@@ -129,7 +129,7 @@ mark() {
 # check <reason-producing command…>: add each line it prints to why[].
 check() { mapfile -t -O "${#why[@]}" why < <("$@"); }
 # reasons <command…>: the command's output as reasons when it fails, nothing when it succeeds.
-# shellcheck disable=SC2329  # called through check
+# shellcheck disable=SC2317,SC2329  # called through check (SC2317 is the code before shellcheck 0.11)
 reasons() { local out; out=$("$@" 2>&1) || printf '%s\n' "${out:-$1 failed}"; }
 # shellcheck source=gates/roundtrip/stage_ferrofin.sh
 . "$HERE/stage_ferrofin.sh"   # ferrofin_stage
