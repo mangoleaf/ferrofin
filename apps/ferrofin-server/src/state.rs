@@ -2697,6 +2697,7 @@ pub async fn build_app_state(
             db.clone(),
             Arc::clone(&sessions),
             Arc::clone(&library),
+            Arc::clone(&config_trait),
         )));
     }
     let tv_series: Arc<dyn ferrofin_traits::tv::TvSeriesManager> =
