@@ -20,7 +20,8 @@
 //! - `REAL` columns → [`f64`]; `INTEGER` booleans → [`bool`].
 //! - Enum-valued `INTEGER` columns are kept as [`i32`] discriminants and mapped
 //!   onto the [`crate::enums`] types (`ItemValueType`, `LinkedChildType`,
-//!   `MediaStreamTypeEntity`, `ImageInfoImageType`) by the conversion layer.
+//!   `MediaStreamTypeEntity`), or for image types onto
+//!   `ferrofin_model::entities::ImageType`, by the conversion layer.
 //! - The `Blurhash` `BLOB` → [`Vec<u8>`]; the `KeyframeTicks` JSON `TEXT` → a
 //!   [`String`] holding the raw JSON (parsed by the conversion layer).
 
