@@ -9,6 +9,9 @@ own README defines its numbers:
 | [`adoption/`](adoption/README.md) | Does every supported Jellyfin database adopt, intact? | the synthetic fixtures (`adoption/build-fixtures.sh`) |
 | [`parity/`](parity/README.md) | Do Jellyfin and Ferrofin answer jellyfin-web's requests alike? | the benchmark corpus, prepared for Jellyfin |
 | [`bench/`](bench/README.md) | How fast, and how much memory, against Jellyfin or the previous release? | the benchmark corpus; idle cores |
+| [`roundtrip/`](roundtrip/README.md) | Does the latest Jellyfin start on what Ferrofin leaves, with what the user did? | the adoption fixtures; the Jellyfin image `UPSTREAM_TAG` names |
+
+`roundtrip/` is not part of a `gates/run` session yet: run `gates/roundtrip/run.sh` on its own.
 
 [`gates/supply-chain/`](supply-chain) is not a gate. It is cargo-vet's store (`config.toml`, `audits.toml`,
 `imports.lock`), which CI's `vet` job reads and `gates/run` never runs.
