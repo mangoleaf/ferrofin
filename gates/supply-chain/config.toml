@@ -162,8 +162,9 @@ version = "9.1.1"
 criteria = "safe-to-deploy"
 
 [[exemptions.brotli-decompressor]]
-version = "6.3.0"
+version = "6.3.1"
 criteria = "safe-to-deploy"
+notes = "2026-11-10: the v1.5.1 freeze sweep moved it from 6.3.0, a starting exemption, and no imported audit covers 6.3.1; lifted by an imported or Ferrofin audit of 6.3.1"
 
 [[exemptions.bytemuck]]
 version = "1.25.2"
@@ -230,8 +231,9 @@ version = "0.5.4"
 criteria = "safe-to-deploy"
 
 [[exemptions.cms]]
-version = "0.3.0-rc.1"
+version = "0.3.0-rc.2"
 criteria = "safe-to-deploy"
+notes = "2026-11-10: the v1.5.1 freeze sweep moved it from 0.3.0-rc.1, a starting exemption, and no imported audit covers 0.3.0-rc.2; lifted by an imported or Ferrofin audit of 0.3.0-rc.2"
 
 [[exemptions.colorchoice]]
 version = "1.0.5"
@@ -624,8 +626,9 @@ version = "0.14.0"
 criteria = "safe-to-deploy"
 
 [[exemptions.itoa]]
-version = "1.0.18"
+version = "1.0.19"
 criteria = "safe-to-deploy"
+notes = "2026-11-10: the v1.5.1 freeze sweep moved it from 1.0.18, a starting exemption, and no imported audit covers 1.0.19; lifted by an imported or Ferrofin audit of 1.0.19"
 
 [[exemptions.jni]]
 version = "0.22.4"
@@ -784,12 +787,14 @@ version = "0.31.3"
 criteria = "safe-to-deploy"
 
 [[exemptions.notify]]
-version = "8.2.1"
+version = "8.2.2"
 criteria = "safe-to-deploy"
+notes = "2026-11-10: the v1.5.1 freeze sweep moved it from 8.2.1, a starting exemption, and no imported audit covers 8.2.2; lifted by an imported or Ferrofin audit of 8.2.2"
 
 [[exemptions.notify-types]]
-version = "2.2.0"
+version = "2.3.0"
 criteria = "safe-to-deploy"
+notes = "2026-11-10: the v1.5.1 freeze sweep moved it from 2.2.0, a starting exemption, and no imported audit covers 2.3.0; lifted by an imported or Ferrofin audit of 2.3.0"
 
 [[exemptions.num-bigint]]
 version = "0.4.8"
@@ -1236,8 +1241,9 @@ version = "2.0.119"
 criteria = "safe-to-deploy"
 
 [[exemptions.syn]]
-version = "3.0.9"
+version = "3.0.10"
 criteria = "safe-to-deploy"
+notes = "2026-11-10: the v1.5.1 freeze sweep moved it from 3.0.9, a starting exemption, and no imported audit covers 3.0.10; lifted by an imported or Ferrofin audit of 3.0.10"
 
 [[exemptions.synstructure]]
 version = "0.14.0"
@@ -1629,8 +1635,9 @@ version = "0.11.7"
 criteria = "safe-to-deploy"
 
 [[exemptions.zip]]
-version = "9.4.2"
+version = "9.5.0"
 criteria = "safe-to-deploy"
+notes = "2026-11-10: the v1.5.1 freeze sweep moved it from 9.4.2, a starting exemption, and no imported audit covers 9.5.0; lifted by an imported or Ferrofin audit of 9.5.0"
 
 [[exemptions.zlib-rs]]
 version = "0.6.8"
