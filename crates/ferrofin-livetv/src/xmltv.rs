@@ -141,28 +141,19 @@ pub struct Xmltv {
     pub error: Option<String>,
 }
 
-/// Parses an XMLTV document. Malformed XML yields whatever was read before the
-/// error, with [`Xmltv::error`] saying what went wrong, so a caller can tell a
-/// partial read from a complete guide.
+/// Parses an XMLTV document held as text, keeping every programme. Malformed
+/// XML yields whatever was read before the error, with [`Xmltv::error`] saying
+/// what went wrong, so a caller can tell a partial read from a complete guide.
+#[cfg(test)]
 #[must_use]
 pub fn parse_xmltv(xml: &str) -> Xmltv {
     parse_xmltv_where(xml, |_| true)
 }
 
-/// [`parse_xmltv`], keeping only the programmes `keep` accepts. Each one is
-/// judged on its start tag, before its children are read, so `keep` sees only
-/// the `channel`, `start` and `stop` it carries; the children of one it
-/// rejects are read past without being built, so a reader that wants a few
-/// channels' airings over a window builds no more of the rest of a large
-/// guide than their start tags. `keep` is also asked about a
-/// programme that never closes (cut off by an error, or left open around a
-/// nested one), so it should only decide. Channels and [`Xmltv::error`] are
-/// reported in full, so `parse_xmltv_where(xml, |_| false)` reads just the
-/// channel list and whether the document is readable.
-///
-/// The text is already decoded, so an encoding the document declares is not
-/// applied again, and it is read with no language, as `new XmlTvReader(path)`
-/// reads it.
+/// [`read_xmltv_where`] over a document held as text. The text is already
+/// decoded, so an encoding the document declares is not applied again, and it
+/// is read with no language, as `new XmlTvReader(path)` reads it.
+#[cfg(test)]
 #[must_use]
 pub fn parse_xmltv_where(xml: &str, keep: impl FnMut(&XmltvProgramme) -> bool) -> Xmltv {
     let mut programmes = Vec::new();
@@ -173,8 +164,21 @@ pub fn parse_xmltv_where(xml: &str, keep: impl FnMut(&XmltvProgramme) -> bool) -
     }
 }
 
-/// [`parse_xmltv_where`] over a document read as it arrives, from a file or
-/// any other byte source, so the document is never held whole.
+/// Reads an XMLTV document as it arrives, from a file or any other byte
+/// source, so the document is never held whole, keeping only the programmes
+/// `keep` accepts in [`Xmltv::programmes`]. Malformed XML yields whatever was
+/// read before the error, with [`Xmltv::error`] saying what went wrong, so a
+/// caller can tell a partial read from a complete guide.
+///
+/// Each programme is judged on its start tag, before its children are read,
+/// so `keep` sees only the `channel`, `start` and `stop` it carries; the
+/// children of one it rejects are read past without being built, so a reader
+/// that wants a few channels' airings over a window builds no more of the rest
+/// of a large guide than their start tags. `keep` is also asked about a
+/// programme that never closes (cut off by an error, or left open around a
+/// nested one), so it should only decide. Channels and [`Xmltv::error`] are
+/// reported in full, so `read_xmltv_where(source, None, |_| false)` reads just
+/// the channel list and whether the document is readable.
 ///
 /// The bytes are decoded the way `XmlTvReader`'s `XmlReader` decodes the
 /// cached file (Jellyfin.XmlTv `XmlTvReader.CreateXmlTextReader`): by the
@@ -590,7 +594,7 @@ fn located(error: impl std::fmt::Display, position: u64) -> String {
 
 /// Reads the XMLTV document `reader` yields, handing each programme `keep`
 /// accepts on its start tag to `each` as it closes — see
-/// [`parse_xmltv_where`].
+/// [`read_xmltv_where`].
 ///
 /// The guide is read where `XmlTvReader` reads it ([`TvScope`]), and what
 /// `XmlReader` would read on the way must be well-formed: a mismatched end
