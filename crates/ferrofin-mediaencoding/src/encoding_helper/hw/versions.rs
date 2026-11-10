@@ -2,10 +2,9 @@
 //! consults.
 //!
 //! Port of the `_minFFmpeg*` / `_min*Kernel*i915*` / `_minKernelVersionAmd*`
-//! readonly fields of C# `EncodingHelper` (10.11.z lines 64–87), plus
-//! `EncoderValidator._minFFmpegMultiThreadedCli`. Every value is upstream-fixed
-//! — an ffmpeg release either grew the option or it did not — so these are
-//! constants, never configuration.
+//! readonly fields of C# `EncodingHelper` (10.11.z lines 64–87). Every value is
+//! upstream-fixed — an ffmpeg release either grew the option or it did not — so
+//! these are constants, never configuration.
 //!
 //! Ferrofin's container image ships jellyfin-ffmpeg 7, which clears every gate
 //! here; the gates still matter because an operator may point
@@ -79,10 +78,6 @@ pub const MIN_FFMPEG_RKMPP_HEVC_DEC_DOVI_RPU: FfmpegVersion = FfmpegVersion::wit
 /// The `-readrate_catchup` option exists. Port of
 /// `_minFFmpegReadrateCatchupOption` (8.0).
 pub const MIN_FFMPEG_READRATE_CATCHUP_OPTION: FfmpegVersion = FfmpegVersion::new(8, 0);
-
-/// The ffmpeg CLI became multi-threaded and so less sensitive to stdin timing.
-/// Port of `EncoderValidator._minFFmpegMultiThreadedCli` (7.0).
-pub const MIN_FFMPEG_MULTI_THREADED_CLI: FfmpegVersion = FfmpegVersion::new(7, 0);
 
 /// First kernel exhibiting the i915 hang. Port of `_minKerneli915Hang` (5.18).
 ///
