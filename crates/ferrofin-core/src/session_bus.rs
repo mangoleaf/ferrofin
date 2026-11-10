@@ -45,6 +45,7 @@ impl FerrofinSessionMessageBus {
     /// # Panics
     /// Panics only if the internal mutex has been poisoned by a prior panic
     /// while a lock was held (not reachable in normal operation).
+    #[cfg(test)]
     #[must_use]
     pub fn connection_count(&self) -> usize {
         self.sinks.lock().expect("session bus mutex poisoned").len()

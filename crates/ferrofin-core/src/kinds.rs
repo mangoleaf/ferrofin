@@ -1,8 +1,8 @@
 //! `BaseItem` domain behavior, ported as free functions over [`BaseItemKind`].
 //!
 //! In Jellyfin the `BaseItem` → `Folder` → `Video` (etc.) class hierarchy carries
-//! virtual boolean properties — `IsFolder`, `SupportsThemeMedia`,
-//! `SupportsPlayedStatus`, … — that each concrete subclass overrides. Ferrofin has no
+//! virtual boolean properties — `IsFolder`, `SupportsPlayedStatus`, … — that
+//! each concrete subclass overrides. Ferrofin has no
 //! `BaseItem` object graph: item rows are [`ferrofin_db::entities::base_items::BaseItemEntity`]
 //! and their *kind* is a [`BaseItemKind`]. The OOP behavior therefore lives here
 //! as pure functions keyed on the kind.
@@ -12,8 +12,7 @@
 //!   (`Folder`/`AggregateFolder`/`BoxSet`/`Series`/`Season`/`MusicAlbum`/… plus the
 //!   `BasePluginFolder` line);
 //! - `Video` and its subclasses (`Movie`/`Episode`/`MusicVideo`/`Trailer`/`Video`)
-//!   override `SupportsThemeMedia` and `SupportsInheritedParentImages` to
-//!   `true`;
+//!   override `SupportsInheritedParentImages` to `true`;
 //! - the `IItemByName` kinds (`Genre`/`MusicGenre`/`Studio`/`Year`/`Person`/
 //!   `MusicArtist`) are the by-name items.
 //!
@@ -402,13 +401,6 @@ pub fn implements_has_media_sources(kind: BaseItemKind) -> bool {
         || matches!(kind, BaseItemKind::LiveTvChannel | BaseItemKind::TvChannel)
 }
 
-/// Whether items of this kind can have theme songs/videos
-/// (C# `BaseItem.SupportsThemeMedia`, `true` for `Folder` and `Video`).
-#[must_use]
-pub fn supports_theme_media(kind: BaseItemKind) -> bool {
-    is_folder(kind) || is_video(kind)
-}
-
 /// Whether items of this kind inherit parent images — the C#
 /// `BaseItem.SupportsInheritedParentImages` override table (v12.0-rc7):
 ///
@@ -481,14 +473,6 @@ pub fn default_primary_image_aspect_ratio(kind: BaseItemKind) -> f64 {
         BaseItemKind::Episode | BaseItemKind::Studio => 16.0 / 9.0,
         _ => 0.0,
     }
-}
-
-/// Whether items of this kind participate in the ancestor closure
-/// (C# `BaseItem.SupportsAncestors`, `true` by default; the by-name grouping
-/// kinds do not).
-#[must_use]
-pub fn supports_ancestors(kind: BaseItemKind) -> bool {
-    !is_item_by_name(kind)
 }
 
 /// Whether an item of this kind may be deleted at all — the kind half of
@@ -835,9 +819,8 @@ mod tests {
         collection_type_of, has_media_sources, implements_has_media_sources, is_folder,
         is_item_by_name, is_video, latest_items_index_container_kind, photo_auto_orients,
         presentation_unique_key, saved_sort_name, series_presentation_unique_key,
-        series_user_data_keys, supports_adding_to_playlist, supports_ancestors,
-        supports_inherited_parent_images, supports_played_status, supports_position_ticks_resume,
-        supports_similarity, supports_theme_media,
+        series_user_data_keys, supports_adding_to_playlist, supports_inherited_parent_images,
+        supports_played_status, supports_position_ticks_resume, supports_similarity,
     };
     use ferrofin_model::data::MediaType;
     use ferrofin_model::data::{BaseItemKind, CollectionType};
@@ -1189,7 +1172,7 @@ mod tests {
     }
 
     #[test]
-    fn videos_support_theme_media() {
+    fn videos_support_inherited_parent_images() {
         for kind in [
             BaseItemKind::Movie,
             BaseItemKind::Episode,
@@ -1198,14 +1181,8 @@ mod tests {
             BaseItemKind::Trailer,
         ] {
             assert!(is_video(kind));
-            assert!(supports_theme_media(kind));
             assert!(supports_inherited_parent_images(kind));
         }
-    }
-
-    #[test]
-    fn folders_support_theme_media() {
-        assert!(supports_theme_media(BaseItemKind::Series));
     }
 
     /// `IHasMediaSources` is implemented by `Video`, `Audio` and
@@ -1412,7 +1389,7 @@ mod tests {
     }
 
     #[test]
-    fn by_name_kinds_do_not_support_ancestors_or_played_status() {
+    fn by_name_kinds_do_not_support_played_status() {
         for kind in [
             BaseItemKind::Genre,
             BaseItemKind::MusicGenre,
@@ -1422,10 +1399,8 @@ mod tests {
             BaseItemKind::MusicArtist,
         ] {
             assert!(is_item_by_name(kind));
-            assert!(!supports_ancestors(kind));
             assert!(!supports_played_status(kind, MediaType::Unknown));
         }
-        assert!(supports_ancestors(BaseItemKind::Movie));
         assert!(supports_played_status(
             BaseItemKind::Movie,
             MediaType::Unknown

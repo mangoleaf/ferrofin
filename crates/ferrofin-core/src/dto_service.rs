@@ -4900,7 +4900,7 @@ impl FerrofinDtoService {
                 // not see.
                 let allowed: std::collections::HashSet<Uuid> = match self
                     .library
-                    .get_parentally_allowed_item_ids(&person_ids, user, true)
+                    .get_parentally_allowed_item_ids(&person_ids, user)
                     .await
                 {
                     Ok(allowed) => allowed.into_iter().collect(),
@@ -5596,7 +5596,6 @@ mod tests {
             &self,
             ids: &[Uuid],
             _user: &UserEntity,
-            _skip_allowed_tags: bool,
         ) -> Result<Vec<Uuid>, ServiceError> {
             if self
                 .named_items
