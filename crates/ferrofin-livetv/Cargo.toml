@@ -33,6 +33,7 @@ flate2.workspace = true
 # XMLTV guides in the encoding they declare (`XmlReader`'s decoding).
 encoding_rs.workspace = true
 tracing.workspace = true
+shlex.workspace = true
 tokio = { workspace = true }
 # The recording listing's file checks, as many at a time as there are usable cores.
 futures-util.workspace = true

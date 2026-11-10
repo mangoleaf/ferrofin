@@ -3285,9 +3285,8 @@ async fn stored_channel(f: &Fixture) -> String {
 }
 
 /// A recording's id names no `BaseItems` row, and it must still play for every
-/// caller who may reach it. Its rule is `GET /LiveTv/Recordings/{id}`'s, the one
-/// route that reads it, since `PlaybackInfo` finds no item for anyone: "Live TV
-/// access", its own visibility, the library holding its file, and its channel.
+/// caller who may reach it. PlaybackInfo and the stream routes apply Live TV
+/// access and check the recording, its containing libraries, and its channel.
 #[allow(
     clippy::too_many_lines,
     reason = "one recording, through every rule that reaches it"
@@ -3300,6 +3299,7 @@ async fn a_recording_plays_for_whoever_may_read_it() {
     let id = stored_recording(&f, "recordings", "show", channel).await;
     let uri = format!("/Videos/{id}/stream?static=true");
     let audio = format!("/Audio/{id}/stream?static=true");
+    let info = format!("/Items/{id}/PlaybackInfo");
     assert_eq!(status_with(&f.router, &uri, &[]).await, StatusCode::OK);
     for token in [&f.viewer, &f.admin] {
         assert_eq!(
@@ -3314,6 +3314,12 @@ async fn a_recording_plays_for_whoever_may_read_it() {
             .0,
             StatusCode::OK
         );
+        for (method, body) in [("GET", None), ("POST", Some(json!({"MediaSourceId": id})))] {
+            let (status, response) = call(&f.router, method, &info, Some(token), body).await;
+            assert_eq!(status, StatusCode::OK, "{method} {info}: {response}");
+            assert_eq!(response["MediaSources"][0]["Id"], id);
+            assert!(response["PlaySessionId"].is_string());
+        }
         for uri in [&uri, &audio] {
             assert_eq!(
                 call(&f.router, "GET", uri, Some(token), None).await.0,
@@ -3324,6 +3330,24 @@ async fn a_recording_plays_for_whoever_may_read_it() {
     }
     let hidden = stored_recording(&f, "more", "kept-out", channel).await;
     let uri_hidden = format!("/Videos/{hidden}/stream?static=true");
+    let hidden_info = format!("/Items/{hidden}/PlaybackInfo");
+    for (recording, expected) in [
+        (&hidden_info, StatusCode::NOT_FOUND),
+        (&info, StatusCode::OK),
+    ] {
+        assert_eq!(
+            call(
+                &f.router,
+                "POST",
+                recording,
+                Some(&f.viewer),
+                Some(json!({}))
+            )
+            .await
+            .0,
+            expected
+        );
+    }
     assert_eq!(
         call(&f.router, "GET", &uri_hidden, Some(&f.viewer), None)
             .await
@@ -3370,11 +3394,9 @@ async fn a_recording_plays_for_whoever_may_read_it() {
             policy["BlockUnratedItems"] = json!([kind]);
         })
         .await;
-        for route in [uri.clone(), format!("/LiveTv/Recordings/{id}")] {
+        for route in [&uri, &info, &format!("/LiveTv/Recordings/{id}")] {
             assert_eq!(
-                call(&f.router, "GET", &route, Some(&f.viewer), None)
-                    .await
-                    .0,
+                call(&f.router, "GET", route, Some(&f.viewer), None).await.0,
                 StatusCode::NOT_FOUND,
                 "{kind} unrated blocked: {route}"
             );
@@ -3385,7 +3407,7 @@ async fn a_recording_plays_for_whoever_may_read_it() {
         policy["EnableLiveTvAccess"] = json!(false);
     })
     .await;
-    for uri in [&uri, &audio] {
+    for uri in [&uri, &audio, &info] {
         assert_eq!(
             call(&f.router, "GET", uri, Some(&f.viewer), None).await.0,
             StatusCode::NOT_FOUND,

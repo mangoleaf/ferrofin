@@ -953,7 +953,8 @@ pub const VERIFIED_SUBSYSTEMS_AGAINST_EARLIER_PIN: &[(&str, &str)] = &[];
 /// HLS routes;
 /// `video-stream-copy` is whether a transcode job copies the source video and
 /// what dynamic HDR metadata the copy strips, which the HLS and stream routes
-/// share.
+/// share; `recording-postprocessing` is the executable run after a retained
+/// DVR capture, which no HTTP response describes.
 pub const SUBSYSTEM_KEYS: &[&str] = &[
     "query-translation",
     "dto-fields",
@@ -967,6 +968,7 @@ pub const SUBSYSTEM_KEYS: &[&str] = &[
     "trickplay-extraction",
     "trickplay",
     "video-stream-copy",
+    "recording-postprocessing",
 ];
 
 /// One shared subsystem whose Ferrofin implementation was compared against the
@@ -994,6 +996,27 @@ pub struct VerifiedSubsystem {
 /// [`VERIFIED_SUBSYSTEMS_AGAINST_EARLIER_PIN`] names), under the rules of
 /// [`VERIFIED`]. Subsystem rows never count towards the operation parity line.
 pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
+    VerifiedSubsystem {
+        key: "recording-postprocessing",
+        upstream_file: "src/Jellyfin.LiveTv/Recordings/RecordingsManager.cs",
+        upstream_method: "PostProcessRecording",
+        ferrofin: "ferrofin-livetv manager.rs settle_timer (RecordStream: only the retained \
+                   capture branch, after persisting Completed, including a failed capture \
+                   whose retry window is exhausted) -> recording_postprocess.rs run: read \
+                   current LiveTvOptions, skip a blank executable, expand {path} ignoring \
+                   case, launch without a shell, await exit, log spawn/argument errors \
+                   without changing recording success. Compared with RecordStream and \
+                   PostProcessRecording at the pinned v12.4 tag.",
+        date: "2026-11-08",
+        divergences: &[
+            "Arguments use POSIX shell-word quoting without shell execution; the template \
+             is split before replacing {path}, so spaces, quotes and metacharacters in \
+             recording names remain literal argument contents instead of changing parsing.",
+            "Argument values are not logged because a configured template can contain secrets.",
+            "After a configured processor exits, refresh the recording again so changed codecs \
+             and duration are discovered even when its library has no filesystem watcher.",
+        ],
+    },
     VerifiedSubsystem {
         key: "scan-failure-isolation",
         upstream_file: "MediaBrowser.Controller/Entities/TV/Episode.cs",
@@ -1401,7 +1424,8 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
                    require_streamable_item at the stream, HLS, universal audio, subtitle and \
                    attachment routes (StreamingHelpers.GetStreamingState, \
                    SubtitleController.GetSubtitle, VideoAttachmentsController.GetAttachment); \
-                   item_repository.rs \
+                   handlers/media_info.rs playback_info (MediaInfoController.GetPlaybackInfo, \
+                   GetPostedPlaybackInfo); item_repository.rs \
                    resolve_views_with_parent and item_visibility.rs hidden_playlists on \
                    listings that can hold a playlist (Folder.QueryRecursive, \
                    Folder.QueryWithPostFiltering, Playlist.IsVisible); dto_service.rs \
@@ -1438,11 +1462,13 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
              same check, as PlaybackInfo does. A DVR recording has no row here, so it takes \
              Live TV access, IsVisibleStandalone over its entity, the libraries holding its \
              file (found as GetCollectionFolders finds them, ignoring case) and then its \
-             channel, a rule GET and DELETE /LiveTv/Recordings/{recordingId} \
-             now share and GET /LiveTv/Recordings lists by; upstream's recording is a library \
-             item, whose library holds it. On the routes upstream leaves anonymous, no \
-             credential, a token that names nobody and an API key stay so, which binds a \
-             client that sends its token. The legacy /hls/ \
+             channel. GET and POST PlaybackInfo use that rule for DVR ids as well, resolving \
+             sources through the recording media-source manager. GET and DELETE \
+             /LiveTv/Recordings/{recordingId} share the visibility check, and GET \
+             /LiveTv/Recordings lists by it. Upstream addresses recordings by their \
+             library item ids and has no separate DVR id to resolve. On the routes upstream \
+             leaves anonymous, no credential, a token that names nobody and an API key \
+             stay so, which binds a client that sends its token. The legacy /hls/ \
              routes are outside this: they serve a transcode's file by its random name, and \
              the item id selects nothing, as upstream. Deliberate divergence (owner decision \
              2026-10-31, gl-1090).",
