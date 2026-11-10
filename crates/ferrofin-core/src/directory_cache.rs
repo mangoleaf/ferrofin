@@ -351,7 +351,6 @@ fn image_metadata(entry: &FileSystemEntryInfo) -> FileSystemMetadata {
         extension,
         length,
         last_write_time_utc: None,
-        creation_time_utc: None,
         is_directory,
     }
 }

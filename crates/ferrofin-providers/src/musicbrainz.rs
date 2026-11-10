@@ -549,14 +549,9 @@ impl MusicBrainzClient {
             .await
     }
 
-    /// Resolves an artist's `MusicBrainzArtist` id by name, or `None`. Port of
-    /// `MusicBrainzArtistProvider`'s search. Uses `artist:"…"` / `artistaccent`
-    /// lucene the same way the C# builds it.
-    pub async fn search_artist(&self, name: &str) -> Option<String> {
-        Some(self.search_artist_match(name).await?.id)
-    }
-
-    /// The first artist search hit, id **and** name.
+    /// The first artist search hit for `name`, its `MusicBrainzArtist` id
+    /// **and** name, or `None`. Port of `MusicBrainzArtistProvider`'s search.
+    /// Uses `artist:"…"` / `artistaccent` lucene the same way the C# builds it.
     ///
     /// The name is what `MusicBrainzArtistProvider.cs:146` writes back over the
     /// item's when `ReplaceArtistName` is on
@@ -1328,7 +1323,10 @@ mod tests {
         let c = MusicBrainzClient::new(&server.base_url, "test");
 
         assert_eq!(
-            c.search_artist("Miles Davis").await.as_deref(),
+            c.search_artist_match("Miles Davis")
+                .await
+                .map(|hit| hit.id)
+                .as_deref(),
             Some("artist-mbid")
         );
 
@@ -1532,7 +1530,7 @@ mod tests {
     #[ignore = "hits the live MusicBrainz API; run with --ignored"]
     async fn live_resolves_kind_of_blue() {
         let c = MusicBrainzClient::new("", "test");
-        let artist = c.search_artist("Miles Davis").await;
+        let artist = c.search_artist_match("Miles Davis").await.map(|hit| hit.id);
         assert!(artist.is_some(), "expected an artist mbid");
         let ids = c
             .resolve_album(
