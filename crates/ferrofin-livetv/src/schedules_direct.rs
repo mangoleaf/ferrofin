@@ -38,7 +38,7 @@ pub use guide::SdProgram;
 
 use ferrofin_util::directory_path::DirectoryPath;
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, RwLock};
 use std::time::{Duration, SystemTime};
 
@@ -231,8 +231,9 @@ impl SchedulesDirect {
     }
 
     /// The on-disk cache file for the country list.
+    #[cfg(test)]
     #[must_use]
-    pub fn countries_cache_path(&self) -> PathBuf {
+    pub fn countries_cache_path(&self) -> std::path::PathBuf {
         self.cache_dir.join(COUNTRIES_CACHE_FILE)
     }
 

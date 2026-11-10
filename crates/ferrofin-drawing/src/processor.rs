@@ -48,17 +48,15 @@ use uuid::Uuid;
 
 /// The cache-invalidation version stamped into every resized-image cache key.
 ///
-/// Port of the C# `private const char Version = '3'`: bump it to invalidate all
-/// previously-cached resized images. Surfaced as the default of
-/// [`ImageProcessor::cache_version`] (a configurable setting) rather than a bare
-/// literal, so a host can force a cache flush without a recompile.
+/// Port of the C# `private const char Version` (`'4'` at v12.4): bump it to
+/// invalidate all previously-cached resized images.
 ///
-/// Deliberately ahead of upstream's `'3'`. The JPEG encoder moved from 4:4:4 to
-/// Jellyfin's 4:2:0 chroma subsampling with optimized Huffman tables, so every
-/// image cached by an earlier Ferrofin is stale in a way upstream never had to
-/// invalidate. Without the bump an upgraded install keeps serving the old bytes
-/// from disk forever. The key is Ferrofin-local (its own cache directory) and
-/// never reaches the wire, so this does not diverge from the HTTP contract.
+/// Ferrofin moved to `'4'` while upstream was still at `'3'`, when its JPEG
+/// encoder moved from 4:4:4 to Jellyfin's 4:2:0 chroma subsampling with
+/// optimized Huffman tables: every image cached by an earlier Ferrofin was
+/// stale, and without the bump an upgraded install would keep serving the old
+/// bytes from disk forever. The key is Ferrofin-local (its own cache directory)
+/// and never reaches the wire, so it is not part of the HTTP contract.
 const DEFAULT_CACHE_VERSION: char = '4';
 
 /// The image extensions that require a transparency-preserving output format.
@@ -143,16 +141,15 @@ pub struct ImageProcessor<F = StdFileMeta> {
     /// shared with the blocking-pool tasks that call it.
     file_meta: Arc<F>,
 
-    /// The cache-invalidation version stamped into every cache key. Defaults to
-    /// [`DEFAULT_CACHE_VERSION`]; a configurable setting so a host can force a
-    /// cache flush.
+    /// The cache-invalidation version stamped into every cache key: upstream's
+    /// `Version` constant, [`DEFAULT_CACHE_VERSION`]. Only tests override it.
     cache_version: char,
 }
 
 impl ImageProcessor<StdFileMeta> {
     /// Constructs an [`ImageProcessor`] over `encoder`, caching resized images
     /// beneath `image_cache_path`, using the real `std::fs`-backed [`FileMeta`]
-    /// and the default [`cache_version`](Self::with_cache_version) of `'4'`.
+    /// and the cache version `'4'` (upstream's `Version`).
     #[must_use]
     pub fn new(encoder: Arc<dyn ImageEncoder>, image_cache_path: impl Into<DirectoryPath>) -> Self {
         Self {
@@ -169,8 +166,9 @@ impl ImageProcessor<StdFileMeta> {
 }
 
 impl<F: FileMeta> ImageProcessor<F> {
-    /// Constructs an [`ImageProcessor`] with an explicit [`FileMeta`] seam (used
-    /// by tests to supply a fake filesystem).
+    /// Constructs an [`ImageProcessor`] with an explicit [`FileMeta`] seam, so a
+    /// test can supply a fake filesystem.
+    #[cfg(test)]
     #[must_use]
     pub fn with_file_meta(
         encoder: Arc<dyn ImageEncoder>,
@@ -200,6 +198,7 @@ impl<F: FileMeta> ImageProcessor<F> {
 
     /// Overrides the `cache_version` (default `DEFAULT_CACHE_VERSION`) stamped
     /// into cache keys. Bumping it invalidates every previously-cached resized image.
+    #[cfg(test)]
     #[must_use]
     pub fn with_cache_version(mut self, version: char) -> Self {
         self.cache_version = version;
