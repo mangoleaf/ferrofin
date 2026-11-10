@@ -120,7 +120,8 @@ pub struct Cli {
 #[derive(Debug, Clone, clap::Subcommand)]
 pub enum Command {
     /// Copy a stopped data directory and a snapshot of its database into a
-    /// new directory, leaving the source untouched.
+    /// new directory, with its configuration as the XML Jellyfin reads,
+    /// leaving the source untouched.
     // Hidden from `--help` (the man page's synopsis still shows a generic
     // `[subcommands]`) until Jellyfin can start on what it writes: the export lacks the history rewrite (gl-1549) and the
     // removal of Ferrofin's own objects (gl-1553); gl-1570 documents it.
