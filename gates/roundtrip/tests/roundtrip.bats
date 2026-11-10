@@ -61,6 +61,7 @@ removed() { [ ! -f "$TMP/state/removed" ] || grep "^${1:-}" "$TMP/state/removed"
   echo 'nothing' > handlers.rs
   run --separate-stderr rt_jellyfin_image handlers.rs
   [ "$status" -eq 2 ]
+  # shellcheck disable=SC2154  # $stderr is set by bats' run --separate-stderr
   [[ "$stderr" == *"cannot read UPSTREAM_TAG"* ]]
 }
 
@@ -168,7 +169,9 @@ EOS
 
 @test "run.sh: an unknown route, a bad run id, a reused work directory, a held id and a missing image are refused" {
   run --separate-stderr run_gate "$TMP/w1" --only 9.9
-  [ "$status" -eq 2 ]; [[ "$stderr" == *"no route 9.9 in routes.sh"* ]]
+  [ "$status" -eq 2 ]
+  # shellcheck disable=SC2154  # $stderr is set by bats' run --separate-stderr
+  [[ "$stderr" == *"no route 9.9 in routes.sh"* ]]
   run --separate-stderr run_gate "$TMP/w2" --run-id 'Bad Id'
   [ "$status" -eq 2 ]; [[ "$stderr" == *"--run-id must be"* ]]
   mkdir "$TMP/w3"
