@@ -22,34 +22,46 @@
 //!
 //! `database.xml` is not written: Ferrofin is SQLite-only, and Jellyfin writes
 //! its SQLite default itself.
+//!
+//! Each library's options go the same way ([`export_library_options`]): its
+//! `options.json`, read as the server reads it, as the `options.xml` beside it,
+//! with its media paths stored as Jellyfin stores them.
 
 mod branding;
 mod encoding;
+mod library;
 mod metadata;
 mod network;
 mod system;
 mod xbmcmetadata;
 mod xml;
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use serde_json::{Map, Value};
 
 use ferrofin_model::branding::BrandingOptions;
-use ferrofin_model::configuration::{EncodingOptions, MetadataConfiguration, XbmcMetadataOptions};
+use ferrofin_model::configuration::{
+    EncodingOptions, LibraryOptions, MetadataConfiguration, XbmcMetadataOptions,
+};
 use ferrofin_networking::NetworkConfiguration;
 use ferrofin_traits::error::ServiceError;
+use ferrofin_traits::system::ServerApplicationPaths;
 
+use crate::app_paths::FerrofinServerApplicationPaths;
 use crate::configuration_manager::FerrofinServerConfigurationManager as Manager;
+use crate::virtual_folder_manager::FerrofinVirtualFolderManager;
+use crate::virtual_paths::VirtualPathExpander;
 
 /// One file of the export, relative to Jellyfin's program data directory
-/// (`config/system.xml`, `data/device.txt`).
+/// (`config/system.xml`, `data/device.txt`, `root/default/Movies/options.xml`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExportedFile {
     /// Where the file goes, relative to Jellyfin's program data directory.
-    pub path: &'static str,
+    pub path: String,
     /// The file's contents.
     pub contents: String,
 }
@@ -58,7 +70,7 @@ pub struct ExportedFile {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NotExported {
     /// The document it belongs to (`config/network.xml`).
-    pub file: &'static str,
+    pub file: String,
     /// The setting's name (`CertificatePath`).
     pub setting: String,
     /// Why Jellyfin is not given Ferrofin's value.
@@ -68,7 +80,8 @@ pub struct NotExported {
 /// The configuration export: the files to write, and what they leave out.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ConfigExport {
-    /// The XML documents and the server id file.
+    /// The files to write: the XML documents and the server id file, or each
+    /// library's `options.xml`.
     pub files: Vec<ExportedFile>,
     /// The settings whose Ferrofin value Jellyfin is not given.
     pub not_exported: Vec<NotExported>,
@@ -76,8 +89,6 @@ pub struct ConfigExport {
 
 /// How one document is written.
 struct Document {
-    /// The file, relative to Jellyfin's program data directory.
-    file: &'static str,
     /// The document element (`ServerConfiguration`).
     root: &'static str,
     /// Settings the import does not carry in, so the export does not carry
@@ -106,36 +117,42 @@ pub fn export_configuration(config_dir: &Path) -> Result<ConfigExport, ServiceEr
     let named = config_dir.join("users").join(Manager::NAMED_SUBDIR);
     let mut export = ConfigExport::default();
     export_document(
+        system::FILE,
         &system::DOCUMENT,
         &system::read(config_dir)?,
         &crate::configuration_manager::default_server_configuration(),
         &mut export,
     )?;
     export_named::<EncodingOptions>(
+        encoding::FILE,
         &encoding::DOCUMENT,
         &named,
         Manager::ENCODING_FILE_NAME,
         &mut export,
     )?;
     export_named::<BrandingOptions>(
+        branding::FILE,
         &branding::DOCUMENT,
         &named,
         Manager::BRANDING_FILE_NAME,
         &mut export,
     )?;
     export_named::<NetworkConfiguration>(
+        network::FILE,
         &network::DOCUMENT,
         &named,
         Manager::NETWORK_FILE_NAME,
         &mut export,
     )?;
     export_named::<MetadataConfiguration>(
+        metadata::FILE,
         &metadata::DOCUMENT,
         &named,
         Manager::METADATA_FILE_NAME,
         &mut export,
     )?;
     export_named::<XbmcMetadataOptions>(
+        xbmcmetadata::FILE,
         &xbmcmetadata::DOCUMENT,
         &named,
         Manager::XBMC_METADATA_FILE_NAME,
@@ -145,14 +162,111 @@ pub fn export_configuration(config_dir: &Path) -> Result<ConfigExport, ServiceEr
     Ok(export)
 }
 
+/// Exports the options of every library of the Ferrofin data directory
+/// `program_data_dir`, whose config directory is `config_dir`, as the
+/// `root/default/<library>/options.xml` Jellyfin reads. Nothing in it is
+/// changed.
+///
+/// A library is a directory under `root/default`, or a link to one, as the
+/// server lists them. Its options are read as the server reads them
+/// (`FerrofinVirtualFolderManager::read_options`): its `options.json`, else
+/// the adopted `options.xml` Ferrofin has not converted yet, else the
+/// defaults. Each media path is stored as `CollectionFolder.SaveLibraryOptions`
+/// stores it, through `ReverseVirtualPath`. A path in the data or metadata
+/// directory becomes `%AppDataPath%/…` or `%MetadataPath%/…` (the Collections
+/// library's own folder is one), so it follows Jellyfin's directories.
+///
+/// `program_data_dir` must be the path the server ran with (its `--data-dir`),
+/// as Jellyfin's own `ReverseVirtualPath` uses its running paths: Ferrofin
+/// stores media paths resolved, so a data directory read from another mount
+/// point leaves the Collections folder as an absolute path Jellyfin may not
+/// have.
+///
+/// # Errors
+///
+/// Returns [`ServiceError::Backend`] when `system.json` (which names the
+/// metadata directory) is missing or does not parse, when the library root
+/// cannot be listed, when a library folder's name is not UTF-8, or when a
+/// value cannot be written as XML.
+pub async fn export_library_options(
+    program_data_dir: &Path,
+    config_dir: &Path,
+) -> Result<ConfigExport, ServiceError> {
+    // Only the data, metadata and library directories are read; the log,
+    // cache and web directories are there because the constructor takes them.
+    let paths = FerrofinServerApplicationPaths::new(
+        program_data_dir,
+        program_data_dir.join("log"),
+        config_dir,
+        program_data_dir.join("cache"),
+        program_data_dir.join("web"),
+    );
+    // `%MetadataPath%` stands for the configured metadata directory, as the
+    // server's load sets it.
+    paths.set_internal_metadata_path(Some(&system::read(config_dir)?.metadata_path));
+    let root = PathBuf::from(paths.default_user_views_path());
+    let expander = VirtualPathExpander::from_paths(Arc::new(paths));
+    let list_error =
+        |e: std::io::Error| ServiceError::Backend(format!("list {}: {e}", root.display()));
+    let mut libraries = Vec::new();
+    match tokio::fs::read_dir(&root).await {
+        Ok(mut entries) => {
+            while let Some(entry) = entries.next_entry().await.map_err(list_error)? {
+                // `metadata` follows a link, as the server's listing does.
+                if tokio::fs::metadata(entry.path())
+                    .await
+                    .is_ok_and(|m| m.is_dir())
+                {
+                    libraries.push(entry.file_name());
+                }
+            }
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(list_error(e)),
+    }
+    libraries.sort();
+    let mut export = ConfigExport::default();
+    for name in libraries {
+        let folder = root.join(&name);
+        let name = name.into_string().map_err(|name| {
+            ServiceError::Backend(format!(
+                "the library folder {} has a name that is not UTF-8",
+                Path::new(&name).display()
+            ))
+        })?;
+        let mut options = FerrofinVirtualFolderManager::read_options(&folder, &expander).await;
+        for info in &mut options.path_infos {
+            if !info.path.is_empty() {
+                info.path = expander.reverse(&info.path);
+            }
+        }
+        export_document(
+            &format!("root/default/{name}/options.xml"),
+            &library::DOCUMENT,
+            &options,
+            &LibraryOptions::default(),
+            &mut export,
+        )
+        .map_err(|e| match e {
+            ServiceError::Backend(message) => {
+                ServiceError::Backend(format!("library {name}: {message}"))
+            }
+            other => other,
+        })?;
+    }
+    Ok(export)
+}
+
 /// Exports the named document stored as `named/{file}`.
 fn export_named<T: Serialize + DeserializeOwned + Default>(
+    path: &str,
     document: &Document,
     named: &Path,
     file: &str,
     export: &mut ConfigExport,
 ) -> Result<(), ServiceError> {
     export_document(
+        path,
         document,
         &read_named::<T>(&named.join(file))?,
         &T::default(),
@@ -178,8 +292,10 @@ fn read_named<T: DeserializeOwned + Default>(path: &Path) -> Result<T, ServiceEr
     }
 }
 
-/// Writes `value` as `document`, listing what it leaves out against `default`.
+/// Writes `value` as `document` at `path`, listing what it leaves out against
+/// `default`.
 fn export_document<T: Serialize>(
+    path: &str,
     document: &Document,
     value: &T,
     default: &T,
@@ -192,16 +308,16 @@ fn export_document<T: Serialize>(
             && ours.as_ref() != default
         {
             export.not_exported.push(NotExported {
-                file: document.file,
+                file: path.to_owned(),
                 setting: setting.to_owned(),
                 reason,
             });
         }
     };
-    for path in document.ferrofin_only {
-        let ours = take(&mut fields, path);
-        let default = take(&mut defaults, path);
-        left_out(path, ours, default.as_ref());
+    for member in document.ferrofin_only {
+        let ours = take(&mut fields, member);
+        let default = take(&mut defaults, member);
+        left_out(member, ours, default.as_ref());
     }
     for setting in document.written_as_default {
         let default = defaults.get(*setting);
@@ -213,7 +329,7 @@ fn export_document<T: Serialize>(
     }
     mark_cleared(&mut fields, &defaults);
     export.files.push(ExportedFile {
-        path: document.file,
+        path: path.to_owned(),
         contents: xml::document(document.root, &fields, document.entries)?,
     });
     Ok(())
@@ -316,7 +432,7 @@ fn server_id(config_dir: &Path) -> Result<ExportedFile, ServiceError> {
         )));
     }
     Ok(ExportedFile {
-        path: "data/device.txt",
+        path: "data/device.txt".to_owned(),
         contents: id.to_owned(),
     })
 }
@@ -417,15 +533,15 @@ mod tests {
         let dir = config_dir(&system, &[]);
         let export = export_configuration(dir.path()).expect("exports");
         let documents = [
-            ("system", &system::DOCUMENT),
-            ("encoding", &encoding::DOCUMENT),
-            ("branding", &branding::DOCUMENT),
-            ("network", &network::DOCUMENT),
-            ("metadata", &metadata::DOCUMENT),
-            ("xbmcmetadata", &xbmcmetadata::DOCUMENT),
+            ("system", system::FILE),
+            ("encoding", encoding::FILE),
+            ("branding", branding::FILE),
+            ("network", network::FILE),
+            ("metadata", metadata::FILE),
+            ("xbmcmetadata", xbmcmetadata::FILE),
         ];
-        for (name, document) in documents {
-            let (root, ours) = members(file(&export, document.file));
+        for (name, path) in documents {
+            let (root, ours) = members(file(&export, path));
             let (jellyfin_root, mut theirs) = members(golden(name));
             assert_eq!(root, jellyfin_root, "{name}: root element");
             let mut ours = ours;
@@ -600,7 +716,7 @@ mod tests {
         let reported: Vec<_> = export
             .not_exported
             .iter()
-            .map(|n| (n.file, n.setting.as_str()))
+            .map(|n| (n.file.as_str(), n.setting.as_str()))
             .collect();
         assert_eq!(
             reported,
@@ -645,7 +761,7 @@ mod tests {
         let export = export_configuration(dir.path()).expect("exports");
         assert_eq!(file(&export, "data/device.txt"), SERVER_ID);
         // The six documents and the id, and no `database.xml`.
-        let paths: Vec<_> = export.files.iter().map(|f| f.path).collect();
+        let paths: Vec<_> = export.files.iter().map(|f| f.path.as_str()).collect();
         assert_eq!(
             paths,
             [
@@ -747,5 +863,369 @@ mod tests {
         let dir = config_dir(&system, &[]);
         let export = export_configuration(dir.path()).expect("exports");
         assert!(file(&export, "config/system.xml").contains("<ItemType>Movie</ItemType>"));
+    }
+
+    /// A Ferrofin data directory with a default `system.json` and the given
+    /// libraries, each written as its `options.json`.
+    fn data_dir(libraries: &[(&str, &LibraryOptions)]) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = dir.path().join("config");
+        std::fs::create_dir_all(&config).expect("config dir");
+        std::fs::write(
+            config.join("system.json"),
+            serde_json::to_vec(&crate::configuration_manager::default_server_configuration())
+                .expect("serialize"),
+        )
+        .expect("write system.json");
+        for (name, options) in libraries {
+            write_library(&dir, name, options);
+        }
+        dir
+    }
+
+    async fn export_libraries(dir: &tempfile::TempDir) -> ConfigExport {
+        export_library_options(dir.path(), &dir.path().join("config"))
+            .await
+            .expect("exports")
+    }
+
+    fn with_paths(paths: &[&str]) -> LibraryOptions {
+        LibraryOptions {
+            path_infos: paths
+                .iter()
+                .map(|p| ferrofin_model::configuration::MediaPathInfo {
+                    path: (*p).to_owned(),
+                })
+                .collect(),
+            ..LibraryOptions::default()
+        }
+    }
+
+    /// Ferrofin's default library options, exported, have the shape Jellyfin
+    /// 12.4 writes for a library it created with its own defaults, and the
+    /// Collections library's folder in the data directory is stored as
+    /// `%AppDataPath%/collections`, as Jellyfin stores it
+    /// (`testdata/library-options.xml`, `testdata/collections-options.xml`).
+    #[tokio::test]
+    async fn library_options_have_the_shape_jellyfin_writes() {
+        let movies = with_paths(&["/media/movies"]);
+        let dir = data_dir(&[("Movies", &movies)]);
+        let collections_path = dir.path().join("data").join("collections");
+        let mut collections = with_paths(&[collections_path.to_str().expect("utf-8")]);
+        collections.save_local_metadata = true;
+        write_library(&dir, "Collections", &collections);
+        let export = export_libraries(&dir).await;
+        let goldens = [
+            (
+                "root/default/Movies/options.xml",
+                include_str!("config_export/testdata/library-options.xml"),
+            ),
+            (
+                "root/default/Collections/options.xml",
+                include_str!("config_export/testdata/collections-options.xml"),
+            ),
+        ];
+        for (path, golden) in goldens {
+            let (root, mut ours) = members(file(&export, path));
+            let (jellyfin_root, theirs) = members(golden);
+            assert_eq!(root, jellyfin_root, "{path}: root element");
+            // `[DefaultValue(false)]`: written by us, omitted by `XmlSerializer`
+            // while false. Both read the same.
+            for member in [
+                "SaveLyricsWithMedia",
+                "SaveTrickplayWithMedia",
+                "PreferNonstandardArtistsTag",
+                "UseCustomTagDelimiters",
+            ] {
+                let node = ours.remove(member).expect("written");
+                assert_eq!(node.text, "false", "{path}: {member}");
+            }
+            let missing: Vec<_> = theirs.keys().filter(|k| !ours.contains_key(*k)).collect();
+            let extra: Vec<_> = ours.keys().filter(|k| !theirs.contains_key(*k)).collect();
+            assert!(
+                missing.is_empty(),
+                "{path}: Jellyfin writes {missing:?}, the export does not"
+            );
+            assert!(
+                extra.is_empty(),
+                "{path}: the export writes {extra:?}, Jellyfin has no such member"
+            );
+            let differ: Vec<_> = ours
+                .iter()
+                .filter(|(member, node)| theirs.get(*member) != Some(*node))
+                .map(|(member, node)| (member, node, theirs.get(member)))
+                .collect();
+            assert!(
+                differ.is_empty(),
+                "{path}: members that differ: {differ:#?}"
+            );
+        }
+    }
+
+    /// Writes `options` as the `options.json` of the library `name`.
+    fn write_library(dir: &tempfile::TempDir, name: &str, options: &LibraryOptions) {
+        let folder = dir.path().join("root").join("default").join(name);
+        std::fs::create_dir_all(&folder).expect("library dir");
+        std::fs::write(
+            folder.join("options.json"),
+            serde_json::to_vec(options).expect("serialize"),
+        )
+        .expect("write options.json");
+    }
+
+    /// Every library option, each changed from its default, goes to XML and
+    /// back through the import as it was; a media path in the data directory
+    /// comes back in Jellyfin's token form. The test checks that it changed
+    /// every member with a default value, at the top level, in a type and in
+    /// an image option, so one added later is covered too; the members with no
+    /// default are checked by name.
+    #[tokio::test]
+    async fn every_library_option_round_trips_through_the_import() {
+        let dir = data_dir(&[]);
+        let in_data = dir.path().join("data").join("home-videos");
+        let defaults = object(&LibraryOptions::default()).expect("object");
+        let mut fields = Map::new();
+        for (key, default) in &defaults {
+            let changed = match (key.as_str(), default) {
+                // An enum: any other of its names.
+                ("AllowEmbeddedSubtitles", _) => json!("AllowText"),
+                // Collections of objects, set below.
+                ("PathInfos" | "TypeOptions", _) => continue,
+                (_, Value::Bool(b)) => json!(!b),
+                (_, Value::Number(n)) => json!(n.as_i64().expect("an integer") + 7),
+                (_, Value::String(s)) => json!(format!("{s} & <changed>")),
+                (_, Value::Array(items)) if items.is_empty() => json!(["first", "second"]),
+                (_, Value::Array(_)) => json!(["#"]),
+                (_, other) => panic!("no changed value for {key}: {other}"),
+            };
+            fields.insert(key.clone(), changed);
+        }
+        for (key, value) in [
+            // The members whose default is no value at all.
+            ("PreferredMetadataLanguage", json!("de")),
+            ("MetadataCountryCode", json!("DE")),
+            // Every saver unchecked: an empty list, not no list.
+            ("MetadataSavers", json!([])),
+            ("LocalMetadataReaderOrder", json!(["Nfo"])),
+            ("SubtitleDownloadLanguages", json!(["deu", "eng"])),
+            (
+                "PathInfos",
+                json!([{"Path": "/media/films"}, {"Path": in_data.to_str().expect("utf-8")}]),
+            ),
+            (
+                "TypeOptions",
+                json!([
+                    {
+                        "Type": "Movie",
+                        "MetadataFetchers": ["TheMovieDb"],
+                        "MetadataFetcherOrder": ["TheMovieDb", "The Open Movie Database"],
+                        "ImageFetchers": ["TheMovieDb"],
+                        "ImageFetcherOrder": ["TheMovieDb"],
+                        "ImageOptions": [
+                            {"Type": "Backdrop", "Limit": 3, "MinWidth": 1280},
+                            {"Type": "Logo", "Limit": 1, "MinWidth": 0},
+                        ],
+                        "SimilarItemProviders": ["Local"],
+                        "SimilarItemProviderOrder": ["Local"],
+                    },
+                    {"Type": "Series", "ImageFetchers": ["TheTVDB"], "ImageOptions": []},
+                ]),
+            ),
+        ] {
+            fields.insert(key.to_owned(), value);
+        }
+        let options: LibraryOptions =
+            serde_json::from_value(Value::Object(fields)).expect("valid options");
+        let changed = object(&options).expect("object");
+        assert_every_member_changed(&changed, &defaults);
+        write_library(&dir, "Films", &options);
+
+        let export = export_libraries(&dir).await;
+        let xml = file(&export, "root/default/Films/options.xml");
+        assert!(
+            xml.contains("<Path>%AppDataPath%/home-videos</Path>"),
+            "{xml}"
+        );
+        assert!(xml.contains("<MetadataSavers />"), "{xml}");
+        let back: LibraryOptions =
+            config_import::import_over(&LibraryOptions::default(), xml, "LibraryOptions", &[])
+                .expect("imports");
+        let mut expected = options;
+        expected.path_infos[1].path = "%AppDataPath%/home-videos".to_owned();
+        assert_eq!(back, expected);
+        assert!(export.not_exported.is_empty(), "{:?}", export.not_exported);
+    }
+
+    /// A media path in the metadata directory is stored as `%MetadataPath%/…`,
+    /// whether that directory is the default (`{data_dir}/metadata`) or the one
+    /// `system.json`'s `MetadataPath` names.
+    #[tokio::test]
+    async fn a_media_path_in_the_metadata_directory_takes_its_token() {
+        let dir = data_dir(&[]);
+        let in_default = dir.path().join("metadata").join("extras");
+        write_library(
+            &dir,
+            "Extras",
+            &with_paths(&[in_default.to_str().expect("utf-8")]),
+        );
+        let export = export_libraries(&dir).await;
+        let xml = file(&export, "root/default/Extras/options.xml");
+        assert!(xml.contains("<Path>%MetadataPath%/extras</Path>"), "{xml}");
+
+        let custom = dir.path().join("elsewhere");
+        let mut system = crate::configuration_manager::default_server_configuration();
+        system.metadata_path = custom.to_str().expect("utf-8").to_owned();
+        std::fs::write(
+            dir.path().join("config").join("system.json"),
+            serde_json::to_vec(&system).expect("serialize"),
+        )
+        .expect("write system.json");
+        let in_custom = custom.join("trailers");
+        write_library(
+            &dir,
+            "Trailers",
+            &with_paths(&[in_custom.to_str().expect("utf-8")]),
+        );
+        let export = export_libraries(&dir).await;
+        let xml = file(&export, "root/default/Trailers/options.xml");
+        assert!(
+            xml.contains("<Path>%MetadataPath%/trailers</Path>"),
+            "{xml}"
+        );
+        // The default directory is no longer the metadata directory.
+        let xml = file(&export, "root/default/Extras/options.xml");
+        assert!(
+            xml.contains(&format!("<Path>{}</Path>", in_default.display())),
+            "{xml}"
+        );
+    }
+
+    /// A library adopted from Jellyfin whose `options.xml` Ferrofin never
+    /// converted is exported from that XML, as the server reads it, and
+    /// nothing is written into the source.
+    #[tokio::test]
+    async fn an_unconverted_adopted_options_xml_is_exported_as_read() {
+        let dir = data_dir(&[]);
+        let folder = dir.path().join("root").join("default").join("Collections");
+        std::fs::create_dir_all(&folder).expect("library dir");
+        let golden = include_str!("config_export/testdata/collections-options.xml");
+        std::fs::write(folder.join("options.xml"), golden).expect("write");
+        let export = export_libraries(&dir).await;
+        let xml = file(&export, "root/default/Collections/options.xml");
+        assert!(
+            xml.contains("<Path>%AppDataPath%/collections</Path>"),
+            "{xml}"
+        );
+        assert!(
+            xml.contains("<SaveLocalMetadata>true</SaveLocalMetadata>"),
+            "{xml}"
+        );
+        assert!(
+            !folder.join("options.json").exists(),
+            "the source was changed"
+        );
+    }
+
+    /// A data directory with no libraries exports none, and a file beside the
+    /// library folders is not one.
+    #[tokio::test]
+    async fn only_library_folders_are_exported() {
+        let dir = data_dir(&[]);
+        let export = export_libraries(&dir).await;
+        assert!(export.files.is_empty(), "{:?}", export.files);
+
+        let dir = data_dir(&[("Music", &LibraryOptions::default())]);
+        std::fs::write(
+            dir.path().join("root").join("default").join("stray.txt"),
+            "x",
+        )
+        .expect("write");
+        // A link to a library folder is a library, as the server lists it; a
+        // link that leads nowhere is not.
+        let elsewhere = dir.path().join("elsewhere");
+        std::fs::create_dir_all(&elsewhere).expect("dir");
+        let root = dir.path().join("root").join("default");
+        std::os::unix::fs::symlink(&elsewhere, root.join("Linked")).expect("link");
+        std::os::unix::fs::symlink(dir.path().join("gone"), root.join("Gone")).expect("link");
+        let export = export_libraries(&dir).await;
+        let paths: Vec<_> = export.files.iter().map(|f| f.path.as_str()).collect();
+        assert_eq!(
+            paths,
+            [
+                "root/default/Linked/options.xml",
+                "root/default/Music/options.xml"
+            ]
+        );
+    }
+
+    /// Fails unless `changed` sets every library member away from `defaults`,
+    /// and every member of its first type and that type's first image option.
+    fn assert_every_member_changed(changed: &Map<String, Value>, defaults: &Map<String, Value>) {
+        let mut unchanged = left_at_default(changed, defaults);
+        let first_type = changed["TypeOptions"][0].as_object().expect("a type");
+        let type_defaults =
+            object(&ferrofin_model::configuration::TypeOptions::default()).expect("object");
+        unchanged.extend(
+            left_at_default(first_type, &type_defaults)
+                .into_iter()
+                .map(|k| format!("TypeOptions.{k}")),
+        );
+        let first_image = first_type["ImageOptions"][0]
+            .as_object()
+            .expect("an image option");
+        let image_defaults =
+            object(&ferrofin_model::configuration::ImageOption::default()).expect("object");
+        unchanged.extend(
+            left_at_default(first_image, &image_defaults)
+                .into_iter()
+                .map(|k| format!("ImageOptions.{k}")),
+        );
+        // serde drops a misspelled key, so the members with no default are
+        // checked by name.
+        for key in [
+            "PreferredMetadataLanguage",
+            "MetadataCountryCode",
+            "MetadataSavers",
+            "LocalMetadataReaderOrder",
+            "SubtitleDownloadLanguages",
+        ] {
+            if !changed.contains_key(key) {
+                unchanged.push(key.to_owned());
+            }
+        }
+        if !first_type.contains_key("Type") {
+            unchanged.push("TypeOptions.Type".to_owned());
+        }
+        assert!(
+            unchanged.is_empty(),
+            "members left at their default: {unchanged:?}"
+        );
+    }
+
+    /// The members of `defaults` that `changed` leaves at their default, or
+    /// leaves out.
+    fn left_at_default(changed: &Map<String, Value>, defaults: &Map<String, Value>) -> Vec<String> {
+        defaults
+            .iter()
+            .filter(|(key, default)| changed.get(*key).is_none_or(|value| value == *default))
+            .map(|(key, _)| key.clone())
+            .collect()
+    }
+
+    /// A value XML cannot carry stops the export, naming the library and the
+    /// setting, so the operator knows which `options.json` to fix.
+    #[tokio::test]
+    async fn a_value_xml_cannot_carry_names_the_library() {
+        let options = LibraryOptions {
+            season_zero_display_name: "bad\u{1}name".to_owned(),
+            ..LibraryOptions::default()
+        };
+        let dir = data_dir(&[("Films", &options)]);
+        let error = export_library_options(dir.path(), &dir.path().join("config"))
+            .await
+            .expect_err("refused");
+        let error = error.to_string();
+        assert!(error.contains("library Films"), "{error}");
+        assert!(error.contains("SeasonZeroDisplayName"), "{error}");
     }
 }
