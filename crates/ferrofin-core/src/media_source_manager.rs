@@ -3,7 +3,7 @@
 //! Port of `Emby.Server.Implementations.Library.MediaSourceManager` (the
 //! API-facing subset). Responsibilities that carry over to this seam:
 //! - **streams/attachments as DTOs:** read the persisted
-//!   [`MediaStreamInfoEntity`](ferrofin_db::entities::base_items::MediaStreamInfoEntity)
+//!   [`MediaStreamInfoEntity`]
 //!   / attachment rows through the injected persistence repositories and map them
 //!   to the wire [`MediaStream`]/[`MediaAttachment`] DTOs;
 //! - **static + playback media sources:** assemble a [`MediaSourceInfo`] for a
@@ -219,7 +219,7 @@ impl FerrofinMediaSourceManager {
     }
 
     /// Wires the user manager, so a user is offered only the versions they may
-    /// see ([`Self::visible_versions`]).
+    /// see (`Self::visible_versions`).
     #[must_use]
     pub fn with_users(mut self, users: Arc<dyn ferrofin_traits::library::UserManager>) -> Self {
         self.users = Some(users);
@@ -227,7 +227,7 @@ impl FerrofinMediaSourceManager {
     }
 
     /// Installs the standalone item-visibility evaluator the per-user version
-    /// filter runs ([`Self::visible_versions`]).
+    /// filter runs (`Self::visible_versions`).
     #[must_use]
     pub fn with_visibility(
         mut self,

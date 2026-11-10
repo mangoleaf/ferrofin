@@ -60,7 +60,7 @@ pub struct ChannelRow {
     /// `LiveTvChannel.IsMovie`, aggregated from the programmes at refresh).
     ///
     /// This and the two kinds below are derived only by
-    /// [`crate::guide_repository::channel_rows`], and only for the kinds its
+    /// `guide_repository::channel_rows`, and only for the kinds its
     /// query filters on; everywhere else they read `false`.
     #[sqlx(default)]
     pub is_movie: bool,
@@ -446,7 +446,7 @@ fn set_first_image(images: &mut Vec<ItemImageInfo>, image: ItemImageInfo) {
 /// so it is replaced by the tuner's or guide's logo, as upstream replaces it
 /// on every refresh.
 ///
-/// A logo that is not a URL ([`is_artwork_url`]) sets nothing. A Primary an
+/// A logo that is not a URL (`is_artwork_url`) sets nothing. A Primary an
 /// earlier version stored from that same value is removed: the image routes
 /// no longer serve it, and the old version can store it again beside this one
 /// during a rolling update, so it goes on a refresh, not once.
@@ -521,7 +521,7 @@ impl ProgramImages {
 /// updated upstream (`UpdateImage` returns `false`), so it is only written
 /// when the programme's other fields changed (`item_updated`) — then the item,
 /// removal included, is saved. A listing value that is not a URL
-/// ([`is_artwork_url`]) counts as none.
+/// (`is_artwork_url`) counts as none.
 #[must_use]
 pub fn program_images_update(
     current: &[ItemImageInfo],

@@ -93,7 +93,7 @@ pub struct TreeRoots {
     pub collections: PathBuf,
     /// The playlist folders (`data/playlists/`).
     pub playlists: PathBuf,
-    /// The scheduled tasks' last results ([`TASK_RESULTS_ENTRY`]; upstream's
+    /// The scheduled tasks' last results (`TASK_RESULTS_ENTRY`; upstream's
     /// `Data/ScheduledTasks`).
     pub task_results: PathBuf,
 }

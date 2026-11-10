@@ -4,7 +4,7 @@
 //! This crate is NEW code (no C# source); it mirrors the whisper-api pattern
 //! (`create_router` + health checkers). It provides:
 //!
-//! - [`HealthChecker`] — an `async` trait (via [`async_trait`](async_trait)) for
+//! - [`HealthChecker`] — an `async` trait (via [`async_trait`]) for
 //!   probing a single dependency: [`check`](HealthChecker::check) +
 //!   [`name`](HealthChecker::name).
 //! - [`FnChecker`] — a helper wrapping an `async` closure as a checker.

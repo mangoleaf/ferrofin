@@ -1,12 +1,12 @@
 //! Error type for the `ferrofin-drawing` crate.
 //!
 //! The image-processing traits in `ferrofin-traits` return
-//! [`ServiceError`](ferrofin_traits::error::ServiceError), so the public methods
+//! [`ServiceError`], so the public methods
 //! ultimately hand one back. Internally, the genuine *infrastructure* failures —
 //! reading, creating, or encoding an image file — are carried as this typed
 //! [`DrawingError`] instead of being flattened into
 //! `ServiceError::Backend(String)`. Converting via [`From`] boxes the typed
-//! error into [`ServiceError::BackendSource`](ferrofin_traits::error::ServiceError::BackendSource),
+//! error into [`ServiceError::BackendSource`],
 //! so the underlying [`std::io::Error`] / [`image::ImageError`] /
 //! [`jpeg_encoder::EncodingError`] stays reachable
 //! through [`Error::source`](std::error::Error::source) for logging and tests.

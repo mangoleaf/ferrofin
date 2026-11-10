@@ -1,7 +1,7 @@
 //! `MediaInfoController` — playback-info resolution.
 //!
 //! Ports `GET`/`POST /Items/{itemId}/PlaybackInfo`: resolves the item's playable
-//! [`MediaSourceInfo`](ferrofin_model::dto::MediaSourceInfo)s for the requesting
+//! [`MediaSourceInfo`]s for the requesting
 //! user via the [`MediaSourceManager`](ferrofin_traits::library::MediaSourceManager)
 //! and returns them in a [`PlaybackInfoResponse`]. The `POST` form also takes
 //! the client's device profile and stream picks (query or body) and negotiates

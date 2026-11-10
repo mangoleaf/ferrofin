@@ -11,7 +11,7 @@
 //! - `GET /Environment/NetworkShares` — always the empty array (deprecated).
 //!
 //! Filesystem access goes through the injected
-//! [`FileSystem`](ferrofin_traits::filesystem::FileSystem) trait, on the
+//! [`FileSystem`] trait, on the
 //! blocking pool: a path on a hung network mount must cost a thread of its
 //! own, not a runtime worker.
 

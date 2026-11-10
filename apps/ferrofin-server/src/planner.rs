@@ -5,14 +5,14 @@
 //! resolution, the [`EncodingJobInfo`] state, and the full ffmpeg HLS command
 //! line). It is Jellyfin's `StreamingHelpers.GetStreamingState` +
 //! `EncodingHelper.GetCommandLineArguments`, deliberately left behind the
-//! [`StreamStatePlanner`] seam so the [`HlsStreamManagerImpl`] orchestration above
+//! [`StreamStatePlanner`] seam so the `HlsStreamManagerImpl` orchestration above
 //! it stays testable.
 //!
 //! It lives in the composition-root binary (`ferrofin-server`) because it is the
 //! one place that may depend on **both** `ferrofin-core`'s
-//! [`MediaSourceManager`](ferrofin_traits::library::MediaSourceManager) **and**
+//! [`MediaSourceManager`] **and**
 //! `ferrofin-mediaencoding`'s [`EncodingHelper`] arg builder — the seam
-//! ([`HlsStreamManagerImpl`]) lives in `ferrofin-hls`, which must not depend on
+//! (`HlsStreamManagerImpl`) lives in `ferrofin-hls`, which must not depend on
 //! `ferrofin-core` (`RULES_CODE_REUSE`), so the concrete planner is injected from
 //! above through the trait.
 //!

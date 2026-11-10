@@ -2,7 +2,7 @@
 //!
 //! Ports the portable item-write surface:
 //!
-//! - `POST /Items/{itemId}` — applies an edited [`BaseItemDto`] onto the stored
+//! - `POST /Items/{itemId}` — applies an edited `BaseItemDto` onto the stored
 //!   item row and persists it.
 //! - `POST /Items/{itemId}/ContentType` — sets (or clears) the configured
 //!   content-type override for the item's folder in the server configuration.

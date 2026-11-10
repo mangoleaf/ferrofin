@@ -24,7 +24,7 @@
 //! - the C# per-request `HttpContext.Items["AuthorizationInfo"]` cache is dropped
 //!   (the HTTP layer, Wave 7, may cache the resolved value itself);
 //! - token freshness bookkeeping is preserved: a device seen more than
-//!   [`DEVICE_ACTIVITY_REFRESH_MINUTES`] ago, or reporting a changed
+//!   `DEVICE_ACTIVITY_REFRESH_MINUTES` ago, or reporting a changed
 //!   device-name/app-version, has its row updated (skipping cast receivers,
 //!   matching upstream `allowTokenInfoUpdate`).
 

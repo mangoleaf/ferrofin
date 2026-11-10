@@ -3,19 +3,19 @@
 //!
 //! Port of `MediaBrowser.Providers.Subtitles.SubtitleManager`:
 //!
-//! - [`Self::search_subtitles`] enriches the request from the resolved item
+//! - `Self::search_subtitles` enriches the request from the resolved item
 //!   (name/year/series/season/episode/path) and fans it out across the
 //!   registered providers (OpenSubtitles, …), aggregating the candidates. A
 //!   provider that errors is skipped (logged) rather than failing the whole
 //!   search, matching Jellyfin's per-provider aggregation.
-//! - [`Self::download_subtitles`] routes the namespaced id back to its provider,
+//! - `Self::download_subtitles` routes the namespaced id back to its provider,
 //!   fetches the content, and **attaches** it to the item (a sidecar in the library
 //!   configured media or internal-metadata folder + an external [`MediaStream`](ferrofin_model::entities_media::MediaStream)
-//!   row). [`Self::upload_subtitle`] attaches caller-supplied content the same way.
-//! - [`Self::get_remote_subtitles`] routes an id to its provider and returns the
+//!   row). `Self::upload_subtitle` attaches caller-supplied content the same way.
+//! - `Self::get_remote_subtitles` routes an id to its provider and returns the
 //!   raw content (the `/Providers/Subtitles/Subtitles/{id}` route).
-//! - [`Self::delete_subtitles`] removes the external stream row + sidecar file.
-//! - [`Self::get_supported_providers`] lists the registered providers for an item.
+//! - `Self::delete_subtitles` removes the external stream row + sidecar file.
+//! - `Self::get_supported_providers` lists the registered providers for an item.
 
 use ferrofin_util::directory_path::DirectoryPath;
 use std::path::{Path, PathBuf};

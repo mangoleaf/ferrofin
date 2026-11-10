@@ -1313,7 +1313,7 @@ impl FerrofinLiveTvManager {
     /// Reads the server's `PreferredMetadataLanguage` through `language`, each
     /// time a guide is read, so a changed setting applies to the next read.
     /// It is the language an XMLTV guide is read in when its provider names
-    /// none ([`guide_language`](Self::guide_language)). Without one (tests) a
+    /// none (`guide_language`). Without one (tests) a
     /// guide is read with no language.
     #[must_use]
     pub fn with_metadata_language(

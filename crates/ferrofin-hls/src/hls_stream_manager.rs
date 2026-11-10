@@ -19,8 +19,8 @@
 //!   [`TranscodeManagerImpl::wait_for_segment`], with the segment file resolved
 //!   from the cache dir;
 //! - the legacy transcode-folder file resolution +
-//!   [`HlsSegmentController.ValidateTranscodePath`] path-traversal guard;
-//! - stop-encoding → [`TranscodeManager::kill_transcoding_jobs`].
+//!   `HlsSegmentController.ValidateTranscodePath` path-traversal guard;
+//! - stop-encoding → `TranscodeManager::kill_transcoding_jobs`.
 //!
 //! Turning the raw [`HlsStreamRequest`] into a concrete transcode plan
 //! (media-source resolution, `StreamState`, and the ffmpeg command line) —
@@ -61,7 +61,7 @@ use crate::master_playlist::{MasterPlaylistContext, TrickplayResolution, build_m
 ///
 /// Port of the useful output of `StreamingHelpers.GetStreamingState` +
 /// `EncodingHelper.GetCommandLineArguments` — the fields the ported HLS
-/// orchestration consumes. Built by a [`StreamStatePlanner`]; the [`state`] is
+/// orchestration consumes. Built by a [`StreamStatePlanner`]; the `state` is
 /// handed to [`TranscodeManagerImpl::start_ffmpeg`] once named by
 /// [`StreamStatePlanner::display_names`].
 pub struct TranscodePlan {

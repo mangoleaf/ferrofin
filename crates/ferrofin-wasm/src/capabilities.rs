@@ -2,7 +2,7 @@
 //! interface: host-mediated HTTP, read-only item queries, and media-segment
 //! writes. Each is called synchronously from a plugin's runtime thread (a
 //! plain OS thread — safe to block); async manager calls go through the
-//! runtime [`Handle`] captured at wiring time.
+//! runtime `Handle` captured at wiring time.
 
 use std::io::Read as _;
 use std::path::Path;

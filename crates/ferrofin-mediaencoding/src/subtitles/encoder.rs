@@ -136,7 +136,7 @@ const DOTNET_MAX_TIMER_DELAY_MS: u32 = u32::MAX - 1;
 /// killed and the extraction fails.
 ///
 /// Deliberate divergence: a negative value, or one longer than
-/// [`DOTNET_MAX_TIMER_DELAY_MS`] (71,582 minutes), makes upstream's
+/// `DOTNET_MAX_TIMER_DELAY_MS` (71,582 minutes), makes upstream's
 /// `CancelAfter` throw after ffmpeg has already started, so the extraction
 /// fails and the orphaned ffmpeg keeps running. `None` here reports such a
 /// value as invalid, so the caller fails the extraction without starting
@@ -753,7 +753,7 @@ impl<P: SubtitleParser, I: SubtitleIo> SubtitleEncoder<P, I> {
     ///
     /// Port of `SubtitleEncoder.ExtractAllExtractableSubtitles`: the embedded
     /// streams in one ffmpeg run over the video file, then each external
-    /// `.mks` file in its own ([`Self::extract_all_extractable_subtitles_mks`]);
+    /// `.mks` file in its own (`Self::extract_all_extractable_subtitles_mks`);
     /// each output cache path is serialized with the keyed lock. Errors are
     /// swallowed (logged in C#) so a single un-extractable stream cannot abort
     /// the caller.

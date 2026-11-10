@@ -2,7 +2,7 @@
 //! `VideosController` / `UniversalAudioController` — the live HLS/transcode routes.
 //!
 //! These wire the now-real transcode runtime + `ferrofin-hls` playlist generator to
-//! the HTTP surface, entirely through the [`HlsStreamManager`] seam
+//! the HTTP surface, entirely through the `HlsStreamManager` seam
 //! (`ferrofin-traits`). The heavyweight `StreamState`/arg-building/ffmpeg-spawn
 //! machinery lives in the implementation crate (`ferrofin-mediaencoding`); every
 //! handler here only:
@@ -27,7 +27,7 @@
 //!
 //! The transcode branch of `/Videos|Audio/{id}/stream[.{container}]` and
 //! `/Audio/{id}/universal` is folded into the direct-play handlers
-//! (`videos`/`audio`), which call [`HlsStreamManager::transcode_stream`] for a
+//! (`videos`/`audio`), which call `HlsStreamManager::transcode_stream` for a
 //! request that is not `Static=true`, a static video request for a disc
 //! folder, and a universal request with no direct-playable source.
 

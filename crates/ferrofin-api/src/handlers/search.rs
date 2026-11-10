@@ -1,6 +1,6 @@
 //! `SearchController` — search-hint typeahead.
 //!
-//! Ports `GET /Search/Hints`: a ranked list of [`SearchHint`]s for an
+//! Ports `GET /Search/Hints`: a ranked list of `SearchHint`s for an
 //! autocomplete term, built through the
 //! [`SearchManager`](ferrofin_traits::library::SearchManager) seam and wrapped in a
 //! [`SearchHintResult`]. The search manager fills every hint field, its

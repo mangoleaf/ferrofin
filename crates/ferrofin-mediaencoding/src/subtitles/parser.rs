@@ -43,7 +43,7 @@ pub trait SubtitleParser: Send + Sync {
 /// The extension-keyed SubtitleEdit-style parser used by the encoder.
 ///
 /// Port of `SubtitleEditParser`. Stateless — the C# per-instance
-/// reflection cache is replaced by the static [`Self::formats_for`] table.
+/// reflection cache is replaced by the static `Self::formats_for` table.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct SubtitleEditParser;
 

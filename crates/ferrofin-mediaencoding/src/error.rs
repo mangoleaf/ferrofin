@@ -2,13 +2,13 @@
 //!
 //! The media-encoding traits in `ferrofin-traits` (`MediaEncoder`,
 //! `SubtitleEncoder`, `AttachmentExtractor`, `TrickplayFrameExtractor`, …) return
-//! [`ServiceError`](ferrofin_traits::error::ServiceError), so the public methods
+//! [`ServiceError`], so the public methods
 //! ultimately hand one back. Internally, the genuine *infrastructure* failures —
 //! a filesystem read/create, an ffprobe JSON parse, or an ffmpeg/ffprobe
 //! subprocess invocation — are carried as this typed [`MediaEncodingError`]
 //! instead of being flattened into `ServiceError::Backend(String)`. Converting
 //! via [`From`] boxes the typed error into
-//! [`ServiceError::BackendSource`](ferrofin_traits::error::ServiceError::BackendSource),
+//! [`ServiceError::BackendSource`],
 //! so an underlying [`std::io::Error`] / [`serde_json::Error`] stays reachable
 //! through [`Error::source`](std::error::Error::source) for logging and tests.
 //!

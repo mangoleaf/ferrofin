@@ -20,7 +20,7 @@ use ferrofin_model::media_info::MediaProtocol;
 /// Gets the ffmpeg input argument for a single input file.
 ///
 /// For non-`File` protocols the path is simply [`quote`]d; for `File` it is
-/// routed through [`get_file_input_argument`] (which applies the
+/// routed through `get_file_input_argument` (which applies the
 /// `inputPrefix:` scheme and quote escaping).
 #[must_use]
 pub fn get_input_argument(input_prefix: &str, input_file: &str, protocol: MediaProtocol) -> String {
@@ -34,7 +34,7 @@ pub fn get_input_argument(input_prefix: &str, input_file: &str, protocol: MediaP
 /// Gets the ffmpeg input argument for a list of input files.
 ///
 /// For non-`File` protocols the first file is [`quote`]d; for `File` the list
-/// is routed through [`get_concat_input_argument`].
+/// is routed through `get_concat_input_argument`.
 ///
 /// # Panics
 ///

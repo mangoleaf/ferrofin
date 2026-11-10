@@ -34,7 +34,7 @@ use libsqlite3_sys as ffi;
 /// The SQL expression to sort by wherever Jellyfin's C# emits `RANDOM()`.
 ///
 /// Registered on every connection this crate opens (see
-/// [`register_random_function`]), so query builders can reference it
+/// `register_random_function`), so query builders can reference it
 /// unconditionally.
 pub const RANDOM_SQL_EXPR: &str = "ferrofin_random()";
 

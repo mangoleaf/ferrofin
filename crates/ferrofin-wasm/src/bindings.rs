@@ -4,7 +4,7 @@
 //! The [`bindgen!`](wasmtime::component::bindgen) macro turns
 //! `wit/ferrofin-plugin.wit` into typed Rust: the [`Plugin`] world struct
 //! (typed wrappers over the guest's exports) and the
-//! [`host::Host`](ferrofin::plugin::host::Host) trait this module implements
+//! `host::Host` trait this module implements
 //! for [`HostState`]. Synchronous bindings are deliberate: every guest call
 //! already runs on the plugin's dedicated runtime thread (see
 //! [`runtime`](crate::runtime)), so async plumbing here would buy nothing.

@@ -3,7 +3,7 @@
 //!
 //! Two of Jellyfin's path conventions don't fit axum's `matchit` router, so the
 //! vendored path is normalized to an equivalent axum pattern before it is
-//! registered. The transform is captured in [`to_axum_path`] and reused by both
+//! registered. The transform is captured in `to_axum_path` and reused by both
 //! the router builder and the contract-superset test, so they can never drift.
 
 use axum::response::IntoResponse;
@@ -105,7 +105,7 @@ fn canonical_name_map() -> BTreeMap<String, String> {
 
 /// The normalized axum route table derived from the vendored contract.
 ///
-/// Applies [`to_axum_path`] to every vendored path and de-duplicates the
+/// Applies `to_axum_path` to every vendored path and de-duplicates the
 /// resulting `(method, axum_path)` pairs. Two vendored paths can normalize to the
 /// same axum path (different methods on what becomes one pattern); the router
 /// registers each `(method, path)` once. Order is deterministic (sorted).

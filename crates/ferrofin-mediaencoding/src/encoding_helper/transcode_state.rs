@@ -470,14 +470,14 @@ impl EncodingJobInfo {
     }
 
     /// The output width, in pixels (`OutputWidth`); see
-    /// [`Self::output_dimensions`].
+    /// `Self::output_dimensions`.
     #[must_use]
     pub fn output_width(&self) -> Option<i32> {
         self.output_dimensions().0
     }
 
     /// The output height, in pixels (`OutputHeight`); see
-    /// [`Self::output_dimensions`].
+    /// `Self::output_dimensions`.
     #[must_use]
     pub fn output_height(&self) -> Option<i32> {
         self.output_dimensions().1

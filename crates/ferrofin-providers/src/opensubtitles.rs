@@ -20,7 +20,7 @@
 //! turns a `file_id` into a one-time download link whose body is the subtitle.
 //!
 //! That link is a destination OpenSubtitles chose, so it is fetched through
-//! the guard image downloads use ([`GuardedHttp`]): a private address is
+//! the guard image downloads use (`GuardedHttp`): a private address is
 //! refused on the link and on every redirect from it, unless the server's
 //! `subtitle_private_http_allow` lists it
 //! ([`with_link_destinations`](OpenSubtitlesProvider::with_link_destinations)).

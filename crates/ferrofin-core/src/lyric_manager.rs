@@ -10,7 +10,7 @@
 //! item's internal metadata folder (`{metadata}/library/{id2}/{idN}`)
 //! **always**; `TrySaveToFiles` then writes the first path that succeeds. That
 //! is why an upload works on a read-only media mount — the normal deployment —
-//! and it is what [`Self::save_lyric`] / [`Self::download_lyrics`] do here.
+//! and it is what `Self::save_lyric` / `Self::download_lyrics` do here.
 //! Reads and deletes go through the item's `Lyric` media streams, as
 //! `GetLyricsAsync` / `DeleteLyricsAsync` do: the scan's audio probe records
 //! them from the sidecars `LyricResolver` matches in both places, so a saved

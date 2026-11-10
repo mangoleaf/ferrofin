@@ -24,7 +24,7 @@
 //!
 //! So the recorder hands each event to a bounded queue and returns. One
 //! background task drains the queue and applies a whole batch in a single
-//! transaction: one commit for up to [`BATCH`] events instead of one per event,
+//! transaction: one commit for up to `BATCH` events instead of one per event,
 //! and no checkpoint ever lands on a request. Events go through one queue in
 //! submission order, so a start/stop update can never overtake the insert that
 //! creates its row. A full queue drops the event with a warning rather than

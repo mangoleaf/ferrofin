@@ -3,7 +3,7 @@
 //!
 //! Port of `Emby.Server.Implementations.Session.SessionManager` (the largest
 //! implementation in the crate, ~81K of C#). It owns the **in-memory**
-//! [`SessionInfo`] table (the C# `_activeConnections` `ConcurrentDictionary`),
+//! `SessionInfo` table (the C# `_activeConnections` `ConcurrentDictionary`),
 //! reports playback through the injected [`UserDataManager`], and broadcasts
 //! server → client messages to each session's client (see below).
 //!
@@ -18,7 +18,7 @@
 //!   image.
 //! - **The domain `SessionInfo` is modelled here**, not in `ferrofin-traits`
 //!   (whose reads surface the [`SessionInfoDto`] wire type). It is a private
-//!   in-memory struct; [`session_info_to_dto`] maps it to the DTO on read.
+//!   in-memory struct; `session_info_to_dto` maps it to the DTO on read.
 //! - **Message broadcast collapses to pre-serialized JSON** (the trait takes a
 //!   `&str` payload). A broadcast serializes a small `{ MessageType, Data }`
 //!   envelope once and `send`s the bytes to each session's directly attached
@@ -457,7 +457,7 @@ struct OutboundMessage<'a> {
 /// Holds injected siblings and the in-memory session table. The table is an
 /// async [`Mutex`] so the managers' `async fn`s can take it without blocking a
 /// runtime worker; it is **never** held across an `.await` on a client socket —
-/// [`FerrofinSessionManager::broadcast`] snapshots its targets and releases the
+/// `FerrofinSessionManager::broadcast` snapshots its targets and releases the
 /// guard before sending, so one stalled WebSocket client cannot stall session
 /// state for everyone else.
 #[derive(Clone)]
@@ -684,7 +684,7 @@ impl FerrofinSessionManager {
 
     /// Port of `SessionManager.CheckForIdlePlayback`: every session playing
     /// something that has not checked in for more than
-    /// [`IDLE_PLAYBACK_MINUTES`] at `now` is stopped, at the position its
+    /// `IDLE_PLAYBACK_MINUTES` at `now` is stopped, at the position its
     /// client last reported (upstream PR #17631) and with its media source.
     /// As upstream, the stop names no live stream, so it releases none. Its
     /// stop event gets the dashboard's "has finished playing" entry from the
@@ -806,7 +806,7 @@ impl FerrofinSessionManager {
     /// sweep upstream does not have. Every minute the inactive check runs
     /// while `InactiveSessionThreshold` (read live) is above 0 and sessions
     /// idle past `idle_session_window` end, and every
-    /// [`IDLE_PLAYBACK_MINUTES`] minutes the idle check runs. Upstream starts
+    /// `IDLE_PLAYBACK_MINUTES` minutes the idle check runs. Upstream starts
     /// its timers with a playback and stops them while nothing plays; here
     /// they then find nothing to do. The composition root spawns this and
     /// aborts it when the host is torn down.

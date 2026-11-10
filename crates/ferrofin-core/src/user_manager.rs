@@ -24,7 +24,7 @@
 //! Faithful port simplifications, each flagged:
 //! - `authenticate_user` shares the configured network policy with HTTP auth,
 //!   and enforces disabled accounts, remote access, lockout and access schedules.
-//! - `get_user_dto` assembles the full [`UserDto`](ferrofin_model::dto::UserDto)
+//! - `get_user_dto` assembles the full [`UserDto`]
 //!   (policy + configuration) from the `Users` row and its
 //!   `Permissions`/`Preferences`/`AccessSchedules`, including the profile-image
 //!   cache tag when an image processor is attached.

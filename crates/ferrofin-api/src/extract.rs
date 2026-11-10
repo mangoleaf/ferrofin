@@ -34,14 +34,14 @@
 //!
 //! * **Member names bind ignoring case**, as ASP.NET's MVC JSON options do
 //!   (`PropertyNameCaseInsensitive`, inherited from `JsonSerializerDefaults.Web`
-//!   and never overridden by Jellyfin): a body is parsed into a [`doc::Doc`],
+//!   and never overridden by Jellyfin): a body is parsed into a `doc::Doc`,
 //!   which folds struct member names and resolves duplicates the way
 //!   `System.Text.Json` does. Sonarr's and Radarr's camelCase
 //!   `/Library/Media/Updated` webhook bound to nothing before it.
 //!
 //! * **A body past the route's limit is 413.** Every route reads at most
 //!   axum's 2 MiB default, except the uploads, which take
-//!   [`MAX_UPLOAD_BODY_BYTES`] through [`upload_body_limit`]. Jellyfin's
+//!   `MAX_UPLOAD_BODY_BYTES` through `upload_body_limit`. Jellyfin's
 //!   `ExceptionMiddleware` answers Kestrel's "request body too large" with a
 //!   plain-text 500 (it maps no `BadHttpRequestException`); Ferrofin keeps the
 //!   `413` the condition is, never the binder's 400 claiming the body is

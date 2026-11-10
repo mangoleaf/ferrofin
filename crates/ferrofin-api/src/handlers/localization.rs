@@ -3,7 +3,7 @@
 //! Ports the four read-only `[Authorize(FirstTimeSetupOrDefault)]` actions:
 //! - `GET /Localization/Cultures` — the known cultures, de-duplicated by display
 //!   name (case-insensitive) and ordered by it (case-insensitively — see
-//!   [`distinct_ordered_cultures`]).
+//!   `distinct_ordered_cultures`).
 //! - `GET /Localization/Countries` — the known countries.
 //! - `GET /Localization/ParentalRatings` — the known parental ratings.
 //! - `GET /Localization/Options` — the UI localization options.

@@ -22,7 +22,7 @@
 //! Ownership and shares are persisted and **enforced**: the `Playlists` table
 //! records the owner + open-access flag and `PlaylistShares` the per-user
 //! permissions, and every route resolves the caller's
-//! [`PlaylistAccess`](ferrofin_traits::collections::PlaylistAccess) first. Edit
+//! [`PlaylistAccess`] first. Edit
 //! actions (update, add/remove/move items) need owner or a `CanEdit` share
 //! (`403` otherwise); share management is owner-only; an invisible playlist is
 //! `404` (the C# `GetPlaylistForUser` null). Playlists predating owner tracking

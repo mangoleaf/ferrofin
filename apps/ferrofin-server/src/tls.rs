@@ -216,7 +216,7 @@ pub fn load_certificate(
 /// An HTTPS listener: Kestrel's `UseHttps` on one address.
 ///
 /// Connections are accepted on a task of their own and each handshake runs on
-/// its own task, bounded by [`HANDSHAKE_TIMEOUT`], so a slow or stalled client
+/// its own task, bounded by `HANDSHAKE_TIMEOUT`, so a slow or stalled client
 /// never holds up the next one; the serve loop takes finished connections.
 /// Dropping the listener stops accepting and closes the socket.
 pub struct TlsListener {

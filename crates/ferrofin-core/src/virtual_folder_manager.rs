@@ -8,7 +8,7 @@
 //! `LibraryStructureController`.
 //!
 //! A "virtual folder" is a directory under
-//! [`ServerApplicationPaths::default_user_views_path`]; inside it Jellyfin keeps:
+//! `ServerApplicationPaths::default_user_views_path`; inside it Jellyfin keeps:
 //! - one `.mblink` **shortcut** file per media path — a plain-text file whose
 //!   whole content is the target path (see `MbLinkShortcutHandler`);
 //! - an optional `<type>.collection` marker naming the collection type;

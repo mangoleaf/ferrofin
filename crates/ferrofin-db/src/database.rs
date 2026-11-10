@@ -137,7 +137,7 @@ impl Database {
     /// [`Database::connect`] with an explicit pool size and statement cache.
     ///
     /// `pool_size` `Some(n)` pins the pool at exactly `n` connections; `None`
-    /// uses the sizing formula ([`default_pool_size`]). `statement_cache` is
+    /// uses the sizing formula (`default_pool_size`). `statement_cache` is
     /// how many prepared statements each connection keeps, reader and writer
     /// pools alike; `None` keeps [`DEFAULT_STATEMENT_CACHE_CAPACITY`]. The
     /// composition root resolves its config layers (`FERROFIN_DB_POOL` /
@@ -1204,7 +1204,7 @@ impl Database {
     /// boot's, the file as it was before the first attempt).
     ///
     /// The snapshot is written under a temporary name and only renamed into
-    /// place once it is complete and on disk ([`publish_snapshot`]), so an
+    /// place once it is complete and on disk (`publish_snapshot`), so an
     /// existing one is never a copy a full disk or a kill cut short. Something
     /// other than a file on the snapshot's name (a directory) is no snapshot:
     /// the rename onto it fails, and so does the repair, rather than run with

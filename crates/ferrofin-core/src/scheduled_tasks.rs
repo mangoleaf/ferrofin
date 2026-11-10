@@ -1199,7 +1199,7 @@ impl FerrofinTaskManager {
     /// Ends the registry with its host: port of `TaskManager.Dispose`, which
     /// disposes each `ScheduledTaskWorker`. From here on no run starts and the
     /// scheduler fires nothing (`DisposeTriggers`); each running run is
-    /// cancelled, waited on for at most [`SHUTDOWN_RUN_WAIT`], and recorded as
+    /// cancelled, waited on for at most `SHUTDOWN_RUN_WAIT`, and recorded as
     /// [`Aborted`](TaskCompletionStatus::Aborted), which jellyfin-web shows as
     /// "Aborted by server shutdown".
     ///
@@ -1329,8 +1329,8 @@ impl FerrofinTaskManager {
     /// Starts the background trigger scheduler, returning its join handle.
     ///
     /// Fires each registered task's `StartupTrigger`s after
-    /// [`STARTUP_TRIGGER_DELAY`], then evaluates daily/weekly/interval triggers
-    /// every [`SCHEDULER_PERIOD`] and cancels runs that exceed their trigger's
+    /// `STARTUP_TRIGGER_DELAY`, then evaluates daily/weekly/interval triggers
+    /// every `SCHEDULER_PERIOD` and cancels runs that exceed their trigger's
     /// `max_runtime_ticks`. Call once from the composition root; a task
     /// registered afterwards fires its own startup trigger from
     /// [`register`](Self::register).
@@ -1738,7 +1738,7 @@ impl ScheduledTask for RefreshLibraryTask {
     }
 }
 
-/// Bridges the concrete registry onto the `ferrofin-traits` [`TaskManager`] seam
+/// Bridges the concrete registry onto the `ferrofin-traits` `TaskManager` seam
 /// the API layer depends on.
 ///
 /// Delegates to the inherent [`list`](FerrofinTaskManager::list) /

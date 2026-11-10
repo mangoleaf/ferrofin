@@ -276,7 +276,7 @@ async fn announce_shutdown(
 /// the boot sequence has exactly one implementation.
 ///
 /// `POST /System/Restart` (and a scheduled backup restore) re-create the host
-/// IN-PROCESS: the server drains, the state is dropped, and [`serve_once`] runs
+/// IN-PROCESS: the server drains, the state is dropped, and `serve_once` runs
 /// again — Jellyfin's `Program.Main` `do { … } while (_restartOnShutdown)`. A
 /// container therefore survives a restart without a supervisor, exactly as a
 /// Jellyfin container does. Shutdown and signals return from here and the

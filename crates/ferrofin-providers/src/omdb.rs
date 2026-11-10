@@ -470,7 +470,7 @@ struct OmdbSeason {
 /// An OMDb title record — port of `OmdbProvider.RootObject`, restricted to the
 /// fields Jellyfin actually maps onto an item.
 ///
-/// Every string field goes through [`na_option`], so OMDb's `"N/A"` sentinel
+/// Every string field goes through `na_option`, so OMDb's `"N/A"` sentinel
 /// arrives as `None` (C# does this with `JsonOmdbNotAvailableStringConverter`).
 #[derive(Debug, Default, Clone, Deserialize)]
 pub struct OmdbItem {

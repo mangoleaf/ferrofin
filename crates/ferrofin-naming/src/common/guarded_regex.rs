@@ -35,7 +35,7 @@ use fancy_regex::{Captures, Error, Regex};
 
 /// A compiled naming pattern with a linear-time rejection guard.
 ///
-/// See the [module docs](self) for why the guard is sound.
+/// See the module docs for why the guard is sound.
 #[derive(Debug, Clone)]
 pub struct GuardedRegex {
     /// The relaxed (lookaround-free) superset pattern, when one could be built.

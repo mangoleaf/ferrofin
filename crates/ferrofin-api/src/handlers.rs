@@ -1,7 +1,7 @@
 //! Real ported handlers for the contract routes.
 //!
 //! Each submodule mirrors one `Jellyfin.Api` controller and holds axum handlers
-//! that call the [`AppState`](crate::state::AppState) manager traits, project
+//! that call the [`AppState`] manager traits, project
 //! results through [`DtoService`](ferrofin_traits::dto::DtoService), and return
 //! the wire DTOs from `ferrofin-model`. Every operation in the vendored contract
 //! is served by a real handler, listed in [`REAL_ROUTES`], and [`register`]

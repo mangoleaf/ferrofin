@@ -74,7 +74,7 @@ fn installed_rules() -> Arc<SortRules> {
 /// trim and lower-case (.NET invariant simple casing), remove each article where it stands as a whole word
 /// (at the start, surrounded by spaces, or at the end), delete the
 /// remove-character set, turn each replace-character into a space, then
-/// [`modify_sort_chunks`] left-pads every run of digits to 10 so numbers sort
+/// `modify_sort_chunks` left-pads every run of digits to 10 so numbers sort
 /// naturally (`Movie 0001 (2020)` → `movie 0000000001 (0000002020)`).
 ///
 /// **The stage order is load-bearing and matches C#: words, then removes, then

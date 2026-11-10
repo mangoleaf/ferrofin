@@ -2,7 +2,7 @@
 //!
 //! Aspect-preserving resize math. The C# original rounds via
 //! `Convert.ToInt32(double)`, which uses banker's rounding (round half to even);
-//! [`round_to_i32`] replicates that exactly so the ported behavior matches.
+//! `round_to_i32` replicates that exactly so the ported behavior matches.
 
 use super::ImageDimensions;
 

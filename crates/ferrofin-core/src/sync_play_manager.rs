@@ -7,11 +7,11 @@
 //! `SyncPlayGroupUpdate` envelopes to member sockets via the
 //! [`SessionMessageBus`]. The server never plays media — clients synchronize off
 //! the server clock using each command's future `When` timestamp (see the
-//! time-sync note on [`Group::unpause_when`]).
+//! time-sync note on `Group::unpause_when`).
 //!
 //! The C# per-state strategy objects (`IdleGroupState`, `WaitingGroupState`, …)
 //! and their request-object double-dispatch are collapsed into a `match` over
-//! ([`GroupStateType`], [`PlaybackRequest`]) inside [`Group::handle`], which is
+//! ([`GroupStateType`], [`PlaybackRequest`]) inside `Group::handle`, which is
 //! how Rust expresses the same table without method-overload dispatch.
 
 use std::collections::HashMap;

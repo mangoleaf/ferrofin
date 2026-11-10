@@ -12,7 +12,7 @@
 //! and then replaces the media-encoding seams (`hls` / `attachments`) — installed
 //! as disabled stubs by [`AppState::new`] — with the real ffmpeg-backed transcode
 //! pair via [`with_media_encoding`](AppState::with_media_encoding) (built by
-//! [`build_media_encoding`](crate::media_encoding::build_media_encoding)).
+//! [`build_media_encoding`]).
 
 use std::sync::Arc;
 

@@ -277,7 +277,7 @@ pub fn metadata_fetcher_order(
     type_entry(options, kind).map(|t| t.metadata_fetcher_order.clone())
 }
 
-/// The server-wide [`MetadataOptions`] entry for item type `kind`.
+/// The server-wide `MetadataOptions` entry for item type `kind`.
 ///
 /// Port of `MetadataConfigurationExtensions.GetMetadataOptionsForType`
 /// (v10.11.8 `MediaBrowser.Controller/Library/MetadataConfigurationExtensions.cs:21`):
@@ -1002,7 +1002,7 @@ fn supported_image_types(provs: &[Provider], type_name: &str) -> Vec<ImageType> 
 /// `MetadataFetcherOrder` (`libraryoptionseditor.js` `getOrderedPlugins`,
 /// `setMetadataFetchersIntoOptions`), so the order a new library is shown is
 /// the order its scans run. Its `ImageFetchers` are ordered the same way
-/// ([`ordered_image_fetchers`]).
+/// (`ordered_image_fetchers`).
 #[must_use]
 pub fn library_options_info(
     item_types: &[String],

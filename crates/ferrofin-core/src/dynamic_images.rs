@@ -88,7 +88,7 @@
 //!   way, and also redraws the library tiles; the root's reaches the user
 //!   root's image too ([`DynamicImageProviders::refresh_user_root_between`]).
 //!   The walk plans neither, so each is forced as its own refresh plan says
-//!   ([`unwalked_refresh_plan`](crate::library_scan::unwalked_refresh_plan)):
+//!   (`unwalked_refresh_plan`):
 //!   by the refresh's options, or by its own first or overdue refresh.
 //!
 //! Upstream's `GenresValidator`

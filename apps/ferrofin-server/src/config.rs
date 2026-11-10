@@ -4,7 +4,7 @@
 //!
 //! This is the *bootstrap-only* config: the small set of knobs the host needs
 //! to find its data directory, bind a socket, and locate ffmpeg **before** the
-//! runtime [`FerrofinServerConfigurationManager`] takes over the persistent
+//! runtime `FerrofinServerConfigurationManager` takes over the persistent
 //! `system.json` / `branding.json`. It is deliberately distinct from that
 //! runtime configuration: a missing `config.toml` is not an error.
 //!
@@ -328,7 +328,7 @@ pub enum LogFormat {
 pub struct Config {
     /// Program-data root; derives the `data`/`config`/`cache`/`log`/`web`
     /// sub-directories. From `--data-dir` / `FERROFIN_DATA_DIR`, else
-    /// `$XDG_DATA_HOME/ferrofin`, else [`SYSTEM_DATA_DIR`].
+    /// `$XDG_DATA_HOME/ferrofin`, else `SYSTEM_DATA_DIR`.
     pub data_dir: PathBuf,
 
     /// The bootstrap `config.toml` this configuration was read from, or would

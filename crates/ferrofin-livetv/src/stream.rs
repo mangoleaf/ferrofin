@@ -121,7 +121,7 @@ impl Default for ReqwestTunerSource {
 
 impl ReqwestTunerSource {
     /// Creates a tuner source over a `reqwest` client bounded by
-    /// [`TUNER_RESPONSE_TIMEOUT_SECONDS`] — both to connect and between reads
+    /// `TUNER_RESPONSE_TIMEOUT_SECONDS` — both to connect and between reads
     /// of the stream body.
     #[must_use]
     pub fn new() -> Self {
