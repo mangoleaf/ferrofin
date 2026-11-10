@@ -286,8 +286,9 @@ version = "2.5.0"
 criteria = "safe-to-deploy"
 
 [[exemptions.crc32fast]]
-version = "1.5.4"
+version = "1.5.5"
 criteria = "safe-to-deploy"
+notes = "2026-11-10: the v1.5.1 freeze sweep moved it from 1.5.4, a starting exemption, and no imported audit covers 1.5.5; lifted by an imported or Ferrofin audit of 1.5.5"
 
 [[exemptions.crossbeam-channel]]
 version = "0.5.17"
