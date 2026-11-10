@@ -191,7 +191,8 @@ fn png(colour: [u8; 3]) -> Vec<u8> {
 /// is true), with the file's own modification time — so neither a rescan nor
 /// a full-refresh validation draws the collage over it. A row adopted from
 /// Jellyfin stores that path as `%MetadataPath%/Genre/…`, which the item read
-/// expands (gl-848) and every save keeps as stored.
+/// expands (gl-848); every save stores it that way, a Ferrofin row's too
+/// (`ReverseVirtualPath`, gl-1581).
 #[rstest::rstest]
 #[case::ferrofin(false)]
 #[case::adopted(true)]
@@ -323,15 +324,10 @@ async fn an_uploaded_genre_primary_survives_rescans(#[case] adopted: bool) {
             .fetch_one(db.pool())
             .await
             .expect("stored path");
-    let expected = if adopted {
-        "%MetadataPath%/Genre/Crime".to_owned()
-    } else {
-        genre_dir.to_string_lossy().into_owned()
-    };
     assert_eq!(
         stored.as_deref(),
-        Some(expected.as_str()),
-        "the saves keep the path as stored"
+        Some("%MetadataPath%/Genre/Crime"),
+        "every save stores the path tokenised"
     );
 }
 

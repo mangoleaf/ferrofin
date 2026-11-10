@@ -4681,14 +4681,9 @@ mod tests {
                     && f.name.as_deref() == Some("Playlists")
             })
             .expect("Playlists media folder present");
-        assert!(
-            playlists
-                .path
-                .as_deref()
-                .is_some_and(|p| p.ends_with("/data/playlists")),
-            "playlists path should end with /data/playlists, got {:?}",
-            playlists.path
-        );
+        // Stored as upstream stores it, `%AppDataPath%/playlists` (gl-1581);
+        // this test's repository reads it as stored, the server's expands it.
+        assert_eq!(playlists.path.as_deref(), Some("%AppDataPath%/playlists"));
         // The backing directory is created on disk.
         assert!(playlists_path.is_dir());
 

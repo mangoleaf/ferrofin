@@ -567,7 +567,8 @@ pub(crate) async fn set_item_path_in(
 /// does (`FindFolders(path)`), and never by type: `CollectionFolder` is the type
 /// of *every* library, so a type match would file collections into whichever one
 /// sorted first. Two spellings are accepted because Jellyfin writes the literal
-/// `%AppDataPath%` token where Ferrofin writes the resolved path — both are
+/// `%AppDataPath%` token, as every save does now, where an earlier Ferrofin
+/// wrote the resolved path — both are
 /// equalities, not patterns, so a user library that happens to be called
 /// `collections` cannot be mistaken for this.
 pub(crate) async fn container_at(db: &Database, path: &str) -> Result<Option<Uuid>, ServiceError> {
@@ -590,8 +591,9 @@ pub(crate) async fn container_at(db: &Database, path: &str) -> Result<Option<Uui
         .transpose()
 }
 
-/// The `kind` row stored under the id `path` derives, moved to `path`, or
-/// `None`: the container a lookup by path misses once the data directory moved.
+/// The `kind` row stored under the id `path` derives, moved to `path` (stored
+/// as `stored_path`, its `ReverseVirtualPath` form), or `None`: the container
+/// a lookup by path misses once the data directory moved.
 ///
 /// The Jellyfin derivation keys a data-directory container on its
 /// program-data-relative path (`data\collections`), so the id survives the
@@ -605,6 +607,7 @@ pub(crate) async fn moved_container(
     db: &Database,
     kind: BaseItemKind,
     path: &str,
+    stored_path: &str,
     mode: &crate::item_type_lookup::IdDerivation,
 ) -> Result<Option<Uuid>, ServiceError> {
     let Some(id) = crate::item_type_lookup::derive_item_id_with(mode, kind, path) else {
@@ -616,7 +619,7 @@ pub(crate) async fn moved_container(
     if crate::item_type_lookup::kind_from_type_name(&row.type_) != Some(kind) {
         return Ok(None);
     }
-    set_container_path(db.writer(), id, path).await?;
+    set_container_path(db.writer(), id, stored_path).await?;
     db.invalidate_libraries(); // the container may be a library row
     tracing::info!(item_id = %id, from = row.path.as_deref().unwrap_or_default(), path,
         "moved a container to the data directory");
@@ -929,7 +932,8 @@ pub(crate) async fn repath_root_folder(
 }
 
 /// The literal Jellyfin writes into `BaseItems.Path` in place of the data
-/// directory (`%AppDataPath%/collections`), which Ferrofin stores resolved.
+/// directory (`%AppDataPath%/collections`), which an earlier Ferrofin stored
+/// resolved.
 const JELLYFIN_DATA_PATH_TOKEN: &str = "%AppDataPath%";
 
 /// Stamps a provisioned container with its directory and makes it its own top
@@ -1038,6 +1042,38 @@ impl FerrofinItemPersistenceService {
     ) -> Self {
         self.virtual_paths = virtual_paths;
         self
+    }
+
+    /// What a by-path read seeks for `paths`: each one's stored form, as
+    /// `TranslateQuery` seeks `GetPathToSave(filter.Path)`, and the resolved
+    /// form too where they differ, for a row an earlier build saved resolved
+    /// and has not saved since (gl-1581).
+    fn path_keys(&self, paths: &[String]) -> Vec<String> {
+        paths
+            .iter()
+            .flat_map(|path| {
+                let stored = self.virtual_paths.reverse(path);
+                let resolved = (stored != *path).then(|| path.clone());
+                std::iter::once(stored).chain(resolved)
+            })
+            .collect()
+    }
+
+    /// [`PathRow`]s as [`ItemPathRow`]s, each `Path` expanded (`RestorePath`):
+    /// the scan matches them against the paths it lists. A row whose id does
+    /// not parse is no item the scan can act on.
+    fn path_rows(&self, rows: Vec<PathRow>) -> impl Iterator<Item = ItemPathRow> + '_ {
+        rows.into_iter()
+            .filter_map(|(id, item_type, mut path, parent, extra_type)| {
+                self.virtual_paths.expand_in_place(&mut path);
+                Some(ItemPathRow {
+                    id: Uuid::parse_str(&id).ok()?,
+                    item_type,
+                    path,
+                    parent_id: parent.as_deref().and_then(|p| Uuid::parse_str(p).ok()),
+                    extra_type,
+                })
+            })
     }
 
     /// Attaches the rating tables the owned-video copy scores the ratings it
@@ -1426,13 +1462,15 @@ impl FerrofinItemPersistenceService {
         };
         let rows: Vec<(String, Option<String>)> = sqlx::query_as(
             r#"SELECT "Id", "Path" FROM "BaseItems"
-               WHERE ("Type" = ?1 OR ("Type" = ?2 AND "Path" = ?3))
+               WHERE ("Type" = ?1 OR ("Type" = ?2 AND "Path" IN (?3, ?4)))
                  AND ("DateCreated" IS NULL OR "DateModified" IS NULL
                       OR "DateLastSaved" IS NULL)"#,
         )
         .bind(type_name(BaseItemKind::PlaylistsFolder)?)
         .bind(type_name(BaseItemKind::CollectionFolder)?)
         .bind(collections_path)
+        // stored tokenised, as every save writes it (gl-1581)
+        .bind(self.virtual_paths.reverse(collections_path))
         .fetch_all(self.db.pool())
         .await
         .map_err(db_err)?;
@@ -1440,7 +1478,9 @@ impl FerrofinItemPersistenceService {
         let mut dated = Vec::with_capacity(rows.len());
         for (id, path) in rows {
             let dir = match path {
-                Some(path) => tokio::fs::metadata(path).await.ok(),
+                Some(path) => tokio::fs::metadata(self.virtual_paths.expand(&path))
+                    .await
+                    .ok(),
                 None => None,
             };
             let (created, modified) = dir
@@ -1752,20 +1792,24 @@ impl FerrofinItemPersistenceService {
     /// without a `FerrofinPlaylists` row first imports one from the `Data` it
     /// wrote ([`crate::item_data::import_playlist_meta_if_missing_in`]).
     ///
-    /// The `Path` written is the stored one when that is a virtual-path form
-    /// of the item's ([`Self::stored_virtual_path`]).
+    /// The `Path` is written through `ReverseVirtualPath`, as upstream's
+    /// mapper writes every saved path (`BaseItemMapper.Map` →
+    /// `GetPathToSave`): a path in this server's data or internal metadata
+    /// directory is stored as `%AppDataPath%/…` or `%MetadataPath%/…`, and
+    /// every read expands it back.
     async fn upsert_item(
         &self,
         item: &BaseItemEntity,
         sql: &'static str,
         scan: bool,
     ) -> Result<(), ServiceError> {
-        let stored_path = self.stored_virtual_path(item).await?;
         let mut query = sqlx::query(sql);
         for (name, value) in written_columns(item) {
-            let value = match (name, &stored_path) {
-                ("Path", Some(stored)) => Column::Text(Some(stored.clone())),
-                _ => value,
+            let value = match (name, value) {
+                ("Path", Column::Text(Some(path))) => {
+                    Column::Text(Some(self.virtual_paths.reverse(&path)))
+                }
+                (_, value) => value,
             };
             query = match value {
                 Column::Text(v) => query.bind(v),
@@ -1806,39 +1850,6 @@ impl FerrofinItemPersistenceService {
             self.push_name_to_children(item).await?;
         }
         Ok(())
-    }
-
-    /// The `Path` a tokenised row stores, when the save of `item` must keep
-    /// it: Jellyfin stores a path in its data or metadata directory as
-    /// `%AppDataPath%/…` or `%MetadataPath%/…` (`ReverseVirtualPath`), and so
-    /// does Ferrofin for the box sets and playlists it creates, and every read
-    /// expands it (`FerrofinItemRepository`'s rows, as `BaseItemMapper.Map`),
-    /// so a row read and saved back carries the expansion. Ferrofin writes
-    /// other paths resolved (`virtual_paths`), so the stored token form is
-    /// kept only while it still expands to the path saved; a path the save
-    /// changes is written as given.
-    ///
-    /// Reads the stored path only for a path inside one of those directories
-    /// (one a token could stand for): a media item's save reads nothing more.
-    async fn stored_virtual_path(
-        &self,
-        item: &BaseItemEntity,
-    ) -> Result<Option<String>, ServiceError> {
-        let Some(path) = item.path.as_deref() else {
-            return Ok(None);
-        };
-        if self.virtual_paths.reverse(path) == path {
-            return Ok(None);
-        }
-        let stored: Option<Option<String>> =
-            sqlx::query_scalar(r#"SELECT "Path" FROM "BaseItems" WHERE "Id" = ?1"#)
-                .bind(&item.id)
-                .fetch_optional(self.db.pool())
-                .await
-                .map_err(db_err)?;
-        Ok(stored
-            .flatten()
-            .filter(|stored| stored != path && self.virtual_paths.expand(stored) == path))
     }
 
     /// `BeforeSaveInternal` names an episode or a season after its parents
@@ -2610,9 +2621,10 @@ impl ItemPersistenceService for FerrofinItemPersistenceService {
                     let mut conn = self.db.pool().acquire().await.map_err(db_err)?;
                     let mut ids = Vec::with_capacity(members.len());
                     for member in members {
-                        if let Some(id) = resolve_playlist_member(&mut conn, member)
-                            .await
-                            .map_err(db_err)?
+                        if let Some(id) =
+                            resolve_playlist_member(&mut conn, member, &self.virtual_paths)
+                                .await
+                                .map_err(db_err)?
                         {
                             ids.push(id);
                         }
@@ -2959,7 +2971,7 @@ impl ItemPersistenceService for FerrofinItemPersistenceService {
             None,
             None,
         ))
-        .bind(path)
+        .bind(self.virtual_paths.reverse(path))
         .bind(chrono::Utc::now())
         .execute(&mut *tx)
         .await
@@ -2993,7 +3005,7 @@ impl ItemPersistenceService for FerrofinItemPersistenceService {
         let id = guid_to_db(id);
         sqlx::query(r#"UPDATE "BaseItems" SET "Path" = ?2 WHERE "Id" = ?1"#)
             .bind(&id)
-            .bind(path)
+            .bind(self.virtual_paths.reverse(path))
             .execute(self.db.writer())
             .await
             .map_err(db_err)?;
@@ -3249,6 +3261,9 @@ impl ItemPersistenceService for FerrofinItemPersistenceService {
                 query.fetch_all(self.db.pool()).await.map_err(db_err)?
             {
                 let Some(id) = key(&item) else { continue };
+                // the scan compares these with the files beside the media:
+                // a stored token is expanded first (`RestorePath`)
+                let path = self.virtual_paths.expand(&path);
                 let links = out.entry(id).or_default();
                 match crate::db_error::media_stream_type_from_disc(stream_type) {
                     MediaStreamType::Subtitle => links.external_subtitles.push(path),
@@ -3268,15 +3283,13 @@ impl ItemPersistenceService for FerrofinItemPersistenceService {
         paths: &[String],
     ) -> Result<Option<Vec<ItemPathRow>>, ServiceError> {
         let mut out = Vec::new();
-        for chunk in paths.chunks(ferrofin_db::BATCH_BIND_CHUNK) {
+        for chunk in self.path_keys(paths).chunks(ferrofin_db::BATCH_BIND_CHUNK) {
             let sql = items_at_paths_sql(chunk.len());
             let mut query = sqlx::query_as::<_, PathRow>(sqlx::AssertSqlSafe(sql.as_str()));
             for path in chunk {
                 query = query.bind(path);
             }
-            out.extend(path_rows(
-                query.fetch_all(self.db.pool()).await.map_err(db_err)?,
-            ));
+            out.extend(self.path_rows(query.fetch_all(self.db.pool()).await.map_err(db_err)?));
         }
         Ok(Some(out))
     }
@@ -3336,9 +3349,7 @@ impl ItemPersistenceService for FerrofinItemPersistenceService {
             for library in top_parent_ids {
                 query = query.bind(guid_to_db(*library));
             }
-            out.extend(path_rows(
-                query.fetch_all(self.db.pool()).await.map_err(db_err)?,
-            ));
+            out.extend(self.path_rows(query.fetch_all(self.db.pool()).await.map_err(db_err)?));
         }
         // Extras written by older scans may also match their own TopParentId.
         let mut seen = std::collections::HashSet::with_capacity(out.len());
@@ -3358,7 +3369,7 @@ impl ItemPersistenceService for FerrofinItemPersistenceService {
         let mut out = Vec::new();
         // Three binds per root, after the libraries'.
         let per_chunk = (ferrofin_db::BATCH_BIND_CHUNK.saturating_sub(libraries.len()) / 3).max(1);
-        for chunk in roots.chunks(per_chunk) {
+        for chunk in self.path_keys(roots).chunks(per_chunk) {
             for sql in [
                 items_under_roots_sql(libraries.len(), chunk.len()),
                 pathless_children_sql(libraries.len(), chunk.len()),
@@ -3372,9 +3383,7 @@ impl ItemPersistenceService for FerrofinItemPersistenceService {
                     let (exact, from, to) = path_prefix_range(root);
                     query = query.bind(exact).bind(from).bind(to);
                 }
-                out.extend(path_rows(
-                    query.fetch_all(self.db.pool()).await.map_err(db_err)?,
-                ));
+                out.extend(self.path_rows(query.fetch_all(self.db.pool()).await.map_err(db_err)?));
             }
         }
         // Overlapping roots match a row more than once.
@@ -3405,7 +3414,11 @@ impl ItemPersistenceService for FerrofinItemPersistenceService {
                         season_id: parse(season),
                         owner_id: parse(owner),
                         extra_type,
-                        path,
+                        path: {
+                            let mut path = path;
+                            self.virtual_paths.expand_in_place(&mut path);
+                            path
+                        },
                     });
                 }
             }
@@ -3420,13 +3433,20 @@ impl ItemPersistenceService for FerrofinItemPersistenceService {
         paths: &[String],
     ) -> Result<Option<Vec<String>>, ServiceError> {
         let mut out: Vec<String> = Vec::new();
-        for chunk in paths.chunks(ferrofin_db::BATCH_BIND_CHUNK) {
+        for chunk in self.path_keys(paths).chunks(ferrofin_db::BATCH_BIND_CHUNK) {
             let sql = local_group_paths_sql(chunk.len());
             let mut query = sqlx::query_scalar::<_, String>(sqlx::AssertSqlSafe(sql.as_str()));
             for path in chunk {
                 query = query.bind(path);
             }
-            out.extend(query.fetch_all(self.db.pool()).await.map_err(db_err)?);
+            out.extend(
+                query
+                    .fetch_all(self.db.pool())
+                    .await
+                    .map_err(db_err)?
+                    .iter()
+                    .map(|path| self.virtual_paths.expand(path)),
+            );
         }
         out.sort_unstable();
         out.dedup();
@@ -3758,7 +3778,13 @@ impl ItemPersistenceService for FerrofinItemPersistenceService {
                       OR (?6 IS NOT NULL AND "Size" IS NOT ?6))"#,
         )
         .bind(&item.id)
-        .bind(&item.path)
+        // stored as every save stores it (`GetPathToSave`), so the guard
+        // below compares like with like
+        .bind(
+            item.path
+                .as_deref()
+                .map(|path| self.virtual_paths.reverse(path)),
+        )
         .bind(&item.parent_id)
         .bind(&item.top_parent_id)
         .bind(date_modified)
@@ -5542,12 +5568,16 @@ async fn write_scanned_members(
 async fn resolve_playlist_member(
     conn: &mut sqlx::SqliteConnection,
     member: &PlaylistMember,
+    virtual_paths: &crate::virtual_paths::VirtualPathExpander,
 ) -> Result<Option<Uuid>, sqlx::Error> {
     if let Some(path) = member.path.as_deref() {
+        // the stored form first, as `FindByPath` seeks it, and the resolved
+        // one an earlier build stored (gl-1581)
         let id: Option<String> = sqlx::query_scalar(
-            r#"SELECT "Id" FROM "BaseItems" WHERE "Path" = ?1
+            r#"SELECT "Id" FROM "BaseItems" WHERE "Path" IN (?1, ?2)
                ORDER BY "DateCreated" DESC LIMIT 1"#,
         )
+        .bind(virtual_paths.reverse(path))
         .bind(path)
         .fetch_optional(&mut *conn)
         .await?;
@@ -6289,21 +6319,6 @@ fn incomplete_inputs(kind: BaseItemKind, item: &BaseItemEntity) -> bool {
 
 /// One `(Id, Type, Path, ParentId, ExtraType)` row of the path-scoped reads.
 type PathRow = (String, String, Option<String>, Option<String>, Option<i32>);
-
-/// [`PathRow`]s as [`ItemPathRow`]s; a row whose id does not parse is no
-/// item the scan can act on.
-fn path_rows(rows: Vec<PathRow>) -> impl Iterator<Item = ItemPathRow> {
-    rows.into_iter()
-        .filter_map(|(id, item_type, path, parent, extra_type)| {
-            Some(ItemPathRow {
-                id: Uuid::parse_str(&id).ok()?,
-                item_type,
-                path,
-                parent_id: parent.as_deref().and_then(|p| Uuid::parse_str(p).ok()),
-                extra_type,
-            })
-        })
-}
 
 /// The binds that match a path at or under `root`, component-wise:
 /// `(root, root + "/", root + "0")` — the root itself, then the half-open
@@ -8367,13 +8382,107 @@ mod tests {
         assert_eq!(clean.as_deref(), Some("amelie"));
     }
 
-    /// gl-848: a row adopted from Jellyfin stores `%MetadataPath%/Genre/…`,
-    /// which the item read expands; saving the row back (every save of a read
-    /// row, a scan's included) keeps the stored form, while a save that moves
-    /// the item, or a server with no directories to expand to, writes the
-    /// path it is given.
+    /// gl-1581: the scan's path reads — the by-path lookup (`FindByPath`),
+    /// a scoped scan's rows under its roots and a library scan's rows — find a
+    /// recording under the data directory whether its row is stored
+    /// tokenised, as every save now writes it, or resolved, as an earlier
+    /// build saved it; and they hand back the resolved path the scan matches
+    /// against, so the prune can find a deleted recording gone.
     #[tokio::test]
-    async fn a_save_keeps_the_stored_virtual_path_it_expands_from() {
+    async fn the_scan_path_reads_find_a_row_in_either_stored_form() {
+        use ferrofin_traits::persistence::ItemPathRow;
+        let db = test_db().await;
+        let root = tempfile::tempdir().expect("tempdir");
+        let paths = crate::app_paths::test_paths(root.path());
+        let data = ferrofin_traits::system::ServerApplicationPaths::data_path(&*paths);
+        let svc = FerrofinItemPersistenceService::new(db.clone()).with_virtual_paths(
+            crate::virtual_paths::VirtualPathExpander::from_paths(std::sync::Arc::clone(&paths)),
+        );
+        let library = Uuid::from_u128(0x11B);
+        let recording = |n: u128, path: String| ferrofin_db::entities::base_items::BaseItemEntity {
+            id: ferrofin_db::store::guid_to_db(Uuid::from_u128(n)),
+            type_: "MediaBrowser.Controller.Entities.Movie".to_owned(),
+            path: Some(path),
+            parent_id: Some(ferrofin_db::store::guid_to_db(library)),
+            top_parent_id: Some(ferrofin_db::store::guid_to_db(library)),
+            ..ferrofin_db::entities::base_items::BaseItemEntity::default()
+        };
+        let new = format!("{data}/livetv/recordings/New.ts");
+        let old = format!("{data}/livetv/recordings/Old.ts");
+        seed_item(&db, library, BaseItemKind::CollectionFolder).await;
+        svc.save_items(&[recording(0x5EC1, new.clone())])
+            .await
+            .expect("save");
+        seed_item(&db, Uuid::from_u128(0x5EC2), BaseItemKind::Movie).await;
+        sqlx::query(
+            r#"UPDATE "BaseItems" SET "Path" = ?1, "ParentId" = ?3, "TopParentId" = ?3
+               WHERE "Id" = ?2"#,
+        )
+        .bind(&old)
+        .bind(ferrofin_db::store::guid_to_db(Uuid::from_u128(0x5EC2)))
+        .bind(ferrofin_db::store::guid_to_db(library))
+        .execute(db.writer())
+        .await
+        .expect("an earlier build's resolved row");
+
+        let stored: Option<String> =
+            sqlx::query_scalar(r#"SELECT "Path" FROM "BaseItems" WHERE "Id" = ?1"#)
+                .bind(ferrofin_db::store::guid_to_db(Uuid::from_u128(0x5EC1)))
+                .fetch_one(db.pool())
+                .await
+                .expect("row");
+        assert_eq!(
+            stored.as_deref(),
+            Some("%AppDataPath%/livetv/recordings/New.ts")
+        );
+
+        let both = vec![(0x5EC1, Some(new.clone())), (0x5EC2, Some(old.clone()))];
+        let sorted = |rows: Vec<ItemPathRow>| {
+            let mut rows: Vec<(u128, Option<String>)> = rows
+                .into_iter()
+                .map(|row| (row.id.as_u128(), row.path))
+                .collect();
+            rows.sort();
+            rows
+        };
+        let at = svc
+            .items_at_paths(&[new.clone(), old.clone(), "/media/absent.mkv".to_owned()])
+            .await
+            .expect("lookup")
+            .expect("answers");
+        assert_eq!(sorted(at), both, "by path");
+        let scoped = svc
+            .items_in_scope(&[library], &[format!("{data}/livetv/recordings")])
+            .await
+            .expect("scope")
+            .expect("answers");
+        assert_eq!(sorted(scoped), both, "under the scanned root");
+        let all = svc
+            .library_items(&[library])
+            .await
+            .expect("library")
+            .expect("answers");
+        assert_eq!(sorted(all), both, "the library's rows");
+        let mut children: Vec<(u128, Option<String>)> = svc
+            .child_links(&[library])
+            .await
+            .expect("children")
+            .expect("answers")
+            .into_iter()
+            .map(|link| (link.id.as_u128(), link.path))
+            .collect();
+        children.sort();
+        assert_eq!(children, both, "the folder's children");
+    }
+
+    /// Every save writes `Path` the way upstream's `ReverseVirtualPath` does
+    /// (`BaseItemMapper.Map` → `GetPathToSave`): a row adopted from Jellyfin
+    /// keeps `%MetadataPath%/Genre/…` when saved back (gl-848), a row whose
+    /// save moves it within the metadata directory is stored tokenised too
+    /// (gl-1581: Ferrofin used to store that resolved), and a server with no
+    /// directories to reverse writes the path it is given.
+    #[tokio::test]
+    async fn every_save_stores_the_path_reverse_virtual_path_gives() {
         let db = test_db().await;
         let root = tempfile::tempdir().expect("tempdir");
         let paths = crate::app_paths::test_paths(root.path());
@@ -8422,7 +8531,26 @@ mod tests {
         svc.save_items(std::slice::from_ref(&genre))
             .await
             .expect("move");
-        assert_eq!(stored_path(genre.id.clone()).await, genre.path);
+        assert_eq!(
+            stored_path(genre.id.clone()).await.as_deref(),
+            Some("%MetadataPath%/Genre/Action Movies")
+        );
+
+        // a new row: what a fresh Ferrofin writes for its own by-name items
+        let studio = ferrofin_db::entities::base_items::BaseItemEntity {
+            id: ferrofin_db::store::guid_to_db(Uuid::new_v4()),
+            type_: "MediaBrowser.Controller.Entities.Studio".to_owned(),
+            name: Some("Acme".to_owned()),
+            path: Some(format!("{metadata}/Studio/Acme")),
+            ..ferrofin_db::entities::base_items::BaseItemEntity::default()
+        };
+        svc.save_items(std::slice::from_ref(&studio))
+            .await
+            .expect("create");
+        assert_eq!(
+            stored_path(studio.id.clone()).await.as_deref(),
+            Some("%MetadataPath%/Studio/Acme")
+        );
 
         let plain = FerrofinItemPersistenceService::new(db.clone());
         let mut adopted = genre.clone();
@@ -10192,6 +10320,62 @@ mod tests {
         };
         assert!(!super::scan_save_changes_row(&renamed, &locked, false));
         assert!(super::scan_save_changes_row(&moved, &locked, false));
+    }
+
+    /// gl-1581: a file under the data directory (a recording) is stored
+    /// tokenised, so its file facts compare the tokenised form: an unchanged
+    /// file is not reported changed (no re-date, no re-extraction on every
+    /// scan), and a changed one keeps the token.
+    #[tokio::test]
+    async fn update_file_facts_compares_a_tokenised_row_in_its_stored_form() {
+        let db = test_db().await;
+        let root = tempfile::tempdir().expect("tempdir");
+        let paths = crate::app_paths::test_paths(root.path());
+        let data = ferrofin_traits::system::ServerApplicationPaths::data_path(&*paths);
+        let svc = FerrofinItemPersistenceService::new(db.clone()).with_virtual_paths(
+            crate::virtual_paths::VirtualPathExpander::from_paths(std::sync::Arc::clone(&paths)),
+        );
+        let at = |s: &str| {
+            chrono::DateTime::parse_from_rfc3339(s)
+                .unwrap()
+                .with_timezone(&chrono::Utc)
+        };
+        let id = Uuid::new_v4();
+        let row = ferrofin_db::entities::base_items::BaseItemEntity {
+            id: guid_to_db(id),
+            type_: stored_type_name(BaseItemKind::Movie).unwrap().to_owned(),
+            name: Some("Rec".into()),
+            path: Some(format!("{data}/livetv/recordings/Rec/Rec.ts")),
+            date_modified: Some(at("2020-01-05T00:00:00Z")),
+            size: Some(10),
+            ..Default::default()
+        };
+        svc.save_items(std::slice::from_ref(&row))
+            .await
+            .expect("seed");
+        assert!(
+            !svc.update_file_facts(&row, None).await.expect("unchanged"),
+            "the same file is no change"
+        );
+        let changed = ferrofin_db::entities::base_items::BaseItemEntity {
+            size: Some(11),
+            ..row.clone()
+        };
+        assert!(
+            svc.update_file_facts(&changed, None)
+                .await
+                .expect("changed")
+        );
+        let stored: Option<String> =
+            sqlx::query_scalar(r#"SELECT "Path" FROM "BaseItems" WHERE "Id" = ?1"#)
+                .bind(guid_to_db(id))
+                .fetch_one(db.pool())
+                .await
+                .expect("row");
+        assert_eq!(
+            stored.as_deref(),
+            Some("%AppDataPath%/livetv/recordings/Rec/Rec.ts")
+        );
     }
 
     /// An undecodable row's file-facts write carries `BeforeSaveInternal`'s

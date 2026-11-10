@@ -129,7 +129,22 @@ pub async fn consolidate_localized_user_views(
         if stale.is_empty() {
             continue;
         }
-        dropped += consolidate(&mut tx, &view_type, &path, canonical, &candidates, &stale).await?;
+        // The id comes from the resolved path; the row stores it as upstream's
+        // save does, through `ReverseVirtualPath` (`%MetadataPath%/views/…`).
+        let stored_path = Path::new(
+            crate::app_paths::FerrofinServerApplicationPaths::VIRTUAL_INTERNAL_METADATA_PATH,
+        )
+        .join("views")
+        .join(&folder);
+        dropped += consolidate(
+            &mut tx,
+            &view_type,
+            &stored_path,
+            canonical,
+            &candidates,
+            &stale,
+        )
+        .await?;
     }
     sqlx::query(
         r#"INSERT INTO "FerrofinMeta" ("Key", "Value") VALUES (?1, '1')
@@ -870,7 +885,8 @@ mod tests {
             .expect("canonical view");
         assert_eq!(view.name.as_deref(), Some("TV en direct"));
         assert_eq!(view.forced_sort_name.as_deref(), Some("TV en direct"));
-        assert_eq!(view.path.as_deref(), Some(view_path));
+        // the id from the resolved path, the row as upstream stores it (gl-1581)
+        assert_eq!(view.path.as_deref(), Some("%MetadataPath%/views/livetv"));
         assert_eq!(view.date_created, Some(at(2024, 3, 1)));
         assert_eq!(view.data.as_deref(), Some(r#"{"ViewType":"livetv"}"#));
         assert_eq!(
