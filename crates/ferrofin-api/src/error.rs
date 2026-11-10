@@ -186,8 +186,24 @@ struct ErrorBody {
     error: String,
 }
 
+/// Marks a response whose producer has already logged its failure, or kept it
+/// below `error` on purpose, so the request span does not log it again (LOGGING.md §2).
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct FailureLogged;
+
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
+        let mut response = self.respond();
+        if response.status().is_server_error() {
+            response.extensions_mut().insert(FailureLogged);
+        }
+        response
+    }
+}
+
+impl ApiError {
+    /// Logs a 5xx once and builds the response.
+    fn respond(self) -> Response {
         let status = self.status();
         // 5xx messages can leak internals, so log the detail server-side but
         // return a generic body; 4xx/501 messages are safe to surface.

@@ -6,10 +6,11 @@
 //! manager for the master playlist, the variant `main.m3u8`, and then a dynamic
 //! segment — exactly what the `ferrofin-api` `handlers::hls` routes forward — and
 //! asserts the returned [`ServedFile`] points at a real, non-empty `.ts` segment
-//! that a live ffmpeg produced. The un-ported request→plan glue
-//! ([`StreamStatePlanner`]) is supplied here by a test planner that generates a
-//! tiny clip and emits real HLS ffmpeg args; everything below it is production
-//! code (`HlsStreamManagerImpl` + `TranscodeManagerImpl` + `TokioSegmentTranscoder`).
+//! that a live ffmpeg produced. The request→plan glue ([`StreamStatePlanner`],
+//! whose real implementation lives in the server binary) is supplied here by a
+//! test planner that generates a tiny clip and emits real HLS ffmpeg args;
+//! everything below it is production code (`HlsStreamManagerImpl` +
+//! `TranscodeManagerImpl` + `TokioSegmentTranscoder`).
 //!
 //! Excluded from the unit-coverage gate (integration `tests/` never count toward
 //! `cargo llvm-cov -p ferrofin-hls`) and gated on `FERROFIN_FFMPEG_TESTS` + `ffmpeg`
@@ -153,8 +154,9 @@ impl ServerApplicationPaths for TempPaths {
     }
 }
 
-/// A real [`StreamStatePlanner`] that stands in for the un-ported
-/// `GetStreamingState` + `GetCommandLineArguments`: it points every plan at a
+/// A real [`StreamStatePlanner`] that stands in for the server's
+/// `FerrofinStreamStatePlanner` (`GetStreamingState` +
+/// `GetCommandLineArguments`): it points every plan at a
 /// pre-generated clip and emits real mpegts-HLS ffmpeg args writing
 /// `out%d.ts` + `out.m3u8` into the transcode cache directory.
 struct FfmpegPlanner {
@@ -165,8 +167,7 @@ struct FfmpegPlanner {
     /// Emit fMP4 segments (`out%d.mp4` + `out-1.mp4` init) instead of mpegts.
     fmp4: bool,
     /// Encode at the source's pace (`-re`) and seek the input to the requested
-    /// segment, with the production planner's `temp_file` segments, so segment
-    /// requests can outrun the encoder.
+    /// segment, so segment requests can outrun the encoder.
     realtime: bool,
 }
 
@@ -225,9 +226,11 @@ impl FfmpegPlanner {
         if let Some(id) = segment_id {
             args.extend(["-start_number".into(), id.to_string()]);
         }
-        if self.realtime {
-            args.extend(["-hls_flags".into(), "temp_file".into()]);
-        }
+        // As the production planner does on every HLS job: the serve path takes
+        // a segment file's existence as its completeness, which only the
+        // `temp_file` rename makes true (without it ffmpeg creates the file
+        // empty and fills it a moment later, gl-759).
+        args.extend(["-hls_flags".into(), "temp_file".into()]);
         if event {
             args.extend(["-hls_base_url".into(), "hls/out/".into()]);
             if !self.fmp4 {

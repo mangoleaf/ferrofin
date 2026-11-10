@@ -15,6 +15,7 @@ use ferrofin_model::media_info::{SubtitleTrackEvent, SubtitleTrackInfo};
 
 use super::model::Subtitle;
 use super::{srt, ssa, vtt};
+use crate::error::MediaEncodingError;
 
 /// Parses subtitle streams keyed by file extension.
 ///
@@ -28,9 +29,10 @@ pub trait SubtitleParser: Send + Sync {
     ///
     /// # Errors
     ///
-    /// Returns an error message when the extension is unsupported or no cue
-    /// could be parsed (C# throws `ArgumentException` in both cases).
-    fn parse(&self, data: &[u8], file_extension: &str) -> Result<Subtitle, String>;
+    /// [`MediaEncodingError::InvalidInput`] when the extension is unsupported
+    /// or no cue could be parsed (C# throws `ArgumentException` in both cases),
+    /// and [`MediaEncodingError::Process`] when a format's load throws.
+    fn parse(&self, data: &[u8], file_extension: &str) -> Result<Subtitle, MediaEncodingError>;
 
     /// Whether `file_extension` is supported by this parser.
     ///
@@ -128,9 +130,9 @@ impl SubtitleParser for SubtitleEditParser {
     /// only the last). Each format loads into its own here; the first clean
     /// load wins, and when none is clean the first format's cues stand, which
     /// is what upstream returns for an extension with one format.
-    fn parse(&self, data: &[u8], file_extension: &str) -> Result<Subtitle, String> {
+    fn parse(&self, data: &[u8], file_extension: &str) -> Result<Subtitle, MediaEncodingError> {
         let formats = Self::formats_for(file_extension)
-            .ok_or_else(|| format!("Unsupported file extension: {file_extension}"))?;
+            .ok_or_else(|| unsupported_extension(file_extension))?;
 
         let lines = read_all_lines(data);
         let mut first: Option<Subtitle> = None;
@@ -161,7 +163,9 @@ impl SubtitleParser for SubtitleEditParser {
         let subtitle = clean.or(first).unwrap_or_default();
 
         if subtitle.paragraphs.is_empty() {
-            return Err(format!("Unsupported format: {file_extension}"));
+            return Err(MediaEncodingError::InvalidInput(format!(
+                "Unsupported format: {file_extension}"
+            )));
         }
 
         Ok(subtitle)
@@ -170,6 +174,11 @@ impl SubtitleParser for SubtitleEditParser {
     fn supports_file_extension(&self, file_extension: &str) -> bool {
         Self::formats_for(file_extension).is_some()
     }
+}
+
+/// `Parse`'s `ArgumentException` for an extension it has no format for.
+pub(crate) fn unsupported_extension(file_extension: &str) -> MediaEncodingError {
+    MediaEncodingError::InvalidInput(format!("Unsupported file extension: {file_extension}"))
 }
 
 /// Projects a parsed [`Subtitle`] onto the wire [`SubtitleTrackInfo`] DTO.

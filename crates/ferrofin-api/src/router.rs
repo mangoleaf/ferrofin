@@ -1,12 +1,13 @@
 //! [`create_router`] — assembles the full `ferrofin-api` [`axum::Router`].
 //!
 //! Every path+method in the vendored Jellyfin contract is registered so a known
-//! route never 404s. Unit 1 (INFRA) points them all at the shared
-//! `not_implemented` stub (`501`); later waves register real handlers over the
-//! matching entries. The router also mounts the health probes, the OpenAPI spec,
-//! the auth-context middleware, the panic boundary
-//! ([`crate::panic_boundary`]), CORS from the configured `CorsHosts`
-//! ([`crate::cors`]) and tracing.
+//! route never 404s: [`handlers::register`] mounts the real handlers, and a
+//! contract route missing from [`handlers::REAL_ROUTES`] gets the shared
+//! `not_implemented` stub (`501`). Every contract operation has a real handler
+//! today, so the stub only guards a route a future contract adds. The router
+//! also mounts the health probes, the OpenAPI spec, the auth-context
+//! middleware, the panic boundary ([`crate::panic_boundary`]), CORS from the
+//! configured `CorsHosts` ([`crate::cors`]) and tracing.
 
 use axum::extract::{MatchedPath, Request};
 use axum::response::Response;
@@ -17,6 +18,7 @@ use tracing::Span;
 
 use crate::auth::auth_context_layer;
 use crate::compression::compression_layer;
+use crate::error::FailureLogged;
 use crate::handlers;
 use crate::openapi::ApiDoc;
 use crate::routes::{axum_routes, not_implemented};
@@ -38,9 +40,10 @@ fn stub_for(method: &str) -> Option<MethodRouter<AppState>> {
 
 /// Assembles the complete `ferrofin-api` router over the injected [`AppState`].
 ///
-/// Registers all vendored contract routes (as `501` stubs in this unit), merges
-/// the health-probe router and the OpenAPI spec, and layers the auth-context
-/// middleware, the panic boundary, CORS, and HTTP tracing.
+/// Registers all vendored contract routes (each its real handler, or the `501`
+/// stub for one that has none), merges the health-probe router and the OpenAPI
+/// spec, and layers the auth-context middleware, the panic boundary, CORS, and
+/// HTTP tracing.
 ///
 /// # Panics
 ///
@@ -66,7 +69,7 @@ pub fn create_router(state: AppState) -> Router {
             .unwrap_or_else(|| panic!("vendored contract uses unsupported method {method:?}"));
         api = api.route(&path, stub);
     }
-    // Mount the real First-Light handlers over the (now-skipped) stub slots.
+    // Mount the real handlers in the slots the loop skipped.
     api = handlers::register(api);
 
     // `/health` is behind the IP filter, as `MapHealthChecks` is upstream. The
@@ -112,11 +115,15 @@ pub fn create_router(state: AppState) -> Router {
     // a sampled request's `trace_id` is stamped on for log↔trace correlation.
     // With OTLP export off the OTel context is invalid, so no `trace_id` is
     // recorded and the layer degrades to plain per-request spans as before.
+    // `record_status` logs a 5xx nothing has logged yet, so the default
+    // `on_failure`, which logs every 5xx again, is off: for an HTTP response
+    // a 5xx status is the only failure it ever reports.
     .layer(
         TraceLayer::new_for_http()
             .make_span_with(make_request_span)
             .on_request(record_trace_id)
-            .on_response(record_status),
+            .on_response(record_status)
+            .on_failure(()),
     )
     // `UseCors()` with `CorsPolicyProvider`: the policy follows the live
     // `CorsHosts` on every request.
@@ -184,8 +191,8 @@ fn make_request_span(req: &Request) -> Span {
 ///   resolves no field and is a no-op, so that work disappears. Nothing reads
 ///   the value with export off: spans themselves are never printed
 ///   (`FmtSpan::NONE`), and the one log line emitted after it is recorded —
-///   `tower_http`'s failure line for a 5xx — carries the status in its own
-///   `classification` field regardless.
+///   [`record_status`]'s failure line for a 5xx — carries the status in its
+///   own field regardless.
 ///
 /// Every field a log reader sees at span creation is identical in both branches.
 fn build_request_span(req: &Request, otlp: bool) -> Span {
@@ -226,13 +233,25 @@ fn record_trace_id(_req: &Request, span: &Span) {
     }
 }
 
-/// Records the final HTTP status code onto the request span.
+/// Records the final HTTP status code onto the request span, and logs a 5xx
+/// whose producer has not (a relayed origin's, a plugin's, a health check's):
+/// every failed request is logged once (LOGGING.md §2).
 ///
-/// A no-op when the span was built without the `http.response.status_code`
-/// field, i.e. whenever OTLP export is off — see [`build_request_span`] for why
-/// that field is exporter-only and what recording it costs.
-fn record_status(res: &Response, _latency: std::time::Duration, span: &Span) {
-    span.record("http.response.status_code", res.status().as_u16());
+/// The recording is a no-op when the span was built without the
+/// `http.response.status_code` field, i.e. whenever OTLP export is off — see
+/// [`build_request_span`] for why that field is exporter-only and what
+/// recording it costs.
+fn record_status(res: &Response, latency: std::time::Duration, span: &Span) {
+    let status = res.status();
+    span.record("http.response.status_code", status.as_u16());
+    if status.is_server_error() && res.extensions().get::<FailureLogged>().is_none() {
+        tracing::error!(
+            parent: span,
+            http.response.status_code = status.as_u16(),
+            elapsed_ms = u64::try_from(latency.as_millis()).unwrap_or(u64::MAX),
+            "response failed"
+        );
+    }
 }
 
 /// A tiny router serving the merged OpenAPI document at
@@ -430,6 +449,11 @@ mod tests {
             .collect();
         assert_eq!(lines.len(), 1, "one boundary line: {log}");
         assert!(lines[0].contains(" ERROR "), "{}", lines[0]);
+        let errors: Vec<&str> = log
+            .lines()
+            .filter(|line| line.contains(" ERROR "))
+            .collect();
+        assert_eq!(errors, lines, "the request's only error line: {log}");
         // The event's own fields, after the request span's prefix.
         let (_, fields) = lines[0]
             .split_once("Error processing request")
@@ -455,6 +479,45 @@ mod tests {
         .expect("answered in time")
         .unwrap();
         assert_eq!(live.status(), StatusCode::OK);
+    }
+
+    /// A 5xx no layer has logged (here a failing health check's `503`) gets
+    /// the request span's one `response failed` line, through the whole
+    /// router: the duplicate-free logging never drops a failure's only line.
+    #[tokio::test]
+    async fn a_5xx_nothing_logged_gets_the_span_s_one_line() {
+        let captured = Captured::default();
+        let writer = captured.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_writer(move || writer.clone())
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+        let down =
+            ferrofin_health::FnChecker::new("down", || async { Err("unreachable".to_owned()) });
+        let router =
+            create_router(fake_state().with_health_checkers(vec![std::sync::Arc::new(down)]));
+
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .uri("/health")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+        let log = String::from_utf8(captured.0.lock().expect("log").clone()).expect("utf-8");
+        let errors: Vec<&str> = log
+            .lines()
+            .filter(|line| line.contains(" ERROR "))
+            .collect();
+        assert_eq!(errors.len(), 1, "{log}");
+        assert!(errors[0].contains("response failed"), "{log}");
+        assert!(errors[0].contains("http.response.status_code=503"), "{log}");
+        assert!(errors[0].contains("url.path=/health"), "{log}");
     }
 
     #[test]
@@ -604,6 +667,90 @@ mod tests {
             super::record_status(&res, std::time::Duration::from_millis(1), &span);
         });
         spy.0.lock().expect("spy lock").clone()
+    }
+
+    /// Everything logged at `debug` and above while `respond` builds a
+    /// response to `GET /Items` and `record_status` sees it, as the request
+    /// span sees it.
+    fn request_log(respond: impl FnOnce() -> axum::response::Response) -> String {
+        let captured = Captured::default();
+        let writer = captured.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_max_level(tracing::Level::DEBUG)
+            .with_writer(move || writer.clone())
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            let req = Request::builder()
+                .uri("/Items")
+                .body(Body::empty())
+                .unwrap();
+            let span = super::build_request_span(&req, false);
+            let res = span.in_scope(respond);
+            super::record_status(&res, std::time::Duration::from_millis(3), &span);
+        });
+        String::from_utf8(captured.0.lock().expect("log").clone()).expect("utf-8")
+    }
+
+    /// The lines of `log` at `info` or above.
+    fn above_debug(log: &str) -> Vec<&str> {
+        log.lines()
+            .filter(|line| {
+                [" INFO ", " WARN ", " ERROR "]
+                    .iter()
+                    .any(|l| line.contains(l))
+            })
+            .collect()
+    }
+
+    /// A 5xx nothing has logged (a relayed origin's, a plugin's) gets the
+    /// request's one error line, inside the request span. An `ApiError` 5xx is
+    /// logged once, by the `ApiError`; a shed request and a refused transcode
+    /// stay at `debug`; a 4xx logs nothing.
+    #[test]
+    fn every_failed_request_is_logged_once() {
+        use crate::ApiError;
+        use axum::response::IntoResponse as _;
+        use ferrofin_traits::error::ServiceError;
+
+        let log = request_log(|| {
+            axum::response::Response::builder()
+                .status(StatusCode::BAD_GATEWAY)
+                .body(Body::empty())
+                .unwrap()
+        });
+        let lines = above_debug(&log);
+        assert_eq!(lines.len(), 1, "{log}");
+        assert!(lines[0].contains(" ERROR "), "{log}");
+        assert!(lines[0].contains("response failed"), "{log}");
+        assert!(lines[0].contains("http.response.status_code=502"), "{log}");
+        assert!(lines[0].contains("elapsed_ms=3"), "{log}");
+        assert!(
+            lines[0].contains("url.path=/Items"),
+            "the span's fields: {log}"
+        );
+
+        let log = request_log(|| ApiError::from(ServiceError::backend("boom")).into_response());
+        let lines = above_debug(&log);
+        assert_eq!(lines.len(), 1, "{log}");
+        assert!(lines[0].contains(" ERROR "), "{log}");
+        assert!(lines[0].contains("handler failed"), "{log}");
+
+        for (name, shed) in [
+            ("busy", ServiceError::busy("at the limit", 10)),
+            ("unavailable", ServiceError::unavailable("shed")),
+        ] {
+            let log = request_log(|| ApiError::from(shed).into_response());
+            assert!(above_debug(&log).is_empty(), "{name}: {log}");
+            assert!(
+                log.contains(" DEBUG "),
+                "{name} is still logged, at debug: {log}"
+            );
+            assert!(log.contains("request shed"), "{name}: {log}");
+        }
+
+        let log = request_log(|| ApiError::NotFound("item".into()).into_response());
+        assert!(log.is_empty(), "{log}");
     }
 
     #[test]

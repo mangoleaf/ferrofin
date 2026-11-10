@@ -282,8 +282,8 @@ async fn compositing_past_the_budget_is_refused_and_on_it_runs(
     );
 }
 
-/// A format change at the same size is a copy, not a resize, so an image that
-/// could never be resized can still change format.
+/// A format change at the same size encodes the decoded image as it is, with
+/// no resize, so an image that could never be resized can still change format.
 #[tokio::test]
 async fn the_same_size_needs_no_budget() {
     let fixture = Fixture::new();
@@ -296,7 +296,7 @@ async fn the_same_size_needs_no_budget() {
 
     encode(&encoder, &input, &output, false, &resize_to(200, 200))
         .await
-        .expect("a copy");
+        .expect("no resize");
 }
 
 /// The owner's rule: past a limit the processor serves the original, and

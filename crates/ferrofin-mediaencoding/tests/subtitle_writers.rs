@@ -7,6 +7,7 @@
 // libse keeps times as `double`s, and the port must reproduce them exactly.
 #![allow(clippy::float_cmp)]
 
+use ferrofin_mediaencoding::MediaEncodingError;
 use ferrofin_mediaencoding::subtitles::model::{
     Paragraph, Subtitle, TICKS_PER_MILLISECOND, TimeCode,
 };
@@ -480,7 +481,11 @@ fn parser_unsupported_extension_errors() {
     let err = SubtitleEditParser::new()
         .parse(b"whatever", "xyz")
         .unwrap_err();
-    assert!(err.contains("Unsupported file extension"));
+    assert!(
+        matches!(err, MediaEncodingError::InvalidInput(_)),
+        "{err:?}"
+    );
+    assert!(err.to_string().contains("Unsupported file extension"));
 }
 
 #[test]
@@ -488,7 +493,11 @@ fn parser_no_cues_errors_with_unsupported_format() {
     let err = SubtitleEditParser::new()
         .parse(b"not a subtitle at all", "srt")
         .unwrap_err();
-    assert!(err.contains("Unsupported format"));
+    assert!(
+        matches!(err, MediaEncodingError::InvalidInput(_)),
+        "{err:?}"
+    );
+    assert!(err.to_string().contains("Unsupported format"));
 }
 
 #[test]

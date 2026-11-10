@@ -38,6 +38,7 @@ use ferrofin_model::media_info::MediaInfo;
 use uuid::Uuid;
 
 use crate::error::ServiceError;
+use crate::filesystem::OpenedFile;
 
 /// A parked media-probe request: which file to probe and how.
 ///
@@ -112,8 +113,9 @@ pub struct TranscodingProgress {
 /// Wraps the ffmpeg/ffprobe subprocess: probing, frame and image extraction.
 ///
 /// Port of the object-safe, domain-tree-free subset of `IMediaEncoder`. The
-/// hardware-capability probes and `EncodingJobInfo`-coupled command builders are
-/// deferred to the Wave 6 implementation (see the module docs).
+/// hardware-capability probes and `EncodingJobInfo`-coupled command builders
+/// live with the encoder implementation in `ferrofin-mediaencoding`, not on
+/// this seam (see the module docs).
 #[async_trait]
 pub trait MediaEncoder: Send + Sync {
     /// The resolved path to the `ffmpeg` binary. Port of the `EncoderPath`
@@ -129,8 +131,9 @@ pub trait MediaEncoder: Send + Sync {
     async fn set_ffmpeg_path(&self) -> Result<bool, ServiceError>;
 
     /// Probes a media source, returning its container/stream information. Port
-    /// of `GetMediaInfo(MediaInfoRequest, …)`; returns [`MediaSourceInfo`]
-    /// pending a ported `MediaInfo` (see the module docs).
+    /// of `GetMediaInfo(MediaInfoRequest, …)`; returns the narrower
+    /// [`MediaSourceInfo`], and [`Self::get_media_info_full`] the full
+    /// [`MediaInfo`] (see the module docs).
     async fn get_media_info(
         &self,
         request: &MediaInfoRequest,
@@ -242,14 +245,12 @@ impl EncoderSupport for NoEncoders {
 
 /// Extracts evenly spaced trickplay thumbnail frames from a video file.
 ///
-/// Port of the software path of
-/// `IMediaEncoder.ExtractVideoImagesOnIntervalAccelerated`: one ffmpeg run with
-/// an `fps=1/interval` + width-bounded `scale` filter chain writing numbered
-/// JPEG thumbnails into a directory. The hardware-acceleration and
-/// keyframe-only variants ride the deferred hw-accel matrix (see the
-/// `ferrofin-mediaencoding` crate docs) and are not modeled at this seam; the
-/// trickplay manager's `EnableHwAcceleration`/`EnableHwEncoding`/
-/// `EnableKeyFrameOnlyExtraction` options therefore select the software path.
+/// Port of `IMediaEncoder.ExtractVideoImagesOnIntervalAccelerated`: one ffmpeg
+/// run with an `fps=1/interval` + width-bounded `scale` filter chain writing
+/// numbered JPEG thumbnails into a directory. The [`TrickplayExtraction`]
+/// request carries the trickplay options `EnableHwAcceleration` (the hardware
+/// path), `EnableHwEncoding` (a hardware MJPEG encoder) and
+/// `EnableKeyFrameOnlyExtraction` (decode keyframes only).
 ///
 /// This is a separate small trait (rather than a `MediaEncoder` method) so the
 /// trickplay manager in `ferrofin-core` can depend on exactly this capability.
@@ -406,9 +407,11 @@ fn _assert_object_safe_keyframe_extractor(_: &dyn KeyframeExtractor) {}
 
 /// Manages live transcode jobs: lookup, keep-alive pings, progress, teardown.
 ///
-/// Port of the object-safe subset of `ITranscodeManager`. `StartFfMpeg` (which
-/// takes an un-ported `StreamState` + `CancellationTokenSource`) and the
-/// `LockAsync` disposable are deferred to the Wave 6 implementation.
+/// Port of the object-safe subset of `ITranscodeManager`. `StartFfMpeg` and
+/// `LockAsync` are not on this seam: `ferrofin-mediaencoding`'s
+/// `TranscodeManagerImpl::start_ffmpeg` starts a job from a
+/// `StartFfMpegRequest`, and the HLS stream manager holds the per-playlist lock
+/// `LockAsync` takes upstream.
 #[async_trait]
 pub trait TranscodeManager: Send + Sync {
     /// Looks up a running job by its playback-session id. Port of the
@@ -553,16 +556,17 @@ pub struct TrimmedSubtitle {
     pub data: Vec<u8>,
 }
 
-/// An extracted attachment: its metadata plus the extracted bytes.
+/// An extracted attachment: its metadata plus the extracted file, opened.
 ///
 /// Port of the C# `(MediaAttachment Attachment, Stream Stream)` tuple returned
-/// by `IAttachmentExtractor.GetAttachment`; the `Stream` becomes the bytes.
-#[derive(Debug, Clone, PartialEq)]
+/// by `IAttachmentExtractor.GetAttachment`; the `Stream` (`AsyncFile.OpenRead`
+/// of the cached file) becomes an [`OpenedFile`], streamed, never read whole.
+#[derive(Debug)]
 pub struct ExtractedAttachment {
     /// The attachment's stream metadata.
     pub attachment: MediaAttachment,
-    /// The extracted attachment bytes.
-    pub data: Vec<u8>,
+    /// The extracted attachment file, open from its start.
+    pub file: OpenedFile,
 }
 
 /// Extracts embedded font/cover attachments from media containers.
@@ -571,7 +575,8 @@ pub struct ExtractedAttachment {
 /// `GetAttachment` becomes an [`item_id`](Uuid).
 #[async_trait]
 pub trait AttachmentExtractor: Send + Sync {
-    /// Extracts one attachment (by index) from an item's media source. Port of
+    /// Extracts one attachment (by index) from an item's media source into the
+    /// cache and opens the cached file. Port of
     /// `GetAttachment(item, mediaSourceId, attachmentStreamIndex, …)`.
     async fn get_attachment(
         &self,

@@ -7,15 +7,15 @@
 //!
 //! **Contract:** every path in the vendored Jellyfin 10.11.8 OpenAPI spec is
 //! registered as a route so a client never 404s on a known path (the vendored
-//! table is [`VENDORED_ROUTES`]). First-Light and core routes have real
-//! handlers; un-ported routes return `501 Not Implemented` via the shared
-//! [`routes::not_implemented`] handler. The test `tests/contract_superset.rs`
-//! asserts the registered route table is a superset of the vendored spec.
+//! table is [`VENDORED_ROUTES`]). Every contract operation has a real handler
+//! (listed in [`handlers::REAL_ROUTES`]); a contract route without one would
+//! return `501 Not Implemented` via the shared [`routes::not_implemented`]
+//! handler, never `404`. The test `tests/contract_superset.rs` asserts the
+//! registered route table is a superset of the vendored spec.
 //!
-//! This crate is the INFRA layer landed by Wave 7 unit 1: [`AppState`],
-//! [`error::ApiError`], [`auth`] (token middleware + `RequireAuth`),
-//! [`router::create_router`], the shared `not_implemented` stub, and the
-//! utoipa [`openapi::ApiDoc`].
+//! Beside the [`handlers`], the crate holds [`AppState`], [`error::ApiError`],
+//! [`auth`] (token middleware + `RequireAuth`), [`router::create_router`], the
+//! shared `not_implemented` stub, and the utoipa [`openapi::ApiDoc`].
 
 pub mod auth;
 pub mod compression;

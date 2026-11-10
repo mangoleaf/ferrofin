@@ -127,6 +127,12 @@ Conventions:
 ### File Transformation
 - Ferrofin files: `crates/ferrofin-extensions/src/file_transformation.rs`,
   vendored assets `crates/ferrofin-extensions/assets/filetransformation/`.
+- Ahead of the pin: the `/web` response for a transformed file (`transform_web_file` in
+  `apps/ferrofin-server/src/lib.rs`) follows `Infrastructure/FileTransformationMiddleware.cs`
+  @ `0900de8f1`: an `ETag` of the first 8 bytes of SHA-256 over the transformed bytes,
+  `Cache-Control: no-cache`, no `Last-Modified`, and an equal `If-None-Match` answered with
+  `304`. At `f4f01c3` the static-file middleware derived the `ETag` from the source's
+  modification time and the output's length, so a same-length change could be served stale.
 - Accepted divergences:
   - **A failing callback leaves the file as it was.** The plugin writes a callback's body over
     the file whatever its status (`TransformationHelper.ApplyTransformation`), so an error
@@ -155,8 +161,7 @@ Conventions:
   `LocationsExcluded` config + inactive-library eligibility filters, the two
   24-hour dashboard tasks, and the vendored settings page. Routes and tasks
   self-gate on the plugin's enabled flag (disabled → routes 404, tasks no-op).
-- Divergence PENDING OWNER DECISION (D10 in
-  `brain/plans/PLAN_ITEM_FILE_DELETION.md`): the pinned plugin (`e6f58d6`,
+- Divergence PENDING OWNER DECISION: the pinned plugin (`e6f58d6`,
   `MergeVersionsManager.cs:211-233`) writes a merge as OWNED local versions —
   each alternate gets `OwnerId` = the primary and the primary's
   `LocalAlternateVersions` lists it, so the save writes `ChildType` 2 rows —

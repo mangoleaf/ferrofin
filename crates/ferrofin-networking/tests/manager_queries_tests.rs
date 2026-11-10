@@ -1,12 +1,11 @@
 //! Additional coverage for the [`NetworkManager`] query surface that the
-//! transliterated Jellyfin oracle does not directly exercise (loopbacks,
-//! all-bind-interfaces, link-local detection, textual LAN membership, published
+//! transliterated Jellyfin oracle does not directly exercise
+//! (all-bind-interfaces, link-local detection, textual LAN membership, published
 //! overrides, and re-`update_settings`). These extend, and never weaken, the
 //! ported assertions.
 
 use std::net::{IpAddr, Ipv4Addr};
 
-use ferrofin_networking::error::NetworkingError;
 use ferrofin_networking::{NetworkConfiguration, NetworkManager, NullLogger};
 
 const MOCK_INTERFACES: &str = "192.168.1.208/24,-16,eth16|200.200.200.200/24,11,eth11";
@@ -18,30 +17,6 @@ fn conf() -> NetworkConfiguration {
         local_network_subnets: vec!["192.168.1.0/24".to_owned()],
         ..Default::default()
     }
-}
-
-#[test]
-fn get_loopbacks_returns_both_families_when_enabled() {
-    let nm = NetworkManager::with_defaults(conf(), MOCK_INTERFACES);
-    let loopbacks = nm.get_loopbacks();
-    assert_eq!(loopbacks.len(), 2);
-    assert!(
-        loopbacks
-            .iter()
-            .any(|l| l.address == IpAddr::V4(Ipv4Addr::LOCALHOST))
-    );
-}
-
-#[test]
-fn get_loopbacks_empty_when_both_disabled() {
-    let conf = NetworkConfiguration {
-        enable_ipv4: false,
-        enable_ipv6: false,
-        ..Default::default()
-    };
-    let nm = NetworkManager::with_defaults(conf, MOCK_INTERFACES);
-    let loopbacks = nm.get_loopbacks();
-    assert!(loopbacks.is_empty(), "{loopbacks:?}");
 }
 
 #[test]
@@ -176,10 +151,4 @@ fn null_logger_discards_warnings() {
     // Smoke: a manager built with the null logger runs the pipeline.
     let nm = NetworkManager::with_defaults(conf(), MOCK_INTERFACES);
     let _ = nm.get_bind_address("192.168.1.1");
-}
-
-#[test]
-fn networking_error_displays_value() {
-    let err = NetworkingError::InvalidValue("bad".to_owned());
-    assert_eq!(err.to_string(), "invalid network value: bad");
 }

@@ -112,9 +112,7 @@ impl RemoteSearchProvider for TmdbSearchProvider {
         //    accept the whitespace that `str::parse` alone rejects.
         //    (Those same C# calls THROW on a NON-NUMERIC value and take the
         //    whole provider down with it; we fall through to the remaining
-        //    branches instead — Jellyfin bug, not a behaviour to port. Recorded
-        //    as an accepted divergence in suite/parity/classifications.json
-        //    under `POST /Items/RemoteSearch/Movie`, with the measurement.)
+        //    branches instead — Jellyfin bug, not a behaviour to port.)
         if let Some(tmdb_id) = provider_id_of(ids, "Tmdb").and_then(parse_numeric_provider_id)
             && let Some(details) = self
                 .tmdb
@@ -427,8 +425,7 @@ impl RemoteSearchProvider for TmdbBoxSetSearchProvider {
         // running the name search. A padded id still pins it — see
         // `parse_numeric_provider_id`. (C#'s `Convert.ToInt32` throws on a
         // NON-NUMERIC id and takes the provider down with it; we fall through
-        // to the name search instead — Jellyfin bug, not a behaviour to port,
-        // recorded with its measurement in suite/parity/classifications.json.)
+        // to the name search instead — Jellyfin bug, not a behaviour to port.)
         if let Some(tmdb_id) = provider_id_of(search_info.provider_ids.as_ref(), "Tmdb")
             .and_then(parse_numeric_provider_id)
             .filter(|id| *id > 0)
@@ -7251,8 +7248,9 @@ mod tests {
         assert!(parse_ymd("not-a-date").is_none());
     }
 
-    /// The read-only descriptor queries return empty/default results (no store,
-    /// no remote providers wired in First-Light) — never an error.
+    /// The read-only descriptor queries return empty/default results when the
+    /// manager has no store and no remote providers attached (its `Default`),
+    /// except the compiled-in metadata-plugin registry — never an error.
     #[tokio::test]
     async fn read_only_queries_return_empty_defaults() {
         let mgr = LocalProviderManager::default();

@@ -1207,6 +1207,19 @@ pub static SETTINGS: &[SettingSpec] = &[
         ..ROW
     },
     SettingSpec {
+        key: "wasm_call_grace_secs",
+        env: Some("FERROFIN_WASM_CALL_GRACE_SECS"),
+        env_read: PARSED_U32,
+        label: "Plugin call grace",
+        group: Group::Plugins,
+        kind: whole_numbers(config::WASM_CALL_GRACE_SECS_RANGE),
+        unit: Some(Unit::Seconds),
+        default: "10",
+        description: "Wait past a plugin call's deadline before the plugin is disabled as stuck.",
+        running: |c| json!(c.wasm_call_grace_secs),
+        ..ROW
+    },
+    SettingSpec {
         key: "wasm_memory_limit_mb",
         env: Some("FERROFIN_WASM_MEMORY_LIMIT_MB"),
         env_read: PARSED_U32,

@@ -3052,10 +3052,11 @@ impl ItemPersistenceService for FerrofinItemPersistenceService {
     }
 
     async fn save_images(&self, item: &BaseItemEntity) -> Result<(), ServiceError> {
-        // The image rows live in BaseItemImageInfos and are owned by their own
-        // repository; without the domain item's ImageInfos list on the entity
-        // there is nothing to persist here beyond confirming the item exists.
-        // (Full image persistence lands with the image repository unit.)
+        // The image rows live in BaseItemImageInfos and are written through
+        // `save_item_images`/`set_item_image*`; without the domain item's
+        // ImageInfos list on the entity there is nothing to persist here beyond
+        // confirming the item exists, and nothing calls this. TODO(gl-211): open
+        // work item: remove it from the trait.
         let exists: Option<i64> =
             sqlx::query_scalar(r#"SELECT 1 FROM "BaseItems" WHERE "Id" = ?1"#)
                 .bind(&item.id)
@@ -4392,9 +4393,10 @@ impl ItemPersistenceService for FerrofinItemPersistenceService {
     }
 
     async fn update_inherited_values(&self) -> Result<(), ServiceError> {
-        // Recomputing inherited parental-rating / tag values across the item tree
-        // requires the AncestorIds closure traversal owned by the library manager;
-        // deferred to that unit. No-op here so callers can invoke it safely.
+        // A no-op that nothing calls. Upstream's `UpdateInheritedValues` deletes
+        // the `ItemValuesMap` rows of type `InheritedTags`, which Ferrofin never
+        // writes (an adopted database may hold some). TODO(gl-211): open work
+        // item: port it and call it after the post-scan tasks, or remove it.
         Ok(())
     }
 }

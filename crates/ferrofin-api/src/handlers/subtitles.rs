@@ -8,19 +8,20 @@
 //! - `POST /Items/{itemId}/RemoteSearch/Subtitles/{subtitleId}` — download one.
 //! - `GET /Providers/Subtitles/Subtitles/{subtitleId}` — fetch a remote subtitle.
 //!
-//! The delete route is DB-backed and real. Upload / remote search / download /
-//! get drive the un-ported `ISubtitleProvider` registry (deferred); the routes
-//! exist (not `501`) and surface the manager's empty/"not enabled" behaviour so
-//! clients see stable semantics.
+//! Delete, upload, remote search, download and get go through the
+//! [`SubtitleManager`](ferrofin_traits::subtitles::SubtitleManager) seam, which
+//! searches the registered subtitle providers (OpenSubtitles), routes a
+//! download or fetch to the provider the id names, and attaches or removes the
+//! external subtitle.
 //!
-//! On-the-fly subtitle *conversion* is now real: the
+//! On-the-fly subtitle *conversion*: the
 //! `Videos/{itemId}/{container}/Subtitles/{index}/{format}` (with and without a
 //! start-position segment) routes call the
 //! [`SubtitleEncoder`](ferrofin_traits::media_encoding::SubtitleEncoder) seam
 //! (ffmpeg-backed `SubtitleEncoderImpl` at the composition root; the disabled
 //! stub `404`s), and the `subtitles.m3u8` route builds the segment playlist from
 //! the media source's runtime. The `FallbackFont` routes resolve
-//! `EncodingOptions.FallbackFontPath` (via the config seam's new
+//! `EncodingOptions.FallbackFontPath` (via the config seam's
 //! `get_encoding_options`) and enumerate / stream fonts through the
 //! [`FileSystem`](ferrofin_traits::filesystem::FileSystem) seam, on the
 //! blocking pool.
@@ -160,10 +161,10 @@ struct UploadSubtitleDto {
 ///
 /// Port of `SubtitleController.UploadSubtitle`: `404` when the item is missing,
 /// `400` when the `Data` is not valid base64. The decoded bytes are handed to the
-/// [`SubtitleManager`](ferrofin_traits::subtitles::SubtitleManager); with no
-/// subtitle-provider host wired the manager rejects the write (`400`), otherwise
-/// a metadata refresh is queued and `204` returned. Subtitle management is
-/// checked before decoding or writing the upload.
+/// [`SubtitleManager`](ferrofin_traits::subtitles::SubtitleManager), which
+/// attaches them to the item as an external subtitle (the sidecar file and its
+/// stream row); then a metadata refresh is queued and `204` returned. Subtitle
+/// management is checked before decoding or writing the upload.
 #[utoipa::path(
     post,
     path = "/Videos/{itemId}/Subtitles",
@@ -285,8 +286,9 @@ async fn download_remote_subtitles(
 /// `GET /Providers/Subtitles/Subtitles/{subtitleId}` — fetch a remote subtitle.
 ///
 /// Port of `SubtitleController.GetRemoteSubtitles`: streams the raw subtitle
-/// bytes with a MIME type derived from its format. With no provider host wired
-/// the fetch is rejected (`400`); a provider would yield the file.
+/// bytes with a MIME type derived from its format. The id's provider prefix
+/// picks the registered provider that fetches the file; an id naming no
+/// provider is a `400`.
 #[utoipa::path(
     get,
     path = "/Providers/Subtitles/Subtitles/{subtitleId}",

@@ -35,6 +35,7 @@ use ferrofin_model::entities_media::MediaStream;
 use ferrofin_model::media_info::MediaProtocol;
 use ferrofin_traits::configuration::ServerConfigurationManager;
 use ferrofin_traits::error::ServiceError;
+use ferrofin_traits::filesystem::OpenedFile;
 use ferrofin_traits::library::MediaSourceManager;
 use ferrofin_traits::media_encoding::SubtitleEncoder;
 use ferrofin_traits::media_encoding::{
@@ -445,10 +446,8 @@ struct FfmpegSubtitleIo {
 
 #[async_trait]
 impl SubtitleIo for FfmpegSubtitleIo {
-    async fn read_file(&self, path: &str) -> Result<Vec<u8>, String> {
-        tokio::fs::read(path)
-            .await
-            .map_err(|e| format!("read {path}: {e}"))
+    async fn read_file(&self, path: &str) -> std::io::Result<Vec<u8>> {
+        tokio::fs::read(path).await
     }
 
     async fn http_get(&self, url: &str) -> Result<Vec<u8>, String> {
@@ -674,7 +673,7 @@ impl MediaSourceResolver for MediaSourceManagerResolver {
 /// Port of the `Process`/`File`/`Directory` calls in the C# extractor: the cache
 /// folder/file paths come from the injected [`PathManager`]
 /// (`IPathManager.GetAttachmentFolderPath`/`GetAttachmentPath`), the file checks/
-/// reads use `tokio::fs`, and `-dump_attachment` runs through `tokio::process`.
+/// opens use `tokio::fs`, and `-dump_attachment` runs through `tokio::process`.
 struct FfmpegAttachmentIo {
     path_manager: Arc<dyn PathManager>,
 }
@@ -712,10 +711,18 @@ impl AttachmentIo for FfmpegAttachmentIo {
             .map_err(|e| format!("create {path}: {e}"))
     }
 
-    async fn read_file(&self, path: &str) -> Result<Vec<u8>, String> {
-        tokio::fs::read(path)
-            .await
-            .map_err(|e| format!("read {path}: {e}"))
+    async fn open_file(&self, path: &str) -> std::io::Result<OpenedFile> {
+        let file = tokio::fs::File::open(path).await?;
+        let meta = file.metadata().await?;
+        // A directory opens fine and fails on the first read, after the headers.
+        if meta.is_dir() {
+            return Err(std::io::ErrorKind::IsADirectory.into());
+        }
+        Ok(OpenedFile {
+            path: path.to_owned(),
+            length: meta.len(),
+            reader: Box::new(file.into_std().await),
+        })
     }
 
     async fn run_ffmpeg(
@@ -1729,6 +1736,75 @@ mod tests {
         }
     }
 
+    /// A sidecar gone from disk keeps its I/O kind through the real read, so the
+    /// encoder answers the `404` upstream's `FileNotFoundException` is, not a 500.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_missing_sidecar_reads_as_not_found() {
+        let tmp = tempfile::tempdir().unwrap();
+        let io = subtitle_io(tmp.path(), "ffmpeg".to_owned(), 1);
+        let mut stream = MediaStream {
+            stream_type: MediaStreamType::Subtitle,
+            ..MediaStream::default()
+        };
+        stream.is_external = true;
+        stream.codec = Some("srt".to_owned());
+        stream.path = Some(
+            tmp.path()
+                .join("gone.en.srt")
+                .to_string_lossy()
+                .into_owned(),
+        );
+        let error = PureSubtitleEncoder::new(SubtitleEditParser::new(), io)
+            .get_subtitles(&MediaSourceInfo::default(), &stream, "vtt", 0, 0, false)
+            .await
+            .unwrap_err();
+        let error = ServiceError::from(error);
+        assert!(matches!(error, ServiceError::NotFound(_)), "{error:?}");
+    }
+
+    /// A PGS sidecar asked for as text is refused unread, after the real
+    /// I/O opens it as `AsyncFile.OpenRead` does: a missing file is the `404`,
+    /// a directory in its place the `500` .NET's open throws for one, and a
+    /// file the parser has no reader for the `400`.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_pgs_sidecar_asked_for_as_text_is_opened_before_it_is_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = |name: &str| tmp.path().join(name).to_string_lossy().into_owned();
+        std::fs::write(tmp.path().join("movie.en.sup"), b"PG").unwrap();
+        std::fs::create_dir(tmp.path().join("folder.en.sup")).unwrap();
+        let encoder = PureSubtitleEncoder::new(
+            SubtitleEditParser::new(),
+            subtitle_io(tmp.path(), "ffmpeg".to_owned(), 1),
+        );
+        for (name, expected) in [
+            ("gone.en.sup", "not found"),
+            ("folder.en.sup", "backend source"),
+            ("movie.en.sup", "invalid input"),
+        ] {
+            let stream = MediaStream {
+                stream_type: MediaStreamType::Subtitle,
+                is_external: true,
+                codec: Some("pgssub".to_owned()),
+                path: Some(path(name)),
+                ..MediaStream::default()
+            };
+            let error = encoder
+                .get_subtitles(&MediaSourceInfo::default(), &stream, "vtt", 0, 0, false)
+                .await
+                .unwrap_err();
+            let error = ServiceError::from(error);
+            let kind = match &error {
+                ServiceError::NotFound(_) => "not found",
+                ServiceError::BackendSource(_) => "backend source",
+                ServiceError::InvalidInput(_) => "invalid input",
+                _ => "other",
+            };
+            assert_eq!(kind, expected, "{name}: {error:?}");
+        }
+    }
+
     /// A configured timeout of zero minutes expires at once: the still-running
     /// ffmpeg is killed and its half-written output deleted, as upstream's
     /// `RunSubtitleExtractionProcess` + `ExtractSubtitlesForFile` do.
@@ -2027,16 +2103,23 @@ mod tests {
                 .is_some_and(|path| path.ends_with("/src/font.ttf"))
         );
 
-        // file_exists + read_file + remove_file over a real temp file.
+        // file_exists + open_file + remove_file over a real temp file.
         let file = tmp.path().join("data.bin");
         assert!(!io.file_exists(&file.to_string_lossy()));
         std::fs::write(&file, b"hello").unwrap();
         assert!(io.file_exists(&file.to_string_lossy()));
-        assert_eq!(
-            io.read_file(&file.to_string_lossy()).await.unwrap(),
-            b"hello"
-        );
-        assert!(io.read_file("/no/such/file").await.is_err());
+        let mut opened = io.open_file(&file.to_string_lossy()).await.unwrap();
+        let mut data = Vec::new();
+        std::io::Read::read_to_end(&mut opened.reader, &mut data).unwrap();
+        assert_eq!((opened.length, data.as_slice()), (5, &b"hello"[..]));
+        // A missing file keeps its kind: the extractor answers it `404`.
+        let missing = io.open_file("/no/such/file").await.unwrap_err();
+        assert_eq!(missing.kind(), std::io::ErrorKind::NotFound);
+        let folder = io
+            .open_file(&tmp.path().to_string_lossy())
+            .await
+            .unwrap_err();
+        assert_eq!(folder.kind(), std::io::ErrorKind::IsADirectory);
         io.remove_file(&file.to_string_lossy()).await.unwrap();
         assert!(!io.file_exists(&file.to_string_lossy()));
         // Already gone is not an error: the failed run may never have

@@ -159,6 +159,33 @@ fn ldaps_server_on(
     (port, rx)
 }
 
+/// A listener on `[::1]`, with the same port held on 127.0.0.1 for as long as
+/// the second value lives; `None` when `[::1]` cannot be bound (no IPv6
+/// loopback) for any reason but the port being in use.
+///
+/// The other tests serve on 127.0.0.1 and connect to `localhost`, which tries
+/// `::1` first. While the twin is held no other test process can serve this
+/// port number, so none of their clients lands on this one-shot listener,
+/// ending it and resetting the client waiting in its backlog. The twin is bound
+/// first, so the `[::1]` listener never exists on a port another test serves.
+async fn ipv6_listener() -> Option<(TcpListener, std::net::TcpListener)> {
+    for _ in 0..100 {
+        let twin = std::net::TcpListener::bind("127.0.0.1:0").expect("bind 127.0.0.1");
+        let port = twin.local_addr().expect("addr").port();
+        // A listening socket refuses every other bind, `SO_REUSEADDR` or not.
+        assert!(
+            std::net::TcpListener::bind(("127.0.0.1", port)).is_err(),
+            "port is held on 127.0.0.1"
+        );
+        match TcpListener::bind(("::1", port)).await {
+            Ok(listener) => return Some((listener, twin)),
+            Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {}
+            Err(_) => return None,
+        }
+    }
+    panic!("no 127.0.0.1 port whose [::1] twin is free");
+}
+
 /// Writes `contents` to `name` under `dir`.
 fn write(dir: &tempfile::TempDir, name: &str, contents: &str) -> PathBuf {
     let path = dir.path().join(name);
@@ -400,9 +427,17 @@ async fn certificate_files_that_cannot_be_read_fail_the_connect_step() {
 
 #[tokio::test]
 async fn a_closed_port_or_a_bad_port_fails_the_connect_step() {
-    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
-    let port = listener.local_addr().expect("addr").port();
-    drop(listener);
+    // Bound for the whole test and never listening, so connecting is refused.
+    // A port bound then dropped is free for another test process's listener.
+    // The hold is exclusive only without `SO_REUSEADDR`, as the assert checks.
+    let held = tokio::net::TcpSocket::new_v4().expect("socket");
+    held.bind("127.0.0.1:0".parse().expect("addr"))
+        .expect("bind");
+    let port = held.local_addr().expect("addr").port();
+    assert!(
+        std::net::TcpListener::bind(("127.0.0.1", port)).is_err(),
+        "port is held"
+    );
     let mut options = ldaps("127.0.0.1", port, CertificateVerification::None);
     options.use_ssl = false;
 
@@ -870,7 +905,7 @@ fn an_ipv6_address_is_read_with_or_without_brackets() {
 
 #[tokio::test]
 async fn ldaps_to_an_ipv6_address_checks_the_certificate_against_the_address() {
-    let Ok(listener) = TcpListener::bind("[::1]:0").await else {
+    let Some((listener, _twin)) = ipv6_listener().await else {
         eprintln!("skipping: this host has no IPv6 loopback");
         return;
     };
@@ -878,7 +913,7 @@ async fn ldaps_to_an_ipv6_address_checks_the_certificate_against_the_address() {
     let ca = TestCa::new("Directory CA");
     let root = write(&dir, "ca.pem", &ca.issued.pem);
     let for_address = ca.issue(&["::1"], ExtendedKeyUsagePurpose::ServerAuth);
-    let (port, handshake) = ldaps_server_on(listener, server_config(&for_address, None));
+    let (port, mut handshake) = ldaps_server_on(listener, server_config(&for_address, None));
     // Bracketed as in a URL here, bare below: both name the address.
     let connection = Ldap3Directory::default()
         .connect(&ldaps(
@@ -887,13 +922,19 @@ async fn ldaps_to_an_ipv6_address_checks_the_certificate_against_the_address() {
             CertificateVerification::CustomRoot(root.clone()),
         ))
         .await;
-    assert!(connection.is_ok(), "{:?}", connection.err());
+    // On failure, the server's side too, so the message names which side failed.
+    assert!(
+        connection.is_ok(),
+        "{:?}; server: {:?}",
+        connection.err(),
+        handshake.try_recv()
+    );
     assert_eq!(handshake.await.expect("server"), Ok(false));
 
     // A certificate for a name, not for the address, is refused.
-    let listener = TcpListener::bind("[::1]:0").await.expect("bind");
+    let (listener, _twin) = ipv6_listener().await.expect("[::1] bound a moment ago");
     let for_name = ca.issue(&["localhost"], ExtendedKeyUsagePurpose::ServerAuth);
-    let (port, _handshake) = ldaps_server_on(listener, server_config(&for_name, None));
+    let (port, mut handshake) = ldaps_server_on(listener, server_config(&for_name, None));
     let error = connect_error(
         Ldap3Directory::default()
             .connect(&ldaps(
@@ -905,16 +946,22 @@ async fn ldaps_to_an_ipv6_address_checks_the_certificate_against_the_address() {
     );
     assert!(
         matches!(&error, LdapError::Connect(m) if m.contains("not valid for name")),
-        "{error:?}"
+        "{error:?}; server: {:?}",
+        handshake.try_recv()
     );
 
     // Skip-verify connects to the address whatever the certificate says.
-    let listener = TcpListener::bind("[::1]:0").await.expect("bind");
-    let (port, handshake) = ldaps_server_on(listener, server_config(&for_name, None));
+    let (listener, _twin) = ipv6_listener().await.expect("[::1] bound a moment ago");
+    let (port, mut handshake) = ldaps_server_on(listener, server_config(&for_name, None));
     let connection = Ldap3Directory::default()
         .connect(&ldaps("::1", port, CertificateVerification::None))
         .await;
-    assert!(connection.is_ok(), "{:?}", connection.err());
+    assert!(
+        connection.is_ok(),
+        "{:?}; server: {:?}",
+        connection.err(),
+        handshake.try_recv()
+    );
     assert_eq!(handshake.await.expect("server"), Ok(false));
 }
 

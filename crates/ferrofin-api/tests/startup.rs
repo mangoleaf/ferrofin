@@ -690,13 +690,12 @@ async fn startup_user_get_and_set_password() {
 // ---------------------------------------------------------------------------
 // `POST /Startup/User` — the guard from upstream security commit 62a5ded920
 // ("Prevent unauthenticated re-run of the startup wizard on misconfiguration",
-// Shadowghost, 2026-07-17). Ferrofin tracks upstream MASTER here, so these three
-// cases are transliterated from master's own
+// Shadowghost, 2026-07-17), in every Jellyfin release since v12.0. These three
+// cases are transliterated from upstream's own
 // `tests/Jellyfin.Api.Tests/Controllers/StartupControllerTests.cs`. Jellyfin
 // 10.11.8 predates the commit and answers 204 for all of them, silently
-// re-setting an already-provisioned admin's password — that is the divergence
-// recorded as `jellyfin-bug` in suite/parity/classifications.json, and it is why
-// the parity journey cannot be the oracle for this behaviour. These tests are.
+// re-setting an already-provisioned admin's password — a Jellyfin bug, which is
+// why a 10.11.8 server cannot be the oracle for this behaviour. These tests are.
 //
 // Do not relax any of them: 10.11.8's shape is the hole batch A1 closed on this
 // same controller, one layer deeper.
@@ -720,7 +719,7 @@ async fn post_startup_user(users: Arc<MemUsers>, body: serde_json::Value) -> Sta
 
 #[tokio::test]
 async fn startup_user_post_returns_404_when_no_first_user() {
-    // master: `var user = _userManager.GetFirstUser(); if (user is null) return NotFound();`
+    // upstream: `var user = _userManager.GetFirstUser(); if (user is null) return NotFound();`
     // (upstream `UpdateStartupUser_WhenNoUserExists_ReturnsNotFound`).
     let users = Arc::new(MemUsers {
         no_first_user: true,
@@ -737,7 +736,7 @@ async fn startup_user_post_returns_404_when_no_first_user() {
 
 #[tokio::test]
 async fn startup_user_post_forbidden_when_password_already_set() {
-    // master: `if (!string.IsNullOrEmpty(user.Password)) return Forbid();`
+    // upstream: `if (!string.IsNullOrEmpty(user.Password)) return Forbid();`
     // Upstream's `UpdateStartupUser_WhenPasswordAlreadyConfigured_ReturnsForbidden`
     // asserts `ForbidResult` AND `ChangePassword(..) Times.Never` — the status
     // alone would not prove the write was skipped, which is the whole point of
@@ -760,7 +759,7 @@ async fn startup_user_post_forbidden_when_password_already_set() {
 
 #[tokio::test]
 async fn startup_user_post_checks_forbid_before_the_empty_password_bad_request() {
-    // Ordering matters: master checks NotFound -> Forbid -> BadRequest. An
+    // Ordering matters: upstream checks NotFound -> Forbid -> BadRequest. An
     // implementation that validated the body first would leak, via a 400, that
     // the wizard is still reachable for a provisioned account.
     let provisioned = Arc::new(MemUsers {
@@ -792,7 +791,7 @@ async fn startup_user_post_checks_forbid_before_the_empty_password_bad_request()
 
 #[tokio::test]
 async fn startup_user_post_treats_an_empty_password_column_as_unset() {
-    // master guards on `!string.IsNullOrEmpty(user.Password)`, not on "is the
+    // upstream guards on `!string.IsNullOrEmpty(user.Password)`, not on "is the
     // column present". A `Password` of `''` — reachable through an adopted or
     // hand-edited Jellyfin DB, never through `DefaultAuthenticationProvider`,
     // which writes NULL — must still be able to run the wizard once.

@@ -29,6 +29,35 @@ use crate::bindings::types::{HttpRequest, HttpResponse, ItemQuery, ItemSummary, 
 /// Self-protective cap, not a tuning knob.
 pub const MAX_QUERY_ROWS: u32 = 1000;
 
+/// What a host function answers once the guest call it serves has no time
+/// left. The guest's epoch deadline falls at or before that moment, so the
+/// guest is interrupted at its next check and the call fails as an overrun;
+/// only a guest that returns without one sees this text.
+pub const OUT_OF_TIME: &str = "the plugin call is out of time";
+
+/// `cx.handle.block_on(work)`, held to the guest call's `deadline`, so a host
+/// wait never outlives the call it serves (and never trips the runtime's
+/// watchdog). Past the deadline `work` is
+/// dropped: a permit wait is abandoned, an ffmpeg child is killed. For reads
+/// only: a write cancelled half-way is worse than one that runs over, so
+/// writes keep their own bound and the runtime's watchdog covers them.
+///
+/// # Errors
+/// [`OUT_OF_TIME`] once the deadline passes.
+fn block_on_until<T>(
+    cx: &Collaborators,
+    deadline: std::time::Instant,
+    work: impl std::future::Future<Output = T>,
+) -> Result<T, String> {
+    if deadline <= std::time::Instant::now() {
+        return Err(OUT_OF_TIME.to_owned());
+    }
+    // The timer is made inside the runtime: the plugin thread has no context.
+    cx.handle
+        .block_on(async { tokio::time::timeout_at(deadline.into(), work).await })
+        .map_err(|_| OUT_OF_TIME.to_owned())
+}
+
 /// The manager handles a plugin's host functions call into. Installed once
 /// by the composition root after the managers exist (plugin **loading**
 /// happens earlier, so a guest calling these during its own load gets a
@@ -172,7 +201,10 @@ impl GuestHttp {
             builder
                 .timeout(call_timeout)
                 .redirect(reqwest::redirect::Policy::none())
-                .user_agent(concat!("ferrofin-wasm/", env!("CARGO_PKG_VERSION")))
+                .user_agent(format!(
+                    "ferrofin-wasm/{}",
+                    ferrofin_health::RELEASE_VERSION
+                ))
                 .build()
                 .map_err(|e| format!("building the guest http client: {e}"))
         };
@@ -194,6 +226,9 @@ impl GuestHttp {
 fn check_destination(url: &reqwest::Url, plugin_name: &str) -> Result<std::net::IpAddr, String> {
     let host = url.host_str().ok_or("url has no host")?;
     let port = url.port_or_known_default().unwrap_or(443);
+    // shortcut: this lookup is bounded by the system resolver, not by the
+    // guest call's deadline (http-fetch's request is); resolve under the
+    // deadline if a slow resolver behind a proxy ever trips the watchdog.
     let addrs: Vec<std::net::IpAddr> = std::net::ToSocketAddrs::to_socket_addrs(&(host, port))
         .map_err(|e| format!("could not resolve `{host}`: {e}"))?
         .map(|sa| sa.ip())
@@ -217,7 +252,10 @@ fn pinned_client(
     reqwest::blocking::Client::builder()
         .timeout(call_timeout)
         .redirect(reqwest::redirect::Policy::none())
-        .user_agent(concat!("ferrofin-wasm/", env!("CARGO_PKG_VERSION")))
+        .user_agent(format!(
+            "ferrofin-wasm/{}",
+            ferrofin_health::RELEASE_VERSION
+        ))
         // Port 0 = "keep the URL's port"; only the address pins.
         .resolve(host, std::net::SocketAddr::new(vetted, 0))
         .build()
@@ -418,10 +456,16 @@ pub fn download_image(
 /// Executes `query-items` for a guest: filters → `InternalItemsQuery`,
 /// entities → the small stable [`ItemSummary`] projection.
 ///
+/// The reads are held to `deadline`, the guest call's.
+///
 /// # Errors
-/// Unknown kind names, an unparsable parent id, or a repository failure —
-/// as the guest-visible error string.
-pub fn query_items(cx: &Collaborators, query: &ItemQuery) -> Result<Vec<ItemSummary>, String> {
+/// Unknown kind names, an unparsable parent id, a repository failure, or
+/// [`OUT_OF_TIME`] — as the guest-visible error string.
+pub fn query_items(
+    cx: &Collaborators,
+    deadline: std::time::Instant,
+    query: &ItemQuery,
+) -> Result<Vec<ItemSummary>, String> {
     let mut internal = InternalItemsQuery::default();
     for kind in &query.kinds {
         let parsed: BaseItemKind = serde_json::from_value(serde_json::Value::String(kind.clone()))
@@ -462,9 +506,7 @@ pub fn query_items(cx: &Collaborators, query: &ItemQuery) -> Result<Vec<ItemSumm
             let uid: Uuid = raw
                 .parse()
                 .map_err(|_| format!("user-id `{raw}` is not a valid UUID"))?;
-            let user = cx
-                .handle
-                .block_on(cx.users.get_user_by_id(uid))
+            let user = block_on_until(cx, deadline, cx.users.get_user_by_id(uid))?
                 .map_err(|e| format!("user lookup failed: {e}"))?
                 .ok_or_else(|| format!("no such user {uid}"))?;
             internal.set_user(Arc::new(user));
@@ -473,9 +515,7 @@ pub fn query_items(cx: &Collaborators, query: &ItemQuery) -> Result<Vec<ItemSumm
         None => None,
     };
 
-    let entities = cx
-        .handle
-        .block_on(cx.library.get_item_list(&internal))
+    let entities = block_on_until(cx, deadline, cx.library.get_item_list(&internal))?
         .map_err(|e| format!("item query failed: {e}"))?;
 
     // Per-user enrichment: one batch read for all returned items.
@@ -485,8 +525,7 @@ pub fn query_items(cx: &Collaborators, query: &ItemQuery) -> Result<Vec<ItemSumm
                 .iter()
                 .filter_map(|e| Uuid::parse_str(&e.id).ok())
                 .collect();
-            cx.handle
-                .block_on(cx.user_data.get_user_data_batch(&ids, uid))
+            block_on_until(cx, deadline, cx.user_data.get_user_data_batch(&ids, uid))?
                 .map_err(|e| format!("user data read failed: {e}"))?
         }
         None => std::collections::HashMap::new(),
@@ -555,9 +594,17 @@ pub(crate) fn summarize(
 
 /// Executes `next-up` for a guest: the user's next episodes, in order.
 ///
+/// The reads are held to `deadline`, the guest call's.
+///
 /// # Errors
-/// Invalid user id, or a manager failure — as the guest-visible string.
-pub fn next_up(cx: &Collaborators, user_id: &str, limit: u32) -> Result<Vec<ItemSummary>, String> {
+/// Invalid user id, a manager failure, or [`OUT_OF_TIME`] — as the
+/// guest-visible string.
+pub fn next_up(
+    cx: &Collaborators,
+    deadline: std::time::Instant,
+    user_id: &str,
+    limit: u32,
+) -> Result<Vec<ItemSummary>, String> {
     let uid: Uuid = user_id
         .parse()
         .map_err(|_| format!("user-id `{user_id}` is not a valid UUID"))?;
@@ -566,13 +613,13 @@ pub fn next_up(cx: &Collaborators, user_id: &str, limit: u32) -> Result<Vec<Item
         limit: Some(i32::try_from(limit.min(MAX_QUERY_ROWS)).unwrap_or(i32::MAX)),
         ..Default::default()
     };
-    let result = cx
-        .handle
-        .block_on(
-            cx.tv
-                .get_next_up(&query, &ferrofin_traits::options::DtoOptions::default()),
-        )
-        .map_err(|e| format!("next-up failed: {e}"))?;
+    let result = block_on_until(
+        cx,
+        deadline,
+        cx.tv
+            .get_next_up(&query, &ferrofin_traits::options::DtoOptions::default()),
+    )?
+    .map_err(|e| format!("next-up failed: {e}"))?;
     // The NextUp trait returns wire DTOs; re-fetch the entities by id so the
     // projection stays entity-based (one code path for summaries).
     let ids: Vec<String> = result.items.iter().map(|d| d.id.to_string()).collect();
@@ -581,6 +628,7 @@ pub fn next_up(cx: &Collaborators, user_id: &str, limit: u32) -> Result<Vec<Item
     }
     let ordered = query_items(
         cx,
+        deadline,
         &ItemQuery {
             kinds: Vec::new(),
             parent_id: None,
@@ -774,13 +822,15 @@ const TICKS_PER_SEC: f64 = 10_000_000.0;
 
 /// Resolves a guest-named library item to its filesystem path — the ONLY
 /// way media bytes are ever addressed (a guest never supplies paths).
-fn resolve_media_path(cx: &Collaborators, item_id: &str) -> Result<String, String> {
+fn resolve_media_path(
+    cx: &Collaborators,
+    deadline: std::time::Instant,
+    item_id: &str,
+) -> Result<String, String> {
     let id: Uuid = item_id
         .parse()
         .map_err(|_| format!("item-id `{item_id}` is not a valid UUID"))?;
-    let entity = cx
-        .handle
-        .block_on(cx.library.get_item_by_id(id))
+    let entity = block_on_until(cx, deadline, cx.library.get_item_by_id(id))?
         .map_err(|e| format!("item lookup failed: {e}"))?
         .ok_or_else(|| format!("no such library item {id}"))?;
     let path = entity
@@ -792,30 +842,33 @@ fn resolve_media_path(cx: &Collaborators, item_id: &str) -> Result<String, Strin
 
 /// Executes `media-info` for a guest.
 ///
+/// The reads are held to `deadline`, the guest call's.
+///
 /// # Errors
-/// Unknown/pathless item or repository failure, as the guest-visible string.
+/// Unknown/pathless item, repository failure, or [`OUT_OF_TIME`], as the
+/// guest-visible string.
 pub fn media_info(
     cx: &Collaborators,
+    deadline: std::time::Instant,
     item_id: &str,
 ) -> Result<crate::bindings::types::MediaTechnicalInfo, String> {
     let id: Uuid = item_id
         .parse()
         .map_err(|_| format!("item-id `{item_id}` is not a valid UUID"))?;
-    let entity = cx
-        .handle
-        .block_on(cx.library.get_item_by_id(id))
+    let entity = block_on_until(cx, deadline, cx.library.get_item_by_id(id))?
         .map_err(|e| format!("item lookup failed: {e}"))?
         .ok_or_else(|| format!("no such library item {id}"))?;
-    let streams = cx
-        .handle
-        .block_on(cx.media_streams.get_media_streams(
-            &ferrofin_traits::persistence::MediaStreamQuery {
+    let streams = block_on_until(
+        cx,
+        deadline,
+        cx.media_streams
+            .get_media_streams(&ferrofin_traits::persistence::MediaStreamQuery {
                 item_id: id,
                 stream_type: None,
                 index: None,
-            },
-        ))
-        .map_err(|e| format!("stream lookup failed: {e}"))?;
+            }),
+    )?
+    .map_err(|e| format!("stream lookup failed: {e}"))?;
     // Stream-type discriminants per the DB mapping: 0 = Audio, 1 = Video.
     Ok(crate::bindings::types::MediaTechnicalInfo {
         duration_ticks: entity.run_time_ticks.unwrap_or(0),
@@ -834,8 +887,10 @@ pub fn media_info(
 /// Executes `extract-audio` for a guest: caps the window, clamps the spec,
 /// resolves the item, and decodes under the global analysis budget.
 ///
+/// The permit wait and the decode are held to `deadline`, the guest call's.
+///
 /// # Errors
-/// Cap violations, unknown items, or decode failures.
+/// Cap violations, unknown items, decode failures, or [`OUT_OF_TIME`].
 #[allow(
     clippy::cast_precision_loss,
     clippy::cast_possible_truncation,
@@ -844,6 +899,7 @@ pub fn media_info(
 // any cast, so precision/truncation cannot bite.
 pub fn extract_audio(
     cx: &Collaborators,
+    deadline: std::time::Instant,
     memory_limit_bytes: usize,
     window: &crate::bindings::types::AudioWindow,
 ) -> Result<crate::bindings::types::AudioChunk, String> {
@@ -867,17 +923,15 @@ pub fn extract_audio(
             "decoded window (~{decoded_bytes} bytes) exceeds the plugin's analysis budget ({bytes_cap} bytes) — request a shorter window or lower rate"
         ));
     }
-    let path = resolve_media_path(cx, &window.item_id)?;
+    let path = resolve_media_path(cx, deadline, &window.item_id)?;
     let start_secs = (window.start_ticks.max(0)) as f64 / TICKS_PER_SEC;
-    let samples = cx
-        .handle
-        .block_on(async {
-            let _permit = cx.analysis.acquire().await;
-            cx.extractor
-                .extract_audio(&path, start_secs, duration_secs, spec)
-                .await
-        })
-        .map_err(|e| format!("audio extraction failed: {e}"))?;
+    let samples = block_on_until(cx, deadline, async {
+        let _permit = cx.analysis.acquire().await;
+        cx.extractor
+            .extract_audio(&path, start_secs, duration_secs, spec)
+            .await
+    })?
+    .map_err(|e| format!("audio extraction failed: {e}"))?;
     Ok(crate::bindings::types::AudioChunk {
         spec: crate::bindings::types::AudioSpec {
             sample_rate: spec.sample_rate,
@@ -888,14 +942,16 @@ pub fn extract_audio(
     })
 }
 
-/// Executes `extract-frames` for a guest.
+/// Executes `extract-frames` for a guest. The permit wait and the decode
+/// are held to `deadline`, the guest call's.
 ///
 /// # Errors
-/// Cap violations, unknown items, or decode failures.
+/// Cap violations, unknown items, decode failures, or [`OUT_OF_TIME`].
 #[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
 // tick↔second conversions on bounded timestamps.
 pub fn extract_frames(
     cx: &Collaborators,
+    deadline: std::time::Instant,
     request: &crate::bindings::types::FrameRequest,
 ) -> Result<Vec<crate::bindings::types::VideoFrame>, String> {
     if request.timestamps_ticks.is_empty() {
@@ -909,21 +965,19 @@ pub fn extract_frames(
     }
     let max_dimension = request.max_dimension.clamp(16, FRAME_DIMENSION_MAX);
     let jpeg = matches!(request.format, crate::bindings::types::FrameFormat::Jpeg);
-    let path = resolve_media_path(cx, &request.item_id)?;
+    let path = resolve_media_path(cx, deadline, &request.item_id)?;
     let timestamps: Vec<f64> = request
         .timestamps_ticks
         .iter()
         .map(|t| (*t).max(0) as f64 / TICKS_PER_SEC)
         .collect();
-    let frames = cx
-        .handle
-        .block_on(async {
-            let _permit = cx.analysis.acquire().await;
-            cx.extractor
-                .extract_frames(&path, &timestamps, max_dimension, jpeg)
-                .await
-        })
-        .map_err(|e| format!("frame extraction failed: {e}"))?;
+    let frames = block_on_until(cx, deadline, async {
+        let _permit = cx.analysis.acquire().await;
+        cx.extractor
+            .extract_frames(&path, &timestamps, max_dimension, jpeg)
+            .await
+    })?
+    .map_err(|e| format!("frame extraction failed: {e}"))?;
     Ok(frames
         .into_iter()
         .map(|f| crate::bindings::types::VideoFrame {
@@ -941,24 +995,24 @@ pub fn extract_frames(
 }
 
 /// Executes `extract-subtitle-track`. `size_cap` bounds the extracted
-/// track (`FERROFIN_WASM_SUBTITLE_EXTRACT_MB`).
+/// track (`FERROFIN_WASM_SUBTITLE_EXTRACT_MB`); the permit wait and the
+/// decode are held to `deadline`, the guest call's.
 ///
 /// # Errors
-/// Unknown item, decode failure, or an over-cap track.
+/// Unknown item, decode failure, an over-cap track, or [`OUT_OF_TIME`].
 pub fn extract_subtitle_track(
     cx: &Collaborators,
+    deadline: std::time::Instant,
     size_cap: usize,
     item_id: &str,
     stream_index: u32,
 ) -> Result<Vec<u8>, String> {
-    let path = resolve_media_path(cx, item_id)?;
-    let bytes = cx
-        .handle
-        .block_on(async {
-            let _permit = cx.analysis.acquire().await;
-            cx.extractor.extract_subtitle(&path, stream_index).await
-        })
-        .map_err(|e| format!("subtitle extraction failed: {e}"))?;
+    let path = resolve_media_path(cx, deadline, item_id)?;
+    let bytes = block_on_until(cx, deadline, async {
+        let _permit = cx.analysis.acquire().await;
+        cx.extractor.extract_subtitle(&path, stream_index).await
+    })?
+    .map_err(|e| format!("subtitle extraction failed: {e}"))?;
     if bytes.len() > size_cap {
         return Err(format!("extracted track exceeds the {size_cap}-byte cap"));
     }
@@ -1061,7 +1115,9 @@ pub fn get_state(path: Option<&std::path::Path>, key: &str) -> Option<Vec<u8>> {
 }
 
 /// Executes `set-state` for a guest: `None` deletes; writes are atomic
-/// (temp + rename) and capped (key/value/total).
+/// (a temporary file of their own, renamed in), serialised with another
+/// server on the same data directory (a lock file), and capped
+/// (key/value/total).
 ///
 /// # Errors
 /// Cap violations or I/O failures, as the guest-visible string.
@@ -1143,20 +1199,65 @@ pub fn set_state_capped(
     let mut kept = slot
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
+    // The slot serialises this process's writers; the lock file, another
+    // server's on the same data directory too (a rolling update runs two).
+    let _other_servers = lock_state_file(path);
     let map = state_after_set(path, &mut kept, key, value, total_cap)?;
     let bytes = serde_json::to_vec(&map).map_err(|e| format!("serialize state: {e}"))?;
     let crc = crc32fast::hash(&bytes);
-    let tmp = path.with_extension("tmp");
-    std::fs::write(&tmp, bytes).map_err(|e| format!("write state: {e}"))?;
-    // Stamped before the rename, which keeps length, modified time and
-    // inode: the stamp is this write's file even if another server renames
-    // its own over it straight after.
-    let stamp = state_stamp(&tmp);
-    std::fs::rename(&tmp, path).map_err(|e| format!("commit state: {e}"))?;
+    let mut written = None;
+    // A temporary file of this write's own, renamed over the state file.
+    ferrofin_util::file_helper::atomic_write_with(path, |file| {
+        use std::io::Write as _;
+        file.write_all(&bytes)?;
+        // Stamped before the rename, which keeps length, modified time and
+        // inode: the stamp is this write's file even if a server without the
+        // lock file (an older version) renames its own over it straight after.
+        written = file.metadata().ok();
+        Ok(())
+    })
+    .map_err(|e| format!("write state: {e}"))?;
     // Keep what was just written: the next read or write needs no parse, and a
     // rewrite inside one modified-time tick cannot pass for the old file.
-    *kept = stamp.map(|stamp| KeptState { stamp, crc, map });
+    *kept = written
+        .filter(|meta| meta.modified().is_ok())
+        .map(|meta| KeptState {
+            stamp: FileStamp::of(&meta),
+            crc,
+            map,
+        });
     Ok(())
+}
+
+/// Locks `{id}.state.lock` beside the state file at `path` for one write,
+/// released when the returned file drops. `None` when the lock cannot be
+/// taken (a filesystem without `flock`): the write goes ahead under the
+/// in-process lock alone, so a plugin's state never stops saving over it.
+fn lock_state_file(path: &Path) -> Option<std::fs::File> {
+    static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    let lock = path.with_extension("lock");
+    let taken = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&lock)
+        .and_then(|file| file.lock().map(|()| file));
+    match taken {
+        Ok(file) => Some(file),
+        Err(error) if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) => {
+            tracing::warn!(
+                path = %lock.display(),
+                %error,
+                "cannot lock a plugin state file; its writes are not serialised with \
+                 another server sharing this data directory"
+            );
+            None
+        }
+        Err(error) => {
+            debug!(path = %lock.display(), %error, "cannot lock a plugin state file");
+            None
+        }
+    }
 }
 
 /// The would-be state map after setting `key` to `value`, refused at the
@@ -1343,7 +1444,6 @@ pub fn create_collection(
         name: name.to_owned(),
         parent_id: None,
         is_locked: false,
-        provider_ids: std::collections::HashMap::new(),
         item_id_list: ids,
         user_ids: Vec::new(),
     };
@@ -1590,5 +1690,79 @@ mod tests {
         std::fs::remove_file(&path).expect("remove");
         super::set_state(Some(&path), "e", Some(b"5".to_vec())).expect("set e");
         assert_eq!(read(&path), r#"{"e":"35"}"#);
+    }
+
+    /// gl-1155: two servers on one data directory (a rolling update) write
+    /// one plugin's state under two per-process locks. The second spelling
+    /// of the path, through a symlinked directory, gets a lock of its own as
+    /// the other server's process would, while naming the same files. Every
+    /// write lands, none tears the file, and no temporary file is left.
+    #[cfg(unix)]
+    #[test]
+    fn set_state_holds_between_two_servers_writing_one_file() {
+        const WRITES: usize = 100;
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::os::unix::fs::symlink(dir.path(), dir.path().join("other")).expect("symlink");
+        let paths = [
+            dir.path().join("plugin.state.json"),
+            dir.path().join("other").join("plugin.state.json"),
+        ];
+        std::thread::scope(|scope| {
+            for (server, path) in paths.iter().enumerate() {
+                scope.spawn(move || {
+                    for write in 0..WRITES {
+                        super::set_state(Some(path), &format!("{server}-{write}"), Some(vec![1]))
+                            .expect("set");
+                    }
+                });
+            }
+        });
+        let map: std::collections::BTreeMap<String, String> =
+            serde_json::from_str(&read(&paths[0])).expect("a whole file");
+        assert_eq!(map.len(), 2 * WRITES, "every write kept");
+        let mut names: Vec<_> = std::fs::read_dir(dir.path())
+            .expect("dir")
+            .map(|entry| entry.expect("entry").file_name())
+            .collect();
+        names.sort();
+        assert_eq!(names, ["other", "plugin.state.json", "plugin.state.lock"]);
+    }
+
+    /// gl-1155: a lock file that cannot be taken (here a directory, which no
+    /// open for writing gets) leaves each write to its process's own lock, as
+    /// an older server without the lock file writes. Two such writers may
+    /// drop each other's updates, but every write succeeds, the file stays
+    /// whole, and no temporary file is left: each write has a temporary file
+    /// of its own.
+    #[cfg(unix)]
+    #[test]
+    fn set_state_stays_whole_without_the_lock_file() {
+        const WRITES: usize = 100;
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::os::unix::fs::symlink(dir.path(), dir.path().join("other")).expect("symlink");
+        std::fs::create_dir(dir.path().join("plugin.state.lock")).expect("unlockable");
+        let paths = [
+            dir.path().join("plugin.state.json"),
+            dir.path().join("other").join("plugin.state.json"),
+        ];
+        std::thread::scope(|scope| {
+            for (server, path) in paths.iter().enumerate() {
+                scope.spawn(move || {
+                    for write in 0..WRITES {
+                        super::set_state(Some(path), &format!("{server}-{write}"), Some(vec![1]))
+                            .expect("set");
+                    }
+                });
+            }
+        });
+        let map: std::collections::BTreeMap<String, String> =
+            serde_json::from_str(&read(&paths[0])).expect("a whole file");
+        assert!(!map.is_empty());
+        let mut names: Vec<_> = std::fs::read_dir(dir.path())
+            .expect("dir")
+            .map(|entry| entry.expect("entry").file_name())
+            .collect();
+        names.sort();
+        assert_eq!(names, ["other", "plugin.state.json", "plugin.state.lock"]);
     }
 }

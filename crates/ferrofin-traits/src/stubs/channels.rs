@@ -1,9 +1,10 @@
-//! Minimal channels manager trait (deferred subsystem).
+//! The channels manager trait.
 //!
-//! Port of a representative slice of
-//! `MediaBrowser.Controller.Channels.IChannelManager`. Channels are deferred, so
-//! the per-backend `IChannel` strategy interface and the full item-query surface
-//! are **not** ported.
+//! Port of a slice of `MediaBrowser.Controller.Channels.IChannelManager`. The
+//! per-backend `IChannel` strategy interface and the rest of the item-query
+//! surface are not ported, so no channel can be registered and `ferrofin-core`'s
+//! implementation answers every query empty. TODO(parity, gl-298): open work
+//! item: give channels an extension seam.
 //!
 //! Port rules applied: channel/item results reuse `ferrofin-model` DTOs
 //! ([`ChannelFeatures`], `QueryResult<BaseItemDto>`); the `ChannelQuery` param
@@ -18,9 +19,9 @@ use ferrofin_model::querying::QueryResult;
 use crate::error::ServiceError;
 use crate::options::InternalItemsQuery;
 
-/// The (deferred) channels manager.
+/// The channels manager.
 ///
-/// Port of `IChannelManager` (minimal slice).
+/// Port of a slice of `IChannelManager` (see the module docs).
 #[async_trait]
 pub trait ChannelManager: Send + Sync {
     /// Gets the features advertised by a channel (or all channels when `None`).

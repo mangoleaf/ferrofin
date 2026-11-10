@@ -973,37 +973,25 @@ impl FerrofinTrickplayManager {
     /// Moves either way and removes the emptied source container.
     ///
     /// This is an inherent method (not on the [`TrickplayManager`] trait),
-    /// consumed by the "Migrate Trickplay Image Location" scheduled task.
+    /// consumed by the "Migrate Trickplay Image Location" scheduled task. That
+    /// task's source query selects physical Video kinds, including owned extras
+    /// and complete channel VOD (SourceTypes is declared but not consumed by
+    /// the pinned query), so any other item is skipped here.
     ///
     /// # Errors
     ///
     /// Returns [`ServiceError`] when the item lookup, configuration read, or a
     /// filesystem move fails.
-    pub async fn move_generated_trickplay_data(&self, item_id: Uuid) -> Result<(), ServiceError> {
-        self.move_trickplay_data(item_id, false).await
-    }
-
-    /// The source migration task selects physical Video kinds, including owned
-    /// extras and complete channel VOD. SourceTypes is declared but not consumed
-    /// by the pinned query. Keep its other filters outside the public manager.
     pub(crate) async fn move_generated_library_trickplay_data(
         &self,
         item_id: Uuid,
-    ) -> Result<(), ServiceError> {
-        self.move_trickplay_data(item_id, true).await
-    }
-
-    async fn move_trickplay_data(
-        &self,
-        item_id: Uuid,
-        library_only: bool,
     ) -> Result<(), ServiceError> {
         let lock = self.item_locks.get(&item_id.to_string());
         let _item = lock.lock().await;
         let Some(entity) = self.items.retrieve_item(item_id).await? else {
             return Ok(());
         };
-        if library_only && !is_library_video(&entity) {
+        if !is_library_video(&entity) {
             return Ok(());
         }
         let Some(library) = self.library_options(&entity).await? else {
@@ -4372,7 +4360,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn move_generated_trickplay_data_consolidates_media_adjacent_tiles() {
+    async fn move_generated_library_trickplay_data_consolidates_media_adjacent_tiles() {
         let db = test_db().await;
         let item = Uuid::new_v4();
         let r = rig(&db, options_2x2(&[320]), FakeExtractor::new(0, 180));
@@ -4392,7 +4380,7 @@ mod tests {
         std::fs::write(media_tiles.join("0.jpg"), b"tile").expect("tile");
 
         r.mgr
-            .move_generated_trickplay_data(item)
+            .move_generated_library_trickplay_data(item)
             .await
             .expect("move");
 
@@ -4405,7 +4393,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn move_generated_trickplay_data_is_a_noop_without_media_tiles() {
+    async fn move_generated_library_trickplay_data_is_a_noop_without_media_tiles() {
         let db = test_db().await;
         let item = Uuid::new_v4();
         let r = rig(&db, options_2x2(&[320]), FakeExtractor::new(0, 180));
@@ -4425,14 +4413,14 @@ mod tests {
         std::fs::write(local_tiles.join("0.jpg"), b"tile").expect("tile");
 
         r.mgr
-            .move_generated_trickplay_data(item)
+            .move_generated_library_trickplay_data(item)
             .await
             .expect("move");
         assert!(local_tiles.join("0.jpg").is_file(), "internal tiles kept");
 
         // An unknown item is also fine.
         r.mgr
-            .move_generated_trickplay_data(Uuid::new_v4())
+            .move_generated_library_trickplay_data(Uuid::new_v4())
             .await
             .expect("missing item ok");
     }
@@ -5113,7 +5101,10 @@ mod tests {
                 !tile.exists(),
                 "changing the checkbox alone does not relocate data"
             );
-            r.mgr.move_generated_trickplay_data(item).await.unwrap();
+            r.mgr
+                .move_generated_library_trickplay_data(item)
+                .await
+                .unwrap();
             assert_eq!(std::fs::read(&tile).unwrap(), original);
             assert!(
                 !old.exists(),
@@ -5131,7 +5122,10 @@ mod tests {
             .update_library_options("Movies", &options)
             .await
             .unwrap();
-        r.mgr.move_generated_trickplay_data(item).await.unwrap();
+        r.mgr
+            .move_generated_library_trickplay_data(item)
+            .await
+            .unwrap();
         assert!(internal.join("320 - 2x2/0.jpg").is_file());
         assert!(
             !sidecar.exists(),
@@ -5161,14 +5155,20 @@ mod tests {
         std::fs::create_dir_all(&internal).unwrap();
         std::fs::write(internal.join("0.jpg"), b"source").unwrap();
         std::fs::create_dir_all(&sidecar).unwrap();
-        r.mgr.move_generated_trickplay_data(item).await.unwrap();
+        r.mgr
+            .move_generated_library_trickplay_data(item)
+            .await
+            .unwrap();
         assert!(
             internal.join("0.jpg").exists(),
             "an existing empty destination is skipped by the pinned guard"
         );
         std::fs::write(sidecar.join("0.jpg"), b"old collision").unwrap();
         std::fs::write(sidecar.join("extra.jpg"), b"preserved destination file").unwrap();
-        r.mgr.move_generated_trickplay_data(item).await.unwrap();
+        r.mgr
+            .move_generated_library_trickplay_data(item)
+            .await
+            .unwrap();
         assert_eq!(std::fs::read(sidecar.join("0.jpg")).unwrap(), b"source");
         assert_eq!(
             std::fs::read(sidecar.join("extra.jpg")).unwrap(),
@@ -5200,7 +5200,12 @@ mod tests {
         std::fs::write(internal.join("0.jpg"), b"source tiles").unwrap();
         std::fs::create_dir_all(sidecar.parent().unwrap()).unwrap();
         std::fs::write(&sidecar, b"destination blocker").unwrap();
-        assert!(r.mgr.move_generated_trickplay_data(item).await.is_err());
+        assert!(
+            r.mgr
+                .move_generated_library_trickplay_data(item)
+                .await
+                .is_err()
+        );
         assert_eq!(
             std::fs::read(internal.join("0.jpg")).unwrap(),
             b"source tiles"
@@ -5232,7 +5237,12 @@ mod tests {
         std::fs::create_dir_all(internal.join("320 - 2x2")).unwrap();
         std::fs::write(internal.join("320 - 2x2/0.jpg"), b"source tiles").unwrap();
         std::fs::write(internal.join("retained.txt"), b"ordinary source file").unwrap();
-        assert!(r.mgr.move_generated_trickplay_data(item).await.is_err());
+        assert!(
+            r.mgr
+                .move_generated_library_trickplay_data(item)
+                .await
+                .is_err()
+        );
         assert_eq!(
             std::fs::read(sidecar.join("320 - 2x2/0.jpg")).unwrap(),
             b"source tiles"

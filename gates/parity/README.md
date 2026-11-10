@@ -30,7 +30,7 @@ A release run sends the sweep and the edge cases as one set; a new difference in
 ledger and the filing of new differences as issues extend this same path in later steps.
 
 ```bash
-# needs docker, python3 (3.11+), jq, curl, timeout, taskset; the benchmark corpus, prepared for Jellyfin
+# needs docker, python3 (3.11+), jq, curl, timeout, taskset, setsid, flock; the benchmark corpus, prepared for Jellyfin
 export FERROFIN_GATES_DIR=/srv/gates          # the output root (gates/lib.sh): the corpus and every run go under it
 gates/bench/testdata/build.sh                       # once: the corpus (see gates/bench/README.md)
 gates/bench/testdata/build.sh --prepare-jellyfin    # once: the corpus upgraded and scanned by the pinned Jellyfin

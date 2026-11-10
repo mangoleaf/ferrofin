@@ -44,11 +44,12 @@ const SYNCED_FORMAT: &str = "lrc";
 const PLAIN_FORMAT: &str = "txt";
 
 /// The descriptive `User-Agent` lrclib.net asks API consumers to send.
-const USER_AGENT: &str = concat!(
-    "Ferrofin/",
-    env!("CARGO_PKG_VERSION"),
-    " (Jellyfin-compatible media server)"
-);
+static USER_AGENT: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+    format!(
+        "{} (Jellyfin-compatible media server)",
+        ferrofin_health::USER_AGENT
+    )
+});
 
 /// The number of .NET ticks (100 ns) per second.
 const TICKS_PER_SECOND: i64 = 10_000_000;
@@ -264,7 +265,7 @@ impl LrcLibProvider {
             .http
             .get(format!("{}{path}", self.base_url))
             .query(query)
-            .header(reqwest::header::USER_AGENT, USER_AGENT)
+            .header(reqwest::header::USER_AGENT, USER_AGENT.as_str())
             .send_limited(&self.limiter)
             .await;
         let response = match result {

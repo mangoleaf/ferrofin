@@ -50,6 +50,7 @@ pub struct ExternalMediaTarget {
 impl ExternalMediaTarget {
     /// A target for a plain video **file**: the containing folder is the
     /// file's directory (`Path.GetDirectoryName`).
+    #[cfg(test)]
     #[must_use]
     pub fn for_file(path: impl Into<String>, internal_metadata_path: Option<String>) -> Self {
         let path = path.into();

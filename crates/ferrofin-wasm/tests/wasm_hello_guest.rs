@@ -49,6 +49,10 @@ fn build_guest() -> Option<PathBuf> {
         // toolchain pin would otherwise leak in and miss the wasm target.
         .env_remove("RUSTUP_TOOLCHAIN")
         .env_remove("CARGO")
+        // TMPDIR is this test run's scratch directory. A compiler-cache daemon
+        // this build starts (sccache) would keep it after the run, and a deep
+        // one overflows sccache's startup socket path (SUN_LEN).
+        .env_remove("TMPDIR")
         .output()
         .expect("spawn cargo for the guest build");
     if !output.status.success() {

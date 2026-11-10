@@ -810,7 +810,7 @@ async fn support_bundle(
          * Plugin version: {version}\n\
          * Runs on: {os}\n\
          {analysis}",
-        ferrofin = env!("CARGO_PKG_VERSION"),
+        ferrofin = ferrofin_health::RELEASE_VERSION,
         os = operating_system(),
         analysis = state.intro_skipper_analysis.support_bundle().await,
     )

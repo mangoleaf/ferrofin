@@ -1189,7 +1189,10 @@ pub trait ItemPersistenceService: Send + Sync {
     async fn set_ancestors(&self, item_id: Uuid, ancestor_ids: &[Uuid])
     -> Result<(), ServiceError>;
 
-    /// Persists the image info attached to an item.
+    /// Persists the image info attached to an item. The `ferrofin-core`
+    /// implementation only confirms the item exists: image rows are written by
+    /// [`Self::save_item_images`] and the `set_item_image*` methods, and nothing
+    /// calls this one. TODO(gl-211): open work item: remove it from the trait.
     async fn save_images(&self, item: &BaseItemEntity) -> Result<(), ServiceError>;
 
     /// Replaces the item's stored image rows (`BaseItemImageInfos`) with
@@ -2078,7 +2081,11 @@ pub trait ItemPersistenceService: Send + Sync {
         Ok(None)
     }
 
-    /// Recomputes and persists inherited values across the item tree.
+    /// Port of `UpdateInheritedValues`, which upstream runs at the end of the
+    /// post-scan tasks (`RunPostScanTasks`) to delete the `ItemValuesMap` rows
+    /// of type `InheritedTags`.
+    /// The `ferrofin-core` implementation is a no-op, and nothing calls it.
+    /// TODO(gl-211): open work item: port it and call it, or remove it.
     async fn update_inherited_values(&self) -> Result<(), ServiceError>;
 }
 
