@@ -240,6 +240,7 @@ pub mod path_manager;
 pub mod people_repository;
 pub mod playback_activity;
 pub mod playback_metrics;
+mod playback_sessions_repository;
 pub mod plugin_manager;
 pub mod plugin_offered_item_repository;
 mod query_restrictions;

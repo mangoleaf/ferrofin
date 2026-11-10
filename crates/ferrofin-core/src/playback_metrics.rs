@@ -3,7 +3,9 @@
 //! Writes one `FerrofinPlaybackSessions` row per PlaybackInfo decision and updates it
 //! on playstate start/stop. The point is ranking `TranscodeReasons` by
 //! frequency and cost to find transcodes that
-//! a better profile decision would have avoided.
+//! a better profile decision would have avoided. The rows expire with the
+//! activity log: the Optimize Database task deletes those older than
+//! `ActivityLogRetentionDays` (`playback_sessions_repository::prune`).
 //!
 //! Storage failures are logged and swallowed — metrics must never break
 //! playback (the trait contract).
