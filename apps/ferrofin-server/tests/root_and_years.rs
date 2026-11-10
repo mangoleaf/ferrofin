@@ -10,9 +10,11 @@
 //!   on a database that never had one.
 //! - `GET /Items/{movie}/Ancestors` climbs past the library's
 //!   `CollectionFolder` to that root, with and without a user in scope.
-//! - The scan materializes one `Year` row per distinct `ProductionYear`,
-//!   with the path-derived ids Jellyfin's `GetItemByNameId<Year>` produces,
-//!   so `GET /Years` lists them and `GET /Years/{year}` returns one.
+//! - The scan writes no `Year` row, as Jellyfin's does not (gl-1583). The
+//!   first `GET /Years` creates one per distinct `ProductionYear`, the whole
+//!   list even for one page (`GetYear` runs before the paging upstream), with
+//!   the path-derived ids Jellyfin's `GetItemByNameId<Year>` produces, and
+//!   `GET /Years/{year}` returns one.
 //! - `GET /Years/{year}` for a year no item carries still resolves
 //!   (`GetYear` always creates), exactly as upstream.
 
@@ -261,23 +263,42 @@ async fn items_root_ancestors_and_years_over_real_http() {
         "years parsed: {years:?}"
     );
 
-    // ---- the scan's year pass materialized the rows (no /Years call yet) ----
+    // ---- the finished scan wrote no Year row ----
+    let result = wait_for("the scan's end", async || {
+        let (_, tasks) = send(&router, &auth_header, "GET", "/ScheduledTasks").await;
+        let task = tasks
+            .as_array()?
+            .iter()
+            .find(|task| task["Key"] == "RefreshLibrary")?
+            .clone();
+        let result = task["LastExecutionResult"].clone();
+        (task["State"] == "Idle" && !result.is_null()).then_some(result)
+    })
+    .await;
+    assert_eq!(result["Status"], "Completed", "{result}");
     let items: Arc<dyn ItemRepository> = Arc::new(FerrofinItemRepository::new(
         harness.db.clone(),
         Arc::new(ItemTypeLookup::new()),
     ));
-    let year_rows = wait_for("the scan's Year rows", async || {
+    let year_rows = async || {
         let mut rows = items
             .get_item_list(&InternalItemsQuery {
                 include_item_types: vec![BaseItemKind::Year],
                 ..InternalItemsQuery::default()
             })
             .await
-            .ok()?;
+            .expect("year rows");
         rows.sort_by(|a, b| a.name.cmp(&b.name));
-        (rows.len() == 2).then_some(rows)
-    })
-    .await;
+        rows
+    };
+    assert!(year_rows().await.is_empty(), "the scan created Year rows");
+
+    // ---- one page of /Years creates every year, as `GetYear` does upstream ----
+    let (status, page) = send(&router, &auth_header, "GET", "/Years?limit=1").await;
+    assert_eq!(status, StatusCode::OK, "{page}");
+    assert_eq!(page["Items"].as_array().map(Vec::len), Some(1), "{page}");
+    let year_rows = year_rows().await;
+    assert_eq!(year_rows.len(), 2, "every year created: {year_rows:?}");
     let paths = harness.wired.state.config.application_paths();
     let mode = ferrofin_core::item_type_lookup::IdDerivation::Jellyfin {
         program_data_path: Some(paths.program_data_path()),
@@ -382,7 +403,7 @@ async fn items_root_ancestors_and_years_over_real_http() {
         year["Id"]
             .as_str()
             .is_some_and(|id| id.eq_ignore_ascii_case(&scanned)),
-        "/Years/1999 is the scanned row: {year}"
+        "/Years/1999 is the row the first /Years created: {year}"
     );
     // A year no item carries is created on demand (`GetYear` always creates).
     let (status, year) = send(&router, &auth_header, "GET", "/Years/1850").await;
