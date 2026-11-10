@@ -1971,7 +1971,7 @@ fn log_is_empty(path: &std::path::Path) -> bool {
 /// The temporary name a snapshot is written under until it is complete
 /// (`backup` with `.partial` appended), after removing whatever an earlier,
 /// interrupted attempt left there.
-fn start_snapshot(backup: &std::path::Path) -> Result<std::path::PathBuf> {
+pub(crate) fn start_snapshot(backup: &std::path::Path) -> Result<std::path::PathBuf> {
     let mut partial = backup.as_os_str().to_owned();
     partial.push(".partial");
     let partial = std::path::PathBuf::from(partial);
@@ -1993,7 +1993,7 @@ fn start_snapshot(backup: &std::path::Path) -> Result<std::path::PathBuf> {
 /// crash. Until then only `partial` exists, so a snapshot that a full disk or a
 /// kill cut short is never taken for a complete one: the next attempt removes
 /// it and starts over.
-fn publish_snapshot(partial: &std::path::Path, backup: &std::path::Path) -> Result<()> {
+pub(crate) fn publish_snapshot(partial: &std::path::Path, backup: &std::path::Path) -> Result<()> {
     let failed = |source| crate::DbError::Backup {
         path: backup.display().to_string(),
         source,
@@ -2011,7 +2011,7 @@ fn publish_snapshot(partial: &std::path::Path, backup: &std::path::Path) -> Resu
 /// Passes `written` through, removing the half-written `partial` first when
 /// it failed: a copy cut short by a full disk must not keep holding the space
 /// the migrations after it need.
-fn abandon_on_error(partial: &std::path::Path, written: Result<()>) -> Result<()> {
+pub(crate) fn abandon_on_error(partial: &std::path::Path, written: Result<()>) -> Result<()> {
     if written.is_err()
         && let Err(error) = std::fs::remove_file(partial)
         && error.kind() != std::io::ErrorKind::NotFound
@@ -2055,7 +2055,7 @@ fn log_kept_snapshot(backup: &std::path::Path) {
 
 /// The `VACUUM INTO` statement that writes a copy of the database to `dest`,
 /// its quotes doubled for the SQL string literal.
-fn vacuum_into(dest: &std::path::Path) -> String {
+pub(crate) fn vacuum_into(dest: &std::path::Path) -> String {
     let dest = dest.to_string_lossy().replace('\'', "''");
     format!("VACUUM INTO '{dest}'")
 }
