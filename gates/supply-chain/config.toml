@@ -383,8 +383,9 @@ version = "5.4.2"
 criteria = "safe-to-deploy"
 
 [[exemptions.fancy-regex]]
-version = "0.20.0"
+version = "0.20.1"
 criteria = "safe-to-deploy"
+notes = "2026-11-10: the v1.5.1 freeze sweep moved it from 0.20.0, a starting exemption, and no imported audit covers 0.20.1; lifted by an imported or Ferrofin audit of 0.20.1"
 
 [[exemptions.fastrand]]
 version = "2.5.0"
