@@ -73,7 +73,9 @@ struct EpisodeOrderRow {
     #[sqlx(rename = "Type")]
     type_: String,
     parent_id: Option<String>,
+    #[sqlx(try_from = "ferrofin_db::entities::unset::NonNilGuid")]
     season_id: Option<String>,
+    #[sqlx(try_from = "ferrofin_db::entities::unset::NonNilGuid")]
     channel_id: Option<String>,
     path: Option<String>,
     index_number: Option<i64>,

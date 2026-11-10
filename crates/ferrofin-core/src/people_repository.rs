@@ -72,14 +72,25 @@ const PERSON_TYPE_NAME: &str = "MediaBrowser.Controller.Entities.Person";
 
 /// A `Person` item insert up to its `VALUES` list, whose rows are
 /// [`PERSON_ITEM_ROW`]s. `INSERT OR IGNORE`: an id already stored keeps its row.
-const PERSON_ITEM_INSERT: &str = r#"INSERT OR IGNORE INTO "BaseItems"
+const PERSON_ITEM_INSERT: &str = concat!(
+    r#"INSERT OR IGNORE INTO "BaseItems"
     ("Id","Type","Name","CleanName","SortName","PresentationUniqueKey","Path",
      "IsFolder","IsInMixedFolder",
-     "IsLocked","IsMovie","IsRepeat","IsSeries","IsVirtualItem")
-    VALUES "#;
+     "IsLocked","IsMovie","IsRepeat","IsSeries","IsVirtualItem","UnratedType","#,
+    crate::item_persistence_service::unset_columns!(),
+    r#")
+    VALUES "#
+);
 
-/// One `Person` item's `VALUES` row: `Id` … `Path` bound, the flags 0.
-const PERSON_ITEM_ROW: &str = "(?, ?, ?, ?, ?, ?, ?, 0, 0, 0, 0, 0, 0, 0)";
+/// One `Person` item's `VALUES` row: `Id` … `Path` bound, the flags 0, then
+/// what upstream writes for the columns a person has no value for. A `Person`'s
+/// `UnratedType` is `Other` (`BaseItem.GetBlockUnratedType`, which it does not
+/// override).
+const PERSON_ITEM_ROW: &str = concat!(
+    "(?, ?, ?, ?, ?, ?, ?, 0, 0, 0, 0, 0, 0, 0, 'Other', ",
+    crate::item_persistence_service::unset_values!(),
+    ")"
+);
 
 /// The columns a `Peoples` insert writes, in bind order.
 const PEOPLES_COLUMNS: &str = r#""Id", "Name", "PersonType""#;
@@ -439,11 +450,17 @@ impl FerrofinPeopleRepository {
                 // `PresentationUniqueKey` too — `Person-{Name}` with the
                 // diacritics removed, exactly as Jellyfin writes it. This
                 // insert bypasses `upsert_item`, so nothing else would set it.
-                r#"INSERT OR IGNORE INTO "BaseItems"
+                concat!(
+                    r#"INSERT OR IGNORE INTO "BaseItems"
                    ("Id","Type","Name","CleanName","SortName","PresentationUniqueKey","Path",
                     "IsFolder","IsInMixedFolder",
-                    "IsLocked","IsMovie","IsRepeat","IsSeries","IsVirtualItem")
-                   VALUES (?1,?2,?3,?4,?5,?6,?7,0,0,0,0,0,0,0)"#,
+                    "IsLocked","IsMovie","IsRepeat","IsSeries","IsVirtualItem","UnratedType","#,
+                    crate::item_persistence_service::unset_columns!(),
+                    r#")
+                   VALUES (?1,?2,?3,?4,?5,?6,?7,0,0,0,0,0,0,0,'Other',"#,
+                    crate::item_persistence_service::unset_values!(),
+                    ")"
+                ),
             )
             .bind(target)
             .bind(person_type)
@@ -464,8 +481,8 @@ impl FerrofinPeopleRepository {
                     (SELECT "PremiereDate" FROM "BaseItems" WHERE "Id" = ?1)),
                  "EndDate" = COALESCE("EndDate",
                     (SELECT "EndDate" FROM "BaseItems" WHERE "Id" = ?1)),
-                 "ProductionLocations" = COALESCE("ProductionLocations",
-                    (SELECT "ProductionLocations" FROM "BaseItems" WHERE "Id" = ?1))
+                 "ProductionLocations" = COALESCE(NULLIF("ProductionLocations", ''),
+                    (SELECT NULLIF("ProductionLocations", '') FROM "BaseItems" WHERE "Id" = ?1), '')
                WHERE "Id" = ?2"#,
         )
         .bind(old_id)
@@ -2003,9 +2020,10 @@ impl PeopleRepository for FerrofinPeopleRepository {
         metadata: PersonMetadata,
     ) -> Result<(), ServiceError> {
         sqlx::query(
+            // No birthplace is the joined empty list upstream's mapper writes, never NULL.
             r#"UPDATE "BaseItems"
                SET "Overview" = ?2, "PremiereDate" = ?3, "EndDate" = ?4,
-                   "ProductionLocations" = ?5
+                   "ProductionLocations" = coalesce(?5, '')
                WHERE "Id" = ?1"#,
         )
         .bind(guid_to_db(person_id))
@@ -2969,6 +2987,13 @@ mod tests {
         let dup_b = Uuid::from_u128(0xA2);
         seed_named_item(&db, dup_a, BaseItemKind::Person, "Uma Thurman").await;
         seed_named_item(&db, dup_b, BaseItemKind::Person, "Uma Thurman").await;
+        // A birthplace on one duplicate survives the collapse, though the survivor's own row
+        // is inserted with the empty list (gl-1580).
+        sqlx::query(r#"UPDATE "BaseItems" SET "ProductionLocations" = 'Paris' WHERE "Id" = ?1"#)
+            .bind(guid_to_db(dup_a))
+            .execute(db.writer())
+            .await
+            .expect("birthplace");
         // …one carrying a favorite.
         let user = crate::test_support::seed_user(&db, Uuid::from_u128(0x9)).await;
         let user_id = Uuid::parse_str(&user.id).unwrap();
@@ -2999,6 +3024,19 @@ mod tests {
             vec![target.clone()],
             "duplicates collapsed onto the derived id"
         );
+        // The survivor's row has upstream's values where the duplicates had none (gl-1580).
+        let survivor = Uuid::parse_str(&target).unwrap();
+        assert_eq!(
+            crate::item_persistence_service::null_mapper_columns(&db, survivor).await,
+            Vec::<&str>::new()
+        );
+        let birthplace: Option<String> =
+            sqlx::query_scalar(r#"SELECT "ProductionLocations" FROM "BaseItems" WHERE "Id" = ?1"#)
+                .bind(&target)
+                .fetch_one(db.pool())
+                .await
+                .expect("survivor");
+        assert_eq!(birthplace.as_deref(), Some("Paris"));
         // The favorite followed the survivor.
         let fav: i64 = sqlx::query_scalar(
             r#"SELECT COUNT(*) FROM "UserData" WHERE "ItemId" = ?1 AND "IsFavorite" = 1"#,
@@ -3010,6 +3048,71 @@ mod tests {
         assert_eq!(fav, 1);
         // Idempotent: the marker short-circuits the second run.
         assert_eq!(repo.unify_person_identities().await.expect("again"), 0);
+    }
+
+    /// A person collapsed with no birthplace on any duplicate keeps the empty list, never NULL
+    /// (the collapse's `''` fallback, gl-1580).
+    #[tokio::test]
+    async fn a_collapse_without_a_birthplace_stores_the_empty_list() {
+        use crate::item_type_lookup::{IdDerivation, person_item_id};
+        let db = test_db().await;
+        let mode = IdDerivation::Jellyfin {
+            program_data_path: Some("/data".to_owned()),
+        };
+        crate::test_support::seed_named_item(
+            &db,
+            Uuid::from_u128(0xB1),
+            BaseItemKind::Person,
+            "Solo Person",
+        )
+        .await;
+        let repo = FerrofinPeopleRepository::new(db.clone())
+            .with_identity(mode.clone(), "/data/metadata/People".to_owned());
+        assert_eq!(repo.unify_person_identities().await.expect("unify"), 1);
+        let survivor =
+            person_item_id(&mode, "/data/metadata/People", "Solo Person").expect("derived");
+        assert_eq!(
+            crate::item_persistence_service::null_mapper_columns(&db, survivor).await,
+            Vec::<&str>::new()
+        );
+    }
+
+    /// A person row is written with upstream's values for the columns a person has none of:
+    /// no NULL, and `Other` for its unrated category (gl-1580).
+    #[tokio::test]
+    async fn a_created_person_row_has_the_mappers_defaults() {
+        let db = test_db().await;
+        let people = tempfile::tempdir().unwrap();
+        let repo = FerrofinPeopleRepository::new(db.clone()).with_identity(
+            crate::item_type_lookup::IdDerivation::Jellyfin {
+                program_data_path: None,
+            },
+            people.path().to_string_lossy().into_owned(),
+        );
+        assert_eq!(
+            repo.create_person_items(&["Ann Example".to_owned()])
+                .await
+                .unwrap(),
+            1
+        );
+        let (id, unrated): (String, Option<String>) = sqlx::query_as(
+            r#"SELECT "Id", "UnratedType" FROM "BaseItems" WHERE "Type" = ?1 AND "Name" = 'Ann Example'"#,
+        )
+        .bind(PERSON_TYPE_NAME)
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(unrated.as_deref(), Some("Other"));
+        assert_eq!(
+            crate::item_persistence_service::unrated_type_name(BaseItemKind::Person),
+            "Other",
+            "the literal in PERSON_ITEM_ROW"
+        );
+        let id = Uuid::parse_str(&id).unwrap();
+        assert_eq!(
+            crate::item_persistence_service::null_mapper_columns(&db, id).await,
+            Vec::<&str>::new()
+        );
     }
 
     #[tokio::test]
@@ -3399,6 +3502,11 @@ mod tests {
         )
         .await
         .expect("biography");
+        // A biography with no birthplace stores the empty list, not NULL (gl-1580).
+        assert_eq!(
+            crate::item_persistence_service::null_mapper_columns(&db, first[0].id).await,
+            Vec::<&str>::new()
+        );
         log_people_writes(&db).await;
 
         let again = repo.update_people(item, &credits).await.expect("again");
