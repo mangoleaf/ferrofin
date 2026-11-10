@@ -1331,6 +1331,7 @@ dependencies = [
  "chrono",
  "ferrofin-model",
  "ferrofin-util",
+ "libc",
  "libsqlite3-sys",
  "rstest",
  "sha2 0.11.1",

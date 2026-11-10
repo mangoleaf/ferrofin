@@ -48,6 +48,11 @@ async fn database_with_unfolded_log(scratch: &Path, database: &Path) {
         .connect()
         .await
         .unwrap();
+    // Ferrofin's own bookkeeping table: what makes it a Ferrofin database.
+    sqlx::query("CREATE TABLE _sqlx_migrations (version BIGINT PRIMARY KEY)")
+        .execute(&mut conn)
+        .await
+        .unwrap();
     sqlx::query("CREATE TABLE Items (Name TEXT NOT NULL)")
         .execute(&mut conn)
         .await
@@ -353,4 +358,138 @@ async fn the_database_directory_keeps_its_mode_and_time_after_the_snapshot() {
     let copy = copy.unwrap();
     assert_eq!(copy.permissions().mode() & 0o777, 0o555);
     assert_eq!(copy.modified().unwrap(), old);
+}
+
+/// A database with `statements` run on it, at `data/jellyfin.db` of a new
+/// source under `scratch`.
+async fn source_with_database(scratch: &Path, statements: &[&str]) -> PathBuf {
+    let source = scratch.join("source");
+    let database = source.join(EXPORTED_DATABASE);
+    std::fs::create_dir_all(database.parent().unwrap()).unwrap();
+    let mut conn = SqliteConnectOptions::new()
+        .filename(&database)
+        .create_if_missing(true)
+        .connect()
+        .await
+        .unwrap();
+    for statement in statements {
+        sqlx::query(sqlx::AssertSqlSafe(*statement))
+            .execute(&mut conn)
+            .await
+            .unwrap();
+    }
+    sqlx::Connection::close(conn).await.unwrap();
+    source
+}
+
+/// The refusal reason of an export of `source`, which must leave the source as
+/// it found it.
+async fn refusal(source: &Path, out: &Path) -> String {
+    let before = files(source);
+    let result = export_data_dir(source, &source.join(EXPORTED_DATABASE), out).await;
+    assert_eq!(files(source), before, "the source is left as it was");
+    match result {
+        Err(ferrofin_db::DbError::ExportRefused { reason }) => reason,
+        other => panic!("expected a refusal, got {other:?}"),
+    }
+}
+
+/// A database the export cannot vouch for is refused, with the cause named,
+/// from the staged copy: not Ferrofin's, inconsistent, or adopted from a
+/// Jellyfin release Ferrofin does not know.
+#[tokio::test]
+async fn a_database_the_export_cannot_vouch_for_is_refused() {
+    let scratch = tempfile::tempdir().unwrap();
+    let source = source_with_database(scratch.path(), &["CREATE TABLE Items (Name TEXT)"]).await;
+    let reason = refusal(&source, &scratch.path().join("out")).await;
+    assert!(reason.contains("not a Ferrofin database"), "{reason}");
+
+    let scratch = tempfile::tempdir().unwrap();
+    let source = source_with_database(
+        scratch.path(),
+        &[
+            "PRAGMA foreign_keys = OFF",
+            "CREATE TABLE _sqlx_migrations (version BIGINT PRIMARY KEY)",
+            "CREATE TABLE Users (Id TEXT PRIMARY KEY)",
+            "CREATE TABLE Devices (UserId TEXT REFERENCES Users(Id))",
+            "INSERT INTO Devices (UserId) VALUES ('gone')",
+        ],
+    )
+    .await;
+    let reason = refusal(&source, &scratch.path().join("out")).await;
+    assert!(reason.contains("foreign-key check"), "{reason}");
+    assert!(reason.contains("Devices"), "{reason}");
+
+    let scratch = tempfile::tempdir().unwrap();
+    let source = source_with_database(
+        scratch.path(),
+        &[
+            "CREATE TABLE _sqlx_migrations (version BIGINT PRIMARY KEY)",
+            r#"CREATE TABLE "__EFMigrationsHistory" ("MigrationId" TEXT PRIMARY KEY, "ProductVersion" TEXT)"#,
+            r#"INSERT INTO "__EFMigrationsHistory" VALUES ('20991231000000_FromTheFuture', '99.0')"#,
+        ],
+    )
+    .await;
+    let reason = refusal(&source, &scratch.path().join("out")).await;
+    assert!(reason.contains("matches no Jellyfin release"), "{reason}");
+}
+
+/// A database damaged anywhere (its header, a middle page, a truncated end)
+/// is refused as damaged, or as failing its integrity check, never with a raw
+/// database error.
+#[tokio::test]
+async fn a_damaged_database_is_refused() {
+    for damage in ["header", "middle", "truncated"] {
+        let scratch = tempfile::tempdir().unwrap();
+        let source = source_with_database(
+            scratch.path(),
+            &[
+                "PRAGMA page_size = 4096",
+                "CREATE TABLE _sqlx_migrations (version BIGINT PRIMARY KEY)",
+                "CREATE TABLE Items (Name TEXT)",
+                "CREATE INDEX IX_Items_Name ON Items (Name)",
+                "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 2000) \
+                 INSERT INTO Items SELECT printf('item %d', i) FROM n",
+            ],
+        )
+        .await;
+        let database = source.join(EXPORTED_DATABASE);
+        let mut bytes = std::fs::read(&database).unwrap();
+        match damage {
+            // Past the magic, which the export checks before anything else.
+            "header" => bytes[16..100].fill(0x5a),
+            "middle" => {
+                let middle = bytes.len() / 2;
+                bytes[middle..middle + 4096].fill(0x5a);
+            }
+            _ => bytes.truncate(bytes.len() / 2),
+        }
+        std::fs::write(&database, bytes).unwrap();
+        let reason = refusal(&source, &scratch.path().join("out")).await;
+        assert!(
+            reason.contains("damaged") || reason.contains("integrity check"),
+            "{damage}: {reason}"
+        );
+    }
+}
+
+/// A write-ahead log damaged before its end, with commits after the damage,
+/// is refused: SQLite would fold it in only up to the damage and drop them.
+#[tokio::test]
+async fn a_log_damaged_before_its_end_is_refused() {
+    let scratch = tempfile::tempdir().unwrap();
+    let source = source(scratch.path()).await;
+    let log = with_suffix(&source.join(EXPORTED_DATABASE), "-wal");
+    let mut bytes = std::fs::read(&log).unwrap();
+    let page_size = u32::from_be_bytes([bytes[8], bytes[9], bytes[10], bytes[11]]) as usize;
+    let frames = (bytes.len() - 32) / (24 + page_size);
+    assert!(frames > 2, "the fixture's log has {frames} frames");
+    // A byte of the first frame's page: every later frame is of the same log.
+    bytes[32 + 24 + 100] ^= 0xff;
+    std::fs::write(&log, bytes).unwrap();
+    let reason = refusal(&source, &scratch.path().join("out")).await;
+    assert!(
+        reason.contains("write-ahead log is damaged at frame 1"),
+        "{reason}"
+    );
 }

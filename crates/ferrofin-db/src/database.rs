@@ -1585,7 +1585,7 @@ impl JellyfinGeneration {
 }
 
 /// The generation whose id set equals `applied` (sorted), if any.
-fn match_generation(applied: &[String]) -> Option<&'static JellyfinGeneration> {
+pub(crate) fn match_generation(applied: &[String]) -> Option<&'static JellyfinGeneration> {
     JELLYFIN_GENERATIONS.iter().find(|g| g.matches(applied))
 }
 
