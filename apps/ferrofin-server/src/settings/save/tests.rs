@@ -631,6 +631,7 @@ fn a_value_outside_a_settings_range_is_refused_naming_it() {
         ("quick_connect_pending_per_ip", json!(0), "from 1 to 1000"),
         ("metrics_sample_interval", json!(0), "from 1 to 300"),
         ("wasm_call_timeout_secs", json!(0), "from 1 to 600"),
+        ("wasm_call_grace_secs", json!(1), "from 2 to 600"),
         ("wasm_memory_limit_mb", json!(0), "from 16 to 4096"),
         ("wasm_event_queue_capacity", json!(0), "from 16 to 65536"),
         ("max_plugin_download_mb", json!(0), "from 8 to 1024"),

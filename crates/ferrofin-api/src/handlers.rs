@@ -953,7 +953,8 @@ pub const VERIFIED_SUBSYSTEMS_AGAINST_EARLIER_PIN: &[(&str, &str)] = &[];
 /// HLS routes;
 /// `video-stream-copy` is whether a transcode job copies the source video and
 /// what dynamic HDR metadata the copy strips, which the HLS and stream routes
-/// share.
+/// share; `recording-postprocessing` is the executable run after a retained
+/// DVR capture, which no HTTP response describes.
 pub const SUBSYSTEM_KEYS: &[&str] = &[
     "query-translation",
     "dto-fields",
@@ -967,6 +968,7 @@ pub const SUBSYSTEM_KEYS: &[&str] = &[
     "trickplay-extraction",
     "trickplay",
     "video-stream-copy",
+    "recording-postprocessing",
 ];
 
 /// One shared subsystem whose Ferrofin implementation was compared against the
@@ -994,6 +996,27 @@ pub struct VerifiedSubsystem {
 /// [`VERIFIED_SUBSYSTEMS_AGAINST_EARLIER_PIN`] names), under the rules of
 /// [`VERIFIED`]. Subsystem rows never count towards the operation parity line.
 pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
+    VerifiedSubsystem {
+        key: "recording-postprocessing",
+        upstream_file: "src/Jellyfin.LiveTv/Recordings/RecordingsManager.cs",
+        upstream_method: "PostProcessRecording",
+        ferrofin: "ferrofin-livetv manager.rs settle_timer (RecordStream: only the retained \
+                   capture branch, after persisting Completed, including a failed capture \
+                   whose retry window is exhausted) -> recording_postprocess.rs run: read \
+                   current LiveTvOptions, skip a blank executable, expand {path} ignoring \
+                   case, launch without a shell, await exit, log spawn/argument errors \
+                   without changing recording success. Compared with RecordStream and \
+                   PostProcessRecording at the pinned v12.4 tag.",
+        date: "2026-11-08",
+        divergences: &[
+            "Arguments use POSIX shell-word quoting without shell execution; the template \
+             is split before replacing {path}, so spaces, quotes and metacharacters in \
+             recording names remain literal argument contents instead of changing parsing.",
+            "Argument values are not logged because a configured template can contain secrets.",
+            "After a configured processor exits, refresh the recording again so changed codecs \
+             and duration are discovered even when its library has no filesystem watcher.",
+        ],
+    },
     VerifiedSubsystem {
         key: "scan-failure-isolation",
         upstream_file: "MediaBrowser.Controller/Entities/TV/Episode.cs",
@@ -1401,7 +1424,8 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
                    require_streamable_item at the stream, HLS, universal audio, subtitle and \
                    attachment routes (StreamingHelpers.GetStreamingState, \
                    SubtitleController.GetSubtitle, VideoAttachmentsController.GetAttachment); \
-                   item_repository.rs \
+                   handlers/media_info.rs playback_info (MediaInfoController.GetPlaybackInfo, \
+                   GetPostedPlaybackInfo); item_repository.rs \
                    resolve_views_with_parent and item_visibility.rs hidden_playlists on \
                    listings that can hold a playlist (Folder.QueryRecursive, \
                    Folder.QueryWithPostFiltering, Playlist.IsVisible); dto_service.rs \
@@ -1438,11 +1462,13 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
              same check, as PlaybackInfo does. A DVR recording has no row here, so it takes \
              Live TV access, IsVisibleStandalone over its entity, the libraries holding its \
              file (found as GetCollectionFolders finds them, ignoring case) and then its \
-             channel, a rule GET and DELETE /LiveTv/Recordings/{recordingId} \
-             now share and GET /LiveTv/Recordings lists by; upstream's recording is a library \
-             item, whose library holds it. On the routes upstream leaves anonymous, no \
-             credential, a token that names nobody and an API key stay so, which binds a \
-             client that sends its token. The legacy /hls/ \
+             channel. GET and POST PlaybackInfo use that rule for DVR ids as well, resolving \
+             sources through the recording media-source manager. GET and DELETE \
+             /LiveTv/Recordings/{recordingId} share the visibility check, and GET \
+             /LiveTv/Recordings lists by it. Upstream addresses recordings by their \
+             library item ids and has no separate DVR id to resolve. On the routes upstream \
+             leaves anonymous, no credential, a token that names nobody and an API key \
+             stay so, which binds a client that sends its token. The legacy /hls/ \
              routes are outside this: they serve a transcode's file by its random name, and \
              the item id selects nothing, as upstream. Deliberate divergence (owner decision \
              2026-10-31, gl-1090).",
@@ -3656,6 +3682,81 @@ pub const VERIFIED: &[Verified] = &[
          Ferrofin's error shape, not upstream's. Fix path: gl-666.",
         ],
         refs: &[],
+    },
+    Verified {
+        method: "get",
+        path: "/Items/{itemId}/RemoteSearch/Subtitles/{language}",
+        upstream_file: "Jellyfin.Api/Controllers/SubtitleController.cs",
+        upstream_method: "SearchRemoteSubtitles",
+        ferrofin: "handlers/subtitles.rs search_remote_subtitles (RequireSubtitleManagement, the \
+               SubtitleManagement policy's UserPermissionRequirement; require_video, \
+               GetItemById<Video>(itemId, User.GetUserId()): a missing, hidden or non-video \
+               item is a 404; isPerfectMatch) → ferrofin-core subtitle_manager.rs \
+               search_subtitles and enrich (SubtitleManager.SearchSubtitles, both overloads: \
+               the language's two-letter code from FindLanguageInfo, the request filled from \
+               a Movie or an Episode and [] for any other kind; every provider that supports \
+               the content type searched, results in provider order, a failing provider \
+               contributing none; Normalize's MD5 provider-name prefix on each id; \
+               isPerfectMatch's hash-match filter applied to every provider's results, \
+               where upstream leaves it to the provider, as the plugin's MatchFilter does) → \
+               ferrofin-providers opensubtitles.rs search (the OpenSubtitles plugin's Search, \
+               v25, compared for the code it derives: GetLanguage's zh-CN and pt-PT, and no \
+               search for a language without a two-letter code)",
+        date: "2026-11-09",
+        divergences: &[
+            "A DVD or Blu-ray rip or an ISO is searched; upstream returns [] unless the \
+         video's VideoType is VideoFile. Fix path: gl-1524.",
+            "The built-in OpenSubtitles provider matches the plugin it ports only in the \
+         language code it derives (GetLanguage's zh and pt rewrites and its refusal of a \
+         language with no code), not in GetLanguage's check against the API's language list; \
+         its parameters, early returns, filters, ordering and result fields differ from \
+         OpenSubtitleDownloader.Search. Fix path: gl-1525.",
+            "The 401 (no or bad token), 403 (no subtitle management) and 404 bodies are \
+         Ferrofin's error shape, not upstream's. Fix path: gl-666.",
+        ],
+        refs: &["access-filtering"],
+    },
+    Verified {
+        method: "get",
+        path: "/Videos/{itemId}/{container}/Attachments/{index}",
+        upstream_file: "Jellyfin.Api/Controllers/VideoAttachmentsController.cs",
+        upstream_method: "GetAttachment",
+        ferrofin: "handlers/hls.rs get_video_attachment → ferrofin-mediaencoding \
+               attachments/extractor.rs get_attachment, extract_attachment \
+               (AttachmentExtractor.GetAttachment, GetAttachmentStream, ExtractAttachment, \
+               ExtractAttachmentInternal) → apps/ferrofin-server media_encoding.rs \
+               MediaSourceManagerResolver, FfmpegAttachmentIo open_file, run_ffmpeg → \
+               handlers/streaming.rs opened_file_response (FileStreamResult)",
+        date: "2026-11-09",
+        divergences: &[
+            "The media source comes from GetStaticMediaSources: upstream's \
+         GetPlaybackMediaSources(item, null, true, false) first re-probes a .strm item (and \
+         one with no main stream), so a .strm whose target changed serves its last probe's \
+         attachments here. Fix path: gl-1519. Its dynamic sources, a channel's tuner \
+         streams, are in the static list here, and list no attachments on either side (a \
+         404).",
+            "A dropped request kills a running extraction and deletes its output (gl-283); \
+         upstream's action passes CancellationToken.None, so its extraction runs to the end \
+         and the next request is served from the cache. Fix path: gl-1517.",
+            "A whitespace-only mediaSourceId is the 400 only once the item is found: upstream's \
+         model validation refuses it before the item is read, so for a missing or hidden \
+         item it is a 400 there and a 404 here. Fix path: gl-1518.",
+            "A nil videoId is a 404, not GetItemById's 400. Fix path: gl-1034.",
+            "A mediaSourceId selects its source in any GUID spelling; upstream compares the N \
+         form, ignoring case. Clients echo the id they were given, and an adopted database \
+         may hold the hyphenated form.",
+            "An attachment MIME type that MediaTypeHeaderValue.Parse refuses (FileStreamResult \
+         parses it) is a 500 upstream. Here it is sent as stored, or as \
+         application/octet-stream, as a missing one is, when no header can carry it (a \
+         control or non-ASCII character). Jellyfin bug not ported.",
+            "An item that cannot have media sources (a series, a box set) is a 404 (no \
+         attachment with that index); upstream's GetStaticMediaSources throws \
+         ArgumentException, a 400. Fix path: gl-397.",
+            "The 400, 404 and 500 bodies have Ferrofin's error shape, not upstream's: a missing \
+         item is NotFound()'s problem details there, a cached file gone before it is opened \
+         the exception middleware's text. Fix path: gl-666.",
+        ],
+        refs: &["access-filtering"],
     },
     Verified {
         method: "get",

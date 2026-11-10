@@ -74,23 +74,6 @@ const ALL_PREFERENCE_KINDS: &[PreferenceKind] = &[
     PreferenceKind::AllowedTags,
 ];
 
-/// A `Guid`-list preference, parsed (C# `GetPreferenceValues<Guid>`); values
-/// that are not GUIDs are skipped, as `Guid.TryParse` skips them.
-///
-/// # Errors
-/// Returns [`ServiceError::Db`] if the query fails.
-pub async fn guid_preference(
-    pool: &sqlx::SqlitePool,
-    user_id: &str,
-    kind: PreferenceKind,
-) -> Result<Vec<uuid::Uuid>, ServiceError> {
-    Ok(get_preference(pool, user_id, kind)
-        .await?
-        .iter()
-        .filter_map(|v| ferrofin_util::guid_extensions::parse_dotnet_guid(v))
-        .collect())
-}
-
 /// [`has_permission`] from the cross-request policy cache ([`Database::user_policy`]), for a read on
 /// a request path. Every committed policy write invalidates the user's entry, so it is as current as
 /// the database for anything outside a transaction.
@@ -122,7 +105,9 @@ pub async fn cached_preference(
     })
 }
 
-/// [`guid_preference`] from the cross-request policy cache, as [`cached_permission`] reads.
+/// A `Guid`-list preference (C# `GetPreferenceValues<Guid>`) from the cross-request policy cache,
+/// as [`cached_permission`] reads. Values that are not GUIDs are skipped, as `Guid.TryParse`
+/// skips them.
 ///
 /// # Errors
 /// Returns [`ServiceError::Db`] if the policy read fails.
@@ -263,6 +248,9 @@ where
 /// `SetPreference`). Inserts the row when absent, updates it otherwise, then
 /// drops the user's cached policy rows ([`Database::invalidate_user_policy`]).
 ///
+/// Only tests call it, `ferrofin-livetv`'s among them, so it is not
+/// `#[cfg(test)]`; production writes go through [`set_preference_tx`].
+///
 /// # Errors
 /// Returns [`ServiceError::Db`] if either statement fails.
 pub async fn set_preference(
@@ -276,24 +264,6 @@ pub async fn set_preference(
     tx.commit().await.map_err(db_err)?;
     db.invalidate_user_policy(user_id);
     Ok(())
-}
-
-/// Whether a list-valued preference contains `needle`, case-insensitively (the
-/// comparison C# `CanAccessDevice` uses for `EnabledDevices`).
-///
-/// # Errors
-/// Returns [`ServiceError::Db`] if the query fails.
-pub async fn preference_contains<'e, E>(
-    executor: E,
-    user_id: &str,
-    kind: PreferenceKind,
-    needle: &str,
-) -> Result<bool, ServiceError>
-where
-    E: SqliteExecutor<'e>,
-{
-    let values = get_preference(executor, user_id, kind).await?;
-    Ok(values.iter().any(|v| v.eq_ignore_ascii_case(needle)))
 }
 
 /// Whether the user is currently within an access schedule, or has none (C#

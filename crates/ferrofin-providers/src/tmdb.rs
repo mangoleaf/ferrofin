@@ -413,7 +413,8 @@ pub struct TmdbDetails {
 /// One credited person from a title's `credits`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TmdbPerson {
-    /// The person's TMDB id — the key for a [`person_details`](TmdbClient::person_details)
+    /// The person's TMDB id — the key for a
+    /// [`person_details_for_language`](TmdbClient::person_details_for_language)
     /// biography lookup.
     pub tmdb_id: i64,
     /// The person's name.
@@ -1375,8 +1376,7 @@ pub struct TmdbClient {
     http: reqwest::Client,
     limiter: RateLimiter,
     /// The key to use when the TMDb settings page names none: Jellyfin's
-    /// built-in project key, or one the operator passed to
-    /// [`with_api_key`](TmdbClient::with_api_key).
+    /// built-in project key.
     api_key: SecretString,
     /// API root, overridable for tests ([`with_base_url`](TmdbClient::with_base_url)).
     base_url: String,
@@ -1463,24 +1463,6 @@ impl TmdbClient {
             http: reqwest::Client::new(),
             limiter: RateLimiter::new("tmdb"),
             api_key: SecretString::from(DEFAULT_API_KEY),
-            base_url: API_BASE.to_owned(),
-            plugin: crate::plugin_config::ConfigSource::new(),
-            image_root: None,
-            last_person: std::sync::Mutex::default(),
-        }
-    }
-
-    /// A client using a user-supplied API key (empty falls back to the built-in).
-    #[must_use]
-    pub fn with_api_key(key: String) -> Self {
-        Self {
-            http: reqwest::Client::new(),
-            limiter: RateLimiter::new("tmdb"),
-            api_key: SecretString::from(if key.is_empty() {
-                DEFAULT_API_KEY.to_owned()
-            } else {
-                key
-            }),
             base_url: API_BASE.to_owned(),
             plugin: crate::plugin_config::ConfigSource::new(),
             image_root: None,
@@ -1591,20 +1573,11 @@ impl TmdbClient {
     }
 
     /// Matches `name`/`year` against TMDB and returns its poster (Primary) and
-    /// backdrop image URLs — whichever the best match provides.
+    /// backdrop image URLs — whichever the best match provides — in the
+    /// resolved metadata `language` (`None`: TMDB's default).
     ///
     /// Returns an empty vec on no match or any network/parse error (best-effort:
     /// artwork acquisition must never abort a scan).
-    pub async fn images_for(
-        &self,
-        kind: TmdbKind,
-        name: &str,
-        year: Option<i32>,
-    ) -> Vec<RemoteImage> {
-        self.images_for_language(kind, name, year, None).await
-    }
-
-    /// Finds title artwork using a resolved metadata language.
     pub async fn images_for_language(
         &self,
         kind: TmdbKind,
@@ -1682,17 +1655,13 @@ impl TmdbClient {
 
     /// The poster and backdrop TMDB picks for the title `tmdb_id` names —
     /// `GET /movie/{id}` or `/tv/{id}`, their `poster_path`/`backdrop_path` —
-    /// in the shape [`images_for`](Self::images_for) returns for a name
-    /// search. What the scan's image pass fetches for an item whose TMDB id
-    /// is known: upstream's `TmdbMovieImageProvider`/`TmdbSeriesImageProvider`
-    /// look an item's artwork up by its id, never by its name, so an item
-    /// identified as another title gets that title's artwork. Empty on a miss
-    /// or any failure.
-    pub async fn images_by_id(&self, kind: TmdbKind, tmdb_id: i64) -> Vec<RemoteImage> {
-        self.images_by_id_for_language(kind, tmdb_id, None).await
-    }
-
-    /// Reads the title's preferred poster/backdrop in the metadata language.
+    /// in the shape [`images_for_language`](Self::images_for_language)
+    /// returns for a name search, in the resolved metadata `language`. What
+    /// the scan's image pass fetches for an item whose TMDB id is known:
+    /// upstream's `TmdbMovieImageProvider`/`TmdbSeriesImageProvider` look an
+    /// item's artwork up by its id, never by its name, so an item identified
+    /// as another title gets that title's artwork. Empty on a miss or any
+    /// failure.
     pub async fn images_by_id_for_language(
         &self,
         kind: TmdbKind,
@@ -1749,13 +1718,8 @@ impl TmdbClient {
     /// `TmdbSeasonProvider` (the credits and the TVDB id) and the season and
     /// episode image providers share. The scan reads the poster from the
     /// season's own `poster_path` and no season video, so only the two the
-    /// season provider maps are appended.
-    pub async fn season_details(&self, tmdb_id: i64, season_number: i32) -> Option<SeasonDetails> {
-        self.season_details_for_language(tmdb_id, season_number, None)
-            .await
-    }
-
-    /// Fetches a season and its episodes in the resolved metadata language.
+    /// season provider maps are appended. The text comes in the resolved
+    /// metadata `language`.
     pub async fn season_details_for_language(
         &self,
         tmdb_id: i64,
@@ -2228,18 +2192,8 @@ impl TmdbClient {
     /// regulars credited in THIS episode, in billing order), then its
     /// `guest_stars` (typed `GuestStar`), then the wanted `crew`. `people` is
     /// `None` when the answer carries no credits; the request's failure
-    /// count records a failed one.
-    pub async fn episode_extras(
-        &self,
-        series: i64,
-        season: i32,
-        episode: i32,
-    ) -> Option<EpisodeExtras> {
-        self.episode_extras_for_language(series, season, episode, None)
-            .await
-    }
-
-    /// Episode credits and trailers in the resolved metadata language.
+    /// count records a failed one. The trailers and credits come in the
+    /// resolved metadata `language`.
     pub async fn episode_extras_for_language(
         &self,
         series: i64,
@@ -2692,15 +2646,11 @@ impl TmdbClient {
         Some(response)
     }
 
-    /// Fetches a person's biography via `/person/{id}`, or `None` on any
-    /// network/parse error or when TMDB has no biographical text.
-    pub async fn person_details(&self, tmdb_id: i64) -> Option<TmdbPersonDetails> {
-        self.person_details_for_language(tmdb_id, None).await
-    }
-
-    /// Fetches the biography in the resolved item/server metadata language.
-    /// The caller normalizes regional codes with the item's country, as
-    /// `TmdbPersonProvider.GetMetadata` does before `GetPersonAsync`.
+    /// Fetches a person's biography via `/person/{id}` in the resolved
+    /// item/server metadata language, or `None` on any network/parse error or
+    /// when TMDB has no biographical text. The caller normalizes regional
+    /// codes with the item's country, as `TmdbPersonProvider.GetMetadata` does
+    /// before `GetPersonAsync`.
     pub async fn person_details_for_language(
         &self,
         tmdb_id: i64,
@@ -2883,12 +2833,16 @@ mod tests {
         ])
         .await;
         let client = TmdbClient::new().with_base_url(&server.base_url);
-        let (details, failures) =
-            crate::rate_limit::count_request_failures(client.season_details(1399, 1)).await;
+        let (details, failures) = crate::rate_limit::count_request_failures(
+            client.season_details_for_language(1399, 1, None),
+        )
+        .await;
         assert!(details.is_none());
         assert_eq!(failures, 1);
-        let (details, failures) =
-            crate::rate_limit::count_request_failures(client.season_details(1399, 2)).await;
+        let (details, failures) = crate::rate_limit::count_request_failures(
+            client.season_details_for_language(1399, 2, None),
+        )
+        .await;
         assert!(details.is_some());
         assert_eq!(failures, 0);
     }
@@ -2916,7 +2870,10 @@ mod tests {
         assert_eq!(series.tags, ["drama"]);
         assert_eq!(series.tvdb_id.as_deref(), Some("3"));
         assert_eq!(series.tvrage_id.as_deref(), Some("4"));
-        let extras = client.episode_extras(2, 1, 1).await.unwrap();
+        let extras = client
+            .episode_extras_for_language(2, 1, 1, None)
+            .await
+            .unwrap();
         assert_eq!(
             extras.provider_ids,
             [
@@ -2933,7 +2890,7 @@ mod tests {
         // A successful but incomplete response must not clear stored credits.
         assert!(
             client
-                .episode_extras(2, 1, 9)
+                .episode_extras_for_language(2, 1, 9, None)
                 .await
                 .unwrap()
                 .people
@@ -3532,7 +3489,7 @@ mod tests {
             MockServer::start(vec![("/episode/", format!(r#"{{"credits":{body}}}"#))]).await;
         let client = TmdbClient::new().with_base_url(&server.base_url);
         let people = client
-            .episode_extras(1399, 1, 1)
+            .episode_extras_for_language(1399, 1, 1, None)
             .await
             .and_then(|extras| extras.people)
             .expect("credits fetched");
@@ -3764,7 +3721,7 @@ mod tests {
         let client = TmdbClient::new().with_base_url(&server.base_url);
 
         let people = client
-            .episode_extras(1399, 1, 1)
+            .episode_extras_for_language(1399, 1, 1, None)
             .await
             .and_then(|extras| extras.people)
             .expect("credits fetched");
@@ -3879,14 +3836,6 @@ mod tests {
             certification(TmdbKind::Series, None, Some(ratings), Some(country)).as_deref(),
             Some(expected)
         );
-    }
-
-    #[test]
-    fn empty_user_key_falls_back_to_builtin() {
-        let c = TmdbClient::with_api_key(String::new());
-        assert_eq!(c.api_key.expose_secret(), DEFAULT_API_KEY);
-        let c = TmdbClient::with_api_key("mykey".to_owned());
-        assert_eq!(c.api_key.expose_secret(), "mykey");
     }
 
     #[test]

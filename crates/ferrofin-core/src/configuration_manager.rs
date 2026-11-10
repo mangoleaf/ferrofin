@@ -694,9 +694,9 @@ impl FerrofinServerConfigurationManager {
         (*self.snapshot_shared()).clone()
     }
 
-    /// The shared application paths as the concrete type (used by sibling
-    /// managers in this crate that need the extra accessors — trickplay/plugins
-    /// paths — beyond the trait surface).
+    /// The shared application paths as the concrete type, for tests that need
+    /// its accessors beyond the trait surface.
+    #[cfg(test)]
     #[must_use]
     pub fn concrete_paths(&self) -> Arc<FerrofinServerApplicationPaths> {
         Arc::clone(&self.paths)

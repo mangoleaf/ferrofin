@@ -127,6 +127,12 @@ Conventions:
 ### File Transformation
 - Ferrofin files: `crates/ferrofin-extensions/src/file_transformation.rs`,
   vendored assets `crates/ferrofin-extensions/assets/filetransformation/`.
+- Ahead of the pin: the `/web` response for a transformed file (`transform_web_file` in
+  `apps/ferrofin-server/src/lib.rs`) follows `Infrastructure/FileTransformationMiddleware.cs`
+  @ `0900de8f1`: an `ETag` of the first 8 bytes of SHA-256 over the transformed bytes,
+  `Cache-Control: no-cache`, no `Last-Modified`, and an equal `If-None-Match` answered with
+  `304`. At `f4f01c3` the static-file middleware derived the `ETag` from the source's
+  modification time and the output's length, so a same-length change could be served stale.
 - Accepted divergences:
   - **A failing callback leaves the file as it was.** The plugin writes a callback's body over
     the file whatever its status (`TransformationHelper.ApplyTransformation`), so an error

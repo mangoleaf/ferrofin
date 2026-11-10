@@ -20,6 +20,11 @@ use ferrofin_wasm::capabilities::{
 mod common;
 use common::{EnabledStub, OneMovieLibrary, RecordingSegments, one_shot_http};
 
+/// A guest-call deadline no test here reaches.
+fn far_deadline() -> std::time::Instant {
+    std::time::Instant::now() + std::time::Duration::from_secs(600)
+}
+
 fn client() -> ferrofin_wasm::capabilities::GuestHttp {
     ferrofin_wasm::capabilities::GuestHttp::new(std::time::Duration::from_secs(5)).unwrap()
 }
@@ -131,6 +136,7 @@ async fn query_items_maps_filters_in_and_the_projection_out() {
     let rows = tokio::task::spawn_blocking(move || {
         query_items(
             &cx,
+            far_deadline(),
             &ItemQuery {
                 kinds: vec!["Movie".to_owned()],
                 parent_id: None,
@@ -183,6 +189,7 @@ async fn query_items_rejects_unknown_kinds() {
     let err = tokio::task::spawn_blocking(move || {
         query_items(
             &cx,
+            far_deadline(),
             &ItemQuery {
                 kinds: vec!["Blockbuster".to_owned()],
                 parent_id: None,
@@ -729,11 +736,12 @@ async fn user_scoped_query_applies_user_and_enriches_summaries() {
     query.is_favorite = Some(false);
     query.sort_by = Some("DatePlayed".to_owned());
     query.sort_descending = true;
-    let items =
-        tokio::task::spawn_blocking(move || ferrofin_wasm::capabilities::query_items(&cx, &query))
-            .await
-            .unwrap()
-            .expect("user-scoped query");
+    let items = tokio::task::spawn_blocking(move || {
+        ferrofin_wasm::capabilities::query_items(&cx, far_deadline(), &query)
+    })
+    .await
+    .unwrap()
+    .expect("user-scoped query");
 
     // Per-user enrichment came from the batch read.
     assert_eq!(items.len(), 1);
@@ -756,11 +764,12 @@ async fn user_scoped_query_applies_user_and_enriches_summaries() {
     let (cx, _) = recorded_query_rig();
     let mut bad = base_item_query();
     bad.sort_by = Some("Bogus".to_owned());
-    let err =
-        tokio::task::spawn_blocking(move || ferrofin_wasm::capabilities::query_items(&cx, &bad))
-            .await
-            .unwrap()
-            .unwrap_err();
+    let err = tokio::task::spawn_blocking(move || {
+        ferrofin_wasm::capabilities::query_items(&cx, far_deadline(), &bad)
+    })
+    .await
+    .unwrap()
+    .unwrap_err();
     assert!(err.contains("sort-by"), "{err}");
 }
 
@@ -768,11 +777,12 @@ async fn user_scoped_query_applies_user_and_enriches_summaries() {
 async fn next_up_projects_through_the_entity_path() {
     let (cx, _library) = recorded_query_rig();
     let user = uuid::Uuid::from_u128(0x5678).to_string();
-    let items =
-        tokio::task::spawn_blocking(move || ferrofin_wasm::capabilities::next_up(&cx, &user, 5))
-            .await
-            .unwrap()
-            .expect("next-up");
+    let items = tokio::task::spawn_blocking(move || {
+        ferrofin_wasm::capabilities::next_up(&cx, far_deadline(), &user, 5)
+    })
+    .await
+    .unwrap()
+    .expect("next-up");
     assert_eq!(items.len(), 1, "the stub queue's one episode came back");
     assert_eq!(items[0].name, "Big Buck Bunny");
     assert_eq!(items[0].played, Some(true), "user enrichment applied");
@@ -780,7 +790,7 @@ async fn next_up_projects_through_the_entity_path() {
     // A malformed user id errors cleanly.
     let (cx, _) = recorded_query_rig();
     let err = tokio::task::spawn_blocking(move || {
-        ferrofin_wasm::capabilities::next_up(&cx, "not-a-uuid", 5)
+        ferrofin_wasm::capabilities::next_up(&cx, far_deadline(), "not-a-uuid", 5)
     })
     .await
     .unwrap()
@@ -862,18 +872,18 @@ async fn analysis_capabilities_cap_resolve_and_extract() {
 
     tokio::task::spawn_blocking(move || {
         // Over the 60 s window cap.
-        let err = extract_audio(&cx, MEM, &window(61)).unwrap_err();
+        let err = extract_audio(&cx, far_deadline(), MEM, &window(61)).unwrap_err();
         assert!(err.contains("60"), "{err}");
         // Over the byte budget (tiny memory limit).
-        let err = extract_audio(&cx, 1024, &window(10)).unwrap_err();
+        let err = extract_audio(&cx, far_deadline(), 1024, &window(10)).unwrap_err();
         assert!(err.contains("budget"), "{err}");
         // Unknown item id.
         let mut w = window(10);
         w.item_id = uuid::Uuid::from_u128(0xdead).to_string();
-        let err = extract_audio(&cx, MEM, &w).unwrap_err();
+        let err = extract_audio(&cx, far_deadline(), MEM, &w).unwrap_err();
         assert!(err.contains("no such"), "{err}");
         // Happy path: resolved via the library, decoded by the stub.
-        let chunk = extract_audio(&cx, MEM, &window(10)).expect("extract");
+        let chunk = extract_audio(&cx, far_deadline(), MEM, &window(10)).expect("extract");
         assert!(!chunk.samples.is_empty(), "{:?}", chunk.samples);
         assert_eq!(chunk.spec.sample_rate, 11_025);
 
@@ -886,19 +896,25 @@ async fn analysis_capabilities_cap_resolve_and_extract() {
             max_dimension: dim,
             format: FrameFormat::Gray8,
         };
-        let err = extract_frames(&cx, &req(17, 128)).unwrap_err();
+        let err = extract_frames(&cx, far_deadline(), &req(17, 128)).unwrap_err();
         assert!(err.contains("16"), "{err}");
-        let frames = extract_frames(&cx, &req(2, 9999)).expect("frames");
+        let frames = extract_frames(&cx, far_deadline(), &req(2, 9999)).expect("frames");
         assert_eq!(frames.len(), 2);
         assert_eq!(frames[0].width, 320, "dimension clamped to the cap");
 
         // Subtitle extraction rides the same item-addressed path.
-        let srt =
-            ferrofin_wasm::capabilities::extract_subtitle_track(&cx, 10 * 1024 * 1024, ITEM, 0)
-                .expect("srt");
+        let srt = ferrofin_wasm::capabilities::extract_subtitle_track(
+            &cx,
+            far_deadline(),
+            10 * 1024 * 1024,
+            ITEM,
+            0,
+        )
+        .expect("srt");
         assert!(String::from_utf8_lossy(&srt).contains("stream 0"));
         let err = ferrofin_wasm::capabilities::extract_subtitle_track(
             &cx,
+            far_deadline(),
             10 * 1024 * 1024,
             &uuid::Uuid::from_u128(0xdead).to_string(),
             0,
@@ -907,11 +923,11 @@ async fn analysis_capabilities_cap_resolve_and_extract() {
         assert!(err.contains("no such"), "{err}");
 
         // media-info: duration + streams + container.
-        let info = media_info(&cx, ITEM).expect("info");
+        let info = media_info(&cx, far_deadline(), ITEM).expect("info");
         assert_eq!(info.duration_ticks, 5_000_000_000);
         assert!(info.has_audio && info.has_video);
         assert_eq!(info.container, "mkv");
-        let err = media_info(&cx, "junk").unwrap_err();
+        let err = media_info(&cx, far_deadline(), "junk").unwrap_err();
         assert!(err.contains("UUID"), "{err}");
     })
     .await

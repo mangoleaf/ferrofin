@@ -43,7 +43,7 @@ use uuid::Uuid;
 use crate::auth::RequireAuth;
 use crate::error::ApiError;
 use crate::extract::{DotnetGuid, Query};
-use crate::handlers::streaming::require_streamable_item;
+use crate::handlers::streaming::{opened_file_response, require_streamable_item};
 use crate::state::AppState;
 
 /// The MIME type for an HLS playlist (`.m3u8`), matching Jellyfin's
@@ -967,8 +967,9 @@ async fn stop_encoding_process(
 ///
 /// Port of `VideoAttachmentsController.GetAttachment`: resolves the item, extracts
 /// attachment `index` from `mediaSourceId` via the [`AttachmentExtractor`], and
-/// returns its bytes with the attachment's MIME type (default
-/// `application/octet-stream`). A missing item/attachment is `404`.
+/// streams the cached file with the attachment's MIME type (default
+/// `application/octet-stream`), as its `FileStreamResult` does. A missing
+/// item/attachment is `404`.
 async fn get_video_attachment(
     State(state): State<AppState>,
     axum::Extension(auth): axum::Extension<ferrofin_traits::options::AuthorizationInfo>,
@@ -992,16 +993,15 @@ async fn get_video_attachment(
         .attachments
         .get_attachment(video_id, &media_source_id, index)
         .await?;
+    // A type no header can carry falls back as a missing one does. Upstream's
+    // `FileStreamResult` parses it (`MediaTypeHeaderValue.Parse`) and answers
+    // 500 for one it refuses (Jellyfin bug not ported).
     let mime = extracted
         .attachment
         .mime_type
-        .filter(|m| !m.trim().is_empty())
+        .filter(|m| !m.trim().is_empty() && header::HeaderValue::from_str(m).is_ok())
         .unwrap_or_else(|| "application/octet-stream".to_owned());
-    let mut response = (StatusCode::OK, Body::from(extracted.data)).into_response();
-    if let Ok(value) = header::HeaderValue::from_str(&mime) {
-        response.headers_mut().insert(header::CONTENT_TYPE, value);
-    }
-    Ok(response)
+    opened_file_response(extracted.file, &mime)
 }
 
 /// Registers this controller's real routes onto `router`.

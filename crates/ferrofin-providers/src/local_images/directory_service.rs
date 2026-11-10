@@ -208,7 +208,6 @@ fn fs_metadata_from(path: &Path, metadata: &std::fs::Metadata) -> FileSystemMeta
         extension,
         length,
         last_write_time_utc: None,
-        creation_time_utc: None,
         is_directory,
     }
 }

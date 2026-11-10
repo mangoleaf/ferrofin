@@ -2582,7 +2582,7 @@ mod tests {
             virtual_folders: Arc::new(
                 ferrofin_traits::stubs::virtual_folders::DisabledVirtualFolderManager,
             ),
-            chapters: Arc::new(ferrofin_traits::stubs::chapters::NoChapters),
+            chapters: Arc::new(crate::tests::NoChapters),
             users: Arc::new(ferrofin_core::FerrofinUserManager::new(db.clone())),
             external_identities: Arc::new(
                 ferrofin_core::external_identity_repository::FerrofinExternalIdentityStore::new(

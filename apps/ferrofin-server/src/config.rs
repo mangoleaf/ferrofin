@@ -194,6 +194,7 @@ struct FileConfig {
     row_cache_ttl_secs: Option<u32>,
     trickplay_concurrency: Option<CountOrAuto>,
     wasm_call_timeout_secs: Option<u32>,
+    wasm_call_grace_secs: Option<u32>,
     wasm_memory_limit_mb: Option<u32>,
     wasm_event_queue_capacity: Option<u32>,
     wasm_private_http_allow: Option<String>,
@@ -744,6 +745,15 @@ pub struct Config {
     /// `config.toml` > default, clamped to [`WASM_CALL_TIMEOUT_SECS_RANGE`]
     /// with a warning; zero is treated as unset.
     pub wasm_call_timeout_secs: Option<u32>,
+
+    /// How long past a WASM plugin call's deadline its caller waits before
+    /// the call is lost (stuck in a host function) and the plugin disabled
+    /// until restart, in seconds. `None` = the 10 s default
+    /// (`ferrofin_wasm::WasmSettings`). Resolved
+    /// `FERROFIN_WASM_CALL_GRACE_SECS` env > `wasm_call_grace_secs` in
+    /// `config.toml` > default, clamped to [`WASM_CALL_GRACE_SECS_RANGE`]
+    /// with a warning; zero is treated as unset.
+    pub wasm_call_grace_secs: Option<u32>,
 
     /// Per-plugin linear-memory cap for WASM plugins, in MiB. `None` = the
     /// 128 MiB default (a `memory.grow` ceiling, never a reservation).
@@ -1341,6 +1351,15 @@ impl Config {
                 "seconds",
                 Zero::Default,
             ),
+            wasm_call_grace_secs: resolve_clamped_or_unset(
+                env,
+                "FERROFIN_WASM_CALL_GRACE_SECS",
+                "wasm_call_grace_secs",
+                file.wasm_call_grace_secs,
+                &WASM_CALL_GRACE_SECS_RANGE,
+                "seconds",
+                Zero::Default,
+            ),
             wasm_memory_limit_mb: resolve_clamped_or_unset(
                 env,
                 "FERROFIN_WASM_MEMORY_LIMIT_MB",
@@ -1736,6 +1755,7 @@ impl Config {
             row_cache_ttl_secs: None,
             trickplay_concurrency: None,
             wasm_call_timeout_secs: None,
+            wasm_call_grace_secs: None,
             wasm_memory_limit_mb: None,
             wasm_event_queue_capacity: None,
             wasm_private_http_allow: None,
@@ -1840,6 +1860,13 @@ pub const SESSION_IDLE_HOURS_RANGE: RangeInclusive<u32> = 1..=168;
 
 /// The seconds one WASM plugin call may run (`wasm_call_timeout_secs`).
 pub const WASM_CALL_TIMEOUT_SECS_RANGE: RangeInclusive<u32> = 1..=600;
+
+/// The seconds past a WASM plugin call's deadline before the call is lost
+/// (`wasm_call_grace_secs`): from 2, above the 1 s epoch tick, since a call
+/// within its budget ends within about a tick of its deadline (the ticker
+/// can run late, and the trap and reply take their time); to 600, the
+/// longest a call may run.
+pub const WASM_CALL_GRACE_SECS_RANGE: RangeInclusive<u32> = 2..=600;
 
 /// The MiB of memory one WASM plugin may grow to (`wasm_memory_limit_mb`).
 pub const WASM_MEMORY_LIMIT_MB_RANGE: RangeInclusive<u32> = 16..=4_096;
@@ -4103,6 +4130,7 @@ mod tests {
         // Unset ⇒ None (ferrofin-wasm applies its 30/128/256 defaults).
         let cfg = Config::load_from(Cli::default(), &FakeEnv::new()).unwrap();
         assert_eq!(cfg.wasm_call_timeout_secs, None);
+        assert_eq!(cfg.wasm_call_grace_secs, None);
         assert_eq!(cfg.wasm_memory_limit_mb, None);
         assert_eq!(cfg.wasm_event_queue_capacity, None);
         assert_eq!(cfg.max_plugin_download_mb, None);
@@ -4145,10 +4173,12 @@ mod tests {
         // Env values apply.
         let env = FakeEnv::new()
             .with("FERROFIN_WASM_CALL_TIMEOUT_SECS", "10")
+            .with("FERROFIN_WASM_CALL_GRACE_SECS", "20")
             .with("FERROFIN_WASM_MEMORY_LIMIT_MB", "64")
             .with("FERROFIN_WASM_EVENT_QUEUE_CAPACITY", "32");
         let cfg = Config::load_from(Cli::default(), &env).unwrap();
         assert_eq!(cfg.wasm_call_timeout_secs, Some(10));
+        assert_eq!(cfg.wasm_call_grace_secs, Some(20));
         assert_eq!(cfg.wasm_memory_limit_mb, Some(64));
         assert_eq!(cfg.wasm_event_queue_capacity, Some(32));
 
@@ -4157,7 +4187,7 @@ mod tests {
         let toml = dir.path().join("config.toml");
         std::fs::write(
             &toml,
-            "wasm_call_timeout_secs = 5\nwasm_memory_limit_mb = 256\n",
+            "wasm_call_timeout_secs = 5\nwasm_call_grace_secs = 30\nwasm_memory_limit_mb = 256\n",
         )
         .unwrap();
         let env = FakeEnv::new().with("FERROFIN_WASM_CALL_TIMEOUT_SECS", "15");
@@ -4167,7 +4197,20 @@ mod tests {
         };
         let cfg = Config::load_from(cli, &env).unwrap();
         assert_eq!(cfg.wasm_call_timeout_secs, Some(15), "env beats file");
+        assert_eq!(cfg.wasm_call_grace_secs, Some(30), "file applies");
         assert_eq!(cfg.wasm_memory_limit_mb, Some(256), "file applies");
+
+        // The grace never drops to the 1 s epoch tick: 1 is clamped to 2.
+        let env = FakeEnv::new().with("FERROFIN_WASM_CALL_GRACE_SECS", "1");
+        let cfg = Config::load_from(Cli::default(), &env).unwrap();
+        assert_eq!(cfg.wasm_call_grace_secs, Some(2));
+        assert!(
+            cfg.load_warnings
+                .iter()
+                .any(|w| w.contains("FERROFIN_WASM_CALL_GRACE_SECS") && w.contains("using 2")),
+            "{:?}",
+            cfg.load_warnings
+        );
 
         // The private-HTTP allowlist resolves env > file, empty = unset.
         let cfg = Config::load_from(Cli::default(), &FakeEnv::new()).unwrap();
@@ -4458,6 +4501,7 @@ row_cache_ttl_secs = 10
             "scan_probe_concurrency",
             "playback_metrics_queue",
             "wasm_call_timeout_secs",
+            "wasm_call_grace_secs",
             "wasm_memory_limit_mb",
             "wasm_event_queue_capacity",
             "max_plugin_download_mb",
@@ -4484,6 +4528,7 @@ row_cache_ttl_secs = 10
             cfg.scan_probe_concurrency,
             cfg.playback_metrics_queue,
             cfg.wasm_call_timeout_secs,
+            cfg.wasm_call_grace_secs,
             cfg.wasm_memory_limit_mb,
             cfg.wasm_event_queue_capacity,
             cfg.max_plugin_download_mb,
@@ -4547,6 +4592,8 @@ row_cache_ttl_secs = 10
     /// Every default lies inside its setting's range, wherever the default
     /// is defined.
     #[test]
+    // One row per ranged setting: the table is the test.
+    #[allow(clippy::too_many_lines)]
     fn every_default_lies_inside_its_range() {
         let count = |n: usize| u32::try_from(n).expect("a u32");
         let secs = |d: std::time::Duration| u32::try_from(d.as_secs()).expect("a u32");
@@ -4602,6 +4649,11 @@ row_cache_ttl_secs = 10
                 "wasm_call_timeout_secs",
                 wasm.call_timeout_secs,
                 WASM_CALL_TIMEOUT_SECS_RANGE,
+            ),
+            (
+                "wasm_call_grace_secs",
+                wasm.call_grace_secs,
+                WASM_CALL_GRACE_SECS_RANGE,
             ),
             (
                 "wasm_memory_limit_mb",

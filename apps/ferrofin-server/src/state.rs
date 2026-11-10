@@ -711,6 +711,7 @@ pub async fn build_app_state(
             config.wasm_event_queue_capacity,
             config.wasm_private_http_allow.as_deref(),
         )
+        .with_call_grace_secs(config.wasm_call_grace_secs)
         .with_state_limit_mb(config.wasm_state_limit_mb)
         .with_image_download_mb(config.wasm_image_download_mb)
         .with_image_timeout_secs(config.wasm_image_timeout_secs)
@@ -2029,6 +2030,7 @@ pub async fn build_app_state(
                 config.wasm_event_queue_capacity,
                 config.wasm_private_http_allow.as_deref(),
             )
+            .with_call_grace_secs(config.wasm_call_grace_secs)
             .with_state_limit_mb(config.wasm_state_limit_mb)
             .with_image_download_mb(config.wasm_image_download_mb)
             .with_image_timeout_secs(config.wasm_image_timeout_secs)

@@ -1,5 +1,7 @@
 //! gl-1015, gl-1056: a blur hash, a thumbnail, a collage or the splashscreen
-//! drawn from a large JPEG never builds its full-resolution bitmap.
+//! drawn from a large JPEG never builds its full-resolution bitmap; gl-1481:
+//! an original-size WebP of it builds that bitmap once and makes no Rust-side
+//! copy of it.
 //!
 //! A photo library uses each photo as its own Primary image, so a scan
 //! blur-hashes every photo, draws the library's tile from them, and the
@@ -99,7 +101,7 @@ fn write_photo(path: &std::path::Path, width: u16, height: u16) {
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn a_large_jpeg_is_never_decoded_at_full_size() {
+async fn a_large_jpeg_is_decoded_no_larger_than_its_output_needs() {
     const WIDTH: u16 = 2400;
     const HEIGHT: u16 = 1600;
     // The bitmap a full decode builds: 3 bytes a pixel.
@@ -161,6 +163,54 @@ async fn a_large_jpeg_is_never_decoded_at_full_size() {
     }
 
     collages_and_the_splashscreen_shrink_a_poster_from_a_reduced_decode(&encoder, dir.path()).await;
+    an_original_size_webp_encodes_the_decoded_bitmap(&encoder, dir.path(), &input, FULL_BITMAP)
+        .await;
+}
+
+/// gl-1481: a WebP at the photo's own size (a `format=webp` request with no
+/// size) encodes the decoded RGB bitmap as it is. A same-size resize used to
+/// copy it whole, and the WebP branch converted it to an RGBA copy first:
+/// 7 bytes a pixel once the decode itself was dropped. libwebp's own buffers
+/// come from C's allocator, which this count does not see.
+async fn an_original_size_webp_encodes_the_decoded_bitmap(
+    encoder: &ImageCrateEncoder,
+    dir: &std::path::Path,
+    input: &str,
+    full_bitmap: usize,
+) {
+    let output = dir.join("original.webp");
+    let output = output.to_str().expect("utf-8 path").to_owned();
+    let options = ImageProcessingOptions {
+        supported_output_formats: vec![ImageFormat::Webp],
+        ..Default::default()
+    };
+    let baseline = start_peak();
+    let written = encoder
+        .encode_image(
+            input,
+            Utc::now(),
+            &output,
+            false,
+            None,
+            80,
+            &options,
+            ImageFormat::Webp,
+        )
+        .await
+        .expect("encode");
+    let peak = peak_since(baseline);
+    assert_eq!(written, output);
+    assert_eq!(
+        encoder.get_image_size(&output).await.expect("probe"),
+        encoder.get_image_size(input).await.expect("probe")
+    );
+    // The decode's bitmap and its decoder's buffers. A same-size copy (3 bytes
+    // a pixel) or an RGBA copy (4) beside it would take the peak past one and
+    // a half times the bitmap.
+    assert!(
+        peak < full_bitmap * 3 / 2,
+        "an original-size WebP peaked at {peak} bytes, the bitmap is {full_bitmap}"
+    );
 }
 
 /// gl-1056: the collage cells and the splashscreen's tiles a 2000x3000 poster

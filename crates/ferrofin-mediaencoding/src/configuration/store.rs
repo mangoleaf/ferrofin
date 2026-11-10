@@ -1,7 +1,9 @@
-//! Port of `EncodingConfigurationStore` + `EncodingConfigurationFactory`.
+//! Port of `EncodingConfigurationStore`. Upstream's `EncodingConfigurationFactory`
+//! only hands the store to reflection-based registration; the composition root
+//! registers it directly instead.
 
 use ferrofin_common::configuration::{
-    ConfigurationFactory, ConfigurationStore, ConfigurationValidationError, ValidatingConfiguration,
+    ConfigurationStore, ConfigurationValidationError, ValidatingConfiguration,
 };
 use ferrofin_model::configuration::EncodingOptions;
 
@@ -111,30 +113,9 @@ impl<D: DirChecker> ValidatingConfiguration for EncodingConfigurationStore<D> {
     }
 }
 
-/// Provides the encoding configuration store to the host at startup.
-///
-/// Port of `EncodingConfigurationFactory`.
-#[derive(Debug, Clone, Copy, Default)]
-pub struct EncodingConfigurationFactory;
-
-impl ConfigurationFactory for EncodingConfigurationFactory {
-    /// Returns the single encoding [`ConfigurationStore`].
-    ///
-    /// Port of `EncodingConfigurationFactory.GetConfigurations`.
-    fn configurations(&self) -> Vec<ConfigurationStore> {
-        vec![ConfigurationStore {
-            key: ENCODING_KEY.to_owned(),
-            type_key: ENCODING_TYPE_KEY.to_owned(),
-        }]
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{
-        ConfigurationFactory, DirChecker, ENCODING_KEY, EncodingConfigurationFactory,
-        EncodingConfigurationStore, ValidatingConfiguration,
-    };
+    use super::{DirChecker, EncodingConfigurationStore, ValidatingConfiguration};
     use ferrofin_model::configuration::EncodingOptions;
 
     /// A fake [`DirChecker`] answering from a fixed allow-list.
@@ -155,10 +136,12 @@ mod tests {
     }
 
     #[test]
-    fn factory_exposes_encoding_store() {
-        let stores = EncodingConfigurationFactory.configurations();
-        assert_eq!(stores.len(), 1);
-        assert_eq!(stores[0].key, ENCODING_KEY);
+    fn store_describes_the_encoding_key() {
+        let store = EncodingConfigurationStore::new(FakeDirs(vec![])).store();
+        assert_eq!(
+            store.key, "encoding",
+            "the key the composition root registers"
+        );
     }
 
     #[test]

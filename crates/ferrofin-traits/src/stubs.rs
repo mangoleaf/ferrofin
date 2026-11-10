@@ -15,13 +15,11 @@
 //! (test constructors, a host without ffmpeg): [`NoopLibraryMonitor`],
 //! [`DisabledVirtualFolderManager`], and the disabled HLS stream manager,
 //! subtitle encoder and attachment extractor in [`hls_stream`]. The composition
-//! root replaces each with the real one. The chapter-less [`chapters`] manager
-//! is for extension contexts built without the database (extension tests).
+//! root replaces each with the real one.
 //!
 //! Every trait is object-safe and carries a `_assert_object_safe_*` assertion.
 
 pub mod channels;
-pub mod chapters;
 pub mod hls_stream;
 pub mod library_monitor;
 pub mod live_tv;

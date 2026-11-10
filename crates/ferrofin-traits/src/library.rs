@@ -179,18 +179,6 @@ pub struct SearchResult {
     pub score: f32,
 }
 
-/// A search hint (an item row) with the term that matched it.
-///
-/// Port of `MediaBrowser.Controller.Library.SearchHintInfo`; the domain
-/// `BaseItem Item` becomes a [`BaseItemEntity`] row.
-#[derive(Debug, Clone)]
-pub struct SearchHintInfo {
-    /// The matched item row.
-    pub item: BaseItemEntity,
-    /// The term that matched.
-    pub matched_term: String,
-}
-
 /// A recommendation category derived from a baseline item.
 ///
 /// Port of `MediaBrowser.Controller.Library.SimilarItemsRecommendation`; the
@@ -441,10 +429,11 @@ pub trait LibraryManager: Send + Sync {
     }
 
     /// The ids of `ids` that pass the parental check for `user`, in input
-    /// order: C# `BaseItem.IsParentalAllowed(user, skipAllowedTagsCheck)`, the
-    /// rating, unrated and tag rules with no folder or library access check.
-    /// The DTO service filters a page's cast through it, as `AttachPeople`
-    /// does with `Person.IsVisible(user)`. The default applies the stricter
+    /// order: C# `BaseItem.IsParentalAllowed(user, skipAllowedTagsCheck: true)`,
+    /// the rating, unrated and blocked-tag rules with no allowed-tags, folder
+    /// or library access check. The DTO service filters a page's cast through
+    /// it, as `AttachPeople` does with `Person.IsVisible(user)`, which always
+    /// skips the allowed-tags check. The default applies the stricter
     /// standalone check ([`Self::get_visible_item_ids`]), so an
     /// implementation that does not override it never shows a person the user
     /// may not see.
@@ -452,7 +441,6 @@ pub trait LibraryManager: Send + Sync {
         &self,
         ids: &[Uuid],
         user: &UserEntity,
-        _skip_allowed_tags: bool,
     ) -> Result<Vec<Uuid>, ServiceError> {
         self.get_visible_item_ids(ids, user).await
     }

@@ -20,7 +20,7 @@
 //!
 //! Ferrofin's query paths keep using the `FerrofinPlaylists` /
 //! `FerrofinPlaylistShares` tables as a **derived cache**; every ownership or
-//! share mutation writes through to `Data` via [`sync_container_data`], a
+//! share mutation writes through to `Data` via `sync_container_data_in`, a
 //! whole-row save of a playlist the cache holds rewrites those keys from it in
 //! the save's transaction, and [`reconcile_playlist_permissions`] rebuilds the
 //! cache from `Data` at startup.
@@ -414,6 +414,7 @@ pub fn fill_series_air(
 /// The `Data` keys a photo's EXIF fields round-trip through, in the C# `Photo`
 /// property spelling — the same names Jellyfin serializes, so a database
 /// adopted in either direction keeps its photo metadata.
+#[cfg(test)]
 pub const PHOTO_EXIF_KEYS: [&str; 12] = [
     "CameraMake",
     "CameraModel",
@@ -617,6 +618,7 @@ pub fn read_data_i32(data: &Map<String, Value>, key: &str) -> Option<i32> {
 
 /// Whether the parsed `Data` object carries a `LinkedChildren` key at all —
 /// the presence signal that Jellyfin (or a prior Ferrofin sync) owns this blob.
+#[cfg(test)]
 #[must_use]
 pub fn has_linked_children_key(data: &Map<String, Value>) -> bool {
     data.contains_key("LinkedChildren")
@@ -643,27 +645,28 @@ fn container_type_names() -> [&'static str; 2] {
     ]
 }
 
-/// Rewrites a playlist's owner / open-access / shares keys in its `Data` JSON
-/// from the Ferrofin tables — call after any ownership / share mutation (12.0
-/// still stores those in `Data`; membership it does not — see the body). A
-/// missing row or a non-playlist type is a no-op (deletions race here harmlessly).
-///
-/// The reads and the write share one writer transaction, so each sync reflects
-/// the tables at its own point in the writer's order: a sync that read before a
-/// share change committed cannot write its older `Shares` after that change's
-/// own sync, where the next boot's [`reconcile_playlist_permissions`] would
-/// bring a revoked share back.
+/// [`sync_container_data_in`] in a writer transaction of its own.
 ///
 /// # Errors
 /// Returns [`ServiceError`] if the underlying queries fail.
+#[cfg(test)]
 pub async fn sync_container_data(db: &Database, container: Uuid) -> Result<(), ServiceError> {
     let mut tx = db.writer().begin().await.map_err(db_err)?;
     sync_container_data_in(&mut tx, container).await?;
     tx.commit().await.map_err(db_err)
 }
 
-/// [`sync_container_data`] on a connection the caller holds, normally a writer
-/// transaction, so a table change and its `Data` sync commit together.
+/// Rewrites a playlist's owner / open-access / shares keys in its `Data` JSON
+/// from the Ferrofin tables — call after any ownership / share mutation (12.0
+/// still stores those in `Data`; membership it does not — see the body). A
+/// missing row or a non-playlist type is a no-op (deletions race here harmlessly).
+///
+/// It runs on a connection the caller holds, normally a writer transaction, so
+/// a table change and its `Data` sync commit together and each sync reflects
+/// the tables at its own point in the writer's order: a sync that read before a
+/// share change committed cannot write its older `Shares` after that change's
+/// own sync, where the next boot's [`reconcile_playlist_permissions`] would
+/// bring a revoked share back.
 pub(crate) async fn sync_container_data_in(
     conn: &mut sqlx::SqliteConnection,
     container: Uuid,
