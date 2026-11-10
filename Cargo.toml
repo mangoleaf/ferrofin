@@ -215,7 +215,7 @@ wasmtime-wasi = { version = "50.0.1", default-features = false, features = ["p2"
 wat = "1.263.0"            # dev-only in practice: inline-WAT test fixtures (no committed .wasm)
 
 # ── domain helpers ─────────────────────────────────────────────────
-uuid = { version = "1.29.1", features = ["v4", "serde"] }
+uuid = { version = "1.29.2", features = ["v4", "serde"] }
 url = "2.5.8"
 chrono = { version = "0.4", features = ["serde"] }
 unicode-normalization = "0.1.26"
@@ -252,7 +252,7 @@ bitflags = "2.13.2"
 # transitive dependency of flate2/zip, so it adds no new compilation. The WASM
 # host also uses it to tell whether a plugin's state file still holds the bytes
 # its kept map came from.
-crc32fast = "1.5.4"
+crc32fast = "1.5.5"
 regex = "1"
 percent-encoding = "2.3.2"
 # Base64 with .NET's rules (`Base64.IsValid`, `Convert.FromBase64String`) for
@@ -269,7 +269,7 @@ icu_locale_fallback = "2.4.0"
 icu_normalizer = "2.4.0"
 icu_provider = "2.4.0"
 zerovec = "0.11.9"
-fancy-regex = "0.20.0"    # for C# regexes that use lookaround
+fancy-regex = "0.20.1"    # for C# regexes that use lookaround
 quick-xml = { version = "0.42.0", features = ["serialize"] }   # NFO/XBMC metadata parsing (ferrofin-providers)
 # Embedded lyric tags read from the file (ID3v2 SYLT, frame order), which
 # ffprobe's tag map cannot give — the scan's port of ATL's `Track.Lyrics`.
