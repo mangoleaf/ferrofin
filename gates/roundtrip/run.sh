@@ -4,7 +4,8 @@
 # The way back to Jellyfin, proved on real Jellyfin: for each route in routes.sh, on a FRESH copy of a
 # pristine synthetic fixture (gates/adoption/build-fixtures.sh), each stage records each of its checks:
 #   Ferrofin   IMAGE (default ferrofin:bench) adopts the copy and scans it, the usage stage runs (usage.py:
-#              play, favorite, resume, a playlist, a collection, a user with a password) and captures
+#              watch state, accounts, a device, an API key, display preferences, playlists, collections,
+#              libraries, a metadata edit, an image and deletes; README.md) and captures
 #              Ferrofin's answers (answers.py) once its closing library scan has completed, and Ferrofin
 #              is stopped. Checks: ready; boot log (generation, migrations, no ERROR); the scan completes;
 #              the usage stage; a clean stop.
@@ -13,8 +14,9 @@
 #              ROUNDTRIP_READY_TIMEOUT; every migration it began finished (a failure names the migration
 #              and its SQLite error); no ERR or FTL entry outside checks_boot.py's allowlist up to that
 #              point; its answers equal Ferrofin's (adoption_normalise: ids, image sizes and the probes
-#              that differ by design left out), so the users, the Ferrofin-made user's login, the watch
-#              state, the playlists and the collections came back; integrity_check and foreign_key_check
+#              that differ by design left out), so everything answers.py captures came back: users and
+#              their logins, watch state, devices, API keys, settings, playlists and collections, and
+#              more; integrity_check and foreign_key_check
 #              clean once it has stopped.
 # The errors check reads the log up to the probes: an error a probe causes is judged by the answers.
 # One PASS/FAIL line per route; the exit status is 1 if any failed, 2 if the run was refused. Every

@@ -27,8 +27,8 @@ ferrofin_stage() {
     rt_docker logs "$name" > "$dst/ferrofin-boot.log" 2>&1
     check adoption_check_boot_log "$dst/ferrofin-boot.log" "$generation"
     mark Ferrofin "boot log (generation, migrations, no ERROR)"
-    # its actions, a scan (within SCAN_TIMEOUT) and the probes: twice that bounds the whole stage
-    check reasons_within $((2 * SCAN_TIMEOUT)) "the usage stage" env ROUNDTRIP_SCAN_TIMEOUT="$SCAN_TIMEOUT" \
+    # its actions, two scans each followed by a settle (each wait within SCAN_TIMEOUT) and the probes: five times that
+    check reasons_within $((5 * SCAN_TIMEOUT)) "the usage stage" env ROUNDTRIP_SCAN_TIMEOUT="$SCAN_TIMEOUT" \
       python3 "$HERE/usage.py" --base-url "$url" --data-dir "$dst/ferrofin" --oracle-out "$dst/oracle.txt"
     [ -s "$dst/oracle.txt" ] || [ "$mark_from" != "${#why[@]}" ] || why+=("the usage stage wrote no answers")
     mark Ferrofin "usage stage, then Ferrofin's answers"

@@ -149,6 +149,15 @@ EOS
   [[ "$output" == "2 line(s) differ, first: < userdata synthetic-admin 0646d8a3c487e7c559c99be73da1bdde played=1"* ]]
 }
 
+@test "compare: a play count or a like on another item is a reason, though the normalised lines are equal" {
+  answers oracle.txt 3; answers jellyfin.txt 3
+  echo "userplays synthetic-admin 0646d8a3c487e7c559c99be73da1bdde count=2 likes=true" >> oracle.txt
+  echo "userplays synthetic-admin 1559654e1fb057800c6600ca97f14dbb count=2 likes=true" >> jellyfin.txt
+  diff -q <(adoption_normalise oracle.txt) <(adoption_normalise jellyfin.txt)   # equal once ids are redacted
+  run rt_compare_answers oracle.txt jellyfin.txt
+  [[ "$output" == "2 line(s) differ, first: < userplays synthetic-admin 0646d8a3c487e7c559c99be73da1bdde count=2"* ]]
+}
+
 @test "compare: no answers from Jellyfin is a reason" {
   answers oracle.txt 3; : > jellyfin.txt
   run rt_compare_answers oracle.txt jellyfin.txt
