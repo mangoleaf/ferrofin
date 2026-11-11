@@ -239,7 +239,7 @@ fn get_media_info_mp4_metadata_success() {
     assert_eq!(s4.language.as_deref(), Some("eng"));
     assert_eq!(s4.stream_type, MediaStreamType::Subtitle);
     assert_eq!(s4.codec.as_deref(), Some("mov_text"));
-    assert_eq!(s4.title, None);
+    assert_eq!(s4.title.as_deref(), Some("SDH"));
     assert!(s4.is_hearing_impaired);
 
     let s5 = &res.media_source.media_streams[5];

@@ -893,6 +893,7 @@ pub struct ListingsProviderInfo {
     pub path: Option<String>,
 
     /// Gets or sets the enabled tuners.
+    #[serde(deserialize_with = "crate::json::value::null_as_default")]
     pub enabled_tuners: Vec<String>,
 
     /// Gets or sets a value indicating whether all tuners are enabled.
@@ -915,6 +916,7 @@ pub struct ListingsProviderInfo {
     pub movie_categories: Option<Vec<String>>,
 
     /// Gets or sets the channel mappings.
+    #[serde(deserialize_with = "crate::json::value::null_as_default")]
     pub channel_mappings: Vec<NameValuePair>,
 
     /// Gets or sets the movie prefix.
@@ -1090,9 +1092,11 @@ pub struct LiveTvOptions {
     pub enable_original_audio_with_encoded_recordings: bool,
 
     /// Gets or sets the tuner hosts.
+    #[serde(deserialize_with = "crate::json::value::null_as_default")]
     pub tuner_hosts: Vec<TunerHostInfo>,
 
     /// Gets or sets the listing providers.
+    #[serde(deserialize_with = "crate::json::value::null_as_default")]
     pub listing_providers: Vec<ListingsProviderInfo>,
 
     /// Gets or sets the pre padding seconds.
@@ -1102,6 +1106,7 @@ pub struct LiveTvOptions {
     pub post_padding_seconds: i32,
 
     /// Gets or sets the media locations created.
+    #[serde(deserialize_with = "crate::json::value::null_as_default")]
     pub media_locations_created: Vec<String>,
 
     /// Gets or sets the recording post processor.
@@ -1166,6 +1171,19 @@ mod tests {
         assert!(p.id.is_none());
         assert!(p.enabled_tuners.is_empty(), "{:?}", p.enabled_tuners);
         assert!(p.channel_mappings.is_empty(), "{:?}", p.channel_mappings);
+    }
+
+    #[test]
+    fn null_lists_read_as_empty() {
+        // `#nullable disable` upstream: System.Text.Json binds these nulls.
+        let p: ListingsProviderInfo =
+            serde_json::from_str(r#"{"EnabledTuners":null,"ChannelMappings":null}"#).unwrap();
+        assert_eq!(p, ListingsProviderInfo::default());
+        let o: LiveTvOptions = serde_json::from_str(
+            r#"{"TunerHosts":null,"ListingProviders":null,"MediaLocationsCreated":null}"#,
+        )
+        .unwrap();
+        assert_eq!(o, LiveTvOptions::default());
     }
 
     #[test]

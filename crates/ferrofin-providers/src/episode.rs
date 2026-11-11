@@ -248,7 +248,7 @@ pub fn omdb_answer(
     }
 }
 
-/// Maps OMDb's credited people to persistable rows: the director, the writer,
+/// Maps OMDb's credited people to persistable rows: each director, each writer,
 /// then each actor. OMDb carries no per-person id or image.
 #[must_use]
 pub fn omdb_people(item: &OmdbItem) -> Vec<PeopleEntity> {

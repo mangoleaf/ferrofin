@@ -424,8 +424,8 @@ impl<T: Transcoder> MediaEncoderImpl<T> {
     /// Builds the `ExtractImageInternal` argument line (software path only).
     ///
     /// Port of the core of `ExtractImageInternal`: the deinterlace + scale
-    /// filter chain, optional thumbnail sampling, stream `-map`, and `-ss`
-    /// offset.
+    /// filter chain, optional thumbnail sampling, stream `-map`, `-ss`
+    /// offset, and the container's input format (`-f`, `GetInputFormat`).
     ///
     /// An HDR video stream is tone-mapped after the sampling
     /// ([`Self::hdr_tone_map`]). The kept frame is then converted to the
@@ -541,6 +541,11 @@ impl<T: Transcoder> MediaEncoderImpl<T> {
         let seek_mpegts = offset_ticks.is_some() && container.eq_ignore_ascii_case("mpegts");
         if use_iframe && (use_tradeoff || seek_mpegts) {
             args = format!("-skip_frame nokey {args}");
+        }
+
+        // Outermost, as upstream prepends it last.
+        if let Some(format) = crate::encoding_helper::helper::input_format(container) {
+            args = format!("-f {format} {args}");
         }
 
         args
@@ -2115,7 +2120,42 @@ mod tests {
             ImageResolution::MatchSource,
         );
         assert_eq!(args.contains("thumbnail=n=24"), thumbnail, "{args}");
-        assert_eq!(args.starts_with("-skip_frame nokey "), keyframes, "{args}");
+        assert_eq!(args.contains("-skip_frame nokey "), keyframes, "{args}");
+    }
+
+    /// `ExtractImageInternal` names the container's demuxer (`-f`,
+    /// `GetInputFormat`) outermost, ahead of `-skip_frame` and `-ss`, and
+    /// leaves ffmpeg to probe a container it has no name for.
+    #[rstest]
+    #[case::mpegts("ts", "-f mpegts -skip_frame nokey -ss 00:00:10.000 -i ")]
+    #[case::matroska("mkv", "-f matroska -ss 00:00:10.000 -i ")]
+    #[case::matroska_webm("mkv,webm", "-f matroska,webm -ss 00:00:10.000 -i ")]
+    #[case::mp4(
+        "mov,mp4,m4a,3gp,3g2,mj2",
+        "-f mov,mp4,m4a,3gp,3g2,mj2 -ss 00:00:10.000 -i "
+    )]
+    #[case::m2ts_has_no_name("m2ts", "-ss 00:00:10.000 -i ")]
+    #[case::mpeg_has_no_name("mpeg", "-ss 00:00:10.000 -i ")]
+    #[case::unknown_container("", "-ss 00:00:10.000 -i ")]
+    fn the_input_format_leads_the_extraction(#[case] container: &str, #[case] start: &str) {
+        let args = MediaEncoderImpl::<NoopTranscoder>::extract_image_arguments(
+            "file:\"/media/movie\"",
+            container,
+            Some(&video_stream()),
+            None,
+            None,
+            Some(10 * TICKS_PER_SECOND),
+            true,
+            "/tmp/out.jpg",
+            // The trade-off adds `-skip_frame` (`seekMpegTs` wants `mpegts`,
+            // which the probe stores as `ts`), to show `-f` ahead of it.
+            ExtractionSettings {
+                perf_tradeoff: container == "ts",
+                ..ExtractionSettings::default()
+            },
+            ImageResolution::MatchSource,
+        );
+        assert!(args.starts_with(start), "{args}");
     }
 
     /// A video stream whose colour or Dolby Vision metadata gives its range;
@@ -2365,7 +2405,8 @@ mod tests {
         let arguments = transcoder.0.lock().unwrap().clone();
         assert_eq!(arguments.len(), 1, "{arguments:?}");
         assert!(
-            arguments[0].starts_with("-skip_frame nokey ") && !arguments[0].contains("thumbnail"),
+            arguments[0].starts_with("-f matroska -skip_frame nokey ")
+                && !arguments[0].contains("thumbnail"),
             "{}",
             arguments[0]
         );
