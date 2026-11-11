@@ -639,6 +639,73 @@ async fn a_seek_back_below_a_killed_jobs_segments_keeps_the_running_job() {
     mgr.stop_encoding(&req).await.expect("stop_encoding");
 }
 
+/// gl-1520 against a real ffmpeg encoding at the source's pace: play 0, seek
+/// forward to 5 and play 6 and 7, then seek back to 4, whose request the
+/// client drops while the job encodes it, and retry it. The killed job's 5 to 7
+/// adjoin 4, and ffmpeg writes nothing of 4 until it is finished, so the retry
+/// waits on the job started at 4 rather than restarting it.
+#[tokio::test]
+async fn a_retry_of_a_slow_first_segment_keeps_the_running_job() {
+    if !ffmpeg_gate() {
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let cache = tmp.path().join("transcodes");
+    std::fs::create_dir_all(&cache).unwrap();
+    let clip = tmp.path().join("clip.mp4");
+    make_clip_of(&clip, 60);
+
+    let planner = FfmpegPlanner {
+        dir: cache.clone(),
+        clip,
+        fmp4: false,
+        realtime: true,
+    };
+    let spawns = Arc::new(Mutex::new(Vec::new()));
+    let transcoder = RecordingTranscoder {
+        inner: TokioSegmentTranscoder::new(),
+        spawns: Arc::clone(&spawns),
+    };
+    let manager = Arc::new(TranscodeManagerImpl::new(NoopSessionReporter));
+    let cfg: Box<dyn Fn() -> EncodingOptions + Send + Sync> = Box::new(EncodingOptions::default);
+    let generator = Arc::new(DynamicHlsPlaylistGenerator::new(cfg, Vec::new()));
+    let paths = Arc::new(TempPaths {
+        transcode: cache.to_string_lossy().into_owned(),
+    });
+    let mgr = HlsStreamManagerImpl::new(planner, transcoder, manager, generator, paths, "ffmpeg");
+
+    let req = request();
+    for segment in [0, 5, 6, 7] {
+        mgr.dynamic_segment(&req, segment, false)
+            .await
+            .unwrap_or_else(|error| panic!("segment {segment}: {error:?}"));
+    }
+    let dropped = tokio::time::timeout(
+        std::time::Duration::from_millis(500),
+        mgr.dynamic_segment(&req, 4, false),
+    )
+    .await;
+    assert!(dropped.is_err(), "segment 4 was answered: {dropped:?}");
+    let served = mgr
+        .dynamic_segment(&req, 4, false)
+        .await
+        .expect("segment 4");
+    assert!(served.path.ends_with("out4.ts"), "served {}", served.path);
+
+    let start_numbers: Vec<String> = spawns
+        .lock()
+        .unwrap()
+        .iter()
+        .filter_map(|args| {
+            args.windows(2)
+                .find(|pair| pair[0] == "-start_number")
+                .map(|pair| pair[1].clone())
+        })
+        .collect();
+    assert_eq!(start_numbers, ["0", "5", "4"], "the retry restarted");
+    mgr.stop_encoding(&req).await.expect("stop_encoding");
+}
+
 /// The duration ffprobe reads from the media file at `path`, 0 when it reads none.
 fn probed_duration(path: &Path) -> f64 {
     let output = std::process::Command::new("ffprobe")
