@@ -2535,13 +2535,14 @@ pub const VERIFIED: &[Verified] = &[
         upstream_file: "Jellyfin.Api/Controllers/UserController.cs",
         upstream_method: "ForgotPassword",
         ferrofin: "handlers/users.rs forgot_password (ForgotPasswordDto, extract.rs \
-               RequiredString, ip_access.rs is_local_connection) → ferrofin-core \
-               user_manager.rs start_forgot_password_process \
+               RequiredString and body_parameter, ip_access.rs is_local_connection) → \
+               ferrofin-core user_manager.rs start_forgot_password_process \
                (UserManager.StartForgotPasswordProcess), password_reset_provider_for \
                (GetPasswordResetProvider(User?)) → password_reset.rs \
                DefaultPasswordResetProvider (issue_reset_pin). Compared: the [Required] \
                required string EnteredUsername (missing, null, empty and whitespace are 400s \
-               before the action, with Jellyfin 12.4's messages, measured), isLocal as \
+               before the action, with Jellyfin 12.4's messages, measured), the body's \
+               forgotPasswordRequest entry when it fails to bind (measured), isLocal as \
                IsLocal() || IsInLocalNetwork(ip), the warning for a request from outside the \
                local network, the user lookup, the provider chosen by the saved \
                PasswordResetProviderId among the enabled ones with the built-in fallback, the \
@@ -2554,8 +2555,6 @@ pub const VERIFIED: &[Verified] = &[
          (UpdateUserAsync), which deletes and re-adds their access schedules, so each one's \
          Id in UserPolicy.AccessSchedules changes. Ferrofin saves nothing. Jellyfin bug not \
          ported.",
-            "A body that fails to bind keys its parameter entry `body` (\"The body field is \
-         required.\"), not upstream's `forgotPasswordRequest`. Fix path: gl-1161.",
             "The 500 body (a PIN file that cannot be written) is Ferrofin's error shape, not \
          upstream's. Fix path: gl-666.",
         ],
@@ -2567,12 +2566,14 @@ pub const VERIFIED: &[Verified] = &[
         upstream_file: "Jellyfin.Api/Controllers/UserController.cs",
         upstream_method: "ForgotPasswordPin",
         ferrofin: "handlers/users.rs forgot_password_pin (ForgotPasswordPinDto, extract.rs \
-               RequiredString) → ferrofin-core user_manager.rs redeem_password_reset_pin \
-               (UserManager.RedeemPasswordResetPin), redeem_with → password_reset.rs \
+               RequiredString and body_parameter) → ferrofin-core user_manager.rs \
+               redeem_password_reset_pin (UserManager.RedeemPasswordResetPin), redeem_with → \
+               password_reset.rs \
                DefaultPasswordResetProvider (redeem_reset_pins), change_password, \
                log_password_changed. Compared: the [Required] required string Pin (missing, \
                null, empty and whitespace are 400s before the action, with Jellyfin 12.4's \
-               messages, measured), every provider asked in order whether enabled or not, \
+               messages, measured), the body's forgotPasswordPinRequest entry when it fails \
+               to bind (measured), every provider asked in order whether enabled or not, \
                the first success answered, an expired record deleted, the PIN compared \
                ordinally with its dashes removed, the password set to the PIN as entered, \
                the UserPasswordChanged activity entry, the record removed once the password \
@@ -2589,8 +2590,6 @@ pub const VERIFIED: &[Verified] = &[
          unreadable record fails the request with nothing reset. Upstream resets each match as \
          it walks the directory, so the matches before the failing record (in directory \
          order) are applied and their files deleted. Jellyfin bug not ported.",
-            "A body that fails to bind keys its parameter entry `body` (\"The body field is \
-         required.\"), not upstream's `forgotPasswordPinRequest`. Fix path: gl-1161.",
             "The 404 (no provider redeemed the PIN) and 500 bodies are Ferrofin's error shape, \
          not upstream's. Fix path: gl-666.",
         ],
