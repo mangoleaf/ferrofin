@@ -442,12 +442,17 @@ pub async fn build_app_state(
     // scope (`AddUserToQuery`'s playlists and box-set gate) reaches it through
     // this late slot, filled once the evaluator exists.
     let scope_visibility = ferrofin_core::VisibilitySlot::default();
+    // The user-view manager is built over the repository too, so the scope's
+    // `GetUserViews` call (`AddUserToQuery` writes the user's views) reaches it
+    // through this late slot.
+    let scope_user_views = ferrofin_core::UserViewsSlot::default();
     let item_repository_impl = Arc::new(
         FerrofinItemRepository::new(db.clone(), Arc::clone(&item_type_lookup))
             .with_root_ids(root_folder_ids)
             .with_virtual_paths(virtual_paths.clone())
             .with_active_recordings(Arc::clone(&active_recordings))
-            .with_visibility(Arc::clone(&scope_visibility)),
+            .with_visibility(Arc::clone(&scope_visibility))
+            .with_user_views(Arc::clone(&scope_user_views)),
     );
     let item_repository: Arc<dyn ferrofin_traits::persistence::ItemRepository> =
         Arc::clone(&item_repository_impl) as _;
@@ -455,6 +460,7 @@ pub async fn build_app_state(
         FerrofinItemCountService::new(db.clone())
             .with_root_ids(root_folder_ids)
             .with_visibility(Arc::clone(&scope_visibility))
+            .with_user_views(Arc::clone(&scope_user_views))
             .with_virtual_paths(virtual_paths.clone()),
     );
     let item_persistence_impl = Arc::new(
@@ -1425,6 +1431,7 @@ pub async fn build_app_state(
             .with_users(Arc::clone(&users))
             .with_database(db.clone()),
     );
+    scope_user_views.bind(&user_views);
 
     // Close the Live TV <-> item-layer cycle: the guide refresh mirrors the
     // channel lineup into `BaseItems` (C# `GuideManager.GetChannel` ->
@@ -2198,6 +2205,20 @@ pub async fn build_app_state(
         plugins.as_ref(),
         users.as_ref(),
         extension_cx.external_identities.as_ref(),
+    )
+    .await;
+    // Likewise the settings of the metadata plugins Jellyfin builds in, from
+    // their `PluginConfiguration` documents, so an adopted server does not come
+    // up with TMDb, OMDb, MusicBrainz, AudioDB and Studio Images at the
+    // defaults (gl-1574).
+    ferrofin_core::plugin_config_adoption::import_adopted_plugin_configs(
+        &std::path::Path::new(&paths.plugins_path()).join("configurations"),
+        &plugin_state_dir,
+        plugins.as_ref(),
+        &ferrofin_providers::builtin_plugins::ALL
+            .iter()
+            .map(|p| (p.id, p.configuration_file_name))
+            .collect::<Vec<_>>(),
     )
     .await;
     let intro_skipper_analysis = ferrofin_extensions::intro_skipper::analysis(&extension_cx);

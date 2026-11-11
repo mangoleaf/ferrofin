@@ -156,15 +156,18 @@ holds the database, playlists and collections:
 | `/var/lib/jellyfin/metadata/` | `{data_dir}/metadata/` | images and downloaded metadata |
 | `/etc/jellyfin/` | `{config_dir}/` | XML configuration |
 | `/var/lib/jellyfin/plugins/configurations/LDAP-Auth.xml` | `{data_dir}/plugins/configurations/` | LDAP-Auth's settings, if Jellyfin used it |
+| `/var/lib/jellyfin/plugins/configurations/Jellyfin.Plugin.{Tmdb,Omdb,MusicBrainz,AudioDb,StudioImages}.xml` | `{data_dir}/plugins/configurations/` | the settings of the metadata plugins Jellyfin builds in |
 
 The script reads `data_dir` and `config_dir` from `/etc/ferrofin/config.toml`. The package
 sets only `data_dir`, so `config_dir` is `{data_dir}/config`; `/etc/ferrofin` keeps just
 `config.toml` and stays read-only to the service.
 
 The rest of Jellyfin's `data/` (subtitle and attachment extraction caches, backups, task
-history) is not copied, nor are `plugins/` and `Subtitle Edit/`, except
-`plugins/configurations/LDAP-Auth.xml`, the LDAP-Auth plugin's settings, which Ferrofin's
-LDAP-Auth imports on the first start. `root/default/` holds
+history) is not copied, nor are `plugins/` and `Subtitle Edit/`, except the plugin
+settings Ferrofin imports on the first start from `plugins/configurations/`:
+`LDAP-Auth.xml`, the LDAP-Auth plugin's, and the `Jellyfin.Plugin.*.xml` files of the
+metadata plugins Jellyfin builds in (TMDb, OMDb, MusicBrainz, AudioDB, Studio Images).
+An import never replaces settings already saved in Ferrofin. `root/default/` holds
 only the library definitions (`.mblink` files naming each media path); media stays where
 it is.
 

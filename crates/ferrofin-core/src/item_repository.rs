@@ -35,6 +35,7 @@ use ferrofin_traits::options::ItemImageInfo;
 use uuid::Uuid;
 
 use ferrofin_traits::error::ServiceError;
+use ferrofin_traits::library::UserViewManager;
 use ferrofin_traits::options::{DescendantQueryRoots, InternalItemsQuery};
 use ferrofin_traits::persistence::{
     FolderChild, ItemRepository, ItemTypeLookup, ItemWithCounts, ParentalRestrictions,
@@ -73,7 +74,9 @@ struct EpisodeOrderRow {
     #[sqlx(rename = "Type")]
     type_: String,
     parent_id: Option<String>,
+    #[sqlx(try_from = "ferrofin_db::entities::unset::NonNilGuid")]
     season_id: Option<String>,
+    #[sqlx(try_from = "ferrofin_db::entities::unset::NonNilGuid")]
     channel_id: Option<String>,
     path: Option<String>,
     index_number: Option<i64>,
@@ -124,6 +127,10 @@ pub struct FerrofinItemRepository {
     /// sets, bound late by the composition root (see
     /// [`FerrofinItemRepository::with_visibility`]).
     visibility: VisibilitySlot,
+    /// The user-view manager the query scope runs `GetUserViews` through,
+    /// bound late by the composition root (see
+    /// [`FerrofinItemRepository::with_user_views`]).
+    user_views: UserViewsSlot,
 }
 
 /// What the files Live TV is recording right now are, asked when needed.
@@ -158,6 +165,114 @@ pub(crate) fn bound_visibility(slot: &VisibilitySlot) -> Option<Arc<ItemVisibili
     }
     visibility
 }
+
+/// `AddUserToQuery`'s `GetUserViews` call (`LibraryManager.cs:2106-2111`).
+/// Every unscoped user query runs it, and it writes the views it returns on
+/// their first read (`GetNamedView`, `GetUserView`): the user's Playlists view,
+/// a grouped view, the Folders view, the Live TV folder.
+/// The user-view manager is built over this repository, so the composition root
+/// binds it late and it is held weakly; an unbound slot does nothing.
+///
+/// Upstream runs the whole call on every such query. Here, for the life of the
+/// process, it runs once per user and per set of root folders the user may
+/// see. The rows it writes usually change only when that set does, so a query
+/// over the same set writes nothing and costs no statement.
+#[derive(Default)]
+pub struct UserViewMaterialisation {
+    manager: std::sync::OnceLock<std::sync::Weak<dyn UserViewManager>>,
+    /// Per user, the sorted root folders their views were last written for.
+    written_for: std::sync::Mutex<HashMap<Uuid, Vec<Uuid>>>,
+}
+
+impl std::fmt::Debug for UserViewMaterialisation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("UserViewMaterialisation")
+            .field("bound", &self.manager.get().is_some())
+            .finish_non_exhaustive()
+    }
+}
+
+impl UserViewMaterialisation {
+    /// Binds the server's user-view manager; a second bind is ignored.
+    pub fn bind(&self, manager: &Arc<dyn UserViewManager>) {
+        let _ = self.manager.set(Arc::downgrade(manager));
+    }
+
+    /// The bound manager, while the server holds it. An unbound slot is
+    /// silent; a bound manager that is gone says so at `debug`, because the
+    /// scope then writes no view.
+    fn manager(&self) -> Option<Arc<dyn UserViewManager>> {
+        let manager = self.manager.get()?.upgrade();
+        if manager.is_none() {
+            tracing::debug!("the user-view manager is gone; a library query writes no view");
+        }
+        manager
+    }
+
+    /// Writes `user`'s views, as `GetUserViews` does, unless they were already
+    /// written for these root folders.
+    ///
+    /// The set is recorded first, so the queries the manager runs cannot
+    /// re-enter it and a concurrent query does not run it twice. A query
+    /// cancelled mid-write (its client gone) forgets it again, so the next
+    /// query writes what that one did not. A failure is logged once and the
+    /// record kept: the rows are a side effect of the scope, not part of its
+    /// answer, and the next `/UserViews` or change of the set writes them.
+    async fn materialise(&self, user: Uuid, mut roots: Vec<Uuid>) {
+        let Some(manager) = self.manager() else {
+            return;
+        };
+        roots.sort_unstable();
+        {
+            let mut written_for = self.written_for();
+            if written_for.get(&user) == Some(&roots) {
+                return;
+            }
+            written_for.insert(user, roots.clone());
+        }
+        let mut pending = PendingViewWrite {
+            slot: self,
+            user,
+            roots,
+            finished: false,
+        };
+        if let Err(err) = manager.get_user_views_with_hidden(user, true).await {
+            tracing::warn!(user_id = %user, %err, "could not write the user's views for a library query");
+        }
+        pending.finished = true;
+    }
+
+    fn written_for(&self) -> std::sync::MutexGuard<'_, HashMap<Uuid, Vec<Uuid>>> {
+        self.written_for
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
+
+/// A write [`UserViewMaterialisation`] has recorded and not finished: dropped
+/// unfinished (its query cancelled), it forgets the record, unless a later
+/// query has recorded another set since.
+struct PendingViewWrite<'a> {
+    slot: &'a UserViewMaterialisation,
+    user: Uuid,
+    roots: Vec<Uuid>,
+    finished: bool,
+}
+
+impl Drop for PendingViewWrite<'_> {
+    fn drop(&mut self) {
+        if !self.finished {
+            let mut written_for = self.slot.written_for();
+            if written_for.get(&self.user) == Some(&self.roots) {
+                written_for.remove(&self.user);
+            }
+        }
+    }
+}
+
+/// A late-bound [`UserViewMaterialisation`], shared by the item repository and
+/// the count service.
+pub type UserViewsSlot = Arc<UserViewMaterialisation>;
 
 impl std::fmt::Debug for FerrofinItemRepository {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -344,6 +459,7 @@ impl FerrofinItemRepository {
             virtual_paths: VirtualPathExpander::identity(),
             active_recordings: ActiveRecordingSlot::default(),
             visibility: VisibilitySlot::default(),
+            user_views: UserViewsSlot::default(),
             roots: None,
         }
     }
@@ -412,6 +528,16 @@ impl FerrofinItemRepository {
     #[must_use]
     pub fn with_visibility(mut self, slot: VisibilitySlot) -> Self {
         self.visibility = slot;
+        self
+    }
+
+    /// Installs the slot the composition root binds to the server's user-view
+    /// manager once it is built over this repository. An unscoped user query
+    /// then writes the user's views as `AddUserToQuery`'s `GetUserViews` does
+    /// ([`UserViewMaterialisation`]); left empty, it writes none.
+    #[must_use]
+    pub fn with_user_views(mut self, slot: UserViewsSlot) -> Self {
+        self.user_views = slot;
         self
     }
 
@@ -1103,6 +1229,7 @@ impl FerrofinItemRepository {
                     &self.db,
                     &self.virtual_paths,
                     self.visibility().as_deref(),
+                    &self.user_views,
                     prepared,
                 )
                 .await?
@@ -1179,6 +1306,9 @@ impl FerrofinItemRepository {
                     &self.db,
                     &self.virtual_paths,
                     self.visibility().as_deref(),
+                    // upstream scopes this one by `AncestorIds`, so its
+                    // `AddUserToQuery` writes no view
+                    &UserViewMaterialisation::default(),
                     &resolved,
                 )
                 .await?
@@ -1231,6 +1361,7 @@ impl FerrofinItemRepository {
                 &self.db,
                 &self.virtual_paths,
                 self.visibility().as_deref(),
+                &self.user_views,
                 filter,
             )
             .await;
@@ -2021,6 +2152,7 @@ impl FerrofinItemRepository {
             &self.db,
             &self.virtual_paths,
             self.visibility().as_deref(),
+            &self.user_views,
             filter,
         )
         .await?;
@@ -3056,12 +3188,13 @@ pub(crate) async fn scope_to_user_libraries(
     db: &Database,
     paths: &VirtualPathExpander,
     visibility: Option<&ItemVisibility>,
+    user_views: &UserViewMaterialisation,
     filter: &InternalItemsQuery,
 ) -> Result<Option<InternalItemsQuery>, ServiceError> {
     let preferences = crate::query_restrictions::resolve(db, filter).await?;
     let prepared = preferences.as_ref().unwrap_or(filter);
     Ok(
-        scope_to_user_libraries_prepared(db, paths, visibility, prepared)
+        scope_to_user_libraries_prepared(db, paths, visibility, user_views, prepared)
             .await?
             .or(preferences),
     )
@@ -3071,6 +3204,7 @@ async fn scope_to_user_libraries_prepared(
     db: &Database,
     paths: &VirtualPathExpander,
     visibility: Option<&ItemVisibility>,
+    user_views: &UserViewMaterialisation,
     filter: &InternalItemsQuery,
 ) -> Result<Option<InternalItemsQuery>, ServiceError> {
     let Some(user) = filter.user.as_ref() else {
@@ -3092,6 +3226,14 @@ async fn scope_to_user_libraries_prepared(
     let ids: Vec<Uuid> = views.iter().map(|view| view.id).collect();
     let by_view = library_top_parents_by_view(db, &ids).await?;
     let views = without_itemless_linked_libraries(views, &by_view, visibility, user).await?;
+    // `GetUserViews` writes the views it returns as it scopes (gl-1584).
+    if let Ok(user_id) = Uuid::parse_str(&user.id) {
+        let roots = views
+            .iter()
+            .filter(|view| !view.user_view)
+            .map(|view| view.id);
+        user_views.materialise(user_id, roots.collect()).await;
+    }
     // `GetTopParentIdsForQuery` per view: a collection folder becomes its
     // physical folders plus itself (what the rows a Ferrofin scan saved
     // carry, [`library_top_parents_by_view`]), and anything else — a Live TV
@@ -3784,6 +3926,7 @@ impl ItemRepository for FerrofinItemRepository {
                 &self.db,
                 &self.virtual_paths,
                 self.visibility().as_deref(),
+                &self.user_views,
                 &filter,
             )
             .await?
@@ -11728,6 +11871,192 @@ mod tests {
         .await;
         let user = seed_user_with_defaults(db, Uuid::from_u128(0x9805)).await;
         (first, second, Uuid::from_u128(0x9805), user)
+    }
+
+    /// A user-view manager that counts its `GetUserViews` calls (gl-1584).
+    /// With `hang_first` the first call signals `started` and never finishes;
+    /// with `fail` every call fails.
+    #[derive(Default)]
+    struct CountingViews {
+        calls: std::sync::atomic::AtomicUsize,
+        hang_first: bool,
+        fail: bool,
+        started: tokio::sync::Notify,
+    }
+
+    #[async_trait::async_trait]
+    impl UserViewManager for CountingViews {
+        async fn get_user_views(&self, _: Uuid) -> Result<Vec<BaseItemEntity>, ServiceError> {
+            Ok(Vec::new())
+        }
+
+        async fn get_user_views_with_hidden(
+            &self,
+            _: Uuid,
+            _: bool,
+        ) -> Result<Vec<BaseItemEntity>, ServiceError> {
+            let earlier = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if self.hang_first && earlier == 0 {
+                self.started.notify_one();
+                std::future::pending::<()>().await;
+            }
+            if self.fail {
+                return Err(ServiceError::backend("the view write fails"));
+            }
+            Ok(Vec::new())
+        }
+
+        async fn get_media_folders(&self) -> Result<Vec<BaseItemEntity>, ServiceError> {
+            Ok(Vec::new())
+        }
+
+        async fn get_user_root_children(
+            &self,
+            _: &UserEntity,
+        ) -> Result<Vec<BaseItemEntity>, ServiceError> {
+            Ok(Vec::new())
+        }
+
+        async fn get_latest_items(
+            &self,
+            _: &ferrofin_traits::options::LatestItemsQuery,
+            _: &ferrofin_traits::options::DtoOptions,
+        ) -> Result<Vec<(Option<BaseItemEntity>, Vec<BaseItemEntity>)>, ServiceError> {
+            Ok(Vec::new())
+        }
+    }
+
+    /// A repository whose scope reaches `views` through a bound slot, as the
+    /// composition root wires it.
+    fn repo_writing_views(db: &Database, views: &Arc<CountingViews>) -> FerrofinItemRepository {
+        let slot = UserViewsSlot::default();
+        let bound: Arc<dyn UserViewManager> = Arc::clone(views) as _;
+        slot.bind(&bound);
+        // the slot holds the manager weakly; the test keeps `views` alive
+        repo(db).with_user_views(slot)
+    }
+
+    /// gl-1584: `AddUserToQuery` runs `GetUserViews`, which writes the user's
+    /// views, on every unscoped query. Here the scope runs it once per user and
+    /// per set of root folders the user may see: a repeat or a scoped query runs
+    /// nothing, and a library joining the set runs it again.
+    #[tokio::test]
+    async fn the_scope_writes_a_users_views_once_per_set_of_root_folders() {
+        let db = test_db().await;
+        let (_, second, _, user) = two_libraries(&db).await;
+        let views = Arc::new(CountingViews::default());
+        let repository = repo_writing_views(&db, &views);
+        let calls = || views.calls.load(std::sync::atomic::Ordering::SeqCst);
+
+        assert_eq!(unscoped_names(&repository, &user).await.len(), 2);
+        assert_eq!(
+            calls(),
+            1,
+            "the user's first unscoped query writes their views"
+        );
+        unscoped_names(&repository, &user).await;
+        repository
+            .get_item_list(&InternalItemsQuery {
+                user: Some(Arc::new(user.clone())),
+                parent_id: second,
+                ..InternalItemsQuery::default()
+            })
+            .await
+            .expect("scoped");
+        assert_eq!(
+            calls(),
+            1,
+            "the same set, or a scoped query, writes nothing"
+        );
+
+        seed_named_item(
+            &db,
+            Uuid::from_u128(0x9806),
+            BaseItemKind::CollectionFolder,
+            "Third",
+        )
+        .await;
+        db.invalidate_libraries();
+        unscoped_names(&repository, &user).await;
+        assert_eq!(
+            calls(),
+            2,
+            "a library joining the user's set writes them again"
+        );
+    }
+
+    /// gl-1584: a query dropped while the views are being written (its client
+    /// gone) does not leave them recorded as written: the next query writes
+    /// them.
+    #[tokio::test]
+    async fn a_cancelled_view_write_is_retried_by_the_next_query() {
+        let db = test_db().await;
+        let (_, _, _, user) = two_libraries(&db).await;
+        let views = Arc::new(CountingViews {
+            hang_first: true,
+            ..CountingViews::default()
+        });
+        let repository = repo_writing_views(&db, &views);
+
+        // The first write starts and hangs; its query is dropped mid-write.
+        tokio::select! {
+            _ = unscoped_names(&repository, &user) => panic!("the first write hangs"),
+            () = views.started.notified() => {}
+        }
+        assert_eq!(unscoped_names(&repository, &user).await.len(), 2);
+        assert_eq!(
+            views.calls.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "the next query writes what the dropped one did not"
+        );
+    }
+
+    /// gl-1584: a view write that fails leaves the query's answer alone and
+    /// is not retried by every later query over the same set (one warning,
+    /// not one per request); the next `/UserViews` writes the views.
+    #[tokio::test]
+    async fn a_failed_view_write_answers_the_query_and_is_not_retried_per_query() {
+        let db = test_db().await;
+        let (_, _, _, user) = two_libraries(&db).await;
+        let views = Arc::new(CountingViews {
+            fail: true,
+            ..CountingViews::default()
+        });
+        let repository = repo_writing_views(&db, &views);
+        for _ in 0..3 {
+            assert_eq!(unscoped_names(&repository, &user).await.len(), 2);
+        }
+        assert_eq!(views.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    /// gl-1584: a browse of the aggregate root writes no view. Upstream
+    /// scopes it by `AncestorIds` (`SetAncestorIds`), so its `AddUserToQuery`
+    /// never reaches `GetUserViews`.
+    #[tokio::test]
+    async fn an_aggregate_root_browse_writes_no_view() {
+        use crate::aggregate_folder::RootFolderIds;
+        use crate::test_support::seed_folder_item;
+        let db = test_db().await;
+        let (_, _, _, user) = two_libraries(&db).await;
+        let (user_root, aggregate) = (Uuid::from_u128(0xE301), Uuid::from_u128(0xE302));
+        seed_folder_item(&db, aggregate, BaseItemKind::AggregateFolder, "root", None).await;
+        seed_folder_item(&db, user_root, BaseItemKind::UserRootFolder, "MF", None).await;
+        let views = Arc::new(CountingViews::default());
+        let repository = repo_writing_views(&db, &views).with_root_ids(RootFolderIds {
+            user_root,
+            aggregate,
+        });
+        repository
+            .get_item_list(&InternalItemsQuery {
+                user: Some(Arc::new(user)),
+                parent_id: aggregate,
+                recursive: true,
+                include_item_types: vec![BaseItemKind::Movie],
+                ..InternalItemsQuery::default()
+            })
+            .await
+            .expect("aggregate browse");
+        assert_eq!(views.calls.load(std::sync::atomic::Ordering::SeqCst), 0);
     }
 
     /// The names an unscoped browse returns for `user`.
