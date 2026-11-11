@@ -118,6 +118,7 @@ use ferrofin_traits::providers::{GeneratedImageProvider, ItemUpdateType, Metadat
 use uuid::Uuid;
 
 use crate::item_type_lookup::kind_from_type_name;
+use crate::library_scan::off_runtime;
 use crate::refresh_plan::{PassOutcome, RefreshRequest};
 
 /// Edge length of the square collage every provider here draws — upstream's
@@ -614,7 +615,7 @@ impl DynamicImageProviders {
             return Ok(ItemUpdateType::None);
         }
 
-        std::fs::create_dir_all(&item_dir).map_err(|e| {
+        off_runtime(|| std::fs::create_dir_all(&item_dir)).map_err(|e| {
             ServiceError::backend(format!(
                 "failed to create the item art dir {}: {e}",
                 item_dir.display()
@@ -624,7 +625,8 @@ impl DynamicImageProviders {
             kind,
             DynamicImageKind::PhotoAlbum | DynamicImageKind::Folder
         ) {
-            copy_single_image(&item_dir, &sources[0])?
+            // One closure: the stale Primaries go before the copy lands.
+            off_runtime(|| copy_single_image(&item_dir, &sources[0]))?
         } else {
             let output = item_dir.join(format!("{PRIMARY_STEM}.png"));
             let options = ImageCollageOptions {
@@ -633,7 +635,7 @@ impl DynamicImageProviders {
                 width: SQUARE_COLLAGE_SIZE,
                 height: SQUARE_COLLAGE_SIZE,
             };
-            remove_other_primaries(&item_dir, &output);
+            off_runtime(|| remove_other_primaries(&item_dir, &output));
             self.processor
                 .create_image_collage(&options, item.name.as_deref())
                 .await?;
@@ -646,7 +648,7 @@ impl DynamicImageProviders {
         let mut info = ItemImageInfo {
             path: output.to_string_lossy().into_owned(),
             image_type: ImageType::Primary,
-            date_modified: file_date_modified(&output),
+            date_modified: off_runtime(|| file_date_modified(&output)),
             width: 0,
             height: 0,
             blur_hash: None,
@@ -961,7 +963,7 @@ pub(crate) async fn fill_image_metadata(processor: &dyn ImageProcessor, image: &
 /// stored value was truncated to it on the way in, so a raw nanosecond `mtime`
 /// would never compare equal and every scan would redraw every collage.
 fn has_changed_by_date(image: &ItemImageInfo) -> bool {
-    let Ok(meta) = std::fs::metadata(&image.path) else {
+    let Ok(meta) = off_runtime(|| std::fs::metadata(&image.path)) else {
         return true;
     };
     let Ok(modified) = meta.modified() else {
@@ -1015,8 +1017,13 @@ pub(crate) fn is_own_image(root: &Path, item_id: Uuid, image: &ItemImageInfo) ->
 /// `ImageService.ValidateImages`: drops the local images whose file is gone,
 /// returning whether any was.
 pub(crate) fn drop_missing_images(images: &mut Vec<ItemImageInfo>) -> bool {
+    if !images.iter().any(ItemImageInfo::is_local_file) {
+        return false;
+    }
     let before = images.len();
-    images.retain(|image| !image.is_local_file() || Path::new(&image.path).is_file());
+    off_runtime(|| {
+        images.retain(|image| !image.is_local_file() || Path::new(&image.path).is_file());
+    });
     images.len() != before
 }
 
@@ -1901,6 +1908,95 @@ mod tests {
             "the sort-name-first photo is the one copied"
         );
         assert_eq!(fx.providers.refresh_all().await.expect("pass").generated, 0);
+    }
+
+    /// The album's photo is copied off the runtime worker, so a copy from a
+    /// slow mount never holds it: on a runtime with one worker, a task still
+    /// runs while the copy waits on its destination (a FIFO the test reads the
+    /// photo out of, too small to hold it; `std::fs::copy` refuses a FIFO as
+    /// its source).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn a_photo_copy_leaves_the_runtime_worker_free() {
+        use std::io::Read as _;
+        use std::time::Duration;
+
+        let fx = fixture().await;
+        let media = fx.media_dir();
+        let album = fx
+            .seed(BaseItemKind::PhotoAlbum, "Iceland", None, None)
+            .await;
+        let photo = media.join("aurora.jpg");
+        // Larger than a pipe's buffer, so the copy waits for the reader.
+        std::fs::write(&photo, vec![7_u8; 1 << 20]).expect("photo");
+        let id = Uuid::new_v4();
+        fx.persistence
+            .save_items(&[BaseItemEntity {
+                id: guid_to_db(id),
+                type_: stored_type_name(BaseItemKind::Photo).unwrap().to_owned(),
+                name: Some("aurora".to_owned()),
+                parent_id: Some(guid_to_db(album)),
+                path: Some(photo.to_string_lossy().into_owned()),
+                ..Default::default()
+            }])
+            .await
+            .expect("photo");
+        fx.persistence
+            .set_ancestors(id, &[album])
+            .await
+            .expect("ancestors");
+        seed_images(
+            &fx.db,
+            id,
+            &[image_info(
+                ImageType::Primary,
+                &photo.to_string_lossy(),
+                None,
+            )],
+        )
+        .await;
+        let art = own_art_dir(&fx.tmp.path().join("metadata").join("library"), album);
+        std::fs::create_dir_all(&art).expect("art dir");
+        // Nothing reads it back: the image probe answers 0x0 for a zero-length
+        // file (the FIFO) without opening it, which would block forever.
+        let output = art.join("primary.jpg");
+        let status = std::process::Command::new("mkfifo")
+            .arg(&output)
+            .status()
+            .expect("mkfifo runs");
+        assert!(status.success(), "mkfifo {}", output.display());
+
+        let copying = Arc::new(tokio::sync::Notify::new());
+        let (ran, waited) = std::sync::mpsc::channel();
+        let task = {
+            let copying = Arc::clone(&copying);
+            tokio::spawn(async move {
+                copying.notified().await;
+                ran.send(()).ok();
+            })
+        };
+        let reader = std::thread::spawn(move || {
+            // Opening the read end waits for the copy to open the write end.
+            let mut fifo = std::fs::File::open(&output).expect("fifo");
+            copying.notify_one();
+            let starved = waited.recv_timeout(Duration::from_secs(2)).is_err();
+            let mut copied = Vec::new();
+            fifo.read_to_end(&mut copied).expect("read the copy");
+            (starved, copied)
+        });
+        // On the worker: the test's own future runs on the thread that started it.
+        let report = tokio::spawn(async move { fx.providers.refresh_all().await })
+            .await
+            .expect("the pass finished")
+            .expect("pass");
+
+        assert_eq!(report.generated, 1);
+        let (starved, copied) = reader.join().expect("reader");
+        assert_eq!(copied, std::fs::read(&photo).expect("photo"));
+        assert!(!starved, "the copy held the only worker");
+        tokio::time::timeout(Duration::from_secs(30), task)
+            .await
+            .expect("the task never ran")
+            .expect("the task ran");
     }
 
     /// `ArtistImageProvider` yields no sources upstream, so an artist row is

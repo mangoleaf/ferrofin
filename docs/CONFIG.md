@@ -279,7 +279,7 @@ Ferrofin serves HTTPS itself, as Jellyfin does, from the dashboard's **Networkin
 
 A reverse proxy that terminates TLS needs none of this. List it under **Known proxies** instead.
 Addresses published from each request (**Enable published server URI by request**) take the
-proxy's `X-Forwarded-Proto`, but not yet its `X-Forwarded-Host` (gl-813).
+proxy's `X-Forwarded-Proto` and `X-Forwarded-Host`.
 
 ## Admin seeding (fresh database only)
 
