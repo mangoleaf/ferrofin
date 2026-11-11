@@ -58,6 +58,15 @@ pub(crate) const PROGRAM_SELECT: &str = r#"SELECT p."Id",p."ChannelId",p."StartD
 /// tag). The kinds it does not filter on read as `false`: only the channel
 /// kind filters read them, and each one costs a pass over the airings.
 ///
+/// The guide refresh stores the aggregate on the channel items too
+/// (`save_channel_aggregates`), which is what the item queries read. The two
+/// differ for `IsKids`, whose stored "Kids" tag stays once added, as upstream's
+/// does, where this derivation drops a channel whose kids airing left the
+/// guide; and for `IsSeries`, which is stored from the listing's flag where
+/// this reads `GetProgram`'s widened one (`IsSeries || EpisodeTitle`), so a
+/// channel airing only sub-titled episodes matches here and not there
+/// (gl-1620).
+///
 /// `restrictions` are the user's parental restrictions, which keep only the
 /// channels whose item that user may list.
 ///
@@ -428,9 +437,10 @@ pub async fn delete_programs(db: &Database, ids: &[String]) -> Result<(), Servic
     delete_by_id(db, "FerrofinLiveTvPrograms", ids).await
 }
 
-/// The programme items among `ids` that have a tag in `ItemValues`, which the
-/// blocked and allowed tag rules read. An airing stored before the guide
-/// indexed its tags has none, so the guide refresh writes them once.
+/// The items among `ids` that have a tag in `ItemValues`, which the blocked
+/// and allowed tag rules read: the guide refresh asks it of its programmes and
+/// of its channels. An item stored before the guide indexed its tags has none,
+/// so the refresh writes them once.
 ///
 /// # Errors
 ///
