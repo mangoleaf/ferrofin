@@ -1062,8 +1062,8 @@ impl FerrofinTaskManager {
     pub async fn run_now(&self, key: &str) -> Result<(), ServiceError> {
         let (task, progress) = self.claim(key, None)?;
         let start = Utc::now();
-        let outcome = execute_contained(task.as_ref(), &progress).await;
-        self.finish(key, &task, start, &outcome, &progress);
+        let (outcome, panicked_at) = execute_contained(task.as_ref(), &progress).await;
+        self.finish(key, &task, start, &outcome, panicked_at, &progress);
         outcome
     }
 
@@ -1120,7 +1120,7 @@ impl FerrofinTaskManager {
             async move {
                 let started = std::time::Instant::now();
                 tracing::info!("scheduled task started");
-                let outcome = execute_contained(task.as_ref(), &progress).await;
+                let (outcome, panicked_at) = execute_contained(task.as_ref(), &progress).await;
                 let elapsed_ms = started.elapsed().as_millis();
                 let result = match &outcome {
                     Ok(()) if progress.was_stopped() => "cancelled",
@@ -1135,7 +1135,7 @@ impl FerrofinTaskManager {
                         tracing::error!(elapsed_ms, outcome = result, error = %e, "scheduled task failed");
                     }
                 }
-                this.finish(&key_owned, &task, start, &outcome, &progress);
+                this.finish(&key_owned, &task, start, &outcome, panicked_at, &progress);
             }
             .instrument(span),
         ));
@@ -1192,19 +1192,24 @@ impl FerrofinTaskManager {
     /// Records a finished run's outcome and returns the task to
     /// [`Idle`](TaskState::Idle), unless the run was stopped already (see
     /// [`record_result`](Self::record_result)). `start` is when the run was
-    /// claimed.
+    /// claimed; `panicked_at` is where a body that panicked did.
     fn finish(
         &self,
         key: &str,
         task: &Arc<dyn ScheduledTask>,
         start: chrono::DateTime<Utc>,
         outcome: &Result<(), ServiceError>,
+        panicked_at: Option<String>,
         progress: &TaskProgress,
     ) {
-        let (status, error_message) = match outcome {
-            Ok(()) if progress.was_stopped() => (TaskCompletionStatus::Cancelled, None),
-            Ok(()) => (TaskCompletionStatus::Completed, None),
-            Err(e) => (TaskCompletionStatus::Failed, Some(e.to_string())),
+        let (status, error_message, long_error_message) = match outcome {
+            Ok(()) if progress.was_stopped() => (TaskCompletionStatus::Cancelled, None, None),
+            Ok(()) => (TaskCompletionStatus::Completed, None, None),
+            Err(e) => (
+                TaskCompletionStatus::Failed,
+                Some(e.to_string()),
+                panicked_at.or_else(|| cause_chain(e)),
+            ),
         };
         self.record_result(
             key,
@@ -1218,7 +1223,7 @@ impl FerrofinTaskManager {
                 key: Some(key.to_string()),
                 id: Some(self.id_for_key(key)),
                 error_message,
-                long_error_message: None,
+                long_error_message,
             },
         );
     }
@@ -1477,19 +1482,41 @@ impl FerrofinTaskManager {
 /// error: [`finish`](FerrofinTaskManager::finish) records the failure, returns
 /// the task to [`Idle`](TaskState::Idle) and starts its queued triggers. The
 /// catch sits inside the run, so stopping it still aborts the spawned task.
-/// The panic hook has already logged the panic itself.
+/// The panic hook has already logged the panic itself, and recorded where it
+/// happened ([`take_location`](ferrofin_util::panic::take_location)), which is
+/// returned beside a panic's error as `panicked at <file:line:column>`.
 async fn execute_contained(
     task: &dyn ScheduledTask,
     progress: &TaskProgress,
-) -> Result<(), ServiceError> {
-    futures_util::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(task.execute(progress)))
-        .await
-        .unwrap_or_else(|panic| {
+) -> (Result<(), ServiceError>, Option<String>) {
+    match futures_util::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(
+        task.execute(progress),
+    ))
+    .await
+    {
+        Ok(outcome) => (outcome, None),
+        Err(panic) => (
             Err(ServiceError::backend(format!(
                 "scheduled task panicked: {}",
                 ferrofin_util::panic::message(panic.as_ref())
-            )))
-        })
+            ))),
+            ferrofin_util::panic::take_location().map(|at| format!("panicked at {at}")),
+        ),
+    }
+}
+
+/// A failed run's `LongErrorMessage`, which upstream fills with the
+/// exception's stack trace (`ScheduledTaskWorker.OnTaskCompleted`). A Rust
+/// error carries no stack trace but its causes, so this is the `source()`
+/// chain below `error`, one cause per line, or `None` when it has none. Each
+/// URL is cut to its host (`LOGGING.md` rule 5): a cause is text Ferrofin did
+/// not write, and a request URL can carry a key.
+fn cause_chain(error: &ServiceError) -> Option<String> {
+    let causes: Vec<String> =
+        std::iter::successors(std::error::Error::source(error), |cause| cause.source())
+            .map(|cause| ferrofin_util::source_url::redact_urls_in(&cause.to_string()).into_owned())
+            .collect();
+    (!causes.is_empty()).then(|| causes.join("\n"))
 }
 
 /// Converts trigger ticks (100 ns) to a chrono duration.
@@ -3034,6 +3061,115 @@ mod tests {
             .expect("result");
         assert_eq!(result.status, TaskCompletionStatus::Failed);
         assert_eq!(result.error_message.as_deref(), Some("backend error: boom"));
+        assert_eq!(result.long_error_message, None, "the error has no causes");
+    }
+
+    /// The middle of [`ChainedFailureTask`]'s error.
+    #[derive(Debug, thiserror::Error)]
+    #[error("could not read the guide")]
+    struct ReadGuide(#[source] std::io::Error);
+
+    /// The top of [`ChainedFailureTask`]'s error.
+    #[derive(Debug, thiserror::Error)]
+    #[error("guide refresh failed")]
+    struct RefreshGuide(#[source] ReadGuide);
+
+    /// A task whose body fails with an error that has two causes, the last
+    /// naming a URL that carries a token.
+    struct ChainedFailureTask;
+
+    #[allow(clippy::unnecessary_literal_bound)]
+    #[async_trait]
+    impl ScheduledTask for ChainedFailureTask {
+        fn key(&self) -> &str {
+            "chained"
+        }
+        fn name(&self) -> &str {
+            "Chained Task"
+        }
+        fn description(&self) -> &str {
+            "fails with causes"
+        }
+        fn category(&self) -> &str {
+            "Test"
+        }
+        async fn execute(&self, _progress: &TaskProgress) -> Result<(), ServiceError> {
+            Err(ServiceError::backend_source(RefreshGuide(ReadGuide(
+                std::io::Error::new(
+                    std::io::ErrorKind::ConnectionRefused,
+                    "connection refused: https://guide.example/xmltv?token=secret",
+                ),
+            ))))
+        }
+    }
+
+    /// gl-908: upstream's `OnTaskCompleted` records a failure's
+    /// `ex.StackTrace` as `LongErrorMessage`. A Rust error has no stack trace,
+    /// so a failed run records the error's causes, one per line, with each URL
+    /// cut to its host, on the result it keeps, saves and publishes.
+    #[tokio::test]
+    async fn a_failed_runs_long_error_message_is_its_cause_chain() {
+        let mgr = FerrofinTaskManager::new();
+        mgr.register(Arc::new(ChainedFailureTask));
+        let dir = tempfile::tempdir().expect("tempdir");
+        mgr.set_result_store(dir.path().join("task_results.json"));
+        let events = crate::event_manager::FerrofinEventManager::new();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+        events.subscribe(
+            "TaskCompleted",
+            Arc::new(move |payload: &str| {
+                let _ = tx.send(payload.to_owned());
+                crate::event_manager::consumer_done()
+            }),
+        );
+        mgr.set_event_manager(Arc::new(events));
+
+        mgr.run_now("chained").await.expect_err("the body fails");
+
+        let causes = "could not read the guide\nconnection refused: https://guide.example";
+        let result = mgr
+            .get("chained")
+            .expect("info")
+            .last_execution_result
+            .expect("result");
+        assert_eq!(
+            result.error_message.as_deref(),
+            Some("guide refresh failed")
+        );
+        assert_eq!(result.long_error_message.as_deref(), Some(causes));
+        assert_eq!(
+            super::lock(&mgr.stored_results)["chained"]
+                .long_error_message
+                .as_deref(),
+            Some(causes)
+        );
+        let published = tokio::time::timeout(PANIC_TEST_LIMIT, rx.recv())
+            .await
+            .expect("published in time")
+            .expect("published");
+        let published: serde_json::Value = serde_json::from_str(&published).expect("json");
+        assert_eq!(published["LongErrorMessage"], causes);
+    }
+
+    /// gl-908: for a panic, `LongErrorMessage` is where the body panicked,
+    /// which the server's panic hook records for the run that catches it. The
+    /// run is queued, as the dashboard and the scheduler start one; this
+    /// runtime has one thread, so the hook and the catch share it.
+    #[tokio::test]
+    async fn a_panicked_runs_long_error_message_is_where_it_panicked() {
+        let (mgr, _runs) = panicking(None);
+        let previous = std::panic::take_hook();
+        std::panic::set_hook(Box::new(ferrofin_util::panic::record_location));
+        mgr.queue("panicking").expect("queued");
+        let result = idle_result(&mgr, "panicking").await;
+        std::panic::set_hook(previous);
+
+        assert_eq!(result.error_message.as_deref(), Some(KABOOM));
+        let long = result.long_error_message.expect("where it panicked");
+        assert!(
+            long.starts_with(concat!("panicked at ", file!(), ":")),
+            "{long}"
+        );
     }
 
     #[tokio::test]
