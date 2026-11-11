@@ -3387,15 +3387,17 @@ impl LiveTvManager for FerrofinLiveTvManager {
         let mut rows: Vec<ChannelRow> =
             crate::guide_repository::channel_rows(&self.db, query, restrictions.as_ref()).await?;
 
-        // Favourite/like filters and favourite-first sorting read the user's
-        // channel user-data (C# pushes the same predicates into SQL).
+        // Favourite/like filters, favourite-first sorting and the user-data
+        // sort keys read the user's channel user-data (C# pushes the same
+        // predicates and `OrderMapper` keys into SQL).
         let user_id = query
             .user
             .as_ref()
             .and_then(|u| Uuid::parse_str(&u.id).ok());
         let needs_user_data = query.enable_favorite_sorting
             || query.is_favorite.is_some()
-            || query.is_liked.is_some();
+            || query.is_liked.is_some()
+            || crate::projection::sort_reads_user_data(&query.sort_by);
         let user_data = match user_id {
             Some(uid) if needs_user_data => {
                 crate::guide_repository::channel_user_data(&self.db, uid).await?
