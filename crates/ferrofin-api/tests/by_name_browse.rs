@@ -1397,3 +1397,67 @@ async fn a_by_name_list_refuses_a_parent_naming_no_item(#[case] route: &str) {
         );
     }
 }
+
+/// `GetArtists` and `GetAlbumArtists` declare `[FromQuery] double?
+/// minCommunityRating` (v12.4 `ArtistsController.cs:92`, `:246`): a value the
+/// binder cannot convert is a `400` before the action runs, a blank one binds
+/// null, and a valid one changes nothing, as `GetItemValues` copies it onto
+/// neither filter. The Genres, `MusicGenres` and Studios actions do not declare
+/// it, so there every value is ignored. Each value's status was measured on a
+/// stock Jellyfin 12.4.
+#[rstest::rstest]
+#[case::artists("/Artists", true)]
+#[case::album_artists("/Artists/AlbumArtists", true)]
+#[case::genres("/Genres", false)]
+#[case::music_genres("/MusicGenres", false)]
+#[case::studios("/Studios", false)]
+#[tokio::test]
+async fn min_community_rating_binds_as_a_double_where_declared(
+    #[case] route: &str,
+    #[case] declared: bool,
+) {
+    for (query, binds) in [
+        ("minCommunityRating=abc", false),
+        ("MINCOMMUNITYRATING=abc", false),
+        ("minCommunityRating=1.5%20x", false),
+        ("minCommunityRating=0x10", false),
+        // A scalar binds its first occurrence (`ValueProviderResult.FirstValue`).
+        ("minCommunityRating=abc&minCommunityRating=1.5", false),
+        ("minCommunityRating=1.5&minCommunityRating=abc", true),
+        ("minCommunityRating=1.5", true),
+        ("minCommunityRating=%201.5%20", true),
+        ("minCommunityRating=", true),
+        ("minCommunityRating=%09", true),
+        ("minCommunityRating=1e400", true),
+        ("minCommunityRating=-Infinity", true),
+        ("minCommunityRating=NaN", true),
+    ] {
+        let refused = declared && !binds;
+        let library = ByNameLibrary::default();
+        let response = create_router(by_name_state_with_library(library.clone()))
+            .oneshot(
+                Request::builder()
+                    .uri(format!("{route}?{query}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let expected = if refused {
+            StatusCode::BAD_REQUEST
+        } else {
+            StatusCode::OK
+        };
+        assert_eq!(response.status(), expected, "{route}?{query}");
+        let seen = library.seen.lock().expect("lock");
+        assert_eq!(
+            seen.is_empty(),
+            refused,
+            "{route}?{query}: listed once bound"
+        );
+        assert!(
+            seen.iter().all(|q| q.min_community_rating.is_none()),
+            "{route}?{query}: never applied"
+        );
+    }
+}

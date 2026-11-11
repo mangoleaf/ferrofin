@@ -42,6 +42,8 @@ async fn get_artists(
     RequireAuth(auth): RequireAuth,
     Query(query): Query<ByNameListQuery>,
 ) -> Result<Json<QueryResult<BaseItemDto>>, ApiError> {
+    // Model binding: refused before the action runs.
+    query.check_min_community_rating()?;
     let user = resolve_user_or_api_key(&state, &auth, query.user_id).await?;
     // `GetParentItem`: an id naming no item is a 400.
     query.parent(&state, &auth, user.as_deref()).await?;
@@ -74,6 +76,8 @@ async fn get_album_artists(
     RequireAuth(auth): RequireAuth,
     Query(query): Query<ByNameListQuery>,
 ) -> Result<Json<QueryResult<BaseItemDto>>, ApiError> {
+    // Model binding: refused before the action runs.
+    query.check_min_community_rating()?;
     let user = resolve_user_or_api_key(&state, &auth, query.user_id).await?;
     // `GetParentItem`: an id naming no item is a 400.
     query.parent(&state, &auth, user.as_deref()).await?;
