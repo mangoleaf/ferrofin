@@ -4752,24 +4752,17 @@ impl FerrofinDtoService {
             // (C# AttachPeople: `People[].Id` is the per-name item id, the
             // one favorites are written against — never the per-credit
             // `Peoples` row id, which fragments a person across types).
-            // One clean key per distinct spelling, not one per credit per
-            // item: `slot_by_name` maps every RAW spelling seen to the slot
-            // of the name it resolves through using the same clean key as the database, so
-            // the projection can look the id up by the stored string.
+            // One lookup per distinct spelling, not one per credit per item,
+            // and not one per clean name: `GetPerson` reads each spelling's
+            // own item. `slot_by_name` maps every RAW spelling to its slot,
+            // so the projection can look the id up by the stored string.
             let mut names: Vec<String> = Vec::new();
-            let mut slot_by_clean: HashMap<String, usize> = HashMap::new();
             let mut slot_by_name: HashMap<String, usize> = HashMap::new();
             for person in people.values().flatten() {
-                if slot_by_name.contains_key(person.name.as_str()) {
-                    continue;
+                if !slot_by_name.contains_key(person.name.as_str()) {
+                    slot_by_name.insert(person.name.clone(), names.len());
+                    names.push(person.name.clone());
                 }
-                let slot = *slot_by_clean
-                    .entry(crate::text_util::get_clean_value(&person.name))
-                    .or_insert_with(|| {
-                        names.push(person.name.clone());
-                        names.len() - 1
-                    });
-                slot_by_name.insert(person.name.clone(), slot);
             }
             // The id is the ONLY thing this resolution needs, so it asks for the
             // id — not the row. Materializing a full `BaseItemEntity` per
@@ -5523,10 +5516,11 @@ mod tests {
         ) -> Result<Vec<BaseItemEntity>, ServiceError> {
             // Only the by-name lookup is served (`get_named_item` filters
             // `get_item_list` by name). Match the way the real by-name resolver
-            // does — on the CLEAN value (`LibraryManager::get_named_items`
-            // compares `get_clean_value(name)` against the stored `CleanName`),
-            // so accents, punctuation, spacing and case all fold exactly as they
-            // do against a real database.
+            // does for the other kinds — on the CLEAN value
+            // (`LibraryManager::get_named_items` compares `get_clean_value(name)`
+            // against the stored `CleanName`), so accents, punctuation, spacing
+            // and case all fold. The real manager reads a `Person` by the id its
+            // spelling derives instead (gl-1079); these tests pin the prefetch.
             let Some(name) = query.name.as_deref() else {
                 return Ok(vec![]);
             };
@@ -12559,7 +12553,10 @@ mod tests {
     /// Credit spellings whose *stored* form differs from every "tidy" convention
     /// a test would otherwise use: mixed case, leading/trailing and doubled
     /// internal whitespace, punctuation, accents, and non-Latin script. Paired
-    /// with the name of the ONE by-name `Person` item that backs each.
+    /// with the name of the ONE by-name `Person` item that backs each in the
+    /// tests' `FakeLibrary`, which resolves by clean value; the real manager
+    /// reads a person by the id each spelling derives (`GetPerson`), so these
+    /// pairs pin the prefetch's key convention, not which item a name opens.
     ///
     /// The clean value folds case and diacritics and NOTHING else (C#
     /// `GetCleanValue` is `RemoveDiacritics().ToLowerInvariant()`), so each

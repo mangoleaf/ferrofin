@@ -4039,13 +4039,15 @@ mod tests {
         );
     }
 
-    /// Spellings sharing a clean name are one person on one row: it survives
-    /// the loss of the spelling it carries, as the credit left still resolves
-    /// to it, and no second item appears. The name-keyed sweep deleted it.
+    /// Spellings sharing a clean name are two people, as `GetPerson` reads
+    /// them (gl-1079): a library an earlier Ferrofin scanned kept the second
+    /// spelling on the first one's item, and the run gives it an item of its
+    /// own, refreshed with the providers like any new person.
     #[tokio::test]
-    async fn refresh_people_keeps_the_item_a_second_spelling_resolves_to() {
+    async fn refresh_people_gives_a_second_spelling_an_item_of_its_own() {
         let run = PeopleRun::new().await;
-        run.credit(0xA10, &["H Jon Benjamin"]).await;
+        run.credit(0xA10, &["H Jon Benjamin", "H. Jon Benjamin"])
+            .await;
         let first = run.id_of("H. Jon Benjamin");
         seed_named_item(&run.db, first, BaseItemKind::Person, "H. Jon Benjamin").await;
         crate::test_support::set_clean_name(&run.db, first, "H. Jon Benjamin").await;
@@ -4053,18 +4055,24 @@ mod tests {
 
         run.run().await;
 
-        assert_eq!(run.names().await, ["H. Jon Benjamin"]);
+        assert_eq!(run.names().await, ["H Jon Benjamin", "H. Jon Benjamin"]);
+        let refreshed = run.refreshed();
+        assert_eq!(refreshed.first(), Some(&run.id_of("H Jon Benjamin")));
+        assert!(!refreshed.contains(&first), "{refreshed:?}");
     }
 
     /// An item whose id is not the derived one, as in a database whose metadata
     /// moved: its exact-name credit keeps it, and no second item is made for
-    /// the credit, which would refresh every person of such a library.
+    /// the credit, which would refresh every person of such a library. It is
+    /// the item the person reads open, too.
     #[tokio::test]
     async fn refresh_people_keeps_a_credited_name_under_another_id() {
+        use ferrofin_traits::persistence::PeopleRepository as _;
         let run = PeopleRun::new().await;
         run.credit(0xA20, &["Moved Mary"]).await;
         let moved = Uuid::from_u128(0xA2F);
         seed_named_item(&run.db, moved, BaseItemKind::Person, "Moved Mary").await;
+        crate::test_support::set_clean_name(&run.db, moved, "Moved Mary").await;
         run.mark_refreshed(moved).await;
 
         run.run().await;
@@ -4075,6 +4083,15 @@ mod tests {
             run.refreshed(),
             Vec::<Uuid>::new(),
             "nothing new to refresh"
+        );
+        let people = crate::people_repository::FerrofinPeopleRepository::new(run.db.clone())
+            .with_identity(PeopleRun::mode(), PeopleRun::root(&run.people_root));
+        assert_eq!(
+            people
+                .find_person_item_ids(&["Moved Mary".to_owned()])
+                .await
+                .expect("read"),
+            [Some(moved)]
         );
     }
 
