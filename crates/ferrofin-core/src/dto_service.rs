@@ -9145,6 +9145,33 @@ mod tests {
         assert!((dto.primary_image_aspect_ratio.unwrap() - 2.0).abs() < 1e-9);
     }
 
+    /// gl-1678: a series on the page is also its episodes' image parent, so
+    /// its id is in the page's image read twice. On a page past one IN-list
+    /// chunk the two copies fall in different chunks, and each must still
+    /// read its one backdrop once, as Jellyfin lists it.
+    #[tokio::test]
+    async fn a_series_on_a_page_past_one_chunk_lists_its_backdrop_once() {
+        let db = test_db().await;
+        let (episode, _season_id, series_id) = seed_episode_tree(&db).await;
+        let mut page = vec![fetch_item(&db, series_id).await, episode.clone()];
+        for _ in 0..ferrofin_db::PADDED_LIST_MAX {
+            let mut other = episode.clone();
+            other.id = guid_to_db(Uuid::new_v4());
+            page.push(other);
+        }
+        let svc = service(db);
+        let dtos = svc
+            .get_base_item_dtos(&page, &DtoOptions::default(), None, None, true)
+            .await
+            .unwrap();
+        let fanart = ["tag:/shows/fanart.jpg".to_owned()];
+        assert_eq!(dtos[0].backdrop_image_tags.as_deref(), Some(&fanart[..]));
+        assert_eq!(
+            dtos[1].parent_backdrop_image_tags.as_deref(),
+            Some(&fanart[..])
+        );
+    }
+
     /// Audio → MusicAlbum → MusicArtist (by album-artist name): `AlbumId`,
     /// `AlbumPrimaryImageTag`, `AlbumNormalizationGain` from the album row
     /// (:1207-1222), the album's Logo as the parent logo, and the artist's

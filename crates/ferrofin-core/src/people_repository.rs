@@ -1034,16 +1034,14 @@ async fn person_items_by_clean_names(
     conn: &mut SqliteConnection,
     cleans: &[String],
 ) -> Result<HashMap<String, String>, ServiceError> {
-    let mut seen = HashSet::new();
-    let distinct: Vec<&String> = cleans.iter().filter(|c| seen.insert(*c)).collect();
     let mut by_clean = HashMap::new();
-    for binds in ferrofin_db::padded_in_chunks(&distinct) {
+    for binds in ferrofin_db::padded_in_chunks(cleans) {
         let mut query = sqlx::query_as::<_, (String, String)>(sqlx::AssertSqlSafe(
             person_items_by_clean_names_sql(binds.len()),
         ))
         .bind(PERSON_TYPE_NAME);
         for clean in binds {
-            query = query.bind(*clean);
+            query = query.bind(clean);
         }
         for (clean, id) in query.fetch_all(&mut *conn).await.map_err(db_err)? {
             by_clean.entry(clean).or_insert(id);
@@ -1059,15 +1057,13 @@ async fn overviews_by_ids(
     conn: &mut SqliteConnection,
     ids: &[String],
 ) -> Result<HashMap<String, Option<String>>, ServiceError> {
-    let mut seen = HashSet::new();
-    let distinct: Vec<&String> = ids.iter().filter(|id| seen.insert(*id)).collect();
-    let mut stored = HashMap::with_capacity(distinct.len());
-    for binds in ferrofin_db::padded_in_chunks(&distinct) {
+    let mut stored = HashMap::with_capacity(ids.len());
+    for binds in ferrofin_db::padded_in_chunks(ids) {
         let mut query = sqlx::query_as::<_, (String, Option<String>)>(sqlx::AssertSqlSafe(
             overviews_by_ids_sql(binds.len()),
         ));
         for id in binds {
-            query = query.bind(*id);
+            query = query.bind(id);
         }
         stored.extend(query.fetch_all(&mut *conn).await.map_err(db_err)?);
     }

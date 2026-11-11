@@ -5031,6 +5031,12 @@ mod tests {
             };
             assert_eq!(paths(&batched[&id]), paths(&one), "{id}");
         }
+        // gl-1678: an id repeated past one IN chunk still reads its rows once.
+        let mut repeated = vec![first];
+        repeated.extend((0..ferrofin_db::PADDED_LIST_MAX).map(|_| Uuid::new_v4()));
+        repeated.push(first);
+        let once = repo.get_image_infos_batch(&repeated).await.unwrap();
+        assert_eq!(once[&first].len(), 3);
     }
 
     /// A page's artist and music-video album links resolve through one
