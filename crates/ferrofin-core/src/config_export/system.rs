@@ -9,9 +9,11 @@ use super::Document;
 use crate::config_import::SYSTEM_XML_DENY;
 use crate::configuration_manager::FerrofinServerConfigurationManager as Manager;
 
+/// Where Jellyfin reads it, relative to its program data directory.
+pub(super) const FILE: &str = "config/system.xml";
+
 /// The main server configuration.
 pub(super) const DOCUMENT: Document = Document {
-    file: "config/system.xml",
     root: "ServerConfiguration",
     written_as_default: SYSTEM_XML_DENY,
     // The 4:4:4 trickplay tiles opt-in (owner decision 2026-11-01, gl-1128).
