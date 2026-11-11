@@ -1614,9 +1614,13 @@ impl FerrofinLiveTvManager {
             return Ok(());
         };
         let view_id = self.live_tv_view_id().await;
-        let rows =
-            crate::guide_repository::channel_rows(&self.db, &LiveTvChannelQuery::default(), None)
-                .await?;
+        let rows = crate::guide_repository::channel_rows(
+            &self.db,
+            &LiveTvChannelQuery::default(),
+            None,
+            false,
+        )
+        .await?;
         // The channel items already stored, read ONCE: the merge below needs
         // them (the C# loads each item before assigning to it) and so does
         // `CleanDatabase`.
@@ -3473,9 +3477,10 @@ impl LiveTvManager for FerrofinLiveTvManager {
     ) -> Result<QueryResult<BaseItemDto>, ServiceError> {
         // Port of `LiveTvManager.GetInternalChannels` + the controller's
         // projection. The generic item repository upstream runs this over SQL.
-        // Here the read applies the user's parental restrictions (as
-        // `new InternalItemsQuery(user)` does) and the kind filters over the
-        // stored channel items; the type, favourite and like filters and the
+        // Here the read lists only the channels whose item is stored, as
+        // upstream lists the items, and applies the user's parental
+        // restrictions (as `new InternalItemsQuery(user)` does) and the kind
+        // filters over them; the type, favourite and like filters and the
         // sort run over the loaded lineup, all before the page is cut.
         let restrictions = self
             .user_restrictions(&InternalItemsQuery {
@@ -3483,8 +3488,13 @@ impl LiveTvManager for FerrofinLiveTvManager {
                 ..InternalItemsQuery::default()
             })
             .await?;
-        let mut rows: Vec<ChannelRow> =
-            crate::guide_repository::channel_rows(&self.db, query, restrictions.as_ref()).await?;
+        let mut rows: Vec<ChannelRow> = crate::guide_repository::channel_rows(
+            &self.db,
+            query,
+            restrictions.as_ref(),
+            self.item_store.get().is_some(),
+        )
+        .await?;
 
         // Favourite/like filters and favourite-first sorting read the user's
         // channel user-data (C# pushes the same predicates into SQL).
@@ -8479,10 +8489,14 @@ mod tests {
         // Read back through the repository, not inline SQL (the SQL-boundary
         // ratchet): `channel_rows` is the lineup in stored order, and
         // `channel_stream_source` is the per-channel tuner facts.
-        let rows =
-            crate::guide_repository::channel_rows(&mgr.db, &LiveTvChannelQuery::default(), None)
-                .await
-                .expect("channels");
+        let rows = crate::guide_repository::channel_rows(
+            &mgr.db,
+            &LiveTvChannelQuery::default(),
+            None,
+            false,
+        )
+        .await
+        .expect("channels");
         // The DRM row is dropped, and the identity is `hdhr_{GuideNumber}` —
         // NOT the M3U `m3u_{md5}{md5}` shape.
         assert_eq!(rows.len(), 2);
@@ -15450,10 +15464,15 @@ mod tests {
             .expect("ids");
         assert!(found.is_empty(), "{found:?}");
         assert_eq!(
-            crate::guide_repository::channel_rows(&mgr.db, &LiveTvChannelQuery::default(), None)
-                .await
-                .expect("channels")
-                .len(),
+            crate::guide_repository::channel_rows(
+                &mgr.db,
+                &LiveTvChannelQuery::default(),
+                None,
+                false
+            )
+            .await
+            .expect("channels")
+            .len(),
             2
         );
     }
@@ -15502,10 +15521,14 @@ mod tests {
         .await
         .expect("provider");
         mgr.refresh_guide().await.expect("refresh");
-        let before =
-            crate::guide_repository::channel_rows(&mgr.db, &LiveTvChannelQuery::default(), None)
-                .await
-                .expect("channels");
+        let before = crate::guide_repository::channel_rows(
+            &mgr.db,
+            &LiveTvChannelQuery::default(),
+            None,
+            false,
+        )
+        .await
+        .expect("channels");
         assert_eq!(before.len(), 2);
         let kept_id = before[0].id.clone();
         let found = crate::guide_repository::all_program_ids(&mgr.db)
@@ -15521,10 +15544,14 @@ mod tests {
         );
         mgr.refresh_guide().await.expect("refresh2");
 
-        let after =
-            crate::guide_repository::channel_rows(&mgr.db, &LiveTvChannelQuery::default(), None)
-                .await
-                .expect("channels2");
+        let after = crate::guide_repository::channel_rows(
+            &mgr.db,
+            &LiveTvChannelQuery::default(),
+            None,
+            false,
+        )
+        .await
+        .expect("channels2");
         assert_eq!(after.len(), 1);
         assert_eq!(after[0].id, kept_id, "the surviving channel keeps its id");
     }
@@ -15607,10 +15634,15 @@ mod tests {
         mgr.refresh_guide().await.expect("refresh2");
         assert_eq!(count().await, programs_after);
         assert_eq!(
-            crate::guide_repository::channel_rows(&mgr.db, &LiveTvChannelQuery::default(), None)
-                .await
-                .expect("channels")
-                .len(),
+            crate::guide_repository::channel_rows(
+                &mgr.db,
+                &LiveTvChannelQuery::default(),
+                None,
+                false
+            )
+            .await
+            .expect("channels")
+            .len(),
             2,
             "the tuner lineup is untouched by the guide's state"
         );
