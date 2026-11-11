@@ -369,6 +369,13 @@ impl AggregateFolderStore {
             &self.db, correct, aggregate, user_root,
         )
         .await?;
+        self.settle_playlists(aggregate, user_root).await
+    }
+
+    /// The playlists in the folder a create finds: those an older Ferrofin
+    /// left without a parent adopted into it, and the ancestors the folder and
+    /// its playlists are missing recorded. Part of [`Self::repair_playlists_folder`].
+    async fn settle_playlists(&self, aggregate: Uuid, user_root: Uuid) -> Result<(), ServiceError> {
         // Playlists an older Ferrofin saved with neither parent nor top parent
         // go into the folder a create finds. Startup's repair, once per
         // process: upstream's lookup (`GetPlaylistsFolder`) writes nothing.
