@@ -33,6 +33,7 @@ const CLIENT_AUTH: &str =
 /// A booted server plus what the test drives it with.
 struct Harness {
     wired: WiredApp,
+    db: Database,
     /// The movies library's and the home videos library's media directories.
     movies_dir: String,
     home_dir: String,
@@ -82,6 +83,7 @@ async fn boot() -> Harness {
         .expect("seed admin");
     Harness {
         wired,
+        db,
         movies_dir: movies_dir.to_string_lossy().into_owned(),
         home_dir: home_dir.to_string_lossy().into_owned(),
         _temp: temp,
@@ -336,4 +338,106 @@ fn urlencoding(value: &str) -> String {
         }
     }
     out
+}
+
+/// The Playlists `UserView` rows stored, by name.
+async fn stored_playlists_views(db: &Database) -> i64 {
+    sqlx::query_scalar(
+        r#"SELECT COUNT(*) FROM "BaseItems"
+           WHERE "Type" = 'MediaBrowser.Controller.Entities.UserView' AND "Name" = 'Playlists'"#,
+    )
+    .fetch_one(db.pool())
+    .await
+    .expect("count views")
+}
+
+/// gl-1584: through the real composition root, an item query that names no
+/// scope writes the user's Playlists view once they can see a playlist, as
+/// Jellyfin's `AddUserToQuery` does through `GetUserViews`, though `/UserViews`
+/// is never asked; and the row is the one `/UserViews` then serves.
+#[tokio::test]
+async fn an_unscoped_item_query_writes_the_users_playlists_view() {
+    let harness = boot().await;
+    let router = ferrofin_api::create_router(harness.wired.state.clone());
+    let (auth_header, user_id) = authenticate(&router).await;
+    let path = urlencoding(&harness.movies_dir);
+    let (status, body) = send(
+        &router,
+        &auth_header,
+        "POST",
+        &format!("/Library/VirtualFolders?name=Movies&collectionType=movies&paths={path}&refreshLibrary=false"),
+        Some(serde_json::json!({"LibraryOptions": {"TypeOptions": [
+            {"Type": "Movie", "MetadataFetchers": [], "ImageFetchers": []}
+        ]}})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "library added: {body}");
+    let (status, _) = send(&router, &auth_header, "POST", "/Library/Refresh", None).await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "scan queued");
+    let movie = wait_for("the scanned movies", async || {
+        let (_, items) = send(
+            &router,
+            &auth_header,
+            "GET",
+            &format!("/Items?recursive=true&includeItemTypes=Movie&userId={user_id}"),
+            None,
+        )
+        .await;
+        (items["TotalRecordCount"].as_i64() == Some(3))
+            .then(|| items["Items"][0]["Id"].as_str().map(str::to_owned))
+            .flatten()
+    })
+    .await;
+    assert_eq!(
+        stored_playlists_views(&harness.db).await,
+        0,
+        "no playlist to see: the queries so far wrote no Playlists view"
+    );
+
+    let (status, body) = send(
+        &router,
+        &auth_header,
+        "POST",
+        "/Playlists",
+        Some(serde_json::json!({"Name": "Road Trip", "Ids": [movie], "UserId": user_id, "MediaType": "Video"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "playlist created: {body}");
+    let (status, _) = send(
+        &router,
+        &auth_header,
+        "GET",
+        &format!("/Items?recursive=true&userId={user_id}&limit=1"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        stored_playlists_views(&harness.db).await,
+        1,
+        "the next unscoped query wrote the user's Playlists view"
+    );
+
+    let (status, views) = send(
+        &router,
+        &auth_header,
+        "GET",
+        &format!("/UserViews?userId={user_id}"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        views["Items"]
+            .as_array()
+            .expect("views")
+            .iter()
+            .any(|view| view["Name"] == "Playlists"),
+        "{views}"
+    );
+    assert_eq!(
+        stored_playlists_views(&harness.db).await,
+        1,
+        "/UserViews serves that row and writes no other"
+    );
 }

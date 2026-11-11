@@ -453,6 +453,7 @@ impl FerrofinVirtualFolderManager {
                 id,
                 *aggregate,
                 &self.id_derivation,
+                &self.virtual_paths,
             )
             .await?;
         }
