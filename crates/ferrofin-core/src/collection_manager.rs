@@ -2303,6 +2303,7 @@ mod tests {
             &db,
             BaseItemKind::CollectionFolder,
             &path,
+            &path,
             &mode,
         )
         .await
@@ -2547,8 +2548,11 @@ mod tests {
             assert_eq!(row.parent_id, Some(ferrofin_db::store::guid_to_db(folder)));
         }
         assert_eq!(
-            crate::test_support::fetch_item(&db, folder).await.path,
-            Some(current.to_string_lossy().into_owned()),
+            crate::test_support::fetch_item(&db, folder)
+                .await
+                .path
+                .as_deref(),
+            Some("%AppDataPath%/playlists"),
             "the start re-paths the folder"
         );
     }
