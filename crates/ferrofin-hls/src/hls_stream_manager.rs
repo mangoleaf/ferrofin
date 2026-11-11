@@ -2769,12 +2769,23 @@ mod tests {
         );
     }
 
-    /// A manager running at most one re-encoding job.
-    fn manager_capped_at_one(dir: &Path) -> Mgr {
-        let script = FakeScript {
+    /// What the fake ffmpeg writes for [`manager_capped_at_one`]'s jobs.
+    fn capped_script() -> FakeScript {
+        FakeScript {
             segment_files: vec!["out0.ts".to_owned(), "out-1.ts".to_owned()],
             extra_files: vec!["out.m3u8".to_owned(), "out.ts".to_owned()],
             ..FakeScript::default()
+        }
+    }
+
+    /// A manager running at most one re-encoding job. The jobs it starts
+    /// exit once written, as a short clip does: the placeholder playlist lists
+    /// no segment, so a live-playlist start whose job kept running would wait
+    /// out `MIN_SEGMENT_WAIT_TIMEOUT` for the planner's three.
+    fn manager_capped_at_one(dir: &Path) -> Mgr {
+        let script = FakeScript {
+            exits_immediately: true,
+            ..capped_script()
         };
         let limits = TranscodeLimits {
             server: 1,
@@ -2785,6 +2796,8 @@ mod tests {
     }
 
     /// Starts a job of `user` that takes the only slot, on another playlist.
+    /// It runs through its own fake ffmpeg, not the manager's, which exits:
+    /// this one keeps running, so the job keeps the slot.
     async fn take_the_slot(
         mgr: &Mgr,
         dir: &Path,
@@ -2800,7 +2813,7 @@ mod tests {
         let output_path = dir.join("held").join("out.m3u8");
         mgr.manager
             .start_ffmpeg(
-                &mgr.transcoder,
+                &FakeSegmentTranscoder::new(capped_script()),
                 StartFfMpegRequest {
                     program: "ffmpeg",
                     state: &state,
@@ -2939,9 +2952,15 @@ mod tests {
                 user_id: alice,
                 ..req()
             };
-            start_through(&mgr, path, &as_alice)
-                .await
-                .unwrap_or_else(|error| panic!("{path:?}: {error}"));
+            // Bounded well under `MIN_SEGMENT_WAIT_TIMEOUT`, so a start that
+            // waited out a deadline fails here instead of passing late.
+            tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                start_through(&mgr, path, &as_alice),
+            )
+            .await
+            .unwrap_or_else(|_| panic!("{path:?}: the admitted start hung"))
+            .unwrap_or_else(|error| panic!("{path:?}: {error}"));
         }
     }
 
