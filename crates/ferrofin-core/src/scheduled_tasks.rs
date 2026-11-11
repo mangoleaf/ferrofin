@@ -303,6 +303,13 @@ struct Registration {
 }
 
 impl Registration {
+    /// Whether `run` (the progress handle a run got from `claim`) is this
+    /// task's live run: `claim` gives each run a fresh handle, so a run that
+    /// was stopped, or replaced since, no longer matches.
+    fn is_live(&self, run: &TaskProgress) -> bool {
+        self.state == TaskState::Running && Arc::ptr_eq(&self.progress.stopped, &run.stopped)
+    }
+
     /// Whether this registration's effective triggers include a
     /// `StartupTrigger`.
     /// The time limit of the startup trigger that starts this task.
@@ -945,21 +952,33 @@ impl FerrofinTaskManager {
         }
     }
 
-    /// Records a run's outcome and returns the task to [`Idle`](TaskState::Idle).
-    fn record_result(&self, key: &str, result: TaskResult) {
-        self.publish_task_completed(&result);
-        self.log_failed_task(&result);
-        self.persist_result(key, &result);
+    /// Records the outcome of `run` and returns the task to
+    /// [`Idle`](TaskState::Idle), if `run` is still the task's live run.
+    ///
+    /// A stopped run can still get here: an abort cannot stop a run that does
+    /// not yield again. [`stop_run`](Self::stop_run) has recorded it already,
+    /// and a newer run may own the task by now, which this result must not end.
+    /// Like `stop_run`, the state changes under the lock before the result is
+    /// published and saved, so a run is ended once.
+    fn record_result(&self, key: &str, run: &TaskProgress, result: &TaskResult) {
         let mut guard = lock(&self.tasks);
-        if let Some(reg) = guard.get_mut(key) {
-            reg.state = TaskState::Idle;
-            reg.last_result = Some(result);
-            reg.run = None;
-            reg.started_at = None;
-            reg.run_max_ticks = None;
-        }
+        let Some(reg) = guard.get_mut(key).filter(|reg| reg.is_live(run)) else {
+            tracing::debug!(
+                task = key,
+                "run is no longer the task's live run; its result is dropped"
+            );
+            return;
+        };
+        reg.state = TaskState::Idle;
+        reg.last_result = Some(result.clone());
+        reg.run = None;
+        reg.started_at = None;
+        reg.run_max_ticks = None;
         self.publish_snapshot(&guard);
         drop(guard);
+        self.publish_task_completed(result);
+        self.log_failed_task(result);
+        self.persist_result(key, result);
         self.drain_busy_queue();
     }
 
@@ -1070,6 +1089,7 @@ impl FerrofinTaskManager {
             trigger,
             ..progress
         };
+        let run = progress.clone();
         let this = self.clone();
         let key_owned = key.to_owned();
         let start = Utc::now();
@@ -1103,19 +1123,20 @@ impl FerrofinTaskManager {
             }
             .instrument(span),
         ));
-        let mut guard = lock(&self.tasks);
-        if let Some(reg) = guard.get_mut(key) {
-            // Track the handle while it is still the live run. Otherwise the
-            // run either finished (aborting it is a no-op) or was stopped
-            // (cancelled, or the registry shut down) between `claim` and here,
-            // before its handle was stored: abort it so it cannot outlive that.
-            if reg.state == TaskState::Running {
-                reg.run = Some(handle);
-            } else {
-                handle.abort();
-            }
-        }
+        self.track_run(key, &run, handle);
         Ok(())
+    }
+
+    /// Keeps `handle` as the task's run handle while `run` is still its live
+    /// run. Otherwise the run either finished (aborting it is a no-op) or was
+    /// stopped (cancelled, or the registry shut down) between `claim` and its
+    /// handle being stored, and a newer run may own the task: the handle is
+    /// aborted so the run cannot outlive that.
+    fn track_run(&self, key: &str, run: &TaskProgress, handle: tokio::task::JoinHandle<()>) {
+        match lock(&self.tasks).get_mut(key) {
+            Some(reg) if reg.is_live(run) => reg.run = Some(handle),
+            _ => handle.abort(),
+        }
     }
 
     /// Validates that `key` is registered and idle, flips it to
@@ -1153,7 +1174,9 @@ impl FerrofinTaskManager {
     }
 
     /// Records a finished run's outcome and returns the task to
-    /// [`Idle`](TaskState::Idle). `start` is when the run was claimed.
+    /// [`Idle`](TaskState::Idle), unless the run was stopped already (see
+    /// [`record_result`](Self::record_result)). `start` is when the run was
+    /// claimed.
     fn finish(
         &self,
         key: &str,
@@ -1169,7 +1192,8 @@ impl FerrofinTaskManager {
         };
         self.record_result(
             key,
-            TaskResult {
+            progress,
+            &TaskResult {
                 start_time_utc: start,
                 end_time_utc: Utc::now(),
                 status,
@@ -2802,6 +2826,158 @@ mod tests {
         // The task can be started again after cancellation.
         mgr.queue("gated").expect("requeued");
         assert_eq!(mgr.get("gated").expect("info").state, TaskState::Running);
+    }
+
+    /// A task whose first run is cancelled and started again, as
+    /// `/Library/Refresh` does (`CancelIfRunningAndQueue`), after the body's
+    /// last await: a re-send landing while the run records its result. The
+    /// abort cannot stop a run that does not yield again, so it still
+    /// finishes. Later runs wait for `gate`.
+    struct ReplacedAtItsEnd {
+        mgr: std::sync::OnceLock<FerrofinTaskManager>,
+        runs: Arc<AtomicU32>,
+        gate: Arc<tokio::sync::Notify>,
+    }
+
+    #[allow(clippy::unnecessary_literal_bound)]
+    #[async_trait]
+    impl ScheduledTask for ReplacedAtItsEnd {
+        fn key(&self) -> &str {
+            "replaced"
+        }
+        fn name(&self) -> &str {
+            "Replaced Task"
+        }
+        fn description(&self) -> &str {
+            "replaced as its first run ends"
+        }
+        fn category(&self) -> &str {
+            "Test"
+        }
+        async fn execute(&self, _progress: &TaskProgress) -> Result<(), ServiceError> {
+            if self.runs.fetch_add(1, Ordering::SeqCst) == 0 {
+                let mgr = self.mgr.get().expect("manager");
+                mgr.cancel("replaced")?;
+                mgr.queue("replaced")?;
+            } else {
+                self.gate.notified().await;
+            }
+            Ok(())
+        }
+    }
+
+    /// gl-1025: the result of a run that was stopped but still finished must
+    /// not end the run that replaced it. It did, so the task read Idle while
+    /// the replacement ran, and a third run could start beside it.
+    #[tokio::test]
+    async fn a_stopped_run_that_still_finishes_does_not_end_its_replacement() {
+        let mgr = FerrofinTaskManager::new();
+        let runs = Arc::new(AtomicU32::new(0));
+        let gate = Arc::new(tokio::sync::Notify::new());
+        let task = Arc::new(ReplacedAtItsEnd {
+            mgr: std::sync::OnceLock::new(),
+            runs: runs.clone(),
+            gate: gate.clone(),
+        });
+        mgr.register(task.clone());
+        task.mgr.set(mgr.clone()).expect("set once");
+        let dir = tempfile::tempdir().expect("tempdir");
+        mgr.set_result_store(dir.path().join("task_results.json"));
+        let events = crate::event_manager::FerrofinEventManager::new();
+        let (tx, rx) = std::sync::mpsc::channel::<String>();
+        events.subscribe(
+            "TaskCompleted",
+            Arc::new(move |payload: &str| {
+                let _ = tx.send(payload.to_owned());
+                crate::event_manager::consumer_done()
+            }),
+        );
+        mgr.set_event_manager(Arc::new(events));
+
+        mgr.queue("replaced").expect("first run");
+        wait_for_runs(&runs, 2).await;
+        let info = mgr.get("replaced").expect("info");
+        assert_eq!(info.state, TaskState::Running, "the replacement runs");
+        assert_eq!(
+            info.last_execution_result.expect("result").status,
+            TaskCompletionStatus::Cancelled,
+            "the stop's result stands"
+        );
+        assert!(
+            matches!(mgr.queue("replaced"), Err(ServiceError::InvalidInput(_))),
+            "no run starts beside the replacement"
+        );
+        // The stopped run's finish neither saves nor announces a result.
+        assert_eq!(
+            super::lock(&mgr.stored_results)["replaced"].status,
+            TaskCompletionStatus::Cancelled
+        );
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let mut ended: Vec<String> = Vec::new();
+        while ended.is_empty() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the stop is announced"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            ended.extend(rx.try_iter());
+        }
+        // Long enough for a second publish, spawned before the first was read.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        ended.extend(rx.try_iter());
+        assert_eq!(ended.len(), 1, "one TaskCompleted, the stop's: {ended:?}");
+        let ended: serde_json::Value = serde_json::from_str(&ended[0]).expect("payload");
+        assert_eq!(ended["Status"], "Cancelled");
+
+        gate.notify_one();
+        let result = idle_result(&mgr, "replaced").await;
+        assert_eq!(result.status, TaskCompletionStatus::Completed);
+        assert_eq!(runs.load(Ordering::SeqCst), 2);
+    }
+
+    /// gl-1025: the handle of a run that ended before it was stored must not
+    /// take the place of the run that replaced it, which `cancel` must still
+    /// stop.
+    #[tokio::test]
+    async fn a_late_run_handle_does_not_replace_the_live_runs() {
+        let mgr = FerrofinTaskManager::new();
+        mgr.register(Arc::new(GatedTask {
+            gate: Arc::new(tokio::sync::Notify::new()),
+        }));
+        // A run that only ends when aborted; the receiver sees its future dropped.
+        let until_aborted = || {
+            let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+            let handle = tokio::spawn(async move {
+                let _tx = tx;
+                std::future::pending::<()>().await;
+            });
+            (handle, rx)
+        };
+        let (_, first) = mgr.claim("gated", None).expect("first claim");
+        mgr.cancel("gated").expect("cancel");
+        let (_, second) = mgr.claim("gated", None).expect("second claim");
+        let (second_handle, mut second_dropped) = until_aborted();
+        mgr.track_run("gated", &second, second_handle);
+        let (first_handle, first_dropped) = until_aborted();
+        mgr.track_run("gated", &first, first_handle);
+
+        let wait = std::time::Duration::from_secs(5);
+        assert!(
+            tokio::time::timeout(wait, first_dropped).await.is_ok(),
+            "the late handle is aborted"
+        );
+        assert!(
+            matches!(
+                second_dropped.try_recv(),
+                Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+            ),
+            "the live run is left alone"
+        );
+        mgr.cancel("gated").expect("cancel");
+        assert!(
+            tokio::time::timeout(wait, second_dropped).await.is_ok(),
+            "cancel stops the live run"
+        );
     }
 
     #[tokio::test]
