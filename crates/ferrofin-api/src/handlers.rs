@@ -3564,9 +3564,10 @@ pub const VERIFIED: &[Verified] = &[
                GetManageableItems: manual links, in order, missing items out), then \
                LibraryManager::filter_visible_items_standalone over the rows just read \
                (ItemVisibility::visible, one answer per distinct id) before the paging, as \
-               upstream filters before Skip and Take, and tv_shows::build_dto_options + \
-               get_linked_children_dtos + the PlaylistItemId tag",
-        date: "2026-11-09",
+               upstream filters before Skip and Take (the count taken first; a negative \
+               startIndex skips nothing, a negative limit takes nothing), and \
+               tv_shows::build_dto_options + get_linked_children_dtos + the PlaylistItemId tag",
+        date: "2026-11-11",
         divergences: &[
             "A member the caller may not open is left out with the standalone check, which also \
          walks its library, where upstream's IsVisible reads only its rating and tags and \
@@ -3579,8 +3580,6 @@ pub const VERIFIED: &[Verified] = &[
          the edges: a member of a disabled library or a file in no library is kept here and \
          dropped there, and a member whose parent fails the caller's rating limit is dropped \
          here and kept there. This list answers as GET /Items/{id} does.",
-            "A negative limit is ignored and the rest of the list comes back; upstream's \
-         Take(limit) answers an empty page. Fix path: gl-1137.",
             "The 404 (no playlist the caller can see) and 403 (another user's id without the \
          administrator role) bodies are Ferrofin's error shape, not upstream's. Fix path: \
          gl-666.",
