@@ -14,7 +14,7 @@ use ferrofin_traits::options::InternalItemsQuery;
 use ferrofin_traits::persistence::ParentalRestrictions;
 use ferrofin_traits::stubs::LiveTvChannelQuery;
 
-use crate::projection::{ChannelRow, ChannelUserData, ProgramRow};
+use crate::projection::{ChannelRow, ChannelUserData, ChannelUserDataRow, ProgramRow};
 
 /// A user's parental restrictions for a guide read: the item layer's
 /// predicate and the query its user's preferences were loaded onto.
@@ -238,10 +238,9 @@ pub async fn program_rows_by_ids(
     Ok(out)
 }
 
-/// The user's channel user-data rows, keyed by the stored channel id:
-/// `(IsFavorite, Rating)`. Backs the favourite/like filters and
-/// favourite-first sorting, which upstream pushes into the item repository's
-/// SQL.
+/// The user's channel user-data rows, keyed by the stored channel id. Backs
+/// the favourite/like filters, favourite-first sorting and the play-state
+/// sort keys, which upstream pushes into the item repository's SQL.
 ///
 /// # Errors
 ///
@@ -251,7 +250,8 @@ pub async fn channel_user_data(
     user_id: Uuid,
 ) -> Result<ChannelUserData, ServiceError> {
     let rows = sqlx::query(
-        r#"SELECT ud."ItemId", ud."IsFavorite", ud."Rating"
+        r#"SELECT ud."ItemId", ud."IsFavorite", ud."Rating", ud."PlayCount", ud."Played",
+                  ud."LastPlayedDate"
            FROM "UserData" ud
            JOIN "FerrofinLiveTvChannels" c ON c."Id" = ud."ItemId"
            WHERE ud."UserId" = ?1 AND ud."CustomDataKey" = lower(ud."ItemId")"#,
@@ -265,10 +265,13 @@ pub async fn channel_user_data(
         .map(|r| {
             (
                 r.get::<String, _>("ItemId"),
-                (
-                    r.get::<bool, _>("IsFavorite"),
-                    r.get::<Option<f64>, _>("Rating"),
-                ),
+                ChannelUserDataRow {
+                    is_favorite: r.get("IsFavorite"),
+                    rating: r.get("Rating"),
+                    play_count: r.get("PlayCount"),
+                    played: r.get("Played"),
+                    last_played_date: r.get("LastPlayedDate"),
+                },
             )
         })
         .collect())

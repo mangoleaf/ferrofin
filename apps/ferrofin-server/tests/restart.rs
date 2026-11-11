@@ -304,6 +304,79 @@ async fn restart_loads_config_toml_again_and_keeps_the_last_one_that_loaded() {
         .expect("run exits cleanly");
 }
 
+/// gl-555: a base URL saved on the Networking page marks a restart pending,
+/// changes nothing before it, and the next lifetime mounts, redirects to and
+/// advertises it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_networking_page_base_url_applies_on_the_restart() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let client = reqwest::Client::builder()
+        .timeout(REQUEST_TIMEOUT)
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .expect("client");
+    let (server, base, config) = spawn_server(&client, |port| Config {
+        server_name: "ferrofin-base-url".to_owned(),
+        admin_user: ADMIN_USER.to_owned(),
+        admin_password: ADMIN_PASSWORD.to_owned(),
+        port,
+        ..Config::test_stub(tmp.path())
+    })
+    .await;
+    let tok = token(&client, &base).await;
+    let auth = format!("{CLIENT}, Token=\"{tok}\"");
+    let url = format!("{base}/System/Configuration/network");
+    let mut network: serde_json::Value = client
+        .get(&url)
+        .header("Authorization", &auth)
+        .send()
+        .await
+        .expect("network request")
+        .json()
+        .await
+        .expect("network JSON");
+    // As jellyfin-web's Networking page saves it: the whole document back.
+    network["BaseUrl"] = "/jellyfin".into();
+    let saved = client
+        .post(&url)
+        .header("Authorization", &auth)
+        .json(&network)
+        .send()
+        .await
+        .expect("save request")
+        .status();
+    assert!(saved.is_success(), "{saved}");
+    let info = system_info(&client, &base, &tok).await.expect("info");
+    assert_eq!(info["HasPendingRestart"], true, "the save marks a restart");
+
+    assert_eq!(post(&client, &base, "/System/Restart", &tok).await, 204);
+    let mounted = format!("{base}/jellyfin");
+    wait_for_new_lifetime(&client, &mounted, &config.server_name, &tok).await;
+    let outside = client
+        .get(format!("{base}/System/Info/Public"))
+        .send()
+        .await
+        .expect("request outside the mount");
+    assert_eq!(outside.status(), 302);
+    assert_eq!(outside.headers()["location"], "/jellyfin/web/");
+    let public: serde_json::Value = client
+        .get(format!("{mounted}/System/Info/Public"))
+        .send()
+        .await
+        .expect("public info")
+        .json()
+        .await
+        .expect("public JSON");
+    assert_eq!(public["LocalAddress"], mounted.as_str());
+
+    assert_eq!(post(&client, &mounted, "/System/Shutdown", &tok).await, 204);
+    tokio::task::spawn_blocking(move || server.join())
+        .await
+        .expect("join task")
+        .expect("server thread did not panic")
+        .expect("run exits cleanly");
+}
+
 /// Saved dashboard settings survive a new lifetime, while the restart flag
 /// clears. The old session token must still authorize these checks.
 async fn prepare_dashboard_restart(
