@@ -271,6 +271,35 @@ pub(crate) async fn folder_of_kind(
     .map_err(db_err)
 }
 
+/// Records `item`'s parent chain as its ancestors: `parent`, then each
+/// `ParentId` above it up to the root, what `BaseItem.GetParents` walks
+/// (`BaseItem.cs:1116-1126`). It is all of `GetAncestorIds` for an item with no
+/// collection folders, such as a playlist under the Playlists folder. A link
+/// to a row that does not exist is skipped, as a key to it could not be stored.
+pub(crate) async fn add_parent_chain_in(
+    connection: &mut sqlx::SqliteConnection,
+    item: Uuid,
+    parent: Uuid,
+) -> Result<(), ServiceError> {
+    sqlx::query(
+        r#"WITH RECURSIVE "chain"("ParentItemId") AS (
+               SELECT ?2
+               UNION
+               SELECT p."ParentId" FROM "chain" c
+                 JOIN "BaseItems" p ON p."Id" = c."ParentItemId"
+                WHERE p."ParentId" IS NOT NULL)
+           INSERT OR IGNORE INTO "AncestorIds" ("ItemId", "ParentItemId")
+           SELECT ?1, "ParentItemId" FROM "chain"
+            WHERE "ParentItemId" IN (SELECT "Id" FROM "BaseItems")"#,
+    )
+    .bind(guid_to_db(item))
+    .bind(guid_to_db(parent))
+    .execute(&mut *connection)
+    .await
+    .map_err(db_err)?;
+    Ok(())
+}
+
 /// Records `ancestors` for `item`: `GetAncestorIds`, its parents up to the root
 /// and the libraries it belongs to. An ancestor with no row yet is skipped, as
 /// a key to it could not be stored.

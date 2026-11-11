@@ -1494,6 +1494,9 @@ impl PlaylistManager for FerrofinPlaylistManager {
             crate::item_persistence_service::set_item_path_in(&mut tx, id, &stored)
                 .await
                 .map_err(db_err)?;
+            // `AddChild`'s save writes `GetAncestorIds()`: the Playlists folder
+            // and the root (`ItemPersistenceService.cs:321-323`).
+            crate::library_structure_repository::add_parent_chain_in(&mut tx, id, parent).await?;
             // The ownership meta row (C# `OwnerUserId`/`OpenAccess`).
             sqlx::query(
                 r#"INSERT INTO "FerrofinPlaylists" ("PlaylistId", "OwnerUserId", "OpenAccess")
@@ -4373,6 +4376,35 @@ mod tests {
             mgr.get_playlist_for_user(playlist_id, carol).await,
             Err(ferrofin_traits::error::ServiceError::NotFound(_))
         ));
+    }
+
+    /// A new playlist's ancestors are the Playlists folder and the root, as
+    /// `AddChild`'s save writes `GetAncestorIds()` upstream.
+    #[tokio::test]
+    async fn create_playlist_writes_its_ancestors() {
+        let db = test_db().await;
+        let (mgr, _root) = playlist_manager(&db).await;
+        let created = mgr
+            .create_playlist(&PlaylistCreationRequest {
+                name: Some("Mix".to_owned()),
+                user_id: Uuid::new_v4(),
+                ..PlaylistCreationRequest::default()
+            })
+            .await
+            .expect("create");
+        let playlist = Uuid::parse_str(&created.id).expect("uuid");
+        let row = crate::test_support::fetch_item(&db, playlist).await;
+        let folder = row.parent_id.expect("under the Playlists folder");
+        let root = crate::test_support::fetch_item(&db, Uuid::parse_str(&folder).expect("uuid"))
+            .await
+            .parent_id
+            .expect("the folder is under the root");
+        let mut chain = vec![folder, root];
+        chain.sort();
+        assert_eq!(
+            crate::library_structure_repository::ancestors_of(&db, playlist).await,
+            chain
+        );
     }
 
     /// No user, no playlist: upstream's `GetUserById(Guid.Empty)` throws in

@@ -251,10 +251,12 @@ impl AggregateFolderStore {
     /// one-shot rewrite of a legacy `ManualPlaylistsFolder` row onto 10.11.8's
     /// identity, the folder's row itself when there is none, its move to the
     /// data directory when the row is somewhere else, the retype of a folder
-    /// kept at the directory under an id of its own, and the playlists an
-    /// older Ferrofin left without a parent put into the folder.
+    /// kept at the directory under an id of its own, the playlists an older
+    /// Ferrofin left without a parent put into the folder, and the ancestors
+    /// of the folder and its playlists that are missing (earlier builds wrote
+    /// none, and the previous version during a rolling update still may not).
     ///
-    /// Each is idempotent, run once per process.
+    /// Each is idempotent, run once per process: so on every boot.
     async fn repair_playlists_folder(
         &self,
         aggregate: Uuid,
@@ -383,6 +385,16 @@ impl AggregateFolderStore {
                 folder,
             )
             .await?;
+            // `CreateRootFolder`'s save writes the folder's ancestors, and each
+            // playlist's save its own; rows earlier builds made have none.
+            let added =
+                crate::item_persistence_service::add_playlist_ancestors(&self.db, folder).await?;
+            if added > 0 {
+                tracing::info!(
+                    rows = added,
+                    "recorded the ancestors of the playlists folder and its playlists"
+                );
+            }
         }
         Ok(())
     }
@@ -686,6 +698,56 @@ mod tests {
             fetch_item(&db, placed).await.parent_id,
             Some(db_guid(elsewhere)),
             "a playlist with a parent is left alone"
+        );
+    }
+
+    /// Startup writes the ancestors upstream's saves write: the Playlists
+    /// folder's (the root) when it is made, and those of a playlist under it
+    /// that an earlier build left without any (the folder and the root), on
+    /// the next boot. A playlist a scan found elsewhere keeps its own.
+    #[tokio::test]
+    async fn ensure_writes_the_playlists_missing_ancestors() {
+        use crate::library_structure_repository::ancestors_of;
+
+        let db = test_db().await;
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let store = store(&db, &tmp);
+        store.ensure().await.expect("ensure");
+        let folder = store.playlists_id().expect("playlists id");
+        let aggregate = store.id();
+        assert_eq!(ancestors_of(&db, folder).await, [db_guid(aggregate)]);
+
+        // As an earlier build left them: no ancestors at all.
+        let made = Uuid::from_u128(0x0A1);
+        seed_folder_item(&db, made, BaseItemKind::Playlist, "Made", Some(folder)).await;
+        let elsewhere = Uuid::from_u128(0xE15);
+        seed_folder_item(&db, elsewhere, BaseItemKind::Folder, "Elsewhere", None).await;
+        let scanned = Uuid::from_u128(0x5CA);
+        seed_folder_item(
+            &db,
+            scanned,
+            BaseItemKind::Playlist,
+            "Scanned",
+            Some(elsewhere),
+        )
+        .await;
+        assert_eq!(ancestors_of(&db, made).await, Vec::<String>::new());
+
+        store.ensure().await.expect("the next boot");
+        let mut chain = vec![db_guid(folder), db_guid(aggregate)];
+        chain.sort();
+        assert_eq!(ancestors_of(&db, made).await, chain);
+        assert_eq!(
+            ancestors_of(&db, scanned).await,
+            Vec::<String>::new(),
+            "a playlist outside the Playlists folder is left to the scan"
+        );
+        assert_eq!(
+            crate::item_persistence_service::add_playlist_ancestors(&db, folder)
+                .await
+                .expect("again"),
+            0,
+            "nothing is added twice"
         );
     }
 
