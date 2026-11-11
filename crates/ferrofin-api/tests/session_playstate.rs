@@ -2430,8 +2430,14 @@ async fn session_mutations_refuse_an_uncontrollable_target_before_writing() {
     );
 }
 
+/// `SyncPlayAccessRequirement` derives from `DefaultAuthorizationRequirement`,
+/// whose handler succeeds it for an administrator and for every API key ("Api
+/// keys are unrestricted"); `SyncPlayAccessHandler` returns early for an API
+/// key's empty user id and never fails it. So both reach the manager on every
+/// route, whatever the stored policy and membership; for an API key the manager
+/// then answers as upstream's does (its own tests pin `Join`/`List`/`{id}`).
 #[tokio::test]
-async fn sync_play_inherits_admin_override_but_api_keys_have_no_user() {
+async fn sync_play_admits_administrators_and_api_keys_whatever_the_policy() {
     for access in [CREATE_AND_JOIN, JOIN_ONLY, NO_SYNC_PLAY] {
         for (method, uri, body, allowed) in [
             (
@@ -2447,21 +2453,29 @@ async fn sync_play_inherits_admin_override_but_api_keys_have_no_user() {
                 StatusCode::NO_CONTENT,
             ),
             ("GET", "/SyncPlay/List", "", StatusCode::OK),
+            (
+                "GET",
+                "/SyncPlay/00000000-0000-0000-0000-000000000001",
+                "",
+                StatusCode::OK,
+            ),
             ("POST", "/SyncPlay/Leave", "", StatusCode::NO_CONTENT),
+            ("POST", "/SyncPlay/Pause", "{}", StatusCode::NO_CONTENT),
+            (
+                "POST",
+                "/SyncPlay/Ping",
+                r#"{"Ping":5}"#,
+                StatusCode::NO_CONTENT,
+            ),
         ] {
             for api_key in [false, true] {
                 let (app, reached) = policy_state_as(access, false, !api_key, api_key);
                 let (status, _) = send(app, method, uri, Body::from(body)).await;
-                assert_eq!(
-                    status,
-                    if api_key {
-                        StatusCode::BAD_REQUEST
-                    } else {
-                        allowed
-                    },
+                assert_eq!(status, allowed, "{access} {api_key} {uri}");
+                assert!(
+                    reached.load(std::sync::atomic::Ordering::SeqCst),
                     "{access} {api_key} {uri}"
                 );
-                assert_eq!(reached.load(std::sync::atomic::Ordering::SeqCst), !api_key);
             }
         }
     }

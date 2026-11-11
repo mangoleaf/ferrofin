@@ -3036,7 +3036,7 @@ pub async fn build_app_state(
                 let member = ferrofin_traits::stubs::SyncPlaySession {
                     session_id,
                     user_id: session.user_id,
-                    user_name: session.user_name.unwrap_or_default(),
+                    user_name: session.user_name,
                 };
                 let sync_play = Arc::clone(&sync_play);
                 tokio::spawn(async move {
