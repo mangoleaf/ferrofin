@@ -820,12 +820,13 @@ async fn serve_once(
 /// restore (applied by the next lifetime, after this one's teardown) never
 /// races a scan writing into the tree it replaces.
 ///
-/// The transcodes are killed and the DVR stopped the same way (gl-141), so no
-/// ffmpeg writes into the transcode cache the next lifetime purges, and every
-/// capture in flight has settled before its database closes: otherwise the
-/// next lifetime would re-arm its timer and record the showing twice. They get
-/// `shutdown_timeout_secs` between them, as upstream's hosted services get the
-/// host's `ShutdownTimeout` to stop in, so a stuck tuner cannot hold a restart.
+/// The attachment extractions and the transcodes are killed and the DVR stopped
+/// the same way (gl-141), so no ffmpeg keeps writing into a cache the next
+/// lifetime purges or extracts into, and every capture in flight has settled
+/// before its database closes: otherwise the next lifetime would re-arm its
+/// timer and record the showing twice. They get `shutdown_timeout_secs`
+/// between them, as upstream's hosted services get the host's
+/// `ShutdownTimeout` to stop in, so a stuck tuner cannot hold a restart.
 async fn tear_down_host(
     wired: WiredApp,
     discovery: Option<tokio::task::JoinHandle<()>>,
@@ -836,7 +837,10 @@ async fn tear_down_host(
     wired.task_manager.shutdown().await;
     wired.state.library.shutdown_scans().await;
     // Transcodes first: a live one holds a tuner stream that Live TV then closes.
+    // Before them the attachment extractions, which are quick to stop and come
+    // before the transcode that burns their fonts in.
     let playback = async {
+        wired.state.attachments.shutdown().await;
         wired.state.hls.shutdown().await;
         if let Some(live_tv) = &wired.state.live_tv {
             live_tv.shutdown().await;
@@ -846,7 +850,7 @@ async fn tear_down_host(
     if tokio::time::timeout(timeout, playback).await.is_err() {
         tracing::warn!(
             timeout_secs,
-            "transcodes or recordings were still stopping when the shutdown timeout ran out; going on without them"
+            "attachment extractions, transcodes or recordings were still stopping when the shutdown timeout ran out; going on without them"
         );
     }
     stop_background_tasks(wired.background).await;
