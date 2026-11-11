@@ -563,14 +563,23 @@ pub struct ProgramImages {
 
 impl ProgramImages {
     /// The listing's URLs, in `UpdateImages` order, with a value that is no URL
-    /// ([`is_artwork_url`]) read as none.
+    /// ([`is_artwork_url`]) read as none. A guide's padding around a URL is
+    /// dropped, so the image loads; upstream stores the padded path, which
+    /// does not (a Jellyfin bug not ported).
     fn urls(&self) -> [(ImageType, Option<&str>); 3] {
         [
             (ImageType::Primary, &self.primary),
             (ImageType::Thumb, &self.thumb),
             (ImageType::Backdrop, &self.backdrop),
         ]
-        .map(|(image_type, url)| (image_type, url.as_deref().filter(|url| is_artwork_url(url))))
+        .map(|(image_type, url)| {
+            (
+                image_type,
+                url.as_deref()
+                    .map(str::trim)
+                    .filter(|url| is_artwork_url(url)),
+            )
+        })
     }
 
     /// How many of the listing's values are neither blank nor a URL.
@@ -578,7 +587,7 @@ impl ProgramImages {
         [&self.primary, &self.thumb, &self.backdrop]
             .into_iter()
             .flatten()
-            .filter(|value| !value.trim().is_empty() && !is_artwork_url(value))
+            .filter(|value| !value.trim().is_empty() && !is_artwork_url(value.trim()))
             .count()
     }
 }
@@ -815,7 +824,8 @@ pub fn program_entity(
             .filter(|id| !id.trim().is_empty()),
         // `SeriesName = info.Name` for an episode (not projected on the DTO,
         // kept for fidelity of the synthetic row).
-        series_name: (is_series || row.episode_title.is_some()).then(|| row.title.clone()),
+        series_name: (is_series || row.episode_title.as_deref().is_some_and(|t| !t.is_empty()))
+            .then(|| row.title.clone()),
         media_type: Some("Unknown".to_owned()),
         date_created: row.date_created.as_deref().and_then(parse_dt),
         show_id: row.show_id.clone(),
@@ -1926,5 +1936,37 @@ mod tests {
             .expect("changed");
         assert_eq!(updated.series_name.as_deref(), Some("Show"));
         assert_eq!(updated.show_id.as_deref(), Some("SHOW-A"));
+    }
+
+    /// gl-1631: a guide's padding around an image URL is dropped, so the
+    /// artwork loads, and a blank one counts as none, not as a refused value.
+    #[test]
+    fn a_padded_image_url_is_read_trimmed() {
+        let images = ProgramImages {
+            primary: None,
+            thumb: Some(" http://img.test/still.jpg ".to_owned()),
+            backdrop: Some("   ".to_owned()),
+        };
+        assert_eq!(
+            images.urls()[1],
+            (ImageType::Thumb, Some("http://img.test/still.jpg"))
+        );
+        assert_eq!(images.urls()[2], (ImageType::Backdrop, None));
+        assert_eq!(images.refused(), 0);
+    }
+
+    /// gl-1631: an empty `<sub-title/>` is `""`, which is no episode title:
+    /// no `SeriesName` (`!string.IsNullOrEmpty(info.EpisodeTitle)`).
+    #[test]
+    fn an_empty_episode_title_makes_no_series_name() {
+        let row = ProgramRow {
+            is_series: false,
+            episode_title: Some(String::new()),
+            ..guide_row("[]", None)
+        };
+        let item = program_entity(&row, parse, None);
+        assert_eq!(item.episode_title.as_deref(), Some(""));
+        assert_eq!(item.series_name, None);
+        assert!(!program_tags(&row).iter().any(|t| t == "Series"));
     }
 }

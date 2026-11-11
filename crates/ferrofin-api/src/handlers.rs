@@ -1015,7 +1015,10 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
                    with GuideManager.GetProgram, XmlTvListingsProvider.GetProgramInfo and \
                    GetProgramInfoWithEtag and src/Jellyfin.LiveTv/Listings/XmlTvProgramEtag.cs \
                    at the pinned v12.4 tag, and the etag bytes with those a Jellyfin 12.4 \
-                   server stored for the same guide.",
+                   server stored for the same guide. The XMLTV reader keeps a guide's text \
+                   as Jellyfin.XmlTv reads it (xmltv.rs apply_end, end_programme_run, \
+                   copyright_year, push_text; gl-1631), checked against that server on \
+                   padded, empty, blank, CRLF and date text.",
         date: "2026-11-10",
         divergences: &[
             "Jellyfin.XmlTv drops the element right after an <image> or <url> when no \
@@ -1023,16 +1026,15 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
              skips one more node. Ferrofin reads that element, so on such a compact guide the \
              airing's rating, artwork or other field, and its etag, differ from Jellyfin's. \
              Jellyfin bug not ported.",
+            "A programme's image URL padded with whitespace is stored trimmed, so the \
+             artwork loads; upstream's UpdateImage stores the padded path, which does not. \
+             Jellyfin bug not ported.",
             "A programme is saved only when a field GetProgram assigns changed. Upstream skips \
              only an XMLTV airing whose etag equals the stored one; every other airing (each \
              Schedules Direct one, whose md5 is compared after its ids were replaced, and an \
              XMLTV one with no etag) is saved on every refresh, which moves its \
              DateLastSaved and the DTO Etag derived from it. Fix path: gl-1628 (owner \
              decision).",
-            "Ferrofin's XMLTV parser trims element text and drops an empty <desc/> or \
-             <sub-title/>, where Jellyfin.XmlTv keeps both, so for such a guide the stored \
-             Name, Overview, EpisodeTitle, a dd_progid ShowId or another text field, and the \
-             etag, differ. Fix path: gl-1631.",
         ],
     },
     VerifiedSubsystem {

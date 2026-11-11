@@ -611,11 +611,12 @@ pub fn recording_name(timer: &TimerRecordingInfo) -> String {
                 }
             }
         }
+        // `!string.IsNullOrWhiteSpace(info.EpisodeTitle)`, then appended as
+        // written.
         if let Some(episode_title) = timer
             .episode_title
             .as_deref()
-            .map(str::trim)
-            .filter(|t| !t.is_empty())
+            .filter(|t| !t.trim().is_empty())
         {
             let mut candidate = name.clone();
             if add_hyphen {
@@ -836,6 +837,20 @@ mod tests {
         let name = recording_name(&t);
         assert!(name.starts_with("Parity Show 2026_08_23_"), "{name}");
         assert!(name.ends_with(" - Untitled"), "{name}");
+    }
+
+    /// `GetRecordingName` appends `" " + info.EpisodeTitle` as written, and
+    /// skips only a blank one (gl-1631).
+    #[test]
+    fn a_padded_episode_title_is_appended_as_written() {
+        let mut t = timer("Parity Show");
+        t.is_program_series = true;
+        t.season_number = Some(1);
+        t.episode_number = Some(2);
+        t.episode_title = Some(" Pilot ".to_owned());
+        assert_eq!(recording_name(&t), "Parity Show S01E02  Pilot ");
+        t.episode_title = Some("   ".to_owned());
+        assert_eq!(recording_name(&t), "Parity Show S01E02");
     }
 
     #[test]

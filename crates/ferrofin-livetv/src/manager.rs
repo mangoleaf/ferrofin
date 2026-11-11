@@ -927,10 +927,8 @@ fn xmltv_etag(prog: &XmltvProgramme, class: &ProgramClass) -> Option<String> {
     crate::xmltv_etag::xmltv_program_etag(&crate::xmltv_etag::EtagInput {
         id: class.external_id.as_deref(),
         channel_id: &prog.channel_id,
-        // shortcut: the parser keeps no title as "", which upstream's is null; an
-        // empty `<title></title>` hashes as null here, where upstream hashes "".
-        // gl-1631 ports the parser's text handling, which settles it.
-        name: non_empty(Some(&prog.title)),
+        // `XmlTvProgram.Title` is null for a programme with no `<title>`.
+        name: (!prog.missing_title).then_some(prog.title.as_str()),
         official_rating: non_empty(prog.rating.as_deref()),
         overview: prog.desc.as_deref(),
         start: prog.start.map(|d| d.to_utc()),
@@ -1073,9 +1071,13 @@ impl CategoryClasses {
         } else {
             prog.sub_title.clone()
         };
-        let is_series = !is_movie && (episode_number.is_some() || episode_title.is_some());
-        // `program.Title?.GetMD5()`: no title, no series id.
-        let external_series_id = episode_number.filter(|_| !prog.title.is_empty()).map(|_| {
+        // `!string.IsNullOrEmpty(info.EpisodeTitle)`: an empty `<sub-title/>`
+        // is no episode title.
+        let is_series = !is_movie
+            && (episode_number.is_some()
+                || episode_title.as_deref().is_some_and(|t| !t.is_empty()));
+        // `program.Title?.GetMD5()`: an empty title still hashes; none does not.
+        let external_series_id = episode_number.filter(|_| !prog.missing_title).map(|_| {
             ferrofin_common::extensions::get_md5(&prog.title)
                 .simple()
                 .to_string()
