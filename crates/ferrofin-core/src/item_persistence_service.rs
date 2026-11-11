@@ -247,13 +247,17 @@ fn item_value_ids_sql(count: usize) -> String {
 /// a `MusicArtist` is `IsAccessedByName` (`MusicArtist.cs:30-33`,
 /// `IsFolder => !IsAccessedByName`).
 fn by_name_insert_sql(count: usize) -> String {
+    // `DateCreated` is `CreateItemByName`'s (`LibraryManager.cs:1374-1381`).
+    // Its `DateModified` is not stored: the validator's refresh of the new row
+    // restats its path, a directory, which has none (D2), and the post-scan
+    // pass that ports that refresh stamps the rest.
     format!(
         r#"INSERT INTO "BaseItems"
            ("Id","Type","Name","CleanName","SortName","PresentationUniqueKey","UnratedType",
-            "IsFolder","IsInMixedFolder",
+            "DateCreated","IsFolder","IsInMixedFolder",
             "IsLocked","IsMovie","IsRepeat","IsSeries","IsVirtualItem",{columns})
            SELECT v.column1, v.column2, v.column3, v.column4, v.column5, v.column6, v.column7,
-                  0, 0, 0, 0, 0, 0, 0, {values}
+                  v.column8, 0, 0, 0, 0, 0, 0, 0, {values}
            FROM (VALUES {rows}) AS v
            WHERE NOT EXISTS (
                SELECT 1 FROM "BaseItems" b
@@ -265,7 +269,7 @@ fn by_name_insert_sql(count: usize) -> String {
 }
 
 /// The values each row of [`by_name_insert_sql`] binds.
-const BY_NAME_INSERT_BINDS: usize = 7;
+const BY_NAME_INSERT_BINDS: usize = 8;
 
 /// The `ItemValueId` of each of `values` (`(Type, Value, CleanValue)`, distinct
 /// by type and value), keyed by type and value, creating the rows not stored
@@ -412,6 +416,7 @@ async fn write_item_values(
         }
         query.execute(&mut **tx).await.map_err(db_err)?;
     }
+    let now = datetime_to_db(chrono::Utc::now());
     for chunk in ferrofin_db::power_of_two_chunks(
         &by_name,
         ferrofin_db::BATCH_BIND_CHUNK / BY_NAME_INSERT_BINDS,
@@ -427,7 +432,8 @@ async fn write_item_values(
                 .bind(*clean)
                 .bind(sort_name)
                 .bind(key)
-                .bind(unrated_type_name(kind));
+                .bind(unrated_type_name(kind))
+                .bind(&now);
         }
         query.execute(&mut **tx).await.map_err(db_err)?;
     }
@@ -537,13 +543,15 @@ pub(crate) async fn insert_named_item_in(
         // `CleanName` is what `searchTerm` and the search hints match
         // (`BaseItemMapper.cs:279` derives it on every save); without it a
         // new box set or playlist is never found by name.
-        // The dates are `Folder.AddChild`'s: `DateCreated`/`DateModified`
-        // from the folder `CreatePlaylist`/`CreateCollectionAsync` just made
-        // (this instant), else `DateTime.UtcNow`. `DateLastSaved` is stamped
-        // on create too, by the first save after it (`UpdateItemsAsync`: the
-        // playlist's `ForceSave` refresh, the box set's member add or queued
-        // refresh). Undated, the row sorted anywhere by date added and never
-        // matched `minDateLastSaved`.
+        // The dates are `Folder.AddChild`'s: `DateCreated` from the folder
+        // `CreatePlaylist`/`CreateCollectionAsync` just made (this instant),
+        // else `DateTime.UtcNow`. `DateLastSaved` is stamped on create too, by
+        // the first save after it (`UpdateItemsAsync`: the playlist's
+        // `ForceSave` refresh, the box set's member add or queued refresh).
+        // That save restats the item's path (`MetadataService.cs:244-249`), a
+        // folder's directory, which has no `DateModified` (D2), so a folder's
+        // is NULL, not `AddChild`'s (gl-1586). Undated, the row sorted
+        // anywhere by date added and never matched `minDateLastSaved`.
         concat!(
             r#"INSERT INTO "BaseItems"
            ("Id", "Type", "IsFolder", "IsInMixedFolder", "IsLocked", "IsMovie",
@@ -552,7 +560,8 @@ pub(crate) async fn insert_named_item_in(
             "DateCreated", "DateModified", "DateLastSaved", "UnratedType", "#,
             unset_columns!(),
             r#")
-           VALUES (?1, ?2, ?3, 0, ?10, 0, 0, 0, 0, ?4, ?5, ?7, ?6, ?6, ?8, ?9, ?9, ?9, ?11, "#,
+           VALUES (?1, ?2, ?3, 0, ?10, 0, 0, 0, 0, ?4, ?5, ?7, ?6, ?6, ?8, ?9,
+                   CASE WHEN ?3 THEN NULL ELSE ?9 END, ?9, ?11, "#,
             unset_values!(),
             ")"
         ),
@@ -7862,6 +7871,7 @@ mod tests {
 
     /// The inserts that bypass the upsert write the same values as it (gl-1580).
     #[tokio::test]
+    #[allow(clippy::too_many_lines)]
     async fn inserts_beside_the_upsert_store_the_mappers_defaults() {
         use crate::item_persistence_service::null_mapper_columns;
         let db = test_db().await;
@@ -7957,6 +7967,19 @@ mod tests {
                 "{writer}"
             );
         }
+        // The scan's genre has `CreateItemByName`'s `DateCreated` and, its path being a
+        // directory, no `DateModified`; its first refresh stamps the rest (gl-1586).
+        let row: ferrofin_db::entities::base_items::BaseItemEntity =
+            crate::test_support::fetch_item(&db, genre).await;
+        assert!(row.date_created.is_some(), "DateCreated");
+        assert_eq!(
+            (
+                row.date_modified,
+                row.date_last_saved,
+                row.date_last_refreshed
+            ),
+            (None, None, None)
+        );
     }
 
     /// A row Ferrofin wrote before the defaults (NULL) and one that holds them compare as the

@@ -117,6 +117,17 @@ async fn a_validation_deletes_the_by_name_rows_nothing_names_any_more() {
         names(&items, BaseItemKind::Studio).await,
         ["United Artists", "Warner Bros."]
     );
+    // The validation gives each new genre its first refresh, saved and stamped once, as
+    // `GenresValidator` does; a studio is stamped by its own artwork pass, which this
+    // scanner has no client for (gl-1586).
+    let crime = refresh_stamps(&db, BaseItemKind::Genre, "Crime").await;
+    assert!(crime.0.is_some() && crime.0 == crime.1, "{crime:?}");
+    assert_eq!(
+        refresh_stamps(&db, BaseItemKind::Studio, "Warner Bros.")
+            .await
+            .0,
+        None
+    );
 
     // A by-name artist no track credits, and a locked genre nothing names.
     let artist = ferrofin_core::item_type_lookup::stored_type_name(BaseItemKind::MusicArtist)
@@ -154,4 +165,26 @@ async fn a_validation_deletes_the_by_name_rows_nothing_names_any_more() {
         names(&items, BaseItemKind::MusicArtist).await.is_empty(),
         "the by-name artist nothing credits goes"
     );
+    assert_eq!(
+        refresh_stamps(&db, BaseItemKind::Genre, "Crime").await,
+        crime,
+        "a later validation refreshes it no more"
+    );
+}
+
+/// `(DateLastRefreshed, DateLastSaved)` of the `kind` row named `name`, as stored.
+async fn refresh_stamps(
+    db: &ferrofin_db::Database,
+    kind: BaseItemKind,
+    name: &str,
+) -> (Option<String>, Option<String>) {
+    sqlx::query_as(
+        r#"SELECT "DateLastRefreshed", "DateLastSaved" FROM "BaseItems"
+           WHERE "Type" = ?1 AND "Name" = ?2"#,
+    )
+    .bind(ferrofin_core::item_type_lookup::stored_type_name(kind).expect("type"))
+    .bind(name)
+    .fetch_one(db.pool())
+    .await
+    .expect("row")
 }

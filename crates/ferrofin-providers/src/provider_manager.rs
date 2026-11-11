@@ -629,6 +629,19 @@ const FANART_PROVIDER_NAME: &str = fetcher_names::FANART;
 /// The display name of the OMDb providers.
 const OMDB_PROVIDER_NAME: &str = fetcher_names::OMDB;
 
+/// `SaveInternal`'s restat of the path it saves (`MetadataService.cs:244-249`),
+/// its directory arm: a directory has no `DateModified` (D2), as a person's or a
+/// by-name item's metadata folder (gl-1586). A path that cannot be read keeps
+/// the value, as upstream's missing entry does. A file's mtime is the scan's to
+/// read.
+async fn restat_directory(row: &mut BaseItemEntity) {
+    if let Some(path) = row.path.as_deref().filter(|p| !p.is_empty())
+        && tokio::fs::metadata(path).await.is_ok_and(|m| m.is_dir())
+    {
+        row.date_modified = None;
+    }
+}
+
 /// A case-insensitive, non-empty provider-id lookup — the C# provider-id
 /// dictionaries are `OrdinalIgnoreCase` and every `Get*Id` helper treats an
 /// empty value as absent.
@@ -2891,6 +2904,7 @@ impl LocalProviderManager {
             if decision.stamp_refreshed {
                 row.date_last_refreshed = Some(Utc::now());
             }
+            restat_directory(&mut row).await;
             store.save_items(std::slice::from_ref(&row)).await?;
             // Re-derive the by-name index from the row that was just written:
             // C# `BaseItemRepository.SaveItems` saves the row and then
@@ -9115,8 +9129,12 @@ mod tests {
         let mut person = row("Person", "Brad Pitt");
         person.id = item_id.to_string();
         // As the people repository writes it: a person's sort key is its name
-        // verbatim (`Person.EnableAlphaNumericSorting => false`).
+        // verbatim (`Person.EnableAlphaNumericSorting => false`), its path is
+        // its metadata folder, and its `DateModified` the creation time.
         person.sort_name = Some("Brad Pitt".to_owned());
+        let folder = tempfile::tempdir().expect("person folder");
+        person.path = Some(folder.path().to_string_lossy().into_owned());
+        person.date_modified = Some(chrono::Utc::now());
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         let items = Arc::new(FakeItems {
             rows: HashMap::from([(item_id, person)]),
@@ -9158,6 +9176,8 @@ mod tests {
             );
             assert!(saved[0].date_last_refreshed.is_some(), "refresh stamped");
             assert_eq!(saved[0].sort_name.as_deref(), Some("Brad Pitt"));
+            // The save restats the folder, a directory: no `DateModified` (gl-1586).
+            assert_eq!(saved[0].date_modified, None);
         }
         // The resolved TMDB id is persisted, so the next refresh skips the
         // search: the merged id set (`MergeBaseItemData`'s ProviderIds rule
@@ -9180,6 +9200,33 @@ mod tests {
             .await
             .expect("refresh");
         assert_eq!(none, ItemUpdateType::None);
+    }
+
+    /// The save's restat clears a directory's `DateModified` only: a playlist
+    /// file keeps its mtime, and a path that is gone or empty keeps the value
+    /// (gl-1586).
+    #[tokio::test]
+    async fn the_save_restat_clears_only_a_directorys_date_modified() {
+        let dir = tempfile::tempdir().expect("dir");
+        let file = dir.path().join("list.m3u");
+        std::fs::write(&file, b"#EXTM3U\n").expect("file");
+        let when = Some(chrono::Utc::now());
+        for (path, expected) in [
+            (Some(dir.path().to_string_lossy().into_owned()), None),
+            (Some(file.to_string_lossy().into_owned()), when),
+            (
+                Some(dir.path().join("gone").to_string_lossy().into_owned()),
+                when,
+            ),
+            (Some(String::new()), when),
+            (None, when),
+        ] {
+            let mut entity = row("Person", "Ada");
+            entity.path.clone_from(&path);
+            entity.date_modified = when;
+            super::restat_directory(&mut entity).await;
+            assert_eq!(entity.date_modified, expected, "{path:?}");
+        }
     }
 
     #[test]
