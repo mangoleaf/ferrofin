@@ -930,12 +930,13 @@ impl Writes {
     }
 
     /// Moves the `BaseItems` row named `name`'s `DateLastSaved` ten minutes
-    /// into the past (in the server's own `datetime_to_db` format).
+    /// into the past, to a whole second, written as the server's own
+    /// `datetime_to_db` writes one (no fraction).
     async fn backdate_last_saved(&self, name: &str) {
         self.assert_quiet("before the backdate").await;
         let done = sqlx::query(
             r#"UPDATE "BaseItems"
-               SET "DateLastSaved" = strftime('%Y-%m-%d %H:%M:%S', 'now', '-10 minutes') || '.0000000'
+               SET "DateLastSaved" = strftime('%Y-%m-%d %H:%M:%S', 'now', '-10 minutes')
                WHERE "Name" = ?1"#,
         )
         .bind(name)
