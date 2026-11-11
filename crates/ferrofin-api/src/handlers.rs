@@ -950,7 +950,9 @@ pub const VERIFIED_SUBSYSTEMS_AGAINST_EARLIER_PIN: &[(&str, &str)] = &[];
 /// `video-stream-copy` is whether a transcode job copies the source video and
 /// what dynamic HDR metadata the copy strips, which the HLS and stream routes
 /// share; `recording-postprocessing` is the executable run after a retained
-/// DVR capture, which no HTTP response describes.
+/// DVR capture, which no HTTP response describes; `guide-programme-items` is
+/// what the guide refresh stores on each programme item and its external ids,
+/// which every programme operation reads.
 pub const SUBSYSTEM_KEYS: &[&str] = &[
     "query-translation",
     "dto-fields",
@@ -965,6 +967,7 @@ pub const SUBSYSTEM_KEYS: &[&str] = &[
     "trickplay",
     "video-stream-copy",
     "recording-postprocessing",
+    "guide-programme-items",
 ];
 
 /// One shared subsystem whose Ferrofin implementation was compared against the
@@ -992,6 +995,42 @@ pub struct VerifiedSubsystem {
 /// [`VERIFIED_SUBSYSTEMS_AGAINST_EARLIER_PIN`] names), under the rules of
 /// [`VERIFIED`]. Subsystem rows never count towards the operation parity line.
 pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
+    VerifiedSubsystem {
+        key: "guide-programme-items",
+        upstream_file: "src/Jellyfin.LiveTv/Guide/GuideManager.cs",
+        upstream_method: "GetProgram",
+        ferrofin: "What the guide refresh stores on each programme item and its external \
+                   ids. ferrofin-livetv manager.rs insert_programs and \
+                   insert_schedules_direct_programs keep the listing's Etag (xmltv_etag over \
+                   xmltv_etag.rs xmltv_program_etag, a port of XmlTvProgramEtag.TryCreate; \
+                   Schedules Direct's md5), Audio, IsHD, OriginalAirDate and Zap2It series id \
+                   in FerrofinLiveTvPrograms; sync_channel_program_items saves the items \
+                   (projection.rs program_entity for a new airing, program_item_update for a \
+                   stored one) and replaces their ids (program_provider_ids, \
+                   program_provider_ids_replaced, replace_provider_ids_for_items). Compared \
+                   with GuideManager.GetProgram, XmlTvListingsProvider.GetProgramInfo and \
+                   GetProgramInfoWithEtag and src/Jellyfin.LiveTv/Listings/XmlTvProgramEtag.cs \
+                   at the pinned v12.4 tag, and the etag bytes with those a Jellyfin 12.4 \
+                   server stored for the same guide.",
+        date: "2026-11-10",
+        divergences: &[
+            "Jellyfin.XmlTv drops the element right after an <image> or <url> when no \
+             whitespace separates them: ProcessImageNode reads past the end tag and its caller \
+             skips one more node. Ferrofin reads that element, so on such a compact guide the \
+             airing's rating, artwork or other field, and its etag, differ from Jellyfin's. \
+             Jellyfin bug not ported.",
+            "A programme is saved only when a field GetProgram assigns changed. Upstream skips \
+             only an XMLTV airing whose etag equals the stored one; every other airing (each \
+             Schedules Direct one, whose md5 is compared after its ids were replaced, and an \
+             XMLTV one with no etag) is saved on every refresh, which moves its \
+             DateLastSaved and the DTO Etag derived from it. Fix path: gl-1628 (owner \
+             decision).",
+            "Ferrofin's XMLTV parser trims element text and drops an empty <desc/> or \
+             <sub-title/>, where Jellyfin.XmlTv keeps both, so for such a guide the stored \
+             Name, Overview, EpisodeTitle, a dd_progid ShowId or another text field, and the \
+             etag, differ. Fix path: gl-1631.",
+        ],
+    },
     VerifiedSubsystem {
         key: "recording-postprocessing",
         upstream_file: "src/Jellyfin.LiveTv/Recordings/RecordingsManager.cs",
@@ -2731,8 +2770,9 @@ pub const VERIFIED: &[Verified] = &[
         upstream_method: "GetLiveTvChannels",
         ferrofin: "handlers/live_tv.rs get_channels (items.rs resolve_user_opt, \
                program_dto_options, add_current_program) → ferrofin-livetv manager.rs \
-               get_channels (user_restrictions; guide_repository.rs channel_rows: the user's \
-               parental restrictions, and isMovie/isSeries over the stored channel item's \
+               get_channels (user_restrictions; guide_repository.rs channel_rows: only the \
+               lineup channels whose item is stored, the user's parental restrictions, and \
+               isMovie/isSeries over the stored channel item's \
                columns and isKids/isNews/isSports over its Kids/News/Sports tags; \
                channel_user_data; projection.rs filter_channel_rows, sort_channel_rows, \
                remove_fields; channel_entity → DtoService get_base_item_dtos, which runs \
@@ -2746,10 +2786,6 @@ pub const VERIFIED: &[Verified] = &[
             "Every sortBy key but SortName, Name, IsFavoriteOrLiked and DateCreated compares \
          equal, so the appended SortName decides; upstream's OrderMapper sorts on them. Fix \
          path: gl-1354.",
-            "A lineup channel whose item is not stored (while a guide refresh is between \
-         writing the lineup and its items, after a failed item write, or after the item was \
-         deleted) is listed to a user nothing restricts, with no kinds and no user data; \
-         upstream lists only the stored LiveTvChannel items. Fix path: gl-1623.",
             "isFavorite and isLiked with no user (an API key naming none) match no channel \
          when true and every channel when false, and enableFavoriteSorting sorts nothing; \
          upstream's TranslateQuery and OrderMapper dereference the null user \

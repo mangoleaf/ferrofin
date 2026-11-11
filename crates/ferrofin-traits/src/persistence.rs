@@ -2051,6 +2051,24 @@ pub trait ItemPersistenceService: Send + Sync {
         Ok(())
     }
 
+    /// [`Self::replace_provider_ids`] for many items in one write: each item's
+    /// external-id set becomes the one given with it.
+    ///
+    /// The default replaces them one item at a time.
+    ///
+    /// # Errors
+    ///
+    /// [`ServiceError::Backend`] on a storage failure.
+    async fn replace_provider_ids_for_items(
+        &self,
+        items: &[(Uuid, Vec<(String, String)>)],
+    ) -> Result<(), ServiceError> {
+        for (item_id, ids) in items {
+            self.replace_provider_ids(*item_id, ids).await?;
+        }
+        Ok(())
+    }
+
     /// Restores retained history using the item's persisted user-data keys.
     /// Existing destination state wins for each user and leaves that user's
     /// snapshot available for other destinations. Restored rows have no
