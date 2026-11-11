@@ -84,18 +84,28 @@ pub fn forwarded_for(headers: &axum::http::HeaderMap) -> Vec<std::net::IpAddr> {
     reachable
 }
 
-/// One `X-Forwarded-For` entry as an address.
+/// One `X-Forwarded-For` entry as an address, in the shapes .NET's
+/// `IPEndPoint.TryParse` takes: an address, `v4:port`, or an IPv6 address in
+/// one pair of brackets, with or without a port. A bracketed IPv4 address and
+/// unbalanced or doubled brackets do not parse.
+///
+/// .NET also reads the old numeric IPv4 spellings (`2130706434`, `127.2`)
+/// and an IPv6 scope id without a port (`[fe80::1%2]`), which this does not,
+/// so the walk stops at one where Jellyfin's goes on. Fix path: gl-1642.
 #[must_use]
 pub(crate) fn parse_forwarded_entry(entry: &str) -> Option<std::net::IpAddr> {
     if let Ok(ip) = entry.parse::<std::net::IpAddr>() {
         return Some(normalize_ip(ip));
     }
-    // `host:port`, or `[v6]:port`.
+    // `v4:port`, or `[v6]:port`.
     if let Ok(socket) = entry.parse::<std::net::SocketAddr>() {
         return Some(normalize_ip(socket.ip()));
     }
-    let trimmed = entry.trim_start_matches('[').trim_end_matches(']');
-    trimmed.parse::<std::net::IpAddr>().ok().map(normalize_ip)
+    entry
+        .strip_prefix('[')
+        .and_then(|v6| v6.strip_suffix(']'))
+        .and_then(|v6| v6.parse::<std::net::Ipv6Addr>().ok())
+        .map(|v6| normalize_ip(std::net::IpAddr::V6(v6)))
 }
 
 /// The managers behind [`AppState`], held once and shared via [`Arc`].
