@@ -22,7 +22,9 @@ use ferrofin_api::test_support::{
 use ferrofin_db::entities::base_items::BaseItemEntity;
 use ferrofin_db::entities::security::DeviceEntity;
 use ferrofin_db::entities::users::UserEntity;
-use ferrofin_model::dto::{NameIdPair, SessionInfoDto, UpdateUserItemDataDto, UserItemDataDto};
+use ferrofin_model::dto::{
+    BaseItemDto, NameIdPair, SessionInfoDto, UpdateUserItemDataDto, UserItemDataDto,
+};
 use ferrofin_model::session::{
     ClientCapabilities, GeneralCommand, MessageCommand, PlayMethod, PlayRequest,
     PlaybackProgressInfo, PlaybackStartInfo, PlaybackStopInfo, PlaystateRequest,
@@ -515,6 +517,10 @@ struct SessionCalls {
     logged_out: Option<String>,
     /// The user each `log_session_activity` call carried (`None` for none).
     logged_users: Vec<Option<String>>,
+    /// The item the listed session shows as playing.
+    playing: Option<Uuid>,
+    /// The library item the session plays (`FullNowPlayingItem`).
+    library_item: Option<Uuid>,
 }
 
 /// A recording [`SessionManager`]: `log_session_activity` yields a fixed session
@@ -650,9 +656,22 @@ impl SessionManager for RecordingSessions {
         _controllable_user_to_check: Option<Uuid>,
         _is_api_key: bool,
     ) -> Result<Vec<SessionInfoDto>, ServiceError> {
-        self.calls.lock().unwrap().listed =
-            Some((device_id.map(ToOwned::to_owned), active_within_seconds));
-        Ok(vec![current_session_dto(false)])
+        let mut calls = self.calls.lock().unwrap();
+        calls.listed = Some((device_id.map(ToOwned::to_owned), active_within_seconds));
+        Ok(vec![SessionInfoDto {
+            now_playing_item: calls.playing.map(|id| BaseItemDto {
+                id,
+                ..BaseItemDto::default()
+            }),
+            ..current_session_dto(false)
+        }])
+    }
+    async fn now_playing_library_item_id(
+        &self,
+        session_id: &str,
+    ) -> Result<Option<Uuid>, ServiceError> {
+        assert_eq!(session_id, SESSION_ID);
+        Ok(self.calls.lock().unwrap().library_item)
     }
     async fn logout(&self, access_token: &str) -> Result<(), ServiceError> {
         self.calls.lock().unwrap().logged_out = Some(access_token.to_owned());
@@ -1018,7 +1037,11 @@ fn recording() -> (Arc<RecordingSessions>, Arc<RecordingUserData>) {
 /// requests succeed. Enough to drive the `/SyncPlay/*` handler wiring.
 const GROUP_ID: Uuid = Uuid::from_u128(0xABCD);
 
-struct FakeSyncPlay;
+#[derive(Default)]
+struct FakeSyncPlay {
+    /// The item each new group was seeded with.
+    seeds: Mutex<Vec<Option<Uuid>>>,
+}
 
 #[async_trait]
 impl SyncPlayManager for FakeSyncPlay {
@@ -1026,8 +1049,12 @@ impl SyncPlayManager for FakeSyncPlay {
         &self,
         session: &SyncPlaySession,
         group_name: &str,
-        _now_playing: Option<&SyncPlayNowPlaying>,
+        now_playing: Option<&SyncPlayNowPlaying>,
     ) -> Result<GroupInfoDto, ServiceError> {
+        self.seeds
+            .lock()
+            .unwrap()
+            .push(now_playing.map(|playing| playing.item_id));
         Ok(GroupInfoDto {
             group_id: GROUP_ID,
             group_name: group_name.to_owned(),
@@ -1073,7 +1100,30 @@ impl SyncPlayManager for FakeSyncPlay {
 /// An authenticated state with the fake SyncPlay manager wired in.
 fn sync_state() -> AppState {
     let (sessions, user_data) = recording();
-    state(sessions, user_data).with_sync_play(Arc::new(FakeSyncPlay))
+    state(sessions, user_data).with_sync_play(Arc::new(FakeSyncPlay::default()))
+}
+
+/// C# `Group.CreateGroup` seeds a new group from the session's
+/// `FullNowPlayingItem`, the library item, not the item it shows, which may
+/// be a client's own `Item`; with no library item it seeds nothing (gl-1062).
+#[tokio::test]
+async fn sync_play_new_seeds_from_the_library_item() {
+    let (sessions, user_data) = recording();
+    let sync_play = Arc::new(FakeSyncPlay::default());
+    let app = state(sessions.clone(), user_data).with_sync_play(sync_play.clone());
+    sessions.calls.lock().unwrap().playing = Some(Uuid::from_u128(0x0062_0001));
+    for library_item in [Some(ITEM_ID), None] {
+        sessions.calls.lock().unwrap().library_item = library_item;
+        let (status, _) = send(
+            app.clone(),
+            "POST",
+            "/SyncPlay/New",
+            Body::from(r#"{"GroupName":"g"}"#),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+    }
+    assert_eq!(*sync_play.seeds.lock().unwrap(), [Some(ITEM_ID), None]);
 }
 
 #[tokio::test]

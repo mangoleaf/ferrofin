@@ -1899,8 +1899,9 @@ pub const VERIFIED: &[Verified] = &[
                cache (user_entity_ext.rs cached_permission, cached_preference; the User \
                upstream holds) and a controllableByUserId naming the caller answered from the \
                caller's row; the NowPlayingItem it shows is \
-               the item on_playback_start and on_playback_progress name (kept_now_playing_item, \
-               NowPlayingItem::new on the report's row; UpdateNowPlayingItem), built by the \
+               the report's own Item as sent, else the library item on_playback_start and \
+               on_playback_progress name (NowPlayingItem::of on the report's row, \
+               kept_now_playing_item, shown_reported_item; UpdateNowPlayingItem), built by the \
                first listing and then copied (shown_now_playing_item → now_playing_item → \
                MediaSourceManager::get_media_source on that row, get_item_info; GetMediaSource, \
                GetItemInfo), and cleared by on_playback_stopped (RemoveNowPlayingItem); the \
@@ -1921,7 +1922,7 @@ pub const VERIFIED: &[Verified] = &[
                NowPlayingQueueFullItems is never sent (v12.4's SessionInfoDto has none); the \
                pool loses a session where upstream's does (report_session_ended, close_if_needed; \
                ReportSessionEnded, CloseIfNeededAsync) and also to evict_idle_sessions",
-        date: "2026-11-05",
+        date: "2026-11-11",
         divergences: SESSIONS_DIVERGENCES,
         refs: &[],
     },
@@ -1935,12 +1936,16 @@ pub const VERIFIED: &[Verified] = &[
                TranscodeManager.GetTranscodingJob; current_session_id: RequestHelpers.GetSessionId) \
                → ferrofin-core session_manager.rs on_playback_start (SessionManager.OnPlaybackStart: \
                update_live_stream_session_mapping, update_now_playing for UpdateNowPlayingItem \
-               with the NowPlayingItem kept or named on the row it read, the ClearTranscodingInfo \
+               with the report's own Item as sent, else the NowPlayingItem kept or named on the \
+               library row it read (NowPlayingItem::of), the ClearTranscodingInfo \
                of a report that does not transcode, record_playback_start per session user on \
-               progress_item for GetProgressItem, the log line and the PlaybackStart event's \
-               MediaInfo (playback_media_info) named from info.Item, the now-playing item) → \
-               playback_activity.rs (PlaybackStartLogger, from that MediaInfo, reading nothing)",
-        date: "2026-11-06",
+               progress_item for GetProgressItem only for a library item, the log line and the \
+               PlaybackStart event's MediaInfo (NowPlayingItem::media_info: \
+               reported_media_info or playback_media_info) named from info.Item, the now-playing \
+               item, and its Item (playback_library_item) the library item) → \
+               playback_activity.rs (PlaybackStartLogger, from that MediaInfo and Item: the \
+               entry's ItemId and the theme-media check from Item, reading nothing)",
+        date: "2026-11-11",
         divergences: PLAYBACK_START_DIVERGENCES,
         refs: &["user-data"],
     },
@@ -1952,7 +1957,7 @@ pub const VERIFIED: &[Verified] = &[
         ferrofin: "handlers/playstate.rs on_playback_start (LegacyStartQuery: the query members \
                with canSeek false and PlayMethod Transcode when absent) → the POST \
                /Sessions/Playing path from validate_play_method on",
-        date: "2026-11-02",
+        date: "2026-11-11",
         divergences: PLAYBACK_START_DIVERGENCES,
         refs: &["user-data"],
     },
@@ -1966,13 +1971,16 @@ pub const VERIFIED: &[Verified] = &[
                TranscodeManager.OnPlaybackProgress runs off the PlaybackProgress event, here \
                before the report reaches the session manager) → \
                ferrofin-core session_manager.rs on_playback_progress \
-               (SessionManager.OnPlaybackProgress: kept_now_playing_item or the library item's row \
-               for GetNowPlayingItem, update_now_playing with the check-in only when not automated, \
+               (SessionManager.OnPlaybackProgress: kept_now_playing_item, else the row the \
+               session holds for that ItemId (library_row, FullNowPlayingItem) or the one read \
+               for GetNowPlayingItem, the report's own Item as sent in its place \
+               (NowPlayingItem::of), update_now_playing with the check-in only when not automated, \
                the ClearTranscodingInfo of a report that does not transcode, update_play_progress \
-               per session user for OnPlaybackProgress(user, item, info), \
+               per session user for OnPlaybackProgress(user, item, info) only for a library item, \
                update_live_stream_session_mapping, the PlaybackProgress event carrying the \
-               now-playing item's playback_media_info for MediaInfo = info.Item)",
-        date: "2026-11-06",
+               now-playing item's NowPlayingItem::media_info for MediaInfo = info.Item and \
+               playback_library_item for Item)",
+        date: "2026-11-11",
         divergences: PLAYBACK_PROGRESS_DIVERGENCES,
         refs: &["user-data"],
     },
@@ -1985,7 +1993,7 @@ pub const VERIFIED: &[Verified] = &[
                members with isPaused and isMuted false, PlayMethod Transcode and RepeatMode \
                RepeatNone when absent) → the POST /Sessions/Playing/Progress path from \
                validate_play_method on",
-        date: "2026-11-02",
+        date: "2026-11-11",
         divergences: PLAYBACK_PROGRESS_DIVERGENCES,
         refs: &["user-data"],
     },
@@ -2001,10 +2009,14 @@ pub const VERIFIED: &[Verified] = &[
                live stream, the reported NowPlayingQueue and PlaylistItemId, RemoveNowPlayingItem's \
                PlayState reset and ClearTranscodingInfo, save_stopped_play_state per session user \
                unless the playback failed, close_live_stream_if_needed, the log line and the \
-               PlaybackStopped event's MediaInfo (playback_media_info) named from info.Item: the \
-               kept now-playing item when the stop names it (info.Item = current), else the row \
-               the stop read, none once the library no longer has it) → \
-               playback_activity.rs (PlaybackStopLogger, from that MediaInfo, reading nothing)",
+               PlaybackStopped event's MediaInfo named from info.Item (PlaybackSession::stopped_item): \
+               the stop's own Item as sent (reported_media_info), else the now-playing item when \
+               the stop names it (info.Item = current), else the row the stop read \
+               (playback_media_info), none once \
+               the library no longer has it; its Item (playback_library_item) the library item; \
+               the idle stop carries a reported Item the session shows, as CheckForIdlePlayback's \
+               Item = session.NowPlayingItem) → playback_activity.rs (PlaybackStopLogger, from \
+               that MediaInfo and Item, reading nothing)",
         date: "2026-11-11",
         divergences: PLAYBACK_STOP_DIVERGENCES,
         refs: &["user-data"],
@@ -3857,8 +3869,6 @@ const NO_USER_USER_DATA_FILTER_DIVERGENCE: &str = "A user-data filter (`isFavori
 /// The divergences of the two playback-start reports (`POST /Sessions/Playing`,
 /// `POST /PlayingItems/{itemId}`).
 const PLAYBACK_START_DIVERGENCES: &[&str] = &[
-    "A report's own Item is ignored: the session's NowPlayingItem and the activity entry \
-     come from the library item. Fix path: gl-1062.",
     NOW_PLAYING_ITEM_BUILT_ON_READ,
     "SessionInfo.StartAutomaticProgress is not run, so the session's position does not \
      advance between reports. Fix path: gl-803.",
@@ -3869,8 +3879,6 @@ const PLAYBACK_START_DIVERGENCES: &[&str] = &[
 
 /// The divergences of the two playback-progress reports.
 const PLAYBACK_PROGRESS_DIVERGENCES: &[&str] = &[
-    "A report's own Item is ignored: the session's NowPlayingItem comes from the library \
-     item. Fix path: gl-1062.",
     NOW_PLAYING_ITEM_BUILT_ON_READ,
     "SessionInfo.StartAutomaticProgress is not re-armed by a report, so no automated progress \
      follows it. Fix path: gl-803.",
@@ -3880,9 +3888,6 @@ const PLAYBACK_PROGRESS_DIVERGENCES: &[&str] = &[
 
 /// The divergences of the two playback-stop reports.
 const PLAYBACK_STOP_DIVERGENCES: &[&str] = &[
-    "A report's own Item is not used: the log line and the activity entry name the library \
-     item, as the session shows it or, for an item it does not show, as the stop read it. Fix \
-     path: gl-1062.",
     "The activity entry is written in English, not the server's UI culture. Fix path: gl-429.",
     "The live stream is released and the stop published even when the user-data save fails, \
      and the item is always read again rather than taken from the session, so an item deleted \
@@ -3903,8 +3908,6 @@ const NOW_PLAYING_ITEM_BUILT_ON_READ: &str = "A playback report keeps the item i
 
 /// The accepted divergences of `GET /Sessions`.
 const SESSIONS_DIVERGENCES: &[&str] = &[
-    "A playback report's own Item is ignored and the NowPlayingItem is always built from the \
-     library item; upstream shows a reported Item as sent. Fix path: gl-1062.",
     NOW_PLAYING_ITEM_BUILT_ON_READ,
     "A NowPlayingItem whose media source lookup fails is shown without its streams, and one \
      whose build fails is not shown, while the report itself has succeeded and saved the \

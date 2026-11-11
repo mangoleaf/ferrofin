@@ -2286,6 +2286,91 @@ async fn start_and_progress_for_an_item_the_library_does_not_have_save_nothing()
     );
 }
 
+/// A report's own `Item` changes what the session shows, not what is saved: a
+/// library item reported with one still saves the user's start and progress
+/// (C# `if (libraryItem is not null)`), whether the progress carries the
+/// `Item` again or not, and one the library does not have saves nothing
+/// (gl-1062).
+#[tokio::test]
+async fn a_library_item_reported_with_its_own_item_still_saves_progress() {
+    use ferrofin_model::session::{PlaybackProgressInfo, PlaybackStartInfo};
+    use ferrofin_traits::library::UserDataManager as _;
+
+    let db = test_db().await;
+    let mgr = manager(&db);
+    let user_id = Uuid::new_v4();
+    let user = seed_named_user(&db, user_id, "viewer").await;
+    let session = mgr
+        .log_session_activity("Web", "1.0", "dev-own-item", "TV", "e", Some(&user))
+        .await
+        .unwrap();
+    let item = Uuid::new_v4();
+    crate::test_support::seed_named_item(&db, item, BaseItemKind::Movie, "Film").await;
+    // An hour long, so ten and twenty minutes in are resume points.
+    let library = library_manager(&db);
+    let mut row = library.get_item_by_id(item).await.unwrap().expect("row");
+    row.run_time_ticks = Some(36_000_000_000);
+    library.update_items(&[row], None).await.unwrap();
+    let report = |position_ticks, with_item: bool| PlaybackProgressInfo {
+        session_id: session.id.clone(),
+        item_id: item,
+        position_ticks: Some(position_ticks),
+        item: with_item.then(|| BaseItemDto {
+            id: item,
+            name: Some("Client Title".to_owned()),
+            ..BaseItemDto::default()
+        }),
+        ..PlaybackStartInfo::default()
+    };
+    let user_data = FerrofinUserDataManager::new(
+        db.clone(),
+        Arc::new(FixedConfig {
+            config: default_server_configuration(),
+        }),
+    );
+
+    mgr.on_playback_start(&report(0, true)).await.unwrap();
+    for (position_ticks, with_item) in [(6_000_000_000, true), (12_000_000_000, false)] {
+        mgr.on_playback_progress(&report(position_ticks, with_item), false)
+            .await
+            .unwrap();
+        let data = user_data
+            .get_user_data_dto(item, user_id)
+            .await
+            .unwrap()
+            .expect("row");
+        assert_eq!(
+            (data.play_count, data.playback_position_ticks),
+            (1, position_ticks)
+        );
+    }
+
+    // An `Item` reported for an id the library does not have saves nothing.
+    let unknown = Uuid::new_v4();
+    let unknown_report = PlaybackProgressInfo {
+        item_id: unknown,
+        ..report(6_000_000_000, true)
+    };
+    mgr.on_playback_start(&unknown_report).await.unwrap();
+    mgr.on_playback_progress(&unknown_report, false)
+        .await
+        .unwrap();
+    let data = user_data
+        .get_user_data_dto(unknown, user_id)
+        .await
+        .unwrap()
+        .expect("the empty row");
+    assert_eq!(
+        (
+            data.play_count,
+            data.playback_position_ticks,
+            data.last_played_date
+        ),
+        (0, 0, None),
+        "nothing was saved"
+    );
+}
+
 /// C# `OnPlaybackStopped` refuses a negative position (stalled clients report
 /// one): it releases the live stream first, so no tuner leaks, then throws
 /// before anything is saved. The resume point the last progress report left
