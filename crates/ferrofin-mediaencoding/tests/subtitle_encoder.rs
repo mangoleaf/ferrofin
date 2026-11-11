@@ -53,17 +53,17 @@ impl FakeIo {
 
 #[async_trait]
 impl SubtitleIo for FakeIo {
-    async fn read_file(&self, path: &str) -> Result<Vec<u8>, String> {
+    async fn read_file(&self, path: &str) -> std::io::Result<Vec<u8>> {
         self.files
             .lock()
             .unwrap()
             .get(path)
             .cloned()
-            .ok_or_else(|| format!("no such file: {path}"))
+            .ok_or_else(|| std::io::ErrorKind::NotFound.into())
     }
 
     async fn http_get(&self, url: &str) -> Result<Vec<u8>, String> {
-        self.read_file(url).await
+        self.read_file(url).await.map_err(|e| e.to_string())
     }
 
     fn path_protocol(&self, path: &str) -> MediaProtocol {

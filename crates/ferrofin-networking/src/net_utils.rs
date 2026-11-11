@@ -1,8 +1,8 @@
 //! IP / subnet math — port of `MediaBrowser.Common.Net.NetworkUtils`.
 //!
 //! Pure address/subnet helpers: CIDR parsing (with .NET's "host bits must be
-//! zero" rule), subnet containment, mask↔CIDR conversion, FQDN/host parsing and
-//! URI-safe address formatting. Reuses the [`IpData`]/[`IpNetwork`] value types
+//! zero" rule), subnet containment, FQDN/host parsing and URI-safe address
+//! formatting. Reuses the [`IpData`]/[`IpNetwork`] value types
 //! from `ferrofin-model` rather than redefining them.
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
@@ -47,8 +47,10 @@ pub fn is_ipv6_link_local(address: IpAddr) -> bool {
 /// Converts a CIDR prefix length to a dotted-decimal mask address. IPv4 math
 /// only (matches `NetworkUtils.CidrToMask`); the `family` selects the base
 /// prefix width used in the shift.
+// Test-only: upstream's `CidrToMask` has no caller outside `NetworkUtils` either.
+#[cfg(test)]
 #[must_use]
-pub fn cidr_to_mask(cidr: u8, family: AddressFamily) -> Ipv4Addr {
+fn cidr_to_mask(cidr: u8, family: AddressFamily) -> Ipv4Addr {
     let base = if family == AddressFamily::InterNetwork {
         net_constants::MINIMUM_IPV4_PREFIX_SIZE
     } else {
@@ -67,8 +69,10 @@ pub fn cidr_to_mask(cidr: u8, family: AddressFamily) -> Ipv4Addr {
 /// Converts a subnet mask address to a CIDR prefix length. IPv4 only
 /// (`NetworkUtils.MaskToCidr`). Returns the bitwise-complement byte for an
 /// invalid (non-contiguous) mask, matching the C# fallback.
+// Test-only: upstream's `MaskToCidr` has no caller outside `NetworkUtils` either.
+#[cfg(test)]
 #[must_use]
-pub fn mask_to_cidr(mask: Ipv4Addr) -> u8 {
+fn mask_to_cidr(mask: Ipv4Addr) -> u8 {
     if mask == Ipv4Addr::UNSPECIFIED {
         return 0;
     }
@@ -120,8 +124,10 @@ pub fn format_ip_string(address: Option<IpAddr>) -> String {
 /// Returns the broadcast address for `network` (`NetworkUtils.GetBroadcastAddress`).
 ///
 /// IPv4 math only, matching the C# implementation.
+// Test-only: upstream's `GetBroadcastAddress` has no caller outside `NetworkUtils` either.
+#[cfg(test)]
 #[must_use]
-pub fn get_broadcast_address(network: IpNetwork) -> Ipv4Addr {
+fn get_broadcast_address(network: IpNetwork) -> Ipv4Addr {
     let base = match network.base_address {
         IpAddr::V4(v4) => u32::from_be_bytes(v4.octets()),
         IpAddr::V6(_) => 0,
@@ -213,7 +219,7 @@ pub fn try_parse_to_subnet(value: &str, negated: bool) -> Option<IpData> {
 /// polarity (`NetworkUtils.TryParseToSubnets`).
 ///
 /// Off-polarity entries are skipped silently; entries matching this pass that
-/// fail to parse are reported through `logger` (see [`log_invalid_subnet`]).
+/// fail to parse are reported through `logger` (see `log_invalid_subnet`).
 /// Returns `None` when nothing parsed (mirroring the C# `NotNullWhen` contract).
 #[must_use]
 pub fn try_parse_to_subnets(
@@ -289,6 +295,10 @@ pub type HostResolver = fn(&str) -> Option<Vec<IpAddr>>;
 /// address-family filter mirrors the `isIPv4Enabled`/`isIPv6Enabled` gates.
 /// Returns `None` when the host cannot be parsed into at least one address.
 /// [`try_parse_host_with`] takes another resolver.
+///
+/// Only tests call it, chiefly the transliterated `NetworkExtensionsTests`:
+/// production parses through [`try_parse_host_with`] with the manager's
+/// resolver.
 #[must_use]
 pub fn try_parse_host(
     host: &str,

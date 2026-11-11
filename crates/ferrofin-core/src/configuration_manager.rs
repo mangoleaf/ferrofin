@@ -14,7 +14,7 @@
 //! - `ReplaceConfiguration` fires a `ConfigurationUpdating` event and validates
 //!   the metadata path against the filesystem. Successful saves notify registered
 //!   observers; the metadata-path validation is preserved
-//!   ([`prepare_metadata_path`]): a new, non-empty
+//!   (`prepare_metadata_path`): a new, non-empty
 //!   metadata path that differs from the current one must already exist on disk.
 //! - `OnConfigurationUpdated` recomputes the internal metadata path; that is
 //!   reproduced by pushing the new `MetadataPath` into the shared
@@ -108,7 +108,7 @@ fn default_metadata_options() -> Vec<ferrofin_model::configuration::MetadataOpti
 /// `ServerConfiguration()` constructor defaults (and its `BaseApplicationConfiguration`
 /// base) here — the one place a "blank" configuration is minted before the first
 /// `system.json` is written, including the per-item-type `MetadataOptions` table
-/// the C# constructor seeds (see [`default_metadata_options`]).
+/// the C# constructor seeds (see `default_metadata_options`).
 #[must_use]
 pub fn default_server_configuration() -> ServerConfiguration {
     ServerConfiguration {
@@ -694,9 +694,9 @@ impl FerrofinServerConfigurationManager {
         (*self.snapshot_shared()).clone()
     }
 
-    /// The shared application paths as the concrete type (used by sibling
-    /// managers in this crate that need the extra accessors — trickplay/plugins
-    /// paths — beyond the trait surface).
+    /// The shared application paths as the concrete type, for tests that need
+    /// its accessors beyond the trait surface.
+    #[cfg(test)]
     #[must_use]
     pub fn concrete_paths(&self) -> Arc<FerrofinServerApplicationPaths> {
         Arc::clone(&self.paths)
@@ -1246,7 +1246,7 @@ async fn repair_lost_startup_flag(
 /// file [`FerrofinServerConfigurationManager::load`] would take the completed
 /// flag from: `system.json` when it says so, and Jellyfin's `system.xml` when
 /// it says so — the import source while `system.json` does not exist yet, and
-/// the source [`repair_lost_startup_flag`] restores the flag from when
+/// the source `repair_lost_startup_flag` restores the flag from when
 /// `system.json` says the wizard is incomplete. Resetting the flag means
 /// setting it to false in all of them; one left true sets it again.
 ///

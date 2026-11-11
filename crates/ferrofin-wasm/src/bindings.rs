@@ -4,7 +4,7 @@
 //! The [`bindgen!`](wasmtime::component::bindgen) macro turns
 //! `wit/ferrofin-plugin.wit` into typed Rust: the [`Plugin`] world struct
 //! (typed wrappers over the guest's exports) and the
-//! [`host::Host`](ferrofin::plugin::host::Host) trait this module implements
+//! `host::Host` trait this module implements
 //! for [`HostState`]. Synchronous bindings are deliberate: every guest call
 //! already runs on the plugin's dedicated runtime thread (see
 //! [`runtime`](crate::runtime)), so async plumbing here would buy nothing.
@@ -57,7 +57,9 @@ pub struct HostState {
     /// the call timeout baked in at construction).
     pub http: std::sync::Arc<crate::capabilities::GuestHttp>,
     /// The per-call timeout, needed when `http-fetch` builds a one-off
-    /// DNS-pinned client (the shared client's timeout is not readable).
+    /// DNS-pinned client (the shared client's timeout is not readable). A
+    /// fetch gets the smaller of it and the time left in the call
+    /// ([`fetch_timeout`]).
     pub http_timeout: std::time::Duration,
     /// The operator-configured total state cap, in bytes
     /// (`FERROFIN_WASM_STATE_LIMIT_MB`, default 8 MiB).
@@ -84,9 +86,9 @@ pub struct HostState {
     /// True when this guest call attempted a write suppressed by live segment policy.
     pub segment_policy_skipped: bool,
     /// When the current guest call's time budget runs out, armed with the
-    /// epoch deadline (`runtime::arm_deadline`). Epoch checks only run in
-    /// wasm code, so WASI clock waits are capped at this instead
-    /// ([`DeadlineClocks`]).
+    /// epoch deadline (`InstanceSpec::arm_deadline`). Epoch checks only run
+    /// in wasm code, so WASI clock waits ([`DeadlineClocks`]) and the bounded
+    /// host waits are capped at this instead.
     pub call_deadline: std::time::Instant,
     /// The empty WASI context (see the struct docs).
     pub wasi: wasmtime_wasi::WasiCtx,
@@ -218,6 +220,23 @@ fn guest_log_text(message: &str) -> std::borrow::Cow<'_, str> {
     ))
 }
 
+/// The timeout one `http-fetch` gets: the call timeout, cut to the time left
+/// before the guest call's `deadline` — a fetch that ran on would only see
+/// the guest trap at its deadline the moment the response came back.
+///
+/// # Errors
+/// [`OUT_OF_TIME`](crate::capabilities::OUT_OF_TIME) when no time is left.
+pub fn fetch_timeout(
+    call_timeout: std::time::Duration,
+    deadline: std::time::Instant,
+) -> Result<std::time::Duration, String> {
+    let left = deadline.saturating_duration_since(std::time::Instant::now());
+    if left.is_zero() {
+        return Err(crate::capabilities::OUT_OF_TIME.to_owned());
+    }
+    Ok(call_timeout.min(left))
+}
+
 impl host::Host for HostState {
     fn log(&mut self, level: types::LogLevel, message: String) {
         // Guest text is data, not format. It is a field of its own: named
@@ -265,7 +284,7 @@ impl host::Host for HostState {
             self.memory_limit_bytes,
             self.private_http_allowed,
             &self.egress,
-            self.http_timeout,
+            fetch_timeout(self.http_timeout, self.call_deadline)?,
             &request,
         )
     }
@@ -298,7 +317,7 @@ impl host::Host for HostState {
             .collaborators
             .get()
             .ok_or("next-up is not available during plugin load")?;
-        crate::capabilities::next_up(cx, &user_id, limit)
+        crate::capabilities::next_up(cx, self.call_deadline, &user_id, limit)
     }
 
     fn set_user_data(
@@ -392,6 +411,7 @@ impl host::Host for HostState {
             .ok_or("extract-subtitle-track is not available during plugin load")?;
         crate::capabilities::extract_subtitle_track(
             cx,
+            self.call_deadline,
             self.subtitle_extract_cap,
             &item_id,
             stream_index,
@@ -403,7 +423,7 @@ impl host::Host for HostState {
             .collaborators
             .get()
             .ok_or("media-info is not available during plugin load")?;
-        crate::capabilities::media_info(cx, &item_id)
+        crate::capabilities::media_info(cx, self.call_deadline, &item_id)
     }
 
     fn extract_audio(&mut self, window: types::AudioWindow) -> Result<types::AudioChunk, String> {
@@ -411,7 +431,7 @@ impl host::Host for HostState {
             .collaborators
             .get()
             .ok_or("extract-audio is not available during plugin load")?;
-        crate::capabilities::extract_audio(cx, self.memory_limit_bytes, &window)
+        crate::capabilities::extract_audio(cx, self.call_deadline, self.memory_limit_bytes, &window)
     }
 
     fn extract_frames(
@@ -422,7 +442,7 @@ impl host::Host for HostState {
             .collaborators
             .get()
             .ok_or("extract-frames is not available during plugin load")?;
-        crate::capabilities::extract_frames(cx, &request)
+        crate::capabilities::extract_frames(cx, self.call_deadline, &request)
     }
 
     fn query_items(&mut self, query: types::ItemQuery) -> Result<Vec<types::ItemSummary>, String> {
@@ -430,7 +450,7 @@ impl host::Host for HostState {
             .collaborators
             .get()
             .ok_or("query-items is not available during plugin load")?;
-        crate::capabilities::query_items(cx, &query)
+        crate::capabilities::query_items(cx, self.call_deadline, &query)
     }
 
     fn write_media_segments(

@@ -66,8 +66,11 @@ fn startup() -> TaskTriggerInfo {
 // file-sweep helpers (the C# FileSystemHelper used by the cleanup tasks)
 // ---------------------------------------------------------------------------
 
-/// Recursively collects every file under `dir` (missing dir = empty).
-fn files_under(dir: &Path) -> Vec<PathBuf> {
+/// Recursively collects the files under `dir` that `wanted` accepts (missing
+/// dir = empty). The filter runs during the walk, so a sweep holds only the
+/// paths it acts on, not one per file in the tree (upstream's lazy
+/// `GetFiles(…).Where(…).ToList()`).
+fn files_under(dir: &Path, wanted: &dyn Fn(&Path) -> bool) -> Vec<PathBuf> {
     let mut files = Vec::new();
     let mut stack = vec![dir.to_path_buf()];
     while let Some(current) = stack.pop() {
@@ -78,7 +81,7 @@ fn files_under(dir: &Path) -> Vec<PathBuf> {
             let path = entry.path();
             match entry.file_type() {
                 Ok(t) if t.is_dir() => stack.push(path),
-                Ok(t) if t.is_file() => files.push(path),
+                Ok(t) if t.is_file() && wanted(&path) => files.push(path),
                 _ => {}
             }
         }
@@ -106,7 +109,7 @@ pub fn delete_encoded_media_cache(paths: &dyn ServerApplicationPaths) -> u64 {
         }
     };
     let mut deleted = 0;
-    for file in files_under(&dir) {
+    for file in files_under(&dir, &|_| true) {
         match std::fs::remove_file(&file) {
             Ok(()) => deleted += 1,
             Err(e) => tracing::warn!(path = %file.display(), error = %e, "failed to delete file"),
@@ -127,15 +130,12 @@ fn delete_files_older_than(
     progress_span: f64,
     keep: &dyn Fn(&Path) -> bool,
 ) -> u64 {
-    let candidates: Vec<PathBuf> = files_under(dir)
-        .into_iter()
-        .filter(|f| !keep(f))
-        .filter(|f| {
-            std::fs::metadata(f)
+    let candidates = files_under(dir, &|f| {
+        !keep(f)
+            && std::fs::metadata(f)
                 .and_then(|m| m.modified())
                 .is_ok_and(|modified| modified < cutoff)
-        })
-        .collect();
+    });
     let total = candidates.len();
     let mut deleted = 0u64;
     for (index, file) in candidates.iter().enumerate() {
@@ -475,11 +475,14 @@ impl ScheduledTask for DeleteTranscodeFileTask {
 
 /// "Optimize database" — compacts the database and truncates free space. Port
 /// of `OptimizeDatabaseTask` + the SQLite provider's `RunScheduledOptimisation`
-/// (`PRAGMA optimize`, `VACUUM`, WAL checkpoint truncation).
+/// (`PRAGMA optimize`, `VACUUM`, WAL checkpoint truncation). Before the vacuum
+/// it also prunes Ferrofin's own `FerrofinPlaybackSessions` rows (no upstream
+/// equivalent) older than `ActivityLogRetentionDays`.
 pub struct OptimizeDatabaseTask {
     db: Database,
     sessions: Arc<dyn SessionManager>,
     library: Arc<dyn LibraryManager>,
+    config: Arc<dyn ServerConfigurationManager>,
 }
 
 impl OptimizeDatabaseTask {
@@ -487,18 +490,21 @@ impl OptimizeDatabaseTask {
     /// snapshot holds its maintenance turn), the session manager (the
     /// vacuum is skipped while anything is playing — `VACUUM` and the
     /// truncating checkpoint take exclusive locks that fail live requests; a
-    /// real mid-playback black-screen traced to exactly this window) and the
-    /// library manager (skipped, as upstream, while a library scan runs).
+    /// real mid-playback black-screen traced to exactly this window), the
+    /// library manager (skipped, as upstream, while a library scan runs) and
+    /// the config (the playback-metrics retention window).
     #[must_use]
     pub fn new(
         db: Database,
         sessions: Arc<dyn SessionManager>,
         library: Arc<dyn LibraryManager>,
+        config: Arc<dyn ServerConfigurationManager>,
     ) -> Self {
         Self {
             db,
             sessions,
             library,
+            config,
         }
     }
 }
@@ -555,6 +561,29 @@ impl ScheduledTask for OptimizeDatabaseTask {
             tracing::info!("skipping database optimization: a database snapshot is running");
             return Ok(());
         };
+        // Playback-decision rows hold per-user, per-device history: they expire
+        // with the activity log (unset keeps both), before the vacuum reclaims
+        // their pages. Clean Activity Log has no default trigger; this task does.
+        // A window reaching past chrono's earliest date keeps every row too.
+        let retention = self
+            .config
+            .configuration()
+            .await?
+            .activity_log_retention_days;
+        if let Some((days, cutoff)) = retention.filter(|d| *d >= 0).and_then(|days| {
+            Utc::now()
+                .checked_sub_signed(chrono::Duration::days(i64::from(days)))
+                .map(|cutoff| (days, cutoff))
+        }) {
+            // Ferrofin's own side job: a failure must not cost the optimize.
+            match crate::playback_sessions_repository::prune(&self.db, cutoff).await {
+                Ok(removed) => tracing::info!(removed, days, "pruned playback-decision metrics"),
+                Err(err) => tracing::warn!(
+                    %err,
+                    "could not prune playback-decision metrics; optimizing anyway"
+                ),
+            }
+        }
         tracing::info!("optimizing and vacuuming the database");
         for (statement, pct) in [("PRAGMA optimize", 25.0), ("VACUUM", 75.0)] {
             sqlx::query(statement)
@@ -728,6 +757,7 @@ mod tests {
     use ferrofin_traits::error::ServiceError;
 
     use super::*;
+    use crate::playback_sessions_repository::test_rows;
     use crate::scheduled_tasks::TaskProgress;
     use crate::test_support::test_db;
     use ferrofin_db::entities::security::DeviceEntity;
@@ -941,6 +971,19 @@ mod tests {
         Arc::new(FakePlaybackSessions(true))
     }
 
+    /// Seeds a playback-decision row a year old, past any test's retention.
+    async fn seed_old_session(db: &Database) {
+        test_rows::insert(db, "old", Utc::now() - chrono::Duration::days(365)).await;
+    }
+
+    /// A config whose `ActivityLogRetentionDays` is `days`; the database
+    /// task never touches its paths.
+    fn retention_days(days: Option<i32>) -> Arc<dyn ServerConfigurationManager> {
+        Arc::new(FakeConfig::over(std::path::Path::new("unused"), |c| {
+            c.activity_log_retention_days = days;
+        }))
+    }
+
     // -- fakes ------------------------------------------------------------
 
     struct FakeConfig {
@@ -1115,6 +1158,36 @@ mod tests {
         assert!(cache.exists(), "cache root should remain");
     }
 
+    /// The walk lists only the files its filter accepts, so a sweep over a
+    /// large cache holds the paths it deletes, not one per file in the tree:
+    /// neither a younger file nor a keep-listed old one is listed.
+    #[test]
+    fn files_under_lists_only_the_wanted_files() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let old = touch(dir.path(), "images/ab/old.webp");
+        backdate(&old, 31);
+        let kept = touch(dir.path(), "temp/old.tmp");
+        backdate(&kept, 31);
+        for rel in ["images/ab/fresh.webp", "images/cd/fresh.webp", "top.bin"] {
+            touch(dir.path(), rel);
+        }
+        let cutoff = SystemTime::now() - CACHE_FILE_MAX_AGE;
+        let temp = dir.path().join("temp");
+        let wanted = |f: &Path| {
+            !f.starts_with(&temp)
+                && std::fs::metadata(f)
+                    .and_then(|m| m.modified())
+                    .is_ok_and(|modified| modified < cutoff)
+        };
+
+        assert_eq!(files_under(dir.path(), &wanted), vec![old]);
+        assert_eq!(files_under(dir.path(), &|_| true).len(), 5);
+        assert_eq!(
+            files_under(&dir.path().join("missing"), &|_| true),
+            Vec::<PathBuf>::new()
+        );
+    }
+
     #[tokio::test]
     async fn clean_logs_respects_retention_and_serilog_exclusion() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -1219,6 +1292,7 @@ mod tests {
             db.clone(),
             idle_sessions(),
             crate::test_support::library_manager_over(db),
+            retention_days(Some(30)),
         );
         assert_eq!(task.key(), "OptimizeDatabaseTask");
         assert_eq!(
@@ -1233,10 +1307,12 @@ mod tests {
     #[tokio::test]
     async fn optimize_database_skips_while_playback_is_active() {
         let db = test_db().await;
+        seed_old_session(&db).await;
         let task = OptimizeDatabaseTask::new(
             db.clone(),
             playing_sessions(),
-            crate::test_support::library_manager_over(db),
+            crate::test_support::library_manager_over(db.clone()),
+            retention_days(Some(30)),
         );
         let progress = TaskProgress::default();
         task.execute(&progress).await.expect("skip is Ok");
@@ -1244,6 +1320,7 @@ mod tests {
             progress.current().abs() < f64::EPSILON,
             "guarded run must not have executed the vacuum steps"
         );
+        assert_eq!(test_rows::remaining(&db).await, ["old"], "nor the prune");
     }
 
     /// `OptimizeDatabaseTask.ExecuteAsync` returns at once while a library
@@ -1253,10 +1330,12 @@ mod tests {
     #[tokio::test]
     async fn optimize_database_skips_while_a_library_scan_runs() {
         let db = test_db().await;
+        seed_old_session(&db).await;
         let task = OptimizeDatabaseTask::new(
             db.clone(),
             idle_sessions(),
-            crate::test_support::library_manager_mid_scan(db).await,
+            crate::test_support::library_manager_mid_scan(db.clone()).await,
+            retention_days(Some(30)),
         );
         let progress = TaskProgress::default();
         task.execute(&progress).await.expect("skip is Ok");
@@ -1264,6 +1343,7 @@ mod tests {
             progress.current().abs() < f64::EPSILON,
             "a run during a library scan must not have executed the vacuum steps"
         );
+        assert_eq!(test_rows::remaining(&db).await, ["old"], "nor the prune");
     }
 
     /// While a backup snapshot holds the database's maintenance turn, the
@@ -1276,7 +1356,9 @@ mod tests {
             db.clone(),
             idle_sessions(),
             crate::test_support::library_manager_over(db.clone()),
+            retention_days(Some(30)),
         );
+        seed_old_session(&db).await;
         let snapshot = db.try_maintenance_turn().expect("free");
         let progress = TaskProgress::default();
         task.execute(&progress).await.expect("skip is Ok");
@@ -1284,9 +1366,73 @@ mod tests {
             progress.current().abs() < f64::EPSILON,
             "a run during a snapshot must not have executed the vacuum steps"
         );
+        assert_eq!(test_rows::remaining(&db).await, ["old"], "nor the prune");
         drop(snapshot);
         task.execute(&progress).await.expect("run");
         assert!((progress.current() - 100.0).abs() < f64::EPSILON);
+        assert_eq!(test_rows::remaining(&db).await, Vec::<String>::new());
+    }
+
+    /// A failed prune is Ferrofin's own side job: it is logged, and the
+    /// upstream optimize steps still run to the end.
+    #[tokio::test]
+    async fn optimize_database_runs_on_when_the_prune_fails() {
+        let db = test_db().await;
+        test_rows::drop_table(&db).await;
+        let task = OptimizeDatabaseTask::new(
+            db.clone(),
+            idle_sessions(),
+            crate::test_support::library_manager_over(db),
+            retention_days(Some(30)),
+        );
+        let progress = TaskProgress::default();
+        task.execute(&progress).await.expect("run");
+        assert!((progress.current() - 100.0).abs() < f64::EPSILON);
+    }
+
+    /// Ferrofin's playback-decision rows expire with the activity log: the
+    /// optimize run drops those decided before `ActivityLogRetentionDays`,
+    /// and `null` keeps every row, as it keeps the log.
+    #[tokio::test]
+    async fn optimize_database_prunes_playback_sessions_past_activity_log_retention() {
+        let db = test_db().await;
+        test_rows::insert(&db, "old", Utc::now() - chrono::Duration::days(11)).await;
+        test_rows::insert(&db, "recent", Utc::now() - chrono::Duration::days(9)).await;
+        let task = |days| {
+            OptimizeDatabaseTask::new(
+                db.clone(),
+                idle_sessions(),
+                crate::test_support::library_manager_over(db.clone()),
+                retention_days(days),
+            )
+        };
+
+        task(None)
+            .execute(&TaskProgress::default())
+            .await
+            .expect("run");
+        assert_eq!(test_rows::remaining(&db).await, ["old", "recent"]);
+
+        // A window past chrono's earliest date keeps every row, and the
+        // optimize still runs to the end.
+        let progress = TaskProgress::default();
+        task(Some(i32::MAX)).execute(&progress).await.expect("run");
+        assert!((progress.current() - 100.0).abs() < f64::EPSILON);
+        assert_eq!(test_rows::remaining(&db).await, ["old", "recent"]);
+
+        // A negative window keeps every row, as unset does; its cutoff would
+        // otherwise lie in the future and take them all.
+        task(Some(-1))
+            .execute(&TaskProgress::default())
+            .await
+            .expect("run");
+        assert_eq!(test_rows::remaining(&db).await, ["old", "recent"]);
+
+        task(Some(10))
+            .execute(&TaskProgress::default())
+            .await
+            .expect("run");
+        assert_eq!(test_rows::remaining(&db).await, ["recent"]);
     }
 
     #[tokio::test]

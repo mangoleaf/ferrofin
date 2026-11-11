@@ -20,6 +20,7 @@ use ferrofin_db::entities::base_items::BaseItemEntity;
 use ferrofin_model::entities_media::MediaAttachment;
 use ferrofin_model::querying::QueryResult;
 use ferrofin_traits::error::ServiceError;
+use ferrofin_traits::filesystem::OpenedFile;
 use ferrofin_traits::library::LibraryManager;
 use ferrofin_traits::media_encoding::{
     AttachmentExtractor, ExtractedAttachment, HlsStreamManager, HlsStreamRequest, ServedFile,
@@ -199,7 +200,7 @@ impl HlsStreamManager for FakeHls {
     }
 }
 
-/// A fake [`AttachmentExtractor`] returning fixed bytes + MIME.
+/// A fake [`AttachmentExtractor`] returning a file of fixed bytes + MIME.
 struct FakeAttachments {
     mime: Option<String>,
     data: Vec<u8>,
@@ -223,7 +224,11 @@ impl AttachmentExtractor for FakeAttachments {
                 mime_type: self.mime.clone(),
                 delivery_url: None,
             },
-            data: self.data.clone(),
+            file: OpenedFile {
+                path: "font.ttf".to_owned(),
+                length: self.data.len() as u64,
+                reader: Box::new(std::io::Cursor::new(self.data.clone())),
+            },
         })
     }
 
@@ -884,18 +889,60 @@ async fn a_transcode_is_the_authorizations_user_never_the_querys(#[case] api_key
     }
 }
 
+/// Everything logged at `debug` and above while a test runs.
+#[derive(Clone, Default)]
+struct Captured(Arc<Mutex<Vec<u8>>>);
+
+impl std::io::Write for Captured {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().expect("log").extend_from_slice(buf);
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl Captured {
+    /// Captures this thread's events until the guard drops.
+    fn install(&self) -> tracing::subscriber::DefaultGuard {
+        let writer = self.clone();
+        tracing::subscriber::set_default(
+            tracing_subscriber::fmt()
+                .with_ansi(false)
+                .with_max_level(tracing::Level::DEBUG)
+                .with_writer(move || writer.clone())
+                .finish(),
+        )
+    }
+
+    /// The lines captured so far at `level`.
+    fn lines(&self, level: &str) -> Vec<String> {
+        let log = String::from_utf8(self.0.lock().expect("log").clone()).expect("utf-8");
+        log.lines()
+            .filter(|line| line.contains(&format!(" {level} ")))
+            .map(str::to_owned)
+            .collect()
+    }
+}
+
 /// A refused transcode reaches the client as 503 with its wait, on every
-/// route that starts one, and a client can read why.
+/// route that starts one, and a client can read why. It is load shedding,
+/// logged at `debug` only, so a refused client's retries write no error
+/// lines (gl-904).
 #[tokio::test]
 async fn a_refused_transcode_answers_503_with_retry_after() {
+    let captured = Captured::default();
+    let _guard = captured.install();
     let hls = Arc::new(FakeHls {
         served_path: "/unused".to_owned(),
         rec: Arc::new(Recorded::default()),
         fail: Some(ServiceError::busy("at the limit", 10)),
     });
     let router = router_no_static(hls);
-    for route in starting_routes() {
-        let response = router.clone().oneshot(authed("GET", &route)).await.unwrap();
+    let starting = starting_routes();
+    for route in &starting {
+        let response = router.clone().oneshot(authed("GET", route)).await.unwrap();
         assert_eq!(
             response.status(),
             StatusCode::SERVICE_UNAVAILABLE,
@@ -905,6 +952,15 @@ async fn a_refused_transcode_answers_503_with_retry_after() {
         let body = body_string(response).await;
         assert_eq!(body, r#"{"error":"at the limit"}"#, "{route}");
     }
+    for level in ["INFO", "WARN", "ERROR"] {
+        assert_eq!(captured.lines(level), Vec::<String>::new(), "{level}");
+    }
+    let shed = captured
+        .lines("DEBUG")
+        .iter()
+        .filter(|l| l.contains("request shed"))
+        .count();
+    assert_eq!(shed, starting.len(), "one debug line per refusal");
 }
 
 /// The audio HLS routes encode to `audioBitRate ?? maxStreamingBitrate`
@@ -1350,14 +1406,17 @@ async fn stop_encoding_returns_204_and_records() {
     );
 }
 
+/// The file streams in chunks, whole and in order, with `FileStreamResult`'s
+/// headers: its `Content-Length` and no `Accept-Ranges`.
 #[tokio::test]
-async fn attachment_serves_bytes_with_mime() {
+async fn attachment_streams_the_file_with_mime() {
+    let data: Vec<u8> = (0..200_000_u32).map(|i| (i % 251) as u8).collect();
     let rec = Arc::new(Recorded::default());
     let router = router_with(
         ok_hls("/nope", rec),
         Arc::new(FakeAttachments {
             mime: Some("font/ttf".to_owned()),
-            data: b"FONTDATA".to_vec(),
+            data: data.clone(),
         }),
         Arc::new(ItemLibrary { present: true }),
     );
@@ -1370,7 +1429,38 @@ async fn attachment_serves_bytes_with_mime() {
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
     assert_eq!(resp.headers().get("content-type").unwrap(), "font/ttf");
-    assert_eq!(body_string(resp).await, "FONTDATA");
+    assert_eq!(resp.headers().get("content-length").unwrap(), "200000");
+    assert!(resp.headers().get("accept-ranges").is_none());
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    assert_eq!(body.as_ref(), data.as_slice());
+}
+
+/// A MIME type no header can carry is sent as a missing one is.
+#[tokio::test]
+async fn attachment_with_an_unusable_mime_is_octet_stream() {
+    let rec = Arc::new(Recorded::default());
+    let router = router_with(
+        ok_hls("/nope", rec),
+        Arc::new(FakeAttachments {
+            mime: Some("font/ttf\n".to_owned()),
+            data: b"X".to_vec(),
+        }),
+        Arc::new(ItemLibrary { present: true }),
+    );
+    let resp = router
+        .oneshot(authed(
+            "GET",
+            &format!("/Videos/{ITEM_ID}/src1/Attachments/0"),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(
+        resp.headers().get("content-type").unwrap(),
+        "application/octet-stream"
+    );
 }
 
 #[tokio::test]

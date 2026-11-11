@@ -1,13 +1,13 @@
 //! Error type for the `ferrofin-livetv` crate.
 //!
 //! The Live TV traits in `ferrofin-traits` return
-//! [`ServiceError`](ferrofin_traits::error::ServiceError), so the public methods
+//! [`ServiceError`], so the public methods
 //! ultimately hand one back. Internally, the genuine *infrastructure* failures —
 //! fetching an M3U/XMLTV source over HTTP, reading it from disk, or serializing a
 //! DVR DTO to its stored JSON — are carried as this typed [`LiveTvError`] instead
 //! of being flattened into `ServiceError::Backend(String)`. Converting via
 //! [`From`] boxes the typed error into
-//! [`ServiceError::BackendSource`](ferrofin_traits::error::ServiceError::BackendSource),
+//! [`ServiceError::BackendSource`],
 //! so the underlying [`reqwest::Error`] / [`std::io::Error`] /
 //! [`serde_json::Error`] stays reachable through
 //! [`Error::source`](std::error::Error::source) for logging and tests.

@@ -20,7 +20,7 @@
 //! turns a `file_id` into a one-time download link whose body is the subtitle.
 //!
 //! That link is a destination OpenSubtitles chose, so it is fetched through
-//! the guard image downloads use ([`GuardedHttp`]): a private address is
+//! the guard image downloads use (`GuardedHttp`): a private address is
 //! refused on the link and on every redirect from it, unless the server's
 //! `subtitle_private_http_allow` lists it
 //! ([`with_link_destinations`](OpenSubtitlesProvider::with_link_destinations)).
@@ -58,7 +58,7 @@ const API_BASE: &str = "https://api.opensubtitles.com/api/v1";
 const DEFAULT_API_KEY: &str = "gUCLWGoAg2PmyseoTM0INFFVPcDCeDlT";
 
 /// The `User-Agent` OpenSubtitles requires (they reject generic agents).
-const USER_AGENT: &str = concat!("Ferrofin/", env!("CARGO_PKG_VERSION"));
+const USER_AGENT: &str = ferrofin_health::USER_AGENT;
 
 /// The download link's fetch, for its limiter and log lines.
 static LINK_FETCH: FetchKind = FetchKind::new(
@@ -453,28 +453,17 @@ fn map_search(response: &SearchResponse, language: &str) -> Vec<RemoteSubtitleIn
     out
 }
 
-/// A 3-letter ISO-639-2/T code to the 2-letter ISO-639-1 code the search `languages`
-/// parameter expects; unknown codes pass through.
-fn three_to_two_letter(code: &str) -> &str {
-    match code.to_ascii_lowercase().as_str() {
-        "eng" => "en",
-        "spa" => "es",
-        "fra" | "fre" => "fr",
-        "deu" | "ger" => "de",
-        "ita" => "it",
-        // The API lists no bare pt/zh; the plugin's GetLanguage rewrites them.
-        "por" => "pt-PT",
-        "rus" => "ru",
-        "jpn" => "ja",
-        "zho" | "chi" => "zh-CN",
-        "kor" => "ko",
-        "nld" | "dut" => "nl",
-        "pol" => "pl",
-        "ara" => "ar",
-        "swe" => "sv",
-        "tur" => "tr",
-        // Unknown: best-effort first two chars of the original input.
-        _ => code.get(0..2).unwrap_or(code),
+/// The search `languages` value (`OpenSubtitleDownloader.GetLanguage`): the
+/// request's two-letter code, which the subtitle manager fills in, with the
+/// regioned tags the API lists in place of bare `zh` and `pt`. `None` for a
+/// language with no two-letter code, which upstream refuses with a
+/// `NotSupportedException`.
+fn search_language(request: &SubtitleSearchRequest) -> Option<&str> {
+    match request.two_letter_iso_language_name.as_deref() {
+        Some("zh") => Some("zh-CN"),
+        Some("pt") => Some("pt-PT"),
+        Some(code) if !code.is_empty() => Some(code),
+        _ => None,
     }
 }
 
@@ -902,6 +891,15 @@ impl SubtitleProvider for OpenSubtitlesProvider {
             // Unconfigured provider contributes no candidates (not an error).
             return Ok(Vec::new());
         }
+        let Some(language) = search_language(request) else {
+            // Not searched, as upstream; at debug, since the scheduled task asks once per video.
+            tracing::debug!(
+                item_id = %request.item_id,
+                language = ?request.language,
+                "OpenSubtitles has no code for this language"
+            );
+            return Ok(Vec::new());
+        };
 
         let hash = match request.media_path.as_deref() {
             Some(path) if !path.to_ascii_lowercase().ends_with(".strm") => {
@@ -923,12 +921,7 @@ impl SubtitleProvider for OpenSubtitlesProvider {
                 query.push(("moviehash_match".to_owned(), "only".to_owned()));
             }
         }
-        if !request.language.is_empty() {
-            query.push((
-                "languages".to_owned(),
-                three_to_two_letter(&request.language).to_owned(),
-            ));
-        }
+        query.push(("languages".to_owned(), language.to_owned()));
         if let Some(imdb) = request
             .imdb_id
             .as_deref()
@@ -2144,17 +2137,61 @@ mod tests {
         assert!(parse_subtitle_id("srt-eng-x").is_none());
     }
 
-    #[test]
-    fn language_code_three_to_two_common_cases() {
-        for (three, two) in [("eng", "en"), ("spa", "es"), ("fra", "fr"), ("jpn", "ja")] {
-            assert_eq!(three_to_two_letter(three), two);
-        }
-        // French alternate 3-letter code also maps.
-        assert_eq!(three_to_two_letter("fre"), "fr");
-        // Portuguese and Chinese use the regioned tags the API actually lists.
-        assert_eq!(three_to_two_letter("por"), "pt-PT");
-        assert_eq!(three_to_two_letter("chi"), "zh-CN");
-        // Unknown passes through (truncated to 2 for the search param).
-        assert_eq!(three_to_two_letter("xyz"), "xy");
+    /// A search for `language` whose culture has `two_letter`, over a
+    /// configured account, and the request lines the API saw.
+    async fn search_for(
+        language: &str,
+        two_letter: Option<&str>,
+    ) -> (Result<Vec<RemoteSubtitleInfo>, ServiceError>, Vec<String>) {
+        let mock =
+            ApiMock::start(|_| vec![("/subtitles", vec![(200, r#"{"data":[]}"#.to_owned())])])
+                .await;
+        let (provider, _) = account_provider(&mock, "user");
+        let result = provider
+            .search(&SubtitleSearchRequest {
+                language: language.to_owned(),
+                two_letter_iso_language_name: two_letter.map(str::to_owned),
+                ..Default::default()
+            })
+            .await;
+        let seen = mock.requests.lock().unwrap().clone();
+        (result, seen)
+    }
+
+    /// gl-1462: `OpenSubtitleDownloader.GetLanguage` searches the request's
+    /// two-letter code, with the regioned tags the API lists for bare `zh`
+    /// and `pt`.
+    #[rstest::rstest]
+    #[case("est", "et", "et")]
+    #[case("ces", "cs", "cs")]
+    #[case("slk", "sk", "sk")]
+    #[case("bos", "bs", "bs")]
+    #[case("eng", "en", "en")]
+    #[case("chi", "zh", "zh-CN")]
+    #[case("por", "pt", "pt-PT")]
+    #[tokio::test]
+    async fn search_sends_the_two_letter_language(
+        #[case] language: &str,
+        #[case] two_letter: &str,
+        #[case] sent: &str,
+    ) {
+        let (result, seen) = search_for(language, Some(two_letter)).await;
+        result.expect("search");
+        assert_eq!(seen, [format!("GET /subtitles?languages={sent}")]);
+    }
+
+    /// A language with no two-letter code is not supported: upstream's
+    /// `GetLanguage` throws before the search, so nothing is searched.
+    #[rstest::rstest]
+    #[case("xyz", None)]
+    #[case("und", Some(""))]
+    #[tokio::test]
+    async fn search_skips_a_language_without_a_two_letter_code(
+        #[case] language: &str,
+        #[case] two_letter: Option<&str>,
+    ) {
+        let (result, seen) = search_for(language, two_letter).await;
+        assert_eq!(result.expect("search"), []);
+        assert!(seen.is_empty(), "{seen:?}");
     }
 }

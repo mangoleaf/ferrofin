@@ -2,11 +2,11 @@
 //! `MediaBrowser.Providers.MediaInfo.FFProbeVideoInfo` (and the entry-point role
 //! of `ProbeProvider`).
 //!
-//! Scope note (First-Light): the full C# `FFProbeVideoInfo` couples the probe to
-//! ~13 collaborators (media-source / subtitle / chapter / attachment / stream
+//! Scope note: the full C# `FFProbeVideoInfo` couples the probe to ~13
+//! collaborators (media-source / subtitle / chapter / attachment / stream
 //! repositories, the Blu-ray/DVD examiners, the localization manager, and the
-//! library store). None of those are ported in this wave, so this port keeps the
-//! two pieces that are pure and testable and that only need the ffprobe seam:
+//! library store). This module keeps the pieces that are pure and testable and
+//! that only need the ffprobe seam:
 //!
 //! - [`FFProbeVideoInfo::get_media_info`] — builds a [`MediaInfoRequest`] from a
 //!   [`VideoProbeInput`] and drives it through a borrowed
@@ -50,8 +50,8 @@ const MAX_VALID_RUNTIME_TICKS: i64 = 12 * 60 * 60 * TICKS_PER_SECOND;
 /// touch.
 ///
 /// The full C# `Video` is a large library-item aggregate; this carries only the
-/// probe-relevant surface so the provider stays decoupled from the (not-yet
-/// ported) item store.
+/// probe-relevant surface so the provider stays decoupled from the item store
+/// (`ferrofin-core`'s item repository).
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct VideoProbeInput {
     /// The item name (`Name`) — used only for the invalid-runtime error message.
@@ -78,8 +78,6 @@ pub struct VideoProbeInput {
     pub width: i32,
     /// The video height (`Height`).
     pub height: i32,
-    /// The default video-stream index (`DefaultVideoStreamIndex`).
-    pub default_video_stream_index: Option<i32>,
     /// Whether the item has subtitle streams (`HasSubtitles`).
     pub has_subtitles: bool,
 }
@@ -147,8 +145,9 @@ impl<'a> FFProbeVideoInfo<'a> {
     /// Port of the object-safe subset of `Fetch`: it copies the container /
     /// total-bitrate / runtime (and, for disc sources, size) onto the item,
     /// re-indexes the streams `0..n`, then derives width / height /
-    /// `DefaultVideoStreamIndex` / `HasSubtitles` from the video stream. The
-    /// rest of `Fetch` is the library scan's (see the module docs).
+    /// `HasSubtitles` from the video stream. The rest of `Fetch` is the
+    /// library scan's (see the module docs), `DefaultVideoStreamIndex`
+    /// included: the scan stores it in the item's `Data`.
     #[must_use]
     pub fn fetch(
         &self,
@@ -179,7 +178,6 @@ impl<'a> FFProbeVideoInfo<'a> {
 
         video.height = video_stream.and_then(|s| s.height).unwrap_or(0);
         video.width = video_stream.and_then(|s| s.width).unwrap_or(0);
-        video.default_video_stream_index = video_stream.map(|s| s.index);
         video.has_subtitles = media_streams
             .iter()
             .any(|s| s.stream_type == MediaStreamType::Subtitle);
@@ -508,7 +506,6 @@ mod tests {
             streams.iter().map(|s| s.index).collect::<Vec<_>>(),
             vec![0, 1, 2]
         );
-        assert_eq!(item.default_video_stream_index, Some(1));
     }
 
     #[test]
@@ -525,6 +522,5 @@ mod tests {
         assert_eq!(item.width, 0);
         assert_eq!(item.height, 0);
         assert!(!item.has_subtitles);
-        assert_eq!(item.default_video_stream_index, None);
     }
 }

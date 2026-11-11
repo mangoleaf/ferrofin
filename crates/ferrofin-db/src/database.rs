@@ -137,7 +137,7 @@ impl Database {
     /// [`Database::connect`] with an explicit pool size and statement cache.
     ///
     /// `pool_size` `Some(n)` pins the pool at exactly `n` connections; `None`
-    /// uses the sizing formula ([`default_pool_size`]). `statement_cache` is
+    /// uses the sizing formula (`default_pool_size`). `statement_cache` is
     /// how many prepared statements each connection keeps, reader and writer
     /// pools alike; `None` keeps [`DEFAULT_STATEMENT_CACHE_CAPACITY`]. The
     /// composition root resolves its config layers (`FERROFIN_DB_POOL` /
@@ -403,7 +403,8 @@ impl Database {
         self.rows.enable(ttl);
     }
 
-    /// Whether [`Database::enable_row_cache`] has run.
+    /// Whether [`Database::enable_row_cache`] has run. Test-only: the server's
+    /// integration tests check with it that the composition root turned the caches on.
     #[must_use]
     pub fn row_cache_enabled(&self) -> bool {
         self.rows.enabled()
@@ -641,6 +642,9 @@ impl Database {
 
     /// Every Live TV tuner host as `(id, url, type, data)`, id-ordered.
     ///
+    /// Test-only, but not `#[cfg(test)]`: its callers are tests in this crate's
+    /// `tests/` and in `ferrofin-core`. The server reads these rows through `ferrofin-livetv`.
+    ///
     /// # Errors
     ///
     /// Returns an error if the query fails.
@@ -654,6 +658,9 @@ impl Database {
     }
 
     /// Every Live TV listing provider as `(id, type, path)`, id-ordered.
+    ///
+    /// Test-only, but not `#[cfg(test)]`: its callers are tests in this crate's
+    /// `tests/` and in `ferrofin-core`. The server reads these rows through `ferrofin-livetv`.
     ///
     /// # Errors
     ///
@@ -1032,7 +1039,8 @@ impl Database {
 
     /// Plants an adoption record as the gate would — for tests of the boot
     /// repairs that key on it (an in-memory database never goes through the
-    /// gate).
+    /// gate). Test-only, but not `#[cfg(test)]`: its callers are
+    /// `ferrofin-core`'s unit tests, which `#[cfg(test)]` here would not reach.
     ///
     /// # Errors
     /// Returns [`DbError::Sqlx`](crate::DbError::Sqlx) if the write fails.
@@ -1048,20 +1056,6 @@ impl Database {
         .bind(generation)
         .execute(&self.writer)
         .await?;
-        Ok(())
-    }
-
-    /// The writer-pool half of a membership import: marks the adoption
-    /// record's import as done. Callers run it inside the same transaction
-    /// as the imported rows via [`Self::writer`]; this convenience is for the
-    /// non-transactional case.
-    ///
-    /// # Errors
-    /// Returns [`DbError::Sqlx`](crate::DbError::Sqlx) if the write fails.
-    pub async fn mark_membership_import_done(&self) -> Result<()> {
-        sqlx::query(r#"UPDATE "FerrofinAdoption" SET "MembershipImportDone" = 1"#)
-            .execute(&self.writer)
-            .await?;
         Ok(())
     }
 
@@ -1204,7 +1198,7 @@ impl Database {
     /// boot's, the file as it was before the first attempt).
     ///
     /// The snapshot is written under a temporary name and only renamed into
-    /// place once it is complete and on disk ([`publish_snapshot`]), so an
+    /// place once it is complete and on disk (`publish_snapshot`), so an
     /// existing one is never a copy a full disk or a kill cut short. Something
     /// other than a file on the snapshot's name (a directory) is no snapshot:
     /// the rename onto it fails, and so does the repair, rather than run with

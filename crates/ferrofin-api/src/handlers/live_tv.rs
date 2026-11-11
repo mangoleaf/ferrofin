@@ -1,7 +1,7 @@
 //! `LiveTvController` — Ferrofin's M3U-tuner + XMLTV-guide Live TV.
 //!
 //! The read/query surface (info, channels, programs, recommended) is served from
-//! the real [`LiveTvManager`] when the composition root has wired it; until then
+//! the real `LiveTvManager` when the composition root has wired it; until then
 //! (or when nothing is configured) it returns the honest empty/disabled state so
 //! the web UI still works. The configuration surface — add/delete a tuner host or
 //! listing provider — and the single-resource `{id}` lookups are backed by the
@@ -10,14 +10,14 @@
 //!
 //! The DVR surface (recordings, timers, series timers) is backed by the manager
 //! too: timers and series timers persist and list/get/update/cancel, and
-//! recordings list/get/delete. The recording *capture* engine (a scheduler that
-//! records a channel to disk when a timer fires) is a further increment.
+//! recordings list/get/delete. When a timer fires, the DVR (`ferrofin-livetv`)
+//! records the channel to a file under the recordings directory.
 //!
 //! The three program queries (`GET`/`POST /LiveTv/Programs` and
 //! `/LiveTv/Programs/Recommended`) bind the contract's whole filter set — channel
 //! ids, the start/end date window, the airing/kind flags, genres, paging and
 //! sort — and carry it into the `InternalItemsQuery` the manager seam takes; see
-//! [`query_programs`]. Three divergences are deliberate and documented at their
+//! `query_programs`. Three divergences are deliberate and documented at their
 //! handlers: `GET /LiveTv/Channels` cannot page (its seam method takes no
 //! query), `Programs/Recommended` does not apply upstream's per-user
 //! recommendation *score* re-ordering (it needs channel user-data the seam does
@@ -52,7 +52,7 @@ use ferrofin_traits::stubs::{LiveTvChannelQuery, RecordingVisibility};
 
 use crate::auth::{RequireAdmin, RequireLiveTvAccess, RequireLiveTvManagement};
 use crate::error::ApiError;
-use crate::extract::{JsonBody, Query};
+use crate::extract::{DotnetGuid, JsonBody, Query};
 use crate::handlers::items::{require_visible_item, resolve_user_opt};
 use crate::handlers::query_parse::{
     de_comma_delimited, de_comma_delimited_guids, de_pipe_delimited, parse_csv_enums_lenient,
@@ -225,7 +225,7 @@ async fn get_channels(
 async fn get_channel(
     State(state): State<AppState>,
     RequireLiveTvAccess(auth): RequireLiveTvAccess,
-    Path(channel_id): Path<Uuid>,
+    Path(DotnetGuid(channel_id)): Path<DotnetGuid>,
     Query(query): Query<UserIdQuery>,
 ) -> Result<Json<BaseItemDto>, ApiError> {
     let Some(m) = state.live_tv.as_ref() else {
@@ -747,7 +747,7 @@ async fn get_recommended_programs(
 async fn get_program(
     State(state): State<AppState>,
     RequireLiveTvAccess(auth): RequireLiveTvAccess,
-    Path(program_id): Path<Uuid>,
+    Path(DotnetGuid(program_id)): Path<DotnetGuid>,
     Query(query): Query<UserIdQuery>,
 ) -> Result<Json<BaseItemDto>, ApiError> {
     let Some(m) = state.live_tv.as_ref() else {
@@ -1194,7 +1194,7 @@ struct LiveTvUserQuery {
 async fn get_recording(
     State(state): State<AppState>,
     RequireLiveTvAccess(auth): RequireLiveTvAccess,
-    Path(recording_id): Path<Uuid>,
+    Path(DotnetGuid(recording_id)): Path<DotnetGuid>,
     Query(query): Query<LiveTvUserQuery>,
 ) -> Result<Json<BaseItemDto>, ApiError> {
     let user = resolve_user_opt(&state, &auth, query.user_id).await?;
@@ -1320,7 +1320,7 @@ async fn libraries_allow(
 async fn delete_recording(
     State(state): State<AppState>,
     RequireLiveTvManagement(auth): RequireLiveTvManagement,
-    Path(recording_id): Path<Uuid>,
+    Path(DotnetGuid(recording_id)): Path<DotnetGuid>,
 ) -> Result<axum::http::StatusCode, ApiError> {
     require_visible_recording(&state, recording_id, auth.user.as_deref()).await?;
     live_tv(&state)?.delete_recording(recording_id).await?;
@@ -1409,7 +1409,7 @@ async fn get_recording_groups(
 /// this always reports `404` — the faithful outcome.
 async fn get_recording_group(
     RequireLiveTvAccess(_auth): RequireLiveTvAccess,
-    Path(_group_id): Path<Uuid>,
+    Path(DotnetGuid(_group_id)): Path<DotnetGuid>,
 ) -> Result<Json<BaseItemDto>, ApiError> {
     Err(ApiError::NotFound("recording group".into()))
 }
@@ -2432,7 +2432,7 @@ mod tests {
         let err = get_channel(
             State(state),
             auth(),
-            Path(Uuid::nil()),
+            Path(DotnetGuid(Uuid::nil())),
             Query(UserIdQuery::default()),
         )
         .await
@@ -2658,7 +2658,7 @@ mod tests {
 
     #[tokio::test]
     async fn recording_group_and_an_unopened_live_stream_file_are_404() {
-        let group = get_recording_group(auth(), Path(Uuid::nil()))
+        let group = get_recording_group(auth(), Path(DotnetGuid(Uuid::nil())))
             .await
             .unwrap_err();
         assert_eq!(group.status(), axum::http::StatusCode::NOT_FOUND);

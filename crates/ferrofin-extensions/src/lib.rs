@@ -4,7 +4,7 @@
 //!
 //! An [`Extension`] is a repo-curated capability that **surfaces as a plugin** on
 //! the frozen `/Plugins` API (enable/disable toggle, config page) via the
-//! existing [`PluginManager`](ferrofin_traits::plugins::PluginManager), and can
+//! existing [`PluginManager`], and can
 //! contribute background [`ScheduledTask`]s. The set is static —
 //! [`builtin_extensions`] — but each is enable/disable-able at runtime; a task
 //! self-gates on its plugin's enabled flag, so toggling needs no restart.
@@ -244,6 +244,40 @@ mod tests {
         }
     }
 
+    /// A [`ferrofin_traits::chapters::ChapterManager`] with no chapters, for
+    /// the extension contexts these tests build without the chapter store.
+    pub(crate) struct NoChapters;
+
+    #[async_trait]
+    impl ferrofin_traits::chapters::ChapterManager for NoChapters {
+        async fn supports(&self, _item_id: uuid::Uuid) -> Result<bool, ServiceError> {
+            Ok(false)
+        }
+        async fn save_chapters(
+            &self,
+            _item_id: uuid::Uuid,
+            _chapters: &[ferrofin_model::entities_media::ChapterInfo],
+        ) -> Result<(), ServiceError> {
+            Err(ServiceError::backend("no chapter store attached"))
+        }
+        async fn get_chapter(
+            &self,
+            _item_id: uuid::Uuid,
+            _index: i32,
+        ) -> Result<Option<ferrofin_model::entities_media::ChapterInfo>, ServiceError> {
+            Ok(None)
+        }
+        async fn get_chapters(
+            &self,
+            _item_id: uuid::Uuid,
+        ) -> Result<Vec<ferrofin_model::entities_media::ChapterInfo>, ServiceError> {
+            Ok(Vec::new())
+        }
+        async fn delete_chapter_data(&self, _item_id: uuid::Uuid) -> Result<(), ServiceError> {
+            Err(ServiceError::backend("no chapter store attached"))
+        }
+    }
+
     async fn context() -> ExtensionContext {
         context_with_users().await.0
     }
@@ -290,7 +324,7 @@ mod tests {
             virtual_folders: Arc::new(
                 ferrofin_traits::stubs::virtual_folders::DisabledVirtualFolderManager,
             ),
-            chapters: Arc::new(ferrofin_traits::stubs::chapters::NoChapters),
+            chapters: Arc::new(NoChapters),
             users: Arc::clone(&users) as Arc<dyn UserManager>,
             external_identities: Arc::new(
                 ferrofin_core::external_identity_repository::FerrofinExternalIdentityStore::new(

@@ -3,19 +3,19 @@
 //!
 //! Port of `MediaBrowser.Providers.Subtitles.SubtitleManager`:
 //!
-//! - [`Self::search_subtitles`] enriches the request from the resolved item
+//! - `Self::search_subtitles` enriches the request from the resolved item
 //!   (name/year/series/season/episode/path) and fans it out across the
 //!   registered providers (OpenSubtitles, …), aggregating the candidates. A
 //!   provider that errors is skipped (logged) rather than failing the whole
 //!   search, matching Jellyfin's per-provider aggregation.
-//! - [`Self::download_subtitles`] routes the namespaced id back to its provider,
+//! - `Self::download_subtitles` routes the namespaced id back to its provider,
 //!   fetches the content, and **attaches** it to the item (a sidecar in the library
 //!   configured media or internal-metadata folder + an external [`MediaStream`](ferrofin_model::entities_media::MediaStream)
-//!   row). [`Self::upload_subtitle`] attaches caller-supplied content the same way.
-//! - [`Self::get_remote_subtitles`] routes an id to its provider and returns the
+//!   row). `Self::upload_subtitle` attaches caller-supplied content the same way.
+//! - `Self::get_remote_subtitles` routes an id to its provider and returns the
 //!   raw content (the `/Providers/Subtitles/Subtitles/{id}` route).
-//! - [`Self::delete_subtitles`] removes the external stream row + sidecar file.
-//! - [`Self::get_supported_providers`] lists the registered providers for an item.
+//! - `Self::delete_subtitles` removes the external stream row + sidecar file.
+//! - `Self::get_supported_providers` lists the registered providers for an item.
 
 use ferrofin_util::directory_path::DirectoryPath;
 use std::path::{Path, PathBuf};
@@ -113,9 +113,15 @@ impl FerrofinSubtitleManager {
             .join(&dashless)
     }
 
-    /// Fills the request's item-derived fields (name/year/series/season/episode/
-    /// path/content-type) from the resolved item, so providers can build a query.
+    /// Fills the request's two-letter language and its item-derived fields
+    /// (name/year/series/season/episode/path/content-type) from the resolved
+    /// item, so providers can build a query.
     async fn enrich(&self, request: &mut SubtitleSearchRequest) -> Result<bool, ServiceError> {
+        // SubtitleManager.SearchSubtitles: FindLanguageInfo(Language)?.TwoLetterISOLanguageName.
+        if let Some(culture) = crate::localization_manager::find_culture(&request.language) {
+            request.two_letter_iso_language_name =
+                Some(culture.two_letter_iso_language_name.clone());
+        }
         if let Some(item) = self.library_manager.get_item_by_id(request.item_id).await? {
             let Some(content_type) = subtitle_media_type(&item.type_) else {
                 return Ok(false);
@@ -707,6 +713,43 @@ mod tests {
         async fn get_subtitles(&self, _: &str) -> Result<SubtitleResponse, ServiceError> {
             unreachable!("search only")
         }
+    }
+
+    /// gl-1462: `SearchSubtitles` hands providers the two-letter code of the
+    /// culture `FindLanguageInfo` finds for the language, by any of its names.
+    #[rstest::rstest]
+    #[case("est", Some("et"))]
+    #[case("ces", Some("cs"))]
+    #[case("cze", Some("cs"))]
+    #[case("slk", Some("sk"))]
+    #[case("bos", Some("bs"))]
+    #[case("gre", Some("el"))]
+    #[case("ger", Some("de"))]
+    #[case("German", Some("de"))]
+    #[case("por", Some("pt"))]
+    #[case("chi", Some("zh"))]
+    #[case("und", Some(""))]
+    #[case("xyz", None)]
+    #[tokio::test]
+    async fn search_gives_providers_the_two_letter_language(
+        #[case] language: &str,
+        #[case] expected: Option<&str>,
+    ) {
+        let db = test_db().await;
+        let item = Uuid::new_v4();
+        seed_item(&db, item, BaseItemKind::Movie).await;
+        let captured = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mgr = manager(db, vec![Arc::new(CapturingProvider(captured.clone()))]);
+        mgr.search_subtitles(&SubtitleSearchRequest {
+            item_id: item,
+            language: language.to_owned(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        let seen = captured.lock().unwrap()[0].clone();
+        assert_eq!(seen.two_letter_iso_language_name.as_deref(), expected);
+        assert_eq!(seen.language, language);
     }
 
     #[allow(clippy::too_many_lines)]

@@ -22,8 +22,8 @@ unscoped lookup. Its baseline implementation in
 at line 1234 rejects a nil ID, then calls `ItemRepository::retrieve_item`.
 Resolving a user for DTO or playback preferences does not authorize the item.
 
-The original ignored `brain/plans/PLAN_PER_USER_ITEM_VISIBILITY.md` correctly
-identified this gap but needs two corrections:
+The original plan for this work (a maintainer note outside this repository)
+correctly identified this gap but needs two corrections:
 
 - Current main's delete is **row-only**. Its claim that files are already deleted
   is stale. The live test removes the hidden row and leaves its media file intact.
@@ -43,10 +43,11 @@ Source oracle: the repository's then-current `UPSTREAM_TAG`, **v12.0-rc7**, comm
 Live oracle: the available **Jellyfin 12.1.0** binary. These are separate evidence
 sources; the runtime tests are not represented as a run of rc7.
 
-Ferrofin was rebuilt from the investigation worktree with:
+Ferrofin was rebuilt from the investigation worktree into the main checkout's
+target directory (`$MAIN_CHECKOUT` below is that checkout's path) with:
 
 ```sh
-CARGO_TARGET_DIR=/home/mango/dev/ferrofin/target RUSTC_WRAPPER= \
+CARGO_TARGET_DIR=$MAIN_CHECKOUT/target RUSTC_WRAPPER= \
   cargo build --locked --offline -p ferrofin-server
 ```
 
@@ -100,7 +101,7 @@ The harness requires Python 3, ffmpeg with libx264, and these server binaries:
 
 ```sh
 python3 /tmp/ferrofin-visibility-live.py ferrofin \
-  /home/mango/dev/ferrofin/target/debug/ferrofin-server
+  $MAIN_CHECKOUT/target/debug/ferrofin-server
 python3 /tmp/ferrofin-visibility-live.py jellyfin \
   /tmp/ferrofin-extras-jellyfin-bin/jellyfin.dll \
   --dotnet /tmp/ferrofin-extras-dotnet/dotnet

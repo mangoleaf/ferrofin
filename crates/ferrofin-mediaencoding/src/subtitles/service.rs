@@ -4,7 +4,7 @@
 //! SubtitleEncoder` that the `SubtitleController` (and the streaming pipeline)
 //! call: resolve the media source for `(item, mediaSourceId)`, locate the
 //! subtitle stream by index, then delegate to the pure
-//! [`SubtitleEncoder`](super::encoder::SubtitleEncoder) for the readable-file
+//! [`SubtitleEncoder`] for the readable-file
 //! resolution, charset normalization, and format conversion.
 //!
 //! The concrete encoder is generic over its [`SubtitleParser`] and
@@ -14,7 +14,6 @@
 
 use std::sync::Arc;
 
-use crate::error::MediaEncodingError;
 use async_trait::async_trait;
 use ferrofin_model::dto::MediaSourceInfo;
 use ferrofin_model::entities::MediaStreamType;
@@ -122,7 +121,7 @@ where
                 preserve_original_timestamps,
             )
             .await
-            .map_err(|e| MediaEncodingError::process(e).into())
+            .map_err(Into::into)
     }
 
     async fn get_subtitle_file_character_set(
@@ -134,7 +133,7 @@ where
         self.encoder
             .get_subtitle_file_character_set(subtitle_stream)
             .await
-            .map_err(|e| MediaEncodingError::process(e).into())
+            .map_err(Into::into)
     }
 
     async fn get_subtitle_file_path(
@@ -145,7 +144,7 @@ where
         self.encoder
             .get_subtitle_file_path(media_source, subtitle_stream)
             .await
-            .map_err(|e| MediaEncodingError::process(e).into())
+            .map_err(Into::into)
     }
 
     async fn extract_all_extractable_subtitles(
@@ -167,7 +166,7 @@ where
         self.encoder
             .get_trimmed_subtitles(media_source, subtitle_stream, start_time_ticks)
             .await
-            .map_err(|e| MediaEncodingError::process(e).into())
+            .map_err(Into::into)
     }
 }
 
@@ -200,7 +199,7 @@ mod tests {
 
     #[async_trait]
     impl SubtitleIo for MemIo {
-        async fn read_file(&self, _path: &str) -> Result<Vec<u8>, String> {
+        async fn read_file(&self, _path: &str) -> std::io::Result<Vec<u8>> {
             Ok(self.bytes.clone())
         }
         async fn http_get(&self, _url: &str) -> Result<Vec<u8>, String> {
@@ -318,6 +317,206 @@ mod tests {
         assert_eq!(out, SRT_SAMPLE.as_bytes());
     }
 
+    /// `GetWriter`'s `ArgumentException` is a 400 upstream, not a 500.
+    #[tokio::test]
+    async fn an_unknown_output_format_is_invalid_input() {
+        let source = source_with(vec![srt_stream(0, "/subs/a.srt")]);
+        let io = MemIo {
+            bytes: SRT_SAMPLE.as_bytes().to_vec(),
+        };
+        let err = build(Some(source), io)
+            .get_subtitles(Uuid::nil(), "msrc", 0, "xyz", 0, 0, false)
+            .await
+            .expect_err("no writer for xyz");
+        assert!(matches!(err, ServiceError::InvalidInput(_)), "{err:?}");
+    }
+
+    /// `SubtitleEditParser.Parse` throws `ArgumentException` for a file with
+    /// no cues: a 400 upstream.
+    #[tokio::test]
+    async fn a_sidecar_without_cues_is_invalid_input() {
+        let source = source_with(vec![srt_stream(0, "/subs/a.srt")]);
+        let io = MemIo {
+            bytes: b"this is not a subtitle\n".to_vec(),
+        };
+        let err = build(Some(source), io)
+            .get_subtitles(Uuid::nil(), "msrc", 0, "vtt", 0, 0, false)
+            .await
+            .expect_err("no cues");
+        assert!(matches!(err, ServiceError::InvalidInput(_)), "{err:?}");
+    }
+
+    /// An I/O seam on which every local read fails with one error kind, every
+    /// HTTP fetch fails, and no extraction writes its output.
+    struct FailingIo(std::io::ErrorKind);
+
+    #[async_trait]
+    impl SubtitleIo for FailingIo {
+        async fn read_file(&self, _path: &str) -> std::io::Result<Vec<u8>> {
+            Err(self.0.into())
+        }
+        async fn http_get(&self, url: &str) -> Result<Vec<u8>, String> {
+            Err(format!("GET {url}: HTTP 503"))
+        }
+        fn path_protocol(&self, path: &str) -> MediaProtocol {
+            if path.starts_with("http") {
+                MediaProtocol::Http
+            } else {
+                MediaProtocol::File
+            }
+        }
+        fn subtitle_cache_path(
+            &self,
+            media_source_id: &str,
+            subtitle_stream_index: i32,
+            output_extension: &str,
+        ) -> Option<String> {
+            Some(format!(
+                "/cache/{media_source_id}-{subtitle_stream_index}{output_extension}"
+            ))
+        }
+        async fn extract(&self, _args: &str, _output_paths: &[String]) -> Result<(), String> {
+            Ok(())
+        }
+        fn file_exists(&self, _path: &str) -> bool {
+            false
+        }
+        async fn open_file(&self, _path: &str) -> std::io::Result<()> {
+            Err(self.0.into())
+        }
+        fn file_size(&self, _path: &str) -> Option<u64> {
+            None
+        }
+        fn delete_file(&self, _path: &str) -> Result<(), String> {
+            Ok(())
+        }
+        fn write_file(&self, _path: &str, _content: &[u8]) -> Result<(), String> {
+            Ok(())
+        }
+        fn file_stamp(&self, _path: &str) -> Option<(u64, i64)> {
+            None
+        }
+    }
+
+    /// An external PGS track at `path`.
+    fn pgs_stream(path: &str) -> MediaStream {
+        let mut stream = srt_stream(0, path);
+        stream.codec = Some("pgssub".to_owned());
+        stream
+    }
+
+    /// A sidecar gone since the scan is the `404` of upstream's
+    /// `FileNotFoundException`, and its message, which reaches the client of an
+    /// anonymous route, names no path. A PGS track, refused unread as text,
+    /// still opens its file first, so it is the `404` too.
+    #[tokio::test]
+    async fn a_missing_sidecar_is_not_found_without_its_path() {
+        // ENOTDIR (a path through a file) is .NET's `DirectoryNotFoundException`.
+        for kind in [
+            std::io::ErrorKind::NotFound,
+            std::io::ErrorKind::NotADirectory,
+        ] {
+            for stream in [srt_stream(0, "/subs/a.srt"), pgs_stream("/subs/a.sup")] {
+                let enc = failing(kind, stream);
+                for format in ["vtt", "srt"] {
+                    let err = enc
+                        .get_subtitles(Uuid::nil(), "msrc", 0, format, 0, 0, false)
+                        .await
+                        .expect_err("sidecar gone");
+                    assert!(
+                        matches!(err, ServiceError::NotFound(_)),
+                        "{kind:?} {format}: {err:?}"
+                    );
+                    assert!(!err.to_string().contains("/subs"), "{err}");
+                }
+            }
+        }
+    }
+
+    /// An external track with an empty path whose codec takes the ffmpeg
+    /// SubRip conversion: `ConvertTextSubtitleToSrtInternal`'s
+    /// `ArgumentException.ThrowIfNullOrEmpty(inputPath)`, a `400`.
+    #[tokio::test]
+    async fn a_conversion_without_an_input_path_is_invalid_input() {
+        let mut stream = srt_stream(0, "");
+        stream.codec = Some("smi".to_owned());
+        let err = failing(std::io::ErrorKind::NotFound, stream)
+            .get_subtitles(Uuid::nil(), "msrc", 0, "vtt", 0, 0, false)
+            .await
+            .expect_err("no input path");
+        assert!(matches!(err, ServiceError::InvalidInput(_)), "{err:?}");
+    }
+
+    /// Any other failed read stays the `500` (`UnauthorizedAccessException`,
+    /// `IOException` upstream), its path kept for the server log, a PGS
+    /// track's failed open included.
+    #[tokio::test]
+    async fn an_unreadable_sidecar_stays_a_backend_error() {
+        for (stream, path) in [
+            (srt_stream(0, "/subs/a.srt"), "/subs/a.srt"),
+            (pgs_stream("/subs/a.sup"), "/subs/a.sup"),
+        ] {
+            let err = failing(std::io::ErrorKind::PermissionDenied, stream)
+                .get_subtitles(Uuid::nil(), "msrc", 0, "vtt", 0, 0, false)
+                .await
+                .expect_err("sidecar unreadable");
+            assert!(matches!(err, ServiceError::BackendSource(_)), "{err:?}");
+            assert!(err.to_string().contains(&format!("read {path}")), "{err}");
+        }
+    }
+
+    /// An embedded track whose extraction left no cache file: upstream swallows
+    /// the failed extraction, and its read of the cache is the
+    /// `FileNotFoundException` `404`.
+    #[tokio::test]
+    async fn an_embedded_track_whose_extraction_failed_is_not_found() {
+        let mut stream = srt_stream(0, "");
+        stream.is_external = false;
+        stream.path = None;
+        let err = failing(std::io::ErrorKind::NotFound, stream)
+            .get_subtitles(Uuid::nil(), "msrc", 0, "vtt", 0, 0, false)
+            .await
+            .expect_err("no cache file");
+        assert!(matches!(err, ServiceError::NotFound(_)), "{err:?}");
+    }
+
+    /// A remote sidecar that cannot be fetched stays the `500` of upstream's
+    /// `HttpRequestException`.
+    #[tokio::test]
+    async fn a_failed_remote_sidecar_stays_a_backend_error() {
+        let err = failing(
+            std::io::ErrorKind::NotFound,
+            srt_stream(0, "https://subs.example/a.srt"),
+        )
+        .get_subtitles(Uuid::nil(), "msrc", 0, "vtt", 0, 0, false)
+        .await
+        .expect_err("fetch failed");
+        assert!(matches!(err, ServiceError::BackendSource(_)), "{err:?}");
+    }
+
+    /// The service over `stream`, on an I/O seam where every read fails with
+    /// `kind` ([`FailingIo`]).
+    fn failing(kind: std::io::ErrorKind, stream: MediaStream) -> impl SubtitleEncoderTrait {
+        let source = source_with(vec![stream]);
+        let encoder = Arc::new(SubtitleEncoder::new(SubtitleEditParser, FailingIo(kind)));
+        SubtitleEncoderImpl::new(encoder, Arc::new(FixedResolver(Some(source))))
+    }
+
+    /// `GetReadableFile`'s `ResourceNotFoundException`: an embedded track of a
+    /// source with no subtitle cache.
+    #[tokio::test]
+    async fn an_embedded_track_without_a_cache_is_not_found() {
+        let mut stream = srt_stream(0, "");
+        stream.is_external = false;
+        stream.path = None;
+        let enc = build(Some(source_with(vec![stream])), MemIo { bytes: Vec::new() });
+        let err = enc
+            .get_subtitles(Uuid::nil(), "msrc", 0, "vtt", 0, 0, false)
+            .await
+            .expect_err("no cache");
+        assert!(matches!(err, ServiceError::NotFound(_)), "{err:?}");
+    }
+
     #[tokio::test]
     async fn character_set_of_utf8_srt_is_empty() {
         let io = MemIo {
@@ -362,7 +561,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn trimmed_subtitles_of_a_bitmap_track_are_a_process_error() {
+    async fn trimmed_subtitles_of_a_bitmap_track_are_invalid_input() {
         let enc = build(None, MemIo { bytes: Vec::new() });
         let mut stream = srt_stream(0, "/subs/a.sup");
         stream.codec = Some("PGSSUB".to_owned());
@@ -370,6 +569,7 @@ mod tests {
             .get_trimmed_subtitles(&stream, &MediaSourceInfo::default(), 0)
             .await
             .expect_err("no writer for a bitmap");
+        assert!(matches!(err, ServiceError::InvalidInput(_)), "{err:?}");
         assert!(err.to_string().contains("Unsupported format"), "{err}");
     }
 

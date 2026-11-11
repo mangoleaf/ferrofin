@@ -29,8 +29,9 @@ on:
 permissions: {} # each job grants only what it needs
 
 jobs:
-  # The CI run create-release requires may be days old: an advisory published since then
-  # blocks the release too. A job of its own, so the tools it installs never run beside
+  # The CI run create-release requires may be days old: an advisory published, or a version
+  # yanked, since then against a crate the workspace builds blocks the release too (the WASM
+  # guest never ships). A job of its own, so the tools it installs never run beside
   # create-release's RELEASE_TOKEN.
   release-advisories:
     if: >-
@@ -143,6 +144,26 @@ jobs:
       # the Dockerfile's self-contained path: BuildKit builds only the stages
       # the final image needs, so jellyfin-web + the ffmpeg runtime are built
       # from source here. Slower (~20 min) but zero extra infrastructure.
+      # Built and loaded first, pushed only once its binary passes the audit: the second
+      # build-push-action is the first one's cache, so it only pushes.
+      - uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7
+        with:
+          context: .
+          load: true
+          tags: ${{ steps.tags.outputs.tags }}
+          build-args: |
+            SERVICE_VERSION=${{ github.ref_name }}
+      - uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
+        with:
+          tool: cargo-audit@0.22.2
+      - name: audit the image's binary
+        run: |
+          set -eu
+          # Outside the checkout: a new file in the build context would make the push build miss the cache.
+          docker create --name audit "ghcr.io/$GITHUB_REPOSITORY:$GITHUB_REF_NAME" >/dev/null
+          docker cp audit:/usr/local/bin/ferrofin-server "$RUNNER_TEMP/ferrofin-server"
+          docker rm audit >/dev/null
+          scripts/audit-bin.py "$RUNNER_TEMP/ferrofin-server"
       - uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7
         with:
           context: .
@@ -213,7 +234,8 @@ jobs:
   # ── server binaries, one archive per target, attached to the Release ──
   # Linux x86_64 and aarch64 are the supported set. macOS and Windows are
   # experimental: they build and smoke-boot here (the owner has no such machine,
-  # so CI is the test environment) and a failure never blocks the release.
+  # so CI is the test environment) and a failure here never blocks the release;
+  # audit-binaries failing on one of their binaries does.
   binaries:
     if: github.event_name == 'push' && startsWith(github.ref_name, 'v')
     strategy:
@@ -253,15 +275,20 @@ jobs:
         with:
           key: ${{ matrix.target }}
           lookup-only: true # release builds never write the cache (poisoning surface)
+      # Every binary carries its crate list for `cargo audit bin` (audit-binaries checks it);
+      # the same version as the Dockerfile's.
+      - uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
+        with:
+          tool: cargo-auditable@0.7.7
       # Linux builds use zig as the C toolchain, linked against GLIBC_FLOOR (the
       # aarch64 cross-build also needs it for the C in bundled SQLite and aws-lc-sys).
       - if: contains(matrix.target, 'linux')
         run: |
           # The pair v1.3.2's aarch64 build used; move both together, deliberately.
           pip install cargo-zigbuild==0.23.4 ziglang==0.16.0
-          cargo zigbuild --locked --release -p ferrofin-server --target "${{ matrix.target }}.$GLIBC_FLOOR"
+          cargo auditable zigbuild --locked --release -p ferrofin-server --target "${{ matrix.target }}.$GLIBC_FLOOR"
       - if: ${{ !contains(matrix.target, 'linux') }}
-        run: cargo build --locked --release -p ferrofin-server --target ${{ matrix.target }}
+        run: cargo auditable build --locked --release -p ferrofin-server --target ${{ matrix.target }}
       # The .deb depends on jellyfin-ffmpeg8 + jellyfin-web (the same runtime the
       # image bundles); package metadata and contents live in the server manifest.
       - name: build the Debian package
@@ -355,6 +382,10 @@ jobs:
           # /System/Info/Public reports the Jellyfin API version (10.11.8) for client
           # compatibility; Ferrofin's own build version is the `build` field of /health/live.
           grep -q "\"build\":\"$GITHUB_REF_NAME\"" live.json || { echo "version mismatch"; cat smoke.log; exit 1; }
+          # The CLI names the release too; it once printed the manifest's placeholder version.
+          cli_version=$("$bin" --version)
+          echo "$cli_version"
+          printf '%s\n' "$cli_version" | grep -qF -- "$GITHUB_REF_NAME" || { echo "--version does not name $GITHUB_REF_NAME"; exit 1; }
       - name: package
         shell: bash
         run: |
@@ -376,14 +407,52 @@ jobs:
           path: dist/*
           if-no-files-found: error
 
+  # ── every archive and package the Release attaches, through `cargo audit bin` ──
+  # The files as published (the .deb's binary included), each of which must carry its
+  # cargo-auditable record. A vulnerable experimental binary blocks the release too: none
+  # is published with a known vulnerability deny.toml has not accepted. A job of its own,
+  # so the tool it installs never runs beside github-release's contents: write.
+  audit-binaries:
+    if: github.event_name == 'push' && startsWith(github.ref_name, 'v')
+    needs: binaries
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          pattern: ferrofin-*
+          path: dist
+          merge-multiple: true
+      - uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
+        with:
+          tool: cargo-audit@0.22.2 # = docker-image's; scripts/audit-bin.py relies on its behaviour
+      - name: audit every binary
+        run: |
+          set -eu
+          mkdir unpacked
+          for f in dist/*; do
+            case $f in
+              *.tar.gz) tar xzf "$f" -C unpacked ;;
+              *.zip) unzip -q "$f" -d unpacked ;;
+              *.deb) dpkg-deb -x "$f" "unpacked/$(basename "$f" .deb)" ;;
+            esac
+          done
+          find unpacked -type f \( -name ferrofin-server -o -name ferrofin-server.exe \) -print0 \
+            | xargs -0 scripts/audit-bin.py
+
   # ── GitHub Release, created as a draft, with git-cliff placeholder notes + the binaries (final versions only) ──
   #   It stays a draft until the github-release-notes skill writes the real notes and publishes it.
   github-release:
     if: >-
       !cancelled() && github.event_name == 'push' && startsWith(github.ref_name, 'v') &&
       !contains(github.ref_name, '-rc.') &&
-      needs.docker-image.result == 'success' && needs.binaries.result == 'success'
-    needs: [docker-image, binaries]
+      needs.docker-image.result == 'success' && needs.binaries.result == 'success' &&
+      needs.audit-binaries.result == 'success'
+    needs: [docker-image, binaries, audit-binaries]
     runs-on: ubuntu-latest
     permissions:
       contents: write # creates the Release

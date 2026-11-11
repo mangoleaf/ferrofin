@@ -2,6 +2,9 @@
 
 ## Reproduction and fix
 
+(Since gl-99 `enrich_people` only adds a Primary to a person who has none, and leaves
+every other person's images alone; what follows is the earlier state.)
+
 A full movie metadata refresh re-fetches its credits. `enrich_people` reuses cached
 profile files and their dimensions/blurhash, but calls `save_item_images` anyway.
 That save previously deleted every image row for the person and inserted new rows

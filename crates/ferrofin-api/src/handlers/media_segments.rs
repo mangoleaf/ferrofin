@@ -13,11 +13,10 @@ use axum::routing::{delete, get};
 use axum::{Json, Router};
 use ferrofin_model::media_segments::{MediaSegmentDto, MediaSegmentType};
 use ferrofin_model::querying::QueryResult;
-use uuid::Uuid;
 
 use crate::auth::{RequireAdmin, RequireAuth};
 use crate::error::ApiError;
-use crate::extract::Query;
+use crate::extract::{DotnetGuid, Query};
 use crate::handlers::query_parse::parse_csv_enums_lenient;
 use crate::state::AppState;
 
@@ -61,7 +60,7 @@ fn include_segment_types(pairs: &[(String, String)]) -> Option<String> {
 async fn get_item_segments(
     State(state): State<AppState>,
     RequireAuth(auth): RequireAuth,
-    Path(item_id): Path<Uuid>,
+    Path(DotnetGuid(item_id)): Path<DotnetGuid>,
     Query(pairs): Query<Vec<(String, String)>>,
 ) -> Result<Json<QueryResult<MediaSegmentDto>>, ApiError> {
     let Some(item) = state

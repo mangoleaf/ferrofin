@@ -1,13 +1,13 @@
 //! Error type for the `ferrofin-providers` crate.
 //!
 //! The provider traits in `ferrofin-traits` return
-//! [`ServiceError`](ferrofin_traits::error::ServiceError), so the public methods
+//! [`ServiceError`], so the public methods
 //! ultimately hand one back. Internally, the genuine *infrastructure* failures —
 //! an HTTP request to a remote provider (TMDB, OpenSubtitles, …) or a local
 //! filesystem write while saving a fetched image — are carried as this typed
 //! [`ProvidersError`] instead of being flattened into `ServiceError::Backend(String)`.
 //! Converting via [`From`] boxes the typed error into
-//! [`ServiceError::BackendSource`](ferrofin_traits::error::ServiceError::BackendSource),
+//! [`ServiceError::BackendSource`],
 //! so the underlying [`reqwest::Error`] / [`std::io::Error`] stays reachable
 //! through [`Error::source`](std::error::Error::source) for logging and tests.
 //!

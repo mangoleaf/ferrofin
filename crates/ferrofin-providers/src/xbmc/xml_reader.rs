@@ -5,7 +5,7 @@
 //! (`ReadElementContentAsString`, `GetAttribute`, `IsEmptyElement`, `ReadSubtree`,
 //! `Skip`, `MoveToContent`). Porting those call sites faithfully requires the
 //! same positional semantics, so this module first tokenizes the document into a
-//! flat [`XmlToken`] list (entities unescaped, adjacent text coalesced) and then
+//! flat `XmlToken` list (entities unescaped, adjacent text coalesced) and then
 //! exposes an [`XmlCursor`] over it that re-creates the reader contract.
 //!
 //! Only the surface the parsers actually use is implemented; unused `XmlReader`

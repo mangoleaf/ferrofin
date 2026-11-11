@@ -27,13 +27,15 @@
 //! to, so a guard would only compile it twice and scan each match twice.
 //! `tests/common_guarded_regex.rs` checks that for every vendored pattern, and
 //! fails on a new one that `fancy-regex` would backtrack on without lookaround
-//! (a `\b`, say), which would need its guard kept.
+//! (a backreference, say). Such a pattern needs a decision rather than a guard:
+//! with no lookaround to relax there is no guard to build, and the linear-time
+//! engine rejects the backreference anyway.
 
 use fancy_regex::{Captures, Error, Regex};
 
 /// A compiled naming pattern with a linear-time rejection guard.
 ///
-/// See the [module docs](self) for why the guard is sound.
+/// See the module docs for why the guard is sound.
 #[derive(Debug, Clone)]
 pub struct GuardedRegex {
     /// The relaxed (lookaround-free) superset pattern, when one could be built.

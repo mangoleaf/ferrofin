@@ -410,7 +410,7 @@ pub fn full_refresh(plan: &ItemRefreshPlan, request: &RefreshRequest<'_>) -> boo
 /// - `isFirstRefresh`: `DateLastRefreshed` unset.
 /// - `requiresRefresh`: `AutomaticRefreshIntervalDays > 0` and that many
 ///   days since `DateLastRefreshed`; else, when the metadata mode is not
-///   `None`, [`item_requires_refresh`].
+///   `None`, `item_requires_refresh`.
 /// - `GetProviders`: every provider runs when replacing all metadata, on a
 ///   full refresh, or on a first/required refresh in `Default` mode or above;
 ///   otherwise only the providers whose change monitor fired, plus every

@@ -442,7 +442,7 @@ impl SourceResponse {
 /// Jellyfin's default `HttpClient` sends (`Jellyfin-Server/<version>`,
 /// `Jellyfin.Server/Startup.cs`). A generic product token only — never
 /// anything identifying the user or the install.
-const USER_AGENT: &str = concat!("Ferrofin/", env!("CARGO_PKG_VERSION"));
+const USER_AGENT: &str = ferrofin_health::USER_AGENT;
 
 /// The real fetcher: `reqwest` for `http(s)://`, a filesystem read otherwise.
 ///
@@ -496,7 +496,7 @@ impl Default for ReqwestFetcher {
 
 impl ReqwestFetcher {
     /// Creates a fetcher over a fresh `reqwest` client presenting the
-    /// [`USER_AGENT`] product header.
+    /// `USER_AGENT` product header.
     #[must_use]
     pub fn new() -> Self {
         let client = reqwest::Client::builder()

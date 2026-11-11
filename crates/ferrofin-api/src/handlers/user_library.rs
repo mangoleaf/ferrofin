@@ -23,7 +23,7 @@
 //!
 //! The `UserData` reads and writes check `AssertCanUpdateUser` with the
 //! user-preference restriction, as `ItemsController` does
-//! ([`super::users::assert_can_update_user`]). The person on-demand metadata
+//! (`super::users::assert_can_update_user`). The person on-demand metadata
 //! refresh (`RefreshOnDemandIfNeeded`) runs in `items::get_item`, which both
 //! item routes reach. `GET /Items/Latest` ports `GetLatestMedia` (the grouping
 //! lives in the [`UserViewManager`](ferrofin_traits::library::UserViewManager)).
@@ -39,7 +39,7 @@ use uuid::Uuid;
 
 use crate::auth::RequireAuth;
 use crate::error::ApiError;
-use crate::extract::{JsonBody, Query};
+use crate::extract::{DotnetGuid, JsonBody, Query};
 use crate::handlers::items::{resolve_user, user_uuid};
 use crate::state::AppState;
 
@@ -167,7 +167,7 @@ async fn resolve_user_and_item(
 async fn mark_favorite(
     State(state): State<AppState>,
     RequireAuth(auth): RequireAuth,
-    Path(item_id): Path<Uuid>,
+    Path(DotnetGuid(item_id)): Path<DotnetGuid>,
     Query(query): Query<UserIdQuery>,
 ) -> Result<Json<UserItemDataDto>, ApiError> {
     set_favorite(&state, &auth, query.user_id, item_id, true).await
@@ -189,7 +189,7 @@ async fn mark_favorite(
 async fn unmark_favorite(
     State(state): State<AppState>,
     RequireAuth(auth): RequireAuth,
-    Path(item_id): Path<Uuid>,
+    Path(DotnetGuid(item_id)): Path<DotnetGuid>,
     Query(query): Query<UserIdQuery>,
 ) -> Result<Json<UserItemDataDto>, ApiError> {
     set_favorite(&state, &auth, query.user_id, item_id, false).await
@@ -201,7 +201,7 @@ async fn unmark_favorite(
 async fn mark_favorite_for_user(
     State(state): State<AppState>,
     RequireAuth(auth): RequireAuth,
-    Path((user_id, item_id)): Path<(Uuid, Uuid)>,
+    Path((DotnetGuid(user_id), DotnetGuid(item_id))): Path<(DotnetGuid, DotnetGuid)>,
 ) -> Result<Json<UserItemDataDto>, ApiError> {
     set_favorite(&state, &auth, Some(user_id), item_id, true).await
 }
@@ -210,7 +210,7 @@ async fn mark_favorite_for_user(
 async fn unmark_favorite_for_user(
     State(state): State<AppState>,
     RequireAuth(auth): RequireAuth,
-    Path((user_id, item_id)): Path<(Uuid, Uuid)>,
+    Path((DotnetGuid(user_id), DotnetGuid(item_id))): Path<(DotnetGuid, DotnetGuid)>,
 ) -> Result<Json<UserItemDataDto>, ApiError> {
     set_favorite(&state, &auth, Some(user_id), item_id, false).await
 }
@@ -219,7 +219,7 @@ async fn unmark_favorite_for_user(
 async fn update_rating_for_user(
     State(state): State<AppState>,
     RequireAuth(auth): RequireAuth,
-    Path((user_id, item_id)): Path<(Uuid, Uuid)>,
+    Path((DotnetGuid(user_id), DotnetGuid(item_id))): Path<(DotnetGuid, DotnetGuid)>,
     Query(query): Query<RatingQuery>,
 ) -> Result<Json<UserItemDataDto>, ApiError> {
     let (user_uuid, resolved_item) =
@@ -232,7 +232,7 @@ async fn update_rating_for_user(
 async fn delete_rating_for_user(
     State(state): State<AppState>,
     RequireAuth(auth): RequireAuth,
-    Path((user_id, item_id)): Path<(Uuid, Uuid)>,
+    Path((DotnetGuid(user_id), DotnetGuid(item_id))): Path<(DotnetGuid, DotnetGuid)>,
 ) -> Result<Json<UserItemDataDto>, ApiError> {
     let (user_uuid, resolved_item) =
         resolve_user_and_item(&state, &auth, Some(user_id), item_id).await?;
@@ -296,7 +296,7 @@ struct RatingQuery {
 async fn update_rating(
     State(state): State<AppState>,
     RequireAuth(auth): RequireAuth,
-    Path(item_id): Path<Uuid>,
+    Path(DotnetGuid(item_id)): Path<DotnetGuid>,
     Query(query): Query<RatingQuery>,
 ) -> Result<Json<UserItemDataDto>, ApiError> {
     let (user_uuid, resolved_item) =
@@ -322,7 +322,7 @@ async fn update_rating(
 async fn delete_rating(
     State(state): State<AppState>,
     RequireAuth(auth): RequireAuth,
-    Path(item_id): Path<Uuid>,
+    Path(DotnetGuid(item_id)): Path<DotnetGuid>,
     Query(query): Query<UserIdQuery>,
 ) -> Result<Json<UserItemDataDto>, ApiError> {
     let (user_uuid, resolved_item) =
@@ -348,7 +348,7 @@ async fn delete_rating(
 async fn get_item_user_data(
     State(state): State<AppState>,
     RequireAuth(auth): RequireAuth,
-    Path(item_id): Path<Uuid>,
+    Path(DotnetGuid(item_id)): Path<DotnetGuid>,
     Query(query): Query<UserIdQuery>,
 ) -> Result<Json<UserItemDataDto>, ApiError> {
     let user = resolve_user(&state, &auth, query.user_id).await?;
@@ -387,7 +387,7 @@ async fn get_item_user_data(
 async fn update_item_user_data(
     State(state): State<AppState>,
     RequireAuth(auth): RequireAuth,
-    Path(item_id): Path<Uuid>,
+    Path(DotnetGuid(item_id)): Path<DotnetGuid>,
     Query(query): Query<UserIdQuery>,
     JsonBody(update): JsonBody<UpdateUserItemDataDto>,
 ) -> Result<Json<UserItemDataDto>, ApiError> {
@@ -457,7 +457,7 @@ async fn get_root_folder(
 async fn get_local_trailers(
     State(state): State<AppState>,
     RequireAuth(auth): RequireAuth,
-    Path(item_id): Path<Uuid>,
+    Path(DotnetGuid(item_id)): Path<DotnetGuid>,
     Query(query): Query<UserIdQuery>,
 ) -> Result<Json<Vec<BaseItemDto>>, ApiError> {
     get_extras(&state, &auth, query.user_id, item_id, &[ExtraType::Trailer]).await
@@ -480,7 +480,7 @@ async fn get_local_trailers(
 async fn get_special_features(
     State(state): State<AppState>,
     RequireAuth(auth): RequireAuth,
-    Path(item_id): Path<Uuid>,
+    Path(DotnetGuid(item_id)): Path<DotnetGuid>,
     Query(query): Query<UserIdQuery>,
 ) -> Result<Json<Vec<BaseItemDto>>, ApiError> {
     get_extras(&state, &auth, query.user_id, item_id, DISPLAY_EXTRA_TYPES).await
@@ -546,7 +546,7 @@ async fn get_extras(
 async fn get_intros(
     State(state): State<AppState>,
     RequireAuth(auth): RequireAuth,
-    Path(item_id): Path<Uuid>,
+    Path(DotnetGuid(item_id)): Path<DotnetGuid>,
     Query(query): Query<UserIdQuery>,
 ) -> Result<Json<QueryResult<BaseItemDto>>, ApiError> {
     // Resolve the user + item so a missing one is a `404` (C# null-checks both).
@@ -729,6 +729,7 @@ pub(crate) fn type_name_matches(stored: &str, kind: ferrofin_model::data::BaseIt
 async fn get_critic_reviews(
     State(_state): State<AppState>,
     RequireAuth(_auth): RequireAuth,
+    // Upstream's action binds no id at all: kept on `Uuid`, not `DotnetGuid`.
     Path(_item_id): Path<Uuid>,
 ) -> Result<Json<QueryResult<BaseItemDto>>, ApiError> {
     Ok(Json(QueryResult::from_items(Vec::new())))
@@ -740,7 +741,7 @@ async fn get_critic_reviews(
 async fn get_latest_media_for_user(
     state: State<AppState>,
     auth: RequireAuth,
-    Path(user_id): Path<Uuid>,
+    Path(DotnetGuid(user_id)): Path<DotnetGuid>,
     Query(mut query): Query<LatestQuery>,
 ) -> Result<Json<Vec<BaseItemDto>>, ApiError> {
     query.user_id = Some(user_id);
@@ -755,7 +756,7 @@ async fn get_latest_media_for_user(
 async fn get_root_folder_for_user(
     state: State<AppState>,
     auth: RequireAuth,
-    Path(user_id): Path<Uuid>,
+    Path(DotnetGuid(user_id)): Path<DotnetGuid>,
 ) -> Result<Json<BaseItemDto>, ApiError> {
     let query = UserIdQuery {
         user_id: Some(user_id),
@@ -768,12 +769,12 @@ async fn get_root_folder_for_user(
 async fn get_intros_for_user(
     state: State<AppState>,
     auth: RequireAuth,
-    Path((user_id, item_id)): Path<(Uuid, Uuid)>,
+    Path((DotnetGuid(user_id), DotnetGuid(item_id))): Path<(DotnetGuid, DotnetGuid)>,
 ) -> Result<Json<QueryResult<BaseItemDto>>, ApiError> {
     let query = UserIdQuery {
         user_id: Some(user_id),
     };
-    get_intros(state, auth, Path(item_id), Query(query)).await
+    get_intros(state, auth, Path(DotnetGuid(item_id)), Query(query)).await
 }
 
 /// `GET /Users/{userId}/Items/{itemId}/LocalTrailers` — path-scoped form of
@@ -781,12 +782,12 @@ async fn get_intros_for_user(
 async fn get_local_trailers_for_user(
     state: State<AppState>,
     auth: RequireAuth,
-    Path((user_id, item_id)): Path<(Uuid, Uuid)>,
+    Path((DotnetGuid(user_id), DotnetGuid(item_id))): Path<(DotnetGuid, DotnetGuid)>,
 ) -> Result<Json<Vec<BaseItemDto>>, ApiError> {
     let query = UserIdQuery {
         user_id: Some(user_id),
     };
-    get_local_trailers(state, auth, Path(item_id), Query(query)).await
+    get_local_trailers(state, auth, Path(DotnetGuid(item_id)), Query(query)).await
 }
 
 /// `GET /Users/{userId}/Items/{itemId}/SpecialFeatures` — path-scoped form of
@@ -794,12 +795,12 @@ async fn get_local_trailers_for_user(
 async fn get_special_features_for_user(
     state: State<AppState>,
     auth: RequireAuth,
-    Path((user_id, item_id)): Path<(Uuid, Uuid)>,
+    Path((DotnetGuid(user_id), DotnetGuid(item_id))): Path<(DotnetGuid, DotnetGuid)>,
 ) -> Result<Json<Vec<BaseItemDto>>, ApiError> {
     let query = UserIdQuery {
         user_id: Some(user_id),
     };
-    get_special_features(state, auth, Path(item_id), Query(query)).await
+    get_special_features(state, auth, Path(DotnetGuid(item_id)), Query(query)).await
 }
 
 /// `GET /Users/{userId}/Items/{itemId}/UserData` — path-scoped form of
@@ -807,12 +808,12 @@ async fn get_special_features_for_user(
 async fn get_item_user_data_for_user(
     state: State<AppState>,
     auth: RequireAuth,
-    Path((user_id, item_id)): Path<(Uuid, Uuid)>,
+    Path((DotnetGuid(user_id), DotnetGuid(item_id))): Path<(DotnetGuid, DotnetGuid)>,
 ) -> Result<Json<UserItemDataDto>, ApiError> {
     let query = UserIdQuery {
         user_id: Some(user_id),
     };
-    get_item_user_data(state, auth, Path(item_id), Query(query)).await
+    get_item_user_data(state, auth, Path(DotnetGuid(item_id)), Query(query)).await
 }
 
 /// `POST /Users/{userId}/Items/{itemId}/UserData` — path-scoped form of
@@ -820,13 +821,13 @@ async fn get_item_user_data_for_user(
 async fn update_item_user_data_for_user(
     state: State<AppState>,
     auth: RequireAuth,
-    Path((user_id, item_id)): Path<(Uuid, Uuid)>,
+    Path((DotnetGuid(user_id), DotnetGuid(item_id))): Path<(DotnetGuid, DotnetGuid)>,
     update: JsonBody<UpdateUserItemDataDto>,
 ) -> Result<Json<UserItemDataDto>, ApiError> {
     let query = UserIdQuery {
         user_id: Some(user_id),
     };
-    update_item_user_data(state, auth, Path(item_id), Query(query), update).await
+    update_item_user_data(state, auth, Path(DotnetGuid(item_id)), Query(query), update).await
 }
 
 /// Registers this controller's real routes onto `router`.

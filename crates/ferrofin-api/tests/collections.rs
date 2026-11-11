@@ -427,6 +427,9 @@ impl PlaylistManager for RecordingPlaylists {
     ) -> Result<Vec<BaseItemEntity>, ServiceError> {
         Ok(vec![item_entity(ITEM_A), item_entity(ITEM_B)])
     }
+    async fn get_playlist_item_ids(&self, _playlist_id: Uuid) -> Result<Vec<Uuid>, ServiceError> {
+        Ok(vec![ITEM_A, ITEM_B])
+    }
     async fn add_user_to_shares(
         &self,
         _request: &ferrofin_model::playlists::PlaylistUserUpdateRequest,

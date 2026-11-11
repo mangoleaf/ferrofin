@@ -24,7 +24,7 @@ use uuid::Uuid;
 
 use crate::auth::RequireAuth;
 use crate::error::ApiError;
-use crate::extract::Query;
+use crate::extract::{DotnetGuid, Query};
 use crate::handlers::items::{require_visible_item, resolve_user_opt};
 use crate::handlers::query_parse::{parse_csv_enums_lenient, parse_csv_uuids};
 use crate::state::AppState;
@@ -157,7 +157,7 @@ macro_rules! similar_handler {
         async fn $name(
             State(state): State<AppState>,
             RequireAuth(auth): RequireAuth,
-            Path(item_id): Path<Uuid>,
+            Path(DotnetGuid(item_id)): Path<DotnetGuid>,
             Query(query): Query<SimilarParams>,
         ) -> Result<Json<QueryResult<BaseItemDto>>, ApiError> {
             similar_items(&state, &auth, item_id, query).await

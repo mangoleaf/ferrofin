@@ -34,8 +34,9 @@ use crate::options::{DtoOptions, InternalItemsQuery};
 ///
 /// Port of `MediaBrowser.Model.LiveTv.LiveTvChannelQuery`, with the C# `UserId`
 /// resolved to the requesting user's row (the crate-wide `User` → [`UserEntity`]
-/// rule) — the user drives the favorite/like filters, favorite-first sorting and
-/// the projected `UserData`.
+/// rule) — the user drives the favorite/like filters, favorite-first sorting,
+/// the projected `UserData` and the parental restrictions that filter the
+/// lineup.
 #[derive(Debug, Clone, Default)]
 #[allow(clippy::struct_excessive_bools)] // one field per upstream query property
 pub struct LiveTvChannelQuery {
@@ -781,6 +782,24 @@ pub trait LiveTvManager: Send + Sync {
     async fn start_dvr(&self) -> Result<(), ServiceError> {
         Ok(())
     }
+
+    /// Stops the DVR and closes the open live streams as the host tears down
+    /// (gl-141): disarms every pending timer, stops every capture in flight,
+    /// and returns once those captures have settled, before the database they
+    /// write to closes.
+    ///
+    /// Port of what disposing upstream's host does to Live TV:
+    /// `RecordingsManager.Dispose` cancels each active recording, which then
+    /// settles as `Completed`, and `MediaSourceManager.Dispose` closes the
+    /// open live streams. Two steps go beyond it:
+    /// - the pending timers are stopped (`TimerManager.StopTimers`), since
+    ///   upstream does not dispose its `TimerManager`;
+    /// - the call waits for the cancelled captures to settle, since their writes
+    ///   go to a database the host closes next.
+    ///
+    /// A capture stuck on its tuner holds the wait, so the caller bounds it.
+    /// The default has no timer, capture or stream to stop.
+    async fn shutdown(&self) {}
 
     /// The folders recordings are written to, each as the library it should
     /// be: "Recordings", "Recorded Movies" and "Recorded Shows", as far as

@@ -6,10 +6,11 @@
 //! manager for the master playlist, the variant `main.m3u8`, and then a dynamic
 //! segment — exactly what the `ferrofin-api` `handlers::hls` routes forward — and
 //! asserts the returned [`ServedFile`] points at a real, non-empty `.ts` segment
-//! that a live ffmpeg produced. The un-ported request→plan glue
-//! ([`StreamStatePlanner`]) is supplied here by a test planner that generates a
-//! tiny clip and emits real HLS ffmpeg args; everything below it is production
-//! code (`HlsStreamManagerImpl` + `TranscodeManagerImpl` + `TokioSegmentTranscoder`).
+//! that a live ffmpeg produced. The request→plan glue ([`StreamStatePlanner`],
+//! whose real implementation lives in the server binary) is supplied here by a
+//! test planner that generates a tiny clip and emits real HLS ffmpeg args;
+//! everything below it is production code (`HlsStreamManagerImpl` +
+//! `TranscodeManagerImpl` + `TokioSegmentTranscoder`).
 //!
 //! Excluded from the unit-coverage gate (integration `tests/` never count toward
 //! `cargo llvm-cov -p ferrofin-hls`) and gated on `FERROFIN_FFMPEG_TESTS` + `ffmpeg`
@@ -153,8 +154,9 @@ impl ServerApplicationPaths for TempPaths {
     }
 }
 
-/// A real [`StreamStatePlanner`] that stands in for the un-ported
-/// `GetStreamingState` + `GetCommandLineArguments`: it points every plan at a
+/// A real [`StreamStatePlanner`] that stands in for the server's
+/// `FerrofinStreamStatePlanner` (`GetStreamingState` +
+/// `GetCommandLineArguments`): it points every plan at a
 /// pre-generated clip and emits real mpegts-HLS ffmpeg args writing
 /// `out%d.ts` + `out.m3u8` into the transcode cache directory.
 struct FfmpegPlanner {
@@ -165,8 +167,7 @@ struct FfmpegPlanner {
     /// Emit fMP4 segments (`out%d.mp4` + `out-1.mp4` init) instead of mpegts.
     fmp4: bool,
     /// Encode at the source's pace (`-re`) and seek the input to the requested
-    /// segment, with the production planner's `temp_file` segments, so segment
-    /// requests can outrun the encoder.
+    /// segment, so segment requests can outrun the encoder.
     realtime: bool,
 }
 
@@ -225,9 +226,11 @@ impl FfmpegPlanner {
         if let Some(id) = segment_id {
             args.extend(["-start_number".into(), id.to_string()]);
         }
-        if self.realtime {
-            args.extend(["-hls_flags".into(), "temp_file".into()]);
-        }
+        // As the production planner does on every HLS job: the serve path takes
+        // a segment file's existence as its completeness, which only the
+        // `temp_file` rename makes true (without it ffmpeg creates the file
+        // empty and fills it a moment later, gl-759).
+        args.extend(["-hls_flags".into(), "temp_file".into()]);
         if event {
             args.extend(["-hls_base_url".into(), "hls/out/".into()]);
             if !self.fmp4 {
@@ -633,5 +636,101 @@ async fn a_seek_back_below_a_killed_jobs_segments_keeps_the_running_job() {
         })
         .collect();
     assert_eq!(start_numbers, ["0", "20", "10"], "one ffmpeg per seek");
+    mgr.stop_encoding(&req).await.expect("stop_encoding");
+}
+
+/// The duration ffprobe reads from the media file at `path`, 0 when it reads none.
+fn probed_duration(path: &Path) -> f64 {
+    let output = std::process::Command::new("ffprobe")
+        .args([
+            "-v",
+            "error",
+            "-show_entries",
+            "format=duration",
+            "-of",
+            "csv=p=0",
+        ])
+        .arg(path)
+        .output()
+        .expect("spawn ffprobe");
+    String::from_utf8_lossy(&output.stdout)
+        .trim()
+        .parse()
+        .unwrap_or(0.0)
+}
+
+/// gl-1396 against a real ffmpeg encoding at the source's pace: a seek kills
+/// the job partway through a segment, and its graceful `q` exit finalises that
+/// segment cut short under its normal name. The restart deletes it, so every
+/// finished segment left on disk is whole and none is served short.
+#[tokio::test]
+async fn a_seek_restart_leaves_no_cut_short_segment_on_disk() {
+    if !ffmpeg_gate() {
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let cache = tmp.path().join("transcodes");
+    std::fs::create_dir_all(&cache).unwrap();
+    let clip = tmp.path().join("clip.mp4");
+    make_clip_of(&clip, 30);
+
+    let planner = FfmpegPlanner {
+        dir: cache.clone(),
+        clip,
+        fmp4: false,
+        realtime: true,
+    };
+    let manager = Arc::new(TranscodeManagerImpl::new(NoopSessionReporter));
+    let cfg: Box<dyn Fn() -> EncodingOptions + Send + Sync> = Box::new(EncodingOptions::default);
+    let generator = Arc::new(DynamicHlsPlaylistGenerator::new(cfg, Vec::new()));
+    let paths = Arc::new(TempPaths {
+        transcode: cache.to_string_lossy().into_owned(),
+    });
+    let mgr: Mgr = HlsStreamManagerImpl::new(
+        planner,
+        TokioSegmentTranscoder::new(),
+        manager,
+        generator,
+        paths,
+        "ffmpeg",
+    );
+
+    let req = request();
+    for segment in [0, 1] {
+        mgr.dynamic_segment(&req, segment, false)
+            .await
+            .unwrap_or_else(|error| panic!("segment {segment}: {error:?}"));
+    }
+    // Into the middle of a two-second segment, so the kill cuts one short.
+    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+    let served = mgr
+        .dynamic_segment(&req, 10, false)
+        .await
+        .expect("segment 10");
+    assert!(served.path.ends_with("out10.ts"), "served {}", served.path);
+
+    let mut segments: Vec<(String, f64)> = std::fs::read_dir(&cache)
+        .unwrap()
+        .flatten()
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .filter(|name| {
+            name.starts_with("out") && Path::new(name).extension().is_some_and(|ext| ext == "ts")
+        })
+        .map(|name| {
+            let duration = probed_duration(&cache.join(&name));
+            (name, duration)
+        })
+        .collect();
+    segments.sort_by(|a, b| a.0.cmp(&b.0));
+    for name in ["out0.ts", "out1.ts", "out10.ts"] {
+        assert!(
+            segments.iter().any(|(segment, _)| segment == name),
+            "{name} missing: {segments:?}"
+        );
+    }
+    assert!(
+        segments.iter().all(|&(_, duration)| duration > 1.5),
+        "a segment on disk is cut short: {segments:?}"
+    );
     mgr.stop_encoding(&req).await.expect("stop_encoding");
 }

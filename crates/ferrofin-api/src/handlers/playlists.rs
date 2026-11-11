@@ -17,12 +17,12 @@
 //! Every route is behind `[Authorize]`, so it takes the [`RequireAuth`]
 //! extractor (a missing/invalid token is `401`). The `404 Playlist not found`
 //! path is faithful (it flows from
-//! [`PlaylistManager::get_playlist_for_user`](ferrofin_traits::collections::PlaylistManager)).
+//! [`PlaylistManager::get_playlist_access`](ferrofin_traits::collections::PlaylistManager::get_playlist_access)).
 //!
 //! Ownership and shares are persisted and **enforced**: the `Playlists` table
 //! records the owner + open-access flag and `PlaylistShares` the per-user
 //! permissions, and every route resolves the caller's
-//! [`PlaylistAccess`](ferrofin_traits::collections::PlaylistAccess) first. Edit
+//! [`PlaylistAccess`] first. Edit
 //! actions (update, add/remove/move items) need owner or a `CanEdit` share
 //! (`403` otherwise); share management is owner-only; an invisible playlist is
 //! `404` (the C# `GetPlaylistForUser` null). Playlists predating owner tracking
@@ -46,7 +46,7 @@ use uuid::Uuid;
 
 use crate::auth::RequireAuth;
 use crate::error::{ApiError, ProblemStatus};
-use crate::extract::{JsonBody, Query};
+use crate::extract::{DotnetGuid, JsonBody, Query};
 use crate::handlers::items::effective_user_id;
 use crate::handlers::query_parse::parse_csv_uuids;
 use crate::state::AppState;
@@ -158,21 +158,15 @@ async fn create_playlist(
 async fn get_playlist(
     State(state): State<AppState>,
     RequireAuth(auth): RequireAuth,
-    Path(playlist_id): Path<Uuid>,
+    Path(DotnetGuid(playlist_id)): Path<DotnetGuid>,
 ) -> Result<Json<PlaylistDto>, ApiError> {
     let user_id = auth.user_id();
     let access = state
         .playlists
         .get_playlist_access(playlist_id, user_id)
         .await?;
-    let items = state
-        .playlists
-        .get_playlist_items(playlist_id, user_id)
-        .await?;
-    let item_ids = items
-        .iter()
-        .filter_map(|i| Uuid::parse_str(&i.id).ok())
-        .collect();
+    // `GetManageableItems().Select(t => t.Item2.Id)`: the ids alone, no row.
+    let item_ids = state.playlists.get_playlist_item_ids(playlist_id).await?;
     Ok(Json(PlaylistDto {
         open_access: access.open_access,
         shares: state.playlists.get_playlist_shares(playlist_id).await?,
@@ -199,7 +193,7 @@ async fn get_playlist(
 async fn update_playlist(
     State(state): State<AppState>,
     RequireAuth(auth): RequireAuth,
-    Path(playlist_id): Path<Uuid>,
+    Path(DotnetGuid(playlist_id)): Path<DotnetGuid>,
     JsonBody(body): JsonBody<UpdatePlaylistDto>,
 ) -> Result<StatusCode, ApiError> {
     let calling_user_id = auth.user_id();
@@ -257,9 +251,9 @@ struct GetPlaylistItemsQuery {
 /// `GET /Playlists/{playlistId}/Items` — the playlist's member items, paged.
 ///
 /// Port of `PlaylistsController.GetPlaylistItems`. Each returned DTO carries its
-/// `PlaylistItemId` (the member item id, matching the minimal port's entry-id
-/// approximation). An invisible playlist is `404`; the separate C# `Forbid()`
-/// branch is unreachable here because visible ⇔ permitted-to-read.
+/// `PlaylistItemId`: the member item id, as upstream's
+/// `Item1.ItemId?.ToString("N")`. An invisible playlist is `404`; the separate
+/// C# `Forbid()` branch is unreachable here because visible ⇔ permitted-to-read.
 #[utoipa::path(
     get,
     path = "/Playlists/{playlistId}/Items",
@@ -274,7 +268,7 @@ struct GetPlaylistItemsQuery {
 async fn get_playlist_items(
     State(state): State<AppState>,
     RequireAuth(auth): RequireAuth,
-    Path(playlist_id): Path<Uuid>,
+    Path(DotnetGuid(playlist_id)): Path<DotnetGuid>,
     Query(query): Query<GetPlaylistItemsQuery>,
 ) -> Result<Json<QueryResult<BaseItemDto>>, ApiError> {
     // `RequestHelpers.GetUserId(User, userId)`: another user's id only for an
@@ -291,22 +285,16 @@ async fn get_playlist_items(
         .get_playlist_items(playlist_id, calling_user_id)
         .await?;
     // `GetManageableItems().Where(i => i.Item2.IsVisible(user))`: a member
-    // the caller may not see is out of the page and the count. Divergence
-    // (gl-1092): the standalone check, which also walks the member's
-    // library, where upstream's `IsVisible` reads only its rating and tags,
-    // so a member from a library the caller was not granted is dropped too.
+    // the caller may not see is out of the page and the count, checked on the
+    // rows just read. Divergence (gl-1092): the standalone check, which also
+    // walks the member's library, where upstream's `IsVisible` reads only its
+    // rating and tags, so a member from a library the caller was not granted
+    // is dropped too.
     if let Some(user) = &user {
-        let ids: Vec<Uuid> = items
-            .iter()
-            .filter_map(|item| Uuid::parse_str(&item.id).ok())
-            .collect();
-        let visible: std::collections::HashSet<Uuid> = state
+        items = state
             .library
-            .get_visible_item_ids(&ids, user)
-            .await?
-            .into_iter()
-            .collect();
-        items.retain(|item| Uuid::parse_str(&item.id).is_ok_and(|id| visible.contains(&id)));
+            .filter_visible_items_standalone(items, user)
+            .await?;
     }
     let total = i32::try_from(items.len()).unwrap_or(i32::MAX);
 
@@ -398,7 +386,7 @@ struct AddItemsQuery {
 async fn add_item_to_playlist(
     State(state): State<AppState>,
     RequireAuth(auth): RequireAuth,
-    Path(playlist_id): Path<Uuid>,
+    Path(DotnetGuid(playlist_id)): Path<DotnetGuid>,
     Query(query): Query<AddItemsQuery>,
 ) -> Result<StatusCode, ApiError> {
     // C# `userId = RequestHelpers.GetUserId(User, userId)` — the share check
@@ -447,7 +435,7 @@ struct RemoveItemsQuery {
 async fn remove_item_from_playlist(
     State(state): State<AppState>,
     RequireAuth(auth): RequireAuth,
-    Path(playlist_id): Path<Uuid>,
+    Path(DotnetGuid(playlist_id)): Path<DotnetGuid>,
     Query(query): Query<RemoveItemsQuery>,
 ) -> Result<StatusCode, ApiError> {
     let calling_user_id = auth.user_id();
@@ -519,7 +507,8 @@ async fn move_item(
         .parse()
         .map_err(|_| ApiError::BadRequest(format!("invalid index {new_index:?}")))?;
     let calling_user_id = auth.user_id();
-    let playlist_uuid = Uuid::parse_str(playlist_id)
+    // `Guid.Parse(playlistId)` here, and `new Guid(playlistId)` in `MoveItemAsync`.
+    let playlist_uuid = DotnetGuid::parse(playlist_id)
         .map_err(|_| ApiError::BadRequest(format!("invalid id {playlist_id:?}")))?;
     require_edit(
         state
@@ -529,7 +518,12 @@ async fn move_item(
     )?;
     state
         .playlists
-        .move_item(playlist_id, item_id, new_index, calling_user_id)
+        .move_item(
+            &playlist_uuid.to_string(),
+            item_id,
+            new_index,
+            calling_user_id,
+        )
         .await?;
     Ok(StatusCode::NO_CONTENT)
 }
@@ -553,7 +547,7 @@ async fn move_item(
 async fn get_playlist_users(
     State(state): State<AppState>,
     RequireAuth(auth): RequireAuth,
-    Path(playlist_id): Path<Uuid>,
+    Path(DotnetGuid(playlist_id)): Path<DotnetGuid>,
 ) -> Result<Json<Vec<PlaylistUserPermissions>>, ApiError> {
     let access = state
         .playlists
@@ -593,7 +587,7 @@ async fn get_playlist_users(
 async fn get_playlist_user(
     State(state): State<AppState>,
     RequireAuth(auth): RequireAuth,
-    Path((playlist_id, user_id)): Path<(Uuid, Uuid)>,
+    Path((DotnetGuid(playlist_id), DotnetGuid(user_id))): Path<(DotnetGuid, DotnetGuid)>,
 ) -> Result<Json<PlaylistUserPermissions>, ApiError> {
     let calling_user_id = auth.user_id();
     let access = state
@@ -644,7 +638,7 @@ async fn get_playlist_user(
 async fn update_playlist_user(
     State(state): State<AppState>,
     RequireAuth(auth): RequireAuth,
-    Path((playlist_id, user_id)): Path<(Uuid, Uuid)>,
+    Path((DotnetGuid(playlist_id), DotnetGuid(user_id))): Path<(DotnetGuid, DotnetGuid)>,
     body: Option<JsonBody<UpdatePlaylistUserDto>>,
 ) -> Result<StatusCode, ApiError> {
     let body = body.map(|JsonBody(b)| b).unwrap_or_default();
@@ -689,7 +683,7 @@ async fn update_playlist_user(
 async fn remove_user_from_playlist(
     State(state): State<AppState>,
     RequireAuth(auth): RequireAuth,
-    Path((playlist_id, user_id)): Path<(Uuid, Uuid)>,
+    Path((DotnetGuid(playlist_id), DotnetGuid(user_id))): Path<(DotnetGuid, DotnetGuid)>,
 ) -> Result<StatusCode, ApiError> {
     let calling_user_id = auth.user_id();
     require_edit(

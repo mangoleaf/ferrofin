@@ -434,6 +434,7 @@ impl VersionRows {
 
     /// The ids of `video`'s local alternate versions, in their link order
     /// (`LibraryManager.GetLocalAlternateVersionIds`).
+    #[cfg(test)]
     #[must_use]
     pub fn local_version_ids(&self, video: &BaseItemEntity) -> Vec<Uuid> {
         self.local_alternates(video, video)
@@ -897,7 +898,7 @@ fn label_after(display: &[char], prefix: &[char]) -> Option<String> {
 /// item.
 ///
 /// The name is followed by the terms the video's `Data` calls for, joined
-/// by `/` ([`disc_terms`]): `3D`, then `Bluray`/`DVD` for a disc or a disc
+/// by `/` (`disc_terms`): `3D`, then `Bluray`/`DVD` for a disc or a disc
 /// image, `ISO` for an image of unknown kind (`BaseItem.cs:1340-1375`).
 #[must_use]
 pub fn media_source_name(

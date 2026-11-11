@@ -276,7 +276,7 @@ async fn announce_shutdown(
 /// the boot sequence has exactly one implementation.
 ///
 /// `POST /System/Restart` (and a scheduled backup restore) re-create the host
-/// IN-PROCESS: the server drains, the state is dropped, and [`serve_once`] runs
+/// IN-PROCESS: the server drains, the state is dropped, and `serve_once` runs
 /// again — Jellyfin's `Program.Main` `do { … } while (_restartOnShutdown)`. A
 /// container therefore survives a restart without a supervisor, exactly as a
 /// Jellyfin container does. Shutdown and signals return from here and the
@@ -801,7 +801,7 @@ async fn serve_once(
     // every background task, then close the pools so nothing from this lifetime
     // still holds the database file when the next one opens — or restores — it.
     let restart = wired.lifecycle.restart_requested() && !signals.fired();
-    tear_down_host(wired, discovery, sampler).await;
+    tear_down_host(wired, discovery, sampler, config.shutdown_timeout_secs).await;
     db.close().await;
     serve_result?;
     tracing::info!(
@@ -819,14 +819,36 @@ async fn serve_once(
 /// never cuts a scan mid-item with the pool closing under it, and a backup
 /// restore (applied by the next lifetime, after this one's teardown) never
 /// races a scan writing into the tree it replaces.
+///
+/// The transcodes are killed and the DVR stopped the same way (gl-141), so no
+/// ffmpeg writes into the transcode cache the next lifetime purges, and every
+/// capture in flight has settled before its database closes: otherwise the
+/// next lifetime would re-arm its timer and record the showing twice. They get
+/// `shutdown_timeout_secs` between them, as upstream's hosted services get the
+/// host's `ShutdownTimeout` to stop in, so a stuck tuner cannot hold a restart.
 async fn tear_down_host(
     wired: WiredApp,
     discovery: Option<tokio::task::JoinHandle<()>>,
     sampler: Option<tokio::task::JoinHandle<()>>,
+    timeout_secs: u32,
 ) {
     stop_background_tasks(discovery.into_iter().chain(sampler).collect()).await;
     wired.task_manager.shutdown().await;
     wired.state.library.shutdown_scans().await;
+    // Transcodes first: a live one holds a tuner stream that Live TV then closes.
+    let playback = async {
+        wired.state.hls.shutdown().await;
+        if let Some(live_tv) = &wired.state.live_tv {
+            live_tv.shutdown().await;
+        }
+    };
+    let timeout = std::time::Duration::from_secs(u64::from(timeout_secs));
+    if tokio::time::timeout(timeout, playback).await.is_err() {
+        tracing::warn!(
+            timeout_secs,
+            "transcodes or recordings were still stopping when the shutdown timeout ran out; going on without them"
+        );
+    }
     stop_background_tasks(wired.background).await;
 }
 
@@ -1431,13 +1453,40 @@ async fn transform_web_file(
         && let Ok(text) = String::from_utf8(bytes)
     {
         let transformed = transformations.run_transformation(rel, text).await;
+        // The plugin's validator (`FileTransformationMiddleware` @ 0900de8f1,
+        // ahead of the ported rev): an `ETag` over the transformed bytes and
+        // `no-cache`, and no `Last-Modified` (so no `If-Modified-Since` to
+        // answer). A changed transform revalidates to a `200`, never stale.
+        let etag = transformed_etag(&transformed);
+        let validators = [
+            (axum::http::header::ETAG, etag.as_str()),
+            (axum::http::header::CACHE_CONTROL, "no-cache"),
+        ];
+        if req
+            .headers()
+            .get(axum::http::header::IF_NONE_MATCH)
+            .is_some_and(|v| v.as_bytes() == etag.as_bytes())
+        {
+            return (axum::http::StatusCode::NOT_MODIFIED, validators).into_response();
+        }
         return (
             [(axum::http::header::CONTENT_TYPE, web_file_mime(rel))],
+            validators,
             transformed,
         )
             .into_response();
     }
     next.run(req).await
+}
+
+/// The plugin's `ETag` for a transformed file: the first 8 bytes of the
+/// SHA-256 of its contents, as quoted lowercase hex.
+fn transformed_etag(contents: &str) -> String {
+    use sha2::Digest as _;
+    let digest = sha2::Sha256::digest(contents.as_bytes());
+    let mut first = [0u8; 8];
+    first.copy_from_slice(&digest[..8]);
+    format!("\"{:016x}\"", u64::from_be_bytes(first))
 }
 
 /// The MIME type for a transformed web file, from its extension (the plain
@@ -1898,6 +1947,8 @@ mod tests {
             .unwrap();
         assert_eq!(gz.status(), StatusCode::OK);
         assert_eq!(gz.headers()["content-encoding"], "gzip");
+        // The compression layer keeps the transformed file's strong `ETag`.
+        assert!(gz.headers()["etag"].to_str().unwrap().starts_with('"'));
         let gz_body = axum::body::to_bytes(gz.into_body(), usize::MAX)
             .await
             .unwrap();
@@ -2062,6 +2113,57 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(&body[..], b"<!doctype html>ferrofin");
+    }
+
+    /// A transformed file carries an `ETag` over its transformed bytes and
+    /// `Cache-Control: no-cache`, revalidates to a `304`, and gets a new
+    /// `ETag` (a `200`, never a stale `304`) once the transform set changes
+    /// its output, as the File Transformation plugin's middleware does.
+    #[tokio::test]
+    async fn transformed_web_file_revalidates_until_its_output_changes() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("index.html"), "<!doctype html>ferrofin").unwrap();
+        std::fs::write(dir.path().join("a.js"), "hello world").unwrap();
+        let service = transformations(dir.path());
+        service
+            .add_transformation(uuid::Uuid::from_u128(13), "a.js", Arc::new(Identity))
+            .await;
+        let app = mount_web(Router::new(), dir.path(), Arc::clone(&service));
+        let get = |if_none_match: Option<&str>| {
+            let mut request = Request::builder().uri("/web/a.js");
+            if let Some(etag) = if_none_match {
+                request = request.header("if-none-match", etag);
+            }
+            app.clone().oneshot(request.body(Body::empty()).unwrap())
+        };
+
+        let first = get(None).await.unwrap();
+        assert_eq!(first.status(), StatusCode::OK);
+        assert_eq!(first.headers()["cache-control"], "no-cache");
+        assert!(first.headers().get("last-modified").is_none());
+        let etag = first.headers()["etag"].to_str().unwrap().to_owned();
+        // The plugin's format: SHA-256("hello world") starts b94d27b9934d3e08.
+        assert_eq!(etag, "\"b94d27b9934d3e08\"");
+
+        let revalidated = get(Some(&etag)).await.unwrap();
+        assert_eq!(revalidated.status(), StatusCode::NOT_MODIFIED);
+        assert_eq!(revalidated.headers()["etag"], etag.as_str());
+        assert_eq!(revalidated.headers()["cache-control"], "no-cache");
+        let body = axum::body::to_bytes(revalidated.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert!(body.is_empty());
+
+        service
+            .add_transformation(uuid::Uuid::from_u128(14), "a.js", Arc::new(Upper))
+            .await;
+        let changed = get(Some(&etag)).await.unwrap();
+        assert_eq!(changed.status(), StatusCode::OK);
+        assert_ne!(changed.headers()["etag"], etag.as_str());
+        let body = axum::body::to_bytes(changed.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(&body[..], b"HELLO WORLD");
     }
 
     #[tokio::test]

@@ -754,6 +754,38 @@ pub trait ItemRepository: Send + Sync {
 
 fn _assert_object_safe_item_repository(_: &dyn ItemRepository) {}
 
+/// A user's parental restrictions as SQL over `BaseItems`, for a statement the
+/// item repository does not build: the Live TV guide reads its own cache, where
+/// upstream's `LiveTvManager.GetPrograms` queries the programme items with
+/// `new InternalItemsQuery(user)`. The predicate is the repository's own, so
+/// the guide and `GET /Items` hide the same rows.
+#[async_trait]
+pub trait ParentalRestrictions: Send + Sync {
+    /// `query` with the restrictions `SetUser` reads from its user's
+    /// preferences (blocked unrated kinds, blocked and allowed tags) loaded,
+    /// or `None` when it has no user or nothing restricts what that user sees.
+    ///
+    /// # Errors
+    ///
+    /// A failed read of the user's preferences.
+    async fn resolve(
+        &self,
+        query: &InternalItemsQuery,
+    ) -> Result<Option<InternalItemsQuery>, ServiceError>;
+
+    /// Pushes the ` AND …` clauses that keep the `BaseItems` rows under
+    /// `alias` a query from [`resolve`](Self::resolve) may list: its maximum
+    /// rating, blocked unrated kinds and inherited tags.
+    fn push_restrictions(
+        &self,
+        qb: &mut sqlx::QueryBuilder<sqlx::Sqlite>,
+        query: &InternalItemsQuery,
+        alias: &str,
+    );
+}
+
+fn _assert_object_safe_parental_restrictions(_: &dyn ParentalRestrictions) {}
+
 /// Writes item rows and their derived data.
 ///
 /// Port of `IItemPersistenceService`. The C# `BaseItem` arguments become
@@ -1157,7 +1189,10 @@ pub trait ItemPersistenceService: Send + Sync {
     async fn set_ancestors(&self, item_id: Uuid, ancestor_ids: &[Uuid])
     -> Result<(), ServiceError>;
 
-    /// Persists the image info attached to an item.
+    /// Persists the image info attached to an item. The `ferrofin-core`
+    /// implementation only confirms the item exists: image rows are written by
+    /// [`Self::save_item_images`] and the `set_item_image*` methods, and nothing
+    /// calls this one. TODO(gl-211): open work item: remove it from the trait.
     async fn save_images(&self, item: &BaseItemEntity) -> Result<(), ServiceError>;
 
     /// Replaces the item's stored image rows (`BaseItemImageInfos`) with
@@ -1178,6 +1213,25 @@ pub trait ItemPersistenceService: Send + Sync {
     ) -> Result<(), ServiceError> {
         let _ = (item_id, images);
         Ok(())
+    }
+
+    /// Adds `image` to the item only while it has no image of that type,
+    /// leaving every other row alone: upstream's `if (!item.HasImage(type))
+    /// item.SetImage(image, 0)`, decided by the write itself so an image
+    /// stored meanwhile is never replaced. Returns whether it was added.
+    ///
+    /// The default adds nothing (stub/fake services).
+    ///
+    /// # Errors
+    ///
+    /// [`ServiceError::Backend`] on a storage failure.
+    async fn add_item_image_if_absent(
+        &self,
+        item_id: Uuid,
+        image: &ItemImageInfo,
+    ) -> Result<bool, ServiceError> {
+        let _ = (item_id, image);
+        Ok(false)
     }
 
     /// [`Self::save_item_images`] for many items, each with its own image
@@ -1778,19 +1832,24 @@ pub trait ItemPersistenceService: Send + Sync {
         Ok(0)
     }
 
-    /// Clears `item_id`'s `DateLastRefreshed`, so the next scan takes it as
-    /// never refreshed: its refresh failed after the row was saved, and the
-    /// saved row no longer shows what is left to do. Nothing else on the row
-    /// moves. Returns whether there is such a row.
+    /// Sets `item_id`'s `DateLastRefreshed` to `at`, and nothing else on the
+    /// row. `None` clears it, so the next scan takes the item as never
+    /// refreshed: the scan saves an item's row before what hangs off it, and
+    /// the row carries no stamp until those writes are done, so a refresh
+    /// cut short there is redone. Returns whether there is such a row.
     ///
-    /// The default clears nothing and answers `false` (for stub/fake
+    /// The default writes nothing and answers `false` (for stub/fake
     /// services).
     ///
     /// # Errors
     ///
     /// [`ServiceError::Backend`] on a storage failure.
-    async fn clear_date_last_refreshed(&self, item_id: Uuid) -> Result<bool, ServiceError> {
-        let _ = item_id;
+    async fn set_date_last_refreshed(
+        &self,
+        item_id: Uuid,
+        at: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> Result<bool, ServiceError> {
+        let _ = (item_id, at);
         Ok(false)
     }
 
@@ -2022,7 +2081,11 @@ pub trait ItemPersistenceService: Send + Sync {
         Ok(None)
     }
 
-    /// Recomputes and persists inherited values across the item tree.
+    /// Port of `UpdateInheritedValues`, which upstream runs at the end of the
+    /// post-scan tasks (`RunPostScanTasks`) to delete the `ItemValuesMap` rows
+    /// of type `InheritedTags`.
+    /// The `ferrofin-core` implementation is a no-op, and nothing calls it.
+    /// TODO(gl-211): open work item: port it and call it, or remove it.
     async fn update_inherited_values(&self) -> Result<(), ServiceError>;
 }
 
@@ -2627,7 +2690,7 @@ pub struct ItemChildLink {
 /// Returned by
 /// [`ItemPersistenceService::image_metadata_for_items`] and consumed by the
 /// scan's port of C#'s `LibraryManager.ImageNeedsRefresh`, and by its credited
-/// people's image write, which compares each person's whole row set.
+/// people's image write, which looks only for a stored `Primary`.
 #[derive(Debug, Clone)]
 pub struct StoredImageMetadata {
     /// The item the row belongs to.
@@ -2653,11 +2716,11 @@ pub struct StoredImageMetadata {
 pub struct WrittenPerson {
     /// The materialized `Person` item id.
     pub id: Uuid,
-    /// Whether the person's item still lacks a biography — the caller fetches
-    /// details only for these, so a re-scan backfills people scanned before the
-    /// biography feature and never re-fetches an already-enriched person.
+    /// Whether the person's item still lacks a biography. The caller fetches
+    /// details only for these, and only while the person was never refreshed.
     pub needs_details: bool,
-    /// The remote profile-image URL to download, when present.
+    /// The credit's remote profile-image URL, when present: the caller gives
+    /// it to a person that has no `Primary` yet.
     pub image_url: Option<String>,
     /// The remote provider id (TMDB person id) for a biography lookup.
     pub provider_id: Option<i64>,
@@ -2727,8 +2790,7 @@ pub trait PeopleRepository: Send + Sync {
     ///
     /// Returns a [`WrittenPerson`] per credited person so the caller (which has
     /// the HTTP/filesystem access the repository lacks) can download artwork and
-    /// fetch biographies — the `is_new` flag lets it enrich only freshly-created
-    /// people, keeping re-scans cheap.
+    /// fetch biographies for the people still lacking them.
     async fn update_people(
         &self,
         item_id: Uuid,

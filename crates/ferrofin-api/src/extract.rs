@@ -34,14 +34,14 @@
 //!
 //! * **Member names bind ignoring case**, as ASP.NET's MVC JSON options do
 //!   (`PropertyNameCaseInsensitive`, inherited from `JsonSerializerDefaults.Web`
-//!   and never overridden by Jellyfin): a body is parsed into a [`doc::Doc`],
+//!   and never overridden by Jellyfin): a body is parsed into a `doc::Doc`,
 //!   which folds struct member names and resolves duplicates the way
 //!   `System.Text.Json` does. Sonarr's and Radarr's camelCase
 //!   `/Library/Media/Updated` webhook bound to nothing before it.
 //!
 //! * **A body past the route's limit is 413.** Every route reads at most
 //!   axum's 2 MiB default, except the uploads, which take
-//!   [`MAX_UPLOAD_BODY_BYTES`] through [`upload_body_limit`]. Jellyfin's
+//!   `MAX_UPLOAD_BODY_BYTES` through `upload_body_limit`. Jellyfin's
 //!   `ExceptionMiddleware` answers Kestrel's "request body too large" with a
 //!   plain-text 500 (it maps no `BadHttpRequestException`); Ferrofin keeps the
 //!   `413` the condition is, never the binder's 400 claiming the body is
@@ -610,7 +610,11 @@ where
             // The handler names a parameter its route does not have. That is
             // a bug in the route table, not a bad request.
             tracing::error!(parameter = P::NAME, "route has no such parameter");
-            return Err(StatusCode::INTERNAL_SERVER_ERROR.into_response());
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                axum::Extension(crate::error::FailureLogged),
+            )
+                .into_response());
         };
         if value.trim().is_empty() {
             return Err(ProblemDetails::member_validation(
@@ -620,6 +624,53 @@ where
             .into_response());
         }
         Ok(Self(value.to_owned(), PhantomData))
+    }
+}
+
+/// A route or query `Guid`, bound the way ASP.NET binds one. Extract it as
+/// `Path(DotnetGuid(id)): Path<DotnetGuid>`, or by position in a tuple.
+///
+/// ASP.NET converts a `[FromRoute]` or `[FromQuery]` `Guid` with
+/// `GuidConverter`, which is `Guid.Parse`
+/// ([`parse_dotnet_guid`](ferrofin_util::guid_extensions::parse_dotnet_guid)):
+/// the value is trimmed, and the D, N, B, P and X formats bind. `Uuid`'s own
+/// `Deserialize` is `Uuid::parse_str`, which refuses P, X and padding and
+/// takes an `urn:uuid:` prefix .NET has no format for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DotnetGuid(pub uuid::Uuid);
+
+impl DotnetGuid {
+    /// Parses `value` as `Guid.Parse` does. The error is `Uuid::parse_str`'s
+    /// complaint, so a spelling both parsers refuse keeps the 400 body it had
+    /// when ids were parsed that way.
+    pub(crate) fn parse(value: &str) -> Result<uuid::Uuid, String> {
+        ferrofin_util::guid_extensions::parse_dotnet_guid(value).ok_or_else(|| {
+            match uuid::Uuid::parse_str(value) {
+                Err(error) => error.to_string(),
+                // A spelling `Uuid` takes and .NET does not (today, `urn:uuid:`).
+                Ok(_) => "not a .NET GUID format".to_owned(),
+            }
+        })
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for DotnetGuid {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct GuidVisitor;
+        impl serde::de::Visitor<'_> for GuidVisitor {
+            type Value = DotnetGuid;
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("a GUID string")
+            }
+            fn visit_str<E: serde::de::Error>(self, value: &str) -> Result<DotnetGuid, E> {
+                DotnetGuid::parse(value)
+                    .map(DotnetGuid)
+                    .map_err(|reason| E::custom(format_args!("UUID parsing failed: {reason}")))
+            }
+        }
+        // `deserialize_str` and `Uuid`'s message prefix, as `Uuid` has: axum's
+        // path rejection then names the parameter and its value as before.
+        deserializer.deserialize_str(GuidVisitor)
     }
 }
 
@@ -814,6 +865,16 @@ mod tests {
     /// [`RequiredRouteString<Name>`]: `/named/{name}` has the parameter, and
     /// `/other/{other}` does not.
     async fn bind_route_string(uri: &str) -> (StatusCode, String) {
+        let response = route_string_response(uri).await;
+        let status = response.status();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        (status, String::from_utf8_lossy(&body).into_owned())
+    }
+
+    /// The whole response [`bind_route_string`] reads.
+    async fn route_string_response(uri: &str) -> axum::response::Response {
         use tower::ServiceExt as _;
         async fn echo(RequiredRouteString(value, _): RequiredRouteString<Name>) -> String {
             format!("[{value}]")
@@ -821,19 +882,13 @@ mod tests {
         let app = axum::Router::new()
             .route("/named/{name}", axum::routing::get(echo))
             .route("/other/{other}", axum::routing::get(echo));
-        let response = app
-            .oneshot(
-                Request::get(uri)
-                    .body(axum::body::Body::empty())
-                    .expect("request"),
-            )
-            .await
-            .expect("response");
-        let status = response.status();
-        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
-            .await
-            .expect("body");
-        (status, String::from_utf8_lossy(&body).into_owned())
+        app.oneshot(
+            Request::get(uri)
+                .body(axum::body::Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response")
     }
 
     #[rstest::rstest]
@@ -873,7 +928,14 @@ mod tests {
 
     #[tokio::test]
     async fn a_required_route_string_its_route_lacks_is_a_500() {
-        let (status, _) = bind_route_string("/other/abc").await;
-        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        let response = route_string_response("/other/abc").await;
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        // Logged where it is found, so the request span does not log it again.
+        assert!(
+            response
+                .extensions()
+                .get::<crate::error::FailureLogged>()
+                .is_some()
+        );
     }
 }

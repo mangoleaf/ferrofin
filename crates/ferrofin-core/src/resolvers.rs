@@ -7,9 +7,9 @@
 //! layers call — mirroring how [`crate::kinds`] holds the `Supports*` table.
 //!
 //! Landed here:
-//! - [`should_ignore_path`] — the [`IgnorePatterns.ShouldIgnore`] glob table
+//! - [`should_ignore_path`] — the `IgnorePatterns.ShouldIgnore` glob table
 //!   (sample/artwork files, metadata/trash/temp directories, hidden files);
-//! - [`sort_name`] — the `BaseItem.SortName` normalization (article stripping +
+//! - `sort_name` — the `BaseItem.SortName` normalization (article stripping +
 //!   lower-casing) used to order by-name and library rows;
 //! - [`FileSystemWatcher`] — a small trait the [`crate::library_monitor`] uses so
 //!   tests can watch a fake instead of a real filesystem.
@@ -136,7 +136,7 @@ fn is_sample_clip(file_name: &str, stem: &str) -> bool {
 /// `IgnorePatterns.ShouldIgnore`), plus the "unix hidden file" rule (`**/.*`):
 /// any leading-dot file name is ignored.
 ///
-/// The path is matched case-insensitively against the [`IGNORE_RULES`] table.
+/// The path is matched case-insensitively against the `IGNORE_RULES` table.
 /// Application-folder and top-level-folder exemptions from
 /// `CoreResolutionIgnoreRule` are the caller's concern (they need the item tree);
 /// this covers the pattern table those exemptions gate.

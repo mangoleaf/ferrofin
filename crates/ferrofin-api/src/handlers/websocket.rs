@@ -12,7 +12,7 @@
 //! a request without valid credentials is refused with `403` before the upgrade.
 //! No route policy runs on it (remote access, access schedule), as upstream.
 //! It then answers pings, sends periodic keep-alives, and **registers a message
-//! sink** on the [`SessionMessageBus`] keyed by the
+//! sink** on the `SessionMessageBus` keyed by the
 //! caller's session id, so server→client pushes (SyncPlay commands/group updates
 //! and the remote-control `Play`/`Playstate`/`GeneralCommand` casts) reach this
 //! client. The session manager also treats a bus-registered session as having a

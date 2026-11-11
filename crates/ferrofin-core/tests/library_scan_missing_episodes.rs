@@ -15,9 +15,11 @@ use std::sync::{Arc, Mutex};
 use async_trait::async_trait;
 use ferrofin_core::file_system::FerrofinFileSystem;
 use ferrofin_core::item_type_lookup::{ItemTypeLookup, derive_item_id};
+use ferrofin_core::scheduled_tasks::library::TmdbUpcomingEpisodesTask;
 use ferrofin_core::{
-    FerrofinItemPersistenceService, FerrofinItemRepository, FerrofinVirtualFolderManager,
-    LibraryScanner,
+    FerrofinItemCountService, FerrofinItemPersistenceService, FerrofinItemRepository,
+    FerrofinLibraryManager, FerrofinPeopleRepository, FerrofinVirtualFolderManager, LibraryScanner,
+    ScheduledTask as _, TaskProgress,
 };
 use ferrofin_db::entities::base_items::BaseItemEntity;
 use ferrofin_model::configuration::{LibraryOptions, MediaPathInfo};
@@ -159,6 +161,7 @@ fn settings(unaired: bool, missing: bool, libraries: &[&str]) -> String {
 
 /// `tv/Show/Season 1/Show S01E01.mkv` in a TV library.
 struct Library {
+    db: ferrofin_db::Database,
     vf: Arc<dyn VirtualFolderManager>,
     persistence: Arc<FerrofinItemPersistenceService>,
     items: Arc<dyn ItemRepository>,
@@ -206,6 +209,7 @@ impl Library {
             Arc::new(ItemTypeLookup::new()),
         ));
         Self {
+            db,
             vf,
             persistence,
             items,
@@ -219,18 +223,34 @@ impl Library {
         *self.settings.0.lock().expect("settings") = json;
     }
 
-    fn scanner(&self, base: &str) -> LibraryScanner {
+    /// A TMDb client against the stand-in at `base`, reading these settings.
+    fn tmdb(&self, base: &str) -> Arc<TmdbClient> {
         let tmdb = TmdbClient::new()
             .with_base_url(&format!("{base}/tmdb"))
             .with_image_root(&format!("{base}/img"));
         tmdb.attach_plugin_manager(Arc::clone(&self.settings) as Arc<dyn PluginManager>);
+        Arc::new(tmdb)
+    }
+
+    fn scanner(&self, base: &str) -> LibraryScanner {
         LibraryScanner::new(
             Arc::clone(&self.vf),
             Arc::new(FerrofinFileSystem::new()),
             self.persistence.clone(),
         )
         .with_items(Arc::clone(&self.items))
-        .with_metadata(Arc::new(tmdb), self.tmp.join("metadata"))
+        .with_metadata(self.tmdb(base), self.tmp.join("metadata"))
+    }
+
+    /// The library manager over [`Self::scanner`], as the server builds it.
+    fn library(&self, base: &str) -> FerrofinLibraryManager {
+        FerrofinLibraryManager::new(
+            Arc::clone(&self.items),
+            Arc::new(FerrofinItemCountService::new(self.db.clone())),
+            self.persistence.clone(),
+            Arc::new(FerrofinPeopleRepository::new(self.db.clone())),
+        )
+        .with_scanner(Arc::new(self.scanner(base)))
     }
 
     fn series_id(&self) -> Uuid {
@@ -411,4 +431,22 @@ async fn a_file_arriving_for_a_placeholder_replaces_it() {
     lib.scanner(&base).scan_all().await.expect("rescan");
     assert_eq!(lib.virtual_episodes().await, vec![(1, 3), (2, 1)]);
     assert!(lib.row(lib.provider_id(1, Some(2))).await.is_none());
+}
+
+/// The "Refresh upcoming and missing episodes (TheMovieDb)" task refreshes a
+/// series that has not ended by its path: one scanned before the options
+/// were on gains its virtual episodes from the task alone.
+#[tokio::test]
+async fn the_upcoming_episodes_task_refreshes_a_continuing_series() {
+    let tmp = tempfile::tempdir().expect("tmp");
+    let lib = Library::new(tmp.path()).await;
+    let base = spawn_tmdb();
+    lib.scanner(&base).scan_all().await.expect("scan");
+    assert_eq!(lib.virtual_episodes().await, Vec::<(i64, i64)>::new());
+
+    lib.set(settings(true, true, &[lib.folder_id.as_str()]));
+    let task = TmdbUpcomingEpisodesTask::new(lib.tmdb(&base), Arc::new(lib.library(&base)));
+    task.execute(&TaskProgress::default()).await.expect("run");
+
+    assert_eq!(lib.virtual_episodes().await, vec![(1, 2), (1, 3), (2, 1)]);
 }

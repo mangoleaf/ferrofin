@@ -3,7 +3,9 @@
 //! Writes one `FerrofinPlaybackSessions` row per PlaybackInfo decision and updates it
 //! on playstate start/stop. The point is ranking `TranscodeReasons` by
 //! frequency and cost to find transcodes that
-//! a better profile decision would have avoided.
+//! a better profile decision would have avoided. The rows expire with the
+//! activity log: the Optimize Database task deletes those older than
+//! `ActivityLogRetentionDays` (`playback_sessions_repository::prune`).
 //!
 //! Storage failures are logged and swallowed — metrics must never break
 //! playback (the trait contract).
@@ -24,7 +26,7 @@
 //!
 //! So the recorder hands each event to a bounded queue and returns. One
 //! background task drains the queue and applies a whole batch in a single
-//! transaction: one commit for up to [`BATCH`] events instead of one per event,
+//! transaction: one commit for up to `BATCH` events instead of one per event,
 //! and no checkpoint ever lands on a request. Events go through one queue in
 //! submission order, so a start/stop update can never overtake the insert that
 //! creates its row. A full queue drops the event with a warning rather than

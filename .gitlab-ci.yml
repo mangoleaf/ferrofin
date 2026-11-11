@@ -60,7 +60,7 @@ request-release:
   stage: .pre
   image: alpine:3
   script:
-    - echo "Release requested — create-release runs once lint + coverage pass."
+    - echo "Release requested — create-release runs once lint + dependencies + vet + coverage pass."
   rules:
     - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
       when: manual
@@ -68,8 +68,8 @@ request-release:
 
 # ---------------------------------------------------------------------------
 # create-release — main only. GATED by the manual request-release job above plus
-# lint + coverage (via needs): it is SKIPPED unless you clicked request-release
-# AND both checks passed. This is how a release is triggered early WITHOUT waiting
+# lint + dependencies + vet + coverage (via needs): it is SKIPPED unless you clicked request-release
+# AND all the checks passed. This is how a release is triggered early WITHOUT waiting
 # — click request-release any time; this then runs automatically once the checks
 # go green, or is skipped/cancelled if they fail. It never auto-releases: no
 # request-release click means this is skipped.
@@ -90,6 +90,8 @@ create-release:
   needs:
     - job: request-release
     - job: lint
+    - job: dependencies
+    - job: vet
     - job: coverage
       parallel:
         matrix:
@@ -136,7 +138,7 @@ create-release:
       fi
   rules:
     # No `when:` -> on_success. The manual gate is request-release (a need above);
-    # this runs automatically once request-release + lint + coverage all succeed,
+    # this runs automatically once request-release + lint + dependencies + vet + coverage all succeed,
     # and is skipped otherwise — so it never releases without a request-release click.
     - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
 
@@ -354,6 +356,8 @@ lint:
     # Debuginfo is useless in CI and is what blows the runner pod's 12Gi memory
     # limit: `--all-targets` links every test binary, 16 concurrent rust-lld's
     # OOM-kill the job mid-link (same rationale as the GitHub workflow).
+    # Cargo.toml's [profile.dev] already leaves dependencies without debuginfo;
+    # this also drops the workspace's line tables.
     CARGO_PROFILE_DEV_DEBUG: "0"
     # Cap parallel rustc/linker processes: the workspace has enough crates that
     # unrestricted parallelism peaks above 12Gi during the link phase.
@@ -371,6 +375,60 @@ lint:
     - cargo clippy --locked --all-targets --all-features -- -D warnings
     - cargo nextest run --locked --workspace
     - cargo test --locked --workspace --doc   # nextest can't run doctests
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+      interruptible: true
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+    - if: '$CI_COMMIT_TAG =~ /^v\d+\.\d+\.\d+(-rc\.\d+)?$/'
+
+# The supply chain, without a build: the same three checks as the `dependencies` job in
+# .github/workflows/ci.yml. cargo-deny checks the crates the workspace and the wasm-hello guest build
+# against the RustSec advisory database (yanked versions included) and deny.toml's license, ban and
+# source rules; cargo-machete looks for declared but unused dependencies; check-workspace-deps.py
+# for a dependency a crate declares itself instead of taking the workspace's. A job of its own, not
+# part of `lint`, so an advisory published today turns the pipeline red without hiding the lint
+# result; create-release needs it, so a release never tags past one. Each check runs whatever the
+# one before found, so an advisory never hides the rest.
+dependencies:
+  stage: test
+  image: $CI_REGISTRY_IMAGE/ci:rust-1.99.1   # cargo-deny + cargo-machete baked in (ci/Dockerfile)
+  needs:
+    # When ci/Dockerfile changed, wait for the image that carries the tools; ignored on runs
+    # where ci-image is skipped.
+    - job: ci-image
+      optional: true
+  variables:
+    CARGO_TERM_COLOR: always
+  script:
+    - |
+      rc=0
+      cargo deny --locked check || rc=1
+      # The wasm-hello guest is outside the workspace, with its own Cargo.lock. Run from the root, so the
+      # root's deny.toml applies (cargo-deny reads its config from the directory it starts in).
+      cargo deny --manifest-path examples/wasm-hello/Cargo.toml --locked check || rc=1
+      cargo machete apps crates || rc=1   # vendor/ holds upstream code as published
+      scripts/check-workspace-deps.py || rc=1
+      exit $rc
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+      interruptible: true
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+    - if: '$CI_COMMIT_TAG =~ /^v\d+\.\d+\.\d+(-rc\.\d+)?$/'
+
+# cargo-vet, the same check as the `vet` job in .github/workflows/ci.yml: every crate in Cargo.lock
+# needs an audit or an exemption in gates/supply-chain/ (CONTRIBUTING.md, "Dependencies"). --locked
+# reads the committed gates/supply-chain/imports.lock instead of fetching the imports, so the result
+# changes only with the branch. create-release needs it.
+vet:
+  stage: test
+  image: $CI_REGISTRY_IMAGE/ci:rust-1.99.1   # cargo-vet baked in (ci/Dockerfile)
+  needs:
+    - job: ci-image   # as in `dependencies`
+      optional: true
+  variables:
+    CARGO_TERM_COLOR: always
+  script:
+    - cargo vet --locked
   rules:
     - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
       interruptible: true
@@ -416,7 +474,7 @@ coverage:
       - SHARD: [core, heavy, rest]
   variables:
     CARGO_HOME: $CI_PROJECT_DIR/.cargo
-    # Same 12Gi OOM as `lint` (see its variables): full-debuginfo links of the
+    # Same 12Gi OOM as `lint` (see its variables): debuginfo links of the
     # instrumented test binaries, many at once. Line coverage reads the coverage
     # mapping sections, not DWARF, so dropping debuginfo changes no percentage.
     CARGO_PROFILE_DEV_DEBUG: "0"

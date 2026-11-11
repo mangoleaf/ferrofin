@@ -43,7 +43,7 @@ STEPS = {
 }
 # Aggregate check -> the jobs it gates (a matrix job is named "<job> (<value>)"). A run from
 # before a check was split has the check alone, so its span is its total.
-GROUPS = {"lint": ("clippy", "lint-tests"), "coverage": ("coverage-shard",)}
+GROUPS = {"lint": ("clippy", "lint-tests", "vet"), "coverage": ("coverage-shard",)}
 METRICS = ["total", "span", "free disk", "rust-cache restore", "clippy",
            "tests", "test compile", "test execution", "tests run"]
 

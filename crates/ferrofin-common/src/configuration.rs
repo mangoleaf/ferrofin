@@ -3,9 +3,9 @@
 //! Jellyfin registers a set of *configuration stores* at startup, each keyed by
 //! a name and a .NET `Type`. Rust has no runtime `Type`, so the store's type is
 //! represented as a `type_key` string (e.g. the fully-qualified config type
-//! name) that the host resolves. The DI/runtime `IConfigurationManager` and the
-//! `IApplicationHost`-bound pieces are deferred; the portable value/interface
-//! shapes live here.
+//! name) that the host resolves. Only the portable value/interface shapes live
+//! here: the runtime `IConfigurationManager` is the `ServerConfigurationManager`
+//! trait in `ferrofin-traits`, implemented in `ferrofin-core`.
 
 /// Describes a single entry in the application configuration.
 ///
@@ -17,30 +17,6 @@ pub struct ConfigurationStore {
     pub key: String,
     /// A key identifying the type used to store this configuration entry.
     pub type_key: String,
-}
-
-/// Payload for the "configuration updated" event.
-///
-/// Port of `ConfigurationUpdateEventArgs`. The C# `object NewConfiguration`
-/// becomes a `type_key` plus the serialized configuration body, keeping the
-/// struct free of a runtime `Type` while still identifying what changed.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct ConfigurationUpdateEventArgs {
-    /// The configuration key that changed.
-    pub key: String,
-    /// A key identifying the type of the new configuration.
-    pub type_key: String,
-}
-
-impl ConfigurationUpdateEventArgs {
-    /// Creates a new event payload for `key`.
-    #[must_use]
-    pub fn new(key: impl Into<String>, type_key: impl Into<String>) -> Self {
-        Self {
-            key: key.into(),
-            type_key: type_key.into(),
-        }
-    }
 }
 
 /// Provides a set of configuration stores for a module or plugin.

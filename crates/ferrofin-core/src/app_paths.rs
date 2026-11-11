@@ -29,7 +29,7 @@
 //! and its reverse can share them.
 
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, RwLock};
+use std::sync::RwLock;
 
 use ferrofin_traits::system::ServerApplicationPaths;
 
@@ -399,8 +399,8 @@ impl ServerApplicationPaths for FerrofinServerApplicationPaths {
 /// Builds a [`FerrofinServerApplicationPaths`] rooted at `root/{program,log,…}`
 /// for tests.
 #[cfg(test)]
-pub(crate) fn test_paths(root: &Path) -> Arc<FerrofinServerApplicationPaths> {
-    Arc::new(FerrofinServerApplicationPaths::new(
+pub(crate) fn test_paths(root: &Path) -> std::sync::Arc<FerrofinServerApplicationPaths> {
+    std::sync::Arc::new(FerrofinServerApplicationPaths::new(
         root.join("program"),
         root.join("log"),
         root.join("config"),
@@ -408,9 +408,6 @@ pub(crate) fn test_paths(root: &Path) -> Arc<FerrofinServerApplicationPaths> {
         root.join("web"),
     ))
 }
-
-/// Re-exported so callers can name the shared handle type ergonomically.
-pub type SharedApplicationPaths = Arc<FerrofinServerApplicationPaths>;
 
 #[cfg(test)]
 mod tests {

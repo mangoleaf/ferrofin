@@ -12,7 +12,7 @@
 //! and then replaces the media-encoding seams (`hls` / `attachments`) — installed
 //! as disabled stubs by [`AppState::new`] — with the real ffmpeg-backed transcode
 //! pair via [`with_media_encoding`](AppState::with_media_encoding) (built by
-//! [`build_media_encoding`](crate::media_encoding::build_media_encoding)).
+//! [`build_media_encoding`]).
 
 use std::sync::Arc;
 
@@ -131,8 +131,9 @@ const PACKAGE_NAME: &str = "ferrofin-server";
 /// The **Jellyfin server version Ferrofin reports** in `SystemInfo`/`PublicSystemInfo`
 /// (`Version`): the newest Jellyfin release Ferrofin adopts (12.4.0, whose database
 /// carries 12.2's migration-id set and adopts as generation `12.2.0`; handlers are
-/// ported from `UPSTREAM_TAG`) — NOT Ferrofin's own crate version (`CARGO_PKG_VERSION`, used only for
-/// build/log lines). Clients gate on it: jellyfin-web's SDK refuses any server below
+/// ported from `UPSTREAM_TAG`) — NOT Ferrofin's own release version
+/// (`ferrofin_health::RELEASE_VERSION`, sent in User-Agents and backups).
+/// Clients gate on it: jellyfin-web's SDK refuses any server below
 /// `MINIMUM_VERSION = 10.10.0` with an "Update Required" screen, and jellyfin-sdk-kotlin
 /// (Android TV and friends) flags anything below `Jellyfin.minimumVersion = 12.0.0`
 /// as unsupported. The route gate stays pinned to the 10.11.8 contract, which covers
@@ -441,13 +442,15 @@ pub async fn build_app_state(
     // scope (`AddUserToQuery`'s playlists and box-set gate) reaches it through
     // this late slot, filled once the evaluator exists.
     let scope_visibility = ferrofin_core::VisibilitySlot::default();
-    let item_repository: Arc<dyn ferrofin_traits::persistence::ItemRepository> = Arc::new(
+    let item_repository_impl = Arc::new(
         FerrofinItemRepository::new(db.clone(), Arc::clone(&item_type_lookup))
             .with_root_ids(root_folder_ids)
             .with_virtual_paths(virtual_paths.clone())
             .with_active_recordings(Arc::clone(&active_recordings))
             .with_visibility(Arc::clone(&scope_visibility)),
     );
+    let item_repository: Arc<dyn ferrofin_traits::persistence::ItemRepository> =
+        Arc::clone(&item_repository_impl) as _;
     let item_count_service: Arc<dyn ferrofin_traits::persistence::ItemCountService> = Arc::new(
         FerrofinItemCountService::new(db.clone())
             .with_root_ids(root_folder_ids)
@@ -672,7 +675,7 @@ pub async fn build_app_state(
     // MusicAlbum/MusicArtist "Identify" providers.
     let musicbrainz_client = Arc::new(ferrofin_providers::MusicBrainzClient::new(
         &config.musicbrainz_base_url,
-        env!("CARGO_PKG_VERSION"),
+        ferrofin_health::RELEASE_VERSION,
     ));
     // TheAudioDb — artist bio/genre + artist/album artwork by MusicBrainz id
     // (built-in free key). Shared by the scan and the "Choose Image" methods.
@@ -708,6 +711,7 @@ pub async fn build_app_state(
             config.wasm_event_queue_capacity,
             config.wasm_private_http_allow.as_deref(),
         )
+        .with_call_grace_secs(config.wasm_call_grace_secs)
         .with_state_limit_mb(config.wasm_state_limit_mb)
         .with_image_download_mb(config.wasm_image_download_mb)
         .with_image_timeout_secs(config.wasm_image_timeout_secs)
@@ -1106,7 +1110,7 @@ pub async fn build_app_state(
             .with_metadata_root(metadata_root.clone()),
     );
     // Kept concrete so the "Migrate Trickplay Image Location" task can call the
-    // inherent `move_generated_trickplay_data` helper.
+    // inherent `move_generated_library_trickplay_data` helper.
     let trickplay_impl = Arc::new(
         FerrofinTrickplayManager::new(
             db.clone(),
@@ -1427,6 +1431,8 @@ pub async fn build_app_state(
         Arc::clone(&item_persistence_service),
         Arc::clone(&item_repository),
         Arc::clone(&user_views),
+        Arc::clone(&item_visibility) as _,
+        item_repository_impl,
     );
     // Channel logos and guide artwork are remote image rows: the refresh warms
     // their cache and tags a channel's logo for programme DTOs.
@@ -2024,6 +2030,7 @@ pub async fn build_app_state(
                 config.wasm_event_queue_capacity,
                 config.wasm_private_http_allow.as_deref(),
             )
+            .with_call_grace_secs(config.wasm_call_grace_secs)
             .with_state_limit_mb(config.wasm_state_limit_mb)
             .with_image_download_mb(config.wasm_image_download_mb)
             .with_image_timeout_secs(config.wasm_image_timeout_secs)
@@ -2690,6 +2697,7 @@ pub async fn build_app_state(
             db.clone(),
             Arc::clone(&sessions),
             Arc::clone(&library),
+            Arc::clone(&config_trait),
         )));
     }
     let tv_series: Arc<dyn ferrofin_traits::tv::TvSeriesManager> =

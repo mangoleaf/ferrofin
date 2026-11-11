@@ -87,6 +87,9 @@ The drop-in repoints `ExecStart=` at `/usr/local/bin`; everything else in the un
 shared with the package. The unit is installed but **not started yet**. Choose the
 fresh-install or migration procedure below before starting it.
 
+To check an installed binary, from the package or the tarball, for known vulnerabilities, see
+[`SECURITY.md`](../SECURITY.md#checking-a-binary-for-known-vulnerabilities).
+
 ## 3. The unit
 
 The unit runs as the `ferrofin` user with no extra sandboxing, like Jellyfin's own unit.

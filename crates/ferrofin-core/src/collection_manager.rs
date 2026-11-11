@@ -1,15 +1,15 @@
-//! [`FerrofinCollectionManager`] + [`FerrofinPlaylistManager`] — **minimal**
+//! [`FerrofinCollectionManager`] + [`FerrofinPlaylistManager`] — the
 //! [`CollectionManager`]/[`PlaylistManager`] impls.
 //!
 //! Ports of `Emby.Server.Implementations.Collections.CollectionManager` and
-//! `Emby.Server.Implementations.Playlists.PlaylistManager`. Both are thin unit-8
-//! managers: a box set and a playlist are both `BaseItem` rows, so creating one
-//! inserts a minimal `BaseItems` row (of the `BoxSet`/`Playlist` stored type)
+//! `Emby.Server.Implementations.Playlists.PlaylistManager`. A box set and a
+//! playlist are both `BaseItem` rows, so creating one inserts a minimal
+//! `BaseItems` row (of the `BoxSet`/`Playlist` stored type)
 //! through `ferrofin-db`, and membership is recorded as manual **linked children**
 //! via the injected
-//! [`LinkedChildrenService`](ferrofin_traits::persistence::LinkedChildrenService).
+//! [`LinkedChildrenService`].
 //! Reads go through the injected
-//! [`LibraryManager`](ferrofin_traits::library::LibraryManager) so the same
+//! [`LibraryManager`] so the same
 //! persistence seam backs everything.
 //!
 //! Playlist **ownership and access** are real: the `FerrofinPlaylists` table records the
@@ -1177,31 +1177,30 @@ impl FerrofinPlaylistManager {
         } else {
             crate::item_repository::query_user(&self.db, user_id).await?
         };
-        let by_id: std::collections::HashMap<Uuid, BaseItemEntity> = self
-            .items
-            .retrieve_items(ids)
-            .await?
+        let rows = self.items.retrieve_items(ids).await?;
+        // Checked once per row read, before the repeats.
+        let visible = match (&user, &self.visibility) {
+            (Some(user), Some((visibility, _))) => visibility.visible(&rows, user, false).await?,
+            _ => vec![true; rows.len()],
+        };
+        let by_id: std::collections::HashMap<Uuid, BaseItemEntity> = rows
             .into_iter()
+            .zip(visible)
+            .filter_map(|(row, visible)| visible.then_some(row))
             .filter_map(|row| Some((Uuid::parse_str(&row.id).ok()?, row)))
             .collect();
         // `itemIds.Select(GetItemById).Where(i => i is not null)`: request
         // order, repeats kept.
-        let mut inputs: Vec<(Uuid, &BaseItemEntity)> = ids
+        let inputs: Vec<(Uuid, &BaseItemEntity)> = ids
             .iter()
             .filter_map(|id| by_id.get(id).map(|row| (*id, row)))
             .collect();
-        if let (Some(user), Some((visibility, _))) = (&user, &self.visibility) {
-            let rows: Vec<BaseItemEntity> = inputs.iter().map(|(_, row)| (*row).clone()).collect();
-            let visible = visibility.visible(&rows, user, false).await?;
-            inputs = inputs
-                .into_iter()
-                .zip(visible)
-                .filter_map(|(input, visible)| visible.then_some(input))
-                .collect();
-        }
-        let mut items = Vec::new();
+        let addable = |row: &BaseItemEntity| {
+            kind_from_type_name(&row.type_).is_some_and(crate::kinds::supports_adding_to_playlist)
+        };
+        let mut member_ids = Vec::new();
         for (id, row) in inputs {
-            match kind_from_type_name(&row.type_) {
+            let expanded = match kind_from_type_name(&row.type_) {
                 Some(kind @ (BaseItemKind::MusicGenre | BaseItemKind::MusicArtist)) => {
                     let mut query = InternalItemsQuery {
                         recursive: true,
@@ -1221,23 +1220,28 @@ impl FerrofinPlaylistManager {
                     } else {
                         query.artist_ids = vec![id];
                     }
-                    items.extend(self.library_manager.get_item_list(&query).await?);
+                    self.library_manager.get_item_list(&query).await?
                 }
                 Some(kind) if crate::kinds::is_folder(kind) => {
                     let query = folder_items_query(id, kind, row, user.clone());
-                    items.extend(self.library_manager.query_items(&query).await?.items);
+                    self.library_manager.query_items(&query).await?.items
                 }
-                _ => items.push(row.clone()),
-            }
+                _ => {
+                    // The item itself: an id named many times costs no copy of its row.
+                    if addable(row) {
+                        member_ids.push(id);
+                    }
+                    continue;
+                }
+            };
+            member_ids.extend(
+                expanded
+                    .iter()
+                    .filter(|row| addable(row))
+                    .filter_map(|row| Uuid::parse_str(&row.id).ok()),
+            );
         }
-        Ok(items
-            .into_iter()
-            .filter(|row| {
-                kind_from_type_name(&row.type_)
-                    .is_some_and(crate::kinds::supports_adding_to_playlist)
-            })
-            .filter_map(|row| Uuid::parse_str(&row.id).ok())
-            .collect())
+        Ok(member_ids)
     }
 
     /// `CreatePlaylist`'s media type when the request names none
@@ -1726,6 +1730,18 @@ impl PlaylistManager for FerrofinPlaylistManager {
         // caller may not see itself, as `PlaylistsController` does.
         self.require_visible(playlist_id, user_id).await?;
         Ok(page.items)
+    }
+
+    async fn get_playlist_item_ids(&self, playlist_id: Uuid) -> Result<Vec<Uuid>, ServiceError> {
+        // The manual links in order, with no member row read. Each names an
+        // existing item, as `get_playlist_items`' join requires: the foreign
+        // key on `ChildId` is enforced, and every boot checks it.
+        Ok(read_entries(self.db.pool(), &guid_to_db(playlist_id))
+            .await?
+            .into_iter()
+            .filter(|(_, child_type)| *child_type == i64::from(LINKED_CHILD_MANUAL))
+            .filter_map(|(child, _)| Uuid::parse_str(&child).ok())
+            .collect())
     }
 
     async fn add_user_to_shares(
@@ -3370,8 +3386,8 @@ mod tests {
     #[tokio::test]
     async fn get_playlist_items_preserves_link_order() {
         // Members must come back in link order, not id/insertion order — seed
-        // three tracks and add them out of sort order; the result must echo the
-        // added sequence. (No prior coverage guarded playlist ordering.)
+        // three tracks and add them out of sort order, one twice; the result
+        // must echo the added sequence, and so must the ids-only read.
         let db = test_db().await;
         let a = Uuid::new_v4();
         let b = Uuid::new_v4();
@@ -3384,7 +3400,7 @@ mod tests {
         let created = mgr
             .create_playlist(&PlaylistCreationRequest {
                 name: Some("Ordered".to_owned()),
-                item_id_list: vec![c, a, b],
+                item_id_list: vec![c, a, b, a],
                 user_id: owner,
                 ..PlaylistCreationRequest::default()
             })
@@ -3399,7 +3415,11 @@ mod tests {
             .iter()
             .filter_map(|i| Uuid::parse_str(&i.id).ok())
             .collect();
-        assert_eq!(ids, vec![c, a, b]);
+        assert_eq!(ids, vec![c, a, b, a]);
+        assert_eq!(
+            mgr.get_playlist_item_ids(playlist_id).await.expect("ids"),
+            ids
+        );
     }
 
     #[tokio::test]
@@ -3775,6 +3795,8 @@ mod tests {
             .await
             .expect("owner reads an empty playlist");
         assert!(playlist_items.is_empty(), "{playlist_items:?}");
+        let ids = mgr.get_playlist_item_ids(playlist_id).await.expect("ids");
+        assert!(ids.is_empty(), "{ids:?}");
         assert!(matches!(
             mgr.get_playlist_items(playlist_id, Uuid::new_v4()).await,
             Err(ferrofin_traits::error::ServiceError::NotFound(_))
@@ -3844,6 +3866,10 @@ mod tests {
             .filter_map(|i| Uuid::parse_str(&i.id).ok())
             .collect();
         assert_eq!(ids, vec![member], "shortcut links are not playlist members");
+        assert_eq!(
+            mgr.get_playlist_item_ids(playlist_id).await.expect("ids"),
+            ids
+        );
     }
 
     #[tokio::test]

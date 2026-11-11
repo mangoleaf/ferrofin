@@ -63,7 +63,7 @@ use uuid::Uuid;
 
 use crate::auth::RequireAuth;
 use crate::error::ApiError;
-use crate::extract::Query;
+use crate::extract::{DotnetGuid, Query};
 use crate::handlers::items::effective_user_id;
 use crate::state::AppState;
 
@@ -142,7 +142,7 @@ async fn get_all_channel_features(RequireAuth(_auth): RequireAuth) -> Json<Vec<C
 )]
 async fn get_channel_features(
     RequireAuth(_auth): RequireAuth,
-    Path(channel_id): Path<Uuid>,
+    Path(DotnetGuid(channel_id)): Path<DotnetGuid>,
 ) -> Result<Json<ChannelFeatures>, ApiError> {
     Err(ApiError::BadRequest(format!(
         "no channel provider found for channel {channel_id}"
@@ -175,7 +175,7 @@ async fn get_channel_features(
 async fn get_channel_items(
     State(state): State<AppState>,
     RequireAuth(auth): RequireAuth,
-    Path(channel_id): Path<Uuid>,
+    Path(DotnetGuid(channel_id)): Path<DotnetGuid>,
     Query(query): Query<ChannelUserQuery>,
 ) -> Result<Json<QueryResult<BaseItemDto>>, ApiError> {
     // Upstream runs `RequestHelpers.GetUserId(User, userId)` on the very first

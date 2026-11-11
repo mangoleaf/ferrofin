@@ -452,6 +452,9 @@ impl PlaylistManager for RecordingPlaylists {
             })
             .into())
     }
+    async fn get_playlist_item_ids(&self, _playlist_id: Uuid) -> Result<Vec<Uuid>, ServiceError> {
+        Ok(vec![ITEM_A, ITEM_B])
+    }
     async fn add_user_to_shares(
         &self,
         _request: &ferrofin_model::playlists::PlaylistUserUpdateRequest,
@@ -988,6 +991,31 @@ async fn move_item_records_call() {
     assert_eq!(pid, PLAYLIST_ID.to_string());
     assert_eq!(entry, ITEM_A.to_string());
     assert_eq!(idx, 3);
+}
+
+/// `MoveItem` binds `playlistId` as a string and parses it with `Guid.Parse`
+/// (then `new Guid` in `MoveItemAsync`): the P and padded spellings move the
+/// item, and `urn:uuid:`, which .NET has no format for, is refused.
+#[tokio::test]
+async fn move_item_parses_the_playlist_id_like_guid_parse() {
+    for (spelling, moves) in [
+        (format!("%28{PLAYLIST_ID}%29"), true),
+        (format!("%20{PLAYLIST_ID}%20"), true),
+        (format!("urn%3Auuid%3A{PLAYLIST_ID}"), false),
+    ] {
+        let pl = Arc::new(RecordingPlaylists::default());
+        let app = state(pl.clone(), Arc::new(RecordingCollections::default()));
+        let uri = format!("/Playlists/{spelling}/Items/{ITEM_A}/Move/3");
+        let (status, _) = send(app, "POST", &uri, Body::empty()).await;
+        let moved = pl.moved.lock().unwrap().clone().map(|(pid, _, _)| pid);
+        if moves {
+            assert_eq!(status, StatusCode::NO_CONTENT, "{uri}");
+            assert_eq!(moved, Some(PLAYLIST_ID.to_string()), "{uri}");
+        } else {
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{uri}");
+            assert_eq!(moved, None, "{uri}");
+        }
+    }
 }
 
 #[tokio::test]

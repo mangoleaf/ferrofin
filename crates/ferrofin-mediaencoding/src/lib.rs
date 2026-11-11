@@ -32,8 +32,7 @@ pub use attachments::{
     AttachmentExtractorImpl, AttachmentIo, MediaSourceResolver, NoopAttachmentIo,
 };
 pub use configuration::{
-    DirChecker, EncodingConfigurationFactory, EncodingConfigurationStore, EncodingOptionsReader,
-    RealDirChecker,
+    DirChecker, EncodingConfigurationStore, EncodingOptionsReader, RealDirChecker,
 };
 pub use encoder::{
     EncoderValidator, FfmpegVersion, MediaEncoderConfig, MediaEncoderImpl, TokioTranscoder,

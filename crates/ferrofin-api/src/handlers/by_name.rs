@@ -8,7 +8,7 @@
 //!   folding the aggregated counts onto each DTO when the caller asked to filter
 //!   by item type (Jellyfin's `RequestHelpers.CreateQueryResult`).
 //! - A **single** endpoint resolving one by-name item by its route name and
-//!   projecting it with [`DtoService::get_base_item_dto`].
+//!   projecting it with `DtoService::get_base_item_dto`.
 //!
 //! This module holds the pieces those handlers share so each controller file is
 //! just its route wiring plus the manager call that differs — extracting the
@@ -37,7 +37,10 @@ use crate::state::AppState;
 #[serde(rename_all = "camelCase")]
 pub(crate) struct ByNameListQuery {
     /// The target user; defaults to the authenticated caller when absent.
-    #[serde(default)]
+    #[serde(
+        default,
+        deserialize_with = "crate::handlers::query_parse::empty_as_none_uuid"
+    )]
     pub user_id: Option<uuid::Uuid>,
     /// The index of the first record to return.
     #[serde(default)]
@@ -58,7 +61,10 @@ pub(crate) struct ByNameListQuery {
     #[serde(default)]
     pub name_less_than: Option<String>,
     /// Localizes the browse to a specific parent item/folder when set.
-    #[serde(default)]
+    #[serde(
+        default,
+        deserialize_with = "crate::handlers::query_parse::empty_as_none_uuid"
+    )]
     pub parent_id: Option<uuid::Uuid>,
     /// When non-empty, the aggregated counts are folded onto each DTO.
     #[serde(default)]
@@ -393,7 +399,10 @@ fn parse_csv_i32(raw: Option<&str>) -> Result<Vec<i32>, ApiError> {
 #[serde(rename_all = "camelCase")]
 pub(crate) struct ByNameItemQuery {
     /// The target user; defaults to the authenticated caller when absent.
-    #[serde(default)]
+    #[serde(
+        default,
+        deserialize_with = "crate::handlers::query_parse::empty_as_none_uuid"
+    )]
     pub user_id: Option<uuid::Uuid>,
 }
 
@@ -478,8 +487,9 @@ const SLUG_CHAR: char = '-';
 /// stops after `'?'`), and "Ferrofin matches neither tree" is the definition of
 /// the bug, not of a capability worth keeping — nothing shipped before this
 /// batch reached that row either, since the pre-existing behaviour here was the
-/// create-on-GET defect this batch removed. The upstream quirk itself is
-/// recorded, with the evidence, in `suite/parity/classifications.json`.
+/// create-on-GET defect this batch removed. The test
+/// `a_hyphenated_name_is_only_ever_read_as_a_slug` (`tests/by_name_browse.rs`)
+/// pins the upstream quirk.
 ///
 /// Returns [`None`] when nothing matches; the caller substitutes
 /// [`LibraryManager::empty_by_name_item`], which is upstream's `item ??= new

@@ -175,7 +175,8 @@ error enum to HTTP status via `IntoResponse` (`NotImplemented → 501`, `Unautho
 
 - **Dependencies live in the root `Cargo.toml`** `[workspace.dependencies]`; crates reference
   them as `dep.workspace = true`. **Never** inline a version in a crate's `Cargo.toml`. Check
-  crates.io for the latest version before adding a new dependency.
+  crates.io for the latest version before adding a new dependency. A new crate or version
+  also needs a cargo-vet audit or exemption (CONTRIBUTING.md, "Dependencies").
 - **Lints are workspace-wide** (`[workspace.lints]`): `missing_docs` and `clippy::pedantic`
   are warnings, and CI treats warnings as errors. So **every `pub` item needs a `///` doc**,
   and pedantic clippy must pass.
@@ -236,8 +237,10 @@ cargo fmt --all --check
 cargo clippy --all-targets --all-features -- -D warnings
 cargo nextest run --workspace          # + `cargo test --workspace --doc` for doctests
 cargo deny --locked check              # advisories, licenses, bans, sources (deny.toml)
+cargo deny --manifest-path examples/wasm-hello/Cargo.toml --locked check   # the same for the WASM guest
 cargo machete apps crates              # declared but unused dependencies
 scripts/check-workspace-deps.py        # every dependency through [workspace.dependencies]
+cargo vet --locked                     # every crate audited or exempted (gates/supply-chain/; CONTRIBUTING.md "Dependencies")
 ```
 
 **Coverage gate — ≥80% line coverage, enforced per-crate:**
@@ -329,7 +332,7 @@ Jellyfin. Read [`gates/bench/README.md`](gates/bench/README.md) first — it def
 sentence.
 
 ```bash
-# needs docker, k6, jq, taskset, curl, python3, sha256sum, timeout, setsid; ffprobe for TTFS
+# needs docker, k6, jq, taskset, curl, python3, sha256sum, timeout, setsid, flock; ffprobe for TTFS
 # plus ffmpeg (libx264 + libx265) and Python Pillow to build the test data
 export FERROFIN_GATES_DIR=/srv/gates           # output root: absolute, local disk, outside the repo (gates/lib.sh)
 docker pull jellyfin/jellyfin:10.11.8

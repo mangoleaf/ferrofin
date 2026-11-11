@@ -356,7 +356,7 @@ async fn serve_remote_static(
     // replaces it per request (reqwest fills only headers a request leaves unset).
     let client = CLIENT.get_or_init(|| {
         reqwest::Client::builder()
-            .user_agent(concat!("Ferrofin/", env!("CARGO_PKG_VERSION")))
+            .user_agent(ferrofin_health::USER_AGENT)
             .build()
             .unwrap_or_default()
     });

@@ -9,7 +9,7 @@ use crate::error::{CryptoError, Result};
 /// A parsed password hash: id, ordered parameters, salt, and hash bytes.
 ///
 /// Port of `PasswordHash`. Parameters preserve insertion order (a `Vec` of
-/// key/value pairs) so [`PasswordHash::to_string`] reproduces the C# output
+/// key/value pairs) so `PasswordHash::to_string` reproduces the C# output
 /// byte-for-byte.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PasswordHash {

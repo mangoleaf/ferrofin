@@ -18,7 +18,7 @@
 //!   downgrades it to `DirectPlay` otherwise.
 //! - `PingPlaybackSession`, the progress report's keep-alive and the stop
 //!   report's kill go to the same runtime (`PingTranscodingJob`,
-//!   `KillTranscodingJobs`) before the report reaches the [`SessionManager`].
+//!   `KillTranscodingJobs`) before the report reaches the `SessionManager`.
 
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
@@ -32,7 +32,7 @@ use uuid::Uuid;
 
 use crate::auth::RequireAuth;
 use crate::error::ApiError;
-use crate::extract::{JsonBody, Query};
+use crate::extract::{DotnetGuid, JsonBody, Query};
 use crate::handlers::items::{resolve_user, user_uuid};
 use crate::handlers::session_ctx::{current_session, current_session_id};
 use crate::state::AppState;
@@ -88,7 +88,7 @@ struct UserIdQuery {
 async fn mark_played_item(
     State(state): State<AppState>,
     RequireAuth(auth): RequireAuth,
-    Path(item_id): Path<Uuid>,
+    Path(DotnetGuid(item_id)): Path<DotnetGuid>,
     Query(query): Query<MarkPlayedQuery>,
 ) -> Result<Json<UserItemDataDto>, ApiError> {
     let user = resolve_user(&state, &auth, query.user_id).await?;
@@ -126,7 +126,7 @@ async fn mark_played_item(
 async fn mark_unplayed_item(
     State(state): State<AppState>,
     RequireAuth(auth): RequireAuth,
-    Path(item_id): Path<Uuid>,
+    Path(DotnetGuid(item_id)): Path<DotnetGuid>,
     Query(query): Query<UserIdQuery>,
 ) -> Result<Json<UserItemDataDto>, ApiError> {
     let user = resolve_user(&state, &auth, query.user_id).await?;
@@ -147,7 +147,7 @@ async fn mark_unplayed_item(
 async fn mark_played_for_user(
     State(state): State<AppState>,
     RequireAuth(auth): RequireAuth,
-    Path((user_id, item_id)): Path<(Uuid, Uuid)>,
+    Path((DotnetGuid(user_id), DotnetGuid(item_id))): Path<(DotnetGuid, DotnetGuid)>,
     Query(query): Query<MarkPlayedQuery>,
 ) -> Result<Json<UserItemDataDto>, ApiError> {
     let user = resolve_user(&state, &auth, Some(user_id)).await?;
@@ -170,7 +170,7 @@ async fn mark_played_for_user(
 async fn unmark_played_for_user(
     State(state): State<AppState>,
     RequireAuth(auth): RequireAuth,
-    Path((user_id, item_id)): Path<(Uuid, Uuid)>,
+    Path((DotnetGuid(user_id), DotnetGuid(item_id))): Path<(DotnetGuid, DotnetGuid)>,
 ) -> Result<Json<UserItemDataDto>, ApiError> {
     let user = resolve_user(&state, &auth, Some(user_id)).await?;
     let uid = user_uuid(&user)?;
@@ -354,7 +354,7 @@ struct LegacyStartQuery {
 async fn on_playback_start(
     State(state): State<AppState>,
     RequireAuth(auth): RequireAuth,
-    Path(item_id): Path<Uuid>,
+    Path(DotnetGuid(item_id)): Path<DotnetGuid>,
     Query(query): Query<LegacyStartQuery>,
 ) -> Result<StatusCode, ApiError> {
     let mut info = PlaybackStartInfo {
@@ -423,7 +423,7 @@ struct LegacyProgressQuery {
 async fn on_playback_progress(
     State(state): State<AppState>,
     RequireAuth(auth): RequireAuth,
-    Path(item_id): Path<Uuid>,
+    Path(DotnetGuid(item_id)): Path<DotnetGuid>,
     Query(query): Query<LegacyProgressQuery>,
 ) -> Result<StatusCode, ApiError> {
     let mut info = PlaybackProgressInfo {
@@ -484,7 +484,7 @@ struct LegacyStopQuery {
 async fn on_playback_stopped(
     State(state): State<AppState>,
     RequireAuth(auth): RequireAuth,
-    Path(item_id): Path<Uuid>,
+    Path(DotnetGuid(item_id)): Path<DotnetGuid>,
     Query(query): Query<LegacyStopQuery>,
 ) -> Result<StatusCode, ApiError> {
     let mut info = PlaybackStopInfo {
@@ -513,10 +513,10 @@ async fn on_playback_stopped(
 async fn on_playback_start_for_user(
     state: State<AppState>,
     auth: RequireAuth,
-    Path((_user_id, item_id)): Path<(Uuid, Uuid)>,
+    Path((DotnetGuid(_user_id), DotnetGuid(item_id))): Path<(DotnetGuid, DotnetGuid)>,
     query: Query<LegacyStartQuery>,
 ) -> Result<StatusCode, ApiError> {
-    on_playback_start(state, auth, Path(item_id), query).await
+    on_playback_start(state, auth, Path(DotnetGuid(item_id)), query).await
 }
 
 /// `POST /Users/{userId}/PlayingItems/{itemId}/Progress` — path-scoped form of
@@ -524,10 +524,10 @@ async fn on_playback_start_for_user(
 async fn on_playback_progress_for_user(
     state: State<AppState>,
     auth: RequireAuth,
-    Path((_user_id, item_id)): Path<(Uuid, Uuid)>,
+    Path((DotnetGuid(_user_id), DotnetGuid(item_id))): Path<(DotnetGuid, DotnetGuid)>,
     query: Query<LegacyProgressQuery>,
 ) -> Result<StatusCode, ApiError> {
-    on_playback_progress(state, auth, Path(item_id), query).await
+    on_playback_progress(state, auth, Path(DotnetGuid(item_id)), query).await
 }
 
 /// `DELETE /Users/{userId}/PlayingItems/{itemId}` — path-scoped form of
@@ -535,10 +535,10 @@ async fn on_playback_progress_for_user(
 async fn on_playback_stopped_for_user(
     state: State<AppState>,
     auth: RequireAuth,
-    Path((_user_id, item_id)): Path<(Uuid, Uuid)>,
+    Path((DotnetGuid(_user_id), DotnetGuid(item_id))): Path<(DotnetGuid, DotnetGuid)>,
     query: Query<LegacyStopQuery>,
 ) -> Result<StatusCode, ApiError> {
-    on_playback_stopped(state, auth, Path(item_id), query).await
+    on_playback_stopped(state, auth, Path(DotnetGuid(item_id)), query).await
 }
 
 /// Kills the live transcode job(s) for a stopping playback session — matched by

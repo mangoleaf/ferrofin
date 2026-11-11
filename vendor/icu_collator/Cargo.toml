@@ -8,7 +8,7 @@
 # If you are reading this file be aware that the original Cargo.toml
 # will likely look very different (and much more reasonable).
 #
-# Ferrofin: vendored from crates.io icu_collator 2.3.1 for the one-line Jamo
+# Ferrofin: vendored from crates.io icu_collator 2.4.0 for the one-line Jamo
 # fix in src/elements.rs (see PATCHED.md). Only the library source, this
 # manifest and the license are vendored: the upstream README, tests, benches
 # and packaging metadata are not, and their manifest entries are removed here.
@@ -17,7 +17,7 @@
 edition = "2024"
 rust-version = "1.88"
 name = "icu_collator"
-version = "2.3.1"
+version = "2.4.0"
 authors = ["The ICU4X Project Developers"]
 build = false
 include = [
@@ -96,26 +96,26 @@ optional = true
 default-features = false
 
 [dependencies.icu_collator_data]
-version = "~2.3.0"
+version = "~2.4.0"
 optional = true
 default-features = false
 
 [dependencies.icu_collections]
-version = "~2.3.0"
+version = "~2.4.0"
 default-features = false
 
 [dependencies.icu_locale_core]
-version = "2.3.0"
+version = "2.4.0"
 features = ["alloc"]
 default-features = false
 
 [dependencies.icu_locale_fallback]
-version = "~2.3.0"
+version = "~2.4.0"
 optional = true
 default-features = false
 
 [dependencies.icu_normalizer]
-version = "~2.3.0"
+version = "~2.4.0"
 features = [
     "utf8_iter",
     "utf16_iter",
@@ -123,11 +123,11 @@ features = [
 default-features = false
 
 [dependencies.icu_properties]
-version = "~2.3.0"
+version = "~2.4.0"
 default-features = false
 
 [dependencies.icu_provider]
-version = "2.3.0"
+version = "2.4.0"
 default-features = false
 
 [dependencies.serde]
@@ -149,15 +149,15 @@ features = [
 default-features = false
 
 [dependencies.utf16_iter]
-version = "1.0.2"
+version = "1.0.4"
 default-features = false
 
 [dependencies.utf8_iter]
-version = "1.0.2"
+version = "1.0.4"
 default-features = false
 
 [dependencies.zerovec]
-version = "0.11.8"
+version = "0.11.9"
 default-features = false
 
 [lints.clippy]

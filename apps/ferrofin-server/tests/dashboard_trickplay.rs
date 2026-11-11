@@ -107,14 +107,22 @@ async fn blocking_custom_provider_service_error_still_updates_the_refresh_stamp(
         .unwrap()
         .unwrap()
         .date_last_refreshed;
-    let etag = fixture.refresh("FullRefresh", false).await;
-    fixture.wait_etag(&etag).await;
-    let after = repo
-        .retrieve_item(id)
-        .await
-        .unwrap()
-        .unwrap()
-        .date_last_refreshed;
+    fixture.refresh("FullRefresh", false).await;
+    // The row's save moves the Etag; its stamp is written after everything
+    // the refresh writes, so wait for the stamp itself.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let after = loop {
+        let after = repo
+            .retrieve_item(id)
+            .await
+            .unwrap()
+            .unwrap()
+            .date_last_refreshed;
+        if after > before || std::time::Instant::now() > deadline {
+            break after;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    };
     assert!(
         after > before,
         "RunCustomProvider sets ErrorMessage without counting a failure, so ordinary errors still permit DateLastRefreshed"

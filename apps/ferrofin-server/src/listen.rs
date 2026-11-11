@@ -12,7 +12,7 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use anyhow::Context as _;
 
 /// What `axum::serve` accepts: a TCP listener that sets the socket options of
-/// every accepted connection ([`crate::configure_accepted`]).
+/// every accepted connection (`crate::configure_accepted`).
 pub type Listener = axum::serve::TapIo<tokio::net::TcpListener, fn(&mut tokio::net::TcpStream)>;
 
 pub use ferrofin_api::forwarded_headers::Transport;

@@ -1,12 +1,9 @@
-//! [`FerrofinChannelManager`] — a **stub** [`ChannelManager`] for the deferred
-//! channels subsystem.
+//! [`FerrofinChannelManager`] — the [`ChannelManager`] the server runs with.
 //!
-//! Port of the disabled/null shape of
-//! `Emby.Server.Implementations.Channels.ChannelManager`. Channels are not part
-//! of the Ferrofin v1 feature set (per the port plan's deferred-subsystem list),
-//! so no `IChannel` backends are registered and every query resolves to an
-//! empty result. The seam exists only so the DI graph and `AppState` can name an
-//! `Arc<dyn ChannelManager>`; a real implementation is a future wave.
+//! Upstream's `ChannelManager` (`Jellyfin.LiveTv.Channels`) fans each query
+//! out to its registered `IChannel` backends. Ferrofin has no `IChannel` seam, so
+//! nothing can register a channel and every query resolves to an empty result.
+//! TODO(parity, gl-298): open work item: give channels an extension seam.
 //!
 //! There is no per-backend strategy fan-out and no persistence here — the
 //! methods return empty collections rather than touching the database.
@@ -21,7 +18,7 @@ use ferrofin_traits::error::ServiceError;
 use ferrofin_traits::options::InternalItemsQuery;
 use ferrofin_traits::stubs::ChannelManager;
 
-/// The stub channels manager for the deferred channels subsystem.
+/// The channels manager with no channel backends (see the module docs).
 ///
 /// Every method returns an empty result: no channels are advertised and no
 /// channel items exist.
@@ -29,7 +26,7 @@ use ferrofin_traits::stubs::ChannelManager;
 pub struct FerrofinChannelManager;
 
 impl FerrofinChannelManager {
-    /// Creates the stub channels manager.
+    /// Creates the channels manager.
     #[must_use]
     pub fn new() -> Self {
         Self
@@ -42,7 +39,7 @@ impl ChannelManager for FerrofinChannelManager {
         &self,
         _id: Option<Uuid>,
     ) -> Result<Vec<ChannelFeatures>, ServiceError> {
-        // Channels are deferred: no backends are registered.
+        // No channel backends can be registered (see the module docs).
         Ok(Vec::new())
     }
 

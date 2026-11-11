@@ -20,7 +20,7 @@ use ferrofin_model::media_info::MediaProtocol;
 /// Gets the ffmpeg input argument for a single input file.
 ///
 /// For non-`File` protocols the path is simply [`quote`]d; for `File` it is
-/// routed through [`get_file_input_argument`] (which applies the
+/// routed through `get_file_input_argument` (which applies the
 /// `inputPrefix:` scheme and quote escaping).
 #[must_use]
 pub fn get_input_argument(input_prefix: &str, input_file: &str, protocol: MediaProtocol) -> String {
@@ -34,7 +34,7 @@ pub fn get_input_argument(input_prefix: &str, input_file: &str, protocol: MediaP
 /// Gets the ffmpeg input argument for a list of input files.
 ///
 /// For non-`File` protocols the first file is [`quote`]d; for `File` the list
-/// is routed through [`get_concat_input_argument`].
+/// is routed through `get_concat_input_argument`.
 ///
 /// # Panics
 ///
@@ -123,7 +123,8 @@ pub fn quote_if_needed(value: &str) -> Cow<'_, str> {
 ///
 /// # Errors
 ///
-/// Returns an error naming the string (any URL in it by its scheme and host)
+/// Returns an error naming the string (any URL in it by its scheme and host,
+/// nothing after a header flag such as `-user_agent`)
 /// when its quoting is unbalanced. That is a builder bug, and guessing at the
 /// split could hand part of a path to ffmpeg as options, so the caller must not guess: it refuses the command,
 /// or passes the whole string as one argument, which cannot add an option.
@@ -131,7 +132,7 @@ pub fn split_args(arguments: &str) -> Result<Vec<String>, String> {
     shlex::split(arguments).ok_or_else(|| {
         format!(
             "unbalanced quoting in ffmpeg arguments `{}`",
-            ferrofin_util::source_url::redact_urls_in(arguments)
+            crate::transcoding::shown_argument_line(arguments)
         )
     })
 }
@@ -270,6 +271,21 @@ mod tests {
         for secret in ["acct-user", "info-secret", "path-secret", "query-secret"] {
             assert!(!err.contains(secret), "{secret} shown in: {err}");
         }
+    }
+
+    /// Nothing after a header flag is shown when the quoting does not balance:
+    /// there is no telling where its value ends (gl-1407).
+    #[rstest::rstest]
+    #[case::in_the_value(r#"-probesize 1 -user_agent "Box/1.0 ua-secret -i x"#)]
+    #[case::after_the_value(r#"-probesize 1 -user_agent "Box/1.0 ua-secret" -i "file:/a.mkv"#)]
+    #[case::headers(r#"-probesize 1 -headers "Cookie: ua-secret -i x"#)]
+    #[case::referer(r#"-probesize 1 -referer "http://portal.example/ua-secret -i x"#)]
+    #[case::the_first_flag_in_the_line(r#"-probesize 1 -user_agent "ua-secret" -headers "x"#)]
+    fn unbalanced_quoting_hides_header_flag_values(#[case] arguments: &str) {
+        let err = split_args(arguments).unwrap_err();
+        assert!(err.contains("-probesize 1 -"), "{err}");
+        assert!(err.contains("<redacted>"), "{err}");
+        assert!(!err.contains("ua-secret"), "ua-secret shown in: {err}");
     }
 
     #[test]

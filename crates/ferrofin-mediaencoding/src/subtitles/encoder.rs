@@ -25,10 +25,11 @@ use ferrofin_traits::media_encoding::TrimmedSubtitle;
 
 use crate::encoder::{get_input_argument, quote};
 use crate::encoding_helper::helper;
+use crate::error::MediaEncodingError;
 use crate::keyed_locks::KeyedLocks;
 
 use super::model::{Paragraph, Subtitle, TimeCode};
-use super::parser::{SubtitleEditParser, SubtitleParser};
+use super::parser::{SubtitleEditParser, SubtitleParser, unsupported_extension};
 use super::{json_writer, srt, ssa, ttml, vtt};
 
 /// The output format a [`GetWriter`](write)-selected writer emits.
@@ -100,6 +101,14 @@ impl Writer {
         }
     }
 
+    /// The writer for `format`, or the `400` upstream's `ArgumentException`
+    /// is. Port of `SubtitleEncoder.GetWriter`.
+    fn get(format: &str) -> Result<Self, MediaEncodingError> {
+        Self::for_format(format).ok_or_else(|| {
+            MediaEncodingError::InvalidInput(format!("Unsupported format: {format}"))
+        })
+    }
+
     /// Writes `subtitle` in this writer's format.
     fn write(self, subtitle: &Subtitle) -> String {
         match self {
@@ -127,7 +136,7 @@ const DOTNET_MAX_TIMER_DELAY_MS: u32 = u32::MAX - 1;
 /// killed and the extraction fails.
 ///
 /// Deliberate divergence: a negative value, or one longer than
-/// [`DOTNET_MAX_TIMER_DELAY_MS`] (71,582 minutes), makes upstream's
+/// `DOTNET_MAX_TIMER_DELAY_MS` (71,582 minutes), makes upstream's
 /// `CancelAfter` throw after ffmpeg has already started, so the extraction
 /// fails and the orphaned ffmpeg keeps running. `None` here reports such a
 /// value as invalid, so the caller fails the extraction without starting
@@ -150,8 +159,9 @@ pub trait SubtitleIo: Send + Sync {
     ///
     /// # Errors
     ///
-    /// Returns an error message if the file cannot be read.
-    async fn read_file(&self, path: &str) -> Result<Vec<u8>, String>;
+    /// The I/O error, its kind intact: the encoder answers a missing file with
+    /// the `404` upstream's `FileNotFoundException` is.
+    async fn read_file(&self, path: &str) -> std::io::Result<Vec<u8>>;
 
     /// Fetches the raw bytes of an HTTP(S) `url`. Port of the
     /// `IHttpClientFactory` `GetStreamAsync` calls.
@@ -189,6 +199,25 @@ pub trait SubtitleIo: Send + Sync {
     /// request) instead of hitting the cache.
     fn file_exists(&self, path: &str) -> bool {
         std::path::Path::new(path).is_file()
+    }
+
+    /// Opens the local file at `path` and reads at most one byte: the
+    /// failures [`read_file`](Self::read_file) would have opening it, without
+    /// the file in memory. Port of the `AsyncFile.OpenRead` that upstream's
+    /// `GetSubtitleStream` returns, which opens the file without reading it;
+    /// the one-byte read refuses a directory, as .NET's open does.
+    ///
+    /// # Errors
+    ///
+    /// The I/O error, its kind intact, as [`read_file`](Self::read_file)
+    /// returns it.
+    async fn open_file(&self, path: &str) -> std::io::Result<()> {
+        use tokio::io::AsyncReadExt as _;
+        tokio::fs::File::open(path)
+            .await?
+            .read(&mut [0; 1])
+            .await
+            .map(drop)
     }
 
     /// Returns the size in bytes of the file at `path`, or `None` if the file
@@ -245,6 +274,27 @@ pub trait SubtitleIo: Send + Sync {
             .ok()?;
         let ticks = i64::try_from(since_epoch.as_nanos() / 100).ok()?;
         Some((metadata.len(), UNIX_EPOCH_TICKS + ticks))
+    }
+}
+
+/// A failed read of `path`: [`MediaEncodingError::NotFound`] for what .NET
+/// throws `FileNotFoundException` or `DirectoryNotFoundException` for (`ENOENT`
+/// and `ENOTDIR` in `Interop.GetExceptionForIoErrno`; a `404` upstream), else
+/// an I/O failure (`500`). The `404` names no path: its
+/// message reaches the client, and the subtitle routes take anonymous callers.
+fn read_error(path: &str, error: std::io::Error) -> MediaEncodingError {
+    match error.kind() {
+        std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory => {
+            // A 4xx is not logged where it is answered, so this is the one
+            // place left that names the file.
+            tracing::debug!(
+                path = %ferrofin_util::source_url::redact_url(path),
+                %error,
+                "subtitle file not found"
+            );
+            MediaEncodingError::NotFound("subtitle file not found".to_owned())
+        }
+        _ => MediaEncodingError::io(format!("read {path}"), error),
     }
 }
 
@@ -306,13 +356,16 @@ impl<P: SubtitleParser, I: SubtitleIo> SubtitleEncoder<P, I> {
     /// it ([`get_subtitle_stream`](Self::get_subtitle_stream)), then — unless the
     /// stream is already in the requested format (ASS being a superset of SSA) —
     /// re-parse and re-emit it ([`convert_subtitles`](Self::convert_subtitles))
-    /// over `[start, end]`. The caller resolves the [`MediaSourceInfo`] and the
-    /// target subtitle stream from the item + media-source id.
+    /// over `[start, end]`. A file in a format the parser has no reader for is
+    /// refused after it is opened, before it is read. The caller resolves the
+    /// [`MediaSourceInfo`] and the target subtitle stream from the item +
+    /// media-source id.
     ///
     /// # Errors
     ///
-    /// Returns an error message when the readable file cannot be resolved/read,
-    /// or when `output_format` has no writer.
+    /// [`MediaEncodingError::NotFound`] when the readable file is missing,
+    /// [`MediaEncodingError::InvalidInput`] when `output_format` has no writer or
+    /// the file no parser or no cue, else the failure resolving or reading it.
     #[allow(clippy::too_many_arguments)]
     pub async fn get_subtitles(
         &self,
@@ -322,20 +375,32 @@ impl<P: SubtitleParser, I: SubtitleIo> SubtitleEncoder<P, I> {
         start_time_ticks: i64,
         end_time_ticks: i64,
         preserve_original_timestamps: bool,
-    ) -> Result<Vec<u8>, String> {
+    ) -> Result<Vec<u8>, MediaEncodingError> {
         let info = self
             .get_readable_file(media_source, subtitle_stream)
             .await?;
-        let stream = self.get_subtitle_stream(&info).await?;
 
         // Return the original when the same format is requested. ASS is a
         // superset of SSA, so an SSA source satisfies an ASS request verbatim
         // (styles preserved). Character encoding was handled in
         // `get_subtitle_stream`.
-        if info.format.eq_ignore_ascii_case(output_format)
+        let same_format = info.format.eq_ignore_ascii_case(output_format)
             || (info.format.eq_ignore_ascii_case(subtitle_format::SSA)
-                && output_format.eq_ignore_ascii_case(subtitle_format::ASS))
-        {
+                && output_format.eq_ignore_ascii_case(subtitle_format::ASS));
+
+        // `Parse` refuses a format it has no parser for whatever the file
+        // holds, so a bitmap track (megabytes of PGS or VobSub) is opened, as
+        // upstream opens it, but not read into memory (gl-1495).
+        if !same_format && !self.parser.supports_file_extension(&info.format) {
+            self.io
+                .open_file(&info.path)
+                .await
+                .map_err(|e| read_error(&info.path, e))?;
+            return Err(unsupported_extension(&info.format));
+        }
+
+        let stream = self.get_subtitle_stream(&info).await?;
+        if same_format {
             return Ok(stream.into_bytes());
         }
 
@@ -358,7 +423,8 @@ impl<P: SubtitleParser, I: SubtitleIo> SubtitleEncoder<P, I> {
     ///
     /// # Errors
     ///
-    /// Returns an error message if parsing fails or `output_format` has no writer.
+    /// [`MediaEncodingError::InvalidInput`] if parsing fails or `output_format`
+    /// has no writer.
     pub async fn convert_subtitles(
         &self,
         data: &[u8],
@@ -367,7 +433,7 @@ impl<P: SubtitleParser, I: SubtitleIo> SubtitleEncoder<P, I> {
         start_time_ticks: i64,
         end_time_ticks: i64,
         preserve_original_timestamps: bool,
-    ) -> Result<Vec<u8>, String> {
+    ) -> Result<Vec<u8>, MediaEncodingError> {
         let guard = self.locks.get(&input_info.path);
         let _held = guard.lock().await;
 
@@ -380,8 +446,7 @@ impl<P: SubtitleParser, I: SubtitleIo> SubtitleEncoder<P, I> {
             preserve_original_timestamps,
         );
 
-        let writer = Writer::for_format(output_format)
-            .ok_or_else(|| format!("Unsupported format: {output_format}"))?;
+        let writer = Writer::get(output_format)?;
 
         Ok(writer.write(&subtitle).into_bytes())
     }
@@ -415,19 +480,20 @@ impl<P: SubtitleParser, I: SubtitleIo> SubtitleEncoder<P, I> {
     ///
     /// # Errors
     ///
-    /// Returns an error message when the readable file cannot be resolved,
-    /// read or parsed, or its format has no writer (a bitmap track).
+    /// [`MediaEncodingError::NotFound`] when the readable file is missing,
+    /// [`MediaEncodingError::InvalidInput`] when it cannot be parsed or its
+    /// format has no writer (a bitmap track), else the failure resolving or
+    /// reading it.
     pub async fn get_trimmed_subtitles(
         &self,
         media_source: &MediaSourceInfo,
         subtitle_stream: &MediaStream,
         start_time_ticks: i64,
-    ) -> Result<TrimmedSubtitle, String> {
+    ) -> Result<TrimmedSubtitle, MediaEncodingError> {
         let info = self
             .get_readable_file(media_source, subtitle_stream)
             .await?;
-        let writer = Writer::for_format(&info.format)
-            .ok_or_else(|| format!("Unsupported format: {}", info.format))?;
+        let writer = Writer::get(&info.format)?;
         let stream = self.get_subtitle_stream(&info).await?;
 
         let guard = self.locks.get(&info.path);
@@ -458,11 +524,12 @@ impl<P: SubtitleParser, I: SubtitleIo> SubtitleEncoder<P, I> {
     ///
     /// # Errors
     ///
-    /// Returns an error message if the underlying read fails.
+    /// [`MediaEncodingError::NotFound`] when the file is missing, else the
+    /// failed read or HTTP fetch.
     pub async fn get_subtitle_stream(
         &self,
         file_info: &SubtitleInfo,
-    ) -> Result<SubtitleStream, String> {
+    ) -> Result<SubtitleStream, MediaEncodingError> {
         if file_info.is_external && MediaStream::is_text_format(Some(&file_info.format)) {
             let bytes = self.read_bytes(&file_info.path, file_info.protocol).await?;
 
@@ -474,7 +541,11 @@ impl<P: SubtitleParser, I: SubtitleIo> SubtitleEncoder<P, I> {
                 }
             }
         } else {
-            let bytes = self.io.read_file(&file_info.path).await?;
+            let bytes = self
+                .io
+                .read_file(&file_info.path)
+                .await
+                .map_err(|e| read_error(&file_info.path, e))?;
             Ok(SubtitleStream::new(bytes, false))
         }
     }
@@ -524,12 +595,12 @@ impl<P: SubtitleParser, I: SubtitleIo> SubtitleEncoder<P, I> {
     ///
     /// # Errors
     ///
-    /// Returns an error message when the readable file cannot be resolved.
+    /// The [`get_readable_file`](Self::get_readable_file) failure.
     pub async fn get_subtitle_file_path(
         &self,
         media_source: &MediaSourceInfo,
         subtitle_stream: &MediaStream,
-    ) -> Result<String, String> {
+    ) -> Result<String, MediaEncodingError> {
         Ok(self
             .get_readable_file(media_source, subtitle_stream)
             .await?
@@ -547,11 +618,12 @@ impl<P: SubtitleParser, I: SubtitleIo> SubtitleEncoder<P, I> {
     ///
     /// # Errors
     ///
-    /// Returns an error message when the subtitle bytes cannot be read.
+    /// [`MediaEncodingError::NotFound`] when the file is missing, else the
+    /// failed read or HTTP fetch.
     pub async fn get_subtitle_file_character_set(
         &self,
         subtitle_stream: &MediaStream,
-    ) -> Result<String, String> {
+    ) -> Result<String, MediaEncodingError> {
         let path = subtitle_stream.path.clone().unwrap_or_default();
         let protocol = self.io.path_protocol(&path);
         let bytes = self.read_bytes(&path, protocol).await?;
@@ -575,11 +647,18 @@ impl<P: SubtitleParser, I: SubtitleIo> SubtitleEncoder<P, I> {
     }
 
     /// Reads bytes from a path over its protocol (HTTP or local file).
-    async fn read_bytes(&self, path: &str, protocol: MediaProtocol) -> Result<Vec<u8>, String> {
+    async fn read_bytes(
+        &self,
+        path: &str,
+        protocol: MediaProtocol,
+    ) -> Result<Vec<u8>, MediaEncodingError> {
         if protocol == MediaProtocol::Http {
-            self.io.http_get(path).await
+            Ok(self.io.http_get(path).await?)
         } else {
-            self.io.read_file(path).await
+            self.io
+                .read_file(path)
+                .await
+                .map_err(|e| read_error(path, e))
         }
     }
 
@@ -592,13 +671,15 @@ impl<P: SubtitleParser, I: SubtitleIo> SubtitleEncoder<P, I> {
     ///
     /// # Errors
     ///
-    /// Returns an error message when the media source has no subtitle cache or
-    /// ffmpeg conversion fails.
+    /// [`MediaEncodingError::NotFound`] when the media source has no subtitle
+    /// cache (upstream's `ResourceNotFoundException`) or the sidecar to convert
+    /// is missing, [`MediaEncodingError::InvalidInput`] when that sidecar has no
+    /// path, else the failed ffmpeg conversion.
     pub async fn get_readable_file(
         &self,
         media_source: &MediaSourceInfo,
         subtitle_stream: &MediaStream,
-    ) -> Result<SubtitleInfo, String> {
+    ) -> Result<SubtitleInfo, MediaEncodingError> {
         let stream_path = subtitle_stream.path.clone().unwrap_or_default();
 
         if !subtitle_stream.is_external || ends_with_ignore_ascii_case(&stream_path, ".mks") {
@@ -609,10 +690,10 @@ impl<P: SubtitleParser, I: SubtitleIo> SubtitleEncoder<P, I> {
             let output_path = self
                 .subtitle_cache_path(media_source, subtitle_stream.index, &output_file_extension)
                 .ok_or_else(|| {
-                    format!(
+                    MediaEncodingError::NotFound(format!(
                         "MediaSource {} has no subtitle cache (non-GUID Id, e.g. Live TV stream).",
                         media_source.id.clone().unwrap_or_default()
-                    )
+                    ))
                 })?;
 
             return Ok(SubtitleInfo {
@@ -643,10 +724,10 @@ impl<P: SubtitleParser, I: SubtitleIo> SubtitleEncoder<P, I> {
             let output_path = self
                 .subtitle_cache_path(media_source, subtitle_stream.index, "srt")
                 .ok_or_else(|| {
-                    format!(
+                    MediaEncodingError::NotFound(format!(
                         "MediaSource {} has no subtitle cache (non-GUID Id, e.g. Live TV stream).",
                         media_source.id.clone().unwrap_or_default()
-                    )
+                    ))
                 })?;
 
             self.convert_text_subtitle_to_srt(subtitle_stream, &output_path)
@@ -672,7 +753,7 @@ impl<P: SubtitleParser, I: SubtitleIo> SubtitleEncoder<P, I> {
     ///
     /// Port of `SubtitleEncoder.ExtractAllExtractableSubtitles`: the embedded
     /// streams in one ffmpeg run over the video file, then each external
-    /// `.mks` file in its own ([`Self::extract_all_extractable_subtitles_mks`]);
+    /// `.mks` file in its own (`Self::extract_all_extractable_subtitles_mks`);
     /// each output cache path is serialized with the keyed lock. Errors are
     /// swallowed (logged in C#) so a single un-extractable stream cannot abort
     /// the caller.
@@ -923,7 +1004,7 @@ impl<P: SubtitleParser, I: SubtitleIo> SubtitleEncoder<P, I> {
         &self,
         subtitle_stream: &MediaStream,
         output_path: &str,
-    ) -> Result<(), String> {
+    ) -> Result<(), MediaEncodingError> {
         let guard = self.locks.get(output_path);
         let _held = guard.lock().await;
 
@@ -937,7 +1018,9 @@ impl<P: SubtitleParser, I: SubtitleIo> SubtitleEncoder<P, I> {
             return Ok(());
         }
         if input_path.is_empty() {
-            return Err("inputPath is empty".to_owned());
+            return Err(MediaEncodingError::InvalidInput(
+                "inputPath is empty".to_owned(),
+            ));
         }
 
         // Tell ffmpeg the source charset (C# `GetSubtitleFileCharacterSet`), or
@@ -976,9 +1059,9 @@ impl<P: SubtitleParser, I: SubtitleIo> SubtitleEncoder<P, I> {
             }
             _ => {
                 let _ = self.io.delete_file(output_path);
-                Err(format!(
+                Err(MediaEncodingError::Process(format!(
                     "ffmpeg subtitle conversion produced no output for {output_path}"
-                ))
+                )))
             }
         }
     }
@@ -1066,8 +1149,12 @@ pub struct NoopSubtitleIo;
 
 #[async_trait]
 impl SubtitleIo for NoopSubtitleIo {
-    async fn read_file(&self, _path: &str) -> Result<Vec<u8>, String> {
-        Err("no subtitle I/O configured".to_owned())
+    async fn read_file(&self, _path: &str) -> std::io::Result<Vec<u8>> {
+        Err(std::io::Error::other("no subtitle I/O configured"))
+    }
+
+    async fn open_file(&self, _path: &str) -> std::io::Result<()> {
+        Err(std::io::Error::other("no subtitle I/O configured"))
     }
 
     async fn http_get(&self, _url: &str) -> Result<Vec<u8>, String> {
@@ -1165,9 +1252,11 @@ fn detect_charset(bytes: &[u8]) -> DetectedCharset {
         return DetectedCharset::Utf8OrAscii;
     }
 
-    let mut detector = chardetng::EncodingDetector::new();
+    // `Allow` keeps chardetng's pre-1.0 candidate set. It is inert today: 7-bit
+    // ISO-2022-JP is valid UTF-8, so the check above already served it.
+    let mut detector = chardetng::EncodingDetector::new(chardetng::Iso2022JpDetection::Allow);
     detector.feed(bytes, true);
-    let encoding = detector.guess(None, true);
+    let encoding = detector.guess(None, chardetng::Utf8Detection::Allow);
     if encoding == encoding_rs::UTF_8 {
         DetectedCharset::Utf8OrAscii
     } else {

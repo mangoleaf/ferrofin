@@ -36,7 +36,12 @@ At the **outermost layer that still has context** — never also at the origin.
   (`ferrofin-api/src/error.rs`) logs 5xx once. Do **not** add origin logging on request
   paths — that double-logs. A handler panic is logged once by the panic boundary
   (`ferrofin-api/src/panic_boundary.rs`) that answers it `500`, beside the panic hook's
-  own line (rule 7).
+  own line (rule 7). Both mark their responses `FailureLogged`, as do the IP filter's
+  `503` and `RequiredRouteString`'s `500` (`ferrofin-api/src/extract.rs`), and the
+  request span (`record_status` in `ferrofin-api/src/router.rs`) logs `response failed`
+  only for a 5xx without that mark: one passed through from a relayed origin, a plugin
+  or a health check. A new 5xx path that logs its own failure marks its response the
+  same way.
 - **Background paths** (spawned tasks, samplers, schedulers): at the task's own top
   level, with the span active.
 - `let _ =` / `.ok()` on a fallible call is allowed **only** when failure is truly
@@ -103,8 +108,10 @@ line and the stderr tail in its errors filtered (`transcoding::ffmpeg_log`). The
 `-user_agent` and `-referer` values go too. An ordinary file transcode's log stays byte
 for byte. A `.strm` item's media path is its target URL, so whatever names that path does
 the same: subtitle extraction, a failed probe and the `.strm` reader log it through
-`redact_url`, and an error that quotes the input or ffmpeg's arguments (attachment
-extraction, a failed spawn) passes them through `redact_urls_in`.
+`redact_url`, and an error that quotes the input (attachment extraction) passes it through
+`redact_urls_in`. A process runner's error that quotes ffmpeg's or ffprobe's arguments (a
+failed spawn or run, unbalanced quoting) also hides the `-user_agent`, `-referer` and
+`-headers` values (`transcoding::shown_argument_line`).
 
 ## 6. The sinks are fixed
 

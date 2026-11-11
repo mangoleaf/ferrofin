@@ -1,6 +1,6 @@
-# Vendored icu_collator 2.3.1
+# Vendored icu_collator 2.4.0
 
-This is the crates.io `icu_collator` 2.3.1 package with one change. Only its
+This is the crates.io `icu_collator` 2.4.0 package with one change. Only its
 `src/`, `Cargo.toml` and `LICENSE` are vendored; its README, `tests/`,
 `benches/` and packaging metadata are not. The root `Cargo.toml` patches it
 in through `[patch.crates-io]`.
@@ -13,6 +13,10 @@ and prefixes. Korean `search` collation needs it: genrb drops 67 modern Jamo
 entries from that tailoring, and without the fix the root shortcut overrides
 the ones restored in the generated data.
 
+2.4.0 still has the unconditional shortcut (its `src/elements.rs` around line
+1504, `if let Some(&jamo) = self.jamo.get(jamo_index)`), so the change is
+re-applied unchanged.
+
 ## Upstream tests
 
 The upstream suite includes Unicode's CLDR collation conformance files
@@ -24,4 +28,4 @@ the crates.io package back into a scratch copy, then run:
 cargo test --test tests
 ```
 
-Last run on 2026-10-11 with the patch applied: 63 passed, 0 failed.
+Last run on 2026-11-07 with the patch applied: 64 passed, 0 failed.

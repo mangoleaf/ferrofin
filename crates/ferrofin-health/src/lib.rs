@@ -4,7 +4,7 @@
 //! This crate is NEW code (no C# source); it mirrors the whisper-api pattern
 //! (`create_router` + health checkers). It provides:
 //!
-//! - [`HealthChecker`] — an `async` trait (via [`async_trait`](async_trait)) for
+//! - [`HealthChecker`] — an `async` trait (via [`async_trait`]) for
 //!   probing a single dependency: [`check`](HealthChecker::check) +
 //!   [`name`](HealthChecker::name).
 //! - [`FnChecker`] — a helper wrapping an `async` closure as a checker.
@@ -51,6 +51,16 @@ pub use router::{STARTUP_CHECK, health_router, health_routers, startup_router};
 pub fn build_version() -> &'static str {
     env!("FERROFIN_BUILD_VERSION")
 }
+
+/// [`build_version`] without the tag's `v`: `1.5.1`, or `1.5.0-12-gabc123def456`
+/// between tags. The version Ferrofin names itself by in its outbound
+/// `User-Agent`s and backup manifests, as Jellyfin writes `Jellyfin-Server/10.11.8`.
+pub const RELEASE_VERSION: &str = env!("FERROFIN_RELEASE_VERSION");
+
+/// The `User-Agent` Ferrofin's own HTTP requests send, `Ferrofin/1.5.1`: the
+/// product header of Jellyfin's `NamedClient.Default` (`Jellyfin-Server/<version>`),
+/// with [`RELEASE_VERSION`].
+pub const USER_AGENT: &str = concat!("Ferrofin/", env!("FERROFIN_RELEASE_VERSION"));
 
 use utoipa::OpenApi;
 
@@ -110,7 +120,19 @@ fn ready_doc() {}
 mod tests {
     use utoipa::OpenApi;
 
-    use super::HealthApi;
+    use super::{HealthApi, RELEASE_VERSION, USER_AGENT, build_version};
+
+    /// The release version is the build's `git describe` less the tag's `v`.
+    #[test]
+    fn the_user_agent_names_the_build_without_its_tag_v() {
+        assert_eq!(
+            build_version()
+                .strip_prefix('v')
+                .unwrap_or_else(build_version),
+            RELEASE_VERSION
+        );
+        assert_eq!(USER_AGENT, format!("Ferrofin/{RELEASE_VERSION}"));
+    }
 
     #[test]
     fn openapi_spec_has_probe_paths() {

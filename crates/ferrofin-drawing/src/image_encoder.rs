@@ -23,7 +23,7 @@
 //! - `GetImageSize` returns [`ImageDimensions::default`] (`0×0`) on a zero-byte or
 //!   undecodable file, exactly like the Skia `return default;` fallbacks.
 //! - `CreateSplashscreen` builds `{DataPath}/splashscreen.png` (see
-//!   [`crate::splashscreen`]). `GetImageBlurHash` is implemented (decode → 128x128 resize → BlurHash-encode);
+//!   `crate::splashscreen`). `GetImageBlurHash` is implemented (decode → 128x128 resize → BlurHash-encode);
 //!   its output is valid but not byte-identical to Skia's (see the method doc).
 //! - A JPEG headed for a blur hash, a smaller `EncodeImage` output, a collage
 //!   cell or a splashscreen tile is decoded at the smallest DCT scale (1/8,
@@ -36,7 +36,7 @@
 //!   which upstream has no counterpart for. An image they refuse is
 //!   [`ServiceError::InvalidInput`], and the processor serves the original.
 //! - `EncodeImage`'s background colour, blur and foreground layer are drawn
-//!   after the resize ([`composite`]); its unplayed/percent-played indicators
+//!   after the resize (`composite`); its unplayed/percent-played indicators
 //!   are not (gl-806), so a request for one alone is resized and re-encoded
 //!   undecorated.
 
@@ -215,7 +215,7 @@ impl ImageCrateEncoder {
             // every poster several times larger than Jellyfin's — so this branch
             // routes around it.
             //
-            // libwebp cannot write a side over 16383 px. Refused before the RGBA
+            // libwebp cannot write a side over 16383 px. Refused before any
             // copy, and as invalid input like the JPEG limit: it is decided by the
             // input alone and recurs on every request (nothing is cached).
             if image.width() > WEBP_MAX_DIMENSION || image.height() > WEBP_MAX_DIMENSION {
@@ -226,16 +226,32 @@ impl ImageCrateEncoder {
                     image.height()
                 )));
             }
-            let rgba = match image {
-                DynamicImage::ImageRgba8(rgba) => Cow::Borrowed(rgba),
-                other => Cow::Owned(other.to_rgba8()),
+            // RGB8 (every colour JPEG) and RGBA8 go in as they are: libwebp
+            // imports RGB with alpha 0xFF, the input an RGBA copy of it would
+            // give. Any other layout is converted to RGBA first.
+            let converted;
+            let encoder = match image {
+                DynamicImage::ImageRgb8(rgb) => {
+                    webp::Encoder::from_rgb(rgb.as_raw(), rgb.width(), rgb.height())
+                }
+                DynamicImage::ImageRgba8(rgba) => {
+                    webp::Encoder::from_rgba(rgba.as_raw(), rgba.width(), rgba.height())
+                }
+                other => {
+                    converted = other.to_rgba8();
+                    webp::Encoder::from_rgba(
+                        converted.as_raw(),
+                        converted.width(),
+                        converted.height(),
+                    )
+                }
             };
             // Precision loss is irrelevant: quality is clamped to 0..=100.
             #[allow(clippy::cast_precision_loss)]
             let quality = quality.clamp(0, 100) as f32;
             // `encode_simple`, not `encode`: the latter unwraps libwebp's error
             // and panics on any other encode failure.
-            let bytes = webp::Encoder::from_rgba(rgba.as_raw(), rgba.width(), rgba.height())
+            let bytes = encoder
                 .encode_simple(false, quality)
                 .map_err(|code| DrawingError::webp_encode(format!("encode {output_path}"), code))?;
             Ok(bytes.to_vec())
@@ -708,7 +724,8 @@ impl EncodeSource {
     }
 
     /// The image resized with Lanczos3 to the size `target_of` gives for its
-    /// upright size, decoded through [`Self::decode_covering`].
+    /// upright size, decoded through [`Self::decode_covering`]; the decoded
+    /// image itself when `target_of` gives its own size.
     ///
     /// A full decode measures the upright image itself. When it differs from
     /// what the header read planned with (an EXIF orientation stored after the
@@ -729,6 +746,11 @@ impl EncodeSource {
         } else {
             target
         };
+        // At its own size the decoded image is the result: a resize to it
+        // would only copy it whole.
+        if upright == target {
+            return Ok(decoded.image);
+        }
         ImageCrateEncoder::resize_exact(memory, &decoded.image, target)
     }
 }
@@ -1279,11 +1301,11 @@ impl ImageEncoder for ImageCrateEncoder {
     /// upright size. `orientation` is unused: Skia falls back to it only when
     /// the codec cannot open the file, and then has no bitmap to draw either.
     /// The background colour, blur and foreground layer are drawn after the
-    /// resize ([`composite`]); the played/unplayed indicators are not (gl-806).
+    /// resize (`composite`); the played/unplayed indicators are not (gl-806).
     ///
     /// A JPEG is sized from its header and decoded only once the target is
     /// known, at the smallest DCT scale still covering twice it
-    /// ([`THUMBNAIL_DECODE_FACTOR`]); the resize after it is the same Lanczos3
+    /// (`THUMBNAIL_DECODE_FACTOR`); the resize after it is the same Lanczos3
     /// shrink. Upstream decodes in full here
     /// (`SkiaEncoder.Decode`); the output size is the same either way.
     async fn encode_image(
@@ -1338,7 +1360,7 @@ impl ImageEncoder for ImageCrateEncoder {
     /// Port of `CreateImageCollage`. Dispatches on the width/height ratio: a
     /// `>= 1.4` ratio builds a horizontal thumb strip, anything else a `2×2`
     /// square collage. The thumb strip's library-name text is not drawn yet
-    /// (see [`build_thumb_collage`]).
+    /// (see `build_thumb_collage`).
     async fn create_image_collage(
         &self,
         options: &ImageCollageOptions,
@@ -1365,8 +1387,8 @@ impl ImageEncoder for ImageCrateEncoder {
     }
 
     /// Port of `CreateSplashscreen`: builds `{DataPath}/splashscreen.png`
-    /// ([`crate::splashscreen`]) when there is at least one poster and one
-    /// backdrop, and does nothing otherwise. [`Self::write`] lands it whole, so
+    /// (`crate::splashscreen`) when there is at least one poster and one
+    /// backdrop, and does nothing otherwise. `Self::write` lands it whole, so
     /// a reader never sees half a PNG.
     async fn create_splashscreen(
         &self,
@@ -2826,6 +2848,30 @@ mod tests {
         assert!(matches!(err, ServiceError::BackendSource(_)), "{err:?}");
         assert!(err.to_string().contains("libwebp VP8_ENC_ERROR"), "{err}");
         assert!(!Path::new(&out).exists(), "nothing is written");
+    }
+
+    /// gl-1481: an opaque RGB8 image goes into libwebp as it is, and encodes
+    /// to the same bytes as its RGBA copy did, at low, usual and full quality.
+    #[rstest]
+    #[case(0)]
+    #[case(80)]
+    #[case(100)]
+    fn an_rgb_webp_is_byte_identical_to_its_rgba_copy(#[case] quality: i32) {
+        // Truncation is the point: wrap the coordinates into channel values.
+        #[allow(clippy::cast_possible_truncation)]
+        let rgb = image::RgbImage::from_fn(97, 61, |x, y| {
+            image::Rgb([(x * 3) as u8, (y * 5) as u8, ((x + y) * 7) as u8])
+        });
+        let rgba = DynamicImage::ImageRgb8(rgb.clone()).to_rgba8();
+        let encode = |image: DynamicImage| {
+            ImageCrateEncoder::encode(&image, "out.webp", CrateFormat::WebP, quality)
+                .expect("encode")
+        };
+
+        assert_eq!(
+            encode(DynamicImage::ImageRgb8(rgb)),
+            encode(DynamicImage::ImageRgba8(rgba))
+        );
     }
 
     #[tokio::test]

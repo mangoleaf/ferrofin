@@ -68,6 +68,9 @@ FROM ${WEB_IMAGE} AS web
 
 # ── server binary ───────────────────────────────────────────────────────
 FROM rust:1.99.1-trixie AS build
+# cargo-auditable embeds the crate list in the binary (a .dep-v0 section) for `cargo audit bin`
+# and image scanners; release.yml installs the same version. Before COPY, so a rebuild keeps it.
+RUN cargo install --locked cargo-auditable@0.7.7
 WORKDIR /src
 COPY . .
 # .git is excluded from the build context, so bake the release version in from
@@ -75,8 +78,8 @@ COPY . .
 # which ferrofin-health's build.rs treats as unset → crate version fallback).
 ARG SERVICE_VERSION=
 ENV FERROFIN_GIT_DESCRIBE=${SERVICE_VERSION}
-# Strip the container binary while leaving local profiling builds unchanged.
-RUN CARGO_PROFILE_RELEASE_STRIP=symbols cargo build --locked --release -p ferrofin-server
+# Strip the container binary while leaving local profiling builds unchanged (the record survives).
+RUN CARGO_PROFILE_RELEASE_STRIP=symbols cargo auditable build --locked --release -p ferrofin-server
 
 # ── runtime ─────────────────────────────────────────────────────────────
 FROM ${RUNTIME_IMAGE}

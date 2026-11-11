@@ -8,19 +8,20 @@
 //! - `POST /Items/{itemId}/RemoteSearch/Subtitles/{subtitleId}` — download one.
 //! - `GET /Providers/Subtitles/Subtitles/{subtitleId}` — fetch a remote subtitle.
 //!
-//! The delete route is DB-backed and real. Upload / remote search / download /
-//! get drive the un-ported `ISubtitleProvider` registry (deferred); the routes
-//! exist (not `501`) and surface the manager's empty/"not enabled" behaviour so
-//! clients see stable semantics.
+//! Delete, upload, remote search, download and get go through the
+//! [`SubtitleManager`](ferrofin_traits::subtitles::SubtitleManager) seam, which
+//! searches the registered subtitle providers (OpenSubtitles), routes a
+//! download or fetch to the provider the id names, and attaches or removes the
+//! external subtitle.
 //!
-//! On-the-fly subtitle *conversion* is now real: the
+//! On-the-fly subtitle *conversion*: the
 //! `Videos/{itemId}/{container}/Subtitles/{index}/{format}` (with and without a
 //! start-position segment) routes call the
 //! [`SubtitleEncoder`](ferrofin_traits::media_encoding::SubtitleEncoder) seam
 //! (ffmpeg-backed `SubtitleEncoderImpl` at the composition root; the disabled
 //! stub `404`s), and the `subtitles.m3u8` route builds the segment playlist from
 //! the media source's runtime. The `FallbackFont` routes resolve
-//! `EncodingOptions.FallbackFontPath` (via the config seam's new
+//! `EncodingOptions.FallbackFontPath` (via the config seam's
 //! `get_encoding_options`) and enumerate / stream fonts through the
 //! [`FileSystem`](ferrofin_traits::filesystem::FileSystem) seam, on the
 //! blocking pool.
@@ -44,7 +45,7 @@ use uuid::Uuid;
 
 use crate::auth::{RequireAdmin, RequireAuth, RequireSubtitleManagement};
 use crate::error::ApiError;
-use crate::extract::{JsonBody, Query, upload_body_limit};
+use crate::extract::{DotnetGuid, JsonBody, Query, upload_body_limit};
 use crate::handlers::image_upload::decode_base64;
 use crate::handlers::items::resolve_user_opt;
 use crate::handlers::queue_high_priority_refresh;
@@ -132,7 +133,7 @@ async fn require_video(
 async fn delete_subtitle(
     State(state): State<AppState>,
     RequireAdmin(auth): RequireAdmin,
-    Path((item_id, index)): Path<(Uuid, i32)>,
+    Path((DotnetGuid(item_id), index)): Path<(DotnetGuid, i32)>,
 ) -> Result<StatusCode, ApiError> {
     require_item(&state, item_id, &auth).await?;
     state.subtitles.delete_subtitles(item_id, index).await?;
@@ -160,10 +161,10 @@ struct UploadSubtitleDto {
 ///
 /// Port of `SubtitleController.UploadSubtitle`: `404` when the item is missing,
 /// `400` when the `Data` is not valid base64. The decoded bytes are handed to the
-/// [`SubtitleManager`](ferrofin_traits::subtitles::SubtitleManager); with no
-/// subtitle-provider host wired the manager rejects the write (`400`), otherwise
-/// a metadata refresh is queued and `204` returned. Subtitle management is
-/// checked before decoding or writing the upload.
+/// [`SubtitleManager`](ferrofin_traits::subtitles::SubtitleManager), which
+/// attaches them to the item as an external subtitle (the sidecar file and its
+/// stream row); then a metadata refresh is queued and `204` returned. Subtitle
+/// management is checked before decoding or writing the upload.
 #[utoipa::path(
     post,
     path = "/Videos/{itemId}/Subtitles",
@@ -179,7 +180,7 @@ struct UploadSubtitleDto {
 async fn upload_subtitle(
     State(state): State<AppState>,
     RequireSubtitleManagement(auth): RequireSubtitleManagement,
-    Path(item_id): Path<Uuid>,
+    Path(DotnetGuid(item_id)): Path<DotnetGuid>,
     JsonBody(body): JsonBody<UploadSubtitleDto>,
 ) -> Result<StatusCode, ApiError> {
     require_video(&state, item_id, &auth).await?;
@@ -227,7 +228,7 @@ struct RemoteSearchQuery {
 async fn search_remote_subtitles(
     State(state): State<AppState>,
     RequireSubtitleManagement(auth): RequireSubtitleManagement,
-    Path((item_id, language)): Path<(Uuid, String)>,
+    Path((DotnetGuid(item_id), language)): Path<(DotnetGuid, String)>,
     Query(query): Query<RemoteSearchQuery>,
 ) -> Result<Json<Vec<RemoteSubtitleInfo>>, ApiError> {
     require_video(&state, item_id, &auth).await?;
@@ -266,7 +267,7 @@ async fn search_remote_subtitles(
 async fn download_remote_subtitles(
     State(state): State<AppState>,
     RequireSubtitleManagement(auth): RequireSubtitleManagement,
-    Path((item_id, subtitle_id)): Path<(Uuid, String)>,
+    Path((DotnetGuid(item_id), subtitle_id)): Path<(DotnetGuid, String)>,
 ) -> Result<StatusCode, ApiError> {
     require_video(&state, item_id, &auth).await?;
     // The C# logs-and-continues on a provider failure, still returning 204, then
@@ -285,8 +286,9 @@ async fn download_remote_subtitles(
 /// `GET /Providers/Subtitles/Subtitles/{subtitleId}` — fetch a remote subtitle.
 ///
 /// Port of `SubtitleController.GetRemoteSubtitles`: streams the raw subtitle
-/// bytes with a MIME type derived from its format. With no provider host wired
-/// the fetch is rejected (`400`); a provider would yield the file.
+/// bytes with a MIME type derived from its format. The id's provider prefix
+/// picks the registered provider that fetches the file; an id naming no
+/// provider is a `400`.
 #[utoipa::path(
     get,
     path = "/Providers/Subtitles/Subtitles/{subtitleId}",
@@ -507,7 +509,12 @@ async fn serve_graphical_subtitle(
 async fn get_subtitle(
     State(state): State<AppState>,
     axum::Extension(auth): axum::Extension<ferrofin_traits::options::AuthorizationInfo>,
-    Path((item_id, media_source_id, index, route_format)): Path<(Uuid, String, i32, String)>,
+    Path((DotnetGuid(item_id), media_source_id, index, route_format)): Path<(
+        DotnetGuid,
+        String,
+        i32,
+        String,
+    )>,
     Query(query): Query<SubtitleStreamQuery>,
     request: Request,
 ) -> Result<Response, ApiError> {
@@ -554,13 +561,9 @@ async fn get_subtitle(
 async fn get_subtitle_with_ticks(
     State(state): State<AppState>,
     axum::Extension(auth): axum::Extension<ferrofin_traits::options::AuthorizationInfo>,
-    Path((item_id, media_source_id, index, start_position_ticks, route_format)): Path<(
-        Uuid,
-        String,
-        i32,
-        i64,
-        String,
-    )>,
+    Path((DotnetGuid(item_id), media_source_id, index, start_position_ticks, route_format)): Path<
+        (DotnetGuid, String, i32, i64, String),
+    >,
     Query(mut query): Query<SubtitleStreamQuery>,
     request: Request,
 ) -> Result<Response, ApiError> {
@@ -625,7 +628,7 @@ async fn get_subtitle_playlist(
     // The subtitle stream index is part of the URL but does not affect the
     // playlist body (the segments all point at the same `stream.vtt`); the C#
     // suppresses the same unused parameter (CA1801).
-    Path((item_id, media_source_id, _index)): Path<(Uuid, String, i32)>,
+    Path((DotnetGuid(item_id), media_source_id, _index)): Path<(DotnetGuid, String, i32)>,
     Query(query): Query<SubtitlePlaylistQuery>,
     parts: axum::http::request::Parts,
 ) -> Result<Response, ApiError> {

@@ -25,7 +25,7 @@
 //!   which the user manager counts toward lockout when the name signed in
 //!   with is an account's (creation turned off only arises for a name that is
 //!   not). The bind counts as refused only for the result codes that refuse
-//!   credentials ([`REFUSED_BIND`]). A directory that cannot be reached,
+//!   credentials (`REFUSED_BIND`). A directory that cannot be reached,
 //!   times out, fails the bind with another code, refuses the configured bind
 //!   DN, or fails the user search or the admin filter's (a referred server
 //!   failing it, a referral loop and the referral budget included) is a
@@ -816,7 +816,7 @@ impl AuthenticationManager for LdapAuthProvider {
 
     /// `ChangePassword`: finds the user's entry by their name as sign-in does
     /// (`LocateLdapUser`), then, on a connection of its own bound as the bind
-    /// DN, writes the new password to it ([`set_password`]). The bind DN must
+    /// DN, writes the new password to it (`set_password`). The bind DN must
     /// be allowed to set users' passwords.
     ///
     /// Refused before any connection while `AllowPassChange` is off

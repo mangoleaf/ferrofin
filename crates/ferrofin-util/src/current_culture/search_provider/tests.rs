@@ -48,6 +48,36 @@ fn public_search_comparer_matches_the_full_dotnet_pair_oracle() {
     }
 }
 
+/// CLDR 49 (CLDR-19476, in the ICU 79.1rc export) suppresses the L/l + MIDDLE DOT
+/// contraction in root search collation, so a middle dot after `l` weighs as punctuation and
+/// `l·l` sorts before `ll`. Catalan search keeps its own contraction, and standard collation is
+/// untouched. .NET on ICU 78 or older, Jellyfin 12.4's image included (ICU 76), still answers
+/// "after" (+1) in every row; the owner accepted the search-culture change on 2026-11-07.
+#[rstest::rstest]
+#[case::root_search("root_search", -1)]
+#[case::english_search("en-US_search", -1)]
+#[case::spanish_search("es-ES-u-co-search", -1)]
+#[case::catalan_search("ca-ES-u-co-search", 1)]
+#[case::catalan("ca-ES", 1)]
+#[case::invariant("und", 1)]
+fn middle_dot_after_l_contracts_only_where_cldr_49_keeps_it(
+    #[case] culture: &str,
+    #[case] expected: i8,
+) {
+    let comparer = comparer(culture).unwrap();
+    for (left, right) in [
+        ("l\u{b7}l", "ll"),
+        ("L\u{b7}L", "LL"),
+        ("col\u{b7}legi", "collegi"),
+    ] {
+        assert_eq!(
+            sign(comparer.compare(left, right)),
+            expected,
+            "culture {culture:?}, operands {left:?} and {right:?}"
+        );
+    }
+}
+
 fn canonical_syllable(character: char) -> String {
     let offset = u32::from(character) - 0xac00;
     let mut result = String::new();

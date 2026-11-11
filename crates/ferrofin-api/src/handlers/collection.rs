@@ -13,7 +13,7 @@
 //! `401`, a caller without the permission `403`). Item id
 //! lists arrive as the comma-delimited `ids` query parameter (Jellyfin's
 //! `CommaDelimitedCollectionModelBinder`) and are split via
-//! [`parse_csv_uuids`](crate::handlers::query_parse::parse_csv_uuids). The work
+//! `parse_csv_uuids`. The work
 //! is delegated to the [`CollectionManager`](ferrofin_traits::collections::CollectionManager)
 //! seam on [`AppState`].
 
@@ -27,7 +27,7 @@ use uuid::Uuid;
 
 use crate::auth::RequireCollectionManagement;
 use crate::error::ApiError;
-use crate::extract::Query;
+use crate::extract::{DotnetGuid, Query};
 use crate::handlers::query_parse::parse_csv_uuids;
 use crate::state::AppState;
 
@@ -87,7 +87,6 @@ async fn create_collection(
         name: query.name.unwrap_or_default(),
         parent_id: query.parent_id,
         is_locked: query.is_locked,
-        provider_ids: std::collections::HashMap::new(),
         item_id_list,
         user_ids,
     };
@@ -110,7 +109,7 @@ async fn create_collection(
 async fn add_to_collection(
     State(state): State<AppState>,
     RequireCollectionManagement(_auth): RequireCollectionManagement,
-    Path(collection_id): Path<Uuid>,
+    Path(DotnetGuid(collection_id)): Path<DotnetGuid>,
     Query(query): Query<CollectionItemsQuery>,
 ) -> Result<StatusCode, ApiError> {
     let ids = parse_csv_uuids(query.ids.as_deref())?;
@@ -134,7 +133,7 @@ async fn add_to_collection(
 async fn remove_from_collection(
     State(state): State<AppState>,
     RequireCollectionManagement(_auth): RequireCollectionManagement,
-    Path(collection_id): Path<Uuid>,
+    Path(DotnetGuid(collection_id)): Path<DotnetGuid>,
     Query(query): Query<CollectionItemsQuery>,
 ) -> Result<StatusCode, ApiError> {
     let ids = parse_csv_uuids(query.ids.as_deref())?;

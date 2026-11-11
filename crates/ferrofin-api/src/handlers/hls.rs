@@ -2,7 +2,7 @@
 //! `VideosController` / `UniversalAudioController` — the live HLS/transcode routes.
 //!
 //! These wire the now-real transcode runtime + `ferrofin-hls` playlist generator to
-//! the HTTP surface, entirely through the [`HlsStreamManager`] seam
+//! the HTTP surface, entirely through the `HlsStreamManager` seam
 //! (`ferrofin-traits`). The heavyweight `StreamState`/arg-building/ffmpeg-spawn
 //! machinery lives in the implementation crate (`ferrofin-mediaencoding`); every
 //! handler here only:
@@ -27,7 +27,7 @@
 //!
 //! The transcode branch of `/Videos|Audio/{id}/stream[.{container}]` and
 //! `/Audio/{id}/universal` is folded into the direct-play handlers
-//! (`videos`/`audio`), which call [`HlsStreamManager::transcode_stream`] for a
+//! (`videos`/`audio`), which call `HlsStreamManager::transcode_stream` for a
 //! request that is not `Static=true`, a static video request for a disc
 //! folder, and a universal request with no direct-playable source.
 
@@ -42,8 +42,8 @@ use uuid::Uuid;
 
 use crate::auth::RequireAuth;
 use crate::error::ApiError;
-use crate::extract::Query;
-use crate::handlers::streaming::require_streamable_item;
+use crate::extract::{DotnetGuid, Query};
+use crate::handlers::streaming::{opened_file_response, require_streamable_item};
 use crate::state::AppState;
 
 /// The MIME type for an HLS playlist (`.m3u8`), matching Jellyfin's
@@ -726,7 +726,7 @@ async fn require_query_item(
 async fn get_video_master_playlist(
     State(state): State<AppState>,
     RequireAuth(auth): RequireAuth,
-    Path(item_id): Path<Uuid>,
+    Path(DotnetGuid(item_id)): Path<DotnetGuid>,
     Query(query): Query<HlsQuery>,
     RawQuery(raw): RawQuery,
     parts: axum::http::request::Parts,
@@ -742,7 +742,7 @@ async fn get_video_master_playlist(
 async fn get_video_variant_playlist(
     State(state): State<AppState>,
     RequireAuth(auth): RequireAuth,
-    Path(item_id): Path<Uuid>,
+    Path(DotnetGuid(item_id)): Path<DotnetGuid>,
     Query(query): Query<HlsQuery>,
     RawQuery(raw): RawQuery,
     parts: axum::http::request::Parts,
@@ -758,7 +758,7 @@ async fn get_video_variant_playlist(
 async fn get_video_live_playlist(
     State(state): State<AppState>,
     RequireAuth(auth): RequireAuth,
-    Path(item_id): Path<Uuid>,
+    Path(DotnetGuid(item_id)): Path<DotnetGuid>,
     Query(query): Query<HlsQuery>,
     RawQuery(raw): RawQuery,
     parts: axum::http::request::Parts,
@@ -775,7 +775,7 @@ async fn get_video_live_playlist(
 async fn get_audio_master_playlist(
     State(state): State<AppState>,
     RequireAuth(auth): RequireAuth,
-    Path(item_id): Path<Uuid>,
+    Path(DotnetGuid(item_id)): Path<DotnetGuid>,
     Query(query): Query<HlsQuery>,
     RawQuery(raw): RawQuery,
     parts: axum::http::request::Parts,
@@ -791,7 +791,7 @@ async fn get_audio_master_playlist(
 async fn get_audio_variant_playlist(
     State(state): State<AppState>,
     RequireAuth(auth): RequireAuth,
-    Path(item_id): Path<Uuid>,
+    Path(DotnetGuid(item_id)): Path<DotnetGuid>,
     Query(query): Query<HlsQuery>,
     RawQuery(raw): RawQuery,
     parts: axum::http::request::Parts,
@@ -827,7 +827,7 @@ pub(super) fn parse_segment_index(segment_id: &str) -> Result<i32, ApiError> {
 async fn get_video_hls_segment(
     State(state): State<AppState>,
     RequireAuth(auth): RequireAuth,
-    Path((item_id, _playlist_id, segment_id)): Path<(Uuid, String, String)>,
+    Path((DotnetGuid(item_id), _playlist_id, segment_id)): Path<(DotnetGuid, String, String)>,
     Query(query): Query<HlsQuery>,
     RawQuery(raw): RawQuery,
     request: Request,
@@ -847,7 +847,7 @@ async fn get_video_hls_segment(
 async fn get_audio_hls_segment(
     State(state): State<AppState>,
     RequireAuth(auth): RequireAuth,
-    Path((item_id, _playlist_id, segment_id)): Path<(Uuid, String, String)>,
+    Path((DotnetGuid(item_id), _playlist_id, segment_id)): Path<(DotnetGuid, String, String)>,
     Query(query): Query<HlsQuery>,
     RawQuery(raw): RawQuery,
     request: Request,
@@ -883,6 +883,7 @@ fn path_extension(uri_path: &str) -> String {
 /// cache; `400` on a traversal/miss (mapped from [`ServiceError::InvalidInput`]).
 async fn get_hls_video_segment_legacy(
     State(state): State<AppState>,
+    // Upstream binds an unused `string itemId` here, not a `Guid`: kept on `Uuid`.
     Path((_item_id, _playlist_id, segment_id)): Path<(Uuid, String, String)>,
     request: Request,
 ) -> Result<Response, ApiError> {
@@ -903,6 +904,7 @@ async fn get_hls_video_segment_legacy(
 async fn get_hls_playlist_legacy(
     State(state): State<AppState>,
     RequireAuth(_auth): RequireAuth,
+    // Upstream binds an unused `string itemId` here, not a `Guid`: kept on `Uuid`.
     Path((_item_id, playlist_id)): Path<(Uuid, String)>,
     request: Request,
 ) -> Result<Response, ApiError> {
@@ -918,6 +920,7 @@ async fn get_hls_playlist_legacy(
 /// segment serve (`HlsSegmentController.GetHlsAudioSegmentLegacy`).
 async fn get_hls_audio_segment_legacy(
     State(state): State<AppState>,
+    // Upstream binds an unused `string itemId` here, not a `Guid`: kept on `Uuid`.
     Path((_item_id, segment_id)): Path<(Uuid, String)>,
     request: Request,
 ) -> Result<Response, ApiError> {
@@ -964,12 +967,13 @@ async fn stop_encoding_process(
 ///
 /// Port of `VideoAttachmentsController.GetAttachment`: resolves the item, extracts
 /// attachment `index` from `mediaSourceId` via the [`AttachmentExtractor`], and
-/// returns its bytes with the attachment's MIME type (default
-/// `application/octet-stream`). A missing item/attachment is `404`.
+/// streams the cached file with the attachment's MIME type (default
+/// `application/octet-stream`), as its `FileStreamResult` does. A missing
+/// item/attachment is `404`.
 async fn get_video_attachment(
     State(state): State<AppState>,
     axum::Extension(auth): axum::Extension<ferrofin_traits::options::AuthorizationInfo>,
-    Path((video_id, media_source_id, index)): Path<(Uuid, String, i32)>,
+    Path((DotnetGuid(video_id), media_source_id, index)): Path<(DotnetGuid, String, i32)>,
     parts: axum::http::request::Parts,
 ) -> Result<Response, ApiError> {
     // No token on a font URL: anonymous, as upstream.
@@ -989,16 +993,15 @@ async fn get_video_attachment(
         .attachments
         .get_attachment(video_id, &media_source_id, index)
         .await?;
+    // A type no header can carry falls back as a missing one does. Upstream's
+    // `FileStreamResult` parses it (`MediaTypeHeaderValue.Parse`) and answers
+    // 500 for one it refuses (Jellyfin bug not ported).
     let mime = extracted
         .attachment
         .mime_type
-        .filter(|m| !m.trim().is_empty())
+        .filter(|m| !m.trim().is_empty() && header::HeaderValue::from_str(m).is_ok())
         .unwrap_or_else(|| "application/octet-stream".to_owned());
-    let mut response = (StatusCode::OK, Body::from(extracted.data)).into_response();
-    if let Ok(value) = header::HeaderValue::from_str(&mime) {
-        response.headers_mut().insert(header::CONTENT_TYPE, value);
-    }
-    Ok(response)
+    opened_file_response(extracted.file, &mime)
 }
 
 /// Registers this controller's real routes onto `router`.

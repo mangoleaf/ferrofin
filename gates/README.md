@@ -10,6 +10,9 @@ own README defines its numbers:
 | [`parity/`](parity/README.md) | Do Jellyfin and Ferrofin answer jellyfin-web's requests alike? | the benchmark corpus, prepared for Jellyfin |
 | [`bench/`](bench/README.md) | How fast, and how much memory, against Jellyfin or the previous release? | the benchmark corpus; idle cores |
 
+[`gates/supply-chain/`](supply-chain) is not a gate. It is cargo-vet's store (`config.toml`, `audits.toml`,
+`imports.lock`), which CI's `vet` job reads and `gates/run` never runs.
+
 ## The output root
 
 Everything a gate creates goes under one directory, `FERROFIN_GATES_DIR`: an absolute path on a local

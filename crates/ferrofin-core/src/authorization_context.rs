@@ -24,7 +24,7 @@
 //! - the C# per-request `HttpContext.Items["AuthorizationInfo"]` cache is dropped
 //!   (the HTTP layer, Wave 7, may cache the resolved value itself);
 //! - token freshness bookkeeping is preserved: a device seen more than
-//!   [`DEVICE_ACTIVITY_REFRESH_MINUTES`] ago, or reporting a changed
+//!   `DEVICE_ACTIVITY_REFRESH_MINUTES` ago, or reporting a changed
 //!   device-name/app-version, has its row updated (skipping cast receivers,
 //!   matching upstream `allowTokenInfoUpdate`).
 
@@ -1536,8 +1536,8 @@ mod tests {
         let fresh_request = header_request("Authorization", r#"MediaBrowser Token="fresh-tok""#);
         let info = ctx.get_authorization_info(&fresh_request).await.unwrap();
         assert!(!info.is_authenticated);
-        let mut fresh = devices
-            .get_device_by_access_token("dev-tok")
+        let mut fresh = ctx
+            .device_by_token("dev-tok")
             .await
             .expect("token lookup")
             .expect("seeded device");
@@ -1565,8 +1565,8 @@ mod tests {
         let ctx = context(db.clone()).with_auth_cache(Arc::clone(&cache));
         let devices = crate::device_manager::FerrofinDeviceManager::new(db.clone())
             .with_auth_cache(Arc::clone(&cache));
-        let mut other = devices
-            .get_device_by_access_token("dev-tok")
+        let mut other = ctx
+            .device_by_token("dev-tok")
             .await
             .expect("token lookup")
             .expect("seeded device");
@@ -1585,8 +1585,8 @@ mod tests {
         }
         assert_eq!(cache.len(), 2);
 
-        let device = devices
-            .get_device_by_access_token("dev-tok")
+        let device = ctx
+            .device_by_token("dev-tok")
             .await
             .expect("token lookup")
             .expect("seeded device");
@@ -1626,8 +1626,8 @@ mod tests {
         let ctx = context(db.clone()).with_auth_cache(Arc::clone(&cache));
         let devices = crate::device_manager::FerrofinDeviceManager::new(db.clone())
             .with_auth_cache(Arc::clone(&cache));
-        let device = devices
-            .get_device_by_access_token("dev-tok")
+        let device = ctx
+            .device_by_token("dev-tok")
             .await
             .expect("token lookup")
             .expect("seeded device");

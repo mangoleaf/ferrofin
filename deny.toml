@@ -1,5 +1,6 @@
-# cargo-deny: the supply-chain gate. CI's `dependencies` job runs `cargo deny --locked check`
-# on every push and PR, and release.yml re-checks the advisories before it tags a release.
+# cargo-deny: the supply-chain gate. CI's `dependencies` job (GitHub and GitLab) runs `cargo deny --locked check`
+# on every push and PR, for the workspace and for the workspace-excluded examples/wasm-hello guest (its own
+# Cargo.lock, same policy), and release.yml re-checks the workspace's advisories before it tags a release.
 # What to do when it fails is in CONTRIBUTING.md, "Dependencies".
 
 [graph]
@@ -8,16 +9,26 @@ all-features = true
 
 [advisories]
 # Every RustSec advisory against a crate the workspace builds fails the gate: vulnerabilities,
-# and the unmaintained and unsound notices of transitive crates too (a yanked version only
-# warns). Cargo.lock also records optional crates no feature turns on (quinn, for reqwest's
-# unused HTTP/3); the gate does not see those, so keep them patched with `cargo update` too.
-# An entry here needs a reason, and goes once its crate is upgraded or dropped.
+# and the unmaintained and unsound notices of transitive crates too. So does a version its
+# publisher yanked from crates.io. Cargo.lock also records optional crates no feature turns on
+# (quinn, for reqwest's unused HTTP/3); the gate does not see those, so keep them patched with
+# `cargo update` too. An entry here needs a reason, and goes once its crate is upgraded or dropped.
 unmaintained = "all"
 unsound = "all"
+yanked = "deny"
 ignore = [
     # A proc-macro lofty (tag and lyrics reading) builds with; every 0.25 release, 0.25.5
     # included, depends on it. Not a vulnerability, and no code of it ships in the binary.
     { id = "RUSTSEC-2024-0436", reason = "paste: unmaintained proc-macro of lofty 0.25, no fixed release" },
+    # Bundled SQLite before 3.54 can return uninitialized page-cache memory when it opens a
+    # database with a `-wal` file a less trusted party wrote. The fix, libsqlite3-sys 0.39, is
+    # out of reach: sqlx-sqlite 0.9.0, still the latest sqlx, requires `<0.38.0`. Ferrofin opens
+    # only the database in its data directory (its own, or the Jellyfin one the operator
+    # adopts), and only Ferrofin, the operator and an administrator write a `-wal` there: a
+    # restore is for administrators only and reads only the server's own backups folder, which
+    # only an administrator's backup or the operator fills. Remove this once a sqlx release
+    # allows libsqlite3-sys 0.39 and the workspace moves to it.
+    { id = "RUSTSEC-2026-0459", reason = "libsqlite3-sys: fixed in 0.39, which sqlx 0.9 cannot take; no untrusted -wal is opened" },
 ]
 
 [licenses]

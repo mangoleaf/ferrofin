@@ -2,13 +2,13 @@
 //!
 //! Ports Jellyfin's `SyncPlayController`. Group lifecycle (`New`/`Join`/`Leave`/
 //! `List`/`{id}`) and the 17 playback requests all resolve the caller's session
-//! ([`sync_play_session`]) and drive the real [`SyncPlayManager`], which mutates
+//! (`sync_play_session`) and drive the real [`SyncPlayManager`], which mutates
 //! live group state and pushes `SyncPlayCommand`/`SyncPlayGroupUpdate` messages
 //! to member sockets via the session message bus.
 //!
 //! Every route is gated by the user's `SyncPlayAccess` policy first — the C#
 //! `[Authorize(Policy = Policies.SyncPlay*)]` attributes, which land here as
-//! [`require_access`] because Ferrofin has no attribute-driven policy layer.
+//! `require_access` because Ferrofin has no attribute-driven policy layer.
 //!
 //! The manager is wired at the composition root
 //! ([`AppState::with_sync_play`](crate::state::AppState::with_sync_play)); until
@@ -38,7 +38,7 @@ use uuid::Uuid;
 
 use crate::auth::RequireAuth;
 use crate::error::ApiError;
-use crate::extract::{JsonBody, ProblemDetails};
+use crate::extract::{DotnetGuid, JsonBody, ProblemDetails};
 use crate::handlers::items::{resolve_user_opt, user_uuid};
 use crate::handlers::session_ctx::current_session;
 use crate::state::AppState;
@@ -274,7 +274,7 @@ async fn list_groups(
 async fn get_group(
     RequireAuth(auth): RequireAuth,
     State(state): State<AppState>,
-    Path(group_id): Path<Uuid>,
+    Path(DotnetGuid(group_id)): Path<DotnetGuid>,
 ) -> Result<Json<GroupInfoDto>, ApiError> {
     require_access(&state, &auth, SyncPlayAccess::JoinGroup).await?;
     let mgr = manager(&state)?;

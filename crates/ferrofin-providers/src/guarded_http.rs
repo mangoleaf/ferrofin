@@ -422,9 +422,8 @@ mod tests {
         use std::sync::atomic::{AtomicUsize, Ordering};
         use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("bind");
+        // Held on `::1` too, which `localhost` tries first (gl-1387).
+        let (listener, _ipv6) = crate::mock_http::loopback_listener().await;
         let port = listener.local_addr().expect("address").port();
         let connections = std::sync::Arc::new(AtomicUsize::new(0));
         let server = tokio::spawn({

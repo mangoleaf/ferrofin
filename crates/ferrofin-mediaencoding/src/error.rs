@@ -2,20 +2,23 @@
 //!
 //! The media-encoding traits in `ferrofin-traits` (`MediaEncoder`,
 //! `SubtitleEncoder`, `AttachmentExtractor`, `TrickplayFrameExtractor`, …) return
-//! [`ServiceError`](ferrofin_traits::error::ServiceError), so the public methods
+//! [`ServiceError`], so the public methods
 //! ultimately hand one back. Internally, the genuine *infrastructure* failures —
 //! a filesystem read/create, an ffprobe JSON parse, or an ffmpeg/ffprobe
 //! subprocess invocation — are carried as this typed [`MediaEncodingError`]
 //! instead of being flattened into `ServiceError::Backend(String)`. Converting
 //! via [`From`] boxes the typed error into
-//! [`ServiceError::BackendSource`](ferrofin_traits::error::ServiceError::BackendSource),
+//! [`ServiceError::BackendSource`],
 //! so an underlying [`std::io::Error`] / [`serde_json::Error`] stays reachable
 //! through [`Error::source`](std::error::Error::source) for logging and tests.
 //!
 //! Pure *semantic* failures (empty id → `400`, missing media source → `404`, an
 //! unsupported attachment → `404`) carry no source chain and are still
-//! constructed directly as the matching `ServiceError` variant at the call site —
-//! wrapping them here would only obscure the HTTP status they must map to.
+//! constructed directly as the matching `ServiceError` variant at the call site.
+//! The subtitle encoder, below the service layer, reports its own as
+//! [`NotFound`](MediaEncodingError::NotFound) and
+//! [`InvalidInput`](MediaEncodingError::InvalidInput), which [`From`] maps to the
+//! matching variant, never to a `500`.
 //!
 //! The [`Process`](MediaEncodingError::Process) variant is the exception to
 //! source-preservation: the `Transcoder` / ffmpeg seam methods return
@@ -27,10 +30,13 @@
 use ferrofin_traits::error::ServiceError;
 use thiserror::Error;
 
-/// A backend/infrastructure failure raised inside `ferrofin-mediaencoding` while
-/// touching the filesystem, parsing ffprobe output, or driving an ffmpeg process.
+/// A failure raised inside `ferrofin-mediaencoding` while touching the
+/// filesystem, parsing ffprobe output, or driving an ffmpeg process.
 ///
-/// Every variant maps to `ServiceError::BackendSource` (HTTP `500`). The typed
+/// [`NotFound`](Self::NotFound) and [`InvalidInput`](Self::InvalidInput) are the
+/// `404` and `400` a seam below the service layer reports (the subtitle
+/// encoder's `FileNotFoundException` and `ArgumentException`); every other
+/// variant maps to `ServiceError::BackendSource` (HTTP `500`). The typed
 /// variants keep their underlying cause as the
 /// [`source`](std::error::Error::source); [`Process`](Self::Process) carries the
 /// already-stringified process failure message.
@@ -64,6 +70,24 @@ pub enum MediaEncodingError {
     /// no `Error` object to keep as a `source()`; the message is carried as-is.
     #[error("{0}")]
     Process(String),
+
+    /// What was asked for does not exist: a file gone from disk, or a media
+    /// source with no subtitle cache. Maps to `ServiceError::NotFound` (`404`).
+    #[error("{0}")]
+    NotFound(String),
+
+    /// The request cannot be served as asked: a subtitle format with no writer
+    /// or parser, or a file with no cues. Maps to `ServiceError::InvalidInput`
+    /// (`400`).
+    #[error("{0}")]
+    InvalidInput(String),
+}
+
+/// A seam's stringified failure, as [`MediaEncodingError::Process`].
+impl From<String> for MediaEncodingError {
+    fn from(message: String) -> Self {
+        Self::Process(message)
+    }
 }
 
 impl MediaEncodingError {
@@ -89,9 +113,13 @@ impl MediaEncodingError {
 
 impl From<MediaEncodingError> for ServiceError {
     fn from(err: MediaEncodingError) -> Self {
-        // Every variant is an infrastructure failure (HTTP 500); box it so the
-        // io/JSON cause survives as a `source()` chain where one exists.
-        Self::backend_source(err)
+        match err {
+            MediaEncodingError::NotFound(what) => Self::not_found(what),
+            MediaEncodingError::InvalidInput(why) => Self::invalid_input(why),
+            // An infrastructure failure (HTTP 500); box it so the io/JSON
+            // cause survives as a `source()` chain where one exists.
+            err => Self::backend_source(err),
+        }
     }
 }
 
@@ -147,5 +175,19 @@ mod tests {
         assert_eq!(svc.to_string(), "ffmpeg spawn failed: No such file");
         // …but the stringified process failure has no further `source()`.
         assert!(svc.source().is_none());
+    }
+
+    #[test]
+    fn not_found_and_invalid_input_keep_their_status() {
+        let svc: ServiceError = MediaEncodingError::NotFound("gone".to_owned()).into();
+        assert!(
+            matches!(svc, ServiceError::NotFound(ref m) if m == "gone"),
+            "{svc:?}"
+        );
+        let svc: ServiceError = MediaEncodingError::InvalidInput("bad".to_owned()).into();
+        assert!(
+            matches!(svc, ServiceError::InvalidInput(ref m) if m == "bad"),
+            "{svc:?}"
+        );
     }
 }

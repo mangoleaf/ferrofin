@@ -40,7 +40,7 @@ const COPY_BUFFER_BYTES: usize = 81_920;
 ///
 /// Port of `ProgressiveFileStream`'s `Task.Delay(50)` — the recorder reads the
 /// live-stream buffer through the same tail-follow as an HTTP consumer.
-const COPY_POLL_MS: u64 = 50;
+pub(crate) const COPY_POLL_MS: u64 = 50;
 
 /// How long the recorder tolerates a source that stops producing before it
 /// gives up on the recording, in milliseconds.
@@ -155,13 +155,6 @@ impl TimerRecordingInfo {
     pub fn recording_end_date(&self) -> DateTime<Utc> {
         self.end_date + chrono::Duration::seconds(i64::from(self.post_padding_seconds))
     }
-
-    /// The instant the capture starts: the programme's start minus its
-    /// pre-padding (C# `item.StartDate.AddSeconds(-item.PrePaddingSeconds)`).
-    #[must_use]
-    pub fn recording_start_date(&self) -> DateTime<Utc> {
-        self.start_date - chrono::Duration::seconds(i64::from(self.pre_padding_seconds))
-    }
 }
 
 /// A recording currently being captured.
@@ -172,8 +165,6 @@ impl TimerRecordingInfo {
 pub struct ActiveRecording {
     /// The firing timer's id — the key both upstream and Ferrofin use.
     pub timer_id: String,
-    /// The `FerrofinLiveTvRecordings` row this capture is filling.
-    pub recording_id: Uuid,
     /// The file being written.
     pub path: PathBuf,
     /// When the capture started.
@@ -185,10 +176,9 @@ pub struct ActiveRecording {
 impl ActiveRecording {
     /// Registers a new capture with a fresh cancellation flag.
     #[must_use]
-    pub fn new(timer_id: String, recording_id: Uuid, path: PathBuf) -> Self {
+    pub fn new(timer_id: String, path: PathBuf) -> Self {
         Self {
             timer_id,
-            recording_id,
             path,
             started_at: Utc::now(),
             cancel: Arc::new(AtomicBool::new(false)),
@@ -518,16 +508,35 @@ pub async fn record_encoded(
         tokio::time::sleep(Duration::from_millis(COPY_POLL_MS)).await;
     }
 
-    // Ask ffmpeg to finish the file it is writing, then insist.
+    // `EncodedRecorder.Stop`: ask ffmpeg to finish the file it is writing,
+    // then insist, logging each step that fails.
+    let path = target.display();
+    tracing::info!(%path, "live tv: stopping the recording process");
     if let Some(mut stdin) = child.stdin.take() {
-        let _ = stdin.write_all(b"q\n").await;
-        let _ = stdin.flush().await;
+        let asked = async {
+            stdin.write_all(b"q\n").await?;
+            stdin.flush().await
+        };
+        if let Err(error) = asked.await {
+            tracing::warn!(%path, %error, "live tv: could not ask the recording process to stop");
+        }
     }
     match tokio::time::timeout(Duration::from_secs(10), child.wait()).await {
-        Ok(Ok(status)) => tracing::info!(?status, "live tv: the recording process stopped"),
-        _ => {
-            let _ = child.kill().await;
+        Ok(Ok(status)) => {
+            tracing::info!(%path, ?status, "live tv: the recording process stopped");
+            return Ok(());
         }
+        Ok(Err(error)) => tracing::warn!(
+            %path,
+            %error,
+            "live tv: could not wait for the recording process to exit"
+        ),
+        Err(_) => {}
+    }
+    tracing::info!(%path, "live tv: killing the recording process");
+    if let Err(error) = child.kill().await {
+        // The process may still be writing the recording.
+        tracing::error!(%path, %error, "live tv: could not kill the recording process");
     }
     Ok(())
 }
@@ -951,17 +960,13 @@ mod tests {
         );
         // Another timer already recording to it counts too; this timer's own
         // in-flight path does not.
-        let taken = ActiveRecording::new("t2".to_owned(), uuid::Uuid::nil(), path);
+        let taken = ActiveRecording::new("t2".to_owned(), path);
         let free = dir.path().join("Other.ts");
         assert_eq!(
             ensure_file_unique(
                 &free,
                 "t1",
-                &[ActiveRecording::new(
-                    "t2".to_owned(),
-                    uuid::Uuid::nil(),
-                    free.clone()
-                )]
+                &[ActiveRecording::new("t2".to_owned(), free.clone())]
             ),
             dir.path().join("Other - 1.ts")
         );
@@ -1022,6 +1027,140 @@ mod tests {
         assert!(line.contains("-codec:a:0 copy"), "{line}");
         assert!(line.contains("-sn"), "{line}");
         assert!(line.ends_with("/rec/out.ts"), "{line}");
+    }
+
+    /// A stand-in ffmpeg in `dir` that runs the shell `script`.
+    #[cfg(unix)]
+    fn stand_in_ffmpeg(dir: &Path, script: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt as _;
+        let ffmpeg = dir.join("ffmpeg");
+        std::fs::write(&ffmpeg, format!("#!/bin/sh\n{script}")).expect("script");
+        std::fs::set_permissions(&ffmpeg, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        ffmpeg
+    }
+
+    /// Captures this thread's log lines in `log` until the guard drops.
+    #[cfg(unix)]
+    fn capture_logs(log: &Path) -> tracing::subscriber::DefaultGuard {
+        tracing::subscriber::set_default(
+            tracing_subscriber::fmt()
+                .with_ansi(false)
+                .with_writer(std::fs::File::create(log).expect("log"))
+                .finish(),
+        )
+    }
+
+    /// The input every stand-in recording reads (the stand-ins ignore it).
+    #[cfg(unix)]
+    fn tuner_input() -> RecordingInput {
+        RecordingInput::Url {
+            url: "http://tuner/live".to_owned(),
+            headers: std::collections::HashMap::new(),
+        }
+    }
+
+    /// `EncodedRecorder.Stop`: a process that quits on `q` stops cleanly with
+    /// no warning and no kill; one that cannot be sent `q` is killed, and both
+    /// steps are logged.
+    ///
+    /// One test, so both stand-ins are written before either is spawned: a
+    /// parallel test forking while a script is still open for writing would
+    /// make its exec fail with `ETXTBSY` under `cargo test`.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_recording_stop_logs_each_step_and_kills_only_a_stuck_process() {
+        use super::record_encoded;
+        let dir = tempfile::tempdir().expect("temp dir");
+        let quits = dir.path().join("quits");
+        std::fs::create_dir(&quits).expect("dir");
+        let quits = stand_in_ffmpeg(&quits, "read -r _\nexit 0\n");
+        let ready = dir.path().join("ready");
+        // It closes its stdin, so `q` cannot reach it, and never exits by itself.
+        let stuck = stand_in_ffmpeg(
+            dir.path(),
+            &format!("exec 0<&-\n: > '{}'\nexec sleep 600\n", ready.display()),
+        );
+        let source = MediaSourceInfo::default();
+        let input = tuner_input();
+
+        let log = dir.path().join("clean.log");
+        let target = dir.path().join("rec").join("clean.ts");
+        {
+            let _logs = capture_logs(&log);
+            record_encoded(
+                quits.to_str().expect("utf-8"),
+                &source,
+                &input,
+                &target,
+                std::time::Duration::from_secs(3600),
+                &AtomicBool::new(true),
+            )
+            .await
+            .expect("record");
+        }
+        let text = std::fs::read_to_string(&log).expect("log");
+        let path = target.display().to_string();
+        for message in [
+            "stopping the recording process",
+            "the recording process stopped",
+        ] {
+            assert!(
+                text.lines()
+                    .any(|l| l.contains("INFO") && l.contains(message) && l.contains(&path)),
+                "no INFO line \"{message}\" naming {path}:\n{text}"
+            );
+        }
+        assert!(
+            !text.contains("killing"),
+            "a clean stop was killed:\n{text}"
+        );
+        assert!(!text.contains("WARN"), "a clean stop warned:\n{text}");
+
+        let log = dir.path().join("stuck.log");
+        let target = dir.path().join("rec").join("stuck.ts");
+        let _logs = capture_logs(&log);
+        let cancel = AtomicBool::new(false);
+        let stop = async {
+            for _ in 0..1000 {
+                if ready.exists() {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            // A recorder that failed to start has returned by now; join! reports it.
+            if ready.exists() {
+                // From here the 10 s wait for an exit passes at once.
+                tokio::time::pause();
+            }
+            cancel.store(true, Ordering::SeqCst);
+        };
+        let (recorded, ()) = tokio::join!(
+            record_encoded(
+                stuck.to_str().expect("utf-8"),
+                &source,
+                &input,
+                &target,
+                std::time::Duration::from_secs(3600),
+                &cancel,
+            ),
+            stop
+        );
+        recorded.expect("record");
+        assert!(ready.exists(), "the stand-in ffmpeg never started");
+        let text = std::fs::read_to_string(&log).expect("log");
+        let path = target.display().to_string();
+        for (level, message) in [
+            ("INFO", "stopping the recording process"),
+            ("WARN", "could not ask the recording process to stop"),
+            ("INFO", "killing the recording process"),
+        ] {
+            assert!(
+                text.lines()
+                    .any(|l| l.contains(level) && l.contains(message) && l.contains(&path)),
+                "no {level} line \"{message}\" naming {path}:\n{text}"
+            );
+        }
+        assert!(!text.contains("ERROR"), "the kill succeeded:\n{text}");
     }
 
     #[tokio::test]

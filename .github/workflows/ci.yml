@@ -23,7 +23,8 @@ env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: "-D warnings"
   # Debuginfo is useless in CI (nothing is debugged interactively) and only
-  # inflates target/ and the rust-cache entries.
+  # inflates target/ and the rust-cache entries. Cargo.toml's [profile.dev] already
+  # leaves dependencies without it; this also drops the workspace's line tables.
   CARGO_PROFILE_DEV_DEBUG: "0"
   # Only push runs write caches (with rust-cache's save-if): PR runs read them, so the
   # 10 GB cache quota holds the base branches' entries that every PR reads instead of
@@ -182,13 +183,13 @@ jobs:
           df -h /
           du -sh target || true # absent when the job failed before building
 
-  # The supply chain, without a build: cargo-deny checks the crates the workspace builds
-  # against the RustSec advisory database and deny.toml's license, ban and source rules,
-  # cargo-machete looks for declared but unused dependencies, and check-workspace-deps.py for
-  # a dependency a crate declares itself instead of taking the workspace's. Outside `lint`, so
-  # an advisory published today turns every branch red without blocking merges; it does block
-  # a release, which needs this whole run green and re-checks the advisories before tagging
-  # (release.yml).
+  # The supply chain, without a build: cargo-deny checks the crates the workspace and the
+  # wasm-hello guest build against the RustSec advisory database (yanked versions included) and
+  # deny.toml's license, ban and source rules, cargo-machete looks for declared but unused
+  # dependencies, and check-workspace-deps.py for a dependency a crate declares itself instead
+  # of taking the workspace's. Outside `lint`, so an advisory published today turns every branch
+  # red without blocking merges; it does block a release, which needs this whole run green and
+  # re-checks the advisories before tagging (release.yml).
   dependencies:
     if: *not-release-pr
     runs-on: ubuntu-latest
@@ -209,28 +210,58 @@ jobs:
           tool: cargo-deny@0.20.2,cargo-machete@0.9.2
       # Each check runs whatever the one before found, so an advisory never hides the rest.
       - run: cargo deny --locked check
+      # The wasm-hello guest is outside the workspace, with its own Cargo.lock. Run from the root, so the
+      # root's deny.toml applies (cargo-deny reads its config from the directory it starts in).
+      - if: ${{ !cancelled() }}
+        run: cargo deny --manifest-path examples/wasm-hello/Cargo.toml --locked check
       - if: ${{ !cancelled() }}
         run: cargo machete apps crates # vendor/ holds upstream code as published
       - if: ${{ !cancelled() }}
         run: scripts/check-workspace-deps.py
 
+  # cargo-vet: every crate in Cargo.lock needs an audit (gates/supply-chain/audits.toml, or one
+  # imported from the organisations gates/supply-chain/config.toml names) or an exemption there, so
+  # a PR that adds an unaudited crate, or moves one to an unaudited version, fails here naming it
+  # (CONTRIBUTING.md, "Dependencies"). Its result changes only with the branch, never with the date
+  # (--locked reads the committed gates/supply-chain/imports.lock instead of fetching the imports),
+  # so unlike `dependencies` it is part of `lint` and blocks merging.
+  vet:
+    if: *not-release-pr
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+      # cargo-vet reads the crate graph through `cargo metadata`. Same master-commit pin
+      # as clippy (see the note there).
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067
+        with:
+          toolchain: 1.99.1 # = rust-toolchain.toml
+      # Built from crates.io, as ci/Dockerfile does for GitLab: the install-action release pinned
+      # above predates cargo-vet 0.10.3, and its fallback would fetch a binary it holds no hash for.
+      - run: cargo install --locked cargo-vet@0.10.3
+      - run: cargo vet --locked
+
   lint:
     # Renamed as well as skipped in the release PR's run (see benchmark-report): a skipped
     # check named `lint` on the commit could pass for the push run's failed one.
     name: ${{ (github.event.pull_request.head.repo.full_name == github.repository && startsWith(github.head_ref, 'release/') && github.base_ref == 'main') && 'lint (release PR, checked by its push run)' || 'lint' }}
-    needs: [clippy, lint-tests]
+    needs: [clippy, lint-tests, vet]
     # always(): a failed or cancelled job must fail this check, not leave it skipped
     if: ${{ always() && !(github.event.pull_request.head.repo.full_name == github.repository && startsWith(github.head_ref, 'release/') && github.base_ref == 'main') }}
     runs-on: ubuntu-latest
     permissions: {}
     steps:
-      - name: clippy and every test partition passed
+      - name: clippy, every test partition and cargo vet passed
         env:
           CLIPPY: ${{ needs.clippy.result }}
           TESTS: ${{ needs.lint-tests.result }}
+          VET: ${{ needs.vet.result }}
         run: |
-          echo "clippy: $CLIPPY, lint-tests: $TESTS"
-          [ "$CLIPPY" = success ] && [ "$TESTS" = success ]
+          echo "clippy: $CLIPPY, lint-tests: $TESTS, vet: $VET"
+          [ "$CLIPPY" = success ] && [ "$TESTS" = success ] && [ "$VET" = success ]
 
   shell-tests:
     if: *not-release-pr

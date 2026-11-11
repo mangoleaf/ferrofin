@@ -202,7 +202,7 @@ pub(crate) fn m3u_external_channel_id(tuner_url: &str, stream_url: &str) -> Stri
 /// The M3U playlist tuner.
 ///
 /// Port of `M3UTunerHost` (v10.11.8 `src/Jellyfin.LiveTv/TunerHosts/M3UTunerHost.cs`)
-/// over the existing [`parse_m3u`] port: the lineup is the playlist, and every
+/// over the existing `parse_m3u` port: the lineup is the playlist, and every
 /// stream is a plain HTTP one.
 pub struct M3uTunerHost {
     /// The HTTP/file seam the playlist is read through.

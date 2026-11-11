@@ -21,6 +21,7 @@ use serde::{Deserialize, Deserializer};
 use uuid::Uuid;
 
 use crate::error::ApiError;
+use crate::extract::DotnetGuid;
 
 /// Splits a comma-delimited value case-insensitively, and silently drops tokens
 /// that don't parse instead of erroring.
@@ -56,7 +57,8 @@ where
     T::deserialize(crate::query::value::Value::nullable(token)).ok()
 }
 
-/// Splits a comma-delimited value into [`Uuid`]s, skipping empty tokens.
+/// Splits a comma-delimited value into [`Uuid`]s, skipping empty tokens. Each
+/// token parses as `Guid.Parse` does ([`DotnetGuid`]).
 ///
 /// A malformed id is a `400`.
 pub(crate) fn parse_csv_uuids(raw: Option<&str>) -> Result<Vec<Uuid>, ApiError> {
@@ -67,7 +69,7 @@ pub(crate) fn parse_csv_uuids(raw: Option<&str>) -> Result<Vec<Uuid>, ApiError> 
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .map(|token| {
-            Uuid::parse_str(token)
+            DotnetGuid::parse(token)
                 .map_err(|_| ApiError::BadRequest(format!("invalid id {token:?}")))
         })
         .collect()
@@ -77,8 +79,9 @@ pub(crate) fn parse_csv_uuids(raw: Option<&str>) -> Result<Vec<Uuid>, ApiError> 
 /// `Guid?`: an **empty or whitespace-only** value is *absent*, not malformed.
 ///
 /// `SimpleTypeModelBinder` returns `null` for a nullable value type whose
-/// submitted value is empty, and the `Guid` type converter trims before parsing,
-/// so upstream answers `?userId=` and `?userId=%20` exactly as it answers a
+/// submitted value is empty, and the `Guid` type converter (`Guid.Parse`,
+/// [`DotnetGuid`]) trims before parsing, so upstream answers `?userId=` and
+/// `?userId=%20` exactly as it answers a
 /// request with no `userId` at all. serde's own `Option<Uuid>` sees the key and
 /// tries to parse `""`, which made both shapes a `400` here against a `200`
 /// there — measured on the lane-3 pair against Jellyfin 10.11.8 for
@@ -97,7 +100,7 @@ where
     let raw = Option::<String>::deserialize(deserializer)?;
     match raw.as_deref().map(str::trim) {
         None | Some("") => Ok(None),
-        Some(value) => Uuid::parse_str(value)
+        Some(value) => DotnetGuid::parse(value)
             .map(Some)
             .map_err(serde::de::Error::custom),
     }
@@ -499,6 +502,10 @@ mod tests {
         let ids = parse_csv_uuids(Some(&format!("{id},{id}"))).expect("valid");
         assert_eq!(ids, vec![id, id]);
         assert!(parse_csv_uuids(Some("not-a-uuid")).is_err());
+        // `Guid.Parse`'s formats, not `Uuid::parse_str`'s.
+        let ids = parse_csv_uuids(Some(&format!("({id}), {}", id.simple()))).expect("P and N");
+        assert_eq!(ids, vec![id, id]);
+        assert!(parse_csv_uuids(Some(&format!("urn:uuid:{id}"))).is_err());
     }
 
     /// A stand-in for a request DTO property carrying the *comma* factory.

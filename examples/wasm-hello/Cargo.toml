@@ -28,7 +28,7 @@ publish = false
 crate-type = ["cdylib"]
 
 [dependencies]
-wit-bindgen = "0.60"
+wit-bindgen = "0.63"
 
 [profile.release]
 # Small artifacts load faster and make the RSS measurement representative.

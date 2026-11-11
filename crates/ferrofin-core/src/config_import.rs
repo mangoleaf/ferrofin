@@ -25,7 +25,7 @@
 //! an entry of a collection whose default is empty — the value has to be
 //! inferred from the element itself, and XML alone cannot say whether
 //! `<Foo />` means `""` or `[]`. Instead of guessing once, the import tries the
-//! [`READINGS`] in order and keeps the first that `T` accepts.
+//! `READINGS` in order and keeps the first that `T` accepts.
 //!
 //! ## The rest of `config/`
 //!
@@ -166,7 +166,7 @@ struct Node {
 ///
 /// Elements named in `deny` are skipped, as are elements Ferrofin's
 /// configuration does not have. A field whose value `T` rejects under every
-/// [`Reading`] is logged and left at its default.
+/// `Reading` is logged and left at its default.
 ///
 /// # Errors
 ///

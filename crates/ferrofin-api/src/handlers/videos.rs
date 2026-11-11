@@ -14,7 +14,7 @@ use uuid::Uuid;
 
 use crate::auth::{RequireAdmin, RequireAuth, RequireDownload};
 use crate::error::ApiError;
-use crate::extract::Query;
+use crate::extract::{DotnetGuid, Query};
 use crate::handlers::items::{require_visible_item, resolve_user_opt};
 use crate::handlers::query_parse::parse_csv_uuids;
 use crate::handlers::streaming::{
@@ -31,7 +31,7 @@ use crate::state::AppState;
 async fn get_video_stream(
     State(state): State<AppState>,
     axum::Extension(auth): axum::Extension<ferrofin_traits::options::AuthorizationInfo>,
-    Path(item_id): Path<Uuid>,
+    Path(DotnetGuid(item_id)): Path<DotnetGuid>,
     Query(query): Query<crate::handlers::hls::HlsQueryPub>,
     request: Request,
 ) -> Result<Response, ApiError> {
@@ -54,7 +54,7 @@ async fn get_video_stream(
 async fn get_video_stream_by_container(
     State(state): State<AppState>,
     axum::Extension(auth): axum::Extension<ferrofin_traits::options::AuthorizationInfo>,
-    Path((item_id, container)): Path<(Uuid, String)>,
+    Path((DotnetGuid(item_id), container)): Path<(DotnetGuid, String)>,
     Query(query): Query<crate::handlers::hls::HlsQueryPub>,
     request: Request,
 ) -> Result<Response, ApiError> {
@@ -111,7 +111,7 @@ struct AdditionalPartsQuery {
 async fn get_additional_parts(
     State(state): State<AppState>,
     RequireAuth(auth): RequireAuth,
-    Path(item_id): Path<Uuid>,
+    Path(DotnetGuid(item_id)): Path<DotnetGuid>,
     Query(query): Query<AdditionalPartsQuery>,
 ) -> Result<Json<QueryResult<BaseItemDto>>, ApiError> {
     let user = resolve_user_opt(&state, &auth, query.user_id).await?;
@@ -223,7 +223,7 @@ async fn merge_versions(
 async fn delete_alternate_sources(
     State(state): State<AppState>,
     RequireAdmin(auth): RequireAdmin,
-    Path(item_id): Path<Uuid>,
+    Path(DotnetGuid(item_id)): Path<DotnetGuid>,
 ) -> Result<StatusCode, ApiError> {
     let item = require_visible_item(&state, item_id, auth.user.as_deref()).await?;
     if !is_video(&item) {
@@ -253,7 +253,7 @@ async fn delete_alternate_sources(
 async fn get_download(
     State(state): State<AppState>,
     RequireDownload(auth, policy): RequireDownload,
-    Path(item_id): Path<Uuid>,
+    Path(DotnetGuid(item_id)): Path<DotnetGuid>,
     request: Request,
 ) -> Result<Response, ApiError> {
     let item = state

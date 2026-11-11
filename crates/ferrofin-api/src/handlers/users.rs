@@ -21,7 +21,7 @@
 //!
 //! Port notes:
 //! - `AuthenticateNewSession` returns an [`AuthenticationResult`] in C#; the
-//!   ported [`SessionManager::authenticate_new_session`] returns an
+//!   ported `SessionManager::authenticate_new_session` returns an
 //!   [`AuthenticationResultData`] (session DTO + minted access token), which the
 //!   handler assembles into the wire [`AuthenticationResult`] — the client gets a
 //!   real `AccessToken` to present on subsequent requests.
@@ -37,7 +37,7 @@
 //!   `UserDto` it builds, and the authentication result takes it from the
 //!   session.
 //! - A refused login answers as upstream's `ExceptionMiddleware` does, with no
-//!   reason in the body ([`login_failure`]).
+//!   reason in the body (`login_failure`).
 
 use axum::extract::{Path, State};
 use axum::http::request::Parts;
@@ -62,7 +62,7 @@ use crate::auth::{
     is_administrator_identity,
 };
 use crate::error::ApiError;
-use crate::extract::{JsonBody, ProblemDetails, Query, RequiredString};
+use crate::extract::{DotnetGuid, JsonBody, ProblemDetails, Query, RequiredString};
 use crate::handlers::items::user_uuid;
 use crate::panic_boundary::ERROR_BODY;
 use crate::state::AppState;
@@ -279,7 +279,7 @@ struct AuthenticateByIdQuery {
 /// "User not found", else exactly `AuthenticateUserByName` with that user's name.
 async fn authenticate_by_id(
     State(state): State<AppState>,
-    Path(user_id): Path<Uuid>,
+    Path(DotnetGuid(user_id)): Path<DotnetGuid>,
     Query(query): Query<AuthenticateByIdQuery>,
     parts: Parts,
 ) -> Result<Response, ApiError> {
@@ -606,7 +606,7 @@ fn sort_by_username(users: &mut [UserEntity]) {
 async fn get_user_by_id(
     State(state): State<AppState>,
     RequireAuthIgnoringSchedule(auth): RequireAuthIgnoringSchedule,
-    Path(user_id): Path<Uuid>,
+    Path(DotnetGuid(user_id)): Path<DotnetGuid>,
 ) -> Result<Json<UserDto>, ApiError> {
     let user = load_user(&state, user_id).await?;
     let mut dto = state.users.get_user_dto(&user, None).await?;
@@ -641,7 +641,7 @@ async fn get_user_by_id(
 async fn delete_user(
     State(state): State<AppState>,
     RequireAdmin(_auth): RequireAdmin,
-    Path(user_id): Path<Uuid>,
+    Path(DotnetGuid(user_id)): Path<DotnetGuid>,
 ) -> Result<StatusCode, ApiError> {
     let user = load_user(&state, user_id).await?;
     state.sessions.revoke_user_tokens(user_id, "").await?;
@@ -798,7 +798,7 @@ async fn update_user(
 async fn update_user_policy(
     State(state): State<AppState>,
     RequireAdmin(_auth): RequireAdmin,
-    Path(user_id): Path<Uuid>,
+    Path(DotnetGuid(user_id)): Path<DotnetGuid>,
     JsonBody(new_policy): JsonBody<UserPolicy>,
 ) -> Result<Response, ApiError> {
     // Model validation runs after the authorization policy and before the
@@ -1104,7 +1104,7 @@ async fn load_user(state: &AppState, user_id: Uuid) -> Result<UserEntity, ApiErr
 async fn update_user_for_user(
     state: State<AppState>,
     auth: RequireAuth,
-    Path(user_id): Path<Uuid>,
+    Path(DotnetGuid(user_id)): Path<DotnetGuid>,
     body: JsonBody<UserDto>,
 ) -> Result<Response, ApiError> {
     let query = UserIdQuery {
@@ -1118,7 +1118,7 @@ async fn update_user_for_user(
 async fn update_user_configuration_for_user(
     state: State<AppState>,
     auth: RequireAuth,
-    Path(user_id): Path<Uuid>,
+    Path(DotnetGuid(user_id)): Path<DotnetGuid>,
     config: JsonBody<UserConfiguration>,
 ) -> Result<StatusCode, ApiError> {
     let query = UserIdQuery {
@@ -1131,7 +1131,7 @@ async fn update_user_configuration_for_user(
 async fn update_user_password_for_user(
     state: State<AppState>,
     auth: RequireAuth,
-    Path(user_id): Path<Uuid>,
+    Path(DotnetGuid(user_id)): Path<DotnetGuid>,
     body: JsonBody<UpdateUserPassword>,
 ) -> Result<StatusCode, ApiError> {
     let query = UserIdQuery {

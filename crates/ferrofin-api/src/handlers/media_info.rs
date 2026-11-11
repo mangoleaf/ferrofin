@@ -1,7 +1,7 @@
 //! `MediaInfoController` — playback-info resolution.
 //!
 //! Ports `GET`/`POST /Items/{itemId}/PlaybackInfo`: resolves the item's playable
-//! [`MediaSourceInfo`](ferrofin_model::dto::MediaSourceInfo)s for the requesting
+//! [`MediaSourceInfo`]s for the requesting
 //! user via the [`MediaSourceManager`](ferrofin_traits::library::MediaSourceManager)
 //! and returns them in a [`PlaybackInfoResponse`]. The `POST` form also takes
 //! the client's device profile and stream picks (query or body) and negotiates
@@ -32,7 +32,7 @@ use uuid::Uuid;
 
 use crate::auth::RequireAuth;
 use crate::error::ApiError;
-use crate::extract::{JsonBody, Query};
+use crate::extract::{DotnetGuid, JsonBody, Query};
 use crate::handlers::items::{
     effective_user_id, require_visible_item, resolve_user_opt, user_uuid,
 };
@@ -1261,7 +1261,7 @@ fn apply_subtitle_delivery(
 async fn get_playback_info(
     State(state): State<AppState>,
     RequireAuth(auth): RequireAuth,
-    Path(item_id): Path<Uuid>,
+    Path(DotnetGuid(item_id)): Path<DotnetGuid>,
     Query(query): Query<PlaybackInfoQuery>,
     parts: Parts,
 ) -> Result<Json<PlaybackInfoResponse>, ApiError> {
@@ -1372,7 +1372,7 @@ fn flags_from(query: &PlaybackInfoQuery, body: Option<&PlaybackInfoBody>) -> Pla
 async fn post_playback_info(
     State(state): State<AppState>,
     RequireAuth(auth): RequireAuth,
-    Path(item_id): Path<Uuid>,
+    Path(DotnetGuid(item_id)): Path<DotnetGuid>,
     Query(query): Query<PlaybackInfoQuery>,
     parts: Parts,
     body: Option<JsonBody<PlaybackInfoBody>>,

@@ -433,11 +433,22 @@ impl EncodingJobInfo {
     /// (`DrawingUtils.Resize`). Port of `OutputWidth`/`OutputHeight`: `None`
     /// for an audio request without a sized video stream; a video request
     /// without source dimensions falls back to the requested bound.
+    ///
+    /// A source rotated by 90 degrees is resized at its displayed size, the
+    /// transpose of the stored one, since that is the frame ffmpeg scales and
+    /// writes. Upstream resizes the stored size, so a portrait phone video's
+    /// `RESOLUTION` reads landscape (720x405 for a 720x1280 encode): a
+    /// Jellyfin bug, deliberately not ported.
     fn output_dimensions(&self) -> (Option<i32>, Option<i32>) {
         let request = &self.base_request;
         if let Some(stream) = self.video_stream.as_ref()
             && let (Some(width), Some(height)) = (stream.width, stream.height)
         {
+            let (width, height) = if stream.rotation.unwrap_or(0).abs() == 90 {
+                (height, width)
+            } else {
+                (width, height)
+            };
             let size = ferrofin_model::drawing::drawing_utils::resize(
                 ImageDimensions::new(width, height),
                 request.width.unwrap_or(0),
@@ -459,14 +470,14 @@ impl EncodingJobInfo {
     }
 
     /// The output width, in pixels (`OutputWidth`); see
-    /// [`Self::output_dimensions`].
+    /// `Self::output_dimensions`.
     #[must_use]
     pub fn output_width(&self) -> Option<i32> {
         self.output_dimensions().0
     }
 
     /// The output height, in pixels (`OutputHeight`); see
-    /// [`Self::output_dimensions`].
+    /// `Self::output_dimensions`.
     #[must_use]
     pub fn output_height(&self) -> Option<i32> {
         self.output_dimensions().1
@@ -809,6 +820,33 @@ mod derived_state_tests {
         // An audio request has no output size.
         j.is_input_video = false;
         assert_eq!((j.output_width(), j.output_height()), (None, None));
+    }
+
+    /// A portrait phone video, stored 1920x1080 and rotated by 90 degrees, is
+    /// sized as it is displayed and encoded: 1080x1920, bounded as such.
+    #[rstest::rstest]
+    #[case::no_bounds(None, None, (1080, 1920))]
+    #[case::max_width(Some(720), None, (720, 1280))]
+    #[case::pinned_to_the_displayed_size(Some(1080), Some(1920), (1080, 1920))]
+    fn a_rotated_source_is_sized_as_displayed(
+        #[case] max_width: Option<i32>,
+        #[case] max_height: Option<i32>,
+        #[case] expected: (i32, i32),
+    ) {
+        for rotation in [90, -90] {
+            let mut j = job();
+            j.video_stream = Some(MediaStream {
+                rotation: Some(rotation),
+                ..video(1920, 1080)
+            });
+            j.base_request.max_width = max_width;
+            j.base_request.max_height = max_height;
+            assert_eq!(
+                (j.output_width(), j.output_height()),
+                (Some(expected.0), Some(expected.1)),
+                "{rotation}"
+            );
+        }
     }
 
     #[test]

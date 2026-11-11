@@ -3,8 +3,8 @@
 //! Ports the *read* surface of Jellyfin's `ImageController`: resolve an item (or
 //! a by-name genre/studio/person/artist, or a user profile), find the requested
 //! [`ItemImageInfo`] by type (and optional index), and serve its file. The image
-//! rows come from [`LibraryManager::get_item_images`] /
-//! [`UserManager::get_profile_image`], both backed by real `ferrofin-db` reads.
+//! rows come from `LibraryManager::get_item_images` /
+//! `UserManager::get_profile_image`, both backed by real `ferrofin-db` reads.
 //!
 //! ## Port scope — processed serving
 //!
@@ -23,13 +23,13 @@
 //!
 //! TODO(overlays, gl-806): the `percentPlayed`/`unplayedCount` parameters bind
 //! and are validated, but their overlays are not drawn — see the TODO on
-//! [`get_item_image_parametrized`] for the port path.
+//! `get_item_image_parametrized` for the port path.
 //!
 //! A missing item (or by-name item, or user), or an item with no image of the
 //! requested type/index, or an image whose file is remote/absent, is a `404` —
 //! exactly the contract's not-found outcome. So is a Live TV item's row that is
 //! neither a URL nor a file in the internal metadata directory
-//! ([`live_tv_image_is_servable`]). `HEAD` shares each handler with `GET` (the
+//! (`live_tv_image_is_servable`). `HEAD` shares each handler with `GET` (the
 //! file service is `HEAD`-aware).
 //!
 //! ## Write side
@@ -38,12 +38,12 @@
 //! `POST`/`DELETE /Items/{itemId}/Images/{imageType}[/{imageIndex}]`. The upload
 //! body is base64-encoded image bytes with the MIME type in the `Content-Type`
 //! header (Jellyfin's `[AcceptsImageFile]`), decoded via the shared
-//! [`image_upload`](crate::handlers::image_upload) helpers and handed to
-//! [`ProviderManager::save_image`]/[`ProviderManager::delete_image`]. These call
-//! through to the image-store seam; the concrete shell manager reports the image
-//! pipeline as deferred (as it does for `queue_refresh`), so the request shape,
-//! `400`/`404` validation, and the `save_image`/`delete_image` contract here are
-//! final while the on-disk pipeline is a later wave.
+//! `image_upload` helpers and handed to
+//! `ProviderManager::save_image`/`ProviderManager::delete_image`. The
+//! provider manager writes the file into the item's metadata folder (the image
+//! saver moves it beside the media when the library saves artwork there),
+//! records the image row and saves the item; a delete removes the rows, then
+//! their local files.
 
 use std::borrow::Cow;
 
@@ -68,7 +68,7 @@ use uuid::Uuid;
 
 use crate::auth::{AuthenticatedIdentity, RequireAdmin, RequireAuth};
 use crate::error::ApiError;
-use crate::extract::{Query, upload_body_limit};
+use crate::extract::{DotnetGuid, Query, upload_body_limit};
 use crate::handlers::image_upload::{decode_base64, try_get_image_extension_from_content_type};
 use crate::handlers::items::resolve_user;
 use crate::handlers::users::UserIdQuery;
@@ -883,7 +883,7 @@ async fn authorize_image_item(
 async fn get_item_image(
     State(state): State<AppState>,
     auth: Result<AuthenticatedIdentity, ApiError>,
-    Path((item_id, image_type)): Path<(Uuid, String)>,
+    Path((DotnetGuid(item_id), image_type)): Path<(DotnetGuid, String)>,
     Query(query): Query<ImageQuery>,
     request: Request,
 ) -> Result<Response, ApiError> {
@@ -917,7 +917,7 @@ async fn get_item_image(
 async fn get_item_image_by_index(
     State(state): State<AppState>,
     auth: Result<AuthenticatedIdentity, ApiError>,
-    Path((item_id, image_type, image_index)): Path<(Uuid, String, i32)>,
+    Path((DotnetGuid(item_id), image_type, image_index)): Path<(DotnetGuid, String, i32)>,
     Query(query): Query<ImageQuery>,
     request: Request,
 ) -> Result<Response, ApiError> {
@@ -964,7 +964,7 @@ async fn get_item_image_parametrized(
     State(state): State<AppState>,
     auth: Result<AuthenticatedIdentity, ApiError>,
     Path((
-        item_id,
+        DotnetGuid(item_id),
         image_type,
         image_index,
         tag,
@@ -974,7 +974,7 @@ async fn get_item_image_parametrized(
         percent_played,
         unplayed_count,
     )): Path<(
-        Uuid,
+        DotnetGuid,
         String,
         i32,
         String,
@@ -1035,7 +1035,7 @@ async fn get_item_image_parametrized(
 async fn get_item_image_infos(
     State(state): State<AppState>,
     RequireAuth(auth): RequireAuth,
-    Path(item_id): Path<Uuid>,
+    Path(DotnetGuid(item_id)): Path<DotnetGuid>,
 ) -> Result<axum::Json<Vec<ImageInfo>>, ApiError> {
     let item = state
         .library
@@ -1486,7 +1486,7 @@ async fn delete_user_image(
 async fn get_user_image_legacy(
     state: State<AppState>,
     auth: Result<AuthenticatedIdentity, ApiError>,
-    Path((user_id, image_type)): Path<(Uuid, String)>,
+    Path((DotnetGuid(user_id), image_type)): Path<(DotnetGuid, String)>,
     Query(query): Query<LegacyUserImageQuery>,
     Query(_): Query<LegacyImageIndexQuery>,
     request: Request,
@@ -1501,7 +1501,7 @@ async fn get_user_image_legacy(
 async fn get_user_image_by_index_legacy(
     state: State<AppState>,
     auth: Result<AuthenticatedIdentity, ApiError>,
-    Path((user_id, image_type, _image_index)): Path<(Uuid, String, i32)>,
+    Path((DotnetGuid(user_id), image_type, _image_index)): Path<(DotnetGuid, String, i32)>,
     Query(query): Query<LegacyUserImageQuery>,
     request: Request,
 ) -> Result<Response, ApiError> {
@@ -1515,7 +1515,7 @@ async fn get_user_image_by_index_legacy(
 async fn post_user_image_legacy(
     state: State<AppState>,
     auth: RequireAuth,
-    Path((user_id, image_type)): Path<(Uuid, String)>,
+    Path((DotnetGuid(user_id), image_type)): Path<(DotnetGuid, String)>,
     headers: axum::http::HeaderMap,
     body: String,
 ) -> Result<StatusCode, ApiError> {
@@ -1532,7 +1532,7 @@ async fn post_user_image_legacy(
 async fn delete_user_image_legacy(
     state: State<AppState>,
     auth: RequireAuth,
-    Path((user_id, image_type)): Path<(Uuid, String)>,
+    Path((DotnetGuid(user_id), image_type)): Path<(DotnetGuid, String)>,
     Query(_): Query<LegacyDeleteIndexQuery>,
 ) -> Result<axum::http::StatusCode, ApiError> {
     // `[FromRoute, Required] ImageType`: bound (400 when invalid), then ignored.
@@ -1553,7 +1553,7 @@ async fn delete_user_image_legacy(
 async fn post_user_image_by_index_legacy(
     state: State<AppState>,
     auth: RequireAuth,
-    Path((user_id, image_type, _image_index)): Path<(Uuid, String, i32)>,
+    Path((DotnetGuid(user_id), image_type, _image_index)): Path<(DotnetGuid, String, i32)>,
     headers: axum::http::HeaderMap,
     body: String,
 ) -> Result<StatusCode, ApiError> {
@@ -1573,7 +1573,7 @@ async fn post_user_image_by_index_legacy(
 async fn delete_user_image_by_index_legacy(
     state: State<AppState>,
     auth: RequireAuth,
-    Path((user_id, image_type, _image_index)): Path<(Uuid, String, i32)>,
+    Path((DotnetGuid(user_id), image_type, _image_index)): Path<(DotnetGuid, String, i32)>,
 ) -> Result<axum::http::StatusCode, ApiError> {
     // `[FromRoute, Required] ImageType`: bound (400 when invalid), then ignored.
     parse_image_type(&image_type)?;
@@ -1631,7 +1631,7 @@ async fn save_item_image(
 async fn set_item_image(
     State(state): State<AppState>,
     RequireAdmin(auth): RequireAdmin,
-    Path((item_id, image_type)): Path<(Uuid, String)>,
+    Path((DotnetGuid(item_id), image_type)): Path<(DotnetGuid, String)>,
     headers: axum::http::HeaderMap,
     body: String,
 ) -> Result<StatusCode, ApiError> {
@@ -1666,7 +1666,7 @@ async fn set_item_image(
 async fn set_item_image_by_index(
     State(state): State<AppState>,
     RequireAdmin(auth): RequireAdmin,
-    Path((item_id, image_type, _image_index)): Path<(Uuid, String, i32)>,
+    Path((DotnetGuid(item_id), image_type, _image_index)): Path<(DotnetGuid, String, i32)>,
     headers: axum::http::HeaderMap,
     body: String,
 ) -> Result<StatusCode, ApiError> {
@@ -1700,7 +1700,7 @@ async fn set_item_image_by_index(
 async fn delete_item_image(
     State(state): State<AppState>,
     RequireAdmin(auth): RequireAdmin,
-    Path((item_id, image_type)): Path<(Uuid, String)>,
+    Path((DotnetGuid(item_id), image_type)): Path<(DotnetGuid, String)>,
     Query(query): Query<ImageQuery>,
 ) -> Result<StatusCode, ApiError> {
     let image_type = parse_image_type(&image_type)?;
@@ -1734,7 +1734,7 @@ async fn delete_item_image(
 async fn delete_item_image_by_index(
     State(state): State<AppState>,
     RequireAdmin(auth): RequireAdmin,
-    Path((item_id, image_type, image_index)): Path<(Uuid, String, i32)>,
+    Path((DotnetGuid(item_id), image_type, image_index)): Path<(DotnetGuid, String, i32)>,
 ) -> Result<StatusCode, ApiError> {
     let image_type = parse_image_type(&image_type)?;
     require_item(&state, item_id, auth.user.as_deref()).await?;
@@ -1780,7 +1780,7 @@ pub(crate) struct UpdateImageIndexQuery {
 async fn update_item_image_index(
     State(state): State<AppState>,
     RequireAdmin(auth): RequireAdmin,
-    Path((item_id, image_type, image_index)): Path<(Uuid, String, i32)>,
+    Path((DotnetGuid(item_id), image_type, image_index)): Path<(DotnetGuid, String, i32)>,
     Query(query): Query<UpdateImageIndexQuery>,
 ) -> Result<StatusCode, ApiError> {
     let image_type = parse_image_type(&image_type)?;

@@ -10,9 +10,33 @@ use sqlx::Row as _;
 use uuid::Uuid;
 
 use ferrofin_traits::error::{ServiceError, db_err};
+use ferrofin_traits::options::InternalItemsQuery;
+use ferrofin_traits::persistence::ParentalRestrictions;
 use ferrofin_traits::stubs::LiveTvChannelQuery;
 
 use crate::projection::{ChannelRow, ChannelUserData, ProgramRow};
+
+/// A user's parental restrictions for a guide read: the item layer's
+/// predicate and the query its user's preferences were loaded onto.
+pub(crate) type UserRestrictions<'a> =
+    Option<&'a (&'a dyn ParentalRestrictions, InternalItemsQuery)>;
+
+/// Pushes the user's maximum rating, blocked unrated kinds and inherited
+/// tags, as `TranslateQuery` applies them to the programme or channel items
+/// upstream lists: an `EXISTS` over the `BaseItems` row whose id is
+/// `id_column`, a trusted column expression (never a value). A guide row whose
+/// item is not stored yet is not shown to such a user.
+pub(crate) fn push_item_restrictions(
+    qb: &mut sqlx::QueryBuilder<sqlx::Sqlite>,
+    id_column: &str,
+    (filter, user): &(&dyn ParentalRestrictions, InternalItemsQuery),
+) {
+    qb.push(format_args!(
+        r#"EXISTS (SELECT 1 FROM "BaseItems" bi WHERE bi."Id" = {id_column}"#
+    ));
+    filter.push_restrictions(qb, user, "bi");
+    qb.push(")");
+}
 
 /// The columns a guide list read returns, joined to the owning channel for
 /// `ChannelName`. Held apart from the filters so the `WHERE`/`ORDER`/`LIMIT`
@@ -34,14 +58,18 @@ pub(crate) const PROGRAM_SELECT: &str = r#"SELECT p."Id",p."ChannelId",p."StartD
 /// tag). The kinds it does not filter on read as `false`: only the channel
 /// kind filters read them, and each one costs a pass over the airings.
 ///
+/// `restrictions` are the user's parental restrictions, which keep only the
+/// channels whose item that user may list.
+///
 /// # Errors
 ///
 /// Fails when the database read fails.
-pub async fn channel_rows(
+pub(crate) async fn channel_rows(
     db: &Database,
     query: &LiveTvChannelQuery,
+    restrictions: UserRestrictions<'_>,
 ) -> Result<Vec<ChannelRow>, ServiceError> {
-    channel_rows_query(query)
+    channel_rows_query(query, restrictions)
         .build_query_as()
         .fetch_all(db.pool())
         .await
@@ -49,7 +77,10 @@ pub async fn channel_rows(
 }
 
 /// [`channel_rows`]' statement, shared with its plan pin.
-fn channel_rows_query(query: &LiveTvChannelQuery) -> sqlx::QueryBuilder<sqlx::Sqlite> {
+fn channel_rows_query(
+    query: &LiveTvChannelQuery,
+    restrictions: UserRestrictions<'_>,
+) -> sqlx::QueryBuilder<sqlx::Sqlite> {
     let mut qb = sqlx::QueryBuilder::new(
         r#"SELECT "Id","TvgId","ExternalId","Name","Number","ChannelType","DateCreated","ImageUrl""#,
     );
@@ -66,7 +97,12 @@ fn channel_rows_query(query: &LiveTvChannelQuery) -> sqlx::QueryBuilder<sqlx::Sq
             ));
         }
     }
-    qb.push(r#" FROM "FerrofinLiveTvChannels" ORDER BY "SortIndex", "Name""#);
+    qb.push(r#" FROM "FerrofinLiveTvChannels""#);
+    if let Some(restrictions) = restrictions {
+        qb.push(" WHERE ");
+        push_item_restrictions(&mut qb, r#""FerrofinLiveTvChannels"."Id""#, restrictions);
+    }
+    qb.push(r#" ORDER BY "SortIndex", "Name""#);
     qb
 }
 
@@ -392,6 +428,41 @@ pub async fn delete_programs(db: &Database, ids: &[String]) -> Result<(), Servic
     delete_by_id(db, "FerrofinLiveTvPrograms", ids).await
 }
 
+/// The programme items among `ids` that have a tag in `ItemValues`, which the
+/// blocked and allowed tag rules read. An airing stored before the guide
+/// indexed its tags has none, so the guide refresh writes them once.
+///
+/// # Errors
+///
+/// Fails when the database read fails.
+pub(crate) async fn programs_with_tag_values(
+    db: &Database,
+    ids: &[Uuid],
+) -> Result<std::collections::HashSet<Uuid>, ServiceError> {
+    let mut out = std::collections::HashSet::new();
+    for chunk in ferrofin_db::padded_in_chunks(ids) {
+        let mut qb: sqlx::QueryBuilder<sqlx::Sqlite> = sqlx::QueryBuilder::new(
+            r#"SELECT DISTINCT m."ItemId" FROM "ItemValuesMap" m
+               JOIN "ItemValues" v ON v."ItemValueId" = m."ItemValueId"
+               WHERE v."Type" = "#,
+        );
+        qb.push_bind(i32::from(ferrofin_db::enums::ItemValueType::Tags))
+            .push(r#" AND m."ItemId" IN ("#);
+        let mut separated = qb.separated(", ");
+        for id in chunk {
+            separated.push_bind(guid_to_db(*id));
+        }
+        qb.push(")");
+        let rows: Vec<String> = qb
+            .build_query_scalar()
+            .fetch_all(db.pool())
+            .await
+            .map_err(db_err)?;
+        out.extend(rows.iter().filter_map(|id| Uuid::parse_str(id).ok()));
+    }
+    Ok(out)
+}
+
 /// The ids of the airings stored on one channel, read on `conn`: inside a
 /// guide write's transaction, which removes those it did not re-emit.
 ///
@@ -673,6 +744,48 @@ pub mod test_support {
     use super::{Database, PROGRAM_SELECT, ProgramRow, db_err};
     use ferrofin_traits::error::ServiceError;
 
+    /// From now on, counts each programme row written to `BaseItems` (an
+    /// insert, or an upsert that updates the stored row) and each
+    /// `ItemValuesMap` link written or removed. Call it once per database.
+    pub async fn count_program_writes(db: &Database) -> Result<(), ServiceError> {
+        for statement in [
+            r#"CREATE TABLE "TestProgramWrites" ("Kind" TEXT, "Id" TEXT)"#,
+            r#"CREATE TRIGGER "TestProgramInserted" AFTER INSERT ON "BaseItems"
+               WHEN NEW."Type" = 'MediaBrowser.Controller.LiveTv.LiveTvProgram'
+               BEGIN INSERT INTO "TestProgramWrites" VALUES ('item', NEW."Id"); END"#,
+            r#"CREATE TRIGGER "TestProgramUpdated" AFTER UPDATE ON "BaseItems"
+               WHEN NEW."Type" = 'MediaBrowser.Controller.LiveTv.LiveTvProgram'
+               BEGIN INSERT INTO "TestProgramWrites" VALUES ('item', NEW."Id"); END"#,
+            r#"CREATE TRIGGER "TestValueLinked" AFTER INSERT ON "ItemValuesMap"
+               BEGIN INSERT INTO "TestProgramWrites" VALUES ('value', NEW."ItemId"); END"#,
+            r#"CREATE TRIGGER "TestValueUnlinked" AFTER DELETE ON "ItemValuesMap"
+               BEGIN INSERT INTO "TestProgramWrites" VALUES ('value', OLD."ItemId"); END"#,
+        ] {
+            sqlx::query(statement)
+                .execute(db.writer())
+                .await
+                .map_err(db_err)?;
+        }
+        Ok(())
+    }
+
+    /// The writes [`count_program_writes`] has counted since it started, or
+    /// since the last call: `(programme rows, value links)`.
+    pub async fn take_program_writes(db: &Database) -> Result<(i64, i64), ServiceError> {
+        let counts = sqlx::query_as(
+            r#"SELECT COALESCE(SUM("Kind" = 'item'), 0), COALESCE(SUM("Kind" = 'value'), 0)
+               FROM "TestProgramWrites""#,
+        )
+        .fetch_one(db.pool())
+        .await
+        .map_err(db_err)?;
+        sqlx::query(r#"DELETE FROM "TestProgramWrites""#)
+            .execute(db.writer())
+            .await
+            .map_err(db_err)?;
+        Ok(counts)
+    }
+
     /// Every stored guide programme, channel-joined, in one read.
     pub async fn program_rows(db: &Database) -> Result<Vec<ProgramRow>, ServiceError> {
         sqlx::query_as(PROGRAM_SELECT)
@@ -691,12 +804,13 @@ pub mod test_support {
     }
 
     /// The `EXPLAIN QUERY PLAN` details of [`super::channel_rows`]' statement
-    /// for `query`, in plan order.
-    pub async fn channel_rows_plan(
+    /// for `query` and `restrictions`, in plan order.
+    pub(crate) async fn channel_rows_plan(
         db: &Database,
         query: &super::LiveTvChannelQuery,
+        restrictions: super::UserRestrictions<'_>,
     ) -> Result<Vec<String>, ServiceError> {
-        plan(db, super::channel_rows_query(query)).await
+        plan(db, super::channel_rows_query(query, restrictions)).await
     }
 
     /// The `EXPLAIN QUERY PLAN` details of `qb`'s statement, in plan order.

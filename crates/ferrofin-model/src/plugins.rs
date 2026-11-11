@@ -26,7 +26,7 @@ pub enum PluginStatus {
     Deleted,
     /// This plugin has been superseded by another version.
     Superseded,
-    /// [DEPRECATED] See [`PluginStatus::Superseded`].
+    /// `DEPRECATED` See [`PluginStatus::Superseded`].
     Superceded,
     /// This plugin caused an error when instantiated.
     Malfunctioned,
@@ -139,37 +139,10 @@ pub struct PluginManifest {
     pub assemblies: Vec<String>,
 }
 
-/// Defines a plugin's web page.
-#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize, ToSchema)]
-#[serde(rename_all = "PascalCase")]
-pub struct PluginPageInfo {
-    /// Gets or sets the name of the plugin.
-    pub name: String,
-
-    /// Gets or sets the display name of the plugin.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub display_name: Option<String>,
-
-    /// Gets or sets the resource path.
-    pub embedded_resource_path: String,
-
-    /// Gets or sets a value indicating whether this plugin should appear in the
-    /// main menu.
-    pub enable_in_main_menu: bool,
-
-    /// Gets or sets the menu section.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub menu_section: Option<String>,
-
-    /// Gets or sets the menu icon.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub menu_icon: Option<String>,
-}
-
 /// The configuration page info returned by the dashboard controller.
 ///
 /// Port of `MediaBrowser.Model.Plugins.ConfigurationPageInfo`. In Jellyfin this
-/// is projected from a plugin's [`PluginPageInfo`] plus the owning plugin id;
+/// is projected from a plugin's `PluginPageInfo` plus the owning plugin id;
 /// Ferrofin projects it from the compiled-in registry the same way — Jellyfin's
 /// five in-tree provider plugins, the curated extensions, and any loaded WASM
 /// plugin each contribute their pages.

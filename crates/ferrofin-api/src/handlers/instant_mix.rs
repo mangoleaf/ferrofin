@@ -33,7 +33,7 @@ use uuid::Uuid;
 
 use crate::auth::RequireAuth;
 use crate::error::ApiError;
-use crate::extract::Query;
+use crate::extract::{DotnetGuid, Query};
 use crate::handlers::by_name::additional_dto_options;
 use crate::handlers::items::resolve_user_opt;
 use crate::state::AppState;
@@ -187,7 +187,7 @@ async fn instant_mix_from_item(
 async fn from_song(
     State(state): State<AppState>,
     RequireAuth(auth): RequireAuth,
-    Path(item_id): Path<Uuid>,
+    Path(DotnetGuid(item_id)): Path<DotnetGuid>,
     Query(query): Query<InstantMixQuery>,
 ) -> Result<Json<QueryResult<BaseItemDto>>, ApiError> {
     instant_mix_from_item(&state, &auth, item_id, &query, None).await
@@ -207,7 +207,7 @@ async fn from_song(
 async fn from_album(
     State(state): State<AppState>,
     RequireAuth(auth): RequireAuth,
-    Path(item_id): Path<Uuid>,
+    Path(DotnetGuid(item_id)): Path<DotnetGuid>,
     Query(query): Query<InstantMixQuery>,
 ) -> Result<Json<QueryResult<BaseItemDto>>, ApiError> {
     instant_mix_from_item(&state, &auth, item_id, &query, None).await
@@ -227,7 +227,7 @@ async fn from_album(
 async fn from_playlist(
     State(state): State<AppState>,
     RequireAuth(auth): RequireAuth,
-    Path(item_id): Path<Uuid>,
+    Path(DotnetGuid(item_id)): Path<DotnetGuid>,
     Query(query): Query<InstantMixQuery>,
 ) -> Result<Json<QueryResult<BaseItemDto>>, ApiError> {
     instant_mix_from_item(
@@ -254,7 +254,7 @@ async fn from_playlist(
 async fn from_artist(
     State(state): State<AppState>,
     RequireAuth(auth): RequireAuth,
-    Path(item_id): Path<Uuid>,
+    Path(DotnetGuid(item_id)): Path<DotnetGuid>,
     Query(query): Query<InstantMixQuery>,
 ) -> Result<Json<QueryResult<BaseItemDto>>, ApiError> {
     instant_mix_from_item(&state, &auth, item_id, &query, None).await
@@ -274,7 +274,7 @@ async fn from_artist(
 async fn from_item(
     State(state): State<AppState>,
     RequireAuth(auth): RequireAuth,
-    Path(item_id): Path<Uuid>,
+    Path(DotnetGuid(item_id)): Path<DotnetGuid>,
     Query(query): Query<InstantMixQuery>,
 ) -> Result<Json<QueryResult<BaseItemDto>>, ApiError> {
     instant_mix_from_item(&state, &auth, item_id, &query, None).await

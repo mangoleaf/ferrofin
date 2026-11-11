@@ -37,8 +37,8 @@ use uuid::Uuid;
 use ferrofin_traits::error::ServiceError;
 use ferrofin_traits::options::{DescendantQueryRoots, InternalItemsQuery};
 use ferrofin_traits::persistence::{
-    FolderChild, ItemRepository, ItemTypeLookup, ItemWithCounts, PlaylistAccessColumns,
-    PlaylistItemsWithAccess,
+    FolderChild, ItemRepository, ItemTypeLookup, ItemWithCounts, ParentalRestrictions,
+    PlaylistAccessColumns, PlaylistItemsWithAccess,
 };
 
 use crate::aggregate_folder::RootFolderIds;
@@ -141,7 +141,7 @@ pub type ActiveRecordingSlot = Arc<std::sync::OnceLock<ActiveRecordingSource>>;
 /// A late-bound [`ItemVisibility`]: the evaluator is built over the repository,
 /// so the repository holds it weakly (an `Arc` would be a cycle) and the
 /// composition root fills the slot once. The query scope needs it for
-/// `GetUserViews`' playlists and box-set gate (see [`scope_to_user_libraries`]).
+/// `GetUserViews`' playlists and box-set gate (see `scope_to_user_libraries`).
 pub type VisibilitySlot = Arc<std::sync::OnceLock<std::sync::Weak<ItemVisibility>>>;
 
 /// The evaluator in `slot`, while the server holds it. An empty slot (a
@@ -4646,6 +4646,32 @@ impl ItemRepository for FerrofinItemRepository {
     }
 }
 
+/// The parental half of `append_predicates`, for the Live TV guide.
+#[async_trait]
+impl ParentalRestrictions for FerrofinItemRepository {
+    async fn resolve(
+        &self,
+        query: &InternalItemsQuery,
+    ) -> Result<Option<InternalItemsQuery>, ServiceError> {
+        if query.user.is_none() {
+            return Ok(None);
+        }
+        let resolved = crate::query_restrictions::resolve(&self.db, query)
+            .await?
+            .unwrap_or_else(|| query.clone());
+        Ok(crate::translate_query::has_parental_restrictions(&resolved).then_some(resolved))
+    }
+
+    fn push_restrictions(
+        &self,
+        qb: &mut QueryBuilder<Sqlite>,
+        query: &InternalItemsQuery,
+        alias: &str,
+    ) {
+        crate::translate_query::append_parental_restrictions(qb, query, alias);
+    }
+}
+
 /// The distinct `(StreamType, Language)` pairs of the streams of `discs` on the
 /// items `filter` matches (v12.2 `BaseItemRepository.ByName.cs:110-115`).
 ///
@@ -5603,21 +5629,65 @@ mod tests {
                     has_parental_rating: Some(true),
                     ..query.clone()
                 };
+                let selected = repository.get_items(&selector).await.unwrap();
                 assert_eq!(
-                    repository
-                        .get_items(&selector)
-                        .await
-                        .unwrap()
-                        .total_record_count,
-                    2,
-                    "TranslateQuery's explicit HasParentalRating selector skips BlockUnratedItems"
+                    selected.total_record_count, 1,
+                    "hasParentalRating=true keeps the user's BlockUnratedItems, where \
+                     TranslateQuery's selector arm skips it"
                 );
+                assert_eq!(selected.items[0].id, guid_to_db(rated));
             }
             assert!(
                 result.items.iter().any(|item| item.id == guid_to_db(rated)),
                 "a score of zero is rated"
             );
         }
+    }
+
+    /// The guide's seam over [`append_parental_restrictions`]: no user, or a
+    /// user nothing restricts, needs nothing; a saved preference is loaded onto
+    /// the query, a loaded query keeps what it carries, and the clause pushed
+    /// is the repository's own.
+    #[tokio::test]
+    async fn parental_restrictions_load_the_users_saved_preferences() {
+        use ferrofin_db::enums::PreferenceKind;
+        use ferrofin_model::data::UnratedItem;
+        use ferrofin_traits::persistence::ParentalRestrictions as _;
+        let db = test_db().await;
+        let repository = repo(&db);
+        let none = repository.resolve(&InternalItemsQuery::default()).await;
+        assert!(none.unwrap().is_none(), "no user");
+        let user = Arc::new(seed_user_with_defaults(&db, Uuid::new_v4()).await);
+        let query = InternalItemsQuery {
+            user: Some(Arc::clone(&user)),
+            ..Default::default()
+        };
+        let free = repository.resolve(&query).await;
+        assert!(free.unwrap().is_none(), "nothing restricts");
+        crate::user_entity_ext::set_preference(
+            &db,
+            &user.id,
+            PreferenceKind::BlockUnratedItems,
+            &["LiveTvProgram".to_owned()],
+        )
+        .await
+        .unwrap();
+        let resolved = repository
+            .resolve(&query)
+            .await
+            .unwrap()
+            .expect("restricted");
+        assert_eq!(resolved.block_unrated_items, [UnratedItem::LiveTvProgram]);
+        let again = repository.resolve(&resolved).await.unwrap().expect("kept");
+        assert_eq!(again.block_unrated_items, [UnratedItem::LiveTvProgram]);
+        let mut qb = QueryBuilder::<Sqlite>::new("");
+        repository.push_restrictions(&mut qb, &resolved, "bi");
+        let sql = qb.sql();
+        let sql = sql.as_str();
+        assert!(
+            sql.contains(r#"bi."InheritedParentalRatingValue" IS NOT NULL"#),
+            "{sql}"
+        );
     }
 
     #[tokio::test]

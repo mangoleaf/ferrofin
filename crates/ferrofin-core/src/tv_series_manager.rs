@@ -2,13 +2,13 @@
 //!
 //! Port of `Emby.Server.Implementations.TV.TVSeriesManager` (v12). It computes a
 //! user's "Next Up" episode list by delegating the per-series next-up algorithm
-//! to the [`NextUpService`](ferrofin_traits::persistence::NextUpService), deciding
+//! to the [`NextUpService`], deciding
 //! each series' pick with `DetermineNextEpisode` (the specials merge and the
 //! resumable rule), ordering the picks by the last watched episode's play date,
 //! paginating with the same `start_index`/`limit`/`enable_total_record_count`
 //! semantics as C# `GetResult`, and only then reading the page's episode rows
-//! and projecting them to [`BaseItemDto`](ferrofin_model::dto::BaseItemDto)
-//! through the injected [`DtoService`](ferrofin_traits::dto::DtoService). C#
+//! and projecting them to [`BaseItemDto`]
+//! through the injected [`DtoService`]. C#
 //! materialises every pick before it pages; here a pick outside the page, an
 //! episode or a special, is decided, ordered and counted from the batch's facts
 //! and never loaded.
@@ -19,8 +19,8 @@
 //!   overload is folded into the query's [`NextUpQuery::parent_id`].
 //! - The C# `query.User` domain object is resolved from
 //!   [`NextUpQuery::user_id`] through the injected
-//!   [`UserManager`](ferrofin_traits::library::UserManager); the derived
-//!   [`UserEntity`](ferrofin_db::entities::users::UserEntity) then rides the
+//!   [`UserManager`]; the derived
+//!   [`UserEntity`] then rides the
 //!   [`InternalItemsQuery`] the way C# builds `new InternalItemsQuery(user)`.
 //! - The un-ported `Series`/`Episode` domain tree is not reconstructed: the
 //!   presentation key for a `series_id` is read straight off the persisted row
@@ -31,7 +31,7 @@
 //!   [`user_data`](ferrofin_traits::persistence::NextUpEpisodeBatchResult::user_data),
 //!   which the service fills from the same projection that picked the episodes.
 //! - `DisplaySpecialsWithinSeasons` is read from the injected
-//!   [`ServerConfigurationManager`](ferrofin_traits::configuration::ServerConfigurationManager),
+//!   [`ServerConfigurationManager`],
 //!   as in C#.
 //! - Synchronous C# methods become `async fn -> Result<_, ServiceError>` (the
 //!   impl paginates the database via its injected repositories).

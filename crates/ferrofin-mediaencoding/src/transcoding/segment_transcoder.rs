@@ -134,6 +134,9 @@ pub struct FakeScript {
     /// Whether the child has already exited when handed back. When `false`, the
     /// child stays running until [`FakeTranscodeChild::finish`] is called.
     pub exits_immediately: bool,
+    /// Files to write when a still-running child is killed: what ffmpeg's
+    /// graceful `q` exit finalises, cut short.
+    pub kill_files: Vec<String>,
 }
 
 /// A [`SegmentTranscoder`] that writes fake segment files instead of spawning
@@ -208,7 +211,6 @@ pub struct FakeTranscodeChild {
     output_dir: PathBuf,
     exit_code: i32,
     exited: Arc<AtomicBool>,
-    killed: Arc<AtomicBool>,
     polls_remaining: Arc<AtomicUsize>,
 }
 
@@ -225,7 +227,6 @@ impl FakeTranscodeChild {
             output_dir,
             exit_code,
             exited: Arc::new(AtomicBool::new(exits_immediately)),
-            killed: Arc::new(AtomicBool::new(false)),
             polls_remaining: Arc::new(AtomicUsize::new(write_after_polls)),
         }
     }
@@ -240,12 +241,6 @@ impl FakeTranscodeChild {
             .materialize(&self.output_dir)
             .expect("fake materialize on finish");
         self.exited.store(true, Ordering::SeqCst);
-    }
-
-    /// Whether [`kill`](TranscodeChild::kill) was called (test inspection).
-    #[must_use]
-    pub fn was_killed(&self) -> bool {
-        self.killed.load(Ordering::SeqCst)
     }
 }
 
@@ -274,8 +269,12 @@ impl TranscodeChild for FakeTranscodeChild {
     }
 
     async fn kill(&self) -> Result<(), String> {
-        self.killed.store(true, Ordering::SeqCst);
-        self.exited.store(true, Ordering::SeqCst);
+        if !self.exited.swap(true, Ordering::SeqCst) {
+            for name in &self.fake.script.kill_files {
+                std::fs::write(self.output_dir.join(name), b"cut short\n")
+                    .map_err(|e| format!("fake write {name}: {e}"))?;
+            }
+        }
         Ok(())
     }
 }

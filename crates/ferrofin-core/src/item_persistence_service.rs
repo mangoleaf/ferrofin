@@ -1026,7 +1026,7 @@ impl FerrofinItemPersistenceService {
 
     /// Installs the server's [`VirtualPathExpander`], so a save keeps the
     /// `%MetadataPath%`/`%AppDataPath%` form an adopted row stores while the
-    /// saved path is still its expansion ([`Self::upsert_item`]). Called once
+    /// saved path is still its expansion (`Self::upsert_item`). Called once
     /// by the composition root; without it every save writes the path it is
     /// given.
     ///
@@ -1083,7 +1083,7 @@ impl FerrofinItemPersistenceService {
     /// Rewrites `BaseItems.CleanName` from `Name` (rows with a non-empty
     /// name, `Id` order) and then `ItemValues.CleanValue` from `Value`
     /// (non-empty values, `ItemValueId` order) with [`get_clean_value`], in
-    /// partitions of [`REPAIR_PARTITION`] rows, writing only the rows whose
+    /// partitions of `REPAIR_PARTITION` rows, writing only the rows whose
     /// stored column disagrees — exactly the routine's loop, with each
     /// partition's updates committed as one transaction where EF's
     /// `SaveChangesAsync` runs per partition upstream. A whitespace-only source
@@ -1232,7 +1232,7 @@ impl FerrofinItemPersistenceService {
     /// (`Jellyfin.Server/Migrations/Routines/20260722120000_RefreshForcedSortNames.cs`).
     ///
     /// For every `BaseItems` row with a non-empty `ForcedSortName` (`Id`
-    /// order, partitions of [`REPAIR_PARTITION`]) recomputes `SortName` as
+    /// order, partitions of `REPAIR_PARTITION`) recomputes `SortName` as
     /// `GetSortName(ForcedSortName, Type != Person)` —
     /// [`crate::kinds::forced_sort_name_for`] — and writes it only when it
     /// differs from the stored value. 10.11.8 derived a forced sort name with
@@ -3052,10 +3052,11 @@ impl ItemPersistenceService for FerrofinItemPersistenceService {
     }
 
     async fn save_images(&self, item: &BaseItemEntity) -> Result<(), ServiceError> {
-        // The image rows live in BaseItemImageInfos and are owned by their own
-        // repository; without the domain item's ImageInfos list on the entity
-        // there is nothing to persist here beyond confirming the item exists.
-        // (Full image persistence lands with the image repository unit.)
+        // The image rows live in BaseItemImageInfos and are written through
+        // `save_item_images`/`set_item_image*`; without the domain item's
+        // ImageInfos list on the entity there is nothing to persist here beyond
+        // confirming the item exists, and nothing calls this. TODO(gl-211): open
+        // work item: remove it from the trait.
         let exists: Option<i64> =
             sqlx::query_scalar(r#"SELECT 1 FROM "BaseItems" WHERE "Id" = ?1"#)
                 .bind(&item.id)
@@ -3084,6 +3085,35 @@ impl ItemPersistenceService for FerrofinItemPersistenceService {
         write_item_images(&mut tx, item_id, images).await?;
         tx.commit().await.map_err(db_err)?;
         Ok(())
+    }
+
+    async fn add_item_image_if_absent(
+        &self,
+        item_id: Uuid,
+        image: &ItemImageInfo,
+    ) -> Result<bool, ServiceError> {
+        // One statement: a write takes the lock before it reads, so no image
+        // of the type can be stored between the check and the insert.
+        let added = sqlx::query(
+            r#"INSERT INTO "BaseItemImageInfos"
+               ("Id", "ItemId", "ImageType", "Path", "Width", "Height", "Blurhash", "DateModified")
+               SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8
+               WHERE NOT EXISTS (SELECT 1 FROM "BaseItemImageInfos"
+                                 WHERE "ItemId" = ?2 AND "ImageType" = ?3)"#,
+        )
+        .bind(guid_to_db(Uuid::new_v4()))
+        .bind(guid_to_db(item_id))
+        .bind(image_type_to_disc(image.image_type))
+        .bind(&image.path)
+        .bind(i64::from(image.width))
+        .bind(i64::from(image.height))
+        .bind(image.blur_hash.as_deref().map(str::as_bytes))
+        .bind(datetime_to_db(image.date_modified))
+        .execute(self.db.writer())
+        .await
+        .map_err(db_err)?
+        .rows_affected();
+        Ok(added > 0)
     }
 
     async fn save_items_images(
@@ -3982,14 +4012,19 @@ impl ItemPersistenceService for FerrofinItemPersistenceService {
         Ok(written)
     }
 
-    async fn clear_date_last_refreshed(&self, item_id: Uuid) -> Result<bool, ServiceError> {
-        let cleared =
-            sqlx::query(r#"UPDATE "BaseItems" SET "DateLastRefreshed" = NULL WHERE "Id" = ?1"#)
+    async fn set_date_last_refreshed(
+        &self,
+        item_id: Uuid,
+        at: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> Result<bool, ServiceError> {
+        let written =
+            sqlx::query(r#"UPDATE "BaseItems" SET "DateLastRefreshed" = ?2 WHERE "Id" = ?1"#)
                 .bind(guid_to_db(item_id))
+                .bind(opt_datetime_to_db(at))
                 .execute(self.db.writer())
                 .await
                 .map_err(db_err)?;
-        Ok(cleared.rows_affected() > 0)
+        Ok(written.rows_affected() > 0)
     }
 
     async fn presentation_unique_key(&self, item_id: Uuid) -> Result<Option<String>, ServiceError> {
@@ -4358,9 +4393,10 @@ impl ItemPersistenceService for FerrofinItemPersistenceService {
     }
 
     async fn update_inherited_values(&self) -> Result<(), ServiceError> {
-        // Recomputing inherited parental-rating / tag values across the item tree
-        // requires the AncestorIds closure traversal owned by the library manager;
-        // deferred to that unit. No-op here so callers can invoke it safely.
+        // A no-op that nothing calls. Upstream's `UpdateInheritedValues` deletes
+        // the `ItemValuesMap` rows of type `InheritedTags`, which Ferrofin never
+        // writes (an adopted database may hold some). TODO(gl-211): open work
+        // item: port it and call it after the post-scan tasks, or remove it.
         Ok(())
     }
 }
@@ -12832,7 +12868,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn clearing_the_refresh_stamp_moves_nothing_else() {
+    async fn setting_the_refresh_stamp_moves_nothing_else() {
         let db = test_db().await;
         let service = FerrofinItemPersistenceService::new(db.clone());
         let item = Uuid::new_v4();
@@ -12845,14 +12881,26 @@ mod tests {
         let stamped = crate::test_support::fetch_item(&db, item).await;
         assert!(stamped.date_last_refreshed.is_some());
 
-        assert!(service.clear_date_last_refreshed(item).await.unwrap());
+        assert!(service.set_date_last_refreshed(item, None).await.unwrap());
 
         let row = crate::test_support::fetch_item(&db, item).await;
         assert_eq!(row.date_last_refreshed, None);
         assert_eq!(row.date_last_saved, stamped.date_last_saved);
+
+        // At the stored precision, as a stamp the scan read back is.
+        let earlier = stamped.date_last_refreshed.unwrap() - chrono::TimeDelta::days(3);
+        assert!(
+            service
+                .set_date_last_refreshed(item, Some(earlier))
+                .await
+                .unwrap()
+        );
+        let row = crate::test_support::fetch_item(&db, item).await;
+        assert_eq!(row.date_last_refreshed, Some(earlier), "put back");
+        assert_eq!(row.date_last_saved, stamped.date_last_saved);
         assert!(
             !service
-                .clear_date_last_refreshed(Uuid::new_v4())
+                .set_date_last_refreshed(Uuid::new_v4(), None)
                 .await
                 .unwrap(),
             "no such row"

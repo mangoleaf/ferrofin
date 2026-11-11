@@ -23,12 +23,12 @@
 //!
 //! - [`auth_context_layer`] — a middleware that builds a transport-agnostic
 //!   [`RequestContext`] from the request's credential headers + query, asks
-//!   [`AuthorizationContext`] to parse it into an [`AuthorizationInfo`], and
+//!   `AuthorizationContext` to parse it into an [`AuthorizationInfo`], and
 //!   stashes that as a request extension. It never rejects: an anonymous request
 //!   still gets a (default) [`AuthorizationInfo`], matching the C# behaviour
 //!   where `[Authorize]` — not the context builder — enforces auth.
 //! - [`RequireAuth`] — a `FromRequestParts` extractor for handlers behind
-//!   `[Authorize]`. It runs [`AuthService::authenticate`], yielding the
+//!   `[Authorize]`. It runs `AuthService::authenticate`, yielding the
 //!   authenticated [`AuthorizationInfo`] or a `401`.
 
 use axum::extract::{FromRequestParts, State};
@@ -371,7 +371,7 @@ pub async fn is_administrator_identity(
 /// rendered and the server ignored — an account with it cleared could still
 /// browse the whole guide.
 ///
-/// The policy itself is [`require_user_permission`], which both Live TV
+/// The policy itself is `require_user_permission`, which both Live TV
 /// extractors share; this one names `EnableLiveTvAccess` as the permission the
 /// non-administrator arm demands. `EnableLiveTvAccess` defaults to `true`
 /// (`UserEntityExtensions.cs:187`), which is why a stock account sees no change.
@@ -400,7 +400,7 @@ impl FromRequestParts<AppState> for RequireLiveTvAccess {
 /// timer — and the rest under [`RequireAdmin`], which refused the
 /// non-administrator the dashboard had explicitly granted recording rights.
 ///
-/// The policy itself is [`require_user_permission`]; this one names
+/// The policy itself is `require_user_permission`; this one names
 /// `EnableLiveTvManagement`, which defaults to `false`
 /// (`UserEntityExtensions.cs:188`).
 #[derive(Debug, Clone)]
@@ -706,7 +706,7 @@ impl FromRequestParts<AppState> for FirstTimeSetupOrElevated {
 /// derives from `DefaultAuthorizationRequirement`. Here they come from
 /// [`RequireAuth`], which this extractor runs before the permission check.
 ///
-/// The policy itself is [`require_user_permission`].
+/// The policy itself is `require_user_permission`.
 #[derive(Debug, Clone)]
 pub struct RequireLyricManagement(pub AuthorizationInfo);
 
@@ -727,7 +727,7 @@ impl FromRequestParts<AppState> for RequireLyricManagement {
 /// which every `CollectionController` action declares.
 ///
 /// Port of `new UserPermissionRequirement(PermissionKind.EnableCollectionManagement)`;
-/// the policy itself is [`require_user_permission`], whose administrator arm
+/// the policy itself is `require_user_permission`, whose administrator arm
 /// is why an administrator with `EnableCollectionManagement = 0` may create
 /// a collection on a real 10.11.8.
 #[derive(Debug, Clone)]

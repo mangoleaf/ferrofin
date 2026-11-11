@@ -307,8 +307,6 @@ struct RunningJob {
     segment_cleaner: Option<super::segment_cleaner::SegmentCleanerTask>,
     /// Dashboard details updated by stderr statistics.
     info: TranscodingInfo,
-    /// Dynamic segment paths waiting for response completion.
-    segment_endings: std::collections::HashMap<PathBuf, i64>,
     /// Per-segment end-position tracking for the segment cleaner (replaces the
     /// old division-by-segment-length estimate that deleted ahead on MKV remux).
     served_segments: std::sync::Arc<Mutex<std::collections::HashMap<i64, i64>>>,
@@ -351,12 +349,13 @@ impl RunningJob {
                 paused: false,
                 stopped: false,
                 last_progress: None,
+                size_failure: None,
+                panicked: false,
             })),
             run_time_ticks: state.run_time_ticks,
             start_time_ticks: state.base_request.start_time_ticks,
             segment_cleaner: None,
             info: transcoding_info(state, hardware_acceleration_type),
-            segment_endings: std::collections::HashMap::new(),
             served_segments: std::sync::Arc::new(Mutex::new(std::collections::HashMap::new())),
             output_dir,
             playlist_path,
@@ -379,6 +378,7 @@ fn hls_start_number(arguments: &[String]) -> i32 {
 }
 
 /// Per-job control state, serialized with teardown.
+#[allow(clippy::struct_excessive_bools)] // independent flags, not one state machine
 struct ThrottleController {
     keys: Option<super::throttler::PauseKeys>,
     /// Whether this job was eligible and live when its timer was armed. Only
@@ -388,9 +388,41 @@ struct ThrottleController {
     paused: bool,
     stopped: bool,
     last_progress: Option<super::progress::FfmpegProgress>,
+    /// The progressive output-size failure last logged at `warn`; cleared by a
+    /// successful read.
+    size_failure: Option<String>,
+    /// Whether this job's controls step has panicked before, so a repeat
+    /// logs at `debug`.
+    panicked: bool,
 }
 
 impl ThrottleController {
+    /// The progressive output's size on disk, or `None` when it cannot be read,
+    /// which stops throttling the job (a paused job resumes).
+    ///
+    /// Every due timer reads it, so a failure is logged at `warn` the first time
+    /// it is seen and at `debug` while it repeats (LOGGING.md §1), as
+    /// [`EncodingOptionsReader`](crate::configuration::reader::EncodingOptionsReader)
+    /// does for the settings read. A successful read re-arms the warning.
+    fn output_length(&mut self, path: &str) -> Option<i64> {
+        match std::fs::metadata(path) {
+            Ok(metadata) => {
+                self.size_failure = None;
+                Some(i64::try_from(metadata.len()).unwrap_or(i64::MAX))
+            }
+            Err(error) => {
+                let error = error.to_string();
+                if self.size_failure.as_ref() == Some(&error) {
+                    tracing::debug!(path, %error, "cannot read the progressive transcode's output size");
+                } else {
+                    tracing::warn!(path, %error, "cannot read the progressive transcode's output size; not throttling it until it can be read");
+                    self.size_failure = Some(error);
+                }
+                None
+            }
+        }
+    }
+
     /// The job's pause keys, adopting ones the startup probe published after
     /// its timer was armed. A job that never got a timer (ineligible) never
     /// adopts keys.
@@ -685,30 +717,8 @@ impl<S: SessionReporter, C: FileCleaner> TranscodeManagerImpl<S, C> {
         self.pause_keys.clone()
     }
 
-    /// Associates a dynamic segment with its exact ending position.
-    ///
-    /// Resolution alone does not advance progress: the HTTP response must terminate (including cancellation).
-    ///
-    /// # Panics
-    ///
-    /// Panics if the registry lock is poisoned.
-    pub fn track_segment_download(&self, playlist: &str, file: &Path, ending_ticks: i64) {
-        let mut jobs = self.jobs.lock().expect("jobs lock poisoned");
-        if let Some(running) = jobs
-            .iter_mut()
-            .find(|job| {
-                job.handle.job_type == TranscodingJobType::Hls
-                    && job.handle.path.eq_ignore_ascii_case(playlist)
-            })
-            .and_then(|job| job.running.as_mut())
-        {
-            running
-                .segment_endings
-                .insert(file.to_path_buf(), ending_ticks);
-        }
-    }
-
-    /// Tracks reads and completion of a response produced by a registered job.
+    /// Tracks reads and completion of a progressive job's output response.
+    /// Dynamic HLS segments bind through [`Self::segment_progress`] instead.
     ///
     /// The observer releases its consumer mark on drop, including disconnects.
     ///
@@ -727,11 +737,11 @@ impl<S: SessionReporter, C: FileCleaner> TranscodeManagerImpl<S, C> {
         let file = Path::new(file);
         let mut jobs = self.jobs.lock().expect("jobs lock poisoned");
         let job = jobs.iter_mut().find(|job| {
-            job.running.as_ref().is_some_and(|running| {
-                (job.handle.job_type == TranscodingJobType::Progressive
-                    && running.playlist_path == file)
-                    || running.segment_endings.contains_key(file)
-            })
+            job.handle.job_type == TranscodingJobType::Progressive
+                && job
+                    .running
+                    .as_ref()
+                    .is_some_and(|running| running.playlist_path == file)
         })?;
         let running = job.running.as_ref()?;
         let observer = DownloadObserver {
@@ -739,7 +749,7 @@ impl<S: SessionReporter, C: FileCleaner> TranscodeManagerImpl<S, C> {
             handle: job.handle.clone(),
             child: std::sync::Arc::clone(&running.child),
             progress: std::sync::Arc::clone(&running.progress),
-            ending_ticks: running.segment_endings.get(file).copied(),
+            ending_ticks: None,
             segment_index: None,
             served_segments: std::sync::Arc::clone(&running.served_segments),
             completed: std::sync::atomic::AtomicBool::new(false),
@@ -794,9 +804,13 @@ impl<S: SessionReporter, C: FileCleaner> TranscodeManagerImpl<S, C> {
     /// Configuration read failures are logged and resume a paused encoder; they
     /// cannot leave playback stalled behind an unreadable settings document.
     ///
+    /// A job whose step panics is logged with its path and session, at
+    /// `error` the first time and at `debug` after that; the jobs after it
+    /// still get their steps, and its own is retried at the next pass.
+    ///
     /// # Panics
     ///
-    /// Panics if the registry or progress mutex has been poisoned.
+    /// Panics if the registry mutex has been poisoned.
     pub async fn update_transcoding_jobs(&self) {
         self.update_transcoding_jobs_with_options(None).await;
     }
@@ -825,76 +839,87 @@ impl<S: SessionReporter, C: FileCleaner> TranscodeManagerImpl<S, C> {
         };
         for (handle, child, controller, progress, runtime, start, mut info) in running {
             let mut controller = controller.lock().await;
-            if controller.stopped {
-                continue;
-            }
-            if child.has_exited() {
-                controller.stopped = true;
-                continue;
-            }
-            if let Some(report) = child.progress()
-                && controller.last_progress != Some(report)
-            {
-                controller.last_progress = Some(report);
-                if let Some(encoded) = report.for_job(runtime, start) {
-                    progress.lock().expect("progress lock poisoned").encoded = encoded;
-                    info.framerate = encoded.framerate;
-                    info.completion_percentage = encoded.percent_complete;
-                    info.bitrate = encoded.bit_rate.or(info.bitrate);
-                    self.reporter.report_progress(&handle, encoded).await;
-                    if handle
-                        .device_id
-                        .as_deref()
-                        .is_some_and(|device| !device.trim().is_empty())
-                    {
-                        self.reporter.report_started(&handle, info).await;
+            // One job's panic ends its own step, not the pass: the jobs after
+            // it still get theirs (gl-1412), as upstream's per-job timers do.
+            let step = async {
+                if controller.stopped {
+                    return;
+                }
+                if child.has_exited() {
+                    controller.stopped = true;
+                    return;
+                }
+                if let Some(report) = child.progress()
+                    && controller.last_progress != Some(report)
+                {
+                    controller.last_progress = Some(report);
+                    if let Some(encoded) = report.for_job(runtime, start) {
+                        progress.lock().expect("progress lock poisoned").encoded = encoded;
+                        info.framerate = encoded.framerate;
+                        info.completion_percentage = encoded.percent_complete;
+                        info.bitrate = encoded.bit_rate.or(info.bitrate);
+                        self.reporter.report_progress(&handle, encoded).await;
+                        if handle
+                            .device_id
+                            .as_deref()
+                            .is_some_and(|device| !device.trim().is_empty())
+                        {
+                            self.reporter.report_started(&handle, info).await;
+                        }
                     }
                 }
-            }
-            let Some(keys) = controller.keys_now(&self.pause_keys) else {
-                continue;
-            };
-            if Instant::now() < controller.next_tick {
-                continue;
-            }
-            controller.next_tick = Instant::now() + super::throttler::THROTTLE_INTERVAL;
-            // Each due timer reads the live document once. The 500ms stderr
-            // pump never performs settings reads for jobs with no due timer.
-            let options = if let Some(options) = override_options {
-                options.clone()
-            } else if let Some(config) = &self.encoding_config {
-                self.throttle_options.read(config.as_ref()).await
-            } else {
-                ferrofin_model::configuration::EncodingOptions::default()
-            };
-            let progress = *progress.lock().expect("progress lock poisoned");
-            let output_length = if options.enable_throttling
-                && progress.download_position_ticks.unwrap_or(0) <= 0
-                && progress.encoded.bytes_transcoded.is_none()
-                && progress.bytes_downloaded > 0
-                && progress.encoded.position_ticks.unwrap_or(0) > 0
-            {
-                match std::fs::metadata(&handle.path) {
-                    Ok(metadata) => Some(i64::try_from(metadata.len()).unwrap_or(i64::MAX)),
-                    Err(error) => {
-                        tracing::error!(path = %handle.path, %error, "reading progressive transcode size failed");
-                        None
+                let Some(keys) = controller.keys_now(&self.pause_keys) else {
+                    return;
+                };
+                if Instant::now() < controller.next_tick {
+                    return;
+                }
+                controller.next_tick = Instant::now() + super::throttler::THROTTLE_INTERVAL;
+                // Each due timer reads the live document once. The 500ms stderr
+                // pump never performs settings reads for jobs with no due timer.
+                let options = if let Some(options) = override_options {
+                    options.clone()
+                } else if let Some(config) = &self.encoding_config {
+                    self.throttle_options.read(config.as_ref()).await
+                } else {
+                    ferrofin_model::configuration::EncodingOptions::default()
+                };
+                let progress = *progress.lock().expect("progress lock poisoned");
+                let output_length = if options.enable_throttling
+                    && progress.download_position_ticks.unwrap_or(0) <= 0
+                    && progress.encoded.bytes_transcoded.is_none()
+                    && progress.bytes_downloaded > 0
+                    && progress.encoded.position_ticks.unwrap_or(0) > 0
+                {
+                    controller.output_length(&handle.path)
+                } else {
+                    None
+                };
+                let paused = super::throttler::should_pause(&options, progress, output_length);
+                if paused != controller.paused {
+                    let key = if paused { keys.pause() } else { keys.resume() };
+                    match child.write_stdin(key).await {
+                        Ok(()) => {
+                            controller.paused = paused;
+                            tracing::debug!(path = %handle.path, paused, "transcode throttle state changed");
+                        }
+                        Err(error) => {
+                            tracing::error!(path = %handle.path, %error, paused, "controlling transcode throttle failed");
+                        }
                     }
                 }
-            } else {
-                None
             };
-            let paused = super::throttler::should_pause(&options, progress, output_length);
-            if paused != controller.paused {
-                let key = if paused { keys.pause() } else { keys.resume() };
-                match child.write_stdin(key).await {
-                    Ok(()) => {
-                        controller.paused = paused;
-                        tracing::debug!(path = %handle.path, paused, "transcode throttle state changed");
-                    }
-                    Err(error) => {
-                        tracing::error!(path = %handle.path, %error, paused, "controlling transcode throttle failed");
-                    }
+            let outcome =
+                futures_util::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(step)).await;
+            if let Err(payload) = outcome {
+                let panic = ferrofin_util::panic::message(payload.as_ref());
+                let play_session_id = handle.play_session_id.as_deref().unwrap_or("");
+                // Once per job: a step that panics on every pass would
+                // otherwise repeat it each tick, beside the panic hook's line.
+                if std::mem::replace(&mut controller.panicked, true) {
+                    tracing::debug!(task = "transcode_controls", path = %handle.path, play_session_id, panic, "transcode job's controls step panicked again");
+                } else {
+                    tracing::error!(task = "transcode_controls", path = %handle.path, play_session_id, panic, "transcode job's controls step panicked; the other jobs go on, and this one is retried each tick");
                 }
             }
         }
@@ -904,7 +929,8 @@ impl<S: SessionReporter, C: FileCleaner> TranscodeManagerImpl<S, C> {
     ///
     /// A weak reference prevents this composition task from retaining all jobs
     /// after server shutdown. A tick that panics is logged and ends alone
-    /// (`survive_panic`): the next tick runs as usual.
+    /// (`survive_panic`): the next tick runs as usual. One job's panicking
+    /// step ends only that step ([`Self::update_transcoding_jobs`]).
     pub async fn run_transcode_controls(manager: std::sync::Weak<Self>) {
         let mut failing = false;
         loop {
@@ -1434,6 +1460,10 @@ impl<S: SessionReporter, C: FileCleaner> TranscodeManagerImpl<S, C> {
 
     /// Stops a job already out of the registry: its process, its rolling
     /// deletion and, when `delete_files` is set, its partial output.
+    ///
+    /// A panic while stopping the process is logged and the file and session
+    /// steps still run, as upstream's `KillTranscodingJob` goes on past a
+    /// failed `Stop`: no later sweep or kill would reach this job again.
     async fn tear_down(
         &self,
         handle: &TranscodingJobHandle,
@@ -1453,22 +1483,33 @@ impl<S: SessionReporter, C: FileCleaner> TranscodeManagerImpl<S, C> {
             );
             // Stop the timer under the same lock as control writes, resuming
             // before kill so ffmpeg cannot remain in its paused command loop.
-            let mut controller = running.controller.lock().await;
-            controller.stopped = true;
-            if controller.paused
-                && let Some(keys) = controller.keys
-            {
-                match running.child.write_stdin(keys.resume()).await {
-                    Ok(()) => controller.paused = false,
-                    Err(error) => {
-                        tracing::error!(path = %handle.path, %error, "resuming transcode before teardown failed");
+            let stop = async {
+                let mut controller = running.controller.lock().await;
+                controller.stopped = true;
+                if controller.paused
+                    && let Some(keys) = controller.keys
+                {
+                    match running.child.write_stdin(keys.resume()).await {
+                        Ok(()) => controller.paused = false,
+                        Err(error) => {
+                            tracing::error!(path = %handle.path, %error, "resuming transcode before teardown failed");
+                        }
                     }
                 }
+                if let Err(error) = running.child.kill().await {
+                    tracing::error!(path = %handle.path, %error, "killing ffmpeg at teardown failed; it may still be running");
+                }
+            };
+            if let Err(payload) =
+                futures_util::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(stop)).await
+            {
+                tracing::error!(
+                    path = %handle.path,
+                    play_session_id = handle.play_session_id.as_deref().unwrap_or(""),
+                    panic = ferrofin_util::panic::message(payload.as_ref()),
+                    "stopping ffmpeg at teardown panicked; it may still be running"
+                );
             }
-            if let Err(error) = running.child.kill().await {
-                tracing::error!(path = %handle.path, %error, "killing ffmpeg at teardown failed; it may still be running");
-            }
-            drop(controller);
             if delete_files {
                 let stem = running
                     .playlist_path
@@ -1534,18 +1575,51 @@ impl<S: SessionReporter, C: FileCleaner> TranscodeManagerImpl<S, C> {
         idle.into_iter().map(|(handle, _)| handle).collect()
     }
 
-    /// Runs [`Self::reap_idle_jobs`] forever, sweeping every `interval`. The
-    /// composition root spawns this once next to the manager.
+    /// Runs [`Self::reap_idle_jobs`], sweeping every `interval`, until the
+    /// manager drops. The composition root spawns this once next to the manager.
+    ///
+    /// The weak reference lets a server lifetime's manager, and the session
+    /// graph its reporter holds, go when an in-process restart drops it
+    /// (gl-141), as [`Self::run_transcode_controls`] does.
     ///
     /// A sweep that panics is logged and ends alone (`survive_panic`): the
     /// jobs it had not reached are still registered, so the next sweep reaps
     /// them. The job it was tearing down is already out of the registry and
-    /// is not retried.
-    pub async fn run_idle_reaper(self: std::sync::Arc<Self>, interval: Duration) {
+    /// is not retried; a panic while stopping its process does not reach the
+    /// sweep, since `tear_down` contains it and still tells the session layer.
+    pub async fn run_idle_reaper(manager: std::sync::Weak<Self>, interval: Duration) {
         let mut failing = false;
         loop {
             tokio::time::sleep(interval).await;
-            survive_panic("transcode_idle_reaper", &mut failing, self.reap_idle_jobs()).await;
+            let Some(manager) = manager.upgrade() else {
+                return;
+            };
+            survive_panic(
+                "transcode_idle_reaper",
+                &mut failing,
+                manager.reap_idle_jobs(),
+            )
+            .await;
+        }
+    }
+
+    /// Kills every job at the end of a server lifetime, deleting its partial
+    /// output and releasing its tuner, whether or not a consumer is still on it.
+    ///
+    /// The drain has already disconnected every client, and the next lifetime
+    /// clears the transcode cache before it starts a job, so nothing could
+    /// read these jobs' output again. Upstream leaves them to their kill
+    /// timers; killing them here stops an ffmpeg writing into a directory
+    /// the next lifetime purges (gl-141).
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal job-registry mutex has been poisoned.
+    pub async fn shutdown(&self) {
+        let jobs = std::mem::take(&mut *self.jobs.lock().expect("jobs lock poisoned"));
+        for job in jobs {
+            self.tear_down(&job.handle, &job.display, job.running, true, true)
+                .await;
         }
     }
 
@@ -2376,8 +2450,10 @@ mod tests {
 
         let logs = CapturedLogs::default();
         let guard = logs.install();
-        let reaper =
-            tokio::spawn(Arc::clone(&m).run_idle_reaper(std::time::Duration::from_secs(10)));
+        let reaper = tokio::spawn(TranscodeManagerImpl::run_idle_reaper(
+            Arc::downgrade(&m),
+            std::time::Duration::from_secs(10),
+        ));
         // Each sweep reaches one job: the first two panic in its teardown.
         for _ in 0..60 {
             if m.active_job_count() == 0 && !reporter.killed.lock().unwrap().is_empty() {
@@ -2409,6 +2485,54 @@ mod tests {
         );
         let recovered = reaper_lines("INFO");
         assert_eq!(recovered.len(), 1, "{recovered:#?}");
+    }
+
+    /// gl-141: the reaper holds its manager weakly, so dropping a server
+    /// lifetime's manager ends the reaper instead of keeping the manager, and
+    /// the session graph its reporter holds, alive across an in-process restart.
+    #[tokio::test(start_paused = true)]
+    async fn the_idle_reaper_ends_once_its_manager_is_dropped() {
+        let m = Arc::new(manager());
+        let reaper = tokio::spawn(TranscodeManagerImpl::run_idle_reaper(
+            Arc::downgrade(&m),
+            std::time::Duration::from_secs(10),
+        ));
+        drop(m);
+        tokio::time::timeout(std::time::Duration::from_secs(60), reaper)
+            .await
+            .expect("the reaper outlived its manager")
+            .expect("the reaper panicked");
+    }
+
+    /// gl-141: the end of a server lifetime kills every job, busy or idle,
+    /// deleting its partial output and releasing its tuner, so no ffmpeg
+    /// outlives the lifetime that started it.
+    #[tokio::test]
+    async fn shutdown_kills_and_removes_every_job() {
+        let reporter = Arc::new(RecordingReporter::default());
+        let m = TranscodeManagerImpl::new(ReporterHandle(Arc::clone(&reporter)));
+        m.register_job(handle("s1", "/t/a.m3u8", TranscodingJobType::Hls, "dev1"));
+        m.register_job(handle(
+            "s2",
+            "/t/b.mkv",
+            TranscodingJobType::Progressive,
+            "dev2",
+        ));
+        // A consumer mid-request keeps a job off the idle reaper's list.
+        m.jobs.lock().unwrap()[0].active_request_count = 1;
+
+        m.shutdown().await;
+
+        assert_eq!(m.active_job_count(), 0);
+        let mut killed = reporter.killed.lock().unwrap().clone();
+        killed.sort();
+        assert_eq!(
+            killed,
+            [
+                ("/t/a.m3u8".to_owned(), true, true),
+                ("/t/b.mkv".to_owned(), true, true)
+            ]
+        );
     }
 }
 
@@ -3520,6 +3644,8 @@ pub(super) mod throttle_tests {
         events: Mutex<Vec<Vec<u8>>>,
         fail_write: AtomicBool,
         fail_kill: AtomicBool,
+        /// Whether `kill` panics.
+        panic_kill: AtomicBool,
         exited: AtomicBool,
         /// How many more progress reads panic.
         panics: AtomicUsize,
@@ -3539,6 +3665,10 @@ pub(super) mod throttle_tests {
         }
         async fn kill(&self) -> Result<(), String> {
             self.0.events.lock().unwrap().push(b"kill".to_vec());
+            assert!(
+                !self.0.panic_kill.load(Ordering::SeqCst),
+                "killing ffmpeg panicked"
+            );
             if self.0.fail_kill.load(Ordering::SeqCst) {
                 return Err("fixture kill failure".to_owned());
             }
@@ -3633,18 +3763,26 @@ pub(super) mod throttle_tests {
         fixture_job(manager, true).await
     }
     /// As [`fixture_of`], for a video (throttle-eligible) or audio-only job.
-    async fn fixture_job(
-        manager: TranscodeManagerImpl<NoopSessionReporter>,
+    async fn fixture_job<S: SessionReporter>(
+        manager: TranscodeManagerImpl<S>,
         is_input_video: bool,
     ) -> (
         tempfile::TempDir,
-        Arc<TranscodeManagerImpl<NoopSessionReporter>>,
+        Arc<TranscodeManagerImpl<S>>,
         Arc<ChildState>,
         TranscodingJobHandle,
     ) {
+        let manager = Arc::new(manager);
+        let (directory, child, handle) = start_job(&manager, is_input_video).await;
+        (directory, manager, child, handle)
+    }
+    /// Starts one more job on `manager`, in a directory of its own.
+    async fn start_job<S: SessionReporter>(
+        manager: &TranscodeManagerImpl<S>,
+        is_input_video: bool,
+    ) -> (tempfile::TempDir, Arc<ChildState>, TranscodingJobHandle) {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("out.m3u8");
-        let manager = Arc::new(manager);
         let child = Arc::new(ChildState::default());
         let mut state = state(&path);
         state.is_input_video = is_input_video;
@@ -3665,7 +3803,7 @@ pub(super) mod throttle_tests {
             )
             .await
             .unwrap();
-        (directory, manager, child, handle)
+        (directory, child, handle)
     }
     async fn due(
         manager: &TranscodeManagerImpl<NoopSessionReporter>,
@@ -3785,10 +3923,8 @@ pub(super) mod throttle_tests {
 
     #[tokio::test]
     async fn first_timer_waits_and_completed_download_controls_live_pause_resume() {
-        let (directory, manager, child, handle) = fixture(Some(PauseKeys::Patched)).await;
+        let (_directory, manager, child, handle) = fixture(Some(PauseKeys::Patched)).await;
         encoded(&child, 200);
-        let segment = directory.path().join("out0.ts");
-        manager.track_segment_download(&handle.path, &segment, 6 * TICKS_PER_SECOND);
         manager
             .update_transcoding_jobs_with_options(Some(&options(60)))
             .await;
@@ -3796,7 +3932,9 @@ pub(super) mod throttle_tests {
             child.events.lock().unwrap().is_empty(),
             "the initial five seconds have not elapsed"
         );
-        let observer = manager.stream_progress(segment.to_str().unwrap()).unwrap();
+        let observer = manager
+            .segment_progress(&handle.path, 6 * TICKS_PER_SECOND, 0)
+            .unwrap();
         due(&manager, &handle).await;
         manager
             .update_transcoding_jobs_with_options(Some(&options(60)))
@@ -3884,6 +4022,40 @@ pub(super) mod throttle_tests {
             "{errors:#?}"
         );
         assert_eq!(manager.active_job_count(), 0);
+    }
+
+    /// gl-1411: a teardown whose ffmpeg kill panics still deletes the job's
+    /// partial files and tells the session layer, which releases its live
+    /// stream: the job is already out of the registry, so nothing would retry
+    /// them. The panic is logged with the job.
+    #[tokio::test]
+    async fn a_teardown_whose_kill_panics_still_cleans_up_and_tells_the_session() {
+        use super::tests::RecordingReporter;
+        use crate::configuration::reader::tests::CapturedLogs;
+        let reporter = Arc::new(RecordingReporter::default());
+        let (_directory, manager, child, handle) =
+            fixture_job(TranscodeManagerImpl::new(Arc::clone(&reporter)), true).await;
+        child.panic_kill.store(true, Ordering::SeqCst);
+
+        let logs = CapturedLogs::default();
+        let guard = logs.install();
+        manager.kill_and_remove(&handle, true, true).await;
+        drop(guard);
+
+        assert_eq!(
+            *reporter.killed.lock().unwrap(),
+            [(handle.path.clone(), true, true)]
+        );
+        assert!(!Path::new(&handle.path).exists(), "partial files kept");
+        assert_eq!(manager.active_job_count(), 0);
+        let errors = logs.lines_at("ERROR");
+        assert!(
+            errors.len() == 1
+                && errors[0].contains("killing ffmpeg panicked")
+                && errors[0].contains(&handle.path)
+                && errors[0].contains("throttle-session"),
+            "{errors:#?}"
+        );
     }
 
     #[tokio::test]
@@ -4054,8 +4226,83 @@ pub(super) mod throttle_tests {
         assert_eq!(repeats, 2);
     }
 
-    /// A tick that panics ends that tick only: the controls loop logs it with
-    /// its `task` and pumps the job's progress at the next one.
+    /// A progressive output the throttle cannot size is reported once at
+    /// `warn`, then at `debug` while it stays unreadable: the job carries on
+    /// unthrottled, as upstream's does, so an `error` per due timer would flood
+    /// the log (LOGGING.md §1). A successful read re-arms the warning.
+    #[tokio::test]
+    async fn an_unreadable_progressive_output_is_warned_about_once_not_every_tick() {
+        use crate::configuration::reader::tests::CapturedLogs;
+        async fn tick(
+            manager: &TranscodeManagerImpl<NoopSessionReporter>,
+            handle: &TranscodingJobHandle,
+        ) {
+            due(manager, handle).await;
+            manager
+                .update_transcoding_jobs_with_options(Some(&options(60)))
+                .await;
+        }
+        let (_directory, manager, child, handle) = fixture(Some(PauseKeys::Patched)).await;
+        // ffmpeg reports a position but no byte count and the client has
+        // downloaded bytes, so the tick sizes the output file (the progressive
+        // branch; the fixture's job type does not enter into it).
+        *child.progress.lock().unwrap() = Some(FfmpegProgress {
+            elapsed_ticks: Some(200 * TICKS_PER_SECOND),
+            framerate: Some(25.0),
+            bytes_transcoded: None,
+            bit_rate: None,
+        });
+        progress(&manager, &handle).lock().unwrap().bytes_downloaded = 100;
+        // The fixture's transcoder wrote the output; it disappears mid-job.
+        std::fs::remove_file(&handle.path).unwrap();
+        let warned = |logs: &CapturedLogs| {
+            logs.lines_at("WARN")
+                .into_iter()
+                .filter(|line| line.contains("progressive transcode"))
+                .count()
+        };
+
+        let logs = CapturedLogs::default();
+        let guard = logs.install();
+        for _ in 0..3 {
+            tick(&manager, &handle).await;
+        }
+        assert!(
+            logs.lines_at("ERROR").is_empty(),
+            "{:#?}",
+            logs.lines_at("ERROR")
+        );
+        assert_eq!(warned(&logs), 1, "{:#?}", logs.lines_at("WARN"));
+        let repeats = logs
+            .lines_at("DEBUG")
+            .into_iter()
+            .filter(|line| line.contains("progressive transcode"))
+            .count();
+        assert_eq!(repeats, 2);
+        assert!(child.events.lock().unwrap().is_empty(), "no size, no pause");
+
+        // 10000 bytes encoded against 100 downloaded is past the 60 s gap at
+        // 200 s encoded, so a good read pauses the job; losing the file again
+        // resumes it and warns again.
+        std::fs::write(&handle.path, [0u8; 10_000]).unwrap();
+        tick(&manager, &handle).await;
+        std::fs::remove_file(&handle.path).unwrap();
+        tick(&manager, &handle).await;
+        drop(guard);
+        assert_eq!(
+            *child.events.lock().unwrap(),
+            vec![b"p".to_vec(), b"u".to_vec()]
+        );
+        assert_eq!(
+            warned(&logs),
+            2,
+            "a good read re-arms the warning: {:#?}",
+            logs.lines_at("WARN")
+        );
+    }
+
+    /// A job's step that panics ends that step only: the controls loop logs
+    /// it with its `task` and pumps the job's progress at the next tick.
     #[tokio::test]
     async fn a_panicking_tick_is_logged_and_the_controls_loop_carries_on() {
         use crate::configuration::reader::tests::CapturedLogs;
@@ -4107,6 +4354,62 @@ pub(super) mod throttle_tests {
         );
     }
 
+    /// gl-1412: a job whose step panics on every pass ends only its own step,
+    /// so the job after it in the registry still gets its progress pumped. The
+    /// panic is logged with the job, at `error` once and then at `debug`.
+    #[tokio::test]
+    async fn a_job_that_panics_every_pass_does_not_starve_the_jobs_after_it() {
+        use crate::configuration::reader::tests::CapturedLogs;
+        let (_broken_directory, manager, broken, broken_handle) = fixture(None).await;
+        let (_directory, healthy, handle) = start_job(&manager, true).await;
+        encoded(&broken, 200);
+        encoded(&healthy, 200);
+        broken.panics.store(usize::MAX, Ordering::SeqCst);
+        tokio::time::pause();
+
+        let logs = CapturedLogs::default();
+        let guard = logs.install();
+        let controls = tokio::spawn(TranscodeManagerImpl::run_transcode_controls(
+            Arc::downgrade(&manager),
+        ));
+        // Three passes, each reaching the broken job first.
+        tokio::time::sleep(Duration::from_millis(1600)).await;
+        drop(guard);
+        controls.abort();
+
+        assert_eq!(
+            progress(&manager, &handle)
+                .lock()
+                .unwrap()
+                .encoded
+                .framerate,
+            Some(25.0),
+            "the job after the broken one starved"
+        );
+        let broken_lines = |level| -> Vec<String> {
+            logs.lines_at(level)
+                .into_iter()
+                .filter(|line| {
+                    line.contains("task=\"transcode_controls\"")
+                        && line.contains(&broken_handle.path)
+                })
+                .collect()
+        };
+        let errors = broken_lines("ERROR");
+        assert!(
+            errors.len() == 1
+                && errors[0].contains("reading ffmpeg progress failed")
+                && errors[0].contains("throttle-session"),
+            "{errors:#?}"
+        );
+        assert_eq!(
+            broken_lines("DEBUG").len(),
+            2,
+            "{:#?}",
+            logs.lines_at("DEBUG")
+        );
+    }
+
     #[tokio::test]
     async fn client_ping_does_not_substitute_for_download_and_old_body_cannot_update_seek_replacement()
      {
@@ -4121,10 +4424,10 @@ pub(super) mod throttle_tests {
             .update_transcoding_jobs_with_options(Some(&options(60)))
             .await;
         assert!(child.events.lock().unwrap().is_empty());
-        let segment = directory.path().join("out0.ts");
-        manager.track_segment_download(&handle.path, &segment, 6 * TICKS_PER_SECOND);
         let old_progress = progress(&manager, &handle);
-        let observer = manager.stream_progress(segment.to_str().unwrap()).unwrap();
+        let observer = manager
+            .segment_progress(&handle.path, 6 * TICKS_PER_SECOND, 0)
+            .unwrap();
         assert_eq!(manager.jobs.lock().unwrap()[0].active_request_count, 1);
         manager.kill_and_remove(&handle, false, false).await;
         let state = state(Path::new(&handle.path));
@@ -4146,8 +4449,9 @@ pub(super) mod throttle_tests {
             )
             .await
             .unwrap();
-        manager.track_segment_download(&replacement.path, &segment, 100 * TICKS_PER_SECOND);
-        let new_observer = manager.stream_progress(segment.to_str().unwrap()).unwrap();
+        let new_observer = manager
+            .segment_progress(&replacement.path, 100 * TICKS_PER_SECOND, 0)
+            .unwrap();
         observer.complete();
         drop(observer);
         assert_eq!(
@@ -4174,13 +4478,12 @@ pub(super) mod throttle_tests {
     }
 
     #[tokio::test]
-    async fn repeated_and_out_of_order_completions_are_monotonic_and_missing_markers_are_untracked()
-    {
-        let (directory, manager, _child, handle) = fixture(None).await;
+    async fn repeated_and_out_of_order_completions_are_monotonic() {
+        let (_directory, manager, _child, handle) = fixture(None).await;
         for (index, ending) in [(9, 62), (0, 3), (4, 30)] {
-            let path = directory.path().join(format!("out{index}.ts"));
-            manager.track_segment_download(&handle.path, &path, ending * TICKS_PER_SECOND);
-            let observer = manager.stream_progress(path.to_str().unwrap()).unwrap();
+            let observer = manager
+                .segment_progress(&handle.path, ending * TICKS_PER_SECOND, index)
+                .unwrap();
             observer.complete();
             observer.complete();
         }
@@ -4192,18 +4495,8 @@ pub(super) mod throttle_tests {
             Some(62 * TICKS_PER_SECOND)
         );
         assert!(
-            manager
-                .stream_progress(directory.path().join("out99.ts").to_str().unwrap())
-                .is_none()
-        );
-        assert!(
-            manager
-                .stream_progress(directory.path().join("other/out9.ts").to_str().unwrap())
-                .is_none()
-        );
-        assert!(
             manager.stream_progress(handle.path.as_str()).is_none(),
-            "playlist fetches are not segment download progress"
+            "an HLS job's files bind through segment_progress only"
         );
     }
 

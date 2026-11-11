@@ -5,16 +5,18 @@
 //! `IHasItemChangeMonitor`. Two of those strategy interfaces are, per the
 //! `ferrofin-traits` port note, **not** ported as traits — they become
 //! match-on-item-kind logic in `ferrofin-core`; and `IForcedProvider` is a pure
-//! marker. So this port is a plain struct exposing the provider's three
-//! behaviours as methods:
+//! marker. `IHasItemChangeMonitor.HasChanged` (run the provider when the
+//! file's last write time moved) belongs to the refresh decision in
+//! `ferrofin_providers::refresh_plan`, which covers a changed photo through
+//! `RequiresRefresh` in `Default` and `FullRefresh` refreshes; a
+//! `ValidationOnly` refresh and a row with no stored `DateModified` do not run
+//! this provider yet (gl-1530). So this port is a plain struct exposing the
+//! provider's two behaviours as methods:
 //!
 //! - [`name`](PhotoProvider::name) → the constant `"Embedded Information"`.
-//! - [`has_changed`](PhotoProvider::has_changed) → the
-//!   `IHasItemChangeMonitor.HasChanged` last-write-time comparison, file-protocol
-//!   gated, behind the [`DirectoryService`] seam.
 //! - [`fetch`](PhotoProvider::fetch) → the `FetchAsync` body: set the Primary
 //!   image path, then backfill zero/negative width/height from the
-//!   [`ImageProcessor`](ferrofin_traits::drawing::ImageProcessor).
+//!   [`ImageProcessor`].
 //!
 //! # Always-on vs. conditional
 //!
@@ -53,7 +55,7 @@ const PROVIDER_NAME: &str = "Embedded Information";
 const EXIF_INCLUDE_EXTENSIONS: [&str; 7] =
     [".jpg", ".jpeg", ".png", ".tiff", ".cr2", ".webp", ".avif"];
 
-/// Whether `path`'s extension is one the (deferred) EXIF branch would open.
+/// Whether `path`'s extension is one the EXIF branch opens.
 ///
 /// Port of the C# `_includeExtensions.Contains(Path.GetExtension(path),
 /// StringComparison.OrdinalIgnoreCase)` gate. Matched case-insensitively; a
@@ -77,33 +79,10 @@ fn extension_of(path: &str) -> String {
     }
 }
 
-/// A single file's read-only stat, as returned by the directory-service seam.
-///
-/// Port of the fields of `FileSystemMetadata` that
-/// [`PhotoProvider::has_changed`] reads — only the last-write-time is needed.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct FileInfo {
-    /// The file's last-modified time in UTC. Port of `LastWriteTimeUtc`.
-    pub last_write_time_utc: DateTime<Utc>,
-}
-
-/// The directory-lookup seam [`PhotoProvider::has_changed`] needs.
-///
-/// Port of the single `IDirectoryService.GetFile(path)` call the C#
-/// `HasChanged` makes. Behind a trait so the real filesystem stat stays out of
-/// the parity/coverage numbers and unit tests use a fake — matching the crate's
-/// [`FileMeta`](crate::processor::FileMeta) convention.
-pub trait DirectoryService: Send + Sync {
-    /// Returns the file at `path`, or `None` when it does not exist. Port of
-    /// `IDirectoryService.GetFile` (which returns `null` for a missing file).
-    fn get_file(&self, path: &str) -> Option<FileInfo>;
-}
-
 /// The photo whose embedded information is being refreshed.
 ///
 /// A value struct standing in for the C# `Photo` (a `BaseItem` subclass), holding
-/// the fields [`fetch`](PhotoProvider::fetch) and
-/// [`has_changed`](PhotoProvider::has_changed) read or write.
+/// the fields [`fetch`](PhotoProvider::fetch) reads or writes.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct PhotoItem {
     /// The item's stable identity. Port of `BaseItem.Id`; forwarded to
@@ -114,10 +93,6 @@ pub struct PhotoItem {
     /// The path to the source image file. Port of `BaseItem.Path`.
     pub path: String,
 
-    /// Whether the item is backed by a local file (vs. a remote/URL source).
-    /// Port of `BaseItem.IsFileProtocol`; gates [`has_changed`](PhotoProvider::has_changed).
-    pub is_file_protocol: bool,
-
     /// Set by [`PhotoProvider::fetch`] when EXIF was read from the file.
     ///
     /// Not a Jellyfin field: C# expresses the same thing by only entering the
@@ -126,10 +101,6 @@ pub struct PhotoItem {
     /// onto a row when this is `false`, or a file with no readable EXIF would
     /// clear values it never spoke about.
     pub exif_was_read: bool,
-
-    /// The item's recorded last-modified time. Port of `BaseItem.DateModified`,
-    /// compared against the on-disk time in [`has_changed`](PhotoProvider::has_changed).
-    pub date_modified: DateTime<Utc>,
 
     /// The image width in pixels (`<= 0` when unknown → backfilled). Port of
     /// `Photo.Width`.
@@ -251,7 +222,7 @@ fn last_write_time(path: &str) -> DateTime<Utc> {
 /// Metadata provider for photos — the embedded-information provider.
 ///
 /// Port of `Emby.Photos.PhotoProvider`. Holds the shared
-/// [`ImageProcessor`](ferrofin_traits::drawing::ImageProcessor) used to probe
+/// [`ImageProcessor`] used to probe
 /// image dimensions when the item's stored width/height are unknown.
 pub struct PhotoProvider {
     /// The image processor used for dimension probing. Port of the injected
@@ -275,26 +246,6 @@ impl PhotoProvider {
         PROVIDER_NAME
     }
 
-    /// Whether the item has changed since it was last refreshed. Port of
-    /// `IHasItemChangeMonitor.HasChanged`.
-    ///
-    /// Only file-protocol items are monitored: for them, the on-disk file's
-    /// last-write-time is looked up through `directory_service` and compared
-    /// against the item's recorded [`date_modified`](PhotoItem::date_modified)
-    /// (a strictly-later disk time means changed — the C#
-    /// `item.HasChanged(file.LastWriteTimeUtc)` semantics). A non-file-protocol
-    /// item, or one whose file is missing, is never "changed".
-    #[must_use]
-    pub fn has_changed(&self, item: &PhotoItem, directory_service: &dyn DirectoryService) -> bool {
-        if !item.is_file_protocol {
-            return false;
-        }
-        match directory_service.get_file(&item.path) {
-            Some(file) => file.last_write_time_utc > item.date_modified,
-            None => false,
-        }
-    }
-
     /// Refreshes the item's embedded information, returning what changed. Port of
     /// `FetchAsync`.
     ///
@@ -302,7 +253,7 @@ impl PhotoProvider {
     /// item's file, dated by its last write time and with an existing image's
     /// size reset, then — when the stored width or height is `<= 0` — probe the
     /// primary image's dimensions through the
-    /// [`ImageProcessor`](ferrofin_traits::drawing::ImageProcessor) and write back
+    /// [`ImageProcessor`] and write back
     /// any positive result. A "format not supported" probe error
     /// ([`ServiceError::invalid_input`], the analogue of the C# `catch
     /// (ArgumentException)`) is swallowed, leaving the dimensions untouched;
@@ -310,7 +261,7 @@ impl PhotoProvider {
     ///
     /// The C# `ImageUpdate | MetadataImport` combined result collapses to
     /// [`ItemUpdateType::ImageUpdate`] — the non-`[Flags]`
-    /// [`ItemUpdateType`](ferrofin_traits::providers::ItemUpdateType) port has no
+    /// [`ItemUpdateType`] port has no
     /// combined variant.
     ///
     /// # Errors
@@ -371,7 +322,7 @@ impl PhotoProvider {
 
 /// The EXIF fields read off one file, plus the image dimensions the tags carry.
 ///
-/// A flat intermediate so the tag→item mapping ([`apply_exif`]) stays pure and
+/// A flat intermediate so the tag→item mapping (`apply_exif`) stays pure and
 /// unit-testable without a file on disk.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct ExifTags {
@@ -1047,18 +998,13 @@ fn apply_exif(item: &mut PhotoItem, tags: &ExifTags) {
     }
 }
 
-/// Object-safety assertion for the [`DirectoryService`] seam, matching the
-/// crate's trait conventions.
-fn _assert_object_safe_directory_service(_: &dyn DirectoryService) {}
-
 #[cfg(test)]
 mod tests {
     //! Round-trip cases transliterated from `PhotoProvider.cs`: a zero-width
     //! photo is backfilled from the processor; a photo with positive stored
     //! dimensions is left alone; the primary image path is always set; the EXIF
     //! extension gate accepts the seven photo types and excludes everything
-    //! else; `HasChanged` follows the file-protocol + last-write-time rules; and
-    //! the reported update type is `ImageUpdate`.
+    //! else; and the reported update type is `ImageUpdate`.
     use super::*;
     use async_trait::async_trait;
     use chrono::TimeZone;
@@ -1160,18 +1106,6 @@ mod tests {
             _library_name: Option<&str>,
         ) -> Result<(), ServiceError> {
             Ok(())
-        }
-    }
-
-    /// A fake [`DirectoryService`] returning a fixed last-write-time (or nothing,
-    /// for a missing file).
-    struct FakeDir {
-        file: Option<FileInfo>,
-    }
-
-    impl DirectoryService for FakeDir {
-        fn get_file(&self, _path: &str) -> Option<FileInfo> {
-            self.file
         }
     }
 
@@ -1299,71 +1233,6 @@ mod tests {
         ] {
             assert!(!is_exif_candidate(path), "should exclude {path}");
         }
-    }
-
-    #[test]
-    fn has_changed_true_when_disk_is_newer_for_file_item() {
-        let provider = PhotoProvider::new(Arc::new(FakeProcessor::reporting(1, 1)));
-        let item = PhotoItem {
-            path: "/p.jpg".into(),
-            is_file_protocol: true,
-            date_modified: ts(1_000),
-            ..Default::default()
-        };
-        let dir = FakeDir {
-            file: Some(FileInfo {
-                last_write_time_utc: ts(2_000),
-            }),
-        };
-        assert!(provider.has_changed(&item, &dir));
-    }
-
-    #[test]
-    fn has_changed_false_when_disk_not_newer() {
-        let provider = PhotoProvider::new(Arc::new(FakeProcessor::reporting(1, 1)));
-        let item = PhotoItem {
-            path: "/p.jpg".into(),
-            is_file_protocol: true,
-            date_modified: ts(2_000),
-            ..Default::default()
-        };
-        let dir = FakeDir {
-            file: Some(FileInfo {
-                last_write_time_utc: ts(2_000),
-            }),
-        };
-        assert!(!provider.has_changed(&item, &dir));
-    }
-
-    #[test]
-    fn has_changed_false_for_non_file_protocol() {
-        let provider = PhotoProvider::new(Arc::new(FakeProcessor::reporting(1, 1)));
-        let item = PhotoItem {
-            path: "https://cdn/p.jpg".into(),
-            is_file_protocol: false,
-            date_modified: ts(0),
-            ..Default::default()
-        };
-        // Even a much-newer disk time is ignored for non-file items.
-        let dir = FakeDir {
-            file: Some(FileInfo {
-                last_write_time_utc: ts(9_999),
-            }),
-        };
-        assert!(!provider.has_changed(&item, &dir));
-    }
-
-    #[test]
-    fn has_changed_false_when_file_missing() {
-        let provider = PhotoProvider::new(Arc::new(FakeProcessor::reporting(1, 1)));
-        let item = PhotoItem {
-            path: "/gone.jpg".into(),
-            is_file_protocol: true,
-            date_modified: ts(1_000),
-            ..Default::default()
-        };
-        let dir = FakeDir { file: None };
-        assert!(!provider.has_changed(&item, &dir));
     }
 
     #[test]

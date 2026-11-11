@@ -92,6 +92,7 @@ pub async fn ip_access_layer(
     );
     Response::builder()
         .status(axum::http::StatusCode::SERVICE_UNAVAILABLE)
+        .extension(crate::error::FailureLogged)
         .body(axum::body::Body::empty())
         .unwrap_or_default()
 }

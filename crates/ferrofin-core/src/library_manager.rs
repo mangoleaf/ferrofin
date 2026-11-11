@@ -24,7 +24,7 @@
 //!   promoted in its place) or an alternate version's references moved to
 //!   its primary, then the item's (and a folder's children's) internal
 //!   metadata, then — with `delete_file_location` — its files
-//!   ([`crate::item_deletion`]; the first path's failure stops the delete
+//!   (`crate::item_deletion`; the first path's failure stops the delete
 //!   with every row in place), then the extracted data, then the rows and
 //!   everything the persistence delete takes with them (`ParentId`
 //!   descendants, the extras and stacked parts it owns).
@@ -702,6 +702,9 @@ struct ScanQueue {
     finished: HashMap<u64, ScanResult>,
     /// Where a waiting caller wants its scan's progress reported.
     sinks: HashMap<u64, ScanProgressSink>,
+    /// The items edited outside the scans (a metadata edit) while one runs,
+    /// for it to read again before it reaches them ([`PriorityLane::edited`]).
+    edited: Vec<Uuid>,
     /// The worker's task, for a test to simulate it dying.
     #[cfg(test)]
     worker_task: Option<tokio::task::AbortHandle>,
@@ -857,8 +860,19 @@ impl ScanQueue {
         }
     }
 
+    /// Records that `ids` were just edited outside the scans, for the
+    /// running scan to read again ([`PriorityLane::edited`]). Nothing while
+    /// no scan runs: the next one reads every row afresh.
+    fn record_edited(&mut self, ids: impl IntoIterator<Item = Uuid>) {
+        if self.running.is_some() {
+            self.edited.extend(ids);
+        }
+    }
+
     /// Records how the running scan ended, for its waiters.
     fn finish_running(&mut self, result: &ScanResult) {
+        // The next scan reads every row afresh.
+        self.edited.clear();
         if let Some(done) = self.running.take() {
             for ticket in done.waiters.tickets {
                 self.sinks.remove(&ticket);
@@ -1001,6 +1015,9 @@ impl ScanWorker {
                         cancel: cancel.clone(),
                         validation: pending.request.is_library_validation(),
                     });
+                    // It reads every row afresh, even after a scan that
+                    // ended without `finish_running`.
+                    queue.edited.clear();
                     Some((pending.request, cancel, waited))
                 } else {
                     // Standing down under the same lock that a new request
@@ -1255,6 +1272,10 @@ impl PriorityLane for QueueLane {
             tracing::error!(%err, scope = scope_label(&refresh.target), "item refresh failed");
         }
         self.progress.send_modify(|n| *n = n.wrapping_add(1));
+    }
+
+    fn edited(&self) -> Vec<Uuid> {
+        std::mem::take(&mut lock_queue(&self.queue).edited)
     }
 }
 
@@ -2537,6 +2558,12 @@ async fn containing_folder_path(item: &BaseItemEntity, path: &str) -> Option<Str
 }
 
 impl FerrofinLibraryManager {
+    /// Tells the running scan, if any, that `ids` were just edited, so it
+    /// reads them again before it saves them ([`ScanQueue::record_edited`]).
+    fn edited(&self, ids: impl IntoIterator<Item = Uuid>) {
+        lock_queue(&self.scan_queue).record_edited(ids);
+    }
+
     /// [`containing_folder_path`] of `item`, its stored path expanded; `None`
     /// for an item without a path.
     async fn item_containing_folder(&self, item: &BaseItemEntity) -> Option<String> {
@@ -2624,7 +2651,7 @@ impl LibraryManager for FerrofinLibraryManager {
     }
 
     /// The trait's lookup-then-check, with the item and its chain read together
-    /// ([`ItemVisibility::visible_item`]).
+    /// (`ItemVisibility::visible_item`).
     async fn get_item_by_id_for_user(
         &self,
         id: Uuid,
@@ -2789,17 +2816,15 @@ impl LibraryManager for FerrofinLibraryManager {
         if ids.is_empty() {
             return Ok(Vec::new());
         }
-        let service = self
-            .visibility
-            .as_ref()
-            .ok_or_else(|| ServiceError::backend("item visibility is not configured"))?;
+        if self.visibility.is_none() {
+            return Err(ServiceError::backend("item visibility is not configured"));
+        }
         let rows = self.items.retrieve_items(ids).await?;
-        let visible: std::collections::HashSet<_> = rows
+        let visible: std::collections::HashSet<_> = self
+            .filter_visible_items_standalone(rows, user)
+            .await?
             .iter()
-            .zip(service.visible(&rows, user, true).await?)
-            .filter(|(_, visible)| *visible)
-            .filter_map(|(row, _)| Uuid::parse_str(&row.id).ok())
-            .filter(|id| !id.is_nil() && *id != PLACEHOLDER_ITEM_ID)
+            .filter_map(|row| Uuid::parse_str(&row.id).ok())
             .collect();
         Ok(ids
             .iter()
@@ -2808,11 +2833,35 @@ impl LibraryManager for FerrofinLibraryManager {
             .collect())
     }
 
+    async fn filter_visible_items_standalone(
+        &self,
+        items: Vec<BaseItemEntity>,
+        user: &ferrofin_db::entities::users::UserEntity,
+    ) -> Result<Vec<BaseItemEntity>, ServiceError> {
+        if items.is_empty() {
+            return Ok(items);
+        }
+        let service = self
+            .visibility
+            .as_ref()
+            .ok_or_else(|| ServiceError::backend("item visibility is not configured"))?;
+        let visible = service.visible(&items, user, true).await?;
+        Ok(items
+            .into_iter()
+            .zip(visible)
+            .filter(|(row, visible)| {
+                *visible
+                    && Uuid::parse_str(&row.id)
+                        .is_ok_and(|id| !id.is_nil() && id != PLACEHOLDER_ITEM_ID)
+            })
+            .map(|(row, _)| row)
+            .collect())
+    }
+
     async fn get_parentally_allowed_item_ids(
         &self,
         ids: &[Uuid],
         user: &ferrofin_db::entities::users::UserEntity,
-        skip_allowed_tags: bool,
     ) -> Result<Vec<Uuid>, ServiceError> {
         if ids.is_empty() {
             return Ok(Vec::new());
@@ -2824,11 +2873,7 @@ impl LibraryManager for FerrofinLibraryManager {
         let rows = self.items.retrieve_items(ids).await?;
         let allowed: std::collections::HashSet<Uuid> = rows
             .iter()
-            .zip(
-                service
-                    .parentally_allowed(&rows, user, skip_allowed_tags)
-                    .await?,
-            )
+            .zip(service.parentally_allowed(&rows, user, true).await?)
             .filter(|(_, allowed)| *allowed)
             .filter_map(|(row, _)| Uuid::parse_str(&row.id).ok())
             .collect();
@@ -3130,14 +3175,21 @@ impl LibraryManager for FerrofinLibraryManager {
         if items.is_empty() {
             return Ok(());
         }
+        // v12.2 `CreateItems` runs `OnMetadataChanged` on each item first: the
+        // parental filters read the stored score, so it must match the ratings
+        // saved.
+        let mut rated = items.to_vec();
+        if let Some(visibility) = &self.visibility {
+            visibility.update_rating_scores(&mut rated).await?;
+        }
         // The parent linkage is already carried on each row's ParentId column; the
         // upsert is the single persistence path (C# CreateItems == save + register).
-        self.persistence.save_items(items).await?;
+        self.persistence.save_items(&rated).await?;
         // `ItemAdded` (LibraryChangedNotifier): announce only after the write
         // succeeded, so a failed save never tells clients to fetch a row that
         // is not there.
         if let Some(changed) = &self.changed {
-            changed.record_added(items);
+            changed.record_added(&rated);
         }
         Ok(())
     }
@@ -3165,6 +3217,11 @@ impl LibraryManager for FerrofinLibraryManager {
         }
         let items = rated.as_slice();
         self.persistence.save_items(items).await?;
+        self.edited(
+            items
+                .iter()
+                .filter_map(|item| Uuid::parse_str(&item.id).ok()),
+        );
         // Re-index each item's genre/tag/studio/artist links: the filter
         // facets and by-name browses read `ItemValues`, not the row columns,
         // so a metadata edit that only saved the row was invisible to them
@@ -3209,6 +3266,7 @@ impl LibraryManager for FerrofinLibraryManager {
                 .await?;
         }
         self.persistence.update_rating(&item).await?;
+        self.edited(Uuid::parse_str(&item.id).ok());
         Ok(())
     }
 
@@ -3223,6 +3281,7 @@ impl LibraryManager for FerrofinLibraryManager {
         self.persistence
             .replace_provider_ids(item_id, provider_ids)
             .await?;
+        self.edited([item_id]);
         // The edit's save copies the new ids to the item's local versions
         // (`Video.UpdateToRepositoryAsync`); a non-owner has none to copy to.
         self.persistence
@@ -3245,7 +3304,9 @@ impl LibraryManager for FerrofinLibraryManager {
     ) -> Result<(), ServiceError> {
         self.persistence
             .replace_locked_fields(item_id, field_ids)
-            .await
+            .await?;
+        self.edited([item_id]);
+        Ok(())
     }
 
     async fn delete_item(&self, id: Uuid, options: &DeleteOptions) -> Result<(), ServiceError> {
@@ -3483,7 +3544,9 @@ impl LibraryManager for FerrofinLibraryManager {
         let Ok(item_id) = Uuid::parse_str(&item.id) else {
             return Ok(());
         };
-        self.people.update_people(item_id, people).await.map(|_| ())
+        self.people.update_people(item_id, people).await?;
+        self.edited([item_id]);
+        Ok(())
     }
 
     async fn get_people(
@@ -3822,7 +3885,8 @@ impl FerrofinLibraryManager {
     /// dashboard's stop button — withdraws only this caller's request: still
     /// queued, it is dropped unless a fire-and-forget request or another
     /// caller shares it; running, it stops cooperatively once nobody else
-    /// wants it, with the item in progress written whole or not at all. Only
+    /// wants it, with the item in progress written whole, not at all, or as
+    /// far as it got and left unstamped for the next scan to redo. Only
     /// then does the next queued scan start, so a refresh's replacement task
     /// waits for the cancelled scan to end: at most one item — plus, when
     /// the scan is serving a priority-lane item refresh at that moment, the
@@ -5690,6 +5754,116 @@ mod tests {
         );
     }
 
+    /// v12.2 `CreateItems` and `UpdateItemsAsync` run `OnMetadataChanged` on
+    /// each item before it is saved (`ParentalRatingScoreTests`): a created
+    /// item stores its score, a custom rating wins over the official one, and
+    /// clearing the ratings clears the score.
+    #[tokio::test]
+    async fn saved_items_store_the_score_of_their_ratings() {
+        let db = test_db().await;
+        let data = tempfile::tempdir().unwrap();
+        let base = manager(&db);
+        let localization = Arc::new(crate::LocalizationManager::new("US"));
+        let score = |rating| {
+            localization
+                .get_rating_score(rating, None)
+                .map(|score| i64::from(score.score))
+        };
+        let visibility = Arc::new(crate::item_visibility::ItemVisibility::new(
+            db.clone(),
+            base.items.clone(),
+            localization.clone(),
+            data.path().to_string_lossy().into_owned(),
+        ));
+        let mgr = base.with_visibility(visibility);
+        let id = Uuid::from_u128(0x7a01);
+        let stored = || async { mgr.get_item_by_id(id).await.expect("read").expect("row") };
+
+        let movie = BaseItemEntity {
+            id: guid_to_db(id),
+            type_: crate::item_type_lookup::stored_type_name(BaseItemKind::Movie)
+                .expect("movie")
+                .to_owned(),
+            name: Some("Up".to_owned()),
+            official_rating: Some("G".to_owned()),
+            custom_rating: Some("NC-17".to_owned()),
+            ..BaseItemEntity::default()
+        };
+        mgr.create_items(&[movie], None).await.expect("create");
+        assert_eq!(
+            stored().await.inherited_parental_rating_value,
+            score("NC-17")
+        );
+        assert_ne!(score("NC-17"), score("G"));
+
+        let mut row = stored().await;
+        row.custom_rating = None;
+        mgr.update_items(&[row], None).await.expect("official");
+        assert_eq!(stored().await.inherited_parental_rating_value, score("G"));
+
+        let mut row = stored().await;
+        row.custom_rating = Some("NC-17".to_owned());
+        mgr.update_items(&[row], None).await.expect("custom");
+        assert_eq!(
+            stored().await.inherited_parental_rating_value,
+            score("NC-17")
+        );
+
+        let mut row = stored().await;
+        row.custom_rating = None;
+        row.official_rating = None;
+        mgr.update_items(&[row], None).await.expect("cleared");
+        assert_eq!(stored().await.inherited_parental_rating_value, None);
+    }
+
+    /// Each metadata edit made while a scan runs is handed to that scan once,
+    /// for it to read the item again before it saves it; while none runs
+    /// nothing is kept, as the next scan reads every row afresh.
+    #[tokio::test]
+    async fn an_edit_is_handed_to_the_running_scan_once() {
+        let db = test_db().await;
+        let mgr = manager(&db);
+        let movie = Uuid::from_u128(0x91);
+        seed_named_item(&db, movie, BaseItemKind::Movie, "Solaris").await;
+        let lane = QueueLane {
+            queue: Arc::clone(&mgr.scan_queue),
+            progress: Arc::clone(&mgr.scan_progress),
+        };
+        mgr.update_item_locked_fields(movie, &[0])
+            .await
+            .expect("idle edit");
+        assert!(lane.edited().is_empty(), "no scan runs: nothing kept");
+
+        lock_queue(&mgr.scan_queue).running = Some(RunningScan {
+            waiters: Waiters::default(),
+            cancel: ScanCancel::new(),
+            validation: true,
+        });
+        let row = mgr.get_item_by_id(movie).await.expect("read").expect("row");
+        mgr.update_items(std::slice::from_ref(&row), None)
+            .await
+            .expect("row");
+        mgr.update_people(&row, &[]).await.expect("people");
+        mgr.update_item_provider_ids(movie, &[("Tmdb".to_owned(), "603".to_owned())])
+            .await
+            .expect("provider ids");
+        mgr.update_item_locked_fields(movie, &[0])
+            .await
+            .expect("locked fields");
+        mgr.update_item_rating(row).await.expect("rating");
+        assert_eq!(lane.edited(), [movie; 5]);
+        assert!(lane.edited().is_empty(), "handed over once");
+
+        mgr.update_item_locked_fields(movie, &[1])
+            .await
+            .expect("late edit");
+        lock_queue(&mgr.scan_queue).finish_running(&ScanResult::Completed);
+        assert!(
+            lane.edited().is_empty(),
+            "the next scan reads every row afresh"
+        );
+    }
+
     #[tokio::test]
     async fn update_items_reindexes_the_filter_facets() {
         let db = test_db().await;
@@ -6085,7 +6259,7 @@ mod tests {
         .await
         .unwrap();
         assert!(
-            base.get_parentally_allowed_item_ids(&[shown], &user, true)
+            base.get_parentally_allowed_item_ids(&[shown], &user)
                 .await
                 .is_err(),
             "no visibility service"
@@ -6100,13 +6274,13 @@ mod tests {
         let library = base.with_visibility(visibility);
         assert_eq!(
             library
-                .get_parentally_allowed_item_ids(&[hidden, missing, shown], &user, true)
+                .get_parentally_allowed_item_ids(&[hidden, missing, shown], &user)
                 .await
                 .unwrap(),
             [shown]
         );
         let parentally_allowed_item_ids = library
-            .get_parentally_allowed_item_ids(&[], &user, true)
+            .get_parentally_allowed_item_ids(&[], &user)
             .await
             .unwrap();
         assert!(

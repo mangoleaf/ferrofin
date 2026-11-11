@@ -8,8 +8,9 @@
 //!
 //! Jellyfin marks these `[Obsolete("Use GetPersons")]`, but they remain in the
 //! contract and TV/mobile clients still call them, so they are ported. The
-//! instant-mix / similar / per-name image routes stay on the `501` stub (later
-//! batches).
+//! artist instant-mix, similar and per-name image routes live in
+//! [`instant_mix`](super::instant_mix), [`similar`](super::similar) and
+//! [`images`](super::images).
 
 use axum::extract::{Path, State};
 use axum::routing::get;

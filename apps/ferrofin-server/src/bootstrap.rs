@@ -399,7 +399,7 @@ fn tracer_provider_for(
 
     let resource = Resource::builder()
         .with_service_name("ferrofin")
-        .with_attribute(KeyValue::new("service.version", env!("CARGO_PKG_VERSION")))
+        .with_attribute(KeyValue::new("service.version", crate::service_version()))
         .build();
 
     // ParentBased(TraceIdRatioBased): honour an upstream sampling decision when
@@ -606,7 +606,7 @@ fn spawn_pool_sampler(db: &Database) {
 ///
 /// The chosen candidate is validated by running `<candidate> -version` and
 /// requiring exit `0` plus output beginning `ffmpeg version`. The ffprobe path
-/// is `config.ffprobe_path` if set, else [`derive_ffprobe_path`]'s port of
+/// is `config.ffprobe_path` if set, else `derive_ffprobe_path`'s port of
 /// `FfprobePathRegex`; it is `-version`-validated the same way.
 ///
 /// Alongside validation this runs the whole capability probe round — the
