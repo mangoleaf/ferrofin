@@ -56,10 +56,14 @@ use uuid::Uuid;
 const ITEM_ID: Uuid = Uuid::from_u128(0x00B5_0001);
 /// A non-video item: the subtitle routes upstream binds to `Video` 404 on it.
 const SERIES_ID: Uuid = Uuid::from_u128(0x00B5_0002);
+/// A Movie with a library file: its refresh goes through the library scan,
+/// which [`OneItemLibrary`] has none of, so queueing it fails.
+const FILED_ITEM_ID: Uuid = Uuid::from_u128(0x00B5_0003);
 
 // ---- Fakes -----------------------------------------------------------------
 
-/// A library where only [`ITEM_ID`] (a Movie) and [`SERIES_ID`] exist.
+/// A library where only [`ITEM_ID`] and [`FILED_ITEM_ID`] (Movies) and
+/// [`SERIES_ID`] exist.
 struct OneItemLibrary;
 
 #[async_trait]
@@ -83,6 +87,11 @@ impl LibraryManager for OneItemLibrary {
         Ok(match id {
             ITEM_ID => Some(minimal_base_item(id, "The Item", "Movie")),
             SERIES_ID => Some(minimal_base_item(id, "The Show", "Series")),
+            FILED_ITEM_ID => Some(BaseItemEntity {
+                path: Some("/media/Film.mkv".to_owned()),
+                top_parent_id: Some(Uuid::from_u128(0x00B5_00FF).to_string()),
+                ..minimal_base_item(id, "Film", "Movie")
+            }),
             _ => None,
         })
     }
@@ -106,13 +115,6 @@ impl LibraryManager for OneItemLibrary {
         _query: &InternalItemsQuery,
         _collection_type: CollectionType,
     ) -> Result<Vec<BaseItemEntity>, ServiceError> {
-        unimplemented!("unused")
-    }
-    async fn create_items(
-        &self,
-        _items: &[BaseItemEntity],
-        _parent_id: Option<Uuid>,
-    ) -> Result<(), ServiceError> {
         unimplemented!("unused")
     }
     async fn update_items(
@@ -367,6 +369,8 @@ struct CannedSubtitles {
     logins: Logins,
     /// The decoded size of each upload that reached the manager.
     uploads: Arc<Mutex<Vec<usize>>>,
+    /// Whether a remote download succeeds; it fails by default.
+    download_succeeds: bool,
 }
 
 #[async_trait]
@@ -382,6 +386,9 @@ impl SubtitleManager for CannedSubtitles {
         _item_id: Uuid,
         _subtitle_id: &str,
     ) -> Result<(), ServiceError> {
+        if self.download_succeeds {
+            return Ok(());
+        }
         Err(ServiceError::invalid_input("no providers"))
     }
     async fn upload_subtitle(
@@ -811,6 +818,70 @@ async fn subtitle_remote_search_is_empty_list() {
     let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
     let items = v.as_array().unwrap();
     assert!(items.is_empty(), "{items:?}");
+}
+
+// ---- Remote subtitle download ----------------------------------------------
+
+/// Collects what a `tracing` fmt subscriber writes.
+#[derive(Clone, Default)]
+struct CapturedLog(Arc<Mutex<Vec<u8>>>);
+
+impl std::io::Write for CapturedLog {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(buf);
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// `SubtitleController.DownloadRemoteSubtitles` catches whatever its `try`
+/// throws, the download or the refresh queued after it, logs it at error and
+/// still answers `204` (gl-178).
+#[tokio::test]
+async fn a_failed_remote_download_or_refresh_is_logged_and_still_answers_204() {
+    for (download_succeeds, item_id, cause) in [
+        (false, ITEM_ID, "no providers"),
+        (true, FILED_ITEM_ID, "needs a library scanner"),
+    ] {
+        let app = remote_search_state(Arc::new(CannedSubtitles {
+            download_succeeds,
+            ..CannedSubtitles::default()
+        }));
+        let log = CapturedLog::default();
+        let writer = log.clone();
+        let _guard = tracing::subscriber::set_default(
+            tracing_subscriber::fmt()
+                .with_ansi(false)
+                .with_writer(move || writer.clone())
+                .finish(),
+        );
+        let response = create_router(app)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/Items/{item_id}/RemoteSearch/Subtitles/abc_42"))
+                    .header("X-Emby-Token", "tok")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT, "{cause}");
+        let logged = String::from_utf8(log.0.lock().unwrap().clone()).unwrap();
+        let line = logged
+            .lines()
+            .find(|line| line.contains("ERROR") && line.contains("Error downloading subtitles"))
+            .unwrap_or_else(|| panic!("no error line for {cause}: {logged}"));
+        // The event's own fields: the request span also prints the path, which holds both ids.
+        assert!(
+            line.contains(&format!("item_id={item_id}"))
+                && line.contains("subtitle_id=\"abc_42\"")
+                && line.contains(cause),
+            "{line}"
+        );
+    }
 }
 
 // ---- OpenSubtitles login validation ----------------------------------------

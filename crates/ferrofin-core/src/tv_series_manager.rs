@@ -677,9 +677,6 @@ mod tests {
         async fn get_users(&self) -> Result<Vec<UserEntity>, ServiceError> {
             Ok(vec![self.user.clone()])
         }
-        async fn get_user_ids(&self) -> Result<Vec<Uuid>, ServiceError> {
-            Ok(vec![Uuid::parse_str(&self.user.id).unwrap()])
-        }
         async fn initialize(&self) -> Result<(), ServiceError> {
             Ok(())
         }
@@ -820,13 +817,6 @@ mod tests {
             _collection_type: ferrofin_model::data::CollectionType,
         ) -> Result<Vec<BaseItemEntity>, ServiceError> {
             Ok(Vec::new())
-        }
-        async fn create_items(
-            &self,
-            _items: &[BaseItemEntity],
-            _parent_id: Option<Uuid>,
-        ) -> Result<(), ServiceError> {
-            Ok(())
         }
         async fn update_items(
             &self,
@@ -989,12 +979,6 @@ mod tests {
     struct FakeDtoService;
     #[async_trait]
     impl DtoService for FakeDtoService {
-        async fn get_primary_image_aspect_ratio(
-            &self,
-            _item_id: Uuid,
-        ) -> Result<Option<f64>, ServiceError> {
-            Ok(None)
-        }
         async fn get_base_item_dto(
             &self,
             item: &BaseItemEntity,
@@ -1022,15 +1006,6 @@ mod tests {
                     ..BaseItemDto::default()
                 })
                 .collect())
-        }
-        async fn get_item_by_name_dto(
-            &self,
-            _item: &BaseItemEntity,
-            _options: &DtoOptions,
-            _tagged_item_ids: Option<&[Uuid]>,
-            _user: Option<&UserEntity>,
-        ) -> Result<BaseItemDto, ServiceError> {
-            Ok(BaseItemDto::default())
         }
     }
 

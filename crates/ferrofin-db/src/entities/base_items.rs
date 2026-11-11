@@ -13,17 +13,17 @@
 //! [module docs](crate::entities):
 //! - `INTEGER` surrogate keys → [`i64`]; other `INTEGER` numerics → [`i64`]
 //!   (`Option<i64>` where nullable).
-//! - `TEXT` `Guid` columns → [`String`] (the hyphenated form as stored; the
-//!   conversion layer parses these into `Uuid`). All foreign keys to
+//! - `TEXT` `Guid` columns → [`String`] (the hyphenated form as stored; callers
+//!   parse these into `Uuid`). All foreign keys to
 //!   `BaseItems` are bare `Guid` columns (there is no ORM navigation).
 //! - `TEXT` `DateTime` columns → [`DateTime<Utc>`](chrono::DateTime).
 //! - `REAL` columns → [`f64`]; `INTEGER` booleans → [`bool`].
 //! - Enum-valued `INTEGER` columns are kept as [`i32`] discriminants and mapped
 //!   onto the [`crate::enums`] types (`ItemValueType`, `LinkedChildType`,
 //!   `MediaStreamTypeEntity`), or for image types onto
-//!   `ferrofin_model::entities::ImageType`, by the conversion layer.
+//!   `ferrofin_model::entities::ImageType`, by callers.
 //! - The `Blurhash` `BLOB` → [`Vec<u8>`]; the `KeyframeTicks` JSON `TEXT` → a
-//!   [`String`] holding the raw JSON (parsed by the conversion layer).
+//!   [`String`] holding the raw JSON (parsed by callers).
 
 use chrono::{DateTime, Utc};
 
@@ -531,7 +531,7 @@ pub struct MediaStreamInfoEntity {
 /// item.
 ///
 /// `KeyframeTicks` is a JSON `TEXT` column and kept here as a [`String`]
-/// holding the raw JSON (parsed by the conversion layer).
+/// holding the raw JSON (parsed by callers).
 #[derive(Debug, Clone, PartialEq, Eq, sqlx::FromRow)]
 #[sqlx(rename_all = "PascalCase")]
 pub struct KeyframeDataEntity {

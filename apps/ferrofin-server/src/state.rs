@@ -1894,7 +1894,6 @@ pub async fn build_app_state(
             Arc::clone(&media_stream_repository),
             Arc::clone(&media_attachment_repository),
             Arc::clone(&media_encoder),
-            Arc::clone(&providers),
         )
         .with_live_tv(Arc::clone(&live_tv))
         // `GetPlaybackMediaSources`' forced probe of a `.strm` shortcut or an
@@ -2722,6 +2721,7 @@ pub async fn build_app_state(
             db.clone(),
             Arc::clone(&sessions),
             Arc::clone(&library),
+            Arc::clone(&config_trait),
         )));
     }
     let tv_series: Arc<dyn ferrofin_traits::tv::TvSeriesManager> =
@@ -2772,7 +2772,6 @@ pub async fn build_app_state(
     // ---- host + system + auth + quick-connect -----------------------------
     let app_host = Arc::new(
         FerrofinServerApplicationHost::new(
-            Arc::clone(&paths),
             Arc::clone(&config_trait),
             HostNetworkInfo {
                 http_port: config.port,
@@ -3060,7 +3059,7 @@ pub async fn build_app_state(
                 let member = ferrofin_traits::stubs::SyncPlaySession {
                     session_id,
                     user_id: session.user_id,
-                    user_name: session.user_name.unwrap_or_default(),
+                    user_name: session.user_name,
                 };
                 let sync_play = Arc::clone(&sync_play);
                 tokio::spawn(async move {

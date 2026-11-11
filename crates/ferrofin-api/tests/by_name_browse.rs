@@ -378,13 +378,6 @@ impl LibraryManager for ByNameLibrary {
     ) -> Result<Vec<BaseItemEntity>, ServiceError> {
         unimplemented!()
     }
-    async fn create_items(
-        &self,
-        _i: &[BaseItemEntity],
-        _p: Option<Uuid>,
-    ) -> Result<(), ServiceError> {
-        unimplemented!()
-    }
     async fn update_items(
         &self,
         _i: &[BaseItemEntity],
@@ -428,9 +421,6 @@ impl UserManager for OkUsers {
         Ok((id == USER_ID).then(|| user_entity(USER_ID)))
     }
     async fn get_users(&self) -> Result<Vec<UserEntity>, ServiceError> {
-        unimplemented!()
-    }
-    async fn get_user_ids(&self) -> Result<Vec<Uuid>, ServiceError> {
         unimplemented!()
     }
     async fn initialize(&self) -> Result<(), ServiceError> {
@@ -523,12 +513,6 @@ fn entity_to_dto(item: &BaseItemEntity) -> BaseItemDto {
 
 #[async_trait]
 impl DtoService for OkDto {
-    async fn get_primary_image_aspect_ratio(
-        &self,
-        _item_id: Uuid,
-    ) -> Result<Option<f64>, ServiceError> {
-        unimplemented!()
-    }
     async fn get_base_item_dto(
         &self,
         item: &BaseItemEntity,
@@ -547,15 +531,6 @@ impl DtoService for OkDto {
         _skip: bool,
     ) -> Result<Vec<BaseItemDto>, ServiceError> {
         Ok(items.iter().map(entity_to_dto).collect())
-    }
-    async fn get_item_by_name_dto(
-        &self,
-        item: &BaseItemEntity,
-        _o: &DtoOptions,
-        _tagged: Option<&[Uuid]>,
-        _u: Option<&UserEntity>,
-    ) -> Result<BaseItemDto, ServiceError> {
-        Ok(entity_to_dto(item))
     }
 }
 
@@ -1084,12 +1059,6 @@ impl RecordingDto {
 
 #[async_trait]
 impl DtoService for RecordingDto {
-    async fn get_primary_image_aspect_ratio(
-        &self,
-        _item_id: Uuid,
-    ) -> Result<Option<f64>, ServiceError> {
-        unimplemented!()
-    }
     async fn get_base_item_dto(
         &self,
         item: &BaseItemEntity,
@@ -1110,16 +1079,6 @@ impl DtoService for RecordingDto {
     ) -> Result<Vec<BaseItemDto>, ServiceError> {
         self.seen.lock().expect("recorder lock").push(o.clone());
         Ok(items.iter().map(entity_to_dto).collect())
-    }
-    async fn get_item_by_name_dto(
-        &self,
-        item: &BaseItemEntity,
-        o: &DtoOptions,
-        _tagged: Option<&[Uuid]>,
-        _u: Option<&UserEntity>,
-    ) -> Result<BaseItemDto, ServiceError> {
-        self.seen.lock().expect("recorder lock").push(o.clone());
-        Ok(entity_to_dto(item))
     }
 }
 
@@ -1394,6 +1353,70 @@ async fn a_by_name_list_refuses_a_parent_naming_no_item(#[case] route: &str) {
             query.ancestor_ids,
             [MOVIES_LIBRARY_ID],
             "{route} scoped by its parent"
+        );
+    }
+}
+
+/// `GetArtists` and `GetAlbumArtists` declare `[FromQuery] double?
+/// minCommunityRating` (v12.4 `ArtistsController.cs:92`, `:246`): a value the
+/// binder cannot convert is a `400` before the action runs, a blank one binds
+/// null, and a valid one changes nothing, as `GetItemValues` copies it onto
+/// neither filter. The Genres, `MusicGenres` and Studios actions do not declare
+/// it, so there every value is ignored. Each value's status was measured on a
+/// stock Jellyfin 12.4.
+#[rstest::rstest]
+#[case::artists("/Artists", true)]
+#[case::album_artists("/Artists/AlbumArtists", true)]
+#[case::genres("/Genres", false)]
+#[case::music_genres("/MusicGenres", false)]
+#[case::studios("/Studios", false)]
+#[tokio::test]
+async fn min_community_rating_binds_as_a_double_where_declared(
+    #[case] route: &str,
+    #[case] declared: bool,
+) {
+    for (query, binds) in [
+        ("minCommunityRating=abc", false),
+        ("MINCOMMUNITYRATING=abc", false),
+        ("minCommunityRating=1.5%20x", false),
+        ("minCommunityRating=0x10", false),
+        // A scalar binds its first occurrence (`ValueProviderResult.FirstValue`).
+        ("minCommunityRating=abc&minCommunityRating=1.5", false),
+        ("minCommunityRating=1.5&minCommunityRating=abc", true),
+        ("minCommunityRating=1.5", true),
+        ("minCommunityRating=%201.5%20", true),
+        ("minCommunityRating=", true),
+        ("minCommunityRating=%09", true),
+        ("minCommunityRating=1e400", true),
+        ("minCommunityRating=-Infinity", true),
+        ("minCommunityRating=NaN", true),
+    ] {
+        let refused = declared && !binds;
+        let library = ByNameLibrary::default();
+        let response = create_router(by_name_state_with_library(library.clone()))
+            .oneshot(
+                Request::builder()
+                    .uri(format!("{route}?{query}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let expected = if refused {
+            StatusCode::BAD_REQUEST
+        } else {
+            StatusCode::OK
+        };
+        assert_eq!(response.status(), expected, "{route}?{query}");
+        let seen = library.seen.lock().expect("lock");
+        assert_eq!(
+            seen.is_empty(),
+            refused,
+            "{route}?{query}: listed once bound"
+        );
+        assert!(
+            seen.iter().all(|q| q.min_community_rating.is_none()),
+            "{route}?{query}: never applied"
         );
     }
 }

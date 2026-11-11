@@ -247,9 +247,6 @@ impl UserManager for OkUsers {
     async fn get_users(&self) -> Result<Vec<UserEntity>, ServiceError> {
         unimplemented!()
     }
-    async fn get_user_ids(&self) -> Result<Vec<Uuid>, ServiceError> {
-        unimplemented!()
-    }
     async fn initialize(&self) -> Result<(), ServiceError> {
         unimplemented!()
     }
@@ -345,12 +342,6 @@ fn to_dto(item: &BaseItemEntity, options: &DtoOptions) -> BaseItemDto {
 
 #[async_trait]
 impl DtoService for OkDto {
-    async fn get_primary_image_aspect_ratio(
-        &self,
-        _item_id: Uuid,
-    ) -> Result<Option<f64>, ServiceError> {
-        unimplemented!()
-    }
     async fn get_base_item_dto(
         &self,
         item: &BaseItemEntity,
@@ -369,15 +360,6 @@ impl DtoService for OkDto {
         _skip_visibility_check: bool,
     ) -> Result<Vec<BaseItemDto>, ServiceError> {
         Ok(items.iter().map(|item| to_dto(item, options)).collect())
-    }
-    async fn get_item_by_name_dto(
-        &self,
-        item: &BaseItemEntity,
-        options: &DtoOptions,
-        _tagged_item_ids: Option<&[Uuid]>,
-        _user: Option<&UserEntity>,
-    ) -> Result<BaseItemDto, ServiceError> {
-        Ok(to_dto(item, options))
     }
 }
 
@@ -511,13 +493,6 @@ impl LibraryManager for StubLibrary {
         _q: &InternalItemsQuery,
         _c: ferrofin_model::data::CollectionType,
     ) -> Result<Vec<BaseItemEntity>, ServiceError> {
-        unimplemented!()
-    }
-    async fn create_items(
-        &self,
-        _i: &[BaseItemEntity],
-        _p: Option<Uuid>,
-    ) -> Result<(), ServiceError> {
         unimplemented!()
     }
     async fn update_items(

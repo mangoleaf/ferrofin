@@ -54,19 +54,25 @@ pub fn read_playlist_file(path: &str, contents: &str) -> Vec<PathBuf> {
 /// DetectEncoding`, which reads the file in the encoding `UtfUnknown`
 /// detects and in UTF-8 when it detects none.
 ///
-/// A BOM decides first; then bytes that are valid UTF-8 are UTF-8, and
-/// anything else is decoded in the legacy encoding [`chardetng`] guesses
-/// (an old Winamp `.m3u` is usually Windows-1252).
+/// A BOM decides first; then bytes that are valid UTF-8 with no ESC byte are
+/// UTF-8, and anything else is decoded in the encoding [`chardetng`] guesses:
+/// ISO-2022-JP first, otherwise UTF-8 or a legacy encoding (an old Winamp
+/// `.m3u` is usually Windows-1252).
 #[must_use]
 pub fn decode_playlist(bytes: &[u8]) -> String {
     if let Some((encoding, _)) = encoding_rs::Encoding::for_bom(bytes) {
         return encoding.decode_with_bom_removal(bytes).0.into_owned();
     }
-    if let Ok(text) = std::str::from_utf8(bytes) {
+    // 7-bit ISO-2022-JP is valid UTF-8 too, and `UtfUnknown`'s escape prober
+    // finds it first: an ESC, which starts its designations, leaves the choice
+    // to chardetng. It answers ISO-2022-JP only for ASCII that decodes as it,
+    // and UTF-8 for any other valid UTF-8. TODO(gl-1657): the prober's other
+    // 7-bit encodings, ISO-2022-KR and HZ-GB-2312, are not detected yet.
+    if !bytes.contains(&0x1B)
+        && let Ok(text) = std::str::from_utf8(bytes)
+    {
         return text.to_owned();
     }
-    // `Allow` keeps chardetng's pre-1.0 candidate set. It is inert today: 7-bit
-    // ISO-2022-JP is valid UTF-8, so the check above already decoded it.
     let mut detector = chardetng::EncodingDetector::new(chardetng::Iso2022JpDetection::Allow);
     detector.feed(bytes, true);
     detector
@@ -462,6 +468,21 @@ mod tests {
         assert_eq!(
             decode_playlist(b"Beyonc\xE9 - D\xE9j\xE0 Vu.mp3\n"),
             "Beyoncé - Déjà Vu.mp3\n"
+        );
+    }
+
+    /// 7-bit ISO-2022-JP is valid UTF-8 too; `UtfUnknown` detects it first
+    /// (gl-1422). An ESC that starts no ISO-2022-JP designation, or one in
+    /// non-ASCII UTF-8, stays UTF-8.
+    #[test]
+    fn an_iso_2022_jp_playlist_is_detected_before_utf8() {
+        let (jis, _, _) = encoding_rs::ISO_2022_JP.encode("日本語/曲.mp3\n");
+        assert!(jis.is_ascii(), "the fixture is 7-bit");
+        assert_eq!(decode_playlist(&jis), "日本語/曲.mp3\n");
+        assert_eq!(decode_playlist(b"\x1B[1ma.mp3\n"), "\u{1B}[1ma.mp3\n");
+        assert_eq!(
+            decode_playlist("\u{1B}[1m曲.mp3\n".as_bytes()),
+            "\u{1B}[1m曲.mp3\n"
         );
     }
 

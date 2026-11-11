@@ -2446,13 +2446,6 @@ mod tests {
         ) -> Result<Vec<BaseItemEntity>, ServiceError> {
             self.0.get_latest_item_list(query, collection_type).await
         }
-        async fn create_items(
-            &self,
-            items: &[BaseItemEntity],
-            parent_id: Option<Uuid>,
-        ) -> Result<(), ServiceError> {
-            self.0.create_items(items, parent_id).await
-        }
         async fn update_items(
             &self,
             items: &[BaseItemEntity],
@@ -4529,7 +4522,7 @@ mod tests {
         let (media, movie, chapters, task) = chapter_task_fixture(false).await;
         let mut damaged = task.library.get_item_by_id(movie).await.unwrap().unwrap();
         damaged.id = "not-a-guid".to_owned();
-        task.library.create_items(&[damaged], None).await.unwrap();
+        task.library.update_items(&[damaged], None).await.unwrap();
 
         task.execute(&TaskProgress::default())
             .await

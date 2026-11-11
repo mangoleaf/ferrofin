@@ -257,7 +257,7 @@ impl StreamInfo {
         if let Some(codec) = target.first()
             && !codec.is_empty()
             && let Some(value) = self.get_option(Some(codec), "rangetype")
-            && let Some(rt) = super::condition_processor::parse_video_range_type_pub(value)
+            && let Some(rt) = super::condition_processor::parse_video_range_type(value)
         {
             return rt;
         }

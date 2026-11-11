@@ -22,7 +22,7 @@
 //! plus the default policy's user checks, remote access included); the other
 //! reads take [`RequireAuth`].
 
-use axum::extract::{Path, State};
+use axum::extract::State;
 use axum::http::StatusCode;
 use axum::routing::get;
 use axum::{Json, Router};
@@ -32,7 +32,7 @@ use serde_json::Value;
 
 use crate::auth::{RequireAdminWithDefault, RequireAuth, is_administrator_identity};
 use crate::error::ApiError;
-use crate::extract::{JsonBody, JsonValueBody};
+use crate::extract::{JsonBody, JsonValueBody, RequiredRouteString, RouteParameter};
 use crate::state::AppState;
 
 /// The on-disk file backing a persisted named configuration, or `None` when
@@ -137,6 +137,14 @@ async fn update_branding_configuration(
     Ok(StatusCode::NO_CONTENT)
 }
 
+/// `{key}`, the `[FromRoute, Required] string` of `GetNamedConfiguration` and
+/// `UpdateNamedConfiguration`.
+struct Key;
+
+impl RouteParameter for Key {
+    const NAME: &'static str = "key";
+}
+
 /// `GET /System/Configuration/{key}` — a named configuration.
 ///
 /// Port of `ConfigurationController.GetNamedConfiguration`: the configuration
@@ -161,7 +169,7 @@ async fn update_branding_configuration(
 async fn get_named_configuration(
     State(state): State<AppState>,
     auth: RequireAuth,
-    Path(key): Path<String>,
+    RequiredRouteString(key, _): RequiredRouteString<Key>,
 ) -> Result<Json<Value>, ApiError> {
     // Typed here, not through the document: the numbers JsonDefaults cannot
     // write must answer 400, not come back as `null`.
@@ -412,16 +420,9 @@ fn normalize_named_configuration(key: &str, raw: &str) -> Result<Value, ApiError
 async fn update_named_configuration(
     State(state): State<AppState>,
     _auth: RequireAdminWithDefault,
-    Path(key): Path<String>,
+    RequiredRouteString(key, _): RequiredRouteString<Key>,
     JsonValueBody(raw): JsonValueBody<Box<serde_json::value::RawValue>>,
 ) -> Result<StatusCode, ApiError> {
-    // `[FromRoute, Required]`: the binder nulls a whitespace-only value, and
-    // `[ApiController]` answers before the action runs.
-    if key.trim().is_empty() {
-        return Err(ApiError::BadRequest(
-            "The key field is required.".to_owned(),
-        ));
-    }
     let body = normalize_named_configuration(&key, raw.get())?;
     if key.eq_ignore_ascii_case("branding") {
         let branding: BrandingOptions =

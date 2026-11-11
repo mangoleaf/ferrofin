@@ -2101,61 +2101,6 @@ impl PeopleRepository for FerrofinPeopleRepository {
         }
         Ok(names)
     }
-
-    async fn get_people_names_by_items(
-        &self,
-        item_ids: &[Uuid],
-        person_types: &[String],
-    ) -> Result<HashMap<Uuid, Vec<String>>, ServiceError> {
-        if item_ids.is_empty() {
-            return Ok(HashMap::new());
-        }
-        let mut qb = QueryBuilder::<Sqlite>::new(
-            r#"SELECT m."ItemId", p."Name" FROM "PeopleBaseItemMap" m
-               JOIN "Peoples" p ON p."Id" = m."PeopleId" WHERE m."ItemId" IN ("#,
-        );
-        {
-            let mut sep = qb.separated(", ");
-            for id in ferrofin_db::padded_in_list(item_ids) {
-                sep.push_bind(guid_to_db(*id));
-            }
-        }
-        qb.push(")");
-        let types: Vec<&String> = person_types
-            .iter()
-            .filter(|t| is_valid_person_type(t))
-            .collect();
-        if !types.is_empty() {
-            qb.push(r#" AND p."PersonType" IN ("#);
-            let mut sep = qb.separated(", ");
-            for t in types {
-                sep.push_bind(t.clone());
-            }
-            qb.push(")");
-        }
-        qb.push(r#" ORDER BY m."ListOrder""#);
-
-        let rows: Vec<(String, String)> = qb
-            .build_query_as::<(String, String)>()
-            .fetch_all(self.db.pool())
-            .await
-            .map_err(db_err)?;
-
-        let mut result: HashMap<Uuid, Vec<String>> = HashMap::new();
-        for (item_id, name) in rows {
-            if name.is_empty() {
-                continue;
-            }
-            let Ok(id) = Uuid::parse_str(&item_id) else {
-                continue;
-            };
-            let names = result.entry(id).or_default();
-            if !names.contains(&name) {
-                names.push(name);
-            }
-        }
-        Ok(result)
-    }
 }
 
 /// Test-only: a `Peoples` row with no item link, so the raw SQL stays inside
@@ -3859,39 +3804,6 @@ mod tests {
             .await
             .expect("names");
         assert_eq!(names, vec!["Alice".to_owned(), "Bob".to_owned()]);
-    }
-
-    #[tokio::test]
-    async fn names_by_items_groups_and_dedupes() {
-        let db = test_db().await;
-        let item_a = Uuid::new_v4();
-        let item_b = Uuid::new_v4();
-        seed_item(&db, item_a, BaseItemKind::Movie).await;
-        seed_item(&db, item_b, BaseItemKind::Movie).await;
-        let repo = FerrofinPeopleRepository::new(db);
-        repo.update_people(item_a, &[person("Alice", "Actor")])
-            .await
-            .expect("a");
-        repo.update_people(
-            item_b,
-            &[person("Alice", "Actor"), person("Bob", "Director")],
-        )
-        .await
-        .expect("b");
-
-        let map = repo
-            .get_people_names_by_items(&[item_a, item_b], &[])
-            .await
-            .expect("map");
-        assert_eq!(map.get(&item_a).map(Vec::len), Some(1));
-        assert_eq!(map.get(&item_b).map(Vec::len), Some(2));
-
-        // Filtering by a person type narrows the names.
-        let map = repo
-            .get_people_names_by_items(&[item_b], &["Director".to_owned()])
-            .await
-            .expect("filtered");
-        assert_eq!(map.get(&item_b).cloned(), Some(vec!["Bob".to_owned()]));
     }
 
     #[tokio::test]

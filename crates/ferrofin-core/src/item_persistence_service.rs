@@ -2641,8 +2641,8 @@ impl ItemPersistenceService for FerrofinItemPersistenceService {
             self.upsert_item(item, UPSERT_SQL, false).await?;
         }
         // `ItemUpdated`. An item the caller also reported as ADDED is folded back
-        // out of the updated bucket by the notifier, so the library manager's
-        // `create_items` hook still wins for a creation.
+        // out of the updated bucket by the notifier, so a creation's
+        // `report_item_added` still wins.
         if let Some(changed) = self.changed.get() {
             changed.record_updated(items);
         }

@@ -8,7 +8,9 @@
 //!
 //! Every route is gated by the user's `SyncPlayAccess` policy first — the C#
 //! `[Authorize(Policy = Policies.SyncPlay*)]` attributes, which land here as
-//! `require_access` because Ferrofin has no attribute-driven policy layer.
+//! `require_access` because Ferrofin has no attribute-driven policy layer. An
+//! administrator or an API key passes every one, as upstream's default handler
+//! grants them.
 //!
 //! The manager is wired at the composition root
 //! ([`AppState::with_sync_play`](crate::state::AppState::with_sync_play)); until
@@ -62,7 +64,7 @@ async fn sync_play_session(
     Ok(SyncPlaySession {
         session_id,
         user_id: session.user_id,
-        user_name: session.user_name.unwrap_or_default(),
+        user_name: session.user_name,
     })
 }
 
@@ -82,10 +84,24 @@ async fn now_playing(
         .sessions
         .get_sessions(Uuid::nil(), Some(device_id), None, None, true)
         .await?;
-    Ok(sessions
+    let playing = sessions
         .into_iter()
         .find(|s| s.id.as_deref() == Some(session_id))
-        .and_then(now_playing_of))
+        .and_then(now_playing_of);
+    // The group is seeded with the library item (`FullNowPlayingItem`), not
+    // the shown one, which may be a client's own `Item` (gl-1062).
+    let library_item_id = match &playing {
+        Some(_) => {
+            state
+                .sessions
+                .now_playing_library_item_id(session_id)
+                .await?
+        }
+        None => None,
+    };
+    Ok(playing
+        .zip(library_item_id)
+        .map(|(playing, item_id)| SyncPlayNowPlaying { item_id, ..playing }))
 }
 
 /// The [`SyncPlayNowPlaying`] facts of one session, `None` when it plays
@@ -138,12 +154,14 @@ async fn require_access(
     required: SyncPlayAccess,
 ) -> Result<(), ApiError> {
     let mgr = manager(state)?;
-    // SyncPlayAccessHandler still resolves a user after the default handler.
-    // UserManager.GetUserById rejects an API key's empty user id before the
-    // handler can test for a missing row.
-    if auth.user_id().is_nil() {
-        return Err(ApiError::BadRequest("Guid can't be empty".to_owned()));
+    // SyncPlayAccessRequirement inherits DefaultAuthorizationRequirement, whose
+    // handler succeeds it for every API key ("Api keys are unrestricted"), and
+    // SyncPlayAccessHandler returns early for the key's empty user id. The
+    // manager then answers the key's user-less session as upstream's does.
+    if auth.is_api_key {
+        return Ok(());
     }
+    // Any other caller has a user: `RequireAuth` refuses one without.
     let Some(user) = resolve_user_opt(state, auth, None).await? else {
         return Err(ApiError::NotFound("SyncPlay user".to_owned()));
     };

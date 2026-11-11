@@ -768,12 +768,15 @@ fn extractor_and_local_providers() -> Vec<Provider> {
             // Upstream registers six identically-named local providers (one per
             // kind); Ferrofin's single weighted genre/tag/people scorer is the
             // same thing, so it is advertised once for every kind it serves.
+            // Their `Supports` is `IsAssignableFrom`, so `AudioBook : Audio`
+            // is served by the audio one.
             name: "Local Genre/Tag",
             caps: &[Cap::LocalSimilarity],
             types: &[
                 "Movie",
                 "Series",
                 "Audio",
+                "AudioBook",
                 "MusicAlbum",
                 "MusicArtist",
                 "Trailer",
@@ -2034,6 +2037,20 @@ mod tests {
                 .iter()
                 .any(|p| p.item_type.as_deref() == Some("Photo"))
         );
+        // `GetPluginSummary<AudioBook>()` takes the audio local provider.
+        let audiobook = plugins
+            .iter()
+            .find(|p| p.item_type.as_deref() == Some("AudioBook"))
+            .expect("audiobook summary");
+        assert!(
+            audiobook
+                .plugins
+                .iter()
+                .any(|p| p.name.as_deref() == Some("Local Genre/Tag")
+                    && p.type_ == MetadataPluginType::LocalSimilarityProvider),
+            "{:?}",
+            audiobook.plugins
+        );
     }
 
     /// `typeOptions?.MetadataFetcherOrder ?? globalMetadataOptions.
@@ -2255,6 +2272,11 @@ mod tests {
     #[case("Series", &[("TheMovieDb", false), ("Local Genre/Tag", true)])]
     #[case("MusicArtist", &[("ListenBrainz", false), ("Local Genre/Tag", true)])]
     #[case("MusicAlbum", &[("Local Genre/Tag", true)])]
+    #[case("Audio", &[("Local Genre/Tag", true)])]
+    // `AudioBook : Audio`, and `ILocalSimilarItemsProvider<Audio>.Supports` is
+    // `IsAssignableFrom`, so the audio provider serves audiobooks too.
+    #[case("AudioBook", &[("Local Genre/Tag", true)])]
+    #[case("Book", &[])]
     #[case("Episode", &[])]
     fn similarity_providers_list_the_remote_ones_first(
         #[case] kind: &str,

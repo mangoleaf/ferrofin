@@ -1,0 +1,314 @@
+{
+ "POST /Backup/Create": [
+  "backupOptions",
+  "The backupOptions field is required."
+ ],
+ "POST /Backup/Restore": [
+  "archiveRestoreDto",
+  "A value for the 'archiveRestoreDto' parameter or property was not provided."
+ ],
+ "POST /Devices/Options": [
+  "deviceOptions",
+  "The deviceOptions field is required."
+ ],
+ "POST /DisplayPreferences/{displayPreferencesId}": [
+  "displayPreferences",
+  "The displayPreferences field is required."
+ ],
+ "POST /Environment/ValidatePath": [
+  "validatePathDto",
+  "The validatePathDto field is required."
+ ],
+ "POST /Items/RemoteSearch/Apply/{itemId}": [
+  "searchResult",
+  "The searchResult field is required."
+ ],
+ "POST /Items/RemoteSearch/Book": [
+  "query",
+  "The query field is required."
+ ],
+ "POST /Items/RemoteSearch/BoxSet": [
+  "query",
+  "The query field is required."
+ ],
+ "POST /Items/RemoteSearch/Movie": [
+  "query",
+  "The query field is required."
+ ],
+ "POST /Items/RemoteSearch/MusicAlbum": [
+  "query",
+  "The query field is required."
+ ],
+ "POST /Items/RemoteSearch/MusicArtist": [
+  "query",
+  "The query field is required."
+ ],
+ "POST /Items/RemoteSearch/MusicVideo": [
+  "query",
+  "The query field is required."
+ ],
+ "POST /Items/RemoteSearch/Person": [
+  "query",
+  "The query field is required."
+ ],
+ "POST /Items/RemoteSearch/Series": [
+  "query",
+  "The query field is required."
+ ],
+ "POST /Items/RemoteSearch/Trailer": [
+  "query",
+  "The query field is required."
+ ],
+ "POST /Items/{itemId}": [
+  "request",
+  "The request field is required."
+ ],
+ "POST /Items/{itemId}/PlaybackInfo": [],
+ "POST /Library/Media/Updated": [
+  "dto",
+  "The dto field is required."
+ ],
+ "POST /Library/VirtualFolders": [],
+ "POST /Library/VirtualFolders/LibraryOptions": [
+  "request",
+  "The request field is required."
+ ],
+ "POST /Library/VirtualFolders/Paths": [
+  "mediaPathDto",
+  "The mediaPathDto field is required."
+ ],
+ "POST /Library/VirtualFolders/Paths/Update": [
+  "mediaPathRequestDto",
+  "The mediaPathRequestDto field is required."
+ ],
+ "POST /LiveStreams/Open": [],
+ "POST /LiveTv/ChannelMappings": [
+  "dto",
+  "The dto field is required."
+ ],
+ "POST /LiveTv/ListingProviders": [
+  "listingsProviderInfo",
+  "The listingsProviderInfo field is required."
+ ],
+ "POST /LiveTv/Programs": [
+  "body",
+  "The body field is required."
+ ],
+ "POST /LiveTv/SeriesTimers": [
+  "seriesTimerInfo",
+  "The seriesTimerInfo field is required."
+ ],
+ "POST /LiveTv/SeriesTimers/{timerId}": [
+  "seriesTimerInfo",
+  "The seriesTimerInfo field is required."
+ ],
+ "POST /LiveTv/Timers": [
+  "timerInfo",
+  "The timerInfo field is required."
+ ],
+ "POST /LiveTv/Timers/{timerId}": [
+  "timerInfo",
+  "The timerInfo field is required."
+ ],
+ "POST /LiveTv/TunerHosts": [
+  "tunerHostInfo",
+  "The tunerHostInfo field is required."
+ ],
+ "POST /Playlists": [],
+ "POST /Playlists/{playlistId}": [
+  "updatePlaylistRequest",
+  "The updatePlaylistRequest field is required."
+ ],
+ "POST /Playlists/{playlistId}/Users/{userId}": [
+  "updatePlaylistUserRequest",
+  "The updatePlaylistUserRequest field is required."
+ ],
+ "POST /Repositories": [
+  "repositoryInfos",
+  "The repositoryInfos field is required."
+ ],
+ "POST /ScheduledTasks/{taskId}/Triggers": [
+  "triggerInfos",
+  "The triggerInfos field is required."
+ ],
+ "POST /Sessions/Capabilities/Full": [
+  "capabilities",
+  "The capabilities field is required."
+ ],
+ "POST /Sessions/Playing": [
+  "playbackStartInfo",
+  "The playbackStartInfo field is required."
+ ],
+ "POST /Sessions/Playing/Progress": [
+  "playbackProgressInfo",
+  "The playbackProgressInfo field is required."
+ ],
+ "POST /Sessions/Playing/Stopped": [
+  "playbackStopInfo",
+  "The playbackStopInfo field is required."
+ ],
+ "POST /Sessions/{sessionId}/Command": [
+  "command",
+  "The command field is required."
+ ],
+ "POST /Sessions/{sessionId}/Message": [
+  "command",
+  "The command field is required."
+ ],
+ "POST /Startup/Configuration": [
+  "startupConfiguration",
+  "The startupConfiguration field is required."
+ ],
+ "POST /Startup/RemoteAccess": [
+  "startupRemoteAccessDto",
+  "The startupRemoteAccessDto field is required."
+ ],
+ "POST /Startup/User": [
+  "startupUserDto",
+  "The startupUserDto field is required."
+ ],
+ "POST /SyncPlay/Buffering": [
+  "requestData",
+  "The requestData field is required."
+ ],
+ "POST /SyncPlay/Join": [
+  "requestData",
+  "The requestData field is required."
+ ],
+ "POST /SyncPlay/MovePlaylistItem": [
+  "requestData",
+  "The requestData field is required."
+ ],
+ "POST /SyncPlay/New": [
+  "requestData",
+  "The requestData field is required."
+ ],
+ "POST /SyncPlay/NextItem": [
+  "requestData",
+  "The requestData field is required."
+ ],
+ "POST /SyncPlay/Ping": [
+  "requestData",
+  "The requestData field is required."
+ ],
+ "POST /SyncPlay/PreviousItem": [
+  "requestData",
+  "The requestData field is required."
+ ],
+ "POST /SyncPlay/Queue": [
+  "requestData",
+  "The requestData field is required."
+ ],
+ "POST /SyncPlay/Ready": [
+  "requestData",
+  "The requestData field is required."
+ ],
+ "POST /SyncPlay/RemoveFromPlaylist": [
+  "requestData",
+  "The requestData field is required."
+ ],
+ "POST /SyncPlay/Seek": [
+  "requestData",
+  "The requestData field is required."
+ ],
+ "POST /SyncPlay/SetIgnoreWait": [
+  "requestData",
+  "The requestData field is required."
+ ],
+ "POST /SyncPlay/SetNewQueue": [
+  "requestData",
+  "The requestData field is required."
+ ],
+ "POST /SyncPlay/SetPlaylistItem": [
+  "requestData",
+  "The requestData field is required."
+ ],
+ "POST /SyncPlay/SetRepeatMode": [
+  "requestData",
+  "The requestData field is required."
+ ],
+ "POST /SyncPlay/SetShuffleMode": [
+  "requestData",
+  "The requestData field is required."
+ ],
+ "POST /System/Configuration": [
+  "configuration",
+  "The configuration field is required."
+ ],
+ "POST /System/Configuration/Branding": [
+  "configuration",
+  "The configuration field is required."
+ ],
+ "POST /System/Configuration/{key}": [
+  "configuration",
+  "The configuration field is required."
+ ],
+ "POST /System/MediaEncoder/Path": [
+  "mediaEncoderPath",
+  "The mediaEncoderPath field is required."
+ ],
+ "POST /UserItems/{itemId}/UserData": [
+  "userDataDto",
+  "The userDataDto field is required."
+ ],
+ "POST /Users": [
+  "updateUser",
+  "The updateUser field is required."
+ ],
+ "POST /Users/AuthenticateByName": [
+  "request",
+  "The request field is required."
+ ],
+ "POST /Users/AuthenticateWithQuickConnect": [
+  "request",
+  "The request field is required."
+ ],
+ "POST /Users/Configuration": [
+  "userConfig",
+  "The userConfig field is required."
+ ],
+ "POST /Users/ForgotPassword": [
+  "forgotPasswordRequest",
+  "The forgotPasswordRequest field is required."
+ ],
+ "POST /Users/ForgotPassword/Pin": [
+  "forgotPasswordPinRequest",
+  "The forgotPasswordPinRequest field is required."
+ ],
+ "POST /Users/New": [
+  "request",
+  "The request field is required."
+ ],
+ "POST /Users/Password": [
+  "request",
+  "The request field is required."
+ ],
+ "POST /Users/{userId}": [
+  "updateUser",
+  "The updateUser field is required."
+ ],
+ "POST /Users/{userId}/Configuration": [
+  "userConfig",
+  "The userConfig field is required."
+ ],
+ "POST /Users/{userId}/EasyPassword": [
+  "request",
+  "The request field is required."
+ ],
+ "POST /Users/{userId}/Items/{itemId}/UserData": [
+  "userDataDto",
+  "The userDataDto field is required."
+ ],
+ "POST /Users/{userId}/Password": [
+  "request",
+  "The request field is required."
+ ],
+ "POST /Users/{userId}/Policy": [
+  "newPolicy",
+  "The newPolicy field is required."
+ ],
+ "POST /Videos/{itemId}/Subtitles": [
+  "body",
+  "The body field is required."
+ ]
+}

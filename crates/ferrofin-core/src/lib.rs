@@ -63,8 +63,7 @@
 //!   ([`ferrofin_traits::library::LibraryManager`]);
 //! - [`media_source_manager`] — [`FerrofinMediaSourceManager`]
 //!   ([`ferrofin_traits::library::MediaSourceManager`]), holding in-memory
-//!   live-stream state and injecting `Arc<dyn MediaEncoder>` / `Arc<dyn
-//!   ProviderManager>` for probing;
+//!   live-stream state and injecting `Arc<dyn MediaEncoder>` for probing;
 //! - [`user_view_manager`] — [`FerrofinUserViewManager`]
 //!   ([`ferrofin_traits::library::UserViewManager`]), with
 //!   [`user_view_repository`] holding the boot-time consolidation of
@@ -241,6 +240,7 @@ pub mod path_manager;
 pub mod people_repository;
 pub mod playback_activity;
 pub mod playback_metrics;
+mod playback_sessions_repository;
 pub mod plugin_config_adoption;
 pub mod plugin_manager;
 pub mod plugin_offered_item_repository;

@@ -236,9 +236,6 @@ impl UserManager for OkUsers {
     async fn get_users(&self) -> Result<Vec<UserEntity>, ServiceError> {
         unimplemented!()
     }
-    async fn get_user_ids(&self) -> Result<Vec<Uuid>, ServiceError> {
-        unimplemented!()
-    }
     async fn initialize(&self) -> Result<(), ServiceError> {
         unimplemented!()
     }
@@ -632,13 +629,6 @@ impl LibraryManager for OkLibrary {
     ) -> Result<Vec<BaseItemEntity>, ServiceError> {
         unimplemented!()
     }
-    async fn create_items(
-        &self,
-        _items: &[BaseItemEntity],
-        _parent_id: Option<Uuid>,
-    ) -> Result<(), ServiceError> {
-        unimplemented!()
-    }
     async fn update_items(
         &self,
         _items: &[BaseItemEntity],
@@ -782,12 +772,6 @@ fn entity_to_dto_with_fields(item: &BaseItemEntity, options: &DtoOptions) -> Bas
 
 #[async_trait]
 impl DtoService for OkDto {
-    async fn get_primary_image_aspect_ratio(
-        &self,
-        _item_id: Uuid,
-    ) -> Result<Option<f64>, ServiceError> {
-        unimplemented!()
-    }
     async fn get_base_item_dto(
         &self,
         item: &BaseItemEntity,
@@ -809,15 +793,6 @@ impl DtoService for OkDto {
             .iter()
             .map(|item| entity_to_dto_with_fields(item, options))
             .collect())
-    }
-    async fn get_item_by_name_dto(
-        &self,
-        item: &BaseItemEntity,
-        _options: &DtoOptions,
-        _tagged_item_ids: Option<&[Uuid]>,
-        _user: Option<&UserEntity>,
-    ) -> Result<BaseItemDto, ServiceError> {
-        Ok(entity_to_dto(item))
     }
     async fn can_delete(
         &self,
@@ -1086,13 +1061,6 @@ impl LibraryManager for StubLibrary {
         _q: &InternalItemsQuery,
         _c: ferrofin_model::data::CollectionType,
     ) -> Result<Vec<BaseItemEntity>, ServiceError> {
-        unimplemented!()
-    }
-    async fn create_items(
-        &self,
-        _items: &[BaseItemEntity],
-        _parent_id: Option<Uuid>,
-    ) -> Result<(), ServiceError> {
         unimplemented!()
     }
     async fn update_items(
@@ -3036,6 +3004,27 @@ async fn critic_reviews_are_empty() {
     assert!(result.items.is_empty(), "{:?}", result.items);
 }
 
+/// Jellyfin 10.11.8's `GetCriticReviews` binds no id at all, so whatever fills
+/// the `{itemId}` segment, a GUID or not, gets the empty result.
+#[tokio::test]
+async fn critic_reviews_take_any_item_id() {
+    for item_id in [
+        "not-a-guid",
+        "urn:uuid:00000000-0000-0000-0000-000000000001",
+        "%20",
+    ] {
+        let (status, body) = send(
+            "GET",
+            &format!("/Items/{item_id}/CriticReviews"),
+            Body::empty(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{item_id}");
+        let result: QueryResult<BaseItemDto> = serde_json::from_slice(&body).expect("result");
+        assert!(result.items.is_empty(), "{item_id}: {:?}", result.items);
+    }
+}
+
 #[tokio::test]
 async fn latest_returns_flattened_items() {
     let (status, body) = send("GET", "/Items/Latest", Body::empty()).await;
@@ -3122,12 +3111,6 @@ struct DenyingDto(Vec<Uuid>);
 
 #[async_trait]
 impl DtoService for DenyingDto {
-    async fn get_primary_image_aspect_ratio(
-        &self,
-        _item_id: Uuid,
-    ) -> Result<Option<f64>, ServiceError> {
-        unimplemented!()
-    }
     async fn get_base_item_dto(
         &self,
         item: &BaseItemEntity,
@@ -3147,15 +3130,6 @@ impl DtoService for DenyingDto {
     ) -> Result<Vec<BaseItemDto>, ServiceError> {
         Ok(items.iter().map(entity_to_dto).collect())
     }
-    async fn get_item_by_name_dto(
-        &self,
-        item: &BaseItemEntity,
-        _options: &DtoOptions,
-        _tagged_item_ids: Option<&[Uuid]>,
-        _user: Option<&UserEntity>,
-    ) -> Result<BaseItemDto, ServiceError> {
-        Ok(entity_to_dto(item))
-    }
     async fn can_delete(
         &self,
         item: &BaseItemEntity,
@@ -3174,12 +3148,6 @@ struct DtoSays(Option<bool>);
 
 #[async_trait]
 impl DtoService for DtoSays {
-    async fn get_primary_image_aspect_ratio(
-        &self,
-        _item_id: Uuid,
-    ) -> Result<Option<f64>, ServiceError> {
-        unimplemented!()
-    }
     async fn get_base_item_dto(
         &self,
         item: &BaseItemEntity,
@@ -3201,15 +3169,6 @@ impl DtoService for DtoSays {
         _owner_id: Option<Uuid>,
         _skip_visibility_check: bool,
     ) -> Result<Vec<BaseItemDto>, ServiceError> {
-        unimplemented!()
-    }
-    async fn get_item_by_name_dto(
-        &self,
-        _item: &BaseItemEntity,
-        _options: &DtoOptions,
-        _tagged_item_ids: Option<&[Uuid]>,
-        _user: Option<&UserEntity>,
-    ) -> Result<BaseItemDto, ServiceError> {
         unimplemented!()
     }
 }
@@ -3879,12 +3838,6 @@ struct LinkedChildrenDto;
 
 #[async_trait]
 impl DtoService for LinkedChildrenDto {
-    async fn get_primary_image_aspect_ratio(
-        &self,
-        _item_id: Uuid,
-    ) -> Result<Option<f64>, ServiceError> {
-        unimplemented!()
-    }
     async fn get_base_item_dto(
         &self,
         item: &BaseItemEntity,
@@ -3917,15 +3870,6 @@ impl DtoService for LinkedChildrenDto {
                 ..entity_to_dto(item)
             })
             .collect())
-    }
-    async fn get_item_by_name_dto(
-        &self,
-        item: &BaseItemEntity,
-        _options: &DtoOptions,
-        _tagged_item_ids: Option<&[Uuid]>,
-        _user: Option<&UserEntity>,
-    ) -> Result<BaseItemDto, ServiceError> {
-        Ok(entity_to_dto(item))
     }
 }
 

@@ -68,13 +68,6 @@ impl LibraryManager for CountingLibrary {
     ) -> Result<Vec<BaseItemEntity>, ServiceError> {
         unreachable!("{UNREACHED}")
     }
-    async fn create_items(
-        &self,
-        _items: &[BaseItemEntity],
-        _parent_id: Option<Uuid>,
-    ) -> Result<(), ServiceError> {
-        unreachable!("{UNREACHED}")
-    }
     async fn update_items(
         &self,
         _items: &[BaseItemEntity],

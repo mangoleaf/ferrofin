@@ -11,9 +11,8 @@
 //! - **live streams:** hold the open-live-stream table in memory, opening via the
 //!   injected [`MediaEncoder`] probe.
 //!
-//! Injected siblings (`Arc<dyn MediaEncoder>` for probing, `Arc<dyn
-//! ProviderManager>` for the metadata this DTO layer would enrich with) are taken
-//! by dependency injection, never constructed here — they land at the Wave 8
+//! The injected sibling (`Arc<dyn MediaEncoder>`, for probing) is taken by
+//! dependency injection, never constructed here — it lands at the Wave 8
 //! composition root.
 
 use ferrofin_model::configuration::{PathSubstitution, path_after_network_substitution};
@@ -37,24 +36,22 @@ use ferrofin_traits::persistence::{
     ItemRepository, MediaAttachmentQuery, MediaAttachmentRepository, MediaStreamQuery,
     MediaStreamRepository,
 };
-use ferrofin_traits::providers::{MetadataRefreshMode, MetadataRefreshOptions, ProviderManager};
+use ferrofin_traits::providers::{MetadataRefreshMode, MetadataRefreshOptions};
 
 use crate::db_error::media_stream_type_from_disc;
 use crate::scheduled_tasks::maintenance::CACHE_FILE_MAX_AGE;
 
 /// The concrete media-source manager.
 ///
-/// Holds injected persistence repositories plus the sibling `MediaEncoder` /
-/// `ProviderManager` (both by `Arc<dyn _>`), and the in-memory open-live-stream
-/// table keyed by the live-stream id.
+/// Holds injected persistence repositories plus the sibling `MediaEncoder`
+/// (by `Arc<dyn _>`), and the in-memory open-live-stream table keyed by the
+/// live-stream id.
 #[derive(Clone)]
 pub struct FerrofinMediaSourceManager {
     items: Arc<dyn ItemRepository>,
     streams: Arc<dyn MediaStreamRepository>,
     attachments: Arc<dyn MediaAttachmentRepository>,
     encoder: Arc<dyn MediaEncoder>,
-    #[allow(dead_code)]
-    provider: Arc<dyn ProviderManager>,
     /// Live TV manager, when configured — lets playback resolve a Live TV channel
     /// id (which is not a `BaseItems` row) to its tuner stream.
     live_tv: Option<Arc<dyn ferrofin_traits::stubs::LiveTvManager>>,
@@ -114,21 +111,20 @@ impl std::fmt::Debug for FerrofinMediaSourceManager {
 }
 
 impl FerrofinMediaSourceManager {
-    /// Creates a media-source manager over the injected repositories and siblings.
+    /// Creates a media-source manager over the injected repositories and media
+    /// encoder.
     #[must_use]
     pub fn new(
         items: Arc<dyn ItemRepository>,
         streams: Arc<dyn MediaStreamRepository>,
         attachments: Arc<dyn MediaAttachmentRepository>,
         encoder: Arc<dyn MediaEncoder>,
-        provider: Arc<dyn ProviderManager>,
     ) -> Self {
         Self {
             items,
             streams,
             attachments,
             encoder,
-            provider,
             live_tv: None,
             user_data: None,
             users: None,
@@ -2495,95 +2491,6 @@ mod tests {
         }
     }
 
-    /// A no-op provider manager (unused by the tested paths).
-    pub(super) struct StubProvider;
-
-    #[async_trait]
-    impl ProviderManager for StubProvider {
-        async fn queue_refresh(
-            &self,
-            _item_id: Uuid,
-            _options: &ferrofin_traits::providers::MetadataRefreshOptions,
-            _priority: ferrofin_traits::providers::RefreshPriority,
-        ) -> Result<(), ServiceError> {
-            Ok(())
-        }
-        async fn refresh_full_item(
-            &self,
-            _item_id: Uuid,
-            _options: &ferrofin_traits::providers::MetadataRefreshOptions,
-        ) -> Result<(), ServiceError> {
-            Ok(())
-        }
-        async fn refresh_single_item(
-            &self,
-            _item_id: Uuid,
-            _options: &ferrofin_traits::providers::MetadataRefreshOptions,
-        ) -> Result<ferrofin_traits::providers::ItemUpdateType, ServiceError> {
-            Ok(ferrofin_traits::providers::ItemUpdateType::None)
-        }
-        async fn save_image_from_url(
-            &self,
-            _item_id: Uuid,
-            _url: &str,
-            _image_type: ferrofin_model::entities::ImageType,
-            _image_index: Option<i32>,
-        ) -> Result<(), ServiceError> {
-            Ok(())
-        }
-        async fn save_image(
-            &self,
-            _item_id: Uuid,
-            _content: &[u8],
-            _mime_type: &str,
-            _image_type: ferrofin_model::entities::ImageType,
-            _image_index: Option<i32>,
-        ) -> Result<(), ServiceError> {
-            Ok(())
-        }
-        async fn get_available_remote_images(
-            &self,
-            _item_id: Uuid,
-            _query: &ferrofin_model::providers::RemoteImageQuery,
-        ) -> Result<Vec<ferrofin_model::providers::RemoteImageInfo>, ServiceError> {
-            Ok(Vec::new())
-        }
-        async fn get_remote_image_provider_info(
-            &self,
-            _item_id: Uuid,
-        ) -> Result<Vec<ferrofin_model::providers::ImageProviderInfo>, ServiceError> {
-            Ok(Vec::new())
-        }
-        async fn save_metadata(
-            &self,
-            _item_id: Uuid,
-            _update_type: ferrofin_traits::providers::ItemUpdateType,
-        ) -> Result<(), ServiceError> {
-            Ok(())
-        }
-        async fn get_external_id_infos(
-            &self,
-            _item_id: Uuid,
-        ) -> Result<Vec<ferrofin_model::providers::ExternalIdInfo>, ServiceError> {
-            Ok(Vec::new())
-        }
-        async fn get_all_metadata_plugins(
-            &self,
-        ) -> Result<Vec<ferrofin_model::configuration::MetadataPluginSummary>, ServiceError>
-        {
-            Ok(Vec::new())
-        }
-        async fn get_metadata_options(
-            &self,
-            _item_id: Uuid,
-        ) -> Result<ferrofin_model::configuration::MetadataOptions, ServiceError> {
-            Ok(ferrofin_model::configuration::MetadataOptions::default())
-        }
-        async fn get_refresh_queue(&self) -> Result<Vec<Uuid>, ServiceError> {
-            Ok(Vec::new())
-        }
-    }
-
     /// A config manager whose configuration is the factory default — the
     /// user-data manager needs one, and nothing on the playback-permission path
     /// reads it.
@@ -2631,7 +2538,7 @@ mod tests {
         ))
     }
 
-    fn manager(db: &Database) -> FerrofinMediaSourceManager {
+    pub(super) fn manager(db: &Database) -> FerrofinMediaSourceManager {
         let lookup: Arc<dyn ferrofin_traits::persistence::ItemTypeLookup> =
             Arc::new(ItemTypeLookup::new());
         FerrofinMediaSourceManager::new(
@@ -2639,7 +2546,6 @@ mod tests {
             Arc::new(FerrofinMediaStreamRepository::new(db.clone())),
             Arc::new(FerrofinMediaAttachmentRepository::new(db.clone())),
             Arc::new(StubEncoder),
-            Arc::new(StubProvider),
         )
     }
 
@@ -2996,9 +2902,6 @@ mod tests {
         }
         async fn refresh_guide(&self) -> Result<(), ServiceError> {
             Ok(())
-        }
-        async fn get_channel_stream_url(&self, _id: Uuid) -> Result<Option<String>, ServiceError> {
-            Ok(Some(FAKE_TUNER_URL.to_owned()))
         }
         async fn live_tv_media_type(&self, _id: Uuid) -> Result<Option<String>, ServiceError> {
             // `LiveTvChannel.MediaType` for a television channel.
@@ -4125,7 +4028,6 @@ mod audio_stream_index_tests {
     use rstest::rstest;
 
     use super::tests::StubEncoder;
-    use super::tests::StubProvider;
 
     fn test_manager(db: &ferrofin_db::Database) -> FerrofinMediaSourceManager {
         let lookup: Arc<dyn ferrofin_traits::persistence::ItemTypeLookup> =
@@ -4135,7 +4037,6 @@ mod audio_stream_index_tests {
             Arc::new(FerrofinMediaStreamRepository::new(db.clone())),
             Arc::new(FerrofinMediaAttachmentRepository::new(db.clone())),
             Arc::new(StubEncoder),
-            Arc::new(StubProvider),
         )
     }
 
@@ -4286,6 +4187,134 @@ mod audio_stream_index_tests {
     }
 }
 
+/// Transliteration of `MediaSourceManagerTests`'
+/// `SetDefaultSubtitleStreamIndex_RememberedSelection_RespectsSubtitleMode`
+/// and `SetDefaultSubtitleStreamIndex_OnlyForcedRemembersFullTrackWithNoForcedStream_SelectsNothing`
+/// (v12.4, from jellyfin#17998): a remembered subtitle against the user's
+/// `SubtitleMode`, read back from the item's saved user data as
+/// `SetDefaultAudioAndSubtitleStreamIndices` reads it.
+#[cfg(test)]
+mod subtitle_stream_index_tests {
+    use super::*;
+    use crate::test_support::{fetch_item, seed_user, seed_video_item, test_db};
+    use ferrofin_model::configuration::SubtitlePlaybackMode;
+    use ferrofin_model::data::BaseItemKind;
+    use ferrofin_traits::library::ReportedStreams;
+    use rstest::rstest;
+
+    /// The C# fixture: a video, an English default audio track, an English
+    /// default full subtitle (2) and an English forced one (3).
+    fn streams() -> Vec<MediaStream> {
+        let subtitle = |index, is_default, is_forced| MediaStream {
+            index,
+            stream_type: MediaStreamType::Subtitle,
+            language: Some("eng".to_owned()),
+            is_default,
+            is_forced,
+            ..Default::default()
+        };
+        vec![
+            MediaStream {
+                index: 0,
+                stream_type: MediaStreamType::Video,
+                is_default: true,
+                ..Default::default()
+            },
+            MediaStream {
+                index: 1,
+                stream_type: MediaStreamType::Audio,
+                language: Some("eng".to_owned()),
+                is_default: true,
+                ..Default::default()
+            },
+            subtitle(2, true, false),
+            subtitle(3, false, true),
+        ]
+    }
+
+    /// The default subtitle of a movie with `streams` for a user in `mode`
+    /// whose playback report remembered subtitle `remembered` on it.
+    async fn default_subtitle(
+        mode: SubtitlePlaybackMode,
+        remembered: i32,
+        streams: Vec<MediaStream>,
+    ) -> Option<i32> {
+        let db = test_db().await;
+        let (item_id, user_id) = (Uuid::from_u128(0x0396_0001), Uuid::from_u128(0x0396_0002));
+        seed_video_item(&db, item_id, BaseItemKind::Movie).await;
+        let mut user = seed_user(&db, user_id).await;
+        user.subtitle_mode = mode.json_value();
+        user.subtitle_language_preference = Some(String::new());
+        user.remember_subtitle_selections = true;
+        user.audio_language_preference = Some(String::new());
+
+        let user_data = super::tests::user_data_manager(&db);
+        let report = ReportedStreams {
+            subtitle_stream_index: Some(remembered),
+            remember_audio: true,
+            remember_subtitles: true,
+            ..Default::default()
+        };
+        user_data
+            .update_play_progress(user_id, item_id, None, report)
+            .await
+            .unwrap();
+
+        let mgr = super::tests::manager(&db)
+            .with_user_data(user_data)
+            .with_users(Arc::new(crate::user_manager::FerrofinUserManager::new(
+                db.clone(),
+            )));
+        let mut sources = [MediaSourceInfo {
+            media_streams: streams,
+            ..Default::default()
+        }];
+        mgr.set_default_audio_and_subtitle_stream_indices(
+            &fetch_item(&db, item_id).await,
+            &mut sources,
+            user_id,
+            Some(&user),
+        )
+        .await
+        .unwrap();
+        sources[0].default_subtitle_stream_index
+    }
+
+    // A remembered full track must not survive a switch to "only forced" (it
+    // falls through to the forced track here); a remembered forced track and
+    // "off" still must.
+    #[rstest]
+    #[case(SubtitlePlaybackMode::OnlyForced, 2, Some(3))]
+    #[case(SubtitlePlaybackMode::OnlyForced, 3, Some(3))]
+    #[case(SubtitlePlaybackMode::OnlyForced, -1, Some(-1))]
+    #[case(SubtitlePlaybackMode::Default, 2, Some(2))]
+    #[case(SubtitlePlaybackMode::Always, 2, Some(2))]
+    #[case(SubtitlePlaybackMode::Smart, 2, Some(2))]
+    #[case(SubtitlePlaybackMode::None, 2, None)]
+    #[tokio::test]
+    async fn remembered_selection_respects_subtitle_mode(
+        #[case] mode: SubtitlePlaybackMode,
+        #[case] remembered: i32,
+        #[case] expected: Option<i32>,
+    ) {
+        assert_eq!(
+            default_subtitle(mode, remembered, streams()).await,
+            expected
+        );
+    }
+
+    #[tokio::test]
+    async fn only_forced_remembering_a_full_track_with_no_forced_stream_selects_nothing() {
+        let mut streams = streams();
+        // The C# fixture without its forced subtitle (3).
+        streams.truncate(3);
+        assert_eq!(
+            default_subtitle(SubtitlePlaybackMode::OnlyForced, 2, streams).await,
+            None
+        );
+    }
+}
+
 /// The version a user is part-way through, through the playback path, and
 /// the per-user filter it runs after (`GetStaticMediaSources`,
 /// `MediaSourceManager.cs:383-423`, then `GetPlaybackMediaSources`'
@@ -4360,7 +4389,6 @@ mod version_resume_tests {
             Arc::new(FerrofinMediaStreamRepository::new(db.clone())),
             Arc::new(FerrofinMediaAttachmentRepository::new(db.clone())),
             Arc::new(super::tests::StubEncoder),
-            Arc::new(super::tests::StubProvider),
         )
         .with_user_data(super::tests::user_data_manager(db))
         .with_users(Arc::new(crate::user_manager::FerrofinUserManager::new(

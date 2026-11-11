@@ -8,7 +8,7 @@
 //! The per-name image routes (`/Studios/{name}/Images/{imageType}`) are
 //! registered by the image controller ([`images`](super::images)).
 
-use axum::extract::{Path, State};
+use axum::extract::State;
 use axum::routing::get;
 use axum::{Json, Router};
 use ferrofin_model::data::BaseItemKind;
@@ -18,7 +18,7 @@ use ferrofin_traits::options::DtoOptions;
 
 use crate::auth::RequireAuth;
 use crate::error::ApiError;
-use crate::extract::Query;
+use crate::extract::{Query, RequiredRouteString, RouteParameter};
 use crate::handlers::by_name::{ByNameItemQuery, ByNameListQuery, project_query_result};
 use crate::handlers::items::resolve_user_or_api_key;
 use crate::state::AppState;
@@ -55,6 +55,13 @@ async fn get_studios(
     Ok(Json(projected))
 }
 
+/// `{name}`, the `[FromRoute, Required] string` of `GetStudio`.
+struct Name;
+
+impl RouteParameter for Name {
+    const NAME: &'static str = "name";
+}
+
 /// `GET /Studios/{name}` — a single studio by name.
 ///
 /// Port of `StudiosController.GetStudio`, which is
@@ -82,7 +89,7 @@ async fn get_studios(
 async fn get_studio(
     State(state): State<AppState>,
     RequireAuth(auth): RequireAuth,
-    Path(name): Path<String>,
+    RequiredRouteString(name, _): RequiredRouteString<Name>,
     Query(query): Query<ByNameItemQuery>,
 ) -> Result<Json<BaseItemDto>, ApiError> {
     let user = resolve_user_or_api_key(&state, &auth, query.user_id).await?;

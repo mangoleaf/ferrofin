@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generate crates/ferrofin-api/src/query/{non_nullable,required}.json.
+"""Generate crates/ferrofin-api/src/query/{non_nullable,required,body}.json.
 
 For every upstream API action, list the query parameters that refuse an empty
 value: a NON-nullable value type (`bool enableTotalRecordCount = true`, `int
@@ -15,6 +15,14 @@ signatures are the source.
 non-nullable `string` without a default (MVC's implicit `[Required]` under
 nullable reference types). Absent, `CheckModel` answers "The X field is
 required." (400); an absent non-nullable value type binds its default.
+
+`body.json` names each action's `[FromBody]` parameter. When its body fails to
+bind, ASP.NET files a second entry beside the complaint, keyed by the C#
+parameter name: "The X field is required." for a required parameter
+(`[Required]`, or a non-nullable type, MVC's implicit `[Required]`), "A value
+for the 'X' parameter or property was not provided." for `[BindRequired]`
+(measured on Jellyfin 12.4). The value is `[name, message]`, or `[]` for a
+nullable (`X?`) parameter, which gets no entry.
 
 Routes come from each action's own attributes — the controller's `[Route]`
 plus every `[HttpGet|Head|Post|Put|Delete|Patch("…")]`, aliases (`Name = …`)
@@ -36,7 +44,8 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 OUT = ROOT / "crates/ferrofin-api/src/query/non_nullable.json"
 OUT_REQUIRED = ROOT / "crates/ferrofin-api/src/query/required.json"
-TAGS = ["v10.11.8", "v12.1"]  # later wins
+OUT_BODY = ROOT / "crates/ferrofin-api/src/query/body.json"
+TAGS = ["v10.11.8", "v12.1", "v12.4"]  # later wins
 VALUE_TYPES = {
     "bool", "byte", "sbyte", "short", "ushort", "int", "uint", "long", "ulong",
     "float", "double", "decimal", "Guid", "DateTime", "DateTimeOffset", "TimeSpan",
@@ -105,6 +114,23 @@ def non_nullable(params, enums):
     return names, present
 
 
+def body_parameter(params):
+    """`[name, message]` for the `[FromBody]` parameter, `[]` for a nullable
+    one, `None` when the action binds no body."""
+    for param in split_params(params):
+        param = " ".join(param.split())
+        lead = re.match(r"\s*((?:\[[^\]]*\]\s*)*)", param).group(1)
+        if "FromBody" not in lead:
+            continue
+        ty, name = param[len(lead):].split("=")[0].split()[-2:]
+        if re.search(r"\bBindRequired\b", lead):
+            return [name, f"A value for the '{name}' parameter or property was not provided."]
+        if re.search(r"\bRequired\b", lead) or not ty.endswith("?"):
+            return [name, f"The {name} field is required."]
+        return []
+    return None
+
+
 def join_route(prefix, template):
     if template is None or template == "":
         path = prefix
@@ -153,7 +179,7 @@ def actions(repo, tag, enums):
             routes = [(m.group(1).upper(), join_route(prefix, m.group(2))) for m in HTTP.finditer(" ".join(attrs))]
             if not routes:
                 continue
-            names = non_nullable(text[start:i - 1], enums)
+            names = (*non_nullable(text[start:i - 1], enums), body_parameter(text[start:i - 1]))
             for route in routes:
                 table[route] = names
     return table
@@ -166,18 +192,21 @@ def main():
         merged.update(actions(repo, tag, enum_names(repo, tag)))
     table = {f"{m} {p}": sorted(set(n[0]), key=str.lower) for (m, p), n in merged.items() if n[0]}
     required = {f"{m} {p}": sorted(set(n[1]), key=str.lower) for (m, p), n in merged.items() if n[1]}
+    body = {f"{m} {p}": n[2] for (m, p), n in merged.items() if n[2] is not None}
     # The server matches routes by shape (parameters erased, literals
     # case-folded); two routes of one shape must agree.
     shapes = {}
     for (m, p), n in merged.items():
         shape = (m, "/".join("{}" if "{" in s else s.lower() for s in p.split("/")))
-        if shape in shapes and (sorted(shapes[shape][0]), sorted(shapes[shape][1])) != (sorted(n[0]), sorted(n[1])):
+        if shape in shapes and (sorted(shapes[shape][0]), sorted(shapes[shape][1]), shapes[shape][2]) != (sorted(n[0]), sorted(n[1]), n[2]):
             sys.exit(f"routes collide on shape {shape}: {shapes[shape]} vs {n}")
         shapes[shape] = n
     OUT.write_text(json.dumps(dict(sorted(table.items())), indent=1) + "\n")
     OUT_REQUIRED.write_text(json.dumps(dict(sorted(required.items())), indent=1) + "\n")
+    OUT_BODY.write_text(json.dumps(dict(sorted(body.items())), indent=1) + "\n")
     print(f"{len(table)} routes, {sum(map(len, table.values()))} parameters -> {OUT.relative_to(ROOT)}")
     print(f"{len(required)} routes, {sum(map(len, required.values()))} parameters -> {OUT_REQUIRED.relative_to(ROOT)}")
+    print(f"{len(body)} routes, {sum(map(bool, body.values()))} required -> {OUT_BODY.relative_to(ROOT)}")
 
 
 if __name__ == "__main__":

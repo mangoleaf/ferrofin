@@ -718,7 +718,8 @@ pub(crate) fn type_name_matches(stored: &str, kind: ferrofin_model::data::BaseIt
 /// `GET /Items/{itemId}/CriticReviews` — critic reviews for an item.
 ///
 /// Jellyfin removed critic-review providers; the route survives returning an
-/// empty [`QueryResult`], which this port mirrors.
+/// empty [`QueryResult`], which this port mirrors. Jellyfin 10.11.8's action
+/// binds no id, so any `{itemId}` segment, a GUID or not, gets that answer.
 #[utoipa::path(
     get,
     path = "/Items/{itemId}/CriticReviews",
@@ -729,8 +730,6 @@ pub(crate) fn type_name_matches(stored: &str, kind: ferrofin_model::data::BaseIt
 async fn get_critic_reviews(
     State(_state): State<AppState>,
     RequireAuth(_auth): RequireAuth,
-    // Upstream's action binds no id at all: kept on `Uuid`, not `DotnetGuid`.
-    Path(_item_id): Path<Uuid>,
 ) -> Result<Json<QueryResult<BaseItemDto>>, ApiError> {
     Ok(Json(QueryResult::from_items(Vec::new())))
 }

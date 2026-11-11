@@ -924,8 +924,9 @@ impl Config {
     ///
     /// # Errors
     ///
-    /// Returns an error if `config.toml` exists but cannot be parsed, or if the
-    /// resolved bind address is not a valid IP.
+    /// Returns an error if `config.toml` exists but cannot be parsed, if a
+    /// directory cannot be made absolute (a blank one), or if the resolved
+    /// bind address is not a valid IP.
     pub fn load(cli: Cli) -> anyhow::Result<Self> {
         Self::load_from(cli, &EnvProvider)
     }
@@ -1012,6 +1013,21 @@ impl Config {
             .map(PathBuf::from)
             .or(file.web_dir)
             .unwrap_or_else(|| data_dir.join("web"));
+
+        // `Path.GetFullPath` in `StartupHelpers.CreateApplicationPaths`: a
+        // relative directory is resolved against the working directory once,
+        // so every path derived from it (stored, logged, or checked by a
+        // delete's guard) is absolute. Unlike `GetFullPath`, `..` is kept
+        // (POSIX semantics), and a blank value fails as it throws there.
+        let absolute = |key: &str, dir: PathBuf| {
+            std::path::absolute(&dir).map_err(|e| {
+                anyhow::anyhow!("{key} `{}` cannot be made absolute: {e}", dir.display())
+            })
+        };
+        let data_dir = absolute("data_dir", data_dir)?;
+        let config_dir = absolute("config_dir", config_dir)?;
+        let cache_dir = absolute("cache_dir", cache_dir)?;
+        let web_dir = absolute("web_dir", web_dir)?;
 
         let chosen_bind = cli
             .bind_addr
@@ -2709,6 +2725,42 @@ mod tests {
         assert_eq!(cfg.cache_dir, PathBuf::from("/mnt/fast-cache"));
         assert_eq!(cfg.config_dir, PathBuf::from("/etc/ferrofin"));
         assert_eq!(cfg.web_dir, PathBuf::from("/usr/share/ferrofin-web"));
+    }
+
+    /// `--data-dir ./data` and a relative sub-directory resolve against the
+    /// working directory (`Path.GetFullPath`): a delete's guard refuses every
+    /// relative path, so a relative directory would keep each item's data.
+    #[test]
+    fn relative_directories_are_made_absolute() {
+        let cwd = std::env::current_dir().unwrap();
+        let env = FakeEnv::new().with("FERROFIN_CACHE_DIR", "relative-cache");
+        let cli = Cli {
+            data_dir: Some(PathBuf::from("./relative-data")),
+            ..Cli::default()
+        };
+        let cfg = Config::load_from(cli, &env).unwrap();
+        assert_eq!(cfg.data_dir, cwd.join("relative-data"));
+        assert_eq!(cfg.config_dir, cwd.join("relative-data/config"));
+        assert_eq!(cfg.web_dir, cwd.join("relative-data/web"));
+        assert_eq!(cfg.cache_dir, cwd.join("relative-cache"));
+        assert_eq!(
+            cfg.database_url(),
+            format!(
+                "sqlite://{}",
+                cwd.join("relative-data/ferrofin.db").display()
+            )
+        );
+    }
+
+    /// A blank directory has no absolute form (`GetFullPath("")` throws):
+    /// startup stops and names the setting.
+    #[test]
+    fn a_blank_directory_stops_startup_naming_it() {
+        let env = FakeEnv::new()
+            .with("FERROFIN_DATA_DIR", "/srv/ferrofin")
+            .with("FERROFIN_CACHE_DIR", "");
+        let err = Config::load_from(Cli::default(), &env).unwrap_err();
+        assert!(err.to_string().starts_with("cache_dir ``"), "{err}");
     }
 
     #[test]

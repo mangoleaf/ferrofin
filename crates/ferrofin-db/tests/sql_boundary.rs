@@ -31,13 +31,13 @@ const CEILINGS: &[(&str, usize)] = &[
     ("crates/ferrofin-core/src/activity_manager.rs", 5),
     ("crates/ferrofin-core/src/api_key_manager.rs", 3),
     ("crates/ferrofin-core/src/authorization_context.rs", 6),
-    ("crates/ferrofin-core/src/collection_manager.rs", 11),
+    ("crates/ferrofin-core/src/collection_manager.rs", 10),
     ("crates/ferrofin-core/src/device_manager.rs", 8),
     (
         "crates/ferrofin-core/src/display_preferences_manager.rs",
-        12,
+        11,
     ),
-    ("crates/ferrofin-core/src/dto_service.rs", 11),
+    ("crates/ferrofin-core/src/dto_service.rs", 10),
     ("crates/ferrofin-core/src/library_manager.rs", 8),
     ("crates/ferrofin-core/src/library_scan.rs", 24),
     ("crates/ferrofin-core/src/linked_children_service.rs", 9),
@@ -55,9 +55,9 @@ const CEILINGS: &[(&str, usize)] = &[
     ("crates/ferrofin-core/src/test_support.rs", 8),
     ("crates/ferrofin-core/src/trickplay_manager.rs", 7),
     ("crates/ferrofin-core/src/user_entity_ext.rs", 11),
-    ("crates/ferrofin-core/src/user_manager.rs", 21),
+    ("crates/ferrofin-core/src/user_manager.rs", 20),
     ("crates/ferrofin-core/src/virtual_folder_manager.rs", 4),
-    ("crates/ferrofin-livetv/src/manager.rs", 8),
+    ("crates/ferrofin-livetv/src/manager.rs", 7),
 ];
 
 /// Collects every `.rs` file under `dir`, recursively.
