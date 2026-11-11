@@ -631,10 +631,11 @@ const OMDB_PROVIDER_NAME: &str = fetcher_names::OMDB;
 
 /// `SaveInternal`'s restat of the path it saves (`MetadataService.cs:244-249`),
 /// its directory arm: a directory has no `DateModified` (D2), as a person's or a
-/// by-name item's metadata folder (gl-1586). A path that cannot be read keeps
+/// by-name item's metadata folder (gl-1586), the Playlists folder and a user's
+/// Playlists view (gl-1625). A path that cannot be read keeps
 /// the value, as upstream's missing entry does. A file's mtime is the scan's to
 /// read.
-async fn restat_directory(row: &mut BaseItemEntity) {
+pub async fn restat_directory(row: &mut BaseItemEntity) {
     if let Some(path) = row.path.as_deref().filter(|p| !p.is_empty())
         && tokio::fs::metadata(path).await.is_ok_and(|m| m.is_dir())
     {

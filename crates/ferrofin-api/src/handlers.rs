@@ -1418,7 +1418,10 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
                    GetTopParentIdsForQuery's grouping arm), and UserViewMaterialisation, the \
                    scope's get_user_views_with_hidden call that writes the user's views as \
                    AddUserToQuery's GetUserViews call writes them (LibraryManager.AddUserToQuery, \
-                   UserViewManager.GetUserViews, compared 2026-11-10), reading a library's options at its \
+                   UserViewManager.GetUserViews, compared 2026-11-10), with \
+                   user_view_manager.rs ensure_user_playlists_view and view_refresh_due dating \
+                   and refreshing the Playlists view (LibraryManager.GetNamedView, compared \
+                   2026-11-11), reading a library's options at its \
                    Path expanded as BaseItemMapper.Map expands it \
                    (CollectionFolder.GetLibraryOptions, compared 2026-11-05); handlers/items.rs \
                    require_scope_visible, require_scope_id_visible, retain_visible_ids at the \
@@ -1487,8 +1490,14 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
              /UserViews rather than the next query; a write its query was cancelled in is \
              retried. The query \
              that writes them is scoped by the rows read before the write (gl-1584). The \
-             Playlists view's rename (gl-1397) and GetNamedView's refresh queue (gl-1566) are \
-             ported on neither path.",
+             Playlists view's rename (gl-1397) is ported on neither path. GetNamedView's \
+             refresh of the Playlists view (when it is new, 24 hours after its last refresh, \
+             or once its display parent was saved since) is the view's save, made at once \
+             rather than queued (gl-1625); the collage that refresh draws upstream is \
+             TODO(gl-1656), and the other views' dates and refresh TODO(gl-1655). It falls \
+             due only where the views are read: on every GET /UserViews, and on the query \
+             path when that writes them, so a refresh due while the set stays the same \
+             waits for the next GET /UserViews.",
             "GET and POST /LiveTv/Programs read librarySeriesId's row as the request's user, or \
              as the signed-in caller when a POST body names no user, so a series that user \
              cannot open (library, rating or tag rules) answers like an id that is no series: \

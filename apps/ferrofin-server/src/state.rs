@@ -511,7 +511,8 @@ pub async fn build_app_state(
         }
     }
     // One-shot: the Playlists folder and the Collections library an older
-    // build created were left without some of their dates.
+    // build created were left without some of their dates, and an older
+    // build filled the `DateModified` a refreshed folder has none of.
     match item_persistence_impl
         .repair_container_dates(&format!("{}/collections", paths.data_path()))
         .await
@@ -520,7 +521,7 @@ pub async fn build_app_state(
         Ok(repaired) => {
             tracing::info!(
                 repaired,
-                "backfilled dates of the playlists folder and the collections library"
+                "repaired dates of the playlists folder and the collections library"
             );
         }
         Err(err) => {

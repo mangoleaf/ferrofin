@@ -9652,7 +9652,7 @@ impl LibraryScanner {
     /// | dead by-name rows | the unlocked genres, music genres and studios no item value names, and the by-name artists no item credits | `GenresValidator.cs:107-119`, `StudiosValidator.cs:108-120`, `ArtistsValidator.cs:130-143` |
     /// | folder aggregates | every series, album and artist the scan planned, written where the value moved | `UpdateMetadataFromChildren` in each folder's `RefreshMetadata` |
     /// | by-name paths | the by-name rows with no `Path` | `CreateItemByName` sets it at insert |
-    /// | first refreshes | the genres, music genres, root and user root never refreshed, stamped | `GenresValidator.cs:79-83`, `MusicGenresValidator.cs:64-67`, `ValidateTopLibraryFolders` |
+    /// | first refreshes | the genres, music genres, root and user root never refreshed, stamped; the Playlists folder never refreshed, once its directory holds an entry | `GenresValidator.cs:79-83`, `MusicGenresValidator.cs:64-67`, `ValidateTopLibraryFolders`; `Folder.cs:400-412` |
     /// | studio images | the studios never refreshed | `StudiosValidator.cs:69-84` (new studios) |
     /// | library tiles | their own 7-day staleness (`HasChangedByDate`), every tile when the validation runs every provider; never a locked library's | `CollectionFolderImageProvider` |
     /// | dynamic images | first the photo albums, folders and playlist files the walk refreshed with every provider (`runAllProviders`), forced; then per item: no generated Primary yet, or its file changed (`HasChangedByDate`); never a locked row | `BaseDynamicImageProvider.HasChanged`, `MetadataService.GetProviders` |
@@ -12966,7 +12966,13 @@ impl LibraryScanner {
     ///   when the validation began; the scan here creates that row, so it is
     ///   one never refreshed);
     /// - the root and user root folders (`ValidateTopLibraryFolders`,
-    ///   `LibraryManager.cs:1434-1452`, every validation).
+    ///   `LibraryManager.cs:1434-1452`, every validation);
+    /// - the Playlists folder, the root's virtual child
+    ///   (`AggregateFolder.cs:171-174`), once its directory holds an entry:
+    ///   the validation skips a top parent whose directory is empty
+    ///   (`Folder.cs:400-412`, `DirectoryService.IsAccessible`), and keeps its
+    ///   row as it is (gl-1625). Its save restats that directory, which has no
+    ///   `DateModified` (`MetadataService.cs:244-256`, D2).
     ///
     /// A first refresh saves the row with `DateLastRefreshed` and
     /// `DateLastSaved` stamped (`MetadataService.cs:154-156,221-223`). A later
@@ -13003,6 +13009,29 @@ impl LibraryScanner {
             self.persistence
                 .stamp_date_last_refreshed(&fresh, Utc::now())
                 .await?;
+        }
+        let folders = self
+            .persistence
+            .never_refreshed_ids(BaseItemKind::PlaylistsFolder, false)
+            .await?;
+        if let (Some(repo), false) = (&self.item_repository, folders.is_empty()) {
+            for mut row in repo.retrieve_items(&folders).await? {
+                let accessible = match row.path.as_deref() {
+                    Some(path) => match tokio::fs::read_dir(path).await {
+                        Ok(mut entries) => entries.next_entry().await.is_ok_and(|e| e.is_some()),
+                        Err(_) => false,
+                    },
+                    None => false,
+                };
+                if !accessible {
+                    continue;
+                }
+                ferrofin_providers::provider_manager::restat_directory(&mut row).await;
+                row.date_last_refreshed = Some(Utc::now());
+                self.persistence
+                    .save_items(std::slice::from_ref(&row))
+                    .await?;
+            }
         }
         Ok(())
     }
@@ -29512,6 +29541,79 @@ mod tests {
             let row: BaseItemEntity = fetch_item(&db, *id).await;
             assert_eq!(row.date_last_refreshed, before, "{kind:?}");
         }
+    }
+
+    /// The Playlists folder gets its first refresh once its directory holds
+    /// an entry, as upstream's validation skips an empty top parent: the
+    /// save restats the directory, so `DateModified` goes, and the refresh
+    /// and the save are stamped, once (gl-1625).
+    #[tokio::test]
+    async fn the_playlists_folder_is_first_refreshed_once_its_directory_holds_a_playlist() {
+        use crate::item_persistence_service::FerrofinItemPersistenceService;
+        use crate::item_repository::FerrofinItemRepository;
+        use crate::item_type_lookup::ItemTypeLookup;
+        use crate::test_support::{fetch_item, save_item, seed_item, test_db};
+        use ferrofin_model::data::BaseItemKind;
+        use ferrofin_traits::persistence::ItemRepository;
+
+        let db = test_db().await;
+        let persistence = Arc::new(FerrofinItemPersistenceService::new(db.clone()));
+        let items: Arc<dyn ItemRepository> = Arc::new(FerrofinItemRepository::new(
+            db.clone(),
+            Arc::new(ItemTypeLookup::new()),
+        ));
+        let tmp = tempfile::tempdir().unwrap();
+        let vf: Arc<dyn VirtualFolderManager> = Arc::new(
+            FerrofinVirtualFolderManager::new(tmp.path().join("default"))
+                .with_item_store(persistence.clone()),
+        );
+        let scanner =
+            LibraryScanner::new(vf, Arc::new(FerrofinFileSystem::new()), persistence.clone())
+                .with_items(items);
+        let dir = tmp.path().join("playlists");
+        std::fs::create_dir_all(&dir).unwrap();
+        let folder = uuid::Uuid::new_v4();
+        seed_item(&db, folder, BaseItemKind::PlaylistsFolder).await;
+        let mut row = fetch_item(&db, folder).await;
+        let created = chrono::DateTime::parse_from_rfc3339("2026-11-01T02:03:04Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        row.path = Some(dir.to_string_lossy().into_owned());
+        row.is_folder = true;
+        row.date_modified = Some(created);
+        save_item(&db, &row).await;
+        let saved = fetch_item(&db, folder).await.date_last_saved;
+
+        scanner.stamp_first_refreshes().await.expect("empty");
+        let row = fetch_item(&db, folder).await;
+        assert_eq!(
+            (
+                row.date_modified,
+                row.date_last_refreshed,
+                row.date_last_saved
+            ),
+            (Some(created), None, saved),
+            "an empty directory is skipped"
+        );
+
+        std::fs::create_dir(dir.join("Mix")).unwrap();
+        scanner
+            .stamp_first_refreshes()
+            .await
+            .expect("with a playlist");
+        let row = fetch_item(&db, folder).await;
+        assert_eq!(row.date_modified, None, "the directory's restat");
+        let refreshed = row.date_last_refreshed.expect("refreshed");
+        let saved = row.date_last_saved.expect("saved");
+        assert!(saved >= refreshed, "{saved} {refreshed}");
+
+        scanner.stamp_first_refreshes().await.expect("again");
+        let row = fetch_item(&db, folder).await;
+        assert_eq!(
+            (row.date_last_refreshed, row.date_last_saved),
+            (Some(refreshed), Some(saved)),
+            "refreshed once"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]
