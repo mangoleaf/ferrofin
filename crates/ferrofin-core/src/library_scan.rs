@@ -9234,7 +9234,9 @@ impl LibraryScanner {
                 start_position_ticks: chapter.start_position_ticks,
                 name: chapter.name.clone(),
                 image_path: chapter.image_path.clone(),
-                image_date_modified: chapter.image_date_modified.unwrap_or_default(),
+                image_date_modified: chapter
+                    .image_date_modified
+                    .unwrap_or_else(ferrofin_model::json::datetime::dotnet_min),
                 image_tag: None,
             })
             .collect::<Vec<_>>();
@@ -24080,10 +24082,9 @@ fn chapter_to_entity(
         start_position_ticks: chapter.start_position_ticks,
         name: chapter.name.clone(),
         image_path: chapter.image_path.clone(),
-        image_date_modified: chapter
-            .image_path
-            .as_ref()
-            .map(|_| chapter.image_date_modified),
+        // Upstream's `Map` stores the date whether or not there is an image:
+        // `MinValue` for a chapter without one.
+        image_date_modified: Some(chapter.image_date_modified),
     }
 }
 
@@ -26223,6 +26224,19 @@ mod tests {
         assert_eq!(
             super::frequency_ordered_distinct(rows.iter().copied()),
             vec!["B".to_owned(), "a".to_owned()]
+        );
+    }
+
+    /// gl-1590: a chapter without an image is stored with its date, .NET's
+    /// `DateTime.MinValue`, as upstream's `ChapterRepository.Map` stores it,
+    /// not NULL.
+    #[test]
+    fn an_imageless_chapter_entity_keeps_its_min_value_date() {
+        let chapter = ferrofin_model::entities_media::ChapterInfo::default();
+        let entity = crate::library_scan::chapter_to_entity("id", 0, &chapter);
+        assert_eq!(
+            entity.image_date_modified,
+            Some(ferrofin_model::json::datetime::dotnet_min())
         );
     }
 
