@@ -1883,7 +1883,6 @@ pub async fn build_app_state(
             Arc::clone(&media_stream_repository),
             Arc::clone(&media_attachment_repository),
             Arc::clone(&media_encoder),
-            Arc::clone(&providers),
         )
         .with_live_tv(Arc::clone(&live_tv))
         // `GetPlaybackMediaSources`' forced probe of a `.strm` shortcut or an

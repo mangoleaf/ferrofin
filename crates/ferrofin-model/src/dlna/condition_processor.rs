@@ -33,16 +33,6 @@ fn parse_video_range_type(value: &str) -> Option<VideoRangeType> {
     None
 }
 
-/// The wire name of a [`VideoRangeType`], mirroring `Enum.GetName`.
-pub(crate) fn video_range_type_name(value: VideoRangeType) -> &'static str {
-    for candidate in video_range_type_names() {
-        if candidate.0 == value {
-            return candidate.1;
-        }
-    }
-    "Unknown"
-}
-
 /// All [`VideoRangeType`] variants and their wire names, in declaration order
 /// (mirrors `Enum.GetNames<VideoRangeType>()`).
 fn video_range_type_names() -> [(VideoRangeType, &'static str); 13] {
@@ -459,8 +449,6 @@ fn is_range_satisfied_value(
 
     Ok(false)
 }
-
-pub(crate) use video_range_type_name as range_type_name;
 
 #[cfg(test)]
 mod tests {

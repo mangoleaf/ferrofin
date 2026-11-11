@@ -5,11 +5,9 @@
 //! optimal [`StreamInfo`] with the chosen [`PlayMethod`] and accumulated
 //! [`TranscodeReasons`].
 
-use std::cmp::Ordering;
-
 use super::codec_profile::CodecProfile;
 use super::condition_processor::{
-    ConditionProcessor, StreamBuilderError, range_type_name, video_range_type_all_names,
+    ConditionProcessor, StreamBuilderError, video_range_type_all_names,
 };
 use super::device_profile::DeviceProfile;
 use super::direct_play_profile::DirectPlayProfile;
@@ -23,7 +21,7 @@ use super::stream_info::StreamInfo;
 use super::subtitle_profile::SubtitleProfile;
 use super::transcoder_support::TranscoderSupport;
 use super::transcoding_profile::TranscodingProfile;
-use crate::data::{MediaStreamProtocol, VideoRangeType};
+use crate::data::MediaStreamProtocol;
 use crate::dto::MediaSourceInfo;
 use crate::entities::{MediaStreamType, VideoType};
 use crate::entities_media::MediaStream;
@@ -2736,14 +2734,6 @@ fn is_manifest_container(container: Option<&str>) -> bool {
     c.split(',')
         .any(|part| MANIFESTS.iter().any(|m| part.eq_ignore_ascii_case(m)))
 }
-
-// Keep the range-name helper referenced so it is not flagged unused.
-#[allow(dead_code)]
-const _RANGE_NAME_FN: fn(VideoRangeType) -> &'static str = range_type_name;
-
-// Ordering import retained for clarity of intent in comparators.
-#[allow(dead_code)]
-const _ORDERING: Option<Ordering> = None;
 
 #[cfg(test)]
 mod tests {
