@@ -739,6 +739,73 @@ async fn create_playlist_rejects_bodies_upstream_binding_refuses() {
     }
 }
 
+/// `Ids` carries `JsonCommaDelimitedCollectionConverterFactory` (v12.4
+/// CreatePlaylistDto.cs:23): a string is split on `,`, each piece trimmed and
+/// dropped when `GuidConverter` refuses it, and `""` is no ids; an array stays
+/// strict, and `null` is MVC's implicit `[Required]` 400 (`IReadOnlyList<Guid>
+/// Ids` is non-nullable). Each case was measured on a live Jellyfin 12.4.
+#[tokio::test]
+async fn create_playlist_ids_bind_a_comma_delimited_string() {
+    let (a, b) = (ITEM_A.simple(), ITEM_B);
+    for (body, expected) in [
+        (
+            format!(r#"{{"Name":"Mix","Ids":"{a},{b}"}}"#),
+            vec![ITEM_A, ITEM_B],
+        ),
+        (
+            format!(r#"{{"Name":"Mix","Ids":" {a} , not-a-guid,"}}"#),
+            vec![ITEM_A],
+        ),
+        (r#"{"Name":"Mix","Ids":""}"#.to_owned(), vec![]),
+    ] {
+        let pl = Arc::new(RecordingPlaylists::default());
+        let app = state(pl.clone(), Arc::new(RecordingCollections::default()));
+        let (status, _) = send(app, "POST", "/Playlists", Body::from(body.clone())).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let created = pl.created.lock().unwrap().clone().expect("recorded");
+        assert_eq!(created.item_id_list, expected, "{body}");
+    }
+    for body in [
+        r#"{"Name":"Mix","Ids":null}"#.to_owned(),
+        format!(r#"{{"Name":"Mix","Ids":["{a}","not-a-guid"]}}"#),
+    ] {
+        let pl = Arc::new(RecordingPlaylists::default());
+        let app = state(pl.clone(), Arc::new(RecordingCollections::default()));
+        let (status, _) = send(app, "POST", "/Playlists", Body::from(body.clone())).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert!(pl.created.lock().unwrap().is_none(), "{body}");
+    }
+}
+
+/// `UpdatePlaylistDto.Ids` carries the same converter (v12.4
+/// UpdatePlaylistDto.cs:22) but is nullable: `null` leaves the entries alone,
+/// while `""` or a string whose every piece is malformed replaces them with
+/// none (`UpdatePlaylist` clears `LinkedChildren` whenever `Ids` is not null).
+/// Each case was measured on a live Jellyfin 12.4.
+#[tokio::test]
+async fn update_playlist_ids_bind_a_comma_delimited_string() {
+    let uri = format!("/Playlists/{PLAYLIST_ID}");
+    for (body, expected) in [
+        (format!(r#"{{"Ids":"{ITEM_B}"}}"#), Some(vec![ITEM_B])),
+        (r#"{"Ids":""}"#.to_owned(), Some(vec![])),
+        (r#"{"Ids":"zzz"}"#.to_owned(), Some(vec![])),
+        (r#"{"Ids":null}"#.to_owned(), None),
+    ] {
+        let pl = Arc::new(RecordingPlaylists::default());
+        let app = state(pl.clone(), Arc::new(RecordingCollections::default()));
+        let (status, bytes) = send(app, "POST", &uri, Body::from(body.clone())).await;
+        let text = String::from_utf8_lossy(&bytes);
+        assert_eq!(status, StatusCode::NO_CONTENT, "{body}: {text}");
+        let updated = pl.updated.lock().unwrap().clone().expect("recorded");
+        assert_eq!(updated.ids, expected, "{body}");
+    }
+    let pl = Arc::new(RecordingPlaylists::default());
+    let app = state(pl.clone(), Arc::new(RecordingCollections::default()));
+    let (status, _) = send(app, "POST", &uri, Body::from(r#"{"Ids":["zzz"]}"#)).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(pl.updated.lock().unwrap().is_none());
+}
+
 /// A `Users` entry binds through upstream's `PlaylistUserPermissions(Guid
 /// userId, bool canEdit = false)` constructor on create and update alike: a
 /// missing `CanEdit` is `false`, a missing or null `UserId` the empty GUID,
@@ -823,7 +890,7 @@ async fn get_missing_playlist_is_404() {
 #[tokio::test]
 async fn playlist_items_projects_the_fields_the_client_asked_for() {
     // C# builds the options from the REQUEST:
-    //   var dtoOptions = new DtoOptions { Fields = fields }.AddClientFields(User)
+    //   var dtoOptions = new DtoOptions { Fields = fields }
     //       .AddAdditionalDtoOptions(enableImages, enableUserData, …);
     // Ferrofin hardcoded `DtoOptions::default()` — every field, always — and the
     // query struct did not even accept `fields`. A 50-item playlist came back as
@@ -888,6 +955,42 @@ async fn get_playlist_items_pages_and_tags_entry_id() {
         result.items[0].playlist_item_id.as_deref(),
         Some(ITEM_A.simple().to_string().as_str())
     );
+}
+
+/// `GetPlaylistItems` pages with LINQ: `Skip(startIndex)` skips nothing for a
+/// negative index, `Take(limit)` takes nothing for a negative limit, and the
+/// total is counted before either. `StartIndex` echoes the request.
+#[rstest::rstest]
+#[case::negative_limit("limit=-1", &[], 0)]
+#[case::zero_limit("limit=0", &[], 0)]
+#[case::negative_start("startIndex=-1", &[ITEM_A, ITEM_B], -1)]
+#[case::negative_start_with_limit("startIndex=-1&limit=1", &[ITEM_A], -1)]
+#[case::limit_past_the_end("startIndex=1&limit=5", &[ITEM_B], 1)]
+#[case::start_past_the_end("startIndex=5", &[], 5)]
+#[case::start_with_negative_limit("startIndex=1&limit=-3", &[], 1)]
+#[tokio::test]
+async fn get_playlist_items_pages_as_skip_and_take(
+    #[case] paging: &str,
+    #[case] expected: &[Uuid],
+    #[case] start_index: i32,
+) {
+    let app = state(
+        Arc::new(RecordingPlaylists::default()),
+        Arc::new(RecordingCollections::default()),
+    );
+    let (status, bytes) = send(
+        app,
+        "GET",
+        &format!("/Playlists/{PLAYLIST_ID}/Items?{paging}"),
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let result: QueryResult<BaseItemDto> = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(result.total_record_count, 2);
+    assert_eq!(result.start_index, start_index);
+    let ids: Vec<Uuid> = result.items.iter().map(|dto| dto.id).collect();
+    assert_eq!(ids, expected);
 }
 
 /// `GET /Playlists/{id}/Items?userId=` is `RequestHelpers.GetUserId`: a

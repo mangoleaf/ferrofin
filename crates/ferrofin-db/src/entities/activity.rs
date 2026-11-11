@@ -2,7 +2,7 @@
 //!
 //! Mirrors the `ActivityLogs` table one-to-one (see `migrations/0001_initial.sql`),
 //! following the [module conventions](crate::entities): the `TEXT` `Guid`
-//! columns stay [`String`] (the conversion layer parses them into `Uuid`), the
+//! columns stay [`String`] (callers parse them into `Uuid`), the
 //! `TEXT` `DateTime` column becomes [`DateTime<Utc>`](chrono::DateTime), and the
 //! `LogSeverity` enum discriminant is kept as an [`i32`].
 

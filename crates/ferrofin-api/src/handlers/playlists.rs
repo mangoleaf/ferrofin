@@ -298,25 +298,18 @@ async fn get_playlist_items(
     }
     let total = i32::try_from(items.len()).unwrap_or(i32::MAX);
 
-    if let Some(start) = query.start_index
-        && let Ok(start) = usize::try_from(start)
-    {
-        if start >= items.len() {
-            items.clear();
-        } else {
-            items.drain(0..start);
-        }
+    // LINQ's `Skip` skips nothing for a negative index and `Take` takes
+    // nothing for a negative limit.
+    if let Some(start) = query.start_index {
+        items.drain(..usize::try_from(start).unwrap_or(0).min(items.len()));
     }
-    if let Some(limit) = query.limit
-        && let Ok(limit) = usize::try_from(limit)
-        && limit < items.len()
-    {
-        items.truncate(limit);
+    if let Some(limit) = query.limit {
+        items.truncate(usize::try_from(limit).unwrap_or(0));
     }
 
-    // Built from the CLIENT's parameters, matching C#:
+    // Built from the CLIENT's parameters, matching C# (v12.4 dropped
+    // `.AddClientFields(User)` here):
     //   var dtoOptions = new DtoOptions { Fields = fields }
-    //       .AddClientFields(User)
     //       .AddAdditionalDtoOptions(enableImages, enableUserData, imageTypeLimit,
     //                                enableImageTypes);
     //
