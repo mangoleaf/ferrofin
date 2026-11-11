@@ -99,10 +99,10 @@ fn log_startup_banner(config: &Config) {
     );
     tracing::info!(
         bind = %config.bind_addr,
-        port = config.port,
-        https_port = config.https_port,
-        // Before the saved network configuration is read: the base URL served
-        // is on the "ferrofin-server ready" line.
+        // Before the saved network configuration is read: the ports and the
+        // base URL served are on the "ferrofin-server ready" line.
+        bootstrap_port = config.port,
+        bootstrap_https_port = config.https_port,
         bootstrap_base_url = %config.base_url,
         published_url = config.published_url.as_deref().unwrap_or("<auto>"),
         "network"
@@ -1067,9 +1067,10 @@ async fn bind_http_listeners(
     // The same saved network settings `build_app_state` gives the shared
     // network manager, read before it exists.
     let paths = bootstrap::application_paths(config);
-    let network =
-        ferrofin_networking::NetworkManager::live(state::load_network_configuration(&paths).await);
-    let addresses = listen_addresses(config, Some(&network), config.port);
+    let saved = state::load_network_configuration(&paths).await;
+    let (port, _) = listen::ports(config, &saved);
+    let network = ferrofin_networking::NetworkManager::live(saved);
+    let addresses = listen_addresses(config, Some(&network), port);
     anyhow::ensure!(
         !addresses.is_empty(),
         "the network settings leave no address to listen on (IPv4 and IPv6 are both disabled)"
@@ -1106,18 +1107,22 @@ fn bind_https_listeners(
     config: &Config,
     wired: &WiredApp,
 ) -> anyhow::Result<(Vec<listen::ServedListener>, Vec<SocketAddr>)> {
+    use ferrofin_traits::system::ServerApplicationHost as _;
     let Some(https) = wired.https.as_ref() else {
         return Ok((Vec::new(), Vec::new()));
     };
+    // The lifetime's HTTPS port (`listen::ports`): the host holds it until
+    // the bound one replaces it.
+    let port = wired.app_host.https_port();
     let network = wired
         .state
         .network
         .as_ref()
         .and_then(|network| network.read().ok());
-    let addresses = listen_addresses(config, network.as_deref(), config.https_port);
+    let addresses = listen_addresses(config, network.as_deref(), port);
     drop(network);
     let listeners = listen::bind_all(&addresses)
-        .context("failed to bind the HTTPS listeners (FERROFIN_HTTPS_PORT)")?
+        .with_context(|| format!("failed to bind the HTTPS listeners on port {port}"))?
         .into_iter()
         .map(|listener| {
             tls::TlsListener::new(listener, Arc::clone(&https.config))

@@ -385,13 +385,26 @@ pub struct Config {
     #[doc(hidden)]
     pub provider_endpoints: ProviderEndpoints,
 
-    /// HTTP port to listen on. Default [`DEFAULT_HTTP_PORT`].
+    /// HTTP port from `--port`, else `FERROFIN_PORT`, else `config.toml`, else
+    /// [`DEFAULT_HTTP_PORT`]. The Networking page's `InternalHttpPort` sits
+    /// between the variable and the file: the server listens on what
+    /// `listen::ports` picks.
     pub port: u16,
 
+    /// Whether `--port` or `FERROFIN_PORT` set [`Self::port`]: it then
+    /// outranks the Networking page's `InternalHttpPort`.
+    pub port_from_flag_or_env: bool,
+
     /// HTTPS port, listened on beside the HTTP port when the network
-    /// configuration's `EnableHttps` is on and its certificate loads. Default
-    /// [`DEFAULT_HTTPS_PORT`].
+    /// configuration's `EnableHttps` is on and its certificate loads: from
+    /// `FERROFIN_HTTPS_PORT`, else `config.toml`, else [`DEFAULT_HTTPS_PORT`],
+    /// with the Networking page's `InternalHttpsPort` between the two
+    /// (`listen::ports`).
     pub https_port: u16,
+
+    /// Whether `FERROFIN_HTTPS_PORT` set [`Self::https_port`]: it then
+    /// outranks the Networking page's `InternalHttpsPort`.
+    pub https_port_from_env: bool,
 
     /// Publicly reachable server URL advertised to clients
     /// (`HostNetworkInfo.published_server_url`). `None` = auto-detect.
@@ -1025,13 +1038,13 @@ impl Config {
             .parse()
             .map_err(|e| anyhow::anyhow!("invalid FERROFIN_BIND_ADDR `{bind_addr_str}`: {e}"))?;
 
-        let port = cli
-            .port
-            .or_else(|| parse_var(env, "FERROFIN_PORT"))
-            .or(file.port)
-            .unwrap_or(DEFAULT_HTTP_PORT);
+        let flag_or_env_port = cli.port.or_else(|| parse_var(env, "FERROFIN_PORT"));
+        let port_from_flag_or_env = flag_or_env_port.is_some();
+        let port = flag_or_env_port.or(file.port).unwrap_or(DEFAULT_HTTP_PORT);
 
-        let https_port = parse_var(env, "FERROFIN_HTTPS_PORT")
+        let env_https_port = parse_var(env, "FERROFIN_HTTPS_PORT");
+        let https_port_from_env = env_https_port.is_some();
+        let https_port = env_https_port
             .or(file.https_port)
             .unwrap_or(DEFAULT_HTTPS_PORT);
 
@@ -1233,7 +1246,9 @@ impl Config {
             discovery_bind_addr: Some(std::net::SocketAddr::from(([0, 0, 0, 0], 7359))),
             provider_endpoints: ProviderEndpoints::default(),
             port,
+            port_from_flag_or_env,
             https_port,
+            https_port_from_env,
             published_url,
             base_url,
             base_url_from_env,
@@ -1726,7 +1741,9 @@ impl Config {
             discovery_bind_addr: None,
             provider_endpoints: ProviderEndpoints::offline(),
             port: 0,
+            port_from_flag_or_env: false,
             https_port: 0,
+            https_port_from_env: false,
             published_url: None,
             base_url: String::new(),
             base_url_from_env: false,
@@ -2516,7 +2533,7 @@ pub(crate) fn parse_var<T: std::str::FromStr>(env: &dyn Env, key: &str) -> Optio
     let parsed = value.parse().ok();
     if parsed.is_none() {
         env.warn(format!(
-            "{key} `{raw}` is not a valid value and is ignored; config.toml or the default applies"
+            "{key} `{raw}` is not a valid value and is ignored, as if it were unset"
         ));
     }
     parsed
@@ -2599,6 +2616,7 @@ mod tests {
         assert_eq!(cfg.data_dir, PathBuf::from(NOWHERE).join("ferrofin"));
         assert_eq!(cfg.port, DEFAULT_HTTP_PORT);
         assert_eq!(cfg.https_port, DEFAULT_HTTPS_PORT);
+        assert!(!cfg.port_from_flag_or_env && !cfg.https_port_from_env);
         assert_eq!(cfg.bind_addr.to_string(), DEFAULT_BIND_ADDR);
         assert_eq!(cfg.log_level, DEFAULT_LOG_LEVEL);
         assert_eq!(cfg.admin_user, DEFAULT_ADMIN_USER);
@@ -2713,6 +2731,7 @@ mod tests {
         };
         let cfg = Config::load_from(cli, &env).unwrap();
         assert_eq!(cfg.port, 7000, "CLI port overrides env");
+        assert!(cfg.port_from_flag_or_env);
         assert_eq!(
             cfg.data_dir,
             PathBuf::from("/cli/data"),
@@ -2724,9 +2743,13 @@ mod tests {
 
     #[test]
     fn env_port_overrides_default() {
-        let env = FakeEnv::new().with("FERROFIN_PORT", "9000");
+        let env = FakeEnv::new()
+            .with("FERROFIN_PORT", "9000")
+            .with("FERROFIN_HTTPS_PORT", "9443");
         let cfg = Config::load_from(Cli::default(), &env).unwrap();
         assert_eq!(cfg.port, 9000);
+        assert_eq!(cfg.https_port, 9443);
+        assert!(cfg.port_from_flag_or_env && cfg.https_port_from_env);
     }
 
     #[test]
@@ -2805,6 +2828,7 @@ mod tests {
         };
         let cfg = Config::load_from(by_flag, &FakeEnv::new()).unwrap();
         assert_eq!(cfg.port, 5001, "--data-dir names the file");
+        assert!(!cfg.port_from_flag_or_env, "the file's port is not pinned");
         assert_eq!(cfg.config_file, flag_dir.join("config.toml"));
         assert!(cfg.config_file_found);
 
@@ -3200,6 +3224,10 @@ mod tests {
         assert_eq!(cfg.port, DEFAULT_HTTP_PORT);
         assert_eq!(cfg.enable_metrics, None);
         assert_eq!(cfg.https_port, DEFAULT_HTTPS_PORT);
+        assert!(
+            !cfg.port_from_flag_or_env && !cfg.https_port_from_env,
+            "neither pins its port over the Networking page"
+        );
         assert_eq!(
             cfg.shutdown_timeout_secs, 45,
             "surrounding blanks are not an error"

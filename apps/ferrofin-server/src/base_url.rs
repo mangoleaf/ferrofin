@@ -17,7 +17,7 @@ use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use ferrofin_core::system_manager::LifecycleController;
 use ferrofin_networking::NetworkConfiguration;
-use ferrofin_traits::configuration::{ConfigurationListener, ConfigurationUpdate};
+use ferrofin_traits::configuration::ConfigurationListener;
 
 pub(crate) use ferrofin_networking::normalize_base_url as normalize;
 
@@ -55,27 +55,12 @@ pub(crate) fn restart_listener(
     variable_set: bool,
     lifecycle: Arc<dyn LifecycleController>,
 ) -> Arc<ConfigurationListener> {
-    Arc::new(move |update| {
-        let ConfigurationUpdate::Named { key, json } = update else {
-            return;
-        };
-        if key != "network" {
-            return;
-        }
-        // A document that does not parse boots as the defaults
-        // (`load_network_configuration`), so it is compared as them.
-        let saved = serde_json::from_str(json).unwrap_or_default();
-        if resolve(&bootstrap, variable_set, &saved) == running {
-            return;
-        }
-        // A restart already pending, for this or any other reason, is not
-        // announced again.
-        let flagged = !lifecycle.has_pending_restart();
-        lifecycle.mark_restart_required();
-        if flagged {
-            tracing::info!("the server needs a restart to serve under the new base URL");
-        }
-    })
+    crate::state::network_restart_listener(
+        running,
+        move |saved| resolve(&bootstrap, variable_set, saved),
+        "serve under the new base URL",
+        lifecycle,
+    )
 }
 
 /// Strip the mount before case canonicalization/routing, and retain it in redirects.
@@ -152,6 +137,7 @@ mod tests {
     use axum::Router;
     use axum::body::{Body, to_bytes};
     use axum::routing::get;
+    use ferrofin_traits::configuration::ConfigurationUpdate;
     use tower::{Layer as _, ServiceExt as _};
 
     use super::*;

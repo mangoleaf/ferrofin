@@ -2833,12 +2833,13 @@ pub const VERIFIED: &[Verified] = &[
                ConvertEmptyStringToNull, then [Required]; normalize_named_configuration: \
                GetConfigurationType and Deserialize) → save_named_configuration \
                (BaseConfigurationManager.SaveConfiguration: the validating store, the write, \
-               the live network policy, the listeners, the committed checks for \
-               ApplicationHost.OnConfigurationUpdated) → for livetv \
+               the live network policy, the listeners (ferrofin-server listen.rs \
+               restart_listener: the port restart of OnConfigurationUpdated), the committed \
+               checks for ApplicationHost.OnConfigurationUpdated) → for livetv \
                LiveTvManager::create_recording_folders (ferrofin-livetv recording_folders.rs: \
                RecordingsManager.OnNamedConfigurationUpdated, which the Live TV manager's tuner \
                and provider saves run too, as upstream's save of livetv does)",
-        date: "2026-10-30",
+        date: "2026-11-11",
         divergences: &[
             "database is refused with a 400: Ferrofin has no other database provider (owner \
          decision 2026-10-23).",
@@ -2861,6 +2862,20 @@ pub const VERIFIED: &[Verified] = &[
          OnConfigurationUpdated flags no restart for BaseUrl, while its redirect middleware \
          and GetLocalApiUrl read the new value at once and its mount keeps the old one \
          (owner decision on gl-555).",
+            "A network save marks a restart pending, as OnConfigurationUpdated does, when the \
+         ports it resolves to differ from the ports this lifetime listens on. Resolving \
+         differs from upstream's raw comparison in three ways: --port/FERROFIN_PORT and \
+         FERROFIN_HTTPS_PORT outrank InternalHttpPort and InternalHttpsPort (owner decision \
+         on gl-554); a saved port at its default (8096, 8920) leaves config.toml's, as an empty \
+         BaseUrl does (gl-554's fix, reading the owner's precedence); and equal saved ports \
+         are reset to the defaults first, as ApplicationHost.Init does, where upstream flags a \
+         restart that changes nothing for a save of two equal ports. Upstream's guard on a \
+         running port of 0 (the ports not read yet) needs no counterpart: the listener is \
+         registered once the ports are resolved. Its guard on IsPortAuthorized flags the \
+         restart once per lifetime, which Ferrofin matches because it sets IsPortAuthorized \
+         at every boot and the restart flag stays set once raised; but upstream also clears \
+         IsPortAuthorized and saves when it flags the restart, and Ferrofin leaves it true. \
+         Fix path: gl-1701.",
             "The 400 and 500 bodies are Ferrofin's error shape, not upstream's. Fix path: \
          gl-666.",
         ],
