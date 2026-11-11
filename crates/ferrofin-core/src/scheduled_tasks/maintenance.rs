@@ -475,9 +475,19 @@ impl ScheduledTask for DeleteTranscodeFileTask {
 
 /// "Optimize database" — compacts the database and truncates free space. Port
 /// of `OptimizeDatabaseTask` + the SQLite provider's `RunScheduledOptimisation`
-/// (`PRAGMA optimize`, `VACUUM`, WAL checkpoint truncation). Before the vacuum
-/// it also prunes Ferrofin's own `FerrofinPlaybackSessions` rows (no upstream
-/// equivalent) older than `ActivityLogRetentionDays`.
+/// (`VACUUM`, WAL checkpoint truncation). Before the vacuum it also prunes
+/// Ferrofin's own `FerrofinPlaybackSessions` rows (no upstream equivalent)
+/// older than `ActivityLogRetentionDays`.
+///
+/// Accepted divergence (owner decision, 2026-11-11): Jellyfin 12.x's
+/// `OptimizeAsync` also runs a full `ANALYZE` (under `analysis_limit=0`, once
+/// the library holds items), as its `RefreshDatabaseStatisticsPostScanTask`
+/// does after every library scan, and Ferrofin deliberately does neither. Its
+/// plan pins and `EXPLAIN QUERY PLAN` tests assume the planner has no
+/// statistics (`sqlite_stat1` never exists). `PRAGMA optimize` is not run
+/// either: it analyses every populated, indexed table that has none.
+/// Statistics an earlier version left behind are dropped at boot
+/// (`ferrofin-db`'s `Database::connect_tuned`).
 pub struct OptimizeDatabaseTask {
     db: Database,
     sessions: Arc<dyn SessionManager>,
@@ -585,13 +595,13 @@ impl ScheduledTask for OptimizeDatabaseTask {
             }
         }
         tracing::info!("optimizing and vacuuming the database");
-        for (statement, pct) in [("PRAGMA optimize", 25.0), ("VACUUM", 75.0)] {
-            sqlx::query(statement)
-                .execute(self.db.writer())
-                .await
-                .map_err(db_err)?;
-            progress.report(pct);
-        }
+        // Unlike upstream, no `ANALYZE`, and no `PRAGMA optimize` either: see
+        // the type's doc.
+        sqlx::query("VACUUM")
+            .execute(self.db.writer())
+            .await
+            .map_err(db_err)?;
+        progress.report(75.0);
         // `PRAGMA wal_checkpoint(TRUNCATE)`, in turn with the background
         // checkpoints: the vacuum's commit has just started one, which the
         // truncation would otherwise answer busy against.
@@ -1294,6 +1304,30 @@ mod tests {
         let progress = TaskProgress::default();
         task.execute(&progress).await.expect("run");
         assert!((progress.current() - 100.0).abs() < f64::EPSILON);
+    }
+
+    /// Ferrofin's plan pins assume the planner has no statistics, so the
+    /// run takes none, over populated, indexed tables (Jellyfin 12.x runs a
+    /// full `ANALYZE` here).
+    #[tokio::test]
+    async fn optimize_database_leaves_no_planner_statistics() {
+        let db = test_db().await;
+        // The placeholder `BaseItems` row is there too.
+        seed_old_session(&db).await;
+        test_rows::insert(&db, "recent", Utc::now()).await;
+        let task = OptimizeDatabaseTask::new(
+            db.clone(),
+            idle_sessions(),
+            crate::test_support::library_manager_over(db.clone()),
+            retention_days(Some(30)),
+        );
+        task.execute(&TaskProgress::default()).await.expect("run");
+        assert_eq!(
+            test_rows::remaining(&db).await,
+            ["recent"],
+            "the run went through"
+        );
+        assert_eq!(test_rows::stat_tables(&db).await, Vec::<String>::new());
     }
 
     #[tokio::test]
