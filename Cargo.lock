@@ -1307,6 +1307,7 @@ dependencies = [
  "opentelemetry",
  "opentelemetry_sdk",
  "quick-xml",
+ "rand 0.10.3",
  "regex",
  "reqwest",
  "rstest",
