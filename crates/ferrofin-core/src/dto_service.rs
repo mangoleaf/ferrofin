@@ -2941,7 +2941,6 @@ impl FerrofinDtoService {
         }
 
         dto.name = item.name.clone();
-        dto.original_title = item.original_title.clone();
         dto.official_rating = item.official_rating.clone();
         // `Container` has no dedicated column on the row at this layer (it lives in
         // the serialized `Data` blob, not yet parsed here), so it stays `None`.
@@ -10599,6 +10598,40 @@ mod tests {
             dto.media_streams.as_ref().is_some_and(|s| !s.is_empty()),
             "MediaStreams emptied — the second read of the prefetched map lost its rows"
         );
+    }
+
+    /// `dto.OriginalTitle = item.OriginalTitle` only under
+    /// `ItemFields.OriginalTitle` (v12.4 `DtoService.cs:1230-1233`), unlike
+    /// the `Name` and `OfficialRating` beside it.
+    #[tokio::test]
+    async fn original_title_needs_its_field() {
+        let db = test_db().await;
+        let id = Uuid::new_v4();
+        seed_named_item(&db, id, BaseItemKind::Movie, "Spirited Away").await;
+        let mut item = fetch_item(&db, id).await;
+        item.original_title = Some("Sen to Chihiro".to_owned());
+        let svc = service(db);
+
+        let bare = DtoOptions {
+            fields: Vec::new(),
+            ..DtoOptions::default()
+        };
+        let dto = svc
+            .get_base_item_dto(&item, &bare, None, None)
+            .await
+            .unwrap();
+        assert_eq!(dto.name.as_deref(), Some("Spirited Away"));
+        assert_eq!(dto.original_title, None);
+
+        let asked = DtoOptions {
+            fields: vec![ItemFields::OriginalTitle],
+            ..DtoOptions::default()
+        };
+        let dto = svc
+            .get_base_item_dto(&item, &asked, None, None)
+            .await
+            .unwrap();
+        assert_eq!(dto.original_title.as_deref(), Some("Sen to Chihiro"));
     }
 
     /// The item DTO's sources run `GetStaticMediaSources(item, true, user)`'s
