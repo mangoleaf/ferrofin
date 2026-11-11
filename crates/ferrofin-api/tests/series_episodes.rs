@@ -444,13 +444,6 @@ impl LibraryManager for SeriesLibrary {
     ) -> Result<Vec<BaseItemEntity>, ServiceError> {
         unimplemented!()
     }
-    async fn create_items(
-        &self,
-        _i: &[BaseItemEntity],
-        _p: Option<Uuid>,
-    ) -> Result<(), ServiceError> {
-        unimplemented!()
-    }
     async fn update_items(
         &self,
         _i: &[BaseItemEntity],
@@ -563,9 +556,6 @@ struct NameDto;
 
 #[async_trait]
 impl DtoService for NameDto {
-    async fn get_primary_image_aspect_ratio(&self, _id: Uuid) -> Result<Option<f64>, ServiceError> {
-        unimplemented!()
-    }
     async fn get_base_item_dto(
         &self,
         _item: &BaseItemEntity,
@@ -591,15 +581,6 @@ impl DtoService for NameDto {
                 ..BaseItemDto::default()
             })
             .collect())
-    }
-    async fn get_item_by_name_dto(
-        &self,
-        _item: &BaseItemEntity,
-        _options: &DtoOptions,
-        _tagged_item_ids: Option<&[Uuid]>,
-        _user: Option<&UserEntity>,
-    ) -> Result<BaseItemDto, ServiceError> {
-        unimplemented!()
     }
 }
 

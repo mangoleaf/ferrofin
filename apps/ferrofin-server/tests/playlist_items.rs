@@ -74,7 +74,6 @@ struct Fixture {
     temp: std::sync::Arc<tempfile::TempDir>,
     db: Database,
     router: axum::Router,
-    state: ferrofin_api::state::AppState,
     token: String,
     library: Uuid,
 }
@@ -113,7 +112,7 @@ async fn fixture() -> Fixture {
     ferrofin_server::seed::seed_default_admin(wired.state.users.as_ref(), &config)
         .await
         .unwrap();
-    let router = ferrofin_api::create_router(wired.state.clone());
+    let router = ferrofin_api::create_router(wired.state);
     let token = login(&router, "admin", "playlist-pw").await;
 
     let media = temp.path().join("media");
@@ -144,7 +143,6 @@ async fn fixture() -> Fixture {
         temp: std::sync::Arc::new(temp),
         db,
         router,
-        state: wired.state,
         token,
         library,
     }
@@ -175,13 +173,11 @@ impl Fixture {
         if row.parent_id.is_none() {
             row.parent_id = Some(guid_to_db(self.library));
         }
-        self.state.library.create_items(&[row], None).await.unwrap();
+        let persistence = ferrofin_core::FerrofinItemPersistenceService::new(self.db.clone());
+        persistence.save_items(&[row]).await.unwrap();
         let mut chain = ancestors.to_vec();
         chain.push(self.library);
-        ferrofin_core::FerrofinItemPersistenceService::new(self.db.clone())
-            .set_ancestors(id, &chain)
-            .await
-            .unwrap();
+        persistence.set_ancestors(id, &chain).await.unwrap();
         id
     }
 

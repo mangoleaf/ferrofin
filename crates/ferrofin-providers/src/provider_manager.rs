@@ -11992,13 +11992,6 @@ mod tests {
         ) -> Result<Vec<String>, ServiceError> {
             unimplemented!()
         }
-        async fn get_people_names_by_items(
-            &self,
-            _item_ids: &[Uuid],
-            _person_types: &[String],
-        ) -> Result<HashMap<Uuid, Vec<String>>, ServiceError> {
-            unimplemented!()
-        }
     }
 
     /// What a path-less season's refresh needs: the season (number 1, under a

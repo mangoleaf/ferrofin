@@ -406,11 +406,6 @@ pub(crate) struct ByNameItemQuery {
     pub user_id: Option<uuid::Uuid>,
 }
 
-/// Projects a page of already-resolved by-name item rows into a
-/// [`QueryResult<BaseItemDto>`] via [`DtoService::get_item_by_name_dto`].
-///
-/// Used by the browses whose manager call already yields the item rows (Persons,
-/// Years) rather than count-carrying [`ItemWithCounts`] aggregates.
 /// Strips `ItemCounts` from a by-name **list**'s options.
 ///
 /// C# `DtoService.GetItemByNameDto` only stamps the ten count fields when
@@ -440,6 +435,11 @@ fn without_item_counts(options: &DtoOptions) -> DtoOptions {
     trimmed
 }
 
+/// Projects a page of already-resolved by-name item rows into a
+/// [`QueryResult<BaseItemDto>`], as `DtoService.GetItemByNameDto` does upstream.
+///
+/// Used by the browses whose manager call already yields the item rows (Persons,
+/// Years) rather than count-carrying [`ItemWithCounts`] aggregates.
 pub(crate) async fn project_item_rows(
     state: &AppState,
     result: QueryResult<ferrofin_db::entities::base_items::BaseItemEntity>,
@@ -448,10 +448,10 @@ pub(crate) async fn project_item_rows(
 ) -> Result<QueryResult<BaseItemDto>, ApiError> {
     let start_index = Some(result.start_index);
     let total = Some(result.total_record_count);
-    // With no pre-supplied tagged ids and no `ItemCounts` field requested (the
-    // by-name list options), `get_item_by_name_dto` reduces to `build_dto` — the
-    // same thing `get_base_item_dtos` does, but batching the per-item image and
-    // user-data loads into two queries instead of 2×N. Same rows, same order.
+    // With no tagged items and no `ItemCounts` field (the by-name list
+    // options), C# `GetItemByNameDto` is `GetBaseItemDtoInternal`: what
+    // `get_base_item_dtos` does, batching the per-item image and user-data
+    // loads into two queries instead of 2×N. Same rows, same order.
     let options = without_item_counts(options);
     let dtos = state
         .dto
@@ -618,10 +618,11 @@ pub(crate) async fn resolve_album_ids(
 /// Projects a page of [`ItemWithCounts`] aggregates into a
 /// [`QueryResult<BaseItemDto>`], mirroring `RequestHelpers.CreateQueryResult`.
 ///
-/// Each aggregate's item row is projected through
-/// [`DtoService::get_item_by_name_dto`]; when `include_item_types` — the
-/// caller's [`ByNameListQuery::should_include_item_types`] — is set, the
-/// per-kind counts are copied onto the DTO's count fields (`ChildCount`,
+/// Each aggregate's item row is projected as `DtoService.GetItemByNameDto`
+/// projects it, without `ItemCounts` (see [`project_item_rows`]); when
+/// `include_item_types` — the caller's
+/// [`ByNameListQuery::should_include_item_types`] — is set, the per-kind
+/// counts are copied onto the DTO's count fields (`ChildCount`,
 /// `ProgramCount`, …) exactly as Jellyfin does.
 pub(crate) async fn project_query_result(
     state: &AppState,

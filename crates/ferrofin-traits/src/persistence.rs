@@ -1704,10 +1704,9 @@ pub trait ItemPersistenceService: Send + Sync {
         Ok(false)
     }
 
-    /// Announces `ItemAdded` for a row created outside
-    /// [`crate::library::LibraryManager::create_items`] (which announces its
-    /// own), as `LibraryManager.CreateItem` raises it for every new item.
-    /// Returns whether the row exists.
+    /// Announces `ItemAdded` for a row created outside the library scan
+    /// (which announces its own), as `LibraryManager.CreateItem` raises it for
+    /// every new item. Returns whether the row exists.
     ///
     /// The default announces nothing (for stub/fake services).
     ///
@@ -2809,13 +2808,6 @@ pub trait PeopleRepository: Send + Sync {
         &self,
         filter: &InternalPeopleQuery,
     ) -> Result<Vec<String>, ServiceError>;
-
-    /// Batch-fetches the distinct people names per item, filtered by type.
-    async fn get_people_names_by_items(
-        &self,
-        item_ids: &[Uuid],
-        person_types: &[String],
-    ) -> Result<HashMap<Uuid, Vec<String>>, ServiceError>;
 }
 
 fn _assert_object_safe_people_repository(_: &dyn PeopleRepository) {}

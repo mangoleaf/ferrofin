@@ -168,12 +168,6 @@ impl DeviceManager for StubDevices {
         // no-op (so the panic `FakeSessions.logout_device` is never reached).
         Ok(QueryResult::from_items(Vec::new()))
     }
-    async fn get_device_infos(
-        &self,
-        _query: &DeviceQuery,
-    ) -> Result<QueryResult<ferrofin_model::devices::DeviceInfo>, ServiceError> {
-        unimplemented!()
-    }
     async fn get_devices_for_user(
         &self,
         _user_id: Option<Uuid>,

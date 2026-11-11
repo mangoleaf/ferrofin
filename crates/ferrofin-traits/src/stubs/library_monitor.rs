@@ -36,24 +36,6 @@ impl LibraryMonitor for NoopLibraryMonitor {
 
     fn restart(&self) {}
 
-    async fn report_file_system_change_beginning(&self, path: &str) -> Result<(), ServiceError> {
-        if path.is_empty() {
-            return Err(ServiceError::invalid_input("path can't be empty"));
-        }
-        Ok(())
-    }
-
-    async fn report_file_system_change_complete(
-        &self,
-        path: &str,
-        _refresh_path: bool,
-    ) -> Result<(), ServiceError> {
-        if path.is_empty() {
-            return Err(ServiceError::invalid_input("path can't be empty"));
-        }
-        Ok(())
-    }
-
     async fn report_file_system_changed(&self, path: &str) -> Result<(), ServiceError> {
         if path.is_empty() {
             return Err(ServiceError::invalid_input("path can't be empty"));
@@ -82,31 +64,11 @@ mod tests {
             .report_file_system_changed("/media/movies/Solaris")
             .await
             .expect("report");
-        monitor
-            .report_file_system_change_beginning("/media/movies/Solaris")
-            .await
-            .expect("begin");
-        monitor
-            .report_file_system_change_complete("/media/movies/Solaris", true)
-            .await
-            .expect("complete");
     }
 
     #[tokio::test]
     async fn empty_path_is_rejected() {
         let monitor = NoopLibraryMonitor;
         assert!(monitor.report_file_system_changed("").await.is_err());
-        assert!(
-            monitor
-                .report_file_system_change_beginning("")
-                .await
-                .is_err()
-        );
-        assert!(
-            monitor
-                .report_file_system_change_complete("", false)
-                .await
-                .is_err()
-        );
     }
 }

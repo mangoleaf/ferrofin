@@ -3112,12 +3112,6 @@ mod tests {
             }
             Ok(())
         }
-        async fn get_channel_stream_url(
-            &self,
-            _id: Uuid,
-        ) -> Result<Option<String>, ferrofin_traits::error::ServiceError> {
-            unimplemented!()
-        }
         async fn get_timers(
             &self,
         ) -> Result<Vec<TimerInfoDto>, ferrofin_traits::error::ServiceError> {

@@ -430,13 +430,6 @@ impl LibraryManager for StubLibrary {
     ) -> Result<Vec<BaseItemEntity>, ServiceError> {
         unimplemented!()
     }
-    async fn create_items(
-        &self,
-        _i: &[BaseItemEntity],
-        _p: Option<Uuid>,
-    ) -> Result<(), ServiceError> {
-        unimplemented!()
-    }
     async fn update_items(
         &self,
         _i: &[BaseItemEntity],
@@ -587,9 +580,6 @@ impl UserManager for StubUsers {
     }
 
     async fn get_users(&self) -> Result<Vec<UserEntity>, ServiceError> {
-        unimplemented!()
-    }
-    async fn get_user_ids(&self) -> Result<Vec<Uuid>, ServiceError> {
         unimplemented!()
     }
     async fn initialize(&self) -> Result<(), ServiceError> {
