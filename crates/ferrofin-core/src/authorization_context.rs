@@ -753,20 +753,6 @@ mod tests {
         ) -> Result<String, ServiceError> {
             self.get_smart_api_url(&RequestContext::default()).await
         }
-        async fn get_local_api_url(
-            &self,
-            _hostname: &str,
-            _scheme: Option<&str>,
-            _port: Option<u16>,
-        ) -> Result<String, ServiceError> {
-            unreachable!()
-        }
-        fn expand_virtual_path(&self, path: &str) -> String {
-            path.to_owned()
-        }
-        fn reverse_virtual_path(&self, path: &str) -> String {
-            path.to_owned()
-        }
     }
 
     #[test]

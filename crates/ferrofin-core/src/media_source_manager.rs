@@ -2997,9 +2997,6 @@ mod tests {
         async fn refresh_guide(&self) -> Result<(), ServiceError> {
             Ok(())
         }
-        async fn get_channel_stream_url(&self, _id: Uuid) -> Result<Option<String>, ServiceError> {
-            Ok(Some(FAKE_TUNER_URL.to_owned()))
-        }
         async fn live_tv_media_type(&self, _id: Uuid) -> Result<Option<String>, ServiceError> {
             // `LiveTvChannel.MediaType` for a television channel.
             Ok(Some("Video".to_owned()))

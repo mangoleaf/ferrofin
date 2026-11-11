@@ -214,9 +214,6 @@ impl UserManager for OkUsers {
     async fn get_users(&self) -> Result<Vec<UserEntity>, ServiceError> {
         unimplemented!()
     }
-    async fn get_user_ids(&self) -> Result<Vec<Uuid>, ServiceError> {
-        unimplemented!()
-    }
     async fn initialize(&self) -> Result<(), ServiceError> {
         unimplemented!()
     }
@@ -315,13 +312,6 @@ impl LibraryManager for OkLibrary {
         _q: &InternalItemsQuery,
         _c: ferrofin_model::data::CollectionType,
     ) -> Result<Vec<BaseItemEntity>, ServiceError> {
-        unimplemented!()
-    }
-    async fn create_items(
-        &self,
-        _i: &[BaseItemEntity],
-        _p: Option<Uuid>,
-    ) -> Result<(), ServiceError> {
         unimplemented!()
     }
     async fn update_items(
@@ -699,14 +689,6 @@ impl SessionManager for RecordingSessions {
         // The user-data manager's batched `UserDataChanged` goes out here;
         // delivery is covered by the ferrofin-core session-manager tests.
         Ok(())
-    }
-    async fn send_message_to_user_device_sessions(
-        &self,
-        _d: &str,
-        _m: SessionMessageType,
-        _p: &str,
-    ) -> Result<(), ServiceError> {
-        unimplemented!()
     }
     async fn send_restart_required_notification(&self) -> Result<(), ServiceError> {
         unimplemented!()
@@ -2064,6 +2046,70 @@ async fn post_capabilities_parses_csv() {
     assert_eq!(id, "sess-x");
     assert!(caps.supports_media_control);
     assert_eq!(caps.playable_media_types.len(), 2);
+}
+
+/// `PlayableMediaTypes` and `SupportedCommands` carry
+/// `JsonCommaDelimitedCollectionConverterFactory` (v12.4
+/// ClientCapabilitiesDto.cs:18-25): a string is split on `,`, each piece
+/// converted as `Enum.Parse(…, ignoreCase: true)` does and dropped when it does
+/// not parse; `null` is MVC's implicit `[Required]` 400, and an array stays
+/// strict. Each case was measured on a live Jellyfin 12.4.
+#[tokio::test]
+async fn post_full_capabilities_binds_comma_delimited_lists() {
+    use ferrofin_model::data::MediaType;
+    use ferrofin_model::session::GeneralCommandType;
+    let uri = "/Sessions/Capabilities/Full?id=sess-x";
+    let cases = [
+        (
+            r#"{"PlayableMediaTypes":"Audio, video,Bogus,","SupportedCommands":"MoveUp,,TotallyNotAValidCommand, movedown"}"#,
+            vec![MediaType::Audio, MediaType::Video],
+            vec![GeneralCommandType::MoveUp, GeneralCommandType::MoveDown],
+        ),
+        (
+            r#"{"PlayableMediaTypes":"","SupportedCommands":["MoveUp"]}"#,
+            vec![],
+            vec![GeneralCommandType::MoveUp],
+        ),
+    ];
+    for (body, media_types, commands) in cases {
+        let (sessions, user_data) = recording();
+        let (status, _) = send(
+            state(sessions.clone(), user_data),
+            "POST",
+            uri,
+            Body::from(body),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+        let (_, caps) = sessions
+            .calls
+            .lock()
+            .unwrap()
+            .capabilities
+            .clone()
+            .expect("caps");
+        assert_eq!(caps.playable_media_types, media_types, "{body}");
+        assert_eq!(caps.supported_commands, commands, "{body}");
+    }
+    for body in [
+        r#"{"PlayableMediaTypes":null}"#,
+        r#"{"SupportedCommands":null}"#,
+        r#"{"SupportedCommands":["Bogus"]}"#,
+    ] {
+        let (sessions, user_data) = recording();
+        let (status, _) = send(
+            state(sessions.clone(), user_data),
+            "POST",
+            uri,
+            Body::from(body),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert!(
+            sessions.calls.lock().unwrap().capabilities.is_none(),
+            "{body}"
+        );
+    }
 }
 
 #[tokio::test]

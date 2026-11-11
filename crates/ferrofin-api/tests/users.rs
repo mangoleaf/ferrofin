@@ -154,9 +154,6 @@ impl UserManager for MemUsers {
             .chain(mem_users())
             .collect())
     }
-    async fn get_user_ids(&self) -> Result<Vec<Uuid>, ServiceError> {
-        Ok(vec![ADMIN_ID, BOB_ID])
-    }
     async fn initialize(&self) -> Result<(), ServiceError> {
         Ok(())
     }
@@ -482,14 +479,6 @@ impl SessionManager for NoopSessions {
         // fake here (apps/ferrofin-server/tests/user_updated_push.rs).
         Ok(())
     }
-    async fn send_message_to_user_device_sessions(
-        &self,
-        _device_id: &str,
-        _message_type: SessionMessageType,
-        _data: &str,
-    ) -> Result<(), ServiceError> {
-        unimplemented!("fake")
-    }
     async fn send_restart_required_notification(&self) -> Result<(), ServiceError> {
         unimplemented!("fake")
     }
@@ -789,9 +778,6 @@ impl UserManager for OkUsers {
     async fn get_users(&self) -> Result<Vec<UserEntity>, ServiceError> {
         unimplemented!()
     }
-    async fn get_user_ids(&self) -> Result<Vec<Uuid>, ServiceError> {
-        unimplemented!()
-    }
     async fn initialize(&self) -> Result<(), ServiceError> {
         unimplemented!()
     }
@@ -1009,13 +995,6 @@ impl LibraryManager for OkLibrary {
     ) -> Result<Vec<BaseItemEntity>, ServiceError> {
         unimplemented!()
     }
-    async fn create_items(
-        &self,
-        _items: &[BaseItemEntity],
-        _parent_id: Option<Uuid>,
-    ) -> Result<(), ServiceError> {
-        unimplemented!()
-    }
     async fn update_items(
         &self,
         _items: &[BaseItemEntity],
@@ -1145,12 +1124,6 @@ fn entity_to_dto(item: &BaseItemEntity) -> BaseItemDto {
 
 #[async_trait]
 impl DtoService for OkDto {
-    async fn get_primary_image_aspect_ratio(
-        &self,
-        _item_id: Uuid,
-    ) -> Result<Option<f64>, ServiceError> {
-        unimplemented!()
-    }
     async fn get_base_item_dto(
         &self,
         item: &BaseItemEntity,
@@ -1169,15 +1142,6 @@ impl DtoService for OkDto {
         _skip_visibility_check: bool,
     ) -> Result<Vec<BaseItemDto>, ServiceError> {
         Ok(items.iter().map(entity_to_dto).collect())
-    }
-    async fn get_item_by_name_dto(
-        &self,
-        item: &BaseItemEntity,
-        _options: &DtoOptions,
-        _tagged_item_ids: Option<&[Uuid]>,
-        _user: Option<&UserEntity>,
-    ) -> Result<BaseItemDto, ServiceError> {
-        Ok(entity_to_dto(item))
     }
 }
 
@@ -1360,14 +1324,6 @@ impl SessionManager for OkSessions {
     ) -> Result<(), ServiceError> {
         // The delete handler pushes UserDeleted here best-effort.
         Ok(())
-    }
-    async fn send_message_to_user_device_sessions(
-        &self,
-        _device_id: &str,
-        _message_type: ferrofin_model::session::SessionMessageType,
-        _data: &str,
-    ) -> Result<(), ServiceError> {
-        unimplemented!()
     }
     async fn send_restart_required_notification(&self) -> Result<(), ServiceError> {
         unimplemented!()
@@ -1723,13 +1679,6 @@ impl ferrofin_traits::collections::PlaylistManager for RecordingPlaylists {
     ) -> Result<ferrofin_traits::collections::PlaylistAccess, ServiceError> {
         unimplemented!("unused")
     }
-    async fn get_playlist_for_user(
-        &self,
-        _playlist_id: Uuid,
-        _user_id: Uuid,
-    ) -> Result<BaseItemEntity, ServiceError> {
-        unimplemented!("unused")
-    }
     async fn create_playlist(
         &self,
         _request: &ferrofin_model::playlists::PlaylistCreationRequest,
@@ -1740,9 +1689,6 @@ impl ferrofin_traits::collections::PlaylistManager for RecordingPlaylists {
         &self,
         _request: &ferrofin_model::playlists::PlaylistUpdateRequest,
     ) -> Result<(), ServiceError> {
-        unimplemented!("unused")
-    }
-    async fn get_playlists(&self, _user_id: Uuid) -> Result<Vec<BaseItemEntity>, ServiceError> {
         unimplemented!("unused")
     }
     async fn get_playlist_items(

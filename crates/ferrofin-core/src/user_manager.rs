@@ -1107,18 +1107,6 @@ impl UserManager for FerrofinUserManager {
             .map_err(db_err)
     }
 
-    async fn get_user_ids(&self) -> Result<Vec<Uuid>, ServiceError> {
-        let ids: Vec<String> =
-            sqlx::query_scalar(r#"SELECT "Id" FROM "Users" ORDER BY "Username""#)
-                .fetch_all(self.db.pool())
-                .await
-                .map_err(db_err)?;
-        Ok(ids
-            .into_iter()
-            .filter_map(|id| Uuid::parse_str(&id).ok())
-            .collect())
-    }
-
     async fn initialize(&self) -> Result<(), ServiceError> {
         if self.user_count().await? > 0 {
             return Ok(());

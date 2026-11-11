@@ -11,9 +11,9 @@
 //! pool directly, so the manager stays composition-root agnostic.
 //!
 //! Port simplifications, all faithful to the trait surface:
-//! - `create_items`/`update_items` collapse to `save_items` on the persistence
-//!   service (the row upsert is idempotent); the `parent_id` argument is accepted
-//!   for API parity but the parent linkage is already carried on each row's
+//! - `update_items` collapses to `save_items` on the persistence service (the
+//!   row upsert is idempotent); the `parent_id` argument is accepted for API
+//!   parity but the parent linkage is already carried on each row's
 //!   `ParentId` column. `update_items` is the edit's save, so first it does
 //!   what `UpdateItemsAsync` and the mapper do to a loaded item: it re-derives
 //!   `SortName` (a caller that must keep a key it supplies saves through the
@@ -3167,33 +3167,6 @@ impl LibraryManager for FerrofinLibraryManager {
             .await
     }
 
-    async fn create_items(
-        &self,
-        items: &[BaseItemEntity],
-        _parent_id: Option<Uuid>,
-    ) -> Result<(), ServiceError> {
-        if items.is_empty() {
-            return Ok(());
-        }
-        // v12.2 `CreateItems` runs `OnMetadataChanged` on each item first: the
-        // parental filters read the stored score, so it must match the ratings
-        // saved.
-        let mut rated = items.to_vec();
-        if let Some(visibility) = &self.visibility {
-            visibility.update_rating_scores(&mut rated).await?;
-        }
-        // The parent linkage is already carried on each row's ParentId column; the
-        // upsert is the single persistence path (C# CreateItems == save + register).
-        self.persistence.save_items(&rated).await?;
-        // `ItemAdded` (LibraryChangedNotifier): announce only after the write
-        // succeeded, so a failed save never tells clients to fetch a row that
-        // is not there.
-        if let Some(changed) = &self.changed {
-            changed.record_added(&rated);
-        }
-        Ok(())
-    }
-
     async fn update_items(
         &self,
         items: &[BaseItemEntity],
@@ -5757,10 +5730,10 @@ mod tests {
         );
     }
 
-    /// v12.2 `CreateItems` and `UpdateItemsAsync` run `OnMetadataChanged` on
-    /// each item before it is saved (`ParentalRatingScoreTests`): a created
-    /// item stores its score, a custom rating wins over the official one, and
-    /// clearing the ratings clears the score.
+    /// v12.2 `UpdateItemsAsync` runs `OnMetadataChanged` on each item before
+    /// it is saved (`ParentalRatingScoreTests`): a saved item stores its
+    /// score, a custom rating wins over the official one, and clearing the
+    /// ratings clears the score.
     #[tokio::test]
     async fn saved_items_store_the_score_of_their_ratings() {
         let db = test_db().await;
@@ -5792,7 +5765,7 @@ mod tests {
             custom_rating: Some("NC-17".to_owned()),
             ..BaseItemEntity::default()
         };
-        mgr.create_items(&[movie], None).await.expect("create");
+        mgr.update_items(&[movie], None).await.expect("first save");
         assert_eq!(
             stored().await.inherited_parental_rating_value,
             score("NC-17")

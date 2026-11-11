@@ -128,20 +128,15 @@ async fn live_collection_flags_and_request_overrides_reach_real_folder_queries()
         json!("tvshowseries"),
     ] {
         let id = Uuid::new_v4();
-        wired
-            .state
-            .library
-            .create_items(
-                &[BaseItemEntity {
-                    id: guid_to_db(id),
-                    type_: "MediaBrowser.Controller.Entities.UserView".into(),
-                    name: Some("fixture view".into()),
-                    is_folder: true,
-                    data: Some(json!({"ViewType":view_type,"DisplayParentId":parent}).to_string()),
-                    ..Default::default()
-                }],
-                None,
-            )
+        persistence
+            .save_items(&[BaseItemEntity {
+                id: guid_to_db(id),
+                type_: "MediaBrowser.Controller.Entities.UserView".into(),
+                name: Some("fixture view".into()),
+                is_folder: true,
+                data: Some(json!({"ViewType":view_type,"DisplayParentId":parent}).to_string()),
+                ..Default::default()
+            }])
             .await
             .unwrap();
         view_ids.push(id);
@@ -157,24 +152,19 @@ async fn live_collection_flags_and_request_overrides_reach_real_folder_queries()
     ] {
         let id = Uuid::new_v4();
         ids.push(id);
-        wired
-            .state
-            .library
-            .create_items(
-                &[BaseItemEntity {
-                    id: guid_to_db(id),
-                    type_: kind.into(),
-                    name: Some(name.into()),
-                    sort_name: Some(name.to_lowercase()),
-                    clean_name: Some(name.to_lowercase()),
-                    media_type: Some("Video".into()),
-                    parent_id: Some(stored_parent.clone()),
-                    top_parent_id: Some(stored_parent.clone()),
-                    is_folder: kind.ends_with("Series"),
-                    ..Default::default()
-                }],
-                None,
-            )
+        persistence
+            .save_items(&[BaseItemEntity {
+                id: guid_to_db(id),
+                type_: kind.into(),
+                name: Some(name.into()),
+                sort_name: Some(name.to_lowercase()),
+                clean_name: Some(name.to_lowercase()),
+                media_type: Some("Video".into()),
+                parent_id: Some(stored_parent.clone()),
+                top_parent_id: Some(stored_parent.clone()),
+                is_folder: kind.ends_with("Series"),
+                ..Default::default()
+            }])
             .await
             .unwrap();
         persistence.set_ancestors(id, &[parent_id]).await.unwrap();
@@ -189,27 +179,22 @@ async fn live_collection_flags_and_request_overrides_reach_real_folder_queries()
         .unwrap()
         .presentation_unique_key
         .expect("the stored Series has its source presentation key");
-    wired
-        .state
-        .library
-        .create_items(
-            &[BaseItemEntity {
-                id: guid_to_db(episode_id),
-                type_: "MediaBrowser.Controller.Entities.TV.Episode".into(),
-                name: Some("Unplayed episode".into()),
-                // A stored key like the other rows': an episode's own
-                // `CreateSortName` keeps its name's case, which would sort it
-                // before "bravo series" in the TV view's expected order.
-                sort_name: Some("unplayed episode".into()),
-                parent_id: Some(guid_to_db(ids[1])),
-                series_id: Some(guid_to_db(ids[1])),
-                series_presentation_unique_key: Some(series_key),
-                top_parent_id: Some(stored_parent.clone()),
-                media_type: Some("Video".into()),
-                ..Default::default()
-            }],
-            None,
-        )
+    persistence
+        .save_items(&[BaseItemEntity {
+            id: guid_to_db(episode_id),
+            type_: "MediaBrowser.Controller.Entities.TV.Episode".into(),
+            name: Some("Unplayed episode".into()),
+            // A stored key like the other rows': an episode's own
+            // `CreateSortName` keeps its name's case, which would sort it
+            // before "bravo series" in the TV view's expected order.
+            sort_name: Some("unplayed episode".into()),
+            parent_id: Some(guid_to_db(ids[1])),
+            series_id: Some(guid_to_db(ids[1])),
+            series_presentation_unique_key: Some(series_key),
+            top_parent_id: Some(stored_parent.clone()),
+            media_type: Some("Video".into()),
+            ..Default::default()
+        }])
         .await
         .unwrap();
     persistence
@@ -507,34 +492,29 @@ async fn live_collection_flags_and_request_overrides_reach_real_folder_queries()
     post(&router, token, &format!("/Users/{user}/Policy"), policy).await;
     let hidden = Uuid::new_v4();
     let hidden_parent = Uuid::new_v4();
-    wired
-        .state
-        .library
-        .create_items(
-            &[
-                BaseItemEntity {
-                    id: guid_to_db(hidden),
-                    type_: "MediaBrowser.Controller.Entities.Video".into(),
-                    name: Some("Hidden requested video".into()),
-                    sort_name: Some("hidden requested video".into()),
-                    tags: Some("hidden-selection".into()),
-                    media_type: Some("Video".into()),
-                    parent_id: Some(stored_parent.clone()),
-                    top_parent_id: Some(stored_parent.clone()),
-                    ..Default::default()
-                },
-                BaseItemEntity {
-                    id: guid_to_db(hidden_parent),
-                    type_: "MediaBrowser.Controller.Entities.UserView".into(),
-                    name: Some("Hidden view".into()),
-                    is_folder: true,
-                    tags: Some("hidden-selection".into()),
-                    data: Some(json!({"ViewType":"movies","DisplayParentId":parent}).to_string()),
-                    ..Default::default()
-                },
-            ],
-            None,
-        )
+    persistence
+        .save_items(&[
+            BaseItemEntity {
+                id: guid_to_db(hidden),
+                type_: "MediaBrowser.Controller.Entities.Video".into(),
+                name: Some("Hidden requested video".into()),
+                sort_name: Some("hidden requested video".into()),
+                tags: Some("hidden-selection".into()),
+                media_type: Some("Video".into()),
+                parent_id: Some(stored_parent.clone()),
+                top_parent_id: Some(stored_parent.clone()),
+                ..Default::default()
+            },
+            BaseItemEntity {
+                id: guid_to_db(hidden_parent),
+                type_: "MediaBrowser.Controller.Entities.UserView".into(),
+                name: Some("Hidden view".into()),
+                is_folder: true,
+                tags: Some("hidden-selection".into()),
+                data: Some(json!({"ViewType":"movies","DisplayParentId":parent}).to_string()),
+                ..Default::default()
+            },
+        ])
         .await
         .unwrap();
     let outside_media = temp.path().join("outside");
@@ -565,23 +545,18 @@ async fn live_collection_flags_and_request_overrides_reach_real_folder_queries()
     let outside = Uuid::new_v4();
     let outside_parent_id = Uuid::parse_str(outside_parent).unwrap();
     let stored_outside_parent = guid_to_db(outside_parent_id);
-    wired
-        .state
-        .library
-        .create_items(
-            &[BaseItemEntity {
-                id: guid_to_db(outside),
-                type_: "MediaBrowser.Controller.Entities.Video".into(),
-                name: Some("Outside requested video".into()),
-                sort_name: Some("outside requested video".into()),
-                clean_name: Some("outside requested video".into()),
-                media_type: Some("Video".into()),
-                parent_id: Some(stored_outside_parent.clone()),
-                top_parent_id: Some(stored_outside_parent),
-                ..Default::default()
-            }],
-            None,
-        )
+    persistence
+        .save_items(&[BaseItemEntity {
+            id: guid_to_db(outside),
+            type_: "MediaBrowser.Controller.Entities.Video".into(),
+            name: Some("Outside requested video".into()),
+            sort_name: Some("outside requested video".into()),
+            clean_name: Some("outside requested video".into()),
+            media_type: Some("Video".into()),
+            parent_id: Some(stored_outside_parent.clone()),
+            top_parent_id: Some(stored_outside_parent),
+            ..Default::default()
+        }])
         .await
         .unwrap();
     persistence

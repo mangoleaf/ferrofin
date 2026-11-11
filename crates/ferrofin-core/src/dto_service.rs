@@ -117,7 +117,7 @@ struct Prefetched {
     /// The configured `PathSubstitutions`, read once per page when the `Path`
     /// or `MediaSources` field is requested.
     path_substitutions: Vec<PathSubstitution>,
-    /// Image rows per item id (same order as [`FerrofinDtoService::load_images`]).
+    /// Image rows per item id, by type then insertion order (`rowid`).
     images: HashMap<Uuid, Vec<ItemImageInfo>>,
     /// The requesting user's play-state per item id.
     user_data: HashMap<Uuid, UserItemDataDto>,
@@ -1468,28 +1468,11 @@ impl FerrofinDtoService {
         self
     }
 
-    /// Loads an item's image rows from `BaseItemImageInfos`, ordered by type then
-    /// by insertion order (`rowid`), the order the image routes address them.
-    async fn load_images(&self, item_id: Uuid) -> Result<Vec<ItemImageInfo>, ServiceError> {
-        let rows = sqlx::query_as::<_, BaseItemImageInfoEntity>(
-            r#"SELECT * FROM "BaseItemImageInfos"
-               WHERE "ItemId" = ?1 ORDER BY "ImageType", rowid"#,
-        )
-        .bind(guid_to_db(item_id))
-        .fetch_all(self.db.pool())
-        .await
-        .map_err(db_err)?;
-
-        Ok(rows
-            .iter()
-            .map(|row| to_image_info(row, &self.virtual_paths))
-            .collect())
-    }
-
-    /// Batch form of [`Self::load_images`]: all image rows for `item_ids` in one
-    /// query per chunk, keyed by item id (per-item ordering preserved).
+    /// All image rows for `item_ids` in one query per chunk, keyed by item id,
+    /// each item's ordered by type then by insertion order (`rowid`), the order
+    /// the image routes address them.
     ///
-    /// The per-item form is an N+1 that dominates list-endpoint latency under
+    /// A per-item read is an N+1 that dominates list-endpoint latency under
     /// concurrent load; list callers prefetch through this instead.
     async fn load_images_batch(
         &self,
@@ -1907,7 +1890,7 @@ impl FerrofinDtoService {
     ) -> Result<(), ServiceError> {
         let item_id = row_id(item);
         // The page's credits and their images were bulk-loaded once by the
-        // prefetch (the per-item get_people + per-person load_images was the
+        // prefetch (a per-item get_people and per-person image read was the
         // N+1 cost of a large-cast item).
         let people = attach_order(
             prefetched
@@ -3591,25 +3574,6 @@ impl FerrofinDtoService {
         Ok(map)
     }
 
-    /// Populates the item-by-name counts on a DTO (port of `SetItemByNameInfo`)
-    /// using the injected [`ItemCountService`].
-    async fn set_item_by_name_info(
-        &self,
-        dto: &mut BaseItemDto,
-        user: Option<&UserEntity>,
-    ) -> Result<(), ServiceError> {
-        let Some(related) = related_item_kinds(dto.type_) else {
-            return Ok(());
-        };
-        let access_filter = access_filter_for(user);
-        let counts = self
-            .item_counts
-            .get_item_counts_for_name_item(dto.type_, dto.id, related, &access_filter)
-            .await?;
-        apply_name_counts(dto, &counts);
-        Ok(())
-    }
-
     /// Resolves by-name item counts for the whole page: groups the by-name rows
     /// by kind and issues one batched count query per kind (instead of one per
     /// row — the `ItemCounts` N+1 on an Artists/Genres/Persons page).
@@ -3898,22 +3862,6 @@ pub(crate) async fn primary_image_aspect_ratio(
 
 #[async_trait]
 impl ferrofin_traits::dto::DtoService for FerrofinDtoService {
-    async fn get_primary_image_aspect_ratio(
-        &self,
-        item_id: Uuid,
-    ) -> Result<Option<f64>, ServiceError> {
-        let images = self.load_images(item_id).await?;
-        // The kind decides the fallback ratio for a remote/unreadable image
-        // (`GetDefaultPrimaryImageAspectRatio`); an item that no longer
-        // exists takes the `BaseItem` default of 0.
-        let kind = self
-            .library
-            .get_item_by_id(item_id)
-            .await?
-            .map_or(BaseItemKind::Folder, |row| row_kind(&row));
-        Ok(self.primary_aspect_ratio(item_id, kind, &images).await)
-    }
-
     async fn get_base_item_dto(
         &self,
         item: &BaseItemEntity,
@@ -3974,41 +3922,6 @@ impl ferrofin_traits::dto::DtoService for FerrofinDtoService {
     ) -> Result<Vec<BaseItemDto>, ServiceError> {
         self.project(items, options, user, None, RowRead::LinkedChildren)
             .await
-    }
-
-    async fn get_item_by_name_dto(
-        &self,
-        item: &BaseItemEntity,
-        options: &DtoOptions,
-        tagged_item_ids: Option<&[Uuid]>,
-        user: Option<&UserEntity>,
-    ) -> Result<BaseItemDto, ServiceError> {
-        let mut prefetched = self
-            .prefetch(
-                std::slice::from_ref(item),
-                options,
-                user,
-                None,
-                false,
-                false,
-            )
-            .await?;
-        // Single-item page: the id cannot repeat, so every entry moves.
-        let mut dto = self
-            .build_dto(item, options, user, None, &mut prefetched, false)
-            .await?;
-
-        // When the caller pre-supplies the tagged items, count them by kind
-        // (port of the static `SetItemByNameInfo` overload); otherwise fall back
-        // to the count-service path.
-        if options.contains_field(ItemFields::ItemCounts) {
-            if let Some(ids) = tagged_item_ids.filter(|ids| !ids.is_empty()) {
-                self.set_tagged_counts(&mut dto, ids).await?;
-            } else {
-                self.set_item_by_name_info(&mut dto, user).await?;
-            }
-        }
-        Ok(dto)
     }
 
     async fn can_download(&self, item: &BaseItemEntity) -> Result<bool, ServiceError> {
@@ -5482,38 +5395,6 @@ impl FerrofinDtoService {
         }
         Ok(())
     }
-
-    /// Counts pre-supplied tagged items by kind onto a by-name DTO (port of the
-    /// static `SetItemByNameInfo(item, dto, taggedItems)` overload). The kinds of
-    /// the tagged items are read from their rows.
-    async fn set_tagged_counts(
-        &self,
-        dto: &mut BaseItemDto,
-        tagged_item_ids: &[Uuid],
-    ) -> Result<(), ServiceError> {
-        let mut kinds_vec = Vec::with_capacity(tagged_item_ids.len());
-        for id in tagged_item_ids {
-            if let Some(row) = self.library.get_item_by_id(*id).await? {
-                kinds_vec.push(row_kind(&row));
-            }
-        }
-
-        let count = |target: BaseItemKind| {
-            i32::try_from(kinds_vec.iter().filter(|k| **k == target).count()).unwrap_or(i32::MAX)
-        };
-
-        dto.artist_count = Some(count(BaseItemKind::MusicArtist));
-        dto.album_count = Some(count(BaseItemKind::MusicAlbum));
-        dto.episode_count = Some(count(BaseItemKind::Episode));
-        dto.movie_count = Some(count(BaseItemKind::Movie));
-        dto.trailer_count = Some(count(BaseItemKind::Trailer));
-        dto.music_video_count = Some(count(BaseItemKind::MusicVideo));
-        dto.series_count = Some(count(BaseItemKind::Series));
-        dto.program_count = Some(count(BaseItemKind::LiveTvProgram));
-        dto.song_count = Some(count(BaseItemKind::Audio));
-        dto.child_count = Some(i32::try_from(tagged_item_ids.len()).unwrap_or(i32::MAX));
-        Ok(())
-    }
 }
 
 #[cfg(test)]
@@ -5667,13 +5548,6 @@ mod tests {
             _collection_type: ferrofin_model::data::CollectionType,
         ) -> Result<Vec<BaseItemEntity>, ServiceError> {
             Ok(vec![])
-        }
-        async fn create_items(
-            &self,
-            _items: &[BaseItemEntity],
-            _parent_id: Option<Uuid>,
-        ) -> Result<(), ServiceError> {
-            Ok(())
         }
         async fn update_items(
             &self,
@@ -11144,22 +11018,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn primary_aspect_ratio_endpoint_matches_processor() {
-        let db = test_db().await;
-        let id = Uuid::new_v4();
-        seed_named_item(&db, id, BaseItemKind::Movie, "M").await;
-        seed_images(
-            &db,
-            id,
-            &[image_info(ImageType::Primary, "/primary.jpg", None)],
-        )
-        .await;
-        let svc = service(db);
-        let ratio = svc.get_primary_image_aspect_ratio(id).await.unwrap();
-        assert_eq!(ratio, Some(2.0));
-    }
-
-    #[tokio::test]
     async fn attaches_user_data_when_a_user_is_present() {
         let db = test_db().await;
         let id = Uuid::new_v4();
@@ -11804,37 +11662,8 @@ mod tests {
         assert_eq!(client_kind(BaseItemKind::Movie), BaseItemKind::Movie);
     }
 
-    #[tokio::test]
-    async fn item_by_name_dto_counts_supplied_tagged_items() {
-        let db = test_db().await;
-        // The genre item plus two tagged movies and a series it groups.
-        let genre = Uuid::new_v4();
-        seed_named_item(&db, genre, BaseItemKind::Genre, "Action").await;
-        let m1 = Uuid::new_v4();
-        let m2 = Uuid::new_v4();
-        let s1 = Uuid::new_v4();
-        seed_named_item(&db, m1, BaseItemKind::Movie, "A").await;
-        seed_named_item(&db, m2, BaseItemKind::Movie, "B").await;
-        seed_named_item(&db, s1, BaseItemKind::Series, "C").await;
-
-        let item = fetch_item(&db, genre).await;
-        // Library fake must resolve the tagged ids to rows.
-        let library = Arc::new(DbBackedLibrary { db: db.clone() });
-        let svc = service_with(db, library);
-        let dto = svc
-            .get_item_by_name_dto(&item, &DtoOptions::default(), Some(&[m1, m2, s1]), None)
-            .await
-            .unwrap();
-
-        assert_eq!(dto.movie_count, Some(2));
-        assert_eq!(dto.series_count, Some(1));
-        assert_eq!(dto.child_count, Some(3));
-    }
-
-    /// A [`LibraryManager`] fake whose `get_item_by_id` hits the real DB — used by
-    /// the tagged-items count test, which needs each id resolved to its kind,
-    /// and by `an_off_page_version_in_progress_leads_the_sources`, whose user
-    /// may open every item that exists.
+    /// A [`LibraryManager`] fake whose `get_item_by_id` hits the real DB, for
+    /// the tests whose user may open every item that exists.
     struct DbBackedLibrary {
         db: Database,
     }
@@ -11887,13 +11716,6 @@ mod tests {
             _collection_type: ferrofin_model::data::CollectionType,
         ) -> Result<Vec<BaseItemEntity>, ServiceError> {
             Ok(vec![])
-        }
-        async fn create_items(
-            &self,
-            _items: &[BaseItemEntity],
-            _parent_id: Option<Uuid>,
-        ) -> Result<(), ServiceError> {
-            Ok(())
         }
         async fn update_items(
             &self,

@@ -862,14 +862,6 @@ mod tests {
         ) -> Result<(), ServiceError> {
             unreachable!("not used by maintenance tasks")
         }
-        async fn send_message_to_user_device_sessions(
-            &self,
-            device_id: &str,
-            message_type: SessionMessageType,
-            data: &str,
-        ) -> Result<(), ServiceError> {
-            unreachable!("not used by maintenance tasks")
-        }
         async fn send_restart_required_notification(&self) -> Result<(), ServiceError> {
             unreachable!("not used by maintenance tasks")
         }
