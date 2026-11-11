@@ -3431,7 +3431,9 @@ pub const VERIFIED: &[Verified] = &[
         upstream_file: "Jellyfin.Api/Controllers/PlaylistsController.cs",
         upstream_method: "CreatePlaylist",
         ferrofin: "handlers/playlists.rs create_playlist (CreatePlaylistQuery, effective_user_id) \
-               → ferrofin-model playlists.rs CreatePlaylistDto → ferrofin-core \
+               → ferrofin-model playlists.rs CreatePlaylistDto (Ids through \
+               json::guid::comma_delimited, JsonCommaDelimitedCollectionConverterFactory) \
+               → ferrofin-core \
                collection_manager.rs FerrofinPlaylistManager::create_playlist \
                (PlaylistManager.CreatePlaylist: playlists_folder → item_persistence_service \
                playlists_folder_by_type, GetPlaylistsFolder's by-type lookup; \
@@ -3464,9 +3466,6 @@ pub const VERIFIED: &[Verified] = &[
             "With no media type named and a mixed folder as the first deciding id, the type \
          comes from the folder's first member by name, not upstream's tree-order walk. Fix \
          path: gl-588.",
-            "A body Ids sent as a comma-delimited string is a 400; upstream's \
-         JsonCommaDelimitedCollectionConverterFactory splits it and drops entries that do \
-         not parse. Fix path: gl-883.",
             "A malformed id in the ids query is a 400; upstream's \
          CommaDelimitedCollectionModelBinder drops it, so an all-malformed list falls back \
          to the body's Ids. Fix path: gl-884.",
@@ -3513,7 +3512,9 @@ pub const VERIFIED: &[Verified] = &[
         upstream_method: "UpdatePlaylist",
         ferrofin: "handlers/playlists.rs update_playlist (get_playlist_access + require_edit: \
                GetPlaylistForUser and the owner-or-editing-share check) → ferrofin-model \
-               playlists.rs UpdatePlaylistDto, entities_media.rs PlaylistUserPermissions \
+               playlists.rs UpdatePlaylistDto (Ids through \
+               json::guid::comma_delimited::option, the same converter), \
+               entities_media.rs PlaylistUserPermissions \
                (constructor defaults) → ferrofin-core collection_manager.rs \
                FerrofinPlaylistManager::update_playlist (PlaylistManager.UpdatePlaylist: \
                playlist_items for the Ids' AddToPlaylistInternal, rename_named_item_in, \
@@ -3544,9 +3545,6 @@ pub const VERIFIED: &[Verified] = &[
          FirstOrDefault answers the first entry's, and DELETE \
          /Playlists/{id}/Users/{userId} removes the user's one share where upstream \
          removes only the first entry (a second one keeps sharing). Fix path: gl-949.",
-            "A body Ids sent as a comma-delimited string is a 400; upstream's \
-         JsonCommaDelimitedCollectionConverterFactory splits it and drops entries that do \
-         not parse (so \"abc\" clears the playlist). Fix path: gl-883.",
             "The 404 (no playlist the caller can see) and 403 (no editing share) bodies are \
          Ferrofin's error shape, not upstream's (a \"Playlist not found\" string and an \
          empty Forbid). Fix path: gl-666.",

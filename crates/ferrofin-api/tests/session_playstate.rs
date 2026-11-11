@@ -2044,6 +2044,70 @@ async fn post_capabilities_parses_csv() {
     assert_eq!(caps.playable_media_types.len(), 2);
 }
 
+/// `PlayableMediaTypes` and `SupportedCommands` carry
+/// `JsonCommaDelimitedCollectionConverterFactory` (v12.4
+/// ClientCapabilitiesDto.cs:18-25): a string is split on `,`, each piece
+/// converted as `Enum.Parse(…, ignoreCase: true)` does and dropped when it does
+/// not parse; `null` is MVC's implicit `[Required]` 400, and an array stays
+/// strict. Each case was measured on a live Jellyfin 12.4.
+#[tokio::test]
+async fn post_full_capabilities_binds_comma_delimited_lists() {
+    use ferrofin_model::data::MediaType;
+    use ferrofin_model::session::GeneralCommandType;
+    let uri = "/Sessions/Capabilities/Full?id=sess-x";
+    let cases = [
+        (
+            r#"{"PlayableMediaTypes":"Audio, video,Bogus,","SupportedCommands":"MoveUp,,TotallyNotAValidCommand, movedown"}"#,
+            vec![MediaType::Audio, MediaType::Video],
+            vec![GeneralCommandType::MoveUp, GeneralCommandType::MoveDown],
+        ),
+        (
+            r#"{"PlayableMediaTypes":"","SupportedCommands":["MoveUp"]}"#,
+            vec![],
+            vec![GeneralCommandType::MoveUp],
+        ),
+    ];
+    for (body, media_types, commands) in cases {
+        let (sessions, user_data) = recording();
+        let (status, _) = send(
+            state(sessions.clone(), user_data),
+            "POST",
+            uri,
+            Body::from(body),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+        let (_, caps) = sessions
+            .calls
+            .lock()
+            .unwrap()
+            .capabilities
+            .clone()
+            .expect("caps");
+        assert_eq!(caps.playable_media_types, media_types, "{body}");
+        assert_eq!(caps.supported_commands, commands, "{body}");
+    }
+    for body in [
+        r#"{"PlayableMediaTypes":null}"#,
+        r#"{"SupportedCommands":null}"#,
+        r#"{"SupportedCommands":["Bogus"]}"#,
+    ] {
+        let (sessions, user_data) = recording();
+        let (status, _) = send(
+            state(sessions.clone(), user_data),
+            "POST",
+            uri,
+            Body::from(body),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert!(
+            sessions.calls.lock().unwrap().capabilities.is_none(),
+            "{body}"
+        );
+    }
+}
+
 #[tokio::test]
 async fn report_viewing_uses_current_session_when_absent() {
     let (sessions, user_data) = recording();

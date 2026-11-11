@@ -10,16 +10,20 @@ use crate::session::{ClientCapabilities, GeneralCommandType};
 
 /// Client capabilities DTO.
 ///
-/// Upstream `PlayableMediaTypes`/`SupportedCommands` use a comma-delimited
-/// collection JSON converter for query-string binding; on the wire in JSON they
-/// serialize as plain arrays, which is what the derived serde impl produces.
+/// Upstream puts `JsonCommaDelimitedCollectionConverterFactory` on
+/// `PlayableMediaTypes` and `SupportedCommands`, so a body may send either as
+/// an array or as a comma-delimited string (`"Audio,Video"`), and a `null` is
+/// MVC's implicit `[Required]` refusal ([`crate::json::delimited::comma`]).
+/// Both are written as plain arrays, as the converter's `Write` does.
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "PascalCase", default)]
 pub struct ClientCapabilitiesDto {
     /// Gets or sets the list of playable media types.
+    #[serde(deserialize_with = "crate::json::delimited::comma")]
     pub playable_media_types: Vec<MediaType>,
 
     /// Gets or sets the list of supported commands.
+    #[serde(deserialize_with = "crate::json::delimited::comma")]
     pub supported_commands: Vec<GeneralCommandType>,
 
     /// Gets or sets a value indicating whether the session supports media control.

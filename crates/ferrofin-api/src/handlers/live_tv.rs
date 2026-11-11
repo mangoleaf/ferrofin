@@ -54,10 +54,7 @@ use crate::auth::{RequireAdmin, RequireLiveTvAccess, RequireLiveTvManagement};
 use crate::error::ApiError;
 use crate::extract::{DotnetGuid, JsonBody, Query};
 use crate::handlers::items::{require_visible_item, resolve_user_opt};
-use crate::handlers::query_parse::{
-    de_comma_delimited, de_comma_delimited_guids, de_pipe_delimited, parse_csv_enums_lenient,
-    parse_csv_uuids, parse_pipe_strings,
-};
+use crate::handlers::query_parse::{parse_csv_enums_lenient, parse_csv_uuids, parse_pipe_strings};
 use crate::state::AppState;
 
 /// `GET /LiveTv/Info` — top-level Live TV status.
@@ -372,14 +369,14 @@ impl ProgramsQuery {
 /// `Genres`), so each also accepts the delimited-**string** spelling —
 /// `{"SortBy":"StartDate"}` as well as `{"SortBy":["StartDate"]}` — with
 /// unconvertible entries dropped rather than rejected. See
-/// [`de_comma_delimited`].
+/// [`ferrofin_model::json::delimited`].
 #[derive(Debug, Default, serde::Deserialize)]
 #[serde(rename_all = "PascalCase", default)]
 #[allow(clippy::struct_excessive_bools)] // one field per contract property
 #[cfg_attr(test, derive(serde::Serialize))]
 struct GetProgramsDto {
     /// The channels to return guide information for.
-    #[serde(deserialize_with = "de_comma_delimited_guids")]
+    #[serde(deserialize_with = "ferrofin_model::json::guid::comma_delimited::option::deserialize")]
     channel_ids: Option<Vec<Uuid>>,
     /// The target user. Unlike the query-string form this does *not* fall back
     /// to the authenticated caller (upstream reads the body id only).
@@ -425,17 +422,17 @@ struct GetProgramsDto {
     #[serde(default, deserialize_with = "ferrofin_model::json::value::nullable")]
     limit: Option<i32>,
     /// The sort columns.
-    #[serde(deserialize_with = "de_comma_delimited")]
+    #[serde(deserialize_with = "ferrofin_model::json::delimited::comma_option")]
     sort_by: Option<Vec<ItemSortBy>>,
     /// The sort orders, paired positionally with `SortBy`.
-    #[serde(deserialize_with = "de_comma_delimited")]
+    #[serde(deserialize_with = "ferrofin_model::json::delimited::comma_option")]
     sort_order: Option<Vec<SortOrder>>,
     /// The genre names to return guide information for. Upstream decorates
     /// this one — and only this one — with the *pipe* converter factory.
-    #[serde(deserialize_with = "de_pipe_delimited")]
+    #[serde(deserialize_with = "ferrofin_model::json::delimited::pipe_option")]
     genres: Option<Vec<String>>,
     /// The genre ids to return guide information for.
-    #[serde(deserialize_with = "de_comma_delimited_guids")]
+    #[serde(deserialize_with = "ferrofin_model::json::guid::comma_delimited::option::deserialize")]
     genre_ids: Option<Vec<Uuid>>,
     /// Whether image information is included.
     #[serde(default, deserialize_with = "ferrofin_model::json::value::nullable")]
@@ -444,7 +441,7 @@ struct GetProgramsDto {
     #[serde(default, deserialize_with = "ferrofin_model::json::value::nullable")]
     image_type_limit: Option<i32>,
     /// The image types to include.
-    #[serde(deserialize_with = "de_comma_delimited")]
+    #[serde(deserialize_with = "ferrofin_model::json::delimited::comma_option")]
     enable_image_types: Option<Vec<ImageType>>,
     /// Whether user data is included.
     #[serde(default, deserialize_with = "ferrofin_model::json::value::nullable")]
@@ -455,7 +452,7 @@ struct GetProgramsDto {
     #[serde(with = "ferrofin_model::json::guid::option")]
     library_series_id: Option<Uuid>,
     /// Additional DTO fields.
-    #[serde(deserialize_with = "de_comma_delimited")]
+    #[serde(deserialize_with = "ferrofin_model::json::delimited::comma_option")]
     fields: Option<Vec<ItemFields>>,
     /// Whether the total record count is computed (schema default `true`).
     #[serde(deserialize_with = "ferrofin_model::json::value::nullable")]
