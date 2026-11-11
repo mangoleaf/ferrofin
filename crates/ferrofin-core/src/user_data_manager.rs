@@ -1463,12 +1463,15 @@ fn apply_play_report(
     let mut played_to_completion = false;
 
     if position_ticks > 0 && has_runtime && !is_audiobook && !is_book {
-        #[allow(clippy::cast_precision_loss)]
-        let pct_in = (position_ticks as f64 / runtime_ticks as f64) * 100.0;
+        // `pctIn < MinResumePct` as `position * 100 < MinResumePct * runtime`:
+        // the C# percentage is a decimal, exact where an f64 one is not
+        // (0.29 * 100.0 is 28.999999999999996).
+        let position_x100 = i128::from(position_ticks) * 100;
+        let runtime = i128::from(runtime_ticks);
 
-        if pct_in < f64::from(config.min_resume_pct) {
+        if position_x100 < i128::from(config.min_resume_pct) * runtime {
             position_ticks = 0;
-        } else if pct_in > f64::from(config.max_resume_pct)
+        } else if position_x100 > i128::from(config.max_resume_pct) * runtime
             || position_ticks >= runtime_ticks - TICKS_PER_SECOND
         {
             position_ticks = 0;
@@ -2487,6 +2490,7 @@ pub(crate) async fn seed_content_permissions(
 #[cfg(test)]
 mod tests {
     mod lost_updates;
+    mod resume_thresholds;
 
     use super::*;
     use crate::configuration_manager::default_server_configuration;
