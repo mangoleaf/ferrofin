@@ -224,6 +224,8 @@ the report, the route answers `404` while the **Ferrofin Settings** plugin is di
 | `FERROFIN_WEB_DIR` | `{data_dir}/web` | Built jellyfin-web `dist/` served at `/web`. Absent → API-only. |
 | `FERROFIN_CONFIG_FILE` | `{data_dir}/config.toml` | Path to the optional bootstrap `config.toml`. |
 
+A relative data, configuration, cache or web directory (`--data-dir ./data`) is resolved against the working directory once, at startup, as Jellyfin does: the server uses, logs and reports the absolute path (keeping any `..`). A blank one stops the server, naming it.
+
 The data, configuration and cache directories must be different directories: startup checks each against its Jellyfin marker file (`.jellyfin-data`, `.jellyfin-config`, `.jellyfin-cache`) and stops when two of them are one directory (see `docs/UPGRADING.md`).
 
 The database file is `{data_dir}/ferrofin.db`. For drop-in adoption Ferrofin also opens a
