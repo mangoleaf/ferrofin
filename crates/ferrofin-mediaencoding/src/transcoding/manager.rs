@@ -3233,8 +3233,9 @@ mod start_ffmpeg_tests {
 
     /// With no stop report, the idle reaper takes the failed start's job and
     /// output at its ping timeout, where upstream's leaked request count keeps
-    /// them (gl-1373).
-    #[tokio::test]
+    /// them (gl-1373). The reaper deletes the output on a task of its own,
+    /// after `DeletePartialStreamFiles`' first wait (gl-1402).
+    #[tokio::test(start_paused = true)]
     async fn the_idle_reaper_takes_a_failed_start_and_its_output() {
         let tmp = tempfile::tempdir().unwrap();
         let output = tmp.path().join("s").join("out.mkv");
@@ -3249,11 +3250,18 @@ mod start_ffmpeg_tests {
         m.start_ffmpeg(&fake, ffmpeg_req(&st, &output, vec![]))
             .await
             .unwrap_err();
+        assert!(output.exists(), "the failed start keeps its output");
         // The start's consumer mark ended with it: past the ping timeout
         // (a fake clock: any elapsed time exceeds -1), the job is idle.
         m.jobs.lock().unwrap()[0].ping_timeout_ms = -1;
         assert_eq!(m.reap_idle_jobs().await.len(), 1);
         assert_eq!(m.active_job_count(), 0);
+        for _ in 0..100 {
+            if !output.exists() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
         assert!(!output.exists(), "the reaper deletes the output");
     }
 
