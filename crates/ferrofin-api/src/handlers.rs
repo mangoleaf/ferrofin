@@ -2726,6 +2726,42 @@ pub const VERIFIED: &[Verified] = &[
     },
     Verified {
         method: "get",
+        path: "/LiveTv/Channels",
+        upstream_file: "Jellyfin.Api/Controllers/LiveTvController.cs",
+        upstream_method: "GetLiveTvChannels",
+        ferrofin: "handlers/live_tv.rs get_channels (items.rs resolve_user_opt, \
+               program_dto_options, add_current_program) → ferrofin-livetv manager.rs \
+               get_channels (user_restrictions; guide_repository.rs channel_rows: the user's \
+               parental restrictions, and isMovie/isSeries over the stored channel item's \
+               columns and isKids/isNews/isSports over its Kids/News/Sports tags; \
+               channel_user_data; projection.rs filter_channel_rows, sort_channel_rows, \
+               remove_fields; channel_entity → DtoService get_base_item_dtos, which runs \
+               AddChannelInfo) (RequestHelpers.GetUserId, LiveTvManager.GetInternalChannels, \
+               BaseItemRepository.TranslateQuery, RemoveFields)",
+        date: "2026-11-10",
+        divergences: &[
+            "type keeps the channels of that ChannelType, as the parameter documents; \
+         upstream's GetInternalChannels never passes LiveTvChannelQuery.ChannelType on and \
+         lists every channel. Jellyfin bug not ported.",
+            "Every sortBy key but SortName, Name, IsFavoriteOrLiked and DateCreated compares \
+         equal, so the appended SortName decides; upstream's OrderMapper sorts on them. Fix \
+         path: gl-1354.",
+            "A lineup channel whose item is not stored (while a guide refresh is between \
+         writing the lineup and its items, after a failed item write, or after the item was \
+         deleted) is listed to a user nothing restricts, with no kinds and no user data; \
+         upstream lists only the stored LiveTvChannel items. Fix path: gl-1623.",
+            "isFavorite and isLiked with no user (an API key naming none) match no channel \
+         when true and every channel when false, and enableFavoriteSorting sorts nothing; \
+         upstream's TranslateQuery and OrderMapper dereference the null user \
+         (filter.User!.Id) and fail the request. Jellyfin bug not ported.",
+            "The 400 (a value the query binder cannot convert) and 403 (another user's id \
+         without the administrator role) bodies are Ferrofin's error shape, not upstream's. \
+         Fix path: gl-666.",
+        ],
+        refs: &["access-filtering", "user-data"],
+    },
+    Verified {
+        method: "get",
         path: "/LiveTv/Recordings",
         upstream_file: "Jellyfin.Api/Controllers/LiveTvController.cs",
         upstream_method: "GetRecordings",

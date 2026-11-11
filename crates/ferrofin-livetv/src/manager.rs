@@ -58,9 +58,9 @@ use crate::mapping::{
     tuner_channel_mapping,
 };
 use crate::projection::{
-    ChannelRow, ProgramImages, ProgramRow as GuideProgramRow, channel_entity,
-    channel_images_update, channel_item_update, is_artwork_url, program_entity,
-    program_images_update, program_item_update, remove_fields,
+    ChannelAggregate, ChannelRow, ProgramImages, ProgramRow as GuideProgramRow, carries_tags,
+    channel_aggregate_update, channel_entity, channel_images_update, channel_item_update,
+    is_artwork_url, program_entity, program_images_update, program_item_update, remove_fields,
 };
 use crate::schedules_direct::{SchedulesDirect, SdChannel, SdProgram};
 use crate::stream::{LiveStreamHandle, LiveStreamKind, TunerStreamSource};
@@ -183,6 +183,10 @@ fn start_day(start_date: &str) -> &str {
 ///
 /// Port of `LiveTvDtoService.ServiceName` (v10.11.8 LiveTvDtoService.cs:30).
 const LIVE_TV_SERVICE_NAME: &str = "Emby";
+
+/// The provider key a channel item names its service under
+/// (`GuideManager.ExternalServiceTag`).
+const EXTERNAL_SERVICE_TAG: &str = "ExternalServiceId";
 
 /// The id-scheme version `LiveTvDtoService` appends before hashing.
 ///
@@ -1648,6 +1652,7 @@ impl FerrofinLiveTvManager {
                 store.persistence.save_items(batch).await?;
             }
         }
+        Self::save_channel_service_ids(store, &rows).await?;
         Self::reattach_channel_user_data(store, &created).await;
         // The channel's Primary image (`GetChannel`), once its item exists.
         let channels: Vec<(Uuid, &ChannelRow)> = rows
@@ -1766,7 +1771,10 @@ impl FerrofinLiveTvManager {
     /// airings the guide holds (upstream's `newProgramIdList`), for the
     /// `CleanDatabase` at the end, which reads the stored ids alone
     /// (`GetItemIdsList`, :346), and the id and end of each one written, for
-    /// `PreCacheImages`.
+    /// `PreCacheImages`. Each channel's airings are also folded into its
+    /// aggregate (`IsMovie`, `IsSeries`, the "Kids" tag), which is stored on
+    /// the channel items once every channel is done
+    /// ([`Self::save_channel_aggregates`]).
     ///
     /// `listings` are the airings this pass wrote, with their listing's
     /// artwork: `GuideManager.UpdateImages` runs on those, as upstream runs it
@@ -1788,8 +1796,14 @@ impl FerrofinLiveTvManager {
         // Upstream's `newProgramIdList`: every airing the guide still holds.
         let mut kept: HashSet<Uuid> = HashSet::new();
         let mut refreshed = Vec::new();
+        // What each channel's airings add up to (`RefreshChannelsInternal`),
+        // a channel with none included; stored once every channel is done.
+        let mut aggregates: Vec<(Uuid, ChannelAggregate)> = Vec::new();
         for channel_id in crate::guide_repository::all_channel_ids(&self.db).await? {
             let rows = crate::guide_repository::channel_program_rows(&self.db, &channel_id).await?;
+            if let Ok(id) = Uuid::parse_str(&channel_id) {
+                aggregates.push((id, ChannelAggregate::of(&rows)));
+            }
             if rows.is_empty() {
                 continue;
             }
@@ -1801,6 +1815,7 @@ impl FerrofinLiveTvManager {
                 refreshed.push(written);
             }
         }
+        Self::save_channel_aggregates(&self.db, store, &aggregates).await?;
         // What is left was written this pass and replaced since (a later
         // provider rewrote its channel's guide): it has no guide row, so its
         // item goes in the clean below.
@@ -1829,6 +1844,91 @@ impl FerrofinLiveTvManager {
             }
         }
         Ok(refreshed)
+    }
+
+    /// `item.SetProviderId(ExternalServiceTag, serviceName)` in `GetChannel`
+    /// (`GuideManager.cs:430-437`): every channel item carries the
+    /// `ExternalServiceId` provider row naming its service, written only where
+    /// it is missing or names another, so an unchanged lineup writes nothing.
+    /// The item's other provider ids stay as they are.
+    async fn save_channel_service_ids(
+        store: &LiveTvItemStore,
+        rows: &[ChannelRow],
+    ) -> Result<(), ServiceError> {
+        let ids: Vec<Uuid> = rows
+            .iter()
+            .filter_map(|row| Uuid::parse_str(&row.id).ok())
+            .collect();
+        if ids.is_empty() {
+            return Ok(());
+        }
+        let stored = store.persistence.provider_ids_for_items(&ids).await?;
+        for id in ids {
+            let current = stored.get(&id).and_then(|ids| {
+                ids.iter()
+                    .find(|(key, _)| key.eq_ignore_ascii_case(EXTERNAL_SERVICE_TAG))
+                    .map(|(_, value)| value.as_str())
+            });
+            if current.is_none_or(|value| !value.eq_ignore_ascii_case(LIVE_TV_SERVICE_NAME)) {
+                store
+                    .persistence
+                    .save_provider_id(id, EXTERNAL_SERVICE_TAG, LIVE_TV_SERVICE_NAME)
+                    .await?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Stores each channel's [`ChannelAggregate`] on its item
+    /// ([`channel_aggregate_update`]), and the tag values of those whose tags
+    /// moved, so the user's blocked and allowed tags and `tags=Kids` see the
+    /// "Kids" tag. A channel whose stored tags were never indexed has them
+    /// written once, as the programmes' are. An unchanged guide writes nothing.
+    ///
+    /// The items are read here, after every channel's airings are done, so a
+    /// metadata editor's write during the guide refresh is not reverted with a
+    /// row read before it.
+    async fn save_channel_aggregates(
+        db: &Database,
+        store: &LiveTvItemStore,
+        aggregates: &[(Uuid, ChannelAggregate)],
+    ) -> Result<(), ServiceError> {
+        let ids: Vec<Uuid> = aggregates.iter().map(|(id, _)| *id).collect();
+        let stored: HashMap<Uuid, BaseItemEntity> = store
+            .items
+            .retrieve_items(&ids)
+            .await?
+            .into_iter()
+            .filter(|row| row.type_ == crate::projection::CHANNEL_TYPE_NAME)
+            .filter_map(|row| Uuid::parse_str(&row.id).ok().map(|id| (id, row)))
+            .collect();
+        let tagged: Vec<Uuid> = stored
+            .iter()
+            .filter(|(_, row)| carries_tags(row.tags.as_deref()))
+            .map(|(id, _)| *id)
+            .collect();
+        let indexed = crate::guide_repository::programs_with_tag_values(db, &tagged).await?;
+        let mut rows: Vec<BaseItemEntity> = Vec::new();
+        let mut values: Vec<(Uuid, Vec<(i32, String)>)> = Vec::new();
+        for (id, aggregate) in aggregates {
+            let Some(current) = stored.get(id) else {
+                continue;
+            };
+            let updated = channel_aggregate_update(current, *aggregate);
+            let saved = updated.as_ref().unwrap_or(current);
+            let unindexed = carries_tags(saved.tags.as_deref()) && !indexed.contains(id);
+            if saved.tags != current.tags || unindexed {
+                values.push((*id, item_values_of(saved)));
+            }
+            rows.extend(updated);
+        }
+        for chunk in rows.chunks(PROGRAM_ITEM_WRITE_CHUNK) {
+            store.persistence.save_items(chunk).await?;
+        }
+        for chunk in values.chunks(PROGRAM_ITEM_WRITE_CHUNK) {
+            store.persistence.save_item_values_for_items(chunk).await?;
+        }
+        Ok(())
     }
 
     /// One channel's turn of [`Self::sync_program_items`]: `GetProgram` over
@@ -3372,12 +3472,11 @@ impl LiveTvManager for FerrofinLiveTvManager {
         options: &DtoOptions,
     ) -> Result<QueryResult<BaseItemDto>, ServiceError> {
         // Port of `LiveTvManager.GetInternalChannels` + the controller's
-        // projection. The generic item repository upstream runs this over SQL;
-        // Ferrofin filters and sorts the loaded lineup instead — identical
-        // results, one query. An IPTV lineup can run to thousands of channels,
-        // so the read derives only the guide kinds this query filters on.
-        // The user's parental restrictions apply in the read, before the page
-        // is cut, as `new InternalItemsQuery(user)` applies them upstream.
+        // projection. The generic item repository upstream runs this over SQL.
+        // Here the read applies the user's parental restrictions (as
+        // `new InternalItemsQuery(user)` does) and the kind filters over the
+        // stored channel items; the type, favourite and like filters and the
+        // sort run over the loaded lineup, all before the page is cut.
         let restrictions = self
             .user_restrictions(&InternalItemsQuery {
                 user: query.user.clone(),
@@ -3898,11 +3997,14 @@ impl LiveTvManager for FerrofinLiveTvManager {
                 ChannelType::Tv
             });
             // `GuideManager.GetChannel` stores `ProviderIds[ExternalServiceId]
-            // = "Emby"`; the DTO service projected `{}` (the guide cache has no
-            // `BaseItemProviders` rows), so fill it here when the field was
-            // requested.
+            // = "Emby"`, as the guide refresh now does too; a channel the
+            // refresh has not reached yet has no row, so fill it here when the
+            // field was requested.
             if let Some(provider_ids) = dto.provider_ids.as_mut() {
-                provider_ids.insert("ExternalServiceId".to_owned(), "Emby".to_owned());
+                provider_ids.insert(
+                    EXTERNAL_SERVICE_TAG.to_owned(),
+                    LIVE_TV_SERVICE_NAME.to_owned(),
+                );
             }
         }
         if !options.add_current_program {
@@ -14304,33 +14406,14 @@ mod tests {
     }
 
     /// The channel kind filters match upstream's split: `isMovie`/`isSeries`
-    /// hit the aggregated channel columns, `isKids` the aggregated "Kids"
-    /// tag, and `isNews`/`isSports` translate to channel tags the guide never
-    /// writes — `true` matches nothing.
+    /// read the channel item's aggregated columns, `isKids` its aggregated
+    /// "Kids" tag, and `isNews`/`isSports` its "News"/"Sports" tags, which
+    /// the guide never writes: without an editor's tag, `true` matches nothing.
     #[tokio::test]
     async fn channel_kind_filters_follow_the_guide_aggregation() {
-        let mut sources = HashMap::new();
-        sources.insert("http://tuner/playlist.m3u".to_owned(), M3U.to_owned());
-        sources.insert("http://guide/xmltv.xml".to_owned(), dated(CLASSIFIED_XMLTV));
-        let mgr = manager_with(FakeFetcher(sources)).await;
-        mgr.save_tuner_host(TunerHostInfo {
-            type_: Some("m3u".to_owned()),
-            url: Some("http://tuner/playlist.m3u".to_owned()),
-            ..TunerHostInfo::default()
-        })
-        .await
-        .expect("tuner");
-        mgr.save_listing_provider(
-            as_xmltv(ListingsProviderInfo {
-                path: Some("http://guide/xmltv.xml".to_owned()),
-                ..ListingsProviderInfo::default()
-            }),
-            false,
-            false,
-        )
-        .await
-        .expect("provider");
-        mgr.refresh_guide().await.expect("refresh");
+        let lab = item_lab(M3U, Some(dated(CLASSIFIED_XMLTV))).await;
+        lab.mgr.refresh_guide().await.expect("refresh");
+        let mgr = lab.mgr.clone();
 
         // Every classified programme airs on Channel One; Channel Two is bare.
         let names = |result: ferrofin_model::querying::QueryResult<BaseItemDto>| {
@@ -14388,8 +14471,8 @@ mod tests {
             ),
             ["Channel One"]
         );
-        // News/Sports are channel *tags* upstream never writes: true matches
-        // nothing, false everything — even though Channel One airs news.
+        // News/Sports are channel tags the guide never writes: true matches
+        // nothing, false everything, even though Channel One airs news.
         let found = names(
             with(LiveTvChannelQuery {
                 is_news: Some(true),
