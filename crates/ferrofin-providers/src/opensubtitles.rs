@@ -1076,7 +1076,8 @@ impl SubtitleProvider for OpenSubtitlesProvider {
             .map_err(link_err)?
             .response
             .error_for_status()
-            .map_err(net_err)?
+            // The link is a one-time capability URL: keep it out of the error text (LOGGING.md §5).
+            .map_err(|error| net_err(error.without_url()))?
             .counted_bytes()
             .await
             .map_err(body_err)?;
@@ -1613,6 +1614,44 @@ mod tests {
         );
         assert_eq!(source.requests(), 1, "the listed link was fetched");
         assert_eq!(secret.requests(), 0, "the hop was never sent");
+    }
+
+    /// A link that answers an error status fails the download without naming
+    /// the link: it is a one-time capability URL, and the error reaches the
+    /// server log (gl-178).
+    #[tokio::test]
+    async fn a_failed_link_fetch_keeps_the_link_out_of_the_error() {
+        use crate::mock_http::MockServer;
+        let source = MockServer::start_raw(vec![MockServer::raw_status("404 Not Found")]).await;
+        let source_port = source.base_url.rsplit(':').next().unwrap().to_owned();
+        let mock = ApiMock::start(move |_| {
+            vec![
+                ("/login", vec![login_reply(FUTURE_PAYLOAD)]),
+                ("/infos/user", vec![user_reply(20, "2100-01-01T00:00:00Z")]),
+                (
+                    "/download",
+                    vec![(
+                        200,
+                        format!(
+                            r#"{{"link":"http://localhost:{source_port}/file/one-time-token.srt","remaining":19}}"#
+                        ),
+                    )],
+                ),
+            ]
+        })
+        .await;
+        let (provider, _) = account_provider(&mock, "user");
+        let provider = provider.with_link_destinations(PrivateAllowList::parse("localhost").0);
+
+        let error = provider
+            .get_subtitles("srt-en-1")
+            .await
+            .expect_err("a 404 link fails the download");
+
+        let text = format!("{error} {error:?}");
+        assert!(text.contains("404"), "{text}");
+        assert!(!text.contains("one-time-token"), "{text}");
+        assert_eq!(source.requests(), 1, "the link was fetched");
     }
 
     /// `HttpStatusCode.Unauthorized` on `/download`: the token is dropped and

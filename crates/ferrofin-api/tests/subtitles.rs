@@ -56,18 +56,22 @@ use uuid::Uuid;
 const ITEM_ID: Uuid = Uuid::from_u128(0x00B5_0001);
 /// A non-video item: the subtitle routes upstream binds to `Video` 404 on it.
 const SERIES_ID: Uuid = Uuid::from_u128(0x00B5_0002);
+/// A Movie with a library file: its refresh goes through the library scan,
+/// which [`OneItemLibrary`] can run and await but not queue, so queueing it
+/// fails.
+const FILED_ITEM_ID: Uuid = Uuid::from_u128(0x00B5_0003);
+/// [`FILED_ITEM_ID`]'s file: the refresh a subtitle delete awaits is its
+/// path's scan.
+const FILED_ITEM_PATH: &str = "/media/Film.mkv";
 
 // ---- Fakes -----------------------------------------------------------------
-
-/// [`ITEM_ID`]'s file, in a library: the refresh a subtitle delete awaits is
-/// its path's scan.
-const ITEM_PATH: &str = "/movies/The Item/The Item.mkv";
 
 /// The refreshes [`OneItemLibrary`] ran for a caller that awaited them
 /// (`run_refresh_scan`), as debug-printed targets.
 static AWAITED_REFRESHES: Mutex<Vec<String>> = Mutex::new(Vec::new());
 
-/// A library where only [`ITEM_ID`] (a Movie) and [`SERIES_ID`] exist.
+/// A library where only [`ITEM_ID`] and [`FILED_ITEM_ID`] (Movies) and
+/// [`SERIES_ID`] exist.
 struct OneItemLibrary;
 
 #[async_trait]
@@ -89,12 +93,13 @@ impl LibraryManager for OneItemLibrary {
 
     async fn get_item_by_id(&self, id: Uuid) -> Result<Option<BaseItemEntity>, ServiceError> {
         Ok(match id {
-            ITEM_ID => Some(BaseItemEntity {
-                path: Some(ITEM_PATH.to_owned()),
-                top_parent_id: Some(Uuid::from_u128(0x00B5_0100).to_string()),
-                ..minimal_base_item(id, "The Item", "Movie")
-            }),
+            ITEM_ID => Some(minimal_base_item(id, "The Item", "Movie")),
             SERIES_ID => Some(minimal_base_item(id, "The Show", "Series")),
+            FILED_ITEM_ID => Some(BaseItemEntity {
+                path: Some(FILED_ITEM_PATH.to_owned()),
+                top_parent_id: Some(Uuid::from_u128(0x00B5_00FF).to_string()),
+                ..minimal_base_item(id, "Film", "Movie")
+            }),
             _ => None,
         })
     }
@@ -390,6 +395,8 @@ struct CannedSubtitles {
     logins: Logins,
     /// The decoded size of each upload that reached the manager.
     uploads: Arc<Mutex<Vec<usize>>>,
+    /// Whether a remote download succeeds; it fails by default.
+    download_succeeds: bool,
 }
 
 #[async_trait]
@@ -405,6 +412,9 @@ impl SubtitleManager for CannedSubtitles {
         _item_id: Uuid,
         _subtitle_id: &str,
     ) -> Result<(), ServiceError> {
+        if self.download_succeeds {
+            return Ok(());
+        }
         Err(ServiceError::invalid_input("no providers"))
     }
     async fn upload_subtitle(
@@ -722,16 +732,20 @@ async fn delete_subtitle_awaits_the_items_refresh_before_204() {
         deleted: deleted.clone(),
         ..CannedSubtitles::default()
     }));
-    let (status, body, _) =
-        call_method(app, "DELETE", &format!("/Videos/{ITEM_ID}/Subtitles/3")).await;
+    let (status, body, _) = call_method(
+        app,
+        "DELETE",
+        &format!("/Videos/{FILED_ITEM_ID}/Subtitles/3"),
+    )
+    .await;
     assert_eq!(status, StatusCode::NO_CONTENT, "{body:?}");
-    assert_eq!(*deleted.lock().unwrap(), [(ITEM_ID, 3)]);
+    assert_eq!(*deleted.lock().unwrap(), [(FILED_ITEM_ID, 3)]);
     assert!(
         AWAITED_REFRESHES
             .lock()
             .unwrap()
             .iter()
-            .any(|target| target.contains(ITEM_PATH)),
+            .any(|target| target.contains(FILED_ITEM_PATH)),
         "the refresh ran before the answer"
     );
 }
@@ -949,6 +963,70 @@ async fn subtitle_remote_search_is_empty_list() {
     let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
     let items = v.as_array().unwrap();
     assert!(items.is_empty(), "{items:?}");
+}
+
+// ---- Remote subtitle download ----------------------------------------------
+
+/// Collects what a `tracing` fmt subscriber writes.
+#[derive(Clone, Default)]
+struct CapturedLog(Arc<Mutex<Vec<u8>>>);
+
+impl std::io::Write for CapturedLog {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(buf);
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// `SubtitleController.DownloadRemoteSubtitles` catches whatever its `try`
+/// throws, the download or the refresh queued after it, logs it at error and
+/// still answers `204` (gl-178).
+#[tokio::test]
+async fn a_failed_remote_download_or_refresh_is_logged_and_still_answers_204() {
+    for (download_succeeds, item_id, cause) in [
+        (false, ITEM_ID, "no providers"),
+        (true, FILED_ITEM_ID, "needs a library scanner"),
+    ] {
+        let app = remote_search_state(Arc::new(CannedSubtitles {
+            download_succeeds,
+            ..CannedSubtitles::default()
+        }));
+        let log = CapturedLog::default();
+        let writer = log.clone();
+        let _guard = tracing::subscriber::set_default(
+            tracing_subscriber::fmt()
+                .with_ansi(false)
+                .with_writer(move || writer.clone())
+                .finish(),
+        );
+        let response = create_router(app)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/Items/{item_id}/RemoteSearch/Subtitles/abc_42"))
+                    .header("X-Emby-Token", "tok")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT, "{cause}");
+        let logged = String::from_utf8(log.0.lock().unwrap().clone()).unwrap();
+        let line = logged
+            .lines()
+            .find(|line| line.contains("ERROR") && line.contains("Error downloading subtitles"))
+            .unwrap_or_else(|| panic!("no error line for {cause}: {logged}"));
+        // The event's own fields: the request span also prints the path, which holds both ids.
+        assert!(
+            line.contains(&format!("item_id={item_id}"))
+                && line.contains("subtitle_id=\"abc_42\"")
+                && line.contains(cause),
+            "{line}"
+        );
+    }
 }
 
 // ---- OpenSubtitles login validation ----------------------------------------
@@ -1445,7 +1523,7 @@ async fn subtitle_management_gates_every_operation_but_deletion_requires_admin()
             ),
             (
                 "DELETE",
-                format!("/Videos/{ITEM_ID}/Subtitles/1"),
+                format!("/Videos/{FILED_ITEM_ID}/Subtitles/1"),
                 "",
                 StatusCode::NO_CONTENT,
             ),

@@ -3770,6 +3770,53 @@ pub const VERIFIED: &[Verified] = &[
         refs: &["access-filtering"],
     },
     Verified {
+        method: "post",
+        path: "/Items/{itemId}/RemoteSearch/Subtitles/{language}",
+        upstream_file: "Jellyfin.Api/Controllers/SubtitleController.cs",
+        upstream_method: "DownloadRemoteSubtitles",
+        ferrofin: "handlers/subtitles.rs download_remote_subtitles (RequireSubtitleManagement, the \
+               SubtitleManagement policy's UserPermissionRequirement; require_video, \
+               GetItemById<Video>(itemId, User.GetUserId()): a missing, hidden or non-video \
+               item is a 404; the download and the refresh queued after it share one try, \
+               whose failure is logged at error as \"Error downloading subtitles\" and still \
+               answered 204) → ferrofin-core subtitle_manager.rs download_subtitles, route and \
+               attach (SubtitleManager.DownloadSubtitles, GetProvider and GetRemoteSubtitles' \
+               Split('_', 2): an id naming no provider fails the download; TrySaveSubtitle and \
+               TrySaveToFiles: the library's SaveSubtitlesWithMedia picks the folder beside the \
+               media path or the item's internal-metadata folder, \
+               {stem}.{language}[.forced][.sdh].{format} with the language lowercased and a \
+               path separator refused, the format checked against \
+               NamingOptions.SubtitleFileExtensions, a taken name moved to {name}.{n}.{format}, \
+               the name written bracketed as a self-write) → handlers.rs \
+               queue_high_priority_refresh (QueueRefresh at RefreshPriority.High) → \
+               ferrofin-providers opensubtitles.rs get_subtitles (the OpenSubtitles plugin's \
+               GetSubtitles: a plugin outside the Jellyfin tree, not compared yet, gl-1644)",
+        date: "2026-11-10",
+        divergences: &[
+            "A download that fails once its provider is found writes no activity entry: \
+         upstream's DownloadSubtitles raises SubtitleDownloadFailure for any failure but a \
+         RateLimitExceededException, which SubtitleDownloadFailureLogger records as \
+         SubtitleDownloadFailureFromForItem. Fix path: gl-1640.",
+            "A DVD or Blu-ray folder rip's subtitle is written beside the rip's folder; \
+         upstream's Video.ContainingFolderPath is the rip's folder itself, so it lands \
+         inside it there. Fix path: gl-1643.",
+            "The subtitle is recorded as an external stream as soon as it is written; upstream \
+         leaves that to the queued refresh's probe, so the item lists it here before the \
+         refresh has run, and also when queueing the refresh failed. Fix path: gl-1641.",
+            "A client that hangs up stops the download, the write or the refresh where it \
+         is, unlogged; upstream passes CancellationToken.None and finishes them. Fix path: \
+         gl-1645.",
+            "A nil itemId is a 404, not GetItemById's 400. Fix path: gl-1034.",
+            "A whitespace-only subtitleId is taken (a logged failed download and a 204, or a \
+         404 for a missing or hidden item); upstream's model validation answers 400 before \
+         the action runs. Fix path: gl-1061.",
+            "The 400 (a malformed itemId), 401 (no or bad token), 403 (no subtitle \
+         management) and 404 bodies are Ferrofin's error shape, not upstream's. Fix path: \
+         gl-666.",
+        ],
+        refs: &["access-filtering"],
+    },
+    Verified {
         method: "get",
         path: "/Videos/{itemId}/{container}/Attachments/{index}",
         upstream_file: "Jellyfin.Api/Controllers/VideoAttachmentsController.cs",
