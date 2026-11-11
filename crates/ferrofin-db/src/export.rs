@@ -41,6 +41,49 @@ pub const EXPORTED_DATABASE: &str = "data/jellyfin.db";
 /// The first bytes of every SQLite database file.
 const SQLITE_HEADER: &[u8; 16] = b"SQLite format 3\0";
 
+/// The directory an export into `target` (the output as
+/// [`refuse_unsafe`] resolved it) writes before renaming it to `target` whole:
+/// `target` with `.partial` appended, beside it. One left behind is an export
+/// that was interrupted, which [`refuse_unsafe`] reports rather than reuses.
+#[must_use]
+pub fn partial_output(target: &Path) -> PathBuf {
+    with_suffix(target, ".partial")
+}
+
+/// Refuses, before anything is written, an export from `source` (with its
+/// database `database`) into `out` that would be unsafe or meaningless, and
+/// returns the output resolved (links followed as far as it exists, `.` and
+/// `..` applied, no trailing `/`): the path to rename the [`partial_output`]
+/// to. It refuses:
+/// - an output that is not a new or empty directory, is the source, sits
+///   inside it or holds it, or is a mount point, and one an interrupted export
+///   left a [`partial_output`] beside;
+/// - a database another process holds open (a running server);
+/// - an output inside a directory the source reaches through a link;
+/// - less free space beside the output than the export needs.
+///
+/// The database itself (its log, its integrity, its foreign keys, whether it
+/// is Ferrofin's and from which Jellyfin release) is checked on the copy the
+/// snapshot stages, by [`export_data_dir`], so the source is never opened.
+/// Call this from a process that does not have the database open: it can only
+/// see another process's hold on it.
+///
+/// # Errors
+/// [`DbError::ExportRefused`] naming the cause, or [`DbError::Export`] when a
+/// path cannot be inspected (on a platform without the POSIX interfaces the
+/// checks use, always).
+pub async fn refuse_unsafe(source: &Path, database: &Path, out: &Path) -> Result<PathBuf> {
+    let (source, database, out) = (source.to_owned(), database.to_owned(), out.to_owned());
+    blocking(move || {
+        let target = refusal::paths(&source, &out)?;
+        let database = std::fs::canonicalize(&database).map_err(failed(&database))?;
+        refusal::not_in_use(&database)?;
+        refusal::reach(&source, &database, &target)?;
+        Ok(target)
+    })
+    .await
+}
+
 /// What [`export_data_dir`] wrote.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExportSummary {
@@ -56,9 +99,10 @@ pub struct ExportSummary {
 /// snapshot of its database `database` (a path under `source`) at
 /// [`EXPORTED_DATABASE`] under `out`.
 ///
-/// `database` is checked first, before anything is written: it must exist and
-/// be a SQLite file. Then every file and directory under `source` is copied to
-/// the same place under `out`, with its permissions and modification time.
+/// Run [`refuse_unsafe`] first. `database` is checked before anything is
+/// written: it must exist and be a SQLite file. Then every file and directory
+/// under `source` is copied to the same place under `out`, with its
+/// permissions and modification time.
 /// Symbolic links are followed, so the output holds no link back into the
 /// source. Left out are the database files: `database`, the file it links to,
 /// the source's own [`EXPORTED_DATABASE`] (a native database's leftover would
@@ -79,8 +123,11 @@ pub struct ExportSummary {
 /// file cannot be read or its copy written, or when the source holds something
 /// that is neither a file nor a directory, a broken link, or a directory
 /// reached twice; [`DbError::Backup`] or [`DbError::Sqlx`] when the database
-/// snapshot fails; and [`DbError::ExportSourceChanged`] when the source
-/// changed during the export.
+/// snapshot fails; [`DbError::ExportRefused`] when the copy of the database the
+/// snapshot stages fails its checks (a log it cannot fold in whole, a damaged
+/// file, `integrity_check`, `foreign_key_check`, not Ferrofin's, a Jellyfin
+/// history from no release Ferrofin adopts); and
+/// [`DbError::ExportSourceChanged`] when the source changed during the export.
 pub async fn export_data_dir(source: &Path, database: &Path, out: &Path) -> Result<ExportSummary> {
     let (db, from) = (database.to_owned(), source.to_owned());
     let (resolved, real_source) = blocking(move || {

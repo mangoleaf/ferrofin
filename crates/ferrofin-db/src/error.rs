@@ -98,6 +98,14 @@ pub enum DbError {
         changed: Vec<String>,
     },
 
+    /// An export (`ferrofin-server export-jellyfin`) refused to run, because
+    /// completing it would be unsafe or meaningless; the reason names why.
+    #[error("the export is refused: {reason}")]
+    ExportRefused {
+        /// What made the export unsafe or meaningless.
+        reason: String,
+    },
+
     /// A stored `Guid` column did not parse as a hyphenated UUID.
     #[error("invalid guid in column `{column}`: {source}")]
     InvalidGuid {
