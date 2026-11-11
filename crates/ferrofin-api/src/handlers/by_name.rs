@@ -134,6 +134,13 @@ pub(crate) struct ByNameListQuery {
     /// controllers declare no such parameter, so their handlers ignore it.
     #[serde(default)]
     pub studios: Option<String>,
+    /// `[FromQuery] double? minCommunityRating`, which only the
+    /// `ArtistsController` actions declare: bound raw, so the Genres,
+    /// `MusicGenres` and Studios routes ignore it, and checked by
+    /// [`Self::check_min_community_rating`] on the Artists routes. A valid value
+    /// is never read: `GetItemValues` copies it onto neither filter.
+    #[serde(default)]
+    pub min_community_rating: Option<String>,
 }
 
 /// Builds the projection options a by-name browse hands to the DTO service.
@@ -175,6 +182,23 @@ pub(crate) fn additional_dto_options(
 }
 
 impl ByNameListQuery {
+    /// The `400` the query binder answers on `/Artists` and
+    /// `/Artists/AlbumArtists` for a `minCommunityRating` that does not convert
+    /// to `double?`. It binds as the query binder binds one (blank is absent),
+    /// only later, as `ImageQuery`'s `imageIndex` does.
+    pub(crate) fn check_min_community_rating(&self) -> Result<(), ApiError> {
+        let Some(raw) = self.min_community_rating.as_deref() else {
+            return Ok(());
+        };
+        <Option<f64> as serde::Deserialize>::deserialize(crate::query::value::Value::nullable(raw))
+            .map(drop)
+            .map_err(|_| {
+                ApiError::BadRequest(format!(
+                    "The value '{raw}' is not valid for minCommunityRating."
+                ))
+            })
+    }
+
     /// This browse's [`DtoOptions`], with `enable_user_data` supplied by the
     /// caller — see [`additional_dto_options`] for why it is not read off the
     /// query.
@@ -695,16 +719,17 @@ mod tests {
     use ferrofin_model::querying::ItemFields;
 
     /// Every query parameter the vendored contracts give the five list routes
-    /// that bind [`ByNameListQuery`] is one of its fields, except the four
-    /// `/Artists` parameters v12.2 accepts and ignores: `GetItemValues` copies
-    /// `MinCommunityRating`, `Person`, `PersonIds` and `PersonTypes` onto
-    /// neither of its filters (`ByName.cs:180-233`). serde drops an unknown
-    /// key without a word, so a missing field is a filter the client asked for
-    /// and never got: `studios` was one, and every artist came back.
+    /// that bind [`ByNameListQuery`] is one of its fields, except the three
+    /// `/Artists` parameters v12.4 accepts and ignores and whose binding never
+    /// fails: `GetItemValues` copies `Person`, `PersonIds` and `PersonTypes`
+    /// onto neither of its filters (`ByName.cs:180-233`), and a string or a
+    /// comma-delimited list binds whatever is sent. serde drops an unknown key
+    /// without a word, so a missing field is a filter the client asked for and
+    /// never got (`studios` was one, and every artist came back), or a value
+    /// the binder refuses and Ferrofin let through (`minCommunityRating`).
     #[test]
     fn by_name_list_query_binds_every_contract_parameter() {
-        const UPSTREAM_NO_OPS: [&str; 4] =
-            ["minCommunityRating", "person", "personIds", "personTypes"];
+        const UPSTREAM_NO_OPS: [&str; 3] = ["person", "personIds", "personTypes"];
         let mut contract = std::collections::BTreeSet::new();
         for raw in [
             include_str!("../../../../contracts/jellyfin-openapi-10.11.8.json"),
@@ -740,7 +765,7 @@ mod tests {
         assert_eq!(
             unbound,
             UPSTREAM_NO_OPS.into_iter().collect(),
-            "left: the contract parameters ByNameListQuery drops; right: v12.2's no-ops. \
+            "left: the contract parameters ByNameListQuery drops; right: v12.4's no-ops. \
              A newly dropped parameter must be bound, not listed"
         );
     }
