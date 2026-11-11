@@ -35,6 +35,7 @@ events, the adoption report's format). Each route also has a folder with:
 | File | What |
 |---|---|
 | `oracle.txt` | Ferrofin's answers before the stop (the usage stage's) |
+| `oracle.txt.actions` | each usage-stage action's request and its HTTP status |
 | `answers.txt` | Jellyfin's answers after the return |
 | `ferrofin-boot.log`, `ferrofin.log` | Ferrofin's log after the scan, and its whole log |
 | `jellyfin-boot.log`, `jellyfin.log` | Jellyfin's log up to the probes, and its whole log |
@@ -54,7 +55,7 @@ Settings (environment), each a whole number of seconds:
 | Setting | Default | What |
 |---|---|---|
 | `ROUNDTRIP_READY_TIMEOUT` | 300 | how long a server may take to answer after its start |
-| `ROUNDTRIP_SCAN_TIMEOUT` | 600 | how long a library scan, Jellyfin's startup tasks or Jellyfin's answers may take (the adoption gate's scan timeout); twice that bounds the whole usage stage |
+| `ROUNDTRIP_SCAN_TIMEOUT` | 600 | how long a library scan, Jellyfin's startup tasks or Jellyfin's answers may take (the adoption gate's scan timeout); five times that bounds the whole usage stage (two scans, each followed by a settle, and the probes) |
 | `ROUNDTRIP_STOP_TIMEOUT` | 60 | how long a server is given to stop after TERM before docker kills it |
 | `ROUNDTRIP_DOCKER_TIMEOUT` | 120 | how long any other docker call may take (a stop gets `ROUNDTRIP_STOP_TIMEOUT` more) |
 
@@ -102,16 +103,24 @@ python3 gates/roundtrip/usage.py --base-url <url> --data-dir <dir> --oracle-out 
 ```
 
 - `<dir>` is the copy the server runs on (it holds `data/jellyfin.db`). Credentials come from it at run
-  time (its newest API key, and the account `smoke.sh` probes as, `ADOPTION_USER` when set) and are
+  time (its newest API key, and the account `smoke.sh` probes as, `ADOPTION_USER` when set, with that
+  account's own web session for the playlist edits, which upstream refuses an API key) and are
   never written anywhere.
-- The script performs its actions. It then refreshes the library, waits until that scan has completed
-  (within `ROUNDTRIP_SCAN_TIMEOUT` seconds, from the environment the harness gives it),
+- The script performs its actions, scanning the library partway through and again at the end; after each
+  scan has completed it waits until no scheduled task runs on two polls in a row (each within
+  `ROUNDTRIP_SCAN_TIMEOUT` seconds, from the environment the harness gives it). It then
   captures Ferrofin's answers with [`answers.py`](answers.py), checks that each action shows in them, and
   writes them to `<file>`. The lines are written as captured; the harness normalises both files when it
   compares them.
-- It exits 0, or non-zero with one line on stderr naming the action that failed (`usage: create a
-  playlist: HTTP 500`, or `usage: favorite <movie>: not in Ferrofin's answers (…)` for a write the
-  server accepted and lost).
+- It exits 0, or non-zero with one line on stderr naming the action that failed (`usage: create the
+  playlist Round trip playlist: HTTP 500`, or `usage: favorite <movie>: not in Ferrofin's answers (…)`
+  for a write the server accepted and lost).
+- Each action's request goes to `<file>.actions`, one `<action>  <HTTP status>` per line in order (a scan's
+  status is `completed` or `failed`, a request that got no answer `no answer`), whether the stage passed,
+  failed or was stopped at its deadline (TERM; the action in flight then has no line). The probes' own
+  requests are not in it.
+- The stage creates an API key, which is then the copy's newest: `smoke.sh` and `answers.py` probe through
+  it, so Jellyfin must take a key Ferrofin made for every administrator probe after the return.
 
 The answers file has one answer per line:
 
@@ -119,25 +128,52 @@ The answers file has one answer per line:
 <status>  <metric>  <path>                                     smoke.sh's probes, as it prints them
 userdata <user> <item id> played=<0|1> fav=<0|1> resume=<ticks>   what the IsPlayed, IsFavorite and IsResumable
                                                                 filters return, for every user, sorted
+userplays <user> <item id> count=<n> likes=<true|false|->        what the IsPlayed and Likes filters return, for
+                                                                every user, sorted
+user <name> admin=<0|1> disabled=… folders=… sessions=… …      every account's policy and settings, by name
+badlogin <user> <status>                                       each account the stage creates with a password,
+                                                                signing in with a wrong one first
 login <user> <status> token=<yes|no>                           each account the stage creates (answers.GATE_USERS)
+device <device id> name=<custom name>                          the device each of those sign-ins is
+prefs <user> <sort by> <sort order> <custom prefs>             every account's home-screen display preferences
+apikeys <app names>                                            the API keys
+libraries <names>                                              the libraries (/Library/MediaFolders)
+config <system|encoding|network> <setting>=<value> …           settings a dashboard shows
 collection <Playlist|BoxSet> <item count> <name>               the probed account's playlists and collections
+members <Playlist|BoxSet> <name> = <item names>                their items: a playlist's in order, a collection's
+                                                                by name
+image <Playlist|BoxSet> <name> <image types>                   which images they have (not their sizes: an
+                                                                upload is stored 0x0 until gl-1054 is fixed)
+item <name> lock=<0|1> fields=<locked fields> overview=<n>     the probed account's movies, by name
 ```
+
+Lists inside a line are sorted unless they say otherwise. The sign-in probes write device rows, tokens and
+login dates, so the capture is not read-only: it runs after anything that counts the rows a server changed.
 
 The harness captures the same answers from Jellyfin (`answers.py --base-url --data-dir --out`) and
 compares the two files, so **the oracle must be `answers.capture`'s output**, never lines a usage stage
 writes itself. A probe added to `answers.py` is therefore captured and compared on both sides at once.
 This README, not the issue text that first described the contract, is the contract: it adds the `login`
-and `collection` lines and has the file written as captured. The harness bounds the whole stage at twice
-`ROUNDTRIP_SCAN_TIMEOUT`. The minimal actions today:
+and later line kinds, and has the file written as captured. The harness bounds the whole stage at five
+times `ROUNDTRIP_SCAN_TIMEOUT`. The actions, each checked in the answers it leads to:
 
-- mark three movies played;
-- favorite two;
-- set one resume position;
-- create a playlist and a collection;
-- create `roundtrip-user` with a password.
+- watch state: mark three movies played, favorite two, set a resume position on one, like one;
+- accounts: create `roundtrip-user` with a password and `roundtrip-passwordless` without one; sign
+  `roundtrip-user` in (a new device), play a movie to its end as it and name its device; narrow
+  `roundtrip-passwordless`'s policy and change its settings; create an API key;
+- change the probed account's display preferences;
+- create a playlist (add one movie, remove one, move the last first) and a collection (add one, remove
+  one), and a second of each to delete;
+- add a library and remove the copy's home-videos library;
+- scan the library and let the server settle, so the metadata refreshes those changes queued (no
+  scheduled task shows them) have run before anything they could undo;
+- rename the playlist, edit and lock a movie's metadata, give the collection a primary image;
+- delete the second playlist and collection: the copy's media is mounted read-only, so the items the
+  stage deletes are these, whose files live in the data directory;
+- scan the library again, then capture.
 
-The full usage stage replaces the actions in `usage.py` and adds probes to `answers.py`, and keeps this
-command line and this line format.
+A new action keeps this command line and these line kinds, and adds the probe that shows it to
+`answers.py`.
 
 ## Layout
 

@@ -20,7 +20,7 @@ class Tasks:
     def __init__(self, *states):
         self.states, self.polls = list(states), 0
 
-    def answer(self, method, path, query, body):
+    def answer(self, method, path, query, body, auth=""):
         state = self.states[min(self.polls, len(self.states) - 1)]
         self.polls += 1
         return 200, [{"Key": "RefreshLibrary", "State": "Idle"}, {"Key": "Startup", "State": state}]

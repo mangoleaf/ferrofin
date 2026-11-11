@@ -12,6 +12,7 @@ Exit status 0 when done, 1 with one line on stdout saying why not.
 """
 
 import argparse
+import http.client
 import json
 from pathlib import Path
 import sqlite3
@@ -37,13 +38,22 @@ class Server(metadata.Api):
     def __init__(self, base, data_dir):
         super().__init__(base, database(data_dir))
 
-    def send(self, method, path, body=None, auth=None):
+    def request(self, path, method="GET", image=False, missing_ok=False):
+        """metadata.Api.request (the scan and settle polls), with a connection the server drops a CheckError,
+        as in send."""
+        try:
+            return super().request(path, method, image=image, missing_ok=missing_ok)
+        except (OSError, http.client.HTTPException) as error:
+            raise CheckError(f"{method} {path.split('?')[0]}: no answer ({type(error).__name__})") from None
+
+    def send(self, method, path, body=None, auth=None, content_type="application/json"):
         """(status, decoded JSON or None) for one request; never raises for an HTTP status.
-        auth: the Authorization header to send instead of the API key's."""
-        data = None if body is None else json.dumps(body).encode()
+        auth: the Authorization header to send instead of the API key's. A bytes body is sent as it is,
+        with content_type (an image upload); any other body as JSON."""
+        data = body if isinstance(body, bytes) else None if body is None else json.dumps(body).encode()
         headers = {"Authorization": auth or self.auth}
         if data is not None:
-            headers["Content-Type"] = "application/json"
+            headers["Content-Type"] = content_type
         request = urllib.request.Request(self.base + path, data=data, method=method, headers=headers)
         try:
             with urllib.request.urlopen(request, timeout=30) as response:
@@ -52,7 +62,8 @@ class Server(metadata.Api):
         except urllib.error.HTTPError as error:
             status, raw = error.code, b""
             error.close()
-        except (urllib.error.URLError, TimeoutError) as error:
+        # URLError and timeouts are OSErrors; a connection the server drops is http.client's own.
+        except (OSError, http.client.HTTPException) as error:
             raise CheckError(f"{method} {path.split('?')[0]}: no answer ({type(error).__name__})") from None
         try:
             return status, (json.loads(raw) if raw else None)

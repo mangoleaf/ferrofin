@@ -126,7 +126,7 @@ rt_compare_answers() {
   local diff
   [ -s "$2" ] || { echo "no answers from Jellyfin"; return 0; }
   diff=$(diff <(adoption_normalise "$1") <(adoption_normalise "$2")) || true
-  [ -n "$diff" ] || diff=$(diff <(grep '^userdata ' "$1") <(grep '^userdata ' "$2")) || true
+  [ -n "$diff" ] || diff=$(diff <(grep -E '^user(data|plays) ' "$1") <(grep -E '^user(data|plays) ' "$2")) || true
   [ -n "$diff" ] || return 0
   printf '%s line(s) differ, first: %s (diff %s %s)\n' "$(grep -c '^[<>]' <<<"$diff")" \
     "$(grep -m1 '^[<>]' <<<"$diff" | cut -c1-160)" "$1" "$2"
