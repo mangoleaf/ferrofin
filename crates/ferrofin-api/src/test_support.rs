@@ -2779,7 +2779,8 @@ pub fn elevated_state_with_virtual_folders(vf: Arc<dyn VirtualFolderManager>) ->
 }
 
 /// A [`FakeConfig`] whose startup wizard is complete, so the
-/// `FirstTimeSetupOr*` extractors take their post-setup branch.
+/// `FirstTimeSetupOr*` extractors take their post-setup branch. Client log
+/// uploads are allowed, as in a stock install.
 pub struct SetupCompleteConfig;
 
 #[async_trait]
@@ -2790,6 +2791,7 @@ impl ServerConfigurationManager for SetupCompleteConfig {
     async fn configuration(&self) -> Result<Arc<ServerConfiguration>, ServiceError> {
         Ok(Arc::new(ServerConfiguration {
             is_startup_wizard_completed: true,
+            allow_client_log_upload: true,
             ..ServerConfiguration::default()
         }))
     }
@@ -2813,6 +2815,27 @@ impl ServerConfigurationManager for SetupCompleteConfig {
 #[must_use]
 pub fn setup_complete_state(auth: Arc<dyn AuthService>) -> AppState {
     fake_state_with(auth, Arc::new(SetupCompleteConfig))
+}
+
+/// [`setup_complete_state`] whose request context resolves through `context`
+/// (the identity a route reading the request's [`AuthorizationInfo`] sees)
+/// over the given user manager, so a handler that re-reads the caller's policy
+/// ([`PolicyUsers`]) sees the one `auth` carries.
+#[must_use]
+pub fn setup_complete_state_as(
+    context: Arc<dyn AuthorizationContext>,
+    auth: Arc<dyn AuthService>,
+    users: Arc<dyn UserManager>,
+) -> AppState {
+    fake_state_over(
+        users,
+        context,
+        auth,
+        Arc::new(SetupCompleteConfig),
+        Arc::new(FakeSessions),
+        Arc::new(FakeActivity),
+        Arc::new(FakeTasks),
+    )
 }
 
 /// [`fake_state`] with the given auth service and configuration manager.
@@ -2851,9 +2874,29 @@ pub fn fake_state_with_streams(
     activity: Arc<dyn ActivityManager>,
     tasks: Arc<dyn TaskManager>,
 ) -> AppState {
+    fake_state_over(
+        Arc::new(FakeUsers),
+        Arc::new(FakeAuthContext),
+        auth,
+        config,
+        sessions,
+        activity,
+        tasks,
+    )
+}
+
+fn fake_state_over(
+    users: Arc<dyn UserManager>,
+    context: Arc<dyn AuthorizationContext>,
+    auth: Arc<dyn AuthService>,
+    config: Arc<dyn ServerConfigurationManager>,
+    sessions: Arc<dyn SessionManager>,
+    activity: Arc<dyn ActivityManager>,
+    tasks: Arc<dyn TaskManager>,
+) -> AppState {
     AppState::new(
         Arc::new(FakeLibrary),
-        Arc::new(FakeUsers),
+        users,
         Arc::new(FakeUserViews),
         Arc::new(FakeUserData),
         Arc::new(FakeMediaSources),
@@ -2866,7 +2909,7 @@ pub fn fake_state_with_streams(
         Arc::new(FakeSimilarItems),
         Arc::new(FakeSearch),
         Arc::new(FakeDto),
-        Arc::new(FakeAuthContext),
+        context,
         auth,
         Arc::new(FakeQuickConnect),
         Arc::new(FakePlaylists),
