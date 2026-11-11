@@ -2228,7 +2228,7 @@ pub async fn build_app_state(
         task_manager.register(task);
     }
     wasm_host.subscribe_events(&event_bus, &plugins);
-    let playlists: Arc<dyn ferrofin_traits::collections::PlaylistManager> = Arc::new(
+    let playlists = Arc::new(
         FerrofinPlaylistManager::new(
             db.clone(),
             Arc::clone(&library),
@@ -2245,6 +2245,12 @@ pub async fn build_app_state(
         // A new playlist's folder stored as `%AppDataPath%/playlists/<name>`.
         .with_virtual_paths(virtual_paths.clone()),
     );
+    // A playlist an older Ferrofin saved with a container as one entry, or
+    // with no media type, takes what a create or add stores today. It needs
+    // the playlist manager's expansion, so it runs here, before the scheduler
+    // can start a scan.
+    ferrofin_core::adoption_repairs::run_expand_saved_playlist_containers(db, &playlists).await;
+    let playlists: Arc<dyn ferrofin_traits::collections::PlaylistManager> = playlists;
 
     // The full Jellyfin dashboard task set (Library + Maintenance categories),
     // now that every backing manager exists. Once registered, the scheduler
