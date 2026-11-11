@@ -21579,6 +21579,10 @@ fn apply_nfo(entity: &mut BaseItemEntity, n: &ferrofin_providers::xbmc::item::Nf
     merge_multi_value(&mut entity.genres, &n.genres);
     merge_multi_value(&mut entity.studios, &n.studios);
     merge_multi_value(&mut entity.tags, &n.tags);
+    // `<country>` (`BaseNfoParser.cs:397-410`) into the provider result;
+    // `merge_union_lists` applies the lock, a full refresh's replace and the
+    // union with the stored row (`MergeBaseItemData`).
+    merge_multi_value(&mut entity.production_locations, &n.production_locations);
     // `<status>` (`SeriesNfoParser.cs:75-90`, via `TvParserHelpers.
     // TryParseSeriesStatus`) — `Series.Status`, which lives in the `Data`
     // blob (`"Status":"Ended"`) and comes back out as the DTO's `Status`.
@@ -27095,6 +27099,36 @@ mod tests {
         assert_eq!(e.genres.as_deref(), Some("Action|Drama"));
         assert_eq!(e.studios.as_deref(), Some("ACME"));
         assert_eq!(e.community_rating, Some(7.5));
+    }
+
+    /// gl-1587: an NFO's `<country>` values reach the provider result's
+    /// `ProductionLocations`, filled when empty, else a case-insensitive
+    /// distinct union with what it already holds (`MetadataService.cs:1295-1304`'s
+    /// rule; the lock and the replace against the stored row are
+    /// `merge_union_lists`').
+    #[test]
+    fn apply_nfo_stores_the_production_locations() {
+        use ferrofin_db::entities::base_items::BaseItemEntity;
+        use ferrofin_providers::xbmc::item::{NfoBaseItem, NfoItemKind};
+        let mut n = NfoBaseItem::new(NfoItemKind::Movie);
+        n.production_locations = vec!["United Kingdom".into(), "France".into()];
+
+        let mut empty = BaseItemEntity::default();
+        super::apply_nfo(&mut empty, &n);
+        assert_eq!(
+            empty.production_locations.as_deref(),
+            Some("United Kingdom|France")
+        );
+
+        let mut known = BaseItemEntity {
+            production_locations: Some("france|Japan".into()),
+            ..Default::default()
+        };
+        super::apply_nfo(&mut known, &n);
+        assert_eq!(
+            known.production_locations.as_deref(),
+            Some("france|Japan|United Kingdom")
+        );
     }
 
     /// An NFO episode range (`<episodenumberend>`, or the last of several
