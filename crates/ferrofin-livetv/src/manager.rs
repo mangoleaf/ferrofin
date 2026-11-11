@@ -891,9 +891,10 @@ fn xmltv_program_rows<'a>(
             .as_ref()
             .map(|base| format!("{base}_{channel_external}"));
         let id = external_id.as_deref().map_or_else(
-            // No start attribute means upstream has no id to build
-            // either; keep the row addressable rather than dropping
-            // it, keyed on what it does have.
+            // No readable start: upstream builds the id from year 1, the
+            // same for every such airing of the channel; this one keys it
+            // on the channel and title instead (the parity row's
+            // divergence).
             || internal_program_id(&format!("{channel_external}_{}", prog.title)),
             internal_program_id,
         );
@@ -2633,8 +2634,10 @@ impl FerrofinLiveTvManager {
     /// `XmlTvListingsProvider.GetProgramsAsync` hands the window straight to
     /// `XmlTvReader.GetProgrammes(channelId, start, end)`, which keeps a
     /// programme that *overlaps* it — an airing already in progress when the
-    /// refresh runs is part of the guide. An airing with no `stop` is treated as
-    /// instantaneous at its start.
+    /// refresh runs is part of the guide. `PopulateHeader` makes a missing or
+    /// unreadable `start` or `stop` `DateTimeOffset.MinValue`, so an airing
+    /// with no stop always ends before the window and is dropped, and one with
+    /// no start but a stop inside the window is kept.
     ///
     /// The boundary form (`end >= start`, `start < end`) is the one that
     /// reproduces the oracle: on the lab fixture Jellyfin retains exactly the
@@ -2646,14 +2649,10 @@ impl FerrofinLiveTvManager {
         start: DateTime<Utc>,
         end: DateTime<Utc>,
     ) -> bool {
-        let Some(prog_start) = prog.start.map(|d| d.with_timezone(&Utc)) else {
-            // No start attribute: upstream's reader cannot place it either, and
-            // the row is already unaddressable. Keep it rather than silently
-            // shrinking the lineup.
-            return true;
+        let Some(prog_end) = prog.stop.map(|d| d.with_timezone(&Utc)) else {
+            return false;
         };
-        let prog_end = prog.stop.map_or(prog_start, |d| d.with_timezone(&Utc));
-        prog_end >= start && prog_start < end
+        prog_end >= start && prog.start.is_none_or(|d| d.with_timezone(&Utc) < end)
     }
 
     /// The number of days of guide data a refresh ingests and
@@ -17093,15 +17092,40 @@ mod guide_window_tests {
         assert_eq!(kept, 169);
     }
 
-    /// A programme with no `start` cannot be placed, so it is not silently
-    /// dropped by the window.
+    /// `PopulateHeader` (gl-1646): a missing or unreadable time is
+    /// `DateTimeOffset.MinValue`, so an airing with no stop is dropped, and one
+    /// with no start whose stop falls in the window is kept.
     #[test]
-    fn undated_airings_survive_the_window() {
+    fn an_airing_needs_a_stop_in_the_window() {
         let base = Utc.with_ymd_and_hms(2026, 8, 30, 0, 0, 0).unwrap();
-        assert!(FerrofinLiveTvManager::in_guide_window(
+        let (start, end) = (base, base + Duration::days(7));
+        let no_stop = crate::xmltv::XmltvProgramme {
+            stop: None,
+            ..programme(1, 1)
+        };
+        assert!(!FerrofinLiveTvManager::in_guide_window(
+            &no_stop, start, end
+        ));
+        assert!(!FerrofinLiveTvManager::in_guide_window(
             &crate::xmltv::XmltvProgramme::default(),
-            base,
-            base + Duration::days(7)
+            start,
+            end
+        ));
+        let no_start = crate::xmltv::XmltvProgramme {
+            start: None,
+            ..programme(1, 1)
+        };
+        assert!(FerrofinLiveTvManager::in_guide_window(
+            &no_start, start, end
+        ));
+        let no_start_long_ago = crate::xmltv::XmltvProgramme {
+            start: None,
+            ..programme(-48, 1)
+        };
+        assert!(!FerrofinLiveTvManager::in_guide_window(
+            &no_start_long_ago,
+            start,
+            end
         ));
     }
 

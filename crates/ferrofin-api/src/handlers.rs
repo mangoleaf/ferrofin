@@ -1017,15 +1017,23 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
                    at the pinned v12.4 tag, and the etag bytes with those a Jellyfin 12.4 \
                    server stored for the same guide. The XMLTV reader keeps a guide's text \
                    as Jellyfin.XmlTv reads it (xmltv.rs apply_end, end_programme_run, \
-                   copyright_year, push_text; gl-1631), checked against that server on \
-                   padded, empty, blank, CRLF and date text.",
-        date: "2026-11-10",
+                   push_text; gl-1631), checked against that server on padded, empty, blank, \
+                   CRLF and date text, and its times and dates through one port of \
+                   XmlTvReader.ParseDate (parse_xmltv_time, copyright_year; gl-1646) that \
+                   upstream's XmlTvReaderDateTimeTests pin, with PopulateHeader's \
+                   MinValue for a missing time in the guide window (manager.rs \
+                   in_guide_window) and the previously-shown check.",
+        date: "2026-11-11",
         divergences: &[
             "Jellyfin.XmlTv drops the element right after an <image> or <url> when no \
              whitespace separates them: ProcessImageNode reads past the end tag and its caller \
              skips one more node. Ferrofin reads that element, so on such a compact guide the \
              airing's rating, artwork or other field, and its etag, differ from Jellyfin's. \
              Jellyfin bug not ported.",
+            "An airing whose start is missing or does not parse (and whose stop is in the \
+             guide window) is kept with no start date and one id per channel and title; \
+             upstream's PopulateHeader takes DateTimeOffset.MinValue, year 1, which gives \
+             every such airing of a channel the same programme id. Jellyfin bug not ported.",
             "A programme's image URL padded with whitespace is stored trimmed, so the \
              artwork loads; upstream's UpdateImage stores the padded path, which does not. \
              Jellyfin bug not ported.",

@@ -1180,17 +1180,20 @@ fn apply_start(
             b"premiere" => p.programme.is_premiere = true,
             // `ProcessPreviouslyShown` (Jellyfin.XmlTv XmlTvReader.cs:833-852):
             // a `start` is the original air date, and an airing whose original
-            // air date is its own start instant is a first showing. Without a
-            // `start` it is a repeat; one that does not parse, or a programme
-            // whose own start does not, never matches.
+            // air date is its own start instant (`DateTimeOffset.MinValue`
+            // when its start is missing or unreadable) is a first showing.
+            // Without a `start`, or with one that does not parse, it is a
+            // repeat.
             b"previously-shown" => {
+                let own_start = p.programme.start.or_else(|| {
+                    FixedOffset::east_opt(0)?
+                        .with_ymd_and_hms(1, 1, 1, 0, 0, 0)
+                        .single()
+                });
                 let first_showing = attr(e, b"start")
                     .filter(|start| !start.is_empty())
                     .is_some_and(|start| {
-                        matches!(
-                            (parse_xmltv_time(&start), p.programme.start),
-                            (Some(shown), Some(start)) if shown == start
-                        )
+                        parse_xmltv_time(&start).is_some_and(|shown| Some(shown) == own_start)
                     });
                 if !first_showing {
                     p.programme.is_previously_shown = true;
@@ -1241,57 +1244,11 @@ fn push_text(text: &mut String, run: &str) {
     }
 }
 
-/// The year of a `<date>`, as `XmlTvReader.ParseDate` reads it: the whole
-/// text must match `^(?<dateDigits>[0-9]{4,14})(\s(?<dateOffset>[+-]*[0-9]{1,4}))?$`
-/// (.NET's `$` also before one final `\n`), the digits completed from
-/// `20000101000000` must be a date (`TryParseExact`), and a five-character
-/// offset must be one (`zzz`); any other offset is ignored. `None` when the
-/// date does not parse.
+/// The year of a `<date>` (`ProcessCopyrightDate`): `CopyrightDate.Year`, the
+/// clock year of [`parse_xmltv_time`]'s instant, or `None` when the date does
+/// not parse.
 fn copyright_year(raw: &str) -> Option<i32> {
-    const COMPLETION: &str = "20000101000000";
-    let text = raw.strip_suffix('\n').unwrap_or(raw);
-    let digits = text.bytes().take_while(u8::is_ascii_digit).count();
-    if !(4..=14).contains(&digits) {
-        return None;
-    }
-    let (date, rest) = text.split_at(digits);
-    let offset = if rest.is_empty() {
-        None
-    } else {
-        let mut chars = rest.chars();
-        if !chars.next().is_some_and(char::is_whitespace) {
-            return None;
-        }
-        let offset = chars.as_str();
-        let unsigned = offset.trim_start_matches(['+', '-']);
-        if unsigned.is_empty()
-            || unsigned.len() > 4
-            || !unsigned.bytes().all(|b| b.is_ascii_digit())
-        {
-            return None;
-        }
-        Some(offset)
-    };
-    let full = format!("{date}{}", &COMPLETION[digits..]);
-    let naive = chrono::NaiveDateTime::parse_from_str(&full, "%Y%m%d%H%M%S").ok()?;
-    // .NET's calendar starts at year 1, and Linux has no leap second (`ss` 60).
-    let year = chrono::Datelike::year(&naive);
-    if year < 1 || chrono::Timelike::nanosecond(&naive) >= 1_000_000_000 {
-        return None;
-    }
-    if let Some(offset) = offset.filter(|o| o.len() == 5) {
-        // `"+0100".Insert(3, ":")`, then `zzz`: one sign, two-digit hours to
-        // 14, two-digit minutes.
-        let (sign, digits) = offset.split_at(1);
-        if !matches!(sign, "+" | "-") || !digits.bytes().all(|b| b.is_ascii_digit()) {
-            return None;
-        }
-        let (hours, minutes): (u32, u32) = (digits[..2].parse().ok()?, digits[2..].parse().ok()?);
-        if hours > 14 || minutes > 59 || (hours == 14 && minutes > 0) {
-            return None;
-        }
-    }
-    Some(year)
+    parse_xmltv_time(raw).map(|at| chrono::Datelike::year(&at))
 }
 
 /// Jellyfin.XmlTv `SetChannelNumber`: a display-name with `-` and `_` turned
@@ -1487,57 +1444,73 @@ fn apply_end(
     }
 }
 
-/// Parses an XMLTV timestamp: `YYYYMMDDHHMMSS` optionally followed by a
-/// ` ±HHMM` offset. A missing offset is treated as UTC.
-///
-/// The XMLTV DTD lets a feed give "some initial substring" of the time
-/// (`200007281733 +0100`). A whole-unit prefix (year, then month, day, hour,
-/// minute) is completed from `20000101000000`, so each missing unit takes its
-/// first value; a prefix that cuts a unit in half is no time. Only numeric
-/// offsets are read: a named zone (`BST`) makes the whole time unreadable.
+/// Parses an XMLTV time (`start`, `stop`, `previously-shown`, `<date>`) as
+/// `Jellyfin.XmlTv` `XmlTvReader.ParseDate` does, which its tests
+/// (`XmlTvReaderDateTimeTests`) pin:
+/// - the whole text must match
+///   `^(?<dateDigits>[0-9]{4,14})(\s(?<dateOffset>[+-]*[0-9]{1,4}))?$`, .NET's
+///   `$` also matching before one final `\n`, so padding, an offset with no
+///   space before it or a named zone (`BST`) make no time;
+/// - the digits are completed from `20000101000000` and must be a time
+///   (`TryParseExact("yyyyMMddHHmmss")`: from year 1, no leap second);
+/// - a five-character offset (`+0100`) is one (`zzz`: one sign, hours to 14);
+///   any other offset is ignored, and no offset is UTC.
 ///
 /// The declared offset is preserved rather than normalised away — see
 /// [`XmltvProgramme::start`] for why the programme's item GUID depends on it.
 #[must_use]
 pub fn parse_xmltv_time(raw: &str) -> Option<DateTime<FixedOffset>> {
     const COMPLETION: &str = "20000101000000";
-    let raw = raw.trim();
-    let (datetime, offset) = match raw.split_once(' ') {
-        Some((dt, off)) => (dt, Some(off.trim())),
-        None => (raw, None),
-    };
-    let digits = datetime.bytes().take_while(u8::is_ascii_digit).count();
-    let given = if digits >= 14 {
-        14
-    } else if digits >= 4 && digits % 2 == 0 && digits == datetime.len() {
-        digits
-    } else {
-        return None;
-    };
-    let full = format!("{}{}", &datetime[..given], &COMPLETION[given..]);
-    let naive = chrono::NaiveDateTime::parse_from_str(&full, "%Y%m%d%H%M%S").ok()?;
-    let fixed = match offset.filter(|o| !o.is_empty()) {
-        Some(o) => parse_offset(o)?,
-        None => FixedOffset::east_opt(0)?,
-    };
-    fixed.from_local_datetime(&naive).single()
-}
-
-/// Parses a `±HHMM` numeric timezone offset into a [`FixedOffset`].
-fn parse_offset(o: &str) -> Option<FixedOffset> {
-    let bytes = o.as_bytes();
-    // Every byte after the sign must be an ASCII digit before the string is
-    // sliced: a multi-byte character there would split at a non-boundary.
-    if bytes.len() != 5
-        || (bytes[0] != b'+' && bytes[0] != b'-')
-        || !bytes[1..].iter().all(u8::is_ascii_digit)
-    {
+    let text = raw.strip_suffix('\n').unwrap_or(raw);
+    let digits = text.bytes().take_while(u8::is_ascii_digit).count();
+    if !(4..=14).contains(&digits) {
         return None;
     }
-    let hours: i32 = o[1..3].parse().ok()?;
-    let mins: i32 = o[3..5].parse().ok()?;
-    let secs = (hours * 3600 + mins * 60) * if bytes[0] == b'-' { -1 } else { 1 };
-    FixedOffset::east_opt(secs)
+    let (date, rest) = text.split_at(digits);
+    let offset = if rest.is_empty() {
+        None
+    } else {
+        let mut chars = rest.chars();
+        if !chars.next().is_some_and(char::is_whitespace) {
+            return None;
+        }
+        let offset = chars.as_str();
+        let unsigned = offset.trim_start_matches(['+', '-']);
+        if unsigned.is_empty()
+            || unsigned.len() > 4
+            || !unsigned.bytes().all(|b| b.is_ascii_digit())
+        {
+            return None;
+        }
+        Some(offset)
+    };
+    let full = format!("{date}{}", &COMPLETION[digits..]);
+    let naive = chrono::NaiveDateTime::parse_from_str(&full, "%Y%m%d%H%M%S").ok()?;
+    // .NET's calendar starts at year 1, and Linux has no leap second (`ss` 60).
+    if chrono::Datelike::year(&naive) < 1 || chrono::Timelike::nanosecond(&naive) >= 1_000_000_000 {
+        return None;
+    }
+    let zone = match offset.filter(|o| o.len() == 5) {
+        // `"+0100".Insert(3, ":")`, then `zzz`: one sign, two-digit hours to
+        // 14, two-digit minutes.
+        Some(zzz) => {
+            let (sign, hhmm) = zzz.split_at(1);
+            if !matches!(sign, "+" | "-") || !hhmm.bytes().all(|b| b.is_ascii_digit()) {
+                return None;
+            }
+            let (hours, minutes): (i32, i32) = (hhmm[..2].parse().ok()?, hhmm[2..].parse().ok()?);
+            if hours > 14 || minutes > 59 || (hours == 14 && minutes > 0) {
+                return None;
+            }
+            let seconds = (hours * 60 + minutes) * 60;
+            FixedOffset::east_opt(if sign == "-" { -seconds } else { seconds })?
+        }
+        None => FixedOffset::east_opt(0)?,
+    };
+    let at = zone.from_local_datetime(&naive).single()?;
+    // A `DateTimeOffset` must also be a UTC instant from year 1 to 9999.
+    let utc_year = chrono::Datelike::year(&at.naive_utc());
+    (1..=9999).contains(&utc_year).then_some(at)
 }
 
 /// Reads an attribute by (local) name, with XML entity references resolved.
@@ -1791,31 +1764,87 @@ mod tests {
         assert!(parse_xmltv_time("garbage").is_none());
     }
 
-    /// The XMLTV DTD: a time is `YYYYMMDDhhmmss`, of which "some initial
-    /// substring" may be given, the missing units taking their first value. A
-    /// unit is never cut in half, and an offset is `+hhmm`/`-hhmm`; anything
-    /// else is no time, never a panic.
+    /// `XmlTvReader.ParseDate` (gl-1646): some initial substring of
+    /// `YYYYMMDDhhmmss`, completed from `20000101000000` whatever its length,
+    /// then an optional space and `+hhmm`/`-hhmm` (any other offset ignored);
+    /// anything else is no time, never a panic.
     #[rstest::rstest]
     #[case("200007281733 +0100", Some("2000-07-28T17:33:00+01:00"))]
     #[case("2000072817", Some("2000-07-28T17:00:00+00:00"))]
     #[case("20000728", Some("2000-07-28T00:00:00+00:00"))]
     #[case("200007", Some("2000-07-01T00:00:00+00:00"))]
     #[case("2026", Some("2026-01-01T00:00:00+00:00"))]
-    #[case("20000728173", None)]
+    #[case("20000728173", Some("2000-07-28T17:30:00+00:00"))]
     #[case("200", None)]
     #[case("20260725060000 -0530", Some("2026-07-25T06:00:00-05:30"))]
     #[case("20260725060000 +0é0", None)]
     #[case("20260725060000 +01é", None)]
     #[case("20260725060000 +01x0", None)]
-    // Unchanged: 14 digits with an attached tail read the 14, as UTC.
-    #[case("20260725060000+0100", Some("2026-07-25T06:00:00+00:00"))]
-    #[case("2026072506000", None)]
+    #[case("20260725060000+0100", None)]
+    #[case("2026072506000", Some("2026-07-25T06:00:00+00:00"))]
+    #[case(" 20260725060000 +0000", None)]
+    #[case("20260725060000 +0000\n", Some("2026-07-25T06:00:00+00:00"))]
+    #[case("20260725060000 +000", Some("2026-07-25T06:00:00+00:00"))]
+    #[case("00000725060000", None)]
+    #[case("20260725235960", None)]
+    // The `DateTimeOffset` range: the instant in UTC is from year 1 to 9999.
+    #[case("00010101000000 +0100", None)]
+    #[case("00010101000000 -0100", Some("0001-01-01T00:00:00-01:00"))]
+    #[case("99991231235959 -0100", None)]
+    #[case("99991231235959 +0100", Some("9999-12-31T23:59:59+01:00"))]
+    // `zzz`: hours to 14, minutes to 59.
+    #[case("20260725060000 +1400", Some("2026-07-25T06:00:00+14:00"))]
+    #[case("20260725060000 +1401", None)]
+    #[case("20260725060000 +0060", None)]
+    // `ParseDate_Invalid_Null`.
+    #[case("", None)]
+    #[case(" ", None)]
+    #[case("a", None)]
+    #[case("1", None)]
     #[case("202607281733xyz", None)]
     #[case("200007281733 BST", None)]
-    fn time_parser_follows_the_dtd(#[case] raw: &str, #[case] expected: Option<&str>) {
+    fn time_parser_follows_parse_date(#[case] raw: &str, #[case] expected: Option<&str>) {
         assert_eq!(
             parse_xmltv_time(raw).map(|t| t.to_rfc3339()).as_deref(),
             expected,
+            "{raw}"
+        );
+    }
+
+    /// `XmlTvReaderDateTimeTests.HandlePartDatesTest`, transliterated: each
+    /// value's instant, in UTC.
+    #[rstest::rstest]
+    #[case("2016", "2016-01-01T00:00:00")]
+    #[case("201601", "2016-01-01T00:00:00")]
+    #[case("20160101", "2016-01-01T00:00:00")]
+    #[case("2016010112", "2016-01-01T12:00:00")]
+    #[case("201601011234", "2016-01-01T12:34:00")]
+    #[case("20160101123456", "2016-01-01T12:34:56")]
+    #[case("20160101120000 +0000", "2016-01-01T12:00:00")]
+    #[case("20160101120000 +1000", "2016-01-01T02:00:00")]
+    #[case("20160101120000 +0100", "2016-01-01T11:00:00")]
+    #[case("20160101120000 +0010", "2016-01-01T11:50:00")]
+    #[case("20160101120000 +0001", "2016-01-01T11:59:00")]
+    #[case("20160101120000 -1000", "2016-01-01T22:00:00")]
+    #[case("20160101120000 -0100", "2016-01-01T13:00:00")]
+    #[case("20160101120000 -0010", "2016-01-01T12:10:00")]
+    #[case("20160101120000 -0001", "2016-01-01T12:01:00")]
+    #[case("2016 -0100", "2016-01-01T01:00:00")]
+    #[case("201601 -0100", "2016-01-01T01:00:00")]
+    #[case("20160101 -0100", "2016-01-01T01:00:00")]
+    #[case("2016010112 -0100", "2016-01-01T13:00:00")]
+    #[case("201601011200 -0100", "2016-01-01T13:00:00")]
+    #[case("20160101120000 +000", "2016-01-01T12:00:00")]
+    #[case("20160101120000 +00", "2016-01-01T12:00:00")]
+    #[case("20160101120000 +0", "2016-01-01T12:00:00")]
+    #[case("20160101120000 0", "2016-01-01T12:00:00")]
+    fn part_dates_parse_as_upstream(#[case] raw: &str, #[case] utc: &str) {
+        let at = parse_xmltv_time(raw).expect(raw);
+        assert_eq!(
+            at.with_timezone(&chrono::Utc)
+                .format("%Y-%m-%dT%H:%M:%S")
+                .to_string(),
+            utc,
             "{raw}"
         );
     }
@@ -2106,6 +2135,9 @@ mod episode_num_tests {
     #[case("20190615 +-100", None)]
     #[case("0000", None)]
     #[case("20190615235960", None)]
+    // The clock year, not the UTC one.
+    #[case("20160101000000 +0100", Some(2016))]
+    #[case("20161231235959 -0100", Some(2016))]
     // `XmlTvReaderDateTimeTests.HandlePartDatesTest`: every value reads as 2016
     // (`DateTimeOffset.Year` is the clock year).
     #[case("2016", Some(2016))]
@@ -2683,12 +2715,18 @@ mod previously_shown_tests {
         assert_eq!(previously_shown(start, element), repeat, "{element}");
     }
 
-    /// A programme whose own start does not parse matches no original air date.
+    /// A programme whose own start does not parse starts at
+    /// `DateTimeOffset.MinValue` upstream (`PopulateHeader`), so only an
+    /// original air date at that instant matches it (gl-1646).
     #[test]
-    fn an_unreadable_programme_start_matches_no_original_air_date() {
+    fn an_unreadable_programme_start_matches_only_year_one() {
         assert!(previously_shown(
             "soon",
             "<previously-shown start=\"20260725200000\"/>"
+        ));
+        assert!(!previously_shown(
+            "soon",
+            "<previously-shown start=\"00010101000000\"/>"
         ));
     }
 }
