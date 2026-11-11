@@ -1740,8 +1740,8 @@ macro_rules! item_image_tail {
     };
 }
 
-/// The divergences the four item image rows share (GET and HEAD, plain and
-/// indexed).
+/// The divergences the six item image rows share (GET and HEAD, plain, indexed
+/// and positional).
 const ITEM_IMAGE_DIVERGENCES: &[&str] = &[
     "percentPlayed and unplayedCount are bound but not drawn, and not passed to the \
      processor: a request naming a percentPlayed between 0 and 100 or a positive \
@@ -2120,6 +2120,40 @@ pub const VERIFIED: &[Verified] = &[
                handlers/images.rs get_item_image_by_index, the GET row's path, with ServeFile \
                sending the headers alone",
         date: "2026-11-03",
+        divergences: ITEM_IMAGE_DIVERGENCES,
+        refs: &["images"],
+    },
+    Verified {
+        method: "get",
+        path: "/Items/{itemId}/Images/{imageType}/{imageIndex}/{tag}/{format}/{maxWidth}/{maxHeight}/{percentPlayed}/{unplayedCount}",
+        upstream_file: "Jellyfin.Api/Controllers/ImageController.cs",
+        upstream_method: "GetItemImage2",
+        ferrofin: concat!(
+            "handlers/images.rs get_item_image_parametrized (the route's imageIndex, maxWidth, \
+             maxHeight and unplayedCount bind with the query binder's int rules, trimmed and \
+             with the 0x, # and &h hex forms, percentPlayed with its double rules (no hex; \
+             gl-1665: Rust's inf binds and a thousands separator, 1,000, is a 400, the other \
+             way round from upstream's), format as the ImageFormat enum and tag as a required \
+             string (RequiredRouteString: a blank one is the 400), so a malformed member is a \
+             400; tag, format and both sizes are passed on as given, a 0 or negative size and \
+             a tag of 0 included; PositionalImageQuery binds only the query members the action \
+             declares, so a malformed maxWidth, percentPlayed or imageIndex in the query is not \
+             read; measured on 12.4) → ",
+            item_image_tail!()
+        ),
+        date: "2026-11-11",
+        divergences: ITEM_IMAGE_DIVERGENCES,
+        refs: &["images"],
+    },
+    Verified {
+        method: "head",
+        path: "/Items/{itemId}/Images/{imageType}/{imageIndex}/{tag}/{format}/{maxWidth}/{maxHeight}/{percentPlayed}/{unplayedCount}",
+        upstream_file: "Jellyfin.Api/Controllers/ImageController.cs",
+        upstream_method: "GetItemImage2",
+        ferrofin: "HeadItemImage2 is GetItemImage2's own action: handlers/images.rs \
+               get_item_image_parametrized, the GET row's path, with ServeFile sending the \
+               headers alone (measured on 12.4)",
+        date: "2026-11-11",
         divergences: ITEM_IMAGE_DIVERGENCES,
         refs: &["images"],
     },
