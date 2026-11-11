@@ -3797,6 +3797,26 @@ pub const VERIFIED: &[Verified] = &[
         ],
         refs: &[],
     },
+    Verified {
+        method: "post",
+        path: "/Devices/Options",
+        upstream_file: "Jellyfin.Api/Controllers/DevicesController.cs",
+        upstream_method: "UpdateDeviceOptions",
+        ferrofin: "handlers/devices.rs update_device_options (RequireAdmin, \
+               Policies.RequiresElevation; a missing or blank id and an empty body are 400) → \
+               ferrofin-core device_manager.rs update_device_options (DeviceManager.\
+               UpdateDeviceOptions: one upsert of CustomName, null when the body has none) → \
+               session_manager.rs on_device_options_updated (the DeviceOptionsUpdated handler \
+               SessionManager.OnDeviceManagerDeviceOptionsUpdated: every live session of the \
+               device takes a non-blank name as its DeviceName with HasCustomDeviceName, a \
+               blank one only clears HasCustomDeviceName)",
+        date: "2026-11-10",
+        divergences: &[
+            "The 400 for a missing or blank id, the 401 (no or bad token) and the 403 (not an \
+         administrator) bodies are Ferrofin's error shape, not upstream's. Fix path: gl-666.",
+        ],
+        refs: &[],
+    },
 ];
 
 /// What `/Artists` and `/Artists/AlbumArtists` do differently from v12's
