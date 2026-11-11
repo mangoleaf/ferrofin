@@ -20482,6 +20482,11 @@ fn lone_video(
 struct EpisodeFolder {
     /// Whether its episodes are in a mixed folder.
     mixed: bool,
+    /// Whether `ResolveVideos` resolved an item of it (an extra is none):
+    /// `ResolvePaths` then resolves only its items and the files it set
+    /// aside, never a `\bsample\b` file it dropped ([`dropped_sample`]);
+    /// else it resolves each file on its own ([`lone_episode_name`]).
+    has_items: bool,
     /// Its stacks and episode version groups, when it has any: a folder whose
     /// every video is one file resolves each file as an episode of its own.
     groups: Option<VideoGroups>,
@@ -20561,8 +20566,10 @@ fn set_aside_extras(
 /// (`MovieResolver.cs:231-234`), which groups stacks and episode versions
 /// (`VideoListResolver.GetEpisodesGroupedByVersion`) and sets
 /// `IsInMixedFolder = Count > 1` — a series or season folder is never a top
-/// parent. A folder of an untyped library's series is not recorded: its
-/// files resolve one by one (`MovieResolver.cs:219-222`).
+/// parent — and whether it resolved an item: if not, `ResolvePaths` resolves
+/// each file on its own (`LibraryManager.cs:1064`), never in a mixed folder.
+/// A folder of an untyped library's series is not recorded: its files
+/// resolve one by one (`MovieResolver.cs:219-222`).
 fn note_episode_folder(dir: &str, entries: &[FileSystemEntryInfo], ctx: &PlanCtx<'_>) {
     if !ctx.tv_library.get() {
         return;
@@ -20575,7 +20582,8 @@ fn note_episode_folder(dir: &str, entries: &[FileSystemEntryInfo], ctx: &PlanCtx
         true,
         Some(ferrofin_model::data::CollectionType::tvshows),
     );
-    let mixed = videos.len() > 1;
+    let has_items = videos.iter().any(|video| video.extra_type.is_none());
+    let mixed = has_items && videos.len() > 1;
     let groups = VideoGroups::of(videos, ctx.naming);
     let grouped = groups
         .videos
@@ -20585,23 +20593,22 @@ fn note_episode_folder(dir: &str, entries: &[FileSystemEntryInfo], ctx: &PlanCtx
         dir.to_owned(),
         EpisodeFolder {
             mixed,
+            has_items,
             groups: grouped.then_some(groups),
         },
     );
 }
 
 /// The name and year of the episode file at `path` that is in no stack or
-/// version group: in a folder `ResolveVideos<Episode>` resolves
+/// version group: in a folder `ResolveVideos<Episode>` resolved an item of
 /// ([`note_episode_folder`]) its parsed name and year (`parseName: true`,
 /// `Name = video.Name`, `ProductionYear = video.Year`,
 /// `MovieResolver.cs:234,305-306`); else none, leaving it the file name
-/// `EpisodeResolver` gives it (an untyped library's series).
+/// `EpisodeResolver` gives it (an untyped library's series, or a folder
+/// `ResolveVideos` resolved no item of, whose files `ResolvePaths` resolves
+/// one by one, `LibraryManager.cs:1064`).
 fn lone_episode_name(path: &str, ctx: &PlanCtx<'_>) -> (Option<String>, Option<i32>) {
-    let resolved = Path::new(path)
-        .parent()
-        .and_then(Path::to_str)
-        .is_some_and(|dir| ctx.episode_folders.borrow().contains_key(dir));
-    if !resolved {
+    if !folder_has_items(path, ctx) {
         return (None, None);
     }
     let parsed = video_resolver::parse_name(&file_stem(path), ctx.naming);
@@ -20641,13 +20648,49 @@ fn folder_names_an_episode(folder_name: &str, naming: &NamingOptions) -> bool {
         .is_some_and(|info| info.season_number.is_some() && info.episode_number.is_some())
 }
 
-/// Whether the TV walk plans the episode file at `path`: the scope keeps it
-/// or — when it is in a stack or a version group — any file of the group,
-/// which is planned whole ([`LibraryScanner::plan_episode_group`]).
+/// Whether the TV walk plans the episode file at `path`, one no extra rule
+/// takes: not a sample its folder dropped ([`dropped_sample`], which records
+/// it excluded), and the scope keeps it or — when it is in a stack or a
+/// version group — any file of the group, which is planned whole
+/// ([`LibraryScanner::plan_episode_group`]).
 fn episode_file_kept(path: &str, ctx: &PlanCtx<'_>) -> bool {
-    ctx.scope.keeps(path)
-        || episode_group(path, ctx)
-            .is_some_and(|(video, _)| group_files(&video).any(|file| ctx.scope.keeps(file)))
+    !dropped_sample(path, ctx)
+        && (ctx.scope.keeps(path)
+            || episode_group(path, ctx)
+                .is_some_and(|(video, _)| group_files(&video).any(|file| ctx.scope.keeps(file))))
+}
+
+/// Whether the file at `path` is a `\bsample\b` name `ResolveVideos<Episode>`
+/// left out of a folder it resolved an item of (`MovieResolver.cs:256-269`):
+/// `ResolvePaths` resolves nothing else of that folder
+/// (`LibraryManager.cs:1052-1060`), so it is no item, and it is recorded
+/// excluded so a stored row at it is reconciled away. A folder of samples
+/// only resolves each file on its own (`:1064`), as an episode.
+fn dropped_sample(path: &str, ctx: &PlanCtx<'_>) -> bool {
+    let dropped = Path::new(path)
+        .file_name()
+        .and_then(std::ffi::OsStr::to_str)
+        .is_some_and(video_resolver::is_sample_filename)
+        && folder_has_items(path, ctx);
+    if dropped {
+        ctx.excluded.borrow_mut().push(path.to_owned());
+    }
+    dropped
+}
+
+/// Whether the folder holding the file at `path` is one the walk recorded
+/// ([`note_episode_folder`]) and `ResolveVideos` resolved an item of
+/// ([`EpisodeFolder::has_items`]).
+fn folder_has_items(path: &str, ctx: &PlanCtx<'_>) -> bool {
+    Path::new(path)
+        .parent()
+        .and_then(Path::to_str)
+        .is_some_and(|dir| {
+            ctx.episode_folders
+                .borrow()
+                .get(dir)
+                .is_some_and(|folder| folder.has_items)
+        })
 }
 
 /// The items upstream's `ResolveVideos` resolves from `entries`, the
@@ -42314,6 +42357,141 @@ mod tests {
                 .all(|v| v.path.as_deref() != Some(sample.as_str())),
             "the sample is no extra"
         );
+    }
+
+    /// gl-1351: a tvshows library resolves a folder's files through
+    /// `ResolveVideos<Episode>`, which drops every `\bsample\b` name
+    /// (`MovieResolver.cs:63-64,256-269`), and once that resolved an item
+    /// `ResolvePaths` resolves nothing else of the folder
+    /// (`LibraryManager.cs:1052-1060`). So a sample name the ignore and extra
+    /// rules miss, beside an episode, is no item: in a season folder, in the
+    /// series folder, or in a folder of loose episodes.
+    #[rstest::rstest]
+    #[case::leading_word("Season 01", "sample-show.s01e01.mkv")]
+    #[case::trailing_word("Season 01", "Show S01E01 sample.mkv")]
+    #[case::inner_word("Season 01", "Show.S01E01.Sample.720p.mkv")]
+    #[case::series_folder("", "Show S01E01 sample.mkv")]
+    #[case::loose_folder("Show S01E01", "Show S01E01 sample.mkv")]
+    #[tokio::test]
+    async fn a_sample_name_beside_an_episode_is_no_item(#[case] dir: &str, #[case] name: &str) {
+        use ferrofin_model::data::BaseItemKind;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let media = tmp.path().join("tv");
+        let folder = media.join("Show").join(dir);
+        touch(&folder, "Show S01E01.mkv");
+        touch(&folder, name);
+
+        let (db, _cf) = scan_one(CollectionTypeOptions::tvshows, "TV", &media).await;
+
+        let episode = folder
+            .join("Show S01E01.mkv")
+            .to_string_lossy()
+            .into_owned();
+        let paths = |rows: Vec<ferrofin_db::entities::base_items::BaseItemEntity>| {
+            rows.into_iter()
+                .filter_map(|row| row.path)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            paths(scanned_by_kind(&db, BaseItemKind::Episode).await),
+            [episode],
+            "the sample is no episode"
+        );
+        assert_eq!(
+            paths(scanned_by_kind(&db, BaseItemKind::Video).await),
+            Vec::<String>::new(),
+            "the sample is no extra"
+        );
+    }
+
+    /// gl-1351: a folder whose every video is a sample name or an extra
+    /// resolves no item through `ResolveVideos<Episode>` (an extra goes to
+    /// `ExtraFiles`, not `Items`), so `ResolvePaths` resolves each file on its
+    /// own (`LibraryManager.cs:1064`) and `EpisodeResolver` takes the sample,
+    /// named after its file (`parseName: false`, `EpisodeResolver.cs:58`) and
+    /// in no mixed folder, however many extras the folder holds.
+    #[rstest::rstest]
+    #[case::alone(&[])]
+    #[case::beside_an_extra(&["Show S01E01-trailer.mkv"])]
+    #[case::beside_two_extras(&["Show S01E01-trailer.mkv", "Show S01E01-featurette.mkv"])]
+    #[tokio::test]
+    async fn a_season_of_sample_names_only_keeps_its_episodes(#[case] extras: &[&str]) {
+        use ferrofin_model::data::BaseItemKind;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let media = tmp.path().join("tv");
+        let season = media.join("Show").join("Season 01");
+        touch(&season, "Show S01E01 sample.mkv");
+        for extra in extras {
+            touch(&season, extra);
+        }
+
+        let (db, _cf) = scan_one(CollectionTypeOptions::tvshows, "TV", &media).await;
+
+        let episodes = scanned_by_kind(&db, BaseItemKind::Episode).await;
+        let sample = season
+            .join("Show S01E01 sample.mkv")
+            .to_string_lossy()
+            .into_owned();
+        assert_eq!(
+            episodes
+                .iter()
+                .map(|e| (e.path.as_deref(), e.name.as_deref(), e.is_in_mixed_folder))
+                .collect::<Vec<_>>(),
+            [(Some(sample.as_str()), Some("Show S01E01 sample"), false)]
+        );
+    }
+
+    /// gl-1351: the next scan reconciles away a sample episode an earlier
+    /// scan stored, once its folder resolves an item: the sample is recorded
+    /// excluded, so its file still on disk keeps no row.
+    #[tokio::test]
+    async fn a_stored_sample_episode_is_pruned_once_its_folder_resolves_an_item() {
+        async fn episode_paths(db: &Database) -> Vec<String> {
+            scanned_by_kind(db, BaseItemKind::Episode)
+                .await
+                .into_iter()
+                .filter_map(|row| row.path)
+                .collect()
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        let media = tmp.path().join("tv");
+        let season = media.join("Show").join("Season 01");
+        let path = |name: &str| season.join(name).to_string_lossy().into_owned();
+        touch(&season, "Show S01E01 sample.mkv");
+        let db = crate::test_support::test_db().await;
+        let persistence = Arc::new(FerrofinItemPersistenceService::new(db.clone()));
+        let vf = Arc::new(
+            FerrofinVirtualFolderManager::new(tmp.path().join("default"))
+                .with_item_store(persistence.clone()),
+        );
+        vf.add_virtual_folder(
+            "TV",
+            Some(CollectionTypeOptions::tvshows),
+            &LibraryOptions {
+                path_infos: vec![MediaPathInfo {
+                    path: media.to_string_lossy().into_owned(),
+                }],
+                ..LibraryOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+        let items: Arc<dyn ItemRepository> = Arc::new(crate::FerrofinItemRepository::new(
+            db.clone(),
+            Arc::new(crate::item_type_lookup::ItemTypeLookup::new()),
+        ));
+        let scanner = LibraryScanner::new(vf, Arc::new(FerrofinFileSystem::new()), persistence)
+            .with_items(items);
+
+        scanner.scan_all().await.unwrap();
+        assert_eq!(episode_paths(&db).await, [path("Show S01E01 sample.mkv")]);
+
+        touch(&season, "Show S01E01.mkv");
+        scanner.scan_all().await.unwrap();
+        assert_eq!(episode_paths(&db).await, [path("Show S01E01.mkv")]);
     }
 
     /// Upstream `MovieResolverTests.AllExtrasTypesFolderNames_ContainsSampleSingularAndPlural`
