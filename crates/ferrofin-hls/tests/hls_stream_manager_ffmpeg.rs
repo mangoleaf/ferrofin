@@ -409,8 +409,15 @@ async fn end_to_end_master_variant_and_real_segment() {
     // mpegts segments start with the 0x47 sync byte.
     assert_eq!(bytes[0], 0x47, "not a valid mpegts segment");
 
-    // 4. Stopping the encoding kills the job and deletes the partial files.
+    // 4. Stopping the encoding kills the job and deletes the partial files,
+    // after `DeletePartialStreamFiles`' 1.5 s wait.
     mgr.stop_encoding(&req).await.expect("stop_encoding");
+    for _ in 0..100 {
+        if !cache.join("out0.ts").exists() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
     assert!(
         !cache.join("out0.ts").exists(),
         "partial segment should be deleted after stop"

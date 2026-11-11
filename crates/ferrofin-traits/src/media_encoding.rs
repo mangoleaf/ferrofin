@@ -441,6 +441,11 @@ pub trait TranscodeManager: Send + Sync {
     /// Kills the transcode jobs for a device (optionally scoped to one play
     /// session). Port of `KillTranscodingJobs(deviceId, playSessionId,
     /// deleteFiles)`; the `deleteFiles` predicate is replaced by a flag.
+    ///
+    /// Returns once the jobs are stopped and their partial files deleted,
+    /// which `DeletePartialStreamFiles` first waits 1.5 s for and retries for
+    /// up to about 6 s. The deletions run on tasks of their own, so a caller
+    /// that stops waiting does not cut them off.
     async fn kill_transcoding_jobs(
         &self,
         device_id: &str,
@@ -1005,7 +1010,8 @@ pub trait HlsStreamManager: Send + Sync {
     ) -> Result<ServedFile, ServiceError>;
 
     /// Stops the active encoding(s) for `request`'s device / play session,
-    /// deleting their partial files.
+    /// deleting their partial files once it has returned: upstream does not
+    /// await `KillTranscodingJobs` here.
     ///
     /// Port of `HlsSegmentController.StopEncodingProcess` → `KillTranscodingJobs`.
     /// Only [`device_id`](HlsStreamRequest::device_id) and
@@ -1015,6 +1021,23 @@ pub trait HlsStreamManager: Send + Sync {
     ///
     /// Returns a [`ServiceError`] if the kill cannot be dispatched.
     async fn stop_encoding(&self, request: &HlsStreamRequest) -> Result<(), ServiceError>;
+
+    /// [`Self::stop_encoding`], returning only once the partial files are
+    /// deleted too, as the playback-stop reports await `KillTranscodingJobs`
+    /// (see [`TranscodeManager::kill_transcoding_jobs`]).
+    ///
+    /// The default is [`Self::stop_encoding`], for a manager whose stop leaves
+    /// nothing to wait for.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`ServiceError`] if the kill cannot be dispatched.
+    async fn stop_encoding_awaiting_deletion(
+        &self,
+        request: &HlsStreamRequest,
+    ) -> Result<(), ServiceError> {
+        self.stop_encoding(request).await
+    }
 
     /// Refreshes the keep-alive timer for the transcoding job(s) of a play
     /// session so an active-but-paused transcode is not reaped.

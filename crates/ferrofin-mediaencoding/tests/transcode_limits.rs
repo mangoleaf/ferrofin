@@ -458,6 +458,35 @@ async fn next_episode_evicts_the_users_idle_job() {
     );
 }
 
+/// The next episode does not wait out the evicted job's partial-file
+/// deletion, whose first attempt waits 1.5 s: upstream has no eviction, and
+/// the ping-timeout kill it stands in for holds up no request. The files
+/// still go once that delay has passed.
+#[tokio::test(start_paused = true)]
+async fn an_eviction_does_not_hold_up_the_next_start() {
+    let fixture = Fixture::new(0, 1);
+    fixture.start("ep1", ALICE, TRANSCODE).await.unwrap();
+    let evicted = fixture.playlist("ep1");
+    assert!(evicted.exists());
+
+    let started = tokio::time::Instant::now();
+    fixture
+        .start("ep2", ALICE, TRANSCODE)
+        .await
+        .expect("the idle job gives up its slot");
+    let took = started.elapsed();
+    assert!(took < std::time::Duration::from_millis(1500), "{took:?}");
+    assert!(evicted.exists(), "deleted before the delay");
+
+    for _ in 0..100 {
+        if !evicted.exists() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    assert!(!evicted.exists(), "the evicted job's files were kept");
+}
+
 /// As on a seek restart, a job taking over the same live stream re-opens
 /// ffmpeg on the tuner, so the evicted job must not close it. Another live
 /// stream's tuner goes back, as the reaper would send it.

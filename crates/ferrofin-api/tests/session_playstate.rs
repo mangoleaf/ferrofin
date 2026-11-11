@@ -814,6 +814,16 @@ struct RecordingHls {
     stops: Mutex<Vec<(Option<String>, Option<String>)>>,
     /// The play sessions a transcoding job runs for.
     jobs: Mutex<Vec<String>>,
+    /// Every `stop_encoding_awaiting_deletion` call, which then records in
+    /// [`Self::stops`] too.
+    awaited_stops: std::sync::atomic::AtomicUsize,
+    /// When set, `stop_encoding` waits for [`Self::release`], as a kill still
+    /// waiting out its partial-file deletion.
+    hold: std::sync::atomic::AtomicBool,
+    /// Signalled when a held `stop_encoding` starts waiting.
+    reached: tokio::sync::Notify,
+    /// Lets a held `stop_encoding` finish.
+    release: tokio::sync::Notify,
 }
 
 #[async_trait]
@@ -854,11 +864,23 @@ impl HlsStreamManager for RecordingHls {
         unimplemented!()
     }
     async fn stop_encoding(&self, request: &HlsStreamRequest) -> Result<(), ServiceError> {
+        if self.hold.load(std::sync::atomic::Ordering::SeqCst) {
+            self.reached.notify_one();
+            self.release.notified().await;
+        }
         self.stops
             .lock()
             .unwrap()
             .push((request.device_id.clone(), request.play_session_id.clone()));
         Ok(())
+    }
+    async fn stop_encoding_awaiting_deletion(
+        &self,
+        request: &HlsStreamRequest,
+    ) -> Result<(), ServiceError> {
+        self.awaited_stops
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.stop_encoding(request).await
     }
     async fn ping_transcoding_job(
         &self,
@@ -2252,7 +2274,51 @@ async fn stopped_with_session_kills_transcode_and_records() {
         hls.stops.lock().unwrap().as_slice(),
         &[(Some("dev-1".to_owned()), Some("abc".to_owned()))]
     );
+    // Awaited with its partial-file deletion, as PlaystateController awaits
+    // KillTranscodingJobs.
+    assert_eq!(
+        hls.awaited_stops.load(std::sync::atomic::Ordering::SeqCst),
+        1
+    );
     assert!(hls.pings.lock().unwrap().is_empty());
+}
+
+/// The stop report's kill waits out the partial-file deletion. A client that
+/// hangs up meanwhile does not cut off the stop: upstream's action finishes
+/// whatever the client does, and so does the user-data save here.
+#[tokio::test]
+async fn a_stop_the_client_hangs_up_on_still_records() {
+    let (sessions, user_data) = recording();
+    let hls = Arc::new(RecordingHls::default());
+    hls.hold.store(true, std::sync::atomic::Ordering::SeqCst);
+    let info = PlaybackStopInfo {
+        item_id: ITEM_ID,
+        play_session_id: Some("abc".to_owned()),
+        ..PlaybackStopInfo::default()
+    };
+    let mut request = tokio::spawn(send(
+        state_with_hls(sessions.clone(), user_data, hls.clone()),
+        "POST",
+        "/Sessions/Playing/Stopped",
+        Body::from(serde_json::to_vec(&info).unwrap()),
+    ));
+    tokio::select! {
+        () = hls.reached.notified() => {}
+        done = &mut request => panic!("the request ended before its kill: {done:?}"),
+    }
+    // The client hangs up while the kill waits.
+    request.abort();
+    assert!(request.await.unwrap_err().is_cancelled());
+    assert_eq!(sessions.calls.lock().unwrap().stops, 0);
+
+    hls.release.notify_one();
+    for _ in 0..100 {
+        if sessions.calls.lock().unwrap().stops == 1 {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(sessions.calls.lock().unwrap().stops, 1);
 }
 
 /// `PlaystateController.ReportPlaybackStopped` and `OnPlaybackStopped` kill

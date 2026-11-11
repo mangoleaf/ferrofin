@@ -253,16 +253,61 @@ impl SessionReporter for NoopSessionReporter {
     }
 }
 
-/// Deletes a killed HLS job's partial segment files from its cache directory.
+/// `DeletePartialStreamFiles` gives up after this many attempts (its
+/// `retryCount >= 10` guard).
+const PARTIAL_FILES_ATTEMPTS: u32 = 10;
+
+/// The wait before the first attempt: `KillTranscodingJob` calls
+/// `DeletePartialStreamFiles(…, 0, 1500)`.
+const PARTIAL_FILES_FIRST_DELAY: Duration = Duration::from_millis(1500);
+
+/// The wait before each retry: `DeletePartialStreamFiles` recurses with
+/// `delayMs: 500`.
+const PARTIAL_FILES_RETRY_DELAY: Duration = Duration::from_millis(500);
+
+/// Why one attempt at deleting a killed job's partial files left some behind.
+#[derive(Debug, thiserror::Error)]
+pub enum PartialFilesError {
+    /// The job's directory could not be listed (`GetFilePaths` threw).
+    #[error("listing the transcode directory failed: {0}")]
+    Listing(#[source] std::io::Error),
+    /// Some of the job's files could not be deleted (the `AggregateException`
+    /// `DeleteHlsPartialStreamFiles` throws).
+    #[error("{failed} file(s) could not be deleted, the first {}: {first}", path.display())]
+    Files {
+        /// How many of the job's files are left.
+        failed: usize,
+        /// The first of them.
+        path: PathBuf,
+        /// Its error.
+        #[source]
+        first: std::io::Error,
+    },
+}
+
+/// Deletes a killed job's partial files from its cache directory, one attempt.
 ///
-/// Port of `DeleteHlsPartialStreamFiles`: every file in `output_dir` whose name
-/// contains the playlist stem is removed. Behind a seam so kill/cleanup stays
-/// unit-testable against a temp dir without touching a real transcode cache.
-/// The teardown runs it on the blocking pool (hence `'static`) and waits for it.
+/// Port of `DeleteHlsPartialStreamFiles`, for both job types: every file in
+/// `output_dir` whose name contains the playlist stem is removed, which takes
+/// a progressive job's trimmed subtitle copy along with its output. Behind a
+/// seam so kill/cleanup stays unit-testable against a temp dir without
+/// touching a real transcode cache. The teardown runs each attempt on the
+/// blocking pool (hence `'static`) and retries as `DeletePartialStreamFiles`
+/// does.
 pub trait FileCleaner: Send + Sync + 'static {
     /// Deletes every file in `output_dir` whose filename contains
-    /// `playlist_stem` (case-insensitively). Port of `DeleteHlsPartialStreamFiles`.
-    fn delete_partial_stream_files(&self, output_dir: &Path, playlist_stem: &str);
+    /// `playlist_stem` (case-insensitively), going on past a file it cannot
+    /// delete. Port of `DeleteHlsPartialStreamFiles`.
+    ///
+    /// # Errors
+    ///
+    /// [`PartialFilesError::Listing`] when the directory cannot be listed, and
+    /// [`PartialFilesError::Files`] when any matching file is left.
+    fn delete_partial_stream_files(
+        &self,
+        output_dir: &Path,
+        playlist_stem: &str,
+    ) -> Result<(), PartialFilesError>;
 }
 
 /// The real [`FileCleaner`]: deletes files with `std::fs`.
@@ -270,22 +315,138 @@ pub trait FileCleaner: Send + Sync + 'static {
 pub struct FsFileCleaner;
 
 impl FileCleaner for FsFileCleaner {
-    fn delete_partial_stream_files(&self, output_dir: &Path, playlist_stem: &str) {
-        let Ok(entries) = std::fs::read_dir(output_dir) else {
-            return;
-        };
+    fn delete_partial_stream_files(
+        &self,
+        output_dir: &Path,
+        playlist_stem: &str,
+    ) -> Result<(), PartialFilesError> {
         let stem_lower = playlist_stem.to_ascii_lowercase();
-        for entry in entries.flatten() {
-            let name = entry.file_name();
-            if name
-                .to_string_lossy()
-                .to_ascii_lowercase()
-                .contains(&stem_lower)
+        let mut failed = 0;
+        let mut first = None;
+        for entry in std::fs::read_dir(output_dir).map_err(PartialFilesError::Listing)? {
+            let entry = entry.map_err(PartialFilesError::Listing)?;
+            // `GetFilePaths` lists files only.
+            if entry.file_type().is_ok_and(|kind| kind.is_dir())
+                || !entry
+                    .file_name()
+                    .to_string_lossy()
+                    .to_ascii_lowercase()
+                    .contains(&stem_lower)
             {
-                let _ = std::fs::remove_file(entry.path());
+                continue;
+            }
+            let path = entry.path();
+            tracing::debug!(path = %path.display(), "deleting HLS file");
+            match std::fs::remove_file(&path) {
+                // `File.Delete` succeeds on a file already gone.
+                Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
+                    // Upstream logs each one at Error; one line per segment is
+                    // too many, so the attempt's summary carries the count.
+                    tracing::debug!(path = %path.display(), %error, "deleting HLS file failed");
+                    failed += 1;
+                    first.get_or_insert((path, error));
+                }
+                _ => {}
             }
         }
+        first.map_or(Ok(()), |(path, first)| {
+            Err(PartialFilesError::Files {
+                failed,
+                path,
+                first,
+            })
+        })
     }
+}
+
+/// Whether `DeletePartialStreamFiles` retries after `error`: only an
+/// `IOException` does. Listing the HLS directory and deleting the progressive
+/// output throw one; a failed HLS file lands in an `AggregateException`, which
+/// is not one, and a progressive job lists no directory (its `File.Exists`
+/// throws nothing). Access denied (`EACCES`, `EPERM`) is .NET's
+/// `UnauthorizedAccessException`, not an `IOException` either.
+fn partial_files_retry(job_type: TranscodingJobType, error: &PartialFilesError) -> bool {
+    let (PartialFilesError::Listing(io) | PartialFilesError::Files { first: io, .. }) = error;
+    io.kind() != std::io::ErrorKind::PermissionDenied
+        && matches!(
+            (error, job_type),
+            (PartialFilesError::Listing(_), TranscodingJobType::Hls)
+                | (
+                    PartialFilesError::Files { .. },
+                    TranscodingJobType::Progressive
+                )
+        )
+}
+
+/// Deletes a killed job's partial files, waiting and retrying as
+/// `DeletePartialStreamFiles` does: [`PARTIAL_FILES_FIRST_DELAY`] before the
+/// first attempt, [`PARTIAL_FILES_RETRY_DELAY`] before each retry, at most
+/// [`PARTIAL_FILES_ATTEMPTS`] attempts. Each attempt runs on the blocking pool.
+///
+/// Upstream logs every failed attempt at Error. Here a failure that will be
+/// retried is a `warn!` and only the last one an `error!` (LOGGING.md rules 1
+/// and 2).
+async fn delete_partial_stream_files<C: FileCleaner>(
+    cleaner: std::sync::Arc<C>,
+    handle: TranscodingJobHandle,
+    output_dir: PathBuf,
+    stem: String,
+) {
+    let play_session_id = handle.play_session_id.as_deref().unwrap_or("");
+    let mut delay = PARTIAL_FILES_FIRST_DELAY;
+    for attempt in 1..=PARTIAL_FILES_ATTEMPTS {
+        tracing::info!(path = %handle.path, play_session_id, attempt, "deleting partial stream file(s)");
+        tokio::time::sleep(delay).await;
+        delay = PARTIAL_FILES_RETRY_DELAY;
+        let (cleaner, dir, stem, span) = (
+            std::sync::Arc::clone(&cleaner),
+            output_dir.clone(),
+            stem.clone(),
+            tracing::Span::current(),
+        );
+        let error = match tokio::task::spawn_blocking(move || {
+            span.in_scope(|| cleaner.delete_partial_stream_files(&dir, &stem))
+        })
+        .await
+        {
+            Ok(Ok(())) => return,
+            // `DeleteProgressivePartialStreamFiles` checks `File.Exists`, which
+            // is false when the directory is gone: nothing to delete.
+            Ok(Err(PartialFilesError::Listing(error)))
+                if handle.job_type == TranscodingJobType::Progressive
+                    && error.kind() == std::io::ErrorKind::NotFound =>
+            {
+                return;
+            }
+            Ok(Err(error)) => error,
+            Err(error) => {
+                tracing::error!(path = %handle.path, play_session_id, %error, "deleting partial stream file(s) failed");
+                return;
+            }
+        };
+        if attempt < PARTIAL_FILES_ATTEMPTS && partial_files_retry(handle.job_type, &error) {
+            tracing::warn!(path = %handle.path, play_session_id, attempt, %error, "deleting partial stream file(s) failed; retrying");
+        } else {
+            tracing::error!(path = %handle.path, play_session_id, attempt, %error, "deleting partial stream file(s) failed");
+            return;
+        }
+    }
+}
+
+/// What a teardown does with the job's partial output.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PartialFiles {
+    /// Kept (`delete_files = false`).
+    Keep,
+    /// Deleted before the teardown returns, as `KillTranscodingJob` awaits
+    /// `DeletePartialStreamFiles`.
+    Delete,
+    /// Deleted on a task of its own once the job is stopped, so the
+    /// teardown's caller does not wait out the deletion's delays; the session
+    /// layer hears of the kill before the files go, where `KillTranscodingJob`
+    /// closes the live stream after them. Carries the deletion trace's
+    /// `trigger` (LOGGING.md §4).
+    DeleteDetached(&'static str),
 }
 
 /// The live half of a job spawned by `start_ffmpeg`: the process handle plus the
@@ -1244,6 +1405,8 @@ impl<S: SessionReporter, C: FileCleaner> TranscodeManagerImpl<S, C> {
                 ));
             };
             if Instant::now() >= deadline {
+                // Awaited: a client retrying the failed start reuses the stem,
+                // and a deletion still pending would take the new job's files.
                 self.kill_and_remove(handle, true, false).await;
                 return Err(format!(
                     "timed out waiting for {} after {WAIT_FOR_FILE_TIMEOUT_MS}ms",
@@ -1445,8 +1608,7 @@ impl<S: SessionReporter, C: FileCleaner> TranscodeManagerImpl<S, C> {
     }
 
     /// Kills the process behind `handle` (if any) and removes it, deleting its
-    /// partial segment files when `delete_files` is set. Shared by the timeout
-    /// path, the kill-timer, and `kill_transcoding_jobs`.
+    /// partial segment files before it returns when `delete_files` is set.
     ///
     /// # Panics
     ///
@@ -1457,6 +1619,81 @@ impl<S: SessionReporter, C: FileCleaner> TranscodeManagerImpl<S, C> {
         delete_files: bool,
         close_live_stream: bool,
     ) {
+        let files = if delete_files {
+            PartialFiles::Delete
+        } else {
+            PartialFiles::Keep
+        };
+        self.remove_and_tear_down(handle, files, close_live_stream)
+            .await;
+    }
+
+    /// Stops the transcode jobs of `play_session_id` (or, when it is blank, of
+    /// `device_id`) and returns: their partial files are deleted after, each
+    /// job's on a task of its own.
+    ///
+    /// `HlsSegmentController.StopEncodingProcess` calls `KillTranscodingJobs`
+    /// without awaiting it, and each `KillTranscodingJob` runs up to its
+    /// first await before that call returns: the job is stopped and out of
+    /// the registry, and only `DeletePartialStreamFiles`' waits and deletes
+    /// are left.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal job-registry mutex has been poisoned.
+    pub async fn stop_transcoding_jobs(&self, device_id: &str, play_session_id: Option<&str>) {
+        drop(self.kill_matching(device_id, play_session_id, true).await);
+    }
+
+    /// Stops the jobs `KillTranscodingJobs(deviceId, playSessionId, _)`
+    /// matches, one after another, and returns the tasks deleting their
+    /// partial files when `delete_files` is set.
+    async fn kill_matching(
+        &self,
+        device_id: &str,
+        play_session_id: Option<&str>,
+        delete_files: bool,
+    ) -> Vec<tokio::task::JoinHandle<()>> {
+        let killed: Vec<TranscodingJobHandle> = {
+            let jobs = self.jobs.lock().expect("jobs lock poisoned");
+            jobs.iter()
+                .filter(|j| match play_session_id {
+                    Some(psid) if !psid.trim().is_empty() => j
+                        .handle
+                        .play_session_id
+                        .as_deref()
+                        .is_some_and(|s| s.eq_ignore_ascii_case(psid)),
+                    _ => j
+                        .handle
+                        .device_id
+                        .as_deref()
+                        .is_some_and(|d| d.eq_ignore_ascii_case(device_id)),
+                })
+                .map(|j| j.handle.clone())
+                .collect()
+        };
+        let files = if delete_files {
+            PartialFiles::DeleteDetached("api")
+        } else {
+            PartialFiles::Keep
+        };
+        let mut deletions = Vec::new();
+        for job in &killed {
+            // `KillTranscodingJobs` passes `closeLiveStream: false`; the
+            // session layer releases the stream on the stop report instead.
+            deletions.extend(self.remove_and_tear_down(job, files, false).await);
+        }
+        deletions
+    }
+
+    /// [`Self::kill_and_remove`] with the teardown's [`PartialFiles`]; returns
+    /// the task deleting the files when it is detached.
+    async fn remove_and_tear_down(
+        &self,
+        handle: &TranscodingJobHandle,
+        files: PartialFiles,
+        close_live_stream: bool,
+    ) -> Option<tokio::task::JoinHandle<()>> {
         let (display, running) = {
             let mut jobs = self.jobs.lock().expect("jobs lock poisoned");
             let idx = jobs.iter().position(|j| {
@@ -1468,8 +1705,8 @@ impl<S: SessionReporter, C: FileCleaner> TranscodeManagerImpl<S, C> {
                 None => (String::new(), None),
             }
         };
-        self.tear_down(handle, &display, running, delete_files, close_live_stream)
-            .await;
+        self.tear_down(handle, &display, running, files, close_live_stream)
+            .await
     }
 
     /// Kills an idle job taken out of the registry to admit `next`, another of
@@ -1493,12 +1730,21 @@ impl<S: SessionReporter, C: FileCleaner> TranscodeManagerImpl<S, C> {
         );
         let same_live_stream =
             handle.live_stream_id.is_some() && handle.live_stream_id == next.live_stream_id;
-        self.tear_down(&handle, &playing_label, running, true, !same_live_stream)
-            .await;
+        // The start does not wait out the deletion's delays: upstream has no
+        // eviction, and its ping timeout's kill holds up no request.
+        self.tear_down(
+            &handle,
+            &playing_label,
+            running,
+            PartialFiles::DeleteDetached("api"),
+            !same_live_stream,
+        )
+        .await;
     }
 
     /// Stops a job already out of the registry: its process, its rolling
-    /// deletion and, when `delete_files` is set, its partial output.
+    /// deletion and, unless `files` keeps it, its partial output. Returns the
+    /// task deleting that output when it is detached.
     ///
     /// A panic while stopping the process is logged and the file and session
     /// steps still run, as upstream's `KillTranscodingJob` goes on past a
@@ -1508,9 +1754,11 @@ impl<S: SessionReporter, C: FileCleaner> TranscodeManagerImpl<S, C> {
         handle: &TranscodingJobHandle,
         playing_label: &str,
         running: Option<RunningJob>,
-        delete_files: bool,
+        files: PartialFiles,
         close_live_stream: bool,
-    ) {
+    ) -> Option<tokio::task::JoinHandle<()>> {
+        let delete_files = files != PartialFiles::Keep;
+        let mut detached = None;
         if let Some(mut running) = running {
             // Stop rolling deletion before process and partial-file teardown.
             drop(running.segment_cleaner.take());
@@ -1555,22 +1803,35 @@ impl<S: SessionReporter, C: FileCleaner> TranscodeManagerImpl<S, C> {
                     .file_stem()
                     .map(|s| s.to_string_lossy().into_owned())
                     .unwrap_or_default();
-                // The directory scan and unlinks block, so they run on the
-                // blocking pool; awaited, so callers still go on only after them.
-                let cleaner = std::sync::Arc::clone(&self.file_cleaner);
-                let output_dir = running.output_dir;
-                if let Err(error) = tokio::task::spawn_blocking(move || {
-                    cleaner.delete_partial_stream_files(&output_dir, &stem);
-                })
-                .await
-                {
-                    tracing::error!(path = %handle.path, %error, "deleting a killed transcode's partial files failed");
+                let deletion = delete_partial_stream_files(
+                    std::sync::Arc::clone(&self.file_cleaner),
+                    handle.clone(),
+                    running.output_dir,
+                    stem,
+                );
+                if let PartialFiles::DeleteDetached(trigger) = files {
+                    // Background work starts its own trace (LOGGING.md §4),
+                    // linked to what started it.
+                    let span = tracing::info_span!(
+                        parent: None,
+                        "delete_partial_stream_files",
+                        path = %handle.path,
+                        play_session_id = handle.play_session_id.as_deref().unwrap_or(""),
+                        trigger,
+                    );
+                    span.follows_from(tracing::Span::current());
+                    detached = Some(tokio::spawn(tracing::Instrument::instrument(
+                        deletion, span,
+                    )));
+                } else {
+                    deletion.await;
                 }
             }
         }
         self.reporter
             .on_job_killed(handle, delete_files, close_live_stream)
             .await;
+        detached
     }
 
     /// One sweep of the idle reaper: kills every job that has **no active
@@ -1608,8 +1869,11 @@ impl<S: SessionReporter, C: FileCleaner> TranscodeManagerImpl<S, C> {
                 "killing idle transcode job (no consumer within the ping timeout)"
             );
             // `OnTranscodeKillTimerStopped`: `KillTranscodingJob(job, true, _)` —
-            // the consumer is gone for good, so the tuner goes back.
-            self.kill_and_remove(handle, true, true).await;
+            // the consumer is gone for good, so the tuner goes back. Each job
+            // has its own timer upstream and nothing waits on it, so the sweep
+            // does not wait out one job's deletion delays before the next.
+            self.remove_and_tear_down(handle, PartialFiles::DeleteDetached("schedule"), true)
+                .await;
         }
         idle.into_iter().map(|(handle, _)| handle).collect()
     }
@@ -1649,17 +1913,29 @@ impl<S: SessionReporter, C: FileCleaner> TranscodeManagerImpl<S, C> {
     /// clears the transcode cache before it starts a job, so nothing could
     /// read these jobs' output again. Upstream leaves them to their kill
     /// timers; killing them here stops an ffmpeg writing into a directory
-    /// the next lifetime purges (gl-141).
+    /// the next lifetime purges (gl-141). It returns once their partial files
+    /// are deleted, which `DeletePartialStreamFiles` first waits 1.5 s for:
+    /// a deletion left running could take the files of a job the next
+    /// lifetime starts on the same path.
     ///
     /// # Panics
     ///
     /// Panics if the internal job-registry mutex has been poisoned.
     pub async fn shutdown(&self) {
         let jobs = std::mem::take(&mut *self.jobs.lock().expect("jobs lock poisoned"));
-        for job in jobs {
-            self.tear_down(&job.handle, &job.display, job.running, true, true)
-                .await;
-        }
+        // Together, so the deletions' delays are waited out once, not per job;
+        // the session layer hears of each job as its teardown ends.
+        futures_util::future::join_all(jobs.into_iter().map(|job| async move {
+            self.tear_down(
+                &job.handle,
+                &job.display,
+                job.running,
+                PartialFiles::Delete,
+                true,
+            )
+            .await;
+        }))
+        .await;
     }
 
     /// Marks a consumer active on the job registered for `path`/`job_type`,
@@ -2084,32 +2360,17 @@ impl<S: SessionReporter, C: FileCleaner> TranscodeManager for TranscodeManagerIm
         play_session_id: Option<&str>,
         delete_files: bool,
     ) -> Result<(), ServiceError> {
-        // Collect the matching handles under the lock, then tear each down via
-        // `kill_and_remove` (child.kill + partial-file delete + reporter) so a
-        // live spawned job's process is actually stopped, not just dropped.
-        let killed: Vec<TranscodingJobHandle> = {
-            let jobs = self.jobs.lock().expect("jobs lock poisoned");
-            jobs.iter()
-                .filter(|j| match play_session_id {
-                    Some(psid) if !psid.trim().is_empty() => j
-                        .handle
-                        .play_session_id
-                        .as_deref()
-                        .is_some_and(|s| s.eq_ignore_ascii_case(psid)),
-                    _ => j
-                        .handle
-                        .device_id
-                        .as_deref()
-                        .is_some_and(|d| d.eq_ignore_ascii_case(device_id)),
-                })
-                .map(|j| j.handle.clone())
-                .collect()
-        };
-
-        for job in &killed {
-            // `KillTranscodingJobs` passes `closeLiveStream: false`; the session
-            // layer releases the stream on the stop report instead.
-            self.kill_and_remove(job, delete_files, false).await;
+        // The jobs are stopped one after another, as each `KillTranscodingJob`
+        // runs its `Stop` before `Task.WhenAll` sees it; their deletions run
+        // on tasks of their own, together, and are awaited here (a caller that
+        // gives up waiting leaves them running).
+        for deletion in self
+            .kill_matching(device_id, play_session_id, delete_files)
+            .await
+        {
+            if let Err(error) = deletion.await {
+                tracing::error!(%error, "deleting a killed transcode's partial files failed");
+            }
         }
         Ok(())
     }
@@ -2591,8 +2852,8 @@ mod start_ffmpeg_tests {
     use crate::transcoding::segment_transcoder::{FakeScript, FakeSegmentTranscoder};
 
     use super::{
-        FileCleaner, FsFileCleaner, HLS_PING_TIMEOUT_MS, NoopSessionReporter, StartFfMpegRequest,
-        TranscodeManagerImpl, ffmpeg_log_file_name,
+        FileCleaner, FsFileCleaner, HLS_PING_TIMEOUT_MS, NoopSessionReporter, PartialFilesError,
+        StartFfMpegRequest, TranscodeManagerImpl, ffmpeg_log_file_name,
     };
 
     /// Builds a `StartFfMpegRequest` for `state`/`output_path` with `args`,
@@ -2972,8 +3233,9 @@ mod start_ffmpeg_tests {
 
     /// With no stop report, the idle reaper takes the failed start's job and
     /// output at its ping timeout, where upstream's leaked request count keeps
-    /// them (gl-1373).
-    #[tokio::test]
+    /// them (gl-1373). The reaper deletes the output on a task of its own,
+    /// after `DeletePartialStreamFiles`' first wait (gl-1402).
+    #[tokio::test(start_paused = true)]
     async fn the_idle_reaper_takes_a_failed_start_and_its_output() {
         let tmp = tempfile::tempdir().unwrap();
         let output = tmp.path().join("s").join("out.mkv");
@@ -2988,11 +3250,18 @@ mod start_ffmpeg_tests {
         m.start_ffmpeg(&fake, ffmpeg_req(&st, &output, vec![]))
             .await
             .unwrap_err();
+        assert!(output.exists(), "the failed start keeps its output");
         // The start's consumer mark ended with it: past the ping timeout
         // (a fake clock: any elapsed time exceeds -1), the job is idle.
         m.jobs.lock().unwrap()[0].ping_timeout_ms = -1;
         assert_eq!(m.reap_idle_jobs().await.len(), 1);
         assert_eq!(m.active_job_count(), 0);
+        for _ in 0..100 {
+            if !output.exists() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
         assert!(!output.exists(), "the reaper deletes the output");
     }
 
@@ -3158,8 +3427,12 @@ mod start_ffmpeg_tests {
     }
 
     impl FileCleaner for RecordingCleaner {
-        fn delete_partial_stream_files(&self, output_dir: &Path, playlist_stem: &str) {
-            FsFileCleaner.delete_partial_stream_files(output_dir, playlist_stem);
+        fn delete_partial_stream_files(
+            &self,
+            output_dir: &Path,
+            playlist_stem: &str,
+        ) -> Result<(), PartialFilesError> {
+            let deleted = FsFileCleaner.delete_partial_stream_files(output_dir, playlist_stem);
             // Recorded once the files are gone, so a kill that returned before
             // its deletion finished leaves no call behind.
             self.calls.lock().unwrap().push((
@@ -3167,10 +3440,14 @@ mod start_ffmpeg_tests {
                 playlist_stem.to_owned(),
                 std::thread::current().id(),
             ));
+            deleted
         }
     }
 
-    #[tokio::test]
+    /// `KillTranscodingJobs`, awaited as the stop reports await it, returns
+    /// once the partial files are gone, after `DeletePartialStreamFiles`'
+    /// first wait; the deletion runs on the blocking pool.
+    #[tokio::test(start_paused = true)]
     async fn kill_transcoding_jobs_kills_child_and_deletes_partial_files() {
         let tmp = tempfile::tempdir().unwrap();
         let out_dir = tmp.path().join("s");
@@ -3190,11 +3467,17 @@ mod start_ffmpeg_tests {
             .unwrap();
         assert!(playlist.exists());
 
+        let started = tokio::time::Instant::now();
         m.kill_transcoding_jobs("dev", Some("sess"), true)
             .await
             .unwrap();
 
         assert_eq!(m.active_job_count(), 0);
+        let took = started.elapsed();
+        assert!(
+            took >= super::PARTIAL_FILES_FIRST_DELAY && took < super::PARTIAL_FILES_FIRST_DELAY * 2,
+            "{took:?}"
+        );
         let calls = cleaner.calls.lock().unwrap();
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].1, "out"); // playlist stem
@@ -3204,6 +3487,30 @@ mod start_ffmpeg_tests {
         // The partial files (containing the stem "out") are gone.
         assert!(!out_dir.join("out0.ts").exists());
         assert!(!playlist.exists());
+    }
+
+    /// `StopEncodingProcess` does not await `KillTranscodingJobs`: the jobs are
+    /// stopped and out of the registry when it answers, and their partial files
+    /// go after `DeletePartialStreamFiles`' first wait.
+    #[tokio::test(start_paused = true)]
+    async fn stop_transcoding_jobs_returns_before_the_deletion() {
+        let tmp = tempfile::tempdir().unwrap();
+        let m = manager();
+        let playlist = start_in(&m, tmp.path()).await;
+
+        let started = tokio::time::Instant::now();
+        m.stop_transcoding_jobs("dev", Some("sess")).await;
+
+        assert_eq!(m.active_job_count(), 0);
+        assert!(started.elapsed() < super::PARTIAL_FILES_FIRST_DELAY);
+        assert!(playlist.exists(), "deleted before the first wait");
+        for _ in 0..100 {
+            if !playlist.exists() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        assert!(!playlist.exists(), "the stopped job's files were kept");
     }
 
     #[tokio::test]
@@ -3271,6 +3578,69 @@ mod start_ffmpeg_tests {
         let killed = m.reap_idle_jobs().await;
         assert_eq!(killed.len(), 1);
         assert_eq!(m.active_job_count(), 0, "idle reaper removed the job");
+    }
+
+    /// Starts a fake job writing `out.m3u8` and `out0.ts` into `dir`.
+    async fn start_in(
+        m: &TranscodeManagerImpl<NoopSessionReporter>,
+        dir: &Path,
+    ) -> std::path::PathBuf {
+        let fake = FakeSegmentTranscoder::new(FakeScript {
+            segment_files: vec!["out0.ts".to_owned()],
+            extra_files: vec!["out.m3u8".to_owned()],
+            ..FakeScript::default()
+        });
+        let playlist = dir.join("out.m3u8");
+        let st = state(&playlist, Some(&playlist));
+        m.start_ffmpeg(&fake, ffmpeg_req(&st, &playlist, vec![]))
+            .await
+            .unwrap();
+        playlist
+    }
+
+    /// The idle reaper stands in for upstream's per-job kill timer, which
+    /// nothing waits on: the sweep does not wait out the deletion's delays,
+    /// and the files go after them.
+    #[tokio::test(start_paused = true)]
+    async fn the_idle_reaper_leaves_the_deletion_to_a_task_of_its_own() {
+        let tmp = tempfile::tempdir().unwrap();
+        let m = manager();
+        let playlist = start_in(&m, tmp.path()).await;
+        m.jobs.lock().unwrap()[0].ping_timeout_ms = -1;
+
+        let started = tokio::time::Instant::now();
+        assert_eq!(m.reap_idle_jobs().await.len(), 1);
+        assert!(started.elapsed() < super::PARTIAL_FILES_FIRST_DELAY);
+        assert!(playlist.exists(), "deleted before the first wait");
+        for _ in 0..100 {
+            if !playlist.exists() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        assert!(!playlist.exists(), "the reaped job's files were kept");
+    }
+
+    /// The end of a lifetime returns once its jobs' files are deleted, and
+    /// the jobs wait out the first delay together, not one after another.
+    #[tokio::test(start_paused = true)]
+    async fn shutdown_waits_for_the_deletions_together() {
+        let tmp = tempfile::tempdir().unwrap();
+        let m = manager();
+        let playlists = [
+            start_in(&m, &tmp.path().join("a")).await,
+            start_in(&m, &tmp.path().join("b")).await,
+        ];
+
+        let started = tokio::time::Instant::now();
+        m.shutdown().await;
+
+        let took = started.elapsed();
+        assert!(
+            took >= super::PARTIAL_FILES_FIRST_DELAY && took < super::PARTIAL_FILES_FIRST_DELAY * 2,
+            "{took:?}"
+        );
+        assert!(playlists.iter().all(|playlist| !playlist.exists()));
     }
 
     /// Drives `start` until its job is registered with a running child, i.e.
@@ -4765,5 +5135,253 @@ pub(super) mod throttle_tests {
         );
         drop(observer);
         assert_eq!(manager.jobs.lock().unwrap()[0].active_request_count, 0);
+    }
+}
+
+/// Tests for the partial-file deletion that ends `KillTranscodingJob`: one
+/// [`FileCleaner`] attempt and `DeletePartialStreamFiles`' waits and retries.
+#[cfg(test)]
+mod partial_files_tests {
+    use std::io::ErrorKind;
+    use std::path::Path;
+    use std::sync::{Arc, Mutex};
+
+    use ferrofin_traits::media_encoding::{TranscodingJobHandle, TranscodingJobType};
+
+    use super::{
+        FileCleaner, FsFileCleaner, PARTIAL_FILES_FIRST_DELAY, PARTIAL_FILES_RETRY_DELAY,
+        PartialFilesError, delete_partial_stream_files,
+    };
+    use crate::configuration::reader::tests::CapturedLogs;
+
+    /// Fails its first `failures` attempts with an error of `kind`, from the
+    /// listing or from the files, and counts every attempt.
+    struct FailingCleaner {
+        failures: usize,
+        listing: bool,
+        kind: ErrorKind,
+        attempts: Mutex<usize>,
+    }
+
+    impl FileCleaner for FailingCleaner {
+        fn delete_partial_stream_files(
+            &self,
+            _output_dir: &Path,
+            _playlist_stem: &str,
+        ) -> Result<(), PartialFilesError> {
+            let mut attempts = self.attempts.lock().unwrap();
+            *attempts += 1;
+            if *attempts > self.failures {
+                return Ok(());
+            }
+            let error = std::io::Error::from(self.kind);
+            Err(if self.listing {
+                PartialFilesError::Listing(error)
+            } else {
+                PartialFilesError::Files {
+                    failed: 3,
+                    path: "/t/out0.ts".into(),
+                    first: error,
+                }
+            })
+        }
+    }
+
+    /// `DeletePartialStreamFiles` logs each attempt, waits 1500 ms before the
+    /// first and 500 ms before each retry, and makes at most ten. Only an
+    /// `IOException` is retried: deleting the progressive output or listing the
+    /// HLS directory, not an HLS file (an `AggregateException`) and not access
+    /// denied (an `UnauthorizedAccessException`). A progressive job lists no
+    /// directory upstream: one that is gone holds no output. A failure that
+    /// will be retried is a warning, and only the last one an error.
+    #[rstest::rstest]
+    #[case::progressive_output_kept(
+        TranscodingJobType::Progressive,
+        false,
+        ErrorKind::ResourceBusy,
+        usize::MAX,
+        10,
+        9,
+        1
+    )]
+    #[case::hls_files_kept(
+        TranscodingJobType::Hls,
+        false,
+        ErrorKind::ResourceBusy,
+        usize::MAX,
+        1,
+        0,
+        1
+    )]
+    #[case::hls_directory_unlisted(
+        TranscodingJobType::Hls,
+        true,
+        ErrorKind::NotFound,
+        usize::MAX,
+        10,
+        9,
+        1
+    )]
+    #[case::progressive_directory_gone(
+        TranscodingJobType::Progressive,
+        true,
+        ErrorKind::NotFound,
+        usize::MAX,
+        1,
+        0,
+        0
+    )]
+    #[case::progressive_directory_unlisted(
+        TranscodingJobType::Progressive,
+        true,
+        ErrorKind::ResourceBusy,
+        usize::MAX,
+        1,
+        0,
+        1
+    )]
+    #[case::access_denied(
+        TranscodingJobType::Progressive,
+        false,
+        ErrorKind::PermissionDenied,
+        usize::MAX,
+        1,
+        0,
+        1
+    )]
+    #[case::a_failure_that_clears(
+        TranscodingJobType::Progressive,
+        false,
+        ErrorKind::ResourceBusy,
+        2,
+        3,
+        2,
+        0
+    )]
+    #[case::deleted_at_once(TranscodingJobType::Hls, false, ErrorKind::ResourceBusy, 0, 1, 0, 0)]
+    #[tokio::test(start_paused = true)]
+    async fn the_deletion_waits_and_retries_as_delete_partial_stream_files_does(
+        #[case] job_type: TranscodingJobType,
+        #[case] listing: bool,
+        #[case] kind: ErrorKind,
+        #[case] failures: usize,
+        #[case] attempts: usize,
+        #[case] warnings: usize,
+        #[case] errors: usize,
+    ) {
+        let cleaner = Arc::new(FailingCleaner {
+            failures,
+            listing,
+            kind,
+            attempts: Mutex::new(0),
+        });
+        let handle = TranscodingJobHandle {
+            play_session_id: Some("s1".to_owned()),
+            path: "/t/out.m3u8".to_owned(),
+            job_type,
+            device_id: Some("dev1".to_owned()),
+            live_stream_id: None,
+        };
+
+        let logs = CapturedLogs::default();
+        let guard = logs.install();
+        let started = tokio::time::Instant::now();
+        delete_partial_stream_files(Arc::clone(&cleaner), handle, "/t".into(), "out".to_owned())
+            .await;
+        drop(guard);
+
+        assert_eq!(*cleaner.attempts.lock().unwrap(), attempts);
+        let retries = u32::try_from(attempts - 1).unwrap();
+        assert_eq!(
+            started.elapsed(),
+            PARTIAL_FILES_FIRST_DELAY + PARTIAL_FILES_RETRY_DELAY * retries
+        );
+        let deleting = logs.lines_at("INFO");
+        assert!(
+            deleting.len() == attempts
+                && deleting
+                    .iter()
+                    .all(|line| line.contains("deleting partial stream file(s)")
+                        && line.contains("/t/out.m3u8")),
+            "{deleting:#?}"
+        );
+        let warned = logs.lines_at("WARN");
+        assert_eq!(warned.len(), warnings, "{warned:#?}");
+        let failed = logs.lines_at("ERROR");
+        assert!(
+            failed.len() == errors
+                && failed
+                    .iter()
+                    .all(|line| line.contains("play_session_id=\"s1\"")),
+            "{failed:#?}"
+        );
+    }
+
+    /// One attempt deletes every file whose name holds the stem, in any case,
+    /// and nothing else: `GetFilePaths` lists files, not directories.
+    #[test]
+    fn an_attempt_deletes_the_jobs_files_only() {
+        let tmp = tempfile::tempdir().unwrap();
+        for name in ["out.m3u8", "out0.ts", "OUT1.ts", "other.ts"] {
+            std::fs::write(tmp.path().join(name), b"").unwrap();
+        }
+        std::fs::create_dir(tmp.path().join("out.d")).unwrap();
+
+        FsFileCleaner
+            .delete_partial_stream_files(tmp.path(), "out")
+            .expect("deleted");
+
+        let mut left: Vec<String> = std::fs::read_dir(tmp.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        left.sort();
+        assert_eq!(left, ["other.ts", "out.d"]);
+    }
+
+    /// A file that cannot be deleted does not end the attempt: every matching
+    /// file is tried, and the attempt reports how many are left and the first
+    /// error. Skipped as root, which a read-only directory does not stop.
+    #[cfg(unix)]
+    #[test]
+    fn an_attempt_goes_on_past_a_file_it_cannot_delete() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        for name in ["out0.ts", "out1.ts", "other.ts"] {
+            std::fs::write(tmp.path().join(name), b"").unwrap();
+        }
+        let mode = |mode| {
+            std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(mode)).unwrap();
+        };
+        mode(0o555);
+        if std::fs::write(tmp.path().join("probe"), b"").is_ok() {
+            mode(0o755);
+            return;
+        }
+
+        let error = FsFileCleaner
+            .delete_partial_stream_files(tmp.path(), "out")
+            .unwrap_err();
+        mode(0o755);
+
+        assert!(
+            matches!(&error, PartialFilesError::Files { failed: 2, first, .. }
+                if first.kind() == ErrorKind::PermissionDenied),
+            "{error:?}"
+        );
+    }
+
+    /// A directory that cannot be listed fails the attempt, so it is retried,
+    /// rather than ending the deletion with nothing said.
+    #[test]
+    fn an_unlisted_directory_fails_the_attempt() {
+        let tmp = tempfile::tempdir().unwrap();
+        let error = FsFileCleaner
+            .delete_partial_stream_files(&tmp.path().join("gone"), "out")
+            .unwrap_err();
+        assert!(
+            matches!(&error, PartialFilesError::Listing(io) if io.kind() == ErrorKind::NotFound),
+            "{error:?}"
+        );
     }
 }

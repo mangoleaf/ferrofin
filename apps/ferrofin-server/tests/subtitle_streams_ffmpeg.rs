@@ -964,7 +964,14 @@ async fn without_a_readable_version_a_seeked_text_embed_reads_a_copy_cut_to_the_
                 .await;
         }
     }
+    // The files go after `DeletePartialStreamFiles`' 1.5 s wait.
     for copy in copies {
+        for _ in 0..100 {
+            if !Path::new(&copy).exists() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
         assert!(!Path::new(&copy).exists(), "deleted with its job: {copy}");
     }
 }
