@@ -2927,13 +2927,28 @@ mod tests {
 
     /// Seeds a movie with a runtime, for the play-state heuristics.
     async fn seed_movie_with_runtime(db: &Database, id: Uuid, runtime_ticks: i64) {
-        seed_item(db, id, BaseItemKind::Movie).await;
-        sqlx::query(r#"UPDATE "BaseItems" SET "RunTimeTicks" = ?2 WHERE "Id" = ?1"#)
-            .bind(guid_to_db(id))
-            .bind(runtime_ticks)
-            .execute(db.writer())
-            .await
-            .expect("set runtime");
+        seed_playable(db, id, BaseItemKind::Movie, runtime_ticks, None).await;
+    }
+
+    /// Seeds an item for the play-state heuristics, with its runtime (none
+    /// unless `runtime_ticks` is positive) and stored `ExtraType`.
+    async fn seed_playable(
+        db: &Database,
+        id: Uuid,
+        kind: BaseItemKind,
+        runtime_ticks: i64,
+        extra_type: Option<i32>,
+    ) {
+        seed_item(db, id, kind).await;
+        sqlx::query(
+            r#"UPDATE "BaseItems" SET "RunTimeTicks" = ?2, "ExtraType" = ?3 WHERE "Id" = ?1"#,
+        )
+        .bind(guid_to_db(id))
+        .bind((runtime_ticks > 0).then_some(runtime_ticks))
+        .bind(extra_type)
+        .execute(db.writer())
+        .await
+        .expect("set runtime");
     }
 
     /// The update a client sends when a user taps the heart.

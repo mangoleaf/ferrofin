@@ -74,14 +74,7 @@ async fn play_report_resume_thresholds(
     let db = test_db().await;
     let (user, item) = (Uuid::from_u128(1), Uuid::from_u128(2));
     seed_user(&db, user).await;
-    seed_item(&db, item, kind).await;
-    sqlx::query(r#"UPDATE "BaseItems" SET "RunTimeTicks" = ?2, "ExtraType" = ?3 WHERE "Id" = ?1"#)
-        .bind(guid_to_db(item))
-        .bind((runtime > 0).then_some(runtime))
-        .bind(extra_type)
-        .execute(db.writer())
-        .await
-        .expect("set runtime");
+    seed_playable(&db, item, kind, runtime, extra_type).await;
     let mut config = default_server_configuration();
     setting(&mut config);
     let mgr = FerrofinUserDataManager::new(db, Arc::new(FixedConfig { config }));
