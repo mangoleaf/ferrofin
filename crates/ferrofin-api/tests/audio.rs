@@ -144,9 +144,6 @@ impl UserManager for OkUsers {
     async fn get_users(&self) -> Result<Vec<UserEntity>, ServiceError> {
         unimplemented!()
     }
-    async fn get_user_ids(&self) -> Result<Vec<Uuid>, ServiceError> {
-        unimplemented!()
-    }
     async fn initialize(&self) -> Result<(), ServiceError> {
         unimplemented!()
     }
@@ -379,13 +376,6 @@ impl LibraryManager for StreamLibrary {
         _q: &InternalItemsQuery,
         _c: ferrofin_model::data::CollectionType,
     ) -> Result<Vec<BaseItemEntity>, ServiceError> {
-        unimplemented!()
-    }
-    async fn create_items(
-        &self,
-        _i: &[BaseItemEntity],
-        _p: Option<Uuid>,
-    ) -> Result<(), ServiceError> {
         unimplemented!()
     }
     async fn update_items(

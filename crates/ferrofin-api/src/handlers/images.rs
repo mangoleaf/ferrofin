@@ -1244,7 +1244,33 @@ async fn serve_named_image(
     .await
 }
 
-/// Builds a `GET`/`HEAD` handler pair for a by-name image controller of `kind`.
+/// `{name}`, the `[FromRoute, Required] string` of the by-name image routes,
+/// registered as `{name}` (Persons, Studios).
+struct ImageName;
+
+impl RouteParameter for ImageName {
+    const NAME: &'static str = "name";
+}
+
+/// [`ImageName`] on the Genres and `MusicGenres` routes, registered as
+/// `{genreName}`.
+struct GenreImageName;
+
+impl RouteParameter for GenreImageName {
+    const NAME: &'static str = "name";
+    const ROUTE_NAME: &'static str = "genreName";
+}
+
+/// [`ImageName`] on the Artists route, registered as `{itemId}`.
+struct ArtistImageName;
+
+impl RouteParameter for ArtistImageName {
+    const NAME: &'static str = "name";
+    const ROUTE_NAME: &'static str = "itemId";
+}
+
+/// Builds a `GET`/`HEAD` handler pair for a by-name image controller of `kind`,
+/// binding the name through the `$name` [`RouteParameter`].
 ///
 /// Each by-name controller (Genres, Studios, Persons, Artists, `MusicGenres`) has
 /// the same two routes — `…/{name}/Images/{imageType}` and the `/{imageIndex}`
@@ -1252,14 +1278,15 @@ async fn serve_named_image(
 /// both handlers so the six controllers reuse one code path instead of copying
 /// it, matching the shared `GetImageInternal` fan-in in C#.
 macro_rules! by_name_image_handlers {
-    ($kind:expr, $base:ident, $indexed:ident) => {
+    ($kind:expr, $name:ty, $base:ident, $indexed:ident) => {
         // The Artists controller exposes only the indexed route, so its `$base`
         // handler is generated-but-unused; the others use both. One `allow`
         // keeps the shared macro simple rather than forking it per controller.
         #[allow(dead_code)]
         async fn $base(
             State(state): State<AppState>,
-            Path((name, image_type)): Path<(String, String)>,
+            RequiredRouteString(name, _): RequiredRouteString<$name>,
+            Path((_, image_type)): Path<(String, String)>,
             Query(query): Query<ImageQuery>,
             request: Request,
         ) -> Result<Response, ApiError> {
@@ -1270,7 +1297,8 @@ macro_rules! by_name_image_handlers {
 
         async fn $indexed(
             State(state): State<AppState>,
-            Path((name, image_type, image_index)): Path<(String, String, i32)>,
+            RequiredRouteString(name, _): RequiredRouteString<$name>,
+            Path((_, image_type, image_index)): Path<(String, String, i32)>,
             Query(query): Query<ImageQuery>,
             request: Request,
         ) -> Result<Response, ApiError> {
@@ -1291,26 +1319,31 @@ macro_rules! by_name_image_handlers {
 
 by_name_image_handlers!(
     BaseItemKind::Genre,
+    GenreImageName,
     get_genre_image,
     get_genre_image_by_index
 );
 by_name_image_handlers!(
     BaseItemKind::MusicGenre,
+    GenreImageName,
     get_music_genre_image,
     get_music_genre_image_by_index
 );
 by_name_image_handlers!(
     BaseItemKind::Studio,
+    ImageName,
     get_studio_image,
     get_studio_image_by_index
 );
 by_name_image_handlers!(
     BaseItemKind::Person,
+    ImageName,
     get_person_image,
     get_person_image_by_index
 );
 by_name_image_handlers!(
     BaseItemKind::MusicArtist,
+    ArtistImageName,
     get_artist_image,
     get_artist_image_by_index
 );

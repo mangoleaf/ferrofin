@@ -121,9 +121,6 @@ impl UserManager for OkUsers {
     async fn get_users(&self) -> Result<Vec<UserEntity>, ServiceError> {
         unimplemented!()
     }
-    async fn get_user_ids(&self) -> Result<Vec<Uuid>, ServiceError> {
-        unimplemented!()
-    }
     async fn initialize(&self) -> Result<(), ServiceError> {
         unimplemented!()
     }
@@ -335,13 +332,6 @@ impl LibraryManager for OkLibrary {
     ) -> Result<Vec<BaseItemEntity>, ServiceError> {
         unimplemented!()
     }
-    async fn create_items(
-        &self,
-        _items: &[BaseItemEntity],
-        _parent_id: Option<Uuid>,
-    ) -> Result<(), ServiceError> {
-        unimplemented!()
-    }
     async fn update_items(
         &self,
         _items: &[BaseItemEntity],
@@ -466,12 +456,6 @@ fn entity_to_dto(item: &BaseItemEntity) -> BaseItemDto {
 
 #[async_trait]
 impl DtoService for OkDto {
-    async fn get_primary_image_aspect_ratio(
-        &self,
-        _item_id: Uuid,
-    ) -> Result<Option<f64>, ServiceError> {
-        unimplemented!()
-    }
     async fn get_base_item_dto(
         &self,
         item: &BaseItemEntity,
@@ -490,15 +474,6 @@ impl DtoService for OkDto {
         _skip_visibility_check: bool,
     ) -> Result<Vec<BaseItemDto>, ServiceError> {
         Ok(items.iter().map(entity_to_dto).collect())
-    }
-    async fn get_item_by_name_dto(
-        &self,
-        item: &BaseItemEntity,
-        _options: &DtoOptions,
-        _tagged_item_ids: Option<&[Uuid]>,
-        _user: Option<&UserEntity>,
-    ) -> Result<BaseItemDto, ServiceError> {
-        Ok(entity_to_dto(item))
     }
 }
 
@@ -676,14 +651,6 @@ impl SessionManager for OkSessions {
     async fn send_message_to_user_sessions(
         &self,
         _user_ids: &[Uuid],
-        _message_type: ferrofin_model::session::SessionMessageType,
-        _data: &str,
-    ) -> Result<(), ServiceError> {
-        unimplemented!()
-    }
-    async fn send_message_to_user_device_sessions(
-        &self,
-        _device_id: &str,
         _message_type: ferrofin_model::session::SessionMessageType,
         _data: &str,
     ) -> Result<(), ServiceError> {
@@ -1814,12 +1781,6 @@ impl ferrofin_traits::devices::DeviceManager for ProfileDevices {
         &self,
         _query: &ferrofin_traits::devices::DeviceQuery,
     ) -> Result<QueryResult<ferrofin_db::entities::security::DeviceEntity>, ServiceError> {
-        unimplemented!()
-    }
-    async fn get_device_infos(
-        &self,
-        _query: &ferrofin_traits::devices::DeviceQuery,
-    ) -> Result<QueryResult<ferrofin_model::devices::DeviceInfo>, ServiceError> {
         unimplemented!()
     }
     async fn get_devices_for_user(

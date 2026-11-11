@@ -125,7 +125,7 @@ async fn an_item_update_leaves_other_items_alone() {
 }
 
 // An empty-GUID row an older Ferrofin (or Jellyfin 10.11's GET) stored is
-// left where it is: no item reads it, and the list leaves it out.
+// left where it is: no item reads it.
 #[tokio::test]
 async fn an_empty_guid_row_is_left_alone() {
     let (db, user, mgr) = manager().await;
@@ -146,16 +146,8 @@ async fn an_empty_guid_row_is_left_alone() {
         .get_item_display_preferences(user, item, "client")
         .await
         .expect("get");
-    let listed = mgr
-        .list_item_display_preferences(user, "client")
-        .await
-        .expect("list");
 
     assert_eq!(prefs.sort_by, "SortName");
-    assert_eq!(
-        listed.iter().map(|p| p.item_id.clone()).collect::<Vec<_>>(),
-        [guid_to_db(item)]
-    );
     assert_eq!(
         rows(&db, user).await,
         [

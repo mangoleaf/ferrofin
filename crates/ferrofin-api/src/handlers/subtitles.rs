@@ -46,11 +46,15 @@ use uuid::Uuid;
 
 use crate::auth::{RequireAdmin, RequireAuth, RequireSubtitleManagement};
 use crate::error::{ApiError, ProblemStatus};
-use crate::extract::{DotnetGuid, JsonBody, Query, upload_body_limit};
+use crate::extract::{
+    DotnetGuid, JsonBody, Query, RequiredRouteString, RouteParameter, blank_route_values,
+    upload_body_limit,
+};
 use crate::handlers::image_upload::decode_base64;
 use crate::handlers::items::resolve_user_opt;
 use crate::handlers::streaming::{
     opened_file_response, physical_file_precondition, require_streamable_item,
+    stream_route_container,
 };
 use crate::handlers::{queue_high_priority_refresh, run_item_refresh};
 use crate::state::AppState;
@@ -236,6 +240,13 @@ struct RemoteSearchQuery {
     is_perfect_match: Option<bool>,
 }
 
+/// `{language}`, the `[FromRoute, Required] string` of `SearchRemoteSubtitles`.
+struct Language;
+
+impl RouteParameter for Language {
+    const NAME: &'static str = "language";
+}
+
 /// `GET /Items/{itemId}/RemoteSearch/Subtitles/{language}` — search providers.
 ///
 /// Port of `SubtitleController.SearchRemoteSubtitles`: `404` for a missing item,
@@ -257,7 +268,8 @@ struct RemoteSearchQuery {
 async fn search_remote_subtitles(
     State(state): State<AppState>,
     RequireSubtitleManagement(auth): RequireSubtitleManagement,
-    Path((DotnetGuid(item_id), language)): Path<(DotnetGuid, String)>,
+    RequiredRouteString(language, _): RequiredRouteString<Language>,
+    Path((DotnetGuid(item_id), _)): Path<(DotnetGuid, String)>,
     Query(query): Query<RemoteSearchQuery>,
 ) -> Result<Json<Vec<RemoteSubtitleInfo>>, ApiError> {
     require_video(&state, item_id, &auth).await?;
@@ -272,6 +284,15 @@ async fn search_remote_subtitles(
     };
     let results = state.subtitles.search_subtitles(&request).await?;
     Ok(Json(results))
+}
+
+/// `{subtitleId}`, the `[FromRoute, Required] string` of
+/// `DownloadRemoteSubtitles`, which the router registers as `{language}`.
+struct DownloadedSubtitleId;
+
+impl RouteParameter for DownloadedSubtitleId {
+    const NAME: &'static str = "subtitleId";
+    const ROUTE_NAME: &'static str = "language";
 }
 
 /// `POST /Items/{itemId}/RemoteSearch/Subtitles/{subtitleId}` — download one.
@@ -297,7 +318,8 @@ async fn search_remote_subtitles(
 async fn download_remote_subtitles(
     State(state): State<AppState>,
     RequireSubtitleManagement(auth): RequireSubtitleManagement,
-    Path((DotnetGuid(item_id), subtitle_id)): Path<(DotnetGuid, String)>,
+    RequiredRouteString(subtitle_id, _): RequiredRouteString<DownloadedSubtitleId>,
+    Path((DotnetGuid(item_id), _)): Path<(DotnetGuid, String)>,
 ) -> Result<StatusCode, ApiError> {
     require_video(&state, item_id, &auth).await?;
     let downloaded = async {
@@ -312,6 +334,13 @@ async fn download_remote_subtitles(
         tracing::error!(%item_id, ?subtitle_id, %error, "Error downloading subtitles");
     }
     Ok(StatusCode::NO_CONTENT)
+}
+
+/// `{subtitleId}`, the `[FromRoute, Required] string` of `GetRemoteSubtitles`.
+struct RemoteSubtitleId;
+
+impl RouteParameter for RemoteSubtitleId {
+    const NAME: &'static str = "subtitleId";
 }
 
 /// `GET /Providers/Subtitles/Subtitles/{subtitleId}` — fetch a remote subtitle.
@@ -330,7 +359,7 @@ async fn download_remote_subtitles(
 async fn get_remote_subtitles(
     State(state): State<AppState>,
     RequireSubtitleManagement(_auth): RequireSubtitleManagement,
-    Path(subtitle_id): Path<String>,
+    RequiredRouteString(subtitle_id, _): RequiredRouteString<RemoteSubtitleId>,
 ) -> Result<Response, ApiError> {
     let result = state.subtitles.get_remote_subtitles(&subtitle_id).await?;
     let mime = subtitle_mime(&result.format);
@@ -511,6 +540,15 @@ async fn serve_graphical_subtitle(
     Ok(Some(response))
 }
 
+/// `{routeMediaSourceId}`, the `[FromRoute, Required] string` of `GetSubtitle`
+/// and `GetSubtitleWithTicks`, which the router registers as `{container}`.
+struct RouteMediaSourceId;
+
+impl RouteParameter for RouteMediaSourceId {
+    const NAME: &'static str = "routeMediaSourceId";
+    const ROUTE_NAME: &'static str = "container";
+}
+
 /// `GET /Videos/{itemId}/{container}/Subtitles/{index}/{routeFormat}` — convert a
 /// subtitle stream to the requested format on the fly.
 ///
@@ -540,15 +578,18 @@ async fn serve_graphical_subtitle(
 async fn get_subtitle(
     State(state): State<AppState>,
     axum::Extension(auth): axum::Extension<ferrofin_traits::options::AuthorizationInfo>,
-    Path((DotnetGuid(item_id), media_source_id, index, route_format)): Path<(
-        DotnetGuid,
-        String,
-        i32,
-        String,
-    )>,
+    RequiredRouteString(media_source_id, _): RequiredRouteString<RouteMediaSourceId>,
+    Path((DotnetGuid(item_id), _, index, route_format)): Path<(DotnetGuid, String, i32, String)>,
     Query(query): Query<SubtitleStreamQuery>,
     request: Request,
 ) -> Result<Response, ApiError> {
+    // `Stream.{routeFormat}`: a required string after the literal, which
+    // matches only with something after it (the same `stream.` literal).
+    if let Some(value) = stream_route_container(&route_format)
+        && let Some(rejection) = blank_route_values([("routeFormat", value)])
+    {
+        return Ok(rejection);
+    }
     require_streamable_item(
         &state,
         &auth,
@@ -592,12 +633,24 @@ async fn get_subtitle(
 async fn get_subtitle_with_ticks(
     State(state): State<AppState>,
     axum::Extension(auth): axum::Extension<ferrofin_traits::options::AuthorizationInfo>,
-    Path((DotnetGuid(item_id), media_source_id, index, start_position_ticks, route_format)): Path<
-        (DotnetGuid, String, i32, i64, String),
-    >,
+    RequiredRouteString(media_source_id, _): RequiredRouteString<RouteMediaSourceId>,
+    Path((DotnetGuid(item_id), _, index, start_position_ticks, route_format)): Path<(
+        DotnetGuid,
+        String,
+        i32,
+        i64,
+        String,
+    )>,
     Query(mut query): Query<SubtitleStreamQuery>,
     request: Request,
 ) -> Result<Response, ApiError> {
+    // `Stream.{routeFormat}`: a required string after the literal, which
+    // matches only with something after it (the same `stream.` literal).
+    if let Some(value) = stream_route_container(&route_format)
+        && let Some(rejection) = blank_route_values([("routeFormat", value)])
+    {
+        return Ok(rejection);
+    }
     require_streamable_item(
         &state,
         &auth,
@@ -630,6 +683,15 @@ struct SubtitlePlaylistQuery {
     segment_length: i32,
 }
 
+/// `{mediaSourceId}`, the `[FromRoute, Required] string` of
+/// `GetSubtitlePlaylist`, which the router registers as `{container}`.
+struct PlaylistMediaSourceId;
+
+impl RouteParameter for PlaylistMediaSourceId {
+    const NAME: &'static str = "mediaSourceId";
+    const ROUTE_NAME: &'static str = "container";
+}
+
 /// `GET /Videos/{itemId}/{container}/Subtitles/{index}/subtitles.m3u8` — the HLS
 /// subtitle playlist for a stream.
 ///
@@ -659,7 +721,8 @@ async fn get_subtitle_playlist(
     // The subtitle stream index is part of the URL but does not affect the
     // playlist body (the segments all point at the same `stream.vtt`); the C#
     // suppresses the same unused parameter (CA1801).
-    Path((DotnetGuid(item_id), media_source_id, _index)): Path<(DotnetGuid, String, i32)>,
+    RequiredRouteString(media_source_id, _): RequiredRouteString<PlaylistMediaSourceId>,
+    Path((DotnetGuid(item_id), _, _index)): Path<(DotnetGuid, String, i32)>,
     Query(query): Query<SubtitlePlaylistQuery>,
     parts: axum::http::request::Parts,
 ) -> Result<Response, ApiError> {
@@ -818,6 +881,13 @@ async fn get_fallback_font_list(
     Ok(Json(fonts))
 }
 
+/// `{name}`, the `[FromRoute, Required] string` of `GetFallbackFont`.
+struct FontName;
+
+impl RouteParameter for FontName {
+    const NAME: &'static str = "name";
+}
+
 /// `GET /FallbackFont/Fonts/{name}` — serve a single fallback font file.
 ///
 /// Port of `SubtitleController.GetFallbackFont`: locate the named file under
@@ -840,12 +910,9 @@ async fn get_fallback_font_list(
 async fn get_fallback_font(
     State(state): State<AppState>,
     RequireAuth(_auth): RequireAuth,
-    Path(name): Path<String>,
+    RequiredRouteString(name, _): RequiredRouteString<FontName>,
     headers: HeaderMap,
 ) -> Result<Response, ApiError> {
-    if name.trim().is_empty() {
-        return Err(ApiError::BadRequest("missing required 'name'".to_owned()));
-    }
     let options = state.config.get_encoding_options().await?;
     let Some(path) = options.fallback_font_path.filter(|p| !p.is_empty()) else {
         return Ok(StatusCode::OK.into_response());

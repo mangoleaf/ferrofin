@@ -177,13 +177,6 @@ pub trait DisplayPreferencesManager: Send + Sync {
         client: &str,
     ) -> Result<ItemDisplayPreferencesEntity, ServiceError>;
 
-    /// Lists all item display preferences for a user/client.
-    async fn list_item_display_preferences(
-        &self,
-        user_id: Uuid,
-        client: &str,
-    ) -> Result<Vec<ItemDisplayPreferencesEntity>, ServiceError>;
-
     /// Lists the custom (key/value) display preferences for a user/item/client.
     async fn list_custom_item_display_preferences(
         &self,

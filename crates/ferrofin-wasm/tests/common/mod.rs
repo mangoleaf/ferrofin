@@ -169,13 +169,6 @@ impl LibraryManager for OneMovieLibrary {
     ) -> Result<Vec<BaseItemEntity>, ServiceError> {
         unimplemented!("stub")
     }
-    async fn create_items(
-        &self,
-        _items: &[BaseItemEntity],
-        _parent_id: Option<Uuid>,
-    ) -> Result<(), ServiceError> {
-        unimplemented!("stub")
-    }
     async fn update_items(
         &self,
         _items: &[BaseItemEntity],
@@ -359,9 +352,6 @@ pub struct StubUsers;
 #[async_trait::async_trait]
 impl ferrofin_traits::library::UserManager for StubUsers {
     async fn get_users(&self) -> Result<Vec<UserEntity>, ServiceError> {
-        unimplemented!("stub")
-    }
-    async fn get_user_ids(&self) -> Result<Vec<Uuid>, ServiceError> {
         unimplemented!("stub")
     }
     async fn initialize(&self) -> Result<(), ServiceError> {

@@ -2535,13 +2535,14 @@ pub const VERIFIED: &[Verified] = &[
         upstream_file: "Jellyfin.Api/Controllers/UserController.cs",
         upstream_method: "ForgotPassword",
         ferrofin: "handlers/users.rs forgot_password (ForgotPasswordDto, extract.rs \
-               RequiredString, ip_access.rs is_local_connection) → ferrofin-core \
-               user_manager.rs start_forgot_password_process \
+               RequiredString and body_parameter, ip_access.rs is_local_connection) → \
+               ferrofin-core user_manager.rs start_forgot_password_process \
                (UserManager.StartForgotPasswordProcess), password_reset_provider_for \
                (GetPasswordResetProvider(User?)) → password_reset.rs \
                DefaultPasswordResetProvider (issue_reset_pin). Compared: the [Required] \
                required string EnteredUsername (missing, null, empty and whitespace are 400s \
-               before the action, with Jellyfin 12.4's messages, measured), isLocal as \
+               before the action, with Jellyfin 12.4's messages, measured), the body's \
+               forgotPasswordRequest entry when it fails to bind (measured), isLocal as \
                IsLocal() || IsInLocalNetwork(ip), the warning for a request from outside the \
                local network, the user lookup, the provider chosen by the saved \
                PasswordResetProviderId among the enabled ones with the built-in fallback, the \
@@ -2554,8 +2555,6 @@ pub const VERIFIED: &[Verified] = &[
          (UpdateUserAsync), which deletes and re-adds their access schedules, so each one's \
          Id in UserPolicy.AccessSchedules changes. Ferrofin saves nothing. Jellyfin bug not \
          ported.",
-            "A body that fails to bind keys its parameter entry `body` (\"The body field is \
-         required.\"), not upstream's `forgotPasswordRequest`. Fix path: gl-1161.",
             "The 500 body (a PIN file that cannot be written) is Ferrofin's error shape, not \
          upstream's. Fix path: gl-666.",
         ],
@@ -2567,12 +2566,14 @@ pub const VERIFIED: &[Verified] = &[
         upstream_file: "Jellyfin.Api/Controllers/UserController.cs",
         upstream_method: "ForgotPasswordPin",
         ferrofin: "handlers/users.rs forgot_password_pin (ForgotPasswordPinDto, extract.rs \
-               RequiredString) → ferrofin-core user_manager.rs redeem_password_reset_pin \
-               (UserManager.RedeemPasswordResetPin), redeem_with → password_reset.rs \
+               RequiredString and body_parameter) → ferrofin-core user_manager.rs \
+               redeem_password_reset_pin (UserManager.RedeemPasswordResetPin), redeem_with → \
+               password_reset.rs \
                DefaultPasswordResetProvider (redeem_reset_pins), change_password, \
                log_password_changed. Compared: the [Required] required string Pin (missing, \
                null, empty and whitespace are 400s before the action, with Jellyfin 12.4's \
-               messages, measured), every provider asked in order whether enabled or not, \
+               messages, measured), the body's forgotPasswordPinRequest entry when it fails \
+               to bind (measured), every provider asked in order whether enabled or not, \
                the first success answered, an expired record deleted, the PIN compared \
                ordinally with its dashes removed, the password set to the PIN as entered, \
                the UserPasswordChanged activity entry, the record removed once the password \
@@ -2589,8 +2590,6 @@ pub const VERIFIED: &[Verified] = &[
          unreadable record fails the request with nothing reset. Upstream resets each match as \
          it walks the directory, so the matches before the failing record (in directory \
          order) are applied and their files deleted. Jellyfin bug not ported.",
-            "A body that fails to bind keys its parameter entry `body` (\"The body field is \
-         required.\"), not upstream's `forgotPasswordPinRequest`. Fix path: gl-1161.",
             "The 404 (no provider redeemed the PIN) and 500 bodies are Ferrofin's error shape, \
          not upstream's. Fix path: gl-666.",
         ],
@@ -2780,7 +2779,8 @@ pub const VERIFIED: &[Verified] = &[
         path: "/System/Configuration/{key}",
         upstream_file: "Jellyfin.Api/Controllers/ConfigurationController.cs",
         upstream_method: "GetNamedConfiguration",
-        ferrofin: "handlers/config.rs get_named_configuration → ferrofin-core \
+        ferrofin: "handlers/config.rs get_named_configuration (RequiredRouteString key: \
+               ConvertEmptyStringToNull, then [Required]) → ferrofin-core \
                configuration_manager.rs get_named_configuration and get_encoding_options \
                (read_named, through read_named_kept for branding and encoding; \
                BaseConfigurationManager.GetConfiguration and LoadConfiguration, the seven \
@@ -2822,7 +2822,8 @@ pub const VERIFIED: &[Verified] = &[
         path: "/System/Configuration/{key}",
         upstream_file: "Jellyfin.Api/Controllers/ConfigurationController.cs",
         upstream_method: "UpdateNamedConfiguration",
-        ferrofin: "handlers/config.rs update_named_configuration (normalize_named_configuration: \
+        ferrofin: "handlers/config.rs update_named_configuration (RequiredRouteString key: \
+               ConvertEmptyStringToNull, then [Required]; normalize_named_configuration: \
                GetConfigurationType and Deserialize) → save_named_configuration \
                (BaseConfigurationManager.SaveConfiguration: the validating store, the write, \
                the live network policy, the listeners, the committed checks for \
@@ -3311,13 +3312,12 @@ pub const VERIFIED: &[Verified] = &[
                finish_structure_change (after_structure_change: LibraryMonitor::restart, then \
                queue_library_scan when refreshLibrary) → ferrofin-core virtual_folder_manager.rs \
                remove_media_path (LibraryManager.RemoveMediaPath: require_folder, \
-               delete_shortcut_for over resolve_shortcut and the virtual-path expansion, the \
-               ordinal PathInfos filter, save_options, record_changed_locations) → library_monitor.rs \
+               delete_shortcut_for over resolve_shortcut and the virtual-path expansion, \
+               compared with the raw path ignoring case, the ordinal PathInfos filter with the \
+               same raw path, save_options, record_changed_locations) → library_monitor.rs \
                restart and run (LibraryMonitor.Stop and Start)",
-        date: "2026-11-03",
+        date: "2026-11-11",
         divergences: &[
-            "A path with a trailing separator deletes the location's shortcut but keeps its \
-         PathInfos entry; upstream matches neither and changes nothing. Fix path: gl-1205.",
             "A request for a library that does not exist (404) restarts nothing and queues no \
          scan; upstream throws inside its try, so its finally still queues the requested full \
          scan, or restarts the monitor, for an unchanged library.",
@@ -3600,7 +3600,9 @@ pub const VERIFIED: &[Verified] = &[
         path: "/Playlists/{itemId}/Items/{itemId}/Move/{newIndex}",
         upstream_file: "Jellyfin.Api/Controllers/PlaylistsController.cs",
         upstream_method: "MoveItem",
-        ferrofin: "handlers/playlists.rs move_item (the playlist id parses through \
+        ferrofin: "handlers/playlists.rs move_item (blank_route_values playlistId and \
+               itemId: ConvertEmptyStringToNull, then [Required], both in one 400; the \
+               playlist id parses through \
                DotnetGuid::parse, Guid.Parse and MoveItemAsync's new Guid; \
                get_playlist_access + require_edit: \
                GetPlaylistForUser and the owner-or-editing-share check) → ferrofin-core \
@@ -3806,7 +3808,8 @@ pub const VERIFIED: &[Verified] = &[
         path: "/FallbackFont/Fonts/{name}",
         upstream_file: "Jellyfin.Api/Controllers/SubtitleController.cs",
         upstream_method: "GetFallbackFont",
-        ferrofin: "handlers/subtitles.rs get_fallback_font → ferrofin-core file_system.rs \
+        ferrofin: "handlers/subtitles.rs get_fallback_font (RequiredRouteString name: \
+               ConvertEmptyStringToNull, then [Required]) → ferrofin-core file_system.rs \
                get_files, open_file → handlers/streaming.rs opened_file_response, \
                physical_file_precondition",
         date: "2026-10-30",
@@ -3820,8 +3823,8 @@ pub const VERIFIED: &[Verified] = &[
          application/octet-stream. The list route serves four extensions, all covered.",
             "The EnableFallbackFont side effect of a missing FallbackFontPath is not ported, as \
          on GET /FallbackFont/Fonts.",
-            "The 400 (no name) and the 404 and 500 of a font that cannot be opened have \
-         Ferrofin's error shape, not upstream's. Fix path: gl-666.",
+            "The 404 and 500 of a font that cannot be opened have Ferrofin's error shape, not \
+         upstream's. Fix path: gl-666.",
         ],
         refs: &[],
     },
@@ -3831,7 +3834,8 @@ pub const VERIFIED: &[Verified] = &[
         upstream_file: "Jellyfin.Api/Controllers/SubtitleController.cs",
         upstream_method: "SearchRemoteSubtitles",
         ferrofin: "handlers/subtitles.rs search_remote_subtitles (RequireSubtitleManagement, the \
-               SubtitleManagement policy's UserPermissionRequirement; require_video, \
+               SubtitleManagement policy's UserPermissionRequirement; RequiredRouteString \
+               language: ConvertEmptyStringToNull, then [Required]; require_video, \
                GetItemById<Video>(itemId, User.GetUserId()): a missing, hidden or non-video \
                item is a 404; isPerfectMatch) → ferrofin-core subtitle_manager.rs \
                search_subtitles and enrich (SubtitleManager.SearchSubtitles, both overloads: \
@@ -3910,7 +3914,9 @@ pub const VERIFIED: &[Verified] = &[
         path: "/Videos/{itemId}/{container}/Attachments/{index}",
         upstream_file: "Jellyfin.Api/Controllers/VideoAttachmentsController.cs",
         upstream_method: "GetAttachment",
-        ferrofin: "handlers/hls.rs get_video_attachment → ferrofin-mediaencoding \
+        ferrofin: "handlers/hls.rs get_video_attachment (RequiredRouteString mediaSourceId, \
+               registered as {container}: ConvertEmptyStringToNull, then [Required], before \
+               the item is read) → ferrofin-mediaencoding \
                attachments/extractor.rs get_attachment, extract_attachment \
                (AttachmentExtractor.GetAttachment, GetAttachmentStream, ExtractAttachment, \
                ExtractAttachmentInternal) → apps/ferrofin-server media_encoding.rs \
@@ -3927,9 +3933,6 @@ pub const VERIFIED: &[Verified] = &[
             "A dropped request kills a running extraction and deletes its output (gl-283); \
          upstream's action passes CancellationToken.None, so its extraction runs to the end \
          and the next request is served from the cache. Fix path: gl-1517.",
-            "A whitespace-only mediaSourceId is the 400 only once the item is found: upstream's \
-         model validation refuses it before the item is read, so for a missing or hidden \
-         item it is a 400 there and a 404 here. Fix path: gl-1518.",
             "A nil videoId is a 404, not GetItemById's 400. Fix path: gl-1034.",
             "A mediaSourceId selects its source in any GUID spelling; upstream compares the N \
          form, ignoring case. Clients echo the id they were given, and an adopted database \

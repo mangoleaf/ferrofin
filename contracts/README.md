@@ -31,7 +31,8 @@ one real clients (jellyfin-web, Swiftfin, Findroid, Wolphin, …) are built agai
     `crates/ferrofin-api/src/handlers/items.rs`, which checks `GET /Items` parameters
     against the union of both contracts — 12.1.0 adds `audioLanguages` and
     `subtitleLanguages` to 10.11.8's 86;
-  - the `query_parameters!` metadata check (`crates/ferrofin-api/src/query.rs`);
+  - the `query_parameters!` metadata check and the body-parameter table's coverage test
+    (`crates/ferrofin-api/src/query.rs`);
   - `newer_contract_operations_never_404` in `crates/ferrofin-api/tests/contract_superset.rs`,
     which probes every operation 12.1.0 has and 10.11.8 lacks (today only
     `GET /Items/{itemId}/Collections`) on the live router.

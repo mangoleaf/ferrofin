@@ -224,13 +224,6 @@ impl LibraryManager for AudioLibrary {
     ) -> Result<Vec<BaseItemEntity>, ServiceError> {
         unimplemented!("unused")
     }
-    async fn create_items(
-        &self,
-        _i: &[BaseItemEntity],
-        _p: Option<Uuid>,
-    ) -> Result<(), ServiceError> {
-        unimplemented!("unused")
-    }
     async fn update_items(
         &self,
         _i: &[BaseItemEntity],

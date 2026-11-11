@@ -982,9 +982,6 @@ impl ferrofin_traits::stubs::LiveTvManager for ScriptedLiveTv {
     async fn refresh_guide(&self) -> Result<(), ServiceError> {
         unreachable!()
     }
-    async fn get_channel_stream_url(&self, _id: Uuid) -> Result<Option<String>, ServiceError> {
-        unreachable!()
-    }
     async fn get_timers(&self) -> Result<Vec<ferrofin_model::live_tv::TimerInfoDto>, ServiceError> {
         unreachable!()
     }

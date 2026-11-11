@@ -330,13 +330,6 @@ impl LibraryManager for ItemLibrary {
     ) -> Result<Vec<BaseItemEntity>, ServiceError> {
         unimplemented!("unused")
     }
-    async fn create_items(
-        &self,
-        _items: &[BaseItemEntity],
-        _parent_id: Option<Uuid>,
-    ) -> Result<(), ServiceError> {
-        unimplemented!("unused")
-    }
     async fn update_items(
         &self,
         _items: &[BaseItemEntity],
@@ -1378,6 +1371,74 @@ async fn legacy_video_segment_and_playlist_and_audio() {
     assert!(resolved.iter().any(|(n, m)| n == "9.ts" && !m));
     assert!(resolved.iter().any(|(n, m)| n == "pl7.m3u8" && *m));
     assert!(resolved.iter().any(|(n, m)| n == "seg2.mp3" && !m));
+}
+
+/// The legacy `HlsSegmentController` actions bind `{itemId}` as a
+/// `[FromRoute, Required] string` they never read: any value serves the file,
+/// and only a blank one is the binder's 400, before the file is looked up.
+#[rstest]
+#[case::video_segment("/Videos/{id}/hls/pl7/9.ts", "9.ts")]
+#[case::playlist("/Videos/{id}/hls/pl7/stream.m3u8", "pl7.m3u8")]
+#[case::audio_aac("/Audio/{id}/hls/seg2/stream.aac", "seg2.aac")]
+#[case::audio_mp3("/Audio/{id}/hls/seg2/stream.mp3", "seg2.mp3")]
+#[tokio::test]
+async fn legacy_routes_take_any_item_id_but_a_blank_one(
+    #[case] template: &str,
+    #[case] file_name: &str,
+) {
+    let tmp = TempFile::new();
+    for (item_id, served) in [
+        ("not-a-guid", true),
+        ("urn:uuid:{ITEM_ID}", true),
+        ("%28{ITEM_ID}%29", true),
+        ("%20", false),
+    ] {
+        let rec = Arc::new(Recorded::default());
+        let router = router_with(
+            ok_hls(&tmp.path, rec.clone()),
+            Arc::new(FakeAttachments {
+                mime: None,
+                data: vec![],
+            }),
+            Arc::new(ItemLibrary { present: true }),
+        );
+        let uri = template.replace("{id}", &item_id.replace("{ITEM_ID}", &ITEM_ID.to_string()));
+        let resp = router.oneshot(authed("GET", &uri)).await.unwrap();
+        let status = resp.status();
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let resolved = rec.resolved.lock().unwrap().clone();
+        if served {
+            assert_eq!(status, StatusCode::OK, "{uri}");
+            assert_eq!(resolved.len(), 1, "{uri}");
+            assert_eq!(resolved[0].0, file_name, "{uri}");
+        } else {
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{uri}");
+            let body = String::from_utf8_lossy(&body);
+            assert!(
+                body.contains("The itemId field is required."),
+                "{uri}: {body}"
+            );
+            assert!(resolved.is_empty(), "{uri}: {resolved:?}");
+        }
+    }
+}
+
+/// Authorization runs before model binding upstream, so the authenticated
+/// legacy playlist route answers a refused caller 401 even for a blank
+/// `{itemId}`, and looks nothing up.
+#[tokio::test]
+async fn legacy_playlist_checks_auth_before_the_blank_item_id() {
+    let tmp = TempFile::new();
+    let rec = Arc::new(Recorded::default());
+    let router = router_denying_auth(ok_hls(&tmp.path, rec.clone()));
+    let resp = router
+        .oneshot(authed("GET", "/Videos/%20/hls/pl7/stream.m3u8"))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    assert!(rec.resolved.lock().unwrap().is_empty());
 }
 
 #[tokio::test]

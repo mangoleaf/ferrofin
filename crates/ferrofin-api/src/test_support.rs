@@ -27,7 +27,6 @@ use ferrofin_model::configuration::{
     MetadataOptions, MetadataPluginSummary, ServerConfiguration, UserConfiguration,
 };
 use ferrofin_model::data::CollectionType;
-use ferrofin_model::devices::DeviceInfo;
 use ferrofin_model::dto::{
     BaseItemDto, ClientCapabilitiesDto, DeviceInfoDto, ItemCounts, MediaSourceInfo, NameIdPair,
     SessionInfoDto, UpdateUserItemDataDto, UserDto, UserItemDataDto,
@@ -538,13 +537,6 @@ macro_rules! fake_library_manager {
             ) -> Result<Vec<BaseItemEntity>, ServiceError> {
                 unimplemented!("fake")
             }
-            async fn create_items(
-                &self,
-                _items: &[BaseItemEntity],
-                _parent_id: Option<Uuid>,
-            ) -> Result<(), ServiceError> {
-                unimplemented!("fake")
-            }
             async fn update_items(
                 &self,
                 _items: &[BaseItemEntity],
@@ -809,9 +801,6 @@ impl UserManager for PolicyUsers {
     async fn get_users(&self) -> Result<Vec<UserEntity>, ServiceError> {
         FakeUsers.get_users().await
     }
-    async fn get_user_ids(&self) -> Result<Vec<Uuid>, ServiceError> {
-        FakeUsers.get_user_ids().await
-    }
     async fn initialize(&self) -> Result<(), ServiceError> {
         FakeUsers.initialize().await
     }
@@ -902,9 +891,6 @@ pub struct FakeUsers;
 #[async_trait]
 impl UserManager for FakeUsers {
     async fn get_users(&self) -> Result<Vec<UserEntity>, ServiceError> {
-        unimplemented!("fake")
-    }
-    async fn get_user_ids(&self) -> Result<Vec<Uuid>, ServiceError> {
         unimplemented!("fake")
     }
     async fn initialize(&self) -> Result<(), ServiceError> {
@@ -1061,9 +1047,6 @@ pub struct FakeAdminUsers;
 #[async_trait]
 impl UserManager for FakeAdminUsers {
     async fn get_users(&self) -> Result<Vec<UserEntity>, ServiceError> {
-        unimplemented!("fake")
-    }
-    async fn get_user_ids(&self) -> Result<Vec<Uuid>, ServiceError> {
         unimplemented!("fake")
     }
     async fn initialize(&self) -> Result<(), ServiceError> {
@@ -1383,14 +1366,6 @@ impl SessionManager for FakeSessions {
         // delivery is covered by ferrofin-core's tests.
         Ok(())
     }
-    async fn send_message_to_user_device_sessions(
-        &self,
-        _device_id: &str,
-        _message_type: SessionMessageType,
-        _data: &str,
-    ) -> Result<(), ServiceError> {
-        unimplemented!("fake")
-    }
     async fn send_restart_required_notification(&self) -> Result<(), ServiceError> {
         unimplemented!("fake")
     }
@@ -1573,20 +1548,6 @@ impl ServerApplicationHost for FakeAppHost {
         _peer: std::net::IpAddr,
     ) -> Result<String, ServiceError> {
         self.get_smart_api_url(&RequestContext::default()).await
-    }
-    async fn get_local_api_url(
-        &self,
-        _hostname: &str,
-        _scheme: Option<&str>,
-        _port: Option<u16>,
-    ) -> Result<String, ServiceError> {
-        unimplemented!("fake")
-    }
-    fn expand_virtual_path(&self, path: &str) -> String {
-        path.to_owned()
-    }
-    fn reverse_virtual_path(&self, path: &str) -> String {
-        path.to_owned()
     }
 }
 
@@ -1844,12 +1805,6 @@ pub struct FakeDto;
 
 #[async_trait]
 impl DtoService for FakeDto {
-    async fn get_primary_image_aspect_ratio(
-        &self,
-        _item_id: Uuid,
-    ) -> Result<Option<f64>, ServiceError> {
-        unimplemented!("fake")
-    }
     async fn get_base_item_dto(
         &self,
         _item: &BaseItemEntity,
@@ -1867,15 +1822,6 @@ impl DtoService for FakeDto {
         _owner_id: Option<Uuid>,
         _skip_visibility_check: bool,
     ) -> Result<Vec<BaseItemDto>, ServiceError> {
-        unimplemented!("fake")
-    }
-    async fn get_item_by_name_dto(
-        &self,
-        _item: &BaseItemEntity,
-        _options: &DtoOptions,
-        _tagged_item_ids: Option<&[Uuid]>,
-        _user: Option<&UserEntity>,
-    ) -> Result<BaseItemDto, ServiceError> {
         unimplemented!("fake")
     }
     async fn can_delete(
@@ -1931,13 +1877,6 @@ impl PlaylistManager for FakePlaylists {
     ) -> Result<ferrofin_traits::collections::PlaylistAccess, ServiceError> {
         unimplemented!("fake")
     }
-    async fn get_playlist_for_user(
-        &self,
-        _playlist_id: Uuid,
-        _user_id: Uuid,
-    ) -> Result<BaseItemEntity, ServiceError> {
-        unimplemented!("fake")
-    }
     async fn create_playlist(
         &self,
         _request: &PlaylistCreationRequest,
@@ -1945,9 +1884,6 @@ impl PlaylistManager for FakePlaylists {
         unimplemented!("fake")
     }
     async fn update_playlist(&self, _request: &PlaylistUpdateRequest) -> Result<(), ServiceError> {
-        unimplemented!("fake")
-    }
-    async fn get_playlists(&self, _user_id: Uuid) -> Result<Vec<BaseItemEntity>, ServiceError> {
         unimplemented!("fake")
     }
     async fn get_playlist_items(
@@ -2259,12 +2195,6 @@ impl DeviceManager for FakeDevices {
     ) -> Result<QueryResult<DeviceEntity>, ServiceError> {
         unimplemented!("fake")
     }
-    async fn get_device_infos(
-        &self,
-        _query: &DeviceQuery,
-    ) -> Result<QueryResult<DeviceInfo>, ServiceError> {
-        unimplemented!("fake")
-    }
     async fn get_devices_for_user(
         &self,
         _user_id: Option<Uuid>,
@@ -2409,13 +2339,6 @@ impl DisplayPreferencesManager for FakeDisplayPreferences {
         _item_id: Uuid,
         _client: &str,
     ) -> Result<ItemDisplayPreferencesEntity, ServiceError> {
-        unimplemented!("fake")
-    }
-    async fn list_item_display_preferences(
-        &self,
-        _user_id: Uuid,
-        _client: &str,
-    ) -> Result<Vec<ItemDisplayPreferencesEntity>, ServiceError> {
         unimplemented!("fake")
     }
     async fn list_custom_item_display_preferences(

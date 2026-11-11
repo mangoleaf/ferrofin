@@ -201,9 +201,6 @@ impl UserManager for OkUsers {
     async fn get_users(&self) -> Result<Vec<UserEntity>, ServiceError> {
         unimplemented!()
     }
-    async fn get_user_ids(&self) -> Result<Vec<Uuid>, ServiceError> {
-        unimplemented!()
-    }
     async fn initialize(&self) -> Result<(), ServiceError> {
         unimplemented!()
     }
@@ -299,12 +296,6 @@ struct OkDto {
 
 #[async_trait]
 impl DtoService for OkDto {
-    async fn get_primary_image_aspect_ratio(
-        &self,
-        _item_id: Uuid,
-    ) -> Result<Option<f64>, ServiceError> {
-        unimplemented!()
-    }
     async fn get_base_item_dto(
         &self,
         _item: &BaseItemEntity,
@@ -345,15 +336,6 @@ impl DtoService for OkDto {
             .store(true, std::sync::atomic::Ordering::SeqCst);
         self.get_base_item_dtos(items, options, user, None, true)
             .await
-    }
-    async fn get_item_by_name_dto(
-        &self,
-        _item: &BaseItemEntity,
-        _options: &DtoOptions,
-        _tagged_item_ids: Option<&[Uuid]>,
-        _user: Option<&UserEntity>,
-    ) -> Result<BaseItemDto, ServiceError> {
-        unimplemented!()
     }
 }
 
@@ -409,17 +391,6 @@ impl PlaylistManager for RecordingPlaylists {
             Err(ServiceError::not_found("playlist"))
         }
     }
-    async fn get_playlist_for_user(
-        &self,
-        playlist_id: Uuid,
-        _user_id: Uuid,
-    ) -> Result<BaseItemEntity, ServiceError> {
-        if playlist_id == PLAYLIST_ID {
-            Ok(item_entity(playlist_id))
-        } else {
-            Err(ServiceError::not_found("playlist"))
-        }
-    }
     async fn create_playlist(
         &self,
         request: &PlaylistCreationRequest,
@@ -435,9 +406,6 @@ impl PlaylistManager for RecordingPlaylists {
     ) -> Result<(), ServiceError> {
         *self.updated.lock().unwrap() = Some(request.clone());
         Ok(())
-    }
-    async fn get_playlists(&self, _user_id: Uuid) -> Result<Vec<BaseItemEntity>, ServiceError> {
-        unimplemented!()
     }
     async fn get_playlist_items(
         &self,

@@ -126,9 +126,6 @@ impl UserManager for MemUsers {
     async fn get_users(&self) -> Result<Vec<UserEntity>, ServiceError> {
         Ok(mem_users())
     }
-    async fn get_user_ids(&self) -> Result<Vec<Uuid>, ServiceError> {
-        Ok(vec![ADMIN_ID, BOB_ID])
-    }
     async fn initialize(&self) -> Result<(), ServiceError> {
         Ok(())
     }
@@ -396,14 +393,6 @@ impl SessionManager for NoopSessions {
     async fn send_message_to_user_sessions(
         &self,
         _user_ids: &[Uuid],
-        _message_type: SessionMessageType,
-        _data: &str,
-    ) -> Result<(), ServiceError> {
-        unimplemented!("fake")
-    }
-    async fn send_message_to_user_device_sessions(
-        &self,
-        _device_id: &str,
         _message_type: SessionMessageType,
         _data: &str,
     ) -> Result<(), ServiceError> {

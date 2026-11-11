@@ -658,13 +658,6 @@ pub trait LibraryManager: Send + Sync {
         collection_type: CollectionType,
     ) -> Result<Vec<BaseItemEntity>, ServiceError>;
 
-    /// Persists (inserts or updates) the given item rows under a parent.
-    async fn create_items(
-        &self,
-        items: &[BaseItemEntity],
-        parent_id: Option<Uuid>,
-    ) -> Result<(), ServiceError>;
-
     /// Updates the given item rows under a parent.
     async fn update_items(
         &self,
@@ -1560,9 +1553,6 @@ pub fn policy_update_refusal(state: PolicyGuardState, policy: &UserPolicy) -> Op
 pub trait UserManager: Send + Sync {
     /// Gets all user rows.
     async fn get_users(&self) -> Result<Vec<UserEntity>, ServiceError>;
-
-    /// Gets the ids of all users.
-    async fn get_user_ids(&self) -> Result<Vec<Uuid>, ServiceError>;
 
     /// Ensures at least one user exists (first-run bootstrap).
     async fn initialize(&self) -> Result<(), ServiceError>;
@@ -2879,16 +2869,6 @@ pub trait LibraryMonitor: Send + Sync {
     /// restart at a time, each reading the structure when it runs, so the
     /// watches end up matching the latest one.
     fn restart(&self);
-
-    /// Signals that a change at `path` is beginning (suppress self-triggering).
-    async fn report_file_system_change_beginning(&self, path: &str) -> Result<(), ServiceError>;
-
-    /// Signals that a change at `path` is complete, optionally refreshing it.
-    async fn report_file_system_change_complete(
-        &self,
-        path: &str,
-        refresh_path: bool,
-    ) -> Result<(), ServiceError>;
 
     /// Signals that `path` changed on disk, as the filesystem watcher saw it
     /// (a refresh it starts is labelled [`ScanTrigger::Watcher`]).

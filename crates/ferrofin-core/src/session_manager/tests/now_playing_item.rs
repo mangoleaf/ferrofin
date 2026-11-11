@@ -44,12 +44,6 @@ struct CountingDtoService {
 
 #[async_trait]
 impl DtoService for CountingDtoService {
-    async fn get_primary_image_aspect_ratio(
-        &self,
-        _item_id: Uuid,
-    ) -> Result<Option<f64>, ServiceError> {
-        unreachable!("not reached from a NowPlayingItem build")
-    }
     async fn get_base_item_dto(
         &self,
         _item: &BaseItemEntity,
@@ -80,15 +74,6 @@ impl DtoService for CountingDtoService {
                 ..BaseItemDto::default()
             })
             .collect())
-    }
-    async fn get_item_by_name_dto(
-        &self,
-        _item: &BaseItemEntity,
-        _options: &DtoOptions,
-        _tagged_item_ids: Option<&[Uuid]>,
-        _user: Option<&UserEntity>,
-    ) -> Result<BaseItemDto, ServiceError> {
-        unreachable!("not reached from a NowPlayingItem build")
     }
 }
 
