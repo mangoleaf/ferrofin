@@ -179,6 +179,13 @@ impl HlsStreamManager for FakeHls {
         Ok(())
     }
 
+    async fn stop_encoding_awaiting_deletion(
+        &self,
+        _request: &HlsStreamRequest,
+    ) -> Result<(), ServiceError> {
+        unimplemented!("StopEncodingProcess does not await KillTranscodingJobs")
+    }
+
     async fn ping_transcoding_job(
         &self,
         play_session_id: &str,

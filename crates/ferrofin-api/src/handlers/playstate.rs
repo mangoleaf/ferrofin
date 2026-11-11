@@ -311,10 +311,35 @@ async fn report_playback_stopped(
     // A stop report kills the session's live transcode and deletes its partial
     // files (C# PlaystateController → KillTranscodingJobs). Without it the job
     // encodes to the end of the item for nobody.
-    kill_session_transcodes(&state, &auth, info.play_session_id.as_deref()).await;
-    state.sessions.on_playback_stopped(&info).await?;
-    record_metrics_stopped(&state, info.play_session_id.as_deref(), info.position_ticks).await;
+    finish_playback_stop(state, auth, info).await?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+/// The rest of a stop report: the kill of the session's transcodes, then the
+/// stop itself (`SessionManager.OnPlaybackStopped`) and its metrics.
+///
+/// It runs on a task of its own, which the request awaits: the kill waits out
+/// the partial-file deletion (`DeletePartialStreamFiles` waits 1.5 s first),
+/// and a client that hangs up meanwhile must not cut off the stop's user-data
+/// save. Upstream's action does not observe the disconnect, so it finishes.
+async fn finish_playback_stop(
+    state: AppState,
+    auth: ferrofin_traits::options::AuthorizationInfo,
+    info: PlaybackStopInfo,
+) -> Result<(), ApiError> {
+    // In the request's span: the request awaits it (LOGGING.md §4).
+    tokio::spawn(tracing::Instrument::in_current_span(async move {
+        kill_session_transcodes(&state, &auth, info.play_session_id.as_deref()).await;
+        state.sessions.on_playback_stopped(&info).await?;
+        record_metrics_stopped(&state, info.play_session_id.as_deref(), info.position_ticks).await;
+        Ok(())
+    }))
+    .await
+    .map_err(|error| {
+        ApiError::Service(ferrofin_traits::error::ServiceError::backend(format!(
+            "playback stop task failed: {error}"
+        )))
+    })?
 }
 
 /// Query parameters for the obsolete `POST /PlayingItems/{itemId}` start form.
@@ -498,9 +523,7 @@ async fn on_playback_stopped(
     };
     info.session_id = Some(current_session_id(&state, &auth).await?);
     // The legacy stop form kills the session's transcode too (same upstream path).
-    kill_session_transcodes(&state, &auth, info.play_session_id.as_deref()).await;
-    state.sessions.on_playback_stopped(&info).await?;
-    record_metrics_stopped(&state, info.play_session_id.as_deref(), info.position_ticks).await;
+    finish_playback_stop(state, auth, info).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -544,7 +567,8 @@ async fn on_playback_stopped_for_user(
 /// Kills the live transcode job(s) for a stopping playback session — matched by
 /// its `playSessionId` when present, else everything on the caller's device —
 /// deleting their partial files (C# `PlaystateController` →
-/// `_transcodeManager.KillTranscodingJobs(deviceId, playSessionId, _ => true)`).
+/// `_transcodeManager.KillTranscodingJobs(deviceId, playSessionId, _ => true)`),
+/// awaited whole as upstream awaits it: the deletion included.
 ///
 /// Best-effort: a stop report must still record playstate even if the kill
 /// dispatch fails, so the error is logged, not returned.
@@ -558,7 +582,7 @@ async fn kill_session_transcodes(
         device_id: auth.device_id.clone(),
         ..Default::default()
     };
-    if let Err(error) = state.hls.stop_encoding(&request).await {
+    if let Err(error) = state.hls.stop_encoding_awaiting_deletion(&request).await {
         tracing::warn!(%error, "failed to stop transcodes for a stopped playback session");
     }
 }

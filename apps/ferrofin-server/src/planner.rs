@@ -5717,7 +5717,8 @@ mod tests {
         assert!(copy.is_file(), "{}", copy.display());
         let stem = plan.playlist_path.file_stem().unwrap().to_string_lossy();
         ferrofin_mediaencoding::FsFileCleaner
-            .delete_partial_stream_files(plan.playlist_path.parent().unwrap(), &stem);
+            .delete_partial_stream_files(plan.playlist_path.parent().unwrap(), &stem)
+            .expect("the job's files deleted");
         assert!(!copy.exists(), "{}", copy.display());
     }
 

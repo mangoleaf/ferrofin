@@ -20,7 +20,8 @@
 //!   from the cache dir;
 //! - the legacy transcode-folder file resolution +
 //!   `HlsSegmentController.ValidateTranscodePath` path-traversal guard;
-//! - stop-encoding → `TranscodeManager::kill_transcoding_jobs`.
+//! - stop-encoding → `TranscodeManagerImpl::stop_transcoding_jobs` (the
+//!   playback-stop reports' awaited form → `TranscodeManager::kill_transcoding_jobs`).
 //!
 //! Turning the raw [`HlsStreamRequest`] into a concrete transcode plan
 //! (media-source resolution, `StreamState`, and the ffmpeg command line) —
@@ -985,11 +986,16 @@ where
             .map_err(|error| ServiceError::backend(format!("list transcode segments: {error}")))?;
         self.manager.kill_and_remove(handle, false, false).await;
         let listed = playlist_path.to_path_buf();
-        tokio::task::spawn_blocking(move || {
-            delete_cut_short_segment(&listed, ext, job_start, before);
-        })
-        .await
-        .map_err(|error| ServiceError::backend(format!("delete a cut-short segment: {error}")))
+        let cut_short =
+            tokio::task::spawn_blocking(move || cut_short_segment(&listed, ext, job_start, before))
+                .await
+                .map_err(|error| {
+                    ServiceError::backend(format!("find a cut-short segment: {error}"))
+                })?;
+        if let Some(path) = cut_short {
+            delete_cut_short_segment(&path).await;
+        }
+        Ok(())
     }
 
     /// The transcode cache directory (`GetTranscodePath`), prepared on the
@@ -1284,6 +1290,17 @@ where
     }
 
     async fn stop_encoding(&self, request: &HlsStreamRequest) -> Result<(), ServiceError> {
+        let device = request.device_id.as_deref().unwrap_or_default();
+        self.manager
+            .stop_transcoding_jobs(device, request.play_session_id.as_deref())
+            .await;
+        Ok(())
+    }
+
+    async fn stop_encoding_awaiting_deletion(
+        &self,
+        request: &HlsStreamRequest,
+    ) -> Result<(), ServiceError> {
         use ferrofin_traits::media_encoding::TranscodeManager as _;
         let device = request.device_id.as_deref().unwrap_or_default();
         self.manager
@@ -1626,7 +1643,14 @@ fn segment_writes(playlist: &Path, ext: &str, start: i32) -> std::io::Result<Seg
     Ok(writes)
 }
 
-/// Deletes the segment a seek restart's killed job was encoding: the `q` exit
+/// `DynamicHlsController.DeleteFile` gives up after this many attempts (its
+/// `retryCount >= 5` guard).
+const DELETE_FILE_ATTEMPTS: u32 = 5;
+
+/// `DynamicHlsController.DeleteFile`'s `Task.Delay(100)` before each retry.
+const DELETE_FILE_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// The segment a seek restart's killed job was encoding: the `q` exit
 /// finalises it, cut short, under its normal name, and every later request
 /// would serve it as complete (gl-1396). Port of `GetDynamicSegment`'s
 /// `DeleteLastFile`, which takes the newest file by mtime; this takes the
@@ -1634,13 +1658,13 @@ fn segment_writes(playlist: &Path, ext: &str, start: i32) -> std::io::Result<Seg
 /// just before the kill, because where mtimes are coarse the newest file can
 /// be an earlier job's (gl-52). A job killed hard (no exit within the `q`
 /// timeout) still has the `.tmp` after that segment, which is then whole, and
-/// nothing is deleted. Blocking.
-fn delete_cut_short_segment(
+/// there is none. Blocking.
+fn cut_short_segment(
     playlist: &Path,
     ext: &str,
     start: i32,
     before: std::io::Result<SegmentWrites>,
-) {
+) -> Option<PathBuf> {
     let (before, after) = match (before, segment_writes(playlist, ext, start)) {
         (Ok(before), Ok(after)) => (before, after),
         (Err(error), _) | (_, Err(error)) => {
@@ -1649,7 +1673,7 @@ fn delete_cut_short_segment(
                 %error,
                 "cannot list a killed transcode's segments; one it cut short may be served short"
             );
-            return;
+            return None;
         }
     };
     let written: Vec<(i32, bool)> = after
@@ -1657,28 +1681,51 @@ fn delete_cut_short_segment(
         .filter(|(key, write)| before.get(key) != Some(write))
         .map(|(key, _)| key)
         .collect();
-    let Some(index) = written
+    let index = written
         .iter()
         .filter(|&&(_, in_progress)| !in_progress)
         .map(|&(index, _)| index)
-        .max()
-    else {
-        return;
-    };
-    if written.contains(&(index.saturating_add(1), true)) {
-        return;
-    }
-    let path = segment_file(playlist, index, ext);
-    tracing::debug!(path = %path.display(), "deleting a killed transcode's cut-short segment");
-    match std::fs::remove_file(&path) {
-        Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
-            tracing::warn!(
-                path = %path.display(),
-                %error,
-                "deleting a killed transcode's cut-short segment failed; it is served short"
-            );
+        .max()?;
+    (!written.contains(&(index.saturating_add(1), true)))
+        .then(|| segment_file(playlist, index, ext))
+}
+
+/// Deletes a seek restart's cut-short segment at `path`, retrying as
+/// `DynamicHlsController.DeleteFile` does: [`DELETE_FILE_RETRY_DELAY`] after an
+/// `IOException`, at most [`DELETE_FILE_ATTEMPTS`] attempts (upstream also
+/// waits once after the last, for nothing), and no retry for access denied
+/// (.NET's `UnauthorizedAccessException`). Upstream logs every
+/// failed attempt at Error; here one that will be retried is a `warn!` and
+/// only the last an `error!` (LOGGING.md rules 1 and 2).
+async fn delete_cut_short_segment(path: &Path) {
+    for attempt in 1..=DELETE_FILE_ATTEMPTS {
+        tracing::debug!(path = %path.display(), attempt, "deleting a killed transcode's cut-short segment");
+        match tokio::fs::remove_file(path).await {
+            // `File.Delete` succeeds on a file already gone.
+            Ok(()) => return,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return,
+            Err(error)
+                if attempt < DELETE_FILE_ATTEMPTS
+                    && error.kind() != std::io::ErrorKind::PermissionDenied =>
+            {
+                tracing::warn!(
+                    path = %path.display(),
+                    attempt,
+                    %error,
+                    "deleting a killed transcode's cut-short segment failed; retrying"
+                );
+                tokio::time::sleep(DELETE_FILE_RETRY_DELAY).await;
+            }
+            Err(error) => {
+                tracing::error!(
+                    path = %path.display(),
+                    attempt,
+                    %error,
+                    "deleting a killed transcode's cut-short segment failed; it is served short"
+                );
+                return;
+            }
         }
-        _ => {}
     }
 }
 
@@ -3143,6 +3190,62 @@ mod tests {
                 "{name} after the restart"
             );
         }
+    }
+
+    /// `DynamicHlsController.DeleteFile`: an `IOException` is retried 100 ms
+    /// later, five attempts in all; a file already gone is no failure.
+    #[rstest::rstest]
+    #[case::deleted_at_once("out1.ts", true, 0)]
+    #[case::already_gone("out2.ts", false, 0)]
+    #[case::retried_until_it_gives_up("not-a-dir/out1.ts", false, 4)]
+    #[tokio::test(start_paused = true)]
+    async fn the_cut_short_segment_delete_retries_as_delete_file_does(
+        #[case] name: &str,
+        #[case] exists: bool,
+        #[case] retries: u32,
+    ) {
+        let tmp = tempfile::tempdir().unwrap();
+        // A path under a regular file fails with ENOTDIR, an IOException.
+        std::fs::write(tmp.path().join("not-a-dir"), b"").unwrap();
+        let path = tmp.path().join(name);
+        if exists {
+            std::fs::write(&path, b"cut short").unwrap();
+        }
+
+        let started = tokio::time::Instant::now();
+        delete_cut_short_segment(&path).await;
+
+        assert_eq!(started.elapsed(), DELETE_FILE_RETRY_DELAY * retries);
+        assert!(!path.exists());
+    }
+
+    /// `StopEncodingProcess` does not await `KillTranscodingJobs`; the stop
+    /// reports do. Both stop the job first; only the awaiting one returns
+    /// once its partial files are gone.
+    #[rstest::rstest]
+    #[case::stop_encoding(false)]
+    #[case::awaiting_deletion(true)]
+    #[tokio::test(start_paused = true)]
+    async fn only_the_awaiting_stop_waits_for_the_partial_files(#[case] awaiting: bool) {
+        let tmp = tempfile::tempdir().unwrap();
+        let script = FakeScript {
+            segment_files: vec!["out0.ts".to_owned()],
+            extra_files: vec!["out.m3u8".to_owned()],
+            ..FakeScript::default()
+        };
+        let (mgr, _) = manager_with(tmp.path(), script, "ts");
+        mgr.dynamic_segment(&req(), 0, false).await.unwrap();
+        let segment = tmp.path().join("out0.ts");
+        assert!(segment.exists());
+
+        if awaiting {
+            mgr.stop_encoding_awaiting_deletion(&req()).await.unwrap();
+        } else {
+            mgr.stop_encoding(&req()).await.unwrap();
+        }
+
+        assert_eq!(mgr.manager.active_job_count(), 0);
+        assert_eq!(segment.exists(), !awaiting);
     }
 
     #[tokio::test]

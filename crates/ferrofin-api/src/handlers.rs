@@ -1994,8 +1994,10 @@ pub const VERIFIED: &[Verified] = &[
         path: "/Sessions/Playing/Stopped",
         upstream_file: "Jellyfin.Api/Controllers/PlaystateController.cs",
         upstream_method: "ReportPlaybackStopped",
-        ferrofin: "handlers/playstate.rs report_playback_stopped (kill_session_transcodes: \
-               KillTranscodingJobs) → ferrofin-core session_manager.rs on_playback_stopped \
+        ferrofin: "handlers/playstate.rs report_playback_stopped (finish_playback_stop, on a \
+               task the request awaits and a hang-up does not cut off; kill_session_transcodes: \
+               KillTranscodingJobs, awaited with its partial-file deletion) → ferrofin-core \
+               session_manager.rs on_playback_stopped \
                (SessionManager.OnPlaybackStopped: the negative-position refusal after releasing the \
                live stream, the reported NowPlayingQueue and PlaylistItemId, RemoveNowPlayingItem's \
                PlayState reset and ClearTranscodingInfo, save_stopped_play_state per session user \
@@ -2015,7 +2017,7 @@ pub const VERIFIED: &[Verified] = &[
         upstream_method: "OnPlaybackStopped",
         ferrofin: "handlers/playstate.rs on_playback_stopped (LegacyStopQuery: mediaSourceId, \
                nextMediaType, positionTicks, liveStreamId, playSessionId) → the POST \
-               /Sessions/Playing/Stopped path from kill_session_transcodes on",
+               /Sessions/Playing/Stopped path from finish_playback_stop on",
         date: "2026-11-02",
         divergences: PLAYBACK_STOP_DIVERGENCES,
         refs: &["user-data"],
@@ -3757,6 +3759,43 @@ pub const VERIFIED: &[Verified] = &[
          the exception middleware's text. Fix path: gl-666.",
         ],
         refs: &["access-filtering"],
+    },
+    Verified {
+        method: "delete",
+        path: "/Videos/ActiveEncodings",
+        upstream_file: "Jellyfin.Api/Controllers/HlsSegmentController.cs",
+        upstream_method: "StopEncodingProcess",
+        ferrofin: "handlers/hls.rs stop_encoding_process (RequireAuth: [Authorize]; Query: \
+               deviceId and playSessionId from query/required.json) → ferrofin-hls \
+               hls_stream_manager.rs stop_encoding → ferrofin-mediaencoding \
+               transcoding/manager.rs stop_transcoding_jobs and kill_matching \
+               (TranscodeManager.KillTranscodingJobs, not awaited: the jobs of that \
+               playSessionId, ignoring ASCII case, each stopped before the 204, as \
+               KillTranscodingJob runs up to its first await), remove_and_tear_down and \
+               tear_down (KillTranscodingJob: out of the registry, \
+               TranscodingJob.Stop, the live stream left open), then on a task of its own \
+               delete_partial_stream_files and FsFileCleaner (DeletePartialStreamFiles and \
+               DeleteHlsPartialStreamFiles: 1500 ms before the first of at most ten attempts, \
+               500 ms before each retry, which only an IOException earns)",
+        date: "2026-11-11",
+        divergences: &[
+            "A killed progressive job's files go by the HLS rule, every file in its directory \
+         whose name holds its stem, so its trimmed subtitle copy goes with its output; \
+         upstream deletes the output file alone and makes no such copy.",
+            "Access denied on one file does not end the attempt, so the job's other files are \
+         still deleted; upstream's UnauthorizedAccessException leaves its loop at that file. \
+         A directory the server may not list is logged as an error; upstream's \
+         IgnoreInaccessible lists it as empty and logs nothing. A file is the job's when its \
+         name holds the stem; upstream matches the whole path, so a directory whose own path \
+         holds the stem would give up every file in it. Jellyfin bugs not ported.",
+            "A file left behind is logged at debug, and each failed attempt once with the count \
+         left, a warning while it will be retried and an error at the last; upstream logs \
+         each file and each attempt at Error (LOGGING.md: nothing above debug that grows \
+         with the segments, an error logged once).",
+            "The 400 for a missing, empty or whitespace-only deviceId or playSessionId is \
+         Ferrofin's error shape, not upstream's. Fix path: gl-666.",
+        ],
+        refs: &[],
     },
     Verified {
         method: "get",
