@@ -3472,12 +3472,11 @@ impl LiveTvManager for FerrofinLiveTvManager {
         options: &DtoOptions,
     ) -> Result<QueryResult<BaseItemDto>, ServiceError> {
         // Port of `LiveTvManager.GetInternalChannels` + the controller's
-        // projection. The generic item repository upstream runs this over SQL;
-        // Ferrofin filters and sorts the loaded lineup instead — identical
-        // results, one query. An IPTV lineup can run to thousands of channels,
-        // so the read derives only the guide kinds this query filters on.
-        // The user's parental restrictions apply in the read, before the page
-        // is cut, as `new InternalItemsQuery(user)` applies them upstream.
+        // projection. The generic item repository upstream runs this over SQL.
+        // Here the read applies the user's parental restrictions (as
+        // `new InternalItemsQuery(user)` does) and the kind filters over the
+        // stored channel items; the type, favourite and like filters and the
+        // sort run over the loaded lineup, all before the page is cut.
         let restrictions = self
             .user_restrictions(&InternalItemsQuery {
                 user: query.user.clone(),
@@ -14434,33 +14433,14 @@ mod tests {
     }
 
     /// The channel kind filters match upstream's split: `isMovie`/`isSeries`
-    /// hit the aggregated channel columns, `isKids` the aggregated "Kids"
-    /// tag, and `isNews`/`isSports` translate to channel tags the guide never
-    /// writes — `true` matches nothing.
+    /// read the channel item's aggregated columns, `isKids` its aggregated
+    /// "Kids" tag, and `isNews`/`isSports` its "News"/"Sports" tags, which
+    /// the guide never writes: without an editor's tag, `true` matches nothing.
     #[tokio::test]
     async fn channel_kind_filters_follow_the_guide_aggregation() {
-        let mut sources = HashMap::new();
-        sources.insert("http://tuner/playlist.m3u".to_owned(), M3U.to_owned());
-        sources.insert("http://guide/xmltv.xml".to_owned(), dated(CLASSIFIED_XMLTV));
-        let mgr = manager_with(FakeFetcher(sources)).await;
-        mgr.save_tuner_host(TunerHostInfo {
-            type_: Some("m3u".to_owned()),
-            url: Some("http://tuner/playlist.m3u".to_owned()),
-            ..TunerHostInfo::default()
-        })
-        .await
-        .expect("tuner");
-        mgr.save_listing_provider(
-            as_xmltv(ListingsProviderInfo {
-                path: Some("http://guide/xmltv.xml".to_owned()),
-                ..ListingsProviderInfo::default()
-            }),
-            false,
-            false,
-        )
-        .await
-        .expect("provider");
-        mgr.refresh_guide().await.expect("refresh");
+        let lab = item_lab(M3U, Some(dated(CLASSIFIED_XMLTV))).await;
+        lab.mgr.refresh_guide().await.expect("refresh");
+        let mgr = lab.mgr.clone();
 
         // Every classified programme airs on Channel One; Channel Two is bare.
         let names = |result: ferrofin_model::querying::QueryResult<BaseItemDto>| {
@@ -14518,8 +14498,8 @@ mod tests {
             ),
             ["Channel One"]
         );
-        // News/Sports are channel *tags* upstream never writes: true matches
-        // nothing, false everything — even though Channel One airs news.
+        // News/Sports are channel tags the guide never writes: true matches
+        // nothing, false everything, even though Channel One airs news.
         let found = names(
             with(LiveTvChannelQuery {
                 is_news: Some(true),

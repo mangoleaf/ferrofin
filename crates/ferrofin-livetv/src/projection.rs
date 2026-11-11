@@ -58,21 +58,6 @@ pub struct ChannelRow {
     /// channel's. Read only by the guide refresh's item mirror.
     #[sqlx(default)]
     pub image_url: Option<String>,
-    /// Whether the guide airs a movie on this channel (upstream
-    /// `LiveTvChannel.IsMovie`, aggregated from the programmes at refresh).
-    ///
-    /// This and the two kinds below are derived only by
-    /// `guide_repository::channel_rows`, and only for the kinds its
-    /// query filters on; everywhere else they read `false`.
-    #[sqlx(default)]
-    pub is_movie: bool,
-    /// Whether the guide airs a series episode on this channel.
-    #[sqlx(default)]
-    pub is_series: bool,
-    /// Whether the guide airs a kids' programme on this channel (upstream
-    /// models this as the channel's "Kids" tag).
-    #[sqlx(default)]
-    pub is_kids: bool,
 }
 
 /// One `FerrofinLiveTvPrograms` row joined to its channel, as the query paths
@@ -143,13 +128,9 @@ pub type ChannelUserData = std::collections::HashMap<String, (bool, Option<f64>)
 
 /// Applies `GetInternalChannels`' filters to the loaded lineup.
 ///
-/// The type filter matches the stored `ChannelType`. The kind flags follow
-/// upstream's split (`BaseItemRepository.TranslateQuery` over channel items
-/// `GuideManager.RefreshChannels` aggregated): `IsMovie`/`IsSeries` match the
-/// channel's aggregated columns, `IsKids` matches the aggregated "Kids" tag,
-/// while `IsNews`/`IsSports` translate to the "News"/"Sports" *tags* — which
-/// the guide refresh never writes onto a channel — so a `true` value matches
-/// nothing and a `false` one everything. `IsDisliked` is accepted and
+/// The type filter matches the stored `ChannelType`. The kind flags are
+/// applied by the read itself ([`crate::guide_repository`]'s `channel_rows`,
+/// from the stored channel items). `IsDisliked` is accepted and
 /// dropped, as upstream's `GetInternalChannels` drops it. The favourite/like
 /// filters read `user_data` (`UserItemData.MinLikeValue` upstream is 6.5 on
 /// the 0–10 rating scale).
@@ -168,18 +149,6 @@ pub fn filter_channel_rows(
             }
         };
         rows.retain(|r| r.channel_type == want);
-    }
-    if let Some(want) = query.is_movie {
-        rows.retain(|r| r.is_movie == want);
-    }
-    if let Some(want) = query.is_series {
-        rows.retain(|r| r.is_series == want);
-    }
-    if let Some(want) = query.is_kids {
-        rows.retain(|r| r.is_kids == want);
-    }
-    if query.is_news == Some(true) || query.is_sports == Some(true) {
-        rows.clear();
     }
     if let Some(want) = query.is_favorite {
         rows.retain(|r| user_data.get(&r.id).is_some_and(|d| d.0) == want);
@@ -1476,9 +1445,6 @@ mod tests {
             channel_type: "Tv".to_owned(),
             date_created: None,
             image_url: None,
-            is_movie: false,
-            is_series: false,
-            is_kids: false,
         };
         let entity = channel_entity(&row, parse, Some(view));
         assert_eq!(entity.type_, CHANNEL_TYPE_NAME);
@@ -1515,9 +1481,6 @@ mod tests {
             channel_type: "Tv".to_owned(),
             date_created: None,
             image_url: None,
-            is_movie: false,
-            is_series: false,
-            is_kids: false,
         };
         let fresh = channel_entity(&row, parse, Some(view));
 
@@ -1604,9 +1567,6 @@ mod tests {
             channel_type: "Tv".to_owned(),
             date_created: Some(created.to_owned()),
             image_url: None,
-            is_movie: false,
-            is_series: false,
-            is_kids: false,
         };
         // `e` and `c` share the sort key "0000000002.00000-alpha".
         let lineup = vec![

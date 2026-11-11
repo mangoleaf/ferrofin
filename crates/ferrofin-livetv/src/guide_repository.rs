@@ -50,22 +50,18 @@ pub(crate) const PROGRAM_SELECT: &str = r#"SELECT p."Id",p."ChannelId",p."StartD
                       c."ChannelType" AS "ChannelMediaKind"
                FROM "FerrofinLiveTvPrograms" p
                JOIN "FerrofinLiveTvChannels" c ON c."Id" = p."ChannelId""#;
-/// Every channel in the lineup, in stored (`SortIndex`) order.
+/// Every channel in the lineup the kind filters of `query` keep, in stored
+/// (`SortIndex`) order.
 ///
-/// Each kind `query` filters on (`IsMovie`, `IsSeries`, `IsKids`) is derived
-/// from the guide the way `GuideManager.RefreshChannels` aggregates it onto
-/// upstream channel items (`isMovie |= program.IsMovie; ...`, plus the "Kids"
-/// tag). The kinds it does not filter on read as `false`: only the channel
-/// kind filters read them, and each one costs a pass over the airings.
-///
-/// The guide refresh stores the aggregate on the channel items too
-/// (`save_channel_aggregates`), which is what the item queries read. The two
-/// differ for `IsKids`, whose stored "Kids" tag stays once added, as upstream's
-/// does, where this derivation drops a channel whose kids airing left the
-/// guide; and for `IsSeries`, which is stored from the listing's flag where
-/// this reads `GetProgram`'s widened one (`IsSeries || EpisodeTitle`), so a
-/// channel airing only sub-titled episodes matches here and not there
-/// (gl-1620).
+/// Upstream's `GetInternalChannels` lists the stored channel items, so its
+/// kind filters read what the guide refresh stored on them
+/// (`save_channel_aggregates`; `TranslateQuery`, v12.4
+/// Jellyfin.Server.Implementations/Item/BaseItemRepository.TranslateQuery.cs:206-258,665-677):
+/// `IsMovie` and `IsSeries` the item's columns, `IsKids`, `IsNews` and
+/// `IsSports` its "Kids", "News" and "Sports" tags: any of the tags asked for,
+/// none of those asked against. The "Kids" tag stays once
+/// added, so a channel whose kids airing left the guide still matches. A
+/// channel whose item is not stored has neither flags nor tags.
 ///
 /// `restrictions` are the user's parental restrictions, which keep only the
 /// channels whose item that user may list.
@@ -91,41 +87,70 @@ fn channel_rows_query(
     restrictions: UserRestrictions<'_>,
 ) -> sqlx::QueryBuilder<sqlx::Sqlite> {
     let mut qb = sqlx::QueryBuilder::new(
-        r#"SELECT "Id","TvgId","ExternalId","Name","Number","ChannelType","DateCreated","ImageUrl""#,
+        r#"SELECT "Id","TvgId","ExternalId","Name","Number","ChannelType","DateCreated","ImageUrl"
+           FROM "FerrofinLiveTvChannels""#,
     );
-    // A kind left out reads as `false` (`ChannelRow`'s `#[sqlx(default)]`).
-    for (filter, kind) in [
-        (query.is_movie, "IsMovie"),
-        (query.is_series, "IsSeries"),
-        (query.is_kids, "IsKids"),
-    ] {
-        if filter.is_some() {
+    let mut joiner = " WHERE ";
+    if let Some(restrictions) = restrictions {
+        qb.push(std::mem::replace(&mut joiner, " AND "));
+        push_item_restrictions(&mut qb, r#""FerrofinLiveTvChannels"."Id""#, restrictions);
+    }
+    for (filter, column) in [(query.is_movie, "IsMovie"), (query.is_series, "IsSeries")] {
+        if let Some(want) = filter {
+            qb.push(std::mem::replace(&mut joiner, " AND "));
             qb.push(format_args!(
-                r#",EXISTS(SELECT 1 FROM "FerrofinLiveTvPrograms" p
-                     WHERE p."ChannelId" = "FerrofinLiveTvChannels"."Id" AND p."{kind}" = 1) AS "{kind}""#
-            ));
+                r#"COALESCE((SELECT bi."{column}" FROM "BaseItems" bi
+                     WHERE bi."Id" = "FerrofinLiveTvChannels"."Id"), 0) = "#
+            ))
+            .push_bind(want);
         }
     }
-    qb.push(r#" FROM "FerrofinLiveTvChannels""#);
-    if let Some(restrictions) = restrictions {
-        qb.push(" WHERE ");
-        push_item_restrictions(&mut qb, r#""FerrofinLiveTvChannels"."Id""#, restrictions);
+    // Upstream gathers the kinds asked for as one tag list and the kinds asked
+    // against as one excluded list: a channel matches when it carries any of
+    // the first and none of the second.
+    let kinds = [
+        (query.is_kids, "Kids"),
+        (query.is_news, "News"),
+        (query.is_sports, "Sports"),
+    ];
+    for want in [true, false] {
+        let tags: Vec<String> = kinds
+            .iter()
+            .filter(|(filter, _)| *filter == Some(want))
+            .map(|(_, tag)| ferrofin_util::string_extensions::get_clean_value(tag))
+            .collect();
+        if tags.is_empty() {
+            continue;
+        }
+        qb.push(std::mem::replace(&mut joiner, " AND "));
+        if !want {
+            qb.push("NOT ");
+        }
+        qb.push(
+            r#"EXISTS (SELECT 1 FROM "ItemValuesMap" m
+               JOIN "ItemValues" v ON v."ItemValueId" = m."ItemValueId"
+               WHERE m."ItemId" = "FerrofinLiveTvChannels"."Id" AND v."Type" = "#,
+        )
+        .push_bind(i32::from(ferrofin_db::enums::ItemValueType::Tags))
+        .push(r#" AND v."CleanValue" IN ("#);
+        let mut separated = qb.separated(", ");
+        for tag in tags {
+            separated.push_bind(tag);
+        }
+        qb.push("))");
     }
     qb.push(r#" ORDER BY "SortIndex", "Name""#);
     qb
 }
 
-/// One channel by id, or `None` when unknown. The aggregated kind flags are
-/// not derived here — nothing on the single-channel path reads them (they are
-/// `[JsonIgnore]` upstream, filter-only).
+/// One channel by id, or `None` when unknown.
 ///
 /// # Errors
 ///
 /// Fails when the database read fails.
 pub async fn channel_row(db: &Database, id: Uuid) -> Result<Option<ChannelRow>, ServiceError> {
     sqlx::query_as(
-        r#"SELECT "Id","TvgId","ExternalId","Name","Number","ChannelType","DateCreated",
-                  0 AS "IsMovie", 0 AS "IsSeries", 0 AS "IsKids"
+        r#"SELECT "Id","TvgId","ExternalId","Name","Number","ChannelType","DateCreated"
            FROM "FerrofinLiveTvChannels" WHERE "Id" = ?1"#,
     )
     .bind(guid_to_db(id))
@@ -155,8 +180,7 @@ pub async fn channel_rows_by_ids(
     // this lookup to run.
     for chunk in ferrofin_db::padded_in_chunks(ids) {
         let mut qb: sqlx::QueryBuilder<sqlx::Sqlite> = sqlx::QueryBuilder::new(
-            r#"SELECT "Id","TvgId","ExternalId","Name","Number","ChannelType","DateCreated",
-                  0 AS "IsMovie", 0 AS "IsSeries", 0 AS "IsKids"
+            r#"SELECT "Id","TvgId","ExternalId","Name","Number","ChannelType","DateCreated"
            FROM "FerrofinLiveTvChannels" WHERE "Id" IN ("#,
         );
         let mut separated = qb.separated(", ");
