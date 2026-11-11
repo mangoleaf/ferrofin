@@ -1995,7 +1995,8 @@ pub const VERIFIED: &[Verified] = &[
         upstream_file: "Jellyfin.Api/Controllers/PlaystateController.cs",
         upstream_method: "ReportPlaybackStopped",
         ferrofin: "handlers/playstate.rs report_playback_stopped (kill_session_transcodes: \
-               KillTranscodingJobs) → ferrofin-core session_manager.rs on_playback_stopped \
+               KillTranscodingJobs, only for a PlaySessionId that is not blank) → ferrofin-core \
+               session_manager.rs on_playback_stopped \
                (SessionManager.OnPlaybackStopped: the negative-position refusal after releasing the \
                live stream, the reported NowPlayingQueue and PlaylistItemId, RemoveNowPlayingItem's \
                PlayState reset and ClearTranscodingInfo, save_stopped_play_state per session user \
@@ -2004,7 +2005,7 @@ pub const VERIFIED: &[Verified] = &[
                kept now-playing item when the stop names it (info.Item = current), else the row \
                the stop read, none once the library no longer has it) → \
                playback_activity.rs (PlaybackStopLogger, from that MediaInfo, reading nothing)",
-        date: "2026-11-06",
+        date: "2026-11-11",
         divergences: PLAYBACK_STOP_DIVERGENCES,
         refs: &["user-data"],
     },
@@ -2016,7 +2017,7 @@ pub const VERIFIED: &[Verified] = &[
         ferrofin: "handlers/playstate.rs on_playback_stopped (LegacyStopQuery: mediaSourceId, \
                nextMediaType, positionTicks, liveStreamId, playSessionId) → the POST \
                /Sessions/Playing/Stopped path from kill_session_transcodes on",
-        date: "2026-11-02",
+        date: "2026-11-11",
         divergences: PLAYBACK_STOP_DIVERGENCES,
         refs: &["user-data"],
     },
@@ -3879,8 +3880,6 @@ const PLAYBACK_PROGRESS_DIVERGENCES: &[&str] = &[
 
 /// The divergences of the two playback-stop reports.
 const PLAYBACK_STOP_DIVERGENCES: &[&str] = &[
-    "A stop naming no PlaySessionId kills every transcode on the caller's device; upstream \
-     kills none. Fix path: gl-1184.",
     "A report's own Item is not used: the log line and the activity entry name the library \
      item, as the session shows it or, for an item it does not show, as the stop read it. Fix \
      path: gl-1062.",

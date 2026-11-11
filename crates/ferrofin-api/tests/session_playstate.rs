@@ -2159,6 +2159,43 @@ async fn stopped_with_session_kills_transcode_and_records() {
     assert!(hls.pings.lock().unwrap().is_empty());
 }
 
+/// `PlaystateController.ReportPlaybackStopped` and `OnPlaybackStopped` kill
+/// transcodes only `if (!string.IsNullOrWhiteSpace(PlaySessionId))`: a stop
+/// with no play session, or a blank one, records playstate and leaves every
+/// transcode on the caller's device running (gl-1184).
+#[tokio::test]
+async fn a_stop_without_a_play_session_kills_no_transcode() {
+    let user = Uuid::from_u128(0x11);
+    let (sessions, user_data) = recording();
+    let hls = Arc::new(RecordingHls::default());
+    let app = state_with_hls(sessions.clone(), user_data, hls.clone());
+    for play_session_id in [None, Some(""), Some(" ")] {
+        let info = PlaybackStopInfo {
+            item_id: ITEM_ID,
+            play_session_id: play_session_id.map(str::to_owned),
+            ..PlaybackStopInfo::default()
+        };
+        let (status, _) = send(
+            app.clone(),
+            "POST",
+            "/Sessions/Playing/Stopped",
+            Body::from(serde_json::to_vec(&info).unwrap()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+    }
+    for uri in [
+        format!("/PlayingItems/{ITEM_ID}"),
+        format!("/PlayingItems/{ITEM_ID}?playSessionId=%20"),
+        format!("/Users/{user}/PlayingItems/{ITEM_ID}"),
+    ] {
+        let (status, _) = send(app.clone(), "DELETE", &uri, Body::empty()).await;
+        assert_eq!(status, StatusCode::NO_CONTENT, "{uri}");
+    }
+    assert_eq!(sessions.calls.lock().unwrap().stops, 6);
+    assert!(hls.stops.lock().unwrap().is_empty());
+}
+
 #[tokio::test]
 async fn transcode_dispatch_rejection_is_swallowed() {
     // The default state's disabled HLS runtime rejects both the ping and the
