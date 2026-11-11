@@ -2124,6 +2124,39 @@ pub const VERIFIED: &[Verified] = &[
         refs: &["images"],
     },
     Verified {
+        method: "delete",
+        path: "/Items/{itemId}/Images/{imageType}",
+        upstream_file: "Jellyfin.Api/Controllers/ImageController.cs",
+        upstream_method: "DeleteItemImage",
+        ferrofin: "handlers/images.rs delete_item_image (RequireAdmin, as RequiresElevation; \
+               ImageIndexQuery: imageIndex is the action's only query member, so a malformed \
+               one is the binder's 400 before the item is read, a blank one is 0, and no other \
+               query parameter is read, measured on 12.4; require_item, GetItemById(itemId, \
+               User.GetUserId()): a missing item, or one a signed-in user cannot see, is a 404, \
+               and an API key's caller is not checked) → ferrofin-providers \
+               provider_manager.rs delete_image (BaseItem.DeleteImageAsync: a missing slot or a \
+               negative index is nothing to do, with no save; otherwise a local row's file is \
+               deleted and the item saved with ItemUpdateType.ImageUpdate) → ferrofin-core \
+               item_persistence_service.rs delete_item_image (GetImages(type) \
+               .ElementAtOrDefault(index), the row's path expanded as ExpandVirtualPath)",
+        date: "2026-11-11",
+        divergences: &[
+            "A file that cannot be deleted still removes the image: the row goes first and the \
+             file error is dropped, a 204, where DeleteImageAsync deletes the file first and a \
+             failure is a 500 that keeps the image (measured on 12.4). Fix path: gl-1663.",
+            "A Chapter image's file is not deleted: chapter images are not image rows, so the \
+             delete finds nothing and answers 204, where GetImageInfo returns the chapter's \
+             image and DeleteImageAsync deletes its file. Fix path: gl-1663.",
+            "A file in the shared album-covers directory is kept, as an album and its tracks \
+             name the same file there (docs/MUSIC_ARTWORK.md); DeleteImageAsync deletes any \
+             local file, a track's extracted cover that the album's other tracks share \
+             (AudioImageProvider.GetAudioImagePath) included, which leaves them naming a \
+             missing file. Whether tracks keep the album's cover is gl-692.",
+            "The 400 and 404 bodies are Ferrofin's error shape, not upstream's. Fix path: gl-666.",
+        ],
+        refs: &["images"],
+    },
+    Verified {
         method: "post",
         path: "/UserImage",
         upstream_file: "Jellyfin.Api/Controllers/ImageController.cs",

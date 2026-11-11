@@ -1938,6 +1938,33 @@ async fn delete_item_image_with_a_malformed_index_is_400() {
     assert!(s.providers.deleted.lock().expect("lock").is_empty());
 }
 
+/// gl-1119: `DeleteItemImage` declares one query member, `imageIndex`, so a
+/// malformed size, quality or overlay value is never read, and a missing item
+/// is then the `404`. Measured on 12.4.
+#[rstest::rstest]
+#[case::max_width(ITEM_ID, "maxWidth=x", StatusCode::NO_CONTENT, Some(0))]
+#[case::quality(ITEM_ID, "quality=x", StatusCode::NO_CONTENT, Some(0))]
+#[case::percent_played(ITEM_ID, "percentPlayed=x", StatusCode::NO_CONTENT, Some(0))]
+#[case::unplayed_count(ITEM_ID, "unplayedCount=x", StatusCode::NO_CONTENT, Some(0))]
+#[case::blank_image_index(ITEM_ID, "imageIndex=", StatusCode::NO_CONTENT, Some(0))]
+#[case::hex_image_index(ITEM_ID, "imageIndex=0x1", StatusCode::NO_CONTENT, Some(1))]
+#[case::missing_item(MISSING_ID, "maxWidth=x", StatusCode::NOT_FOUND, None)]
+#[tokio::test]
+async fn delete_item_image_binds_only_its_image_index(
+    #[case] item: Uuid,
+    #[case] query: &str,
+    #[case] expected: StatusCode,
+    #[case] deleted_index: Option<i32>,
+) {
+    let s = elevated_stubs(String::new(), String::new());
+    let uri = format!("/Items/{item}/Images/Primary?{query}");
+    let (status, _) = send(&s, "DELETE", &uri, None).await;
+    assert_eq!(status, expected, "{uri}");
+    let deleted = s.providers.deleted.lock().expect("lock").clone();
+    let expected_deleted: Vec<_> = deleted_index.map(|i| (ITEM_ID, i)).into_iter().collect();
+    assert_eq!(deleted, expected_deleted, "{uri}");
+}
+
 #[tokio::test]
 async fn delete_item_image_missing_item_is_404() {
     let s = elevated_stubs(String::new(), String::new());

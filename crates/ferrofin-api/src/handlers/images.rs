@@ -1334,12 +1334,12 @@ impl LegacyUserImageQuery {
     }
 }
 
-/// `GetUserImageLegacy`'s `[FromQuery] int? imageIndex`, bound and dropped. The
-/// indexed form takes it from the route, so there `?imageIndex=x` is not read.
-#[allow(dead_code)] // Only the binder reads it.
+/// `[FromQuery] int? imageIndex` as the action's only query member: what
+/// `DeleteItemImage` declares, and what `GetUserImageLegacy` binds and drops. The
+/// indexed forms take it from the route, so there `?imageIndex=x` is not read.
 #[derive(Debug, Default, serde::Deserialize)]
 #[serde(default, rename_all = "camelCase")]
-struct LegacyImageIndexQuery {
+struct ImageIndexQuery {
     image_index: Option<i32>,
 }
 
@@ -1488,7 +1488,7 @@ async fn get_user_image_legacy(
     auth: Result<AuthenticatedIdentity, ApiError>,
     Path((DotnetGuid(user_id), image_type)): Path<(DotnetGuid, String)>,
     Query(query): Query<LegacyUserImageQuery>,
-    Query(_): Query<LegacyImageIndexQuery>,
+    Query(_): Query<ImageIndexQuery>,
     request: Request,
 ) -> Result<Response, ApiError> {
     // `[FromRoute, Required] ImageType`: bound (400 when invalid), then ignored.
@@ -1682,7 +1682,9 @@ async fn set_item_image_by_index(
 ///
 /// Port of `ImageController.DeleteItemImage`. A missing item is `404`; the image
 /// index comes from the optional `imageIndex` query parameter (default `0`, as in
-/// C#'s `imageIndex ?? 0`). On success the handler returns `204`.
+/// C#'s `imageIndex ?? 0`), the action's only query member: a malformed one is
+/// the binder's `400` before the item is read, and no other is read. On success
+/// the handler returns `204`.
 #[utoipa::path(
     delete,
     path = "/Items/{itemId}/Images/{imageType}",
@@ -1701,15 +1703,13 @@ async fn delete_item_image(
     State(state): State<AppState>,
     RequireAdmin(auth): RequireAdmin,
     Path((DotnetGuid(item_id), image_type)): Path<(DotnetGuid, String)>,
-    Query(query): Query<ImageQuery>,
+    Query(query): Query<ImageIndexQuery>,
 ) -> Result<StatusCode, ApiError> {
     let image_type = parse_image_type(&image_type)?;
-    // Bound before the item is read, as the binder's `400` comes first upstream.
-    let index = query.query_image_index()?;
     require_item(&state, item_id, auth.user.as_deref()).await?;
     state
         .providers
-        .delete_image(item_id, image_type, Some(index))
+        .delete_image(item_id, image_type, Some(query.image_index.unwrap_or(0)))
         .await?;
     Ok(StatusCode::NO_CONTENT)
 }
@@ -1906,10 +1906,10 @@ pub fn register(router: Router<AppState>) -> Router<AppState> {
 }
 
 crate::query::query_parameters! {
-    ImageQuery {} => [("get", "/Items/{itemId}/Images/{imageType}"), ("get", "/Items/{itemId}/Images/{imageType}/{imageIndex}"), ("delete", "/Items/{itemId}/Images/{imageType}")];
+    ImageQuery {} => [("get", "/Items/{itemId}/Images/{imageType}"), ("get", "/Items/{itemId}/Images/{imageType}/{imageIndex}")];
     UserImageQuery {} => [("get", "/UserImage")];
     LegacyUserImageQuery {} => [];
-    LegacyImageIndexQuery {} => [];
+    ImageIndexQuery {} => [("delete", "/Items/{itemId}/Images/{imageType}")];
     LegacyDeleteIndexQuery {} => [];
     UpdateImageIndexQuery {} => [("post", "/Items/{itemId}/Images/{imageType}/{imageIndex}/Index")];
 }
