@@ -3004,6 +3004,27 @@ async fn critic_reviews_are_empty() {
     assert!(result.items.is_empty(), "{:?}", result.items);
 }
 
+/// Jellyfin 10.11.8's `GetCriticReviews` binds no id at all, so whatever fills
+/// the `{itemId}` segment, a GUID or not, gets the empty result.
+#[tokio::test]
+async fn critic_reviews_take_any_item_id() {
+    for item_id in [
+        "not-a-guid",
+        "urn:uuid:00000000-0000-0000-0000-000000000001",
+        "%20",
+    ] {
+        let (status, body) = send(
+            "GET",
+            &format!("/Items/{item_id}/CriticReviews"),
+            Body::empty(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{item_id}");
+        let result: QueryResult<BaseItemDto> = serde_json::from_slice(&body).expect("result");
+        assert!(result.items.is_empty(), "{item_id}: {:?}", result.items);
+    }
+}
+
 #[tokio::test]
 async fn latest_returns_flattened_items() {
     let (status, body) = send("GET", "/Items/Latest", Body::empty()).await;

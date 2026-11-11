@@ -637,9 +637,14 @@ where
 /// [`RequiredRouteString`]. Each such parameter gets a marker type that
 /// implements this.
 pub trait RouteParameter {
-    /// The parameter's name in the route template (`{lyricId}` is
-    /// `"lyricId"`), which is also the key ASP.NET files its error under.
+    /// The parameter's name in Jellyfin's route template (`{lyricId}` is
+    /// `"lyricId"`), which is the key ASP.NET files its error under.
     const NAME: &'static str;
+    /// The name Ferrofin's route template gives the segment. The router names
+    /// every parameter at one position after the first name the contract uses
+    /// there ([`routes::normalize_contract_path`](crate::routes::normalize_contract_path)),
+    /// so `/Artists/{name}` is registered as `/Artists/{itemId}`.
+    const ROUTE_NAME: &'static str = Self::NAME;
 }
 
 /// A `[FromRoute, Required] string` route parameter, bound the way ASP.NET
@@ -669,25 +674,40 @@ where
         let params = RawPathParams::from_request_parts(parts, state)
             .await
             .map_err(IntoResponse::into_response)?;
-        let Some((_, value)) = params.iter().find(|(name, _)| *name == P::NAME) else {
+        let Some((_, value)) = params.iter().find(|(name, _)| *name == P::ROUTE_NAME) else {
             // The handler names a parameter its route does not have. That is
             // a bug in the route table, not a bad request.
-            tracing::error!(parameter = P::NAME, "route has no such parameter");
+            tracing::error!(parameter = P::ROUTE_NAME, "route has no such parameter");
             return Err((
                 StatusCode::INTERNAL_SERVER_ERROR,
                 axum::Extension(crate::error::FailureLogged),
             )
                 .into_response());
         };
-        if value.trim().is_empty() {
-            return Err(ProblemDetails::member_validation(
-                P::NAME,
-                format!("The {} field is required.", P::NAME),
-            )
-            .into_response());
+        if let Some(rejection) = blank_route_values([(P::NAME, value)]) {
+            return Err(rejection);
         }
         Ok(Self(value.to_owned(), PhantomData))
     }
+}
+
+/// [`RequiredRouteString`]'s rule for route values a handler reads itself:
+/// a part of one captured segment (`Stream.{routeFormat}`,
+/// `{segmentId}.{segmentContainer}`), or a value taken by position because the
+/// route repeats a parameter name. The `400` names every blank
+/// `(name, value)`, as the model-state filter reports every failing parameter
+/// in one body; `None` when each value has text. Values bound by different
+/// extractors still answer first-wins (gl-1672).
+pub(crate) fn blank_route_values<'a>(
+    values: impl IntoIterator<Item = (&'a str, &'a str)>,
+) -> Option<Response> {
+    ProblemDetails::members_validation(
+        values
+            .into_iter()
+            .filter(|(_, value)| value.trim().is_empty())
+            .map(|(name, _)| (name.to_owned(), format!("The {name} field is required."))),
+    )
+    .map(IntoResponse::into_response)
 }
 
 /// A route or query `Guid`, bound the way ASP.NET binds one. Extract it as

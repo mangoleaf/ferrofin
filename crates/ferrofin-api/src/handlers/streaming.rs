@@ -226,7 +226,8 @@ pub(crate) async fn static_source(
 }
 
 /// The container a `stream.{container}` route segment names, or `None` when the
-/// segment is not that route.
+/// segment is not that route. The subtitle routes' `Stream.{routeFormat}` is
+/// the same literal.
 ///
 /// The route registers as one capture (`routes::to_axum_path`), so the literal
 /// is checked here, in any case, as ASP.NET matches a route's literals. The

@@ -9,7 +9,7 @@
 //! to its by-name `Person` item, mirroring `ILibraryManager.GetPeopleItems`. The
 //! per-name image routes are Batch 9.
 
-use axum::extract::{Path, State};
+use axum::extract::State;
 use axum::routing::get;
 use axum::{Json, Router};
 use ferrofin_model::data::BaseItemKind;
@@ -20,7 +20,7 @@ use uuid::Uuid;
 
 use crate::auth::RequireAuth;
 use crate::error::ApiError;
-use crate::extract::Query;
+use crate::extract::{Query, RequiredRouteString, RouteParameter};
 use crate::handlers::by_name::{ByNameItemQuery, additional_dto_options, project_item_rows};
 use crate::handlers::items::{resolve_user_or_api_key, user_uuid};
 use crate::handlers::query_parse::parse_csv_enums_lenient;
@@ -175,6 +175,13 @@ async fn get_persons(
     Ok(Json(projected))
 }
 
+/// `{name}`, the `[FromRoute, Required] string` of `GetPerson`.
+struct Name;
+
+impl RouteParameter for Name {
+    const NAME: &'static str = "name";
+}
+
 /// `GET /Persons/{name}` — a single person by name.
 ///
 /// Port of `PersonsController.GetPerson`. A missing person is a `404`, matching
@@ -192,7 +199,7 @@ async fn get_persons(
 async fn get_person(
     State(state): State<AppState>,
     RequireAuth(auth): RequireAuth,
-    Path(name): Path<String>,
+    RequiredRouteString(name, _): RequiredRouteString<Name>,
     Query(query): Query<ByNameItemQuery>,
 ) -> Result<Json<BaseItemDto>, ApiError> {
     let user = resolve_user_or_api_key(&state, &auth, query.user_id).await?;

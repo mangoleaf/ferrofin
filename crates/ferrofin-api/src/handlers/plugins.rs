@@ -46,7 +46,7 @@ use uuid::Uuid;
 
 use crate::auth::{RequireAdmin, RequireAuth};
 use crate::error::ApiError;
-use crate::extract::{DotnetGuid, JsonSeqBody, Query};
+use crate::extract::{DotnetGuid, JsonSeqBody, Query, RequiredRouteString, RouteParameter};
 use crate::state::AppState;
 
 /// Ports Jellyfin's `RequiresElevation` policy for the plugin-mutating
@@ -574,6 +574,14 @@ fn parse_assembly_guid(raw: Option<&str>) -> Result<Option<Uuid>, ApiError> {
     }
 }
 
+/// `{name}`, the `[FromRoute, Required] string` of `GetPackageInfo` and
+/// `InstallPackage`.
+struct PackageName;
+
+impl RouteParameter for PackageName {
+    const NAME: &'static str = "name";
+}
+
 /// `GET /Packages/{name}` — a package by name or assembly GUID.
 ///
 /// Port of `PackageController.GetPackageInfo`:
@@ -609,7 +617,7 @@ fn parse_assembly_guid(raw: Option<&str>) -> Result<Option<Uuid>, ApiError> {
 async fn get_package_info(
     State(state): State<AppState>,
     RequireAdmin(_auth): RequireAdmin,
-    Path(name): Path<String>,
+    RequiredRouteString(name, _): RequiredRouteString<PackageName>,
     Query(query): Query<PackageInfoQuery>,
 ) -> Result<Json<PackageInfo>, ApiError> {
     let assembly_guid = parse_assembly_guid(query.assembly_guid.as_deref())?;
@@ -670,7 +678,7 @@ struct InstallPackageQuery {
 async fn install_package(
     State(state): State<AppState>,
     RequireAdmin(auth): RequireAdmin,
-    Path(name): Path<String>,
+    RequiredRouteString(name, _): RequiredRouteString<PackageName>,
     Query(query): Query<InstallPackageQuery>,
 ) -> Result<StatusCode, ApiError> {
     require_admin(&state, &auth).await?;
