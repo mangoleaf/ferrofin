@@ -48,9 +48,11 @@ pub struct ImageParentRow {
     pub parent_id: Option<String>,
     /// `OwnerId`, if any.
     pub owner_id: Option<String>,
-    /// `SeriesId`, if any (a season's display parent).
+    /// `SeriesId`, if any (a season's display parent; the zero GUID reads as `None`).
+    #[sqlx(try_from = "crate::entities::unset::NonNilGuid")]
     pub series_id: Option<String>,
-    /// `SeasonId`, if any (an episode's display parent).
+    /// `SeasonId`, if any (an episode's display parent; the zero GUID reads as `None`).
+    #[sqlx(try_from = "crate::entities::unset::NonNilGuid")]
     pub season_id: Option<String>,
     /// The pipe-joined album artists (`AlbumArtists`), if any.
     pub album_artists: Option<String>,

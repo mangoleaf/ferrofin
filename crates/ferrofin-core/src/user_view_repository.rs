@@ -402,14 +402,18 @@ async fn create_canonical_copy(
     let presentation_key = Uuid::parse_str(canonical_db)
         .map(|id| id.as_simple().to_string())
         .map_err(|e| ServiceError::backend(format!("canonical view id: {e}")))?;
-    sqlx::query(
+    sqlx::query(concat!(
         r#"INSERT INTO "BaseItems"
            ("Id", "Type", "Name", "SortName", "ForcedSortName", "Path",
             "DateCreated", "DateModified", "Data", "TopParentId",
             "PresentationUniqueKey", "IsFolder", "IsInMixedFolder", "IsLocked",
-            "IsMovie", "IsRepeat", "IsSeries", "IsVirtualItem")
-           VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, 1, 0, 0, 0, 0, 0, 0)"#,
-    )
+            "IsMovie", "IsRepeat", "IsSeries", "IsVirtualItem", "UnratedType", "#,
+        crate::item_persistence_service::unset_columns!(),
+        r#")
+           VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, 1, 0, 0, 0, 0, 0, 0, ?12, "#,
+        crate::item_persistence_service::unset_values!(),
+        ")"
+    ))
     .bind(canonical_db)
     .bind(&source.type_)
     .bind(&source.name)
@@ -421,6 +425,9 @@ async fn create_canonical_copy(
     .bind(&source.data)
     .bind(&source.top_parent_id)
     .bind(&presentation_key)
+    .bind(crate::item_persistence_service::unrated_type_name(
+        crate::item_type_lookup::kind_from_type_name(&source.type_).unwrap_or(BaseItemKind::Folder),
+    ))
     .execute(&mut **tx)
     .await
     .map_err(db_err)?;
@@ -876,6 +883,11 @@ mod tests {
         assert_eq!(
             view.top_parent_id.as_deref(),
             Some(guid_to_db(canonical).as_str())
+        );
+        // Upstream's values where the view has none (gl-1580).
+        assert_eq!(
+            crate::item_persistence_service::null_mapper_columns(&db, canonical).await,
+            Vec::<&str>::new()
         );
         assert!(
             fetch_item_opt(&db, stale_id).await.is_none(),

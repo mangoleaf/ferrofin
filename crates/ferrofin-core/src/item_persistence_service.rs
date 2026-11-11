@@ -79,6 +79,78 @@ pub(crate) const REPAIR_PARTITION: i64 = 10_000;
 /// `(Id, SeriesId, IndexNumber, PresentationUniqueKey)`.
 type SeasonKeyRow = (String, Option<String>, Option<i64>, Option<String>);
 
+/// The `BaseItems` columns upstream writes a value for on every row the item has none of, which
+/// an `INSERT` that bypasses the upsert lists beside its own: `BaseItemMapper.Map` (v12.4
+/// `BaseItemMapper.cs:306-414`) writes every column on every save, so an item with no channel,
+/// lists, size or media type stores the property's default ([`unset_values!`]). `UnratedType`
+/// depends on the kind, so each insert binds it ([`unrated_type_name`]). The upsert derives the
+/// same values in [`columns_of`]; rows read the zero GUID and the empty lists back as `None`
+/// (`ferrofin_db::entities::unset`).
+macro_rules! unset_columns {
+    () => {
+        r#""ChannelId","Genres","Studios","Tags","ProductionLocations","Width","Height","MediaType""#
+    };
+}
+
+/// [`unset_columns!`]'s values: the zero GUID, the four joined empty lists, `0` twice and
+/// `MediaType.Unknown`.
+macro_rules! unset_values {
+    () => {
+        "'00000000-0000-0000-0000-000000000000','','','','',0,0,'Unknown'"
+    };
+}
+
+/// [`unset_columns!`]'s values copied from a stored row, each column's default where the row
+/// has none.
+macro_rules! unset_copied {
+    () => {
+        r#"coalesce(nullif("ChannelId",''),'00000000-0000-0000-0000-000000000000'),
+           coalesce("Genres",''),coalesce("Studios",''),coalesce("Tags",''),
+           coalesce("ProductionLocations",''),coalesce("Width",0),coalesce("Height",0),
+           coalesce(nullif("MediaType",''),'Unknown')"#
+    };
+}
+
+pub(crate) use {unset_columns, unset_values};
+
+/// Test-only: the columns of `BaseItems` row `id` that hold NULL among [`unset_columns!`] and
+/// `UnratedType`, which every writer fills (gl-1580).
+#[cfg(test)]
+pub(crate) async fn null_mapper_columns(db: &Database, id: Uuid) -> Vec<&'static str> {
+    const COLUMNS: [&str; 9] = [
+        "ChannelId",
+        "Genres",
+        "Studios",
+        "Tags",
+        "ProductionLocations",
+        "Width",
+        "Height",
+        "MediaType",
+        "UnratedType",
+    ];
+    let mut nulls = Vec::new();
+    for column in COLUMNS {
+        let sql = format!(r#"SELECT "{column}" IS NULL FROM "BaseItems" WHERE "Id" = ?1"#);
+        let null: bool = sqlx::query_scalar(sqlx::AssertSqlSafe(sql))
+            .bind(guid_to_db(id))
+            .fetch_one(db.pool())
+            .await
+            .expect("the row exists");
+        if null {
+            nulls.push(column);
+        }
+    }
+    nulls
+}
+
+/// The `UnratedType` upstream stores for a `kind` with no channel: `GetBlockUnratedType()`
+/// (`BaseItemMapper.cs:411`), the table [`crate::kinds::unrated_item`] ports.
+pub(crate) fn unrated_type_name(kind: BaseItemKind) -> String {
+    crate::kinds::unrated_item(kind, false)
+        .json_name()
+        .into_owned()
+}
+
 /// Maps an `ItemValues.Type` discriminant to the stored `BaseItems.Type` name of
 /// its browsable by-name item, or [`None`] for value types with no browse tab
 /// (tags — handled elsewhere).
@@ -177,18 +249,23 @@ fn item_value_ids_sql(count: usize) -> String {
 fn by_name_insert_sql(count: usize) -> String {
     format!(
         r#"INSERT INTO "BaseItems"
-           ("Id","Type","Name","CleanName","SortName","PresentationUniqueKey",
+           ("Id","Type","Name","CleanName","SortName","PresentationUniqueKey","UnratedType",
             "IsFolder","IsInMixedFolder",
-            "IsLocked","IsMovie","IsRepeat","IsSeries","IsVirtualItem")
-           SELECT v.column1, v.column2, v.column3, v.column4, v.column5, v.column6,
-                  0, 0, 0, 0, 0, 0, 0
-           FROM (VALUES {}) AS v
+            "IsLocked","IsMovie","IsRepeat","IsSeries","IsVirtualItem",{columns})
+           SELECT v.column1, v.column2, v.column3, v.column4, v.column5, v.column6, v.column7,
+                  0, 0, 0, 0, 0, 0, 0, {values}
+           FROM (VALUES {rows}) AS v
            WHERE NOT EXISTS (
                SELECT 1 FROM "BaseItems" b
                WHERE b."Type" = v.column2 AND b."CleanName" = v.column4)"#,
-        ferrofin_db::values_rows(count, 6)
+        columns = unset_columns!(),
+        values = unset_values!(),
+        rows = ferrofin_db::values_rows(count, BY_NAME_INSERT_BINDS)
     )
 }
+
+/// The values each row of [`by_name_insert_sql`] binds.
+const BY_NAME_INSERT_BINDS: usize = 7;
 
 /// The `ItemValueId` of each of `values` (`(Type, Value, CleanValue)`, distinct
 /// by type and value), keyed by type and value, creating the rows not stored
@@ -335,16 +412,22 @@ async fn write_item_values(
         }
         query.execute(&mut **tx).await.map_err(db_err)?;
     }
-    for chunk in ferrofin_db::power_of_two_chunks(&by_name, ferrofin_db::BATCH_BIND_CHUNK / 6) {
+    for chunk in ferrofin_db::power_of_two_chunks(
+        &by_name,
+        ferrofin_db::BATCH_BIND_CHUNK / BY_NAME_INSERT_BINDS,
+    ) {
         let mut query = sqlx::query(sqlx::AssertSqlSafe(by_name_insert_sql(chunk.len())));
         for (row_id, type_name, name, clean, sort_name, key) in chunk {
+            let kind = crate::item_type_lookup::kind_from_type_name(type_name)
+                .unwrap_or(BaseItemKind::Folder);
             query = query
                 .bind(row_id)
                 .bind(*type_name)
                 .bind(*name)
                 .bind(*clean)
                 .bind(sort_name)
-                .bind(key);
+                .bind(key)
+                .bind(unrated_type_name(kind));
         }
         query.execute(&mut **tx).await.map_err(db_err)?;
     }
@@ -461,12 +544,18 @@ pub(crate) async fn insert_named_item_in(
         // playlist's `ForceSave` refresh, the box set's member add or queued
         // refresh). Undated, the row sorted anywhere by date added and never
         // matched `minDateLastSaved`.
-        r#"INSERT INTO "BaseItems"
+        concat!(
+            r#"INSERT INTO "BaseItems"
            ("Id", "Type", "IsFolder", "IsInMixedFolder", "IsLocked", "IsMovie",
             "IsRepeat", "IsSeries", "IsVirtualItem", "Name", "SortName",
             "PresentationUniqueKey", "ParentId", "TopParentId", "CleanName",
-            "DateCreated", "DateModified", "DateLastSaved")
-           VALUES (?1, ?2, ?3, 0, ?10, 0, 0, 0, 0, ?4, ?5, ?7, ?6, ?6, ?8, ?9, ?9, ?9)"#,
+            "DateCreated", "DateModified", "DateLastSaved", "UnratedType", "#,
+            unset_columns!(),
+            r#")
+           VALUES (?1, ?2, ?3, 0, ?10, 0, 0, 0, 0, ?4, ?5, ?7, ?6, ?6, ?8, ?9, ?9, ?9, ?11, "#,
+            unset_values!(),
+            ")"
+        ),
     )
     .bind(guid_to_db(id))
     .bind(type_name)
@@ -485,6 +574,7 @@ pub(crate) async fn insert_named_item_in(
     .bind(crate::text_util::get_clean_value(name))
     .bind(datetime_to_db(chrono::Utc::now()))
     .bind(i64::from(is_locked))
+    .bind(unrated_type_name(kind))
     .execute(&mut *conn)
     .await
     .map_err(db_err)?;
@@ -725,14 +815,18 @@ pub(crate) async fn insert_root_folder(
 ) -> Result<(), ServiceError> {
     let type_name = stored_type_name(kind)
         .ok_or_else(|| ServiceError::backend(format!("no stored type name for {kind:?}")))?;
-    sqlx::query(
+    sqlx::query(concat!(
         r#"INSERT OR IGNORE INTO "BaseItems"
              ("Id", "Type", "Name", "SortName", "CleanName", "Path",
               "IsFolder", "IsInMixedFolder", "IsLocked", "IsMovie",
               "IsRepeat", "IsSeries", "IsVirtualItem",
-              "PresentationUniqueKey", "DateCreated")
-           VALUES (?1, ?2, ?3, ?4, ?5, ?6, 1, 0, 0, 0, 0, 0, 0, ?7, ?8)"#,
-    )
+              "PresentationUniqueKey", "DateCreated", "UnratedType", "#,
+        unset_columns!(),
+        r#")
+           VALUES (?1, ?2, ?3, ?4, ?5, ?6, 1, 0, 0, 0, 0, 0, 0, ?7, ?8, ?9, "#,
+        unset_values!(),
+        ")"
+    ))
     .bind(guid_to_db(id))
     .bind(type_name)
     .bind(name)
@@ -741,6 +835,7 @@ pub(crate) async fn insert_root_folder(
     .bind(path)
     .bind(id.as_simple().to_string())
     .bind(ferrofin_db::store::datetime_to_db(chrono::Utc::now()))
+    .bind(unrated_type_name(kind))
     .execute(db.writer())
     .await
     .map_err(db_err)?;
@@ -766,22 +861,27 @@ pub(crate) async fn rekey_container(
         .ok_or_else(|| ServiceError::backend(format!("no stored type name for {kind:?}")))?;
     let (legacy_db, correct_db) = (guid_to_db(legacy), guid_to_db(correct));
     let mut tx = db.writer().begin().await.map_err(db_err)?;
-    sqlx::query(
+    sqlx::query(concat!(
         r#"INSERT INTO "BaseItems"
              ("Id", "Type", "Name", "SortName", "CleanName", "Path",
               "IsFolder", "IsInMixedFolder", "IsLocked", "IsMovie",
               "IsRepeat", "IsSeries", "IsVirtualItem",
-              "ParentId", "TopParentId", "PresentationUniqueKey", "DateCreated")
+              "ParentId", "TopParentId", "PresentationUniqueKey", "DateCreated", "UnratedType", "#,
+        unset_columns!(),
+        r#")
            SELECT ?2, ?3, "Name", "SortName", "CleanName", "Path",
                   "IsFolder", "IsInMixedFolder", "IsLocked", "IsMovie",
                   "IsRepeat", "IsSeries", "IsVirtualItem",
-                  "ParentId", ?2, ?4, "DateCreated"
-             FROM "BaseItems" WHERE "Id" = ?1"#,
-    )
+                  "ParentId", ?2, ?4, "DateCreated", ?5, "#,
+        unset_copied!(),
+        r#"
+             FROM "BaseItems" WHERE "Id" = ?1"#
+    ))
     .bind(&legacy_db)
     .bind(&correct_db)
     .bind(type_name)
     .bind(correct.as_simple().to_string())
+    .bind(unrated_type_name(kind))
     .execute(&mut *tx)
     .await
     .map_err(db_err)?;
@@ -1940,6 +2040,18 @@ fn written_columns(item: &BaseItemEntity) -> Vec<(&'static str, Column)> {
 
 /// `item`'s columns with the three derived ones given, in [`UPSERT_SQL`]'s
 /// order.
+///
+/// A column the item has no value for gets the one upstream's mapper writes
+/// (`BaseItemMapper.Map`, v12.4 `BaseItemMapper.cs:306-414`, which writes
+/// every column from the item's properties): the zero GUID for `ChannelId`,
+/// for `SeriesId` on the `IHasSeries` kinds and for an episode's `SeasonId`;
+/// `''` for the joined `Genres`, `Studios`, `Tags` and `ProductionLocations`;
+/// `0` for `Width` and `Height`; `Unknown` for `MediaType`; and
+/// `GetBlockUnratedType()` for `UnratedType`. A stored row's absent value gets
+/// the same default here, so an old NULL, a stored default and an absent value
+/// all compare equal (a row reads the zero GUIDs and empty lists back as
+/// `None`, `ferrofin_db::entities::unset`).
+#[allow(clippy::too_many_lines)] // one entry per `BaseItems` column
 fn columns_of(
     item: &BaseItemEntity,
     clean_name: Option<String>,
@@ -1947,6 +2059,32 @@ fn columns_of(
     sort_name: Option<String>,
 ) -> Vec<(&'static str, Column)> {
     use Column::{Bool, Int, Real, Text};
+    use ferrofin_db::entities::unset::NIL_GUID;
+    let kind = crate::item_type_lookup::kind_from_type_name(&item.type_);
+    let has_series = kind.is_some_and(|kind| {
+        matches!(
+            kind,
+            BaseItemKind::AudioBook
+                | BaseItemKind::Book
+                | BaseItemKind::Episode
+                | BaseItemKind::Season
+        )
+    });
+    let nil_unless = |v: &Option<String>, applies: bool| {
+        Text(v.clone().or_else(|| applies.then(|| NIL_GUID.to_owned())))
+    };
+    let list = |v: &Option<String>| Text(Some(v.clone().unwrap_or_default()));
+    let size = |v: Option<i64>| Int(Some(v.unwrap_or(0)));
+    let channel = item
+        .channel_id
+        .as_deref()
+        .and_then(|id| Uuid::parse_str(id).ok())
+        .is_some_and(|id| !id.is_nil());
+    let unrated_type = item.unrated_type.clone().unwrap_or_else(|| {
+        crate::kinds::unrated_item(kind.unwrap_or(BaseItemKind::Folder), channel)
+            .json_name()
+            .into_owned()
+    });
     let text = |v: &Option<String>| Text(v.clone());
     // The backstop for the `BaseItem` setters' `FiniteOrNull`: whatever
     // built the entity, a NaN or infinite rating or gain is written as no
@@ -1959,7 +2097,7 @@ fn columns_of(
         ("AlbumArtists", text(&item.album_artists)),
         ("Artists", text(&item.artists)),
         ("Audio", Int(item.audio.map(i64::from))),
-        ("ChannelId", text(&item.channel_id)),
+        ("ChannelId", nil_unless(&item.channel_id, true)),
         ("CleanName", Text(clean_name)),
         ("CommunityRating", real(item.community_rating)),
         ("CriticRating", real(item.critic_rating)),
@@ -1979,8 +2117,8 @@ fn columns_of(
         ("ExternalServiceId", text(&item.external_service_id)),
         ("ExtraType", Int(item.extra_type.map(i64::from))),
         ("ForcedSortName", text(&item.forced_sort_name)),
-        ("Genres", text(&item.genres)),
-        ("Height", Int(item.height)),
+        ("Genres", list(&item.genres)),
+        ("Height", size(item.height)),
         ("IndexNumber", Int(item.index_number)),
         (
             "InheritedParentalRatingSubValue",
@@ -1998,7 +2136,14 @@ fn columns_of(
         ("IsSeries", Bool(item.is_series)),
         ("IsVirtualItem", Bool(item.is_virtual_item)),
         ("LUFS", real(item.lufs)),
-        ("MediaType", text(&item.media_type)),
+        (
+            "MediaType",
+            Text(Some(
+                item.media_type
+                    .clone()
+                    .unwrap_or_else(|| "Unknown".to_owned()),
+            )),
+        ),
         ("Name", text(&item.name)),
         ("NormalizationGain", real(item.normalization_gain)),
         ("OfficialRating", text(&item.official_rating)),
@@ -2020,12 +2165,15 @@ fn columns_of(
         ("PremiereDate", date(item.premiere_date)),
         ("PresentationUniqueKey", Text(presentation_unique_key)),
         ("PrimaryVersionId", text(&item.primary_version_id)),
-        ("ProductionLocations", text(&item.production_locations)),
+        ("ProductionLocations", list(&item.production_locations)),
         ("ProductionYear", Int(item.production_year)),
         ("RunTimeTicks", Int(item.run_time_ticks)),
-        ("SeasonId", text(&item.season_id)),
+        (
+            "SeasonId",
+            nil_unless(&item.season_id, kind == Some(BaseItemKind::Episode)),
+        ),
         ("SeasonName", text(&item.season_name)),
-        ("SeriesId", text(&item.series_id)),
+        ("SeriesId", nil_unless(&item.series_id, has_series)),
         ("SeriesName", text(&item.series_name)),
         (
             "SeriesPresentationUniqueKey",
@@ -2035,14 +2183,14 @@ fn columns_of(
         ("Size", Int(item.size)),
         ("SortName", Text(sort_name)),
         ("StartDate", date(item.start_date)),
-        ("Studios", text(&item.studios)),
+        ("Studios", list(&item.studios)),
         ("Tagline", text(&item.tagline)),
-        ("Tags", text(&item.tags)),
+        ("Tags", list(&item.tags)),
         ("TopParentId", text(&item.top_parent_id)),
         ("TotalBitrate", Int(item.total_bitrate)),
         ("Type", Text(Some(item.type_.clone()))),
-        ("UnratedType", text(&item.unrated_type)),
-        ("Width", Int(item.width)),
+        ("UnratedType", Text(Some(unrated_type))),
+        ("Width", size(item.width)),
     ]
 }
 
@@ -2940,11 +3088,17 @@ impl ItemPersistenceService for FerrofinItemPersistenceService {
             // `IsAccessedByName`, whose `IsFolder` is `!IsAccessedByName`
             // (`MusicArtist.cs:33`). A real 10.11.8 stores 0 on the row a GET
             // lazily creates.
-            r#"INSERT OR IGNORE INTO "BaseItems"
+            concat!(
+                r#"INSERT OR IGNORE INTO "BaseItems"
                ("Id","Type","Name","CleanName","SortName","PresentationUniqueKey","Path",
-                "DateCreated","DateModified",
-                "IsFolder","IsInMixedFolder","IsLocked","IsMovie","IsRepeat","IsSeries","IsVirtualItem")
-               VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?8,0,0,0,0,0,0,0)"#,
+                "DateCreated","DateModified","UnratedType",
+                "IsFolder","IsInMixedFolder","IsLocked","IsMovie","IsRepeat","IsSeries","IsVirtualItem","#,
+                unset_columns!(),
+                r#")
+               VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?8,?9,0,0,0,0,0,0,0,"#,
+                unset_values!(),
+                ")"
+            ),
         )
         .bind(guid_to_db(id))
         .bind(type_name)
@@ -2961,6 +3115,7 @@ impl ItemPersistenceService for FerrofinItemPersistenceService {
         ))
         .bind(path)
         .bind(chrono::Utc::now())
+        .bind(unrated_type_name(kind))
         .execute(&mut *tx)
         .await
         .map_err(db_err)?;
@@ -3878,7 +4033,7 @@ impl ItemPersistenceService for FerrofinItemPersistenceService {
     async fn update_rating(&self, item: &BaseItemEntity) -> Result<bool, ServiceError> {
         let written = sqlx::query(
             r#"UPDATE "BaseItems"
-               SET "OfficialRating" = ?2, "UnratedType" = ?3,
+               SET "OfficialRating" = ?2, "UnratedType" = coalesce(?3, "UnratedType"),
                    "InheritedParentalRatingValue" = ?4,
                    "InheritedParentalRatingSubValue" = ?5, "DateLastSaved" = ?6
                WHERE "Id" = ?1"#,
@@ -7412,11 +7567,13 @@ async fn write_owned_copies(
     let saved_at = datetime_to_db(chrono::Utc::now());
     for copy in copies {
         let row = &copy.row;
+        // An empty list is stored as the joined empty list upstream's mapper writes, never NULL
+        // (a row reads '' back as `None`).
         if copy.local {
             sqlx::query(
                 r#"UPDATE "BaseItems"
                    SET "Overview" = ?2, "ProductionYear" = ?3, "PremiereDate" = ?4,
-                       "CommunityRating" = ?5, "OfficialRating" = ?6, "Genres" = ?7,
+                       "CommunityRating" = ?5, "OfficialRating" = ?6, "Genres" = coalesce(?7, ''),
                        "InheritedParentalRatingValue" = ?8,
                        "InheritedParentalRatingSubValue" = ?9, "DateLastSaved" = ?10
                    WHERE "Id" = ?1"#,
@@ -7437,7 +7594,8 @@ async fn write_owned_copies(
         } else {
             sqlx::query(
                 r#"UPDATE "BaseItems"
-                   SET "Genres" = ?2, "Studios" = ?3, "ProductionLocations" = ?4,
+                   SET "Genres" = coalesce(?2, ''), "Studios" = coalesce(?3, ''),
+                       "ProductionLocations" = coalesce(?4, ''),
                        "CommunityRating" = ?5, "CriticRating" = ?6, "Overview" = ?7,
                        "OfficialRating" = ?8, "CustomRating" = ?9, "ProductionYear" = ?10,
                        "PremiereDate" = ?11, "InheritedParentalRatingValue" = ?12,
@@ -7535,6 +7693,303 @@ mod tests {
     use ferrofin_db::store::guid_to_db;
 
     use super::FerrofinItemPersistenceService;
+
+    /// One stored column of row `id`, as text.
+    async fn stored_text(db: &ferrofin_db::Database, id: Uuid, column: &str) -> Option<String> {
+        let sql = format!(r#"SELECT CAST("{column}" AS TEXT) FROM "BaseItems" WHERE "Id" = ?1"#);
+        sqlx::query_scalar(sqlx::AssertSqlSafe(sql))
+            .bind(guid_to_db(id))
+            .fetch_one(db.pool())
+            .await
+            .expect("the row exists")
+    }
+
+    /// What upstream's mapper stores in [`super::unset_columns!`]'s columns for an item with
+    /// none of them, in that order.
+    const STORED_DEFAULTS: [&str; 8] = [
+        "00000000-0000-0000-0000-000000000000",
+        "",
+        "",
+        "",
+        "",
+        "0",
+        "0",
+        "Unknown",
+    ];
+
+    /// Row `id`'s values in [`super::unset_columns!`]'s columns, as text.
+    async fn stored_defaults(db: &ferrofin_db::Database, id: Uuid) -> Vec<Option<String>> {
+        let mut values = Vec::new();
+        for column in [
+            "ChannelId",
+            "Genres",
+            "Studios",
+            "Tags",
+            "ProductionLocations",
+            "Width",
+            "Height",
+            "MediaType",
+        ] {
+            values.push(stored_text(db, id, column).await);
+        }
+        values
+    }
+
+    fn expected_defaults() -> Vec<Option<String>> {
+        STORED_DEFAULTS.map(|v| Some(v.to_owned())).to_vec()
+    }
+
+    /// Every writer of a `BaseItems` row stores what upstream's mapper writes for the columns
+    /// an item has none of, never NULL, and the row reads them back as `None` (gl-1580).
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)] // one table of kinds, then the read-back and caller-value cases
+    async fn writers_store_the_mappers_defaults_and_read_them_back_as_none() {
+        use ferrofin_db::entities::base_items::BaseItemEntity;
+        use ferrofin_db::entities::unset::NIL_GUID;
+        let db = test_db().await;
+        let store = FerrofinItemPersistenceService::new(db.clone());
+        // The upsert, for every `IHasSeries` kind (`SeriesId`), an episode (`SeasonId`) and
+        // two kinds with neither.
+        let saved = [
+            (BaseItemKind::Movie, "Movie"),
+            (BaseItemKind::Book, "Book"),
+            (BaseItemKind::AudioBook, "Book"),
+            (BaseItemKind::Season, "Series"),
+            (BaseItemKind::Episode, "Series"),
+            (BaseItemKind::Folder, "Other"),
+        ]
+        .map(|(kind, unrated)| (Uuid::new_v4(), kind, unrated));
+        let entities: Vec<BaseItemEntity> = saved
+            .iter()
+            .map(|(id, kind, _)| BaseItemEntity {
+                id: guid_to_db(*id),
+                type_: stored_type_name(*kind).unwrap().to_owned(),
+                name: Some(format!("{kind:?}")),
+                ..Default::default()
+            })
+            .collect();
+        store.save_items(&entities).await.unwrap();
+        for (id, kind, unrated) in &saved {
+            assert_eq!(
+                stored_defaults(&db, *id).await,
+                expected_defaults(),
+                "{kind:?}"
+            );
+            assert_eq!(
+                stored_text(&db, *id, "UnratedType").await.as_deref(),
+                Some(*unrated),
+                "{kind:?}"
+            );
+            let has_series = matches!(
+                kind,
+                BaseItemKind::Book
+                    | BaseItemKind::AudioBook
+                    | BaseItemKind::Season
+                    | BaseItemKind::Episode
+            );
+            assert_eq!(
+                stored_text(&db, *id, "SeriesId").await.as_deref(),
+                has_series.then_some(NIL_GUID),
+                "{kind:?}"
+            );
+            assert_eq!(
+                stored_text(&db, *id, "SeasonId").await.as_deref(),
+                (*kind == BaseItemKind::Episode).then_some(NIL_GUID),
+                "{kind:?}"
+            );
+        }
+        let [(movie, ..), _, _, _, (episode, ..), _] = saved;
+        // An item of a channel is channel content (`GetBlockUnratedType`'s `SourceType`).
+        let channel_folder = Uuid::new_v4();
+        store
+            .save_items(&[BaseItemEntity {
+                id: guid_to_db(channel_folder),
+                channel_id: Some(guid_to_db(Uuid::new_v4())),
+                ..entities[5].clone()
+            }])
+            .await
+            .unwrap();
+        assert_eq!(
+            stored_text(&db, channel_folder, "UnratedType")
+                .await
+                .as_deref(),
+            Some("ChannelContent")
+        );
+        // A stored zero GUID or empty list reads as no value; a size of 0 and
+        // `Unknown` are values Ferrofin also writes and reads as such.
+        let row = super::container_row(&db, episode).await.unwrap().unwrap();
+        assert_eq!(
+            (
+                row.channel_id,
+                row.series_id,
+                row.season_id,
+                row.genres,
+                row.tags
+            ),
+            (None, None, None, None, None)
+        );
+        assert_eq!(
+            (row.width, row.media_type.as_deref()),
+            (Some(0), Some("Unknown"))
+        );
+        // A value the item has wins.
+        let channel = guid_to_db(Uuid::new_v4());
+        store
+            .save_items(&[BaseItemEntity {
+                genres: Some("Drama".into()),
+                width: Some(1920),
+                media_type: Some("Video".into()),
+                channel_id: Some(channel.clone()),
+                ..entities[0].clone()
+            }])
+            .await
+            .unwrap();
+        let row = super::container_row(&db, movie).await.unwrap().unwrap();
+        assert_eq!(
+            (
+                row.channel_id,
+                row.genres.as_deref(),
+                row.width,
+                row.media_type.as_deref()
+            ),
+            (Some(channel), Some("Drama"), Some(1920), Some("Video"))
+        );
+        assert_eq!(
+            stored_text(&db, movie, "UnratedType").await.as_deref(),
+            Some("Movie")
+        );
+    }
+
+    /// The inserts that bypass the upsert write the same values as it (gl-1580).
+    #[tokio::test]
+    async fn inserts_beside_the_upsert_store_the_mappers_defaults() {
+        use crate::item_persistence_service::null_mapper_columns;
+        let db = test_db().await;
+        let store = FerrofinItemPersistenceService::new(db.clone());
+        let movie = Uuid::new_v4();
+        seed_item(&db, movie, BaseItemKind::Movie).await;
+        let boxset = Uuid::new_v4();
+        super::insert_named_item(&db, boxset, BaseItemKind::BoxSet, "Box", true, None, false)
+            .await
+            .unwrap();
+        let (root, rekeyed) = (Uuid::new_v4(), Uuid::new_v4());
+        super::insert_root_folder(&db, root, BaseItemKind::AggregateFolder, "root", "/root")
+            .await
+            .unwrap();
+        super::rekey_container(&db, root, rekeyed, BaseItemKind::UserRootFolder)
+            .await
+            .unwrap();
+        // A container an older Ferrofin wrote has NULLs, which the rekey fills, and keeps a
+        // value it has.
+        let (legacy, legacy_rekeyed) = (Uuid::new_v4(), Uuid::new_v4());
+        super::insert_root_folder(
+            &db,
+            legacy,
+            BaseItemKind::AggregateFolder,
+            "legacy",
+            "/legacy",
+        )
+        .await
+        .unwrap();
+        sqlx::query(
+            r#"UPDATE "BaseItems" SET "ChannelId" = NULL, "Genres" = NULL, "Studios" = NULL,
+                   "Tags" = 'Kept', "ProductionLocations" = NULL, "Width" = NULL, "Height" = NULL,
+                   "MediaType" = NULL WHERE "Id" = ?1"#,
+        )
+        .bind(guid_to_db(legacy))
+        .execute(db.writer())
+        .await
+        .unwrap();
+        super::rekey_container(&db, legacy, legacy_rekeyed, BaseItemKind::UserRootFolder)
+            .await
+            .unwrap();
+        let mut kept = expected_defaults();
+        kept[3] = Some("Kept".to_owned());
+        assert_eq!(stored_defaults(&db, legacy_rekeyed).await, kept);
+        let artist = store
+            .ensure_by_name_item(BaseItemKind::MusicArtist, "Band", "/artists/Band")
+            .await
+            .unwrap()
+            .unwrap();
+        store
+            .save_item_values(movie, &[(2, "Drama".to_owned())])
+            .await
+            .unwrap();
+        let genre: String = sqlx::query_scalar(
+            r#"SELECT "Id" FROM "BaseItems" WHERE "Type" = ?1 AND "Name" = 'Drama'"#,
+        )
+        .bind(stored_type_name(BaseItemKind::Genre).unwrap())
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        let genre = Uuid::parse_str(&genre).unwrap();
+        let location = Uuid::new_v4();
+        let now = chrono::Utc::now();
+        crate::library_structure_repository::insert_location_folder(
+            &db,
+            location,
+            None,
+            "/media/movies",
+            (now, now),
+        )
+        .await
+        .unwrap();
+        for (writer, id, unrated) in [
+            ("insert_named_item_in", boxset, "Movie"),
+            ("rekey_container", rekeyed, "Other"),
+            ("ensure_by_name_item", artist, "Music"),
+            ("by_name_insert_sql", genre, "Other"),
+            ("insert_location_folder", location, "Other"),
+        ] {
+            assert_eq!(
+                null_mapper_columns(&db, id).await,
+                Vec::<&str>::new(),
+                "{writer}"
+            );
+            assert_eq!(
+                stored_defaults(&db, id).await,
+                expected_defaults(),
+                "{writer}"
+            );
+            assert_eq!(
+                stored_text(&db, id, "UnratedType").await.as_deref(),
+                Some(unrated),
+                "{writer}"
+            );
+        }
+    }
+
+    /// A row Ferrofin wrote before the defaults (NULL) and one that holds them compare as the
+    /// same saved item, so the scan does not rewrite every row for them alone.
+    #[tokio::test]
+    async fn a_stored_default_or_null_is_no_change_to_a_scan_save() {
+        use ferrofin_db::entities::base_items::BaseItemEntity;
+        let db = test_db().await;
+        let store = FerrofinItemPersistenceService::new(db.clone());
+        let id = Uuid::new_v4();
+        let saved = BaseItemEntity {
+            id: guid_to_db(id),
+            type_: stored_type_name(BaseItemKind::Book).unwrap().to_owned(),
+            name: Some("Book".into()),
+            ..Default::default()
+        };
+        store
+            .save_items(std::slice::from_ref(&saved))
+            .await
+            .unwrap();
+        let stored = super::container_row(&db, id).await.unwrap().unwrap();
+        assert!(!super::scan_save_changes_row(&saved, &stored, false));
+        sqlx::query(
+            r#"UPDATE "BaseItems" SET "ChannelId" = NULL, "Genres" = NULL, "Width" = NULL,
+                   "MediaType" = NULL, "UnratedType" = NULL, "SeriesId" = NULL WHERE "Id" = ?1"#,
+        )
+        .bind(guid_to_db(id))
+        .execute(db.writer())
+        .await
+        .unwrap();
+        let stored = super::container_row(&db, id).await.unwrap().unwrap();
+        assert!(!super::scan_save_changes_row(&saved, &stored, false));
+    }
 
     #[tokio::test]
     async fn indexed_image_deletion_preserves_siblings_and_compacts_slots() {
@@ -9257,7 +9712,12 @@ mod tests {
                 !plan.iter().any(|s| s.starts_with("SCAN ItemValues")),
                 "{plan:?}"
             );
-            let plan = query_plan(&db, &super::by_name_insert_sql(n), 6 * n).await;
+            let plan = query_plan(
+                &db,
+                &super::by_name_insert_sql(n),
+                super::BY_NAME_INSERT_BINDS * n,
+            )
+            .await;
             assert!(
                 plan.iter().any(|s| s.starts_with(
                     "SEARCH b USING COVERING INDEX IX_BaseItems_Type_CleanName (Type=? AND CleanName=?)"
@@ -14808,6 +15268,38 @@ mod owned_video_copy_tests {
         row.studios = Some("Own Studio".to_owned());
         row.production_year = Some(2001);
         save_item(db, &row).await;
+    }
+
+    /// An owner with no genres, studios or production locations gives its versions and parts
+    /// the empty lists upstream's mapper stores, not NULL (gl-1580).
+    #[tokio::test]
+    async fn an_owners_empty_lists_copy_as_empty_lists() {
+        let db = test_db().await;
+        let service = FerrofinItemPersistenceService::new(db.clone());
+        let (primary, version, part) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+        for id in [primary, version, part] {
+            seed_item(&db, id, BaseItemKind::Movie).await;
+        }
+        let mut row: BaseItemEntity = fetch_item(&db, primary).await;
+        row.overview = Some("A heist.".to_owned());
+        save_item(&db, &row).await;
+        owned_by(&db, version, primary, true).await;
+        owned_by(&db, part, primary, false).await;
+        assert_eq!(
+            service
+                .copy_metadata_to_owned_videos(&[primary], true, true)
+                .await
+                .unwrap(),
+            2
+        );
+        for id in [version, part] {
+            let copied: BaseItemEntity = fetch_item(&db, id).await;
+            assert_eq!(copied.overview.as_deref(), Some("A heist."));
+            assert_eq!(
+                super::null_mapper_columns(&db, id).await,
+                Vec::<&str>::new()
+            );
+        }
     }
 
     #[tokio::test]

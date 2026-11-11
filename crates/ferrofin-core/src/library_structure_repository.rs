@@ -152,12 +152,19 @@ async fn ensure_location(
         .and_then(|v| v.to_str())
         .unwrap_or(location);
     sqlx::query(
-            r#"INSERT INTO "BaseItems" (
+            concat!(
+                r#"INSERT INTO "BaseItems" (
                 "Id", "Type", "Name", "SortName", "CleanName", "Path", "ParentId", "TopParentId",
                 "PresentationUniqueKey", "DateCreated", "DateModified", "DateLastSaved",
-                "IsFolder", "IsInMixedFolder", "IsLocked", "IsMovie", "IsRepeat", "IsSeries", "IsVirtualItem"
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?1, ?8, ?9, ?10, ?11, 1, 0, 0, 0, 0, 0, 0)
-            ON CONFLICT("Id") DO NOTHING"#,
+                "IsFolder", "IsInMixedFolder", "IsLocked", "IsMovie", "IsRepeat", "IsSeries", "IsVirtualItem",
+                "UnratedType", "#,
+                crate::item_persistence_service::unset_columns!(),
+                r#"
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?1, ?8, ?9, ?10, ?11, 1, 0, 0, 0, 0, 0, 0, ?12, "#,
+                crate::item_persistence_service::unset_values!(),
+                r#")
+            ON CONFLICT("Id") DO NOTHING"#
+            ),
         ).bind(&folder).bind(stored_type_name(BaseItemKind::Folder).unwrap_or_default())
             .bind(name)
             .bind(crate::kinds::saved_sort_name(BaseItemKind::Folder, name, None))
@@ -165,6 +172,7 @@ async fn ensure_location(
             .bind(location).bind(aggregate).bind(id.simple().to_string())
             .bind(datetime_to_db(dates.0)).bind(datetime_to_db(dates.1))
             .bind(datetime_to_db(Utc::now()))
+            .bind(crate::item_persistence_service::unrated_type_name(BaseItemKind::Folder))
             .execute(&mut *connection).await.map_err(db_err)?;
     if let Some(aggregate) = aggregate {
         sqlx::query(
