@@ -4145,6 +4145,21 @@ impl LiveTvManager for FerrofinLiveTvManager {
     }
 
     async fn create_timer(&self, mut timer: TimerInfoDto) -> Result<String, ServiceError> {
+        // `LiveTvDtoService.GetTimerInfo` turns the posted ids into the
+        // programme's listing id before `CreateTimer` looks for its timer. Here
+        // the posted ids find the guide row, and the timer takes its ids from
+        // it: `ProgramId` in the `N` spelling the guide links by
+        // (`timer_program_ids`) and the row's listing id, so the check below
+        // finds a timer stored under either.
+        let program = self.program_row_for_timer(&timer.base).await?;
+        if let Some(program) = &program {
+            if let Ok(id) = Uuid::parse_str(&program.id) {
+                timer.base.program_id = Some(id.simple().to_string());
+            }
+            // `CopyProgramInfoToTimerInfo`: the guide is the authority on what
+            // this timer is actually recording.
+            copy_program_into_timer(program, &mut timer);
+        }
         // Port of `DefaultLiveTvService.CreateTimer`: one timer per programme —
         // a cancelled or completed one is revived, a live one is a conflict.
         if let Some(existing) = self.timer_for_program(&timer).await? {
@@ -4176,11 +4191,6 @@ impl LiveTvManager for FerrofinLiveTvManager {
         timer.base.type_ = Some("Timer".to_owned());
         timer.base.service_name = Some(ferrofin_traits::stubs::LIVE_TV_SERVICE_NAME.to_owned());
         timer.base.server_id = Some(self.server_id.clone());
-        // `CopyProgramInfoToTimerInfo`: the guide is the authority on what this
-        // timer is actually recording.
-        if let Some(program) = self.program_row_for_timer(&timer.base).await? {
-            copy_program_into_timer(&program, &mut timer);
-        }
         // `ExternalChannelId = info.ChannelId` (LiveTvDtoService.cs:69).
         timer.base.external_channel_id = self.channel_external_id(timer.base.channel_id).await?;
         // `info.IsManual = true` (DefaultLiveTvService.cs:255).
@@ -4990,13 +5000,14 @@ impl FerrofinLiveTvManager {
     }
 
     /// Port of `LiveTvManager.AddRecordingInfo`: links each programme DTO to
-    /// the timer that records it (`ProgramId == program.ExternalId`), setting
-    /// `TimerId`/`Status` (unless cancelled/errored) and `SeriesTimerId`.
+    /// the timer that records it (its `ProgramId` names the programme, see
+    /// [`Self::timer_program_ids`]), setting `TimerId`/`Status` (unless
+    /// cancelled/errored) and `SeriesTimerId`.
     ///
-    /// The upstream fallback that matches a *series timer* by its `SeriesId`
-    /// has nothing to match here: Ferrofin's stored `SeriesTimerInfoDto`
-    /// carries no series id (the DTO shape has none), so only the direct
-    /// `timer.SeriesTimerId` link is applied.
+    /// Only the direct `timer.SeriesTimerId` link is applied: upstream's
+    /// fallback that gives a programme with no such timer the series timer
+    /// whose `SeriesId` is its `ExternalSeriesId` is not ported. Fix path:
+    /// gl-1680.
     async fn add_recording_info(
         &self,
         dtos: &mut [BaseItemDto],
@@ -5017,14 +5028,14 @@ impl FerrofinLiveTvManager {
     }
 
     /// The `GetTimersAsync` timers (every one but the `Completed`) whose
-    /// `ProgramId` is one of these programmes' `ExternalId`s: all that
+    /// `ProgramId` names one of these programmes: all that
     /// [`Self::apply_recording_info`] can match on the page, in the same
     /// `StartDate` order, so its first match is upstream's `FirstOrDefault`.
     async fn scheduled_timers_for(
         &self,
         rows: impl Iterator<Item = &GuideProgramRow>,
     ) -> Result<Vec<TimerInfoDto>, ServiceError> {
-        let ids: Vec<&str> = rows.filter_map(|row| row.external_id.as_deref()).collect();
+        let ids: Vec<String> = rows.flat_map(Self::timer_program_ids).collect();
         if ids.is_empty() {
             return Ok(Vec::new());
         }
@@ -5037,17 +5048,29 @@ impl FerrofinLiveTvManager {
         )
     }
 
+    /// The ids a timer's `ProgramId` names this programme by (ignoring ASCII
+    /// case): its internal id in the `N` spelling, which `create_timer` and the
+    /// series fan-out store, and the guide's own id, which a timer stored with
+    /// `ProgramId` naming its listing carries. Upstream's `TimerInfo.ProgramId`
+    /// is always the guide's id (`LiveTvDtoService.GetTimerInfo` takes
+    /// `ExternalProgramId`, else the programme item's `ExternalId`).
+    fn timer_program_ids(row: &GuideProgramRow) -> impl Iterator<Item = String> {
+        Uuid::parse_str(&row.id)
+            .ok()
+            .map(|id| id.simple().to_string())
+            .into_iter()
+            .chain(row.external_id.clone())
+    }
+
     /// [`Self::add_recording_info`]'s per-programme body, over an
     /// already-loaded timer list.
     fn apply_recording_info(dto: &mut BaseItemDto, row: &GuideProgramRow, timers: &[TimerInfoDto]) {
-        let Some(external_id) = row.external_id.as_deref() else {
-            return;
-        };
+        let ids: Vec<String> = Self::timer_program_ids(row).collect();
         let timer = timers.iter().find(|t| {
             t.base
                 .program_id
                 .as_deref()
-                .is_some_and(|p| p.eq_ignore_ascii_case(external_id))
+                .is_some_and(|p| ids.iter().any(|id| p.eq_ignore_ascii_case(id)))
         });
         let Some(timer) = timer else {
             return;
@@ -14581,80 +14604,117 @@ mod tests {
         }
     }
 
-    /// `AddRecordingInfo`: a timer whose `ProgramId` matches the programme's
-    /// `ExternalId` links `TimerId`/`Status`/`SeriesTimerId`; a cancelled
-    /// timer stays invisible.
+    /// `AddRecordingInfo` links a programme to the timer that records it, made
+    /// the way a client makes one: the `Timers/Defaults` body posted back,
+    /// whose `ProgramId` is the programme's internal id (gl-1352), or a body
+    /// naming it by another spelling of that id. A series
+    /// timer's airings carry its `SeriesTimerId`; a cancelled timer keeps that
+    /// link but drops `TimerId`/`Status` (upstream's `!= Cancelled && != Error`
+    /// gate).
     #[tokio::test]
     async fn program_dtos_link_their_recording_timer() {
-        use ferrofin_model::live_tv::{BaseTimerInfoDto, RecordingStatus, TimerInfoDto};
-        let mgr = manager_with_relative_guide().await;
-
-        // The guide row's ExternalId is `{channelId}_{start:O}`; read it back
-        // from the stored rows rather than re-deriving it here.
-        let rows = mgr
-            .query_program_rows(&InternalItemsQuery::default(), chrono::Utc::now())
-            .await
-            .expect("rows");
-        let target = rows
-            .iter()
-            .find(|r| r.title == "Now Playing")
-            .expect("now playing row");
-        let external_id = target.external_id.clone().expect("external id");
-
+        let mgr = manager_with_series_guide().await;
+        let manual = airings_of(&mgr, "Something Else").await.remove(0);
+        let manual_id = Uuid::parse_str(&manual.id).expect("guid");
+        let defaults = defaults_for(&mgr, &manual).await;
+        assert_eq!(
+            defaults.base.program_id,
+            Some(manual_id.simple().to_string()),
+            "the body names the programme by its internal id"
+        );
         let timer_id = mgr
-            .create_timer(TimerInfoDto {
-                status: RecordingStatus::New,
-                series_timer_id: Some("st-9".to_owned()),
-                base: BaseTimerInfoDto {
-                    channel_id: Uuid::parse_str(&target.channel_id).expect("guid"),
-                    program_id: Some(external_id.clone()),
-                    // Far enough out that the scheduler leaves it alone: this
-                    // test is about the programme→timer link, not the capture.
-                    start_date: chrono::Utc::now() + chrono::Duration::hours(6),
-                    end_date: chrono::Utc::now() + chrono::Duration::hours(7),
-                    ..BaseTimerInfoDto::default()
-                },
-                ..TimerInfoDto::default()
-            })
+            .create_timer(timer_from_defaults(&defaults))
             .await
             .expect("timer");
 
+        // The fan-out schedules every future airing on this channel, and the
+        // sweep cancels the repeats of the first.
+        let (series, other_channel): (Vec<_>, Vec<_>) = airings_of(&mgr, "Recurring")
+            .await
+            .into_iter()
+            .filter(|r| parse_dt(&r.start_date).is_some_and(|s| s > Utc::now()))
+            .partition(|r| r.channel_id == manual.channel_id);
+        let st_id = mgr
+            .create_series_timer(defaults_for(&mgr, &series[0]).await)
+            .await
+            .expect("series timer");
+        let child_id = mgr
+            .get_timers()
+            .await
+            .expect("timers")
+            .into_iter()
+            .find(|t| t.status == RecordingStatus::New && t.series_timer_id.is_some())
+            .and_then(|t| t.base.id)
+            .expect("the first airing's timer");
+
+        // Any id that names the programme resolves to it, as upstream's
+        // `GetTimerInfo` resolves it: a hyphenated, upper-case id links, and a
+        // second body naming the programme by its listing id alone is the
+        // conflict `GetTimerByProgramId` finds.
+        let other = &other_channel[0];
+        let mut hyphenated = defaults_for(&mgr, other).await;
+        hyphenated.base.program_id = Some(
+            Uuid::parse_str(&other.id)
+                .expect("guid")
+                .hyphenated()
+                .to_string()
+                .to_uppercase(),
+        );
+        hyphenated.base.external_program_id = None;
+        let other_timer = mgr
+            .create_timer(timer_from_defaults(&hyphenated))
+            .await
+            .expect("hyphenated body");
+        let mut by_listing = defaults_for(&mgr, other).await;
+        by_listing.base.program_id = None;
+        assert!(
+            matches!(
+                mgr.create_timer(timer_from_defaults(&by_listing)).await,
+                Err(ServiceError::InvalidInput(_))
+            ),
+            "one timer per programme"
+        );
+
+        let links = |programs: &[BaseItemDto], row: &GuideProgramRow| {
+            let id = Uuid::parse_str(&row.id).expect("guid");
+            let p = programs.iter().find(|p| p.id == id).expect("programme");
+            (
+                p.timer_id.clone(),
+                p.status.clone(),
+                p.series_timer_id.clone(),
+            )
+        };
         let programs = mgr
             .get_programs(&InternalItemsQuery::default(), &DtoOptions::default())
             .await
-            .expect("programs");
-        let linked = programs
-            .items
-            .iter()
-            .find(|p| p.name.as_deref() == Some("Now Playing"))
-            .expect("linked");
-        assert_eq!(linked.timer_id.as_deref(), Some(timer_id.as_str()));
-        assert_eq!(linked.status.as_deref(), Some("New"));
-        assert_eq!(linked.series_timer_id.as_deref(), Some("st-9"));
-        let unlinked = programs
-            .items
-            .iter()
-            .find(|p| p.name.as_deref() == Some("Aired"))
-            .expect("unlinked");
-        assert_eq!(unlinked.timer_id, None);
-        assert_eq!(unlinked.status, None);
+            .expect("programs")
+            .items;
+        assert_eq!(
+            links(&programs, &manual),
+            (Some(timer_id.clone()), Some("New".to_owned()), None)
+        );
+        assert_eq!(
+            links(&programs, &series[0]),
+            (Some(child_id), Some("New".to_owned()), Some(st_id.clone()))
+        );
+        assert!(series.len() > 1, "the fixture has repeats");
+        for repeat in &series[1..] {
+            assert_eq!(links(&programs, repeat), (None, None, Some(st_id.clone())));
+        }
+        assert_eq!(
+            links(&programs, other),
+            (Some(other_timer), Some("New".to_owned()), None)
+        );
 
-        // A cancelled timer keeps its SeriesTimerId link but drops
-        // TimerId/Status (upstream's `!= Cancelled && != Error` gate).
-        // Through the real cancel path: `UpdateTimerAsync` only ever takes the
-        // four padding fields, so a client cannot set `Status` this way.
+        // A manual timer outside any series timer is deleted on cancel, so its
+        // programme links nothing.
         mgr.cancel_timer(&timer_id).await.expect("cancel");
         let programs = mgr
             .get_programs(&InternalItemsQuery::default(), &DtoOptions::default())
             .await
-            .expect("programs");
-        let after = programs
-            .items
-            .iter()
-            .find(|p| p.name.as_deref() == Some("Now Playing"))
-            .expect("after");
-        assert_eq!(after.timer_id, None);
-        assert_eq!(after.status, None);
+            .expect("programs")
+            .items;
+        assert_eq!(links(&programs, &manual), (None, None, None));
     }
 
     /// gl-1256: a programme page parses only the timers it can link, the

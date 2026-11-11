@@ -2754,6 +2754,152 @@ pub const VERIFIED: &[Verified] = &[
         refs: &["access-filtering"],
     },
     Verified {
+        method: "get",
+        path: "/LiveTv/Programs",
+        upstream_file: "Jellyfin.Api/Controllers/LiveTvController.cs",
+        upstream_method: "GetLiveTvPrograms",
+        ferrofin: "handlers/live_tv.rs get_programs (ProgramsQuery::into_parts: parse_csv_uuids, \
+               parse_pipe_strings, parse_csv_enums_lenient, pair_order_by, \
+               program_dto_options; items.rs resolve_user_opt) → query_programs_inner (the \
+               StartDate default order, the librarySeriesId block) → ferrofin-livetv \
+               manager.rs get_programs (stored_series_timer for seriesTimerId, \
+               user_restrictions, program_rows_query over push_program_filters, \
+               push_program_order and push_program_paging, the PROGRAM_COUNT total, \
+               projection.rs remove_fields, program_dtos → program_entity and dto_service.rs \
+               get_base_item_dtos, apply_program_info, add_recording_info → \
+               scheduled_timers_for over dvr_repository.rs scheduled_timers_for_programs, \
+               timer_program_ids, apply_recording_info) (RequestHelpers.GetUserId, \
+               RequestHelpers.GetOrderBy, DtoExtensions.AddAdditionalDtoOptions, \
+               LiveTvManager.GetPrograms, LibraryManager.QueryItems, \
+               BaseItemRepository.TranslateQuery and ApplyOrder, RemoveFields, \
+               DtoService.GetBaseItemDtos, AddInfoToProgramDto, AddRecordingInfo, \
+               GetTimersInternal, DefaultLiveTvService.GetTimersAsync)",
+        date: "2026-11-11",
+        divergences: &[
+            "genreIds is bound but filters nothing: every programme the other filters keep is \
+         listed, where upstream's TranslateQuery keeps only those with one of the genres \
+         (WhereReferencedItem over the Genre item values). Fix path: gl-1686.",
+            "isSports, isNews and isKids each match the programme's own flag, so when two or \
+         more are true a programme must have them all; upstream turns each true one into a \
+         tag and keeps a programme with any of those tags, so isSports=true&isKids=true \
+         lists sports and kids programmes alike. A false one excludes its flag in both. Fix \
+         path: gl-1687.",
+            "Only StartDate, Name, SortName, OfficialRating, ProductionYear and Random order \
+         the page, over the guide's own columns: Name and SortName sort the title as stored \
+         (case-sensitively), OfficialRating sorts its text, Default sorts as StartDate, and \
+         any other key is skipped (StartDate when none is left); ties break on the \
+         programme id. Upstream's ApplyOrder sorts by every key through OrderMapper: Name \
+         by CleanName, SortName by the sort name, OfficialRating by the parental rating \
+         score, DateCreated, PremiereDate, CommunityRating, Runtime and the rest by their \
+         columns, drops Default (SortName when no key is left) and breaks ties on the sort \
+         name. Fix path: gl-1688.",
+            "A sortOrder with more entries than a non-empty sortBy has keys has the extra \
+         entries ignored; upstream's GetOrderBy indexes past the sortBy array and answers \
+         500 (IndexOutOfRangeException). Jellyfin bug not ported.",
+            "enableTotalRecordCount=false with a startIndex reports the page's length plus \
+         startIndex as TotalRecordCount; upstream's QueryItems reads GetItemList and \
+         reports the page's length. Fix path: gl-1689.",
+            "Programme DTOs are projected from the guide's own table, not the stored \
+         LiveTvProgram item, so what that table has no column for is missing: \
+         CommunityRating, PremiereDate (the listing's original air date), Audio, an HD \
+         listing's Width and Height, and the ProgramEtag and SeriesZap2It provider ids; \
+         upstream's GuideManager.GetProgram stores each on the item the DTO is made from. \
+         Fix path: gl-763, gl-1591.",
+            "The listing's fields (Name, Overview, OfficialRating, Genres, the flags) are read \
+         from the guide table, so a change saved to a programme's item (POST \
+         /Items/{itemId}) is not shown here; upstream lists the stored item, the change \
+         included, until a guide refresh that updates the programme assigns the listing's \
+         values over it. Fix path: gl-1690.",
+            "A programme whose own timer carries no SeriesTimerId, or that has no timer, gets \
+         none; upstream's AddRecordingInfo then takes the first series timer (by name) whose \
+         SeriesId equals the programme's ExternalSeriesId, ignoring case, so every airing of \
+         a recorded series shows its SeriesTimerId, those on other channels included. Fix \
+         path: gl-1680.",
+            "A malformed id in channelIds or genreIds is a 400; upstream's \
+         CommaDelimitedCollectionModelBinder drops it. Fix path: gl-884.",
+            "The 400 (a value the query binder cannot convert) and 403 (another user's id \
+         without the administrator role) bodies are Ferrofin's error shape, not upstream's. \
+         Fix path: gl-666.",
+        ],
+        refs: &["access-filtering", "images"],
+    },
+    Verified {
+        method: "post",
+        path: "/LiveTv/Programs",
+        upstream_file: "Jellyfin.Api/Controllers/LiveTvController.cs",
+        upstream_method: "GetPrograms",
+        ferrofin: "handlers/live_tv.rs post_programs (GetProgramsDto::into_parts, \
+               pair_order_by, program_dto_options; items.rs resolve_user_opt for a non-nil \
+               body UserId only) → query_programs_inner (the StartDate default order, the \
+               LibrarySeriesId block) → ferrofin-livetv manager.rs get_programs \
+               (stored_series_timer for SeriesTimerId, user_restrictions, program_rows_query \
+               over push_program_filters, push_program_order and push_program_paging, the \
+               PROGRAM_COUNT total, projection.rs remove_fields, program_dtos → \
+               program_entity and dto_service.rs get_base_item_dtos, apply_program_info, \
+               add_recording_info → scheduled_timers_for over dvr_repository.rs \
+               scheduled_timers_for_programs, timer_program_ids, apply_recording_info) \
+               (GetProgramsDto, RequestHelpers.GetOrderBy, \
+               DtoExtensions.AddAdditionalDtoOptions, LiveTvManager.GetPrograms, \
+               LibraryManager.QueryItems, BaseItemRepository.TranslateQuery and ApplyOrder, \
+               RemoveFields, DtoService.GetBaseItemDtos, AddInfoToProgramDto, \
+               AddRecordingInfo, GetTimersInternal, DefaultLiveTvService.GetTimersAsync)",
+        date: "2026-11-11",
+        divergences: &[
+            "A body UserId naming another user, sent without the administrator role, is a 403 \
+         (the RequestHelpers.GetUserId rule GET applies); upstream's GetPrograms reads \
+         body.UserId through GetUserById with no such check, so any Live TV user can list \
+         the guide as another user, with that user's user data and parental restrictions. \
+         Jellyfin bug not ported.",
+            "An offset-less MinStartDate, MaxStartDate, MinEndDate or MaxEndDate (or a bare \
+         date) is read as UTC; upstream's GetDateTime leaves it Unspecified and EF's \
+         DateTimeKindValueConverter reads it as server-local time, as the GET form here \
+         does. Fix path: gl-1033.",
+            "A null EnableTotalRecordCount reads as true; upstream's member is a non-nullable \
+         bool, which System.Text.Json refuses to bind from null (a 400). Fix path: gl-1691.",
+            "GenreIds is bound but filters nothing: every programme the other filters keep is \
+         listed, where upstream's TranslateQuery keeps only those with one of the genres \
+         (WhereReferencedItem over the Genre item values). Fix path: gl-1686.",
+            "IsSports, IsNews and IsKids each match the programme's own flag, so when two or \
+         more are true a programme must have them all; upstream turns each true one into a \
+         tag and keeps a programme with any of those tags. A false one excludes its flag in \
+         both. Fix path: gl-1687.",
+            "Only StartDate, Name, SortName, OfficialRating, ProductionYear and Random order \
+         the page, over the guide's own columns: Name and SortName sort the title as stored \
+         (case-sensitively), OfficialRating sorts its text, Default sorts as StartDate, and \
+         any other key is skipped (StartDate when none is left); ties break on the \
+         programme id. Upstream's ApplyOrder sorts by every key through OrderMapper: Name \
+         by CleanName, SortName by the sort name, OfficialRating by the parental rating \
+         score, DateCreated, PremiereDate, CommunityRating, Runtime and the rest by their \
+         columns, drops Default (SortName when no key is left) and breaks ties on the sort \
+         name. Fix path: gl-1688.",
+            "A SortOrder with more entries than a non-empty SortBy has keys has the extra \
+         entries ignored; upstream's GetOrderBy indexes past the SortBy array and answers \
+         500 (IndexOutOfRangeException). Jellyfin bug not ported.",
+            "EnableTotalRecordCount=false with a StartIndex reports the page's length plus \
+         StartIndex as TotalRecordCount; upstream's QueryItems reads GetItemList and \
+         reports the page's length. Fix path: gl-1689.",
+            "Programme DTOs are projected from the guide's own table, not the stored \
+         LiveTvProgram item, so what that table has no column for is missing: \
+         CommunityRating, PremiereDate (the listing's original air date), Audio, an HD \
+         listing's Width and Height, and the ProgramEtag and SeriesZap2It provider ids; \
+         upstream's GuideManager.GetProgram stores each on the item the DTO is made from. \
+         Fix path: gl-763, gl-1591.",
+            "The listing's fields (Name, Overview, OfficialRating, Genres, the flags) are read \
+         from the guide table, so a change saved to a programme's item (POST \
+         /Items/{itemId}) is not shown here; upstream lists the stored item, the change \
+         included, until a guide refresh that updates the programme assigns the listing's \
+         values over it. Fix path: gl-1690.",
+            "A programme whose own timer carries no SeriesTimerId, or that has no timer, gets \
+         none; upstream's AddRecordingInfo then takes the first series timer (by name) whose \
+         SeriesId equals the programme's ExternalSeriesId, ignoring case, so every airing of \
+         a recorded series shows its SeriesTimerId, those on other channels included. Fix \
+         path: gl-1680.",
+            "The 400 (a body that does not bind) body is Ferrofin's error shape, not \
+         upstream's. Fix path: gl-666.",
+        ],
+        refs: &["access-filtering", "images"],
+    },
+    Verified {
         method: "delete",
         path: "/LiveTv/TunerHosts",
         upstream_file: "Jellyfin.Api/Controllers/LiveTvController.cs",
