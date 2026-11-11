@@ -42,7 +42,7 @@ use uuid::Uuid;
 
 use crate::auth::RequireAuth;
 use crate::error::ApiError;
-use crate::extract::{DotnetGuid, Query};
+use crate::extract::{DotnetGuid, Query, RequiredRouteString, RouteParameter};
 use crate::handlers::streaming::{opened_file_response, require_streamable_item};
 use crate::state::AppState;
 
@@ -876,6 +876,15 @@ fn path_extension(uri_path: &str) -> String {
         .unwrap_or_default()
 }
 
+/// `{itemId}` of the legacy `HlsSegmentController` routes, a
+/// `[FromRoute, Required] string` the actions never read: a blank one is the
+/// binder's `400`, and any other value binds, GUID or not.
+struct LegacyItemId;
+
+impl RouteParameter for LegacyItemId {
+    const NAME: &'static str = "itemId";
+}
+
 /// `GET /Videos/{itemId}/hls/{playlistId}/{segmentId}.{segmentContainer}` — the
 /// legacy video segment serve (`HlsSegmentController.GetHlsVideoSegmentLegacy`).
 ///
@@ -883,8 +892,8 @@ fn path_extension(uri_path: &str) -> String {
 /// cache; `400` on a traversal/miss (mapped from [`ServiceError::InvalidInput`]).
 async fn get_hls_video_segment_legacy(
     State(state): State<AppState>,
-    // Upstream binds an unused `string itemId` here, not a `Guid`: kept on `Uuid`.
-    Path((_item_id, _playlist_id, segment_id)): Path<(Uuid, String, String)>,
+    _item_id: RequiredRouteString<LegacyItemId>,
+    Path((_, _playlist_id, segment_id)): Path<(String, String, String)>,
     request: Request,
 ) -> Result<Response, ApiError> {
     let ext = path_extension(request.uri().path());
@@ -904,8 +913,8 @@ async fn get_hls_video_segment_legacy(
 async fn get_hls_playlist_legacy(
     State(state): State<AppState>,
     RequireAuth(_auth): RequireAuth,
-    // Upstream binds an unused `string itemId` here, not a `Guid`: kept on `Uuid`.
-    Path((_item_id, playlist_id)): Path<(Uuid, String)>,
+    _item_id: RequiredRouteString<LegacyItemId>,
+    Path((_, playlist_id)): Path<(String, String)>,
     request: Request,
 ) -> Result<Response, ApiError> {
     let file_name = format!(
@@ -920,8 +929,8 @@ async fn get_hls_playlist_legacy(
 /// segment serve (`HlsSegmentController.GetHlsAudioSegmentLegacy`).
 async fn get_hls_audio_segment_legacy(
     State(state): State<AppState>,
-    // Upstream binds an unused `string itemId` here, not a `Guid`: kept on `Uuid`.
-    Path((_item_id, segment_id)): Path<(Uuid, String)>,
+    _item_id: RequiredRouteString<LegacyItemId>,
+    Path((_, segment_id)): Path<(String, String)>,
     request: Request,
 ) -> Result<Response, ApiError> {
     let ext = path_extension(request.uri().path());
