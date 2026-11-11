@@ -11,9 +11,8 @@
 //! - **live streams:** hold the open-live-stream table in memory, opening via the
 //!   injected [`MediaEncoder`] probe.
 //!
-//! Injected siblings (`Arc<dyn MediaEncoder>` for probing, `Arc<dyn
-//! ProviderManager>` for the metadata this DTO layer would enrich with) are taken
-//! by dependency injection, never constructed here — they land at the Wave 8
+//! The injected sibling (`Arc<dyn MediaEncoder>`, for probing) is taken by
+//! dependency injection, never constructed here — it lands at the Wave 8
 //! composition root.
 
 use ferrofin_model::configuration::{PathSubstitution, path_after_network_substitution};
@@ -37,24 +36,22 @@ use ferrofin_traits::persistence::{
     ItemRepository, MediaAttachmentQuery, MediaAttachmentRepository, MediaStreamQuery,
     MediaStreamRepository,
 };
-use ferrofin_traits::providers::{MetadataRefreshMode, MetadataRefreshOptions, ProviderManager};
+use ferrofin_traits::providers::{MetadataRefreshMode, MetadataRefreshOptions};
 
 use crate::db_error::media_stream_type_from_disc;
 use crate::scheduled_tasks::maintenance::CACHE_FILE_MAX_AGE;
 
 /// The concrete media-source manager.
 ///
-/// Holds injected persistence repositories plus the sibling `MediaEncoder` /
-/// `ProviderManager` (both by `Arc<dyn _>`), and the in-memory open-live-stream
-/// table keyed by the live-stream id.
+/// Holds injected persistence repositories plus the sibling `MediaEncoder`
+/// (by `Arc<dyn _>`), and the in-memory open-live-stream table keyed by the
+/// live-stream id.
 #[derive(Clone)]
 pub struct FerrofinMediaSourceManager {
     items: Arc<dyn ItemRepository>,
     streams: Arc<dyn MediaStreamRepository>,
     attachments: Arc<dyn MediaAttachmentRepository>,
     encoder: Arc<dyn MediaEncoder>,
-    #[allow(dead_code)]
-    provider: Arc<dyn ProviderManager>,
     /// Live TV manager, when configured — lets playback resolve a Live TV channel
     /// id (which is not a `BaseItems` row) to its tuner stream.
     live_tv: Option<Arc<dyn ferrofin_traits::stubs::LiveTvManager>>,
@@ -114,21 +111,20 @@ impl std::fmt::Debug for FerrofinMediaSourceManager {
 }
 
 impl FerrofinMediaSourceManager {
-    /// Creates a media-source manager over the injected repositories and siblings.
+    /// Creates a media-source manager over the injected repositories and media
+    /// encoder.
     #[must_use]
     pub fn new(
         items: Arc<dyn ItemRepository>,
         streams: Arc<dyn MediaStreamRepository>,
         attachments: Arc<dyn MediaAttachmentRepository>,
         encoder: Arc<dyn MediaEncoder>,
-        provider: Arc<dyn ProviderManager>,
     ) -> Self {
         Self {
             items,
             streams,
             attachments,
             encoder,
-            provider,
             live_tv: None,
             user_data: None,
             users: None,
@@ -2495,95 +2491,6 @@ mod tests {
         }
     }
 
-    /// A no-op provider manager (unused by the tested paths).
-    pub(super) struct StubProvider;
-
-    #[async_trait]
-    impl ProviderManager for StubProvider {
-        async fn queue_refresh(
-            &self,
-            _item_id: Uuid,
-            _options: &ferrofin_traits::providers::MetadataRefreshOptions,
-            _priority: ferrofin_traits::providers::RefreshPriority,
-        ) -> Result<(), ServiceError> {
-            Ok(())
-        }
-        async fn refresh_full_item(
-            &self,
-            _item_id: Uuid,
-            _options: &ferrofin_traits::providers::MetadataRefreshOptions,
-        ) -> Result<(), ServiceError> {
-            Ok(())
-        }
-        async fn refresh_single_item(
-            &self,
-            _item_id: Uuid,
-            _options: &ferrofin_traits::providers::MetadataRefreshOptions,
-        ) -> Result<ferrofin_traits::providers::ItemUpdateType, ServiceError> {
-            Ok(ferrofin_traits::providers::ItemUpdateType::None)
-        }
-        async fn save_image_from_url(
-            &self,
-            _item_id: Uuid,
-            _url: &str,
-            _image_type: ferrofin_model::entities::ImageType,
-            _image_index: Option<i32>,
-        ) -> Result<(), ServiceError> {
-            Ok(())
-        }
-        async fn save_image(
-            &self,
-            _item_id: Uuid,
-            _content: &[u8],
-            _mime_type: &str,
-            _image_type: ferrofin_model::entities::ImageType,
-            _image_index: Option<i32>,
-        ) -> Result<(), ServiceError> {
-            Ok(())
-        }
-        async fn get_available_remote_images(
-            &self,
-            _item_id: Uuid,
-            _query: &ferrofin_model::providers::RemoteImageQuery,
-        ) -> Result<Vec<ferrofin_model::providers::RemoteImageInfo>, ServiceError> {
-            Ok(Vec::new())
-        }
-        async fn get_remote_image_provider_info(
-            &self,
-            _item_id: Uuid,
-        ) -> Result<Vec<ferrofin_model::providers::ImageProviderInfo>, ServiceError> {
-            Ok(Vec::new())
-        }
-        async fn save_metadata(
-            &self,
-            _item_id: Uuid,
-            _update_type: ferrofin_traits::providers::ItemUpdateType,
-        ) -> Result<(), ServiceError> {
-            Ok(())
-        }
-        async fn get_external_id_infos(
-            &self,
-            _item_id: Uuid,
-        ) -> Result<Vec<ferrofin_model::providers::ExternalIdInfo>, ServiceError> {
-            Ok(Vec::new())
-        }
-        async fn get_all_metadata_plugins(
-            &self,
-        ) -> Result<Vec<ferrofin_model::configuration::MetadataPluginSummary>, ServiceError>
-        {
-            Ok(Vec::new())
-        }
-        async fn get_metadata_options(
-            &self,
-            _item_id: Uuid,
-        ) -> Result<ferrofin_model::configuration::MetadataOptions, ServiceError> {
-            Ok(ferrofin_model::configuration::MetadataOptions::default())
-        }
-        async fn get_refresh_queue(&self) -> Result<Vec<Uuid>, ServiceError> {
-            Ok(Vec::new())
-        }
-    }
-
     /// A config manager whose configuration is the factory default — the
     /// user-data manager needs one, and nothing on the playback-permission path
     /// reads it.
@@ -2639,7 +2546,6 @@ mod tests {
             Arc::new(FerrofinMediaStreamRepository::new(db.clone())),
             Arc::new(FerrofinMediaAttachmentRepository::new(db.clone())),
             Arc::new(StubEncoder),
-            Arc::new(StubProvider),
         )
     }
 
@@ -4122,7 +4028,6 @@ mod audio_stream_index_tests {
     use rstest::rstest;
 
     use super::tests::StubEncoder;
-    use super::tests::StubProvider;
 
     fn test_manager(db: &ferrofin_db::Database) -> FerrofinMediaSourceManager {
         let lookup: Arc<dyn ferrofin_traits::persistence::ItemTypeLookup> =
@@ -4132,7 +4037,6 @@ mod audio_stream_index_tests {
             Arc::new(FerrofinMediaStreamRepository::new(db.clone())),
             Arc::new(FerrofinMediaAttachmentRepository::new(db.clone())),
             Arc::new(StubEncoder),
-            Arc::new(StubProvider),
         )
     }
 
@@ -4485,7 +4389,6 @@ mod version_resume_tests {
             Arc::new(FerrofinMediaStreamRepository::new(db.clone())),
             Arc::new(FerrofinMediaAttachmentRepository::new(db.clone())),
             Arc::new(super::tests::StubEncoder),
-            Arc::new(super::tests::StubProvider),
         )
         .with_user_data(super::tests::user_data_manager(db))
         .with_users(Arc::new(crate::user_manager::FerrofinUserManager::new(

@@ -314,8 +314,8 @@ struct RunningJob {
     output_dir: PathBuf,
     /// The `.m3u8`/output path whose stem selects the files to delete.
     playlist_path: PathBuf,
-    /// The segment file extension (e.g. `.ts`), for diagnostics/index scans.
-    #[allow(dead_code)]
+    /// The segment file extension (e.g. `.ts`), which names the segment file
+    /// `wait_for_segment` waits for.
     segment_extension: String,
     /// The first segment this job's ffmpeg writes: its `-start_number`, or the
     /// hls muxer's default 0. Segments below it, or past a gap in its run, are

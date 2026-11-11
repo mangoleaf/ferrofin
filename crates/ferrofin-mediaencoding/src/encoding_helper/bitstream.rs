@@ -119,8 +119,9 @@ pub fn should_remove_dynamic_hdr_metadata(state: &EncodingJobInfo) -> HdrMetadat
         return HdrMetadataRemoval::None;
     }
     let wants = |t: VideoRangeType| {
-        let name = range_type_name(t);
-        requested.iter().any(|r| r.eq_ignore_ascii_case(&name))
+        requested
+            .iter()
+            .any(|r| r.eq_ignore_ascii_case(&t.json_name()))
     };
     let has_hdr10 = wants(VideoRangeType::Hdr10);
     let has_dovi = wants(VideoRangeType::Dovi);
@@ -160,11 +161,6 @@ pub fn should_remove_dynamic_hdr_metadata(state: &EncodingJobInfo) -> HdrMetadat
     }
 }
 
-/// The wire name of a range type, as the client spells it in its profile.
-fn range_type_name(t: VideoRangeType) -> String {
-    t.json_name().into_owned()
-}
-
 /// Whether Ferrofin strips the Dolby Vision RPU from this copy where upstream
 /// copies it through.
 ///
@@ -189,8 +185,9 @@ pub fn strips_dovi_for_a_client_without_dovi(state: &EncodingJobInfo) -> bool {
     }
     let requested = state.requested_range_types(video.codec.as_deref().unwrap_or_default());
     let wants = |t: VideoRangeType| {
-        let name = range_type_name(t);
-        requested.iter().any(|r| r.eq_ignore_ascii_case(&name))
+        requested
+            .iter()
+            .any(|r| r.eq_ignore_ascii_case(&t.json_name()))
     };
     !requested.is_empty()
         && !wants(VideoRangeType::Dovi)
