@@ -266,10 +266,8 @@ impl PlayQueue {
 
     /// The queue's item ids, for the library-access checks.
     ///
-    /// Read from `sorted`, which holds the same items as the active list but
-    /// keeps its order through a shuffle: `join_group` compares this list
-    /// before and after its off-lock access check, and a reshuffle in between
-    /// changes no item a member can or cannot see.
+    /// Read from `sorted`, which holds the same items as the active list and
+    /// keeps its order through a shuffle.
     fn item_ids(&self) -> Vec<Uuid> {
         self.sorted.iter().map(|i| i.item_id).collect()
     }
@@ -1790,6 +1788,18 @@ pub struct FerrofinSyncPlayManager {
     /// affected member's access to the queued items. Absent (unit tests), every
     /// queue is treated as accessible.
     access: Option<LibraryAccess>,
+    /// When set, the next off-lock access check waits here, so a test can
+    /// change the group while it runs.
+    #[cfg(test)]
+    access_check_pause: Mutex<Option<Arc<AccessCheckPause>>>,
+}
+
+/// Holds one access check open: it signals `entered`, then waits for `release`.
+#[cfg(test)]
+#[derive(Default)]
+struct AccessCheckPause {
+    entered: tokio::sync::Notify,
+    release: tokio::sync::Notify,
 }
 
 impl std::fmt::Debug for FerrofinSyncPlayManager {
@@ -1809,6 +1819,8 @@ impl FerrofinSyncPlayManager {
             group_wait_timeout: DEFAULT_GROUP_WAIT_TIMEOUT,
             group_wait_sweep: Some(GROUP_WAIT_SWEEP_INTERVAL),
             access: None,
+            #[cfg(test)]
+            access_check_pause: Mutex::default(),
         }
     }
 
@@ -1833,6 +1845,14 @@ impl FerrofinSyncPlayManager {
     /// Uses the same standalone policy as by-ID endpoints. Explicit-ID browse
     /// queries intentionally have different semantics and cannot authorize queues.
     async fn has_access_to_queue(&self, user_id: Uuid, items: &[Uuid]) -> bool {
+        #[cfg(test)]
+        {
+            let pause = self.access_check_pause.lock().unwrap().take();
+            if let Some(pause) = pause {
+                pause.entered.notify_one();
+                pause.release.notified().await;
+            }
+        }
         match self.visible_subset(user_id, items).await {
             None => true,
             Some(visible) => items.iter().all(|id| visible.contains(id)),
@@ -2203,22 +2223,35 @@ impl SyncPlayManager for FerrofinSyncPlayManager {
         let targets: Vec<(String, bool)>;
         let outbound: Vec<Outbound>;
         let left: Option<LeaveNotices>;
-        // The joiner must be able to see what the group is already playing (C#
-        // `JoinGroup` -> `HasAccessToPlayQueue`). Read the queue under the lock,
-        // then check without holding it.
-        let checked_queue = self
-            .lock()
-            .groups
-            .get(&group_id)
-            .map(|g| g.queue.item_ids());
-        if let Some(queue) = &checked_queue
-            && !self.has_access_to_queue(session.user_id, queue).await
+        // The joiner must be able to see what the group is playing when it joins
+        // (C# `JoinGroup` -> `HasAccessToPlayQueue`, under the group lock). The
+        // check hits the database, so it runs off the registry lock, on the items
+        // not checked yet; anything queued meanwhile is checked in another round.
+        // Every round needs an item not checked before, so the rounds end.
+        let mut checked = std::collections::HashSet::new();
         {
-            self.send_access_denied(&session.session_id, group_id);
-            return Ok(());
-        }
-        {
-            let mut reg = self.lock();
+            let mut reg = loop {
+                let unchecked: Vec<Uuid> = {
+                    let reg = self.lock();
+                    let unchecked: Vec<Uuid> =
+                        reg.groups.get(&group_id).map_or_else(Vec::new, |g| {
+                            g.queue
+                                .item_ids()
+                                .into_iter()
+                                .filter(|id| !checked.contains(id))
+                                .collect()
+                        });
+                    if unchecked.is_empty() {
+                        break reg;
+                    }
+                    unchecked
+                };
+                if !self.has_access_to_queue(session.user_id, &unchecked).await {
+                    self.send_access_denied(&session.session_id, group_id);
+                    return Ok(());
+                }
+                checked.extend(unchecked);
+            };
             if !reg.groups.contains_key(&group_id) {
                 let env = render_update(GroupUpdate::GroupDoesNotExist(GroupDoesNotExistUpdate {
                     group_id,
@@ -2226,23 +2259,6 @@ impl SyncPlayManager for FerrofinSyncPlayManager {
                 }));
                 drop(reg);
                 self.bus.send(&session.session_id, env);
-                return Ok(());
-            }
-            // The access check above ran off-lock; if the queue moved on since,
-            // it was never checked against what the group is playing now.
-            // Refusing here (rather than joining) keeps the gate closed.
-            if reg
-                .groups
-                .get(&group_id)
-                .is_some_and(|g| Some(g.queue.item_ids()) != checked_queue)
-            {
-                drop(reg);
-                tracing::warn!(
-                    session_id = %session.session_id,
-                    %group_id,
-                    "sync-play join refused: the queue changed during the access check"
-                );
-                self.send_access_denied(&session.session_id, group_id);
                 return Ok(());
             }
             // `JoinGroup`'s "Restore session" branch: a join to the group the
@@ -2408,45 +2424,56 @@ impl SyncPlayManager for FerrofinSyncPlayManager {
             PlaybackRequest::Queue { item_ids, .. } => item_ids,
             _ => &[],
         };
-        // The set of members the access check below was made against. The check
-        // itself hits the database, so it cannot run under the registry lock;
-        // the mutation re-verifies this snapshot while holding that lock, which
-        // is what stops a member who joined in between from being skipped.
-        let mut checked_members: Option<Vec<Uuid>> = None;
-        if !incoming.is_empty() {
-            let members = {
-                let reg = self.lock();
-                reg.session_to_group
-                    .get(&session.session_id)
-                    .and_then(|id| reg.groups.get(id))
-                    .map(Group::member_user_ids)
-                    .unwrap_or_default()
-            };
-            // For a member with no user (an API key's session) this is a 400.
-            // For a Play, upstream throws it after an Idle, Playing or Paused
-            // group has switched to Waiting, and leaves it there; that half-made
-            // state change is a Jellyfin bug, not ported: the group keeps its
-            // state.
-            if !members.is_empty() && !self.all_members_have_access(&members, incoming).await? {
-                // Upstream logs and returns to the previous state without
-                // broadcasting (`WaitingGroupState.HandleRequest` on a failed
-                // `SetPlayQueue`), so the refusal is only visible in the log.
-                tracing::warn!(
-                    session_id = %session.session_id,
-                    items = incoming.len(),
-                    "sync-play queue change refused: a member cannot access the items"
-                );
-                return Ok(());
-            }
-            checked_members = Some(members);
-        }
         // `Group.RunTimeTicks` is what `SanitizePositionTicks` clamps a Seek or a
         // Ready position against, and upstream refreshes it from the library
         // every time the playing item changes. Resolved here, off the registry
         // lock, for the items this request is about to put in the queue.
         let runtimes = self.item_run_times(incoming).await;
+        // Upstream checks whoever is a member when it applies the queue (under
+        // the group lock). The check hits the database, so it runs off the
+        // registry lock, on the members not checked yet; whoever joins meanwhile
+        // is checked in another round. Every round needs a member not checked
+        // before, so the rounds end.
+        let mut checked = std::collections::HashSet::new();
         let plan = {
-            let mut reg = self.lock();
+            let mut reg = loop {
+                let unchecked: Vec<Uuid> = {
+                    let reg = self.lock();
+                    let unchecked: Vec<Uuid> = if incoming.is_empty() {
+                        Vec::new()
+                    } else {
+                        reg.session_to_group
+                            .get(&session.session_id)
+                            .and_then(|id| reg.groups.get(id))
+                            .map(Group::member_user_ids)
+                            .unwrap_or_default()
+                            .into_iter()
+                            .filter(|id| !checked.contains(id))
+                            .collect()
+                    };
+                    if unchecked.is_empty() {
+                        break reg;
+                    }
+                    unchecked
+                };
+                // For a member with no user (an API key's session) this is a 400.
+                // For a Play, upstream throws it after an Idle, Playing or Paused
+                // group has switched to Waiting, and leaves it there; that half-made
+                // state change is a Jellyfin bug, not ported: the group keeps its
+                // state.
+                if !self.all_members_have_access(&unchecked, incoming).await? {
+                    // Upstream logs and returns to the previous state without
+                    // broadcasting (`WaitingGroupState.HandleRequest` on a failed
+                    // `SetPlayQueue`), so the refusal is only visible in the log.
+                    tracing::warn!(
+                        session_id = %session.session_id,
+                        items = incoming.len(),
+                        "sync-play queue change refused: a member cannot access the items"
+                    );
+                    return Ok(());
+                }
+                checked.extend(unchecked);
+            };
             let Some(&group_id) = reg.session_to_group.get(&session.session_id) else {
                 drop(reg);
                 let env = envelope(
@@ -2464,19 +2491,6 @@ impl SyncPlayManager for FerrofinSyncPlayManager {
                 // Unreachable: a group is only dropped once it has no members.
                 return Err(ServiceError::backend("sync-play mapped group missing"));
             };
-            // Closes the window between the off-lock access check and this
-            // mutation: if the membership changed, the items were not checked
-            // against whoever is in the group *now*, so refuse rather than
-            // apply a queue nobody vouched for.
-            if let Some(checked) = &checked_members
-                && group.member_user_ids() != *checked
-            {
-                tracing::warn!(
-                    session_id = %session.session_id,
-                    "sync-play queue change refused: membership changed during the access check"
-                );
-                return Ok(());
-            }
             // Member-scoped requests mutate the requesting member, not the group.
             match &request {
                 PlaybackRequest::Ping { ping } => {
@@ -4330,8 +4344,7 @@ mod tests {
         assert!(reordered);
     }
 
-    /// The list the access checks compare does not move with a shuffle, so a
-    /// reshuffle during `join_group`'s off-lock check cannot refuse the join.
+    /// The list the access checks read keeps its order through a shuffle.
     #[test]
     fn shuffling_keeps_the_access_check_list() {
         let mut q = queue_playing(6, 2);
@@ -5541,6 +5554,190 @@ mod tests {
             bus.sent.lock().unwrap().is_empty(),
             "a queue edit inaccessible to a member is refused"
         );
+    }
+
+    /// Seeds a movie that `user` alone cannot see (a tag their policy blocks).
+    async fn seed_movie_hidden_from(
+        db: &ferrofin_db::Database,
+        library: &dyn LibraryManager,
+        user: Uuid,
+    ) -> Uuid {
+        let id = seed_movie(db, "Restricted movie").await;
+        let mut movie = library.get_item_by_id(id).await.unwrap().unwrap();
+        movie.tags = Some("Restricted".into());
+        library.update_items(&[movie], None).await.unwrap();
+        crate::user_manager::FerrofinUserManager::new(db.clone())
+            .update_policy(
+                user,
+                &ferrofin_model::users::UserPolicy {
+                    enable_all_folders: true,
+                    blocked_tags: vec!["restricted".into()],
+                    ..ferrofin_model::users::UserPolicy::default()
+                },
+            )
+            .await
+            .unwrap();
+        id
+    }
+
+    /// Runs `first` until its off-lock access check starts, runs `meanwhile`
+    /// while that check is held open, then lets `first` finish.
+    async fn during_access_check(
+        m: &FerrofinSyncPlayManager,
+        first: impl std::future::Future<Output = ()>,
+        meanwhile: impl std::future::Future<Output = ()>,
+    ) {
+        let pause = Arc::new(AccessCheckPause::default());
+        *m.access_check_pause.lock().unwrap() = Some(Arc::clone(&pause));
+        tokio::join!(first, async {
+            tokio::time::timeout(StdDuration::from_secs(10), pause.entered.notified())
+                .await
+                .expect("the access check started");
+            meanwhile.await;
+            pause.release.notify_one();
+        });
+    }
+
+    fn queue_of(m: &FerrofinSyncPlayManager, group_id: Uuid) -> Vec<Uuid> {
+        m.lock().groups[&group_id].queue.item_ids()
+    }
+
+    /// Upstream checks a new queue against whoever is a member when it applies
+    /// it (`AllUsersHaveAccessToQueue` under the group lock), so a member who
+    /// joins during the check is checked too, never a reason to drop the request.
+    #[tokio::test]
+    async fn a_queue_change_checks_a_member_who_joins_during_its_access_check() {
+        for joiner_sees_it in [true, false] {
+            for set_new_queue in [false, true] {
+                let case =
+                    format!("joiner sees it: {joiner_sees_it}, SetNewQueue: {set_new_queue}");
+                let (m, bus, db, library) = access_mgr().await;
+                let owner = db_session(&db, "s1", "alice").await;
+                let joiner = db_session(&db, "s2", "bob").await;
+                let movie = if joiner_sees_it {
+                    seed_movie(&db, "Movie").await
+                } else {
+                    seed_movie_hidden_from(&db, library.as_ref(), joiner.user_id).await
+                };
+                let info = m.new_group(&owner, "movie night", None).await.unwrap();
+                let request = if set_new_queue {
+                    PlaybackRequest::Play {
+                        playing_queue: vec![movie],
+                        playing_item_position: 0,
+                        start_position_ticks: 0,
+                    }
+                } else {
+                    PlaybackRequest::Queue {
+                        item_ids: vec![movie],
+                        mode: GroupQueueMode::Queue,
+                    }
+                };
+
+                during_access_check(
+                    &m,
+                    async { m.handle_request(&owner, request).await.unwrap() },
+                    async { m.join_group(&joiner, info.group_id).await.unwrap() },
+                )
+                .await;
+
+                assert_eq!(
+                    m.get_group(&owner, info.group_id)
+                        .await
+                        .unwrap()
+                        .participants
+                        .len(),
+                    2,
+                    "{case}: the joiner joined"
+                );
+                if joiner_sees_it {
+                    assert_eq!(queue_of(&m, info.group_id), vec![movie], "{case}");
+                    for sid in ["s1", "s2"] {
+                        assert!(
+                            update_types(&bus, sid).contains(&"PlayQueue".to_owned()),
+                            "{case}: {sid} is sent the new queue"
+                        );
+                    }
+                } else {
+                    assert!(queue_of(&m, info.group_id).is_empty(), "{case}");
+                    assert!(
+                        !update_types(&bus, "s1").contains(&"PlayQueue".to_owned()),
+                        "{case}: a refused queue change broadcasts nothing"
+                    );
+                }
+            }
+        }
+    }
+
+    /// A member who leaves during the check needs no check: the queue applies to
+    /// whoever is left, as upstream (whose leave waits for the group lock).
+    #[tokio::test]
+    async fn a_member_leaving_during_the_access_check_does_not_drop_the_queue_change() {
+        let (m, bus, db, _library) = access_mgr().await;
+        let owner = db_session(&db, "s1", "alice").await;
+        let leaver = db_session(&db, "s2", "bob").await;
+        let movie = seed_movie(&db, "Movie").await;
+        let info = m.new_group(&owner, "movie night", None).await.unwrap();
+        m.join_group(&leaver, info.group_id).await.unwrap();
+        let queue = PlaybackRequest::Queue {
+            item_ids: vec![movie],
+            mode: GroupQueueMode::Queue,
+        };
+
+        during_access_check(
+            &m,
+            async { m.handle_request(&owner, queue).await.unwrap() },
+            async { m.leave_group(&leaver).await.unwrap() },
+        )
+        .await;
+
+        assert_eq!(queue_of(&m, info.group_id), vec![movie]);
+        assert!(update_types(&bus, "s1").contains(&"PlayQueue".to_owned()));
+    }
+
+    /// Upstream checks a joiner against the queue the group has when it joins
+    /// (`HasAccessToPlayQueue` under the group lock), so items queued during the
+    /// check are checked too, never a reason to refuse the join.
+    #[tokio::test]
+    async fn a_join_checks_items_queued_during_its_access_check() {
+        for joiner_sees_it in [true, false] {
+            let (m, bus, db, library) = access_mgr().await;
+            let owner = db_session(&db, "s1", "alice").await;
+            let joiner = db_session(&db, "s2", "bob").await;
+            let first = seed_movie(&db, "First").await;
+            let queued = if joiner_sees_it {
+                seed_movie(&db, "Second").await
+            } else {
+                seed_movie_hidden_from(&db, library.as_ref(), joiner.user_id).await
+            };
+            let info = m.new_group(&owner, "movie night", None).await.unwrap();
+            set_queue(&m, &owner, vec![first]).await;
+            let queue = PlaybackRequest::Queue {
+                item_ids: vec![queued],
+                mode: GroupQueueMode::Queue,
+            };
+
+            during_access_check(
+                &m,
+                async { m.join_group(&joiner, info.group_id).await.unwrap() },
+                async { m.handle_request(&owner, queue).await.unwrap() },
+            )
+            .await;
+
+            assert_eq!(queue_of(&m, info.group_id), vec![first, queued]);
+            let participants = m
+                .get_group(&owner, info.group_id)
+                .await
+                .unwrap()
+                .participants;
+            let denied = update_types(&bus, "s2").contains(&"LibraryAccessDenied".to_owned());
+            if joiner_sees_it {
+                assert_eq!(participants.len(), 2, "the joiner joined");
+                assert!(!denied);
+            } else {
+                assert_eq!(participants.len(), 1, "the joiner stays out");
+                assert!(denied, "and is told why");
+            }
+        }
     }
 
     #[tokio::test]
