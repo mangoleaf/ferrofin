@@ -1541,7 +1541,8 @@ pub async fn build_app_state(
     .with_virtual_paths(virtual_paths.clone())
     // An item moved to a new id (its kind changed) takes its folders along.
     .with_path_manager(Arc::clone(&path_manager))
-    // A row the scan removes takes its metadata folders and extracted data.
+    // A row the scan removes takes its metadata folders and extracted data,
+    // and a video whose file changed loses its extracted data.
     .with_item_data_cleanup(Arc::clone(&item_data_cleanup))
     // Each library location is the `Folder` row Jellyfin keeps for it, under
     // the aggregate root, and what it holds hangs off it (owner decision D1).
