@@ -239,6 +239,9 @@ pub struct FerrofinItemCountService {
     /// The `IsVisible` evaluator the count's library scope asks about
     /// playlists and box sets (see [`FerrofinItemCountService::with_visibility`]).
     visibility: crate::item_repository::VisibilitySlot,
+    /// The user-view manager the count's library scope runs `GetUserViews`
+    /// through (see [`FerrofinItemCountService::with_user_views`]).
+    user_views: crate::item_repository::UserViewsSlot,
     /// Expands a library row stored tokenised before its options are read
     /// (see [`FerrofinItemCountService::with_virtual_paths`]).
     virtual_paths: crate::virtual_paths::VirtualPathExpander,
@@ -259,6 +262,7 @@ impl FerrofinItemCountService {
             db,
             roots: None,
             visibility: crate::item_repository::VisibilitySlot::default(),
+            user_views: crate::item_repository::UserViewsSlot::default(),
             virtual_paths: crate::virtual_paths::VirtualPathExpander::identity(),
         }
     }
@@ -286,6 +290,16 @@ impl FerrofinItemCountService {
         self
     }
 
+    /// Installs the slot the composition root binds to the server's user-view
+    /// manager, the same one the item repository holds, so a count's library
+    /// scope writes the user's views exactly when a query's does
+    /// (`AddUserToQuery`'s `GetUserViews`). Left empty, it writes none.
+    #[must_use]
+    pub fn with_user_views(mut self, slot: crate::item_repository::UserViewsSlot) -> Self {
+        self.user_views = slot;
+        self
+    }
+
     /// Injects the two root-folder ids resolved once at startup, so the user
     /// root's `ChildCount` includes the `AggregateFolder`'s virtual children.
     ///
@@ -310,6 +324,7 @@ impl FerrofinItemCountService {
             &self.db,
             &self.virtual_paths,
             visibility.as_deref(),
+            &self.user_views,
             filter,
         )
         .await
