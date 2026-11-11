@@ -2196,6 +2196,20 @@ pub async fn build_app_state(
         extension_cx.external_identities.as_ref(),
     )
     .await;
+    // Likewise the settings of the metadata plugins Jellyfin builds in, from
+    // their `PluginConfiguration` documents, so an adopted server does not come
+    // up with TMDb, OMDb, MusicBrainz, AudioDB and Studio Images at the
+    // defaults (gl-1574).
+    ferrofin_core::plugin_config_adoption::import_adopted_plugin_configs(
+        &std::path::Path::new(&paths.plugins_path()).join("configurations"),
+        &plugin_state_dir,
+        plugins.as_ref(),
+        &ferrofin_providers::builtin_plugins::ALL
+            .iter()
+            .map(|p| (p.id, p.configuration_file_name))
+            .collect::<Vec<_>>(),
+    )
+    .await;
     let intro_skipper_analysis = ferrofin_extensions::intro_skipper::analysis(&extension_cx);
     subscribe_intro_skipper(&event_bus, &intro_skipper_analysis);
     // Register actual loaded producers before the core "Media Segment Scan"
