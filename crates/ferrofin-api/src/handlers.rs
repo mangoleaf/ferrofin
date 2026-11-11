@@ -3028,6 +3028,15 @@ pub const VERIFIED: &[Verified] = &[
          AddChild overwrites it. Jellyfin bug not ported.",
             "The 400 bodies (a malformed id, an id naming no item) are Ferrofin's error \
          shape, not upstream's. Fix path: gl-666.",
+            "The first collection's box-set refresh runs in a background task \
+         (refresh_full_item) rather than the High-priority refresh queue, and the new \
+         library's scan is queued once it has run, where upstream queues the scan when \
+         AddVirtualFolder makes the library and the refresh through QueueRefresh. \
+         Upstream's slower background scan almost always loses that race; Ferrofin's \
+         would win it and give the box set a Default first refresh, which takes TMDb's \
+         collection name over the typed one of a create with items. The scan this create \
+         queues now always follows the refresh; a membership change or an unrelated scan \
+         during that refresh can still race it, as upstream (gl-1622).",
         ],
         refs: &[],
     },

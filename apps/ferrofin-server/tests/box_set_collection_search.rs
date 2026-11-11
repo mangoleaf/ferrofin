@@ -147,9 +147,10 @@ async fn a_new_collection_searches_tmdb_by_its_parsed_and_cleaned_name() {
         assert_eq!(api.await_overview(&id).await, OVERVIEW, "{name}");
     }
 
-    // What was searched, not how often: the first create also queues a scan of
-    // the new Collections library, and its box-set pass can refresh a box set
-    // whose queued refresh has not saved the id yet.
+    // What was searched, not how often: the first create queues a scan of the
+    // new Collections library once its own refresh has run, and that scan's
+    // box-set pass can refresh a later box set whose queued refresh has not
+    // saved the id yet.
     let seen = searches.lock().unwrap().clone();
     // `CleanDateTimes` is greedy: of two years only the last comes out, so the
     // range keeps its first, as it does in Jellyfin.

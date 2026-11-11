@@ -1774,7 +1774,8 @@ pub async fn build_app_state(
         )
         // A box set takes its members' rating when they change.
         .with_visibility(Arc::clone(&item_visibility))
-        // …and its metadata and artwork, through a queued refresh.
+        // …and its metadata and artwork, through a queued refresh (the first
+        // collection's runs at once, ahead of its library's scan).
         .with_providers(Arc::clone(&providers))
         .with_self_writes(Arc::clone(&self_writes_guard))
         // …and names a new Collections library in the server's language.
