@@ -2066,6 +2066,47 @@ mod tests {
         assert!(read_book_metadata(&path).is_none());
     }
 
+    // Transliterated from Jellyfin v12.4 `ComicBookInfoProviderTests`, whose
+    // archive bundles an empty `<ComicInfo />` (no metadata either), so the
+    // result is the comment reader's alone. Upstream also asserts its Debug
+    // log lines; Ferrofin's reader logs nothing here yet (gl-1667).
+    #[rstest::rstest]
+    // `ReadMetadata_EmptyArchiveComment_SkipsWithoutDeserializing`; the first
+    // is an archive written without ever touching its comment.
+    #[case::no_comment(None)]
+    #[case::empty(Some(""))]
+    #[case::whitespace(Some("   "))]
+    // `ReadMetadata_ArchiveCommentIsNotComicBookInfo_SkipsWithoutError`.
+    #[case::not_comic_book_info(Some("Created by some packer"))]
+    fn an_archive_comment_without_comic_book_info_has_no_metadata(#[case] comment: Option<&str>) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = write_archive(
+            &dir,
+            "comic.cbz",
+            &[("ComicInfo.xml", b"<ComicInfo />")],
+            comment,
+        );
+        assert!(read_book_metadata(&path).is_none());
+    }
+
+    // `ReadMetadata_ValidComicBookInfoComment_ReturnsMetadata`.
+    #[test]
+    fn a_valid_comic_book_info_comment_is_read() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = write_archive(
+            &dir,
+            "comic.cbz",
+            &[("ComicInfo.xml", b"<ComicInfo />")],
+            Some(
+                r#"{"appID":"test","ComicBookInfo/1.0":{"series":"Jungle Juice","title":"Episode 36","issue":175}}"#,
+            ),
+        );
+        let book = read_book_metadata(&path).expect("metadata");
+        assert_eq!(book.name.as_deref(), Some("Episode 36"));
+        assert_eq!(book.series_name.as_deref(), Some("Jungle Juice"));
+        assert_eq!(book.index_number, Some(175));
+    }
+
     #[test]
     fn an_epub_is_read_through_its_container_and_opf() {
         let dir = tempfile::tempdir().expect("tempdir");

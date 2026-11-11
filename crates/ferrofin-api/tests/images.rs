@@ -1938,6 +1938,33 @@ async fn delete_item_image_with_a_malformed_index_is_400() {
     assert!(s.providers.deleted.lock().expect("lock").is_empty());
 }
 
+/// gl-1119: `DeleteItemImage` declares one query member, `imageIndex`, so a
+/// malformed size, quality or overlay value is never read, and a missing item
+/// is then the `404`. Measured on 12.4.
+#[rstest::rstest]
+#[case::max_width(ITEM_ID, "maxWidth=x", StatusCode::NO_CONTENT, Some(0))]
+#[case::quality(ITEM_ID, "quality=x", StatusCode::NO_CONTENT, Some(0))]
+#[case::percent_played(ITEM_ID, "percentPlayed=x", StatusCode::NO_CONTENT, Some(0))]
+#[case::unplayed_count(ITEM_ID, "unplayedCount=x", StatusCode::NO_CONTENT, Some(0))]
+#[case::blank_image_index(ITEM_ID, "imageIndex=", StatusCode::NO_CONTENT, Some(0))]
+#[case::hex_image_index(ITEM_ID, "imageIndex=0x1", StatusCode::NO_CONTENT, Some(1))]
+#[case::missing_item(MISSING_ID, "maxWidth=x", StatusCode::NOT_FOUND, None)]
+#[tokio::test]
+async fn delete_item_image_binds_only_its_image_index(
+    #[case] item: Uuid,
+    #[case] query: &str,
+    #[case] expected: StatusCode,
+    #[case] deleted_index: Option<i32>,
+) {
+    let s = elevated_stubs(String::new(), String::new());
+    let uri = format!("/Items/{item}/Images/Primary?{query}");
+    let (status, _) = send(&s, "DELETE", &uri, None).await;
+    assert_eq!(status, expected, "{uri}");
+    let deleted = s.providers.deleted.lock().expect("lock").clone();
+    let expected_deleted: Vec<_> = deleted_index.map(|i| (ITEM_ID, i)).into_iter().collect();
+    assert_eq!(deleted, expected_deleted, "{uri}");
+}
+
 #[tokio::test]
 async fn delete_item_image_missing_item_is_404() {
     let s = elevated_stubs(String::new(), String::new());
@@ -2964,10 +2991,101 @@ async fn the_positional_route_reads_its_query_string_transforms() {
         (options.fill_width, options.fill_height, options.blur),
         (Some(50), Some(20), Some(2))
     );
-    // The route's segments win: 100 wide, no height limit (`0`), JPEG.
-    assert_eq!((options.max_width, options.max_height), (Some(100), None));
+    // The route's segments win: 100 wide, a height of `0` as given, JPEG.
+    assert_eq!(
+        (options.max_width, options.max_height),
+        (Some(100), Some(0))
+    );
     assert_eq!(
         options.supported_output_formats,
         [ferrofin_model::drawing::ImageFormat::Jpg]
     );
+}
+
+/// gl-1212: `GetItemImage2` passes its route's sizes and tag on as given. A
+/// `0` size reaches the processor, where `HasDefaultOptions` counts it, so
+/// the image is re-encoded; a tag of `0` is a tag, with the year-long
+/// caching, its `ETag` and its `304`. Measured on 12.4.
+#[tokio::test]
+async fn the_positional_route_passes_a_zero_size_and_tag_on() {
+    let img = TempImage::new(b"IMAGEBYTES");
+    let processor = Arc::new(RecordingProcessor::default());
+    let mut s = stubs(img.path(), String::new());
+    s.processor = Some(processor.clone());
+    let uri = format!("/Items/{ITEM_ID}/Images/Primary/0/0/jpg/0/0/0/0");
+
+    let (status, headers, _) = send_with_headers(&s, &uri, &[]).await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        headers["cache-control"],
+        "public, max-age=31536000, immutable"
+    );
+    assert_eq!(headers["etag"], "\"0\"");
+    let options = processor
+        .asked
+        .lock()
+        .expect("asked lock")
+        .first()
+        .cloned()
+        .expect("the image was processed");
+    assert_eq!((options.max_width, options.max_height), (Some(0), Some(0)));
+    let (status, _, body) = send_with_headers(&s, &uri, &[("If-None-Match", "\"0\"")]).await;
+    assert_eq!((status, body.len()), (StatusCode::NOT_MODIFIED, 0));
+
+    // A negative size is passed on too (`HasDefaultOptions` counts it as well).
+    let uri = format!("/Items/{ITEM_ID}/Images/Primary/0/tag/jpg/-5/-5/0/0");
+    let (status, _, _) = send_with_headers(&s, &uri, &[]).await;
+    assert_eq!(status, StatusCode::OK);
+    let options = processor
+        .asked
+        .lock()
+        .expect("asked lock")
+        .last()
+        .cloned()
+        .expect("the image was processed");
+    assert_eq!(
+        (options.max_width, options.max_height),
+        (Some(-5), Some(-5))
+    );
+}
+
+/// gl-1212: `GetItemImage2` takes `imageIndex`, `tag`, `format`, `maxWidth`,
+/// `maxHeight`, `percentPlayed` and `unplayedCount` from the route alone, so a
+/// malformed one in the query is never read, while the query members it
+/// declares are bound. Its route numbers bind as the query binder binds a
+/// number: hex, `#`, a sign and surrounding spaces. Measured on 12.4.
+#[rstest::rstest]
+#[case::query_max_width("0/tag/jpg/100/100/0/0?maxWidth=x", StatusCode::OK)]
+#[case::query_max_height("0/tag/jpg/100/100/0/0?maxHeight=x", StatusCode::OK)]
+#[case::query_percent_played("0/tag/jpg/100/100/0/0?percentPlayed=x", StatusCode::OK)]
+#[case::query_unplayed_count("0/tag/jpg/100/100/0/0?unplayedCount=x", StatusCode::OK)]
+#[case::query_image_index("0/tag/jpg/100/100/0/0?imageIndex=x", StatusCode::OK)]
+#[case::query_format("0/tag/jpg/100/100/0/0?format=x", StatusCode::OK)]
+#[case::query_width("0/tag/jpg/100/100/0/0?width=x", StatusCode::BAD_REQUEST)]
+#[case::query_quality("0/tag/jpg/100/100/0/0?quality=x", StatusCode::BAD_REQUEST)]
+#[case::query_fill_height("0/tag/jpg/100/100/0/0?fillHeight=x", StatusCode::BAD_REQUEST)]
+#[case::query_blur("0/tag/jpg/100/100/0/0?blur=x", StatusCode::BAD_REQUEST)]
+#[case::hex_image_index("0x0/tag/jpg/100/100/0/0", StatusCode::OK)]
+#[case::hash_max_width("0/tag/jpg/%2364/100/0/0", StatusCode::OK)]
+#[case::padded_unplayed_count("0/tag/jpg/100/100/0/%20%200", StatusCode::OK)]
+#[case::signed_max_height("0/tag/jpg/100/%2B100/0/0", StatusCode::OK)]
+#[case::malformed_image_index("x/tag/jpg/100/100/0/0", StatusCode::BAD_REQUEST)]
+#[case::malformed_max_width("0/tag/jpg/x/100/0/0", StatusCode::BAD_REQUEST)]
+#[case::malformed_percent_played("0/tag/jpg/100/100/x/0", StatusCode::BAD_REQUEST)]
+#[case::hex_percent_played("0/tag/jpg/100/100/0x0/0", StatusCode::BAD_REQUEST)]
+#[case::blank_tag("0/%20/jpg/100/100/0/0", StatusCode::BAD_REQUEST)]
+#[case::padded_tag("0/%20tag%20/jpg/100/100/0/0", StatusCode::OK)]
+#[tokio::test]
+async fn the_positional_route_binds_what_its_action_declares(
+    #[case] tail: &str,
+    #[case] expected: StatusCode,
+) {
+    let img = TempImage::new(b"POSTER");
+    let s = stubs(img.path(), String::new());
+    for method in ["GET", "HEAD"] {
+        let uri = format!("/Items/{ITEM_ID}/Images/Primary/{tail}");
+        let (status, _) = send(&s, method, &uri, None).await;
+        assert_eq!(status, expected, "{method} {uri}");
+    }
 }

@@ -40,6 +40,8 @@ use ferrofin_traits::stubs::{
 };
 use ferrofin_util::shuffle_extensions::shuffle;
 
+use crate::collection_manager::require_user;
+
 /// .NET tick resolution: 100-nanosecond units, so 10_000 ticks per millisecond.
 /// Clients expect `PositionTicks`/`When` on the wire in these units.
 const TICKS_PER_MS: i64 = 10_000;
@@ -155,7 +157,8 @@ struct GroupMember {
     /// The signed-in user behind the session — the grain the library-access
     /// checks and the `active_users` counter work at.
     user_id: Uuid,
-    user_name: String,
+    /// Null for an API key's session (C# `GroupMember.UserName`).
+    user_name: Option<String>,
     ping_ms: i64,
     is_buffering: bool,
     ignore_wait: bool,
@@ -594,7 +597,7 @@ impl Group {
     /// not sorted.
     fn info(&self, now: DateTime<Utc>) -> GroupInfoDto {
         let mut seen = std::collections::HashSet::new();
-        let participants: Vec<String> = self
+        let participants: Vec<Option<String>> = self
             .members
             .iter()
             .filter(|m| seen.insert(m.user_name.clone()))
@@ -1883,15 +1886,38 @@ impl FerrofinSyncPlayManager {
         }
     }
 
+    /// Tells a joiner it may not see what the group plays
+    /// (`SyncPlayLibraryAccessDeniedUpdate`).
+    fn send_access_denied(&self, session_id: &str, group_id: Uuid) {
+        let env = render_update(GroupUpdate::LibraryAccessDenied(
+            LibraryAccessDeniedUpdate {
+                group_id,
+                data: String::new(),
+            },
+        ));
+        self.bus.send(session_id, env);
+    }
+
     /// Whether every member of the group may see `items` (C#
     /// `Group.AllUsersHaveAccessToQueue`), used to gate queue changes.
-    async fn all_members_have_access(&self, members: &[Uuid], items: &[Uuid]) -> bool {
+    ///
+    /// Upstream looks each member up with `GetUserById`, which throws for an
+    /// API key's session: the request then fails with a 400. `members` comes
+    /// sorted, so that nil id is checked first, as upstream checks the key's
+    /// session first (it can only be in the group it created, as its first
+    /// member).
+    async fn all_members_have_access(
+        &self,
+        members: &[Uuid],
+        items: &[Uuid],
+    ) -> Result<bool, ServiceError> {
         for user_id in members {
+            require_user(*user_id)?;
             if !self.has_access_to_queue(*user_id, items).await {
-                return false;
+                return Ok(false);
             }
         }
-        true
+        Ok(true)
     }
 
     /// The run time of each of `ids`, in ONE query — the values behind
@@ -2167,6 +2193,9 @@ impl SyncPlayManager for FerrofinSyncPlayManager {
         session: &SyncPlaySession,
         group_id: Uuid,
     ) -> Result<(), ServiceError> {
+        // `JoinGroup` looks the user up before anything else, and that throws
+        // for an API key's session (no user).
+        require_user(session.user_id)?;
         let now = Utc::now();
         let joined_env;
         let user_joined_env;
@@ -2185,13 +2214,7 @@ impl SyncPlayManager for FerrofinSyncPlayManager {
         if let Some(queue) = &checked_queue
             && !self.has_access_to_queue(session.user_id, queue).await
         {
-            let env = render_update(GroupUpdate::LibraryAccessDenied(
-                LibraryAccessDeniedUpdate {
-                    group_id,
-                    data: String::new(),
-                },
-            ));
-            self.bus.send(&session.session_id, env);
+            self.send_access_denied(&session.session_id, group_id);
             return Ok(());
         }
         {
@@ -2219,13 +2242,7 @@ impl SyncPlayManager for FerrofinSyncPlayManager {
                     %group_id,
                     "sync-play join refused: the queue changed during the access check"
                 );
-                let env = render_update(GroupUpdate::LibraryAccessDenied(
-                    LibraryAccessDeniedUpdate {
-                        group_id,
-                        data: String::new(),
-                    },
-                ));
-                self.bus.send(&session.session_id, env);
+                self.send_access_denied(&session.session_id, group_id);
                 return Ok(());
             }
             // `JoinGroup`'s "Restore session" branch: a join to the group the
@@ -2308,6 +2325,8 @@ impl SyncPlayManager for FerrofinSyncPlayManager {
         &self,
         session: &SyncPlaySession,
     ) -> Result<Vec<GroupInfoDto>, ServiceError> {
+        // As in `JoinGroup`, the user lookup comes first.
+        require_user(session.user_id)?;
         // A group is only listed when the caller could actually join it — C#
         // `ListGroups` filters on `HasAccessToPlayQueue`.
         let now = Utc::now();
@@ -2347,6 +2366,8 @@ impl SyncPlayManager for FerrofinSyncPlayManager {
         session: &SyncPlaySession,
         group_id: Uuid,
     ) -> Result<GroupInfoDto, ServiceError> {
+        // As in `JoinGroup`, the user lookup comes first.
+        require_user(session.user_id)?;
         let now = Utc::now();
         let found = {
             let reg = self.lock();
@@ -2374,8 +2395,16 @@ impl SyncPlayManager for FerrofinSyncPlayManager {
         // A request that puts new items in the queue is refused unless *every*
         // member can see them (C# `SetPlayQueue`/`Queue` ->
         // `AllUsersHaveAccessToQueue`, which return false and broadcast nothing).
+        // `SetPlayQueue` refuses an out-of-range position before that check, so
+        // such a request skips it (and reaches the state machine's refusal).
         let incoming: &[Uuid] = match &request {
-            PlaybackRequest::Play { playing_queue, .. } => playing_queue,
+            PlaybackRequest::Play {
+                playing_queue,
+                playing_item_position,
+                ..
+            } if usize::try_from(*playing_item_position).is_ok_and(|p| p < playing_queue.len()) => {
+                playing_queue
+            }
             PlaybackRequest::Queue { item_ids, .. } => item_ids,
             _ => &[],
         };
@@ -2393,7 +2422,12 @@ impl SyncPlayManager for FerrofinSyncPlayManager {
                     .map(Group::member_user_ids)
                     .unwrap_or_default()
             };
-            if !members.is_empty() && !self.all_members_have_access(&members, incoming).await {
+            // For a member with no user (an API key's session) this is a 400.
+            // For a Play, upstream throws it after an Idle, Playing or Paused
+            // group has switched to Waiting, and leaves it there; that half-made
+            // state change is a Jellyfin bug, not ported: the group keeps its
+            // state.
+            if !members.is_empty() && !self.all_members_have_access(&members, incoming).await? {
                 // Upstream logs and returns to the previous state without
                 // broadcasting (`WaitingGroupState.HandleRequest` on a failed
                 // `SetPlayQueue`), so the refusal is only visible in the log.
@@ -2609,7 +2643,7 @@ mod tests {
         SyncPlaySession {
             session_id: id.into(),
             user_id: Uuid::new_v4(),
-            user_name: name.into(),
+            user_name: Some(name.into()),
         }
     }
 
@@ -2700,7 +2734,7 @@ mod tests {
         let s = session("s1", "alice");
         let info = m.new_group(&s, "movie night", None).await.unwrap();
         assert_eq!(info.group_name, "movie night");
-        assert_eq!(info.participants, vec!["alice".to_string()]);
+        assert_eq!(info.participants, vec![Some("alice".to_string())]);
         assert_eq!(info.state, GroupStateType::Idle);
         // `Group.CreateGroup`: GroupJoined, then the Idle state's Stop command.
         assert_eq!(bus.count_for("s1"), 2);
@@ -2722,7 +2756,10 @@ mod tests {
         m.join_group(&b, info.group_id).await.unwrap();
 
         let g = m.get_group(&a, info.group_id).await.unwrap();
-        assert_eq!(g.participants, vec!["alice".to_string(), "bob".to_string()]);
+        assert_eq!(
+            g.participants,
+            vec![Some("alice".to_string()), Some("bob".to_string())]
+        );
         // alice: GroupJoined + her own Stop, then UserJoined(bob).
         assert_eq!(bus.count_for("s1"), 3);
         // bob: GroupJoined + the Idle state's Stop.
@@ -3008,7 +3045,7 @@ mod tests {
         let first = m.get_group(&z, info.group_id).await.unwrap();
         assert_eq!(
             first.participants,
-            vec!["zoe".to_string(), "adam".to_string()]
+            vec![Some("zoe".to_string()), Some("adam".to_string())]
         );
         tokio::time::sleep(std::time::Duration::from_millis(5)).await;
         let second = m.get_group(&z, info.group_id).await.unwrap();
@@ -3910,6 +3947,87 @@ mod tests {
         let s = session("s1", "alice");
         m.handle_request(&s, PlaybackRequest::Pause).await.unwrap();
         assert!(bus.bodies()[0].contains("NotInGroup"));
+    }
+
+    fn is_empty_guid(err: &ServiceError) -> bool {
+        matches!(err, ServiceError::InvalidInput(why) if why == "Guid can't be empty")
+    }
+
+    /// An API key's session: `RequestHelpers.GetSession` logs it with no user,
+    /// so its `UserId` is `Guid.Empty` and its `UserName` null.
+    #[tokio::test]
+    async fn an_api_key_session_can_create_and_leave_a_group_but_not_join_list_or_read_one() {
+        let (m, bus) = mgr();
+        let key = SyncPlaySession {
+            session_id: "k1".into(),
+            user_id: Uuid::nil(),
+            user_name: None,
+        };
+        // `JoinGroup`, `ListGroups` and `GetGroup` start with
+        // `GetUserById(session.UserId)`, which throws "Guid can't be empty" (a
+        // 400) before any group is looked at.
+        let missing = Uuid::new_v4();
+        for err in [
+            m.join_group(&key, missing).await.unwrap_err(),
+            m.list_groups(&key).await.unwrap_err(),
+            m.get_group(&key, missing).await.unwrap_err(),
+        ] {
+            assert!(is_empty_guid(&err), "{err:?}");
+        }
+        assert!(bus.bodies().is_empty(), "{:?}", bus.bodies());
+        // `NewGroup` reads no user: the key's session is the one member,
+        // counted under the empty user id, its null `UserName` a participant.
+        let info = m.new_group(&key, "g", None).await.unwrap();
+        assert_eq!(info.participants, vec![None]);
+        assert_eq!(
+            serde_json::to_value(&info).unwrap()["Participants"],
+            json!([null])
+        );
+        assert!(m.is_user_active(Uuid::nil()).await.unwrap());
+        let alice = session("s1", "alice");
+        m.join_group(&alice, info.group_id).await.unwrap();
+        assert_eq!(
+            m.get_group(&alice, info.group_id)
+                .await
+                .unwrap()
+                .participants,
+            vec![None, Some("alice".to_owned())]
+        );
+        // A new queue reaches `AllUsersHaveAccessToQueue`, whose member lookup
+        // throws for the key's empty id, whoever asks...
+        for s in [&key, &alice] {
+            let err = m.handle_request(s, play(1)).await.unwrap_err();
+            assert!(is_empty_guid(&err), "{err:?}");
+        }
+        let queue = |item_ids| PlaybackRequest::Queue {
+            item_ids,
+            mode: GroupQueueMode::Queue,
+        };
+        let err = m.handle_request(&key, queue(vec![Uuid::new_v4()])).await;
+        assert!(is_empty_guid(&err.unwrap_err()));
+        // ...unless `SetPlayQueue` refused the position, or `AddToPlayQueue`
+        // the empty list, first.
+        for position in [1, -1] {
+            let out_of_range = PlaybackRequest::Play {
+                playing_queue: vec![Uuid::new_v4()],
+                playing_item_position: position,
+                start_position_ticks: 0,
+            };
+            m.handle_request(&key, out_of_range).await.unwrap();
+        }
+        m.handle_request(&key, queue(Vec::new())).await.unwrap();
+        // `LeaveGroup` reads no user either; the null name leaves `UserLeft`
+        // without `Data` (`WhenWritingNull`).
+        bus.sent.lock().unwrap().clear();
+        m.leave_group(&key).await.unwrap();
+        assert!(!m.is_user_active(Uuid::nil()).await.unwrap());
+        let left: serde_json::Value = bus
+            .bodies_for("s1")
+            .iter()
+            .map(|b| serde_json::from_str::<serde_json::Value>(b).unwrap())
+            .find(|v| v["Data"]["Type"] == "UserLeft")
+            .expect("alice is told the key's session left");
+        assert!(left["Data"].get("Data").is_none(), "{left}");
     }
 
     #[tokio::test]
@@ -4970,7 +5088,7 @@ mod tests {
         m.join_group(&a, info.group_id).await.unwrap();
 
         let group = m.get_group(&a, info.group_id).await.unwrap();
-        assert_eq!(group.participants, vec!["alice".to_string()]);
+        assert_eq!(group.participants, vec![Some("alice".to_string())]);
         let after = &bus.bodies_for("s1")[before..];
         assert!(after.iter().any(|x| x.contains("GroupJoined")), "{after:?}");
         assert!(!after.iter().any(|x| x.contains("GroupLeft")), "{after:?}");
@@ -4998,7 +5116,11 @@ mod tests {
         let group = m.get_group(&a, info.group_id).await.unwrap();
         assert_eq!(
             group.participants,
-            vec!["alice".to_string(), "bob".to_string(), "carol".to_string()]
+            vec![
+                Some("alice".to_string()),
+                Some("bob".to_string()),
+                Some("carol".to_string())
+            ]
         );
         let alice_after = &bus.bodies_for("s1")[before..];
         assert!(alice_after.iter().any(|x| x.contains("UserJoined")));
@@ -5123,7 +5245,7 @@ mod tests {
         SyncPlaySession {
             session_id: id.into(),
             user_id,
-            user_name: name.into(),
+            user_name: Some(name.into()),
         }
     }
 
@@ -5283,6 +5405,30 @@ mod tests {
             GroupStateType::Idle,
             "and leaves the group in its previous state"
         );
+    }
+
+    /// `SetPlayQueue` refuses an out-of-range position before it checks
+    /// access, so that refusal settles the state as any refused queue does
+    /// (`WaitingGroupState.HandleRequest`: a `Waiting` group goes `Idle`), even
+    /// for items a member cannot see.
+    #[tokio::test]
+    async fn an_out_of_range_queue_is_refused_before_the_access_check() {
+        let (m, _bus, db, _library) = access_mgr().await;
+        let owner = db_session(&db, "s1", "alice").await;
+        let other = db_session(&db, "s2", "bob").await;
+        let movie = seed_movie(&db, "Movie").await;
+        let info = m.new_group(&owner, "movie night", None).await.unwrap();
+        m.join_group(&other, info.group_id).await.unwrap();
+        set_queue(&m, &owner, vec![movie]).await;
+        let state = || async { m.get_group(&owner, info.group_id).await.unwrap().state };
+        assert_eq!(state().await, GroupStateType::Waiting);
+        let unseen = PlaybackRequest::Play {
+            playing_queue: vec![Uuid::new_v4()],
+            playing_item_position: 1,
+            start_position_ticks: 0,
+        };
+        m.handle_request(&owner, unseen).await.unwrap();
+        assert_eq!(state().await, GroupStateType::Idle);
     }
 
     #[allow(clippy::too_many_lines)]
