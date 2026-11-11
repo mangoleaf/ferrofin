@@ -258,9 +258,22 @@ Wired and working, with a documented limitation or lighter verification:
     the ComicBookInfo JSON in a `.cbz`'s archive comment, and EPUB/OPF Dublin Core + Calibre
     fields, with the cover extracted from the archive. There is still no *remote* book
     provider — that is the third-party Bookshelf plugin.
-  - **`.cbr` / `.cb7`** are recognized and browsable, but yield no embedded metadata or
-    cover: those are RAR and 7z archives, and neither has a maintained pure-Rust reader
-    worth the dependency. `.cbz` and `.cbt` are fully read.
+  - A book's runtime is its pages × 10000 ticks, as Jellyfin 12's probe sets it, so reading
+    progress shows as a share of the pages: a comic counts its archive's entries other than
+    folders (ZIP, 7z or tar, read from the archive's directory only), a PDF the `/Count` of its
+    page tree. It is counted when the book is added, when its file changes and when its
+    metadata is refreshed, as Jellyfin does, and also on any scan while a `.cbz`, `.cb7`,
+    `.cbt` or PDF still has one second, so books added by an older release are counted by
+    the next scan. An `.epub`
+    has one second, as upstream. A RAR `.cbr` is not counted until a RAR reader is chosen
+    (a new one has one second). **Accepted divergence:** `.mobi`, `.azw` and `.azw3` keep one second
+    where upstream gives them no runtime, because with none every stop marks the book played
+    and clears its position.
+  - **`.cbr`** files holding a RAR archive are recognized and browsable, but yield no
+    embedded metadata, cover or page count: no maintained pure-Rust RAR reader exists yet.
+    A comic is read as what its content is, so a `.cbr` holding a ZIP, 7z or tar archive is
+    read as one. Covers and page counts come from `.cbz`, `.cb7` and `.cbt`; embedded metadata
+    from `.cbz`.
 - **Photo keywords** — the EXIF pass fills every field Jellyfin's does except `Genres` and
   `Tags`, which upstream aggregates from XMP/IPTC keywords.
 - **Playlist files are read, never written** — a library scan makes a playlist of each

@@ -643,6 +643,11 @@ fn a_value_outside_a_settings_range_is_refused_naming_it() {
             json!(999),
             "from 1000 to 10000000",
         ),
+        (
+            "book_archive_max_entries",
+            json!(999),
+            "from 1000 to 10000000",
+        ),
         ("tvdb_cache_hours", json!(169), "from 1 to 168"),
         ("shutdown_timeout_secs", json!(4), "from 5 to 600"),
         ("item_values_write_chunk", json!(0), "from 1 to 5000"),

@@ -1680,6 +1680,11 @@ pub async fn build_app_state(
         }
         scanner = scanner.with_directory_cache_limits(limits);
     }
+    // The comic-archive entry cap a book's page count stops at (bootstrap
+    // knob, clamped to a positive range); unset keeps the providers' default.
+    if let Some(max_entries) = config.book_archive_max_entries {
+        scanner = scanner.with_book_archive_max_entries(max_entries);
+    }
     // Scans publish `RefreshProgress` events, which the consumers registered
     // below (once the session manager exists) forward to clients over the
     // WebSocket; the items a scan changes go to the `LibraryChanged`

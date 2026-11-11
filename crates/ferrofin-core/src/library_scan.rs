@@ -4380,6 +4380,10 @@ pub struct LibraryScanner {
     /// disables progress logging. Keeps info-level volume at O(items/N) per
     /// RULES_LOGGING; per-item detail stays at `debug`.
     progress_every: usize,
+    /// The most entries a comic archive may hold for a book's probe to count
+    /// its pages (`book_archive_max_entries`; default
+    /// [`ferrofin_providers::books::DEFAULT_ARCHIVE_MAX_ENTRIES`]).
+    book_archive_max_entries: u32,
     /// Optional domain-event seam. When present the scan publishes
     /// `RefreshProgress` (per-library %, once per second), which the
     /// composition root forwards to client sessions over the WebSocket.
@@ -4639,6 +4643,7 @@ impl LibraryScanner {
             rating_resolver: None,
             default_metadata_language: "en".to_owned(),
             progress_every: DEFAULT_SCAN_PROGRESS_EVERY,
+            book_archive_max_entries: ferrofin_providers::books::DEFAULT_ARCHIVE_MAX_ENTRIES,
             events: None,
             change_notifier: None,
             virtual_paths: crate::virtual_paths::VirtualPathExpander::identity(),
@@ -5006,6 +5011,16 @@ impl LibraryScanner {
     #[must_use]
     pub fn with_progress_every(mut self, every: usize) -> Self {
         self.progress_every = every;
+        self
+    }
+
+    /// Sets the most entries a comic archive may hold for a book's probe to
+    /// count its pages; past it the book keeps its runtime. Wired from the
+    /// `FERROFIN_BOOK_ARCHIVE_MAX_ENTRIES` bootstrap knob; unit tests keep
+    /// the default.
+    #[must_use]
+    pub fn with_book_archive_max_entries(mut self, max_entries: u32) -> Self {
+        self.book_archive_max_entries = max_entries;
         self
     }
 
@@ -8020,6 +8035,7 @@ impl LibraryScanner {
             probe.failed = true;
         }
         let probe_ran = probe.info.is_some();
+        let book_run_time = self.book_run_time(planned_row, stored_row, plan).await;
         let mut failures = u32::from(probe.failed);
         let locked_fields = links.map_or(ALL_LOCKABLE_FIELDS, |l| l.locked_fields.as_slice());
         let video_info = probe.info.as_ref().filter(|_| !probe.is_audio);
@@ -8032,6 +8048,9 @@ impl LibraryScanner {
             .and_then(|info| info.show_name.as_ref())
             .filter(|name| !name.is_empty());
         let mut entity = planned_row.clone();
+        if book_run_time.is_some() {
+            entity.run_time_ticks = book_run_time;
+        }
         // `FindExtras` names a stored extra before its refresh, so the
         // merge below starts from that name and a local reader's title
         // replaces it as it would any stored name. Only the merge's base
@@ -8407,7 +8426,8 @@ impl LibraryScanner {
         let writes_date_created = redated.is_some() || entity.date_created.is_some();
         let facts = SaveFacts {
             locked,
-            probe_ran,
+            // A book's probe measured its runtime, as ffprobe does a file's.
+            probe_ran: probe_ran || book_run_time.is_some(),
             locked_fields,
             merge,
             redated,
@@ -11025,6 +11045,7 @@ impl LibraryScanner {
     ) -> FileFacts {
         let data = crate::item_data::parse_data(entity.data.as_deref());
         let probe = match probe_request(entity) {
+            None if entity.type_.ends_with(".Book") => ProbeKind::Book,
             None => ProbeKind::None,
             Some(request) if request.media_is_audio => ProbeKind::Audio,
             Some(_) => ProbeKind::Video {
@@ -18319,6 +18340,71 @@ impl LibraryScanner {
         }
     }
 
+    /// A book's probe (`ProbeProvider.FetchAsync(Book)`): the runtime its
+    /// pages give it ([`ferrofin_providers::books::book_run_time_ticks`]), or
+    /// `None` when it does not run, the item is no book, or the file cannot be
+    /// counted: the item keeps its runtime, as upstream's does when the
+    /// provider throws.
+    ///
+    /// It runs when `plan` probes the book (upstream's triggers: a new book, a
+    /// changed file, a requested refresh), and, a Ferrofin divergence, on any
+    /// scan of a comic or PDF whose `stored` runtime is still the one-second
+    /// placeholder: the owner decision on gl-495 (2026-10-31) has runtimes
+    /// refresh on rescan, with no migration or repair, so books an older
+    /// release stored at one second take their page count on the next scan.
+    /// A book whose pages cannot be counted, or one of exactly 1000 pages, is
+    /// opened again on each scan for that, and saved only when the count
+    /// changes its row. `.cbr` is left out of that rule until a RAR reader is
+    /// chosen ([`ferrofin_providers::books::has_countable_pages`]).
+    ///
+    /// TODO(parity, open work item; gl-1706): the probe's result does not
+    /// reach the refresh result as upstream's does. Upstream's probe answers
+    /// `MetadataImport`, so `refreshResult.UpdateType > None` merges the pass's
+    /// result onto a book (`MetadataService.cs:895-917`) even when no reader
+    /// found metadata; here only the readers' answers count
+    /// ([`PassAnswers::any`]). And a count that fails is no provider failure
+    /// here, where upstream's throwing provider (`RunCustomProvider`)
+    /// withholds the `DateLastRefreshed` stamp. Port path: count a book probe
+    /// that ran in `any` (under "Replace all metadata" that clears what no
+    /// reader supplied), decide the failure half with the owner (counting it
+    /// would refresh an unreadable new book in full on every scan), and test
+    /// both modes.
+    async fn book_run_time(
+        &self,
+        entity: &BaseItemEntity,
+        stored: Option<&BaseItemEntity>,
+        plan: ItemRefreshPlan,
+    ) -> Option<i64> {
+        if !entity.type_.ends_with(".Book") {
+            return None;
+        }
+        let path = entity.path.clone().filter(|path| !path.is_empty())?;
+        let placeholder = stored.is_some_and(|row| {
+            row.run_time_ticks == Some(ferrofin_providers::books::NOMINAL_BOOK_RUN_TIME_TICKS)
+        }) && ferrofin_providers::books::has_countable_pages(&path);
+        if !plan.probe && !placeholder {
+            return None;
+        }
+        let max_entries = self.book_archive_max_entries;
+        let counted = {
+            let path = path.clone();
+            tokio::task::spawn_blocking(move || {
+                ferrofin_providers::books::book_run_time_ticks(&path, max_entries)
+            })
+            .await
+            .ok()
+            .flatten()
+        };
+        if counted.is_none() {
+            tracing::debug!(
+                item_id = %entity.id,
+                path,
+                "book pages not counted; its runtime stays as it is"
+            );
+        }
+        counted
+    }
+
     /// The embedded-metadata passes for the kinds whose metadata lives inside
     /// the file rather than on a remote provider: photos (EXIF) and books
     /// (`ComicInfo`/`ComicBookInfo`/OPF). Returns the credits, a book's
@@ -19200,7 +19286,10 @@ impl LibraryScanner {
         };
         entity.media_type = Some("Book".to_owned());
         entity.is_in_mixed_folder = in_mixed_folder;
-        entity.run_time_ticks = Some(BOOK_RUN_TIME_TICKS);
+        // A placeholder until the book's probe counts its pages
+        // ([`LibraryScanner::book_run_time`]), and what it keeps when they
+        // cannot be counted.
+        entity.run_time_ticks = Some(ferrofin_providers::books::NOMINAL_BOOK_RUN_TIME_TICKS);
         entity.index_number = parsed.index.map(i64::from);
         entity.parent_index_number = parsed.parent_index.map(i64::from);
         entity.production_year = parsed.year.map(i64::from);
@@ -19259,11 +19348,6 @@ impl LibraryScanner {
 const BOOK_EXTENSIONS: &[&str] = &[
     "azw", "azw3", "cb7", "cbr", "cbt", "cbz", "epub", "mobi", "pdf",
 ];
-
-/// A `Book`'s runtime: upstream's `Book()` constructor hardcodes
-/// `TimeSpan.TicksPerSecond`, so a book is nominally one second long and
-/// position-ticks resume has a non-zero denominator to work against.
-const BOOK_RUN_TIME_TICKS: i64 = 10_000_000;
 
 /// Whether `path` is a `.cue` sheet.
 ///
@@ -22873,7 +22957,8 @@ fn is_path_less(item: &BaseItemEntity) -> bool {
 /// `RefreshedOwnedItems`, `Video.cs:690`), so a stored part keeps its own. `IsoType` is the resolver's on a
 /// new item only and never updated after. Stat-owned (`SaveInternal`):
 /// `DateModified` (a file's; a folder has none, D2) and `Size` (files).
-/// Probe-owned: `RunTimeTicks` of a playable kind, `TotalBitrate`, the
+/// Probe-owned: `RunTimeTicks` of a playable kind and of a book (its pages,
+/// [`LibraryScanner::book_run_time`]), `TotalBitrate`, the
 /// video `Width`/`Height` (a photo's come from its EXIF reader) and a track's
 /// ReplayGain `NormalizationGain`.
 ///
@@ -43863,8 +43948,11 @@ mod tests {
         assert_eq!(study.index_number, Some(1));
         assert_eq!(study.production_year, Some(1887));
         assert_eq!(study.media_type.as_deref(), Some("Book"));
-        // Upstream's `Book()` gives every book a one-second runtime.
-        assert_eq!(study.run_time_ticks, Some(super::BOOK_RUN_TIME_TICKS));
+        // An EPUB's probe gives it one second (`FetchAsync(Book)`).
+        assert_eq!(
+            study.run_time_ticks,
+            Some(ferrofin_providers::books::NOMINAL_BOOK_RUN_TIME_TICKS)
+        );
         assert!(!study.is_folder);
 
         // The single-document folder points at the file, not the folder.
