@@ -220,6 +220,7 @@ fn report(config: &Config, env: &FakeEnv) -> ServerSettingsDto {
         config,
         env,
         &ServerConfiguration::default(),
+        &NetworkConfiguration::default(),
         false,
     )
     .expect("snapshot")
@@ -796,6 +797,67 @@ fn each_source_is_reported_and_only_file_and_default_values_are_editable() {
     assert_eq!(report.settings.len(), SETTINGS.len());
 }
 
+/// gl-555: the Networking page's base URL outranks `config.toml`, and the
+/// variable outranks it; the row reports the base URL the server serves under.
+#[test]
+fn the_networking_page_base_url_outranks_the_file_but_not_the_variable() {
+    let data = DataDir::new(&["base_url = \"/file\"".to_owned()]);
+    let page = NetworkConfiguration {
+        base_url: "/page/".to_owned(),
+        ..NetworkConfiguration::default()
+    };
+    let row = |env: &FakeEnv, network: &NetworkConfiguration| {
+        let running = load(data.cli(), env);
+        let report = snapshot(
+            SETTINGS,
+            &running,
+            env,
+            &ServerConfiguration::default(),
+            network,
+            false,
+        )
+        .expect("report");
+        let row = entry(&report, "base_url").clone();
+        let served =
+            crate::base_url::resolve(&running.base_url, running.base_url_from_env, network);
+        assert_eq!(row.value, Some(json!(served)), "{row:?}");
+        row
+    };
+
+    let from_page = row(&FakeEnv::new(), &page);
+    assert_eq!(from_page.source, Source::NetworkConfiguration);
+    assert_eq!(from_page.value, Some(json!("/page")));
+    assert_eq!(from_page.saved_value, Some(json!("/file")), "not in use");
+    assert!(!from_page.editable);
+
+    let from_file = row(&FakeEnv::new(), &NetworkConfiguration::default());
+    assert_eq!(from_file.source, Source::ConfigFile);
+    assert_eq!(from_file.value, Some(json!("/file")));
+
+    let from_variable = row(&FakeEnv::new().with("FERROFIN_BASE_URL", "/env"), &page);
+    assert_eq!(from_variable.source, Source::Environment);
+    assert_eq!(from_variable.value, Some(json!("/env")));
+
+    // The common install: no base_url in config.toml at all.
+    let no_file = DataDir::new(&[]);
+    let running = load(no_file.cli(), &FakeEnv::new());
+    let report = snapshot(
+        SETTINGS,
+        &running,
+        &FakeEnv::new(),
+        &ServerConfiguration::default(),
+        &page,
+        false,
+    )
+    .expect("report");
+    let page_alone = entry(&report, "base_url");
+    assert_eq!(page_alone.source, Source::NetworkConfiguration);
+    let served = crate::base_url::resolve(&running.base_url, running.base_url_from_env, &page);
+    assert_eq!(page_alone.value, Some(json!(served)));
+    assert_eq!(served, "/page");
+    assert_eq!(page_alone.saved_value, None);
+}
+
 #[test]
 fn a_flag_locks_an_editable_setting_and_names_itself() {
     let row = SettingSpec {
@@ -874,6 +936,7 @@ fn read_only_settings_carry_their_note_whatever_sets_them() {
             "published_url",
             "Dashboard → Networking → Published server URIs",
         ),
+        ("base_url", "Dashboard → Networking → Base URL sets it"),
         // D2a: until the Networking page drives them.
         (
             "port",
@@ -882,10 +945,6 @@ fn read_only_settings_carry_their_note_whatever_sets_them() {
         (
             "https_port",
             "Set it with the https_port key in config.toml or the FERROFIN_HTTPS_PORT",
-        ),
-        (
-            "base_url",
-            "Set it with the base_url key in config.toml or the FERROFIN_BASE_URL",
         ),
     ];
     for (key, note) in notes {
@@ -1078,6 +1137,7 @@ fn a_config_file_that_no_longer_loads_is_a_conflict_naming_it() {
         &running,
         &env,
         &ServerConfiguration::default(),
+        &NetworkConfiguration::default(),
         false,
     )
     .expect_err("refused");
@@ -1115,6 +1175,7 @@ fn a_config_file_that_no_longer_loads_quotes_no_secret() {
             &running,
             &env,
             &ServerConfiguration::default(),
+            &NetworkConfiguration::default(),
             false,
         )
         .expect_err("refused");
@@ -1324,7 +1385,15 @@ fn stored_row(key: &str, trickplay: TrickplayOptions) -> ServerSettingDto {
         trickplay_options: trickplay,
         ..ServerConfiguration::default()
     };
-    let report = snapshot(SETTINGS, &running, &env, &configuration, false).expect("report");
+    let report = snapshot(
+        SETTINGS,
+        &running,
+        &env,
+        &configuration,
+        &NetworkConfiguration::default(),
+        false,
+    )
+    .expect("report");
     entry(&report, key).clone()
 }
 
