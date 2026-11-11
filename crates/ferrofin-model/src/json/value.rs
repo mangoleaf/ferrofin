@@ -1,5 +1,6 @@
 //! Type markers for value conversions that cannot be inferred from serde's
-//! `deserialize_option` or `deserialize_string` callbacks alone.
+//! `deserialize_option` or `deserialize_string` callbacks alone, and the
+//! `deserialize_with` helpers for C# members that bind a JSON `null`.
 
 use serde::de::Visitor;
 use serde::{Deserialize, Deserializer};
@@ -31,6 +32,21 @@ where
         }
     }
     deserializer.deserialize_newtype_struct(NULLABLE_VALUE, Nullable(PhantomData))
+}
+
+/// Reads a C# reference member under `#nullable disable` that Ferrofin keeps
+/// non-optional: System.Text.Json binds a JSON `null` to it, so it reads as the
+/// type's default (`""`, an empty list) rather than failing the body. An absent
+/// member keeps the container's default, upstream's constructor value.
+///
+/// # Errors
+/// Propagates the inner type's conversion error for every other value.
+pub fn null_as_default<'de, D, T>(deserializer: D) -> Result<T, D::Error>
+where
+    D: Deserializer<'de>,
+    T: Deserialize<'de> + Default,
+{
+    Option::<T>::deserialize(deserializer).map(Option::unwrap_or_default)
 }
 
 /// A string read through a converter that requires an actual JSON string.
