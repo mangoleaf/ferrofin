@@ -232,9 +232,10 @@ fn item_value_ids_sql(count: usize) -> String {
 /// A real 10.11.8 leaves the column NULL for exactly ONE kind —
 /// `LiveTvProgram` — and the column is what `GetItemValues` groups on.
 ///
-/// The existence guard is by **type and name**, not by id (`OR IGNORE` keys on
-/// the PRIMARY KEY, which is the `ItemValueId` — a fresh guid every first
-/// write). A `MusicArtist` the scanner resolved from an artist DIRECTORY
+/// The existence guard is by **type and name**, and by id: a genre, music genre
+/// or studio's id derives from its name's path, so a row stored under it with
+/// another clean name (one an older version spelled differently) must not fail
+/// the insert. A `MusicArtist` the scanner resolved from an artist DIRECTORY
 /// already carries that `CleanName` under its path-derived id, and
 /// `item_repository::push_by_name_join` joins `agg.cval = bi."CleanName"`, so a
 /// second row here would list every artist TWICE on /Artists. An adopted
@@ -261,7 +262,8 @@ fn by_name_insert_sql(count: usize) -> String {
            FROM (VALUES {rows}) AS v
            WHERE NOT EXISTS (
                SELECT 1 FROM "BaseItems" b
-               WHERE b."Type" = v.column2 AND b."CleanName" = v.column4)"#,
+               WHERE b."Type" = v.column2 AND b."CleanName" = v.column4)
+             AND NOT EXISTS (SELECT 1 FROM "BaseItems" b WHERE b."Id" = v.column1)"#,
         columns = unset_columns!(),
         values = unset_values!(),
         rows = ferrofin_db::values_rows(count, BY_NAME_INSERT_BINDS)
@@ -326,6 +328,7 @@ async fn write_item_values(
     tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     item_id: Uuid,
     values: &[(i32, String)],
+    identity: Option<&crate::item_type_lookup::ByNameIdentity>,
 ) -> Result<(), ServiceError> {
     let id = guid_to_db(item_id);
     // Whether this item's genres are *music* genres, which get their own
@@ -360,13 +363,15 @@ async fn write_item_values(
             .get(&(*type_, (*value).to_owned()))
             .ok_or_else(|| db_err(sqlx::Error::RowNotFound))?;
         links.push(value_id);
-        // Materialize the browsable by-name item (genre/studio) sharing the
-        // ItemValueId as its id, so the Genres/Studios tabs list it, the
-        // /Genres/{name} lookup resolves it, and a `GenreIds=<id>` filter
-        // (which resolves the id → BaseItems.CleanName) matches. Faithful to
-        // Jellyfin, where genres/studios are BaseItems; here their id is the
-        // shared value id, and the DTO's genre/studio links find the row by
-        // type and name (`item_repository::by_name_ids_by_clean_name`).
+        // Materialize the browsable by-name item (genre/studio), so the
+        // Genres/Studios tabs list it, the /Genres/{name} lookup resolves it,
+        // and a `GenreIds=<id>` filter (which resolves the id →
+        // BaseItems.CleanName) matches. Faithful to Jellyfin, where
+        // genres/studios are BaseItems with the id `GetItemByNameId<T>` derives
+        // from their path (`identity`, gl-1597); a by-name artist, and a row
+        // when no identity is wired, borrows the shared value id. The DTO's
+        // genre/studio links find the row by type and name
+        // (`item_repository::by_name_ids_by_clean_name`), whatever its id.
         // A music item's genre materializes ONLY as a `MusicGenre` row.
         // Upstream keeps the two disjoint — `LibraryManager.GetMusicGenre`
         // for audio, `GetGenre` otherwise — so a real 10.11.8 library has
@@ -375,25 +380,29 @@ async fn write_item_values(
         // phantom entry on the Genres tab.
         let row = if owner_is_music && *type_ == i32::from(ferrofin_db::enums::ItemValueType::Genre)
         {
-            music_genre_row(value, clean)
+            music_genre_row(value, clean, identity)
         } else {
             by_name_type_name(*type_).map(|type_name| {
+                let row_id = by_name_kind(*type_)
+                    .and_then(|kind| identity.and_then(|ids| ids.id(kind, value)))
+                    .map_or_else(|| value_id.clone(), guid_to_db);
+                let key = by_name_kind(*type_).map(|kind| {
+                    crate::kinds::presentation_unique_key(
+                        kind,
+                        Uuid::parse_str(&row_id).unwrap_or_default(),
+                        Some(value),
+                        None,
+                        None,
+                        None,
+                    )
+                });
                 (
-                    value_id.clone(),
+                    row_id,
                     type_name,
                     *value,
                     clean.as_str(),
                     ferrofin_util::sort_name::create_sort_name(value),
-                    by_name_kind(*type_).map(|kind| {
-                        crate::kinds::presentation_unique_key(
-                            kind,
-                            Uuid::parse_str(value_id).unwrap_or_default(),
-                            Some(value),
-                            None,
-                            None,
-                            None,
-                        )
-                    }),
+                    key,
                 )
             })
         };
@@ -447,19 +456,23 @@ async fn write_item_values(
 /// Jellyfin keeps `Genre` and `MusicGenre` as two separate items over the one
 /// `ItemValueType`, and `GetMusicGenres` selects on the row type alone
 /// (`BaseItemRepository.cs:221`), so without this row `/MusicGenres` is empty.
-/// Ferrofin's other by-name rows borrow the `ItemValueId` as their id, which
-/// this one cannot — that id already belongs to the `Genre` row for the same
-/// value — so it takes a derived id instead, the way Jellyfin derives every
-/// by-name id.
+/// Its id is the one Jellyfin derives from its path (`identity`, gl-1597);
+/// with no identity wired, one derived from the bare name.
 ///
 /// The existence check is by **type and name**, not by id: an adopted database
 /// already has Jellyfin's `MusicGenre` rows under Jellyfin's ids, and a scan
 /// must not lay a second row beside each of them. Its `PresentationUniqueKey`
 /// is the `{Type}-{Name}` key the other by-name rows take: a real 10.11.8
 /// scanner row reads back as `MusicGenre-Ambient`.
-fn music_genre_row<'a>(value: &'a str, clean: &'a str) -> Option<ByNameRow<'a>> {
+fn music_genre_row<'a>(
+    value: &'a str,
+    clean: &'a str,
+    identity: Option<&crate::item_type_lookup::ByNameIdentity>,
+) -> Option<ByNameRow<'a>> {
     let type_name = stored_type_name(BaseItemKind::MusicGenre)?;
-    let id = crate::item_type_lookup::derive_item_id(BaseItemKind::MusicGenre, value)?;
+    let id = identity
+        .and_then(|ids| ids.id(BaseItemKind::MusicGenre, value))
+        .or_else(|| crate::item_type_lookup::derive_item_id(BaseItemKind::MusicGenre, value))?;
     Some((
         guid_to_db(id),
         type_name,
@@ -1152,6 +1165,9 @@ pub struct FerrofinItemPersistenceService {
     /// `%MetadataPath%`/`%AppDataPath%` path on a save
     /// ([`FerrofinItemPersistenceService::with_virtual_paths`]).
     virtual_paths: crate::virtual_paths::VirtualPathExpander,
+    /// How by-name `Genre`, `MusicGenre` and `Studio` rows take their ids
+    /// ([`FerrofinItemPersistenceService::with_by_name_identity`]).
+    by_name_identity: Option<crate::item_type_lookup::ByNameIdentity>,
 }
 
 impl std::fmt::Debug for FerrofinItemPersistenceService {
@@ -1174,7 +1190,22 @@ impl FerrofinItemPersistenceService {
             changed: std::sync::OnceLock::new(),
             localization: std::sync::OnceLock::new(),
             virtual_paths: crate::virtual_paths::VirtualPathExpander::identity(),
+            by_name_identity: None,
         }
+    }
+
+    /// Installs how by-name `Genre`, `MusicGenre` and `Studio` rows take their
+    /// ids: Jellyfin's, derived from the kind and the name's metadata path
+    /// (gl-1597). Called once by the composition root; with none (no call, or
+    /// a pre-parity database's [`None`]) a genre or studio row borrows its
+    /// `ItemValues` id and a music genre's derives from the bare name.
+    #[must_use]
+    pub fn with_by_name_identity(
+        mut self,
+        identity: Option<crate::item_type_lookup::ByNameIdentity>,
+    ) -> Self {
+        self.by_name_identity = identity;
+        self
     }
 
     /// Installs the server's [`VirtualPathExpander`], so a save keeps the
@@ -3064,7 +3095,7 @@ impl ItemPersistenceService for FerrofinItemPersistenceService {
         values: &[(i32, String)],
     ) -> Result<(), ServiceError> {
         let mut tx = self.db.writer().begin().await.map_err(db_err)?;
-        write_item_values(&mut tx, item_id, values).await?;
+        write_item_values(&mut tx, item_id, values, self.by_name_identity.as_ref()).await?;
         tx.commit().await.map_err(db_err)
     }
 
@@ -3074,7 +3105,7 @@ impl ItemPersistenceService for FerrofinItemPersistenceService {
     ) -> Result<(), ServiceError> {
         let mut tx = self.db.writer().begin().await.map_err(db_err)?;
         for (item_id, values) in items {
-            write_item_values(&mut tx, *item_id, values).await?;
+            write_item_values(&mut tx, *item_id, values, self.by_name_identity.as_ref()).await?;
         }
         tx.commit().await.map_err(db_err)
     }
@@ -3107,11 +3138,21 @@ impl ItemPersistenceService for FerrofinItemPersistenceService {
         }
         // Mint the id the SCANNER would mint for this name, not a fresh one, so
         // that a later scan of content carrying this value converges on THIS
-        // row instead of inserting a second one beside it: the `ItemValues` id
-        // for the value-backed kinds (what `save_item_values` uses), the
-        // derived id for `MusicGenre` (what `music_genre_row` uses).
-        let id = match by_name_value_type(kind) {
-            Some(value_type) => {
+        // row instead of inserting a second one beside it: Jellyfin's
+        // path-derived id where the identity covers the kind (gl-1597), else
+        // the `ItemValues` id for the value-backed kinds (what
+        // `save_item_values` uses) and the name-derived id for `MusicGenre`
+        // (what `music_genre_row` uses).
+        // With the derived id, no `ItemValues` row is made for a genre or
+        // studio, as upstream's `GetGenre` makes none: a row no item tags is
+        // dead, and the next validation's dead by-name sweep removes it.
+        let derived = self
+            .by_name_identity
+            .as_ref()
+            .and_then(|ids| ids.id(kind, name));
+        let id = match (derived, by_name_value_type(kind)) {
+            (Some(id), _) => Some(id),
+            (None, Some(value_type)) => {
                 let fresh = guid_to_db(Uuid::new_v4());
                 sqlx::query(
                     r#"INSERT OR IGNORE INTO "ItemValues" ("ItemValueId","CleanValue","Type","Value")
@@ -3134,10 +3175,10 @@ impl ItemPersistenceService for FerrofinItemPersistenceService {
                 .map_err(db_err)?;
                 Uuid::parse_str(&value_id).ok()
             }
-            None if kind == BaseItemKind::MusicGenre => {
+            (None, None) if kind == BaseItemKind::MusicGenre => {
                 crate::item_type_lookup::derive_item_id(BaseItemKind::MusicGenre, name)
             }
-            None => None,
+            (None, None) => None,
         };
         let Some(id) = id else {
             tx.rollback().await.map_err(db_err)?;
@@ -4664,7 +4705,14 @@ pub(crate) async fn rekey_rows_at(
     if moves.is_empty() {
         return Ok(Vec::new());
     }
-    let mut tx = db.writer().begin().await.map_err(db_err)?;
+    // The write lock first: the moves read before they write, and a boot
+    // repair runs this beside the previous version (CONTRIBUTING.md,
+    // "Migrations and one-shot repairs").
+    let mut tx = db
+        .writer()
+        .begin_with("BEGIN IMMEDIATE")
+        .await
+        .map_err(db_err)?;
     // Every reference moves inside the one transaction; the foreign
     // keys are checked once, at its end, against the moved rows.
     sqlx::query("PRAGMA defer_foreign_keys = ON")
@@ -9523,8 +9571,9 @@ mod tests {
     }
 
     // Saving a movie's genre/studio values must also materialize the browsable
-    // by-name BaseItems row (sharing the ItemValueId as its id) so the
-    // Genres/Studios tabs list it and a `GenreIds=<id>` filter resolves.
+    // by-name BaseItems row (with no identity wired, sharing the ItemValueId
+    // as its id) so the Genres/Studios tabs list it and a `GenreIds=<id>`
+    // filter resolves.
     #[tokio::test]
     async fn save_item_values_materializes_by_name_items() {
         let db = test_db().await;
@@ -9883,6 +9932,107 @@ mod tests {
             assert_eq!(value, expected);
             assert_eq!(row_id.as_ref(), Some(value_id), "{value}: its by-name row");
         }
+    }
+
+    /// The id of the by-name row of `type_suffix` named `name`.
+    async fn by_name_row_id(
+        db: &ferrofin_db::Database,
+        type_suffix: &str,
+        name: &str,
+    ) -> Option<String> {
+        sqlx::query_scalar(
+            r#"SELECT "Id" FROM "BaseItems" WHERE "Type" LIKE '%.' || ?1 AND "Name" = ?2"#,
+        )
+        .bind(type_suffix)
+        .bind(name)
+        .fetch_optional(db.pool())
+        .await
+        .expect("row")
+    }
+
+    /// gl-1597: with the identity wired, a scanned genre, studio and music
+    /// genre take the ids Jellyfin derives from their paths, not the shared
+    /// `ItemValues` id or one derived from the bare name; the on-demand
+    /// creator mints the same, so a later scan finds its row.
+    #[tokio::test]
+    async fn by_name_rows_take_the_ids_jellyfin_derives() {
+        let db = test_db().await;
+        let (movie, song) = (Uuid::new_v4(), Uuid::new_v4());
+        seed_item(&db, movie, BaseItemKind::Movie).await;
+        seed_item(&db, song, BaseItemKind::Audio).await;
+        let identity = crate::test_support::by_name_identity();
+        let svc = FerrofinItemPersistenceService::new(db.clone())
+            .with_by_name_identity(Some(identity.clone()));
+        svc.save_item_values(
+            movie,
+            &[(2, "Adventure".to_owned()), (3, "Pixar".to_owned())],
+        )
+        .await
+        .expect("movie values");
+        svc.save_item_values(song, &[(2, "Ambient".to_owned())])
+            .await
+            .expect("song values");
+        let derived = |kind, name| identity.id(kind, name).map(guid_to_db);
+        assert_eq!(
+            by_name_row_id(&db, "Genre", "Adventure").await,
+            Some("51CEC964-5B89-6084-D12B-259ACD05CCB1".to_owned())
+        );
+        // Jellyfin 12.4's ids for the same names.
+        assert_eq!(
+            by_name_row_id(&db, "Studio", "Pixar").await.as_deref(),
+            Some("A1384420-050B-89EA-581E-04C0DD9A83A8")
+        );
+        assert_eq!(
+            by_name_row_id(&db, "MusicGenre", "Ambient")
+                .await
+                .as_deref(),
+            Some("7566EE57-563D-F93E-E76C-CE4F2C4349A7")
+        );
+        let created = svc
+            .ensure_by_name_item(
+                BaseItemKind::Genre,
+                "Comedy",
+                "/config/metadata/Genre/Comedy",
+            )
+            .await
+            .expect("ensure")
+            .map(guid_to_db);
+        assert_eq!(created, derived(BaseItemKind::Genre, "Comedy"));
+        svc.save_item_values(movie, &[(2, "Comedy".to_owned())])
+            .await
+            .expect("rescan");
+        let rows: i64 = sqlx::query_scalar(
+            r#"SELECT COUNT(*) FROM "BaseItems" WHERE "Type" LIKE '%.Genre' AND "Name" = 'Comedy'"#,
+        )
+        .fetch_one(db.pool())
+        .await
+        .expect("count");
+        assert_eq!(rows, 1, "the scan converges on the row the lookup created");
+    }
+
+    /// gl-1597: a by-name row whose derived id is already stored under another
+    /// clean name (one an older version spelled differently) leaves the
+    /// insert alone instead of failing the whole save on the primary key.
+    #[tokio::test]
+    async fn a_by_name_insert_skips_an_id_already_stored() {
+        let db = test_db().await;
+        let movie = Uuid::new_v4();
+        seed_item(&db, movie, BaseItemKind::Movie).await;
+        let identity = crate::test_support::by_name_identity();
+        let taken = identity
+            .id(BaseItemKind::Genre, "Adventure")
+            .expect("derived");
+        crate::test_support::seed_named_item(&db, taken, BaseItemKind::Genre, "Other").await;
+        let svc =
+            FerrofinItemPersistenceService::new(db.clone()).with_by_name_identity(Some(identity));
+        svc.save_item_values(movie, &[(2, "Adventure".to_owned())])
+            .await
+            .expect("the save goes through");
+        assert_eq!(by_name_row_id(&db, "Genre", "Adventure").await, None);
+        assert_eq!(
+            by_name_row_id(&db, "Genre", "Other").await,
+            Some(guid_to_db(taken))
+        );
     }
 
     /// The value-id read seeks `IX_ItemValues_Type_Value` for its pairs, and

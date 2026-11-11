@@ -463,8 +463,18 @@ pub async fn build_app_state(
             .with_user_views(Arc::clone(&scope_user_views))
             .with_virtual_paths(virtual_paths.clone()),
     );
+    // Genre, music genre and studio rows take the ids Jellyfin derives from
+    // their metadata paths (gl-1597); a pre-parity database keeps its own.
+    let by_name_identity = ferrofin_core::item_type_lookup::ByNameIdentity::new(
+        &id_derivation,
+        paths.genre_path(),
+        paths.music_genre_path(),
+        paths.studio_path(),
+    );
     let item_persistence_impl = Arc::new(
-        FerrofinItemPersistenceService::new(db.clone()).with_virtual_paths(virtual_paths.clone()),
+        FerrofinItemPersistenceService::new(db.clone())
+            .with_virtual_paths(virtual_paths.clone())
+            .with_by_name_identity(by_name_identity.clone()),
     );
     let item_persistence_service: Arc<dyn ferrofin_traits::persistence::ItemPersistenceService> =
         Arc::clone(&item_persistence_impl) as _;
@@ -871,6 +881,17 @@ pub async fn build_app_state(
     )
     .await
     .context("failed to give playlists their folders")?;
+    // Every boot (gl-1597): genre, music genre and studio rows an earlier
+    // version wrote under its own ids move to the ids Jellyfin derives, their
+    // art folders with them. Rows the version beside this one in a rolling
+    // update writes after this point move on the next boot.
+    ferrofin_core::adoption_repairs::run_rekey_by_name_rows(
+        db,
+        by_name_identity.as_ref(),
+        Some(metadata_library_now.as_path()),
+        Some(path_manager.as_ref()),
+    )
+    .await;
     let client_event_logger: Arc<dyn ferrofin_traits::events::ClientEventLogger> =
         Arc::new(FerrofinClientEventLogger::new(
             Arc::clone(&paths) as Arc<dyn ferrofin_traits::system::ServerApplicationPaths>
@@ -2451,6 +2472,9 @@ pub async fn build_app_state(
         .with_musicbrainz_server(&config.musicbrainz_base_url)
         .with_virtual_paths(virtual_paths)
         .with_metadata_root(metadata_root.clone())
+        // A genre or studio link to a name with no row yet carries the id its
+        // row is created with (gl-1597).
+        .with_by_name_identity(by_name_identity.clone())
         // The `MediaSources`' default-stream selection normalizes languages
         // through the same localization the media-source manager does.
         .with_localization(Arc::clone(&localization))

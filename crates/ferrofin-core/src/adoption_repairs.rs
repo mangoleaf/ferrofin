@@ -45,8 +45,8 @@ use crate::item_persistence_service::{
     detach_user_data, move_user_data, rekey_rows, rekey_rows_at, user_weights,
 };
 use crate::item_type_lookup::{
-    IdDerivation, derive_item_id_with, kind_from_type_name, legacy_virtual_season_id,
-    stored_type_name, virtual_season_id,
+    ByNameIdentity, IdDerivation, derive_item_id_with, kind_from_type_name,
+    legacy_virtual_season_id, stored_type_name, virtual_season_id,
 };
 use crate::library_scan::{SeasonNames, rekey_source};
 use crate::virtual_paths::VirtualPathExpander;
@@ -1629,6 +1629,200 @@ pub async fn run_rekey_pathless_playlists(
         );
     }
     Ok(())
+}
+
+/// Moves per transaction in [`rekey_by_name_rows`], keeping each write short.
+const BY_NAME_MOVES_PER_TRANSACTION: usize = 128;
+
+/// The moves [`rekey_by_name_rows`] makes: `(from, to, stored type name)`
+/// for each row provably Ferrofin's whose derived id is free.
+async fn plan_by_name_moves(
+    db: &Database,
+    identity: &ByNameIdentity,
+) -> Result<Vec<(Uuid, Uuid, &'static str)>, ServiceError> {
+    let mut planned: Vec<(Uuid, Uuid, &'static str)> = Vec::new();
+    let mut kept = 0_usize;
+    for (kind, value_type) in [
+        (BaseItemKind::Genre, Some(2)),
+        (BaseItemKind::Studio, Some(3)),
+        (BaseItemKind::MusicGenre, None),
+    ] {
+        let Some(type_name) = stored_type_name(kind) else {
+            continue;
+        };
+        // A genre or studio is Ferrofin's when its id is its value's
+        // `ItemValueId`; a music genre has no value row of its own.
+        let rows: Vec<(String, Option<String>, bool)> = match value_type {
+            Some(value_type) => sqlx::query_as(
+                r#"SELECT b."Id", b."Name",
+                          EXISTS (SELECT 1 FROM "ItemValues" v
+                                  WHERE v."ItemValueId" = b."Id" AND v."Type" = ?2)
+                   FROM "BaseItems" b WHERE b."Type" = ?1 ORDER BY b.rowid"#,
+            )
+            .bind(type_name)
+            .bind(value_type),
+            None => sqlx::query_as(
+                r#"SELECT "Id", "Name", 0 FROM "BaseItems" WHERE "Type" = ?1 ORDER BY rowid"#,
+            )
+            .bind(type_name),
+        }
+        .fetch_all(db.pool())
+        .await
+        .map_err(db_err)?;
+        let stored: HashSet<Uuid> = rows
+            .iter()
+            .filter_map(|(id, ..)| Uuid::parse_str(id).ok())
+            .collect();
+        let mut targets = HashSet::new();
+        for (id, name, is_value_id) in &rows {
+            let (Ok(from), Some(name)) = (Uuid::parse_str(id), name.as_deref()) else {
+                continue;
+            };
+            // A music genre is Ferrofin's when its id derives from the bare
+            // name, untrimmed (`music_genre_row`) or trimmed
+            // (`ensure_by_name_item`).
+            let ferrofin_wrote_it = *is_value_id
+                || (value_type.is_none()
+                    && [name, name.trim()].iter().any(|n| {
+                        crate::item_type_lookup::derive_item_id(BaseItemKind::MusicGenre, n)
+                            == Some(from)
+                    }));
+            let Some(to) = identity
+                .id(kind, name)
+                .filter(|to| ferrofin_wrote_it && *to != from)
+            else {
+                continue;
+            };
+            if stored.contains(&to) || !targets.insert(to) {
+                tracing::debug!(
+                    item_id = %from,
+                    to = %to,
+                    "a by-name row's derived id is taken; it keeps its id"
+                );
+                kept += 1;
+                continue;
+            }
+            planned.push((from, to, type_name));
+        }
+    }
+    if kept > 0 {
+        tracing::info!(
+            kept,
+            "genre, music genre or studio rows keep their old ids: another row holds their \
+             derived ids"
+        );
+    }
+    Ok(planned)
+}
+
+/// Moves the by-name `Genre`, `MusicGenre` and `Studio` rows an earlier
+/// Ferrofin wrote under its own ids to the ids Jellyfin derives from their
+/// metadata paths (gl-1597, [`ByNameIdentity`]), with their user data, images,
+/// provider ids and id-named folders, as a scan's rekey moves an item
+/// (`rekey_rows`, `RekeyKind::Represented`: the kind, refresh stamp and
+/// provider ids stay).
+///
+/// Only rows provably Ferrofin's move: a genre or studio whose id is its
+/// `ItemValues` row's, and a music genre whose id derives from the bare name
+/// (`derive_item_id`). A row under any other id, Jellyfin's on an adopted
+/// database among them, stays as it is, and so does a locked row whose value
+/// row was pruned and made again under a new id. So does a row whose derived
+/// id another row already holds, or that a second row also derives: nothing is
+/// folded or deleted.
+///
+/// It runs on every boot, not once: the previous version, beside this one in
+/// a rolling update, keeps writing rows under the old ids, and the next boot
+/// moves them. A database with none to move costs one read per kind. A move
+/// that fails is undone, its folders with it.
+///
+/// No snapshot is taken: the moves delete and fold nothing, every reference
+/// moves inside the move's transaction under the deferred foreign-key check,
+/// and almost every database that ever scanned a genre has rows to move, so
+/// a kept copy would cost a full database's disk on nearly every install. The
+/// old id stays recoverable: a genre's or studio's is its `ItemValueId`, a
+/// music genre's derives from its name.
+///
+/// # Errors
+/// Returns [`ServiceError`] if the planning read fails. A batch whose
+/// transaction cannot be opened or committed is logged, and the repair stops
+/// there for the next boot.
+pub async fn rekey_by_name_rows(
+    db: &Database,
+    identity: &ByNameIdentity,
+    art_root: Option<&Path>,
+    path_manager: Option<&dyn PathManager>,
+) -> Result<usize, ServiceError> {
+    let planned = plan_by_name_moves(db, identity).await?;
+    if planned.is_empty() {
+        return Ok(0);
+    }
+    let mut made = 0;
+    for chunk in planned.chunks(BY_NAME_MOVES_PER_TRANSACTION) {
+        let (mut moves, mut renamed) = (Vec::new(), Vec::new());
+        for &(from, to, type_name) in chunk {
+            let (folders, dirs) = move_item_folders(art_root, path_manager, (from, to), "", false);
+            renamed.push((to, folders));
+            moves.push(ItemRekey {
+                from,
+                to,
+                type_name: type_name.to_owned(),
+                dirs,
+                merged: Vec::new(),
+                extra: false,
+            });
+        }
+        let done: BTreeSet<Uuid> = match rekey_rows(db, &moves, RekeyKind::Represented).await {
+            Ok(done) => done.iter().map(|m| m.to).collect(),
+            // The transaction could not be opened or committed (a move that
+            // fails alone is undone inside it): the lock or the database is
+            // the problem, and the next batch would wait as long again. Stop
+            // here; the batches already made stay, the next boot does the rest.
+            Err(err) => {
+                tracing::warn!(
+                    %err,
+                    "could not move genre, music genre and studio rows to their ids; \
+                     the next boot does the rest"
+                );
+                for (_, folders) in renamed {
+                    folders.undo();
+                }
+                break;
+            }
+        };
+        for (to, folders) in renamed {
+            if done.contains(&to) {
+                folders.commit();
+            } else {
+                folders.undo();
+            }
+        }
+        made += done.len();
+    }
+    Ok(made)
+}
+
+/// [`rekey_by_name_rows`] and its log line, for the composition root: a
+/// failure is logged and the next boot retries, never stopping this one.
+pub async fn run_rekey_by_name_rows(
+    db: &Database,
+    identity: Option<&ByNameIdentity>,
+    art_root: Option<&Path>,
+    path_manager: Option<&dyn PathManager>,
+) {
+    let Some(identity) = identity else {
+        return;
+    };
+    match rekey_by_name_rows(db, identity, art_root, path_manager).await {
+        Ok(0) => {}
+        Ok(moved) => tracing::info!(
+            moved,
+            "moved genre, music genre and studio rows to the ids Jellyfin derives"
+        ),
+        Err(err) => tracing::warn!(
+            %err,
+            "could not move genre, music genre and studio rows to their ids; the next boot retries"
+        ),
+    }
 }
 
 /// The extension of the database snapshot
@@ -3605,6 +3799,141 @@ mod tests {
         seed_folder_item, seed_item, seed_named_item, seed_provider_id, seed_user, seed_user_data,
         test_db,
     };
+
+    /// The id of the row of `type_suffix` named `name`.
+    async fn row_id(db: &Database, type_suffix: &str, name: &str) -> Option<String> {
+        sqlx::query_scalar(
+            r#"SELECT "Id" FROM "BaseItems" WHERE "Type" LIKE '%.' || ?1 AND "Name" = ?2"#,
+        )
+        .bind(type_suffix)
+        .bind(name)
+        .fetch_optional(db.pool())
+        .await
+        .expect("row")
+    }
+
+    /// gl-1597: the genre, music genre and studio rows an earlier Ferrofin
+    /// wrote under its own ids move to the ids Jellyfin derives, a user's
+    /// favourite and the generated art folder with them. A row that already
+    /// carries another id (Jellyfin's, on an adopted database) stays, and a
+    /// second boot moves nothing.
+    #[tokio::test]
+    async fn by_name_rows_move_to_the_ids_jellyfin_derives() {
+        use ferrofin_traits::persistence::ItemPersistenceService as _;
+        let db = test_db().await;
+        let art = tempfile::tempdir().expect("art root");
+        let (movie, song, user) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+        crate::test_support::seed_item(&db, movie, BaseItemKind::Movie).await;
+        crate::test_support::seed_item(&db, song, BaseItemKind::Audio).await;
+        crate::test_support::seed_user(&db, user).await;
+        // As an earlier version wrote them: no identity wired.
+        let old = crate::item_persistence_service::FerrofinItemPersistenceService::new(db.clone());
+        old.save_item_values(
+            movie,
+            &[(2, "Adventure".to_owned()), (3, "Pixar".to_owned())],
+        )
+        .await
+        .expect("movie values");
+        old.save_item_values(song, &[(2, "Ambient".to_owned())])
+            .await
+            .expect("song values");
+        let old_genre = row_id(&db, "Genre", "Adventure").await.expect("old genre");
+        sqlx::query(
+            r#"INSERT INTO "UserData" ("ItemId","UserId","CustomDataKey","IsFavorite","Played",
+                                       "PlayCount","PlaybackPositionTicks")
+               VALUES (?1, ?2, lower(?1), 1, 0, 0, 0)"#,
+        )
+        .bind(&old_genre)
+        .bind(guid_to_db(user))
+        .execute(db.writer())
+        .await
+        .expect("favourite");
+        let old_art = crate::dynamic_images::own_art_dir(
+            art.path(),
+            Uuid::parse_str(&old_genre).expect("guid"),
+        );
+        std::fs::create_dir_all(&old_art).expect("art dir");
+        std::fs::write(old_art.join("primary.jpg"), b"collage").expect("collage");
+        // An adopted Jellyfin row: neither its value id nor a name-derived one.
+        let adopted = Uuid::from_u128(0x0AD0_97ED);
+        crate::test_support::seed_named_item(&db, adopted, BaseItemKind::Genre, "Drama").await;
+
+        let identity = crate::test_support::by_name_identity();
+        let moved = rekey_by_name_rows(&db, &identity, Some(art.path()), None)
+            .await
+            .expect("repair");
+        assert_eq!(moved, 3);
+        let derived = |kind, name| identity.id(kind, name).map(guid_to_db);
+        let genre = derived(BaseItemKind::Genre, "Adventure").expect("derived");
+        assert_eq!(
+            row_id(&db, "Genre", "Adventure").await.as_deref(),
+            Some(genre.as_str())
+        );
+        assert_eq!(
+            row_id(&db, "Studio", "Pixar").await,
+            derived(BaseItemKind::Studio, "Pixar")
+        );
+        assert_eq!(
+            row_id(&db, "MusicGenre", "Ambient").await,
+            derived(BaseItemKind::MusicGenre, "Ambient")
+        );
+        assert_eq!(
+            row_id(&db, "Genre", "Drama").await,
+            Some(guid_to_db(adopted)),
+            "an adopted row keeps Jellyfin's id"
+        );
+        let favourite: Option<bool> = sqlx::query_scalar(
+            r#"SELECT "IsFavorite" FROM "UserData" WHERE "ItemId" = ?1 AND "UserId" = ?2"#,
+        )
+        .bind(&genre)
+        .bind(guid_to_db(user))
+        .fetch_optional(db.pool())
+        .await
+        .expect("favourite");
+        assert_eq!(favourite, Some(true), "the favourite moved with the genre");
+        let new_art =
+            crate::dynamic_images::own_art_dir(art.path(), Uuid::parse_str(&genre).expect("guid"));
+        assert!(
+            new_art.join("primary.jpg").is_file(),
+            "the art folder moved"
+        );
+        assert!(!old_art.exists());
+        assert_eq!(
+            rekey_by_name_rows(&db, &identity, Some(art.path()), None)
+                .await
+                .expect("again"),
+            0
+        );
+    }
+
+    /// gl-1597: a Ferrofin row whose derived id another row already holds
+    /// keeps its id; nothing is folded or deleted.
+    #[tokio::test]
+    async fn a_by_name_row_whose_derived_id_is_taken_stays() {
+        use ferrofin_traits::persistence::ItemPersistenceService as _;
+        let db = test_db().await;
+        let movie = Uuid::new_v4();
+        crate::test_support::seed_item(&db, movie, BaseItemKind::Movie).await;
+        let old = crate::item_persistence_service::FerrofinItemPersistenceService::new(db.clone());
+        old.save_item_values(movie, &[(2, "Adventure".to_owned())])
+            .await
+            .expect("values");
+        let identity = crate::test_support::by_name_identity();
+        let taken = identity
+            .id(BaseItemKind::Genre, "Adventure")
+            .expect("derived");
+        // Another genre, under another name, already at that id.
+        crate::test_support::seed_named_item(&db, taken, BaseItemKind::Genre, "Other").await;
+        let before = row_id(&db, "Genre", "Adventure").await;
+        assert_eq!(
+            rekey_by_name_rows(&db, &identity, None, None)
+                .await
+                .expect("repair"),
+            0
+        );
+        assert_eq!(row_id(&db, "Genre", "Adventure").await, before);
+        assert_eq!(row_id(&db, "Genre", "Other").await, Some(guid_to_db(taken)));
+    }
 
     #[tokio::test]
     async fn child_parent_names_are_synced_once() {

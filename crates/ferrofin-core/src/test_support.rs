@@ -1047,3 +1047,17 @@ pub fn rooted_library_manager(
     .with_dashboard_configuration(configuration)
     .with_visibility(visibility)
 }
+
+/// The by-name identity the tests use, rooted at `/config` as a stock Jellyfin
+/// is (gl-1597).
+pub fn by_name_identity() -> crate::item_type_lookup::ByNameIdentity {
+    crate::item_type_lookup::ByNameIdentity::new(
+        &crate::item_type_lookup::IdDerivation::Jellyfin {
+            program_data_path: Some("/config".to_owned()),
+        },
+        "/config/metadata/Genre",
+        "/config/metadata/MusicGenre",
+        "/config/metadata/Studio",
+    )
+    .expect("a Jellyfin-mode identity")
+}

@@ -173,6 +173,9 @@ struct Prefetched {
     /// already had to compute it to build `by_name_ids`. `Prefetched::by_name_id`
     /// reads it instead of re-cleaning the same name once per item.
     clean_values: HashMap<String, String>,
+    /// How a genre, music genre or studio name with no row derives its id
+    /// (the service's [`FerrofinDtoService::with_by_name_identity`]).
+    by_name_identity: Option<crate::item_type_lookup::ByNameIdentity>,
     /// Chapters per item id (populated only when the `Chapters` field is requested).
     chapters: HashMap<Uuid, Vec<ferrofin_model::entities_media::ChapterInfo>>,
     /// The trickplay rows of every media source a page video lists, by source
@@ -334,12 +337,19 @@ impl Prefetched {
         self.by_name_ids.get(&kind)?.get(clean).copied()
     }
 
-    /// A studio/genre id from the prefetched map. A `MusicGenre` with no row
-    /// takes the derived id its row is created with (`music_genre_row`,
-    /// `ensure_by_name_item`); a `Genre`/`Studio` with neither a row nor a
-    /// stored value row takes the nil id.
+    /// A studio/genre id from the prefetched map. A name with no row takes the
+    /// id its row is created with: Jellyfin's path-derived one with the
+    /// identity wired, as upstream's `GetGenreId`/`GetMusicGenreId`/
+    /// `GetStudioId` derive it (gl-1597). Without one, a `MusicGenre` takes
+    /// the id derived from the bare name, and a `Genre`/`Studio` with neither
+    /// a row nor a stored value row the nil id.
     fn by_name_id(&self, kind: BaseItemKind, name: &str) -> Uuid {
         self.lookup_clean(kind, &self.clean_key(name))
+            .or_else(|| {
+                self.by_name_identity
+                    .as_ref()
+                    .and_then(|ids| ids.id(kind, name))
+            })
             .or_else(|| {
                 (kind == BaseItemKind::MusicGenre)
                     .then(|| crate::item_type_lookup::derive_item_id(kind, name.trim()))
@@ -1338,6 +1348,9 @@ pub struct FerrofinDtoService {
     /// The internal metadata directory, the only place a Live TV item's image
     /// file is opened from ([`primary_image_aspect_ratio`]).
     metadata_root: Option<DirectoryPath>,
+    /// How a genre, music genre or studio row's id derives
+    /// ([`FerrofinDtoService::with_by_name_identity`]).
+    by_name_identity: Option<crate::item_type_lookup::ByNameIdentity>,
     /// The MusicBrainz root the "Links" row points music items at — the
     /// configured mirror, as C# uses `Plugin.Instance.Configuration.Server`.
     musicbrainz_server: String,
@@ -1399,6 +1412,7 @@ impl FerrofinDtoService {
             trickplay,
             virtual_paths: VirtualPathExpander::identity(),
             metadata_root: None,
+            by_name_identity: None,
             musicbrainz_server: ferrofin_providers::musicbrainz::DEFAULT_BASE_URL.to_owned(),
             live_tv: Arc::new(OnceLock::new()),
             localization: None,
@@ -1454,6 +1468,19 @@ impl FerrofinDtoService {
     #[must_use]
     pub fn with_virtual_paths(mut self, virtual_paths: VirtualPathExpander) -> Self {
         self.virtual_paths = virtual_paths;
+        self
+    }
+
+    /// Installs how genre, music genre and studio rows take their ids
+    /// (gl-1597), so a `GenreItems`/`Studios` link to a name with no row yet
+    /// carries the id its row is created with. Called once by the composition
+    /// root; [`None`] keeps the `ItemValues` id fallback.
+    #[must_use]
+    pub fn with_by_name_identity(
+        mut self,
+        identity: Option<crate::item_type_lookup::ByNameIdentity>,
+    ) -> Self {
+        self.by_name_identity = identity;
         self
     }
 
@@ -1791,9 +1818,10 @@ impl FerrofinDtoService {
     /// Port of `_libraryManager.GetGenreId`/`GetMusicGenreId`/`GetStudioId`
     /// and `LinkedChildrenService.FindArtists`. Upstream hashes a name to the
     /// by-name item's id; here the item is found by type and clean name (see
-    /// [`crate::item_repository::by_name_ids_by_clean_name`]), because a
-    /// Ferrofin-scanned row carries its `ItemValues` id, an adopted row
-    /// Jellyfin's path-derived id, and a `MusicGenre` row a derived id.
+    /// [`crate::item_repository::by_name_ids_by_clean_name`]), because a row
+    /// an older Ferrofin scanned may carry its `ItemValues` id or a
+    /// name-derived one. A name with no row derives its id
+    /// (`Prefetched::by_name_id`, gl-1597).
     async fn resolve_by_name_ids(
         &self,
         clean_pairs: &[(BaseItemKind, String)],
@@ -1810,7 +1838,14 @@ impl FerrofinDtoService {
             .into_iter()
             .partition(|(kind, _)| ITEM_KINDS.contains(kind));
         let keys: Vec<(BaseItemKind, String)> = keys.into_iter().cloned().collect();
-        let mut map = crate::item_repository::by_name_ids_by_clean_name(&self.db, &keys).await?;
+        // With the identity wired, a name with no row derives its id
+        // (`Prefetched::by_name_id`), not the `ItemValues` id.
+        let mut map = crate::item_repository::by_name_ids_by_clean_name(
+            &self.db,
+            &keys,
+            self.by_name_identity.is_none(),
+        )
+        .await?;
         for kind in ITEM_KINDS {
             let cleans: Vec<&String> = item_keys
                 .iter()
@@ -5192,6 +5227,7 @@ impl FerrofinDtoService {
             person_paths,
             by_name_ids,
             clean_values,
+            by_name_identity: self.by_name_identity.clone(),
             chapters,
             trickplay,
             trickplay_sources,
@@ -11871,6 +11907,25 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(map[&BaseItemKind::MusicArtist][&clean], artist);
+    }
+
+    /// gl-1597: with the identity wired, a genre, music genre or studio name
+    /// with no row links to the id its row is created with, as upstream's
+    /// `GetGenreId`/`GetStudioId` derive it, not the nil id.
+    #[test]
+    fn a_by_name_link_with_no_row_derives_its_id() {
+        let pf = Prefetched {
+            by_name_identity: Some(crate::test_support::by_name_identity()),
+            ..Prefetched::default()
+        };
+        assert_eq!(
+            pf.by_name_id(BaseItemKind::Genre, "Adventure"),
+            Uuid::parse_str("51CEC964-5B89-6084-D12B-259ACD05CCB1").expect("guid")
+        );
+        assert_eq!(
+            pf.by_name_id(BaseItemKind::Studio, "Pixar"),
+            Uuid::parse_str("A1384420-050B-89EA-581E-04C0DD9A83A8").expect("guid")
+        );
     }
 
     #[tokio::test]

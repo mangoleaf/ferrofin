@@ -8585,7 +8585,7 @@ mod tests {
         let repository = repo(&db);
 
         // Seeding a movie's genre also materializes the browsable by-name Genre
-        // row (id = ItemValueId), the way the scanner does.
+        // row (id = ItemValueId, as the scanner gives it with no identity wired).
         let movie = Uuid::from_u128(0x8002);
         seed_named_item(&db, movie, BaseItemKind::Movie, "A Drama Film").await;
         seed_item_genre(&db, movie, "Drama").await;
@@ -9504,7 +9504,7 @@ mod tests {
         let repository = repo(&db);
 
         // Two movies carrying one genre each; seeding materializes the browsable
-        // by-name Genre rows (id = ItemValueId).
+        // by-name Genre rows (id = ItemValueId, with no identity wired).
         //
         // They hang off a library, and the user holds the default permissions,
         // because the by-name tabs are confined to the user's libraries now
@@ -14422,7 +14422,9 @@ mod tests {
             (BaseItemKind::Studio, "acme".to_owned()),
             (BaseItemKind::Studio, "nobody".to_owned()),
         ];
-        let ids = by_name_ids_by_clean_name(&db, &keys).await.expect("ids");
+        let ids = by_name_ids_by_clean_name(&db, &keys, true)
+            .await
+            .expect("ids");
         assert_eq!(ids[&BaseItemKind::Genre]["drama"], lo, "Min(Id) survivor");
         assert!(!ids.contains_key(&BaseItemKind::MusicGenre), "{ids:?}");
         assert_eq!(
@@ -14431,10 +14433,21 @@ mod tests {
             "no row: the value id"
         );
         assert!(!ids[&BaseItemKind::Studio].contains_key("nobody"));
+        // With an identity wired the caller derives a no-row id: no value-id
+        // fallback.
+        let derived = by_name_ids_by_clean_name(&db, &keys, false)
+            .await
+            .expect("ids");
+        assert!(
+            !derived
+                .get(&BaseItemKind::Studio)
+                .is_some_and(|ids| ids.contains_key("acme")),
+            "no row: no value id"
+        );
 
         let plan: Vec<(i64, i64, i64, String)> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
             "EXPLAIN QUERY PLAN {}",
-            by_name_ids_sql(1)
+            by_name_ids_sql(1, true)
         )))
         .bind("t")
         .bind(2)
@@ -16608,16 +16621,21 @@ fn item_ids_by_clean_name_sql(names: usize) -> String {
 
 /// The statement behind [`by_name_ids_by_clean_name`] for `keys` keys of three
 /// binds each (stored type name, `ItemValues.Type`, clean name).
-fn by_name_ids_sql(keys: usize) -> String {
+fn by_name_ids_sql(keys: usize, value_fallback: bool) -> String {
     let values = vec!["(?, ?, ?)"; keys].join(", ");
+    let fallback = if value_fallback {
+        r#"(SELECT iv."ItemValueId" FROM "ItemValues" iv
+                 WHERE iv."Type" = w."ValueType" AND iv."CleanValue" = w."CleanName"
+                 LIMIT 1)"#
+    } else {
+        "NULL"
+    };
     format!(
         r#"WITH "want"("Type", "ValueType", "CleanName") AS (VALUES {values})
            SELECT w."Type", w."CleanName", COALESCE(
                (SELECT MIN(bi."Id") FROM "BaseItems" bi
                  WHERE bi."Type" = w."Type" AND bi."CleanName" = w."CleanName"),
-               (SELECT iv."ItemValueId" FROM "ItemValues" iv
-                 WHERE iv."Type" = w."ValueType" AND iv."CleanValue" = w."CleanName"
-                 LIMIT 1))
+               {fallback})
            FROM "want" w"#
     )
 }
@@ -16630,10 +16648,12 @@ fn by_name_ids_sql(keys: usize) -> String {
 /// on an adopted database it carries Jellyfin's path-derived id, unrelated to
 /// the `ItemValues` id. When several rows share the name the lowest id wins,
 /// the survivor `GetItemValues`' `Min(Id)` collapse lists when they also share
-/// a `PresentationUniqueKey`, and a listed row otherwise. A `Genre`/`Studio` name
-/// with no row falls back to its `ItemValues` id, the id a scan or
-/// `ItemPersistenceService::ensure_by_name_item` gives the row; a key with
-/// neither is absent from the map.
+/// a `PresentationUniqueKey`, and a listed row otherwise. With
+/// `value_fallback`, a `Genre`/`Studio` name with no row falls back to its
+/// `ItemValues` id, the id a scan or `ItemPersistenceService::ensure_by_name_item`
+/// gives the row when no `ByNameIdentity` is wired; without it (an identity is
+/// wired, and the caller derives the id) such a key is absent, as is a key
+/// with neither.
 ///
 /// # Errors
 ///
@@ -16641,11 +16661,12 @@ fn by_name_ids_sql(keys: usize) -> String {
 pub(crate) async fn by_name_ids_by_clean_name(
     db: &Database,
     keys: &[(BaseItemKind, String)],
+    value_fallback: bool,
 ) -> Result<HashMap<BaseItemKind, HashMap<String, Uuid>>, ServiceError> {
     let mut ids: HashMap<BaseItemKind, HashMap<String, Uuid>> = HashMap::new();
     for chunk in keys.chunks(ferrofin_db::BATCH_BIND_CHUNK / 3) {
         let mut query = sqlx::query_as::<_, (String, String, Option<String>)>(sqlx::AssertSqlSafe(
-            by_name_ids_sql(chunk.len()),
+            by_name_ids_sql(chunk.len(), value_fallback),
         ));
         for (kind, clean) in chunk {
             let value_type = match kind {
