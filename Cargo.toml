@@ -219,7 +219,7 @@ uuid = { version = "1.29.2", features = ["v4", "serde"] }
 url = "2.5.8"
 chrono = { version = "0.4", features = ["serde"] }
 unicode-normalization = "0.1.26"
-rand = "0.10.3"           # ShuffleExtensions (ferrofin-util `shuffle`), password salts (ferrofin-common)
+rand = "0.10.3"           # ShuffleExtensions (ferrofin-util `shuffle`), password salts (ferrofin-common), QuickConnect secrets (ferrofin-core)
 # Legacy text encodings (subtitles, playlist files) — C# `UtfUnknown`.
 encoding_rs = "0.8.44"
 chardetng = "1.0.0"

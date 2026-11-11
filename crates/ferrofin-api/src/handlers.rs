@@ -2510,8 +2510,8 @@ pub const VERIFIED: &[Verified] = &[
         upstream_file: "Jellyfin.Api/Controllers/QuickConnectController.cs",
         upstream_method: "InitiateQuickConnect",
         ferrofin: "handlers/quick_connect.rs initiate → ferrofin-core quick_connect_manager.rs \
-               try_connect (make_room, draw_free_code)",
-        date: "2026-10-28",
+               try_connect (make_room, draw_free_code, generate_code, generate_secret)",
+        date: "2026-11-11",
         divergences: &[
             "A drawn code that a pending request already holds is drawn again; upstream \
          TryConnect's `_currentRequests[code] = result` overwrites the other device's \

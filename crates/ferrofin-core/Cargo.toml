@@ -31,6 +31,8 @@ serde_json.workspace = true
 quick-xml.workspace = true
 thiserror.workspace = true
 uuid.workspace = true
+# QuickConnect secrets (the thread-local CSPRNG, as ferrofin-common's salts).
+rand.workspace = true
 chrono.workspace = true
 # Root linguistic comparison for UserViewBuilder literal name filters.
 icu_collator.workspace = true
