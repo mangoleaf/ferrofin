@@ -3219,13 +3219,12 @@ pub const VERIFIED: &[Verified] = &[
                finish_structure_change (after_structure_change: LibraryMonitor::restart, then \
                queue_library_scan when refreshLibrary) → ferrofin-core virtual_folder_manager.rs \
                remove_media_path (LibraryManager.RemoveMediaPath: require_folder, \
-               delete_shortcut_for over resolve_shortcut and the virtual-path expansion, the \
-               ordinal PathInfos filter, save_options, record_changed_locations) → library_monitor.rs \
+               delete_shortcut_for over resolve_shortcut and the virtual-path expansion, \
+               compared with the raw path ignoring case, the ordinal PathInfos filter with the \
+               same raw path, save_options, record_changed_locations) → library_monitor.rs \
                restart and run (LibraryMonitor.Stop and Start)",
-        date: "2026-11-03",
+        date: "2026-11-11",
         divergences: &[
-            "A path with a trailing separator deletes the location's shortcut but keeps its \
-         PathInfos entry; upstream matches neither and changes nothing. Fix path: gl-1205.",
             "A request for a library that does not exist (404) restarts nothing and queues no \
          scan; upstream throws inside its try, so its finally still queues the requested full \
          scan, or restarts the monitor, for an unchanged library.",
