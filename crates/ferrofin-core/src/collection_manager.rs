@@ -64,6 +64,7 @@ use ferrofin_traits::providers::{
     MetadataRefreshMode, MetadataRefreshOptions, ProviderManager, RefreshPriority,
 };
 use ferrofin_traits::system::ServerApplicationPaths;
+use tracing::Instrument;
 
 use crate::collections_library::{CollectionsFolder, CollectionsLibrary};
 use crate::db_error::db_err;
@@ -86,6 +87,71 @@ enum Rerate {
     /// change (`MetadataService.UpdateOfficialRating`, `:623-635`): a locked
     /// item keeps its rating, and a failure is logged, never the request's.
     Refresh,
+}
+
+/// Queues the scan `AddVirtualFolder(…, true)` ends with, for the new
+/// Collections library. A scan that cannot be queued does not fail the
+/// create: the next one reaches the library.
+async fn queue_collections_scan(library_manager: &dyn LibraryManager) {
+    if let Err(err) = library_manager.queue_library_scan().await {
+        tracing::warn!(%err, "could not queue a scan of the new collections library");
+    }
+}
+
+/// The new Collections library's scan, which the create that made the
+/// library owes whatever follows (upstream queues it in `AddVirtualFolder`'s
+/// `finally`). [`queue`](Self::queue) runs it; dropped unrun (the create
+/// failed or was cancelled, or the refresh before it panicked) it is queued
+/// in the background (gl-1622).
+struct ScanOwed(Option<Arc<dyn LibraryManager>>);
+
+impl ScanOwed {
+    /// Queues the scan now.
+    async fn queue(mut self) {
+        if let Some(manager) = self.0.take() {
+            queue_collections_scan(manager.as_ref()).await;
+        }
+    }
+}
+
+impl Drop for ScanOwed {
+    fn drop(&mut self) {
+        if let Some(manager) = self.0.take()
+            && let Ok(runtime) = tokio::runtime::Handle::try_current()
+        {
+            drop(runtime.spawn(in_background(
+                async move { queue_collections_scan(manager.as_ref()).await },
+                tracing::info_span!(parent: None, "collections_scan", trigger = "api"),
+            )));
+        }
+    }
+}
+
+/// `work`, as a background task outliving the request runs: under the
+/// request's culture (the refresh queue's worker captures it the same way)
+/// and in `span`, a root span tagged with its trigger (LOGGING.md, rule 4).
+fn in_background(
+    work: impl std::future::Future<Output = ()>,
+    span: tracing::Span,
+) -> impl std::future::Future<Output = ()> {
+    ferrofin_util::current_culture::scope(ferrofin_util::current_culture::capture(), work)
+        .instrument(span)
+}
+
+/// The first collection's box-set refresh (`refresh_full_item`, what the
+/// refresh queue's worker runs for a queued one), then `scan`, which queues
+/// the new library's scan: whatever the refresh's outcome, the scan follows
+/// it (gl-1622).
+async fn refresh_then_scan(
+    providers: Arc<dyn ProviderManager>,
+    id: Uuid,
+    options: MetadataRefreshOptions,
+    scan: impl std::future::Future<Output = ()>,
+) {
+    if let Err(err) = providers.refresh_full_item(id, &options).await {
+        tracing::warn!(item_id = %id, %err, "the first collection's refresh failed");
+    }
+    scan.await;
 }
 
 /// `_providerManager.QueueRefresh(id, options, RefreshPriority.High)`, which
@@ -479,7 +545,9 @@ pub struct FerrofinCollectionManager {
     /// ([`update_rating_to_items`]). `None` in unit tests: the rating stays.
     visibility: Option<Arc<crate::item_visibility::ItemVisibility>>,
     /// Queues the box set's refresh after a membership change
-    /// ([`queue_refresh`]). `None` in unit tests: nothing is queued.
+    /// ([`queue_refresh`]); the first collection's runs at once, ahead of its
+    /// library's scan ([`refresh_then_scan`]). `None` in unit tests: nothing
+    /// is queued.
     providers: Option<Arc<dyn ProviderManager>>,
     /// Brackets the folder a new box set is made in, as `CollectionManager.CreateCollectionAsync` does
     /// (`ReportFileSystemChangeBeginning`/`Complete`). `None` in unit tests.
@@ -579,14 +647,17 @@ impl FerrofinCollectionManager {
     /// the library it belongs to, making both when there is no folder, and
     /// adopting any orphan box sets a previous version left behind.
     ///
-    /// `AddVirtualFolder(…, true)` ends with a background library scan, which is
-    /// queued here; a scan that cannot be queued does not fail the create, the
-    /// next one reaches the library.
+    /// `AddVirtualFolder(…, true)` ends with a background library scan. The
+    /// third value holds that scan when this call made the folder (empty
+    /// otherwise), owed from the moment the folder exists: the caller queues
+    /// it at once or, for a first collection, after its box set's refresh,
+    /// and an error or cancel anywhere after still queues it.
     async fn ensure_collections_folder(
         &self,
-    ) -> Result<(CollectionsLibrary, Option<CollectionsFolder>), ServiceError> {
+    ) -> Result<(CollectionsLibrary, Option<CollectionsFolder>, ScanOwed), ServiceError> {
         let library = self.collections_library().await?;
         let mut folder = library.find().await?;
+        let mut owed = ScanOwed(None);
         if folder.is_none() {
             let _one_at_a_time = self.provisioning.lock().await;
             folder = library.find().await?;
@@ -597,9 +668,7 @@ impl FerrofinCollectionManager {
                         .await?;
                 }
                 folder = library.ensure_folder().await?;
-                if let Err(err) = self.library_manager.queue_library_scan().await {
-                    tracing::warn!(%err, "could not queue a scan of the new collections library");
-                }
+                owed = ScanOwed(Some(Arc::clone(&self.library_manager)));
             }
         }
         if let Some(folder) = &folder {
@@ -610,7 +679,35 @@ impl FerrofinCollectionManager {
             )
             .await?;
         }
-        Ok((library, folder))
+        Ok((library, folder, owed))
+    }
+
+    /// The new box set's refresh, `options`: queued, as upstream queues it.
+    /// The first collection also made the Collections library, whose scan
+    /// would otherwise give the box set its first refresh in Default mode,
+    /// which replaces the name the user typed with TMDb's (gl-1622). So its
+    /// own refresh runs first and the scan is queued after it, the order
+    /// upstream's slower background scan almost always ends up in: its
+    /// `FullRefresh` (with items) keeps the typed name, and the scan then
+    /// finds the box set refreshed.
+    async fn refresh_new_box_set(
+        &self,
+        id: Uuid,
+        options: MetadataRefreshOptions,
+        owed: ScanOwed,
+    ) -> Result<(), ServiceError> {
+        if owed.0.is_none() {
+            return queue_refresh(self.providers.as_deref(), id, options).await;
+        }
+        let Some(providers) = self.providers.clone() else {
+            owed.queue().await;
+            return Ok(());
+        };
+        drop(tokio::spawn(in_background(
+            refresh_then_scan(providers, id, options, owed.queue()),
+            tracing::info_span!(parent: None, "collection_refresh", item_id = %id, trigger = "api"),
+        )));
+        Ok(())
     }
 
     /// The name a new Collections library takes:
@@ -634,7 +731,8 @@ impl FerrofinCollectionManager {
     }
 
     /// Queues a box set's provider refresh after it is created or its members
-    /// change, as `CollectionManager` does. Called once by the composition
+    /// change, as `CollectionManager` does (the first collection's runs at
+    /// once, ahead of its library's scan). Called once by the composition
     /// root.
     #[must_use]
     pub fn with_providers(mut self, providers: Arc<dyn ProviderManager>) -> Self {
@@ -700,7 +798,10 @@ impl CollectionManager for FerrofinCollectionManager {
         &self,
         options: &CollectionCreationOptions,
     ) -> Result<BaseItemEntity, ServiceError> {
-        let (library, parent) = self.ensure_collections_folder().await?;
+        // `owed` holds the new library's scan when this create made it: an
+        // error below still queues it (the guard's drop), and the refresh
+        // takes it over.
+        let (library, parent, owed) = self.ensure_collections_folder().await?;
         let (mode, _) = container_identity(&self.db, &self.paths).await?;
         // `Path.Combine(parentFolder.Path, folderName)`: `{data}/collections`,
         // or the library location above it that `FindFolders` found.
@@ -773,25 +874,21 @@ impl CollectionManager for FerrofinCollectionManager {
         }
         if options.item_id_list.is_empty() {
             // `CreateCollectionAsync` with no items: a default refresh.
-            queue_refresh(
-                self.providers.as_deref(),
-                id,
-                MetadataRefreshOptions::default(),
-            )
-            .await?;
+            self.refresh_new_box_set(id, MetadataRefreshOptions::default(), owed)
+                .await?;
             return Ok(row);
         }
         self.update_rating_to_items(id, Rerate::Direct).await?;
         // `AddToCollectionAsync` with the `FullRefresh` options create passes
         // ("the initial adding of items is going to create a local metadata
         // file"), which it then marks `ForceSave`.
-        queue_refresh(
-            self.providers.as_deref(),
+        self.refresh_new_box_set(
             id,
             MetadataRefreshOptions {
                 metadata_refresh_mode: MetadataRefreshMode::FullRefresh,
                 ..force_save_refresh()
             },
+            owed,
         )
         .await?;
         Ok(self
@@ -978,7 +1075,9 @@ impl CollectionManager for FerrofinCollectionManager {
         // :88-118): the folder by its path, and the library and folder made
         // only when the caller asked for them.
         let folder = if create_if_needed {
-            self.ensure_collections_folder().await?.1
+            let (_, folder, owed) = self.ensure_collections_folder().await?;
+            owed.queue().await;
+            folder
         } else {
             self.collections_library().await?.find().await?
         };
@@ -5372,12 +5471,15 @@ mod tests {
     type RefreshLog =
         std::sync::Mutex<Vec<(Uuid, ferrofin_traits::providers::MetadataRefreshOptions)>>;
 
-    /// A [`ProviderManager`] recording `queue_refresh` and
-    /// `refresh_single_item` calls; nothing else on these paths reaches it.
+    /// A [`ProviderManager`] recording `queue_refresh`, `refresh_single_item`
+    /// and `refresh_full_item` calls; nothing else on these paths reaches it.
     #[derive(Default)]
     struct QueuedRefreshes {
         queued: RefreshLog,
         awaited: RefreshLog,
+        full: RefreshLog,
+        /// `refresh_full_item` fails (after recording) when set.
+        fail_full: std::sync::atomic::AtomicBool,
     }
 
     /// A log's `(item, mode, force_save)` triples, emptied.
@@ -5418,10 +5520,16 @@ mod tests {
         }
         async fn refresh_full_item(
             &self,
-            _item_id: Uuid,
-            _options: &ferrofin_traits::providers::MetadataRefreshOptions,
+            item_id: Uuid,
+            options: &ferrofin_traits::providers::MetadataRefreshOptions,
         ) -> Result<(), ferrofin_traits::error::ServiceError> {
-            unreachable!("not on these paths")
+            self.full.lock().unwrap().push((item_id, options.clone()));
+            if self.fail_full.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err(ferrofin_traits::error::ServiceError::backend(
+                    "TMDb is down",
+                ));
+            }
+            Ok(())
         }
         async fn refresh_single_item(
             &self,
@@ -5513,6 +5621,169 @@ mod tests {
         }
     }
 
+    /// The first collection makes the Collections library, whose scan would
+    /// give the new box set its first refresh in Default mode, replacing the
+    /// typed name with TMDb's: its own refresh runs instead of being queued,
+    /// and the scan is queued after it. Later collections queue theirs
+    /// (gl-1622).
+    #[tokio::test]
+    async fn the_first_collection_is_refreshed_before_its_library_is_scanned() {
+        use ferrofin_traits::providers::MetadataRefreshMode::FullRefresh;
+        let db = test_db().await;
+        let movie = Uuid::new_v4();
+        seed_item(&db, movie, BaseItemKind::Movie).await;
+        let queued = Arc::new(QueuedRefreshes::default());
+        let mgr = collection_manager_over(&db).with_providers(Arc::clone(&queued) as Arc<_>);
+        let create = |name: &str| CollectionCreationOptions {
+            name: name.to_owned(),
+            item_id_list: vec![movie],
+            ..CollectionCreationOptions::default()
+        };
+
+        let first = mgr
+            .create_collection(&create("First"))
+            .await
+            .expect("first");
+        let first = Uuid::parse_str(&first.id).expect("uuid");
+        assert_eq!(queued.take(), Vec::new(), "the first is not queued");
+        let mut ran = Vec::new();
+        for _ in 0..200 {
+            ran = drain(&queued.full);
+            if !ran.is_empty() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            ran,
+            vec![(first, FullRefresh, true)],
+            "it runs, with create's options"
+        );
+
+        let second = mgr
+            .create_collection(&create("Second"))
+            .await
+            .expect("second");
+        let second = Uuid::parse_str(&second.id).expect("uuid");
+        assert_eq!(queued.take(), vec![(second, FullRefresh, true)]);
+        assert_eq!(drain(&queued.full), Vec::new());
+    }
+
+    /// A scan stand-in recording, for each scan, how many box-set refreshes
+    /// had run when it started.
+    struct ScanAfter {
+        refreshes: Arc<QueuedRefreshes>,
+        seen: std::sync::Mutex<Vec<usize>>,
+        ran: tokio::sync::Notify,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::library_manager::ScanRunner for ScanAfter {
+        async fn run(
+            &self,
+            _scope: &ferrofin_traits::library::ScanTarget,
+            _run: crate::library_scan::ScanRun<'_>,
+        ) -> Result<crate::library_scan::ScanOutcome, ferrofin_traits::error::ServiceError>
+        {
+            let refreshed = self.refreshes.full.lock().unwrap().len();
+            self.seen.lock().unwrap().push(refreshed);
+            self.ran.notify_one();
+            Ok(crate::library_scan::ScanOutcome::default())
+        }
+    }
+
+    /// A collection manager whose library manager runs [`ScanAfter`].
+    async fn scanning_collection_manager() -> (FerrofinCollectionManager, Arc<ScanAfter>, Uuid) {
+        let db = test_db().await;
+        let movie = Uuid::new_v4();
+        seed_item(&db, movie, BaseItemKind::Movie).await;
+        let refreshes = Arc::new(QueuedRefreshes::default());
+        let scans = Arc::new(ScanAfter {
+            refreshes: Arc::clone(&refreshes),
+            seen: std::sync::Mutex::new(Vec::new()),
+            ran: tokio::sync::Notify::new(),
+        });
+        let library = crate::test_support::concrete_library_manager_over(db.clone())
+            .with_scan_runner(Arc::clone(&scans) as Arc<_>);
+        let mgr = FerrofinCollectionManager::new(
+            db.clone(),
+            Arc::new(library),
+            Arc::new(FerrofinLinkedChildrenService::new(db.clone())),
+            test_paths(),
+        )
+        .with_providers(refreshes as Arc<_>);
+        (mgr, scans, movie)
+    }
+
+    /// The new library's scan is owed whatever follows its creation: after
+    /// the first box set's refresh, after a create refused once the library
+    /// was made (an unknown item), and at once for the folder alone (gl-1622).
+    #[tokio::test]
+    async fn the_new_librarys_scan_is_queued_whatever_follows() {
+        let wait = |scans: Arc<ScanAfter>| async move {
+            tokio::time::timeout(std::time::Duration::from_secs(5), scans.ran.notified())
+                .await
+                .expect("the library is scanned");
+            // Long enough for a second scan, were one queued, to start.
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            scans.seen.lock().unwrap().clone()
+        };
+
+        let (mgr, scans, movie) = scanning_collection_manager().await;
+        mgr.create_collection(&CollectionCreationOptions {
+            name: "First".to_owned(),
+            item_id_list: vec![movie],
+            ..CollectionCreationOptions::default()
+        })
+        .await
+        .expect("create");
+        assert_eq!(wait(scans).await, vec![1], "scanned after the refresh");
+
+        let (mgr, scans, _) = scanning_collection_manager().await;
+        mgr.create_collection(&CollectionCreationOptions {
+            name: "Refused".to_owned(),
+            item_id_list: vec![Uuid::new_v4()],
+            ..CollectionCreationOptions::default()
+        })
+        .await
+        .expect_err("an unknown item");
+        assert_eq!(wait(scans).await, vec![0], "scanned all the same");
+
+        let (mgr, scans, _) = scanning_collection_manager().await;
+        mgr.get_collections_folder(true).await.expect("folder");
+        assert_eq!(wait(scans).await, vec![0], "scanned at once");
+    }
+
+    /// The spawned refresh comes before the scan, which follows a failed
+    /// refresh too.
+    #[tokio::test]
+    async fn the_new_librarys_scan_follows_the_box_sets_refresh() {
+        let providers = Arc::new(QueuedRefreshes::default());
+        providers
+            .fail_full
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let refreshed = Arc::clone(&providers);
+        let scanned = std::sync::atomic::AtomicBool::new(false);
+        super::refresh_then_scan(
+            providers as Arc<_>,
+            Uuid::new_v4(),
+            ferrofin_traits::providers::MetadataRefreshOptions::default(),
+            async {
+                assert_eq!(
+                    refreshed.full.lock().unwrap().len(),
+                    1,
+                    "refreshed before the scan"
+                );
+                scanned.store(true, std::sync::atomic::Ordering::SeqCst);
+            },
+        )
+        .await;
+        assert!(
+            scanned.load(std::sync::atomic::Ordering::SeqCst),
+            "a failed refresh still lets the scan run"
+        );
+    }
+
     /// `CollectionManager` queues a High-priority refresh on every create and
     /// membership change: a default one for an empty create, `FullRefresh`
     /// (+`ForceSave`) for a create with items, `ForceSave` for an add that
@@ -5527,6 +5798,8 @@ mod tests {
         seed_item(&db, movie_b, BaseItemKind::Movie).await;
         let queued = Arc::new(QueuedRefreshes::default());
         let mgr = collection_manager_over(&db).with_providers(Arc::clone(&queued) as Arc<_>);
+        // The Collections library exists: no create below is the first.
+        mgr.get_collections_folder(true).await.expect("folder");
 
         let empty = mgr
             .create_collection(&CollectionCreationOptions {

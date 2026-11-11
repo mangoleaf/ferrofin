@@ -76,7 +76,9 @@ pub async fn library_manager_mid_scan(
 }
 
 /// The concrete manager [`library_manager_over`] hands out.
-fn concrete_library_manager_over(db: Database) -> crate::library_manager::FerrofinLibraryManager {
+pub(crate) fn concrete_library_manager_over(
+    db: Database,
+) -> crate::library_manager::FerrofinLibraryManager {
     use crate::item_count_service::FerrofinItemCountService;
     use crate::people_repository::FerrofinPeopleRepository;
 
