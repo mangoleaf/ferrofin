@@ -2525,6 +2525,15 @@ struct RefreshContext<'a> {
     version_groups: &'a VersionGroups,
 }
 
+/// `BeforeSaveInternal`'s `item.HasChanged(info.LastWriteTimeUtc)`: the
+/// stat'ed file `item` moved from the `DateModified` stored for it. A path
+/// that could not be stat'ed, or a directory (D2), has no mtime to compare.
+fn file_changed(stored: &BaseItemEntity, item: &Planned) -> bool {
+    item.entity.date_modified.is_some_and(|mtime| {
+        ferrofin_providers::refresh_plan::file_changed(stored.date_modified, mtime)
+    })
+}
+
 impl<'a> RefreshContext<'a> {
     /// A context for `run` over nothing yet: every item in scope, no policy,
     /// lock, external resolver or superseded copy.
@@ -2569,9 +2578,8 @@ impl<'a> RefreshContext<'a> {
     /// rule skips), and a path that could not be stat'ed has no mtime to
     /// compare.
     fn redated(&self, stored: &BaseItemEntity, item: &Planned) -> Option<DateTime<Utc>> {
-        let mtime = item.entity.date_modified?;
         self.date_if_changed(item)
-            .filter(|_| ferrofin_providers::refresh_plan::file_changed(stored.date_modified, mtime))
+            .filter(|_| file_changed(stored, item))
     }
 
     /// The date [`redated`](Self::redated) gives `item` should its file have
@@ -4411,7 +4419,8 @@ pub struct LibraryScanner {
     /// metadata folders, then its extracted data (trickplay tiles in both
     /// locations, chapter images, subtitle and attachment caches) — which
     /// every row a scan removes takes too
-    /// ([`delete_with_item_data`](Self::delete_with_item_data)). `None` until
+    /// ([`delete_with_item_data`](Self::delete_with_item_data)); and the
+    /// prune of a video whose file changed (`scan_item`). `None` until
     /// [`with_item_data_cleanup`](Self::with_item_data_cleanup) (unit tests),
     /// or with no item repository: a removal deletes rows only.
     item_data: Option<Arc<crate::item_data_cleanup::ItemDataCleanup>>,
@@ -4974,7 +4983,8 @@ impl LibraryScanner {
     }
 
     /// The library manager's delete cleanup (the item's metadata folders and
-    /// extracted data), which every row a scan removes takes before it goes.
+    /// extracted data), which every row a scan removes takes before it goes,
+    /// and which prunes a video whose file changed.
     #[must_use]
     pub fn with_item_data_cleanup(
         mut self,
@@ -8735,6 +8745,24 @@ impl LibraryScanner {
         );
         if !decision.save {
             return Ok(ItemSaved::Unchanged);
+        }
+        // `BeforeSaveInternal`: a video whose file changed loses what was
+        // extracted from the old file before this refresh's trickplay and
+        // chapters extract from the new one. Only on a save, which stores the
+        // new `DateModified`, so the same change never prunes twice.
+        //
+        // TODO(parity, open work item — NOT an accepted divergence; gl-1697):
+        // a row the scan could not read (`Stored::Unread`, and
+        // `Stored::Undecodable` above) has no stored `DateModified` to
+        // compare, yet its save stores the new one, so its change is never
+        // pruned. Un-defer path: have the save (`update_file_facts` for an
+        // undecodable row) report whether the stored `DateModified` drifted,
+        // and prune on that; never count an unknown date as changed.
+        if let (Some(stored), Some(cleanup)) = (stored_row, &self.item_data)
+            && file_changed(stored, item)
+            && kind.is_some_and(crate::kinds::is_video)
+        {
+            cleanup.prune_extracted_data(&entity).await?;
         }
         // Existing items can run from fresh probe values before their final
         // save: Blocking keeps the metadata Etag unchanged until extraction
@@ -40654,10 +40682,12 @@ mod tests {
         );
     }
 
-    /// Records each `DeleteExternalItemFiles` call's id and media path.
+    /// Records each `DeleteExternalItemFiles` call's id and media path, and
+    /// each `DeleteExternalItemDataAsync` call's media path.
     #[derive(Default)]
     struct RecordingExternalData {
         calls: std::sync::Mutex<Vec<(uuid::Uuid, String)>>,
+        pruned: std::sync::Mutex<Vec<String>>,
     }
 
     #[async_trait::async_trait]
@@ -40665,9 +40695,10 @@ mod tests {
         async fn delete_external_item_data(
             &self,
             _item_id: uuid::Uuid,
-            _media: ferrofin_traits::system::MediaLocation<'_>,
+            media: ferrofin_traits::system::MediaLocation<'_>,
         ) -> Result<(), ServiceError> {
-            unimplemented!("a scan removal only removes the files")
+            self.pruned.lock().unwrap().push(media.path.to_owned());
+            Ok(())
         }
 
         async fn delete_external_item_files(
@@ -40770,6 +40801,90 @@ mod tests {
             media.join("Kilo.mkv").to_string_lossy(),
             "no video named Kilo is left"
         );
+        assert!(
+            external.pruned.lock().unwrap().is_empty(),
+            "a scan removal only removes the files"
+        );
+    }
+
+    /// `MetadataService.BeforeSaveInternal` (`MetadataService.cs:373-399`):
+    /// a video whose file changed loses what was extracted from the old file
+    /// (`DeleteExternalItemDataAsync`), once. A new or unchanged item prunes
+    /// nothing, and neither does a changed file of another kind.
+    #[tokio::test]
+    async fn a_changed_video_file_is_pruned_of_its_extracted_data_once() {
+        use crate::item_repository::FerrofinItemRepository;
+        use crate::item_type_lookup::ItemTypeLookup;
+        use ferrofin_model::configuration::{LibraryOptions, MediaPathInfo};
+        use ferrofin_model::entities::CollectionTypeOptions;
+        use ferrofin_traits::persistence::ItemRepository;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let media = tmp.path().join("home");
+        std::fs::create_dir_all(&media).unwrap();
+        let (clip, photo) = (media.join("Clip.mkv"), media.join("Photo.jpg"));
+        for file in [&clip, &photo] {
+            std::fs::write(file, b"").unwrap();
+        }
+        let db = Database::connect_in_memory().await.unwrap();
+        db.run_migrations().await.unwrap();
+        let persistence = Arc::new(FerrofinItemPersistenceService::new(db.clone()));
+        let vf = Arc::new(
+            FerrofinVirtualFolderManager::new(tmp.path().join("default"))
+                .with_item_store(persistence.clone()),
+        );
+        vf.add_virtual_folder(
+            "Home",
+            Some(CollectionTypeOptions::homevideos),
+            &LibraryOptions {
+                path_infos: vec![MediaPathInfo {
+                    path: media.to_string_lossy().into_owned(),
+                }],
+                ..LibraryOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+        let items: Arc<dyn ItemRepository> = Arc::new(FerrofinItemRepository::new(
+            db.clone(),
+            Arc::new(ItemTypeLookup::new()),
+        ));
+        let external = Arc::new(RecordingExternalData::default());
+        let cleanup = Arc::new(crate::item_data_cleanup::ItemDataCleanup::new(
+            crate::app_paths::test_paths(tmp.path()),
+        ));
+        cleanup.set_external_data(external.clone());
+        let scanner = LibraryScanner::new(vf, Arc::new(FerrofinFileSystem::new()), persistence)
+            .with_items(items)
+            .with_item_data_cleanup(cleanup);
+        let pruned = || std::mem::take(&mut *external.pruned.lock().unwrap());
+
+        scanner.scan_all().await.unwrap();
+        assert_eq!(
+            pruned(),
+            Vec::<String>::new(),
+            "a new item has nothing to prune"
+        );
+        scanner.scan_all().await.unwrap();
+        assert_eq!(pruned(), Vec::<String>::new(), "nor has an unchanged one");
+
+        let later = std::time::SystemTime::now() + std::time::Duration::from_hours(1);
+        for file in [&clip, &photo] {
+            std::fs::File::options()
+                .write(true)
+                .open(file)
+                .unwrap()
+                .set_modified(later)
+                .unwrap();
+        }
+        scanner.scan_all().await.unwrap();
+        assert_eq!(
+            pruned(),
+            [clip.to_string_lossy().into_owned()],
+            "the changed video alone"
+        );
+        scanner.scan_all().await.unwrap();
+        assert_eq!(pruned(), Vec::<String>::new(), "and only once");
     }
 
     /// A real filesystem whose listing of one directory fails (`fail`), or
