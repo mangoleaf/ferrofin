@@ -380,8 +380,9 @@ impl FerrofinItemRepository {
     /// whose `dto.Path = appHost.ExpandVirtualPath(entity.Path)` turns an
     /// adopted by-name item's `%MetadataPath%/Genre/Action`, or the playlists
     /// folder's `%AppDataPath%/playlists`, into a real path. Every row an
-    /// [`ItemRepository`] read returns goes through here; the save keeps the
-    /// stored token form (`FerrofinItemPersistenceService::upsert_item`).
+    /// [`ItemRepository`] read returns goes through here; the save stores the
+    /// token form again (`FerrofinItemPersistenceService::upsert_item`,
+    /// `GetPathToSave`).
     fn mapped(&self, mut row: BaseItemEntity) -> BaseItemEntity {
         self.virtual_paths.expand_in_place(&mut row.path);
         row
@@ -1003,8 +1004,9 @@ impl FerrofinItemRepository {
     /// That row went through [`Self::mapped`], so its `Path` is expanded where
     /// [`Self::query_view_row`] reads the stored one. Only a view's path is
     /// read, and only for its `/views/livetv` or `/views/folders` tail, which
-    /// the expansion leaves alone: Jellyfin stores a view under
-    /// `%MetadataPath%/views/`, Ferrofin under the expanded directory.
+    /// the expansion leaves alone: a view is stored under
+    /// `%MetadataPath%/views/` (an earlier Ferrofin stored the expanded
+    /// directory).
     /// Whether it has linked children is read only for a recursive browse of
     /// a box set or a playlist, the one browse that asks
     /// ([`Self::linked_container_scope`]); `filter` is the browse the row

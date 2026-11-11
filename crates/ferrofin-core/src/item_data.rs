@@ -1133,11 +1133,14 @@ pub(crate) async fn import_membership(
     containing_folder: Option<&str>,
     keep_repeats: bool,
     map: &Map<String, Value>,
+    virtual_paths: &crate::virtual_paths::VirtualPathExpander,
 ) -> Result<ImportedMembership, ServiceError> {
     let mut resolved: Vec<(i64, String, i64)> = Vec::new();
     let mut dropped = 0usize;
     for child in &read_linked_children(map) {
-        let Some(child_db) = resolve_linked_child(tx, child, containing_folder).await? else {
+        let Some(child_db) =
+            resolve_linked_child(tx, child, containing_folder, virtual_paths).await?
+        else {
             tracing::debug!(
                 item_id = %container_db.to_ascii_lowercase(),
                 child_id = child.item_id.as_deref(),
@@ -1197,12 +1200,13 @@ pub(crate) async fn resolve_linked_child(
     tx: &mut sqlx::SqliteConnection,
     child: &LinkedChildJson,
     containing_folder: Option<&str>,
+    virtual_paths: &crate::virtual_paths::VirtualPathExpander,
 ) -> Result<Option<String>, ServiceError> {
     if let Some(id) = live_item(tx, child.item_id.as_deref()).await? {
         return Ok(Some(id));
     }
     if let Some(path) = child.path.as_deref().filter(|p| !p.is_empty()) {
-        if let Some(id) = item_by_path(tx, path).await? {
+        if let Some(id) = item_by_path(tx, path, virtual_paths).await? {
             return Ok(Some(id));
         }
         let rooted = matches!(
@@ -1216,7 +1220,7 @@ pub(crate) async fn resolve_linked_child(
             .and_then(|f| std::path::absolute(std::path::Path::new(f).join(path)).ok())
             .map(|p| ferrofin_util::path_helper::get_full_path(&p.to_string_lossy()));
         if let Some(absolute) = absolute
-            && let Some(id) = item_by_path(tx, &absolute.to_string_lossy()).await?
+            && let Some(id) = item_by_path(tx, &absolute.to_string_lossy(), virtual_paths).await?
         {
             return Ok(Some(id));
         }
@@ -1239,16 +1243,23 @@ async fn live_item(
         .map_err(db_err)
 }
 
-/// The id of an item stored at exactly `path` (the lowest id on a tie).
+/// The id of an item stored at exactly `path` (the lowest id on a tie):
+/// `FindByPath` seeks the stored form (`GetPathToSave`), which is how
+/// Jellyfin stores a row under its data or metadata directory, and the
+/// resolved one too (gl-1581).
 pub(crate) async fn item_by_path(
     tx: &mut sqlx::SqliteConnection,
     path: &str,
+    virtual_paths: &crate::virtual_paths::VirtualPathExpander,
 ) -> Result<Option<String>, ServiceError> {
-    sqlx::query_scalar(r#"SELECT "Id" FROM "BaseItems" WHERE "Path" = ?1 ORDER BY "Id" LIMIT 1"#)
-        .bind(path)
-        .fetch_optional(&mut *tx)
-        .await
-        .map_err(db_err)
+    sqlx::query_scalar(
+        r#"SELECT "Id" FROM "BaseItems" WHERE "Path" IN (?1, ?2) ORDER BY "Id" LIMIT 1"#,
+    )
+    .bind(virtual_paths.reverse(path))
+    .bind(path)
+    .fetch_optional(&mut *tx)
+    .await
+    .map_err(db_err)
 }
 
 /// Upserts a playlist's owner / open-access row and replaces its shares from
@@ -1730,9 +1741,16 @@ mod tests {
 
         let map = parse_data(Some(&blob));
         let mut tx = db.writer().begin().await.expect("tx");
-        import_membership(&mut tx, &guid_to_db(playlist), None, true, &map)
-            .await
-            .expect("import membership");
+        import_membership(
+            &mut tx,
+            &guid_to_db(playlist),
+            None,
+            true,
+            &map,
+            &crate::virtual_paths::VirtualPathExpander::identity(),
+        )
+        .await
+        .expect("import membership");
         import_playlist_meta(&mut tx, &guid_to_db(playlist), &map)
             .await
             .expect("import meta");

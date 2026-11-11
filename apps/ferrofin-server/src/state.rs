@@ -544,7 +544,8 @@ pub async fn build_app_state(
     }
     let people_repository_impl = Arc::new(
         FerrofinPeopleRepository::new(db.clone())
-            .with_identity(id_derivation.clone(), paths.people_path()),
+            .with_identity(id_derivation.clone(), paths.people_path())
+            .with_virtual_paths(virtual_paths.clone()),
     );
     // One-shot: collapse pre-unification per-(name, type) person items onto
     // the deterministic per-name id (repointing favorites/images), so a
@@ -576,7 +577,10 @@ pub async fn build_app_state(
     let people_repository: Arc<dyn ferrofin_traits::persistence::PeopleRepository> =
         people_repository_impl;
     let media_stream_repository: Arc<dyn ferrofin_traits::persistence::MediaStreamRepository> =
-        Arc::new(FerrofinMediaStreamRepository::new(db.clone()));
+        Arc::new(
+            FerrofinMediaStreamRepository::new(db.clone())
+                .with_virtual_paths(virtual_paths.clone()),
+        );
     let media_attachment_repository: Arc<
         dyn ferrofin_traits::persistence::MediaAttachmentRepository,
     > = Arc::new(FerrofinMediaAttachmentRepository::new(db.clone()));
