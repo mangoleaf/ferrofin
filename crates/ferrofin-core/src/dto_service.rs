@@ -3221,14 +3221,18 @@ impl FerrofinDtoService {
         // is on the DTO and is read instead, so the map is not read here: that
         // block may already have moved the entry into the source. When it did
         // not run, there was no earlier read at all.)
-        if options.contains_field(ItemFields::MediaStreams) {
+        //
+        // C# assigns for every `IHasMediaSources` item, empty list or not, and
+        // for no other kind (`DtoService.cs:1467-1494`): a programme, a book
+        // or a photo never gets the field, even with stream rows.
+        if options.contains_field(ItemFields::MediaStreams)
+            && kinds::implements_has_media_sources(kind)
+        {
             if is_live_tv_channel(kind) {
-                // C# assigns for every `IHasMediaSources`, and a channel's
-                // `GetMediaStreams()` override is always `[]` — the field is
-                // present-and-empty on the channel detail, never probed rows.
+                // A channel's `GetMediaStreams()` override is always `[]` — the
+                // field is present-and-empty on the channel detail, never
+                // probed rows.
                 dto.media_streams = Some(Vec::new());
-            } else if is_live_tv_program(kind) {
-                // A programme is not `IHasMediaSources`; C# never assigns.
             } else {
                 // With the item's sources on the DTO, C# reads the streams
                 // off the item's own source (`DtoService.cs:1473-1485`) — the
@@ -3252,9 +3256,8 @@ impl FerrofinDtoService {
                             .unwrap_or_default()
                     }
                 };
-                if !streams.is_empty() {
-                    dto.media_streams = Some(streams);
-                }
+                // An unprobed or unreadable file has no rows: `[]`, not absent.
+                dto.media_streams = Some(streams);
             }
         }
 
@@ -10598,6 +10601,62 @@ mod tests {
             dto.media_streams.as_ref().is_some_and(|s| !s.is_empty()),
             "MediaStreams emptied — the second read of the prefetched map lost its rows"
         );
+    }
+
+    /// `dto.MediaStreams = mediaStreams` runs for every `IHasMediaSources`
+    /// item, empty or not (v12.4 `DtoService.cs:1467-1494`): a video with no
+    /// stream rows (a file ffprobe could not read) carries `[]`, whether the
+    /// streams come off its own source or straight from the rows.
+    #[tokio::test]
+    async fn a_video_with_no_streams_gets_an_empty_media_streams_list() {
+        let db = test_db().await;
+        let id = Uuid::new_v4();
+        seed_named_item(&db, id, BaseItemKind::Movie, "Broken Reel").await;
+        let item = fetch_item(&db, id).await;
+        let svc = service_with_sources(
+            db,
+            FakeSources {
+                streams: Some(Vec::new()),
+                ..FakeSources::default()
+            },
+        );
+
+        for fields in [
+            vec![ItemFields::MediaStreams],
+            vec![ItemFields::MediaSources, ItemFields::MediaStreams],
+        ] {
+            let options = DtoOptions {
+                fields: fields.clone(),
+                ..DtoOptions::default()
+            };
+            let dto = svc
+                .get_base_item_dto(&item, &options, None, None)
+                .await
+                .unwrap();
+            assert_eq!(dto.media_streams, Some(Vec::new()), "fields {fields:?}");
+        }
+    }
+
+    /// A kind that is not `IHasMediaSources` upstream (a `Book`) never gets
+    /// `MediaStreams`, even when it owns stream rows.
+    #[tokio::test]
+    async fn a_book_with_stream_rows_gets_no_media_streams() {
+        let db = test_db().await;
+        let id = Uuid::new_v4();
+        seed_named_item(&db, id, BaseItemKind::Book, "Read Me").await;
+        let item = fetch_item(&db, id).await;
+        let svc = service(db);
+        let options = DtoOptions {
+            fields: vec![ItemFields::MediaStreams],
+            ..DtoOptions::default()
+        };
+
+        let dto = svc
+            .get_base_item_dto(&item, &options, None, None)
+            .await
+            .unwrap();
+
+        assert_eq!(dto.media_streams, None);
     }
 
     /// `dto.OriginalTitle = item.OriginalTitle` only under
