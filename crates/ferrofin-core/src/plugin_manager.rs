@@ -980,7 +980,19 @@ impl PluginManager for FerrofinPluginManager {
                 // the load-bearing part.
                 let _ = std::fs::remove_file(wasm_dir.join(format!("{id}.state.json")));
                 let _ = std::fs::remove_file(wasm_dir.join(format!("{id}.state.lock")));
-                let _ = std::fs::remove_file(wasm_dir.join(format!("{id}.segments")));
+                // The segment cache is the directory `CachedMediaSegmentProvider`
+                // writes (`{item}.json` + `producer.json`), not a file.
+                let segments = wasm_dir.join(format!("{id}.segments"));
+                if let Err(error) = std::fs::remove_dir_all(&segments)
+                    && error.kind() != std::io::ErrorKind::NotFound
+                {
+                    tracing::warn!(
+                        plugin = %id,
+                        path = %segments.display(),
+                        %error,
+                        "could not remove the uninstalled plugin's segment cache; installed again, it can serve the segments it wrote before"
+                    );
+                }
                 let _ = std::fs::remove_dir_all(self.plugins_dir.join(id.to_string()));
                 // The items the analysis pass offered it go with its state,
                 // so the plugin installed again is offered the whole library.
@@ -2834,8 +2846,12 @@ mod tests {
     #[tokio::test]
     async fn an_uninstalled_wasm_plugin_is_gone_until_the_restart() {
         let rig = update_rig("0.9.0", true, false).await;
+        // The cache is a directory, as `CachedMediaSegmentProvider` writes it:
+        // one `{item}.json` per analysed item and the `producer.json` identity.
         let segments = rig.wasm_dir.join(format!("{PKG_ID}.segments"));
-        std::fs::write(&segments, b"{}").unwrap();
+        std::fs::create_dir(&segments).unwrap();
+        std::fs::write(segments.join(format!("{}.json", Uuid::new_v4())), b"[]").unwrap();
+        std::fs::write(segments.join("producer.json"), format!("\"{PKG_ID}\"")).unwrap();
         let state_lock = rig.wasm_dir.join(format!("{PKG_ID}.state.lock"));
         std::fs::write(&state_lock, b"").unwrap();
         let listed = |plugins: Vec<PluginDescriptor>| plugins.iter().any(|d| d.id == PKG_ID);
