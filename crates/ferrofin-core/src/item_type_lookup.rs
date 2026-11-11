@@ -15,6 +15,7 @@ use std::sync::OnceLock;
 
 use ferrofin_model::data::{BASE_ITEM_KIND_NAMES, BaseItemKind};
 use ferrofin_traits::persistence::ItemTypeLookup as ItemTypeLookupTrait;
+use ferrofin_traits::system::ServerApplicationPaths;
 
 /// The fully-qualified stored type names for the music-related kinds
 /// (C# `ItemTypeLookup.MusicGenreTypes`).
@@ -176,10 +177,16 @@ pub fn derive_item_id_with(
 #[must_use]
 pub fn person_path(people_path: &str, name: &str) -> String {
     let valid = item_by_name_folder_name(name);
-    match valid.chars().find(|c| c.is_alphanumeric()) {
+    match person_subfolder(&valid) {
         Some(prefix) => format!("{people_path}/{prefix}/{valid}"),
         None => format!("{people_path}/{valid}"),
     }
+}
+
+/// `Person.GetPath`'s subfolder for the folder name `name`: its first letter
+/// or digit.
+fn person_subfolder(name: &str) -> Option<char> {
+    name.chars().find(|c| c.is_alphanumeric())
 }
 
 /// The deterministic by-name `Person` item id for `name` — Jellyfin's
@@ -260,6 +267,50 @@ pub fn by_name_path(root: &str, name: &str) -> String {
 #[must_use]
 pub fn year_path(year_root: &str, name: &str) -> String {
     by_name_path(year_root, name)
+}
+
+/// `GetRebasedPath` of a by-name `Genre`, `MusicGenre`, `Person`, `Studio`
+/// or `Year` item at `path`: `GetPath(Path.GetFileName(Path), false)`, the
+/// path's last component as it is under its kind's metadata directory, a
+/// person's under its first letter or digit. While this differs from the
+/// item's `Path` (ordinal), `RequiresRefresh` refreshes the item, and
+/// `BeforeMetadataRefresh` moves it here (v12.4 `Genre.cs:96,113`,
+/// `MusicGenre.cs:93,110`, `Person.cs:126,143`, `Studio.cs:91,108`,
+/// `Year.cs:98,115`). [`None`] for any other kind: a by-name artist's arm is
+/// the scan's ([`ByNameStore::rebased_path`]).
+///
+/// [`ByNameStore::rebased_path`]: crate::by_name_store::ByNameStore::rebased_path
+#[must_use]
+pub fn rebased_by_name_path(
+    paths: &dyn ServerApplicationPaths,
+    kind: BaseItemKind,
+    path: &str,
+) -> Option<String> {
+    let file_name = path.rsplit('/').next().unwrap_or(path);
+    let root = match kind {
+        BaseItemKind::Genre => paths.genre_path(),
+        BaseItemKind::MusicGenre => paths.music_genre_path(),
+        BaseItemKind::Studio => paths.studio_path(),
+        BaseItemKind::Year => paths.year_path(),
+        BaseItemKind::Person => match person_subfolder(file_name) {
+            Some(prefix) => path_combine(&paths.people_path(), &prefix.to_string()),
+            None => paths.people_path(),
+        },
+        _ => return None,
+    };
+    Some(path_combine(&root, file_name))
+}
+
+/// `Path.Combine(root, part)` for a relative `part`: `root` itself when
+/// `part` is empty, else the two joined by one `/`.
+pub(crate) fn path_combine(root: &str, part: &str) -> String {
+    if part.is_empty() {
+        root.to_owned()
+    } else if root.ends_with('/') {
+        format!("{root}{part}")
+    } else {
+        format!("{root}/{part}")
+    }
 }
 
 /// The deterministic by-name `Year` item id for `name` (the production year
@@ -554,6 +605,83 @@ mod tests {
         assert!(a.is_some());
         assert_eq!(a, b, "same name, same id — regardless of credit type");
         assert_ne!(a, c);
+    }
+
+    /// gl-1209: `GetRebasedPath` of the by-name kinds, the stored path's last
+    /// component as it is (`GetPath(name, false)`, no sanitising) under its
+    /// kind's current metadata directory, a person's under its first letter
+    /// or digit; a by-name artist's is the scan's.
+    #[rstest::rstest]
+    #[case::genre_moved(
+        BaseItemKind::Genre,
+        "/old/metadata/Genre/Crime",
+        Some("/srv/metadata/Genre/Crime")
+    )]
+    #[case::genre_in_place(
+        BaseItemKind::Genre,
+        "/srv/metadata/Genre/Crime",
+        Some("/srv/metadata/Genre/Crime")
+    )]
+    #[case::music_genre(
+        BaseItemKind::MusicGenre,
+        "/old/MusicGenre/Jazz",
+        Some("/srv/metadata/MusicGenre/Jazz")
+    )]
+    #[case::studio(
+        BaseItemKind::Studio,
+        "/old/Studio/Pixar",
+        Some("/srv/metadata/Studio/Pixar")
+    )]
+    #[case::year(BaseItemKind::Year, "/old/Year/1999", Some("/srv/metadata/Year/1999"))]
+    #[case::person(
+        BaseItemKind::Person,
+        "/old/People/B/Bob Parity",
+        Some("/srv/metadata/People/B/Bob Parity")
+    )]
+    #[case::person_without_its_letter_folder(
+        BaseItemKind::Person,
+        "/old/People/Bob Parity",
+        Some("/srv/metadata/People/B/Bob Parity")
+    )]
+    #[case::person_first_letter_or_digit(
+        BaseItemKind::Person,
+        "/old/People/'Ziggy",
+        Some("/srv/metadata/People/Z/'Ziggy")
+    )]
+    #[case::person_without_a_letter(
+        BaseItemKind::Person,
+        "/old/People/...",
+        Some("/srv/metadata/People/...")
+    )]
+    #[case::name_kept_as_stored(
+        BaseItemKind::Genre,
+        "/old/Genre/sci-fi.",
+        Some("/srv/metadata/Genre/sci-fi.")
+    )]
+    #[case::trailing_separator(BaseItemKind::Genre, "/old/Genre/", Some("/srv/metadata/Genre"))]
+    #[case::person_trailing_separator(
+        BaseItemKind::Person,
+        "/old/People/",
+        Some("/srv/metadata/People")
+    )]
+    #[case::artist_is_the_scans(BaseItemKind::MusicArtist, "/old/artists/X", None)]
+    #[case::movie(BaseItemKind::Movie, "/media/m.mkv", None)]
+    fn rebased_by_name_path_is_get_rebased_path(
+        #[case] kind: BaseItemKind,
+        #[case] path: &str,
+        #[case] rebased: Option<&str>,
+    ) {
+        let paths = crate::app_paths::FerrofinServerApplicationPaths::new(
+            "/srv",
+            "/srv/log",
+            "/srv/config",
+            "/srv/cache",
+            "/srv/web",
+        );
+        assert_eq!(
+            super::rebased_by_name_path(&paths, kind, path).as_deref(),
+            rebased
+        );
     }
 
     use super::{
