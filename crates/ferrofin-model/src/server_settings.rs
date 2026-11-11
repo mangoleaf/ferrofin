@@ -86,8 +86,8 @@ pub struct ServerSettingDto {
     pub value: Option<serde_json::Value>,
 
     /// The value `config.toml` holds now, when it differs from the one in use:
-    /// the file changed since the server started, or a variable or flag
-    /// outranks it.
+    /// the file changed since the server started, or a variable, a flag or
+    /// the Networking page outranks it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub saved_value: Option<serde_json::Value>,
 
@@ -278,6 +278,10 @@ pub enum ServerSettingSource {
     Flag,
     /// An environment variable.
     Environment,
+    /// jellyfin-web's Dashboard → Networking page, the saved network
+    /// configuration, for a setting it covers when it holds a value: it
+    /// outranks `config.toml`, and a variable or a flag outranks it.
+    NetworkConfiguration,
     /// `config.toml`.
     ConfigFile,
     /// The server configuration, for a setting stored there

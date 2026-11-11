@@ -198,8 +198,8 @@ Wired and working, with a documented limitation or lighter verification:
   Ferrofin Settings entry, lists every Ferrofin setting in nine tabs in a pane on the left, with a
   search across them, grouped by tab, and filters for changed settings and read-only ones. Each has
   a readable name with its key, variable, flag and default below, what sets it (`config.toml`,
-  environment variable or flag), and, for each one the page may not change, its value with a lock,
-  why and where it is changed instead. Secrets are shown to administrators, marked as secrets. The
+  the Networking page, environment variable or flag), and, for each one the page may not change,
+  its value with a lock, why and where it is changed instead. Secrets are shown to administrators, marked as secrets. The
   rest are edited there, each on one line with its default shown while unset: Save writes the
   changes of every tab to `config.toml`, a refused value shows the server's message next to it,
   Reset to default removes the key, and Restart now applies them, all but the few that need a full
