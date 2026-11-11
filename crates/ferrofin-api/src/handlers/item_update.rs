@@ -428,7 +428,11 @@ fn apply_update(
     if let Some(created) = request.date_created {
         item.date_created = Some(created);
     }
-    if let Some(series_name) = &request.series_name {
+    let kind = BaseItemKind::from_stored_type_name(&item.type_);
+    // `if (request.SeriesName is not null && item is IHasSeries)` (`:286-289`).
+    if let Some(series_name) = &request.series_name
+        && has_series(kind)
+    {
         item.series_name = Some(series_name.clone());
     }
 
@@ -461,31 +465,81 @@ fn apply_update(
     // `if (item is IHasDisplayOrder hasDisplayOrder) hasDisplayOrder.DisplayOrder
     // = request.DisplayOrder` (`ItemUpdateController.cs:412-415`): kept in the
     // row's `Data`, where the series and the box set read it from.
-    if matches!(
-        BaseItemKind::from_stored_type_name(&item.type_),
-        Some(BaseItemKind::Series | BaseItemKind::BoxSet)
-    ) {
+    if matches!(kind, Some(BaseItemKind::Series | BaseItemKind::BoxSet)) {
         set_data_string(item, "DisplayOrder", request.display_order.as_deref());
     }
     apply_kind_fields(item, request);
 
-    if let Some(album) = &request.album {
-        item.album = Some(album.clone());
+    // `case Audio song: song.Album = request.Album` and the `MusicVideo` case
+    // (`:461-467`): only there, and an absent member clears it.
+    if has_album(kind) {
+        item.album.clone_from(&request.album);
     }
-    if let Some(artist_items) = &request.artist_items {
+    // `item is IHasArtist` (`:453-459`).
+    if let Some(artist_items) = &request.artist_items
+        && has_artist(kind)
+    {
         let names: Vec<String> = artist_items
             .iter()
             .filter_map(|a| a.name.clone())
             .collect::<Vec<_>>();
         item.artists = Some(trimmed_distinct(&names).join("|"));
     }
-    if let Some(album_artists) = &request.album_artists {
+    // `item is IHasAlbumArtist` (`:445-451`).
+    if let Some(album_artists) = &request.album_artists
+        && has_album_artist(kind)
+    {
         let names: Vec<String> = album_artists
             .iter()
             .filter_map(|a| a.name.clone())
             .collect::<Vec<_>>();
         item.album_artists = Some(trimmed_distinct(&names).join("|"));
     }
+}
+
+/// An `IHasSeries` at `v12.4`: `AudioBook`, `Book`, `Episode`, `Season`
+/// (gl-1619).
+fn has_series(kind: Option<BaseItemKind>) -> bool {
+    matches!(
+        kind,
+        Some(
+            BaseItemKind::AudioBook
+                | BaseItemKind::Book
+                | BaseItemKind::Episode
+                | BaseItemKind::Season
+        )
+    )
+}
+
+/// An `IHasArtist`: `Audio`, `AudioBook` (a subclass of `Audio`), `MusicAlbum`,
+/// `MusicVideo`.
+fn has_artist(kind: Option<BaseItemKind>) -> bool {
+    matches!(
+        kind,
+        Some(
+            BaseItemKind::Audio
+                | BaseItemKind::AudioBook
+                | BaseItemKind::MusicAlbum
+                | BaseItemKind::MusicVideo
+        )
+    )
+}
+
+/// An `IHasAlbumArtist`: `Audio` (and `AudioBook`), `MusicAlbum`.
+fn has_album_artist(kind: Option<BaseItemKind>) -> bool {
+    matches!(
+        kind,
+        Some(BaseItemKind::Audio | BaseItemKind::AudioBook | BaseItemKind::MusicAlbum)
+    )
+}
+
+/// The kinds the editor's `Album` switch names: `Audio` (and `AudioBook`) and
+/// `MusicVideo`.
+fn has_album(kind: Option<BaseItemKind>) -> bool {
+    matches!(
+        kind,
+        Some(BaseItemKind::Audio | BaseItemKind::AudioBook | BaseItemKind::MusicVideo)
+    )
 }
 
 /// The fields `UpdateItem` writes only on some kinds: a video's aspect ratio
@@ -1757,6 +1811,61 @@ mod tests {
         super::apply_update(&mut item, &request, &crate::test_support::FakeLocalization);
         assert_eq!(item.artists.as_deref(), Some("Ölwerk|Band"));
         assert_eq!(item.album_artists.as_deref(), Some("Ärger"));
+    }
+
+    /// jellyfin-web sends `Album`, `ArtistItems`, `AlbumArtists` and `SeriesName` with
+    /// every save; each is written only on the kinds that have it, and a track's
+    /// `Album` follows the request even when it is absent (gl-1619).
+    #[test]
+    fn the_music_and_series_fields_go_only_where_the_item_has_them() {
+        use ferrofin_model::data::BaseItemKind as K;
+        let item_of = |kind: ferrofin_model::data::BaseItemKind| {
+            let mut item = crate::test_support::minimal_base_item(
+                uuid::Uuid::new_v4(),
+                "Item",
+                kind.stored_type_name().expect("stored name"),
+            );
+            item.album = Some("Kept".to_owned());
+            item.series_name = Some("Kept".to_owned());
+            item
+        };
+        let web: UpdateItemRequest = crate::extract::deserialize_mvc(
+            r#"{"Name":"Item","Album":"An Album","SeriesName":"A Show",
+                "ArtistItems":[{"Name":"Band"}],"AlbumArtists":[{"Name":"Band"}]}"#,
+        )
+        .expect("binds");
+        let cases = [
+            (K::Movie, ("Kept", "Kept", None, None)),
+            // A series is no `IHasSeries`: its own `SeriesName` is never written.
+            (K::Series, ("Kept", "Kept", None, None)),
+            (K::Audio, ("An Album", "Kept", Some("Band"), Some("Band"))),
+            // `Audio`'s subclass, and an `IHasSeries` as well.
+            (
+                K::AudioBook,
+                ("An Album", "A Show", Some("Band"), Some("Band")),
+            ),
+            // Artists, but no case in the `Album` switch.
+            (K::MusicAlbum, ("Kept", "Kept", Some("Band"), Some("Band"))),
+            (K::MusicVideo, ("An Album", "Kept", Some("Band"), None)),
+            (K::Episode, ("Kept", "A Show", None, None)),
+            (K::Season, ("Kept", "A Show", None, None)),
+            (K::Book, ("Kept", "A Show", None, None)),
+        ];
+        for (kind, (album, series, artists, album_artists)) in cases {
+            let mut item = item_of(kind);
+            super::apply_update(&mut item, &web, &crate::test_support::FakeLocalization);
+            assert_eq!(item.album.as_deref(), Some(album), "{kind:?}");
+            assert_eq!(item.series_name.as_deref(), Some(series), "{kind:?}");
+            assert_eq!(item.artists.as_deref(), artists, "{kind:?}");
+            assert_eq!(item.album_artists.as_deref(), album_artists, "{kind:?}");
+        }
+        let bare: UpdateItemRequest =
+            crate::extract::deserialize_mvc(r#"{"Name":"Item"}"#).expect("binds");
+        for kind in [K::Audio, K::AudioBook, K::MusicVideo] {
+            let mut item = item_of(kind);
+            super::apply_update(&mut item, &bare, &crate::test_support::FakeLocalization);
+            assert_eq!(item.album, None, "an absent Album clears a {kind:?}'s");
+        }
     }
 
     /// The children's tags take `Concat(added).Except(removed).Distinct(OrdinalIgnoreCase)`,
