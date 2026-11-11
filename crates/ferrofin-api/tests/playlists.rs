@@ -739,6 +739,73 @@ async fn create_playlist_rejects_bodies_upstream_binding_refuses() {
     }
 }
 
+/// `Ids` carries `JsonCommaDelimitedCollectionConverterFactory` (v12.4
+/// CreatePlaylistDto.cs:23): a string is split on `,`, each piece trimmed and
+/// dropped when `GuidConverter` refuses it, and `""` is no ids; an array stays
+/// strict, and `null` is MVC's implicit `[Required]` 400 (`IReadOnlyList<Guid>
+/// Ids` is non-nullable). Each case was measured on a live Jellyfin 12.4.
+#[tokio::test]
+async fn create_playlist_ids_bind_a_comma_delimited_string() {
+    let (a, b) = (ITEM_A.simple(), ITEM_B);
+    for (body, expected) in [
+        (
+            format!(r#"{{"Name":"Mix","Ids":"{a},{b}"}}"#),
+            vec![ITEM_A, ITEM_B],
+        ),
+        (
+            format!(r#"{{"Name":"Mix","Ids":" {a} , not-a-guid,"}}"#),
+            vec![ITEM_A],
+        ),
+        (r#"{"Name":"Mix","Ids":""}"#.to_owned(), vec![]),
+    ] {
+        let pl = Arc::new(RecordingPlaylists::default());
+        let app = state(pl.clone(), Arc::new(RecordingCollections::default()));
+        let (status, _) = send(app, "POST", "/Playlists", Body::from(body.clone())).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let created = pl.created.lock().unwrap().clone().expect("recorded");
+        assert_eq!(created.item_id_list, expected, "{body}");
+    }
+    for body in [
+        r#"{"Name":"Mix","Ids":null}"#.to_owned(),
+        format!(r#"{{"Name":"Mix","Ids":["{a}","not-a-guid"]}}"#),
+    ] {
+        let pl = Arc::new(RecordingPlaylists::default());
+        let app = state(pl.clone(), Arc::new(RecordingCollections::default()));
+        let (status, _) = send(app, "POST", "/Playlists", Body::from(body.clone())).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert!(pl.created.lock().unwrap().is_none(), "{body}");
+    }
+}
+
+/// `UpdatePlaylistDto.Ids` carries the same converter (v12.4
+/// UpdatePlaylistDto.cs:22) but is nullable: `null` leaves the entries alone,
+/// while `""` or a string whose every piece is malformed replaces them with
+/// none (`UpdatePlaylist` clears `LinkedChildren` whenever `Ids` is not null).
+/// Each case was measured on a live Jellyfin 12.4.
+#[tokio::test]
+async fn update_playlist_ids_bind_a_comma_delimited_string() {
+    let uri = format!("/Playlists/{PLAYLIST_ID}");
+    for (body, expected) in [
+        (format!(r#"{{"Ids":"{ITEM_B}"}}"#), Some(vec![ITEM_B])),
+        (r#"{"Ids":""}"#.to_owned(), Some(vec![])),
+        (r#"{"Ids":"zzz"}"#.to_owned(), Some(vec![])),
+        (r#"{"Ids":null}"#.to_owned(), None),
+    ] {
+        let pl = Arc::new(RecordingPlaylists::default());
+        let app = state(pl.clone(), Arc::new(RecordingCollections::default()));
+        let (status, bytes) = send(app, "POST", &uri, Body::from(body.clone())).await;
+        let text = String::from_utf8_lossy(&bytes);
+        assert_eq!(status, StatusCode::NO_CONTENT, "{body}: {text}");
+        let updated = pl.updated.lock().unwrap().clone().expect("recorded");
+        assert_eq!(updated.ids, expected, "{body}");
+    }
+    let pl = Arc::new(RecordingPlaylists::default());
+    let app = state(pl.clone(), Arc::new(RecordingCollections::default()));
+    let (status, _) = send(app, "POST", &uri, Body::from(r#"{"Ids":["zzz"]}"#)).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(pl.updated.lock().unwrap().is_none());
+}
+
 /// A `Users` entry binds through upstream's `PlaylistUserPermissions(Guid
 /// userId, bool canEdit = false)` constructor on create and update alike: a
 /// missing `CanEdit` is `false`, a missing or null `UserId` the empty GUID,

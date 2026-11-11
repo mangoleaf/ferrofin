@@ -12,12 +12,15 @@
 //! - [`guid::option`] — `JsonNullableGuidConverter`: `Guid.Empty` is written as
 //!   `null`.
 //! - [`guid::vec`] / [`guid::option_vec`] — element-wise `JsonGuidConverter`.
+//! - [`guid::comma_delimited`] — the same, for a member that also carries
+//!   `JsonCommaDelimitedCollectionConverterFactory` ([`delimited`]).
 //! - [`datetime`] / [`datetime::option`] — `JsonDateTimeConverter`: ISO-8601 with
 //!   the 100 ns tick fraction; when the millisecond component is zero all seven
 //!   fraction digits are written, otherwise trailing zeros are trimmed (that is
 //!   `Utf8JsonWriter.WriteStringValue(DateTime)`).
 
 mod datetime_input;
+pub mod delimited;
 pub mod enums;
 pub mod number;
 pub mod value;
@@ -168,6 +171,54 @@ pub mod guid {
         ) -> Result<Option<Vec<Uuid>>, D::Error> {
             Option::<Vec<super::ReadGuid>>::deserialize(deserializer)
                 .map(|values| values.map(|ids| ids.into_iter().map(|guid| guid.0).collect()))
+        }
+    }
+
+    /// `JsonCommaDelimitedCollectionConverterFactory` over `Guid` — a
+    /// non-nullable `Vec<Uuid>` member that also takes a comma-delimited string
+    /// ([`crate::json::delimited`]). A piece converts as `GuidConverter` does
+    /// (trimmed, any `Guid.Parse` spelling, dropped when malformed), an array
+    /// element as [`super::guid`] reads it; both are written as [`vec`].
+    pub mod comma_delimited {
+        use serde::Deserializer;
+        use uuid::Uuid;
+
+        pub use super::vec::serialize;
+
+        /// Reads an array or a comma-delimited string.
+        ///
+        /// # Errors
+        ///
+        /// Fails on `null` (MVC's implicit `[Required]`), on a token that is
+        /// neither an array nor a string, and on a malformed array element.
+        pub fn deserialize<'de, D: Deserializer<'de>>(
+            deserializer: D,
+        ) -> Result<Vec<Uuid>, D::Error> {
+            crate::json::delimited::comma::<D, super::ReadGuid>(deserializer)
+                .map(|ids| ids.into_iter().map(|guid| guid.0).collect())
+        }
+
+        /// The nullable member — `Option<Vec<Uuid>>`, written as
+        /// [`super::option_vec`].
+        pub mod option {
+            use serde::Deserializer;
+            use uuid::Uuid;
+
+            pub use super::super::option_vec::serialize;
+
+            /// Reads an array or a comma-delimited string; `null`/absent is
+            /// `None`.
+            ///
+            /// # Errors
+            ///
+            /// Fails on a token that is neither an array, a string nor `null`,
+            /// and on a malformed array element.
+            pub fn deserialize<'de, D: Deserializer<'de>>(
+                deserializer: D,
+            ) -> Result<Option<Vec<Uuid>>, D::Error> {
+                crate::json::delimited::comma_option::<D, super::super::ReadGuid>(deserializer)
+                    .map(|ids| ids.map(|ids| ids.into_iter().map(|guid| guid.0).collect()))
+            }
         }
     }
 }
