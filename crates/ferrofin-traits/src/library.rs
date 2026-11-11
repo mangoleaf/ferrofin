@@ -2920,6 +2920,22 @@ pub trait RecordingLibrary: Send + Sync {
     /// `RecordingsManager.TriggerRefresh(path)`: queues the refresh of the item
     /// nearest `path`, which also drops the item of a file that has gone.
     async fn refresh_path(&self, path: &str) -> Result<(), ServiceError>;
+
+    /// `ILibraryManager.FindByPath(path, isFolder)`: the id of the item at
+    /// exactly `path` (stored as it is, or in its `%AppDataPath%` form), a
+    /// folder or not as `is_folder` says, the newest `DateCreated` first.
+    async fn find_by_path(&self, path: &str, is_folder: bool)
+    -> Result<Option<Uuid>, ServiceError>;
+
+    /// The files below the folder `folder_id`, with their paths, newest
+    /// `DateCreated` first: what `RecordingsManager.EnforceKeepUpTo` asks of a
+    /// series folder (`GetItemList` with `Recursive`, `IsFolder = false` and
+    /// `IsVirtualItem = false`, then `IsFileProtocol`).
+    async fn files_under(&self, folder_id: Uuid) -> Result<Vec<(Uuid, String)>, ServiceError>;
+
+    /// `ILibraryManager.DeleteItem(item, new DeleteOptions { DeleteFileLocation
+    /// = true }, true)`: the item goes, with its files.
+    async fn delete_item(&self, id: Uuid) -> Result<(), ServiceError>;
 }
 
 fn _assert_object_safe_recording_library(_: &dyn RecordingLibrary) {}

@@ -1833,6 +1833,7 @@ pub async fn build_app_state(
             virtual_folders: Arc::clone(&virtual_folders),
             library: Arc::clone(&library),
             monitor: Arc::clone(&library_monitor),
+            virtual_paths: virtual_paths.clone(),
         }),
         Arc::clone(&configuration_write_lock),
     );
