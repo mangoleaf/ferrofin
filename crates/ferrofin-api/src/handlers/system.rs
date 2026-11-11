@@ -246,13 +246,12 @@ async fn get_log_file(
 
 /// `GET /System/Endpoint` — information about the request's network endpoint.
 ///
-/// Port of `SystemController.GetEndpointInfo`. `IsLocal` is true for a loopback
-/// peer (the same-machine web client); `IsInNetwork` additionally covers the
-/// `IsInNetwork` is the CONFIGURED answer (`NetworkManager.IsInLocalNetwork`,
-/// via [`AppState::is_in_local_network`]) once the composition root has wired
-/// the policy, and the RFC1918 / unique-local approximation below otherwise.
-/// The peer address comes from the connection ([`ConnectInfo`]); a proxied
-/// request that hides it (no `ConnectInfo`) falls back to the non-local answer.
+/// Port of `SystemController.GetEndpointInfo`, over the client a known proxy
+/// forwarded ([`AppState::client_address`], C# `GetNormalizedRemoteIP()` after
+/// `ForwardedHeadersMiddleware`). `IsLocal` is C# `HttpContext.IsLocal()`: the
+/// connection was accepted on that client's own address, or the request names
+/// neither address. `IsInNetwork` is `NetworkManager.IsInLocalNetwork` for it
+/// ([`AppState::is_in_local_network`]).
 #[utoipa::path(
     get,
     path = "/System/Endpoint",
@@ -264,21 +263,18 @@ async fn get_endpoint_info(
     _auth: RequireAuth,
     parts: axum::http::request::Parts,
 ) -> Json<EndPointInfo> {
-    // The peer socket address is inserted as a request extension by the server's
-    // `with_connect_info`; it survives the outer routing middleware. Absent (a
-    // proxied request or a test) → the conservative non-local answer.
-    let peer = parts
+    let client = state.client_address(&parts);
+    let no_addresses = parts
         .extensions
         .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
-        .map(|ci| ci.0.ip());
-    // `IsLocal` stays the transport peer — it answers "is the caller on this
-    // machine", and a proxied request is not, whatever it forwards. `IsInNetwork`
-    // is about the client, so it resolves the chain.
-    let is_local = peer.is_some_and(|ip| ip.is_loopback());
-    let is_in_network = peer.is_some() && state.is_in_local_network(state.client_address(&parts));
+        .is_none()
+        && parts
+            .extensions
+            .get::<crate::ip_access::ConnectionLocalAddr>()
+            .is_none();
     Json(EndPointInfo {
-        is_local,
-        is_in_network,
+        is_local: no_addresses || crate::ip_access::is_local_connection(&parts.extensions, client),
+        is_in_network: state.is_in_local_network(client),
     })
 }
 
