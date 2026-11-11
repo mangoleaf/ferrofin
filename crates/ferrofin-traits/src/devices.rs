@@ -12,7 +12,10 @@
 //!   [`UserEntity`] row; identity arguments become [`uuid::Uuid`].
 //! - `Jellyfin.Data.Queries.DeviceQuery` is ported as [`DeviceQuery`] (a small
 //!   service param, not a wire DTO).
-//! - The `DeviceOptionsUpdated` event is dropped (event wiring is `ferrofin-core`).
+//! - The `DeviceOptionsUpdated` event is not raised. Its one subscriber (C#
+//!   `SessionManager.OnDeviceManagerDeviceOptionsUpdated`) is
+//!   `SessionManager::on_device_options_updated`, which `POST /Devices/Options`
+//!   calls after the save.
 //! - `Task<T>` → `async fn -> Result<T, ServiceError>`; the synchronous C#
 //!   methods stay `async fn` for a uniform, fallible surface.
 //!

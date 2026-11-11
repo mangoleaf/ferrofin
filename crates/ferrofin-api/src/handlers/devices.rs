@@ -155,8 +155,9 @@ async fn get_device_options(
 /// `POST /Devices/Options` — update a device's custom name.
 ///
 /// Port of `DevicesController.UpdateDeviceOptions`: upserts the device's custom
-/// name (only that field of the DTO is used, matching the C# call). Returns
-/// `204 No Content`.
+/// name (only that field of the DTO is used, matching the C# call), then renames
+/// the device's live sessions as upstream's `DeviceOptionsUpdated` handler does.
+/// Returns `204 No Content`.
 #[utoipa::path(
     post,
     path = "/Devices/Options",
@@ -176,6 +177,11 @@ async fn update_device_options(
         .devices
         .update_device_options(id, options.custom_name.as_deref())
         .await?;
+    // C# `DeviceOptionsUpdated` → `SessionManager.OnDeviceManagerDeviceOptionsUpdated`.
+    state
+        .sessions
+        .on_device_options_updated(id, options.custom_name.as_deref())
+        .await;
     Ok(axum::http::StatusCode::NO_CONTENT)
 }
 
