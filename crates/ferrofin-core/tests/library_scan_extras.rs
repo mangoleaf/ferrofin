@@ -2630,6 +2630,8 @@ async fn new_extras_take_their_owners_title_metadata_and_dates() {
     f.scanner.scan_all().await.unwrap();
     let movie = f.row(BR).await;
     assert_eq!(movie.overview.as_deref(), Some("First plot"));
+    // the NFO's <country> reaches the row the extras copy (gl-1587)
+    assert_eq!(movie.production_locations.as_deref(), Some("US"));
     for extra in [BR_TRAILER, BR_FEATURETTE] {
         let row = f.row(extra).await;
         assert_eq!(row.genres, movie.genres, "{extra}");
