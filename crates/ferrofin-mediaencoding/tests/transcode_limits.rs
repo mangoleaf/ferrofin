@@ -724,6 +724,38 @@ async fn a_finished_job_holds_no_slot() {
     );
 }
 
+/// A job whose ffmpeg exits non-zero at startup stays registered (gl-1373)
+/// and holds no slot either.
+#[tokio::test]
+async fn a_job_whose_ffmpeg_failed_at_startup_holds_no_slot() {
+    let fixture = Fixture::scripted(
+        0,
+        1,
+        FakeScript {
+            exit_code: 1,
+            exits_immediately: true,
+            ..FakeScript::default()
+        },
+    );
+    let failed = fixture.start("a1", ALICE, TRANSCODE).await;
+    assert!(
+        matches!(failed, Err(StartFfmpegError::Failed(_))),
+        "{failed:?}"
+    );
+    assert_eq!(fixture.manager.active_job_count(), 1);
+    let admitted = fixture.start("a2", ALICE, TRANSCODE).await;
+    assert!(
+        matches!(admitted, Err(StartFfmpegError::Failed(_))),
+        "admitted, then failed like the first: {admitted:?}"
+    );
+    assert_eq!(fixture.manager.active_job_count(), 2);
+    assert_eq!(
+        fixture.killed(),
+        Vec::<String>::new(),
+        "nothing needed evicting"
+    );
+}
+
 /// An admitted job that fails before it spawns gives its slot back.
 #[tokio::test]
 async fn a_start_failing_after_admission_gives_its_slot_back() {

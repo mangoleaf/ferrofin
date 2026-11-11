@@ -2355,6 +2355,27 @@ mod tests {
             .map_or(0, |(count, _)| *count)
     }
 
+    /// A segment start whose ffmpeg exits non-zero leaves its exited job
+    /// registered (gl-1373); the retry replaces it with a fresh start, and
+    /// the breaker counts one failure per start.
+    #[tokio::test]
+    async fn a_segment_retry_after_a_failed_start_restarts_once() {
+        let tmp = tempfile::tempdir().unwrap();
+        let script = FakeScript {
+            exit_code: 1,
+            exits_immediately: true,
+            ..FakeScript::default()
+        };
+        let (mgr, _) = manager_with(tmp.path(), script, "ts");
+        for attempt in 1..=2 {
+            let err = mgr.dynamic_segment(&req(), 0, false).await.unwrap_err();
+            assert!(matches!(err, ServiceError::Backend(_)), "got {err:?}");
+            assert_eq!(restart_failures(&mgr, tmp.path()), attempt);
+            assert_eq!(mgr.manager.active_job_count(), 1, "the exited job is kept");
+        }
+        assert_eq!(mgr.transcoder.requests.lock().unwrap().len(), 2);
+    }
+
     #[tokio::test]
     async fn a_dead_init_transcode_is_a_backend_error_that_feeds_the_breaker() {
         let tmp = tempfile::tempdir().unwrap();

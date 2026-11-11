@@ -1508,7 +1508,8 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
                    job on those routes and the HLS ones: ferrofin-mediaencoding \
                    transcoding/manager.rs start_ffmpeg, compared with \
                    MediaBrowser.MediaEncoding/Transcoding/TranscodeManager.cs (StartFfMpeg, \
-                   PingTimer, KillTranscodingJobs) and \
+                   PingTimer, KillTranscodingJobs; a start whose ffmpeg exits non-zero, with \
+                   OnTranscodeBeginRequest, compared 2026-11-11) and \
                    Emby.Server.Implementations/Session/SessionManager.cs (MaxActiveSessions)",
         date: "2026-11-02",
         divergences: &[
@@ -1536,6 +1537,16 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
              free. The user is the authorization's, as upstream's StartFfMpeg userId is; an \
              API key has none, so it is outside the per-user cap and inside the server-wide \
              one.",
+            "A job whose ffmpeg exits non-zero during its start stays registered, as upstream, \
+             so a retry serves its output and ends at once and a stop report deletes it, but \
+             the idle reaper also takes it with its output once nothing has read or pinged it \
+             for its ping timeout: upstream's StartFfMpeg throws before a stream holds the job, \
+             so its ActiveRequestCount stays 1 (a retried HLS segment's \
+             WaitForActiveTranscodingRequests then waits until the request is cancelled) and \
+             only KillTranscodingJobs removes it. A later start of the same output replaces \
+             the exited job, where upstream adds the new one beside it and \
+             OnTranscodeBeginRequest still finds the exited one first. Jellyfin bugs not \
+             ported (gl-1373).",
         ],
     },
     VerifiedSubsystem {

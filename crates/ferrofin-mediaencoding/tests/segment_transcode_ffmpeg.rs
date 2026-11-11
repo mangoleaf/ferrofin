@@ -26,7 +26,7 @@ use ferrofin_mediaencoding::{
 };
 use ferrofin_model::dlna::SubtitleDeliveryMethod;
 use ferrofin_model::dto::MediaSourceInfo;
-use ferrofin_traits::media_encoding::TranscodingJobType;
+use ferrofin_traits::media_encoding::{TranscodeManager as _, TranscodingJobType};
 
 /// Whether a program is on `PATH` (via `<prog> -version`).
 fn on_path(program: &str) -> bool {
@@ -463,10 +463,17 @@ async fn manager_start_ffmpeg_surfaces_nonzero_exit_as_error() {
         .await
         .expect_err("bogus input should fail");
     assert!(
-        err.to_string().contains("exited with code") || err.to_string().contains("timed out"),
+        err.to_string().contains("exited with code"),
         "unexpected error: {err}"
     );
-    // The failed job left nothing registered (OnTranscodeFailedToStart).
+    // The exited job stays registered, as upstream's `StartFfMpeg` leaves it
+    // (`OnTranscodeFailedToStart` is for a process that never started), until
+    // a stop report removes it (gl-1373).
+    assert_eq!(manager.active_job_count(), 1);
+    manager
+        .kill_transcoding_jobs("dev", None, true)
+        .await
+        .expect("kill");
     assert_eq!(manager.active_job_count(), 0);
 }
 
