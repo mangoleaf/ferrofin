@@ -52,7 +52,7 @@ use ferrofin_traits::stubs::{LiveTvChannelQuery, RecordingVisibility};
 
 use crate::auth::{RequireAdmin, RequireLiveTvAccess, RequireLiveTvManagement};
 use crate::error::ApiError;
-use crate::extract::{DotnetGuid, JsonBody, Query};
+use crate::extract::{DotnetGuid, JsonBody, Query, RequiredRouteString, RouteParameter};
 use crate::handlers::items::{require_visible_item, resolve_user_opt};
 use crate::handlers::query_parse::{
     de_comma_delimited, de_comma_delimited_guids, de_pipe_delimited, parse_csv_enums_lenient,
@@ -739,6 +739,14 @@ async fn get_recommended_programs(
     ))
 }
 
+/// `{programId}`, the `[FromRoute, Required] string` of `GetProgram`: a blank
+/// one is the binder's `400`, before the GUID parse below.
+struct ProgramId;
+
+impl RouteParameter for ProgramId {
+    const NAME: &'static str = "programId";
+}
+
 /// `GET /LiveTv/Programs/{programId}` — a single programme.
 ///
 /// Port of `LiveTvController.GetProgram`: `new DtoOptions()` means every field,
@@ -747,6 +755,7 @@ async fn get_recommended_programs(
 async fn get_program(
     State(state): State<AppState>,
     RequireLiveTvAccess(auth): RequireLiveTvAccess,
+    _: RequiredRouteString<ProgramId>,
     Path(DotnetGuid(program_id)): Path<DotnetGuid>,
     Query(query): Query<UserIdQuery>,
 ) -> Result<Json<BaseItemDto>, ApiError> {
@@ -946,6 +955,13 @@ async fn delete_listing_provider(
     Ok(axum::http::StatusCode::NO_CONTENT)
 }
 
+/// `{tunerId}`, the `[FromRoute, Required] string` of `ResetTuner`.
+struct TunerId;
+
+impl RouteParameter for TunerId {
+    const NAME: &'static str = "tunerId";
+}
+
 /// `POST /LiveTv/Tuners/{tunerId}/Reset` — reset a tuner.
 ///
 /// Port of `LiveTvController.ResetTuner`. M3U tuners are stateless, so this is a
@@ -953,7 +969,7 @@ async fn delete_listing_provider(
 async fn reset_tuner(
     State(state): State<AppState>,
     RequireAdmin(_auth): RequireAdmin,
-    Path(tuner_id): Path<String>,
+    RequiredRouteString(tuner_id, _): RequiredRouteString<TunerId>,
 ) -> Result<axum::http::StatusCode, ApiError> {
     live_tv(&state)?.reset_tuner(&tuner_id).await?;
     Ok(axum::http::StatusCode::NO_CONTENT)
@@ -1435,6 +1451,13 @@ async fn get_schedules_direct_countries(
         .into_response())
 }
 
+/// `{recordingId}`, the `[FromRoute, Required] string` of `GetLiveRecordingFile`.
+struct RecordingId;
+
+impl RouteParameter for RecordingId {
+    const NAME: &'static str = "recordingId";
+}
+
 /// `GET /LiveTv/LiveRecordings/{recordingId}/stream` — a recording in flight.
 ///
 /// Port of `LiveTvController.GetLiveRecordingFile`: the id is the FIRING
@@ -1451,7 +1474,7 @@ async fn get_schedules_direct_countries(
 /// recording readable without a token.
 async fn get_live_recording_stream(
     State(state): State<AppState>,
-    Path(recording_id): Path<String>,
+    RequiredRouteString(recording_id, _): RequiredRouteString<RecordingId>,
 ) -> Result<Response, ApiError> {
     let Some(live_tv) = state.live_tv.as_ref() else {
         return Err(ApiError::NotFound("recording".into()));
@@ -1609,6 +1632,13 @@ fn route_container(segment: &str) -> Option<&str> {
     valid.then_some(container)
 }
 
+/// `{streamId}`, the `[FromRoute, Required] string` of `GetLiveStreamFile`.
+struct StreamId;
+
+impl RouteParameter for StreamId {
+    const NAME: &'static str = "streamId";
+}
+
 /// `GET /LiveTv/LiveStreamFiles/{streamId}/stream.{container}` — the buffered
 /// live-stream file.
 ///
@@ -1624,7 +1654,8 @@ fn route_container(segment: &str) -> Option<&str> {
 /// per-open GUID.
 async fn get_live_stream_file(
     State(state): State<AppState>,
-    Path((stream_id, container)): Path<(String, String)>,
+    RequiredRouteString(stream_id, _): RequiredRouteString<StreamId>,
+    Path((_, container)): Path<(String, String)>,
 ) -> Result<Response, ApiError> {
     let Some(container) = route_container(&container) else {
         return Err(ApiError::NotFound("live stream file".into()));
@@ -1747,11 +1778,20 @@ async fn get_timers(
     )))
 }
 
+/// `{timerId}`, the `[FromRoute, Required] string` of the timer and series
+/// timer actions (`GetTimer`, `UpdateTimer`, `CancelTimer` and their
+/// `SeriesTimer` siblings).
+struct TimerId;
+
+impl RouteParameter for TimerId {
+    const NAME: &'static str = "timerId";
+}
+
 /// `GET /LiveTv/Timers/{timerId}` — a single timer (`404` if absent).
 async fn get_timer(
     State(state): State<AppState>,
     RequireLiveTvAccess(_auth): RequireLiveTvAccess,
-    Path(timer_id): Path<String>,
+    RequiredRouteString(timer_id, _): RequiredRouteString<TimerId>,
 ) -> Result<Json<TimerInfoDto>, ApiError> {
     live_tv(&state)?
         .get_timer(&timer_id)
@@ -1803,7 +1843,7 @@ async fn notify_timer_event(
 async fn update_timer(
     State(state): State<AppState>,
     RequireLiveTvManagement(_auth): RequireLiveTvManagement,
-    Path(timer_id): Path<String>,
+    RequiredRouteString(timer_id, _): RequiredRouteString<TimerId>,
     JsonBody(timer): JsonBody<TimerInfoDto>,
 ) -> Result<axum::http::StatusCode, ApiError> {
     live_tv(&state)?.update_timer(&timer_id, timer).await?;
@@ -1814,7 +1854,7 @@ async fn update_timer(
 async fn cancel_timer(
     State(state): State<AppState>,
     RequireLiveTvManagement(_auth): RequireLiveTvManagement,
-    Path(timer_id): Path<String>,
+    RequiredRouteString(timer_id, _): RequiredRouteString<TimerId>,
 ) -> Result<axum::http::StatusCode, ApiError> {
     live_tv(&state)?.cancel_timer(&timer_id).await?;
     notify_timer_event(
@@ -1912,7 +1952,7 @@ async fn get_series_timers(
 async fn get_series_timer(
     State(state): State<AppState>,
     RequireLiveTvAccess(_auth): RequireLiveTvAccess,
-    Path(timer_id): Path<String>,
+    RequiredRouteString(timer_id, _): RequiredRouteString<TimerId>,
 ) -> Result<Json<SeriesTimerInfoDto>, ApiError> {
     live_tv(&state)?
         .get_series_timer(&timer_id)
@@ -1943,7 +1983,7 @@ async fn create_series_timer(
 async fn update_series_timer(
     State(state): State<AppState>,
     RequireLiveTvManagement(_auth): RequireLiveTvManagement,
-    Path(timer_id): Path<String>,
+    RequiredRouteString(timer_id, _): RequiredRouteString<TimerId>,
     JsonBody(timer): JsonBody<SeriesTimerInfoDto>,
 ) -> Result<axum::http::StatusCode, ApiError> {
     live_tv(&state)?
@@ -1956,7 +1996,7 @@ async fn update_series_timer(
 async fn cancel_series_timer(
     State(state): State<AppState>,
     RequireLiveTvManagement(_auth): RequireLiveTvManagement,
-    Path(timer_id): Path<String>,
+    RequiredRouteString(timer_id, _): RequiredRouteString<TimerId>,
 ) -> Result<axum::http::StatusCode, ApiError> {
     live_tv(&state)?.cancel_series_timer(&timer_id).await?;
     notify_timer_event(
@@ -2669,6 +2709,7 @@ mod tests {
         // anonymous and reports only "no such stream".
         let file = get_live_stream_file(
             State(fake_state()),
+            RequiredRouteString("s1".into(), std::marker::PhantomData),
             Path(("s1".into(), "stream.mp4".into())),
         )
         .await
@@ -2676,9 +2717,13 @@ mod tests {
         assert_eq!(file.status(), axum::http::StatusCode::NOT_FOUND);
         // A manager with nothing open says the same.
         let state = fake_state().with_live_tv(std::sync::Arc::new(FakeLiveTv::default()));
-        let file = get_live_stream_file(State(state), Path(("s1".into(), "stream.ts".into())))
-            .await
-            .unwrap_err();
+        let file = get_live_stream_file(
+            State(state),
+            RequiredRouteString("s1".into(), std::marker::PhantomData),
+            Path(("s1".into(), "stream.ts".into())),
+        )
+        .await
+        .unwrap_err();
         assert_eq!(file.status(), axum::http::StatusCode::NOT_FOUND);
     }
 
@@ -2728,6 +2773,7 @@ mod tests {
 
         let response = get_live_stream_file(
             State(state),
+            RequiredRouteString("uid-1".to_owned(), std::marker::PhantomData),
             Path(("uid-1".to_owned(), "stream.ts".to_owned())),
         )
         .await
@@ -2773,6 +2819,7 @@ mod tests {
 
         let response = get_live_stream_file(
             State(state),
+            RequiredRouteString("uid-1".to_owned(), std::marker::PhantomData),
             Path(("uid-1".to_owned(), "stream.ts".to_owned())),
         )
         .await
@@ -2849,9 +2896,12 @@ mod tests {
         let state = fake_state();
         // The recording stream is anonymous upstream, so it reports only
         // "no such recording" — never 501, whatever is wired.
-        let rec = get_live_recording_stream(State(state.clone()), Path(Uuid::nil().to_string()))
-            .await
-            .unwrap_err();
+        let rec = get_live_recording_stream(
+            State(state.clone()),
+            RequiredRouteString(Uuid::nil().to_string(), std::marker::PhantomData),
+        )
+        .await
+        .unwrap_err();
         assert_eq!(rec.status(), axum::http::StatusCode::NOT_FOUND);
         let map = set_channel_mapping(
             State(state),
@@ -3821,9 +3871,12 @@ mod tests {
         // recording is a library item behind the authenticated item routes, and
         // serving it from this anonymous route would make every recording
         // readable without a token.
-        let err = get_live_recording_stream(State(state), Path(Uuid::new_v4().to_string()))
-            .await
-            .unwrap_err();
+        let err = get_live_recording_stream(
+            State(state),
+            RequiredRouteString(Uuid::new_v4().to_string(), std::marker::PhantomData),
+        )
+        .await
+        .unwrap_err();
         assert_eq!(err.status(), axum::http::StatusCode::NOT_FOUND);
     }
 

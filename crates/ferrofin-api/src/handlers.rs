@@ -2688,7 +2688,8 @@ pub const VERIFIED: &[Verified] = &[
         path: "/System/Configuration/{key}",
         upstream_file: "Jellyfin.Api/Controllers/ConfigurationController.cs",
         upstream_method: "GetNamedConfiguration",
-        ferrofin: "handlers/config.rs get_named_configuration → ferrofin-core \
+        ferrofin: "handlers/config.rs get_named_configuration (RequiredRouteString key: \
+               ConvertEmptyStringToNull, then [Required]) → ferrofin-core \
                configuration_manager.rs get_named_configuration and get_encoding_options \
                (read_named, through read_named_kept for branding and encoding; \
                BaseConfigurationManager.GetConfiguration and LoadConfiguration, the seven \
@@ -2730,7 +2731,8 @@ pub const VERIFIED: &[Verified] = &[
         path: "/System/Configuration/{key}",
         upstream_file: "Jellyfin.Api/Controllers/ConfigurationController.cs",
         upstream_method: "UpdateNamedConfiguration",
-        ferrofin: "handlers/config.rs update_named_configuration (normalize_named_configuration: \
+        ferrofin: "handlers/config.rs update_named_configuration (RequiredRouteString key: \
+               ConvertEmptyStringToNull, then [Required]; normalize_named_configuration: \
                GetConfigurationType and Deserialize) → save_named_configuration \
                (BaseConfigurationManager.SaveConfiguration: the validating store, the write, \
                the live network policy, the listeners, the committed checks for \
@@ -3511,7 +3513,9 @@ pub const VERIFIED: &[Verified] = &[
         path: "/Playlists/{itemId}/Items/{itemId}/Move/{newIndex}",
         upstream_file: "Jellyfin.Api/Controllers/PlaylistsController.cs",
         upstream_method: "MoveItem",
-        ferrofin: "handlers/playlists.rs move_item (the playlist id parses through \
+        ferrofin: "handlers/playlists.rs move_item (blank_route_values playlistId and \
+               itemId: ConvertEmptyStringToNull, then [Required], both in one 400; the \
+               playlist id parses through \
                DotnetGuid::parse, Guid.Parse and MoveItemAsync's new Guid; \
                get_playlist_access + require_edit: \
                GetPlaylistForUser and the owner-or-editing-share check) → ferrofin-core \
@@ -3664,7 +3668,8 @@ pub const VERIFIED: &[Verified] = &[
         path: "/FallbackFont/Fonts/{name}",
         upstream_file: "Jellyfin.Api/Controllers/SubtitleController.cs",
         upstream_method: "GetFallbackFont",
-        ferrofin: "handlers/subtitles.rs get_fallback_font → ferrofin-core file_system.rs \
+        ferrofin: "handlers/subtitles.rs get_fallback_font (RequiredRouteString name: \
+               ConvertEmptyStringToNull, then [Required]) → ferrofin-core file_system.rs \
                get_files, open_file → handlers/streaming.rs opened_file_response, \
                physical_file_precondition",
         date: "2026-10-30",
@@ -3678,8 +3683,8 @@ pub const VERIFIED: &[Verified] = &[
          application/octet-stream. The list route serves four extensions, all covered.",
             "The EnableFallbackFont side effect of a missing FallbackFontPath is not ported, as \
          on GET /FallbackFont/Fonts.",
-            "The 400 (no name) and the 404 and 500 of a font that cannot be opened have \
-         Ferrofin's error shape, not upstream's. Fix path: gl-666.",
+            "The 404 and 500 of a font that cannot be opened have Ferrofin's error shape, not \
+         upstream's. Fix path: gl-666.",
         ],
         refs: &[],
     },
@@ -3689,7 +3694,8 @@ pub const VERIFIED: &[Verified] = &[
         upstream_file: "Jellyfin.Api/Controllers/SubtitleController.cs",
         upstream_method: "SearchRemoteSubtitles",
         ferrofin: "handlers/subtitles.rs search_remote_subtitles (RequireSubtitleManagement, the \
-               SubtitleManagement policy's UserPermissionRequirement; require_video, \
+               SubtitleManagement policy's UserPermissionRequirement; RequiredRouteString \
+               language: ConvertEmptyStringToNull, then [Required]; require_video, \
                GetItemById<Video>(itemId, User.GetUserId()): a missing, hidden or non-video \
                item is a 404; isPerfectMatch) → ferrofin-core subtitle_manager.rs \
                search_subtitles and enrich (SubtitleManager.SearchSubtitles, both overloads: \
@@ -3721,7 +3727,9 @@ pub const VERIFIED: &[Verified] = &[
         path: "/Videos/{itemId}/{container}/Attachments/{index}",
         upstream_file: "Jellyfin.Api/Controllers/VideoAttachmentsController.cs",
         upstream_method: "GetAttachment",
-        ferrofin: "handlers/hls.rs get_video_attachment → ferrofin-mediaencoding \
+        ferrofin: "handlers/hls.rs get_video_attachment (RequiredRouteString mediaSourceId, \
+               registered as {container}: ConvertEmptyStringToNull, then [Required], before \
+               the item is read) → ferrofin-mediaencoding \
                attachments/extractor.rs get_attachment, extract_attachment \
                (AttachmentExtractor.GetAttachment, GetAttachmentStream, ExtractAttachment, \
                ExtractAttachmentInternal) → apps/ferrofin-server media_encoding.rs \
@@ -3738,9 +3746,6 @@ pub const VERIFIED: &[Verified] = &[
             "A dropped request kills a running extraction and deletes its output (gl-283); \
          upstream's action passes CancellationToken.None, so its extraction runs to the end \
          and the next request is served from the cache. Fix path: gl-1517.",
-            "A whitespace-only mediaSourceId is the 400 only once the item is found: upstream's \
-         model validation refuses it before the item is read, so for a missing or hidden \
-         item it is a 400 there and a 404 here. Fix path: gl-1518.",
             "A nil videoId is a 404, not GetItemById's 400. Fix path: gl-1034.",
             "A mediaSourceId selects its source in any GUID spelling; upstream compares the N \
          form, ignoring case. Clients echo the id they were given, and an adopted database \

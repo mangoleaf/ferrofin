@@ -30,6 +30,7 @@
 
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
+use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use ferrofin_model::dto::BaseItemDto;
@@ -46,7 +47,9 @@ use uuid::Uuid;
 
 use crate::auth::RequireAuth;
 use crate::error::{ApiError, ProblemStatus};
-use crate::extract::{DotnetGuid, JsonBody, Query};
+use crate::extract::{
+    DotnetGuid, JsonBody, Query, RequiredRouteString, RouteParameter, blank_route_values,
+};
 use crate::handlers::items::effective_user_id;
 use crate::handlers::query_parse::parse_csv_uuids;
 use crate::state::AppState;
@@ -416,6 +419,16 @@ struct RemoveItemsQuery {
     entry_ids: Option<String>,
 }
 
+/// `{playlistId}`, the `[FromRoute, Required] string` of
+/// `RemoveItemFromPlaylist`, which the router registers as `{itemId}`: a blank
+/// one is the binder's `400`, before the GUID parse.
+struct RemovedFromPlaylistId;
+
+impl RouteParameter for RemovedFromPlaylistId {
+    const NAME: &'static str = "playlistId";
+    const ROUTE_NAME: &'static str = "itemId";
+}
+
 /// `DELETE /Playlists/{playlistId}/Items` — removes entries from a playlist.
 ///
 /// Port of `PlaylistsController.RemoveItemFromPlaylist`: requires owner or a
@@ -435,6 +448,7 @@ struct RemoveItemsQuery {
 async fn remove_item_from_playlist(
     State(state): State<AppState>,
     RequireAuth(auth): RequireAuth,
+    _: RequiredRouteString<RemovedFromPlaylistId>,
     Path(DotnetGuid(playlist_id)): Path<DotnetGuid>,
     Query(query): Query<RemoveItemsQuery>,
 ) -> Result<StatusCode, ApiError> {
@@ -477,8 +491,10 @@ async fn remove_item_from_playlist(
 /// Port of `PlaylistsController.MoveItem`. Because the normalized axum path
 /// captures both the playlist id and the item id under the same positional name
 /// (`{itemId}`), the three path segments are read positionally through
-/// [`axum::extract::RawPathParams`]. Requires owner or a `CanEdit` share (`403`
-/// otherwise); a missing/invisible playlist is `404`.
+/// [`axum::extract::RawPathParams`]. Both ids are `[FromRoute, Required]
+/// string`s, so a blank one is the binder's `400`, naming each. Requires owner
+/// or a `CanEdit` share (`403` otherwise); a missing/invisible playlist is
+/// `404`.
 #[utoipa::path(
     post,
     path = "/Playlists/{playlistId}/Items/{itemId}/Move/{newIndex}",
@@ -498,11 +514,16 @@ async fn move_item(
     State(state): State<AppState>,
     RequireAuth(auth): RequireAuth,
     raw: axum::extract::RawPathParams,
-) -> Result<StatusCode, ApiError> {
+) -> Result<Response, ApiError> {
     let values: Vec<&str> = raw.iter().map(|(_, value)| value).collect();
     let [playlist_id, item_id, new_index] = values.as_slice() else {
         return Err(ApiError::BadRequest("missing path parameters".to_owned()));
     };
+    if let Some(rejection) =
+        blank_route_values([("playlistId", *playlist_id), ("itemId", *item_id)])
+    {
+        return Ok(rejection);
+    }
     let new_index: i32 = new_index
         .parse()
         .map_err(|_| ApiError::BadRequest(format!("invalid index {new_index:?}")))?;
@@ -525,7 +546,7 @@ async fn move_item(
             calling_user_id,
         )
         .await?;
-    Ok(StatusCode::NO_CONTENT)
+    Ok(StatusCode::NO_CONTENT.into_response())
 }
 
 /// `GET /Playlists/{playlistId}/Users` — the playlist's share list.
