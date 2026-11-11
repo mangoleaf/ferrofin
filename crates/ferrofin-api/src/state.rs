@@ -873,40 +873,27 @@ impl AppState {
     }
 
     /// [`walk_forwarded_headers`](crate::forwarded_headers::walk_forwarded_headers)
-    /// under the configured known proxies. Nothing is forwarded without a
-    /// network policy, as Jellyfin forwards nothing without known proxies.
+    /// from `parts`' peer under the configured known proxies: the scheme and
+    /// host `ForwardedHeadersMiddleware` gives the request. Nothing is
+    /// forwarded without a network policy, as Jellyfin forwards nothing
+    /// without known proxies, nor without a peer to start the walk from.
     #[must_use]
     pub fn forwarded_request(
         &self,
-        peer: std::net::IpAddr,
-        headers: &axum::http::HeaderMap,
+        parts: &axum::http::request::Parts,
     ) -> crate::forwarded_headers::ForwardedRequest {
         use crate::forwarded_headers::{ForwardedRequest, forwarded_through};
-        self.inner
-            .network
-            .as_deref()
-            .map_or_else(ForwardedRequest::default, |network| {
-                forwarded_through(network, peer, headers)
-            })
-    }
-
-    /// The scheme `parts`' request has (`HttpRequest.Scheme`), lowercased as
-    /// `UriBuilder` writes it: the one known proxies forwarded, else its
-    /// listener's ([`Transport`](crate::forwarded_headers::Transport)), else
-    /// `http`.
-    #[must_use]
-    pub fn request_scheme(&self, parts: &axum::http::request::Parts) -> String {
-        use crate::forwarded_headers::{Transport, effective_scheme};
-        let forwarded = parts
-            .extensions
-            .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
-            .and_then(|axum::extract::ConnectInfo(peer)| {
-                self.forwarded_request(peer.ip(), &parts.headers).scheme
-            });
-        effective_scheme(
-            forwarded.as_deref(),
-            parts.extensions.get::<Transport>().copied(),
-        )
+        match (
+            self.inner.network.as_deref(),
+            parts
+                .extensions
+                .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>(),
+        ) {
+            (Some(network), Some(axum::extract::ConnectInfo(peer))) => {
+                forwarded_through(network, peer.ip(), &parts.headers)
+            }
+            _ => ForwardedRequest::default(),
+        }
     }
 
     /// [`Self::client_address`] over an already-extracted peer and chain, so the

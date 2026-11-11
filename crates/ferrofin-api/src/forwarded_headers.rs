@@ -541,7 +541,7 @@ mod tests {
     }
 
     /// The scheme a request has, as the API resolves it for the addresses it
-    /// publishes (`AppState::request_scheme`).
+    /// publishes (`handlers::system::context_from_parts`).
     fn request_scheme(
         known_proxy: Option<&str>,
         peer: Option<&str>,
@@ -574,7 +574,9 @@ mod tests {
         if let Some(transport) = transport {
             parts.extensions.insert(transport);
         }
-        state.request_scheme(&parts)
+        crate::handlers::system::context_from_parts(&state, &parts)
+            .scheme
+            .expect("a scheme")
     }
 
     #[rstest]

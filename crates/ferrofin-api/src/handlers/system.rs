@@ -26,17 +26,33 @@ use crate::state::AppState;
 
 /// Builds a [`RequestContext`] from an axum request's [`Parts`] (headers +
 /// query), mirroring the auth middleware's construction so the system manager
-/// sees the same request view, plus the request's scheme for the addresses
-/// built from it.
+/// sees the same request view.
+///
+/// The addresses built from it see the request as `ForwardedHeadersMiddleware`
+/// leaves it. The scheme (`HttpRequest.Scheme`, lowercased as `UriBuilder`
+/// writes it) is the one known proxies forwarded, else the listener's. A known
+/// proxy's `X-Forwarded-Host` replaces the `Host` header (`HttpRequest.Host`).
 pub(crate) fn context_from_parts(state: &AppState, parts: &Parts) -> RequestContext {
-    RequestContext {
-        scheme: Some(state.request_scheme(parts)),
+    use crate::forwarded_headers::{Transport, effective_scheme};
+    let forwarded = state.forwarded_request(parts);
+    let mut context = RequestContext {
+        scheme: Some(effective_scheme(
+            forwarded.scheme.as_deref(),
+            parts.extensions.get::<Transport>().copied(),
+        )),
         ..crate::auth::request_context(
             &parts.headers,
             parts.uri.query(),
             Some(state.client_address(parts).to_string()),
         )
+    };
+    if let Some(host) = forwarded.host {
+        context
+            .headers
+            .retain(|(name, _)| !name.eq_ignore_ascii_case("host"));
+        context.headers.push(("host".to_owned(), host));
     }
+    context
 }
 
 /// `GET /System/Info` — the full system information for an authenticated client.
@@ -334,6 +350,65 @@ crate::query::query_parameters! {
 mod tests {
     use super::is_in_local_network;
     use std::net::IpAddr;
+
+    /// `request.Host` after `ForwardedHeadersMiddleware`: a known proxy's
+    /// `X-Forwarded-Host` replaces the `Host` header the smart API URL is
+    /// built from; an unknown peer's is ignored.
+    #[test]
+    fn system_context_takes_the_host_a_known_proxy_forwards() {
+        use std::net::SocketAddr;
+        use std::sync::{Arc, RwLock};
+
+        use axum::extract::ConnectInfo;
+        use axum::http::Request;
+        use ferrofin_networking::{NetworkConfiguration, NetworkManager};
+
+        let raw = Some("10.0.0.9:8096");
+        for (peer, host, forwarded_host, expected) in [
+            (
+                "10.0.0.2:5000",
+                raw,
+                Some("media.example.org:8443"),
+                Some("media.example.org:8443"),
+            ),
+            (
+                "10.0.0.2:5000",
+                None,
+                Some("media.example.org"),
+                Some("media.example.org"),
+            ),
+            ("10.0.0.3:5000", raw, Some("media.example.org:8443"), raw),
+            ("10.0.0.2:5000", raw, Some("bad host"), raw),
+            ("10.0.0.2:5000", raw, None, raw),
+        ] {
+            let manager = NetworkManager::with_defaults(
+                NetworkConfiguration {
+                    known_proxies: vec!["10.0.0.2".to_owned()],
+                    ..Default::default()
+                },
+                "127.0.0.1/8,1,lo",
+            );
+            let state =
+                crate::test_support::fake_state().with_network(Arc::new(RwLock::new(manager)));
+            let mut request = Request::builder().uri("/System/Info/Public");
+            if let Some(host) = host {
+                request = request.header("host", host);
+            }
+            if let Some(host) = forwarded_host {
+                request = request.header("x-forwarded-host", host);
+            }
+            let (mut parts, ()) = request.body(()).expect("request").into_parts();
+            parts
+                .extensions
+                .insert(ConnectInfo(peer.parse::<SocketAddr>().expect("peer")));
+            let context = super::context_from_parts(&state, &parts);
+            assert_eq!(
+                context.header("host"),
+                expected,
+                "{peer} {forwarded_host:?}"
+            );
+        }
+    }
 
     #[test]
     fn system_context_preserves_transport_peer_and_resolves_only_trusted_proxies() {
