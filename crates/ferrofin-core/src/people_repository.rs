@@ -1090,10 +1090,11 @@ fn peoples_by_names_sql(count: usize) -> String {
 }
 
 /// The stored items of type `?1` among `count` ids (`?2`…). `+"Type"` keeps
-/// the read on the primary key, one seek per id.
+/// the read on the primary key, one seek per id; it comes first so the text
+/// differs from other id reads, which `scan_statements` counts by prefix.
 fn person_items_by_ids_sql(count: usize) -> String {
     format!(
-        r#"SELECT "Id" FROM "BaseItems" WHERE "Id" IN ({}) AND +"Type" = ?1"#,
+        r#"SELECT "Id" FROM "BaseItems" WHERE +"Type" = ?1 AND "Id" IN ({})"#,
         ferrofin_db::numbered_placeholders(2..=count + 1)
     )
 }
