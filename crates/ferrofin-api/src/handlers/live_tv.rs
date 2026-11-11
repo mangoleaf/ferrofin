@@ -1833,10 +1833,13 @@ async fn cancel_timer(
 struct TimerDefaultsQuery {
     /// The programme the new timer would record.
     ///
-    /// The contract declares this a plain string, and clients really do send
-    /// `?programId=` empty — binding it as a `Uuid` would turn that into a
-    /// `400` instead of the standing defaults.
-    program_id: Option<String>,
+    /// Upstream binds a `string?`, which reads an empty or blank value as null
+    /// (clients really do send `?programId=`), and hands anything else to
+    /// `new Guid(programId)`: the D, N, B, P and X spellings, trimmed.
+    /// [`empty_as_none_uuid`](crate::handlers::query_parse::empty_as_none_uuid)
+    /// binds the same set.
+    #[serde(deserialize_with = "crate::handlers::query_parse::empty_as_none_uuid")]
+    program_id: Option<Uuid>,
 }
 
 /// `GET /LiveTv/Timers/Defaults` — the values a new timer starts from.
@@ -1845,23 +1848,23 @@ struct TimerDefaultsQuery {
 /// from the Live TV configuration, every day, keep until deleted), plus the
 /// named programme's own name, channel, window and ids — which is what the
 /// client posts straight back to create the timer.
+///
+/// A `programId` that does not parse is the binder's `400`, where upstream's
+/// `new Guid` throws a `FormatException` (a `500`); the nil GUID is
+/// `GetItemById`'s `ArgumentException`, a `400`. An id naming no programme
+/// answers the standing defaults, where upstream dereferences the null
+/// programme (a `500`).
 async fn get_default_timer(
     State(state): State<AppState>,
     RequireLiveTvAccess(_auth): RequireLiveTvAccess,
     Query(query): Query<TimerDefaultsQuery>,
 ) -> Result<Json<SeriesTimerInfoDto>, ApiError> {
+    if query.program_id.is_some_and(|id| id.is_nil()) {
+        return Err(ApiError::BadRequest("Guid can't be empty".to_owned()));
+    }
     match state.live_tv.as_ref() {
         Some(manager) => Ok(Json(
-            manager
-                .get_new_timer_defaults(
-                    query
-                        .program_id
-                        .as_deref()
-                        .map(str::trim)
-                        .filter(|id| !id.is_empty())
-                        .and_then(|id| Uuid::parse_str(id).ok()),
-                )
-                .await?,
+            manager.get_new_timer_defaults(query.program_id).await?,
         )),
         // No Live TV configured: the padding-free standing defaults.
         None => Ok(Json(ferrofin_traits::stubs::new_timer_defaults(0, 0))),
@@ -2907,6 +2910,8 @@ mod tests {
         discovery_duration_ms: std::sync::Mutex<Option<u64>>,
         /// The `newDevicesOnly` flag the handler forwarded.
         discovery_new_only: std::sync::Mutex<Option<bool>>,
+        /// The programme ids `get_new_timer_defaults` was asked for.
+        timer_defaults_asked: std::sync::Mutex<Vec<Option<Uuid>>>,
     }
 
     #[async_trait::async_trait]
@@ -3181,6 +3186,13 @@ mod tests {
             _id: &str,
         ) -> Result<(), ferrofin_traits::error::ServiceError> {
             unimplemented!()
+        }
+        async fn get_new_timer_defaults(
+            &self,
+            program_id: Option<Uuid>,
+        ) -> Result<SeriesTimerInfoDto, ferrofin_traits::error::ServiceError> {
+            self.timer_defaults_asked.lock().unwrap().push(program_id);
+            Ok(ferrofin_traits::stubs::new_timer_defaults(0, 0))
         }
         async fn get_recordings(
             &self,
@@ -3813,6 +3825,105 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(err.status(), axum::http::StatusCode::NOT_FOUND);
+    }
+
+    const PROGRAM: Uuid = Uuid::from_u128(0x9c4e_63f1_031b_4f25_988b_4f7d_78a8_b53e);
+
+    /// `GetDefaultTimer` hands a non-empty `programId` to `new Guid(programId)`
+    /// (`LibraryManagerExtensions.GetItemById`), which takes the D, N, B, P and
+    /// X spellings, trimmed. The binder reads an empty or blank value as null:
+    /// the standing defaults. A value that does not parse is a 400 (upstream's
+    /// `FormatException` is a 500), and so is the nil GUID (`GetItemById`'s
+    /// "Guid can't be empty").
+    #[rstest::rstest]
+    #[case::absent(None, Ok(None))]
+    #[case::empty(Some(""), Ok(None))]
+    #[case::blank(Some("  "), Ok(None))]
+    #[case::d(Some("9c4e63f1-031b-4f25-988b-4f7d78a8b53e"), Ok(Some(PROGRAM)))]
+    #[case::n(Some("9c4e63f1031b4f25988b4f7d78a8b53e"), Ok(Some(PROGRAM)))]
+    #[case::b(Some("{9c4e63f1-031b-4f25-988b-4f7d78a8b53e}"), Ok(Some(PROGRAM)))]
+    #[case::p(Some("(9c4e63f1-031b-4f25-988b-4f7d78a8b53e)"), Ok(Some(PROGRAM)))]
+    #[case::x(
+        Some("{0x9c4e63f1,0x031b,0x4f25,{0x98,0x8b,0x4f,0x7d,0x78,0xa8,0xb5,0x3e}}"),
+        Ok(Some(PROGRAM))
+    )]
+    #[case::padded(Some(" 9c4e63f1-031b-4f25-988b-4f7d78a8b53e "), Ok(Some(PROGRAM)))]
+    #[case::urn(
+        Some("urn:uuid:9c4e63f1-031b-4f25-988b-4f7d78a8b53e"),
+        Err("Failed to deserialize query string: programId: ")
+    )]
+    #[case::garbage(
+        Some("not-a-guid"),
+        Err("Failed to deserialize query string: programId: ")
+    )]
+    #[case::nil(
+        Some("00000000-0000-0000-0000-000000000000"),
+        Err("Guid can't be empty")
+    )]
+    #[tokio::test]
+    async fn timer_defaults_bind_the_program_id_like_new_guid(
+        #[case] program_id: Option<&str>,
+        #[case] expected: Result<Option<Uuid>, &str>,
+    ) {
+        let fake = std::sync::Arc::new(FakeLiveTv::default());
+        let state = crate::test_support::elevated_fake_state().with_live_tv(fake.clone());
+        let uri = timer_defaults_uri(program_id);
+        let (status, body) = get_timer_defaults(state, &uri).await;
+        let asked = fake.timer_defaults_asked.lock().unwrap().clone();
+        match expected {
+            Ok(forwarded) => {
+                assert_eq!(status, axum::http::StatusCode::OK, "{uri}: {body}");
+                assert_eq!(asked, vec![forwarded], "{uri}");
+            }
+            Err(message) => {
+                assert_eq!(status, axum::http::StatusCode::BAD_REQUEST, "{uri}: {body}");
+                assert!(body.contains(message), "{uri}: {body}");
+                assert!(asked.is_empty(), "{uri} reached the manager: {asked:?}");
+            }
+        }
+    }
+
+    /// With no Live TV configured, a nil `programId` is still `GetItemById`'s
+    /// 400, not the padding-free defaults.
+    #[tokio::test]
+    async fn a_nil_program_id_is_a_400_without_live_tv() {
+        let uri = timer_defaults_uri(Some("00000000-0000-0000-0000-000000000000"));
+        let (status, body) =
+            get_timer_defaults(crate::test_support::elevated_fake_state(), &uri).await;
+        assert_eq!(status, axum::http::StatusCode::BAD_REQUEST, "{body}");
+        assert!(body.contains("Guid can't be empty"), "{body}");
+    }
+
+    /// `/LiveTv/Timers/Defaults`, with `programId` percent-encoded when given.
+    fn timer_defaults_uri(program_id: Option<&str>) -> String {
+        let mut uri = "/LiveTv/Timers/Defaults".to_owned();
+        if let Some(value) = program_id {
+            uri.push_str("?programId=");
+            uri.extend(percent_encoding::utf8_percent_encode(
+                value,
+                percent_encoding::NON_ALPHANUMERIC,
+            ));
+        }
+        uri
+    }
+
+    /// GETs `uri` through the router over `state`: the status and the body.
+    async fn get_timer_defaults(state: AppState, uri: &str) -> (axum::http::StatusCode, String) {
+        use tower::ServiceExt;
+
+        let response = crate::create_router(state)
+            .oneshot(
+                axum::http::Request::get(uri)
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        (status, String::from_utf8_lossy(&body).into_owned())
     }
 }
 
