@@ -145,7 +145,14 @@ pub trait SubtitleManager: Send + Sync {
     /// Fetches the raw content of a remote subtitle by id.
     async fn get_remote_subtitles(&self, id: &str) -> Result<SubtitleResponse, ServiceError>;
 
-    /// Deletes the subtitle stream at `index` from the item.
+    /// Deletes the file of the item's external subtitle stream at `index`
+    /// (`SubtitleManager.DeleteSubtitles`). The stream itself is left to the
+    /// item refresh the caller runs next.
+    ///
+    /// # Errors
+    ///
+    /// [`ServiceError::InvalidInput`] when no subtitle stream has that index
+    /// or it has no file (an embedded stream): upstream's `ArgumentException`.
     async fn delete_subtitles(&self, item_id: Uuid, index: i32) -> Result<(), ServiceError>;
 
     /// Lists the subtitle providers that support the item.

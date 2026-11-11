@@ -3662,6 +3662,41 @@ pub const VERIFIED: &[Verified] = &[
         refs: &[],
     },
     Verified {
+        method: "delete",
+        path: "/Videos/{itemId}/Subtitles/{index}",
+        upstream_file: "Jellyfin.Api/Controllers/SubtitleController.cs",
+        upstream_method: "DeleteSubtitle",
+        ferrofin: "handlers/subtitles.rs delete_subtitle (RequireAdmin, the RequiresElevation \
+               policy; a nil itemId is GetItemById's ArgumentException; require_item, \
+               GetItemById<BaseItem>(itemId, User.GetUserId()): a missing or hidden item is \
+               NotFound()'s ProblemDetails 404; every other failure answered as \
+               ExceptionMiddleware answers a throw, its status with text/plain \"Error \
+               processing request.\" (error.rs into_exception_response); the delete and the \
+               refresh on a task of their own, as upstream finishes them for a client that \
+               hangs up) → ferrofin-core subtitle_manager.rs delete_subtitles \
+               (SubtitleManager.DeleteSubtitles: GetMediaStreams for the subtitle stream at \
+               index, none or one with no or an empty path the 400; a row not marked \
+               external is skipped too, which changes no answer, since neither server stores \
+               a path on one, and keeps a stray path from deleting the media file; the file \
+               deleted inside the self-write bracket, a file already gone ignored as \
+               File.Delete does on Linux) → handlers.rs run_item_refresh (the awaited \
+               item.RefreshMetadata, whose re-probe drops the stream and renumbers the rest; \
+               queued instead for an item outside every library, as for the lyrics delete). \
+               The parity sweep's request (the corpus movie's stream 0, its video) expects \
+               the 400. Measured on 12.4: an embedded, a \
+               missing and a video stream's index, a nil id, an unknown id and an external \
+               sidecar's index",
+        date: "2026-11-11",
+        divergences: &[
+            "A hex (0x, #, &h) or padded index is a 400; upstream's route binder reads it as \
+         a number. Fix path: gl-1664.",
+            "The 400 for an itemId or index the route binder cannot convert (upstream's \
+         ValidationProblemDetails), and the 401 and 403 bodies, are Ferrofin's error shape, \
+         not upstream's. Fix path: gl-666.",
+        ],
+        refs: &["access-filtering"],
+    },
+    Verified {
         method: "get",
         path: "/FallbackFont/Fonts",
         upstream_file: "Jellyfin.Api/Controllers/SubtitleController.cs",

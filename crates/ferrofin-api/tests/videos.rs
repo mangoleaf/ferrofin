@@ -555,10 +555,9 @@ impl LibraryManager for StreamLibrary {
     }
 }
 
-/// A [`SubtitleManager`] recording deletes and returning empty search results.
-struct CannedSubtitles {
-    deleted: Arc<Mutex<Vec<(Uuid, i32)>>>,
-}
+/// A [`SubtitleManager`] refusing every upload and download, for the upload
+/// routes' tests (deletion is tested in `tests/subtitles.rs`).
+struct CannedSubtitles;
 
 #[async_trait]
 impl SubtitleManager for CannedSubtitles {
@@ -585,8 +584,7 @@ impl SubtitleManager for CannedSubtitles {
     async fn get_remote_subtitles(&self, _id: &str) -> Result<SubtitleResponse, ServiceError> {
         Err(ServiceError::invalid_input("no providers"))
     }
-    async fn delete_subtitles(&self, item_id: Uuid, index: i32) -> Result<(), ServiceError> {
-        self.deleted.lock().unwrap().push((item_id, index));
+    async fn delete_subtitles(&self, _item_id: Uuid, _index: i32) -> Result<(), ServiceError> {
         Ok(())
     }
     async fn get_supported_providers(
@@ -620,9 +618,8 @@ fn state(path: &str, subtitles: Arc<dyn SubtitleManager>) -> Harness {
 }
 
 /// The elevated harness, for the video routes that are `RequiresElevation`
-/// upstream: `POST /Videos/MergeVersions`,
-/// `DELETE /Videos/{itemId}/AlternateSources`, and
-/// `DELETE /Videos/{itemId}/Subtitles/{index}`.
+/// upstream: `POST /Videos/MergeVersions` and
+/// `DELETE /Videos/{itemId}/AlternateSources`.
 fn elevated_state(path: &str, subtitles: Arc<dyn SubtitleManager>) -> Harness {
     state_with(
         StreamSources::at(path),
@@ -1488,62 +1485,12 @@ async fn additional_parts_missing_item_is_404() {
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
 }
 
-// ---- Subtitle upload / delete ----------------------------------------------
-
-#[tokio::test]
-async fn subtitle_delete_records_and_204() {
-    let (_dir, path) = temp_media();
-    let deleted = Arc::new(Mutex::new(Vec::new()));
-    let app = elevated_state(
-        &path,
-        Arc::new(CannedSubtitles {
-            deleted: deleted.clone(),
-        }),
-    )
-    .app;
-    let (status, _) = call_with_body(
-        app,
-        "DELETE",
-        &format!("/Videos/{ITEM_ID}/Subtitles/3"),
-        Body::empty(),
-        None,
-    )
-    .await;
-    assert_eq!(status, StatusCode::NO_CONTENT);
-    assert_eq!(*deleted.lock().unwrap(), vec![(ITEM_ID, 3)]);
-}
-
-#[tokio::test]
-async fn subtitle_delete_missing_item_404() {
-    let (_dir, path) = temp_media();
-    let app = elevated_state(
-        &path,
-        Arc::new(CannedSubtitles {
-            deleted: Arc::new(Mutex::new(Vec::new())),
-        }),
-    )
-    .app;
-    let (status, _) = call_with_body(
-        app,
-        "DELETE",
-        &format!("/Videos/{}/Subtitles/0", Uuid::from_u128(7)),
-        Body::empty(),
-        None,
-    )
-    .await;
-    assert_eq!(status, StatusCode::NOT_FOUND);
-}
+// ---- Subtitle upload (deletion is in tests/subtitles.rs) -------------------
 
 #[tokio::test]
 async fn subtitle_upload_bad_base64_is_400() {
     let (_dir, path) = temp_media();
-    let app = state(
-        &path,
-        Arc::new(CannedSubtitles {
-            deleted: Arc::new(Mutex::new(Vec::new())),
-        }),
-    )
-    .app;
+    let app = state(&path, Arc::new(CannedSubtitles)).app;
     let body = serde_json::json!({
         "Language": "eng",
         "Format": "srt",

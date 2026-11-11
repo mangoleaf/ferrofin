@@ -1165,14 +1165,6 @@ kind = "status"
 issue = 844
 reason = "Cancelling a package installation always answers 404."
 
-# Deleting a non-subtitle stream answers 204 where upstream answers 400.
-[[entry]]
-request = "DeleteSubtitle"
-path = "$status"
-kind = "status"
-issue = 846
-reason = "Deleting a non-subtitle stream answers 204 where upstream answers 400."
-
 # Ferrofin sends the session's NowPlayingItem with every field; Jellyfin trims it (SessionManager.GetItemInfo).
 [[entry]]
 request = "screen-playback-start/sessions"

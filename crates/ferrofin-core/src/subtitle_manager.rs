@@ -14,7 +14,8 @@
 //!   row). `Self::upload_subtitle` attaches caller-supplied content the same way.
 //! - `Self::get_remote_subtitles` routes an id to its provider and returns the
 //!   raw content (the `/Providers/Subtitles/Subtitles/{id}` route).
-//! - `Self::delete_subtitles` removes the external stream row + sidecar file.
+//! - `Self::delete_subtitles` deletes an external subtitle's file; the item
+//!   refresh the route then awaits drops its stream.
 //! - `Self::get_supported_providers` lists the registered providers for an item.
 
 use ferrofin_util::directory_path::DirectoryPath;
@@ -36,7 +37,7 @@ use ferrofin_traits::subtitles::{
     SubtitleSearchRequest,
 };
 
-use crate::db_error::{db_err, media_stream_type_disc};
+use crate::db_error::media_stream_type_disc;
 
 /// The concrete subtitle manager.
 #[derive(Clone)]
@@ -514,49 +515,34 @@ impl SubtitleManager for FerrofinSubtitleManager {
     }
 
     async fn delete_subtitles(&self, item_id: Uuid, index: i32) -> Result<(), ServiceError> {
-        // Resolve the row first so we can remove any on-disk sidecar, then drop
-        // the external subtitle stream at that index (mirrors the C# order:
-        // delete the file, then the stream row).
-        let subtitle_disc = i64::from(media_stream_type_disc(
-            ferrofin_model::entities::MediaStreamType::Subtitle,
-        ));
-        let path: Option<String> = sqlx::query_scalar(
-            r#"SELECT "Path" FROM "MediaStreamInfos"
-               WHERE "ItemId" = ?1 AND "StreamIndex" = ?2
-                 AND "StreamType" = ?3 AND "IsExternal" = 1"#,
-        )
-        .bind(guid_to_db(item_id))
-        .bind(i64::from(index))
-        .bind(subtitle_disc)
-        .fetch_optional(self.db.pool())
-        .await
-        .map_err(db_err)?
-        .flatten();
-
-        if let Some(path) = path.as_deref()
-            && !path.is_empty()
-        {
-            // A missing file is fine — the goal is that it no longer exists.
-            let _write = SelfWrite::begin(self.self_writes.as_ref(), path);
-            match tokio::fs::remove_file(path).await {
-                Ok(()) => {}
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                Err(e) => return Err(ServiceError::backend(e.to_string())),
-            }
+        // `GetMediaStreams(…)[0]` throws for no subtitle stream at `index`, and
+        // `ReportFileSystemChangeBeginning` for one with no path (an embedded
+        // stream): both are `ArgumentException`s. Upstream stores no path on an
+        // embedded row, so skipping one that has a path changes no answer and
+        // keeps a stray path from deleting the media file.
+        let path = self
+            .media_streams
+            .get_media_streams(&MediaStreamQuery {
+                item_id,
+                stream_type: Some(ferrofin_model::entities::MediaStreamType::Subtitle),
+                index: Some(index),
+            })
+            .await?
+            .into_iter()
+            .find(|stream| stream.is_external)
+            .and_then(|stream| stream.path)
+            .filter(|path| !path.is_empty())
+            .ok_or_else(|| {
+                ServiceError::invalid_input(format!("no subtitle file at stream index {index}"))
+            })?;
+        // `File.Delete` ignores a file already gone. The stream rows are left
+        // to the item refresh the caller awaits next (`item.RefreshMetadata`).
+        let _write = SelfWrite::begin(self.self_writes.as_ref(), path.as_str());
+        match tokio::fs::remove_file(&path).await {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(ServiceError::backend(e.to_string())),
         }
-
-        sqlx::query(
-            r#"DELETE FROM "MediaStreamInfos"
-               WHERE "ItemId" = ?1 AND "StreamIndex" = ?2
-                 AND "StreamType" = ?3 AND "IsExternal" = 1"#,
-        )
-        .bind(guid_to_db(item_id))
-        .bind(i64::from(index))
-        .bind(subtitle_disc)
-        .execute(self.db.writer())
-        .await
-        .map_err(db_err)?;
-        Ok(())
     }
 
     async fn get_supported_providers(
@@ -1685,8 +1671,10 @@ mod tests {
         assert!(subtitles.is_empty(), "{subtitles:?}");
     }
 
+    /// The stream rows stay: the refresh the handler awaits re-probes them, as
+    /// upstream's `DeleteSubtitles` leaves them to `item.RefreshMetadata`.
     #[tokio::test]
-    async fn delete_removes_external_stream_and_sidecar() {
+    async fn delete_removes_the_sidecar_and_leaves_the_rows_to_the_refresh() {
         let db = test_db().await;
         let item = Uuid::new_v4();
         seed_item(&db, item, BaseItemKind::Movie).await;
@@ -1725,16 +1713,81 @@ mod tests {
             })
             .await
             .expect("remaining");
-        assert_eq!(remaining.len(), 1);
-        assert_eq!(remaining[0].stream_index, 3);
+        let indexes: Vec<_> = remaining.iter().map(|s| s.stream_index).collect();
+        assert_eq!(indexes, [2, 3]);
     }
 
+    /// `File.Delete` ignores a file that is already gone: the delete succeeds,
+    /// still bracketed, and the refresh drops the stream.
     #[tokio::test]
-    async fn delete_missing_index_is_idempotent() {
+    async fn delete_of_a_sidecar_already_gone_succeeds() {
         let db = test_db().await;
         let item = Uuid::new_v4();
         seed_item(&db, item, BaseItemKind::Movie).await;
-        let mgr = manager(db, Vec::new());
-        mgr.delete_subtitles(item, 9).await.expect("no-op delete");
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let gone = tmp.path().join("movie.fre.srt");
+        FerrofinMediaStreamRepository::new(db.clone())
+            .save_media_streams(item, &[subtitle_stream(2, true, gone.to_str())])
+            .await
+            .expect("save streams");
+
+        let recording = Arc::new(Recording::default());
+        manager(db, Vec::new())
+            .with_self_writes(recording.clone())
+            .delete_subtitles(item, 2)
+            .await
+            .expect("a missing file is no error");
+        let shown = gone.display();
+        assert_eq!(
+            recording.calls(),
+            [format!("begin {shown}"), format!("complete {shown} false")]
+        );
+    }
+
+    /// gl-846: `DeleteSubtitles` throws an `ArgumentException`, a `400`, for an
+    /// index with no subtitle stream (`GetMediaStreams(…)[0]`) and for one with
+    /// no file (`ReportFileSystemChangeBeginning(null)`), deleting nothing.
+    #[rstest::rstest]
+    #[case::no_stream_at_the_index(9)]
+    #[case::not_a_subtitle_stream(0)]
+    #[case::embedded(1)]
+    #[case::external_without_a_path(3)]
+    #[case::embedded_naming_the_media_file(4)]
+    #[case::external_with_an_empty_path(5)]
+    #[tokio::test]
+    async fn delete_without_a_subtitle_file_is_invalid_input(#[case] index: i32) {
+        let db = test_db().await;
+        let item = Uuid::new_v4();
+        seed_item(&db, item, BaseItemKind::Movie).await;
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let media = tmp.path().join("movie.mkv");
+        std::fs::write(&media, b"media").expect("write media");
+        FerrofinMediaStreamRepository::new(db.clone())
+            .save_media_streams(
+                item,
+                &[
+                    MediaStreamInfoEntity {
+                        stream_index: 0,
+                        stream_type: media_stream_type_disc(MediaStreamType::Video),
+                        ..Default::default()
+                    },
+                    subtitle_stream(1, false, None),
+                    subtitle_stream(3, true, None),
+                    subtitle_stream(4, false, Some(media.to_str().unwrap())),
+                    subtitle_stream(5, true, Some("")),
+                ],
+            )
+            .await
+            .expect("save streams");
+
+        let error = manager(db, Vec::new())
+            .delete_subtitles(item, index)
+            .await
+            .expect_err("no subtitle file at the index");
+        assert!(matches!(error, ServiceError::InvalidInput(_)), "{error:?}");
+        assert!(
+            media.exists(),
+            "an embedded stream's row never names a file to delete"
+        );
     }
 }
