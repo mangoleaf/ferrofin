@@ -2855,6 +2855,12 @@ pub const VERIFIED: &[Verified] = &[
          MediaLocationsCreated entries that are not recording folders instead of removing \
          them from their libraries: adoption carries that list over but not the recording \
          paths, so upstream's rule would delete the library holding the recordings.",
+            "A network save whose BaseUrl changes the base URL this lifetime serves \
+         (FERROFIN_BASE_URL outranks it) marks a restart pending, and the redirects and \
+         advertised URLs keep the running value until then. Upstream's \
+         OnConfigurationUpdated flags no restart for BaseUrl, while its redirect middleware \
+         and GetLocalApiUrl read the new value at once and its mount keeps the old one \
+         (owner decision on gl-555).",
             "The 400 and 500 bodies are Ferrofin's error shape, not upstream's. Fix path: \
          gl-666.",
         ],

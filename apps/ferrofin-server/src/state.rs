@@ -89,8 +89,9 @@ fn start_network_change_monitor(
 /// The same `{config}/users/named/network.json` that
 /// `GET/POST /System/Configuration/network` reads and writes — so what the
 /// dashboard's policy settings feed the shared network manager. `AutoDiscovery`
-/// is sampled for each server lifetime; listener/base URL bootstrap settings are
-/// configured separately. Missing or unreadable files use defaults; malformed JSON
+/// and `BaseUrl` (`base_url::resolve`) are sampled for each server lifetime;
+/// listener bootstrap settings are configured separately. Missing or
+/// unreadable files use defaults; malformed JSON
 /// also logs a warning that the remote-IP filter will not be enforced.
 pub(crate) async fn load_network_configuration(
     paths: &impl ferrofin_traits::system::ServerApplicationPaths,
@@ -173,6 +174,9 @@ pub struct WiredApp {
     /// HTTPS for this lifetime, when the server listens with it
     /// (`ListenWithHttps`): the certificate the HTTPS listeners serve.
     pub https: Option<crate::tls::HttpsServing>,
+    /// The base URL this lifetime mounts, redirects to and advertises
+    /// (`base_url::resolve`); empty for none.
+    pub base_url: String,
 }
 
 /// The concrete [`LifecycleController`] for the running server.
@@ -937,6 +941,11 @@ pub async fn build_app_state(
         config.https_port,
     );
     let loaded_certificate_path = network_config.certificate_path.clone();
+    // Read after the configuration manager has imported an adopted
+    // `network.xml`, so an adopted install's prefix applies on its first boot.
+    let base_url =
+        crate::base_url::resolve(&config.base_url, config.base_url_from_env, &network_config);
+    let started_network = network_config.clone();
     let network = Arc::new(std::sync::RwLock::new(
         ferrofin_networking::NetworkManager::live(network_config),
     ));
@@ -2753,7 +2762,7 @@ pub async fn build_app_state(
                 https_port: config.https_port,
                 listen_with_https: https.is_some(),
                 published_server_url: config.published_url.clone(),
-                base_url: config.base_url.clone(),
+                base_url: base_url.clone(),
                 // Read live from the network manager attached below; this is
                 // only the startup fact.
                 enable_published_server_uri_by_request: network
@@ -2768,6 +2777,13 @@ pub async fn build_app_state(
         ),
     );
     config_mgr.add_configuration_listener(app_host.configuration_listener());
+    // A Networking page save that changes the base URL served takes a restart.
+    config_mgr.add_configuration_listener(crate::base_url::restart_listener(
+        base_url.clone(),
+        config.base_url.clone(),
+        config.base_url_from_env,
+        Arc::clone(&lifecycle),
+    ));
     app_host.warn_if_published_url_base_path_differs();
     app_host
         .refresh_server_name()
@@ -2998,12 +3014,15 @@ pub async fn build_app_state(
     // with and where each value comes from, and the settings stored in the
     // server configuration, while the Ferrofin plugin is enabled in the plugin
     // manager.
-    let state = state.with_server_settings(Arc::new(crate::settings::FerrofinServerSettings::new(
-        config.clone(),
-        Arc::clone(&lifecycle),
-        Arc::clone(&plugins),
-        Arc::clone(&config_trait),
-    )));
+    let state = state.with_server_settings(Arc::new(
+        crate::settings::FerrofinServerSettings::new(
+            config.clone(),
+            Arc::clone(&lifecycle),
+            Arc::clone(&plugins),
+            Arc::clone(&config_trait),
+        )
+        .with_network(started_network),
+    ));
 
     // ---- SyncPlay ---------------------------------------------------------
     // The SyncPlay manager shares the session message bus (created with the
@@ -3145,6 +3164,7 @@ pub async fn build_app_state(
         background,
         task_manager,
         https,
+        base_url,
     })
 }
 

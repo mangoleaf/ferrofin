@@ -397,9 +397,14 @@ pub struct Config {
     /// (`HostNetworkInfo.published_server_url`). `None` = auto-detect.
     pub published_url: Option<String>,
 
-    /// URL path prefix the server is mounted under
-    /// (`HostNetworkInfo.base_url`). Empty string = root.
+    /// URL path prefix from `FERROFIN_BASE_URL`, else `config.toml`. Empty
+    /// string = root. The Networking page's `BaseUrl` sits between the two:
+    /// the server mounts what `base_url::resolve` picks.
     pub base_url: String,
+
+    /// Whether `FERROFIN_BASE_URL` set [`Self::base_url`], a blank value
+    /// included: it then outranks the Networking page's `BaseUrl`.
+    pub base_url_from_env: bool,
 
     /// OMDb (omdbapi.com) API key override. Empty uses Jellyfin's built-in key.
     /// From `FERROFIN_OMDB_KEY` or
@@ -1036,10 +1041,9 @@ impl Config {
             .or(file.published_url)
             .filter(|s| !s.is_empty());
 
-        let base_url = env
-            .var("FERROFIN_BASE_URL")
-            .or(file.base_url)
-            .unwrap_or_default();
+        let base_url_env = env.var("FERROFIN_BASE_URL");
+        let base_url_from_env = base_url_env.is_some();
+        let base_url = base_url_env.or(file.base_url).unwrap_or_default();
         let base_url = crate::base_url::normalize(&base_url);
 
         let omdb_api_key = env
@@ -1232,6 +1236,7 @@ impl Config {
             https_port,
             published_url,
             base_url,
+            base_url_from_env,
             omdb_api_key,
             studios_repo_url,
             tvdb_api_key,
@@ -1724,6 +1729,7 @@ impl Config {
             https_port: 0,
             published_url: None,
             base_url: String::new(),
+            base_url_from_env: false,
             omdb_api_key: String::new(),
             studios_repo_url: OFFLINE_PROVIDER_URL.to_owned(),
             tvdb_api_key: String::new(),
