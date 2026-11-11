@@ -7216,7 +7216,7 @@ fn recording_status_name(status: RecordingStatus) -> String {
 }
 
 /// Parses a timestamp stored in the guide cache: the canonical storage format
-/// (`YYYY-MM-DD HH:MM:SS.fffffff`, UTC by convention — see
+/// (`yyyy-MM-dd HH:mm:ss.FFFFFFF`, UTC by convention — see
 /// [`ferrofin_db::store`]), falling back to RFC-3339 for rows written before the
 /// cache switched to the canonical format.
 fn parse_dt(s: &str) -> Option<DateTime<Utc>> {

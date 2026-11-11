@@ -29,7 +29,7 @@
 //! `BuildIsPlayedFilter` folder roll-up (`push_is_played`).
 //!
 //! `Guid` columns are stored as UPPERCASE hyphenated `TEXT` and datetimes as
-//! `YYYY-MM-DD HH:MM:SS.fffffff` (Jellyfin's canonical storage formats), so
+//! `yyyy-MM-dd HH:mm:ss.FFFFFFF` (Jellyfin's canonical storage formats), so
 //! identity binds use [`guid_to_db`] and datetime binds use [`datetime_to_db`]
 //! — byte-identical to Jellyfin-written rows under SQLite `BINARY` collation.
 
@@ -3548,7 +3548,7 @@ fn order_column(by: ItemSortBy, _has_user: bool) -> &'static str {
         ItemSortBy::PremiereDate => {
             r#"COALESCE(bi."PremiereDate",
                 CASE WHEN bi."ProductionYear" IS NOT NULL
-                     THEN printf('%04d-01-01 00:00:00.0000000', bi."ProductionYear") END)"#
+                     THEN printf('%04d-01-01 00:00:00', bi."ProductionYear") END)"#
         }
         ItemSortBy::StartDate => r#"bi."StartDate""#,
         ItemSortBy::Album => r#"bi."Album""#,
