@@ -2143,6 +2143,107 @@ mod tests {
         );
     }
 
+    /// gl-1584: an unscoped query for a user writes their Playlists view, as
+    /// upstream's `AddUserToQuery` does through `GetUserViews`
+    /// (`LibraryManager.cs:2090-2117`), though `/UserViews` is never asked. The
+    /// row is the one `/UserViews` then serves, and a repeat query adds none.
+    #[tokio::test]
+    async fn an_unscoped_user_query_writes_the_users_playlists_view() {
+        let db = test_db().await;
+        let user = Uuid::from_u128(0x5401);
+        let user_row = crate::test_support::seed_user_with_defaults(&db, user).await;
+        let folder = Uuid::from_u128(0x5402);
+        put(
+            &db,
+            folder,
+            (BaseItemKind::ManualPlaylistsFolder, "Playlists"),
+            (None, folder),
+            &format!("{DATA}/playlists"),
+            &serde_json::json!({}),
+        )
+        .await;
+        put(
+            &db,
+            Uuid::from_u128(0x5403),
+            (BaseItemKind::Playlist, "Mine"),
+            (Some(folder), folder),
+            &format!("{DATA}/playlists/Mine"),
+            &serde_json::json!({"OwnerUserId": user, "OpenAccess": true}),
+        )
+        .await;
+
+        // Wired as the composition root wires it: the scope reaches the
+        // evaluator and the user-view manager through late slots.
+        let scope_user_views = crate::item_repository::UserViewsSlot::default();
+        let scope_visibility = crate::item_repository::VisibilitySlot::default();
+        let lookup: Arc<dyn ferrofin_traits::persistence::ItemTypeLookup> =
+            Arc::new(ItemTypeLookup::new());
+        let items = Arc::new(
+            FerrofinItemRepository::new(db.clone(), lookup)
+                .with_visibility(Arc::clone(&scope_visibility))
+                .with_user_views(Arc::clone(&scope_user_views)),
+        );
+        let evaluator = visibility(&db);
+        assert!(scope_visibility.set(Arc::downgrade(&evaluator)).is_ok());
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let users: Arc<dyn UserManager> =
+            Arc::new(crate::user_manager::FerrofinUserManager::new(db.clone()));
+        let manager: Arc<dyn UserViewManager> = Arc::new(
+            FerrofinUserViewManager::new(Arc::clone(&items) as Arc<dyn ItemRepository>)
+                .with_database(db.clone())
+                .with_item_store(Arc::new(FerrofinItemPersistenceService::new(db.clone())))
+                .with_metadata_path(tmp.path())
+                .with_id_derivation(item_type_lookup::IdDerivation::Jellyfin {
+                    program_data_path: Some("/config".to_owned()),
+                })
+                .with_users(users)
+                .with_visibility(Arc::clone(&evaluator)),
+        );
+        scope_user_views.bind(&manager);
+        let views = || {
+            let items = Arc::clone(&items);
+            async move {
+                items
+                    .get_item_list(&InternalItemsQuery {
+                        include_item_types: vec![BaseItemKind::UserView],
+                        ..Default::default()
+                    })
+                    .await
+                    .expect("views")
+                    .into_iter()
+                    .filter(|view| view.name.as_deref() == Some("Playlists"))
+                    .map(|view| view.id)
+                    .collect::<Vec<_>>()
+            }
+        };
+        assert!(views().await.is_empty(), "no view before any query");
+
+        let mut query = InternalItemsQuery {
+            recursive: true,
+            ..Default::default()
+        };
+        query.set_user(Arc::new(user_row));
+        items.get_item_list(&query).await.expect("query");
+        let written = views().await;
+        assert_eq!(
+            written.len(),
+            1,
+            "the user's query wrote their Playlists view"
+        );
+        let served = manager
+            .get_user_views(user)
+            .await
+            .expect("user views")
+            .into_iter()
+            .find(|view| view.name.as_deref() == Some("Playlists"))
+            .expect("served")
+            .id;
+        assert_eq!(written, vec![served], "the row /UserViews serves");
+
+        items.get_item_list(&query).await.expect("again");
+        assert_eq!(views().await.len(), 1, "a repeat query writes no other row");
+    }
+
     /// A playlists view an adopted blob stores with a numeric `ViewType`
     /// (11, `CollectionType.playlists`) answers to the same rule as the named
     /// one: listed only once the user can see a playlist.
@@ -4681,14 +4782,9 @@ mod tests {
                     && f.name.as_deref() == Some("Playlists")
             })
             .expect("Playlists media folder present");
-        assert!(
-            playlists
-                .path
-                .as_deref()
-                .is_some_and(|p| p.ends_with("/data/playlists")),
-            "playlists path should end with /data/playlists, got {:?}",
-            playlists.path
-        );
+        // Stored as upstream stores it, `%AppDataPath%/playlists` (gl-1581);
+        // this test's repository reads it as stored, the server's expands it.
+        assert_eq!(playlists.path.as_deref(), Some("%AppDataPath%/playlists"));
         // The backing directory is created on disk.
         assert!(playlists_path.is_dir());
 

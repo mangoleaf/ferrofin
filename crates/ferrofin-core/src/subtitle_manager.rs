@@ -520,18 +520,20 @@ impl SubtitleManager for FerrofinSubtitleManager {
         let subtitle_disc = i64::from(media_stream_type_disc(
             ferrofin_model::entities::MediaStreamType::Subtitle,
         ));
-        let path: Option<String> = sqlx::query_scalar(
-            r#"SELECT "Path" FROM "MediaStreamInfos"
-               WHERE "ItemId" = ?1 AND "StreamIndex" = ?2
-                 AND "StreamType" = ?3 AND "IsExternal" = 1"#,
-        )
-        .bind(guid_to_db(item_id))
-        .bind(i64::from(index))
-        .bind(subtitle_disc)
-        .fetch_optional(self.db.pool())
-        .await
-        .map_err(db_err)?
-        .flatten();
+        // Through the stream repository, which expands a stored
+        // `%MetadataPath%`/`%AppDataPath%` path (`RestorePath`), so the file
+        // removed is the one on disk.
+        let path: Option<String> = self
+            .media_streams
+            .get_media_streams(&MediaStreamQuery {
+                item_id,
+                stream_type: Some(ferrofin_model::entities::MediaStreamType::Subtitle),
+                index: Some(index),
+            })
+            .await?
+            .into_iter()
+            .find(|stream| stream.is_external)
+            .and_then(|stream| stream.path);
 
         if let Some(path) = path.as_deref()
             && !path.is_empty()
@@ -1727,6 +1729,51 @@ mod tests {
             .expect("remaining");
         assert_eq!(remaining.len(), 1);
         assert_eq!(remaining[0].stream_index, 3);
+    }
+
+    /// gl-1581: a sidecar in the metadata directory is stored `%MetadataPath%/…`,
+    /// and the delete removes the file it points at, read through the stream
+    /// repository (`RestorePath`), not the stored text.
+    #[tokio::test]
+    async fn delete_removes_a_sidecar_stored_tokenised() {
+        let db = test_db().await;
+        let item = Uuid::new_v4();
+        seed_item(&db, item, BaseItemKind::Movie).await;
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let paths = crate::app_paths::test_paths(tmp.path());
+        let metadata =
+            ferrofin_traits::system::ServerApplicationPaths::internal_metadata_path(&*paths);
+        let repo = Arc::new(
+            FerrofinMediaStreamRepository::new(db.clone()).with_virtual_paths(
+                crate::virtual_paths::VirtualPathExpander::from_paths(Arc::clone(&paths)),
+            ),
+        );
+        let dir = std::path::Path::new(&metadata).join("library/ab/abcd");
+        std::fs::create_dir_all(&dir).expect("metadata dir");
+        let sidecar = dir.join("movie.eng.srt");
+        std::fs::write(&sidecar, b"1\n").expect("write sidecar");
+        repo.save_media_streams(item, &[subtitle_stream(2, true, sidecar.to_str())])
+            .await
+            .expect("save streams");
+
+        let mgr = FerrofinSubtitleManager::new(
+            db.clone(),
+            library_manager_over(db.clone()),
+            repo.clone(),
+            Vec::new(),
+            std::path::PathBuf::from(&metadata),
+        );
+        mgr.delete_subtitles(item, 2).await.expect("delete");
+        assert!(!sidecar.exists(), "the file the token points at is removed");
+        let remaining = repo
+            .get_media_streams(&MediaStreamQuery {
+                item_id: item,
+                stream_type: Some(MediaStreamType::Subtitle),
+                index: None,
+            })
+            .await
+            .expect("remaining");
+        assert!(remaining.is_empty(), "{remaining:?}");
     }
 
     #[tokio::test]

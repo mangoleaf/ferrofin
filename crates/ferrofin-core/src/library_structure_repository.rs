@@ -36,6 +36,7 @@ pub(crate) async fn preserve_children(
     collection: Uuid,
     aggregate: Uuid,
     mode: &IdDerivation,
+    virtual_paths: &crate::virtual_paths::VirtualPathExpander,
 ) -> Result<(), ServiceError> {
     let cf = guid_to_db(collection);
     let mut tx = db.writer().begin().await.map_err(db_err)?;
@@ -76,11 +77,15 @@ pub(crate) async fn preserve_children(
                 UNION SELECT b."Id" FROM "BaseItems" b JOIN tree t ON b."ParentId" = t.id
             ) SELECT b."Id" AS id, b."Path" AS path FROM "BaseItems" b JOIN tree t ON b."Id" = t.id"#,
         ).bind(&child.id).fetch_all(&mut *tx).await.map_err(db_err)?;
+        // stored tokenised under the data directory (gl-1581); the locations
+        // are the resolved directories
         let physical_path = child
             .path
             .as_deref()
-            .or_else(|| descendants.iter().find_map(|row| row.path.as_deref()));
+            .or_else(|| descendants.iter().find_map(|row| row.path.as_deref()))
+            .map(|path| virtual_paths.expand(path));
         let location = physical_path
+            .as_deref()
             .and_then(|path| {
                 locations
                     .iter()
@@ -103,7 +108,8 @@ pub(crate) async fn preserve_children(
             .ok_or_else(|| ServiceError::backend("cannot derive the library location id"))?;
         let folder = guid_to_db(id);
         let now = Utc::now();
-        ensure_location(&mut tx, id, Some(&aggregate), location, (now, now)).await?;
+        let stored = virtual_paths.reverse(location);
+        ensure_location(&mut tx, id, Some(&aggregate), &stored, (now, now)).await?;
         sqlx::query(r#"UPDATE "BaseItems" SET "ParentId" = ? WHERE "Id" = ?"#)
             .bind(if child.id == folder {
                 &aggregate
@@ -152,12 +158,19 @@ async fn ensure_location(
         .and_then(|v| v.to_str())
         .unwrap_or(location);
     sqlx::query(
-            r#"INSERT INTO "BaseItems" (
+            concat!(
+                r#"INSERT INTO "BaseItems" (
                 "Id", "Type", "Name", "SortName", "CleanName", "Path", "ParentId", "TopParentId",
                 "PresentationUniqueKey", "DateCreated", "DateModified", "DateLastSaved",
-                "IsFolder", "IsInMixedFolder", "IsLocked", "IsMovie", "IsRepeat", "IsSeries", "IsVirtualItem"
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?1, ?8, ?9, ?10, ?11, 1, 0, 0, 0, 0, 0, 0)
-            ON CONFLICT("Id") DO NOTHING"#,
+                "IsFolder", "IsInMixedFolder", "IsLocked", "IsMovie", "IsRepeat", "IsSeries", "IsVirtualItem",
+                "UnratedType", "#,
+                crate::item_persistence_service::unset_columns!(),
+                r#"
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?1, ?8, ?9, ?10, ?11, 1, 0, 0, 0, 0, 0, 0, ?12, "#,
+                crate::item_persistence_service::unset_values!(),
+                r#")
+            ON CONFLICT("Id") DO NOTHING"#
+            ),
         ).bind(&folder).bind(stored_type_name(BaseItemKind::Folder).unwrap_or_default())
             .bind(name)
             .bind(crate::kinds::saved_sort_name(BaseItemKind::Folder, name, None))
@@ -165,6 +178,7 @@ async fn ensure_location(
             .bind(location).bind(aggregate).bind(id.simple().to_string())
             .bind(datetime_to_db(dates.0)).bind(datetime_to_db(dates.1))
             .bind(datetime_to_db(Utc::now()))
+            .bind(crate::item_persistence_service::unrated_type_name(BaseItemKind::Folder))
             .execute(&mut *connection).await.map_err(db_err)?;
     if let Some(aggregate) = aggregate {
         sqlx::query(
@@ -409,4 +423,56 @@ pub(crate) async fn user_data_items(db: &Database, user: Uuid) -> Vec<String> {
         .fetch_all(db.pool())
         .await
         .expect("user data")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_support::{fetch_item, save_item, seed_named_item, test_db};
+
+    /// gl-1581: a legacy child of a library stored tokenised under the data
+    /// directory (a recording) is matched to its resolved location by its
+    /// expanded path, and the location folder it moves under is stored the
+    /// way every save stores it, its id still the one the resolved location
+    /// derives.
+    #[tokio::test]
+    async fn preserve_children_matches_a_tokenised_child_to_its_location() {
+        let db = test_db().await;
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let paths = crate::app_paths::test_paths(tmp.path());
+        let data = ferrofin_traits::system::ServerApplicationPaths::data_path(&*paths);
+        let expander =
+            crate::virtual_paths::VirtualPathExpander::from_paths(std::sync::Arc::clone(&paths));
+        let location = format!("{data}/livetv/recordings");
+        let (aggregate, library, child) = (
+            Uuid::from_u128(0xA66),
+            Uuid::from_u128(0xCF1),
+            Uuid::from_u128(0xC41),
+        );
+        seed_named_item(&db, aggregate, BaseItemKind::AggregateFolder, "root").await;
+        seed_named_item(&db, library, BaseItemKind::CollectionFolder, "Recs").await;
+        seed_named_item(&db, child, BaseItemKind::Movie, "Rec").await;
+        let mut row = fetch_item(&db, library).await;
+        row.data = Some(serde_json::json!({ "PhysicalLocationsList": [location] }).to_string());
+        save_item(&db, &row).await;
+        let mut row = fetch_item(&db, child).await;
+        row.parent_id = Some(guid_to_db(library));
+        row.path = Some("%AppDataPath%/livetv/recordings/Rec/Rec.ts".to_owned());
+        save_item(&db, &row).await;
+
+        let mode = IdDerivation::LegacyLowercase;
+        preserve_children(&db, library, aggregate, &mode, &expander)
+            .await
+            .expect("preserved");
+        let folder = derive_item_id_with(&mode, BaseItemKind::Folder, &location).expect("id");
+        assert_eq!(
+            fetch_item(&db, child).await.parent_id,
+            Some(guid_to_db(folder)),
+            "the child moves under its location's folder"
+        );
+        assert_eq!(
+            fetch_item(&db, folder).await.path.as_deref(),
+            Some("%AppDataPath%/livetv/recordings")
+        );
+    }
 }

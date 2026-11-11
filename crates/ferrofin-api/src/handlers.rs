@@ -1456,7 +1456,10 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
                    visible_view_rows → library_enabled under scope_to_user_libraries, \
                    root_folder_top_parents and grouped_libraries (GetChildren(user, true) in \
                    AddUserToQuery's GetUserViews, UserViewManager.HasVisibleItem and \
-                   GetTopParentIdsForQuery's grouping arm), reading a library's options at its \
+                   GetTopParentIdsForQuery's grouping arm), and UserViewMaterialisation, the \
+                   scope's get_user_views_with_hidden call that writes the user's views as \
+                   AddUserToQuery's GetUserViews call writes them (LibraryManager.AddUserToQuery, \
+                   UserViewManager.GetUserViews, compared 2026-11-10), reading a library's options at its \
                    Path expanded as BaseItemMapper.Map expands it \
                    (CollectionFolder.GetLibraryOptions, compared 2026-11-05); handlers/items.rs \
                    require_scope_visible, require_scope_id_visible, retain_visible_ids at the \
@@ -1513,6 +1516,20 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
              routes are outside this: they serve a transcode's file by its random name, and \
              the item id selects nothing, as upstream. Deliberate divergence (owner decision \
              2026-10-31, gl-1090).",
+            "An unscoped query for a user writes the user's views (the Playlists view, a \
+             grouped view, the Folders view, the Live TV view), where upstream's \
+             AddUserToQuery calls GetUserViews on every such query: for the life of the \
+             process, once per user and per set of root folders the user may see. Those \
+             writes create a missing row or rename a grouped, Folders or Live TV view whose \
+             name changed, so the rows end the same, except that a change while the set \
+             stays the same (for example a view row deleted, the Folders view enabled, a new \
+             server culture, a changed grouped-folders preference, or Live TV becoming \
+             available to the user), or a write that failed, is written by the next GET \
+             /UserViews rather than the next query; a write its query was cancelled in is \
+             retried. The query \
+             that writes them is scoped by the rows read before the write (gl-1584). The \
+             Playlists view's rename (gl-1397) and GetNamedView's refresh queue (gl-1566) are \
+             ported on neither path.",
             "GET and POST /LiveTv/Programs read librarySeriesId's row as the request's user, or \
              as the signed-in caller when a POST body names no user, so a series that user \
              cannot open (library, rating or tag rules) answers like an id that is no series: \

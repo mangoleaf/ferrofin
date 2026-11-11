@@ -279,7 +279,8 @@ async fn scan_ignores_resource_forks_and_dot_samples_but_keeps_owned_suffix_samp
     .await;
     f.scanner.scan_all().await.unwrap();
     let paths: Vec<String> = sqlx::query_scalar(
-        r#"SELECT "Path" FROM "BaseItems" WHERE "MediaType" IS NOT NULL ORDER BY "Path""#,
+        // Every row has a `MediaType`; a media item's is not `Unknown`.
+        r#"SELECT "Path" FROM "BaseItems" WHERE "MediaType" <> 'Unknown' ORDER BY "Path""#,
     )
     .fetch_all(f.db.pool())
     .await
