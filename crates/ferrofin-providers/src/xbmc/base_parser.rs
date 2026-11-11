@@ -13,6 +13,7 @@
 //! fakes for both.
 
 use chrono::Datelike;
+use ferrofin_common::providers;
 use ferrofin_model::data::PersonKind;
 use ferrofin_model::entities::MetadataField;
 use ferrofin_util::finite::finite_or_none;
@@ -22,7 +23,7 @@ use crate::container_types::{FileSystemMetadata, LocalImageInfo, MetadataResult,
 use super::config::NfoConfiguration;
 use super::item::{NfoBaseItem, NfoItemKind};
 use super::xml_ext::{
-    get_image_type, get_person_array, get_person_from_xml_node, left_part, provider_id_parsers,
+    get_image_type, get_person_array, get_person_from_xml_node, left_part,
     read_element_content_as_bool, read_normalized_string, try_read_date_time,
     try_read_date_time_exact, try_read_int,
 };
@@ -248,22 +249,22 @@ impl<'a> BaseNfoParser<'a> {
     fn parse_provider_links(result: &mut MetadataResult<NfoBaseItem>, xml: &str) {
         let item = &mut result.item;
 
-        if let Some(imdb) = provider_id_parsers::try_find_imdb_id(xml) {
-            item.set_provider_id("Imdb", &imdb);
+        if let Some(imdb) = providers::try_find_imdb_id(xml) {
+            item.set_provider_id("Imdb", imdb);
         }
 
         if item.kind == NfoItemKind::Movie
-            && let Some(tmdb) = provider_id_parsers::try_find_tmdb_movie_id(xml)
+            && let Some(tmdb) = providers::try_find_tmdb_movie_id(xml)
         {
-            item.set_provider_id("Tmdb", &tmdb);
+            item.set_provider_id("Tmdb", tmdb);
         }
 
         if item.kind == NfoItemKind::Series {
-            if let Some(tmdb) = provider_id_parsers::try_find_tmdb_series_id(xml) {
-                item.set_provider_id("Tmdb", &tmdb);
+            if let Some(tmdb) = providers::try_find_tmdb_series_id(xml) {
+                item.set_provider_id("Tmdb", tmdb);
             }
-            if let Some(tvdb) = provider_id_parsers::try_find_tvdb_id(xml) {
-                item.set_provider_id("Tvdb", &tvdb);
+            if let Some(tvdb) = providers::try_find_tvdb_id(xml) {
+                item.set_provider_id("Tvdb", tvdb);
             }
         }
     }

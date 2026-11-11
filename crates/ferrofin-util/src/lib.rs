@@ -14,15 +14,11 @@
 //! feature, `keyed_locks` is the async keyed lock the C# takes from
 //! `AsyncKeyedLock`.
 
-pub mod copy_to_extensions;
 pub mod current_culture;
-pub mod dictionary_extensions;
 pub mod directory_path;
-pub mod enumerable_extensions;
 pub mod error;
 pub mod file_helper;
 pub mod finite;
-pub mod formatting_stream_writer;
 pub mod guid_extensions;
 pub mod http_client;
 #[cfg(feature = "tokio")]
@@ -38,5 +34,4 @@ pub mod source_url;
 pub mod split_string_extensions;
 pub mod stable_sort;
 pub mod stream_extensions;
-pub mod string_builder_extensions;
 pub mod string_extensions;
