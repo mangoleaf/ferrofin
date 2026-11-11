@@ -136,9 +136,11 @@ impl ByNameStore {
 
     /// Fills in the metadata `Path` of by-name rows that have none.
     ///
-    /// A scan materializes `Genre`/`Studio`/`MusicArtist` rows keyed by their
-    /// `ItemValues` id and `MusicGenre` rows by a derived id, and neither insert
-    /// wrote a `Path` — but Jellyfin's equivalent row always has one
+    /// A scan materializes `Genre`/`MusicGenre`/`Studio` rows under the ids
+    /// Jellyfin derives from their paths (gl-1597; an older version under their
+    /// `ItemValues` id or a name-derived one) and `MusicArtist` rows under their
+    /// `ItemValues` id, and neither insert writes a `Path`. But Jellyfin's
+    /// equivalent row always has one
     /// (`/config/metadata/MusicGenre/Jazz`) and `DtoService` emits it
     /// unconditionally, so the field was missing from every by-name DTO.
     /// Idempotent: only `Path IS NULL` rows are read, so the steady state is one
@@ -316,8 +318,9 @@ mod tests {
             .expect("ensure")
             .expect("a row");
         // Now content carrying that genre is scanned. The convergence rule:
-        // the value's `ItemValueId` IS the row's id, so the scan's by-name
-        // insert is a no-op instead of a second "Zzznope" in `/Genres`.
+        // with no identity wired, the value's `ItemValueId` IS the row's id
+        // (with one, both mint the derived id), so the scan's by-name insert is
+        // a no-op instead of a second "Zzznope" in `/Genres`.
         let movie = Uuid::from_u128(0x3001);
         crate::test_support::seed_named_item(&db, movie, BaseItemKind::Movie, "A Movie").await;
         crate::test_support::seed_item_genre(&db, movie, "Zzznope").await;

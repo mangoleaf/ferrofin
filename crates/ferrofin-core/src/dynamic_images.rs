@@ -312,10 +312,10 @@ impl DynamicImageProviders {
     /// skipped — one unreadable poster must not lose every other collage.
     ///
     /// `Genre` and `MusicGenre` are separate rows, as upstream keeps them: a
-    /// scan writes a `Genre` row for a non-music item's genre (its id is the
-    /// `ItemValueId`) and a `MusicGenre` row for a music item's (a derived id),
-    /// so a name used by both a movie and an album has two rows and two
-    /// Primaries. An adopted database's rows keep Jellyfin's ids.
+    /// scan writes a `Genre` row for a non-music item's genre and a `MusicGenre`
+    /// row for a music item's, each under the id Jellyfin derives from its path
+    /// (gl-1597), so a name used by both a movie and an album has two rows and
+    /// two Primaries. An adopted database's rows keep Jellyfin's ids.
     ///
     /// TODO(parity, open work item — NOT an accepted divergence; gl-950): the
     /// user root is drawn here behind its gate, where upstream's

@@ -253,7 +253,12 @@ fn by_name_item_id_with_casing(
 #[must_use]
 pub fn by_name_path(root: &str, name: &str) -> String {
     let valid = item_by_name_folder_name(name);
-    format!("{root}/{valid}")
+    // `Path.Combine(root, "")` is `root` itself.
+    if valid.is_empty() {
+        root.to_owned()
+    } else {
+        format!("{root}/{valid}")
+    }
 }
 
 /// [`by_name_path`] for the `Year` metadata dir — `Year.GetPath(name)`.
@@ -267,6 +272,56 @@ pub fn year_path(year_root: &str, name: &str) -> String {
 #[must_use]
 pub fn year_item_id(mode: &IdDerivation, year_root: &str, name: &str) -> Option<uuid::Uuid> {
     by_name_item_id(mode, BaseItemKind::Year, &year_path(year_root, name))
+}
+
+/// How the by-name `Genre`, `MusicGenre` and `Studio` rows take their ids:
+/// Jellyfin's `GetItemByNameId<T>(T.GetPath(name))`, the kind and the name's
+/// path under the kind's metadata directory (gl-1597), the same way `Year`
+/// and `Person` ids derive ([`year_item_id`], [`person_item_id`]).
+#[derive(Debug, Clone)]
+pub struct ByNameIdentity {
+    /// The database's id derivation.
+    mode: IdDerivation,
+    /// `ApplicationPaths.GenrePath`.
+    genre_root: String,
+    /// `ApplicationPaths.MusicGenrePath`.
+    music_genre_root: String,
+    /// `ApplicationPaths.StudioPath`.
+    studio_root: String,
+}
+
+impl ByNameIdentity {
+    /// The identity under `mode`, with the three kinds' metadata directories,
+    /// or [`None`] under [`IdDerivation::LegacyLowercase`]: a pre-parity
+    /// database's ids are not Jellyfin's anyway, and its by-name rows keep the
+    /// ids they were written with.
+    #[must_use]
+    pub fn new(
+        mode: &IdDerivation,
+        genre_root: impl Into<String>,
+        music_genre_root: impl Into<String>,
+        studio_root: impl Into<String>,
+    ) -> Option<Self> {
+        matches!(mode, IdDerivation::Jellyfin { .. }).then(|| Self {
+            mode: mode.clone(),
+            genre_root: genre_root.into(),
+            music_genre_root: music_genre_root.into(),
+            studio_root: studio_root.into(),
+        })
+    }
+
+    /// The id Jellyfin derives for `name`'s `kind` row, or [`None`] for a
+    /// kind other than `Genre`, `MusicGenre` and `Studio`.
+    #[must_use]
+    pub fn id(&self, kind: BaseItemKind, name: &str) -> Option<uuid::Uuid> {
+        let root = match kind {
+            BaseItemKind::Genre => &self.genre_root,
+            BaseItemKind::MusicGenre => &self.music_genre_root,
+            BaseItemKind::Studio => &self.studio_root,
+            _ => return None,
+        };
+        by_name_item_id(&self.mode, kind, &by_name_path(root, name.trim()))
+    }
 }
 
 /// The id of a season with no folder of its own (a series' episodes sit in
@@ -561,6 +616,66 @@ mod tests {
     };
     use ferrofin_model::data::BaseItemKind;
     use ferrofin_traits::persistence::ItemTypeLookup as _;
+
+    /// gl-1597: the by-name genre, music genre and studio ids are Jellyfin's
+    /// `GetItemByNameId<T>(T.GetPath(name))`. The vector is a stock Jellyfin
+    /// 12.4's `Adventure` genre (program data `/config`).
+    #[test]
+    fn by_name_identity_derives_jellyfins_genre_id() {
+        let identity = super::ByNameIdentity::new(
+            &IdDerivation::Jellyfin {
+                program_data_path: Some("/config".to_owned()),
+            },
+            "/config/metadata/Genre",
+            "/config/metadata/MusicGenre",
+            "/config/metadata/Studio",
+        )
+        .expect("a Jellyfin-mode identity");
+        // A stock Jellyfin 12.4's ids for the same names.
+        for (kind, name, id) in [
+            (
+                BaseItemKind::Genre,
+                "Adventure",
+                "51CEC964-5B89-6084-D12B-259ACD05CCB1",
+            ),
+            (
+                BaseItemKind::Genre,
+                "Crime Drama",
+                "CF39391B-4058-A0C0-27CB-D69ACFDDF1CB",
+            ),
+            (
+                BaseItemKind::MusicGenre,
+                "Ambient",
+                "7566EE57-563D-F93E-E76C-CE4F2C4349A7",
+            ),
+            (
+                BaseItemKind::Studio,
+                "Pixar",
+                "A1384420-050B-89EA-581E-04C0DD9A83A8",
+            ),
+        ] {
+            assert_eq!(
+                identity.id(kind, name),
+                uuid::Uuid::parse_str(id).ok(),
+                "{name}"
+            );
+        }
+        assert_eq!(identity.id(BaseItemKind::MusicArtist, "Adventure"), None);
+        // A pre-parity database keeps its by-name ids.
+        assert!(
+            super::ByNameIdentity::new(&IdDerivation::LegacyLowercase, "g", "m", "s").is_none()
+        );
+    }
+
+    /// `Path.Combine(root, "")`: a name with no valid file-name characters
+    /// derives from the kind's directory itself.
+    #[test]
+    fn a_name_with_no_valid_characters_is_the_directory_itself() {
+        assert_eq!(
+            super::by_name_path("/config/metadata/Genre", "   "),
+            "/config/metadata/Genre"
+        );
+    }
 
     #[test]
     fn maps_known_kinds_to_fqns() {
