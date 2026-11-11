@@ -291,11 +291,14 @@ fn read_retention_days(config_dir: &Path) -> i32 {
 /// Without this, a panic bypasses tracing entirely — it never reaches the JSON
 /// stdout stream, the log file, or (with export on) the active span in Tempo.
 /// The previous hook is preserved so abort/backtrace behaviour is unchanged.
+/// It also records where the panic happened, for a scheduled task's result
+/// (`ferrofin_util::panic::record_location`).
 fn install_panic_hook() {
     static INSTALLED: std::sync::Once = std::sync::Once::new();
     INSTALLED.call_once(|| {
         let previous = std::panic::take_hook();
         std::panic::set_hook(Box::new(move |info| {
+            ferrofin_util::panic::record_location(info);
             let location = info
                 .location()
                 .map_or_else(String::new, ToString::to_string);
@@ -1865,6 +1868,12 @@ mod tests {
             "hook emitted the error line: {out}"
         );
         assert!(out.contains("kaboom"), "panic message captured: {out}");
+        // …and record where it happened for a scheduled task's result.
+        let at = ferrofin_util::panic::take_location();
+        assert!(
+            at.as_deref().is_some_and(|at| at.starts_with(file!())),
+            "{at:?}"
+        );
     }
 
     #[tokio::test]
