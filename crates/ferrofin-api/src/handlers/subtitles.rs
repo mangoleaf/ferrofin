@@ -248,9 +248,10 @@ async fn search_remote_subtitles(
 /// `POST /Items/{itemId}/RemoteSearch/Subtitles/{subtitleId}` — download one.
 ///
 /// Port of `SubtitleController.DownloadRemoteSubtitles`: `404` for a missing
-/// item, else `204` after attempting the download (the C# swallows download
-/// errors and still returns `204`; a metadata refresh is queued). After router
-/// normalization the trailing id segment is captured as `{language}`.
+/// item, else `204` after attempting the download and queueing a metadata
+/// refresh. Like the C# `try`, a failure of either is logged at error and still
+/// answered `204`. After router normalization the trailing id segment is
+/// captured as `{language}`.
 #[utoipa::path(
     post,
     path = "/Items/{itemId}/RemoteSearch/Subtitles/{language}",
@@ -270,15 +271,16 @@ async fn download_remote_subtitles(
     Path((DotnetGuid(item_id), subtitle_id)): Path<(DotnetGuid, String)>,
 ) -> Result<StatusCode, ApiError> {
     require_video(&state, item_id, &auth).await?;
-    // The C# logs-and-continues on a provider failure, still returning 204, then
-    // queues a refresh. A download that succeeds queues the refresh too.
-    if state
-        .subtitles
-        .download_subtitles(item_id, &subtitle_id)
-        .await
-        .is_ok()
-    {
-        queue_high_priority_refresh(&state, item_id).await?;
+    let downloaded = async {
+        state
+            .subtitles
+            .download_subtitles(item_id, &subtitle_id)
+            .await?;
+        queue_high_priority_refresh(&state, item_id).await
+    }
+    .await;
+    if let Err(error) = downloaded {
+        tracing::error!(%item_id, ?subtitle_id, %error, "Error downloading subtitles");
     }
     Ok(StatusCode::NO_CONTENT)
 }
