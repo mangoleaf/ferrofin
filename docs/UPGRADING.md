@@ -47,6 +47,56 @@ database the new one has already migrated.
 
 Back up the data directory first, as for any major upgrade.
 
+## 1.5.1
+
+**Before you upgrade**
+
+- **Recording post-processors.** A `RecordingPostProcessor` and its arguments that earlier releases
+  ignored now run on every completed DVR recording. Check the executable, the service account's
+  permissions and the argument template first. Templates use POSIX shell-word quoting without a
+  shell, and `"{path}"` passes the recording path as one argument.
+- **Playback-decision history.** The first **Optimize database** run after upgrading (within 6
+  hours, once nothing is playing and no library scan runs) permanently deletes
+  `FerrofinPlaybackSessions` rows older than `ActivityLogRetentionDays` (30 days by default). To keep
+  older transcode-reason history, copy the table out before upgrading, or unset
+  `ActivityLogRetentionDays`, which also leaves Clean Activity Log without a window, as in Jellyfin.
+- **Stop timing.** A stop can now take up to twice `shutdown_timeout_secs` (default 30 s): the drain
+  and then the wait for transcodes and recordings each have that bound. A container stop grace
+  period shorter than that can cut the teardown short.
+
+**If scripts or other API clients use the server**
+
+- `ferrofin-server --version` prints the release (`ferrofin-server v1.5.1`) where it printed the
+  crate placeholder (`ferrofin-server 0.4.1`).
+
+**Monitoring and reverse proxies**
+
+- Log-based alerts: a failed request's `response failed` line now has target
+  `ferrofin_api::router` and fields `http.response.status_code` and `elapsed_ms`, where it had
+  `tower_http::trace::on_failure`, `classification` and `latency`. It is not written again for a 5xx
+  that an `ApiError`, the panic boundary or the IP filter already logged.
+- Trace dashboards that filter on `service.version="0.4.1"` see the release instead (`v1.5.1`, the
+  value `/health/live` reports).
+- `cargo audit bin` on a release binary reports RUSTSEC-2026-0459 and exits 1. That is the accepted
+  advisory, not a new problem.
+
+**Libraries**
+
+- A thumb or photo that an earlier version left truncated is not repaired; it stays until it is
+  deleted or replaced.
+- A user whose profile blocks unrated Live TV channels, or sets allowed tags, now sees an empty or
+  shorter channel list, as on Jellyfin. Clear the setting in that user's parental controls to show
+  the channels again.
+
+**After you upgrade**
+
+- Run the **Refresh Guide** scheduled task once, or wait for its next 24-hour run. Until then, guide
+  airings stored by an earlier version have no parental score: a rating-limited user still sees
+  them, and a user who blocks unrated programmes sees an empty guide.
+- Review any Intro Skipper chapter-name patterns an admin entered: a lookbehind with a backreference
+  or an atomic group now compiles instead of matching nothing, and `\xHH` above `0x7F` matches the
+  character, not a raw byte. The defaults are unaffected.
+
 ## 1.5.0
 
 **Before you upgrade**
