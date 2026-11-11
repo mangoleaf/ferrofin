@@ -233,6 +233,37 @@ async fn item_value_ids(
     Ok(ids)
 }
 
+/// Replaces `item_id`'s external-id rows (`BaseItemProviders`) with `ids`, in
+/// `tx`. Blank keys and values are not ids (the C# `SetProviderId` drops them).
+async fn write_provider_ids(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    item_id: Uuid,
+    ids: &[(String, String)],
+) -> Result<(), ServiceError> {
+    let id = guid_to_db(item_id);
+    sqlx::query(r#"DELETE FROM "BaseItemProviders" WHERE "ItemId" = ?1"#)
+        .bind(&id)
+        .execute(&mut **tx)
+        .await
+        .map_err(db_err)?;
+    for (provider, value) in ids {
+        if provider.trim().is_empty() || value.trim().is_empty() {
+            continue;
+        }
+        sqlx::query(
+            r#"INSERT OR REPLACE INTO "BaseItemProviders"
+               ("ItemId", "ProviderId", "ProviderValue") VALUES (?1, ?2, ?3)"#,
+        )
+        .bind(&id)
+        .bind(provider)
+        .bind(value)
+        .execute(&mut **tx)
+        .await
+        .map_err(db_err)?;
+    }
+    Ok(())
+}
+
 /// Replaces `item_id`'s `ItemValues` links with `values`, inside `tx`: the
 /// body of [`ItemPersistenceService::save_item_values`], shared with its
 /// batched form.
@@ -2736,30 +2767,20 @@ impl ItemPersistenceService for FerrofinItemPersistenceService {
         item_id: Uuid,
         ids: &[(String, String)],
     ) -> Result<(), ServiceError> {
-        let id = guid_to_db(item_id);
         // One transaction so the clear+rewrite is atomic on the single writer
         // connection (same shape as `set_ancestors`).
         let mut tx = self.db.writer().begin().await.map_err(db_err)?;
-        sqlx::query(r#"DELETE FROM "BaseItemProviders" WHERE "ItemId" = ?1"#)
-            .bind(&id)
-            .execute(&mut *tx)
-            .await
-            .map_err(db_err)?;
-        for (provider, value) in ids {
-            // Blank keys/values are not ids (the C# `SetProviderId` drops them).
-            if provider.trim().is_empty() || value.trim().is_empty() {
-                continue;
-            }
-            sqlx::query(
-                r#"INSERT OR REPLACE INTO "BaseItemProviders"
-                   ("ItemId", "ProviderId", "ProviderValue") VALUES (?1, ?2, ?3)"#,
-            )
-            .bind(&id)
-            .bind(provider)
-            .bind(value)
-            .execute(&mut *tx)
-            .await
-            .map_err(db_err)?;
+        write_provider_ids(&mut tx, item_id, ids).await?;
+        tx.commit().await.map_err(db_err)
+    }
+
+    async fn replace_provider_ids_for_items(
+        &self,
+        items: &[(Uuid, Vec<(String, String)>)],
+    ) -> Result<(), ServiceError> {
+        let mut tx = self.db.writer().begin().await.map_err(db_err)?;
+        for (item_id, ids) in items {
+            write_provider_ids(&mut tx, *item_id, ids).await?;
         }
         tx.commit().await.map_err(db_err)
     }
@@ -8336,6 +8357,37 @@ mod tests {
                 ("Tmdb".to_owned(), "603".to_owned()),
             ]
         );
+    }
+
+    /// The batch form replaces each item's set, and an empty set clears it.
+    #[tokio::test]
+    async fn replace_provider_ids_for_items_swaps_each_items_set() {
+        let db = test_db().await;
+        let (first, second) = (Uuid::new_v4(), Uuid::new_v4());
+        seed_item(&db, first, BaseItemKind::LiveTvProgram).await;
+        seed_item(&db, second, BaseItemKind::LiveTvProgram).await;
+        let svc = FerrofinItemPersistenceService::new(db.clone());
+        for id in [first, second] {
+            svc.save_provider_id(id, "Custom", "x")
+                .await
+                .expect("seed id");
+        }
+        svc.replace_provider_ids_for_items(&[
+            (first, vec![("ProgramEtag".to_owned(), "A".to_owned())]),
+            (second, Vec::new()),
+        ])
+        .await
+        .expect("replace");
+
+        let rows = svc
+            .provider_ids_for_items(&[first, second])
+            .await
+            .expect("read back");
+        assert_eq!(
+            rows.get(&first).cloned().unwrap_or_default(),
+            [("ProgramEtag".to_owned(), "A".to_owned())]
+        );
+        assert_eq!(rows.get(&second).cloned().unwrap_or_default(), []);
     }
 
     // Saving an item must stamp the derived `CleanName` (C# `SaveItem` computes

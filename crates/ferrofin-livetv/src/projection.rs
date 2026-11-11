@@ -114,6 +114,20 @@ pub struct ProgramRow {
     pub date_created: Option<String>,
     /// The listing's showing-identity key (`ProgramInfo.ShowId`), if any.
     pub show_id: Option<String>,
+    /// The listing's `ProgramInfo.Etag` (gl-763), the item's `ProgramEtag`
+    /// provider id.
+    pub etag: Option<String>,
+    /// The listing's `Audio`, as its stored `ProgramAudio` number (Schedules
+    /// Direct only).
+    pub audio: Option<i32>,
+    /// The listing's `IsHD` (Schedules Direct only): a 1280x720 item.
+    #[sqlx(rename = "IsHD")]
+    pub is_hd: Option<bool>,
+    /// The listing's `OriginalAirDate` (DB text form; Schedules Direct only).
+    pub original_air_date: Option<String>,
+    /// The listing's `SeriesProviderIds["Zap2It"]` (Schedules Direct only).
+    #[sqlx(rename = "SeriesZap2It")]
+    pub series_zap2it: Option<String>,
     /// The owning channel's name.
     pub channel_name: String,
     /// The owning channel's number, if any.
@@ -760,6 +774,12 @@ pub fn program_entity(
         .and_then(|g| serde_json::from_str(g).ok())
         .unwrap_or_default();
     let is_series = row.is_series;
+    // `if (info.IsHD ?? false) { Width = 1280; Height = 720; }`.
+    let (width, height) = if row.is_hd == Some(true) {
+        (1280, 720)
+    } else {
+        (0, 0)
+    };
     BaseItemEntity {
         id: row.id.clone(),
         type_: PROGRAM_TYPE_NAME.to_owned(),
@@ -780,6 +800,11 @@ pub fn program_entity(
         is_repeat: row.is_repeat,
         index_number: row.episode_number.map(i64::from),
         parent_index_number: row.season_number.map(i64::from),
+        // `if (!isSeries || info.IsRepeat) item.PremiereDate = info.OriginalAirDate`.
+        premiere_date: (!is_series || row.is_repeat)
+            .then(|| row.original_air_date.as_deref().and_then(parse_dt))
+            .flatten(),
+        audio: row.audio,
         sort_name: Some(item_sort_name(&row.title)),
         external_id: row.external_id.clone(),
         // `GetProgram` assigns `ExternalSeriesId` only from a non-blank
@@ -806,12 +831,10 @@ pub fn program_entity(
         // `item.Width`/`item.Height` are non-nullable `int`s upstream, so a
         // programme stores 0/0 unless the listing declares HD
         // (`if (info.IsHD ?? false) { Width = 1280; Height = 720; }`,
-        // GuideManager.cs:566-570). `XmlTvListingsProvider.GetProgramInfo` never
-        // sets `IsHD`, so an XMLTV guide always takes the 0/0 branch; the DTO
-        // layer only projects a dimension greater than zero, so neither reaches
-        // the wire.
-        width: Some(0),
-        height: Some(0),
+        // GuideManager.cs:596-600). Only Schedules Direct sets `IsHD`; the DTO
+        // layer projects only a dimension greater than zero.
+        width: Some(width),
+        height: Some(height),
         is_folder: false,
         ..BaseItemEntity::default()
     }
@@ -853,7 +876,14 @@ pub fn program_item_update(
     item.production_year = fresh.production_year;
     item.index_number = fresh.index_number;
     item.parent_index_number = fresh.parent_index_number;
-    item.premiere_date = fresh.premiere_date;
+    // Assigned only for a non-series airing or a repeat (`GuideManager.cs:633-636`).
+    if !fresh.is_series || fresh.is_repeat {
+        item.premiere_date = fresh.premiere_date;
+    }
+    item.audio = fresh.audio;
+    // `item.CommunityRating = info.CommunityRating`: neither listings
+    // provider fills it (XMLTV's star rating never parses into a value).
+    item.community_rating = fresh.community_rating;
     item.genres.clone_from(&fresh.genres);
     item.tags.clone_from(&fresh.tags);
     item.is_movie = fresh.is_movie;
@@ -873,13 +903,27 @@ pub fn program_item_update(
     {
         item.external_series_id = Some(series.to_owned());
     }
-    item.series_name.clone_from(&fresh.series_name);
-    item.show_id.clone_from(&fresh.show_id);
+    // Set for an episode only, never cleared (`GuideManager.cs:546-550`).
+    if fresh.series_name.is_some() {
+        item.series_name.clone_from(&fresh.series_name);
+    }
+    // `if (!string.Equals(info.ShowId, item.ShowId, OrdinalIgnoreCase))`: a
+    // difference only in case keeps the stored spelling.
+    let same_show = match (stored.show_id.as_deref(), fresh.show_id.as_deref()) {
+        (Some(stored), Some(fresh)) => crate::mapping::eq_ordinal_ignore_case(stored, fresh),
+        (stored, fresh) => stored == fresh,
+    };
+    if !same_show {
+        item.show_id.clone_from(&fresh.show_id);
+    }
     item.media_type.clone_from(&fresh.media_type);
     item.unrated_type.clone_from(&fresh.unrated_type);
     item.is_virtual_item = fresh.is_virtual_item;
-    item.width = fresh.width;
-    item.height = fresh.height;
+    // An HD listing sets 1280x720; one that is not leaves the stored size.
+    if fresh.width.is_some_and(|w| w > 0) {
+        item.width = fresh.width;
+        item.height = fresh.height;
+    }
     item.is_folder = fresh.is_folder;
     if stored
         .forced_sort_name
@@ -890,6 +934,75 @@ pub fn program_item_update(
         item.sort_name.clone_from(&fresh.sort_name);
     }
     (item != *stored).then_some(item)
+}
+
+/// `GuideManager.EtagKey`: the provider id a programme item keeps its
+/// listing's etag under.
+pub const PROGRAM_ETAG_KEY: &str = "ProgramEtag";
+
+/// A programme item's external ids as `GuideManager.GetProgram` sets them
+/// (`GuideManager.cs:614-619,643-656`): the listing's `ProviderIds`, with each
+/// `SeriesProviderIds` entry as `"Series" + key`, and the etag restored as
+/// [`PROGRAM_ETAG_KEY`]. Only Schedules Direct fills a series id (`Zap2It`);
+/// neither listing fills `ProviderIds`.
+#[must_use]
+pub fn program_provider_ids(row: &ProgramRow) -> Vec<(String, String)> {
+    let non_blank = |v: &Option<String>| v.clone().filter(|v| !v.trim().is_empty());
+    let mut ids = Vec::new();
+    if let Some(series) = non_blank(&row.series_zap2it) {
+        ids.push(("SeriesZap2It".to_owned(), series));
+    }
+    if let Some(etag) = non_blank(&row.etag) {
+        ids.push((PROGRAM_ETAG_KEY.to_owned(), etag));
+    }
+    ids
+}
+
+/// `XmlTvProgramEtag.MatchesStored`: the listing's etag is XMLTV's and equals
+/// the one stored in `current` (ignoring case), so `GetProgram` leaves the
+/// airing as it is (`GuideManager.cs:512-518`).
+#[must_use]
+pub fn xmltv_etag_unchanged(current: &[(String, String)], listed: &[(String, String)]) -> bool {
+    let etag = |ids: &[(String, String)]| {
+        ids.iter()
+            .find(|(key, _)| key.eq_ignore_ascii_case(PROGRAM_ETAG_KEY))
+            .map(|(_, value)| value.clone())
+    };
+    etag(listed)
+        .filter(|listed| listed.starts_with(crate::xmltv_etag::PREFIX))
+        .is_some_and(|listed| {
+            etag(current).is_some_and(|stored| stored.eq_ignore_ascii_case(&listed))
+        })
+}
+
+/// Whether the guide refresh replaces a programme's stored external ids
+/// (`current`) with the listing's (`listed`, [`program_provider_ids`]).
+///
+/// `GetProgram` skips an airing whose XMLTV etag is the stored one
+/// (`XmlTvProgramEtag.MatchesStored`), so an unchanged XMLTV listing leaves an
+/// editor's extra ids alone; one that is new, `written` for another change,
+/// or whose etag moved has them replaced. Every other airing (a Schedules
+/// Direct `md5`, or no etag) is saved with the listing's ids on every refresh,
+/// because its etag is compared after the ids were replaced; replacing only a
+/// set that differs ends in the same rows without rewriting them.
+#[must_use]
+pub fn program_provider_ids_replaced(
+    current: &[(String, String)],
+    listed: &[(String, String)],
+    written: bool,
+) -> bool {
+    let xmltv = listed.iter().any(|(key, value)| {
+        key.eq_ignore_ascii_case(PROGRAM_ETAG_KEY) && value.starts_with(crate::xmltv_etag::PREFIX)
+    });
+    if xmltv {
+        return written || !xmltv_etag_unchanged(current, listed);
+    }
+    let sorted = |ids: &[(String, String)]| {
+        let mut ids = ids.to_vec();
+        ids.sort();
+        ids
+    };
+    sorted(current) != sorted(listed)
 }
 
 /// The flag-derived tag list, in `GuideManager.GetProgram`'s exact order.
@@ -1183,6 +1296,11 @@ mod tests {
             episode_number: None,
             date_created: None,
             show_id: None,
+            etag: None,
+            audio: None,
+            is_hd: None,
+            original_air_date: None,
+            series_zap2it: None,
             channel_name: String::new(),
             channel_number: None,
             channel_media_kind: "Tv".to_owned(),
@@ -1221,6 +1339,11 @@ mod tests {
             episode_number: None,
             date_created: None,
             show_id: None,
+            etag: None,
+            audio: None,
+            is_hd: None,
+            original_air_date: None,
+            series_zap2it: None,
             channel_name: String::new(),
             channel_number: None,
             channel_media_kind: "Tv".to_owned(),
@@ -1368,6 +1491,11 @@ mod tests {
             episode_number: None,
             date_created: None,
             show_id: Some("a584069bf4e49f1dbb474bfb43129f3c".to_owned()),
+            etag: None,
+            audio: None,
+            is_hd: None,
+            original_air_date: None,
+            series_zap2it: None,
             channel_name: "Parity One".to_owned(),
             channel_number: Some("1".to_owned()),
             channel_media_kind: "Tv".to_owned(),
@@ -1689,5 +1817,114 @@ mod tests {
         ] {
             assert!(!options.contains_field(f));
         }
+    }
+
+    /// gl-763: `GetProgram` sets the listing's ids, with the etag restored as
+    /// `ProgramEtag`, whenever it saves the programme. It skips only an XMLTV
+    /// airing whose etag is stored; any other airing is saved on every
+    /// refresh, so only a different set is rewritten.
+    #[rstest::rstest]
+    #[case::same_etag_keeps_an_editors_id(&[("Custom", "x"), ("ProgramEtag", "xmltv-sha256-v1:A")], &[("ProgramEtag", "xmltv-sha256-v1:A")], false, false)]
+    #[case::same_etag_case_insensitive(&[("ProgramEtag", "xmltv-sha256-v1:a")], &[("ProgramEtag", "xmltv-sha256-v1:A")], false, false)]
+    #[case::written_programme(&[("ProgramEtag", "xmltv-sha256-v1:A")], &[("ProgramEtag", "xmltv-sha256-v1:A")], true, true)]
+    #[case::moved_etag(&[("ProgramEtag", "xmltv-sha256-v1:A")], &[("ProgramEtag", "xmltv-sha256-v1:B")], false, true)]
+    #[case::first_etag(&[], &[("ProgramEtag", "xmltv-sha256-v1:A")], false, true)]
+    #[case::no_etag_same_set(&[("SeriesZap2It", "EP1")], &[("SeriesZap2It", "EP1")], false, false)]
+    #[case::no_etag_new_set(&[("Custom", "x")], &[], false, true)]
+    #[case::schedules_direct_md5_drops_an_editors_id(&[("Custom", "x"), ("ProgramEtag", "md5")], &[("ProgramEtag", "md5")], false, true)]
+    #[case::schedules_direct_same_set(&[("ProgramEtag", "md5")], &[("ProgramEtag", "md5")], false, false)]
+    fn programme_ids_follow_get_programs_saves(
+        #[case] current: &[(&str, &str)],
+        #[case] listed: &[(&str, &str)],
+        #[case] written: bool,
+        #[case] replaced: bool,
+    ) {
+        let owned = |ids: &[(&str, &str)]| -> Vec<(String, String)> {
+            ids.iter()
+                .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+                .collect()
+        };
+        assert_eq!(
+            program_provider_ids_replaced(&owned(current), &owned(listed), written),
+            replaced
+        );
+    }
+
+    /// gl-763: a Schedules Direct listing's audio, HD flag, original air date
+    /// and Zap2It series id reach the item as `GetProgram` assigns them.
+    #[test]
+    fn a_listings_audio_size_air_date_and_ids_reach_the_item() {
+        let listed = ProgramRow {
+            etag: Some("md5".to_owned()),
+            audio: Some(3),
+            is_hd: Some(true),
+            original_air_date: Some("2010-01-05T00:00:00Z".to_owned()),
+            series_zap2it: Some("EP00001457".to_owned()),
+            is_series: false,
+            ..guide_row("[]", None)
+        };
+        let item = program_entity(&listed, parse, None);
+        assert_eq!((item.width, item.height), (Some(1280), Some(720)));
+        assert_eq!(item.audio, Some(3));
+        assert_eq!(item.premiere_date, parse("2010-01-05T00:00:00Z"));
+        assert_eq!(
+            program_provider_ids(&listed),
+            [
+                ("SeriesZap2It".to_owned(), "EP00001457".to_owned()),
+                ("ProgramEtag".to_owned(), "md5".to_owned()),
+            ]
+        );
+
+        // A first-run episode keeps the stored premiere date, and a listing
+        // that is no longer HD keeps the stored size.
+        let episode = ProgramRow {
+            is_series: true,
+            is_repeat: false,
+            is_hd: Some(false),
+            original_air_date: None,
+            audio: Some(1),
+            ..listed
+        };
+        let updated =
+            program_item_update(&item, &program_entity(&episode, parse, None)).expect("changed");
+        assert_eq!((updated.width, updated.height), (Some(1280), Some(720)));
+        assert_eq!(updated.premiere_date, item.premiere_date);
+        assert_eq!(updated.audio, Some(1));
+        // A repeat takes the listing's (here no) air date.
+        let repeat = program_item_update(
+            &item,
+            &program_entity(
+                &ProgramRow {
+                    is_repeat: true,
+                    ..episode
+                },
+                parse,
+                None,
+            ),
+        )
+        .expect("changed");
+        assert_eq!(repeat.premiere_date, None);
+    }
+
+    /// `GetProgram` sets `SeriesName` for an episode and never clears it, and
+    /// keeps a stored `ShowId` that differs only in case.
+    #[test]
+    fn series_name_stays_and_show_id_keeps_its_spelling() {
+        let episode = ProgramRow {
+            show_id: Some("SHOW-A".to_owned()),
+            ..guide_row("[]", None)
+        };
+        let stored = program_entity(&episode, parse, None);
+        assert_eq!(stored.series_name.as_deref(), Some("Show"));
+        let not_an_episode = ProgramRow {
+            is_series: false,
+            show_id: Some("show-a".to_owned()),
+            overview: Some("now a special".to_owned()),
+            ..episode
+        };
+        let updated = program_item_update(&stored, &program_entity(&not_an_episode, parse, None))
+            .expect("changed");
+        assert_eq!(updated.series_name.as_deref(), Some("Show"));
+        assert_eq!(updated.show_id.as_deref(), Some("SHOW-A"));
     }
 }

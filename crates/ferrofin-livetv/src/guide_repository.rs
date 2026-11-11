@@ -46,6 +46,7 @@ pub(crate) const PROGRAM_SELECT: &str = r#"SELECT p."Id",p."ChannelId",p."StartD
                       p."IsRepeat",p."IsPremiere",p."IsMovie",p."IsSeries",p."IsNews",p."IsKids",
                       p."IsSports",p."IsLive",p."ExternalId",p."ExternalSeriesId",
                       p."SeasonNumber",p."EpisodeNumber",p."DateCreated",p."ShowId",
+                      p."Etag",p."Audio",p."IsHD",p."OriginalAirDate",p."SeriesZap2It",
                       c."Name" AS "ChannelName",c."Number" AS "ChannelNumber",
                       c."ChannelType" AS "ChannelMediaKind"
                FROM "FerrofinLiveTvPrograms" p

@@ -106,6 +106,11 @@ pub struct XmltvProgramme {
     /// The text of the last `<episode-num>` whose `system` the reader understands
     /// (`xmltv_ns`, e.g. `0.5.` → S1E6, or `SxxExx`).
     pub episode_num: Option<String>,
+    /// `XmlTvProgram.ProgramId`: the last non-blank `<episode-num
+    /// system="dd_progid">` (`ParseEpisodeDataForProgramId`), which
+    /// `GetProgramInfo` takes as the airing's `ShowId`.
+    #[serde(default)]
+    pub program_id: Option<String>,
     /// `Episode.Series` — the 1-based season number from that `<episode-num>`.
     pub season_number: Option<i32>,
     /// `Episode.Episode` — the 1-based episode number from that `<episode-num>`.
@@ -1339,9 +1344,12 @@ fn apply_end(
         b"date" => p.year = text.get(0..4).and_then(|y| y.parse().ok()),
         // `XmlTvReader.ProcessEpisodeNum` dispatches on `system`; a later
         // element assigns only the parts it carries (a part that does not parse
-        // leaves the earlier value), and unknown systems (`onscreen`,
-        // `dd_progid`, …) are skipped.
+        // leaves the earlier value), `dd_progid` sets the programme id, and
+        // unknown systems (`onscreen`, …) are skipped.
         b"episode-num" if !text.is_empty() => {
+            if episode_system == Some("dd_progid") {
+                p.program_id = Some(text.to_owned());
+            }
             if let Some((season, episode)) = parse_episode_num(episode_system, text) {
                 p.episode_num = Some(text.to_owned());
                 if season.is_some() {
@@ -1453,8 +1461,9 @@ fn attr(e: &BytesStart<'_>, name: &[u8]) -> Option<String> {
 }
 
 /// Season and episode numbers from an `<episode-num>` of the given `system`,
-/// as `XmlTvReader.ProcessEpisodeNum` reads them; `None` when the system is one
-/// the reader skips (`onscreen`, `dd_progid`, an unknown one).
+/// as `XmlTvReader.ProcessEpisodeNum` reads them; `None` for a system that
+/// carries none (`dd_progid`, read as the programme id instead, `onscreen`, an
+/// unknown one).
 ///
 /// `xmltv_ns` is `S.E.P`, each part 0-based and optionally `n/total`, any part
 /// empty → 1-based numbers. `SxxExx` is the `s(\d+)e(\d+)` pattern anywhere in
@@ -1983,6 +1992,35 @@ mod episode_num_tests {
         #[case] expected: Option<(Option<i32>, Option<i32>)>,
     ) {
         assert_eq!(parse_episode_num(system, text), expected);
+    }
+
+    /// `ParseEpisodeDataForProgramId`: the last non-blank `dd_progid` is the
+    /// programme id; a blank one, and the other systems, leave it.
+    #[test]
+    fn the_last_non_blank_dd_progid_is_the_programme_id() {
+        let ids = |children: &str| {
+            let guide = parse_xmltv(&format!(
+                "<tv><programme start=\"20260725060000 +0000\" channel=\"x\"><title>T</title>{children}</programme></tv>"
+            ));
+            guide
+                .programmes
+                .into_iter()
+                .next()
+                .expect("one programme")
+                .program_id
+        };
+        assert_eq!(
+            ids(r#"<episode-num system="dd_progid">EP1.0001</episode-num>
+                   <episode-num system="dd_progid">EP2.0002</episode-num>
+                   <episode-num system="dd_progid">  </episode-num>
+                   <episode-num system="xmltv_ns">0.1.</episode-num>
+                   <episode-num system="onscreen">S1E2</episode-num>"#),
+            Some("EP2.0002".to_owned())
+        );
+        assert_eq!(
+            ids(r#"<episode-num system="onscreen">EP9</episode-num>"#),
+            None
+        );
     }
 
     #[test]

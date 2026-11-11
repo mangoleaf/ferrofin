@@ -404,13 +404,17 @@ const PROGRAM_UPSERT_CONFLICT: &str = r#" ON CONFLICT("Id") DO UPDATE SET
                     "IsSports"=excluded."IsSports","ExternalId"=excluded."ExternalId",
                     "IsLive"=excluded."IsLive","ExternalSeriesId"=excluded."ExternalSeriesId",
                     "SeasonNumber"=excluded."SeasonNumber","EpisodeNumber"=excluded."EpisodeNumber",
-                    "ShowId"=excluded."ShowId"
+                    "ShowId"=excluded."ShowId","Etag"=excluded."Etag",
+                    "Audio"=excluded."Audio","IsHD"=excluded."IsHD",
+                    "OriginalAirDate"=excluded."OriginalAirDate",
+                    "SeriesZap2It"=excluded."SeriesZap2It"
                 WHERE "DateCreated" IS NULL
                    OR ("ChannelId","StartDate","EndDate","Title","EpisodeTitle","Overview",
                        "Genres","ImageUrl","ProductionYear","EpisodeNum","IsNew","IsPremiere",
                        "IsRepeat","OfficialRating","IsMovie","IsSeries","IsNews","IsKids",
                        "IsSports","ExternalId","IsLive","ExternalSeriesId","SeasonNumber",
-                       "EpisodeNumber","ShowId")
+                       "EpisodeNumber","ShowId","Etag","Audio","IsHD","OriginalAirDate",
+                       "SeriesZap2It")
                IS NOT (excluded."ChannelId",excluded."StartDate",excluded."EndDate",
                        excluded."Title",excluded."EpisodeTitle",excluded."Overview",
                        excluded."Genres",excluded."ImageUrl",excluded."ProductionYear",
@@ -419,7 +423,9 @@ const PROGRAM_UPSERT_CONFLICT: &str = r#" ON CONFLICT("Id") DO UPDATE SET
                        excluded."IsSeries",excluded."IsNews",excluded."IsKids",
                        excluded."IsSports",excluded."ExternalId",excluded."IsLive",
                        excluded."ExternalSeriesId",excluded."SeasonNumber",
-                       excluded."EpisodeNumber",excluded."ShowId")"#;
+                       excluded."EpisodeNumber",excluded."ShowId",excluded."Etag",
+                       excluded."Audio",excluded."IsHD",excluded."OriginalAirDate",
+                       excluded."SeriesZap2It")"#;
 
 /// The on-disk locations the Live TV engine reads and writes.
 ///
@@ -798,6 +804,15 @@ fn sd_program_class(program: &SdProgram) -> ProgramClass {
 /// each with its end, for `PreCacheImages`.
 type RefreshedAirings = Vec<(Uuid, Option<DateTime<Utc>>)>;
 
+/// One channel's turn of the guide mirror's writes: the items to save, their
+/// values, the listings' images and the external ids.
+type ProgramWrites = (
+    Vec<BaseItemEntity>,
+    Vec<(Uuid, Vec<(i32, String)>)>,
+    Vec<(Uuid, ProgramImages)>,
+    Vec<(Uuid, Vec<(String, String)>)>,
+);
+
 /// A guide write's rows, built as the write draws them.
 ///
 /// Boxed so the iterator's closure types never reach the futures holding it
@@ -820,8 +835,26 @@ struct ProgramRow<'a> {
     genres: Option<String>,
     class: ProgramClass,
     fields: ProgramFields<'a>,
+    /// What the listing sets beyond the airing's own columns.
+    listing: ProgramListing,
     /// The listing's artwork, for the item mirror's `UpdateImages`.
     images: ProgramImages,
+}
+
+/// The `ProgramInfo` fields `GuideManager.GetProgram` stores that only one of
+/// the listings providers fills.
+#[derive(Debug, Clone, Default)]
+struct ProgramListing {
+    /// `Etag`: XMLTV's [`xmltv_etag`], or Schedules Direct's `md5`.
+    etag: Option<String>,
+    /// `Audio` (Schedules Direct), as its stored `ProgramAudio` number.
+    audio: Option<i32>,
+    /// `IsHD` (Schedules Direct).
+    is_hd: Option<bool>,
+    /// `OriginalAirDate` (Schedules Direct), as stored.
+    original_air_date: Option<String>,
+    /// `SeriesProviderIds["Zap2It"]` (Schedules Direct).
+    series_zap2it: Option<String>,
 }
 
 /// The rows one XMLTV airing becomes: one for each tuner channel that takes its
@@ -843,6 +876,11 @@ fn xmltv_program_rows<'a>(
         serde_json::to_string(&prog.categories).ok()
     };
     let class = classes.classify(prog);
+    // Computed by the provider, before `ListingsManager` suffixes the id.
+    let listing = ProgramListing {
+        etag: xmltv_etag(prog, &class),
+        ..ProgramListing::default()
+    };
     channels.iter().map(move |(channel_id, channel_external)| {
         // `ListingsManager.GetProgramsAsync` (v10.11.8
         // ListingsManager.cs:151-155) suffixes the provider's id with
@@ -868,6 +906,7 @@ fn xmltv_program_rows<'a>(
             genres: genres.clone(),
             class: class.clone(),
             fields: ProgramFields::of_xmltv(prog),
+            listing: listing.clone(),
             // `XmlTvListingsProvider.GetProgramInfo`'s `ImageUrl`,
             // `ThumbImageUrl` and `BackdropImageUrl`.
             images: ProgramImages {
@@ -876,6 +915,51 @@ fn xmltv_program_rows<'a>(
                 backdrop: prog.backdrop_image.clone(),
             },
         }
+    })
+}
+
+/// The airing's `ProgramInfo.Etag`, as `XmlTvListingsProvider.GetProgramInfoWithEtag`
+/// computes it over the fields `GetProgramInfo` fills (after its movie reset).
+fn xmltv_etag(prog: &XmltvProgramme, class: &ProgramClass) -> Option<String> {
+    fn non_empty(s: Option<&str>) -> Option<&str> {
+        s.filter(|s| !s.is_empty())
+    }
+    crate::xmltv_etag::xmltv_program_etag(&crate::xmltv_etag::EtagInput {
+        id: class.external_id.as_deref(),
+        channel_id: &prog.channel_id,
+        // shortcut: the parser keeps no title as "", which upstream's is null; an
+        // empty `<title></title>` hashes as null here, where upstream hashes "".
+        // gl-1631 ports the parser's text handling, which settles it.
+        name: non_empty(Some(&prog.title)),
+        official_rating: non_empty(prog.rating.as_deref()),
+        overview: prog.desc.as_deref(),
+        start: prog.start.map(|d| d.to_utc()),
+        end: prog.stop.map(|d| d.to_utc()),
+        genres: prog
+            .categories
+            .iter()
+            .map(String::as_str)
+            .filter(|c| !c.trim().is_empty())
+            .collect(),
+        is_repeat: class.is_repeat,
+        episode_title: class.episode_title.as_deref(),
+        image_url: non_empty(prog.icon.as_deref()),
+        thumb_image_url: non_empty(prog.still_image.as_deref()),
+        backdrop_image_url: non_empty(prog.backdrop_image.as_deref()),
+        is_movie: class.is_movie,
+        is_sports: class.is_sports,
+        // The provider's `Episode?.Episode is not null`, which the movie reset
+        // clears with the episode number.
+        is_series: class.episode_number.is_some(),
+        is_live: prog.is_live,
+        is_news: class.is_news,
+        is_kids: class.is_kids,
+        is_premiere: prog.is_premiere,
+        production_year: prog.year,
+        series_id: class.external_series_id.as_deref(),
+        show_id: Some(&class.show_id),
+        season_number: class.season_number,
+        episode_number: class.episode_number,
     })
 }
 
@@ -997,7 +1081,13 @@ impl CategoryClasses {
                 .to_string()
         });
         ProgramClass {
-            show_id: Self::show_id(prog, season_number, episode_number),
+            // `if (string.IsNullOrWhiteSpace(program.ProgramId)) { … md5 … } else
+            // { programInfo.ShowId = program.ProgramId; }`.
+            show_id: prog
+                .program_id
+                .clone()
+                .filter(|id| !id.trim().is_empty())
+                .unwrap_or_else(|| Self::show_id(prog, season_number, episode_number)),
             is_movie,
             is_series,
             is_news: Self::any_in(&self.news, &categories),
@@ -1971,6 +2061,10 @@ impl FerrofinLiveTvManager {
             .map(|(id, _)| *id)
             .collect();
         let indexed = crate::guide_repository::programs_with_tag_values(db, &tagged).await?;
+        // The programmes' external ids, which `GetProgram` replaces with the
+        // listing's when it saves one.
+        let stored_ids = store.persistence.provider_ids_for_items(&ids).await?;
+        let mut ids_to_write: Vec<(Uuid, Vec<(String, String)>)> = Vec::new();
         // Every airing as `CreateItems`/`UpdateItemsAsync` would save it, with
         // the row stored for it.
         let mut items: Vec<(BaseItemEntity, Option<&BaseItemEntity>)> = Vec::new();
@@ -1986,18 +2080,31 @@ impl FerrofinLiveTvManager {
         // their end.
         let mut written: HashSet<Uuid> = HashSet::new();
         let mut ends: HashMap<Uuid, Option<DateTime<Utc>>> = HashMap::new();
+        // The airings `GetProgram`'s fast path leaves as they are, images too.
+        let mut unchanged_ids: HashSet<Uuid> = HashSet::new();
         for row in rows {
             let fresh = program_entity(row, parse_dt, view_id);
             let id = Uuid::parse_str(&fresh.id).ok();
             let stored_row = id.and_then(|id| stored.get(&id));
+            let listed = crate::projection::program_provider_ids(row);
+            let current = id
+                .and_then(|id| stored_ids.get(&id))
+                .map_or(&[][..], Vec::as_slice);
+            // `GuideManager.cs:512-518`: an XMLTV airing whose etag equals the
+            // stored one returns before any field is assigned, so an editor's
+            // change to it stays.
+            let unchanged =
+                stored_row.is_some() && crate::projection::xmltv_etag_unchanged(current, &listed);
+            let unindexed = |prev: &BaseItemEntity| {
+                prev.tags.is_some() && id.is_some_and(|id| !indexed.contains(&id))
+            };
             // A new airing without genres or tags has no links to replace and
             // none to write.
             let values_changed = stored_row.map_or_else(
                 || fresh.genres.is_some() || fresh.tags.is_some(),
                 |prev| {
-                    prev.genres != fresh.genres
-                        || prev.tags != fresh.tags
-                        || (prev.tags.is_some() && id.is_some_and(|id| !indexed.contains(&id)))
+                    unindexed(prev)
+                        || (!unchanged && (prev.genres != fresh.genres || prev.tags != fresh.tags))
                 },
             );
             if let Some(id) = id {
@@ -2006,14 +2113,25 @@ impl FerrofinLiveTvManager {
             let item = match stored_row {
                 // `isNew` — `CreateItems` stores the item whole.
                 None => Some(fresh),
+                Some(_) if unchanged => None,
                 // `isUpdated` — only the fields the listing owns are assigned
                 // onto the STORED row, and it is written back only when one of
                 // them actually changed.
                 Some(prev) => program_item_update(prev, &fresh),
             };
             if let Some(id) = id {
+                if unchanged {
+                    unchanged_ids.insert(id);
+                }
                 if item.is_some() {
                     written.insert(id);
+                }
+                if crate::projection::program_provider_ids_replaced(
+                    current,
+                    &listed,
+                    item.is_some(),
+                ) {
+                    ids_to_write.push((id, listed));
                 }
                 // The merged row's values: an editor's studios stay linked.
                 if values_changed && let Some(saved) = item.as_ref().or(stored_row) {
@@ -2037,24 +2155,46 @@ impl FerrofinLiveTvManager {
             .map(|(item, _)| item)
             .collect();
         drop(stored);
-        for chunk in save.chunks(PROGRAM_ITEM_WRITE_CHUNK) {
-            store.persistence.save_items(chunk).await?;
-        }
-        drop(save);
-        for chunk in values_to_write.chunks(PROGRAM_ITEM_WRITE_CHUNK) {
-            store.persistence.save_item_values_for_items(chunk).await?;
-        }
-        // `UpdateImages`, for the airings the listings returned. An image
-        // change alone also makes the programme "updated" upstream.
+        // `UpdateImages`, for the airings the listings returned.
         let listed: Vec<(Uuid, ProgramImages)> = ids
             .iter()
             .filter_map(|id| listings.remove(id).map(|images| (*id, images)))
+            .filter(|(id, _)| !unchanged_ids.contains(id))
             .collect();
-        Self::sync_program_images(store, &listed, &mut written).await?;
+        let writes = (save, values_to_write, listed, ids_to_write);
+        Self::write_program_items(store, writes, &mut written).await?;
         Ok(written
             .into_iter()
             .map(|id| (id, ends.get(&id).copied().flatten()))
             .collect())
+    }
+
+    /// Writes one channel's turn of the programme mirror, in an order a failure
+    /// part-way can recover from: the items, their values, their images
+    /// (`UpdateImages`; an image change alone also makes the programme
+    /// "updated" upstream, so it joins `written`), and last their external ids.
+    /// A stored etag that matches sends the next refresh down `GetProgram`'s
+    /// fast path, which skips the images, so it lands after them.
+    async fn write_program_items(
+        store: &LiveTvItemStore,
+        (save, values, images, ids): ProgramWrites,
+        written: &mut HashSet<Uuid>,
+    ) -> Result<(), ServiceError> {
+        for chunk in save.chunks(PROGRAM_ITEM_WRITE_CHUNK) {
+            store.persistence.save_items(chunk).await?;
+        }
+        drop(save);
+        for chunk in values.chunks(PROGRAM_ITEM_WRITE_CHUNK) {
+            store.persistence.save_item_values_for_items(chunk).await?;
+        }
+        Self::sync_program_images(store, &images, written).await?;
+        for chunk in ids.chunks(PROGRAM_ITEM_WRITE_CHUNK) {
+            store
+                .persistence
+                .replace_provider_ids_for_items(chunk)
+                .await?;
+        }
+        Ok(())
     }
 
     /// `GuideManager.UpdateImages` over the airings in `listed`, writing the
@@ -2692,6 +2832,13 @@ impl FerrofinLiveTvManager {
                     serde_json::to_string(&program.genres).ok()
                 };
                 let class = sd_program_class(program);
+                let listing = ProgramListing {
+                    etag: program.etag.clone(),
+                    audio: Some(program.audio.json_value()),
+                    is_hd: Some(program.is_hd),
+                    original_air_date: program.original_air_date.map(datetime_to_db),
+                    series_zap2it: program.series_id.clone().filter(|id| !id.trim().is_empty()),
+                };
                 channels.iter().map(move |(channel_id, channel_external)| {
                     // `ListingsManager.GetProgramsAsync`: `program.Id += "_" + channel.Id`.
                     let external_id = format!("{}_{channel_external}", program.id);
@@ -2704,6 +2851,7 @@ impl FerrofinLiveTvManager {
                         genres: genres.clone(),
                         class: class.clone(),
                         fields: ProgramFields::of_schedules_direct(program),
+                        listing: listing.clone(),
                         // `SchedulesDirect.GetProgram`'s `ImageUrl` and
                         // `ThumbImageUrl`; it sets no backdrop.
                         images: ProgramImages {
@@ -2935,7 +3083,7 @@ impl FerrofinLiveTvManager {
 }
 
 /// The columns of one programme row in [`GuideWrite::upsert`]'s insert.
-const PROGRAM_COLUMNS: usize = 27;
+const PROGRAM_COLUMNS: usize = 32;
 
 /// The programme rows one insert statement carries: as many as fit under
 /// [`SQLITE_BIND_LIMIT`].
@@ -2986,7 +3134,8 @@ impl GuideWrite {
                     "Genres","ImageUrl","ProductionYear","EpisodeNum","IsNew","IsPremiere",
                     "IsRepeat","OfficialRating","IsMovie","IsSeries","IsNews","IsKids",
                     "IsSports","IsLive","ExternalId","ExternalSeriesId","SeasonNumber",
-                    "EpisodeNumber","DateCreated","ShowId") "#,
+                    "EpisodeNumber","DateCreated","ShowId","Etag","Audio","IsHD",
+                    "OriginalAirDate","SeriesZap2It") "#,
             );
             // Every row is stamped now; on a conflict the stored instant wins.
             let now = &self.now;
@@ -3020,7 +3169,12 @@ impl GuideWrite {
                     .push_bind(class.season_number)
                     .push_bind(class.episode_number)
                     .push_bind(now)
-                    .push_bind(&class.show_id);
+                    .push_bind(&class.show_id)
+                    .push_bind(&row.listing.etag)
+                    .push_bind(row.listing.audio)
+                    .push_bind(row.listing.is_hd.map(i32::from))
+                    .push_bind(&row.listing.original_air_date)
+                    .push_bind(&row.listing.series_zap2it);
             });
             qb.push(PROGRAM_UPSERT_CONFLICT);
             qb.build().execute(&mut *self.tx).await.map_err(db_err)?;
@@ -7626,12 +7780,9 @@ fn update_existing_timer_with_new_metadata(existing: &mut TimerInfoDto, updated:
 /// string for exactly the rows a movie series-rule looks at. The fallback covers
 /// rows written before the column existed, which no refresh has rewritten yet.
 ///
-/// The one knowing gap: upstream's `else` arm takes the listings' own
-/// `program.ProgramId` when the guide supplies one
-/// (`<episode-num system="dd_progid">`); Ferrofin's XMLTV reader does not
-/// capture that element yet, so the MD5 arm always runs. A guide carrying
-/// dd_progid would group differently — porting it means reading the element in
-/// [`crate::xmltv`] and carrying it into `CategoryClasses::show_id`.
+/// A guide's own programme id (`<episode-num system="dd_progid">`) is the
+/// value when it carries one, as upstream's `else` arm takes it
+/// (`ProgramClass::show_id`, gl-763).
 fn program_show_id(program: &GuideProgramRow) -> String {
     if let Some(stored) = program.show_id.as_deref().filter(|s| !s.is_empty()) {
         return stored.to_owned();
@@ -7878,6 +8029,7 @@ fn live_tv_service_key() -> &'static str {
 mod tests {
     mod channel_list;
     mod guide_mirror;
+    mod programme_listing;
     mod recording_folders;
     mod schedules_direct;
 
@@ -9861,8 +10013,24 @@ mod tests {
         row.custom_rating = Some("PG".to_owned());
         row.is_locked = true;
         persistence.save_items(&[row]).await.expect("editor write");
+        // A stale etag, so the refresh merges the listing onto the row rather
+        // than taking `GetProgram`'s fast path, which would leave it whole.
+        persistence
+            .save_provider_id(edited, "ProgramEtag", "xmltv-sha256-v1:STALE")
+            .await
+            .expect("stale etag");
 
         mgr.refresh_guide().await.expect("second refresh");
+        let etag = persistence
+            .provider_ids_for_items(&[edited])
+            .await
+            .expect("ids")
+            .remove(&edited)
+            .unwrap_or_default();
+        assert!(
+            etag.iter().all(|(_, value)| !value.ends_with("STALE")),
+            "the listing was merged: {etag:?}"
+        );
         let kept = channel_item(items, edited).await;
         assert_eq!(kept.custom_rating.as_deref(), Some("PG"));
         assert!(kept.is_locked);
@@ -9877,8 +10045,9 @@ mod tests {
     }
 
     /// Each airing's genres become its `ItemValues` links, written in the
-    /// batched form, and an airing whose stored list differs has its links
-    /// replaced by the listing's.
+    /// batched form. An edited list stays while the listing's XMLTV etag is the
+    /// stored one (`GetProgram`'s fast path, gl-763); once the listing is
+    /// processed again, its list replaces the stored one.
     #[tokio::test]
     async fn a_guide_refresh_links_each_airings_genres_and_replaces_a_changed_list() {
         let lab = program_item_lab().await;
@@ -9907,6 +10076,21 @@ mod tests {
             .expect("stale links");
 
         mgr.refresh_guide().await.expect("second refresh");
+        let links = crate::guide_repository::test_support::program_genre_links(&mgr.db)
+            .await
+            .expect("links");
+        assert_eq!(
+            links,
+            [(id.clone(), "Drama".to_owned())],
+            "the etag matched"
+        );
+
+        // A stored etag that no longer matches the listing's.
+        persistence
+            .save_provider_id(airing, "ProgramEtag", "xmltv-sha256-v1:STALE")
+            .await
+            .expect("stale etag");
+        mgr.refresh_guide().await.expect("third refresh");
         let links = crate::guide_repository::test_support::program_genre_links(&mgr.db)
             .await
             .expect("links");
@@ -14397,7 +14581,7 @@ mod tests {
                 })
                 .collect()
         };
-        assert_eq!(assigned.len(), 25, "{assigned:?}");
+        assert_eq!(assigned.len(), 30, "{assigned:?}");
         // Every other assignment copies its own column from the listing; the
         // one left over is `DateCreated`'s COALESCE.
         for name in &assigned {
