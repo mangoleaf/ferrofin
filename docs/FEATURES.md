@@ -1,6 +1,6 @@
 # Feature status
 
-**Parity: 69 / 412 operations deep-verified against Jellyfin v12.4** (`83d0d0e7f7`), plus
+**Parity: 70 / 412 operations deep-verified against Jellyfin v12.4** (`83d0d0e7f7`), plus
 14 compared against v12.2 and owed a re-check, 10 subsystem rows (as of 2026-11-11; the
 `contract_superset` test prints the current line).
 **Live parity:** the latest release's overview, how many of the requests jellyfin-web makes
