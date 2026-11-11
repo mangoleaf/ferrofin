@@ -571,6 +571,9 @@ struct DetailsResponse {
     /// it played (`TvShowMethods.CreditsAggregate`).
     #[serde(default)]
     aggregate_credits: Option<AggregateCreditsResponse>,
+    /// Series only: the show's creators (TMDbLib's `TvShow.CreatedBy`).
+    #[serde(default)]
+    created_by: Option<Vec<CreatedByEntry>>,
     #[serde(default)]
     release_dates: Option<ReleaseDatesResults>,
     #[serde(default)]
@@ -635,14 +638,14 @@ fn episode_people_from(
     for c in credits
         .crew
         .into_iter()
-        .filter(|c| crew_person_type(c.job.as_deref()).is_some())
+        .filter(|c| crew_person_type(c.department.as_deref(), c.job.as_deref()).is_some())
         .filter(|c| {
             !cfg.hide_missing_crew_members
                 || c.profile_path.as_deref().is_some_and(|p| !p.is_empty())
         })
         .take(cfg.max_crew_members)
     {
-        let Some(person_type) = crew_person_type(c.job.as_deref()) else {
+        let Some(person_type) = crew_person_type(c.department.as_deref(), c.job.as_deref()) else {
             continue;
         };
         if c.name.is_empty() {
@@ -775,6 +778,17 @@ struct CastRole {
     episode_count: i32,
 }
 
+/// One creator of a series (TMDbLib's `CreatedBy`).
+#[derive(Debug, Deserialize)]
+struct CreatedByEntry {
+    #[serde(default)]
+    id: i64,
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    profile_path: Option<String>,
+}
+
 /// `castQuery.OrderBy(a => a.Order)` after the settings page's
 /// `HideMissingCastMembers` filter, then `.Take(MaxCastMembers)`
 /// (`TmdbMovieProvider.cs:280-286`, `TmdbEpisodeProvider.cs:217-219,248-250`):
@@ -792,6 +806,8 @@ struct CrewEntry {
     id: i64,
     #[serde(default)]
     name: String,
+    #[serde(default)]
+    department: Option<String>,
     #[serde(default)]
     job: Option<String>,
     #[serde(default)]
@@ -882,14 +898,14 @@ fn crew_people(crew: Vec<CrewEntry>, cfg: &crate::plugin_config::TmdbConfig) -> 
     let mut people = Vec::new();
     for c in crew
         .into_iter()
-        .filter(|c| crew_person_type(c.job.as_deref()).is_some())
+        .filter(|c| crew_person_type(c.department.as_deref(), c.job.as_deref()).is_some())
         .filter(|c| {
             !cfg.hide_missing_crew_members
                 || c.profile_path.as_deref().is_some_and(|p| !p.is_empty())
         })
         .take(cfg.max_crew_members)
     {
-        let Some(person_type) = crew_person_type(c.job.as_deref()) else {
+        let Some(person_type) = crew_person_type(c.department.as_deref(), c.job.as_deref()) else {
             continue;
         };
         if c.name.is_empty() {
@@ -910,13 +926,16 @@ fn crew_people(crew: Vec<CrewEntry>, cfg: &crate::plugin_config::TmdbConfig) -> 
     people
 }
 
-/// `TmdbSeriesProvider.GetPersons` (v12.2, jellyfin/jellyfin#17716): the
-/// whole run's cast from `aggregate_credits` when TMDB has one
-/// ([`map_aggregate_cast`]), otherwise the latest season's flat
-/// `credits.cast` ([`map_cast`]); the crew always from the flat credits.
+/// `TmdbSeriesProvider.GetPersons` (v12.4): the whole run's cast from
+/// `aggregate_credits` when TMDB has one ([`map_aggregate_cast`]), otherwise
+/// the latest season's flat `credits.cast` ([`map_cast`],
+/// jellyfin/jellyfin#17716); the crew always from the flat credits; then
+/// every `created_by` entry as a `Creator`, outside the cast and crew caps
+/// (jellyfin/jellyfin#17107).
 fn series_people(
     aggregate: Option<AggregateCreditsResponse>,
     credits: Option<CreditsResponse>,
+    created_by: Option<Vec<CreatedByEntry>>,
     cfg: &crate::plugin_config::TmdbConfig,
 ) -> Vec<TmdbPerson> {
     let aggregate = aggregate.map(|a| a.cast).unwrap_or_default();
@@ -927,6 +946,28 @@ fn series_people(
         map_aggregate_cast(aggregate, cfg)
     };
     people.extend(crew_people(crew, cfg));
+    for creator in created_by.unwrap_or_default() {
+        let Some(name) = creator
+            .name
+            .as_deref()
+            .map(str::trim)
+            .filter(|n| !n.is_empty())
+        else {
+            continue;
+        };
+        people.push(TmdbPerson {
+            // An id of 0 is dropped where the credit is stored, as for cast and crew.
+            tmdb_id: creator.id,
+            name: name.to_owned(),
+            person_type: "Creator".to_owned(),
+            role: None,
+            sort_order: None,
+            profile_url: creator
+                .profile_path
+                .filter(|p| !p.is_empty())
+                .map(|p| cfg.image_url(crate::plugin_config::TmdbImageKind::Profile, &p)),
+        });
+    }
     people
 }
 
@@ -1033,13 +1074,17 @@ fn cast_credit(
     }
 }
 
-/// Maps a TMDB crew `job` to the Jellyfin person type Ferrofin surfaces, or `None`
-/// to skip the credit.
-fn crew_person_type(job: Option<&str>) -> Option<&'static str> {
-    match job? {
-        "Director" => Some("Director"),
-        "Writer" | "Screenplay" | "Author" | "Novel" => Some("Writer"),
-        "Producer" | "Executive Producer" => Some("Producer"),
+/// `TmdbUtils.MapCrewToPersonType` (v12.4): a crew credit's Jellyfin person
+/// type from its department and job, ignoring case, or `None` for every
+/// credit upstream drops (its `WantedCrewKinds` are these three).
+fn crew_person_type(department: Option<&str>, job: Option<&str>) -> Option<&'static str> {
+    match (
+        department?.to_ascii_lowercase().as_str(),
+        job?.to_ascii_lowercase().as_str(),
+    ) {
+        ("directing", "director") => Some("Director"),
+        ("production", "producer") => Some("Producer"),
+        ("writing", "writer" | "screenplay" | "novel") => Some("Writer"),
         _ => None,
     }
 }
@@ -2387,7 +2432,7 @@ impl TmdbClient {
             .or(d.first_air_date)
             .filter(|s| !s.is_empty());
         let people = if kind == TmdbKind::Series {
-            series_people(d.aggregate_credits, d.credits, cfg)
+            series_people(d.aggregate_credits, d.credits, d.created_by, cfg)
         } else {
             credits_to_people(d.credits, cfg)
         };
@@ -3628,7 +3673,7 @@ mod tests {
             format!(
                 r#"{{"name": "Show",
                     "credits": {{"cast": [{{"id": 9, "name": "Latest Season", "character": "Now", "order": 0}}],
-                                "crew": [{{"id": 7, "name": "Showrunner", "job": "Director"}}]}},
+                                "crew": [{{"id": 7, "name": "Showrunner", "department": "Directing", "job": "Director"}}]}},
                     "aggregate_credits": {{"cast": {aggregate}}}}}"#
             )
         };
@@ -3662,6 +3707,77 @@ mod tests {
             "Latest Season",
             "a movie has no aggregate cast"
         );
+    }
+
+    /// `TmdbSeriesProvider.GetPersons` (v12.4, jellyfin/jellyfin#17107): every
+    /// `created_by` entry follows the cast and crew as a `Creator`, its name
+    /// trimmed and a blank one skipped, outside the cast and crew caps. A
+    /// movie has no creators.
+    #[test]
+    fn a_series_credits_its_creators_after_the_cast_and_crew() {
+        let json = r#"{"name": "Show",
+            "credits": {"cast": [{"id": 9, "name": "Lead", "character": "Hero", "order": 0}],
+                        "crew": [{"id": 7, "name": "Showrunner", "department": "Directing", "job": "Director"}]},
+            "created_by": [
+                {"id": 11, "name": " Vince Gilligan ", "profile_path": "/vg.jpg"},
+                {"id": 0, "name": "No Id", "profile_path": ""},
+                {"id": 12, "name": "   "},
+                {"id": 13, "name": null}
+            ]}"#;
+        let people = |kind, cfg: &crate::plugin_config::TmdbConfig| -> Vec<TmdbPerson> {
+            let d: DetailsResponse = serde_json::from_str(json).expect("details");
+            TmdbClient::details_from_response(d, kind, cfg, None).people
+        };
+        let rows = |people: &[TmdbPerson]| -> Vec<(String, String, i64)> {
+            people
+                .iter()
+                .map(|p| (p.name.clone(), p.person_type.clone(), p.tmdb_id))
+                .collect()
+        };
+        let creators = [
+            ("Vince Gilligan".to_owned(), "Creator".to_owned(), 11),
+            ("No Id".to_owned(), "Creator".to_owned(), 0),
+        ];
+        let series = people(TmdbKind::Series, &cast_config(10));
+        assert_eq!(
+            rows(&series),
+            [
+                ("Lead".to_owned(), "Actor".to_owned(), 9),
+                ("Showrunner".to_owned(), "Director".to_owned(), 7),
+                creators[0].clone(),
+                creators[1].clone(),
+            ]
+        );
+        assert!(
+            series[2]
+                .profile_url
+                .as_deref()
+                .is_some_and(|u| u.ends_with("/vg.jpg"))
+        );
+        assert_eq!(series[3].profile_url, None);
+        assert_eq!((series[2].role.clone(), series[2].sort_order), (None, None));
+        let capped = crate::plugin_config::TmdbConfig {
+            max_crew_members: 0,
+            hide_missing_cast_members: true,
+            hide_missing_crew_members: true,
+            ..cast_config(0)
+        };
+        assert_eq!(
+            rows(&people(TmdbKind::Series, &capped)),
+            creators,
+            "the cast and crew caps leave the creators alone"
+        );
+        assert!(
+            people(TmdbKind::Movie, &cast_config(10))
+                .iter()
+                .all(|p| p.person_type != "Creator"),
+            "a movie has no creators"
+        );
+        let d: DetailsResponse =
+            serde_json::from_str(r#"{"name": "Show", "created_by": null}"#).expect("null creators");
+        let people =
+            TmdbClient::details_from_response(d, TmdbKind::Series, &cast_config(10), None).people;
+        assert!(people.is_empty(), "{people:?}");
     }
 
     /// `Role = actor.Character?.Trim() ?? string.Empty` (v12.2
@@ -3710,10 +3826,10 @@ mod tests {
             {"id": 3, "name": "Guest Star", "character": "Villain", "profile_path": "/g.jpg", "order": 520}
           ],
           "crew": [
-            {"id": 4, "name": "Ep Director", "job": "Director"},
-            {"id": 5, "name": "Ep Writer", "job": "Screenplay"},
-            {"id": 6, "name": "Best Boy", "job": "Best Boy"},
-            {"id": 7, "name": "", "job": "Director"}
+            {"id": 4, "name": "Ep Director", "department": "Directing", "job": "Director"},
+            {"id": 5, "name": "Ep Writer", "department": "Writing", "job": "Screenplay"},
+            {"id": 6, "name": "Best Boy", "department": "Lighting", "job": "Best Boy"},
+            {"id": 7, "name": "", "department": "Directing", "job": "Director"}
           ]
         }"#;
         let server =
@@ -3759,16 +3875,77 @@ mod tests {
         assert_eq!(people[1].profile_url, None);
     }
 
+    /// `TmdbUtils.MapCrewToPersonType` (v12.4) keys on the department AND
+    /// the job, ignoring case: executive producers and authors are dropped,
+    /// and so is a wanted job filed under another department.
     #[test]
-    fn crew_jobs_map_to_person_types() {
-        assert_eq!(crew_person_type(Some("Director")), Some("Director"));
-        assert_eq!(crew_person_type(Some("Screenplay")), Some("Writer"));
+    fn crew_credits_keep_only_upstreams_department_and_job_pairs() {
+        let json = r#"{"crew": [
+            {"id": 1, "name": "Exec", "department": "Production", "job": "Executive Producer"},
+            {"id": 2, "name": "Author", "department": "Writing", "job": "Author"},
+            {"id": 3, "name": "Misfiled", "department": "Crew", "job": "Director"},
+            {"id": 4, "name": "Lower", "department": "directing", "job": "director"},
+            {"id": 5, "name": "Novelist", "department": "Writing", "job": "Novel"},
+            {"id": 6, "name": "Prod", "department": "Production", "job": "Producer"}
+        ]}"#;
+        let cfg = crate::plugin_config::TmdbConfig::default();
+        let kinds = |people: Vec<TmdbPerson>| -> Vec<(String, String)> {
+            people
+                .into_iter()
+                .map(|p| (p.name, p.person_type))
+                .collect()
+        };
+        let expected = [
+            ("Lower".to_owned(), "Director".to_owned()),
+            ("Novelist".to_owned(), "Writer".to_owned()),
+            ("Prod".to_owned(), "Producer".to_owned()),
+        ];
         assert_eq!(
-            crew_person_type(Some("Executive Producer")),
-            Some("Producer")
+            kinds(credits_to_people(serde_json::from_str(json).ok(), &cfg)),
+            expected
         );
-        assert_eq!(crew_person_type(Some("Gaffer")), None);
-        assert_eq!(crew_person_type(None), None);
+        assert_eq!(
+            kinds(episode_people_from(
+                serde_json::from_str(json).expect("credits"),
+                &cfg
+            )),
+            expected
+        );
+        // The `MaxCrewMembers` cap counts only the kept crew, so a dropped
+        // executive producer no longer takes the director's slot.
+        let one = crate::plugin_config::TmdbConfig {
+            max_crew_members: 1,
+            ..cfg
+        };
+        assert_eq!(
+            kinds(credits_to_people(serde_json::from_str(json).ok(), &one)),
+            expected[..1]
+        );
+    }
+
+    /// `TmdbUtils.MapCrewToPersonType` (v12.4); upstream ships no
+    /// `[InlineData]` for it, so the cases follow the rule itself.
+    #[rstest::rstest]
+    #[case(Some("Directing"), Some("Director"), Some("Director"))]
+    #[case(Some("DIRECTING"), Some("director"), Some("Director"))]
+    #[case(Some("Production"), Some("Producer"), Some("Producer"))]
+    #[case(Some("Writing"), Some("Writer"), Some("Writer"))]
+    #[case(Some("Writing"), Some("Screenplay"), Some("Writer"))]
+    #[case(Some("writing"), Some("NOVEL"), Some("Writer"))]
+    #[case(Some("Production"), Some("Executive Producer"), None)]
+    #[case(Some("Writing"), Some("Author"), None)]
+    #[case(Some("Writing"), Some("Story"), None)]
+    #[case(Some("Crew"), Some("Director"), None)]
+    #[case(Some("Directing"), Some("Producer"), None)]
+    #[case(Some("Camera"), Some("Gaffer"), None)]
+    #[case(None, Some("Director"), None)]
+    #[case(Some("Directing"), None, None)]
+    fn crew_department_and_job_map_to_person_types(
+        #[case] department: Option<&str>,
+        #[case] job: Option<&str>,
+        #[case] expected: Option<&str>,
+    ) {
+        assert_eq!(crew_person_type(department, job), expected);
     }
 
     #[test]

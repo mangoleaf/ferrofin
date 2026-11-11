@@ -31301,8 +31301,8 @@ mod tests {
             {"id": 3, "name": "Jason Momoa", "character": "Khal Drogo"}
         ],
         "crew": [
-            {"id": 4, "name": "Tim Van Patten", "job": "Director"},
-            {"id": 5, "name": "A Gaffer", "job": "Gaffer"}
+            {"id": 4, "name": "Tim Van Patten", "department": "Directing", "job": "Director"},
+            {"id": 5, "name": "A Gaffer", "department": "Lighting", "job": "Gaffer"}
         ]
     }"#;
 
