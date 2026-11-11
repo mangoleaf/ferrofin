@@ -1910,6 +1910,29 @@ async fn await_subtitle_refresh(api: &Api, library: &Value, id: &str) {
     }
 }
 
+/// Waits until nothing scans `library` or is queued to. A refresh shows `Active`
+/// from before it lists the item's folders until after it saves, so by then
+/// every refresh that listed them before the caller's last write has saved.
+async fn await_library_idle(api: &Api, library: &Value) {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let folders = api.get("/Library/VirtualFolders").await;
+        if folders
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|folder| &folder["ItemId"] == library && folder["RefreshStatus"] == "Idle")
+        {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "library refresh did not finish: {folders}"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+}
+
 #[allow(clippy::too_many_lines, clippy::too_many_arguments)]
 async fn verify_automatic_subtitle_constraints(
     api: &Api,
@@ -2199,13 +2222,16 @@ async fn verify_subtitle_destinations(
     assert_eq!(std::fs::read(&path).unwrap(), CONTENT);
     expected_paths.push(path);
     // Each upload records its stream and queues a refresh of the item. A refresh
-    // an earlier upload queued can still be running, listing the folder from
-    // before the newest sidecar, and save the set without it; the refresh queued
-    // behind it (the running scan is never joined) re-lists the folder and saves
-    // it again. So wait for the set to settle rather than read it mid-way
-    // (gl-1408); a stream that never comes back still fails below.
+    // an earlier upload queued can still be running: it listed the folders
+    // before the newest sidecars, reads the stored rows after them, and saves
+    // its older set over them (gl-1408, gl-1527); the refresh queued behind it
+    // (the running scan is never joined) re-lists the folders and saves them
+    // again. A matching set can be the uploads' own rows just before such a
+    // save, so read it only once the library is idle, and keep reading until
+    // it has settled; a stream that never comes back still fails below.
     let deadline = Instant::now() + Duration::from_secs(30);
     let item = loop {
+        await_library_idle(api, library).await;
         let item = api.get(&format!("/Items/{id}?Fields=MediaStreams")).await;
         let streams: Vec<_> = item["MediaStreams"]
             .as_array()
@@ -2279,6 +2305,9 @@ async fn verify_subtitle_destinations(
             .unwrap();
         assert_eq!(response.status(), reqwest::StatusCode::BAD_REQUEST);
     }
+    // Counted once no refresh is left running either, so the count is the set
+    // the refreshes leave rather than one read in the middle of a save.
+    await_library_idle(api, library).await;
     let item = api.get(&format!("/Items/{id}?Fields=MediaStreams")).await;
     assert_eq!(
         item["MediaStreams"]
