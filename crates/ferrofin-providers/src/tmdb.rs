@@ -4054,90 +4054,40 @@ mod tests {
         assert_eq!(ep2.still_url, None);
     }
 
-    // ---- clean_name / find_best_match (TmdbUtils ports) ----
+    // ---- clean_name / normalize_title / find_best_match ----
+    // Transliterated from Jellyfin v12.4 `TmdbUtilsTests`; the C# expected
+    // values are the oracle.
 
-    #[test]
-    fn clean_name_strips_punctuation() {
-        assert_eq!(super::clean_name("Show: The Subtitle"), "Show The Subtitle");
-        assert_eq!(super::clean_name("WALL·E"), "WALL·E");
-        assert_eq!(super::clean_name("[HEVC] Show (2026)"), "HEVC Show 2026");
-        assert_eq!(super::clean_name("  hello  "), "hello");
+    #[rstest::rstest]
+    #[case("The Amityville Horror", "The Amityville Horror")]
+    #[case("WALL-E", "WALL E")]
+    // The interpunct is kept, it matches the TMDb title better than a space does.
+    #[case("WALL·E", "WALL·E")]
+    #[case("50-50", "50 50")]
+    #[case("A Christmas No. 1", "A Christmas No 1")]
+    // Vulgar fractions are numbers, dropping them turned "8½" into a search for "8".
+    #[case("8½", "8½")]
+    #[case("9½ Weeks", "9½ Weeks")]
+    #[case("  Léon: The Professional  ", "Léon The Professional")]
+    fn clean_name_matches_tmdb_utils(#[case] name: &str, #[case] expected: &str) {
+        assert_eq!(super::clean_name(name), expected);
     }
 
-    fn hit(name: &str, year: Option<i32>) -> TmdbSearchHit {
-        TmdbSearchHit {
-            tmdb_id: 0,
-            name: Some(name.to_owned()),
-            original_name: None,
-            year,
-            premiere_date: None,
-            poster_url: None,
-            overview: None,
-        }
+    #[rstest::rstest]
+    #[case(Some("WALL-E"), "wall e")]
+    #[case(Some("WALL·E"), "wall e")]
+    #[case(Some("WALL E"), "wall e")]
+    #[case(Some("8½"), "8½")]
+    #[case(Some("Ocean's Eleven"), "ocean s eleven")]
+    // C# takes a null title; a `&str` cannot be null, so it is the empty string.
+    #[case(None, "")]
+    #[case(Some("   "), "")]
+    fn normalize_title_matches_tmdb_utils(#[case] title: Option<&str>, #[case] expected: &str) {
+        assert_eq!(super::normalize_title(title.unwrap_or_default()), expected);
     }
 
-    #[test]
-    fn find_best_match_prefers_exact_title_and_year() {
-        let mut a = hit("Mulan", Some(1998));
-        a.tmdb_id = 1;
-        let mut b = hit("Mulan", Some(2020));
-        b.tmdb_id = 2;
-        let results = vec![a, b];
-        let best = super::find_best_match(&results, "Mulan", Some(2020)).unwrap();
-        assert_eq!(best.tmdb_id, 2);
-    }
-
-    #[test]
-    fn find_best_match_title_outranks_year() {
-        let mut wrong_title = hit("Something Else", Some(2026));
-        wrong_title.tmdb_id = 1;
-        let mut right_title = hit("The Show", Some(2024));
-        right_title.tmdb_id = 2;
-        let results = vec![wrong_title, right_title];
-        let best = super::find_best_match(&results, "The Show", Some(2026)).unwrap();
-        assert_eq!(best.tmdb_id, 2);
-    }
-
-    #[test]
-    fn find_best_match_adjacent_year_scores() {
-        let mut a = hit("Show", Some(2025));
-        a.tmdb_id = 1;
-        let mut b = hit("Show", Some(2020));
-        b.tmdb_id = 2;
-        let results = vec![b, a];
-        let best = super::find_best_match(&results, "Show", Some(2026)).unwrap();
-        assert_eq!(best.tmdb_id, 1);
-    }
-
-    #[test]
-    fn find_best_match_falls_back_to_first_on_no_match() {
-        let mut a = hit("Unrelated", Some(1990));
-        a.tmdb_id = 1;
-        let mut b = hit("Also Unrelated", Some(1995));
-        b.tmdb_id = 2;
-        let results = vec![a, b];
-        let best = super::find_best_match(&results, "My Show", Some(2026)).unwrap();
-        assert_eq!(best.tmdb_id, 1);
-    }
-
-    #[test]
-    fn find_best_match_uses_original_name() {
-        let mut a = hit("Wrong", Some(2026));
-        a.tmdb_id = 1;
-        let mut b = hit("Also Wrong", Some(2026));
-        b.tmdb_id = 2;
-        b.original_name = Some("The Real Title".to_owned());
-        let results = vec![a, b];
-        let best = super::find_best_match(&results, "The Real Title", Some(2026)).unwrap();
-        assert_eq!(best.tmdb_id, 2);
-    }
-
-    #[test]
-    fn find_best_match_empty_returns_none() {
-        assert!(super::find_best_match(&[], "Show", Some(2026)).is_none());
-    }
-
-    /// Upstream's `Movie(id, title, originalTitle, year)` test helper.
+    /// Upstream's `Movie(id, title, originalTitle, year)` test helper. Series
+    /// results are `TmdbSearchHit`s too, so it stands for `Series(…)` as well.
     fn movie(tmdb_id: i64, title: &str, original_title: &str, year: i32) -> TmdbSearchHit {
         TmdbSearchHit {
             tmdb_id,
@@ -4150,15 +4100,79 @@ mod tests {
         }
     }
 
-    // Rows of `TmdbUtilsTests.FindBestMatch_Movies_TestData` (Jellyfin v12.4),
-    // added by jellyfin/jellyfin#18343 in v12.3.
+    // `FindBestMatch_Movies_TestData`. Upstream's year 0 ("unknown") is `None`.
     #[rstest::rstest]
+    // TMDb's year parameter does not filter, so the remake and the original
+    // both come back and the wrong one is first. Results are in the order the
+    // live API returned them.
+    #[case::mulan_2020(
+        "Mulan",
+        Some(2020),
+        &[movie(10_674, "Mulan", "Mulan", 1998), movie(337_401, "Mulan", "Mulan", 2020), movie(752_662, "Hua Mulan", "花木兰", 2020)],
+        337_401
+    )]
+    #[case::mulan_1998(
+        "Mulan",
+        Some(1998),
+        &[movie(10_674, "Mulan", "Mulan", 1998), movie(337_401, "Mulan", "Mulan", 2020), movie(752_662, "Hua Mulan", "花木兰", 2020)],
+        10_674
+    )]
+    #[case::aladdin_2019(
+        "Aladdin",
+        Some(2019),
+        &[movie(812, "Aladdin", "Aladdin", 1992), movie(420_817, "Aladdin", "Aladdin", 2019), movie(602_411, "Adventures of Aladdin", "Adventures of Aladdin", 2019)],
+        420_817
+    )]
+    #[case::the_lion_king_2019(
+        "The Lion King",
+        Some(2019),
+        &[movie(8587, "The Lion King", "The Lion King", 1994), movie(420_818, "The Lion King", "The Lion King", 2019)],
+        420_818
+    )]
+    #[case::the_amityville_horror_1979(
+        "The Amityville Horror",
+        Some(1979),
+        &[movie(10_065, "The Amityville Horror", "The Amityville Horror", 2005), movie(11_449, "The Amityville Horror", "The Amityville Horror", 1979)],
+        11_449
+    )]
+    // A featurette outranks the film it belongs to. The interpunct must not
+    // stop "WALL-E" from matching "WALL·E", or the prefix match on the
+    // featurette wins.
+    #[case::wall_e_2008(
+        "WALL-E",
+        Some(2008),
+        &[movie(877_268, "WALL·E's Treasures & Trinkets", "WALL·E's Treasures & Trinkets", 2008), movie(10_681, "WALL·E", "WALL·E", 2008), movie(10_673, "Wall Street", "Wall Street", 1987)],
+        10_681
+    )]
+    // The name only survives as "8" if the fraction is stripped, and then
+    // every 1963 result ties.
+    #[case::eight_and_a_half_1963(
+        "8½",
+        Some(1963),
+        &[movie(422_801, "Interpol Code 8", "国際秘密警察　指令第８号", 1963), movie(520_251, "Um 8 Uhr kommt Sadowski", "Um 8 Uhr kommt Sadowski", 1963), movie(422, "8½", "8½", 1963)],
+        422
+    )]
+    // Matched on the original title, the localized one is unrecognizable.
+    #[case::original_title_1966(
+        "Ściany mają uszy",
+        Some(1966),
+        &[movie(1, "Something Else", "Something Else", 1966), movie(2, "Walls Have Ears", "Ściany mają uszy", 1966)],
+        2
+    )]
+    // Regional release dates straddle the new year, so a year that is off by
+    // one still matches.
+    #[case::off_by_one_year(
+        "Some Movie",
+        Some(2011),
+        &[movie(1, "Some Movie", "Some Movie", 2015), movie(2, "Some Movie", "Some Movie", 2010)],
+        2
+    )]
     // M. Night Shyamalan's Split premiered at a festival in 2016 and was
     // released in 2017, so the obscure 2016 film of the same name must not
     // outrank it. Years one apart tie and TMDb's own ordering decides.
     #[case::split_2016(
         "Split",
-        2016,
+        Some(2016),
         &[movie(381_288, "Split", "Split", 2017), movie(358_364, "Split", "Split", 2016)],
         381_288
     )]
@@ -4166,17 +4180,77 @@ mod tests {
     // by one.
     #[case::two_years_apart(
         "Some Movie",
-        2016,
+        Some(2016),
         &[movie(1, "Some Movie", "Some Movie", 2018), movie(2, "Some Movie", "Some Movie", 2016)],
         2
     )]
+    // Nothing matches the name, so TMDb's own ordering is kept.
+    #[case::a_christmas_no_1_2021(
+        "A Christmas No. 1",
+        Some(2021),
+        &[movie(878_111, "A Christmas Number One", "A Christmas Number One", 2021), movie(2, "Ten Hours for Christmas", "10 Horas para o Natal", 2021)],
+        878_111
+    )]
+    // A title that matches always beats one that only shares the year.
+    #[case::title_outranks_year(
+        "Some Movie",
+        Some(2020),
+        &[movie(1, "A Different Movie", "A Different Movie", 2020), movie(2, "Some Movie", "Some Movie", 1994)],
+        2
+    )]
+    // Without a year the title alone decides, and equally good titles keep
+    // TMDb's order.
+    #[case::no_year_known(
+        "Mulan",
+        None,
+        &[movie(10_674, "Mulan", "Mulan", 1998), movie(337_401, "Mulan", "Mulan", 2020)],
+        10_674
+    )]
+    // An unparsable name must not throw or reorder anything.
+    #[case::empty_name(
+        "  ",
+        Some(2020),
+        &[movie(1, "Some Movie", "Some Movie", 1994), movie(2, "Some Movie", "Some Movie", 2020)],
+        1
+    )]
     fn find_best_match_movies(
         #[case] name: &str,
-        #[case] year: i32,
+        #[case] year: Option<i32>,
         #[case] results: &[TmdbSearchHit],
         #[case] expected: i64,
     ) {
-        let best = super::find_best_match(results, name, Some(year)).map(|hit| hit.tmdb_id);
+        let best = super::find_best_match(results, name, year).map(|hit| hit.tmdb_id);
         assert_eq!(best, Some(expected));
+    }
+
+    #[test]
+    fn find_best_match_series_picks_matching_first_air_year() {
+        let results = [
+            movie(10_042, "Doc", "Doc", 2001),
+            movie(101_048, "Doc", "Doc", 2020),
+            movie(255_055, "Doc", "Doc", 2025),
+            movie(2430, "Doc Martin", "Doc Martin", 2004),
+        ];
+        let best = super::find_best_match(&results, "Doc", Some(2025)).map(|hit| hit.tmdb_id);
+        assert_eq!(best, Some(255_055));
+    }
+
+    // Upstream's null result lists have no Rust form: a slice cannot be null.
+    #[test]
+    fn find_best_match_no_results_returns_none() {
+        assert!(super::find_best_match(&[], "Mulan", Some(2020)).is_none());
+        assert!(super::find_best_match(&[], "Doc", Some(2025)).is_none());
+    }
+
+    // Not an upstream row: every upstream row scores some result above 0, so
+    // none reaches the all-zero fallback to TMDb's first result.
+    #[test]
+    fn find_best_match_keeps_the_first_result_when_nothing_scores() {
+        let results = [
+            movie(1, "Unrelated", "Unrelated", 1990),
+            movie(2, "Also Unrelated", "Also Unrelated", 1995),
+        ];
+        let best = super::find_best_match(&results, "My Show", Some(2026)).map(|hit| hit.tmdb_id);
+        assert_eq!(best, Some(1));
     }
 }
