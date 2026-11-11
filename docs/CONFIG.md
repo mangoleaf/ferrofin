@@ -457,7 +457,8 @@ Jellyfin's shared keys. The settings below are optional overrides or additions.
 TMDB's `TmdbApiKey` plugin setting overrides its shared key. OpenSubtitles uses
 Jellyfin's shared application key with the username/password configured in its
 plugin settings; its `ApiKey` field is an optional override. The shared key does
-not replace the account needed for subtitle downloads.
+not replace the account needed for subtitle downloads and for the subtitle
+searches a scan or the scheduled task makes.
 
 ## Extensions
 

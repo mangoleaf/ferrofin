@@ -49,10 +49,16 @@ async fn provider(
             )
                 .into_response();
         }
+        "/infos/languages" => {
+            let codes = ["en", "fr", "es", "pt-PT", "de"].map(|code| json!({"language_code":code}));
+            return Json(json!({"data":codes})).into_response();
+        }
         "/subtitles" => {
-            return Json(
-                json!({"data":[{"attributes":{"moviehash_match":false,"files":[{"file_id":42}]}}]}),
-            )
+            return Json(json!({"total_pages":1,"page":1,"data":[{"attributes":{
+                "moviehash_match":false,
+                "feature_details":{"feature_type":"Movie","imdb_id":133_093},
+                "files":[{"file_id":42}]
+            }}]}))
             .into_response();
         }
         _ => {}
@@ -1987,7 +1993,7 @@ async fn verify_automatic_subtitle_constraints(
             .iter()
             .any(|uri| uri.starts_with("/subtitles?")
                 && uri.contains("moviehash_match=only")
-                && uri.contains("imdb_id=0133093"))
+                && uri.contains("imdb_id=133093"))
     );
     assert!(
         !requests
@@ -2016,7 +2022,7 @@ async fn verify_automatic_subtitle_constraints(
             .iter()
             .any(|uri| uri.starts_with("/subtitles?")
                 && !uri.contains("moviehash_match=only")
-                && uri.contains("imdb_id=0133093"))
+                && uri.contains("imdb_id=133093"))
     );
 
     // Manual search candidates carry the upstream MD5 provider namespace, which
