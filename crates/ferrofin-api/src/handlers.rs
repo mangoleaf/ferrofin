@@ -939,7 +939,9 @@ pub const VERIFIED_SUBSYSTEMS_AGAINST_EARLIER_PIN: &[(&str, &str)] = &[];
 /// share; `recording-postprocessing` is the executable run after a retained
 /// DVR capture, which no HTTP response describes; `recording-keep-up-to` is
 /// which of a series timer's recordings a starting capture deletes past its
-/// "Keep up to", which no HTTP response describes either.
+/// "Keep up to", and `direct-recording` how the DVR copies an unshared tuner
+/// URL and how that copy's end settles the timer (completed, or failed and
+/// retried), which no HTTP response describes either.
 pub const SUBSYSTEM_KEYS: &[&str] = &[
     "query-translation",
     "dto-fields",
@@ -955,6 +957,7 @@ pub const SUBSYSTEM_KEYS: &[&str] = &[
     "video-stream-copy",
     "recording-postprocessing",
     "recording-keep-up-to",
+    "direct-recording",
 ];
 
 /// One shared subsystem whose Ferrofin implementation was compared against the
@@ -1036,6 +1039,36 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
             "Argument values are not logged because a configured template can contain secrets.",
             "After a configured processor exits, refresh the recording again so changed codecs \
              and duration are discovered even when its library has no filesystem watcher.",
+        ],
+    },
+    VerifiedSubsystem {
+        key: "direct-recording",
+        upstream_file: "src/Jellyfin.LiveTv/IO/DirectRecorder.cs",
+        upstream_method: "RecordFromMediaSource",
+        ferrofin: "ferrofin-livetv dvr.rs record_direct, the RecordingInput::Url arm only (the \
+                   buffer arm, RecordFromDirectStreamProvider, is not covered): copy the tuner \
+                   body until the duration or the cancel, which also interrupts a pending read \
+                   (StreamHelper.CopyUntilCancelled), wait out a clean end of stream in \
+                   CANCEL_POLL_MS steps, flush and return a transport error -> manager.rs \
+                   record_stream and settle_timer \
+                   (RecordingsManager.RecordStream: a stop settles Completed; any other failure \
+                   retries in RETRY_INTERVAL_SECONDS while UtcNow < EndDate and RetryCount < \
+                   MAX_RETRY_COUNT, and a non-empty partial file stays). Compared with \
+                   RecordFromMediaSource, CopyUntilCancelled and RecordStream at the pinned v12.4 \
+                   tag.",
+        date: "2026-11-11",
+        divergences: &[
+            "The tuner gets 30 s to connect, to answer and between two chunks of the body \
+             (TUNER_RESPONSE_TIMEOUT_SECONDS): a tuner silent that long fails the attempt, which \
+             retries into a new file. Upstream waits HttpClient's 100 s for the answer and has no \
+             timeout on the body, so a stalled connection records nothing more until the \
+             programme ends. Jellyfin bug not ported.",
+            "The tuner URL is opened with the source's RequiredHttpHeaders (an M3U tuner's \
+             User-Agent), as playback opens it; upstream's recorder sends none, so a provider \
+             that needs them refuses its recordings. Jellyfin bug not ported.",
+            "A tuner answering an error status fails the attempt, which retries; upstream never \
+             checks the status, records the error body as the programme and settles it \
+             Completed. Jellyfin bug not ported.",
         ],
     },
     VerifiedSubsystem {
@@ -1583,6 +1616,14 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
                    create_tiles and move_dir (CreateTiles), \
                    and scheduled_tasks/library.rs TrickplayImagesTask, compared with \
                    MediaBrowser.Providers/Trickplay/TrickplayImagesTask.cs (ExecuteAsync). \
+                   Also the sets a changed video loses before its refresh: library_scan.rs \
+                   scan_item and file_changed, item_data_cleanup.rs prune_extracted_data, \
+                   external_data_manager.rs delete_external_item_data and \
+                   trickplay_manager.rs delete_trickplay_data, compared with \
+                   MediaBrowser.Providers/Manager/MetadataService.cs (BeforeSaveInternal), \
+                   Emby.Server.Implementations/Library/ExternalDataManager.cs \
+                   (DeleteExternalItemDataAsync) and TrickplayManager.cs \
+                   (DeleteTrickplayDataAsync). \
                    How ffmpeg extracts the frames, on either path, is the \
                    trickplay-extraction row's; how many generations run at once is not part \
                    of this row. Also BaseItemDto.Trickplay: which media sources it lists \
@@ -1600,7 +1641,7 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
                    Emby.Server.Implementations/Dto/DtoService.cs (the Trickplay field), \
                    MediaBrowser.Controller/Entities/BaseItem.cs (GetMediaSources) and \
                    MediaBrowser.Controller/Entities/Video.cs (GetAllItemsForMediaSources)",
-        date: "2026-11-06",
+        date: "2026-11-11",
         divergences: &[
             "An explicit Replace does not delete the item's trickplay folder and rows first: \
              each selected width is generated in the work directory and swapped in, so the old \
