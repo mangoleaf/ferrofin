@@ -84,18 +84,28 @@ pub fn forwarded_for(headers: &axum::http::HeaderMap) -> Vec<std::net::IpAddr> {
     reachable
 }
 
-/// One `X-Forwarded-For` entry as an address.
+/// One `X-Forwarded-For` entry as an address, in the shapes .NET's
+/// `IPEndPoint.TryParse` takes: an address, `v4:port`, or an IPv6 address in
+/// one pair of brackets, with or without a port. A bracketed IPv4 address and
+/// unbalanced or doubled brackets do not parse.
+///
+/// .NET also reads the old numeric IPv4 spellings (`2130706434`, `127.2`)
+/// and an IPv6 scope id without a port (`[fe80::1%2]`), which this does not,
+/// so the walk stops at one where Jellyfin's goes on. Fix path: gl-1642.
 #[must_use]
 pub(crate) fn parse_forwarded_entry(entry: &str) -> Option<std::net::IpAddr> {
     if let Ok(ip) = entry.parse::<std::net::IpAddr>() {
         return Some(normalize_ip(ip));
     }
-    // `host:port`, or `[v6]:port`.
+    // `v4:port`, or `[v6]:port`.
     if let Ok(socket) = entry.parse::<std::net::SocketAddr>() {
         return Some(normalize_ip(socket.ip()));
     }
-    let trimmed = entry.trim_start_matches('[').trim_end_matches(']');
-    trimmed.parse::<std::net::IpAddr>().ok().map(normalize_ip)
+    entry
+        .strip_prefix('[')
+        .and_then(|v6| v6.strip_suffix(']'))
+        .and_then(|v6| v6.parse::<std::net::Ipv6Addr>().ok())
+        .map(|v6| normalize_ip(std::net::IpAddr::V6(v6)))
 }
 
 /// The managers behind [`AppState`], held once and shared via [`Arc`].
@@ -863,40 +873,27 @@ impl AppState {
     }
 
     /// [`walk_forwarded_headers`](crate::forwarded_headers::walk_forwarded_headers)
-    /// under the configured known proxies. Nothing is forwarded without a
-    /// network policy, as Jellyfin forwards nothing without known proxies.
+    /// from `parts`' peer under the configured known proxies: the scheme and
+    /// host `ForwardedHeadersMiddleware` gives the request. Nothing is
+    /// forwarded without a network policy, as Jellyfin forwards nothing
+    /// without known proxies, nor without a peer to start the walk from.
     #[must_use]
     pub fn forwarded_request(
         &self,
-        peer: std::net::IpAddr,
-        headers: &axum::http::HeaderMap,
+        parts: &axum::http::request::Parts,
     ) -> crate::forwarded_headers::ForwardedRequest {
         use crate::forwarded_headers::{ForwardedRequest, forwarded_through};
-        self.inner
-            .network
-            .as_deref()
-            .map_or_else(ForwardedRequest::default, |network| {
-                forwarded_through(network, peer, headers)
-            })
-    }
-
-    /// The scheme `parts`' request has (`HttpRequest.Scheme`), lowercased as
-    /// `UriBuilder` writes it: the one known proxies forwarded, else its
-    /// listener's ([`Transport`](crate::forwarded_headers::Transport)), else
-    /// `http`.
-    #[must_use]
-    pub fn request_scheme(&self, parts: &axum::http::request::Parts) -> String {
-        use crate::forwarded_headers::{Transport, effective_scheme};
-        let forwarded = parts
-            .extensions
-            .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
-            .and_then(|axum::extract::ConnectInfo(peer)| {
-                self.forwarded_request(peer.ip(), &parts.headers).scheme
-            });
-        effective_scheme(
-            forwarded.as_deref(),
-            parts.extensions.get::<Transport>().copied(),
-        )
+        match (
+            self.inner.network.as_deref(),
+            parts
+                .extensions
+                .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>(),
+        ) {
+            (Some(network), Some(axum::extract::ConnectInfo(peer))) => {
+                forwarded_through(network, peer.ip(), &parts.headers)
+            }
+            _ => ForwardedRequest::default(),
+        }
     }
 
     /// [`Self::client_address`] over an already-extracted peer and chain, so the

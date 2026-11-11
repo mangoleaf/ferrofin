@@ -3614,6 +3614,24 @@ pub const VERIFIED: &[Verified] = &[
         refs: &[],
     },
     Verified {
+        method: "get",
+        path: "/System/Endpoint",
+        upstream_file: "Jellyfin.Api/Controllers/SystemController.cs",
+        upstream_method: "GetEndpointInfo",
+        ferrofin: "handlers/system.rs get_endpoint_info (auth.rs RequireAuth) → state.rs \
+               client_address (GetNormalizedRemoteIP after ForwardedHeadersMiddleware) → \
+               ip_access.rs is_local_connection (HttpContextExtensions.IsLocal), state.rs \
+               is_in_local_network (NetworkManager.IsInLocalNetwork)",
+        date: "2026-11-10",
+        divergences: &[
+            "IsLocal compares the connection's local address and the client's with \
+         IPv4-mapped IPv6 addresses unmapped, as the IP gate does; upstream's Equals compares \
+         them as given, so a dual-stack listener's mapped local address never equals a plain \
+         IPv4 client that a known proxy forwarded. Jellyfin bug not ported.",
+        ],
+        refs: &[],
+    },
+    Verified {
         method: "post",
         path: "/System/Restart",
         upstream_file: "Jellyfin.Api/Controllers/SystemController.cs",
