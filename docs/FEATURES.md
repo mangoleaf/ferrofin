@@ -79,8 +79,9 @@ Checked against a real Jellyfin server by the retired v2 runtime diff:
     downloaded, keep working.
 - **Sessions & playback** — sessions, playstate reporting, remote control, capabilities, and
   the **WebSocket push** messages clients rely on (`UserDataChanged`, session updates, …).
-- **Playlists & collections** — create/edit/reorder/share, membership, stored in Jellyfin's
-  `Data`-JSON shape, the same source of truth Jellyfin itself reads.
+- **Playlists & collections** — create/edit/reorder/share and membership, in Jellyfin's
+  `LinkedChildren` table. A playlist's owner and shares live in Ferrofin's permission tables,
+  imported once from Jellyfin's `Data` JSON and written back to it on every change.
   - **Accepted divergence:** a playlist's items listing and a reorder leave out a member from a
     library the user was not given, where Jellyfin lists it and hides only what the member's
     rating or tags rule out. Library access is a boundary here. What is stored stays: adding
