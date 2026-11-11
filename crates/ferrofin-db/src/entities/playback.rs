@@ -7,13 +7,13 @@
 //! [module docs](crate::entities):
 //! - `INTEGER` surrogate/count columns → [`i32`] / [`i64`] (per the C# `int` /
 //!   `long` width),
-//! - `TEXT` `Guid` columns → [`String`] (the hyphenated form as stored; the
-//!   conversion layer parses these into `Uuid`),
+//! - `TEXT` `Guid` columns → [`String`] (the hyphenated form as stored; callers
+//!   parse these into `Uuid`),
 //! - `TEXT` `DateTime` columns → [`DateTime<Utc>`](chrono::DateTime),
 //! - `INTEGER` booleans → [`bool`], `REAL` → [`f64`],
 //! - the enum-valued `INTEGER` `Type` column of `MediaSegments` is kept as its
 //!   [`i32`] discriminant here and mapped onto
-//!   [`ferrofin_model::media_segments::MediaSegmentType`] by the conversion layer.
+//!   [`ferrofin_model::media_segments::MediaSegmentType`] by callers.
 
 use chrono::{DateTime, Utc};
 
@@ -95,8 +95,7 @@ pub struct MediaSegmentEntity {
     /// The start position, in ticks (`StartTicks`).
     pub start_ticks: i64,
     /// The segment type discriminant (`Type`), mapped onto
-    /// [`ferrofin_model::media_segments::MediaSegmentType`] by the conversion
-    /// layer.
+    /// [`ferrofin_model::media_segments::MediaSegmentType`] by callers.
     #[sqlx(rename = "Type")]
     pub type_: i32,
 }
