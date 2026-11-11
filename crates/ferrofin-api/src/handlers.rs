@@ -1218,9 +1218,10 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
              as the stream's last send, so progress inside the first period is held back.",
             "A task start or completion is sent with the task list captured at the transition \
              (its names, descriptions and categories shown again in the socket's culture), \
-             where upstream reads the list when it sends; a progress frame due while one is still \
-             queued is dropped, so a short run never shows out of order, and a later report sends \
-             once the period has passed.",
+             where upstream reads the list when it sends, so a start frame never carries the \
+             run's first progress report, which upstream's can; a progress frame due while one \
+             is still queued is dropped, so a short run never shows out of order, and a later \
+             report sends once the period has passed.",
             "A socket's task list is ordered in its own upgrade request's culture. Upstream's one \
              send loop per listener orders every socket's list in the CurrentCulture it inherited \
              when the listener was built, on the first request after boot to reach the WebSocket \
@@ -1740,8 +1741,8 @@ macro_rules! item_image_tail {
     };
 }
 
-/// The divergences the four item image rows share (GET and HEAD, plain and
-/// indexed).
+/// The divergences the six item image rows share (GET and HEAD, plain, indexed
+/// and positional).
 const ITEM_IMAGE_DIVERGENCES: &[&str] = &[
     "percentPlayed and unplayedCount are bound but not drawn, and not passed to the \
      processor: a request naming a percentPlayed between 0 and 100 or a positive \
@@ -2136,6 +2137,73 @@ pub const VERIFIED: &[Verified] = &[
                sending the headers alone",
         date: "2026-11-03",
         divergences: ITEM_IMAGE_DIVERGENCES,
+        refs: &["images"],
+    },
+    Verified {
+        method: "get",
+        path: "/Items/{itemId}/Images/{imageType}/{imageIndex}/{tag}/{format}/{maxWidth}/{maxHeight}/{percentPlayed}/{unplayedCount}",
+        upstream_file: "Jellyfin.Api/Controllers/ImageController.cs",
+        upstream_method: "GetItemImage2",
+        ferrofin: concat!(
+            "handlers/images.rs get_item_image_parametrized (the route's imageIndex, maxWidth, \
+             maxHeight and unplayedCount bind with the query binder's int rules, trimmed and \
+             with the 0x, # and &h hex forms, percentPlayed with its double rules (no hex; \
+             gl-1665: Rust's inf binds and a thousands separator, 1,000, is a 400, the other \
+             way round from upstream's), format as the ImageFormat enum and tag as a required \
+             string (RequiredRouteString: a blank one is the 400), so a malformed member is a \
+             400; tag, format and both sizes are passed on as given, a 0 or negative size and \
+             a tag of 0 included; PositionalImageQuery binds only the query members the action \
+             declares, so a malformed maxWidth, percentPlayed or imageIndex in the query is not \
+             read; measured on 12.4) → ",
+            item_image_tail!()
+        ),
+        date: "2026-11-11",
+        divergences: ITEM_IMAGE_DIVERGENCES,
+        refs: &["images"],
+    },
+    Verified {
+        method: "head",
+        path: "/Items/{itemId}/Images/{imageType}/{imageIndex}/{tag}/{format}/{maxWidth}/{maxHeight}/{percentPlayed}/{unplayedCount}",
+        upstream_file: "Jellyfin.Api/Controllers/ImageController.cs",
+        upstream_method: "GetItemImage2",
+        ferrofin: "HeadItemImage2 is GetItemImage2's own action: handlers/images.rs \
+               get_item_image_parametrized, the GET row's path, with ServeFile sending the \
+               headers alone (measured on 12.4)",
+        date: "2026-11-11",
+        divergences: ITEM_IMAGE_DIVERGENCES,
+        refs: &["images"],
+    },
+    Verified {
+        method: "delete",
+        path: "/Items/{itemId}/Images/{imageType}",
+        upstream_file: "Jellyfin.Api/Controllers/ImageController.cs",
+        upstream_method: "DeleteItemImage",
+        ferrofin: "handlers/images.rs delete_item_image (RequireAdmin, as RequiresElevation; \
+               ImageIndexQuery: imageIndex is the action's only query member, so a malformed \
+               one is the binder's 400 before the item is read, a blank one is 0, and no other \
+               query parameter is read, measured on 12.4; require_item, GetItemById(itemId, \
+               User.GetUserId()): a missing item, or one a signed-in user cannot see, is a 404, \
+               and an API key's caller is not checked) → ferrofin-providers \
+               provider_manager.rs delete_image (BaseItem.DeleteImageAsync: a missing slot or a \
+               negative index is nothing to do, with no save; otherwise a local row's file is \
+               deleted and the item saved with ItemUpdateType.ImageUpdate) → ferrofin-core \
+               item_persistence_service.rs delete_item_image (GetImages(type) \
+               .ElementAtOrDefault(index), the row's path expanded as ExpandVirtualPath)",
+        date: "2026-11-11",
+        divergences: &[
+            "A file that cannot be deleted still removes the image: the row goes first and the \
+             file error is dropped, a 204, where DeleteImageAsync deletes the file first and a \
+             failure is a 500 that keeps the image (measured on 12.4). Fix path: gl-1663.",
+            "A Chapter image's file is not deleted: chapter images are not image rows, so the \
+             delete finds nothing and answers 204, where GetImageInfo returns the chapter's \
+             image and DeleteImageAsync deletes its file. Fix path: gl-1663.",
+            "A file in the shared album-covers directory is kept, as an album and its tracks \
+             name the same file there (docs/MUSIC_ARTWORK.md); DeleteImageAsync deletes any \
+             local file, a track's extracted cover that the album's other tracks share \
+             (AudioImageProvider.GetAudioImagePath) included, which leaves them naming a \
+             missing file. Whether tracks keep the album's cover is gl-692.",
+            "The 400 and 404 bodies are Ferrofin's error shape, not upstream's. Fix path: gl-666.",
+        ],
         refs: &["images"],
     },
     Verified {
@@ -3498,9 +3566,10 @@ pub const VERIFIED: &[Verified] = &[
                GetManageableItems: manual links, in order, missing items out), then \
                LibraryManager::filter_visible_items_standalone over the rows just read \
                (ItemVisibility::visible, one answer per distinct id) before the paging, as \
-               upstream filters before Skip and Take, and tv_shows::build_dto_options + \
-               get_linked_children_dtos + the PlaylistItemId tag",
-        date: "2026-11-09",
+               upstream filters before Skip and Take (the count taken first; a negative \
+               startIndex skips nothing, a negative limit takes nothing), and \
+               tv_shows::build_dto_options + get_linked_children_dtos + the PlaylistItemId tag",
+        date: "2026-11-11",
         divergences: &[
             "A member the caller may not open is left out with the standalone check, which also \
          walks its library, where upstream's IsVisible reads only its rating and tags and \
@@ -3513,8 +3582,6 @@ pub const VERIFIED: &[Verified] = &[
          the edges: a member of a disabled library or a file in no library is kept here and \
          dropped there, and a member whose parent fails the caller's rating limit is dropped \
          here and kept there. This list answers as GET /Items/{id} does.",
-            "A negative limit is ignored and the rest of the list comes back; upstream's \
-         Take(limit) answers an empty page. Fix path: gl-1137.",
             "The 404 (no playlist the caller can see) and 403 (another user's id without the \
          administrator role) bodies are Ferrofin's error shape, not upstream's. Fix path: \
          gl-666.",
@@ -3750,6 +3817,53 @@ pub const VERIFIED: &[Verified] = &[
         refs: &["access-filtering"],
     },
     Verified {
+        method: "post",
+        path: "/Items/{itemId}/RemoteSearch/Subtitles/{language}",
+        upstream_file: "Jellyfin.Api/Controllers/SubtitleController.cs",
+        upstream_method: "DownloadRemoteSubtitles",
+        ferrofin: "handlers/subtitles.rs download_remote_subtitles (RequireSubtitleManagement, the \
+               SubtitleManagement policy's UserPermissionRequirement; require_video, \
+               GetItemById<Video>(itemId, User.GetUserId()): a missing, hidden or non-video \
+               item is a 404; the download and the refresh queued after it share one try, \
+               whose failure is logged at error as \"Error downloading subtitles\" and still \
+               answered 204) → ferrofin-core subtitle_manager.rs download_subtitles, route and \
+               attach (SubtitleManager.DownloadSubtitles, GetProvider and GetRemoteSubtitles' \
+               Split('_', 2): an id naming no provider fails the download; TrySaveSubtitle and \
+               TrySaveToFiles: the library's SaveSubtitlesWithMedia picks the folder beside the \
+               media path or the item's internal-metadata folder, \
+               {stem}.{language}[.forced][.sdh].{format} with the language lowercased and a \
+               path separator refused, the format checked against \
+               NamingOptions.SubtitleFileExtensions, a taken name moved to {name}.{n}.{format}, \
+               the name written bracketed as a self-write) → handlers.rs \
+               queue_high_priority_refresh (QueueRefresh at RefreshPriority.High) → \
+               ferrofin-providers opensubtitles.rs get_subtitles (the OpenSubtitles plugin's \
+               GetSubtitles: a plugin outside the Jellyfin tree, not compared yet, gl-1644)",
+        date: "2026-11-10",
+        divergences: &[
+            "A download that fails once its provider is found writes no activity entry: \
+         upstream's DownloadSubtitles raises SubtitleDownloadFailure for any failure but a \
+         RateLimitExceededException, which SubtitleDownloadFailureLogger records as \
+         SubtitleDownloadFailureFromForItem. Fix path: gl-1640.",
+            "A DVD or Blu-ray folder rip's subtitle is written beside the rip's folder; \
+         upstream's Video.ContainingFolderPath is the rip's folder itself, so it lands \
+         inside it there. Fix path: gl-1643.",
+            "The subtitle is recorded as an external stream as soon as it is written; upstream \
+         leaves that to the queued refresh's probe, so the item lists it here before the \
+         refresh has run, and also when queueing the refresh failed. Fix path: gl-1641.",
+            "A client that hangs up stops the download, the write or the refresh where it \
+         is, unlogged; upstream passes CancellationToken.None and finishes them. Fix path: \
+         gl-1645.",
+            "A nil itemId is a 404, not GetItemById's 400. Fix path: gl-1034.",
+            "A whitespace-only subtitleId is taken (a logged failed download and a 204, or a \
+         404 for a missing or hidden item); upstream's model validation answers 400 before \
+         the action runs. Fix path: gl-1061.",
+            "The 400 (a malformed itemId), 401 (no or bad token), 403 (no subtitle \
+         management) and 404 bodies are Ferrofin's error shape, not upstream's. Fix path: \
+         gl-666.",
+        ],
+        refs: &["access-filtering"],
+    },
+    Verified {
         method: "get",
         path: "/Videos/{itemId}/{container}/Attachments/{index}",
         upstream_file: "Jellyfin.Api/Controllers/VideoAttachmentsController.cs",
@@ -3864,6 +3978,26 @@ pub const VERIFIED: &[Verified] = &[
             "The 400 (an API key with no userId, or a value the query binder cannot convert), \
          403 (another user's id without the administrator role) and 404 (a userId naming no \
          account) bodies are Ferrofin's error shape, not upstream's. Fix path: gl-666.",
+        ],
+        refs: &[],
+    },
+    Verified {
+        method: "post",
+        path: "/Devices/Options",
+        upstream_file: "Jellyfin.Api/Controllers/DevicesController.cs",
+        upstream_method: "UpdateDeviceOptions",
+        ferrofin: "handlers/devices.rs update_device_options (RequireAdmin, \
+               Policies.RequiresElevation; a missing or blank id and an empty body are 400) → \
+               ferrofin-core device_manager.rs update_device_options (DeviceManager.\
+               UpdateDeviceOptions: one upsert of CustomName, null when the body has none) → \
+               session_manager.rs on_device_options_updated (the DeviceOptionsUpdated handler \
+               SessionManager.OnDeviceManagerDeviceOptionsUpdated: every live session of the \
+               device takes a non-blank name as its DeviceName with HasCustomDeviceName, a \
+               blank one only clears HasCustomDeviceName)",
+        date: "2026-11-10",
+        divergences: &[
+            "The 400 for a missing or blank id, the 401 (no or bad token) and the 403 (not an \
+         administrator) bodies are Ferrofin's error shape, not upstream's. Fix path: gl-666.",
         ],
         refs: &[],
     },

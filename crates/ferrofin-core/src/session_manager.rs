@@ -1952,6 +1952,17 @@ impl SessionManager for FerrofinSessionManager {
         Ok(())
     }
 
+    async fn on_device_options_updated(&self, device_id: &str, custom_name: Option<&str>) {
+        let custom_name = custom_name.filter(|name| !name.trim().is_empty());
+        let mut sessions = self.sessions.lock().await;
+        for session in sessions.values_mut().filter(|s| s.device_id == device_id) {
+            session.has_custom_device_name = custom_name.is_some();
+            if let Some(name) = custom_name {
+                session.device_name = Some(name.to_owned());
+            }
+        }
+    }
+
     async fn on_playback_start(&self, info: &PlaybackStartInfo) -> Result<(), ServiceError> {
         let session_id = info
             .session_id

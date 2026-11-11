@@ -9,7 +9,10 @@
 //! Differences from upstream, all faithful simplifications:
 //! - The C# constructor eagerly loads every device into concurrent maps; this
 //!   port queries the tables on demand instead (no cache-coherency window).
-//! - The `DeviceOptionsUpdated` event is dropped (event wiring is out of scope).
+//! - The `DeviceOptionsUpdated` event is not raised here. Its one subscriber
+//!   (C# `SessionManager.OnDeviceManagerDeviceOptionsUpdated`) is
+//!   `SessionManager::on_device_options_updated`, which `POST /Devices/Options`
+//!   calls after the save.
 //! - `GetDeviceOptions` returns the [`DeviceOptionsEntity`] row; the API layer
 //!   maps it to the `DeviceOptionsDto` upstream returns.
 

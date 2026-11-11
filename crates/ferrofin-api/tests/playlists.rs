@@ -823,7 +823,7 @@ async fn get_missing_playlist_is_404() {
 #[tokio::test]
 async fn playlist_items_projects_the_fields_the_client_asked_for() {
     // C# builds the options from the REQUEST:
-    //   var dtoOptions = new DtoOptions { Fields = fields }.AddClientFields(User)
+    //   var dtoOptions = new DtoOptions { Fields = fields }
     //       .AddAdditionalDtoOptions(enableImages, enableUserData, …);
     // Ferrofin hardcoded `DtoOptions::default()` — every field, always — and the
     // query struct did not even accept `fields`. A 50-item playlist came back as
@@ -888,6 +888,42 @@ async fn get_playlist_items_pages_and_tags_entry_id() {
         result.items[0].playlist_item_id.as_deref(),
         Some(ITEM_A.simple().to_string().as_str())
     );
+}
+
+/// `GetPlaylistItems` pages with LINQ: `Skip(startIndex)` skips nothing for a
+/// negative index, `Take(limit)` takes nothing for a negative limit, and the
+/// total is counted before either. `StartIndex` echoes the request.
+#[rstest::rstest]
+#[case::negative_limit("limit=-1", &[], 0)]
+#[case::zero_limit("limit=0", &[], 0)]
+#[case::negative_start("startIndex=-1", &[ITEM_A, ITEM_B], -1)]
+#[case::negative_start_with_limit("startIndex=-1&limit=1", &[ITEM_A], -1)]
+#[case::limit_past_the_end("startIndex=1&limit=5", &[ITEM_B], 1)]
+#[case::start_past_the_end("startIndex=5", &[], 5)]
+#[case::start_with_negative_limit("startIndex=1&limit=-3", &[], 1)]
+#[tokio::test]
+async fn get_playlist_items_pages_as_skip_and_take(
+    #[case] paging: &str,
+    #[case] expected: &[Uuid],
+    #[case] start_index: i32,
+) {
+    let app = state(
+        Arc::new(RecordingPlaylists::default()),
+        Arc::new(RecordingCollections::default()),
+    );
+    let (status, bytes) = send(
+        app,
+        "GET",
+        &format!("/Playlists/{PLAYLIST_ID}/Items?{paging}"),
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let result: QueryResult<BaseItemDto> = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(result.total_record_count, 2);
+    assert_eq!(result.start_index, start_index);
+    let ids: Vec<Uuid> = result.items.iter().map(|dto| dto.id).collect();
+    assert_eq!(ids, expected);
 }
 
 /// `GET /Playlists/{id}/Items?userId=` is `RequestHelpers.GetUserId`: a

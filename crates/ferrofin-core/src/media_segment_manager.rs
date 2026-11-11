@@ -136,8 +136,29 @@ impl FerrofinMediaSegmentManager {
             ferrofin_util::string_extensions::equals_ordinal_ignore_case(name, provider.name())
         })
     }
+    /// Maps a stored `MediaSegments` row onto the wire DTO (C#
+    /// `MediaSegmentManager.Map`). An unnamed `Type` keeps its integer.
     fn to_dto(entity: MediaSegmentEntity) -> Result<MediaSegmentDto, ServiceError> {
-        MediaSegmentDto::try_from(entity).map_err(|e| ServiceError::backend(e.to_string()))
+        let guid = |column: &str, value: &str| {
+            Uuid::parse_str(value).map_err(|e| {
+                ServiceError::backend(format!("invalid guid in column `{column}`: {e}"))
+            })
+        };
+        let MediaSegmentEntity {
+            id,
+            item_id,
+            type_,
+            start_ticks,
+            end_ticks,
+            ..
+        } = entity;
+        Ok(MediaSegmentDto {
+            id: guid("MediaSegments.Id", &id)?,
+            item_id: guid("MediaSegments.ItemId", &item_id)?,
+            type_: MediaSegmentType::from_json_value(type_),
+            start_ticks,
+            end_ticks,
+        })
     }
     async fn rows(&self, item: Uuid) -> Result<Vec<MediaSegmentEntity>, ServiceError> {
         self.selected_rows(Some(item), None).await
@@ -881,6 +902,7 @@ impl MediaSegmentManager for FerrofinMediaSegmentManager {
 
 #[cfg(test)]
 mod tests {
+    use ferrofin_db::entities::playback::MediaSegmentEntity;
     use ferrofin_model::data::BaseItemKind;
     use ferrofin_model::media_segments::{MediaSegmentDto, MediaSegmentType};
     use uuid::Uuid;
@@ -890,6 +912,51 @@ mod tests {
     use crate::test_support::{library_manager_over, seed_item, test_db};
 
     use super::FerrofinMediaSegmentManager;
+
+    /// A stored row with the given `Type` discriminant.
+    fn stored(type_: i32) -> MediaSegmentEntity {
+        MediaSegmentEntity {
+            id: Uuid::from_u128(0x52).to_string(),
+            end_ticks: 6_000_000,
+            item_id: Uuid::from_u128(0x50).to_string(),
+            segment_provider_id: "chapter-provider".to_owned(),
+            start_ticks: 0,
+            type_,
+        }
+    }
+
+    #[test]
+    fn a_stored_row_maps_its_guids_ticks_and_every_type() {
+        let expected = [
+            MediaSegmentType::Unknown,
+            MediaSegmentType::Commercial,
+            MediaSegmentType::Preview,
+            MediaSegmentType::Recap,
+            MediaSegmentType::Outro,
+            MediaSegmentType::Intro,
+            MediaSegmentType::Unrecognized(99),
+        ];
+        for (value, want) in [0, 1, 2, 3, 4, 5, 99].into_iter().zip(expected) {
+            let dto = FerrofinMediaSegmentManager::to_dto(stored(value)).expect("convert");
+            assert_eq!(dto.type_, want, "discriminant {value}");
+            assert_eq!(dto.id, Uuid::from_u128(0x52));
+            assert_eq!(dto.item_id, Uuid::from_u128(0x50));
+            assert_eq!((dto.start_ticks, dto.end_ticks), (0, 6_000_000));
+        }
+    }
+
+    #[test]
+    fn a_stored_row_with_a_malformed_guid_is_an_error() {
+        let row = MediaSegmentEntity {
+            item_id: "not-a-guid".to_owned(),
+            ..stored(5)
+        };
+        let error = FerrofinMediaSegmentManager::to_dto(row).expect_err("bad guid");
+        assert!(
+            error.to_string().contains("MediaSegments.ItemId"),
+            "{error}"
+        );
+    }
 
     fn segment(item: Uuid, kind: MediaSegmentType, start: i64, end: i64) -> MediaSegmentDto {
         MediaSegmentDto {

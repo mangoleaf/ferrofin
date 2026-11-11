@@ -213,6 +213,18 @@ pub trait SessionManager: Send + Sync {
         reported_device_name: &str,
     ) -> Result<(), ServiceError>;
 
+    /// Applies a device's newly saved custom name to its live sessions (C#
+    /// `SessionManager.OnDeviceManagerDeviceOptionsUpdated`, raised by
+    /// `DeviceManager.UpdateDeviceOptions`). A non-blank `custom_name` becomes
+    /// each session's device name and marks it custom; a blank one only clears
+    /// the mark, so the next reported name replaces the old one.
+    ///
+    /// The default does nothing, so test fakes without sessions need no
+    /// change; the concrete session manager overrides it.
+    async fn on_device_options_updated(&self, device_id: &str, custom_name: Option<&str>) {
+        let _ = (device_id, custom_name);
+    }
+
     /// Reports that playback started for an item.
     async fn on_playback_start(&self, info: &PlaybackStartInfo) -> Result<(), ServiceError>;
 

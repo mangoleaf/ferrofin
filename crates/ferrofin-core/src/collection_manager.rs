@@ -227,8 +227,9 @@ fn folder_items_query(
 /// Upstream's `GetUserById(Guid.Empty)` throw (`UserManager.cs:123-128`, a
 /// 400 through `ExceptionMiddleware`): `CreatePlaylist` and every
 /// `GetPlaylists`/`GetPlaylistForUser` lookup make it, so an API key that
-/// names no user gets neither an unowned playlist nor a look at one.
-fn require_user(user_id: Uuid) -> Result<(), ServiceError> {
+/// names no user gets neither an unowned playlist nor a look at one. SyncPlay's
+/// `JoinGroup`/`ListGroups`/`GetGroup` make it for an API key's session too.
+pub(crate) fn require_user(user_id: Uuid) -> Result<(), ServiceError> {
     if user_id.is_nil() {
         return Err(ServiceError::invalid_input("Guid can't be empty"));
     }

@@ -2941,7 +2941,6 @@ impl FerrofinDtoService {
         }
 
         dto.name = item.name.clone();
-        dto.original_title = item.original_title.clone();
         dto.official_rating = item.official_rating.clone();
         // `Container` has no dedicated column on the row at this layer (it lives in
         // the serialized `Data` blob, not yet parsed here), so it stays `None`.
@@ -3222,14 +3221,18 @@ impl FerrofinDtoService {
         // is on the DTO and is read instead, so the map is not read here: that
         // block may already have moved the entry into the source. When it did
         // not run, there was no earlier read at all.)
-        if options.contains_field(ItemFields::MediaStreams) {
+        //
+        // C# assigns for every `IHasMediaSources` item, empty list or not, and
+        // for no other kind (`DtoService.cs:1467-1494`): a programme, a book
+        // or a photo never gets the field, even with stream rows.
+        if options.contains_field(ItemFields::MediaStreams)
+            && kinds::implements_has_media_sources(kind)
+        {
             if is_live_tv_channel(kind) {
-                // C# assigns for every `IHasMediaSources`, and a channel's
-                // `GetMediaStreams()` override is always `[]` — the field is
-                // present-and-empty on the channel detail, never probed rows.
+                // A channel's `GetMediaStreams()` override is always `[]` — the
+                // field is present-and-empty on the channel detail, never
+                // probed rows.
                 dto.media_streams = Some(Vec::new());
-            } else if is_live_tv_program(kind) {
-                // A programme is not `IHasMediaSources`; C# never assigns.
             } else {
                 // With the item's sources on the DTO, C# reads the streams
                 // off the item's own source (`DtoService.cs:1473-1485`) — the
@@ -3253,9 +3256,8 @@ impl FerrofinDtoService {
                             .unwrap_or_default()
                     }
                 };
-                if !streams.is_empty() {
-                    dto.media_streams = Some(streams);
-                }
+                // An unprobed or unreadable file has no rows: `[]`, not absent.
+                dto.media_streams = Some(streams);
             }
         }
 
@@ -10599,6 +10601,96 @@ mod tests {
             dto.media_streams.as_ref().is_some_and(|s| !s.is_empty()),
             "MediaStreams emptied — the second read of the prefetched map lost its rows"
         );
+    }
+
+    /// `dto.MediaStreams = mediaStreams` runs for every `IHasMediaSources`
+    /// item, empty or not (v12.4 `DtoService.cs:1467-1494`): a video with no
+    /// stream rows (a file ffprobe could not read) carries `[]`, whether the
+    /// streams come off its own source or straight from the rows.
+    #[tokio::test]
+    async fn a_video_with_no_streams_gets_an_empty_media_streams_list() {
+        let db = test_db().await;
+        let id = Uuid::new_v4();
+        seed_named_item(&db, id, BaseItemKind::Movie, "Broken Reel").await;
+        let item = fetch_item(&db, id).await;
+        let svc = service_with_sources(
+            db,
+            FakeSources {
+                streams: Some(Vec::new()),
+                ..FakeSources::default()
+            },
+        );
+
+        for fields in [
+            vec![ItemFields::MediaStreams],
+            vec![ItemFields::MediaSources, ItemFields::MediaStreams],
+        ] {
+            let options = DtoOptions {
+                fields: fields.clone(),
+                ..DtoOptions::default()
+            };
+            let dto = svc
+                .get_base_item_dto(&item, &options, None, None)
+                .await
+                .unwrap();
+            assert_eq!(dto.media_streams, Some(Vec::new()), "fields {fields:?}");
+        }
+    }
+
+    /// A kind that is not `IHasMediaSources` upstream (a `Book`) never gets
+    /// `MediaStreams`, even when it owns stream rows.
+    #[tokio::test]
+    async fn a_book_with_stream_rows_gets_no_media_streams() {
+        let db = test_db().await;
+        let id = Uuid::new_v4();
+        seed_named_item(&db, id, BaseItemKind::Book, "Read Me").await;
+        let item = fetch_item(&db, id).await;
+        let svc = service(db);
+        let options = DtoOptions {
+            fields: vec![ItemFields::MediaStreams],
+            ..DtoOptions::default()
+        };
+
+        let dto = svc
+            .get_base_item_dto(&item, &options, None, None)
+            .await
+            .unwrap();
+
+        assert_eq!(dto.media_streams, None);
+    }
+
+    /// `dto.OriginalTitle = item.OriginalTitle` only under
+    /// `ItemFields.OriginalTitle` (v12.4 `DtoService.cs:1230-1233`), unlike
+    /// the `Name` and `OfficialRating` beside it.
+    #[tokio::test]
+    async fn original_title_needs_its_field() {
+        let db = test_db().await;
+        let id = Uuid::new_v4();
+        seed_named_item(&db, id, BaseItemKind::Movie, "Spirited Away").await;
+        let mut item = fetch_item(&db, id).await;
+        item.original_title = Some("Sen to Chihiro".to_owned());
+        let svc = service(db);
+
+        let bare = DtoOptions {
+            fields: Vec::new(),
+            ..DtoOptions::default()
+        };
+        let dto = svc
+            .get_base_item_dto(&item, &bare, None, None)
+            .await
+            .unwrap();
+        assert_eq!(dto.name.as_deref(), Some("Spirited Away"));
+        assert_eq!(dto.original_title, None);
+
+        let asked = DtoOptions {
+            fields: vec![ItemFields::OriginalTitle],
+            ..DtoOptions::default()
+        };
+        let dto = svc
+            .get_base_item_dto(&item, &asked, None, None)
+            .await
+            .unwrap();
+        assert_eq!(dto.original_title.as_deref(), Some("Sen to Chihiro"));
     }
 
     /// The item DTO's sources run `GetStaticMediaSources(item, true, user)`'s

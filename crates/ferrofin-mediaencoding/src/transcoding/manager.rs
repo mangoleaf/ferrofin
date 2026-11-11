@@ -1568,6 +1568,28 @@ impl<S: SessionReporter, C: FileCleaner> TranscodeManagerImpl<S, C> {
         self.with_running(handle, |running| running.start_number)
     }
 
+    /// Whether the running job behind `handle` has served a segment at or past
+    /// `index`, its own or one an earlier job left. Rolling deletion removes
+    /// segments only up to one the job has served, so until then every segment
+    /// it wrote from `index` on is still on disk. `false` when no process is
+    /// attached to it.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal job-registry mutex has been poisoned.
+    #[must_use]
+    pub fn has_served_segment_from(&self, handle: &TranscodingJobHandle, index: i32) -> bool {
+        self.with_running(handle, |running| {
+            running
+                .served_segments
+                .lock()
+                .expect("served_segments lock poisoned")
+                .keys()
+                .any(|&served| served >= i64::from(index))
+        })
+        .unwrap_or(false)
+    }
+
     /// Kills the process behind `handle` (if any) and removes it, deleting its
     /// partial segment files before it returns when `delete_files` is set.
     ///
@@ -4837,6 +4859,26 @@ pub(super) mod throttle_tests {
                 .download_position_ticks,
             Some(100 * TICKS_PER_SECOND)
         );
+    }
+
+    /// What the segment path reads to tell a job's first segments that rolling
+    /// deletion removed from ones it has not written yet (gl-1520).
+    #[tokio::test]
+    async fn a_job_reports_whether_it_served_a_segment_from_an_index() {
+        let (_directory, manager, _child, handle) = fixture(None).await;
+        assert!(
+            !manager.has_served_segment_from(&handle, 0),
+            "nothing served"
+        );
+        drop(
+            manager
+                .segment_progress(&handle.path, 6 * TICKS_PER_SECOND, 3)
+                .unwrap(),
+        );
+        assert!(manager.has_served_segment_from(&handle, 3));
+        assert!(!manager.has_served_segment_from(&handle, 4));
+        manager.kill_and_remove(&handle, false, false).await;
+        assert!(!manager.has_served_segment_from(&handle, 0), "no job");
     }
 
     #[tokio::test]
