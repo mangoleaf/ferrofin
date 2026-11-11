@@ -548,7 +548,10 @@ impl SubtitleIo for FfmpegSubtitleIo {
 /// exit code `-1`) and deletes every output it was writing
 /// (`ExtractSubtitlesForFile`, `AttachmentExtractor`'s failure path). Here both
 /// cases are a drop before `finished` is set — the timeout returns early, and a
-/// cancelled request drops the future awaiting it. Without the deletion, a file
+/// cancelled request drops the future awaiting it. An attachment extraction
+/// runs on a task its request only awaits (upstream's token there is one
+/// nothing cancels), so for it only the host's teardown does (a shutdown or a
+/// restart, `AttachmentExtractor::shutdown`). Without the deletion, a file
 /// cut off mid-write would stay in the cache and be served on every later
 /// request, because extraction skips any output that already exists.
 struct RunningExtraction<'a> {
@@ -748,9 +751,11 @@ impl AttachmentIo for FfmpegAttachmentIo {
             .kill_on_drop(true)
             .spawn()
             .map_err(|e| format!("spawn ffmpeg {ffmpeg_path}: {e}"))?;
-        // Until ffmpeg exits on its own, a cancelled request (its future
-        // dropped) kills it and deletes `outputs`. Upstream has no timeout
-        // here, only the cancellation (owner decision 2026-10-25).
+        // Until ffmpeg exits on its own, dropping this future kills it and
+        // deletes `outputs`. The extractor awaits it on a task of its own, so
+        // only the host's teardown (a shutdown or a restart) does that, never a
+        // request that stops waiting. No timeout, as upstream (owner decision
+        // 2026-10-25).
         let mut running = RunningExtraction {
             child,
             output_paths: outputs,
@@ -2002,10 +2007,11 @@ mod tests {
         assert!(killed, "ffmpeg {pid} kept running after the cancellation");
     }
 
-    /// Dropping the request future mid-dump (a client giving up on a font)
-    /// kills ffmpeg and deletes the attachment it was writing, as upstream's
-    /// cancellation does (`Kill(true)`, then the failure path's delete), so a
-    /// truncated font is never served from the attachment cache.
+    /// Dropping the dump mid-run (the host's teardown stopping the
+    /// extraction's task) kills ffmpeg and deletes the attachment it was
+    /// writing, as upstream's cancellation branch would (`Kill(true)`, then the
+    /// failure path's delete), so a truncated font is never served from the
+    /// attachment cache.
     #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn a_cancelled_attachment_extraction_kills_ffmpeg_and_deletes_its_output() {
@@ -2048,7 +2054,7 @@ mod tests {
             .to_owned();
         assert!(std::path::Path::new(&output).is_file());
 
-        // The request is cancelled.
+        // The extraction's task is dropped.
         drop(dump);
 
         assert!(!std::path::Path::new(&output).exists());

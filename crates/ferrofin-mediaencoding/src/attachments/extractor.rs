@@ -91,10 +91,13 @@ pub trait AttachmentIo: Send + Sync {
     /// C# sets `WorkingDirectory = outputFolder`.
     ///
     /// `outputs` are the files the run writes, where they are known before it
-    /// starts. A run whose future is dropped before ffmpeg exits (the request
-    /// cancelled) kills ffmpeg and deletes them, as upstream's cancellation
-    /// does: `Kill(true)`, then the exit code -1 takes the failure path, which
-    /// deletes what the run may have half-written.
+    /// starts. A run whose future is dropped before ffmpeg exits kills ffmpeg
+    /// and deletes them, as upstream's cancellation branch would: `Kill(true)`,
+    /// then the exit code -1 takes the failure path, which deletes what the run
+    /// may have half-written. The extractor runs every extraction on a task of
+    /// its own, so that happens only when the host tears down (a shutdown or a
+    /// restart, [`AttachmentExtractor::shutdown`]), never when a caller stops
+    /// waiting.
     ///
     /// # Errors
     ///
@@ -170,7 +173,35 @@ where
     io: Arc<I>,
     /// Per-output-folder locks (port of `AsyncKeyedLocker<string>`), serializing
     /// extraction so two callers never race on the same cache folder.
-    locks: KeyedLocks,
+    locks: Arc<KeyedLocks>,
+    /// Set by [`AttachmentExtractor::shutdown`]; each running extraction holds
+    /// a receiver until it is gone.
+    stop: Arc<tokio::sync::watch::Sender<bool>>,
+}
+
+/// A handle on the same extractor: it shares the seams and the folder locks,
+/// so an extraction finishing on a task of its own still holds the lock other
+/// callers wait on.
+impl<E, R, I> Clone for AttachmentExtractorImpl<E, R, I>
+where
+    E: MediaEncoder,
+    R: MediaSourceResolver,
+    I: AttachmentIo,
+{
+    fn clone(&self) -> Self {
+        Self {
+            media_encoder: Arc::clone(&self.media_encoder),
+            resolver: Arc::clone(&self.resolver),
+            io: Arc::clone(&self.io),
+            locks: Arc::clone(&self.locks),
+            stop: Arc::clone(&self.stop),
+        }
+    }
+}
+
+/// The error an extraction stopped by [`AttachmentExtractor::shutdown`] ends in.
+fn stopped() -> ServiceError {
+    ServiceError::backend("attachment extraction stopped: the server is shutting down")
 }
 
 impl<E, R, I> AttachmentExtractorImpl<E, R, I>
@@ -185,8 +216,41 @@ where
             media_encoder,
             resolver,
             io,
-            locks: KeyedLocks::new(),
+            locks: Arc::default(),
+            stop: Arc::new(tokio::sync::watch::Sender::new(false)),
         }
+    }
+
+    /// Runs an extraction on a task of its own and waits for it.
+    ///
+    /// Upstream extracts with a token nothing cancels: the attachment route
+    /// passes `CancellationToken.None`, and a transcode's token is its own,
+    /// made before the job that could cancel it exists. So a caller that stops
+    /// waiting (a client hanging up) does not stop the extraction: ffmpeg runs
+    /// to its end under the folder's lock, and the next request is served from
+    /// the cache. Only [`AttachmentExtractor::shutdown`] stops it.
+    async fn run_to_completion<T: Send + 'static>(
+        &self,
+        extraction: impl Future<Output = Result<T, ServiceError>> + Send + 'static,
+    ) -> Result<T, ServiceError> {
+        let mut stop = self.stop.subscribe();
+        if *stop.borrow_and_update() {
+            return Err(stopped());
+        }
+        // Under the caller's span, which awaits it, as the item delete's task is:
+        // a slow source keeps that span open until ffmpeg ends.
+        tokio::spawn(tracing::Instrument::in_current_span(async move {
+            tokio::select! {
+                result = extraction => result,
+                // Dropping the extraction kills its ffmpeg and deletes what it
+                // was writing.
+                Ok(_) = stop.wait_for(|is_stopped| *is_stopped) => Err(stopped()),
+            }
+        }))
+        .await
+        .map_err(|error| {
+            ServiceError::backend(format!("attachment extraction task failed: {error}"))
+        })?
     }
 
     /// Returns the keyed lock for `key`, creating it on first use.
@@ -471,77 +535,10 @@ where
 
         Ok(attachment_path)
     }
-}
 
-#[async_trait]
-impl<E, R, I> AttachmentExtractor for AttachmentExtractorImpl<E, R, I>
-where
-    E: MediaEncoder,
-    R: MediaSourceResolver,
-    I: AttachmentIo,
-{
-    async fn get_attachment(
-        &self,
-        item_id: Uuid,
-        media_source_id: &str,
-        attachment_stream_index: i32,
-    ) -> Result<ExtractedAttachment, ServiceError> {
-        if media_source_id.trim().is_empty() {
-            return Err(ServiceError::invalid_input("mediaSourceId is empty"));
-        }
-
-        let media_source = self
-            .resolver
-            .resolve(item_id, media_source_id)
-            .await?
-            .ok_or_else(|| {
-                ServiceError::not_found(format!("MediaSource {media_source_id} not found"))
-            })?;
-
-        let attachment = media_source
-            .media_attachments
-            .iter()
-            .find(|a| a.index == attachment_stream_index)
-            .cloned()
-            .ok_or_else(|| {
-                ServiceError::not_found(format!(
-                    "MediaSource {media_source_id} has no attachment with stream index {attachment_stream_index}"
-                ))
-            })?;
-
-        if attachment
-            .codec
-            .as_deref()
-            .is_some_and(|c| c.eq_ignore_ascii_case("mjpeg"))
-        {
-            return Err(ServiceError::not_found(format!(
-                "Attachment with stream index {attachment_stream_index} can't be extracted for MediaSource {media_source_id}"
-            )));
-        }
-
-        let input_file = media_source.path.clone().unwrap_or_default();
-        let attachment_path = self
-            .extract_attachment(&input_file, &media_source, &attachment)
-            .await?;
-        // `GetAttachmentStream`'s `AsyncFile.OpenRead`: a file gone since the
-        // extraction throws `FileNotFoundException` or
-        // `DirectoryNotFoundException` (`ENOENT`, `ENOTDIR`), which upstream's
-        // exception middleware answers `404`. The message names no path: it
-        // reaches the client, and the route takes anonymous callers.
-        let file = self.io.open_file(&attachment_path).await.map_err(|error| {
-            match error.kind() {
-                std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory => {
-                    tracing::debug!(path = attachment_path, %error, "attachment file not found");
-                    ServiceError::not_found("attachment file not found")
-                }
-                _ => MediaEncodingError::io(format!("open {attachment_path}"), error).into(),
-            }
-        })?;
-
-        Ok(ExtractedAttachment { attachment, file })
-    }
-
-    async fn extract_all_attachments(
+    /// Extracts every attachment of `media_source` to its cache folder, under
+    /// the folder's lock. Port of `ExtractAllAttachments`.
+    async fn extract_all(
         &self,
         input_file: &str,
         media_source: &MediaSourceInfo,
@@ -628,12 +625,107 @@ where
     }
 }
 
+#[async_trait]
+impl<E, R, I> AttachmentExtractor for AttachmentExtractorImpl<E, R, I>
+where
+    E: MediaEncoder + 'static,
+    R: MediaSourceResolver + 'static,
+    I: AttachmentIo + 'static,
+{
+    async fn get_attachment(
+        &self,
+        item_id: Uuid,
+        media_source_id: &str,
+        attachment_stream_index: i32,
+    ) -> Result<ExtractedAttachment, ServiceError> {
+        if media_source_id.trim().is_empty() {
+            return Err(ServiceError::invalid_input("mediaSourceId is empty"));
+        }
+
+        let media_source = self
+            .resolver
+            .resolve(item_id, media_source_id)
+            .await?
+            .ok_or_else(|| {
+                ServiceError::not_found(format!("MediaSource {media_source_id} not found"))
+            })?;
+
+        let attachment = media_source
+            .media_attachments
+            .iter()
+            .find(|a| a.index == attachment_stream_index)
+            .cloned()
+            .ok_or_else(|| {
+                ServiceError::not_found(format!(
+                    "MediaSource {media_source_id} has no attachment with stream index {attachment_stream_index}"
+                ))
+            })?;
+
+        if attachment
+            .codec
+            .as_deref()
+            .is_some_and(|c| c.eq_ignore_ascii_case("mjpeg"))
+        {
+            return Err(ServiceError::not_found(format!(
+                "Attachment with stream index {attachment_stream_index} can't be extracted for MediaSource {media_source_id}"
+            )));
+        }
+
+        let (extractor, extracting) = (self.clone(), attachment.clone());
+        let attachment_path = self
+            .run_to_completion(async move {
+                let input_file = media_source.path.clone().unwrap_or_default();
+                extractor
+                    .extract_attachment(&input_file, &media_source, &extracting)
+                    .await
+            })
+            .await?;
+        // `GetAttachmentStream`'s `AsyncFile.OpenRead`: a file gone since the
+        // extraction throws `FileNotFoundException` or
+        // `DirectoryNotFoundException` (`ENOENT`, `ENOTDIR`), which upstream's
+        // exception middleware answers `404`. The message names no path: it
+        // reaches the client, and the route takes anonymous callers.
+        let file = self.io.open_file(&attachment_path).await.map_err(|error| {
+            match error.kind() {
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory => {
+                    tracing::debug!(path = attachment_path, %error, "attachment file not found");
+                    ServiceError::not_found("attachment file not found")
+                }
+                _ => MediaEncodingError::io(format!("open {attachment_path}"), error).into(),
+            }
+        })?;
+
+        Ok(ExtractedAttachment { attachment, file })
+    }
+
+    async fn extract_all_attachments(
+        &self,
+        input_file: &str,
+        media_source: &MediaSourceInfo,
+    ) -> Result<(), ServiceError> {
+        let (extractor, input_file, media_source) =
+            (self.clone(), input_file.to_owned(), media_source.clone());
+        self.run_to_completion(
+            async move { extractor.extract_all(&input_file, &media_source).await },
+        )
+        .await
+    }
+
+    async fn shutdown(&self) {
+        self.stop.send_replace(true);
+        // Each running extraction drops its receiver once its ffmpeg is killed
+        // and its outputs are deleted.
+        self.stop.closed().await;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::HashSet;
     use std::io::Read as _;
     use std::sync::Arc;
     use std::sync::Mutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     use async_trait::async_trait;
     use ferrofin_model::dto::MediaSourceInfo;
@@ -641,6 +733,7 @@ mod tests {
     use ferrofin_model::media_info::MediaProtocol;
     use ferrofin_traits::error::ServiceError;
     use ferrofin_traits::media_encoding::{AttachmentExtractor, MediaEncoder, MediaInfoRequest};
+    use tokio::sync::Notify;
     use uuid::Uuid;
 
     use super::{AttachmentExtractorImpl, AttachmentIo, MediaSourceResolver};
@@ -740,6 +833,12 @@ mod tests {
         created_dir: Mutex<Option<String>>,
         working_dir: Mutex<Option<String>>,
         outputs: Mutex<Vec<String>>,
+        /// When set, the first run signals the first and waits for the
+        /// second before it does anything, like an ffmpeg still reading a
+        /// slow source.
+        gate: Option<(Arc<Notify>, Arc<Notify>)>,
+        /// How many runs started.
+        runs: AtomicUsize,
     }
 
     impl FakeIo {
@@ -755,6 +854,8 @@ mod tests {
                 created_dir: Mutex::new(None),
                 working_dir: Mutex::new(None),
                 outputs: Mutex::new(Vec::new()),
+                gate: None,
+                runs: AtomicUsize::new(0),
             }
         }
 
@@ -815,6 +916,11 @@ mod tests {
             working_dir: Option<&str>,
             outputs: &[String],
         ) -> Result<i32, String> {
+            let first = self.runs.fetch_add(1, Ordering::SeqCst) == 0;
+            if first && let Some((started, release)) = &self.gate {
+                started.notify_one();
+                release.notified().await;
+            }
             *self.last_args.lock().unwrap() = Some(args.to_owned());
             outputs.clone_into(&mut self.outputs.lock().unwrap());
             *self.working_dir.lock().unwrap() = working_dir.map(str::to_owned);
@@ -903,6 +1009,98 @@ mod tests {
         assert_eq!(ex.io.working_dir.lock().unwrap().as_deref(), None);
         // A cancelled run deletes the file it was writing.
         assert_eq!(ex.io.outputs(), ["/cache/font.ttf"]);
+    }
+
+    /// A gated extractor of one attachment whose name is not a leaf: the
+    /// transcode path dumps it by index, to the cache path the attachment
+    /// route uses.
+    fn gated_extractor() -> (
+        AttachmentExtractorImpl<FakeEncoder, FixedResolver, FakeIo>,
+        MediaSourceInfo,
+        Arc<Notify>,
+        Arc<Notify>,
+    ) {
+        let (started, release) = (Arc::new(Notify::new()), Arc::new(Notify::new()));
+        let mut io = FakeIo::new(Some("/cache"), 0);
+        io.gate = Some((Arc::clone(&started), Arc::clone(&release)));
+        let source = source_with(vec![attachment(3, Some("fonts/font.ttf"))]);
+        (
+            extractor(Some(source.clone()), io),
+            source,
+            started,
+            release,
+        )
+    }
+
+    /// One call of either caller: the attachment route or the transcode path.
+    async fn extract(
+        ex: &AttachmentExtractorImpl<FakeEncoder, FixedResolver, FakeIo>,
+        source: &MediaSourceInfo,
+        all: bool,
+    ) -> Result<(), ServiceError> {
+        if all {
+            ex.extract_all_attachments("/media/movie.mkv", source).await
+        } else {
+            ex.get_attachment(Uuid::nil(), "0f2c8d1e-1111-2222-3333-444455556666", 3)
+                .await
+                .map(drop)
+        }
+    }
+
+    /// A caller that stops waiting (a client hanging up mid-dump) does not
+    /// stop the extraction. Upstream's attachment route passes
+    /// `CancellationToken.None`, and a transcode's token is its own, made
+    /// before the job that could cancel it, so ffmpeg runs to its end, the
+    /// file stays, and the next request is served from the cache.
+    #[rstest::rstest]
+    #[case::attachment_route(false)]
+    #[case::transcode(true)]
+    #[tokio::test]
+    async fn a_dropped_caller_does_not_stop_the_extraction(#[case] all: bool) {
+        let (ex, source, started, release) = gated_extractor();
+
+        // The caller is dropped while ffmpeg runs.
+        tokio::select! {
+            _ = extract(&ex, &source, all) => panic!("the extraction ended before ffmpeg was let go"),
+            () = started.notified() => {}
+        }
+        release.notify_one();
+
+        // The next caller waits for the extraction, which still holds the
+        // folder, then finds its file: no second ffmpeg.
+        extract(&ex, &source, all).await.unwrap();
+        assert!(ex.io.file_exists("/cache/font.ttf"));
+        assert!(ex.io.removed.lock().unwrap().is_empty());
+        assert_eq!(ex.io.runs.load(Ordering::SeqCst), 1);
+    }
+
+    /// The host's teardown (a shutdown or a restart) stops an extraction
+    /// nobody waits for any more, so no ffmpeg outlives the server lifetime
+    /// that started it, and refuses new ones.
+    #[rstest::rstest]
+    #[case::attachment_route(false)]
+    #[case::transcode(true)]
+    #[tokio::test]
+    async fn shutdown_stops_a_running_extraction(#[case] all: bool) {
+        let (ex, source, started, release) = gated_extractor();
+        tokio::select! {
+            _ = extract(&ex, &source, all) => panic!("the extraction ended before ffmpeg was let go"),
+            () = started.notified() => {}
+        }
+
+        // Returns once the run is gone: dropped, so ffmpeg is killed, and the
+        // folder's lock is free.
+        ex.shutdown().await;
+        assert!(ex.lock_for("/cache").try_lock().is_ok());
+        release.notify_one();
+        tokio::task::yield_now().await;
+
+        assert!(!ex.io.file_exists("/cache/font.ttf"));
+        assert!(matches!(
+            extract(&ex, &source, all).await,
+            Err(ServiceError::Backend(message)) if message.contains("shutting down")
+        ));
+        assert_eq!(ex.io.runs.load(Ordering::SeqCst), 1);
     }
 
     /// A cached file gone before it is opened is upstream's

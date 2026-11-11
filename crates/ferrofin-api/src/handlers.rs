@@ -3621,13 +3621,19 @@ pub const VERIFIED: &[Verified] = &[
         ferrofin: "handlers/system.rs restart_application (auth.rs RequireAdmin) → ferrofin-core \
                system_manager.rs restart → apps/ferrofin-server state.rs \
                FerrofinLifecycleController stop, lib.rs announce_shutdown, tear_down_host \
-               (HlsStreamManager::shutdown, LiveTvManager::shutdown: Program.cs disposes the \
-               host, RecordingsManager.Dispose, MediaSourceManager.Dispose)",
-        date: "2026-11-08",
+               (HlsStreamManager::shutdown, AttachmentExtractor::shutdown, \
+               LiveTvManager::shutdown: Program.cs disposes the host, RecordingsManager.Dispose, \
+               AttachmentExtractor.Dispose, MediaSourceManager.Dispose)",
+        date: "2026-11-11",
         divergences: &[
-            "The host teardown goes further than upstream's disposal (gl-141). It does four things. \
+            "The host teardown goes further than upstream's disposal (gl-141). It does five things. \
          It kills every transcode: upstream's TranscodeManager.Dispose kills no job, and each \
          dies at its own kill timer, into a transcode cache the next host has already purged. \
+         It kills every attachment extraction still running and deletes the outputs it names \
+         (gl-1517; a batch dump names none, as its files are named by the media): \
+         upstream's AttachmentExtractor.Dispose only disposes its locks, and an extraction, \
+         which runs with a token nothing cancels, finishes under the next host, whose fresh \
+         locks let a request serve the half-written file or start a second ffmpeg onto it. \
          It closes every open live stream: MediaSourceManager.Dispose releases one consumer \
          per stream. It stops the pending recording timers: upstream does not dispose its \
          TimerManager. And it waits for the recordings RecordingsManager.Dispose cancels to \
@@ -3722,12 +3728,13 @@ pub const VERIFIED: &[Verified] = &[
         upstream_file: "Jellyfin.Api/Controllers/VideoAttachmentsController.cs",
         upstream_method: "GetAttachment",
         ferrofin: "handlers/hls.rs get_video_attachment → ferrofin-mediaencoding \
-               attachments/extractor.rs get_attachment, extract_attachment \
-               (AttachmentExtractor.GetAttachment, GetAttachmentStream, ExtractAttachment, \
-               ExtractAttachmentInternal) → apps/ferrofin-server media_encoding.rs \
-               MediaSourceManagerResolver, FfmpegAttachmentIo open_file, run_ffmpeg → \
-               handlers/streaming.rs opened_file_response (FileStreamResult)",
-        date: "2026-11-09",
+               attachments/extractor.rs get_attachment, run_to_completion (the extraction \
+               on a task of its own: upstream passes CancellationToken.None), \
+               extract_attachment (AttachmentExtractor.GetAttachment, GetAttachmentStream, \
+               ExtractAttachment, ExtractAttachmentInternal) → apps/ferrofin-server \
+               media_encoding.rs MediaSourceManagerResolver, FfmpegAttachmentIo open_file, \
+               run_ffmpeg → handlers/streaming.rs opened_file_response (FileStreamResult)",
+        date: "2026-11-11",
         divergences: &[
             "The media source comes from GetStaticMediaSources: upstream's \
          GetPlaybackMediaSources(item, null, true, false) first re-probes a .strm item (and \
@@ -3735,9 +3742,6 @@ pub const VERIFIED: &[Verified] = &[
          attachments here. Fix path: gl-1519. Its dynamic sources, a channel's tuner \
          streams, are in the static list here, and list no attachments on either side (a \
          404).",
-            "A dropped request kills a running extraction and deletes its output (gl-283); \
-         upstream's action passes CancellationToken.None, so its extraction runs to the end \
-         and the next request is served from the cache. Fix path: gl-1517.",
             "A whitespace-only mediaSourceId is the 400 only once the item is found: upstream's \
          model validation refuses it before the item is read, so for a missing or hidden \
          item it is a 400 there and a 404 here. Fix path: gl-1518.",
