@@ -365,15 +365,19 @@ for the same delay, with or without real time monitoring. Sonarr and Radarr send
 keys (`{"updates":[{"path":…}]}`); request bodies bind in any letter case, as Jellyfin's do.
 Either way, as Jellyfin's `FileRefresher` does, the scan starts at the nearest item already
 in the library and runs **Scan for new and updated files** on it. For a new episode in a
-season folder that is its season: the episode is added, the season (whose folder changed)
-is refreshed, the season's other episodes are checked but not probed or saved unless they
-changed too, and nothing else in the library is walked. For an episode in the series
+season folder that is its season: the episode is added, the season is checked and left as
+it was (a folder item stores no modification date, as in Jellyfin, so a change to its folder
+does not make it due for a refresh), the season's other episodes are checked but not probed
+or saved unless they changed too (a lone episode counts as changed once a second joins its
+folder, which changes its shared-folder flag, `IsInMixedFolder`), and nothing else in the
+library is walked. For an episode in the series
 folder itself (no season folders) it is the series. The series' **Date Episode Added** moves at once,
 where Jellyfin waits for the series' own next refresh. Measured with every Series, Season
 and Episode downloader off: a new episode appears about `LibraryMonitorDelay` seconds after
 its file lands (5.1 s with a 5 s delay), and the scan itself takes about 50 ms. Provider
-requests come on top: the new episode's first refresh asks every checked downloader, and
-the season's folder change asks the season providers.
+requests come on top: the new episode's first refresh asks every checked downloader
+(TheMovieDb's requests for an episode are under its season's path, `/tv/{id}/season/{n}`).
+The season's own providers are not asked because of the new episode.
 
 ### Accepted divergences (fixes, not gaps)
 
