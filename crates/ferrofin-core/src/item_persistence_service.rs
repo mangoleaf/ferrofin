@@ -1088,6 +1088,46 @@ pub(crate) async fn adopt_orphans(
     Ok(())
 }
 
+/// Adds the ancestors missing from the Playlists folder `folder` and from every
+/// playlist directly under it: each row's `ParentId` chain up to the root, as
+/// upstream's save of any item writes `GetAncestorIds()`
+/// (`ItemPersistenceService.cs:321-323`). Earlier builds wrote neither the
+/// folder's (the root) nor an API-made playlist's (the folder and the root).
+///
+/// Run on every boot, not once: a playlist the previous version makes during a
+/// rolling update has none either. Only missing rows are added
+/// (`INSERT OR IGNORE`, with links to rows that do not exist skipped), so a
+/// second run adds nothing. Playlists a library scan found sit under their
+/// library folders, not here, and keep the ancestors the scan gave them.
+pub(crate) async fn add_playlist_ancestors(
+    db: &Database,
+    folder: Uuid,
+) -> Result<u64, ServiceError> {
+    let Some(playlist) = stored_type_name(BaseItemKind::Playlist) else {
+        return Ok(0);
+    };
+    let added = sqlx::query(
+        r#"WITH RECURSIVE "chain"("ItemId", "ParentItemId") AS (
+               SELECT "Id", "ParentId" FROM "BaseItems"
+                WHERE ("Id" = ?1 OR ("ParentId" = ?1 AND "Type" = ?2))
+                  AND "ParentId" IS NOT NULL
+               UNION
+               SELECT c."ItemId", p."ParentId" FROM "chain" c
+                 JOIN "BaseItems" p ON p."Id" = c."ParentItemId"
+                WHERE p."ParentId" IS NOT NULL)
+           INSERT OR IGNORE INTO "AncestorIds" ("ItemId", "ParentItemId")
+           SELECT "ItemId", "ParentItemId" FROM "chain"
+            WHERE "ParentItemId" IN (SELECT "Id" FROM "BaseItems")"#,
+    )
+    .bind(guid_to_db(folder))
+    .bind(playlist)
+    .execute(db.writer())
+    .await
+    .map_err(db_err)?
+    .rows_affected();
+    Ok(added)
+}
+
 /// The concrete item-persistence service.
 #[derive(Clone)]
 pub struct FerrofinItemPersistenceService {
