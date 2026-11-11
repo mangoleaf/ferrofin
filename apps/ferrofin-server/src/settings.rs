@@ -18,7 +18,10 @@
 //! Precedence is the loader's: a flag, else the variable, else `config.toml`,
 //! else the default. A value a flag or a variable sets is locked on the page
 //! (owner decision D1 of the settings-page milestone): one saved to
-//! `config.toml` underneath would not apply while it is set.
+//! `config.toml` underneath would not apply while it is set. A setting
+//! jellyfin-web's Networking page covers ([`SettingSpec::network`]) takes the
+//! page's saved value between the variable and `config.toml` (owner decision
+//! on gl-555).
 
 use std::path::Path;
 use std::sync::Arc;
@@ -35,6 +38,7 @@ use ferrofin_model::server_settings::{
     ServerSettingUnit as Unit, ServerSettingsDto, ServerSettingsUpdateDto,
     ServerSettingsUpdateResultDto,
 };
+use ferrofin_networking::NetworkConfiguration;
 use ferrofin_traits::configuration::ServerConfigurationManager;
 use ferrofin_traits::error::ServiceError;
 use ferrofin_traits::plugins::PluginManager;
@@ -191,6 +195,12 @@ pub struct SettingSpec {
     /// them, as on Jellyfin's plugin pages). `null` when unset and the
     /// default applies.
     pub running: fn(&Config) -> Value,
+    /// The value the Networking page saved in the network configuration a
+    /// server lifetime started with, which outranks `config.toml` but not a
+    /// flag or a variable; `null` when it sets none, or covers no such
+    /// setting. Only for a read-only row: a `config.toml` save would not apply
+    /// under it, and nothing locks the row for it.
+    pub network: fn(&NetworkConfiguration) -> Value,
     /// A rule a value the page saves must meet beyond its kind: one the
     /// server applies by warning and falling back to the default, which a save
     /// refuses instead, so a value the server would ignore is never saved.
@@ -334,6 +344,7 @@ const ROW: SettingSpec = SettingSpec {
     options: &[],
     store: SettingStore::ConfigFile,
     running: |_| Value::Null,
+    network: |_| Value::Null,
     check: |_| Ok(()),
 };
 
@@ -423,13 +434,21 @@ pub static SETTINGS: &[SettingSpec] = &[
         label: "Base URL",
         group: Group::Network,
         access: SettingAccess::ReadOnly(
-            "Set it with the base_url key in config.toml or the FERROFIN_BASE_URL environment \
-             variable. The base URL on Dashboard → Networking is not read yet; it will take \
-             over.",
+            "Dashboard → Networking → Base URL sets it, and a change there applies after a \
+             restart. While that is empty, the base_url key in config.toml does. The \
+             FERROFIN_BASE_URL environment variable outranks both.",
         ),
         default: "none",
         description: "URL path prefix the server is mounted under.",
         running: |c| json!(c.base_url),
+        network: |n| {
+            let base = crate::base_url::normalize(&n.base_url);
+            if base.is_empty() {
+                Value::Null
+            } else {
+                json!(base)
+            }
+        },
         ..ROW
     },
     SettingSpec {
@@ -1657,7 +1676,11 @@ fn locked_reason(spec: &SettingSpec, source: Source, env: &dyn Env) -> Option<St
                  the server process."
             ))
         }
-        Source::ConfigFile | Source::ServerConfiguration | Source::Default => None,
+        // A row the Networking page covers says so in its note.
+        Source::NetworkConfiguration
+        | Source::ConfigFile
+        | Source::ServerConfiguration
+        | Source::Default => None,
     };
     match (note, set_by) {
         (Some(note), Some(set_by)) => Some(format!("{note} {set_by}")),
@@ -1684,7 +1707,8 @@ fn file_value(spec: &SettingSpec, file: &Config, in_use: Option<&Value>) -> Opti
 
 /// What the page receives for `spec`. `running` is the configuration in use;
 /// `saved` is `config.toml` as it is now, loaded alone, when it has keys;
-/// `configuration` is the server configuration, for a row stored there.
+/// `configuration` is the server configuration, for a row stored there;
+/// `network` the network configuration the lifetime started with.
 fn setting(
     spec: &SettingSpec,
     running: &Config,
@@ -1692,6 +1716,7 @@ fn setting(
     file_keys: &[String],
     saved: Option<&Config>,
     configuration: &ServerConfiguration,
+    network: &NetworkConfiguration,
 ) -> ServerSettingDto {
     let (kind, min, max) = spec.kind.to_dto();
     let mut dto = ServerSettingDto {
@@ -1726,7 +1751,9 @@ fn setting(
         custom: false,
     };
     match spec.store {
-        SettingStore::ConfigFile => from_the_file(spec, running, env, file_keys, saved, &mut dto),
+        SettingStore::ConfigFile => {
+            from_the_file(spec, running, env, file_keys, saved, network, &mut dto);
+        }
         SettingStore::ServerConfiguration(field) => {
             // Nothing outranks the server configuration, and the page may
             // always change it. A new server's value is its default.
@@ -1759,17 +1786,24 @@ fn fits_an_option(spec: &SettingSpec, text: &str) -> bool {
 /// Fills `dto` for `spec`, a row stored in `config.toml`: its value in use,
 /// the file's value when that differs, its source and whether the page may
 /// change it. A choice whose `config.toml` value fits no option reports that
-/// value as written, as Custom: the loader runs the default in its place.
+/// value as written, as Custom: the loader runs the default in its place. A
+/// value the Networking page saved in `network` outranks the file.
 fn from_the_file(
     spec: &SettingSpec,
     running: &Config,
     env: &dyn Env,
     file_keys: &[String],
     saved: Option<&Config>,
+    network: &NetworkConfiguration,
     dto: &mut ServerSettingDto,
 ) {
-    let source = source(spec, &running.cli, env, file_keys);
+    let mut source = source(spec, &running.cli, env, file_keys);
+    let on_the_page = present((spec.network)(network));
+    if on_the_page.is_some() && matches!(source, Source::ConfigFile | Source::Default) {
+        source = Source::NetworkConfiguration;
+    }
     let value = match spec.access {
+        _ if source == Source::NetworkConfiguration => on_the_page,
         SettingAccess::EnvOnly => spec
             .env
             .filter(|_| env_applies(spec, env))
@@ -1816,12 +1850,14 @@ fn no_longer_loads(path: &Path, err: &anyhow::Error) -> ServiceError {
 }
 
 /// Every one of `rows`, as the page receives them: those stored in
-/// `config.toml` as `running` holds them, the others as `configuration` does.
+/// `config.toml` as `running` holds them, unless `network` outranks it, the
+/// others as `configuration` does.
 fn snapshot(
     rows: &[SettingSpec],
     running: &Config,
     env: &dyn Env,
     configuration: &ServerConfiguration,
+    network: &NetworkConfiguration,
     restart_pending: bool,
 ) -> Result<ServerSettingsDto, ServiceError> {
     let path = &running.config_file;
@@ -1851,6 +1887,7 @@ fn snapshot(
                     &file_keys,
                     saved.as_ref(),
                     configuration,
+                    network,
                 )
             })
             .collect(),
@@ -1921,6 +1958,9 @@ pub struct FerrofinServerSettings {
     plugins: Arc<dyn PluginManager>,
     /// The server configuration, which the rows stored there read and save.
     configuration: Arc<dyn ServerConfigurationManager>,
+    /// The network configuration this lifetime started with, whose
+    /// Networking page values outrank `config.toml` ([`SettingSpec::network`]).
+    network: NetworkConfiguration,
     /// The rows it reports and saves: [`SETTINGS`].
     rows: &'static [SettingSpec],
 }
@@ -1945,8 +1985,17 @@ impl FerrofinServerSettings {
             lifecycle,
             plugins,
             configuration,
+            network: NetworkConfiguration::default(),
             rows: SETTINGS,
         }
+    }
+
+    /// The same, reporting the values the Networking page saved in
+    /// `network`, the network configuration this lifetime started with.
+    #[must_use]
+    pub fn with_network(mut self, network: NetworkConfiguration) -> Self {
+        self.network = network;
+        self
     }
 
     /// The same, with `env` in place of the process environment.
@@ -1977,6 +2026,7 @@ impl ServerSettingsManager for FerrofinServerSettings {
         let restart_pending = self.lifecycle.has_pending_restart();
         let configuration = self.configuration.configuration().await?;
         let running = self.config.clone();
+        let network = self.network.clone();
         let env = Arc::clone(&self.env);
         let rows = self.rows;
         // Reads config.toml and probes its directory.
@@ -1986,6 +2036,7 @@ impl ServerSettingsManager for FerrofinServerSettings {
                 &running,
                 env.as_ref(),
                 &configuration,
+                &network,
                 restart_pending,
             )
         })

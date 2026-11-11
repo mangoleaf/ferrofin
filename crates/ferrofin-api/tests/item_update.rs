@@ -2408,9 +2408,13 @@ async fn refresh_missing_item_is_404() {
     assert!(queued.lock().unwrap().is_empty());
 }
 
-/// `POST /Items/{itemId}/ContentType` for a missing item is a `404`.
+/// `POST /Items/{itemId}/ContentType` for a missing item is a `404`; for the
+/// nil id a `400`, as `GetItemById(Guid.Empty)` throws `ArgumentException`.
+#[rstest::rstest]
+#[case::missing(Uuid::from_u128(0xFEED), StatusCode::NOT_FOUND)]
+#[case::nil(Uuid::nil(), StatusCode::BAD_REQUEST)]
 #[tokio::test]
-async fn content_type_missing_item_is_404() {
+async fn content_type_unresolved_item(#[case] item_id: Uuid, #[case] expected: StatusCode) {
     let router = create_router(state(
         Uuid::from_u128(0x5D),
         Arc::new(Mutex::new(Vec::new())),
@@ -2419,17 +2423,14 @@ async fn content_type_missing_item_is_404() {
         .oneshot(
             Request::builder()
                 .method("POST")
-                .uri(format!(
-                    "/Items/{}/ContentType?contentType=movies",
-                    Uuid::from_u128(0xFEED)
-                ))
+                .uri(format!("/Items/{item_id}/ContentType?contentType=movies"))
                 .header("X-Emby-Token", "valid")
                 .body(Body::empty())
                 .unwrap(),
         )
         .await
         .unwrap();
-    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    assert_eq!(response.status(), expected);
 }
 
 // ---- from batch16_handlers.rs -------------------------------------------------

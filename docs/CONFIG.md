@@ -48,10 +48,11 @@ boots.
 
 `GET /Ferrofin/Settings` (administrators only) reports every setting below with its readable
 name (`Label`), its tab (`Group`), the value in use and its unit (`Unit`, when it has one), its
-default, and where that value comes from: a flag, a variable, `config.toml` or the default. A
-value `config.toml` holds that is not in use (the file changed since the server started, or a flag
-or variable outranks it) is reported beside it. A choice lists its options (`Options`, each with
-its `Value`, `Label` and `Note`) and says when the stored value fits none (`Custom: true`, the
+default, and where that value comes from: a flag, a variable, the Networking page (`base_url`
+only), `config.toml` or the default. A value `config.toml` holds that is not in use (the file
+changed since the server started, or a flag, a variable or the Networking page outranks it) is
+reported beside it. A choice lists its options (`Options`, each with its `Value`, `Label` and
+`Note`) and says when the stored value fits none (`Custom: true`, the
 value as written in `Value`); a setting may carry a longer `Note`; and each says where it is
 stored (`Store`: `ConfigFile`, or `ServerConfiguration` for one the server configuration holds,
 which applies at once, `Applies: Immediately`). Each setting also says
@@ -72,8 +73,8 @@ Trickplay, Images, Providers, Performance, Logging, Plugins, System), the first 
 on the left (a row above the settings on a narrow screen). Each setting
 is headed by a readable name, with its `config.toml` key, variable, flag and default on a small
 line below, then its description. A badge beside the name says what sets it, when anything does
-(`config.toml`, a variable or a flag), and secrets are marked as secrets. Disabling the plugin
-hides the page and the menu entry.
+(`config.toml`, the Networking page, a variable or a flag), and secrets are marked as secrets.
+Disabling the plugin hides the page and the menu entry.
 
 ### Editing settings from the dashboard
 
@@ -113,8 +114,8 @@ A search box and two filters sit above the tabs, since they reach every tab:
 - the search matches a setting's name, description, `config.toml` key, variable and flag,
   ignoring case, and each word typed must match. It lists the matches of every tab, each tab's
   under its name with their count, and dims the tabs with none (so does **Changed**);
-- **Changed** lists, from every tab, the settings something sets (a flag, a variable or
-  `config.toml`) and those holding an edit not saved yet;
+- **Changed** lists, from every tab, the settings something sets (a flag, a variable, the
+  Networking page or `config.toml`) and those holding an edit not saved yet;
 - **Hide read-only** leaves out the settings the page may not change, on a tab and in a list.
 
 Opening a tab ends a search and **Changed**. Each tab shows how many edits it
@@ -143,8 +144,8 @@ changed. These have no field whatever sets them, each with its reason on the pag
   it lists, so it is set the same way, for the same reason;
 - the settings jellyfin-web's own pages cover: `bind_addr`, `published_url`, `port`, `https_port`
   and `base_url` under Dashboard → Networking, `server_name` and `enable_metrics` under
-  Dashboard → General (Networking does not drive `port`, `https_port` and `base_url` yet, so their
-  notes say to set them by hand in `config.toml`, or with their variable or flag);
+  Dashboard → General (Networking does not drive `port` and `https_port` yet, so their notes say
+  to set them by hand in `config.toml`, or with their variable or flag);
 - the OpenTelemetry variables, which `config.toml` has no key for.
 
 A saved change [applies at the next restart](#when-a-change-applies). After a save the line below
@@ -239,7 +240,7 @@ Jellyfin `jellyfin.db` (root or `data/jellyfin.db`) found in the data dir — se
 | `FERROFIN_PORT` | `8096` | HTTP port. |
 | `FERROFIN_HTTPS_PORT` | `8920` | HTTPS port (parity value). Served beside the HTTP port when the dashboard's Networking settings enable HTTPS and the PKCS#12 (`.pfx`) certificate at their certificate path loads; see [HTTPS](#https). |
 | `FERROFIN_PUBLISHED_URL` | auto-detect | Public base URL advertised to clients. |
-| `FERROFIN_BASE_URL` | none | URL path prefix the server is mounted under. |
+| `FERROFIN_BASE_URL` | none | URL path prefix the server is mounted under. It outranks **Base URL** on Dashboard → Networking, which outranks the `config.toml` key `base_url`. A blank value is set: it serves at the root and still outranks the Networking page. A change on the Networking page applies after a restart, and the dashboard shows the restart as pending. |
 | `FERROFIN_SERVER_NAME` | host name | Server name reported to clients. |
 | `FERROFIN_LOG` | `info` | Log filter, `RUST_LOG`/`EnvFilter` syntax; `RUST_LOG` wins when set. The `config.toml` key is `log_level`. |
 | `FERROFIN_LOG_FORMAT` | `json` | Stdout log lines: `json` (one JSON object per line, with the request's `trace_id`, for a log pipeline) or `text` (human-readable, for running the server by hand). Any other value logs a warning and is `json`. The log file under `{data_dir}/log` is always plain text. The `config.toml` key is `log_format`. |

@@ -2525,6 +2525,15 @@ struct RefreshContext<'a> {
     version_groups: &'a VersionGroups,
 }
 
+/// `BeforeSaveInternal`'s `item.HasChanged(info.LastWriteTimeUtc)`: the
+/// stat'ed file `item` moved from the `DateModified` stored for it. A path
+/// that could not be stat'ed, or a directory (D2), has no mtime to compare.
+fn file_changed(stored: &BaseItemEntity, item: &Planned) -> bool {
+    item.entity.date_modified.is_some_and(|mtime| {
+        ferrofin_providers::refresh_plan::file_changed(stored.date_modified, mtime)
+    })
+}
+
 impl<'a> RefreshContext<'a> {
     /// A context for `run` over nothing yet: every item in scope, no policy,
     /// lock, external resolver or superseded copy.
@@ -2569,9 +2578,8 @@ impl<'a> RefreshContext<'a> {
     /// rule skips), and a path that could not be stat'ed has no mtime to
     /// compare.
     fn redated(&self, stored: &BaseItemEntity, item: &Planned) -> Option<DateTime<Utc>> {
-        let mtime = item.entity.date_modified?;
         self.date_if_changed(item)
-            .filter(|_| ferrofin_providers::refresh_plan::file_changed(stored.date_modified, mtime))
+            .filter(|_| file_changed(stored, item))
     }
 
     /// The date [`redated`](Self::redated) gives `item` should its file have
@@ -4407,7 +4415,8 @@ pub struct LibraryScanner {
     /// metadata folders, then its extracted data (trickplay tiles in both
     /// locations, chapter images, subtitle and attachment caches) — which
     /// every row a scan removes takes too
-    /// ([`delete_with_item_data`](Self::delete_with_item_data)). `None` until
+    /// ([`delete_with_item_data`](Self::delete_with_item_data)); and the
+    /// prune of a video whose file changed (`scan_item`). `None` until
     /// [`with_item_data_cleanup`](Self::with_item_data_cleanup) (unit tests),
     /// or with no item repository: a removal deletes rows only.
     item_data: Option<Arc<crate::item_data_cleanup::ItemDataCleanup>>,
@@ -4969,7 +4978,8 @@ impl LibraryScanner {
     }
 
     /// The library manager's delete cleanup (the item's metadata folders and
-    /// extracted data), which every row a scan removes takes before it goes.
+    /// extracted data), which every row a scan removes takes before it goes,
+    /// and which prunes a video whose file changed.
     #[must_use]
     pub fn with_item_data_cleanup(
         mut self,
@@ -8160,7 +8170,6 @@ impl LibraryScanner {
         // An NFO always credits a list, empty when it names nobody
         // (`BaseNfoParser` calls `ResetPeople`).
         let nfo_people = local.found.then_some(local.people);
-        let nfo_ids = local.ids;
         // `var isLocalLocked = temp.Item.IsLocked` (`MetadataService.cs:873`):
         // an NFO's `<lockdata>true` skips the remote providers for this pass
         // and, through the merge's metadata-settings half, locks the item
@@ -8170,6 +8179,30 @@ impl LibraryScanner {
         if nfo_locked {
             entity.is_locked = true;
         }
+        // Photos and books carry their metadata inside the file, not on any
+        // remote provider — local readers, run with the NFO and before the
+        // remote providers (a book's readers are upstream's
+        // `ILocalMetadataProvider`s), so a remote provider fills only what
+        // they left. A photo's Primary image is the file itself; a book's is
+        // the cover extracted from its archive.
+        let (embedded_people, embedded_ids, embedded_images, embedded_read) = if plan.local_metadata
+        {
+            self.enrich_from_file(&mut entity, locked, policy).await
+        } else {
+            (Vec::new(), Vec::new(), Vec::new(), false)
+        };
+        let embedded_found =
+            embedded_read || !embedded_people.is_empty() || !embedded_images.is_empty();
+        // The first local reader that found metadata supplies `temp`'s ids,
+        // as it does the credits (below): the NFO's, else the file's (a
+        // book's OPF identifiers, `OpfReader.CreateBookFromOpf`). Like the
+        // NFO's, they count only when the local readers run (`run_local`):
+        // identifying keeps the chosen result's ids.
+        let local_reader_ids = match (local.found, run_local) {
+            (true, _) => local.ids,
+            (false, true) => embedded_ids,
+            (false, false) => Vec::new(),
+        };
         // A new item's resolver read the ids its name carries
         // (`SetProviderIdsFromPath`): the item's own before any provider
         // runs.
@@ -8186,7 +8219,7 @@ impl LibraryScanner {
             Some(_) if series_child => Vec::new(),
             Some(result) => search_result_ids(result),
             None => merge_provider_ids(
-                known_provider_ids(&nfo_ids, state.art_cache, &entity.id),
+                known_provider_ids(&local_reader_ids, state.art_cache, &entity.id),
                 resolved_ids.clone(),
             ),
         };
@@ -8196,19 +8229,6 @@ impl LibraryScanner {
         // save: a refresh that stops or fails before it saves the item
         // leaves its ids as they were.
         let identified = state.refresh.identified(item);
-        // Photos and books carry their metadata inside the file, not on any
-        // remote provider — local readers, run with the NFO and before the
-        // remote providers (a book's readers are upstream's
-        // `ILocalMetadataProvider`s), so a remote provider fills only what
-        // they left. A photo's Primary image is the file itself; a book's is
-        // the cover extracted from its archive.
-        let (embedded_people, embedded_images, embedded_read) = if plan.local_metadata {
-            self.enrich_from_file(&mut entity, locked, policy).await
-        } else {
-            (Vec::new(), Vec::new(), false)
-        };
-        let embedded_found =
-            embedded_read || !embedded_people.is_empty() || !embedded_images.is_empty();
         // A pass whose remote providers run only because a D2 backfill
         // heuristic asked (none of upstream's triggers fired) merges like
         // "Search for missing metadata": its answers only fill what the item
@@ -8221,7 +8241,7 @@ impl LibraryScanner {
         // provider running, and only then do the backfill's answers fill.
         let backfill_only = plan.remote_metadata && !plan.run_all_providers;
         let local_row = (backfill_only && plan.local_monitor_fired).then(|| entity.clone());
-        let local_ids = local_row.as_ref().map(|_| nfo_ids.clone());
+        let local_ids = local_row.as_ref().map(|_| local_reader_ids.clone());
         // Then every enabled remote provider, one after the other, fills the
         // gaps the NFO left (`ExecuteRemoteProviders`, see
         // `fetch_remote_metadata`), so a bare file with no NFO shows the same
@@ -8273,10 +8293,10 @@ impl LibraryScanner {
         // upstream's book readers, only ever adds people).
         let local_people =
             nfo_people.or_else(|| (!embedded_people.is_empty()).then_some(embedded_people));
-        // The ids the pass's readers and providers answered with, the NFO's
-        // first; the probe's tag ids settle apart from them
+        // The ids the pass's readers and providers answered with, the local
+        // reader's first; the probe's tag ids settle apart from them
         // (`AudioFileProber`'s own rule).
-        let pass_ids = merge_provider_ids(nfo_ids, remote.provider_ids);
+        let pass_ids = merge_provider_ids(local_reader_ids, remote.provider_ids);
         // An existing item is saved as its stored row with this scan's
         // file facts and provider results merged on (upstream's Default
         // refresh), never as the row rebuilt from disk.
@@ -8493,7 +8513,8 @@ impl LibraryScanner {
         });
         // The ids follow the merge: a backfill's only fill
         // (`MergeBaseItemData` with `replaceData` false, `MetadataService.cs:
-        // 1307-1334`), after the NFO's merged by the mode when it changed.
+        // 1307-1334`), after the local reader's merged by the mode when it
+        // changed.
         let none = Vec::new();
         let (replaced_ids, filled_ids) = match (&local_ids, backfill_only) {
             (Some(local_ids), _) => (local_ids, &pass_ids),
@@ -8704,6 +8725,24 @@ impl LibraryScanner {
         );
         if !decision.save {
             return Ok(ItemSaved::Unchanged);
+        }
+        // `BeforeSaveInternal`: a video whose file changed loses what was
+        // extracted from the old file before this refresh's trickplay and
+        // chapters extract from the new one. Only on a save, which stores the
+        // new `DateModified`, so the same change never prunes twice.
+        //
+        // TODO(parity, open work item — NOT an accepted divergence; gl-1697):
+        // a row the scan could not read (`Stored::Unread`, and
+        // `Stored::Undecodable` above) has no stored `DateModified` to
+        // compare, yet its save stores the new one, so its change is never
+        // pruned. Un-defer path: have the save (`update_file_facts` for an
+        // undecodable row) report whether the stored `DateModified` drifted,
+        // and prune on that; never count an unknown date as changed.
+        if let (Some(stored), Some(cleanup)) = (stored_row, &self.item_data)
+            && file_changed(stored, item)
+            && kind.is_some_and(crate::kinds::is_video)
+        {
+            cleanup.prune_extracted_data(&entity).await?;
         }
         // Existing items can run from fresh probe values before their final
         // save: Blocking keeps the metadata Etag unchanged until extraction
@@ -18310,39 +18349,45 @@ impl LibraryScanner {
 
     /// The embedded-metadata passes for the kinds whose metadata lives inside
     /// the file rather than on a remote provider: photos (EXIF) and books
-    /// (`ComicInfo`/`ComicBookInfo`/OPF). Returns the credits and the image
-    /// extracted from the file, for the artwork pass, and whether a book's
-    /// reader found metadata at all (a text-only OPF answers too:
-    /// `MetadataImport`).
+    /// (`ComicInfo`/`ComicBookInfo`/OPF). Returns the credits, a book's
+    /// provider ids, the image extracted from the file, for the artwork pass,
+    /// and whether a book's reader found metadata at all (a text-only OPF
+    /// answers too: `MetadataImport`).
     async fn enrich_from_file(
         &self,
         entity: &mut BaseItemEntity,
         locked: bool,
         policy: FetcherPolicy<'_>,
-    ) -> (Vec<PeopleEntity>, Vec<ItemImageInfo>, bool) {
+    ) -> (
+        Vec<PeopleEntity>,
+        Vec<(String, String)>,
+        Vec<ItemImageInfo>,
+        bool,
+    ) {
         let images = self.enrich_photo(entity, locked).await;
-        let (people, book_found) = self.enrich_book(entity, locked, policy).await;
-        (people, images, book_found)
+        let (people, ids, book_found) = self.enrich_book(entity, locked, policy).await;
+        (people, ids, images, book_found)
     }
 
     /// The book embedded-metadata pass — port of `ComicProvider`,
     /// `ComicBookInfoProvider`, `EpubProvider` and `OpfProvider`.
     ///
     /// Fills only what the row still lacks, like every other local reader, and
-    /// returns the cast (writer/penciller/…). The covers are the two dynamic
-    /// image providers' job, in the ordered artwork pass
+    /// returns the cast (writer/penciller/…) and the provider ids (an OPF's
+    /// ISBN, Google Books and Amazon identifiers). The covers are the two
+    /// dynamic image providers' job, in the ordered artwork pass
     /// ([`extract_book_cover`](Self::extract_book_cover)).
     async fn enrich_book(
         &self,
         entity: &mut BaseItemEntity,
         locked: bool,
         policy: FetcherPolicy<'_>,
-    ) -> (Vec<PeopleEntity>, bool) {
+    ) -> (Vec<PeopleEntity>, Vec<(String, String)>, bool) {
         if !entity.type_.ends_with(".Book") || locked {
-            return (Vec::new(), false);
+            return (Vec::new(), Vec::new(), false);
         }
         let Some(path) = entity.path.clone().filter(|p| !p.is_empty()) else {
-            return (Vec::new(), false);
+            return (Vec::new(), Vec::new(), false);
         };
         let read = {
             let path = path.clone();
@@ -18355,14 +18400,19 @@ impl LibraryScanner {
             })
             .await
         };
-        let (people, found) = match read.ok().flatten() {
+        match read.ok().flatten() {
             Some(book) => {
                 apply_book(entity, &book);
-                (book_people(&book), true)
+                // `OpfReader`'s `SetProviderId`s: trimmed, a blank one dropped.
+                let ids = ferrofin_providers::metadata_merge::set_provider_ids(
+                    book.provider_ids
+                        .iter()
+                        .map(|(k, v)| (k.as_str(), v.as_str())),
+                );
+                (book_people(&book), ids, true)
             }
-            None => (Vec::new(), false),
-        };
-        (people, found)
+            None => (Vec::new(), Vec::new(), false),
+        }
     }
 
     /// A book cover extractor's turn in the artwork pass: it fills a missing
@@ -23136,18 +23186,18 @@ fn apply_details(entity: &mut BaseItemEntity, d: &TmdbDetails) {
     }
 }
 
-/// The ids a fetcher may resolve this row by: the sidecar's first, then any the
-/// row already carries from a previous scan.
+/// The ids a fetcher may resolve this row by: the local reader's (an NFO's, a
+/// book's OPF) first, then any the row already carries from a previous scan.
 ///
 /// Both are `info.GetProviderId` as far as the fetchers are concerned; the
-/// sidecar leads because it is what the user pinned.
+/// local file leads because it is what the user pinned.
 fn known_provider_ids(
-    nfo_ids: &[(String, String)],
+    local_ids: &[(String, String)],
     art_cache: &ArtworkCache,
     entity_id: &str,
 ) -> Vec<(String, String)> {
     merge_provider_ids(
-        nfo_ids.to_vec(),
+        local_ids.to_vec(),
         art_cache
             .item_provider_ids
             .get(entity_id)
@@ -39471,6 +39521,186 @@ mod tests {
         assert_eq!(book.tagline.as_deref(), Some("Plugin tagline."));
     }
 
+    /// A book's OPF identifiers are its provider ids: `OpfReader.
+    /// CreateBookFromOpf` sets ISBN, GoogleBooks and Amazon with
+    /// `SetProviderId`, the first local reader with metadata merges them into
+    /// `temp` (`MetadataService.cs:805-853`), the remote providers' lookup
+    /// starts from them (`MergeNewData`), and a Default scan writes them over
+    /// the stored ones (`MergeBaseItemData` with `shouldReplace`), so a
+    /// changed ISBN replaces the old one.
+    #[tokio::test]
+    // A recording plugin + full scan harness + two scans; the sequence is the
+    // point.
+    #[allow(clippy::too_many_lines)]
+    async fn a_books_opf_identifiers_are_its_provider_ids() {
+        /// A plugin source that answers nothing and records the ids it was
+        /// asked by.
+        #[derive(Default)]
+        struct LookupIds(std::sync::Mutex<Vec<Vec<(String, String)>>>);
+        #[async_trait::async_trait]
+        impl ferrofin_traits::providers::DynamicMetadataProvider for LookupIds {
+            fn name(&self) -> &'static str {
+                "lookup-ids"
+            }
+            async fn lookup(
+                &self,
+                item: &ferrofin_traits::providers::DynamicMetadataLookup,
+            ) -> Result<
+                Option<ferrofin_traits::providers::DynamicMetadataResult>,
+                ferrofin_traits::error::ServiceError,
+            > {
+                self.0.lock().unwrap().push(item.provider_ids.clone());
+                Ok(None)
+            }
+        }
+        let opf = |isbn: &str| {
+            format!(
+                r#"<package xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:opf="http://www.idpf.org/2007/opf"><metadata><dc:title>Dune</dc:title><dc:identifier opf:scheme="ISBN">{isbn}</dc:identifier><dc:identifier opf:scheme="GOOGLE"> B1hSG45JCX4C </dc:identifier></metadata></package>"#
+            )
+        };
+        let tmp = tempfile::tempdir().unwrap();
+        let media = tmp.path().join("books");
+        std::fs::create_dir_all(&media).unwrap();
+        // Not a ZIP: only the `<stem>.opf` sidecar reads.
+        std::fs::write(media.join("Dune.epub"), b"not an archive").unwrap();
+        let sidecar = media.join("Dune.opf");
+        std::fs::write(&sidecar, opf("9780441013593")).unwrap();
+        let db = Database::connect_in_memory().await.unwrap();
+        db.run_migrations().await.unwrap();
+        let persistence = Arc::new(FerrofinItemPersistenceService::new(db.clone()));
+        let vf: Arc<dyn VirtualFolderManager> = Arc::new(
+            FerrofinVirtualFolderManager::new(tmp.path().join("views"))
+                .with_item_store(persistence.clone()),
+        );
+        vf.add_virtual_folder(
+            "Books",
+            Some(CollectionTypeOptions::books),
+            &LibraryOptions {
+                path_infos: vec![MediaPathInfo {
+                    path: media.to_string_lossy().into_owned(),
+                }],
+                ..LibraryOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+        let seen = Arc::new(LookupIds::default());
+        let scanner =
+            LibraryScanner::new(vf, Arc::new(FerrofinFileSystem::new()), persistence.clone())
+                .with_items(crate::test_support::item_repository_over(db))
+                .with_dynamic_providers(vec![seen.clone()]);
+        let id = crate::item_type_lookup::derive_item_id(
+            BaseItemKind::Book,
+            &media.join("Dune.epub").to_string_lossy(),
+        )
+        .expect("id");
+        let stored_ids = || async {
+            let mut ids = persistence
+                .provider_ids_for_items(&[id])
+                .await
+                .expect("ids")
+                .remove(&id)
+                .unwrap_or_default();
+            ids.sort();
+            ids
+        };
+        let pair = |k: &str, v: &str| (k.to_owned(), v.to_owned());
+
+        scanner.scan_all().await.unwrap();
+        assert_eq!(
+            stored_ids().await,
+            [
+                pair("GoogleBooks", "B1hSG45JCX4C"),
+                pair("ISBN", "9780441013593")
+            ],
+            "the OPF's identifiers, trimmed, are the book's ids"
+        );
+        let asked = seen.0.lock().unwrap().clone();
+        assert!(
+            asked
+                .first()
+                .is_some_and(|ids| ids.contains(&pair("ISBN", "9780441013593"))),
+            "the plugin was asked by the OPF's ISBN: {asked:?}"
+        );
+
+        std::fs::write(&sidecar, opf("9780593099322")).unwrap();
+        // Newer than the book's last save: the OPF reader's change monitor.
+        std::fs::File::options()
+            .write(true)
+            .open(&sidecar)
+            .unwrap()
+            .set_modified(std::time::SystemTime::now() + std::time::Duration::from_hours(1))
+            .unwrap();
+        scanner.scan_all().await.unwrap();
+        assert_eq!(
+            stored_ids().await,
+            [
+                pair("GoogleBooks", "B1hSG45JCX4C"),
+                pair("ISBN", "9780593099322")
+            ],
+            "a Default scan replaces the stored ISBN with the file's new one"
+        );
+
+        // Identify → Apply: the local readers do not run, so the chosen
+        // result's ISBN stands over the file's.
+        let chosen = ferrofin_traits::providers::MetadataRefreshOptions {
+            metadata_refresh_mode: MetadataRefreshMode::FullRefresh,
+            image_refresh_mode: MetadataRefreshMode::FullRefresh,
+            replace_all_metadata: true,
+            replace_all_images: true,
+            remove_old_metadata: true,
+            search_result: Some(ferrofin_model::providers::RemoteSearchResult {
+                name: Some("Dune".into()),
+                provider_ids: Some(std::collections::HashMap::from([pair(
+                    "ISBN",
+                    "9780000000002",
+                )])),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let none = ferrofin_traits::providers::MetadataRefreshOptions {
+            metadata_refresh_mode: MetadataRefreshMode::None,
+            image_refresh_mode: MetadataRefreshMode::None,
+            ..Default::default()
+        };
+        let cancel = super::ScanCancel::new();
+        scanner
+            .scan_target(
+                &super::ScanTarget::Items(vec![
+                    media.join("Dune.epub").to_string_lossy().into_owned(),
+                ]),
+                super::ScanRun::new(&chosen, &none, &cancel)
+                    .with_passes(super::ScanPasses::Touched),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            stored_ids().await,
+            [pair("ISBN", "9780000000002")],
+            "identifying keeps the chosen ids, not the OPF's"
+        );
+
+        // An OPF that no longer names an identifier removes none.
+        std::fs::write(
+            &sidecar,
+            r#"<package xmlns:dc="http://purl.org/dc/elements/1.1/"><metadata><dc:title>Dune</dc:title></metadata></package>"#,
+        )
+        .unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&sidecar)
+            .unwrap()
+            .set_modified(std::time::SystemTime::now() + std::time::Duration::from_hours(2))
+            .unwrap();
+        scanner.scan_all().await.unwrap();
+        assert_eq!(
+            stored_ids().await,
+            [pair("ISBN", "9780000000002")],
+            "the stored ids stand"
+        );
+    }
+
     // A dynamic (Tier-1b WASM) metadata source is a remote provider of the
     // fold: the local readers' values come first (here: the NFO year, which
     // its answer cannot replace), its answer fills what is still empty, its
@@ -40367,10 +40597,12 @@ mod tests {
         );
     }
 
-    /// Records each `DeleteExternalItemFiles` call's id and media path.
+    /// Records each `DeleteExternalItemFiles` call's id and media path, and
+    /// each `DeleteExternalItemDataAsync` call's media path.
     #[derive(Default)]
     struct RecordingExternalData {
         calls: std::sync::Mutex<Vec<(uuid::Uuid, String)>>,
+        pruned: std::sync::Mutex<Vec<String>>,
     }
 
     #[async_trait::async_trait]
@@ -40378,9 +40610,10 @@ mod tests {
         async fn delete_external_item_data(
             &self,
             _item_id: uuid::Uuid,
-            _media: ferrofin_traits::system::MediaLocation<'_>,
+            media: ferrofin_traits::system::MediaLocation<'_>,
         ) -> Result<(), ServiceError> {
-            unimplemented!("a scan removal only removes the files")
+            self.pruned.lock().unwrap().push(media.path.to_owned());
+            Ok(())
         }
 
         async fn delete_external_item_files(
@@ -40483,6 +40716,90 @@ mod tests {
             media.join("Kilo.mkv").to_string_lossy(),
             "no video named Kilo is left"
         );
+        assert!(
+            external.pruned.lock().unwrap().is_empty(),
+            "a scan removal only removes the files"
+        );
+    }
+
+    /// `MetadataService.BeforeSaveInternal` (`MetadataService.cs:373-399`):
+    /// a video whose file changed loses what was extracted from the old file
+    /// (`DeleteExternalItemDataAsync`), once. A new or unchanged item prunes
+    /// nothing, and neither does a changed file of another kind.
+    #[tokio::test]
+    async fn a_changed_video_file_is_pruned_of_its_extracted_data_once() {
+        use crate::item_repository::FerrofinItemRepository;
+        use crate::item_type_lookup::ItemTypeLookup;
+        use ferrofin_model::configuration::{LibraryOptions, MediaPathInfo};
+        use ferrofin_model::entities::CollectionTypeOptions;
+        use ferrofin_traits::persistence::ItemRepository;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let media = tmp.path().join("home");
+        std::fs::create_dir_all(&media).unwrap();
+        let (clip, photo) = (media.join("Clip.mkv"), media.join("Photo.jpg"));
+        for file in [&clip, &photo] {
+            std::fs::write(file, b"").unwrap();
+        }
+        let db = Database::connect_in_memory().await.unwrap();
+        db.run_migrations().await.unwrap();
+        let persistence = Arc::new(FerrofinItemPersistenceService::new(db.clone()));
+        let vf = Arc::new(
+            FerrofinVirtualFolderManager::new(tmp.path().join("default"))
+                .with_item_store(persistence.clone()),
+        );
+        vf.add_virtual_folder(
+            "Home",
+            Some(CollectionTypeOptions::homevideos),
+            &LibraryOptions {
+                path_infos: vec![MediaPathInfo {
+                    path: media.to_string_lossy().into_owned(),
+                }],
+                ..LibraryOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+        let items: Arc<dyn ItemRepository> = Arc::new(FerrofinItemRepository::new(
+            db.clone(),
+            Arc::new(ItemTypeLookup::new()),
+        ));
+        let external = Arc::new(RecordingExternalData::default());
+        let cleanup = Arc::new(crate::item_data_cleanup::ItemDataCleanup::new(
+            crate::app_paths::test_paths(tmp.path()),
+        ));
+        cleanup.set_external_data(external.clone());
+        let scanner = LibraryScanner::new(vf, Arc::new(FerrofinFileSystem::new()), persistence)
+            .with_items(items)
+            .with_item_data_cleanup(cleanup);
+        let pruned = || std::mem::take(&mut *external.pruned.lock().unwrap());
+
+        scanner.scan_all().await.unwrap();
+        assert_eq!(
+            pruned(),
+            Vec::<String>::new(),
+            "a new item has nothing to prune"
+        );
+        scanner.scan_all().await.unwrap();
+        assert_eq!(pruned(), Vec::<String>::new(), "nor has an unchanged one");
+
+        let later = std::time::SystemTime::now() + std::time::Duration::from_hours(1);
+        for file in [&clip, &photo] {
+            std::fs::File::options()
+                .write(true)
+                .open(file)
+                .unwrap()
+                .set_modified(later)
+                .unwrap();
+        }
+        scanner.scan_all().await.unwrap();
+        assert_eq!(
+            pruned(),
+            [clip.to_string_lossy().into_owned()],
+            "the changed video alone"
+        );
+        scanner.scan_all().await.unwrap();
+        assert_eq!(pruned(), Vec::<String>::new(), "and only once");
     }
 
     /// A real filesystem whose listing of one directory fails (`fail`), or

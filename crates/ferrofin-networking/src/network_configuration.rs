@@ -22,12 +22,12 @@
 //! manager; live interfaces refresh at boot, on save and before peer URL resolution.
 //!
 //! `AutoDiscovery` is captured at the start of each server lifetime and controls
-//! the UDP 7359 listener. Changing it requires a restart. HTTP listener ports, the
-//! advertised global URL and the mounted base URL come from the server's bootstrap
-//! configuration (CLI/environment/config.toml), not this DTO's corresponding fields.
-//! In particular, use `FERROFIN_BASE_URL` or bootstrap `base_url` for the mounted
-//! prefix; saving `BaseUrl` here does not remount routes. Bootstrap settings require
-//! a process restart to reload. `EnableHttps`, `RequireHttps` and the certificate
+//! the UDP 7359 listener. Changing it requires a restart. `BaseUrl` is read the same
+//! way: the server mounts, redirects to and advertises it for the whole lifetime,
+//! below `FERROFIN_BASE_URL` and above bootstrap `base_url`, and saving a different
+//! one flags a restart. HTTP listener ports and the advertised global URL come from
+//! the server's bootstrap configuration (CLI/environment/config.toml), not this DTO's
+//! corresponding fields. `EnableHttps`, `RequireHttps` and the certificate
 //! fields do apply: at startup the server listens with HTTPS on its bootstrap HTTPS
 //! port when HTTPS is enabled and the certificate loads, and a new certificate path
 //! flags a restart. `EnablePublishedServerUriByRequest` is read live.
