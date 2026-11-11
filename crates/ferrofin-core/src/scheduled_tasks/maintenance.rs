@@ -546,7 +546,10 @@ impl ScheduledTask for OptimizeDatabaseTask {
     fn default_triggers(&self) -> Vec<TaskTriggerInfo> {
         vec![interval_hours(6)]
     }
-    async fn execute(&self, progress: &TaskProgress) -> Result<(), ServiceError> {
+    /// Reports no progress, as upstream's `ExecuteAsync` (its
+    /// `RunScheduledOptimisation` takes none): `CurrentProgressPercentage`
+    /// stays null for the whole run.
+    async fn execute(&self, _progress: &TaskProgress) -> Result<(), ServiceError> {
         // `OptimizeDatabaseTask.ExecuteAsync`: the vacuum and the truncating
         // checkpoint hold the only writer a library scan writes through, and
         // can stall it, so the run waits for the next trigger.
@@ -601,12 +604,10 @@ impl ScheduledTask for OptimizeDatabaseTask {
             .execute(self.db.writer())
             .await
             .map_err(db_err)?;
-        progress.report(75.0);
         // `PRAGMA wal_checkpoint(TRUNCATE)`, in turn with the background
         // checkpoints: the vacuum's commit has just started one, which the
         // truncation would otherwise answer busy against.
         self.db.truncate_wal().await.map_err(ServiceError::from)?;
-        progress.report(100.0);
         Ok(())
     }
 }
@@ -1287,13 +1288,16 @@ mod tests {
 
     // -- Optimize database -------------------------------------------------
 
+    /// `OptimizeDatabaseTask.ExecuteAsync` never reports progress, so the
+    /// task's `CurrentProgressPercentage` stays null for the whole run.
     #[tokio::test]
-    async fn optimize_database_runs_pragmas_and_vacuum() {
+    async fn optimize_database_runs_without_reporting_progress() {
         let db = test_db().await;
+        seed_old_session(&db).await;
         let task = OptimizeDatabaseTask::new(
             db.clone(),
             idle_sessions(),
-            crate::test_support::library_manager_over(db),
+            crate::test_support::library_manager_over(db.clone()),
             retention_days(Some(30)),
         );
         assert_eq!(task.key(), "OptimizeDatabaseTask");
@@ -1303,7 +1307,8 @@ mod tests {
         );
         let progress = TaskProgress::default();
         task.execute(&progress).await.expect("run");
-        assert!((progress.current() - 100.0).abs() < f64::EPSILON);
+        assert_eq!(test_rows::remaining(&db).await, Vec::<String>::new());
+        assert_eq!(progress.reported(), None);
     }
 
     /// Ferrofin's plan pins assume the planner has no statistics, so the
@@ -1340,13 +1345,14 @@ mod tests {
             crate::test_support::library_manager_over(db.clone()),
             retention_days(Some(30)),
         );
-        let progress = TaskProgress::default();
-        task.execute(&progress).await.expect("skip is Ok");
-        assert!(
-            progress.current().abs() < f64::EPSILON,
-            "guarded run must not have executed the vacuum steps"
+        task.execute(&TaskProgress::default())
+            .await
+            .expect("skip is Ok");
+        assert_eq!(
+            test_rows::remaining(&db).await,
+            ["old"],
+            "a guarded run must return before the prune and the vacuum"
         );
-        assert_eq!(test_rows::remaining(&db).await, ["old"], "nor the prune");
     }
 
     /// `OptimizeDatabaseTask.ExecuteAsync` returns at once while a library
@@ -1363,13 +1369,14 @@ mod tests {
             crate::test_support::library_manager_mid_scan(db.clone()).await,
             retention_days(Some(30)),
         );
-        let progress = TaskProgress::default();
-        task.execute(&progress).await.expect("skip is Ok");
-        assert!(
-            progress.current().abs() < f64::EPSILON,
-            "a run during a library scan must not have executed the vacuum steps"
+        task.execute(&TaskProgress::default())
+            .await
+            .expect("skip is Ok");
+        assert_eq!(
+            test_rows::remaining(&db).await,
+            ["old"],
+            "a run during a library scan must return before the prune and the vacuum"
         );
-        assert_eq!(test_rows::remaining(&db).await, ["old"], "nor the prune");
     }
 
     /// While a backup snapshot holds the database's maintenance turn, the
@@ -1386,16 +1393,16 @@ mod tests {
         );
         seed_old_session(&db).await;
         let snapshot = db.try_maintenance_turn().expect("free");
-        let progress = TaskProgress::default();
-        task.execute(&progress).await.expect("skip is Ok");
-        assert!(
-            progress.current().abs() < f64::EPSILON,
-            "a run during a snapshot must not have executed the vacuum steps"
+        task.execute(&TaskProgress::default())
+            .await
+            .expect("skip is Ok");
+        assert_eq!(
+            test_rows::remaining(&db).await,
+            ["old"],
+            "a run during a snapshot must return before the prune and the vacuum"
         );
-        assert_eq!(test_rows::remaining(&db).await, ["old"], "nor the prune");
         drop(snapshot);
-        task.execute(&progress).await.expect("run");
-        assert!((progress.current() - 100.0).abs() < f64::EPSILON);
+        task.execute(&TaskProgress::default()).await.expect("run");
         assert_eq!(test_rows::remaining(&db).await, Vec::<String>::new());
     }
 
@@ -1405,15 +1412,15 @@ mod tests {
     async fn optimize_database_runs_on_when_the_prune_fails() {
         let db = test_db().await;
         test_rows::drop_table(&db).await;
+        assert!(test_rows::free_pages(&db).await > 0, "the drop freed pages");
         let task = OptimizeDatabaseTask::new(
             db.clone(),
             idle_sessions(),
-            crate::test_support::library_manager_over(db),
+            crate::test_support::library_manager_over(db.clone()),
             retention_days(Some(30)),
         );
-        let progress = TaskProgress::default();
-        task.execute(&progress).await.expect("run");
-        assert!((progress.current() - 100.0).abs() < f64::EPSILON);
+        task.execute(&TaskProgress::default()).await.expect("run");
+        assert_eq!(test_rows::free_pages(&db).await, 0, "the vacuum ran");
     }
 
     /// Ferrofin's playback-decision rows expire with the activity log: the
@@ -1439,11 +1446,12 @@ mod tests {
             .expect("run");
         assert_eq!(test_rows::remaining(&db).await, ["old", "recent"]);
 
-        // A window past chrono's earliest date keeps every row, and the
-        // optimize still runs to the end.
-        let progress = TaskProgress::default();
-        task(Some(i32::MAX)).execute(&progress).await.expect("run");
-        assert!((progress.current() - 100.0).abs() < f64::EPSILON);
+        // A window past chrono's earliest date keeps every row, and the run
+        // still succeeds.
+        task(Some(i32::MAX))
+            .execute(&TaskProgress::default())
+            .await
+            .expect("run");
         assert_eq!(test_rows::remaining(&db).await, ["old", "recent"]);
 
         // A negative window keeps every row, as unset does; its cutoff would
