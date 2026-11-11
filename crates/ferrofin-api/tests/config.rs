@@ -1500,6 +1500,51 @@ async fn named_configuration_converts_values_before_persisting_and_keeps_failed_
     assert_eq!(live.guide_days, None);
 }
 
+/// `LiveTvOptions` and `ListingsProviderInfo` are `#nullable disable` upstream:
+/// a null list binds and the save answers 204 (measured on Jellyfin 12.4).
+/// Ferrofin stores the empty list Jellyfin reads back from `livetv.xml`.
+#[tokio::test]
+async fn null_lists_in_the_livetv_document_are_saved_as_empty() {
+    let dir = tempfile::tempdir().unwrap();
+    let status = post(
+        admin_state_with_paths(paths_at(dir.path())),
+        "/System/Configuration/livetv",
+        &serde_json::json!({
+            "TunerHosts": null,
+            "MediaLocationsCreated": null,
+            "ListingProviders": [{"Type": "xmltv", "EnabledTuners": null, "ChannelMappings": null}],
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let live: ferrofin_model::live_tv::LiveTvOptions =
+        serde_json::from_slice(&std::fs::read(dir.path().join("named/livetv.json")).unwrap())
+            .unwrap();
+    let provider = ferrofin_model::live_tv::ListingsProviderInfo {
+        type_: Some("xmltv".to_owned()),
+        ..Default::default()
+    };
+    assert_eq!(
+        live,
+        ferrofin_model::live_tv::LiveTvOptions {
+            listing_providers: vec![provider],
+            ..Default::default()
+        }
+    );
+
+    let status = post(
+        admin_state_with_paths(paths_at(dir.path())),
+        "/System/Configuration/livetv",
+        &serde_json::json!({"ListingProviders": null}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let live: ferrofin_model::live_tv::LiveTvOptions =
+        serde_json::from_slice(&std::fs::read(dir.path().join("named/livetv.json")).unwrap())
+            .unwrap();
+    assert_eq!(live, ferrofin_model::live_tv::LiveTvOptions::default());
+}
+
 #[tokio::test]
 async fn nonfinite_encoding_values_survive_storage_and_fail_http_serialization() {
     let dir = tempfile::tempdir().unwrap();
