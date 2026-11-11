@@ -950,7 +950,9 @@ pub const VERIFIED_SUBSYSTEMS_AGAINST_EARLIER_PIN: &[(&str, &str)] = &[];
 /// `video-stream-copy` is whether a transcode job copies the source video and
 /// what dynamic HDR metadata the copy strips, which the HLS and stream routes
 /// share; `recording-postprocessing` is the executable run after a retained
-/// DVR capture, which no HTTP response describes.
+/// DVR capture, which no HTTP response describes; `recording-keep-up-to` is
+/// which of a series timer's recordings a starting capture deletes past its
+/// "Keep up to", which no HTTP response describes either.
 pub const SUBSYSTEM_KEYS: &[&str] = &[
     "query-translation",
     "dto-fields",
@@ -965,6 +967,7 @@ pub const SUBSYSTEM_KEYS: &[&str] = &[
     "trickplay",
     "video-stream-copy",
     "recording-postprocessing",
+    "recording-keep-up-to",
 ];
 
 /// One shared subsystem whose Ferrofin implementation was compared against the
@@ -992,6 +995,41 @@ pub struct VerifiedSubsystem {
 /// [`VERIFIED_SUBSYSTEMS_AGAINST_EARLIER_PIN`] names), under the rules of
 /// [`VERIFIED`]. Subsystem rows never count towards the operation parity line.
 pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
+    VerifiedSubsystem {
+        key: "recording-keep-up-to",
+        upstream_file: "src/Jellyfin.LiveTv/Recordings/RecordingsManager.cs",
+        upstream_method: "EnforceKeepUpTo",
+        ferrofin: "ferrofin-livetv manager.rs start_capture (OnStarted: spawned, as its async \
+                   void does not hold the recorder up) -> enforce_keep_up_to: no series timer \
+                   id, series folder or stored series timer, or KeepUpTo <= 0, does nothing; \
+                   under one lock (_recordingDeleteSemaphore) the series timer's Completed \
+                   timers whose file (TimerInfo.RecordingPath, kept on the timer's recording \
+                   row) is a file (File.Exists, so not a folder), \
+                   OrderByDescending(EndDate).Skip(KeepUpTo - 1), each through \
+                   delete_library_item_for_timer (DeleteLibraryItemForTimer: FindByPath(path, \
+                   false) and DeleteItem with DeleteFileLocation, else the file; then the \
+                   timer, disarmed), errors logged per timer; then FindByPath(seriesPath, \
+                   true) and its recursive non-folder, non-virtual files by DateCreated \
+                   descending (RecordingLibrary::files_under, IsFileProtocol) that are files, \
+                   Skip(KeepUpTo - 1), each DeleteItem with DeleteFileLocation, errors \
+                   logged per item. FindByPath matches the stored %AppDataPath% form \
+                   (TranslateQuery's GetPathToSave), then the path as given, for a row \
+                   Ferrofin stored resolved. A deleted file's recording rows go with it, as a \
+                   library delete's forget_recordings. Compared with EnforceKeepUpTo, \
+                   DeleteLibraryItemsForTimers, DeleteLibraryItemForTimer, RecordStream's \
+                   OnStarted and LibraryManager.FindByPath at the pinned v12.4 tag.",
+        date: "2026-11-11",
+        divergences: &[
+            "A file being recorded is never selected; upstream's pass over the series \
+             folder would select one past the limit that was already a library item, which \
+             a Ferrofin capture is not until it ends. The library's delete of a non-episode \
+             video that is not in a mixed folder still removes that folder, capture included, \
+             as upstream's Video.GetDeletePaths does.",
+            "Where the library refuses a delete (a protected folder, or a library this \
+             version has not fully scanned yet), the recording and its timer stay and the \
+             error is logged; upstream's DeleteItem has no such refusal.",
+        ],
+    },
     VerifiedSubsystem {
         key: "recording-postprocessing",
         upstream_file: "src/Jellyfin.LiveTv/Recordings/RecordingsManager.cs",

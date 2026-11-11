@@ -515,6 +515,8 @@ pub struct FerrofinLiveTvManager {
     /// One `CreateRecordingFolders` pass at a time. Upstream's triggers can
     /// overlap, and two passes would each add a "Recordings" library.
     recording_folders_lock: Arc<tokio::sync::Mutex<()>>,
+    /// One `EnforceKeepUpTo` pass at a time (`_recordingDeleteSemaphore`).
+    keep_up_to_lock: Arc<tokio::sync::Mutex<()>>,
     /// Serializes writing `named/livetv.json` with a save over the API, which
     /// holds the same lock
     /// ([`set_recording_library`](Self::set_recording_library)).
@@ -1256,6 +1258,7 @@ impl FerrofinLiveTvManager {
             encoder: None,
             recording_library: Arc::new(OnceLock::new()),
             recording_folders_lock: Arc::new(tokio::sync::Mutex::new(())),
+            keep_up_to_lock: Arc::new(tokio::sync::Mutex::new(())),
             options_write_lock: Arc::new(OnceLock::new()),
             self_writes: None,
             release_date_format: crate::recording_metadata::default_release_date_format(),
@@ -6330,6 +6333,27 @@ impl FerrofinLiveTvManager {
                 timer_id = %info.id
             ),
         ));
+        // `OnStarted` ends with `EnforceKeepUpTo`, which its `async void`
+        // keeps from holding the recorder up.
+        let manager = self.clone();
+        let series_timer_id = timer.series_timer_id.clone();
+        let series = series.map(std::path::Path::to_path_buf);
+        tokio::spawn(tracing::Instrument::instrument(
+            async move {
+                if let Err(error) = manager
+                    .enforce_keep_up_to(series_timer_id.as_deref(), series.as_deref())
+                    .await
+                {
+                    tracing::error!(%error, "live tv: error deleting the recordings past a series timer's Keep up to");
+                }
+            },
+            tracing::info_span!(
+                parent: None,
+                "keep_up_to",
+                trigger = "schedule",
+                timer_id = %info.id
+            ),
+        ));
         // TODO(parity, open work item — NOT an accepted divergence; gl-749):
         // with `save_recording_images`, upstream also copies the programme's
         // artwork beside the recording (`SaveRecordingImages`), but the guide
@@ -6523,6 +6547,181 @@ impl FerrofinLiveTvManager {
             }
         }
         Ok(())
+    }
+
+    /// Port of `RecordingsManager.EnforceKeepUpTo`: once a series timer's
+    /// recording has started, its oldest finished recordings past the series
+    /// timer's `KeepUpTo` are deleted, the one starting counted among those
+    /// kept (`Skip(KeepUpTo - 1)`); then the oldest files in the series'
+    /// folder past it. A file being recorded is never one of them; the
+    /// library's delete of a non-episode video that is not in a mixed folder
+    /// still removes that folder, as upstream's `Video.GetDeletePaths` does.
+    async fn enforce_keep_up_to(
+        &self,
+        series_timer_id: Option<&str>,
+        series_path: Option<&std::path::Path>,
+    ) -> Result<(), ServiceError> {
+        let (Some(series_timer_id), Some(series_path)) = (
+            series_timer_id.filter(|id| !id.trim().is_empty()),
+            series_path.filter(|path| !path.as_os_str().to_string_lossy().trim().is_empty()),
+        ) else {
+            return Ok(());
+        };
+        let Some(series_timer) = self.get_series_timer(series_timer_id).await? else {
+            return Ok(());
+        };
+        let Some(keep) = series_timer
+            .keep_up_to
+            .checked_sub(1)
+            .and_then(|keep| usize::try_from(keep).ok())
+        else {
+            return Ok(());
+        };
+        if *self.stopped.borrow() {
+            return Ok(());
+        }
+        let _one_pass = self.keep_up_to_lock.lock().await;
+        if *self.stopped.borrow() {
+            return Ok(());
+        }
+
+        // A finished timer's file (upstream's `TimerInfo.RecordingPath`) is on
+        // its recording row, the newest row first.
+        let mut recording_paths: HashMap<String, String> = HashMap::new();
+        let completed = ferrofin_model::live_tv::RecordingQuery {
+            status: Some(RecordingStatus::Completed),
+            ..ferrofin_model::live_tv::RecordingQuery::default()
+        };
+        for row in crate::dvr_repository::recording_rows(&self.db, &completed).await? {
+            if let (Some(timer_id), Some(path)) = (
+                row.timer_id,
+                row.path.filter(|path| !path.trim().is_empty()),
+            ) {
+                recording_paths.entry(timer_id).or_insert(path);
+            }
+        }
+        let mut finished = Vec::new();
+        for timer in self.all_timers().await? {
+            let of_series = timer
+                .series_timer_id
+                .as_deref()
+                .is_some_and(|id| id.eq_ignore_ascii_case(series_timer_id));
+            if timer.status != RecordingStatus::Completed || !of_series {
+                continue;
+            }
+            let Some(id) = timer.base.id else { continue };
+            let Some(path) = recording_paths.remove(&id) else {
+                continue;
+            };
+            if file_exists(&path).await {
+                finished.push((timer.base.end_date, id, path));
+            }
+        }
+        // `OrderByDescending(EndDate)`, a stable sort as LINQ's is.
+        finished.sort_by_key(|(end_date, ..)| std::cmp::Reverse(*end_date));
+        for (_, timer_id, path) in finished.into_iter().skip(keep) {
+            if *self.stopped.borrow() {
+                return Ok(());
+            }
+            if self.paths_being_recorded().contains(&path) {
+                continue;
+            }
+            // The span's `timer_id` is the capture starting, so the deleted
+            // recording is named by its file alone.
+            match self.delete_library_item_for_timer(&timer_id, &path).await {
+                Ok(()) => tracing::info!(
+                    path,
+                    "live tv: deleted a recording past its series timer's Keep up to"
+                ),
+                Err(error) => {
+                    tracing::error!(path, %error, "live tv: error deleting a recording");
+                }
+            }
+        }
+
+        match self.recording_library.get() {
+            Some(library) => {
+                self.enforce_keep_up_to_in_folder(library.as_ref(), series_path, keep)
+                    .await
+            }
+            None => Ok(()),
+        }
+    }
+
+    /// `EnforceKeepUpTo`'s pass over the series folder: its files that exist,
+    /// newest `DateCreated` first, past the first `keep`, go with their items.
+    async fn enforce_keep_up_to_in_folder(
+        &self,
+        library: &dyn RecordingLibrary,
+        series_path: &std::path::Path,
+        keep: usize,
+    ) -> Result<(), ServiceError> {
+        let Some(series) = library
+            .find_by_path(&series_path.to_string_lossy(), true)
+            .await?
+        else {
+            return Ok(());
+        };
+        let mut files = Vec::new();
+        for (id, path) in library.files_under(series).await? {
+            if file_exists(&path).await {
+                files.push((id, path));
+            }
+        }
+        for (id, path) in files.into_iter().skip(keep) {
+            if self.paths_being_recorded().contains(&path) {
+                continue;
+            }
+            // A recording is that item: its row goes with it, as a library
+            // delete's `forget_recordings`.
+            let deleted = match library.delete_item(id).await {
+                Ok(()) => crate::dvr_repository::delete_recordings_at(&self.db, &path).await,
+                Err(error) => Err(error),
+            };
+            match deleted {
+                Ok(()) => tracing::info!(
+                    item_id = %id,
+                    path,
+                    "live tv: deleted a series recording past its series timer's Keep up to"
+                ),
+                Err(error) => {
+                    tracing::error!(item_id = %id, path, %error, "live tv: error deleting an item");
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Port of `RecordingsManager.DeleteLibraryItemForTimer`: the library
+    /// item at a finished timer's file goes with the file, else the file
+    /// alone; then its recording rows and the timer.
+    async fn delete_library_item_for_timer(
+        &self,
+        timer_id: &str,
+        path: &str,
+    ) -> Result<(), ServiceError> {
+        let library = self.recording_library.get();
+        let item = match library {
+            Some(library) => library.find_by_path(path, false).await?,
+            None => None,
+        };
+        match (library, item) {
+            (Some(library), Some(item)) => library.delete_item(item).await?,
+            _ => {
+                if file_exists(path).await {
+                    tokio::fs::remove_file(path).await.map_err(|error| {
+                        ServiceError::from(crate::error::LiveTvError::io(
+                            format!("delete {path}"),
+                            error,
+                        ))
+                    })?;
+                }
+            }
+        }
+        crate::dvr_repository::delete_recordings_at(&self.db, path).await?;
+        // `TimerManager.Delete`: the row, and any fire still armed.
+        self.disarm_timer(timer_id);
+        self.delete_by_id(DELETE_TIMER_SQL, timer_id).await
     }
 
     /// The rows `visible` keeps, in order; every row when there is no filter.
@@ -6953,6 +7152,13 @@ impl FerrofinLiveTvManager {
         self.forget_row_state(id);
         Ok(())
     }
+}
+
+/// `File.Exists`: a file is there, following links; a directory is not.
+async fn file_exists(path: &str) -> bool {
+    tokio::fs::metadata(path)
+        .await
+        .is_ok_and(|metadata| metadata.is_file())
 }
 
 /// The guide query a series timer's fan-out runs (`GetTimersForSeries`): the
@@ -7755,6 +7961,7 @@ fn live_tv_service_key() -> &'static str {
 mod tests {
     mod channel_list;
     mod guide_mirror;
+    mod keep_up_to;
     mod recording_folders;
     mod schedules_direct;
 
