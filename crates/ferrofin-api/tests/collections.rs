@@ -392,8 +392,11 @@ impl PlaylistManager for RecordingPlaylists {
         &self,
         _playlist_id: Uuid,
         _user_id: Uuid,
-    ) -> Result<Vec<BaseItemEntity>, ServiceError> {
-        Ok(vec![item_entity(ITEM_A), item_entity(ITEM_B)])
+    ) -> Result<ferrofin_traits::persistence::PlaylistMembers, ServiceError> {
+        Ok(ferrofin_traits::persistence::PlaylistMembers {
+            items: vec![item_entity(ITEM_A), item_entity(ITEM_B)],
+            entries: vec![0, 1],
+        })
     }
     async fn get_playlist_item_ids(&self, _playlist_id: Uuid) -> Result<Vec<Uuid>, ServiceError> {
         Ok(vec![ITEM_A, ITEM_B])

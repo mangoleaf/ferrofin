@@ -411,14 +411,17 @@ impl PlaylistManager for RecordingPlaylists {
         &self,
         _playlist_id: Uuid,
         _user_id: Uuid,
-    ) -> Result<Vec<BaseItemEntity>, ServiceError> {
+    ) -> Result<ferrofin_traits::persistence::PlaylistMembers, ServiceError> {
         // Dashed upper case, as a Jellyfin-scanned database stores `Id`.
-        Ok([ITEM_A, ITEM_B]
-            .map(|id| BaseItemEntity {
-                id: id.to_string().to_uppercase(),
-                ..item_entity(id)
-            })
-            .into())
+        Ok(ferrofin_traits::persistence::PlaylistMembers {
+            items: [ITEM_A, ITEM_B]
+                .map(|id| BaseItemEntity {
+                    id: id.to_string().to_uppercase(),
+                    ..item_entity(id)
+                })
+                .into(),
+            entries: vec![0, 1],
+        })
     }
     async fn get_playlist_item_ids(&self, _playlist_id: Uuid) -> Result<Vec<Uuid>, ServiceError> {
         Ok(vec![ITEM_A, ITEM_B])
