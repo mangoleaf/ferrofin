@@ -151,11 +151,11 @@ const READINGS: [Reading; 3] = [Reading::Inferred, Reading::EmptyAsList, Reading
 /// A parsed XML element: local name, trimmed text, child elements, and whether
 /// it carried `xsi:nil="true"` (how `XmlSerializer` writes a null value type).
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct Node {
-    name: String,
-    text: String,
-    nil: bool,
-    children: Vec<Node>,
+pub(crate) struct Node {
+    pub(crate) name: String,
+    pub(crate) text: String,
+    pub(crate) nil: bool,
+    pub(crate) children: Vec<Node>,
 }
 
 /// Imports `xml` over `default`, returning the merged configuration.
@@ -414,7 +414,7 @@ fn parse_number(text: &str) -> Option<Value> {
 }
 
 /// Parses an XML document into its root [`Node`].
-fn parse(xml: &str) -> Result<Node, ServiceError> {
+pub(crate) fn parse(xml: &str) -> Result<Node, ServiceError> {
     use quick_xml::events::Event;
 
     let mut reader = quick_xml::Reader::from_str(xml);
