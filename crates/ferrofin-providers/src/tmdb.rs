@@ -635,14 +635,14 @@ fn episode_people_from(
     for c in credits
         .crew
         .into_iter()
-        .filter(|c| crew_person_type(c.job.as_deref()).is_some())
+        .filter(|c| crew_person_type(c.department.as_deref(), c.job.as_deref()).is_some())
         .filter(|c| {
             !cfg.hide_missing_crew_members
                 || c.profile_path.as_deref().is_some_and(|p| !p.is_empty())
         })
         .take(cfg.max_crew_members)
     {
-        let Some(person_type) = crew_person_type(c.job.as_deref()) else {
+        let Some(person_type) = crew_person_type(c.department.as_deref(), c.job.as_deref()) else {
             continue;
         };
         if c.name.is_empty() {
@@ -793,6 +793,8 @@ struct CrewEntry {
     #[serde(default)]
     name: String,
     #[serde(default)]
+    department: Option<String>,
+    #[serde(default)]
     job: Option<String>,
     #[serde(default)]
     profile_path: Option<String>,
@@ -882,14 +884,14 @@ fn crew_people(crew: Vec<CrewEntry>, cfg: &crate::plugin_config::TmdbConfig) -> 
     let mut people = Vec::new();
     for c in crew
         .into_iter()
-        .filter(|c| crew_person_type(c.job.as_deref()).is_some())
+        .filter(|c| crew_person_type(c.department.as_deref(), c.job.as_deref()).is_some())
         .filter(|c| {
             !cfg.hide_missing_crew_members
                 || c.profile_path.as_deref().is_some_and(|p| !p.is_empty())
         })
         .take(cfg.max_crew_members)
     {
-        let Some(person_type) = crew_person_type(c.job.as_deref()) else {
+        let Some(person_type) = crew_person_type(c.department.as_deref(), c.job.as_deref()) else {
             continue;
         };
         if c.name.is_empty() {
@@ -1033,13 +1035,17 @@ fn cast_credit(
     }
 }
 
-/// Maps a TMDB crew `job` to the Jellyfin person type Ferrofin surfaces, or `None`
-/// to skip the credit.
-fn crew_person_type(job: Option<&str>) -> Option<&'static str> {
-    match job? {
-        "Director" => Some("Director"),
-        "Writer" | "Screenplay" | "Author" | "Novel" => Some("Writer"),
-        "Producer" | "Executive Producer" => Some("Producer"),
+/// `TmdbUtils.MapCrewToPersonType` (v12.4): a crew credit's Jellyfin person
+/// type from its department and job, ignoring case, or `None` for every
+/// credit upstream drops (its `WantedCrewKinds` are these three).
+fn crew_person_type(department: Option<&str>, job: Option<&str>) -> Option<&'static str> {
+    match (
+        department?.to_ascii_lowercase().as_str(),
+        job?.to_ascii_lowercase().as_str(),
+    ) {
+        ("directing", "director") => Some("Director"),
+        ("production", "producer") => Some("Producer"),
+        ("writing", "writer" | "screenplay" | "novel") => Some("Writer"),
         _ => None,
     }
 }
@@ -3628,7 +3634,7 @@ mod tests {
             format!(
                 r#"{{"name": "Show",
                     "credits": {{"cast": [{{"id": 9, "name": "Latest Season", "character": "Now", "order": 0}}],
-                                "crew": [{{"id": 7, "name": "Showrunner", "job": "Director"}}]}},
+                                "crew": [{{"id": 7, "name": "Showrunner", "department": "Directing", "job": "Director"}}]}},
                     "aggregate_credits": {{"cast": {aggregate}}}}}"#
             )
         };
@@ -3710,10 +3716,10 @@ mod tests {
             {"id": 3, "name": "Guest Star", "character": "Villain", "profile_path": "/g.jpg", "order": 520}
           ],
           "crew": [
-            {"id": 4, "name": "Ep Director", "job": "Director"},
-            {"id": 5, "name": "Ep Writer", "job": "Screenplay"},
-            {"id": 6, "name": "Best Boy", "job": "Best Boy"},
-            {"id": 7, "name": "", "job": "Director"}
+            {"id": 4, "name": "Ep Director", "department": "Directing", "job": "Director"},
+            {"id": 5, "name": "Ep Writer", "department": "Writing", "job": "Screenplay"},
+            {"id": 6, "name": "Best Boy", "department": "Lighting", "job": "Best Boy"},
+            {"id": 7, "name": "", "department": "Directing", "job": "Director"}
           ]
         }"#;
         let server =
@@ -3759,16 +3765,77 @@ mod tests {
         assert_eq!(people[1].profile_url, None);
     }
 
+    /// `TmdbUtils.MapCrewToPersonType` (v12.4) keys on the department AND
+    /// the job, ignoring case: executive producers and authors are dropped,
+    /// and so is a wanted job filed under another department.
     #[test]
-    fn crew_jobs_map_to_person_types() {
-        assert_eq!(crew_person_type(Some("Director")), Some("Director"));
-        assert_eq!(crew_person_type(Some("Screenplay")), Some("Writer"));
+    fn crew_credits_keep_only_upstreams_department_and_job_pairs() {
+        let json = r#"{"crew": [
+            {"id": 1, "name": "Exec", "department": "Production", "job": "Executive Producer"},
+            {"id": 2, "name": "Author", "department": "Writing", "job": "Author"},
+            {"id": 3, "name": "Misfiled", "department": "Crew", "job": "Director"},
+            {"id": 4, "name": "Lower", "department": "directing", "job": "director"},
+            {"id": 5, "name": "Novelist", "department": "Writing", "job": "Novel"},
+            {"id": 6, "name": "Prod", "department": "Production", "job": "Producer"}
+        ]}"#;
+        let cfg = crate::plugin_config::TmdbConfig::default();
+        let kinds = |people: Vec<TmdbPerson>| -> Vec<(String, String)> {
+            people
+                .into_iter()
+                .map(|p| (p.name, p.person_type))
+                .collect()
+        };
+        let expected = [
+            ("Lower".to_owned(), "Director".to_owned()),
+            ("Novelist".to_owned(), "Writer".to_owned()),
+            ("Prod".to_owned(), "Producer".to_owned()),
+        ];
         assert_eq!(
-            crew_person_type(Some("Executive Producer")),
-            Some("Producer")
+            kinds(credits_to_people(serde_json::from_str(json).ok(), &cfg)),
+            expected
         );
-        assert_eq!(crew_person_type(Some("Gaffer")), None);
-        assert_eq!(crew_person_type(None), None);
+        assert_eq!(
+            kinds(episode_people_from(
+                serde_json::from_str(json).expect("credits"),
+                &cfg
+            )),
+            expected
+        );
+        // The `MaxCrewMembers` cap counts only the kept crew, so a dropped
+        // executive producer no longer takes the director's slot.
+        let one = crate::plugin_config::TmdbConfig {
+            max_crew_members: 1,
+            ..cfg
+        };
+        assert_eq!(
+            kinds(credits_to_people(serde_json::from_str(json).ok(), &one)),
+            expected[..1]
+        );
+    }
+
+    /// `TmdbUtils.MapCrewToPersonType` (v12.4); upstream ships no
+    /// `[InlineData]` for it, so the cases follow the rule itself.
+    #[rstest::rstest]
+    #[case(Some("Directing"), Some("Director"), Some("Director"))]
+    #[case(Some("DIRECTING"), Some("director"), Some("Director"))]
+    #[case(Some("Production"), Some("Producer"), Some("Producer"))]
+    #[case(Some("Writing"), Some("Writer"), Some("Writer"))]
+    #[case(Some("Writing"), Some("Screenplay"), Some("Writer"))]
+    #[case(Some("writing"), Some("NOVEL"), Some("Writer"))]
+    #[case(Some("Production"), Some("Executive Producer"), None)]
+    #[case(Some("Writing"), Some("Author"), None)]
+    #[case(Some("Writing"), Some("Story"), None)]
+    #[case(Some("Crew"), Some("Director"), None)]
+    #[case(Some("Directing"), Some("Producer"), None)]
+    #[case(Some("Camera"), Some("Gaffer"), None)]
+    #[case(None, Some("Director"), None)]
+    #[case(Some("Directing"), None, None)]
+    fn crew_department_and_job_map_to_person_types(
+        #[case] department: Option<&str>,
+        #[case] job: Option<&str>,
+        #[case] expected: Option<&str>,
+    ) {
+        assert_eq!(crew_person_type(department, job), expected);
     }
 
     #[test]
