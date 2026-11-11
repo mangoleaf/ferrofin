@@ -1098,8 +1098,18 @@ impl FerrofinItemPersistenceService {
     /// Why once per database: 12.0's `GetCleanValue` replaces punctuation with
     /// spaces, and the query translator now computes that form, so every
     /// stored `'h. jon benjamin'` would miss a lookup for `'h jon benjamin'`
-    /// until rewritten. A database Jellyfin 12.0 wrote already agrees and
-    /// reads back untouched (0 rewrites).
+    /// until rewritten. A database Jellyfin 12.x wrote is in that form
+    /// already, and is skipped unread (below).
+    ///
+    /// Upstream runs the routine on an upgrade only: a fresh install records
+    /// every routine without `RunMigrationOnSetup`, this one among them, as
+    /// applied without running it (`JellyfinMigrationService`).
+    /// So an adopted database whose history records it is left as Jellyfin
+    /// left it, and a native database, a fresh install of its own, keeps the
+    /// `PLACEHOLDER` row's `CleanName` NULL as a fresh Jellyfin does (gl-1585).
+    /// An adopted database with an adoption record, upgraded from before the
+    /// routine, gets every row, the placeholder included, as Jellyfin's
+    /// upgrade does.
     ///
     /// Returns the number of rows rewritten (names + values).
     ///
@@ -1113,24 +1123,43 @@ impl FerrofinItemPersistenceService {
         if self.repair_done(META_KEY).await? {
             return Ok(0);
         }
-        let repaired = self.refresh_clean_names().await? + self.refresh_clean_values().await?;
+        let repaired = if self
+            .db
+            .jellyfin_migration_applied("20260610120000_RefreshCleanNamesAndValues")
+            .await?
+        {
+            0
+        } else {
+            // No adoption record: a native database (a fresh install of its own,
+            // whose placeholder Jellyfin leaves NULL), or a 10.11 adoption by a
+            // Ferrofin before 1.2 that wrote none. That one's own Jellyfin
+            // history, which adoption leaves untouched, lacks the routine, so
+            // Jellyfin fills the placeholder on a return.
+            let no_adoption_record = self.db.adoption_state().await?.is_none();
+            self.refresh_clean_names(no_adoption_record).await?
+                + self.refresh_clean_values().await?
+        };
         self.mark_repair_done(META_KEY).await?;
         Ok(repaired)
     }
 
     /// `RefreshCleanNamesAsync`: `BaseItems.CleanName` from `Name`, for every
-    /// row with a non-empty name, in `Id` order. Returns the rows rewritten.
-    async fn refresh_clean_names(&self) -> Result<u64, ServiceError> {
+    /// row with a non-empty name, in `Id` order, but the `PLACEHOLDER` row when
+    /// `skip_placeholder`. Returns the rows rewritten.
+    async fn refresh_clean_names(&self, skip_placeholder: bool) -> Result<u64, ServiceError> {
         let mut repaired: u64 = 0;
         let mut last_id = String::new();
         loop {
             let rows: Vec<(String, String, Option<String>)> = sqlx::query_as(
                 r#"SELECT "Id", "Name", "CleanName" FROM "BaseItems"
                    WHERE "Name" IS NOT NULL AND "Name" <> '' AND "Id" > ?1
+                     AND NOT (?3 AND "Id" = ?4)
                    ORDER BY "Id" LIMIT ?2"#,
             )
             .bind(&last_id)
             .bind(REPAIR_PARTITION)
+            .bind(skip_placeholder)
+            .bind(PLACEHOLDER_ID)
             .fetch_all(self.db.pool())
             .await
             .map_err(db_err)?;
@@ -11449,9 +11478,9 @@ mod tests {
             .await
             .unwrap();
         let service = FerrofinItemPersistenceService::new(db.clone());
-        // Two rows: this one and the detached-UserData placeholder item `0032`
-        // seeds with no `CleanName`.
-        assert_eq!(service.repair_clean_values().await.unwrap(), 2);
+        // This row only: on a native database the placeholder keeps its NULL
+        // `CleanName`.
+        assert_eq!(service.repair_clean_values().await.unwrap(), 1);
         let clean: String =
             sqlx::query_scalar(r#"SELECT "CleanName" FROM "BaseItems" WHERE "Id" = ?1"#)
                 .bind(ferrofin_db::store::guid_to_db(id))
@@ -11463,6 +11492,100 @@ mod tests {
         assert_eq!(clean, "οσ");
     }
 
+    /// The placeholder row's `CleanName` from the clean-value repair.
+    async fn placeholder_clean_name(db: &ferrofin_db::Database) -> Option<String> {
+        sqlx::query_scalar(r#"SELECT "CleanName" FROM "BaseItems" WHERE "Id" = ?1"#)
+            .bind(super::PLACEHOLDER_ID)
+            .fetch_one(db.pool())
+            .await
+            .expect("placeholder")
+    }
+
+    /// gl-1585: Jellyfin runs `RefreshCleanNamesAndValues` on an upgrade only,
+    /// so a fresh install keeps the `PLACEHOLDER` row's `CleanName` NULL. A
+    /// native database is a fresh install of its own: the repair still runs
+    /// (its other rows may predate the 12.0 rule) but leaves the placeholder.
+    #[tokio::test]
+    async fn the_clean_value_repair_leaves_a_native_placeholder_null() {
+        let db = test_db().await;
+        let stale = Uuid::from_u128(0xC1F0);
+        crate::test_support::seed_named_item(&db, stale, BaseItemKind::Movie, "Dune: Part Two")
+            .await;
+        sqlx::query(r#"UPDATE "BaseItems" SET "CleanName" = 'dune: part two' WHERE "Id" = ?1"#)
+            .bind(guid_to_db(stale))
+            .execute(db.writer())
+            .await
+            .expect("10.11.8 clean name");
+        let service = FerrofinItemPersistenceService::new(db.clone());
+        assert_eq!(service.repair_clean_values().await.expect("repair"), 1);
+        assert_eq!(placeholder_clean_name(&db).await, None);
+    }
+
+    /// gl-1585: an adopted database whose history records the routine went
+    /// through it in Jellyfin (or is a fresh 12.x install, which records it
+    /// unrun): the repair leaves every row as Jellyfin left it, the fresh
+    /// install's NULL placeholder included.
+    #[tokio::test]
+    async fn the_clean_value_repair_skips_a_database_jellyfin_already_ran_it_on() {
+        let db = test_db().await;
+        db.record_adoption("12.2.0").await.expect("adoption");
+        // A name and a value in the 10.11.8 form: the whole pass is skipped,
+        // not only the placeholder, so both stay as they are.
+        let stale = Uuid::from_u128(0xC1F1);
+        crate::test_support::seed_named_item(&db, stale, BaseItemKind::Movie, "Dune: Part Two")
+            .await;
+        sqlx::query(r#"UPDATE "BaseItems" SET "CleanName" = 'dune: part two' WHERE "Id" = ?1"#)
+            .bind(guid_to_db(stale))
+            .execute(db.writer())
+            .await
+            .expect("10.11.8 clean name");
+        sqlx::query(
+            r#"INSERT INTO "ItemValues" ("ItemValueId","Type","Value","CleanValue")
+               VALUES ('v1', 3, 'Warner Bros. Pictures', 'warner bros. pictures')"#,
+        )
+        .execute(db.writer())
+        .await
+        .expect("10.11.8 clean value");
+        sqlx::query(
+            r#"CREATE TABLE "__EFMigrationsHistory" ("MigrationId" TEXT, "ProductVersion" TEXT)"#,
+        )
+        .execute(db.writer())
+        .await
+        .expect("history table");
+        sqlx::query(
+            r#"INSERT INTO "__EFMigrationsHistory"
+               VALUES ('20260610120000_RefreshCleanNamesAndValues', '12.0.0')"#,
+        )
+        .execute(db.writer())
+        .await
+        .expect("history row");
+        let service = FerrofinItemPersistenceService::new(db.clone());
+        assert_eq!(service.repair_clean_values().await.expect("repair"), 0);
+        assert_eq!(placeholder_clean_name(&db).await, None);
+        let name: Option<String> =
+            sqlx::query_scalar(r#"SELECT "CleanName" FROM "BaseItems" WHERE "Id" = ?1"#)
+                .bind(guid_to_db(stale))
+                .fetch_one(db.pool())
+                .await
+                .expect("name");
+        assert_eq!(name.as_deref(), Some("dune: part two"));
+        let value: String = sqlx::query_scalar(
+            r#"SELECT "CleanValue" FROM "ItemValues" WHERE "ItemValueId" = 'v1'"#,
+        )
+        .fetch_one(db.pool())
+        .await
+        .expect("value");
+        assert_eq!(value, "warner bros. pictures");
+        assert_eq!(
+            db.meta_get("clean_values_v12")
+                .await
+                .expect("meta")
+                .as_deref(),
+            Some("1"),
+            "the pass is recorded as done"
+        );
+    }
+
     /// The port of 12.0's `RefreshCleanNamesAndValues`: a database written
     /// under 10.11.8's rule (fold + lower-case, punctuation kept) is moved to
     /// the 12.0 form once, names and values alike, and a second boot does
@@ -11470,6 +11593,8 @@ mod tests {
     #[tokio::test]
     async fn the_clean_value_repair_rewrites_10_11_8_columns_once() {
         let db = test_db().await;
+        // Adopted from 10.11.8, before the routine: Jellyfin's upgrade runs it.
+        db.record_adoption("10.11.8").await.expect("adoption");
         let service = FerrofinItemPersistenceService::new(db.clone());
         // The marker the previous repair (which kept punctuation) left behind.
         db.meta_set("clean_values_keep_punctuation_v1", "1")
@@ -11511,7 +11636,7 @@ mod tests {
         .expect("10.11.8 clean values");
 
         // 2 stale names + 2 stale values, plus migration 0001's placeholder
-        // row: it has a `Name` and a NULL `CleanName`, and upstream's
+        // row: it has a `Name` and a NULL `CleanName`, and the upgrade's
         // `Where(!IsNullOrEmpty(Name))` takes it along. The settled rows are
         // read, compared and left alone.
         assert_eq!(service.repair_clean_values().await.expect("repair"), 5);
