@@ -343,12 +343,8 @@ impl FerrofinPeopleRepository {
                 ids.into_iter().map(guid_to_db).collect()
             })
             .collect();
-        let mut seen = HashSet::new();
-        let ids: Vec<&String> = candidates
-            .iter()
-            .flatten()
-            .filter(|id| seen.insert(*id))
-            .collect();
+        // `padded_in_chunks` binds each distinct id once.
+        let ids: Vec<&String> = candidates.iter().flatten().collect();
         let mut stored: HashSet<String> = HashSet::new();
         for binds in ferrofin_db::padded_in_chunks(&ids) {
             let mut query = sqlx::query_scalar::<_, String>(sqlx::AssertSqlSafe(
@@ -365,13 +361,11 @@ impl FerrofinPeopleRepository {
             .map(|ids| ids.iter().find(|id| stored.contains(*id)).cloned())
             .collect();
 
-        let mut seen = HashSet::new();
         let missing: Vec<String> = names
             .iter()
             .zip(&found)
             .filter(|(name, id)| id.is_none() && !name.is_empty())
             .map(|(name, _)| crate::text_util::get_clean_value(name))
-            .filter(|clean| seen.insert(clean.clone()))
             .collect();
         // `(CleanName, Name, Id)`, each clean name's rows by `SortName`, `Id`.
         let mut rows: Vec<(String, Option<String>, String)> = Vec::new();
@@ -1130,15 +1124,13 @@ async fn overviews_by_ids(
     conn: &mut SqliteConnection,
     ids: &[String],
 ) -> Result<HashMap<String, Option<String>>, ServiceError> {
-    let mut seen = HashSet::new();
-    let distinct: Vec<&String> = ids.iter().filter(|id| seen.insert(*id)).collect();
-    let mut stored = HashMap::with_capacity(distinct.len());
-    for binds in ferrofin_db::padded_in_chunks(&distinct) {
+    let mut stored = HashMap::with_capacity(ids.len());
+    for binds in ferrofin_db::padded_in_chunks(ids) {
         let mut query = sqlx::query_as::<_, (String, Option<String>)>(sqlx::AssertSqlSafe(
             overviews_by_ids_sql(binds.len()),
         ));
         for id in binds {
-            query = query.bind(*id);
+            query = query.bind(id);
         }
         stored.extend(query.fetch_all(&mut *conn).await.map_err(db_err)?);
     }

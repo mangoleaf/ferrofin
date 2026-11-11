@@ -5505,7 +5505,12 @@ mod tests {
             vec![movie_id]
         );
         let visible_item_ids = library
-            .get_visible_item_ids(&vec![movie_id; 1200], &guest_user)
+            .get_visible_item_ids(
+                &std::iter::once(movie_id)
+                    .chain((1..1200).map(|_| Uuid::new_v4()))
+                    .collect::<Vec<_>>(),
+                &guest_user,
+            )
             .await
             .unwrap();
         assert!(visible_item_ids.is_empty(), "{visible_item_ids:?}");
