@@ -46,6 +46,38 @@ pub(crate) fn is_valid_container(value: &str) -> bool {
     ferrofin_model::media_info::is_valid_stream_identifier(value)
 }
 
+/// The containers [`input_format`] forces no format for: upstream's "need to
+/// find out the ffmpeg names" list, `m4v` (reported failures), `strm` and
+/// `iso` (no ffmpeg format).
+const NO_INPUT_FORMAT: [&str; 16] = [
+    "m2ts", "wmv", "mts", "vob", "mpg", "mpeg", "rec", "dvr-ms", "ogm", "divx", "tp", "rmvb",
+    "rtp", "m4v", "strm", "iso",
+];
+
+/// The ffmpeg input format (`-f`) to force for an item's container, or `None`
+/// to let ffmpeg probe it.
+///
+/// Port of `EncodingHelper.GetInputFormat`: `None` for an empty container or
+/// one failing the validation pattern; `mkv` renamed `matroska` wherever it
+/// appears (`mkv,webm` is `matroska,webm`); `ts` is `mpegts`; `None` for
+/// [`NO_INPUT_FORMAT`]; any other container unchanged, since ffmpeg finds a
+/// demuxer by its whole comma-separated name too (`mov,mp4,m4a,3gp,3g2,mj2`).
+#[must_use]
+pub fn input_format(container: &str) -> Option<String> {
+    if container.is_empty() || !is_valid_container(container) {
+        return None;
+    }
+    let container =
+        ferrofin_util::string_extensions::replace_ignore_ascii_case(container, "mkv", "matroska");
+    if container.eq_ignore_ascii_case("ts") {
+        return Some("mpegts".to_owned());
+    }
+    (!NO_INPUT_FORMAT
+        .iter()
+        .any(|skipped| container.eq_ignore_ascii_case(skipped)))
+    .then_some(container)
+}
+
 /// Infers an audio codec from the actual URL suffix.
 /// Port of EncodingHelper.InferAudioCodec; a bare URL retains its odd native
 /// whole-path fallback, while an empty/whitespace suffix uses AAC.
@@ -3638,6 +3670,45 @@ mod tests {
         assert_eq!(video_sync_option("", v(7, 0)), "");
         // Below the gate the number is passed through unexamined.
         assert_eq!(video_sync_option("9", v(4, 4)), " -vsync 9");
+    }
+
+    /// `GetInputFormat`, case by case: the probe's normalised containers
+    /// (`mkv`, `mkv,webm`, `ts`, `mpeg`, mp4's full ffmpeg name) among them.
+    #[rstest]
+    #[case::empty("", None)]
+    #[case::fails_validation("mkv webm", None)]
+    #[case::too_long(&"a".repeat(41), None)]
+    #[case::mkv("mkv", Some("matroska"))]
+    #[case::mkv_any_case("MKV", Some("matroska"))]
+    #[case::mkv_in_a_list("mkv,webm", Some("matroska,webm"))]
+    #[case::ts("ts", Some("mpegts"))]
+    #[case::ts_any_case("TS", Some("mpegts"))]
+    #[case::m2ts("m2ts", None)]
+    #[case::wmv("wmv", None)]
+    #[case::mts("mts", None)]
+    #[case::vob("vob", None)]
+    #[case::mpg("mpg", None)]
+    #[case::mpeg("mpeg", None)]
+    #[case::mpeg_any_case("MPEG", None)]
+    #[case::rec("rec", None)]
+    #[case::dvr_ms("dvr-ms", None)]
+    #[case::ogm("ogm", None)]
+    #[case::divx("divx", None)]
+    #[case::tp("tp", None)]
+    #[case::rmvb("rmvb", None)]
+    #[case::rtp("rtp", None)]
+    #[case::m4v("m4v", None)]
+    #[case::strm("strm", None)]
+    #[case::iso("iso", None)]
+    #[case::passed_through("avi", Some("avi"))]
+    #[case::passed_through_unchanged("AVI", Some("AVI"))]
+    #[case::mpegts_itself("mpegts", Some("mpegts"))]
+    #[case::mp4_family("mov,mp4,m4a,3gp,3g2,mj2", Some("mov,mp4,m4a,3gp,3g2,mj2"))]
+    fn the_input_format_follows_get_input_format(
+        #[case] container: &str,
+        #[case] expected: Option<&str>,
+    ) {
+        assert_eq!(input_format(container).as_deref(), expected);
     }
 
     const FORCED_3S: &str = " -force_key_frames:0 expr:gte(t,n_forced*3)";
