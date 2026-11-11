@@ -273,7 +273,9 @@ jobs:
     # scan-behaviour check — its logic is driven with canned /metrics text, its refusals
     # against a python3 static file server, and whole runs against gates/verify/tests/fake_server.py,
     # which plays back a scripted server's scans), gates/parity/ (the live parity replay — its runner is
-    # driven against a fake docker and fake servers, its comparison with fixture response pairs), every
+    # driven against a fake docker and fake servers, its comparison with fixture response pairs),
+    # gates/roundtrip/ (the round trip back to Jellyfin — its runner against a fake docker, its log
+    # checks with canned Jellyfin logs, its usage stage against a stub server), every
     # gate's Python tests (gates/bench's again, beside benchmark-report) and scripts/ci-timings.py (CI
     # time medians — its log parsing is driven with canned job logs). The gates' part is one list, the
     # Makefile's test-gates-offline target.
