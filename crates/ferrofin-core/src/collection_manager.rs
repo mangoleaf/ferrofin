@@ -4755,9 +4755,10 @@ mod tests {
         );
     }
 
-    /// `Folder.AddChild` dates a new child (`DateCreated`/`DateModified`, from
-    /// the new folder in `CreatePlaylist`/`CreateCollectionAsync`), and the
-    /// create's `ForceSave` refresh stamps `DateLastSaved`.
+    /// `Folder.AddChild` dates a new child (`DateCreated`, from the new folder
+    /// in `CreatePlaylist`/`CreateCollectionAsync`), and the create's
+    /// `ForceSave` refresh stamps `DateLastSaved`. That save restats the
+    /// folder, so its `AddChild` `DateModified` ends NULL (D2, gl-1586).
     #[tokio::test]
     async fn created_box_sets_and_playlists_are_dated() {
         let db = test_db().await;
@@ -4784,9 +4785,11 @@ mod tests {
         for id in [collection.id.as_str(), playlist.as_str()] {
             let row =
                 crate::test_support::fetch_item(&db, Uuid::parse_str(id).expect("uuid")).await;
+            // A folder's directory has no `DateModified` (D2): the first save
+            // restats it, so upstream stores none (gl-1586).
+            assert_eq!(row.date_modified, None, "{} DateModified", row.type_);
             for (column, value) in [
                 ("DateCreated", row.date_created),
-                ("DateModified", row.date_modified),
                 ("DateLastSaved", row.date_last_saved),
             ] {
                 let value = value.unwrap_or_else(|| panic!("{} has no {column}", row.type_));

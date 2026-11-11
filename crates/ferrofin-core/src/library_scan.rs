@@ -9652,6 +9652,7 @@ impl LibraryScanner {
     /// | dead by-name rows | the unlocked genres, music genres and studios no item value names, and the by-name artists no item credits | `GenresValidator.cs:107-119`, `StudiosValidator.cs:108-120`, `ArtistsValidator.cs:130-143` |
     /// | folder aggregates | every series, album and artist the scan planned, written where the value moved | `UpdateMetadataFromChildren` in each folder's `RefreshMetadata` |
     /// | by-name paths | the by-name rows with no `Path` | `CreateItemByName` sets it at insert |
+    /// | first refreshes | the genres, music genres, root and user root never refreshed, stamped | `GenresValidator.cs:79-83`, `MusicGenresValidator.cs:64-67`, `ValidateTopLibraryFolders` |
     /// | studio images | the studios never refreshed | `StudiosValidator.cs:69-84` (new studios) |
     /// | library tiles | their own 7-day staleness (`HasChangedByDate`), every tile when the validation runs every provider; never a locked library's | `CollectionFolderImageProvider` |
     /// | dynamic images | first the photo albums, folders and playlist files the walk refreshed with every provider (`runAllProviders`), forced; then per item: no generated Primary yet, or its file changed (`HasChangedByDate`); never a locked row | `BaseDynamicImageProvider.HasChanged`, `MetadataService.GetProviders` |
@@ -9762,6 +9763,9 @@ impl LibraryScanner {
             && let Err(err) = store.backfill_paths().await
         {
             tracing::warn!(%err, "by-name path backfill failed");
+        }
+        if let Err(err) = self.stamp_first_refreshes().await {
+            tracing::warn!(%err, "first-refresh stamp failed");
         }
         timings.by_name_paths = started.elapsed();
         if !self.between_passes(run, &mut done).await {
@@ -12953,6 +12957,54 @@ impl LibraryScanner {
                 }
             }
         }
+    }
+
+    /// The first refresh of the rows upstream refreshes with nothing to fetch
+    /// for them (gl-1586):
+    /// - each new genre and music genre (`GenresValidator.cs:79-83`,
+    ///   `MusicGenresValidator.cs:64-67` refresh a genre no row existed for
+    ///   when the validation began; the scan here creates that row, so it is
+    ///   one never refreshed);
+    /// - the root and user root folders (`ValidateTopLibraryFolders`,
+    ///   `LibraryManager.cs:1434-1452`, every validation).
+    ///
+    /// A first refresh saves the row with `DateLastRefreshed` and
+    /// `DateLastSaved` stamped (`MetadataService.cs:154-156,221-223`). A later
+    /// one finds nothing changed and saves nothing, so only the rows never
+    /// refreshed are stamped.
+    ///
+    /// No other pass selects these kinds by that stamp. The user root's own refresh
+    /// (`refresh_user_root_between`) reads it as upstream's `isFirstRefresh`,
+    /// which `ValidateTopLibraryFolders` has used up by then upstream too.
+    ///
+    /// A genre made on demand (`ensure_by_name_item`, a by-name lookup) is one
+    /// the validator finds existing and leaves alone. It is the one never
+    /// refreshed genre with a `DateModified`: `CreateItemByName` dates it, and
+    /// the scan's insert does not (its directory has none, D2).
+    async fn stamp_first_refreshes(&self) -> Result<(), ServiceError> {
+        let mut genres = Vec::new();
+        for kind in [BaseItemKind::Genre, BaseItemKind::MusicGenre] {
+            genres.extend(self.persistence.never_refreshed_ids(kind, false).await?);
+        }
+        let mut fresh = match (&self.item_repository, genres.is_empty()) {
+            (Some(repo), false) => repo
+                .retrieve_items(&genres)
+                .await?
+                .into_iter()
+                .filter(|row| row.date_modified.is_none())
+                .filter_map(|row| Uuid::parse_str(&row.id).ok())
+                .collect(),
+            _ => genres,
+        };
+        for kind in [BaseItemKind::AggregateFolder, BaseItemKind::UserRootFolder] {
+            fresh.extend(self.persistence.never_refreshed_ids(kind, false).await?);
+        }
+        if !fresh.is_empty() {
+            self.persistence
+                .stamp_date_last_refreshed(&fresh, Utc::now())
+                .await?;
+        }
+        Ok(())
     }
 
     /// The studio half of upstream's `StudiosValidator` (`StudiosValidator.cs:
@@ -29389,6 +29441,77 @@ mod tests {
             "no thumb in the repository: an answer"
         );
         assert_eq!(items.get_image_infos(lenfilm).await.unwrap().len(), 1);
+    }
+
+    /// The first-refresh pass stamps the new genres, music genres, root and
+    /// user root once, and leaves alone a studio (its own pass stamps it), a
+    /// person (which upstream never refreshes there) and a genre made on
+    /// demand, which upstream's validator finds existing (gl-1586).
+    #[tokio::test]
+    async fn the_first_refresh_pass_stamps_genres_and_the_root_folders_once() {
+        use crate::item_persistence_service::FerrofinItemPersistenceService;
+        use crate::item_repository::FerrofinItemRepository;
+        use crate::item_type_lookup::ItemTypeLookup;
+        use crate::test_support::{fetch_item, seed_item, test_db};
+        use ferrofin_db::entities::base_items::BaseItemEntity;
+        use ferrofin_model::data::BaseItemKind;
+        use ferrofin_traits::persistence::ItemRepository;
+
+        let db = test_db().await;
+        let persistence = Arc::new(FerrofinItemPersistenceService::new(db.clone()));
+        let items: Arc<dyn ItemRepository> = Arc::new(FerrofinItemRepository::new(
+            db.clone(),
+            Arc::new(ItemTypeLookup::new()),
+        ));
+        let tmp = tempfile::tempdir().unwrap();
+        let vf: Arc<dyn VirtualFolderManager> = Arc::new(
+            FerrofinVirtualFolderManager::new(tmp.path().join("default"))
+                .with_item_store(persistence.clone()),
+        );
+        let scanner =
+            LibraryScanner::new(vf, Arc::new(FerrofinFileSystem::new()), persistence.clone())
+                .with_items(items);
+        let on_demand = uuid::Uuid::new_v4();
+        seed_item(&db, on_demand, BaseItemKind::Genre).await;
+        let mut row: BaseItemEntity = fetch_item(&db, on_demand).await;
+        row.date_modified = Some(chrono::Utc::now());
+        crate::test_support::save_item(&db, &row).await;
+        let stamped = [
+            BaseItemKind::Genre,
+            BaseItemKind::MusicGenre,
+            BaseItemKind::AggregateFolder,
+            BaseItemKind::UserRootFolder,
+        ];
+        let mut ids = Vec::new();
+        for kind in stamped
+            .into_iter()
+            .chain([BaseItemKind::Studio, BaseItemKind::Person])
+        {
+            let id = uuid::Uuid::new_v4();
+            seed_item(&db, id, kind).await;
+            ids.push((id, kind));
+        }
+
+        scanner.stamp_first_refreshes().await.expect("first pass");
+        let row: BaseItemEntity = fetch_item(&db, on_demand).await;
+        assert_eq!(row.date_last_refreshed, None, "made on demand");
+        let mut first = Vec::new();
+        for (id, kind) in &ids {
+            let row: BaseItemEntity = fetch_item(&db, *id).await;
+            if stamped.contains(kind) {
+                assert!(row.date_last_refreshed.is_some(), "{kind:?}");
+                assert_eq!(row.date_last_saved, row.date_last_refreshed, "{kind:?}");
+            } else {
+                assert_eq!(row.date_last_refreshed, None, "{kind:?}");
+            }
+            first.push(row.date_last_refreshed);
+        }
+        // A later validation finds them refreshed: nothing is stamped again.
+        scanner.stamp_first_refreshes().await.expect("second pass");
+        for ((id, kind), before) in ids.iter().zip(first) {
+            let row: BaseItemEntity = fetch_item(&db, *id).await;
+            assert_eq!(row.date_last_refreshed, before, "{kind:?}");
+        }
     }
 
     #[tokio::test(flavor = "multi_thread")]

@@ -318,9 +318,10 @@ impl DynamicImageProviders {
     /// Primaries. An adopted database's rows keep Jellyfin's ids.
     ///
     /// TODO(parity, open work item — NOT an accepted divergence; gl-950): the
-    /// user root is drawn here behind its gate and its refresh is never
-    /// recorded, where upstream's `ValidateTopLibraryFolders` refreshes it on
-    /// every library validation. Un-defer path: refresh it through
+    /// user root is drawn here behind its gate, where upstream's
+    /// `ValidateTopLibraryFolders` refreshes it on every library validation;
+    /// the scan records only that refresh's first stamp
+    /// (`LibraryScanner::stamp_first_refreshes`, gl-1586). Un-defer path: refresh it through
     /// [`refresh_user_root_between`](Self::refresh_user_root_between) with
     /// library validation's default options before this pass, and take it
     /// out of the list below.

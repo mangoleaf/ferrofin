@@ -27,7 +27,7 @@ use std::collections::{HashMap, HashSet};
 use async_trait::async_trait;
 use ferrofin_db::Database;
 use ferrofin_db::entities::base_items::PeopleEntity;
-use ferrofin_db::store::{guid_to_db, opt_datetime_to_db};
+use ferrofin_db::store::{datetime_to_db, guid_to_db, opt_datetime_to_db};
 use ferrofin_model::data::BaseItemKind;
 use ferrofin_model::querying::QueryResult;
 use sqlx::QueryBuilder;
@@ -75,6 +75,7 @@ const PERSON_TYPE_NAME: &str = "MediaBrowser.Controller.Entities.Person";
 const PERSON_ITEM_INSERT: &str = concat!(
     r#"INSERT OR IGNORE INTO "BaseItems"
     ("Id","Type","Name","CleanName","SortName","PresentationUniqueKey","Path",
+     "DateCreated","DateModified","DateLastSaved",
      "IsFolder","IsInMixedFolder",
      "IsLocked","IsMovie","IsRepeat","IsSeries","IsVirtualItem","UnratedType","#,
     crate::item_persistence_service::unset_columns!(),
@@ -82,12 +83,16 @@ const PERSON_ITEM_INSERT: &str = concat!(
     VALUES "#
 );
 
-/// One `Person` item's `VALUES` row: `Id` … `Path` bound, the flags 0, then
-/// what upstream writes for the columns a person has no value for. A `Person`'s
-/// `UnratedType` is `Other` (`BaseItem.GetBlockUnratedType`, which it does not
-/// override).
+/// One `Person` item's `VALUES` row: `Id` … `Path` bound, the three dates bound
+/// (the creation time each: `GetOrCreatePerson` sets `DateCreated` and
+/// `DateModified`, and `SavePeopleMetadataAsync` stamps `DateLastSaved` before
+/// it saves, `LibraryManager.cs:1240-1264,3932`; nothing refreshes a person
+/// there, so `DateLastRefreshed` stays NULL until the people task's refresh,
+/// whose save clears `DateModified`), the flags 0, then what upstream
+/// writes for the columns a person has no value for. A `Person`'s `UnratedType`
+/// is `Other` (`BaseItem.GetBlockUnratedType`, which it does not override).
 const PERSON_ITEM_ROW: &str = concat!(
-    "(?, ?, ?, ?, ?, ?, ?, 0, 0, 0, 0, 0, 0, 0, 'Other', ",
+    "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, 0, 0, 0, 0, 0, 'Other', ",
     crate::item_persistence_service::unset_values!(),
     ")"
 );
@@ -480,11 +485,12 @@ impl FerrofinPeopleRepository {
                 concat!(
                     r#"INSERT OR IGNORE INTO "BaseItems"
                    ("Id","Type","Name","CleanName","SortName","PresentationUniqueKey","Path",
+                    "DateCreated","DateModified","DateLastSaved",
                     "IsFolder","IsInMixedFolder",
                     "IsLocked","IsMovie","IsRepeat","IsSeries","IsVirtualItem","UnratedType","#,
                     crate::item_persistence_service::unset_columns!(),
                     r#")
-                   VALUES (?1,?2,?3,?4,?5,?6,?7,0,0,0,0,0,0,0,'Other',"#,
+                   VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?8,?8,0,0,0,0,0,0,0,'Other',"#,
                     crate::item_persistence_service::unset_values!(),
                     ")"
                 ),
@@ -496,6 +502,7 @@ impl FerrofinPeopleRepository {
             .bind(person_sort_name(name))
             .bind(person_presentation_key(target, name))
             .bind(path)
+            .bind(datetime_to_db(chrono::Utc::now()))
             .execute(&mut **tx)
             .await
             .map_err(db_err)?;
@@ -640,6 +647,7 @@ impl FerrofinPeopleRepository {
         name: &str,
         item_id: &str,
     ) -> Result<bool, ServiceError> {
+        let now = datetime_to_db(chrono::Utc::now());
         let inserted = sqlx::query(sqlx::AssertSqlSafe(format!(
             "{PERSON_ITEM_INSERT}{PERSON_ITEM_ROW}"
         )))
@@ -650,6 +658,9 @@ impl FerrofinPeopleRepository {
         .bind(person_sort_name(name))
         .bind(person_presentation_key(item_id, name))
         .bind(self.person_stored_path(name))
+        .bind(&now)
+        .bind(&now)
+        .bind(&now)
         .execute(&mut **tx)
         .await
         .map_err(db_err)?
@@ -729,6 +740,7 @@ impl FerrofinPeopleRepository {
         }
         if let Some(type_name) = type_name {
             let columns = PERSON_ITEM_ROW.matches('?').count();
+            let now = datetime_to_db(chrono::Utc::now());
             for chunk in
                 ferrofin_db::power_of_two_chunks(&created, ferrofin_db::BATCH_BIND_CHUNK / columns)
             {
@@ -745,7 +757,10 @@ impl FerrofinPeopleRepository {
                         .bind(clean)
                         .bind(person_sort_name(name))
                         .bind(person_presentation_key(id, name))
-                        .bind(self.person_stored_path(name));
+                        .bind(self.person_stored_path(name))
+                        .bind(&now)
+                        .bind(&now)
+                        .bind(&now);
                 }
                 query.execute(&mut **tx).await.map_err(db_err)?;
             }
@@ -3165,6 +3180,8 @@ mod tests {
                 .await
                 .expect("survivor");
         assert_eq!(birthplace.as_deref(), Some("Paris"));
+        // The survivor row is a person created now (gl-1586).
+        assert_person_dated(&db, survivor).await;
         // The favorite followed the survivor.
         let fav: i64 = sqlx::query_scalar(
             r#"SELECT COUNT(*) FROM "UserData" WHERE "ItemId" = ?1 AND "IsFavorite" = 1"#,
@@ -3241,6 +3258,47 @@ mod tests {
             crate::item_persistence_service::null_mapper_columns(&db, id).await,
             Vec::<&str>::new()
         );
+        assert_person_dated(&db, id).await;
+    }
+
+    /// A new person row has `GetOrCreatePerson`'s `DateCreated` and
+    /// `DateModified` and the `DateLastSaved` `SavePeopleMetadataAsync` stamps,
+    /// all the same instant, and no `DateLastRefreshed`: nothing refreshes it
+    /// (gl-1586).
+    async fn assert_person_dated(db: &ferrofin_db::Database, id: Uuid) {
+        let row: ferrofin_db::entities::base_items::BaseItemEntity =
+            crate::test_support::fetch_item(db, id).await;
+        let created = row.date_created.expect("DateCreated");
+        assert!(
+            (chrono::Utc::now() - created).num_seconds() < 60,
+            "{created} is the create time"
+        );
+        assert_eq!(row.date_modified, Some(created));
+        assert_eq!(row.date_last_saved, Some(created));
+        assert_eq!(row.date_last_refreshed, None);
+    }
+
+    /// The credits' person rows (`person_items_for_write`) are dated as the
+    /// single insert's are.
+    #[tokio::test]
+    async fn credited_person_rows_are_dated() {
+        let db = test_db().await;
+        let item = Uuid::new_v4();
+        seed_item(&db, item, BaseItemKind::Movie).await;
+        FerrofinPeopleRepository::new(db.clone())
+            .update_people(item, &[person("Alice", "Actor"), person("Bob", "Director")])
+            .await
+            .expect("update");
+        let ids: Vec<String> =
+            sqlx::query_scalar(r#"SELECT "Id" FROM "BaseItems" WHERE "Type" = ?1"#)
+                .bind(PERSON_TYPE_NAME)
+                .fetch_all(db.pool())
+                .await
+                .expect("people");
+        assert_eq!(ids.len(), 2);
+        for id in ids {
+            assert_person_dated(&db, Uuid::parse_str(&id).unwrap()).await;
+        }
     }
 
     #[tokio::test]
