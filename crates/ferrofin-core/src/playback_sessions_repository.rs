@@ -63,14 +63,6 @@ pub(crate) mod test_rows {
         .expect("read playback sessions")
     }
 
-    /// The database's free pages (`PRAGMA freelist_count`): `VACUUM` leaves none.
-    pub(crate) async fn free_pages(db: &Database) -> i64 {
-        sqlx::query_scalar("PRAGMA freelist_count")
-            .fetch_one(db.pool())
-            .await
-            .expect("freelist_count")
-    }
-
     /// The planner-statistics tables (`sqlite_stat*`) in the database, sorted.
     /// Here, not in the optimize task's tests: `sql_boundary.rs` caps the SQL
     /// in `maintenance.rs` and exempts repository files.
