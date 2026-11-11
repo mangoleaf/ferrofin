@@ -990,19 +990,6 @@ impl ferrofin_traits::library::LibraryMonitor for CountingMonitor {
     fn restart(&self) {
         self.0.fetch_add(1, Ordering::SeqCst);
     }
-    async fn report_file_system_change_beginning(
-        &self,
-        _path: &str,
-    ) -> Result<(), ferrofin_traits::error::ServiceError> {
-        Ok(())
-    }
-    async fn report_file_system_change_complete(
-        &self,
-        _path: &str,
-        _refresh_path: bool,
-    ) -> Result<(), ferrofin_traits::error::ServiceError> {
-        Ok(())
-    }
     async fn report_file_system_changed(
         &self,
         _path: &str,
@@ -1151,19 +1138,6 @@ impl ferrofin_traits::library::LibraryMonitor for StuckWalkMonitor {
     /// A real monitor's restart runs this walk on its own task.
     fn restart(&self) {
         self.restarts.fetch_add(1, Ordering::SeqCst);
-    }
-    async fn report_file_system_change_beginning(
-        &self,
-        _path: &str,
-    ) -> Result<(), ferrofin_traits::error::ServiceError> {
-        Ok(())
-    }
-    async fn report_file_system_change_complete(
-        &self,
-        _path: &str,
-        _refresh_path: bool,
-    ) -> Result<(), ferrofin_traits::error::ServiceError> {
-        Ok(())
     }
     async fn report_file_system_changed(
         &self,

@@ -315,13 +315,6 @@ impl ferrofin_traits::configuration::DisplayPreferencesManager for StubDisplayPr
         self.wait_for_the_other_reads().await;
         Ok(canned_item_prefs())
     }
-    async fn list_item_display_preferences(
-        &self,
-        _user_id: Uuid,
-        _client: &str,
-    ) -> Result<Vec<ItemDisplayPreferencesEntity>, ServiceError> {
-        Ok(vec![canned_item_prefs()])
-    }
     async fn list_custom_item_display_preferences(
         &self,
         _user_id: Uuid,
@@ -924,13 +917,6 @@ impl ferrofin_traits::configuration::DisplayPreferencesManager for RoundTripDisp
         _client: &str,
     ) -> Result<ItemDisplayPreferencesEntity, ServiceError> {
         Ok(canned_item_prefs())
-    }
-    async fn list_item_display_preferences(
-        &self,
-        _user_id: Uuid,
-        _client: &str,
-    ) -> Result<Vec<ItemDisplayPreferencesEntity>, ServiceError> {
-        Ok(vec![canned_item_prefs()])
     }
     async fn list_custom_item_display_preferences(
         &self,

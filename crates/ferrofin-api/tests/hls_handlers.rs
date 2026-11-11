@@ -330,13 +330,6 @@ impl LibraryManager for ItemLibrary {
     ) -> Result<Vec<BaseItemEntity>, ServiceError> {
         unimplemented!("unused")
     }
-    async fn create_items(
-        &self,
-        _items: &[BaseItemEntity],
-        _parent_id: Option<Uuid>,
-    ) -> Result<(), ServiceError> {
-        unimplemented!("unused")
-    }
     async fn update_items(
         &self,
         _items: &[BaseItemEntity],

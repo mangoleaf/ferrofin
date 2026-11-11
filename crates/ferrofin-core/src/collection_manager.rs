@@ -68,7 +68,7 @@ use ferrofin_traits::system::ServerApplicationPaths;
 use crate::collections_library::{CollectionsFolder, CollectionsLibrary};
 use crate::db_error::db_err;
 use crate::item_data;
-use crate::item_type_lookup::{kind_from_type_name, stored_type_name};
+use crate::item_type_lookup::kind_from_type_name;
 
 /// The manual [`LinkedChildType`](ferrofin_db::enums::LinkedChildType) discriminant
 /// (`0`) used to record a box-set/playlist member.
@@ -1429,17 +1429,6 @@ impl PlaylistManager for FerrofinPlaylistManager {
         self.access(playlist_id, user_id).await
     }
 
-    async fn get_playlist_for_user(
-        &self,
-        playlist_id: Uuid,
-        user_id: Uuid,
-    ) -> Result<BaseItemEntity, ServiceError> {
-        // Visibility gate first: invisible reads as missing (the C#
-        // `GetPlaylistForUser` returns null for both).
-        self.access(playlist_id, user_id).await?;
-        self.require_playlist(playlist_id).await
-    }
-
     async fn create_playlist(
         &self,
         request: &PlaylistCreationRequest,
@@ -1654,42 +1643,6 @@ impl PlaylistManager for FerrofinPlaylistManager {
             queue_refresh(self.providers.as_deref(), request.id, force_save_refresh()).await?;
         }
         Ok(())
-    }
-
-    async fn get_playlists(&self, user_id: Uuid) -> Result<Vec<BaseItemEntity>, ServiceError> {
-        require_user(user_id)?;
-        let type_name = stored_type_name(BaseItemKind::Playlist)
-            .ok_or_else(|| ServiceError::backend("no stored type name for Playlist"))?;
-        // Visibility predicate (C# `Playlist.IsVisible`): legacy/unowned rows,
-        // open-access, owned by the caller, or shared with the caller.
-        let rows = sqlx::query_as::<_, BaseItemEntity>(
-            r#"SELECT bi.* FROM "BaseItems" bi
-               LEFT JOIN "FerrofinPlaylists" p ON p."PlaylistId" = bi."Id"
-               WHERE bi."Type" = ?1 AND (
-                   p."PlaylistId" IS NULL
-                   OR p."OwnerUserId" IS NULL
-                   OR p."OpenAccess" = 1
-                   OR p."OwnerUserId" = ?2
-                   OR EXISTS (SELECT 1 FROM "FerrofinPlaylistShares" s
-                              WHERE s."PlaylistId" = bi."Id" AND s."UserId" = ?2))
-               ORDER BY bi."Name""#,
-        )
-        .bind(type_name)
-        .bind(guid_to_db(user_id))
-        .fetch_all(self.db.pool())
-        .await
-        .map_err(db_err)?;
-        let Some((visibility, user)) = self.visibility_user(user_id).await? else {
-            return Ok(rows);
-        };
-        // `GetPlaylists(userId)`: `.Where(p => p.IsVisible(user))`, whose
-        // parental and file-playlist halves SQL cannot answer.
-        let allowed = visibility.playlist_policy(&rows, &user).await?;
-        Ok(rows
-            .into_iter()
-            .zip(allowed)
-            .filter_map(|(row, allowed)| allowed.then_some(row))
-            .collect())
     }
 
     async fn get_playlist_items(
@@ -3319,11 +3272,10 @@ mod tests {
             .expect("create");
         let playlist_id = Uuid::parse_str(&created.id).expect("uuid");
 
-        let row = mgr
-            .get_playlist_for_user(playlist_id, owner)
+        mgr.get_playlist_access(playlist_id, owner)
             .await
-            .expect("get");
-        assert_eq!(row.name.as_deref(), Some("Roadtrip"));
+            .expect("the owner sees it");
+        assert_eq!(name_of(&db, playlist_id).await, "Roadtrip");
 
         mgr.update_playlist(&PlaylistUpdateRequest {
             id: playlist_id,
@@ -3332,20 +3284,15 @@ mod tests {
         })
         .await
         .expect("update");
-        let row = mgr
-            .get_playlist_for_user(playlist_id, owner)
-            .await
-            .expect("get2");
-        assert_eq!(row.name.as_deref(), Some("Roadtrip 2"));
-
-        let all = mgr.get_playlists(owner).await.expect("list");
-        assert_eq!(all.len(), 1);
+        assert_eq!(name_of(&db, playlist_id).await, "Roadtrip 2");
 
         // Removing the sole member leaves the playlist row intact.
         mgr.remove_item_from_playlist(&created.id, &[track.to_string()])
             .await
             .expect("remove");
-        assert_eq!(mgr.get_playlists(owner).await.expect("list2").len(), 1);
+        mgr.get_playlist_access(playlist_id, owner)
+            .await
+            .expect("still there");
     }
 
     #[tokio::test]
@@ -3891,7 +3838,7 @@ mod tests {
         let db = test_db().await;
         let (mgr, _root) = playlist_manager(&db).await;
         let err = mgr
-            .get_playlist_for_user(Uuid::new_v4(), Uuid::new_v4())
+            .get_playlist_access(Uuid::new_v4(), Uuid::new_v4())
             .await
             .expect_err("missing");
         assert!(matches!(
@@ -4365,14 +4312,10 @@ mod tests {
             mgr.get_playlist_access(playlist_id, carol).await,
             Err(ferrofin_traits::error::ServiceError::NotFound(_))
         ));
-        assert!(matches!(
-            mgr.get_playlist_for_user(playlist_id, carol).await,
-            Err(ferrofin_traits::error::ServiceError::NotFound(_))
-        ));
     }
 
     /// No user, no playlist: upstream's `GetUserById(Guid.Empty)` throws in
-    /// `CreatePlaylist` and in every `GetPlaylists`/`GetPlaylistForUser`.
+    /// `CreatePlaylist` and in every `GetPlaylistForUser` gate.
     #[tokio::test]
     async fn a_nil_user_is_refused() {
         use ferrofin_traits::error::ServiceError;
@@ -4393,8 +4336,17 @@ mod tests {
             .await
             .map(drop),
         );
+        let playlists = || async {
+            library_manager_over(db.clone())
+                .get_item_ids(&ferrofin_traits::options::InternalItemsQuery {
+                    include_item_types: vec![BaseItemKind::Playlist],
+                    ..ferrofin_traits::options::InternalItemsQuery::default()
+                })
+                .await
+                .expect("read")
+        };
         assert!(
-            mgr.get_playlists(Uuid::new_v4()).await.unwrap().is_empty(),
+            playlists().await.is_empty(),
             "no unowned playlist was written"
         );
         // A member, so the items read takes its joined path, not the
@@ -4413,14 +4365,13 @@ mod tests {
             .id,
         )
         .expect("uuid");
-        invalid(mgr.get_playlist_access(owned, Uuid::nil()).await.map(drop));
-        invalid(
-            mgr.get_playlist_for_user(owned, Uuid::nil())
-                .await
-                .map(drop),
+        assert_eq!(
+            playlists().await,
+            [owned],
+            "the read sees a written playlist"
         );
+        invalid(mgr.get_playlist_access(owned, Uuid::nil()).await.map(drop));
         invalid(mgr.get_playlist_items(owned, Uuid::nil()).await.map(drop));
-        invalid(mgr.get_playlists(Uuid::nil()).await.map(drop));
     }
 
     #[tokio::test]
@@ -4467,11 +4418,10 @@ mod tests {
             .expect("legacy rows stay visible");
         assert_eq!(access.level, PlaylistAccessLevel::Owner);
         assert!(!access.open_access);
-        assert_eq!(mgr.get_playlists(Uuid::new_v4()).await.unwrap().len(), 1);
     }
 
     #[tokio::test]
-    async fn get_playlists_filters_by_visibility() {
+    async fn playlist_access_follows_ownership_and_shares() {
         use ferrofin_model::entities_media::PlaylistUserPermissions;
 
         let db = test_db().await;
@@ -4496,21 +4446,20 @@ mod tests {
             .await
             .expect("p2")
             .id;
-        mgr.create_playlist(&create("Carol's", carol, Vec::new()))
+        let p3 = mgr
+            .create_playlist(&create("Carol's", carol, Vec::new()))
             .await
-            .expect("p3");
+            .expect("p3")
+            .id;
 
-        let p1 = Uuid::parse_str(&p1).expect("uuid");
-        let p2 = Uuid::parse_str(&p2).expect("uuid");
-        let visible: Vec<Uuid> = mgr
-            .get_playlists(alice)
-            .await
-            .unwrap()
-            .into_iter()
-            .filter_map(|r| Uuid::parse_str(&r.id).ok())
-            .collect();
-        assert_eq!(visible.len(), 2, "alice sees her own + bob's shared");
-        assert!(visible.contains(&p1) && visible.contains(&p2));
+        // Alice sees her own and Bob's shared playlist, not Carol's.
+        for (playlist, visible) in [(p1, true), (p2, true), (p3, false)] {
+            let playlist = Uuid::parse_str(&playlist).expect("uuid");
+            assert_eq!(
+                mgr.get_playlist_access(playlist, alice).await.is_ok(),
+                visible
+            );
+        }
     }
 
     #[tokio::test]
@@ -4892,10 +4841,6 @@ mod tests {
             mgr.get_playlist_access(playlist_id, stranger).await,
             Err(ferrofin_traits::error::ServiceError::NotFound(_))
         ));
-        assert!(matches!(
-            mgr.get_playlist_for_user(playlist_id, stranger).await,
-            Err(ferrofin_traits::error::ServiceError::NotFound(_))
-        ));
     }
 
     #[tokio::test]
@@ -4936,7 +4881,6 @@ mod tests {
         reason = "one owner, one limited user and their playlists through every access path"
     )]
     async fn a_parental_limit_hides_playlists_and_members_beyond_it() {
-        use ferrofin_db::entities::base_items::BaseItemEntity;
         use ferrofin_model::entities_media::PlaylistUserPermissions;
         use ferrofin_model::playlists::PlaylistCreationResult;
         use ferrofin_traits::error::ServiceError;
@@ -5005,18 +4949,13 @@ mod tests {
             "no limit"
         );
         assert!(mgr.get_playlist_access(empty, kid).await.is_ok(), "empty");
-        let listed = |rows: Vec<BaseItemEntity>| {
-            let mut ids: Vec<Uuid> = rows
-                .into_iter()
-                .filter_map(|r| Uuid::parse_str(&r.id).ok())
-                .collect();
-            ids.sort();
-            ids
-        };
-        let mut expected = vec![mixed, empty];
-        expected.sort();
-        assert_eq!(listed(mgr.get_playlists(kid).await.expect("kid")), expected);
-        assert_eq!(mgr.get_playlists(owner).await.expect("owner").len(), 3);
+        assert!(
+            mgr.get_playlist_access(mixed, kid).await.is_ok(),
+            "a member within the limit"
+        );
+        for playlist in [mixed, empty] {
+            assert!(mgr.get_playlist_access(playlist, owner).await.is_ok());
+        }
 
         let members: Vec<Uuid> = mgr
             .get_playlist_items(mixed, kid)
@@ -5232,7 +5171,6 @@ mod tests {
             );
         };
         not_found(mgr.get_playlist_access(movie, caller).await.map(drop));
-        not_found(mgr.get_playlist_for_user(movie, caller).await.map(drop));
         not_found(mgr.get_playlist_items(movie, caller).await.map(drop));
         // A box set's manual member reaches the members-present branch.
         let box_set = Uuid::new_v4();

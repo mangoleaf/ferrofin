@@ -584,14 +584,6 @@ mod tests {
         ) -> Result<(), ServiceError> {
             unimplemented!()
         }
-        async fn send_message_to_user_device_sessions(
-            &self,
-            _device_id: &str,
-            _message_type: SessionMessageType,
-            _data: &str,
-        ) -> Result<(), ServiceError> {
-            unimplemented!()
-        }
         async fn send_restart_required_notification(&self) -> Result<(), ServiceError> {
             unimplemented!()
         }

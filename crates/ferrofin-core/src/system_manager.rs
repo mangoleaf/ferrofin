@@ -620,7 +620,6 @@ mod tests {
                 .expect("config"),
         );
         let host: Arc<dyn ServerApplicationHost> = Arc::new(FerrofinServerApplicationHost::new(
-            Arc::clone(&paths),
             Arc::clone(&cfg) as Arc<dyn ServerConfigurationManager>,
             HostNetworkInfo::default(),
             "test-machine",

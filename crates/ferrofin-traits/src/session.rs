@@ -309,14 +309,6 @@ pub trait SessionManager: Send + Sync {
         Ok(())
     }
 
-    /// Sends a pre-serialized JSON message to all sessions of a specific device.
-    async fn send_message_to_user_device_sessions(
-        &self,
-        device_id: &str,
-        message_type: SessionMessageType,
-        data: &str,
-    ) -> Result<(), ServiceError>;
-
     /// Broadcasts a "restart required" notification to all sessions.
     async fn send_restart_required_notification(&self) -> Result<(), ServiceError>;
 

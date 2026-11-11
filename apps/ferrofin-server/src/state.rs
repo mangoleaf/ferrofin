@@ -2748,7 +2748,6 @@ pub async fn build_app_state(
     // ---- host + system + auth + quick-connect -----------------------------
     let app_host = Arc::new(
         FerrofinServerApplicationHost::new(
-            Arc::clone(&paths),
             Arc::clone(&config_trait),
             HostNetworkInfo {
                 http_port: config.port,

@@ -12,7 +12,6 @@ use async_trait::async_trait;
 use ferrofin_db::Database;
 use ferrofin_db::entities::security::{DeviceEntity, DeviceOptionsEntity};
 use ferrofin_db::entities::users::UserEntity;
-use ferrofin_model::devices::DeviceInfo;
 use ferrofin_model::dto::{ClientCapabilitiesDto, DeviceInfoDto};
 use ferrofin_model::querying::QueryResult;
 use ferrofin_model::session::{
@@ -89,12 +88,6 @@ impl DeviceManager for CountingDevices {
         query: &DeviceQuery,
     ) -> Result<QueryResult<DeviceEntity>, ServiceError> {
         self.inner.get_devices(query).await
-    }
-    async fn get_device_infos(
-        &self,
-        query: &DeviceQuery,
-    ) -> Result<QueryResult<DeviceInfo>, ServiceError> {
-        self.inner.get_device_infos(query).await
     }
     async fn get_devices_for_user(
         &self,

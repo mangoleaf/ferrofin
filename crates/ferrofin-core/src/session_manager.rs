@@ -2345,18 +2345,6 @@ impl SessionManager for FerrofinSessionManager {
             .await
     }
 
-    async fn send_message_to_user_device_sessions(
-        &self,
-        device_id: &str,
-        message_type: SessionMessageType,
-        data: &str,
-    ) -> Result<(), ServiceError> {
-        self.broadcast(message_type, data, |s| {
-            s.device_id.eq_ignore_ascii_case(device_id)
-        })
-        .await
-    }
-
     async fn send_restart_required_notification(&self) -> Result<(), ServiceError> {
         self.broadcast(SessionMessageType::RestartRequired, "", |_| true)
             .await
@@ -3281,12 +3269,6 @@ mod bus_fallback_tests {
 
     #[async_trait]
     impl DtoService for UnusedDtoService {
-        async fn get_primary_image_aspect_ratio(
-            &self,
-            _item_id: Uuid,
-        ) -> Result<Option<f64>, ServiceError> {
-            unreachable!("dto service is not exercised by broadcast")
-        }
         async fn get_base_item_dto(
             &self,
             _item: &BaseItemEntity,
@@ -3304,15 +3286,6 @@ mod bus_fallback_tests {
             _owner_id: Option<Uuid>,
             _skip_visibility_check: bool,
         ) -> Result<Vec<BaseItemDto>, ServiceError> {
-            unreachable!("dto service is not exercised by broadcast")
-        }
-        async fn get_item_by_name_dto(
-            &self,
-            _item: &BaseItemEntity,
-            _options: &DtoOptions,
-            _tagged_item_ids: Option<&[Uuid]>,
-            _user: Option<&ferrofin_db::entities::users::UserEntity>,
-        ) -> Result<BaseItemDto, ServiceError> {
             unreachable!("dto service is not exercised by broadcast")
         }
     }
@@ -3670,12 +3643,6 @@ mod broadcast_lock_tests {
 
     #[async_trait]
     impl DtoService for UnusedDtoService {
-        async fn get_primary_image_aspect_ratio(
-            &self,
-            _item_id: Uuid,
-        ) -> Result<Option<f64>, ServiceError> {
-            unreachable!("dto service is not exercised by these tests")
-        }
         async fn get_base_item_dto(
             &self,
             _item: &BaseItemEntity,
@@ -3693,15 +3660,6 @@ mod broadcast_lock_tests {
             _owner_id: Option<Uuid>,
             _skip_visibility_check: bool,
         ) -> Result<Vec<BaseItemDto>, ServiceError> {
-            unreachable!("dto service is not exercised by these tests")
-        }
-        async fn get_item_by_name_dto(
-            &self,
-            _item: &BaseItemEntity,
-            _options: &DtoOptions,
-            _tagged_item_ids: Option<&[Uuid]>,
-            _user: Option<&UserEntity>,
-        ) -> Result<BaseItemDto, ServiceError> {
             unreachable!("dto service is not exercised by these tests")
         }
     }

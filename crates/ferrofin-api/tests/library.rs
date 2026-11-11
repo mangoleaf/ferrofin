@@ -190,13 +190,6 @@ impl LibraryManager for RecordingLibrary {
     ) -> Result<Vec<BaseItemEntity>, ServiceError> {
         unimplemented!("unused")
     }
-    async fn create_items(
-        &self,
-        _items: &[BaseItemEntity],
-        _parent_id: Option<Uuid>,
-    ) -> Result<(), ServiceError> {
-        unimplemented!("unused")
-    }
     async fn update_items(
         &self,
         _items: &[BaseItemEntity],
@@ -295,16 +288,6 @@ impl LibraryMonitor for RecordingMonitor {
         Ok(())
     }
     fn restart(&self) {}
-    async fn report_file_system_change_beginning(&self, _path: &str) -> Result<(), ServiceError> {
-        Ok(())
-    }
-    async fn report_file_system_change_complete(
-        &self,
-        _path: &str,
-        _refresh_path: bool,
-    ) -> Result<(), ServiceError> {
-        Ok(())
-    }
     async fn report_file_system_changed(&self, path: &str) -> Result<(), ServiceError> {
         self.watcher.lock().unwrap().push(path.to_owned());
         Ok(())

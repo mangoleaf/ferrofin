@@ -3946,17 +3946,6 @@ impl LiveTvManager for FerrofinLiveTvManager {
         Ok(())
     }
 
-    async fn get_channel_stream_url(&self, id: Uuid) -> Result<Option<String>, ServiceError> {
-        let url: Option<String> = sqlx::query_scalar(
-            r#"SELECT "StreamUrl" FROM "FerrofinLiveTvChannels" WHERE "Id" = ?1"#,
-        )
-        .bind(guid_to_db(id))
-        .fetch_optional(self.db.pool())
-        .await
-        .map_err(db_err)?;
-        Ok(url)
-    }
-
     async fn get_channel_media_sources(
         &self,
         id: Uuid,
@@ -7821,12 +7810,6 @@ mod tests {
 
     #[async_trait::async_trait]
     impl ferrofin_traits::dto::DtoService for FakeDto {
-        async fn get_primary_image_aspect_ratio(
-            &self,
-            _item_id: Uuid,
-        ) -> Result<Option<f64>, ServiceError> {
-            Ok(None)
-        }
         async fn get_base_item_dto(
             &self,
             item: &BaseItemEntity,
@@ -7898,15 +7881,6 @@ mod tests {
                     ..BaseItemDto::default()
                 })
                 .collect())
-        }
-        async fn get_item_by_name_dto(
-            &self,
-            _item: &BaseItemEntity,
-            _options: &DtoOptions,
-            _tagged_item_ids: Option<&[Uuid]>,
-            _user: Option<&UserEntity>,
-        ) -> Result<BaseItemDto, ServiceError> {
-            unimplemented!("not a by-name path")
         }
     }
 
@@ -8968,12 +8942,11 @@ mod tests {
         assert_eq!(channels.items[0].channel_number.as_deref(), Some("1"));
 
         let chan_id = channels.items[0].id;
-        let stream = mgr
-            .get_channel_stream_url(chan_id)
+        let (stream, _tuner) = crate::guide_repository::channel_stream_source(&mgr.db, chan_id)
             .await
             .expect("stream")
-            .expect("url");
-        assert_eq!(stream, "http://tuner/one");
+            .expect("channel");
+        assert_eq!(stream.path, "http://tuner/one");
 
         // The guide programme binds to Channel One (tvg-id one.tv) only.
         let programs = mgr

@@ -4,8 +4,8 @@
 //!
 //! Port rules applied throughout:
 //! - Persisted devices are the [`DeviceEntity`] / [`DeviceOptionsEntity`]
-//!   `ferrofin-db` rows; API-facing reads surface the [`DeviceInfoDto`] /
-//!   [`DeviceInfo`] wire DTOs. The C# `GetDeviceOptions` returns a
+//!   `ferrofin-db` rows; API-facing reads surface the [`DeviceInfoDto`] wire
+//!   DTO. The C# `GetDeviceOptions` returns a
 //!   `DeviceOptionsDto`; here it returns the [`DeviceOptionsEntity`] row, and
 //!   the API layer maps it to `ferrofin_model::dto::DeviceOptionsDto`.
 //! - The `CanAccessDevice(User, …)` domain-`User` argument becomes a
@@ -21,7 +21,6 @@
 use async_trait::async_trait;
 use ferrofin_db::entities::security::{DeviceEntity, DeviceOptionsEntity};
 use ferrofin_db::entities::users::UserEntity;
-use ferrofin_model::devices::DeviceInfo;
 use ferrofin_model::dto::{ClientCapabilitiesDto, DeviceInfoDto};
 use ferrofin_model::querying::QueryResult;
 use ferrofin_model::session::ClientCapabilities;
@@ -78,12 +77,6 @@ pub trait DeviceManager: Send + Sync {
         &self,
         query: &DeviceQuery,
     ) -> Result<QueryResult<DeviceEntity>, ServiceError>;
-
-    /// Queries device info (capability-enriched) records.
-    async fn get_device_infos(
-        &self,
-        query: &DeviceQuery,
-    ) -> Result<QueryResult<DeviceInfo>, ServiceError>;
 
     /// Gets the device info DTOs visible to a user (or all when `None`).
     async fn get_devices_for_user(

@@ -201,9 +201,6 @@ impl LiveTvManager for CountriesLiveTv {
     async fn refresh_guide(&self) -> Result<(), ServiceError> {
         Ok(())
     }
-    async fn get_channel_stream_url(&self, _id: Uuid) -> Result<Option<String>, ServiceError> {
-        unreachable!()
-    }
     async fn get_timers(&self) -> Result<Vec<TimerInfoDto>, ServiceError> {
         unreachable!()
     }

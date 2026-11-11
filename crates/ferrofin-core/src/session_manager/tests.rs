@@ -81,12 +81,6 @@ struct UnusedDtoService;
 
 #[async_trait]
 impl DtoService for UnusedDtoService {
-    async fn get_primary_image_aspect_ratio(
-        &self,
-        _item_id: Uuid,
-    ) -> Result<Option<f64>, ServiceError> {
-        unreachable!("dto service is not exercised by these tests")
-    }
     async fn get_base_item_dto(
         &self,
         _item: &BaseItemEntity,
@@ -112,15 +106,6 @@ impl DtoService for UnusedDtoService {
                 ..BaseItemDto::default()
             })
             .collect())
-    }
-    async fn get_item_by_name_dto(
-        &self,
-        _item: &BaseItemEntity,
-        _options: &DtoOptions,
-        _tagged_item_ids: Option<&[Uuid]>,
-        _user: Option<&UserEntity>,
-    ) -> Result<BaseItemDto, ServiceError> {
-        unreachable!("dto service is not exercised by these tests")
     }
 }
 
@@ -4375,12 +4360,6 @@ impl RecordingDtoService {
 
 #[async_trait]
 impl DtoService for RecordingDtoService {
-    async fn get_primary_image_aspect_ratio(
-        &self,
-        _item_id: Uuid,
-    ) -> Result<Option<f64>, ServiceError> {
-        unreachable!("not reached from a NowPlayingItem build")
-    }
     async fn get_base_item_dto(
         &self,
         _item: &BaseItemEntity,
@@ -4414,15 +4393,6 @@ impl DtoService for RecordingDtoService {
                 ..BaseItemDto::default()
             })
             .collect())
-    }
-    async fn get_item_by_name_dto(
-        &self,
-        _item: &BaseItemEntity,
-        _options: &DtoOptions,
-        _tagged_item_ids: Option<&[Uuid]>,
-        _user: Option<&UserEntity>,
-    ) -> Result<BaseItemDto, ServiceError> {
-        unreachable!("not reached from a NowPlayingItem build")
     }
 }
 
