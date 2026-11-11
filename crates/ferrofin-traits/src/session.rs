@@ -433,6 +433,29 @@ pub trait SessionManager: Send + Sync {
         Ok(sessions.iter().map(SessionSummary::from).collect())
     }
 
+    /// The id of the library item the session `session_id` plays (C#
+    /// `SessionInfo.FullNowPlayingItem`), which SyncPlay seeds a new group
+    /// from: the item a playback report's `ItemId` names, `None` when it plays
+    /// nothing or the library does not have the item. It can differ from the
+    /// `NowPlayingItem` the session shows, which may be a client's own `Item`.
+    ///
+    /// The default reads the shown item's id from the elevated
+    /// [`Self::get_sessions`] view, so test fakes need no change. The concrete
+    /// manager overrides it to read the library item.
+    async fn now_playing_library_item_id(
+        &self,
+        session_id: &str,
+    ) -> Result<Option<Uuid>, ServiceError> {
+        let sessions = self
+            .get_sessions(Uuid::nil(), None, None, None, true)
+            .await?;
+        Ok(sessions
+            .into_iter()
+            .find(|s| s.id.as_deref() == Some(session_id))
+            .and_then(|s| s.now_playing_item)
+            .map(|item| item.id))
+    }
+
     /// Resolves a session from its access token, returning the session DTO.
     async fn get_session_by_authentication_token(
         &self,

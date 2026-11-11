@@ -82,10 +82,24 @@ async fn now_playing(
         .sessions
         .get_sessions(Uuid::nil(), Some(device_id), None, None, true)
         .await?;
-    Ok(sessions
+    let playing = sessions
         .into_iter()
         .find(|s| s.id.as_deref() == Some(session_id))
-        .and_then(now_playing_of))
+        .and_then(now_playing_of);
+    // The group is seeded with the library item (`FullNowPlayingItem`), not
+    // the shown one, which may be a client's own `Item` (gl-1062).
+    let library_item_id = match &playing {
+        Some(_) => {
+            state
+                .sessions
+                .now_playing_library_item_id(session_id)
+                .await?
+        }
+        None => None,
+    };
+    Ok(playing
+        .zip(library_item_id)
+        .map(|(playing, item_id)| SyncPlayNowPlaying { item_id, ..playing }))
 }
 
 /// The [`SyncPlayNowPlaying`] facts of one session, `None` when it plays
