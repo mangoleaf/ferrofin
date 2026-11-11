@@ -890,7 +890,7 @@ impl Writes {
 
     /// How an item is named in the write log: its path under the media root
     /// (`live/Lantern/Season 01`), which tells two "Season 1" rows apart, or
-    /// `Type:Name` for an item outside it (a person, a genre, a year).
+    /// `Type:Name` for an item outside it (a person, a genre).
     fn key(&self, path: Option<&str>, name: Option<&str>, kind: Option<&str>) -> String {
         let root = format!("{}/", self.media.display());
         match path.and_then(|p| p.strip_prefix(&root)) {
@@ -3144,7 +3144,7 @@ fn assert_full_pass(seen: &Seen, movies: f64, keys: &[String], row: &str) {
             && written
                 .iter()
                 .all(|w| w == "movies" || w.starts_with("movies/") || w.contains(':')),
-        "row {row}: the three movies, the location (and their people, genres, years) {written:?}"
+        "row {row}: the three movies, the location (and their people, genres) {written:?}"
     );
 }
 

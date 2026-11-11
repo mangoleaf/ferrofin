@@ -339,13 +339,6 @@ async fn movie_library(
         db.clone(),
         Arc::new(ItemTypeLookup::new()),
     ));
-    let years = ferrofin_core::YearStore::new(
-        persistence.clone(),
-        ferrofin_core::item_type_lookup::IdDerivation::Jellyfin {
-            program_data_path: None,
-        },
-        root.join("metadata/Year"),
-    );
     let streams = FerrofinMediaStreamRepository::new(db.clone());
     let streams: Arc<dyn MediaStreamRepository> = match cancel_at {
         CancelAt::Streams(cancel) => Arc::new(CancelOnStreams {
@@ -356,7 +349,6 @@ async fn movie_library(
     };
     let mut scanner = LibraryScanner::new(vf, Arc::new(FerrofinFileSystem::new()), persistence)
         .with_items(items)
-        .with_years(years)
         .with_probe(
             Arc::clone(probe) as Arc<dyn MediaEncoder>,
             streams,
@@ -396,12 +388,29 @@ async fn scan(
         .expect("scan")
 }
 
-/// `Year` rows the closing years pass materialized.
-async fn years(db: &Database) -> i64 {
-    sqlx::query_scalar(r#"SELECT COUNT(*) FROM "BaseItems" WHERE "Type" LIKE '%Entities.Year'"#)
+/// Adds a genre no item names, which the library-wide dead by-name sweep
+/// deletes: the sign that the closing passes ran.
+async fn seed_dead_genre(db: &Database) {
+    sqlx::query(
+        r#"INSERT INTO "BaseItems"
+           ("Id", "Type", "IsFolder", "IsInMixedFolder", "IsLocked", "IsMovie",
+            "IsRepeat", "IsSeries", "IsVirtualItem", "Name", "CleanName")
+           VALUES ('0D1C0D1C-0000-4000-8000-000000000001',
+                   'MediaBrowser.Controller.Entities.Genre', 1, 0, 0, 0, 0, 0, 0,
+                   'Orphan', 'orphan')"#,
+    )
+    .execute(db.writer())
+    .await
+    .expect("seed dead genre");
+}
+
+/// Whether the genre [`seed_dead_genre`] added is still there.
+async fn dead_genre_left(db: &Database) -> bool {
+    sqlx::query_scalar::<_, i64>(r#"SELECT COUNT(*) FROM "BaseItems" WHERE "Name" = 'Orphan'"#)
         .fetch_one(db.pool())
         .await
-        .expect("years")
+        .expect("dead genre")
+        == 1
 }
 
 /// A probe that never returns (a hung ffprobe) cannot keep a cancelled
@@ -630,14 +639,15 @@ async fn a_cancel_after_the_last_item_skips_the_pruning() {
 }
 
 /// `RunPostScanTasks` takes the scan's token: a cancellation between two
-/// closing passes stops before the next one (here the years pass never
-/// runs), and the progress never reaches 100 %.
+/// closing passes stops before the next one (here the dead by-name sweep
+/// never runs), and the progress never reaches 100 %.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_cancel_between_closing_passes_skips_the_rest() {
     let tmp = tempfile::tempdir().expect("tmp");
     let probe = HeldProbe::new();
     probe.release.add_permits(1);
     let (db, scanner) = movie_library(tmp.path(), &probe, Vec::new(), CancelAt::Nowhere).await;
+    seed_dead_genre(&db).await;
 
     let cancel = ScanCancel::new();
     let reported = Arc::new(Mutex::new(Vec::new()));
@@ -654,7 +664,10 @@ async fn a_cancel_between_closing_passes_skips_the_rest() {
     let outcome = scan(&scanner, &cancel, Some(&after_first_pass)).await;
     assert!(outcome.stopped, "{outcome:?}");
     assert_eq!(outcome.created, 3, "every item was scanned");
-    assert_eq!(years(&db).await, 0, "the years pass never ran");
+    assert!(
+        dead_genre_left(&db).await,
+        "the dead by-name sweep never ran"
+    );
     let reported = reported.lock().expect("reported").clone();
     assert!(reported.contains(&96.0), "{reported:?}");
     assert!(reported.iter().all(|p| *p < 100.0), "{reported:?}");
@@ -665,18 +678,19 @@ async fn a_cancel_between_closing_passes_skips_the_rest() {
 
     let outcome = scanner.scan_all().await.expect("rescan");
     assert!(!outcome.stopped);
-    assert_eq!(years(&db).await, 3, "the next scan runs the passes");
+    assert!(!dead_genre_left(&db).await, "the next scan runs the passes");
 }
 
 /// An item refresh's closing passes are the touched items' only: the
-/// library-wide passes (here the years pass) never run for it; the next
-/// library scan runs them.
+/// library-wide passes (here the dead by-name sweep) never run for it; the
+/// next library scan runs them.
 #[tokio::test(flavor = "multi_thread")]
 async fn an_item_refresh_runs_no_library_wide_closing_pass() {
     let tmp = tempfile::tempdir().expect("tmp");
     let probe = HeldProbe::new();
     probe.release.add_permits(1);
     let (db, scanner) = movie_library(tmp.path(), &probe, Vec::new(), CancelAt::Nowhere).await;
+    seed_dead_genre(&db).await;
     let heat = tmp.path().join("movies/Heat (1995)/Heat (1995).mkv");
     let options = MetadataRefreshOptions::default();
     let outcome = scanner
@@ -688,10 +702,10 @@ async fn an_item_refresh_runs_no_library_wide_closing_pass() {
         .await
         .expect("item refresh");
     assert_eq!(outcome.created, 1, "{outcome:?}");
-    assert_eq!(years(&db).await, 0, "no years pass");
+    assert!(dead_genre_left(&db).await, "no dead by-name sweep");
 
     scanner.scan_all().await.expect("scan");
-    assert_eq!(years(&db).await, 3);
+    assert!(!dead_genre_left(&db).await);
 }
 
 /// A priority lane holding one item refresh, handed out once `ready`.
@@ -728,6 +742,7 @@ async fn an_item_refresh_is_served_between_closing_passes() {
     let probe = HeldProbe::new();
     probe.release.add_permits(1);
     let (db, scanner) = movie_library(tmp.path(), &probe, Vec::new(), CancelAt::Nowhere).await;
+    seed_dead_genre(&db).await;
     let heat = tmp.path().join("movies/Heat (1995)/Heat (1995).mkv");
     let options = MetadataRefreshOptions::default();
     let lane = Arc::new(ReadyLane {
@@ -768,7 +783,7 @@ async fn an_item_refresh_is_served_between_closing_passes() {
         served[0].unchanged, 1,
         "Heat was already scanned: {served:?}"
     );
-    assert_eq!(years(&db).await, 3, "the passes went on");
+    assert!(!dead_genre_left(&db).await, "the passes went on");
 }
 
 /// PNG magic: the artwork pass stores only bytes it recognizes as an image.

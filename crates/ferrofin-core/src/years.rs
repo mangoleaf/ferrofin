@@ -11,9 +11,9 @@
 //! one — so a year always resolves, scanned or not.
 //!
 //! Ferrofin does the same on read ([`crate::library_manager`] resolves a
-//! missing `Year` through [`YearStore::ensure_missing`]) and, additionally,
-//! materializes every scanned production year at the end of a library scan so
-//! the read path is write-free in the steady state.
+//! missing `Year` through [`YearStore::ensure_missing`]), and nothing else
+//! creates one: a library scan writes no `Year` row, as upstream's does not
+//! (gl-1583).
 
 use std::path::PathBuf;
 use std::sync::Arc;

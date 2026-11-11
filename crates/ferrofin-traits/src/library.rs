@@ -1108,10 +1108,13 @@ pub trait LibraryManager: Send + Sync {
     /// through `GetYear`, which creates the `Year` item when it does not exist
     /// yet. Here the distinct years come from [`Self::get_distinct_years`]
     /// over the same `query` and are resolved via [`Self::get_named_items`];
-    /// the concrete manager materializes a missing `Year` on that lookup, and
-    /// the library scan creates every scanned year up front, so each year
-    /// resolves. The default still drops a slot no implementation resolved
-    /// (a fake without the provisioner), mirroring `.Where(i => i is not null)`.
+    /// the concrete manager creates a missing `Year` on that lookup, so each
+    /// year resolves. Every distinct year is resolved before the paging, as
+    /// `GetAllItems` runs each through `GetYear` before `Skip`/`Take`, so one
+    /// call creates every year it counts. Only a `/Years` lookup creates one: a
+    /// library scan writes no `Year` row, as upstream's does not. The default still
+    /// drops a slot no implementation resolved (a fake without the
+    /// provisioner), mirroring `.Where(i => i is not null)`.
     async fn get_years(
         &self,
         query: &InternalItemsQuery,
@@ -1143,28 +1146,21 @@ pub trait LibraryManager: Send + Sync {
         // is the number of distinct years, not the size of the page.
         let total = i32::try_from(years.len()).unwrap_or(i32::MAX);
         let start = usize::try_from(query.start_index.unwrap_or(0).max(0)).unwrap_or(0);
-        // Page the year list first, then resolve the slice in one query. Every
-        // year resolves (the scan materializes them and the lookup creates any
-        // straggler), so paging the names is paging the rows.
-        let paged: Vec<String> = match query.limit.filter(|l| *l >= 0) {
-            Some(limit) => years
-                .into_iter()
-                .skip(start)
-                .take(usize::try_from(limit).unwrap_or(usize::MAX))
-                .map(|y| y.to_string())
-                .collect(),
-            None => years
-                .into_iter()
-                .skip(start)
-                .map(|y| y.to_string())
-                .collect(),
-        };
-        let items: Vec<BaseItemEntity> = self
-            .get_named_items(BaseItemKind::Year, &paged)
+        // Resolve every year in one query, then page: `GetYear` creates the
+        // missing rows of the whole list before `Skip`/`Take` upstream.
+        let names: Vec<String> = years.iter().map(ToString::to_string).collect();
+        let page = self
+            .get_named_items(BaseItemKind::Year, &names)
             .await?
             .into_iter()
-            .flatten()
-            .collect();
+            .skip(start);
+        let items: Vec<BaseItemEntity> = match query.limit.filter(|l| *l >= 0) {
+            Some(limit) => page
+                .take(usize::try_from(limit).unwrap_or(usize::MAX))
+                .flatten()
+                .collect(),
+            None => page.flatten().collect(),
+        };
         Ok(QueryResult::new(query.start_index, Some(total), items))
     }
 

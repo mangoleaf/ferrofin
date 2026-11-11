@@ -2098,8 +2098,8 @@ pub enum ScanPasses {
     /// webhooks): upstream's `ProviderManager.RefreshItem` runs no post-scan
     /// task, so a refresh of one movie never enriches every album in the
     /// database. What a library-wide pass owes the items such a refresh
-    /// created (a new studio's artwork, a new year, a new by-name artist's
-    /// first refresh) is selected by the next library validation from what
+    /// created (a new studio's artwork, a new by-name artist's first
+    /// refresh) is selected by the next library validation from what
     /// is stored — each pass's persisted selection — never from this scan's
     /// memory.
     Touched,
@@ -3813,7 +3813,7 @@ pub(crate) fn dead_by_name_queries() -> [InternalItemsQuery; 2] {
 
 /// The closing passes [`LibraryScanner::post_scan_passes`] runs, each worth
 /// an equal share of the last 4 % of a scan's progress.
-const POST_SCAN_PASSES: u32 = 12;
+const POST_SCAN_PASSES: u32 = 11;
 
 /// The `albums` whose stored Primary is still the cover `covers` holds for
 /// them, from one read of their image rows. A failed read is logged and
@@ -3908,7 +3908,6 @@ async fn splashscreen_images(items: &dyn ItemRepository, image_type: ImageType) 
 struct PassTimings {
     music: std::time::Duration,
     album_covers: std::time::Duration,
-    years: std::time::Duration,
     artists: std::time::Duration,
     dead_by_name: std::time::Duration,
     aggregates: std::time::Duration,
@@ -3927,7 +3926,6 @@ impl PassTimings {
         let [
             music,
             album_covers,
-            years,
             artists,
             dead_by_name,
             aggregates,
@@ -3941,7 +3939,6 @@ impl PassTimings {
         crate::scan_metrics::passes_finished(&[
             (music, self.music),
             (album_covers, self.album_covers),
-            (years, self.years),
             (artists, self.artists),
             (dead_by_name, self.dead_by_name),
             (aggregates, self.aggregates),
@@ -3957,7 +3954,6 @@ impl PassTimings {
             albums_and_artists,
             music_ms = ms(self.music),
             album_covers_ms = ms(self.album_covers),
-            years_ms = ms(self.years),
             artists_ms = ms(self.artists),
             dead_by_name_ms = ms(self.dead_by_name),
             aggregates_ms = ms(self.aggregates),
@@ -4329,10 +4325,6 @@ pub struct LibraryScanner {
     /// and their tracks) and the other closing passes. Absent → no music
     /// pass.
     item_repository: Option<Arc<dyn ItemRepository>>,
-    /// The `Year` by-name provisioner for the post-scan year pass (one `Year`
-    /// row per distinct scanned `ProductionYear`, so `/Years` lists every
-    /// year without a write on the read path). Absent → no year pass.
-    years: Option<crate::years::YearStore>,
     /// The `Genre`/`MusicGenre`/`Studio`/`MusicArtist` by-name provisioner. The
     /// scan uses it only to backfill the metadata `Path` of the by-name rows it
     /// materialized itself — Jellyfin's carry one and the DTO emits it
@@ -4624,7 +4616,6 @@ impl LibraryScanner {
             musicbrainz: None,
             audiodb: None,
             item_repository: None,
-            years: None,
             by_name: None,
             recording_paths: None,
             self_writes: None,
@@ -4881,15 +4872,6 @@ impl LibraryScanner {
     #[must_use]
     pub fn with_id_derivation(mut self, mode: item_type_lookup::IdDerivation) -> Self {
         self.id_derivation = mode;
-        self
-    }
-
-    /// Attaches the `Year` provisioner so every scan ends by materializing a
-    /// `Year` item per distinct production year (needs
-    /// [`with_items`](Self::with_items) for the distinct-year query).
-    #[must_use]
-    pub fn with_years(mut self, years: crate::years::YearStore) -> Self {
-        self.years = Some(years);
         self
     }
 
@@ -7385,9 +7367,9 @@ impl LibraryScanner {
             (&excluded, &superseded, &unmoved),
         ))
         .await;
-        // Boxed: the post-scan passes (music, years, studio/library/dynamic
-        // images) run once per scan, and inlining their state kept the scan
-        // future at clippy's `large_futures` ceiling.
+        // Boxed: the post-scan passes (music, studio/library/dynamic images)
+        // run once per scan, and inlining their state kept the scan future at
+        // clippy's `large_futures` ceiling.
         outcome.stopped = !match run.passes {
             ScanPasses::Library => {
                 Box::pin(self.post_scan_passes(folders, &planned, &art_cache, &work, run)).await
@@ -9647,7 +9629,6 @@ impl LibraryScanner {
     /// |---|---|---|
     /// | music | the walk's per-item decision for each album and artist ([`music`]); the item keeps what made it due until this pass writes it; then every album the scan planned, its artist credits written where they moved | `MetadataService.RefreshMetadata`; `AlbumMetadataService.SetPeople` |
     /// | album covers | the albums this scan planned whose cover is not stored yet | the cover a track's `AudioImageProvider` extracts, shared with its album |
-    /// | years | the library's distinct production years, created where no `Year` row exists | none: Jellyfin creates them lazily on read |
     /// | artists | the by-name artists a library artist supersedes; the by-name artists never refreshed (`DateLastRefreshed IS NULL`) | `ArtistsValidator.cs:86-91` (`isNew \|\| neverRefreshed`) |
     /// | dead by-name rows | the unlocked genres, music genres and studios no item value names, and the by-name artists no item credits | `GenresValidator.cs:107-119`, `StudiosValidator.cs:108-120`, `ArtistsValidator.cs:130-143` |
     /// | folder aggregates | every series, album and artist the scan planned, written where the value moved | `UpdateMetadataFromChildren` in each folder's `RefreshMetadata` |
@@ -9690,17 +9671,6 @@ impl LibraryScanner {
         let started = std::time::Instant::now();
         self.finish_album_artwork(art_cache, run).await;
         timings.album_covers = started.elapsed();
-        if !self.between_passes(run, &mut done).await {
-            return false;
-        }
-        // One `Year` item per distinct ProductionYear now in the library
-        // (Jellyfin creates them lazily from `/Years`; doing it here keeps
-        // that read write-free and lists every year on first request).
-        let started = std::time::Instant::now();
-        if let Err(err) = self.materialize_years().await {
-            tracing::warn!(%err, "year pass failed");
-        }
-        timings.years = started.elapsed();
         if !self.between_passes(run, &mut done).await {
             return false;
         }
@@ -10277,26 +10247,6 @@ impl LibraryScanner {
             self.persistence
                 .update_date_last_media_added(*id, date.aggregate)
                 .await?;
-        }
-        Ok(())
-    }
-
-    /// The post-scan year pass: reads the distinct `ProductionYear`s across
-    /// the whole library and creates the `Year` rows that are missing. No-op
-    /// unless both the item repository and the year provisioner are wired.
-    async fn materialize_years(&self) -> Result<(), ServiceError> {
-        let (Some(items), Some(years)) = (&self.item_repository, &self.years) else {
-            return Ok(());
-        };
-        let distinct = items
-            .get_distinct_years(&InternalItemsQuery {
-                recursive: true,
-                ..InternalItemsQuery::default()
-            })
-            .await?;
-        let created = years.ensure_missing(&distinct).await?;
-        if !created.is_empty() {
-            tracing::info!(created = created.len(), "materialized year items");
         }
         Ok(())
     }

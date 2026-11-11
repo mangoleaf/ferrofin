@@ -1477,9 +1477,9 @@ pub async fn build_app_state(
             .with_configuration(Arc::clone(&config_trait)),
     );
     // The by-name `Year` provisioner (`GetYear`): one row per production year
-    // at `{metadata}/Year/{year}` with Jellyfin's normalized by-name id. Shared
-    // by the scan's post-pass (every scanned year) and the library manager's
-    // on-demand `/Years/{year}` resolution.
+    // at `{metadata}/Year/{year}` with Jellyfin's normalized by-name id,
+    // created on demand by the library manager when `/Years` resolves a year.
+    // A scan creates none, as upstream's does not.
     let year_store = ferrofin_core::YearStore::new(
         Arc::clone(&item_persistence_service),
         id_derivation.clone(),
@@ -1548,9 +1548,6 @@ pub async fn build_app_state(
     // Each library location is the `Folder` row Jellyfin keeps for it, under
     // the aggregate root, and what it holds hangs off it (owner decision D1).
     .with_root_folder(root_folder_ids.aggregate)
-    // Materialize a `Year` item per distinct ProductionYear at the end of
-    // every scan (needs the item repository wired via `with_music` below).
-    .with_years(year_store.clone())
     .with_by_name_store(by_name_store.clone())
     // OfficialRating → numeric parental score on each scanned row (the
     // Parental Rating sort and max-rating filters read the numeric column).
