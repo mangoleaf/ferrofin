@@ -903,8 +903,7 @@ pub const VERIFIED_AGAINST_EARLIER_PIN: &[(&str, &str, &str)] = &[
     // rows is unchanged); each leaves the list with its fix.
     // gl-1034: a nil parentId is an empty page, not GetItemById's 400.
     ("get", "/Shows/NextUp", "v12.2"),
-    // gl-1037: a malformed minCommunityRating is ignored, not a 400; gl-884: a
-    // malformed genreIds/studioIds token is a 400, not dropped.
+    // gl-884: a malformed genreIds/studioIds token is a 400, not dropped.
     ("get", "/Artists", "v12.2"),
     ("get", "/Artists/AlbumArtists", "v12.2"),
     // gl-408: parameters these actions do not declare are bound (a 400 on a
@@ -923,9 +922,6 @@ pub const VERIFIED_AGAINST_EARLIER_PIN: &[(&str, &str, &str)] = &[
         "v12.2",
     ),
     ("post", "/Audio/{itemId}/Lyrics", "v12.2"),
-    // gl-1059: "EnabledTuners": null or "ChannelMappings": null is a 400, not
-    // bound.
-    ("post", "/LiveTv/ListingProviders", "v12.2"),
     // gl-762: livetv lists tuners and listing providers by id, not as added.
     ("get", "/System/Configuration/{key}", "v12.2"),
 ];
@@ -1829,7 +1825,8 @@ pub const VERIFIED: &[Verified] = &[
         upstream_file: "Jellyfin.Api/Controllers/ArtistsController.cs",
         upstream_method: "GetArtists",
         ferrofin: "handlers/artists.rs get_artists (items.rs resolve_user_or_api_key) → \
-               handlers/by_name.rs (ByNameListQuery artists_query, resolve_by_name_ids, \
+               handlers/by_name.rs (ByNameListQuery check_min_community_rating, \
+               artists_query, resolve_by_name_ids, \
                project_query_result) → ferrofin-core item_repository.rs get_artists \
                (item_values_with_counts, item_counts_by_clean_name)",
         date: "2026-10-25",
@@ -1842,7 +1839,8 @@ pub const VERIFIED: &[Verified] = &[
         upstream_file: "Jellyfin.Api/Controllers/ArtistsController.cs",
         upstream_method: "GetAlbumArtists",
         ferrofin: "handlers/artists.rs get_album_artists (items.rs resolve_user_or_api_key) → \
-               handlers/by_name.rs (artists_query, resolve_by_name_ids) → ferrofin-core \
+               handlers/by_name.rs (check_min_community_rating, artists_query, \
+               resolve_by_name_ids) → ferrofin-core \
                item_repository.rs get_album_artists (item_values_with_counts)",
         date: "2026-10-25",
         divergences: BY_NAME_DIVERGENCES_ARTISTS,
@@ -2630,7 +2628,7 @@ pub const VERIFIED: &[Verified] = &[
                store_listing_provider) → schedules_direct.rs SchedulesDirect::validate \
                (ListingsManager.SaveListingProvider, XmlTvListingsProvider.Validate, \
                SchedulesDirect.Validate)",
-        date: "2026-10-21",
+        date: "2026-11-11",
         divergences: &[
             "An XMLTV provider with no Path, or a null one, is a 400; upstream's Validate \
          dereferences the null path and answers a NullReferenceException 500 (an empty or \
@@ -2640,8 +2638,17 @@ pub const VERIFIED: &[Verified] = &[
          bug not ported.",
             "SchedulesDirect.GetTokenInternal logs the session token at info; Ferrofin never \
          logs the password, its hash or the token. Jellyfin bug not ported.",
-            "A body with \"EnabledTuners\": null or \"ChannelMappings\": null is a 400; \
-         upstream binds the null and saves the provider (200). Fix path: gl-1059.",
+            "A null EnabledTuners or ChannelMappings is saved and answered as the empty list, \
+         and a null category list (answered without the member, as upstream does) reads \
+         back as its default keywords: the values upstream reads back from livetv.xml after \
+         a restart. Until then upstream keeps the null, so GET /System/Configuration/livetv \
+         omits the member (and so does upstream's own answer, for the two lists), mapping \
+         the guide dereferences a null ChannelMappings (a NullReferenceException), and with \
+         EnableAllTuners off the tuner check calls Contains on a null EnabledTuners (an \
+         ArgumentNullException). Jellyfin bug not ported.",
+            "A null element in a list (\"EnabledTuners\":[null], \"ChannelMappings\":[null] or \
+         a category list) is a 400; upstream binds and stores it (200, measured on Jellyfin \
+         12.4 for the first two). Fix path: gl-1677.",
             "The 400 (an XMLTV provider with no Path, a Schedules Direct save missing its \
          Username, Password or ListingsId, or a query value the binder cannot convert), 401 \
          (Schedules Direct refuses the login) and 404 (an unknown or missing Type, or an \
@@ -2840,6 +2847,10 @@ pub const VERIFIED: &[Verified] = &[
             "livetv's TunerHosts and ListingProviders are the Live TV manager's rows, kept in \
          the database, so lists in a posted document are stored with it but neither add nor \
          change a tuner or a provider.",
+            "A null list in livetv (TunerHosts, ListingProviders, MediaLocationsCreated, or a \
+         provider's EnabledTuners or ChannelMappings) is saved as the empty list, the value \
+         upstream reads back from livetv.xml after a restart; until then upstream keeps the \
+         null and its GET omits the member.",
             "The save answers once CreateRecordingFolders has finished, where upstream's async \
          void handler runs alongside it. It still cannot fail the save.",
             "The first CreateRecordingFolders on a data directory forgets the \
@@ -4032,8 +4043,14 @@ const BY_NAME_DIVERGENCES_ARTISTS: &[&str] = &[
      are all on the other side of the played filter gets the ten count fields as 0 where v12 \
      omits them (its `ItemCounts?` is null for a name the count scope never saw). \
      Un-defer path: make `ItemWithCounts.counts` an `Option` in ferrofin-traits.",
-    "`minCommunityRating`, `person`, `personIds`, `personTypes` are accepted and ignored, \
-     exactly as v12 — GetItemValues copies none of them onto either filter.",
+    "`person`, `personIds`, `personTypes` and a valid `minCommunityRating` are accepted \
+     and ignored, exactly as v12 — GetItemValues copies none of them onto either filter; a \
+     `minCommunityRating` that is not a double is the binder's 400 in both, except that the \
+     shared float binder takes `inf` (a 400 upstream) and refuses a thousands separator \
+     such as `1,5` (bound upstream). Fix path: gl-1665.",
+    "The 400 (a value the query binder cannot convert, a parentId naming no item, or a \
+     conflicting `filters` pair) and 403 (another user's id without the administrator \
+     role) bodies are Ferrofin's error shape, not upstream's. Fix path: gl-666.",
     "`searchTerm` is not v12.2 TranslateQuery's search branch: the wildcard branch is \
      chosen on, and matches CleanName with, the raw lower-cased term rather than the \
      cleaned one, a whitespace-only term filters nothing (upstream's IsNullOrEmpty applies \
