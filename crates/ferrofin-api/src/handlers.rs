@@ -1218,9 +1218,10 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
              as the stream's last send, so progress inside the first period is held back.",
             "A task start or completion is sent with the task list captured at the transition \
              (its names, descriptions and categories shown again in the socket's culture), \
-             where upstream reads the list when it sends; a progress frame due while one is still \
-             queued is dropped, so a short run never shows out of order, and a later report sends \
-             once the period has passed.",
+             where upstream reads the list when it sends, so a start frame never carries the \
+             run's first progress report, which upstream's can; a progress frame due while one \
+             is still queued is dropped, so a short run never shows out of order, and a later \
+             report sends once the period has passed.",
             "A socket's task list is ordered in its own upgrade request's culture. Upstream's one \
              send loop per listener orders every socket's list in the CurrentCulture it inherited \
              when the listener was built, on the first request after boot to reach the WebSocket \

@@ -98,12 +98,16 @@ fn first_run_delay(task_key: &str) -> chrono::TimeDelta {
 /// A live handle a running task uses to report its completion percentage.
 ///
 /// Port of the C# `IProgress<double>` each `IScheduledTask.ExecuteAsync`
-/// receives; the registry surfaces the reported value as
-/// [`TaskInfo::current_progress_percentage`] while the task is running.
+/// receives; the registry surfaces the last reported value as
+/// [`TaskInfo::current_progress_percentage`] while the task is running, and
+/// nothing before its first report (upstream's `CurrentProgress` stays null
+/// until `ScheduledTaskWorker.OnProgressChanged` sets it).
 #[derive(Clone, Debug, Default)]
 pub struct TaskProgress {
     /// The current percentage, stored as `f64` bits.
     percent: Arc<AtomicU64>,
+    /// Set by the first [`report`](Self::report).
+    reported: Arc<AtomicBool>,
     /// Set by [`stopped`](Self::stopped).
     stopped: Arc<AtomicBool>,
     /// Why the run started (`api`, `schedule`, `startup`); empty for a
@@ -136,13 +140,16 @@ impl TaskProgress {
         self.stopped.load(Ordering::Relaxed)
     }
 
-    /// Reports the task's completion percentage (clamped to `0.0..=100.0`)
-    /// and raises the registry's progress signal, as upstream's
-    /// `ScheduledTaskWorker.OnProgressChanged` raises `TaskProgress` on every
-    /// report.
+    /// Reports the task's completion percentage, capped at 100 with no lower
+    /// bound, and raises the registry's progress signal, as upstream's
+    /// `ScheduledTaskWorker.OnProgressChanged` caps it (`Math.Min(e, 100)`,
+    /// which keeps a NaN) and raises `TaskProgress` on every report.
     pub fn report(&self, percent: f64) {
-        self.percent
-            .store(percent.clamp(0.0, 100.0).to_bits(), Ordering::Relaxed);
+        // Not `f64::min`, which turns a NaN into 100.
+        let capped = if percent > 100.0 { 100.0 } else { percent };
+        self.percent.store(capped.to_bits(), Ordering::Relaxed);
+        // Release: whoever sees the flag sees this report's percentage.
+        self.reported.store(true, Ordering::Release);
         if let Some(progressed) = &self.progressed {
             // Nobody subscribed is not an error.
             let _ = progressed.send(());
@@ -153,6 +160,13 @@ impl TaskProgress {
     #[must_use]
     pub fn current(&self) -> f64 {
         f64::from_bits(self.percent.load(Ordering::Relaxed))
+    }
+
+    /// The last reported percentage, or `None` before the first report.
+    fn reported(&self) -> Option<f64> {
+        self.reported
+            .load(Ordering::Acquire)
+            .then(|| self.current())
     }
 }
 
@@ -338,8 +352,10 @@ impl Registration {
         let key = self.task.key().to_string();
         let mut info = TaskInfo {
             state: self.state,
-            current_progress_percentage: (self.state == TaskState::Running)
-                .then(|| self.progress.current()),
+            current_progress_percentage: self
+                .progress
+                .reported()
+                .filter(|_| self.state == TaskState::Running),
             id: Some(self.id.clone()),
             last_execution_result: self.last_result.clone(),
             triggers: self.effective_triggers(),
@@ -1720,7 +1736,9 @@ impl ScheduledTask for RefreshLibraryTask {
         // Libraries" over the API), so its root trace, its log lines and its
         // metrics record the origin. The scan's progress is the task's (the
         // dashboard's "Scan Media Library" bar), and a scan that failed fails
-        // the task.
+        // the task. Upstream reports 0 first, so the run shows 0 %, not no
+        // progress, until the scan's first report.
+        progress.report(0.0);
         let sink = progress.clone();
         let trigger = ferrofin_traits::library::ScanTrigger::from_task_trigger(progress.trigger());
         let finished = self
@@ -1879,7 +1897,8 @@ mod tests {
             // Receive only after the whole run has finished: the start is captured.
             let started = subscription.updates.try_recv().unwrap();
             assert_eq!(started[0].state, TaskState::Running);
-            assert_eq!(started[0].current_progress_percentage, Some(0.0));
+            // Nothing reported yet: upstream's `CurrentProgress` is null.
+            assert_eq!(started[0].current_progress_percentage, None);
             let ended = subscription.updates.try_recv().unwrap();
             assert_eq!(ended[0].state, TaskState::Idle);
             assert_eq!(
@@ -1928,6 +1947,19 @@ mod tests {
         }
         assert_eq!(subscription.progress.try_recv(), Ok(()));
         assert!(subscription.progress.try_recv().is_err(), "one report");
+    }
+
+    /// `ScheduledTaskWorker.OnProgressChanged` caps a report with
+    /// `Math.Min(e, 100)`: no lower bound, and a NaN stays NaN.
+    #[test]
+    fn a_progress_report_is_capped_at_100_with_no_lower_bound() {
+        let progress = TaskProgress::default();
+        progress.report(150.0);
+        assert!((progress.current() - 100.0).abs() < f64::EPSILON);
+        progress.report(-5.0);
+        assert!((progress.current() + 5.0).abs() < f64::EPSILON);
+        progress.report(f64::NAN);
+        assert!(progress.current().is_nan());
     }
 
     /// A task recording the trigger each of its runs saw.
@@ -2703,6 +2735,8 @@ mod tests {
         mgr.queue("gated").expect("queued");
         let info = mgr.get("gated").expect("info");
         assert_eq!(info.state, TaskState::Running);
+        // The spawned run has not reported yet (nothing awaited since).
+        assert_eq!(info.current_progress_percentage, None);
         assert!(mgr.queue("gated").is_err());
 
         // The spawned run reports progress, visible while Running.
