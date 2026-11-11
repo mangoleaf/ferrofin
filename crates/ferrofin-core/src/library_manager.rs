@@ -4849,6 +4849,9 @@ mod tests {
 
         tasks.queue("RefreshLibrary").expect("queued");
         runner.started(1).await;
+        // The run reports 0 before the scan reports anything
+        // (`RefreshMediaLibraryTask`'s `progress.Report(0)`): 0 %, not none.
+        assert_eq!(info(&tasks).current_progress_percentage, Some(0.0));
         runner.release(1);
         for _ in 0..500 {
             if info(&tasks).current_progress_percentage == Some(48.0) {
