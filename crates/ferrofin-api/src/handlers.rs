@@ -901,8 +901,6 @@ pub const UPSTREAM_PIN_DATE: &str = "2026-10-28";
 pub const VERIFIED_AGAINST_EARLIER_PIN: &[(&str, &str, &str)] = &[
     // The v12.4 re-check found a gap that v12.2 has too (the C# under these
     // rows is unchanged); each leaves the list with its fix.
-    // gl-1034: a nil parentId is an empty page, not GetItemById's 400.
-    ("get", "/Shows/NextUp", "v12.2"),
     // gl-884: a malformed genreIds/studioIds token is a 400, not dropped.
     ("get", "/Artists", "v12.2"),
     ("get", "/Artists/AlbumArtists", "v12.2"),
@@ -911,17 +909,6 @@ pub const VERIFIED_AGAINST_EARLIER_PIN: &[(&str, &str, &str)] = &[
     ("get", "/Genres", "v12.2"),
     ("get", "/MusicGenres", "v12.2"),
     ("get", "/Studios", "v12.2"),
-    // gl-1034: a nil item id is a 404, not GetItemById's 400.
-    ("get", "/Audio/{itemId}/Lyrics", "v12.2"),
-    ("delete", "/Audio/{itemId}/Lyrics", "v12.2"),
-    ("get", "/Audio/{itemId}/RemoteSearch/Lyrics", "v12.2"),
-    ("post", "/Items/{itemId}/ContentType", "v12.2"),
-    (
-        "post",
-        "/Audio/{itemId}/RemoteSearch/Lyrics/{lyricId}",
-        "v12.2",
-    ),
-    ("post", "/Audio/{itemId}/Lyrics", "v12.2"),
     // gl-762: livetv lists tuners and listing providers by id, not as added.
     ("get", "/System/Configuration/{key}", "v12.2"),
 ];
@@ -1800,9 +1787,10 @@ pub const VERIFIED: &[Verified] = &[
         upstream_file: "Jellyfin.Api/Controllers/TvShowsController.cs",
         upstream_method: "GetNextUp",
         ferrofin: "handlers/tv_shows.rs get_next_up → ferrofin-core tv_series_manager.rs \
-               (TVSeriesManager) → next_up_service.rs (NextUpService, top_parent_ids → \
+               (TVSeriesManager; resolve_parents: GetItemById's 400 for a nil parentId, after \
+               the seriesId return) → next_up_service.rs (NextUpService, top_parent_ids → \
                item_repository.rs view_top_parent_ids)",
-        date: "2026-10-19",
+        date: "2026-11-11",
         divergences: &[
             "TVSeriesManager.GetPreferredVersion (continue in the alternate version the user \
          has been watching, matched by media-source name) is not ported: the pick is always \
@@ -1813,9 +1801,10 @@ pub const VERIFIED: &[Verified] = &[
          statement ignores, so the answer is always empty; Ferrofin scopes by TopParentId = \
          that item (a physical library folder answers, anything else is empty as upstream). \
          Jellyfin bug not ported.",
-            "The 400 (an API key with no userId, or a value the query binder cannot convert), \
-         403 (another user's id without the administrator role) and 404 (a userId naming no \
-         account) bodies are Ferrofin's error shape, not upstream's. Fix path: gl-666.",
+            "The 400 (an API key with no userId, a nil parentId, or a value the query binder \
+         cannot convert), 403 (another user's id without the administrator role) and 404 (a \
+         userId naming no account) bodies are Ferrofin's error shape, not upstream's. Fix \
+         path: gl-666.",
         ],
         refs: &["images", "access-filtering"],
     },
@@ -2279,17 +2268,18 @@ pub const VERIFIED: &[Verified] = &[
         path: "/Audio/{itemId}/Lyrics",
         upstream_file: "Jellyfin.Api/Controllers/LyricsController.cs",
         upstream_method: "GetLyrics",
-        ferrofin: "handlers/lyrics.rs get_lyrics → ferrofin-core lyric_manager.rs \
-               get_lyrics (the item's Lyric streams, LrcLyricParser then TxtLyricParser)",
-        date: "2026-10-19",
+        ferrofin: "handlers/lyrics.rs get_lyrics (require_item: GetItemById's 400 for a nil \
+               id) → ferrofin-core lyric_manager.rs get_lyrics (the item's Lyric streams, \
+               LrcLyricParser then TxtLyricParser)",
+        date: "2026-11-11",
         divergences: &[
             "A Lyric stream whose file cannot be read (removed outside the server before the next \
          refresh, or unreadable) is skipped and the next stream read; upstream's \
          File.ReadAllTextAsync throws on the first such stream, a plain-text 404 when the \
          file or its folder is gone and a 500 otherwise, so a later stream's lyric is never \
          served. Jellyfin bug not ported.",
-            "The 404 (no such item, one the caller may not see, or no lyrics) body is Ferrofin's \
-         error shape, not upstream's. Fix path: gl-666.",
+            "The 400 (nil item id) and 404 (no such item, one the caller may not see, or no \
+         lyrics) bodies are Ferrofin's error shape, not upstream's. Fix path: gl-666.",
         ],
         refs: &[],
     },
@@ -2298,12 +2288,13 @@ pub const VERIFIED: &[Verified] = &[
         path: "/Audio/{itemId}/Lyrics",
         upstream_file: "Jellyfin.Api/Controllers/LyricsController.cs",
         upstream_method: "UploadLyrics",
-        ferrofin: "handlers/lyrics.rs upload_lyrics (require_item, an empty body by its \
-               size hint, upload_format, then the Bytes read under upload_body_limit; \
-               queue_high_priority_refresh) → ferrofin-core lyric_manager.rs save_lyric \
+        ferrofin: "handlers/lyrics.rs upload_lyrics (require_item with GetItemById's 400 for \
+               a nil id, an empty body by its size hint, upload_format, then the Bytes read \
+               under upload_body_limit; queue_high_priority_refresh) → ferrofin-core \
+               lyric_manager.rs save_lyric \
                (decode_stream_text, parse_by_format on the format as given, save_targets \
                with save_extension, try_save_to_files)",
-        date: "2026-10-24",
+        date: "2026-11-11",
         divergences: &[
             "An upload with no Content-Length (a chunked body) is read and saved; upstream \
          tests Request.ContentLength and answers every chunked upload 400 \"No lyrics \
@@ -2313,9 +2304,10 @@ pub const VERIFIED: &[Verified] = &[
          upstream reads it too; upstream's ExceptionMiddleware maps no \
          BadHttpRequestException, so Kestrel's \"request body too large\" reaches the \
          client as a plain-text 500. Jellyfin bug not ported.",
-            "The 400 (an empty body, a file name without an extension, a format no parser \
-         reads, a missing or blank fileName) and 404 (no such item, or one the caller may \
-         not see) bodies are Ferrofin's error shape, not upstream's. Fix path: gl-666.",
+            "The 400 (a nil item id, an empty body, a file name without an extension, a format \
+         no parser reads, a missing or blank fileName) and 404 (no such item, or one the \
+         caller may not see) bodies are Ferrofin's error shape, not upstream's. Fix path: \
+         gl-666.",
         ],
         refs: &[],
     },
@@ -2324,12 +2316,12 @@ pub const VERIFIED: &[Verified] = &[
         path: "/Audio/{itemId}/Lyrics",
         upstream_file: "Jellyfin.Api/Controllers/LyricsController.cs",
         upstream_method: "DeleteLyrics",
-        ferrofin: "handlers/lyrics.rs delete_lyrics (run_item_refresh) → ferrofin-core \
-               lyric_manager.rs delete_lyrics",
-        date: "2026-10-19",
+        ferrofin: "handlers/lyrics.rs delete_lyrics (require_item: GetItemById's 400 for a \
+               nil id; run_item_refresh) → ferrofin-core lyric_manager.rs delete_lyrics",
+        date: "2026-11-11",
         divergences: &[
-            "The 404 (no such item, or one the caller may not see) body is Ferrofin's error \
-         shape, not upstream's. Fix path: gl-666.",
+            "The 400 (nil item id) and 404 (no such item, or one the caller may not see) bodies \
+         are Ferrofin's error shape, not upstream's. Fix path: gl-666.",
         ],
         refs: &[],
     },
@@ -2338,12 +2330,13 @@ pub const VERIFIED: &[Verified] = &[
         path: "/Audio/{itemId}/RemoteSearch/Lyrics",
         upstream_file: "Jellyfin.Api/Controllers/LyricsController.cs",
         upstream_method: "SearchRemoteLyrics",
-        ferrofin: "handlers/lyrics.rs search_remote_lyrics → ferrofin-core lyric_manager.rs \
-               search_lyrics (search_request_for, search_request, search_provider)",
-        date: "2026-10-19",
+        ferrofin: "handlers/lyrics.rs search_remote_lyrics (require_item: GetItemById's 400 \
+               for a nil id) → ferrofin-core lyric_manager.rs search_lyrics \
+               (search_request_for, search_request, search_provider)",
+        date: "2026-11-11",
         divergences: &[
-            "The 404 (no such item, or one the caller may not see) body is Ferrofin's error \
-         shape, not upstream's. Fix path: gl-666.",
+            "The 400 (nil item id) and 404 (no such item, or one the caller may not see) bodies \
+         are Ferrofin's error shape, not upstream's. Fix path: gl-666.",
         ],
         refs: &[],
     },
@@ -2353,13 +2346,14 @@ pub const VERIFIED: &[Verified] = &[
         upstream_file: "Jellyfin.Api/Controllers/LyricsController.cs",
         upstream_method: "DownloadRemoteLyrics",
         ferrofin: "handlers/lyrics.rs download_remote_lyrics (RequiredRouteString lyricId: \
-               ConvertEmptyStringToNull, then [Required]; queue_high_priority_refresh) → \
-               ferrofin-core lyric_manager.rs download_lyrics (fetch_remote, save_targets, \
-               try_save_to_files)",
-        date: "2026-10-19",
+               ConvertEmptyStringToNull, then [Required]; require_item: GetItemById's 400 for \
+               a nil id; queue_high_priority_refresh) → ferrofin-core lyric_manager.rs \
+               download_lyrics (fetch_remote, save_targets, try_save_to_files)",
+        date: "2026-11-11",
         divergences: &[
-            "The 404 (no such item, one the caller may not see, or no lyric for the id) body \
-         is Ferrofin's error shape, not upstream's. Fix path: gl-666.",
+            "The 400 (nil item id) and 404 (no such item, one the caller may not see, or no \
+         lyric for the id) bodies are Ferrofin's error shape, not upstream's. Fix path: \
+         gl-666.",
         ],
         refs: &[],
     },
@@ -2770,14 +2764,14 @@ pub const VERIFIED: &[Verified] = &[
         path: "/Items/{itemId}/ContentType",
         upstream_file: "Jellyfin.Api/Controllers/ItemUpdateController.cs",
         upstream_method: "UpdateItemContentType",
-        ferrofin: "handlers/item_update.rs update_item_content_type → ferrofin-core \
-               library_manager.rs containing_folder_path (BaseItem/Video/Playlist and the \
-               by-name ContainingFolderPath overrides) → ferrofin-model \
-               content_type_overrides.rs with_content_type_override",
-        date: "2026-10-21",
+        ferrofin: "handlers/item_update.rs update_item_content_type (GetItemById's 400 for a \
+               nil id) → ferrofin-core library_manager.rs containing_folder_path \
+               (BaseItem/Video/Playlist and the by-name ContainingFolderPath overrides) → \
+               ferrofin-model content_type_overrides.rs with_content_type_override",
+        date: "2026-11-11",
         divergences: &[
-            "The 404 (no such item, or one the caller may not see) body is Ferrofin's error \
-         shape, not upstream's. Fix path: gl-666.",
+            "The 400 (nil item id) and 404 (no such item, or one the caller may not see) bodies \
+         are Ferrofin's error shape, not upstream's. Fix path: gl-666.",
         ],
         refs: &[],
     },
@@ -3875,7 +3869,7 @@ pub const VERIFIED: &[Verified] = &[
             "A client that hangs up stops the download, the write or the refresh where it \
          is, unlogged; upstream passes CancellationToken.None and finishes them. Fix path: \
          gl-1645.",
-            "A nil itemId is a 404, not GetItemById's 400. Fix path: gl-1034.",
+            "A nil itemId is a 404, not GetItemById's 400. Fix path: gl-1695.",
             "A whitespace-only subtitleId is taken (a logged failed download and a 204, or a \
          404 for a missing or hidden item); upstream's model validation answers 400 before \
          the action runs. Fix path: gl-1061.",
@@ -3909,7 +3903,7 @@ pub const VERIFIED: &[Verified] = &[
             "A dropped request kills a running extraction and deletes its output (gl-283); \
          upstream's action passes CancellationToken.None, so its extraction runs to the end \
          and the next request is served from the cache. Fix path: gl-1517.",
-            "A nil videoId is a 404, not GetItemById's 400. Fix path: gl-1034.",
+            "A nil videoId is a 404, not GetItemById's 400. Fix path: gl-1695.",
             "A mediaSourceId selects its source in any GUID spelling; upstream compares the N \
          form, ignoring case. Clients echo the id they were given, and an adopted database \
          may hold the hyphenated form.",
