@@ -80,15 +80,22 @@ pub struct XmltvProgramme {
     /// Airing end (parsed from the `stop` attribute), keeping the offset the
     /// file declared.
     pub stop: Option<DateTime<FixedOffset>>,
-    /// `<title>`, in the guide's language (see [`read_xmltv_where`]).
+    /// `<title>`, in the guide's language (see [`read_xmltv_where`]), as
+    /// written; `""` when the programme has none ([`Self::missing_title`]).
     pub title: String,
+    /// Whether the programme has no `<title>` at all, which upstream's
+    /// `XmlTvProgram.Title` keeps as null where an empty one is `""`.
+    #[serde(default)]
+    pub missing_title: bool,
     /// `<sub-title>` — the episode title, when present, in the guide's
-    /// language.
+    /// language, as written (an empty element is `""`).
     pub sub_title: Option<String>,
-    /// `<desc>` — the synopsis, when present, in the guide's language.
+    /// `<desc>` — the synopsis, when present, in the guide's language, as
+    /// written (an empty element is `""`).
     pub desc: Option<String>,
     /// The `<category>` values, those in the guide's language when there are
-    /// any.
+    /// any, as written; a blank one is left out, as `GetProgramInfo` leaves it
+    /// out of `Genres`.
     pub categories: Vec<String>,
     /// The `src` of the programme's first own `<icon>` that has a `src`,
     /// `width` or `height` (`Icons.FirstOrDefault()?.Source`), when it has one.
@@ -101,11 +108,17 @@ pub struct XmltvProgramme {
     /// The text of the programme's first own `<image>` of type `backdrop`,
     /// its `BackdropImageUrl`.
     pub backdrop_image: Option<String>,
-    /// Production year from `<date>` (first four digits), when present.
+    /// Production year: the year of `<date>` as `ParseDate` reads it
+    /// (`copyright_year`), when one parses.
     pub year: Option<i32>,
     /// The text of the last `<episode-num>` whose `system` the reader understands
     /// (`xmltv_ns`, e.g. `0.5.` → S1E6, or `SxxExx`).
     pub episode_num: Option<String>,
+    /// `XmlTvProgram.ProgramId`: the last non-blank `<episode-num
+    /// system="dd_progid">` (`ParseEpisodeDataForProgramId`), which
+    /// `GetProgramInfo` takes as the airing's `ShowId`.
+    #[serde(default)]
+    pub program_id: Option<String>,
     /// `Episode.Series` — the 1-based season number from that `<episode-num>`.
     pub season_number: Option<i32>,
     /// `Episode.Episode` — the 1-based episode number from that `<episode-num>`.
@@ -745,7 +758,7 @@ fn read_events<R: BufRead>(
                     }
                     saw_content = true;
                 }
-                text.push_str(e.as_ref());
+                push_text(&mut text, e.as_ref());
             }
             Ok(Event::GeneralRef(e)) => {
                 if depth == 0 {
@@ -772,7 +785,7 @@ fn read_events<R: BufRead>(
                     out.error = Some(located(OUTSIDE_ROOT, position));
                     break;
                 }
-                text.push_str(e.as_ref());
+                push_text(&mut text, e.as_ref());
             }
             Ok(Event::End(e)) => {
                 depth = depth.saturating_sub(1);
@@ -788,8 +801,7 @@ fn read_events<R: BufRead>(
                 );
                 match name {
                     // `GetChannel` returns no channel without an id or a
-                    // display-name. Text is trimmed here, so a white-space-only
-                    // name counts as none, where upstream keeps it.
+                    // display-name (`IsNullOrEmpty`); a blank name is a name.
                     b"channel" => {
                         if let Some(mut c) = channel.take() {
                             end_channel_run(&mut c, language);
@@ -868,7 +880,10 @@ fn attribute_value(a: &quick_xml::events::attributes::Attribute<'_>) -> String {
 /// Reads a `<programme>` start tag's `channel`/`start`/`stop` attributes in a
 /// single pass over the attribute list.
 fn read_programme(e: &BytesStart<'_>) -> XmltvProgramme {
-    let mut p = XmltvProgramme::default();
+    let mut p = XmltvProgramme {
+        missing_title: true,
+        ..XmltvProgramme::default()
+    };
     for a in e.attributes().flatten() {
         let value = attribute_value(&a);
         match a.key.local_name().as_ref().as_bytes() {
@@ -1053,12 +1068,20 @@ fn end_programme_run(p: &mut OpenProgramme, language: Option<&str>) {
     match programme_child_name(&run.name).as_ref() {
         b"category" => programme
             .categories
-            .extend(run.pick_all(language).filter(|value| !value.is_empty())),
-        b"title" => programme.title = run.pick_one(language),
-        b"sub-title" => {
-            programme.sub_title = Some(run.pick_one(language)).filter(|v| !v.is_empty());
+            // Untrimmed; a blank one is no genre (`GetProgramInfo`'s filter).
+            .extend(
+                run.pick_all(language)
+                    .filter(|value| !value.trim().is_empty()),
+            ),
+        b"title" => {
+            programme.title = run.pick_one(language);
+            programme.missing_title = false;
         }
-        b"desc" => programme.desc = Some(run.pick_one(language)).filter(|v| !v.is_empty()),
+        b"sub-title" => {
+            // An empty `<sub-title/>` is `""`, as `ProcessNode` sets it.
+            programme.sub_title = Some(run.pick_one(language));
+        }
+        b"desc" => programme.desc = Some(run.pick_one(language)),
         _ => {}
     }
 }
@@ -1207,6 +1230,70 @@ fn apply_start(
     }
 }
 
+/// Appends one text or CDATA run to `text`, with its line breaks normalised
+/// to `\n` as the XML end-of-line rule (and `XmlReader`) does; a character
+/// reference such as `&#13;` is not normalised.
+fn push_text(text: &mut String, run: &str) {
+    if run.contains('\r') {
+        text.push_str(&run.replace("\r\n", "\n").replace('\r', "\n"));
+    } else {
+        text.push_str(run);
+    }
+}
+
+/// The year of a `<date>`, as `XmlTvReader.ParseDate` reads it: the whole
+/// text must match `^(?<dateDigits>[0-9]{4,14})(\s(?<dateOffset>[+-]*[0-9]{1,4}))?$`
+/// (.NET's `$` also before one final `\n`), the digits completed from
+/// `20000101000000` must be a date (`TryParseExact`), and a five-character
+/// offset must be one (`zzz`); any other offset is ignored. `None` when the
+/// date does not parse.
+fn copyright_year(raw: &str) -> Option<i32> {
+    const COMPLETION: &str = "20000101000000";
+    let text = raw.strip_suffix('\n').unwrap_or(raw);
+    let digits = text.bytes().take_while(u8::is_ascii_digit).count();
+    if !(4..=14).contains(&digits) {
+        return None;
+    }
+    let (date, rest) = text.split_at(digits);
+    let offset = if rest.is_empty() {
+        None
+    } else {
+        let mut chars = rest.chars();
+        if !chars.next().is_some_and(char::is_whitespace) {
+            return None;
+        }
+        let offset = chars.as_str();
+        let unsigned = offset.trim_start_matches(['+', '-']);
+        if unsigned.is_empty()
+            || unsigned.len() > 4
+            || !unsigned.bytes().all(|b| b.is_ascii_digit())
+        {
+            return None;
+        }
+        Some(offset)
+    };
+    let full = format!("{date}{}", &COMPLETION[digits..]);
+    let naive = chrono::NaiveDateTime::parse_from_str(&full, "%Y%m%d%H%M%S").ok()?;
+    // .NET's calendar starts at year 1, and Linux has no leap second (`ss` 60).
+    let year = chrono::Datelike::year(&naive);
+    if year < 1 || chrono::Timelike::nanosecond(&naive) >= 1_000_000_000 {
+        return None;
+    }
+    if let Some(offset) = offset.filter(|o| o.len() == 5) {
+        // `"+0100".Insert(3, ":")`, then `zzz`: one sign, two-digit hours to
+        // 14, two-digit minutes.
+        let (sign, digits) = offset.split_at(1);
+        if !matches!(sign, "+" | "-") || !digits.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+        let (hours, minutes): (u32, u32) = (digits[..2].parse().ok()?, digits[2..].parse().ok()?);
+        if hours > 14 || minutes > 59 || (hours == 14 && minutes > 0) {
+            return None;
+        }
+    }
+    Some(year)
+}
+
 /// Jellyfin.XmlTv `SetChannelNumber`: a display-name with `-` and `_` turned
 /// into `.` is the channel number when it parses as a `double` under
 /// `NumberStyles.Any` and the invariant culture.
@@ -1291,7 +1378,10 @@ fn apply_end(
     channel: Option<&mut OpenChannel>,
     programme: Option<&mut OpenProgramme>,
 ) {
-    let text = text.trim();
+    // `ReadElementContentAsString` keeps the text as written; only an episode
+    // number, which `ProcessEpisodeNum` parses whitespace-tolerantly, is read
+    // trimmed.
+    let trimmed = text.trim();
     if let Some(c) = channel {
         if name == b"display-name" && depth == c.child_depth {
             // `ProcessNode`'s `allOccurrencesSetter`: every display-name of
@@ -1309,11 +1399,11 @@ fn apply_end(
     };
     if depth == open.child_depth + 1 {
         // `ProcessRating` reads a `<value>` (matched ignoring case) of the open
-        // rating: an empty one drops the rating, a later one replaces an
-        // earlier one. Two upstream quirks are not mirrored: a whitespace-only
-        // value counts as empty here (text is trimmed), and upstream's
-        // `Skip()` after reading a value swallows a second `<value>` written
-        // with no whitespace before it (the DTD allows one value).
+        // rating as written: an empty one drops the rating, a later one
+        // replaces an earlier one. One upstream quirk is not mirrored:
+        // upstream's `Skip()` after reading a value swallows a second
+        // `<value>` written with no whitespace before it (the DTD allows one
+        // value).
         if let Some(rating) = open.rating.as_mut()
             && !rating.dropped
             && name.eq_ignore_ascii_case(b"value")
@@ -1336,14 +1426,25 @@ fn apply_end(
             let lang = open.run_lang.take();
             TextRun::push(&mut open.run, name, text, lang);
         }
-        b"date" => p.year = text.get(0..4).and_then(|y| y.parse().ok()),
+        // `ProcessCopyrightDate`: an empty `<date>` clears the year, one that
+        // `ParseDate` cannot read leaves the earlier one.
+        b"date" if text.is_empty() => p.year = None,
+        b"date" => {
+            if let Some(year) = copyright_year(text) {
+                p.year = Some(year);
+            }
+        }
         // `XmlTvReader.ProcessEpisodeNum` dispatches on `system`; a later
         // element assigns only the parts it carries (a part that does not parse
-        // leaves the earlier value), and unknown systems (`onscreen`,
-        // `dd_progid`, …) are skipped.
-        b"episode-num" if !text.is_empty() => {
-            if let Some((season, episode)) = parse_episode_num(episode_system, text) {
-                p.episode_num = Some(text.to_owned());
+        // leaves the earlier value), `dd_progid` sets the programme id, and
+        // unknown systems (`onscreen`, …) are skipped.
+        b"episode-num" if !trimmed.is_empty() => {
+            // `ParseEpisodeDataForProgramId` keeps a non-blank id as written.
+            if episode_system == Some("dd_progid") {
+                p.program_id = Some(text.to_owned());
+            }
+            if let Some((season, episode)) = parse_episode_num(episode_system, trimmed) {
+                p.episode_num = Some(trimmed.to_owned());
                 if season.is_some() {
                     p.season_number = season;
                 }
@@ -1453,8 +1554,9 @@ fn attr(e: &BytesStart<'_>, name: &[u8]) -> Option<String> {
 }
 
 /// Season and episode numbers from an `<episode-num>` of the given `system`,
-/// as `XmlTvReader.ProcessEpisodeNum` reads them; `None` when the system is one
-/// the reader skips (`onscreen`, `dd_progid`, an unknown one).
+/// as `XmlTvReader.ProcessEpisodeNum` reads them; `None` for a system that
+/// carries none (`dd_progid`, read as the programme id instead, `onscreen`, an
+/// unknown one).
 ///
 /// `xmltv_ns` is `S.E.P`, each part 0-based and optionally `n/total`, any part
 /// empty → 1-based numbers. `SxxExx` is the `s(\d+)e(\d+)` pattern anywhere in
@@ -1983,6 +2085,124 @@ mod episode_num_tests {
         #[case] expected: Option<(Option<i32>, Option<i32>)>,
     ) {
         assert_eq!(parse_episode_num(system, text), expected);
+    }
+
+    /// `XmlTvReader.ParseDate` for `<date>`, reduced to the year (gl-1631).
+    #[rstest::rstest]
+    #[case("2019", Some(2019))]
+    #[case("20190615", Some(2019))]
+    #[case("2019\n", Some(2019))]
+    #[case("20190615 +0100", Some(2019))]
+    #[case("20190615 +01", Some(2019))]
+    #[case(" 2019", None)]
+    #[case("2019 ", None)]
+    #[case("2019-06-15", None)]
+    #[case("201913", None)]
+    #[case("201", None)]
+    #[case("201906151200001", None)]
+    #[case("20190615 +1500", None)]
+    #[case("20190615 BST", None)]
+    #[case("20190615 ++100", None)]
+    #[case("20190615 +-100", None)]
+    #[case("0000", None)]
+    #[case("20190615235960", None)]
+    // `XmlTvReaderDateTimeTests.HandlePartDatesTest`: every value reads as 2016
+    // (`DateTimeOffset.Year` is the clock year).
+    #[case("2016", Some(2016))]
+    #[case("201601", Some(2016))]
+    #[case("20160101", Some(2016))]
+    #[case("2016010112", Some(2016))]
+    #[case("201601011234", Some(2016))]
+    #[case("20160101123456", Some(2016))]
+    #[case("20160101120000 +0000", Some(2016))]
+    #[case("20160101120000 +1000", Some(2016))]
+    #[case("20160101120000 +0100", Some(2016))]
+    #[case("20160101120000 +0010", Some(2016))]
+    #[case("20160101120000 +0001", Some(2016))]
+    #[case("20160101120000 -1000", Some(2016))]
+    #[case("20160101120000 -0100", Some(2016))]
+    #[case("20160101120000 -0010", Some(2016))]
+    #[case("20160101120000 -0001", Some(2016))]
+    #[case("2016 -0100", Some(2016))]
+    #[case("201601 -0100", Some(2016))]
+    #[case("20160101 -0100", Some(2016))]
+    #[case("2016010112 -0100", Some(2016))]
+    #[case("201601011200 -0100", Some(2016))]
+    #[case("20160101120000 +000", Some(2016))]
+    #[case("20160101120000 +00", Some(2016))]
+    #[case("20160101120000 +0", Some(2016))]
+    #[case("20160101120000 0", Some(2016))]
+    // `ParseDate_Invalid_Null`.
+    #[case("", None)]
+    #[case(" ", None)]
+    #[case("a", None)]
+    #[case("1", None)]
+    fn copyright_dates(#[case] raw: &str, #[case] year: Option<i32>) {
+        assert_eq!(super::copyright_year(raw), year);
+    }
+
+    /// `ProcessCopyrightDate`: an empty `<date>` clears the year, one that
+    /// does not parse leaves the earlier one.
+    #[test]
+    fn a_later_date_that_does_not_parse_keeps_the_year() {
+        let year = |children: &str| {
+            let guide = parse_xmltv(&format!(
+                "<tv><programme start=\"20260725060000 +0000\" channel=\"x\"><title>T</title>{children}</programme></tv>"
+            ));
+            guide
+                .programmes
+                .into_iter()
+                .next()
+                .expect("one programme")
+                .year
+        };
+        assert_eq!(year("<date>2019</date><date> 2020 </date>"), Some(2019));
+        assert_eq!(year("<date>2019</date><date></date>"), None);
+    }
+
+    /// The XML end-of-line rule: a CRLF guide's text reads with `\n`, as
+    /// `XmlReader` gives it; a channel's display name is kept as written.
+    #[test]
+    fn line_breaks_are_normalised_and_names_kept_as_written() {
+        let guide = parse_xmltv(
+            "<tv>\r\n<channel id=\"x\"><display-name> 5 </display-name></channel>\r\n\
+             <programme start=\"20260725060000 +0000\" channel=\"x\"><title>T</title>\
+             <desc>one\r\ntwo\rthree</desc><sub-title><![CDATA[a\r\nb\rc]]></sub-title>\
+             </programme></tv>",
+        );
+        assert_eq!(guide.programmes[0].desc.as_deref(), Some("one\ntwo\nthree"));
+        assert_eq!(guide.programmes[0].sub_title.as_deref(), Some("a\nb\nc"));
+        assert_eq!(guide.channels[0].display_name, " 5 ");
+        assert_eq!(guide.channels[0].number.as_deref(), Some(" 5 "));
+    }
+
+    /// `ParseEpisodeDataForProgramId`: the last non-blank `dd_progid` is the
+    /// programme id; a blank one, and the other systems, leave it.
+    #[test]
+    fn the_last_non_blank_dd_progid_is_the_programme_id() {
+        let ids = |children: &str| {
+            let guide = parse_xmltv(&format!(
+                "<tv><programme start=\"20260725060000 +0000\" channel=\"x\"><title>T</title>{children}</programme></tv>"
+            ));
+            guide
+                .programmes
+                .into_iter()
+                .next()
+                .expect("one programme")
+                .program_id
+        };
+        assert_eq!(
+            ids(r#"<episode-num system="dd_progid">EP1.0001</episode-num>
+                   <episode-num system="dd_progid">EP2.0002</episode-num>
+                   <episode-num system="dd_progid">  </episode-num>
+                   <episode-num system="xmltv_ns">0.1.</episode-num>
+                   <episode-num system="onscreen">S1E2</episode-num>"#),
+            Some("EP2.0002".to_owned())
+        );
+        assert_eq!(
+            ids(r#"<episode-num system="onscreen">EP9</episode-num>"#),
+            None
+        );
     }
 
     #[test]

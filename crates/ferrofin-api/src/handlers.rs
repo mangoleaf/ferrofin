@@ -954,7 +954,9 @@ pub const VERIFIED_SUBSYSTEMS_AGAINST_EARLIER_PIN: &[(&str, &str)] = &[];
 /// `video-stream-copy` is whether a transcode job copies the source video and
 /// what dynamic HDR metadata the copy strips, which the HLS and stream routes
 /// share; `recording-postprocessing` is the executable run after a retained
-/// DVR capture, which no HTTP response describes.
+/// DVR capture, which no HTTP response describes; `guide-programme-items` is
+/// what the guide refresh stores on each programme item and its external ids,
+/// which every programme operation reads.
 pub const SUBSYSTEM_KEYS: &[&str] = &[
     "query-translation",
     "dto-fields",
@@ -969,6 +971,7 @@ pub const SUBSYSTEM_KEYS: &[&str] = &[
     "trickplay",
     "video-stream-copy",
     "recording-postprocessing",
+    "guide-programme-items",
 ];
 
 /// One shared subsystem whose Ferrofin implementation was compared against the
@@ -996,6 +999,44 @@ pub struct VerifiedSubsystem {
 /// [`VERIFIED_SUBSYSTEMS_AGAINST_EARLIER_PIN`] names), under the rules of
 /// [`VERIFIED`]. Subsystem rows never count towards the operation parity line.
 pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
+    VerifiedSubsystem {
+        key: "guide-programme-items",
+        upstream_file: "src/Jellyfin.LiveTv/Guide/GuideManager.cs",
+        upstream_method: "GetProgram",
+        ferrofin: "What the guide refresh stores on each programme item and its external \
+                   ids. ferrofin-livetv manager.rs insert_programs and \
+                   insert_schedules_direct_programs keep the listing's Etag (xmltv_etag over \
+                   xmltv_etag.rs xmltv_program_etag, a port of XmlTvProgramEtag.TryCreate; \
+                   Schedules Direct's md5), Audio, IsHD, OriginalAirDate and Zap2It series id \
+                   in FerrofinLiveTvPrograms; sync_channel_program_items saves the items \
+                   (projection.rs program_entity for a new airing, program_item_update for a \
+                   stored one) and replaces their ids (program_provider_ids, \
+                   program_provider_ids_replaced, replace_provider_ids_for_items). Compared \
+                   with GuideManager.GetProgram, XmlTvListingsProvider.GetProgramInfo and \
+                   GetProgramInfoWithEtag and src/Jellyfin.LiveTv/Listings/XmlTvProgramEtag.cs \
+                   at the pinned v12.4 tag, and the etag bytes with those a Jellyfin 12.4 \
+                   server stored for the same guide. The XMLTV reader keeps a guide's text \
+                   as Jellyfin.XmlTv reads it (xmltv.rs apply_end, end_programme_run, \
+                   copyright_year, push_text; gl-1631), checked against that server on \
+                   padded, empty, blank, CRLF and date text.",
+        date: "2026-11-10",
+        divergences: &[
+            "Jellyfin.XmlTv drops the element right after an <image> or <url> when no \
+             whitespace separates them: ProcessImageNode reads past the end tag and its caller \
+             skips one more node. Ferrofin reads that element, so on such a compact guide the \
+             airing's rating, artwork or other field, and its etag, differ from Jellyfin's. \
+             Jellyfin bug not ported.",
+            "A programme's image URL padded with whitespace is stored trimmed, so the \
+             artwork loads; upstream's UpdateImage stores the padded path, which does not. \
+             Jellyfin bug not ported.",
+            "A programme is saved only when a field GetProgram assigns changed. Upstream skips \
+             only an XMLTV airing whose etag equals the stored one; every other airing (each \
+             Schedules Direct one, whose md5 is compared after its ids were replaced, and an \
+             XMLTV one with no etag) is saved on every refresh, which moves its \
+             DateLastSaved and the DTO Etag derived from it. Fix path: gl-1628 (owner \
+             decision).",
+        ],
+    },
     VerifiedSubsystem {
         key: "recording-postprocessing",
         upstream_file: "src/Jellyfin.LiveTv/Recordings/RecordingsManager.cs",
@@ -2625,6 +2666,39 @@ pub const VERIFIED: &[Verified] = &[
          there) bodies are Ferrofin's error shape, not upstream's. Fix path: gl-666.",
         ],
         refs: &[],
+    },
+    Verified {
+        method: "get",
+        path: "/LiveTv/Channels",
+        upstream_file: "Jellyfin.Api/Controllers/LiveTvController.cs",
+        upstream_method: "GetLiveTvChannels",
+        ferrofin: "handlers/live_tv.rs get_channels (items.rs resolve_user_opt, \
+               program_dto_options, add_current_program) → ferrofin-livetv manager.rs \
+               get_channels (user_restrictions; guide_repository.rs channel_rows: only the \
+               lineup channels whose item is stored, the user's parental restrictions, and \
+               isMovie/isSeries over the stored channel item's \
+               columns and isKids/isNews/isSports over its Kids/News/Sports tags; \
+               channel_user_data; projection.rs filter_channel_rows, sort_channel_rows, \
+               remove_fields; channel_entity → DtoService get_base_item_dtos, which runs \
+               AddChannelInfo) (RequestHelpers.GetUserId, LiveTvManager.GetInternalChannels, \
+               BaseItemRepository.TranslateQuery, RemoveFields)",
+        date: "2026-11-10",
+        divergences: &[
+            "type keeps the channels of that ChannelType, as the parameter documents; \
+         upstream's GetInternalChannels never passes LiveTvChannelQuery.ChannelType on and \
+         lists every channel. Jellyfin bug not ported.",
+            "Every sortBy key but SortName, Name, IsFavoriteOrLiked and DateCreated compares \
+         equal, so the appended SortName decides; upstream's OrderMapper sorts on them. Fix \
+         path: gl-1354.",
+            "isFavorite and isLiked with no user (an API key naming none) match no channel \
+         when true and every channel when false, and enableFavoriteSorting sorts nothing; \
+         upstream's TranslateQuery and OrderMapper dereference the null user \
+         (filter.User!.Id) and fail the request. Jellyfin bug not ported.",
+            "The 400 (a value the query binder cannot convert) and 403 (another user's id \
+         without the administrator role) bodies are Ferrofin's error shape, not upstream's. \
+         Fix path: gl-666.",
+        ],
+        refs: &["access-filtering", "user-data"],
     },
     Verified {
         method: "get",

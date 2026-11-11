@@ -1473,6 +1473,7 @@ dependencies = [
  "rstest",
  "serde",
  "serde_json",
+ "sha2 0.11.1",
  "shlex",
  "sqlx",
  "tempfile",
