@@ -27,6 +27,7 @@ pub mod display_preferences;
 pub mod finite_real;
 pub mod playback;
 pub mod security;
+pub mod unset;
 pub mod users;
 
 #[cfg(test)]

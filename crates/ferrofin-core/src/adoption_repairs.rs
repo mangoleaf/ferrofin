@@ -259,14 +259,20 @@ pub async fn import_membership_once(
                             .map(|d| d.to_string_lossy().into_owned())
                     })
                 };
-                let done =
-                    import_membership(&mut tx, &id, folder.as_deref(), type_ == playlist, &map)
-                        .await?;
+                let done = import_membership(
+                    &mut tx,
+                    &id,
+                    folder.as_deref(),
+                    type_ == playlist,
+                    &map,
+                    paths,
+                )
+                .await?;
                 written += done.written;
                 dropped += done.dropped;
             }
         } else {
-            written += import_video_alternate_versions(&mut tx, &id, &map).await?;
+            written += import_video_alternate_versions(&mut tx, &id, &map, paths).await?;
         }
     }
     sqlx::query(r#"UPDATE "FerrofinAdoption" SET "MembershipImportDone" = 1"#)
@@ -290,6 +296,7 @@ async fn import_video_alternate_versions(
     tx: &mut sqlx::SqliteConnection,
     parent_db: &str,
     map: &Map<String, Value>,
+    virtual_paths: &VirtualPathExpander,
 ) -> Result<usize, ServiceError> {
     let mut candidates: Vec<(String, i64)> = Vec::new();
     if let Some(paths) = map.get("LocalAlternateVersions").and_then(Value::as_array) {
@@ -297,7 +304,7 @@ async fn import_video_alternate_versions(
             if path.is_empty() {
                 continue;
             }
-            if let Some(child) = item_by_path(tx, path).await? {
+            if let Some(child) = item_by_path(tx, path, virtual_paths).await? {
                 candidates.push((child, LOCAL_ALTERNATE_VERSION));
             } else {
                 tracing::warn!(
@@ -313,7 +320,7 @@ async fn import_video_alternate_versions(
         linked_map.insert("LinkedChildren".to_owned(), v.clone());
     }
     for child in read_linked_children(&linked_map) {
-        if let Some(child_db) = resolve_linked_child(tx, &child, None).await? {
+        if let Some(child_db) = resolve_linked_child(tx, &child, None, virtual_paths).await? {
             candidates.push((child_db, LINKED_ALTERNATE_VERSION));
         } else {
             tracing::warn!(
@@ -3848,6 +3855,37 @@ mod tests {
         );
     }
 
+    /// gl-1581: Jellyfin stores a child under its data directory (a
+    /// recording) as `%AppDataPath%/…`, and `FindByPath` reverses the entry's
+    /// resolved path before the comparison, so the entry resolves.
+    #[tokio::test]
+    async fn a_10_11_linked_child_stored_tokenised_resolves_by_its_resolved_path() {
+        let db = test_db().await;
+        db.record_adoption("10.11.8").await.expect("record");
+        let (boxset, recording) = (Uuid::new_v4(), Uuid::new_v4());
+        seed_folder_item(&db, boxset, BaseItemKind::BoxSet, "Set", None).await;
+        seed_item(&db, recording, BaseItemKind::Movie).await;
+        set_path(&db, recording, "%AppDataPath%/livetv/recordings/R/R.ts").await;
+        set_data(
+            &db,
+            boxset,
+            r#"{"LinkedChildren":[{"Type":"Manual","Path":"/pd/data/livetv/recordings/R/R.ts"}]}"#,
+        )
+        .await;
+        let paths = VirtualPathExpander::from_paths(std::sync::Arc::new(
+            crate::FerrofinServerApplicationPaths::new("/pd", "/pd/log", "/pd/c", "/pd/k", "/pd/w"),
+        ));
+
+        assert_eq!(
+            import_membership_once(&db, &paths).await.expect("import"),
+            1
+        );
+        assert_eq!(
+            links(&db).await,
+            vec![(guid_to_db(boxset), guid_to_db(recording), 0, 0)]
+        );
+    }
+
     /// Only a playlist keeps a repeated child; a box set keeps one row per
     /// child, a `LinkedAlternateVersion` entry over a `Manual` one, each at
     /// the ordinal it resolved at.
@@ -6974,9 +7012,9 @@ mod tests {
 // Jellyfin stores `{program data}/root`, its library folders and every image
 // path absolute: `ReverseVirtualPath` tokenises only `{program data}/data` and
 // the metadata directory, and `BaseItemMapper.MapImageToEntity` saves image
-// paths raw. Ferrofin writes every path resolved, except the Collections
-// library's folder and the box sets and playlists created through the API
-// (gl-941), which it tokenises as upstream does and so never rewrites. The ids of items under
+// paths raw. Ferrofin tokenises the same two directories on every save
+// (gl-1581), and never rewrites those rows; only a row an earlier build stored
+// resolved is rebased here. The ids of items under
 // program data are derived from the path relative to it (`GetNewItemId`), so
 // after the directory moves (a Debian `/var/lib/jellyfin` adopted into
 // `/var/lib/ferrofin`, or Ferrofin's own data directory relocated) every id
