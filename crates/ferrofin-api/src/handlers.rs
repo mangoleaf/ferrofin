@@ -3338,13 +3338,16 @@ pub const VERIFIED: &[Verified] = &[
                [boxset] folder and AddChild's path-derived id, its Path stored through \
                VirtualPathExpander::reverse as AddChild's save stores it, \
                %AppDataPath%/collections/<name> [boxset] (BaseItemMapper.Map → \
-               GetPathToSave → ReverseVirtualPath), AddToCollectionAsync's refusal \
-               of an id naming no item after the box set is stored) and \
+               GetPathToSave → ReverseVirtualPath), the folder claimed and the row stored \
+               under box_set_folders, which a Collections scan storing the box sets of \
+               the folders it found (resolve_box_set_folders, BoxSetResolver) holds too, \
+               AddToCollectionAsync's refusal of an id naming no item after the box set \
+               is stored) and \
                ensure_collections_folder → collections_library.rs (EnsureLibraryFolder: \
                physical_folder for FindFolders, ensure_library for AddVirtualFolder with its \
                LibraryOptions, ensure_folder for the Folder row ValidateTopLibraryFolders \
                makes)",
-        date: "2026-11-03",
+        date: "2026-11-11",
         divergences: &[
             "A missing name makes a box set with an empty name, where upstream's \
          GetValidFilename dereferences the null and answers 500. Jellyfin bug not ported.",

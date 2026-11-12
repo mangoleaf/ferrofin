@@ -108,6 +108,18 @@ pub trait CollectionManager: Send + Sync {
         &self,
         create_if_needed: bool,
     ) -> Result<Option<BaseItemEntity>, ServiceError>;
+
+    /// `BoxSetResolver` for a scan of the library location `location`: stores
+    /// a box set for each of `folders` (the `[boxset]` and `collection.xml`
+    /// folders the scan found directly in it) that no box set holds yet, as
+    /// the resolver and `Folder.AddChild` would, and returns the ids stored.
+    /// `None` when `location` is not the folder box sets are created in, which
+    /// is the only one resolved.
+    async fn resolve_box_set_folders(
+        &self,
+        location: &str,
+        folders: &[String],
+    ) -> Result<Option<Vec<Uuid>>, ServiceError>;
 }
 
 fn _assert_object_safe_collection_manager(_: &dyn CollectionManager) {}
