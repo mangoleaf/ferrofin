@@ -1628,7 +1628,10 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
                    generate_sets and tile_and_save (RefreshTrickplayDataInternal), \
                    create_tiles and move_dir (CreateTiles), \
                    and scheduled_tasks/library.rs TrickplayImagesTask, compared with \
-                   MediaBrowser.Providers/Trickplay/TrickplayImagesTask.cs (ExecuteAsync). \
+                   MediaBrowser.Providers/Trickplay/TrickplayImagesTask.cs (ExecuteAsync): \
+                   each video gets its page's row, as upstream hands over the page's Video, \
+                   and its stored streams from one read per page, where upstream's \
+                   GetMediaStreams reads them at the video's turn. \
                    Also the sets a changed video loses before its refresh: library_scan.rs \
                    scan_item and file_changed, item_data_cleanup.rs prune_extracted_data, \
                    external_data_manager.rs delete_external_item_data and \

@@ -2433,6 +2433,7 @@ pub async fn build_app_state(
             Arc::clone(&library),
             Arc::clone(&virtual_folders),
             Arc::clone(&trickplay),
+            Arc::clone(&media_stream_repository),
         )));
         task_manager.register(Arc::new(maint_tasks::CleanActivityLogTask::new(
             Arc::clone(&config_trait),
