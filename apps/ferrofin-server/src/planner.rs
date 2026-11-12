@@ -2809,7 +2809,9 @@ mod tests {
     use super::*;
     use ferrofin_traits::system::ServerApplicationPaths as _;
 
+    use ferrofin_mediaencoding::encoding_helper::downmix;
     use ferrofin_model::configuration::HlsAudioSeekStrategy;
+    use ferrofin_model::entities::DownMixStereoAlgorithms;
     use ferrofin_model::entities_media::MediaAttachment;
     use ferrofin_model::media_info::LiveStreamRequest;
     use rstest::rstest;
@@ -4077,6 +4079,96 @@ mod tests {
         assert!(
             !args.contains("-af volume"),
             "no boost without downmix: {args}"
+        );
+    }
+
+    /// The arguments of a progressive transcode under jellyfin#18195's oracle
+    /// setup: a `channels`-channel FLAC (`5.1` when it has 6) re-encoded to
+    /// AAC with `output` channels, under the `Dave750` stereo downmix and the
+    /// given volume boost; audio-only, or beside a copied H.264 video.
+    async fn progressive_downmix_arguments(
+        is_audio: bool,
+        channels: i32,
+        output: i32,
+        boost: f64,
+    ) -> Vec<String> {
+        let mut audio = audio_stream("flac");
+        audio.channels = Some(channels);
+        audio.channel_layout = (channels == 6).then(|| "5.1".to_owned());
+        let streams = if is_audio {
+            vec![audio]
+        } else {
+            vec![video_stream("h264"), audio]
+        };
+        let p = planner_over_with(
+            Arc::new(FakeMediaSources {
+                sources: vec![source("abc", streams)],
+                live_streams: HashMap::new(),
+            }),
+            false,
+            &[],
+            EncodingOptions {
+                down_mix_stereo_algorithm: DownMixStereoAlgorithms::Dave750,
+                down_mix_audio_boost: boost,
+                ..EncodingOptions::default()
+            },
+        );
+        let mut req = request("abc");
+        req.video_codec = Some("h264".to_owned());
+        req.audio_codec = Some("aac".to_owned());
+        req.audio_channels = Some(output);
+        p.plan(&req, is_audio, None, PlaylistKind::Progressive)
+            .await
+            .unwrap()
+            .arguments
+    }
+
+    /// Upstream `GetProgressiveAudioFullCommandLine_StereoDownmix_AppliesDownMixAlgorithm`
+    /// (jellyfin#18195): a 5.1 source downmixed to stereo gets the algorithm's
+    /// filter, which keeps the LFE that `-ac 2` alone drops (jellyfin#18194).
+    #[tokio::test]
+    async fn progressive_audio_stereo_downmix_applies_the_downmix_algorithm() {
+        let filter = downmix::algorithm_filter_string(DownMixStereoAlgorithms::Dave750, "5.1")
+            .expect("Dave750 has a 5.1 row");
+        let args = progressive_downmix_arguments(true, 6, 2, 1.0).await;
+        assert!(args.windows(2).any(|w| w == ["-af", filter]), "{args:?}");
+    }
+
+    /// Upstream `GetProgressiveAudioFullCommandLine_NoDownmix_EmitsNoAudioFilter`.
+    #[tokio::test]
+    async fn progressive_audio_without_a_downmix_emits_no_audio_filter() {
+        let args = progressive_downmix_arguments(true, 2, 2, 2.0).await;
+        assert!(!args.iter().any(|arg| arg == "-af"), "{args:?}");
+    }
+
+    /// Upstream `GetProgressiveVideoAudioArguments_NonStereoOutput_KeepsChannelCount`:
+    /// the downmix filter is for stereo output only, so any other count keeps
+    /// its `-ac`.
+    #[rstest]
+    #[case(1)]
+    #[case(6)]
+    #[tokio::test]
+    async fn progressive_video_non_stereo_output_keeps_the_channel_count(#[case] output: i32) {
+        let args = progressive_downmix_arguments(false, 6, output, 2.0).await;
+        let channels = output.to_string();
+        assert!(
+            args.windows(2).any(|w| w[0] == "-ac" && w[1] == channels),
+            "{args:?}"
+        );
+        assert!(
+            !without_temp_dir(&args.join(" ")).contains("pan="),
+            "{args:?}"
+        );
+    }
+
+    /// Upstream `GetProgressiveVideoAudioArguments_StereoDownmix_UsesFilterInsteadOfChannelCount`.
+    #[tokio::test]
+    async fn progressive_video_stereo_downmix_uses_the_filter_instead_of_the_channel_count() {
+        let args = progressive_downmix_arguments(false, 6, 2, 2.0).await;
+        assert!(!args.iter().any(|arg| arg == "-ac"), "{args:?}");
+        assert!(
+            without_temp_dir(&args.join(" ")).contains("pan=stereo"),
+            "{args:?}"
         );
     }
 
