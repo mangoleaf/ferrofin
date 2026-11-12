@@ -19,8 +19,11 @@
 //! The media-segment task runs the registered providers; season fingerprinting
 //! and guest analysis retain their own producer passes and persistent output.
 //!
-//! The C# `IProgress<double>` maps to [`TaskProgress`]; `CancellationToken`s
-//! are dropped (a queued run is cancelled by aborting its tokio task).
+//! The C# `IProgress<double>` and `CancellationToken` both map to
+//! [`TaskProgress`]. The keyframe, chapter-image, subtitle and
+//! audio-normalization tasks check [`TaskProgress::stop_requested`] where
+//! upstream checks its token; the others are dropped when they do not stop
+//! in time (gl-1709).
 
 use std::path::Path;
 use std::sync::Arc;
@@ -185,6 +188,9 @@ impl ScheduledTask for KeyframeExtractionTask {
                 break;
             }
             for item in &items {
+                if progress.stop_requested() {
+                    return Ok(());
+                }
                 done += 1;
                 progress.report(100.0 * f64::from(done) / f64::from(total.max(1)));
                 let Ok(item_id) = Uuid::parse_str(&item.id) else {
@@ -331,8 +337,13 @@ impl AudioNormalizationTask {
         }
     }
 
-    /// Measures integrated LUFS for the given ffmpeg input arguments.
-    async fn measure(&self, input_args: Vec<String>) -> Result<Option<f64>, ServiceError> {
+    /// Measures integrated LUFS for the given ffmpeg input arguments; `None`
+    /// also when the run is asked to stop, which ends ffmpeg.
+    async fn measure(
+        &self,
+        input_args: Vec<String>,
+        progress: &TaskProgress,
+    ) -> Result<Option<f64>, ServiceError> {
         let mut args = vec!["-hide_banner".to_owned()];
         args.extend(input_args);
         args.extend(
@@ -340,11 +351,17 @@ impl AudioNormalizationTask {
                 .iter()
                 .map(|s| (*s).to_owned()),
         );
-        let stderr = match self
-            .runner
-            .run_stderr(&self.encoder.encoder_path(), &args)
+        let program = self.encoder.encoder_path();
+        let Some(run) = progress
+            .cancel_token()
+            .unless_cancelled(self.runner.run_stderr(&program, &args))
             .await
-        {
+        else {
+            // Upstream's `CalculateLUFSAsync` throws here: the run is cancelled.
+            progress.stopped();
+            return Ok(None);
+        };
+        let stderr = match run {
             Ok(stderr) => stderr,
             Err(error) => {
                 tracing::warn!(%error, "failed to start audio normalization analysis");
@@ -394,8 +411,11 @@ impl AudioNormalizationTask {
                 break;
             }
             for album in &albums {
+                if progress.stop_requested() {
+                    return Ok(());
+                }
                 done += 1;
-                self.normalize_album(album).await?;
+                self.normalize_album(album, progress).await?;
                 progress.report(base + span * f64::from(done) / f64::from(total.max(1)));
             }
             start_index += PAGE_SIZE;
@@ -404,7 +424,11 @@ impl AudioNormalizationTask {
     }
 
     /// Measures one album's LUFS over its tracks, unless it already has one.
-    async fn normalize_album(&self, album: &BaseItemEntity) -> Result<(), ServiceError> {
+    async fn normalize_album(
+        &self,
+        album: &BaseItemEntity,
+        progress: &TaskProgress,
+    ) -> Result<(), ServiceError> {
         if album.lufs.is_none()
             && album.normalization_gain.is_none()
             && let Ok(album_id) = Uuid::parse_str(&album.id)
@@ -430,7 +454,10 @@ impl AudioNormalizationTask {
                     album = album.name.as_deref().unwrap_or_default(),
                     "calculating album LUFS"
                 );
-                if let Some(lufs) = self.measure_album(&album.id, &track_paths).await? {
+                if let Some(lufs) = self
+                    .measure_album(&album.id, &track_paths, progress)
+                    .await?
+                {
                     self.save_lufs(&album.id, lufs).await?;
                 }
             }
@@ -443,6 +470,7 @@ impl AudioNormalizationTask {
         &self,
         album_id: &str,
         track_paths: &[String],
+        progress: &TaskProgress,
     ) -> Result<Option<f64>, ServiceError> {
         // Same scratch directory the frame extractor uses, named once on the
         // paths trait so the two cannot drift apart.
@@ -459,14 +487,17 @@ impl AudioNormalizationTask {
         std::fs::write(&concat, lines.join("\n"))
             .map_err(|e| ServiceError::backend(e.to_string()))?;
         let measured = self
-            .measure(vec![
-                "-f".to_owned(),
-                "concat".to_owned(),
-                "-safe".to_owned(),
-                "0".to_owned(),
-                "-i".to_owned(),
-                concat.to_string_lossy().into_owned(),
-            ])
+            .measure(
+                vec![
+                    "-f".to_owned(),
+                    "concat".to_owned(),
+                    "-safe".to_owned(),
+                    "0".to_owned(),
+                    "-i".to_owned(),
+                    concat.to_string_lossy().into_owned(),
+                ],
+                progress,
+            )
             .await;
         if let Err(e) = std::fs::remove_file(&concat) {
             tracing::warn!(path = %concat.display(), error = %e, "failed to delete concat file");
@@ -497,12 +528,15 @@ impl AudioNormalizationTask {
                 break;
             }
             for track in &tracks {
+                if progress.stop_requested() {
+                    return Ok(());
+                }
                 done += 1;
                 if track.lufs.is_none()
                     && track.normalization_gain.is_none()
                     && let Some(path) = track.path.clone()
                     && crate::media_info_resolver::is_file_protocol(&path)
-                    && let Some(lufs) = self.measure(vec!["-i".to_owned(), path]).await?
+                    && let Some(lufs) = self.measure(vec!["-i".to_owned(), path], progress).await?
                 {
                     self.save_lufs(&track.id, lufs).await?;
                 }
@@ -554,6 +588,9 @@ impl ScheduledTask for AudioNormalizationTask {
             return Ok(());
         }
         self.scan_albums(&folder_ids, progress, 0.0, 50.0).await?;
+        if progress.stop_requested() {
+            return Ok(());
+        }
         self.scan_tracks(&folder_ids, progress, 50.0, 50.0).await?;
         progress.report(100.0);
         Ok(())
@@ -602,6 +639,7 @@ impl ChapterImagesTask {
         item_id: Uuid,
         streams: &[ferrofin_db::entities::base_items::MediaStreamInfoEntity],
         extract: bool,
+        cancel: &crate::ScanCancel,
     ) -> Result<bool, ServiceError> {
         // Read just before the refresh, as upstream does: a scan may rewrite
         // a video's chapters while the run works through the page, and the
@@ -609,14 +647,13 @@ impl ChapterImagesTask {
         let mut chapters = self.chapters.get_chapters(item_id).await?;
         let outcome = self
             .extractor
-            .refresh(
-                video,
-                &mut chapters,
-                Some(streams),
-                extract,
-                &crate::ScanCancel::default(),
-            )
+            .refresh(video, &mut chapters, Some(streams), extract, cancel)
             .await?;
+        if outcome.cancelled {
+            // Upstream's `ThrowIfCancellationRequested` before an extraction:
+            // nothing saved. The run's loop stops without recording a failure.
+            return Ok(false);
+        }
         if outcome.changed {
             // ChapterManager.SaveChapters retains only markers inside runtime.
             let saved = chapters
@@ -770,6 +807,9 @@ impl ScheduledTask for ChapterImagesTask {
                 .collect();
             let streams = self.extractor.streams_batch(&ids).await?;
             for video in &videos {
+                if progress.stop_requested() {
+                    return Ok(());
+                }
                 progress.report(100.0 * f64::from(done) / f64::from(total.max(1)));
                 done += 1;
                 let Some(path) = video.path.as_deref().filter(|path| !path.is_empty()) else {
@@ -793,9 +833,15 @@ impl ScheduledTask for ChapterImagesTask {
                         item_id,
                         streams.get(&item_id).map_or(&[], Vec::as_slice),
                         !failed.contains(&history_key),
+                        progress.cancel_token(),
                     )
                     .await?;
                 if !success {
+                    // Stopped before or during an extraction: no failure. Upstream's
+                    // history write takes the cancelled token and throws first.
+                    if progress.stop_requested() {
+                        return Ok(());
+                    }
                     append_failure_history(&fail_history_path, &history_key)?;
                     failed.insert(history_key);
                 }
@@ -808,8 +854,8 @@ impl ScheduledTask for ChapterImagesTask {
 }
 
 /// Records one extraction failure in the chapter-image failure history as soon
-/// as it happens, as upstream does, so a run the scheduler stops (max runtime,
-/// dashboard Stop, shutdown: its future is dropped) keeps every failure it
+/// as it happens, as upstream does, so a run whose future the scheduler drops
+/// (shutdown, or a stop it did not answer in time) keeps every failure it
 /// found. An append (`|key`, the `|`-separated format upstream reads) instead
 /// of upstream's whole-file rewrite: rewriting per failure made a systemic
 /// failure quadratic in the history's own size.
@@ -1212,6 +1258,9 @@ impl ScheduledTask for SubtitleDownloadTask {
                 break;
             }
             for video in &videos {
+                if progress.stop_requested() {
+                    return Ok(());
+                }
                 progress.report(100.0 * f64::from(done) / f64::from(total.max(1)));
                 done += 1;
                 let Some(options) = ferrofin_model::entities_media::owning_library(
@@ -1226,7 +1275,7 @@ impl ScheduledTask for SubtitleDownloadTask {
                     continue;
                 }
                 self.downloader
-                    .download_missing(video, options, &crate::ScanCancel::new())
+                    .download_missing(video, options, progress.cancel_token())
                     .await;
             }
             start_index += PAGE_SIZE;
@@ -2358,6 +2407,8 @@ mod tests {
         stall_after_reads: std::sync::atomic::AtomicUsize,
         reads: std::sync::atomic::AtomicUsize,
         stalled: tokio::sync::Notify,
+        /// Cancelled by every read: a stop landing while a video refreshes.
+        stop_on_read: Mutex<Option<crate::ScanCancel>>,
     }
 
     #[async_trait]
@@ -2386,6 +2437,9 @@ mod tests {
         async fn get_chapters(&self, _item_id: Uuid) -> Result<Vec<ChapterInfo>, ServiceError> {
             if self.fail_read.load(std::sync::atomic::Ordering::SeqCst) {
                 return Err(ServiceError::backend("temporary chapter read failure"));
+            }
+            if let Some(stop) = self.stop_on_read.lock().expect("lock").as_ref() {
+                stop.cancel();
             }
             let reads = self.reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             if reads
@@ -2669,6 +2723,64 @@ mod tests {
         assert!(calls[0].iter().any(|a| a == "concat"));
     }
 
+    /// A stop cuts an album measurement's ffmpeg off: no reading, the concat
+    /// list removed, the run stopped (upstream's `CalculateLUFSAsync` throws,
+    /// and its `finally` deletes the list).
+    #[tokio::test]
+    async fn a_stop_ends_an_album_measurement_and_removes_its_concat_list() {
+        let db = test_db().await;
+        let media = tempfile::tempdir().expect("tempdir");
+        let paths = Arc::new(crate::FerrofinServerApplicationPaths::new(
+            media.path().join("data"),
+            media.path().join("logs"),
+            media.path().join("config"),
+            media.path().join("cache"),
+            media.path().join("web"),
+        ));
+        let concat = Path::new(&paths.temp_path()).join("album.concat");
+        let task = AudioNormalizationTask::new(
+            db.clone(),
+            library_manager_over(db.clone()),
+            Arc::new(FakeFolders(Vec::new())),
+            Arc::new(FakeEncoder {
+                fail_extract: false,
+            }),
+            Arc::new(EndlessRunner),
+            paths,
+        );
+        let progress = TaskProgress::default();
+        let stop = progress.cancel_token().clone();
+        let tracks = ["a.flac".to_owned(), "b.flac".to_owned()];
+        let stopped = async {
+            tokio::join!(task.measure_album("album", &tracks, &progress), async {
+                while !concat.exists() {
+                    tokio::task::yield_now().await;
+                }
+                stop.cancel();
+            })
+        };
+        let (measured, ()) = tokio::time::timeout(std::time::Duration::from_secs(10), stopped)
+            .await
+            .expect("the stop ends the measurement");
+        assert_eq!(measured.expect("measure"), None);
+        assert!(progress.was_stopped(), "the run is recorded Cancelled");
+        assert!(!concat.exists(), "the concat list is removed");
+    }
+
+    /// An ffmpeg that never exits.
+    struct EndlessRunner;
+
+    #[async_trait]
+    impl FfmpegRunner for EndlessRunner {
+        async fn run_stderr(
+            &self,
+            _program: &str,
+            _args: &[String],
+        ) -> Result<String, ServiceError> {
+            std::future::pending().await
+        }
+    }
+
     /// The measured value is assigned to `BaseItem.LUFS`, whose setter runs
     /// `FiniteOrNull`: a `nan` or infinite reading is no measurement, so
     /// nothing is stored and the next run measures again.
@@ -2702,7 +2814,10 @@ mod tests {
                 )),
             );
             let measured = task
-                .measure(vec!["-i".to_owned(), "t.flac".to_owned()])
+                .measure(
+                    vec!["-i".to_owned(), "t.flac".to_owned()],
+                    &TaskProgress::default(),
+                )
                 .await
                 .expect("measure");
             assert_eq!(measured, expected, "{reading}");
@@ -4238,6 +4353,66 @@ mod tests {
         assert!(keyframe_data.is_empty(), "{keyframe_data:?}");
     }
 
+    /// `ThrowIfCancellationRequested` before each video: a stop requested
+    /// while one is extracted ends the run before the next, as stopped.
+    #[tokio::test]
+    async fn keyframe_task_stops_before_the_next_video_once_asked() {
+        let db = test_db().await;
+        let media = tempfile::tempdir().expect("tempdir");
+        for (id, name) in [
+            (Uuid::from_u128(0xB6), "one.mkv"),
+            (Uuid::from_u128(0xB7), "two.mkv"),
+        ] {
+            seed_item(&db, id, BaseItemKind::Movie).await;
+            set_media_type(&db, id, "Video").await;
+            let path = media.path().join(name);
+            std::fs::write(&path, b"x").expect("write");
+            set_path(&db, id, &path.to_string_lossy()).await;
+        }
+        let progress = TaskProgress::default();
+        let extracted = Arc::new(Mutex::new(Vec::new()));
+        let task = KeyframeExtractionTask::with_extractors(
+            library_manager_over(db.clone()),
+            vec![Arc::new(StoppingExtractor {
+                stop: progress.cancel_token().clone(),
+                extracted: Arc::clone(&extracted),
+            })],
+        );
+        task.execute(&progress).await.expect("run");
+        assert_eq!(
+            extracted.lock().expect("log").len(),
+            1,
+            "the second video is never reached"
+        );
+        assert!(progress.was_stopped(), "the run is recorded Cancelled");
+    }
+
+    /// A keyframe extractor that asks its run to stop as it extracts.
+    struct StoppingExtractor {
+        stop: crate::ScanCancel,
+        extracted: Arc<Mutex<Vec<String>>>,
+    }
+
+    #[async_trait]
+    impl KeyframeExtractor for StoppingExtractor {
+        fn is_metadata_based(&self) -> bool {
+            false
+        }
+
+        async fn try_extract_keyframes(
+            &self,
+            _item_id: Uuid,
+            file_path: &str,
+        ) -> Option<ferrofin_keyframes::keyframe_data::KeyframeData> {
+            self.extracted
+                .lock()
+                .expect("log")
+                .push(file_path.to_owned());
+            self.stop.cancel();
+            None
+        }
+    }
+
     /// A keyframe extractor that logs `name:file` for each call and answers
     /// for files ending in `answers_for`.
     struct LoggingExtractor {
@@ -4448,6 +4623,7 @@ mod tests {
             stall_after_reads: std::sync::atomic::AtomicUsize::new(usize::MAX),
             reads: std::sync::atomic::AtomicUsize::new(0),
             stalled: tokio::sync::Notify::new(),
+            stop_on_read: Mutex::new(None),
         });
         let streams = Arc::new(FakeStreams::new(vec![MediaStreamInfoEntity {
             item_id: movie.to_string(),
@@ -4570,8 +4746,35 @@ mod tests {
         drop(media);
     }
 
-    // The scheduler stops a run (4 h max runtime, dashboard Stop, shutdown) by
-    // aborting its future; a failure found before that must already be on
+    /// A stop landing while a video refreshes ends the run without
+    /// blocklisting the video: upstream's history write takes the cancelled
+    /// token and throws before it writes.
+    #[tokio::test]
+    async fn a_chapter_refresh_cut_off_by_a_stop_is_not_a_failure() {
+        let (media, _movie, chapters, task) =
+            chapter_task_fixture_for(true, &["first.mkv", "second.mkv"]).await;
+        let progress = TaskProgress::default();
+        *chapters.stop_on_read.lock().expect("lock") = Some(progress.cancel_token().clone());
+        task.execute(&progress).await.expect("run");
+
+        assert!(progress.was_stopped(), "the run is recorded Cancelled");
+        assert_eq!(
+            chapters.reads.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the second video is never reached"
+        );
+        assert!(
+            !media
+                .path()
+                .join("cache")
+                .join("chapter-failures.txt")
+                .exists(),
+            "nothing blocklisted"
+        );
+    }
+
+    // The scheduler drops a run's future (shutdown, or a stop the run did not
+    // answer in time); a failure found before that must already be on
     // disk, or the next run retries it — upstream writes it per failure.
     #[tokio::test]
     async fn a_failure_is_recorded_before_an_aborted_run_reaches_the_end() {

@@ -4202,6 +4202,57 @@ pub const VERIFIED: &[Verified] = &[
         ],
         refs: &[],
     },
+    Verified {
+        method: "delete",
+        path: "/ScheduledTasks/Running/{taskId}",
+        upstream_file: "Jellyfin.Api/Controllers/ScheduledTasksController.cs",
+        upstream_method: "StopTask",
+        ferrofin: "handlers/scheduled_tasks.rs stop_task (RequireAdmin, \
+               Policies.RequiresElevation; RequiredRouteString taskId: ConvertEmptyStringToNull, \
+               then [Required]) → ferrofin-core scheduled_tasks.rs cancel_task (the Id matched \
+               ignoring case, as OrdinalIgnoreCase; none is the 404) → cancel → \
+               Registration::request_stop (ScheduledTaskWorker.Cancel/CancelIfRunning: the \
+               run's token cancelled, State Cancelling until the run returns) → \
+               execute_contained and finish (ExecuteInternal: the run records Cancelled when \
+               its body stopped for it, else its own outcome, then ExecuteQueuedTasks)",
+        date: "2026-11-11",
+        divergences: &[
+            "Stopping a task that is idle or already stopping answers 204 and changes nothing; \
+         upstream's Cancel throws InvalidOperationException there, a 500. Jellyfin bug not \
+         ported.",
+            "A body still running STOP_WAIT (2 s) after the stop is dropped and recorded \
+         Cancelled; upstream waits for ExecuteAsync however long it takes. Fix path: every \
+         task body checks its token as upstream's do (gl-1709); the value is a candidate \
+         setting (gl-1710).",
+            "The 401 (no or bad token), 403 (not an administrator) and 404 (no task has that \
+         id) bodies are Ferrofin's error shape, not upstream's. Fix path: gl-666.",
+        ],
+        refs: &[],
+    },
+    Verified {
+        method: "post",
+        path: "/Library/Refresh",
+        upstream_file: "Jellyfin.Api/Controllers/LibraryController.cs",
+        upstream_method: "RefreshLibrary",
+        ferrofin: "handlers/library.rs refresh_library (RequireAdmin, \
+               Policies.RequiresElevation) → TaskManager::cancel_if_running_and_queue on the \
+               RefreshLibrary task's wire id (LibraryManager.ValidateMediaLibrary → \
+               TaskManager.CancelIfRunningAndQueue<RefreshMediaLibraryTask>) → ferrofin-core \
+               scheduled_tasks.rs cancel (CancelIfRunning) and queue_scheduled \
+               (QueueScheduledTask with new TaskOptions(): started when Idle, else queued \
+               until the cancelled run has ended); a failure is logged as \"Error refreshing \
+               library\" and the answer is 204 either way, as the controller's catch",
+        date: "2026-11-11",
+        divergences: &[
+            "A Scan Media Library run the refresh cancels ends when its scan wait is \
+         withdrawn, before the scan's item in progress does; upstream's run stays Cancelling \
+         until ValidateMediaLibraryInternal returns. The scan queue still starts the new \
+         scan after the stopping one. Fix path: gl-1709.",
+            "The 401 (no or bad token) and 403 (not an administrator) bodies are Ferrofin's \
+         error shape, not upstream's. Fix path: gl-666.",
+        ],
+        refs: &[],
+    },
 ];
 
 /// What `/Artists` and `/Artists/AlbumArtists` do differently from v12's

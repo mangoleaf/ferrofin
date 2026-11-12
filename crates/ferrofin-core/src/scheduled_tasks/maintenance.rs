@@ -11,8 +11,11 @@
 //! - [`OptimizeDatabaseTask`] — `OptimizeDatabaseTask` (`OptimizeDatabaseTask`)
 //! - [`CleanupUserDataTask`] — `CleanupUserDataTask` (`CleanupUserDataTask`)
 //!
-//! The C# `IProgress<double>` maps to [`TaskProgress`]; `CancellationToken`s are
-//! dropped (a queued run is cancelled by aborting its tokio task).
+//! The C# `IProgress<double>` and `CancellationToken` both map to
+//! [`TaskProgress`]: the file sweeps check
+//! [`TaskProgress::stop_requested`] before each file, as upstream's
+//! `ThrowIfCancellationRequested` does, since a sweep on the blocking pool
+//! outlives a dropped body.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -122,6 +125,7 @@ pub fn delete_encoded_media_cache(paths: &dyn ServerApplicationPaths) -> u64 {
 /// empty subdirectories (the root is kept). Returns how many files were
 /// deleted. Per-file failures are logged and skipped (the C# helper's
 /// swallow-and-log behavior). `keep` filters which file names are eligible.
+/// A stop request ends the sweep before its next file, the pruning skipped.
 fn delete_files_older_than(
     dir: &Path,
     cutoff: SystemTime,
@@ -130,6 +134,9 @@ fn delete_files_older_than(
     progress_span: f64,
     keep: &dyn Fn(&Path) -> bool,
 ) -> u64 {
+    if progress.stop_requested() {
+        return 0;
+    }
     let candidates = files_under(dir, &|f| {
         !keep(f)
             && std::fs::metadata(f)
@@ -139,6 +146,9 @@ fn delete_files_older_than(
     let total = candidates.len();
     let mut deleted = 0u64;
     for (index, file) in candidates.iter().enumerate() {
+        if progress.stop_requested() {
+            return deleted;
+        }
         match std::fs::remove_file(file) {
             Ok(()) => deleted += 1,
             Err(e) => tracing::warn!(path = %file.display(), error = %e, "failed to delete file"),
@@ -774,6 +784,25 @@ mod tests {
     /// reports a fixed `has_active_playback`; every other method is
     /// unreachable (the tasks only consult the guard).
     struct FakePlaybackSessions(bool);
+
+    /// A stop request ends a sweep before its next file, the empty-folder
+    /// pruning included, as upstream's `ThrowIfCancellationRequested` before
+    /// each delete does: a sweep on the blocking pool outlives its dropped body.
+    #[test]
+    fn a_sweep_stops_before_its_next_file_once_asked() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("old.tmp"), b"x").expect("write");
+        std::fs::create_dir(dir.path().join("empty")).expect("mkdir");
+        let progress = TaskProgress::default();
+        progress.cancel_token().cancel();
+        let everything = SystemTime::now() + std::time::Duration::from_secs(3600);
+        let deleted =
+            delete_files_older_than(dir.path(), everything, &progress, 0.0, 100.0, &|_| false);
+        assert_eq!(deleted, 0);
+        assert!(dir.path().join("old.tmp").exists());
+        assert!(dir.path().join("empty").exists(), "nothing pruned either");
+        assert!(progress.was_stopped(), "the run is recorded Cancelled");
+    }
 
     #[allow(unused_variables)] // stub bodies are unreachable!(), params deliberately unused
     #[async_trait]
