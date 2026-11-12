@@ -1985,6 +1985,14 @@ impl CollectionManager for FakeCollections {
     ) -> Result<Option<BaseItemEntity>, ServiceError> {
         unimplemented!("fake")
     }
+
+    async fn resolve_box_set_folders(
+        &self,
+        _location: &str,
+        _folders: &[String],
+    ) -> Result<Option<Vec<Uuid>>, ServiceError> {
+        unimplemented!("fake")
+    }
 }
 
 /// A fake [`SubtitleManager`]; every method is unused by INFRA-level tests.

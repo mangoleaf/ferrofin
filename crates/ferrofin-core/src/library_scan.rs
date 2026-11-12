@@ -5732,9 +5732,10 @@ impl LibraryScanner {
     /// `folders` with the scan's options: upstream's
     /// `Folder.ValidateChildrenInternal2` → `RefreshMetadataRecursive` runs
     /// `BoxSetMetadataService` for every child of the library, as for any
-    /// library. A box set has no file to resolve, so the walk plans none; its
-    /// children are the box sets in the library's locations
-    /// (`{data}/collections/<name> [boxset]`). The single-item refresh decides
+    /// library. The walk plans no box set: its children are the box sets in
+    /// the library's locations (`{data}/collections/<name> [boxset]`), which
+    /// `BoxSetResolver` resolves first ([`Self::resolve_box_sets`]: new
+    /// folders stored, gone ones removed). The single-item refresh decides
     /// what runs, as for any item: a plain scan fetches only for a box set
     /// never refreshed or past the library's `AutomaticRefreshIntervalDays`,
     /// within the library's fetcher settings. A failure is logged and the
@@ -5752,7 +5753,7 @@ impl LibraryScanner {
         scope: Option<&[String]>,
         run: ScanRun<'_>,
     ) {
-        let (Some(providers), Some(items)) = (&self.metadata_savers, &self.item_repository) else {
+        let Some(items) = &self.item_repository else {
             return;
         };
         let locations: Vec<PathBuf> = folders
@@ -5764,6 +5765,11 @@ impl LibraryScanner {
         if locations.is_empty() {
             return;
         }
+        self.resolve_box_sets(items.as_ref(), &locations, scope, run)
+            .await;
+        let Some(providers) = &self.metadata_savers else {
+            return;
+        };
         let box_sets = match items
             .get_item_list(&InternalItemsQuery {
                 include_item_types: vec![BaseItemKind::BoxSet],
@@ -15427,8 +15433,8 @@ impl LibraryScanner {
                     }
                     // `boxsets` is the only type left: a BoxSet's members are
                     // curated through the collection API, not resolved off
-                    // disk. Its box sets are refreshed once the walk is done
-                    // (`refresh_box_sets`).
+                    // disk. Its box sets are resolved from their folders and
+                    // refreshed once the walk is done (`refresh_box_sets`).
                     Some(_) => {}
                 }
                 if let Some((location_folder, aggregate)) = placed {
@@ -24518,6 +24524,8 @@ fn season_image_item(entity: &BaseItemEntity, series_folder: Option<&str>) -> Im
 }
 
 mod artwork;
+mod box_sets;
+pub(crate) use box_sets::box_set_name;
 mod collections;
 mod fanout;
 mod missing_episodes;

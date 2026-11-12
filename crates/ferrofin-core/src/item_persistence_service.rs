@@ -561,6 +561,28 @@ pub(crate) async fn set_item_path_in(
     Ok(())
 }
 
+/// Stores `ids` as item `id`'s provider ids (`TrySetProviderId` for each),
+/// on a connection the caller holds.
+pub(crate) async fn set_provider_ids_in(
+    conn: &mut sqlx::SqliteConnection,
+    id: Uuid,
+    ids: &[(String, String)],
+) -> Result<(), ServiceError> {
+    for (provider, value) in ids {
+        sqlx::query(
+            r#"INSERT OR REPLACE INTO "BaseItemProviders"
+               ("ItemId", "ProviderId", "ProviderValue") VALUES (?1, ?2, ?3)"#,
+        )
+        .bind(guid_to_db(id))
+        .bind(provider)
+        .bind(value)
+        .execute(&mut *conn)
+        .await
+        .map_err(db_err)?;
+    }
+    Ok(())
+}
+
 /// The id of the container row stored at `path`, or `None`.
 ///
 /// **Matched by exact path**, the way `CollectionManager.EnsureLibraryFolder`

@@ -527,6 +527,14 @@ impl CollectionManager for RecordingCollections {
     ) -> Result<Option<BaseItemEntity>, ServiceError> {
         unimplemented!()
     }
+
+    async fn resolve_box_set_folders(
+        &self,
+        _location: &str,
+        _folders: &[String],
+    ) -> Result<Option<Vec<Uuid>>, ServiceError> {
+        unimplemented!()
+    }
 }
 
 /// Assembles an [`AppState`] over the recording playlist/collection fakes.

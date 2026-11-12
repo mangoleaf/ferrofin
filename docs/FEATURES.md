@@ -54,8 +54,9 @@ Checked against a real Jellyfin server by the retired v2 runtime diff:
   none of the media is deleted). Deep-verified for
   `movies` / `tvshows` / `music` / `homevideos` / `musicvideos` / `mixed` / untyped
   libraries; `books` is scanned too but is **not** deep-verified — see the entry below.
-  `boxsets` is the one library type not resolved off disk (its members are curated through
-  the collection API). A rescan reprocesses only what changed: see
+  A `boxsets` library resolves only its box sets: each `… [boxset]` folder in
+  `{data}/collections`, or each folder there holding a `collection.xml`, as Jellyfin's
+  `BoxSetResolver` does (their members are curated through the collection API). A rescan reprocesses only what changed: see
   [What a library scan does](#what-a-library-scan-does) below, and
   [`gates/verify/`](../gates/verify/README.md) to check it against any running server. Movie and
   episode probes download missing subtitles in the library's configured languages,
@@ -278,6 +279,10 @@ Wired and working, with a documented limitation or lighter verification:
   Jellyfin's `{data}/collections/<name> [boxset]` folder (ones made before 1.4.0 get it, and
   the id it derives, at the first boot after upgrading), and its membership lives in the `LinkedChildren`
   table, as Jellyfin 12 keeps it.
+  A scan of the Collections library stores a box set for each such folder that has none and
+  removes the box sets whose folder is gone, as Jellyfin's does; a folderless one stays. As on
+  Jellyfin 12, a box set stored again from its folder (after the library was removed and made
+  again) comes back empty: its members were only in the database.
 
 ## Not implemented (by design)
 
