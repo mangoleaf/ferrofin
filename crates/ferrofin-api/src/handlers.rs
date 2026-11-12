@@ -4068,17 +4068,35 @@ pub const VERIFIED: &[Verified] = &[
                isPerfectMatch's hash-match filter applied to every provider's results, \
                where upstream leaves it to the provider, as the plugin's MatchFilter does) → \
                ferrofin-providers opensubtitles.rs search (the OpenSubtitles plugin's Search, \
-               v25, compared for the code it derives: GetLanguage's zh-CN and pt-PT, and no \
-               search for a language without a two-letter code)",
-        date: "2026-11-09",
+               v25 @ 60d2c74d: an account's Login first, sharing the downloads' session, and \
+               no login with an account the API refused (CredentialsInvalid: a 401, or a 400 \
+               for an e-mail username); an automated search's [] without a login or with the \
+               quota spent; the [] for an episode without its numbers or series name and for \
+               a video without a path; \
+               GetLanguage's zh-CN and pt-PT checked against the /infos/languages list, read \
+               once, a regioned code falling back to its language and no search for a language \
+               the list or the culture lacks; the movie hash; type, then imdb_id or else the \
+               file name as query with an episode's numbers; AddQueryString's sorted, lowercased \
+               query; every page of SearchSubtitlesAsync; BadSubtitleFilter, with the files a \
+               download found empty, MediaFilter and MatchFilter; the order by hash match, \
+               downloads, rating and trusted uploader; one candidate per result, its first \
+               file's id, with Release, Comments, Ratings, UploadDate, Fps and the machine and \
+               AI translation flags)",
+        date: "2026-11-11",
         divergences: &[
             "A DVD or Blu-ray rip or an ISO is searched; upstream returns [] unless the \
          video's VideoType is VideoFile. Fix path: gl-1524.",
-            "The built-in OpenSubtitles provider matches the plugin it ports only in the \
-         language code it derives (GetLanguage's zh and pt rewrites and its refusal of a \
-         language with no code), not in GetLanguage's check against the API's language list; \
-         its parameters, early returns, filters, ordering and result fields differ from \
-         OpenSubtitleDownloader.Search. Fix path: gl-1525.",
+            "With an OpenSubtitles API key and no account, a manual search still searches; \
+         the plugin's Login throws without an account, so it finds nothing. Fix path: gl-808 \
+         (owner decision).",
+            "OpenSubtitles keeps an account the API refused (CredentialsInvalid) only until the \
+         server restarts, the account changes or a login with it succeeds (the settings page's \
+         validation included), and a download still tries to log in with it; \
+         the plugin saves the flag to its configuration until its settings page validates new \
+         credentials, and fails such a download at once (Unable to login). Fix path: gl-1644.",
+            "OpenSubtitles candidates carry ProviderName \"opensubtitles\" and the MD5 of that \
+         name as their id prefix; the plugin's Name, and so upstream's, is \"Open Subtitles\". \
+         Fix path: gl-1704.",
             "The 401 (no or bad token), 403 (no subtitle management) and 404 bodies are \
          Ferrofin's error shape, not upstream's. Fix path: gl-666.",
         ],
