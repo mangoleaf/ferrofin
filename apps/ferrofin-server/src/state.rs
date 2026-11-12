@@ -2420,7 +2420,10 @@ pub async fn build_app_state(
         ))));
         task_manager.register(Arc::new(maint_tasks::DeleteLogFileTask::new(
             Arc::clone(&config_trait),
-            server_config.log_file_retention_days,
+            {
+                let config_mgr = Arc::clone(&config_mgr);
+                move || config_mgr.snapshot_shared().log_file_retention_days
+            },
         )));
         task_manager.register(Arc::new(maint_tasks::CleanupUserDataTask::new(db.clone())));
         task_manager.register(Arc::new(maint_tasks::MoveTrickplayImagesTask::new(
