@@ -1695,7 +1695,7 @@ impl ferrofin_traits::collections::PlaylistManager for RecordingPlaylists {
         &self,
         _playlist_id: Uuid,
         _user_id: Uuid,
-    ) -> Result<Vec<BaseItemEntity>, ServiceError> {
+    ) -> Result<ferrofin_traits::persistence::PlaylistMembers, ServiceError> {
         unimplemented!("unused")
     }
     async fn get_playlist_item_ids(&self, _playlist_id: Uuid) -> Result<Vec<Uuid>, ServiceError> {
@@ -2374,6 +2374,48 @@ async fn authenticate_by_name_returns_authentication_result() {
     assert_eq!(json["ServerId"], "server-1");
     // ...and the minted access token the client must present on later requests.
     assert_eq!(json["AccessToken"], "canned-token");
+}
+
+/// A sign-in whose user cannot be reloaded afterwards (here: gone from the
+/// store) still answers with the minted token, and its bare `User` carries
+/// the session's `ServerId` and `new UserDto()`'s policy, `new UserPolicy()`,
+/// not an all-false one that tells the client the user may not play anything.
+#[tokio::test]
+async fn sign_in_fallback_user_carries_the_constructor_policy() {
+    let router = create_router(state_with_sessions(
+        Arc::new(MemUsers::default()),
+        Arc::new(MemConfig::new(true)),
+        Arc::new(ferrofin_api::test_support::FakeActivity),
+        Arc::new(AdminAuth),
+        Arc::new(OkSessions::default()),
+    ));
+    let response = router
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/Users/AuthenticateByName")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(r#"{"Username":"alice","Pw":"secret"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let json = json_body(response).await;
+    assert_eq!(json["AccessToken"], "canned-token");
+    assert_eq!(json["User"]["Name"], "alice");
+    assert_eq!(json["User"]["ServerId"], "server-1");
+    let policy = &json["User"]["Policy"];
+    // `UserPolicy.cs`'s constructor values.
+    assert_eq!(policy["EnableMediaPlayback"], true);
+    assert_eq!(policy["EnableAllFolders"], true);
+    assert_eq!(policy["IsHidden"], true);
+    assert_eq!(policy["IsAdministrator"], false);
+    assert_eq!(policy["LoginAttemptsBeforeLockout"], -1);
+    assert_eq!(policy["SyncPlayAccess"], "CreateAndJoinGroups");
+    // Every member: an empty body binds the constructor policy.
+    let constructor: UserPolicy = serde_json::from_str("{}").unwrap();
+    assert_eq!(*policy, serde_json::to_value(constructor).unwrap());
 }
 
 /// The obsolete `UserController.AuthenticateUser` (`POST /Users/{userId}/

@@ -54,8 +54,9 @@ Checked against a real Jellyfin server by the retired v2 runtime diff:
   none of the media is deleted). Deep-verified for
   `movies` / `tvshows` / `music` / `homevideos` / `musicvideos` / `mixed` / untyped
   libraries; `books` is scanned too but is **not** deep-verified — see the entry below.
-  `boxsets` is the one library type not resolved off disk (its members are curated through
-  the collection API). A rescan reprocesses only what changed: see
+  A `boxsets` library resolves only its box sets: each `… [boxset]` folder in
+  `{data}/collections`, or each folder there holding a `collection.xml`, as Jellyfin's
+  `BoxSetResolver` does (their members are curated through the collection API). A rescan reprocesses only what changed: see
   [What a library scan does](#what-a-library-scan-does) below, and
   [`gates/verify/`](../gates/verify/README.md) to check it against any running server. Movie and
   episode probes download missing subtitles in the library's configured languages,
@@ -259,9 +260,22 @@ Wired and working, with a documented limitation or lighter verification:
     the ComicBookInfo JSON in a `.cbz`'s archive comment, and EPUB/OPF Dublin Core + Calibre
     fields, with the cover extracted from the archive. There is still no *remote* book
     provider — that is the third-party Bookshelf plugin.
-  - **`.cbr` / `.cb7`** are recognized and browsable, but yield no embedded metadata or
-    cover: those are RAR and 7z archives, and neither has a maintained pure-Rust reader
-    worth the dependency. `.cbz` and `.cbt` are fully read.
+  - A book's runtime is its pages × 10000 ticks, as Jellyfin 12's probe sets it, so reading
+    progress shows as a share of the pages: a comic counts its archive's entries other than
+    folders (ZIP, 7z or tar, read from the archive's directory only), a PDF the `/Count` of its
+    page tree. It is counted when the book is added, when its file changes and when its
+    metadata is refreshed, as Jellyfin does, and also on any scan while a `.cbz`, `.cb7`,
+    `.cbt` or PDF still has one second, so books added by an older release are counted by
+    the next scan. An `.epub`
+    has one second, as upstream. A RAR `.cbr` is not counted until a RAR reader is chosen
+    (a new one has one second). **Accepted divergence:** `.mobi`, `.azw` and `.azw3` keep one second
+    where upstream gives them no runtime, because with none every stop marks the book played
+    and clears its position.
+  - **`.cbr`** files holding a RAR archive are recognized and browsable, but yield no
+    embedded metadata, cover or page count: no maintained pure-Rust RAR reader exists yet.
+    A comic is read as what its content is, so a `.cbr` holding a ZIP, 7z or tar archive is
+    read as one. Covers and page counts come from `.cbz`, `.cb7` and `.cbt`; embedded metadata
+    from `.cbz`.
 - **Photo keywords** — the EXIF pass fills every field Jellyfin's does except `Genres` and
   `Tags`, which upstream aggregates from XMP/IPTC keywords.
 - **Playlist files are read, never written** — a library scan makes a playlist of each
@@ -276,8 +290,13 @@ Wired and working, with a documented limitation or lighter verification:
   `<name>.xml` sidecar it writes beside a playlist file hides the file's entries and the
   playlist stays empty; Ferrofin always reads the entries and never that sidecar.
   `collection.xml` is still not read or written. A collection made in Ferrofin gets
-  Jellyfin's `{data}/collections/<name> [boxset]` folder (ones made before that stay
-  folderless), and its membership lives in the `LinkedChildren` table, as Jellyfin 12 keeps it.
+  Jellyfin's `{data}/collections/<name> [boxset]` folder (ones made before 1.4.0 get it, and the
+  id it derives, at the first boot of 1.5.2 or later), and its membership lives in the
+  `LinkedChildren` table, as Jellyfin 12 keeps it. A scan of the Collections library stores a box
+  set for each such folder that has none and removes the box sets whose folder is gone, as
+  Jellyfin's does; one the boot repair could not give a folder stays. As on Jellyfin 12, a box set
+  stored again from its folder (after the library was removed and made again) comes back empty:
+  its members were only in the database.
 
 ## Not implemented (by design)
 

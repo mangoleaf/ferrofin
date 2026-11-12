@@ -3,8 +3,8 @@
 //!
 //! This module is the only thing that actually launches a process, pumps its
 //! stderr to a log file, and waits on / kills it. It is exercised solely by the
-//! ffmpeg-gated integration tests in `tests/segment_transcode_ffmpeg.rs` (behind
-//! `FERROFIN_FFMPEG_TESTS`), never the unit suite, so it is carved out of the
+//! ffmpeg-gated integration tests in `tests/segment_transcode_ffmpeg.rs`
+//! (`#[ignore]`d), never the unit suite, so it is carved out of the
 //! line-coverage gate below. Everything it feeds — the `start_ffmpeg`
 //! orchestration, the wait-until-segment loops, kill/cleanup — is unit-tested
 //! against [`FakeSegmentTranscoder`](super::FakeSegmentTranscoder) and stays

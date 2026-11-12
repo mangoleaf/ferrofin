@@ -287,7 +287,8 @@ impl FromRequestParts<AppState> for RequireAuthIgnoringSchedule {
 }
 
 /// Elevation combined with a controller-level default policy, as on
-/// ConfigurationController and ItemLookupController. Unlike bare elevation,
+/// ConfigurationController, ItemLookupController and the Intro Skipper
+/// plugin's SkipIntroController writes. Unlike bare elevation,
 /// these routes also enforce the user's remote-access restriction.
 #[derive(Debug, Clone)]
 pub struct RequireAdminWithDefault(pub AuthorizationInfo);

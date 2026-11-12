@@ -59,7 +59,9 @@ use ferrofin_traits::library::{
     LibraryManager, SelfWrite, SelfWriteGuard, UserManager, VirtualFolderManager,
 };
 use ferrofin_traits::options::InternalItemsQuery;
-use ferrofin_traits::persistence::{ItemPersistenceService, ItemRepository, LinkedChildrenService};
+use ferrofin_traits::persistence::{
+    ItemPersistenceService, ItemRepository, LinkedChildrenService, PlaylistMembers,
+};
 use ferrofin_traits::providers::{
     MetadataRefreshMode, MetadataRefreshOptions, ProviderManager, RefreshPriority,
 };
@@ -402,7 +404,7 @@ pub(crate) async fn new_playlist_folder_and_id(
 ///
 /// # Errors
 /// The I/O error that kept the folder from being made, or a failed lookup.
-async fn new_box_set_folder_and_id(
+pub(crate) async fn new_box_set_folder_and_id(
     db: &Database,
     mode: &crate::item_type_lookup::IdDerivation,
     collections: &str,
@@ -496,6 +498,12 @@ pub struct FerrofinCollectionManager {
     /// One provision at a time: two first creates at once would otherwise each
     /// add a library (`Collections`, `Collections2`).
     provisioning: Arc<tokio::sync::Mutex<()>>,
+    /// Held while a create claims a box set folder until its row is stored,
+    /// and while a scan stores the box sets of the folders it found
+    /// ([`CollectionManager::resolve_box_set_folders`]): the scan would
+    /// otherwise store a row for a folder a create just made, and the
+    /// create's own row would then fail.
+    box_set_folders: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl std::fmt::Debug for FerrofinCollectionManager {
@@ -526,6 +534,7 @@ impl FerrofinCollectionManager {
             virtual_folders: None,
             virtual_paths: crate::virtual_paths::VirtualPathExpander::identity(),
             provisioning: Arc::default(),
+            box_set_folders: Arc::default(),
         }
     }
 
@@ -721,6 +730,7 @@ impl CollectionManager for FerrofinCollectionManager {
             _ => Vec::new(),
         };
         let parent = parent.map(|folder| folder.id);
+        let claim = self.box_set_folders.lock().await;
         let (path, id) =
             new_box_set_folder_and_id(&self.db, &mode, &collections, &options.name).await?;
         // `ReportFileSystemChangeBeginning(path)` around the whole create.
@@ -759,6 +769,7 @@ impl CollectionManager for FerrofinCollectionManager {
             }
             return Err(err);
         }
+        drop(claim);
         let row = self
             .library_manager
             .get_item_by_id(id)
@@ -986,6 +997,109 @@ impl CollectionManager for FerrofinCollectionManager {
             return Ok(None);
         };
         crate::item_persistence_service::container_row(&self.db, folder.id).await
+    }
+
+    async fn resolve_box_set_folders(
+        &self,
+        location: &str,
+        folders: &[String],
+    ) -> Result<Option<Vec<Uuid>>, ServiceError> {
+        // The folder box sets are made in, found as `create_collection`
+        // finds it but never provisioned: a scan resolves only that one,
+        // under the `Folder` `AddChild` gives a new box set as its parent.
+        let library = self.collections_library().await?;
+        let Some(folder) = library.find().await? else {
+            return Ok(None);
+        };
+        if folder.legacy
+            || !ferrofin_model::content_type_overrides::paths_equal(
+                &folder.path,
+                &self.virtual_paths.expand(location),
+            )
+        {
+            return Ok(None);
+        }
+        let (mode, _) = container_identity(&self.db, &self.paths).await?;
+        let owner = match &self.virtual_folders {
+            Some(virtual_folders) => library.library_at(virtual_folders.as_ref()).await?,
+            None => None,
+        };
+        let ancestors = library.ancestors(&folder, owner.as_ref());
+        let _claim = self.box_set_folders.lock().await;
+        let mut added = Vec::new();
+        for path in folders {
+            let Some(name) = crate::library_scan::box_set_name(path) else {
+                continue;
+            };
+            // Stored as `AddChild`'s save stores it (`ReverseVirtualPath`).
+            let stored = self.virtual_paths.reverse(path);
+            let Some(id) =
+                crate::item_type_lookup::derive_item_id_with(&mode, BaseItemKind::BoxSet, path)
+            else {
+                continue;
+            };
+            let held = async {
+                let at_path = crate::library_structure_repository::folder_at(
+                    &self.db,
+                    BaseItemKind::BoxSet,
+                    path,
+                    &stored,
+                )
+                .await?;
+                Ok::<_, ServiceError>(
+                    at_path.is_some()
+                        || crate::item_persistence_service::row_exists(&self.db, id).await?,
+                )
+            }
+            .await;
+            match held {
+                Ok(false) => {}
+                Ok(true) => continue,
+                Err(err) => {
+                    tracing::warn!(%err, path = %path, "could not look for the box set of a folder");
+                    continue;
+                }
+            }
+            // `BoxSetResolver.SetProviderIdFromPath`: the `tmdbid` its name carries.
+            let provider_ids = crate::resolvers::path_provider_ids(&BaseItemEntity {
+                type_: crate::item_type_lookup::stored_type_name(BaseItemKind::BoxSet)
+                    .unwrap_or_default()
+                    .to_owned(),
+                path: Some(path.clone()),
+                ..BaseItemEntity::default()
+            });
+            let written = async {
+                let mut tx = self.db.writer().begin().await.map_err(db_err)?;
+                crate::item_persistence_service::insert_named_item_in(
+                    &mut tx,
+                    id,
+                    BaseItemKind::BoxSet,
+                    &name,
+                    true,
+                    Some(folder.id),
+                    false,
+                )
+                .await?;
+                crate::item_persistence_service::set_item_path_in(&mut tx, id, &stored)
+                    .await
+                    .map_err(db_err)?;
+                crate::library_structure_repository::add_ancestors_in(&mut tx, id, &ancestors)
+                    .await?;
+                crate::item_persistence_service::set_provider_ids_in(&mut tx, id, &provider_ids)
+                    .await?;
+                tx.commit().await.map_err(db_err)
+            }
+            .await;
+            // One folder that cannot be stored does not keep the others, or
+            // the ones already stored, from the scan.
+            match written {
+                Ok(()) => added.push(id),
+                Err(err) => {
+                    tracing::warn!(%err, path = %path, "could not store the box set of a folder");
+                }
+            }
+        }
+        Ok(Some(added))
     }
 }
 
@@ -1650,13 +1764,13 @@ impl PlaylistManager for FerrofinPlaylistManager {
         &self,
         playlist_id: Uuid,
         user_id: Uuid,
-    ) -> Result<Vec<BaseItemEntity>, ServiceError> {
+    ) -> Result<PlaylistMembers, ServiceError> {
         require_user(user_id)?;
-        // One round-trip through the repository seam: the member rows already
-        // in link order (the same ordering `get_linked_children_ids` applies),
-        // each carrying the caller's access columns, so the visibility gate
-        // costs no extra query. The C# `Forbid()` branch is unreachable here
-        // because visible ⇔ permitted-to-read.
+        // One round-trip through the repository seam: each distinct member
+        // row once, the entries in link order (the same ordering
+        // `get_linked_children_ids` applies), and the caller's access columns,
+        // so the visibility gate costs no extra query. The C# `Forbid()`
+        // branch is unreachable here because visible ⇔ permitted-to-read.
         let page = self
             .items
             .get_playlist_items_with_access(playlist_id, user_id, LINKED_CHILD_MANUAL)
@@ -1666,7 +1780,7 @@ impl PlaylistManager for FerrofinPlaylistManager {
             // "missing/invisible playlist", so resolve access on its own. Only
             // empty playlists pay for this second query.
             self.access(playlist_id, user_id).await?;
-            return Ok(Vec::new());
+            return Ok(PlaylistMembers::default());
         };
         // Every row repeats the same access columns; the first decides.
         if decide_access(
@@ -1683,7 +1797,7 @@ impl PlaylistManager for FerrofinPlaylistManager {
         // them all as `ItemIds`, and the items endpoint drops the ones the
         // caller may not see itself, as `PlaylistsController` does.
         self.require_visible(playlist_id, user_id).await?;
-        Ok(page.items)
+        Ok(page.members)
     }
 
     async fn get_playlist_item_ids(&self, playlist_id: Uuid) -> Result<Vec<Uuid>, ServiceError> {
@@ -1985,13 +2099,15 @@ mod playlist_announcements_tests;
 #[cfg(test)]
 mod remove_playlists_tests;
 
+mod saved_containers;
+
 /// One playlist entry: `(ChildId, ChildType)` as stored.
 type Entry = (String, i64);
 
 /// A playlist's entries in stored order. Entries are positions, not a set:
 /// the same item may appear more than once (12.0's `(ParentId, SortOrder)` key).
-async fn read_entries(
-    pool: &sqlx::SqlitePool,
+async fn read_entries<'e>(
+    executor: impl sqlx::SqliteExecutor<'e>,
     playlist_id: &str,
 ) -> Result<Vec<Entry>, ServiceError> {
     sqlx::query_as(
@@ -1999,7 +2115,7 @@ async fn read_entries(
            WHERE "ParentId" = ?1 ORDER BY "SortOrder""#,
     )
     .bind(playlist_id)
-    .fetch_all(pool)
+    .fetch_all(executor)
     .await
     .map_err(db_err)
 }
@@ -3329,7 +3445,8 @@ mod tests {
         let items = mgr
             .get_playlist_items(playlist_id, owner)
             .await
-            .expect("items");
+            .expect("items")
+            .into_entry_rows();
         assert_eq!(items.len(), 2);
         let ids: Vec<Uuid> = items
             .iter()
@@ -3368,6 +3485,7 @@ mod tests {
             .get_playlist_items(playlist_id, owner)
             .await
             .expect("items")
+            .into_entry_rows()
             .iter()
             .filter_map(|i| Uuid::parse_str(&i.id).ok())
             .collect();
@@ -3376,6 +3494,20 @@ mod tests {
             mgr.get_playlist_item_ids(playlist_id).await.expect("ids"),
             ids
         );
+
+        // The repeated member's row is read once (gl-1523).
+        let page = item_repository_over(db.clone())
+            .get_playlist_items_with_access(playlist_id, owner, super::LINKED_CHILD_MANUAL)
+            .await
+            .expect("read");
+        let rows: Vec<Uuid> = page
+            .members
+            .items
+            .iter()
+            .filter_map(|i| Uuid::parse_str(&i.id).ok())
+            .collect();
+        assert_eq!(rows, vec![c, a, b]);
+        assert_eq!(page.members.entries, vec![0, 1, 2, 1]);
     }
 
     #[tokio::test]
@@ -3405,7 +3537,8 @@ mod tests {
         let items = mgr
             .get_playlist_items(playlist_id, owner)
             .await
-            .expect("items");
+            .expect("items")
+            .into_entry_rows();
         assert_eq!(items.len(), 1);
         let dashless = Uuid::parse_str(&items[0].id)
             .expect("uuid")
@@ -3419,7 +3552,8 @@ mod tests {
         let after = mgr
             .get_playlist_items(playlist_id, owner)
             .await
-            .expect("items after");
+            .expect("items after")
+            .into_entry_rows();
         assert!(
             after.is_empty(),
             "removing by dashless PlaylistItemId should empty the playlist"
@@ -3454,6 +3588,7 @@ mod tests {
             .get_playlist_items(playlist_id, owner)
             .await
             .expect("items")
+            .into_entry_rows()
             .iter()
             .filter_map(|i| Uuid::parse_str(&i.id).ok())
             .collect();
@@ -3473,6 +3608,7 @@ mod tests {
             &mgr.get_playlist_items(playlist_id, owner)
                 .await
                 .expect("items2")
+                .into_entry_rows()
                 .last()
                 .expect("non-empty")
                 .id,
@@ -3512,6 +3648,7 @@ mod tests {
             mgr.get_playlist_items(playlist_id, owner)
                 .await
                 .expect("items")
+                .into_entry_rows()
                 .iter()
                 .filter_map(|i| Uuid::parse_str(&i.id).ok())
                 .collect::<Vec<Uuid>>()
@@ -3568,6 +3705,7 @@ mod tests {
                 mgr.get_playlist_items(playlist_id, user)
                     .await
                     .expect("items")
+                    .into_entry_rows()
                     .iter()
                     .filter_map(|i| Uuid::parse_str(&i.id).ok())
                     .collect::<Vec<Uuid>>()
@@ -3611,7 +3749,8 @@ mod tests {
         let items = mgr
             .get_playlist_items(playlist_id, owner)
             .await
-            .expect("items");
+            .expect("items")
+            .into_entry_rows();
         assert_eq!(items.len(), 1);
         assert_eq!(
             items[0].id,
@@ -3652,6 +3791,7 @@ mod tests {
             mgr.get_playlist_items(playlist_id, alice)
                 .await
                 .expect("owner reads")
+                .into_entry_rows()
                 .len(),
             1
         );
@@ -3698,6 +3838,7 @@ mod tests {
             .get_playlist_items(shared, bob)
             .await
             .expect("share grants read")
+            .into_entry_rows()
             .iter()
             .filter_map(|i| Uuid::parse_str(&i.id).ok())
             .collect();
@@ -3721,6 +3862,7 @@ mod tests {
             mgr.get_playlist_items(public, Uuid::new_v4())
                 .await
                 .expect("open access grants read")
+                .entries
                 .len(),
             1
         );
@@ -3749,7 +3891,8 @@ mod tests {
         let playlist_items = mgr
             .get_playlist_items(playlist_id, alice)
             .await
-            .expect("owner reads an empty playlist");
+            .expect("owner reads an empty playlist")
+            .into_entry_rows();
         assert!(playlist_items.is_empty(), "{playlist_items:?}");
         let ids = mgr.get_playlist_item_ids(playlist_id).await.expect("ids");
         assert!(ids.is_empty(), "{ids:?}");
@@ -3777,7 +3920,8 @@ mod tests {
         let items = mgr
             .get_playlist_items(legacy, Uuid::new_v4())
             .await
-            .expect("legacy playlists stay readable");
+            .expect("legacy playlists stay readable")
+            .into_entry_rows();
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].id, ferrofin_db::store::guid_to_db(track));
     }
@@ -3818,6 +3962,7 @@ mod tests {
             .get_playlist_items(playlist_id, owner)
             .await
             .expect("items")
+            .into_entry_rows()
             .iter()
             .filter_map(|i| Uuid::parse_str(&i.id).ok())
             .collect();
@@ -4785,6 +4930,7 @@ mod tests {
         mgr.get_playlist_items(playlist_id, reader)
             .await
             .expect("items")
+            .into_entry_rows()
             .iter()
             .filter_map(|i| Uuid::parse_str(&i.id).ok())
             .collect()
@@ -4956,6 +5102,7 @@ mod tests {
             .get_playlist_items(mixed, kid)
             .await
             .expect("items")
+            .into_entry_rows()
             .into_iter()
             .filter_map(|r| Uuid::parse_str(&r.id).ok())
             .collect();
