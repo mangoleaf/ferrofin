@@ -234,6 +234,16 @@ impl TmdbConfig {
         raw.as_deref().map(str::trim).filter(|s| !s.is_empty())
     }
 
+    /// Whether `kind`'s images are fetched at their original size: unset, or
+    /// `original` in any case (`TmdbUtils.IsOriginalImageSize`). TMDb's
+    /// width and height describe the original file, so a candidate at any
+    /// other size goes without them (`ConvertToRemoteImageInfo`'s `scaleImage`).
+    #[must_use]
+    pub fn is_original_size(&self, kind: TmdbImageKind) -> bool {
+        self.image_size(kind)
+            .is_none_or(|size| size.eq_ignore_ascii_case("original"))
+    }
+
     /// The absolute CDN URL for a TMDb-relative image `path`.
     ///
     /// `GetUrl` (`TmdbClientManager.cs:514-521`): *"Use `original` as default
@@ -493,6 +503,24 @@ mod tests {
             cfg.image_url(TmdbImageKind::Poster, "/p.jpg"),
             "https://image.tmdb.org/t/p/original/p.jpg"
         );
+    }
+
+    /// `TmdbUtilsTests.IsOriginalImageSize_Valid_Success`: an unconfigured
+    /// size fetches the original image, so it keeps the original resolution.
+    #[rstest::rstest]
+    #[case(None, true)]
+    #[case(Some(""), true)]
+    #[case(Some("original"), true)]
+    #[case(Some("Original"), true)]
+    #[case(Some("w500"), false)]
+    #[case(Some("original2"), false)]
+    fn is_original_image_size(#[case] size: Option<&str>, #[case] expected: bool) {
+        use super::TmdbImageKind;
+        let cfg = TmdbConfig {
+            still_size: size.map(str::to_owned),
+            ..TmdbConfig::default()
+        };
+        assert_eq!(cfg.is_original_size(TmdbImageKind::Still), expected);
     }
 
     /// The client's image root replaces the CDN's, and the settings page's

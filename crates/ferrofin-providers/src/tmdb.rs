@@ -1902,16 +1902,14 @@ impl TmdbClient {
         };
         let cfg = &cfg;
         let map = |images: Vec<CollectionImage>, kind: ImageType| {
+            let size = image_type_size(kind);
+            let original = cfg.is_original_size(size);
             images.into_iter().filter_map(move |image| {
-                let size = image_type_size(kind);
-                let scaled = cfg
-                    .image_size(size)
-                    .is_some_and(|size| !size.eq_ignore_ascii_case("original"));
                 Some(TmdbImage {
                     image_type: kind,
                     url: cfg.image_url(size, &non_empty(image.file_path)?),
-                    width: if scaled { None } else { image.width },
-                    height: if scaled { None } else { image.height },
+                    width: image.width.filter(|_| original),
+                    height: image.height.filter(|_| original),
                     community_rating: image.vote_average,
                     vote_count: image.vote_count,
                     language: get_image_language(
@@ -2093,6 +2091,8 @@ impl TmdbClient {
         // each call's iterator is lazy, so it must not consume the config.
         let cfg = &cfg;
         let map = |entries: Vec<ImageEntry>, image_type: ImageType| {
+            let size = image_type_size(image_type);
+            let original = cfg.is_original_size(size);
             entries.into_iter().filter_map(move |e| {
                 let path = e.file_path.filter(|p| !p.is_empty())?;
                 let language = get_image_language(
@@ -2109,9 +2109,9 @@ impl TmdbClient {
                 };
                 Some(TmdbImage {
                     image_type,
-                    url: cfg.image_url(image_type_size(image_type), &path),
-                    width: e.width,
-                    height: e.height,
+                    url: cfg.image_url(size, &path),
+                    width: e.width.filter(|_| original),
+                    height: e.height.filter(|_| original),
                     community_rating: e.vote_average,
                     vote_count: e.vote_count,
                     language,
@@ -2154,6 +2154,7 @@ impl TmdbClient {
                 "{}/tv/{series_tmdb_id}/season/{season_number}/images",
                 self.base_url
             ),
+            crate::plugin_config::TmdbImageKind::Poster,
             request_language,
         )
         .await
@@ -2174,6 +2175,7 @@ impl TmdbClient {
                 "{}/tv/{series_tmdb_id}/season/{season_number}/episode/{episode_number}/images",
                 self.base_url
             ),
+            crate::plugin_config::TmdbImageKind::Still,
             request_language,
         )
         .await
@@ -2181,9 +2183,15 @@ impl TmdbClient {
 
     /// The shared body of [`season_images`](Self::season_images) and
     /// [`episode_images`](Self::episode_images): fetch one TMDB `images`
-    /// document and take its posters and stills, both as `Primary`
-    /// (C# `ConvertPostersToRemoteImageInfo` / `ConvertStillsToRemoteImageInfo`).
-    async fn tv_images(&self, url: String, request_language: Option<&str>) -> Vec<TmdbImage> {
+    /// document and take its posters and stills, both as `Primary`, at the
+    /// size setting of the caller's `kind` (C# `ConvertPostersToRemoteImageInfo`
+    /// with `PosterSize` / `ConvertStillsToRemoteImageInfo` with `StillSize`).
+    async fn tv_images(
+        &self,
+        url: String,
+        kind: crate::plugin_config::TmdbImageKind,
+        request_language: Option<&str>,
+    ) -> Vec<TmdbImage> {
         // The TMDb settings page governs the key, the adult filter, the
         // cast/crew caps and the image sizes; read per call, the way
         // `Plugin.Instance.Configuration` is (`TmdbClientManager`).
@@ -2203,6 +2211,7 @@ impl TmdbClient {
         let Ok(parsed) = resp.counted_json::<ImagesResponse>().await else {
             return Vec::new();
         };
+        let original = cfg.is_original_size(kind);
         parsed
             .posters
             .into_iter()
@@ -2211,12 +2220,9 @@ impl TmdbClient {
                 let path = e.file_path.filter(|p| !p.is_empty())?;
                 Some(TmdbImage {
                     image_type: ImageType::Primary,
-                    // The settings-page size, not a hardcoded `original`: these
-                    // are posters and stills, so they take the same size arm
-                    // every other `Primary` image does.
-                    url: cfg.image_url(image_type_size(ImageType::Primary), &path),
-                    width: e.width,
-                    height: e.height,
+                    url: cfg.image_url(kind, &path),
+                    width: e.width.filter(|_| original),
+                    height: e.height.filter(|_| original),
                     community_rating: e.vote_average,
                     vote_count: e.vote_count,
                     language: get_image_language(
@@ -2607,9 +2613,7 @@ impl TmdbClient {
         let Some(person) = self.person_response(tmdb_id, language, &cfg).await else {
             return Vec::new();
         };
-        let scaled = cfg
-            .image_size(crate::plugin_config::TmdbImageKind::Profile)
-            .is_some_and(|size| !size.eq_ignore_ascii_case("original"));
+        let original = cfg.is_original_size(crate::plugin_config::TmdbImageKind::Profile);
         person
             .images
             .iter()
@@ -2621,8 +2625,8 @@ impl TmdbClient {
                         crate::plugin_config::TmdbImageKind::Profile,
                         &non_empty(image.file_path.clone())?,
                     ),
-                    width: if scaled { None } else { image.width },
-                    height: if scaled { None } else { image.height },
+                    width: image.width.filter(|_| original),
+                    height: image.height.filter(|_| original),
                     community_rating: image.vote_average,
                     vote_count: image.vote_count,
                     language: get_image_language(
@@ -2976,6 +2980,39 @@ mod tests {
             assert_eq!(profiles[0].vote_count, Some(3));
             assert_eq!(collections[0].vote_count, Some(3));
         }
+    }
+
+    /// A season's posters take `PosterSize` and an episode's stills
+    /// `StillSize` (`ConvertPostersToRemoteImageInfo` /
+    /// `ConvertStillsToRemoteImageInfo`); only the scaled one loses its size.
+    #[tokio::test]
+    async fn season_posters_and_episode_stills_take_their_own_size() {
+        let server = crate::mock_http::MockServer::start(vec![
+            (
+                "/episode/2/images",
+                r#"{"stills":[{"file_path":"/s.jpg","width":1920}]}"#.to_owned(),
+            ),
+            (
+                "/season/1/images",
+                r#"{"posters":[{"file_path":"/p.jpg","width":1000}]}"#.to_owned(),
+            ),
+        ])
+        .await;
+        let client = TmdbClient::new().with_base_url(&server.base_url);
+        client.attach_plugin_manager(crate::plugin_config::tests_support::manager_with(
+            crate::builtin_plugins::TMDB.id,
+            br#"{"StillSize":"w300"}"#.to_vec(),
+        ));
+        let season = client.season_images(5, 1, None).await;
+        let episode = client.episode_images(5, 1, 2, None).await;
+        assert_eq!(
+            (season[0].url.as_str(), season[0].width),
+            ("https://image.tmdb.org/t/p/original/p.jpg", Some(1000))
+        );
+        assert_eq!(
+            (episode[0].url.as_str(), episode[0].width),
+            ("https://image.tmdb.org/t/p/w300/s.jpg", None)
+        );
     }
 
     /// `TmdbPersonImageProvider` labels profiles against the item's own
