@@ -182,8 +182,8 @@ Checked against a real Jellyfin server by the retired v2 runtime diff:
 - **Photos & books** — a home-videos library resolves its images into `Photo` items with
   their EXIF read off the file (camera, exposure, GPS, orientation, date taken); a books
   library resolves `.epub`/`.cbz`/… into `Book` items with `ComicInfo`/`ComicBookInfo`/OPF
-  metadata and the cover extracted from the archive: a comic's from a ZIP, 7z or tar archive
-  whatever its extension (a RAR `.cbr` gets none yet).
+  metadata and the cover extracted from the archive: a comic's from a ZIP, 7z, tar or RAR
+  archive whatever its extension (RAR through an external `7z` or `bsdtar`).
 - **Item links & id fields** — the "Links" row (IMDb/TMDB/MusicBrainz/…) and the per-kind
   external-id fields the Identify dialog offers.
 - **Backup & restore.**
@@ -258,9 +258,12 @@ Wired and working, with a documented limitation or lighter verification:
     the ComicBookInfo JSON in a `.cbz`'s archive comment, and EPUB/OPF Dublin Core + Calibre
     fields, with the cover extracted from the archive. There is still no *remote* book
     provider — that is the third-party Bookshelf plugin.
-  - **`.cbr` / `.cb7`** are recognized and browsable, but yield no embedded metadata or
-    cover: those are RAR and 7z archives, and neither has a maintained pure-Rust reader
-    worth the dependency. `.cbz` and `.cbt` are fully read.
+  - **`.cbr` / `.cb7` / `.cbt`** yield no embedded metadata, as upstream reads the archive's
+    `ComicInfo.xml` and ComicBookInfo comment only from a `.cbz`; a sidecar still applies.
+    Their cover is read as a `.cbz`'s is: a 7z or tar archive in process, a RAR one through
+    `7z` found on `PATH` (`bsdtar` when 7z is absent or cannot decode RAR). The Docker image
+    ships 7z with its RAR plugin; without a tool, a RAR comic gets no cover and the server
+    logs that once ([`INSTALL.md`](INSTALL.md#rar-comics) for bare metal).
 - **Photo keywords** — the EXIF pass fills every field Jellyfin's does except `Genres` and
   `Tags`, which upstream aggregates from XMP/IPTC keywords.
 - **Playlist files are read, never written** — a library scan makes a playlist of each

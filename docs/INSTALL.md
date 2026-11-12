@@ -90,6 +90,15 @@ fresh-install or migration procedure below before starting it.
 To check an installed binary, from the package or the tarball, for known vulnerabilities, see
 [`SECURITY.md`](../SECURITY.md#checking-a-binary-for-known-vulnerabilities).
 
+### RAR comics
+
+A `.cbr` comic that is really a RAR archive gets its cover from `7z` on `PATH`, or `bsdtar`
+when 7z is absent or cannot decode RAR, looked for when the first one is read; restart the
+server after installing either. Without one it gets no cover, and the server logs that once.
+Debian's and Ubuntu's 7-Zip decodes RAR only with its plugin from the non-free (Debian) or
+multiverse (Ubuntu) component, so install `7zip 7zip-rar` (`p7zip-full p7zip-rar` on older
+releases), or `libarchive-tools` for bsdtar. The Docker image ships 7z with the plugin.
+
 ## 3. The unit
 
 The unit runs as the `ferrofin` user with no extra sandboxing, like Jellyfin's own unit.
