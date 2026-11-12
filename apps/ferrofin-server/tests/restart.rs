@@ -377,6 +377,60 @@ async fn a_networking_page_base_url_applies_on_the_restart() {
         .expect("run exits cleanly");
 }
 
+/// gl-554: a Local HTTP port saved on the Networking page marks a restart
+/// pending, and the next lifetime listens on and advertises it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_networking_page_port_applies_on_the_restart() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let client = reqwest::Client::builder()
+        .timeout(REQUEST_TIMEOUT)
+        .build()
+        .expect("client");
+    let (server, base, config) = spawn_server(&client, |port| Config {
+        server_name: "ferrofin-page-port".to_owned(),
+        admin_user: ADMIN_USER.to_owned(),
+        admin_password: ADMIN_PASSWORD.to_owned(),
+        port,
+        ..Config::test_stub(tmp.path())
+    })
+    .await;
+    let tok = token(&client, &base).await;
+    let mut network = get_json(&client, &base, "/System/Configuration/network", &tok).await;
+    let page_port = std::iter::repeat_with(free_port)
+        .find(|&page_port| page_port != config.port)
+        .expect("another free port");
+    // As jellyfin-web's Networking page saves it: the whole document back.
+    network["InternalHttpPort"] = page_port.into();
+    let (saved, _) = post_json(
+        &client,
+        &base,
+        "/System/Configuration/network",
+        &tok,
+        &network,
+    )
+    .await;
+    assert_eq!(saved, 204);
+    let info = system_info(&client, &base, &tok).await.expect("info");
+    assert_eq!(info["HasPendingRestart"], true, "the save marks a restart");
+
+    assert_eq!(post(&client, &base, "/System/Restart", &tok).await, 204);
+    let moved = format!("http://127.0.0.1:{page_port}");
+    wait_for_new_lifetime(&client, &moved, &config.server_name, &tok).await;
+    let info = system_info(&client, &moved, &tok).await.expect("info");
+    assert_eq!(info["LocalAddress"], moved.as_str(), "the advertised URL");
+    assert!(
+        !is_up(&client, &base, &config.server_name).await,
+        "the old port is closed"
+    );
+
+    assert_eq!(post(&client, &moved, "/System/Shutdown", &tok).await, 204);
+    tokio::task::spawn_blocking(move || server.join())
+        .await
+        .expect("join task")
+        .expect("server thread did not panic")
+        .expect("run exits cleanly");
+}
+
 /// Saved dashboard settings survive a new lifetime, while the restart flag
 /// clears. The old session token must still authorize these checks.
 async fn prepare_dashboard_restart(

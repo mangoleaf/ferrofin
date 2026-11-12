@@ -29,8 +29,8 @@ Each setting has exactly one key; the variable's stem is not accepted for these 
 `FERROFIN_CONFIG_FILE` has no key: it names the file. A key the file cannot hold is ignored with
 a warning at startup that names it, and a key spelled as its variable's stem (`tvdb_pin`) is
 told the key to use (`tvdb_subscriber_pin`). A number or on/off variable whose value does not
-parse (`FERROFIN_PORT=80g`) is ignored with a warning naming it, so the file's value or the
-default applies, and a blank one counts as unset; the rows that say so (`FERROFIN_DB_POOL`,
+parse (`FERROFIN_PORT=80g`) is ignored with a warning naming it, so what it would outrank
+applies, and a blank one counts as unset; the rows that say so (`FERROFIN_DB_POOL`,
 `FERROFIN_DB_STATEMENT_CACHE`, the cache lifetimes, `FERROFIN_TRICKPLAY_CONCURRENCY`, the login
 backoff's numbers) stop the server on a bad value instead.
 
@@ -48,8 +48,9 @@ boots.
 
 `GET /Ferrofin/Settings` (administrators only) reports every setting below with its readable
 name (`Label`), its tab (`Group`), the value in use and its unit (`Unit`, when it has one), its
-default, and where that value comes from: a flag, a variable, the Networking page (`base_url`
-only), `config.toml` or the default. A value `config.toml` holds that is not in use (the file
+default, and where that value comes from: a flag, a variable, the Networking page (`port`,
+`https_port` and `base_url` only), `config.toml` or the default. A value `config.toml` holds
+that is not in use (the file
 changed since the server started, or a flag, a variable or the Networking page outranks it) is
 reported beside it. A choice lists its options (`Options`, each with its `Value`, `Label` and
 `Note`) and says when the stored value fits none (`Custom: true`, the
@@ -144,8 +145,7 @@ changed. These have no field whatever sets them, each with its reason on the pag
   it lists, so it is set the same way, for the same reason;
 - the settings jellyfin-web's own pages cover: `bind_addr`, `published_url`, `port`, `https_port`
   and `base_url` under Dashboard → Networking, `server_name` and `enable_metrics` under
-  Dashboard → General (Networking does not drive `port` and `https_port` yet, so their notes say
-  to set them by hand in `config.toml`, or with their variable or flag);
+  Dashboard → General;
 - the OpenTelemetry variables, which `config.toml` has no key for.
 
 A saved change [applies at the next restart](#when-a-change-applies). After a save the line below
@@ -237,8 +237,8 @@ Jellyfin `jellyfin.db` (root or `data/jellyfin.db`) found in the data dir — se
 | Variable | Default | Purpose |
 |---|---|---|
 | `FERROFIN_BIND_ADDR` | `0.0.0.0` | Address the HTTP listener binds to. |
-| `FERROFIN_PORT` | `8096` | HTTP port. |
-| `FERROFIN_HTTPS_PORT` | `8920` | HTTPS port (parity value). Served beside the HTTP port when the dashboard's Networking settings enable HTTPS and the PKCS#12 (`.pfx`) certificate at their certificate path loads; see [HTTPS](#https). |
+| `FERROFIN_PORT` | `8096` | HTTP port. It and the `--port` flag outrank **Local HTTP port number** on Dashboard → Networking, which outranks the `config.toml` key `port` unless it holds the default, `8096`. A change on the Networking page applies after a restart, and the dashboard shows the restart as pending. The container image sets `FERROFIN_PORT=8096`, so in a container the Networking page's port applies only once the variable is set blank (`FERROFIN_PORT=`), and the port mapping must follow it. |
+| `FERROFIN_HTTPS_PORT` | `8920` | HTTPS port (parity value). Served beside the HTTP port when the dashboard's Networking settings enable HTTPS and the PKCS#12 (`.pfx`) certificate at their certificate path loads; see [HTTPS](#https). It outranks **Local HTTPS port number** on Dashboard → Networking, which outranks the `config.toml` key `https_port` unless it holds the default, `8920`. A change on the Networking page applies after a restart. When the Networking page gives both ports the same number, it sets neither (Jellyfin resets both to the defaults). |
 | `FERROFIN_PUBLISHED_URL` | auto-detect | Public base URL advertised to clients. |
 | `FERROFIN_BASE_URL` | none | URL path prefix the server is mounted under. It outranks **Base URL** on Dashboard → Networking, which outranks the `config.toml` key `base_url`. A blank value is set: it serves at the root and still outranks the Networking page. A change on the Networking page applies after a restart, and the dashboard shows the restart as pending. |
 | `FERROFIN_SERVER_NAME` | host name | Server name reported to clients. |
@@ -260,7 +260,7 @@ Ferrofin serves HTTPS itself, as Jellyfin does, from the dashboard's **Networkin
 
 - **Enable HTTPS** with a **Custom SSL certificate path** to a PKCS#12 (`.pfx`/`.p12`) file holding
   the certificate and its private key, plus its password if it has one. At startup the server
-  listens with HTTPS on `FERROFIN_HTTPS_PORT` on every address it listens with HTTP on.
+  listens with HTTPS on its HTTPS port on every address it listens with HTTP on.
   If the certificate does not load, the server logs why and serves HTTP only.
   A certificate without a password must use the usual empty-password form, as OpenSSL writes
   it. The rarer NULL-password form, which .NET loads, does not load yet (gl-815). To rewrite
@@ -274,9 +274,11 @@ Ferrofin serves HTTPS itself, as Jellyfin does, from the dashboard's **Networkin
   `X-Forwarded-Proto: https` counts as HTTPS.
 - A new certificate path takes effect after a restart; the dashboard shows the restart as
   pending. A path to a missing file saves but is answered `404`.
-- The ports are `FERROFIN_PORT` and `FERROFIN_HTTPS_PORT`; the port fields on the Networking
-  page are not read yet (gl-554). When both name the same port, HTTPS is not served and the
-  log says so.
+- The ports are the Networking page's **Local HTTP port number** and **Local HTTPS port
+  number**, below `FERROFIN_PORT` (or `--port`) and `FERROFIN_HTTPS_PORT` (see the table above).
+  An adopted Jellyfin install keeps its ports from its first boot, unless a flag or a variable
+  pins them (the container image sets `FERROFIN_PORT`). When a variable, a flag or
+  `config.toml` leaves both on the same port, HTTPS is not served and the log says so.
 - Adoption keeps Jellyfin's **Enable HTTPS** and **Require HTTPS**, but not its certificate
   path and password, which point into Jellyfin's filesystem.
 

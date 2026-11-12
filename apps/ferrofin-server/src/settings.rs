@@ -20,8 +20,8 @@
 //! (owner decision D1 of the settings-page milestone): one saved to
 //! `config.toml` underneath would not apply while it is set. A setting
 //! jellyfin-web's Networking page covers ([`SettingSpec::network`]) takes the
-//! page's saved value between the variable and `config.toml` (owner decision
-//! on gl-555).
+//! page's saved value between the variable and `config.toml` (owner decisions
+//! on gl-554 and gl-555).
 
 use std::path::Path;
 use std::sync::Arc;
@@ -374,9 +374,8 @@ pub static SETTINGS: &[SettingSpec] = &[
         },
         ..ROW
     },
-    // The port, HTTPS port and base URL notes name their key and variable
-    // (owner decision D2a) until the Networking page drives them: gl-554,
-    // gl-335 and gl-555 switch each note to that page.
+    // The port, HTTPS port and base URL notes name the Networking page that
+    // drives them (owner decisions on gl-554 and gl-555).
     SettingSpec {
         key: "port",
         env: Some("FERROFIN_PORT"),
@@ -386,13 +385,18 @@ pub static SETTINGS: &[SettingSpec] = &[
         group: Group::Network,
         kind: PORT,
         access: SettingAccess::ReadOnly(
-            "Set it with the port key in config.toml, the FERROFIN_PORT environment variable or \
-             the --port flag. The port on Dashboard → Networking is not read yet; it will take \
-             over.",
+            "Dashboard → Networking → Local HTTP port number sets it, and a change there applies \
+             after a restart. While that holds the default, 8096, the port key in config.toml \
+             does. The FERROFIN_PORT environment variable and the --port flag outrank both.",
         ),
         default: "8096",
         description: "HTTP port.",
         running: |c| json!(c.port),
+        network: |n| {
+            crate::listen::page_ports(n)
+                .0
+                .map_or(Value::Null, |port| json!(port))
+        },
         ..ROW
     },
     SettingSpec {
@@ -403,13 +407,18 @@ pub static SETTINGS: &[SettingSpec] = &[
         group: Group::Network,
         kind: PORT,
         access: SettingAccess::ReadOnly(
-            "Set it with the https_port key in config.toml or the FERROFIN_HTTPS_PORT \
-             environment variable. The HTTPS port on Dashboard → Networking is not read yet; it \
-             will take over.",
+            "Dashboard → Networking → Local HTTPS port number sets it, and a change there \
+             applies after a restart. While that holds the default, 8920, the https_port key in \
+             config.toml does. The FERROFIN_HTTPS_PORT environment variable outranks both.",
         ),
         default: "8920",
         description: "HTTPS port, served when Dashboard → Networking enables HTTPS.",
         running: |c| json!(c.https_port),
+        network: |n| {
+            crate::listen::page_ports(n)
+                .1
+                .map_or(Value::Null, |port| json!(port))
+        },
         ..ROW
     },
     SettingSpec {
