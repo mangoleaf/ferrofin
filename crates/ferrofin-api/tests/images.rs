@@ -633,7 +633,7 @@ impl UserManager for StubUsers {
         _user: &UserEntity,
         _remote_endpoint: Option<String>,
     ) -> Result<ferrofin_model::dto::UserDto, ServiceError> {
-        // No policy: the caller is not an administrator.
+        // The default policy: the caller is not an administrator.
         Ok(ferrofin_model::dto::UserDto::default())
     }
     async fn update_configuration(

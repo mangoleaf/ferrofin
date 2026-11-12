@@ -2568,9 +2568,16 @@ pub const VERIFIED: &[Verified] = &[
                user's rows for the device id in Id order, then Logout(Device) of each) and \
                session activity, and that upstream has no login rate limit. \
                The UserDto and SessionInfoDto \
-               builders are shared with other routes and not compared here",
+               builders are shared with other routes and not compared here; \
+               authentication_result's fallback User, compared on 2026-11-11 (gl-1106), \
+               carries new UserDto()'s policy, as UserPolicy.cs's constructor sets it",
         date: "2026-11-05",
         divergences: &[
+            "When the user cannot be reloaded once the token is minted (a database read error, or \
+         the user deleted in that moment), User is a bare DTO: the session's id, name and \
+         ServerId with new UserDto()'s configuration and policy, not the user's own. Upstream \
+         builds User from the in-memory user it already holds, which cannot fail there; the \
+         sign-in succeeds on both. Fix path: gl-1719.",
             "The 400 (no client identity, an empty username) and 500 bodies are Ferrofin's error \
          shape, not upstream's. Fix path: gl-666.",
             "MaxActiveSessions counts the user's sessions in the pool, as upstream \
@@ -2613,7 +2620,8 @@ pub const VERIFIED: &[Verified] = &[
         divergences: &[
             "The User member is built at the exchange, from the user as it is then, where \
          upstream returns the UserDto it snapshotted when the code was authorized, up to \
-         10 minutes stale (a user deleted meanwhile gets the bare id/name DTO); the \
+         10 minutes stale (a user deleted meanwhile gets the bare DTO: id, name, the \
+         session's ServerId and new UserDto()'s configuration and policy); the \
          session, token and ServerId are the stored ones on both. Jellyfin bug not \
          ported.",
             "The 404 (unknown or expired secret) body is Ferrofin's error shape, not \

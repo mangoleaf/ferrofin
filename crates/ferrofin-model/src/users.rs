@@ -355,7 +355,7 @@ pub struct UserPolicy {
 /// `true`, `LoginAttemptsBeforeLockout = -1` (unlimited) and `SyncPlayAccess =
 /// CreateAndJoinGroups`. The rest are the C# defaults: `false`, `0`, empty
 /// arrays, and `null` provider ids (`""`).
-fn constructor_policy() -> UserPolicy {
+pub(crate) fn constructor_policy() -> UserPolicy {
     UserPolicy {
         is_hidden: true,
         enable_user_preference_access: true,
