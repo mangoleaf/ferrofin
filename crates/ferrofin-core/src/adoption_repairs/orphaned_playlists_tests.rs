@@ -16,6 +16,7 @@ use super::remove_orphaned_playlists;
 use crate::FerrofinPlaylistManager;
 use crate::item_data::{
     allow_data_writes, fail_data_writes_of, json_guid, reconcile_playlist_permissions,
+    reimport_from_data,
 };
 use crate::test_support::{
     item_repository_over, library_manager_over, seed_item_with_data, seed_named_user, test_db,
@@ -93,7 +94,8 @@ async fn level(
 /// first share; a private one is deleted; an open-access one stays as it
 /// is. Playlists of a user who exists, and unowned ones (no owner, or the
 /// empty GUID), are left alone. The file is copied aside first, the result
-/// survives the boot re-import from `Data`, and the repair is marked done.
+/// is in `Data` too (the tables `Data` alone gives back are the same), and
+/// the repair is marked done.
 #[tokio::test]
 async fn orphaned_playlists_are_disposed_of_as_if_their_owner_had_just_been_deleted() {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -126,7 +128,7 @@ async fn orphaned_playlists_are_disposed_of_as_if_their_owner_had_just_been_dele
             .is_some(),
         "the copy taken first still holds the private playlist"
     );
-    for moment in ["after the repair", "after a restart"] {
+    for moment in ["after the repair", "from `Data` alone"] {
         assert_eq!(
             level(&mgr, shared, carol).await,
             Some(PlaylistAccessLevel::Owner),
@@ -152,9 +154,9 @@ async fn orphaned_playlists_are_disposed_of_as_if_their_owner_had_just_been_dele
             Some(PlaylistAccessLevel::Owner),
             "{moment}"
         );
-        reconcile_playlist_permissions(&db)
-            .await
-            .expect("boot re-import");
+        for playlist in [shared, read_only, public, bobs] {
+            reimport_from_data(&db, playlist).await;
+        }
     }
     let library = library_manager_over(db.clone());
     assert!(
