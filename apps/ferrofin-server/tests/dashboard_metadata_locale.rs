@@ -3508,10 +3508,12 @@ async fn verify_by_name_metadata_languages(
                 .get(&format!("/Items/{id}/RemoteImages?providerName=TheMovieDb"))
                 .await;
             let images = images["Images"].as_array().unwrap();
-            assert_eq!(images.len(), 3, "preferred/untagged/English: {images:?}");
+            assert_eq!(images.len(), 3, "preferred/English/untagged: {images:?}");
             assert_eq!(images[0]["Language"], image_tag);
             assert_eq!(images[0]["Width"], 1600);
-            assert!(images[1]["Language"].is_null() || images[1]["Language"] == "");
+            // Jellyfin 12's ladder: English (3) before untagged (2).
+            assert_eq!(images[1]["Language"], "en", "{images:?}");
+            assert!(images[2]["Language"].is_null() || images[2]["Language"] == "");
             let image = api
                 .client
                 .get(format!("{}/Items/{id}/Images/Primary", api.base))

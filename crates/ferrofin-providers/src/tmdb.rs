@@ -261,7 +261,13 @@ impl From<TmdbImage> for RemoteImage {
 /// remote-image chooser, retaining dimensions for automatic acquisition.
 #[must_use]
 pub fn ordered_download_images(mut images: Vec<TmdbImage>, requested: &str) -> Vec<RemoteImage> {
-    crate::provider_manager::order_tmdb_images(&mut images, requested);
+    ferrofin_model::extensions::order_by_language_descending(&mut images, requested, |image| {
+        (
+            image.language.as_deref(),
+            image.community_rating,
+            image.vote_count,
+        )
+    });
     images.into_iter().map(RemoteImage::from).collect()
 }
 
