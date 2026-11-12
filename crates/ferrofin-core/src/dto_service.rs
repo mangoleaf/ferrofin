@@ -8355,6 +8355,8 @@ mod tests {
                     start_position_ticks: 0,
                     name: Some("Opening".to_owned()),
                     image_path: Some("/meta/chapters/0.jpg".to_owned()),
+                    // An extracted image carries its file's date.
+                    image_date_modified: chrono::DateTime::UNIX_EPOCH,
                     ..ChapterInfo::default()
                 },
                 ChapterInfo {

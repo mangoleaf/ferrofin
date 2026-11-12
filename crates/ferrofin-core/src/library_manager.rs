@@ -2980,7 +2980,11 @@ impl LibraryManager for FerrofinLibraryManager {
         Ok(Some(ferrofin_traits::options::ItemImageInfo {
             path,
             image_type: ferrofin_model::entities::ImageType::Chapter,
-            date_modified: chapter.image_date_modified.unwrap_or_else(chrono::Utc::now),
+            // `GetValueOrDefault()` upstream: a NULL date is `MinValue`, the
+            // same date the chapter's DTO tag is computed from.
+            date_modified: chapter
+                .image_date_modified
+                .unwrap_or_else(ferrofin_model::json::datetime::dotnet_min),
             width: 0,
             height: 0,
             blur_hash: None,
@@ -5687,6 +5691,43 @@ mod tests {
             count(BaseItemKind::Movie).await,
             0,
             "the untouched movie library must not be scanned"
+        );
+    }
+
+    /// gl-1590: a chapter image whose row carries no date is served dated
+    /// `MinValue`, as upstream reads it (`GetValueOrDefault()`), not "now".
+    #[tokio::test]
+    async fn a_chapter_image_without_a_date_is_dated_min_value() {
+        use ferrofin_traits::persistence::ChapterRepository as _;
+        let db = test_db().await;
+        let item = Uuid::new_v4();
+        seed_item(&db, item, BaseItemKind::Movie).await;
+        let chapters = Arc::new(crate::chapter_repository::FerrofinChapterRepository::new(
+            db.clone(),
+        ));
+        chapters
+            .save_chapters(
+                item,
+                &[ferrofin_db::entities::base_items::ChapterEntity {
+                    item_id: item.to_string(),
+                    chapter_index: 0,
+                    start_position_ticks: 0,
+                    name: None,
+                    image_path: Some("/meta/chapters/0.jpg".to_owned()),
+                    image_date_modified: None,
+                }],
+            )
+            .await
+            .expect("save");
+        let mgr = manager(&db).with_chapters(chapters);
+        let image = mgr
+            .get_chapter_image(item, 0)
+            .await
+            .expect("image")
+            .expect("present");
+        assert_eq!(
+            image.date_modified,
+            ferrofin_model::json::datetime::dotnet_min()
         );
     }
 

@@ -120,9 +120,7 @@ impl MediaEncoder for HeldProbe {
                 .map(|start_position_ticks| ChapterInfo {
                     start_position_ticks,
                     name: Some("Chapter".to_owned()),
-                    image_path: None,
-                    image_date_modified: chrono::DateTime::UNIX_EPOCH,
-                    image_tag: None,
+                    ..ChapterInfo::default()
                 })
                 .collect(),
             ..MediaSourceInfo::default()
