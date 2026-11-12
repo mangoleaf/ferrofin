@@ -904,6 +904,14 @@ impl ferrofin_traits::collections::CollectionManager for StubCollections {
     ) -> Result<Option<BaseItemEntity>, ServiceError> {
         unimplemented!("stub")
     }
+
+    async fn resolve_box_set_folders(
+        &self,
+        _location: &str,
+        _folders: &[String],
+    ) -> Result<Option<Vec<Uuid>>, ServiceError> {
+        unimplemented!("stub")
+    }
 }
 
 /// The shared WAT fixture, re-identified (`id` must stay 36 chars) and

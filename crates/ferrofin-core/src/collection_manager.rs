@@ -498,6 +498,12 @@ pub struct FerrofinCollectionManager {
     /// One provision at a time: two first creates at once would otherwise each
     /// add a library (`Collections`, `Collections2`).
     provisioning: Arc<tokio::sync::Mutex<()>>,
+    /// Held while a create claims a box set folder until its row is stored,
+    /// and while a scan stores the box sets of the folders it found
+    /// ([`CollectionManager::resolve_box_set_folders`]): the scan would
+    /// otherwise store a row for a folder a create just made, and the
+    /// create's own row would then fail.
+    box_set_folders: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl std::fmt::Debug for FerrofinCollectionManager {
@@ -528,6 +534,7 @@ impl FerrofinCollectionManager {
             virtual_folders: None,
             virtual_paths: crate::virtual_paths::VirtualPathExpander::identity(),
             provisioning: Arc::default(),
+            box_set_folders: Arc::default(),
         }
     }
 
@@ -723,6 +730,7 @@ impl CollectionManager for FerrofinCollectionManager {
             _ => Vec::new(),
         };
         let parent = parent.map(|folder| folder.id);
+        let claim = self.box_set_folders.lock().await;
         let (path, id) =
             new_box_set_folder_and_id(&self.db, &mode, &collections, &options.name).await?;
         // `ReportFileSystemChangeBeginning(path)` around the whole create.
@@ -761,6 +769,7 @@ impl CollectionManager for FerrofinCollectionManager {
             }
             return Err(err);
         }
+        drop(claim);
         let row = self
             .library_manager
             .get_item_by_id(id)
@@ -988,6 +997,109 @@ impl CollectionManager for FerrofinCollectionManager {
             return Ok(None);
         };
         crate::item_persistence_service::container_row(&self.db, folder.id).await
+    }
+
+    async fn resolve_box_set_folders(
+        &self,
+        location: &str,
+        folders: &[String],
+    ) -> Result<Option<Vec<Uuid>>, ServiceError> {
+        // The folder box sets are made in, found as `create_collection`
+        // finds it but never provisioned: a scan resolves only that one,
+        // under the `Folder` `AddChild` gives a new box set as its parent.
+        let library = self.collections_library().await?;
+        let Some(folder) = library.find().await? else {
+            return Ok(None);
+        };
+        if folder.legacy
+            || !ferrofin_model::content_type_overrides::paths_equal(
+                &folder.path,
+                &self.virtual_paths.expand(location),
+            )
+        {
+            return Ok(None);
+        }
+        let (mode, _) = container_identity(&self.db, &self.paths).await?;
+        let owner = match &self.virtual_folders {
+            Some(virtual_folders) => library.library_at(virtual_folders.as_ref()).await?,
+            None => None,
+        };
+        let ancestors = library.ancestors(&folder, owner.as_ref());
+        let _claim = self.box_set_folders.lock().await;
+        let mut added = Vec::new();
+        for path in folders {
+            let Some(name) = crate::library_scan::box_set_name(path) else {
+                continue;
+            };
+            // Stored as `AddChild`'s save stores it (`ReverseVirtualPath`).
+            let stored = self.virtual_paths.reverse(path);
+            let Some(id) =
+                crate::item_type_lookup::derive_item_id_with(&mode, BaseItemKind::BoxSet, path)
+            else {
+                continue;
+            };
+            let held = async {
+                let at_path = crate::library_structure_repository::folder_at(
+                    &self.db,
+                    BaseItemKind::BoxSet,
+                    path,
+                    &stored,
+                )
+                .await?;
+                Ok::<_, ServiceError>(
+                    at_path.is_some()
+                        || crate::item_persistence_service::row_exists(&self.db, id).await?,
+                )
+            }
+            .await;
+            match held {
+                Ok(false) => {}
+                Ok(true) => continue,
+                Err(err) => {
+                    tracing::warn!(%err, path = %path, "could not look for the box set of a folder");
+                    continue;
+                }
+            }
+            // `BoxSetResolver.SetProviderIdFromPath`: the `tmdbid` its name carries.
+            let provider_ids = crate::resolvers::path_provider_ids(&BaseItemEntity {
+                type_: crate::item_type_lookup::stored_type_name(BaseItemKind::BoxSet)
+                    .unwrap_or_default()
+                    .to_owned(),
+                path: Some(path.clone()),
+                ..BaseItemEntity::default()
+            });
+            let written = async {
+                let mut tx = self.db.writer().begin().await.map_err(db_err)?;
+                crate::item_persistence_service::insert_named_item_in(
+                    &mut tx,
+                    id,
+                    BaseItemKind::BoxSet,
+                    &name,
+                    true,
+                    Some(folder.id),
+                    false,
+                )
+                .await?;
+                crate::item_persistence_service::set_item_path_in(&mut tx, id, &stored)
+                    .await
+                    .map_err(db_err)?;
+                crate::library_structure_repository::add_ancestors_in(&mut tx, id, &ancestors)
+                    .await?;
+                crate::item_persistence_service::set_provider_ids_in(&mut tx, id, &provider_ids)
+                    .await?;
+                tx.commit().await.map_err(db_err)
+            }
+            .await;
+            // One folder that cannot be stored does not keep the others, or
+            // the ones already stored, from the scan.
+            match written {
+                Ok(()) => added.push(id),
+                Err(err) => {
+                    tracing::warn!(%err, path = %path, "could not store the box set of a folder");
+                }
+            }
+        }
+        Ok(Some(added))
     }
 }
 
