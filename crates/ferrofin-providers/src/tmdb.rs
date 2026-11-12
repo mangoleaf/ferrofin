@@ -36,6 +36,30 @@ fn image_type_size(image_type: ImageType) -> crate::plugin_config::TmdbImageKind
         _ => TmdbImageKind::Poster,
     }
 }
+
+/// The TMDb size of the `ThumbnailUrl` preview of a poster, profile or still
+/// (all converted as `Primary`): `ThumbnailSizes["Primary"]`
+/// (`TmdbClientManager.cs:32-38`). Fixed upstream, not a plugin setting.
+const PRIMARY_THUMBNAIL_SIZE: &str = "w500";
+/// The preview size of a backdrop, including one returned as `Thumb`:
+/// `ThumbnailSizes["Backdrop"]`.
+const BACKDROP_THUMBNAIL_SIZE: &str = "w780";
+/// The preview size of a logo: `ThumbnailSizes["Logo"]`.
+const LOGO_THUMBNAIL_SIZE: &str = "w500";
+
+/// The size of the `ThumbnailUrl` preview a TMDb candidate of `family` carries:
+/// `ThumbnailSizes.GetValueOrDefault(type.ToString(), "")`, keyed by the type
+/// the converter was called with, before a languaged backdrop becomes a
+/// `Thumb` (`TmdbClientManager.cs:689`). An empty size is `GetUrl`'s
+/// `original`.
+fn thumbnail_size(family: ImageType) -> &'static str {
+    match family {
+        ImageType::Primary => PRIMARY_THUMBNAIL_SIZE,
+        ImageType::Backdrop | ImageType::Thumb => BACKDROP_THUMBNAIL_SIZE,
+        ImageType::Logo => LOGO_THUMBNAIL_SIZE,
+        _ => "original",
+    }
+}
 /// Jellyfin's built-in TMDB v3 API key, used when no user key is configured so
 /// artwork works out of the box. Verbatim port of `TmdbUtils.ApiKey`.
 const DEFAULT_API_KEY: &str = "4219e299c89411838049ab0dab19ebd5";
@@ -234,6 +258,9 @@ pub struct TmdbImage {
     pub image_type: ImageType,
     /// The full-resolution image URL.
     pub url: String,
+    /// A smaller preview of the image (`RemoteImageInfo.ThumbnailUrl`), when
+    /// the provider offers one.
+    pub thumbnail_url: Option<String>,
     /// The image width in pixels.
     pub width: Option<i32>,
     /// The image height in pixels.
@@ -261,7 +288,13 @@ impl From<TmdbImage> for RemoteImage {
 /// remote-image chooser, retaining dimensions for automatic acquisition.
 #[must_use]
 pub fn ordered_download_images(mut images: Vec<TmdbImage>, requested: &str) -> Vec<RemoteImage> {
-    crate::provider_manager::order_tmdb_images(&mut images, requested);
+    ferrofin_model::extensions::order_by_language_descending(&mut images, requested, |image| {
+        (
+            image.language.as_deref(),
+            image.community_rating,
+            image.vote_count,
+        )
+    });
     images.into_iter().map(RemoteImage::from).collect()
 }
 
@@ -1902,16 +1935,16 @@ impl TmdbClient {
         };
         let cfg = &cfg;
         let map = |images: Vec<CollectionImage>, kind: ImageType| {
+            let size = image_type_size(kind);
+            let original = cfg.is_original_size(size);
             images.into_iter().filter_map(move |image| {
-                let size = image_type_size(kind);
-                let scaled = cfg
-                    .image_size(size)
-                    .is_some_and(|size| !size.eq_ignore_ascii_case("original"));
+                let path = non_empty(image.file_path)?;
                 Some(TmdbImage {
                     image_type: kind,
-                    url: cfg.image_url(size, &non_empty(image.file_path)?),
-                    width: if scaled { None } else { image.width },
-                    height: if scaled { None } else { image.height },
+                    url: cfg.image_url(size, &path),
+                    thumbnail_url: Some(cfg.sized_image_url(thumbnail_size(kind), &path)),
+                    width: image.width.filter(|_| original),
+                    height: image.height.filter(|_| original),
                     community_rating: image.vote_average,
                     vote_count: image.vote_count,
                     language: get_image_language(
@@ -2093,6 +2126,9 @@ impl TmdbClient {
         // each call's iterator is lazy, so it must not consume the config.
         let cfg = &cfg;
         let map = |entries: Vec<ImageEntry>, image_type: ImageType| {
+            let size = image_type_size(image_type);
+            let original = cfg.is_original_size(size);
+            let thumbnail = thumbnail_size(image_type);
             entries.into_iter().filter_map(move |e| {
                 let path = e.file_path.filter(|p| !p.is_empty())?;
                 let language = get_image_language(
@@ -2109,9 +2145,10 @@ impl TmdbClient {
                 };
                 Some(TmdbImage {
                     image_type,
-                    url: cfg.image_url(image_type_size(image_type), &path),
-                    width: e.width,
-                    height: e.height,
+                    url: cfg.image_url(size, &path),
+                    thumbnail_url: Some(cfg.sized_image_url(thumbnail, &path)),
+                    width: e.width.filter(|_| original),
+                    height: e.height.filter(|_| original),
                     community_rating: e.vote_average,
                     vote_count: e.vote_count,
                     language,
@@ -2154,6 +2191,7 @@ impl TmdbClient {
                 "{}/tv/{series_tmdb_id}/season/{season_number}/images",
                 self.base_url
             ),
+            crate::plugin_config::TmdbImageKind::Poster,
             request_language,
         )
         .await
@@ -2174,6 +2212,7 @@ impl TmdbClient {
                 "{}/tv/{series_tmdb_id}/season/{season_number}/episode/{episode_number}/images",
                 self.base_url
             ),
+            crate::plugin_config::TmdbImageKind::Still,
             request_language,
         )
         .await
@@ -2181,9 +2220,15 @@ impl TmdbClient {
 
     /// The shared body of [`season_images`](Self::season_images) and
     /// [`episode_images`](Self::episode_images): fetch one TMDB `images`
-    /// document and take its posters and stills, both as `Primary`
-    /// (C# `ConvertPostersToRemoteImageInfo` / `ConvertStillsToRemoteImageInfo`).
-    async fn tv_images(&self, url: String, request_language: Option<&str>) -> Vec<TmdbImage> {
+    /// document and take its posters and stills, both as `Primary`, at the
+    /// size setting of the caller's `kind` (C# `ConvertPostersToRemoteImageInfo`
+    /// with `PosterSize` / `ConvertStillsToRemoteImageInfo` with `StillSize`).
+    async fn tv_images(
+        &self,
+        url: String,
+        kind: crate::plugin_config::TmdbImageKind,
+        request_language: Option<&str>,
+    ) -> Vec<TmdbImage> {
         // The TMDb settings page governs the key, the adult filter, the
         // cast/crew caps and the image sizes; read per call, the way
         // `Plugin.Instance.Configuration` is (`TmdbClientManager`).
@@ -2203,6 +2248,7 @@ impl TmdbClient {
         let Ok(parsed) = resp.counted_json::<ImagesResponse>().await else {
             return Vec::new();
         };
+        let original = cfg.is_original_size(kind);
         parsed
             .posters
             .into_iter()
@@ -2211,12 +2257,12 @@ impl TmdbClient {
                 let path = e.file_path.filter(|p| !p.is_empty())?;
                 Some(TmdbImage {
                     image_type: ImageType::Primary,
-                    // The settings-page size, not a hardcoded `original`: these
-                    // are posters and stills, so they take the same size arm
-                    // every other `Primary` image does.
-                    url: cfg.image_url(image_type_size(ImageType::Primary), &path),
-                    width: e.width,
-                    height: e.height,
+                    url: cfg.image_url(kind, &path),
+                    thumbnail_url: Some(
+                        cfg.sized_image_url(thumbnail_size(ImageType::Primary), &path),
+                    ),
+                    width: e.width.filter(|_| original),
+                    height: e.height.filter(|_| original),
                     community_rating: e.vote_average,
                     vote_count: e.vote_count,
                     language: get_image_language(
@@ -2607,22 +2653,21 @@ impl TmdbClient {
         let Some(person) = self.person_response(tmdb_id, language, &cfg).await else {
             return Vec::new();
         };
-        let scaled = cfg
-            .image_size(crate::plugin_config::TmdbImageKind::Profile)
-            .is_some_and(|size| !size.eq_ignore_ascii_case("original"));
+        let original = cfg.is_original_size(crate::plugin_config::TmdbImageKind::Profile);
         person
             .images
             .iter()
             .flat_map(|images| &images.profiles)
             .filter_map(|image| {
+                let path = non_empty(image.file_path.clone())?;
                 Some(TmdbImage {
                     image_type: ImageType::Primary,
-                    url: cfg.image_url(
-                        crate::plugin_config::TmdbImageKind::Profile,
-                        &non_empty(image.file_path.clone())?,
+                    url: cfg.image_url(crate::plugin_config::TmdbImageKind::Profile, &path),
+                    thumbnail_url: Some(
+                        cfg.sized_image_url(thumbnail_size(ImageType::Primary), &path),
                     ),
-                    width: if scaled { None } else { image.width },
-                    height: if scaled { None } else { image.height },
+                    width: image.width.filter(|_| original),
+                    height: image.height.filter(|_| original),
                     community_rating: image.vote_average,
                     vote_count: image.vote_count,
                     language: get_image_language(
@@ -2975,7 +3020,51 @@ mod tests {
             assert_eq!(collections[0].community_rating, Some(8.2));
             assert_eq!(profiles[0].vote_count, Some(3));
             assert_eq!(collections[0].vote_count, Some(3));
+            // The preview size is fixed per family, whatever the settings say.
+            let thumbnails = [&profiles[0], &collections[0], &collections[1]]
+                .map(|image| image.thumbnail_url.as_deref().unwrap());
+            assert_eq!(
+                thumbnails,
+                [
+                    "https://image.tmdb.org/t/p/w500/profile.jpg",
+                    "https://image.tmdb.org/t/p/w500/poster.jpg",
+                    "https://image.tmdb.org/t/p/w780/backdrop.jpg",
+                ]
+            );
         }
+    }
+
+    /// A season's posters take `PosterSize` and an episode's stills
+    /// `StillSize` (`ConvertPostersToRemoteImageInfo` /
+    /// `ConvertStillsToRemoteImageInfo`); only the scaled one loses its size.
+    #[tokio::test]
+    async fn season_posters_and_episode_stills_take_their_own_size() {
+        let server = crate::mock_http::MockServer::start(vec![
+            (
+                "/episode/2/images",
+                r#"{"stills":[{"file_path":"/s.jpg","width":1920}]}"#.to_owned(),
+            ),
+            (
+                "/season/1/images",
+                r#"{"posters":[{"file_path":"/p.jpg","width":1000}]}"#.to_owned(),
+            ),
+        ])
+        .await;
+        let client = TmdbClient::new().with_base_url(&server.base_url);
+        client.attach_plugin_manager(crate::plugin_config::tests_support::manager_with(
+            crate::builtin_plugins::TMDB.id,
+            br#"{"StillSize":"w300"}"#.to_vec(),
+        ));
+        let season = client.season_images(5, 1, None).await;
+        let episode = client.episode_images(5, 1, 2, None).await;
+        assert_eq!(
+            (season[0].url.as_str(), season[0].width),
+            ("https://image.tmdb.org/t/p/original/p.jpg", Some(1000))
+        );
+        assert_eq!(
+            (episode[0].url.as_str(), episode[0].width),
+            ("https://image.tmdb.org/t/p/w300/s.jpg", None)
+        );
     }
 
     /// `TmdbPersonImageProvider` labels profiles against the item's own

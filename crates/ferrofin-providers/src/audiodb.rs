@@ -281,6 +281,7 @@ impl AudioDbClient {
 fn push_image(out: &mut Vec<TmdbImage>, url: Option<String>, image_type: ImageType) {
     if let Some(url) = url.filter(|u| !u.trim().is_empty()) {
         out.push(TmdbImage {
+            thumbnail_url: None,
             image_type,
             url,
             width: None,

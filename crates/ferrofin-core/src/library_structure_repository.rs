@@ -410,3 +410,66 @@ pub(crate) async fn user_data_items(db: &Database, user: Uuid) -> Vec<String> {
         .await
         .expect("user data")
 }
+
+/// Test-only: makes every change of a `BaseItems` row's id fail while `on`.
+#[cfg(test)]
+pub(crate) async fn fail_item_rekeys(db: &Database, on: bool) {
+    let sql = if on {
+        r#"CREATE TRIGGER "fail_rekey" BEFORE UPDATE OF "Id" ON "BaseItems"
+           BEGIN SELECT RAISE(ABORT, 'disk full'); END"#
+    } else {
+        r#"DROP TRIGGER "fail_rekey""#
+    };
+    sqlx::query(sql)
+        .execute(db.writer())
+        .await
+        .expect("trigger");
+}
+
+/// Test-only: a `LinkedChildren` row, `parent` holding `child`.
+#[cfg(test)]
+pub(crate) async fn link_child(db: &Database, parent: Uuid, child: Uuid) {
+    sqlx::query(
+        r#"INSERT INTO "LinkedChildren" ("ParentId", "SortOrder", "ChildId", "ChildType")
+           VALUES (?1, 0, ?2, 0)"#,
+    )
+    .bind(guid_to_db(parent))
+    .bind(guid_to_db(child))
+    .execute(db.writer())
+    .await
+    .expect("link");
+}
+
+/// Test-only: every `LinkedChildren` row as `(ParentId, ChildId)`, those of
+/// `last` last.
+#[cfg(test)]
+pub(crate) async fn linked_children(db: &Database, last: Uuid) -> Vec<(String, String)> {
+    sqlx::query_as(r#"SELECT "ParentId", "ChildId" FROM "LinkedChildren" ORDER BY "ParentId" = ?1"#)
+        .bind(guid_to_db(last))
+        .fetch_all(db.pool())
+        .await
+        .expect("links")
+}
+
+/// Test-only: marks every user's row of `item` a favourite.
+#[cfg(test)]
+pub(crate) async fn favourite_item(db: &Database, item: Uuid) {
+    sqlx::query(r#"UPDATE "UserData" SET "IsFavorite" = 1 WHERE "ItemId" = ?1"#)
+        .bind(guid_to_db(item))
+        .execute(db.writer())
+        .await
+        .expect("favourite");
+}
+
+/// Test-only: `item`'s one user-data row as `(CustomDataKey, IsFavorite,
+/// Played)`.
+#[cfg(test)]
+pub(crate) async fn user_data_row(db: &Database, item: Uuid) -> (String, bool, bool) {
+    sqlx::query_as(
+        r#"SELECT "CustomDataKey", "IsFavorite", "Played" FROM "UserData" WHERE "ItemId" = ?1"#,
+    )
+    .bind(guid_to_db(item))
+    .fetch_one(db.pool())
+    .await
+    .expect("user data")
+}

@@ -561,6 +561,28 @@ pub(crate) async fn set_item_path_in(
     Ok(())
 }
 
+/// Stores `ids` as item `id`'s provider ids (`TrySetProviderId` for each),
+/// on a connection the caller holds.
+pub(crate) async fn set_provider_ids_in(
+    conn: &mut sqlx::SqliteConnection,
+    id: Uuid,
+    ids: &[(String, String)],
+) -> Result<(), ServiceError> {
+    for (provider, value) in ids {
+        sqlx::query(
+            r#"INSERT OR REPLACE INTO "BaseItemProviders"
+               ("ItemId", "ProviderId", "ProviderValue") VALUES (?1, ?2, ?3)"#,
+        )
+        .bind(guid_to_db(id))
+        .bind(provider)
+        .bind(value)
+        .execute(&mut *conn)
+        .await
+        .map_err(db_err)?;
+    }
+    Ok(())
+}
+
 /// The id of the container row stored at `path`, or `None`.
 ///
 /// **Matched by exact path**, the way `CollectionManager.EnsureLibraryFolder`
@@ -1747,10 +1769,10 @@ impl FerrofinItemPersistenceService {
     /// its permissions, in the same writer transaction
     /// ([`crate::item_data::sync_saved_playlist_in`]): the
     /// row the caller saves was read earlier, and its copy of those keys must
-    /// not undo a share change committed since, which the next boot's
-    /// re-import from `Data` would make real. A scan's save of a playlist
-    /// without a `FerrofinPlaylists` row first imports one from the `Data` it
-    /// wrote ([`crate::item_data::import_playlist_meta_if_missing_in`]).
+    /// not undo, in `Data`, a share change committed since (`Data` stays an
+    /// exact copy of the tables, [`crate::item_data`]). A scan's save of a
+    /// playlist without a `FerrofinPlaylists` row first imports one from the
+    /// `Data` it wrote ([`crate::item_data::import_playlist_meta_if_missing_in`]).
     ///
     /// The `Path` written is the stored one when that is a virtual-path form
     /// of the item's ([`Self::stored_virtual_path`]).
@@ -2336,6 +2358,17 @@ impl ItemPersistenceService for FerrofinItemPersistenceService {
             .map_err(db_err)?;
         let closure: Vec<String> = deletion_closure_rows(&mut tx, &given).await?;
         detach_user_data(&mut tx, &closure).await?;
+        // The persons the closure credits, read before the delete cascades
+        // their credit rows away (upstream `:147`); those left with no credit
+        // go after it (`:154`).
+        let credited: Vec<String> = sqlx::query_scalar(CLOSURE_CREDITS_SQL)
+            .bind(
+                serde_json::to_string(&closure)
+                    .map_err(|e| ServiceError::Backend(e.to_string()))?,
+            )
+            .fetch_all(&mut *tx)
+            .await
+            .map_err(db_err)?;
         // A playlist or collection that loses a member needs no `Data`
         // re-sync: 12.0 keeps membership out of `Data` (`[JsonIgnore]`), and
         // the playlist keys it does hold are not changed by a delete.
@@ -2375,6 +2408,7 @@ impl ItemPersistenceService for FerrofinItemPersistenceService {
             .execute(&mut *tx)
             .await
             .map_err(db_err)?;
+        crate::people_repository::delete_credits_without_mapping(&mut tx, &credited).await?;
         tx.commit().await.map_err(db_err)?;
         note_written(&self.db, &closure, false);
         Ok(closure
@@ -4434,7 +4468,14 @@ pub(crate) async fn rekey_rows_at(
     if moves.is_empty() {
         return Ok(Vec::new());
     }
-    let mut tx = db.writer().begin().await.map_err(db_err)?;
+    // Reserve the writer before reading the schema: a deferred transaction
+    // fails at its first write when another process (the previous version,
+    // during a rolling update) commits in between.
+    let mut tx = db
+        .writer()
+        .begin_with("BEGIN IMMEDIATE")
+        .await
+        .map_err(db_err)?;
     // Every reference moves inside the one transaction; the foreign
     // keys are checked once, at its end, against the moved rows.
     sqlx::query("PRAGMA defer_foreign_keys = ON")
@@ -6713,6 +6754,12 @@ pub(crate) const DEAD_BY_NAME_ARTISTS_SQL: &str = r#"SELECT b."Id" FROM "BaseIte
 pub(crate) const PRUNE_ORPHAN_ITEM_VALUES_SQL: &str = r#"DELETE FROM "ItemValues"
    WHERE NOT EXISTS (SELECT 1 FROM "ItemValuesMap" AS m
                       WHERE m."ItemValueId" = "ItemValues"."ItemValueId")"#;
+
+/// The distinct persons credited on a deletion closure (`?1`, a JSON array
+/// of ids), each item's credits sought by its id; `EXPLAIN QUERY PLAN` pinned
+/// by `the_closure_credits_read_seeks_each_items_credits`.
+const CLOSURE_CREDITS_SQL: &str = r#"SELECT DISTINCT "PeopleId" FROM "PeopleBaseItemMap"
+   WHERE "ItemId" IN (SELECT value FROM json_each(?1))"#;
 
 /// The ids of the `item_type` rows never refreshed (`DateLastRefreshed`
 /// unset), in id order — `PeopleValidator`'s new person items.
@@ -12095,6 +12142,76 @@ mod tests {
         assert_eq!(left, 0);
     }
 
+    /// `ItemPersistencePeopleCleanupTests.DeleteItem_RemovesUnusedPeopleForItemsDescendantsAndExtras`
+    /// (v12.4): the person rows only the closure credited (the item, its child
+    /// and the child's extra) go with it. A person another item still credits
+    /// stays, and so does an unrelated one with no credit, which only the
+    /// "Refresh People" task sweeps.
+    #[tokio::test]
+    async fn delete_items_removes_the_person_rows_only_the_closure_credited() {
+        use crate::people_repository::{seed_credit, seed_people_row};
+        let db = test_db().await;
+        let svc = FerrofinItemPersistenceService::new(db.clone());
+        let ids: Vec<Uuid> = (0..6).map(|_| Uuid::new_v4()).collect();
+        let (parent, child, extra, survivor, shared, orphan) =
+            (ids[0], ids[1], ids[2], ids[3], ids[4], ids[5]);
+        seed_item(&db, parent, BaseItemKind::Folder).await;
+        for (id, parent_id, owner) in [
+            (child, Some(parent), None),
+            (extra, None, Some(child)),
+            (survivor, None, None),
+        ] {
+            seed_item(&db, id, BaseItemKind::Book).await;
+            let mut row = crate::test_support::fetch_item(&db, id).await;
+            row.parent_id = parent_id.map(guid_to_db);
+            row.owner_id = owner.map(guid_to_db);
+            crate::test_support::save_item(&db, &row).await;
+        }
+        for (item, name) in [
+            (parent, "Parent credit"),
+            (child, "Child credit"),
+            (extra, "Extra credit"),
+        ] {
+            seed_credit(&db, item, Uuid::new_v4(), name).await;
+        }
+        seed_credit(&db, child, shared, "Shared person").await;
+        sqlx::query(
+            r#"INSERT INTO "PeopleBaseItemMap" ("ItemId", "PeopleId", "Role") VALUES (?1, ?2, '')"#,
+        )
+        .bind(guid_to_db(survivor))
+        .bind(guid_to_db(shared))
+        .execute(db.writer())
+        .await
+        .expect("shared credit");
+        seed_people_row(&db, orphan, "Unrelated orphan", "Actor").await;
+
+        svc.delete_items(&[parent]).await.expect("delete");
+
+        let items: Vec<String> =
+            sqlx::query_scalar(r#"SELECT "Id" FROM "BaseItems" WHERE "Id" IN (?1, ?2, ?3, ?4)"#)
+                .bind(guid_to_db(parent))
+                .bind(guid_to_db(child))
+                .bind(guid_to_db(extra))
+                .bind(guid_to_db(survivor))
+                .fetch_all(db.pool())
+                .await
+                .expect("items");
+        assert_eq!(items, [guid_to_db(survivor)]);
+        let maps: Vec<String> = sqlx::query_scalar(r#"SELECT "ItemId" FROM "PeopleBaseItemMap""#)
+            .fetch_all(db.pool())
+            .await
+            .expect("maps");
+        assert_eq!(maps, [guid_to_db(survivor)]);
+        let mut people: Vec<String> = sqlx::query_scalar(r#"SELECT "Id" FROM "Peoples""#)
+            .fetch_all(db.pool())
+            .await
+            .expect("people");
+        people.sort();
+        let mut expected = vec![guid_to_db(shared), guid_to_db(orphan)];
+        expected.sort();
+        assert_eq!(people, expected);
+    }
+
     /// The rating-level repair (Jellyfin `MigrateRatingLevels`):
     /// every row's inherited rating columns are recomputed from its OWN
     /// `OfficialRating` through `GetRatingScore` — a bare age, a US table
@@ -13085,6 +13202,23 @@ mod tests {
         assert!(
             !plan.iter().any(|s| s.starts_with("SCAN m")),
             "never a scan of the maps, got: {plan:?}"
+        );
+    }
+
+    /// The credits read before a deletion seeks each closure item's credit
+    /// rows by `ItemId`, never a scan of every credit in the library.
+    #[tokio::test]
+    async fn the_closure_credits_read_seeks_each_items_credits() {
+        let db = test_db().await;
+        let plan = query_plan(&db, super::CLOSURE_CREDITS_SQL, 1).await;
+        assert!(
+            plan.iter()
+                .any(|s| s.starts_with("SEARCH PeopleBaseItemMap") && s.contains("(ItemId=?)")),
+            "the credits sought by ItemId, got: {plan:?}"
+        );
+        assert!(
+            !plan.iter().any(|s| s.starts_with("SCAN PeopleBaseItemMap")),
+            "never a scan of the credits, got: {plan:?}"
         );
     }
 

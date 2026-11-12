@@ -34,6 +34,7 @@ use ferrofin_model::playlists::{
 use uuid::Uuid;
 
 use crate::error::ServiceError;
+use crate::persistence::PlaylistMembers;
 
 /// The options for creating a collection (box set).
 ///
@@ -108,6 +109,18 @@ pub trait CollectionManager: Send + Sync {
         &self,
         create_if_needed: bool,
     ) -> Result<Option<BaseItemEntity>, ServiceError>;
+
+    /// `BoxSetResolver` for a scan of the library location `location`: stores
+    /// a box set for each of `folders` (the `[boxset]` and `collection.xml`
+    /// folders the scan found directly in it) that no box set holds yet, as
+    /// the resolver and `Folder.AddChild` would, and returns the ids stored.
+    /// `None` when `location` is not the folder box sets are created in, which
+    /// is the only one resolved.
+    async fn resolve_box_set_folders(
+        &self,
+        location: &str,
+        folders: &[String],
+    ) -> Result<Option<Vec<Uuid>>, ServiceError>;
 }
 
 fn _assert_object_safe_collection_manager(_: &dyn CollectionManager) {}
@@ -186,7 +199,8 @@ pub trait PlaylistManager: Send + Sync {
     /// C# update path.
     async fn update_playlist(&self, request: &PlaylistUpdateRequest) -> Result<(), ServiceError>;
 
-    /// Gets the member items of a playlist, in playlist order.
+    /// Gets the members of a playlist: each distinct member row once, and the
+    /// entries in playlist order.
     ///
     /// Ports the read behind `PlaylistsController.GetPlaylistItems`; the C#
     /// `playlist.GetManageableItems()` walk over the playlist's children becomes
@@ -195,7 +209,7 @@ pub trait PlaylistManager: Send + Sync {
         &self,
         playlist_id: Uuid,
         user_id: Uuid,
-    ) -> Result<Vec<BaseItemEntity>, ServiceError>;
+    ) -> Result<PlaylistMembers, ServiceError>;
 
     /// The ids of the members [`get_playlist_items`](Self::get_playlist_items)
     /// lists, in playlist order, repeats kept, without its access check: the

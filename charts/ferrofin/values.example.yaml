@@ -177,6 +177,10 @@ ferrofin:
     # MaxCachedRecords) or after this many idle seconds (default 300).
     # FERROFIN_SCAN_DIRECTORY_CACHE_RECORDS: "100000"
     # FERROFIN_SCAN_DIRECTORY_CACHE_IDLE_SECS: "300"
+    # A comic book's runtime is its page count, read from its archive's directory;
+    # an archive with more entries than this is not counted (1000-10000000,
+    # default 100000).
+    # FERROFIN_BOOK_ARCHIVE_MAX_ENTRIES: "100000"
     # Seconds a resolved access token, and a user's permissions with the libraries'
     # rows and options and whether a Live TV tuner exists, are served from memory
     # (5-300, default 30 each). Changes made through the server apply at once; these

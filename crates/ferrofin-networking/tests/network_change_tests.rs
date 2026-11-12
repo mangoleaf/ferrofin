@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use ferrofin_model::net::{IpData, IpNetwork};
 use ferrofin_networking::network_change::{self, NETWORK_CHANGE_DELAY, NetworkChange};
-use ferrofin_networking::{InterfaceEnumerator, NetworkConfiguration, NetworkManager};
+use ferrofin_networking::{InterfaceEnumerator, NetworkConfiguration, NetworkManager, NullLogger};
 use tokio::sync::mpsc::unbounded_channel;
 
 fn interface(address: &str, prefix: u8, name: &str, index: i32) -> IpData {
@@ -73,8 +73,11 @@ fn addresses(list: &[&str]) -> Vec<IpAddr> {
 #[test]
 fn a_network_change_reads_the_interfaces_again_and_reapplies_the_bind_settings() {
     let host = FakeHost::with(vec![interface("192.168.1.2", 24, "eth0", 2)]);
-    let mut manager =
-        NetworkManager::live_with_enumerator(NetworkConfiguration::default(), host.enumerator());
+    let mut manager = NetworkManager::live_with_enumerator(
+        NetworkConfiguration::default(),
+        host.enumerator(),
+        Arc::new(NullLogger),
+    );
     assert_eq!(bind_addresses(&manager), addresses(&["192.168.1.2"]));
 
     // A VPN comes up, a container's veth appears, and an IPv6 address the
@@ -114,7 +117,8 @@ fn a_network_change_applies_the_bind_addresses_to_the_new_interfaces() {
         ..NetworkConfiguration::default()
     };
     let host = FakeHost::with(vec![interface("192.168.1.2", 24, "eth0", 2)]);
-    let mut manager = NetworkManager::live_with_enumerator(config, host.enumerator());
+    let mut manager =
+        NetworkManager::live_with_enumerator(config, host.enumerator(), Arc::new(NullLogger));
     assert_eq!(bind_addresses(&manager), Vec::<IpAddr>::new());
 
     host.set(vec![
@@ -137,7 +141,8 @@ fn a_network_change_leaves_the_published_overrides_unless_the_host_lacks_ipv6() 
         ..NetworkConfiguration::default()
     };
     let host = FakeHost::with(vec![interface("192.168.1.2", 24, "eth0", 2)]);
-    let mut manager = NetworkManager::live_with_enumerator(config, host.enumerator());
+    let mut manager =
+        NetworkManager::live_with_enumerator(config, host.enumerator(), Arc::new(NullLogger));
     assert_eq!(manager.published_server_urls(), []);
 
     host.set(vec![
@@ -179,6 +184,7 @@ fn start_monitor(
     let manager = Arc::new(RwLock::new(NetworkManager::live_with_enumerator(
         NetworkConfiguration::default(),
         host.enumerator(),
+        Arc::new(NullLogger),
     )));
     let (changes, source) = unbounded_channel();
     let task = tokio::spawn(network_change::monitor(

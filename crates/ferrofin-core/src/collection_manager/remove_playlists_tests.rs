@@ -10,7 +10,7 @@ use ferrofin_traits::collections::{PlaylistAccessLevel, PlaylistManager};
 use ferrofin_traits::error::ServiceError;
 use uuid::Uuid;
 
-use crate::item_data::{json_guid, reconcile_playlist_permissions};
+use crate::item_data::{json_guid, reconcile_playlist_permissions, reimport_from_data};
 use crate::test_support::{
     item_repository_over, library_manager_over, seed_item, seed_item_with_data, seed_named_user,
     test_db,
@@ -84,8 +84,8 @@ async fn level(
 /// A shared playlist goes to its editing share, whose share row goes; a
 /// private one is deleted (its member is not); an open-access one with no
 /// share stays; another user's playlist shared with the deleted user is
-/// left alone, the deleted user's share included. The hand-over survives
-/// the boot re-import of the owners and shares from `Data`.
+/// left alone, the deleted user's share included. The hand-over is in
+/// `Data` too: the tables `Data` alone gives back are the same.
 #[tokio::test]
 async fn removing_an_owner_hands_over_shared_playlists_and_deletes_private_ones() {
     let db = test_db().await;
@@ -145,9 +145,9 @@ async fn removing_an_owner_hands_over_shared_playlists_and_deletes_private_ones(
             vec![PlaylistUserPermissions::new(alice, true)],
             "and the deleted user's share on it {moment}"
         );
-        reconcile_playlist_permissions(&db)
-            .await
-            .expect("boot re-import");
+        for playlist in [shared, public, bobs] {
+            reimport_from_data(&db, playlist).await;
+        }
     }
     let library = library_manager_over(db.clone());
     assert!(
