@@ -251,7 +251,13 @@ impl TmdbConfig {
     /// already begins with `/`.
     #[must_use]
     pub fn image_url(&self, kind: TmdbImageKind, path: &str) -> String {
-        let size = self.image_size(kind).unwrap_or("original");
+        self.sized_image_url(self.image_size(kind).unwrap_or("original"), path)
+    }
+
+    /// The absolute CDN URL for a TMDb-relative image `path` at the size
+    /// segment `size`, whatever the settings page says.
+    #[must_use]
+    pub fn sized_image_url(&self, size: &str, path: &str) -> String {
         let root = self.image_root.as_deref().unwrap_or(TMDB_IMAGE_ROOT);
         format!("{root}/{size}{path}")
     }

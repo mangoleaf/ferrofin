@@ -3971,6 +3971,7 @@ impl LocalProviderManager {
                 .map(|img| RemoteImageInfo {
                     provider_name: Some(source.name().to_owned()),
                     url: Some(img.url),
+                    thumbnail_url: img.thumbnail_url,
                     width: img.width,
                     height: img.height,
                     community_rating: img.community_rating,
@@ -4392,6 +4393,7 @@ fn entity_name(entity: &BaseItemEntity) -> Option<&str> {
 /// A type + URL image with no size/rating/language metadata.
 fn plain_image(image_type: ImageType, url: String) -> TmdbImage {
     TmdbImage {
+        thumbnail_url: None,
         image_type,
         url,
         width: None,

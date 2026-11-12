@@ -36,6 +36,30 @@ fn image_type_size(image_type: ImageType) -> crate::plugin_config::TmdbImageKind
         _ => TmdbImageKind::Poster,
     }
 }
+
+/// The TMDb size of the `ThumbnailUrl` preview of a poster, profile or still
+/// (all converted as `Primary`): `ThumbnailSizes["Primary"]`
+/// (`TmdbClientManager.cs:32-38`). Fixed upstream, not a plugin setting.
+const PRIMARY_THUMBNAIL_SIZE: &str = "w500";
+/// The preview size of a backdrop, including one returned as `Thumb`:
+/// `ThumbnailSizes["Backdrop"]`.
+const BACKDROP_THUMBNAIL_SIZE: &str = "w780";
+/// The preview size of a logo: `ThumbnailSizes["Logo"]`.
+const LOGO_THUMBNAIL_SIZE: &str = "w500";
+
+/// The size of the `ThumbnailUrl` preview a TMDb candidate of `family` carries:
+/// `ThumbnailSizes.GetValueOrDefault(type.ToString(), "")`, keyed by the type
+/// the converter was called with, before a languaged backdrop becomes a
+/// `Thumb` (`TmdbClientManager.cs:689`). An empty size is `GetUrl`'s
+/// `original`.
+fn thumbnail_size(family: ImageType) -> &'static str {
+    match family {
+        ImageType::Primary => PRIMARY_THUMBNAIL_SIZE,
+        ImageType::Backdrop | ImageType::Thumb => BACKDROP_THUMBNAIL_SIZE,
+        ImageType::Logo => LOGO_THUMBNAIL_SIZE,
+        _ => "original",
+    }
+}
 /// Jellyfin's built-in TMDB v3 API key, used when no user key is configured so
 /// artwork works out of the box. Verbatim port of `TmdbUtils.ApiKey`.
 const DEFAULT_API_KEY: &str = "4219e299c89411838049ab0dab19ebd5";
@@ -234,6 +258,9 @@ pub struct TmdbImage {
     pub image_type: ImageType,
     /// The full-resolution image URL.
     pub url: String,
+    /// A smaller preview of the image (`RemoteImageInfo.ThumbnailUrl`), when
+    /// the provider offers one.
+    pub thumbnail_url: Option<String>,
     /// The image width in pixels.
     pub width: Option<i32>,
     /// The image height in pixels.
@@ -1905,9 +1932,11 @@ impl TmdbClient {
             let size = image_type_size(kind);
             let original = cfg.is_original_size(size);
             images.into_iter().filter_map(move |image| {
+                let path = non_empty(image.file_path)?;
                 Some(TmdbImage {
                     image_type: kind,
-                    url: cfg.image_url(size, &non_empty(image.file_path)?),
+                    url: cfg.image_url(size, &path),
+                    thumbnail_url: Some(cfg.sized_image_url(thumbnail_size(kind), &path)),
                     width: image.width.filter(|_| original),
                     height: image.height.filter(|_| original),
                     community_rating: image.vote_average,
@@ -2093,6 +2122,7 @@ impl TmdbClient {
         let map = |entries: Vec<ImageEntry>, image_type: ImageType| {
             let size = image_type_size(image_type);
             let original = cfg.is_original_size(size);
+            let thumbnail = thumbnail_size(image_type);
             entries.into_iter().filter_map(move |e| {
                 let path = e.file_path.filter(|p| !p.is_empty())?;
                 let language = get_image_language(
@@ -2110,6 +2140,7 @@ impl TmdbClient {
                 Some(TmdbImage {
                     image_type,
                     url: cfg.image_url(size, &path),
+                    thumbnail_url: Some(cfg.sized_image_url(thumbnail, &path)),
                     width: e.width.filter(|_| original),
                     height: e.height.filter(|_| original),
                     community_rating: e.vote_average,
@@ -2221,6 +2252,9 @@ impl TmdbClient {
                 Some(TmdbImage {
                     image_type: ImageType::Primary,
                     url: cfg.image_url(kind, &path),
+                    thumbnail_url: Some(
+                        cfg.sized_image_url(thumbnail_size(ImageType::Primary), &path),
+                    ),
                     width: e.width.filter(|_| original),
                     height: e.height.filter(|_| original),
                     community_rating: e.vote_average,
@@ -2619,11 +2653,12 @@ impl TmdbClient {
             .iter()
             .flat_map(|images| &images.profiles)
             .filter_map(|image| {
+                let path = non_empty(image.file_path.clone())?;
                 Some(TmdbImage {
                     image_type: ImageType::Primary,
-                    url: cfg.image_url(
-                        crate::plugin_config::TmdbImageKind::Profile,
-                        &non_empty(image.file_path.clone())?,
+                    url: cfg.image_url(crate::plugin_config::TmdbImageKind::Profile, &path),
+                    thumbnail_url: Some(
+                        cfg.sized_image_url(thumbnail_size(ImageType::Primary), &path),
                     ),
                     width: image.width.filter(|_| original),
                     height: image.height.filter(|_| original),
@@ -2979,6 +3014,17 @@ mod tests {
             assert_eq!(collections[0].community_rating, Some(8.2));
             assert_eq!(profiles[0].vote_count, Some(3));
             assert_eq!(collections[0].vote_count, Some(3));
+            // The preview size is fixed per family, whatever the settings say.
+            let thumbnails = [&profiles[0], &collections[0], &collections[1]]
+                .map(|image| image.thumbnail_url.as_deref().unwrap());
+            assert_eq!(
+                thumbnails,
+                [
+                    "https://image.tmdb.org/t/p/w500/profile.jpg",
+                    "https://image.tmdb.org/t/p/w500/poster.jpg",
+                    "https://image.tmdb.org/t/p/w780/backdrop.jpg",
+                ]
+            );
         }
     }
 

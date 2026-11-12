@@ -1,7 +1,9 @@
 //! TMDb's "Choose Image" candidates, end to end over real HTTP: each image
 //! family takes its own size from the TMDb settings page, and a scaled size
 //! drops TMDb's dimensions, which describe the original file
-//! (`TmdbClientManager.ConvertToRemoteImageInfo`, `TmdbUtils.IsOriginalImageSize`).
+//! (`TmdbClientManager.ConvertToRemoteImageInfo`, `TmdbUtils.IsOriginalImageSize`);
+//! each candidate also carries a preview at its family's fixed size
+//! (`ThumbnailUrl`, `TmdbClientManager.ThumbnailSizes`).
 //!
 //! Boots the real server ([`ferrofin_server::run`]) over a one-episode library
 //! whose series carries a Tmdb id in its folder name, with TMDb answered by an
@@ -82,6 +84,25 @@ struct Api {
 }
 
 impl Api {
+    /// Signs in as the seeded admin.
+    async fn login(client: reqwest::Client, base: String) -> Self {
+        let login: Value = client
+            .post(format!("{base}/Users/AuthenticateByName"))
+            .header("Authorization", CLIENT)
+            .json(&json!({"Username":"admin","Pw":""}))
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let token = login["AccessToken"].as_str().unwrap();
+        let auth = format!("{CLIENT}, Token=\"{token}\"");
+        Self { client, base, auth }
+    }
+
     async fn get(&self, path: &str) -> Value {
         self.client
             .get(format!("{}{path}", self.base))
@@ -128,9 +149,8 @@ impl Api {
         }
     }
 
-    /// TMDb's candidates for `id`: each one's type, URL (relative to the image
-    /// root) and dimensions.
-    async fn tmdb_images(&self, id: &str) -> Vec<(String, String, Option<i64>, Option<i64>)> {
+    /// TMDb's candidates for `id`.
+    async fn tmdb_images(&self, id: &str) -> Vec<Candidate> {
         let images = self.get(&format!("/Items/{id}/RemoteImages")).await;
         images["Images"]
             .as_array()
@@ -138,14 +158,14 @@ impl Api {
             .iter()
             .filter(|image| image["ProviderName"] == "TheMovieDb")
             .map(|image| {
+                let relative = |url: &Value| {
+                    url.as_str()
+                        .map(|url| url.strip_prefix(OFFLINE_PROVIDER_URL).unwrap().to_owned())
+                };
                 (
                     image["Type"].as_str().unwrap().to_owned(),
-                    image["Url"]
-                        .as_str()
-                        .unwrap()
-                        .strip_prefix(OFFLINE_PROVIDER_URL)
-                        .unwrap()
-                        .to_owned(),
+                    relative(&image["Url"]).unwrap(),
+                    relative(&image["ThumbnailUrl"]),
                     image["Width"].as_i64(),
                     image["Height"].as_i64(),
                 )
@@ -154,14 +174,15 @@ impl Api {
     }
 }
 
-fn image(
-    kind: &str,
-    url: &str,
-    size: Option<(i64, i64)>,
-) -> (String, String, Option<i64>, Option<i64>) {
+/// One candidate: its type, its URL and preview URL (relative to the image
+/// root), and its dimensions.
+type Candidate = (String, String, Option<String>, Option<i64>, Option<i64>);
+
+fn image(kind: &str, url: &str, thumbnail: &str, size: Option<(i64, i64)>) -> Candidate {
     (
         kind.to_owned(),
         url.to_owned(),
+        Some(thumbnail.to_owned()),
         size.map(|(width, _)| width),
         size.map(|(_, height)| height),
     )
@@ -199,28 +220,7 @@ async fn tmdb_candidates_follow_each_familys_size_setting() {
         ..Config::test_stub(tmp.path())
     })
     .await;
-    let mut api = Api {
-        client,
-        base,
-        auth: CLIENT.to_owned(),
-    };
-    let login: Value = api
-        .client
-        .post(format!("{}/Users/AuthenticateByName", api.base))
-        .header("Authorization", CLIENT)
-        .json(&json!({"Username":"admin","Pw":""}))
-        .send()
-        .await
-        .unwrap()
-        .error_for_status()
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
-    api.auth = format!(
-        "{CLIENT}, Token=\"{}\"",
-        login["AccessToken"].as_str().unwrap()
-    );
+    let api = Api::login(client, base).await;
 
     // No fetcher: the scan asks TMDb nothing, and the chooser asks every
     // provider whatever the library enables (`IncludeDisabledProviders`).
@@ -259,18 +259,38 @@ async fn tmdb_candidates_follow_each_familys_size_setting() {
         ],
         [
             // A backdrop with text comes back as a Thumb, ranked first for
-            // being in the preferred language, and keeps the backdrop size.
+            // being in the preferred language, and keeps the backdrop sizes.
             vec![
-                image("Thumb", "/w1280/text.jpg", None),
-                image("Primary", "/original/poster.jpg", Some((2000, 3000))),
-                image("Backdrop", "/w1280/backdrop.jpg", None),
-                image("Logo", "/original/logo.png", Some((800, 300))),
+                image("Thumb", "/w1280/text.jpg", "/w780/text.jpg", None),
+                image(
+                    "Primary",
+                    "/original/poster.jpg",
+                    "/w500/poster.jpg",
+                    Some((2000, 3000)),
+                ),
+                image(
+                    "Backdrop",
+                    "/w1280/backdrop.jpg",
+                    "/w780/backdrop.jpg",
+                    None
+                ),
+                image(
+                    "Logo",
+                    "/original/logo.png",
+                    "/w500/logo.png",
+                    Some((800, 300)),
+                ),
             ],
             // A season's posters take the poster size, not the still size.
-            vec![image("Primary", "/original/season.jpg", Some((1000, 1500)))],
+            vec![image(
+                "Primary",
+                "/original/season.jpg",
+                "/w500/season.jpg",
+                Some((1000, 1500)),
+            )],
             // An episode's stills take the still size
             // (`ConvertStillsToRemoteImageInfo`).
-            vec![image("Primary", "/w300/still.jpg", None)],
+            vec![image("Primary", "/w300/still.jpg", "/w500/still.jpg", None)],
         ]
     );
 
