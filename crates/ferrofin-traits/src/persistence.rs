@@ -728,7 +728,12 @@ pub trait ItemRepository: Send + Sync {
         Ok(self.get_query_filters_legacy(filter).await?.tags)
     }
 
-    /// Reports whether all children of `id` are played for the given user.
+    /// Reports whether everything under `id` is played for the given user, as
+    /// v12.4 `GetIsPlayed` (`Folder.IsPlayed`): with `recursive`, every
+    /// non-folder, non-virtual descendant through the `AncestorIds` closure
+    /// and `LinkedChildren`; without, every direct child. An item counts as
+    /// played when any version of its version group is; nothing is
+    /// access-filtered.
     async fn get_is_played(
         &self,
         user: &UserEntity,

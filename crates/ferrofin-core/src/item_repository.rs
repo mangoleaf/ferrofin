@@ -4590,31 +4590,23 @@ impl ItemRepository for FerrofinItemRepository {
         id: Uuid,
         recursive: bool,
     ) -> Result<bool, ServiceError> {
-        // Non-recursive: all direct, non-virtual leaf children played by the user.
-        // Recursive descent (via the AncestorIds/LinkedChildren closure) is the
-        // library manager's job; here the direct-children form is honored and the
-        // recursive flag widens to the ancestor closure where present.
-        let mut filter = InternalItemsQuery::default();
-        filter.set_user(Arc::new(user.clone()));
-        let filter = crate::query_restrictions::resolve(&self.db, &filter)
-            .await?
-            .unwrap_or(filter);
-        let mut qb = QueryBuilder::new(r#"SELECT NOT EXISTS (SELECT 1 FROM "BaseItems" bi "#);
-        if recursive {
-            qb.push(r#"JOIN "AncestorIds" a ON a."ItemId" = bi."Id" WHERE a."ParentItemId" = "#);
+        // v12.4 `GetIsPlayed`: the descendants `GetAllDescendantIds` resolves
+        // (closure and links), or the direct children.
+        let descendants = if recursive {
+            let filter = InternalItemsQuery {
+                descendant_of_id: Some(id),
+                ..Default::default()
+            };
+            resolve_descendant_query(&self.db, &filter).await?
         } else {
-            qb.push(r#"WHERE bi."ParentId" = "#);
-        }
-        qb.push_bind(guid_to_db(id))
-            .push(r#" AND bi."IsFolder" = 0 AND bi."IsVirtualItem" = 0"#);
-        crate::translate_query::append_parental_restrictions(&mut qb, &filter, "bi");
-        qb.push(r#" AND NOT EXISTS (SELECT 1 FROM "UserData" ud WHERE ud."ItemId" = bi."Id" AND ud."UserId" = "#)
-            .push_bind(user.id.clone()).push(r#" AND ud."Played" = 1))"#);
-        let all_played: i64 = qb
-            .build_query_scalar()
-            .fetch_one(self.db.pool())
-            .await
-            .map_err(db_err)?;
+            None
+        };
+        let all_played: i64 =
+            crate::translate_query::build_is_played_query(id, descendants.as_ref(), &user.id)
+                .build_query_scalar()
+                .fetch_one(self.db.pool())
+                .await
+                .map_err(db_err)?;
         Ok(all_played != 0)
     }
 
@@ -10337,8 +10329,8 @@ mod tests {
         let user = seed_user(&db, Uuid::from_u128(0xC0DE)).await;
         seed_user_data(&db, Uuid::from_u128(0xC0DE), child, true, None).await;
 
-        // The recursive branch runs its AncestorIds join. With an ancestor row
-        // present, the played child makes the closure fully played.
+        // The recursive form reads the descendants resolve_descendant_query
+        // finds: with an ancestor row present, the played child is all of them.
         sqlx::query(r#"INSERT INTO "AncestorIds" ("ItemId", "ParentItemId") VALUES (?1, ?2)"#)
             .bind(guid_to_db(child))
             .bind(guid_to_db(parent))
@@ -10386,12 +10378,58 @@ mod tests {
         .await
         .unwrap();
         assert!(
-            repository
+            !repository
                 .get_is_played(&user, parent, false)
                 .await
                 .unwrap(),
-            "hidden unrated episodes do not keep a folder unplayed"
+            "GetIsPlayed is not access-filtered: a hidden unrated episode keeps it unplayed"
         );
+    }
+
+    /// `get_is_played`'s statement reads one folder's rows by key: the
+    /// recursive form reads each resolved descendant by `Id` (the `+` pins of
+    /// `build_is_played_query`; unpinned, it reads every leaf through the
+    /// `IsFolder` index), the direct form `IX_BaseItems_ParentId`.
+    #[tokio::test]
+    async fn is_played_query_seeks_the_folders_rows() {
+        use sqlx::Execute;
+        let db = test_db().await;
+        let parent = Uuid::from_u128(0xC001);
+        let descendants = InternalItemsQuery {
+            descendant_of_id: Some(parent),
+            descendant_roots: Some(DescendantQueryRoots {
+                parent_id: parent,
+                closure_roots: vec![parent],
+                link_roots: vec![parent],
+            }),
+            ..Default::default()
+        };
+        for (descendants, seek) in [
+            (
+                Some(&descendants),
+                "SEARCH bi USING INDEX sqlite_autoindex_BaseItems_1 (Id=?)",
+            ),
+            (
+                None,
+                "SEARCH bi USING INDEX IX_BaseItems_ParentId (ParentId=?)",
+            ),
+        ] {
+            let mut builder =
+                crate::translate_query::build_is_played_query(parent, descendants, "user");
+            let mut query = builder.build();
+            let args = query.take_arguments().unwrap().unwrap();
+            let sql = format!("EXPLAIN QUERY PLAN {}", query.sql().as_str());
+            let plan = sqlx::query_with(sqlx::AssertSqlSafe(sql), args)
+                .fetch_all(db.pool())
+                .await
+                .unwrap()
+                .iter()
+                .map(|row| row.get::<String, _>("detail"))
+                .collect::<Vec<_>>()
+                .join(" | ");
+            assert!(plan.contains(seek), "{plan}");
+            assert!(!plan.contains("SCAN bi"), "{plan}");
+        }
     }
 
     /// Seeds a full row through the persistence service so `DateCreated`,
