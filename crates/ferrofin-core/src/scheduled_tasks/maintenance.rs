@@ -327,20 +327,23 @@ impl ScheduledTask for DeleteCacheFileTask {
 /// Port of `DeleteLogFileTask`.
 pub struct DeleteLogFileTask {
     config: Arc<dyn ServerConfigurationManager>,
-    /// The retention formatted into the description, read at boot (the C#
-    /// formats `TaskCleanLogsDescription` with the live value on every read;
-    /// the sync accessor cannot read the async configuration seam).
-    retention_days: i32,
+    /// Reads the live retention the description is formatted with, as the C#
+    /// formats `TaskCleanLogsDescription` with `LogFileRetentionDays` on every
+    /// read (the async configuration seam has no synchronous read).
+    retention_days: Box<dyn Fn() -> i32 + Send + Sync>,
 }
 
 impl DeleteLogFileTask {
-    /// Builds the task over the config seam; `retention_days` (the boot-time
-    /// `log_file_retention_days`) is formatted into the description.
+    /// Builds the task over the config seam; `retention_days` reads the live
+    /// `log_file_retention_days` formatted into the description.
     #[must_use]
-    pub fn new(config: Arc<dyn ServerConfigurationManager>, retention_days: i32) -> Self {
+    pub fn new(
+        config: Arc<dyn ServerConfigurationManager>,
+        retention_days: impl Fn() -> i32 + Send + Sync + 'static,
+    ) -> Self {
         Self {
             config,
-            retention_days,
+            retention_days: Box::new(retention_days),
         }
     }
 }
@@ -364,7 +367,7 @@ impl ScheduledTask for DeleteLogFileTask {
         "TaskCleanLogsDescription"
     }
     fn description_argument(&self) -> Option<String> {
-        Some(self.retention_days.to_string())
+        Some((self.retention_days)().to_string())
     }
     fn category(&self) -> &str {
         MAINTENANCE
@@ -1194,7 +1197,7 @@ mod tests {
         backdate(&managed, 40);
         let fresh = touch(&logs, "ferrofin-today.log");
 
-        let task = Arc::new(DeleteLogFileTask::new(config, 3));
+        let task = Arc::new(DeleteLogFileTask::new(config, || 3));
         assert_eq!(task.key(), "CleanLogFiles");
         // `string.Format(GetLocalizedString("TaskCleanLogsDescription"), days)`.
         let registry = crate::scheduled_tasks::FerrofinTaskManager::new();
