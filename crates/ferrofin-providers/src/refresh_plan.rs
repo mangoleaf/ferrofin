@@ -80,7 +80,7 @@ pub struct StoredState {
 /// `item as Video` / `item is Audio` split).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProbeKind {
-    /// The item is never probed (a folder, a photo, a book…).
+    /// The item is never probed (a folder, a photo…).
     None,
     /// A video. `file_or_iso` is `VideoType == VideoFile || VideoType == Iso`:
     /// only those compare the file's mtime (a disc folder does not).
@@ -90,6 +90,11 @@ pub enum ProbeKind {
     },
     /// An audio item.
     Audio,
+    /// A book, whose probe counts its pages (`FetchAsync(Book)`). Of the
+    /// change arms only the mtime one applies: `IsMissingMediaInfo` is false
+    /// for a book, and the sidecar and lyric arms are a video's and an audio
+    /// item's.
+    Book,
 }
 
 /// The local metadata sidecar found for the item, if any.
@@ -343,7 +348,7 @@ fn probe_changed(stored: &StoredState, fs: &FileFacts) -> Option<RefreshReason> 
     let (checks_mtime, is_video) = match fs.probe {
         ProbeKind::None => return None,
         ProbeKind::Video { file_or_iso } => (file_or_iso, true),
-        ProbeKind::Audio => (true, false),
+        ProbeKind::Audio | ProbeKind::Book => (true, false),
     };
     if checks_mtime
         && fs
@@ -351,6 +356,9 @@ fn probe_changed(stored: &StoredState, fs: &FileFacts) -> Option<RefreshReason> 
             .is_some_and(|mtime| file_changed(stored.date_modified, mtime))
     {
         return Some(RefreshReason::Modified);
+    }
+    if fs.probe == ProbeKind::Book {
+        return None;
     }
     // `IsMissingMediaInfo` (`ProbeProvider.cs:179-195`). A video's
     // `IsCompleteMedia` is false only for a channel livestream or an active

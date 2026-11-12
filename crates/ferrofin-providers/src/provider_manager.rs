@@ -22,6 +22,7 @@ use chrono::Utc;
 use ferrofin_model::configuration::{MetadataOptions, MetadataPluginSummary};
 use ferrofin_model::data::BaseItemKind;
 use ferrofin_model::entities::{ImageType, MetadataField};
+use ferrofin_model::extensions::order_by_language_descending;
 use ferrofin_model::net::mime_types;
 use ferrofin_model::providers::{
     ExternalIdInfo, ImageProviderInfo, RemoteImageInfo, RemoteImageQuery, RemoteSearchResult,
@@ -3985,6 +3986,7 @@ impl LocalProviderManager {
                 .map(|img| RemoteImageInfo {
                     provider_name: Some(source.name().to_owned()),
                     url: Some(img.url),
+                    thumbnail_url: img.thumbnail_url,
                     width: img.width,
                     height: img.height,
                     community_rating: img.community_rating,
@@ -4009,7 +4011,7 @@ impl LocalProviderManager {
                     })
                 });
             }
-            order_by_language_descending(&mut block, &preferred);
+            order_by_language_descending(&mut block, &preferred, ranking_fields);
             results.extend(block);
         }
         Ok(results)
@@ -4406,6 +4408,7 @@ fn entity_name(entity: &BaseItemEntity) -> Option<&str> {
 /// A type + URL image with no size/rating/language metadata.
 fn plain_image(image_type: ImageType, url: String) -> TmdbImage {
     TmdbImage {
+        thumbnail_url: None,
         image_type,
         url,
         width: None,
@@ -4425,54 +4428,14 @@ fn provider_id_of_pairs<'a>(ids: &'a [(String, String)], key: &str) -> Option<&'
         .filter(|v| !v.is_empty())
 }
 
-/// The C# `OrderByLanguageDescending` rank for one image's language tag
-/// (`MediaBrowser.Model/Extensions/EnumerableExtensions.cs`, v10.11.8).
-///
-/// The ladder is **preferred (4) > no language (3) > English (2) > anything
-/// else (0)** — an untagged image outranks an English one, which is easy to get
-/// backwards. `requested` has already been defaulted to `"en"` by the caller,
-/// per the same file's opening guard.
-///
-/// The no-language test is C# `IsNullOrEmpty`, NOT `IsNullOrWhiteSpace`: a tag
-/// of `" "` is not "no language" here and falls to 0.
-fn language_rank(language: Option<&str>, requested: &str) -> u8 {
-    match language {
-        Some(l) if l.eq_ignore_ascii_case(requested) => 4,
-        // C# `IsNullOrEmpty` — an absent tag and an empty one are both
-        // "no language"; note a WHITESPACE tag is not, and falls to 0.
-        None | Some("") => 3,
-        Some(l) if l.eq_ignore_ascii_case("en") => 2,
-        _ => 0,
-    }
-}
-
-/// C# `Math.Round(value ?? 0, 1)` — banker's rounding, which is .NET's default
-/// midpoint mode and what `round_ties_even` gives.
-fn rounded_rating(rating: Option<f64>) -> f64 {
-    (rating.unwrap_or(0.0) * 10.0).round_ties_even() / 10.0
-}
-
-/// Ports `IEnumerable<RemoteImageInfo>.OrderByLanguageDescending(requested)`:
-/// language rank, then rounded community rating, then vote count — all
-/// descending.
-///
-/// `sort_by` is STABLE, matching LINQ's `OrderByDescending`/`ThenByDescending`,
-/// so images that tie on all three keep the provider's own order.
-fn order_by_language_descending(images: &mut [RemoteImageInfo], requested: &str) {
-    // "Default to English if no requested language is specified."
-    let requested = if requested.trim().is_empty() {
-        "en"
-    } else {
-        requested
-    };
-    images.sort_by(|a, b| {
-        language_rank(b.language.as_deref(), requested)
-            .cmp(&language_rank(a.language.as_deref(), requested))
-            .then_with(|| {
-                rounded_rating(b.community_rating).total_cmp(&rounded_rating(a.community_rating))
-            })
-            .then_with(|| b.vote_count.unwrap_or(0).cmp(&a.vote_count.unwrap_or(0)))
-    });
+/// What `OrderByLanguageDescending` ranks a remote image by: its language,
+/// community rating and vote count.
+fn ranking_fields(image: &RemoteImageInfo) -> (Option<&str>, Option<f64>, Option<i32>) {
+    (
+        image.language.as_deref(),
+        image.community_rating,
+        image.vote_count,
+    )
 }
 
 /// `TmdbUtils.AdjustImageLanguage`: expose regional requested tags when the
@@ -4492,22 +4455,6 @@ fn adjust_tmdb_image_language(language: Option<String>, requested: &str) -> Opti
     } else {
         Some(language)
     }
-}
-
-pub(crate) fn order_tmdb_images(images: &mut [TmdbImage], requested: &str) {
-    let requested = if requested.trim().is_empty() {
-        "en"
-    } else {
-        requested
-    };
-    images.sort_by(|a, b| {
-        language_rank(b.language.as_deref(), requested)
-            .cmp(&language_rank(a.language.as_deref(), requested))
-            .then_with(|| {
-                rounded_rating(b.community_rating).total_cmp(&rounded_rating(a.community_rating))
-            })
-            .then_with(|| b.vote_count.unwrap_or(0).cmp(&a.vote_count.unwrap_or(0)))
-    });
 }
 
 /// The TMDB id an item's external ids pin it to: its own `Tmdb` id, else an
@@ -5462,10 +5409,7 @@ mod tests {
     use std::sync::Arc;
     use std::time::Duration;
 
-    use super::{
-        LocalProviderManager, RemoteImageInfo, RemoteSearchProvider, language_rank,
-        order_by_language_descending, parse_ymd, wants_fetch,
-    };
+    use super::{LocalProviderManager, RemoteSearchProvider, parse_ymd, wants_fetch};
     use ferrofin_model::entities::MetadataField;
     use ferrofin_traits::persistence::OwnerExtrasRefresh;
     use ferrofin_traits::providers::{MetadataRefreshMode as Mode, MetadataRefreshOptions as Opts};
@@ -8422,75 +8366,26 @@ mod tests {
         (item_id, wire(mgr))
     }
 
-    /// `OrderByLanguageDescending`'s ladder, straight from
-    /// `MediaBrowser.Model/Extensions/EnumerableExtensions.cs` (v10.11.8).
-    /// The trap: an UNTAGGED image (3) outranks an English one (2), and a
-    /// whitespace-only tag is not "no language" — `IsNullOrEmpty`, not
-    /// `IsNullOrWhiteSpace` — so it falls to 0.
+    /// The automatic TMDb pick ranks like `GetImages`: requested, then English
+    /// (even rated lower), then untagged, then other languages.
     #[test]
-    fn language_rank_matches_the_csharp_ladder() {
-        assert_eq!(language_rank(Some("fr"), "fr"), 4);
-        assert_eq!(language_rank(Some("FR"), "fr"), 4, "OrdinalIgnoreCase");
-        assert_eq!(language_rank(None, "fr"), 3);
-        assert_eq!(language_rank(Some(""), "fr"), 3);
-        assert_eq!(language_rank(Some("en"), "fr"), 2);
-        assert_eq!(language_rank(Some("de"), "fr"), 0);
-        assert_eq!(
-            language_rank(Some(" "), "fr"),
-            0,
-            "IsNullOrEmpty, not WhiteSpace"
-        );
-        // With "en" requested, English takes the top rank and untagged drops to 3.
-        assert_eq!(language_rank(Some("en"), "en"), 4);
-        assert_eq!(language_rank(None, "en"), 3);
-    }
-
-    /// The full `OrderByDescending(rank).ThenByDescending(Math.Round(rating,
-    /// 1)).ThenByDescending(voteCount)` chain, plus the "default to English
-    /// when nothing is requested" guard.
-    #[test]
-    fn images_order_by_language_then_rating_then_votes() {
-        let img = |lang: Option<&str>, rating: Option<f64>, votes: Option<i32>, url: &str| {
-            RemoteImageInfo {
-                url: Some(url.to_owned()),
-                language: lang.map(str::to_owned),
-                community_rating: rating,
-                vote_count: votes,
-                ..RemoteImageInfo::default()
-            }
+    fn tmdb_download_images_rank_english_above_untagged() {
+        let image = |url: &str, language: Option<&str>, rating: f64| crate::tmdb::TmdbImage {
+            community_rating: Some(rating),
+            language: language.map(str::to_owned),
+            ..super::plain_image(ImageType::Primary, url.to_owned())
         };
-        let mut images = vec![
-            img(Some("de"), Some(9.0), Some(999), "other"),
-            img(Some("en"), Some(1.0), Some(1), "english"),
-            img(None, Some(1.0), Some(1), "untagged"),
-            img(Some("fr"), Some(5.0), Some(2), "fr-low-votes"),
-            img(Some("fr"), Some(5.04), Some(50), "fr-rounds-equal"),
-            img(Some("fr"), Some(5.2), Some(1), "fr-top"),
+        let images = vec![
+            image("fr", Some("fr"), 9.0),
+            image("untagged", None, 8.0),
+            image("en", Some("en"), 1.0),
+            image("de", Some("de"), 0.5),
         ];
-        order_by_language_descending(&mut images, "fr");
-        let urls: Vec<&str> = images.iter().filter_map(|i| i.url.as_deref()).collect();
-        assert_eq!(
-            urls,
-            [
-                // rank 4, by rating: 5.2 > 5.0
-                "fr-top",
-                // 5.04 rounds to 5.0, tying "fr-low-votes" — votes break it
-                "fr-rounds-equal",
-                "fr-low-votes",
-                // rank 3 (untagged) before rank 2 (English) before rank 0
-                "untagged",
-                "english",
-                "other",
-            ]
-        );
-
-        // "Default to English if no requested language is specified."
-        let mut blank = vec![
-            img(Some("de"), None, None, "de"),
-            img(Some("en"), None, None, "en"),
-        ];
-        order_by_language_descending(&mut blank, "   ");
-        assert_eq!(blank[0].url.as_deref(), Some("en"));
+        let urls: Vec<String> = crate::tmdb::ordered_download_images(images, "de")
+            .into_iter()
+            .map(|image| image.url)
+            .collect();
+        assert_eq!(urls, ["de", "en", "untagged", "fr"]);
     }
 
     const TMDB_MIXED_LANGUAGE_IMAGES: &str = r#"{"posters":[
@@ -8530,7 +8425,7 @@ mod tests {
                 "https://image.tmdb.org/t/p/original/en.jpg",
                 "https://image.tmdb.org/t/p/original/none.jpg",
             ],
-            "de and sv are filtered out; en (rank 4) precedes untagged (rank 3)"
+            "de and sv are filtered out; en (rank 4) precedes untagged (rank 2)"
         );
 
         // `IncludeAllLanguages` keeps everything — still ordered.
@@ -9071,7 +8966,7 @@ mod tests {
             [
                 // Within each provider the block is `OrderByLanguageDescending`,
                 // so the two `en`-tagged images (rank 4) come before the two
-                // untagged ones (rank 3) — NOT the raw poster/backdrop/logo
+                // untagged ones (rank 2) — NOT the raw poster/backdrop/logo
                 // order TMDB returned. All four tie on rating and votes, and
                 // the sort is stable, so each rank keeps TMDB's own sequence.
                 (
@@ -13766,7 +13661,9 @@ mod tests {
                             "/fr.jpg"
                         })
                 );
-                assert_eq!(images[1].language, None, "xx is untagged");
+                // Jellyfin 12's ladder: English (3) before untagged (2).
+                assert_eq!(images[1].language.as_deref(), Some("en"));
+                assert_eq!(images[2].language, None, "xx is untagged");
                 if language == "fr-CA" {
                     assert_eq!(images[0].width, Some(1600));
                     assert_eq!(images[0].height, Some(2400));

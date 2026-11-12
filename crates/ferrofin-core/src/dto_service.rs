@@ -4787,24 +4787,17 @@ impl FerrofinDtoService {
             // (C# AttachPeople: `People[].Id` is the per-name item id, the
             // one favorites are written against — never the per-credit
             // `Peoples` row id, which fragments a person across types).
-            // One clean key per distinct spelling, not one per credit per
-            // item: `slot_by_name` maps every RAW spelling seen to the slot
-            // of the name it resolves through using the same clean key as the database, so
-            // the projection can look the id up by the stored string.
+            // One lookup per distinct spelling, not one per credit per item,
+            // and not one per clean name: `GetPerson` reads each spelling's
+            // own item. `slot_by_name` maps every RAW spelling to its slot,
+            // so the projection can look the id up by the stored string.
             let mut names: Vec<String> = Vec::new();
-            let mut slot_by_clean: HashMap<String, usize> = HashMap::new();
             let mut slot_by_name: HashMap<String, usize> = HashMap::new();
             for person in people.values().flatten() {
-                if slot_by_name.contains_key(person.name.as_str()) {
-                    continue;
+                if !slot_by_name.contains_key(person.name.as_str()) {
+                    slot_by_name.insert(person.name.clone(), names.len());
+                    names.push(person.name.clone());
                 }
-                let slot = *slot_by_clean
-                    .entry(crate::text_util::get_clean_value(&person.name))
-                    .or_insert_with(|| {
-                        names.push(person.name.clone());
-                        names.len() - 1
-                    });
-                slot_by_name.insert(person.name.clone(), slot);
             }
             // The id is the ONLY thing this resolution needs, so it asks for the
             // id — not the row. Materializing a full `BaseItemEntity` per
@@ -5559,10 +5552,11 @@ mod tests {
         ) -> Result<Vec<BaseItemEntity>, ServiceError> {
             // Only the by-name lookup is served (`get_named_item` filters
             // `get_item_list` by name). Match the way the real by-name resolver
-            // does — on the CLEAN value (`LibraryManager::get_named_items`
-            // compares `get_clean_value(name)` against the stored `CleanName`),
-            // so accents, punctuation, spacing and case all fold exactly as they
-            // do against a real database.
+            // does for the other kinds — on the CLEAN value
+            // (`LibraryManager::get_named_items` compares `get_clean_value(name)`
+            // against the stored `CleanName`), so accents, punctuation, spacing
+            // and case all fold. The real manager reads a `Person` by the id its
+            // spelling derives instead (gl-1079); these tests pin the prefetch.
             let Some(name) = query.name.as_deref() else {
                 return Ok(vec![]);
             };
@@ -9181,6 +9175,33 @@ mod tests {
         assert!((dto.primary_image_aspect_ratio.unwrap() - 2.0).abs() < 1e-9);
     }
 
+    /// gl-1678: a series on the page is also its episodes' image parent, so
+    /// its id is in the page's image read twice. On a page past one IN-list
+    /// chunk the two copies fall in different chunks, and each must still
+    /// read its one backdrop once, as Jellyfin lists it.
+    #[tokio::test]
+    async fn a_series_on_a_page_past_one_chunk_lists_its_backdrop_once() {
+        let db = test_db().await;
+        let (episode, _season_id, series_id) = seed_episode_tree(&db).await;
+        let mut page = vec![fetch_item(&db, series_id).await, episode.clone()];
+        for _ in 0..ferrofin_db::PADDED_LIST_MAX {
+            let mut other = episode.clone();
+            other.id = guid_to_db(Uuid::new_v4());
+            page.push(other);
+        }
+        let svc = service(db);
+        let dtos = svc
+            .get_base_item_dtos(&page, &DtoOptions::default(), None, None, true)
+            .await
+            .unwrap();
+        let fanart = ["tag:/shows/fanart.jpg".to_owned()];
+        assert_eq!(dtos[0].backdrop_image_tags.as_deref(), Some(&fanart[..]));
+        assert_eq!(
+            dtos[1].parent_backdrop_image_tags.as_deref(),
+            Some(&fanart[..])
+        );
+    }
+
     /// Audio → MusicAlbum → MusicArtist (by album-artist name): `AlbumId`,
     /// `AlbumPrimaryImageTag`, `AlbumNormalizationGain` from the album row
     /// (:1207-1222), the album's Logo as the parent logo, and the artist's
@@ -12614,7 +12635,10 @@ mod tests {
     /// Credit spellings whose *stored* form differs from every "tidy" convention
     /// a test would otherwise use: mixed case, leading/trailing and doubled
     /// internal whitespace, punctuation, accents, and non-Latin script. Paired
-    /// with the name of the ONE by-name `Person` item that backs each.
+    /// with the name of the ONE by-name `Person` item that backs each in the
+    /// tests' `FakeLibrary`, which resolves by clean value; the real manager
+    /// reads a person by the id each spelling derives (`GetPerson`), so these
+    /// pairs pin the prefetch's key convention, not which item a name opens.
     ///
     /// The clean value folds case and diacritics and NOTHING else (C#
     /// `GetCleanValue` is `RemoveDiacritics().ToLowerInvariant()`), so each

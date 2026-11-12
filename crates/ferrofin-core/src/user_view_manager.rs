@@ -769,12 +769,13 @@ impl FerrofinUserViewManager {
 
     /// Materialises the user's playlists view when a playlists folder exists
     /// and the canonical row does not — the `isNew` branch of `GetNamedView`
-    /// (LibraryManager.cs:3054-3075): `Path = {InternalMetadataPath}/views/{id
-    /// N}`, `Name = folder.Name`, `ViewType = playlists`, `UserId`,
-    /// `DisplayParentId = folder.Id`. The row is looked for among `listed`,
-    /// the view rows the caller has just read, which hold it when it exists.
-    /// Returns whether a row was written. Idempotent; a no-op without an item
-    /// store and a metadata path.
+    /// (LibraryManager.cs:3069-3088, v12.4): `Path =
+    /// {InternalMetadataPath}/views/{id N}`, `Name = folder.Name`, `ViewType =
+    /// playlists`, `UserId`, `DisplayParentId = folder.Id`; and renames a row
+    /// whose name is not the folder's, `GetNamedView`'s other branch
+    /// (`:3089-3093`). The row is looked for among `listed`, the view rows the caller
+    /// has just read, which hold it when it exists. Returns whether a row was
+    /// written. Idempotent; a no-op without an item store and a metadata path.
     async fn ensure_user_playlists_view(
         &self,
         user_id: Uuid,
@@ -805,11 +806,16 @@ impl FerrofinUserViewManager {
                 continue;
             };
             let stored_id = ferrofin_db::store::guid_to_db(id);
-            if listed.iter().any(|row| row.id == stored_id) {
+            let name = folder
+                .name
+                .clone()
+                .unwrap_or_else(|| PLAYLISTS_FOLDER_NAME.to_owned());
+            let stored = listed.iter().find(|row| row.id == stored_id);
+            if stored.is_some_and(|row| row.name.as_deref() == Some(name.as_str())) {
                 continue;
             }
             // 12.2: the folder is skipped before `GetNamedView`, so a user
-            // with no playlist to see never gets the view row either.
+            // with no playlist to see never gets the view row, nor its rename.
             if let Some(user) = user
                 && !self
                     .has_visible_item(BaseItemKind::Playlist, user, visible_items)
@@ -817,14 +823,20 @@ impl FerrofinUserViewManager {
             {
                 continue;
             }
+            if let Some(row) = stored {
+                // `BaseItem.Name`'s setter drops the cached `SortName`, so
+                // upstream's save writes one made from the new name.
+                let mut row = row.clone();
+                row.sort_name = Some(create_sort_name(&name));
+                row.name = Some(name);
+                persistence.save_items(std::slice::from_ref(&row)).await?;
+                written = true;
+                continue;
+            }
             let view_path = metadata_path.join("views").join(id.simple().to_string());
             tokio::fs::create_dir_all(&view_path).await.map_err(|e| {
                 ServiceError::backend(format!("create playlists view directory: {e}"))
             })?;
-            let name = folder
-                .name
-                .clone()
-                .unwrap_or_else(|| PLAYLISTS_FOLDER_NAME.to_owned());
             let data = serde_json::json!({
                 "ViewType": "playlists",
                 "DisplayParentId": parent.simple().to_string(),
@@ -2242,6 +2254,108 @@ mod tests {
 
         items.get_item_list(&query).await.expect("again");
         assert_eq!(views().await.len(), 1, "a repeat query writes no other row");
+    }
+
+    /// gl-1397: `GetNamedView(user, folder.Name, folder.Id, playlists)`
+    /// renames a Playlists view whose name is not the folder's
+    /// (LibraryManager.cs:3089-3093, v12.4), so the views read after the
+    /// playlists folder is renamed lists the new name. A user the folder is
+    /// skipped for, with no playlist to see, never reaches `GetNamedView`, so
+    /// their row keeps its name.
+    #[tokio::test]
+    async fn the_playlists_view_follows_a_renamed_playlists_folder() {
+        let db = test_db().await;
+        let user = Uuid::from_u128(0x5401);
+        crate::test_support::seed_user_with_defaults(&db, user).await;
+        let folder = Uuid::from_u128(0x5402);
+        let name_folder = |name: &'static str| {
+            let db = db.clone();
+            async move {
+                put(
+                    &db,
+                    folder,
+                    (BaseItemKind::ManualPlaylistsFolder, name),
+                    (None, folder),
+                    &format!("{DATA}/playlists"),
+                    &serde_json::json!({}),
+                )
+                .await;
+            }
+        };
+        let open_playlist = |open: bool| {
+            let db = db.clone();
+            async move {
+                put(
+                    &db,
+                    Uuid::from_u128(0x5403),
+                    (BaseItemKind::Playlist, "Mix"),
+                    (Some(folder), folder),
+                    &format!("{DATA}/playlists/Mix"),
+                    &serde_json::json!({"OwnerUserId": Uuid::from_u128(0x5409), "OpenAccess": open}),
+                )
+                .await;
+            }
+        };
+        name_folder("Playlists").await;
+        open_playlist(true).await;
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let manager = manager_with_visibility(&db, tmp.path());
+        let view_names = async || -> Vec<String> {
+            manager
+                .get_user_views(user)
+                .await
+                .expect("views")
+                .into_iter()
+                .filter_map(|v| v.name)
+                .collect()
+        };
+        assert_eq!(view_names().await, ["Playlists"]);
+
+        name_folder("Mixtapes").await;
+        assert_eq!(
+            view_names().await,
+            ["Mixtapes"],
+            "the read that renames the row lists the new name"
+        );
+        let view = manager
+            .user_named_view_id(user, folder, "playlists")
+            .expect("view id");
+        let row = crate::test_support::fetch_item(&db, view).await;
+        assert_eq!(
+            (row.name.as_deref(), row.sort_name.as_deref()),
+            (
+                Some("Mixtapes"),
+                Some(create_sort_name("Mixtapes").as_str())
+            ),
+            "the Name setter drops the cached SortName, so the save recomputes it"
+        );
+        // A rewrite would stamp the sort name back, so a read that matches the
+        // name must leave this one alone: no write on the steady-state path.
+        let mut marked = row;
+        marked.sort_name = Some("SENTINEL".to_owned());
+        FerrofinItemPersistenceService::new(db.clone())
+            .save_items(std::slice::from_ref(&marked))
+            .await
+            .expect("mark the row");
+        assert_eq!(view_names().await, ["Mixtapes"]);
+        assert_eq!(
+            crate::test_support::fetch_item(&db, view)
+                .await
+                .sort_name
+                .as_deref(),
+            Some("SENTINEL"),
+            "a read of an up-to-date name writes nothing"
+        );
+
+        open_playlist(false).await;
+        name_folder("Lists").await;
+        assert!(view_names().await.is_empty(), "no playlist to see: no view");
+        let row = crate::test_support::fetch_item(&db, view).await;
+        assert_eq!(
+            row.name.as_deref(),
+            Some("Mixtapes"),
+            "a skipped folder never reaches GetNamedView's rename"
+        );
     }
 
     /// A playlists view an adopted blob stores with a numeric `ViewType`

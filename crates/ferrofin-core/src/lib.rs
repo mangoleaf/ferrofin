@@ -157,7 +157,8 @@
 //!   trait: the task registry over the `ferrofin-model` task DTOs, plus the
 //!   trigger scheduler ([`start_scheduler`](FerrofinTaskManager::start_scheduler)
 //!   fires daily/weekly/interval/startup triggers), live progress reporting,
-//!   abortable queued runs, and on-disk trigger-override persistence.
+//!   cooperative stops (a run's token, `Cancelling` until it returns), and
+//!   on-disk trigger-override persistence.
 //!
 //! Backup and restore (`BackupService`) live in `ferrofin-api`'s `Backup`
 //! handlers.

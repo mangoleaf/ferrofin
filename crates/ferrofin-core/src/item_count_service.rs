@@ -1927,7 +1927,10 @@ mod tests {
         crate::test_support::save_item(&db, &row).await;
         let svc = FerrofinItemCountService::new(db.clone());
         assert!(svc.get_extra_counts_batch(&[]).await.unwrap().is_empty());
-        let mut owners = vec![Uuid::new_v4(); ferrofin_db::BATCH_BIND_CHUNK + 1];
+        // Distinct fillers, so the list still spans two chunks once deduplicated.
+        let mut owners: Vec<Uuid> = (0..=ferrofin_db::BATCH_BIND_CHUNK)
+            .map(|_| Uuid::new_v4())
+            .collect();
         owners[0] = owner;
         owners[ferrofin_db::BATCH_BIND_CHUNK] = owner;
         let counts = svc.get_extra_counts_batch(&owners).await.unwrap();
