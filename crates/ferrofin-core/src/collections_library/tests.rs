@@ -13,6 +13,7 @@ use ferrofin_model::data::BaseItemKind;
 use ferrofin_model::entities::{CollectionTypeOptions, ImageType};
 use ferrofin_traits::collections::{CollectionCreationOptions, CollectionManager};
 use ferrofin_traits::library::VirtualFolderManager;
+use ferrofin_traits::persistence::ItemPersistenceService as _;
 use ferrofin_traits::system::ServerApplicationPaths;
 use uuid::Uuid;
 
@@ -21,7 +22,10 @@ use crate::adoption_repairs::{
 };
 use crate::item_persistence_service::FerrofinItemPersistenceService;
 use crate::item_type_lookup::{IdDerivation, derive_item_id_with, stored_type_name};
-use crate::library_structure_repository::{ancestors_of, fail_item_deletes, user_data_items};
+use crate::library_structure_repository::{
+    ancestors_of, fail_item_deletes, fail_item_rekeys, favourite_item, link_child, linked_children,
+    user_data_items, user_data_row,
+};
 use crate::linked_children_service::FerrofinLinkedChildrenService;
 use crate::test_support::{
     fetch_item, fetch_item_opt, image_info, item_repository_over, library_manager_over, save_item,
@@ -726,25 +730,14 @@ async fn the_database_is_copied_only_when_there_is_work() {
     assert!(snapshot.is_file());
 }
 
-/// One `LinkedChildren` row, `parent` holding `child`.
-async fn link(db: &Database, parent: Uuid, child: Uuid) {
-    sqlx::query(
-        r#"INSERT INTO "LinkedChildren" ("ParentId", "SortOrder", "ChildId", "ChildType")
-           VALUES (?1, 0, ?2, 0)"#,
-    )
-    .bind(guid_to_db(parent))
-    .bind(guid_to_db(child))
-    .execute(db.writer())
-    .await
-    .expect("link");
-}
-
 /// gl-738: a box set Ferrofin before 1.4.0 created with no folder gets the
 /// folder and id a create of its name gives today, its path stored in the
 /// token form. Its members, the playlist holding it, a user's favourite and
-/// played state and its image move with it. Of two with one name the older
-/// gets the plain folder; a box set with a path is left alone; a second boot
-/// does nothing; and a later create of the name takes the next folder.
+/// played state and its image move with it, and one never refreshed is
+/// stamped as refreshed. Of two with one name the older gets the plain
+/// folder; a box set with a path is left alone; a scan finds the moved ones
+/// holding their folders; a second boot does nothing; and a later create of
+/// the name takes the next folder.
 #[tokio::test]
 async fn a_box_set_with_no_folder_gets_the_folder_and_id_a_create_gives() {
     let lab = Lab::new().await;
@@ -754,18 +747,21 @@ async fn a_box_set_with_no_folder_gets_the_folder_and_id_a_create_gives() {
     for box_set in [older, newer] {
         seed_child_item(&lab.db, box_set, BaseItemKind::BoxSet, "Heist", folder).await;
     }
+    let earlier = chrono::DateTime::parse_from_rfc3339("2025-01-01T00:00:00Z")
+        .expect("date")
+        .to_utc();
+    FerrofinItemPersistenceService::new(lab.db.clone())
+        .set_date_last_refreshed(newer, Some(earlier))
+        .await
+        .expect("refresh stamp");
     let (movie, playlist) = (Uuid::new_v4(), Uuid::new_v4());
     seed_item(&lab.db, movie, BaseItemKind::Movie).await;
     seed_named_item(&lab.db, playlist, BaseItemKind::Playlist, "Mix").await;
-    link(&lab.db, older, movie).await;
-    link(&lab.db, playlist, older).await;
+    link_child(&lab.db, older, movie).await;
+    link_child(&lab.db, playlist, older).await;
     let user = Uuid::parse_str(&seed_user(&lab.db, Uuid::from_u128(0x6A)).await.id).expect("id");
     seed_user_data(&lab.db, user, older, true, None).await;
-    sqlx::query(r#"UPDATE "UserData" SET "IsFavorite" = 1 WHERE "ItemId" = ?1"#)
-        .bind(guid_to_db(older))
-        .execute(lab.db.writer())
-        .await
-        .expect("favourite");
+    favourite_item(&lab.db, older).await;
     seed_images(
         &lab.db,
         older,
@@ -784,30 +780,33 @@ async fn a_box_set_with_no_folder_gets_the_folder_and_id_a_create_gives() {
         assert_eq!(row.name.as_deref(), Some("Heist"));
         assert_eq!(row.parent_id, Some(guid_to_db(folder)));
         assert!(fetch_item_opt(&lab.db, old).await.is_none(), "{name}");
+        let refreshed = row.date_last_refreshed.expect("stamped");
+        if old == older {
+            // Never refreshed: stamped, so a scan's first refresh keeps the name.
+            assert!(refreshed > earlier, "{name}: {refreshed}");
+        } else {
+            assert_eq!(refreshed, earlier, "{name}: a stamp it had stays");
+        }
     }
+    let folders = Vec::from(
+        ["Heist", "Heist1"].map(|name| lab.box_set_at(name).0.to_string_lossy().into_owned()),
+    );
+    let added = lab
+        .manager()
+        .resolve_box_set_folders(&lab.collections_str(), &folders)
+        .await
+        .expect("scan");
+    assert_eq!(added, Some(Vec::new()), "no second row for a moved box set");
     let (_, heist) = lab.box_set_at("Heist");
-    let links: Vec<(String, String)> = sqlx::query_as(
-        r#"SELECT "ParentId", "ChildId" FROM "LinkedChildren" ORDER BY "ParentId" = ?1"#,
-    )
-    .bind(guid_to_db(heist))
-    .fetch_all(lab.db.pool())
-    .await
-    .expect("links");
     assert_eq!(
-        links,
+        linked_children(&lab.db, heist).await,
         [
             (guid_to_db(playlist), guid_to_db(heist)),
             (guid_to_db(heist), guid_to_db(movie)),
         ]
     );
     assert_eq!(user_data_items(&lab.db, user).await, [guid_to_db(heist)]);
-    let (key, favourite, played): (String, bool, bool) = sqlx::query_as(
-        r#"SELECT "CustomDataKey", "IsFavorite", "Played" FROM "UserData" WHERE "ItemId" = ?1"#,
-    )
-    .bind(guid_to_db(heist))
-    .fetch_one(lab.db.pool())
-    .await
-    .expect("user data");
+    let (key, favourite, played) = user_data_row(&lab.db, heist).await;
     assert_eq!(key, heist.to_string(), "the row is keyed by the new id");
     assert!(favourite && played);
     let images = item_repository_over(lab.db.clone())
@@ -833,23 +832,16 @@ async fn a_failed_box_set_move_is_undone_and_retried_on_the_next_boot() {
     let lab = Lab::new().await;
     let box_set = Uuid::new_v4();
     seed_named_item(&lab.db, box_set, BaseItemKind::BoxSet, "Heist").await;
-    sqlx::query(
-        r#"CREATE TRIGGER "fail_rekey" BEFORE UPDATE OF "Id" ON "BaseItems"
-           BEGIN SELECT RAISE(ABORT, 'disk full'); END"#,
-    )
-    .execute(lab.db.writer())
-    .await
-    .expect("trigger");
+    fail_item_rekeys(&lab.db, true).await;
 
     assert_eq!(lab.rekey_box_sets().await.expect("repair"), 0);
-    assert_eq!(fetch_item(&lab.db, box_set).await.path, None);
+    let row = fetch_item(&lab.db, box_set).await;
+    assert_eq!(row.path, None);
+    assert!(row.date_last_refreshed.is_some(), "the refresh stamp stays");
     let (path, to) = lab.box_set_at("Heist");
     assert!(!path.exists(), "the unused folder is removed");
 
-    sqlx::query(r#"DROP TRIGGER "fail_rekey""#)
-        .execute(lab.db.writer())
-        .await
-        .expect("drop trigger");
+    fail_item_rekeys(&lab.db, false).await;
     assert_eq!(lab.rekey_box_sets().await.expect("next boot"), 1);
     assert!(path.is_dir());
     assert_eq!(

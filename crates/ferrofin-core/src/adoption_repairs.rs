@@ -1774,7 +1774,9 @@ const BOX_SET_SNAPSHOT_EXTENSION: &str = "db.pre-box-set-folders";
 /// playlists holding it, users' favourites and played state, and its images
 /// move with it; a client holding the old id has to look it up again. Its
 /// metadata folder is renamed to the new id, and the artwork an older
-/// Ferrofin saved there stays in it, not beside the box set.
+/// Ferrofin saved there stays in it, not beside the box set. One never
+/// refreshed gets a refresh stamp without being refreshed, so the next scan
+/// keeps its name.
 ///
 /// Box sets are taken in the order they were stored, one move each, so of two
 /// with one name the older gets the plain folder. A box set with a path is
@@ -1859,7 +1861,8 @@ pub async fn rekey_pathless_box_sets(
 
 /// One [`rekey_pathless_box_sets`] move: box set `from`, named `name`, gets
 /// its folder in `collections` and the id that folder derives, or, when the
-/// move fails, keeps its id, its folders, and no new folder.
+/// move fails, keeps its id, its folders, and no new folder (only the refresh
+/// stamp stays, which only an explicit refresh of that box set reads).
 ///
 /// # Errors
 /// The [`ServiceError`] that kept the folder from being made or the row from
@@ -1872,6 +1875,22 @@ async fn give_box_set_its_folder(
     (art_root, path_manager): (Option<&Path>, Option<&dyn PathManager>),
     (from, name): (Uuid, &str),
 ) -> Result<(), ServiceError> {
+    // An older Ferrofin's create queued no refresh, and the scan refreshes a
+    // box set only once it has a folder: its first refresh would be the
+    // scan's, in `Default` mode, which takes the provider's name over the
+    // user's (`MetadataService` `shouldReplace`). Upstream's create with
+    // members refreshes it at once in `FullRefresh`, which keeps the name.
+    // TODO(gl-1717, open work item): queue that create-time refresh; the
+    // stamp only keeps the scan's first refresh from renaming it.
+    sqlx::query(
+        r#"UPDATE "BaseItems" SET "DateLastRefreshed" = ?2
+           WHERE "Id" = ?1 AND "DateLastRefreshed" IS NULL"#,
+    )
+    .bind(guid_to_db(from))
+    .bind(ferrofin_db::store::datetime_to_db(chrono::Utc::now()))
+    .execute(db.writer())
+    .await
+    .map_err(db_err)?;
     let (path, to) =
         crate::collection_manager::new_box_set_folder_and_id(db, derivation, collections, name)
             .await?;
@@ -1893,7 +1912,16 @@ async fn give_box_set_its_folder(
         return Ok(());
     }
     folders.undo();
-    if let Err(err) = tokio::fs::remove_dir(&path).await {
+    // A row stored at the id meanwhile (the previous version's create of the
+    // same name) owns the folder; when that cannot be read, it is kept.
+    let owned = match crate::item_persistence_service::row_exists(db, to).await {
+        Ok(owned) => owned,
+        Err(err) => {
+            tracing::debug!(%err, item_id = %to, "could not look for a row at a box set's new id");
+            true
+        }
+    };
+    if !owned && let Err(err) = tokio::fs::remove_dir(&path).await {
         tracing::debug!(%err, path = %path, "could not remove an unused box set folder");
     }
     moved?;
