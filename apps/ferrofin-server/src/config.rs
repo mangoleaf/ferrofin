@@ -190,6 +190,7 @@ struct FileConfig {
     scan_probe_concurrency: Option<u32>,
     scan_directory_cache_records: Option<u32>,
     scan_directory_cache_idle_secs: Option<u32>,
+    book_archive_max_entries: Option<u32>,
     auth_cache_ttl_secs: Option<u32>,
     row_cache_ttl_secs: Option<u32>,
     trickplay_concurrency: Option<CountOrAuto>,
@@ -385,13 +386,26 @@ pub struct Config {
     #[doc(hidden)]
     pub provider_endpoints: ProviderEndpoints,
 
-    /// HTTP port to listen on. Default [`DEFAULT_HTTP_PORT`].
+    /// HTTP port from `--port`, else `FERROFIN_PORT`, else `config.toml`, else
+    /// [`DEFAULT_HTTP_PORT`]. The Networking page's `InternalHttpPort` sits
+    /// between the variable and the file: the server listens on what
+    /// `listen::ports` picks.
     pub port: u16,
 
+    /// Whether `--port` or `FERROFIN_PORT` set [`Self::port`]: it then
+    /// outranks the Networking page's `InternalHttpPort`.
+    pub port_from_flag_or_env: bool,
+
     /// HTTPS port, listened on beside the HTTP port when the network
-    /// configuration's `EnableHttps` is on and its certificate loads. Default
-    /// [`DEFAULT_HTTPS_PORT`].
+    /// configuration's `EnableHttps` is on and its certificate loads: from
+    /// `FERROFIN_HTTPS_PORT`, else `config.toml`, else [`DEFAULT_HTTPS_PORT`],
+    /// with the Networking page's `InternalHttpsPort` between the two
+    /// (`listen::ports`).
     pub https_port: u16,
+
+    /// Whether `FERROFIN_HTTPS_PORT` set [`Self::https_port`]: it then
+    /// outranks the Networking page's `InternalHttpsPort`.
+    pub https_port_from_env: bool,
 
     /// Publicly reachable server URL advertised to clients
     /// (`HostNetworkInfo.published_server_url`). `None` = auto-detect.
@@ -711,6 +725,15 @@ pub struct Config {
     /// [`SCAN_DIRECTORY_CACHE_IDLE_SECS_RANGE`] with a warning, `0` included.
     pub scan_directory_cache_idle_secs: Option<u32>,
 
+    /// The most entries a comic archive (`.cbz`, `.cb7`, `.cbt`) may hold for
+    /// a book's probe to count its pages, which set its runtime; past it the
+    /// book keeps the runtime it has. Upstream has no such cap. `None` =
+    /// [`ferrofin_providers::books::DEFAULT_ARCHIVE_MAX_ENTRIES`] (100 000).
+    /// Resolved `FERROFIN_BOOK_ARCHIVE_MAX_ENTRIES` env >
+    /// `book_archive_max_entries` in `config.toml` > default, clamped to
+    /// [`BOOK_ARCHIVE_MAX_ENTRIES_RANGE`] with a warning, `0` included.
+    pub book_archive_max_entries: Option<u32>,
+
     /// How long, in seconds, a resolved access token (its device, user and
     /// policy, an API key's name, or the rejection of a token that matched
     /// nothing) may be served from the auth cache. `None` = 30 s
@@ -1025,13 +1048,13 @@ impl Config {
             .parse()
             .map_err(|e| anyhow::anyhow!("invalid FERROFIN_BIND_ADDR `{bind_addr_str}`: {e}"))?;
 
-        let port = cli
-            .port
-            .or_else(|| parse_var(env, "FERROFIN_PORT"))
-            .or(file.port)
-            .unwrap_or(DEFAULT_HTTP_PORT);
+        let flag_or_env_port = cli.port.or_else(|| parse_var(env, "FERROFIN_PORT"));
+        let port_from_flag_or_env = flag_or_env_port.is_some();
+        let port = flag_or_env_port.or(file.port).unwrap_or(DEFAULT_HTTP_PORT);
 
-        let https_port = parse_var(env, "FERROFIN_HTTPS_PORT")
+        let env_https_port = parse_var(env, "FERROFIN_HTTPS_PORT");
+        let https_port_from_env = env_https_port.is_some();
+        let https_port = env_https_port
             .or(file.https_port)
             .unwrap_or(DEFAULT_HTTPS_PORT);
 
@@ -1233,7 +1256,9 @@ impl Config {
             discovery_bind_addr: Some(std::net::SocketAddr::from(([0, 0, 0, 0], 7359))),
             provider_endpoints: ProviderEndpoints::default(),
             port,
+            port_from_flag_or_env,
             https_port,
+            https_port_from_env,
             published_url,
             base_url,
             base_url_from_env,
@@ -1348,6 +1373,15 @@ impl Config {
                 file.scan_directory_cache_idle_secs,
                 &SCAN_DIRECTORY_CACHE_IDLE_SECS_RANGE,
                 "seconds",
+                Zero::InRange,
+            ),
+            book_archive_max_entries: resolve_clamped_or_unset(
+                env,
+                "FERROFIN_BOOK_ARCHIVE_MAX_ENTRIES",
+                "book_archive_max_entries",
+                file.book_archive_max_entries,
+                &BOOK_ARCHIVE_MAX_ENTRIES_RANGE,
+                "entries",
                 Zero::InRange,
             ),
             auth_cache_ttl_secs: resolve_cache_ttl(
@@ -1726,7 +1760,9 @@ impl Config {
             discovery_bind_addr: None,
             provider_endpoints: ProviderEndpoints::offline(),
             port: 0,
+            port_from_flag_or_env: false,
             https_port: 0,
+            https_port_from_env: false,
             published_url: None,
             base_url: String::new(),
             base_url_from_env: false,
@@ -1773,6 +1809,7 @@ impl Config {
             scan_probe_concurrency: None,
             scan_directory_cache_records: None,
             scan_directory_cache_idle_secs: None,
+            book_archive_max_entries: None,
             auth_cache_ttl_secs: None,
             row_cache_ttl_secs: None,
             trickplay_concurrency: None,
@@ -1853,6 +1890,11 @@ pub const SCAN_DIRECTORY_CACHE_RECORDS_RANGE: RangeInclusive<u32> = 1_000..=10_0
 /// The seconds a library scan's directory listings survive unread
 /// (`scan_directory_cache_idle_secs`).
 pub const SCAN_DIRECTORY_CACHE_IDLE_SECS_RANGE: RangeInclusive<u32> = 30..=3_600;
+
+/// The entries a comic archive may hold for a book's pages to be counted
+/// (`book_archive_max_entries`): from 1000, above the pages of any real
+/// comic, to the 10 million the scan's directory cache also stops at.
+pub const BOOK_ARCHIVE_MAX_ENTRIES_RANGE: RangeInclusive<u32> = 1_000..=10_000_000;
 
 /// The events the playback-metrics write queue holds
 /// (`playback_metrics_queue`).
@@ -2516,7 +2558,7 @@ pub(crate) fn parse_var<T: std::str::FromStr>(env: &dyn Env, key: &str) -> Optio
     let parsed = value.parse().ok();
     if parsed.is_none() {
         env.warn(format!(
-            "{key} `{raw}` is not a valid value and is ignored; config.toml or the default applies"
+            "{key} `{raw}` is not a valid value and is ignored, as if it were unset"
         ));
     }
     parsed
@@ -2599,6 +2641,7 @@ mod tests {
         assert_eq!(cfg.data_dir, PathBuf::from(NOWHERE).join("ferrofin"));
         assert_eq!(cfg.port, DEFAULT_HTTP_PORT);
         assert_eq!(cfg.https_port, DEFAULT_HTTPS_PORT);
+        assert!(!cfg.port_from_flag_or_env && !cfg.https_port_from_env);
         assert_eq!(cfg.bind_addr.to_string(), DEFAULT_BIND_ADDR);
         assert_eq!(cfg.log_level, DEFAULT_LOG_LEVEL);
         assert_eq!(cfg.admin_user, DEFAULT_ADMIN_USER);
@@ -2713,6 +2756,7 @@ mod tests {
         };
         let cfg = Config::load_from(cli, &env).unwrap();
         assert_eq!(cfg.port, 7000, "CLI port overrides env");
+        assert!(cfg.port_from_flag_or_env);
         assert_eq!(
             cfg.data_dir,
             PathBuf::from("/cli/data"),
@@ -2724,9 +2768,13 @@ mod tests {
 
     #[test]
     fn env_port_overrides_default() {
-        let env = FakeEnv::new().with("FERROFIN_PORT", "9000");
+        let env = FakeEnv::new()
+            .with("FERROFIN_PORT", "9000")
+            .with("FERROFIN_HTTPS_PORT", "9443");
         let cfg = Config::load_from(Cli::default(), &env).unwrap();
         assert_eq!(cfg.port, 9000);
+        assert_eq!(cfg.https_port, 9443);
+        assert!(cfg.port_from_flag_or_env && cfg.https_port_from_env);
     }
 
     #[test]
@@ -2805,6 +2853,7 @@ mod tests {
         };
         let cfg = Config::load_from(by_flag, &FakeEnv::new()).unwrap();
         assert_eq!(cfg.port, 5001, "--data-dir names the file");
+        assert!(!cfg.port_from_flag_or_env, "the file's port is not pinned");
         assert_eq!(cfg.config_file, flag_dir.join("config.toml"));
         assert!(cfg.config_file_found);
 
@@ -3200,6 +3249,10 @@ mod tests {
         assert_eq!(cfg.port, DEFAULT_HTTP_PORT);
         assert_eq!(cfg.enable_metrics, None);
         assert_eq!(cfg.https_port, DEFAULT_HTTPS_PORT);
+        assert!(
+            !cfg.port_from_flag_or_env && !cfg.https_port_from_env,
+            "neither pins its port over the Networking page"
+        );
         assert_eq!(
             cfg.shutdown_timeout_secs, 45,
             "surrounding blanks are not an error"
@@ -4425,6 +4478,40 @@ row_cache_ttl_secs = 10
     }
 
     #[test]
+    fn book_archive_max_entries_default_file_env_and_clamp() {
+        // Unset → None (the scanner keeps the providers' default).
+        let cfg = Config::load_from(Cli::default(), &FakeEnv::new()).unwrap();
+        assert_eq!(cfg.book_archive_max_entries, None);
+
+        let dir = tempfile::tempdir().unwrap();
+        let toml = dir.path().join("config.toml");
+        std::fs::write(&toml, "book_archive_max_entries = 5000\n").unwrap();
+        let cli = || Cli {
+            config_file: Some(toml.clone()),
+            ..Cli::default()
+        };
+        let cfg = Config::load_from(cli(), &FakeEnv::new()).unwrap();
+        assert_eq!(cfg.book_archive_max_entries, Some(5000));
+        // The variable beats the file.
+        let env = FakeEnv::new().with("FERROFIN_BOOK_ARCHIVE_MAX_ENTRIES", "20000");
+        let cfg = Config::load_from(cli(), &env).unwrap();
+        assert_eq!(cfg.book_archive_max_entries, Some(20000));
+
+        // Out of range, 0 included, is clamped with a warning naming it.
+        for (value, clamped) in [("0", 1_000), ("999", 1_000), ("10000001", 10_000_000)] {
+            let env = FakeEnv::new().with("FERROFIN_BOOK_ARCHIVE_MAX_ENTRIES", value);
+            let cfg = Config::load_from(Cli::default(), &env).unwrap();
+            assert_eq!(cfg.book_archive_max_entries, Some(clamped), "{value}");
+            assert_eq!(cfg.load_warnings.len(), 1, "{value}");
+            assert!(
+                cfg.load_warnings[0].contains("FERROFIN_BOOK_ARCHIVE_MAX_ENTRIES"),
+                "{value}: {:?}",
+                cfg.load_warnings
+            );
+        }
+    }
+
+    #[test]
     fn scan_progress_every_resolves_from_env_and_preserves_zero() {
         // Env value is used verbatim.
         let env = FakeEnv::new().with("FERROFIN_SCAN_PROGRESS_EVERY", "250");
@@ -4677,6 +4764,11 @@ row_cache_ttl_secs = 10
                 "scan_directory_cache_idle_secs",
                 secs(directories.idle_timeout),
                 SCAN_DIRECTORY_CACHE_IDLE_SECS_RANGE,
+            ),
+            (
+                "book_archive_max_entries",
+                ferrofin_providers::books::DEFAULT_ARCHIVE_MAX_ENTRIES,
+                BOOK_ARCHIVE_MAX_ENTRIES_RANGE,
             ),
             (
                 "playback_metrics_queue",

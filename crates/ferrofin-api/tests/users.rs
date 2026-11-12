@@ -1695,7 +1695,7 @@ impl ferrofin_traits::collections::PlaylistManager for RecordingPlaylists {
         &self,
         _playlist_id: Uuid,
         _user_id: Uuid,
-    ) -> Result<Vec<BaseItemEntity>, ServiceError> {
+    ) -> Result<ferrofin_traits::persistence::PlaylistMembers, ServiceError> {
         unimplemented!("unused")
     }
     async fn get_playlist_item_ids(&self, _playlist_id: Uuid) -> Result<Vec<Uuid>, ServiceError> {

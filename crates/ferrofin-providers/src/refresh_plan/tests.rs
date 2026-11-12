@@ -1128,3 +1128,44 @@ fn a_changed_library_or_a_moved_artist_requires_its_refresh(
     assert_eq!(p.run_all_providers, runs_all);
     assert_eq!(save(p, &opts, false).save, requires);
 }
+
+/// A book's probe counts its pages (`ProbeProvider.FetchAsync(Book)`). It
+/// runs on a new item, on a requested refresh ("Search for missing
+/// metadata" too) and when the file changed (`HasChanged`, `video is
+/// null`), but never for a missing runtime: `IsMissingMediaInfo` is false
+/// for a book.
+#[test]
+fn a_book_probes_when_its_file_changes_never_for_missing_media_info() {
+    let opts = MetadataRefreshOptions::default();
+    let book = FileFacts {
+        probe: ProbeKind::Book,
+        ..video()
+    };
+    assert!(plan(None, &book, &opts).probe, "new");
+    assert!(!plan(Some(&current()), &book, &opts).probe, "unchanged");
+    let no_runtime = StoredState {
+        run_time_ticks: None,
+        total_bitrate: None,
+        ..current()
+    };
+    assert!(!plan(Some(&no_runtime), &book, &opts).probe, "no runtime");
+    let touched = FileFacts {
+        mtime: Some(mtime() + TimeDelta::seconds(5)),
+        ..book
+    };
+    let changed = plan(Some(&current()), &touched, &opts);
+    assert!(changed.probe, "changed file");
+    assert_eq!(changed.reason, RefreshReason::Modified);
+    let undated = StoredState {
+        date_modified: None,
+        ..current()
+    };
+    assert!(plan(Some(&undated), &book, &opts).probe, "no stored mtime");
+    for mode in [FullRefresh, Default] {
+        let requested = MetadataRefreshOptions {
+            replace_all_metadata: mode == Default,
+            ..options(FullRefresh, mode)
+        };
+        assert!(plan(Some(&current()), &book, &requested).probe, "requested");
+    }
+}

@@ -49,10 +49,16 @@ async fn provider(
             )
                 .into_response();
         }
+        "/infos/languages" => {
+            let codes = ["en", "fr", "es", "pt-PT", "de"].map(|code| json!({"language_code":code}));
+            return Json(json!({"data":codes})).into_response();
+        }
         "/subtitles" => {
-            return Json(
-                json!({"data":[{"attributes":{"moviehash_match":false,"files":[{"file_id":42}]}}]}),
-            )
+            return Json(json!({"total_pages":1,"page":1,"data":[{"attributes":{
+                "moviehash_match":false,
+                "feature_details":{"feature_type":"Movie","imdb_id":133_093},
+                "files":[{"file_id":42}]
+            }}]}))
             .into_response();
         }
         _ => {}
@@ -1987,7 +1993,7 @@ async fn verify_automatic_subtitle_constraints(
             .iter()
             .any(|uri| uri.starts_with("/subtitles?")
                 && uri.contains("moviehash_match=only")
-                && uri.contains("imdb_id=0133093"))
+                && uri.contains("imdb_id=133093"))
     );
     assert!(
         !requests
@@ -2016,7 +2022,7 @@ async fn verify_automatic_subtitle_constraints(
             .iter()
             .any(|uri| uri.starts_with("/subtitles?")
                 && !uri.contains("moviehash_match=only")
-                && uri.contains("imdb_id=0133093"))
+                && uri.contains("imdb_id=133093"))
     );
 
     // Manual search candidates carry the upstream MD5 provider namespace, which
@@ -3508,10 +3514,12 @@ async fn verify_by_name_metadata_languages(
                 .get(&format!("/Items/{id}/RemoteImages?providerName=TheMovieDb"))
                 .await;
             let images = images["Images"].as_array().unwrap();
-            assert_eq!(images.len(), 3, "preferred/untagged/English: {images:?}");
+            assert_eq!(images.len(), 3, "preferred/English/untagged: {images:?}");
             assert_eq!(images[0]["Language"], image_tag);
             assert_eq!(images[0]["Width"], 1600);
-            assert!(images[1]["Language"].is_null() || images[1]["Language"] == "");
+            // Jellyfin 12's ladder: English (3) before untagged (2).
+            assert_eq!(images[1]["Language"], "en", "{images:?}");
+            assert!(images[2]["Language"].is_null() || images[2]["Language"] == "");
             let image = api
                 .client
                 .get(format!("{}/Items/{id}/Images/Primary", api.base))

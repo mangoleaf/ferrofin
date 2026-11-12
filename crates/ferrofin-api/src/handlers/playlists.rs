@@ -283,32 +283,49 @@ async fn get_playlist_items(
         state.users.get_user_by_id(calling_user_id).await?
     };
 
-    let mut items = state
+    let mut members = state
         .playlists
         .get_playlist_items(playlist_id, calling_user_id)
         .await?;
     // `GetManageableItems().Where(i => i.Item2.IsVisible(user))`: a member
     // the caller may not see is out of the page and the count, checked on the
-    // rows just read. Divergence (gl-1092): the standalone check, which also
-    // walks the member's library, where upstream's `IsVisible` reads only its
-    // rating and tags, so a member from a library the caller was not granted
-    // is dropped too.
+    // rows just read, once per distinct member. Divergence (gl-1092): the
+    // standalone check, which also walks the member's library, where
+    // upstream's `IsVisible` reads only its rating and tags, so a member from
+    // a library the caller was not granted is dropped too.
     if let Some(user) = &user {
-        items = state
+        let ids: Vec<String> = members.items.iter().map(|row| row.id.clone()).collect();
+        let visible = state
             .library
-            .filter_visible_items_standalone(items, user)
+            .filter_visible_items_standalone(std::mem::take(&mut members.items), user)
             .await?;
+        // The filter only drops rows, so with none dropped the entries stand.
+        if visible.len() != ids.len() {
+            let at: std::collections::HashMap<&str, usize> = visible
+                .iter()
+                .enumerate()
+                .map(|(index, row)| (row.id.as_str(), index))
+                .collect();
+            members.entries = members
+                .entries
+                .iter()
+                .filter_map(|&index| at.get(ids.get(index)?.as_str()).copied())
+                .collect();
+        }
+        members.items = visible;
     }
-    let total = i32::try_from(items.len()).unwrap_or(i32::MAX);
+    let total = i32::try_from(members.entries.len()).unwrap_or(i32::MAX);
 
     // LINQ's `Skip` skips nothing for a negative index and `Take` takes
     // nothing for a negative limit.
+    let entries = &mut members.entries;
     if let Some(start) = query.start_index {
-        items.drain(..usize::try_from(start).unwrap_or(0).min(items.len()));
+        entries.drain(..usize::try_from(start).unwrap_or(0).min(entries.len()));
     }
     if let Some(limit) = query.limit {
-        items.truncate(usize::try_from(limit).unwrap_or(0));
+        entries.truncate(usize::try_from(limit).unwrap_or(0));
     }
+    let items = members.into_entry_rows();
 
     // Built from the CLIENT's parameters, matching C# (v12.4 dropped
     // `.AddClientFields(User)` here):
