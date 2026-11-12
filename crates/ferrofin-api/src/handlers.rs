@@ -1616,6 +1616,14 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
                    create_tiles and move_dir (CreateTiles), \
                    and scheduled_tasks/library.rs TrickplayImagesTask, compared with \
                    MediaBrowser.Providers/Trickplay/TrickplayImagesTask.cs (ExecuteAsync). \
+                   Also the sets a changed video loses before its refresh: library_scan.rs \
+                   scan_item and file_changed, item_data_cleanup.rs prune_extracted_data, \
+                   external_data_manager.rs delete_external_item_data and \
+                   trickplay_manager.rs delete_trickplay_data, compared with \
+                   MediaBrowser.Providers/Manager/MetadataService.cs (BeforeSaveInternal), \
+                   Emby.Server.Implementations/Library/ExternalDataManager.cs \
+                   (DeleteExternalItemDataAsync) and TrickplayManager.cs \
+                   (DeleteTrickplayDataAsync). \
                    How ffmpeg extracts the frames, on either path, is the \
                    trickplay-extraction row's; how many generations run at once is not part \
                    of this row. Also BaseItemDto.Trickplay: which media sources it lists \
@@ -1633,7 +1641,7 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
                    Emby.Server.Implementations/Dto/DtoService.cs (the Trickplay field), \
                    MediaBrowser.Controller/Entities/BaseItem.cs (GetMediaSources) and \
                    MediaBrowser.Controller/Entities/Video.cs (GetAllItemsForMediaSources)",
-        date: "2026-11-06",
+        date: "2026-11-11",
         divergences: &[
             "An explicit Replace does not delete the item's trickplay folder and rows first: \
              each selected width is generated in the work directory and swapped in, so the old \
