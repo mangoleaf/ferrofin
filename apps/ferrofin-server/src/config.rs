@@ -22,6 +22,10 @@ use std::path::{Path, PathBuf};
 use clap::Parser;
 use ferrofin_core::user_manager::LoginBackoffSettings;
 use ferrofin_drawing::ImageLimits;
+use ferrofin_mediaencoding::encoder::media_encoder::{
+    ANALYZE_DURATION_RANGE, DEFAULT_ANALYZE_DURATION, DEFAULT_PROBE_SIZE, FfmpegCount,
+    PROBE_SIZE_RANGE,
+};
 use ferrofin_mediaencoding::transcoding::TranscodeLimits;
 use ferrofin_providers::rate_limit::RequestLimits;
 use ferrofin_providers::{DEFAULT_IMAGE_NEGATIVE_CACHE_TTL_SECS, IMAGE_NEGATIVE_CACHE_TTL_SECS};
@@ -169,6 +173,8 @@ struct FileConfig {
     ffmpeg_path: Option<PathBuf>,
     ffprobe_path: Option<PathBuf>,
     ffmpeg_img_extract_perf_tradeoff: Option<bool>,
+    ffmpeg_analyze_duration: Option<String>,
+    ffmpeg_probe_size: Option<String>,
     max_transcodes: Option<u32>,
     max_transcodes_per_user: Option<u32>,
     library_roots: Option<Vec<PathBuf>>,
@@ -556,6 +562,21 @@ pub struct Config {
     /// `ffmpeg_img_extract_perf_tradeoff` in `config.toml` > `false`,
     /// Jellyfin's default.
     pub ffmpeg_img_extract_perf_tradeoff: bool,
+
+    /// Jellyfin's `FFmpeg:analyzeduration` (`GetFFmpegAnalyzeDuration`): how
+    /// long, in microseconds, probes, transcodes and external subtitle inputs
+    /// analyse an input whose source names no duration of its own. Resolved
+    /// `FERROFIN_FFMPEG_ANALYZE_DURATION` env > `ffmpeg_analyze_duration` in
+    /// `config.toml` > `200M`, Jellyfin's default, clamped to
+    /// [`ANALYZE_DURATION_RANGE`].
+    pub ffmpeg_analyze_duration: FfmpegCount,
+
+    /// Jellyfin's `FFmpeg:probesize` (`GetFFmpegProbeSize`): how many bytes of
+    /// an input probes, transcodes and external subtitle inputs read to find
+    /// its streams. Resolved `FERROFIN_FFMPEG_PROBE_SIZE` env >
+    /// `ffmpeg_probe_size` in `config.toml` > `1G`, Jellyfin's default, clamped
+    /// to [`PROBE_SIZE_RANGE`].
+    pub ffmpeg_probe_size: FfmpegCount,
 
     /// Re-encoding jobs the whole server may run at once; `0` is no cap. Past
     /// it a signed-in user's idle job on the same device is ended first, and a
@@ -1299,6 +1320,24 @@ impl Config {
             )
             .or(file.ffmpeg_img_extract_perf_tradeoff)
             .unwrap_or(false),
+            ffmpeg_analyze_duration: resolve_ffmpeg_count(
+                env,
+                "FERROFIN_FFMPEG_ANALYZE_DURATION",
+                "ffmpeg_analyze_duration",
+                file.ffmpeg_analyze_duration,
+                DEFAULT_ANALYZE_DURATION,
+                ANALYZE_DURATION_RANGE,
+                "microseconds",
+            ),
+            ffmpeg_probe_size: resolve_ffmpeg_count(
+                env,
+                "FERROFIN_FFMPEG_PROBE_SIZE",
+                "ffmpeg_probe_size",
+                file.ffmpeg_probe_size,
+                DEFAULT_PROBE_SIZE,
+                PROBE_SIZE_RANGE,
+                "bytes",
+            ),
             library_roots,
             server_name,
             log_level,
@@ -1786,6 +1825,8 @@ impl Config {
             ffmpeg_path: None,
             ffprobe_path: None,
             ffmpeg_img_extract_perf_tradeoff: false,
+            ffmpeg_analyze_duration: DEFAULT_ANALYZE_DURATION,
+            ffmpeg_probe_size: DEFAULT_PROBE_SIZE,
             max_transcodes: 0,
             max_transcodes_per_user: 0,
             library_roots: Vec::new(),
@@ -1982,6 +2023,33 @@ where
 {
     let value = parse_var(env, env_key).or(file).unwrap_or(default);
     clamp_with_warning(env, env_key, file_key, value, &range, unit)
+}
+
+/// Resolves an ffmpeg input-analysis value in ffmpeg's syntax
+/// (`ffmpeg_analyze_duration`, `ffmpeg_probe_size`): `env_key` when it parses,
+/// else `file` when it parses, else `default`, clamped to `range`. A value
+/// that does not parse warns ([`Env::warn`]) and is skipped, so the server
+/// always boots.
+fn resolve_ffmpeg_count(
+    env: &dyn Env,
+    env_key: &str,
+    file_key: &str,
+    file: Option<String>,
+    default: FfmpegCount,
+    range: RangeInclusive<FfmpegCount>,
+    unit: &str,
+) -> FfmpegCount {
+    let file = file.filter(|raw| !raw.trim().is_empty()).and_then(|raw| {
+        let parsed = raw.trim().parse().ok();
+        if parsed.is_none() {
+            env.warn(format!(
+                "{file_key} `{raw}` in config.toml is not an ffmpeg value such as 200M or 1G \
+                 and is ignored"
+            ));
+        }
+        parsed
+    });
+    resolve_clamped(env, env_key, file_key, file, default, range, unit)
 }
 
 /// `hours` of `tvdb_cache_hours` clamped to [`TVDB_CACHE_HOURS_RANGE`]: the
@@ -3931,6 +3999,71 @@ mod tests {
         let cfg = Config::load_from(cli, &env).unwrap();
         assert_eq!(caps(&cfg), (1024, 1024));
         assert_eq!(cfg.load_warnings.len(), 2, "{:?}", cfg.load_warnings);
+    }
+
+    /// gl-734: `FFmpeg:analyzeduration` / `FFmpeg:probesize` default to
+    /// Jellyfin's `200M` / `1G`, the file sets them in ffmpeg's syntax, the
+    /// variable beats the file, a value outside the range is clamped and one
+    /// that does not parse is ignored, each with a warning naming the setting.
+    #[test]
+    fn ffmpeg_input_analysis_defaults_env_beats_file_clamps_and_ignores_junk() {
+        let analysis = |cfg: &Config| {
+            (
+                cfg.ffmpeg_analyze_duration.to_string(),
+                cfg.ffmpeg_probe_size.to_string(),
+            )
+        };
+        let unset = Config::load_from(Cli::default(), &FakeEnv::new()).unwrap();
+        assert_eq!(analysis(&unset), ("200M".to_owned(), "1G".to_owned()));
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            "ffmpeg_analyze_duration = \"8M\"\nffmpeg_probe_size = \"32Mi\"\n",
+        )
+        .unwrap();
+        let cli = Cli {
+            config_file: Some(path.clone()),
+            ..Cli::default()
+        };
+        let cfg = Config::load_from(cli.clone(), &FakeEnv::new()).unwrap();
+        assert!(cfg.load_warnings.is_empty(), "{:?}", cfg.load_warnings);
+        assert_eq!(analysis(&cfg), ("8M".to_owned(), "33554432".to_owned()));
+
+        let env = FakeEnv::new()
+            .with("FERROFIN_FFMPEG_ANALYZE_DURATION", "1M")
+            .with("FERROFIN_FFMPEG_PROBE_SIZE", " ");
+        let cfg = Config::load_from(cli.clone(), &env).unwrap();
+        assert_eq!(analysis(&cfg), ("1M".to_owned(), "33554432".to_owned()));
+
+        let env = FakeEnv::new()
+            .with("FERROFIN_FFMPEG_ANALYZE_DURATION", "1000M")
+            .with("FERROFIN_FFMPEG_PROBE_SIZE", "64k");
+        let cfg = Config::load_from(cli.clone(), &env).unwrap();
+        assert_eq!(analysis(&cfg), ("600M".to_owned(), "1M".to_owned()));
+        assert_eq!(cfg.load_warnings.len(), 2, "{:?}", cfg.load_warnings);
+        assert!(
+            cfg.load_warnings[0].contains("FERROFIN_FFMPEG_ANALYZE_DURATION")
+                && cfg.load_warnings[0].contains("1M to 600M"),
+            "{:?}",
+            cfg.load_warnings
+        );
+
+        // Junk in the variable falls through to the file; junk in the file
+        // to the default.
+        std::fs::write(&path, "ffmpeg_probe_size = \"lots\"\n").unwrap();
+        let env = FakeEnv::new().with("FERROFIN_FFMPEG_ANALYZE_DURATION", "200m");
+        let cfg = Config::load_from(cli.clone(), &env).unwrap();
+        assert_eq!(analysis(&cfg), ("200M".to_owned(), "1G".to_owned()));
+        assert_eq!(cfg.load_warnings.len(), 2, "{:?}", cfg.load_warnings);
+
+        // A blank value, as a save of an empty field writes it, is the
+        // default, with no warning.
+        std::fs::write(&path, "ffmpeg_probe_size = \"\"\n").unwrap();
+        let cfg = Config::load_from(cli, &FakeEnv::new()).unwrap();
+        assert_eq!(analysis(&cfg), ("200M".to_owned(), "1G".to_owned()));
+        assert!(cfg.load_warnings.is_empty(), "{:?}", cfg.load_warnings);
     }
 
     /// gl-1320: the item-values write chunk defaults to the library

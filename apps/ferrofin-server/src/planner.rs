@@ -37,6 +37,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use ferrofin_core::FerrofinServerApplicationPaths;
 use ferrofin_hls::{PlaylistKind, StreamStatePlanner, TranscodePlan};
+use ferrofin_mediaencoding::encoder::media_encoder::InputAnalysis;
 use ferrofin_mediaencoding::encoder::{FfmpegVersion, split_args};
 use ferrofin_mediaencoding::encoding_helper::helper::{
     shift_audio_codecs_if_needed, shift_video_codecs_if_needed, should_encode_subtitle,
@@ -182,6 +183,9 @@ pub struct FerrofinStreamStatePlanner {
     /// that may need them, and names the folder the `subtitles` filter reads
     /// them from. `None` (unit tests that do not burn in) skips both.
     attachments: Option<(Arc<dyn AttachmentExtractor>, Arc<dyn PathManager>)>,
+    /// The `-analyzeduration` / `-probesize` the media file and an external
+    /// subtitle read with; Jellyfin's defaults unless configured.
+    input_analysis: InputAnalysis,
 }
 
 impl FerrofinStreamStatePlanner {
@@ -219,7 +223,17 @@ impl FerrofinStreamStatePlanner {
             library: None,
             virtual_folders: None,
             attachments: None,
+            input_analysis: InputAnalysis::default(),
         }
+    }
+
+    /// Sets the configured `FFmpeg:analyzeduration` / `FFmpeg:probesize`
+    /// (`ffmpeg_analyze_duration`, `ffmpeg_probe_size`). The composition root
+    /// calls this.
+    #[must_use]
+    pub fn with_input_analysis(mut self, input_analysis: InputAnalysis) -> Self {
+        self.input_analysis = input_analysis;
+        self
     }
 
     /// Wires attachment extraction, so a burned-in text subtitle finds the
@@ -1910,17 +1924,12 @@ impl FerrofinStreamStatePlanner {
         );
         // `GetInputModifier`'s `GetFfmpegAnalyzeDurationArg` (the source's own
         // `AnalyzeDurationMs`, the 3 s a Live TV source carries, else the
-        // `FFmpeg:analyzeduration` default) and `GetFfmpegProbesizeArg`;
+        // configured `FFmpeg:analyzeduration`) and `GetFfmpegProbesizeArg`;
         // GetInputArgument then yields the full `-i file:"…"` fragment.
-        push_split(&mut args, "-analyzeduration");
-        args.push(
-            ferrofin_mediaencoding::encoder::media_encoder::analyze_duration_value(
-                state.media_source.analyze_duration_ms,
-                ferrofin_mediaencoding::encoder::media_encoder::DEFAULT_ANALYZE_DURATION,
-            ),
+        args.extend(
+            self.input_analysis
+                .input_args(state.media_source.analyze_duration_ms),
         );
-        push_split(&mut args, "-probesize");
-        args.push(ferrofin_mediaencoding::encoder::media_encoder::DEFAULT_PROBE_SIZE.to_owned());
         // `GetUserAgentParam`, then `GetRefererParam`: the headers a remote
         // source (a tuner, a playlist channel) requires, as the probe sends
         // them. Each value is one argv element, never parsed as options.
@@ -1973,6 +1982,7 @@ impl FerrofinStreamStatePlanner {
                 state,
                 fast_seek.as_deref(),
                 caps.ffmpeg_version(),
+                &self.input_analysis,
             ),
         );
 
@@ -3677,6 +3687,31 @@ mod tests {
             let args = plan.arguments.join(" ");
             assert!(
                 args.contains(&format!("-analyzeduration {analyze} -probesize 1G")),
+                "{id}: {args}"
+            );
+        }
+    }
+
+    /// A configured `FFmpeg:analyzeduration` / `FFmpeg:probesize`
+    /// (`ffmpeg_analyze_duration`, `ffmpeg_probe_size`) replaces the defaults
+    /// on the media file's input; a source's own analyze duration still wins.
+    #[tokio::test]
+    async fn the_configured_input_analysis_reaches_the_media_files_input() {
+        let mut live = source("live", vec![video_stream("h264"), audio_stream("aac")]);
+        live.analyze_duration_ms = Some(3000);
+        let file = source("file", vec![video_stream("h264"), audio_stream("aac")]);
+        let p = planner(vec![live, file]).with_input_analysis(InputAnalysis {
+            analyze_duration: "8M".parse().unwrap(),
+            probe_size: "32M".parse().unwrap(),
+        });
+        for (id, analyze) in [("live", "3000000"), ("file", "8M")] {
+            let plan = p
+                .plan(&request(id), false, Some(0), PlaylistKind::Vod)
+                .await
+                .unwrap();
+            let args = plan.arguments.join(" ");
+            assert!(
+                args.contains(&format!("-analyzeduration {analyze} -probesize 32M -")),
                 "{id}: {args}"
             );
         }
@@ -5916,14 +5951,21 @@ mod tests {
     }
 
     /// A sidecar the encoder cannot cut (unreadable, unparsable) is read as it
-    /// is, seeked, with the output trim the ffmpeg has, as before gl-1199.
+    /// is, seeked, with the output trim the ffmpeg has, as before gl-1199; and
+    /// with the configured `FFmpeg:analyzeduration` / `FFmpeg:probesize`
+    /// (gl-734).
     #[tokio::test]
     async fn a_sidecar_that_cannot_be_cut_is_read_as_it_is() {
         let subtitles = Arc::new(CuttingSubtitles {
             format: None,
             starts: std::sync::Mutex::new(Vec::new()),
         });
-        let p = cutting_planner(Some((4, 4)), Arc::clone(&subtitles));
+        let p = cutting_planner(Some((4, 4)), Arc::clone(&subtitles)).with_input_analysis(
+            InputAnalysis {
+                analyze_duration: "8M".parse().unwrap(),
+                probe_size: "32M".parse().unwrap(),
+            },
+        );
 
         let plan = p
             .plan(
@@ -5942,9 +5984,9 @@ mod tests {
             inputs_after_the_media(args),
             [
                 "-analyzeduration",
-                "200M",
+                "8M",
                 "-probesize",
-                "1G",
+                "32M",
                 "-ss",
                 "90000000",
                 "-i",

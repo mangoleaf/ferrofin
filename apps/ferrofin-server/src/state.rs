@@ -956,15 +956,11 @@ pub async fn build_app_state(
             ffmpeg.ffprobe.to_string_lossy().into_owned(),
             MediaEncoderConfig {
                 // Jellyfin's `FFmpeg:analyzeduration` / `FFmpeg:probesize`
-                // defaults, which every probe passes; without them ffprobe
-                // falls back to its own 5 s / 5 MB and can miss late streams.
-                analyze_duration: Some(
-                    ferrofin_mediaencoding::encoder::media_encoder::DEFAULT_ANALYZE_DURATION
-                        .to_owned(),
-                ),
-                probe_size: Some(
-                    ferrofin_mediaencoding::encoder::media_encoder::DEFAULT_PROBE_SIZE.to_owned(),
-                ),
+                // (`200M` / `1G` unless configured), which every probe passes;
+                // without them ffprobe falls back to its own 5 s / 5 MB and
+                // can miss late streams.
+                analyze_duration: Some(config.ffmpeg_analyze_duration.to_string()),
+                probe_size: Some(config.ffmpeg_probe_size.to_string()),
                 // `GetNumberOfThreads(null, options, null)`; it reads no
                 // capability, only the usable cores, as the planner's does.
                 threads: ferrofin_mediaencoding::EncodingHelper::new(
@@ -3050,6 +3046,10 @@ pub async fn build_app_state(
             transcode_limits: TranscodeLimits {
                 server: config.max_transcodes,
                 per_user: config.max_transcodes_per_user,
+            },
+            input_analysis: ferrofin_mediaencoding::encoder::media_encoder::InputAnalysis {
+                analyze_duration: config.ffmpeg_analyze_duration,
+                probe_size: config.ffmpeg_probe_size,
             },
         },
     );

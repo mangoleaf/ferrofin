@@ -30,6 +30,7 @@ use ferrofin_model::session::TranscodeReasons;
 use ferrofin_traits::media_encoding::TranscodingJobType;
 
 use crate::encoder::FfmpegVersion;
+use crate::encoder::media_encoder::InputAnalysis;
 
 use super::bitstream;
 use super::transcode_state::{BaseEncodingJobOptions, EncoderCapabilities, EncodingJobInfo};
@@ -1708,10 +1709,11 @@ const MIN_FFMPEG_INPUT_SYNC: FfmpegVersion = FfmpegVersion::new(5, 1);
 /// `fast_seek` is the media file's own `-ss` value, if it seeks: the inputs
 /// are seeked alike, so the tracks stay in step with the video, except the
 /// bitmap sidecars the divergences below read from their start. A subtitle
-/// input reads with the media file's `-analyzeduration` and `-probesize`, and
-/// a burned-in graphical one with its canvas size. A VobSub `.sub` is read
-/// through its `.idx` when one lies beside it, since the `.idx` names the
-/// `.sub` and carries the palette and timing.
+/// input reads with the media file's `-analyzeduration` and `-probesize`
+/// (`input_analysis`: the configured `FFmpeg:analyzeduration` and
+/// `FFmpeg:probesize`), and a burned-in graphical one with its canvas size. A
+/// VobSub `.sub` is read through its `.idx` when one lies beside it, since the
+/// `.idx` names the `.sub` and carries the palette and timing.
 ///
 /// Divergence: each external input is also synced to the media file's clock
 /// (`-isync 0`, from ffmpeg 5.1, `ffmpeg_version`). Without `-copyts` ffmpeg
@@ -1787,6 +1789,7 @@ pub fn external_stream_input_arguments(
     state: &EncodingJobInfo,
     fast_seek: Option<&str>,
     ffmpeg_version: Option<FfmpegVersion>,
+    input_analysis: &InputAnalysis,
 ) -> Vec<String> {
     let mut args = Vec::new();
     let can_sync = ffmpeg_version.is_some_and(|version| version >= MIN_FFMPEG_INPUT_SYNC);
@@ -1825,15 +1828,7 @@ pub fn external_stream_input_arguments(
                 path = idx.to_string_lossy().into_owned();
             }
         }
-        args.extend([
-            "-analyzeduration".to_owned(),
-            crate::encoder::media_encoder::analyze_duration_value(
-                state.media_source.analyze_duration_ms,
-                crate::encoder::media_encoder::DEFAULT_ANALYZE_DURATION,
-            ),
-            "-probesize".to_owned(),
-            crate::encoder::media_encoder::DEFAULT_PROBE_SIZE.to_owned(),
-        ]);
+        args.extend(input_analysis.input_args(state.media_source.analyze_duration_ms));
         let bitmap = !sub.is_text_subtitle_stream();
         let burned_in = should_encode_subtitle(state) && bitmap;
         // A bitmap sidecar is read from its start, embedded or burned in, on
