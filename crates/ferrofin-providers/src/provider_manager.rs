@@ -655,15 +655,23 @@ fn parse_numeric_provider_id(raw: &str) -> Option<i64> {
     raw.trim().parse::<i64>().ok()
 }
 
+/// `AlbumInfoExtensions.MusicBrainzId` (`AlbumInfoExtensions.cs:87-88`): the
+/// `key` id in `ids` only when it can be one of that provider's
+/// (`IsValidProviderId`), so another service's id under a MusicBrainz key
+/// reads as no id and the caller falls back to the next source.
+fn musicbrainz_id_of<'a>(ids: Option<&'a HashMap<String, String>>, key: &str) -> Option<&'a str> {
+    provider_id_of(ids, key).filter(|id| crate::metadata_merge::is_valid_provider_id(key, id))
+}
+
 /// `AlbumInfoExtensions.GetReleaseId` / `GetReleaseGroupId`: the album's own
 /// `key`, else the first contained song that carries one.
 fn album_id_or_song_id(request: &RemoteSearchRequest, key: &str) -> Option<String> {
-    provider_id_of(request.search_info.provider_ids.as_ref(), key)
+    musicbrainz_id_of(request.search_info.provider_ids.as_ref(), key)
         .or_else(|| {
             request
                 .song_infos
                 .iter()
-                .find_map(|song| provider_id_of(song.base.provider_ids.as_ref(), key))
+                .find_map(|song| musicbrainz_id_of(song.base.provider_ids.as_ref(), key))
         })
         .map(str::to_owned)
 }
@@ -672,14 +680,14 @@ fn album_id_or_song_id(request: &RemoteSearchRequest, key: &str) -> Option<Strin
 /// `MusicBrainzAlbumArtist`, else the artist's `MusicBrainzArtist` (from
 /// `ArtistProviderIds`), else the first song's `MusicBrainzAlbumArtist`.
 fn album_artist_mbid(request: &RemoteSearchRequest) -> Option<String> {
-    provider_id_of(
+    musicbrainz_id_of(
         request.search_info.provider_ids.as_ref(),
         "MusicBrainzAlbumArtist",
     )
-    .or_else(|| provider_id_of(request.artist_provider_ids.as_ref(), "MusicBrainzArtist"))
+    .or_else(|| musicbrainz_id_of(request.artist_provider_ids.as_ref(), "MusicBrainzArtist"))
     .or_else(|| {
         request.song_infos.iter().find_map(|song| {
-            provider_id_of(song.base.provider_ids.as_ref(), "MusicBrainzAlbumArtist")
+            musicbrainz_id_of(song.base.provider_ids.as_ref(), "MusicBrainzAlbumArtist")
         })
     })
     .map(str::to_owned)
@@ -700,16 +708,31 @@ fn album_artist_name(request: &RemoteSearchRequest) -> Option<&str> {
 /// `AlbumInfoExtensions.GetMusicBrainzArtistId(ArtistInfo)`: the artist's own
 /// `MusicBrainzArtist`, else the first song's `MusicBrainzAlbumArtist`.
 fn artist_mbid(request: &RemoteSearchRequest) -> Option<String> {
-    provider_id_of(
+    musicbrainz_id_of(
         request.search_info.provider_ids.as_ref(),
         "MusicBrainzArtist",
     )
     .or_else(|| {
         request.song_infos.iter().find_map(|song| {
-            provider_id_of(song.base.provider_ids.as_ref(), "MusicBrainzAlbumArtist")
+            musicbrainz_id_of(song.base.provider_ids.as_ref(), "MusicBrainzAlbumArtist")
         })
     })
     .map(str::to_owned)
+}
+
+/// A MusicBrainz request of the "Identify" flow, failing the provider when
+/// it fails, as the C# `HttpError` does (`MusicBrainzQueryExtensions.cs`).
+/// A by-id lookup MusicBrainz answers with a 404 (or never sends, for a
+/// malformed id) is no failure but `None` (`NotFoundAsNullAsync`), and the
+/// search goes on to its next step. `what` names the request in the error.
+async fn or_failed<T>(
+    what: &str,
+    request: impl std::future::Future<Output = T>,
+) -> Result<T, ServiceError> {
+    match crate::rate_limit::count_request_failures(request).await {
+        (output, 0) => Ok(output),
+        _ => Err(ServiceError::backend(format!("MusicBrainz {what} failed"))),
+    }
 }
 
 /// Maps one MusicBrainz release hit into the "Identify" result shape — port of
@@ -797,7 +820,7 @@ impl RemoteSearchProvider for MusicBrainzAlbumSearchProvider {
     }
 
     /// `MusicBrainzAlbumProvider.Order => 0`
-    /// (`MusicBrainz/MusicBrainzAlbumProvider.cs:46`) — it wants to be first.
+    /// (`MusicBrainz/MusicBrainzAlbumProvider.cs:41`) — it wants to be first.
     fn default_order(&self) -> i32 {
         0
     }
@@ -806,25 +829,28 @@ impl RemoteSearchProvider for MusicBrainzAlbumSearchProvider {
         &self,
         request: &RemoteSearchRequest,
     ) -> Result<Vec<RemoteSearchResult>, ServiceError> {
-        // A release id on the item resolves it exactly (`LookupReleaseAsync`).
-        if let Some(release_id) = album_id_or_song_id(request, "MusicBrainzAlbum") {
-            return Ok(self
-                .musicbrainz
-                .lookup_release(&release_id)
-                .await
-                .map(release_search_result)
-                .into_iter()
-                .collect());
+        // A release id on the item resolves it exactly
+        // (`LookupReleaseOrNullAsync`); one MusicBrainz does not know (404)
+        // or that is malformed falls through to the release group.
+        if let Some(release_id) = album_id_or_song_id(request, "MusicBrainzAlbum")
+            && let Some(hit) = or_failed(
+                "release lookup",
+                self.musicbrainz.lookup_release(&release_id),
+            )
+            .await?
+        {
+            return Ok(vec![release_search_result(hit)]);
         }
-        // A release-group id expands to every release in the group.
-        if let Some(group_id) = album_id_or_song_id(request, "MusicBrainzReleaseGroup") {
-            return Ok(self
-                .musicbrainz
-                .release_group_releases(&group_id)
-                .await
-                .into_iter()
-                .map(release_search_result)
-                .collect());
+        // A release group MusicBrainz knows expands to every release in it,
+        // even none; an unknown one falls through to the name search.
+        if let Some(group_id) = album_id_or_song_id(request, "MusicBrainzReleaseGroup")
+            && let Some(releases) = or_failed(
+                "release group lookup",
+                Box::pin(self.musicbrainz.release_group_releases(&group_id)),
+            )
+            .await?
+        {
+            return Ok(releases.into_iter().map(release_search_result).collect());
         }
         let name = request.search_info.name.as_deref().unwrap_or_default();
         let query = if let Some(arid) = album_artist_mbid(request) {
@@ -838,20 +864,20 @@ impl RemoteSearchProvider for MusicBrainzAlbumSearchProvider {
             let artist = album_artist_name(request).unwrap_or_default();
             format!("\"{query_name}\" AND artist:\"{artist}\"")
         };
-        Ok(self
-            .musicbrainz
-            .find_releases(&query)
-            .await
-            .into_iter()
-            .map(release_search_result)
-            .collect())
+        Ok(
+            or_failed("release search", self.musicbrainz.find_releases(&query))
+                .await?
+                .into_iter()
+                .map(release_search_result)
+                .collect(),
+        )
     }
 }
 
 /// A [`RemoteSearchProvider`] over MusicBrainz artists — the "Identify" flow
 /// for a `MusicArtist`. Port of `MusicBrainzArtistProvider.GetSearchResults`:
-/// a known artist id resolves exactly, else a phrase search by name, retried
-/// through `artistaccent:` when the name carries diacritics.
+/// a known artist id resolves exactly, else a phrase search by a non-blank
+/// name, retried through `artistaccent:` when the name carries diacritics.
 pub struct MusicBrainzArtistSearchProvider {
     musicbrainz: Arc<crate::musicbrainz::MusicBrainzClient>,
 }
@@ -875,38 +901,38 @@ impl RemoteSearchProvider for MusicBrainzArtistSearchProvider {
         item_kind == BaseItemKind::MusicArtist
     }
 
-    /// `MusicBrainzArtistProvider` implements `IRemoteMetadataProvider` and
-    /// `IDisposable` but **not** `IHasOrder`
-    /// (`MusicBrainz/MusicBrainzArtistProvider.cs:25`) — unlike its album
-    /// sibling, which declares 0. Upstream's default 50.
+    /// `MusicBrainzArtistProvider.Order => 0`
+    /// (`MusicBrainz/MusicBrainzArtistProvider.cs:41`, `IHasOrder` since
+    /// v12.0) — first, like its album sibling.
     fn default_order(&self) -> i32 {
-        50
+        0
     }
 
     async fn get_search_results(
         &self,
         request: &RemoteSearchRequest,
     ) -> Result<Vec<RemoteSearchResult>, ServiceError> {
-        if let Some(artist_id) = artist_mbid(request) {
-            return Ok(self
-                .musicbrainz
-                .lookup_artist(&artist_id)
-                .await
-                .map(artist_search_result)
-                .into_iter()
-                .collect());
+        // `LookupArtistOrNullAsync`: an id MusicBrainz does not know (404)
+        // falls through to the name search.
+        if let Some(artist_id) = artist_mbid(request)
+            && let Some(hit) =
+                or_failed("artist lookup", self.musicbrainz.lookup_artist(&artist_id)).await?
+        {
+            return Ok(vec![artist_search_result(hit)]);
         }
         let name = request.search_info.name.as_deref().unwrap_or_default();
-        let hits = self.musicbrainz.find_artists(&format!("\"{name}\"")).await;
+        if name.trim().is_empty() {
+            return Ok(Vec::new());
+        }
+        let phrase = format!("\"{name}\"");
+        let hits = or_failed("artist search", self.musicbrainz.find_artists(&phrase)).await?;
         if !hits.is_empty() {
             return Ok(hits.into_iter().map(artist_search_result).collect());
         }
         if ferrofin_util::string_extensions::has_diacritics(name) {
             // Retry through the accent-preserving field.
-            let hits = self
-                .musicbrainz
-                .find_artists(&format!("artistaccent:\"{name}\""))
-                .await;
+            let accent = format!("artistaccent:\"{name}\"");
+            let hits = or_failed("artist search", self.musicbrainz.find_artists(&accent)).await?;
             return Ok(hits.into_iter().map(artist_search_result).collect());
         }
         Ok(Vec::new())
@@ -914,11 +940,13 @@ impl RemoteSearchProvider for MusicBrainzArtistSearchProvider {
 }
 
 /// The TheAudioDb face of the "Identify" flow for a `MusicAlbum` /
-/// `MusicArtist`. Port of `AudioDbAlbumProvider.GetSearchResults` /
-/// `AudioDbArtistProvider.GetSearchResults`, which both return an empty set —
-/// TheAudioDb has no name search, it is keyed by MusicBrainz id and only
-/// contributes during the metadata fetch. Registered so the provider is
-/// selectable by name exactly as it is in Jellyfin.
+/// `MusicArtist`. Port of `AudioDbAlbumProvider.GetSearchResults`, which
+/// returns an empty set: TheAudioDb contributes to an album only during the
+/// metadata fetch. Registered so the provider is selectable by name exactly
+/// as it is in Jellyfin. TODO(gl-497): v12.4's
+/// `AudioDbArtistProvider.GetSearchResults` searches, by the artist's
+/// `AudioDbArtist` id, else its MusicBrainz id, else its name; the artist
+/// half still returns nothing.
 pub struct AudioDbSearchProvider {
     supported: BaseItemKind,
 }
@@ -942,11 +970,11 @@ impl RemoteSearchProvider for AudioDbSearchProvider {
         item_kind == self.supported
     }
 
-    /// `AudioDbArtistProvider.Order => 1` (`AudioDb/AudioDbArtistProvider.cs:52`)
-    /// and `AudioDbAlbumProvider.Order => 1` (`AudioDb/AudioDbAlbumProvider.cs:53`)
+    /// `AudioDbArtistProvider.Order => 1` (`AudioDb/AudioDbArtistProvider.cs:55`)
+    /// and `AudioDbAlbumProvider.Order => 1` (`AudioDb/AudioDbAlbumProvider.cs:54`)
     /// — both kinds this instance can be built for declare 1, which puts
-    /// TheAudioDb after MusicBrainz's album provider (0) and before an
-    /// unranked one (50).
+    /// TheAudioDb after the MusicBrainz providers (0) and before an unranked
+    /// one (50).
     fn default_order(&self) -> i32 {
         1
     }
@@ -5723,40 +5751,432 @@ mod tests {
         );
     }
 
+    /// `AlbumInfoExtensionsTests.ExampleMbid` / `SongMbid`.
+    const EXAMPLE_MBID: &str = "59b5a40b-e2fd-3f18-a218-e8c9aae12ab5";
+    const SONG_MBID: &str = "6c301dbd-6ccb-3403-a6c4-6a22240a0297";
+
+    /// A song lookup carrying `ids`.
+    fn song_with(ids: &[(&str, &str)]) -> ferrofin_model::providers::SongInfo {
+        ferrofin_model::providers::SongInfo {
+            base: ItemLookupInfo {
+                provider_ids: Some(
+                    ids.iter()
+                        .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+                        .collect(),
+                ),
+                ..ItemLookupInfo::default()
+            },
+            ..ferrofin_model::providers::SongInfo::default()
+        }
+    }
+
     #[test]
     fn album_artist_mbid_follows_the_c_sharp_precedence() {
         use super::album_artist_mbid;
+        const ARTIST: &str = "c0000000-0000-4000-8000-0000000000a1";
         // Own `MusicBrainzAlbumArtist` wins.
         let mut request = id_request(
             BaseItemKind::MusicAlbum,
-            &[("MusicBrainzAlbumArtist", "own")],
+            &[("MusicBrainzAlbumArtist", EXAMPLE_MBID)],
         );
         request.artist_provider_ids = Some(HashMap::from([(
             "MusicBrainzArtist".to_owned(),
-            "artist".to_owned(),
+            ARTIST.to_owned(),
         )]));
-        assert_eq!(album_artist_mbid(&request).as_deref(), Some("own"));
+        assert_eq!(album_artist_mbid(&request).as_deref(), Some(EXAMPLE_MBID));
         // Then the artist's own id.
         request.search_info.provider_ids = None;
-        assert_eq!(album_artist_mbid(&request).as_deref(), Some("artist"));
+        assert_eq!(album_artist_mbid(&request).as_deref(), Some(ARTIST));
         // Then the first song's album-artist id; blanks are absent.
         request.artist_provider_ids = Some(HashMap::from([(
             "MusicBrainzArtist".to_owned(),
             "  ".to_owned(),
         )]));
-        request.song_infos = vec![ferrofin_model::providers::SongInfo {
-            base: ItemLookupInfo {
-                provider_ids: Some(HashMap::from([(
-                    "MusicBrainzAlbumArtist".to_owned(),
-                    "song".to_owned(),
-                )])),
-                ..ItemLookupInfo::default()
-            },
-            ..ferrofin_model::providers::SongInfo::default()
-        }];
-        assert_eq!(album_artist_mbid(&request).as_deref(), Some("song"));
+        request.song_infos = vec![song_with(&[("MusicBrainzAlbumArtist", SONG_MBID)])];
+        assert_eq!(album_artist_mbid(&request).as_deref(), Some(SONG_MBID));
         request.song_infos.clear();
         assert!(album_artist_mbid(&request).is_none());
+    }
+
+    /// `AlbumInfoExtensionsTests.GetReleaseId_OnlyReturnsMbids`: another
+    /// provider's id under a MusicBrainz key reads as no id.
+    #[rstest::rstest]
+    #[case(EXAMPLE_MBID, Some(EXAMPLE_MBID))]
+    #[case("111239", None)]
+    #[case("", None)]
+    fn the_release_id_is_only_an_mbid(#[case] id: &str, #[case] expected: Option<&str>) {
+        let request = id_request(BaseItemKind::MusicAlbum, &[("MusicBrainzAlbum", id)]);
+        assert_eq!(
+            super::album_id_or_song_id(&request, "MusicBrainzAlbum").as_deref(),
+            expected
+        );
+    }
+
+    /// `AlbumInfoExtensionsTests.GetReleaseId_ForeignId_FallsBackToSongs`.
+    #[test]
+    fn a_foreign_release_id_falls_back_to_the_songs() {
+        let mut request = id_request(BaseItemKind::MusicAlbum, &[("MusicBrainzAlbum", "111239")]);
+        request.song_infos = vec![song_with(&[("MusicBrainzAlbum", SONG_MBID)])];
+        assert_eq!(
+            super::album_id_or_song_id(&request, "MusicBrainzAlbum").as_deref(),
+            Some(SONG_MBID)
+        );
+    }
+
+    /// `AlbumInfoExtensionsTests.GetMusicBrainzArtistId_ForeignId_FallsBackToArtistIds`.
+    #[test]
+    fn a_foreign_album_artist_id_falls_back_to_the_artist_ids() {
+        let mut request = id_request(
+            BaseItemKind::MusicAlbum,
+            &[("MusicBrainzAlbumArtist", "111239")],
+        );
+        request.artist_provider_ids = Some(HashMap::from([(
+            "MusicBrainzArtist".to_owned(),
+            EXAMPLE_MBID.to_owned(),
+        )]));
+        assert_eq!(
+            super::album_artist_mbid(&request).as_deref(),
+            Some(EXAMPLE_MBID)
+        );
+    }
+
+    /// `AlbumInfoExtensionsTests.GetMusicBrainzArtistId_ArtistInfo_OnlyReturnsMbids`.
+    #[rstest::rstest]
+    #[case(EXAMPLE_MBID, Some(EXAMPLE_MBID))]
+    #[case("111239", None)]
+    fn the_artist_id_is_only_an_mbid(#[case] id: &str, #[case] expected: Option<&str>) {
+        let request = id_request(BaseItemKind::MusicArtist, &[("MusicBrainzArtist", id)]);
+        assert_eq!(super::artist_mbid(&request).as_deref(), expected);
+    }
+
+    /// `GetMusicBrainzArtistId(ArtistInfo)`: a foreign artist id falls back
+    /// to the first song's `MusicBrainzAlbumArtist`.
+    #[test]
+    fn a_foreign_artist_id_falls_back_to_the_songs() {
+        let mut request = id_request(
+            BaseItemKind::MusicArtist,
+            &[("MusicBrainzArtist", "111239")],
+        );
+        request.song_infos = vec![song_with(&[("MusicBrainzAlbumArtist", SONG_MBID)])];
+        assert_eq!(super::artist_mbid(&request).as_deref(), Some(SONG_MBID));
+    }
+
+    /// A mock MusicBrainz that answers `routes` and 404 to anything else, the
+    /// way it answers an id it merged away or deleted.
+    async fn musicbrainz_404_over(
+        routes: Vec<(&'static str, &'static str)>,
+    ) -> (
+        crate::mock_http::MockServer,
+        Arc<crate::musicbrainz::MusicBrainzClient>,
+    ) {
+        let server = crate::mock_http::MockServer::start_typed(
+            routes
+                .into_iter()
+                .map(|(path, body)| (path, "application/json", body.as_bytes().to_vec()))
+                .collect(),
+        )
+        .await;
+        let client = Arc::new(crate::musicbrainz::MusicBrainzClient::new(
+            &server.base_url,
+            "test",
+        ));
+        (server, client)
+    }
+
+    /// The names of `results`, in order.
+    fn result_names(results: &[RemoteSearchResult]) -> Vec<&str> {
+        results.iter().filter_map(|r| r.name.as_deref()).collect()
+    }
+
+    /// `LookupReleaseOrNullAsync` (gl-499): a release id MusicBrainz no
+    /// longer knows falls through to the release group.
+    #[tokio::test]
+    async fn musicbrainz_album_identify_falls_through_an_unknown_release_to_its_group() {
+        use super::MusicBrainzAlbumSearchProvider;
+        let (_server, mb) = musicbrainz_404_over(vec![
+            (
+                "/ws/2/release-group/c0000000-0000-4000-8000-000000000007",
+                r#"{"releases":[{"id":"c0000000-0000-4000-8000-00000000000a"}]}"#,
+            ),
+            (
+                "/ws/2/release/c0000000-0000-4000-8000-00000000000a",
+                r#"{"id":"c0000000-0000-4000-8000-00000000000a","title":"From the group"}"#,
+            ),
+        ])
+        .await;
+        let provider = MusicBrainzAlbumSearchProvider::new(mb);
+        let results = provider
+            .get_search_results(&id_request(
+                BaseItemKind::MusicAlbum,
+                &[
+                    ("MusicBrainzAlbum", "c0000000-0000-4000-8000-000000000404"),
+                    (
+                        "MusicBrainzReleaseGroup",
+                        "c0000000-0000-4000-8000-000000000007",
+                    ),
+                ],
+            ))
+            .await
+            .expect("results");
+        assert_eq!(result_names(&results), ["From the group"]);
+    }
+
+    /// `LookupReleaseGroupOrNullAsync` (gl-499): with neither id known to
+    /// MusicBrainz, the name/artist search still runs.
+    #[tokio::test]
+    async fn musicbrainz_album_identify_falls_through_unknown_ids_to_the_name_search() {
+        use super::MusicBrainzAlbumSearchProvider;
+        let (_server, mb) = musicbrainz_404_over(vec![("/ws/2/release?", MB_RELEASE_HIT)]).await;
+        let provider = MusicBrainzAlbumSearchProvider::new(mb);
+        let mut request = id_request(
+            BaseItemKind::MusicAlbum,
+            &[
+                ("MusicBrainzAlbum", "c0000000-0000-4000-8000-000000000404"),
+                (
+                    "MusicBrainzReleaseGroup",
+                    "c0000000-0000-4000-8000-000000000405",
+                ),
+            ],
+        );
+        request.search_info.name = Some("Kind of Blue".to_owned());
+        let results = provider
+            .get_search_results(&request)
+            .await
+            .expect("results");
+        assert_eq!(result_names(&results), ["Kind of Blue"]);
+    }
+
+    /// `AlbumInfoExtensions.MusicBrainzId` + `ParseMusicBrainzId` (gl-499): a
+    /// malformed release id is no id, and a malformed album-artist id is no
+    /// `arid:` term — the search goes by the artist's name instead.
+    #[tokio::test]
+    async fn musicbrainz_album_identify_ignores_malformed_ids() {
+        use super::MusicBrainzAlbumSearchProvider;
+        let (server, mb) =
+            musicbrainz_over(vec![("/ws/2/release?", MB_RELEASE_HIT.to_owned())]).await;
+        let provider = MusicBrainzAlbumSearchProvider::new(mb);
+        let mut request = id_request(
+            BaseItemKind::MusicAlbum,
+            &[
+                ("MusicBrainzAlbum", "111239"),
+                ("MusicBrainzAlbumArtist", "111239"),
+            ],
+        );
+        request.search_info.name = Some("Kind of Blue".to_owned());
+        request.album_artists = vec!["Miles Davis".to_owned()];
+        let results = provider
+            .get_search_results(&request)
+            .await
+            .expect("results");
+        assert_eq!(result_names(&results), ["Kind of Blue"]);
+        assert_eq!(
+            server.query_values("/ws/2/release", "query"),
+            [r#""Kind of Blue" AND artist:"Miles Davis""#]
+        );
+    }
+
+    /// `GetSearchResults`: a valid album-artist MBID narrows the name search
+    /// by `arid:`.
+    #[tokio::test]
+    async fn musicbrainz_album_identify_narrows_by_a_valid_album_artist_mbid() {
+        use super::MusicBrainzAlbumSearchProvider;
+        let (server, mb) =
+            musicbrainz_over(vec![("/ws/2/release?", MB_RELEASE_HIT.to_owned())]).await;
+        let mut request = id_request(
+            BaseItemKind::MusicAlbum,
+            &[("MusicBrainzAlbumArtist", EXAMPLE_MBID)],
+        );
+        request.search_info.name = Some("Kind of Blue".to_owned());
+        let results = MusicBrainzAlbumSearchProvider::new(mb)
+            .get_search_results(&request)
+            .await
+            .expect("results");
+        assert_eq!(result_names(&results), ["Kind of Blue"]);
+        assert_eq!(
+            server.query_values("/ws/2/release", "query"),
+            [format!(r#""Kind of Blue" AND arid:{EXAMPLE_MBID}"#)]
+        );
+    }
+
+    /// `GetSearchResults` returns a release group's releases whenever the
+    /// group exists, so a group with none ends the search empty.
+    #[tokio::test]
+    async fn musicbrainz_album_identify_stops_at_an_existing_empty_group() {
+        use super::MusicBrainzAlbumSearchProvider;
+        let (server, mb) = musicbrainz_over(vec![
+            ("/ws/2/release-group/", r#"{"releases":[]}"#.to_owned()),
+            ("/ws/2/release?", MB_RELEASE_HIT.to_owned()),
+        ])
+        .await;
+        let provider = MusicBrainzAlbumSearchProvider::new(mb);
+        let mut request = id_request(
+            BaseItemKind::MusicAlbum,
+            &[(
+                "MusicBrainzReleaseGroup",
+                "c0000000-0000-4000-8000-000000000007",
+            )],
+        );
+        request.search_info.name = Some("Kind of Blue".to_owned());
+        let results = provider
+            .get_search_results(&request)
+            .await
+            .expect("results");
+        assert!(results.is_empty(), "{results:?}");
+        let searches = server.query_values("/ws/2/release", "query");
+        assert!(searches.is_empty(), "{searches:?}");
+    }
+
+    /// `GetReleaseGroupResultAsync`: a release in the group that answers 404
+    /// is skipped and the walk goes on.
+    #[tokio::test]
+    async fn musicbrainz_album_identify_skips_a_group_release_that_is_gone() {
+        use super::MusicBrainzAlbumSearchProvider;
+        let (_server, mb) = musicbrainz_404_over(vec![
+            (
+                "/ws/2/release-group/c0000000-0000-4000-8000-000000000007",
+                r#"{"releases":[{"id":"c0000000-0000-4000-8000-00000000000a"},{"id":"c0000000-0000-4000-8000-000000000404"},{"id":"c0000000-0000-4000-8000-00000000000b"}]}"#,
+            ),
+            (
+                "/ws/2/release/c0000000-0000-4000-8000-00000000000a",
+                r#"{"id":"c0000000-0000-4000-8000-00000000000a","title":"A"}"#,
+            ),
+            (
+                "/ws/2/release/c0000000-0000-4000-8000-00000000000b",
+                r#"{"id":"c0000000-0000-4000-8000-00000000000b","title":"B"}"#,
+            ),
+        ])
+        .await;
+        let results = MusicBrainzAlbumSearchProvider::new(mb)
+            .get_search_results(&id_request(
+                BaseItemKind::MusicAlbum,
+                &[(
+                    "MusicBrainzReleaseGroup",
+                    "c0000000-0000-4000-8000-000000000007",
+                )],
+            ))
+            .await
+            .expect("results");
+        assert_eq!(result_names(&results), ["A", "B"]);
+    }
+
+    /// A group release whose lookup fails other than with a 404 ends the
+    /// walk with the releases before it: upstream's exception stops the
+    /// enumeration, and `GetRemoteSearchResults` keeps what it added.
+    #[tokio::test]
+    async fn musicbrainz_album_identify_keeps_the_group_releases_before_a_failed_one() {
+        use super::MusicBrainzAlbumSearchProvider;
+        use crate::mock_http::MockServer;
+        let json = "Content-Type: application/json\r\n";
+        let server = MockServer::start_raw(vec![
+            MockServer::raw_ok(
+                json,
+                br#"{"releases":[{"id":"c0000000-0000-4000-8000-00000000000a"},{"id":"c0000000-0000-4000-8000-00000000000b"},{"id":"c0000000-0000-4000-8000-00000000000c"}]}"#,
+            ),
+            MockServer::raw_ok(
+                json,
+                br#"{"id":"c0000000-0000-4000-8000-00000000000a","title":"A"}"#,
+            ),
+            MockServer::raw_status("400 Bad Request"),
+        ])
+        .await;
+        let mb = Arc::new(crate::musicbrainz::MusicBrainzClient::new(
+            &server.base_url,
+            "test",
+        ));
+        let results = MusicBrainzAlbumSearchProvider::new(mb)
+            .get_search_results(&id_request(
+                BaseItemKind::MusicAlbum,
+                &[(
+                    "MusicBrainzReleaseGroup",
+                    "c0000000-0000-4000-8000-000000000007",
+                )],
+            ))
+            .await
+            .expect("results");
+        assert_eq!(result_names(&results), ["A"]);
+        assert_eq!(server.requests(), 3);
+    }
+
+    /// `LookupArtistOrNullAsync` (gl-499): an artist id MusicBrainz no
+    /// longer knows falls through to the name search.
+    #[tokio::test]
+    async fn musicbrainz_artist_identify_falls_through_an_unknown_id_to_the_name_search() {
+        use super::MusicBrainzArtistSearchProvider;
+        let (_server, mb) = musicbrainz_404_over(vec![(
+            "/ws/2/artist?",
+            r#"{"artists":[{"id":"c0000000-0000-4000-8000-00000000000c","name":"Miles Davis"}]}"#,
+        )])
+        .await;
+        let provider = MusicBrainzArtistSearchProvider::new(mb);
+        for id in ["c0000000-0000-4000-8000-000000000406", "not-an-mbid"] {
+            let mut request = id_request(BaseItemKind::MusicArtist, &[("MusicBrainzArtist", id)]);
+            request.search_info.name = Some("Miles Davis".to_owned());
+            let results = provider
+                .get_search_results(&request)
+                .await
+                .expect("results");
+            assert_eq!(result_names(&results), ["Miles Davis"], "id {id}");
+        }
+    }
+
+    /// `NotFoundAsNullAsync` maps only a lookup's 404 to null: any other
+    /// failed lookup, and a failed name search (`Find*WithRetryAsync`), fails
+    /// the provider (its `HttpError`) and asks nothing more, not even the
+    /// `artistaccent:` retry. A `Tmdb` key leaves no MBID, so the name
+    /// search is the first request.
+    #[rstest::rstest]
+    #[case(BaseItemKind::MusicAlbum, "MusicBrainzAlbum")]
+    #[case(BaseItemKind::MusicAlbum, "MusicBrainzReleaseGroup")]
+    #[case(BaseItemKind::MusicAlbum, "Tmdb")]
+    #[case(BaseItemKind::MusicArtist, "MusicBrainzArtist")]
+    #[case(BaseItemKind::MusicArtist, "Tmdb")]
+    #[tokio::test]
+    async fn musicbrainz_identify_fails_on_a_request_error_other_than_a_lookup_404(
+        #[case] kind: BaseItemKind,
+        #[case] key: &str,
+    ) {
+        use super::{MusicBrainzAlbumSearchProvider, MusicBrainzArtistSearchProvider};
+        let server = crate::mock_http::MockServer::start_raw(vec![
+            crate::mock_http::MockServer::raw_status("400 Bad Request"),
+        ])
+        .await;
+        let mb = Arc::new(crate::musicbrainz::MusicBrainzClient::new(
+            &server.base_url,
+            "test",
+        ));
+        let mut request = id_request(kind, &[(key, EXAMPLE_MBID)]);
+        request.search_info.name = Some("Björk".to_owned());
+        let result = if kind == BaseItemKind::MusicAlbum {
+            MusicBrainzAlbumSearchProvider::new(mb)
+                .get_search_results(&request)
+                .await
+        } else {
+            MusicBrainzArtistSearchProvider::new(mb)
+                .get_search_results(&request)
+                .await
+        };
+        assert!(result.is_err(), "{result:?}");
+        assert_eq!(server.requests(), 1);
+    }
+
+    /// `if (string.IsNullOrWhiteSpace(searchInfo.Name)) return [];`.
+    #[tokio::test]
+    async fn musicbrainz_artist_identify_does_not_search_a_blank_name() {
+        use super::MusicBrainzArtistSearchProvider;
+        let (server, mb) = musicbrainz_over(vec![(
+            "/ws/2/artist?",
+            r#"{"artists":[{"id":"c0000000-0000-4000-8000-00000000000c","name":"Anyone"}]}"#
+                .to_owned(),
+        )])
+        .await;
+        let provider = MusicBrainzArtistSearchProvider::new(mb);
+        let results = provider
+            .get_search_results(&named_request(BaseItemKind::MusicArtist, "  "))
+            .await
+            .expect("results");
+        assert!(results.is_empty(), "{results:?}");
+        let searches = server.query_values("/ws/2/artist", "query");
+        assert!(searches.is_empty(), "{searches:?}");
     }
 
     #[tokio::test]
