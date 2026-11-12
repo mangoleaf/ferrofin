@@ -77,6 +77,7 @@ fn build_state(
         is_input_video: true,
         subtitle_delivery_method: method.unwrap_or(SubtitleDeliveryMethod::Drop),
         trimmed_subtitle_path: None,
+        transcode_reasons: ferrofin_model::session::TranscodeReasons::empty(),
         run_time_ticks: None,
         transcoding_type: TranscodingJobType::Progressive,
         supported_video_codecs: Vec::new(),

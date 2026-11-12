@@ -200,6 +200,7 @@ fn state(output_path: &Path, session: &str, streams: Streams) -> EncodingJobInfo
         is_input_video: streams.video.is_some(),
         subtitle_delivery_method: SubtitleDeliveryMethod::Encode,
         trimmed_subtitle_path: None,
+        transcode_reasons: ferrofin_model::session::TranscodeReasons::empty(),
         run_time_ticks: None,
         transcoding_type: TranscodingJobType::Hls,
         supported_video_codecs: Vec::new(),
