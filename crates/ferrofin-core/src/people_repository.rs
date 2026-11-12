@@ -1079,6 +1079,32 @@ async fn insert_credit_rows(
     Ok(())
 }
 
+/// Deletes the `Peoples` rows among `candidates` that no credit maps to any
+/// more: upstream's `DeleteCreditsWithoutMapping` over a candidate list
+/// (v12.4 `PeopleRepository.cs:263-275`). Their `Person` items stay for the
+/// "Refresh People" task, as upstream leaves them.
+pub(crate) async fn delete_credits_without_mapping(
+    conn: &mut SqliteConnection,
+    candidates: &[String],
+) -> Result<(), ServiceError> {
+    if candidates.is_empty() {
+        return Ok(());
+    }
+    // One JSON array bind, so a whole library's credits need no chunking.
+    let candidates =
+        serde_json::to_string(candidates).map_err(|e| ServiceError::Backend(e.to_string()))?;
+    sqlx::query(DELETE_CREDITS_WITHOUT_MAPPING_SQL)
+        .bind(candidates)
+        .execute(conn)
+        .await
+        .map_err(db_err)?;
+    Ok(())
+}
+
+const DELETE_CREDITS_WITHOUT_MAPPING_SQL: &str = r#"DELETE FROM "Peoples"
+   WHERE "Id" IN (SELECT value FROM json_each(?1))
+     AND NOT EXISTS (SELECT 1 FROM "PeopleBaseItemMap" m WHERE m."PeopleId" = "Peoples"."Id")"#;
+
 /// The stored `Peoples` rows (`Id`, `Name`, `PersonType`) whose name matches
 /// one of `count` names (`?1`…) under `COLLATE NOCASE`.
 fn peoples_by_names_sql(count: usize) -> String {
@@ -2025,12 +2051,15 @@ impl PeopleRepository for FerrofinPeopleRepository {
         // first statement takes SQLite's write lock upfront, so a concurrent writer
         // (e.g. a page load's playstate update during a scan) can't invalidate a
         // read snapshot and trip `SQLITE_BUSY_SNAPSHOT` (which busy_timeout won't
-        // retry). The map is rebuilt below.
-        sqlx::query(r#"DELETE FROM "PeopleBaseItemMap" WHERE "ItemId" = ?1"#)
-            .bind(guid_to_db(item_id))
-            .execute(&mut *tx)
-            .await
-            .map_err(db_err)?;
+        // retry). The map is rebuilt below, then the persons it credited that
+        // no item credits any more are deleted (upstream's `droppedCredits`).
+        let unmapped: Vec<String> = sqlx::query_scalar(
+            r#"DELETE FROM "PeopleBaseItemMap" WHERE "ItemId" = ?1 RETURNING "PeopleId""#,
+        )
+        .bind(guid_to_db(item_id))
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(db_err)?;
 
         // Ensure a Peoples row exists for each (case-insensitive name + type),
         // reusing an existing id where present so credits share one person row.
@@ -2066,6 +2095,7 @@ impl PeopleRepository for FerrofinPeopleRepository {
         let people_ids: Vec<String> = slots.iter().map(|&slot| person_ids[slot].clone()).collect();
 
         insert_credit_rows(&mut tx, item_id, &people_ids, &deduped, &stored_roles).await?;
+        delete_credits_without_mapping(&mut tx, &unmapped).await?;
         tx.commit().await.map_err(db_err)?;
         self.create_person_directories(&deduped).await;
         Ok(written)
@@ -2930,6 +2960,46 @@ mod tests {
         }
     }
 
+    /// `PeopleRepositoryNameRangeTests.GetPeople_NameRange_IgnoresCase`
+    /// (v12.4): the letter picker's range ignores case, as the list's order
+    /// does, so a capitalised name does not sort below every lowercase bound.
+    #[rstest::rstest]
+    #[case(None, Some("A"), &["50 Cent"])]
+    #[case(None, Some("C"), &["50 Cent", "alpha centauri", "bob dylan", "Brad Pitt"])]
+    #[case(Some("B"), Some("C"), &["bob dylan", "Brad Pitt"])]
+    #[case(Some("Y"), None, &["Zoe Saldana"])]
+    #[tokio::test]
+    async fn get_people_name_range_ignores_case(
+        #[case] name_starts_with_or_greater: Option<&str>,
+        #[case] name_less_than: Option<&str>,
+        #[case] expected: &[&str],
+    ) {
+        let db = test_db().await;
+        for name in [
+            "50 Cent",
+            "alpha centauri",
+            "Brad Pitt",
+            "bob dylan",
+            "Zoe Saldana",
+        ] {
+            super::seed_people_row(&db, Uuid::new_v4(), name, "Actor").await;
+        }
+        let result = FerrofinPeopleRepository::new(db)
+            .get_people(&InternalPeopleQuery {
+                name_starts_with_or_greater: name_starts_with_or_greater.map(str::to_owned),
+                name_less_than: name_less_than.map(str::to_owned),
+                ..Default::default()
+            })
+            .await
+            .expect("people");
+        let names: Vec<&str> = result.items.iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(names, expected);
+        assert_eq!(
+            result.total_record_count,
+            i32::try_from(expected.len()).unwrap()
+        );
+    }
+
     #[rstest::rstest]
     #[case("İpek")]
     #[case("ΟΣ")]
@@ -3456,6 +3526,80 @@ mod tests {
         ])
         .await;
         assert_eq!(maps, [row("Person A", "Actor", "Hero")]);
+    }
+
+    /// `UpdatePeople_CreditDroppedByTheProvider_LeavesNoCreditRowBehind`
+    /// (v12.4): the person row of a credit the refresh dropped goes in the
+    /// same write.
+    #[tokio::test]
+    async fn update_people_deletes_the_person_rows_it_leaves_uncredited() {
+        let (maps, people, ids, _) = update_people_runs(&[
+            &[
+                credit("Person A", "Actor", "Hero"),
+                credit("Person B", "Actor", "Villain"),
+            ],
+            &[credit("Person A", "Actor", "Hero")],
+        ])
+        .await;
+        assert_eq!(ids[0].len(), 2);
+        assert_eq!(maps, [row("Person A", "Actor", "Hero")]);
+        assert_eq!(people.len(), 1, "Person B's row went with its credit");
+    }
+
+    /// `UpdatePeople_CreditStillHeldByAnotherItem_IsKept` (v12.4).
+    #[tokio::test]
+    async fn update_people_keeps_a_person_row_another_item_credits() {
+        let db = test_db().await;
+        let (movie, other) = (Uuid::new_v4(), Uuid::new_v4());
+        let repo = FerrofinPeopleRepository::new(db.clone());
+        for item in [movie, other] {
+            seed_item(&db, item, BaseItemKind::Movie).await;
+            repo.update_people(item, &[credit("Person A", "Actor", "Hero")])
+                .await
+                .expect("credit");
+        }
+
+        repo.update_people(movie, &[]).await.expect("uncredit");
+
+        assert_eq!(super::people_row_count(&db).await, 1);
+        let maps: i64 = sqlx::query_scalar(r#"SELECT COUNT(*) FROM "PeopleBaseItemMap""#)
+            .fetch_one(db.pool())
+            .await
+            .expect("maps");
+        assert_eq!(maps, 1);
+    }
+
+    /// The uncredited-person delete seeks each candidate by its key and its
+    /// credits by `PeopleId`: it runs on every changed refresh and every
+    /// deletion, so it never scans `Peoples` or the credit rows.
+    #[tokio::test]
+    async fn the_uncredited_person_delete_seeks_by_key() {
+        let db = test_db().await;
+        let plan: Vec<(i64, i64, i64, String)> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+            "EXPLAIN QUERY PLAN {}",
+            super::DELETE_CREDITS_WITHOUT_MAPPING_SQL
+        )))
+        .bind("[]")
+        .fetch_all(db.pool())
+        .await
+        .expect("plan");
+        let plan: Vec<String> = plan.into_iter().map(|(.., detail)| detail).collect();
+        assert!(
+            plan.iter()
+                .any(|s| s.starts_with("SEARCH Peoples") && s.contains("(Id=?)")),
+            "the candidates sought by Id, got: {plan:?}"
+        );
+        assert!(
+            plan.iter()
+                .any(|s| s.starts_with("SEARCH m") && s.contains("(PeopleId=?)")),
+            "the credits sought by PeopleId, got: {plan:?}"
+        );
+        assert!(
+            !plan
+                .iter()
+                .any(|s| s.starts_with("SCAN Peoples") || s.starts_with("SCAN m")),
+            "never a scan, got: {plan:?}"
+        );
     }
 
     /// A repository over a fresh database with one movie, whose person ids
