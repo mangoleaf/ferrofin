@@ -1083,7 +1083,9 @@ async fn bind_http_listeners(
     let paths = bootstrap::application_paths(config);
     let saved = state::load_network_configuration(&paths).await;
     let (port, _) = listen::ports(config, &saved);
-    let network = ferrofin_networking::NetworkManager::live(saved);
+    // Quiet: the shared manager logs the settings it ignores, once.
+    let network =
+        ferrofin_networking::NetworkManager::live(saved, Arc::new(ferrofin_networking::NullLogger));
     let addresses = listen_addresses(config, Some(&network), port);
     anyhow::ensure!(
         !addresses.is_empty(),

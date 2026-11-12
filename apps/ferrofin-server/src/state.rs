@@ -1029,7 +1029,10 @@ pub async fn build_app_state(
         crate::base_url::resolve(&config.base_url, config.base_url_from_env, &network_config);
     let started_network = network_config.clone();
     let network = Arc::new(std::sync::RwLock::new(
-        ferrofin_networking::NetworkManager::live(network_config),
+        ferrofin_networking::NetworkManager::live(
+            network_config,
+            Arc::new(ferrofin_networking::TracingLogger),
+        ),
     ));
 
     let users_impl = Arc::new(

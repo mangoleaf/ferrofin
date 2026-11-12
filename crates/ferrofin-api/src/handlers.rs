@@ -3068,7 +3068,11 @@ pub const VERIFIED: &[Verified] = &[
                ConvertEmptyStringToNull, then [Required]; normalize_named_configuration: \
                GetConfigurationType and Deserialize) → save_named_configuration \
                (BaseConfigurationManager.SaveConfiguration: the validating store, the write, \
-               the live network policy, the listeners (ferrofin-server listen.rs \
+               the live network policy (ferrofin-networking NetworkManager::update_settings: \
+               UpdateSettings, warning of each LAN or exclusion entry InitializeLan ignores \
+               and logging an error for each override InitializeOverrides cannot parse, the \
+               loop stopping at the first without exactly one '=' as upstream's does), the \
+               listeners (ferrofin-server listen.rs \
                restart_listener: the port restart of OnConfigurationUpdated), the committed \
                checks for ApplicationHost.OnConfigurationUpdated) → for livetv \
                LiveTvManager::create_recording_folders (ferrofin-livetv recording_folders.rs: \
@@ -3111,6 +3115,9 @@ pub const VERIFIED: &[Verified] = &[
          at every boot and the restart flag stays set once raised; but upstream also clears \
          IsPortAuthorized and saves when it flags the restart, and Ferrofin leaves it true. \
          Fix path: gl-1701.",
+            "An unparsable PublishedServerUriBySubnet entry is logged with its URL cut to \
+         scheme, host and port (docs/conventions/LOGGING.md rule 5), where upstream logs the \
+         entry whole.",
             "The 400 and 500 bodies are Ferrofin's error shape, not upstream's. Fix path: \
          gl-666.",
         ],
