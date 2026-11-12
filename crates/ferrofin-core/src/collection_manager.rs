@@ -1977,13 +1977,15 @@ mod playlist_announcements_tests;
 #[cfg(test)]
 mod remove_playlists_tests;
 
+mod saved_containers;
+
 /// One playlist entry: `(ChildId, ChildType)` as stored.
 type Entry = (String, i64);
 
 /// A playlist's entries in stored order. Entries are positions, not a set:
 /// the same item may appear more than once (12.0's `(ParentId, SortOrder)` key).
-async fn read_entries(
-    pool: &sqlx::SqlitePool,
+async fn read_entries<'e>(
+    executor: impl sqlx::SqliteExecutor<'e>,
     playlist_id: &str,
 ) -> Result<Vec<Entry>, ServiceError> {
     sqlx::query_as(
@@ -1991,7 +1993,7 @@ async fn read_entries(
            WHERE "ParentId" = ?1 ORDER BY "SortOrder""#,
     )
     .bind(playlist_id)
-    .fetch_all(pool)
+    .fetch_all(executor)
     .await
     .map_err(db_err)
 }
