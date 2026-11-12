@@ -1747,10 +1747,10 @@ impl FerrofinItemPersistenceService {
     /// its permissions, in the same writer transaction
     /// ([`crate::item_data::sync_saved_playlist_in`]): the
     /// row the caller saves was read earlier, and its copy of those keys must
-    /// not undo a share change committed since, which the next boot's
-    /// re-import from `Data` would make real. A scan's save of a playlist
-    /// without a `FerrofinPlaylists` row first imports one from the `Data` it
-    /// wrote ([`crate::item_data::import_playlist_meta_if_missing_in`]).
+    /// not undo, in `Data`, a share change committed since (`Data` stays an
+    /// exact copy of the tables, [`crate::item_data`]). A scan's save of a
+    /// playlist without a `FerrofinPlaylists` row first imports one from the
+    /// `Data` it wrote ([`crate::item_data::import_playlist_meta_if_missing_in`]).
     ///
     /// The `Path` written is the stored one when that is a virtual-path form
     /// of the item's ([`Self::stored_virtual_path`]).

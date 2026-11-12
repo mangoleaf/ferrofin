@@ -1514,8 +1514,8 @@ impl PlaylistManager for FerrofinPlaylistManager {
                 (!entries.is_empty()).then(chrono::Utc::now),
             )
             .await?;
-            // Write the owner, open access and shares into BaseItems.Data, which
-            // 12.0 still serialises and each boot re-imports.
+            // Write the owner, open access and shares through to BaseItems.Data,
+            // which 12.0 still serialises (the item_data module doc says why).
             item_data::sync_container_data_in(&mut tx, id).await?;
             // `Playlist.PlaylistMediaType`, which Jellyfin reads back from `Data`.
             item_data::set_data_key_in(&mut tx, id, "PlaylistMediaType", media_type).await?;
@@ -1578,8 +1578,8 @@ impl PlaylistManager for FerrofinPlaylistManager {
         // C# `UpdatePlaylist` saves the name, shares and open access together
         // (the last `UpdatePlaylistInternal`). Every change here commits with
         // the `Data` sync in one writer transaction, so a failed update
-        // applies none of them: a share or open-access change committed
-        // without its sync would be undone by the next boot's re-import. A
+        // applies none of them: a share or open-access change never commits
+        // without its sync, so `Data` stays an exact copy of the tables. A
         // playlist no boot has imported yet is imported first, so its
         // open-access and share changes land on its own rows.
         let mut tx = self.db.writer().begin().await.map_err(db_err)?;
@@ -1702,8 +1702,8 @@ impl PlaylistManager for FerrofinPlaylistManager {
         &self,
         request: &PlaylistUserUpdateRequest,
     ) -> Result<(), ServiceError> {
-        // The share row, committed with its `Data` sync: each boot rebuilds
-        // the shares from `Data`.
+        // The share row, committed with its `Data` sync, so `Data` stays an
+        // exact copy of the tables.
         let mut tx = self.db.writer().begin().await.map_err(db_err)?;
         item_data::import_playlist_meta_if_missing_in(&mut tx, request.id).await?;
         item_data::share_playlist_in(
@@ -1917,11 +1917,11 @@ impl PlaylistManager for FerrofinPlaylistManager {
         let mut first_error = None;
         for playlist in item_data::playlists_owned_by(&self.db, user_id).await? {
             let outcome = async {
-                // A hand-over commits with its `Data` sync, as every boot
-                // re-imports the owner and the shares from `Data`. It reads
-                // before it writes, so it takes the lock first: the boot
-                // repair of orphaned playlists runs it while the previous
-                // version can still be writing.
+                // A hand-over commits with its `Data` sync, so `Data` stays an
+                // exact copy of the owner and the shares. It reads before it
+                // writes, so it takes the lock first: the boot repair of
+                // orphaned playlists runs it while the previous version can
+                // still be writing.
                 let mut tx = self
                     .db
                     .writer()
@@ -3997,8 +3997,8 @@ mod tests {
     }
 
     /// A re-rate saves only the rating: a share revoked between the re-rate's
-    /// read and its save stays revoked in `Data`, so the boot re-import of the
-    /// shares from `Data` does not bring it back.
+    /// read and its save stays revoked, in the tables and in `Data`, and a
+    /// restart does not bring it back.
     #[tokio::test]
     async fn a_rerate_keeps_a_share_change_made_since_its_read() {
         use ferrofin_model::entities_media::PlaylistUserPermissions;
@@ -4031,9 +4031,7 @@ mod tests {
 
         let stored = crate::test_support::fetch_item(&db, playlist_id).await;
         assert_eq!(stored.official_rating.as_deref(), Some("PG"));
-        crate::item_data::reconcile_playlist_permissions(&db)
-            .await
-            .expect("boot re-import");
+        crate::item_data::reimport_from_data(&db, playlist_id).await;
         assert!(
             mgr.get_playlist_shares(playlist_id)
                 .await
@@ -4044,8 +4042,8 @@ mod tests {
     }
 
     /// A whole-row save (the metadata editor's `POST /Items/{id}`) built from a
-    /// row read before a share revoke keeps the revoke in `Data`, so the boot
-    /// re-import of the shares from `Data` does not bring it back.
+    /// row read before a share revoke keeps the revoke, in the tables and in
+    /// `Data`, and a restart does not bring it back.
     #[tokio::test]
     async fn a_whole_row_save_keeps_a_share_change_made_since_its_read() {
         use ferrofin_model::entities_media::PlaylistUserPermissions;
@@ -4078,9 +4076,7 @@ mod tests {
 
         let stored = crate::test_support::fetch_item(&db, playlist_id).await;
         assert_eq!(stored.overview.as_deref(), Some("Edited"));
-        crate::item_data::reconcile_playlist_permissions(&db)
-            .await
-            .expect("boot re-import");
+        crate::item_data::reimport_from_data(&db, playlist_id).await;
         assert!(
             mgr.get_playlist_shares(playlist_id)
                 .await
@@ -4121,9 +4117,7 @@ mod tests {
 
         let stored = crate::test_support::fetch_item(&db, playlist_id).await;
         assert_eq!(stored.overview.as_deref(), Some("Edited"));
-        crate::item_data::reconcile_playlist_permissions(&db)
-            .await
-            .expect("boot re-import");
+        crate::item_data::reimport_from_data(&db, playlist_id).await;
         assert!(
             mgr.get_playlist_shares(playlist_id)
                 .await
@@ -4135,7 +4129,7 @@ mod tests {
 
     /// An update that fails part-way applies none of its changes: its share
     /// and open-access writes never commit without their `Data` sync, so the
-    /// tables and the boot re-import from `Data` agree.
+    /// tables and `Data` agree, before and after a restart.
     #[tokio::test]
     async fn a_failed_update_applies_none_of_its_changes() {
         use ferrofin_model::entities_media::PlaylistUserPermissions;
@@ -4181,9 +4175,7 @@ mod tests {
                 mgr.get_playlist_access(playlist_id, carol).await.is_ok(),
                 "the playlist stays public {moment}"
             );
-            crate::item_data::reconcile_playlist_permissions(&db)
-                .await
-                .expect("boot re-import");
+            crate::item_data::reimport_from_data(&db, playlist_id).await;
         }
         let stored = crate::test_support::fetch_item(&db, playlist_id).await;
         assert_eq!(stored.name.as_deref(), Some("Shared"));
@@ -4534,7 +4526,7 @@ mod tests {
     /// A `Users` entry without a user id binds as the empty GUID (upstream's
     /// `PlaylistUserPermissions` constructor default), and upstream stores and
     /// lists that share as given. It is kept here too: listed, written into
-    /// `Data`, and brought back by the boot re-import.
+    /// `Data`, and brought back from `Data` alone by the boot import.
     #[tokio::test]
     async fn an_empty_guid_share_is_stored_listed_and_survives_a_restart() {
         use ferrofin_model::entities_media::PlaylistUserPermissions;
@@ -4568,13 +4560,8 @@ mod tests {
             serde_json::json!([{"UserId": "00000000000000000000000000000000", "CanEdit": true}])
         );
 
-        // Only `Data` holds the share now: the re-import must bring it back.
-        crate::item_data::clear_playlist_shares(&db, playlist_id).await;
-        let playlist_shares = mgr.get_playlist_shares(playlist_id).await.unwrap();
-        assert!(playlist_shares.is_empty(), "{playlist_shares:?}");
-        crate::item_data::reconcile_playlist_permissions(&db)
-            .await
-            .expect("boot re-import");
+        // The boot import must bring it back from `Data` alone.
+        crate::item_data::reimport_from_data(&db, playlist_id).await;
         assert_eq!(
             mgr.get_playlist_shares(playlist_id).await.unwrap(),
             expected
@@ -4585,7 +4572,7 @@ mod tests {
     /// when either entry can (`Shares.Any(s => s.CanEdit && …)`). With one share
     /// row per user, the user keeps one share at their first entry's place that
     /// can edit when any entry can: on create, on update, and when the boot
-    /// re-import reads such a list from `Data` (as a Jellyfin database can hold).
+    /// import reads such a list from `Data` (as a Jellyfin database can hold).
     #[tokio::test]
     async fn a_user_listed_twice_keeps_one_share_that_can_edit_if_any_entry_can() {
         use ferrofin_model::entities_media::PlaylistUserPermissions as Share;
@@ -4632,7 +4619,8 @@ mod tests {
             collapsed
         );
 
-        // A `Data` list naming carol twice, read back by the boot re-import.
+        // A `Data` list naming bob twice, read back by the boot import of a
+        // playlist without its permission rows.
         let shares = serde_json::json!([
             {"UserId": bob.simple().to_string(), "CanEdit": false},
             {"UserId": carol.simple().to_string(), "CanEdit": false},
@@ -4643,9 +4631,7 @@ mod tests {
             .await
             .expect("write Data");
         drop(conn);
-        crate::item_data::reconcile_playlist_permissions(&db)
-            .await
-            .expect("boot re-import");
+        crate::item_data::reimport_from_data(&db, playlist_id).await;
         assert_eq!(
             mgr.get_playlist_shares(playlist_id).await.unwrap(),
             vec![Share::new(bob, true), Share::new(carol, false)]
