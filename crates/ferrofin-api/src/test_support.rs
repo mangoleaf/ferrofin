@@ -2449,6 +2449,9 @@ pub struct RecordingTasks {
     pub started: std::sync::Mutex<Vec<String>>,
     /// Task ids passed to [`TaskManager::cancel_task`], in call order.
     pub cancelled: std::sync::Mutex<Vec<String>>,
+    /// Task ids passed to [`TaskManager::cancel_if_running_and_queue`], in
+    /// call order.
+    pub requeued: std::sync::Mutex<Vec<String>>,
 }
 
 #[async_trait]
@@ -2470,6 +2473,13 @@ impl TaskManager for RecordingTasks {
         self.cancelled
             .lock()
             .expect("cancelled lock")
+            .push(task_id.to_owned());
+        Ok(())
+    }
+    async fn cancel_if_running_and_queue(&self, task_id: &str) -> Result<(), ServiceError> {
+        self.requeued
+            .lock()
+            .expect("requeued lock")
             .push(task_id.to_owned());
         Ok(())
     }
