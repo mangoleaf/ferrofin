@@ -4,14 +4,15 @@
 //! at irregular times. The extractor reads them from the cues; ffprobe decodes
 //! the same file's keyframes. The two must agree.
 //!
-//! Gated like the other ffmpeg tests: it skips itself unless
-//! `FERROFIN_FFMPEG_TESTS` is set and both `ffmpeg` and `ffprobe` are on `PATH`.
+//! `#[ignore]`d like the other ffmpeg tests; asked for, it needs both `ffmpeg`
+//! and `ffprobe` on `PATH`.
 //!
 //! Run with:
-//! `FERROFIN_FFMPEG_TESTS=1 cargo test -p ferrofin-keyframes --test matroska_keyframe_extractor_ffmpeg`
+//! `cargo test -p ferrofin-keyframes --test matroska_keyframe_extractor_ffmpeg -- --include-ignored`
 
 use std::path::Path;
 use std::process::{Command, Stdio};
+use std::sync::atomic::AtomicBool;
 
 use ferrofin_keyframes::{ff_probe, matroska};
 
@@ -24,26 +25,18 @@ fn on_path(binary: &str) -> bool {
         .is_ok_and(|status| status.success())
 }
 
-/// Whether the ffmpeg-gated test should run; prints why it skips otherwise.
-fn ffmpeg_gate() -> bool {
-    if std::env::var("FERROFIN_FFMPEG_TESTS").is_err() {
-        eprintln!("skipping: FERROFIN_FFMPEG_TESTS not set");
-        return false;
-    }
+/// Panics unless `ffmpeg` and `ffprobe` are on `PATH`: the test is
+/// `#[ignore]`d, so a run that asks for it must not pass without them.
+fn require_ffmpeg() {
     for binary in ["ffmpeg", "ffprobe"] {
-        if !on_path(binary) {
-            eprintln!("skipping: {binary} not found on PATH");
-            return false;
-        }
+        assert!(on_path(binary), "{binary} not found on PATH");
     }
-    true
 }
 
 #[test]
+#[ignore = "runs the real ffmpeg; run with --ignored"]
 fn the_cues_of_an_ffmpeg_matroska_file_match_ffprobes_keyframes() {
-    if !ffmpeg_gate() {
-        return;
-    }
+    require_ffmpeg();
     let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join("matroska_keyframe_extractor");
     std::fs::create_dir_all(&dir).expect("scratch dir");
     let file = dir.join("irregular-gop.mkv");
@@ -74,7 +67,8 @@ fn the_cues_of_an_ffmpeg_matroska_file_match_ffprobes_keyframes() {
     assert!(status.success(), "ffmpeg failed: {status}");
 
     let cues = matroska::get_keyframe_data(&file).expect("read the cues");
-    let probed = ff_probe::get_keyframe_data("ffprobe", &file).expect("run ffprobe");
+    let probed = ff_probe::get_keyframe_data("ffprobe", &file, &AtomicBool::new(false))
+        .expect("run ffprobe");
 
     assert_eq!(
         cues.keyframe_ticks,

@@ -1877,6 +1877,7 @@ mod tests {
                 is_input_video: true,
                 subtitle_delivery_method: ferrofin_model::dlna::SubtitleDeliveryMethod::Encode,
                 trimmed_subtitle_path: None,
+                transcode_reasons: ferrofin_model::session::TranscodeReasons::empty(),
                 run_time_ticks: Some(60 * 10_000_000),
                 transcoding_type: if kind == PlaylistKind::Progressive {
                     TranscodingJobType::Progressive

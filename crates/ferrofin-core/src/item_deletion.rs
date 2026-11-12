@@ -178,10 +178,10 @@ fn is_file_protocol(path: Option<&str>) -> bool {
 ///   supports deleting (there is no channel-plugin mechanism), so `false`;
 /// - `Video.CanDelete` is `false` while a recording writes its file;
 /// - otherwise `IsFileProtocol`: an item with no path, or a streamed one,
-///   cannot be deleted. The exceptions are a collection an older Ferrofin
-///   created (gl-738 tracks giving it a folder), and a playlist an older
+///   cannot be deleted. The exceptions are a box set or a playlist an older
 ///   Ferrofin created that the boot repair could not give a folder
-///   ([`crate::adoption_repairs::rekey_pathless_playlists`]): their rows have
+///   ([`crate::adoption_repairs::rekey_pathless_box_sets`],
+///   [`crate::adoption_repairs::rekey_pathless_playlists`]): their rows have
 ///   no path, where upstream's sit in the data directory
 ///   (`collections/<name> [boxset]`, `playlists/<name>`,
 ///   `PlaylistManager.cs:83-141`), so upstream's `CanDelete()` is `true` for

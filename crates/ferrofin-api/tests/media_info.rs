@@ -185,6 +185,8 @@ impl UserManager for OkUsers {
             id: Uuid::parse_str(&user.id).unwrap_or_else(|_| Uuid::nil()),
             name: Some(user.username.clone()),
             server_id,
+            // All-false: these tests' user may not transcode or remux.
+            policy: Some(ferrofin_model::users::UserPolicy::default()),
             ..ferrofin_model::dto::UserDto::default()
         })
     }

@@ -520,12 +520,14 @@ pub async fn open_database(config: &Config) -> anyhow::Result<Database> {
     db.run_migrations()
         .await
         .context("failed to apply database migrations")?;
-    // Playlist owner/open-access/shares still live in BaseItems.Data JSON (12.0
-    // serialises them); import them on every boot, before anything is served —
-    // a playlist without its permission row is owner-accessible to everyone.
+    // Import the owner/open-access/shares of each playlist that has no
+    // permission row yet from its BaseItems.Data JSON (12.0 serialises them), on
+    // every boot, before anything is served — a playlist without its permission
+    // row is owner-accessible to everyone. A playlist with a row keeps it: the
+    // tables are the source of truth once imported.
     ferrofin_core::item_data::reconcile_playlist_permissions(&db)
         .await
-        .context("failed to reconcile playlist permissions from Data JSON")?;
+        .context("failed to import playlist permissions from Data JSON")?;
     // The one-shot ports of 12.0's data routines: membership from Data JSON
     // for a database newly adopted from 10.11.8 (never from a 12.0 one, whose
     // JSON is frozen), orphaned extras, OwnerId relationships, version links.
