@@ -339,7 +339,7 @@ jobs:
       - uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
         with:
           tool: cargo-llvm-cov,nextest
-      # ffmpeg is only needed by the env-gated integration tests; unit/parity tests avoid it.
+      # No ffmpeg here: only the #[ignore]d integration tests need it, and this job runs none.
       - name: coverage gate (per crate)
         env:
           SHARD: ${{ matrix.shard }}

@@ -498,7 +498,6 @@ Not runtime config, listed for completeness:
   fixture library. `FERROFIN_SCAN_BENCH_{MOVIES,SERIES,EPISODES}` size it,
   `FERROFIN_SCAN_BENCH_PROBE=1` turns on the real ffprobe, and
   `FERROFIN_SCAN_BENCH_{MEDIA,POSTER}` point it at real sample files.
-- `FERROFIN_FFMPEG_TESTS=1` — run the env-gated real-ffmpeg integration tests.
 - `FERROFIN_LDAP_TESTS=1` — run the LDAP-Auth directory test against OpenLDAP in
   containers (`crates/ferrofin-extensions/tests/ldap_directory.rs`; needs docker).
 - `FERROFIN_WASM_GUEST_TESTS=1` — build `examples/wasm-hello` from source (needs the
