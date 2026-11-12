@@ -238,30 +238,43 @@ async fn shutdown_signal(
 
 /// The graceful-shutdown future handed to axum: waits for the first shutdown
 /// trigger, then tells connected clients before the socket drains, so they
-/// show "server unavailable" instead of silently hanging (`ServerShuttingDown`
-/// for restart and shutdown alike, where C# sends `ServerRestarting` for a
-/// restart: gl-1123), and closes every WebSocket: an upgraded connection is
-/// outside axum's drain, and a socket that survived would stay bound to the OLD
-/// host's session manager after an in-process restart (Kestrel closes them on
-/// stop; clients reconnect).
+/// show "server unavailable" instead of silently hanging, and closes every
+/// WebSocket: an upgraded connection is outside axum's drain, and a socket that
+/// survived would stay bound to the OLD host's session manager after an
+/// in-process restart (Kestrel closes them on stop; clients reconnect).
+///
+/// The push is `SessionManager.OnApplicationStopping`'s: `ServerRestarting` when
+/// the host comes back ([`restarts_host`], upstream's `ShouldRestart`),
+/// `ServerShuttingDown` otherwise.
 async fn announce_shutdown(
     shutdown_rx: tokio::sync::oneshot::Receiver<()>,
     sessions: Arc<dyn ferrofin_traits::session::SessionManager>,
+    lifecycle: Arc<state::FerrofinLifecycleController>,
     signals: Signals,
     discovery: Option<tokio::task::AbortHandle>,
 ) {
+    use ferrofin_model::session::SessionMessageType;
     let reason = shutdown_signal(shutdown_rx, &signals).await;
     if let Some(discovery) = discovery {
         discovery.abort();
     }
-    tracing::info!(reason, "graceful shutdown requested");
-    let _ = sessions
-        .send_message_to_all_sessions(
-            ferrofin_model::session::SessionMessageType::ServerShuttingDown,
-            "",
-        )
-        .await;
+    // `stop` stores the restart flag before it fires the trigger.
+    let restart = restarts_host(&lifecycle, signals.fired());
+    tracing::info!(reason, restart, "graceful shutdown requested");
+    let message = if restart {
+        SessionMessageType::ServerRestarting
+    } else {
+        SessionMessageType::ServerShuttingDown
+    };
+    let _ = sessions.send_message_to_all_sessions(message, "").await;
     ferrofin_api::handlers::websocket::close_all_sockets();
+}
+
+/// Whether the stop that drained this lifetime restarts the host: an API
+/// restart (`stop(true)`: `POST /System/Restart` or a backup restore) that no
+/// signal raced. A signal exits the process whatever was asked.
+fn restarts_host(lifecycle: &state::FerrofinLifecycleController, signal_fired: bool) -> bool {
+    lifecycle.restart_requested() && !signal_fired
 }
 
 /// Boots the server from a resolved [`Config`] and serves until shutdown.
@@ -793,6 +806,7 @@ async fn serve_once(
             announce_shutdown(
                 shutdown_rx,
                 Arc::clone(&wired.state.sessions),
+                Arc::clone(&wired.lifecycle),
                 signals.clone(),
                 discovery_abort,
             ),
@@ -803,7 +817,7 @@ async fn serve_once(
     // Tear the host down (Jellyfin: `using CoreAppHost` per iteration): stop
     // every background task, then close the pools so nothing from this lifetime
     // still holds the database file when the next one opens — or restores — it.
-    let restart = wired.lifecycle.restart_requested() && !signals.fired();
+    let restart = restarts_host(&wired.lifecycle, signals.fired());
     tear_down_host(wired, discovery, sampler, config.shutdown_timeout_secs).await;
     db.close().await;
     serve_result?;
@@ -1558,6 +1572,34 @@ mod tests {
     use ferrofin_traits::plugins::FileTransformationService;
     use std::sync::Arc;
     use tower::ServiceExt as _;
+
+    /// gl-1123: only an API restart that no signal raced restarts the host and
+    /// is announced as `ServerRestarting` (upstream's `ShouldRestart`); a
+    /// shutdown or a signal exits the process.
+    #[tokio::test]
+    async fn only_an_api_restart_no_signal_raced_restarts_the_host() {
+        use ferrofin_core::system_manager::LifecycleController as _;
+        let (tx, _rx) = tokio::sync::oneshot::channel();
+        let lifecycle = crate::state::FerrofinLifecycleController::new(tx);
+        assert!(
+            !super::restarts_host(&lifecycle, false),
+            "nothing was asked"
+        );
+        lifecycle.stop(true).await.expect("restart");
+        assert!(
+            super::restarts_host(&lifecycle, false),
+            "POST /System/Restart or a backup restore"
+        );
+        assert!(
+            !super::restarts_host(&lifecycle, true),
+            "a signal exits whatever was asked"
+        );
+        lifecycle.stop(false).await.expect("shutdown");
+        assert!(
+            !super::restarts_host(&lifecycle, false),
+            "POST /System/Shutdown"
+        );
+    }
 
     /// Every connection carries its peer (`ConnectInfo`, which handlers read)
     /// and the address it was accepted on (`ConnectionLocalAddr`, which the IP
