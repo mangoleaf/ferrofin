@@ -316,6 +316,7 @@ const TABS: &[(Group, &[&str])] = &[
             "scan_progress_every",
             "scan_directory_cache_records",
             "scan_directory_cache_idle_secs",
+            "book_archive_max_entries",
         ],
     ),
     (
@@ -797,6 +798,75 @@ fn each_source_is_reported_and_only_file_and_default_values_are_editable() {
     assert_eq!(report.settings.len(), SETTINGS.len());
 }
 
+/// gl-554: the Networking page's ports outrank `config.toml`, and a flag or a
+/// variable outranks them; each row reports the port the server listens on.
+#[test]
+fn the_networking_page_ports_outrank_the_file_but_not_a_flag_or_variable() {
+    let data = DataDir::new(&["port = 5000\nhttps_port = 5443".to_owned()]);
+    let page = NetworkConfiguration {
+        internal_http_port: 8097,
+        internal_https_port: 8921,
+        ..NetworkConfiguration::default()
+    };
+    let rows = |cli: Cli, env: &FakeEnv, network: &NetworkConfiguration| {
+        let running = load(cli, env);
+        let report = snapshot(
+            SETTINGS,
+            &running,
+            env,
+            &ServerConfiguration::default(),
+            network,
+            false,
+        )
+        .expect("report");
+        let (http, https) = crate::listen::ports(&running, network);
+        let rows = (
+            entry(&report, "port").clone(),
+            entry(&report, "https_port").clone(),
+        );
+        assert_eq!(rows.0.value, Some(json!(http)), "{rows:?}");
+        assert_eq!(rows.1.value, Some(json!(https)), "{rows:?}");
+        rows
+    };
+
+    let (http, https) = rows(data.cli(), &FakeEnv::new(), &page);
+    assert_eq!(
+        (http.source, http.value, http.saved_value),
+        (
+            Source::NetworkConfiguration,
+            Some(json!(8097)),
+            Some(json!(5000))
+        )
+    );
+    assert_eq!(
+        (https.source, https.value),
+        (Source::NetworkConfiguration, Some(json!(8921)))
+    );
+
+    let (http, _) = rows(
+        data.cli(),
+        &FakeEnv::new(),
+        &NetworkConfiguration::default(),
+    );
+    assert_eq!(
+        (http.source, http.value),
+        (Source::ConfigFile, Some(json!(5000)))
+    );
+
+    let flag = Cli {
+        port: Some(7000),
+        ..data.cli()
+    };
+    let (http, _) = rows(flag, &FakeEnv::new(), &page);
+    assert_eq!((http.source, http.value), (Source::Flag, Some(json!(7000))));
+    let variable = FakeEnv::new().with("FERROFIN_HTTPS_PORT", "7443");
+    let (_, https) = rows(data.cli(), &variable, &page);
+    assert_eq!(
+        (https.source, https.value),
+        (Source::Environment, Some(json!(7443)))
+    );
+}
+
 /// gl-555: the Networking page's base URL outranks `config.toml`, and the
 /// variable outranks it; the row reports the base URL the server serves under.
 #[test]
@@ -937,14 +1007,13 @@ fn read_only_settings_carry_their_note_whatever_sets_them() {
             "Dashboard → Networking → Published server URIs",
         ),
         ("base_url", "Dashboard → Networking → Base URL sets it"),
-        // D2a: until the Networking page drives them.
         (
             "port",
-            "Set it with the port key in config.toml, the FERROFIN_PORT",
+            "Dashboard → Networking → Local HTTP port number sets it",
         ),
         (
             "https_port",
-            "Set it with the https_port key in config.toml or the FERROFIN_HTTPS_PORT",
+            "Dashboard → Networking → Local HTTPS port number sets it",
         ),
     ];
     for (key, note) in notes {

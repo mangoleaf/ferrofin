@@ -12,6 +12,7 @@
 
 use std::path::Path;
 use std::process::{Command, Stdio};
+use std::sync::atomic::AtomicBool;
 
 use ferrofin_keyframes::{ff_probe, matroska};
 
@@ -74,7 +75,8 @@ fn the_cues_of_an_ffmpeg_matroska_file_match_ffprobes_keyframes() {
     assert!(status.success(), "ffmpeg failed: {status}");
 
     let cues = matroska::get_keyframe_data(&file).expect("read the cues");
-    let probed = ff_probe::get_keyframe_data("ffprobe", &file).expect("run ffprobe");
+    let probed = ff_probe::get_keyframe_data("ffprobe", &file, &AtomicBool::new(false))
+        .expect("run ffprobe");
 
     assert_eq!(
         cues.keyframe_ticks,

@@ -1313,7 +1313,9 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
                    UTF-16 path + DateModified ticks, as a .NET Guid \"N\") ← ferrofin-core \
                    dto_service.rs image_tag, tag_and_fill_blur_hash (attach_images, \
                    add_inherited_images, parent_primary_tag, attach_people with \
-                   person_paths), the chapter tags (the stored item path, \
+                   person_paths) over the page's one image read, load_images_batch, which \
+                   lists each stored image once (ferrofin-db padded_in_chunks binds each id \
+                   once), the chapter tags (the stored item path, \
                    virtual_paths reverse); search_manager.rs fill_artwork; \
                    handlers/images.rs image_info_dto; ferrofin-livetv manager.rs \
                    channel_image_tags (a channel has no path); user_manager.rs get_user_dto \
@@ -1321,7 +1323,8 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
                    reads them (BaseItemMapper.Map's ExpandVirtualPath). Compared with \
                    Emby.Server.Implementations/Dto/DtoService.cs (GetImageCacheTag, \
                    GetPrimaryImageAspectRatio, \
-                   GetTagAndFillBlurhash, AddInheritedImages, AttachPeople), \
+                   GetTagAndFillBlurhash, GetTagsAndFillBlurhashes, AddInheritedImages, \
+                   AttachPeople), \
                    Jellyfin.Server.Implementations/Item/ChapterRepository.cs (Map), \
                    Jellyfin.Api/Controllers/ImageController.cs (GetItemImageInfos), \
                    Jellyfin.Api/Controllers/SearchController.cs (GetSearchHintResult), \
@@ -1339,7 +1342,7 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
                    MediaBrowser.Providers/Manager/ProviderManager.cs (SaveImage), \
                    Jellyfin.Server/Startup.cs (the NamedClient.Default handler) and \
                    Emby.Server.Implementations/Library/LibraryManager.cs (ConvertImageToLocal)",
-        date: "2026-10-31",
+        date: "2026-11-11",
         divergences: &[
             "Decoding and resizing run under limits upstream does not have (owner decision \
              2026-10-31, gl-1097), the settings image_decode_max_megapixels, \
@@ -1433,8 +1436,18 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
                    boot-repair fold, item_persistence_service.rs agree_user_data (the \
                    retired-key update of SaveUserData, from the row ResolveUserDataRow reads), \
                    compared with Jellyfin.Server.Implementations/Item/\
-                   ItemPersistenceService.cs (ReattachUserDataAsync, ReconcileUserDataAsync)",
-        date: "2026-11-06",
+                   ItemPersistenceService.cs (ReattachUserDataAsync, ReconcileUserDataAsync). \
+                   Also the read path of the folder played test: item_repository.rs \
+                   get_is_played with translate_query.rs build_is_played_query \
+                   (resolve_descendant_query's \
+                   closure and links, each item through push_leaf_is_played_per_row), compared \
+                   with Jellyfin.Server.Implementations/Item/BaseItemRepository.Querying.cs \
+                   (GetIsPlayed), BaseItemRepository.TranslateQuery.cs \
+                   (BuildLeafIsPlayedFilter), src/Jellyfin.Database/\
+                   Jellyfin.Database.Implementations/DescendantQueryHelper.cs \
+                   (GetAllDescendantIds) and MediaBrowser.Controller/Entities/Folder.cs \
+                   (IsPlayed)",
+        date: "2026-11-11",
         divergences: &[
             "After a scan or boot-repair fold, which upstream does not have (it deletes the \
              duplicate, and ReconcileUserDataAsync gives the user's rows the most recent play when \
@@ -3060,12 +3073,13 @@ pub const VERIFIED: &[Verified] = &[
                ConvertEmptyStringToNull, then [Required]; normalize_named_configuration: \
                GetConfigurationType and Deserialize) → save_named_configuration \
                (BaseConfigurationManager.SaveConfiguration: the validating store, the write, \
-               the live network policy, the listeners, the committed checks for \
-               ApplicationHost.OnConfigurationUpdated) → for livetv \
+               the live network policy, the listeners (ferrofin-server listen.rs \
+               restart_listener: the port restart of OnConfigurationUpdated), the committed \
+               checks for ApplicationHost.OnConfigurationUpdated) → for livetv \
                LiveTvManager::create_recording_folders (ferrofin-livetv recording_folders.rs: \
                RecordingsManager.OnNamedConfigurationUpdated, which the Live TV manager's tuner \
                and provider saves run too, as upstream's save of livetv does)",
-        date: "2026-10-30",
+        date: "2026-11-11",
         divergences: &[
             "database is refused with a 400: Ferrofin has no other database provider (owner \
          decision 2026-10-23).",
@@ -3088,6 +3102,20 @@ pub const VERIFIED: &[Verified] = &[
          OnConfigurationUpdated flags no restart for BaseUrl, while its redirect middleware \
          and GetLocalApiUrl read the new value at once and its mount keeps the old one \
          (owner decision on gl-555).",
+            "A network save marks a restart pending, as OnConfigurationUpdated does, when the \
+         ports it resolves to differ from the ports this lifetime listens on. Resolving \
+         differs from upstream's raw comparison in three ways: --port/FERROFIN_PORT and \
+         FERROFIN_HTTPS_PORT outrank InternalHttpPort and InternalHttpsPort (owner decision \
+         on gl-554); a saved port at its default (8096, 8920) leaves config.toml's, as an empty \
+         BaseUrl does (gl-554's fix, reading the owner's precedence); and equal saved ports \
+         are reset to the defaults first, as ApplicationHost.Init does, where upstream flags a \
+         restart that changes nothing for a save of two equal ports. Upstream's guard on a \
+         running port of 0 (the ports not read yet) needs no counterpart: the listener is \
+         registered once the ports are resolved. Its guard on IsPortAuthorized flags the \
+         restart once per lifetime, which Ferrofin matches because it sets IsPortAuthorized \
+         at every boot and the restart flag stays set once raised; but upstream also clears \
+         IsPortAuthorized and saves when it flags the restart, and Ferrofin leaves it true. \
+         Fix path: gl-1701.",
             "The 400 and 500 bodies are Ferrofin's error shape, not upstream's. Fix path: \
          gl-666.",
         ],
@@ -3346,13 +3374,16 @@ pub const VERIFIED: &[Verified] = &[
                [boxset] folder and AddChild's path-derived id, its Path stored through \
                VirtualPathExpander::reverse as AddChild's save stores it, \
                %AppDataPath%/collections/<name> [boxset] (BaseItemMapper.Map → \
-               GetPathToSave → ReverseVirtualPath), AddToCollectionAsync's refusal \
-               of an id naming no item after the box set is stored) and \
+               GetPathToSave → ReverseVirtualPath), the folder claimed and the row stored \
+               under box_set_folders, which a Collections scan storing the box sets of \
+               the folders it found (resolve_box_set_folders, BoxSetResolver) holds too, \
+               AddToCollectionAsync's refusal of an id naming no item after the box set \
+               is stored) and \
                ensure_collections_folder → collections_library.rs (EnsureLibraryFolder: \
                physical_folder for FindFolders, ensure_library for AddVirtualFolder with its \
                LibraryOptions, ensure_folder for the Folder row ValidateTopLibraryFolders \
                makes)",
-        date: "2026-11-03",
+        date: "2026-11-11",
         divergences: &[
             "A missing name makes a box set with an empty name, where upstream's \
          GetValidFilename dereferences the null and answers 500. Jellyfin bug not ported.",
@@ -3814,12 +3845,15 @@ pub const VERIFIED: &[Verified] = &[
         ferrofin: "handlers/playlists.rs get_playlist_items (effective_user_id: \
                RequestHelpers.GetUserId) → ferrofin-core collection_manager.rs \
                FerrofinPlaylistManager::get_playlist_items (GetPlaylistForUser and \
-               GetManageableItems: manual links, in order, missing items out), then \
-               LibraryManager::filter_visible_items_standalone over the rows just read \
+               GetManageableItems: manual links, in order, missing items out, each distinct \
+               member's row read once and its entries pointing at it, as \
+               ResolveLinkedChildren's byId lookup shares one BaseItem between repeats), \
+               then LibraryManager::filter_visible_items_standalone over those rows \
                (ItemVisibility::visible, one answer per distinct id) before the paging, as \
                upstream filters before Skip and Take (the count taken first; a negative \
-               startIndex skips nothing, a negative limit takes nothing), and \
-               tv_shows::build_dto_options + get_linked_children_dtos + the PlaylistItemId tag",
+               startIndex skips nothing, a negative limit takes nothing), and the page's \
+               entries through tv_shows::build_dto_options + get_linked_children_dtos + the \
+               PlaylistItemId tag",
         date: "2026-11-11",
         divergences: &[
             "A member the caller may not open is left out with the standalone check, which also \
@@ -3973,10 +4007,11 @@ pub const VERIFIED: &[Verified] = &[
         upstream_method: "RestartApplication",
         ferrofin: "handlers/system.rs restart_application (auth.rs RequireAdmin) → ferrofin-core \
                system_manager.rs restart → apps/ferrofin-server state.rs \
-               FerrofinLifecycleController stop, lib.rs announce_shutdown, tear_down_host \
+               FerrofinLifecycleController stop (SystemManager.ShutdownInternal), lib.rs \
+               announce_shutdown (SessionManager.OnApplicationStopping), tear_down_host \
                (HlsStreamManager::shutdown, LiveTvManager::shutdown: Program.cs disposes the \
                host, RecordingsManager.Dispose, MediaSourceManager.Dispose)",
-        date: "2026-11-08",
+        date: "2026-11-11",
         divergences: &[
             "The host teardown goes further than upstream's disposal (gl-141). It does four things. \
          It kills every transcode: upstream's TranscodeManager.Dispose kills no job, and each \
@@ -3991,8 +4026,6 @@ pub const VERIFIED: &[Verified] = &[
          /System/Shutdown. Upstream's LocalAccessOrRequiresElevation also admits any caller \
          on the local network, with or without a token; here that caller gets 401 without \
          a token and 403 without the administrator role.",
-            "Connected clients get ServerShuttingDown; upstream pushes ServerRestarting for a \
-         restart. Fix path: gl-1123.",
         ],
         refs: &[],
     },
@@ -4055,17 +4088,35 @@ pub const VERIFIED: &[Verified] = &[
                isPerfectMatch's hash-match filter applied to every provider's results, \
                where upstream leaves it to the provider, as the plugin's MatchFilter does) → \
                ferrofin-providers opensubtitles.rs search (the OpenSubtitles plugin's Search, \
-               v25, compared for the code it derives: GetLanguage's zh-CN and pt-PT, and no \
-               search for a language without a two-letter code)",
-        date: "2026-11-09",
+               v25 @ 60d2c74d: an account's Login first, sharing the downloads' session, and \
+               no login with an account the API refused (CredentialsInvalid: a 401, or a 400 \
+               for an e-mail username); an automated search's [] without a login or with the \
+               quota spent; the [] for an episode without its numbers or series name and for \
+               a video without a path; \
+               GetLanguage's zh-CN and pt-PT checked against the /infos/languages list, read \
+               once, a regioned code falling back to its language and no search for a language \
+               the list or the culture lacks; the movie hash; type, then imdb_id or else the \
+               file name as query with an episode's numbers; AddQueryString's sorted, lowercased \
+               query; every page of SearchSubtitlesAsync; BadSubtitleFilter, with the files a \
+               download found empty, MediaFilter and MatchFilter; the order by hash match, \
+               downloads, rating and trusted uploader; one candidate per result, its first \
+               file's id, with Release, Comments, Ratings, UploadDate, Fps and the machine and \
+               AI translation flags)",
+        date: "2026-11-11",
         divergences: &[
             "A DVD or Blu-ray rip or an ISO is searched; upstream returns [] unless the \
          video's VideoType is VideoFile. Fix path: gl-1524.",
-            "The built-in OpenSubtitles provider matches the plugin it ports only in the \
-         language code it derives (GetLanguage's zh and pt rewrites and its refusal of a \
-         language with no code), not in GetLanguage's check against the API's language list; \
-         its parameters, early returns, filters, ordering and result fields differ from \
-         OpenSubtitleDownloader.Search. Fix path: gl-1525.",
+            "With an OpenSubtitles API key and no account, a manual search still searches; \
+         the plugin's Login throws without an account, so it finds nothing. Fix path: gl-808 \
+         (owner decision).",
+            "OpenSubtitles keeps an account the API refused (CredentialsInvalid) only until the \
+         server restarts, the account changes or a login with it succeeds (the settings page's \
+         validation included), and a download still tries to log in with it; \
+         the plugin saves the flag to its configuration until its settings page validates new \
+         credentials, and fails such a download at once (Unable to login). Fix path: gl-1644.",
+            "OpenSubtitles candidates carry ProviderName \"opensubtitles\" and the MD5 of that \
+         name as their id prefix; the plugin's Name, and so upstream's, is \"Open Subtitles\". \
+         Fix path: gl-1704.",
             "The 401 (no or bad token), 403 (no subtitle management) and 404 bodies are \
          Ferrofin's error shape, not upstream's. Fix path: gl-666.",
         ],
@@ -4215,6 +4266,57 @@ pub const VERIFIED: &[Verified] = &[
         divergences: &[
             "The 400 for a missing or blank id, the 401 (no or bad token) and the 403 (not an \
          administrator) bodies are Ferrofin's error shape, not upstream's. Fix path: gl-666.",
+        ],
+        refs: &[],
+    },
+    Verified {
+        method: "delete",
+        path: "/ScheduledTasks/Running/{taskId}",
+        upstream_file: "Jellyfin.Api/Controllers/ScheduledTasksController.cs",
+        upstream_method: "StopTask",
+        ferrofin: "handlers/scheduled_tasks.rs stop_task (RequireAdmin, \
+               Policies.RequiresElevation; RequiredRouteString taskId: ConvertEmptyStringToNull, \
+               then [Required]) → ferrofin-core scheduled_tasks.rs cancel_task (the Id matched \
+               ignoring case, as OrdinalIgnoreCase; none is the 404) → cancel → \
+               Registration::request_stop (ScheduledTaskWorker.Cancel/CancelIfRunning: the \
+               run's token cancelled, State Cancelling until the run returns) → \
+               execute_contained and finish (ExecuteInternal: the run records Cancelled when \
+               its body stopped for it, else its own outcome, then ExecuteQueuedTasks)",
+        date: "2026-11-11",
+        divergences: &[
+            "Stopping a task that is idle or already stopping answers 204 and changes nothing; \
+         upstream's Cancel throws InvalidOperationException there, a 500. Jellyfin bug not \
+         ported.",
+            "A body still running STOP_WAIT (2 s) after the stop is dropped and recorded \
+         Cancelled; upstream waits for ExecuteAsync however long it takes. Fix path: every \
+         task body checks its token as upstream's do (gl-1709); the value is a candidate \
+         setting (gl-1710).",
+            "The 401 (no or bad token), 403 (not an administrator) and 404 (no task has that \
+         id) bodies are Ferrofin's error shape, not upstream's. Fix path: gl-666.",
+        ],
+        refs: &[],
+    },
+    Verified {
+        method: "post",
+        path: "/Library/Refresh",
+        upstream_file: "Jellyfin.Api/Controllers/LibraryController.cs",
+        upstream_method: "RefreshLibrary",
+        ferrofin: "handlers/library.rs refresh_library (RequireAdmin, \
+               Policies.RequiresElevation) → TaskManager::cancel_if_running_and_queue on the \
+               RefreshLibrary task's wire id (LibraryManager.ValidateMediaLibrary → \
+               TaskManager.CancelIfRunningAndQueue<RefreshMediaLibraryTask>) → ferrofin-core \
+               scheduled_tasks.rs cancel (CancelIfRunning) and queue_scheduled \
+               (QueueScheduledTask with new TaskOptions(): started when Idle, else queued \
+               until the cancelled run has ended); a failure is logged as \"Error refreshing \
+               library\" and the answer is 204 either way, as the controller's catch",
+        date: "2026-11-11",
+        divergences: &[
+            "A Scan Media Library run the refresh cancels ends when its scan wait is \
+         withdrawn, before the scan's item in progress does; upstream's run stays Cancelling \
+         until ValidateMediaLibraryInternal returns. The scan queue still starts the new \
+         scan after the stopping one. Fix path: gl-1709.",
+            "The 401 (no or bad token) and 403 (not an administrator) bodies are Ferrofin's \
+         error shape, not upstream's. Fix path: gl-666.",
         ],
         refs: &[],
     },
