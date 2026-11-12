@@ -492,7 +492,8 @@ pub struct Config {
     /// original file.
     pub image_resize_budget_mb: u32,
 
-    /// The largest remote image downloaded, in MiB. Resolved
+    /// The largest remote image downloaded, and the largest metadata provider
+    /// response, in MiB. Resolved
     /// `FERROFIN_IMAGE_DOWNLOAD_MAX_MB` env > `image_download_max_mb` in
     /// `config.toml` > 64, clamped to [`RequestLimits::DOWNLOAD_MAX_MB`] with a
     /// warning. A larger one is refused, and the read stops at the limit.

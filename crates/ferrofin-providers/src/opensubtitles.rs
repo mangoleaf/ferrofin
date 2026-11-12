@@ -494,7 +494,7 @@ impl OpenSubtitlesProvider {
     #[must_use]
     pub fn new(plugins: Arc<dyn PluginManager>) -> Self {
         Self {
-            http: reqwest::Client::new(),
+            http: crate::http_client::client(),
             link_http: Self::link_http(PrivateAllowList::default()),
             limiter: RateLimiter::new("opensubtitles"),
             plugins,
@@ -563,7 +563,7 @@ impl OpenSubtitlesProvider {
         }
         resp.counted_json()
             .await
-            .map_err(|e| LoginFailure::Request(net_err(e)))
+            .map_err(|e| LoginFailure::Request(body_err(e)))
     }
 
     /// `OpenSubtitlesApi.LogOutAsync`: ends the session `token` opened. Best
@@ -837,6 +837,7 @@ fn body_err(e: BodyError) -> ServiceError {
         BodyError::TooLarge => {
             ServiceError::backend("OpenSubtitles sent more than image_download_max_mb")
         }
+        BodyError::Decode(e) => ServiceError::backend(format!("OpenSubtitles request failed: {e}")),
     }
 }
 
@@ -968,7 +969,7 @@ impl SubtitleProvider for OpenSubtitlesProvider {
                 resp.status()
             )));
         }
-        let body: SearchResponse = resp.counted_json().await.map_err(net_err)?;
+        let body: SearchResponse = resp.counted_json().await.map_err(body_err)?;
         let mut results = map_search(&body, &request.language);
         if request.is_perfect_match == Some(true) {
             results.retain(|r| r.is_hash_match == Some(true));

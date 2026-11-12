@@ -91,7 +91,7 @@ impl OmdbClient {
             api_key
         };
         Self {
-            http: reqwest::Client::new(),
+            http: crate::http_client::client(),
             limiter: crate::rate_limit::RateLimiter::new("omdb"),
             api_key: SecretString::from(api_key),
             base_url: API_BASE.to_owned(),

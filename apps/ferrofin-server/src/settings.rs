@@ -769,7 +769,7 @@ pub static SETTINGS: &[SettingSpec] = &[
         kind: whole_numbers(ferrofin_providers::rate_limit::RequestLimits::DOWNLOAD_MAX_MB),
         unit: Some(Unit::Mebibytes),
         default: "64",
-        description: "Largest remote image downloaded, and largest OMDb or OpenSubtitles response; \
+        description: "Largest remote image downloaded, and largest metadata provider response; \
                       a larger one is refused and the read stops there.",
         running: |c| json!(c.image_download_max_mb),
         ..ROW

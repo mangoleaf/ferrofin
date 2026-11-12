@@ -120,7 +120,7 @@ impl StudiosClient {
     pub fn with_repo_url(repo_url: &str) -> Self {
         let trimmed = repo_url.trim_end_matches('/');
         Self {
-            http: reqwest::Client::new(),
+            http: crate::http_client::client(),
             limiter: RateLimiter::new("studios"),
             configured_repo_url: (!trimmed.is_empty()).then(|| trimmed.to_owned()),
             plugin: ConfigSource::new(),
