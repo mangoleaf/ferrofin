@@ -29,8 +29,8 @@ Each setting has exactly one key; the variable's stem is not accepted for these 
 `FERROFIN_CONFIG_FILE` has no key: it names the file. A key the file cannot hold is ignored with
 a warning at startup that names it, and a key spelled as its variable's stem (`tvdb_pin`) is
 told the key to use (`tvdb_subscriber_pin`). A number or on/off variable whose value does not
-parse (`FERROFIN_PORT=80g`) is ignored with a warning naming it, so the file's value or the
-default applies, and a blank one counts as unset; the rows that say so (`FERROFIN_DB_POOL`,
+parse (`FERROFIN_PORT=80g`) is ignored with a warning naming it, so what it would outrank
+applies, and a blank one counts as unset; the rows that say so (`FERROFIN_DB_POOL`,
 `FERROFIN_DB_STATEMENT_CACHE`, the cache lifetimes, `FERROFIN_TRICKPLAY_CONCURRENCY`, the login
 backoff's numbers) stop the server on a bad value instead.
 
@@ -48,8 +48,9 @@ boots.
 
 `GET /Ferrofin/Settings` (administrators only) reports every setting below with its readable
 name (`Label`), its tab (`Group`), the value in use and its unit (`Unit`, when it has one), its
-default, and where that value comes from: a flag, a variable, the Networking page (`base_url`
-only), `config.toml` or the default. A value `config.toml` holds that is not in use (the file
+default, and where that value comes from: a flag, a variable, the Networking page (`port`,
+`https_port` and `base_url` only), `config.toml` or the default. A value `config.toml` holds
+that is not in use (the file
 changed since the server started, or a flag, a variable or the Networking page outranks it) is
 reported beside it. A choice lists its options (`Options`, each with its `Value`, `Label` and
 `Note`) and says when the stored value fits none (`Custom: true`, the
@@ -144,8 +145,7 @@ changed. These have no field whatever sets them, each with its reason on the pag
   it lists, so it is set the same way, for the same reason;
 - the settings jellyfin-web's own pages cover: `bind_addr`, `published_url`, `port`, `https_port`
   and `base_url` under Dashboard → Networking, `server_name` and `enable_metrics` under
-  Dashboard → General (Networking does not drive `port` and `https_port` yet, so their notes say
-  to set them by hand in `config.toml`, or with their variable or flag);
+  Dashboard → General;
 - the OpenTelemetry variables, which `config.toml` has no key for.
 
 A saved change [applies at the next restart](#when-a-change-applies). After a save the line below
@@ -237,8 +237,8 @@ Jellyfin `jellyfin.db` (root or `data/jellyfin.db`) found in the data dir — se
 | Variable | Default | Purpose |
 |---|---|---|
 | `FERROFIN_BIND_ADDR` | `0.0.0.0` | Address the HTTP listener binds to. |
-| `FERROFIN_PORT` | `8096` | HTTP port. |
-| `FERROFIN_HTTPS_PORT` | `8920` | HTTPS port (parity value). Served beside the HTTP port when the dashboard's Networking settings enable HTTPS and the PKCS#12 (`.pfx`) certificate at their certificate path loads; see [HTTPS](#https). |
+| `FERROFIN_PORT` | `8096` | HTTP port. It and the `--port` flag outrank **Local HTTP port number** on Dashboard → Networking, which outranks the `config.toml` key `port` unless it holds the default, `8096`. A change on the Networking page applies after a restart, and the dashboard shows the restart as pending. The container image sets `FERROFIN_PORT=8096`, so in a container the Networking page's port applies only once the variable is set blank (`FERROFIN_PORT=`), and the port mapping must follow it. |
+| `FERROFIN_HTTPS_PORT` | `8920` | HTTPS port (parity value). Served beside the HTTP port when the dashboard's Networking settings enable HTTPS and the PKCS#12 (`.pfx`) certificate at their certificate path loads; see [HTTPS](#https). It outranks **Local HTTPS port number** on Dashboard → Networking, which outranks the `config.toml` key `https_port` unless it holds the default, `8920`. A change on the Networking page applies after a restart. When the Networking page gives both ports the same number, it sets neither (Jellyfin resets both to the defaults). |
 | `FERROFIN_PUBLISHED_URL` | auto-detect | Public base URL advertised to clients. |
 | `FERROFIN_BASE_URL` | none | URL path prefix the server is mounted under. It outranks **Base URL** on Dashboard → Networking, which outranks the `config.toml` key `base_url`. A blank value is set: it serves at the root and still outranks the Networking page. A change on the Networking page applies after a restart, and the dashboard shows the restart as pending. |
 | `FERROFIN_SERVER_NAME` | host name | Server name reported to clients. |
@@ -260,7 +260,7 @@ Ferrofin serves HTTPS itself, as Jellyfin does, from the dashboard's **Networkin
 
 - **Enable HTTPS** with a **Custom SSL certificate path** to a PKCS#12 (`.pfx`/`.p12`) file holding
   the certificate and its private key, plus its password if it has one. At startup the server
-  listens with HTTPS on `FERROFIN_HTTPS_PORT` on every address it listens with HTTP on.
+  listens with HTTPS on its HTTPS port on every address it listens with HTTP on.
   If the certificate does not load, the server logs why and serves HTTP only.
   A certificate without a password must use the usual empty-password form, as OpenSSL writes
   it. The rarer NULL-password form, which .NET loads, does not load yet (gl-815). To rewrite
@@ -274,9 +274,11 @@ Ferrofin serves HTTPS itself, as Jellyfin does, from the dashboard's **Networkin
   `X-Forwarded-Proto: https` counts as HTTPS.
 - A new certificate path takes effect after a restart; the dashboard shows the restart as
   pending. A path to a missing file saves but is answered `404`.
-- The ports are `FERROFIN_PORT` and `FERROFIN_HTTPS_PORT`; the port fields on the Networking
-  page are not read yet (gl-554). When both name the same port, HTTPS is not served and the
-  log says so.
+- The ports are the Networking page's **Local HTTP port number** and **Local HTTPS port
+  number**, below `FERROFIN_PORT` (or `--port`) and `FERROFIN_HTTPS_PORT` (see the table above).
+  An adopted Jellyfin install keeps its ports from its first boot, unless a flag or a variable
+  pins them (the container image sets `FERROFIN_PORT`). When a variable, a flag or
+  `config.toml` leaves both on the same port, HTTPS is not served and the log says so.
 - Adoption keeps Jellyfin's **Enable HTTPS** and **Require HTTPS**, but not its certificate
   path and password, which point into Jellyfin's filesystem.
 
@@ -316,6 +318,7 @@ proxy's `X-Forwarded-Proto` and `X-Forwarded-Host`.
 | `FERROFIN_AUTH_CACHE_TTL_SECS` | `30` | Seconds a resolved access token (its device, user and policy, or an API key's name, or the rejection of a token that matched nothing) is served from memory before the database is read again. Every change made through the server applies at once; this only bounds how long a change made outside it, in the database itself, goes unseen. `5` to `300`. The `config.toml` key is `auth_cache_ttl_secs`. |
 | `FERROFIN_ROW_CACHE_TTL_SECS` | `30` | Seconds the per-user access check serves a user's permissions and preferences, the libraries' rows and options, and the views' and the playlists folder's rows, from memory. Queries scoped to the user's libraries, the home screen's views and every lookup of a library's physical folders read the same cached rows and options. Whether a Live TV tuner is configured, which decides whether Live TV is offered, is cached the same way. As for the auth cache, every change made through the server applies at once, and this only bounds changes made outside it (the database, a library's `options.json`). `5` to `300`. The `config.toml` key is `row_cache_ttl_secs`. |
 | `FERROFIN_SCAN_DIRECTORY_CACHE_IDLE_SECS` | `300` | Seconds a library scan's directory listings survive unread before they are dropped. The default is Jellyfin's (`DirectoryService.IdleTimeoutMs`). `30` to `3600` (a value outside, `0` included, logs a warning and is clamped). The `config.toml` key is `scan_directory_cache_idle_secs`. |
+| `FERROFIN_BOOK_ARCHIVE_MAX_ENTRIES` | `100000` | The most entries a comic archive (`.cbz`, `.cb7`, `.cbt`) may hold for its pages to set the book's runtime. A book's runtime is its pages × 10000 ticks, which is what jellyfin-web's comic and PDF readers report as the position: a comic counts its archive's entries other than folders, a PDF its pages, as Jellyfin does. The count reads only the archive's directory, never a page; an archive with more entries than this is not counted and its book keeps the runtime it has (one second for a new one). Every entry counts towards the limit, folders included. Jellyfin has no such limit. A book is counted when it is added, when its file changes, when its metadata is refreshed ("Search for missing metadata" or "Replace all metadata"), and on any scan while a `.cbz`, `.cb7`, `.cbt` or PDF still has the one-second runtime (as a book added by an older release does); a counted book whose file has not changed is not opened again, while one whose pages cannot be counted is opened again on each scan but not saved. `1000` to `10000000` (a value outside, `0` included, logs a warning and is clamped). The `config.toml` key is `book_archive_max_entries`. |
 | `FERROFIN_TRICKPLAY_CONCURRENCY` | `auto` | How many videos generate trickplay images at once (each one's selected widths in turn: for each, an ffmpeg frame extraction, then tile packing). A video keeps its place until all of its widths are made, so with **Both** selected a scan makes each video's 320 and 640 sets together. A library scan generates several at once; the **Generate Trickplay Images** task goes one item at a time but shares this cap when it overlaps a scan. `auto` allows as many as the image-encoding limit: **Parallel image encoding limit** on the dashboard (`ParallelImageEncodingLimit`), else one per CPU. An integer sets a lower cap; `0`, a negative number, or a value above the auto value means `auto`. Each generation is an ffmpeg process with its own memory, and with hardware acceleration its own GPU memory (about 1 GiB for a 4K HEVC video on an NVIDIA GPU). Packing its tiles then takes about 60 MiB of server memory at the default tile grid, at 320 or 640, because a wider set packs fewer previews into each tile ([Trickplay](#trickplay)). Jellyfin generates one at a time; `1` does the same. The `config.toml` key `trickplay_concurrency` takes an integer or `"auto"`. |
 
 ## Trickplay
@@ -458,7 +461,8 @@ Jellyfin's shared keys. The settings below are optional overrides or additions.
 TMDB's `TmdbApiKey` plugin setting overrides its shared key. OpenSubtitles uses
 Jellyfin's shared application key with the username/password configured in its
 plugin settings; its `ApiKey` field is an optional override. The shared key does
-not replace the account needed for subtitle downloads.
+not replace the account needed for subtitle downloads and for the subtitle
+searches a scan or the scheduled task makes.
 
 ## Extensions
 

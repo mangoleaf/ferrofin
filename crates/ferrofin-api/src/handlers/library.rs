@@ -479,14 +479,10 @@ async fn refresh_library(
     State(state): State<AppState>,
     RequireAdmin(_auth): RequireAdmin,
 ) -> axum::http::StatusCode {
-    // `CancelIfRunningAndQueue`: cancel first so a scan already in flight is
-    // restarted rather than rejected. Cancelling an idle task is a no-op on
-    // both servers, so this is safe on the common path.
+    // `CancelIfRunningAndQueue`: a scan already in flight is cancelled and
+    // the new one starts when it has ended, rather than being rejected.
     let task_id = ferrofin_traits::tasks::task_id_for_key(REFRESH_LIBRARY_TASK_KEY);
-    if let Err(err) = state.tasks.cancel_task(&task_id).await {
-        tracing::error!(%err, "Error refreshing library");
-    }
-    if let Err(err) = state.tasks.start_task(&task_id).await {
+    if let Err(err) = state.tasks.cancel_if_running_and_queue(&task_id).await {
         tracing::error!(%err, "Error refreshing library");
     }
     axum::http::StatusCode::NO_CONTENT

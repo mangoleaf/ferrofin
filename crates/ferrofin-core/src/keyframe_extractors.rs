@@ -14,6 +14,7 @@
 
 use std::path::Path;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use async_trait::async_trait;
 use ferrofin_db::entities::base_items::KeyframeDataEntity;
@@ -127,10 +128,23 @@ impl KeyframeExtractor for FfProbeKeyframeExtractor {
 
         let probe_path = self.encoder.probe_path();
         let path = file_path.to_owned();
+        // A dropped wait (its task stopped) ends ffprobe too: the blocking
+        // pool would otherwise run it over the whole file for nobody.
+        let stop = Arc::new(AtomicBool::new(false));
+        let _stop_on_drop = StopOnDrop(Arc::clone(&stop));
         extract_on_blocking_pool("ffprobe", file_path, move || {
-            ferrofin_keyframes::ff_probe::get_keyframe_data(&probe_path, &path)
+            ferrofin_keyframes::ff_probe::get_keyframe_data(&probe_path, &path, &stop)
         })
         .await
+    }
+}
+
+/// Sets its flag when dropped.
+struct StopOnDrop(Arc<AtomicBool>);
+
+impl Drop for StopOnDrop {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Relaxed);
     }
 }
 

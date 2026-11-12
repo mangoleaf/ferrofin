@@ -1624,6 +1624,163 @@ pub async fn run_rekey_pathless_playlists(
     Ok(())
 }
 
+/// The extension of the database snapshot [`expand_saved_playlist_containers`]
+/// takes (`ferrofin.db.pre-playlist-containers`).
+const PLAYLIST_CONTAINERS_SNAPSHOT_EXTENSION: &str = "db.pre-playlist-containers";
+
+/// What [`expand_saved_playlist_containers`] did.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ExpandedPlaylists {
+    /// Playlists whose container entries were replaced by their contents.
+    pub expanded: usize,
+    /// Playlists given a media type.
+    pub stamped: usize,
+    /// Playlists left for the next boot: one failed, one has no folder yet,
+    /// or the previous version changed its entries while they were read.
+    pub pending: usize,
+}
+
+/// Ferrofin before 1.4.0 stored a container a playlist create or add named
+/// (an album, artist, genre, season, series, box set or folder) as one entry,
+/// and gave a new playlist no media type (gl-6). Jellyfin's
+/// `AddToPlaylistInternal` stores the container's tracks or episodes
+/// (`Playlist.GetPlaylistItems`) and `CreatePlaylist` always stores a media
+/// type, so a client queueing such a playlist got an album as one track, and
+/// a `MediaTypes` filter dropped the playlist. This brings each playlist to
+/// what a create or add stores today (the playlist manager's
+/// `saved_container_plan`): each container entry
+/// replaced in place by its contents as the playlist's owner sees them, and
+/// the media type the entries give.
+///
+/// Only a playlist a create made is changed, one in the playlists folder: a
+/// playlist the scan found in a library takes its entries and media type
+/// from its file or folder. A playlist with no folder yet waits for
+/// [`rekey_pathless_playlists`], which runs first, to give it one. Entry ids
+/// (the items' ids) and the positions after an expanded entry change, so the
+/// file is snapshotted first. Runs once; a playlist that failed, or that the
+/// previous version changed while it was read, keeps its entries, and the
+/// repair runs again on the next boot.
+///
+/// # Errors
+/// Returns [`ServiceError`] if the playlists cannot be listed, the snapshot
+/// cannot be written (nothing is changed then) or the marker write fails.
+pub async fn expand_saved_playlist_containers(
+    db: &Database,
+    playlists: &crate::FerrofinPlaylistManager,
+) -> Result<ExpandedPlaylists, ServiceError> {
+    const KEY: &str = "playlist_containers_expanded_v1";
+    let mut result = ExpandedPlaylists::default();
+    if !once(db, KEY).await? {
+        return Ok(result);
+    }
+    let rows: Vec<(String, Option<String>, Option<String>)> = sqlx::query_as(
+        r#"SELECT p."Id", p."Path", fp."OwnerUserId" FROM "BaseItems" p
+           LEFT JOIN "FerrofinPlaylists" fp ON fp."PlaylistId" = p."Id"
+           WHERE p."Type" = ?1 ORDER BY p.rowid"#,
+    )
+    .bind(stored_type_name(BaseItemKind::Playlist).unwrap_or_default())
+    .fetch_all(db.pool())
+    .await
+    .map_err(db_err)?;
+    let mut plans = Vec::new();
+    for (id, path, owner) in rows {
+        let Ok(id) = Uuid::parse_str(&id) else {
+            continue;
+        };
+        let Some(path) = path.filter(|path| !path.is_empty()) else {
+            result.pending += 1;
+            continue;
+        };
+        if !playlists.in_playlists_folder(&path) {
+            continue;
+        }
+        let owner = owner
+            .as_deref()
+            .and_then(|owner| Uuid::parse_str(owner).ok())
+            .unwrap_or_else(Uuid::nil);
+        match playlists.saved_container_plan(id, owner).await {
+            Ok(Some(plan)) => plans.push(plan),
+            Ok(None) => {}
+            Err(err) => {
+                tracing::warn!(
+                    %err,
+                    item_id = %id,
+                    "could not read a playlist an older Ferrofin saved; \
+                     the repair runs again on the next boot"
+                );
+                result.pending += 1;
+            }
+        }
+    }
+    if !plans.is_empty()
+        && let Some(backup) = db
+            .snapshot_once(PLAYLIST_CONTAINERS_SNAPSHOT_EXTENSION)
+            .await?
+    {
+        tracing::info!(
+            backup = %backup.display(),
+            "database snapshot taken before expanding playlist container entries"
+        );
+    }
+    for plan in &plans {
+        match playlists.apply_saved_container_plan(plan).await {
+            Ok(true) => {
+                result.expanded += usize::from(plan.expands());
+                result.stamped += usize::from(plan.stamps());
+            }
+            Ok(false) => {
+                tracing::debug!(
+                    item_id = %plan.playlist(),
+                    "a playlist changed while its container entries were read; \
+                     the repair runs again on the next boot"
+                );
+                result.pending += 1;
+            }
+            Err(err) => {
+                tracing::warn!(
+                    %err,
+                    item_id = %plan.playlist(),
+                    "could not expand a playlist's container entries; \
+                     the repair runs again on the next boot"
+                );
+                result.pending += 1;
+            }
+        }
+    }
+    if result.pending == 0 {
+        done(db, KEY).await?;
+    }
+    Ok(result)
+}
+
+/// [`expand_saved_playlist_containers`] and its log line, for the
+/// composition root. A failure is logged, not returned: the repair is not
+/// needed to serve, and it runs again on the next boot.
+pub async fn run_expand_saved_playlist_containers(
+    db: &Database,
+    playlists: &crate::FerrofinPlaylistManager,
+) {
+    match expand_saved_playlist_containers(db, playlists).await {
+        Ok(ExpandedPlaylists {
+            expanded: 0,
+            stamped: 0,
+            pending: 0,
+        }) => {}
+        Ok(did) => tracing::info!(
+            expanded = did.expanded,
+            stamped = did.stamped,
+            pending = did.pending,
+            "brought playlists an older Ferrofin saved to what a create or add stores: \
+             container entries expanded, media types stamped"
+        ),
+        Err(err) => tracing::warn!(
+            %err,
+            "could not expand the container entries of playlists an older Ferrofin saved; \
+             the repair runs again on the next boot"
+        ),
+    }
+}
+
 /// The extension of the database snapshot
 /// [`merge_legacy_collections_library`] takes
 /// (`jellyfin.db.pre-collections-library`).
@@ -7964,5 +8121,125 @@ mod program_data_tests {
         let mut expected = vec![missing, format!("{pd}/config/users/gilesw/profile.png")];
         expected.sort();
         assert_eq!(paths, expected);
+    }
+}
+
+#[cfg(test)]
+mod playlist_container_tests {
+    use std::sync::Arc;
+
+    use ferrofin_model::data::BaseItemKind;
+    use ferrofin_traits::system::ServerApplicationPaths;
+
+    use super::*;
+    use crate::test_support::{
+        item_repository_over, library_manager_over, seed_named_item, seed_video_item,
+        set_item_path, test_db,
+    };
+
+    const KEY: &str = "playlist_containers_expanded_v1";
+
+    async fn media_type(db: &Database, id: Uuid) -> Option<String> {
+        sqlx::query_scalar(r#"SELECT "MediaType" FROM "BaseItems" WHERE "Id" = ?1"#)
+            .bind(guid_to_db(id))
+            .fetch_one(db.pool())
+            .await
+            .unwrap()
+    }
+
+    /// A write goes ahead only over the entries its plan read: an entry the
+    /// previous version added in between leaves the playlist as it was. A
+    /// playlist with no folder yet holds the marker back until it has one,
+    /// and a playlist the scan found in a library is never changed. An empty
+    /// playlist takes `CreatePlaylist`'s default, `Audio`.
+    #[tokio::test]
+    async fn a_playlist_changed_meanwhile_or_with_no_folder_waits_for_the_next_boot() {
+        let db = test_db().await;
+        let root = tempfile::tempdir().unwrap();
+        let paths: Arc<dyn ServerApplicationPaths> =
+            Arc::new(crate::app_paths::FerrofinServerApplicationPaths::new(
+                root.path(),
+                root.path().join("log"),
+                root.path().join("config"),
+                root.path().join("cache"),
+                root.path().join("web"),
+            ));
+        let manager = crate::FerrofinPlaylistManager::new(
+            db.clone(),
+            library_manager_over(db.clone()),
+            item_repository_over(db.clone()),
+            Arc::clone(&paths),
+        );
+        let (made, scanned, unfiled, movie) = (
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+        );
+        for (id, name) in [(made, "Made"), (scanned, "Scanned"), (unfiled, "Unfiled")] {
+            seed_named_item(&db, id, BaseItemKind::Playlist, name).await;
+        }
+        let in_playlists = |name: &str| format!("{}/playlists/{name}", paths.data_path());
+        assert!(manager.in_playlists_folder(&in_playlists("Made")));
+        assert!(!manager.in_playlists_folder(&format!("{}/playlists", paths.data_path())));
+        assert!(!manager.in_playlists_folder(&format!("{}/playlists2/Made", paths.data_path())));
+        set_item_path(&db, made, &in_playlists("Made")).await;
+        let library = root.path().join("media/Scanned").display().to_string();
+        set_item_path(&db, scanned, &library).await;
+        seed_video_item(&db, movie, BaseItemKind::Movie).await;
+
+        let plan = manager
+            .saved_container_plan(made, Uuid::nil())
+            .await
+            .unwrap()
+            .expect("a media type is owed");
+        assert!(plan.stamps() && !plan.expands());
+        sqlx::query(
+            r#"INSERT INTO "LinkedChildren" ("ParentId", "SortOrder", "ChildId", "ChildType")
+               VALUES (?1, 0, ?2, 0)"#,
+        )
+        .bind(guid_to_db(made))
+        .bind(guid_to_db(movie))
+        .execute(db.writer())
+        .await
+        .unwrap();
+        assert!(!manager.apply_saved_container_plan(&plan).await.unwrap());
+        assert_eq!(media_type(&db, made).await, None);
+
+        let ran = expand_saved_playlist_containers(&db, &manager)
+            .await
+            .unwrap();
+        assert_eq!(
+            ran,
+            ExpandedPlaylists {
+                expanded: 0,
+                stamped: 1,
+                pending: 1
+            }
+        );
+        assert_eq!(media_type(&db, made).await.as_deref(), Some("Video"));
+        assert_eq!(media_type(&db, scanned).await, None);
+        assert!(db.meta_get(KEY).await.unwrap().is_none());
+
+        set_item_path(&db, unfiled, &in_playlists("Unfiled")).await;
+        let ran = expand_saved_playlist_containers(&db, &manager)
+            .await
+            .unwrap();
+        assert_eq!(
+            ran,
+            ExpandedPlaylists {
+                expanded: 0,
+                stamped: 1,
+                pending: 0
+            }
+        );
+        assert_eq!(media_type(&db, unfiled).await.as_deref(), Some("Audio"));
+        assert!(db.meta_get(KEY).await.unwrap().is_some());
+        assert_eq!(
+            expand_saved_playlist_containers(&db, &manager)
+                .await
+                .unwrap(),
+            ExpandedPlaylists::default()
+        );
     }
 }

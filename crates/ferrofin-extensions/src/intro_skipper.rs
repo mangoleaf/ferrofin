@@ -781,8 +781,9 @@ impl ScheduledTask for DetectSegmentsTask {
         }
         // The automatic analysis gives way, then this waits its turn for the
         // one-pass latch (`ScheduledTaskSemaphore.AcquireAsync`) — a rescan
-        // may hold it. The guard releases it even if the run is aborted
-        // mid-await (the task manager cancels a run by aborting its task).
+        // may hold it. The guard releases it even if the run is dropped
+        // mid-await (the task manager drops a run that does not stop in time,
+        // and aborts one at shutdown).
         self.cancel_automatic().await;
         let _release = self.running.acquire().await?;
         let config = self.load_config().await;

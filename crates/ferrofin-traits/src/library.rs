@@ -984,7 +984,9 @@ pub trait LibraryManager: Send + Sync {
     ///
     /// Matching is by cleaned name (Jellyfin's item-by-name id is derived from
     /// the name), delegating to [`Self::get_item_list`] filtered to `kind`; the
-    /// first match wins, mirroring C# `FirstOrDefault`.
+    /// first match wins, mirroring C# `FirstOrDefault`. The concrete manager
+    /// reads a `Person` by the id its name derives instead, as `GetPerson`
+    /// does, so spellings sharing a clean name are each their own person.
     async fn get_named_item(
         &self,
         kind: BaseItemKind,
@@ -1049,7 +1051,9 @@ pub trait LibraryManager: Send + Sync {
     ///
     /// The default loops [`Self::get_named_item`]; the concrete manager overrides
     /// it with a single `CleanName IN (…)` query — resolving a whole page of
-    /// people/years in one round-trip instead of N.
+    /// by-name items in one round-trip instead of N — and a page of people with the
+    /// people repository's `GetPerson` reads by id
+    /// ([`PeopleRepository::find_person_item_ids`](crate::persistence::PeopleRepository::find_person_item_ids)).
     async fn get_named_items(
         &self,
         kind: BaseItemKind,
@@ -1069,7 +1073,8 @@ pub trait LibraryManager: Send + Sync {
     /// The DTO prefetch resolves a whole page's cast through this and reads
     /// nothing but the id, so the concrete manager overrides it with a
     /// two-column projection rather than materializing a full item row per
-    /// credited name. The default delegates to [`Self::get_named_items`], so
+    /// credited name, and for a `Person` with the people repository's id-only
+    /// `GetPerson` reads. The default delegates to [`Self::get_named_items`], so
     /// every implementation gets it for free with identical results.
     async fn get_named_item_ids(
         &self,
