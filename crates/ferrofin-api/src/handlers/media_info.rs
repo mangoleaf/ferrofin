@@ -1145,7 +1145,8 @@ fn apply_stream_decision(
 /// server does not stream as such: `MediaOptions.EnableDirectStream` is off)
 /// and a transcode both become a transcode at the stream's own
 /// `/audio/{id}/stream.{container}` (or `master.m3u8`) URL, with the
-/// profile's container and sub-protocol.
+/// profile's container and sub-protocol; a source no profile or remux was
+/// chosen for keeps its own, unless it is forced to transcode.
 fn audio_transcode_decision(
     source: &mut MediaSourceInfo,
     mut stream: ferrofin_model::dlna::StreamInfo,
@@ -1169,6 +1170,13 @@ fn audio_transcode_decision(
         }
         push_burn_in(&mut url, &stream);
         source.transcoding_url = Some(url);
+    }
+    // The builder stamps the source it negotiates, whether or not a URL
+    // follows: a chosen profile's container and protocol
+    // (`SetStreamInfoOptionsFromTranscodingProfile`), or the remux container.
+    // It works on a copy here. A source neither was chosen for keeps its own,
+    // unless it is forced to transcode: that branch writes the stream's.
+    if force_remote || stream.container.is_some() {
         source.transcoding_container.clone_from(&stream.container);
         source.transcoding_sub_protocol = stream.sub_protocol;
     }
@@ -2635,13 +2643,18 @@ mod tests {
     /// `!enableDirectStream || !allowVideoStreamCopy` whatever the item type.
     /// Either way the response's flags are the ones `SetDeviceSpecificData`
     /// recomputes after negotiating: neither direct play nor direct stream.
+    /// gl-1041: the builder stamps the container it chose on the source, the
+    /// remux's `ts` too, also for a user who may not transcode audio, who gets
+    /// no URL.
     #[rstest::rstest]
-    #[case::no_veto(true, true, "ts", None)]
-    #[case::direct_stream_vetoed(false, true, "aac", Some("aac"))]
-    #[case::video_copy_vetoed(true, false, "aac", Some("aac"))]
+    #[case::no_veto(true, true, true, "ts", None)]
+    #[case::direct_stream_vetoed(false, true, true, "aac", Some("aac"))]
+    #[case::video_copy_vetoed(true, false, true, "aac", Some("aac"))]
+    #[case::no_transcoding_permission(true, true, false, "ts", None)]
     fn a_direct_stream_veto_stops_the_audio_remux(
         #[case] enable_direct_stream: bool,
         #[case] allow_video_stream_copy: bool,
+        #[case] audio_transcoding: bool,
         #[case] container: &str,
         #[case] audio_codec: Option<&str>,
     ) {
@@ -2691,7 +2704,7 @@ mod tests {
             "ps-audio",
             flags,
             &ferrofin_model::users::UserPolicy {
-                enable_audio_playback_transcoding: true,
+                enable_audio_playback_transcoding: audio_transcoding,
                 ..ferrofin_model::users::UserPolicy::default()
             },
             true,
@@ -2701,6 +2714,12 @@ mod tests {
         .expect("a decision");
         assert_eq!(decision.play_method, "Transcode");
         assert!(!source.supports_direct_play && !source.supports_direct_stream);
+        assert_eq!(source.transcoding_container.as_deref(), Some(container));
+        assert_eq!(source.supports_transcoding, audio_transcoding);
+        if !audio_transcoding {
+            assert!(source.transcoding_url.is_none());
+            return;
+        }
         let url = source.transcoding_url.as_deref().expect("a transcode URL");
         assert!(
             url.starts_with(&format!(
@@ -2712,6 +2731,84 @@ mod tests {
             .split(['?', '&'])
             .find_map(|pair| pair.strip_prefix("AudioCodec="));
         assert_eq!(named, audio_codec, "{url}");
+    }
+
+    /// gl-1041: with no audio transcoding profile this ffmpeg can encode the
+    /// builder chooses none, so a source keeps its own `TranscodingContainer`
+    /// and `TranscodingSubProtocol` and its URL names no container
+    /// (`SetDeviceSpecificData`'s normal branch writes only the URL). A remote
+    /// source forced to transcode takes the stream's, none and `http`, as the
+    /// force-remote branch writes them whatever was chosen.
+    #[rstest::rstest]
+    #[case::kept(false, Some("mp3"), MediaStreamProtocol::hls)]
+    #[case::force_remote(true, None, MediaStreamProtocol::http)]
+    fn without_an_encodable_audio_profile_only_a_forced_transcode_restamps_the_source(
+        #[case] force_remote: bool,
+        #[case] container: Option<&str>,
+        #[case] protocol: MediaStreamProtocol,
+    ) {
+        use ferrofin_model::dlna::{DirectPlayProfile, EncodingContext};
+        let profile = Arc::new(DeviceProfile {
+            direct_play_profiles: vec![DirectPlayProfile {
+                container: "mp3".to_owned(),
+                audio_codec: Some("mp3".to_owned()),
+                video_codec: None,
+                profile_type: DlnaProfileType::Audio,
+            }],
+            transcoding_profiles: vec![TranscodingProfile {
+                container: "truehd".to_owned(),
+                audio_codec: "truehd".to_owned(),
+                profile_type: DlnaProfileType::Audio,
+                protocol: MediaStreamProtocol::hls,
+                context: EncodingContext::Streaming,
+                ..TranscodingProfile::default()
+            }],
+            ..DeviceProfile::default()
+        });
+        let mut source = MediaSourceInfo {
+            id: Some("0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a".to_owned()),
+            container: Some("flac".to_owned()),
+            bitrate: Some(900_000),
+            is_remote: force_remote,
+            supports_transcoding: true,
+            transcoding_container: Some("mp3".to_owned()),
+            transcoding_sub_protocol: MediaStreamProtocol::hls,
+            media_streams: vec![MediaStream {
+                stream_type: MediaStreamType::Audio,
+                codec: Some("flac".to_owned()),
+                channels: Some(2),
+                ..MediaStream::default()
+            }],
+            ..MediaSourceInfo::default()
+        };
+        let decision = super::apply_stream_decision(
+            &mut source,
+            &profile,
+            uuid::Uuid::from_u128(0xA0D10),
+            None,
+            None,
+            None,
+            super::StreamSelection::default(),
+            "ps-audio",
+            super::PlaybackFlags::default(),
+            &ferrofin_model::users::UserPolicy {
+                enable_audio_playback_transcoding: true,
+                force_remote_source_transcoding: force_remote,
+                ..ferrofin_model::users::UserPolicy::default()
+            },
+            true,
+            &support(),
+        )
+        .expect("a profile the builder can evaluate")
+        .expect("a decision");
+        assert_eq!(decision.play_method, "Transcode");
+        assert_eq!(source.transcoding_container.as_deref(), container);
+        assert_eq!(source.transcoding_sub_protocol, protocol);
+        let url = source.transcoding_url.as_deref().expect("a transcode URL");
+        assert!(
+            url.starts_with("/audio/00000000-0000-0000-0000-0000000a0d10/stream?"),
+            "{url}"
+        );
     }
 
     /// `MediaEncoder` as `ITranscoderSupport`: an audio codec is encodable
