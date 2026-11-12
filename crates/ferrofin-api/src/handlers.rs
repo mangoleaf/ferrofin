@@ -1436,8 +1436,18 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
                    boot-repair fold, item_persistence_service.rs agree_user_data (the \
                    retired-key update of SaveUserData, from the row ResolveUserDataRow reads), \
                    compared with Jellyfin.Server.Implementations/Item/\
-                   ItemPersistenceService.cs (ReattachUserDataAsync, ReconcileUserDataAsync)",
-        date: "2026-11-06",
+                   ItemPersistenceService.cs (ReattachUserDataAsync, ReconcileUserDataAsync). \
+                   Also the read path of the folder played test: item_repository.rs \
+                   get_is_played with translate_query.rs build_is_played_query \
+                   (resolve_descendant_query's \
+                   closure and links, each item through push_leaf_is_played_per_row), compared \
+                   with Jellyfin.Server.Implementations/Item/BaseItemRepository.Querying.cs \
+                   (GetIsPlayed), BaseItemRepository.TranslateQuery.cs \
+                   (BuildLeafIsPlayedFilter), src/Jellyfin.Database/\
+                   Jellyfin.Database.Implementations/DescendantQueryHelper.cs \
+                   (GetAllDescendantIds) and MediaBrowser.Controller/Entities/Folder.cs \
+                   (IsPlayed)",
+        date: "2026-11-11",
         divergences: &[
             "After a scan or boot-repair fold, which upstream does not have (it deletes the \
              duplicate, and ReconcileUserDataAsync gives the user's rows the most recent play when \
