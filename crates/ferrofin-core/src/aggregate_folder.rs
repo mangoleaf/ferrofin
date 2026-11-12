@@ -974,6 +974,9 @@ mod tests {
         let written = chrono::DateTime::parse_from_rfc3339("2021-02-03T04:05:06Z")
             .expect("date")
             .with_timezone(&chrono::Utc);
+        let mut refreshed = fetch_item(&db, playlists).await;
+        refreshed.date_last_refreshed = Some(written);
+        crate::test_support::save_item(&db, &refreshed).await;
         std::fs::File::open(&dir)
             .expect("open dir")
             .set_modified(written.into())
@@ -999,6 +1002,10 @@ mod tests {
         assert_eq!(row.top_parent_id, Some(db_guid(playlists)));
         assert_eq!(row.date_modified, Some(written), "LastWriteTimeUtc");
         assert_eq!(row.date_created, Some(written), "CreationTimeUtc");
+        assert_eq!(
+            row.date_last_refreshed, None,
+            "a new folder, refreshed again by the next validation"
+        );
         let saved = row.date_last_saved.expect("saved");
         assert!((before..=after).contains(&saved), "{saved}");
 

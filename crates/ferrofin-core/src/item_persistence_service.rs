@@ -1006,7 +1006,9 @@ pub(crate) async fn retype_container(
 ///
 /// Those columns only, where upstream saves a new folder object over the row:
 /// the row keeps its name, its images and whatever else was set on it, and
-/// its playlists stay where they are.
+/// its playlists stay where they are. The one more it takes from the new
+/// object is its `DateLastRefreshed`, never set, so the next validation gives
+/// the folder its first refresh again (gl-1625).
 pub(crate) async fn repath_virtual_child(
     db: &Database,
     id: Uuid,
@@ -1019,7 +1021,8 @@ pub(crate) async fn repath_virtual_child(
     sqlx::query(
         r#"UPDATE "BaseItems"
            SET "Path" = ?2, "ParentId" = ?3, "TopParentId" = ?1,
-               "DateCreated" = ?4, "DateModified" = ?5, "DateLastSaved" = ?6
+               "DateCreated" = ?4, "DateModified" = ?5, "DateLastSaved" = ?6,
+               "DateLastRefreshed" = NULL
            WHERE "Id" = ?1"#,
     )
     .bind(guid_to_db(id))
@@ -1615,13 +1618,26 @@ impl FerrofinItemPersistenceService {
     /// is never selected: every library is a `CollectionFolder`, so the type
     /// alone would take them all.
     ///
-    /// Only NULL dates are filled, so a row Jellyfin wrote keeps its own.
+    /// Apart from the clear below, it fills NULL dates only, so a date
+    /// Jellyfin wrote is kept.
     /// `DateCreated` and `DateModified` come from the row's directory, as
     /// `CreateRootFolder` dates a folder it creates, or are now when it cannot
     /// be read; `DateLastSaved` is now.
     ///
-    /// Completion is recorded in `FerrofinMeta` under `container_dates_v1`.
-    /// Returns the number of rows repaired.
+    /// A refreshed row (`DateLastRefreshed` set) gets no `DateModified`: its
+    /// refresh saved it after restating the directory, which has none
+    /// (`MetadataService.cs:244-256`, D2), and every folder row Jellyfin
+    /// refreshed is stored so. Either row that has a `DateModified` while it
+    /// is refreshed and its directory is there loses it. That undoes the
+    /// first version of this pass (`container_dates_v1`), which filled it on
+    /// every adopted Playlists folder (gl-1625).
+    ///
+    /// Completion is recorded in `FerrofinMeta` under `container_dates_v2`,
+    /// so a database the first version ran on runs this one too. The first
+    /// version's key is recorded with it, so an older build started on the
+    /// database afterwards (a rollback, or the previous pod of a rolling
+    /// update restarting) does not fill the NULL again.
+    /// Returns the number of rows repaired: filled or cleared.
     ///
     /// # Errors
     ///
@@ -1632,7 +1648,7 @@ impl FerrofinItemPersistenceService {
         &self,
         collections_path: &str,
     ) -> Result<u64, ServiceError> {
-        const META_KEY: &str = "container_dates_v1";
+        const META_KEY: &str = "container_dates_v2";
         if self.repair_done(META_KEY).await? {
             return Ok(0);
         }
@@ -1643,8 +1659,9 @@ impl FerrofinItemPersistenceService {
         let rows: Vec<(String, Option<String>)> = sqlx::query_as(
             r#"SELECT "Id", "Path" FROM "BaseItems"
                WHERE ("Type" = ?1 OR ("Type" = ?2 AND "Path" IN (?3, ?4)))
-                 AND ("DateCreated" IS NULL OR "DateModified" IS NULL
-                      OR "DateLastSaved" IS NULL)"#,
+                 AND ("DateCreated" IS NULL OR "DateLastSaved" IS NULL
+                      OR ("DateModified" IS NULL AND "DateLastRefreshed" IS NULL)
+                      OR ("DateModified" IS NOT NULL AND "DateLastRefreshed" IS NOT NULL))"#,
         )
         .bind(type_name(BaseItemKind::PlaylistsFolder)?)
         .bind(type_name(BaseItemKind::CollectionFolder)?)
@@ -1666,14 +1683,18 @@ impl FerrofinItemPersistenceService {
             let (created, modified) = dir
                 .as_ref()
                 .map_or((now, now), crate::library_scan::created_and_modified);
-            dated.push((id, created, modified));
+            let is_dir = dir.as_ref().is_some_and(std::fs::Metadata::is_dir);
+            dated.push((id, created, modified, is_dir));
         }
         let mut tx = self.db.writer().begin().await.map_err(db_err)?;
         let mut repaired: u64 = 0;
-        for (id, created, modified) in &dated {
+        for (id, created, modified, is_dir) in &dated {
             let written = sqlx::query(
                 r#"UPDATE "BaseItems" SET "DateCreated" = COALESCE("DateCreated", ?2),
-                       "DateModified" = COALESCE("DateModified", ?3),
+                       "DateModified" = CASE
+                           WHEN "DateLastRefreshed" IS NULL THEN COALESCE("DateModified", ?3)
+                           WHEN ?5 THEN NULL
+                           ELSE "DateModified" END,
                        "DateLastSaved" = COALESCE("DateLastSaved", ?4)
                    WHERE "Id" = ?1"#,
             )
@@ -1681,12 +1702,14 @@ impl FerrofinItemPersistenceService {
             .bind(datetime_to_db(*created))
             .bind(datetime_to_db(*modified))
             .bind(datetime_to_db(now))
+            .bind(is_dir)
             .execute(&mut *tx)
             .await
             .map_err(db_err)?;
             repaired += written.rows_affected();
         }
         Self::mark_repair_done_in(&mut tx, META_KEY).await?;
+        Self::mark_repair_done_in(&mut tx, "container_dates_v1").await?;
         tx.commit().await.map_err(db_err)?;
         Ok(repaired)
     }
@@ -7075,6 +7098,32 @@ pub(crate) async fn seed_primary_image(db: &Database, image_id: Uuid, item: Uuid
     .execute(db.writer())
     .await
     .expect("seed primary image");
+}
+
+/// Sets `id`'s `DateModified`, `DateLastRefreshed` and `DateLastSaved` to
+/// each date given, keeping the stored one for a `None`: a refresh's due
+/// rules, read back without a save stamping the row.
+#[cfg(test)]
+pub(crate) async fn seed_refresh_dates(
+    db: &Database,
+    id: Uuid,
+    modified: Option<chrono::DateTime<chrono::Utc>>,
+    refreshed: Option<chrono::DateTime<chrono::Utc>>,
+    saved: Option<chrono::DateTime<chrono::Utc>>,
+) {
+    sqlx::query(
+        r#"UPDATE "BaseItems" SET "DateModified" = coalesce(?2, "DateModified"),
+               "DateLastRefreshed" = coalesce(?3, "DateLastRefreshed"),
+               "DateLastSaved" = coalesce(?4, "DateLastSaved")
+           WHERE "Id" = ?1"#,
+    )
+    .bind(guid_to_db(id))
+    .bind(opt_datetime_to_db(modified))
+    .bind(opt_datetime_to_db(refreshed))
+    .bind(opt_datetime_to_db(saved))
+    .execute(db.writer())
+    .await
+    .expect("seed refresh dates");
 }
 
 /// Stamps a row's `PresentationUniqueKey` directly, for tests that need a
@@ -12813,13 +12862,13 @@ mod tests {
                 .expect("repair"),
             0
         );
-        assert_eq!(
-            db.meta_get("container_dates_v1")
-                .await
-                .expect("meta")
-                .as_deref(),
-            Some("1")
-        );
+        for key in ["container_dates_v2", "container_dates_v1"] {
+            assert_eq!(
+                db.meta_get(key).await.expect("meta").as_deref(),
+                Some("1"),
+                "an older build skips its version too: {key}"
+            );
+        }
         assert!(
             crate::test_support::fetch_item(&db, collections)
                 .await
@@ -12827,6 +12876,95 @@ mod tests {
                 .is_none(),
             "the marker kept the pass from writing"
         );
+    }
+
+    /// A refreshed Playlists folder keeps no `DateModified`, as Jellyfin
+    /// stores every folder it refreshed: a NULL one is not filled, and the
+    /// boot's time the first version of the pass filled in goes, on a
+    /// database that version ran on too. A folder whose directory is gone
+    /// keeps its own, as the refresh's restat would (gl-1625).
+    #[tokio::test]
+    async fn the_container_date_repair_leaves_a_refreshed_folder_without_date_modified() {
+        let db = test_db().await;
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dir = tmp.path().join("playlists");
+        std::fs::create_dir_all(&dir).expect("dir");
+        let dir = dir.to_string_lossy().into_owned();
+        let gone = tmp.path().join("gone").to_string_lossy().into_owned();
+        // Jellyfin's row, the same row after the first version filled it, one
+        // whose directory is gone, and a refreshed one never saved, which the
+        // pass selects to date its save.
+        let (adopted, filled, moved, unsaved) = (
+            Uuid::from_u128(0xD0B1),
+            Uuid::from_u128(0xD0B2),
+            Uuid::from_u128(0xD0B3),
+            Uuid::from_u128(0xD0B4),
+        );
+        let refreshed = "2026-11-04 07:54:06.7840892";
+        let boot = "2026-11-11 02:48:56.7315386";
+        for (id, path, modified, saved) in [
+            (adopted, &dir, None, Some(refreshed)),
+            (filled, &dir, Some(boot), Some(refreshed)),
+            (moved, &gone, Some(boot), Some(refreshed)),
+            (unsaved, &dir, None, None),
+        ] {
+            super::insert_named_item(
+                &db,
+                id,
+                BaseItemKind::PlaylistsFolder,
+                "Playlists",
+                true,
+                None,
+                false,
+            )
+            .await
+            .expect("row");
+            sqlx::query(
+                r#"UPDATE "BaseItems" SET "Path" = ?2, "DateCreated" = ?3, "DateModified" = ?4,
+                       "DateLastRefreshed" = ?3, "DateLastSaved" = ?5
+                   WHERE "Id" = ?1"#,
+            )
+            .bind(guid_to_db(id))
+            .bind(path)
+            .bind(refreshed)
+            .bind(modified)
+            .bind(saved)
+            .execute(db.writer())
+            .await
+            .expect("dated");
+        }
+        sqlx::query(
+            r#"INSERT INTO "FerrofinMeta" ("Key", "Value") VALUES ('container_dates_v1', '1')"#,
+        )
+        .execute(db.writer())
+        .await
+        .expect("the first version ran");
+
+        FerrofinItemPersistenceService::new(db.clone())
+            .repair_container_dates(&tmp.path().join("collections").to_string_lossy())
+            .await
+            .expect("repair");
+
+        for (id, modified) in [(adopted, None), (filled, None), (moved, Some(boot))] {
+            let row = crate::test_support::fetch_item(&db, id).await;
+            assert_eq!(
+                row.date_modified
+                    .map(ferrofin_db::store::datetime_to_db)
+                    .as_deref(),
+                modified,
+                "{id}"
+            );
+            assert_eq!(
+                row.date_last_saved
+                    .map(ferrofin_db::store::datetime_to_db)
+                    .as_deref(),
+                Some(refreshed),
+                "{id}"
+            );
+        }
+        let row = crate::test_support::fetch_item(&db, unsaved).await;
+        assert_eq!(row.date_modified, None, "a refreshed row is not filled");
+        assert!(row.date_last_saved.is_some(), "its save is dated");
     }
 
     /// A stored key that the per-kind rule cannot reproduce is never
