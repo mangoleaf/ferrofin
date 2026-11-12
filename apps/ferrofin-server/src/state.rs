@@ -871,6 +871,12 @@ pub async fn build_app_state(
         ));
 
     // ---- media encoder (probe-only; ffmpeg process seam) ------------------
+    // Upstream's `SetFFmpegPath` reads the encoding thread count once, at
+    // startup, for every probe and frame extraction: a saved change applies
+    // from the next start.
+    let encoding_options = crate::encoding_options::EncodingOptionsReader::new("media encoder")
+        .read(config_mgr.as_ref())
+        .await;
     let media_encoder: Arc<dyn ferrofin_traits::media_encoding::MediaEncoder> = Arc::new(
         MediaEncoderImpl::new(
             Arc::new(TokioTranscoder::new()),
@@ -887,7 +893,12 @@ pub async fn build_app_state(
                 probe_size: Some(
                     ferrofin_mediaencoding::encoder::media_encoder::DEFAULT_PROBE_SIZE.to_owned(),
                 ),
-                threads: 0,
+                // `GetNumberOfThreads(null, options, null)`; it reads no
+                // capability, only the usable cores, as the planner's does.
+                threads: ferrofin_mediaencoding::EncodingHelper::new(
+                    ferrofin_mediaencoding::NoOptionalEncoders,
+                )
+                .number_of_threads(None, &encoding_options),
                 // Frame extraction (chapter images) writes here, never next to
                 // the media file — media mounts are commonly read-only. The
                 // path comes from `ServerApplicationPaths` so the chapter-image
