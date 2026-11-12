@@ -2399,6 +2399,11 @@ pub async fn build_app_state(
     )
     .await
     .context("failed to remove items whose library or file is gone")?;
+    // Once per database: the playlists of users deleted before the fix for
+    // gl-131 (or by a hand-over that failed) are handed over or deleted, as
+    // deleting their owner now does. It deletes through the library manager
+    // too; a failure only warns.
+    ferrofin_core::adoption_repairs::run_remove_orphaned_playlists(db, playlists.as_ref()).await;
     // Jellyfin 12.0's `CleanupOrphanedExternalData`, once per database: the
     // extracted data and chapter images left behind for items no longer
     // stored (every earlier Ferrofin left them when a scan removed an item).
