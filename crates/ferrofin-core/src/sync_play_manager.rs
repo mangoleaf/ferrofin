@@ -2253,9 +2253,11 @@ impl SyncPlayManager for FerrofinSyncPlayManager {
                 checked.extend(unchecked);
             };
             if !reg.groups.contains_key(&group_id) {
+                // Upstream's `JoinGroup` sends `Guid.Empty` and `string.Empty`,
+                // not the id the caller asked for.
                 let env = render_update(GroupUpdate::GroupDoesNotExist(GroupDoesNotExistUpdate {
-                    group_id,
-                    data: group_id.to_string(),
+                    group_id: Uuid::nil(),
+                    data: String::new(),
                 }));
                 drop(reg);
                 self.bus.send(&session.session_id, env);
@@ -3076,7 +3078,17 @@ mod tests {
         let (m, bus) = mgr();
         let s = session("s1", "alice");
         m.join_group(&s, Uuid::new_v4()).await.unwrap();
-        assert!(bus.bodies()[0].contains("GroupDoesNotExist"));
+        let body: serde_json::Value = serde_json::from_str(&bus.bodies()[0]).unwrap();
+        // Upstream sends `Guid.Empty` and `string.Empty`, not the requested id.
+        assert_eq!(
+            body["Data"],
+            json!({
+                "GroupId": "00000000000000000000000000000000",
+                "Type": "GroupDoesNotExist",
+                "Data": "",
+            }),
+            "{body}"
+        );
         let groups = m.list_groups(&s).await.unwrap();
         assert!(groups.is_empty(), "{groups:?}");
     }
