@@ -1313,7 +1313,9 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
                    UTF-16 path + DateModified ticks, as a .NET Guid \"N\") ← ferrofin-core \
                    dto_service.rs image_tag, tag_and_fill_blur_hash (attach_images, \
                    add_inherited_images, parent_primary_tag, attach_people with \
-                   person_paths), the chapter tags (the stored item path, \
+                   person_paths) over the page's one image read, load_images_batch, which \
+                   lists each stored image once (ferrofin-db padded_in_chunks binds each id \
+                   once), the chapter tags (the stored item path, \
                    virtual_paths reverse); search_manager.rs fill_artwork; \
                    handlers/images.rs image_info_dto; ferrofin-livetv manager.rs \
                    channel_image_tags (a channel has no path); user_manager.rs get_user_dto \
@@ -1321,7 +1323,8 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
                    reads them (BaseItemMapper.Map's ExpandVirtualPath). Compared with \
                    Emby.Server.Implementations/Dto/DtoService.cs (GetImageCacheTag, \
                    GetPrimaryImageAspectRatio, \
-                   GetTagAndFillBlurhash, AddInheritedImages, AttachPeople), \
+                   GetTagAndFillBlurhash, GetTagsAndFillBlurhashes, AddInheritedImages, \
+                   AttachPeople), \
                    Jellyfin.Server.Implementations/Item/ChapterRepository.cs (Map), \
                    Jellyfin.Api/Controllers/ImageController.cs (GetItemImageInfos), \
                    Jellyfin.Api/Controllers/SearchController.cs (GetSearchHintResult), \
@@ -1339,7 +1342,7 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
                    MediaBrowser.Providers/Manager/ProviderManager.cs (SaveImage), \
                    Jellyfin.Server/Startup.cs (the NamedClient.Default handler) and \
                    Emby.Server.Implementations/Library/LibraryManager.cs (ConvertImageToLocal)",
-        date: "2026-10-31",
+        date: "2026-11-11",
         divergences: &[
             "Decoding and resizing run under limits upstream does not have (owner decision \
              2026-10-31, gl-1097), the settings image_decode_max_megapixels, \

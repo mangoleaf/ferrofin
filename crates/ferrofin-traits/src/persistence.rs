@@ -2834,8 +2834,26 @@ pub trait PeopleRepository: Send + Sync {
     /// This is the read-only identity half of Jellyfin's GetPerson: it uses
     /// Person.GetPath and the configured item-id mode, never a credit-row id
     /// or a generic matching-name row. Callers must verify the derived item
-    /// exists and is a Person. An unwired identity yields missing slots.
+    /// exists and is a Person. An unwired identity yields missing slots. The
+    /// person reads use [`Self::find_person_item_ids`], which reads the rows.
     async fn get_person_item_ids(
+        &self,
+        names: &[String],
+    ) -> Result<Vec<Option<Uuid>>, ServiceError> {
+        Ok(vec![None; names.len()])
+    }
+
+    /// The stored `Person` item each name (trimmed) reads, in input order:
+    /// Jellyfin's `LibraryManager.GetPerson`, the item at the id the name
+    /// derives when it is a `Person`, so spellings sharing a clean name are
+    /// each their own person. It reads the rows, where
+    /// [`Self::get_person_item_ids`] (the NFO saver's) only derives the current
+    /// id: an item the write path keeps under the older derivation is the
+    /// name's too. With no item at either id, the name reads an item whose own
+    /// name derives the same id and shares its clean name (the same person,
+    /// in a database whose stored ids are not the derived ones). `None` where
+    /// there is none, or the name is blank.
+    async fn find_person_item_ids(
         &self,
         names: &[String],
     ) -> Result<Vec<Option<Uuid>>, ServiceError> {
