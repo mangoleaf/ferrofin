@@ -411,10 +411,11 @@ impl<F: FileMeta> ImageProcessor<F> {
 }
 
 /// The 25 container/extension formats the processor advertises as readable
-/// input. Port of the C# `SupportedInputFormats` set (order preserved; the
-/// lookup itself is case-insensitive in C#, but the set is only ever surfaced,
-/// not matched against, in this unit).
-const SUPPORTED_INPUT_FORMATS: [&str; 25] = [
+/// input, without the dot. Port of `ImageProcessor.SupportedInputFormats`
+/// (order preserved), which `PhotoResolver.IsImageFile` tests a file's
+/// extension against, case-insensitively, to decide it is a photo. Not the
+/// encoder's list, which is `image_encoder`'s own.
+pub const SUPPORTED_INPUT_FORMATS: [&str; 25] = [
     "tiff", "tif", "jpeg", "jpg", "png", "cr2", "crw", "nef", "orf", "pef", "arw", "webp", "gif",
     "bmp", "erf", "raf", "rw2", "nrw", "dng", "ico", "astc", "ktx", "pkm", "wbmp", "avif",
 ];

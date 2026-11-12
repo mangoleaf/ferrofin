@@ -10540,13 +10540,15 @@ impl LibraryScanner {
                     .library_options
                     .as_ref()
                     .is_some_and(|options| !options.enable_photos);
+            // Nor does a photo whose file `PhotoResolver.IsImageFile` no
+            // longer takes (an `.svg` older scans listed) keep its row.
             let keep_row = |row: &ItemPathRow| {
-                !(photos_disabled
-                    && matches!(
-                        item_type_lookup::kind_from_type_name(&row.item_type),
-                        Some(BaseItemKind::Photo | BaseItemKind::PhotoAlbum)
-                    ))
-                    && keep_on_disk(row)
+                let kind = item_type_lookup::kind_from_type_name(&row.item_type);
+                let unresolved = (photos_disabled
+                    && matches!(kind, Some(BaseItemKind::Photo | BaseItemKind::PhotoAlbum)))
+                    || (kind == Some(BaseItemKind::Photo)
+                        && row.path.as_deref().is_some_and(|path| !is_photo_file(path)));
+                !unresolved && keep_on_disk(row)
             };
             let Some((ids, children)) = self
                 .stale_rows(cf, &existing, &live, &keep_row, &listed, &own)
@@ -19735,14 +19737,6 @@ const PHOTO_IGNORE_PREFIXES: [&str; 9] = [
     "default",
 ];
 
-/// The image extensions a photo may have — port of the C# encoder's
-/// `SupportedInputFormats`, which is what `PhotoResolver.IsImageFile` tests
-/// against.
-const PHOTO_EXTENSIONS: [&str; 17] = [
-    "jpeg", "jpg", "png", "dng", "webp", "gif", "bmp", "ico", "astc", "ktx", "pkm", "wbmp", "cr2",
-    "nef", "arw", "svg", "tiff",
-];
-
 /// Whether `path` is an image file that is not artwork — port of
 /// `PhotoResolver.IsImageFile`.
 fn is_photo_file(path: &str) -> bool {
@@ -19750,7 +19744,10 @@ fn is_photo_file(path: &str) -> bool {
     let Some((stem, ext)) = name.rsplit_once('.') else {
         return false;
     };
-    if !PHOTO_EXTENSIONS.iter().any(|e| e.eq_ignore_ascii_case(ext)) {
+    if !ferrofin_drawing::processor::SUPPORTED_INPUT_FORMATS
+        .iter()
+        .any(|e| e.eq_ignore_ascii_case(ext))
+    {
         return false;
     }
     let stem = stem.to_ascii_lowercase();
@@ -27249,6 +27246,22 @@ mod tests {
         assert!(!super::is_photo_file("/p/poster-2.jpg"));
         assert!(!super::is_photo_file("/p/clip.mkv"));
         assert!(!super::is_photo_file("/p/no-extension"));
+    }
+
+    // PhotoResolver.IsImageFile tests IImageProcessor.SupportedInputFormats
+    // (ImageProcessor's 25 entries), not SkiaEncoder's: `.tif`, the other RAW
+    // formats and `.avif` are photos, `.svg` is not.
+    #[test]
+    fn photo_files_take_the_image_processor_input_formats() {
+        for ext in [
+            "tif", "TIF", "crw", "orf", "pef", "erf", "raf", "rw2", "nrw", "avif", "tiff",
+        ] {
+            assert!(
+                super::is_photo_file(&format!("/p/img.{ext}")),
+                ".{ext} is a photo"
+            );
+        }
+        assert!(!super::is_photo_file("/p/vector.svg"));
     }
 
     // PhotoResolver.IsOwnedByMedia: an image whose stem starts with a sibling
