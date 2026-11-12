@@ -550,6 +550,7 @@ impl FerrofinUserManager {
             LazyLock::new(|| {
                 ferrofin_networking::NetworkManager::live(
                     ferrofin_networking::NetworkConfiguration::default(),
+                    Arc::new(ferrofin_networking::TracingLogger),
                 )
             });
         match &self.network {

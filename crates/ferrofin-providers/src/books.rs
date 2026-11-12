@@ -29,6 +29,13 @@ use serde::Deserialize;
 
 use crate::xbmc::xml_reader::XmlCursor;
 
+mod page_count;
+
+pub use page_count::{
+    DEFAULT_ARCHIVE_MAX_ENTRIES, NOMINAL_BOOK_RUN_TIME_TICKS, book_run_time_ticks,
+    has_countable_pages,
+};
+
 /// The comic-archive extensions Jellyfin recognizes
 /// (`ComicImageProvider._comicBookExtensions`).
 pub const COMIC_EXTENSIONS: [&str; 4] = ["cb7", "cbr", "cbt", "cbz"];
@@ -792,10 +799,24 @@ pub fn read_book_cover(path: &str) -> Option<(String, Vec<u8>)> {
 /// archive with no image.
 #[must_use]
 pub fn read_comic_cover(path: &str) -> Option<(String, Vec<u8>)> {
-    use std::io::{Read as _, Seek as _};
     if !COMIC_EXTENSIONS.contains(&extension_of(path).as_str()) {
         return None;
     }
+    let (file, format) = open_comic(path)?;
+    match format {
+        ArchiveFormat::Zip => zip_cover(file),
+        ArchiveFormat::SevenZip => seven_zip_cover(file),
+        ArchiveFormat::Tar => tar_cover(file),
+        ArchiveFormat::Rar => rar_cover(RarReader::get()?, path),
+    }
+}
+
+/// The archive at `path`, opened at its start, and the format its first bytes
+/// show (SharpCompress's `ArchiveFactory` reads the format from the content,
+/// whatever the extension says). `None` for a file that is no archive known
+/// here.
+fn open_comic(path: &str) -> Option<(std::fs::File, ArchiveFormat)> {
+    use std::io::{Read as _, Seek as _};
     let mut file = std::fs::File::open(path).ok()?;
     let mut head = Vec::with_capacity(TAR_BLOCK_BYTES);
     (&mut file)
@@ -803,12 +824,7 @@ pub fn read_comic_cover(path: &str) -> Option<(String, Vec<u8>)> {
         .read_to_end(&mut head)
         .ok()?;
     file.rewind().ok()?;
-    match archive_format(&head)? {
-        ArchiveFormat::Zip => zip_cover(file),
-        ArchiveFormat::SevenZip => seven_zip_cover(file),
-        ArchiveFormat::Tar => tar_cover(file),
-        ArchiveFormat::Rar => rar_cover(RarReader::get()?, path),
-    }
+    Some((file, archive_format(&head)?))
 }
 
 /// What a comic archive really is, read from its first bytes as
@@ -2948,5 +2964,148 @@ mod tests {
         assert_eq!(extension_of("/b/Book.EPUB"), "epub");
         assert_eq!(extension_of("/b/comic.cbz"), "cbz");
         assert_eq!(extension_of("/b/no-extension"), "");
+    }
+
+    /// `ProbeProvider.FetchAsync(Book)`: a comic's runtime is its
+    /// non-directory entries × 10000 whatever the archive format, read by its
+    /// content; an EPUB and the Kindle formats get one second; a RAR is not
+    /// counted yet (gl-747).
+    #[test]
+    fn a_comic_runtime_counts_its_non_directory_entries() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let files: &[(&str, &[u8])] = &[
+            ("pages/001.jpg", b"one"),
+            ("pages/002.jpg", b"two"),
+            ("ComicInfo.xml", b"<ComicInfo/>"),
+        ];
+        let cbz = {
+            let path = dir.path().join("a.cbz");
+            let mut writer = zip::ZipWriter::new(std::fs::File::create(&path).expect("create"));
+            let options = zip::write::SimpleFileOptions::default();
+            writer.add_directory("pages/", options).expect("dir");
+            for (name, bytes) in files {
+                writer.start_file(*name, options).expect("start");
+                std::io::Write::write_all(&mut writer, bytes).expect("write");
+            }
+            writer.finish().expect("finish");
+            path.to_string_lossy().into_owned()
+        };
+        let cbt = {
+            let path = write_tar(&dir, "b.cbt", files);
+            let mut header = tar::Header::new_gnu();
+            header.set_entry_type(tar::EntryType::Directory);
+            header.set_size(0);
+            header.set_mode(0o755);
+            header.set_cksum();
+            let mut bytes = std::fs::read(&path).expect("read tar");
+            // Rewrite with the directory first: `append_data` after `finish`
+            // would land behind the end-of-archive blocks.
+            let mut builder = tar::Builder::new(Vec::new());
+            builder
+                .append_data(&mut header, "pages/", std::io::empty())
+                .expect("dir");
+            let mut archive = tar::Archive::new(bytes.as_slice());
+            for entry in archive.entries().expect("entries") {
+                let mut entry = entry.expect("entry");
+                let mut header = entry.header().clone();
+                let name = entry.path().expect("path").into_owned();
+                builder
+                    .append_data(&mut header, name, &mut entry)
+                    .expect("copy");
+            }
+            bytes = builder.into_inner().expect("finish");
+            std::fs::write(&path, bytes).expect("write tar");
+            path
+        };
+        let cb7 = {
+            let path = dir.path().join("c.cb7");
+            let mut writer =
+                sevenz_rust2::ArchiveWriter::new(std::fs::File::create(&path).expect("create"))
+                    .expect("7z writer");
+            writer
+                .push_archive_entry::<&[u8]>(
+                    sevenz_rust2::ArchiveEntry::new_directory("pages"),
+                    None,
+                )
+                .expect("dir");
+            for (name, bytes) in files {
+                writer
+                    .push_archive_entry(sevenz_rust2::ArchiveEntry::new_file(name), Some(*bytes))
+                    .expect("push");
+            }
+            writer.finish().expect("finish");
+            path.to_string_lossy().into_owned()
+        };
+        // A ZIP named `.cbr` is read as the ZIP it is.
+        let zip_as_cbr = dir.path().join("d.cbr");
+        std::fs::copy(&cbz, &zip_as_cbr).expect("copy");
+        for path in [&cbz, &cbt, &cb7, &zip_as_cbr.to_string_lossy().into_owned()] {
+            assert_eq!(book_run_time_ticks(path, 100_000), Some(30_000), "{path}");
+        }
+        // The cap counts every entry, directories too: four fit in four.
+        assert_eq!(book_run_time_ticks(&cbz, 4), Some(30_000));
+        for path in [&cbz, &cbt, &cb7] {
+            assert_eq!(book_run_time_ticks(path, 3), None, "{path} is past the cap");
+        }
+        let write = |name: &str, bytes: &[u8]| {
+            let path = dir.path().join(name);
+            std::fs::write(&path, bytes).expect("write");
+            path.to_string_lossy().into_owned()
+        };
+        assert_eq!(
+            book_run_time_ticks(&write("f.cbz", b"not an archive"), 100_000),
+            None
+        );
+        for name in ["g.epub", "h.mobi", "i.azw", "j.AZW3"] {
+            assert_eq!(
+                book_run_time_ticks(&write(name, b"any"), 100_000),
+                Some(NOMINAL_BOOK_RUN_TIME_TICKS),
+                "{name}"
+            );
+        }
+        assert_eq!(book_run_time_ticks(&write("k.txt", b"any"), 100_000), None);
+        assert_eq!(
+            book_run_time_ticks(&write("l.pdf", b"%PDF-1.4 broken"), 100_000),
+            None
+        );
+    }
+
+    /// Archives at the edges: a real RAR is not counted until gl-747, so the
+    /// item keeps its runtime; an empty archive has no pages (upstream stores
+    /// 0 too); and a ZIP folder written with a backslash is a folder.
+    #[test]
+    fn edge_case_comic_archives_count_as_upstream_counts_them() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let write = |name: &str, bytes: &[u8]| {
+            let path = dir.path().join(name);
+            std::fs::write(&path, bytes).expect("write");
+            path.to_string_lossy().into_owned()
+        };
+        assert_eq!(
+            book_run_time_ticks(&write("e.cbr", b"Rar!\x1A\x07\x01\x00rest"), 100_000),
+            None
+        );
+        // An empty archive has no pages (upstream stores 0 too), and a ZIP
+        // directory written with a backslash is a directory.
+        let empty = dir.path().join("m.cbz");
+        zip::ZipWriter::new(std::fs::File::create(&empty).expect("create"))
+            .finish()
+            .expect("finish");
+        assert_eq!(
+            book_run_time_ticks(&empty.to_string_lossy(), 100_000),
+            Some(0)
+        );
+        let backslash = dir.path().join("n.cbz");
+        let mut writer = zip::ZipWriter::new(std::fs::File::create(&backslash).expect("create"));
+        for name in ["scans\\", "scans\\001.jpg"] {
+            writer
+                .start_file(name, zip::write::SimpleFileOptions::default())
+                .expect("entry");
+        }
+        writer.finish().expect("finish");
+        assert_eq!(
+            book_run_time_ticks(&backslash.to_string_lossy(), 100_000),
+            Some(10_000)
+        );
     }
 }

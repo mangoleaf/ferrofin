@@ -1323,6 +1323,7 @@ dependencies = [
  "tracing-subscriber",
  "unicode-normalization",
  "uuid",
+ "zip",
 ]
 
 [[package]]
@@ -1573,6 +1574,7 @@ dependencies = [
  "serde_json",
  "tokio",
  "tracing",
+ "tracing-subscriber",
  "windows-sys 0.61.2",
 ]
 
@@ -1592,6 +1594,7 @@ dependencies = [
  "ferrofin-networking",
  "ferrofin-traits",
  "ferrofin-util",
+ "flate2",
  "futures-util",
  "opentelemetry",
  "opentelemetry_sdk",
