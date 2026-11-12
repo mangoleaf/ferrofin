@@ -38,7 +38,7 @@ use ferrofin_traits::error::ServiceError;
 use ferrofin_traits::options::{DescendantQueryRoots, InternalItemsQuery};
 use ferrofin_traits::persistence::{
     FolderChild, ItemRepository, ItemTypeLookup, ItemWithCounts, ParentalRestrictions,
-    PlaylistAccessColumns, PlaylistItemsWithAccess,
+    PlaylistAccessColumns, PlaylistItemsWithAccess, PlaylistMembers,
 };
 
 use crate::aggregate_folder::RootFolderIds;
@@ -2836,31 +2836,6 @@ const PLAYLIST_ITEMS_SQL: &str = r#"SELECT ch.*,
    WHERE lc."ParentId" = ?1 AND lc."ChildType" = ?3
    ORDER BY lc."SortOrder""#;
 
-/// One row of [`PLAYLIST_ITEMS_SQL`]: a member's `BaseItems` row plus the three
-/// access columns (identical on every row of a given playlist).
-struct PlaylistItemRow {
-    /// The member item row.
-    item: BaseItemEntity,
-    /// `FerrofinPlaylists.OwnerUserId` (NULL for a legacy playlist, an older
-    /// build's user-less API-key create, or a `Data` naming no owner).
-    owner: Option<String>,
-    /// `FerrofinPlaylists.OpenAccess` (NULL only when the meta row is absent).
-    open_access: Option<i64>,
-    /// The caller's `FerrofinPlaylistShares.CanEdit` (NULL when not shared).
-    can_edit: Option<i64>,
-}
-
-impl<'r> FromRow<'r, sqlx::sqlite::SqliteRow> for PlaylistItemRow {
-    fn from_row(row: &'r sqlx::sqlite::SqliteRow) -> Result<Self, sqlx::Error> {
-        Ok(Self {
-            item: BaseItemEntity::from_row(row)?,
-            owner: row.try_get("PlaylistOwnerUserId")?,
-            open_access: row.try_get("PlaylistOpenAccess")?,
-            can_edit: row.try_get("PlaylistShareCanEdit")?,
-        })
-    }
-}
-
 /// Appends the caller's name filters against the by-name `bi` row (C#
 /// `TranslateQuery`'s name predicates on the outer query).
 ///
@@ -4624,25 +4599,39 @@ impl ItemRepository for FerrofinItemRepository {
         user_id: Uuid,
         child_type: i32,
     ) -> Result<PlaylistItemsWithAccess, ServiceError> {
-        let rows: Vec<PlaylistItemRow> = sqlx::query_as(PLAYLIST_ITEMS_SQL)
+        use futures_util::TryStreamExt;
+        let mut rows = sqlx::query(PLAYLIST_ITEMS_SQL)
             .bind(guid_to_db(playlist_id))
             .bind(guid_to_db(user_id))
             .bind(i64::from(child_type))
-            .fetch_all(self.db.pool())
-            .await
-            .map_err(db_err)?;
-        // Every row repeats the same access columns; the first carries them.
+            .fetch(self.db.pool());
+        let mut members = PlaylistMembers::default();
+        let mut index_of: HashMap<String, usize> = HashMap::new();
         // No rows at all means the join matched nothing — the caller decides
         // whether that is an empty playlist or a missing/invisible one.
-        let access = rows.first().map(|first| PlaylistAccessColumns {
-            owner_user_id: first.owner.clone(),
-            open_access: first.open_access,
-            share_can_edit: first.can_edit,
-        });
-        Ok(PlaylistItemsWithAccess {
-            items: rows.into_iter().map(|r| self.mapped(r.item)).collect(),
-            access,
-        })
+        let mut access = None;
+        while let Some(row) = rows.try_next().await.map_err(db_err)? {
+            // Every row repeats the same access columns; the first carries them.
+            if access.is_none() {
+                access = Some(PlaylistAccessColumns {
+                    owner_user_id: row.try_get("PlaylistOwnerUserId").map_err(db_err)?,
+                    open_access: row.try_get("PlaylistOpenAccess").map_err(db_err)?,
+                    share_can_edit: row.try_get("PlaylistShareCanEdit").map_err(db_err)?,
+                });
+            }
+            // A repeated member (gl-1523) costs a lookup, not another full row.
+            let id: &str = row.try_get("Id").map_err(db_err)?;
+            let index = if let Some(&seen) = index_of.get(id) {
+                seen
+            } else {
+                index_of.insert(id.to_owned(), members.items.len());
+                let item = BaseItemEntity::from_row(&row).map_err(db_err)?;
+                members.items.push(self.mapped(item));
+                members.items.len() - 1
+            };
+            members.entries.push(index);
+        }
+        Ok(PlaylistItemsWithAccess { members, access })
     }
 }
 

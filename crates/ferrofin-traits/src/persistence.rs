@@ -217,15 +217,72 @@ pub struct PlaylistAccessColumns {
     pub share_can_edit: Option<i64>,
 }
 
-/// A playlist's member rows in link order, plus the caller's access columns.
+/// A playlist's entries, each distinct member row held once.
+///
+/// A playlist may name one item any number of times, and any signed-in user
+/// can grow one, so a row per entry would let the repeats set a read's memory.
+/// Upstream's `Folder.ResolveLinkedChildren` likewise resolves each distinct id
+/// once and shares the item between the entries naming it.
+#[derive(Debug, Clone, Default)]
+pub struct PlaylistMembers {
+    /// Each distinct member row once, in the order it first appears.
+    pub items: Vec<BaseItemEntity>,
+    /// The entries in playlist (link) order, each an index into
+    /// [`items`](Self::items). An index past `items` names no row.
+    pub entries: Vec<usize>,
+}
+
+impl PlaylistMembers {
+    /// One row per entry, in link order, repeats kept.
+    ///
+    /// Entries naming each row at most once, in row order (any playlist of
+    /// distinct members, paged or filtered), keep their rows in place. Otherwise
+    /// a row moves into its last entry and is cloned for the earlier ones. A row
+    /// no entry names is dropped.
+    #[must_use]
+    pub fn into_entry_rows(self) -> Vec<BaseItemEntity> {
+        let mut items = self.items;
+        if self.entries.windows(2).all(|pair| pair[0] < pair[1]) {
+            let mut kept = self.entries.iter().peekable();
+            let mut position = 0;
+            items.retain(|_| {
+                let keep = kept.next_if_eq(&&position).is_some();
+                position += 1;
+                keep
+            });
+            return items;
+        }
+        let mut uses = vec![0_usize; items.len()];
+        for &index in &self.entries {
+            if let Some(count) = uses.get_mut(index) {
+                *count += 1;
+            }
+        }
+        let mut rows = Vec::with_capacity(self.entries.len());
+        for &index in &self.entries {
+            let (Some(count), Some(item)) = (uses.get_mut(index), items.get_mut(index)) else {
+                continue;
+            };
+            *count -= 1;
+            rows.push(if *count == 0 {
+                std::mem::take(item)
+            } else {
+                item.clone()
+            });
+        }
+        rows
+    }
+}
+
+/// A playlist's members, plus the caller's access columns.
 ///
 /// `access` is `None` exactly when the playlist has no member rows — the join
 /// then cannot tell "empty playlist" from "missing/invisible playlist", so the
 /// caller resolves access separately.
 #[derive(Debug, Clone)]
 pub struct PlaylistItemsWithAccess {
-    /// The member item rows, in playlist (link) order.
-    pub items: Vec<BaseItemEntity>,
+    /// The member rows, each distinct one once, and the entries in link order.
+    pub members: PlaylistMembers,
     /// The access columns repeated on every member row (`None` if there are none).
     pub access: Option<PlaylistAccessColumns>,
 }
@@ -736,9 +793,10 @@ pub trait ItemRepository: Send + Sync {
         recursive: bool,
     ) -> Result<bool, ServiceError>;
 
-    /// Reads a playlist's linked members of `child_type` in link order, each
-    /// joined with the caller's playlist-access columns, in a **single**
-    /// statement (`GET /Playlists/{id}/Items`).
+    /// Reads a playlist's linked members of `child_type` with the caller's
+    /// playlist-access columns, in a **single** statement
+    /// (`GET /Playlists/{id}/Items`): each distinct member row once, and the
+    /// entries in link order as indexes into them.
     ///
     /// One round-trip is load-bearing: the previous shape took one reader-pool
     /// connection for the access check, another for the child-id list, and
@@ -2935,8 +2993,40 @@ fn _assert_object_safe_item_type_lookup(_: &dyn ItemTypeLookup) {}
 mod tests {
     use super::{
         MediaAttachmentQuery, MediaStreamQuery, NextUpEpisodeBatchResult, NextUpEpisodeUserData,
-        PlayedAndTotal,
+        PlayedAndTotal, PlaylistMembers,
     };
+    use ferrofin_db::entities::base_items::BaseItemEntity;
+
+    #[test]
+    fn entry_rows_repeat_a_shared_row_in_link_order() {
+        let row = |id: &str| BaseItemEntity {
+            id: id.to_owned(),
+            ..BaseItemEntity::default()
+        };
+        let members = PlaylistMembers {
+            items: vec![row("a"), row("b"), row("unused")],
+            entries: vec![1, 0, 1, 1, 9],
+        };
+        let ids: Vec<String> = members
+            .into_entry_rows()
+            .into_iter()
+            .map(|row| row.id)
+            .collect();
+        // An index past the rows names no row and is skipped.
+        assert_eq!(ids, ["b", "a", "b", "b"]);
+
+        // Each row at most once, in row order: the rows stay where they are.
+        let members = PlaylistMembers {
+            items: vec![row("a"), row("b"), row("c")],
+            entries: vec![0, 2, 9],
+        };
+        let ids: Vec<String> = members
+            .into_entry_rows()
+            .into_iter()
+            .map(|row| row.id)
+            .collect();
+        assert_eq!(ids, ["a", "c"]);
+    }
 
     #[test]
     fn played_and_total_defaults_to_zero() {

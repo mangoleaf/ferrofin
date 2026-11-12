@@ -3806,12 +3806,15 @@ pub const VERIFIED: &[Verified] = &[
         ferrofin: "handlers/playlists.rs get_playlist_items (effective_user_id: \
                RequestHelpers.GetUserId) → ferrofin-core collection_manager.rs \
                FerrofinPlaylistManager::get_playlist_items (GetPlaylistForUser and \
-               GetManageableItems: manual links, in order, missing items out), then \
-               LibraryManager::filter_visible_items_standalone over the rows just read \
+               GetManageableItems: manual links, in order, missing items out, each distinct \
+               member's row read once and its entries pointing at it, as \
+               ResolveLinkedChildren's byId lookup shares one BaseItem between repeats), \
+               then LibraryManager::filter_visible_items_standalone over those rows \
                (ItemVisibility::visible, one answer per distinct id) before the paging, as \
                upstream filters before Skip and Take (the count taken first; a negative \
-               startIndex skips nothing, a negative limit takes nothing), and \
-               tv_shows::build_dto_options + get_linked_children_dtos + the PlaylistItemId tag",
+               startIndex skips nothing, a negative limit takes nothing), and the page's \
+               entries through tv_shows::build_dto_options + get_linked_children_dtos + the \
+               PlaylistItemId tag",
         date: "2026-11-11",
         divergences: &[
             "A member the caller may not open is left out with the standalone check, which also \

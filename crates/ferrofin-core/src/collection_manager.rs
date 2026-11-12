@@ -59,7 +59,9 @@ use ferrofin_traits::library::{
     LibraryManager, SelfWrite, SelfWriteGuard, UserManager, VirtualFolderManager,
 };
 use ferrofin_traits::options::InternalItemsQuery;
-use ferrofin_traits::persistence::{ItemPersistenceService, ItemRepository, LinkedChildrenService};
+use ferrofin_traits::persistence::{
+    ItemPersistenceService, ItemRepository, LinkedChildrenService, PlaylistMembers,
+};
 use ferrofin_traits::providers::{
     MetadataRefreshMode, MetadataRefreshOptions, ProviderManager, RefreshPriority,
 };
@@ -1650,13 +1652,13 @@ impl PlaylistManager for FerrofinPlaylistManager {
         &self,
         playlist_id: Uuid,
         user_id: Uuid,
-    ) -> Result<Vec<BaseItemEntity>, ServiceError> {
+    ) -> Result<PlaylistMembers, ServiceError> {
         require_user(user_id)?;
-        // One round-trip through the repository seam: the member rows already
-        // in link order (the same ordering `get_linked_children_ids` applies),
-        // each carrying the caller's access columns, so the visibility gate
-        // costs no extra query. The C# `Forbid()` branch is unreachable here
-        // because visible ⇔ permitted-to-read.
+        // One round-trip through the repository seam: each distinct member
+        // row once, the entries in link order (the same ordering
+        // `get_linked_children_ids` applies), and the caller's access columns,
+        // so the visibility gate costs no extra query. The C# `Forbid()`
+        // branch is unreachable here because visible ⇔ permitted-to-read.
         let page = self
             .items
             .get_playlist_items_with_access(playlist_id, user_id, LINKED_CHILD_MANUAL)
@@ -1666,7 +1668,7 @@ impl PlaylistManager for FerrofinPlaylistManager {
             // "missing/invisible playlist", so resolve access on its own. Only
             // empty playlists pay for this second query.
             self.access(playlist_id, user_id).await?;
-            return Ok(Vec::new());
+            return Ok(PlaylistMembers::default());
         };
         // Every row repeats the same access columns; the first decides.
         if decide_access(
@@ -1683,7 +1685,7 @@ impl PlaylistManager for FerrofinPlaylistManager {
         // them all as `ItemIds`, and the items endpoint drops the ones the
         // caller may not see itself, as `PlaylistsController` does.
         self.require_visible(playlist_id, user_id).await?;
-        Ok(page.items)
+        Ok(page.members)
     }
 
     async fn get_playlist_item_ids(&self, playlist_id: Uuid) -> Result<Vec<Uuid>, ServiceError> {
@@ -3323,7 +3325,8 @@ mod tests {
         let items = mgr
             .get_playlist_items(playlist_id, owner)
             .await
-            .expect("items");
+            .expect("items")
+            .into_entry_rows();
         assert_eq!(items.len(), 2);
         let ids: Vec<Uuid> = items
             .iter()
@@ -3362,6 +3365,7 @@ mod tests {
             .get_playlist_items(playlist_id, owner)
             .await
             .expect("items")
+            .into_entry_rows()
             .iter()
             .filter_map(|i| Uuid::parse_str(&i.id).ok())
             .collect();
@@ -3370,6 +3374,20 @@ mod tests {
             mgr.get_playlist_item_ids(playlist_id).await.expect("ids"),
             ids
         );
+
+        // The repeated member's row is read once (gl-1523).
+        let page = item_repository_over(db.clone())
+            .get_playlist_items_with_access(playlist_id, owner, super::LINKED_CHILD_MANUAL)
+            .await
+            .expect("read");
+        let rows: Vec<Uuid> = page
+            .members
+            .items
+            .iter()
+            .filter_map(|i| Uuid::parse_str(&i.id).ok())
+            .collect();
+        assert_eq!(rows, vec![c, a, b]);
+        assert_eq!(page.members.entries, vec![0, 1, 2, 1]);
     }
 
     #[tokio::test]
@@ -3399,7 +3417,8 @@ mod tests {
         let items = mgr
             .get_playlist_items(playlist_id, owner)
             .await
-            .expect("items");
+            .expect("items")
+            .into_entry_rows();
         assert_eq!(items.len(), 1);
         let dashless = Uuid::parse_str(&items[0].id)
             .expect("uuid")
@@ -3413,7 +3432,8 @@ mod tests {
         let after = mgr
             .get_playlist_items(playlist_id, owner)
             .await
-            .expect("items after");
+            .expect("items after")
+            .into_entry_rows();
         assert!(
             after.is_empty(),
             "removing by dashless PlaylistItemId should empty the playlist"
@@ -3448,6 +3468,7 @@ mod tests {
             .get_playlist_items(playlist_id, owner)
             .await
             .expect("items")
+            .into_entry_rows()
             .iter()
             .filter_map(|i| Uuid::parse_str(&i.id).ok())
             .collect();
@@ -3467,6 +3488,7 @@ mod tests {
             &mgr.get_playlist_items(playlist_id, owner)
                 .await
                 .expect("items2")
+                .into_entry_rows()
                 .last()
                 .expect("non-empty")
                 .id,
@@ -3506,6 +3528,7 @@ mod tests {
             mgr.get_playlist_items(playlist_id, owner)
                 .await
                 .expect("items")
+                .into_entry_rows()
                 .iter()
                 .filter_map(|i| Uuid::parse_str(&i.id).ok())
                 .collect::<Vec<Uuid>>()
@@ -3562,6 +3585,7 @@ mod tests {
                 mgr.get_playlist_items(playlist_id, user)
                     .await
                     .expect("items")
+                    .into_entry_rows()
                     .iter()
                     .filter_map(|i| Uuid::parse_str(&i.id).ok())
                     .collect::<Vec<Uuid>>()
@@ -3605,7 +3629,8 @@ mod tests {
         let items = mgr
             .get_playlist_items(playlist_id, owner)
             .await
-            .expect("items");
+            .expect("items")
+            .into_entry_rows();
         assert_eq!(items.len(), 1);
         assert_eq!(
             items[0].id,
@@ -3646,6 +3671,7 @@ mod tests {
             mgr.get_playlist_items(playlist_id, alice)
                 .await
                 .expect("owner reads")
+                .into_entry_rows()
                 .len(),
             1
         );
@@ -3692,6 +3718,7 @@ mod tests {
             .get_playlist_items(shared, bob)
             .await
             .expect("share grants read")
+            .into_entry_rows()
             .iter()
             .filter_map(|i| Uuid::parse_str(&i.id).ok())
             .collect();
@@ -3715,6 +3742,7 @@ mod tests {
             mgr.get_playlist_items(public, Uuid::new_v4())
                 .await
                 .expect("open access grants read")
+                .entries
                 .len(),
             1
         );
@@ -3743,7 +3771,8 @@ mod tests {
         let playlist_items = mgr
             .get_playlist_items(playlist_id, alice)
             .await
-            .expect("owner reads an empty playlist");
+            .expect("owner reads an empty playlist")
+            .into_entry_rows();
         assert!(playlist_items.is_empty(), "{playlist_items:?}");
         let ids = mgr.get_playlist_item_ids(playlist_id).await.expect("ids");
         assert!(ids.is_empty(), "{ids:?}");
@@ -3771,7 +3800,8 @@ mod tests {
         let items = mgr
             .get_playlist_items(legacy, Uuid::new_v4())
             .await
-            .expect("legacy playlists stay readable");
+            .expect("legacy playlists stay readable")
+            .into_entry_rows();
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].id, ferrofin_db::store::guid_to_db(track));
     }
@@ -3812,6 +3842,7 @@ mod tests {
             .get_playlist_items(playlist_id, owner)
             .await
             .expect("items")
+            .into_entry_rows()
             .iter()
             .filter_map(|i| Uuid::parse_str(&i.id).ok())
             .collect();
@@ -4793,6 +4824,7 @@ mod tests {
         mgr.get_playlist_items(playlist_id, reader)
             .await
             .expect("items")
+            .into_entry_rows()
             .iter()
             .filter_map(|i| Uuid::parse_str(&i.id).ok())
             .collect()
@@ -4964,6 +4996,7 @@ mod tests {
             .get_playlist_items(mixed, kid)
             .await
             .expect("items")
+            .into_entry_rows()
             .into_iter()
             .filter_map(|r| Uuid::parse_str(&r.id).ok())
             .collect();

@@ -34,6 +34,7 @@ use ferrofin_model::playlists::{
 use uuid::Uuid;
 
 use crate::error::ServiceError;
+use crate::persistence::PlaylistMembers;
 
 /// The options for creating a collection (box set).
 ///
@@ -186,7 +187,8 @@ pub trait PlaylistManager: Send + Sync {
     /// C# update path.
     async fn update_playlist(&self, request: &PlaylistUpdateRequest) -> Result<(), ServiceError>;
 
-    /// Gets the member items of a playlist, in playlist order.
+    /// Gets the members of a playlist: each distinct member row once, and the
+    /// entries in playlist order.
     ///
     /// Ports the read behind `PlaylistsController.GetPlaylistItems`; the C#
     /// `playlist.GetManageableItems()` walk over the playlist's children becomes
@@ -195,7 +197,7 @@ pub trait PlaylistManager: Send + Sync {
         &self,
         playlist_id: Uuid,
         user_id: Uuid,
-    ) -> Result<Vec<BaseItemEntity>, ServiceError>;
+    ) -> Result<PlaylistMembers, ServiceError>;
 
     /// The ids of the members [`get_playlist_items`](Self::get_playlist_items)
     /// lists, in playlist order, repeats kept, without its access check: the
