@@ -1992,7 +1992,12 @@ pub const VERIFIED: &[Verified] = &[
                ReportTranscodingInfo's Sessions order; mediaencoding manager.rs start_ffmpeg → \
                on_job_failed_to_start; ClearTranscodingInfo, OnTranscodeFailedToStart), whose \
                reported PlayMethod handlers/playstate.rs validate_play_method keeps only while \
-               the play session transcodes (ValidatePlayMethod); NowViewingItem is \
+               the play session transcodes (ValidatePlayMethod); its TranscodeReasons are the \
+               job's (manager.rs transcoding_info; ReportTranscodingProgress's \
+               state.TranscodeReasons): the request's TranscodeReasons as ferrofin-model \
+               parse_transcode_reasons reads them (EncodingJobInfo.TranscodeReasons' \
+               Enum.TryParse), plus the AudioCodecNotSupported apps/ferrofin-server planner.rs \
+               plan adds to audio it re-encodes (TryStreamCopy's AddTranscodeReason); NowViewingItem is \
                report_now_viewing_item's (ReportNowViewingItem) and UserPrimaryImageTag is \
                stamped by upsert_session (GetSessionInfo, GetImageCacheTag); \
                LastPlaybackCheckIn is DateTime.MinValue until update_now_playing stamps it \
