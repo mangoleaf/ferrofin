@@ -3986,10 +3986,11 @@ pub const VERIFIED: &[Verified] = &[
         upstream_method: "RestartApplication",
         ferrofin: "handlers/system.rs restart_application (auth.rs RequireAdmin) → ferrofin-core \
                system_manager.rs restart → apps/ferrofin-server state.rs \
-               FerrofinLifecycleController stop, lib.rs announce_shutdown, tear_down_host \
+               FerrofinLifecycleController stop (SystemManager.ShutdownInternal), lib.rs \
+               announce_shutdown (SessionManager.OnApplicationStopping), tear_down_host \
                (HlsStreamManager::shutdown, LiveTvManager::shutdown: Program.cs disposes the \
                host, RecordingsManager.Dispose, MediaSourceManager.Dispose)",
-        date: "2026-11-08",
+        date: "2026-11-11",
         divergences: &[
             "The host teardown goes further than upstream's disposal (gl-141). It does four things. \
          It kills every transcode: upstream's TranscodeManager.Dispose kills no job, and each \
@@ -4004,8 +4005,6 @@ pub const VERIFIED: &[Verified] = &[
          /System/Shutdown. Upstream's LocalAccessOrRequiresElevation also admits any caller \
          on the local network, with or without a token; here that caller gets 401 without \
          a token and 403 without the administrator role.",
-            "Connected clients get ServerShuttingDown; upstream pushes ServerRestarting for a \
-         restart. Fix path: gl-1123.",
         ],
         refs: &[],
     },
