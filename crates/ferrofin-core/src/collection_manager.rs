@@ -404,7 +404,7 @@ pub(crate) async fn new_playlist_folder_and_id(
 ///
 /// # Errors
 /// The I/O error that kept the folder from being made, or a failed lookup.
-async fn new_box_set_folder_and_id(
+pub(crate) async fn new_box_set_folder_and_id(
     db: &Database,
     mode: &crate::item_type_lookup::IdDerivation,
     collections: &str,

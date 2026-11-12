@@ -4468,7 +4468,14 @@ pub(crate) async fn rekey_rows_at(
     if moves.is_empty() {
         return Ok(Vec::new());
     }
-    let mut tx = db.writer().begin().await.map_err(db_err)?;
+    // Reserve the writer before reading the schema: a deferred transaction
+    // fails at its first write when another process (the previous version,
+    // during a rolling update) commits in between.
+    let mut tx = db
+        .writer()
+        .begin_with("BEGIN IMMEDIATE")
+        .await
+        .map_err(db_err)?;
     // Every reference moves inside the one transaction; the foreign
     // keys are checked once, at its end, against the moved rows.
     sqlx::query("PRAGMA defer_foreign_keys = ON")
