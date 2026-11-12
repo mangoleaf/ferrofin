@@ -1756,6 +1756,186 @@ pub async fn run_merge_legacy_collections_library(
     }
 }
 
+/// The extension of the database snapshot [`rekey_pathless_box_sets`]
+/// takes (`jellyfin.db.pre-box-set-folders`).
+const BOX_SET_SNAPSHOT_EXTENSION: &str = "db.pre-box-set-folders";
+
+/// Gives each box set an older Ferrofin (before 1.4.0) created with no folder
+/// the one `CollectionManager.CreateCollectionAsync` makes,
+/// `<collections>/<name> [boxset]`, and moves it to the id `Folder.AddChild`
+/// derives from that path (`crate::collection_manager::new_box_set_folder_and_id`,
+/// gl-738), as [`rekey_pathless_playlists`] does for playlists.
+///
+/// `<collections>` is where a new box set goes: the Collections library's
+/// folder (`CollectionsLibrary::find`, `FindFolders`), else
+/// `{data}/collections`. The path is stored as a create stores it
+/// (`%AppDataPath%/collections/…`, `ReverseVirtualPath`), together with the
+/// new id in the move's own savepoint (`rekey_rows_at`). Its members, the
+/// playlists holding it, users' favourites and played state, and its images
+/// move with it; a client holding the old id has to look it up again. Its
+/// metadata folder is renamed to the new id, and the artwork an older
+/// Ferrofin saved there stays in it, not beside the box set.
+///
+/// Box sets are taken in the order they were stored, one move each, so of two
+/// with one name the older gets the plain folder. A box set with a path is
+/// never touched. Runs once; a move that fails is undone and the repair runs
+/// again on the next boot.
+///
+/// # Errors
+/// Returns [`ServiceError`] if the underlying queries fail.
+pub async fn rekey_pathless_box_sets(
+    db: &Database,
+    derivation: &IdDerivation,
+    (data_path, root_folder_path): (&str, &str),
+    virtual_paths: &VirtualPathExpander,
+    art_root: Option<&Path>,
+    path_manager: Option<&dyn PathManager>,
+) -> Result<usize, ServiceError> {
+    const KEY: &str = "box_set_folders_v1";
+    if !once(db, KEY).await? {
+        return Ok(0);
+    }
+    let box_set_type = stored_type_name(BaseItemKind::BoxSet).unwrap_or_default();
+    let rows: Vec<(String, Option<String>)> = sqlx::query_as(
+        r#"SELECT "Id", "Name" FROM "BaseItems"
+           WHERE "Type" = ?1 AND ("Path" IS NULL OR "Path" = '')
+           ORDER BY rowid"#,
+    )
+    .bind(box_set_type)
+    .fetch_all(db.pool())
+    .await
+    .map_err(db_err)?;
+    if rows.is_empty() {
+        done(db, KEY).await?;
+        return Ok(0);
+    }
+    if let Some(backup) = db.snapshot_once(BOX_SET_SNAPSHOT_EXTENSION).await? {
+        tracing::info!(
+            backup = %backup.display(),
+            "database snapshot taken before giving box sets their folders"
+        );
+    }
+    let collections = crate::collections_library::CollectionsLibrary::new(
+        db.clone(),
+        derivation.clone(),
+        data_path,
+        root_folder_path,
+        virtual_paths.clone(),
+    )
+    .find()
+    .await?
+    .map_or_else(|| format!("{data_path}/collections"), |folder| folder.path);
+    let (mut moved, mut failed, mut first_error) = (0_usize, 0_usize, None);
+    for (id, name) in rows {
+        let Ok(from) = Uuid::parse_str(&id) else {
+            continue;
+        };
+        // One move at a time: the next name's id is free only once the row
+        // before it stands at its own.
+        let item = (from, name.as_deref().unwrap_or_default());
+        let folders = (art_root, path_manager);
+        match give_box_set_its_folder(db, derivation, &collections, virtual_paths, folders, item)
+            .await
+        {
+            Ok(()) => moved += 1,
+            Err(err) => {
+                tracing::debug!(%err, item_id = %from, "could not give a box set its folder");
+                failed += 1;
+                first_error.get_or_insert(err);
+            }
+        }
+    }
+    match first_error {
+        None => done(db, KEY).await?,
+        Some(err) => tracing::warn!(
+            %err,
+            failed,
+            "could not give some box sets their folders; they keep their ids, \
+             and the repair runs again on the next boot"
+        ),
+    }
+    Ok(moved)
+}
+
+/// One [`rekey_pathless_box_sets`] move: box set `from`, named `name`, gets
+/// its folder in `collections` and the id that folder derives, or, when the
+/// move fails, keeps its id, its folders, and no new folder.
+///
+/// # Errors
+/// The [`ServiceError`] that kept the folder from being made or the row from
+/// being moved.
+async fn give_box_set_its_folder(
+    db: &Database,
+    derivation: &IdDerivation,
+    collections: &str,
+    virtual_paths: &VirtualPathExpander,
+    (art_root, path_manager): (Option<&Path>, Option<&dyn PathManager>),
+    (from, name): (Uuid, &str),
+) -> Result<(), ServiceError> {
+    let (path, to) =
+        crate::collection_manager::new_box_set_folder_and_id(db, derivation, collections, name)
+            .await?;
+    let (folders, dirs) = move_item_folders(art_root, path_manager, (from, to), "", false);
+    let rekey = ItemRekey {
+        from,
+        to,
+        type_name: stored_type_name(BaseItemKind::BoxSet)
+            .unwrap_or_default()
+            .to_owned(),
+        dirs,
+        merged: Vec::new(),
+        extra: false,
+    };
+    let stored = virtual_paths.reverse(&path);
+    let moved = rekey_rows_at(db, &[rekey], &[stored], RekeyKind::Represented).await;
+    if matches!(&moved, Ok(done) if !done.is_empty()) {
+        folders.commit();
+        return Ok(());
+    }
+    folders.undo();
+    if let Err(err) = tokio::fs::remove_dir(&path).await {
+        tracing::debug!(%err, path = %path, "could not remove an unused box set folder");
+    }
+    moved?;
+    Err(ServiceError::backend(format!(
+        "box set {from} was not moved to {to}"
+    )))
+}
+
+/// [`rekey_pathless_box_sets`] and its log line, for the composition root. A
+/// failure is a warning and never stops the boot: the box sets keep their ids
+/// and work as before, and the next boot tries again.
+pub async fn run_rekey_pathless_box_sets(
+    db: &Database,
+    derivation: &IdDerivation,
+    directories: (&str, &str),
+    virtual_paths: &VirtualPathExpander,
+    art_root: Option<&Path>,
+    path_manager: Option<&dyn PathManager>,
+) {
+    match rekey_pathless_box_sets(
+        db,
+        derivation,
+        directories,
+        virtual_paths,
+        art_root,
+        path_manager,
+    )
+    .await
+    {
+        Ok(0) => {}
+        Ok(moved) => tracing::info!(
+            items = moved,
+            "gave box sets with no folder their folders and the ids Jellyfin keys them by"
+        ),
+        Err(err) => tracing::warn!(
+            %err,
+            "could not give box sets their folders; they keep their ids, \
+             and the next boot tries again"
+        ),
+    }
+}
+
 /// The extension of the database snapshot [`sweep_missing_items`] takes
 /// (`jellyfin.db.pre-missing-items`).
 const SWEEP_SNAPSHOT_EXTENSION: &str = "db.pre-missing-items";

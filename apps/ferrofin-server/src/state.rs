@@ -1217,6 +1217,18 @@ pub async fn build_app_state(
         &virtual_paths,
     )
     .await;
+    // Then a box set an older Ferrofin created with no folder gets the one
+    // Jellyfin's `CreateCollectionAsync` makes in that library's folder, and
+    // the id Jellyfin keys it by.
+    ferrofin_core::adoption_repairs::run_rekey_pathless_box_sets(
+        db,
+        &id_derivation,
+        (&paths.data_path(), &paths.root_folder_path()),
+        &virtual_paths,
+        Some(metadata_library_now.as_path()),
+        Some(path_manager.as_ref()),
+    )
+    .await;
     // One-shot (Jellyfin 12.2 `20260915120000_MigrateRatingLevels`): recompute
     // every row's inherited parental-rating columns from its OWN
     // `OfficialRating` through `GetRatingScore`, so a rating string an older

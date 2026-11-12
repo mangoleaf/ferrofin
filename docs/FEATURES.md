@@ -275,8 +275,9 @@ Wired and working, with a documented limitation or lighter verification:
   `<name>.xml` sidecar it writes beside a playlist file hides the file's entries and the
   playlist stays empty; Ferrofin always reads the entries and never that sidecar.
   `collection.xml` is still not read or written. A collection made in Ferrofin gets
-  Jellyfin's `{data}/collections/<name> [boxset]` folder (ones made before that stay
-  folderless), and its membership lives in the `LinkedChildren` table, as Jellyfin 12 keeps it.
+  Jellyfin's `{data}/collections/<name> [boxset]` folder (ones made before 1.4.0 get it, and
+  the id it derives, at the first boot after upgrading), and its membership lives in the `LinkedChildren`
+  table, as Jellyfin 12 keeps it.
 
 ## Not implemented (by design)
 
