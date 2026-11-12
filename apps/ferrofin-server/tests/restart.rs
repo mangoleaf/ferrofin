@@ -219,6 +219,104 @@ async fn restart_recreates_the_host_in_process_and_shutdown_exits() {
     );
 }
 
+/// A client side of the session WebSocket.
+type ClientSocket =
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
+
+/// Opens `token`'s session socket and waits for its `ForceKeepAlive` greeting,
+/// so its session is registered before the caller stops the server.
+async fn open_session_socket(base: &str, token: &str) -> ClientSocket {
+    let url = format!("{}/socket?ApiKey={token}", base.replacen("http", "ws", 1));
+    let (mut socket, _) = tokio_tungstenite::connect_async(url)
+        .await
+        .expect("socket opens");
+    message_types(&mut socket, Some("ForceKeepAlive")).await;
+    socket
+}
+
+/// The `MessageType` of every text frame `socket` receives, until one of type
+/// `until` arrives or, with `None`, until the server closes the socket.
+async fn message_types(socket: &mut ClientSocket, until: Option<&str>) -> Vec<String> {
+    use futures_util::StreamExt as _;
+    use tokio_tungstenite::tungstenite::Message;
+    let mut seen = Vec::new();
+    loop {
+        let frame = tokio::time::timeout(Duration::from_secs(10), socket.next())
+            .await
+            .unwrap_or_else(|_| panic!("no frame in time; saw {seen:?}"));
+        match frame {
+            Some(Ok(Message::Text(text))) => {
+                let json: serde_json::Value = serde_json::from_str(&text).expect("json frame");
+                let kind = json["MessageType"].as_str().unwrap_or_default().to_owned();
+                let done = until == Some(kind.as_str());
+                seen.push(kind);
+                if done {
+                    return seen;
+                }
+            }
+            Some(Ok(Message::Close(_)) | Err(_)) | None => {
+                assert!(until.is_none(), "closed before {until:?}; saw {seen:?}");
+                return seen;
+            }
+            Some(Ok(_)) => {}
+        }
+    }
+}
+
+/// gl-1123: connected clients are told whether the server comes back, as
+/// `SessionManager.OnApplicationStopping` tells them from `ShouldRestart`:
+/// `ServerRestarting` for `POST /System/Restart` (a backup restore restarts
+/// through the same call) and `ServerShuttingDown` for `POST /System/Shutdown`.
+///
+/// shortcut: `close_all_sockets` is process-global, so under plain `cargo test`
+/// another test's drain can close this socket before its push; nextest runs each
+/// test in its own process. Serialize the draining tests if plain `cargo test`
+/// must pass.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn connected_clients_are_told_a_restart_apart_from_a_shutdown() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let client = reqwest::Client::builder()
+        .timeout(REQUEST_TIMEOUT)
+        .build()
+        .expect("client");
+    let (server, base, config) = spawn_server(&client, |port| Config {
+        admin_user: ADMIN_USER.to_owned(),
+        admin_password: ADMIN_PASSWORD.to_owned(),
+        port,
+        ..Config::test_stub(tmp.path())
+    })
+    .await;
+    let tok = token(&client, &base).await;
+
+    let mut socket = open_session_socket(&base, &tok).await;
+    assert_eq!(post(&client, &base, "/System/Restart", &tok).await, 204);
+    let pushed = message_types(&mut socket, None).await;
+    assert!(
+        pushed.iter().any(|t| t == "ServerRestarting")
+            && !pushed.iter().any(|t| t == "ServerShuttingDown"),
+        "a restart pushes ServerRestarting; pushed {pushed:?}"
+    );
+
+    wait_for_new_lifetime(&client, &base, &config.server_name, &tok).await;
+    let mut socket = open_session_socket(&base, &tok).await;
+    assert_eq!(post(&client, &base, "/System/Shutdown", &tok).await, 204);
+    let pushed = message_types(&mut socket, None).await;
+    assert!(
+        pushed.iter().any(|t| t == "ServerShuttingDown")
+            && !pushed.iter().any(|t| t == "ServerRestarting"),
+        "a shutdown pushes ServerShuttingDown; pushed {pushed:?}"
+    );
+    tokio::time::timeout(
+        Duration::from_mins(1),
+        tokio::task::spawn_blocking(move || server.join()),
+    )
+    .await
+    .expect("run returns after shutdown")
+    .expect("join task")
+    .expect("server thread did not panic")
+    .expect("run exits cleanly");
+}
+
 /// No environment variables: what the test's own environment holds
 /// (`FERROFIN_SERVER_NAME`, say) must not override its `config.toml`.
 fn no_vars(_: &str) -> Option<String> {

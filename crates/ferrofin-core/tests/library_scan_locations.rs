@@ -613,6 +613,44 @@ async fn a_photo_toggle_removes_existing_photos_and_rediscovers_them_when_enable
     assert!(lib.row(movie).await.is_some());
 }
 
+/// A photo row whose file `PhotoResolver.IsImageFile` no longer takes (an
+/// `.svg` an earlier scan listed) is removed by the next scan, as upstream's
+/// `Folder.ValidateChildrenInternal2` drops a child no resolver returns. Its
+/// file and the other photos stay.
+#[tokio::test]
+async fn a_photo_row_the_resolver_no_longer_takes_is_pruned() {
+    use ferrofin_traits::persistence::ItemPersistenceService;
+    let lib = Library::of_type(&["A.jpg", "B.svg"], CollectionTypeOptions::homevideos).await;
+    lib.scanner.scan_all().await.unwrap();
+    let jpg = derive_item_id(
+        BaseItemKind::Photo,
+        &lib.media.join("A.jpg").to_string_lossy(),
+    )
+    .unwrap();
+    let svg_path = lib.media.join("B.svg").to_string_lossy().into_owned();
+    let svg = derive_item_id(BaseItemKind::Photo, &svg_path).unwrap();
+    assert!(lib.row(svg).await.is_none(), "an .svg is no photo");
+    // The row an earlier scan, which took `.svg`, saved for it.
+    let mut row = lib.row(jpg).await.expect("the .jpg photo");
+    row.id = guid_to_db(svg);
+    row.path = Some(svg_path);
+    row.name = Some("B".to_owned());
+    row.presentation_unique_key = None;
+    FerrofinItemPersistenceService::new(lib.db.clone())
+        .save_items(&[row])
+        .await
+        .unwrap();
+    assert!(lib.row(svg).await.is_some());
+
+    lib.scanner.scan_all().await.unwrap();
+    assert!(
+        lib.row(svg).await.is_none(),
+        "the stale .svg photo is pruned"
+    );
+    assert!(lib.row(jpg).await.is_some());
+    assert!(lib.media.join("B.svg").is_file());
+}
+
 #[tokio::test]
 async fn disabling_photos_does_not_prune_an_unreachable_location() {
     let lib = Library::of_type(&["Album/A.jpg"], CollectionTypeOptions::homevideos).await;

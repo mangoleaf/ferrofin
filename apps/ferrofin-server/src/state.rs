@@ -943,6 +943,12 @@ pub async fn build_app_state(
         ));
 
     // ---- media encoder (probe-only; ffmpeg process seam) ------------------
+    // Upstream's `SetFFmpegPath` reads the encoding thread count once, at
+    // startup, for every probe and frame extraction: a saved change applies
+    // from the next start.
+    let encoding_options = crate::encoding_options::EncodingOptionsReader::new("media encoder")
+        .read(config_mgr.as_ref())
+        .await;
     let media_encoder: Arc<dyn ferrofin_traits::media_encoding::MediaEncoder> = Arc::new(
         MediaEncoderImpl::new(
             Arc::new(TokioTranscoder::new()),
@@ -959,7 +965,12 @@ pub async fn build_app_state(
                 probe_size: Some(
                     ferrofin_mediaencoding::encoder::media_encoder::DEFAULT_PROBE_SIZE.to_owned(),
                 ),
-                threads: 0,
+                // `GetNumberOfThreads(null, options, null)`; it reads no
+                // capability, only the usable cores, as the planner's does.
+                threads: ferrofin_mediaencoding::EncodingHelper::new(
+                    ferrofin_mediaencoding::NoOptionalEncoders,
+                )
+                .number_of_threads(None, &encoding_options),
                 // Frame extraction (chapter images) writes here, never next to
                 // the media file — media mounts are commonly read-only. The
                 // path comes from `ServerApplicationPaths` so the chapter-image
@@ -1615,7 +1626,8 @@ pub async fn build_app_state(
     .with_virtual_paths(virtual_paths.clone())
     // An item moved to a new id (its kind changed) takes its folders along.
     .with_path_manager(Arc::clone(&path_manager))
-    // A row the scan removes takes its metadata folders and extracted data.
+    // A row the scan removes takes its metadata folders and extracted data,
+    // and a video whose file changed loses its extracted data.
     .with_item_data_cleanup(Arc::clone(&item_data_cleanup))
     // Each library location is the `Folder` row Jellyfin keeps for it, under
     // the aggregate root, and what it holds hangs off it (owner decision D1).
@@ -1763,6 +1775,11 @@ pub async fn build_app_state(
         }
         scanner = scanner.with_directory_cache_limits(limits);
     }
+    // The comic-archive entry cap a book's page count stops at (bootstrap
+    // knob, clamped to a positive range); unset keeps the providers' default.
+    if let Some(max_entries) = config.book_archive_max_entries {
+        scanner = scanner.with_book_archive_max_entries(max_entries);
+    }
     // Scans publish `RefreshProgress` events, which the consumers registered
     // below (once the session manager exists) forward to clients over the
     // WebSocket; the items a scan changes go to the `LibraryChanged`
@@ -1907,6 +1924,7 @@ pub async fn build_app_state(
             virtual_folders: Arc::clone(&virtual_folders),
             library: Arc::clone(&library),
             monitor: Arc::clone(&library_monitor),
+            virtual_paths: virtual_paths.clone(),
         }),
         Arc::clone(&configuration_write_lock),
     );
@@ -2311,7 +2329,7 @@ pub async fn build_app_state(
         task_manager.register(task);
     }
     wasm_host.subscribe_events(&event_bus, &plugins);
-    let playlists: Arc<dyn ferrofin_traits::collections::PlaylistManager> = Arc::new(
+    let playlists = Arc::new(
         FerrofinPlaylistManager::new(
             db.clone(),
             Arc::clone(&library),
@@ -2328,6 +2346,12 @@ pub async fn build_app_state(
         // A new playlist's folder stored as `%AppDataPath%/playlists/<name>`.
         .with_virtual_paths(virtual_paths.clone()),
     );
+    // A playlist an older Ferrofin saved with a container as one entry, or
+    // with no media type, takes what a create or add stores today. It needs
+    // the playlist manager's expansion, so it runs here, before the scheduler
+    // can start a scan.
+    ferrofin_core::adoption_repairs::run_expand_saved_playlist_containers(db, &playlists).await;
+    let playlists: Arc<dyn ferrofin_traits::collections::PlaylistManager> = playlists;
 
     // The full Jellyfin dashboard task set (Library + Maintenance categories),
     // now that every backing manager exists. Once registered, the scheduler
@@ -2410,7 +2434,10 @@ pub async fn build_app_state(
         ))));
         task_manager.register(Arc::new(maint_tasks::DeleteLogFileTask::new(
             Arc::clone(&config_trait),
-            server_config.log_file_retention_days,
+            {
+                let config_mgr = Arc::clone(&config_mgr);
+                move || config_mgr.snapshot_shared().log_file_retention_days
+            },
         )));
         task_manager.register(Arc::new(maint_tasks::CleanupUserDataTask::new(db.clone())));
         task_manager.register(Arc::new(maint_tasks::MoveTrickplayImagesTask::new(

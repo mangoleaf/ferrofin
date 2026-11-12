@@ -620,6 +620,20 @@ pub static SETTINGS: &[SettingSpec] = &[
         running: |c| json!(c.scan_directory_cache_idle_secs),
         ..ROW
     },
+    SettingSpec {
+        key: "book_archive_max_entries",
+        env: Some("FERROFIN_BOOK_ARCHIVE_MAX_ENTRIES"),
+        env_read: PARSED_U32,
+        label: "Comic archive entry limit",
+        group: Group::Library,
+        kind: whole_numbers(config::BOOK_ARCHIVE_MAX_ENTRIES_RANGE),
+        unit: Some(Unit::Items),
+        default: "100000",
+        description: "Most entries a comic archive may hold for its pages to set the book's \
+                      runtime; a larger one is not counted.",
+        running: |c| json!(c.book_archive_max_entries),
+        ..ROW
+    },
     // ---- Trickplay ---------------------------------------------------------
     // The two rows stored in the server configuration (gl-1139): the same
     // `TrickplayOptions` the dashboard's Trickplay page edits.

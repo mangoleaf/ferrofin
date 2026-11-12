@@ -334,7 +334,8 @@ async fn a_tuner_stream_answering_a_failure_is_named_by_its_host() {
     assert_names_host(&error, &address);
 }
 
-/// `copy_to_temp_file` and `record_direct` log the body's error as it is.
+/// `copy_to_temp_file` logs the body's error as it is, and `record_direct`
+/// returns it for `settle_timer` to log.
 #[tokio::test]
 async fn a_tuner_stream_cut_short_shows_no_account() {
     let address = serve("HTTP/1.1 200 OK\r\ncontent-length: 100\r\nconnection: close\r\n\r\nshort");

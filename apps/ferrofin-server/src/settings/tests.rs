@@ -316,6 +316,7 @@ const TABS: &[(Group, &[&str])] = &[
             "scan_progress_every",
             "scan_directory_cache_records",
             "scan_directory_cache_idle_secs",
+            "book_archive_max_entries",
         ],
     ),
     (
