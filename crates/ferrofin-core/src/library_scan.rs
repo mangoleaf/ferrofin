@@ -31091,6 +31091,7 @@ mod tests {
             &mut images,
             vec![
                 ferrofin_providers::TmdbImage {
+                    thumbnail_url: None,
                     image_type: ImageType::Primary,
                     url: "fanart-poster".into(),
                     width: Some(1000),
@@ -31100,6 +31101,7 @@ mod tests {
                     language: None,
                 },
                 ferrofin_providers::TmdbImage {
+                    thumbnail_url: None,
                     image_type: ImageType::Logo,
                     url: "fanart-logo".into(),
                     width: Some(800),
@@ -36840,6 +36842,7 @@ mod tests {
                 images: tvdb_art
                     .iter()
                     .map(|image_type| ferrofin_providers::TmdbImage {
+                        thumbnail_url: None,
                         image_type: *image_type,
                         url: format!("{base}/img/tvdb-{image_type:?}.png"),
                         width: None,
