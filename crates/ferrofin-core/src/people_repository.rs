@@ -2667,6 +2667,46 @@ mod tests {
         }
     }
 
+    /// `PeopleRepositoryNameRangeTests.GetPeople_NameRange_IgnoresCase`
+    /// (v12.4): the letter picker's range ignores case, as the list's order
+    /// does, so a capitalised name does not sort below every lowercase bound.
+    #[rstest::rstest]
+    #[case(None, Some("A"), &["50 Cent"])]
+    #[case(None, Some("C"), &["50 Cent", "alpha centauri", "bob dylan", "Brad Pitt"])]
+    #[case(Some("B"), Some("C"), &["bob dylan", "Brad Pitt"])]
+    #[case(Some("Y"), None, &["Zoe Saldana"])]
+    #[tokio::test]
+    async fn get_people_name_range_ignores_case(
+        #[case] name_starts_with_or_greater: Option<&str>,
+        #[case] name_less_than: Option<&str>,
+        #[case] expected: &[&str],
+    ) {
+        let db = test_db().await;
+        for name in [
+            "50 Cent",
+            "alpha centauri",
+            "Brad Pitt",
+            "bob dylan",
+            "Zoe Saldana",
+        ] {
+            super::seed_people_row(&db, Uuid::new_v4(), name, "Actor").await;
+        }
+        let result = FerrofinPeopleRepository::new(db)
+            .get_people(&InternalPeopleQuery {
+                name_starts_with_or_greater: name_starts_with_or_greater.map(str::to_owned),
+                name_less_than: name_less_than.map(str::to_owned),
+                ..Default::default()
+            })
+            .await
+            .expect("people");
+        let names: Vec<&str> = result.items.iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(names, expected);
+        assert_eq!(
+            result.total_record_count,
+            i32::try_from(expected.len()).unwrap()
+        );
+    }
+
     #[rstest::rstest]
     #[case("İpek")]
     #[case("ΟΣ")]
