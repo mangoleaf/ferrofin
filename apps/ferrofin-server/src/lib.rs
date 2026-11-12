@@ -102,7 +102,9 @@ fn log_startup_banner(config: &Config) {
         bind = %config.bind_addr,
         port = config.port,
         https_port = config.https_port,
-        base_url = %config.base_url,
+        // Before the saved network configuration is read: the base URL served
+        // is on the "ferrofin-server ready" line.
+        bootstrap_base_url = %config.base_url,
         published_url = config.published_url.as_deref().unwrap_or("<auto>"),
         "network"
     );
@@ -775,7 +777,7 @@ async fn serve_once(
         .map(tokio::task::JoinHandle::abort_handle);
     // The handover: the listeners serving the startup answers serve the
     // lifetime's router from the next request on, and HTTPS starts with it.
-    let app = lifetime_app(router, &config.base_url, https_redirect(config, &wired));
+    let app = lifetime_app(router, &wired.base_url, https_redirect(&wired));
     serving.serve(https_listeners, &app);
     // `ready` is this lifetime's own, so this is its only `set`.
     let _ = ready.set(app);
@@ -783,6 +785,7 @@ async fn serve_once(
     tracing::info!(
         addresses = ?addresses,
         https_addresses = ?https_addresses,
+        base_url = %wired.base_url,
         "ferrofin-server ready"
     );
 
@@ -1084,12 +1087,12 @@ async fn bind_http_listeners(
 /// The HTTPS redirect this lifetime serves: Jellyfin adds
 /// `UseHttpsRedirection` when `RequireHttps` is set and it listens with HTTPS.
 /// It points at the bound HTTPS port, so it follows the listeners.
-fn https_redirect(config: &Config, wired: &WiredApp) -> Option<Arc<tls::HttpsRedirect>> {
+fn https_redirect(wired: &WiredApp) -> Option<Arc<tls::HttpsRedirect>> {
     use ferrofin_traits::system::ServerApplicationHost as _;
     wired.https.as_ref().filter(|https| https.require).map(|_| {
         Arc::new(tls::HttpsRedirect {
             port: wired.app_host.https_port(),
-            base: base_url::normalize(&config.base_url),
+            base: wired.base_url.clone(),
             network: wired.state.network.clone(),
             config: Arc::clone(&wired.state.config),
         })

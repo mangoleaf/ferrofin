@@ -718,6 +718,33 @@ async fn lyrics_routes_404_on_a_non_audio_item() {
 }
 
 #[tokio::test]
+async fn lyrics_routes_400_on_a_nil_item_id() {
+    // `GetItemById<Audio>(Guid.Empty, …)` reaches `GetItemById(Guid)`, which
+    // throws `ArgumentException("Guid can't be empty")`: a 400, not a 404.
+    let deleted = Arc::new(Mutex::new(false));
+    let canned = || CannedLyrics {
+        stored: Some(LyricDto::default()),
+        remote: Some(("abc_1".to_owned(), LyricDto::default())),
+        deleted: deleted.clone(),
+        saved: Arc::default(),
+    };
+    let nil = Uuid::nil();
+    for (method, path) in [
+        ("GET", format!("/Audio/{nil}/Lyrics")),
+        ("POST", format!("/Audio/{nil}/Lyrics?fileName=x.lrc")),
+        ("DELETE", format!("/Audio/{nil}/Lyrics")),
+        ("GET", format!("/Audio/{nil}/RemoteSearch/Lyrics")),
+        ("POST", format!("/Audio/{nil}/RemoteSearch/Lyrics/abc_1")),
+    ] {
+        let (_dir, path_media) = temp_media();
+        let app = state(&path_media, Arc::new(canned()));
+        let (status, _) = call(app, method, &path).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{method} {path}");
+    }
+    assert!(!*deleted.lock().unwrap());
+}
+
+#[tokio::test]
 async fn lyric_writes_need_the_lyric_management_permission() {
     // Port of `[Authorize(Policy = Policies.LyricManagement)]` — the
     // `UserPermissionRequirement(PermissionKind.EnableLyricManagement)` five of

@@ -462,6 +462,7 @@
                     ConfigFile: 'config.toml',
                     Environment: 'Environment',
                     Flag: 'Flag',
+                    NetworkConfiguration: 'Networking page',
                     ServerConfiguration: 'Server configuration'
                 };
                 // The kinds whose field is short; the others hold text, a
@@ -632,6 +633,9 @@
                     }
                     if (setting.Source === 'Flag') {
                         return 'not used while the command-line flag sets it';
+                    }
+                    if (setting.Source === 'NetworkConfiguration') {
+                        return 'not used while Dashboard → Networking sets it';
                     }
                     return setting.Applies === 'ProcessRestart' ? 'applies after a full process restart' : 'applies after restart';
                 }
@@ -1339,9 +1343,9 @@
                 }
 
                 /**
-                 * Changed: something sets a value (a variable, a flag or
-                 * `config.toml`, whether or not it is in use yet), or the row
-                 * holds an unsaved edit.
+                 * Changed: something sets a value (a variable, a flag, the
+                 * Networking page or `config.toml`, whether or not it is in use
+                 * yet), or the row holds an unsaved edit.
                  */
                 function isChanged(row) {
                     var setting = row.setting;
@@ -1352,11 +1356,12 @@
                 /**
                  * Whether a restart applies a saved change to `setting`:
                  * `config.toml` holds a value not in use yet, or a save removed
-                 * one still in use. A variable or a flag outranks the file
-                 * across a restart too.
+                 * one still in use. A variable, a flag or the Networking page
+                 * outranks the file across a restart too.
                  */
                 function awaitsRestart(state, setting) {
-                    if (setting.Source === 'Environment' || setting.Source === 'Flag') {
+                    if (setting.Source === 'Environment' || setting.Source === 'Flag' ||
+                        setting.Source === 'NetworkConfiguration') {
                         return false;
                     }
                     return setting.SavedValue !== undefined || Boolean(state.resets[setting.Key]);
