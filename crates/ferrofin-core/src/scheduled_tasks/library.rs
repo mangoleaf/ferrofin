@@ -1618,21 +1618,24 @@ pub struct TrickplayImagesTask {
     library: Arc<dyn LibraryManager>,
     folders: Arc<dyn VirtualFolderManager>,
     trickplay: Arc<dyn TrickplayManager>,
+    streams: Arc<dyn MediaStreamRepository>,
 }
 
 impl TrickplayImagesTask {
-    /// Builds the task over the library, virtual-folder (per-library options)
-    /// and trickplay-manager seams.
+    /// Builds the task over the library, virtual-folder (per-library options),
+    /// trickplay-manager and stored-stream seams.
     #[must_use]
     pub fn new(
         library: Arc<dyn LibraryManager>,
         folders: Arc<dyn VirtualFolderManager>,
         trickplay: Arc<dyn TrickplayManager>,
+        streams: Arc<dyn MediaStreamRepository>,
     ) -> Self {
         Self {
             library,
             folders,
             trickplay,
+            streams,
         }
     }
 }
@@ -1697,6 +1700,15 @@ impl ScheduledTask for TrickplayImagesTask {
             if items.is_empty() {
                 break;
             }
+            // Each video gets its page row, as upstream hands over the page's
+            // `Video`, and the page's streams, read once (gl-1375). The filter
+            // is the loop's skips below.
+            let ids: Vec<Uuid> = items
+                .iter()
+                .filter(|item| crate::trickplay_manager::is_library_video(item))
+                .filter_map(|item| Uuid::parse_str(&item.id).ok())
+                .collect();
+            let page_streams = self.streams.get_media_streams_batch(&ids).await?;
             for item in &items {
                 done += 1;
                 // The pin declares SourceTypes but never consumes it in query
@@ -1714,15 +1726,22 @@ impl ScheduledTask for TrickplayImagesTask {
                 .and_then(|folder| folder.library_options.clone())
                 .unwrap_or_default();
                 if let Ok(item_id) = Uuid::parse_str(&item.id) {
+                    let streams = page_streams.get(&item_id).map_or(&[][..], Vec::as_slice);
                     let refreshed = match &check {
                         Some(check) => self
                             .trickplay
-                            .check_trickplay_data(item_id, check, &options)
+                            .check_trickplay_for_media(item_id, item, streams, check, &options)
                             .await
                             .map(|matched| complete &= matched),
                         None => {
                             self.trickplay
-                                .refresh_trickplay_data(item_id, false, &options)
+                                .refresh_trickplay_for_media(
+                                    item_id,
+                                    item,
+                                    Some(streams),
+                                    false,
+                                    &options,
+                                )
                                 .await
                         }
                     };
@@ -3357,6 +3376,7 @@ mod tests {
                 "/media/movies",
             )),
             trickplay.clone(),
+            Arc::new(FakeStreams::new(Vec::new())),
         );
         assert_eq!(task.key(), "RefreshTrickplayImages");
         assert_eq!(
@@ -3409,6 +3429,7 @@ mod tests {
                 "/media/movies",
             )),
             trickplay.clone(),
+            Arc::new(FakeStreams::new(Vec::new())),
         );
         task.execute(&TaskProgress::default()).await.expect("run");
 
@@ -3504,7 +3525,12 @@ mod tests {
             crate::test_support::save_item(&db, &entity).await;
         }
         let manager = Arc::new(FakeTrickplay::default());
-        let task = TrickplayImagesTask::new(library_manager_over(db), folders, manager.clone());
+        let task = TrickplayImagesTask::new(
+            library_manager_over(db),
+            folders,
+            manager.clone(),
+            Arc::new(FakeStreams::new(Vec::new())),
+        );
         task.execute(&TaskProgress::default()).await.unwrap();
         let mut calls = manager.refreshed.lock().unwrap().clone();
         calls.sort();
@@ -3547,7 +3573,12 @@ mod tests {
             after_refresh: Some((folders.clone(), "Deep".to_owned(), options)),
             ..Default::default()
         });
-        let task = TrickplayImagesTask::new(library_manager_over(db), folders, manager.clone());
+        let task = TrickplayImagesTask::new(
+            library_manager_over(db),
+            folders,
+            manager.clone(),
+            Arc::new(FakeStreams::new(Vec::new())),
+        );
         task.execute(&TaskProgress::default()).await.unwrap();
         let calls = manager.refreshed.lock().unwrap();
         assert_eq!(calls.len(), 2);
