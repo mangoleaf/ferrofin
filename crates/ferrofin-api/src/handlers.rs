@@ -3164,6 +3164,50 @@ pub const VERIFIED: &[Verified] = &[
         refs: &[],
     },
     Verified {
+        method: "get",
+        path: "/LiveTv/Timers/{timerId}",
+        upstream_file: "Jellyfin.Api/Controllers/LiveTvController.cs",
+        upstream_method: "GetTimer",
+        ferrofin: "handlers/live_tv.rs get_timer (RequiredRouteString: a blank timerId is a 400) → \
+               find_timer (LiveTvManager.GetTimer: GetTimers with TimerQuery.Id, then the first \
+               whose Id equals timerId ignoring case; none is 200 null, unchecked as upstream) → \
+               ferrofin-traits live_tv.rs get_timers_matching and filter_timers → \
+               ferrofin-livetv manager.rs get_timers (DefaultLiveTvService.GetTimersAsync: every \
+               timer but a Completed one)",
+        date: "2026-11-13",
+        divergences: &[
+            "The timer is the DTO stored at its creation or last change, not one \
+         GetTimerInfoDto builds on each read: no ProgramInfo, no ChannelPrimaryImageTag, and \
+         the guide's ChannelName at creation. Fix path: gl-1745 (then gl-853 for the artwork).",
+        ],
+        refs: &[],
+    },
+    Verified {
+        method: "delete",
+        path: "/LiveTv/Timers/{timerId}",
+        upstream_file: "Jellyfin.Api/Controllers/LiveTvController.cs",
+        upstream_method: "CancelTimer",
+        ferrofin: "handlers/live_tv.rs cancel_timer (RequiredRouteString) → find_timer \
+               (LiveTvManager.CancelTimer's GetTimer: none is a 404) → ferrofin-livetv \
+               manager.rs cancel_timer → cancel_timer_internal (DefaultLiveTvService.\
+               CancelTimerAsync → CancelTimerInternal(id, false, true): Cancelled and manual, \
+               deleted without a SeriesTimerId, else kept; disarm_timer and cancel_recording for \
+               RecordingsManager.CancelRecording) → notify_timer_event TimerCancelled only when \
+               the status was not already Cancelled (statusChanging)",
+        date: "2026-11-13",
+        divergences: &[
+            "TimerCancelled carries the timer's own Id, as Ferrofin's TimerCreated does. \
+         Upstream's default service relays its external id for both \
+         (OnEmbyTvTimerCancelled, OnEmbyTvTimerCreated), so jellyfin-web's onTimerCancelled \
+         clears only a card its own TimerCreated push marked, never one rendered with the \
+         programme's TimerId (cardBuilder's data-timerid). Jellyfin bug not ported.",
+            "TimerCancelled reaches every signed-in session, not only users with \
+         EnableLiveTvAccess (RecordingNotifier.SendMessage). Fix path: gl-1746.",
+            "The 404 body is Ferrofin's error shape, not upstream's. Fix path: gl-666.",
+        ],
+        refs: &[],
+    },
+    Verified {
         method: "post",
         path: "/Users/{userId}/Policy",
         upstream_file: "Jellyfin.Api/Controllers/UserController.cs",

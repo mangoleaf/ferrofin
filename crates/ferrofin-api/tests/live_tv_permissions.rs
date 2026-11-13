@@ -37,7 +37,8 @@ use ferrofin_api::test_support::{authed_fake_state_with_policy, elevated_fake_st
 use ferrofin_db::entities::users::UserEntity;
 use ferrofin_model::dto::BaseItemDto;
 use ferrofin_model::live_tv::{
-    GuideInfo, ListingsProviderInfo, LiveTvInfo, SeriesTimerInfoDto, TimerInfoDto, TunerHostInfo,
+    BaseTimerInfoDto, GuideInfo, ListingsProviderInfo, LiveTvInfo, SeriesTimerInfoDto,
+    TimerInfoDto, TunerHostInfo,
 };
 use ferrofin_model::querying::QueryResult;
 use ferrofin_model::users::UserPolicy;
@@ -168,8 +169,15 @@ impl LiveTvManager for CountingLiveTv {
     async fn refresh_guide(&self) -> Result<(), ServiceError> {
         unimplemented!("not probed by the gate tests")
     }
+    /// The one timer, `t1`, that the probed `DELETE` cancels.
     async fn get_timers(&self) -> Result<Vec<TimerInfoDto>, ServiceError> {
-        unimplemented!("not probed by the gate tests")
+        Ok(vec![TimerInfoDto {
+            base: BaseTimerInfoDto {
+                id: Some("t1".to_owned()),
+                ..BaseTimerInfoDto::default()
+            },
+            ..TimerInfoDto::default()
+        }])
     }
     async fn get_timer(&self, _id: &str) -> Result<Option<TimerInfoDto>, ServiceError> {
         unimplemented!("not probed by the gate tests")
