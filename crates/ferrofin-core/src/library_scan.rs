@@ -2509,8 +2509,6 @@ struct RefreshContext<'a> {
     /// The fetcher policy of an item in no configured library: the
     /// server-wide options only.
     outside: FetcherPolicy<'a>,
-    /// The ids of the locked items.
-    locked: &'a std::collections::HashSet<Uuid>,
     /// The external subtitle/audio resolvers, for the sidecar change check.
     externals: Option<ExternalProbeSeam>,
     /// Plan indices of the earlier copies of an id the plan holds more than
@@ -2537,12 +2535,10 @@ fn file_changed(stored: &BaseItemEntity, item: &Planned) -> bool {
 
 impl<'a> RefreshContext<'a> {
     /// A context for `run` over nothing yet: every item in scope, no policy,
-    /// lock, external resolver or superseded copy.
+    /// external resolver or superseded copy.
     fn of(run: ScanRun<'a>) -> Self {
         static NO_POLICIES: std::sync::LazyLock<HashMap<Uuid, FetcherPolicy<'static>>> =
             std::sync::LazyLock::new(HashMap::new);
-        static NO_LOCKS: std::sync::LazyLock<std::collections::HashSet<Uuid>> =
-            std::sync::LazyLock::new(std::collections::HashSet::new);
         static NO_GROUPS: std::sync::LazyLock<VersionGroups> =
             std::sync::LazyLock::new(VersionGroups::default);
         Self {
@@ -2558,7 +2554,6 @@ impl<'a> RefreshContext<'a> {
             now: Utc::now(),
             policies: &NO_POLICIES,
             outside: FetcherPolicy::default(),
-            locked: &NO_LOCKS,
             externals: None,
             superseded: std::collections::HashSet::new(),
             date_added: DateAdded::default(),
@@ -6953,7 +6948,6 @@ impl LibraryScanner {
                 effective_locale: None,
                 ..Default::default()
             },
-            locked: &locked_items,
             externals: self.external_probe_seam(run.dirs),
             superseded: superseded_copies(&planned),
             date_added,
@@ -7113,10 +7107,13 @@ impl LibraryScanner {
             // `IsLocked` guard backstops the metadata columns; file-derived
             // facts (the probe) still update, and its local images are still
             // validated and discovered.
-            // The stored row is the later read: a lock applied since the
-            // scan began is in it ([`PriorityLane::edited`]).
-            let locked =
-                locked_items.contains(&item.id) || stored.row().is_some_and(|row| row.is_locked);
+            // The stored row is the later read, so it alone decides: a lock
+            // or an unlock applied since the scan began is in it
+            // ([`PriorityLane::edited`]), as upstream reads `item.IsLocked`
+            // at refresh time. The scan-start set covers rows it has none of.
+            let locked = stored
+                .row()
+                .map_or_else(|| locked_items.contains(&item.id), |row| row.is_locked);
             let policy = refresh.policy_for(item);
             // An album or artist whose refresh the music pass completes
             // after the walk leaves it the triggers of that refresh.
@@ -9388,8 +9385,8 @@ impl LibraryScanner {
         let touched = self
             .preload_album_artwork(planned, &mut art_cache, run)
             .await;
-        // One read of the locked-item set for the whole scan, replacing the
-        // per-item row hydration the loop used to pay (see `locked_items`).
+        // One read of the locked-item set for the whole scan, for the items
+        // whose stored row the walk has none of (see `locked_items`).
         let locked_items = self.locked_items(planned).await;
         (art_cache, locked_items, touched)
     }
@@ -11037,7 +11034,7 @@ impl LibraryScanner {
             run_time_ticks: row.run_time_ticks,
             total_bitrate: row.total_bitrate,
             is_virtual_item: row.is_virtual_item,
-            is_locked: row.is_locked || refresh.locked.contains(&item.id),
+            is_locked: row.is_locked,
         });
         let facts = Self::file_facts(
             item,
@@ -14475,12 +14472,14 @@ impl LibraryScanner {
     /// not on `scan_paths`, the library-monitor path that runs for one or two
     /// items on every filesystem event.
     ///
-    /// A lock applied *while* this scan is running is seen through the item's
-    /// stored row instead, read again before the walk reaches the item
-    /// ([`PriorityLane::edited`]). The locked item's stored metadata is
-    /// protected a second time: the scan upsert guards every user-owned
-    /// column with `CASE WHEN "IsLocked" = 1 THEN "<col>"`, evaluated against
-    /// the row's committed value at write time.
+    /// Only the items whose stored row the scan could not read are judged by
+    /// it: a read row's own `IsLocked` decides, so a lock or an unlock applied
+    /// *while* this scan is running is seen through that row, read again
+    /// before the walk reaches the item ([`PriorityLane::edited`]). The
+    /// locked item's stored metadata is protected a second time: the scan
+    /// upsert guards every user-owned column with
+    /// `CASE WHEN "IsLocked" = 1 THEN "<col>"`, evaluated against the row's
+    /// committed value at write time.
     async fn locked_items(&self, planned: &[Planned]) -> std::collections::HashSet<Uuid> {
         // Nothing to scan, nothing to look up. `run_scan` is shared with
         // `scan_paths`, and a noisy directory (`.partial` files, stray
@@ -33143,7 +33142,6 @@ mod tests {
             now: chrono::Utc::now(),
             policies: &std::collections::HashMap::new(),
             outside: super::FetcherPolicy::default(),
-            locked: &std::collections::HashSet::new(),
             externals: None,
             superseded: std::collections::HashSet::new(),
             date_added: super::DateAdded::default(),
