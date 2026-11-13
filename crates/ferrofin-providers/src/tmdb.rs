@@ -528,15 +528,18 @@ pub struct TmdbTrailer {
 }
 
 /// YouTube "Trailer"/"Teaser" videos from a details `videos` append become
-/// `RemoteTrailers` (the C# `TmdbMovieProvider` / `TmdbSeriesProvider` rule).
+/// `RemoteTrailers`, in the order given (the C# `TmdbUtils.IsTrailerType`
+/// filter, ignoring case).
 fn youtube_trailers(videos: Option<VideosResults>) -> Vec<TmdbTrailer> {
     videos
         .map(|v| v.results)
         .unwrap_or_default()
         .into_iter()
         .filter(|v| {
-            v.site.as_deref() == Some("YouTube")
-                && matches!(v.type_.as_deref(), Some("Trailer" | "Teaser"))
+            v.site
+                .as_deref()
+                .is_some_and(|s| s.eq_ignore_ascii_case("youtube"))
+                && (is_video_type(v, "trailer") || is_video_type(v, "teaser"))
         })
         .filter_map(|v| {
             let key = v.key.filter(|k| !k.is_empty())?;
@@ -549,6 +552,14 @@ fn youtube_trailers(videos: Option<VideosResults>) -> Vec<TmdbTrailer> {
             })
         })
         .collect()
+}
+
+/// Whether a TMDb video's `type` is `kind`, ignoring case.
+fn is_video_type(video: &VideoEntry, kind: &str) -> bool {
+    video
+        .type_
+        .as_deref()
+        .is_some_and(|t| t.eq_ignore_ascii_case(kind))
 }
 
 #[derive(Debug, Deserialize)]
@@ -2483,7 +2494,13 @@ impl TmdbClient {
             credits_to_people(d.credits, cfg)
         };
 
-        let trailers = youtube_trailers(d.videos);
+        // Trailers before teasers, else in TMDb's order: the movie and series
+        // providers' stable `OrderByDescending`; episodes keep TMDb's order.
+        let mut videos = d.videos;
+        if let Some(videos) = &mut videos {
+            videos.results.sort_by_key(|v| !is_video_type(v, "trailer"));
+        }
+        let trailers = youtube_trailers(videos);
 
         let original_title = d
             .original_title
@@ -2985,6 +3002,53 @@ mod tests {
                 .unwrap()
                 .people
                 .is_none()
+        );
+    }
+
+    /// A movie's and a series' Trailer videos come before their Teasers, in a
+    /// stable sort (`TmdbMovieProvider` / `TmdbSeriesProvider`'s
+    /// `OrderByDescending`); an episode keeps TMDb's order
+    /// (`TmdbEpisodeProvider`). Site and type match ignoring case
+    /// (`TmdbUtils.IsTrailerType`).
+    #[tokio::test]
+    async fn movie_and_series_trailers_come_before_teasers() {
+        let videos = r#"{"videos":{"results":[
+            {"site":"YouTube","type":"Teaser","key":"teaser1","name":"Teaser"},
+            {"site":"YouTube","type":"Clip","key":"clip"},
+            {"site":"youtube","type":"trailer","key":"trailer1","name":"Trailer"},
+            {"site":"Vimeo","type":"Trailer","key":"vimeo"},
+            {"site":"YouTube","type":"Teaser","key":"teaser2","name":"Teaser 2"},
+            {"site":"YouTube","type":"Trailer","key":"trailer2","name":"Trailer 2"}]}}"#;
+        let server = crate::mock_http::MockServer::start(vec![
+            ("/movie/1", videos.to_owned()),
+            ("/tv/2?", videos.to_owned()),
+            ("/episode/1", videos.to_owned()),
+        ])
+        .await;
+        let client = TmdbClient::new().with_base_url(&server.base_url);
+        let keys = |trailers: Vec<TmdbTrailer>| -> Vec<String> {
+            trailers
+                .into_iter()
+                .map(|t| t.url.replace("https://www.youtube.com/watch?v=", ""))
+                .collect()
+        };
+        let movie = client.details(TmdbKind::Movie, 1, None).await.unwrap();
+        let series = client.details(TmdbKind::Series, 2, None).await.unwrap();
+        let episode = client
+            .episode_extras_for_language(2, 1, 1, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            [
+                keys(movie.trailers),
+                keys(series.trailers),
+                keys(episode.trailers)
+            ],
+            [
+                ["trailer1", "trailer2", "teaser1", "teaser2"],
+                ["trailer1", "trailer2", "teaser1", "teaser2"],
+                ["teaser1", "trailer1", "teaser2", "trailer2"],
+            ]
         );
     }
 
