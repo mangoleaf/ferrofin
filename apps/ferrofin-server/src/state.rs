@@ -3234,6 +3234,17 @@ pub async fn build_app_state(
             Arc::clone(&plugins),
             Arc::new(ferrofin_extensions::ldap_auth::directory::Ldap3Directory::default()),
         ));
+    // The backup engine behind `/Backup*`: archives come from and go back to
+    // the live application paths, and each manifest records this release.
+    let backup_paths: Arc<dyn ferrofin_traits::system::ServerApplicationPaths> =
+        Arc::clone(&paths) as Arc<_>;
+    let backup: Arc<dyn ferrofin_traits::backup::BackupService> =
+        Arc::new(ferrofin_core::backup::FerrofinBackupService::new(
+            backup_paths,
+            Arc::clone(&state.library),
+            Arc::clone(&state.system),
+            ferrofin_health::RELEASE_VERSION,
+        ));
     let state = state
         .with_plugin_request_handler(plugin_routes)
         .with_session_bus(Arc::clone(&session_bus))
@@ -3242,6 +3253,7 @@ pub async fn build_app_state(
         .with_file_transformations(Arc::clone(&file_transformations))
         .with_merge_versions(merge_versions)
         .with_ldap(ldap)
+        .with_backup(backup)
         .with_playback_metrics(playback_metrics);
 
     // Establishing the watches is a FILESYSTEM WALK, not a registration: an
