@@ -535,12 +535,42 @@ impl SubtitleManager for FerrofinSubtitleManager {
             .ok_or_else(|| {
                 ServiceError::invalid_input(format!("no subtitle file at stream index {index}"))
             })?;
-        // `File.Delete` ignores a file already gone. The stream rows are left
-        // to the item refresh the caller awaits next (`item.RefreshMetadata`).
+        // `File.Delete` ignores a file already gone, but throws
+        // `DirectoryNotFoundException` (a 404, before the refresh) when its
+        // folder is missing or a folder in the path is a file. The stream rows
+        // are left to the item refresh the caller awaits next
+        // (`item.RefreshMetadata`).
         let _write = SelfWrite::begin(self.self_writes.as_ref(), path.as_str());
-        match tokio::fs::remove_file(&path).await {
+        let folder_missing = |reason: &str| {
+            // The 404 is not logged where it is answered; name the row here.
+            tracing::debug!(
+                %item_id,
+                path = %ferrofin_util::source_url::redact_url(&path),
+                reason,
+                "subtitle folder not found"
+            );
+            ServiceError::not_found("subtitle folder not found")
+        };
+        let file = Path::new(&path);
+        // `File.Delete` resolves a relative path against the working
+        // directory, where a URL row's folder is missing; never touch the disk
+        // for one (a relative row whose folder exists there is a divergence).
+        if !file.is_absolute() {
+            return Err(folder_missing("relative path"));
+        }
+        match tokio::fs::remove_file(file).await {
             Ok(()) => Ok(()),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                let folder = file.parent().unwrap_or(file);
+                if tokio::fs::metadata(folder).await.is_ok_and(|m| m.is_dir()) {
+                    Ok(())
+                } else {
+                    Err(folder_missing("no such folder"))
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotADirectory => {
+                Err(folder_missing("a folder in the path is a file"))
+            }
             Err(e) => Err(ServiceError::backend(e.to_string())),
         }
     }
@@ -1717,31 +1747,58 @@ mod tests {
         assert_eq!(indexes, [2, 3]);
     }
 
-    /// `File.Delete` ignores a file that is already gone: the delete succeeds,
-    /// still bracketed, and the refresh drops the stream.
+    /// gl-1723: `File.Delete` ignores a file that is already gone (the delete
+    /// succeeds and the refresh drops the stream), but throws
+    /// `DirectoryNotFoundException`, a `404` before the refresh, when the
+    /// file's folder is missing (`ENOENT`, no parent directory) or a folder in
+    /// the path is a file (`ENOTDIR`). A URL row is resolved against upstream's
+    /// working directory, where its folder is missing; here no relative path
+    /// reaches the disk, even one that would name a file. Each attempt is
+    /// bracketed.
+    #[rstest::rstest]
+    #[case::file_missing("{tmp}/movie.fre.srt", true)]
+    #[case::folder_missing("{tmp}/NoSuchFolder/missing.en.srt", false)]
+    #[case::folder_is_a_file("{tmp}/movie.mkv/missing.en.srt", false)]
+    #[case::url("http://relay.invalid/remote.en.srt", false)]
+    #[case::relative_to_a_real_file("{relative_tmp}/movie.mkv", false)]
     #[tokio::test]
-    async fn delete_of_a_sidecar_already_gone_succeeds() {
+    async fn delete_of_a_missing_sidecar_fails_only_for_a_missing_folder(
+        #[case] row: &str,
+        #[case] succeeds: bool,
+    ) {
         let db = test_db().await;
         let item = Uuid::new_v4();
         seed_item(&db, item, BaseItemKind::Movie).await;
         let tmp = tempfile::tempdir().expect("tempdir");
-        let gone = tmp.path().join("movie.fre.srt");
+        let media = tmp.path().join("movie.mkv");
+        std::fs::write(&media, b"media").expect("write media");
+        let root = tmp.path().to_str().unwrap();
+        let cwd = std::env::current_dir().expect("cwd");
+        let up = "../".repeat(cwd.components().count() - 1);
+        let path = row
+            .replace("{tmp}", root)
+            .replace("{relative_tmp}", &format!("{up}{}", &root[1..]));
         FerrofinMediaStreamRepository::new(db.clone())
-            .save_media_streams(item, &[subtitle_stream(2, true, gone.to_str())])
+            .save_media_streams(item, &[subtitle_stream(2, true, Some(&path))])
             .await
             .expect("save streams");
 
         let recording = Arc::new(Recording::default());
-        manager(db, Vec::new())
+        let deleted = manager(db, Vec::new())
             .with_self_writes(recording.clone())
             .delete_subtitles(item, 2)
-            .await
-            .expect("a missing file is no error");
-        let shown = gone.display();
+            .await;
+        if succeeds {
+            deleted.expect("a missing file is no error");
+        } else {
+            let error = deleted.expect_err("a missing folder is");
+            assert!(matches!(error, ServiceError::NotFound(_)), "{error:?}");
+        }
         assert_eq!(
             recording.calls(),
-            [format!("begin {shown}"), format!("complete {shown} false")]
+            [format!("begin {path}"), format!("complete {path} false")]
         );
+        assert!(media.exists(), "no other file is deleted");
     }
 
     /// gl-846: `DeleteSubtitles` throws an `ArgumentException`, a `400`, for an

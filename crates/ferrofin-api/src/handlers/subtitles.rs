@@ -124,9 +124,10 @@ async fn require_video(
 /// deleted the subtitle's file and awaited the item's refresh, whose re-probe
 /// drops that stream and renumbers the rest. A nil id (`GetItemById`) and an
 /// index with no subtitle file (no subtitle stream there, or an embedded one)
-/// throw `ArgumentException`s upstream, so every failure but the missing item
-/// is answered as `ExceptionMiddleware` answers a throw: those are `400`,
-/// `text/plain`, "Error processing request.".
+/// throw `ArgumentException`s upstream, and a subtitle whose folder is missing
+/// throws `File.Delete`'s `DirectoryNotFoundException`, before the refresh. So
+/// every failure but the missing item is answered as `ExceptionMiddleware`
+/// answers a throw: `400` or `404`, `text/plain`, "Error processing request.".
 #[utoipa::path(
     delete,
     path = "/Videos/{itemId}/Subtitles/{index}",
@@ -137,7 +138,7 @@ async fn require_video(
     responses(
         (status = 204, description = "Subtitle deleted"),
         (status = 400, description = "No subtitle file at that index"),
-        (status = 404, description = "Item not found")
+        (status = 404, description = "Item not found, or the subtitle's folder is missing")
     ),
     tag = "ferrofin"
 )]

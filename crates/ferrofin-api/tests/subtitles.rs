@@ -421,14 +421,15 @@ impl SubtitleManager for CannedSubtitles {
     async fn get_remote_subtitles(&self, _id: &str) -> Result<SubtitleResponse, ServiceError> {
         Err(ServiceError::invalid_input("no providers"))
     }
-    /// The item's subtitle files are its streams 1 to 3; any other index is
-    /// the `ArgumentException` upstream's lookup throws.
+    /// The item's subtitle files are its streams 1 to 3; stream 4's folder is
+    /// missing (`DirectoryNotFoundException`); any other index is the
+    /// `ArgumentException` upstream's lookup throws.
     async fn delete_subtitles(&self, item_id: Uuid, index: i32) -> Result<(), ServiceError> {
         self.deleted.lock().unwrap().push((item_id, index));
-        if (1..=3).contains(&index) {
-            Ok(())
-        } else {
-            Err(ServiceError::invalid_input("no subtitle file at the index"))
+        match index {
+            1..=3 => Ok(()),
+            4 => Err(ServiceError::not_found("subtitle folder not found")),
+            _ => Err(ServiceError::invalid_input("no subtitle file at the index")),
         }
     }
     async fn get_supported_providers(
@@ -745,17 +746,20 @@ async fn delete_subtitle_awaits_the_items_refresh_before_204() {
 
 /// gl-846: an index with no subtitle file (none at all, or an embedded
 /// stream's) is the `ArgumentException` `DeleteSubtitles` throws, and a nil id
-/// the one `GetItemById` throws. `ExceptionMiddleware` answers both `400`,
-/// `text/plain`, "Error processing request.". A nil id never reaches the
-/// manager.
+/// the one `GetItemById` throws: `ExceptionMiddleware` answers both `400`. A
+/// nil id never reaches the manager. gl-1723: a subtitle whose folder is
+/// missing is the `DirectoryNotFoundException` `File.Delete` throws, a `404`.
+/// Each is `text/plain`, "Error processing request.".
 #[rstest::rstest]
-#[case::no_subtitle_file(ITEM_ID, 9, true)]
-#[case::nil_item_id(Uuid::nil(), 1, false)]
+#[case::no_subtitle_file(ITEM_ID, 9, true, StatusCode::BAD_REQUEST)]
+#[case::nil_item_id(Uuid::nil(), 1, false, StatusCode::BAD_REQUEST)]
+#[case::folder_missing(ITEM_ID, 4, true, StatusCode::NOT_FOUND)]
 #[tokio::test]
-async fn delete_subtitle_answers_upstreams_exception_400(
+async fn delete_subtitle_answers_upstreams_exception(
     #[case] item_id: Uuid,
     #[case] index: i32,
     #[case] reaches_the_manager: bool,
+    #[case] expected: StatusCode,
 ) {
     let deleted = Arc::new(Mutex::new(Vec::new()));
     let app = admin_state(Arc::new(CannedSubtitles {
@@ -768,7 +772,7 @@ async fn delete_subtitle_answers_upstreams_exception_400(
         &format!("/Videos/{}/Subtitles/{index}", item_id.simple()),
     )
     .await;
-    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(status, expected);
     assert_eq!(content_type.as_deref(), Some("text/plain"));
     assert_eq!(body, b"Error processing request.");
     assert_eq!(deleted.lock().unwrap().is_empty(), !reaches_the_manager);

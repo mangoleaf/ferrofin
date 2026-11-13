@@ -151,8 +151,13 @@ pub trait SubtitleManager: Send + Sync {
     ///
     /// # Errors
     ///
-    /// [`ServiceError::InvalidInput`] when no subtitle stream has that index
-    /// or it has no file (an embedded stream): upstream's `ArgumentException`.
+    /// - [`ServiceError::InvalidInput`] when no subtitle stream has that index
+    ///   or it has no file (an embedded stream): upstream's `ArgumentException`.
+    /// - [`ServiceError::NotFound`] when the file's folder is missing, a folder
+    ///   in its path is a file, or the path is relative (a URL): the
+    ///   `DirectoryNotFoundException` of `File.Delete`, before any refresh. A
+    ///   file already gone from a folder that exists is no error.
+    /// - [`ServiceError::Backend`] for any other failure to delete the file.
     async fn delete_subtitles(&self, item_id: Uuid, index: i32) -> Result<(), ServiceError>;
 
     /// Lists the subtitle providers that support the item.

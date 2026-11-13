@@ -3780,21 +3780,41 @@ pub const VERIFIED: &[Verified] = &[
                index, none or one with no or an empty path the 400; a row not marked \
                external is skipped too, which changes no answer, since neither server stores \
                a path on one, and keeps a stray path from deleting the media file; the file \
-               deleted inside the self-write bracket, a file already gone ignored as \
-               File.Delete does on Linux) → handlers.rs run_item_refresh (the awaited \
+               deleted inside the self-write bracket as File.Delete does on Linux: a file \
+               already gone ignored while its folder exists, else, and for ENOTDIR (a folder \
+               in the path is a file; read in dotnet/runtime's FileSystem.Unix DeleteFile \
+               and Interop.GetExceptionForIoErrno, not measured), the \
+               DirectoryNotFoundException 404 before any refresh; an http(s) row, which \
+               Path.GetFullPath resolves against the working directory (from /, \
+               http://h/a.srt → /http:/h/a.srt, a missing folder), is that 404 without \
+               touching the disk) → \
+               handlers.rs run_item_refresh (the awaited \
                item.RefreshMetadata, whose re-probe drops the stream and renumbers the rest; \
                queued instead for an item outside every library, as for the lyrics delete). \
                The parity sweep's request (the corpus movie's stream 0, its video) expects \
                the 400. Measured on 12.4: an embedded, a \
                missing and a video stream's index, a nil id, an unknown id and an external \
-               sidecar's index",
-        date: "2026-11-11",
+               sidecar's index; and that sidecar's row pointed at a missing file (204), a \
+               missing folder (404, row kept) and an http URL (404, row kept)",
+        date: "2026-11-12",
         divergences: &[
             "A hex (0x, #, &h) or padded index is a 400; upstream's route binder reads it as \
          a number. Fix path: gl-1664.",
             "The 400 for an itemId or index the route binder cannot convert (upstream's \
          ValidationProblemDetails), and the 401 and 403 bodies, are Ferrofin's error shape, \
          not upstream's. Fix path: gl-666.",
+            "A row an adopted database stores with a %AppDataPath% or %MetadataPath% token (a \
+         subtitle Jellyfin saved in its metadata folder) is read unexpanded, so it is the \
+         folder-missing 404 below, where upstream expands it (MediaStreamRepository \
+         RestorePath) and deletes the file. Fix path: gl-1063.",
+            "Every other relative path is the folder-missing 404, without touching the disk, as \
+         the item delete refuses one (item_deletion.rs delete_item_path). Upstream \
+         resolves one against its working directory, so a relative row whose folder exists \
+         there answers 204 and deletes the file it names beside the server process (gl-1723). \
+         A Jellyfin bug, deliberately not ported.",
+            "A file already gone from a read-only mount (EROFS) is a 500; File.Delete checks \
+         that the file is absent and answers it as any missing file, 204 and the refresh. Fix \
+         path: gl-1724.",
         ],
         refs: &["access-filtering"],
     },
