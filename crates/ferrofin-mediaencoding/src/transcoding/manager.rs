@@ -136,7 +136,7 @@ fn transcoding_info(
         height: state.output_height(),
         audio_channels: state.output_audio_channels,
         hardware_acceleration_type: Some(hardware_acceleration_type),
-        transcode_reasons: Vec::new(),
+        transcode_reasons: ferrofin_model::session::transcode_reason_list(state.transcode_reasons),
     }
 }
 
@@ -314,8 +314,8 @@ struct RunningJob {
     output_dir: PathBuf,
     /// The `.m3u8`/output path whose stem selects the files to delete.
     playlist_path: PathBuf,
-    /// The segment file extension (e.g. `.ts`), for diagnostics/index scans.
-    #[allow(dead_code)]
+    /// The segment file extension (e.g. `.ts`), which names the segment file
+    /// `wait_for_segment` waits for.
     segment_extension: String,
     /// The first segment this job's ffmpeg writes: its `-start_number`, or the
     /// hls muxer's default 0. Segments below it, or past a gap in its run, are
@@ -2639,6 +2639,7 @@ mod start_ffmpeg_tests {
             is_input_video: true,
             subtitle_delivery_method: ferrofin_model::dlna::SubtitleDeliveryMethod::Encode,
             trimmed_subtitle_path: None,
+            transcode_reasons: ferrofin_model::session::TranscodeReasons::empty(),
             run_time_ticks: None,
             transcoding_type: TranscodingJobType::Hls,
             supported_video_codecs: Vec::new(),
@@ -2654,6 +2655,27 @@ mod start_ffmpeg_tests {
 
     fn manager() -> TranscodeManagerImpl<NoopSessionReporter> {
         TranscodeManagerImpl::new(NoopSessionReporter)
+    }
+
+    /// `ReportTranscodingProgress` publishes `TranscodeReasons =
+    /// state.TranscodeReasons`, as the JSON list in ascending bit order.
+    #[test]
+    fn the_session_info_reports_the_jobs_transcode_reasons() {
+        use ferrofin_model::session::{TranscodeReason, TranscodeReasons};
+        let mut st = state(Path::new("/transcodes/out.m3u8"), None);
+        st.transcode_reasons =
+            TranscodeReasons::AUDIO_CODEC_NOT_SUPPORTED | TranscodeReasons::CONTAINER_NOT_SUPPORTED;
+        let info = super::transcoding_info(
+            &st,
+            ferrofin_model::entities::HardwareAccelerationType::none,
+        );
+        assert_eq!(
+            info.transcode_reasons,
+            [
+                TranscodeReason::ContainerNotSupported,
+                TranscodeReason::AudioCodecNotSupported
+            ]
+        );
     }
 
     #[test]
@@ -3876,6 +3898,7 @@ pub(super) mod throttle_tests {
             is_input_video: true,
             subtitle_delivery_method: ferrofin_model::dlna::SubtitleDeliveryMethod::Encode,
             trimmed_subtitle_path: None,
+            transcode_reasons: ferrofin_model::session::TranscodeReasons::empty(),
             run_time_ticks: Some(600 * TICKS_PER_SECOND),
             transcoding_type: TranscodingJobType::Hls,
             supported_video_codecs: Vec::new(),

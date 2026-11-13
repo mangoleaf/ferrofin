@@ -4,7 +4,7 @@
 //! `ScheduledTaskWorker` + the `ITaskTrigger` implementations
 //! (`DailyTrigger`/`WeeklyTrigger`/`IntervalTrigger`/`StartupTrigger`). The
 //! registry enumerates tasks, runs one now (foreground or queued to a spawned
-//! tokio task), cancels a queued run by aborting its tokio task, tracks live
+//! tokio task), cancels a running one through its token, tracks live
 //! progress, and — once [`FerrofinTaskManager::start_scheduler`] is called —
 //! fires each task's configured triggers on its own. Trigger overrides set via
 //! [`FerrofinTaskManager::set_triggers`] persist to a JSON file (the C# stores a
@@ -65,6 +65,16 @@ const STARTUP_TRIGGER_DELAY: Duration = Duration::from_secs(3);
 /// `ScheduledTaskWorker.Dispose`.
 const SHUTDOWN_RUN_WAIT: Duration = Duration::from_secs(2);
 
+/// How long a run asked to stop (Stop, its max runtime) has to return on its
+/// own before its body is dropped where it stands. Upstream has no such
+/// limit: it waits for the body however long it takes, which a body that
+/// never checks its token turns into running to its end. The value is
+/// upstream's shutdown wait ([`SHUTDOWN_RUN_WAIT`]); whether it becomes a
+/// setting is the owner's call (gl-1710). Fix path for the limit itself:
+/// every body checks [`TaskProgress::stop_requested`] between its items
+/// (gl-1709).
+pub(crate) const STOP_WAIT: Duration = Duration::from_secs(2);
+
 /// How long after startup an interval task that has **never completed** first
 /// becomes due — upstream's `IntervalTrigger.Start` arms `now.AddHours(1)` when
 /// `lastResult is null`, rather than waiting a whole interval.
@@ -110,6 +120,9 @@ pub struct TaskProgress {
     reported: Arc<AtomicBool>,
     /// Set by [`stopped`](Self::stopped).
     stopped: Arc<AtomicBool>,
+    /// The run's cancellation token (upstream's `CurrentCancellationTokenSource`),
+    /// cancelled by Stop, the run's max runtime and shutdown.
+    cancel: crate::ScanCancel,
     /// Why the run started (`api`, `schedule`, `startup`); empty for a
     /// test's foreground `FerrofinTaskManager::run_now`.
     trigger: &'static str,
@@ -138,6 +151,27 @@ impl TaskProgress {
 
     fn was_stopped(&self) -> bool {
         self.stopped.load(Ordering::Relaxed)
+    }
+
+    /// The run's cancellation token, for the work a body hands it to (the
+    /// chapter-image extractor, the subtitle downloader): upstream's
+    /// `CancellationToken` argument of `ExecuteAsync`.
+    #[must_use]
+    pub fn cancel_token(&self) -> &crate::ScanCancel {
+        &self.cancel
+    }
+
+    /// Whether the run was asked to stop (Stop, its max runtime, shutdown).
+    /// Once it says so the run counts as [`stopped`](Self::stopped), so a
+    /// body that then returns `Ok` is recorded `Cancelled`: upstream's
+    /// `cancellationToken.ThrowIfCancellationRequested()`.
+    #[must_use]
+    pub fn stop_requested(&self) -> bool {
+        let requested = self.cancel.is_cancelled();
+        if requested {
+            self.stopped();
+        }
+        requested
     }
 
     /// Reports the task's completion percentage, capped at 100 with no lower
@@ -280,12 +314,13 @@ struct Registration {
     /// task's [`default_triggers`](ScheduledTask::default_triggers). `None`
     /// until a client configures them.
     triggers_override: Option<Vec<TaskTriggerInfo>>,
-    /// The running task's live progress handle (meaningful while `Running`).
+    /// The current run's live progress handle and token (meaningful while
+    /// not `Idle`).
     progress: TaskProgress,
-    /// The queued (spawned) run, so `cancel` can stop it and shutdown can
-    /// wait for it to stop.
+    /// The queued (spawned) run, so shutdown can abort it and wait for it to
+    /// stop.
     run: Option<tokio::task::JoinHandle<()>>,
-    /// When the current run was claimed (meaningful while `Running`).
+    /// When the current run was claimed (meaningful while not `Idle`).
     started_at: Option<DateTime<Utc>>,
     /// The running invocation's own time limit: the `MaxRuntimeTicks` of the
     /// trigger that started it (`TaskOptions.MaxRuntimeTicks`), `None` for a
@@ -319,9 +354,23 @@ struct Registration {
 impl Registration {
     /// Whether `run` (the progress handle a run got from `claim`) is this
     /// task's live run: `claim` gives each run a fresh handle, so a run that
-    /// was stopped, or replaced since, no longer matches.
+    /// was recorded already (shut down), or replaced since, no longer
+    /// matches. A run asked to stop is live until it returns.
     fn is_live(&self, run: &TaskProgress) -> bool {
-        self.state == TaskState::Running && Arc::ptr_eq(&self.progress.stopped, &run.stopped)
+        self.state != TaskState::Idle && Arc::ptr_eq(&self.progress.stopped, &run.stopped)
+    }
+
+    /// `ScheduledTaskWorker.CancelIfRunning`: asks a `Running` run to stop by
+    /// cancelling its token. The task shows
+    /// [`Cancelling`](TaskState::Cancelling) until the run returns and records
+    /// its own result. Returns whether a stop was requested.
+    fn request_stop(&mut self) -> bool {
+        if self.state != TaskState::Running {
+            return false;
+        }
+        self.progress.cancel.cancel();
+        self.state = TaskState::Cancelling;
+        true
     }
 
     /// Whether this registration's effective triggers include a
@@ -362,7 +411,7 @@ impl Registration {
             current_progress_percentage: self
                 .progress
                 .reported()
-                .filter(|_| self.state == TaskState::Running),
+                .filter(|_| self.state != TaskState::Idle),
             id: Some(self.id.clone()),
             last_execution_result: self.last_result.clone(),
             triggers: self.effective_triggers(),
@@ -971,9 +1020,10 @@ impl FerrofinTaskManager {
     /// Records the outcome of `run` and returns the task to
     /// [`Idle`](TaskState::Idle), if `run` is still the task's live run.
     ///
-    /// A stopped run can still get here: an abort cannot stop a run that does
-    /// not yield again. [`stop_run`](Self::stop_run) has recorded it already,
-    /// and a newer run may own the task by now, which this result must not end.
+    /// A run asked to stop records its own result here, as upstream's
+    /// `ExecuteInternal` does once `ExecuteAsync` returns. A run the shutdown
+    /// aborted can still get here (an abort cannot stop a run that does not
+    /// yield again): [`stop_run`](Self::stop_run) has recorded it already.
     /// Like `stop_run`, the state changes under the lock before the result is
     /// published and saved, so a run is ended once.
     fn record_result(&self, key: &str, run: &TaskProgress, result: &TaskResult) {
@@ -1062,8 +1112,8 @@ impl FerrofinTaskManager {
     pub async fn run_now(&self, key: &str) -> Result<(), ServiceError> {
         let (task, progress) = self.claim(key, None)?;
         let start = Utc::now();
-        let outcome = execute_contained(task.as_ref(), &progress).await;
-        self.finish(key, &task, start, &outcome, &progress);
+        let (outcome, panicked_at) = execute_contained(task.as_ref(), &progress).await;
+        self.finish(key, &task, start, &outcome, panicked_at, &progress);
         outcome
     }
 
@@ -1120,7 +1170,7 @@ impl FerrofinTaskManager {
             async move {
                 let started = std::time::Instant::now();
                 tracing::info!("scheduled task started");
-                let outcome = execute_contained(task.as_ref(), &progress).await;
+                let (outcome, panicked_at) = execute_contained(task.as_ref(), &progress).await;
                 let elapsed_ms = started.elapsed().as_millis();
                 let result = match &outcome {
                     Ok(()) if progress.was_stopped() => "cancelled",
@@ -1135,7 +1185,7 @@ impl FerrofinTaskManager {
                         tracing::error!(elapsed_ms, outcome = result, error = %e, "scheduled task failed");
                     }
                 }
-                this.finish(&key_owned, &task, start, &outcome, &progress);
+                this.finish(&key_owned, &task, start, &outcome, panicked_at, &progress);
             }
             .instrument(span),
         ));
@@ -1144,10 +1194,10 @@ impl FerrofinTaskManager {
     }
 
     /// Keeps `handle` as the task's run handle while `run` is still its live
-    /// run. Otherwise the run either finished (aborting it is a no-op) or was
-    /// stopped (cancelled, or the registry shut down) between `claim` and its
-    /// handle being stored, and a newer run may own the task: the handle is
-    /// aborted so the run cannot outlive that.
+    /// run. Otherwise the run either finished (aborting it is a no-op) or the
+    /// registry shut down between `claim` and its handle being stored, and a
+    /// newer run may own the task: the handle is aborted so the run cannot
+    /// outlive that.
     fn track_run(&self, key: &str, run: &TaskProgress, handle: tokio::task::JoinHandle<()>) {
         match lock(&self.tasks).get_mut(key) {
             Some(reg) if reg.is_live(run) => reg.run = Some(handle),
@@ -1167,7 +1217,9 @@ impl FerrofinTaskManager {
         let reg = guard
             .get_mut(key)
             .ok_or_else(|| ServiceError::not_found(format!("scheduled task {key}")))?;
-        if reg.state == TaskState::Running {
+        // A run that is stopping still holds the task (upstream's
+        // `CurrentCancellationTokenSource` is set until it returns).
+        if reg.state != TaskState::Idle {
             return Err(ServiceError::invalid_input(format!(
                 "scheduled task {key} is already running"
             )));
@@ -1192,19 +1244,24 @@ impl FerrofinTaskManager {
     /// Records a finished run's outcome and returns the task to
     /// [`Idle`](TaskState::Idle), unless the run was stopped already (see
     /// [`record_result`](Self::record_result)). `start` is when the run was
-    /// claimed.
+    /// claimed; `panicked_at` is where a body that panicked did.
     fn finish(
         &self,
         key: &str,
         task: &Arc<dyn ScheduledTask>,
         start: chrono::DateTime<Utc>,
         outcome: &Result<(), ServiceError>,
+        panicked_at: Option<String>,
         progress: &TaskProgress,
     ) {
-        let (status, error_message) = match outcome {
-            Ok(()) if progress.was_stopped() => (TaskCompletionStatus::Cancelled, None),
-            Ok(()) => (TaskCompletionStatus::Completed, None),
-            Err(e) => (TaskCompletionStatus::Failed, Some(e.to_string())),
+        let (status, error_message, long_error_message) = match outcome {
+            Ok(()) if progress.was_stopped() => (TaskCompletionStatus::Cancelled, None, None),
+            Ok(()) => (TaskCompletionStatus::Completed, None, None),
+            Err(e) => (
+                TaskCompletionStatus::Failed,
+                Some(e.to_string()),
+                panicked_at.or_else(|| cause_chain(e)),
+            ),
         };
         self.record_result(
             key,
@@ -1218,14 +1275,20 @@ impl FerrofinTaskManager {
                 key: Some(key.to_string()),
                 id: Some(self.id_for_key(key)),
                 error_message,
-                long_error_message: None,
+                long_error_message,
             },
         );
     }
 
-    /// Cancels a task: a queued (spawned) run is aborted and recorded as
-    /// [`Cancelled`](TaskCompletionStatus::Cancelled); an idle task is left
-    /// idle.
+    /// Cancels a task: `ScheduledTaskWorker.Cancel`. A running run's token is
+    /// cancelled and the task shows [`Cancelling`](TaskState::Cancelling) until
+    /// the run returns, then records what it ended with:
+    /// [`Cancelled`](TaskCompletionStatus::Cancelled) when its body stopped
+    /// for the request ([`TaskProgress::stop_requested`]), or was dropped
+    /// `STOP_WAIT` after it, otherwise its own outcome. Requests queued behind
+    /// it start once it has ended. An idle or already stopping task is left
+    /// as it is, where upstream's `Cancel` throws, which its Stop route
+    /// answers with a 500.
     ///
     /// The manual `Cancel`/`StopTask` path.
     ///
@@ -1233,61 +1296,92 @@ impl FerrofinTaskManager {
     ///
     /// Returns [`ServiceError::NotFound`] if no task has that key.
     pub fn cancel(&self, key: &str) -> Result<(), ServiceError> {
-        self.stop_run(key, TaskCompletionStatus::Cancelled)
+        let mut guard = lock(&self.tasks);
+        let reg = guard
+            .get_mut(key)
+            .ok_or_else(|| ServiceError::not_found(format!("scheduled task {key}")))?;
+        if reg.request_stop() {
+            tracing::info!(task = key, "cancelling scheduled task");
+        }
+        Ok(())
     }
 
     /// Ends the registry with its host: port of `TaskManager.Dispose`, which
     /// disposes each `ScheduledTaskWorker`. From here on no run starts and the
-    /// scheduler fires nothing (`DisposeTriggers`); each running run is
-    /// cancelled, waited on for at most `SHUTDOWN_RUN_WAIT`, and recorded as
-    /// [`Aborted`](TaskCompletionStatus::Aborted), which jellyfin-web shows as
-    /// "Aborted by server shutdown".
+    /// scheduler fires nothing (`DisposeTriggers`); each `Running` run is
+    /// aborted, its token cancelled for the work the abort cannot reach (the
+    /// blocking pool), waited on for at most `SHUTDOWN_RUN_WAIT`, and recorded
+    /// as [`Aborted`](TaskCompletionStatus::Aborted), which jellyfin-web shows
+    /// as "Aborted by server shutdown" (upstream's `wasRunning`). A run already
+    /// `Cancelling` is only waited on, so it records its own result, as
+    /// upstream's does when it returns within the wait.
     ///
     /// Requests queued behind a busy task are dropped, where upstream's
     /// completion path would start them on the workers it is disposing. A run
     /// that finished on its own while being waited on keeps its own result
     /// (upstream records Aborted over it).
     pub async fn shutdown(&self) {
-        let running: Vec<(String, Option<tokio::task::JoinHandle<()>>)> = {
+        type Stopping = (
+            String,
+            Option<tokio::task::JoinHandle<()>>,
+            crate::ScanCancel,
+            bool,
+        );
+        let running: Vec<Stopping> = {
             let mut guard = lock(&self.tasks);
             self.shut_down.store(true, Ordering::Release);
             guard
                 .iter_mut()
-                .filter(|(_, reg)| reg.state == TaskState::Running)
-                .map(|(key, reg)| (key.clone(), reg.run.take()))
+                .filter(|(_, reg)| reg.state != TaskState::Idle)
+                .map(|(key, reg)| {
+                    let was_running = reg.state == TaskState::Running;
+                    (
+                        key.clone(),
+                        reg.run.take(),
+                        reg.progress.cancel.clone(),
+                        was_running,
+                    )
+                })
                 .collect()
         };
         // `claim` refusing is the guarantee; clearing the queue (and the
         // sweep's early return) keeps those refusals out of the log.
         lock(&self.busy_queue).clear();
         // Every run is cancelled before any is waited on, so the runs stop
-        // together rather than one wait after another.
-        for (key, run) in &running {
+        // together rather than one wait after another. The token goes after
+        // the abort, so a body does not end itself as Cancelled first.
+        for (key, run, cancel, was_running) in &running {
+            if !was_running {
+                continue;
+            }
             tracing::info!(task = key, "cancelling scheduled task for shutdown");
             if let Some(run) = run {
                 run.abort();
             }
+            cancel.cancel();
         }
-        for (key, run) in running {
+        for (key, run, _, was_running) in running {
             // A `run_now` run belongs to its caller: there is nothing to wait on.
             if let Some(run) = run
                 && tokio::time::timeout(SHUTDOWN_RUN_WAIT, run).await.is_err()
             {
                 tracing::warn!(task = key, "timed out waiting for scheduled task to stop");
             }
-            let _ = self.stop_run(&key, TaskCompletionStatus::Aborted);
+            if was_running {
+                let _ = self.stop_run(&key, TaskCompletionStatus::Aborted);
+            }
         }
     }
 
-    /// Aborts a running task's spawned run, recording `status`, and returns it
-    /// to [`Idle`](TaskState::Idle).
+    /// Aborts a task's spawned run, recording `status`, and returns it to
+    /// [`Idle`](TaskState::Idle): the shutdown's end of a run.
     fn stop_run(&self, key: &str, status: TaskCompletionStatus) -> Result<(), ServiceError> {
         let localization = self.localizer();
         let mut guard = lock(&self.tasks);
         let reg = guard
             .get_mut(key)
             .ok_or_else(|| ServiceError::not_found(format!("scheduled task {key}")))?;
-        if reg.state != TaskState::Running {
+        if reg.state == TaskState::Idle {
             return Ok(());
         }
         if let Some(run) = reg.run.take() {
@@ -1425,9 +1519,12 @@ impl FerrofinTaskManager {
             }
             for (key, reg) in guard.iter_mut() {
                 let triggers = reg.effective_triggers();
+                // Upstream's `CancelAfter(MaxRuntimeTicks)`: the run's token,
+                // under the lock that found it overrun, so it is that run's.
                 if reg.state == TaskState::Running
                     && let (Some(started), Some(max_ticks)) = (reg.started_at, reg.run_max_ticks)
                     && now - started >= ticks_to_chrono(max_ticks)
+                    && reg.request_stop()
                 {
                     overrun.push(key.clone());
                 }
@@ -1451,15 +1548,14 @@ impl FerrofinTaskManager {
                 }
             }
         }
-        // Upstream's `CancelAfter(MaxRuntimeTicks)` surfaces in the run as an
-        // `OperationCanceledException`, recorded as Cancelled; Aborted is what
-        // a shutdown records ([`Self::shutdown`]).
+        // The run records Cancelled when it stops for it, as upstream's
+        // `OperationCanceledException` does; Aborted is what a shutdown
+        // records ([`Self::shutdown`]).
         for key in overrun {
             tracing::warn!(
                 task = key,
                 "scheduled task exceeded max runtime; cancelling"
             );
-            let _ = self.stop_run(&key, TaskCompletionStatus::Cancelled);
         }
         for (key, max_ticks) in due {
             tracing::info!(task = key, "trigger fired; queueing scheduled task");
@@ -1476,20 +1572,59 @@ impl FerrofinTaskManager {
 /// throws as `Failed`, so a body that panics ends like one that returns an
 /// error: [`finish`](FerrofinTaskManager::finish) records the failure, returns
 /// the task to [`Idle`](TaskState::Idle) and starts its queued triggers. The
-/// catch sits inside the run, so stopping it still aborts the spawned task.
-/// The panic hook has already logged the panic itself.
+/// catch sits inside the run, so the shutdown's abort still ends the spawned
+/// task. The panic hook has already logged the panic itself, and recorded
+/// where it happened ([`take_location`](ferrofin_util::panic::take_location)),
+/// which is returned beside a panic's error as `panicked at <file:line:column>`.
+///
+/// A body still running `STOP_WAIT` after its stop was requested is dropped
+/// where it stands and counts as stopped.
 async fn execute_contained(
     task: &dyn ScheduledTask,
     progress: &TaskProgress,
-) -> Result<(), ServiceError> {
-    futures_util::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(task.execute(progress)))
-        .await
-        .unwrap_or_else(|panic| {
+) -> (Result<(), ServiceError>, Option<String>) {
+    let body =
+        futures_util::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(task.execute(progress)));
+    let overdue = async {
+        progress.cancel.cancelled().await;
+        tokio::time::sleep(STOP_WAIT).await;
+    };
+    let outcome = tokio::select! {
+        biased;
+        outcome = body => outcome,
+        () = overdue => {
+            tracing::warn!(
+                wait_ms = STOP_WAIT.as_millis(),
+                "scheduled task did not stop when asked; dropping it"
+            );
+            progress.stopped();
+            Ok(Ok(()))
+        }
+    };
+    match outcome {
+        Ok(outcome) => (outcome, None),
+        Err(panic) => (
             Err(ServiceError::backend(format!(
                 "scheduled task panicked: {}",
                 ferrofin_util::panic::message(panic.as_ref())
-            )))
-        })
+            ))),
+            ferrofin_util::panic::take_location().map(|at| format!("panicked at {at}")),
+        ),
+    }
+}
+
+/// A failed run's `LongErrorMessage`, which upstream fills with the
+/// exception's stack trace (`ScheduledTaskWorker.OnTaskCompleted`). A Rust
+/// error carries no stack trace but its causes, so this is the `source()`
+/// chain below `error`, one cause per line, or `None` when it has none. Each
+/// URL is cut to its host (`LOGGING.md` rule 5): a cause is text Ferrofin did
+/// not write, and a request URL can carry a key.
+fn cause_chain(error: &ServiceError) -> Option<String> {
+    let causes: Vec<String> =
+        std::iter::successors(std::error::Error::source(error), |cause| cause.source())
+            .map(|cause| ferrofin_util::source_url::redact_urls_in(&cause.to_string()).into_owned())
+            .collect();
+    (!causes.is_empty()).then(|| causes.join("\n"))
 }
 
 /// Converts trigger ticks (100 ns) to a chrono duration.
@@ -1765,15 +1900,23 @@ impl ScheduledTask for RefreshLibraryTask {
         progress.report(0.0);
         let sink = progress.clone();
         let trigger = ferrofin_traits::library::ScanTrigger::from_task_trigger(progress.trigger());
-        let finished = self
-            .library
-            .run_library_scan(trigger, Some(Arc::new(move |percent| sink.report(percent))))
-            .await?;
-        // Stopped by the library manager's own shutdown or refused (already
-        // shut down): cancelled, not completed. A host shutdown never gets
-        // here: the task registry's `shutdown` aborts this run first and
-        // records it Aborted.
-        if !finished {
+        // A stop withdraws the run's wait, and a scan nobody else waits for
+        // stops at its next item. The run ends before that item does, which
+        // upstream's waits for (fix path: gl-1709); the scan queue starts the
+        // next scan after it.
+        let finished = progress
+            .cancel_token()
+            .unless_cancelled(
+                self.library
+                    .run_library_scan(trigger, Some(Arc::new(move |percent| sink.report(percent)))),
+            )
+            .await
+            .transpose()?;
+        // Stopped by the task's own stop, by the library manager's own
+        // shutdown or refused (already shut down): cancelled, not completed.
+        // A host shutdown never gets here: the task registry's `shutdown`
+        // aborts this run first and records it Aborted.
+        if finished != Some(true) {
             progress.stopped();
         }
         Ok(())
@@ -1837,6 +1980,13 @@ impl ferrofin_traits::tasks::TaskManager for FerrofinTaskManager {
 
     async fn cancel_task(&self, task_id: &str) -> Result<(), ServiceError> {
         self.cancel(&self.resolve_id(task_id)?)
+    }
+
+    async fn cancel_if_running_and_queue(&self, task_id: &str) -> Result<(), ServiceError> {
+        let key = self.resolve_id(task_id)?;
+        self.cancel(&key)?;
+        // Upstream's `new TaskOptions()`: no max runtime.
+        self.queue_scheduled(&key, "api", None)
     }
 
     async fn update_triggers(
@@ -2593,7 +2743,8 @@ mod tests {
         .expect("test timed out");
     }
 
-    /// A task that stays running until its gate is released.
+    /// A task that stays running until its gate is released or its stop is
+    /// requested.
     struct GatedTask {
         gate: Arc<tokio::sync::Notify>,
     }
@@ -2615,7 +2766,12 @@ mod tests {
         }
         async fn execute(&self, progress: &TaskProgress) -> Result<(), ServiceError> {
             progress.report(25.0);
-            self.gate.notified().await;
+            tokio::select! {
+                () = self.gate.notified() => {}
+                () = progress.cancel_token().cancelled() => {
+                    assert!(progress.stop_requested());
+                }
+            }
             Ok(())
         }
     }
@@ -2710,8 +2866,9 @@ mod tests {
     }
 
     /// Cancelling the running task drains the queue too (`OnTaskCompleted`
-    /// follows every outcome), and an idle task starts directly.
-    #[tokio::test]
+    /// follows every outcome), once the cancelled run has ended; an idle task
+    /// starts directly.
+    #[tokio::test(start_paused = true)]
     async fn cancelling_a_busy_task_starts_its_queued_request() {
         let (mgr, runs, gate) = counted_gated();
         mgr.queue_scheduled("counted-gated", "schedule", None)
@@ -2720,6 +2877,11 @@ mod tests {
         mgr.queue_scheduled("counted-gated", "schedule", None)
             .expect("queued");
         mgr.cancel("counted-gated").expect("cancel");
+        assert_eq!(
+            mgr.get("counted-gated").unwrap().state,
+            TaskState::Cancelling
+        );
+        assert_eq!(runs.load(Ordering::SeqCst), 1, "nothing starts beside it");
         wait_for_runs(&runs, 2).await;
         assert_eq!(mgr.get("counted-gated").unwrap().state, TaskState::Running);
         gate.notify_one();
@@ -2842,31 +3004,88 @@ mod tests {
         assert_eq!(attrs.get("outcome").map(String::as_str), Some("completed"));
     }
 
+    /// `ScheduledTaskWorker.Cancel` only asks: the task reads `Cancelling`
+    /// (its progress still shown, no second run beside it) until the run
+    /// returns, which records `Cancelled` for a body that stopped for it.
     #[tokio::test]
-    async fn cancel_aborts_a_queued_run_and_records_cancelled() {
+    async fn a_stop_shows_cancelling_until_the_run_returns_cancelled() {
         let mgr = FerrofinTaskManager::new();
-        let gate = Arc::new(tokio::sync::Notify::new());
-        mgr.register(Arc::new(GatedTask { gate }));
-
+        mgr.register(Arc::new(GatedTask {
+            gate: Arc::new(tokio::sync::Notify::new()),
+        }));
         mgr.queue("gated").expect("queued");
-        assert_eq!(mgr.get("gated").expect("info").state, TaskState::Running);
+        until_progress(&mgr, "gated", 25.0).await;
 
         mgr.cancel("gated").expect("cancel");
-        let info = mgr.get("gated").expect("info");
-        assert_eq!(info.state, TaskState::Idle);
-        let result = info.last_execution_result.expect("result");
-        assert_eq!(result.status, TaskCompletionStatus::Cancelled);
+        let id = mgr.id_for_key("gated");
+        let info = ferrofin_traits::tasks::TaskManager::get_task(&mgr, &id)
+            .await
+            .expect("read")
+            .expect("task");
+        assert_eq!(info.state, TaskState::Cancelling);
+        assert_eq!(info.current_progress_percentage, Some(25.0));
+        assert!(info.last_execution_result.is_none(), "nothing recorded yet");
+        assert!(
+            matches!(mgr.queue("gated"), Err(ServiceError::InvalidInput(_))),
+            "no run starts beside the stopping one"
+        );
+        mgr.cancel("gated").expect("a second stop is a no-op");
 
+        let result = idle_result(&mgr, "gated").await;
+        assert_eq!(result.status, TaskCompletionStatus::Cancelled);
+        assert_eq!(
+            mgr.get("gated").expect("info").current_progress_percentage,
+            None
+        );
         // The task can be started again after cancellation.
         mgr.queue("gated").expect("requeued");
         assert_eq!(mgr.get("gated").expect("info").state, TaskState::Running);
+        mgr.cancel("gated").expect("cancel");
+    }
+
+    /// A body that never checks its token records what it ended with: a run
+    /// that returns while `Cancelling` is `Completed`, as upstream records an
+    /// `ExecuteAsync` that returned; one still running `STOP_WAIT` after the
+    /// stop is dropped and recorded `Cancelled`, its future gone.
+    #[tokio::test(start_paused = true)]
+    async fn a_body_that_ignores_its_stop_ends_on_its_own_or_is_dropped() {
+        let (mgr, runs, gate) = counted_gated();
+        mgr.queue("counted-gated").expect("queued");
+        wait_for_runs(&runs, 1).await;
+        mgr.cancel("counted-gated").expect("cancel");
+        gate.notify_one();
+        let result = idle_result(&mgr, "counted-gated").await;
+        assert_eq!(result.status, TaskCompletionStatus::Completed);
+
+        mgr.queue("counted-gated").expect("queued");
+        wait_for_runs(&runs, 2).await;
+        let stopped = tokio::time::Instant::now();
+        mgr.cancel("counted-gated").expect("cancel");
+        let result = idle_result(&mgr, "counted-gated").await;
+        assert_eq!(result.status, TaskCompletionStatus::Cancelled);
+        assert!(stopped.elapsed() >= super::STOP_WAIT, "it had its wait");
+        // The dropped body consumed no permit: the next one is left for a run.
+        gate.notify_one();
+        mgr.queue("counted-gated").expect("queued");
+        wait_for_runs(&runs, 3).await;
+        let result = idle_result(&mgr, "counted-gated").await;
+        assert_eq!(result.status, TaskCompletionStatus::Completed);
+    }
+
+    /// Waits until `key`'s run has reported `percent`.
+    async fn until_progress(mgr: &FerrofinTaskManager, key: &str, percent: f64) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while mgr.get(key).expect("info").current_progress_percentage != Some(percent) {
+            assert!(std::time::Instant::now() < deadline, "progress never seen");
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
     }
 
     /// A task whose first run is cancelled and started again, as
     /// `/Library/Refresh` does (`CancelIfRunningAndQueue`), after the body's
     /// last await: a re-send landing while the run records its result. The
-    /// abort cannot stop a run that does not yield again, so it still
-    /// finishes. Later runs wait for `gate`.
+    /// run never checks its token, so it still finishes. Later runs wait for
+    /// `gate`.
     struct ReplacedAtItsEnd {
         mgr: std::sync::OnceLock<FerrofinTaskManager>,
         runs: Arc<AtomicU32>,
@@ -2891,8 +3110,8 @@ mod tests {
         async fn execute(&self, _progress: &TaskProgress) -> Result<(), ServiceError> {
             if self.runs.fetch_add(1, Ordering::SeqCst) == 0 {
                 let mgr = self.mgr.get().expect("manager");
-                mgr.cancel("replaced")?;
-                mgr.queue("replaced")?;
+                let id = mgr.id_for_key("replaced");
+                ferrofin_traits::tasks::TaskManager::cancel_if_running_and_queue(mgr, &id).await?;
             } else {
                 self.gate.notified().await;
             }
@@ -2900,11 +3119,11 @@ mod tests {
         }
     }
 
-    /// gl-1025: the result of a run that was stopped but still finished must
-    /// not end the run that replaced it. It did, so the task read Idle while
-    /// the replacement ran, and a third run could start beside it.
+    /// gl-1025, and upstream's `CancelIfRunningAndQueue`: a run stopped as it
+    /// ends records its own result, once, and the queued replacement starts
+    /// only after it, so no run ever overlaps another.
     #[tokio::test]
-    async fn a_stopped_run_that_still_finishes_does_not_end_its_replacement() {
+    async fn a_stopped_run_that_still_finishes_is_replaced_after_it_ends() {
         let mgr = FerrofinTaskManager::new();
         let runs = Arc::new(AtomicU32::new(0));
         let gate = Arc::new(tokio::sync::Notify::new());
@@ -2932,26 +3151,26 @@ mod tests {
         wait_for_runs(&runs, 2).await;
         let info = mgr.get("replaced").expect("info");
         assert_eq!(info.state, TaskState::Running, "the replacement runs");
+        // It returned before it saw its token: upstream's `Completed`.
         assert_eq!(
             info.last_execution_result.expect("result").status,
-            TaskCompletionStatus::Cancelled,
-            "the stop's result stands"
+            TaskCompletionStatus::Completed,
+            "the first run's result stands"
         );
         assert!(
             matches!(mgr.queue("replaced"), Err(ServiceError::InvalidInput(_))),
             "no run starts beside the replacement"
         );
-        // The stopped run's finish neither saves nor announces a result.
         assert_eq!(
             super::lock(&mgr.stored_results)["replaced"].status,
-            TaskCompletionStatus::Cancelled
+            TaskCompletionStatus::Completed
         );
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         let mut ended: Vec<String> = Vec::new();
         while ended.is_empty() {
             assert!(
                 std::time::Instant::now() < deadline,
-                "the stop is announced"
+                "the first run's end is announced"
             );
             tokio::time::sleep(std::time::Duration::from_millis(5)).await;
             ended.extend(rx.try_iter());
@@ -2959,9 +3178,13 @@ mod tests {
         // Long enough for a second publish, spawned before the first was read.
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         ended.extend(rx.try_iter());
-        assert_eq!(ended.len(), 1, "one TaskCompleted, the stop's: {ended:?}");
+        assert_eq!(
+            ended.len(),
+            1,
+            "one TaskCompleted, the first run's: {ended:?}"
+        );
         let ended: serde_json::Value = serde_json::from_str(&ended[0]).expect("payload");
-        assert_eq!(ended["Status"], "Cancelled");
+        assert_eq!(ended["Status"], "Completed");
 
         gate.notify_one();
         let result = idle_result(&mgr, "replaced").await;
@@ -2970,8 +3193,8 @@ mod tests {
     }
 
     /// gl-1025: the handle of a run that ended before it was stored must not
-    /// take the place of the run that replaced it, which `cancel` must still
-    /// stop.
+    /// take the place of the run that replaced it, which the shutdown must
+    /// still stop.
     #[tokio::test]
     async fn a_late_run_handle_does_not_replace_the_live_runs() {
         let mgr = FerrofinTaskManager::new();
@@ -2987,8 +3210,8 @@ mod tests {
             });
             (handle, rx)
         };
-        let (_, first) = mgr.claim("gated", None).expect("first claim");
-        mgr.cancel("gated").expect("cancel");
+        let (task, first) = mgr.claim("gated", None).expect("first claim");
+        mgr.finish("gated", &task, Utc::now(), &Ok(()), None, &first);
         let (_, second) = mgr.claim("gated", None).expect("second claim");
         let (second_handle, mut second_dropped) = until_aborted();
         mgr.track_run("gated", &second, second_handle);
@@ -3007,10 +3230,10 @@ mod tests {
             ),
             "the live run is left alone"
         );
-        mgr.cancel("gated").expect("cancel");
+        mgr.shutdown().await;
         assert!(
             tokio::time::timeout(wait, second_dropped).await.is_ok(),
-            "cancel stops the live run"
+            "the shutdown stops the live run"
         );
     }
 
@@ -3034,6 +3257,115 @@ mod tests {
             .expect("result");
         assert_eq!(result.status, TaskCompletionStatus::Failed);
         assert_eq!(result.error_message.as_deref(), Some("backend error: boom"));
+        assert_eq!(result.long_error_message, None, "the error has no causes");
+    }
+
+    /// The middle of [`ChainedFailureTask`]'s error.
+    #[derive(Debug, thiserror::Error)]
+    #[error("could not read the guide")]
+    struct ReadGuide(#[source] std::io::Error);
+
+    /// The top of [`ChainedFailureTask`]'s error.
+    #[derive(Debug, thiserror::Error)]
+    #[error("guide refresh failed")]
+    struct RefreshGuide(#[source] ReadGuide);
+
+    /// A task whose body fails with an error that has two causes, the last
+    /// naming a URL that carries a token.
+    struct ChainedFailureTask;
+
+    #[allow(clippy::unnecessary_literal_bound)]
+    #[async_trait]
+    impl ScheduledTask for ChainedFailureTask {
+        fn key(&self) -> &str {
+            "chained"
+        }
+        fn name(&self) -> &str {
+            "Chained Task"
+        }
+        fn description(&self) -> &str {
+            "fails with causes"
+        }
+        fn category(&self) -> &str {
+            "Test"
+        }
+        async fn execute(&self, _progress: &TaskProgress) -> Result<(), ServiceError> {
+            Err(ServiceError::backend_source(RefreshGuide(ReadGuide(
+                std::io::Error::new(
+                    std::io::ErrorKind::ConnectionRefused,
+                    "connection refused: https://guide.example/xmltv?token=secret",
+                ),
+            ))))
+        }
+    }
+
+    /// gl-908: upstream's `OnTaskCompleted` records a failure's
+    /// `ex.StackTrace` as `LongErrorMessage`. A Rust error has no stack trace,
+    /// so a failed run records the error's causes, one per line, with each URL
+    /// cut to its host, on the result it keeps, saves and publishes.
+    #[tokio::test]
+    async fn a_failed_runs_long_error_message_is_its_cause_chain() {
+        let mgr = FerrofinTaskManager::new();
+        mgr.register(Arc::new(ChainedFailureTask));
+        let dir = tempfile::tempdir().expect("tempdir");
+        mgr.set_result_store(dir.path().join("task_results.json"));
+        let events = crate::event_manager::FerrofinEventManager::new();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+        events.subscribe(
+            "TaskCompleted",
+            Arc::new(move |payload: &str| {
+                let _ = tx.send(payload.to_owned());
+                crate::event_manager::consumer_done()
+            }),
+        );
+        mgr.set_event_manager(Arc::new(events));
+
+        mgr.run_now("chained").await.expect_err("the body fails");
+
+        let causes = "could not read the guide\nconnection refused: https://guide.example";
+        let result = mgr
+            .get("chained")
+            .expect("info")
+            .last_execution_result
+            .expect("result");
+        assert_eq!(
+            result.error_message.as_deref(),
+            Some("guide refresh failed")
+        );
+        assert_eq!(result.long_error_message.as_deref(), Some(causes));
+        assert_eq!(
+            super::lock(&mgr.stored_results)["chained"]
+                .long_error_message
+                .as_deref(),
+            Some(causes)
+        );
+        let published = tokio::time::timeout(PANIC_TEST_LIMIT, rx.recv())
+            .await
+            .expect("published in time")
+            .expect("published");
+        let published: serde_json::Value = serde_json::from_str(&published).expect("json");
+        assert_eq!(published["LongErrorMessage"], causes);
+    }
+
+    /// gl-908: for a panic, `LongErrorMessage` is where the body panicked,
+    /// which the server's panic hook records for the run that catches it. The
+    /// run is queued, as the dashboard and the scheduler start one; this
+    /// runtime has one thread, so the hook and the catch share it.
+    #[tokio::test]
+    async fn a_panicked_runs_long_error_message_is_where_it_panicked() {
+        let (mgr, _runs) = panicking(None);
+        let previous = std::panic::take_hook();
+        std::panic::set_hook(Box::new(ferrofin_util::panic::record_location));
+        mgr.queue("panicking").expect("queued");
+        let result = idle_result(&mgr, "panicking").await;
+        std::panic::set_hook(previous);
+
+        assert_eq!(result.error_message.as_deref(), Some(KABOOM));
+        let long = result.long_error_message.expect("where it panicked");
+        assert!(
+            long.starts_with(concat!("panicked at ", file!(), ":")),
+            "{long}"
+        );
     }
 
     #[tokio::test]
@@ -3399,6 +3731,7 @@ mod tests {
         mgr.queue("gated").expect("queued");
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         mgr.cancel("gated").expect("cancel");
+        idle_result(&mgr, "gated").await;
 
         let mgr2 = FerrofinTaskManager::new();
         mgr2.set_result_store(store);
@@ -3793,9 +4126,10 @@ mod tests {
         assert_eq!(runs.load(Ordering::SeqCst), 1);
         handle.abort();
 
-        // Overrun: a hung run whose trigger caps runtime is stopped by a sweep
-        // once the cap has passed, and recorded as Cancelled (upstream's
-        // `CancelAfter` surfaces as `OperationCanceledException`).
+        // Overrun: a run whose trigger caps runtime is asked to stop by a
+        // sweep once the cap has passed, and recorded as Cancelled when it
+        // stops (upstream's `CancelAfter` surfaces as
+        // `OperationCanceledException`).
         let mgr = FerrofinTaskManager::new();
         let gate = Arc::new(tokio::sync::Notify::new());
         mgr.register(Arc::new(GatedTask { gate }));
@@ -3812,10 +4146,9 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         let start = Utc::now() - chrono::Duration::hours(1);
         mgr.scheduler_sweep(start, Utc::now());
-        let info = mgr.get("gated").expect("info");
-        assert_eq!(info.state, TaskState::Idle);
+        assert_eq!(mgr.get("gated").expect("info").state, TaskState::Cancelling);
         assert_eq!(
-            info.last_execution_result.expect("result").status,
+            idle_result(&mgr, "gated").await.status,
             TaskCompletionStatus::Cancelled
         );
     }
@@ -3858,10 +4191,9 @@ mod tests {
         // trigger's limit and is now past it.
         assert_eq!(mgr.get("gated").expect("info").state, TaskState::Running);
         mgr.scheduler_sweep(hour_ago, Utc::now());
-        let info = mgr.get("gated").expect("info");
-        assert_eq!(info.state, TaskState::Idle);
+        assert_eq!(mgr.get("gated").expect("info").state, TaskState::Cancelling);
         assert_eq!(
-            info.last_execution_result.expect("result").status,
+            idle_result(&mgr, "gated").await.status,
             TaskCompletionStatus::Cancelled
         );
 
@@ -3937,6 +4269,29 @@ mod tests {
             .last_execution_result
             .expect("restored result");
         assert_eq!(restored.status, TaskCompletionStatus::Aborted);
+    }
+
+    /// A run already stopping when the server shuts down is only waited on:
+    /// it records its own Cancelled, as upstream's Dispose records Aborted
+    /// only for a worker that was `Running`.
+    #[tokio::test]
+    async fn shutdown_lets_a_stopping_run_record_its_own_result() {
+        let mgr = FerrofinTaskManager::new();
+        mgr.register(Arc::new(GatedTask {
+            gate: Arc::new(tokio::sync::Notify::new()),
+        }));
+        mgr.queue("gated").expect("queued");
+        until_progress(&mgr, "gated", 25.0).await;
+        mgr.cancel("gated").expect("cancel");
+
+        mgr.shutdown().await;
+
+        let info = mgr.get("gated").expect("info");
+        assert_eq!(info.state, TaskState::Idle);
+        assert_eq!(
+            info.last_execution_result.expect("result").status,
+            TaskCompletionStatus::Cancelled
+        );
     }
 
     /// A run with no spawned handle (`run_now`, which runs in its caller) is

@@ -901,8 +901,6 @@ pub const UPSTREAM_PIN_DATE: &str = "2026-10-28";
 pub const VERIFIED_AGAINST_EARLIER_PIN: &[(&str, &str, &str)] = &[
     // The v12.4 re-check found a gap that v12.2 has too (the C# under these
     // rows is unchanged); each leaves the list with its fix.
-    // gl-1034: a nil parentId is an empty page, not GetItemById's 400.
-    ("get", "/Shows/NextUp", "v12.2"),
     // gl-884: a malformed genreIds/studioIds token is a 400, not dropped.
     ("get", "/Artists", "v12.2"),
     ("get", "/Artists/AlbumArtists", "v12.2"),
@@ -911,17 +909,6 @@ pub const VERIFIED_AGAINST_EARLIER_PIN: &[(&str, &str, &str)] = &[
     ("get", "/Genres", "v12.2"),
     ("get", "/MusicGenres", "v12.2"),
     ("get", "/Studios", "v12.2"),
-    // gl-1034: a nil item id is a 404, not GetItemById's 400.
-    ("get", "/Audio/{itemId}/Lyrics", "v12.2"),
-    ("delete", "/Audio/{itemId}/Lyrics", "v12.2"),
-    ("get", "/Audio/{itemId}/RemoteSearch/Lyrics", "v12.2"),
-    ("post", "/Items/{itemId}/ContentType", "v12.2"),
-    (
-        "post",
-        "/Audio/{itemId}/RemoteSearch/Lyrics/{lyricId}",
-        "v12.2",
-    ),
-    ("post", "/Audio/{itemId}/Lyrics", "v12.2"),
     // gl-762: livetv lists tuners and listing providers by id, not as added.
     ("get", "/System/Configuration/{key}", "v12.2"),
 ];
@@ -950,7 +937,11 @@ pub const VERIFIED_SUBSYSTEMS_AGAINST_EARLIER_PIN: &[(&str, &str)] = &[];
 /// `video-stream-copy` is whether a transcode job copies the source video and
 /// what dynamic HDR metadata the copy strips, which the HLS and stream routes
 /// share; `recording-postprocessing` is the executable run after a retained
-/// DVR capture, which no HTTP response describes.
+/// DVR capture, which no HTTP response describes; `recording-keep-up-to` is
+/// which of a series timer's recordings a starting capture deletes past its
+/// "Keep up to", and `direct-recording` how the DVR copies an unshared tuner
+/// URL and how that copy's end settles the timer (completed, or failed and
+/// retried), which no HTTP response describes either.
 pub const SUBSYSTEM_KEYS: &[&str] = &[
     "query-translation",
     "dto-fields",
@@ -965,6 +956,8 @@ pub const SUBSYSTEM_KEYS: &[&str] = &[
     "trickplay",
     "video-stream-copy",
     "recording-postprocessing",
+    "recording-keep-up-to",
+    "direct-recording",
 ];
 
 /// One shared subsystem whose Ferrofin implementation was compared against the
@@ -993,6 +986,41 @@ pub struct VerifiedSubsystem {
 /// [`VERIFIED`]. Subsystem rows never count towards the operation parity line.
 pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
     VerifiedSubsystem {
+        key: "recording-keep-up-to",
+        upstream_file: "src/Jellyfin.LiveTv/Recordings/RecordingsManager.cs",
+        upstream_method: "EnforceKeepUpTo",
+        ferrofin: "ferrofin-livetv manager.rs start_capture (OnStarted: spawned, as its async \
+                   void does not hold the recorder up) -> enforce_keep_up_to: no series timer \
+                   id, series folder or stored series timer, or KeepUpTo <= 0, does nothing; \
+                   under one lock (_recordingDeleteSemaphore) the series timer's Completed \
+                   timers whose file (TimerInfo.RecordingPath, kept on the timer's recording \
+                   row) is a file (File.Exists, so not a folder), \
+                   OrderByDescending(EndDate).Skip(KeepUpTo - 1), each through \
+                   delete_library_item_for_timer (DeleteLibraryItemForTimer: FindByPath(path, \
+                   false) and DeleteItem with DeleteFileLocation, else the file; then the \
+                   timer, disarmed), errors logged per timer; then FindByPath(seriesPath, \
+                   true) and its recursive non-folder, non-virtual files by DateCreated \
+                   descending (RecordingLibrary::files_under, IsFileProtocol) that are files, \
+                   Skip(KeepUpTo - 1), each DeleteItem with DeleteFileLocation, errors \
+                   logged per item. FindByPath matches the stored %AppDataPath% form \
+                   (TranslateQuery's GetPathToSave), then the path as given, for a row \
+                   Ferrofin stored resolved. A deleted file's recording rows go with it, as a \
+                   library delete's forget_recordings. Compared with EnforceKeepUpTo, \
+                   DeleteLibraryItemsForTimers, DeleteLibraryItemForTimer, RecordStream's \
+                   OnStarted and LibraryManager.FindByPath at the pinned v12.4 tag.",
+        date: "2026-11-11",
+        divergences: &[
+            "A file being recorded is never selected; upstream's pass over the series \
+             folder would select one past the limit that was already a library item, which \
+             a Ferrofin capture is not until it ends. The library's delete of a non-episode \
+             video that is not in a mixed folder still removes that folder, capture included, \
+             as upstream's Video.GetDeletePaths does.",
+            "Where the library refuses a delete (a protected folder, or a library this \
+             version has not fully scanned yet), the recording and its timer stay and the \
+             error is logged; upstream's DeleteItem has no such refusal.",
+        ],
+    },
+    VerifiedSubsystem {
         key: "recording-postprocessing",
         upstream_file: "src/Jellyfin.LiveTv/Recordings/RecordingsManager.cs",
         upstream_method: "PostProcessRecording",
@@ -1011,6 +1039,36 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
             "Argument values are not logged because a configured template can contain secrets.",
             "After a configured processor exits, refresh the recording again so changed codecs \
              and duration are discovered even when its library has no filesystem watcher.",
+        ],
+    },
+    VerifiedSubsystem {
+        key: "direct-recording",
+        upstream_file: "src/Jellyfin.LiveTv/IO/DirectRecorder.cs",
+        upstream_method: "RecordFromMediaSource",
+        ferrofin: "ferrofin-livetv dvr.rs record_direct, the RecordingInput::Url arm only (the \
+                   buffer arm, RecordFromDirectStreamProvider, is not covered): copy the tuner \
+                   body until the duration or the cancel, which also interrupts a pending read \
+                   (StreamHelper.CopyUntilCancelled), wait out a clean end of stream in \
+                   CANCEL_POLL_MS steps, flush and return a transport error -> manager.rs \
+                   record_stream and settle_timer \
+                   (RecordingsManager.RecordStream: a stop settles Completed; any other failure \
+                   retries in RETRY_INTERVAL_SECONDS while UtcNow < EndDate and RetryCount < \
+                   MAX_RETRY_COUNT, and a non-empty partial file stays). Compared with \
+                   RecordFromMediaSource, CopyUntilCancelled and RecordStream at the pinned v12.4 \
+                   tag.",
+        date: "2026-11-11",
+        divergences: &[
+            "The tuner gets 30 s to connect, to answer and between two chunks of the body \
+             (TUNER_RESPONSE_TIMEOUT_SECONDS): a tuner silent that long fails the attempt, which \
+             retries into a new file. Upstream waits HttpClient's 100 s for the answer and has no \
+             timeout on the body, so a stalled connection records nothing more until the \
+             programme ends. Jellyfin bug not ported.",
+            "The tuner URL is opened with the source's RequiredHttpHeaders (an M3U tuner's \
+             User-Agent), as playback opens it; upstream's recorder sends none, so a provider \
+             that needs them refuses its recordings. Jellyfin bug not ported.",
+            "A tuner answering an error status fails the attempt, which retries; upstream never \
+             checks the status, records the error body as the programme and settles it \
+             Completed. Jellyfin bug not ported.",
         ],
     },
     VerifiedSubsystem {
@@ -1255,7 +1313,9 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
                    UTF-16 path + DateModified ticks, as a .NET Guid \"N\") ← ferrofin-core \
                    dto_service.rs image_tag, tag_and_fill_blur_hash (attach_images, \
                    add_inherited_images, parent_primary_tag, attach_people with \
-                   person_paths), the chapter tags (the stored item path, \
+                   person_paths) over the page's one image read, load_images_batch, which \
+                   lists each stored image once (ferrofin-db padded_in_chunks binds each id \
+                   once), the chapter tags (the stored item path, \
                    virtual_paths reverse); search_manager.rs fill_artwork; \
                    handlers/images.rs image_info_dto; ferrofin-livetv manager.rs \
                    channel_image_tags (a channel has no path); user_manager.rs get_user_dto \
@@ -1263,7 +1323,8 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
                    reads them (BaseItemMapper.Map's ExpandVirtualPath). Compared with \
                    Emby.Server.Implementations/Dto/DtoService.cs (GetImageCacheTag, \
                    GetPrimaryImageAspectRatio, \
-                   GetTagAndFillBlurhash, AddInheritedImages, AttachPeople), \
+                   GetTagAndFillBlurhash, GetTagsAndFillBlurhashes, AddInheritedImages, \
+                   AttachPeople), \
                    Jellyfin.Server.Implementations/Item/ChapterRepository.cs (Map), \
                    Jellyfin.Api/Controllers/ImageController.cs (GetItemImageInfos), \
                    Jellyfin.Api/Controllers/SearchController.cs (GetSearchHintResult), \
@@ -1281,7 +1342,7 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
                    MediaBrowser.Providers/Manager/ProviderManager.cs (SaveImage), \
                    Jellyfin.Server/Startup.cs (the NamedClient.Default handler) and \
                    Emby.Server.Implementations/Library/LibraryManager.cs (ConvertImageToLocal)",
-        date: "2026-10-31",
+        date: "2026-11-11",
         divergences: &[
             "Decoding and resizing run under limits upstream does not have (owner decision \
              2026-10-31, gl-1097), the settings image_decode_max_megapixels, \
@@ -1375,8 +1436,18 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
                    boot-repair fold, item_persistence_service.rs agree_user_data (the \
                    retired-key update of SaveUserData, from the row ResolveUserDataRow reads), \
                    compared with Jellyfin.Server.Implementations/Item/\
-                   ItemPersistenceService.cs (ReattachUserDataAsync, ReconcileUserDataAsync)",
-        date: "2026-11-06",
+                   ItemPersistenceService.cs (ReattachUserDataAsync, ReconcileUserDataAsync). \
+                   Also the read path of the folder played test: item_repository.rs \
+                   get_is_played with translate_query.rs build_is_played_query \
+                   (resolve_descendant_query's \
+                   closure and links, each item through push_leaf_is_played_per_row), compared \
+                   with Jellyfin.Server.Implementations/Item/BaseItemRepository.Querying.cs \
+                   (GetIsPlayed), BaseItemRepository.TranslateQuery.cs \
+                   (BuildLeafIsPlayedFilter), src/Jellyfin.Database/\
+                   Jellyfin.Database.Implementations/DescendantQueryHelper.cs \
+                   (GetAllDescendantIds) and MediaBrowser.Controller/Entities/Folder.cs \
+                   (IsPlayed)",
+        date: "2026-11-11",
         divergences: &[
             "After a scan or boot-repair fold, which upstream does not have (it deletes the \
              duplicate, and ReconcileUserDataAsync gives the user's rows the most recent play when \
@@ -1557,7 +1628,18 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
                    generate_sets and tile_and_save (RefreshTrickplayDataInternal), \
                    create_tiles and move_dir (CreateTiles), \
                    and scheduled_tasks/library.rs TrickplayImagesTask, compared with \
-                   MediaBrowser.Providers/Trickplay/TrickplayImagesTask.cs (ExecuteAsync). \
+                   MediaBrowser.Providers/Trickplay/TrickplayImagesTask.cs (ExecuteAsync): \
+                   each video gets its page's row, as upstream hands over the page's Video, \
+                   and its stored streams from one read per page, where upstream's \
+                   GetMediaStreams reads them at the video's turn. \
+                   Also the sets a changed video loses before its refresh: library_scan.rs \
+                   scan_item and file_changed, item_data_cleanup.rs prune_extracted_data, \
+                   external_data_manager.rs delete_external_item_data and \
+                   trickplay_manager.rs delete_trickplay_data, compared with \
+                   MediaBrowser.Providers/Manager/MetadataService.cs (BeforeSaveInternal), \
+                   Emby.Server.Implementations/Library/ExternalDataManager.cs \
+                   (DeleteExternalItemDataAsync) and TrickplayManager.cs \
+                   (DeleteTrickplayDataAsync). \
                    How ffmpeg extracts the frames, on either path, is the \
                    trickplay-extraction row's; how many generations run at once is not part \
                    of this row. Also BaseItemDto.Trickplay: which media sources it lists \
@@ -1575,7 +1657,7 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
                    Emby.Server.Implementations/Dto/DtoService.cs (the Trickplay field), \
                    MediaBrowser.Controller/Entities/BaseItem.cs (GetMediaSources) and \
                    MediaBrowser.Controller/Entities/Video.cs (GetAllItemsForMediaSources)",
-        date: "2026-11-06",
+        date: "2026-11-11",
         divergences: &[
             "An explicit Replace does not delete the item's trickplay folder and rows first: \
              each selected width is generated in the work directory and swapped in, so the old \
@@ -1800,9 +1882,10 @@ pub const VERIFIED: &[Verified] = &[
         upstream_file: "Jellyfin.Api/Controllers/TvShowsController.cs",
         upstream_method: "GetNextUp",
         ferrofin: "handlers/tv_shows.rs get_next_up → ferrofin-core tv_series_manager.rs \
-               (TVSeriesManager) → next_up_service.rs (NextUpService, top_parent_ids → \
+               (TVSeriesManager; resolve_parents: GetItemById's 400 for a nil parentId, after \
+               the seriesId return) → next_up_service.rs (NextUpService, top_parent_ids → \
                item_repository.rs view_top_parent_ids)",
-        date: "2026-10-19",
+        date: "2026-11-11",
         divergences: &[
             "TVSeriesManager.GetPreferredVersion (continue in the alternate version the user \
          has been watching, matched by media-source name) is not ported: the pick is always \
@@ -1813,9 +1896,10 @@ pub const VERIFIED: &[Verified] = &[
          statement ignores, so the answer is always empty; Ferrofin scopes by TopParentId = \
          that item (a physical library folder answers, anything else is empty as upstream). \
          Jellyfin bug not ported.",
-            "The 400 (an API key with no userId, or a value the query binder cannot convert), \
-         403 (another user's id without the administrator role) and 404 (a userId naming no \
-         account) bodies are Ferrofin's error shape, not upstream's. Fix path: gl-666.",
+            "The 400 (an API key with no userId, a nil parentId, or a value the query binder \
+         cannot convert), 403 (another user's id without the administrator role) and 404 (a \
+         userId naming no account) bodies are Ferrofin's error shape, not upstream's. Fix \
+         path: gl-666.",
         ],
         refs: &["images", "access-filtering"],
     },
@@ -1924,7 +2008,12 @@ pub const VERIFIED: &[Verified] = &[
                ReportTranscodingInfo's Sessions order; mediaencoding manager.rs start_ffmpeg → \
                on_job_failed_to_start; ClearTranscodingInfo, OnTranscodeFailedToStart), whose \
                reported PlayMethod handlers/playstate.rs validate_play_method keeps only while \
-               the play session transcodes (ValidatePlayMethod); NowViewingItem is \
+               the play session transcodes (ValidatePlayMethod); its TranscodeReasons are the \
+               job's (manager.rs transcoding_info; ReportTranscodingProgress's \
+               state.TranscodeReasons): the request's TranscodeReasons as ferrofin-model \
+               parse_transcode_reasons reads them (EncodingJobInfo.TranscodeReasons' \
+               Enum.TryParse), plus the AudioCodecNotSupported apps/ferrofin-server planner.rs \
+               plan adds to audio it re-encodes (TryStreamCopy's AddTranscodeReason); NowViewingItem is \
                report_now_viewing_item's (ReportNowViewingItem) and UserPrimaryImageTag is \
                stamped by upsert_session (GetSessionInfo, GetImageCacheTag); \
                LastPlaybackCheckIn is DateTime.MinValue until update_now_playing stamps it \
@@ -2279,17 +2368,18 @@ pub const VERIFIED: &[Verified] = &[
         path: "/Audio/{itemId}/Lyrics",
         upstream_file: "Jellyfin.Api/Controllers/LyricsController.cs",
         upstream_method: "GetLyrics",
-        ferrofin: "handlers/lyrics.rs get_lyrics → ferrofin-core lyric_manager.rs \
-               get_lyrics (the item's Lyric streams, LrcLyricParser then TxtLyricParser)",
-        date: "2026-10-19",
+        ferrofin: "handlers/lyrics.rs get_lyrics (require_item: GetItemById's 400 for a nil \
+               id) → ferrofin-core lyric_manager.rs get_lyrics (the item's Lyric streams, \
+               LrcLyricParser then TxtLyricParser)",
+        date: "2026-11-11",
         divergences: &[
             "A Lyric stream whose file cannot be read (removed outside the server before the next \
          refresh, or unreadable) is skipped and the next stream read; upstream's \
          File.ReadAllTextAsync throws on the first such stream, a plain-text 404 when the \
          file or its folder is gone and a 500 otherwise, so a later stream's lyric is never \
          served. Jellyfin bug not ported.",
-            "The 404 (no such item, one the caller may not see, or no lyrics) body is Ferrofin's \
-         error shape, not upstream's. Fix path: gl-666.",
+            "The 400 (nil item id) and 404 (no such item, one the caller may not see, or no \
+         lyrics) bodies are Ferrofin's error shape, not upstream's. Fix path: gl-666.",
         ],
         refs: &[],
     },
@@ -2298,12 +2388,13 @@ pub const VERIFIED: &[Verified] = &[
         path: "/Audio/{itemId}/Lyrics",
         upstream_file: "Jellyfin.Api/Controllers/LyricsController.cs",
         upstream_method: "UploadLyrics",
-        ferrofin: "handlers/lyrics.rs upload_lyrics (require_item, an empty body by its \
-               size hint, upload_format, then the Bytes read under upload_body_limit; \
-               queue_high_priority_refresh) → ferrofin-core lyric_manager.rs save_lyric \
+        ferrofin: "handlers/lyrics.rs upload_lyrics (require_item with GetItemById's 400 for \
+               a nil id, an empty body by its size hint, upload_format, then the Bytes read \
+               under upload_body_limit; queue_high_priority_refresh) → ferrofin-core \
+               lyric_manager.rs save_lyric \
                (decode_stream_text, parse_by_format on the format as given, save_targets \
                with save_extension, try_save_to_files)",
-        date: "2026-10-24",
+        date: "2026-11-11",
         divergences: &[
             "An upload with no Content-Length (a chunked body) is read and saved; upstream \
          tests Request.ContentLength and answers every chunked upload 400 \"No lyrics \
@@ -2313,9 +2404,10 @@ pub const VERIFIED: &[Verified] = &[
          upstream reads it too; upstream's ExceptionMiddleware maps no \
          BadHttpRequestException, so Kestrel's \"request body too large\" reaches the \
          client as a plain-text 500. Jellyfin bug not ported.",
-            "The 400 (an empty body, a file name without an extension, a format no parser \
-         reads, a missing or blank fileName) and 404 (no such item, or one the caller may \
-         not see) bodies are Ferrofin's error shape, not upstream's. Fix path: gl-666.",
+            "The 400 (a nil item id, an empty body, a file name without an extension, a format \
+         no parser reads, a missing or blank fileName) and 404 (no such item, or one the \
+         caller may not see) bodies are Ferrofin's error shape, not upstream's. Fix path: \
+         gl-666.",
         ],
         refs: &[],
     },
@@ -2324,12 +2416,12 @@ pub const VERIFIED: &[Verified] = &[
         path: "/Audio/{itemId}/Lyrics",
         upstream_file: "Jellyfin.Api/Controllers/LyricsController.cs",
         upstream_method: "DeleteLyrics",
-        ferrofin: "handlers/lyrics.rs delete_lyrics (run_item_refresh) → ferrofin-core \
-               lyric_manager.rs delete_lyrics",
-        date: "2026-10-19",
+        ferrofin: "handlers/lyrics.rs delete_lyrics (require_item: GetItemById's 400 for a \
+               nil id; run_item_refresh) → ferrofin-core lyric_manager.rs delete_lyrics",
+        date: "2026-11-11",
         divergences: &[
-            "The 404 (no such item, or one the caller may not see) body is Ferrofin's error \
-         shape, not upstream's. Fix path: gl-666.",
+            "The 400 (nil item id) and 404 (no such item, or one the caller may not see) bodies \
+         are Ferrofin's error shape, not upstream's. Fix path: gl-666.",
         ],
         refs: &[],
     },
@@ -2338,12 +2430,13 @@ pub const VERIFIED: &[Verified] = &[
         path: "/Audio/{itemId}/RemoteSearch/Lyrics",
         upstream_file: "Jellyfin.Api/Controllers/LyricsController.cs",
         upstream_method: "SearchRemoteLyrics",
-        ferrofin: "handlers/lyrics.rs search_remote_lyrics → ferrofin-core lyric_manager.rs \
-               search_lyrics (search_request_for, search_request, search_provider)",
-        date: "2026-10-19",
+        ferrofin: "handlers/lyrics.rs search_remote_lyrics (require_item: GetItemById's 400 \
+               for a nil id) → ferrofin-core lyric_manager.rs search_lyrics \
+               (search_request_for, search_request, search_provider)",
+        date: "2026-11-11",
         divergences: &[
-            "The 404 (no such item, or one the caller may not see) body is Ferrofin's error \
-         shape, not upstream's. Fix path: gl-666.",
+            "The 400 (nil item id) and 404 (no such item, or one the caller may not see) bodies \
+         are Ferrofin's error shape, not upstream's. Fix path: gl-666.",
         ],
         refs: &[],
     },
@@ -2353,13 +2446,14 @@ pub const VERIFIED: &[Verified] = &[
         upstream_file: "Jellyfin.Api/Controllers/LyricsController.cs",
         upstream_method: "DownloadRemoteLyrics",
         ferrofin: "handlers/lyrics.rs download_remote_lyrics (RequiredRouteString lyricId: \
-               ConvertEmptyStringToNull, then [Required]; queue_high_priority_refresh) → \
-               ferrofin-core lyric_manager.rs download_lyrics (fetch_remote, save_targets, \
-               try_save_to_files)",
-        date: "2026-10-19",
+               ConvertEmptyStringToNull, then [Required]; require_item: GetItemById's 400 for \
+               a nil id; queue_high_priority_refresh) → ferrofin-core lyric_manager.rs \
+               download_lyrics (fetch_remote, save_targets, try_save_to_files)",
+        date: "2026-11-11",
         divergences: &[
-            "The 404 (no such item, one the caller may not see, or no lyric for the id) body \
-         is Ferrofin's error shape, not upstream's. Fix path: gl-666.",
+            "The 400 (nil item id) and 404 (no such item, one the caller may not see, or no \
+         lyric for the id) bodies are Ferrofin's error shape, not upstream's. Fix path: \
+         gl-666.",
         ],
         refs: &[],
     },
@@ -2474,9 +2568,16 @@ pub const VERIFIED: &[Verified] = &[
                user's rows for the device id in Id order, then Logout(Device) of each) and \
                session activity, and that upstream has no login rate limit. \
                The UserDto and SessionInfoDto \
-               builders are shared with other routes and not compared here",
+               builders are shared with other routes and not compared here; \
+               authentication_result's fallback User, compared on 2026-11-11 (gl-1106), \
+               carries new UserDto()'s policy, as UserPolicy.cs's constructor sets it",
         date: "2026-11-05",
         divergences: &[
+            "When the user cannot be reloaded once the token is minted (a database read error, or \
+         the user deleted in that moment), User is a bare DTO: the session's id, name and \
+         ServerId with new UserDto()'s configuration and policy, not the user's own. Upstream \
+         builds User from the in-memory user it already holds, which cannot fail there; the \
+         sign-in succeeds on both. Fix path: gl-1719.",
             "The 400 (no client identity, an empty username) and 500 bodies are Ferrofin's error \
          shape, not upstream's. Fix path: gl-666.",
             "MaxActiveSessions counts the user's sessions in the pool, as upstream \
@@ -2519,7 +2620,8 @@ pub const VERIFIED: &[Verified] = &[
         divergences: &[
             "The User member is built at the exchange, from the user as it is then, where \
          upstream returns the UserDto it snapshotted when the code was authorized, up to \
-         10 minutes stale (a user deleted meanwhile gets the bare id/name DTO); the \
+         10 minutes stale (a user deleted meanwhile gets the bare DTO: id, name, the \
+         session's ServerId and new UserDto()'s configuration and policy); the \
          session, token and ServerId are the stored ones on both. Jellyfin bug not \
          ported.",
             "The 404 (unknown or expired secret) body is Ferrofin's error shape, not \
@@ -2754,6 +2856,152 @@ pub const VERIFIED: &[Verified] = &[
         refs: &["access-filtering"],
     },
     Verified {
+        method: "get",
+        path: "/LiveTv/Programs",
+        upstream_file: "Jellyfin.Api/Controllers/LiveTvController.cs",
+        upstream_method: "GetLiveTvPrograms",
+        ferrofin: "handlers/live_tv.rs get_programs (ProgramsQuery::into_parts: parse_csv_uuids, \
+               parse_pipe_strings, parse_csv_enums_lenient, pair_order_by, \
+               program_dto_options; items.rs resolve_user_opt) → query_programs_inner (the \
+               StartDate default order, the librarySeriesId block) → ferrofin-livetv \
+               manager.rs get_programs (stored_series_timer for seriesTimerId, \
+               user_restrictions, program_rows_query over push_program_filters, \
+               push_program_order and push_program_paging, the PROGRAM_COUNT total, \
+               projection.rs remove_fields, program_dtos → program_entity and dto_service.rs \
+               get_base_item_dtos, apply_program_info, add_recording_info → \
+               scheduled_timers_for over dvr_repository.rs scheduled_timers_for_programs, \
+               timer_program_ids, apply_recording_info) (RequestHelpers.GetUserId, \
+               RequestHelpers.GetOrderBy, DtoExtensions.AddAdditionalDtoOptions, \
+               LiveTvManager.GetPrograms, LibraryManager.QueryItems, \
+               BaseItemRepository.TranslateQuery and ApplyOrder, RemoveFields, \
+               DtoService.GetBaseItemDtos, AddInfoToProgramDto, AddRecordingInfo, \
+               GetTimersInternal, DefaultLiveTvService.GetTimersAsync)",
+        date: "2026-11-11",
+        divergences: &[
+            "genreIds is bound but filters nothing: every programme the other filters keep is \
+         listed, where upstream's TranslateQuery keeps only those with one of the genres \
+         (WhereReferencedItem over the Genre item values). Fix path: gl-1686.",
+            "isSports, isNews and isKids each match the programme's own flag, so when two or \
+         more are true a programme must have them all; upstream turns each true one into a \
+         tag and keeps a programme with any of those tags, so isSports=true&isKids=true \
+         lists sports and kids programmes alike. A false one excludes its flag in both. Fix \
+         path: gl-1687.",
+            "Only StartDate, Name, SortName, OfficialRating, ProductionYear and Random order \
+         the page, over the guide's own columns: Name and SortName sort the title as stored \
+         (case-sensitively), OfficialRating sorts its text, Default sorts as StartDate, and \
+         any other key is skipped (StartDate when none is left); ties break on the \
+         programme id. Upstream's ApplyOrder sorts by every key through OrderMapper: Name \
+         by CleanName, SortName by the sort name, OfficialRating by the parental rating \
+         score, DateCreated, PremiereDate, CommunityRating, Runtime and the rest by their \
+         columns, drops Default (SortName when no key is left) and breaks ties on the sort \
+         name. Fix path: gl-1688.",
+            "A sortOrder with more entries than a non-empty sortBy has keys has the extra \
+         entries ignored; upstream's GetOrderBy indexes past the sortBy array and answers \
+         500 (IndexOutOfRangeException). Jellyfin bug not ported.",
+            "enableTotalRecordCount=false with a startIndex reports the page's length plus \
+         startIndex as TotalRecordCount; upstream's QueryItems reads GetItemList and \
+         reports the page's length. Fix path: gl-1689.",
+            "Programme DTOs are projected from the guide's own table, not the stored \
+         LiveTvProgram item, so what that table has no column for is missing: \
+         CommunityRating, PremiereDate (the listing's original air date), Audio, an HD \
+         listing's Width and Height, and the ProgramEtag and SeriesZap2It provider ids; \
+         upstream's GuideManager.GetProgram stores each on the item the DTO is made from. \
+         Fix path: gl-763, gl-1591.",
+            "The listing's fields (Name, Overview, OfficialRating, Genres, the flags) are read \
+         from the guide table, so a change saved to a programme's item (POST \
+         /Items/{itemId}) is not shown here; upstream lists the stored item, the change \
+         included, until a guide refresh that updates the programme assigns the listing's \
+         values over it. Fix path: gl-1690.",
+            "A programme whose own timer carries no SeriesTimerId, or that has no timer, gets \
+         none; upstream's AddRecordingInfo then takes the first series timer (by name) whose \
+         SeriesId equals the programme's ExternalSeriesId, ignoring case, so every airing of \
+         a recorded series shows its SeriesTimerId, those on other channels included. Fix \
+         path: gl-1680.",
+            "A malformed id in channelIds or genreIds is a 400; upstream's \
+         CommaDelimitedCollectionModelBinder drops it. Fix path: gl-884.",
+            "The 400 (a value the query binder cannot convert) and 403 (another user's id \
+         without the administrator role) bodies are Ferrofin's error shape, not upstream's. \
+         Fix path: gl-666.",
+        ],
+        refs: &["access-filtering", "images"],
+    },
+    Verified {
+        method: "post",
+        path: "/LiveTv/Programs",
+        upstream_file: "Jellyfin.Api/Controllers/LiveTvController.cs",
+        upstream_method: "GetPrograms",
+        ferrofin: "handlers/live_tv.rs post_programs (GetProgramsDto::into_parts, \
+               pair_order_by, program_dto_options; items.rs resolve_user_opt for a non-nil \
+               body UserId only) → query_programs_inner (the StartDate default order, the \
+               LibrarySeriesId block) → ferrofin-livetv manager.rs get_programs \
+               (stored_series_timer for SeriesTimerId, user_restrictions, program_rows_query \
+               over push_program_filters, push_program_order and push_program_paging, the \
+               PROGRAM_COUNT total, projection.rs remove_fields, program_dtos → \
+               program_entity and dto_service.rs get_base_item_dtos, apply_program_info, \
+               add_recording_info → scheduled_timers_for over dvr_repository.rs \
+               scheduled_timers_for_programs, timer_program_ids, apply_recording_info) \
+               (GetProgramsDto, RequestHelpers.GetOrderBy, \
+               DtoExtensions.AddAdditionalDtoOptions, LiveTvManager.GetPrograms, \
+               LibraryManager.QueryItems, BaseItemRepository.TranslateQuery and ApplyOrder, \
+               RemoveFields, DtoService.GetBaseItemDtos, AddInfoToProgramDto, \
+               AddRecordingInfo, GetTimersInternal, DefaultLiveTvService.GetTimersAsync)",
+        date: "2026-11-11",
+        divergences: &[
+            "A body UserId naming another user, sent without the administrator role, is a 403 \
+         (the RequestHelpers.GetUserId rule GET applies); upstream's GetPrograms reads \
+         body.UserId through GetUserById with no such check, so any Live TV user can list \
+         the guide as another user, with that user's user data and parental restrictions. \
+         Jellyfin bug not ported.",
+            "An offset-less MinStartDate, MaxStartDate, MinEndDate or MaxEndDate (or a bare \
+         date) is read as UTC; upstream's GetDateTime leaves it Unspecified and EF's \
+         DateTimeKindValueConverter reads it as server-local time, as the GET form here \
+         does. Fix path: gl-1033.",
+            "A null EnableTotalRecordCount reads as true; upstream's member is a non-nullable \
+         bool, which System.Text.Json refuses to bind from null (a 400). Fix path: gl-1691.",
+            "GenreIds is bound but filters nothing: every programme the other filters keep is \
+         listed, where upstream's TranslateQuery keeps only those with one of the genres \
+         (WhereReferencedItem over the Genre item values). Fix path: gl-1686.",
+            "IsSports, IsNews and IsKids each match the programme's own flag, so when two or \
+         more are true a programme must have them all; upstream turns each true one into a \
+         tag and keeps a programme with any of those tags. A false one excludes its flag in \
+         both. Fix path: gl-1687.",
+            "Only StartDate, Name, SortName, OfficialRating, ProductionYear and Random order \
+         the page, over the guide's own columns: Name and SortName sort the title as stored \
+         (case-sensitively), OfficialRating sorts its text, Default sorts as StartDate, and \
+         any other key is skipped (StartDate when none is left); ties break on the \
+         programme id. Upstream's ApplyOrder sorts by every key through OrderMapper: Name \
+         by CleanName, SortName by the sort name, OfficialRating by the parental rating \
+         score, DateCreated, PremiereDate, CommunityRating, Runtime and the rest by their \
+         columns, drops Default (SortName when no key is left) and breaks ties on the sort \
+         name. Fix path: gl-1688.",
+            "A SortOrder with more entries than a non-empty SortBy has keys has the extra \
+         entries ignored; upstream's GetOrderBy indexes past the SortBy array and answers \
+         500 (IndexOutOfRangeException). Jellyfin bug not ported.",
+            "EnableTotalRecordCount=false with a StartIndex reports the page's length plus \
+         StartIndex as TotalRecordCount; upstream's QueryItems reads GetItemList and \
+         reports the page's length. Fix path: gl-1689.",
+            "Programme DTOs are projected from the guide's own table, not the stored \
+         LiveTvProgram item, so what that table has no column for is missing: \
+         CommunityRating, PremiereDate (the listing's original air date), Audio, an HD \
+         listing's Width and Height, and the ProgramEtag and SeriesZap2It provider ids; \
+         upstream's GuideManager.GetProgram stores each on the item the DTO is made from. \
+         Fix path: gl-763, gl-1591.",
+            "The listing's fields (Name, Overview, OfficialRating, Genres, the flags) are read \
+         from the guide table, so a change saved to a programme's item (POST \
+         /Items/{itemId}) is not shown here; upstream lists the stored item, the change \
+         included, until a guide refresh that updates the programme assigns the listing's \
+         values over it. Fix path: gl-1690.",
+            "A programme whose own timer carries no SeriesTimerId, or that has no timer, gets \
+         none; upstream's AddRecordingInfo then takes the first series timer (by name) whose \
+         SeriesId equals the programme's ExternalSeriesId, ignoring case, so every airing of \
+         a recorded series shows its SeriesTimerId, those on other channels included. Fix \
+         path: gl-1680.",
+            "The 400 (a body that does not bind) body is Ferrofin's error shape, not \
+         upstream's. Fix path: gl-666.",
+        ],
+        refs: &["access-filtering", "images"],
+    },
+    Verified {
         method: "delete",
         path: "/LiveTv/TunerHosts",
         upstream_file: "Jellyfin.Api/Controllers/LiveTvController.cs",
@@ -2770,14 +3018,14 @@ pub const VERIFIED: &[Verified] = &[
         path: "/Items/{itemId}/ContentType",
         upstream_file: "Jellyfin.Api/Controllers/ItemUpdateController.cs",
         upstream_method: "UpdateItemContentType",
-        ferrofin: "handlers/item_update.rs update_item_content_type → ferrofin-core \
-               library_manager.rs containing_folder_path (BaseItem/Video/Playlist and the \
-               by-name ContainingFolderPath overrides) → ferrofin-model \
-               content_type_overrides.rs with_content_type_override",
-        date: "2026-10-21",
+        ferrofin: "handlers/item_update.rs update_item_content_type (GetItemById's 400 for a \
+               nil id) → ferrofin-core library_manager.rs containing_folder_path \
+               (BaseItem/Video/Playlist and the by-name ContainingFolderPath overrides) → \
+               ferrofin-model content_type_overrides.rs with_content_type_override",
+        date: "2026-11-11",
         divergences: &[
-            "The 404 (no such item, or one the caller may not see) body is Ferrofin's error \
-         shape, not upstream's. Fix path: gl-666.",
+            "The 400 (nil item id) and 404 (no such item, or one the caller may not see) bodies \
+         are Ferrofin's error shape, not upstream's. Fix path: gl-666.",
         ],
         refs: &[],
     },
@@ -2833,12 +3081,17 @@ pub const VERIFIED: &[Verified] = &[
                ConvertEmptyStringToNull, then [Required]; normalize_named_configuration: \
                GetConfigurationType and Deserialize) → save_named_configuration \
                (BaseConfigurationManager.SaveConfiguration: the validating store, the write, \
-               the live network policy, the listeners, the committed checks for \
-               ApplicationHost.OnConfigurationUpdated) → for livetv \
+               the live network policy (ferrofin-networking NetworkManager::update_settings: \
+               UpdateSettings, warning of each LAN or exclusion entry InitializeLan ignores \
+               and logging an error for each override InitializeOverrides cannot parse, the \
+               loop stopping at the first without exactly one '=' as upstream's does), the \
+               listeners (ferrofin-server listen.rs \
+               restart_listener: the port restart of OnConfigurationUpdated), the committed \
+               checks for ApplicationHost.OnConfigurationUpdated) → for livetv \
                LiveTvManager::create_recording_folders (ferrofin-livetv recording_folders.rs: \
                RecordingsManager.OnNamedConfigurationUpdated, which the Live TV manager's tuner \
                and provider saves run too, as upstream's save of livetv does)",
-        date: "2026-10-30",
+        date: "2026-11-11",
         divergences: &[
             "database is refused with a 400: Ferrofin has no other database provider (owner \
          decision 2026-10-23).",
@@ -2855,6 +3108,29 @@ pub const VERIFIED: &[Verified] = &[
          MediaLocationsCreated entries that are not recording folders instead of removing \
          them from their libraries: adoption carries that list over but not the recording \
          paths, so upstream's rule would delete the library holding the recordings.",
+            "A network save whose BaseUrl changes the base URL this lifetime serves \
+         (FERROFIN_BASE_URL outranks it) marks a restart pending, and the redirects and \
+         advertised URLs keep the running value until then. Upstream's \
+         OnConfigurationUpdated flags no restart for BaseUrl, while its redirect middleware \
+         and GetLocalApiUrl read the new value at once and its mount keeps the old one \
+         (owner decision on gl-555).",
+            "A network save marks a restart pending, as OnConfigurationUpdated does, when the \
+         ports it resolves to differ from the ports this lifetime listens on. Resolving \
+         differs from upstream's raw comparison in three ways: --port/FERROFIN_PORT and \
+         FERROFIN_HTTPS_PORT outrank InternalHttpPort and InternalHttpsPort (owner decision \
+         on gl-554); a saved port at its default (8096, 8920) leaves config.toml's, as an empty \
+         BaseUrl does (gl-554's fix, reading the owner's precedence); and equal saved ports \
+         are reset to the defaults first, as ApplicationHost.Init does, where upstream flags a \
+         restart that changes nothing for a save of two equal ports. Upstream's guard on a \
+         running port of 0 (the ports not read yet) needs no counterpart: the listener is \
+         registered once the ports are resolved. Its guard on IsPortAuthorized flags the \
+         restart once per lifetime, which Ferrofin matches because it sets IsPortAuthorized \
+         at every boot and the restart flag stays set once raised; but upstream also clears \
+         IsPortAuthorized and saves when it flags the restart, and Ferrofin leaves it true. \
+         Fix path: gl-1701.",
+            "An unparsable PublishedServerUriBySubnet entry is logged with its URL cut to \
+         scheme, host and port (docs/conventions/LOGGING.md rule 5), where upstream logs the \
+         entry whole.",
             "The 400 and 500 bodies are Ferrofin's error shape, not upstream's. Fix path: \
          gl-666.",
         ],
@@ -3113,13 +3389,16 @@ pub const VERIFIED: &[Verified] = &[
                [boxset] folder and AddChild's path-derived id, its Path stored through \
                VirtualPathExpander::reverse as AddChild's save stores it, \
                %AppDataPath%/collections/<name> [boxset] (BaseItemMapper.Map → \
-               GetPathToSave → ReverseVirtualPath), AddToCollectionAsync's refusal \
-               of an id naming no item after the box set is stored) and \
+               GetPathToSave → ReverseVirtualPath), the folder claimed and the row stored \
+               under box_set_folders, which a Collections scan storing the box sets of \
+               the folders it found (resolve_box_set_folders, BoxSetResolver) holds too, \
+               AddToCollectionAsync's refusal of an id naming no item after the box set \
+               is stored) and \
                ensure_collections_folder → collections_library.rs (EnsureLibraryFolder: \
                physical_folder for FindFolders, ensure_library for AddVirtualFolder with its \
                LibraryOptions, ensure_folder for the Folder row ValidateTopLibraryFolders \
                makes)",
-        date: "2026-11-03",
+        date: "2026-11-11",
         divergences: &[
             "A missing name makes a box set with an empty name, where upstream's \
          GetValidFilename dereferences the null and answers 500. Jellyfin bug not ported.",
@@ -3581,12 +3860,15 @@ pub const VERIFIED: &[Verified] = &[
         ferrofin: "handlers/playlists.rs get_playlist_items (effective_user_id: \
                RequestHelpers.GetUserId) → ferrofin-core collection_manager.rs \
                FerrofinPlaylistManager::get_playlist_items (GetPlaylistForUser and \
-               GetManageableItems: manual links, in order, missing items out), then \
-               LibraryManager::filter_visible_items_standalone over the rows just read \
+               GetManageableItems: manual links, in order, missing items out, each distinct \
+               member's row read once and its entries pointing at it, as \
+               ResolveLinkedChildren's byId lookup shares one BaseItem between repeats), \
+               then LibraryManager::filter_visible_items_standalone over those rows \
                (ItemVisibility::visible, one answer per distinct id) before the paging, as \
                upstream filters before Skip and Take (the count taken first; a negative \
-               startIndex skips nothing, a negative limit takes nothing), and \
-               tv_shows::build_dto_options + get_linked_children_dtos + the PlaylistItemId tag",
+               startIndex skips nothing, a negative limit takes nothing), and the page's \
+               entries through tv_shows::build_dto_options + get_linked_children_dtos + the \
+               PlaylistItemId tag",
         date: "2026-11-11",
         divergences: &[
             "A member the caller may not open is left out with the standalone check, which also \
@@ -3740,10 +4022,11 @@ pub const VERIFIED: &[Verified] = &[
         upstream_method: "RestartApplication",
         ferrofin: "handlers/system.rs restart_application (auth.rs RequireAdmin) → ferrofin-core \
                system_manager.rs restart → apps/ferrofin-server state.rs \
-               FerrofinLifecycleController stop, lib.rs announce_shutdown, tear_down_host \
+               FerrofinLifecycleController stop (SystemManager.ShutdownInternal), lib.rs \
+               announce_shutdown (SessionManager.OnApplicationStopping), tear_down_host \
                (HlsStreamManager::shutdown, LiveTvManager::shutdown: Program.cs disposes the \
                host, RecordingsManager.Dispose, MediaSourceManager.Dispose)",
-        date: "2026-11-08",
+        date: "2026-11-11",
         divergences: &[
             "The host teardown goes further than upstream's disposal (gl-141). It does four things. \
          It kills every transcode: upstream's TranscodeManager.Dispose kills no job, and each \
@@ -3758,8 +4041,6 @@ pub const VERIFIED: &[Verified] = &[
          /System/Shutdown. Upstream's LocalAccessOrRequiresElevation also admits any caller \
          on the local network, with or without a token; here that caller gets 401 without \
          a token and 403 without the administrator role.",
-            "Connected clients get ServerShuttingDown; upstream pushes ServerRestarting for a \
-         restart. Fix path: gl-1123.",
         ],
         refs: &[],
     },
@@ -3877,17 +4158,35 @@ pub const VERIFIED: &[Verified] = &[
                isPerfectMatch's hash-match filter applied to every provider's results, \
                where upstream leaves it to the provider, as the plugin's MatchFilter does) → \
                ferrofin-providers opensubtitles.rs search (the OpenSubtitles plugin's Search, \
-               v25, compared for the code it derives: GetLanguage's zh-CN and pt-PT, and no \
-               search for a language without a two-letter code)",
-        date: "2026-11-09",
+               v25 @ 60d2c74d: an account's Login first, sharing the downloads' session, and \
+               no login with an account the API refused (CredentialsInvalid: a 401, or a 400 \
+               for an e-mail username); an automated search's [] without a login or with the \
+               quota spent; the [] for an episode without its numbers or series name and for \
+               a video without a path; \
+               GetLanguage's zh-CN and pt-PT checked against the /infos/languages list, read \
+               once, a regioned code falling back to its language and no search for a language \
+               the list or the culture lacks; the movie hash; type, then imdb_id or else the \
+               file name as query with an episode's numbers; AddQueryString's sorted, lowercased \
+               query; every page of SearchSubtitlesAsync; BadSubtitleFilter, with the files a \
+               download found empty, MediaFilter and MatchFilter; the order by hash match, \
+               downloads, rating and trusted uploader; one candidate per result, its first \
+               file's id, with Release, Comments, Ratings, UploadDate, Fps and the machine and \
+               AI translation flags)",
+        date: "2026-11-11",
         divergences: &[
             "A DVD or Blu-ray rip or an ISO is searched; upstream returns [] unless the \
          video's VideoType is VideoFile. Fix path: gl-1524.",
-            "The built-in OpenSubtitles provider matches the plugin it ports only in the \
-         language code it derives (GetLanguage's zh and pt rewrites and its refusal of a \
-         language with no code), not in GetLanguage's check against the API's language list; \
-         its parameters, early returns, filters, ordering and result fields differ from \
-         OpenSubtitleDownloader.Search. Fix path: gl-1525.",
+            "With an OpenSubtitles API key and no account, a manual search still searches; \
+         the plugin's Login throws without an account, so it finds nothing. Fix path: gl-808 \
+         (owner decision).",
+            "OpenSubtitles keeps an account the API refused (CredentialsInvalid) only until the \
+         server restarts, the account changes or a login with it succeeds (the settings page's \
+         validation included), and a download still tries to log in with it; \
+         the plugin saves the flag to its configuration until its settings page validates new \
+         credentials, and fails such a download at once (Unable to login). Fix path: gl-1644.",
+            "OpenSubtitles candidates carry ProviderName \"opensubtitles\" and the MD5 of that \
+         name as their id prefix; the plugin's Name, and so upstream's, is \"Open Subtitles\". \
+         Fix path: gl-1704.",
             "The 401 (no or bad token), 403 (no subtitle management) and 404 bodies are \
          Ferrofin's error shape, not upstream's. Fix path: gl-666.",
         ],
@@ -3930,7 +4229,7 @@ pub const VERIFIED: &[Verified] = &[
             "A client that hangs up stops the download, the write or the refresh where it \
          is, unlogged; upstream passes CancellationToken.None and finishes them. Fix path: \
          gl-1645.",
-            "A nil itemId is a 404, not GetItemById's 400. Fix path: gl-1034.",
+            "A nil itemId is a 404, not GetItemById's 400. Fix path: gl-1695.",
             "A whitespace-only subtitleId is taken (a logged failed download and a 204, or a \
          404 for a missing or hidden item); upstream's model validation answers 400 before \
          the action runs. Fix path: gl-1061.",
@@ -3964,7 +4263,7 @@ pub const VERIFIED: &[Verified] = &[
             "A dropped request kills a running extraction and deletes its output (gl-283); \
          upstream's action passes CancellationToken.None, so its extraction runs to the end \
          and the next request is served from the cache. Fix path: gl-1517.",
-            "A nil videoId is a 404, not GetItemById's 400. Fix path: gl-1034.",
+            "A nil videoId is a 404, not GetItemById's 400. Fix path: gl-1695.",
             "A mediaSourceId selects its source in any GUID spelling; upstream compares the N \
          form, ignoring case. Clients echo the id they were given, and an adopted database \
          may hold the hyphenated form.",
@@ -4037,6 +4336,57 @@ pub const VERIFIED: &[Verified] = &[
         divergences: &[
             "The 400 for a missing or blank id, the 401 (no or bad token) and the 403 (not an \
          administrator) bodies are Ferrofin's error shape, not upstream's. Fix path: gl-666.",
+        ],
+        refs: &[],
+    },
+    Verified {
+        method: "delete",
+        path: "/ScheduledTasks/Running/{taskId}",
+        upstream_file: "Jellyfin.Api/Controllers/ScheduledTasksController.cs",
+        upstream_method: "StopTask",
+        ferrofin: "handlers/scheduled_tasks.rs stop_task (RequireAdmin, \
+               Policies.RequiresElevation; RequiredRouteString taskId: ConvertEmptyStringToNull, \
+               then [Required]) → ferrofin-core scheduled_tasks.rs cancel_task (the Id matched \
+               ignoring case, as OrdinalIgnoreCase; none is the 404) → cancel → \
+               Registration::request_stop (ScheduledTaskWorker.Cancel/CancelIfRunning: the \
+               run's token cancelled, State Cancelling until the run returns) → \
+               execute_contained and finish (ExecuteInternal: the run records Cancelled when \
+               its body stopped for it, else its own outcome, then ExecuteQueuedTasks)",
+        date: "2026-11-11",
+        divergences: &[
+            "Stopping a task that is idle or already stopping answers 204 and changes nothing; \
+         upstream's Cancel throws InvalidOperationException there, a 500. Jellyfin bug not \
+         ported.",
+            "A body still running STOP_WAIT (2 s) after the stop is dropped and recorded \
+         Cancelled; upstream waits for ExecuteAsync however long it takes. Fix path: every \
+         task body checks its token as upstream's do (gl-1709); the value is a candidate \
+         setting (gl-1710).",
+            "The 401 (no or bad token), 403 (not an administrator) and 404 (no task has that \
+         id) bodies are Ferrofin's error shape, not upstream's. Fix path: gl-666.",
+        ],
+        refs: &[],
+    },
+    Verified {
+        method: "post",
+        path: "/Library/Refresh",
+        upstream_file: "Jellyfin.Api/Controllers/LibraryController.cs",
+        upstream_method: "RefreshLibrary",
+        ferrofin: "handlers/library.rs refresh_library (RequireAdmin, \
+               Policies.RequiresElevation) → TaskManager::cancel_if_running_and_queue on the \
+               RefreshLibrary task's wire id (LibraryManager.ValidateMediaLibrary → \
+               TaskManager.CancelIfRunningAndQueue<RefreshMediaLibraryTask>) → ferrofin-core \
+               scheduled_tasks.rs cancel (CancelIfRunning) and queue_scheduled \
+               (QueueScheduledTask with new TaskOptions(): started when Idle, else queued \
+               until the cancelled run has ended); a failure is logged as \"Error refreshing \
+               library\" and the answer is 204 either way, as the controller's catch",
+        date: "2026-11-11",
+        divergences: &[
+            "A Scan Media Library run the refresh cancels ends when its scan wait is \
+         withdrawn, before the scan's item in progress does; upstream's run stays Cancelling \
+         until ValidateMediaLibraryInternal returns. The scan queue still starts the new \
+         scan after the stopping one. Fix path: gl-1709.",
+            "The 401 (no or bad token) and 403 (not an administrator) bodies are Ferrofin's \
+         error shape, not upstream's. Fix path: gl-666.",
         ],
         refs: &[],
     },

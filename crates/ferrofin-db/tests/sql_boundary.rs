@@ -21,7 +21,7 @@ fn is_exempt(rel: &str) -> bool {
         || rel.ends_with("/adoption_repairs.rs")
         || rel.ends_with("/item_count_service.rs")
         || rel.ends_with("/user_data_manager.rs")
-        // The BaseItems.Data source-of-truth sync — persistence is its job.
+        // The BaseItems.Data write-through sync — persistence is its job.
         || rel.ends_with("/item_data.rs")
 }
 

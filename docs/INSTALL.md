@@ -181,11 +181,12 @@ Jellyfin files untouched. For Docker or other non-Debian layouts, `--help` lists
 for the Jellyfin and Ferrofin directories.
 
 Jellyfin .NET plugins cannot run in Ferrofin; they require Ferrofin-compatible
-replacements. `network.xml` carries remote-access policy, IP filters, trusted proxies, and
-local-network definitions. A copied symbolic link still points at its original target, so
-ensure any linked external state remains available to Ferrofin. If Jellyfin uses custom
-cache, metadata, or configuration paths, copy those separately to the configured Ferrofin
-paths.
+replacements. `network.xml` carries remote-access policy, IP filters, trusted proxies,
+local-network definitions, the base URL the server is served under and the ports it
+listens on (unless `FERROFIN_PORT`, `--port` or `FERROFIN_HTTPS_PORT` pins them). A copied symbolic
+link still points at its original target, so ensure any linked external state remains
+available to Ferrofin. If Jellyfin uses custom cache, metadata, or configuration paths,
+copy those separately to the configured Ferrofin paths.
 
 #### Unicode usernames
 

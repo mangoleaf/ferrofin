@@ -69,8 +69,10 @@ pub trait TrickplayManager: Send + Sync {
         library_options: &LibraryOptions,
     ) -> Result<(), ServiceError>;
 
-    /// Refreshes from the scan's current row before its final save.
-    /// `Some(streams)` is a completed fresh probe, including an empty result;
+    /// Refreshes from the caller's row: the scan's current row before its
+    /// final save, or a Generate Trickplay Images page's row.
+    /// `Some(streams)` is the item's streams the caller holds (a completed
+    /// fresh probe, or the page's stored streams), including an empty result;
     /// `None` uses persisted streams when the probe did not supply new context.
     /// The default preserves identity-only implementations of the seam.
     async fn refresh_trickplay_for_media(
@@ -114,6 +116,24 @@ pub trait TrickplayManager: Send + Sync {
         self.refresh_trickplay_data(item_id, false, library_options)
             .await
             .map(|()| true)
+    }
+
+    /// [`Self::check_trickplay_data`] over the caller's row and stored
+    /// streams, as [`Self::refresh_trickplay_for_media`] is to
+    /// [`Self::refresh_trickplay_data`]: Generate Trickplay Images hands each
+    /// video its page's row and streams. The default preserves identity-only
+    /// implementations of the seam.
+    async fn check_trickplay_for_media(
+        &self,
+        item_id: Uuid,
+        entity: &ferrofin_db::entities::base_items::BaseItemEntity,
+        streams: &[ferrofin_db::entities::base_items::MediaStreamInfoEntity],
+        check: &TrickplayCheck,
+        library_options: &LibraryOptions,
+    ) -> Result<bool, ServiceError> {
+        let _ = (entity, streams);
+        self.check_trickplay_data(item_id, check, library_options)
+            .await
     }
 
     /// Records `check`'s settings as those of the last finished pass, once it

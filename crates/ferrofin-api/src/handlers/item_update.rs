@@ -923,7 +923,8 @@ struct ContentTypeQuery {
 
 /// `POST /Items/{itemId}/ContentType` — sets the folder content-type override.
 ///
-/// Port of `ItemUpdateController.UpdateItemContentType`. A missing item is a
+/// Port of `ItemUpdateController.UpdateItemContentType`. A nil id is a `400`
+/// (`GetItemById(Guid.Empty)` throws `ArgumentException`), a missing item a
 /// `404`. Otherwise the server configuration's `ContentTypes` list is saved
 /// without the entry for the item's `ContainingFolderPath` (its own folder for
 /// a folder, its file's directory for a file), with the new type added under
@@ -934,6 +935,7 @@ struct ContentTypeQuery {
     params(("itemId" = String, Path, description = "The item id")),
     responses(
         (status = 204, description = "Content type updated"),
+        (status = 400, description = "A nil item id"),
         (status = 404, description = "Item not found")
     ),
     tag = "ferrofin"
@@ -944,6 +946,9 @@ async fn update_item_content_type(
     Path(DotnetGuid(item_id)): Path<DotnetGuid>,
     Query(query): Query<ContentTypeQuery>,
 ) -> Result<StatusCode, ApiError> {
+    if item_id.is_nil() {
+        return Err(ApiError::BadRequest("Guid can't be empty".to_owned()));
+    }
     let item = state
         .library
         .get_item_by_id_for_user(item_id, auth.user.as_deref())

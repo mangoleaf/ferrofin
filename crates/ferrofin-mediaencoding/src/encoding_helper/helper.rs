@@ -1989,7 +1989,7 @@ fn range_type_copy_ok<C: EncoderCapabilities>(
         return false;
     }
 
-    if has(&video_range_type_name(range)) {
+    if has(&range.json_name()) {
         return true;
     }
 
@@ -2022,12 +2022,6 @@ fn range_type_copy_ok<C: EncoderCapabilities>(
             bitstream::HdrMetadataRemoval::RemoveDovi,
             Some(video_stream),
         ) && bitstream::video_bit_stream_filters_apply(state))
-}
-
-/// The PascalCase wire name of a video range type. Port of
-/// `VideoRangeType.ToString()`.
-fn video_range_type_name(range_type: VideoRangeType) -> String {
-    range_type.json_name().into_owned()
 }
 
 /// The codec/parameter incompatibilities that prevent an audio copy. Port of
@@ -2216,6 +2210,7 @@ mod tests {
             is_input_video: true,
             subtitle_delivery_method: SubtitleDeliveryMethod::Encode,
             trimmed_subtitle_path: None,
+            transcode_reasons: ferrofin_model::session::TranscodeReasons::empty(),
             run_time_ticks: Some(1),
             transcoding_type: ferrofin_traits::media_encoding::TranscodingJobType::Progressive,
             supported_video_codecs: Vec::new(),

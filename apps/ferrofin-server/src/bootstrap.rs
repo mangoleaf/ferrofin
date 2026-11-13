@@ -291,11 +291,14 @@ fn read_retention_days(config_dir: &Path) -> i32 {
 /// Without this, a panic bypasses tracing entirely — it never reaches the JSON
 /// stdout stream, the log file, or (with export on) the active span in Tempo.
 /// The previous hook is preserved so abort/backtrace behaviour is unchanged.
+/// It also records where the panic happened, for a scheduled task's result
+/// (`ferrofin_util::panic::record_location`).
 fn install_panic_hook() {
     static INSTALLED: std::sync::Once = std::sync::Once::new();
     INSTALLED.call_once(|| {
         let previous = std::panic::take_hook();
         std::panic::set_hook(Box::new(move |info| {
+            ferrofin_util::panic::record_location(info);
             let location = info
                 .location()
                 .map_or_else(String::new, ToString::to_string);
@@ -517,12 +520,14 @@ pub async fn open_database(config: &Config) -> anyhow::Result<Database> {
     db.run_migrations()
         .await
         .context("failed to apply database migrations")?;
-    // Playlist owner/open-access/shares still live in BaseItems.Data JSON (12.0
-    // serialises them); import them on every boot, before anything is served —
-    // a playlist without its permission row is owner-accessible to everyone.
+    // Import the owner/open-access/shares of each playlist that has no
+    // permission row yet from its BaseItems.Data JSON (12.0 serialises them), on
+    // every boot, before anything is served — a playlist without its permission
+    // row is owner-accessible to everyone. A playlist with a row keeps it: the
+    // tables are the source of truth once imported.
     ferrofin_core::item_data::reconcile_playlist_permissions(&db)
         .await
-        .context("failed to reconcile playlist permissions from Data JSON")?;
+        .context("failed to import playlist permissions from Data JSON")?;
     // The one-shot ports of 12.0's data routines: membership from Data JSON
     // for a database newly adopted from 10.11.8 (never from a 12.0 one, whose
     // JSON is frozen), orphaned extras, OwnerId relationships, version links.
@@ -1865,6 +1870,12 @@ mod tests {
             "hook emitted the error line: {out}"
         );
         assert!(out.contains("kaboom"), "panic message captured: {out}");
+        // …and record where it happened for a scheduled task's result.
+        let at = ferrofin_util::panic::take_location();
+        assert!(
+            at.as_deref().is_some_and(|at| at.starts_with(file!())),
+            "{at:?}"
+        );
     }
 
     #[tokio::test]
