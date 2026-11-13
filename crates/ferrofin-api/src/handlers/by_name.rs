@@ -23,7 +23,8 @@ use ferrofin_traits::options::{AuthorizationInfo, DtoOptions};
 use ferrofin_traits::persistence::ItemWithCounts;
 
 use crate::error::ApiError;
-use crate::handlers::items::{parse_order_by, require_scope_visible};
+use crate::handlers::items::require_scope_visible;
+use crate::handlers::query_parse::parse_order_by;
 use crate::state::AppState;
 
 /// The paging + name-range query parameters shared by every by-name **list**

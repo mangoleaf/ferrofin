@@ -44,10 +44,8 @@ use ferrofin_db::entities::base_items::BaseItemEntity;
 use ferrofin_model::configuration::LibraryOptionsResultDto;
 use ferrofin_model::data::BaseItemKind;
 use ferrofin_model::dto::BaseItemDto;
-use ferrofin_model::dto::SortOrder;
 use ferrofin_model::entities::ExtraType;
 use ferrofin_model::entities_media::MetadataProvider;
-use ferrofin_model::live_tv::ItemSortBy;
 use ferrofin_model::querying::{AllThemeMediaResult, QueryResult, ThemeMediaResult};
 use ferrofin_traits::options::{DtoOptions, InternalItemsQuery};
 use uuid::Uuid;
@@ -56,7 +54,7 @@ use crate::auth::{FirstTimeSetupOrAuth, RequireAdmin, RequireAuth};
 use crate::error::ApiError;
 use crate::extract::{DotnetGuid, JsonBody, Query};
 use crate::handlers::items::resolve_user_opt;
-use crate::handlers::query_parse::parse_csv_enums_lenient;
+use crate::handlers::query_parse::{parse_csv_enums_lenient, parse_order_by};
 use crate::handlers::streaming::serve_static_file;
 use crate::state::AppState;
 
@@ -82,20 +80,6 @@ struct ThemeMediaQuery {
     /// Optional. Comma-delimited sort orders (paired with `sort_by`).
     #[serde(default)]
     sort_order: Option<String>,
-}
-
-/// Builds the `order_by` list from the raw `sortBy` / `sortOrder` query values.
-///
-/// Ports `RequestHelpers.GetOrderBy`: each sort key is paired with the sort
-/// order at the same index, falling back to [`SortOrder::Ascending`] when fewer
-/// orders than keys are supplied. An unrecognized token is a `400`.
-fn parse_order_by(sort_by: Option<&str>, sort_order: Option<&str>) -> Vec<(ItemSortBy, SortOrder)> {
-    let keys: Vec<ItemSortBy> = parse_csv_enums_lenient(sort_by);
-    let orders: Vec<SortOrder> = parse_csv_enums_lenient(sort_order);
-    keys.into_iter()
-        .enumerate()
-        .map(|(i, key)| (key, orders.get(i).copied().unwrap_or(SortOrder::Ascending)))
-        .collect()
 }
 
 /// Resolves the theme-media owner for `item_id`, projecting its extras of
