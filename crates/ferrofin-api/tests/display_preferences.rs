@@ -554,15 +554,19 @@ async fn display_preferences_post_parses_scalars_back() {
     assert_eq!(sections, vec![(0, 4)]);
 }
 
-/// With no `skipBackLength`/`skipForwardLength` in `CustomPrefs`, the C#
-/// controller stores 10000/30000 — NOT one shared constant. (Upstream v12.0-rc3
-/// unified both to 15000; the pinned oracle is 10.11.8.)
+/// With `skipBackLength`/`skipForwardLength` missing from `CustomPrefs`, or
+/// empty, the C# controller stores 15000 for both (Jellyfin v12.0-rc1, PR
+/// 16739; unchanged at v12.4).
+#[rstest::rstest]
+#[case::absent(r#"{ "foo": "bar" }"#)]
+#[case::empty(r#"{ "foo": "bar", "skipBackLength": "", "skipForwardLength": "" }"#)]
 #[tokio::test]
-async fn display_preferences_post_skip_length_fallbacks_are_10000_and_30000() {
+async fn display_preferences_post_skip_length_fallbacks_are_15000(#[case] custom_prefs: &str) {
     let prefs = Arc::new(StubDisplayPreferences::default());
     let app = state_with_display_prefs(prefs.clone());
-    let body = r#"{
-        "CustomPrefs": { "foo": "bar" },
+    let body = format!(
+        r#"{{
+        "CustomPrefs": {custom_prefs},
         "ScrollDirection": "Horizontal",
         "SortOrder": "Ascending",
         "ShowBackdrop": false,
@@ -571,7 +575,8 @@ async fn display_preferences_post_skip_length_fallbacks_are_10000_and_30000() {
         "RememberSorting": true,
         "PrimaryImageHeight": 250,
         "PrimaryImageWidth": 250
-    }"#;
+    }}"#
+    );
     let (status, _) = send(
         app,
         "POST",
@@ -583,8 +588,8 @@ async fn display_preferences_post_skip_length_fallbacks_are_10000_and_30000() {
     assert_eq!(status, StatusCode::NO_CONTENT);
 
     let saved = prefs.row.lock().unwrap().clone().unwrap();
-    assert_eq!(saved.skip_backward_length, 10_000);
-    assert_eq!(saved.skip_forward_length, 30_000);
+    assert_eq!(saved.skip_backward_length, 15_000);
+    assert_eq!(saved.skip_forward_length, 15_000);
 }
 
 /// A partial body binds as upstream's `DisplayPreferencesDto` constructor
@@ -1369,7 +1374,7 @@ async fn display_preferences_id_is_read_as_guid_try_parse_reads_it(
 #[case::skip_back_no_break_space(
     r#"{"CustomPrefs":{"skipBackLength":"5000 "}}"#,
     "/CustomPrefs/skipBackLength",
-    "10000"
+    "15000"
 )]
 #[case::overlay_padded(
     r#"{"CustomPrefs":{"enableNextVideoInfoOverlay":" False "}}"#,
