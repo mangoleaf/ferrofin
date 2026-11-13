@@ -376,6 +376,31 @@ fn an_embedded_external_text_track_is_input_1_without_a_canvas() {
     );
 }
 
+/// A sidecar whose path is a URL is read from the URL, embedded or burned in:
+/// a `file:` prefix would have ffmpeg open a local file named after it
+/// (gl-1722, a Jellyfin bug).
+#[rstest]
+#[case(
+    "srt",
+    SubtitleDeliveryMethod::Embed,
+    "http://relay.example/remote.en.srt"
+)]
+#[case(
+    "PGSSUB",
+    SubtitleDeliveryMethod::Encode,
+    "https://relay.example/remote en.sup"
+)]
+fn a_url_sidecar_is_input_1_as_its_url(
+    #[case] codec: &str,
+    #[case] method: SubtitleDeliveryMethod,
+    #[case] url: &str,
+) {
+    let sub = external_subtitle(2, codec, url);
+    let state = build_state(Some(sub), Some(method), None);
+    let input_args = external_stream_input_arguments(&state, None, None, &InputAnalysis::default());
+    assert_eq!(input_args[input_args.len() - 2..], ["-i", url]);
+}
+
 /// A configured `FFmpeg:analyzeduration` / `FFmpeg:probesize` reaches the
 /// subtitle input as it reaches the media file (`GetInputArgument`'s
 /// `NeedsExternalSubtitleMuxing` branch), and a source's own analyze
