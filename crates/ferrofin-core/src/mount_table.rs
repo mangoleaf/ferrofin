@@ -3,7 +3,8 @@
 //! Two endpoints need this: `GET /Environment/Drives` (a port of
 //! `ManagedFileSystem.GetDrives`, which is `DriveInfo.GetDrives()` filtered to
 //! `Fixed | Network | Removable`) and `GET /System/Info/Storage` (a port of
-//! `StorageHelper.GetFreeSpaceOf`, which reports `driveInfo.DriveType.ToString()`).
+//! `StorageHelper.GetFreeSpaceOf`, which reports the mount point and
+//! `DriveType.ToString()` of the deepest drive containing a folder).
 //!
 //! Port notes — how .NET reaches the same answer:
 //! - `DriveInfo.GetDrives()` on Unix is `Interop.Sys.GetAllMountPoints()`, i.e.
@@ -342,22 +343,26 @@ pub struct MountEntry {
 /// Un-escapes the octal escapes `getmntent` leaves in a mount-table field
 /// (`\040` space, `\011` tab, `\012` newline, `\134` backslash).
 fn unescape(field: &str) -> String {
+    // Bytes, not chars: an escape is one byte of a possibly multi-byte UTF-8
+    // name, and the name is decoded as a whole, as .NET does.
     let bytes = field.as_bytes();
-    let mut out = String::with_capacity(field.len());
+    let mut out = Vec::with_capacity(bytes.len());
     let mut i = 0;
     while i < bytes.len() {
-        if bytes[i] == b'\\' && i + 3 < bytes.len() {
-            let digits = &field[i + 1..i + 4];
-            if let Ok(code) = u8::from_str_radix(digits, 8) {
-                out.push(char::from(code));
-                i += 4;
-                continue;
-            }
+        if bytes[i] == b'\\'
+            && let Some(code) = bytes
+                .get(i + 1..i + 4)
+                .and_then(|d| std::str::from_utf8(d).ok())
+                .and_then(|d| u8::from_str_radix(d, 8).ok())
+        {
+            out.push(code);
+            i += 4;
+            continue;
         }
-        out.push(char::from(bytes[i]));
+        out.push(bytes[i]);
         i += 1;
     }
-    out
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 /// Parses a `/proc/mounts` (or `/etc/mtab`) body into its rows, in file order.
@@ -386,20 +391,27 @@ pub fn parse_mount_table(text: &str) -> Vec<MountEntry> {
 #[must_use]
 pub fn read_mount_table() -> Vec<MountEntry> {
     for path in ["/proc/mounts", "/etc/mtab"] {
-        if let Ok(text) = std::fs::read_to_string(path) {
-            return parse_mount_table(&text);
+        // .NET decodes the table with replacement, so one non-UTF-8 byte in a
+        // mount point must not empty it.
+        if let Ok(bytes) = std::fs::read(path) {
+            return parse_mount_table(&String::from_utf8_lossy(&bytes));
         }
     }
     Vec::new()
 }
 
-/// The filesystem type of the mount containing `path`: the longest mount point
-/// that is a path-component prefix of `path`.
+/// The mount containing `path`: the longest mount point that is a
+/// path-component prefix of `path` (`StorageHelper.GetFreeSpaceOf`'s
+/// `bestMatch` over `DriveInfo.GetDrives()`).
 ///
-/// This stands in for `statfs(path).f_type`, which is how .NET resolves the
-/// filesystem for an arbitrary path on Linux.
+/// Upstream matches with a raw, case-insensitive `StartsWith`, so a mount at
+/// `/mnt/media` also claims `/mnt/media2`; the match here is component-wise
+/// and case-sensitive, as the filesystem is. With stacked mounts on one target
+/// the last listed wins (upstream takes the first row), which is invisible:
+/// both rows name the same mount point, and .NET's `DriveType` comes from
+/// `statfs` on it, the topmost (last-listed) filesystem.
 #[must_use]
-pub fn fs_type_for_path<'a>(mounts: &'a [MountEntry], path: &str) -> Option<&'a str> {
+pub fn mount_for_path<'a>(mounts: &'a [MountEntry], path: &str) -> Option<&'a MountEntry> {
     let mut best: Option<&MountEntry> = None;
     for entry in mounts {
         if !path_has_prefix(path, &entry.target) {
@@ -409,7 +421,7 @@ pub fn fs_type_for_path<'a>(mounts: &'a [MountEntry], path: &str) -> Option<&'a 
             best = Some(entry);
         }
     }
-    best.map(|e| e.fs_type.as_str())
+    best
 }
 
 /// Whether `path` is `prefix` or lives beneath it (component-wise, so `/cache`
@@ -465,6 +477,9 @@ shm /dev/shm tmpfs rw,nosuid,nodev,noexec,relatime,size=65536k 0 0
     fn unescapes_octal_fields() {
         let mounts = parse_mount_table("dev /mnt/my\\040disk\\011x ext4 rw 0 0\n");
         assert_eq!(mounts[0].target, "/mnt/my disk\tx");
+        // A UTF-8 name stays one name, whether its bytes are escaped or not.
+        let mounts = parse_mount_table("dev /mnt/M\\303\\251dias\\040é ext4 rw 0 0\n");
+        assert_eq!(mounts[0].target, "/mnt/Médias é");
     }
 
     #[test]
@@ -526,14 +541,16 @@ shm /dev/shm tmpfs rw,nosuid,nodev,noexec,relatime,size=65536k 0 0
     #[test]
     fn resolves_the_longest_containing_mount() {
         let mounts = parse_mount_table(LIVE);
-        assert_eq!(fs_type_for_path(&mounts, "/config/log"), Some("btrfs"));
-        assert_eq!(fs_type_for_path(&mounts, "/usr/share/web"), Some("overlay"));
+        let mount =
+            |path| mount_for_path(&mounts, path).map(|m| (m.target.as_str(), m.fs_type.as_str()));
+        assert_eq!(mount("/config/log"), Some(("/config", "btrfs")));
+        assert_eq!(mount("/usr/share/web"), Some(("/", "overlay")));
         assert_eq!(
-            fs_type_for_path(&mounts, "/sys/fs/cgroup/x"),
-            Some("cgroup2")
+            mount("/sys/fs/cgroup/x"),
+            Some(("/sys/fs/cgroup", "cgroup2"))
         );
         // Component-wise: /cache must not claim /cachex.
-        assert_eq!(fs_type_for_path(&mounts, "/cachex"), Some("overlay"));
-        assert_eq!(fs_type_for_path(&[], "/config"), None);
+        assert_eq!(mount("/cachex"), Some(("/", "overlay")));
+        assert_eq!(mount_for_path(&[], "/config"), None);
     }
 }
