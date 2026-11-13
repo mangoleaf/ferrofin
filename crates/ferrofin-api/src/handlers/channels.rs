@@ -10,7 +10,9 @@
 //!
 //! - The COLLECTION routes (`/Channels`, `/Channels/Features`,
 //!   `/Channels/Items/Latest`) query for `Channel` items and legitimately find
-//!   none, so both servers answer `200` with an empty result.
+//!   none, so both servers answer `200` with an empty result (`/Channels/Items/Latest`
+//!   answers `400` first for a conflicting `filters` pair or an unbindable
+//!   `startIndex`/`limit`).
 //! - The PER-CHANNEL routes (`/Channels/{channelId}/…`) do **not**. Upstream
 //!   resolves the id first — `ChannelManager.GetChannel(id)` is
 //!   `_libraryManager.GetItemById(id) as Channel`, which is `null` for every id
@@ -58,16 +60,19 @@ use axum::routing::get;
 use axum::{Json, Router};
 use ferrofin_model::channels::ChannelFeatures;
 use ferrofin_model::dto::BaseItemDto;
-use ferrofin_model::querying::QueryResult;
+use ferrofin_model::querying::{ItemFilter, QueryResult};
+use ferrofin_traits::options::InternalItemsQuery;
 use uuid::Uuid;
 
 use crate::auth::RequireAuth;
 use crate::error::ApiError;
 use crate::extract::{DotnetGuid, Query};
 use crate::handlers::items::effective_user_id;
+use crate::handlers::query_parse::parse_csv_enums_lenient;
 use crate::state::AppState;
 
-/// The `userId` query parameter the three user-scoped channel routes accept.
+/// The `userId` query parameter `GET /Channels` and `GET /Channels/{channelId}/Items`
+/// accept (`/Channels/Items/Latest` binds [`LatestChannelItemsQuery`]).
 ///
 /// The result is empty either way, but the parameter is **not** inert: upstream
 /// runs `RequestHelpers.GetUserId` on it before it ever reaches the channel
@@ -83,6 +88,30 @@ struct ChannelUserQuery {
         deserialize_with = "crate::handlers::query_parse::empty_as_none_uuid"
     )]
     user_id: Option<Uuid>,
+}
+
+/// The query `GET /Channels/Items/Latest` binds (v12.4
+/// `ChannelsController.GetLatestChannelItems`). `fields` and `channelIds` bind
+/// leniently upstream (a value that does not convert is skipped) and change
+/// nothing while no channel exists, so they are not bound here.
+#[derive(Debug, Default, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct LatestChannelItemsQuery {
+    /// Optional target user; defaults to the authenticated caller.
+    #[serde(
+        default,
+        deserialize_with = "crate::handlers::query_parse::empty_as_none_uuid"
+    )]
+    user_id: Option<Uuid>,
+    /// The index of the first record to return.
+    #[serde(default)]
+    start_index: Option<i32>,
+    /// The maximum number of records to return.
+    #[serde(default)]
+    limit: Option<i32>,
+    /// Comma-delimited `ItemFilter` flags.
+    #[serde(default)]
+    filters: Option<String>,
 }
 
 /// `GET /Channels` — the authenticated user's channels.
@@ -190,21 +219,48 @@ async fn get_channel_items(
 
 /// `GET /Channels/Items/Latest` — latest items across all channels.
 ///
-/// Port of `ChannelsController.GetLatestChannelItems`. No channels → empty.
+/// Port of `ChannelsController.GetLatestChannelItems`: `GetUserId`, then
+/// `ApplyFilters` (a contradictory pair is a `400`). No channels → empty.
 #[utoipa::path(
     get,
     path = "/Channels/Items/Latest",
-    params(("userId" = Option<String>, Query, description = "User id.")),
-    responses((status = 200, description = "Latest channel items returned (QueryResult<BaseItemDto>)")),
+    params(
+        ("userId" = Option<String>, Query, description = "User id."),
+        ("startIndex" = Option<i32>, Query, description = "The index of the first record."),
+        ("limit" = Option<i32>, Query, description = "The maximum number of records."),
+        ("filters" = Option<String>, Query, description = "Comma-delimited item filters.")
+    ),
+    responses(
+        (status = 200, description = "Latest channel items returned (QueryResult<BaseItemDto>)"),
+        (status = 400, description = "Conflicting filters")
+    ),
     tag = "ferrofin"
 )]
 async fn get_latest_channel_items(
     State(state): State<AppState>,
     RequireAuth(auth): RequireAuth,
-    Query(query): Query<ChannelUserQuery>,
+    Query(query): Query<LatestChannelItemsQuery>,
 ) -> Result<Json<QueryResult<BaseItemDto>>, ApiError> {
     effective_user_id(&state, &auth, query.user_id).await?;
-    Ok(Json(QueryResult::default()))
+    // `query.ApplyFilters(filters)`: a contradictory pair is upstream's
+    // `ArgumentException`, a `400`.
+    let mut internal = InternalItemsQuery {
+        start_index: query.start_index,
+        limit: query.limit,
+        ..InternalItemsQuery::default()
+    };
+    internal
+        .apply_filters(&parse_csv_enums_lenient::<ItemFilter>(
+            query.filters.as_deref(),
+        ))
+        .map_err(|e| ApiError::BadRequest(e.to_string()))?;
+    // `ChannelManager.GetLatestChannelItems` answers `new QueryResult(query.StartIndex,
+    // total, items)`; with no channel the total is 0.
+    Ok(Json(QueryResult::new(
+        internal.start_index,
+        Some(0),
+        Vec::new(),
+    )))
 }
 
 /// Registers this controller's real routes onto `router`.
@@ -217,5 +273,6 @@ pub fn register(router: Router<AppState>) -> Router<AppState> {
         .route("/Channels/Items/Latest", get(get_latest_channel_items))
 }
 crate::query::query_parameters! {
-    ChannelUserQuery {} => [("get", "/Channels"), ("get", "/Channels/{channelId}/Items"), ("get", "/Channels/Items/Latest")];
+    ChannelUserQuery {} => [("get", "/Channels"), ("get", "/Channels/{channelId}/Items")];
+    LatestChannelItemsQuery { "filters" => ',' } => [("get", "/Channels/Items/Latest")];
 }
