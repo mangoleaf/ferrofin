@@ -253,6 +253,29 @@ pub fn default_image_order(kind: &str, name: &str) -> usize {
     }
 }
 
+/// The sort key of image provider `name` for item type `kind`, shared by every
+/// pass that runs the remote and dynamic image providers in turn: the
+/// configured `ImageFetcherOrder`, then [`default_image_order`]
+/// (`GetImageProvidersInternal`, `ProviderManager.cs:403-411`). Identifying
+/// runs the provider the chosen result came from (`identified_by`, its
+/// `SearchProviderName`) first, matched ignoring case ("When identifying, run
+/// the provider the user picked first so the correct image is used",
+/// `GetNonLocalImageProviders`, `MetadataService.cs:717-727`).
+#[must_use]
+pub fn image_provider_order(
+    options: Option<&ferrofin_model::configuration::LibraryOptions>,
+    global: Option<&ferrofin_model::configuration::MetadataOptions>,
+    kind: &str,
+    name: &str,
+    identified_by: Option<&str>,
+) -> (bool, usize, usize) {
+    (
+        !identified_by.is_some_and(|chosen| chosen.eq_ignore_ascii_case(name)),
+        image_fetcher_rank(options, global, kind, name),
+        default_image_order(kind, name),
+    )
+}
+
 /// `GetConfiguredOrder` (`ProviderManager.cs:617-628`): the position of
 /// `name` in `order`, or last. Unlike enable lists, order uses exact casing.
 pub(crate) fn configured_order(order: &[String], name: &str) -> usize {
@@ -1223,6 +1246,48 @@ mod tests {
         #[case] expected: usize,
     ) {
         assert_eq!(super::default_image_order(kind, name), expected);
+    }
+
+    /// `GetNonLocalImageProviders`' stable `OrderBy`: the Identify result's
+    /// provider moves to the front (matched ignoring case, a plugin's name
+    /// too) and the rest keep the configured, then the built-in, order.
+    #[rstest::rstest]
+    #[case::scan(None, ["FanArt", "TheMovieDb", "ArtworkPlugin", "The Open Movie Database"])]
+    #[case::omdb(
+        Some("the open movie database"),
+        ["The Open Movie Database", "FanArt", "TheMovieDb", "ArtworkPlugin"]
+    )]
+    #[case::plugin(
+        Some("ArtworkPlugin"),
+        ["ArtworkPlugin", "FanArt", "TheMovieDb", "The Open Movie Database"]
+    )]
+    #[case::not_an_image_provider(
+        Some("TheTVDB"),
+        ["FanArt", "TheMovieDb", "ArtworkPlugin", "The Open Movie Database"]
+    )]
+    #[test]
+    fn identify_runs_the_chosen_image_provider_first(
+        #[case] identified_by: Option<&str>,
+        #[case] expected: [&str; 4],
+    ) {
+        let options = LibraryOptions {
+            type_options: vec![TypeOptions {
+                type_: Some("Movie".to_owned()),
+                image_fetcher_order: vec!["FanArt".to_owned()],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let mut names = [
+            "The Open Movie Database",
+            "ArtworkPlugin",
+            "TheMovieDb",
+            "FanArt",
+        ];
+        names.sort_by_key(|name| {
+            super::image_provider_order(Some(&options), None, "Movie", name, identified_by)
+        });
+        assert_eq!(names, expected);
     }
 
     use super::{all_metadata_plugins, library_options_info};

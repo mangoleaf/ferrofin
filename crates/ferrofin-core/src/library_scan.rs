@@ -852,6 +852,10 @@ struct FetcherPolicy<'a> {
     only_image_provider: Option<&'a str>,
     /// A full image replacement can replace cached plugin artwork.
     replace_images: bool,
+    /// The provider an Identify's chosen result came from
+    /// (`SearchResult.SearchProviderName`): its images run first
+    /// ([`image_order`](Self::image_order)).
+    identified_by: Option<&'a str>,
     /// The server-wide per-kind `MetadataOptions`
     /// (`ServerConfiguration.MetadataOptions`), the answer for a kind the
     /// library saved no `TypeOptions` entry for.
@@ -963,22 +967,19 @@ impl<'a> FetcherPolicy<'a> {
             .to_lowercase()
     }
 
-    /// [`metadata_rank`](Self::metadata_rank) for the image-fetcher order,
-    /// with the same server-wide fallback (`ProviderManager.cs:405-406`).
-    fn image_rank(self, kind: &str, name: &str) -> usize {
-        ferrofin_providers::library_options::image_fetcher_rank(
+    /// The image providers' run order: an Identify's chosen provider first,
+    /// then the configured image-fetcher order (with the same server-wide
+    /// fallback as [`metadata_rank`](Self::metadata_rank)), then the built-in
+    /// one ([`image_provider_order`]).
+    ///
+    /// [`image_provider_order`]: ferrofin_providers::library_options::image_provider_order
+    fn image_order(self, kind: &str, name: &str) -> (bool, usize, usize) {
+        ferrofin_providers::library_options::image_provider_order(
             self.options,
             self.global_for(kind),
             kind,
             name,
-        )
-    }
-
-    /// Configured image preference followed by the built-in provider order.
-    fn image_order(self, kind: &str, name: &str) -> (usize, usize) {
-        (
-            self.image_rank(kind, name),
-            ferrofin_providers::library_options::default_image_order(kind, name),
+            self.identified_by,
         )
     }
 
@@ -8162,6 +8163,12 @@ impl LibraryScanner {
         // (`item.SetProviderIds`, the controller's half) with this item's
         // save, so a refresh that fails leaves no half-applied ids.
         let search = options.search_result.as_ref();
+        // Its image providers run the chosen result's provider first
+        // (`GetNonLocalImageProviders`, `MetadataService.cs:722-727`).
+        let policy = FetcherPolicy {
+            identified_by: search.and_then(|r| r.search_provider_name.as_deref()),
+            ..policy
+        };
         let series_child = matches!(
             item_type_lookup::kind_from_type_name(&entity.type_),
             Some(BaseItemKind::Episode | BaseItemKind::Season)
@@ -8281,7 +8288,7 @@ impl LibraryScanner {
             // first ("When identifying, run the provider the user picked
             // first so the correct IDs are used", `MetadataService.cs:
             // 876-882`).
-            let prefer = preferred_fetcher(search.and_then(|r| r.search_provider_name.as_deref()));
+            let prefer = preferred_fetcher(policy.identified_by);
             // The lookup info's ids are the item's own, which the probe (a
             // pre-refresh provider, `AudioFileProber`) has already given its
             // tag ids where the item had none: `GetLookupInfo` shares the
@@ -14051,7 +14058,7 @@ impl LibraryScanner {
             .iter()
             .filter(|p| p.library_gated() && policy.image_enabled(&lookup.kind, p.name()))
             .collect();
-        sources.sort_by_key(|p| policy.image_rank(&lookup.kind, p.name()));
+        sources.sort_by_key(|p| policy.image_order(&lookup.kind, p.name()));
         for provider in sources {
             if wanted.is_empty() {
                 return;
@@ -37232,14 +37239,20 @@ mod tests {
     }
 
     /// Music's post-pass must interleave plugins with built-in artwork just as
-    /// the item walk does, including its per-kind default provider order.
+    /// the item walk does, including its per-kind default provider order. An
+    /// Identify's result (`identified_by`, its `SearchProviderName`) runs its
+    /// provider first, for every item the refresh's options carry it to
+    /// (`GetNonLocalImageProviders`).
     #[rstest::rstest]
-    #[case::plugin_first(&["ArtworkPlugin", "TheAudioDB"], true)]
-    #[case::remote_first(&["TheAudioDB", "ArtworkPlugin"], false)]
-    #[case::default_remote_first(&[], false)]
+    #[case::plugin_first(&["ArtworkPlugin", "TheAudioDB"], None, true)]
+    #[case::remote_first(&["TheAudioDB", "ArtworkPlugin"], None, false)]
+    #[case::default_remote_first(&[], None, false)]
+    #[case::identified_plugin(&["TheAudioDB", "ArtworkPlugin"], Some("artworkplugin"), true)]
+    #[case::identified_remote(&["ArtworkPlugin", "TheAudioDB"], Some("TheAudioDB"), false)]
     #[tokio::test]
     async fn music_interleaves_plugin_and_remote_artwork(
         #[case] order: &[&str],
+        #[case] identified_by: Option<&str>,
         #[case] plugin_wins: bool,
     ) {
         use ferrofin_traits::persistence::ItemPersistenceService as _;
@@ -37270,13 +37283,27 @@ mod tests {
                 .collect(),
             ..Default::default()
         };
-        fixture
-            .pass(
-                &scanner,
+        let refresh = MetadataRefreshOptions {
+            search_result: identified_by.map(|name| {
+                ferrofin_model::providers::RemoteSearchResult {
+                    search_provider_name: Some(name.to_owned()),
+                    ..Default::default()
+                }
+            }),
+            ..Default::default()
+        };
+        scanner
+            .music_pass_with_options_for_test(
+                &[
+                    (fixture.album_id, super::music::MusicKind::Album),
+                    (fixture.artist_id, super::music::MusicKind::ByNameArtist),
+                ],
                 super::FetcherPolicy {
                     options: Some(&options),
                     ..Default::default()
                 },
+                true,
+                &refresh,
             )
             .await;
         for id in [fixture.album_id, fixture.artist_id] {

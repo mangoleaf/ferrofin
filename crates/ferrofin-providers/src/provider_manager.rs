@@ -2881,6 +2881,10 @@ impl LocalProviderManager {
                     &row,
                     &merged.provider_ids,
                     plan.remote_images,
+                    options
+                        .search_result
+                        .as_ref()
+                        .and_then(|r| r.search_provider_name.as_deref()),
                 ),
             ))
             .await;
@@ -3057,13 +3061,15 @@ impl LocalProviderManager {
         Ok(true)
     }
 
-    /// Remote and dynamic image providers share one ordered acquisition pass.
+    /// Remote and dynamic image providers share one ordered acquisition pass,
+    /// an Identify's chosen provider (`identified_by`) first.
     async fn refresh_ordered_images(
         &self,
         item_id: Uuid,
         row: &BaseItemEntity,
         ids: &[(String, String)],
         fetch: ImageFetch,
+        identified_by: Option<&str>,
     ) -> Result<bool, ServiceError> {
         let kind = short_kind(row);
         let library = self.library_options_for(row).await;
@@ -3095,14 +3101,12 @@ impl LocalProviderManager {
             })
         });
         sources.sort_by_key(|(name, _)| {
-            (
-                crate::library_options::image_fetcher_rank(
-                    library.as_ref(),
-                    global.as_ref(),
-                    kind,
-                    name,
-                ),
-                crate::library_options::default_image_order(kind, name),
+            crate::library_options::image_provider_order(
+                library.as_ref(),
+                global.as_ref(),
+                kind,
+                name,
+                identified_by,
             )
         });
         let lookup = ferrofin_traits::providers::DynamicMetadataLookup {
@@ -13433,21 +13437,27 @@ mod tests {
                 .collect())
         }
     }
+    /// `identified_by` is an Identify → Apply's `SearchProviderName`: that
+    /// provider runs first (`GetNonLocalImageProviders`).
     #[rstest::rstest]
-    #[case::none(&[], &[], None)]
-    #[case::plugin_only(&["ArtworkPlugin"], &[], Some("plugin"))]
-    #[case::plugin_first(&["ArtworkPlugin", "TheMovieDb"], &["ArtworkPlugin", "TheMovieDb"], Some("plugin"))]
-    #[case::plugin_last(&["ArtworkPlugin", "TheMovieDb"], &["TheMovieDb", "ArtworkPlugin"], Some("tmdb"))]
-    #[case::plugin_default(&["ArtworkPlugin", "TheMovieDb"], &[], Some("tmdb"))]
-    #[case::fanart_only(&["FanArt"], &[], Some("fanart"))]
-    #[case::tmdb_only(&["TheMovieDb"], &[], Some("tmdb"))]
-    #[case::fanart_first(&["FanArt", "TheMovieDb"], &["FanArt", "TheMovieDb"], Some("fanart"))]
-    #[case::tmdb_first(&["FanArt", "TheMovieDb"], &["TheMovieDb", "FanArt"], Some("tmdb"))]
-    #[case::default_order(&["FanArt", "TheMovieDb"], &[], Some("tmdb"))]
+    #[case::none(&[], &[], None, None)]
+    #[case::plugin_only(&["ArtworkPlugin"], &[], None, Some("plugin"))]
+    #[case::plugin_first(&["ArtworkPlugin", "TheMovieDb"], &["ArtworkPlugin", "TheMovieDb"], None, Some("plugin"))]
+    #[case::plugin_last(&["ArtworkPlugin", "TheMovieDb"], &["TheMovieDb", "ArtworkPlugin"], None, Some("tmdb"))]
+    #[case::plugin_default(&["ArtworkPlugin", "TheMovieDb"], &[], None, Some("tmdb"))]
+    #[case::fanart_only(&["FanArt"], &[], None, Some("fanart"))]
+    #[case::tmdb_only(&["TheMovieDb"], &[], None, Some("tmdb"))]
+    #[case::fanart_first(&["FanArt", "TheMovieDb"], &["FanArt", "TheMovieDb"], None, Some("fanart"))]
+    #[case::tmdb_first(&["FanArt", "TheMovieDb"], &["TheMovieDb", "FanArt"], None, Some("tmdb"))]
+    #[case::default_order(&["FanArt", "TheMovieDb"], &[], None, Some("tmdb"))]
+    #[case::identified_tmdb(&["FanArt", "TheMovieDb"], &["FanArt", "TheMovieDb"], Some("themoviedb"), Some("tmdb"))]
+    #[case::identified_plugin(&["ArtworkPlugin", "TheMovieDb"], &["TheMovieDb", "ArtworkPlugin"], Some("ArtworkPlugin"), Some("plugin"))]
+    #[case::identified_disabled(&["FanArt"], &[], Some("TheMovieDb"), Some("fanart"))]
     #[tokio::test]
     async fn pathless_refresh_obeys_image_selection_and_order(
         #[case] enabled: &[&str],
         #[case] order: &[&str],
+        #[case] identified_by: Option<&str>,
         #[case] expected: Option<&str>,
     ) {
         use ferrofin_model::configuration::{LibraryOptions, TypeOptions};
@@ -13516,6 +13526,11 @@ mod tests {
                 metadata_refresh_mode: MetadataRefreshMode::None,
                 image_refresh_mode: MetadataRefreshMode::FullRefresh,
                 replace_all_images: true,
+                search_result: identified_by.map(|name| RemoteSearchResult {
+                    provider_ids: Some(HashMap::from([("Tmdb".to_owned(), "603".to_owned())])),
+                    search_provider_name: Some(name.to_owned()),
+                    ..Default::default()
+                }),
                 ..Default::default()
             },
         )
@@ -13648,13 +13663,19 @@ mod tests {
                 .collect();
             assert_eq!(bytes, [b"GIF89afirst".to_vec(), b"GIF89asecond".to_vec()]);
             assert!(
-                !mgr.refresh_ordered_images(item_id, &movie, &ids, super::ImageFetch::MissingOnly)
-                    .await
-                    .unwrap()
+                !mgr.refresh_ordered_images(
+                    item_id,
+                    &movie,
+                    &ids,
+                    super::ImageFetch::MissingOnly,
+                    None
+                )
+                .await
+                .unwrap()
             );
             assert_eq!(*store.images.lock().unwrap(), first);
             assert!(
-                mgr.refresh_ordered_images(item_id, &movie, &ids, super::ImageFetch::All)
+                mgr.refresh_ordered_images(item_id, &movie, &ids, super::ImageFetch::All, None)
                     .await
                     .unwrap()
             );
