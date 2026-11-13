@@ -24738,7 +24738,11 @@ mod tests {
         }
 
         /// A `kind` row under the library, with an image file of each of
-        /// `images`, named after the type.
+        /// `images`, named after the type. It carries the library as its
+        /// ancestor and as its top parent (the shape rows an older scan saved
+        /// have; a current scan stamps the library's location folder, which
+        /// the library also stands for): the artist sample is scoped by the
+        /// top parent (`SetTopParentOrAncestorIds`), a browse by the ancestor.
         async fn row(
             &self,
             id: u128,
@@ -24747,7 +24751,8 @@ mod tests {
         ) -> uuid::Uuid {
             use ferrofin_traits::persistence::ItemPersistenceService as _;
             let id = uuid::Uuid::from_u128(id);
-            crate::test_support::seed_item(&self.db, id, kind).await;
+            crate::test_support::seed_top_parented_item(&self.db, id, kind, "", Self::LIBRARY)
+                .await;
             crate::FerrofinItemPersistenceService::new(self.db.clone())
                 .set_ancestors(id, &[Self::LIBRARY])
                 .await
@@ -24831,7 +24836,14 @@ mod tests {
         );
         crate::test_support::seed_item(&lib.db, other_library, BaseItemKind::CollectionFolder)
             .await;
-        crate::test_support::seed_item(&lib.db, other_track, BaseItemKind::Audio).await;
+        crate::test_support::seed_top_parented_item(
+            &lib.db,
+            other_track,
+            BaseItemKind::Audio,
+            "",
+            other_library,
+        )
+        .await;
         {
             use ferrofin_traits::persistence::ItemPersistenceService as _;
             crate::FerrofinItemPersistenceService::new(lib.db.clone())
