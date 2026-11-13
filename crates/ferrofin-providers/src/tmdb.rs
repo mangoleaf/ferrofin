@@ -13,6 +13,7 @@
 use crate::rate_limit::CountedBody as _;
 use crate::rate_limit::{LimitedRequest as _, RateLimiter};
 use ferrofin_model::entities::ImageType;
+use ferrofin_util::string_extensions::ordinal_ignore_case_key;
 use secrecy::{ExposeSecret, SecretString};
 use serde::Deserialize;
 
@@ -411,7 +412,8 @@ pub struct TmdbDetails {
     pub tagline: Option<String>,
     /// Genre names.
     pub genres: Vec<String>,
-    /// Production-company (studio) names.
+    /// Studio names: a series' networks then its production companies, a
+    /// movie's production companies; trimmed and distinct ignoring case.
     pub studios: Vec<String>,
     /// Community rating (`vote_average`, 0–10), when non-zero.
     pub community_rating: Option<f64>,
@@ -590,8 +592,8 @@ struct DetailsResponse {
     genres: Vec<NamedEntry>,
     #[serde(default)]
     production_companies: Vec<NamedEntry>,
-    /// TV broadcast networks (HBO, AMC, …); empty for movies. Jellyfin's series
-    /// "Networks" browse is populated from these, not production companies.
+    /// TV broadcast networks (HBO, AMC, …); empty for movies. A series' studios
+    /// list these before its production companies.
     #[serde(default)]
     networks: Vec<NamedEntry>,
     #[serde(default)]
@@ -2883,16 +2885,20 @@ struct PersonExternalIds {
     imdb_id: Option<String>,
 }
 
-/// Resolves an item's studios: for series, its broadcast networks (Jellyfin's
-/// "Networks" browse), falling back to production companies when TMDB lists no
-/// networks. Movies carry no networks, so they keep their production companies.
+/// Resolves an item's studios: a series' broadcast networks, then its
+/// production companies (`TmdbSeriesProvider.MapTvShowToSeries`); movies carry
+/// no networks, so they get their production companies (`TmdbMovieProvider`).
+/// Port of `BaseItem.SetStudios`: trimmed, distinct ignoring case. Blank names
+/// are dropped, as upstream's item-value save drops them.
 fn resolve_studios(networks: Vec<NamedEntry>, companies: Vec<NamedEntry>) -> Vec<String> {
-    let networks: Vec<String> = networks.into_iter().filter_map(|c| c.name).collect();
-    if networks.is_empty() {
-        companies.into_iter().filter_map(|c| c.name).collect()
-    } else {
-        networks
-    }
+    let mut seen = std::collections::HashSet::new();
+    networks
+        .into_iter()
+        .chain(companies)
+        .filter_map(|c| c.name)
+        .map(|name| name.trim().to_owned())
+        .filter(|name| !name.is_empty() && seen.insert(ordinal_ignore_case_key(name)))
+        .collect()
 }
 
 /// The four-digit year from a TMDB `YYYY-MM-DD` date string.
@@ -2958,7 +2964,7 @@ mod tests {
     async fn maps_collection_keywords_countries_and_series_fields() {
         let server = crate::mock_http::MockServer::start(vec![
             ("/movie/1", r#"{"belongs_to_collection":{"id":7,"name":"Collection"},"production_countries":[{"name":"Japan"}],"keywords":{"keywords":[{"name":"samurai"}]}}"#.into()),
-            ("/tv/2?", r#"{"episode_run_time":[42,45],"last_air_date":"2020-01-02","homepage":"https://example.org/show","keywords":{"results":[{"name":"drama"}]},"external_ids":{"tvdb_id":3,"tvrage_id":4}}"#.into()),
+            ("/tv/2?", r#"{"episode_run_time":[42,45],"last_air_date":"2020-01-02","homepage":"https://example.org/show","keywords":{"results":[{"name":"drama"}]},"external_ids":{"tvdb_id":3,"tvrage_id":4},"networks":[{"name":"HBO"}],"production_companies":[{"name":"Bad Wolf"}]}"#.into()),
             ("/episode/1", r#"{"external_ids":{"imdb_id":"tt123","tvdb_id":5,"tvrage_id":6},"videos":{"results":[{"site":"YouTube","type":"Trailer","key":"abc","name":"Trailer"}]},"credits":{"cast":[{"id":7,"name":"Actor"}]}}"#.into()),
         ]).await;
         let client = TmdbClient::new().with_base_url(&server.base_url);
@@ -2977,6 +2983,7 @@ mod tests {
         assert_eq!(series.tags, ["drama"]);
         assert_eq!(series.tvdb_id.as_deref(), Some("3"));
         assert_eq!(series.tvrage_id.as_deref(), Some("4"));
+        assert_eq!(series.studios, ["HBO", "Bad Wolf"]);
         let extras = client
             .episode_extras_for_language(2, 1, 1, None)
             .await
@@ -3002,6 +3009,40 @@ mod tests {
                 .unwrap()
                 .people
                 .is_none()
+        );
+    }
+
+    /// A series' studios are its networks then its production companies
+    /// (`TmdbSeriesProvider.MapTvShowToSeries`), a movie's its production
+    /// companies (`TmdbMovieProvider`), each through `BaseItem.SetStudios`:
+    /// trimmed and distinct ignoring case. Blank names are dropped, as
+    /// upstream's item-value save drops them.
+    #[rstest::rstest]
+    #[case::series_with_both(&["HBO"], &["Bad Wolf", "New Line"], &["HBO", "Bad Wolf", "New Line"])]
+    #[case::series_networks_only(&["HBO"], &[], &["HBO"])]
+    #[case::series_companies_only(&[], &["Bad Wolf"], &["Bad Wolf"])]
+    #[case::duplicate_across_lists(&[" HBO "], &["hbo", "Bad Wolf", "BAD WOLF"], &["HBO", "Bad Wolf"])]
+    #[case::non_ascii_duplicate(&["ÉTÉ Films"], &["été films"], &["ÉTÉ Films"])]
+    #[case::blank_names(&["", "  "], &["Bad Wolf"], &["Bad Wolf"])]
+    #[case::unicode_whitespace(&["\u{a0}HBO\u{3000}"], &[], &["HBO"])]
+    #[case::movie(&[], &["Legendary", "Warner Bros."], &["Legendary", "Warner Bros."])]
+    fn studios_are_networks_then_production_companies(
+        #[case] networks: &[&str],
+        #[case] companies: &[&str],
+        #[case] expected: &[&str],
+    ) {
+        let entries = |names: &[&str]| -> Vec<NamedEntry> {
+            names
+                .iter()
+                .map(|n| NamedEntry {
+                    name: Some((*n).to_owned()),
+                })
+                .chain([NamedEntry { name: None }])
+                .collect()
+        };
+        assert_eq!(
+            resolve_studios(entries(networks), entries(companies)),
+            expected
         );
     }
 
