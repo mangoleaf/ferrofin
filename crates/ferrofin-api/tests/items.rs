@@ -17,7 +17,7 @@ use ferrofin_api::create_router;
 use ferrofin_api::state::AppState;
 use ferrofin_api::test_support::{
     FakeConfig, FakeMediaSources, FakeMusic, FakeProviders, FakeSearch, FakeSessions,
-    FakeSimilarItems, FakeSystem, FakeUserData, minimal_base_item,
+    FakeSimilarItems, FakeSystem, FakeUserData, FixedAuth, fake_user_entity, minimal_base_item,
 };
 use ferrofin_db::entities::base_items::{BaseItemEntity, PeopleEntity};
 use ferrofin_db::entities::users::UserEntity;
@@ -32,7 +32,7 @@ use ferrofin_traits::error::ServiceError;
 use ferrofin_traits::library::{
     LibraryManager, UserManager, UserViewManager, VirtualFolderManager,
 };
-use ferrofin_traits::net::{AuthService, AuthorizationContext, RequestContext};
+use ferrofin_traits::net::{AuthService, AuthorizationContext};
 use ferrofin_traits::options::{
     AuthorizationInfo, DeleteOptions, DtoOptions, InternalItemsQuery, InternalPeopleQuery,
 };
@@ -57,38 +57,8 @@ const VIDEO_ID: Uuid = Uuid::from_u128(0x4444_4444_4444_4444_4444_4444_4444_4444
 /// field is a neutral zero value ([`UserEntity`] has no `Default`).
 fn user_entity(id: Uuid, username: &str) -> UserEntity {
     UserEntity {
-        id: id.to_string(),
-        audio_language_preference: None,
-        authentication_provider_id: String::new(),
-        cast_receiver_id: None,
-        display_collections_view: false,
-        display_missing_episodes: false,
-        enable_auto_login: false,
-        enable_local_password: false,
-        enable_next_episode_auto_play: false,
-        enable_user_preference_access: false,
-        hide_played_in_latest: false,
-        internal_id: 0,
-        invalid_login_attempt_count: 0,
-        last_activity_date: None,
-        last_login_date: None,
-        login_attempts_before_lockout: None,
-        max_active_sessions: 0,
-        max_parental_rating_score: None,
-        max_parental_rating_sub_score: None,
-        must_update_password: false,
         password: Some("hashed".to_owned()),
-        password_reset_provider_id: String::new(),
-        play_default_audio_track: false,
-        remember_audio_selections: false,
-        remember_subtitle_selections: false,
-        remote_client_bitrate_limit: None,
-        row_version: 0,
-        subtitle_language_preference: None,
-        subtitle_mode: 0,
-        sync_play_access: 0,
-        username: username.to_owned(),
-        normalized_username: username.to_uppercase(),
+        ..fake_user_entity(id, username)
     }
 }
 
@@ -188,41 +158,21 @@ fn item_entity(id: Uuid, name: &str, kind: BaseItemKind) -> BaseItemEntity {
 
 /// An [`AuthService`] that always authenticates as [`USER_ID`], so `RequireAuth`
 /// yields an authenticated context in the success-path tests.
-struct OkAuthService;
-
-#[async_trait]
-impl AuthService for OkAuthService {
-    async fn authenticate(
-        &self,
-        _request: &RequestContext,
-    ) -> Result<AuthorizationInfo, ServiceError> {
-        Ok(AuthorizationInfo {
-            user: Some(Arc::new(user_entity(USER_ID, "alice"))),
-            is_authenticated: true,
-            ..AuthorizationInfo::default()
-        })
-    }
+fn ok_auth_service() -> FixedAuth {
+    FixedAuth::signed_in(user_entity(USER_ID, "alice"))
 }
 
 /// An [`AuthorizationContext`] that resolves the same authenticated user.
-struct OkAuthContext;
-
-#[async_trait]
-impl AuthorizationContext for OkAuthContext {
-    async fn get_authorization_info(
-        &self,
-        _request: &RequestContext,
-    ) -> Result<AuthorizationInfo, ServiceError> {
-        Ok(AuthorizationInfo {
-            user: Some(Arc::new(user_entity(USER_ID, "alice"))),
-            client: Some("Wolphin".to_owned()),
-            version: Some("1.0".to_owned()),
-            device_id: Some("dev-1".to_owned()),
-            device: Some("Test Device".to_owned()),
-            is_authenticated: true,
-            ..AuthorizationInfo::default()
-        })
-    }
+fn ok_auth_context() -> FixedAuth {
+    FixedAuth(AuthorizationInfo {
+        user: Some(Arc::new(user_entity(USER_ID, "alice"))),
+        client: Some("Wolphin".to_owned()),
+        version: Some("1.0".to_owned()),
+        device_id: Some("dev-1".to_owned()),
+        device: Some("Test Device".to_owned()),
+        is_authenticated: true,
+        ..AuthorizationInfo::default()
+    })
 }
 
 /// A [`UserManager`] whose `get_user_by_id` returns the fixed user.
@@ -872,7 +822,7 @@ fn ok_state_with_users(library: OkLibrary, users: Arc<dyn UserManager>) -> AppSt
         library,
         users,
         Arc::new(OkDto),
-        (Arc::new(OkAuthContext), Arc::new(OkAuthService)),
+        (Arc::new(ok_auth_context()), Arc::new(ok_auth_service())),
     )
 }
 
@@ -952,34 +902,8 @@ async fn json_body(response: axum::response::Response) -> serde_json::Value {
 // ---- extras harness (`send`) --------------------------------------------------
 
 /// An auth pair that authenticates every request as [`USER_ID`].
-struct StubAuth;
-
-#[async_trait]
-impl AuthService for StubAuth {
-    async fn authenticate(
-        &self,
-        _request: &RequestContext,
-    ) -> Result<AuthorizationInfo, ServiceError> {
-        Ok(AuthorizationInfo {
-            user: Some(Arc::new(user_entity(USER_ID, "alice"))),
-            is_authenticated: true,
-            ..AuthorizationInfo::default()
-        })
-    }
-}
-
-#[async_trait]
-impl AuthorizationContext for StubAuth {
-    async fn get_authorization_info(
-        &self,
-        _request: &RequestContext,
-    ) -> Result<AuthorizationInfo, ServiceError> {
-        Ok(AuthorizationInfo {
-            user: Some(Arc::new(user_entity(USER_ID, "alice"))),
-            is_authenticated: true,
-            ..AuthorizationInfo::default()
-        })
-    }
+fn stub_auth() -> FixedAuth {
+    FixedAuth::signed_in(user_entity(USER_ID, "alice"))
 }
 
 /// A [`LibraryManager`] that resolves [`ITEM_ID`], a [`ROOT_ID`] root folder, a
@@ -1399,7 +1323,7 @@ fn person_state(
         },
         Arc::new(OkUsers),
         Arc::new(OkDto),
-        (Arc::new(OkAuthContext), Arc::new(OkAuthService)),
+        (Arc::new(ok_auth_context()), Arc::new(ok_auth_service())),
         providers,
     )
 }
@@ -1681,8 +1605,8 @@ fn stub_state() -> AppState {
         Arc::new(FakeSimilarItems),
         Arc::new(FakeSearch),
         Arc::new(OkDto),
-        Arc::new(StubAuth),
-        Arc::new(StubAuth),
+        Arc::new(stub_auth()),
+        Arc::new(stub_auth()),
         Arc::new(ferrofin_api::test_support::FakeQuickConnect),
         Arc::new(ferrofin_api::test_support::FakePlaylists),
         Arc::new(ferrofin_api::test_support::FakeCollections),
@@ -1819,37 +1743,16 @@ async fn items_adds_the_tags_field_for_a_user_with_allowed_tags() {
 /// no whitelist, so `Tags` here can only have come from the request's policy.
 #[tokio::test]
 async fn items_reads_the_callers_tag_whitelist_from_the_request_policy() {
-    struct WhitelistedAuth;
-    impl WhitelistedAuth {
-        fn info() -> AuthorizationInfo {
-            AuthorizationInfo {
-                user: Some(Arc::new(user_entity(USER_ID, "alice"))),
-                user_policy: Some(Arc::new(ferrofin_model::users::UserPolicy {
-                    allowed_tags: vec!["kids".to_owned()],
-                    ..ferrofin_model::users::UserPolicy::default()
-                })),
-                is_authenticated: true,
-                ..AuthorizationInfo::default()
-            }
-        }
-    }
-    #[async_trait]
-    impl AuthService for WhitelistedAuth {
-        async fn authenticate(
-            &self,
-            _request: &RequestContext,
-        ) -> Result<AuthorizationInfo, ServiceError> {
-            Ok(Self::info())
-        }
-    }
-    #[async_trait]
-    impl AuthorizationContext for WhitelistedAuth {
-        async fn get_authorization_info(
-            &self,
-            _request: &RequestContext,
-        ) -> Result<AuthorizationInfo, ServiceError> {
-            Ok(Self::info())
-        }
+    fn whitelisted_auth() -> FixedAuth {
+        FixedAuth(AuthorizationInfo {
+            user: Some(Arc::new(user_entity(USER_ID, "alice"))),
+            user_policy: Some(Arc::new(ferrofin_model::users::UserPolicy {
+                allowed_tags: vec!["kids".to_owned()],
+                ..ferrofin_model::users::UserPolicy::default()
+            })),
+            is_authenticated: true,
+            ..AuthorizationInfo::default()
+        })
     }
 
     let library = OkLibrary {
@@ -1864,7 +1767,7 @@ async fn items_reads_the_callers_tag_whitelist_from_the_request_policy() {
         library,
         Arc::new(OkUsers),
         Arc::new(OkDto),
-        (Arc::new(WhitelistedAuth), Arc::new(WhitelistedAuth)),
+        (Arc::new(whitelisted_auth()), Arc::new(whitelisted_auth())),
     );
     let response = create_router(state)
         .oneshot(
@@ -3175,19 +3078,11 @@ impl DtoService for DtoSays {
 
 /// An [`AuthService`] whose token is authenticated but names no user and is
 /// not an API key — a token whose user has gone.
-struct UserlessAuthService;
-
-#[async_trait]
-impl AuthService for UserlessAuthService {
-    async fn authenticate(
-        &self,
-        _request: &RequestContext,
-    ) -> Result<AuthorizationInfo, ServiceError> {
-        Ok(AuthorizationInfo {
-            is_authenticated: true,
-            ..AuthorizationInfo::default()
-        })
-    }
+fn userless_auth_service() -> FixedAuth {
+    FixedAuth(AuthorizationInfo {
+        is_authenticated: true,
+        ..AuthorizationInfo::default()
+    })
 }
 
 /// Sends `DELETE uri` through a router over `state`.
@@ -3208,7 +3103,7 @@ async fn delete(state: AppState, uri: &str) -> StatusCode {
 
 /// The authenticated user every other test runs as.
 fn alice() -> Auth {
-    (Arc::new(OkAuthContext), Arc::new(OkAuthService))
+    (Arc::new(ok_auth_context()), Arc::new(ok_auth_service()))
 }
 
 /// The delete log a [`two_item_state`] library keeps.
@@ -3337,7 +3232,7 @@ async fn an_api_key_skips_the_check_and_a_userless_token_is_refused() {
             Arc::new(OkDto),
             (
                 Arc::new(ferrofin_api::test_support::FakeAuthContext),
-                Arc::new(UserlessAuthService),
+                Arc::new(userless_auth_service()),
             ),
         );
         assert_eq!(delete(state, &uri).await, expected, "{uri}");
@@ -3895,7 +3790,7 @@ async fn a_playlist_or_box_set_listing_projects_its_linked_children() {
             },
             Arc::new(OkUsers),
             Arc::new(LinkedChildrenDto),
-            (Arc::new(OkAuthContext), Arc::new(OkAuthService)),
+            (Arc::new(ok_auth_context()), Arc::new(ok_auth_service())),
         );
         let response = create_router(state)
             .oneshot(

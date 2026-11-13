@@ -18,7 +18,7 @@ use ferrofin_api::test_support::{
     FakeDto, FakeLibrary, FakeLocalization, FakeLyrics, FakeMediaSegments, FakeMediaSources,
     FakeMusic, FakePlaylists, FakeProviders, FakeQuickConnect, FakeSearch, FakeSessions,
     FakeSimilarItems, FakeSubtitles, FakeTasks, FakeTrickplay, FakeTvSeries, FakeUserData,
-    FakeUserViews, FakeUsers,
+    FakeUserViews, FakeUsers, FixedAuth, fake_user_entity,
 };
 use ferrofin_db::entities::display_preferences::{
     DisplayPreferencesEntity, HomeSectionEntity, ItemDisplayPreferencesEntity,
@@ -29,7 +29,7 @@ use ferrofin_model::configuration::ServerConfiguration;
 use ferrofin_model::system::{FolderStorageInfo, PublicSystemInfo, SystemInfo, SystemStorageInfo};
 use ferrofin_traits::configuration::ServerConfigurationManager;
 use ferrofin_traits::error::ServiceError;
-use ferrofin_traits::net::{AuthService, AuthorizationContext, RequestContext};
+use ferrofin_traits::net::RequestContext;
 use ferrofin_traits::options::AuthorizationInfo;
 use ferrofin_traits::system::{ServerApplicationPaths, SystemManager};
 use tower::ServiceExt;
@@ -42,73 +42,17 @@ const OTHER_USER_ID: Uuid = Uuid::from_u128(0x00D1_0001);
 
 /// A minimal authenticated user.
 fn user() -> UserEntity {
-    UserEntity {
-        id: USER_ID.to_string(),
-        audio_language_preference: None,
-        authentication_provider_id: String::new(),
-        cast_receiver_id: None,
-        display_collections_view: false,
-        display_missing_episodes: false,
-        enable_auto_login: false,
-        enable_local_password: false,
-        enable_next_episode_auto_play: false,
-        enable_user_preference_access: false,
-        hide_played_in_latest: false,
-        internal_id: 0,
-        invalid_login_attempt_count: 0,
-        last_activity_date: None,
-        last_login_date: None,
-        login_attempts_before_lockout: None,
-        max_active_sessions: 0,
-        max_parental_rating_score: None,
-        max_parental_rating_sub_score: None,
-        must_update_password: false,
-        password: None,
-        password_reset_provider_id: String::new(),
-        play_default_audio_track: false,
-        remember_audio_selections: false,
-        remember_subtitle_selections: false,
-        remote_client_bitrate_limit: None,
-        row_version: 0,
-        subtitle_language_preference: None,
-        subtitle_mode: 0,
-        sync_play_access: 0,
-        username: "bob".to_owned(),
-        normalized_username: "BOB".to_owned(),
-    }
+    fake_user_entity(USER_ID, "bob")
 }
 
 /// An auth stub that authenticates as [`USER_ID`].
-struct OkAuth;
-
-#[async_trait]
-impl AuthService for OkAuth {
-    async fn authenticate(
-        &self,
-        _request: &RequestContext,
-    ) -> Result<AuthorizationInfo, ServiceError> {
-        Ok(AuthorizationInfo {
-            token: Some("tok".into()),
-            user: Some(Arc::new(user())),
-            is_authenticated: true,
-            ..Default::default()
-        })
-    }
-}
-
-#[async_trait]
-impl AuthorizationContext for OkAuth {
-    async fn get_authorization_info(
-        &self,
-        _request: &RequestContext,
-    ) -> Result<AuthorizationInfo, ServiceError> {
-        Ok(AuthorizationInfo {
-            token: Some("tok".into()),
-            user: Some(Arc::new(user())),
-            is_authenticated: true,
-            ..Default::default()
-        })
-    }
+fn ok_auth() -> FixedAuth {
+    FixedAuth(AuthorizationInfo {
+        token: Some("tok".into()),
+        user: Some(Arc::new(user())),
+        is_authenticated: true,
+        ..Default::default()
+    })
 }
 
 /// A configuration manager returning canned config + branding.
@@ -381,7 +325,7 @@ fn state_with_display_prefs_as(
     prefs: Arc<dyn ferrofin_traits::configuration::DisplayPreferencesManager>,
     users: Arc<dyn ferrofin_traits::library::UserManager>,
 ) -> AppState {
-    let auth = Arc::new(OkAuth);
+    let auth = Arc::new(ok_auth());
     AppState::new(
         Arc::new(FakeLibrary),
         users,

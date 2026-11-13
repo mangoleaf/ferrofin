@@ -41,13 +41,13 @@ use axum::extract::ConnectInfo;
 use axum::http::{Request, StatusCode};
 use ferrofin_api::create_router;
 use ferrofin_api::test_support::{
-    FakeAuthContext, FakeAuthService, PolicyUsers, required_query, sample_user,
+    FakeAuthContext, FakeAuthService, FixedAuth, PolicyUsers, required_query, sample_user,
     setup_complete_state_as,
 };
 use ferrofin_model::sync_play::GroupInfoDto;
 use ferrofin_model::users::{AccessSchedule, DynamicDayOfWeek, UserPolicy};
 use ferrofin_traits::error::ServiceError;
-use ferrofin_traits::net::{AuthService, AuthorizationContext, RequestContext};
+use ferrofin_traits::net::{AuthService, AuthorizationContext};
 use ferrofin_traits::options::AuthorizationInfo;
 use ferrofin_traits::stubs::{
     PlaybackRequest, SyncPlayManager, SyncPlayNowPlaying, SyncPlaySession,
@@ -388,30 +388,6 @@ fn policy(caller: Caller) -> UserPolicy {
     }
 }
 
-/// Resolves and authenticates every request as one fixed identity, as a token
-/// naming it would.
-struct Identity(AuthorizationInfo);
-
-#[async_trait]
-impl AuthService for Identity {
-    async fn authenticate(
-        &self,
-        _request: &RequestContext,
-    ) -> Result<AuthorizationInfo, ServiceError> {
-        Ok(self.0.clone())
-    }
-}
-
-#[async_trait]
-impl AuthorizationContext for Identity {
-    async fn get_authorization_info(
-        &self,
-        _request: &RequestContext,
-    ) -> Result<AuthorizationInfo, ServiceError> {
-        Ok(self.0.clone())
-    }
-}
-
 /// A SyncPlay manager in which the caller is, or is not, in a group; anything
 /// past the gate is a fake's panic.
 struct SyncPlay {
@@ -467,7 +443,7 @@ fn router(caller: Caller) -> Router {
             enable_user_preference_access: policy.enable_user_preference_access,
             ..sample_user()
         };
-        let identity = Arc::new(Identity(AuthorizationInfo {
+        let identity = Arc::new(FixedAuth(AuthorizationInfo {
             is_authenticated: true,
             token: Some("policy-sweep-token".into()),
             user: Some(Arc::new(user)),

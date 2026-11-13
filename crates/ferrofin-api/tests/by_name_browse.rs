@@ -15,7 +15,7 @@ use ferrofin_api::create_router;
 use ferrofin_api::state::AppState;
 use ferrofin_api::test_support::{
     FakeAppHost, FakeConfig, FakeMediaSources, FakeMusic, FakeSearch, FakeSessions,
-    FakeSimilarItems, FakeSystem, FakeUserData, FakeUserViews,
+    FakeSimilarItems, FakeSystem, FakeUserData, FakeUserViews, FixedAuth, fake_user_entity,
 };
 use ferrofin_db::entities::base_items::{BaseItemEntity, PeopleEntity};
 use ferrofin_db::entities::users::UserEntity;
@@ -25,7 +25,7 @@ use ferrofin_model::querying::{QueryFiltersLegacy, QueryResult};
 use ferrofin_traits::dto::DtoService;
 use ferrofin_traits::error::ServiceError;
 use ferrofin_traits::library::{LibraryManager, UserManager};
-use ferrofin_traits::net::{AuthService, AuthorizationContext, RequestContext};
+use ferrofin_traits::net::{AuthService, AuthorizationContext};
 use ferrofin_traits::options::{
     AuthorizationInfo, DeleteOptions, DtoOptions, InternalItemsQuery, InternalPeopleQuery,
 };
@@ -38,38 +38,8 @@ const USER_ID: Uuid = Uuid::from_u128(0x5150);
 /// Minimal authenticated user; every non-id field is a neutral zero value.
 fn user_entity(id: Uuid) -> UserEntity {
     UserEntity {
-        id: id.to_string(),
-        audio_language_preference: None,
-        authentication_provider_id: String::new(),
-        cast_receiver_id: None,
-        display_collections_view: false,
-        display_missing_episodes: false,
-        enable_auto_login: false,
-        enable_local_password: false,
-        enable_next_episode_auto_play: false,
-        enable_user_preference_access: false,
-        hide_played_in_latest: false,
-        internal_id: 0,
-        invalid_login_attempt_count: 0,
-        last_activity_date: None,
-        last_login_date: None,
-        login_attempts_before_lockout: None,
-        max_active_sessions: 0,
-        max_parental_rating_score: None,
-        max_parental_rating_sub_score: None,
-        must_update_password: false,
         password: Some("hashed".to_owned()),
-        password_reset_provider_id: String::new(),
-        play_default_audio_track: false,
-        remember_audio_selections: false,
-        remember_subtitle_selections: false,
-        remote_client_bitrate_limit: None,
-        row_version: 0,
-        subtitle_language_preference: None,
-        subtitle_mode: 0,
-        sync_play_access: 0,
-        username: "bob".to_owned(),
-        normalized_username: "BOB".to_owned(),
+        ..fake_user_entity(id, "bob")
     }
 }
 
@@ -536,63 +506,19 @@ impl DtoService for OkDto {
 
 /// An [`AuthService`]/[`AuthorizationContext`] pair that authenticates as
 /// [`USER_ID`] so `RequireAuth` passes.
-struct OkAuth;
-
-#[async_trait]
-impl AuthService for OkAuth {
-    async fn authenticate(&self, _r: &RequestContext) -> Result<AuthorizationInfo, ServiceError> {
-        Ok(AuthorizationInfo {
-            user: Some(Arc::new(user_entity(USER_ID))),
-            is_authenticated: true,
-            ..AuthorizationInfo::default()
-        })
-    }
-}
-
-#[async_trait]
-impl AuthorizationContext for OkAuth {
-    async fn get_authorization_info(
-        &self,
-        _r: &RequestContext,
-    ) -> Result<AuthorizationInfo, ServiceError> {
-        Ok(AuthorizationInfo {
-            user: Some(Arc::new(user_entity(USER_ID))),
-            is_authenticated: true,
-            ..AuthorizationInfo::default()
-        })
-    }
+fn ok_auth() -> FixedAuth {
+    FixedAuth::signed_in(user_entity(USER_ID))
 }
 
 /// An [`AuthService`]/[`AuthorizationContext`] pair for an API key: an
 /// authenticated request with no user, as `AuthorizationContext` builds it for
 /// a server key.
-struct ApiKeyAuth;
-
-impl ApiKeyAuth {
-    fn info() -> AuthorizationInfo {
-        AuthorizationInfo {
-            is_api_key: true,
-            is_authenticated: true,
-            ..AuthorizationInfo::default()
-        }
-    }
-}
-
-#[async_trait]
-impl AuthService for ApiKeyAuth {
-    async fn authenticate(&self, _r: &RequestContext) -> Result<AuthorizationInfo, ServiceError> {
-        Ok(Self::info())
-    }
-}
-
-#[async_trait]
-impl AuthorizationContext for ApiKeyAuth {
-    async fn get_authorization_info(
-        &self,
-        _r: &RequestContext,
-    ) -> Result<AuthorizationInfo, ServiceError> {
-        Ok(Self::info())
-    }
+fn api_key_auth() -> FixedAuth {
+    FixedAuth(AuthorizationInfo {
+        is_api_key: true,
+        is_authenticated: true,
+        ..AuthorizationInfo::default()
+    })
 }
 
 fn by_name_state() -> AppState {
@@ -613,7 +539,7 @@ fn by_name_state_with_dto(dto: Arc<dyn DtoService>) -> AppState {
 
 /// The by-name test state with both seams injected.
 fn by_name_state_with(dto: Arc<dyn DtoService>, library: ByNameLibrary) -> AppState {
-    by_name_state_authed(dto, library, Arc::new(OkAuth))
+    by_name_state_authed(dto, library, Arc::new(ok_auth()))
 }
 
 /// The by-name test state with both seams injected, authenticating every
@@ -1240,7 +1166,7 @@ async fn by_name_browses_honour_image_and_user_data_toggles() {
 #[tokio::test]
 async fn an_api_key_lists_by_name_items_with_no_user(#[case] uri: &str) {
     let library = ByNameLibrary::default();
-    let state = by_name_state_authed(Arc::new(OkDto), library.clone(), Arc::new(ApiKeyAuth));
+    let state = by_name_state_authed(Arc::new(OkDto), library.clone(), Arc::new(api_key_auth()));
     let response = create_router(state)
         .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
         .await
@@ -1281,7 +1207,7 @@ async fn an_api_key_reads_a_by_name_item_with_no_user(#[case] uri: &str, #[case]
     let state = by_name_state_authed(
         Arc::new(OkDto),
         ByNameLibrary::default(),
-        Arc::new(ApiKeyAuth),
+        Arc::new(api_key_auth()),
     );
     let response = create_router(state)
         .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
