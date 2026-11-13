@@ -3924,9 +3924,10 @@ struct PassTimings {
 }
 
 impl PassTimings {
-    /// One `info!` per scan with every pass's milliseconds, and each pass's
+    /// One `info!` per scan with every pass's milliseconds and the whole
+    /// phase's (`elapsed`, `RunPostScanTasks`' closing line), and each pass's
     /// duration on the pass histogram (labels: [`crate::scan_metrics::SCAN_PASSES`]).
-    fn log(&self, albums_and_artists: usize) {
+    fn log(&self, albums_and_artists: usize, elapsed: std::time::Duration) {
         let [
             music,
             album_covers,
@@ -3970,8 +3971,55 @@ impl PassTimings {
             dynamic_images_ms = ms(self.dynamic_images),
             collections_ms = ms(self.collections),
             splashscreen_ms = ms(self.splashscreen),
+            elapsed_ms = ms(elapsed),
             "post-scan passes complete"
         );
+    }
+}
+
+/// Runs one closing pass of [`LibraryScanner::post_scan_passes`] and logs it
+/// as `LibraryManager.RunPostScanTasks` logs each post-scan task: an `info!`
+/// as it starts (`number` of [`POST_SCAN_PASSES`]) and one as it finishes,
+/// with `elapsed_ms` and an `outcome`: `cancelled` when the scan was cancelled
+/// by then, `failed` when `work` answers `false` (it logged its error itself),
+/// else `completed`. A pass whose failures are per item (music, album covers)
+/// logs those inside and answers `true`, as an upstream task completes over
+/// its items' errors. Both lines and every event of `work` run in a
+/// `post_scan_pass` span carrying `pass`, the pass's
+/// [`crate::scan_metrics::SCAN_PASSES`] label. Answers the pass's time.
+///
+/// `work` is boxed before the returned future holds it: a pass's future sits
+/// at clippy's `large_futures` ceiling, and the span around it would tip it over.
+fn post_scan_pass<'a>(
+    pass: &'static str,
+    number: u32,
+    cancel: &'a ScanCancel,
+    work: impl std::future::Future<Output = bool> + 'a,
+) -> impl std::future::Future<Output = std::time::Duration> + 'a {
+    let work = Box::pin(work);
+    async move {
+        let span = tracing::info_span!("post_scan_pass", pass);
+        span.in_scope(|| {
+            tracing::info!(number, passes = POST_SCAN_PASSES, "post-scan pass started");
+        });
+        let started = std::time::Instant::now();
+        let succeeded = tracing::Instrument::instrument(work, span.clone()).await;
+        let elapsed = started.elapsed();
+        let outcome = if cancel.is_cancelled() {
+            "cancelled"
+        } else if succeeded {
+            "completed"
+        } else {
+            "failed"
+        };
+        span.in_scope(|| {
+            tracing::info!(
+                elapsed_ms = elapsed.as_millis(),
+                outcome,
+                "post-scan pass finished"
+            );
+        });
+        elapsed
     }
 }
 
@@ -9719,8 +9767,8 @@ impl LibraryScanner {
     /// | dynamic images | first the photo albums, folders and playlist files the walk refreshed with every provider (`runAllProviders`), forced; then per item: no generated Primary yet, or its file changed (`HasChangedByDate`); never a locked row | `BaseDynamicImageProvider.HasChanged`, `MetadataService.GetProviders` |
     /// | collections | movies in libraries with automatic collections enabled | `CollectionPostScanTask` |
     /// | splashscreen | 30 random movies and series rated at most 13, for posters and thumbs (backdrops when no thumb); rebuilt on every validation, as upstream's | `SplashscreenPostScanTask` |
-    // One straight sequence of the closing passes, each timed; a helper per
-    // pass would only scatter the table above.
+    // One straight sequence of the closing passes, each timed and logged by
+    // `post_scan_pass`; a helper per pass would only scatter the table above.
     #[allow(clippy::too_many_lines)]
     async fn post_scan_passes(
         &self,
@@ -9738,30 +9786,52 @@ impl LibraryScanner {
         if run.cancel.is_cancelled() {
             return false;
         }
+        let [
+            music,
+            album_covers,
+            years,
+            artists,
+            dead_by_name,
+            aggregates,
+            by_name_paths,
+            studios,
+            library_images,
+            dynamic_images,
+            collections,
+            splashscreen,
+        ] = crate::scan_metrics::SCAN_PASSES;
+        tracing::info!(passes = POST_SCAN_PASSES, "running post-scan passes");
+        let phase = std::time::Instant::now();
         let mut timings = PassTimings::default();
         let mut served = work.served.clone();
-        let started = std::time::Instant::now();
         // Music: each album's and artist's providers as the walk decided.
-        self.refresh_music(&work.music, &art_cache.album_gains, run, &mut served)
-            .await;
-        timings.music = started.elapsed();
+        timings.music = post_scan_pass(music, done + 1, run.cancel, async {
+            self.refresh_music(&work.music, &art_cache.album_gains, run, &mut served)
+                .await;
+            true
+        })
+        .await;
         if !self.between_passes(run, &mut done).await {
             return false;
         }
-        let started = std::time::Instant::now();
-        self.finish_album_artwork(art_cache, run).await;
-        timings.album_covers = started.elapsed();
+        timings.album_covers = post_scan_pass(album_covers, done + 1, run.cancel, async {
+            self.finish_album_artwork(art_cache, run).await;
+            true
+        })
+        .await;
         if !self.between_passes(run, &mut done).await {
             return false;
         }
         // One `Year` item per distinct ProductionYear now in the library
         // (Jellyfin creates them lazily from `/Years`; doing it here keeps
         // that read write-free and lists every year on first request).
-        let started = std::time::Instant::now();
-        if let Err(err) = self.materialize_years().await {
-            tracing::warn!(%err, "year pass failed");
-        }
-        timings.years = started.elapsed();
+        timings.years = post_scan_pass(years, done + 1, run.cancel, async {
+            self.materialize_years()
+                .await
+                .inspect_err(|err| tracing::warn!(%err, "year pass failed"))
+                .is_ok()
+        })
+        .await;
         if !self.between_passes(run, &mut done).await {
             return false;
         }
@@ -9769,27 +9839,34 @@ impl LibraryScanner {
         // `MusicArtist` rows a folder-resolved artist of the same name
         // supersedes (otherwise /Artists lists each one twice), then refresh
         // every by-name artist never refreshed.
-        let started = std::time::Instant::now();
-        if let Err(err) = self.retire_accessed_by_name_artists().await {
-            tracing::warn!(%err, "by-name artist retirement pass failed");
-        }
-        if let Err(err) = self
-            .refresh_by_name_artists(run, work.outside, &mut served)
-            .await
-        {
-            tracing::warn!(%err, "by-name artist pass failed");
-        }
-        timings.artists = started.elapsed();
+        timings.artists = post_scan_pass(artists, done + 1, run.cancel, async {
+            let mut succeeded = true;
+            if let Err(err) = self.retire_accessed_by_name_artists().await {
+                tracing::warn!(%err, "by-name artist retirement pass failed");
+                succeeded = false;
+            }
+            if let Err(err) = self
+                .refresh_by_name_artists(run, work.outside, &mut served)
+                .await
+            {
+                tracing::warn!(%err, "by-name artist pass failed");
+                succeeded = false;
+            }
+            succeeded
+        })
+        .await;
         if !self.between_passes(run, &mut done).await {
             return false;
         }
         // The validators' closing sweep: the by-name rows nothing in the
         // library names any more.
-        let started = std::time::Instant::now();
-        if let Err(err) = self.delete_dead_by_name_items().await {
-            tracing::warn!(%err, "dead by-name sweep failed");
-        }
-        timings.dead_by_name = started.elapsed();
+        timings.dead_by_name = post_scan_pass(dead_by_name, done + 1, run.cancel, async {
+            self.delete_dead_by_name_items()
+                .await
+                .inspect_err(|err| tracing::warn!(%err, "dead by-name sweep failed"))
+                .is_ok()
+        })
+        .await;
         if !self.between_passes(run, &mut done).await {
             return false;
         }
@@ -9798,20 +9875,26 @@ impl LibraryScanner {
         // children-derived columns of every folder the scan planned:
         // cumulative runtime (albums, artists) and last media added
         // (series).
-        let started = std::time::Instant::now();
-        if let Err(err) = self
-            .refresh_missing_episodes(&work.missing_episodes_to_refresh(), art_cache, run)
-            .await
-        {
-            tracing::warn!(%err, "missing episode pass failed");
-        }
-        if let Err(err) = self.remove_obsolete_episodes(&work.series, run).await {
-            tracing::warn!(%err, "obsolete episode pass failed");
-        }
-        if let Err(err) = self.update_folder_aggregates(planned, run).await {
-            tracing::warn!(%err, "folder aggregates pass failed");
-        }
-        timings.aggregates = started.elapsed();
+        timings.aggregates = post_scan_pass(aggregates, done + 1, run.cancel, async {
+            let mut succeeded = true;
+            if let Err(err) = self
+                .refresh_missing_episodes(&work.missing_episodes_to_refresh(), art_cache, run)
+                .await
+            {
+                tracing::warn!(%err, "missing episode pass failed");
+                succeeded = false;
+            }
+            if let Err(err) = self.remove_obsolete_episodes(&work.series, run).await {
+                tracing::warn!(%err, "obsolete episode pass failed");
+                succeeded = false;
+            }
+            if let Err(err) = self.update_folder_aggregates(planned, run).await {
+                tracing::warn!(%err, "folder aggregates pass failed");
+                succeeded = false;
+            }
+            succeeded
+        })
+        .await;
         if !self.between_passes(run, &mut done).await {
             return false;
         }
@@ -9819,24 +9902,30 @@ impl LibraryScanner {
         // (`{metadata}/Genre/Action`, …). Jellyfin's `CreateItemByName` sets it
         // at insert time; here the row is a by-product of `save_item_values`,
         // which has no notion of the metadata root, so it is filled here.
-        let started = std::time::Instant::now();
-        if let Some(store) = &self.by_name
-            && let Err(err) = store.backfill_paths().await
-        {
-            tracing::warn!(%err, "by-name path backfill failed");
-        }
-        timings.by_name_paths = started.elapsed();
+        timings.by_name_paths = post_scan_pass(by_name_paths, done + 1, run.cancel, async {
+            let Some(store) = &self.by_name else {
+                return true;
+            };
+            store
+                .backfill_paths()
+                .await
+                .inspect_err(|err| tracing::warn!(%err, "by-name path backfill failed"))
+                .is_ok()
+        })
+        .await;
         if !self.between_passes(run, &mut done).await {
             return false;
         }
         // Studio thumbs from the artwork repository for the by-name Studio
         // rows never refreshed, so the TV Networks / Studios tabs carry
         // artwork.
-        let started = std::time::Instant::now();
-        if let Err(err) = self.enrich_studio_images(run).await {
-            tracing::warn!(%err, "studio image pass failed");
-        }
-        timings.studios = started.elapsed();
+        timings.studios = post_scan_pass(studios, done + 1, run.cancel, async {
+            self.enrich_studio_images(run)
+                .await
+                .inspect_err(|err| tracing::warn!(%err, "studio image pass failed"))
+                .is_ok()
+        })
+        .await;
         if !self.between_passes(run, &mut done).await {
             return false;
         }
@@ -9845,11 +9934,15 @@ impl LibraryScanner {
         // CollectionFolderImageProvider), so it has to run after the passes
         // that fetch that content's artwork — otherwise a first scan sees no
         // art and the "My Media" tile keeps the icon placeholder.
-        let started = std::time::Instant::now();
-        if let Err(err) = self.refresh_library_images(folders, run.options).await {
-            tracing::warn!(%err, "failed to record the library tiles' refresh");
-        }
-        timings.library_images = started.elapsed();
+        timings.library_images = post_scan_pass(library_images, done + 1, run.cancel, async {
+            self.refresh_library_images(folders, run.options)
+                .await
+                .inspect_err(
+                    |err| tracing::warn!(%err, "failed to record the library tiles' refresh"),
+                )
+                .is_ok()
+        })
+        .await;
         if !self.between_passes(run, &mut done).await {
             return false;
         }
@@ -9857,8 +9950,10 @@ impl LibraryScanner {
         // `BaseDynamicImageProvider` family, run by the by-name validators at
         // the end of library validation). Same ordering reason as the library
         // tiles: the collages sample the artwork the passes above produced.
-        let started = std::time::Instant::now();
-        if let Some(providers) = self.dynamic_image_providers() {
+        timings.dynamic_images = post_scan_pass(dynamic_images, done + 1, run.cancel, async {
+            let Some(providers) = self.dynamic_image_providers() else {
+                return true;
+            };
             let between =
                 || -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
                     Box::pin(async move {
@@ -9873,33 +9968,43 @@ impl LibraryScanner {
                 .copied()
                 .filter(|&(_, force)| force)
                 .collect();
+            let mut succeeded = true;
             if let Err(err) = providers.refresh_rows_between(&forced, &between).await {
                 tracing::warn!(%err, "forced dynamic image pass failed");
+                succeeded = false;
             }
             let drawn = forced.iter().map(|&(id, _)| id).collect();
             if let Err(err) = providers.refresh_all_between(&drawn, &between).await {
                 tracing::warn!(%err, "dynamic image pass failed");
+                succeeded = false;
             }
-        }
-        timings.dynamic_images = started.elapsed();
+            succeeded
+        })
+        .await;
         if !self.between_passes(run, &mut done).await {
             return false;
         }
-        let started = std::time::Instant::now();
-        if let Err(err) = self.refresh_automatic_collections(run).await {
-            tracing::warn!(%err, "automatic collection pass failed");
-        }
-        timings.collections = started.elapsed();
+        timings.collections = post_scan_pass(collections, done + 1, run.cancel, async {
+            self.refresh_automatic_collections(run)
+                .await
+                .inspect_err(|err| tracing::warn!(%err, "automatic collection pass failed"))
+                .is_ok()
+        })
+        .await;
         if !self.between_passes(run, &mut done).await {
             return false;
         }
-        let started = std::time::Instant::now();
-        self.refresh_splashscreen().await;
-        timings.splashscreen = started.elapsed();
+        timings.splashscreen = post_scan_pass(
+            splashscreen,
+            done + 1,
+            run.cancel,
+            self.refresh_splashscreen(),
+        )
+        .await;
         if run.cancel.is_cancelled() {
             return false;
         }
-        timings.log(work.music.len());
+        timings.log(work.music.len(), phase.elapsed());
         // Every pass ran: a cancellation landing now skipped nothing.
         self.between_passes(run, &mut done).await;
         true
@@ -9909,10 +10014,10 @@ impl LibraryScanner {
     /// movie and series posters, and their thumbs (their backdrops when no
     /// item has a thumb), handed to the encoder, which writes
     /// `{data}/splashscreen.png` when there is at least one of each. A failure
-    /// is logged; the previous splashscreen stays.
-    async fn refresh_splashscreen(&self) {
+    /// is logged and answers `false`; the previous splashscreen stays.
+    async fn refresh_splashscreen(&self) -> bool {
         let (Some(encoder), Some(items)) = (&self.image_encoder, &self.item_repository) else {
-            return;
+            return true;
         };
         let posters = splashscreen_images(items.as_ref(), ImageType::Primary).await;
         let mut backdrops = splashscreen_images(items.as_ref(), ImageType::Thumb).await;
@@ -9928,9 +10033,11 @@ impl LibraryScanner {
             backdrops = backdrops.len(),
             "building the splashscreen"
         );
-        if let Err(err) = encoder.create_splashscreen(&posters, &backdrops).await {
-            tracing::warn!(%err, "splashscreen pass failed");
-        }
+        encoder
+            .create_splashscreen(&posters, &backdrops)
+            .await
+            .inspect_err(|err| tracing::warn!(%err, "splashscreen pass failed"))
+            .is_ok()
     }
 
     /// Between two closing passes: reports the one just done, serves the
@@ -45015,6 +45122,101 @@ mod tests {
         assert_eq!(rescanned.width, cold.width);
         assert_eq!(rescanned.height, cold.height);
         assert_eq!(rescanned.blur_hash, cold.blur_hash);
+    }
+
+    /// A library scan logs its closing passes as upstream's `RunPostScanTasks`
+    /// logs its post-scan tasks (gl-389): the count first, then each pass's
+    /// start and its end with the time it took, both in the pass's span, and
+    /// the whole phase's time on the summary line.
+    #[tokio::test]
+    async fn a_scan_logs_each_closing_pass_as_it_starts_and_finishes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let fx = poster_fixture(tmp.path(), 8, 12).await;
+        let logs = crate::test_support::CapturedLogs::default();
+        {
+            let _guard = tracing::subscriber::set_default(
+                tracing_subscriber::fmt()
+                    .with_writer(logs.clone())
+                    .with_ansi(false)
+                    .finish(),
+            );
+            fx.scanner.scan_all().await.unwrap();
+        }
+
+        let text = logs.text();
+        let passes = super::POST_SCAN_PASSES;
+        assert!(
+            text.contains(&format!("running post-scan passes passes={passes}")),
+            "{text}"
+        );
+        for (number, pass) in crate::scan_metrics::SCAN_PASSES.iter().enumerate() {
+            let span = format!("post_scan_pass{{pass=\"{pass}\"}}");
+            let started = format!(
+                "post-scan pass started number={} passes={passes}",
+                number + 1
+            );
+            let in_span = |needles: &[&str]| {
+                text.lines()
+                    .any(|line| line.contains(&span) && needles.iter().all(|n| line.contains(n)))
+            };
+            assert!(in_span(&[&started]), "{pass} start: {text}");
+            assert!(
+                in_span(&[
+                    "post-scan pass finished elapsed_ms=",
+                    "outcome=\"completed\""
+                ]),
+                "{pass} end: {text}"
+            );
+        }
+        let summary = text
+            .lines()
+            .find(|line| line.contains("post-scan passes complete"))
+            .unwrap_or_else(|| panic!("no summary: {text}"));
+        assert!(summary.contains("elapsed_ms="), "{summary}");
+    }
+
+    /// A closing pass ends `completed`, `failed` when its work answers false
+    /// (it logged why itself), or `cancelled` when the scan was cancelled by
+    /// then, with its time; the work's own events run in the pass's span.
+    #[tokio::test]
+    async fn a_closing_pass_finishes_completed_failed_or_cancelled() {
+        let logs = crate::test_support::CapturedLogs::default();
+        let _guard = tracing::subscriber::set_default(
+            tracing_subscriber::fmt()
+                .with_writer(logs.clone())
+                .with_ansi(false)
+                .finish(),
+        );
+        let running = super::ScanCancel::new();
+        let cancelled = super::ScanCancel::new();
+        cancelled.cancel();
+        for (cancel, succeeded, outcome) in [
+            (&running, true, "completed"),
+            (&running, false, "failed"),
+            (&cancelled, true, "cancelled"),
+        ] {
+            super::post_scan_pass("years", 3, cancel, async move {
+                tracing::warn!("year pass work");
+                succeeded
+            })
+            .await;
+            let text = logs.text();
+            let last = text.lines().last().unwrap_or_default();
+            assert!(
+                last.contains("post_scan_pass{pass=\"years\"}")
+                    && last.contains("post-scan pass finished")
+                    && last.contains(&format!("outcome=\"{outcome}\"")),
+                "{outcome}: {last}"
+            );
+        }
+        assert!(
+            logs.text()
+                .lines()
+                .any(|line| line.contains("post_scan_pass{pass=\"years\"}")
+                    && line.contains("year pass work")),
+            "{}",
+            logs.text()
+        );
     }
 
     // The same past one stored-row window: the probes a rescan adopts are read
