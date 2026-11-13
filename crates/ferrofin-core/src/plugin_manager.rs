@@ -207,7 +207,7 @@ const DEFAULT_PLUGIN_DOWNLOAD_MB: u32 = 128;
 
 /// The application version assumed when the composition root wires none — the
 /// Jellyfin API version Ferrofin reports from `/System/Info` (kept in step with
-/// `JELLYFIN_API_VERSION` in `apps/ferrofin-server/src/state.rs`, which is what
+/// `JELLYFIN_API_VERSION` in `crates/ferrofin-api/src/openapi.rs`, which is what
 /// a live server passes to
 /// [`with_application_version`](FerrofinPluginManager::with_application_version)).
 ///
