@@ -21,6 +21,7 @@ use ferrofin_db::Database;
 use ferrofin_db::entities::playback::UserDataEntity;
 use ferrofin_db::store::guid_to_db;
 use ferrofin_model::data::BaseItemKind;
+use ferrofin_traits::collections::PlaylistManager;
 use ferrofin_traits::error::ServiceError;
 use ferrofin_util::string_extensions::upper_invariant;
 use serde_json::{Map, Value};
@@ -2250,6 +2251,139 @@ pub async fn run_sweep_missing_items(
     }
     Ok(())
 }
+
+/// The extension of the database snapshot [`remove_orphaned_playlists`]
+/// takes (`jellyfin.db.pre-orphaned-playlists`).
+const ORPHANED_PLAYLISTS_SNAPSHOT_EXTENSION: &str = "db.pre-orphaned-playlists";
+
+/// Disposes of the playlists whose owner has no `Users` row as if that
+/// owner's deletion had just run (owner decision on gl-577): `remove_playlists`
+/// for each such owner, which hands a playlist shared with users who exist
+/// to the first of them with edit rights, else the first of them, and
+/// deletes any other unless it is open access.
+///
+/// Before the fix for gl-131, deleting a user left their playlists to a
+/// deleted owner; a hand-over that fails after the user row is gone still
+/// can. Upstream has no repair: its deletion makes one only when it hands a
+/// playlist to the share of a user already gone, so adopted databases can
+/// hold a few too. Unowned
+/// playlists (no owner, or the empty GUID: made with an API key or resolved
+/// from files) are left alone. Ids are compared parsed, so an owner stored
+/// in another spelling of a user's id is not taken for a missing one.
+///
+/// Runs once. Before the first change the database file is copied once to
+/// `<db>.pre-orphaned-playlists`, as before a table-rebuilding migration;
+/// the private playlists it deletes come back only from that copy. When an
+/// owner's playlists cannot all be disposed of, the repair is not marked
+/// done and the next boot finds what is left.
+///
+/// Returns how many missing owners' playlists were disposed of.
+///
+/// # Errors
+/// Returns [`ServiceError`] if a query, the snapshot or the marker write
+/// fails.
+pub async fn remove_orphaned_playlists(
+    db: &Database,
+    playlists: &dyn PlaylistManager,
+) -> Result<usize, ServiceError> {
+    const KEY: &str = "orphaned_playlist_owners_v1";
+    if !once(db, KEY).await? {
+        return Ok(0);
+    }
+    // Owners before users: a user the previous version adds meanwhile is
+    // read with the users, so their new playlist never looks orphaned.
+    let owners: BTreeSet<Uuid> = sqlx::query_scalar::<_, String>(
+        r#"SELECT DISTINCT p."OwnerUserId" FROM "FerrofinPlaylists" p
+           JOIN "BaseItems" bi ON bi."Id" = p."PlaylistId"
+           WHERE p."OwnerUserId" IS NOT NULL"#,
+    )
+    .fetch_all(db.pool())
+    .await
+    .map_err(db_err)?
+    .iter()
+    .filter_map(|id| Uuid::parse_str(id).ok())
+    .filter(|owner| !owner.is_nil())
+    .collect();
+    if owners.is_empty() {
+        done(db, KEY).await?;
+        return Ok(0);
+    }
+    let users: HashSet<Uuid> = sqlx::query_scalar::<_, String>(r#"SELECT "Id" FROM "Users""#)
+        .fetch_all(db.pool())
+        .await
+        .map_err(db_err)?
+        .iter()
+        .filter_map(|id| Uuid::parse_str(id).ok())
+        .collect();
+    if users.is_empty() {
+        // Every owner would look missing: never delete on that.
+        tracing::warn!(
+            "playlists have owners but no user could be read; \
+             the playlists of missing owners are left until the next boot"
+        );
+        return Ok(0);
+    }
+    let owners: Vec<Uuid> = owners
+        .into_iter()
+        .filter(|owner| !users.contains(owner))
+        .collect();
+    if owners.is_empty() {
+        done(db, KEY).await?;
+        return Ok(0);
+    }
+    if let Some(backup) = db
+        .snapshot_once(ORPHANED_PLAYLISTS_SNAPSHOT_EXTENSION)
+        .await?
+    {
+        tracing::info!(
+            backup = %backup.display(),
+            "database snapshot taken before disposing of playlists whose owner no longer exists"
+        );
+    }
+    let mut disposed = 0;
+    for &owner in &owners {
+        match playlists.remove_playlists(owner).await {
+            Ok(()) => {
+                tracing::debug!(
+                    user_id = %owner,
+                    "disposed of the playlists of a user who no longer exists"
+                );
+                disposed += 1;
+            }
+            Err(err) => tracing::warn!(
+                %err,
+                user_id = %owner,
+                "could not hand over or delete every playlist of a user who no longer \
+                 exists; the next boot tries again"
+            ),
+        }
+    }
+    if disposed == owners.len() {
+        done(db, KEY).await?;
+    }
+    Ok(disposed)
+}
+
+/// [`remove_orphaned_playlists`] and its log line, for the composition root.
+/// A failure is a warning and never stops the boot: the playlists stay as
+/// they were, and the next boot tries again.
+pub async fn run_remove_orphaned_playlists(db: &Database, playlists: &dyn PlaylistManager) {
+    match remove_orphaned_playlists(db, playlists).await {
+        Ok(0) => {}
+        Ok(users) => tracing::info!(
+            users,
+            "disposed of the playlists of users who no longer exist"
+        ),
+        Err(err) => tracing::warn!(
+            %err,
+            "could not dispose of the playlists of users who no longer exist; \
+             the next boot tries again"
+        ),
+    }
+}
+
+#[cfg(test)]
+mod orphaned_playlists_tests;
 
 /// The folders Jellyfin 12.0's `CleanupOrphanedExternalData`
 /// (`Jellyfin.Server/Migrations/Routines/20260525010000_CleanupOrphanedExternalData.cs`)

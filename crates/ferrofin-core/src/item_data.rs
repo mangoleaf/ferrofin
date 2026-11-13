@@ -1381,6 +1381,15 @@ pub(crate) async fn fail_data_writes_of(db: &Database, item: Uuid) {
     .expect("trigger");
 }
 
+/// Test-only: lifts [`fail_data_writes_of`]'s failure.
+#[cfg(test)]
+pub(crate) async fn allow_data_writes(db: &Database) {
+    sqlx::query(r#"DROP TRIGGER "TestFailDataWrite""#)
+        .execute(db.writer())
+        .await
+        .expect("drop trigger");
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
