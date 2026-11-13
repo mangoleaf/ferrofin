@@ -1630,10 +1630,10 @@ fn merge_config(defaults: &[u8], stored: &[u8]) -> Vec<u8> {
 
 /// Projects a posted configuration object onto the plugin's own schema, the way
 /// `JsonSerializer.DeserializeAsync(Request.Body, configPlugin.ConfigurationType)`
-/// does (v10.11.8 Jellyfin.Api/Controllers/PluginsController.cs:194).
+/// does (v12.4 Jellyfin.Api/Controllers/PluginsController.cs:199).
 ///
-/// A typed deserialize has three consequences a raw byte-store does not, and all
-/// three were observable on the wire:
+/// A typed deserialize has three consequences a raw byte-store does not, all
+/// three observable on the wire, and at every depth ([`bind_object`]):
 ///   * a key the configuration type does not declare is DROPPED — Ferrofin
 ///     round-tripped `{"Bogus":"zzz"}` for ever;
 ///   * a value of the wrong JSON kind THROWS — an array where a number belongs,
@@ -1661,24 +1661,44 @@ fn project_config(defaults: &[u8], body: &Members) -> Result<Vec<u8>, ServiceErr
         return serde_json::to_vec(body)
             .map_err(|e| ServiceError::backend(format!("serialize plugin config: {e}")));
     }
-    let mut out = schema;
-    for (key, value) in body {
-        let Some(slot) = out.get_mut(key) else {
-            continue; // unknown key: the deserializer drops it
-        };
-        let Some(bound) = bind_json(slot, value) else {
-            return Err(ServiceError::invalid_input(format!(
-                "plugin configuration field {key} has the wrong type"
-            )));
-        };
-        *slot = bound;
-    }
+    let out = bind_object(&schema, body, true).map_err(|key| {
+        ServiceError::invalid_input(format!(
+            "plugin configuration field {key} has the wrong type"
+        ))
+    })?;
     serde_json::to_vec(&serde_json::Value::Object(out))
         .map_err(|e| ServiceError::backend(format!("serialize plugin config: {e}")))
 }
 
 /// A posted configuration object's members, each kept as its raw JSON text.
 type Members<'a> = BTreeMap<String, &'a RawValue>;
+
+/// Binds each of a posted object's `members` that `schema` declares as
+/// [`bind_json`] does, and drops the others, as the deserializer does. `Err`
+/// names the first member that does not bind.
+///
+/// With `defaults`, `schema`'s values are the type's defaults and fill the
+/// members the object omits. Without, they are an example (a list's first
+/// element, which is data), so an omitted member stays out.
+fn bind_object(
+    schema: &serde_json::Map<String, serde_json::Value>,
+    members: &Members,
+    defaults: bool,
+) -> Result<serde_json::Map<String, serde_json::Value>, String> {
+    let mut out = if defaults {
+        schema.clone()
+    } else {
+        serde_json::Map::new()
+    };
+    for (key, raw) in members {
+        let Some(slot) = schema.get(key) else {
+            continue; // unknown key: the deserializer drops it
+        };
+        let bound = bind_json(slot, raw, defaults).ok_or_else(|| key.clone())?;
+        out.insert(key.clone(), bound);
+    }
+    Ok(out)
+}
 
 /// What the posted JSON `raw` binds to in the field `slot` types, or `None`
 /// where the C# deserializer throws.
@@ -1699,7 +1719,41 @@ type Members<'a> = BTreeMap<String, &'a RawValue>;
 /// A number field stores a whole number as an integer ([`integral`]), so a
 /// `"15.0"` posted for an `int` field is read back by the provider's integer
 /// field rather than failing its whole configuration.
-fn bind_json(slot: &serde_json::Value, raw: &RawValue) -> Option<serde_json::Value> {
+///
+/// The C# binds the whole body into the configuration type, so a nested object
+/// field binds as the configuration does ([`bind_object`]), and a list binds
+/// each element as its default's first element does. Either takes `null`, as a
+/// reference-type property does.
+///
+/// shortcut: the default document is the only schema, so a list whose default is
+/// empty keeps its elements as posted, and a dictionary with default entries
+/// drops the keys it lacks; give plugins a declared schema if one needs either.
+fn bind_json(
+    slot: &serde_json::Value,
+    raw: &RawValue,
+    defaults: bool,
+) -> Option<serde_json::Value> {
+    match slot {
+        serde_json::Value::Object(schema) if !schema.is_empty() => {
+            return match serde_json::from_str::<Option<Members>>(raw.get()).ok()? {
+                Some(members) => bind_object(schema, &members, defaults)
+                    .ok()
+                    .map(serde_json::Value::Object),
+                None => Some(serde_json::Value::Null),
+            };
+        }
+        serde_json::Value::Array(example) if !example.is_empty() => {
+            return match serde_json::from_str::<Option<Vec<&RawValue>>>(raw.get()).ok()? {
+                Some(elements) => elements
+                    .into_iter()
+                    .map(|raw| bind_json(&example[0], raw, false))
+                    .collect::<Option<Vec<_>>>()
+                    .map(serde_json::Value::Array),
+                None => Some(serde_json::Value::Null),
+            };
+        }
+        _ => {}
+    }
     let value = serde_json::from_str::<serde_json::Value>(raw.get()).ok()?;
     match (slot, value) {
         (
@@ -1862,6 +1916,57 @@ mod tests {
         let raw = project_config(b"{}", &body(r#"{"Anything":[1,2]}"#)).unwrap();
         let raw: serde_json::Value = serde_json::from_slice(&raw).unwrap();
         assert_eq!(raw["Anything"], serde_json::json!([1, 2]));
+    }
+
+    /// The deserializer binds the whole body into the configuration type, so
+    /// every depth binds as the top level does (gl-777): a nested class drops
+    /// the keys it does not declare and keeps its defaults for the ones the post
+    /// omits, a list's elements bind as its default's first element, and a wrong
+    /// kind anywhere refuses the save.
+    #[test]
+    fn a_nested_config_write_is_projected_at_every_depth() {
+        fn project(json: &str) -> Result<serde_json::Value, ServiceError> {
+            let defaults = br#"{"Limits":{"Max":1,"Label":"a"},"Ports":[0],"Tags":["t"],"Rules":[{"Match":"m","Weight":1}],"Free":[]}"#;
+            let body: super::Members<'_> = serde_json::from_str(json).unwrap();
+            project_config(defaults, &body).map(|out| serde_json::from_slice(&out).unwrap())
+        }
+
+        let out =
+            project(r#"{"Limits":{"Max":"5","Bogus":1},"Ports":["1",2],"Tags":[3,true,"x"]}"#)
+                .unwrap();
+        assert_eq!(out["Limits"], serde_json::json!({"Max":5,"Label":"a"}));
+        assert_eq!(out["Ports"], serde_json::json!([1, 2]));
+        assert_eq!(out["Tags"], serde_json::json!(["3", "true", "x"]));
+        // The first default element is an example, not the element type's
+        // defaults: an element's omitted members are not filled from it.
+        let out = project(r#"{"Rules":[{"Match":7,"Extra":1},{"Weight":"2"}]}"#).unwrap();
+        assert_eq!(
+            out["Rules"],
+            serde_json::json!([{"Match":"7"},{"Weight":2}])
+        );
+        // An empty default list has no element type: kept as posted.
+        let out = project(r#"{"Free":[1,"x",{"a":[]}]}"#).unwrap();
+        assert_eq!(out["Free"], serde_json::json!([1, "x", {"a": []}]));
+        // A null class or list is taken, as a C# reference property takes it.
+        let out = project(r#"{"Limits":null,"Ports":null}"#).unwrap();
+        assert!(out["Limits"].is_null() && out["Ports"].is_null(), "{out}");
+
+        for posted in [
+            r#"{"Limits":{"Max":[1]}}"#,
+            r#"{"Limits":{"Label":{}}}"#,
+            r#"{"Limits":[1]}"#,
+            r#"{"Ports":["x"]}"#,
+            r#"{"Ports":{}}"#,
+            r#"{"Tags":[{}]}"#,
+            r#"{"Rules":[1]}"#,
+            r#"{"Rules":[{"Weight":"heavy"}]}"#,
+        ] {
+            let err = project(posted).unwrap_err();
+            assert!(
+                matches!(err, ServiceError::InvalidInput(_)),
+                "{posted}: {err:?}"
+            );
+        }
     }
 
     fn descriptor(id: Uuid, name: &str, enabled: bool) -> PluginDescriptor {
