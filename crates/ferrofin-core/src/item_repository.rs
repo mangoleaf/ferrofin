@@ -127,6 +127,9 @@ pub struct FerrofinItemRepository {
 }
 
 /// What the files Live TV is recording right now are, asked when needed.
+///
+/// Live TV reads its timers from the reader pool to answer, so never await it
+/// while holding a pool connection or transaction.
 pub type ActiveRecordingSource = Arc<
     dyn Fn() -> std::pin::Pin<
             Box<dyn std::future::Future<Output = Result<Vec<String>, ServiceError>> + Send>,
@@ -855,6 +858,20 @@ impl FerrofinItemRepository {
     ) -> Result<HashMap<String, ferrofin_db::entities::playback::UserDataEntity>, ServiceError>
     {
         use ferrofin_db::entities::playback::UserDataEntity;
+        // `Video.SourceType` is `LiveTV` while its file is being recorded, which
+        // takes the item out of the channel arm below. Asked only when a video
+        // could be keyed by its channel, and before the reader below is taken:
+        // Live TV reads its timers from the same pool.
+        let active = if rows.iter().any(|row| {
+            row.external_id.as_ref().is_some_and(|id| !id.is_empty())
+                && row.channel_id.is_some()
+                && row.path.is_some()
+                && crate::item_type_lookup::kind_from_type_name(&row.type_).is_some_and(is_video)
+        }) {
+            self.active_recording_paths().await?
+        } else {
+            std::collections::HashSet::new()
+        };
         let ids: Vec<_> = rows.iter().map(|row| row.id.clone()).collect();
         let mut connection = self.db.pool().acquire().await.map_err(db_err)?;
         let keys: HashMap<_, _> =
@@ -878,19 +895,6 @@ impl FerrofinItemRepository {
                 .or_default()
                 .push(candidate);
         }
-        // `Video.SourceType` is `LiveTV` while its file is being recorded, which
-        // takes the item out of the channel arm below. Asked only when a video
-        // could be keyed by its channel.
-        let active = if rows.iter().any(|row| {
-            row.external_id.as_ref().is_some_and(|id| !id.is_empty())
-                && row.channel_id.is_some()
-                && row.path.is_some()
-                && crate::item_type_lookup::kind_from_type_name(&row.type_).is_some_and(is_video)
-        }) {
-            self.active_recording_paths().await?
-        } else {
-            std::collections::HashSet::new()
-        };
         let mut selected = HashMap::new();
         for row in rows {
             let Some(candidates) = by_item.remove(&row.id) else {
@@ -15465,6 +15469,54 @@ mod folder_get_result_tests {
             .map(|(id, _)| *id)
             .collect();
         assert_eq!(favorites().await, expected);
+    }
+
+    /// Live TV answers `active_recording_paths` by reading its timers from the
+    /// same reader pool (`get_timer`), so the user-data filter must not hold a
+    /// reader across the call: with a one-reader pool (the in-memory test
+    /// database, a 1-CPU container, `db_pool = 1`) it waited for itself until
+    /// sqlx's 30 s acquire timeout.
+    #[tokio::test]
+    async fn the_recording_source_can_read_the_pool_while_folder_user_data_is_filtered() {
+        let db = test_db().await;
+        let user_id = Uuid::new_v4();
+        let user = seed_user_with_defaults(&db, user_id).await;
+        let slot = ActiveRecordingSlot::default();
+        let repo = repository(&db).with_active_recordings(Arc::clone(&slot));
+        let id = Uuid::new_v4();
+        seed_named_item(&db, id, BaseItemKind::Movie, "recording").await;
+        let mut entity = crate::test_support::fetch_item(&db, id).await;
+        entity.path = Some("/rec/active.ts".to_owned());
+        entity.channel_id = Some(guid_to_db(Uuid::new_v4()));
+        entity.external_id = Some("channel-key".to_owned());
+        crate::test_support::save_item(&db, &entity).await;
+        seed_user_data(&db, user_id, id, false, None).await;
+        sqlx::query(r#"INSERT INTO "UserData" ("ItemId","UserId","CustomDataKey","IsFavorite","PlayCount","PlaybackPositionTicks","Played") VALUES (?1,?2,'channel-key',1,0,0,0)"#)
+            .bind(guid_to_db(id)).bind(guid_to_db(user_id)).execute(db.writer()).await.unwrap();
+        let pool = db.pool().clone();
+        slot.set(Arc::new(move || {
+            let pool = pool.clone();
+            Box::pin(async move {
+                drop(pool.acquire().await.map_err(db_err)?);
+                Ok(vec!["/rec/active.ts".to_owned()])
+            })
+        }))
+        .ok();
+        let rows = ordered_rows(&repo, &[id]).await;
+        let query = InternalItemsQuery {
+            is_favorite: Some(true),
+            user: Some(Arc::new(user)),
+            ..Default::default()
+        };
+        let children = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            repo.filter_folder_children(rows, &query),
+        )
+        .await
+        .expect("the filter waited on the reader it was holding")
+        .unwrap();
+        // Recording, so keyed by its own id: the channel-keyed favorite is not its row.
+        assert!(children.is_empty(), "{children:?}");
     }
 
     #[tokio::test]
