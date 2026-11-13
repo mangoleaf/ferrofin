@@ -26,6 +26,7 @@ use ferrofin_model::dlna::SubtitleDeliveryMethod;
 use ferrofin_model::dto::MediaSourceInfo;
 use ferrofin_model::entities::{EncoderPreset, MediaStreamType, VideoType};
 use ferrofin_model::entities_media::MediaStream;
+use ferrofin_model::media_info::MediaProtocol;
 use ferrofin_model::session::TranscodeReasons;
 use ferrofin_traits::media_encoding::TranscodingJobType;
 
@@ -1784,6 +1785,12 @@ const MIN_FFMPEG_INPUT_SYNC: FfmpegVersion = FfmpegVersion::new(5, 1);
 /// server cut to the start instead
 /// ([`EncodingJobInfo::trimmed_subtitle_path`]), neither seeked nor synced,
 /// since its cues already start at the start.
+///
+/// Fifth divergence (gl-1722): a sidecar whose path is a URL (`://`) is read
+/// from the URL, the way upstream's `GetExternalSubtitleInputArgument` and the
+/// media file's input write it. Upstream's muxing writes `-i file:"<path>"`
+/// whatever the path, so ffmpeg looks for a local file named after the URL
+/// and the stream fails: a Jellyfin bug, deliberately not ported.
 #[must_use]
 pub fn external_stream_input_arguments(
     state: &EncodingJobInfo,
@@ -1853,7 +1860,11 @@ pub fn external_stream_input_arguments(
         } else if trimmed.is_none() {
             sync(&mut args);
         }
-        args.extend(["-i".to_owned(), format!("file:{path}")]);
+        // Written as the media file's input is: a URL bare, a file `file:`.
+        let input = crate::encoder::get_input_argument("file", &path, MediaProtocol::File);
+        args.push("-i".to_owned());
+        // `quote` always balances; the fallback is one token, which cannot add an option.
+        args.extend(crate::encoder::split_args(&input).unwrap_or_else(|_| vec![input]));
     }
     if let Some(audio) = state
         .audio_stream
