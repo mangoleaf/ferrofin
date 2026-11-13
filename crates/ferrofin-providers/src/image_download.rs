@@ -114,7 +114,8 @@ impl From<SendError> for ImageFetchError {
 impl From<BodyError> for ImageFetchError {
     fn from(error: BodyError) -> Self {
         match error {
-            BodyError::Read(_) => Self::Unavailable,
+            // A body read as bytes is never parsed as JSON.
+            BodyError::Read(_) | BodyError::Decode(_) => Self::Unavailable,
             BodyError::TooLarge => Self::TooLarge,
         }
     }
@@ -369,6 +370,23 @@ mod body_tests {
             .await?
             .into_bytes()
             .await
+    }
+
+    /// gl-76: a download names the server and offers compression, as
+    /// upstream's `NamedClient.Default` does.
+    #[tokio::test]
+    async fn a_download_names_the_server() {
+        let server = MockServer::start_raw(vec![MockServer::raw_ok(PNG_TYPE, &png_of(8))]).await;
+        let url = format!("{}/a.png", server.base_url);
+
+        open_image_capped(&GuardedHttp::open(&IMAGE_FETCH), &url, LIMIT as u64)
+            .await
+            .expect("an image");
+
+        let head = &server.heads()[0];
+        let agent = format!("user-agent: {}\r\n", ferrofin_health::USER_AGENT);
+        assert!(head.contains(&agent.to_ascii_lowercase()), "{head}");
+        assert!(head.contains("accept-encoding: "), "{head}");
     }
 
     /// A body past the limit stops there whether or not it says so up front.

@@ -463,7 +463,7 @@ impl MusicBrainzClient {
     pub fn new(base_url: &str, version: &str) -> Self {
         let base = base_url.trim_end_matches('/');
         Self {
-            http: reqwest::Client::new(),
+            http: crate::http_client::client(),
             configured_base_url: (!base.is_empty()).then(|| base.to_owned()),
             plugin: crate::plugin_config::ConfigSource::new(),
             // MB requires contact info; the project URL satisfies the policy.
