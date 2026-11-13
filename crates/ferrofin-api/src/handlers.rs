@@ -904,11 +904,6 @@ pub const VERIFIED_AGAINST_EARLIER_PIN: &[(&str, &str, &str)] = &[
     // gl-884: a malformed genreIds/studioIds token is a 400, not dropped.
     ("get", "/Artists", "v12.2"),
     ("get", "/Artists/AlbumArtists", "v12.2"),
-    // gl-408: parameters these actions do not declare are bound (a 400 on a
-    // bad value).
-    ("get", "/Genres", "v12.2"),
-    ("get", "/MusicGenres", "v12.2"),
-    ("get", "/Studios", "v12.2"),
     // gl-762: livetv lists tuners and listing providers by id, not as added.
     ("get", "/System/Configuration/{key}", "v12.2"),
 ];
@@ -1912,7 +1907,9 @@ pub const VERIFIED: &[Verified] = &[
                handlers/by_name.rs (ByNameListQuery check_min_community_rating, \
                artists_query, resolve_by_name_ids, \
                project_query_result) → ferrofin-core item_repository.rs get_artists \
-               (item_values_with_counts, item_counts_by_clean_name)",
+               (item_values_with_counts, item_counts_by_clean_name); \
+               its scope rewrite top_parent_or_ancestor_scope \
+               (LibraryManager.SetTopParentOrAncestorIds) compared at v12.4 on 2026-11-13",
         date: "2026-10-25",
         divergences: BY_NAME_DIVERGENCES_ARTISTS,
         refs: &["images", "access-filtering"],
@@ -1925,7 +1922,9 @@ pub const VERIFIED: &[Verified] = &[
         ferrofin: "handlers/artists.rs get_album_artists (items.rs resolve_user_or_api_key) → \
                handlers/by_name.rs (check_min_community_rating, artists_query, \
                resolve_by_name_ids) → ferrofin-core \
-               item_repository.rs get_album_artists (item_values_with_counts)",
+               item_repository.rs get_album_artists (item_values_with_counts); \
+               its scope rewrite top_parent_or_ancestor_scope \
+               (LibraryManager.SetTopParentOrAncestorIds) compared at v12.4 on 2026-11-13",
         date: "2026-10-25",
         divergences: BY_NAME_DIVERGENCES_ARTISTS,
         refs: &["images", "access-filtering"],
@@ -1935,11 +1934,13 @@ pub const VERIFIED: &[Verified] = &[
         path: "/Genres",
         upstream_file: "Jellyfin.Api/Controllers/GenresController.cs",
         upstream_method: "GetGenres",
-        ferrofin: "handlers/genres.rs get_genres (items.rs resolve_user_or_api_key; \
+        ferrofin: "handlers/genres.rs get_genres (by_name.rs ValueListQuery::genres: the \
+               declared parameters only; items.rs resolve_user_or_api_key; \
                music/musicvideos library parent → get_music_genres) → handlers/by_name.rs → \
                ferrofin-core item_repository.rs get_genres / get_music_genres \
-               (item_values_with_counts)",
-        date: "2026-10-25",
+               (item_values_with_counts, \
+               top_parent_or_ancestor_scope: LibraryManager.SetTopParentOrAncestorIds)",
+        date: "2026-11-13",
         divergences: BY_NAME_DIVERGENCES_GENRES_STUDIOS,
         refs: &["images", "access-filtering"],
     },
@@ -1948,10 +1949,12 @@ pub const VERIFIED: &[Verified] = &[
         path: "/MusicGenres",
         upstream_file: "Jellyfin.Api/Controllers/MusicGenresController.cs",
         upstream_method: "GetMusicGenres",
-        ferrofin: "handlers/music_genres.rs get_music_genres (items.rs \
+        ferrofin: "handlers/music_genres.rs get_music_genres (by_name.rs \
+               ValueListQuery::genres: the declared parameters only; items.rs \
                resolve_user_or_api_key) → handlers/by_name.rs → ferrofin-core \
-               item_repository.rs get_music_genres (item_values_with_counts)",
-        date: "2026-10-25",
+               item_repository.rs get_music_genres (item_values_with_counts, \
+               top_parent_or_ancestor_scope: LibraryManager.SetTopParentOrAncestorIds)",
+        date: "2026-11-13",
         divergences: BY_NAME_DIVERGENCES_GENRES_STUDIOS,
         refs: &["images", "access-filtering"],
     },
@@ -1960,10 +1963,12 @@ pub const VERIFIED: &[Verified] = &[
         path: "/Studios",
         upstream_file: "Jellyfin.Api/Controllers/StudiosController.cs",
         upstream_method: "GetStudios",
-        ferrofin: "handlers/studios.rs get_studios (items.rs resolve_user_or_api_key) → \
+        ferrofin: "handlers/studios.rs get_studios (by_name.rs ValueListQuery::studios: \
+               the declared parameters only; items.rs resolve_user_or_api_key) → \
                handlers/by_name.rs → ferrofin-core item_repository.rs get_studios \
-               (item_values_with_counts)",
-        date: "2026-10-25",
+               (item_values_with_counts, \
+               top_parent_or_ancestor_scope: LibraryManager.SetTopParentOrAncestorIds)",
+        date: "2026-11-13",
         divergences: BY_NAME_DIVERGENCES_GENRES_STUDIOS,
         refs: &["images", "access-filtering"],
     },
@@ -4489,16 +4494,15 @@ const BY_NAME_DIVERGENCES_ARTISTS: &[&str] = &[
 ];
 
 /// What `/Genres`, `/MusicGenres` and `/Studios` do differently from their v12
-/// controllers + `GetItemValues`. These controllers take a subset of the
-/// Artists parameters; Ferrofin's shared query struct accepts the superset.
+/// controllers + `GetItemValues`. They bind only the parameters those
+/// controllers declare (`by_name.rs` `ValueListQuery`).
 const BY_NAME_DIVERGENCES_GENRES_STUDIOS: &[&str] = &[
+    "The 400 (a value the query binder cannot convert, or a parentId naming no item) and \
+     403 (another user's id without the administrator role) bodies are Ferrofin's error \
+     shape, not upstream's. Fix path: gl-666.",
     "A `userId` naming no user: v12's GetUserById returns null and the query runs with no \
      user — unscoped, every library on the server; Ferrofin answers 404. Jellyfin bug not \
      ported.",
-    "The shared query struct honors `filters`, `mediaTypes`, `genres`, `tags`, `years`, \
-     `officialRatings`, `genreIds`, `studioIds` — and, for /Studios, `sortBy`/`sortOrder` — \
-     which these v12 controllers do not declare (ASP.NET ignores them). A client sending \
-     one gets a narrowed or re-ordered list here and the full SortName-ordered list there.",
     "A `parentId` that is not a folder: v12 puts it in ItemIds; Ferrofin scopes by \
      AncestorIds in every case, so a non-folder parent answers with nothing. Fix path: \
      gl-971.",

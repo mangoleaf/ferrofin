@@ -1308,6 +1308,78 @@ impl FerrofinItemRepository {
         Ok(resolved)
     }
 
+    /// `LibraryManager.SetTopParentOrAncestorIds` (v12.4
+    /// `LibraryManager.cs:1975-2003`), which upstream runs before every by-name
+    /// list (`GetGenres`, `GetMusicGenres`, `GetStudios`, `GetArtists`,
+    /// `GetAllArtists`, `GetAlbumArtists`) and facet (`GetQueryFiltersLegacy`,
+    /// `GetTagNames`, `GetMediaStreamLanguages`): an `ancestor_ids` scope made
+    /// only of `ICollectionFolder`s and `UserView`s becomes the top parents
+    /// they stand for, each through [`Self::top_parent_ids_for_query`], and the
+    /// ancestors go. A view's items carry no `AncestorIds` row for the view, so
+    /// without this its facets came back empty. Any other ancestor, or a scope
+    /// whose top parents come out empty, leaves the query as it is (`None`).
+    ///
+    /// An id naming no item is upstream's `ArgumentException`; every caller
+    /// binds a parent it found, so it is left to the ancestor scope here.
+    async fn top_parent_or_ancestor_scope(
+        &self,
+        filter: &InternalItemsQuery,
+    ) -> Result<Option<InternalItemsQuery>, ServiceError> {
+        if filter.ancestor_ids.is_empty() {
+            return Ok(None);
+        }
+        // Every ancestor's type first, as upstream's first loop does, so a
+        // scope that stays as it is costs no top-parent reads.
+        let mut parents = Vec::with_capacity(filter.ancestor_ids.len());
+        for &id in &filter.ancestor_ids {
+            let row = match cached_view_row(&self.db, id) {
+                Some(row) => Some(row),
+                None => Self::query_view_row(&self.db, id).await?,
+            };
+            let Some(row) = row else {
+                return Ok(None);
+            };
+            match crate::item_type_lookup::kind_from_type_name(&row.type_name) {
+                Some(BaseItemKind::CollectionFolder | BaseItemKind::UserView) => {
+                    parents.push((id, Some(row)));
+                }
+                // The other `ICollectionFolder`s are `BasePluginFolder`s, whose
+                // `GetTopParent` is the folder itself (`BaseItem.IsTopParent`).
+                Some(
+                    BaseItemKind::BasePluginFolder
+                    | BaseItemKind::PlaylistsFolder
+                    | BaseItemKind::ManualPlaylistsFolder,
+                ) => parents.push((id, None)),
+                _ => return Ok(None),
+            }
+        }
+        let mut top_parent_ids = Vec::new();
+        for (id, view) in parents {
+            match view {
+                Some(row) => top_parent_ids.extend(
+                    Self::top_parent_ids_for_query(
+                        &self.db,
+                        &self.virtual_paths,
+                        id,
+                        filter.user.as_deref(),
+                        0,
+                        Some(row),
+                    )
+                    .await?
+                    .unwrap_or_default(),
+                ),
+                None => top_parent_ids.push(id),
+            }
+        }
+        if top_parent_ids.is_empty() {
+            return Ok(None);
+        }
+        let mut resolved = filter.clone();
+        resolved.top_parent_ids = top_parent_ids;
+        resolved.ancestor_ids.clear();
+        Ok(Some(resolved))
+    }
+
     /// The top parents a query scoped to `id` should use — C#
     /// `GetTopParentIdsForQuery` (`LibraryManager.cs:1728`).
     ///
@@ -1956,8 +2028,9 @@ impl FerrofinItemRepository {
     /// content items that reference each via `ItemValues` of the given types
     /// (port of C# `GetItemValues`).
     ///
-    /// Scoped to the browse's `parent_id` (via [`InternalItemsQuery::ancestor_ids`])
-    /// and `include_item_types`: the Movies "Genres" tab lists only genres carried
+    /// Scoped to the browse's `parent_id` (via [`InternalItemsQuery::ancestor_ids`],
+    /// which [`Self::top_parent_or_ancestor_scope`] turns into top parents for a
+    /// library or view) and `include_item_types`: the Movies "Genres" tab lists only genres carried
     /// by movies, the TV "Networks" tab only studios carried by items under the TV
     /// library, each with an in-scope item count — matching Jellyfin, which scopes
     /// its by-name aggregates to the query. Only values with an in-scope item (and
@@ -1969,6 +2042,8 @@ impl FerrofinItemRepository {
         return_type: BaseItemKind,
         filter: &InternalItemsQuery,
     ) -> Result<QueryResult<ItemWithCounts>, ServiceError> {
+        let rewritten = self.top_parent_or_ancestor_scope(filter).await?;
+        let filter = rewritten.as_ref().unwrap_or(filter);
         // Every kind the six callers pass (`Genre`, `MusicGenre`, `Studio`,
         // `MusicArtist`) is in the lookup table. A kind that were not would
         // fall back to `""`, which no `Type` column holds — an empty result,
@@ -2018,7 +2093,8 @@ impl FerrofinItemRepository {
             .map(guid_to_db)
             .collect();
         // `AddUserToQuery` for the by-name tabs. A no-op for a query that is
-        // already scoped (a browse under one library passes `ancestor_ids`).
+        // already scoped (a browse under a parent passes `ancestor_ids`, or the
+        // top parents a library or view stands for).
         let scoped = scope_to_user_libraries(
             &self.db,
             &self.virtual_paths,
@@ -4474,9 +4550,14 @@ impl ItemRepository for FerrofinItemRepository {
         // `BaseItemRepository.GetMediaStreamLanguages` (v12.2 `ByName.cs:87-116`)
         // runs a fresh `InternalItemsQuery(filter.User)` carrying only the scope
         // and kind fields, after `LibraryManager` applied `AddUserToQuery` and
-        // `SetTopParentOrAncestorIds` (`LibraryManager.cs:4221-4230`) — which is
-        // what `resolve_views` does here, with the user's restrictions.
+        // `SetTopParentOrAncestorIds` (`LibraryManager.cs:4221-4230`): here
+        // `top_parent_or_ancestor_scope`, then `resolve_views` with the user's
+        // restrictions.
         let narrowed = stream_language_query(filter);
+        let narrowed = self
+            .top_parent_or_ancestor_scope(&narrowed)
+            .await?
+            .unwrap_or(narrowed);
         let scoped = self.resolve_views(&narrowed).await?;
         let filter = scoped.as_ref().unwrap_or(&narrowed);
         // Map disc -> type so the rows sort back into per-type lists.
@@ -4508,7 +4589,11 @@ impl ItemRepository for FerrofinItemRepository {
         // offering a choice that returns nothing. The views are resolved as a
         // browse resolves them (which scopes an unparented query to the
         // user's libraries): a library's children hang off its locations'
-        // folders, so `parentId={library}` alone matches none of them.
+        // folders, so `parentId={library}` alone matches none of them. A
+        // library or view parent becomes its top parents first
+        // (`SetTopParentOrAncestorIds`, `LibraryManager.cs:4198`).
+        let rewritten = self.top_parent_or_ancestor_scope(filter).await?;
+        let filter = rewritten.as_ref().unwrap_or(filter);
         let scoped = self.resolve_views(filter).await?;
         let filter = scoped.as_ref().unwrap_or(filter);
         // Each facet runs the filter once as its own WHERE (via `append_predicates`)
@@ -4554,10 +4639,11 @@ impl ItemRepository for FerrofinItemRepository {
         // `Tags` values of the items `TranslateQuery` matches, grouped by
         // `CleanValue`, `MIN(Value)` per group, ordered by that value: the
         // legacy facet's own statement. `LibraryManager.GetTagNames` applies
-        // `AddUserToQuery` and `SetTopParentOrAncestorIds` first; the view
-        // resolution here applies the user's libraries as the other facets
-        // do. TODO(gl-807): it does not rewrite an all-view/library ancestor
-        // scope to `TopParentIds` as `SetTopParentOrAncestorIds` does.
+        // `AddUserToQuery` and `SetTopParentOrAncestorIds` first: here
+        // `top_parent_or_ancestor_scope`, then the view resolution, which
+        // applies the user's libraries as the other facets do.
+        let rewritten = self.top_parent_or_ancestor_scope(filter).await?;
+        let filter = rewritten.as_ref().unwrap_or(filter);
         let scoped = self.resolve_views(filter).await?;
         self.distinct_item_values(scoped.as_ref().unwrap_or(filter), ItemValueType::Tags)
             .await
@@ -9620,6 +9706,159 @@ mod tests {
         .execute(db.writer())
         .await
         .expect("insert stream");
+    }
+
+    /// `LibraryManager.SetTopParentOrAncestorIds` (v12.4 `LibraryManager.cs:1975-2003`),
+    /// run before every by-name list and facet: an ancestor scope made only of
+    /// libraries and views becomes the top parents they stand for
+    /// (`GetTopParentIdsForQuery`), so a view's facets are its library's. These
+    /// rows carry no `AncestorIds` row for the view or the library, so only the
+    /// rewritten scope finds them. A library stands for itself and its
+    /// `PhysicalFolderIds` (an adopted library's rows hang off the latter), and
+    /// the playlists folder (a `BasePluginFolder`) for itself. A scope naming
+    /// any other folder, or a view that stands for nothing, stays an ancestor
+    /// scope. The by-name artists follow the same scope.
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)] // one fixture, every scope shape asserted on it
+    async fn a_view_or_library_ancestor_scope_reads_by_top_parent() {
+        let db = test_db().await;
+        let repository = repo(&db);
+        let (first, second, _user_id, user) = two_libraries(&db).await;
+        let (in_first, in_second) = (Uuid::from_u128(0x9803), Uuid::from_u128(0x9804));
+        let view = Uuid::from_u128(0x9806);
+        let empty_view = Uuid::from_u128(0x9807);
+        let folder = Uuid::from_u128(0x9808);
+        let playlists = Uuid::from_u128(0x9809);
+        let in_playlists = Uuid::from_u128(0x980A);
+        // An adopted library: its rows hang off the location folder its
+        // `PhysicalFolderIds` names, not off the library.
+        let (adopted, location, in_location) = (
+            Uuid::from_u128(0x980B),
+            Uuid::from_u128(0x980C),
+            Uuid::from_u128(0x980D),
+        );
+        seed_child_item(&db, view, BaseItemKind::UserView, "View", second).await;
+        seed_named_item(&db, empty_view, BaseItemKind::UserView, "Nothing").await;
+        seed_named_item(&db, folder, BaseItemKind::Folder, "Folder").await;
+        seed_named_item(&db, playlists, BaseItemKind::PlaylistsFolder, "Playlists").await;
+        seed_top_parented_item(&db, in_playlists, BaseItemKind::Movie, "Listed", playlists).await;
+        seed_named_item(&db, adopted, BaseItemKind::CollectionFolder, "Adopted").await;
+        sqlx::query(r#"UPDATE "BaseItems" SET "Data" = ?2 WHERE "Id" = ?1"#)
+            .bind(guid_to_db(adopted))
+            .bind(collection_folder_data(location))
+            .execute(db.writer())
+            .await
+            .expect("library data");
+        seed_top_parented_item(&db, in_location, BaseItemKind::Movie, "Adopted", location).await;
+        sqlx::query(r#"UPDATE "BaseItems" SET "Data" = ?2 WHERE "Id" = ?1"#)
+            .bind(guid_to_db(view))
+            .bind(format!(
+                r#"{{"ViewType":"movies","DisplayParentId":"{}"}}"#,
+                first.simple()
+            ))
+            .execute(db.writer())
+            .await
+            .expect("view data");
+        for (item, genre, tag, language) in [
+            (in_first, "Drama", "First Tag", "eng"),
+            (in_second, "Comedy", "Second Tag", "fre"),
+            (in_playlists, "Listed Genre", "Listed Tag", "ger"),
+            (in_location, "Adopted Genre", "Adopted Tag", "spa"),
+        ] {
+            seed_item_value(&db, item, ItemValueType::Genre, genre).await;
+            seed_item_value(&db, item, ItemValueType::Tags, tag).await;
+            insert_stream(&db, item, 0, MediaStreamType::Audio, Some(language)).await;
+        }
+        seed_item_value(&db, in_first, ItemValueType::Artist, "First Artist").await;
+        seed_item_value(&db, in_second, ItemValueType::Artist, "Second Artist").await;
+        let artists_of = |scope: Vec<Uuid>| {
+            let query = InternalItemsQuery {
+                user: Some(Arc::new(user.clone())),
+                ancestor_ids: scope,
+                ..InternalItemsQuery::default()
+            };
+            let repository = &repository;
+            async move {
+                repository
+                    .get_artists(&query)
+                    .await
+                    .expect("artists")
+                    .items
+                    .into_iter()
+                    .filter_map(|row| row.item.name)
+                    .collect::<Vec<_>>()
+            }
+        };
+        assert_eq!(artists_of(vec![view]).await, ["First Artist"]);
+        assert_eq!(artists_of(vec![second]).await, ["Second Artist"]);
+        assert_eq!(artists_of(vec![first, folder]).await, Vec::<String>::new());
+        let first_facets = (
+            vec!["Drama".to_owned()],
+            vec!["First Tag".to_owned()],
+            vec!["eng".to_owned()],
+        );
+        let none = (Vec::new(), Vec::new(), Vec::new());
+        for (scope, expected) in [
+            (vec![view], first_facets.clone()),
+            (vec![first], first_facets),
+            (
+                vec![view, second],
+                (
+                    vec!["Comedy".to_owned(), "Drama".to_owned()],
+                    vec!["First Tag".to_owned(), "Second Tag".to_owned()],
+                    vec!["eng".to_owned(), "fre".to_owned()],
+                ),
+            ),
+            (vec![first, folder], none.clone()),
+            (vec![empty_view], none),
+            (
+                vec![playlists],
+                (
+                    vec!["Listed Genre".to_owned()],
+                    vec!["Listed Tag".to_owned()],
+                    vec!["ger".to_owned()],
+                ),
+            ),
+            (
+                vec![adopted],
+                (
+                    vec!["Adopted Genre".to_owned()],
+                    vec!["Adopted Tag".to_owned()],
+                    vec!["spa".to_owned()],
+                ),
+            ),
+        ] {
+            let query = InternalItemsQuery {
+                user: Some(Arc::new(user.clone())),
+                ancestor_ids: scope.clone(),
+                ..InternalItemsQuery::default()
+            };
+            let genres: Vec<String> = repository
+                .get_genres(&query)
+                .await
+                .expect("genres")
+                .items
+                .into_iter()
+                .filter_map(|row| row.item.name)
+                .collect();
+            let mut tags = repository.get_tag_names(&query).await.expect("tags");
+            tags.sort();
+            let mut languages = repository
+                .get_media_stream_languages(&query, MediaStreamType::Audio)
+                .await
+                .expect("languages");
+            languages.sort();
+            assert_eq!((genres, tags, languages), expected, "{scope:?}");
+            let legacy = repository
+                .get_query_filters_legacy(&query)
+                .await
+                .expect("legacy");
+            assert_eq!(
+                (legacy.genres, legacy.tags),
+                (expected.0.clone(), expected.1.clone()),
+                "legacy {scope:?}"
+            );
+        }
     }
 
     const LANG_MOVIES: Uuid = Uuid::from_u128(0xB101);
