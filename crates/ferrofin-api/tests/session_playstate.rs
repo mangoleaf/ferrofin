@@ -1515,6 +1515,78 @@ async fn sync_play_leave_requires_group_membership() {
     assert!(reached.load(std::sync::atomic::Ordering::SeqCst));
 }
 
+/// Upstream's `UseAuthorization` middleware runs before MVC binds the
+/// `[FromBody, Required]` request DTO, so a caller the route's SyncPlay policy
+/// refuses is `403` whatever the body: missing, malformed, or sent with a
+/// content type the JSON binder cannot read. A caller the policy admits gets
+/// the binder's `415` or `400` (gl-696).
+#[tokio::test]
+async fn sync_play_policy_is_checked_before_the_body_is_bound() {
+    // Every SyncPlay route with a body, and whether a user who may only join
+    // groups (and is in none) passes its policy.
+    let routes = [
+        ("/SyncPlay/New", false),
+        ("/SyncPlay/Join", true),
+        ("/SyncPlay/SetNewQueue", false),
+        ("/SyncPlay/SetPlaylistItem", false),
+        ("/SyncPlay/RemoveFromPlaylist", false),
+        ("/SyncPlay/MovePlaylistItem", false),
+        ("/SyncPlay/Queue", false),
+        ("/SyncPlay/Seek", false),
+        ("/SyncPlay/Buffering", false),
+        ("/SyncPlay/Ready", false),
+        ("/SyncPlay/SetIgnoreWait", false),
+        ("/SyncPlay/NextItem", false),
+        ("/SyncPlay/PreviousItem", false),
+        ("/SyncPlay/SetRepeatMode", false),
+        ("/SyncPlay/SetShuffleMode", false),
+        ("/SyncPlay/Ping", true),
+    ];
+    let bodies = [
+        (None, "", StatusCode::UNSUPPORTED_MEDIA_TYPE),
+        (Some("text/plain"), "{}", StatusCode::UNSUPPORTED_MEDIA_TYPE),
+        (Some("application/json"), "", StatusCode::BAD_REQUEST),
+        (Some("application/json"), "{", StatusCode::BAD_REQUEST),
+        (Some("application/json"), "[]", StatusCode::BAD_REQUEST),
+    ];
+    for (uri, joiner_passes) in routes {
+        for (access, admin, api_key, passes) in [
+            (NO_SYNC_PLAY, false, false, false),
+            (JOIN_ONLY, false, false, joiner_passes),
+            // The default handler admits these whatever the SyncPlay policy.
+            (NO_SYNC_PLAY, true, false, true),
+            (NO_SYNC_PLAY, false, true, true),
+        ] {
+            for (content_type, body, binder_status) in bodies {
+                let (state, reached) = policy_state_as(access, false, admin, api_key);
+                let mut request = Request::builder()
+                    .method("POST")
+                    .uri(uri)
+                    .header("Authorization", "Token token-abc");
+                if let Some(content_type) = content_type {
+                    request = request.header("Content-Type", content_type);
+                }
+                let response = create_router(state)
+                    .oneshot(request.body(Body::from(body)).expect("request"))
+                    .await
+                    .expect("response");
+                let want = if passes {
+                    binder_status
+                } else {
+                    StatusCode::FORBIDDEN
+                };
+                assert_eq!(
+                    response.status(),
+                    want,
+                    "{uri} access {access} admin {admin} api key {api_key}, \
+                     {content_type:?} {body:?}"
+                );
+                assert!(!reached.load(std::sync::atomic::Ordering::SeqCst));
+            }
+        }
+    }
+}
+
 #[tokio::test]
 async fn mark_played_returns_dto_and_hits_user_data() {
     let (sessions, user_data) = recording();
