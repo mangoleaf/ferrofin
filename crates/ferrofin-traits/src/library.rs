@@ -2421,8 +2421,9 @@ pub trait UserViewManager: Send + Sync {
     /// [`get_user_root_children`](Self::get_user_root_children) instead.
     ///
     /// Port of `LibraryController.GetMediaFolders`, which returns
-    /// `GetUserRootFolder().Children` sorted by `SortName`, less the libraries
-    /// whose options disable them. Unlike
+    /// `GetUserRootFolder().Children` and the playlists folder sorted by
+    /// `SortName` in the request culture, less the libraries whose options
+    /// disable them. Unlike
     /// [`get_user_views`](Self::get_user_views) (the library collection folders
     /// only), this also includes the playlists folder
     /// ([`BaseItemKind`]`::PlaylistsFolder`, `ManualPlaylistsFolder` to

@@ -4391,6 +4391,30 @@ pub const VERIFIED: &[Verified] = &[
         refs: &[],
     },
     Verified {
+        method: "get",
+        path: "/Library/MediaFolders",
+        upstream_file: "Jellyfin.Api/Controllers/LibraryController.cs",
+        upstream_method: "GetMediaFolders",
+        ferrofin: "handlers/library.rs get_media_folders (RequireAdmin, \
+               Policies.RequiresElevation; no user read, so an API key is served; isHidden \
+               keeps the folders whose IsHidden equals it, true only for PlaylistsFolder \
+               under either stored spelling) → ferrofin-core user_view_manager.rs \
+               get_media_folders (root_children for GetUserRootFolder().Children and \
+               RootFolder.VirtualChildren, the Live TV view left out; item_visibility.rs \
+               without_disabled_libraries for GetLibraryOptions(i).Enabled, which the \
+               playlists folder always passes; OrderBy(i => i.SortName) as a stable sort \
+               of the libraries then the playlists folder by item_repository.rs \
+               folder_sort_name under the request culture's comparer) → \
+               DtoService get_base_item_dtos with DtoOptions::default() and no user (new \
+               DtoOptions(), no UserData) → QueryResult::from_items",
+        date: "2026-11-13",
+        divergences: &[
+            "The 400 (an isHidden value the query binder cannot convert), 401 and 403 bodies \
+         are Ferrofin's error shape, not upstream's. Fix path: gl-666.",
+        ],
+        refs: &["images"],
+    },
+    Verified {
         method: "post",
         path: "/Items/RemoteSearch/MusicAlbum",
         upstream_file: "Jellyfin.Api/Controllers/ItemLookupController.cs",
