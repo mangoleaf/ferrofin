@@ -25,6 +25,7 @@ use std::sync::{Arc, Mutex};
 use async_trait::async_trait;
 use ferrofin_model::updates::{PackageInfo, RepositoryInfo, VersionInfo};
 use serde::{Deserialize, Serialize};
+use serde_json::value::RawValue;
 use uuid::Uuid;
 
 use ferrofin_traits::configuration::ServerConfigurationManager;
@@ -1323,8 +1324,12 @@ impl PluginManager for FerrofinPluginManager {
             // plugin's configuration AND to violate the contract's
             // `BasePluginConfiguration` object shape.
             serde_json::Value::Null => Ok(()),
-            serde_json::Value::Object(map) => {
-                let projected = project_config(&defaults, &map)?;
+            serde_json::Value::Object(_) => {
+                // Read again keeping each member's raw text, the spelling a
+                // number bound into a string field keeps (`bind_json`).
+                let members = serde_json::from_slice::<Members>(&config)
+                    .map_err(|e| ServiceError::backend(format!("read plugin config: {e}")))?;
+                let projected = project_config(&defaults, &members)?;
                 Self::atomic_write(&self.config_path(id), &projected)?;
                 // `UpdateConfiguration` raises `ConfigurationChanged` after the
                 // save; a consumer's failure is its own.
@@ -1633,8 +1638,7 @@ fn merge_config(defaults: &[u8], stored: &[u8]) -> Vec<u8> {
 ///     round-tripped `{"Bogus":"zzz"}` for ever;
 ///   * a value of the wrong JSON kind THROWS — an array where a number belongs,
 ///     say. A number or a bool posted for a string field is the exception:
-///     upstream's `JsonStringConverter` reads it as its text, which Ferrofin does
-///     not port yet and refuses (gl-774);
+///     `JsonStringConverter` reads it as its text ([`bind_json`]);
 ///   * a key the body omits falls back to the C# property default rather than to
 ///     whatever was stored, which is what the merge onto `defaults` gives.
 ///
@@ -1646,10 +1650,7 @@ fn merge_config(defaults: &[u8], stored: &[u8]) -> Vec<u8> {
 /// document) there is no type to project onto, so the object is stored as it
 /// arrives — the pre-existing behaviour, kept deliberately rather than silently
 /// emptying a schemaless plugin's configuration.
-fn project_config(
-    defaults: &[u8],
-    body: &serde_json::Map<String, serde_json::Value>,
-) -> Result<Vec<u8>, ServiceError> {
+fn project_config(defaults: &[u8], body: &Members) -> Result<Vec<u8>, ServiceError> {
     let Ok(serde_json::Value::Object(schema)) =
         serde_json::from_slice::<serde_json::Value>(defaults)
     else {
@@ -1676,8 +1677,16 @@ fn project_config(
         .map_err(|e| ServiceError::backend(format!("serialize plugin config: {e}")))
 }
 
-/// What `value` binds to in the field `slot` types, or `None` where the C#
-/// deserializer throws.
+/// A posted configuration object's members, each kept as its raw JSON text.
+type Members<'a> = BTreeMap<String, &'a RawValue>;
+
+/// What the posted JSON `raw` binds to in the field `slot` types, or `None`
+/// where the C# deserializer throws.
+///
+/// A string field also takes a number or a bool, as the token's raw text:
+/// `JsonDefaults` registers `JsonStringConverter` (`JsonDefaults.cs:45`), whose
+/// `Read` returns any token that is not a string as its UTF-8 text, so `1e3`
+/// stays `"1e3"`. An object or an array there throws.
 ///
 /// `JsonDefaults` reads numbers with `NumberHandling = AllowReadingFromString`
 /// (`src/Jellyfin.Extensions/Json/JsonDefaults.cs:34`), so a number field also
@@ -1690,19 +1699,24 @@ fn project_config(
 /// A number field stores a whole number as an integer ([`integral`]), so a
 /// `"15.0"` posted for an `int` field is read back by the provider's integer
 /// field rather than failing its whole configuration.
-fn bind_json(slot: &serde_json::Value, value: &serde_json::Value) -> Option<serde_json::Value> {
+fn bind_json(slot: &serde_json::Value, raw: &RawValue) -> Option<serde_json::Value> {
+    let value = serde_json::from_str::<serde_json::Value>(raw.get()).ok()?;
     match (slot, value) {
+        (
+            serde_json::Value::String(_),
+            serde_json::Value::Number(_) | serde_json::Value::Bool(_),
+        ) => Some(serde_json::Value::String(raw.get().to_owned())),
         (serde_json::Value::Number(_), serde_json::Value::String(text)) => {
             // No surrounding whitespace, which .NET's number reader rejects too.
             (text.trim() == text)
-                .then(|| serde_json::from_str::<serde_json::Number>(text).ok())
+                .then(|| serde_json::from_str::<serde_json::Number>(&text).ok())
                 .flatten()
                 .map(|number| serde_json::Value::Number(integral(number)))
         }
         (serde_json::Value::Number(_), serde_json::Value::Number(number)) => {
-            Some(serde_json::Value::Number(integral(number.clone())))
+            Some(serde_json::Value::Number(integral(number)))
         }
-        _ => same_json_kind(slot, value).then(|| value.clone()),
+        (slot, value) => same_json_kind(slot, &value).then_some(value),
     }
 }
 
@@ -1790,11 +1804,11 @@ mod tests {
     /// MusicBrainz reads back without `Bogus`.
     #[test]
     fn a_config_write_is_projected_onto_the_plugin_schema() {
+        fn body(json: &str) -> super::Members<'_> {
+            serde_json::from_str(json).unwrap()
+        }
         let defaults =
             br#"{"Server":"https://musicbrainz.org","RateLimit":1,"ReplaceArtistName":false}"#;
-        let body = |json: &str| -> serde_json::Map<String, serde_json::Value> {
-            serde_json::from_str(json).unwrap()
-        };
 
         let full = project_config(defaults, &body(r#"{"RateLimit":9}"#)).unwrap();
         let full: serde_json::Value = serde_json::from_slice(&full).unwrap();
@@ -2076,6 +2090,48 @@ mod tests {
             saved["StillSize"].is_null(),
             "an unset size is null: {saved}"
         );
+    }
+
+    /// `JsonDefaults`' `JsonStringConverter` (v12.4
+    /// `src/Jellyfin.Extensions/Json/Converters/JsonStringConverter.cs`) reads
+    /// a number or a bool posted for a string field as the token's raw text,
+    /// spelling kept; an object or an array there still throws.
+    #[tokio::test]
+    async fn a_string_field_reads_a_number_or_a_bool_as_its_text() {
+        let id = Uuid::from_u128(0x774);
+        let (mgr, _dir) = manager(vec![
+            RegisteredPlugin::new(descriptor(id, "Demo", true), None).with_default_config(
+                br#"{"Server":"https://musicbrainz.org","RateLimit":1}"#.to_vec(),
+            ),
+        ]);
+        for posted in [
+            "5",
+            "1e3",
+            "-0",
+            "5.10",
+            "12345678901234567890123",
+            "true",
+            "false",
+        ] {
+            // Spaced, which the raw text does not include.
+            mgr.set_plugin_configuration(id, format!(r#"{{"Server": {posted} }}"#).into_bytes())
+                .await
+                .expect(posted);
+            let saved: serde_json::Value =
+                serde_json::from_slice(&mgr.get_plugin_configuration(id).await.expect("read"))
+                    .expect("json");
+            assert_eq!(saved["Server"], posted, "{posted} is stored as its text");
+        }
+        for posted in ["{}", "[]", r#"["a"]"#] {
+            let err = mgr
+                .set_plugin_configuration(id, format!(r#"{{"Server":{posted}}}"#).into_bytes())
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(err, ServiceError::InvalidInput(_)),
+                "{posted}: {err:?}"
+            );
+        }
     }
 
     /// A digest `state.json` cannot take is warned about: after a restart the
