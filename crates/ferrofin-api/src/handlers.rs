@@ -1306,8 +1306,9 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
                    program_images_update, manager.rs add_provider_metadata; ferrofin-traits \
                    item_image_info.rs live_tv_image_is_internal, read by handlers/images.rs \
                    live_tv_image_is_servable, ferrofin-providers provider_manager.rs \
-                   delete_image and ferrofin-core dto_service.rs primary_image_aspect_ratio \
-                   and dynamic_images.rs local_images). ferrofin-drawing processor.rs \
+                   delete_image and ferrofin-core dto_service.rs primary_image_aspect_ratio, \
+                   dynamic_images.rs local_images and item_repository.rs \
+                   swap_item_images). ferrofin-drawing processor.rs \
                    get_image_cache_tag (the owning \
                    item's path, null as empty) and get_image_cache_tag_for_path (md5 of the \
                    UTF-16 path + DateModified ticks, as a .NET Guid \"N\") ← ferrofin-core \
@@ -1328,7 +1329,8 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
                    Jellyfin.Server.Implementations/Item/ChapterRepository.cs (Map), \
                    Jellyfin.Api/Controllers/ImageController.cs (GetItemImageInfos), \
                    Jellyfin.Api/Controllers/SearchController.cs (GetSearchHintResult), \
-                   MediaBrowser.Controller/Entities/BaseItem.cs (DeleteImageAsync), \
+                   MediaBrowser.Controller/Entities/BaseItem.cs (DeleteImageAsync, \
+                   SwapImagesAsync), \
                    Emby.Server.Implementations/Images/BaseDynamicImageProvider.cs \
                    (GetStripCollageImagePaths), \
                    src/Jellyfin.LiveTv/LiveTvDtoService.cs (GetImageTag), \
@@ -1342,7 +1344,7 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
                    MediaBrowser.Providers/Manager/ProviderManager.cs (SaveImage), \
                    Jellyfin.Server/Startup.cs (the NamedClient.Default handler) and \
                    Emby.Server.Implementations/Library/LibraryManager.cs (ConvertImageToLocal)",
-        date: "2026-11-11",
+        date: "2026-11-13",
         divergences: &[
             "Decoding and resizing run under limits upstream does not have (owner decision \
              2026-10-31, gl-1097), the settings image_decode_max_megapixels, \
@@ -1391,8 +1393,10 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
              row and leaves the file, where DeleteImageAsync deletes any local file. A Primary \
              with no stored size reports the kind's default PrimaryImageAspectRatio, as a file \
              that cannot be read does, where GetPrimaryImageAspectRatio opens it. A collage \
-             skips it, where GetStripCollageImagePaths draws any local file. Same Jellyfin bug \
-             as the entry above, not ported.",
+             skips it, where GetStripCollageImagePaths draws any local file. A reorder \
+             exchanges two rows' files only when both are in that directory, and otherwise does \
+             nothing, where SwapImagesAsync swaps any local files. Same Jellyfin bug as the \
+             entry above, not ported.",
         ],
     },
     VerifiedSubsystem {

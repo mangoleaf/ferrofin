@@ -5,8 +5,9 @@
 //! channel or programme row that is not a URL, stored before that rule, is
 //! served only from the internal metadata directory, where the metadata editor
 //! and an adopted Jellyfin database keep theirs. The same goes for what else a
-//! stored row reaches: the file a delete removes, the file a missing size is
-//! read from, and the file a collage draws.
+//! stored row reaches: the file a delete removes, the files a reorder
+//! exchanges, the file a missing size is read from, and the file a collage
+//! draws.
 
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
@@ -186,6 +187,14 @@ impl Fixture {
     async fn delete_image(&self, item: &str, image: &str) {
         let uri = format!("/Items/{item}/Images/{image}");
         let (status, body) = self.admin("DELETE", &uri, None).await;
+        assert_eq!(status, StatusCode::NO_CONTENT, "{uri}: {body:?}");
+    }
+
+    /// Asserts the reorder of the item's first two Backdrops answers `204`, as
+    /// every outcome here does.
+    async fn reorder_backdrops(&self, item: &str) {
+        let uri = format!("/Items/{item}/Images/Backdrop/0/Index?newIndex=1");
+        let (status, body) = self.admin("POST", &uri, None).await;
         assert_eq!(status, StatusCode::NO_CONTENT, "{uri}: {body:?}");
     }
 
@@ -647,6 +656,114 @@ async fn a_delete_removes_a_stored_rows_file_only_from_the_metadata_directory() 
         .await;
     fixture.delete_image(&playlist, "Primary").await;
     assert!(!owned.exists(), "an adopted row's file stays on disk");
+}
+
+/// A reorder exchanges the files of a stored row only when both are in the
+/// internal metadata directory, and otherwise writes nothing, as upstream does
+/// for a URL row. Every other item keeps upstream's exchange, of expanded paths.
+#[tokio::test]
+async fn a_reorder_exchanges_stored_rows_files_only_in_the_metadata_directory() {
+    let fixture = fixture().await;
+    let (channel, show) = fixture.channel_and_programme().await;
+    let metadata = fixture.metadata();
+    let first = metadata.join("livetv").join("adopted").join("a.png");
+    let second = first.with_file_name("b.png");
+    std::fs::create_dir_all(first.parent().expect("parent")).expect("dir");
+    let beside = metadata.parent().expect("parent").join("art.png");
+    let linked = first.with_file_name("linked.png");
+    std::os::unix::fs::symlink(&beside, &linked).expect("symlink");
+    let resolves_beside = metadata
+        .join("livetv")
+        .join("..")
+        .join("..")
+        .join("art.png");
+    let write = |a: &[u8], b: &[u8]| {
+        std::fs::write(&first, a).expect("art");
+        std::fs::write(&beside, b).expect("art");
+    };
+    let contents = || {
+        (
+            std::fs::read_to_string(&first).expect("art"),
+            std::fs::read_to_string(&beside).expect("art"),
+        )
+    };
+
+    for item in [&channel, &show] {
+        for outside in [&beside, &resolves_beside, &linked] {
+            let (inside, outside) = (first.to_string_lossy(), outside.to_string_lossy());
+            for rows in [[&inside, &outside], [&outside, &inside]] {
+                write(b"inside", b"outside");
+                fixture
+                    .set_rows(item, &[(BACKDROP, rows[0]), (BACKDROP, rows[1])])
+                    .await;
+                fixture.reorder_backdrops(item).await;
+                assert_eq!(
+                    contents(),
+                    ("inside".to_owned(), "outside".to_owned()),
+                    "{rows:?}"
+                );
+            }
+        }
+
+        // Both in the metadata directory, one stored as an adopted database
+        // stores it: exchanged.
+        std::fs::write(&first, b"first").expect("art");
+        std::fs::write(&second, b"second").expect("art");
+        fixture
+            .set_rows(
+                item,
+                &[
+                    (BACKDROP, &first.to_string_lossy()),
+                    (BACKDROP, "%MetadataPath%/livetv/adopted/b.png"),
+                ],
+            )
+            .await;
+        fixture.reorder_backdrops(item).await;
+        assert_eq!(std::fs::read(&first).expect("art"), b"second");
+        assert_eq!(std::fs::read(&second).expect("art"), b"first");
+
+        // One file under two spellings has nothing to exchange.
+        fixture
+            .set_rows(
+                item,
+                &[
+                    (BACKDROP, &first.to_string_lossy()),
+                    (BACKDROP, "%MetadataPath%/livetv/adopted/a.png"),
+                ],
+            )
+            .await;
+        fixture.reorder_backdrops(item).await;
+        assert_eq!(std::fs::read(&first).expect("art"), b"second");
+    }
+
+    let playlist = fixture.playlist_of(&channel).await;
+    write(b"inside", b"outside");
+    let (inside, outside) = (first.to_string_lossy(), beside.to_string_lossy());
+    fixture
+        .set_rows(&playlist, &[(BACKDROP, &inside), (BACKDROP, &outside)])
+        .await;
+    fixture.reorder_backdrops(&playlist).await;
+    assert_eq!(
+        contents(),
+        ("outside".to_owned(), "inside".to_owned()),
+        "another item's files are exchanged as upstream"
+    );
+
+    // Upstream's paths are expanded, so adopted rows exchange too.
+    std::fs::write(&first, b"first").expect("art");
+    std::fs::write(&second, b"second").expect("art");
+    fixture
+        .set_rows(
+            &playlist,
+            &[
+                (BACKDROP, "%MetadataPath%/livetv/adopted/a.png"),
+                (BACKDROP, "%MetadataPath%/livetv/adopted/b.png"),
+            ],
+        )
+        .await;
+    fixture.reorder_backdrops(&playlist).await;
+    assert_eq!(std::fs::read(&first).expect("art"), b"second");
+    assert_eq!(std::fs::read(&second).expect("art"), b"first");
 }
 
 /// A row with no stored size reports its file's ratio only from the internal
