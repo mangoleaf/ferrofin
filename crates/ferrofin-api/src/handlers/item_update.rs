@@ -112,16 +112,15 @@ pub(crate) async fn update_item(
         .update_items(std::slice::from_ref(&item), None)
         .await?;
     // External ids live in their own table (`BaseItemProviders`), so they are a
-    // second write rather than a column on the row. C# strips empty values and
-    // then ASSIGNS the dictionary, which is why this replaces the set instead of
-    // merging into it.
+    // second write rather than a column on the row. C# `SetProviderIds` ASSIGNS
+    // the dictionary, which is why this replaces the set instead of merging into
+    // it; the manager drops, trims and renames the pairs as `TrySetProviderId` does.
     if let Some(ids) = &request.provider_ids {
-        let mut pairs: Vec<(String, String)> = ids
-            .iter()
-            .filter(|(_, v)| !v.is_empty())
-            .map(|(k, v)| (k.clone(), v.clone()))
-            .collect();
+        let mut pairs: Vec<(String, String)> =
+            ids.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
         // A HashMap has no order; sort so the write (and its test) is deterministic.
+        // Of two keys differing only in case, the later in this byte order wins,
+        // where C# keeps the later in the JSON.
         pairs.sort();
         state
             .library
@@ -248,9 +247,10 @@ pub(crate) struct UpdateItemRequest {
     #[serde(default)]
     album_artists: Option<Vec<NameGuidPair>>,
     /// The item's external ids. C# assigns the whole dictionary
-    /// (`item.ProviderIds = request.ProviderIds`), so a key the client dropped
-    /// is REMOVED, not merged — and pairs with an empty value are stripped
-    /// first (`ItemUpdateController.UpdateItem`, v10.11.8 lines 402-410).
+    /// (`item.SetProviderIds(request.ProviderIds)`), so a key the client
+    /// dropped is REMOVED, not merged — and each pair is trimmed and dropped
+    /// when blank or invalid for its provider (`ItemUpdateController.UpdateItem`,
+    /// v12.4 lines 435-438).
     ///
     /// An ABSENT key leaves the stored ids alone. The vendored contract types
     /// `BaseItemDto.ProviderIds` as `nullable: true`, so a body without it is a
