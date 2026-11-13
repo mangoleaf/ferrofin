@@ -987,15 +987,11 @@ pub async fn build_app_state(
             ffmpeg.ffprobe.to_string_lossy().into_owned(),
             MediaEncoderConfig {
                 // Jellyfin's `FFmpeg:analyzeduration` / `FFmpeg:probesize`
-                // defaults, which every probe passes; without them ffprobe
-                // falls back to its own 5 s / 5 MB and can miss late streams.
-                analyze_duration: Some(
-                    ferrofin_mediaencoding::encoder::media_encoder::DEFAULT_ANALYZE_DURATION
-                        .to_owned(),
-                ),
-                probe_size: Some(
-                    ferrofin_mediaencoding::encoder::media_encoder::DEFAULT_PROBE_SIZE.to_owned(),
-                ),
+                // (`200M` / `1G` unless configured), which every probe passes;
+                // without them ffprobe falls back to its own 5 s / 5 MB and
+                // can miss late streams.
+                analyze_duration: Some(config.ffmpeg_analyze_duration.to_string()),
+                probe_size: Some(config.ffmpeg_probe_size.to_string()),
                 // `GetNumberOfThreads(null, options, null)`; it reads no
                 // capability, only the usable cores, as the planner's does.
                 threads: ferrofin_mediaencoding::EncodingHelper::new(
@@ -1060,7 +1056,10 @@ pub async fn build_app_state(
         crate::base_url::resolve(&config.base_url, config.base_url_from_env, &network_config);
     let started_network = network_config.clone();
     let network = Arc::new(std::sync::RwLock::new(
-        ferrofin_networking::NetworkManager::live(network_config),
+        ferrofin_networking::NetworkManager::live(
+            network_config,
+            Arc::new(ferrofin_networking::TracingLogger),
+        ),
     ));
 
     let users_impl = Arc::new(
@@ -1328,6 +1327,18 @@ pub async fn build_app_state(
         &id_derivation,
         (&paths.data_path(), &paths.root_folder_path()),
         &virtual_paths,
+    )
+    .await;
+    // Then a box set an older Ferrofin created with no folder gets the one
+    // Jellyfin's `CreateCollectionAsync` makes in that library's folder, and
+    // the id Jellyfin keys it by.
+    ferrofin_core::adoption_repairs::run_rekey_pathless_box_sets(
+        db,
+        &id_derivation,
+        (&paths.data_path(), &paths.root_folder_path()),
+        &virtual_paths,
+        Some(metadata_library_now.as_path()),
+        Some(path_manager.as_ref()),
     )
     .await;
     // One-shot (Jellyfin 12.2 `20260915120000_MigrateRatingLevels`): recompute
@@ -2468,6 +2479,7 @@ pub async fn build_app_state(
             Arc::clone(&library),
             Arc::clone(&virtual_folders),
             Arc::clone(&trickplay),
+            Arc::clone(&media_stream_repository),
         )));
         task_manager.register(Arc::new(maint_tasks::CleanActivityLogTask::new(
             Arc::clone(&config_trait),
@@ -2543,6 +2555,11 @@ pub async fn build_app_state(
     )
     .await
     .context("failed to remove items whose library or file is gone")?;
+    // Once per database: the playlists of users deleted before the fix for
+    // gl-131 (or by a hand-over that failed) are handed over or deleted, as
+    // deleting their owner now does. It deletes through the library manager
+    // too; a failure only warns.
+    ferrofin_core::adoption_repairs::run_remove_orphaned_playlists(db, playlists.as_ref()).await;
     // Jellyfin 12.0's `CleanupOrphanedExternalData`, once per database: the
     // extracted data and chapter images left behind for items no longer
     // stored (every earlier Ferrofin left them when a scan removed an item).
@@ -3084,6 +3101,10 @@ pub async fn build_app_state(
             transcode_limits: TranscodeLimits {
                 server: config.max_transcodes,
                 per_user: config.max_transcodes_per_user,
+            },
+            input_analysis: ferrofin_mediaencoding::encoder::media_encoder::InputAnalysis {
+                analyze_duration: config.ffmpeg_analyze_duration,
+                probe_size: config.ffmpeg_probe_size,
             },
         },
     );

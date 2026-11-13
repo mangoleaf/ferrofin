@@ -748,7 +748,7 @@ impl TvdbClient {
             api_key
         };
         Self {
-            http: reqwest::Client::new(),
+            http: crate::http_client::client(),
             limiter: RateLimiter::new("tvdb"),
             api_key: SecretString::from(key.to_owned()),
             pin: (!pin.is_empty()).then(|| pin.to_owned()),

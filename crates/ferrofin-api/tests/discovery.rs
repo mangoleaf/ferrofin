@@ -814,8 +814,8 @@ async fn user_scoped_suggestions_alias_forwards() {
 /// answered `200` with the other account's data — a cross-user read, not a
 /// cosmetic divergence.
 ///
-/// The stub caller is `USER_ID` with a `UserDto` carrying no `Policy`, i.e. not
-/// an administrator, so this exercises the refusing branch.
+/// The stub caller is `USER_ID` with a `UserDto` whose policy is not an
+/// administrator's, so this exercises the refusing branch.
 #[tokio::test]
 async fn suggestions_alias_forbids_another_users_id() {
     let other = uuid::Uuid::from_u128(0x11);

@@ -470,7 +470,7 @@ pub(crate) async fn new_playlist_folder_and_id(
 ///
 /// # Errors
 /// The I/O error that kept the folder from being made, or a failed lookup.
-async fn new_box_set_folder_and_id(
+pub(crate) async fn new_box_set_folder_and_id(
     db: &Database,
     mode: &crate::item_type_lookup::IdDerivation,
     collections: &str,
@@ -2134,8 +2134,16 @@ impl PlaylistManager for FerrofinPlaylistManager {
         for playlist in item_data::playlists_owned_by(&self.db, user_id).await? {
             let outcome = async {
                 // A hand-over commits with its `Data` sync, so `Data` stays an
-                // exact copy of the owner and the shares.
-                let mut tx = self.db.writer().begin().await.map_err(db_err)?;
+                // exact copy of the owner and the shares. It reads before it
+                // writes, so it takes the lock first: the boot repair of
+                // orphaned playlists runs it while the previous version can
+                // still be writing.
+                let mut tx = self
+                    .db
+                    .writer()
+                    .begin_with("BEGIN IMMEDIATE")
+                    .await
+                    .map_err(db_err)?;
                 item_data::import_playlist_meta_if_missing_in(&mut tx, playlist).await?;
                 let Some(permissions) =
                     item_data::playlist_permissions_in(&mut tx, playlist).await?

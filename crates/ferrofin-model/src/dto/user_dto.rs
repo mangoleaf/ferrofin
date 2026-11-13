@@ -109,7 +109,7 @@ impl Default for UserDto {
             last_login_date: None,
             last_activity_date: None,
             configuration: Some(UserConfiguration::default()),
-            policy: Some(UserPolicy::default()),
+            policy: Some(crate::users::constructor_policy()),
             primary_image_aspect_ratio: None,
         }
     }
@@ -126,7 +126,13 @@ mod tests {
         assert_eq!(dto.has_configured_password, Some(true));
         assert_eq!(dto.has_configured_easy_password, Some(false));
         assert!(dto.configuration.is_some());
-        assert!(dto.policy.is_some());
+        let policy = dto.policy.expect("a policy");
+        assert_eq!(policy, crate::users::constructor_policy());
+        // `new UserPolicy()`, not the all-false `UserPolicy::default()`.
+        assert!(policy.enable_media_playback);
+        assert!(policy.enable_all_folders);
+        assert!(policy.is_hidden);
+        assert_eq!(policy.login_attempts_before_lockout, -1);
     }
 
     #[test]

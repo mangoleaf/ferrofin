@@ -463,7 +463,7 @@ impl MusicBrainzClient {
     pub fn new(base_url: &str, version: &str) -> Self {
         let base = base_url.trim_end_matches('/');
         Self {
-            http: reqwest::Client::new(),
+            http: crate::http_client::client(),
             configured_base_url: (!base.is_empty()).then(|| base.to_owned()),
             plugin: crate::plugin_config::ConfigSource::new(),
             // MB requires contact info; the project URL satisfies the policy.
@@ -633,28 +633,37 @@ impl MusicBrainzClient {
 
     /// Looks up a release group's releases (`inc=releases`) and resolves each
     /// through [`lookup_release`](Self::lookup_release) — port of the
-    /// `MusicBrainzAlbumProvider.GetReleaseGroupResultAsync` walk. Empty when
-    /// the group is unknown.
-    pub async fn release_group_releases(&self, release_group_id: &str) -> Vec<ReleaseHit> {
-        let Some(release_group_id) = lookup_id(release_group_id, "release group") else {
-            return Vec::new();
-        };
-        let Some(group): Option<ReleaseGroupLookup> = self
+    /// `MusicBrainzAlbumProvider.GetReleaseGroupResultAsync` walk. `None`
+    /// when the id is malformed or the group lookup fails
+    /// (`LookupReleaseGroupOrNullAsync`), so a caller can tell an unknown
+    /// group from one with no releases.
+    ///
+    /// A release that answers 404 is skipped. One that fails any other way
+    /// ends the walk with the releases before it: upstream's lookup throws
+    /// mid-enumeration, and `GetRemoteSearchResults` keeps what it already
+    /// added. Each release lookup counts its failures in a scope of its own,
+    /// so they do not reach the caller's [`count_request_failures`] scope,
+    /// which sees only the group lookup's.
+    ///
+    /// [`count_request_failures`]: crate::rate_limit::count_request_failures
+    pub async fn release_group_releases(&self, release_group_id: &str) -> Option<Vec<ReleaseHit>> {
+        let release_group_id = lookup_id(release_group_id, "release group")?;
+        let group: ReleaseGroupLookup = self
             .get(
                 &format!("/ws/2/release-group/{release_group_id}"),
                 &[("inc", "releases".to_owned())],
             )
-            .await
-        else {
-            return Vec::new();
-        };
+            .await?;
         let mut hits = Vec::with_capacity(group.releases.len());
         for release in group.releases {
-            if let Some(hit) = self.lookup_release(&release.id).await {
-                hits.push(hit);
+            let (hit, failures) =
+                crate::rate_limit::count_request_failures(self.lookup_release(&release.id)).await;
+            if failures > 0 {
+                break;
             }
+            hits.extend(hit);
         }
-        hits
+        Some(hits)
     }
 
     /// Runs a raw lucene artist search (`/ws/2/artist?query=`) and returns
@@ -1153,7 +1162,7 @@ mod tests {
         assert!(c.first_release_of("").await.is_none());
         let release_group_releases = c.release_group_releases("rg").await;
         assert!(
-            release_group_releases.is_empty(),
+            release_group_releases.is_none(),
             "{release_group_releases:?}"
         );
     }

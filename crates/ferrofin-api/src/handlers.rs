@@ -1645,7 +1645,10 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
                    generate_sets and tile_and_save (RefreshTrickplayDataInternal), \
                    create_tiles and move_dir (CreateTiles), \
                    and scheduled_tasks/library.rs TrickplayImagesTask, compared with \
-                   MediaBrowser.Providers/Trickplay/TrickplayImagesTask.cs (ExecuteAsync). \
+                   MediaBrowser.Providers/Trickplay/TrickplayImagesTask.cs (ExecuteAsync): \
+                   each video gets its page's row, as upstream hands over the page's Video, \
+                   and its stored streams from one read per page, where upstream's \
+                   GetMediaStreams reads them at the video's turn. \
                    Also the sets a changed video loses before its refresh: library_scan.rs \
                    scan_item and file_changed, item_data_cleanup.rs prune_extracted_data, \
                    external_data_manager.rs delete_external_item_data and \
@@ -2022,7 +2025,12 @@ pub const VERIFIED: &[Verified] = &[
                ReportTranscodingInfo's Sessions order; mediaencoding manager.rs start_ffmpeg → \
                on_job_failed_to_start; ClearTranscodingInfo, OnTranscodeFailedToStart), whose \
                reported PlayMethod handlers/playstate.rs validate_play_method keeps only while \
-               the play session transcodes (ValidatePlayMethod); NowViewingItem is \
+               the play session transcodes (ValidatePlayMethod); its TranscodeReasons are the \
+               job's (manager.rs transcoding_info; ReportTranscodingProgress's \
+               state.TranscodeReasons): the request's TranscodeReasons as ferrofin-model \
+               parse_transcode_reasons reads them (EncodingJobInfo.TranscodeReasons' \
+               Enum.TryParse), plus the AudioCodecNotSupported apps/ferrofin-server planner.rs \
+               plan adds to audio it re-encodes (TryStreamCopy's AddTranscodeReason); NowViewingItem is \
                report_now_viewing_item's (ReportNowViewingItem) and UserPrimaryImageTag is \
                stamped by upsert_session (GetSessionInfo, GetImageCacheTag); \
                LastPlaybackCheckIn is DateTime.MinValue until update_now_playing stamps it \
@@ -2577,9 +2585,16 @@ pub const VERIFIED: &[Verified] = &[
                user's rows for the device id in Id order, then Logout(Device) of each) and \
                session activity, and that upstream has no login rate limit. \
                The UserDto and SessionInfoDto \
-               builders are shared with other routes and not compared here",
+               builders are shared with other routes and not compared here; \
+               authentication_result's fallback User, compared on 2026-11-11 (gl-1106), \
+               carries new UserDto()'s policy, as UserPolicy.cs's constructor sets it",
         date: "2026-11-05",
         divergences: &[
+            "When the user cannot be reloaded once the token is minted (a database read error, or \
+         the user deleted in that moment), User is a bare DTO: the session's id, name and \
+         ServerId with new UserDto()'s configuration and policy, not the user's own. Upstream \
+         builds User from the in-memory user it already holds, which cannot fail there; the \
+         sign-in succeeds on both. Fix path: gl-1719.",
             "The 400 (no client identity, an empty username) and 500 bodies are Ferrofin's error \
          shape, not upstream's. Fix path: gl-666.",
             "MaxActiveSessions counts the user's sessions in the pool, as upstream \
@@ -2622,7 +2637,8 @@ pub const VERIFIED: &[Verified] = &[
         divergences: &[
             "The User member is built at the exchange, from the user as it is then, where \
          upstream returns the UserDto it snapshotted when the code was authorized, up to \
-         10 minutes stale (a user deleted meanwhile gets the bare id/name DTO); the \
+         10 minutes stale (a user deleted meanwhile gets the bare DTO: id, name, the \
+         session's ServerId and new UserDto()'s configuration and policy); the \
          session, token and ServerId are the stored ones on both. Jellyfin bug not \
          ported.",
             "The 404 (unknown or expired secret) body is Ferrofin's error shape, not \
@@ -3118,7 +3134,11 @@ pub const VERIFIED: &[Verified] = &[
                ConvertEmptyStringToNull, then [Required]; normalize_named_configuration: \
                GetConfigurationType and Deserialize) → save_named_configuration \
                (BaseConfigurationManager.SaveConfiguration: the validating store, the write, \
-               the live network policy, the listeners (ferrofin-server listen.rs \
+               the live network policy (ferrofin-networking NetworkManager::update_settings: \
+               UpdateSettings, warning of each LAN or exclusion entry InitializeLan ignores \
+               and logging an error for each override InitializeOverrides cannot parse, the \
+               loop stopping at the first without exactly one '=' as upstream's does), the \
+               listeners (ferrofin-server listen.rs \
                restart_listener: the port restart of OnConfigurationUpdated), the committed \
                checks for ApplicationHost.OnConfigurationUpdated) → for livetv \
                LiveTvManager::create_recording_folders (ferrofin-livetv recording_folders.rs: \
@@ -3161,6 +3181,9 @@ pub const VERIFIED: &[Verified] = &[
          at every boot and the restart flag stays set once raised; but upstream also clears \
          IsPortAuthorized and saves when it flags the restart, and Ferrofin leaves it true. \
          Fix path: gl-1701.",
+            "An unparsable PublishedServerUriBySubnet entry is logged with its URL cut to \
+         scheme, host and port (docs/conventions/LOGGING.md rule 5), where upstream logs the \
+         entry whole.",
             "The 400 and 500 bodies are Ferrofin's error shape, not upstream's. Fix path: \
          gl-666.",
         ],
@@ -4084,6 +4107,61 @@ pub const VERIFIED: &[Verified] = &[
         refs: &[],
     },
     Verified {
+        method: "delete",
+        path: "/Videos/{itemId}/Subtitles/{index}",
+        upstream_file: "Jellyfin.Api/Controllers/SubtitleController.cs",
+        upstream_method: "DeleteSubtitle",
+        ferrofin: "handlers/subtitles.rs delete_subtitle (RequireAdmin, the RequiresElevation \
+               policy; a nil itemId is GetItemById's ArgumentException; require_item, \
+               GetItemById<BaseItem>(itemId, User.GetUserId()): a missing or hidden item is \
+               NotFound()'s ProblemDetails 404; every other failure answered as \
+               ExceptionMiddleware answers a throw, its status with text/plain \"Error \
+               processing request.\" (error.rs into_exception_response); the delete and the \
+               refresh on a task of their own, as upstream finishes them for a client that \
+               hangs up) → ferrofin-core subtitle_manager.rs delete_subtitles \
+               (SubtitleManager.DeleteSubtitles: GetMediaStreams for the subtitle stream at \
+               index, none or one with no or an empty path the 400; a row not marked \
+               external is skipped too, which changes no answer, since neither server stores \
+               a path on one, and keeps a stray path from deleting the media file; the file \
+               deleted inside the self-write bracket as File.Delete does on Linux: a file \
+               already gone ignored while its folder exists, else, and for ENOTDIR (a folder \
+               in the path is a file; read in dotnet/runtime's FileSystem.Unix DeleteFile \
+               and Interop.GetExceptionForIoErrno, not measured), the \
+               DirectoryNotFoundException 404 before any refresh; an http(s) row, which \
+               Path.GetFullPath resolves against the working directory (from /, \
+               http://h/a.srt → /http:/h/a.srt, a missing folder), is that 404 without \
+               touching the disk) → \
+               handlers.rs run_item_refresh (the awaited \
+               item.RefreshMetadata, whose re-probe drops the stream and renumbers the rest; \
+               queued instead for an item outside every library, as for the lyrics delete). \
+               The parity sweep's request (the corpus movie's stream 0, its video) expects \
+               the 400. Measured on 12.4: an embedded, a \
+               missing and a video stream's index, a nil id, an unknown id and an external \
+               sidecar's index; and that sidecar's row pointed at a missing file (204), a \
+               missing folder (404, row kept) and an http URL (404, row kept)",
+        date: "2026-11-12",
+        divergences: &[
+            "A hex (0x, #, &h) or padded index is a 400; upstream's route binder reads it as \
+         a number. Fix path: gl-1664.",
+            "The 400 for an itemId or index the route binder cannot convert (upstream's \
+         ValidationProblemDetails), and the 401 and 403 bodies, are Ferrofin's error shape, \
+         not upstream's. Fix path: gl-666.",
+            "A row an adopted database stores with a %AppDataPath% or %MetadataPath% token (a \
+         subtitle Jellyfin saved in its metadata folder) is read unexpanded, so it is the \
+         folder-missing 404 below, where upstream expands it (MediaStreamRepository \
+         RestorePath) and deletes the file. Fix path: gl-1063.",
+            "Every other relative path is the folder-missing 404, without touching the disk, as \
+         the item delete refuses one (item_deletion.rs delete_item_path). Upstream \
+         resolves one against its working directory, so a relative row whose folder exists \
+         there answers 204 and deletes the file it names beside the server process (gl-1723). \
+         A Jellyfin bug, deliberately not ported.",
+            "A file already gone from a read-only mount (EROFS) is a 500; File.Delete checks \
+         that the file is absent and answers it as any missing file, 204 and the refresh. Fix \
+         path: gl-1724.",
+        ],
+        refs: &["access-filtering"],
+    },
+    Verified {
         method: "get",
         path: "/FallbackFont/Fonts",
         upstream_file: "Jellyfin.Api/Controllers/SubtitleController.cs",
@@ -4371,6 +4449,71 @@ pub const VERIFIED: &[Verified] = &[
          scan after the stopping one. Fix path: gl-1709.",
             "The 401 (no or bad token) and 403 (not an administrator) bodies are Ferrofin's \
          error shape, not upstream's. Fix path: gl-666.",
+        ],
+        refs: &[],
+    },
+    Verified {
+        method: "post",
+        path: "/Items/RemoteSearch/MusicAlbum",
+        upstream_file: "Jellyfin.Api/Controllers/ItemLookupController.cs",
+        upstream_method: "GetMusicAlbumRemoteSearchResults",
+        ferrofin: "handlers/item_lookup.rs music_album_remote_search (RequireAuth; JsonBody for \
+               the [Required] body; to_request: AlbumInfo's AlbumArtists, ArtistProviderIds and \
+               SongInfos ride along) → ferrofin-providers provider_manager.rs remote_search \
+               (ProviderManager.GetRemoteSearchResults: the reference item's library options, \
+               or none for no ItemId; CanRefreshMetadata with IncludeDisabledProviders; \
+               SearchProviderName ignoring case; the configured then default order; the server's \
+               language and country for blank ones; each provider's results stamped with its \
+               name and merged by a shared provider id, ImageUrl filled; a failing provider \
+               logged and skipped. The providers run together and merge in provider order, \
+               which gives the C# loop's list) → MusicBrainzAlbumSearchProvider \
+               (MusicBrainzAlbumProvider.GetSearchResults: album_id_or_song_id and \
+               album_artist_mbid are AlbumInfoExtensions' GetReleaseId, GetReleaseGroupId and \
+               GetMusicBrainzArtistId, each id through IsValidProviderId; or_failed fails the \
+               provider on any failed request, as the C# HttpError does, except a by-id \
+               lookup's 404 (NotFoundAsNullAsync), so a 404 or malformed release id falls to \
+               the release group and an unknown group to the arid:/artist: search; \
+               GetReleaseGroupResultAsync's \
+               walk in musicbrainz.rs release_group_releases skips a release that answers 404 \
+               and stops at one that fails otherwise, keeping the releases before it, as \
+               GetRemoteSearchResults keeps what it added before the exception) and \
+               AudioDbSearchProvider (AudioDbAlbumProvider: no results)",
+        date: "2026-11-11",
+        divergences: &[
+            "The search by album and artist name drops the stray `c` the C# appends after the \
+         artist phrase (`artist:\"…\"c`), a typo that adds a bare term to the lucene query.",
+            "A body with no SearchInfo is searched as an empty lookup (200); upstream \
+         dereferences the null SearchInfo and answers 500.",
+            "The 401 (no or bad token) body is Ferrofin's error shape, not upstream's. Fix \
+         path: gl-666.",
+        ],
+        refs: &[],
+    },
+    Verified {
+        method: "post",
+        path: "/Items/RemoteSearch/MusicArtist",
+        upstream_file: "Jellyfin.Api/Controllers/ItemLookupController.cs",
+        upstream_method: "GetMusicArtistRemoteSearchResults",
+        ferrofin: "handlers/item_lookup.rs music_artist_remote_search (RequireAuth; JsonBody for \
+               the [Required] body; to_request: ArtistInfo's SongInfos ride along) → \
+               ferrofin-providers provider_manager.rs remote_search (as for MusicAlbum: \
+               ProviderManager.GetRemoteSearchResults) → MusicBrainzArtistSearchProvider \
+               (MusicBrainzArtistProvider.GetSearchResults, Order 0: artist_mbid is \
+               AlbumInfoExtensions.GetMusicBrainzArtistId(ArtistInfo) through \
+               IsValidProviderId; or_failed fails the provider on any failed request, as the \
+               C# HttpError does, except the lookup's 404 (NotFoundAsNullAsync), so a 404 or \
+               malformed id falls to the name search; a blank name finds nothing; the phrase \
+               search, then artistaccent: for a name with diacritics) and \
+               AudioDbSearchProvider",
+        date: "2026-11-11",
+        divergences: &[
+            "TheAudioDB contributes no artists: v12.4's AudioDbArtistProvider.GetSearchResults \
+         looks the artist up by its AudioDbArtist id, else its MusicBrainz id, else searches \
+         by name. Fix path: gl-497.",
+            "A body with no SearchInfo is searched as an empty lookup (200); upstream \
+         dereferences the null SearchInfo and answers 500.",
+            "The 401 (no or bad token) body is Ferrofin's error shape, not upstream's. Fix \
+         path: gl-666.",
         ],
         refs: &[],
     },

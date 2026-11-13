@@ -4739,8 +4739,9 @@ pub(crate) async fn rekey_rows_at(
     if moves.is_empty() {
         return Ok(Vec::new());
     }
-    // The write lock first: the moves read before they write, and a boot
-    // repair runs this beside the previous version (CONTRIBUTING.md,
+    // Reserve the writer before reading the schema: a deferred transaction
+    // fails at its first write when another process commits in between, and a
+    // boot repair runs this beside the previous version (CONTRIBUTING.md,
     // "Migrations and one-shot repairs").
     let mut tx = db
         .writer()

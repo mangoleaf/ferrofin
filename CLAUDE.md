@@ -261,14 +261,24 @@ cargo llvm-cov nextest -p <crate> --fail-under-lines 80 --summary-only
 ### ffmpeg integration tests
 The real `tokio::process` ffmpeg spawn (transcode) can't be unit-tested and is excluded from
 the coverage gate — it lives behind a seam trait with a fake for unit tests. The real
-integration tests are gated behind an env var and skip if ffmpeg is absent:
+integration tests are `#[ignore]`d, so every default run lists them as skipped. Run them with
+`--include-ignored` (nextest: `--run-ignored all`); asked for, they fail when ffmpeg, ffprobe or
+libx264 is missing:
 
 ```bash
-FERROFIN_FFMPEG_TESTS=1 cargo test -p ferrofin-mediaencoding --test segment_transcode_ffmpeg
-FERROFIN_FFMPEG_TESTS=1 cargo test -p ferrofin-hls          --test hls_stream_manager_ffmpeg
-FERROFIN_FFMPEG_TESTS=1 cargo test -p ferrofin-server       --test no_repeat_extraction_ffmpeg
-FERROFIN_FFMPEG_TESTS=1 cargo test -p ferrofin-server       --test subtitle_streams_ffmpeg
+cargo test -p ferrofin-mediaencoding --test segment_transcode_ffmpeg   -- --include-ignored
+cargo test -p ferrofin-hls          --test hls_stream_manager_ffmpeg   -- --include-ignored
+cargo test -p ferrofin-server       --test no_repeat_extraction_ffmpeg -- --include-ignored
+cargo test -p ferrofin-server       --test subtitle_streams_ffmpeg     -- --include-ignored
+# all of them: every *_ffmpeg test binary and the inline real_ffmpeg_* tests
+cargo nextest run --workspace --run-ignored only -E 'binary(/_ffmpeg$/) | test(/real_ffmpeg/)'
 ```
+
+A test that needs more than that returns early with a message when the host lacks it: an ffmpeg
+new enough (`hls_seek_ffmpeg` 5.0; `subtitle_streams_ffmpeg` and the BT.709 chapter-image and
+several trickplay cases 5.1), one whose version reads (several trickplay tests), jellyfin-ffmpeg's
+`tonemapx`, or a VAAPI render node. The chapter-image test fails on an unreadable version
+instead: it hands the version to the encoder.
 
 `no_repeat_extraction_ffmpeg` checks that chapter images, trickplay and Intro Skipper
 analysis are never redone for an unchanged file: library scans, the three scheduled tasks,
@@ -283,10 +293,10 @@ the right time; and it burns an ASS track in with the fonts its file ships, whic
 extracted into the cache whatever their `filename` tags say.
 
 Both of these need an ffmpeg with libx264, and `subtitle_streams_ffmpeg` also needs ffmpeg
-5.1 or later. CI does not run them (CI never sets `FERROFIN_FFMPEG_TESTS`): run them by hand
-for changes to those paths.
+5.1 or later. CI does not run them (no CI job runs ignored tests): run them by hand for
+changes to those paths.
 
-The image limits have the same kind of gate. `image_limits_cgroup` boots the real binary in a
+The image limits have an environment-variable gate. `image_limits_cgroup` boots the real binary in a
 `systemd-run --user --scope` with a hard memory cap and swap off, and checks that each limit holds
 there: the pixel limit, the resize budget, the memory limit on a Photo item, the budget shared
 by concurrent resizes, a blur's compositing under the budget, and remote images past the download

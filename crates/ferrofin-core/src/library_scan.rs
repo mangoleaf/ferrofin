@@ -16489,14 +16489,13 @@ impl LibraryScanner {
         // An audio file that matched no extra rule is not a movie: a
         // soundtrack sitting beside the film belongs to a music library.
         // Without a collection type it is `Audio` (`AudioResolver.cs:94-134`),
-        // unless it sits in a movie's own folder, which nothing walks.
-        // TODO(parity, open work item — NOT an accepted divergence; gl-1201):
-        // it hangs off the library, not the plain folder the walk is in; pass
-        // `folder.walk.parent(cf, ctx)`, as `video_row` does.
+        // unless it sits in a movie's own folder, which nothing walks. It
+        // hangs off the plain folder the walk is in, as a video does
+        // (`Folder.GetNonCachedChildren` resolves with the folder as parent).
         if !is_video {
             if folder.untyped && !folder.own_folder {
-                let cf = folder.cf;
-                self.plan_untyped_audio(&entry, cf, (cf, vec![cf]), ctx, out);
+                let parent = folder.walk.parent(folder.cf, ctx);
+                self.plan_untyped_audio(&entry, folder.cf, parent, ctx, out);
             }
             return;
         }
@@ -16736,7 +16735,8 @@ impl LibraryScanner {
     /// An audio file in an untyped library: `Audio`, in a mixed folder
     /// (`AudioResolver.cs:94-134`) — never a cue sheet or a theme song, nor
     /// a file whose extension is a video one too. `parent` is what it hangs
-    /// off and the ancestors: the library, or a series or season.
+    /// off and the ancestors: the library, a plain folder, or a series or
+    /// season.
     fn plan_untyped_audio(
         &self,
         entry: &FileSystemEntryInfo,
