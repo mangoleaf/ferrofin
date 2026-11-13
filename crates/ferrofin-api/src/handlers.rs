@@ -1088,7 +1088,10 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
                    sync_season_name, remember_series_folder, locale_parent (GetParents, \
                    GetCollectionFolders, read by resolve_metadata_locale); \
                    apply_parental_rating_score and \
-                   inherit_stored_rating; keep_stored_series_key. Compared with \
+                   inherit_stored_rating; keep_stored_series_key; series_display_order \
+                   (an unread series skips its children's TheTVDB lookups, counting no \
+                   failure). Compared with \
+                   MediaBrowser.Controller/Entities/TV/Episode.cs (GetLookupInfo), \
                    MediaBrowser.Controller/LibraryTaskScheduler/\
                    LimitedConcurrencyLibraryScheduler.cs (ProcessItem), \
                    MediaBrowser.Controller/Entities/Folder.cs (RunTasks, \
@@ -1097,10 +1100,10 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
                    GetPreferredMetadataLanguage, GetPreferredMetadataCountryCode, GetParents), \
                    MediaBrowser.Providers/Manager/ProviderManager.cs (RefreshItem), \
                    MediaBrowser.Providers/Manager/MetadataService.cs (RefreshMetadata), \
-                   MediaBrowser.Controller/Entities/TV/Season.cs (FindSeriesName), \
+                   MediaBrowser.Controller/Entities/TV/Season.cs (FindSeriesName, GetLookupInfo), \
                    MediaBrowser.Controller/Entities/BaseItem.cs (GetParentalRatingScore) and \
                    MediaBrowser.Providers/TV/EpisodeMetadataService.cs (BeforeSaveInternal)",
-        date: "2026-11-09",
+        date: "2026-11-13",
         divergences: &[
             "An item whose parent chain cannot be read is scored from its own rating and \
              country, an ancestor's custom rating not counting, else takes the score stored on \
@@ -1113,6 +1116,12 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
              the server, so an override on the unreadable row or above it goes unused and the \
              child is fetched, and stamped, in that locale, where upstream's read of such a \
              row would throw into the per-child catch and the item would not refresh.",
+            "An episode, or a season whose refresh reaches its TheTVDB lookups, whose series \
+             row cannot be read is refreshed and stamped without TheTVDB's answer, as \
+             upstream treats a child with no series (GetLookupInfo sets no \
+             SeriesProviderIds, and jellyfin-plugin-tvdb 5c4592f returns an empty result), \
+             where upstream's read of such a row would throw into the per-child catch and \
+             the item would not refresh.",
             "A stored item whose refresh stops after its row was saved (a failed write, a \
              cancel, a crash) is left with no DateLastRefreshed, which the scan clears for the \
              save and writes back last, so the next scan retries it as a first refresh where \
