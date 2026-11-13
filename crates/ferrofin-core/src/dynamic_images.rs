@@ -103,7 +103,7 @@ use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
 use ferrofin_db::entities::base_items::BaseItemEntity;
-use ferrofin_db::store::{datetime_to_db, guid_to_db};
+use ferrofin_db::store::datetime_to_db;
 use ferrofin_model::data::BaseItemKind;
 use ferrofin_model::dto::SortOrder;
 use ferrofin_model::entities::ImageType;
@@ -972,36 +972,9 @@ fn has_changed_by_date(image: &ItemImageInfo) -> bool {
     datetime_to_db(DateTime::<Utc>::from(modified)) != datetime_to_db(image.date_modified)
 }
 
-/// An item's own art folders under the metadata `root`: Ferrofin's
-/// `{root}/{ID}` ([`own_art_dir`]), the [`legacy_art_dir`] older scans wrote
-/// some art to, and the `{root}/{xx}/{id:N}` folder Jellyfin's
-/// `BaseItem.GetInternalMetadataPath` uses (`BaseItem.cs:927-937`), which an
-/// adopted database's images keep.
-#[must_use]
-pub(crate) fn internal_metadata_dirs(root: &Path, item_id: Uuid) -> [PathBuf; 3] {
-    let simple = item_id.simple().to_string();
-    [
-        own_art_dir(root, item_id),
-        legacy_art_dir(root, item_id),
-        root.join(&simple[..2]).join(&simple),
-    ]
-}
-
-/// The folder Ferrofin draws an item's art into: `{root}/{ID}`.
-#[must_use]
-pub(crate) fn own_art_dir(root: &Path, item_id: Uuid) -> PathBuf {
-    root.join(guid_to_db(item_id))
-}
-
-/// `{root}/{id}`, the item's id lower-cased: where older scans wrote music,
-/// person, studio and embedded-cover art, beside [`own_art_dir`]. Nothing is
-/// written there any more. It is read and cleaned so that art already there
-/// is found, pruned and removed with the item, and its stored paths keep
-/// working.
-#[must_use]
-pub(crate) fn legacy_art_dir(root: &Path, item_id: Uuid) -> PathBuf {
-    root.join(item_id.hyphenated().to_string())
-}
+pub(crate) use ferrofin_providers::local_images::{
+    internal_metadata_dirs, legacy_art_dir, own_art_dir,
+};
 
 /// Whether `image` is the item's own (`BaseDynamicImageProvider.FetchAsync` /
 /// `HasChanged`): a local file inside one of its
@@ -1085,6 +1058,7 @@ mod tests {
     use crate::test_support::{image_info, item_repository_over, seed_images, test_db};
     use ferrofin_db::Database;
     use ferrofin_db::enums::ItemValueType;
+    use ferrofin_db::store::guid_to_db;
     use ferrofin_drawing::image_encoder::ImageCrateEncoder;
     use ferrofin_drawing::processor::ImageProcessor as DrawingProcessor;
     use ferrofin_traits::persistence::LinkedChildrenService;

@@ -35,7 +35,8 @@ pub use episode_image_provider::EpisodeLocalImageProvider;
 pub use item::{ImageItem, ImageItemKind};
 pub use local_image_provider::LocalImageProvider;
 pub use merge::{
-    file_date_modified, first_of_each_singular_type, local_image_infos, merge_local_images,
+    file_date_modified, first_of_each_singular_type, internal_metadata_dirs, legacy_art_dir,
+    local_image_infos, merge_local_images, own_art_dir, remove_images,
 };
 pub use other_providers::{
     CollectionFolderLocalImageProvider, InternalMetadataFolderImageProvider,
