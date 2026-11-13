@@ -150,8 +150,6 @@ pub struct InternalItemsQuery {
     /// Exact names (cleaned), matched as a set — the batch form of [`Self::name`]
     /// used to resolve many by-name items (people, years) in one query.
     pub names: Vec<String>,
-    /// Whether the raw (un-normalized) name is matched.
-    pub use_raw_name: Option<bool>,
 
     // --- person / id sets ---
     /// Restrict to items featuring this person (by name).
@@ -570,7 +568,6 @@ impl Default for InternalItemsQuery {
             path: None,
             name: None,
             names: Vec::new(),
-            use_raw_name: None,
             person: None,
             person_ids: Vec::new(),
             item_ids: Vec::new(),
