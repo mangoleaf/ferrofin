@@ -833,8 +833,8 @@ impl<F: FileMeta + 'static> ImageProcessor<F> {
 mod tests {
     //! Round-trip cases transliterated from `ImageProcessor.cs`: the cache tag is
     //! a stable 32-char hex sensitive to path and ticks; the cache key changes per
-    //! option and carries `v=3`; default options pass the original through; a
-    //! resize produces then hits the cache.
+    //! option and carries `v=` and [`DEFAULT_CACHE_VERSION`]; default options pass
+    //! the original through; a resize produces then hits the cache.
     use super::*;
     use crate::error::DrawingError;
     use crate::image_encoder::ImageCrateEncoder;
