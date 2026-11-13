@@ -161,7 +161,7 @@ impl RemoteSearchProvider for TmdbSearchProvider {
             return Ok(hits
                 .into_iter()
                 .map(|hit| {
-                    let mut result = self.hit_result(hit);
+                    let mut result = Self::hit_result(hit);
                     // `TmdbSeriesProvider` stamps the id it searched by back
                     // onto each row; `TmdbMovieProvider` does not.
                     if self.kind == TmdbKind::Series {
@@ -187,22 +187,20 @@ impl RemoteSearchProvider for TmdbSearchProvider {
             TmdbKind::Series => None,
         };
         let hits = self.tmdb.search(self.kind, name, year, language).await;
-        Ok(hits.into_iter().map(|hit| self.hit_result(hit)).collect())
+        Ok(hits.into_iter().map(Self::hit_result).collect())
     }
 }
 
 impl TmdbSearchProvider {
     /// One `/search/*` or `/find/*` row as an Identify candidate — the C#
     /// name-search loop for movies, `MapSearchTvToRemoteSearchResult` for
-    /// series. The series mapper sets `PremiereDate` and never `ProductionYear`;
-    /// the movie one sets both, from the same release date.
-    fn hit_result(&self, hit: crate::tmdb::TmdbSearchHit) -> RemoteSearchResult {
+    /// series. Both set `PremiereDate` and `ProductionYear` from the same date:
+    /// the release date for a movie, the first air date for a series
+    /// (jellyfin/jellyfin#16144).
+    fn hit_result(hit: crate::tmdb::TmdbSearchHit) -> RemoteSearchResult {
         RemoteSearchResult {
             name: hit.name,
-            production_year: match self.kind {
-                TmdbKind::Movie => hit.year,
-                TmdbKind::Series => None,
-            },
+            production_year: hit.year,
             premiere_date: hit.premiere_date.as_deref().and_then(parse_ymd),
             image_url: hit.poster_url,
             overview: hit.overview,
@@ -217,8 +215,8 @@ impl TmdbSearchProvider {
 
     /// The single candidate a `Tmdb` id resolves to — the C# `GetMovieAsync`
     /// branch / `MapTvShowToRemoteSearchResult`. Both carry the IMDb id when
-    /// TMDB knows it; the series mapper adds the TVDB id too, and neither
-    /// series mapper sets `ProductionYear`.
+    /// TMDB knows it; the series mapper adds the TVDB id too. Both set
+    /// `ProductionYear` from the release / first air date.
     fn pinned_result(&self, tmdb_id: i64, details: TmdbDetails) -> RemoteSearchResult {
         let mut provider_ids = HashMap::from([("Tmdb".to_owned(), tmdb_id.to_string())]);
         // `TrySetProviderId` — only when TMDB actually has the id.
@@ -232,10 +230,7 @@ impl TmdbSearchProvider {
         }
         RemoteSearchResult {
             name: details.name,
-            production_year: match self.kind {
-                TmdbKind::Movie => details.production_year,
-                TmdbKind::Series => None,
-            },
+            production_year: details.production_year,
             premiere_date: details.premiere_date.as_deref().and_then(parse_ymd),
             image_url: details.poster_url,
             overview: details.overview,
@@ -6461,7 +6456,8 @@ mod tests {
             (
                 // The bare `fr` — the series arm only.
                 "language=fr",
-                r#"{"movie_results":[],"tv_results":[{"id":1396,"name":"Breaking Bad"}]}"#
+                r#"{"movie_results":[],"tv_results":[{"id":1396,"name":"Breaking Bad",
+                    "first_air_date":"2008-01-20"}]}"#
                     .to_owned(),
             ),
             (
@@ -6495,6 +6491,8 @@ mod tests {
             .expect("results");
         assert_eq!(results.len(), 1, "series /find must send the bare language");
         assert_eq!(results[0].name.as_deref(), Some("Breaking Bad"));
+        // `MapSearchTvToRemoteSearchResult`: the year of the first air date.
+        assert_eq!(results[0].production_year, Some(2008));
     }
 
     #[tokio::test]
@@ -6559,7 +6557,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn tmdb_series_identify_sets_premiere_date_and_drops_the_year_filter() {
+    async fn tmdb_series_identify_sets_first_air_year_and_drops_the_year_filter() {
         use super::{TmdbKind, TmdbSearchProvider};
         // `first_air_date_year` first: `TmdbSeriesProvider` leaves
         // `SearchSeriesAsync`'s year at 0, so forwarding one is the bug this
@@ -6592,7 +6590,8 @@ mod tests {
         let provider = TmdbSearchProvider::new(tmdb, TmdbKind::Series);
 
         // A wrong `Year` must not narrow the search, and the series mapper
-        // emits `PremiereDate` — never `ProductionYear`.
+        // emits `PremiereDate` and `ProductionYear` from the first air date
+        // (jellyfin/jellyfin#16144).
         let mut req = named_request(BaseItemKind::Series, "Breaking Bad");
         req.search_info.year = Some(2019);
         let results = provider.get_search_results(&req).await.expect("results");
@@ -6605,7 +6604,7 @@ mod tests {
             results[0].premiere_date.map(|d| d.to_rfc3339()).as_deref(),
             Some("2008-01-20T00:00:00+00:00")
         );
-        assert_eq!(results[0].production_year, None);
+        assert_eq!(results[0].production_year, Some(2008));
 
         // The metadata language reaches TMDB.
         let mut req = named_request(BaseItemKind::Series, "Breaking Bad");
@@ -6623,7 +6622,7 @@ mod tests {
         assert_eq!(ids["Tmdb"], "1396");
         assert_eq!(ids["Imdb"], "tt0903747");
         assert_eq!(ids["Tvdb"], "81189");
-        assert_eq!(results[0].production_year, None);
+        assert_eq!(results[0].production_year, Some(2008));
         assert!(results[0].premiere_date.is_some());
     }
 
