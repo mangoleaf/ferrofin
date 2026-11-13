@@ -653,7 +653,13 @@ impl DynamicImageProviders {
             height: 0,
             blur_hash: None,
         };
-        fill_image_metadata(self.processor.as_ref(), &mut info).await;
+        fill_image_metadata(
+            self.processor.as_ref(),
+            item_id,
+            &output.to_string_lossy(),
+            &mut info,
+        )
+        .await;
         images.retain(|i| i.image_type != ImageType::Primary);
         images.insert(0, info);
         self.persistence.save_item_images(item_id, &images).await?;
@@ -942,16 +948,49 @@ fn folder_sources_query(folder_id: Uuid) -> InternalItemsQuery {
 
 /// Dimensions + blurhash for a written image file, the way the scanner records
 /// every other image (so the DTO carries `Width`/`Height`/`ImageBlurHashes`):
-/// what `LibraryManager.UpdateImagesAsync` fills for a saved image.
-/// Best-effort: a decode failure leaves the size the caller set, and no hash.
-pub(crate) async fn fill_image_metadata(processor: &dyn ImageProcessor, image: &mut ItemImageInfo) {
-    let Ok(dims) = processor.get_image_dimensions(&image.path).await else {
-        return;
+/// what `LibraryManager.UpdateImagesAsync` fills for a saved image. `path` is
+/// the file to read: `image.path` itself, or its expansion when the row stores
+/// a virtual path.
+///
+/// Best-effort: an error reading the size leaves the size the caller set,
+/// and an error computing the blurhash leaves no hash. Each failure is logged
+/// with the item, the image type and the path, the events `UpdateImagesAsync`
+/// and its encoder log, at levels set by LOGGING.md rule 1: a missing file, an
+/// error reading the size and a failed blurhash at `warn!` (upstream: Warning,
+/// Error, Error), a file measured 0x0 at `debug!` (upstream: Debug when empty
+/// or unsupported, Warning when undecodable, which this encoder cannot tell
+/// apart).
+pub(crate) async fn fill_image_metadata(
+    processor: &dyn ImageProcessor,
+    item_id: Uuid,
+    path: &str,
+    image: &mut ItemImageInfo,
+) {
+    let image_type = image.image_type;
+    let dims = match processor.get_image_dimensions(path).await {
+        Ok(dims) => dims,
+        Err(ServiceError::NotFound(_)) => {
+            tracing::warn!(item_id = %item_id, ?image_type, path = %path, "image not found");
+            return;
+        }
+        Err(error) => {
+            tracing::warn!(%error, item_id = %item_id, ?image_type, path = %path, "cannot get image dimensions");
+            return;
+        }
     };
+    if dims.width <= 0 || dims.height <= 0 {
+        // The encoder answers an empty, unsupported or undecodable file 0x0,
+        // and cannot say which: debug, as an SVG logo (no decoder, gl-802) is
+        // one per movie, measured again on every scan.
+        tracing::debug!(item_id = %item_id, ?image_type, path = %path, "unable to determine image dimensions");
+    }
     image.width = dims.width;
     image.height = dims.height;
-    if let Ok(hash) = processor.get_image_blur_hash_sized(&image.path, dims).await {
-        image.blur_hash = Some(hash);
+    match processor.get_image_blur_hash_sized(path, dims).await {
+        Ok(hash) => image.blur_hash = Some(hash),
+        Err(error) => {
+            tracing::warn!(%error, item_id = %item_id, ?image_type, path = %path, "cannot compute blurhash");
+        }
     }
 }
 
@@ -2187,6 +2226,80 @@ mod tests {
             let ids = explain(&db, build_query(&kind_query(kind), QueryShape::IdsOnly)).await;
             let rows = explain(&db, build_query(&kind_query(kind), QueryShape::FullRows)).await;
             assert_eq!(ids, rows, "{kind:?}");
+        }
+    }
+
+    /// An image whose file is gone is logged as not found (`warn!`), one that
+    /// cannot be decoded as unmeasurable (`debug!`), and a truncated one whose
+    /// header still gives its size as having no blurhash (`warn!`), each with
+    /// the item, the image type and the path (gl-384,
+    /// `LibraryManager.UpdateImagesAsync`); none gets a hash.
+    #[tokio::test]
+    async fn an_unreadable_image_is_logged_with_its_item_type_and_path() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let processor =
+            DrawingProcessor::new(Arc::new(ImageCrateEncoder::new()), tmp.path().join("cache"));
+        let item = Uuid::new_v4();
+        let missing = tmp.path().join("gone.png").to_string_lossy().into_owned();
+        let garbage = tmp.path().join("garbage.png");
+        std::fs::write(&garbage, b"not an image").expect("write");
+        let garbage = garbage.to_string_lossy().into_owned();
+        let truncated = write_png(tmp.path(), "truncated.png", [200, 20, 20]);
+        let bytes = std::fs::read(&truncated).expect("read");
+        std::fs::write(&truncated, &bytes[..bytes.len() / 2]).expect("truncate");
+
+        let logs = crate::test_support::CapturedLogs::default();
+        let _guard = tracing::subscriber::set_default(
+            tracing_subscriber::fmt()
+                .with_writer(logs.clone())
+                .with_ansi(false)
+                .with_max_level(tracing::Level::DEBUG)
+                .finish(),
+        );
+        for (path, image_type, size, level, message) in [
+            (
+                &missing,
+                ImageType::Backdrop,
+                (0, 0),
+                "WARN",
+                "image not found",
+            ),
+            (
+                &garbage,
+                ImageType::Logo,
+                (0, 0),
+                "DEBUG",
+                "unable to determine image dimensions",
+            ),
+            (
+                &truncated,
+                ImageType::Primary,
+                (24, 36),
+                "WARN",
+                "cannot compute blurhash",
+            ),
+        ] {
+            let mut info = image_info(image_type, path, None);
+            fill_image_metadata(&processor, item, path, &mut info).await;
+            assert_eq!((info.width, info.height), size, "{path}");
+            assert!(
+                info.blur_hash.as_deref().is_none_or(str::is_empty),
+                "{path}"
+            );
+
+            let text = logs.text();
+            let line = text
+                .lines()
+                .find(|line| line.contains(message))
+                .unwrap_or_else(|| panic!("no {message:?} line: {text}"));
+            for expected in [
+                level.to_owned(),
+                format!("item_id={item}"),
+                format!("image_type={image_type:?}"),
+                format!("path={path}"),
+            ] {
+                assert!(line.contains(&expected), "{expected} missing: {line}");
+            }
         }
     }
 }

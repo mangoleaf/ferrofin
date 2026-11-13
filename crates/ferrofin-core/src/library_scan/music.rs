@@ -1972,7 +1972,7 @@ impl LibraryScanner {
                     fetch.images == ImageFetch::All,
                 )
                 .await;
-                self.fill_image_metadata(&mut downloaded).await;
+                self.fill_image_metadata(work.id, &mut downloaded).await;
                 images.extend(downloaded);
             } else {
                 self.apply_dynamic_images(
@@ -1998,7 +1998,7 @@ impl LibraryScanner {
                     .cloned(),
             );
         }
-        self.fill_image_metadata(&mut images).await;
+        self.fill_image_metadata(work.id, &mut images).await;
         images_changed(&images, Some(&stored)).then_some(images)
     }
 }
