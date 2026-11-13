@@ -178,6 +178,8 @@ pub(super) fn sample(spec: &SettingSpec) -> String {
         "bind_addr" => "\"127.0.0.2\"".to_owned(),
         "log_level" => "\"debug\"".to_owned(),
         "wasm_private_http_allow" => "\"*\"".to_owned(),
+        "ffmpeg_analyze_duration" => "\"8M\"".to_owned(),
+        "ffmpeg_probe_size" => "\"32M\"".to_owned(),
         _ => match spec.kind {
             // The value that is not the default, so setting it changes something.
             SettingKind::Bool => (spec.default != "true").to_string(),
@@ -365,6 +367,8 @@ const TABS: &[(Group, &[&str])] = &[
             "row_cache_ttl_secs",
             "max_transcodes",
             "max_transcodes_per_user",
+            "ffmpeg_analyze_duration",
+            "ffmpeg_probe_size",
             "playback_metrics_queue",
             "session_idle_hours",
         ],
@@ -1324,6 +1328,28 @@ fn the_item_values_write_chunk_row_shows_the_library_default() {
         spec("item_values_write_chunk").default,
         ferrofin_core::library_manager::DEFAULT_ITEM_VALUES_WRITE_CHUNK.to_string()
     );
+}
+
+/// The ffmpeg input-analysis rows show Jellyfin's defaults as the encoder
+/// prints them, and their notes the encoder's ranges (gl-734).
+#[test]
+fn the_ffmpeg_input_analysis_rows_show_the_encoders_defaults_and_ranges() {
+    use ferrofin_mediaencoding::encoder::media_encoder::{
+        ANALYZE_DURATION_RANGE, DEFAULT_ANALYZE_DURATION, DEFAULT_PROBE_SIZE, PROBE_SIZE_RANGE,
+    };
+    for (key, default, range) in [
+        (
+            "ffmpeg_analyze_duration",
+            DEFAULT_ANALYZE_DURATION,
+            ANALYZE_DURATION_RANGE,
+        ),
+        ("ffmpeg_probe_size", DEFAULT_PROBE_SIZE, PROBE_SIZE_RANGE),
+    ] {
+        let row = spec(key);
+        assert_eq!(row.default, default.to_string(), "{key}");
+        let range = format!("{} to {}", range.start(), range.end());
+        assert!(row.note.contains(&range), "{key}: {range} in {}", row.note);
+    }
 }
 
 // ---- choices, notes and the server configuration (gl-1174) -----------------

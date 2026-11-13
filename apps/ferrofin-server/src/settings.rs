@@ -23,6 +23,7 @@
 //! page's saved value between the variable and `config.toml` (owner decisions
 //! on gl-554 and gl-555).
 
+use std::ops::RangeInclusive;
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -30,6 +31,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use ferrofin_core::system_manager::LifecycleController;
 use ferrofin_core::user_manager::LoginBackoffSettings;
 use ferrofin_drawing::ImageLimits;
+use ferrofin_mediaencoding::encoder::media_encoder::{
+    ANALYZE_DURATION_RANGE, FfmpegCount, PROBE_SIZE_RANGE,
+};
 use ferrofin_mediaencoding::transcoding::TranscodeLimits;
 use ferrofin_model::configuration::ServerConfiguration;
 use ferrofin_model::server_settings::{
@@ -1077,6 +1081,41 @@ pub static SETTINGS: &[SettingSpec] = &[
         ..ROW
     },
     SettingSpec {
+        key: "ffmpeg_analyze_duration",
+        env: Some("FERROFIN_FFMPEG_ANALYZE_DURATION"),
+        env_read: EnvRead::Parsed(parses::<FfmpegCount>),
+        label: "ffmpeg analyze duration",
+        group: Group::Performance,
+        kind: SettingKind::Text,
+        default: "200M",
+        description: "How long ffmpeg analyses an input to find its streams, in microseconds: \
+                      lower starts a slow or remote source sooner, and can miss a late stream.",
+        note: "Jellyfin's FFmpeg:analyzeduration, for probes, transcodes and external \
+               subtitles, in ffmpeg's syntax: 200M is 200 seconds (K, M and G are powers of \
+               1000; Ki, Mi and Gi of 1024). 1M to 600M. A source's own duration, such as a \
+               Live TV channel's 3 seconds, wins.",
+        running: |c| json!(c.ffmpeg_analyze_duration.to_string()),
+        check: |value| ffmpeg_count_within(value, &ANALYZE_DURATION_RANGE),
+        ..ROW
+    },
+    SettingSpec {
+        key: "ffmpeg_probe_size",
+        env: Some("FERROFIN_FFMPEG_PROBE_SIZE"),
+        env_read: EnvRead::Parsed(parses::<FfmpegCount>),
+        label: "ffmpeg probe size",
+        group: Group::Performance,
+        kind: SettingKind::Text,
+        default: "1G",
+        description: "How many bytes of an input ffmpeg reads to find its streams: lower starts \
+                      a slow or remote source sooner, and can miss a late stream.",
+        note: "Jellyfin's FFmpeg:probesize, for probes, transcodes and external subtitles, in \
+               ffmpeg's syntax: 1G is 10^9 bytes (K, M and G are powers of 1000; Ki, Mi and Gi \
+               of 1024). 1M to 4G.",
+        running: |c| json!(c.ffmpeg_probe_size.to_string()),
+        check: |value| ffmpeg_count_within(value, &PROBE_SIZE_RANGE),
+        ..ROW
+    },
+    SettingSpec {
         key: "playback_metrics_queue",
         env: Some("FERROFIN_PLAYBACK_METRICS_QUEUE"),
         env_read: PARSED_U32,
@@ -1580,6 +1619,22 @@ fn whole_number_as_written(raw: Option<&str>) -> Value {
 /// (`config::parse_var`): `raw` applies when that takes it.
 fn parses<T: std::str::FromStr>(raw: &str) -> bool {
     config::parse_var::<T>(&OneValue(raw), "").is_some()
+}
+
+/// A save of an ffmpeg input-analysis value (`ffmpeg_analyze_duration`,
+/// `ffmpeg_probe_size`): blank for the default, else ffmpeg's syntax inside
+/// `range`, which the loader would otherwise ignore or clamp with a warning.
+fn ffmpeg_count_within(value: &Value, range: &RangeInclusive<FfmpegCount>) -> Result<(), String> {
+    let text = value.as_str().map(str::trim).unwrap_or_default();
+    if text.is_empty() {
+        return Ok(());
+    }
+    let count: FfmpegCount = text.parse().map_err(str::to_owned)?;
+    if range.contains(&count) {
+        Ok(())
+    } else {
+        Err(format!("is outside {} to {}", range.start(), range.end()))
+    }
 }
 
 /// [`EnvRead::Parsed`] for an on/off variable (`config::parse_bool_var`).

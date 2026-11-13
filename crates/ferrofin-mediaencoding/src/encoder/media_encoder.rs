@@ -65,14 +65,105 @@ pub(crate) fn image_extraction_timeout(
         .map_or(default, std::time::Duration::from_millis)
 }
 
-/// Jellyfin's default `FFmpeg:analyzeduration` (`ConfigurationOptions.cs:19`):
-/// how long ffmpeg and ffprobe analyse an input to find its streams, when the
-/// source names no duration of its own.
-pub const DEFAULT_ANALYZE_DURATION: &str = "200M";
+/// An ffmpeg integer option value, as Jellyfin's `FFmpeg:probesize` (bytes)
+/// and `FFmpeg:analyzeduration` (microseconds) take it: digits, then `K`,
+/// `M` or `G` for powers of 1000, or `Ki`, `Mi` or `Gi` for powers of 1024
+/// (ffmpeg's `av_strtod`). It prints in the same syntax, so `1G` stays `1G`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct FfmpegCount(pub u64);
 
-/// Jellyfin's default `FFmpeg:probesize` (`ConfigurationOptions.cs:18`): how
-/// much of an input ffmpeg and ffprobe read to find its streams.
-pub const DEFAULT_PROBE_SIZE: &str = "1G";
+impl std::str::FromStr for FfmpegCount {
+    type Err = &'static str;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        const INVALID: &str = "is not an ffmpeg value such as 32M, 200M or 1G";
+        let digits_end = value
+            .find(|c: char| !c.is_ascii_digit())
+            .unwrap_or(value.len());
+        let (digits, suffix) = value.split_at(digits_end);
+        let multiplier: u64 = match suffix {
+            "" => 1,
+            "K" | "k" => 1_000,
+            "M" => 1_000_000,
+            "G" => 1_000_000_000,
+            "Ki" | "ki" => 1 << 10,
+            "Mi" => 1 << 20,
+            "Gi" => 1 << 30,
+            _ => return Err(INVALID),
+        };
+        digits
+            .parse::<u64>()
+            .ok()
+            .and_then(|count| count.checked_mul(multiplier))
+            .map(Self)
+            .ok_or(INVALID)
+    }
+}
+
+impl std::fmt::Display for FfmpegCount {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        for (unit, suffix) in [(1_000_000_000, "G"), (1_000_000, "M"), (1_000, "K")] {
+            if self.0 >= unit && self.0.is_multiple_of(unit) {
+                return write!(f, "{}{suffix}", self.0 / unit);
+            }
+        }
+        write!(f, "{}", self.0)
+    }
+}
+
+/// Jellyfin's default `FFmpeg:analyzeduration` (`ConfigurationOptions.cs:19`),
+/// `200M`: how long, in microseconds, ffmpeg and ffprobe analyse an input to
+/// find its streams, when the source names no duration of its own.
+pub const DEFAULT_ANALYZE_DURATION: FfmpegCount = FfmpegCount(200_000_000);
+
+/// Jellyfin's default `FFmpeg:probesize` (`ConfigurationOptions.cs:18`), `1G`:
+/// how many bytes of an input ffmpeg and ffprobe read to find its streams.
+pub const DEFAULT_PROBE_SIZE: FfmpegCount = FfmpegCount(1_000_000_000);
+
+/// The analyze durations an operator may set (`ffmpeg_analyze_duration`):
+/// `1M` to `600M`, 1 s to 10 minutes (owner decision 2026-11-12).
+pub const ANALYZE_DURATION_RANGE: std::ops::RangeInclusive<FfmpegCount> =
+    FfmpegCount(1_000_000)..=FfmpegCount(600_000_000);
+
+/// The probe sizes an operator may set (`ffmpeg_probe_size`): `1M` to `4G`
+/// bytes (owner decision 2026-11-12).
+pub const PROBE_SIZE_RANGE: std::ops::RangeInclusive<FfmpegCount> =
+    FfmpegCount(1_000_000)..=FfmpegCount(4_000_000_000);
+
+/// How much of an input a transcode's ffmpeg analyses to find its streams:
+/// Jellyfin's `FFmpeg:analyzeduration` and `FFmpeg:probesize`, which
+/// `EncodingHelper` reads for the media file and for an external subtitle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InputAnalysis {
+    /// `-analyzeduration` for a source that names no duration of its own.
+    pub analyze_duration: FfmpegCount,
+    /// `-probesize`.
+    pub probe_size: FfmpegCount,
+}
+
+impl Default for InputAnalysis {
+    fn default() -> Self {
+        Self {
+            analyze_duration: DEFAULT_ANALYZE_DURATION,
+            probe_size: DEFAULT_PROBE_SIZE,
+        }
+    }
+}
+
+impl InputAnalysis {
+    /// `GetFfmpegAnalyzeDurationArg`, then `GetFfmpegProbesizeArg`: the flags
+    /// an input reads with, where a source's own positive `AnalyzeDurationMs`
+    /// (`source_ms`) beats the configured duration.
+    #[must_use]
+    pub fn input_args(&self, source_ms: Option<i32>) -> [String; 4] {
+        [
+            "-analyzeduration".to_owned(),
+            analyze_duration_value(source_ms, &self.analyze_duration.to_string()),
+            "-probesize".to_owned(),
+            self.probe_size.to_string(),
+        ]
+    }
+}
 
 /// The `-analyzeduration` value upstream picks for an input
 /// (`EncodingHelper.GetFfmpegAnalyzeDurationArg` and
@@ -1155,6 +1246,89 @@ mod tests {
         assert_eq!(
             super::analyze_duration_value(source_ms, configured),
             expected
+        );
+    }
+
+    /// ffmpeg's `av_strtod` suffixes: `K`/`k`, `M` and `G` are powers of 1000,
+    /// with `i` powers of 1024; `m` would be milli, so it is refused.
+    #[rstest::rstest]
+    #[case("1G", Some(1_000_000_000), "1G")]
+    #[case("200M", Some(200_000_000), "200M")]
+    #[case("32M", Some(32_000_000), "32M")]
+    #[case("500k", Some(500_000), "500K")]
+    #[case("1Gi", Some(1_073_741_824), "1073741824")]
+    #[case("4Mi", Some(4_194_304), "4194304")]
+    #[case("1500000", Some(1_500_000), "1500K")]
+    #[case("0", Some(0), "0")]
+    #[case("", None, "")]
+    #[case("M", None, "")]
+    #[case("200m", None, "")]
+    #[case("1.5G", None, "")]
+    #[case("1GB", None, "")]
+    #[case("-1M", None, "")]
+    #[case("99999999999G", None, "")]
+    fn ffmpeg_counts_parse_and_print_in_ffmpegs_syntax(
+        #[case] text: &str,
+        #[case] count: Option<u64>,
+        #[case] printed: &str,
+    ) {
+        let parsed = text.parse::<super::FfmpegCount>().ok();
+        assert_eq!(parsed.map(|c| c.0), count, "{text}");
+        if let Some(parsed) = parsed {
+            assert_eq!(parsed.to_string(), printed);
+        }
+    }
+
+    #[test]
+    fn input_analysis_defaults_to_jellyfins_values_and_a_source_duration_wins() {
+        let analysis = super::InputAnalysis::default();
+        assert_eq!(
+            analysis.input_args(None),
+            ["-analyzeduration", "200M", "-probesize", "1G"]
+        );
+        let configured = super::InputAnalysis {
+            analyze_duration: super::FfmpegCount(8_000_000),
+            probe_size: super::FfmpegCount(32_000_000),
+        };
+        assert_eq!(
+            configured.input_args(Some(3000)),
+            ["-analyzeduration", "3000000", "-probesize", "32M"]
+        );
+        assert!(super::ANALYZE_DURATION_RANGE.contains(&super::DEFAULT_ANALYZE_DURATION));
+        assert!(super::PROBE_SIZE_RANGE.contains(&super::DEFAULT_PROBE_SIZE));
+    }
+
+    /// A configured `FFmpeg:analyzeduration` / `FFmpeg:probesize` reaches every
+    /// probe (`GetExtraArguments`), and a source's own duration still wins.
+    #[test]
+    fn a_probe_reads_with_the_configured_analysis() {
+        let enc = MediaEncoderImpl::new(
+            Arc::new(NoopTranscoder),
+            "/usr/bin/ffmpeg",
+            "/usr/bin/ffprobe",
+            MediaEncoderConfig {
+                analyze_duration: Some("8M".to_owned()),
+                probe_size: Some("32M".to_owned()),
+                ..MediaEncoderConfig::default()
+            },
+        );
+        let mut request = MediaInfoRequest {
+            media_source: MediaSourceInfo {
+                path: Some("/x".to_owned()),
+                protocol: MediaProtocol::File,
+                ..MediaSourceInfo::default()
+            },
+            extract_chapters: false,
+            media_is_audio: false,
+        };
+        assert_eq!(
+            enc.get_extra_arguments(&request),
+            "-analyzeduration 8M -probesize 32M"
+        );
+        request.media_source.analyze_duration_ms = Some(3000);
+        assert_eq!(
+            enc.get_extra_arguments(&request),
+            "-analyzeduration 3000000 -probesize 32M"
         );
     }
 
