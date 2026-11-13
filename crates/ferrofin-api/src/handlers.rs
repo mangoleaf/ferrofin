@@ -4335,6 +4335,71 @@ pub const VERIFIED: &[Verified] = &[
         ],
         refs: &[],
     },
+    Verified {
+        method: "post",
+        path: "/Items/RemoteSearch/MusicAlbum",
+        upstream_file: "Jellyfin.Api/Controllers/ItemLookupController.cs",
+        upstream_method: "GetMusicAlbumRemoteSearchResults",
+        ferrofin: "handlers/item_lookup.rs music_album_remote_search (RequireAuth; JsonBody for \
+               the [Required] body; to_request: AlbumInfo's AlbumArtists, ArtistProviderIds and \
+               SongInfos ride along) → ferrofin-providers provider_manager.rs remote_search \
+               (ProviderManager.GetRemoteSearchResults: the reference item's library options, \
+               or none for no ItemId; CanRefreshMetadata with IncludeDisabledProviders; \
+               SearchProviderName ignoring case; the configured then default order; the server's \
+               language and country for blank ones; each provider's results stamped with its \
+               name and merged by a shared provider id, ImageUrl filled; a failing provider \
+               logged and skipped. The providers run together and merge in provider order, \
+               which gives the C# loop's list) → MusicBrainzAlbumSearchProvider \
+               (MusicBrainzAlbumProvider.GetSearchResults: album_id_or_song_id and \
+               album_artist_mbid are AlbumInfoExtensions' GetReleaseId, GetReleaseGroupId and \
+               GetMusicBrainzArtistId, each id through IsValidProviderId; or_failed fails the \
+               provider on any failed request, as the C# HttpError does, except a by-id \
+               lookup's 404 (NotFoundAsNullAsync), so a 404 or malformed release id falls to \
+               the release group and an unknown group to the arid:/artist: search; \
+               GetReleaseGroupResultAsync's \
+               walk in musicbrainz.rs release_group_releases skips a release that answers 404 \
+               and stops at one that fails otherwise, keeping the releases before it, as \
+               GetRemoteSearchResults keeps what it added before the exception) and \
+               AudioDbSearchProvider (AudioDbAlbumProvider: no results)",
+        date: "2026-11-11",
+        divergences: &[
+            "The search by album and artist name drops the stray `c` the C# appends after the \
+         artist phrase (`artist:\"…\"c`), a typo that adds a bare term to the lucene query.",
+            "A body with no SearchInfo is searched as an empty lookup (200); upstream \
+         dereferences the null SearchInfo and answers 500.",
+            "The 401 (no or bad token) body is Ferrofin's error shape, not upstream's. Fix \
+         path: gl-666.",
+        ],
+        refs: &[],
+    },
+    Verified {
+        method: "post",
+        path: "/Items/RemoteSearch/MusicArtist",
+        upstream_file: "Jellyfin.Api/Controllers/ItemLookupController.cs",
+        upstream_method: "GetMusicArtistRemoteSearchResults",
+        ferrofin: "handlers/item_lookup.rs music_artist_remote_search (RequireAuth; JsonBody for \
+               the [Required] body; to_request: ArtistInfo's SongInfos ride along) → \
+               ferrofin-providers provider_manager.rs remote_search (as for MusicAlbum: \
+               ProviderManager.GetRemoteSearchResults) → MusicBrainzArtistSearchProvider \
+               (MusicBrainzArtistProvider.GetSearchResults, Order 0: artist_mbid is \
+               AlbumInfoExtensions.GetMusicBrainzArtistId(ArtistInfo) through \
+               IsValidProviderId; or_failed fails the provider on any failed request, as the \
+               C# HttpError does, except the lookup's 404 (NotFoundAsNullAsync), so a 404 or \
+               malformed id falls to the name search; a blank name finds nothing; the phrase \
+               search, then artistaccent: for a name with diacritics) and \
+               AudioDbSearchProvider",
+        date: "2026-11-11",
+        divergences: &[
+            "TheAudioDB contributes no artists: v12.4's AudioDbArtistProvider.GetSearchResults \
+         looks the artist up by its AudioDbArtist id, else its MusicBrainz id, else searches \
+         by name. Fix path: gl-497.",
+            "A body with no SearchInfo is searched as an empty lookup (200); upstream \
+         dereferences the null SearchInfo and answers 500.",
+            "The 401 (no or bad token) body is Ferrofin's error shape, not upstream's. Fix \
+         path: gl-666.",
+        ],
+        refs: &[],
+    },
 ];
 
 /// What `/Artists` and `/Artists/AlbumArtists` do differently from v12's
