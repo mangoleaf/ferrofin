@@ -3098,6 +3098,97 @@ pub const VERIFIED: &[Verified] = &[
         refs: &[],
     },
     Verified {
+        method: "get",
+        path: "/LiveTv/ChannelMappingOptions",
+        upstream_file: "Jellyfin.Api/Controllers/LiveTvController.cs",
+        upstream_method: "GetChannelMappingOptions",
+        ferrofin: "handlers/live_tv.rs get_channel_mapping_options (RequireAdmin for \
+               RequiresElevation) → ferrofin-livetv manager.rs get_channel_mapping_options \
+               (listing_provider_by_id, ListingsBackend::of, channels_for_listings_provider's \
+               live read of every tuner through its host, matcher_channel, provider_channels) \
+               → mapping.rs tuner_channel_mapping, epg_channel_for_tuner_channel, \
+               EpgChannelData (ListingsManager.GetChannelMappingOptions, \
+               GetChannelsForListingsProvider, BaseTunerHost.GetChannels, \
+               GetTunerChannelMapping, GetEpgChannelFromTunerChannel, GetMappedChannel, \
+               EpgChannelData, XmlTvListingsProvider.GetChannels, SchedulesDirect.GetChannels). \
+               A tuner channel's Id is the ChannelInfo.Id its host mints, hdhr_{GuideNumber} \
+               for an HDHomeRun since gl-1751",
+        date: "2026-11-14",
+        divergences: &[
+            "An absent providerId, or one that names no listings provider, is a 404; \
+         upstream's .First(...) throws InvalidOperationException, a 500. Jellyfin bug not \
+         ported.",
+            "The tuners of each type are read in id order, not configuration order, so their \
+         channels are listed in that order, and a channel two tuners of one type both list is \
+         kept for the one read first. Fix path: gl-762.",
+            "An M3U entry with neither tvg-id nor channel-id is matched to the guide by its \
+         display name (or a CUID attribute) as its TunerChannelId; upstream's is null, so its \
+         match goes on to the number. Fix path: gl-751.",
+            "An XMLTV guide declaring an encoding name the WHATWG labels know but .NET's \
+         encoding table does not is decoded, where upstream's XmlReader refuses it and the \
+         options answer 500. Fix path: gl-939.",
+            "An XMLTV guide using an undeclared namespace prefix is read, where upstream's \
+         XmlReader refuses it (500); a <tv> that held programmes but no channel, followed by \
+         something not well-formed, is unreadable here (500) where upstream's GetChannels \
+         stops at </tv> and lists no provider channels; and prefixed channel elements are \
+         matched by local name. Fix path: gl-942.",
+            "A ChannelMappings saved as null reads as the empty list; upstream keeps the null \
+         until a restart and, once a tuner channel is listed, dereferences it (a \
+         NullReferenceException 500). Jellyfin bug not ported.",
+            "A local XMLTV file that is gone, with no cached copy, is a 500; upstream's \
+         OpenRead throws FileNotFoundException (or DirectoryNotFoundException), a 404. Fix \
+         path: gl-1797.",
+            "The 404 (no such provider, or an unknown provider Type) and 500 (a guide that \
+         cannot be read) bodies are Ferrofin's error shape, not upstream's. Fix path: gl-666.",
+        ],
+        refs: &[],
+    },
+    Verified {
+        method: "post",
+        path: "/LiveTv/ChannelMappings",
+        upstream_file: "Jellyfin.Api/Controllers/LiveTvController.cs",
+        upstream_method: "SetChannelMapping",
+        ferrofin: "handlers/live_tv.rs set_channel_mapping (RequireAdmin for \
+               RequiresElevation; SetChannelMappingDto::validation, each [Required] member \
+               left out, null or blank a 400) → ferrofin-livetv manager.rs set_channel_mapping \
+               (listing_provider_by_id, the channelMappingExists toggle, \
+               store_listing_provider as SaveConfiguration, without the XMLTV cache \
+               invalidation SaveListingProvider adds, channels_for_listings_provider, \
+               provider_channels, mapping.rs tuner_channel_mapping), then queue_guide_refresh \
+               (ListingsManager.SetChannelMapping, \
+               CancelIfRunningAndQueue<RefreshGuideScheduledTask>). The tuner list and the \
+               match ladder are the ChannelMappingOptions row's, so a mapping keyed \
+               hdhr_{GuideNumber} applies since gl-1751",
+        date: "2026-11-14",
+        divergences: &[
+            "A ProviderId that names no listings provider is a 404 before anything is stored, \
+         and a TunerChannelId no tuner channel has is a 404 after the pair is stored; \
+         upstream's .First(...) throws InvalidOperationException (a 500) at the same two \
+         points, and both queue the guide refresh before the second. Jellyfin bug not \
+         ported.",
+            "The tuners of each type are read in id order, not configuration order, which \
+         decides the tuner a channel two tuners of one type share is kept for, and so whether \
+         a provider enabled for only one of them lists it. Fix path: gl-762.",
+            "An M3U entry with neither tvg-id nor channel-id is matched to the guide by its \
+         display name (or a CUID attribute) as its TunerChannelId; upstream's is null, so its \
+         match goes on to the number. Fix path: gl-751.",
+            "The guide's channels are read, after the pair is stored, with the \
+         ChannelMappingOptions row's XMLTV differences: encoding names .NET does not know \
+         (gl-939) and undeclared namespace prefixes (gl-942) are read where upstream answers \
+         500, a <tv> with programmes but no channel followed by something not well-formed is \
+         a 500 here where upstream reads no provider channels and goes on (gl-942), prefixed \
+         channel elements are matched by local name (gl-942), and a local file that is gone \
+         with no cached copy is a 500 where upstream answers 404 (gl-1797). Fix path: \
+         gl-939, gl-942, gl-1797.",
+            "A ChannelMappings saved as null reads as the empty list; upstream keeps the null \
+         until a restart, and its .Any(...) throws ArgumentNullException before anything is \
+         stored (a 400). Jellyfin bug not ported.",
+            "The 400 (a body that does not bind), 404 and 500 (a guide that cannot be read) \
+         bodies are Ferrofin's error shape, not upstream's. Fix path: gl-666.",
+        ],
+        refs: &[],
+    },
+    Verified {
         method: "post",
         path: "/Items/{itemId}/ContentType",
         upstream_file: "Jellyfin.Api/Controllers/ItemUpdateController.cs",
