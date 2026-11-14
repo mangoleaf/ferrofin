@@ -1935,6 +1935,114 @@ const ITEM_IMAGE_DIVERGENCES: &[&str] = &[
     "The 400 and 404 bodies are Ferrofin's error shape, not upstream's. Fix path: gl-666.",
 ];
 
+/// The code path the six `/{kind}/{itemId}/Similar` rows share: one handler
+/// serves every alias, as `LibraryController.GetSimilarItems` does.
+macro_rules! similar_items_path {
+    () => {
+        "handlers/similar.rs similar_items, one body for the six aliases (excludeArtistIds \
+         through parse_csv_uuids, fields through parse_csv_enums_lenient, limit; userId \
+         through resolve_user_opt: RequestHelpers.GetUserId, then GetUserById, so an id naming \
+         no account runs with no user; require_visible_item's 404 for a non-nil itemId the \
+         user cannot see, GetItemById(itemId, user); resolve_similar_seed's root folder for a \
+         nil one, a kind no provider serves, so an empty page; DtoOptions { Fields = fields } \
+         plus ProviderIds, which GetSimilarItemsAsync adds to the options the controller then \
+         projects with) → ferrofin-core similar_items_manager.rs get_similar_items (the \
+         Episode and by-name-but-not-MusicArtist short-circuit, kinds.rs \
+         supports_similarity; limit ?? 50; similarity_plan: GetLibraryOptions(item) through \
+         owning_library, the type's TypeOptions by class name, the remote providers it ticked \
+         in SimilarItemProviders and the always-enabled local scorer ordered as one list by \
+         SimilarItemProviderOrder, else SimilarItemProviders, an unlisted name last \
+         (GetConfiguredSimilarProviderOrder); the provider loop's limit check, ExcludeItemIds, \
+         the id-and-presentation-key claim and CalculateScore; local_filter per kind: \
+         MovieSimilarItemsProvider for Movie and Trailer, SeriesSimilarItemsProvider, \
+         MusicAlbum-, MusicArtist- and AudioSimilarItemsProvider (AudioBook through Audio) \
+         and LiveTvProgramSimilarItemsProvider by IsMovie and IsSeries; local_similar's score \
+         pass, similar_items_repository.rs weighted_similar_items (genre 10, tag and studio 5, \
+         director 50, actor and guest star 15, the seed's people distinct) and its one filter \
+         query (Movie, plus Trailer and LiveTvProgram under \
+         EnableExternalContentInSuggestions; IsMovie; IsPlayed = false; the user's access); \
+         flat_similar for the other kinds (the seed's Genres and Tags, both required when both \
+         are set, Random order, ExcludeArtistIds for the music kinds); remote_results (the \
+         reference cache at {cache}/{provider}-similar-{type}/{id:N}.json, batches of 20, the \
+         500-reference cap, the cache write) and resolve_remote_references (the best \
+         reference per provider id, one user-scoped query of the seed's kind, the highest \
+         score per presentation key); the stable score sort, then Take; no \
+         FilterByLibraryAccessAsync pass, as every query is already user-scoped) → \
+         ferrofin-providers similarity.rs (TmdbMovieSimilarProvider, \
+         TmdbSeriesSimilarProvider, ListenBrainzSimilarArtistProvider) → dto_service.rs \
+         get_base_item_dtos; QueryResult(0, the item count, the DTOs)"
+    };
+}
+
+/// The divergences the six `/{kind}/{itemId}/Similar` rows share.
+const SIMILAR_ITEMS_DIVERGENCES: &[&str] = &[
+    SIMILAR_SCORE_WINDOW_DIVERGENCE,
+    SIMILAR_ALTERNATE_VERSIONS_DIVERGENCE,
+    SIMILAR_SCORE_GROUPING_DIVERGENCE,
+    "A local scorer that fails answers 500; upstream logs the provider's failure and goes \
+     on to the remote providers. Fix path: gl-1789.",
+    "A movie-like Live TV programme's genre and tag query reads limit rows, where upstream's \
+     EnableGroupByMetadataKey reads 4 more, so a row the id-and-key claim drops is not \
+     replaced. Fix path: gl-1788.",
+    SIMILAR_IS_VISIBLE_DIVERGENCE,
+    "The reference-cache read swallows an I/O error silently and warns on an empty entry or \
+     one whose References is null, where upstream warns on an IOException and treats both \
+     as a silent miss. Fix path: gl-1652.",
+    "A library adopted from Jellyfin 10.11, or saved before similarity providers were \
+     configurable, keeps the empty SimilarItemProviders that Jellyfin 12's \
+     EnableLocalSimilarityProviders routine fills with Local Genre/Tag, so a client that then \
+     ticks a remote provider without writing SimilarItemProviderOrder ranks the local scorer \
+     after it, where upstream ranks it first (jellyfin-web writes the order, which both \
+     servers then follow). Fix path: gl-1670.",
+    "A movie or trailer seed's page is refilled past the rows the id-and-key claim drops \
+     (another version of the seed: a copy in another library, or an alternate seed's \
+     primary; a key differing only in case), from the score pass's oversample; upstream's \
+     movie provider hands over its limit rows, so the claim's drops leave those places \
+     short, or to the next provider when one is ranked after it. Jellyfin bug not ported.",
+    "A request with no user (an API key naming none, or an administrator naming a userId \
+     with no account) scores a movie or trailer seed locally without the played filter; \
+     upstream's movie provider throws on IsPlayed without a user (BuildIsPlayedFilter \
+     dereferences it), which the manager logs as a provider failure, so it answers the \
+     remote providers' matches alone. Jellyfin bug not ported.",
+    "A limit above 715827882 overflows upstream's limit * 3 to a negative Take, so its movie \
+     provider answers nothing; the oversample saturates here. Jellyfin bug not ported.",
+    "A malformed id in excludeArtistIds is a 400; upstream's \
+     CommaDelimitedCollectionModelBinder drops it. Fix path: gl-884.",
+    "The 400 (a value the query binder cannot convert), 403 (another user's id without the \
+     administrator role) and 404 (an item the user cannot see) bodies are Ferrofin's error \
+     shape, not upstream's. Fix path: gl-666.",
+];
+
+/// How a movie or trailer seed's score pass differs from upstream's, for the
+/// similar-items rows and the recommendations row.
+const SIMILAR_SCORE_WINDOW_DIVERGENCE: &str = "A movie or trailer seed's score pass keeps \
+     its top limit * 3 among the result kinds without the excluded ids, cuts a tie at that \
+     boundary by Id (the owner's tie rule, gl-710), and matches genres, tags and studios by \
+     stored value; upstream's keeps the top limit * 3 of every item it scored (an episode or \
+     series sharing an actor included) before it filters kinds and excluded ids, cuts a tie \
+     in the order the scores were added, and matches clean values, so its page can hold \
+     fewer or other movies. Fix path: gl-1786.";
+
+/// The 12.1 alternate-version rule the score pass still lacks (gl-392).
+const SIMILAR_ALTERNATE_VERSIONS_DIVERGENCE: &str = "The score pass scores an alternate \
+     version whose primary is in the same library, which upstream's hiddenVersionIds leaves \
+     out (12.1), so such versions take places in the limit * 3 window before the filter \
+     query drops them. Fix path: gl-392.";
+
+/// How the score pass's filter query picks each presentation key's row.
+const SIMILAR_SCORE_GROUPING_DIVERGENCE: &str = "With a user, the score pass's filter query \
+     groups its rows by presentation key, so each key keeps its primary or lowest-Id row and \
+     all keyless guide programmes collapse into the lowest-Id one among them; upstream's \
+     provider filters through TranslateQuery alone and keeps each key's best-scoring row, \
+     the primary on a tie, keyless programmes folding into their best-scoring one. Fix path: \
+     gl-1800.";
+
+/// The `IsVisible` pass the similar-items and recommendations handlers skip.
+const SIMILAR_IS_VISIBLE_DIVERGENCE: &str = "The rows are projected without GetBaseItemDtos' \
+     IsVisible pass, which upstream runs for a user; every row came through a user-scoped \
+     query, so this differs only where IsParentalAllowed and that query disagree (and \
+     upstream's similar-items count is the one before the pass). Fix path: gl-1787.";
+
 /// **The API-parity record.** One row per contract operation whose Ferrofin
 /// implementation has been compared against the upstream Jellyfin C#
 /// ([`UPSTREAM_TAG`], or the earlier tag [`VERIFIED_AGAINST_EARLIER_PIN`]
@@ -1987,6 +2095,129 @@ pub const VERIFIED: &[Verified] = &[
          cannot convert), 403 (another user's id without the administrator role) and 404 (a \
          userId naming no account) bodies are Ferrofin's error shape, not upstream's. Fix \
          path: gl-666.",
+        ],
+        refs: &["images", "access-filtering"],
+    },
+    Verified {
+        method: "get",
+        path: "/Albums/{itemId}/Similar",
+        upstream_file: "Jellyfin.Api/Controllers/LibraryController.cs",
+        upstream_method: "GetSimilarItems",
+        ferrofin: similar_items_path!(),
+        date: "2026-11-14",
+        divergences: SIMILAR_ITEMS_DIVERGENCES,
+        refs: &["images", "access-filtering"],
+    },
+    Verified {
+        method: "get",
+        path: "/Artists/{itemId}/Similar",
+        upstream_file: "Jellyfin.Api/Controllers/LibraryController.cs",
+        upstream_method: "GetSimilarItems",
+        ferrofin: similar_items_path!(),
+        date: "2026-11-14",
+        divergences: SIMILAR_ITEMS_DIVERGENCES,
+        refs: &["images", "access-filtering"],
+    },
+    Verified {
+        method: "get",
+        path: "/Items/{itemId}/Similar",
+        upstream_file: "Jellyfin.Api/Controllers/LibraryController.cs",
+        upstream_method: "GetSimilarItems",
+        ferrofin: similar_items_path!(),
+        date: "2026-11-14",
+        divergences: SIMILAR_ITEMS_DIVERGENCES,
+        refs: &["images", "access-filtering"],
+    },
+    Verified {
+        method: "get",
+        path: "/Movies/{itemId}/Similar",
+        upstream_file: "Jellyfin.Api/Controllers/LibraryController.cs",
+        upstream_method: "GetSimilarItems",
+        ferrofin: similar_items_path!(),
+        date: "2026-11-14",
+        divergences: SIMILAR_ITEMS_DIVERGENCES,
+        refs: &["images", "access-filtering"],
+    },
+    Verified {
+        method: "get",
+        path: "/Trailers/{itemId}/Similar",
+        upstream_file: "Jellyfin.Api/Controllers/LibraryController.cs",
+        upstream_method: "GetSimilarItems",
+        ferrofin: similar_items_path!(),
+        date: "2026-11-14",
+        divergences: SIMILAR_ITEMS_DIVERGENCES,
+        refs: &["images", "access-filtering"],
+    },
+    Verified {
+        method: "get",
+        path: "/Shows/{itemId}/Similar",
+        upstream_file: "Jellyfin.Api/Controllers/LibraryController.cs",
+        upstream_method: "GetSimilarItems",
+        ferrofin: similar_items_path!(),
+        date: "2026-11-14",
+        divergences: SIMILAR_ITEMS_DIVERGENCES,
+        refs: &["images", "access-filtering"],
+    },
+    Verified {
+        method: "get",
+        path: "/Movies/Recommendations",
+        upstream_file: "Jellyfin.Api/Controllers/MoviesController.cs",
+        upstream_method: "GetMovieRecommendations",
+        ferrofin: "handlers/movies.rs get_movie_recommendations (userId through \
+               resolve_user_opt: RequestHelpers.GetUserId, then GetUserById; parentId ?? \
+               Guid.Empty through require_scope_id_visible; fields; categoryLimit = 5 and \
+               itemLimit = 8 by default; one get_base_item_dtos pass over every category's \
+               items, split back per category in order) → ferrofin-core \
+               similar_items_manager.rs get_movie_recommendations \
+               (GetMovieRecommendationsAsync: recently_played_query, played movies by \
+               DatePlayed then Random, Limit 7, and liked_query, IsFavoriteOrLiked movie kinds \
+               in Random order, Limit 10, without the recently played, both under ParentId and \
+               EnableGroupByMetadataKey, so item_repository.rs grouped_by_metadata_key reads 4 \
+               more; similar_items_repository.rs people_names_of over the first 6 played, \
+               GetPeopleNamesByItems in ListOrder per item, distinct; each baseline capped to \
+               categoryLimit and scored by similar_category through local_similar, the \
+               MovieSimilarItemsProvider path of the similar-items rows (a programme \
+               baseline takes its own kind's path) with the user and Limit = itemLimit, no \
+               remote provider; next_person_category, the lazy GetPersonRecommendations: \
+               Person = name, Limit = itemLimit + 2 grouped by metadata key, PersonTypes \
+               Director for the director stream and none for the \
+               actor stream, IsMovie, IsPlayed = false, DistinctBy the IMDb id, Take(itemLimit), \
+               CategoryId = name.GetMD5(); round_robin_categories: recently played, recently \
+               played, liked, liked, directors, actors until categoryLimit or a pass adds \
+               nothing, then a stable OrderBy RecommendationType)",
+        date: "2026-11-14",
+        divergences: &[
+            SIMILAR_SCORE_WINDOW_DIVERGENCE,
+            SIMILAR_ALTERNATE_VERSIONS_DIVERGENCE,
+            SIMILAR_SCORE_GROUPING_DIVERGENCE,
+            "Each baseline is scored and access-filtered on its own and fills its category \
+         from its own limit * 3 window; upstream's IBatchLocalSimilarItemsProvider scores \
+         every baseline of a stream in one pass, filters the union of their windows once and \
+         fills each category from any candidate in that union its baseline scored, so a \
+         category the filter left short can be longer upstream. Fix path: gl-1357.",
+            "Credits of equal ListOrder on different played films are named in play order, \
+         most recent first; upstream's GetPeopleNamesByItems leaves them in the order the \
+         database returns them, which decides whose cast heads the actor stream. Fix path: \
+         gl-1799.",
+            "An itemLimit above 715827882 overflows upstream's limit * 3 to a negative Take, so \
+         every similar-to category is empty; the oversample saturates here. Jellyfin bug not \
+         ported.",
+            SIMILAR_IS_VISIBLE_DIVERGENCE,
+            "A similar-to category leaves out a film sharing its baseline's presentation key \
+         (another copy of the baseline); upstream's batch provider excludes only the \
+         baseline's own id and can recommend that copy under its own name. Jellyfin bug not \
+         ported.",
+            "A liked movie-like Live TV programme baseline is scored by the flat genre and tag \
+         query of the similar-items rows (Random order, no IsMovie or IsPlayed filter); \
+         upstream's batch provider weights every baseline, whatever its kind, and applies the \
+         movie filter. Fix path: gl-1802.",
+            "A request with no user (an API key naming none, or an administrator naming a \
+         userId with no account) answers an empty list; upstream's recently-played query \
+         throws on IsPlayed without a user (BuildIsPlayedFilter dereferences it), a 500. \
+         Jellyfin bug not ported.",
+            "The 400 (a value the query binder cannot convert) and 403 (another user's id \
+         without the administrator role) bodies are Ferrofin's error shape, not upstream's. \
+         Fix path: gl-666.",
         ],
         refs: &["images", "access-filtering"],
     },
