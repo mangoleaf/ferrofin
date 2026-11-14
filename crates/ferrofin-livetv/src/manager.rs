@@ -4037,14 +4037,41 @@ impl LiveTvManager for FerrofinLiveTvManager {
         else {
             return Ok(Vec::new());
         };
-        let tuner = self.tuner_host(&tuner_host_id).await?;
         // Each host builds its own sources: the M3U host has exactly one, and
         // an HDHomeRun offers a source per transcode profile the device
         // supports (`BaseTunerHost.GetChannelStreamMediaSources`).
-        let host = self.host_for(&tuner)?;
-        let mut sources = host.channel_media_sources(&tuner, &channel).await?;
+        let mut sources = match self.tuner_host(&tuner_host_id).await {
+            Ok(tuner) => {
+                let mut sources = self
+                    .host_for(&tuner)?
+                    .channel_media_sources(&tuner, &channel)
+                    .await?;
+                sources.iter_mut().for_each(crate::stream::normalize);
+                sources
+            }
+            // The tuner was deleted, and its channels stay listed until the
+            // guide refresh prunes them (migration 0046).
+            Err(ServiceError::NotFound(_)) => Vec::new(),
+            Err(err) => return Err(err),
+        };
+        if sources.is_empty() {
+            // `DefaultLiveTvService.GetChannelStreamMediaSources` throws
+            // `NotImplementedException` when no tuner offers a source, and
+            // `GetMediaSourcesInternal` answers the item's own placeholder
+            // (`LiveTvChannel.GetMediaSources`, not normalized) forced to
+            // `RequiresOpening`, so the open is what fails: "Tuner not found.".
+            sources.push(MediaSourceInfo {
+                id: Some(id.simple().to_string()),
+                name: crate::guide_repository::channel_row(&self.db, id)
+                    .await?
+                    .map(|row| row.name),
+                // `RunTimeTicks is null`: a channel item has none.
+                is_infinite_stream: true,
+                requires_opening: true,
+                ..MediaSourceInfo::default()
+            });
+        }
         for source in &mut sources {
-            crate::stream::normalize(source);
             Self::stamp_source(source);
             // `LiveTvMediaSourceProvider.GetMediaSourcesInternal`: the open
             // token is `{item type}_{item id "N"}_{source id}`. The
@@ -9314,17 +9341,38 @@ mod tests {
             1,
             "airings stay with their channel"
         );
-        // Meanwhile the channel has no tuner to open: "Tuner not found.".
-        let err = mgr
-            .open_channel_stream(chan_id, None)
-            .await
-            .expect_err("no tuner to open");
-        assert!(matches!(err, ServiceError::NotFound(_)), "{err:?}");
-        let err = mgr
+        // Meanwhile no tuner offers the channel a source, so its sources are
+        // the item's own placeholder, to be opened
+        // (`LiveTvMediaSourceProvider.GetMediaSourcesInternal`'s
+        // `NotImplementedException` arm over `LiveTvChannel.GetMediaSources`)…
+        let key = chan_id.simple().to_string();
+        let sources = mgr
             .get_channel_media_sources(chan_id)
             .await
-            .expect_err("no tuner to ask");
-        assert!(matches!(err, ServiceError::NotFound(_)), "{err:?}");
+            .expect("the placeholder source");
+        assert_eq!(
+            sources,
+            vec![ferrofin_model::dto::MediaSourceInfo {
+                id: Some(key.clone()),
+                name: Some("Channel One".to_owned()),
+                is_infinite_stream: true,
+                requires_opening: true,
+                open_token: Some(format!("LiveTvChannel_{key}_{key}")),
+                buffer_ms: Some(1500),
+                ..ferrofin_model::dto::MediaSourceInfo::default()
+            }]
+        );
+        // …and opening it is what fails: "Tuner not found.".
+        for source_id in [None, Some(key.as_str())] {
+            let err = mgr
+                .open_channel_stream(chan_id, source_id)
+                .await
+                .expect_err("no tuner to open");
+            assert!(
+                matches!(&err, ServiceError::NotFound(m) if m == "Tuner not found."),
+                "{err:?}"
+            );
+        }
         mgr.refresh_guide().await.expect("refresh3");
         assert_eq!(
             mgr.get_channels(&LiveTvChannelQuery::default(), &DtoOptions::default())
