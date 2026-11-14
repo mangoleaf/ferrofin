@@ -3391,7 +3391,9 @@ pub const VERIFIED: &[Verified] = &[
         ferrofin: "handlers/live_tv.rs get_series_timers (SeriesTimersQuery: sortBy, \
                sortOrder, Ascending when absent) → ferrofin-livetv manager.rs get_series_timers \
                (LiveTvManager.GetSeriesTimers: dvr_repository.rs series_timer_rows; \
-               sort_series_timers, Priority then the name, else the name; \
+               sort_series_timers, Priority then the name, else the name, names compared by \
+               ferrofin-util numeric_collation.rs invariant_numeric_cmp, SortExtensions' \
+               invariant-culture NumericOrdering comparer, a null name first; \
                build_series_timer_dto for each: the channel's current name from \
                guide_repository.rs channel_row, none without a channel, and \
                GetSeriesTimerInfoDto's FillImages(dto, info.Name, info.SeriesId) through \
@@ -3399,9 +3401,6 @@ pub const VERIFIED: &[Verified] = &[
                image_tag)",
         date: "2026-11-14",
         divergences: &[
-            "Names sort with v10.11.8's AlphanumericComparator runs; v12.4's SortExtensions \
-         compares with invariant culture under NumericOrdering, so names whose numbers differ \
-         only in leading zeros order differently. Fix path: gl-510.",
             "A series timer whose name is blank runs no lookup by name: it takes no Thumb or \
          Backdrop from a library series, and its Primary only from an airing of its listings \
          series. Upstream's FillImages then filters on nothing and takes the library's first \

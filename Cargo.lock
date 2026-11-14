@@ -1467,7 +1467,6 @@ dependencies = [
  "ferrofin-util",
  "flate2",
  "futures-util",
- "icu_collator",
  "quick-xml",
  "regex",
  "reqwest",

@@ -15,6 +15,7 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use ferrofin_db::Database;
 use ferrofin_db::store::{datetime_to_db, guid_to_db, opt_datetime_to_db};
+use ferrofin_util::numeric_collation::invariant_numeric_cmp;
 use sqlx::{QueryBuilder, Row, Sqlite};
 use uuid::Uuid;
 
@@ -7830,107 +7831,9 @@ fn day_pattern(days: &[DayOfWeek]) -> Option<ferrofin_model::live_tv::DayPattern
     }
 }
 
-/// The CLDR root collator the name segments compare through, built once.
-///
-/// `Collator::try_new` reads ICU4X's *baked* root collation data, so the only
-/// way it can fail is a build without that data — in which case the sort
-/// degrades to code-point order rather than taking the process down, and says
-/// so once.
-fn invariant_collator() -> Option<&'static icu_collator::CollatorBorrowed<'static>> {
-    static COLLATOR: std::sync::OnceLock<Option<icu_collator::CollatorBorrowed<'static>>> =
-        std::sync::OnceLock::new();
-    COLLATOR
-        .get_or_init(|| {
-            match icu_collator::Collator::try_new(
-                icu_collator::CollatorPreferences::default(),
-                icu_collator::options::CollatorOptions::default(),
-            ) {
-                Ok(collator) => Some(collator),
-                Err(error) => {
-                    tracing::error!(
-                        %error,
-                        "live tv: CLDR root collation data is unavailable; \
-                         name sorting falls back to code-point order"
-                    );
-                    None
-                }
-            }
-        })
-        .as_ref()
-}
-
-/// Compares two names the way every Jellyfin name sort does.
-///
-/// Port of `AlphanumericComparator.CompareValues` (v10.11.8
-/// Jellyfin.Extensions/AlphanumericComparator.cs): the strings are walked in
-/// alternating digit/non-digit runs, digit runs compare as numbers (leading
-/// zeros trimmed, then by length) and every run then compares as *text* under
-/// `StringComparison.InvariantCulture` — CLDR root collation, which is what
-/// [`invariant_collator`] supplies. Master replaced the whole class with
-/// `StringComparer.Create(CultureInfo.InvariantCulture, CompareOptions.NumericOrdering)`
-/// (MediaBrowser.Controller/Sorting/SortExtensions.cs:13, commit 098e8c6fed),
-/// so both trees demand invariant collation; only the run segmentation differs
-/// between them, and this keeps 10.11.8's, which is what the contract is pinned
-/// to (`"Show 007" > "Show 7"` via the trailing length tie-break).
-///
-/// Code-point order is NOT a stand-in for it even on plain ASCII: root
-/// collation orders by letter at the primary level and puts lowercase before
-/// uppercase at the tertiary level, so `"apple" < "Banana"` where
-/// `'B'(0x42) < 'a'(0x61)` says the opposite.
-fn alphanumeric_compare(a: &str, b: &str) -> std::cmp::Ordering {
-    use std::cmp::Ordering;
-    // The C# `len1`/`len2` are UTF-16 lengths, used for the empty checks and
-    // the trailing `len1 - len2` tie-break; a char count carries the same
-    // meaning here.
-    let (bytes_a, bytes_b) = (a.as_bytes(), b.as_bytes());
-    let by_length = || a.chars().count().cmp(&b.chars().count());
-    if bytes_a.is_empty() || bytes_b.is_empty() {
-        return by_length();
-    }
-    // Run boundaries are always char boundaries: `is_ascii_digit` is false for
-    // every byte of a multi-byte sequence, so a digit run can neither start nor
-    // end inside one.
-    let (mut pos_a, mut pos_b) = (0_usize, 0_usize);
-    loop {
-        let (start_a, start_b) = (pos_a, pos_b);
-        let is_num_a = bytes_a[pos_a].is_ascii_digit();
-        let is_num_b = bytes_b[pos_b].is_ascii_digit();
-        pos_a += 1;
-        pos_b += 1;
-        while pos_a < bytes_a.len() && bytes_a[pos_a].is_ascii_digit() == is_num_a {
-            pos_a += 1;
-        }
-        while pos_b < bytes_b.len() && bytes_b[pos_b].is_ascii_digit() == is_num_b {
-            pos_b += 1;
-        }
-        let mut span_a = &a[start_a..pos_a];
-        let mut span_b = &b[start_b..pos_b];
-        if is_num_a && is_num_b {
-            // "Trim leading zeros so we can compare the length of the strings
-            // to find the largest number" — and the C# keeps the TRIMMED spans
-            // for the text compare that follows.
-            span_a = span_a.trim_start_matches('0');
-            span_b = span_b.trim_start_matches('0');
-            match span_a.len().cmp(&span_b.len()) {
-                Ordering::Equal => {}
-                other => return other,
-            }
-        }
-        let ordering = match invariant_collator() {
-            Some(collator) => collator.compare(span_a, span_b),
-            None => span_a.cmp(span_b),
-        };
-        if ordering != Ordering::Equal {
-            return ordering;
-        }
-        if pos_a >= bytes_a.len() || pos_b >= bytes_b.len() {
-            return by_length();
-        }
-    }
-}
-
-/// Orders series timers the way `LiveTvManager.GetSeriesTimers` does (v10.11.8
-/// LiveTvManager.cs:919-934).
+/// Orders series timers the way `LiveTvManager.GetSeriesTimers` and
+/// `GetSeriesTimersInternal` do (v12.4 LiveTvManager.cs:927-937 and 889-899),
+/// comparing names with `SortExtensions`' invariant-culture numeric comparer.
 ///
 /// The `Priority` branch's ascending arm really is `OrderByDescending(Priority)`
 /// and its descending arm `OrderBy(Priority)` — upstream's inversion, ported
@@ -7945,7 +7848,14 @@ fn sort_series_timers(
         .sort_by
         .as_deref()
         .is_some_and(|s| s.eq_ignore_ascii_case("Priority"));
-    let name = |t: &SeriesTimerInfoDto| t.base.name.clone().unwrap_or_default();
+    let by_name = |a: &SeriesTimerInfoDto, b: &SeriesTimerInfoDto| {
+        let order = match (a.base.name.as_deref(), b.base.name.as_deref()) {
+            (Some(x), Some(y)) => invariant_numeric_cmp(x, y),
+            // `StringComparer.Compare` puts a null name before every string.
+            (x, y) => x.is_some().cmp(&y.is_some()),
+        };
+        if descending { order.reverse() } else { order }
+    };
     if by_priority {
         timers.sort_by(|a, b| {
             let priority = if descending {
@@ -7953,24 +7863,10 @@ fn sort_series_timers(
             } else {
                 b.base.priority.cmp(&a.base.priority)
             };
-            priority.then_with(|| {
-                let by_name = alphanumeric_compare(&name(a), &name(b));
-                if descending {
-                    by_name.reverse()
-                } else {
-                    by_name
-                }
-            })
+            priority.then_with(|| by_name(a, b))
         });
     } else {
-        timers.sort_by(|a, b| {
-            let by_name = alphanumeric_compare(&name(a), &name(b));
-            if descending {
-                by_name.reverse()
-            } else {
-                by_name
-            }
-        });
+        timers.sort_by(by_name);
     }
 }
 
@@ -8408,8 +8304,8 @@ mod tests {
     use uuid::Uuid;
 
     use super::{
-        DEFAULT_LIVE_STREAM_BUFFER_MS, GuideProgramRow, LiveTvPaths, alphanumeric_compare,
-        day_pattern, duplicate_showings_to_cancel, live_tv_service_key, sort_series_timers,
+        DEFAULT_LIVE_STREAM_BUFFER_MS, GuideProgramRow, LiveTvPaths, day_pattern,
+        duplicate_showings_to_cancel, live_tv_service_key, sort_series_timers,
     };
     use ferrofin_model::live_tv::{
         BaseTimerInfoDto, RecordingStatus, SeriesTimerInfoDto, TimerInfoDto,
@@ -14219,50 +14115,8 @@ mod tests {
         assert!(found.is_empty(), "{found:?}");
     }
 
-    /// `AlphanumericComparator.CompareValues`, against the C# as the oracle.
-    ///
-    /// The digit-run arms are v10.11.8's (`Jellyfin.Extensions/AlphanumericComparator.cs`),
-    /// including the trailing `len1 - len2` tie-break master dropped when it
-    /// moved to `CompareOptions.NumericOrdering`; the text arm is the
-    /// `StringComparison.InvariantCulture` BOTH trees ask for.
-    #[test]
-    fn alphanumeric_compare_matches_the_upstream_comparator() {
-        // Numbers sort as numbers, not as text.
-        assert_eq!(
-            alphanumeric_compare("Show 2", "Show 10"),
-            std::cmp::Ordering::Less
-        );
-        // Leading zeros do not change the NUMBER, but upstream's final
-        // `return len1 - len2` still breaks the tie on the raw lengths.
-        assert_eq!(
-            alphanumeric_compare("Show 007", "Show 7"),
-            std::cmp::Ordering::Greater
-        );
-        assert_eq!(
-            alphanumeric_compare("Show", "Show 1"),
-            std::cmp::Ordering::Less
-        );
-        assert_eq!(alphanumeric_compare("", "a"), std::cmp::Ordering::Less);
-        // `StringComparison.InvariantCulture` is CLDR root collation, not
-        // code-point order: the primary level orders by letter, so a lowercase
-        // 'a' sorts before an uppercase 'B' even though 'B'(0x42) < 'a'(0x61).
-        assert_eq!(
-            alphanumeric_compare("apple parity", "Banana parity"),
-            std::cmp::Ordering::Less
-        );
-        assert_eq!(alphanumeric_compare("a", "B"), std::cmp::Ordering::Less);
-        // …and the tertiary level puts lowercase before uppercase within a
-        // letter, which code-point order has backwards.
-        assert_eq!(alphanumeric_compare("a", "A"), std::cmp::Ordering::Less);
-        // A multi-byte run is segmented on char boundaries, not byte ones.
-        assert_eq!(
-            alphanumeric_compare("Café 2", "Café 10"),
-            std::cmp::Ordering::Less
-        );
-    }
-
-    /// `GetDayPattern`, `AlphanumericComparator` and `GetSeriesTimers`' ordering,
-    /// against the C# as the oracle — including upstream's inverted priority arm.
+    /// `GetDayPattern` and `GetSeriesTimers`' ordering, against the C# as the
+    /// oracle — including upstream's inverted priority arm.
     #[test]
     fn day_pattern_and_series_timer_ordering_match_upstream() {
         use ferrofin_model::live_tv::{DayPattern, SeriesTimerQuery};
@@ -14349,6 +14203,55 @@ mod tests {
             names(&v),
             ["B", "C", "A"],
             "…and its descending arm is OrderBy(Priority).ThenByStringDescending(Name)"
+        );
+    }
+
+    /// v12.4's `SortExtensions` compares whole names under invariant-culture
+    /// numeric ordering (gl-510): leading zeros tie, so the stable sort keeps
+    /// their order either way, a later number outranks an earlier difference
+    /// of case, and a null name comes first.
+    #[test]
+    fn series_timer_names_sort_by_invariant_numeric_ordering() {
+        use ferrofin_model::live_tv::SeriesTimerQuery;
+        let timer = |name: &str| SeriesTimerInfoDto {
+            base: ferrofin_model::live_tv::BaseTimerInfoDto {
+                name: Some(name.to_owned()),
+                ..ferrofin_model::live_tv::BaseTimerInfoDto::default()
+            },
+            ..SeriesTimerInfoDto::default()
+        };
+        let names = |v: &[SeriesTimerInfoDto]| {
+            v.iter()
+                .map(|t| t.base.name.clone().unwrap_or_default())
+                .collect::<Vec<_>>()
+        };
+        let mut v = vec![
+            timer("Show 007"),
+            timer("the Show 2"),
+            timer("Show 7"),
+            timer("The Show 1"),
+        ];
+        sort_series_timers(&mut v, &SeriesTimerQuery::default());
+        assert_eq!(
+            names(&v),
+            ["Show 007", "Show 7", "The Show 1", "the Show 2"]
+        );
+        sort_series_timers(
+            &mut v,
+            &SeriesTimerQuery {
+                sort_by: None,
+                sort_order: SortOrder::Descending,
+            },
+        );
+        assert_eq!(
+            names(&v),
+            ["the Show 2", "The Show 1", "Show 007", "Show 7"]
+        );
+        let mut v = vec![timer(""), SeriesTimerInfoDto::default()];
+        sort_series_timers(&mut v, &SeriesTimerQuery::default());
+        assert_eq!(
+            v[0].base.name, None,
+            "a null name sorts before an empty one"
         );
     }
 
