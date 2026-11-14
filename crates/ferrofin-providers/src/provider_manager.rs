@@ -4780,16 +4780,38 @@ impl RefreshQueue {
     }
 }
 
-/// Stands the worker down if it unwinds, so a panicking refresh cannot leave
-/// the queue claimed forever.
-struct WorkerGuard(Arc<std::sync::Mutex<RefreshQueue>>);
+/// A worker's claim on the queue. Dropping it while the worker still holds the
+/// claim (a panicking refresh, an aborted task) stands the worker down, so the
+/// queue is never left claimed forever. Once [`Self::next_refresh`] has stood
+/// the worker down the guard holds nothing, so dropping it cannot clear the
+/// claim of a worker a later request started.
+struct WorkerGuard(Option<Arc<std::sync::Mutex<RefreshQueue>>>);
+
+impl WorkerGuard {
+    /// The next refresh, or `None` once the queue ran dry and the worker stood
+    /// down ([`RefreshQueue::pop_or_stand_down`]).
+    fn next_refresh(&mut self) -> Option<(Uuid, MetadataRefreshOptions)> {
+        let next = self
+            .0
+            .as_ref()?
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .pop_or_stand_down();
+        if next.is_none() {
+            self.0 = None;
+        }
+        next
+    }
+}
 
 impl Drop for WorkerGuard {
     fn drop(&mut self) {
-        self.0
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .processing = false;
+        if let Some(queue) = self.0.take() {
+            queue
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .processing = false;
+        }
     }
 }
 
@@ -4798,21 +4820,12 @@ impl LocalProviderManager {
     /// priority first, until the queue is empty. A failed refresh is logged and
     /// the queue keeps draining.
     async fn drain_refresh_queue(&self) {
-        let guard = WorkerGuard(Arc::clone(&self.refresh_queue));
-        loop {
-            let next = self
-                .refresh_queue
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .pop_or_stand_down();
-            let Some((item_id, options)) = next else {
-                break;
-            };
+        let mut worker = WorkerGuard(Some(Arc::clone(&self.refresh_queue)));
+        while let Some((item_id, options)) = worker.next_refresh() {
             if let Err(err) = self.refresh_full_item(item_id, &options).await {
                 tracing::warn!(%item_id, %err, "queued metadata refresh failed");
             }
         }
-        drop(guard);
     }
 }
 
@@ -9662,6 +9675,61 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(next_seen(&mut rx).await, ids[1]);
+    }
+
+    /// A request that arrives after a worker stood down, but before that
+    /// worker's guard is dropped, starts a new worker. Dropping the old guard
+    /// must leave the new worker's claim alone, or a third request starts a
+    /// second worker beside it.
+    #[test]
+    fn a_stood_down_worker_leaves_the_next_workers_claim_alone() {
+        let queue = claimed_queue();
+        let mut worker = super::WorkerGuard(Some(Arc::clone(&queue)));
+        assert!(worker.next_refresh().is_none());
+        assert!(
+            !queue.lock().unwrap().processing,
+            "stood down under the lock"
+        );
+        let started = {
+            let mut queue = queue.lock().unwrap();
+            queue.push(
+                Uuid::from_u128(31),
+                MetadataRefreshOptions::default(),
+                RefreshPriority::Low,
+            );
+            !std::mem::replace(&mut queue.processing, true)
+        };
+        assert!(started, "the request starts a new worker");
+        drop(worker);
+        assert!(
+            queue.lock().unwrap().processing,
+            "the new worker's claim survives the old guard"
+        );
+    }
+
+    /// A worker dropped mid-drain (a panicking refresh, an aborted task) still
+    /// holds the claim, and dropping its guard releases it.
+    #[test]
+    fn a_worker_dropped_mid_drain_releases_its_claim() {
+        let queue = claimed_queue();
+        queue.lock().unwrap().push(
+            Uuid::from_u128(32),
+            MetadataRefreshOptions::default(),
+            RefreshPriority::Low,
+        );
+        let mut worker = super::WorkerGuard(Some(Arc::clone(&queue)));
+        assert!(worker.next_refresh().is_some());
+        assert!(queue.lock().unwrap().processing, "still draining");
+        drop(worker);
+        assert!(!queue.lock().unwrap().processing, "the claim is released");
+    }
+
+    /// A queue a worker has claimed, as `queue_refresh` leaves it.
+    fn claimed_queue() -> Arc<std::sync::Mutex<super::RefreshQueue>> {
+        Arc::new(std::sync::Mutex::new(super::RefreshQueue {
+            processing: true,
+            ..super::RefreshQueue::default()
+        }))
     }
 
     /// The worker, and so every refresh it runs, carries the culture of the
