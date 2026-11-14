@@ -639,13 +639,19 @@ pub trait LiveTvManager: Send + Sync {
     ///
     /// Port of `LiveTvManager.GetSeriesTimers` (v10.11.8 LiveTvManager.cs:904-930):
     /// `SortBy == "Priority"` orders by priority then name, anything else orders
-    /// by name alone.
+    /// by name alone. The Live TV manager builds each series timer as it reads
+    /// it, as `LiveTvDtoService.GetSeriesTimerInfoDto` does: the channel's
+    /// current name and the library series' artwork.
     async fn get_series_timers(
         &self,
         query: &ferrofin_model::live_tv::SeriesTimerQuery,
     ) -> Result<Vec<SeriesTimerInfoDto>, ServiceError>;
 
-    /// Gets a single series timer by id, or `None` when unknown.
+    /// Gets a single series timer by id, or `None` when unknown: the stored row
+    /// as it is, which the manager's own paths read. `GET
+    /// /LiveTv/SeriesTimers/{timerId}` lists through
+    /// [`get_series_timers`](Self::get_series_timers) instead, as upstream's
+    /// `GetSeriesTimer` does.
     async fn get_series_timer(&self, id: &str) -> Result<Option<SeriesTimerInfoDto>, ServiceError>;
 
     /// Creates a series timer, returning the id the server minted for it.

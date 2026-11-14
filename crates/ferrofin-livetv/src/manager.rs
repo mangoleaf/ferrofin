@@ -2004,7 +2004,7 @@ impl FerrofinLiveTvManager {
     /// get their pass.
     async fn refresh_series_timers(&self) -> Result<(), ServiceError> {
         let timers = self
-            .get_series_timers(&ferrofin_model::live_tv::SeriesTimerQuery::default())
+            .stored_series_timers(&ferrofin_model::live_tv::SeriesTimerQuery::default())
             .await?;
         for timer in timers {
             let Some(id) = timer.base.id.as_deref() else {
@@ -4395,6 +4395,12 @@ impl LiveTvManager for FerrofinLiveTvManager {
             .base
             .external_program_id
             .clone_from(&program.external_id);
+        // `GetSeriesTimerInfoDto`'s `FillImages(dto, info.Name, info.SeriesId)`.
+        // The defaults take the programme's name, but no series id:
+        // `GetNewTimerDefaultsInternal` builds its `ProgramInfo` without one.
+        self.fill_images(Some(&program.title), None, true, false)
+            .await?
+            .onto_series_timer(&mut defaults);
         Ok(defaults)
     }
 
@@ -4402,12 +4408,15 @@ impl LiveTvManager for FerrofinLiveTvManager {
         &self,
         query: &ferrofin_model::live_tv::SeriesTimerQuery,
     ) -> Result<Vec<SeriesTimerInfoDto>, ServiceError> {
-        let mut timers: Vec<SeriesTimerInfoDto> = self
-            .json_list(
-                "FerrofinLiveTvSeriesTimers",
-                r#"SELECT "Id", "Data" FROM "FerrofinLiveTvSeriesTimers""#,
-            )
-            .await?;
+        let mut timers = Vec::new();
+        for (id, data, series_id) in crate::dvr_repository::series_timer_rows(&self.db).await? {
+            if let Some(mut timer) = self.parse_stored_row("FerrofinLiveTvSeriesTimers", &id, &data)
+            {
+                self.build_series_timer_dto(&mut timer, series_id.as_deref())
+                    .await?;
+                timers.push(timer);
+            }
+        }
         sort_series_timers(&mut timers, query);
         Ok(timers)
     }
@@ -5211,9 +5220,11 @@ impl FerrofinLiveTvManager {
     ///
     /// The guide programme the timer names becomes `ProgramInfo`
     /// (`GetBaseItemDto(program, new DtoOptions())`), with the timer's id and
-    /// status unless it is cancelled or failed, and its series timer. The
-    /// channel gives its current name and logo tag, and the run time is the
-    /// timer's window.
+    /// status unless it is cancelled or failed, its series timer, and for a
+    /// series timer's timer the artwork [`Self::fill_images`] finds by the
+    /// timer's name and the programme's series (`TimerInfo.SeriesId` is the
+    /// programme's, `CopyProgramInfoToTimerInfo`). The channel gives its
+    /// current name and logo tag, and the run time is the timer's window.
     async fn build_timer_dto(&self, timer: &mut TimerInfoDto) -> Result<(), ServiceError> {
         // `GetTimerInfoDto` builds a new DTO: the programme and the channel's
         // name and logo come only from this read, and it sets no parent
@@ -5241,6 +5252,20 @@ impl FerrofinLiveTvManager {
                 info.status = Some(recording_status_name(timer.status));
             }
             info.series_timer_id.clone_from(&timer.series_timer_id);
+            if timer.series_timer_id.is_some() {
+                let has_backdrop = info
+                    .parent_backdrop_image_tags
+                    .as_ref()
+                    .is_some_and(|tags| !tags.is_empty());
+                self.fill_images(
+                    timer.base.name.as_deref(),
+                    program.external_series_id.as_deref(),
+                    false,
+                    has_backdrop,
+                )
+                .await?
+                .onto_item(&mut info);
+            }
             timer.program_info = Some(Box::new(info));
         }
         let channel_id = timer.base.channel_id;
@@ -5255,6 +5280,107 @@ impl FerrofinLiveTvManager {
                 .remove(&channel_id);
         }
         Ok(())
+    }
+
+    /// The read half of `LiveTvManager.GetSeriesTimers` and
+    /// `LiveTvDtoService.GetSeriesTimerInfoDto` (v12.4 LiveTvManager.cs:909-955,
+    /// LiveTvDtoService.cs:113-159), which build each series timer as it is
+    /// read: the channel's current name (none without a channel), and the
+    /// artwork [`Self::fill_images`] finds by the timer's name and `series_id`,
+    /// its stored `SeriesTimerInfo.SeriesId`.
+    async fn build_series_timer_dto(
+        &self,
+        timer: &mut SeriesTimerInfoDto,
+        series_id: Option<&str>,
+    ) -> Result<(), ServiceError> {
+        // `GetSeriesTimerInfoDto` builds a new DTO, and sets neither.
+        timer.base.channel_primary_image_tag = None;
+        timer.image_tags.clear();
+        timer.base.channel_name = if timer.base.channel_id.is_nil() {
+            None
+        } else {
+            crate::guide_repository::channel_row(&self.db, timer.base.channel_id)
+                .await?
+                .map(|channel| channel.name)
+        };
+        self.fill_images(timer.base.name.as_deref(), series_id, true, false)
+            .await?
+            .onto_series_timer(timer);
+        Ok(())
+    }
+
+    /// Port of `LiveTvDtoService.FillImages` (v12.4 LiveTvDtoService.cs:161-360,
+    /// both overloads): the artwork of the library series named `name`, for a
+    /// timer card.
+    ///
+    /// The first `Series` of that name with a Thumb gives its Thumb and its
+    /// Backdrop. The Primary is the first `Series` of that name with one when
+    /// `series_primary` (the `SeriesTimerInfoDto` overload); otherwise, or
+    /// failing that, the first guide programme with one in the listings series
+    /// `series_id` (by `name` when there is none), whose Backdrop is taken too
+    /// when neither the series nor the DTO (`has_backdrop`) has one. An image
+    /// whose tag cannot be computed is left out, as upstream's catch does.
+    ///
+    /// A lookup whose only filter would be a blank name is not run: upstream's
+    /// query then filters on nothing and takes the library's first series or
+    /// programme. Whether to port that waits on the owner (gl-1790).
+    async fn fill_images(
+        &self,
+        name: Option<&str>,
+        series_id: Option<&str>,
+        series_primary: bool,
+        has_backdrop: bool,
+    ) -> Result<ParentArtwork, ServiceError> {
+        let mut art = ParentArtwork::default();
+        let (Some(store), Some(images)) = (self.item_store.get(), self.images.get()) else {
+            return Ok(art);
+        };
+        let processor = images.processor.as_ref();
+        let name = name.map(str::trim).filter(|name| !name.is_empty());
+        let series_id = series_id.map(str::trim).filter(|id| !id.is_empty());
+        if let Some(name) = name
+            && let Some(series) = first_with_image(
+                store,
+                BaseItemKind::Series,
+                ImageType::Thumb,
+                Some(name),
+                None,
+            )
+            .await?
+        {
+            let stored = item_images(store, &series).await?;
+            art.thumb = image_tag(processor, &series, &stored, ImageType::Thumb).await;
+            art.backdrop = image_tag(processor, &series, &stored, ImageType::Backdrop).await;
+        }
+        let mut primary = None;
+        if series_primary && let Some(name) = name {
+            primary = first_with_image(
+                store,
+                BaseItemKind::Series,
+                ImageType::Primary,
+                Some(name),
+                None,
+            )
+            .await?;
+        }
+        if primary.is_none() && (name.is_some() || series_id.is_some()) {
+            primary = first_with_image(
+                store,
+                BaseItemKind::LiveTvProgram,
+                ImageType::Primary,
+                if series_id.is_none() { name } else { None },
+                series_id,
+            )
+            .await?;
+        }
+        if let Some(item) = primary {
+            let stored = item_images(store, &item).await?;
+            art.primary = image_tag(processor, &item, &stored, ImageType::Primary).await;
+            if !has_backdrop && art.backdrop.is_none() {
+                art.backdrop = image_tag(processor, &item, &stored, ImageType::Backdrop).await;
+            }
+        }
+        Ok(art)
     }
 
     // ---- DVR ------------------------------------------------------------
@@ -5641,6 +5767,23 @@ impl FerrofinLiveTvManager {
                         series_id,
                     })
             }))
+    }
+
+    /// Every stored series timer as stored, in the query's order: upstream's
+    /// `GetSeriesTimersInternal`, which the guide refresh walks, with none of
+    /// what [`Self::build_series_timer_dto`] adds on a read.
+    async fn stored_series_timers(
+        &self,
+        query: &ferrofin_model::live_tv::SeriesTimerQuery,
+    ) -> Result<Vec<SeriesTimerInfoDto>, ServiceError> {
+        let mut timers: Vec<SeriesTimerInfoDto> = self
+            .json_list(
+                "FerrofinLiveTvSeriesTimers",
+                r#"SELECT "Id", "Data" FROM "FerrofinLiveTvSeriesTimers""#,
+            )
+            .await?;
+        sort_series_timers(&mut timers, query);
+        Ok(timers)
     }
 
     /// Writes a series timer through, DTO and identity columns together.
@@ -8047,6 +8190,103 @@ fn series_child_timer(
     // channel and the listing's own programme id all come from the guide.
     copy_program_into_timer(program, &mut timer);
     timer
+}
+
+/// What [`FerrofinLiveTvManager::fill_images`] found for a timer card:
+/// `(item id, tag)` of its parent Thumb, Backdrop and Primary.
+#[derive(Debug, Default)]
+struct ParentArtwork {
+    thumb: Option<(Uuid, String)>,
+    backdrop: Option<(Uuid, String)>,
+    primary: Option<(Uuid, String)>,
+}
+
+impl ParentArtwork {
+    /// Writes the artwork onto a series timer, which `GetSeriesTimerInfoDto`
+    /// builds new, so a field nothing was found for is cleared.
+    fn onto_series_timer(self, timer: &mut SeriesTimerInfoDto) {
+        let n = |(id, tag): (Uuid, String)| (id.simple().to_string(), tag);
+        (timer.parent_thumb_item_id, timer.parent_thumb_image_tag) = self.thumb.map(n).unzip();
+        let (id, tag) = self.backdrop.map(n).unzip();
+        timer.base.parent_backdrop_item_id = id;
+        timer.base.parent_backdrop_image_tags = tag.map(|tag| vec![tag]);
+        (
+            timer.parent_primary_image_item_id,
+            timer.parent_primary_image_tag,
+        ) = self.primary.map(n).unzip();
+    }
+
+    /// Writes the artwork onto a programme's DTO, which keeps what it has
+    /// where nothing was found: `FillImages(BaseItemDto, …)` only assigns.
+    fn onto_item(self, dto: &mut BaseItemDto) {
+        if let Some((id, tag)) = self.thumb {
+            dto.parent_thumb_item_id = Some(id);
+            dto.parent_thumb_image_tag = Some(tag);
+        }
+        if let Some((id, tag)) = self.backdrop {
+            dto.parent_backdrop_item_id = Some(id);
+            dto.parent_backdrop_image_tags = Some(vec![tag]);
+        }
+        if let Some((id, tag)) = self.primary {
+            dto.parent_primary_image_item_id = Some(id);
+            dto.parent_primary_image_tag = Some(tag);
+        }
+    }
+}
+
+/// `GetItemList(new InternalItemsQuery { IncludeItemTypes = [kind], Name,
+/// ExternalSeriesId, ImageTypes = [image], Limit = 1 }).FirstOrDefault()`, with
+/// no user, as `FillImages` asks it.
+async fn first_with_image(
+    store: &LiveTvItemStore,
+    kind: BaseItemKind,
+    image: ImageType,
+    name: Option<&str>,
+    series_id: Option<&str>,
+) -> Result<Option<BaseItemEntity>, ServiceError> {
+    let query = InternalItemsQuery {
+        include_item_types: vec![kind],
+        name: name.map(str::to_owned),
+        external_series_id: series_id.map(str::to_owned),
+        image_types: vec![image],
+        limit: Some(1),
+        ..InternalItemsQuery::default()
+    };
+    Ok(store.items.get_item_list(&query).await?.into_iter().next())
+}
+
+/// The stored image rows of `item`.
+async fn item_images(
+    store: &LiveTvItemStore,
+    item: &BaseItemEntity,
+) -> Result<Vec<ItemImageInfo>, ServiceError> {
+    match Uuid::parse_str(&item.id) {
+        Ok(id) => store.items.get_image_infos(id).await,
+        Err(_) => Ok(Vec::new()),
+    }
+}
+
+/// `(item id, tag)` of `item`'s first `image_type` image among `images`
+/// (`GetImageInfo(type, 0)`), or `None` when it has none or the tag cannot be
+/// computed: upstream logs that and leaves the field unset.
+async fn image_tag(
+    processor: &dyn ImageProcessor,
+    item: &BaseItemEntity,
+    images: &[ItemImageInfo],
+    image_type: ImageType,
+) -> Option<(Uuid, String)> {
+    let id = Uuid::parse_str(&item.id).ok()?;
+    let image = images.iter().find(|image| image.image_type == image_type)?;
+    match processor
+        .get_image_cache_tag(item.path.as_deref(), image)
+        .await
+    {
+        Ok(tag) => tag.map(|tag| (id, tag)),
+        Err(error) => {
+            tracing::debug!(%error, item_id = %id, "live tv: could not tag a timer's series image");
+            None
+        }
+    }
 }
 
 /// The channels `rows` air on, for [`FerrofinLiveTvManager::channel_image_tags`].
@@ -15246,6 +15486,189 @@ mod tests {
         assert!(
             stored.program_info.is_none(),
             "the read writes nothing back"
+        );
+    }
+
+    /// gl-853: `fill_images` over the real item repository, branch by branch.
+    /// A library series with only a Thumb gives its Thumb; the Primary and
+    /// the Backdrop then come from the airing of the listings series (the
+    /// series-timer overload looks for a series Primary first and finds
+    /// none), by its series id or, without one, by its name. A DTO with a
+    /// backdrop of its own keeps it. A blank name runs no lookup by name, so
+    /// only a series id finds anything. Once the series has a Primary, the
+    /// series-timer overload takes it, and with it no airing backdrop.
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)] // one fixture, every branch
+    async fn fill_images_finds_the_series_and_airing_artwork() {
+        use super::ParentArtwork;
+        use ferrofin_db::store::guid_to_db;
+        use ferrofin_model::data::BaseItemKind;
+        use ferrofin_model::entities::ImageType;
+        use ferrofin_traits::options::ItemImageInfo;
+        let xmltv = dated(
+            "<tv><channel id=\"one.tv\"><display-name>Channel One</display-name></channel>\
+             <programme start=\"20260725060000 +0000\" stop=\"20260725070000 +0000\" \
+             channel=\"one.tv\"><title>Show</title>\
+             <episode-num system=\"xmltv_ns\">0.1.</episode-num>\
+             <icon src=\"http://img/show.png\"/>\
+             <image type=\"backdrop\">http://img/back.jpg</image></programme></tv>",
+        );
+        let lab = item_lab(M3U, Some(xmltv)).await;
+        let art = Arc::new(ArtServices::default());
+        lab.mgr.set_images(art.clone(), art.clone());
+        lab.mgr.refresh_guide().await.expect("refresh");
+        let airing = lab
+            .items
+            .get_item_list(&InternalItemsQuery {
+                include_item_types: vec![BaseItemKind::LiveTvProgram],
+                ..InternalItemsQuery::default()
+            })
+            .await
+            .expect("programmes")
+            .remove(0);
+        let airing_id = Uuid::parse_str(&airing.id).expect("guid");
+        let series_id = airing
+            .external_series_id
+            .clone()
+            .expect("an episode's series");
+        let show = Uuid::new_v4();
+        lab.persistence
+            .save_items(&[BaseItemEntity {
+                id: guid_to_db(show),
+                type_: "MediaBrowser.Controller.Entities.TV.Series".to_owned(),
+                name: Some("Show".to_owned()),
+                clean_name: Some("show".to_owned()),
+                sort_name: Some("show".to_owned()),
+                is_folder: true,
+                ..BaseItemEntity::default()
+            }])
+            .await
+            .expect("series");
+        let image = |path: &str, image_type| ItemImageInfo {
+            path: path.to_owned(),
+            image_type,
+            ..ItemImageInfo::default()
+        };
+        let thumb = image("http://img/thumb.png", ImageType::Thumb);
+        lab.persistence
+            .save_item_images(show, std::slice::from_ref(&thumb))
+            .await
+            .expect("thumb");
+
+        let ids = |art: &ParentArtwork| {
+            (
+                art.thumb.as_ref().map(|found| found.0),
+                art.backdrop.as_ref().map(|found| found.0),
+                art.primary.as_ref().map(|found| found.0),
+            )
+        };
+        let lookup = |name, series, series_primary, has_backdrop| {
+            lab.mgr
+                .fill_images(name, series, series_primary, has_backdrop)
+        };
+        let full = lookup(Some("Show"), Some(series_id.as_str()), true, false)
+            .await
+            .expect("art");
+        assert_eq!(ids(&full), (Some(show), Some(airing_id), Some(airing_id)));
+        assert_eq!(
+            full.thumb.as_ref().map(|found| found.1.as_str()),
+            Some("tag:http://img/thumb.png")
+        );
+        assert!(
+            full.primary
+                .as_ref()
+                .is_some_and(|found| found.1.starts_with("tag:http://img/show.png")),
+            "{full:?}"
+        );
+        assert!(
+            full.backdrop
+                .as_ref()
+                .is_some_and(|found| found.1.starts_with("tag:http://img/back.jpg")),
+            "{full:?}"
+        );
+        let by_name = lookup(Some("Show"), None, false, false).await.expect("art");
+        assert_eq!(
+            ids(&by_name),
+            (Some(show), Some(airing_id), Some(airing_id))
+        );
+        let kept = lookup(Some("Show"), Some(series_id.as_str()), false, true)
+            .await
+            .expect("art");
+        assert_eq!(ids(&kept), (Some(show), None, Some(airing_id)));
+        let blank = lookup(Some("  "), Some(series_id.as_str()), true, false)
+            .await
+            .expect("art");
+        assert_eq!(ids(&blank), (None, Some(airing_id), Some(airing_id)));
+        let nothing = lookup(Some(""), None, true, false).await.expect("art");
+        assert_eq!(ids(&nothing), (None, None, None));
+
+        lab.persistence
+            .save_item_images(
+                show,
+                &[thumb, image("http://img/poster.png", ImageType::Primary)],
+            )
+            .await
+            .expect("primary");
+        let series_primary = lookup(Some("Show"), Some(series_id.as_str()), true, false)
+            .await
+            .expect("art");
+        assert_eq!(ids(&series_primary), (Some(show), None, Some(show)));
+        let program_primary = lookup(Some("Show"), Some(series_id.as_str()), false, false)
+            .await
+            .expect("art");
+        assert_eq!(
+            ids(&program_primary),
+            (Some(show), Some(airing_id), Some(airing_id))
+        );
+    }
+
+    /// A series timer is built new, so what nothing was found for is cleared;
+    /// a programme's DTO keeps its own values where nothing was found.
+    #[test]
+    fn parent_artwork_clears_a_series_timer_and_assigns_onto_an_item() {
+        use super::ParentArtwork;
+        let id = Uuid::from_u128(7);
+        let mut timer = SeriesTimerInfoDto {
+            parent_thumb_item_id: Some("stale".to_owned()),
+            parent_primary_image_tag: Some("stale".to_owned()),
+            ..SeriesTimerInfoDto::default()
+        };
+        timer.base.parent_backdrop_image_tags = Some(vec!["stale".to_owned()]);
+        ParentArtwork {
+            thumb: Some((id, "t".to_owned())),
+            ..ParentArtwork::default()
+        }
+        .onto_series_timer(&mut timer);
+        assert_eq!(
+            (
+                timer.parent_thumb_item_id.as_deref(),
+                timer.parent_thumb_image_tag.as_deref()
+            ),
+            (Some("00000000000000000000000000000007"), Some("t"))
+        );
+        assert_eq!(timer.parent_primary_image_tag, None);
+        assert_eq!(timer.base.parent_backdrop_image_tags, None);
+
+        let mut item = BaseItemDto {
+            parent_backdrop_item_id: Some(id),
+            parent_backdrop_image_tags: Some(vec!["own".to_owned()]),
+            ..BaseItemDto::default()
+        };
+        ParentArtwork {
+            primary: Some((id, "p".to_owned())),
+            ..ParentArtwork::default()
+        }
+        .onto_item(&mut item);
+        assert_eq!(
+            item.parent_backdrop_image_tags,
+            Some(vec!["own".to_owned()])
+        );
+        assert_eq!(
+            (
+                item.parent_primary_image_item_id,
+                item.parent_primary_image_tag.as_deref()
+            ),
+            (Some(id), Some("p"))
         );
     }
 

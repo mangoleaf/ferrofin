@@ -1961,14 +1961,25 @@ async fn get_series_timers(
 }
 
 /// `GET /LiveTv/SeriesTimers/{timerId}` — a single series timer (`404` if absent).
+///
+/// Port of `LiveTvManager.GetSeriesTimer`: the first series timer
+/// `GetSeriesTimers` lists whose id equals `timer_id` ignoring case.
 async fn get_series_timer(
     State(state): State<AppState>,
     RequireLiveTvAccess(_auth): RequireLiveTvAccess,
     RequiredRouteString(timer_id, _): RequiredRouteString<TimerId>,
 ) -> Result<Json<SeriesTimerInfoDto>, ApiError> {
     live_tv(&state)?
-        .get_series_timer(&timer_id)
+        .get_series_timers(&ferrofin_model::live_tv::SeriesTimerQuery::default())
         .await?
+        .into_iter()
+        .find(|timer| {
+            timer
+                .base
+                .id
+                .as_deref()
+                .is_some_and(|id| id.eq_ignore_ascii_case(&timer_id))
+        })
         .map(Json)
         .ok_or_else(|| ApiError::NotFound("series timer".into()))
 }
