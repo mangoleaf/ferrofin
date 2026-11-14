@@ -8963,17 +8963,31 @@ mod tests {
     // Saving an item must stamp the derived `CleanName` (C# `SaveItem` computes
     // `GetCleanValue(item.Name)` at write time). No scan path pre-computes it,
     // and the `searchTerm` filter queries `CleanName` — a NULL there makes the
-    // item invisible to search (the web search page returned nothing).
+    // item invisible to search (the web search page returned nothing). The
+    // titles after `Amélie` are upstream `SearchPunctuationTests.cs` (PR
+    // 14879), which saves a `Series` through `BaseItemRepository.Map`.
+    #[rstest::rstest]
+    #[case("Amélie", "amelie")]
+    #[case("Mr. Robot", "mr robot")]
+    #[case("Spider-Man: Homecoming", "spider man homecoming")]
+    #[case("Beyoncé — Live!", "beyonce live")]
+    #[case("Hello, World!", "hello world")]
+    #[case("(The) Good, the Bad & the Ugly", "the good the bad the ugly")]
+    #[case("Wall-E", "wall e")]
+    #[case("No. 1: The Beginning", "no 1 the beginning")]
+    #[case("Café-au-lait", "cafe au lait")]
+    #[case("Face/Off", "face off")]
+    #[case("V/H/S", "v h s")]
     #[tokio::test]
-    async fn save_items_stamps_derived_clean_name() {
+    async fn save_items_stamps_derived_clean_name(#[case] name: &str, #[case] expected: &str) {
         let db = test_db().await;
         let id = Uuid::new_v4();
         let svc = FerrofinItemPersistenceService::new(db.clone());
 
         let item = ferrofin_db::entities::base_items::BaseItemEntity {
             id: ferrofin_db::store::guid_to_db(id),
-            type_: "MediaBrowser.Controller.Entities.Movies.Movie".to_owned(),
-            name: Some("Amélie".to_owned()),
+            type_: "MediaBrowser.Controller.Entities.TV.Series".to_owned(),
+            name: Some(name.to_owned()),
             ..ferrofin_db::entities::base_items::BaseItemEntity::default()
         };
         svc.save_items(std::slice::from_ref(&item))
@@ -8986,7 +9000,7 @@ mod tests {
                 .fetch_one(db.pool())
                 .await
                 .expect("query");
-        assert_eq!(clean.as_deref(), Some("amelie"));
+        assert_eq!(clean.as_deref(), Some(expected));
     }
 
     /// gl-1581: the scan's path reads — the by-path lookup (`FindByPath`),

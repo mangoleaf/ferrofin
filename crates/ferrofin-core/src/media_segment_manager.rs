@@ -323,23 +323,8 @@ impl FerrofinMediaSegmentManager {
             || vec![provider_id.to_owned()],
             |p| Self::namespaces(p.as_ref()),
         );
-        for id in ids {
-            let mut sql =
-                String::from(r#"DELETE FROM "MediaSegments" WHERE "SegmentProviderId" = ?1"#);
-            if types.is_some() {
-                sql.push_str(r#" AND "Type" = ?2"#);
-            }
-            sql.push_str(r#" RETURNING "ItemId""#);
-            let mut query = sqlx::query_scalar::<_, String>(sqlx::AssertSqlSafe(sql)).bind(id);
-            if let Some(kind) = types {
-                query = query.bind(kind.json_value());
-            }
-            let items = query.fetch_all(self.db.writer()).await.map_err(db_err)?;
-            for item in items {
-                let id = Uuid::parse_str(&item)
-                    .map_err(|error| ServiceError::backend(error.to_string()))?;
-                Self::changed(revisions, id);
-            }
+        for item in media_segment_repository::clear_rows(&self.db, &ids, types).await? {
+            Self::changed(revisions, item);
         }
         Ok(())
     }
@@ -768,11 +753,17 @@ impl MediaSegmentManager for FerrofinMediaSegmentManager {
     ) -> Result<(), ServiceError> {
         let mut revisions = self.mutations.lock().await;
         revisions.epoch = revisions.epoch.wrapping_add(1);
+        // Rows first, all or none, so a failed clear leaves every row and snapshot. Unlike
+        // the publish-first producer paths: putting every item's snapshot back after a
+        // failed clear could be large (gl-1401). If the snapshot erase then fails, the next
+        // scan serves the snapshots it did not reach again, and a retry completes the
+        // erase unless the snapshot walk keeps failing.
+        self.clear_all_provider(identifier, type_filter, &mut revisions)
+            .await?;
         if let Some(provider) = self.provider(identifier) {
             provider.erase_cached_segments(type_filter).await?;
         }
-        self.clear_all_provider(identifier, type_filter, &mut revisions)
-            .await
+        Ok(())
     }
     async fn get_segments(
         &self,
@@ -1194,6 +1185,11 @@ mod tests {
             &self,
             type_filter: Option<MediaSegmentType>,
         ) -> Result<(), ferrofin_traits::error::ServiceError> {
+            if self.publish_fail.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err(ferrofin_traits::error::ServiceError::backend(
+                    "snapshot erase failed",
+                ));
+            }
             let mut output = self.output.lock().unwrap();
             *output = ferrofin_traits::media_segments::MediaSegmentCacheMutation::Replace {
                 type_filter,
@@ -1818,6 +1814,118 @@ mod tests {
             rows,
             "the served rows keep the old set"
         );
+    }
+
+    /// A provider-wide producer erase whose row clear fails keeps the
+    /// producer's snapshot and every namespace's rows (gl-1401).
+    #[tokio::test]
+    async fn a_producer_erase_whose_rows_fail_keeps_the_snapshot_and_every_row() {
+        use std::sync::{Arc, Mutex};
+        let db = test_db().await;
+        let item = Uuid::new_v4();
+        seed_item(&db, item, BaseItemKind::Episode).await;
+        let manager =
+            FerrofinMediaSegmentManager::new(db.clone(), library_manager_over(db.clone()));
+        // Stored under the legacy namespace before its producer registers.
+        manager
+            .create_segment(
+                &segment(item, MediaSegmentType::Outro, 900, 1000),
+                "legacy:Producer",
+            )
+            .await
+            .unwrap();
+        manager.register_segment_provider(provider(
+            "Producer",
+            0,
+            0,
+            &Arc::new(Mutex::new(Vec::new())),
+        ));
+        manager
+            .create_producer_segment(
+                &segment(item, MediaSegmentType::Intro, 0, 100),
+                "legacy:Producer",
+            )
+            .await
+            .unwrap();
+        // The legacy namespace is cleared after the producer's own id: make it fail.
+        sqlx::query(
+            r#"CREATE TRIGGER "FailLegacyDelete" BEFORE DELETE ON "MediaSegments"
+               WHEN OLD."SegmentProviderId" = 'legacy:Producer'
+               BEGIN SELECT RAISE(ABORT, 'injected'); END"#,
+        )
+        .execute(db.writer())
+        .await
+        .unwrap();
+        let snapshot = manager
+            .get_producer_segments(item, "legacy:Producer")
+            .await
+            .unwrap();
+        let rows = manager.get_segments(item, None, false).await.unwrap();
+        assert_eq!((snapshot.len(), rows.len()), (1, 2));
+
+        assert!(
+            manager
+                .delete_all_producer_segments("legacy:Producer", None)
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            manager
+                .get_producer_segments(item, "legacy:Producer")
+                .await
+                .unwrap(),
+            snapshot
+        );
+        assert_eq!(manager.get_segments(item, None, false).await.unwrap(), rows);
+    }
+
+    /// A producer erase whose snapshot erase fails after its rows were cleared
+    /// keeps the snapshot, which the next scan serves again; a retry
+    /// completes the erase (gl-1401).
+    #[tokio::test]
+    async fn a_producer_erase_whose_snapshot_fails_is_served_again_and_a_retry_completes_it() {
+        use std::sync::{Arc, Mutex, atomic::Ordering};
+        let db = test_db().await;
+        let item = Uuid::new_v4();
+        seed_item(&db, item, BaseItemKind::Episode).await;
+        let manager = FerrofinMediaSegmentManager::new(db.clone(), library_manager_over(db));
+        let producer = provider("Producer", 0, 0, &Arc::new(Mutex::new(Vec::new())));
+        manager.register_segment_provider(producer.clone());
+        let written = manager
+            .create_producer_segment(
+                &segment(item, MediaSegmentType::Intro, 0, 100),
+                "legacy:Producer",
+            )
+            .await
+            .unwrap();
+        let snapshot_now = || async {
+            manager
+                .get_producer_segments(item, "legacy:Producer")
+                .await
+                .unwrap()
+        };
+        let rows_now = || async { manager.get_segments(item, None, false).await.unwrap() };
+
+        producer.publish_fail.store(true, Ordering::SeqCst);
+        assert!(
+            manager
+                .delete_all_producer_segments("legacy:Producer", None)
+                .await
+                .is_err()
+        );
+        assert_eq!(rows_now().await, []);
+        assert_eq!(snapshot_now().await, [written]);
+        manager.run_segment_providers(item, false).await.unwrap();
+        let served = rows_now().await;
+        assert_eq!((served.len(), served[0].end_ticks), (1, 100));
+
+        producer.publish_fail.store(false, Ordering::SeqCst);
+        manager
+            .delete_all_producer_segments("legacy:Producer", None)
+            .await
+            .unwrap();
+        assert_eq!(snapshot_now().await, []);
+        assert_eq!(rows_now().await, []);
     }
 
     #[tokio::test]

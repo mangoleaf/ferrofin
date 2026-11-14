@@ -25,6 +25,7 @@ use std::sync::{Arc, Mutex};
 use async_trait::async_trait;
 use ferrofin_model::updates::{PackageInfo, RepositoryInfo, VersionInfo};
 use serde::{Deserialize, Serialize};
+use serde_json::value::RawValue;
 use uuid::Uuid;
 
 use ferrofin_traits::configuration::ServerConfigurationManager;
@@ -206,7 +207,7 @@ const DEFAULT_PLUGIN_DOWNLOAD_MB: u32 = 128;
 
 /// The application version assumed when the composition root wires none — the
 /// Jellyfin API version Ferrofin reports from `/System/Info` (kept in step with
-/// `JELLYFIN_API_VERSION` in `apps/ferrofin-server/src/state.rs`, which is what
+/// `JELLYFIN_API_VERSION` in `crates/ferrofin-api/src/openapi.rs`, which is what
 /// a live server passes to
 /// [`with_application_version`](FerrofinPluginManager::with_application_version)).
 ///
@@ -263,6 +264,12 @@ const MAX_MANIFEST_BYTES: u64 = 16 * 1024 * 1024;
 /// repository that accepts the connection and says nothing pins the task.
 const REPO_FETCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
+/// The total budget for one plugin artifact download, on top of the idle
+/// timeouts: upstream's `InstallationManager.PackageDownloadTimeout`, so a
+/// repository that trickles bytes cannot hold an install, or the Update
+/// Plugins task, open indefinitely.
+const PACKAGE_DOWNLOAD_TIMEOUT: std::time::Duration = std::time::Duration::from_mins(10);
+
 /// Reads a response body in chunks, failing as soon as the running total
 /// exceeds `cap_bytes` — `Content-Length` is advisory (absent on chunked
 /// responses, and a hostile server can lie), so the streamed count is the
@@ -281,7 +288,7 @@ async fn read_capped(
     while let Some(chunk) = response
         .chunk()
         .await
-        .map_err(|e| ServiceError::backend(format!("downloading {url}: {e}")))?
+        .map_err(|e| download_error(url, &e))?
     {
         if (bytes.len() + chunk.len()) as u64 > cap_bytes {
             return Err(ServiceError::invalid_input(format!(
@@ -291,6 +298,17 @@ async fn read_capped(
         bytes.extend_from_slice(&chunk);
     }
     Ok(bytes)
+}
+
+/// The error for a failed download from `url`. A timeout says so, as
+/// upstream's `TimeoutException` does, rather than reqwest's generic "error
+/// decoding response body".
+fn download_error(url: &str, e: &reqwest::Error) -> ServiceError {
+    if e.is_timeout() {
+        ServiceError::backend(format!("downloading {url} timed out"))
+    } else {
+        ServiceError::backend(format!("downloading {url}: {e}"))
+    }
 }
 
 /// Lowercase-hex SHA-256 of `bytes` (the manifest `sha256` extension field).
@@ -316,6 +334,7 @@ async fn download_and_verify(
     chosen: &ferrofin_model::updates::VersionInfo,
     loopback_ok: bool,
     cap_bytes: u64,
+    budget: std::time::Duration,
 ) -> Result<Vec<u8>, ServiceError> {
     require_https(source_url, loopback_ok)?;
     // GitHub release assets 302 to a CDN, so redirects must be followed —
@@ -331,19 +350,20 @@ async fn download_and_verify(
             attempt.error("insecure redirect target (plugin downloads require https)")
         }
     });
-    // Idle timeouts, not a total deadline: a legitimate 100 MiB artifact on
-    // a slow link needs minutes of transfer, but must never sit silent.
+    // Idle timeouts, so the artifact never sits silent, and the total
+    // `budget` a legitimate artifact on a slow link fits in.
     let client = reqwest::Client::builder()
         .redirect(policy)
         .connect_timeout(REPO_FETCH_TIMEOUT)
         .read_timeout(REPO_FETCH_TIMEOUT)
+        .timeout(budget)
         .build()
         .map_err(|e| ServiceError::backend(format!("building download client: {e}")))?;
     let response = client
         .get(source_url)
         .send()
         .await
-        .map_err(|e| ServiceError::backend(format!("downloading {source_url}: {e}")))?;
+        .map_err(|e| download_error(source_url, &e))?;
     if !response.status().is_success() {
         return Err(ServiceError::backend(format!(
             "downloading {source_url}: HTTP {}",
@@ -604,6 +624,23 @@ impl FerrofinPluginManager {
             return None;
         }
         self.plugins.iter().find(|p| p.descriptor.id == id)
+    }
+
+    /// Port of `PackageController.IsBundledPlugin` (Jellyfin 12.0): whether a
+    /// non-empty `assembly_guid`, else `name` (`OrdinalIgnoreCase`), names a
+    /// plugin bundled with the server, one reporting `CanUninstall: false`
+    /// (the in-tree providers). No repository publishes one, so querying them
+    /// "can only ever fail, and does so slowly". A compiled-in extension
+    /// reports `true` ([`RegisteredPlugin::new`]) and is not bundled.
+    fn is_bundled_plugin(&self, name: Option<&str>, assembly_guid: Option<Uuid>) -> bool {
+        let plugin = match assembly_guid.filter(|id| !id.is_nil()) {
+            Some(id) => self.find(id),
+            None => name.and_then(|name| {
+                self.live_plugins()
+                    .find(|p| equals_ordinal_ignore_case(&p.descriptor.name, name))
+            }),
+        };
+        plugin.is_some_and(|p| !p.descriptor.can_uninstall)
     }
 
     /// The registered plugins minus the ones uninstalled since the boot.
@@ -1147,6 +1184,10 @@ impl PluginManager for FerrofinPluginManager {
         version: Option<&str>,
         repository_url: Option<&str>,
     ) -> Result<(), ServiceError> {
+        // `InstallPackage` answers `NotFound()` for a bundled plugin first.
+        if self.is_bundled_plugin(Some(name), assembly_guid) {
+            return Err(ServiceError::not_found(format!("package {name}")));
+        }
         let (Some(wasm_dir), Some(validator)) = (&self.wasm_plugins_dir, &self.validator) else {
             return Err(ServiceError::invalid_input(
                 "runtime plugin installation is not available on this server",
@@ -1236,6 +1277,7 @@ impl PluginManager for FerrofinPluginManager {
             chosen,
             loopback_ok,
             self.max_download_bytes,
+            PACKAGE_DOWNLOAD_TIMEOUT,
         )
         .await?;
 
@@ -1323,8 +1365,12 @@ impl PluginManager for FerrofinPluginManager {
             // plugin's configuration AND to violate the contract's
             // `BasePluginConfiguration` object shape.
             serde_json::Value::Null => Ok(()),
-            serde_json::Value::Object(map) => {
-                let projected = project_config(&defaults, &map)?;
+            serde_json::Value::Object(_) => {
+                // Read again keeping each member's raw text, the spelling a
+                // number bound into a string field keeps (`bind_json`).
+                let members = serde_json::from_slice::<Members>(&config)
+                    .map_err(|e| ServiceError::backend(format!("read plugin config: {e}")))?;
+                let projected = project_config(&defaults, &members)?;
                 Self::atomic_write(&self.config_path(id), &projected)?;
                 // `UpdateConfiguration` raises `ConfigurationChanged` after the
                 // save; a consumer's failure is its own.
@@ -1487,13 +1533,18 @@ impl PluginManager for FerrofinPluginManager {
         Ok(packages)
     }
 
-    /// Port of `InstallationManager.FilterPackages` over the aggregated
-    /// catalogue, with a fallback to the compiled-in plugins.
+    /// Port of `PackageController.GetPackageInfo`: `None` for a plugin bundled
+    /// with the server before any repository is fetched, else
+    /// `InstallationManager.FilterPackages` over the aggregated catalogue, with
+    /// a fallback to the compiled-in extensions.
     async fn find_package(
         &self,
         name: Option<&str>,
         assembly_guid: Option<Uuid>,
     ) -> Result<Option<PackageInfo>, ServiceError> {
+        if self.is_bundled_plugin(name, assembly_guid) {
+            return Ok(None);
+        }
         let catalog = self.list_packages().await?;
         if let Some(found) = filter_packages(&catalog, name, assembly_guid) {
             return Ok(Some(found.clone()));
@@ -1625,16 +1676,15 @@ fn merge_config(defaults: &[u8], stored: &[u8]) -> Vec<u8> {
 
 /// Projects a posted configuration object onto the plugin's own schema, the way
 /// `JsonSerializer.DeserializeAsync(Request.Body, configPlugin.ConfigurationType)`
-/// does (v10.11.8 Jellyfin.Api/Controllers/PluginsController.cs:194).
+/// does (v12.4 Jellyfin.Api/Controllers/PluginsController.cs:199).
 ///
-/// A typed deserialize has three consequences a raw byte-store does not, and all
-/// three were observable on the wire:
+/// A typed deserialize has three consequences a raw byte-store does not, all
+/// three observable on the wire, and at every depth ([`bind_object`]):
 ///   * a key the configuration type does not declare is DROPPED — Ferrofin
 ///     round-tripped `{"Bogus":"zzz"}` for ever;
 ///   * a value of the wrong JSON kind THROWS — an array where a number belongs,
 ///     say. A number or a bool posted for a string field is the exception:
-///     upstream's `JsonStringConverter` reads it as its text, which Ferrofin does
-///     not port yet and refuses (gl-774);
+///     `JsonStringConverter` reads it as its text ([`bind_json`]);
 ///   * a key the body omits falls back to the C# property default rather than to
 ///     whatever was stored, which is what the merge onto `defaults` gives.
 ///
@@ -1646,10 +1696,7 @@ fn merge_config(defaults: &[u8], stored: &[u8]) -> Vec<u8> {
 /// document) there is no type to project onto, so the object is stored as it
 /// arrives — the pre-existing behaviour, kept deliberately rather than silently
 /// emptying a schemaless plugin's configuration.
-fn project_config(
-    defaults: &[u8],
-    body: &serde_json::Map<String, serde_json::Value>,
-) -> Result<Vec<u8>, ServiceError> {
+fn project_config(defaults: &[u8], body: &Members) -> Result<Vec<u8>, ServiceError> {
     let Ok(serde_json::Value::Object(schema)) =
         serde_json::from_slice::<serde_json::Value>(defaults)
     else {
@@ -1660,24 +1707,52 @@ fn project_config(
         return serde_json::to_vec(body)
             .map_err(|e| ServiceError::backend(format!("serialize plugin config: {e}")));
     }
-    let mut out = schema;
-    for (key, value) in body {
-        let Some(slot) = out.get_mut(key) else {
-            continue; // unknown key: the deserializer drops it
-        };
-        let Some(bound) = bind_json(slot, value) else {
-            return Err(ServiceError::invalid_input(format!(
-                "plugin configuration field {key} has the wrong type"
-            )));
-        };
-        *slot = bound;
-    }
+    let out = bind_object(&schema, body, true).map_err(|key| {
+        ServiceError::invalid_input(format!(
+            "plugin configuration field {key} has the wrong type"
+        ))
+    })?;
     serde_json::to_vec(&serde_json::Value::Object(out))
         .map_err(|e| ServiceError::backend(format!("serialize plugin config: {e}")))
 }
 
-/// What `value` binds to in the field `slot` types, or `None` where the C#
-/// deserializer throws.
+/// A posted configuration object's members, each kept as its raw JSON text.
+type Members<'a> = BTreeMap<String, &'a RawValue>;
+
+/// Binds each of a posted object's `members` that `schema` declares as
+/// [`bind_json`] does, and drops the others, as the deserializer does. `Err`
+/// names the first member that does not bind.
+///
+/// With `defaults`, `schema`'s values are the type's defaults and fill the
+/// members the object omits. Without, they are an example (a list's first
+/// element, which is data), so an omitted member stays out.
+fn bind_object(
+    schema: &serde_json::Map<String, serde_json::Value>,
+    members: &Members,
+    defaults: bool,
+) -> Result<serde_json::Map<String, serde_json::Value>, String> {
+    let mut out = if defaults {
+        schema.clone()
+    } else {
+        serde_json::Map::new()
+    };
+    for (key, raw) in members {
+        let Some(slot) = schema.get(key) else {
+            continue; // unknown key: the deserializer drops it
+        };
+        let bound = bind_json(slot, raw, defaults).ok_or_else(|| key.clone())?;
+        out.insert(key.clone(), bound);
+    }
+    Ok(out)
+}
+
+/// What the posted JSON `raw` binds to in the field `slot` types, or `None`
+/// where the C# deserializer throws.
+///
+/// A string field also takes a number or a bool, as the token's raw text:
+/// `JsonDefaults` registers `JsonStringConverter` (`JsonDefaults.cs:45`), whose
+/// `Read` returns any token that is not a string as its UTF-8 text, so `1e3`
+/// stays `"1e3"`. An object or an array there throws.
 ///
 /// `JsonDefaults` reads numbers with `NumberHandling = AllowReadingFromString`
 /// (`src/Jellyfin.Extensions/Json/JsonDefaults.cs:34`), so a number field also
@@ -1690,19 +1765,58 @@ fn project_config(
 /// A number field stores a whole number as an integer ([`integral`]), so a
 /// `"15.0"` posted for an `int` field is read back by the provider's integer
 /// field rather than failing its whole configuration.
-fn bind_json(slot: &serde_json::Value, value: &serde_json::Value) -> Option<serde_json::Value> {
+///
+/// The C# binds the whole body into the configuration type, so a nested object
+/// field binds as the configuration does ([`bind_object`]), and a list binds
+/// each element as its default's first element does. Either takes `null`, as a
+/// reference-type property does.
+///
+/// shortcut: the default document is the only schema, so a list whose default is
+/// empty keeps its elements as posted, and a dictionary with default entries
+/// drops the keys it lacks; give plugins a declared schema if one needs either.
+fn bind_json(
+    slot: &serde_json::Value,
+    raw: &RawValue,
+    defaults: bool,
+) -> Option<serde_json::Value> {
+    match slot {
+        serde_json::Value::Object(schema) if !schema.is_empty() => {
+            return match serde_json::from_str::<Option<Members>>(raw.get()).ok()? {
+                Some(members) => bind_object(schema, &members, defaults)
+                    .ok()
+                    .map(serde_json::Value::Object),
+                None => Some(serde_json::Value::Null),
+            };
+        }
+        serde_json::Value::Array(example) if !example.is_empty() => {
+            return match serde_json::from_str::<Option<Vec<&RawValue>>>(raw.get()).ok()? {
+                Some(elements) => elements
+                    .into_iter()
+                    .map(|raw| bind_json(&example[0], raw, false))
+                    .collect::<Option<Vec<_>>>()
+                    .map(serde_json::Value::Array),
+                None => Some(serde_json::Value::Null),
+            };
+        }
+        _ => {}
+    }
+    let value = serde_json::from_str::<serde_json::Value>(raw.get()).ok()?;
     match (slot, value) {
+        (
+            serde_json::Value::String(_),
+            serde_json::Value::Number(_) | serde_json::Value::Bool(_),
+        ) => Some(serde_json::Value::String(raw.get().to_owned())),
         (serde_json::Value::Number(_), serde_json::Value::String(text)) => {
             // No surrounding whitespace, which .NET's number reader rejects too.
             (text.trim() == text)
-                .then(|| serde_json::from_str::<serde_json::Number>(text).ok())
+                .then(|| serde_json::from_str::<serde_json::Number>(&text).ok())
                 .flatten()
                 .map(|number| serde_json::Value::Number(integral(number)))
         }
         (serde_json::Value::Number(_), serde_json::Value::Number(number)) => {
-            Some(serde_json::Value::Number(integral(number.clone())))
+            Some(serde_json::Value::Number(integral(number)))
         }
-        _ => same_json_kind(slot, value).then(|| value.clone()),
+        (slot, value) => same_json_kind(slot, &value).then_some(value),
     }
 }
 
@@ -1790,11 +1904,11 @@ mod tests {
     /// MusicBrainz reads back without `Bogus`.
     #[test]
     fn a_config_write_is_projected_onto_the_plugin_schema() {
+        fn body(json: &str) -> super::Members<'_> {
+            serde_json::from_str(json).unwrap()
+        }
         let defaults =
             br#"{"Server":"https://musicbrainz.org","RateLimit":1,"ReplaceArtistName":false}"#;
-        let body = |json: &str| -> serde_json::Map<String, serde_json::Value> {
-            serde_json::from_str(json).unwrap()
-        };
 
         let full = project_config(defaults, &body(r#"{"RateLimit":9}"#)).unwrap();
         let full: serde_json::Value = serde_json::from_slice(&full).unwrap();
@@ -1848,6 +1962,57 @@ mod tests {
         let raw = project_config(b"{}", &body(r#"{"Anything":[1,2]}"#)).unwrap();
         let raw: serde_json::Value = serde_json::from_slice(&raw).unwrap();
         assert_eq!(raw["Anything"], serde_json::json!([1, 2]));
+    }
+
+    /// The deserializer binds the whole body into the configuration type, so
+    /// every depth binds as the top level does (gl-777): a nested class drops
+    /// the keys it does not declare and keeps its defaults for the ones the post
+    /// omits, a list's elements bind as its default's first element, and a wrong
+    /// kind anywhere refuses the save.
+    #[test]
+    fn a_nested_config_write_is_projected_at_every_depth() {
+        fn project(json: &str) -> Result<serde_json::Value, ServiceError> {
+            let defaults = br#"{"Limits":{"Max":1,"Label":"a"},"Ports":[0],"Tags":["t"],"Rules":[{"Match":"m","Weight":1}],"Free":[]}"#;
+            let body: super::Members<'_> = serde_json::from_str(json).unwrap();
+            project_config(defaults, &body).map(|out| serde_json::from_slice(&out).unwrap())
+        }
+
+        let out =
+            project(r#"{"Limits":{"Max":"5","Bogus":1},"Ports":["1",2],"Tags":[3,true,"x"]}"#)
+                .unwrap();
+        assert_eq!(out["Limits"], serde_json::json!({"Max":5,"Label":"a"}));
+        assert_eq!(out["Ports"], serde_json::json!([1, 2]));
+        assert_eq!(out["Tags"], serde_json::json!(["3", "true", "x"]));
+        // The first default element is an example, not the element type's
+        // defaults: an element's omitted members are not filled from it.
+        let out = project(r#"{"Rules":[{"Match":7,"Extra":1},{"Weight":"2"}]}"#).unwrap();
+        assert_eq!(
+            out["Rules"],
+            serde_json::json!([{"Match":"7"},{"Weight":2}])
+        );
+        // An empty default list has no element type: kept as posted.
+        let out = project(r#"{"Free":[1,"x",{"a":[]}]}"#).unwrap();
+        assert_eq!(out["Free"], serde_json::json!([1, "x", {"a": []}]));
+        // A null class or list is taken, as a C# reference property takes it.
+        let out = project(r#"{"Limits":null,"Ports":null}"#).unwrap();
+        assert!(out["Limits"].is_null() && out["Ports"].is_null(), "{out}");
+
+        for posted in [
+            r#"{"Limits":{"Max":[1]}}"#,
+            r#"{"Limits":{"Label":{}}}"#,
+            r#"{"Limits":[1]}"#,
+            r#"{"Ports":["x"]}"#,
+            r#"{"Ports":{}}"#,
+            r#"{"Tags":[{}]}"#,
+            r#"{"Rules":[1]}"#,
+            r#"{"Rules":[{"Weight":"heavy"}]}"#,
+        ] {
+            let err = project(posted).unwrap_err();
+            assert!(
+                matches!(err, ServiceError::InvalidInput(_)),
+                "{posted}: {err:?}"
+            );
+        }
     }
 
     fn descriptor(id: Uuid, name: &str, enabled: bool) -> PluginDescriptor {
@@ -2076,6 +2241,48 @@ mod tests {
             saved["StillSize"].is_null(),
             "an unset size is null: {saved}"
         );
+    }
+
+    /// `JsonDefaults`' `JsonStringConverter` (v12.4
+    /// `src/Jellyfin.Extensions/Json/Converters/JsonStringConverter.cs`) reads
+    /// a number or a bool posted for a string field as the token's raw text,
+    /// spelling kept; an object or an array there still throws.
+    #[tokio::test]
+    async fn a_string_field_reads_a_number_or_a_bool_as_its_text() {
+        let id = Uuid::from_u128(0x774);
+        let (mgr, _dir) = manager(vec![
+            RegisteredPlugin::new(descriptor(id, "Demo", true), None).with_default_config(
+                br#"{"Server":"https://musicbrainz.org","RateLimit":1}"#.to_vec(),
+            ),
+        ]);
+        for posted in [
+            "5",
+            "1e3",
+            "-0",
+            "5.10",
+            "12345678901234567890123",
+            "true",
+            "false",
+        ] {
+            // Spaced, which the raw text does not include.
+            mgr.set_plugin_configuration(id, format!(r#"{{"Server": {posted} }}"#).into_bytes())
+                .await
+                .expect(posted);
+            let saved: serde_json::Value =
+                serde_json::from_slice(&mgr.get_plugin_configuration(id).await.expect("read"))
+                    .expect("json");
+            assert_eq!(saved["Server"], posted, "{posted} is stored as its text");
+        }
+        for posted in ["{}", "[]", r#"["a"]"#] {
+            let err = mgr
+                .set_plugin_configuration(id, format!(r#"{{"Server":{posted}}}"#).into_bytes())
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(err, ServiceError::InvalidInput(_)),
+                "{posted}: {err:?}"
+            );
+        }
     }
 
     /// A digest `state.json` cannot take is warned about: after a restart the
@@ -2586,6 +2793,83 @@ mod tests {
             .expect("find")
             .expect("resolves by guid");
         assert_eq!(by_guid.name, "Demo");
+    }
+
+    /// `PackageController.IsBundledPlugin`: a plugin bundled with the server
+    /// (`CanUninstall: false`, the in-tree providers) is published to no
+    /// repository, so `GetPackageInfo` and `InstallPackage` answer not-found
+    /// before any repository is fetched: by a non-empty guid, else by name. A
+    /// compiled-in extension reports `CanUninstall: true` and still resolves.
+    #[tokio::test]
+    async fn bundled_plugins_are_not_found_without_fetching_a_repository() {
+        let hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = Arc::clone(&hits);
+        let md5 = ferrofin_common::extensions::md5_hex(b"bytes");
+        let (base, _stop) = raw_server(move |base| {
+            // A repository that does list the bundled plugin's identity.
+            let manifest = manifest_json(base, &md5, None, TEST_ABI);
+            Box::new(move |_request| {
+                counted.fetch_add(1, Ordering::SeqCst);
+                http_ok("application/json", manifest.as_bytes())
+            })
+        });
+        let extension = Uuid::from_u128(0x5EED);
+        let state_dir = tempfile::tempdir().unwrap();
+        let wasm_root = tempfile::tempdir().unwrap();
+        let mgr = FerrofinPluginManager::new(
+            vec![
+                RegisteredPlugin::new(descriptor(PKG_ID, "HelloPkg", true), None).non_removable(),
+                RegisteredPlugin::new(descriptor(extension, "Demo", true), None),
+            ],
+            state_dir.path().to_path_buf(),
+        )
+        .with_installer(
+            wasm_root.path().join("plugins"),
+            Arc::new(StubValidator {
+                id: Ok(PKG_ID),
+                abi: TEST_ABI,
+            }),
+            Arc::new(FlagLifecycle(AtomicBool::new(false))),
+        );
+        mgr.set_repositories(vec![repo("test", &format!("{base}/manifest.json"))])
+            .await
+            .unwrap();
+
+        // By name (OrdinalIgnoreCase), by guid whatever the name, and by name
+        // again when the guid is all zeros (`IsEmpty()`).
+        for (name, guid) in [
+            ("hellopkg", None),
+            ("no-such-package", Some(PKG_ID)),
+            ("HelloPkg", Some(Uuid::nil())),
+        ] {
+            assert!(
+                mgr.find_package(Some(name), guid).await.unwrap().is_none(),
+                "find_package({name}, {guid:?})"
+            );
+            let err = mgr
+                .install_package(name, guid, None, None)
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(err, ServiceError::NotFound(_)),
+                "install_package({name}, {guid:?}): {err}"
+            );
+        }
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            0,
+            "no repository was contacted"
+        );
+
+        // A guid naming another plugin is not a bundled lookup, whatever the
+        // name says; nor is a compiled-in extension, which still resolves.
+        let found = mgr
+            .find_package(Some("HelloPkg"), Some(extension))
+            .await
+            .unwrap()
+            .expect("the extension resolves by guid");
+        assert_eq!(found.owner, "Ferrofin (compiled-in)");
+        assert!(hits.load(Ordering::SeqCst) > 0, "that lookup did fetch");
     }
 
     /// `FilterPackages`' two predicates are ALTERNATIVES and the guid wins; an
@@ -3673,6 +3957,42 @@ mod tests {
         let resp = reqwest::get(format!("{base}/big")).await.unwrap();
         let ok = super::read_capped(resp, 4096, &base).await.unwrap();
         assert_eq!(ok.len(), 2048);
+    }
+
+    /// `InstallationManager.PackageDownloadTimeout`: the artifact download has
+    /// a total budget besides the idle timeouts, so a repository that trickles
+    /// bytes cannot hold an install (or the Update Plugins task) open, and its
+    /// expiry says the download timed out.
+    #[tokio::test]
+    async fn artifact_download_has_a_total_budget() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/plugin.wasm", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0u8; 4096];
+            let _ = stream.read(&mut request).await;
+            let _ = stream
+                .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 100\r\n\r\n")
+                .await;
+            // One byte every 20 ms: never idle long enough for the read timeout.
+            for _ in 0..100 {
+                if stream.write_all(b"x").await.is_err() {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        });
+        let version = ferrofin_model::updates::VersionInfo {
+            version: "1.0.0".to_owned(),
+            checksum: Some("0".repeat(32)),
+            ..Default::default()
+        };
+        let budget = std::time::Duration::from_millis(300);
+        let err = super::download_and_verify(&url, "Slow", &version, true, 1 << 20, budget)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("timed out"), "{err}");
     }
 
     #[tokio::test]

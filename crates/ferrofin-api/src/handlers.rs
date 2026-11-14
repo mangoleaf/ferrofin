@@ -811,6 +811,48 @@ pub const PLUGIN_ROUTES: &[(&str, &str, &str)] = &[
     ("post", "/Ldap/LdapUserSearch", "ldap-auth"),
 ];
 
+/// Every path a handler registers that is neither a contract route nor in
+/// [`PLUGIN_ROUTES`]: the obsolete routes upstream leaves out of its OpenAPI
+/// document (`/Users/{userId}/Items`, …), extension extras, and Ferrofin's own.
+///
+/// ASP.NET matches every route ignoring case, so
+/// [`canonicalize_path`](crate::routes::canonicalize_path) reads this list
+/// too; a test in `routes.rs` keeps it in step with the handlers' route calls.
+pub const UNLISTED_ROUTES: &[&str] = &[
+    "/Ferrofin/Settings",
+    "/Intros/DisabledEpisodes/Update",
+    "/Intros/DisabledEpisodes/{SeasonId}",
+    "/Intros/ExcludedTimestamps/Clear",
+    "/Intros/Show/{MovieId}",
+    "/Items/{itemId}/Collections",
+    "/MediaSegments/Provider/{providerId}",
+    "/Plugins/{pluginId}/web/{*path}",
+    "/Users/{userId}/Authenticate",
+    "/Users/{userId}/Configuration",
+    "/Users/{userId}/FavoriteItems/{itemId}",
+    "/Users/{userId}/GroupingOptions",
+    "/Users/{userId}/Images/{imageType}",
+    "/Users/{userId}/Images/{imageType}/{imageIndex}",
+    "/Users/{userId}/Items",
+    "/Users/{userId}/Items/Latest",
+    "/Users/{userId}/Items/Resume",
+    "/Users/{userId}/Items/Root",
+    "/Users/{userId}/Items/{itemId}",
+    "/Users/{userId}/Items/{itemId}/Intros",
+    "/Users/{userId}/Items/{itemId}/LocalTrailers",
+    "/Users/{userId}/Items/{itemId}/Rating",
+    "/Users/{userId}/Items/{itemId}/SpecialFeatures",
+    "/Users/{userId}/Items/{itemId}/UserData",
+    "/Users/{userId}/Password",
+    "/Users/{userId}/PlayedItems/{itemId}",
+    "/Users/{userId}/PlayingItems/{itemId}",
+    "/Users/{userId}/PlayingItems/{itemId}/Progress",
+    "/Users/{userId}/Suggestions",
+    "/Users/{userId}/Views",
+    "/embywebsocket",
+    "/socket",
+];
+
 /// `(method, path, extension-id)` for every route owned by a **compiled-in
 /// extension** (`ferrofin-extensions`); core routes are everything in
 /// [`REAL_ROUTES`] not listed here.
@@ -904,11 +946,6 @@ pub const VERIFIED_AGAINST_EARLIER_PIN: &[(&str, &str, &str)] = &[
     // gl-884: a malformed genreIds/studioIds token is a 400, not dropped.
     ("get", "/Artists", "v12.2"),
     ("get", "/Artists/AlbumArtists", "v12.2"),
-    // gl-408: parameters these actions do not declare are bound (a 400 on a
-    // bad value).
-    ("get", "/Genres", "v12.2"),
-    ("get", "/MusicGenres", "v12.2"),
-    ("get", "/Studios", "v12.2"),
     // gl-762: livetv lists tuners and listing providers by id, not as added.
     ("get", "/System/Configuration/{key}", "v12.2"),
 ];
@@ -985,6 +1022,38 @@ pub struct VerifiedSubsystem {
 /// [`VERIFIED_SUBSYSTEMS_AGAINST_EARLIER_PIN`] names), under the rules of
 /// [`VERIFIED`]. Subsystem rows never count towards the operation parity line.
 pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
+    VerifiedSubsystem {
+        key: "paging-sort",
+        upstream_file: "Jellyfin.Api/Helpers/RequestHelpers.cs",
+        upstream_method: "GetOrderBy",
+        ferrofin: "How sortBy and sortOrder pair into an order: handlers/query_parse.rs \
+                   get_order_by (no keys, no pairs; a key takes the order at its index, the \
+                   keys past the last order the first order, else Ascending) and \
+                   parse_order_by (CommaDelimitedCollectionModelBinder's single-value arm, \
+                   parse_csv_enums_lenient: split on commas with empty entries dropped, each \
+                   trimmed, a name in any case or a C# value, a token that does not convert \
+                   dropped), for /Items, /Trailers, /Years, /Artists, /Artists/AlbumArtists, \
+                   /Genres, /MusicGenres, /Items/{itemId}/ThemeSongs, ThemeVideos and \
+                   ThemeMedia and GET /LiveTv/Programs; get_order_by alone after POST \
+                   /LiveTv/Programs' JSON body and after activity_log.rs's strict binder for \
+                   /System/ActivityLog/Entries. Compared with GetOrderBy, \
+                   RequestHelpersTests.GetOrderBy_Success, CommaDelimitedCollectionModelBinder \
+                   and the GetOrderBy calls in ItemsController (TrailersController through it), \
+                   YearsController, ArtistsController, GenresController, \
+                   MusicGenresController, LibraryController, LiveTvController and \
+                   ActivityLogController at the pinned v12.4 tag. ChannelsController's call has \
+                   no counterpart: with no channel provider ported, GET \
+                   /Channels/{channelId}/Items answers 400 whatever the sort, as upstream does \
+                   after pairing. A key repeated in the query is the \
+                   shared query extractor's (crate::query), and paging (startIndex, limit) and \
+                   what each key sorts by are not part of this row.",
+        date: "2026-11-13",
+        divergences: &[
+            "A sortOrder with more entries than a non-empty sortBy has keys has the extra \
+             entries ignored; upstream's GetOrderBy indexes past the sortBy array, which \
+             throws ArgumentOutOfRangeException, and answers 400. Jellyfin bug not ported.",
+        ],
+    },
     VerifiedSubsystem {
         key: "recording-keep-up-to",
         upstream_file: "src/Jellyfin.LiveTv/Recordings/RecordingsManager.cs",
@@ -1088,7 +1157,10 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
                    sync_season_name, remember_series_folder, locale_parent (GetParents, \
                    GetCollectionFolders, read by resolve_metadata_locale); \
                    apply_parental_rating_score and \
-                   inherit_stored_rating; keep_stored_series_key. Compared with \
+                   inherit_stored_rating; keep_stored_series_key; series_display_order \
+                   (an unread series skips its children's TheTVDB lookups, counting no \
+                   failure). Compared with \
+                   MediaBrowser.Controller/Entities/TV/Episode.cs (GetLookupInfo), \
                    MediaBrowser.Controller/LibraryTaskScheduler/\
                    LimitedConcurrencyLibraryScheduler.cs (ProcessItem), \
                    MediaBrowser.Controller/Entities/Folder.cs (RunTasks, \
@@ -1097,10 +1169,10 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
                    GetPreferredMetadataLanguage, GetPreferredMetadataCountryCode, GetParents), \
                    MediaBrowser.Providers/Manager/ProviderManager.cs (RefreshItem), \
                    MediaBrowser.Providers/Manager/MetadataService.cs (RefreshMetadata), \
-                   MediaBrowser.Controller/Entities/TV/Season.cs (FindSeriesName), \
+                   MediaBrowser.Controller/Entities/TV/Season.cs (FindSeriesName, GetLookupInfo), \
                    MediaBrowser.Controller/Entities/BaseItem.cs (GetParentalRatingScore) and \
                    MediaBrowser.Providers/TV/EpisodeMetadataService.cs (BeforeSaveInternal)",
-        date: "2026-11-09",
+        date: "2026-11-13",
         divergences: &[
             "An item whose parent chain cannot be read is scored from its own rating and \
              country, an ancestor's custom rating not counting, else takes the score stored on \
@@ -1113,6 +1185,12 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
              the server, so an override on the unreadable row or above it goes unused and the \
              child is fetched, and stamped, in that locale, where upstream's read of such a \
              row would throw into the per-child catch and the item would not refresh.",
+            "An episode, or a season whose refresh reaches its TheTVDB lookups, whose series \
+             row cannot be read is refreshed and stamped without TheTVDB's answer, as \
+             upstream treats a child with no series (GetLookupInfo sets no \
+             SeriesProviderIds, and jellyfin-plugin-tvdb 5c4592f returns an empty result), \
+             where upstream's read of such a row would throw into the per-child catch and \
+             the item would not refresh.",
             "A stored item whose refresh stops after its row was saved (a failed write, a \
              cancel, a crash) is left with no DateLastRefreshed, which the scan clears for the \
              save and writes back last, so the next scan retries it as a first refresh where \
@@ -1306,8 +1384,9 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
                    program_images_update, manager.rs add_provider_metadata; ferrofin-traits \
                    item_image_info.rs live_tv_image_is_internal, read by handlers/images.rs \
                    live_tv_image_is_servable, ferrofin-providers provider_manager.rs \
-                   delete_image and ferrofin-core dto_service.rs primary_image_aspect_ratio \
-                   and dynamic_images.rs local_images). ferrofin-drawing processor.rs \
+                   delete_image and ferrofin-core dto_service.rs primary_image_aspect_ratio, \
+                   dynamic_images.rs local_images and item_repository.rs \
+                   swap_item_images). ferrofin-drawing processor.rs \
                    get_image_cache_tag (the owning \
                    item's path, null as empty) and get_image_cache_tag_for_path (md5 of the \
                    UTF-16 path + DateModified ticks, as a .NET Guid \"N\") ← ferrofin-core \
@@ -1328,7 +1407,8 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
                    Jellyfin.Server.Implementations/Item/ChapterRepository.cs (Map), \
                    Jellyfin.Api/Controllers/ImageController.cs (GetItemImageInfos), \
                    Jellyfin.Api/Controllers/SearchController.cs (GetSearchHintResult), \
-                   MediaBrowser.Controller/Entities/BaseItem.cs (DeleteImageAsync), \
+                   MediaBrowser.Controller/Entities/BaseItem.cs (DeleteImageAsync, \
+                   SwapImagesAsync), \
                    Emby.Server.Implementations/Images/BaseDynamicImageProvider.cs \
                    (GetStripCollageImagePaths), \
                    src/Jellyfin.LiveTv/LiveTvDtoService.cs (GetImageTag), \
@@ -1342,7 +1422,7 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
                    MediaBrowser.Providers/Manager/ProviderManager.cs (SaveImage), \
                    Jellyfin.Server/Startup.cs (the NamedClient.Default handler) and \
                    Emby.Server.Implementations/Library/LibraryManager.cs (ConvertImageToLocal)",
-        date: "2026-11-11",
+        date: "2026-11-13",
         divergences: &[
             "Decoding and resizing run under limits upstream does not have (owner decision \
              2026-10-31, gl-1097), the settings image_decode_max_megapixels, \
@@ -1391,8 +1471,10 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
              row and leaves the file, where DeleteImageAsync deletes any local file. A Primary \
              with no stored size reports the kind's default PrimaryImageAspectRatio, as a file \
              that cannot be read does, where GetPrimaryImageAspectRatio opens it. A collage \
-             skips it, where GetStripCollageImagePaths draws any local file. Same Jellyfin bug \
-             as the entry above, not ported.",
+             skips it, where GetStripCollageImagePaths draws any local file. A reorder \
+             exchanges two rows' files only when both are in that directory, and otherwise does \
+             nothing, where SwapImagesAsync swaps any local files. Same Jellyfin bug as the \
+             entry above, not ported.",
         ],
     },
     VerifiedSubsystem {
@@ -1580,7 +1662,12 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
                    literal, in any case, as ASP.NET matches it), static_or_transcode and \
                    serve_static_source (the static branches of VideosController.GetVideoStream \
                    and AudioHelper.GetAudioStream: open live stream, remote source, other \
-                   protocol, file, and for video alone the disc-folder exception) and \
+                   protocol, file, and for video alone the disc-folder exception), with \
+                   static_content_type, the type a file answers with (GetMimeType(\".\" + \
+                   OutputContainer, false) ?? GetMimeType(MediaPath), the container as \
+                   StreamingHelpers.GetStreamingState sets it, compared 2026-11-13; a type \
+                   the ported MimeTypes table lacks keeps tower-http's guess from the path, \
+                   gl-1750) and \
                    handlers/hls.rs transcode_stream_fallback \
                    (FileStreamResponseHelpers.GetTranscodedFile, which answers a HEAD before \
                    ffmpeg), which the transcode branch of /Audio/{itemId}/universal also \
@@ -1932,7 +2019,7 @@ pub const VERIFIED: &[Verified] = &[
                (item_values_with_counts, item_counts_by_clean_name)",
         date: "2026-10-25",
         divergences: BY_NAME_DIVERGENCES_ARTISTS,
-        refs: &["images", "access-filtering"],
+        refs: &["images", "access-filtering", "paging-sort"],
     },
     Verified {
         method: "get",
@@ -1945,42 +2032,45 @@ pub const VERIFIED: &[Verified] = &[
                item_repository.rs get_album_artists (item_values_with_counts)",
         date: "2026-10-25",
         divergences: BY_NAME_DIVERGENCES_ARTISTS,
-        refs: &["images", "access-filtering"],
+        refs: &["images", "access-filtering", "paging-sort"],
     },
     Verified {
         method: "get",
         path: "/Genres",
         upstream_file: "Jellyfin.Api/Controllers/GenresController.cs",
         upstream_method: "GetGenres",
-        ferrofin: "handlers/genres.rs get_genres (items.rs resolve_user_or_api_key; \
+        ferrofin: "handlers/genres.rs get_genres (by_name.rs ValueListQuery::genres: the \
+               declared parameters only; items.rs resolve_user_or_api_key; \
                music/musicvideos library parent → get_music_genres) → handlers/by_name.rs → \
                ferrofin-core item_repository.rs get_genres / get_music_genres \
                (item_values_with_counts)",
-        date: "2026-10-25",
+        date: "2026-11-13",
         divergences: BY_NAME_DIVERGENCES_GENRES_STUDIOS,
-        refs: &["images", "access-filtering"],
+        refs: &["images", "access-filtering", "paging-sort"],
     },
     Verified {
         method: "get",
         path: "/MusicGenres",
         upstream_file: "Jellyfin.Api/Controllers/MusicGenresController.cs",
         upstream_method: "GetMusicGenres",
-        ferrofin: "handlers/music_genres.rs get_music_genres (items.rs \
+        ferrofin: "handlers/music_genres.rs get_music_genres (by_name.rs \
+               ValueListQuery::genres: the declared parameters only; items.rs \
                resolve_user_or_api_key) → handlers/by_name.rs → ferrofin-core \
                item_repository.rs get_music_genres (item_values_with_counts)",
-        date: "2026-10-25",
+        date: "2026-11-13",
         divergences: BY_NAME_DIVERGENCES_GENRES_STUDIOS,
-        refs: &["images", "access-filtering"],
+        refs: &["images", "access-filtering", "paging-sort"],
     },
     Verified {
         method: "get",
         path: "/Studios",
         upstream_file: "Jellyfin.Api/Controllers/StudiosController.cs",
         upstream_method: "GetStudios",
-        ferrofin: "handlers/studios.rs get_studios (items.rs resolve_user_or_api_key) → \
+        ferrofin: "handlers/studios.rs get_studios (by_name.rs ValueListQuery::studios: \
+               the declared parameters only; items.rs resolve_user_or_api_key) → \
                handlers/by_name.rs → ferrofin-core item_repository.rs get_studios \
                (item_values_with_counts)",
-        date: "2026-10-25",
+        date: "2026-11-13",
         divergences: BY_NAME_DIVERGENCES_GENRES_STUDIOS,
         refs: &["images", "access-filtering"],
     },
@@ -2911,7 +3001,7 @@ pub const VERIFIED: &[Verified] = &[
         upstream_file: "Jellyfin.Api/Controllers/LiveTvController.cs",
         upstream_method: "GetLiveTvPrograms",
         ferrofin: "handlers/live_tv.rs get_programs (ProgramsQuery::into_parts: parse_csv_uuids, \
-               parse_pipe_strings, parse_csv_enums_lenient, pair_order_by, \
+               parse_pipe_strings, parse_csv_enums_lenient, query_parse.rs parse_order_by, \
                program_dto_options; items.rs resolve_user_opt) → query_programs_inner (the \
                StartDate default order, the librarySeriesId block) → ferrofin-livetv \
                manager.rs get_programs (stored_series_timer for seriesTimerId, \
@@ -2945,9 +3035,6 @@ pub const VERIFIED: &[Verified] = &[
          score, DateCreated, PremiereDate, CommunityRating, Runtime and the rest by their \
          columns, drops Default (SortName when no key is left) and breaks ties on the sort \
          name. Fix path: gl-1688.",
-            "A sortOrder with more entries than a non-empty sortBy has keys has the extra \
-         entries ignored; upstream's GetOrderBy indexes past the sortBy array and answers \
-         500 (IndexOutOfRangeException). Jellyfin bug not ported.",
             "enableTotalRecordCount=false with a startIndex reports the page's length plus \
          startIndex as TotalRecordCount; upstream's QueryItems reads GetItemList and \
          reports the page's length. Fix path: gl-1689.",
@@ -2973,7 +3060,7 @@ pub const VERIFIED: &[Verified] = &[
          without the administrator role) bodies are Ferrofin's error shape, not upstream's. \
          Fix path: gl-666.",
         ],
-        refs: &["access-filtering", "images"],
+        refs: &["access-filtering", "images", "paging-sort"],
     },
     Verified {
         method: "post",
@@ -2981,7 +3068,7 @@ pub const VERIFIED: &[Verified] = &[
         upstream_file: "Jellyfin.Api/Controllers/LiveTvController.cs",
         upstream_method: "GetPrograms",
         ferrofin: "handlers/live_tv.rs post_programs (GetProgramsDto::into_parts, \
-               pair_order_by, program_dto_options; items.rs resolve_user_opt for a non-nil \
+               get_order_by, program_dto_options; items.rs resolve_user_opt for a non-nil \
                body UserId only) → query_programs_inner (the StartDate default order, the \
                LibrarySeriesId block) → ferrofin-livetv manager.rs get_programs \
                (stored_series_timer for SeriesTimerId, user_restrictions, program_rows_query \
@@ -3024,9 +3111,6 @@ pub const VERIFIED: &[Verified] = &[
          score, DateCreated, PremiereDate, CommunityRating, Runtime and the rest by their \
          columns, drops Default (SortName when no key is left) and breaks ties on the sort \
          name. Fix path: gl-1688.",
-            "A SortOrder with more entries than a non-empty SortBy has keys has the extra \
-         entries ignored; upstream's GetOrderBy indexes past the SortBy array and answers \
-         500 (IndexOutOfRangeException). Jellyfin bug not ported.",
             "EnableTotalRecordCount=false with a StartIndex reports the page's length plus \
          StartIndex as TotalRecordCount; upstream's QueryItems reads GetItemList and \
          reports the page's length. Fix path: gl-1689.",
@@ -3049,7 +3133,7 @@ pub const VERIFIED: &[Verified] = &[
             "The 400 (a body that does not bind) body is Ferrofin's error shape, not \
          upstream's. Fix path: gl-666.",
         ],
-        refs: &["access-filtering", "images"],
+        refs: &["access-filtering", "images", "paging-sort"],
     },
     Verified {
         method: "delete",
@@ -3762,8 +3846,6 @@ pub const VERIFIED: &[Verified] = &[
                ferrofin-model dto/display_preferences_dto.rs",
         date: "2026-10-30",
         divergences: &[
-            "A missing or empty skipBackLength/skipForwardLength stores 10000/30000 ms; \
-         upstream's controller stores 15000 for both. Fix path: gl-410.",
             "Values upstream fails on with a 500 take the defaults here: an \
          enableNextVideoInfoOverlay that is not true/false (bool.Parse) is true, a \
          non-numeric or overflowing skip length (int.Parse) is the fallback, a homesection \
@@ -4450,6 +4532,30 @@ pub const VERIFIED: &[Verified] = &[
         refs: &[],
     },
     Verified {
+        method: "get",
+        path: "/Library/MediaFolders",
+        upstream_file: "Jellyfin.Api/Controllers/LibraryController.cs",
+        upstream_method: "GetMediaFolders",
+        ferrofin: "handlers/library.rs get_media_folders (RequireAdmin, \
+               Policies.RequiresElevation; no user read, so an API key is served; isHidden \
+               keeps the folders whose IsHidden equals it, true only for PlaylistsFolder \
+               under either stored spelling) → ferrofin-core user_view_manager.rs \
+               get_media_folders (root_children for GetUserRootFolder().Children and \
+               RootFolder.VirtualChildren, the Live TV view left out; item_visibility.rs \
+               without_disabled_libraries for GetLibraryOptions(i).Enabled, which the \
+               playlists folder always passes; OrderBy(i => i.SortName) as a stable sort \
+               of the libraries then the playlists folder by item_repository.rs \
+               folder_sort_name under the request culture's comparer) → \
+               DtoService get_base_item_dtos with DtoOptions::default() and no user (new \
+               DtoOptions(), no UserData) → QueryResult::from_items",
+        date: "2026-11-13",
+        divergences: &[
+            "The 400 (an isHidden value the query binder cannot convert), 401 and 403 bodies \
+         are Ferrofin's error shape, not upstream's. Fix path: gl-666.",
+        ],
+        refs: &["images"],
+    },
+    Verified {
         method: "post",
         path: "/Items/RemoteSearch/MusicAlbum",
         upstream_file: "Jellyfin.Api/Controllers/ItemLookupController.cs",
@@ -4514,6 +4620,33 @@ pub const VERIFIED: &[Verified] = &[
         ],
         refs: &[],
     },
+    Verified {
+        method: "get",
+        path: "/Playback/BitrateTest",
+        upstream_file: "Jellyfin.Api/Controllers/MediaInfoController.cs",
+        upstream_method: "GetBitrateTestBytes",
+        ferrofin: "handlers/media_info.rs get_bitrate_test (RequireAuth, the controller's \
+               [Authorize]; crate::query::Query binds size case-insensitively, an empty value \
+               refused as for the non-nullable int) → size defaults to 102400 and must be in \
+               [1, 100000000] ([Range]), else 400 → size random bytes (rand::fill, \
+               Random.Shared.NextBytes) as application/octet-stream \
+               (MediaTypeNames.Application.Octet), which the response compression skips as \
+               ResponseCompressionDefaults.MimeTypes does",
+        date: "2026-11-13",
+        divergences: &[
+            "The body is exactly size bytes. Upstream sends the whole buffer it rents from \
+         ArrayPool<byte>.Shared, which is rounded up to a power of two (about 131072 bytes \
+         for the default 102400), so a client dividing the requested size by the download \
+         time under-reports its bandwidth. Jellyfin bug not ported.",
+            "Upstream returns that buffer to the pool in a finally before the File result is \
+         written, so a concurrent request can rent and overwrite it mid-response. Ferrofin's \
+         buffer belongs to its response. Jellyfin bug not ported.",
+            "The 400 for a size out of range or that does not bind (upstream's \
+         ValidationProblemDetails), and the 401 body, are Ferrofin's error shape, not \
+         upstream's. Fix path: gl-666.",
+        ],
+        refs: &[],
+    },
 ];
 
 /// What `/Artists` and `/Artists/AlbumArtists` do differently from v12's
@@ -4548,16 +4681,15 @@ const BY_NAME_DIVERGENCES_ARTISTS: &[&str] = &[
 ];
 
 /// What `/Genres`, `/MusicGenres` and `/Studios` do differently from their v12
-/// controllers + `GetItemValues`. These controllers take a subset of the
-/// Artists parameters; Ferrofin's shared query struct accepts the superset.
+/// controllers + `GetItemValues`. They bind only the parameters those
+/// controllers declare (`by_name.rs` `ValueListQuery`).
 const BY_NAME_DIVERGENCES_GENRES_STUDIOS: &[&str] = &[
+    "The 400 (a value the query binder cannot convert, or a parentId naming no item) and \
+     403 (another user's id without the administrator role) bodies are Ferrofin's error \
+     shape, not upstream's. Fix path: gl-666.",
     "A `userId` naming no user: v12's GetUserById returns null and the query runs with no \
      user — unscoped, every library on the server; Ferrofin answers 404. Jellyfin bug not \
      ported.",
-    "The shared query struct honors `filters`, `mediaTypes`, `genres`, `tags`, `years`, \
-     `officialRatings`, `genreIds`, `studioIds` — and, for /Studios, `sortBy`/`sortOrder` — \
-     which these v12 controllers do not declare (ASP.NET ignores them). A client sending \
-     one gets a narrowed or re-ordered list here and the full SortName-ordered list there.",
     "A `parentId` that is not a folder: v12 puts it in ItemIds; Ferrofin scopes by \
      AncestorIds in every case, so a non-folder parent answers with nothing. Fix path: \
      gl-971.",
@@ -4727,7 +4859,9 @@ const _: () = assert!(
 ///
 /// Called by [`create_router`](crate::router::create_router) after its stub
 /// loop, which skips the `501` stub for each [`REAL_ROUTES`] row, so a real
-/// handler is the sole route for its `(method, path)`.
+/// handler is the sole route for its `(method, path)`. A path outside the
+/// contract is listed in [`UNLISTED_ROUTES`] (or [`PLUGIN_ROUTES`]), so it
+/// matches ignoring case.
 pub fn register(router: Router<AppState>) -> Router<AppState> {
     let router = users::register(router);
     let router = user_views::register(router);

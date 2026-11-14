@@ -321,8 +321,8 @@ pub async fn channel_user_data(
         .collect())
 }
 
-/// One channel of a tuner host's stored lineup, as the channel-mapping and
-/// guide-binding paths need it.
+/// One channel of a tuner host's stored lineup, as the guide-binding path
+/// needs it.
 ///
 /// The stored [`id`](Self::id) is Ferrofin's internal channel key;
 /// [`external_id`](Self::external_id) is the `ChannelInfo.Id` the owning
@@ -389,10 +389,9 @@ pub async fn channel_recommendation_data(
 
 /// One tuner host's stored lineup, in playlist order.
 ///
-/// Backs the port of `ListingsManager.GetChannelsForListingsProvider`, which
-/// upstream re-parses the tuner's M3U on every call; Ferrofin already caches
-/// the parse in this table, so the same `ChannelInfo` fields are read back
-/// from it.
+/// Backs the guide refresh's channel binding, which reads it right after the
+/// refresh stored the lineup it fetched. The channel-mapping dialog reads each
+/// tuner live instead, as upstream's `GetChannelsForListingsProvider` does.
 ///
 /// # Errors
 ///

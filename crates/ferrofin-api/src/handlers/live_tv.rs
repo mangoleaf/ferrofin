@@ -54,7 +54,9 @@ use crate::auth::{RequireAdmin, RequireLiveTvAccess, RequireLiveTvManagement};
 use crate::error::ApiError;
 use crate::extract::{DotnetGuid, JsonBody, Query, RequiredRouteString, RouteParameter};
 use crate::handlers::items::{require_visible_item, resolve_user_opt};
-use crate::handlers::query_parse::{parse_csv_enums_lenient, parse_csv_uuids, parse_pipe_strings};
+use crate::handlers::query_parse::{
+    get_order_by, parse_csv_enums_lenient, parse_csv_uuids, parse_order_by, parse_pipe_strings,
+};
 use crate::state::AppState;
 
 /// `GET /LiveTv/Info` — top-level Live TV status.
@@ -337,10 +339,7 @@ impl ProgramsQuery {
             is_sports: self.is_sports,
             start_index: self.start_index,
             limit: self.limit,
-            order_by: pair_order_by(
-                parse_csv_enums_lenient(self.sort_by.as_deref()),
-                &parse_csv_enums_lenient(self.sort_order.as_deref()),
-            ),
+            order_by: parse_order_by(self.sort_by.as_deref(), self.sort_order.as_deref()),
             genres: parse_pipe_strings(self.genres.as_deref()),
             genre_ids: parse_csv_uuids(self.genre_ids.as_deref())?,
             series_timer_id: self.series_timer_id,
@@ -478,7 +477,7 @@ impl GetProgramsDto {
             is_sports: self.is_sports,
             start_index: self.start_index,
             limit: self.limit,
-            order_by: pair_order_by(
+            order_by: get_order_by(
                 self.sort_by.unwrap_or_default(),
                 &self.sort_order.unwrap_or_default(),
             ),
@@ -624,26 +623,6 @@ struct ProgramFilters {
     library_series_id: Option<Uuid>,
     /// Whether the total record count is computed.
     enable_total_record_count: bool,
-}
-
-/// Pairs sort columns with sort orders.
-///
-/// Mirrors `RequestHelpers.GetOrderBy`: each column takes the order at its own
-/// index, and columns beyond the supplied orders are padded with the **first**
-/// requested order (ascending when none was supplied).
-fn pair_order_by(columns: Vec<ItemSortBy>, orders: &[SortOrder]) -> Vec<(ItemSortBy, SortOrder)> {
-    columns
-        .into_iter()
-        .enumerate()
-        .map(|(i, column)| {
-            let order = orders
-                .get(i)
-                .or_else(|| orders.first())
-                .copied()
-                .unwrap_or(SortOrder::Ascending);
-            (column, order)
-        })
-        .collect()
 }
 
 /// Builds the [`DtoOptions`] for a program query.
@@ -2858,6 +2837,7 @@ mod tests {
             is_live_stream: true,
             is_infinite_stream: false,
             user_agent: None,
+            container: None,
         };
 
         let response = serve_static_source(

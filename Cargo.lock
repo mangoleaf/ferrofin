@@ -1239,6 +1239,7 @@ dependencies = [
  "opentelemetry",
  "opentelemetry_sdk",
  "percent-encoding",
+ "rand 0.10.3",
  "reqwest",
  "rstest",
  "serde",
@@ -1257,7 +1258,6 @@ dependencies = [
  "url",
  "utoipa",
  "uuid",
- "zip",
 ]
 
 [[package]]

@@ -15,7 +15,10 @@ one real clients (jellyfin-web, Swiftfin, Findroid, Wolphin, …) are built agai
     registered table must not contain paths outside the spec, and a live probe checks
     nothing 404s.
   - `crates/ferrofin-api/src/contract_routes.rs` — generated from this file.
-  - `apps/ferrofin-server` — embeds it and serves it at `/api-docs/openapi.json`.
+  - `apps/ferrofin-server` — embeds it to label metrics with each operation's controller and
+    action. `/api-docs/openapi.json` serves `ferrofin-api`'s own utoipa document instead, under
+    upstream's `info`: title `Jellyfin API`, and `version` and `x-jellyfin-version` set to the
+    version `/System/Info` reports.
   - DTO work in `ferrofin-model`: `jq '.components.schemas.<Type>' contracts/jellyfin-openapi-10.11.8.json`
     is the oracle for field names, casing and nullability.
 

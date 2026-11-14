@@ -660,9 +660,14 @@ pub trait ItemRepository: Send + Sync {
     /// when `GetImageInfo` returns `null`); so is a slot against itself, whose
     /// file copy onto itself would throw upstream.
     ///
+    /// The files are the rows' paths expanded (`%MetadataPath%`,
+    /// `%AppDataPath%`), as upstream's `info.Path` is.
+    ///
     /// Returns whether the two files were swapped — the only case in which
     /// upstream reaches its repository save. A missing slot, or a non-local
-    /// (remote) path on either side, is "nothing to do".
+    /// (remote) path on either side, is "nothing to do", and so is a Live TV
+    /// item's file outside the internal metadata directory
+    /// ([`live_tv_image_is_internal`](crate::options::live_tv_image_is_internal)).
     ///
     /// # Errors
     ///

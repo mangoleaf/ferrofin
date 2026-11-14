@@ -651,6 +651,18 @@ mod tests {
     #[case("Ａｂｃ", "ａｂｃ")] // fullwidth letters lowercase and survive
     #[case("  padded  ", "padded")]
     #[case("tab\tand\nnewline", "tab and newline")]
+    // Upstream `SearchPunctuationTests.cs` (jellyfin/jellyfin PR 14879), the
+    // C# expected values verbatim.
+    #[case("Mr. Robot", "mr robot")]
+    #[case("Spider-Man: Homecoming", "spider man homecoming")]
+    #[case("Beyoncé — Live!", "beyonce live")]
+    #[case("Hello, World!", "hello world")]
+    #[case("(The) Good, the Bad & the Ugly", "the good the bad the ugly")]
+    #[case("Wall-E", "wall e")]
+    #[case("No. 1: The Beginning", "no 1 the beginning")]
+    #[case("Café-au-lait", "cafe au lait")]
+    #[case("Face/Off", "face off")]
+    #[case("V/H/S", "v h s")]
     fn get_clean_value_normalizes(#[case] input: &str, #[case] expected: &str) {
         assert_eq!(expected, get_clean_value(input));
     }

@@ -114,21 +114,29 @@ pub trait StorageProbe: Send + Sync {
 ///
 /// ```text
 /// try {
-///     var driveInfo = new DriveInfo(path);
-///     FreeSpace   = driveInfo.AvailableFreeSpace;
-///     UsedSpace   = driveInfo.TotalSize - driveInfo.AvailableFreeSpace;
-///     StorageType = driveInfo.DriveType.ToString();
-///     DeviceId    = driveInfo.Name;
+///     var resolvedPath = ResolvePath(path);
+///     DriveInfo? bestMatch = /* the deepest of DriveInfo.GetDrives() containing resolvedPath */;
+///     if (bestMatch is null) throw new InvalidOperationException(...);
+///     FreeSpace   = bestMatch.AvailableFreeSpace;
+///     UsedSpace   = bestMatch.TotalSize - bestMatch.AvailableFreeSpace;
+///     StorageType = bestMatch.DriveType.ToString();
+///     DeviceId    = bestMatch.Name;
 /// } catch {
 ///     FreeSpace = -1; UsedSpace = -1; StorageType = null; DeviceId = null;
 /// }
 /// ```
 ///
-/// There is deliberately **no** walk up to the nearest existing ancestor: in C#
-/// a path that does not exist makes `AvailableFreeSpace` throw and the catch arm
-/// reports `-1`. `DriveInfo.Name` on Unix is the constructor argument verbatim
-/// (`NormalizeDriveName` only rejects empty/NUL names), so `DeviceId` is the
-/// path exactly as passed in — not the canonicalized one.
+/// `DeviceId` is the mount point of the filesystem holding the folder, so
+/// folders that share a disk show the same one. There is deliberately **no**
+/// walk up to the nearest existing ancestor: in C# a path that does not exist
+/// makes `ResolvePath` throw and the catch arm reports `-1`. The byte counts
+/// come from the folder itself, which is on that mount. One deliberate
+/// difference: a folder no listed mount contains keeps its own byte counts,
+/// with `StorageType` `Unknown` and no `DeviceId`, where upstream's
+/// `bestMatch is null` throw reports `-1`. That happens only where the mount
+/// table cannot be read (only `/proc/mounts` and `/etc/mtab` are read, which
+/// macOS lacks) or a chroot hides `/`, and there the `-1` would also refuse
+/// every backup (`free_space_of`).
 #[derive(Debug, Clone, Copy, Default)]
 pub struct FsStorageProbe;
 
@@ -148,20 +156,24 @@ impl FsStorageProbe {
                 device_id: None,
             };
         };
-        // `driveInfo.DriveType.ToString()`. An unresolvable filesystem is
-        // `DriveType.Unknown`, the C# table's default arm — never a missing key.
-        let storage_type = crate::mount_table::fs_type_for_path(mounts, &resolved_path)
-            .map_or(crate::mount_table::DriveType::Unknown, |t| {
-                crate::mount_table::drive_type(t)
-            })
-            .to_string();
+        // No containing mount (a mount table this platform cannot read, or a
+        // chroot that hides `/`): upstream's `bestMatch is null` throws into the
+        // catch arm, but the folder's own byte counts are the better answer.
+        // `DriveType.Unknown` is the C# table's default arm.
+        let mount = crate::mount_table::mount_for_path(mounts, &resolved_path);
         FolderStorageInfo {
             path: path.to_owned(),
             resolved_path,
             free_space,
             used_space,
-            storage_type: Some(storage_type),
-            device_id: Some(path.to_owned()),
+            storage_type: Some(
+                mount
+                    .map_or(crate::mount_table::DriveType::Unknown, |m| {
+                        crate::mount_table::drive_type(&m.fs_type)
+                    })
+                    .to_string(),
+            ),
+            device_id: mount.map(|m| m.target.clone()),
         }
     }
 }
@@ -414,22 +426,6 @@ impl FerrofinSystemManager {
     }
 }
 
-/// The host OS name in Jellyfin's `SystemInfo.OperatingSystem` vocabulary
-/// (`Windows` / `OSX` / `BSD` / `Linux`).
-///
-/// jellyfin-web's directory browser calls `.toLowerCase()` on this field
-/// unconditionally when opening the folder picker, so it must never be null —
-/// a `None` here throws `undefined.toLowerCase()` and the picker never opens.
-fn host_operating_system() -> &'static str {
-    match std::env::consts::OS {
-        "linux" => "Linux",
-        "macos" => "OSX",
-        "windows" => "Windows",
-        "freebsd" | "openbsd" | "netbsd" | "dragonfly" => "BSD",
-        other => other,
-    }
-}
-
 #[async_trait]
 impl ferrofin_traits::system::SystemManager for FerrofinSystemManager {
     async fn get_system_info(&self, request: &RequestContext) -> Result<SystemInfo, ServiceError> {
@@ -460,7 +456,7 @@ impl ferrofin_traits::system::SystemManager for FerrofinSystemManager {
             log_path: Some(self.paths.log_directory_path()),
             transcoding_temp_path: Some(transcode),
             cast_receiver_applications: Some(cfg.cast_receiver_applications.clone()),
-            operating_system: Some(host_operating_system().to_owned()),
+            // The obsolete members keep upstream's initialisers (`SystemInfo::default`).
             ..Default::default()
         })
     }
@@ -471,7 +467,6 @@ impl ferrofin_traits::system::SystemManager for FerrofinSystemManager {
     ) -> Result<PublicSystemInfo, ServiceError> {
         let cfg = self.configuration_manager.configuration().await?;
         let local_address = self.application_host.get_smart_api_url(request).await.ok();
-        #[allow(deprecated)]
         Ok(PublicSystemInfo {
             version: self.facts.version.clone(),
             product_name: self.facts.product_name.clone(),
@@ -479,7 +474,8 @@ impl ferrofin_traits::system::SystemManager for FerrofinSystemManager {
             server_name: Some(self.application_host.friendly_name()),
             local_address,
             startup_wizard_completed: Some(cfg.is_startup_wizard_completed),
-            operating_system: Some(host_operating_system().to_owned()),
+            // `OperatingSystem` keeps upstream's `""` (`PublicSystemInfo::default`).
+            ..Default::default()
         })
     }
 
@@ -703,6 +699,36 @@ mod tests {
         assert_eq!(info.server_name.as_deref(), Some("test-machine"));
     }
 
+    /// `SystemInfo.cs`/`PublicSystemInfo.cs`: the obsolete members the server
+    /// never sets go out at their initialisers, not the host's facts.
+    #[tokio::test]
+    async fn obsolete_members_keep_upstreams_fixed_values() {
+        let (mgr, _) = build().await;
+        let info = serde_json::to_value(
+            mgr.get_system_info(&RequestContext::default())
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        for (field, value) in [
+            ("OperatingSystem", serde_json::json!("")),
+            ("OperatingSystemDisplayName", serde_json::json!("")),
+            ("CanSelfRestart", serde_json::json!(true)),
+            ("CanLaunchWebBrowser", serde_json::json!(false)),
+            ("EncoderLocation", serde_json::json!("System")),
+            ("SystemArchitecture", serde_json::json!("X64")),
+        ] {
+            assert_eq!(info[field], value, "{field}");
+        }
+        let public = serde_json::to_value(
+            mgr.get_public_system_info(&RequestContext::default())
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(public["OperatingSystem"], serde_json::json!(""));
+    }
+
     #[tokio::test]
     async fn restart_and_shutdown_set_the_flag() {
         let (mgr, lifecycle) = build().await;
@@ -883,17 +909,21 @@ mod tests {
         assert!(info.free_space <= total);
     }
 
-    /// C# reports `DeviceId = driveInfo.Name`, and on Unix `DriveInfo.Name` is
-    /// the constructor argument verbatim — so it echoes the path as passed, not
-    /// the canonicalized one. `StorageType` is `DriveType.ToString()`, always a
-    /// value (`Unknown` is the table's default arm), never a missing key.
+    /// Against the live mount table, `DeviceId` is a mount point containing the
+    /// resolved path. `StorageType` is `DriveType.ToString()`, always a value
+    /// (`Unknown` is the table's default arm), never a missing key.
     #[cfg(unix)]
     #[test]
     fn fs_probe_reports_device_id_and_storage_type() {
         let dir = std::env::temp_dir();
         let path = format!("{}/.", dir.to_string_lossy());
         let info = FsStorageProbe.probe(&path);
-        assert_eq!(info.device_id.as_deref(), Some(path.as_str()));
+        let device_id = info.device_id.expect("device id");
+        assert!(
+            std::path::Path::new(&info.resolved_path).starts_with(&device_id),
+            "{device_id} does not contain {}",
+            info.resolved_path
+        );
         let storage_type = info.storage_type.expect("storage type");
         assert!(
             [
@@ -908,6 +938,40 @@ mod tests {
             .contains(&storage_type.as_str()),
             "unexpected DriveType string {storage_type}"
         );
+    }
+
+    /// v12's `GetFreeSpaceOf` reports the deepest mount containing the resolved
+    /// path: its mount point is `DeviceId` and its type is `StorageType`. A
+    /// mount table with no containing mount keeps the folder's byte counts with
+    /// no `DeviceId` (upstream throws into its catch arm there).
+    #[cfg(unix)]
+    #[test]
+    fn fs_probe_reports_the_containing_mount_point_as_device_id() {
+        use crate::mount_table::MountEntry;
+        let dir = std::fs::canonicalize(std::env::temp_dir())
+            .expect("temp dir")
+            .to_string_lossy()
+            .into_owned();
+        let mount = |target: &str, fs_type: &str| MountEntry {
+            target: target.to_owned(),
+            fs_type: fs_type.to_owned(),
+        };
+        let path = format!("{dir}/.");
+        let mounts = [mount("/", "ext4"), mount(&dir, "tmpfs")];
+        let info = FsStorageProbe::probe_with(&mounts, &path);
+        assert_eq!(info.path, path);
+        assert_eq!(info.device_id.as_deref(), Some(dir.as_str()));
+        assert_eq!(info.storage_type.as_deref(), Some("Ram"));
+        assert!(info.free_space >= 0);
+
+        let info = FsStorageProbe::probe_with(&mounts[..1], &path);
+        assert_eq!(info.device_id.as_deref(), Some("/"));
+        assert_eq!(info.storage_type.as_deref(), Some("Fixed"));
+
+        let info = FsStorageProbe::probe_with(&[], &path);
+        assert!(info.free_space >= 0);
+        assert_eq!(info.storage_type.as_deref(), Some("Unknown"));
+        assert_eq!(info.device_id, None);
     }
 
     /// The C# catch arm: a path that does not exist makes `AvailableFreeSpace`

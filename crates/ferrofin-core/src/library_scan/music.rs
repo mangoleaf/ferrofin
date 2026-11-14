@@ -1305,8 +1305,9 @@ impl LibraryScanner {
     /// `:142-147`): the first `MusicArtist` among the album's parents,
     /// walked up from its own; else the artist named by the album's first
     /// album artist — `LibraryManager.GetArtist(name)` → `CreateItemByName`
-    /// (`LibraryManager.cs:1348-1362`): the `MusicArtist` rows of that raw
-    /// name (`UseRawName`), a folder artist before one known only by name
+    /// (`LibraryManager.cs:1348-1361`): the `MusicArtist` rows of that name's
+    /// `CleanName` (12.2 dropped `UseRawName`, PR 18005), a folder artist
+    /// before one known only by name
     /// (`OrderBy(i => i.IsAccessedByName ? 1 : 0)`). A parent that cannot be
     /// read ends the walk.
     ///
@@ -1348,7 +1349,6 @@ impl LibraryScanner {
                 .get_item_list(&InternalItemsQuery {
                     include_item_types: vec![BaseItemKind::MusicArtist],
                     name: Some(name),
-                    use_raw_name: Some(true),
                     ..InternalItemsQuery::default()
                 })
                 .await?;
@@ -1943,7 +1943,19 @@ impl LibraryScanner {
                     .map(|p| (p.name(), None)),
             );
         }
-        sources.sort_by_key(|(name, _)| work.policy.image_order(kind, name));
+        // Identifying runs the chosen result's provider first
+        // (`GetNonLocalImageProviders`, `MetadataService.cs:722-727`), for
+        // every item the refresh's options carry that result to.
+        let policy = FetcherPolicy {
+            identified_by: work
+                .request
+                .options
+                .search_result
+                .as_ref()
+                .and_then(|r| r.search_provider_name.as_deref()),
+            ..work.policy
+        };
+        sources.sort_by_key(|(name, _)| policy.image_order(kind, name));
         let meta_root = meta_root.resolve();
         let dir = crate::dynamic_images::own_art_dir(&meta_root, work.id);
         let mut images: Vec<_> = stored
@@ -1972,7 +1984,7 @@ impl LibraryScanner {
                     fetch.images == ImageFetch::All,
                 )
                 .await;
-                self.fill_image_metadata(&mut downloaded).await;
+                self.fill_image_metadata(work.id, &mut downloaded).await;
                 images.extend(downloaded);
             } else {
                 self.apply_dynamic_images(
@@ -1998,7 +2010,7 @@ impl LibraryScanner {
                     .cloned(),
             );
         }
-        self.fill_image_metadata(&mut images).await;
+        self.fill_image_metadata(work.id, &mut images).await;
         images_changed(&images, Some(&stored)).then_some(images)
     }
 }
@@ -2014,9 +2026,26 @@ impl LibraryScanner {
         policy: FetcherPolicy<'_>,
         remote: bool,
     ) {
-        let defaults = MetadataRefreshOptions::default();
+        self.music_pass_with_options_for_test(
+            items,
+            policy,
+            remote,
+            &MetadataRefreshOptions::default(),
+        )
+        .await;
+    }
+
+    /// [`music_pass_for_test`](Self::music_pass_for_test) refreshing with
+    /// `options`.
+    pub(super) async fn music_pass_with_options_for_test(
+        &self,
+        items: &[(Uuid, MusicKind)],
+        policy: FetcherPolicy<'_>,
+        remote: bool,
+        options: &MetadataRefreshOptions,
+    ) {
         let request = RefreshRequest {
-            options: &defaults,
+            options,
             force_save: false,
         };
         let plan = ItemRefreshPlan {

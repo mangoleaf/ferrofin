@@ -8,6 +8,7 @@
 
 pub mod activity;
 pub mod api_client;
+pub mod backup;
 pub mod branding;
 pub mod channels;
 pub mod collections;

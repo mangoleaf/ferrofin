@@ -161,7 +161,7 @@ impl RemoteSearchProvider for TmdbSearchProvider {
             return Ok(hits
                 .into_iter()
                 .map(|hit| {
-                    let mut result = self.hit_result(hit);
+                    let mut result = Self::hit_result(hit);
                     // `TmdbSeriesProvider` stamps the id it searched by back
                     // onto each row; `TmdbMovieProvider` does not.
                     if self.kind == TmdbKind::Series {
@@ -187,22 +187,20 @@ impl RemoteSearchProvider for TmdbSearchProvider {
             TmdbKind::Series => None,
         };
         let hits = self.tmdb.search(self.kind, name, year, language).await;
-        Ok(hits.into_iter().map(|hit| self.hit_result(hit)).collect())
+        Ok(hits.into_iter().map(Self::hit_result).collect())
     }
 }
 
 impl TmdbSearchProvider {
     /// One `/search/*` or `/find/*` row as an Identify candidate — the C#
     /// name-search loop for movies, `MapSearchTvToRemoteSearchResult` for
-    /// series. The series mapper sets `PremiereDate` and never `ProductionYear`;
-    /// the movie one sets both, from the same release date.
-    fn hit_result(&self, hit: crate::tmdb::TmdbSearchHit) -> RemoteSearchResult {
+    /// series. Both set `PremiereDate` and `ProductionYear` from the same date:
+    /// the release date for a movie, the first air date for a series
+    /// (jellyfin/jellyfin#16144).
+    fn hit_result(hit: crate::tmdb::TmdbSearchHit) -> RemoteSearchResult {
         RemoteSearchResult {
             name: hit.name,
-            production_year: match self.kind {
-                TmdbKind::Movie => hit.year,
-                TmdbKind::Series => None,
-            },
+            production_year: hit.year,
             premiere_date: hit.premiere_date.as_deref().and_then(parse_ymd),
             image_url: hit.poster_url,
             overview: hit.overview,
@@ -217,8 +215,8 @@ impl TmdbSearchProvider {
 
     /// The single candidate a `Tmdb` id resolves to — the C# `GetMovieAsync`
     /// branch / `MapTvShowToRemoteSearchResult`. Both carry the IMDb id when
-    /// TMDB knows it; the series mapper adds the TVDB id too, and neither
-    /// series mapper sets `ProductionYear`.
+    /// TMDB knows it; the series mapper adds the TVDB id too. Both set
+    /// `ProductionYear` from the release / first air date.
     fn pinned_result(&self, tmdb_id: i64, details: TmdbDetails) -> RemoteSearchResult {
         let mut provider_ids = HashMap::from([("Tmdb".to_owned(), tmdb_id.to_string())]);
         // `TrySetProviderId` — only when TMDB actually has the id.
@@ -232,10 +230,7 @@ impl TmdbSearchProvider {
         }
         RemoteSearchResult {
             name: details.name,
-            production_year: match self.kind {
-                TmdbKind::Movie => details.production_year,
-                TmdbKind::Series => None,
-            },
+            production_year: details.production_year,
             premiere_date: details.premiere_date.as_deref().and_then(parse_ymd),
             image_url: details.poster_url,
             overview: details.overview,
@@ -2615,6 +2610,13 @@ impl LocalProviderManager {
         let Some(stored) = items.retrieve_item(item_id).await? else {
             return Err(ServiceError::not_found(format!("item {item_id}")));
         };
+        // `if (refreshOptions.RemoveOldMetadata &&
+        // refreshOptions.ReplaceAllImages) ImageProvider.RemoveImages(item)`
+        // (`MetadataService.cs:112-118`): before every provider, whatever the
+        // lock or the modes.
+        let removed_images = options.remove_old_metadata
+            && options.replace_all_images
+            && self.remove_own_images(item_id).await?;
         // The item's `LockedFields`: the merge leaves them as stored.
         let locked_fields = self.stored_locked_fields(item_id).await;
         let stored_ids = if options.search_result.is_some() {
@@ -2946,6 +2948,10 @@ impl LocalProviderManager {
                     &row,
                     &merged.provider_ids,
                     plan.remote_images,
+                    options
+                        .search_result
+                        .as_ref()
+                        .and_then(|r| r.search_provider_name.as_deref()),
                 ),
             ))
             .await;
@@ -2970,7 +2976,8 @@ impl LocalProviderManager {
                     || ids_changed
                     || image_saved
                     || generated
-                    || local_images,
+                    || local_images
+                    || removed_images,
                 failed: failures > 0,
             },
         );
@@ -3050,7 +3057,7 @@ impl LocalProviderManager {
             || request.options.replace_all_metadata
         {
             ItemUpdateType::MetadataDownload
-        } else if image_saved || generated || local_images {
+        } else if image_saved || generated || local_images || removed_images {
             ItemUpdateType::ImageUpdate
         } else {
             ItemUpdateType::None
@@ -3059,6 +3066,25 @@ impl LocalProviderManager {
             self.save_metadata(item_id, update).await?;
         }
         Ok(update)
+    }
+
+    /// [`remove_images`](crate::local_images::remove_images) over the item's
+    /// stored images in its own metadata folders, the rows it removed saved
+    /// at once so the providers after it see them gone. Returns whether any
+    /// image was removed.
+    async fn remove_own_images(&self, item_id: Uuid) -> Result<bool, ServiceError> {
+        let (Some(store), Some(root)) = (&self.image_store, &self.metadata_dir) else {
+            return Ok(false);
+        };
+        let Some(mut images) = self.stored_images(item_id).await else {
+            return Ok(false);
+        };
+        let folders = crate::local_images::internal_metadata_dirs(&root.resolve(), item_id);
+        if !crate::local_images::remove_images(&mut images, &folders, &item_id.to_string()) {
+            return Ok(false);
+        }
+        store.save_item_images(item_id, &images).await?;
+        Ok(true)
     }
 
     /// `ImageProvider.ValidateImages` for a season with no folder of its own:
@@ -3123,13 +3149,15 @@ impl LocalProviderManager {
         Ok(true)
     }
 
-    /// Remote and dynamic image providers share one ordered acquisition pass.
+    /// Remote and dynamic image providers share one ordered acquisition pass,
+    /// an Identify's chosen provider (`identified_by`) first.
     async fn refresh_ordered_images(
         &self,
         item_id: Uuid,
         row: &BaseItemEntity,
         ids: &[(String, String)],
         fetch: ImageFetch,
+        identified_by: Option<&str>,
     ) -> Result<bool, ServiceError> {
         let kind = short_kind(row);
         let library = self.library_options_for(row).await;
@@ -3161,14 +3189,12 @@ impl LocalProviderManager {
             })
         });
         sources.sort_by_key(|(name, _)| {
-            (
-                crate::library_options::image_fetcher_rank(
-                    library.as_ref(),
-                    global.as_ref(),
-                    kind,
-                    name,
-                ),
-                crate::library_options::default_image_order(kind, name),
+            crate::library_options::image_provider_order(
+                library.as_ref(),
+                global.as_ref(),
+                kind,
+                name,
+                identified_by,
             )
         });
         let lookup = ferrofin_traits::providers::DynamicMetadataLookup {
@@ -6526,7 +6552,8 @@ mod tests {
             (
                 // The bare `fr` — the series arm only.
                 "language=fr",
-                r#"{"movie_results":[],"tv_results":[{"id":1396,"name":"Breaking Bad"}]}"#
+                r#"{"movie_results":[],"tv_results":[{"id":1396,"name":"Breaking Bad",
+                    "first_air_date":"2008-01-20"}]}"#
                     .to_owned(),
             ),
             (
@@ -6560,6 +6587,8 @@ mod tests {
             .expect("results");
         assert_eq!(results.len(), 1, "series /find must send the bare language");
         assert_eq!(results[0].name.as_deref(), Some("Breaking Bad"));
+        // `MapSearchTvToRemoteSearchResult`: the year of the first air date.
+        assert_eq!(results[0].production_year, Some(2008));
     }
 
     #[tokio::test]
@@ -6624,7 +6653,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn tmdb_series_identify_sets_premiere_date_and_drops_the_year_filter() {
+    async fn tmdb_series_identify_sets_first_air_year_and_drops_the_year_filter() {
         use super::{TmdbKind, TmdbSearchProvider};
         // `first_air_date_year` first: `TmdbSeriesProvider` leaves
         // `SearchSeriesAsync`'s year at 0, so forwarding one is the bug this
@@ -6657,7 +6686,8 @@ mod tests {
         let provider = TmdbSearchProvider::new(tmdb, TmdbKind::Series);
 
         // A wrong `Year` must not narrow the search, and the series mapper
-        // emits `PremiereDate` — never `ProductionYear`.
+        // emits `PremiereDate` and `ProductionYear` from the first air date
+        // (jellyfin/jellyfin#16144).
         let mut req = named_request(BaseItemKind::Series, "Breaking Bad");
         req.search_info.year = Some(2019);
         let results = provider.get_search_results(&req).await.expect("results");
@@ -6670,7 +6700,7 @@ mod tests {
             results[0].premiere_date.map(|d| d.to_rfc3339()).as_deref(),
             Some("2008-01-20T00:00:00+00:00")
         );
-        assert_eq!(results[0].production_year, None);
+        assert_eq!(results[0].production_year, Some(2008));
 
         // The metadata language reaches TMDB.
         let mut req = named_request(BaseItemKind::Series, "Breaking Bad");
@@ -6688,7 +6718,7 @@ mod tests {
         assert_eq!(ids["Tmdb"], "1396");
         assert_eq!(ids["Imdb"], "tt0903747");
         assert_eq!(ids["Tvdb"], "81189");
-        assert_eq!(results[0].production_year, None);
+        assert_eq!(results[0].production_year, Some(2008));
         assert!(results[0].premiere_date.is_some());
     }
 
@@ -12382,6 +12412,110 @@ mod tests {
         assert_eq!(restamped, stamped);
     }
 
+    /// gl-592: "Replace all metadata" with "Replace existing images" removes
+    /// the item's images in its own metadata folders before any provider runs
+    /// (`MetadataService.cs:112-118`, `ItemImageProvider.RemoveImages`): the
+    /// first image of each singular type and every backdrop, in Ferrofin's
+    /// and Jellyfin's layout, whatever the lock. A second Primary, a
+    /// screenshot and an image stored elsewhere stay; either option alone
+    /// removes nothing.
+    #[rstest::rstest]
+    #[case::replace_all(true, true, false, true)]
+    #[case::locked(true, true, true, true)]
+    #[case::metadata_only(true, false, false, false)]
+    #[case::images_only(false, true, false, false)]
+    #[tokio::test]
+    async fn replacing_all_metadata_and_images_removes_the_items_own_images(
+        #[case] remove_old_metadata: bool,
+        #[case] replace_all_images: bool,
+        #[case] is_locked: bool,
+        #[case] removed: bool,
+    ) {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let item_id = Uuid::new_v4();
+        let [ours, _, jellyfins] = crate::local_images::internal_metadata_dirs(tmp.path(), item_id);
+        let elsewhere = tmp.path().join("Genre").join("Crime");
+        let image = |dir: &std::path::Path, name: &str, image_type| {
+            std::fs::create_dir_all(dir).expect("dir");
+            let path = dir.join(name);
+            std::fs::write(&path, b"x").expect("write");
+            ItemImageInfo {
+                path: path.to_string_lossy().into_owned(),
+                image_type,
+                date_modified: chrono::Utc::now(),
+                width: 0,
+                height: 0,
+                blur_hash: None,
+            }
+        };
+        let poster = image(&jellyfins, "poster.jpg", ImageType::Primary);
+        let second = image(&ours, "primary1.jpg", ImageType::Primary);
+        let backdrop = image(&ours, "backdrop.jpg", ImageType::Backdrop);
+        let screenshot = image(&ours, "screenshot.jpg", ImageType::Screenshot);
+        let logo = image(&elsewhere, "logo.png", ImageType::Logo);
+        let all = [&poster, &second, &backdrop, &screenshot, &logo];
+        let mut stored = row("Genre", "Crime");
+        stored.id = item_id.to_string();
+        stored.is_locked = is_locked;
+        stored.date_last_refreshed = Some(chrono::Utc::now());
+        // Settled as the refresh settles it, so only the images change.
+        crate::metadata_merge::settle_sort_name(&mut stored);
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let store = Arc::new(RecordingStore::default());
+        store
+            .images
+            .lock()
+            .expect("lock")
+            .extend(all.iter().map(|image| (item_id, (*image).clone())));
+        let mgr = LocalProviderManager::default()
+            .with_remote_images(
+                Arc::new(crate::tmdb::TmdbClient::new()),
+                Arc::new(FakeItems {
+                    rows: HashMap::from([(item_id, stored)]),
+                    seen: tx,
+                }),
+            )
+            .with_image_store(Arc::clone(&store) as _, tmp.path().to_path_buf());
+        let options = Opts {
+            remove_old_metadata,
+            replace_all_images,
+            ..Opts::default()
+        };
+        let update = mgr
+            .refresh_single_item(item_id, &options)
+            .await
+            .expect("refresh");
+        // The removal is the refresh's only change: an image update, saved.
+        let (expected_update, saves) = if removed {
+            (ItemUpdateType::ImageUpdate, true)
+        } else {
+            (ItemUpdateType::None, false)
+        };
+        assert_eq!(update, expected_update);
+        assert_eq!(!store.saved.lock().expect("lock").is_empty(), saves);
+        let kept: Vec<ItemImageInfo> = store
+            .images
+            .lock()
+            .expect("lock")
+            .iter()
+            .map(|(_, image)| image.clone())
+            .collect();
+        let expected: Vec<ItemImageInfo> = if removed {
+            vec![second.clone(), screenshot.clone(), logo.clone()]
+        } else {
+            all.iter().map(|image| (*image).clone()).collect()
+        };
+        assert_eq!(kept, expected);
+        for image in all {
+            assert_eq!(
+                std::path::Path::new(&image.path).exists(),
+                expected.contains(image),
+                "{}",
+                image.path
+            );
+        }
+    }
+
     /// A season with no folder of its own (a virtual season) refreshes here,
     /// through its series' TMDB season, by the refresh decision and mode: a
     /// Default refresh of a season already refreshed asks nothing, "Search
@@ -13674,21 +13808,27 @@ mod tests {
                 .collect())
         }
     }
+    /// `identified_by` is an Identify → Apply's `SearchProviderName`: that
+    /// provider runs first (`GetNonLocalImageProviders`).
     #[rstest::rstest]
-    #[case::none(&[], &[], None)]
-    #[case::plugin_only(&["ArtworkPlugin"], &[], Some("plugin"))]
-    #[case::plugin_first(&["ArtworkPlugin", "TheMovieDb"], &["ArtworkPlugin", "TheMovieDb"], Some("plugin"))]
-    #[case::plugin_last(&["ArtworkPlugin", "TheMovieDb"], &["TheMovieDb", "ArtworkPlugin"], Some("tmdb"))]
-    #[case::plugin_default(&["ArtworkPlugin", "TheMovieDb"], &[], Some("tmdb"))]
-    #[case::fanart_only(&["FanArt"], &[], Some("fanart"))]
-    #[case::tmdb_only(&["TheMovieDb"], &[], Some("tmdb"))]
-    #[case::fanart_first(&["FanArt", "TheMovieDb"], &["FanArt", "TheMovieDb"], Some("fanart"))]
-    #[case::tmdb_first(&["FanArt", "TheMovieDb"], &["TheMovieDb", "FanArt"], Some("tmdb"))]
-    #[case::default_order(&["FanArt", "TheMovieDb"], &[], Some("tmdb"))]
+    #[case::none(&[], &[], None, None)]
+    #[case::plugin_only(&["ArtworkPlugin"], &[], None, Some("plugin"))]
+    #[case::plugin_first(&["ArtworkPlugin", "TheMovieDb"], &["ArtworkPlugin", "TheMovieDb"], None, Some("plugin"))]
+    #[case::plugin_last(&["ArtworkPlugin", "TheMovieDb"], &["TheMovieDb", "ArtworkPlugin"], None, Some("tmdb"))]
+    #[case::plugin_default(&["ArtworkPlugin", "TheMovieDb"], &[], None, Some("tmdb"))]
+    #[case::fanart_only(&["FanArt"], &[], None, Some("fanart"))]
+    #[case::tmdb_only(&["TheMovieDb"], &[], None, Some("tmdb"))]
+    #[case::fanart_first(&["FanArt", "TheMovieDb"], &["FanArt", "TheMovieDb"], None, Some("fanart"))]
+    #[case::tmdb_first(&["FanArt", "TheMovieDb"], &["TheMovieDb", "FanArt"], None, Some("tmdb"))]
+    #[case::default_order(&["FanArt", "TheMovieDb"], &[], None, Some("tmdb"))]
+    #[case::identified_tmdb(&["FanArt", "TheMovieDb"], &["FanArt", "TheMovieDb"], Some("themoviedb"), Some("tmdb"))]
+    #[case::identified_plugin(&["ArtworkPlugin", "TheMovieDb"], &["TheMovieDb", "ArtworkPlugin"], Some("ArtworkPlugin"), Some("plugin"))]
+    #[case::identified_disabled(&["FanArt"], &[], Some("TheMovieDb"), Some("fanart"))]
     #[tokio::test]
     async fn pathless_refresh_obeys_image_selection_and_order(
         #[case] enabled: &[&str],
         #[case] order: &[&str],
+        #[case] identified_by: Option<&str>,
         #[case] expected: Option<&str>,
     ) {
         use ferrofin_model::configuration::{LibraryOptions, TypeOptions};
@@ -13757,6 +13897,11 @@ mod tests {
                 metadata_refresh_mode: MetadataRefreshMode::None,
                 image_refresh_mode: MetadataRefreshMode::FullRefresh,
                 replace_all_images: true,
+                search_result: identified_by.map(|name| RemoteSearchResult {
+                    provider_ids: Some(HashMap::from([("Tmdb".to_owned(), "603".to_owned())])),
+                    search_provider_name: Some(name.to_owned()),
+                    ..Default::default()
+                }),
                 ..Default::default()
             },
         )
@@ -13889,13 +14034,19 @@ mod tests {
                 .collect();
             assert_eq!(bytes, [b"GIF89afirst".to_vec(), b"GIF89asecond".to_vec()]);
             assert!(
-                !mgr.refresh_ordered_images(item_id, &movie, &ids, super::ImageFetch::MissingOnly)
-                    .await
-                    .unwrap()
+                !mgr.refresh_ordered_images(
+                    item_id,
+                    &movie,
+                    &ids,
+                    super::ImageFetch::MissingOnly,
+                    None
+                )
+                .await
+                .unwrap()
             );
             assert_eq!(*store.images.lock().unwrap(), first);
             assert!(
-                mgr.refresh_ordered_images(item_id, &movie, &ids, super::ImageFetch::All)
+                mgr.refresh_ordered_images(item_id, &movie, &ids, super::ImageFetch::All, None)
                     .await
                     .unwrap()
             );

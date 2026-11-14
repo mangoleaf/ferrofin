@@ -19,7 +19,7 @@ use ferrofin_traits::options::DtoOptions;
 use crate::auth::RequireAuth;
 use crate::error::ApiError;
 use crate::extract::{Query, RequiredRouteString, RouteParameter};
-use crate::handlers::by_name::{ByNameItemQuery, ByNameListQuery, project_query_result};
+use crate::handlers::by_name::{ByNameItemQuery, ValueListQuery, project_query_result};
 use crate::handlers::items::resolve_user_or_api_key;
 use crate::state::AppState;
 
@@ -36,8 +36,9 @@ use crate::state::AppState;
 async fn get_studios(
     State(state): State<AppState>,
     RequireAuth(auth): RequireAuth,
-    Query(query): Query<ByNameListQuery>,
+    Query(query): Query<ValueListQuery>,
 ) -> Result<Json<QueryResult<BaseItemDto>>, ApiError> {
+    let query = query.studios()?;
     let user = resolve_user_or_api_key(&state, &auth, query.user_id).await?;
     // `GetParentItem`: an id naming no item is a 400.
     query.parent(&state, &auth, user.as_deref()).await?;

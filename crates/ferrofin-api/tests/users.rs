@@ -18,7 +18,8 @@ use ferrofin_api::create_router;
 use ferrofin_api::state::AppState;
 use ferrofin_api::test_support::{
     FakeAuthContext, FakeConfig, FakeDto, FakeLibrary, FakeMediaSources, FakeMusic, FakeProviders,
-    FakeSearch, FakeSimilarItems, FakeSystem, FakeUserData, FakeUserViews,
+    FakeSearch, FakeSimilarItems, FakeSystem, FakeUserData, FakeUserViews, FixedAuth,
+    fake_user_entity,
 };
 use ferrofin_db::entities::base_items::BaseItemEntity;
 use ferrofin_db::entities::security::DeviceEntity;
@@ -38,7 +39,7 @@ use ferrofin_traits::configuration::ServerConfigurationManager;
 use ferrofin_traits::dto::DtoService;
 use ferrofin_traits::error::ServiceError;
 use ferrofin_traits::library::{LibraryManager, MediaSourceManager, UserManager, UserViewManager};
-use ferrofin_traits::net::{AuthService, AuthorizationContext, RequestContext};
+use ferrofin_traits::net::{AuthService, RequestContext};
 use ferrofin_traits::options::{
     AuthorizationInfo, DtoOptions, InternalItemsQuery, InternalPeopleQuery,
 };
@@ -56,57 +57,19 @@ const CORRUPT_ID: Uuid = Uuid::from_u128(0x0C0C);
 /// Builds a neutral [`UserEntity`] with the given id + name (no `Default`).
 fn user_entity(id: Uuid, username: &str, password: Option<&str>) -> UserEntity {
     UserEntity {
-        id: id.to_string(),
-        audio_language_preference: None,
-        authentication_provider_id: String::new(),
-        cast_receiver_id: None,
-        display_collections_view: false,
-        display_missing_episodes: false,
-        enable_auto_login: false,
-        enable_local_password: false,
-        enable_next_episode_auto_play: false,
-        enable_user_preference_access: false,
-        hide_played_in_latest: false,
-        internal_id: 0,
-        invalid_login_attempt_count: 0,
-        last_activity_date: None,
-        last_login_date: None,
-        login_attempts_before_lockout: None,
-        max_active_sessions: 0,
-        max_parental_rating_score: None,
-        max_parental_rating_sub_score: None,
-        must_update_password: false,
         password: password.map(ToOwned::to_owned),
-        password_reset_provider_id: String::new(),
-        play_default_audio_track: false,
-        remember_audio_selections: false,
-        remember_subtitle_selections: false,
-        remote_client_bitrate_limit: None,
-        row_version: 0,
-        subtitle_language_preference: None,
-        subtitle_mode: 0,
-        sync_play_access: 0,
-        username: username.to_owned(),
-        normalized_username: ferrofin_util::string_extensions::upper_invariant(username),
+        ..fake_user_entity(id, username)
     }
 }
 
 /// An [`AuthService`] authenticating as the admin user (so `RequireAuth` passes).
-struct AdminAuth;
-
-#[async_trait]
-impl AuthService for AdminAuth {
-    async fn authenticate(
-        &self,
-        _request: &RequestContext,
-    ) -> Result<AuthorizationInfo, ServiceError> {
-        Ok(AuthorizationInfo {
-            user: Some(Arc::new(user_entity(ADMIN_ID, "admin", Some("hash")))),
-            token: Some("current-session".into()),
-            is_authenticated: true,
-            ..AuthorizationInfo::default()
-        })
-    }
+fn admin_auth() -> FixedAuth {
+    FixedAuth(AuthorizationInfo {
+        user: Some(Arc::new(user_entity(ADMIN_ID, "admin", Some("hash")))),
+        token: Some("current-session".into()),
+        is_authenticated: true,
+        ..AuthorizationInfo::default()
+    })
 }
 
 /// A [`UserManager`] backed by an in-memory table, recording password/policy
@@ -592,7 +555,7 @@ fn state_with_activity(
     config: Arc<MemConfig>,
     activity: Arc<dyn ferrofin_traits::activity::ActivityManager>,
 ) -> AppState {
-    state_with_auth(users, config, activity, Arc::new(AdminAuth))
+    state_with_auth(users, config, activity, Arc::new(admin_auth()))
 }
 
 /// [`state_with_activity`] with a caller-supplied [`AuthService`], so a test can
@@ -688,80 +651,30 @@ const USER_ID: Uuid = Uuid::from_u128(0x1234_5678);
 /// field is a neutral zero value ([`UserEntity`] has no `Default`).
 fn hsp_user_entity(id: Uuid, username: &str) -> UserEntity {
     UserEntity {
-        id: id.to_string(),
-        audio_language_preference: None,
-        authentication_provider_id: String::new(),
-        cast_receiver_id: None,
-        display_collections_view: false,
-        display_missing_episodes: false,
-        enable_auto_login: false,
-        enable_local_password: false,
-        enable_next_episode_auto_play: false,
-        enable_user_preference_access: false,
-        hide_played_in_latest: false,
-        internal_id: 0,
-        invalid_login_attempt_count: 0,
-        last_activity_date: None,
-        last_login_date: None,
-        login_attempts_before_lockout: None,
-        max_active_sessions: 0,
-        max_parental_rating_score: None,
-        max_parental_rating_sub_score: None,
-        must_update_password: false,
         password: Some("hashed".to_owned()),
-        password_reset_provider_id: String::new(),
-        play_default_audio_track: false,
-        remember_audio_selections: false,
-        remember_subtitle_selections: false,
-        remote_client_bitrate_limit: None,
-        row_version: 0,
-        subtitle_language_preference: None,
-        subtitle_mode: 0,
-        sync_play_access: 0,
-        username: username.to_owned(),
-        normalized_username: ferrofin_util::string_extensions::upper_invariant(username),
+        ..fake_user_entity(id, username)
     }
 }
 
 /// An [`AuthService`] that always authenticates as [`USER_ID`], so `RequireAuth`
 /// yields an authenticated context in the success-path tests.
-struct OkAuthService;
-
-#[async_trait]
-impl AuthService for OkAuthService {
-    async fn authenticate(
-        &self,
-        _request: &RequestContext,
-    ) -> Result<AuthorizationInfo, ServiceError> {
-        Ok(AuthorizationInfo {
-            user: Some(Arc::new(hsp_user_entity(USER_ID, "alice"))),
-            is_authenticated: true,
-            ..AuthorizationInfo::default()
-        })
-    }
+fn ok_auth_service() -> FixedAuth {
+    FixedAuth::signed_in(hsp_user_entity(USER_ID, "alice"))
 }
 
-/// An [`AuthorizationContext`] that resolves the same authenticated user, so
+/// An `AuthorizationContext` that resolves the same authenticated user, so
 /// handlers reading the request extension (e.g. `AuthenticateByName`'s client
 /// identity) see a populated context.
-struct OkAuthContext;
-
-#[async_trait]
-impl AuthorizationContext for OkAuthContext {
-    async fn get_authorization_info(
-        &self,
-        _request: &RequestContext,
-    ) -> Result<AuthorizationInfo, ServiceError> {
-        Ok(AuthorizationInfo {
-            user: Some(Arc::new(hsp_user_entity(USER_ID, "alice"))),
-            client: Some("Wolphin".to_owned()),
-            version: Some("1.0".to_owned()),
-            device_id: Some("dev-1".to_owned()),
-            device: Some("Test Device".to_owned()),
-            is_authenticated: true,
-            ..AuthorizationInfo::default()
-        })
-    }
+fn ok_auth_context() -> FixedAuth {
+    FixedAuth(AuthorizationInfo {
+        user: Some(Arc::new(hsp_user_entity(USER_ID, "alice"))),
+        client: Some("Wolphin".to_owned()),
+        version: Some("1.0".to_owned()),
+        device_id: Some("dev-1".to_owned()),
+        device: Some("Test Device".to_owned()),
+        is_authenticated: true,
+        ..AuthorizationInfo::default()
+    })
 }
 
 /// A [`UserManager`] whose `get_user_by_id` returns the fixed user (any other id
@@ -1447,8 +1360,8 @@ fn ok_state_recording(
         Arc::new(FakeSimilarItems),
         Arc::new(FakeSearch),
         Arc::new(OkDto),
-        Arc::new(OkAuthContext),
-        Arc::new(OkAuthService),
+        Arc::new(ok_auth_context()),
+        Arc::new(ok_auth_service()),
         Arc::new(ferrofin_api::test_support::FakeQuickConnect),
         Arc::new(ferrofin_api::test_support::FakePlaylists),
         Arc::new(ferrofin_api::test_support::FakeCollections),
@@ -1766,7 +1679,7 @@ fn recording_state(
         users,
         Arc::new(MemConfig::new(true)),
         activity,
-        Arc::new(AdminAuth),
+        Arc::new(admin_auth()),
         Arc::new(NoopSessions::default()),
         playlists,
     )
@@ -1994,7 +1907,7 @@ async fn a_nil_user_id_is_a_bad_request(
     let auth: Arc<dyn AuthService> = if api_key {
         Arc::new(ferrofin_api::test_support::ApiKeyAuthService)
     } else {
-        Arc::new(AdminAuth)
+        Arc::new(admin_auth())
     };
     let router = create_router(state_with_auth(
         users.clone(),
@@ -2386,7 +2299,7 @@ async fn sign_in_fallback_user_carries_the_constructor_policy() {
         Arc::new(MemUsers::default()),
         Arc::new(MemConfig::new(true)),
         Arc::new(ferrofin_api::test_support::FakeActivity),
-        Arc::new(AdminAuth),
+        Arc::new(admin_auth()),
         Arc::new(OkSessions::default()),
     ));
     let response = router
@@ -2760,7 +2673,7 @@ async fn changing_password_preserves_the_requesting_session() {
         users,
         Arc::new(MemConfig::new(true)),
         Arc::new(ferrofin_api::test_support::FakeActivity),
-        Arc::new(AdminAuth),
+        Arc::new(admin_auth()),
         sessions.clone(),
     );
     let router = create_router(app);
@@ -2786,20 +2699,10 @@ async fn changing_password_preserves_the_requesting_session() {
 /// while an API key retains its upstream administrator role.
 #[tokio::test]
 async fn account_updates_respect_preferences_and_api_key_elevation() {
-    struct BobAuth;
-    #[async_trait]
-    impl AuthService for BobAuth {
-        async fn authenticate(
-            &self,
-            _: &RequestContext,
-        ) -> Result<AuthorizationInfo, ServiceError> {
-            Ok(AuthorizationInfo {
-                user: Some(Arc::new(user_entity(BOB_ID, "bob", None))),
-                is_authenticated: true,
-                ..Default::default()
-            })
-        }
+    fn bob_auth() -> FixedAuth {
+        FixedAuth::signed_in(user_entity(BOB_ID, "bob", None))
     }
+
     for (path, body) in [
         ("/Users", r#"{"Name":"new-name","Policy":null}"#),
         ("/Users/Password", r#"{"NewPw":"replacement"}"#),
@@ -2810,7 +2713,7 @@ async fn account_updates_respect_preferences_and_api_key_elevation() {
     ] {
         for (auth, expected) in [
             (
-                Arc::new(BobAuth) as Arc<dyn AuthService>,
+                Arc::new(bob_auth()) as Arc<dyn AuthService>,
                 StatusCode::FORBIDDEN,
             ),
             (

@@ -71,8 +71,8 @@ impl ItemImageInfo {
 }
 
 /// Whether a Live TV channel's or programme's image `path` is in the internal
-/// metadata directory `metadata_root`, the only place its file may be read from
-/// or deleted.
+/// metadata directory `metadata_root`, the only place its file may be read
+/// from, deleted or exchanged with another.
 ///
 /// Those rows hold what a tuner or a guide supplied, which is kept only as a URL
 /// (`ferrofin_livetv::projection::is_artwork_url`), but a row saved before that

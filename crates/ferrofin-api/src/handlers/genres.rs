@@ -24,7 +24,7 @@ use crate::auth::RequireAuth;
 use crate::error::ApiError;
 use crate::extract::{Query, RequiredRouteString, RouteParameter};
 use crate::handlers::by_name::{
-    ByNameItemQuery, ByNameListQuery, project_query_result, resolve_by_name_or_slug,
+    ByNameItemQuery, ValueListQuery, project_query_result, resolve_by_name_or_slug,
 };
 use crate::handlers::items::resolve_user_or_api_key;
 use crate::state::AppState;
@@ -44,8 +44,9 @@ use crate::state::AppState;
 async fn get_genres(
     State(state): State<AppState>,
     RequireAuth(auth): RequireAuth,
-    Query(query): Query<ByNameListQuery>,
+    Query(query): Query<ValueListQuery>,
 ) -> Result<Json<QueryResult<BaseItemDto>>, ApiError> {
+    let query = query.genres();
     let user = resolve_user_or_api_key(&state, &auth, query.user_id).await?;
     let parent = query.parent(&state, &auth, user.as_deref()).await?;
     let internal = query.base_query(user.clone())?;

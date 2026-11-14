@@ -27,7 +27,7 @@ use ferrofin_api::test_support::{
     FakeDisplayPreferences, FakeDto, FakeLocalization, FakeLyrics, FakeMediaSegments, FakeMusic,
     FakePlaylists, FakeProviders, FakeQuickConnect, FakeSearch, FakeSessions, FakeSimilarItems,
     FakeSubtitles, FakeSystem, FakeTasks, FakeTrickplay, FakeTvSeries, FakeUserData, FakeUserViews,
-    FakeUsers, minimal_base_item,
+    FakeUsers, FixedAuth, minimal_base_item,
 };
 use ferrofin_api::test_support::{FakeAuthContext, FakeMediaSources};
 use ferrofin_db::entities::base_items::{BaseItemEntity, PeopleEntity};
@@ -533,7 +533,7 @@ fn build_state(
         media_sources,
         subtitles,
         subtitle_encoder,
-        Arc::new(PolicyAuth(ferrofin_traits::options::AuthorizationInfo {
+        Arc::new(FixedAuth(ferrofin_traits::options::AuthorizationInfo {
             user_policy: Some(Arc::new(ferrofin_model::users::UserPolicy {
                 enable_subtitle_management: true,
                 enable_remote_access: true,
@@ -670,7 +670,7 @@ fn admin_state(subtitles: Arc<dyn SubtitleManager>) -> AppState {
         Arc::new(FakeMediaSources),
         subtitles,
         Arc::new(StubEncoder(Ok(Vec::new()))),
-        Arc::new(PolicyAuth(ferrofin_traits::options::AuthorizationInfo {
+        Arc::new(FixedAuth(ferrofin_traits::options::AuthorizationInfo {
             user_policy: Some(Arc::new(ferrofin_model::users::UserPolicy {
                 is_administrator: true,
                 enable_remote_access: true,
@@ -1441,19 +1441,6 @@ fn fallback_font_calls_go_through_the_blocking_pool() {
     });
 }
 
-/// Mirrors a production token-cache snapshot; FakeUsers must never be queried.
-struct PolicyAuth(ferrofin_traits::options::AuthorizationInfo);
-
-#[async_trait]
-impl ferrofin_traits::net::AuthService for PolicyAuth {
-    async fn authenticate(
-        &self,
-        _request: &ferrofin_traits::net::RequestContext,
-    ) -> Result<ferrofin_traits::options::AuthorizationInfo, ServiceError> {
-        Ok(self.0.clone())
-    }
-}
-
 #[tokio::test]
 async fn subtitle_management_gates_every_operation_but_deletion_requires_admin() {
     use ferrofin_api::test_support::sample_user;
@@ -1491,7 +1478,7 @@ async fn subtitle_management_gates_every_operation_but_deletion_requires_admin()
                 ..CannedSubtitles::default()
             }),
             Arc::new(StubEncoder(Ok(Vec::new()))),
-            Arc::new(PolicyAuth(info)),
+            Arc::new(FixedAuth(info)),
         );
         for (method, uri, body, allowed) in [
             (

@@ -17,7 +17,7 @@ use ferrofin_api::create_router;
 use ferrofin_api::state::AppState;
 use ferrofin_api::test_support::{
     FakeAppHost, FakeConfig, FakeDto, FakeMediaSources, FakeMusic, FakeProviders, FakeSearch,
-    FakeSimilarItems, FakeSystem, FakeUserViews,
+    FakeSimilarItems, FakeSystem, FakeUserViews, fake_user_entity,
 };
 use ferrofin_db::entities::base_items::BaseItemEntity;
 use ferrofin_db::entities::security::DeviceEntity;
@@ -57,38 +57,8 @@ const SESSION_ID: &str = "session-current";
 /// Builds a minimal [`UserEntity`] with the given id/name; neutral zero fields.
 fn user_entity(id: Uuid, username: &str) -> UserEntity {
     UserEntity {
-        id: id.to_string(),
-        audio_language_preference: None,
-        authentication_provider_id: String::new(),
-        cast_receiver_id: None,
-        display_collections_view: false,
-        display_missing_episodes: false,
-        enable_auto_login: false,
-        enable_local_password: false,
-        enable_next_episode_auto_play: false,
-        enable_user_preference_access: false,
-        hide_played_in_latest: false,
-        internal_id: 0,
-        invalid_login_attempt_count: 0,
-        last_activity_date: None,
-        last_login_date: None,
-        login_attempts_before_lockout: None,
-        max_active_sessions: 0,
-        max_parental_rating_score: None,
-        max_parental_rating_sub_score: None,
-        must_update_password: false,
         password: Some("hashed".to_owned()),
-        password_reset_provider_id: String::new(),
-        play_default_audio_track: false,
-        remember_audio_selections: false,
-        remember_subtitle_selections: false,
-        remote_client_bitrate_limit: None,
-        row_version: 0,
-        subtitle_language_preference: None,
-        subtitle_mode: 0,
-        sync_play_access: 0,
-        username: username.to_owned(),
-        normalized_username: username.to_uppercase(),
+        ..fake_user_entity(id, username)
     }
 }
 
@@ -1513,6 +1483,78 @@ async fn sync_play_leave_requires_group_membership() {
     let (status, _) = send(state, "POST", "/SyncPlay/Leave", Body::empty()).await;
     assert_eq!(status, StatusCode::NO_CONTENT);
     assert!(reached.load(std::sync::atomic::Ordering::SeqCst));
+}
+
+/// Upstream's `UseAuthorization` middleware runs before MVC binds the
+/// `[FromBody, Required]` request DTO, so a caller the route's SyncPlay policy
+/// refuses is `403` whatever the body: missing, malformed, or sent with a
+/// content type the JSON binder cannot read. A caller the policy admits gets
+/// the binder's `415` or `400` (gl-696).
+#[tokio::test]
+async fn sync_play_policy_is_checked_before_the_body_is_bound() {
+    // Every SyncPlay route with a body, and whether a user who may only join
+    // groups (and is in none) passes its policy.
+    let routes = [
+        ("/SyncPlay/New", false),
+        ("/SyncPlay/Join", true),
+        ("/SyncPlay/SetNewQueue", false),
+        ("/SyncPlay/SetPlaylistItem", false),
+        ("/SyncPlay/RemoveFromPlaylist", false),
+        ("/SyncPlay/MovePlaylistItem", false),
+        ("/SyncPlay/Queue", false),
+        ("/SyncPlay/Seek", false),
+        ("/SyncPlay/Buffering", false),
+        ("/SyncPlay/Ready", false),
+        ("/SyncPlay/SetIgnoreWait", false),
+        ("/SyncPlay/NextItem", false),
+        ("/SyncPlay/PreviousItem", false),
+        ("/SyncPlay/SetRepeatMode", false),
+        ("/SyncPlay/SetShuffleMode", false),
+        ("/SyncPlay/Ping", true),
+    ];
+    let bodies = [
+        (None, "", StatusCode::UNSUPPORTED_MEDIA_TYPE),
+        (Some("text/plain"), "{}", StatusCode::UNSUPPORTED_MEDIA_TYPE),
+        (Some("application/json"), "", StatusCode::BAD_REQUEST),
+        (Some("application/json"), "{", StatusCode::BAD_REQUEST),
+        (Some("application/json"), "[]", StatusCode::BAD_REQUEST),
+    ];
+    for (uri, joiner_passes) in routes {
+        for (access, admin, api_key, passes) in [
+            (NO_SYNC_PLAY, false, false, false),
+            (JOIN_ONLY, false, false, joiner_passes),
+            // The default handler admits these whatever the SyncPlay policy.
+            (NO_SYNC_PLAY, true, false, true),
+            (NO_SYNC_PLAY, false, true, true),
+        ] {
+            for (content_type, body, binder_status) in bodies {
+                let (state, reached) = policy_state_as(access, false, admin, api_key);
+                let mut request = Request::builder()
+                    .method("POST")
+                    .uri(uri)
+                    .header("Authorization", "Token token-abc");
+                if let Some(content_type) = content_type {
+                    request = request.header("Content-Type", content_type);
+                }
+                let response = create_router(state)
+                    .oneshot(request.body(Body::from(body)).expect("request"))
+                    .await
+                    .expect("response");
+                let want = if passes {
+                    binder_status
+                } else {
+                    StatusCode::FORBIDDEN
+                };
+                assert_eq!(
+                    response.status(),
+                    want,
+                    "{uri} access {access} admin {admin} api key {api_key}, \
+                     {content_type:?} {body:?}"
+                );
+                assert!(!reached.load(std::sync::atomic::Ordering::SeqCst));
+            }
+        }
+    }
 }
 
 #[tokio::test]

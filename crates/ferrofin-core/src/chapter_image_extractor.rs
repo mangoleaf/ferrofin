@@ -126,6 +126,9 @@ impl ChapterImageExtractor {
     ///
     /// # Errors
     /// Returns failures reading library options or stored video streams.
+    // One pass over the chapters in `RefreshChapterImages`' order, with its
+    // count and log line; split up it would only scatter the source order.
+    #[allow(clippy::too_many_lines)]
     pub async fn refresh(
         &self,
         video: &BaseItemEntity,
@@ -195,6 +198,7 @@ impl ChapterImageExtractor {
             .paths
             .chapter_image_folder_path(item_id, video.path.as_deref().unwrap_or_default());
         outcome.current_images = off_runtime(|| saved_images(&directory));
+        let mut extracted = 0_u32;
         for chapter in chapters {
             if chapter.start_position_ticks >= video.run_time_ticks.unwrap_or(0) {
                 break;
@@ -220,7 +224,7 @@ impl ChapterImageExtractor {
                 }
             }
             let result = self
-                .refresh_chapter(chapter, &outcome.current_images, &context)
+                .refresh_chapter(chapter, &outcome.current_images, &context, &mut extracted)
                 .await;
             match result {
                 Ok(changed) => outcome.changed |= changed,
@@ -230,6 +234,16 @@ impl ChapterImageExtractor {
                     break;
                 }
             }
+        }
+        // `RefreshChapterImages` logs this at Information; debug here, as a
+        // first run over a library logs it once per video (LOGGING.md rule 1).
+        if extracted > 0 {
+            tracing::debug!(
+                item_id = %item_id,
+                count = extracted,
+                path = %video.path.as_deref().unwrap_or_default(),
+                "extracted chapter images"
+            );
         }
         Ok(outcome)
     }
@@ -262,11 +276,14 @@ impl ChapterImageExtractor {
         }
     }
 
+    /// Reconciles one chapter's image, extracting it when it is due;
+    /// `extracted` counts the images extracted. Returns whether the row changed.
     async fn refresh_chapter(
         &self,
         chapter: &mut ChapterInfo,
         current_images: &[String],
         context: &RefreshContext<'_>,
+        extracted: &mut u32,
     ) -> Result<bool, ServiceError> {
         let target = self.paths.chapter_image_path(
             context.item_id,
@@ -289,6 +306,7 @@ impl ChapterImageExtractor {
                 }
                 chapter.image_date_modified = last_write_time(&target);
                 chapter.image_path = Some(target);
+                *extracted += 1;
                 return Ok(true);
             }
             if chapter
@@ -1009,6 +1027,60 @@ pub(crate) mod tests {
         fixture.video.run_time_ticks = None;
         assert!(!fixture.refresh(&mut sparse, true).await.changed);
         assert!(!fixture.refresh(&mut [], true).await.changed);
+    }
+
+    /// Each video logs how many chapter images it extracted, as Jellyfin
+    /// 12.2's `RefreshChapterImages` does (gl-401): after the loop, so a
+    /// failure still counts the ones before it, and not when it extracted none
+    /// (images already saved, or only reconciled).
+    #[tokio::test]
+    async fn a_video_logs_how_many_chapter_images_it_extracted() {
+        let logs = crate::test_support::CapturedLogs::default();
+        let _guard = tracing::subscriber::set_default(
+            tracing_subscriber::fmt()
+                .with_writer(logs.clone())
+                .with_ansi(false)
+                .with_max_level(tracing::Level::DEBUG)
+                .finish(),
+        );
+        let extracted_lines = || {
+            logs.text()
+                .lines()
+                .filter(|line| line.contains("extracted chapter images"))
+                .map(str::to_owned)
+                .collect::<Vec<_>>()
+        };
+        let fixture = Fixture::new(RecordingEncoder::default()).await;
+        let mut all = chapters(&[0, 200_000_000, 400_000_000]);
+        assert!(fixture.refresh(&mut all, true).await.success);
+        // A second pass finds every image saved: nothing extracted, no line.
+        assert!(fixture.refresh(&mut all, true).await.success);
+        // Rows that do not name the saved images yet are pointed at them, a
+        // change but no extraction: no line either.
+        let mut fresh = chapters(&[0, 200_000_000, 400_000_000]);
+        let reconciled = fixture.refresh(&mut fresh, true).await;
+        assert!(reconciled.success && reconciled.changed);
+        assert!(fresh.iter().all(|chapter| chapter.image_path.is_some()));
+        let failing = Fixture::new(RecordingEncoder {
+            fail_on: Some(2),
+            ..Default::default()
+        })
+        .await;
+        let mut stopped = chapters(&[0, 200_000_000, 400_000_000]);
+        assert!(!failing.refresh(&mut stopped, true).await.success);
+
+        let lines = extracted_lines();
+        assert_eq!(lines.len(), 2, "{lines:#?}");
+        for (line, fixture, count) in [(&lines[0], &fixture, 3), (&lines[1], &failing, 1)] {
+            for expected in [
+                "DEBUG".to_owned(),
+                format!("item_id={}", Uuid::parse_str(&fixture.video.id).unwrap()),
+                format!("count={count}"),
+                format!("path={}", fixture.video.path.as_deref().unwrap()),
+            ] {
+                assert!(line.contains(&expected), "{expected} missing: {line}");
+            }
+        }
     }
 
     #[tokio::test]

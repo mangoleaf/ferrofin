@@ -18,6 +18,7 @@ use std::sync::Arc;
 
 use anyhow::Context as _;
 use ferrofin_api::AppState;
+use ferrofin_api::openapi::JELLYFIN_API_VERSION;
 use ferrofin_core::application_host::HostNetworkInfo;
 use ferrofin_core::system_manager::{LifecycleController, SystemHostFacts};
 use ferrofin_core::{
@@ -200,18 +201,6 @@ fn num_cpus_for_analysis() -> usize {
 
 /// The package name reported in system info (`IStartupOptions.PackageName`).
 const PACKAGE_NAME: &str = "ferrofin-server";
-
-/// The **Jellyfin server version Ferrofin reports** in `SystemInfo`/`PublicSystemInfo`
-/// (`Version`): the newest Jellyfin release Ferrofin adopts (12.4.0, whose database
-/// carries 12.2's migration-id set and adopts as generation `12.2.0`; handlers are
-/// ported from `UPSTREAM_TAG`) — NOT Ferrofin's own release version
-/// (`ferrofin_health::RELEASE_VERSION`, sent in User-Agents and backups).
-/// Clients gate on it: jellyfin-web's SDK refuses any server below
-/// `MINIMUM_VERSION = 10.10.0` with an "Update Required" screen, and jellyfin-sdk-kotlin
-/// (Android TV and friends) flags anything below `Jellyfin.minimumVersion = 12.0.0`
-/// as unsupported. The route gate stays pinned to the 10.11.8 contract, which covers
-/// every 12.x operation except `GET /Items/{itemId}/Collections` (added in 12.1).
-const JELLYFIN_API_VERSION: &str = "12.4.0";
 
 /// The assembled application state plus the handles the composition root still
 /// needs after wiring (the concrete host, to flip its startup flag and drive
@@ -3296,6 +3285,17 @@ pub async fn build_app_state(
             Arc::clone(&plugins),
             Arc::new(ferrofin_extensions::ldap_auth::directory::Ldap3Directory::default()),
         ));
+    // The backup engine behind `/Backup*`: archives come from and go back to
+    // the live application paths, and each manifest records this release.
+    let backup_paths: Arc<dyn ferrofin_traits::system::ServerApplicationPaths> =
+        Arc::clone(&paths) as Arc<_>;
+    let backup: Arc<dyn ferrofin_traits::backup::BackupService> =
+        Arc::new(ferrofin_core::backup::FerrofinBackupService::new(
+            backup_paths,
+            Arc::clone(&state.library),
+            Arc::clone(&state.system),
+            ferrofin_health::RELEASE_VERSION,
+        ));
     let state = state
         .with_plugin_request_handler(plugin_routes)
         .with_session_bus(Arc::clone(&session_bus))
@@ -3304,6 +3304,7 @@ pub async fn build_app_state(
         .with_file_transformations(Arc::clone(&file_transformations))
         .with_merge_versions(merge_versions)
         .with_ldap(ldap)
+        .with_backup(backup)
         .with_playback_metrics(playback_metrics);
 
     // Establishing the watches is a FILESYSTEM WALK, not a registration: an

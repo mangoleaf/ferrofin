@@ -15,7 +15,7 @@ use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use ferrofin_api::create_router;
 use ferrofin_api::state::AppState;
-use ferrofin_api::test_support::minimal_base_item;
+use ferrofin_api::test_support::{FixedAuth, minimal_base_item};
 use ferrofin_db::entities::base_items::BaseItemEntity;
 use ferrofin_model::entities_media::MediaAttachment;
 use ferrofin_model::querying::QueryResult;
@@ -242,16 +242,8 @@ impl AttachmentExtractor for FakeAttachments {
 }
 
 /// An [`AuthService`]/[`AuthorizationContext`] that authenticates any request.
-struct OkAuth;
-
-#[async_trait]
-impl AuthorizationContext for OkAuth {
-    async fn get_authorization_info(
-        &self,
-        _request: &RequestContext,
-    ) -> Result<AuthorizationInfo, ServiceError> {
-        Ok(ok_auth_info())
-    }
+fn ok_auth() -> FixedAuth {
+    FixedAuth(ok_auth_info())
 }
 
 /// The authorization every request resolves to: authenticated, carrying the
@@ -269,16 +261,6 @@ fn ok_auth_info() -> AuthorizationInfo {
         })),
         is_authenticated: true,
         ..ferrofin_api::test_support::authenticated_user_info()
-    }
-}
-
-#[async_trait]
-impl AuthService for OkAuth {
-    async fn authenticate(
-        &self,
-        _request: &RequestContext,
-    ) -> Result<AuthorizationInfo, ServiceError> {
-        Ok(ok_auth_info())
     }
 }
 
@@ -498,7 +480,7 @@ fn router_with(
 /// Like [`router_with`] but with a media-source manager that yields no static
 /// sources, so the direct-play stream routes fall through to transcode.
 fn router_no_static(hls: Arc<dyn HlsStreamManager>) -> axum::Router {
-    router_no_static_with_auth(hls, Arc::new(OkAuth))
+    router_no_static_with_auth(hls, Arc::new(ok_auth()))
 }
 
 fn router_no_static_with_auth(
@@ -582,8 +564,8 @@ fn build_state(
         Arc::new(t::FakeSimilarItems),
         Arc::new(t::FakeSearch),
         Arc::new(t::FakeDto),
-        Arc::new(OkAuth),
-        Arc::new(OkAuth),
+        Arc::new(ok_auth()),
+        Arc::new(ok_auth()),
         Arc::new(t::FakeQuickConnect),
         Arc::new(t::FakePlaylists),
         Arc::new(t::FakeCollections),
@@ -605,7 +587,7 @@ fn build_state(
 }
 
 /// An authorization context that rejects everything, so a route's auth gate is
-/// observable: with [`OkAuth`] every extractor succeeds and a missing gate looks
+/// observable: with [`ok_auth`] every extractor succeeds and a missing gate looks
 /// identical to a present one.
 struct DenyAuth;
 
@@ -660,30 +642,6 @@ impl AuthService for ApiKeyOrHeaderAuth {
         request: &RequestContext,
     ) -> Result<AuthorizationInfo, ServiceError> {
         Self::resolve(request).ok_or_else(|| ServiceError::unauthorized("no token"))
-    }
-}
-
-/// Resolves every request to this authorization.
-#[derive(Clone)]
-struct PolicyAuth(AuthorizationInfo);
-
-#[async_trait]
-impl AuthorizationContext for PolicyAuth {
-    async fn get_authorization_info(
-        &self,
-        _request: &RequestContext,
-    ) -> Result<AuthorizationInfo, ServiceError> {
-        Ok(self.0.clone())
-    }
-}
-
-#[async_trait]
-impl AuthService for PolicyAuth {
-    async fn authenticate(
-        &self,
-        _request: &RequestContext,
-    ) -> Result<AuthorizationInfo, ServiceError> {
-        Ok(self.0.clone())
     }
 }
 
@@ -818,37 +776,13 @@ fn starting_routes() -> [String; 5] {
 }
 
 /// An API key: authenticated, with no user behind it.
-struct UserlessApiKeyAuth;
-
-impl UserlessApiKeyAuth {
-    fn info() -> AuthorizationInfo {
-        AuthorizationInfo {
-            token: Some(ferrofin_model::secret::Secret::new("key")),
-            is_api_key: true,
-            is_authenticated: true,
-            ..AuthorizationInfo::default()
-        }
-    }
-}
-
-#[async_trait]
-impl AuthorizationContext for UserlessApiKeyAuth {
-    async fn get_authorization_info(
-        &self,
-        _request: &RequestContext,
-    ) -> Result<AuthorizationInfo, ServiceError> {
-        Ok(Self::info())
-    }
-}
-
-#[async_trait]
-impl AuthService for UserlessApiKeyAuth {
-    async fn authenticate(
-        &self,
-        _request: &RequestContext,
-    ) -> Result<AuthorizationInfo, ServiceError> {
-        Ok(Self::info())
-    }
+fn userless_api_key_auth() -> FixedAuth {
+    FixedAuth(AuthorizationInfo {
+        token: Some(ferrofin_model::secret::Secret::new("key")),
+        is_api_key: true,
+        is_authenticated: true,
+        ..AuthorizationInfo::default()
+    })
 }
 
 /// The transcode caps count the user the authorization names, through every
@@ -864,7 +798,7 @@ async fn a_transcode_is_the_authorizations_user_never_the_querys(#[case] api_key
     let hls = ok_hls(temp.path().to_str().unwrap(), rec.clone());
     let (router, expected) = if api_key {
         (
-            router_no_static_with_auth(hls, Arc::new(UserlessApiKeyAuth)),
+            router_no_static_with_auth(hls, Arc::new(userless_api_key_auth())),
             None,
         )
     } else {
@@ -2029,7 +1963,7 @@ async fn an_api_key_may_transcode() {
     let file = directory.path().join("output.mp4");
     std::fs::write(&file, b"progressive bytes").unwrap();
     let rec = Arc::new(Recorded::default());
-    let auth = PolicyAuth(AuthorizationInfo {
+    let auth = FixedAuth(AuthorizationInfo {
         is_authenticated: true,
         is_api_key: true,
         token: Some(ferrofin_model::secret::Secret::new("key")),
@@ -2083,7 +2017,7 @@ async fn a_token_does_not_override_the_account_policy(
     #[case] policy: ferrofin_model::users::UserPolicy,
     #[case] expected: StatusCode,
 ) {
-    let auth = PolicyAuth(AuthorizationInfo {
+    let auth = FixedAuth(AuthorizationInfo {
         user_policy: Some(Arc::new(policy)),
         ..ok_auth_info()
     });
@@ -2118,7 +2052,7 @@ async fn an_api_key_is_held_to_no_account() {
     let directory = tempfile::tempdir().unwrap();
     let file = directory.path().join("movie.mkv");
     std::fs::write(&file, b"bytes").unwrap();
-    let auth = PolicyAuth(AuthorizationInfo {
+    let auth = FixedAuth(AuthorizationInfo {
         is_api_key: true,
         user_policy: Some(Arc::new(ferrofin_model::users::UserPolicy {
             is_disabled: true,
@@ -2211,7 +2145,7 @@ async fn a_static_request_for_a_disc_folder_needs_a_caller_to_transcode() {
     let rec = Arc::new(Recorded::default());
     let app = router_with_sources(
         ok_hls(file.to_str().unwrap(), Arc::clone(&rec)),
-        Arc::new(OkAuth),
+        Arc::new(ok_auth()),
         disc(),
     );
     let response = app.oneshot(authed("GET", &path)).await.unwrap();

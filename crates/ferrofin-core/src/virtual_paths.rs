@@ -43,6 +43,15 @@ impl VirtualPathExpander {
         Self::default()
     }
 
+    /// This server's internal metadata directory, `None` for
+    /// [`Self::identity`].
+    #[must_use]
+    pub fn internal_metadata_path(&self) -> Option<String> {
+        self.paths
+            .as_ref()
+            .map(|paths| paths.internal_metadata_path())
+    }
+
     /// The stored path with both tokens replaced, case-insensitively, as
     /// `string.Replace(…, StringComparison.OrdinalIgnoreCase)` does upstream.
     #[must_use]

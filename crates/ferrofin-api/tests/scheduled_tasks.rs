@@ -17,15 +17,16 @@ use axum::http::{Request, StatusCode};
 use ferrofin_api::create_router;
 use ferrofin_api::state::AppState;
 use ferrofin_api::test_support::{
-    FakeActivity, FakeApiKeys, FakeAppHost, FakeClientEventLogger, FakeCollections, FakeConfig,
-    FakeDevices, FakeDisplayPreferences, FakeDto, FakeFileSystem, FakeLibrary, FakeLocalization,
-    FakeLyrics, FakeMediaSegments, FakeMediaSources, FakeMusic, FakePlaylists, FakeProviders,
-    FakeQuickConnect, FakeSearch, FakeSessions, FakeSimilarItems, FakeSubtitles, FakeSystem,
-    FakeTrickplay, FakeTvSeries, FakeUserData, FakeUserViews, FakeUsers,
+    FakeActivity, FakeApiKeys, FakeAppHost, FakeAuthContext, FakeAuthService,
+    FakeClientEventLogger, FakeCollections, FakeConfig, FakeDevices, FakeDisplayPreferences,
+    FakeDto, FakeFileSystem, FakeLibrary, FakeLocalization, FakeLyrics, FakeMediaSegments,
+    FakeMediaSources, FakeMusic, FakePlaylists, FakeProviders, FakeQuickConnect, FakeSearch,
+    FakeSessions, FakeSimilarItems, FakeSubtitles, FakeSystem, FakeTrickplay, FakeTvSeries,
+    FakeUserData, FakeUserViews, FakeUsers, FixedAuth,
 };
 use ferrofin_model::tasks::{TaskInfo, TaskState};
 use ferrofin_traits::error::ServiceError;
-use ferrofin_traits::net::{AuthService, AuthorizationContext, RequestContext};
+use ferrofin_traits::net::{AuthService, AuthorizationContext};
 use ferrofin_traits::options::AuthorizationInfo;
 use ferrofin_traits::tasks::TaskManager;
 
@@ -35,51 +36,12 @@ use ferrofin_traits::tasks::TaskManager;
 /// so this stub authenticates as an API key — which satisfies the policy
 /// without a user/policy lookup, exactly as C# does. The gate itself is pinned
 /// end to end in `apps/ferrofin-server/tests/elevation.rs`.
-struct OkAuth;
-
-#[async_trait]
-impl AuthService for OkAuth {
-    async fn authenticate(&self, _r: &RequestContext) -> Result<AuthorizationInfo, ServiceError> {
-        Ok(AuthorizationInfo {
-            is_api_key: true,
-            is_authenticated: true,
-            ..AuthorizationInfo::default()
-        })
-    }
-}
-
-#[async_trait]
-impl AuthorizationContext for OkAuth {
-    async fn get_authorization_info(
-        &self,
-        _r: &RequestContext,
-    ) -> Result<AuthorizationInfo, ServiceError> {
-        Ok(AuthorizationInfo {
-            is_api_key: true,
-            is_authenticated: true,
-            ..AuthorizationInfo::default()
-        })
-    }
-}
-
-/// A rejecting auth pair — every request is unauthenticated (`401`).
-struct NoAuth;
-
-#[async_trait]
-impl AuthService for NoAuth {
-    async fn authenticate(&self, _r: &RequestContext) -> Result<AuthorizationInfo, ServiceError> {
-        Err(ServiceError::unauthorized("no credentials"))
-    }
-}
-
-#[async_trait]
-impl AuthorizationContext for NoAuth {
-    async fn get_authorization_info(
-        &self,
-        _r: &RequestContext,
-    ) -> Result<AuthorizationInfo, ServiceError> {
-        Ok(AuthorizationInfo::default())
-    }
+fn ok_auth() -> FixedAuth {
+    FixedAuth(AuthorizationInfo {
+        is_api_key: true,
+        is_authenticated: true,
+        ..AuthorizationInfo::default()
+    })
 }
 
 /// Builds a [`TaskInfo`] with the given key/name and hidden flag.
@@ -216,14 +178,14 @@ impl TaskManager for StubTasks {
 /// other manager is a panic fake.
 fn state(tasks: Arc<StubTasks>, authed: bool) -> AppState {
     let auth_service: Arc<dyn AuthService> = if authed {
-        Arc::new(OkAuth)
+        Arc::new(ok_auth())
     } else {
-        Arc::new(NoAuth)
+        Arc::new(FakeAuthService)
     };
     let auth_context: Arc<dyn AuthorizationContext> = if authed {
-        Arc::new(OkAuth)
+        Arc::new(ok_auth())
     } else {
-        Arc::new(NoAuth)
+        Arc::new(FakeAuthContext)
     };
     AppState::new(
         Arc::new(FakeLibrary),

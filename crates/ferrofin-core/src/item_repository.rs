@@ -31,7 +31,7 @@ use ferrofin_model::dto::ItemCounts;
 use ferrofin_model::entities::ImageType;
 use ferrofin_model::entities::MediaStreamType;
 use ferrofin_model::querying::{QueryFiltersLegacy, QueryResult};
-use ferrofin_traits::options::ItemImageInfo;
+use ferrofin_traits::options::{ItemImageInfo, live_tv_image_is_internal};
 use uuid::Uuid;
 
 use ferrofin_traits::error::ServiceError;
@@ -134,6 +134,9 @@ pub struct FerrofinItemRepository {
 }
 
 /// What the files Live TV is recording right now are, asked when needed.
+///
+/// Live TV reads its timers from the reader pool to answer, so never await it
+/// while holding a pool connection or transaction.
 pub type ActiveRecordingSource = Arc<
     dyn Fn() -> std::pin::Pin<
             Box<dyn std::future::Future<Output = Result<Vec<String>, ServiceError>> + Send>,
@@ -982,6 +985,20 @@ impl FerrofinItemRepository {
     ) -> Result<HashMap<String, ferrofin_db::entities::playback::UserDataEntity>, ServiceError>
     {
         use ferrofin_db::entities::playback::UserDataEntity;
+        // `Video.SourceType` is `LiveTV` while its file is being recorded, which
+        // takes the item out of the channel arm below. Asked only when a video
+        // could be keyed by its channel, and before the reader below is taken:
+        // Live TV reads its timers from the same pool.
+        let active = if rows.iter().any(|row| {
+            row.external_id.as_ref().is_some_and(|id| !id.is_empty())
+                && row.channel_id.is_some()
+                && row.path.is_some()
+                && crate::item_type_lookup::kind_from_type_name(&row.type_).is_some_and(is_video)
+        }) {
+            self.active_recording_paths().await?
+        } else {
+            std::collections::HashSet::new()
+        };
         let ids: Vec<_> = rows.iter().map(|row| row.id.clone()).collect();
         let mut connection = self.db.pool().acquire().await.map_err(db_err)?;
         let keys: HashMap<_, _> =
@@ -1005,19 +1022,6 @@ impl FerrofinItemRepository {
                 .or_default()
                 .push(candidate);
         }
-        // `Video.SourceType` is `LiveTV` while its file is being recorded, which
-        // takes the item out of the channel arm below. Asked only when a video
-        // could be keyed by its channel.
-        let active = if rows.iter().any(|row| {
-            row.external_id.as_ref().is_some_and(|id| !id.is_empty())
-                && row.channel_id.is_some()
-                && row.path.is_some()
-                && crate::item_type_lookup::kind_from_type_name(&row.type_).is_some_and(is_video)
-        }) {
-            self.active_recording_paths().await?
-        } else {
-            std::collections::HashSet::new()
-        };
         let mut selected = HashMap::new();
         for row in rows {
             let Some(candidates) = by_item.remove(&row.id) else {
@@ -4448,16 +4452,29 @@ impl ItemRepository for FerrofinItemRepository {
         index1: i32,
         index2: i32,
     ) -> Result<bool, ServiceError> {
+        /// An image row with whether its owner is a Live TV item.
+        #[derive(sqlx::FromRow)]
+        struct Row {
+            #[sqlx(flatten)]
+            image: BaseItemImageInfoEntity,
+            #[sqlx(rename = "IsLiveTv")]
+            is_live_tv: bool,
+        }
         // Load this item's rows for the requested type in the same stable order
         // get_image_infos exposes, so the caller's 0-based indices address the
         // same images the read side does.
         let disc = image_type_to_disc(image_type);
-        let rows = sqlx::query_as::<_, BaseItemImageInfoEntity>(
-            r#"SELECT * FROM "BaseItemImageInfos" WHERE "ItemId" = ?1 AND "ImageType" = ?2
-                ORDER BY rowid"#,
+        let rows = sqlx::query_as::<_, Row>(
+            r#"SELECT ii.*, bi."Type" IN (?3, ?4) AS "IsLiveTv"
+                FROM "BaseItemImageInfos" ii
+                JOIN "BaseItems" bi ON bi."Id" = ii."ItemId"
+                WHERE ii."ItemId" = ?1 AND ii."ImageType" = ?2
+                ORDER BY ii.rowid"#,
         )
         .bind(guid_to_db(item_id))
         .bind(disc)
+        .bind(BaseItemKind::LiveTvChannel.stored_type_name())
+        .bind(BaseItemKind::LiveTvProgram.stored_type_name())
         .fetch_all(self.db.pool())
         .await
         .map_err(db_err)?;
@@ -4471,19 +4488,46 @@ impl ItemRepository for FerrofinItemRepository {
             return Ok(false);
         };
         // `!info.IsLocalFile` on either side: "Not supported yet", nothing done.
-        if is_remote_image_path(&first.path) || is_remote_image_path(&second.path) {
+        if is_remote_image_path(&first.image.path) || is_remote_image_path(&second.image.path) {
             return Ok(false);
         }
+        // `info.Path` is expanded (`BaseItemRepository.Map`), so an adopted
+        // `%MetadataPath%` row names its file.
+        let (path1, path2) = (
+            self.virtual_paths.expand(&first.image.path),
+            self.virtual_paths.expand(&second.image.path),
+        );
 
         // The same file under two rows (or one slot against itself) has nothing
         // to exchange; upstream's copy onto itself would throw.
-        if first.path == second.path {
+        if path1 == path2 {
             return Ok(false);
+        }
+        // A Live TV item's row holds what a tuner or a guide supplied, so its
+        // file is written only in the internal metadata directory; otherwise
+        // nothing is done, as for a URL. Upstream swaps any local file.
+        if first.is_live_tv {
+            let root = self.virtual_paths.internal_metadata_path();
+            for path in [&path1, &path2] {
+                let internal = match &root {
+                    Some(root) => live_tv_image_is_internal(path, std::path::Path::new(root)).await,
+                    None => false,
+                };
+                if !internal {
+                    tracing::warn!(
+                        item_id = %item_id,
+                        // A source's value: a URL other than http keeps only its
+                        // scheme and host (LOGGING.md §5).
+                        path = %ferrofin_util::source_url::redact_url(path),
+                        "did not exchange the files of a Live TV image reorder: one is outside the metadata directory"
+                    );
+                    return Ok(false);
+                }
+            }
         }
         // `SwapImagesAsync` swaps the CONTENTS of the two files — the rows keep
         // their paths — and then clears the cached dimensions and re-reads each
         // modified time from its file.
-        let (path1, path2) = (first.path.clone(), second.path.clone());
         let modified = tokio::task::spawn_blocking(move || {
             swap_image_files(std::path::Path::new(&path1), std::path::Path::new(&path2))?;
             let stamp = |path: &str| {
@@ -4504,7 +4548,7 @@ impl ItemRepository for FerrofinItemRepository {
                     SET "Width" = 0, "Height" = 0, "Blurhash" = NULL, "DateModified" = ?2
                     WHERE "Id" = ?1"#,
             )
-            .bind(&row.id)
+            .bind(&row.image.id)
             .bind(datetime_to_db(modified))
             .execute(&mut *tx)
             .await
@@ -15809,6 +15853,54 @@ mod folder_get_result_tests {
             .map(|(id, _)| *id)
             .collect();
         assert_eq!(favorites().await, expected);
+    }
+
+    /// Live TV answers `active_recording_paths` by reading its timers from the
+    /// same reader pool (`get_timer`), so the user-data filter must not hold a
+    /// reader across the call: with a one-reader pool (the in-memory test
+    /// database, a 1-CPU container, `db_pool = 1`) it waited for itself until
+    /// sqlx's 30 s acquire timeout.
+    #[tokio::test]
+    async fn the_recording_source_can_read_the_pool_while_folder_user_data_is_filtered() {
+        let db = test_db().await;
+        let user_id = Uuid::new_v4();
+        let user = seed_user_with_defaults(&db, user_id).await;
+        let slot = ActiveRecordingSlot::default();
+        let repo = repository(&db).with_active_recordings(Arc::clone(&slot));
+        let id = Uuid::new_v4();
+        seed_named_item(&db, id, BaseItemKind::Movie, "recording").await;
+        let mut entity = crate::test_support::fetch_item(&db, id).await;
+        entity.path = Some("/rec/active.ts".to_owned());
+        entity.channel_id = Some(guid_to_db(Uuid::new_v4()));
+        entity.external_id = Some("channel-key".to_owned());
+        crate::test_support::save_item(&db, &entity).await;
+        seed_user_data(&db, user_id, id, false, None).await;
+        sqlx::query(r#"INSERT INTO "UserData" ("ItemId","UserId","CustomDataKey","IsFavorite","PlayCount","PlaybackPositionTicks","Played") VALUES (?1,?2,'channel-key',1,0,0,0)"#)
+            .bind(guid_to_db(id)).bind(guid_to_db(user_id)).execute(db.writer()).await.unwrap();
+        let pool = db.pool().clone();
+        slot.set(Arc::new(move || {
+            let pool = pool.clone();
+            Box::pin(async move {
+                drop(pool.acquire().await.map_err(db_err)?);
+                Ok(vec!["/rec/active.ts".to_owned()])
+            })
+        }))
+        .ok();
+        let rows = ordered_rows(&repo, &[id]).await;
+        let query = InternalItemsQuery {
+            is_favorite: Some(true),
+            user: Some(Arc::new(user)),
+            ..Default::default()
+        };
+        let children = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            repo.filter_folder_children(rows, &query),
+        )
+        .await
+        .expect("the filter waited on the reader it was holding")
+        .unwrap();
+        // Recording, so keyed by its own id: the channel-keyed favorite is not its row.
+        assert!(children.is_empty(), "{children:?}");
     }
 
     #[tokio::test]

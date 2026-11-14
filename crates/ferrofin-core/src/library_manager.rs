@@ -3290,11 +3290,15 @@ impl LibraryManager for FerrofinLibraryManager {
         item_id: Uuid,
         provider_ids: &[(String, String)],
     ) -> Result<(), ServiceError> {
-        // An assignment, not a merge (C# `item.ProviderIds = request.ProviderIds`):
-        // `replace_provider_ids` deletes the rows the new set lacks and upserts
-        // the rest in one transaction.
+        // `item.SetProviderIds(request.ProviderIds)` (v12.4
+        // `ItemUpdateController.UpdateItem`): an assignment, not a merge, of the
+        // pairs `TrySetProviderId` keeps. `replace_provider_ids` deletes the rows
+        // the new set lacks and upserts the rest in one transaction.
+        let provider_ids = ferrofin_providers::metadata_merge::set_provider_ids(
+            provider_ids.iter().map(|(k, v)| (k.as_str(), v.as_str())),
+        );
         self.persistence
-            .replace_provider_ids(item_id, provider_ids)
+            .replace_provider_ids(item_id, &provider_ids)
             .await?;
         self.edited([item_id]);
         // The edit's save copies the new ids to the item's local versions
@@ -6227,7 +6231,7 @@ mod tests {
     }
 
     /// The metadata editor's external ids reach the `BaseItemProviders` table and
-    /// REPLACE what was there — the write behind C# `item.ProviderIds = request.ProviderIds`.
+    /// REPLACE what was there — the write behind C# `item.SetProviderIds(request.ProviderIds)`.
     #[tokio::test]
     async fn update_item_provider_ids_replaces_the_stored_set() {
         let db = test_db().await;
@@ -6264,6 +6268,48 @@ mod tests {
             .await
             .expect("lookup by the replaced id");
         assert!(stale.is_empty(), "the replaced key is gone, not merged");
+    }
+
+    /// The editor's set goes through `SetProviderIds` (v12.4
+    /// `ItemUpdateController.UpdateItem`): trimmed, an empty or invalid id
+    /// dropped, a known name in its canonical spelling.
+    #[tokio::test]
+    async fn update_item_provider_ids_sanitizes_the_set() {
+        let db = test_db().await;
+        let id = Uuid::from_u128(0x7B);
+        seed_named_item(&db, id, BaseItemKind::Movie, "Heat").await;
+        let mgr = manager(&db);
+
+        let pairs = |list: &[(&str, &str)]| -> Vec<(String, String)> {
+            list.iter()
+                .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+                .collect()
+        };
+        mgr.update_item_provider_ids(
+            id,
+            &pairs(&[
+                ("Imdb", " tt0113277 "),
+                ("Tmdb", "nm0000123"),
+                ("TmdbCollection", "   "),
+                ("tvdb", "81189"),
+                ("Custom", " x "),
+            ]),
+        )
+        .await
+        .expect("write");
+
+        let store = FerrofinItemPersistenceService::new(db.clone());
+        let mut stored = store
+            .provider_ids_for_items(&[id])
+            .await
+            .expect("ids")
+            .remove(&id)
+            .unwrap_or_default();
+        stored.sort();
+        assert_eq!(
+            stored,
+            pairs(&[("Custom", "x"), ("Imdb", "tt0113277"), ("Tvdb", "81189")])
+        );
     }
 
     #[tokio::test]

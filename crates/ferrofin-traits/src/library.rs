@@ -669,10 +669,12 @@ pub trait LibraryManager: Send + Sync {
     /// `provider_ids`.
     ///
     /// The write behind C# `ItemUpdateController.UpdateItem`'s
-    /// `item.ProviderIds = request.ProviderIds` (v10.11.8
-    /// `Jellyfin.Api/Controllers/ItemUpdateController.cs:402-410`): an
-    /// **assignment**, so a key the request omits is removed, not merged. The
-    /// caller strips empty values first, exactly as the C# does.
+    /// `item.SetProviderIds(request.ProviderIds)` (v12.4
+    /// `Jellyfin.Api/Controllers/ItemUpdateController.cs:435-438`): an
+    /// **assignment**, so a key the request omits is removed, not merged. Each
+    /// pair goes through `TrySetProviderId`: trimmed, dropped when blank, when
+    /// its name holds `=` or when the id cannot belong to its provider, and a
+    /// known provider's name stored in its canonical spelling.
     ///
     /// External ids live in their own table, not on [`BaseItemEntity`], so they
     /// cannot ride along with [`update_items`](Self::update_items) — hence a
@@ -2402,16 +2404,19 @@ pub trait UserViewManager: Send + Sync {
     /// Gets the top-level views for a user.
     async fn get_user_views(&self, user_id: Uuid) -> Result<Vec<BaseItemEntity>, ServiceError>;
 
-    /// Gets the top-level views including any the user hid from their home
-    /// screen. Used by profile settings so hidden views can be re-enabled.
-    /// Managers that do not implement hidden-view filtering can use the
-    /// ordinary view list for both requests.
-    async fn get_user_views_with_hidden(
+    /// Gets the top-level views `query` asks for: port of
+    /// `UserViewManager.GetUserViews(UserViewQuery)`. `include_hidden` keeps
+    /// the views the user hid from their home screen (profile settings use it
+    /// so hidden views can be re-enabled), `include_external_content` the
+    /// Live TV view, and `preset_views` lists a library of a named type as its
+    /// shadow view. Managers that implement none of them can use the ordinary
+    /// view list for every request.
+    async fn get_user_views_with_query(
         &self,
         user_id: Uuid,
-        include_hidden: bool,
+        query: &crate::options::UserViewQuery,
     ) -> Result<Vec<BaseItemEntity>, ServiceError> {
-        let _ = include_hidden;
+        let _ = query;
         self.get_user_views(user_id).await
     }
 
@@ -2421,8 +2426,9 @@ pub trait UserViewManager: Send + Sync {
     /// [`get_user_root_children`](Self::get_user_root_children) instead.
     ///
     /// Port of `LibraryController.GetMediaFolders`, which returns
-    /// `GetUserRootFolder().Children` sorted by `SortName`, less the libraries
-    /// whose options disable them. Unlike
+    /// `GetUserRootFolder().Children` and the playlists folder sorted by
+    /// `SortName` in the request culture, less the libraries whose options
+    /// disable them. Unlike
     /// [`get_user_views`](Self::get_user_views) (the library collection folders
     /// only), this also includes the playlists folder
     /// ([`BaseItemKind`]`::PlaylistsFolder`, `ManualPlaylistsFolder` to

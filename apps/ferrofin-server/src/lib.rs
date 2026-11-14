@@ -503,7 +503,7 @@ fn check_storage_capacity(config: &Config) -> anyhow::Result<()> {
 /// leave the startup server unable to answer.
 async fn apply_scheduled_restore_off_runtime(
     config: &Config,
-) -> anyhow::Result<Option<ferrofin_api::handlers::backup::RestoreFailure>> {
+) -> anyhow::Result<Option<ferrofin_core::backup::RestoreFailure>> {
     let config = config.clone();
     tokio::task::spawn_blocking(move || apply_scheduled_restore(&config))
         .await
@@ -521,50 +521,48 @@ async fn apply_scheduled_restore_off_runtime(
 /// to restore is not re-checked, as Jellyfin's restart loop is not.
 fn apply_scheduled_restore(
     config: &Config,
-) -> anyhow::Result<Option<ferrofin_api::handlers::backup::RestoreFailure>> {
+) -> anyhow::Result<Option<ferrofin_core::backup::RestoreFailure>> {
     static STORAGE_CHECKED: std::sync::atomic::AtomicBool =
         std::sync::atomic::AtomicBool::new(false);
     let roots = boot_tree_roots(config);
     if !STORAGE_CHECKED.swap(true, std::sync::atomic::Ordering::Relaxed)
-        || ferrofin_api::handlers::backup::restore_pending(&roots)
+        || ferrofin_core::backup::restore_pending(&roots)
     {
         check_storage_capacity(config)?;
     }
-    Ok(
-        match ferrofin_api::handlers::backup::apply_pending_restore(&roots) {
-            Ok(Some(archive)) => {
-                tracing::warn!(archive = %archive.display(), "restored backup");
-                None
-            }
-            Ok(None) => None,
-            // Moving the extracted files into place began and failed: the trees are
-            // partly replaced. Jellyfin throws out of startup here; booting on them
-            // would let the web client (which reads "the server answers again" as
-            // success) announce a restore that did not happen. The marker is gone, so
-            // the next boot starts on them, as a restarted Jellyfin does.
-            Err(failure) if failure.partially_applied => {
-                return Err(anyhow::anyhow!(
-                    "the scheduled backup restore failed part-way and the data directory may be \
+    Ok(match ferrofin_core::backup::apply_pending_restore(&roots) {
+        Ok(Some(archive)) => {
+            tracing::warn!(archive = %archive.display(), "restored backup");
+            None
+        }
+        Ok(None) => None,
+        // Moving the extracted files into place began and failed: the trees are
+        // partly replaced. Jellyfin throws out of startup here; booting on them
+        // would let the web client (which reads "the server answers again" as
+        // success) announce a restore that did not happen. The marker is gone, so
+        // the next boot starts on them, as a restarted Jellyfin does.
+        Err(failure) if failure.partially_applied => {
+            return Err(anyhow::anyhow!(
+                "the scheduled backup restore failed part-way and the data directory may be \
                  partly restored: {failure}"
-                ));
-            }
-            // Nothing was replaced (a missing or foreign archive, a marker that could
-            // not be removed, or an extraction that failed and removed what it
-            // wrote): the server boots on its untouched data and records the failure
-            // in the activity log, where an administrator will see it.
-            Err(failure) => {
-                tracing::error!(error = %failure, "scheduled backup restore failed and replaced nothing");
-                Some(failure)
-            }
-        },
-    )
+            ));
+        }
+        // Nothing was replaced (a missing or foreign archive, a marker that could
+        // not be removed, or an extraction that failed and removed what it
+        // wrote): the server boots on its untouched data and records the failure
+        // in the activity log, where an administrator will see it.
+        Err(failure) => {
+            tracing::error!(error = %failure, "scheduled backup restore failed and replaced nothing");
+            Some(failure)
+        }
+    })
 }
 
 /// Records a restore that replaced nothing in the activity log: the only durable,
 /// administrator-visible trace of it.
 async fn record_restore_failure(
     activity: &dyn ferrofin_traits::activity::ActivityManager,
-    failure: &ferrofin_api::handlers::backup::RestoreFailure,
+    failure: &ferrofin_core::backup::RestoreFailure,
 ) {
     let entry = ferrofin_traits::activity::ActivityLogCreate {
         name: "Restoring the backup failed".to_owned(),
@@ -602,7 +600,7 @@ async fn serve_once(
     // addresses below and stays bound for the whole lifetime, so a pending
     // one runs before the bind; with nothing pending the storage check runs
     // after it.
-    let restore_pending = ferrofin_api::handlers::backup::restore_pending(&boot_tree_roots(config));
+    let restore_pending = ferrofin_core::backup::restore_pending(&boot_tree_roots(config));
     let early_restore = if restore_pending {
         Some(apply_scheduled_restore_off_runtime(config).await?)
     } else {
@@ -1181,15 +1179,13 @@ fn listen_addresses(
 /// configuration manager exists: the configured data/config dirs and database
 /// file, plus `MetadataPath` read straight from `system.json` so a relocated
 /// metadata tree is restored where the server will look for it.
-fn boot_tree_roots(config: &Config) -> ferrofin_api::handlers::backup::TreeRoots {
-    let mut roots = ferrofin_api::handlers::backup::TreeRoots::defaults(
+fn boot_tree_roots(config: &Config) -> ferrofin_core::backup::TreeRoots {
+    let mut roots = ferrofin_core::backup::TreeRoots::defaults(
         &config.data_dir,
         &config.config_dir,
         &config.database_path(),
     );
-    if let Some(metadata) =
-        ferrofin_api::handlers::backup::restored_metadata_root(&config.config_dir)
-    {
+    if let Some(metadata) = ferrofin_core::backup::restored_metadata_root(&config.config_dir) {
         roots.metadata = metadata;
     }
     roots

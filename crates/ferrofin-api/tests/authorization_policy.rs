@@ -21,9 +21,11 @@
 //! **The callers**, on a server whose startup wizard is complete, each from a
 //! remote address (so `LocalAccessOrRequiresElevation` is plain elevation):
 //! see [`CALLERS`]. Each policy-named permission and each SyncPlay state is a
-//! caller of its own, so a route gated by the wrong one of them shows. A
-//! response of `401` or `403` is a rejection; any other status, a fake
-//! manager's panic (`500`) included, means the request got past the gate.
+//! caller of its own, so a route gated by the wrong one of them shows. Each
+//! operation is probed twice, with a JSON object and with no body (see
+//! [`probe`]). A response of `401` or `403` is a rejection; any other status,
+//! a fake manager's panic (`500`) included, means the request got past the
+//! gate.
 //!
 //! What each policy predicts, from `ApiServiceCollectionExtensions.cs` and
 //! the handlers behind it (`DefaultAuthorizationHandler`,
@@ -41,13 +43,13 @@ use axum::extract::ConnectInfo;
 use axum::http::{Request, StatusCode};
 use ferrofin_api::create_router;
 use ferrofin_api::test_support::{
-    FakeAuthContext, FakeAuthService, PolicyUsers, required_query, sample_user,
+    FakeAuthContext, FakeAuthService, FixedAuth, PolicyUsers, required_query, sample_user,
     setup_complete_state_as,
 };
 use ferrofin_model::sync_play::GroupInfoDto;
 use ferrofin_model::users::{AccessSchedule, DynamicDayOfWeek, UserPolicy};
 use ferrofin_traits::error::ServiceError;
-use ferrofin_traits::net::{AuthService, AuthorizationContext, RequestContext};
+use ferrofin_traits::net::{AuthService, AuthorizationContext};
 use ferrofin_traits::options::AuthorizationInfo;
 use ferrofin_traits::stubs::{
     PlaybackRequest, SyncPlayManager, SyncPlayNowPlaying, SyncPlaySession,
@@ -388,30 +390,6 @@ fn policy(caller: Caller) -> UserPolicy {
     }
 }
 
-/// Resolves and authenticates every request as one fixed identity, as a token
-/// naming it would.
-struct Identity(AuthorizationInfo);
-
-#[async_trait]
-impl AuthService for Identity {
-    async fn authenticate(
-        &self,
-        _request: &RequestContext,
-    ) -> Result<AuthorizationInfo, ServiceError> {
-        Ok(self.0.clone())
-    }
-}
-
-#[async_trait]
-impl AuthorizationContext for Identity {
-    async fn get_authorization_info(
-        &self,
-        _request: &RequestContext,
-    ) -> Result<AuthorizationInfo, ServiceError> {
-        Ok(self.0.clone())
-    }
-}
-
 /// A SyncPlay manager in which the caller is, or is not, in a group; anything
 /// past the gate is a fake's panic.
 struct SyncPlay {
@@ -467,7 +445,7 @@ fn router(caller: Caller) -> Router {
             enable_user_preference_access: policy.enable_user_preference_access,
             ..sample_user()
         };
-        let identity = Arc::new(Identity(AuthorizationInfo {
+        let identity = Arc::new(FixedAuth(AuthorizationInfo {
             is_authenticated: true,
             token: Some("policy-sweep-token".into()),
             user: Some(Arc::new(user)),
@@ -606,15 +584,21 @@ fn operations() -> BTreeMap<(String, String), Operation> {
 }
 
 /// How the gate answered `caller`'s request, and the status it saw.
-async fn probe(router: &Router, method: &str, uri: &str) -> (Outcome, StatusCode) {
-    // A JSON object, as clients send: an empty body may be refused (415)
-    // before a policy checked in the handler body is reached.
-    let request = Request::builder()
+///
+/// `json` sends a JSON object, as clients do; without it the request has no
+/// body and no content type, which the binder refuses (415). Upstream's
+/// `UseAuthorization` runs before the body is bound, so the gate must answer
+/// first either way (gl-696).
+async fn probe(router: &Router, method: &str, uri: &str, json: bool) -> (Outcome, StatusCode) {
+    let mut request = Request::builder()
         .method(method)
         .uri(uri)
-        .header("Content-Type", "application/json")
-        .extension(ConnectInfo(REMOTE.parse::<SocketAddr>().expect("address")))
-        .body(Body::from("{}"))
+        .extension(ConnectInfo(REMOTE.parse::<SocketAddr>().expect("address")));
+    if json {
+        request = request.header("Content-Type", "application/json");
+    }
+    let request = request
+        .body(Body::from(if json { "{}" } else { "" }))
         .expect("request");
     let status = router
         .clone()
@@ -655,9 +639,11 @@ async fn every_contract_operation_answers_each_caller_as_its_policy_does() {
     let mut excused = Vec::new();
     for caller in CALLERS {
         let router = router(caller);
-        for ((method, path), operation) in &operations {
+        for (((method, path), operation), json) in
+            operations.iter().flat_map(|op| [(op, true), (op, false)])
+        {
             let want = expected(caller, &operation.scopes);
-            let (got, status) = probe(&router, method, &operation.uri).await;
+            let (got, status) = probe(&router, method, &operation.uri, json).await;
             if got == want {
                 continue;
             }
@@ -671,8 +657,10 @@ async fn every_contract_operation_answers_each_caller_as_its_policy_does() {
                 continue;
             }
             failures.push(format!(
-                "{method} {path} as {}: {status}, policy {:?} expects {want:?}",
-                caller.name, operation.scopes
+                "{method} {path} as {}{}: {status}, policy {:?} expects {want:?}",
+                caller.name,
+                if json { "" } else { " without a body" },
+                operation.scopes
             ));
         }
     }
@@ -686,7 +674,7 @@ async fn every_contract_operation_answers_each_caller_as_its_policy_does() {
         .filter(|exception| !excused.contains(exception))
         .collect();
     println!(
-        "authorization policy: {} operations x {} callers",
+        "authorization policy: {} operations x {} callers x 2 bodies",
         operations.len(),
         CALLERS.len()
     );

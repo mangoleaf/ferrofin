@@ -299,6 +299,30 @@ jobs:
       - run: python3 -m unittest discover -s scripts/tests -p 'test_*.py'
       - run: scripts/ci-config-check.sh check
 
+  # The Helm chart, linted and rendered. release.yml only runs `helm package`, which renders no
+  # template, so a template error would first show on a user's `helm install` of the published
+  # chart (gl-148). The first lint renders the defaults (the chart-created PVC among them), the
+  # second the example values with every optional template file switched on. Lint checks rendering,
+  # not the Kubernetes schema. The helm is the runner image's, unpinned, so an image update can
+  # turn --strict red with no commit: hence outside `lint`, like `dependencies`. It blocks a
+  # release, not a merge.
+  chart:
+    if: *not-release-pr
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+      - run: helm version # the runner image's, which release.yml's helm-chart job packages with
+      - run: helm lint --strict charts/ferrofin
+      - run: >-
+          helm lint --strict charts/ferrofin -f charts/ferrofin/values.example.yaml
+          --set ingress.enabled=true,httpRoute.enabled=true,discovery.enabled=true,networkPolicy.enabled=true
+          --set metrics.enabled=true,metrics.serviceMonitor.enabled=true,dashboards.enabled=true
+
   # The 80% per-crate gate (scripts/coverage-gate.sh) runs as three parallel shards;
   # the aggregate `coverage` job below is the one status check main's branch protection
   # requires (matrix jobs report as `coverage-shard (core)` etc., never as `coverage`).
