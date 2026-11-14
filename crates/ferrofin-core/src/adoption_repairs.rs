@@ -4089,12 +4089,13 @@ const HARMONIZE_SNAPSHOT_EXTENSION: &str = "db.pre-harmonize";
 ///
 /// Upstream compares the dates as `DateTime`s; here they are text, written
 /// two ways for one instant: EF trims trailing fraction zeros
-/// (`2026-05-14 17:35:09.533`, `2023-08-14 00:00:00`), Ferrofin's
-/// `datetime_to_db` always writes seven digits (`… 09.5330000`). So each
-/// date is padded to the seven-digit form first — exact to the tick (100 ns),
-/// which `julianday` (milliseconds) is not, and ordered like the instant.
-/// A database Ferrofin has run on holds both forms, and a group that only
-/// differs in that way is no conflict.
+/// (`2026-05-14 17:35:09.533`, `2023-08-14 00:00:00`), and Ferrofin's
+/// `datetime_to_db` wrote seven digits (`… 09.5330000`) until 0050 moved
+/// it, and its rows, to EF's form; a previous version still writes them
+/// during a rolling update. So each date is padded to the seven-digit form
+/// first — exact to the tick (100 ns), which `julianday` (milliseconds) is
+/// not, and ordered like the instant. A group that only differs in that way
+/// is no conflict.
 const CONFLICTING_GROUPS: &str = r#"SELECT "ItemId", "UserId" FROM "UserData"
    WHERE "ItemId" <> ?1
      AND ("ItemId" > ?2 OR ("ItemId" = ?2 AND "UserId" > ?3))
@@ -6838,7 +6839,7 @@ mod tests {
     }
 
     /// One instant written two ways — EF trims fraction zeros, Ferrofin
-    /// writes seven digits — is no conflict: nothing is written (not even
+    /// wrote seven digits before 0050 — is no conflict: nothing is written (not even
     /// the other columns, which differ) and no snapshot is taken. Exact to
     /// the tick: dates one tick apart do conflict.
     #[rstest::rstest]

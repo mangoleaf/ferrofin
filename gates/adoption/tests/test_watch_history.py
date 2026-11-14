@@ -272,7 +272,7 @@ class AdoptionExpectationTest(unittest.TestCase):
         self.assertFalse(history.compare_db(expected, history.snapshot(self.db)))
 
     def test_one_instant_written_two_ways_is_no_conflict(self):
-        # EF trims trailing fraction zeros; Ferrofin writes seven digits. Likes differs,
+        # EF trims trailing fraction zeros; Ferrofin wrote seven digits before 0050. Likes differs,
         # but it is not one of the five fields the repair's query compares.
         self.play("ef", "2026-05-14 17:35:09.533", 1, 10, False)
         self.play("ferrofin", "2026-05-14 17:35:09.5330000", 1, 10, False, Likes=1)

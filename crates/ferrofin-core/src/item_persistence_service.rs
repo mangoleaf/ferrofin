@@ -3250,7 +3250,7 @@ impl ItemPersistenceService for FerrofinItemPersistenceService {
             None,
         ))
         .bind(self.virtual_paths.reverse(path))
-        .bind(chrono::Utc::now())
+        .bind(datetime_to_db(chrono::Utc::now()))
         .bind(unrated_type_name(kind))
         .execute(&mut *tx)
         .await
