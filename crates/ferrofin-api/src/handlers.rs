@@ -1421,13 +1421,19 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
                    cached_remote_image, and the scan's downloads of a credited person's \
                    profile photo and a studio's thumb (ferrofin-core library_scan.rs \
                    download_images and studio_thumb, named from the resolved type through \
-                   tmdb.rs TmdbClient::download and studios.rs StudiosClient::download), \
+                   tmdb.rs TmdbClient::download and studios.rs StudiosClient::download; \
+                   enrich_people and enrich_studio_images hand the file to ferrofin-providers \
+                   image_save.rs ImageFileSaver through finish_artwork, which puts a person's \
+                   or a studio's new art beside its own folder while that is in the server's \
+                   own directories, and otherwise follows the library's opt-in; rows stored \
+                   before keep their art-folder files), \
                    compared with \
                    MediaBrowser.Providers/Manager/ProviderManager.cs (SaveImage), \
                    MediaBrowser.Providers/Manager/ItemImageProvider.cs (EnableImageStub, \
                    SaveImageStub: a Person and a Studio are IItemByName, so their remote \
                    images reach SaveImage through a stub), \
-                   MediaBrowser.Providers/Manager/ImageSaver.cs (GetStandardSavePath), \
+                   MediaBrowser.Providers/Manager/ImageSaver.cs (SaveImage, \
+                   GetStandardSavePath), \
                    Jellyfin.Server/Startup.cs (the NamedClient.Default handler) and \
                    Emby.Server.Implementations/Library/LibraryManager.cs (UpdateImagesAsync, \
                    ConvertImageToLocal)",

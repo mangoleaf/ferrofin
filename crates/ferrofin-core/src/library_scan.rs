@@ -12953,6 +12953,18 @@ impl LibraryScanner {
                     }],
                 )
                 .await;
+                // `ConvertImageToLocal` saves it through `ImageSaver`, which
+                // keeps a person's art beside its own folder.
+                let row = match &self.item_repository {
+                    Some(items) if self.image_saver.is_some() && !infos.is_empty() => items
+                        .retrieve_item(person.id)
+                        .await
+                        .unwrap_or_else(|err| {
+                            tracing::warn!(%err, item_id = %person.id, "could not read person to save their image");
+                            None
+                        }),
+                    _ => None,
+                };
                 // Probe the file once, here, exactly as every other image-persisting
                 // path does. Without it a person image is stored 0x0, and because
                 // nothing caches a probed dimension, `DtoService` re-opens and
@@ -12962,7 +12974,12 @@ impl LibraryScanner {
                 // it writes the result back onto its in-memory BaseItem; Ferrofin
                 // reloads image rows from the DB each time, so the DB is where the
                 // answer has to live.)
-                self.fill_image_metadata(person.id, &mut infos).await;
+                if let Some(row) = &row {
+                    self.finish_artwork(person.id, row, &mut infos, None, None)
+                        .await;
+                } else {
+                    self.fill_image_metadata(person.id, &mut infos).await;
+                }
                 if let Some(primary) = infos.first() {
                     // Added only while the person still has no Primary, by the
                     // write itself: one stored during the download is kept.
@@ -13151,7 +13168,9 @@ impl LibraryScanner {
                 height: 0,
                 blur_hash: None,
             }];
-            self.fill_image_metadata(id, &mut images).await;
+            // Saved beside the studio's own folder, as `ImageSaver` keeps it.
+            self.finish_artwork(id, &entity, &mut images, None, None)
+                .await;
             match self.persistence.save_item_images(id, &images).await {
                 Ok(()) => refreshed.push(id),
                 Err(err) => skipped.note(id, &err),

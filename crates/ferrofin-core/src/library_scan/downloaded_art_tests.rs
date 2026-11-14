@@ -4,13 +4,16 @@
 //!
 //! Upstream saves both through `ProviderManager.SaveImage(item, url, …)`,
 //! which refuses a response that is no image and names the file from the
-//! type the response resolved to (gl-219).
+//! type the response resolved to (gl-219), and hands it to `ImageSaver`,
+//! which keeps a person's and a studio's artwork beside its own folder
+//! (gl-787).
 
 use std::sync::Arc;
 
 use ferrofin_db::entities::base_items::BaseItemEntity;
 use ferrofin_model::data::BaseItemKind;
 use ferrofin_model::entities::ImageType;
+use ferrofin_providers::image_save::ImageFileSaver;
 use ferrofin_traits::library::VirtualFolderManager;
 use ferrofin_traits::options::ItemImageInfo;
 use ferrofin_traits::persistence::{ItemPersistenceService, ItemRepository, WrittenPerson};
@@ -124,13 +127,16 @@ impl Fixture {
         }
     }
 
-    fn scanner(&self) -> LibraryScanner {
-        let vf: Arc<dyn VirtualFolderManager> = Arc::new(
+    fn folders(&self) -> Arc<dyn VirtualFolderManager> {
+        Arc::new(
             FerrofinVirtualFolderManager::new(self.tmp.path().join("root").join("default"))
                 .with_item_store(self.persistence.clone()),
-        );
+        )
+    }
+
+    fn scanner(&self) -> LibraryScanner {
         LibraryScanner::new(
-            vf,
+            self.folders(),
             Arc::new(FerrofinFileSystem::new()),
             self.persistence.clone(),
         )
@@ -142,6 +148,30 @@ impl Fixture {
         .with_studio_images(Arc::new(ferrofin_providers::StudiosClient::with_repo_url(
             &self.host,
         )))
+    }
+
+    /// The image saver the server wires: the metadata directory of the
+    /// application paths over the temporary folder.
+    async fn saver(&self) -> Arc<ImageFileSaver> {
+        let root = self.tmp.path();
+        let paths = Arc::new(crate::FerrofinServerApplicationPaths::new(
+            root,
+            root.join("log"),
+            root.join("server-config"),
+            root.join("cache"),
+            root.join("web"),
+        ));
+        let configuration = Arc::new(
+            crate::FerrofinServerConfigurationManager::load(paths)
+                .await
+                .expect("configuration"),
+        );
+        Arc::new(ImageFileSaver::new(
+            Arc::clone(&self.items),
+            self.folders(),
+            configuration,
+            root.join("metadata").join("library").into(),
+        ))
     }
 
     /// The person credited with the profile photo at `path` on the host.
@@ -222,6 +252,103 @@ async fn a_studio_thumb_is_named_by_its_type_and_a_non_image_is_refused() {
         .expect("read")
         .expect("row");
     assert!(refused.date_last_refreshed.is_some(), "answered");
+}
+
+/// The files in `dir`, none when it does not exist.
+fn files_in(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+    std::fs::read_dir(dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|entry| entry.path())
+        .collect()
+}
+
+/// gl-787: the photo and the thumb the scan downloads are saved where the
+/// image saver keeps a person's and a studio's artwork, beside the item's
+/// own folder (`ContainingFolderPath => Path`), as an upload is, and no copy
+/// stays in the art dir.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_downloaded_photo_and_thumb_are_saved_beside_the_item() {
+    let f = Fixture::new().await;
+    let scanner = f.scanner().with_image_saver(f.saver().await);
+
+    scanner
+        .enrich_people(&f.people, vec![f.credit("/png/ada.jpg")])
+        .await;
+    scanner
+        .enrich_studio_images(ScanRun::defaults())
+        .await
+        .expect("pass");
+
+    let metadata = f.tmp.path().join("metadata");
+    for (id, image_type, published) in [
+        (
+            f.person,
+            ImageType::Primary,
+            metadata.join("People/A/Ada Lovelace/folder.png"),
+        ),
+        (
+            f.studio,
+            ImageType::Thumb,
+            metadata.join("Studio/Mosfilm/landscape.png"),
+        ),
+    ] {
+        let images: Vec<_> = f
+            .images(id)
+            .await
+            .into_iter()
+            .map(|image| (image.image_type, image.path))
+            .collect();
+        assert_eq!(
+            images,
+            [(image_type, published.to_string_lossy().into_owned())]
+        );
+        assert_eq!(std::fs::read(&published).expect("published"), PNG);
+        let art_dir = crate::dynamic_images::own_art_dir(&metadata.join("library"), id);
+        assert_eq!(files_in(&art_dir), Vec::<std::path::PathBuf>::new());
+    }
+}
+
+/// gl-787 under the owner's rule that nothing is written into a media
+/// library without its opt-in: a person whose folder is not in the server's
+/// own directories (here, in a media folder) follows its library's "Save
+/// artwork into media folders", and with no library opting in (here, none
+/// holds the folder) the photo stays in the art dir and the folder is left
+/// alone.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_photo_is_not_written_into_a_media_folder_without_the_librarys_opt_in() {
+    let f = Fixture::new().await;
+    let folder = f.tmp.path().join("media").join("Ada Lovelace");
+    let mut row = f
+        .items
+        .retrieve_item(f.person)
+        .await
+        .expect("read")
+        .expect("row");
+    row.path = Some(folder.to_string_lossy().into_owned());
+    f.persistence.save_items(&[row]).await.expect("move");
+
+    f.scanner()
+        .with_image_saver(f.saver().await)
+        .enrich_people(&f.people, vec![f.credit("/png/ada.jpg")])
+        .await;
+
+    let art_dir = crate::dynamic_images::own_art_dir(
+        &f.tmp.path().join("metadata").join("library"),
+        f.person,
+    );
+    let paths: Vec<_> = f
+        .images(f.person)
+        .await
+        .into_iter()
+        .map(|image| image.path)
+        .collect();
+    assert_eq!(
+        paths,
+        [art_dir.join("primary.png").to_string_lossy().into_owned()]
+    );
+    assert_eq!(files_in(&folder), Vec::<std::path::PathBuf>::new());
 }
 
 /// gl-219: the extension a download is stored under, from its type, when
