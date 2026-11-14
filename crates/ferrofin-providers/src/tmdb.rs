@@ -1457,6 +1457,9 @@ pub struct TmdbCollection {
     pub name: String,
     /// The collection's overview.
     pub overview: Option<String>,
+    /// TMDB's own poster pick (`poster_path`) as an absolute URL at the
+    /// configured poster size, if it has one.
+    pub poster_url: Option<String>,
     /// Poster/backdrop candidates, TMDB's own pick first.
     pub images: Vec<RemoteImage>,
 }
@@ -1905,6 +1908,8 @@ impl TmdbClient {
                 &cfg,
             )
             .await?;
+        let poster_url = non_empty(parsed.poster_path.clone())
+            .map(|p| cfg.image_url(crate::plugin_config::TmdbImageKind::Poster, &p));
         // Preserve the legacy metadata result's single default images. The
         // remote image provider uses `collection_images` instead, because the
         // pinned source converts only the appended candidate lists.
@@ -1930,6 +1935,7 @@ impl TmdbClient {
             tmdb_id: parsed.id,
             name: parsed.name.unwrap_or_default(),
             overview: non_empty(parsed.overview),
+            poster_url,
             images,
         })
     }

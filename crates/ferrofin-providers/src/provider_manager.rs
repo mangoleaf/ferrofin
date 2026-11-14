@@ -431,13 +431,8 @@ impl RemoteSearchProvider for TmdbBoxSetSearchProvider {
             };
             return Ok(vec![RemoteSearchResult {
                 name: Some(collection.name),
-                // `GetPosterUrl(collection.PosterPath)` — TMDB's own pick, which
-                // `TmdbClient::collection` pushes first as the Primary image.
-                image_url: collection
-                    .images
-                    .iter()
-                    .find(|image| image.image_type == ImageType::Primary)
-                    .map(|image| image.url.clone()),
+                // `GetPosterUrl(collection.PosterPath)` — TMDB's own pick only.
+                image_url: collection.poster_url,
                 provider_ids: Some(HashMap::from([(
                     "Tmdb".to_owned(),
                     collection.tmdb_id.to_string(),
@@ -9926,6 +9921,13 @@ mod tests {
                     "poster_path":"/lotr.jpg"}"#
                     .to_owned(),
             ),
+            // No poster of TMDB's own pick, only alternatives.
+            (
+                "/collection/120",
+                r#"{"id":120,"name":"Untitled Collection",
+                    "images":{"posters":[{"file_path":"/alt.jpg"}],"backdrops":[]}}"#
+                    .to_owned(),
+            ),
             // TMDB has no collection 999999 — the mock stands in for that with
             // a body the client cannot read, so `collection()` yields `None`.
             ("/collection/999999", "<not json>".to_owned()),
@@ -9953,6 +9955,15 @@ mod tests {
             Some("https://image.tmdb.org/t/p/original/lotr.jpg")
         );
         assert!(results[0].overview.is_none());
+
+        // The image is `GetPosterUrl(collection.PosterPath)` alone: with no
+        // poster_path there is none, whatever alternatives the images list.
+        let results = provider
+            .get_search_results(&id_request(BaseItemKind::BoxSet, &[("Tmdb", "120")]))
+            .await
+            .expect("results");
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].image_url, None);
 
         // An id TMDB does not answer for returns nothing — C# returns
         // `Enumerable.Empty` rather than falling back to the name search, which
