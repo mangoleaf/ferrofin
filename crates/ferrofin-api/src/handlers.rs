@@ -971,6 +971,8 @@ pub const VERIFIED_SUBSYSTEMS_AGAINST_EARLIER_PIN: &[(&str, &str)] = &[];
 /// whose operations have no row of their own yet, when the progressive body
 /// they answer with ends, and how many jobs ffmpeg may run for them and the
 /// HLS routes;
+/// `transcode-arguments` is the ffmpeg command line of a job on the stream
+/// routes and the HLS routes, in the parts its row names;
 /// `video-stream-copy` is whether a transcode job copies the source video and
 /// what dynamic HDR metadata the copy strips, which the HLS and stream routes
 /// share; `recording-postprocessing` is the executable run after a retained
@@ -989,6 +991,7 @@ pub const SUBSYSTEM_KEYS: &[&str] = &[
     "websocket-streams",
     "scan-failure-isolation",
     "progressive-transcode",
+    "transcode-arguments",
     "trickplay-extraction",
     "trickplay",
     "video-stream-copy",
@@ -1701,6 +1704,128 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
              the exited job, where upstream adds the new one beside it and \
              OnTranscodeBeginRequest still finds the exited one first. Jellyfin bugs not \
              ported (gl-1373).",
+        ],
+    },
+    VerifiedSubsystem {
+        key: "transcode-arguments",
+        upstream_file: "MediaBrowser.Controller/MediaEncoding/EncodingHelper.cs",
+        upstream_method: "GetInputArgument",
+        ferrofin: "The input and map arguments of a transcode job's ffmpeg command line, for \
+                   the HLS and the progressive stream routes alike: every input option but the \
+                   hardware device and decoder ones, and the -map arguments. \
+                   apps/ferrofin-server planner.rs build_arguments' input and map blocks: \
+                   fast_seek_ticks with the \
+                   encoder's get_time_parameter (GetFastSeekCommandLineParameter and \
+                   MediaEncoder.GetTimeParameter: the request's start, half a second later \
+                   for an HLS remux of a video stream, clamped to [0, runtime - 5 s] when the \
+                   runtime is known), the source's User-Agent and Referer headers \
+                   (GetUserAgentParam, GetRefererParam), ferrofin-mediaencoding \
+                   encoder/media_encoder.rs InputAnalysis::input_args \
+                   (GetFfmpegAnalyzeDurationArg and GetFfmpegProbesizeArg: the source's own \
+                   AnalyzeDurationMs, else the configured analyze duration, and the \
+                   configured probe size, defaults 200M and 1G as upstream's), \
+                   transcoding/segment_cleaner.rs \
+                   input_sync_arguments, input_rate_arguments and input_source_arguments \
+                   (GetInputModifier's -async and -vsync from AttachMediaSourceInfo's \
+                   InputAudioSync and InputVideoSync, -re, -readrate and -readrate_catchup, \
+                   -fflags +igndts and the looping reconnect options) over \
+                   transcoding/throttler.rs effective_input_protocol (AttachMediaSourceInfo's \
+                   EncoderPath and EncoderProtocol), encoding_helper/hw/input_args.rs \
+                   graphical_sub_canvas_size (GetGraphicalSubCanvasSize), concat_input with \
+                   disc.rs concat_file_path and ensure_concat_config (GetInputArgument's DVD \
+                   and Blu-ray branch, MediaEncoder.GenerateConcatConfig), media_encoder.rs \
+                   source_input_argument and encoder/encoding_utils.rs get_input_argument \
+                   (MediaEncoder.GetInputPathArgument and GetInputArgument, EncodingUtils: \
+                   file: or bluray: before a path, a URL bare), encoding_helper/helper.rs \
+                   external_stream_input_arguments and needs_external_subtitle_muxing (the \
+                   rest of GetInputArgument: the external subtitle, read through the .idx \
+                   beside a VobSub .sub, then the external audio; NeedsExternalSubtitleMuxing), \
+                   and EncodingHelper::map_args with subtitle_map_args, \
+                   negative_map_args_by_filters and find_index (GetMapArgs, \
+                   GetNegativeMapArgsByFilters, FindIndex). Compared with those methods at the \
+                   pinned v12.4 tag, and with DynamicHlsController.GetCommandLineArguments and \
+                   EncodingHelper.GetProgressiveVideoFullCommandLine and \
+                   GetProgressiveAudioFullCommandLine for where they go. The input options \
+                   come in another order, which ffmpeg does not mind: each applies to the next \
+                   -i. The software graphical-subtitle overlay maps its own graph's output, \
+                   labelled [v], where upstream maps the raw video, cancels it with \
+                   GetNegativeMapArgsByFilters and leaves the graph unlabelled; ffmpeg muxes \
+                   the same streams in the same order either way. Not part of this row: the \
+                   hardware device and decoder arguments (GetInputVideoHwaccelArgs, \
+                   GetHardwareVideoDecoder) and the video filter graph, gl-1766; the video \
+                   encoder and its arguments, gl-1765; the audio arguments, gl-1767; and the \
+                   output and HLS muxer arguments, the -copyts of upstream's HLS command line \
+                   among them, gl-1768",
+        date: "2026-11-14",
+        divergences: &[
+            "Four GetInputModifier rules are not ported: -fflags +genpts for every job \
+             copying the video (IsCopyCodec(OutputVideoCodec)) or reading a source with \
+             GenPtsInput, +ignidx for a source with IgnoreIndex (an in-progress recording), \
+             -rtsp_transport tcp+udp -rtsp_flags prefer_tcp for an RTSP input, and \
+             AttachMediaSourceInfo's -async 1 for a wma or asf container. Fix path: \
+             gl-1779.",
+            "A job reading a video file with hardware acceleration configured passes no -f \
+             with the container's input format (GetInputFormat). Fix path: gl-1676.",
+            "A job behind a hardware decoder passes no -noautoscale. Fix path: gl-928.",
+            "A seeked HLS job copying the video passes -noaccurate_seek (not for a wtv \
+             input), which upstream does not: Ferrofin's HLS output carries -output_ts_offset \
+             in place of upstream's -copyts, and without it a re-encoded audio track would \
+             start at the seek target while the copied video starts at the keyframe before \
+             it, measured 3 s apart (gl-406). Deliberate divergence; the timing model it \
+             rests on is to be recorded by gl-1768.",
+            "A seeked audio-only HLS job passes -noaccurate_seek too, which starts an Opus or \
+             Vorbis track that it re-encodes up to 0.3 s before its target; upstream seeks it \
+             accurately. Fix path: gl-1778.",
+            "Each external input is synced to the media file's clock with -isync 0 from \
+             ffmpeg 5.1, which upstream does not pass: without -copyts each input's timeline \
+             would start at its own first packet. Deliberate divergence; the timing model it \
+             rests on is to be recorded by gl-1768.",
+            "A bitmap sidecar (.sup, VobSub), embedded or burned in, is read from its start \
+             rather than seeked like the media file (gl-1200), and on an ffmpeg before 5.1 \
+             (or of a version that cannot be read) with -seek_timestamp 1 and -itsoffset \
+             -<seek> in place of -isync (gl-929); helper.rs external_stream_input_arguments \
+             records the measurements. Still open there: one clock on every ffmpeg, an owner \
+             decision (gl-1214), a bitmap on screen at a seeked embed's start (gl-1215), and \
+             a converted bitmap sidecar before ffmpeg 5.0 (gl-1221).",
+            "A seeked progressive stream that embeds an external text sidecar, on an ffmpeg \
+             before 5.1 (or of a version that cannot be read), reads a copy the server's \
+             subtitle encoder cut to the start (FilterEvents), neither seeked nor synced and \
+             mapped as 1:0, since that ffmpeg's output trim cannot cut the sidecar as \
+             upstream's server-side cut does (gl-1199). Deliberate divergence.",
+            "A sidecar whose path is a URL is read from the URL; upstream's muxing writes \
+             -i file: before the URL, which ffmpeg cannot open. Jellyfin bug not ported \
+             (gl-1722).",
+            "An audio request maps the audio stream its job planned on (-vn, -map 0:<index> \
+             and the subtitle maps). Upstream's HLS and progressive audio command lines carry \
+             no -map, so ffmpeg picks its default audio stream, which in a file with several \
+             can be another one than the copy, bitrate and channel decisions read. Jellyfin \
+             bug not ported.",
+            "An audio request's SubtitleStreamIndex selects a subtitle, which upstream sets \
+             for a video request alone, so an audio request with an embedded subtitle and \
+             SubtitleMethod=Embed maps it into an output without a subtitle codec and ffmpeg \
+             fails to start. Fix path: gl-1780.",
+            "A video request for a file without a video stream seeks to its start, not half \
+             a second later: upstream's IsVideoRequest gate also offsets such a request when \
+             it asks for VideoCodec=copy, though the half second exists to land on a video \
+             keyframe. Jellyfin bug not ported.",
+            "A seek of 24 hours or more is written in total hours; upstream's TimeSpan format \
+             hh:mm:ss.fff drops the whole days, so it seeks to that time of the first day. \
+             Jellyfin bug not ported.",
+            "An ffmpeg whose version cannot be read at all (any required library older than \
+             4.4's or not listed) gets no -vsync -1 for a native-rate or wtv source, where \
+             upstream's EncoderVersion < 5.1 is true for a null version and passes it. A git \
+             build, read as 4.4 from its libraries as upstream reads it, gets -vsync -1, as \
+             upstream does, which ffmpeg 9 rejects. Fix path: gl-1796.",
+            "The analyze duration and probe size are Ferrofin settings (ffmpeg_analyze_duration, \
+             ffmpeg_probe_size) with upstream's defaults, clamped to 1M-600M and 1M-4G, and a \
+             blank value is the default, so the flags are always passed; Jellyfin drops a flag \
+             whose FFmpeg: value is empty and takes any value. Deliberate divergence (owner \
+             decision 2026-11-12, gl-734).",
+            "Header values, URLs and paths each reach ffmpeg as one argv element; upstream \
+             puts a User-Agent, a Referer or a URL raw between quotes in its command string, \
+             where a quote inside ends the value. A disc-rip playlist file whose path holds a \
+             line break is refused, since the concat demuxer would read the rest as \
+             directives; upstream writes it. Jellyfin bugs not ported.",
         ],
     },
     VerifiedSubsystem {
