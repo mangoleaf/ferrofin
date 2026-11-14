@@ -9,13 +9,13 @@
 //! extraction, and the hardware environment probe ([`encoding_helper::hw`]).
 //! The hardware argument builders themselves — device-init graphs, hardware
 //! decoder selection, tonemapping, and the per-vendor filter chains — are the
-//! named work items of the hardware-transcoding roadmap. Blu-ray (`BdInfo`) is
-//! tracked separately as an open work item in that plan; it belongs to
-//! disc-image playback rather than to encoding, so it needs its own plan.
+//! named work items of the hardware-transcoding roadmap. DVD and Blu-ray
+//! folder rips are read through their primary playlist ([`disc`]).
 
 pub mod analysis;
 pub mod attachments;
 pub mod configuration;
+pub mod disc;
 pub mod encoder;
 pub mod encoding_helper;
 pub mod error;

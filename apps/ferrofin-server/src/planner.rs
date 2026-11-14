@@ -37,6 +37,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use ferrofin_core::FerrofinServerApplicationPaths;
 use ferrofin_hls::{PlaylistKind, StreamStatePlanner, TranscodePlan};
+use ferrofin_mediaencoding::disc;
 use ferrofin_mediaencoding::encoder::media_encoder::InputAnalysis;
 use ferrofin_mediaencoding::encoder::{FfmpegVersion, split_args};
 use ferrofin_mediaencoding::encoding_helper::helper::{
@@ -58,7 +59,7 @@ use ferrofin_traits::library::MediaSourceManager;
 use ferrofin_traits::media_encoding::{
     AttachmentExtractor, HlsStreamRequest, MediaEncoder, SubtitleEncoder, TranscodingJobType,
 };
-use ferrofin_traits::system::PathManager;
+use ferrofin_traits::system::{PathManager, ServerApplicationPaths};
 
 use crate::encoding_options::EncodingOptionsReader;
 
@@ -1285,18 +1286,24 @@ impl StreamStatePlanner for FerrofinStreamStatePlanner {
         // segment or a progressive stream; a playlist build and a HEAD request
         // start none). The condition is upstream's, which reads the method and
         // the always-burn-in flag, not whether the video is copied.
-        // TODO(gl-480): upstream extracts a DVD or Blu-ray rip's attachments
-        // from its `{cache}/concat/{id}.concat` input; the planner builds no
-        // concat input yet, so a rip's attachments are read from its path.
+        // A DVD or Blu-ray rip's attachments come from its concat input, as
+        // its transcode does.
         let starts_ffmpeg = !request.is_head_request && (progressive || segment_id.is_some());
+        let concat_path = self.concat_input(&state.media_source);
+        if starts_ffmpeg && let Some(path) = &concat_path {
+            disc::ensure_concat_config(self.encoder.as_ref(), &state.media_source, path).await?;
+        }
         if starts_ffmpeg
             && (state.subtitle_delivery_method == SubtitleDeliveryMethod::Encode
                 || state.base_request.always_burn_in_subtitle_when_transcoding)
             && let Some(sub) = state.subtitle_stream.as_ref()
             && let Some((extractor, _)) = &self.attachments
         {
+            let input = concat_path
+                .as_ref()
+                .map_or_else(|| media_path.clone(), |p| p.to_string_lossy().into_owned());
             extractor
-                .extract_all_attachments(&media_path, &state.media_source)
+                .extract_all_attachments(&input, &state.media_source)
                 .await?;
             if let Some(mks) = sub
                 .path
@@ -1427,6 +1434,12 @@ fn is_mks(path: &str) -> bool {
 }
 
 impl FerrofinStreamStatePlanner {
+    /// A DVD or Blu-ray rip's ffmpeg input, `{cache}/concat/{id}.concat`
+    /// (`EncodingHelper.GetInputArgument`); `None` for any other source.
+    fn concat_input(&self, source: &MediaSourceInfo) -> Option<PathBuf> {
+        disc::is_disc_rip(source).then(|| disc::concat_file_path(&self.paths.cache_path(), source))
+    }
+
     /// The character set an external text subtitle is read in, or `None`.
     ///
     /// `GetTextSubtitlesFilter` asks the subtitle encoder for an external
@@ -1957,22 +1970,29 @@ impl FerrofinStreamStatePlanner {
         args.extend(
             ferrofin_mediaencoding::transcoding::segment_cleaner::input_source_arguments(state),
         );
-        push_split(&mut args, "-i");
-        let mut input_source = state.media_source.clone();
-        input_source.protocol =
-            ferrofin_mediaencoding::transcoding::throttler::effective_input_protocol(state);
-        let input = self.encoder.get_input_argument(media_path, &input_source);
-        // `get_input_argument` shell-quotes the path (`file:"…"`, inner `\` and
-        // `"` escaped) for the string-command probe path. The segment transcoder
-        // spawns ffmpeg via argv (no shell), so those quotes would become part of
-        // the filename and ffmpeg would fail to open it (exit 254) for any path
-        // containing a space. Unquote it back into a single argv token. `quote`
-        // always balances, and the fallback is one token, which can never add an
-        // option.
-        args.extend(split_args(&input).unwrap_or_else(|error| {
-            tracing::debug!(%error, "input argument does not split; passing it as one");
-            vec![input]
-        }));
+        if let Some(concat) = self.concat_input(&state.media_source) {
+            // `GetInputArgument`'s disc-rip branch: the primary playlist's
+            // files through the concat demuxer, each path one argv element.
+            args.extend(["-f", "concat", "-safe", "0", "-i"].map(str::to_owned));
+            args.push(concat.to_string_lossy().into_owned());
+        } else {
+            push_split(&mut args, "-i");
+            let mut input_source = state.media_source.clone();
+            input_source.protocol =
+                ferrofin_mediaencoding::transcoding::throttler::effective_input_protocol(state);
+            let input = self.encoder.get_input_argument(media_path, &input_source);
+            // `get_input_argument` shell-quotes the path (`file:"…"`, inner `\`
+            // and `"` escaped) for the string-command probe path. The segment
+            // transcoder spawns ffmpeg via argv (no shell), so those quotes
+            // would become part of the filename and ffmpeg would fail to open it
+            // (exit 254) for any path containing a space. Unquote it back into a
+            // single argv token. `quote` always balances, and the fallback is
+            // one token, which can never add an option.
+            args.extend(split_args(&input).unwrap_or_else(|error| {
+                tracing::debug!(%error, "input argument does not split; passing it as one");
+                vec![input]
+            }));
+        }
         // The rest of `GetInputArgument`: an external subtitle the job embeds
         // or overlays, then an external audio track, as the inputs the maps
         // and the overlay pads below number 1 and 2, each on the media
@@ -2817,7 +2837,6 @@ fn segment_path(playlist: &std::path::Path, index: i32, extension: &str) -> Path
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ferrofin_traits::system::ServerApplicationPaths as _;
 
     use ferrofin_mediaencoding::encoding_helper::downmix;
     use ferrofin_model::configuration::HlsAudioSeekStrategy;
@@ -2958,7 +2977,11 @@ mod tests {
             &self,
             _request: &ferrofin_traits::media_encoding::MediaInfoRequest,
         ) -> Result<MediaSourceInfo, ServiceError> {
-            Ok(MediaSourceInfo::default())
+            // A minute per file, for a disc rip's concat durations.
+            Ok(MediaSourceInfo {
+                run_time_ticks: Some(60 * TICKS_PER_SECOND),
+                ..MediaSourceInfo::default()
+            })
         }
         async fn extract_audio_image(
             &self,
@@ -4835,6 +4858,83 @@ mod tests {
         assert_eq!(*attachments.inputs.lock().unwrap(), ["/media/movie.mkv"]);
     }
 
+    /// A DVD or Blu-ray rip is read through `{cache}/concat/{id}.concat`, as
+    /// `EncodingHelper.GetInputArgument` reads it: written once its first
+    /// ffmpeg starts (a playlist build starts none), one `file`/`duration`
+    /// pair per file of the primary playlist (`disc` tests the playlists),
+    /// and the attachments before a burn-in come from it too
+    /// (`TranscodeManager.StartFfMpeg`).
+    #[tokio::test]
+    async fn a_disc_rip_is_read_through_its_concat_file() {
+        let rip = tempfile::tempdir().unwrap();
+        let video_ts = rip.path().join("VIDEO_TS");
+        std::fs::create_dir_all(&video_ts).unwrap();
+        // The menus are left out of the playlist.
+        for vob in ["VIDEO_TS.VOB", "VTS_01_0.VOB", "VTS_01_1.VOB"] {
+            std::fs::write(video_ts.join(vob), b"").unwrap();
+        }
+        let mut dvd = source(
+            GUID_SOURCE,
+            vec![
+                video_stream("mpeg2video"),
+                audio_stream("ac3"),
+                subtitle_stream("ass", 2),
+            ],
+        );
+        dvd.path = Some(rip.path().to_string_lossy().into_owned());
+        dvd.video_type = Some(ferrofin_model::entities::VideoType::Dvd);
+        let attachments = Arc::new(FakeAttachments::default());
+        let mut p = planner(vec![dvd]);
+        p.subtitles = Arc::new(fake_subtitles(None, ""));
+        let p = with_fake_attachments(p, Arc::clone(&attachments));
+        let concat = std::path::Path::new(&p.paths.cache_path())
+            .join("concat")
+            .join(format!("{GUID_SOURCE}.concat"));
+
+        p.plan(&burn_request(2), false, None, PlaylistKind::Vod)
+            .await
+            .unwrap();
+        assert!(!concat.exists(), "a playlist build starts no ffmpeg");
+
+        let plan = p
+            .plan(&burn_request(2), false, Some(0), PlaylistKind::Vod)
+            .await
+            .unwrap();
+        let concat_arg = concat.to_string_lossy().into_owned();
+        let input = plan.arguments.iter().position(|a| a == "-f").unwrap();
+        assert_eq!(
+            plan.arguments[input..input + 6],
+            ["-f", "concat", "-safe", "0", "-i", concat_arg.as_str()]
+        );
+        assert_eq!(*attachments.inputs.lock().unwrap(), [concat_arg]);
+        assert_eq!(
+            std::fs::read_to_string(&concat).unwrap(),
+            format!(
+                "file '{}'\nduration 60\n",
+                video_ts.join("VTS_01_1.VOB").display()
+            )
+        );
+
+        // Written once: a later segment reads the file as it is.
+        std::fs::write(&concat, "kept").unwrap();
+        p.plan(&burn_request(2), false, Some(1), PlaylistKind::Vod)
+            .await
+            .unwrap();
+        assert_eq!(std::fs::read_to_string(&concat).unwrap(), "kept");
+
+        // A rip with nothing to play fails its first ffmpeg start.
+        std::fs::remove_file(&concat).unwrap();
+        std::fs::remove_file(video_ts.join("VTS_01_1.VOB")).unwrap();
+        let Err(err) = p
+            .plan(&burn_request(2), false, Some(0), PlaylistKind::Vod)
+            .await
+        else {
+            panic!("a rip with no playable file planned");
+        };
+        assert!(err.to_string().contains("no playable files"), "{err}");
+        assert!(!concat.exists());
+    }
+
     /// The hardware chains build both `subtitles` spellings from the same
     /// filter, so the fonts reach the `alpha`/`sub2video` one too.
     #[tokio::test]
@@ -5336,10 +5436,9 @@ mod tests {
         req.video_codec = Some("h264".to_owned());
         req.subtitle_stream_index = Some(2);
         req.subtitle_method = Some("Encode".to_owned());
-        let plan = p
-            .plan(&req, false, Some(0), PlaylistKind::Vod)
-            .await
-            .unwrap();
+        // A playlist build: the source is no real rip, so a started ffmpeg
+        // would fail to read its playlist for the concat file.
+        let plan = p.plan(&req, false, None, PlaylistKind::Vod).await.unwrap();
         let args = plan.arguments.join(" ");
         assert!(args.contains("overlay"), "burned in: {args}");
         assert!(args.contains("[0:3]"), "the ffmpeg index, 2 + 1: {args}");
