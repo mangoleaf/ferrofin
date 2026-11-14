@@ -13,7 +13,8 @@
 //! a home videos library, two playlists and the folder view on. Over real HTTP
 //! (`tower::oneshot` against the real router), every row of `GET /UserViews`
 //! and of the user root's listing must report the `ChildCount` its own browse,
-//! `GET /Items?parentId=<row>`, totals.
+//! `GET /Items?parentId=<row>`, totals; the user root itself counts its
+//! libraries only.
 
 use std::time::{Duration, Instant};
 
@@ -318,6 +319,19 @@ async fn libraries_views_and_the_playlists_folder_count_what_they_list() {
             .any(|(kind, _, count, _)| kind == "ManualPlaylistsFolder" && *count == Some(2)),
         "the playlists folder counts its two playlists: {root:?}"
     );
+    // gl-851: the user root's own `ChildCount` is its own rows, the two
+    // libraries, though its listing above also holds the playlists folder
+    // (v12.4 `DtoService.GetChildCount` takes `GetChildCountBatch`'s entry).
+    let (status, user_root) = send(
+        &router,
+        &auth_header,
+        "GET",
+        &format!("/Items/Root?userId={user_id}"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{user_root}");
+    assert_eq!(user_root["ChildCount"], 2, "{user_root}");
 }
 
 /// Percent-encodes a path for a query string, keeping `/`.
