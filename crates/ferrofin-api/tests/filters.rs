@@ -308,6 +308,7 @@ impl LibraryManager for StubLibrary {
             kind.stored_type_name()
                 .expect("a stored kind")
                 .clone_into(&mut item.type_);
+            item.is_folder = kind == BaseItemKind::Folder;
             return Ok(Some(item));
         }
         Ok((id == SEED_ID).then(|| item_entity(SEED_ID, "Seed")))
@@ -1203,6 +1204,46 @@ async fn items_filters_refuses_an_unknown_parent() {
     let (status, _) = get_with(
         Arc::clone(&library),
         &format!("/Items/Filters?includeItemTypes=Movie&parentId={parent}"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let query = library
+        .last_legacy_query
+        .lock()
+        .expect("lock")
+        .clone()
+        .expect("aggregated");
+    assert_eq!(query.ancestor_ids, vec![parent]);
+}
+
+/// gl-971: a parent that is no `Folder` answers empty legacy filters
+/// (v12.4 `FilterController.cs:73-76`), and nothing is aggregated.
+#[tokio::test]
+async fn items_filters_for_a_parent_that_is_not_a_folder_are_empty() {
+    let parent = Uuid::from_u128(0xF00D);
+    let library = Arc::new(StubLibrary {
+        parent: Some((parent, BaseItemKind::Movie)),
+        ..StubLibrary::default()
+    });
+    let (status, body) = get_with(
+        Arc::clone(&library),
+        &format!("/Items/Filters?parentId={parent}"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let filters: QueryFiltersLegacy = serde_json::from_slice(&body).expect("legacy filters");
+    assert_eq!(filters, QueryFiltersLegacy::default());
+    assert!(library.last_legacy_query.lock().expect("lock").is_none());
+
+    // A by-name artist is stored `IsFolder = 0` but is a `Folder` upstream:
+    // its subtree is the scope.
+    let library = Arc::new(StubLibrary {
+        parent: Some((parent, BaseItemKind::MusicArtist)),
+        ..StubLibrary::default()
+    });
+    let (status, _) = get_with(
+        Arc::clone(&library),
+        &format!("/Items/Filters?parentId={parent}"),
     )
     .await;
     assert_eq!(status, StatusCode::OK);

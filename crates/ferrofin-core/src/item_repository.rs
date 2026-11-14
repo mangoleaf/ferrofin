@@ -12590,6 +12590,61 @@ mod tests {
         );
     }
 
+    /// gl-971: a non-folder `parentId` reaches the by-name lists and `/Years`
+    /// as `ItemIds` (v12.4 `GenresController.cs:128-138`,
+    /// `YearsController.cs:111-128`): the inner content query, its per-kind
+    /// counts and the year extraction see that one item, through the type
+    /// filter.
+    #[tokio::test]
+    async fn an_item_id_scope_lists_that_items_own_values() {
+        let db = test_db().await;
+        let repository = repo(&db);
+        let (one, other) = (Uuid::from_u128(0x9A01), Uuid::from_u128(0x9A02));
+        for (id, name, genre, year) in [
+            (one, "One", "Action", 2003),
+            (other, "Other", "Drama", 2010),
+        ] {
+            seed_named_item(&db, id, BaseItemKind::Movie, name).await;
+            seed_item_genre(&db, id, genre).await;
+            seed_item_genre(&db, id, "Common").await;
+            set_production_year(&db, id, year).await;
+        }
+        let scoped = InternalItemsQuery {
+            item_ids: vec![one],
+            ..InternalItemsQuery::default()
+        };
+
+        let genres = repository.get_genres(&scoped).await.expect("genres");
+        let counts: Vec<_> = genres
+            .items
+            .iter()
+            .map(|row| {
+                (
+                    row.item.name.clone().unwrap_or_default(),
+                    row.counts.movie_count,
+                )
+            })
+            .collect();
+        // "Common" is on both movies: one counted means the counts are scoped too.
+        assert_eq!(counts, [("Action".to_owned(), 1), ("Common".to_owned(), 1)]);
+        assert_eq!(
+            repository.get_distinct_years(&scoped).await.expect("years"),
+            [2003]
+        );
+        let series_only = InternalItemsQuery {
+            include_item_types: vec![BaseItemKind::Series],
+            ..scoped
+        };
+        assert!(
+            repository
+                .get_distinct_years(&series_only)
+                .await
+                .expect("years")
+                .is_empty(),
+            "the type filter still applies"
+        );
+    }
+
     /// Only a listing that can hold a playlist reads them: a type-limited
     /// browse without `Playlist`, a named id and a folder's direct children
     /// pay nothing, and a caller that checks visibility itself is left to it.
