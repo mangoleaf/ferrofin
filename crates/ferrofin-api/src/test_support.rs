@@ -265,8 +265,7 @@ pub fn elevated_fake_state() -> AppState {
 }
 
 /// [`elevated_fake_state`] over the given library and system managers, for an
-/// admin-only handler whose behaviour depends on them (the backup create's
-/// scan and free-space guards).
+/// admin-only handler whose behaviour depends on them.
 #[must_use]
 pub fn elevated_state_with(
     library: Arc<dyn LibraryManager>,
@@ -498,6 +497,43 @@ impl AuthService for ApiKeyAuthService {
     }
 }
 
+/// A fake [`AuthService`] and [`AuthorizationContext`] that answers every
+/// request with the same [`AuthorizationInfo`], whatever its credentials say.
+#[derive(Clone)]
+pub struct FixedAuth(pub AuthorizationInfo);
+
+impl FixedAuth {
+    /// Signed in as `user`, with no cached policy and no API key.
+    #[must_use]
+    pub fn signed_in(user: UserEntity) -> Self {
+        Self(AuthorizationInfo {
+            user: Some(Arc::new(user)),
+            is_authenticated: true,
+            ..AuthorizationInfo::default()
+        })
+    }
+}
+
+#[async_trait]
+impl AuthService for FixedAuth {
+    async fn authenticate(
+        &self,
+        _request: &RequestContext,
+    ) -> Result<AuthorizationInfo, ServiceError> {
+        Ok(self.0.clone())
+    }
+}
+
+#[async_trait]
+impl AuthorizationContext for FixedAuth {
+    async fn get_authorization_info(
+        &self,
+        _request: &RequestContext,
+    ) -> Result<AuthorizationInfo, ServiceError> {
+        Ok(self.0.clone())
+    }
+}
+
 /// Implements [`LibraryManager`] for a library fake: the methods given, then
 /// every other required one, which INFRA-level tests never reach.
 macro_rules! fake_library_manager {
@@ -649,20 +685,6 @@ fake_library_manager!(FakeLibrary {
     }
 });
 
-/// [`FakeLibrary`] in the middle of a full library validation
-/// ([`LibraryManager::is_scan_running`]), for the work that refuses or stands
-/// down while a library scan runs.
-pub struct ScanningLibrary;
-
-fake_library_manager!(ScanningLibrary {
-    async fn queue_library_scan(&self) -> Result<(), ServiceError> {
-        unimplemented!("fake")
-    }
-    fn is_scan_running(&self) -> bool {
-        true
-    }
-});
-
 /// [`FakeLibrary`] that counts the library scans queued through it, scoped
 /// or not, for the routes whose requested refresh is under test.
 #[derive(Default)]
@@ -723,40 +745,10 @@ impl ferrofin_traits::media_encoding::EncoderSupport for CommonEncoders {
 /// indistinguishable from a denial.
 #[must_use]
 pub fn sample_user() -> UserEntity {
-    UserEntity {
-        id: "11111111-1111-1111-1111-111111111111".to_owned(),
-        audio_language_preference: None,
-        authentication_provider_id: String::new(),
-        cast_receiver_id: None,
-        display_collections_view: false,
-        display_missing_episodes: false,
-        enable_auto_login: false,
-        enable_local_password: false,
-        enable_next_episode_auto_play: false,
-        enable_user_preference_access: false,
-        hide_played_in_latest: false,
-        internal_id: 0,
-        invalid_login_attempt_count: 0,
-        last_activity_date: None,
-        last_login_date: None,
-        login_attempts_before_lockout: None,
-        max_active_sessions: 0,
-        max_parental_rating_score: None,
-        max_parental_rating_sub_score: None,
-        must_update_password: false,
-        password: None,
-        password_reset_provider_id: String::new(),
-        play_default_audio_track: false,
-        remember_audio_selections: false,
-        remember_subtitle_selections: false,
-        remote_client_bitrate_limit: None,
-        row_version: 0,
-        subtitle_language_preference: None,
-        subtitle_mode: 0,
-        sync_play_access: 0,
-        username: "bench".to_owned(),
-        normalized_username: "BENCH".to_owned(),
-    }
+    fake_user_entity(
+        Uuid::from_u128(0x1111_1111_1111_1111_1111_1111_1111_1111),
+        "bench",
+    )
 }
 
 /// An [`AuthService`] that authenticates as [`sample_user`], so a
@@ -1468,8 +1460,7 @@ impl SessionManager for FakeSessions {
 /// A fake [`SystemManager`]. The info getters return a default value so the
 /// now-real `/System/Info` and `/System/Info/Public` handlers resolve (the
 /// contract probe expects them to route, not `404`); `restart` accepts the
-/// request (the backup-restore handler schedules a restart, and its test
-/// asserts the on-disk marker instead); shutdown/storage stay `unimplemented!`.
+/// request; shutdown/storage stay `unimplemented!`.
 /// `snapshot_database` writes a stand-in database file, and `free_space_of`
 /// reports a disk that never fills.
 pub struct FakeSystem;
@@ -1586,8 +1577,8 @@ impl ServerApplicationPaths for FakePaths {
         String::new()
     }
     fn program_data_path(&self) -> String {
-        // A process-unique temp root so path-backed handlers (e.g. Backup) have a
-        // real, writable directory to operate in during tests.
+        // A process-unique temp root so path-backed handlers have a real,
+        // writable directory to operate in during tests.
         std::env::temp_dir()
             .join(format!("ferrofin-api-test-data-{}", std::process::id()))
             .to_string_lossy()

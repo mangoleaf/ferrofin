@@ -306,6 +306,11 @@ pub struct Inner {
     /// unset those routes report the plugin unavailable (`404`, like a
     /// Jellyfin server without the plugin's controller).
     pub ldap: Option<Arc<dyn ferrofin_traits::ldap::LdapManager>>,
+
+    /// The backup engine behind the `/Backup*` routes. `None` until the
+    /// composition root wires it via [`AppState::with_backup`]; while unset
+    /// those routes answer `500`.
+    pub backup: Option<Arc<dyn ferrofin_traits::backup::BackupService>>,
 }
 
 /// How many [`FileSystem`] calls handlers may have on the blocking pool at once
@@ -474,6 +479,7 @@ impl AppState {
             playback_metrics: None,
             merge_versions: None,
             ldap: None,
+            backup: None,
             music,
             similar_items,
             search,
@@ -1084,6 +1090,22 @@ impl AppState {
         let inner = Arc::get_mut(&mut self.inner)
             .expect("with_ldap must be called before the state is shared");
         inner.ldap = Some(ldap);
+        self
+    }
+
+    /// Wires the backup engine behind the `/Backup*` routes.
+    ///
+    /// [`new`](Self::new) leaves it unset (the routes answer `500`); the
+    /// composition root calls this with the `ferrofin-core` implementation.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the inner state is already shared (cloned).
+    #[must_use]
+    pub fn with_backup(mut self, backup: Arc<dyn ferrofin_traits::backup::BackupService>) -> Self {
+        let inner = Arc::get_mut(&mut self.inner)
+            .expect("with_backup must be called before the state is shared");
+        inner.backup = Some(backup);
         self
     }
 

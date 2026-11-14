@@ -17,14 +17,22 @@
 //! `KNOWN_UNREACHABLE`, so the coverage claim stays honest.
 
 use std::collections::BTreeSet;
+use std::sync::Arc;
 
+use async_trait::async_trait;
 use axum::Router;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use ferrofin_api::create_router;
 use ferrofin_api::test_support::elevated_fake_state;
+use ferrofin_model::sync_play::GroupInfoDto;
+use ferrofin_traits::error::ServiceError;
+use ferrofin_traits::stubs::{
+    PlaybackRequest, SyncPlayManager, SyncPlayNowPlaying, SyncPlaySession,
+};
 use serde_json::{Map, Value, json};
 use tower::ServiceExt;
+use uuid::Uuid;
 
 /// How deep nested members are probed.
 const MAX_DEPTH: usize = 2;
@@ -222,6 +230,49 @@ fn expected_prefix(path: &[Step], top_array: bool) -> String {
     key
 }
 
+/// A wired SyncPlay manager, so the SyncPlay routes get past their access
+/// policy (the elevated caller is an API key, which passes it) to the body;
+/// a probe the binder accepts reaches it and panics like every other fake.
+struct FakeSyncPlay;
+
+#[async_trait]
+impl SyncPlayManager for FakeSyncPlay {
+    async fn new_group(
+        &self,
+        _s: &SyncPlaySession,
+        _n: &str,
+        _p: Option<&SyncPlayNowPlaying>,
+    ) -> Result<GroupInfoDto, ServiceError> {
+        unimplemented!("fake")
+    }
+    async fn join_group(&self, _s: &SyncPlaySession, _g: Uuid) -> Result<(), ServiceError> {
+        unimplemented!("fake")
+    }
+    async fn leave_group(&self, _s: &SyncPlaySession) -> Result<(), ServiceError> {
+        unimplemented!("fake")
+    }
+    async fn list_groups(&self, _s: &SyncPlaySession) -> Result<Vec<GroupInfoDto>, ServiceError> {
+        unimplemented!("fake")
+    }
+    async fn get_group(
+        &self,
+        _s: &SyncPlaySession,
+        _g: Uuid,
+    ) -> Result<GroupInfoDto, ServiceError> {
+        unimplemented!("fake")
+    }
+    async fn handle_request(
+        &self,
+        _s: &SyncPlaySession,
+        _r: PlaybackRequest,
+    ) -> Result<(), ServiceError> {
+        unimplemented!("fake")
+    }
+    async fn is_user_active(&self, _u: Uuid) -> Result<bool, ServiceError> {
+        unimplemented!("fake")
+    }
+}
+
 /// JSON-body operations the oracle cannot reach, with the reason. Empty: every
 /// one is checked.
 const KNOWN_UNREACHABLE: &[&str] = &[];
@@ -249,7 +300,7 @@ async fn every_json_body_member_binds_ignoring_case() {
         default_hook(info);
     }));
     let spec = spec();
-    let router = create_router(elevated_fake_state());
+    let router = create_router(elevated_fake_state().with_sync_play(Arc::new(FakeSyncPlay)));
     let mut unreachable = BTreeSet::new();
     let (mut operations, mut members, mut skipped) = (0, 0, 0);
     for (path, item) in spec["paths"].as_object().expect("paths") {

@@ -16,6 +16,7 @@ use ferrofin_api::test_support::{
     FakeFileSystem, FakeLibrary, FakeLocalization, FakeLyrics, FakeMediaSources, FakeMusic,
     FakePaths, FakePlaylists, FakeProviders, FakeSearch, FakeSessions, FakeSimilarItems,
     FakeSubtitles, FakeSystem, FakeTrickplay, FakeTvSeries, FakeUserData, FakeUserViews, FakeUsers,
+    FixedAuth,
 };
 use ferrofin_model::branding::BrandingOptions;
 use ferrofin_model::configuration::ServerConfiguration;
@@ -850,24 +851,16 @@ async fn plugin_routes_are_elevated_as_upstream() {
 
 /// An administrator whose account may not connect from outside the local
 /// network.
-struct AdminWithoutRemoteAccess;
-
-#[async_trait]
-impl ferrofin_traits::net::AuthService for AdminWithoutRemoteAccess {
-    async fn authenticate(
-        &self,
-        _request: &ferrofin_traits::net::RequestContext,
-    ) -> Result<ferrofin_traits::options::AuthorizationInfo, ServiceError> {
-        Ok(ferrofin_traits::options::AuthorizationInfo {
-            is_authenticated: true,
-            user: Some(Arc::new(ferrofin_api::test_support::sample_user())),
-            user_policy: Some(Arc::new(ferrofin_model::users::UserPolicy {
-                is_administrator: true,
-                ..Default::default()
-            })),
+fn admin_without_remote_access() -> FixedAuth {
+    FixedAuth(ferrofin_traits::options::AuthorizationInfo {
+        is_authenticated: true,
+        user: Some(Arc::new(ferrofin_api::test_support::sample_user())),
+        user_policy: Some(Arc::new(ferrofin_model::users::UserPolicy {
+            is_administrator: true,
             ..Default::default()
-        })
-    }
+        })),
+        ..Default::default()
+    })
 }
 
 /// `SkipIntroController` is `[Authorize]` too, so its three elevated writes
@@ -883,7 +876,7 @@ async fn skip_intro_writes_check_remote_access_as_upstream() {
             started: Mutex::new(Vec::new()),
         }),
         Arc::new(MemConfig::default()),
-        Arc::new(AdminWithoutRemoteAccess),
+        Arc::new(admin_without_remote_access()),
     );
     let id = Uuid::from_u128(1);
     for (method, uri, want) in [

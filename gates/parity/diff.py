@@ -954,7 +954,7 @@ ROLES = ("oracle", "ferrofin")
 #: Reads in flight per server at once (PARITY_CONCURRENCY): default 4, 1 to 8 (run.sh holds the same range).
 CONCURRENCY_DEFAULT = 4
 CONCURRENCY_RANGE = (1, 8)
-#: Between the polls of a read-back that waits for a background refresh (lib.sh's POLL_S, 1 s).
+#: Between the polls of a read-back that waits for a background refresh (gates/isolation.sh's POLL_S, 1 s).
 SETTLE_POLL_S = 1
 
 

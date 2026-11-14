@@ -24,7 +24,7 @@ use ferrofin_model::data::CollectionType;
 use ferrofin_model::dto::{BaseItemDto, SpecialViewOptionDto};
 use ferrofin_model::entities::CollectionTypeOptions;
 use ferrofin_model::querying::QueryResult;
-use ferrofin_traits::options::DtoOptions;
+use ferrofin_traits::options::{DtoOptions, UserViewQuery};
 use uuid::Uuid;
 
 use crate::auth::RequireAuth;
@@ -80,33 +80,57 @@ fn is_eligible_for_grouping(collection_type: Option<CollectionType>) -> bool {
     )
 }
 
-/// Query parameters for `GET /UserViews`.
+/// Query parameters for `GET /UserViews/GroupingOptions`.
 ///
 /// `userId` is optional in the contract; when omitted it defaults to the
 /// authenticated caller (Jellyfin's `RequestHelpers.GetUserId`).
 #[derive(Debug, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct UserViewsQuery {
+struct GroupingOptionsQuery {
     /// The target user; defaults to the authenticated caller when absent.
     #[serde(
         default,
         deserialize_with = "crate::handlers::query_parse::empty_as_none_uuid"
     )]
     user_id: Option<Uuid>,
-    /// Include views the user hid from the home screen. Profile settings use
-    /// this to keep hidden views available for re-enabling.
+}
+
+/// Query parameters for `GET /UserViews`: `UserViewsController.GetUserViews`'
+/// four. `userId` defaults to the authenticated caller.
+#[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GetUserViewsQuery {
+    /// The target user; defaults to the authenticated caller when absent.
+    #[serde(
+        default,
+        deserialize_with = "crate::handlers::query_parse::empty_as_none_uuid"
+    )]
+    user_id: Option<Uuid>,
+    /// Whether to list the channels and the Live TV view; `true` when absent
+    /// (`UserViewQuery`'s default).
+    #[serde(default)]
+    include_external_content: Option<bool>,
+    /// Comma-delimited library types to list as their shadow views; tokens
+    /// that are no `CollectionType` are dropped
+    /// (`CommaDelimitedCollectionModelBinder`).
+    #[serde(default)]
+    preset_views: Option<String>,
+    /// Include views hidden from the home screen.
     #[serde(default)]
     include_hidden: bool,
 }
 
 /// `GET /UserViews` — the target user's library views.
 ///
-/// Port of `UserViewsController.GetUserViews`.
+/// Port of `UserViewsController.GetUserViews`: `includeExternalContent`, when
+/// given, and a non-empty `presetViews` go into the `UserViewQuery`.
 #[utoipa::path(
     get,
     path = "/UserViews",
     params(
         ("userId" = Option<String>, Query, description = "The user id"),
+        ("includeExternalContent" = Option<bool>, Query, description = "Include channels and Live TV (default true)"),
+        ("presetViews" = Option<String>, Query, description = "Comma-delimited library types listed as their shadow views"),
         ("includeHidden" = Option<bool>, Query, description = "Include views hidden from the home screen"),
     ),
     // Body schema omitted: `BaseItemDto` is self-referential and its derived
@@ -118,13 +142,20 @@ struct UserViewsQuery {
 async fn get_user_views(
     State(state): State<AppState>,
     RequireAuth(auth): RequireAuth,
-    Query(query): Query<UserViewsQuery>,
+    Query(query): Query<GetUserViewsQuery>,
 ) -> Result<Json<QueryResult<BaseItemDto>>, ApiError> {
     let user = resolve_user(&state, &auth, query.user_id).await?;
     let user_id = user_uuid(&user)?;
+    let view_query = UserViewQuery {
+        include_external_content: query.include_external_content.unwrap_or(true),
+        include_hidden: query.include_hidden,
+        preset_views: crate::handlers::query_parse::parse_csv_enums_lenient(
+            query.preset_views.as_deref(),
+        ),
+    };
     let folders = state
         .user_views
-        .get_user_views_with_hidden(user_id, query.include_hidden)
+        .get_user_views_with_query(user_id, &view_query)
         .await?;
     // C# `GetUserViews` builds `new DtoOptions()` — ALL item fields (minus the two
     // default-excluded ones); its `AddClientFields` + explicit appends are subsumed.
@@ -167,7 +198,7 @@ async fn get_user_views(
 async fn get_grouping_options(
     State(state): State<AppState>,
     RequireAuth(auth): RequireAuth,
-    Query(query): Query<UserViewsQuery>,
+    Query(query): Query<GroupingOptionsQuery>,
 ) -> Result<Json<Vec<SpecialViewOptionDto>>, ApiError> {
     let user = resolve_user(&state, &auth, query.user_id).await?;
     // Grouping options come from the root libraries the user can open,
@@ -209,7 +240,7 @@ async fn get_user_views_for_user(
     state: State<AppState>,
     auth: RequireAuth,
     axum::extract::Path(DotnetGuid(user_id)): axum::extract::Path<DotnetGuid>,
-    Query(mut query): Query<UserViewsQuery>,
+    Query(mut query): Query<GetUserViewsQuery>,
 ) -> Result<Json<QueryResult<BaseItemDto>>, ApiError> {
     query.user_id = Some(user_id);
     get_user_views(state, auth, Query(query)).await
@@ -222,9 +253,8 @@ async fn get_grouping_options_for_user(
     auth: RequireAuth,
     axum::extract::Path(DotnetGuid(user_id)): axum::extract::Path<DotnetGuid>,
 ) -> Result<Json<Vec<SpecialViewOptionDto>>, ApiError> {
-    let query = UserViewsQuery {
+    let query = GroupingOptionsQuery {
         user_id: Some(user_id),
-        include_hidden: false,
     };
     get_grouping_options(state, auth, Query(query)).await
 }
@@ -242,7 +272,8 @@ pub fn register(router: Router<AppState>) -> Router<AppState> {
 }
 
 crate::query::query_parameters! {
-    UserViewsQuery {} => [("get", "/UserViews"), ("get", "/UserViews/GroupingOptions")];
+    GetUserViewsQuery { "presetViews" => ',' } => [("get", "/UserViews")];
+    GroupingOptionsQuery {} => [("get", "/UserViews/GroupingOptions")];
 }
 
 #[cfg(test)]
@@ -267,11 +298,13 @@ mod tests {
 
     #[test]
     fn user_views_can_request_hidden_views() {
-        let hidden: UserViewsQuery =
+        let hidden: GetUserViewsQuery =
             serde_urlencoded::from_str("includeHidden=true").expect("query parses");
         assert!(hidden.include_hidden);
 
-        let defaulted: UserViewsQuery = serde_urlencoded::from_str("").expect("empty query");
+        let defaulted: GetUserViewsQuery = serde_urlencoded::from_str("").expect("empty query");
         assert!(!defaulted.include_hidden);
+        assert_eq!(defaulted.include_external_content, None);
+        assert_eq!(defaulted.preset_views, None);
     }
 }

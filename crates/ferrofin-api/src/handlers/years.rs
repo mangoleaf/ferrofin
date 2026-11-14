@@ -25,8 +25,8 @@ use crate::auth::RequireAuth;
 use crate::error::ApiError;
 use crate::extract::Query;
 use crate::handlers::by_name::{additional_dto_options, project_item_rows, resolve_parent};
-use crate::handlers::items::{parse_order_by, resolve_user_or_api_key};
-use crate::handlers::query_parse::parse_csv_enums_lenient;
+use crate::handlers::items::resolve_user_or_api_key;
+use crate::handlers::query_parse::{parse_csv_enums_lenient, parse_order_by};
 use crate::state::AppState;
 
 /// The query parameters honoured by `GET /Years`.
@@ -118,10 +118,17 @@ async fn get_years(
     // A `parentId` naming no item, the zero id included, is `GetParentItem`'s
     // `ArgumentException`: a 400.
     let parent = resolve_parent(&state, &auth, query.parent_id, user.as_deref()).await?;
-    let playlist = parent.is_some_and(|row| {
+    let playlist = parent.as_ref().is_some_and(|row| {
         BaseItemKind::from_stored_type_name(&row.type_) == Some(BaseItemKind::Playlist)
     });
+    // A parent that is not a folder (`!parentItem.IsFolder`, the stored
+    // `IsFolder`) is the only item: `new[] { parentItem }.Where(Filter)`
+    // (v12.4 `YearsController.cs:111-128`), so the answer is its own year,
+    // if the type and media-type filters keep it, whether or not it is an
+    // alternate version or an owned item.
+    let only_item = parent.as_ref().is_some_and(|row| !row.is_folder);
     let parent_id = match query.parent_id {
+        Some(_) if only_item => Uuid::nil(),
         Some(parent) => parent,
         None if !recursive => state
             .library
@@ -146,6 +153,8 @@ async fn get_years(
         limit: query.limit,
         recursive,
         parent_id,
+        item_ids: query.parent_id.filter(|_| only_item).into_iter().collect(),
+        include_owned_items: only_item,
         include_item_types,
         exclude_item_types,
         media_types,

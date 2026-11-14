@@ -8,7 +8,10 @@
 //!
 //! Every route is gated by the user's `SyncPlayAccess` policy first — the C#
 //! `[Authorize(Policy = Policies.SyncPlay*)]` attributes, which land here as
-//! `require_access` because Ferrofin has no attribute-driven policy layer. An
+//! the `SyncPlayAuth` extractor because Ferrofin has no attribute-driven
+//! policy layer. It runs before the request body is bound, as upstream's
+//! `UseAuthorization` middleware runs before MVC model binding
+//! (`GET /SyncPlay/{id}` is the exception, see `get_group`). An
 //! administrator or an API key passes every one, as upstream's default handler
 //! grants them.
 //!
@@ -16,10 +19,12 @@
 //! ([`AppState::with_sync_play`](crate::state::AppState::with_sync_play)); until
 //! then these routes return `501`.
 
+use std::marker::PhantomData;
 use std::sync::Arc;
 
-use axum::extract::{Path, State};
+use axum::extract::{FromRequestParts, Path, State};
 use axum::http::StatusCode;
+use axum::http::request::Parts;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -196,25 +201,61 @@ async fn require_access(
     }
 }
 
+/// One [`SyncPlayAccess`] requirement as a type, which [`SyncPlayAuth`] carries.
+trait Requirement {
+    /// The requirement the route's `[Authorize(Policy = …)]` names.
+    const ACCESS: SyncPlayAccess;
+}
+
+/// [`SyncPlayAccess::HasAccess`]: `POST /SyncPlay/Ping`.
+struct HasAccess;
+/// [`SyncPlayAccess::CreateGroup`]: `POST /SyncPlay/New`.
+struct CreateGroup;
+/// [`SyncPlayAccess::JoinGroup`]: `Join` and `List`.
+struct JoinGroup;
+/// [`SyncPlayAccess::IsInGroup`]: `Leave` and the playback verbs but `Ping`.
+struct IsInGroup;
+
+impl Requirement for HasAccess {
+    const ACCESS: SyncPlayAccess = SyncPlayAccess::HasAccess;
+}
+impl Requirement for CreateGroup {
+    const ACCESS: SyncPlayAccess = SyncPlayAccess::CreateGroup;
+}
+impl Requirement for JoinGroup {
+    const ACCESS: SyncPlayAccess = SyncPlayAccess::JoinGroup;
+}
+impl Requirement for IsInGroup {
+    const ACCESS: SyncPlayAccess = SyncPlayAccess::IsInGroup;
+}
+
+/// [`RequireAuth`] plus the route's SyncPlay requirement `R`. An extractor,
+/// so it answers before the body is bound: upstream's `UseAuthorization`
+/// refuses the caller before MVC reads `[FromBody, Required]`, so a refused
+/// caller is `403` whatever the body, never `400` or `415` (gl-696).
+struct SyncPlayAuth<R>(AuthorizationInfo, PhantomData<R>);
+
+impl<R: Requirement> FromRequestParts<AppState> for SyncPlayAuth<R> {
+    type Rejection = ApiError;
+
+    async fn from_request_parts(
+        parts: &mut Parts,
+        state: &AppState,
+    ) -> Result<Self, Self::Rejection> {
+        let RequireAuth(auth) = RequireAuth::from_request_parts(parts, state).await?;
+        require_access(state, &auth, R::ACCESS).await?;
+        Ok(Self(auth, PhantomData))
+    }
+}
+
 /// Applies a playback [`PlaybackRequest`] to the caller's group and returns
-/// `204` — the shared body of the 17 playback endpoints.
+/// `204` — the shared body of the 17 playback endpoints, whose
+/// [`SyncPlayAuth`] already checked the caller's access.
 async fn dispatch(
     state: &AppState,
     auth: &AuthorizationInfo,
     request: PlaybackRequest,
 ) -> Result<StatusCode, ApiError> {
-    dispatch_with(state, auth, SyncPlayAccess::IsInGroup, request).await
-}
-
-/// [`dispatch`] with an explicit access requirement — `Ping` is the one verb
-/// upstream does not gate on `SyncPlayIsInGroup`.
-async fn dispatch_with(
-    state: &AppState,
-    auth: &AuthorizationInfo,
-    access: SyncPlayAccess,
-    request: PlaybackRequest,
-) -> Result<StatusCode, ApiError> {
-    require_access(state, auth, access).await?;
     let mgr = manager(state)?;
     let session = sync_play_session(state, auth).await?;
     mgr.handle_request(&session, request).await?;
@@ -230,11 +271,10 @@ async fn dispatch_with(
 /// policy and before the action, on the name as sent (the controller trims it
 /// afterwards), counting UTF-16 code units as .NET string lengths do.
 async fn new_group(
-    RequireAuth(auth): RequireAuth,
+    SyncPlayAuth(auth, _): SyncPlayAuth<CreateGroup>,
     State(state): State<AppState>,
     JsonBody(body): JsonBody<NewGroupRequestDto>,
 ) -> Result<Response, ApiError> {
-    require_access(&state, &auth, SyncPlayAccess::CreateGroup).await?;
     if body.group_name.encode_utf16().count() > GROUP_NAME_MAX_UTF16_UNITS {
         return Ok(ProblemDetails::member_validation(
             "GroupName",
@@ -254,11 +294,10 @@ async fn new_group(
 
 /// `POST /SyncPlay/Join` — join an existing group.
 async fn join_group(
-    RequireAuth(auth): RequireAuth,
+    SyncPlayAuth(auth, _): SyncPlayAuth<JoinGroup>,
     State(state): State<AppState>,
     JsonBody(body): JsonBody<JoinGroupRequestDto>,
 ) -> Result<StatusCode, ApiError> {
-    require_access(&state, &auth, SyncPlayAccess::JoinGroup).await?;
     let mgr = manager(&state)?;
     let session = sync_play_session(&state, &auth).await?;
     mgr.join_group(&session, body.group_id).await?;
@@ -267,10 +306,9 @@ async fn join_group(
 
 /// `POST /SyncPlay/Leave` — leave the caller's current group.
 async fn leave_group(
-    RequireAuth(auth): RequireAuth,
+    SyncPlayAuth(auth, _): SyncPlayAuth<IsInGroup>,
     State(state): State<AppState>,
 ) -> Result<StatusCode, ApiError> {
-    require_access(&state, &auth, SyncPlayAccess::IsInGroup).await?;
     let mgr = manager(&state)?;
     let session = sync_play_session(&state, &auth).await?;
     mgr.leave_group(&session).await?;
@@ -279,16 +317,19 @@ async fn leave_group(
 
 /// `GET /SyncPlay/List` — the groups visible to the caller.
 async fn list_groups(
-    RequireAuth(auth): RequireAuth,
+    SyncPlayAuth(auth, _): SyncPlayAuth<JoinGroup>,
     State(state): State<AppState>,
 ) -> Result<Json<Vec<GroupInfoDto>>, ApiError> {
-    require_access(&state, &auth, SyncPlayAccess::JoinGroup).await?;
     let mgr = manager(&state)?;
     let session = sync_play_session(&state, &auth).await?;
     Ok(Json(mgr.list_groups(&session).await?))
 }
 
 /// `GET /SyncPlay/{id}` — info for a single group.
+///
+/// The one route whose policy runs after its parameter binds: upstream's
+/// `{id:guid}` is a route constraint, checked by routing before
+/// `UseAuthorization`.
 async fn get_group(
     RequireAuth(auth): RequireAuth,
     State(state): State<AppState>,
@@ -304,7 +345,7 @@ async fn get_group(
 
 /// `POST /SyncPlay/SetNewQueue` — set a new play queue.
 async fn set_new_queue(
-    RequireAuth(auth): RequireAuth,
+    SyncPlayAuth(auth, _): SyncPlayAuth<IsInGroup>,
     State(state): State<AppState>,
     JsonBody(body): JsonBody<PlayRequestDto>,
 ) -> Result<StatusCode, ApiError> {
@@ -322,7 +363,7 @@ async fn set_new_queue(
 
 /// `POST /SyncPlay/SetPlaylistItem` — change the playing item.
 async fn set_playlist_item(
-    RequireAuth(auth): RequireAuth,
+    SyncPlayAuth(auth, _): SyncPlayAuth<IsInGroup>,
     State(state): State<AppState>,
     JsonBody(body): JsonBody<SetPlaylistItemRequestDto>,
 ) -> Result<StatusCode, ApiError> {
@@ -338,7 +379,7 @@ async fn set_playlist_item(
 
 /// `POST /SyncPlay/RemoveFromPlaylist` — remove queue entries (or clear).
 async fn remove_from_playlist(
-    RequireAuth(auth): RequireAuth,
+    SyncPlayAuth(auth, _): SyncPlayAuth<IsInGroup>,
     State(state): State<AppState>,
     JsonBody(body): JsonBody<RemoveFromPlaylistRequestDto>,
 ) -> Result<StatusCode, ApiError> {
@@ -356,7 +397,7 @@ async fn remove_from_playlist(
 
 /// `POST /SyncPlay/MovePlaylistItem` — reorder a queue entry.
 async fn move_playlist_item(
-    RequireAuth(auth): RequireAuth,
+    SyncPlayAuth(auth, _): SyncPlayAuth<IsInGroup>,
     State(state): State<AppState>,
     JsonBody(body): JsonBody<MovePlaylistItemRequestDto>,
 ) -> Result<StatusCode, ApiError> {
@@ -373,7 +414,7 @@ async fn move_playlist_item(
 
 /// `POST /SyncPlay/Queue` — enqueue items.
 async fn queue(
-    RequireAuth(auth): RequireAuth,
+    SyncPlayAuth(auth, _): SyncPlayAuth<IsInGroup>,
     State(state): State<AppState>,
     JsonBody(body): JsonBody<QueueRequestDto>,
 ) -> Result<StatusCode, ApiError> {
@@ -390,7 +431,7 @@ async fn queue(
 
 /// `POST /SyncPlay/Unpause` — resume group playback.
 async fn unpause(
-    RequireAuth(auth): RequireAuth,
+    SyncPlayAuth(auth, _): SyncPlayAuth<IsInGroup>,
     State(state): State<AppState>,
 ) -> Result<StatusCode, ApiError> {
     dispatch(&state, &auth, PlaybackRequest::Unpause).await
@@ -398,7 +439,7 @@ async fn unpause(
 
 /// `POST /SyncPlay/Pause` — pause group playback.
 async fn pause(
-    RequireAuth(auth): RequireAuth,
+    SyncPlayAuth(auth, _): SyncPlayAuth<IsInGroup>,
     State(state): State<AppState>,
 ) -> Result<StatusCode, ApiError> {
     dispatch(&state, &auth, PlaybackRequest::Pause).await
@@ -406,7 +447,7 @@ async fn pause(
 
 /// `POST /SyncPlay/Stop` — stop group playback.
 async fn stop(
-    RequireAuth(auth): RequireAuth,
+    SyncPlayAuth(auth, _): SyncPlayAuth<IsInGroup>,
     State(state): State<AppState>,
 ) -> Result<StatusCode, ApiError> {
     dispatch(&state, &auth, PlaybackRequest::Stop).await
@@ -414,7 +455,7 @@ async fn stop(
 
 /// `POST /SyncPlay/Seek` — seek the group.
 async fn seek(
-    RequireAuth(auth): RequireAuth,
+    SyncPlayAuth(auth, _): SyncPlayAuth<IsInGroup>,
     State(state): State<AppState>,
     JsonBody(body): JsonBody<SeekRequestDto>,
 ) -> Result<StatusCode, ApiError> {
@@ -430,7 +471,7 @@ async fn seek(
 
 /// `POST /SyncPlay/Buffering` — signal the caller is buffering.
 async fn buffering(
-    RequireAuth(auth): RequireAuth,
+    SyncPlayAuth(auth, _): SyncPlayAuth<IsInGroup>,
     State(state): State<AppState>,
     JsonBody(body): JsonBody<BufferRequestDto>,
 ) -> Result<StatusCode, ApiError> {
@@ -449,7 +490,7 @@ async fn buffering(
 
 /// `POST /SyncPlay/Ready` — signal the caller is ready.
 async fn ready(
-    RequireAuth(auth): RequireAuth,
+    SyncPlayAuth(auth, _): SyncPlayAuth<IsInGroup>,
     State(state): State<AppState>,
     JsonBody(body): JsonBody<ReadyRequestDto>,
 ) -> Result<StatusCode, ApiError> {
@@ -468,7 +509,7 @@ async fn ready(
 
 /// `POST /SyncPlay/SetIgnoreWait` — toggle whether the caller is waited for.
 async fn set_ignore_wait(
-    RequireAuth(auth): RequireAuth,
+    SyncPlayAuth(auth, _): SyncPlayAuth<IsInGroup>,
     State(state): State<AppState>,
     JsonBody(body): JsonBody<IgnoreWaitRequestDto>,
 ) -> Result<StatusCode, ApiError> {
@@ -484,7 +525,7 @@ async fn set_ignore_wait(
 
 /// `POST /SyncPlay/NextItem` — advance to the next queue item.
 async fn next_item(
-    RequireAuth(auth): RequireAuth,
+    SyncPlayAuth(auth, _): SyncPlayAuth<IsInGroup>,
     State(state): State<AppState>,
     JsonBody(body): JsonBody<NextItemRequestDto>,
 ) -> Result<StatusCode, ApiError> {
@@ -500,7 +541,7 @@ async fn next_item(
 
 /// `POST /SyncPlay/PreviousItem` — go back to the previous queue item.
 async fn previous_item(
-    RequireAuth(auth): RequireAuth,
+    SyncPlayAuth(auth, _): SyncPlayAuth<IsInGroup>,
     State(state): State<AppState>,
     JsonBody(body): JsonBody<PreviousItemRequestDto>,
 ) -> Result<StatusCode, ApiError> {
@@ -516,7 +557,7 @@ async fn previous_item(
 
 /// `POST /SyncPlay/SetRepeatMode` — set the group repeat mode.
 async fn set_repeat_mode(
-    RequireAuth(auth): RequireAuth,
+    SyncPlayAuth(auth, _): SyncPlayAuth<IsInGroup>,
     State(state): State<AppState>,
     JsonBody(body): JsonBody<SetRepeatModeRequestDto>,
 ) -> Result<StatusCode, ApiError> {
@@ -530,7 +571,7 @@ async fn set_repeat_mode(
 
 /// `POST /SyncPlay/SetShuffleMode` — set the group shuffle mode.
 async fn set_shuffle_mode(
-    RequireAuth(auth): RequireAuth,
+    SyncPlayAuth(auth, _): SyncPlayAuth<IsInGroup>,
     State(state): State<AppState>,
     JsonBody(body): JsonBody<SetShuffleModeRequestDto>,
 ) -> Result<StatusCode, ApiError> {
@@ -548,17 +589,11 @@ async fn set_shuffle_mode(
 /// upstream, so a session in no group gets `204` plus a `NotInGroup` push rather
 /// than a `403` (`SyncPlayController.SyncPlayPing`, `SyncPlayManager.HandleRequest`).
 async fn ping(
-    RequireAuth(auth): RequireAuth,
+    SyncPlayAuth(auth, _): SyncPlayAuth<HasAccess>,
     State(state): State<AppState>,
     JsonBody(body): JsonBody<PingRequestDto>,
 ) -> Result<StatusCode, ApiError> {
-    dispatch_with(
-        &state,
-        &auth,
-        SyncPlayAccess::HasAccess,
-        PlaybackRequest::Ping { ping: body.ping },
-    )
-    .await
+    dispatch(&state, &auth, PlaybackRequest::Ping { ping: body.ping }).await
 }
 
 /// Registers the `/SyncPlay/*` routes.

@@ -18,12 +18,12 @@ use std::fmt::Write as _;
 
 use async_trait::async_trait;
 use ferrofin_model::dto::MediaSourceInfo;
-use ferrofin_model::entities::IsoType;
 use ferrofin_model::entities_media::MediaStream;
 use ferrofin_model::media_info::{MediaProtocol, subtitle_format};
 use ferrofin_traits::media_encoding::TrimmedSubtitle;
 
-use crate::encoder::{get_input_argument, quote};
+use crate::encoder::media_encoder::source_input_argument;
+use crate::encoder::quote;
 use crate::encoding_helper::helper;
 use crate::error::MediaEncodingError;
 use crate::keyed_locks::KeyedLocks;
@@ -761,10 +761,7 @@ impl<P: SubtitleParser, I: SubtitleIo> SubtitleEncoder<P, I> {
     /// the caller.
     pub async fn extract_all_extractable_subtitles(&self, media_source: &MediaSourceInfo) {
         let source_path = media_source.path.clone().unwrap_or_default();
-        // TODO(parity): upstream's `GetInputPathArgument` also picks a disc rip's
-        // playlist files, the `bluray:` prefix for an ISO and the source protocol.
-        let input_path = get_input_argument("file", &source_path, MediaProtocol::File);
-        let mut args = format!("-y -i {input_path}");
+        let mut args = String::new();
         let mut output_paths: Vec<String> = Vec::new();
         // Guards for the paths this call extracts, held across the ffmpeg run so
         // concurrent extractions of the same cache never race (the C# per-path
@@ -839,6 +836,26 @@ impl<P: SubtitleParser, I: SubtitleIo> SubtitleEncoder<P, I> {
         }
 
         if !output_paths.is_empty() {
+            // `GetInputPathArgument`: a disc rip's primary playlist, the
+            // `bluray:` prefix for an ISO, the source's protocol. A rip whose
+            // playlist cannot be read ends the batch, `.mks` files included,
+            // as upstream's throw does. Upstream reads it whenever any track
+            // is due, so a rip with only `.mks` tracks due fails there too;
+            // here it is read only for an embedded track, and those `.mks`
+            // tracks are extracted.
+            let input_path =
+                match crate::disc::input_path_argument(&source_path, media_source).await {
+                    Ok(input_path) => input_path,
+                    Err(error) => {
+                        tracing::warn!(
+                            path = %ferrofin_util::source_url::redact_url(&source_path),
+                            %error,
+                            "unable to get the subtitle streams of this file"
+                        );
+                        return;
+                    }
+                };
+            let args = format!("-y -i {input_path}{args}");
             let result = self.io.extract(&args, &output_paths).await;
             let extracted = result.is_ok();
             self.validate_extraction(&source_path, &output_paths, result)
@@ -877,12 +894,7 @@ impl<P: SubtitleParser, I: SubtitleIo> SubtitleEncoder<P, I> {
 
         for file in files {
             // `MediaEncoder.GetInputArgument(mksFile, mediaSource)`.
-            let prefix = if media_source.iso_type == Some(IsoType::BluRay) {
-                "bluray"
-            } else {
-                "file"
-            };
-            let input_path = get_input_argument(prefix, file, media_source.protocol);
+            let input_path = source_input_argument(file, media_source);
             let mut args = format!("-y -i {input_path}");
             let mut output_paths: Vec<String> = Vec::new();
             let mut held = Vec::new();
