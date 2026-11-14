@@ -10535,11 +10535,12 @@ impl LibraryScanner {
             if !planner_scans_type {
                 continue;
             }
-            if let Some(gone) = folder
-                .locations
-                .iter()
-                .find(|loc| !self.file_system.directory_exists(loc))
-            {
+            if let Some(gone) = off_runtime(|| {
+                folder
+                    .locations
+                    .iter()
+                    .find(|loc| !self.file_system.directory_exists(loc))
+            }) {
                 tracing::warn!(
                     library = %cf,
                     location = %gone,
@@ -10675,22 +10676,26 @@ impl LibraryScanner {
         };
         let mut kept_on_disk = 0_usize;
         let mut kept_folders = 0_usize;
-        let mut stale: std::collections::HashSet<Uuid> = existing
-            .iter()
-            .filter(|row| row_listed(row) && !live.contains(&row.id) && !own.holds(row))
-            .filter(|row| {
-                let keep = !own.invented(row) && keep_on_disk(row);
-                if keep {
-                    if planner_resolves(&row.item_type) {
-                        kept_on_disk += 1;
-                    } else {
-                        kept_folders += 1;
+        // `keep_on_disk` stats each candidate's file: one pass off the
+        // runtime for them all.
+        let mut stale: std::collections::HashSet<Uuid> = off_runtime(|| {
+            existing
+                .iter()
+                .filter(|row| row_listed(row) && !live.contains(&row.id) && !own.holds(row))
+                .filter(|row| {
+                    let keep = !own.invented(row) && keep_on_disk(row);
+                    if keep {
+                        if planner_resolves(&row.item_type) {
+                            kept_on_disk += 1;
+                        } else {
+                            kept_folders += 1;
+                        }
                     }
-                }
-                !keep
-            })
-            .map(|row| row.id)
-            .collect();
+                    !keep
+                })
+                .map(|row| row.id)
+                .collect()
+        });
         if kept_on_disk > 0 {
             tracing::warn!(
                 library = %cf,
@@ -10765,19 +10770,21 @@ impl LibraryScanner {
         live: &std::collections::HashSet<Uuid>,
         listed: &(dyn Fn(Option<&str>) -> bool + Sync),
     ) -> usize {
-        let orphaned: Vec<Uuid> = children
-            .iter()
-            .filter(|child| {
-                child.extra_type.is_none()
-                    && child.owner_id.is_some_and(|owner| stale.contains(&owner))
-                    && !stale.contains(&child.id)
-                    && child
-                        .path
-                        .as_deref()
-                        .is_some_and(|path| self.file_system.file_exists(path))
-            })
-            .map(|child| child.id)
-            .collect();
+        let orphaned: Vec<Uuid> = off_runtime(|| {
+            children
+                .iter()
+                .filter(|child| {
+                    child.extra_type.is_none()
+                        && child.owner_id.is_some_and(|owner| stale.contains(&owner))
+                        && !stale.contains(&child.id)
+                        && child
+                            .path
+                            .as_deref()
+                            .is_some_and(|path| self.file_system.file_exists(path))
+                })
+                .map(|child| child.id)
+                .collect()
+        });
         if orphaned.is_empty() {
             return 0;
         }
