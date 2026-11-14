@@ -4622,23 +4622,19 @@ impl LiveTvManager for FerrofinLiveTvManager {
     async fn live_tv_media_type(&self, id: Uuid) -> Result<Option<String>, ServiceError> {
         // `LiveTvChannel.MediaType => ChannelType == ChannelType.Radio ?
         // MediaType.Audio : MediaType.Video` — the same mapping
-        // `add_channel_info`/`add_recording_info` already apply to the DTO.
+        // `projection::channel_media_type` stores and `apply_program_info`
+        // gives a programme.
         if let Some(row) = crate::guide_repository::channel_row(&self.db, id).await? {
             return Ok(Some(radio_or_tv_media_type(&row.channel_type).to_owned()));
         }
-        // A recording is the capture of one channel's airing, so it carries
-        // that channel's media type (upstream's `RecordingHelper` builds an
-        // `Audio` item for a radio programme and a `Movie`/`Episode`/`Video`
-        // for a television one — all `MediaType.Video`).
-        let Some(recording) = crate::dvr_repository::recording_row(&self.db, id).await? else {
-            return Ok(None);
-        };
-        let Ok(channel_id) = Uuid::parse_str(&recording.channel_id) else {
-            return Ok(None);
-        };
-        Ok(crate::guide_repository::channel_row(&self.db, channel_id)
+        // A recording is `MediaType.Video` whatever its channel: upstream
+        // writes every capture as a `.ts` file (`RecordingsManager`,
+        // `EncodedRecorder`), which the library resolves as a video item, a
+        // radio programme's too. Its entity says the same
+        // (`projection::recording_entity`).
+        Ok(crate::dvr_repository::recording_row(&self.db, id)
             .await?
-            .map(|row| radio_or_tv_media_type(&row.channel_type).to_owned()))
+            .map(|_| "Video".to_owned()))
     }
 
     async fn get_recording_media_sources(
@@ -10874,9 +10870,10 @@ mod tests {
 
     /// `LiveTvChannel.MediaType` — what the media-source manager's per-user
     /// `SupportsTranscoding`/`SupportsDirectStream` overwrite branches on
-    /// (`MediaSourceManager.GetPlaybackMediaSources`, v10.11.8
-    /// MediaSourceManager.cs:204-217). A channel is not a `BaseItems` row here,
-    /// so the Live TV manager is the only thing that can answer.
+    /// (`MediaSourceManager.GetPlaybackMediaSources`, v12.4
+    /// MediaSourceManager.cs:409-417). A channel or a DVR recording is not a
+    /// `BaseItems` row here, so the Live TV manager is the only thing that can
+    /// answer.
     #[tokio::test]
     async fn a_channel_reports_the_media_type_of_its_kind() {
         let mgr = manager_with_relative_guide().await;
@@ -10910,6 +10907,43 @@ mod tests {
             radio_mgr.live_tv_media_type(radio).await.expect("type"),
             Some("Audio".to_owned()),
             "a radio channel is MediaType.Audio"
+        );
+        // A recording of that radio channel is a `.ts` capture, which upstream's
+        // library resolves as a video item: `MediaType.Video`, not the channel's.
+        let recording = Uuid::new_v4();
+        crate::dvr_repository::insert_recording(
+            &radio_mgr.db,
+            recording,
+            &crate::dvr::TimerRecordingInfo {
+                channel_id: radio,
+                ..crate::dvr::TimerRecordingInfo::default()
+            },
+            std::path::Path::new("/recordings/Jazz FM.ts"),
+            Utc::now(),
+        )
+        .await
+        .expect("recording");
+        assert_eq!(
+            radio_mgr.live_tv_media_type(recording).await.expect("type"),
+            Some("Video".to_owned()),
+            "a radio channel's recording is MediaType.Video"
+        );
+        // Its channel is not consulted: a recording whose channel is gone is a
+        // video item all the same.
+        let orphan = Uuid::new_v4();
+        crate::dvr_repository::insert_recording(
+            &radio_mgr.db,
+            orphan,
+            &crate::dvr::TimerRecordingInfo::default(),
+            std::path::Path::new("/recordings/Gone.ts"),
+            Utc::now(),
+        )
+        .await
+        .expect("recording");
+        assert_eq!(
+            radio_mgr.live_tv_media_type(orphan).await.expect("type"),
+            Some("Video".to_owned()),
+            "a recording of no stored channel is MediaType.Video"
         );
         // An id that is neither a channel nor a recording has no media type,
         // and the caller must then leave the source as it was built.
