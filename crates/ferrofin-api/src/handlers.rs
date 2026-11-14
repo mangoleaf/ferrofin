@@ -3255,16 +3255,27 @@ pub const VERIFIED: &[Verified] = &[
         ferrofin: "handlers/live_tv.rs get_timer (RequiredRouteString: a blank timerId is a 400) → \
                find_timer (LiveTvManager.GetTimer: GetTimers with TimerQuery.Id, then the first \
                whose Id equals timerId ignoring case; none is 200 null, unchecked as upstream) → \
-               ferrofin-traits live_tv.rs get_timers_matching and filter_timers → \
-               ferrofin-livetv manager.rs get_timers (DefaultLiveTvService.GetTimersAsync: every \
-               timer but a Completed one)",
-        date: "2026-11-13",
+               ferrofin-livetv manager.rs get_timers_matching (get_timers, \
+               DefaultLiveTvService.GetTimersAsync: every timer but a Completed one; \
+               ferrofin-traits live_tv.rs filter_timers) → build_timer_dto for each \
+               (LiveTvDtoService.GetTimerInfoDto: program_row_for_timer and program_dtos with \
+               DtoOptions::default and no user for ProgramInfo, GetBaseItemDto(program, new \
+               DtoOptions()) with AddInfoToProgramDto, then TimerId and Status unless Cancelled \
+               or Error, and SeriesTimerId; \
+               guide_repository.rs channel_row and manager.rs channel_image_tags for ChannelName and \
+               ChannelPrimaryImageTag, none without the channel; RunTimeTicks from the window)",
+        date: "2026-11-14",
         divergences: &[
-            "The timer is the DTO stored at its creation or last change, not one \
-         GetTimerInfoDto builds on each read: no ProgramInfo, no ChannelPrimaryImageTag, and \
-         the guide's ChannelName at creation. Fix path: gl-1745 (then gl-853 for the artwork).",
+            "ProgramInfo is the programme DTO GET /LiveTv/Programs projects from the guide's \
+         own table, so it lacks what that table has no column for (CommunityRating, \
+         PremiereDate, Audio, an HD listing's Width and Height, the ProgramEtag and \
+         SeriesZap2It provider ids) and shows the listing's fields, not a change saved to \
+         the programme's item. Fix path: gl-763, gl-1591, gl-1690.",
+            "A series timer's timer carries no series artwork in ProgramInfo \
+         (LiveTvDtoService.FillImages). Fix path: gl-853.",
+            "The 400 body is Ferrofin's error shape, not upstream's. Fix path: gl-666.",
         ],
-        refs: &[],
+        refs: &["images"],
     },
     Verified {
         method: "delete",
@@ -3290,6 +3301,43 @@ pub const VERIFIED: &[Verified] = &[
             "The 404 body is Ferrofin's error shape, not upstream's. Fix path: gl-666.",
         ],
         refs: &[],
+    },
+    Verified {
+        method: "get",
+        path: "/LiveTv/Timers",
+        upstream_file: "Jellyfin.Api/Controllers/LiveTvController.cs",
+        upstream_method: "GetTimers",
+        ferrofin: "handlers/live_tv.rs get_timers (TimersQuery: channelId, seriesTimerId, \
+               isActive, isScheduled) → ferrofin-livetv manager.rs get_timers_matching \
+               (LiveTvManager.GetTimers: get_timers, DefaultLiveTvService.GetTimersAsync's every \
+               timer but a Completed one; ferrofin-traits live_tv.rs filter_timers: isActive as \
+               InProgress, isScheduled as New, channelId and seriesTimerId compared as GUIDs, \
+               ordered by StartDate) → build_timer_dto for each \
+               (LiveTvDtoService.GetTimerInfoDto: program_row_for_timer and program_dtos with \
+               DtoOptions::default and no user for ProgramInfo, GetBaseItemDto(program, new \
+               DtoOptions()) with AddInfoToProgramDto, then TimerId and Status unless Cancelled \
+               or Error, and SeriesTimerId; \
+               guide_repository.rs channel_row and manager.rs channel_image_tags for ChannelName and \
+               ChannelPrimaryImageTag, none without the channel; RunTimeTicks from the window)",
+        date: "2026-11-14",
+        divergences: &[
+            "A channelId or seriesTimerId that is no GUID matches no timer; upstream's new Guid \
+         throws a FormatException, a 500. Jellyfin bug not ported.",
+            "A seriesTimerId naming the id an empty series timer id hashes to (the new-timer \
+         defaults' Id) matches no timer; upstream hashes each timer's empty SeriesTimerId to \
+         that id (GetInternalSeriesTimerId), so it lists every timer of no series timer. \
+         Jellyfin bug not ported.",
+            "ProgramInfo is the programme DTO GET /LiveTv/Programs projects from the guide's \
+         own table, so it lacks what that table has no column for (CommunityRating, \
+         PremiereDate, Audio, an HD listing's Width and Height, the ProgramEtag and \
+         SeriesZap2It provider ids) and shows the listing's fields, not a change saved to \
+         the programme's item. Fix path: gl-763, gl-1591, gl-1690.",
+            "A series timer's timer carries no series artwork in ProgramInfo \
+         (LiveTvDtoService.FillImages). Fix path: gl-853.",
+            "The 400 body (a value the query binder cannot convert) is Ferrofin's error shape, \
+         not upstream's. Fix path: gl-666.",
+        ],
+        refs: &["images"],
     },
     Verified {
         method: "post",

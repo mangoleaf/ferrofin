@@ -1,10 +1,14 @@
 //! `GET` and `DELETE /LiveTv/Timers/{timerId}` over the real composition root
-//! and a real session WebSocket (gl-843).
+//! and a real session WebSocket (gl-843), and the timer DTOs as every read
+//! builds them (gl-1745).
 //!
 //! Upstream's `GetTimer` returns `LiveTvManager.GetTimer` unchecked, so an id
 //! it does not list answers `200 null`; `CancelTimer` throws
 //! `ResourceNotFoundException` for one, a `404`, and only a cancel that changed
 //! the timer's status raises `TimerCancelled`.
+//!
+//! `LiveTvDtoService.GetTimerInfoDto` adds the guide programme
+//! (`ProgramInfo`) and the channel's name and logo tag on each read.
 
 use std::path::PathBuf;
 
@@ -25,9 +29,9 @@ type ClientSocket =
 
 /// A served server whose administrator holds a socket.
 struct Fixture {
-    _wired: WiredApp,
+    wired: WiredApp,
     db: Database,
-    _temp: tempfile::TempDir,
+    temp: tempfile::TempDir,
     router: axum::Router,
     token: String,
     socket: ClientSocket,
@@ -80,9 +84,9 @@ async fn fixture() -> Fixture {
             .await
             .expect("socket upgrades");
     Fixture {
-        _wired: wired,
+        wired,
         db,
-        _temp: temp,
+        temp,
         router,
         token,
         socket,
@@ -271,4 +275,132 @@ async fn an_unknown_timer_is_200_null_to_get_and_404_to_delete_with_no_push() {
     );
     let (status, body) = f.call("DELETE", &uri, None).await;
     assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+}
+
+/// How long a lineup may take to appear after its tuner is saved.
+const LINEUP_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
+
+impl Fixture {
+    /// `GET uri` as the administrator, as JSON.
+    async fn get(&self, uri: &str) -> Value {
+        let (status, body) = self.call("GET", uri, None).await;
+        assert_eq!(status, StatusCode::OK, "{uri}: {body}");
+        serde_json::from_str(&body).expect("json")
+    }
+
+    /// Configures a playlist whose channel `one` has a logo and a guide airing
+    /// `one show` on it tomorrow (an episode, with an icon), refreshes the
+    /// guide, and returns the channel's and the programme's ids.
+    async fn guide(&self) -> (String, String) {
+        let day = (chrono::Utc::now() + chrono::Duration::days(1))
+            .format("%Y%m%d")
+            .to_string();
+        let playlist = self.temp.path().join("playlist.m3u");
+        let guide = self.temp.path().join("guide.xml");
+        std::fs::write(
+            &playlist,
+            "#EXTM3U\n#EXTINF:-1 tvg-id=\"one\" tvg-chno=\"1\" \
+             tvg-logo=\"http://art.invalid/logo.png\",one\nhttp://tuner.invalid/one\n",
+        )
+        .expect("playlist");
+        std::fs::write(
+            &guide,
+            format!(
+                "<tv><channel id=\"one\"><display-name>one</display-name></channel>\
+                 <programme start=\"{day}060000 +0000\" stop=\"{day}070000 +0000\" \
+                 channel=\"one\"><title>one show</title>\
+                 <episode-num system=\"xmltv_ns\">0.1.</episode-num>\
+                 <icon src=\"http://art.invalid/show.png\"/></programme></tv>"
+            ),
+        )
+        .expect("guide");
+        let (status, body) = self
+            .call(
+                "POST",
+                "/LiveTv/TunerHosts",
+                Some(json!({ "Type": "m3u", "Url": playlist.to_string_lossy() })),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let (status, body) = self
+            .call(
+                "POST",
+                "/LiveTv/ListingProviders",
+                Some(json!({
+                    "Type": "xmltv",
+                    "Path": guide.to_string_lossy(),
+                    "EnableAllTuners": true,
+                })),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        // Each save queued a refresh, and a later one supersedes an earlier
+        // one's write: once the lineup is listed they have all started, so the
+        // refresh below is the newest and has finished when it returns.
+        let deadline = std::time::Instant::now() + LINEUP_DEADLINE;
+        while self.get("/LiveTv/Channels").await["Items"]
+            .as_array()
+            .is_none_or(Vec::is_empty)
+        {
+            assert!(std::time::Instant::now() < deadline, "no lineup appeared");
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        self.wired
+            .state
+            .live_tv
+            .as_ref()
+            .expect("live tv is wired")
+            .refresh_guide()
+            .await
+            .expect("guide refresh");
+        let id = |page: Value| page["Items"][0]["Id"].as_str().expect("an id").to_owned();
+        (
+            id(self.get("/LiveTv/Channels").await),
+            id(self.get("/LiveTv/Programs").await),
+        )
+    }
+}
+
+/// Each read builds the timer from the guide as `GetTimerInfoDto` does: the
+/// programme as `ProgramInfo` (with the timer's id and status while it is
+/// live), and the channel's current name and logo tag (gl-1745).
+#[tokio::test]
+async fn a_timer_carries_its_programme_and_channel_as_they_are_now() {
+    let f = fixture().await;
+    let (channel, program) = f.guide().await;
+    let (status, body) = f
+        .call(
+            "POST",
+            "/LiveTv/Timers",
+            Some(json!({ "ProgramId": program, "ChannelId": channel })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+    let listed = f.get("/LiveTv/Timers").await["Items"][0].clone();
+    let id = listed["Id"].as_str().expect("the timer").to_owned();
+    let logo = f.get(&format!("/LiveTv/Channels/{channel}")).await["ImageTags"]["Primary"].clone();
+    assert!(logo.is_string(), "the channel has a logo");
+
+    let by_id = f.get(&format!("/LiveTv/Timers/{id}")).await;
+    for timer in [&listed, &by_id] {
+        let info = &timer["ProgramInfo"];
+        assert_eq!(info["Id"], program.as_str(), "{timer}");
+        assert_eq!(info["Name"], "one show", "{timer}");
+        assert_eq!(info["Type"], "Program", "{timer}");
+        assert_eq!(info["TimerId"], id.as_str(), "{timer}");
+        assert_eq!(info["Status"], "New", "{timer}");
+        assert!(info.get("SeriesTimerId").is_none(), "{timer}");
+        assert_eq!(timer["ChannelName"], "one", "{timer}");
+        assert_eq!(timer["ChannelPrimaryImageTag"], logo, "{timer}");
+    }
+
+    // The channel's name is read with the timer, not copied into it.
+    sqlx::query(r#"UPDATE "FerrofinLiveTvChannels" SET "Name" = 'renamed'"#)
+        .execute(f.db.pool())
+        .await
+        .expect("rename the channel");
+    assert_eq!(
+        f.get(&format!("/LiveTv/Timers/{id}")).await["ChannelName"],
+        "renamed"
+    );
 }

@@ -1521,16 +1521,16 @@ impl FerrofinLiveTvManager {
         }
     }
 
-    /// The `ChannelPrimaryImageTag` of each channel among `rows` that has a
+    /// The `ChannelPrimaryImageTag` of each of the channels `ids` that has a
     /// Primary image (`LiveTvDtoService.GetImageTag`), by channel id.
-    async fn channel_image_tags(&self, rows: &[&GuideProgramRow]) -> HashMap<Uuid, String> {
+    async fn channel_image_tags(&self, ids: &[Uuid]) -> HashMap<Uuid, String> {
         let mut tags = HashMap::new();
         let (Some(store), Some(images)) = (self.item_store.get(), self.images.get()) else {
             return tags;
         };
-        let ids: Vec<Uuid> = rows
+        let ids: Vec<Uuid> = ids
             .iter()
-            .filter_map(|row| Uuid::parse_str(&row.channel_id).ok())
+            .copied()
             .collect::<HashSet<_>>()
             .into_iter()
             .collect();
@@ -3918,7 +3918,7 @@ impl LiveTvManager for FerrofinLiveTvManager {
         let has_channel_info = options.fields.contains(&ItemFields::ChannelInfo);
         let has_channel_image = options.fields.contains(&ItemFields::ChannelImage);
         let tags = if has_channel_image {
-            self.channel_image_tags(&rows.values().collect::<Vec<_>>())
+            self.channel_image_tags(&program_channel_ids(rows.values()))
                 .await
         } else {
             HashMap::new()
@@ -4251,6 +4251,19 @@ impl LiveTvManager for FerrofinLiveTvManager {
     async fn get_timer(&self, id: &str) -> Result<Option<TimerInfoDto>, ServiceError> {
         self.json_get("FerrofinLiveTvTimers", SELECT_TIMER_SQL, id)
             .await
+    }
+
+    async fn get_timers_matching(
+        &self,
+        query: &ferrofin_model::live_tv::TimerQuery,
+    ) -> Result<Vec<TimerInfoDto>, ServiceError> {
+        // `LiveTvManager.GetTimers`: the service's timers, filtered, each built
+        // by `GetTimerInfoDto` as it is read.
+        let mut timers = ferrofin_traits::stubs::filter_timers(self.get_timers().await?, query);
+        for timer in &mut timers {
+            self.build_timer_dto(timer).await?;
+        }
+        Ok(timers)
     }
 
     async fn create_timer(&self, mut timer: TimerInfoDto) -> Result<String, ServiceError> {
@@ -5044,7 +5057,7 @@ impl FerrofinLiveTvManager {
         let has_channel_info = options.fields.contains(&ItemFields::ChannelInfo);
         let has_channel_image = options.fields.contains(&ItemFields::ChannelImage);
         let tags = if has_channel_image {
-            self.channel_image_tags(&rows.iter().collect::<Vec<_>>())
+            self.channel_image_tags(&program_channel_ids(rows.iter()))
                 .await
         } else {
             HashMap::new()
@@ -5190,6 +5203,58 @@ impl FerrofinLiveTvManager {
         if let Some(series_timer_id) = timer.series_timer_id.as_deref().filter(|s| !s.is_empty()) {
             dto.series_timer_id = Some(series_timer_id.to_owned());
         }
+    }
+
+    /// The read half of `LiveTvDtoService.GetTimerInfoDto` (v12.4
+    /// LiveTvDtoService.cs:52-110), which upstream runs on every read of a
+    /// timer (`LiveTvManager.GetTimers`), so the stored row is never changed.
+    ///
+    /// The guide programme the timer names becomes `ProgramInfo`
+    /// (`GetBaseItemDto(program, new DtoOptions())`), with the timer's id and
+    /// status unless it is cancelled or failed, and its series timer. The
+    /// channel gives its current name and logo tag, and the run time is the
+    /// timer's window.
+    async fn build_timer_dto(&self, timer: &mut TimerInfoDto) -> Result<(), ServiceError> {
+        // `GetTimerInfoDto` builds a new DTO: the programme and the channel's
+        // name and logo come only from this read, and it sets no parent
+        // backdrop, so a stored or posted value of any of them is dropped.
+        timer.program_info = None;
+        timer.base.channel_name = None;
+        timer.base.channel_primary_image_tag = None;
+        timer.base.parent_backdrop_item_id = None;
+        timer.base.parent_backdrop_image_tags = None;
+        timer.run_time_ticks =
+            Some((timer.base.end_date - timer.base.start_date).num_milliseconds() * 10_000);
+        // `string.IsNullOrEmpty(info.SeriesTimerId) ? null : …`.
+        timer.series_timer_id = timer.series_timer_id.take().filter(|id| !id.is_empty());
+        if let Some(program) = self.program_row_for_timer(&timer.base).await?
+            && let Some(mut info) = self
+                .program_dtos(std::slice::from_ref(&program), &DtoOptions::default(), None)
+                .await?
+                .pop()
+        {
+            if !matches!(
+                timer.status,
+                RecordingStatus::Cancelled | RecordingStatus::Error
+            ) {
+                info.timer_id.clone_from(&timer.base.id);
+                info.status = Some(recording_status_name(timer.status));
+            }
+            info.series_timer_id.clone_from(&timer.series_timer_id);
+            timer.program_info = Some(Box::new(info));
+        }
+        let channel_id = timer.base.channel_id;
+        if !channel_id.is_nil()
+            && let Some(channel) =
+                crate::guide_repository::channel_row(&self.db, channel_id).await?
+        {
+            timer.base.channel_name = Some(channel.name);
+            timer.base.channel_primary_image_tag = self
+                .channel_image_tags(&[channel_id])
+                .await
+                .remove(&channel_id);
+        }
+        Ok(())
     }
 
     // ---- DVR ------------------------------------------------------------
@@ -7982,6 +8047,12 @@ fn series_child_timer(
     // channel and the listing's own programme id all come from the guide.
     copy_program_into_timer(program, &mut timer);
     timer
+}
+
+/// The channels `rows` air on, for [`FerrofinLiveTvManager::channel_image_tags`].
+fn program_channel_ids<'a>(rows: impl Iterator<Item = &'a GuideProgramRow>) -> Vec<Uuid> {
+    rows.filter_map(|row| Uuid::parse_str(&row.channel_id).ok())
+        .collect()
 }
 
 /// Copies what the guide knows about a programme onto the timer that records it.
@@ -15083,6 +15154,99 @@ mod tests {
             .expect("programs")
             .items;
         assert_eq!(links(&programs, &manual), (None, None, None));
+    }
+
+    /// gl-1745: `get_timers_matching` builds each timer as `GetTimerInfoDto`
+    /// does, from the guide and the channel as they are now. A live timer's
+    /// programme carries the timer's id and status, a cancelled one's only its
+    /// series timer. A timer whose programme left the guide has no
+    /// `ProgramInfo`, one whose channel is gone no `ChannelName`, and an empty
+    /// series timer id is none. The run time is the window's, and the stored
+    /// row keeps none of what the read added.
+    #[tokio::test]
+    async fn timers_are_built_from_the_guide_and_the_channel_on_read() {
+        let mgr = manager_with_series_guide().await;
+        let future = airings_of(&mgr, "Recurring")
+            .await
+            .into_iter()
+            .find(|r| parse_dt(&r.start_date).is_some_and(|s| s > Utc::now()))
+            .expect("a future airing");
+        let st_id = mgr
+            .create_series_timer(defaults_for(&mgr, &future).await)
+            .await
+            .expect("series timer");
+        let ids: Vec<String> = mgr
+            .get_timers()
+            .await
+            .expect("timers")
+            .into_iter()
+            .filter_map(|t| t.base.id)
+            .collect();
+        let [live, cancelled, orphan, ..] = ids.as_slice() else {
+            panic!("the fan-out schedules three airings: {ids:?}");
+        };
+        mgr.cancel_timer(cancelled).await.expect("cancel");
+        let mut gone = mgr.get_timer(orphan).await.expect("read").expect("row");
+        gone.base.program_id = Some(Uuid::new_v4().simple().to_string());
+        gone.base.external_program_id = None;
+        gone.base.channel_id = Uuid::new_v4();
+        gone.series_timer_id = Some(String::new());
+        assert!(
+            gone.base.channel_name.is_some(),
+            "the stored name, copied at creation"
+        );
+        mgr.persist_timer(&gone).await.expect("store");
+
+        let listed = mgr
+            .get_timers_matching(&ferrofin_model::live_tv::TimerQuery::default())
+            .await
+            .expect("timers");
+        let find = |id: &str| {
+            listed
+                .iter()
+                .find(|t| t.base.id.as_deref() == Some(id))
+                .expect("listed")
+        };
+        let timer = find(live);
+        let info = timer.program_info.as_deref().expect("the programme");
+        assert_eq!(
+            (info.timer_id.as_deref(), info.status.as_deref()),
+            (Some(live.as_str()), Some("New"))
+        );
+        assert_eq!(info.series_timer_id.as_deref(), Some(st_id.as_str()));
+        let channel = crate::guide_repository::channel_row(&mgr.db, timer.base.channel_id)
+            .await
+            .expect("read")
+            .expect("the channel");
+        assert_eq!(
+            timer.base.channel_name.as_deref(),
+            Some(channel.name.as_str())
+        );
+        assert_eq!(
+            timer.run_time_ticks,
+            Some((timer.base.end_date - timer.base.start_date).num_milliseconds() * 10_000)
+        );
+
+        let info = find(cancelled)
+            .program_info
+            .as_deref()
+            .expect("the programme");
+        assert_eq!(
+            (info.timer_id.as_deref(), info.status.as_deref()),
+            (None, None)
+        );
+        assert_eq!(info.series_timer_id.as_deref(), Some(st_id.as_str()));
+
+        let timer = find(orphan);
+        assert!(timer.program_info.is_none());
+        assert!(timer.base.channel_name.is_none());
+        assert!(timer.series_timer_id.is_none());
+
+        let stored = mgr.get_timer(live).await.expect("read").expect("row");
+        assert!(
+            stored.program_info.is_none(),
+            "the read writes nothing back"
+        );
     }
 
     /// gl-1256: a programme page parses only the timers it can link, the
