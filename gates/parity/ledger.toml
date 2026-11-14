@@ -740,35 +740,6 @@ kind = "value"
 issue = 851
 reason = "The user root's ChildCount counts the playlists folder."
 
-# Equal similarity scores are ordered by SortName on Ferrofin; the owner decided to order them by id, as Jellyfin returns them.
-[[entry]]
-request = "GetSimilarItems"
-path = "Items[].Id"
-kind = "value"
-issue = 710
-reason = "Equal similarity scores are ordered by SortName on Ferrofin; the owner decided to order them by id, as Jellyfin returns them."
-
-[[entry]]
-request = "GetSimilarMovies"
-path = "Items[].Id"
-kind = "value"
-issue = 710
-reason = "Equal similarity scores are ordered by SortName on Ferrofin; the owner decided to order them by id, as Jellyfin returns them."
-
-[[entry]]
-request = "GetSimilarTrailers"
-path = "Items[].Id"
-kind = "value"
-issue = 710
-reason = "Equal similarity scores are ordered by SortName on Ferrofin; the owner decided to order them by id, as Jellyfin returns them."
-
-[[entry]]
-request = "screen-detail-similar"
-path = "Items[].Id"
-kind = "value"
-issue = 710
-reason = "Equal similarity scores are ordered by SortName on Ferrofin; the owner decided to order them by id, as Jellyfin returns them."
-
 # Ferrofin compiles in TheTVDB, FanArt and OpenSubtitles (documented scope), which stock Jellyfin lacks.
 [[entry]]
 request = "GetLibraryOptionsInfo"
