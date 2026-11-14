@@ -481,13 +481,12 @@ impl ServerApplicationHost for FerrofinServerApplicationHost {
         let Some(manager) = &self.network_manager else {
             return Ok(self.build_local_api_url("localhost", None, None));
         };
-        let (hostname, port) = {
-            let mut manager = manager
-                .write()
-                .map_err(|_| ServiceError::backend("network manager lock poisoned"))?;
-            manager.refresh_interfaces();
-            manager.get_bind_address_for_peer(peer, self.http_bind)
-        };
+        // The snapshot a settings save or a network change refreshed, as
+        // upstream's `GetBindAddress` reads it.
+        let (hostname, port) = manager
+            .read()
+            .map_err(|_| ServiceError::backend("network manager lock poisoned"))?
+            .get_bind_address_for_peer(peer, self.http_bind);
         Ok(self.build_local_api_url(&hostname, None, port))
     }
 }
@@ -724,6 +723,40 @@ mod tests {
             h.get_smart_api_url(&request).await.expect("url"),
             "http://10.20.0.2:8096"
         );
+    }
+
+    /// `GetSmartApiUrl` → `GetBindAddress` reads the interface snapshot: a
+    /// smart URL enumerates no interfaces. A settings save or a network change
+    /// refreshes the snapshot, not a request.
+    #[tokio::test]
+    async fn a_smart_url_reads_the_interface_snapshot() {
+        use ferrofin_model::net::{IpData, IpNetwork};
+        let enumerations = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = Arc::clone(&enumerations);
+        let address: IpAddr = "192.168.1.2".parse().expect("address");
+        let manager = NetworkManager::live_with_enumerator(
+            ferrofin_networking::NetworkConfiguration::default(),
+            Arc::new(move |_, _| {
+                counted.fetch_add(1, Ordering::SeqCst);
+                let mut eth0 = IpData::new(address, Some(IpNetwork::new(address, 24)), "eth0");
+                eth0.index = 2;
+                vec![eth0]
+            }),
+            Arc::new(ferrofin_networking::NullLogger),
+        );
+        let at_start = enumerations.load(Ordering::SeqCst);
+        let h = host(HostNetworkInfo::default())
+            .await
+            .with_network(Arc::new(RwLock::new(manager)), None);
+        for _ in 0..2 {
+            assert_eq!(
+                h.get_smart_api_url_for_peer("192.168.1.45".parse().expect("peer"))
+                    .await
+                    .expect("url"),
+                "http://192.168.1.2:8096"
+            );
+        }
+        assert_eq!(enumerations.load(Ordering::SeqCst), at_start);
     }
 
     #[tokio::test]
