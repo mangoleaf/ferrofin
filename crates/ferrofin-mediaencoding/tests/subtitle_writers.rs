@@ -301,7 +301,7 @@ fn ass_load_keeps_the_header_footer_and_event_columns() {
          Dialogue: 2,0:00:01.00,0:00:02.00,Sign, Alice ,0010,0020,0030, fx ,{\\i1}a, b\\Nc\n\n[Fonts]\nfontname: x.ttf\nAAAA",
     );
     let mut s = Subtitle::new();
-    assert_eq!(ssa::load_ass(&mut s, &input), 0);
+    assert_eq!(ssa::load_ass(&mut s, &input).0, 0);
     assert_eq!(
         s.header,
         "[Script Info]\nTitle: t\n\n[V4+ Styles]\nStyle: Sign,Arial,20\n\n[Events]\n"
@@ -330,7 +330,7 @@ fn ssa_load_turns_override_tags_into_html_and_keeps_column_spacing() {
          Dialogue: Marked=0,0:00:01.00,0:00:02.00, Song, Bob ,0,0,0,,{\\i1}it{\\i0}",
     );
     let mut s = Subtitle::new();
-    assert_eq!(ssa::load_ssa(&mut s, &input), 0);
+    assert_eq!(ssa::load_ssa(&mut s, &input).0, 0);
     let p = &s.paragraphs[0];
     assert_eq!(p.text, "<i>it</i>");
     assert_eq!(p.extra.as_deref(), Some(" Song"));
@@ -366,7 +366,7 @@ fn ssa_load_without_format_header_uses_defaults() {
     let input = lines("[Events]\nDialogue: ,0:00:01.18,0:00:01.85,,,,,,,hello there");
     for load in [ssa::load_ass, ssa::load_ssa] {
         let mut s = Subtitle::new();
-        assert_eq!(load(&mut s, &input), 0);
+        assert_eq!(load(&mut s, &input).0, 0);
         assert_eq!(s.paragraphs[0].text, "hello there");
         assert_eq!(s.paragraphs[0].start_time.total_milliseconds(), 1_180.0);
     }
@@ -378,12 +378,12 @@ fn a_custom_format_order_resets_the_ass_columns_but_not_the_ssa_ones() {
         "[Events]\nFormat: Start, End, Layer, Text\nDialogue: 0:00:02.00,0:00:03.50,0,hello, world",
     );
     let mut ass = Subtitle::new();
-    assert_eq!(ssa::load_ass(&mut ass, &input), 0);
+    assert_eq!(ssa::load_ass(&mut ass, &input).0, 0);
     assert_eq!(ass.paragraphs[0].text, "hello, world");
     assert_eq!(ass.paragraphs[0].end_time.total_milliseconds(), 3_500.0);
     // The SSA loader keeps `Name` at the fifth column, which here is the text's tail.
     let mut ssa_sub = Subtitle::new();
-    assert_eq!(ssa::load_ssa(&mut ssa_sub, &input), 0);
+    assert_eq!(ssa::load_ssa(&mut ssa_sub, &input).0, 0);
     assert_eq!(ssa_sub.paragraphs[0].text, "hello");
     assert_eq!(ssa_sub.paragraphs[0].actor.as_deref(), Some(" world"));
 }
@@ -394,8 +394,41 @@ fn ssa_load_bad_timecode_counts_error() {
         lines("[Events]\nFormat: Layer, Start, End, Text\nDialogue: 0,notatime,0:00:03.50,x");
     for load in [ssa::load_ass, ssa::load_ssa] {
         let mut s = Subtitle::new();
-        assert_eq!(load(&mut s, &input), 1);
+        assert_eq!(
+            load(&mut s, &input),
+            (
+                1,
+                "Line 3 - error reading time code: Dialogue: 0,notatime,0:00:03.50,x\n".to_owned()
+            )
+        );
         assert!(s.paragraphs.is_empty(), "{:?}", s.paragraphs);
+    }
+}
+
+/// libse stops collecting messages once they reach 2000 UTF-16 units, and then
+/// gives up on a script that has loaded no cue yet: a good event after that point
+/// is never read. With a cue loaded first, every bad event is still counted.
+#[rstest]
+#[case::no_cue_yet(false, 0)]
+#[case::a_cue_loaded_first(true, 2)]
+fn ssa_load_gives_up_once_the_messages_are_full_and_no_cue_loaded(
+    #[case] good_first: bool,
+    #[case] cues: usize,
+) {
+    let bad = "Dialogue: 0,notatime,0:00:03.50,x\n".repeat(100);
+    let good = "Dialogue: 0,0:00:01.00,0:00:02.00,good\n";
+    let first = if good_first { good } else { "" };
+    let input = lines(&format!(
+        "[Events]\nFormat: Layer, Start, End, Text\n{first}{bad}{good}"
+    ));
+    for load in [ssa::load_ass, ssa::load_ssa] {
+        let mut s = Subtitle::new();
+        let (errors, messages) = load(&mut s, &input);
+        assert_eq!(s.paragraphs.len(), cues);
+        // About 69 units each: the 30th crosses 2000, and is the last.
+        assert_eq!(messages.lines().count(), 30);
+        // With no cue, the 31st error is counted, then the loader stops.
+        assert_eq!(errors, if good_first { 100 } else { 31 });
     }
 }
 
@@ -411,7 +444,7 @@ fn comment_events_load_as_flagged_cues_numbered_as_if_absent() {
     );
     for load in [ssa::load_ass, ssa::load_ssa] {
         let mut s = Subtitle::new();
-        assert_eq!(load(&mut s, &input), 0);
+        assert_eq!(load(&mut s, &input).0, 0);
         let cues: Vec<_> = s
             .paragraphs
             .iter()

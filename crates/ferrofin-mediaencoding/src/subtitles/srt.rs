@@ -12,9 +12,6 @@
 //! libse's `.wsrt` italics (`<3x>`) are not reachable through Jellyfin:
 //! `SubtitleEditParser` passes the bare extension (`srt`) as the file name, which
 //! never ends in `.wsrt`.
-//!
-//! TODO(gl-1218): the loader returns libse's error count but not the messages it
-//! collects (`Errors`), which Jellyfin logs; return them beside the count.
 
 use std::fmt::Write as _;
 
@@ -50,6 +47,36 @@ const BASE_UNIT: f64 = 1000.0;
 /// `TryReadTimeCodesLine`'s `defaultSeparator`.
 const DEFAULT_SEPARATOR: &str = " --> ";
 
+/// libse appends a message to `Errors` only while they are shorter than this, in
+/// UTF-16 units (`_errors.Length < 2000`), so the last one may cross it. Upstream
+/// parity value.
+const MAX_ERRORS_LENGTH: usize = 2000;
+
+/// The `StringBuilder` libse's SubRip, SubStation Alpha and Advanced SubStation
+/// Alpha loaders collect their `Errors` in, with its `Length` in UTF-16 units.
+#[derive(Default)]
+pub(crate) struct ErrorText {
+    /// The messages, one line each.
+    pub(crate) text: String,
+    /// `text`'s length in UTF-16 units, kept so the cap check costs nothing.
+    units: usize,
+}
+
+impl ErrorText {
+    /// `AppendLine(message)` while the text is under [`MAX_ERRORS_LENGTH`];
+    /// whether it was appended.
+    pub(crate) fn append(&mut self, message: std::fmt::Arguments<'_>) -> bool {
+        let room = self.units < MAX_ERRORS_LENGTH;
+        if room {
+            let start = self.text.len();
+            let _ = self.text.write_fmt(message);
+            self.text.push_str(NEWLINE);
+            self.units += self.text[start..].encode_utf16().count();
+        }
+        room
+    }
+}
+
 /// `SubRip.ExpectingLine`: the line `LoadSubtitle` reads next.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ExpectingLine {
@@ -69,6 +96,10 @@ enum ExpectingLine {
 struct Loader {
     /// `_errorCount`.
     error_count: i32,
+    /// `_errors`.
+    errors: ErrorText,
+    /// `_lineNumber`: the 1-based number of the line being read.
+    line_number: usize,
     /// `_isMsFrames`: every time code read so far had two-digit fractions of at
     /// most [`MAX_FRAMES_FRACTION`].
     is_ms_frames: bool,
@@ -78,7 +109,8 @@ struct Loader {
     expecting: ExpectingLine,
 }
 
-/// Parses SubRip `lines` into `subtitle`, returning libse's `ErrorCount`.
+/// Parses SubRip `lines` into `subtitle`, returning libse's `ErrorCount` and
+/// `Errors`.
 ///
 /// Port of `SubRip.LoadSubtitle`. Each line is trimmed at its end and of DEL
 /// characters, then read as the state machine expects; a time code line where a
@@ -88,10 +120,16 @@ struct Loader {
 /// NUL characters in text become spaces. Last, when every fraction in the file had
 /// two digits and was at most 30, they are read as frames at libse's default
 /// 23.976 fps, and each cue's text is trimmed at its end.
-pub fn load(subtitle: &mut Subtitle, lines: &[String]) -> i32 {
+///
+/// `Errors` names each problem by its line: a line where a cue number was expected
+/// and a timing line that does not read (both counted), a timing line with a field
+/// out of range and a cue number with no blank line before it (neither counted).
+pub fn load(subtitle: &mut Subtitle, lines: &[String]) -> (i32, String) {
     let mut do_renumber = false;
     let mut loader = Loader {
         error_count: 0,
+        errors: ErrorText::default(),
+        line_number: 0,
         is_ms_frames: true,
         paragraph: Paragraph::default(),
         expecting: ExpectingLine::Number,
@@ -99,6 +137,7 @@ pub fn load(subtitle: &mut Subtitle, lines: &[String]) -> i32 {
 
     subtitle.paragraphs.clear();
     for (i, raw) in lines.iter().enumerate() {
+        loader.line_number = i + 1;
         let line = raw.trim_end().trim_matches('\u{7f}'); // 127=delete ascii
         let next = lines.get(i + 1).map_or("", String::as_str);
         let next_next = lines.get(i + 2).map_or("", String::as_str);
@@ -160,7 +199,7 @@ pub fn load(subtitle: &mut Subtitle, lines: &[String]) -> i32 {
         p.text.truncate(trimmed);
     }
 
-    loader.error_count
+    (loader.error_count, loader.errors.text)
 }
 
 impl Loader {
@@ -192,17 +231,36 @@ impl Loader {
                             let joined = format!("{}{NEWLINE}{}", last.text, line.trim());
                             joined.trim().clone_into(&mut last.text);
                         }
-                        _ => self.error_count += 1,
+                        _ => {
+                            // `FormatLanguage.LineNumberXExpectedNumberFromSourceLineY`
+                            self.errors.append(format_args!(
+                                "Line {} - expected subtitle number: {line}",
+                                self.line_number
+                            ));
+                            self.error_count += 1;
+                        }
                     }
                 }
             }
             ExpectingLine::TimeCodes => {
-                if let Some((start, end)) = self.try_read_time_codes_line(line) {
-                    self.paragraph.start_time = start;
-                    self.paragraph.end_time = end;
+                if let Some(read) = self.try_read_time_codes_line(line) {
+                    if let Some(repaired) = &read.out_of_range {
+                        // `validate`: reported, not counted, and the line still read.
+                        self.errors.append(format_args!(
+                            "Line {} - error reading time code: {repaired}",
+                            self.line_number
+                        ));
+                    }
+                    self.paragraph.start_time = read.start;
+                    self.paragraph.end_time = read.end;
                     self.paragraph.text = String::new();
                     self.expecting = ExpectingLine::Text;
                 } else if !is_null_or_white_space(line) {
+                    // `FormatLanguage.LineNumberXErrorReadingTimeCodeFromSourceLineY`
+                    self.errors.append(format_args!(
+                        "Line {} - error reading time code: {line}",
+                        self.line_number
+                    ));
                     self.error_count += 1;
                     self.expecting = ExpectingLine::Number; // lets go to next paragraph
                 }
@@ -232,7 +290,15 @@ impl Loader {
             if let Some(n) = int_try_parse(line) {
                 self.paragraph.number = n;
             }
-        } else if let Some((start, end)) = self.try_read_time_codes_line(line) {
+            if line.trim() != get_last_number(&self.paragraph) {
+                // `FormatLanguage.LineNumberXExpectedEmptyLine`, not counted.
+                self.errors.append(format_args!(
+                        "Line {}: Empty line expected, but found number ({line}) followed by time code.",
+                        self.line_number
+                    ),
+                );
+            }
+        } else if let Some(read) = self.try_read_time_codes_line(line) {
             if self.paragraph.end_time.total_milliseconds() > 0.0 || !self.paragraph.text.is_empty()
             {
                 subtitle
@@ -241,7 +307,7 @@ impl Loader {
             }
             // libse reads the line a second time into the new paragraph, with the
             // same result.
-            self.paragraph = Paragraph::new(String::new(), start, end);
+            self.paragraph = Paragraph::new(String::new(), read.start, read.end);
             self.expecting = ExpectingLine::Text;
         } else if !is_null_or_white_space(line)
             || self.is_text(next)
@@ -279,16 +345,16 @@ impl Loader {
             || self.try_read_time_codes_line(text.trim()).is_some())
     }
 
-    /// `SubRip.TryReadTimeCodesLine`: the line's start and end, when it is a time
-    /// code line, and `_isMsFrames` cleared once one of its fractions cannot be a
-    /// frame count. libse's `validate` only adds an error message, so it is not
-    /// taken.
-    fn try_read_time_codes_line(&mut self, input: &str) -> Option<(TimeCode, TimeCode)> {
+    /// `SubRip.TryReadTimeCodesLine`: the line read, when it is a time code line,
+    /// and `_isMsFrames` cleared once one of its fractions cannot be a frame count.
+    /// libse's `validate` only adds an error message, which its one caller, the
+    /// timing line `ReadLine` expects, adds from [`TimeCodesLine::out_of_range`].
+    fn try_read_time_codes_line(&mut self, input: &str) -> Option<TimeCodesLine> {
         let read = read_time_codes_line(input)?;
         if self.is_ms_frames && !read.fractions_can_be_frames {
             self.is_ms_frames = false;
         }
-        Some((read.start, read.end))
+        Some(read)
     }
 }
 
@@ -300,6 +366,9 @@ struct TimeCodesLine {
     end: TimeCode,
     /// Both fractions have two digits and are at most [`MAX_FRAMES_FRACTION`].
     fractions_can_be_frames: bool,
+    /// The repaired line, when an hours, minutes or seconds field is over 99 or a
+    /// fraction over 999 (what libse's `validate` reports).
+    out_of_range: Option<String>,
 }
 
 /// The parsing half of `SubRip.TryReadTimeCodesLine`.
@@ -388,9 +457,8 @@ fn read_time_codes_line(input: &str) -> Option<TimeCodesLine> {
     if !is_valid_time_code(&units) {
         return None;
     }
-    let line = String::from_utf16_lossy(&units)
-        .replace("-->", ":")
-        .replace(' ', "");
+    let repaired = String::from_utf16_lossy(&units);
+    let line = repaired.replace("-->", ":").replace(' ', "");
     let parts: Vec<&str> = line.split([':', ',']).collect();
     if parts.len() < 8 {
         return None;
@@ -435,7 +503,17 @@ fn read_time_codes_line(input: &str) -> Option<TimeCodesLine> {
         start,
         end,
         fractions_can_be_frames,
+        out_of_range: field_out_of_range(&values).then_some(repaired),
     })
+}
+
+/// `validate`'s range check on the eight parts of a time code line: an hours,
+/// minutes or seconds field over 99, or a fraction (parts 3 and 7) over 999.
+fn field_out_of_range(values: &[i32; 8]) -> bool {
+    values
+        .iter()
+        .enumerate()
+        .any(|(i, &v)| v > if i % 4 == 3 { 999 } else { 99 })
 }
 
 /// Whether the UTF-16 unit at `index` is the ASCII character `c`.
