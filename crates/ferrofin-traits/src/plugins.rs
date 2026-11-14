@@ -155,7 +155,9 @@ pub trait PluginManager: Send + Sync {
     /// ```
     ///
     /// So a non-empty guid selects on its own and the name is ignored; an
-    /// all-zeros guid is `IsEmpty()` and falls through to the name branch.
+    /// all-zeros guid is `IsEmpty()` and falls through to the name branch. A
+    /// plugin bundled with the server (`CanUninstall: false`) resolves to
+    /// `None` before any repository is fetched (`PackageController.IsBundledPlugin`).
     ///
     /// # Errors
     /// Backend errors from reading the catalogue.
@@ -199,7 +201,8 @@ pub trait PluginManager: Send + Sync {
     /// pins one, else the newest is chosen.
     ///
     /// # Errors
-    /// [`ServiceError::NotFound`] for an unknown package/version;
+    /// [`ServiceError::NotFound`] for an unknown package/version, or a plugin
+    /// bundled with the server (`CanUninstall: false`), before any fetch;
     /// [`ServiceError::InvalidInput`] for checksum/ABI/validation failures;
     /// backend errors for download or filesystem problems. The default
     /// implementation rejects (a manager without an installer).

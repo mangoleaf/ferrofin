@@ -1674,13 +1674,8 @@ fn append_name_predicates(
     _exclude_tags: &[String],
 ) {
     if let Some(name) = non_blank(filter.name.as_ref()) {
-        if filter.use_raw_name == Some(true) {
-            qb.push(r#" AND ferrofin_lower_invariant(bi."Name") = "#)
-                .push_bind(lower_invariant(name));
-        } else {
-            qb.push(r#" AND bi."CleanName" = "#)
-                .push_bind(get_clean_value(name));
-        }
+        qb.push(r#" AND bi."CleanName" = "#)
+            .push_bind(get_clean_value(name));
     }
 
     // Batch form of the exact-name match: `CleanName IN (…)`. Used to resolve a

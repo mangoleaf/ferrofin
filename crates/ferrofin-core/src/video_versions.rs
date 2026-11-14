@@ -229,8 +229,26 @@ impl VersionRowReader for DbVersionReader<'_> {
     }
 }
 
+tokio::task_local! {
+    /// The groups [`VersionRows::load`] read in the current
+    /// [`reading_groups_once`] scope, by the ids of the rows it was given.
+    static READ_GROUPS: std::cell::RefCell<HashMap<Vec<Uuid>, VersionRows>>;
+}
+
+/// Runs `work` so that a [`VersionRows::load`] inside it of the same rows as
+/// an earlier one reuses that load's result instead of reading again.
+///
+/// A `NowPlayingItem` build runs in one, so its media-source lookup and its
+/// DTO build read the item's group once: the two are a moment apart, and
+/// upstream reads both from the in-memory item. A hit is keyed by row ids
+/// alone, so wrap only work whose loads see the same rows; a task spawned
+/// inside does not inherit the scope and reads as usual.
+pub(crate) async fn reading_groups_once<F: std::future::Future>(work: F) -> F::Output {
+    READ_GROUPS.scope(std::cell::RefCell::default(), work).await
+}
+
 /// Every row the version groups of a set of queried items reach, read once.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct VersionRows {
     /// The rows by id (a queried item another queried item's group reaches
     /// is copied in too).
@@ -257,12 +275,32 @@ impl VersionRows {
     ///    grouped item), and what a merge left pointing at a version a scan
     ///    later grouped under another primary.
     ///
-    /// Each row is read once, so a chain that loops ends.
+    /// Each row is read once, so a chain that loops ends. Inside a
+    /// `reading_groups_once` scope, the same rows as an earlier load in it
+    /// take that load's result.
     ///
     /// # Errors
     ///
     /// [`ServiceError`] when a read fails.
     pub async fn load(
+        reader: &dyn VersionRowReader,
+        queried: &[&BaseItemEntity],
+    ) -> Result<Self, ServiceError> {
+        let Ok(key) =
+            READ_GROUPS.try_with(|_| queried.iter().map(|row| row_id(row)).collect::<Vec<Uuid>>())
+        else {
+            return Self::read(reader, queried).await;
+        };
+        if let Ok(Some(read)) = READ_GROUPS.try_with(|groups| groups.borrow().get(&key).cloned()) {
+            return Ok(read);
+        }
+        let out = Self::read(reader, queried).await?;
+        let _ = READ_GROUPS.try_with(|groups| groups.borrow_mut().insert(key, out.clone()));
+        Ok(out)
+    }
+
+    /// [`Self::load`]'s reads.
+    async fn read(
         reader: &dyn VersionRowReader,
         queried: &[&BaseItemEntity],
     ) -> Result<Self, ServiceError> {

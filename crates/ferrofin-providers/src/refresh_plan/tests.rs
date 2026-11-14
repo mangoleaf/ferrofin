@@ -54,6 +54,7 @@ fn video() -> FileFacts {
         is_shortcut: false,
         is_file_protocol: true,
         is_placeholder: false,
+        is_photo: false,
         path_rebased: false,
         locations_changed: false,
     }
@@ -399,6 +400,90 @@ fn a_disc_folder_does_not_compare_its_mtime_for_the_probe() {
     let disc = plan(Some(&stored), &disc, &opts);
     assert!(!disc.requires_refresh);
     assert!(!disc.probe);
+}
+
+/// `PhotoProvider.HasChanged` (`Emby.Photos/PhotoProvider.cs:47-56`): a
+/// photo's file whose mtime drifted more than a second from the stored
+/// `DateModified` (unset is `DateTime.MinValue`, which every mtime has
+/// drifted from) re-runs the photo reader in every mode but `None`, below
+/// `Default` too, where `GetProviders` runs only the monitors that fired.
+#[rstest]
+#[case::validation_only_moved(ValidationOnly, Some(2_000), true)]
+#[case::validation_only_within_a_second(ValidationOnly, Some(1_000), false)]
+#[case::validation_only_unchanged(ValidationOnly, Some(0), false)]
+#[case::validation_only_no_stored_date(ValidationOnly, None, true)]
+#[case::default_no_stored_date(Default, None, true)]
+#[case::default_unchanged(Default, Some(0), false)]
+#[case::none_mode(NoRefresh, Some(2_000), false)]
+fn a_changed_photo_runs_the_photo_reader(
+    #[case] mode: MetadataRefreshMode,
+    #[case] drift_ms: Option<i64>,
+    #[case] reads: bool,
+) {
+    let photo = FileFacts {
+        probe: ProbeKind::None,
+        is_photo: true,
+        ..video()
+    };
+    let stored = StoredState {
+        date_modified: drift_ms.map(|ms| mtime() - TimeDelta::milliseconds(ms)),
+        ..current()
+    };
+    let p = plan(Some(&stored), &photo, &options(mode, mode));
+    assert_eq!(p.local_metadata, reads);
+    assert_eq!(p.local_monitor_fired, reads);
+    assert!(!p.probe && !p.remote_metadata);
+    if reads {
+        assert_eq!(p.reason, RefreshReason::Modified);
+    }
+
+    // A locked photo keeps its forced `PhotoProvider` in the provider list
+    // but `RefreshWithProviders` returns on `IsLocked` before running it.
+    let locked = StoredState {
+        is_locked: true,
+        ..stored
+    };
+    let p = plan(Some(&locked), &photo, &options(mode, mode));
+    assert!(!p.local_metadata);
+    assert_eq!(p.locked_local, reads);
+
+    // The same file as no photo: nothing reads it below `Default`.
+    let plain = FileFacts {
+        is_photo: false,
+        ..photo
+    };
+    let p = plan(Some(&stored), &plain, &options(mode, mode));
+    assert_eq!(p.local_metadata, p.run_all_providers);
+}
+
+/// `PhotoProvider.HasChanged` needs a local file that exists
+/// (`IsFileProtocol`, `GetFile` not null), and a new photo carries its file's
+/// date (`ResolverHelper.SetInitialItemValues`), so none of these reads the
+/// photo below `Default`, though no `DateModified` is stored.
+#[test]
+fn a_photo_change_monitor_needs_a_stored_local_file() {
+    let photo = FileFacts {
+        probe: ProbeKind::None,
+        is_photo: true,
+        ..video()
+    };
+    let unset = StoredState {
+        date_modified: None,
+        ..current()
+    };
+    let opts = options(ValidationOnly, ValidationOnly);
+    let remote = FileFacts {
+        is_file_protocol: false,
+        ..photo
+    };
+    let missing = FileFacts {
+        mtime: None,
+        ..photo
+    };
+    assert!(!plan(Some(&unset), &remote, &opts).local_metadata);
+    assert!(!plan(Some(&unset), &missing, &opts).local_metadata);
+    assert!(!plan(None, &photo, &opts).local_metadata);
+    assert!(plan(Some(&unset), &photo, &opts).local_metadata);
 }
 
 #[rstest]
@@ -763,6 +848,7 @@ fn test_item_fs() -> FileFacts {
         is_shortcut: false,
         is_file_protocol: true,
         is_placeholder: false,
+        is_photo: false,
         path_rebased: false,
         locations_changed: false,
     }

@@ -207,7 +207,7 @@ const DEFAULT_PLUGIN_DOWNLOAD_MB: u32 = 128;
 
 /// The application version assumed when the composition root wires none — the
 /// Jellyfin API version Ferrofin reports from `/System/Info` (kept in step with
-/// `JELLYFIN_API_VERSION` in `apps/ferrofin-server/src/state.rs`, which is what
+/// `JELLYFIN_API_VERSION` in `crates/ferrofin-api/src/openapi.rs`, which is what
 /// a live server passes to
 /// [`with_application_version`](FerrofinPluginManager::with_application_version)).
 ///
@@ -264,6 +264,12 @@ const MAX_MANIFEST_BYTES: u64 = 16 * 1024 * 1024;
 /// repository that accepts the connection and says nothing pins the task.
 const REPO_FETCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
+/// The total budget for one plugin artifact download, on top of the idle
+/// timeouts: upstream's `InstallationManager.PackageDownloadTimeout`, so a
+/// repository that trickles bytes cannot hold an install, or the Update
+/// Plugins task, open indefinitely.
+const PACKAGE_DOWNLOAD_TIMEOUT: std::time::Duration = std::time::Duration::from_mins(10);
+
 /// Reads a response body in chunks, failing as soon as the running total
 /// exceeds `cap_bytes` — `Content-Length` is advisory (absent on chunked
 /// responses, and a hostile server can lie), so the streamed count is the
@@ -282,7 +288,7 @@ async fn read_capped(
     while let Some(chunk) = response
         .chunk()
         .await
-        .map_err(|e| ServiceError::backend(format!("downloading {url}: {e}")))?
+        .map_err(|e| download_error(url, &e))?
     {
         if (bytes.len() + chunk.len()) as u64 > cap_bytes {
             return Err(ServiceError::invalid_input(format!(
@@ -292,6 +298,17 @@ async fn read_capped(
         bytes.extend_from_slice(&chunk);
     }
     Ok(bytes)
+}
+
+/// The error for a failed download from `url`. A timeout says so, as
+/// upstream's `TimeoutException` does, rather than reqwest's generic "error
+/// decoding response body".
+fn download_error(url: &str, e: &reqwest::Error) -> ServiceError {
+    if e.is_timeout() {
+        ServiceError::backend(format!("downloading {url} timed out"))
+    } else {
+        ServiceError::backend(format!("downloading {url}: {e}"))
+    }
 }
 
 /// Lowercase-hex SHA-256 of `bytes` (the manifest `sha256` extension field).
@@ -317,6 +334,7 @@ async fn download_and_verify(
     chosen: &ferrofin_model::updates::VersionInfo,
     loopback_ok: bool,
     cap_bytes: u64,
+    budget: std::time::Duration,
 ) -> Result<Vec<u8>, ServiceError> {
     require_https(source_url, loopback_ok)?;
     // GitHub release assets 302 to a CDN, so redirects must be followed —
@@ -332,19 +350,20 @@ async fn download_and_verify(
             attempt.error("insecure redirect target (plugin downloads require https)")
         }
     });
-    // Idle timeouts, not a total deadline: a legitimate 100 MiB artifact on
-    // a slow link needs minutes of transfer, but must never sit silent.
+    // Idle timeouts, so the artifact never sits silent, and the total
+    // `budget` a legitimate artifact on a slow link fits in.
     let client = reqwest::Client::builder()
         .redirect(policy)
         .connect_timeout(REPO_FETCH_TIMEOUT)
         .read_timeout(REPO_FETCH_TIMEOUT)
+        .timeout(budget)
         .build()
         .map_err(|e| ServiceError::backend(format!("building download client: {e}")))?;
     let response = client
         .get(source_url)
         .send()
         .await
-        .map_err(|e| ServiceError::backend(format!("downloading {source_url}: {e}")))?;
+        .map_err(|e| download_error(source_url, &e))?;
     if !response.status().is_success() {
         return Err(ServiceError::backend(format!(
             "downloading {source_url}: HTTP {}",
@@ -605,6 +624,23 @@ impl FerrofinPluginManager {
             return None;
         }
         self.plugins.iter().find(|p| p.descriptor.id == id)
+    }
+
+    /// Port of `PackageController.IsBundledPlugin` (Jellyfin 12.0): whether a
+    /// non-empty `assembly_guid`, else `name` (`OrdinalIgnoreCase`), names a
+    /// plugin bundled with the server, one reporting `CanUninstall: false`
+    /// (the in-tree providers). No repository publishes one, so querying them
+    /// "can only ever fail, and does so slowly". A compiled-in extension
+    /// reports `true` ([`RegisteredPlugin::new`]) and is not bundled.
+    fn is_bundled_plugin(&self, name: Option<&str>, assembly_guid: Option<Uuid>) -> bool {
+        let plugin = match assembly_guid.filter(|id| !id.is_nil()) {
+            Some(id) => self.find(id),
+            None => name.and_then(|name| {
+                self.live_plugins()
+                    .find(|p| equals_ordinal_ignore_case(&p.descriptor.name, name))
+            }),
+        };
+        plugin.is_some_and(|p| !p.descriptor.can_uninstall)
     }
 
     /// The registered plugins minus the ones uninstalled since the boot.
@@ -1148,6 +1184,10 @@ impl PluginManager for FerrofinPluginManager {
         version: Option<&str>,
         repository_url: Option<&str>,
     ) -> Result<(), ServiceError> {
+        // `InstallPackage` answers `NotFound()` for a bundled plugin first.
+        if self.is_bundled_plugin(Some(name), assembly_guid) {
+            return Err(ServiceError::not_found(format!("package {name}")));
+        }
         let (Some(wasm_dir), Some(validator)) = (&self.wasm_plugins_dir, &self.validator) else {
             return Err(ServiceError::invalid_input(
                 "runtime plugin installation is not available on this server",
@@ -1237,6 +1277,7 @@ impl PluginManager for FerrofinPluginManager {
             chosen,
             loopback_ok,
             self.max_download_bytes,
+            PACKAGE_DOWNLOAD_TIMEOUT,
         )
         .await?;
 
@@ -1492,13 +1533,18 @@ impl PluginManager for FerrofinPluginManager {
         Ok(packages)
     }
 
-    /// Port of `InstallationManager.FilterPackages` over the aggregated
-    /// catalogue, with a fallback to the compiled-in plugins.
+    /// Port of `PackageController.GetPackageInfo`: `None` for a plugin bundled
+    /// with the server before any repository is fetched, else
+    /// `InstallationManager.FilterPackages` over the aggregated catalogue, with
+    /// a fallback to the compiled-in extensions.
     async fn find_package(
         &self,
         name: Option<&str>,
         assembly_guid: Option<Uuid>,
     ) -> Result<Option<PackageInfo>, ServiceError> {
+        if self.is_bundled_plugin(name, assembly_guid) {
+            return Ok(None);
+        }
         let catalog = self.list_packages().await?;
         if let Some(found) = filter_packages(&catalog, name, assembly_guid) {
             return Ok(Some(found.clone()));
@@ -2749,6 +2795,83 @@ mod tests {
         assert_eq!(by_guid.name, "Demo");
     }
 
+    /// `PackageController.IsBundledPlugin`: a plugin bundled with the server
+    /// (`CanUninstall: false`, the in-tree providers) is published to no
+    /// repository, so `GetPackageInfo` and `InstallPackage` answer not-found
+    /// before any repository is fetched: by a non-empty guid, else by name. A
+    /// compiled-in extension reports `CanUninstall: true` and still resolves.
+    #[tokio::test]
+    async fn bundled_plugins_are_not_found_without_fetching_a_repository() {
+        let hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = Arc::clone(&hits);
+        let md5 = ferrofin_common::extensions::md5_hex(b"bytes");
+        let (base, _stop) = raw_server(move |base| {
+            // A repository that does list the bundled plugin's identity.
+            let manifest = manifest_json(base, &md5, None, TEST_ABI);
+            Box::new(move |_request| {
+                counted.fetch_add(1, Ordering::SeqCst);
+                http_ok("application/json", manifest.as_bytes())
+            })
+        });
+        let extension = Uuid::from_u128(0x5EED);
+        let state_dir = tempfile::tempdir().unwrap();
+        let wasm_root = tempfile::tempdir().unwrap();
+        let mgr = FerrofinPluginManager::new(
+            vec![
+                RegisteredPlugin::new(descriptor(PKG_ID, "HelloPkg", true), None).non_removable(),
+                RegisteredPlugin::new(descriptor(extension, "Demo", true), None),
+            ],
+            state_dir.path().to_path_buf(),
+        )
+        .with_installer(
+            wasm_root.path().join("plugins"),
+            Arc::new(StubValidator {
+                id: Ok(PKG_ID),
+                abi: TEST_ABI,
+            }),
+            Arc::new(FlagLifecycle(AtomicBool::new(false))),
+        );
+        mgr.set_repositories(vec![repo("test", &format!("{base}/manifest.json"))])
+            .await
+            .unwrap();
+
+        // By name (OrdinalIgnoreCase), by guid whatever the name, and by name
+        // again when the guid is all zeros (`IsEmpty()`).
+        for (name, guid) in [
+            ("hellopkg", None),
+            ("no-such-package", Some(PKG_ID)),
+            ("HelloPkg", Some(Uuid::nil())),
+        ] {
+            assert!(
+                mgr.find_package(Some(name), guid).await.unwrap().is_none(),
+                "find_package({name}, {guid:?})"
+            );
+            let err = mgr
+                .install_package(name, guid, None, None)
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(err, ServiceError::NotFound(_)),
+                "install_package({name}, {guid:?}): {err}"
+            );
+        }
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            0,
+            "no repository was contacted"
+        );
+
+        // A guid naming another plugin is not a bundled lookup, whatever the
+        // name says; nor is a compiled-in extension, which still resolves.
+        let found = mgr
+            .find_package(Some("HelloPkg"), Some(extension))
+            .await
+            .unwrap()
+            .expect("the extension resolves by guid");
+        assert_eq!(found.owner, "Ferrofin (compiled-in)");
+        assert!(hits.load(Ordering::SeqCst) > 0, "that lookup did fetch");
+    }
+
     /// `FilterPackages`' two predicates are ALTERNATIVES and the guid wins; an
     /// all-zeros guid is `IsEmpty()` and falls through to the name.
     #[tokio::test]
@@ -3834,6 +3957,42 @@ mod tests {
         let resp = reqwest::get(format!("{base}/big")).await.unwrap();
         let ok = super::read_capped(resp, 4096, &base).await.unwrap();
         assert_eq!(ok.len(), 2048);
+    }
+
+    /// `InstallationManager.PackageDownloadTimeout`: the artifact download has
+    /// a total budget besides the idle timeouts, so a repository that trickles
+    /// bytes cannot hold an install (or the Update Plugins task) open, and its
+    /// expiry says the download timed out.
+    #[tokio::test]
+    async fn artifact_download_has_a_total_budget() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/plugin.wasm", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0u8; 4096];
+            let _ = stream.read(&mut request).await;
+            let _ = stream
+                .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 100\r\n\r\n")
+                .await;
+            // One byte every 20 ms: never idle long enough for the read timeout.
+            for _ in 0..100 {
+                if stream.write_all(b"x").await.is_err() {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        });
+        let version = ferrofin_model::updates::VersionInfo {
+            version: "1.0.0".to_owned(),
+            checksum: Some("0".repeat(32)),
+            ..Default::default()
+        };
+        let budget = std::time::Duration::from_millis(300);
+        let err = super::download_and_verify(&url, "Slow", &version, true, 1 << 20, budget)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("timed out"), "{err}");
     }
 
     #[tokio::test]

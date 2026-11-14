@@ -668,6 +668,8 @@ async fn backup_restore_applies_on_the_in_process_restart() {
     )
     .await;
     assert_eq!(st, 200, "{manifest}");
+    // The release that wrote it, not the crate's placeholder version (gl-235).
+    assert_eq!(manifest["ServerVersion"], ferrofin_health::RELEASE_VERSION);
     let archive = manifest["Path"].as_str().expect("archive path").to_owned();
     // A DATABASE change after the backup: a user that must be gone after restore.
     let (st, created) = post_json(

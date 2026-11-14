@@ -659,6 +659,34 @@ async fn a_page_reads_its_version_groups_in_as_few_queries_as_it_needs() {
     );
 }
 
+/// Inside [`reading_groups_once`] a second load of the same rows reads
+/// nothing and finds the same group; other rows, and loads outside it, read.
+#[tokio::test]
+async fn a_scope_reads_the_same_rows_group_once() {
+    let (primary, alt1, alt2) = version_group();
+    let reader = Counting(
+        Rows(vec![primary.clone(), alt1.clone(), alt2.clone()]),
+        std::sync::atomic::AtomicUsize::new(0),
+    );
+    let count = || reader.1.load(std::sync::atomic::Ordering::Relaxed);
+    reading_groups_once(async {
+        let first = VersionRows::load(&reader, &[&alt1]).await.unwrap();
+        assert_eq!(count(), 2);
+        let again = VersionRows::load(&reader, &[&alt1]).await.unwrap();
+        assert_eq!(count(), 2, "the same rows read nothing");
+        assert_eq!(again.all_version_ids(&alt1), first.all_version_ids(&alt1));
+        assert_eq!(
+            again.local_media_source_ids(&alt1),
+            first.local_media_source_ids(&alt1)
+        );
+        VersionRows::load(&reader, &[&primary]).await.unwrap();
+        assert_eq!(count(), 3, "other rows read");
+    })
+    .await;
+    VersionRows::load(&reader, &[&alt1]).await.unwrap();
+    assert_eq!(count(), 5, "outside the scope, a load reads");
+}
+
 /// A group three levels deep — a version merged onto a version that a scan
 /// later grouped as another primary's local version — lists every row from
 /// any of its members, and reaches the chain's root.

@@ -31,7 +31,7 @@ use ferrofin_model::dto::ItemCounts;
 use ferrofin_model::entities::ImageType;
 use ferrofin_model::entities::MediaStreamType;
 use ferrofin_model::querying::{QueryFiltersLegacy, QueryResult};
-use ferrofin_traits::options::ItemImageInfo;
+use ferrofin_traits::options::{ItemImageInfo, live_tv_image_is_internal};
 use uuid::Uuid;
 
 use ferrofin_traits::error::ServiceError;
@@ -4383,16 +4383,29 @@ impl ItemRepository for FerrofinItemRepository {
         index1: i32,
         index2: i32,
     ) -> Result<bool, ServiceError> {
+        /// An image row with whether its owner is a Live TV item.
+        #[derive(sqlx::FromRow)]
+        struct Row {
+            #[sqlx(flatten)]
+            image: BaseItemImageInfoEntity,
+            #[sqlx(rename = "IsLiveTv")]
+            is_live_tv: bool,
+        }
         // Load this item's rows for the requested type in the same stable order
         // get_image_infos exposes, so the caller's 0-based indices address the
         // same images the read side does.
         let disc = image_type_to_disc(image_type);
-        let rows = sqlx::query_as::<_, BaseItemImageInfoEntity>(
-            r#"SELECT * FROM "BaseItemImageInfos" WHERE "ItemId" = ?1 AND "ImageType" = ?2
-                ORDER BY rowid"#,
+        let rows = sqlx::query_as::<_, Row>(
+            r#"SELECT ii.*, bi."Type" IN (?3, ?4) AS "IsLiveTv"
+                FROM "BaseItemImageInfos" ii
+                JOIN "BaseItems" bi ON bi."Id" = ii."ItemId"
+                WHERE ii."ItemId" = ?1 AND ii."ImageType" = ?2
+                ORDER BY ii.rowid"#,
         )
         .bind(guid_to_db(item_id))
         .bind(disc)
+        .bind(BaseItemKind::LiveTvChannel.stored_type_name())
+        .bind(BaseItemKind::LiveTvProgram.stored_type_name())
         .fetch_all(self.db.pool())
         .await
         .map_err(db_err)?;
@@ -4406,19 +4419,46 @@ impl ItemRepository for FerrofinItemRepository {
             return Ok(false);
         };
         // `!info.IsLocalFile` on either side: "Not supported yet", nothing done.
-        if is_remote_image_path(&first.path) || is_remote_image_path(&second.path) {
+        if is_remote_image_path(&first.image.path) || is_remote_image_path(&second.image.path) {
             return Ok(false);
         }
+        // `info.Path` is expanded (`BaseItemRepository.Map`), so an adopted
+        // `%MetadataPath%` row names its file.
+        let (path1, path2) = (
+            self.virtual_paths.expand(&first.image.path),
+            self.virtual_paths.expand(&second.image.path),
+        );
 
         // The same file under two rows (or one slot against itself) has nothing
         // to exchange; upstream's copy onto itself would throw.
-        if first.path == second.path {
+        if path1 == path2 {
             return Ok(false);
+        }
+        // A Live TV item's row holds what a tuner or a guide supplied, so its
+        // file is written only in the internal metadata directory; otherwise
+        // nothing is done, as for a URL. Upstream swaps any local file.
+        if first.is_live_tv {
+            let root = self.virtual_paths.internal_metadata_path();
+            for path in [&path1, &path2] {
+                let internal = match &root {
+                    Some(root) => live_tv_image_is_internal(path, std::path::Path::new(root)).await,
+                    None => false,
+                };
+                if !internal {
+                    tracing::warn!(
+                        item_id = %item_id,
+                        // A source's value: a URL other than http keeps only its
+                        // scheme and host (LOGGING.md §5).
+                        path = %ferrofin_util::source_url::redact_url(path),
+                        "did not exchange the files of a Live TV image reorder: one is outside the metadata directory"
+                    );
+                    return Ok(false);
+                }
+            }
         }
         // `SwapImagesAsync` swaps the CONTENTS of the two files — the rows keep
         // their paths — and then clears the cached dimensions and re-reads each
         // modified time from its file.
-        let (path1, path2) = (first.path.clone(), second.path.clone());
         let modified = tokio::task::spawn_blocking(move || {
             swap_image_files(std::path::Path::new(&path1), std::path::Path::new(&path2))?;
             let stamp = |path: &str| {
@@ -4439,7 +4479,7 @@ impl ItemRepository for FerrofinItemRepository {
                     SET "Width" = 0, "Height" = 0, "Blurhash" = NULL, "DateModified" = ?2
                     WHERE "Id" = ?1"#,
             )
-            .bind(&row.id)
+            .bind(&row.image.id)
             .bind(datetime_to_db(modified))
             .execute(&mut *tx)
             .await
@@ -12786,6 +12826,61 @@ mod tests {
             repository.get_distinct_years(&query).await.expect("years"),
             [1999],
             "nor its year"
+        );
+    }
+
+    /// gl-971: a non-folder `parentId` reaches the by-name lists and `/Years`
+    /// as `ItemIds` (v12.4 `GenresController.cs:128-138`,
+    /// `YearsController.cs:111-128`): the inner content query, its per-kind
+    /// counts and the year extraction see that one item, through the type
+    /// filter.
+    #[tokio::test]
+    async fn an_item_id_scope_lists_that_items_own_values() {
+        let db = test_db().await;
+        let repository = repo(&db);
+        let (one, other) = (Uuid::from_u128(0x9A01), Uuid::from_u128(0x9A02));
+        for (id, name, genre, year) in [
+            (one, "One", "Action", 2003),
+            (other, "Other", "Drama", 2010),
+        ] {
+            seed_named_item(&db, id, BaseItemKind::Movie, name).await;
+            seed_item_genre(&db, id, genre).await;
+            seed_item_genre(&db, id, "Common").await;
+            set_production_year(&db, id, year).await;
+        }
+        let scoped = InternalItemsQuery {
+            item_ids: vec![one],
+            ..InternalItemsQuery::default()
+        };
+
+        let genres = repository.get_genres(&scoped).await.expect("genres");
+        let counts: Vec<_> = genres
+            .items
+            .iter()
+            .map(|row| {
+                (
+                    row.item.name.clone().unwrap_or_default(),
+                    row.counts.movie_count,
+                )
+            })
+            .collect();
+        // "Common" is on both movies: one counted means the counts are scoped too.
+        assert_eq!(counts, [("Action".to_owned(), 1), ("Common".to_owned(), 1)]);
+        assert_eq!(
+            repository.get_distinct_years(&scoped).await.expect("years"),
+            [2003]
+        );
+        let series_only = InternalItemsQuery {
+            include_item_types: vec![BaseItemKind::Series],
+            ..scoped
+        };
+        assert!(
+            repository
+                .get_distinct_years(&series_only)
+                .await
+                .expect("years")
+                .is_empty(),
+            "the type filter still applies"
         );
     }
 

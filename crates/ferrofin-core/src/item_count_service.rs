@@ -304,12 +304,9 @@ impl FerrofinItemCountService {
         self
     }
 
-    /// Injects the two root-folder ids resolved once at startup, so the user
-    /// root's `ChildCount` includes the `AggregateFolder`'s virtual children.
-    ///
-    /// Both are process constants; the extra work is one id comparison per
-    /// requested parent, and one additional id in the grouped count that is
-    /// already being issued — never a third round-trip.
+    /// Injects the two root-folder ids resolved once at startup, so the
+    /// played/total and whole-server leaf counts can count the
+    /// `AggregateFolder`'s leaves by their roots. Both are process constants.
     #[must_use]
     pub fn with_root_ids(mut self, roots: RootFolderIds) -> Self {
         self.roots = Some(roots);
@@ -1194,22 +1191,16 @@ impl ItemCountService for FerrofinItemCountService {
         // hangs off both, so the sum counts each once). Empty, and so a
         // no-op, on a Ferrofin-written database.
         //
-        // Two more translations come from the root pair. `Folder.GetChildren`
-        // (Folder.cs:1348-1360) delegates the physical root's children to the
-        // user root ("the true root should return our users root folder
-        // children"), so the `AggregateFolder` counts as the `UserRootFolder`;
-        // and `UserRootFolder.GetEligibleChildrenForRecursiveChildren`
-        // (UserRootFolder.cs:96-102) concatenates the aggregate's virtual
-        // children, so the user root's own count gains them.
-        let as_user_root = |p: Uuid| match self.roots {
-            Some(roots) if p == roots.aggregate => roots.user_root,
-            _ => p,
-        };
-        let resolved_parents: Vec<Uuid> = parent_ids.iter().copied().map(as_user_root).collect();
+        // The two roots count their own rows like any other folder: the user
+        // root its libraries, the `AggregateFolder` its physical folders and
+        // the playlists folder. v12.4 `DtoService.GetChildCount`
+        // (`DtoService.cs:797-810`) takes this batch's entry whenever it has
+        // one, so neither `Folder.GetChildren`'s delegation of the physical
+        // root to the user root nor `UserRootFolder.GetChildCount`'s
+        // concatenation of the aggregate's virtual children is reached.
         let by_view =
-            crate::item_repository::library_top_parents_by_view(&self.db, &resolved_parents)
-                .await?;
-        let counted: Vec<Uuid> = resolved_parents
+            crate::item_repository::library_top_parents_by_view(&self.db, parent_ids).await?;
+        let counted: Vec<Uuid> = parent_ids
             .iter()
             .flat_map(|p| match by_view.get(p) {
                 Some(folders) => folders.clone(),
@@ -1254,25 +1245,14 @@ impl ItemCountService for FerrofinItemCountService {
             }
         }
 
-        // The virtual children — one tiny indexed count, issued only when the
-        // page actually carries a root row.
-        let virtual_children = match self.roots {
-            Some(roots)
-                if resolved_parents.contains(&roots.user_root)
-                    && roots.aggregate != roots.user_root =>
-            {
-                self.virtual_child_count(roots.aggregate).await?
-            }
-            _ => 0,
-        };
         let merged = self
-            .merged_child_counts(&resolved_parents, &access_filter, include_virtual)
+            .merged_child_counts(parent_ids, &access_filter, include_virtual)
             .await?;
 
         let mut out = HashMap::with_capacity(parent_ids.len());
-        for (original, parent) in parent_ids.iter().zip(&resolved_parents) {
+        for parent in parent_ids {
             if let Some(&count) = merged.get(parent) {
-                out.insert(*original, i32::try_from(count).unwrap_or(i32::MAX));
+                out.insert(*parent, i32::try_from(count).unwrap_or(i32::MAX));
                 continue;
             }
             // A library sums its folders'; everything else counts its own row.
@@ -1291,13 +1271,7 @@ impl ItemCountService for FerrofinItemCountService {
                     }
                 })
                 .sum();
-            let count = count
-                + if self.roots.is_some_and(|roots| *parent == roots.user_root) {
-                    virtual_children
-                } else {
-                    0
-                };
-            out.insert(*original, i32::try_from(count).unwrap_or(i32::MAX));
+            out.insert(*parent, i32::try_from(count).unwrap_or(i32::MAX));
         }
         Ok(out)
     }
@@ -1469,28 +1443,6 @@ impl FerrofinItemCountService {
             played: i32::try_from(played).unwrap_or(i32::MAX),
             total: i32::try_from(total).unwrap_or(i32::MAX),
         })
-    }
-
-    /// The `AggregateFolder`'s virtual children — the plug-in folders
-    /// `LibraryManager.CreateRootFolder` parents to it and registers with
-    /// `AddVirtualChild` (v12.2 LibraryManager.cs:1146, the playlists folder,
-    /// the only call site).
-    ///
-    /// Type-narrow on purpose: the aggregate's other children (the physical
-    /// library folders, `%AppDataPath%/collections`, the recordings folder) are
-    /// not virtual children and must not be counted into the user root.
-    async fn virtual_child_count(&self, aggregate: Uuid) -> Result<i64, ServiceError> {
-        let count: i64 = sqlx::query_scalar(
-            r#"SELECT COUNT(*) FROM "BaseItems"
-               WHERE "PrimaryVersionId" IS NULL AND "ParentId" = ?1 AND "Type" IN (?2, ?3)"#,
-        )
-        .bind(guid_to_db(aggregate))
-        .bind(stored_type_name(BaseItemKind::PlaylistsFolder).unwrap_or_default())
-        .bind(stored_type_name(BaseItemKind::ManualPlaylistsFolder).unwrap_or_default())
-        .fetch_one(self.db.pool())
-        .await
-        .map_err(db_err)?;
-        Ok(count)
     }
 }
 
@@ -1989,13 +1941,14 @@ mod tests {
         );
     }
 
-    /// The user root's `ChildCount` is its own children **plus** the
-    /// `AggregateFolder`'s virtual children — C#
-    /// `UserRootFolder.GetChildCount(user) => GetChildren(user, true).Count`
-    /// over `GetEligibleChildrenForRecursiveChildren`, which concatenates
-    /// `LibraryManager.RootFolder.VirtualChildren` (UserRootFolder.cs:84-102).
+    /// gl-851: both roots count their own rows, as v12.4's
+    /// `DtoService.GetChildCount` takes them from `GetChildCountBatch`
+    /// (`DtoService.cs:750-810`, `ItemCountService.cs:471-541`): the user root
+    /// its libraries, never the aggregate's virtual child (the playlists
+    /// folder), and the `AggregateFolder` its own children, the playlists
+    /// folder and the physical library folder, not the user root's.
     #[tokio::test]
-    async fn the_user_root_child_count_includes_the_aggregates_virtual_children() {
+    async fn each_root_counts_its_own_rows() {
         use crate::test_support::seed_folder_item;
         let db = test_db().await;
         let user_root = Uuid::from_u128(0xA001);
@@ -2009,38 +1962,35 @@ mod tests {
             None,
         )
         .await;
-        for (n, id) in [Uuid::from_u128(0xA010), Uuid::from_u128(0xA011)]
-            .into_iter()
-            .enumerate()
-        {
-            seed_folder_item(
-                &db,
-                id,
+        for (id, kind, name, parent) in [
+            (
+                0xA010,
                 BaseItemKind::CollectionFolder,
-                &format!("Library {n}"),
-                Some(user_root),
-            )
-            .await;
+                "Library 0",
+                user_root,
+            ),
+            (
+                0xA011,
+                BaseItemKind::CollectionFolder,
+                "Library 1",
+                user_root,
+            ),
+            (
+                0xA012,
+                BaseItemKind::CollectionFolder,
+                "Library 2",
+                user_root,
+            ),
+            (
+                0xA020,
+                BaseItemKind::PlaylistsFolder,
+                "Playlists",
+                aggregate,
+            ),
+            (0xA021, BaseItemKind::Folder, "movies", aggregate),
+        ] {
+            seed_folder_item(&db, Uuid::from_u128(id), kind, name, Some(parent)).await;
         }
-        // The one virtual child `CreateRootFolder` registers…
-        seed_folder_item(
-            &db,
-            Uuid::from_u128(0xA020),
-            BaseItemKind::PlaylistsFolder,
-            "Playlists",
-            Some(aggregate),
-        )
-        .await;
-        // …and a physical library folder, which is a plain child of the
-        // aggregate and must NOT be counted into the user root.
-        seed_folder_item(
-            &db,
-            Uuid::from_u128(0xA021),
-            BaseItemKind::Folder,
-            "movies",
-            Some(aggregate),
-        )
-        .await;
 
         let roots = RootFolderIds {
             user_root,
@@ -2052,42 +2002,12 @@ mod tests {
             .await
             .expect("counts");
 
-        assert_eq!(
-            counts.get(&user_root).copied(),
-            Some(3),
-            "2 libraries + the playlists folder, never the physical folder"
-        );
+        assert_eq!(counts.get(&user_root).copied(), Some(3), "the 3 libraries");
         assert_eq!(
             counts.get(&aggregate).copied(),
-            Some(3),
-            "`Folder.GetChildren` delegates the physical root to the user root"
+            Some(2),
+            "the playlists folder and the physical folder"
         );
-    }
-
-    /// Without the root ids wired the service behaves exactly as before.
-    #[tokio::test]
-    async fn the_concat_is_inert_until_the_root_ids_are_injected() {
-        use crate::test_support::seed_folder_item;
-        let db = test_db().await;
-        let user_root = Uuid::from_u128(0xB001);
-        let aggregate = Uuid::from_u128(0xB002);
-        seed_folder_item(&db, aggregate, BaseItemKind::AggregateFolder, "root", None).await;
-        seed_folder_item(&db, user_root, BaseItemKind::UserRootFolder, "MF", None).await;
-        seed_folder_item(
-            &db,
-            Uuid::from_u128(0xB020),
-            BaseItemKind::PlaylistsFolder,
-            "Playlists",
-            Some(aggregate),
-        )
-        .await;
-
-        let counts = svc(&db)
-            .get_child_count_batch(&[user_root], None)
-            .await
-            .expect("counts");
-
-        assert_eq!(counts.get(&user_root).copied(), Some(0));
     }
 
     /// Reads the stored rows for `ids`, the way the DTO projection already has

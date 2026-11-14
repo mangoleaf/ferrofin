@@ -1,8 +1,9 @@
 //! ffprobe JSON -> [`MediaInfo`] normalization — port of
 //! `MediaBrowser.MediaEncoding.Probing.ProbeResultNormalizer`.
 //!
-//! Pure transformation: no ffmpeg/ffprobe invocation, no file I/O beyond the
-//! MPEG-TS timestamp sniff (which is skipped for anything but a local TS file).
+//! Pure transformation: no ffmpeg/ffprobe invocation and no file I/O. The
+//! MPEG-TS timestamp sniff upstream's `ExtractTimestamp` does here is done by
+//! the async caller (`MediaEncoderImpl::get_media_info_full`).
 
 use std::sync::LazyLock;
 

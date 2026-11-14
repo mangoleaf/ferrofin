@@ -18,7 +18,7 @@ use ferrofin_api::test_support::{
     FakeConfig, FakeDevices, FakeDisplayPreferences, FakeDto, FakeFileSystem, FakeLibrary,
     FakeLocalization, FakeLyrics, FakeMediaSegments, FakeMediaSources, FakeMusic, FakePlaylists,
     FakeProviders, FakeQuickConnect, FakeSearch, FakeSessions, FakeSimilarItems, FakeSubtitles,
-    FakeSystem, FakeTrickplay, FakeTvSeries, FakeUserData, FakeUserViews, FakeUsers,
+    FakeSystem, FakeTrickplay, FakeTvSeries, FakeUserData, FakeUserViews, FakeUsers, FixedAuth,
     fake_user_entity,
 };
 use ferrofin_model::tasks::TaskInfo;
@@ -35,29 +35,11 @@ const CALLER_ID: Uuid = Uuid::from_u128(0x00C4_0000);
 const OTHER_USER_ID: Uuid = Uuid::from_u128(0x00C4_0001);
 
 /// An auth pair that authenticates every request.
-struct OkAuth;
-
-#[async_trait]
-impl AuthService for OkAuth {
-    async fn authenticate(&self, _r: &RequestContext) -> Result<AuthorizationInfo, ServiceError> {
-        Ok(AuthorizationInfo {
-            is_authenticated: true,
-            ..ferrofin_api::test_support::authenticated_user_info()
-        })
-    }
-}
-
-#[async_trait]
-impl AuthorizationContext for OkAuth {
-    async fn get_authorization_info(
-        &self,
-        _r: &RequestContext,
-    ) -> Result<AuthorizationInfo, ServiceError> {
-        Ok(AuthorizationInfo {
-            is_authenticated: true,
-            ..ferrofin_api::test_support::authenticated_user_info()
-        })
-    }
+fn ok_auth() -> FixedAuth {
+    FixedAuth(AuthorizationInfo {
+        is_authenticated: true,
+        ..ferrofin_api::test_support::authenticated_user_info()
+    })
 }
 
 /// An auth pair authenticating as a concrete user, so the cross-user gate has a
@@ -147,7 +129,7 @@ impl TaskManager for StubTasks {
 /// Builds an [`AppState`] whose task manager is `tasks` with always-ok auth; every
 /// other manager is a panic fake.
 fn state(tasks: Arc<StubTasks>) -> AppState {
-    let auth = Arc::new(OkAuth);
+    let auth = Arc::new(ok_auth());
     state_as(tasks, Arc::new(FakeUsers), auth.clone(), auth)
 }
 
