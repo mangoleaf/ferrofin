@@ -40,7 +40,7 @@ START_EPOCH=$(date +%s)
 # shellcheck source=gates/lib.sh
 source gates/lib.sh          # the output root and the local-disk check
 # shellcheck source=gates/parity/lib.sh
-source gates/parity/lib.sh   # READY_TIMEOUT_S, HTTP_TIMEOUT_S, CLEANUP_TIMEOUT_S, KILL_GRACE_S, POLL_S, and the readiness check
+source gates/parity/lib.sh   # READY_TIMEOUT_S, HTTP_TIMEOUT_S, CLEANUP_TIMEOUT_S, KILL_GRACE_S; POLL_S, the readiness check and the isolation steps (gates/isolation.sh)
 gates_supervise "$CALLER" "$0" "$@"   # the run itself goes to a worker (gates/lib.sh, gl-968)
 
 PARITY_CAP_S=${PARITY_CAP_S:-7200}
@@ -209,39 +209,10 @@ auth() { echo "MediaBrowser Client=\"parity\", Device=\"parity\", DeviceId=\"par
 reason() { echo "$*" > "$D/failed"; echo "parity: $NAME: $*" >&2; }   # inside a server's boot subshell
 api() { curl -sf --connect-timeout "$HTTP_TIMEOUT_S" --max-time "$HTTP_TIMEOUT_S" -H "Authorization: $(auth "$TOKEN")" "$URL$1"; }
 api_post() { curl -sf --connect-timeout "$HTTP_TIMEOUT_S" --max-time "$HTTP_TIMEOUT_S" -X POST -H "Authorization: $(auth "$TOKEN")" -H 'Content-Type: application/json' --data "${2:-}" "$URL$1" >/dev/null; }
-drain() {   # every scheduled task idle
-  local give_up=$((SECONDS + DRAIN_TIMEOUT_S)) busy
-  while (( SECONDS < give_up )); do
-    busy=$(api /ScheduledTasks | jq -er 'if type != "array" then error("invalid tasks") else [.[] | select(.State != "Idle") | .Name] | join(",") end') || return 1
-    [ -z "$busy" ] && return 0
-    sleep "$POLL_S"
-  done
-  return 1
-}
-isolate() {   # no plugins, no automatic tasks: the answers come from the core servers, and nothing rewrites the copy
-  # A plugin that cannot be uninstalled (an in-tree one: TMDb, OMDb, …) stays as it is on both servers: Jellyfin
-  # cannot disable it, and its state and settings pages are answers to compare. (gates/bench/run.sh disables every
-  # Ferrofin plugin, for load; parity treats both servers alike.)
-  local id version
-  api /Plugins > "$D/plugins-before.json" && jq -e 'type == "array"' "$D/plugins-before.json" >/dev/null || return 1
-  while read -r id version; do api_post "/Plugins/$id/$version/Disable" || return 1
-  done < <(jq -r '.[] | select(.CanUninstall != false) | "\(.Id) \(.Version)"' "$D/plugins-before.json")
-  api /ScheduledTasks > "$D/tasks-before.json" && jq -e 'type == "array" and length > 0' "$D/tasks-before.json" >/dev/null || return 1
-  while read -r id; do api_post "/ScheduledTasks/$id/Triggers" '[]' || return 1; done < <(jq -r '.[].Id' "$D/tasks-before.json")
-}
-require() {   # require FILE PATH MESSAGE FILTER [jq args]: fetch PATH into FILE and demand the jq FILTER holds of it
-  local file=$1 path=$2 message=$3 filter=$4
-  shift 4
-  if ! api "$path" > "$file" || ! jq -e "$@" "$filter" "$file" >/dev/null; then reason "$message"; return 1; fi
-}
-verify_isolation() {
-  require "$D/plugins.json" /Plugins "plugins not disabled" \
-    'type == "array" and all(.[]; .Status == "Disabled" or .CanUninstall == false)' || return 1
-  require "$D/tasks.json" /ScheduledTasks "automatic task triggers remain enabled" \
-    'type == "array" and length > 0 and all(.[]; .Triggers == [])' || return 1
-  require "$D/libraries.json" /Library/VirtualFolders "library monitoring, automatic refresh or fetchers not disabled" \
-    'type == "array" and length > 0 and all(.[]; .LibraryOptions | .EnableRealtimeMonitor == false and .AutomaticRefreshIntervalDays == 0 and (.TypeOptions | length > 0 and all(.[]; .MetadataFetchers == [] and .ImageFetchers == [])))'
-}
+# gates/isolation.sh (through gates/parity/lib.sh) holds the isolation steps gates/bench/run.sh takes too. A plugin
+# that cannot be uninstalled (an in-tree one: TMDb, OMDb, …) stays as it is on both servers: Jellyfin cannot
+# disable it, and its state and settings pages are answers to compare, so parity passes ALL=0 for both servers
+# (gates/bench/run.sh disables every Ferrofin plugin, for load).
 boot_server() {   # boot_server NAME IMAGE CONFIG_SOURCE PORT CPUS: runs in a background subshell, never exits the run
   NAME=$1; local image=$2 source=$3 port=$4 cpus=$5 started=$SECONDS
   D=$OUT/$NAME; URL=http://127.0.0.1:$port; TOKEN=""
@@ -249,24 +220,8 @@ boot_server() {   # boot_server NAME IMAGE CONFIG_SOURCE PORT CPUS: runs in a ba
   mkdir -p "$D" "$cache"
   echo "$URL" > "$D/url"   # for gates/parity/reset.sh
   cp -r --reflink=auto "$source" "$cfg" || { reason "cannot copy the configuration"; return 1; }
-  # The parity answers are the core servers': no WASM plugin may ride along in the copy (as gates/bench/run.sh).
-  if [ -n "$(find "$cfg" -name '*.wasm' -print -quit 2>/dev/null)" ]; then reason "a WASM plugin is present in the configuration copy"; return 1; fi
-  # Change only the disposable copy, before either server starts its filesystem watcher (as gates/bench/run.sh,
-  # whose isolate/verify_isolation/drain this section mirrors: change them together; gl-754 tracks sharing them).
-  python3 - "$cfg" <<'PY_ISOLATION' || { reason "no library options in the configuration copy"; return 1; }
-import pathlib, sys, xml.etree.ElementTree as ET
-files = list(pathlib.Path(sys.argv[1]).glob("root/default/*/options.xml"))
-if not files:
-    raise SystemExit("no library options found in the configuration")
-for path in files:
-    tree = ET.parse(path)
-    root = tree.getroot()
-    node = root.find("EnableRealtimeMonitor")
-    if node is None:
-        node = ET.SubElement(root, "EnableRealtimeMonitor")
-    node.text = "false"
-    tree.write(path, encoding="utf-8", xml_declaration=True)
-PY_ISOLATION
+  isolation_no_wasm "$cfg" || { reason "$FAIL_REASON"; return 1; }
+  isolation_realtime_monitor_off "$cfg" || { reason "$FAIL_REASON"; return 1; }
   # Ferrofin's compiled-in extensions (Intro Skipper, Merge Versions, …) are plugins Jellyfin does not have: off.
   [ "$NAME" != ferrofin ] || env=(-e FERROFIN_DATA_DIR=/config -e FERROFIN_CACHE_DIR=/cache -e FERROFIN_DISABLE_EXTENSIONS=1)
   [ "$PIN" = 0 ] || cpuset=(--cpuset-cpus "$cpus")
@@ -280,7 +235,7 @@ PY_ISOLATION
     python3 gates/bench/oracle.py matches "$api_version" 2> "$D/oracle-matches.err" || { reason "$(cat "$D/oracle-matches.err")"; return 1; }
   fi
   TOKEN=$(python3 gates/parity/diff.py login --url "$URL" --ids "$IDS" --timeout "$HTTP_TIMEOUT_S") || { reason "cannot sign in as the browse user"; return 1; }
-  isolate || { reason "could not disable plugins and automatic tasks"; return 1; }
+  { isolation_disable_plugins 0 && isolation_disable_triggers; } || { reason "could not disable plugins and automatic tasks: $FAIL_REASON"; return 1; }
   # Jellyfin unloads disabled plugin assemblies only on restart. While the server is stopped, its isolated
   # configuration is the snapshot every write starts from: gates/parity/reset.sh restores it before each one.
   stop_container "parity-$NAME" || { reason "isolation restart failed (stop)"; return 1; }
@@ -291,8 +246,8 @@ PY_ISOLATION
   docker_cmd start "parity-$NAME" >/dev/null || { reason "isolation restart failed (start)"; return 1; }
   wait_ready || { reason "did not come back after the isolation restart"; return 1; }
   TOKEN=$(python3 gates/parity/diff.py login --url "$URL" --ids "$IDS" --timeout "$HTTP_TIMEOUT_S") || { reason "cannot sign in after the restart"; return 1; }
-  verify_isolation || return 1
-  drain || { reason "scheduled tasks did not go idle within ${DRAIN_TIMEOUT_S}s"; return 1; }
+  isolation_verify 0 || { reason "$FAIL_REASON"; return 1; }
+  isolation_tasks_idle || { reason "$FAIL_REASON"; return 1; }
   jq -n --argjson boot_s "$((SECONDS - started))" --arg version "$api_version" '{boot_s:$boot_s, version:$version}' > "$D/boot.json"
 }
 
