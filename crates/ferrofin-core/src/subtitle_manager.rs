@@ -124,6 +124,12 @@ impl FerrofinSubtitleManager {
                 Some(culture.two_letter_iso_language_name.clone());
         }
         if let Some(item) = self.library_manager.get_item_by_id(request.item_id).await? {
+            // SearchSubtitles(Video, …): a disc rip or an ISO is never searched.
+            if crate::item_data::video_format(item.data.as_deref()).video_type
+                != ferrofin_model::entities::VideoType::VideoFile
+            {
+                return Ok(false);
+            }
             let Some(content_type) = subtitle_media_type(&item.type_) else {
                 return Ok(false);
             };
@@ -729,6 +735,43 @@ mod tests {
         async fn get_subtitles(&self, _: &str) -> Result<SubtitleResponse, ServiceError> {
             unreachable!("search only")
         }
+    }
+
+    /// gl-1524: `SearchSubtitles(Video, …)` returns `[]` before any provider
+    /// is asked unless the video's `VideoType` is `VideoFile`.
+    #[rstest::rstest]
+    #[case(r#"{"VideoType":"Dvd"}"#, false)]
+    #[case(r#"{"VideoType":"BluRay"}"#, false)]
+    #[case(r#"{"VideoType":"Iso","IsoType":"Dvd"}"#, false)]
+    #[case(r#"{"VideoType":"VideoFile"}"#, true)]
+    #[case("{}", true)]
+    #[tokio::test]
+    async fn search_asks_providers_only_for_a_video_file(
+        #[case] data: &str,
+        #[case] searched: bool,
+    ) {
+        let db = test_db().await;
+        let item = Uuid::new_v4();
+        seed_item(&db, item, BaseItemKind::Movie).await;
+        let mut row = library_manager_over(db.clone())
+            .get_item_by_id(item)
+            .await
+            .unwrap()
+            .unwrap();
+        row.data = Some(data.to_owned());
+        crate::test_support::save_item(&db, &row).await;
+        let captured = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mgr = manager(db, vec![Arc::new(CapturingProvider(captured.clone()))]);
+        let results = mgr
+            .search_subtitles(&SubtitleSearchRequest {
+                item_id: item,
+                language: "eng".to_owned(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(captured.lock().unwrap().len(), usize::from(searched));
+        assert_eq!(results.len(), usize::from(searched));
     }
 
     /// gl-1462: `SearchSubtitles` hands providers the two-letter code of the
