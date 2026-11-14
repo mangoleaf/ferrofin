@@ -381,6 +381,19 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(spec.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(spec.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let doc: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        // Upstream's `AddJellyfinApiSwagger` identity, with the version `/System/Info` reports.
+        assert_eq!(
+            doc["info"],
+            serde_json::json!({
+                "title": "Jellyfin API",
+                "version": crate::openapi::JELLYFIN_API_VERSION,
+                "x-jellyfin-version": crate::openapi::JELLYFIN_API_VERSION,
+            })
+        );
     }
 
     /// Everything logged while a test runs.

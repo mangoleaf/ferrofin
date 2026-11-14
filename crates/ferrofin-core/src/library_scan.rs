@@ -852,6 +852,10 @@ struct FetcherPolicy<'a> {
     only_image_provider: Option<&'a str>,
     /// A full image replacement can replace cached plugin artwork.
     replace_images: bool,
+    /// The provider an Identify's chosen result came from
+    /// (`SearchResult.SearchProviderName`): its images run first
+    /// ([`image_order`](Self::image_order)).
+    identified_by: Option<&'a str>,
     /// The server-wide per-kind `MetadataOptions`
     /// (`ServerConfiguration.MetadataOptions`), the answer for a kind the
     /// library saved no `TypeOptions` entry for.
@@ -963,22 +967,19 @@ impl<'a> FetcherPolicy<'a> {
             .to_lowercase()
     }
 
-    /// [`metadata_rank`](Self::metadata_rank) for the image-fetcher order,
-    /// with the same server-wide fallback (`ProviderManager.cs:405-406`).
-    fn image_rank(self, kind: &str, name: &str) -> usize {
-        ferrofin_providers::library_options::image_fetcher_rank(
+    /// The image providers' run order: an Identify's chosen provider first,
+    /// then the configured image-fetcher order (with the same server-wide
+    /// fallback as [`metadata_rank`](Self::metadata_rank)), then the built-in
+    /// one ([`image_provider_order`]).
+    ///
+    /// [`image_provider_order`]: ferrofin_providers::library_options::image_provider_order
+    fn image_order(self, kind: &str, name: &str) -> (bool, usize, usize) {
+        ferrofin_providers::library_options::image_provider_order(
             self.options,
             self.global_for(kind),
             kind,
             name,
-        )
-    }
-
-    /// Configured image preference followed by the built-in provider order.
-    fn image_order(self, kind: &str, name: &str) -> (usize, usize) {
-        (
-            self.image_rank(kind, name),
-            ferrofin_providers::library_options::default_image_order(kind, name),
+            self.identified_by,
         )
     }
 
@@ -8160,6 +8161,12 @@ impl LibraryScanner {
         // (`item.SetProviderIds`, the controller's half) with this item's
         // save, so a refresh that fails leaves no half-applied ids.
         let search = options.search_result.as_ref();
+        // Its image providers run the chosen result's provider first
+        // (`GetNonLocalImageProviders`, `MetadataService.cs:722-727`).
+        let policy = FetcherPolicy {
+            identified_by: search.and_then(|r| r.search_provider_name.as_deref()),
+            ..policy
+        };
         let series_child = matches!(
             item_type_lookup::kind_from_type_name(&entity.type_),
             Some(BaseItemKind::Episode | BaseItemKind::Season)
@@ -8279,7 +8286,7 @@ impl LibraryScanner {
             // first ("When identifying, run the provider the user picked
             // first so the correct IDs are used", `MetadataService.cs:
             // 876-882`).
-            let prefer = preferred_fetcher(search.and_then(|r| r.search_provider_name.as_deref()));
+            let prefer = preferred_fetcher(policy.identified_by);
             // The lookup info's ids are the item's own, which the probe (a
             // pre-refresh provider, `AudioFileProber`) has already given its
             // tag ids where the item had none: `GetLookupInfo` shares the
@@ -12462,7 +12469,9 @@ impl LibraryScanner {
     ///
     /// It resolves under the series' `Tvdb` id — this scan's TVDB match, else
     /// the recorded one (TMDB's answer for the series hands its TVDB id on
-    /// to the record) — and without one there is no answer and no request.
+    /// to the record) — and without one there is no answer and no request;
+    /// neither is there when the series row cannot be read
+    /// ([`series_display_order`](Self::series_display_order)).
     /// A failed request counts as a provider failure, as upstream counts it
     /// for this provider: `TvdbSeasonProvider.GetMetadata` has no try/catch
     /// (the series and episode providers' swallow is the divergence
@@ -14044,7 +14053,7 @@ impl LibraryScanner {
             .iter()
             .filter(|p| p.library_gated() && policy.image_enabled(&lookup.kind, p.name()))
             .collect();
-        sources.sort_by_key(|p| policy.image_rank(&lookup.kind, p.name()));
+        sources.sort_by_key(|p| policy.image_order(&lookup.kind, p.name()));
         for provider in sources {
             if wanted.is_empty() {
                 return;
@@ -14495,17 +14504,10 @@ impl LibraryScanner {
         }
     }
 
-    /// `ItemImageProvider.RemoveImages` (`ItemImageProvider.cs:74-103`, run
-    /// by `MetadataService.cs:112-118` for `RemoveOldMetadata` with
-    /// `ReplaceAllImages`): deletes the item's images that live in its own
-    /// metadata folder — the first image of each singular type
-    /// (`_singularImages`, `:42-53`) and every backdrop — so the pass
-    /// supplies them afresh. Screenshots, chapter images and anything stored
-    /// with the media stay (upstream deletes the latter only when it saves
-    /// metadata next to the media, which Ferrofin never does). The metadata
-    /// folder is Ferrofin's (`{metadata}/library/{id}`) or, on a database
-    /// adopted from Jellyfin, Jellyfin's (`{metadata}/library/{xx}/{id:N}`,
-    /// `BaseItem.GetInternalMetadataPath`, `BaseItem.cs:927-937`).
+    /// `ItemImageProvider.RemoveImages` for the scan, by the shared
+    /// [`remove_images`](ferrofin_providers::local_images::remove_images):
+    /// the item's images in its own metadata folders go, so the pass supplies
+    /// them afresh.
     fn remove_item_images(&self, entity: &BaseItemEntity, stored: Option<&[ItemImageInfo]>) {
         let (Some(meta_root), Some(stored)) = (&self.metadata_dir, stored) else {
             return;
@@ -14514,39 +14516,8 @@ impl LibraryScanner {
             |_| vec![meta_root.join(&entity.id)],
             |id| crate::dynamic_images::internal_metadata_dirs(&meta_root.resolve(), id).to_vec(),
         );
-        let mut seen: Vec<ImageType> = Vec::new();
-        for image in stored {
-            let singular = matches!(
-                image.image_type,
-                ImageType::Primary
-                    | ImageType::Art
-                    | ImageType::Banner
-                    | ImageType::Box
-                    | ImageType::BoxRear
-                    | ImageType::Disc
-                    | ImageType::Logo
-                    | ImageType::Menu
-                    | ImageType::Thumb
-            );
-            // `GetImageInfo(type, 0)`: a singular type's first image only.
-            let removable = image.image_type == ImageType::Backdrop
-                || (singular && !seen.contains(&image.image_type));
-            if singular {
-                seen.push(image.image_type);
-            }
-            let path = Path::new(&image.path);
-            if !removable || !folders.iter().any(|folder| path.starts_with(folder)) {
-                continue;
-            }
-            match std::fs::remove_file(path) {
-                // Two image types can share one file (see
-                // `image_type_file_stem`).
-                Err(err) if err.kind() != std::io::ErrorKind::NotFound => {
-                    tracing::warn!(%err, item_id = %entity.id, "failed to remove an image to replace");
-                }
-                _ => {}
-            }
-        }
+        // The rows are rewritten from what the pass finds.
+        ferrofin_providers::local_images::remove_images(&mut stored.to_vec(), &folders, &entity.id);
     }
 
     /// Appends rows for art files already sitting in the item's metadata art
@@ -15188,14 +15159,19 @@ impl LibraryScanner {
 
     /// The series' stored `DisplayOrder`, as the plugin's `SeriesDisplayOrder`
     /// carries it: raw, and empty when the row has none or no repository is
-    /// attached. A failed read is counted as a failed request and answers
-    /// `None`, so the caller skips its lookup instead of guessing an order.
+    /// attached. A row that fails to read answers `None`, and the caller skips
+    /// its TheTVDB lookup rather than guess an order that could fetch the
+    /// wrong episode: upstream gives a child of a series it cannot see no
+    /// `SeriesProviderIds` (`Episode.GetLookupInfo`), and the plugin answers
+    /// that with an empty result. No failure is counted, so this read no
+    /// longer keeps the child unstamped and refreshed again on every scan; a
+    /// transient read error costs the pass's children TheTVDB's answer until
+    /// a full refresh.
     async fn series_display_order(&self, cache: &ArtworkCache, series_id: &str) -> Option<String> {
         if let Some(order) = cache.display_orders.get(series_id) {
             return Some(order.clone());
         }
         if cache.unread_parents.contains(series_id) {
-            ferrofin_providers::rate_limit::note_request_failure();
             return None;
         }
         let (Some(items), Ok(id)) = (&self.item_repository, Uuid::parse_str(series_id)) else {
@@ -15207,7 +15183,6 @@ impl LibraryScanner {
             )),
             Err(err) => {
                 tracing::warn!(%err, item_id = %series_id, "could not read series display order");
-                ferrofin_providers::rate_limit::note_request_failure();
                 None
             }
         }
@@ -24673,6 +24648,8 @@ mod person_biography_tests;
 mod person_image_tests;
 #[cfg(test)]
 mod plan_paths_tests;
+#[cfg(test)]
+mod unread_series_tests;
 
 #[cfg(test)]
 mod tests {
@@ -37293,14 +37270,20 @@ mod tests {
     }
 
     /// Music's post-pass must interleave plugins with built-in artwork just as
-    /// the item walk does, including its per-kind default provider order.
+    /// the item walk does, including its per-kind default provider order. An
+    /// Identify's result (`identified_by`, its `SearchProviderName`) runs its
+    /// provider first, for every item the refresh's options carry it to
+    /// (`GetNonLocalImageProviders`).
     #[rstest::rstest]
-    #[case::plugin_first(&["ArtworkPlugin", "TheAudioDB"], true)]
-    #[case::remote_first(&["TheAudioDB", "ArtworkPlugin"], false)]
-    #[case::default_remote_first(&[], false)]
+    #[case::plugin_first(&["ArtworkPlugin", "TheAudioDB"], None, true)]
+    #[case::remote_first(&["TheAudioDB", "ArtworkPlugin"], None, false)]
+    #[case::default_remote_first(&[], None, false)]
+    #[case::identified_plugin(&["TheAudioDB", "ArtworkPlugin"], Some("artworkplugin"), true)]
+    #[case::identified_remote(&["ArtworkPlugin", "TheAudioDB"], Some("TheAudioDB"), false)]
     #[tokio::test]
     async fn music_interleaves_plugin_and_remote_artwork(
         #[case] order: &[&str],
+        #[case] identified_by: Option<&str>,
         #[case] plugin_wins: bool,
     ) {
         use ferrofin_traits::persistence::ItemPersistenceService as _;
@@ -37331,13 +37314,27 @@ mod tests {
                 .collect(),
             ..Default::default()
         };
-        fixture
-            .pass(
-                &scanner,
+        let refresh = MetadataRefreshOptions {
+            search_result: identified_by.map(|name| {
+                ferrofin_model::providers::RemoteSearchResult {
+                    search_provider_name: Some(name.to_owned()),
+                    ..Default::default()
+                }
+            }),
+            ..Default::default()
+        };
+        scanner
+            .music_pass_with_options_for_test(
+                &[
+                    (fixture.album_id, super::music::MusicKind::Album),
+                    (fixture.artist_id, super::music::MusicKind::ByNameArtist),
+                ],
                 super::FetcherPolicy {
                     options: Some(&options),
                     ..Default::default()
                 },
+                true,
+                &refresh,
             )
             .await;
         for id in [fixture.album_id, fixture.artist_id] {

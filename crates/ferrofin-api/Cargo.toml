@@ -49,6 +49,8 @@ reqwest.workspace = true
 futures-core.workspace = true
 futures-util.workspace = true
 httpdate.workspace = true
+# `GET /Playback/BitrateTest`'s body: random bytes no compressing hop can shrink.
+rand.workspace = true
 async-trait.workspace = true
 serde.workspace = true
 serde_urlencoded.workspace = true
@@ -64,7 +66,6 @@ tracing.workspace = true
 # exporter here — that lives in ferrofin-server; these are API-only helpers.
 opentelemetry.workspace = true
 tracing-opentelemetry.workspace = true
-zip = { workspace = true, features = ["time"] }   # backup archives; `time` stamps entries with now
 
 [dev-dependencies]
 # Self dev-dependency so unit + integration tests build with the `test-util`

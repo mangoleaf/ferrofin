@@ -248,7 +248,7 @@ fn fake_system_methods_run_and_panic() {
         .unwrap();
     assert!(rt.block_on(f.get_system_info(&ctx)).is_ok());
     assert!(rt.block_on(f.get_public_system_info(&ctx)).is_ok());
-    // `restart` accepts the request (the backup-restore handler schedules one);
+    // `restart` accepts the request;
     // shutdown/storage stay `unimplemented!`.
     assert!(rt.block_on(f.restart()).is_ok());
     assert_panics(f.shutdown());
@@ -302,7 +302,7 @@ fn fake_paths_are_empty_except_the_writable_data_root() {
         assert_eq!(s, "");
     }
     // `program_data_path`/`data_path` return a real temp dir so path-backed
-    // handlers (Backup) have somewhere writable to work in tests.
+    // handlers have somewhere writable to work in tests.
     assert_ne!(p.program_data_path(), "");
     assert_eq!(p.data_path(), p.program_data_path());
 }

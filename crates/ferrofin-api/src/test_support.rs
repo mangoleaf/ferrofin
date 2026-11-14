@@ -265,8 +265,7 @@ pub fn elevated_fake_state() -> AppState {
 }
 
 /// [`elevated_fake_state`] over the given library and system managers, for an
-/// admin-only handler whose behaviour depends on them (the backup create's
-/// scan and free-space guards).
+/// admin-only handler whose behaviour depends on them.
 #[must_use]
 pub fn elevated_state_with(
     library: Arc<dyn LibraryManager>,
@@ -683,20 +682,6 @@ fake_library_manager!(FakeLibrary {
         _user: &ferrofin_db::entities::users::UserEntity,
     ) -> Result<Vec<Uuid>, ServiceError> {
         Ok(ids.to_vec())
-    }
-});
-
-/// [`FakeLibrary`] in the middle of a full library validation
-/// ([`LibraryManager::is_scan_running`]), for the work that refuses or stands
-/// down while a library scan runs.
-pub struct ScanningLibrary;
-
-fake_library_manager!(ScanningLibrary {
-    async fn queue_library_scan(&self) -> Result<(), ServiceError> {
-        unimplemented!("fake")
-    }
-    fn is_scan_running(&self) -> bool {
-        true
     }
 });
 
@@ -1475,8 +1460,7 @@ impl SessionManager for FakeSessions {
 /// A fake [`SystemManager`]. The info getters return a default value so the
 /// now-real `/System/Info` and `/System/Info/Public` handlers resolve (the
 /// contract probe expects them to route, not `404`); `restart` accepts the
-/// request (the backup-restore handler schedules a restart, and its test
-/// asserts the on-disk marker instead); shutdown/storage stay `unimplemented!`.
+/// request; shutdown/storage stay `unimplemented!`.
 /// `snapshot_database` writes a stand-in database file, and `free_space_of`
 /// reports a disk that never fills.
 pub struct FakeSystem;
@@ -1593,8 +1577,8 @@ impl ServerApplicationPaths for FakePaths {
         String::new()
     }
     fn program_data_path(&self) -> String {
-        // A process-unique temp root so path-backed handlers (e.g. Backup) have a
-        // real, writable directory to operate in during tests.
+        // A process-unique temp root so path-backed handlers have a real,
+        // writable directory to operate in during tests.
         std::env::temp_dir()
             .join(format!("ferrofin-api-test-data-{}", std::process::id()))
             .to_string_lossy()

@@ -1943,7 +1943,19 @@ impl LibraryScanner {
                     .map(|p| (p.name(), None)),
             );
         }
-        sources.sort_by_key(|(name, _)| work.policy.image_order(kind, name));
+        // Identifying runs the chosen result's provider first
+        // (`GetNonLocalImageProviders`, `MetadataService.cs:722-727`), for
+        // every item the refresh's options carry that result to.
+        let policy = FetcherPolicy {
+            identified_by: work
+                .request
+                .options
+                .search_result
+                .as_ref()
+                .and_then(|r| r.search_provider_name.as_deref()),
+            ..work.policy
+        };
+        sources.sort_by_key(|(name, _)| policy.image_order(kind, name));
         let meta_root = meta_root.resolve();
         let dir = crate::dynamic_images::own_art_dir(&meta_root, work.id);
         let mut images: Vec<_> = stored
@@ -2014,9 +2026,26 @@ impl LibraryScanner {
         policy: FetcherPolicy<'_>,
         remote: bool,
     ) {
-        let defaults = MetadataRefreshOptions::default();
+        self.music_pass_with_options_for_test(
+            items,
+            policy,
+            remote,
+            &MetadataRefreshOptions::default(),
+        )
+        .await;
+    }
+
+    /// [`music_pass_for_test`](Self::music_pass_for_test) refreshing with
+    /// `options`.
+    pub(super) async fn music_pass_with_options_for_test(
+        &self,
+        items: &[(Uuid, MusicKind)],
+        policy: FetcherPolicy<'_>,
+        remote: bool,
+        options: &MetadataRefreshOptions,
+    ) {
         let request = RefreshRequest {
-            options: &defaults,
+            options,
             force_save: false,
         };
         let plan = ItemRefreshPlan {
