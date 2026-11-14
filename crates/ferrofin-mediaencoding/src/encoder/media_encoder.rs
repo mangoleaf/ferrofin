@@ -10,8 +10,8 @@
 //! Frame extraction is software only, as upstream's `ExtractImageInternal`
 //! is, and tone-maps an HDR source with the software filters the startup
 //! probe found; the hardware-acceleration matrix belongs to the trickplay
-//! extractor. Blu-ray (`BdInfo`) has no plan yet and belongs to disc-image
-//! playback rather than encoding. Every ffmpeg/ffprobe process spawn sits
+//! extractor. A DVD or Blu-ray folder rip is read through its primary
+//! playlist ([`crate::disc`]). Every ffmpeg/ffprobe process spawn sits
 //! behind the [`Transcoder`] seam so unit tests inject a fake.
 
 use std::fmt::Write as _;
@@ -703,6 +703,20 @@ fn image_resolution_parameter(resolution: ImageResolution) -> &'static str {
     }
 }
 
+/// The ffmpeg input argument for one file of `media_source`: the `bluray:`
+/// prefix for a Blu-ray ISO, else `file:`, through the source's protocol.
+/// Port of `MediaEncoder.GetInputArgument(string, MediaSourceInfo)`, shared
+/// with the callers that hold no [`MediaEncoder`].
+#[must_use]
+pub fn source_input_argument(input_file: &str, media_source: &MediaSourceInfo) -> String {
+    let prefix = if media_source.iso_type == Some(IsoType::BluRay) {
+        "bluray"
+    } else {
+        "file"
+    };
+    get_input_argument(prefix, input_file, media_source.protocol)
+}
+
 #[async_trait]
 impl<T: Transcoder> MediaEncoder for MediaEncoderImpl<T> {
     fn encoder_path(&self) -> String {
@@ -754,12 +768,7 @@ impl<T: Transcoder> MediaEncoder for MediaEncoderImpl<T> {
             .as_deref()
             .ok_or_else(|| ServiceError::invalid_input("media source has no path"))?;
 
-        let prefix = if source.iso_type == Some(IsoType::BluRay) {
-            "bluray"
-        } else {
-            "file"
-        };
-        let input_path = get_input_argument(prefix, input_file, source.protocol);
+        let input_path = source_input_argument(input_file, source);
         let extra = self.get_extra_arguments(request);
         // `protocol == MediaProtocol.File && !isAudio && _proberSupportsFirstVideoFrame`.
         let first_video_frame = source.protocol == MediaProtocol::File
@@ -915,7 +924,9 @@ impl<T: Transcoder> MediaEncoder for MediaEncoderImpl<T> {
                 temp_dir.display()
             ))
         })?;
-        let input_path = self.get_input_argument(input_file, media_source);
+        // `ExtractImage`'s `GetInputPathArgument`: a disc rip reads its
+        // primary playlist.
+        let input_path = crate::disc::input_path_argument(input_file, media_source).await?;
         let image_stream_index = if video_stream.stream_type == MediaStreamType::Video {
             None
         } else {
@@ -1023,7 +1034,7 @@ impl<T: Transcoder> MediaEncoder for MediaEncoderImpl<T> {
                 temp_dir.display()
             ))
         })?;
-        let input_path = self.get_input_argument(input_file, media_source);
+        let input_path = crate::disc::input_path_argument(input_file, media_source).await?;
         let ffmpeg = self.encoder_path();
         // One slot for both attempts, as for a video frame above.
         let _permit = self
@@ -1104,12 +1115,7 @@ impl<T: Transcoder> MediaEncoder for MediaEncoderImpl<T> {
     }
 
     fn get_input_argument(&self, input_file: &str, media_source: &MediaSourceInfo) -> String {
-        let prefix = if media_source.iso_type == Some(IsoType::BluRay) {
-            "bluray"
-        } else {
-            "file"
-        };
-        get_input_argument(prefix, input_file, media_source.protocol)
+        source_input_argument(input_file, media_source)
     }
 
     fn get_time_parameter(&self, ticks: i64) -> String {
@@ -1534,6 +1540,61 @@ mod tests {
         );
         // Nothing but the extracted picture is left in the temp dir.
         assert_eq!(std::fs::read_dir(tmp.path()).unwrap().count(), 1);
+    }
+
+    /// `ExtractImage` reads its input through `GetInputPathArgument`: a DVD
+    /// rip's primary playlist, never the folder; a rip whose playlist cannot
+    /// be read is an error before any ffmpeg runs.
+    #[tokio::test]
+    async fn extract_image_stream_reads_a_disc_rip_through_its_playlist() {
+        let tmp = tempfile::tempdir().unwrap();
+        let rip = tempfile::tempdir().unwrap();
+        let vob = rip.path().join("VIDEO_TS").join("VTS_01_1.VOB");
+        std::fs::create_dir_all(vob.parent().unwrap()).unwrap();
+        std::fs::write(&vob, b"").unwrap();
+        let transcoder = Arc::new(FlakyTranscoder {
+            calls: std::sync::Mutex::new(Vec::new()),
+            succeed_on: 1,
+        });
+        let enc = MediaEncoderImpl::new(
+            Arc::clone(&transcoder),
+            "/usr/bin/ffmpeg".to_owned(),
+            "/usr/bin/ffprobe".to_owned(),
+            MediaEncoderConfig {
+                temp_dir: tmp.path().to_path_buf().into(),
+                ..MediaEncoderConfig::default()
+            },
+        );
+        let mut source = MediaSourceInfo {
+            video_type: Some(ferrofin_model::entities::VideoType::Dvd),
+            ..MediaSourceInfo::default()
+        };
+        enc.extract_image_stream(
+            &rip.path().to_string_lossy(),
+            "",
+            &source,
+            0,
+            ImageFormat::Png,
+        )
+        .await
+        .expect("second attempt succeeds");
+        let calls = transcoder.calls.lock().unwrap().clone();
+        let input = format!("-i file:\"{}\"", vob.display());
+        assert!(calls.iter().all(|call| call.contains(&input)), "{calls:?}");
+
+        source.video_type = Some(ferrofin_model::entities::VideoType::BluRay);
+        let err = enc
+            .extract_image_stream(
+                &rip.path().to_string_lossy(),
+                "",
+                &source,
+                0,
+                ImageFormat::Png,
+            )
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("BD structure"), "{err}");
+        assert_eq!(transcoder.calls.lock().unwrap().len(), calls.len());
     }
 
     #[tokio::test]
