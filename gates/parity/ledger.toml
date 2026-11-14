@@ -948,13 +948,13 @@ kind = "missing"
 issue = 853
 reason = "Timers carry no artwork: FillImages is not ported."
 
-# The bitrate test sends zero bytes where Jellyfin sends random ones.
+# Both bitrate test bodies are random bytes, and Jellyfin's is longer.
 [[entry]]
 request = "GetBitrateTestBytes"
 path = "$"
 kind = "value"
-issue = 833
-reason = "The bitrate test sends zero bytes where Jellyfin sends random ones."
+verified = "GET /Playback/BitrateTest"
+reason = "Both bodies are random bytes, so they never match, and Ferrofin sends exactly size bytes where Jellyfin sends its whole ArrayPool rental, rounded up to a power of two."
 
 # In-tree plugins carry no embedded logo.
 [[entry]]

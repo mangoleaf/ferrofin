@@ -4547,6 +4547,33 @@ pub const VERIFIED: &[Verified] = &[
         ],
         refs: &[],
     },
+    Verified {
+        method: "get",
+        path: "/Playback/BitrateTest",
+        upstream_file: "Jellyfin.Api/Controllers/MediaInfoController.cs",
+        upstream_method: "GetBitrateTestBytes",
+        ferrofin: "handlers/media_info.rs get_bitrate_test (RequireAuth, the controller's \
+               [Authorize]; crate::query::Query binds size case-insensitively, an empty value \
+               refused as for the non-nullable int) → size defaults to 102400 and must be in \
+               [1, 100000000] ([Range]), else 400 → size random bytes (rand::fill, \
+               Random.Shared.NextBytes) as application/octet-stream \
+               (MediaTypeNames.Application.Octet), which the response compression skips as \
+               ResponseCompressionDefaults.MimeTypes does",
+        date: "2026-11-13",
+        divergences: &[
+            "The body is exactly size bytes. Upstream sends the whole buffer it rents from \
+         ArrayPool<byte>.Shared, which is rounded up to a power of two (about 131072 bytes \
+         for the default 102400), so a client dividing the requested size by the download \
+         time under-reports its bandwidth. Jellyfin bug not ported.",
+            "Upstream returns that buffer to the pool in a finally before the File result is \
+         written, so a concurrent request can rent and overwrite it mid-response. Ferrofin's \
+         buffer belongs to its response. Jellyfin bug not ported.",
+            "The 400 for a size out of range or that does not bind (upstream's \
+         ValidationProblemDetails), and the 401 body, are Ferrofin's error shape, not \
+         upstream's. Fix path: gl-666.",
+        ],
+        refs: &[],
+    },
 ];
 
 /// What `/Artists` and `/Artists/AlbumArtists` do differently from v12's
