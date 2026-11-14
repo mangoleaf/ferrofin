@@ -3707,8 +3707,6 @@ pub const VERIFIED: &[Verified] = &[
                ferrofin-model dto/display_preferences_dto.rs",
         date: "2026-10-30",
         divergences: &[
-            "A missing or empty skipBackLength/skipForwardLength stores 10000/30000 ms; \
-         upstream's controller stores 15000 for both. Fix path: gl-410.",
             "Values upstream fails on with a 500 take the defaults here: an \
          enableNextVideoInfoOverlay that is not true/false (bool.Parse) is true, a \
          non-numeric or overflowing skip length (int.Parse) is the fallback, a homesection \
