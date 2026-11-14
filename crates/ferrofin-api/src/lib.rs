@@ -39,7 +39,7 @@ pub mod state;
 pub mod test_support;
 
 pub use error::{ApiError, ProblemStatus};
-pub use router::create_router;
+pub use router::{create_router, startup_layers};
 pub use state::{AppState, Inner};
 
 /// Re-export the generated vendored contract table under [`routes`].
