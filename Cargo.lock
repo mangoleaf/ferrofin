@@ -1257,7 +1257,6 @@ dependencies = [
  "url",
  "utoipa",
  "uuid",
- "zip",
 ]
 
 [[package]]
