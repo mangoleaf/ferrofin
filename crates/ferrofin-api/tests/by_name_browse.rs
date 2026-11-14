@@ -907,6 +907,59 @@ async fn by_name_lists_pass_the_kind_lists_through() {
     }
 }
 
+/// v12.4 `GenresController.GetGenres`, `MusicGenresController.GetMusicGenres`
+/// and `StudiosController.GetStudios` declare none of `filters`, `mediaTypes`,
+/// `genres`, `genreIds`, `officialRatings`, `tags`, `years`, `studioIds`,
+/// `studios` or `minCommunityRating`, Genres and `MusicGenres` no
+/// `enableUserData`, and Studios no `sortBy`/`sortOrder` (gl-408). ASP.NET
+/// never binds them, so any value, valid or not, answers the unfiltered list.
+#[rstest::rstest]
+#[case::genres("/Genres", "enableUserData=abc&sortBy=SortName&sortOrder=Descending")]
+#[case::music_genres(
+    "/MusicGenres",
+    "enableUserData=abc&sortBy=SortName&sortOrder=Descending"
+)]
+#[case::studios("/Studios", "sortBy=Name&sortOrder=Descending")]
+#[tokio::test]
+async fn value_lists_ignore_parameters_their_action_does_not_declare(
+    #[case] route: &str,
+    #[case] own: &str,
+) {
+    let library = ByNameLibrary::default();
+    let uri = format!(
+        "{route}?filters=IsPlayed,IsUnplayed&mediaTypes=Video&genres=Drama&genreIds=abc\
+         &officialRatings=PG&tags=x&years=abc&studioIds=abc&studios=Acme\
+         &minCommunityRating=abc&{own}"
+    );
+    let response = create_router(by_name_state_with_library(library.clone()))
+        .oneshot(Request::builder().uri(&uri).body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK, "{uri}");
+    let seen = library.seen.lock().expect("lock");
+    let query = seen.last().expect("a by-name query ran");
+    assert_eq!(query.is_played, None);
+    assert_eq!(query.media_types, []);
+    assert_eq!((query.genres.len(), query.genre_ids.len()), (0, 0));
+    assert_eq!((query.official_ratings.len(), query.tags.len()), (0, 0));
+    assert_eq!((query.years.len(), query.studio_ids.len()), (0, 0));
+    // The genre routes declare `sortBy`/`sortOrder`; Studios does not.
+    assert_eq!(
+        query.order_by.is_empty(),
+        route == "/Studios",
+        "{:?}",
+        query.order_by
+    );
+}
+
+/// Studios does declare `bool? enableUserData`, so a value the binder
+/// refuses is still a `400` there.
+#[tokio::test]
+async fn studios_refuse_an_enable_user_data_that_is_not_a_boolean() {
+    let response = get("/Studios?enableUserData=abc").await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}
+
 /// `studios` on the artist routes (v12.2 `ArtistsController.cs:182-195`,
 /// `:336-349`): non-empty, the names' studio ids REPLACE `studioIds`. Upstream's
 /// `GetStudio` mints a row for an unknown name, whose id nothing references;

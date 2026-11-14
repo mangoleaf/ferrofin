@@ -394,3 +394,61 @@ async fn oneshot(router: axum::Router, uri: &str) -> (StatusCode, Vec<u8>) {
         .to_vec();
     (status, bytes)
 }
+
+/// v12.4 `ChannelsController.GetLatestChannelItems` binds `startIndex`,
+/// `limit` and `filters` and calls `query.ApplyFilters(filters)` after
+/// `GetUserId` (gl-408): a contradictory pair is upstream's
+/// `ArgumentException`, a `400`, and so is a paging value the binder refuses.
+#[tokio::test]
+async fn latest_channel_items_apply_their_filters() {
+    for (uri, expected) in [
+        (
+            "/Channels/Items/Latest?filters=IsPlayed,IsUnplayed",
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            "/Channels/Items/Latest?filters=IsFolder,IsNotFolder",
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            "/Channels/Items/Latest?filters=Likes,Dislikes",
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            "/Channels/Items/Latest?startIndex=abc",
+            StatusCode::BAD_REQUEST,
+        ),
+        ("/Channels/Items/Latest?limit=abc", StatusCode::BAD_REQUEST),
+        (
+            "/Channels/Items/Latest?filters=IsPlayed,Bogus&startIndex=0&limit=5&fields=Bogus&channelIds=nope",
+            StatusCode::OK,
+        ),
+    ] {
+        let (status, body) = send(Arc::new(StubTasks::new(Vec::new())), "GET", uri).await;
+        assert_eq!(status, expected, "{uri}");
+        if status == StatusCode::OK {
+            // `new QueryResult(query.StartIndex, total, items)`.
+            let body: serde_json::Value = serde_json::from_slice(&body).expect("json");
+            assert_eq!(body["StartIndex"], 0);
+        }
+    }
+    let uri = "/Channels/Items/Latest?startIndex=20";
+    let (_, body) = send(Arc::new(StubTasks::new(Vec::new())), "GET", uri).await;
+    let body: serde_json::Value = serde_json::from_slice(&body).expect("json");
+    assert_eq!(
+        (body["StartIndex"].clone(), body["TotalRecordCount"].clone()),
+        (20.into(), 0.into())
+    );
+
+    // `GetUserId` runs first: another user's id is the 403, not the filter's 400.
+    let auth = Arc::new(UserAuth(CALLER_ID));
+    let router = create_router(state_as(
+        Arc::new(StubTasks::new(Vec::new())),
+        Arc::new(FakeUsers),
+        auth.clone(),
+        auth,
+    ));
+    let uri = format!("/Channels/Items/Latest?userId={OTHER_USER_ID}&filters=IsPlayed,IsUnplayed");
+    let (status, _) = oneshot(router, &uri).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{uri}");
+}
