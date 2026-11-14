@@ -1053,49 +1053,6 @@ kind = "missing"
 issue = 838
 reason = "The obsolete SystemInfo members are not upstream's constants, and PackageName is set."
 
-# A folder's DeviceId is the folder, not the mount point that holds it.
-[[entry]]
-request = "GetSystemStorage"
-path = "ImageCacheFolder.DeviceId"
-kind = "value"
-issue = 427
-reason = "A folder's DeviceId is the folder, not the mount point that holds it."
-
-[[entry]]
-request = "GetSystemStorage"
-path = "InternalMetadataFolder.DeviceId"
-kind = "value"
-issue = 427
-reason = "A folder's DeviceId is the folder, not the mount point that holds it."
-
-[[entry]]
-request = "GetSystemStorage"
-path = "Libraries[].Folders[].DeviceId"
-kind = "value"
-issue = 427
-reason = "A folder's DeviceId is the folder, not the mount point that holds it."
-
-[[entry]]
-request = "GetSystemStorage"
-path = "LogFolder.DeviceId"
-kind = "value"
-issue = 427
-reason = "A folder's DeviceId is the folder, not the mount point that holds it."
-
-[[entry]]
-request = "GetSystemStorage"
-path = "TranscodingTempFolder.DeviceId"
-kind = "value"
-issue = 427
-reason = "A folder's DeviceId is the folder, not the mount point that holds it."
-
-[[entry]]
-request = "GetSystemStorage"
-path = "WebFolder.DeviceId"
-kind = "value"
-issue = 427
-reason = "A folder's DeviceId is the folder, not the mount point that holds it."
-
 # Each server writes its own FFmpeg logs, named and split by kind differently (gl-835).
 [[entry]]
 request = "GetServerLogs"
