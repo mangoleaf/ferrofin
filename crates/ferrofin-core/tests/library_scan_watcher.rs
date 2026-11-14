@@ -230,6 +230,7 @@ fn series_requests(lines: &[String]) -> Vec<&String> {
 struct CountingFs {
     listed: Mutex<Vec<String>>,
     stall: Mutex<Option<Stall>>,
+    stats: Mutex<Option<StatStall>>,
 }
 
 /// The next listing of `dir` sleeps until the runtime has run a task, as a
@@ -243,9 +244,33 @@ struct Stall {
     starved: Arc<AtomicBool>,
 }
 
+/// Every stat of one of `paths` sleeps until the runtime has run a task, as
+/// a stat on a slow mount does. One made inline on the only worker holds
+/// that task off until `patience` runs out, and is recorded in `starved`.
+struct StatStall {
+    paths: Vec<String>,
+    stat: Arc<tokio::sync::Notify>,
+    ran: std::sync::mpsc::Receiver<()>,
+    patience: Duration,
+    starved: Vec<String>,
+}
+
 impl CountingFs {
     fn take(&self) -> Vec<String> {
         std::mem::take(&mut *self.listed.lock().expect("lock"))
+    }
+
+    fn stat(&self, call: &str, path: &str) {
+        let mut stats = self.stats.lock().expect("lock");
+        let Some(stall) = stats.as_mut().filter(|s| s.paths.iter().any(|p| p == path)) else {
+            return;
+        };
+        // What the task sent for an earlier stat that starved.
+        while stall.ran.try_recv().is_ok() {}
+        stall.stat.notify_one();
+        if stall.ran.recv_timeout(stall.patience).is_err() {
+            stall.starved.push(format!("{call} {path}"));
+        }
     }
 }
 
@@ -271,9 +296,11 @@ impl FileSystem for CountingFs {
         Vec::new()
     }
     fn file_exists(&self, path: &str) -> bool {
+        self.stat("file_exists", path);
         FerrofinFileSystem::new().file_exists(path)
     }
     fn directory_exists(&self, path: &str) -> bool {
+        self.stat("directory_exists", path);
         FerrofinFileSystem::new().directory_exists(path)
     }
     fn validate_writable(&self, _path: &str) -> Result<(), ServiceError> {
@@ -1201,6 +1228,78 @@ async fn a_changed_paths_listing_leaves_the_runtime_worker_free() {
     assert!(
         !starved.load(Ordering::SeqCst),
         "the listing held the only worker"
+    );
+}
+
+/// The prune's stats go through `off_runtime` too: whether the library's
+/// location is there, whether a stale row's file still is, and whether the
+/// version a pruned owner leaves behind is. On a runtime with one worker, a
+/// task still runs while each of them is answered.
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn a_removed_files_prune_leaves_the_runtime_worker_free() {
+    let tmp = tempfile::tempdir().expect("tmp");
+    let media = tmp.path().join("media");
+    let heat = media.join("Heat (1995)");
+    touch(&heat, "Heat (1995).mkv");
+    touch(&media.join("Ronin (1998)"), "Ronin (1998).mkv");
+    let gone = heat.join("Heat (1995).mkv");
+    let version = media.join("Ronin (1998)").join("Ronin (1998).mkv");
+    let fx = Fixture::new(tmp.path(), &media, CollectionTypeOptions::movies)
+        .await
+        .scanned()
+        .await;
+    let owner = id(BaseItemKind::Movie, &gone);
+    // A version stored outside its owner's folder: no walk of that folder
+    // plans it, so the prune releases it.
+    sqlx::query(r#"UPDATE "BaseItems" SET "OwnerId" = ?2 WHERE "Id" = ?1"#)
+        .bind(id(BaseItemKind::Movie, &version))
+        .bind(&owner)
+        .execute(fx.db.writer())
+        .await
+        .expect("own");
+
+    let (ran, stalled_for) = std::sync::mpsc::channel();
+    let stat = Arc::new(tokio::sync::Notify::new());
+    *fx.fs.stats.lock().expect("lock") = Some(StatStall {
+        paths: [&media, &gone, &version]
+            .map(|p| p.to_string_lossy().into_owned())
+            .to_vec(),
+        stat: Arc::clone(&stat),
+        ran: stalled_for,
+        patience: Duration::from_secs(2),
+        starved: Vec::new(),
+    });
+    tokio::spawn(async move {
+        loop {
+            stat.notified().await;
+            if ran.send(()).is_err() {
+                break;
+            }
+        }
+    });
+
+    std::fs::remove_file(&gone).expect("rm");
+    // On the worker: the test's own future runs on the thread that started it.
+    let fx = tokio::spawn(async move {
+        let outcome = fx.report(&[&heat]).await;
+        assert_eq!(outcome.removed, 1, "{outcome:?}");
+        fx
+    })
+    .await
+    .expect("the scan finished");
+
+    assert!(!fx.rows().await.contains_key(&owner), "pruned");
+    let owners: i64 =
+        sqlx::query_scalar(r#"SELECT COUNT(*) FROM "BaseItems" WHERE "OwnerId" IS NOT NULL"#)
+            .fetch_one(fx.db.pool())
+            .await
+            .expect("owners");
+    assert_eq!(owners, 0, "the version is released");
+    let stall = fx.fs.stats.lock().expect("lock").take().expect("stall");
+    assert!(
+        stall.starved.is_empty(),
+        "these stats held the only worker: {:?}",
+        stall.starved
     );
 }
 
