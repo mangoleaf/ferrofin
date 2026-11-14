@@ -140,8 +140,7 @@ impl Extension for IntroSkipperExtension {
 
     fn media_segment_providers(&self, cx: &ExtensionContext) -> Vec<Arc<dyn MediaSegmentProvider>> {
         vec![Arc::new(SegmentProvider {
-            plugins: Arc::clone(&cx.plugins),
-            store: Arc::clone(&cx.intro_skipper),
+            detect: detector(cx),
         })]
     }
 }
@@ -151,8 +150,9 @@ impl Extension for IntroSkipperExtension {
 /// ([`intro_store::published`]). The core "Media Segment Scan" runs it over
 /// the library; it analyses nothing.
 struct SegmentProvider {
-    plugins: Arc<dyn PluginManager>,
-    store: Arc<dyn intro_store::IntroSkipperStore>,
+    /// The detection pass; its segment manager holds this provider, a cycle
+    /// that lives as long as the server does.
+    detect: DetectSegmentsTask,
 }
 
 #[async_trait]
@@ -172,6 +172,7 @@ impl MediaSegmentProvider for SegmentProvider {
             return Ok(false);
         }
         Ok(self
+            .detect
             .plugins
             .get_plugin(EXTENSION_ID)
             .await?
@@ -181,8 +182,18 @@ impl MediaSegmentProvider for SegmentProvider {
         &self,
         request: &MediaSegmentGenerationRequest,
     ) -> Result<Vec<MediaSegmentDto>, ServiceError> {
-        let stored = self.store.segments_unless_excluded(request.item_id).await?;
+        let stored = self
+            .detect
+            .actions
+            .segments_unless_excluded(request.item_id)
+            .await?;
         Ok(intro_store::published(request.item_id, &stored))
+    }
+    /// A changed file (the scan's prune): [`DetectSegmentsTask::forget_item`],
+    /// with the plugin enabled or not, or the old analysis would come back
+    /// with it. Upstream's provider has no cleanup and keeps the old analysis.
+    async fn cleanup(&self, item_id: Uuid) -> Result<(), ServiceError> {
+        self.detect.forget_item(item_id).await
     }
 }
 
@@ -1064,6 +1075,21 @@ impl DetectSegmentsTask {
             .analyze_queue(&[(season_id, entries)], &config, &TaskProgress::default())
             .await;
         tracing::info!(%season_id, analyzed = stored, "intro skipper: season rescanned");
+    }
+
+    /// Forgets what was detected in an item's old file, so the next pass
+    /// analyses the new one: its detection caches, then its detected segments
+    /// and its place in the analysed lists; segments a user entered stay.
+    /// Only a changed file's prune runs it (the provider's cleanup).
+    async fn forget_item(&self, item_id: Uuid) -> Result<(), ServiceError> {
+        // Caches first: if the store write then fails, the old analysis
+        // stands whole, where the other order could analyse the new file
+        // from the old one's prints. A file that cannot be removed is passed
+        // over, as the erase route does.
+        let removed = self.erase_cache_files(Some(&[item_id]), None).await?;
+        self.actions.forget_items(&[item_id]).await?;
+        tracing::debug!(%item_id, cache_files = removed, "intro skipper: a changed file's analysis forgotten");
+        Ok(())
     }
 
     /// Deletes the detection caches (`{item}.{mode tag}.…`: prints, silences,
@@ -2120,8 +2146,7 @@ mod tests {
     fn register_provider(h: &Harness) {
         h.segments
             .register_segment_provider(Arc::new(SegmentProvider {
-                plugins: Arc::clone(&h.task.plugins),
-                store: Arc::clone(&h.task.actions),
+                detect: h.task.clone(),
             }));
     }
 
@@ -3865,8 +3890,7 @@ mod tests {
             .await
             .expect("detect");
         let provider = SegmentProvider {
-            plugins: Arc::clone(&h.task.plugins),
-            store: Arc::clone(&h.task.actions),
+            detect: h.task.clone(),
         };
         assert_eq!(provider.name(), "Intro Skipper");
         let episode = h
@@ -3902,10 +3926,64 @@ mod tests {
 
         let disabled = harness(&TWO_EPISODES, false, "{}", true).await;
         let provider = SegmentProvider {
-            plugins: Arc::clone(&disabled.task.plugins),
-            store: Arc::clone(&disabled.task.actions),
+            detect: disabled.task.clone(),
         };
         assert!(!provider.supports(&episode).await.expect("supports"));
+    }
+
+    /// A changed file (the scan's prune, `MediaSegmentManager::delete_segments`
+    /// calling the provider's cleanup): the episode's detected segments, its
+    /// place in the analysed lists and its detection caches go, so the next
+    /// Media Segment Scan analyses the new file rather than republishing the
+    /// old intro. A user-provided segment and the other episode stay.
+    #[tokio::test]
+    async fn a_changed_file_is_analysed_again() {
+        let h = harness(&TWO_EPISODES, true, "{}", true).await;
+        register_provider(&h);
+        let scan = scan_task(&h);
+        scan.execute(&TaskProgress::default()).await.expect("first");
+        let user = StoredSegment {
+            item_id: EP_A,
+            mode: WireMode::Credits,
+            start: 1700.0,
+            end: 1790.0,
+            is_user_provided: true,
+            config_hash: String::new(),
+        };
+        h.actions
+            .update_timestamp(user.clone())
+            .await
+            .expect("user edit");
+        assert!(intro_state(&h).await.episode_ids.contains(&EP_A));
+        assert_ne!(cache_files(&h, EP_A), Vec::<String>::new());
+        let files_b = || {
+            let mut files = cache_files(&h, EP_B);
+            files.sort();
+            files
+        };
+        let kept_b = (h.actions.segments(EP_B).await.expect("B"), files_b());
+        let calls = h.calls.load(Ordering::SeqCst);
+
+        h.segments.delete_segments(EP_A).await.expect("prune");
+
+        assert_eq!(h.actions.segments(EP_A).await.expect("A"), vec![user]);
+        let state = intro_state(&h).await;
+        assert!(!state.episode_ids.contains(&EP_A), "{state:?}");
+        assert!(state.episode_ids.contains(&EP_B), "{state:?}");
+        assert_eq!(cache_files(&h, EP_A), Vec::<String>::new());
+        assert_eq!(
+            (h.actions.segments(EP_B).await.expect("B"), files_b()),
+            kept_b
+        );
+
+        scan.execute(&TaskProgress::default())
+            .await
+            .expect("second");
+        let again = h.calls.load(Ordering::SeqCst);
+        assert!(again > calls, "the new file is fingerprinted");
+        assert_eq!(intros_of(&h.segments, EP_A).await.len(), 1);
+        scan.execute(&TaskProgress::default()).await.expect("third");
+        assert_eq!(h.calls.load(Ordering::SeqCst), again, "and only once");
     }
 
     /// `DetectSegmentsTask`'s identity (D6): upstream's key, name and
