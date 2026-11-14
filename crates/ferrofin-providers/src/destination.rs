@@ -8,7 +8,9 @@
 //! link and the WASM plugin host:
 //! [`is_private_address`] names the ranges, a [`DestinationPolicy`] decides
 //! which of them a fetch may still reach, and [`PublicOnlyResolver`] applies
-//! the policy to every name a client resolves.
+//! the policy to every name a client resolves. Behind a proxy, which resolves
+//! names itself, a name is vetted before each request and
+//! [`VettedAddresses`] pins it to what was vetted.
 //!
 //! Jellyfin has no destination policy (`Jellyfin.Server/Startup.cs` gives its
 //! HTTP clients redirects and no address filter). The guard is an accepted
@@ -20,10 +22,11 @@
 //! `subtitle_private_http_allow` (owner decision 2026-11-03, gl-1160): the
 //! image list does not apply to it.
 
+use std::collections::HashMap;
 use std::future::Future;
 use std::net::{IpAddr, SocketAddr};
 use std::pin::Pin;
-use std::sync::{Arc, LazyLock, PoisonError, RwLock};
+use std::sync::{Arc, LazyLock, Mutex, PoisonError, RwLock};
 
 use async_trait::async_trait;
 use ferrofin_model::net::IpNetwork;
@@ -107,7 +110,9 @@ impl DestinationPolicy for fn(IpAddr) -> bool {
 }
 
 /// Why a destination was refused. Carried through reqwest's error chain by
-/// [`PublicOnlyResolver`], so a caller can tell its user exactly that.
+/// [`PublicOnlyResolver`], so a caller can tell its user exactly that, and by
+/// [`VettedAddresses`] when a name it was never given (the proxy's own) does
+/// not resolve.
 #[derive(Debug)]
 pub enum DestinationRefused {
     /// The name resolves to an address the policy denies.
@@ -119,14 +124,14 @@ pub enum DestinationRefused {
     },
     /// The name does not resolve.
     Unresolvable {
-        /// The URL's host.
+        /// The name looked up: the URL's host, or a proxy's.
         host: String,
         /// The resolver's error.
         error: std::io::Error,
     },
     /// The name resolves to nothing.
     Empty {
-        /// The URL's host.
+        /// The name looked up: the URL's host, or a proxy's.
         host: String,
     },
 }
@@ -224,6 +229,69 @@ impl reqwest::dns::Resolve for PublicOnlyResolver {
             let addresses = resolve_vetted(policy.as_ref(), &host, 0)
                 .await
                 .map_err(|refused| Box::new(refused) as Box<dyn std::error::Error + Send + Sync>)?;
+            Ok(Box::new(addresses.into_iter()) as reqwest::dns::Addrs)
+        })
+    }
+}
+
+/// A proxied client's resolver: a name resolves to the addresses last vetted
+/// for it ([`Self::pin`]), which is where a host the proxy settings exclude is
+/// reached. A name never vetted, which is the proxy's own, gets the system's
+/// answer unchecked, since a proxy may well be private. A client per request
+/// with `resolve_to_addrs` did the same, but loaded the root certificates and
+/// connected afresh each time.
+///
+/// An entry is replaced by the next request to its host and never removed:
+/// a connection the pool finishes after its request has ended must still
+/// find it. So the map holds one entry per host fetched through the proxy.
+/// The image downloads, the OpenSubtitles link fetch and the WASM plugin host
+/// each keep one; the WASM host's names are the guest's choice (gl-1795).
+#[derive(Debug, Default)]
+pub struct VettedAddresses(Mutex<HashMap<String, Vec<SocketAddr>>>);
+
+impl VettedAddresses {
+    /// Sends `host` to `addresses`, just vetted for it, from now on. The port
+    /// is dropped: each connection takes its own URL's port. (Hosts compare
+    /// in lower case on both sides, so that a miss never falls through to the
+    /// unchecked lookup.)
+    pub fn pin(&self, host: &str, addresses: &[SocketAddr]) {
+        let addresses = addresses
+            .iter()
+            .map(|address| {
+                // `set_port`, not a new address: an IPv6 zone stays.
+                let mut address = *address;
+                address.set_port(0);
+                address
+            })
+            .collect();
+        self.0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(host.to_ascii_lowercase(), addresses);
+    }
+
+    /// The addresses `host` is pinned to, if any.
+    #[must_use]
+    pub fn pinned(&self, host: &str) -> Option<Vec<SocketAddr>> {
+        self.0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(&host.to_ascii_lowercase())
+            .cloned()
+    }
+}
+
+impl reqwest::dns::Resolve for VettedAddresses {
+    fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
+        let pinned = self.pinned(name.as_str());
+        let host = name.as_str().to_owned();
+        Box::pin(async move {
+            let addresses = match pinned {
+                Some(addresses) => addresses,
+                None => lookup(&host, 0).await.map_err(|failed| {
+                    Box::new(failed) as Box<dyn std::error::Error + Send + Sync>
+                })?,
+            };
             Ok(Box::new(addresses.into_iter()) as reqwest::dns::Addrs)
         })
     }
@@ -696,5 +764,30 @@ mod tests {
             lookup("name.invalid", 80).await,
             Err(DestinationRefused::Unresolvable { .. } | DestinationRefused::Empty { .. })
         ));
+    }
+
+    /// A proxied client's resolver answers a vetted name with the addresses
+    /// vetted for it, without their port, so that a request to another port
+    /// of the host still takes its own; any other name, the proxy's, with the
+    /// system's answer.
+    #[tokio::test]
+    async fn the_proxied_resolver_answers_a_vetted_name_with_its_vetted_addresses() {
+        use reqwest::dns::Resolve as _;
+        let pinned = VettedAddresses::default();
+        pinned.pin(
+            "Images.Example",
+            &["203.0.113.7:8080".parse().expect("address")],
+        );
+        let vetted: Vec<std::net::SocketAddr> = pinned
+            .resolve("images.example".parse().expect("name"))
+            .await
+            .expect("pinned")
+            .collect();
+        assert_eq!(vetted, ["203.0.113.7:0".parse().expect("address")]);
+        let mut proxy = pinned
+            .resolve("localhost".parse().expect("name"))
+            .await
+            .expect("the system's answer");
+        assert!(proxy.all(|address| address.ip().is_loopback()));
     }
 }
