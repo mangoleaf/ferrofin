@@ -1006,6 +1006,16 @@ async fn a_playback_start_leaves_the_now_playing_item_to_the_first_read() {
         0,
         "the item's row is not read again: {first:#?}"
     );
+    // The media-source lookup and the DTO build share one read of the
+    // film's version group (gl-1248).
+    assert_eq!(
+        first
+            .iter()
+            .filter(|statement| statement.contains(r#"WHERE b."PrimaryVersionId" IN ("#))
+            .count(),
+        1,
+        "the version group is read once: {first:#?}"
+    );
 
     // A later read copies the item it built.
     let second = playing_statements(&router, &auth_header, "GET", "/Sessions", None).await;
