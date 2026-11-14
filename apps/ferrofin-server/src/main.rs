@@ -8,6 +8,9 @@
 //! lets the composition root live in the library crate, where the First-Light
 //! integration test can drive it. `anyhow` sits at this top level so any bring-up
 //! failure surfaces as a non-zero exit with full context.
+//!
+//! A subcommand runs instead of the server: `export-jellyfin`
+//! ([`ferrofin_server::export_cmd`]) exports a stopped data directory.
 
 // glibc malloc arena contention convoyed 64 threads (32 tokio + 32 sqlx-sqlite)
 // into 2200% kernel-mode CPU at moderate request rates; jemalloc eliminates it.
@@ -27,11 +30,14 @@ static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
 use clap::Parser as _;
 
-use ferrofin_server::config::{Cli, Config};
+use ferrofin_server::config::{Cli, Command, Config};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     let config = Config::load(cli.clone())?;
+    if let Some(Command::ExportJellyfin(args)) = &cli.command {
+        return ferrofin_server::export_cmd::run(&config, args).await;
+    }
     ferrofin_server::run_reloading(config, move || Config::load(cli.clone())).await
 }

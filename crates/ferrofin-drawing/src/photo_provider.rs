@@ -93,12 +93,14 @@ pub struct PhotoItem {
     /// The path to the source image file. Port of `BaseItem.Path`.
     pub path: String,
 
-    /// Set by [`PhotoProvider::fetch`] when EXIF was read from the file.
+    /// Set by [`PhotoProvider::fetch`] when the file was read as TagLib would
+    /// open it, with or without EXIF, and for a WebP or an AVIF Ferrofin reads
+    /// (until gl-1614 decides).
     ///
     /// Not a Jellyfin field: C# expresses the same thing by only entering the
     /// assignment block inside its `try`. A caller must not write the
     /// unconditionally-assigned fields (`overview`, `community_rating`) back
-    /// onto a row when this is `false`, or a file with no readable EXIF would
+    /// onto a row when this is `false`, or a file TagLib would refuse would
     /// clear values it never spoke about.
     pub exif_was_read: bool,
 
@@ -123,7 +125,8 @@ pub struct PhotoItem {
     /// and the field is not locked.
     pub name: Option<String>,
 
-    /// `BaseItem.Overview` — the EXIF user comment.
+    /// `BaseItem.Overview` — TagLib#'s combined comment, "" when the file holds
+    /// none (see `read_exif`).
     pub overview: Option<String>,
 
     /// `BaseItem.CommunityRating` — the EXIF rating.
@@ -279,8 +282,8 @@ impl PhotoProvider {
         item.set_image_path(ImageType::Primary, &path, modified);
 
         // The EXIF branch, gated on the extension set (C#: "other extensions
-        // might cause taglib to hang"). A file that cannot be read or carries no
-        // EXIF simply leaves the fields alone — C# catches and logs.
+        // might cause taglib to hang"). A file TagLib would fail to open leaves
+        // the fields alone — C# catches and logs (see `read_exif`).
         if is_exif_candidate(&path) {
             // Opening and parsing the container is synchronous file IO, once
             // per photo — an album is thousands of them. On a stalled NFS mount
@@ -328,7 +331,8 @@ impl PhotoProvider {
 pub struct ExifTags {
     /// The EXIF-only fields.
     pub exif: PhotoExif,
-    /// `ImageDescription`/`UserComment` — C# `ImageTag.Comment`.
+    /// TagLib#'s comment: `IFDTag.Comment` (see `ifd_comment`), and "" for a
+    /// file TagLib would open that holds none (see `read_exif`).
     pub comment: Option<String>,
     /// `XPTitle`/`ImageDescription` — C# `ImageTag.Title`.
     pub title: Option<String>,
@@ -342,23 +346,77 @@ pub struct ExifTags {
     pub height: Option<i32>,
 }
 
-/// Reads `path`'s EXIF tags, or `None` when the file cannot be OPENED.
+/// Reads `path`'s EXIF tags, or `None` when TagLib would fail to open it.
 ///
 /// Port of the C# `TagLib.File.Create` + `catch (Exception)` block, and the
 /// distinction matters: TagLib opens an image with no EXIF quite happily and
 /// hands back an `ImageTag` whose fields are all null, which upstream then
-/// assigns — clearing the item's camera/GPS/comment. Only a genuine failure
-/// (an unreadable or unsupported file) throws and leaves the item alone.
+/// assigns — clearing the item's camera/GPS/comment. A file TagLib cannot
+/// open throws, and upstream leaves the item alone.
 ///
-/// So a missing or malformed EXIF block yields DEFAULT tags — the clearing
-/// case — while an IO error yields `None`, the leave-alone case.
+/// TagLib picks its reader by the extension, and that reader throws on a file
+/// that does not start as its format does, a PNG saved as `.jpg` among them
+/// (see `taglib_header`), and on a broken container or EXIF block. Each was
+/// measured against Jellyfin 12.4 (gl-1611). A broken IFD it only marks
+/// corrupt and reads on; kamadak-exif refuses such a file, which is left
+/// alone here (gl-1615). So a container that reads with no EXIF in it yields
+/// DEFAULT tags, the clearing case; a mismatched, broken or unreadable file
+/// yields `None`, the leave-alone case.
+///
+/// Ferrofin reads EXIF from containers TagLib reads none from: WebP and AVIF,
+/// which it cannot open, and a PNG's `eXIf` chunk, which its PNG reader skips.
+/// gl-1614 holds that choice for the owner.
 fn read_exif(path: &str) -> Option<ExifTags> {
     let file = std::fs::File::open(path).ok()?;
     // A failed stat skips the IFD walk and leaves the full read to decide. A
     // file cut short after this stat can still read as it was; its new write
     // time has it read again on the next scan.
     let len = file.metadata().map_or(0, |meta| meta.len());
-    Some(exif_tags(&mut BufReader::new(Metered::new(file)), len))
+    let mut reader = BufReader::new(Metered::new(file));
+    let header = taglib_header(path);
+    if let Some(header_matches) = header
+        && !header_matches(reader.fill_buf().ok()?)
+    {
+        return None;
+    }
+    let mut tags = exif_tags(&mut reader, len)?;
+    // TagLib#'s combined `ImageTag.Comment` (`CombinedImageTag.cs:621-631`) is
+    // never null: it is "" when no tag holds a comment. Until gl-1614 decides,
+    // a WebP or an AVIF, which TagLib cannot open, keeps only a comment its
+    // EXIF holds.
+    if header.is_some() {
+        tags.comment.get_or_insert_default();
+    } else {
+        tags.comment = tags.comment.filter(|comment| !comment.is_empty());
+    }
+    Some(tags)
+}
+
+/// The header check of the reader TagLibSharp 2.3.0 picks for `path`'s
+/// extension (Jpeg and Png `ValidateHeader`, `BaseTiffFile.ReadHeader`, Cr2
+/// `ReadAdditionalCR2Header`), or `None` for an extension of
+/// [`EXIF_INCLUDE_EXTENSIONS`] it has no reader for: WebP and AVIF, where
+/// upstream's `TagLib.File.Create` throws and the photo is left alone.
+/// Ferrofin reads those by their content.
+fn taglib_header(path: &str) -> Option<fn(&[u8]) -> bool> {
+    match extension_of(path).as_str() {
+        ".jpg" | ".jpeg" => Some(|head| head.starts_with(b"\xff\xd8")),
+        ".png" => Some(|head| head.starts_with(b"\x89PNG\r\n\x1a\n")),
+        ".tiff" => Some(tiff_header),
+        // After the TIFF header: "CR", version 2.0, and the RAW IFD's offset.
+        ".cr2" => Some(|head| {
+            tiff_header(head)
+                && head
+                    .get(8..16)
+                    .is_some_and(|cr2| cr2.starts_with(b"CR\x02\x00"))
+        }),
+        _ => None,
+    }
+}
+
+/// Whether `head` starts as a TIFF does: a byte order, then the magic 42.
+fn tiff_header(head: &[u8]) -> bool {
+    head.starts_with(b"II\x2a\x00") || head.starts_with(b"MM\x00\x2a")
 }
 
 /// A reader that counts the bytes it returns, so the IFD walk knows what it
@@ -407,13 +465,12 @@ impl<R: Seek> Seek for Metered<R> {
 ///
 /// A TIFF-based file (`.tiff`, `.cr2`) goes through [`primary_tiff`], which
 /// reads its IFDs instead of the whole file. Any other container, and any
-/// TIFF that walk turns down, goes through kamadak-exif's own reader.
-fn exif_tags<R: Read + Seek>(reader: &mut BufReader<Metered<R>>, len: u64) -> ExifTags {
+/// TIFF that walk turns down, goes through kamadak-exif's own reader. `None`
+/// is a file TagLib would refuse (see `tags_or_unopened`).
+fn exif_tags<R: Read + Seek>(reader: &mut BufReader<Metered<R>>, len: u64) -> Option<ExifTags> {
     // A peek leaves the reader at the start, so a JPEG, PNG or WebP is read
     // exactly as before.
-    let is_tiff = reader
-        .fill_buf()
-        .is_ok_and(|head| head.starts_with(b"II\x2a\x00") || head.starts_with(b"MM\x00\x2a"));
+    let is_tiff = reader.fill_buf().is_ok_and(tiff_header);
     let walked = is_tiff
         .then(|| primary_tiff(reader, len))
         .flatten()
@@ -427,9 +484,17 @@ fn exif_tags<R: Read + Seek>(reader: &mut BufReader<Metered<R>>, len: u64) -> Ex
             .and_then(|()| exif::Reader::new().read_from_container(reader)),
         None => exif::Reader::new().read_from_container(reader),
     };
-    parsed
-        .as_ref()
-        .map_or_else(|_| ExifTags::default(), tags_from)
+    tags_or_unopened(parsed)
+}
+
+/// The tags of a parse, or `None` for a file TagLib would fail to open: any
+/// failure but a container that holds no EXIF (see `read_exif`).
+fn tags_or_unopened(parsed: Result<exif::Exif, exif::Error>) -> Option<ExifTags> {
+    match parsed {
+        Ok(exif) => Some(tags_from(&exif)),
+        Err(exif::Error::NotFound(_)) => Some(ExifTags::default()),
+        Err(_) => None,
+    }
 }
 
 /// The most IFDs kamadak-exif 0.6.1's parser reads in one chain before it
@@ -785,7 +850,7 @@ fn tags_from(exif: &exif::Exif) -> ExifTags {
             }
             // The Windows XP* tags are BYTE arrays holding UTF-16LE.
             exif::Value::Byte(bytes) => utf16le(bytes),
-            exif::Value::Undefined(bytes, _) => undefined_text(tag, bytes)?,
+            exif::Value::Undefined(bytes, _) => String::from_utf8_lossy(bytes).into_owned(),
             _ => return None,
         };
         let value = value.trim_end_matches('\0').trim();
@@ -813,9 +878,7 @@ fn tags_from(exif: &exif::Exif) -> ExifTags {
             altitude: gps_altitude(exif),
             iso_speed_rating: integer(Tag::PhotographicSensitivity),
         },
-        // TagLib's `ImageTag.Comment` prefers the standard EXIF UserComment and
-        // only falls back to the TIFF ImageDescription.
-        comment: text(Tag::UserComment).or_else(|| text(Tag::ImageDescription)),
+        comment: ifd_comment(exif),
         // XPTitle (0x9c9b) and Rating (0x4746) are Windows' TIFF extensions —
         // TagLib# surfaces both as ImageTag.Title/Rating, kamadak-exif has no
         // named constant for either.
@@ -830,30 +893,65 @@ fn tags_from(exif: &exif::Exif) -> ExifTags {
     }
 }
 
-/// Decodes an UNDEFINED-typed text field.
+/// TagLib#'s `IFDTag.Comment` (TagLibSharp 2.3.0, `IFDTag.cs:162-171`): the
+/// Exif IFD's `UserComment` whenever TagLib reads that entry as one, even an
+/// empty one, and only otherwise the `ImageDescription` up to its first NUL.
+/// Neither is trimmed.
 ///
-/// EXIF `UserComment` (0x9286) is UNDEFINED with a mandatory 8-byte character
-/// code prefix — `ASCII`, `UNICODE`, `JIS` or eight zeros for "undefined",
-/// each NUL-padded to 8 bytes. `kamadak-exif` hands the prefix through
-/// untouched, so it has to be stripped here or it lands in the overview.
-fn undefined_text(tag: exif::Tag, bytes: &[u8]) -> Option<String> {
-    if tag != exif::Tag::UserComment {
-        return Some(String::from_utf8_lossy(bytes).into_owned());
+/// TagLib's reader (`IFDReader.cs:382-526`) makes a `UserCommentIFDEntry` only
+/// of an entry with a count over 4 that its type branches do not take first:
+/// UNDEFINED, SBYTE, FLOAT, DOUBLE or an unknown type. Any other `UserComment`
+/// is no comment, and the description shows through.
+fn ifd_comment(exif: &exif::Exif) -> Option<String> {
+    // shortcut: of the types TagLib takes, only UNDEFINED is read here; no
+    // writer is known to use SBYTE, FLOAT, DOUBLE or an unknown type for one.
+    if let Some(exif::Value::Undefined(bytes, _)) =
+        primary(exif, exif::Tag::UserComment).map(|field| &field.value)
+        && bytes.len() > 4
+    {
+        return Some(user_comment(bytes));
     }
-    let (code, text) = bytes.split_at_checked(USER_COMMENT_PREFIX_LEN)?;
-    match code {
-        b"ASCII\0\0\0" => Some(String::from_utf8_lossy(text).into_owned()),
-        // UTF-16 with no BOM is big-endian per the spec, but writers disagree;
-        // a BOM wins when present.
-        b"UNICODE\0" => Some(utf16_with_bom(text)),
-        // JIS and the all-zero "undefined" code carry no encoding this can
-        // decode faithfully, so they are dropped rather than mangled.
+    // kamadak-exif splits an ASCII value at each NUL.
+    match &primary(exif, exif::Tag::ImageDescription)?.value {
+        exif::Value::Ascii(parts) => parts
+            .first()
+            .map(|text| String::from_utf8_lossy(text).into_owned()),
         _ => None,
     }
 }
 
-/// The fixed character-code prefix length of an EXIF `UserComment`.
-const USER_COMMENT_PREFIX_LEN: usize = 8;
+/// An EXIF `UserComment`'s text, decoded as TagLib#'s `UserCommentIFDEntry`
+/// does (`UserCommentIFDEntry.cs:108-168`), branch for branch.
+///
+/// The character sets are the one difference: TagLib reads `ASCII` text as
+/// Latin-1 and `UNICODE` text as UTF-8, so a non-ASCII comment comes out
+/// garbled (`café` as `cafÃ©`, UTF-16 cut at its first zero byte). This reads
+/// UTF-8 and UTF-16, as the EXIF specification means.
+fn user_comment(bytes: &[u8]) -> String {
+    let up_to_nul = |text: &[u8]| {
+        let text = text.split(|byte| *byte == 0).next().unwrap_or_default();
+        String::from_utf8_lossy(text).into_owned()
+    };
+    if let Some(text) = bytes.strip_prefix(b"ASCII\0\0\0") {
+        return up_to_nul(text);
+    }
+    if let Some(text) = bytes.strip_prefix(b"UNICODE\0") {
+        return utf16_with_bom(text);
+    }
+    let whole = String::from_utf8_lossy(bytes);
+    let trimmed = whole.trim();
+    if trimmed.is_empty() || trimmed == "\0" {
+        return String::new();
+    }
+    // The all-zero "undefined" code, and CanonZoomBrowser's zero byte followed
+    // by seven bytes of junk.
+    if let [0, _, _, _, _, _, _, _, text @ ..] = bytes {
+        return up_to_nul(text);
+    }
+    // Any other code (JIS among them) is read as text, the code included,
+    // except a corrupt `Unicode` one.
+    up_to_nul(bytes.strip_prefix(b"Unicode\0").unwrap_or(bytes))
+}
 
 /// Decodes UTF-16 text, honouring a leading byte-order mark and defaulting to
 /// big-endian as the EXIF spec specifies.
@@ -974,8 +1072,9 @@ fn exif_datetime(exif: &exif::Exif) -> Option<DateTime<Utc>> {
 /// the tags carry positive ones. Unconditional means a photo whose rating or
 /// comment tag was REMOVED has the field cleared on the next refresh — the file
 /// is the only source of truth for a photo, and upstream assigns both straight
-/// from the tag. It runs only when EXIF was actually read, so a file with none
-/// (or one that failed to open) never reaches here and keeps whatever it had.
+/// from the tag. It runs for every file TagLib would open, one with no EXIF
+/// included; a file it would fail to open never reaches here and keeps
+/// whatever it had.
 fn apply_exif(item: &mut PhotoItem, tags: &ExifTags) {
     item.exif_was_read = true;
     item.exif = tags.exif.clone();
@@ -1390,7 +1489,7 @@ mod tests {
     #[tokio::test]
     async fn a_file_without_exif_leaves_every_field_alone() {
         let dir = tempfile::tempdir().expect("tempdir");
-        // Two bytes of nothing: openable, but no EXIF container.
+        // SOI and nothing else: TagLib throws, so the photo is left alone.
         let path = write_temp(&dir, "empty.jpg", b"\xff\xd8");
         let provider = PhotoProvider::new(Arc::new(FakeProcessor::reporting(4, 3)));
         let mut item = PhotoItem {
@@ -1398,13 +1497,14 @@ mod tests {
             ..Default::default()
         };
         provider.fetch(&mut item).await.expect("fetch");
+        assert!(!item.exif_was_read);
         assert_eq!(item.exif, PhotoExif::default());
         // The always-on dimension backfill still runs.
         assert_eq!((item.width, item.height), (4, 3));
     }
 
     #[tokio::test]
-    async fn a_file_reaching_one_ifd_twice_reads_as_no_exif() {
+    async fn a_file_reaching_one_ifd_twice_is_left_alone() {
         // IFD0 points twice at one Exif IFD holding ISO 400. kamadak-exif
         // 0.6.1 read that IFD again for every pointer, which nested pointers
         // multiply (GHSA-53gf-vqf6-qvp8); 0.6.2 refuses the file.
@@ -1423,8 +1523,10 @@ mod tests {
         };
         provider.fetch(&mut item).await.expect("fetch");
         assert_eq!(item.exif, PhotoExif::default());
-        // Read as an unparsable EXIF block (fields cleared), not an I/O error.
-        assert!(item.exif_was_read);
+        // kamadak-exif refuses the file, which leaves the photo alone as a
+        // broken EXIF block does. TagLib marks such a loop corrupt and reads
+        // on (gl-1615).
+        assert!(!item.exif_was_read);
     }
 
     #[tokio::test]
@@ -1734,15 +1836,12 @@ mod tests {
 
     /// The tags kamadak-exif's own reader finds when it loads the whole file:
     /// the behaviour every streamed read must reproduce.
-    fn whole_file_tags(file: &[u8]) -> ExifTags {
-        exif::Reader::new()
-            .read_from_container(&mut std::io::Cursor::new(file))
-            .as_ref()
-            .map_or_else(|_| ExifTags::default(), tags_from)
+    fn whole_file_tags(file: &[u8]) -> Option<ExifTags> {
+        tags_or_unopened(exif::Reader::new().read_from_container(&mut std::io::Cursor::new(file)))
     }
 
     /// [`exif_tags`] over `file`, with the number of bytes it read.
-    fn streamed_tags(file: &[u8]) -> (ExifTags, usize) {
+    fn streamed_tags(file: &[u8]) -> (Option<ExifTags>, usize) {
         let mut reader = BufReader::new(Metered::new(std::io::Cursor::new(file)));
         let tags = exif_tags(&mut reader, u64::try_from(file.len()).unwrap());
         (tags, usize::try_from(reader.get_ref().read).unwrap())
@@ -1756,6 +1855,7 @@ mod tests {
         let (tags, read) = streamed_tags(&file);
 
         assert_eq!(tags, whole_file_tags(&file));
+        let tags = tags.expect("a readable TIFF");
         assert_eq!(tags.exif.camera_make.as_deref(), Some("Canon"));
         assert_eq!(tags.exif.camera_model.as_deref(), Some("Canon EOS R5"));
         assert_eq!(tags.exif.exposure_time, Some(1.0 / 250.0));
@@ -1980,7 +2080,10 @@ mod tests {
             0,
         );
         assert_eq!(tags, whole_file_tags(&file));
-        assert_eq!(tags.exif.camera_make.as_deref(), Some("Canon"));
+        assert_eq!(
+            tags.and_then(|tags| tags.exif.camera_make).as_deref(),
+            Some("Canon")
+        );
     }
 
     /// A reader whose reads fail from `fail_at` on, as a dying disk or a
@@ -2010,13 +2113,237 @@ mod tests {
     #[test]
     fn a_read_error_during_the_walk_reads_as_the_full_read_does() {
         // IFD0 sits after the pixel data, past the point reads start failing:
-        // the walk gives up and the full read fails as it always did.
+        // the walk gives up and the full read fails as it always did, which
+        // leaves the photo alone, as TagLib's throw does upstream.
         let file = camera_tiff(true, 64 << 10);
         let len = u64::try_from(file.len()).unwrap();
         let mut reader = BufReader::new(Metered::new(FailingReader {
             inner: std::io::Cursor::new(file),
             fail_at: 32 << 10,
         }));
-        assert_eq!(exif_tags(&mut reader, len), ExifTags::default());
+        assert_eq!(exif_tags(&mut reader, len), None);
+    }
+
+    /// A one-pixel JPEG holding `ifd0`'s entries and, when `exif` has any, an
+    /// Exif IFD with them; values over four bytes go out of line. No APP1 when
+    /// both are empty. It has the frame header every image has, which TagLib
+    /// needs for the dimensions upstream reads before the comment.
+    fn jpeg_with_tags(ifd0: &[(u16, u16, &[u8])], exif: &[(u16, u16, &[u8])]) -> Vec<u8> {
+        /// Writes one IFD's entries at `at`, their long values from `data_at`.
+        fn ifd(entries: &[(u16, u16, &[u8])], at: u32, out: &mut Vec<u8>, data: &mut Vec<u8>) {
+            let count = u32::try_from(entries.len()).unwrap();
+            let data_at = at + 2 + 12 * count + 4;
+            out.extend_from_slice(&u16::try_from(count).unwrap().to_le_bytes());
+            for (tag, kind, value) in entries {
+                out.extend_from_slice(&tag.to_le_bytes());
+                out.extend_from_slice(&kind.to_le_bytes());
+                // The count is of values: a LONG is 4 bytes, the rest here 1.
+                let unit = if *kind == 4 { 4 } else { 1 };
+                out.extend_from_slice(&u32::try_from(value.len() / unit).unwrap().to_le_bytes());
+                if value.len() <= 4 {
+                    let mut inline = [0u8; 4];
+                    inline[..value.len()].copy_from_slice(value);
+                    out.extend_from_slice(&inline);
+                } else {
+                    let offset = data_at + u32::try_from(data.len()).unwrap();
+                    out.extend_from_slice(&offset.to_le_bytes());
+                    data.extend_from_slice(value);
+                }
+            }
+            out.extend_from_slice(&0u32.to_le_bytes()); // no next IFD
+        }
+
+        let mut jpeg = Vec::from(b"\xff\xd8".as_slice()); // SOI
+        if !(ifd0.is_empty() && exif.is_empty()) {
+            let mut entries = ifd0.to_vec();
+            // IFD0 at 8, then its out-of-line values, then the Exif IFD and its.
+            let mut tiff = Vec::from(b"II\x2a\x00\x08\x00\x00\x00".as_slice());
+            let pointer;
+            if !exif.is_empty() {
+                let ifd0_len = 2 + 12 * (entries.len() + 1) + 4;
+                let ifd0_data: usize = ifd0.iter().map(|e| e.2.len()).filter(|n| *n > 4).sum();
+                pointer = u32::try_from(8 + ifd0_len + ifd0_data)
+                    .unwrap()
+                    .to_le_bytes();
+                entries.push((0x8769, 4, &pointer));
+            }
+            let (mut out, mut data) = (Vec::new(), Vec::new());
+            ifd(&entries, 8, &mut out, &mut data);
+            tiff.extend_from_slice(&out);
+            tiff.extend_from_slice(&data);
+            if !exif.is_empty() {
+                let (mut out, mut data) = (Vec::new(), Vec::new());
+                ifd(
+                    exif,
+                    u32::try_from(tiff.len()).unwrap(),
+                    &mut out,
+                    &mut data,
+                );
+                tiff.extend_from_slice(&out);
+                tiff.extend_from_slice(&data);
+            }
+            let mut app1 = Vec::from(b"Exif\0\0".as_slice());
+            app1.extend_from_slice(&tiff);
+            jpeg.extend_from_slice(b"\xff\xe1");
+            jpeg.extend_from_slice(&u16::try_from(app1.len() + 2).unwrap().to_be_bytes());
+            jpeg.extend_from_slice(&app1);
+        }
+        // SOF0: 8-bit, 1x1, one component.
+        jpeg.extend_from_slice(b"\xff\xc0\x00\x0b\x08\x00\x01\x00\x01\x01\x01\x11\x00");
+        jpeg.extend_from_slice(b"\xff\xd9"); // EOI
+        jpeg
+    }
+
+    /// gl-1611: the comment TagLib#'s `IFDTag.Comment` reads. Each case has the
+    /// tags of a JPEG a stock Jellyfin 12.4 (TagLibSharp 2.3.0) scanned, and
+    /// `expected` is the `Overview` it stored, which is this comment, or "" for
+    /// `None`.
+    #[rstest::rstest]
+    #[case::no_exif(&[], &[], None)]
+    #[case::an_empty_comment(&[], &[(0x9286, 7, b"ASCII\0\0\0".as_slice())], Some(""))]
+    #[case::padding_is_kept(&[], &[(0x9286, 7, b"ASCII\0\0\0  both ends  ".as_slice())], Some("  both ends  "))]
+    #[case::spaces_alone_are_kept(&[], &[(0x9286, 7, b"ASCII\0\0\0   ".as_slice())], Some("   "))]
+    #[case::the_text_ends_at_a_nul(&[], &[(0x9286, 7, b"ASCII\0\0\0mid\0dle".as_slice())], Some("mid"))]
+    #[case::trailing_nuls(&[], &[(0x9286, 7, b"ASCII\0\0\0nul padded\0\0\0".as_slice())], Some("nul padded"))]
+    #[case::a_description_alone(&[(0x010e, 2, b"  padded desc  \0".as_slice())], &[], Some("  padded desc  "))]
+    #[case::an_empty_comment_hides_the_description(
+        &[(0x010e, 2, b"the description\0".as_slice())],
+        &[(0x9286, 7, b"ASCII\0\0\0".as_slice())],
+        Some("")
+    )]
+    #[case::undefined_zeros_hide_the_description(
+        &[(0x010e, 2, b"canon desc\0".as_slice())],
+        &[(0x9286, 7, [0u8; 40].as_slice())],
+        Some("")
+    )]
+    #[case::spaces_without_a_code_hide_the_description(
+        &[(0x010e, 2, b"spaces desc\0".as_slice())],
+        &[(0x9286, 7, b"        ".as_slice())],
+        Some("")
+    )]
+    #[case::a_byte_comment_is_no_comment(
+        &[(0x010e, 2, b"canon desc\0".as_slice())],
+        &[(0x9286, 1, [0u8; 40].as_slice())],
+        Some("canon desc")
+    )]
+    #[case::an_ascii_comment_is_no_comment(
+        &[(0x010e, 2, b"typed desc\0".as_slice())],
+        &[(0x9286, 2, b"ascii typed\0".as_slice())],
+        Some("typed desc")
+    )]
+    #[case::a_four_byte_comment_is_no_comment(
+        &[(0x010e, 2, b"short desc\0".as_slice())],
+        &[(0x9286, 7, b"ab\0\0".as_slice())],
+        Some("short desc")
+    )]
+    #[case::the_undefined_code(&[], &[(0x9286, 7, b"\0\0\0\0\0\0\0\0undefined text".as_slice())], Some("undefined text"))]
+    #[case::the_jis_code_is_read_as_text(&[], &[(0x9286, 7, b"JIS\0\0\0\0\0jis text".as_slice())], Some("JIS"))]
+    #[case::a_corrupt_unicode_code(&[], &[(0x9286, 7, b"Unicode\0bad code\0x".as_slice())], Some("bad code"))]
+    #[case::an_empty_unicode_comment_hides_the_description(
+        &[(0x010e, 2, b"the description\0".as_slice())],
+        &[(0x9286, 7, b"UNICODE\0".as_slice())],
+        Some("")
+    )]
+    // Not upstream's value: TagLib reads UNICODE text as UTF-8 and stores ''
+    // for this one (y10 in gl-1611's measurements). Ferrofin reads UTF-16,
+    // as the EXIF specification means; the choice is the owner's (gl-1613).
+    #[case::unicode_text_is_utf16(&[], &[(0x9286, 7, b"UNICODE\0\xff\xfeH\0i\0".as_slice())], Some("Hi"))]
+    fn the_comment_is_taglibs(
+        #[case] ifd0: &[(u16, u16, &[u8])],
+        #[case] exif: &[(u16, u16, &[u8])],
+        #[case] expected: Option<&str>,
+    ) {
+        let (read, _) = streamed_tags(&jpeg_with_tags(ifd0, exif));
+        assert_eq!(read.and_then(|tags| tags.comment).as_deref(), expected);
+    }
+
+    /// A PNG of one pixel with no EXIF: its signature, IHDR and IEND. The CRCs
+    /// are right, as TagLib checks the IHDR's.
+    fn png_without_exif() -> Vec<u8> {
+        let mut png = Vec::from(b"\x89PNG\r\n\x1a\n".as_slice());
+        png.extend_from_slice(b"\0\0\0\x0dIHDR\0\0\0\x01\0\0\0\x01\x08\x02\0\0\0\x90\x77\x53\xde");
+        png.extend_from_slice(b"\0\0\0\0IEND\xae\x42\x60\x82");
+        png
+    }
+
+    /// A one-pixel TIFF with no comment. TagLib needs its dimensions.
+    fn tiff_without_a_comment() -> Vec<u8> {
+        let one = vec![1, 0, 0, 0];
+        let dimensions = [(0x0100, 3, 1, one.clone()), (0x0101, 3, 1, one)];
+        tiff_file(true, 0, &dimensions, &[], &[], &[])
+    }
+
+    /// A one-pixel Canon CR2 with no comment: a TIFF whose header goes on with
+    /// "CR", version 2.0 and the RAW IFD's offset. TagLib takes a CR2's
+    /// dimensions from the Exif IFD.
+    fn cr2_without_a_comment() -> Vec<u8> {
+        let one = vec![1, 0, 0, 0];
+        let dimensions = [(0xa002, 4, 1, one.clone()), (0xa003, 4, 1, one)];
+        let mut cr2 = tiff_file(true, 8, &[], &dimensions, &[], &[]);
+        cr2[8..16].copy_from_slice(b"CR\x02\x00\0\0\0\0");
+        cr2
+    }
+
+    /// gl-1611: what a photo's `Overview` becomes, measured against a stock
+    /// Jellyfin 12.4 for each shape. A file TagLib opens stores its comment, ""
+    /// when it holds none (TagLib's combined comment is never null). A file it
+    /// cannot open is left alone: a WebP or an AVIF, which it has no reader
+    /// for, a file that does not start as its extension's format does, and a
+    /// broken one.
+    #[rstest::rstest]
+    #[case::a_jpeg_without_exif("photo.jpg", jpeg_with_tags(&[], &[]), Some(""))]
+    #[case::an_empty_comment(
+        "photo.JPEG",
+        jpeg_with_tags(&[], &[(0x9286, 7, b"ASCII\0\0\0".as_slice())]),
+        Some("")
+    )]
+    #[case::a_png_without_exif("photo.png", png_without_exif(), Some(""))]
+    #[case::a_tiff_without_a_comment("photo.tiff", tiff_without_a_comment(), Some(""))]
+    #[case::a_cr2_without_a_comment("photo.cr2", cr2_without_a_comment(), Some(""))]
+    #[case::a_webp_without_exif("photo.webp", jpeg_with_tags(&[], &[]), None)]
+    #[case::an_avif_with_an_empty_comment(
+        "photo.avif",
+        jpeg_with_tags(&[], &[(0x9286, 7, b"ASCII\0\0\0".as_slice())]),
+        None
+    )]
+    // Not upstream's value, which is NULL: Ferrofin reads a WebP's EXIF until
+    // gl-1614 decides.
+    #[case::a_webp_with_a_comment(
+        "photo.webp",
+        jpeg_with_tags(&[], &[(0x9286, 7, b"ASCII\0\0\0hi".as_slice())]),
+        Some("hi")
+    )]
+    #[case::an_empty_file("photo.jpg", Vec::new(), Some("stale"))]
+    #[case::not_an_image("photo.jpg", b"<html>not an image</html>".to_vec(), Some("stale"))]
+    #[case::a_png_named_jpg("photo.jpg", png_without_exif(), Some("stale"))]
+    #[case::a_jpeg_named_png("photo.png", jpeg_with_tags(&[], &[]), Some("stale"))]
+    #[case::a_png_named_tiff("photo.tiff", png_without_exif(), Some("stale"))]
+    #[case::a_tiff_named_png("photo.png", tiff_without_a_comment(), Some("stale"))]
+    #[case::a_tiff_named_cr2("photo.cr2", tiff_without_a_comment(), Some("stale"))]
+    #[case::a_broken_exif_block(
+        "photo.jpg",
+        b"\xff\xd8\xff\xe1\x00\x1cExif\0\0\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\xff\xd9".to_vec(),
+        Some("stale")
+    )]
+    #[case::cut_inside_a_segment("photo.jpg", b"\xff\xd8\xff\xe0\x00\x10JFIF".to_vec(), Some("stale"))]
+    #[tokio::test]
+    async fn the_overview_is_taglibs_comment(
+        #[case] name: &str,
+        #[case] bytes: Vec<u8>,
+        #[case] expected: Option<&str>,
+    ) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = write_temp(&dir, name, &bytes);
+        let provider = PhotoProvider::new(Arc::new(FakeProcessor::reporting(0, 0)));
+        let mut item = PhotoItem {
+            path,
+            width: 1,
+            height: 1,
+            overview: Some("stale".into()),
+            ..Default::default()
+        };
+        provider.fetch(&mut item).await.expect("fetch");
+        assert_eq!(item.exif_was_read, expected != Some("stale"));
+        assert_eq!(item.overview.as_deref(), expected);
     }
 }

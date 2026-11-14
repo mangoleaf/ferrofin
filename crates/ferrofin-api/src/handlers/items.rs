@@ -39,7 +39,7 @@ use crate::auth::RequireAuth;
 use crate::error::ApiError;
 use crate::extract::{DotnetGuid, Query};
 use crate::handlers::query_parse::{
-    parse_csv_enums_lenient, parse_csv_strings, parse_csv_uuids, parse_pipe_strings,
+    parse_csv_enums_lenient, parse_csv_strings, parse_csv_uuids, parse_order_by, parse_pipe_strings,
 };
 use crate::state::AppState;
 
@@ -1980,37 +1980,6 @@ fn parse_csv_i32(raw: Option<&str>) -> Result<Vec<i32>, ApiError> {
         .map(|s| {
             s.parse::<i32>()
                 .map_err(|_| ApiError::BadRequest(format!("invalid integer {s:?}")))
-        })
-        .collect()
-}
-
-/// Builds the `order_by` list from parallel `sort_by`/`sort_order` lists.
-///
-/// Mirrors `RequestHelpers.GetOrderBy`: each sort column is paired with the
-/// order at the same index, falling back to the last supplied order (then
-/// ascending) when fewer orders than columns are given.
-pub(crate) fn parse_order_by(
-    sort_by: Option<&str>,
-    sort_order: Option<&str>,
-) -> Vec<(
-    ferrofin_model::live_tv::ItemSortBy,
-    ferrofin_model::dto::SortOrder,
-)> {
-    use ferrofin_model::dto::SortOrder;
-    let columns: Vec<ferrofin_model::live_tv::ItemSortBy> = parse_csv_enums_lenient(sort_by);
-    let orders: Vec<SortOrder> = parse_csv_enums_lenient(sort_order);
-    columns
-        .into_iter()
-        .enumerate()
-        .map(|(i, column)| {
-            let order = orders
-                .get(i)
-                // C# RequestHelpers.GetOrderBy pads missing orders with the
-                // FIRST requested order, not the last.
-                .or_else(|| orders.first())
-                .copied()
-                .unwrap_or(SortOrder::Ascending);
-            (column, order)
         })
         .collect()
 }

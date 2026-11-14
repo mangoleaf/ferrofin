@@ -201,6 +201,10 @@ impl GuestHttp {
             builder
                 .timeout(call_timeout)
                 .redirect(reqwest::redirect::Policy::none())
+                // The guest gets the body as sent: nothing decoded for it.
+                .no_gzip()
+                .no_brotli()
+                .no_deflate()
                 .user_agent(format!(
                     "ferrofin-wasm/{}",
                     ferrofin_health::RELEASE_VERSION
@@ -252,6 +256,9 @@ fn pinned_client(
     reqwest::blocking::Client::builder()
         .timeout(call_timeout)
         .redirect(reqwest::redirect::Policy::none())
+        .no_gzip()
+        .no_brotli()
+        .no_deflate()
         .user_agent(format!(
             "ferrofin-wasm/{}",
             ferrofin_health::RELEASE_VERSION

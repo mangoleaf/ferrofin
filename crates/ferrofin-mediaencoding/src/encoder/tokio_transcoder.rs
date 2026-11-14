@@ -121,10 +121,10 @@ impl TokioTranscoder {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
-            // Scheduled-task cancellation is `JoinHandle::abort` — the future is
-            // dropped, and a tokio `Child` outlives its future unless told not
-            // to. Upstream kills the process on the cancellation token; this is
-            // the same contract (observed: a stopped trickplay task left its 4K
+            // A scheduled task that does not stop when asked has its future
+            // dropped (and shutdown aborts it), and a tokio `Child` outlives its
+            // future unless told not to. Upstream kills the process on the
+            // cancellation token; this is the same contract (observed: a stopped trickplay task left its 4K
             // ffmpeg running to completion).
             .kill_on_drop(true);
 
@@ -371,10 +371,10 @@ mod tests {
         assert!(!run.success, "exit 3 is a failure");
     }
 
-    /// The scheduled-task cancel path is `JoinHandle::abort`, i.e. the future
-    /// running the child is dropped. The child must die with it — otherwise a
-    /// stopped trickplay task leaves its ffmpeg burning CPU to completion
-    /// (observed live).
+    /// A scheduled task's run can end by its future being dropped (a stop it
+    /// does not answer in time, or shutdown's abort). The child must die with
+    /// it — otherwise a stopped trickplay task leaves its ffmpeg burning CPU to
+    /// completion (observed live).
     #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn aborting_the_caller_kills_the_child_process() {

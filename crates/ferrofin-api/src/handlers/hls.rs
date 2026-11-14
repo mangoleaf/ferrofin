@@ -42,7 +42,7 @@ use uuid::Uuid;
 
 use crate::auth::RequireAuth;
 use crate::error::ApiError;
-use crate::extract::{DotnetGuid, Query};
+use crate::extract::{DotnetGuid, Query, RequiredRouteString, RouteParameter, blank_route_values};
 use crate::handlers::streaming::{opened_file_response, require_streamable_item};
 use crate::state::AppState;
 
@@ -814,6 +814,14 @@ pub(super) fn parse_segment_index(segment_id: &str) -> Result<i32, ApiError> {
         .map_err(|_| ApiError::BadRequest(format!("invalid segment id {segment_id:?}")))
 }
 
+/// `{playlistId}`, a `[FromRoute, Required] string` of the `hls1` segment
+/// routes and the legacy playlist and video segment routes.
+struct PlaylistId;
+
+impl RouteParameter for PlaylistId {
+    const NAME: &'static str = "playlistId";
+}
+
 /// `GET /Videos/{itemId}/hls1/{playlistId}/{segmentId}.{container}` — a video
 /// segment. Starts (or reuses) the transcode and serves the segment file.
 ///
@@ -827,7 +835,8 @@ pub(super) fn parse_segment_index(segment_id: &str) -> Result<i32, ApiError> {
 async fn get_video_hls_segment(
     State(state): State<AppState>,
     RequireAuth(auth): RequireAuth,
-    Path((DotnetGuid(item_id), _playlist_id, segment_id)): Path<(DotnetGuid, String, String)>,
+    _: RequiredRouteString<PlaylistId>,
+    Path((DotnetGuid(item_id), _, segment_id)): Path<(DotnetGuid, String, String)>,
     Query(query): Query<HlsQuery>,
     RawQuery(raw): RawQuery,
     request: Request,
@@ -847,7 +856,8 @@ async fn get_video_hls_segment(
 async fn get_audio_hls_segment(
     State(state): State<AppState>,
     RequireAuth(auth): RequireAuth,
-    Path((DotnetGuid(item_id), _playlist_id, segment_id)): Path<(DotnetGuid, String, String)>,
+    _: RequiredRouteString<PlaylistId>,
+    Path((DotnetGuid(item_id), _, segment_id)): Path<(DotnetGuid, String, String)>,
     Query(query): Query<HlsQuery>,
     RawQuery(raw): RawQuery,
     request: Request,
@@ -876,17 +886,47 @@ fn path_extension(uri_path: &str) -> String {
         .unwrap_or_default()
 }
 
+/// `{itemId}` of the legacy `HlsSegmentController` routes, a
+/// `[FromRoute, Required] string` the actions never read: a blank one is the
+/// binder's `400`, and any other value binds, GUID or not.
+struct LegacyItemId;
+
+impl RouteParameter for LegacyItemId {
+    const NAME: &'static str = "itemId";
+}
+
+/// `{segmentId}` of the legacy audio segment route, a
+/// `[FromRoute, Required] string`.
+struct LegacySegmentId;
+
+impl RouteParameter for LegacySegmentId {
+    const NAME: &'static str = "segmentId";
+}
+
 /// `GET /Videos/{itemId}/hls/{playlistId}/{segmentId}.{segmentContainer}` — the
 /// legacy video segment serve (`HlsSegmentController.GetHlsVideoSegmentLegacy`).
 ///
 /// Serves the already-produced segment file `<segmentId><ext>` from the transcode
 /// cache; `400` on a traversal/miss (mapped from [`ServiceError::InvalidInput`]).
+/// The route captures `{segmentId}.{segmentContainer}` as one segment, split at
+/// its last `.` as ASP.NET splits it; each half is a required string. A half
+/// that is empty is no match for ASP.NET's complex segment (a 404 on Jellyfin
+/// 12.4), not a blank value.
 async fn get_hls_video_segment_legacy(
     State(state): State<AppState>,
-    // Upstream binds an unused `string itemId` here, not a `Guid`: kept on `Uuid`.
-    Path((_item_id, _playlist_id, segment_id)): Path<(Uuid, String, String)>,
+    _item_id: RequiredRouteString<LegacyItemId>,
+    _: RequiredRouteString<PlaylistId>,
+    Path((_, _, segment_id)): Path<(String, String, String)>,
     request: Request,
 ) -> Result<Response, ApiError> {
+    if let Some((id, container)) = segment_id.rsplit_once('.')
+        && !id.is_empty()
+        && !container.is_empty()
+        && let Some(rejection) =
+            blank_route_values([("segmentId", id), ("segmentContainer", container)])
+    {
+        return Ok(rejection);
+    }
     let ext = path_extension(request.uri().path());
     let file_name = format!(
         "{}{ext}",
@@ -904,8 +944,8 @@ async fn get_hls_video_segment_legacy(
 async fn get_hls_playlist_legacy(
     State(state): State<AppState>,
     RequireAuth(_auth): RequireAuth,
-    // Upstream binds an unused `string itemId` here, not a `Guid`: kept on `Uuid`.
-    Path((_item_id, playlist_id)): Path<(Uuid, String)>,
+    _item_id: RequiredRouteString<LegacyItemId>,
+    RequiredRouteString(playlist_id, _): RequiredRouteString<PlaylistId>,
     request: Request,
 ) -> Result<Response, ApiError> {
     let file_name = format!(
@@ -920,8 +960,8 @@ async fn get_hls_playlist_legacy(
 /// segment serve (`HlsSegmentController.GetHlsAudioSegmentLegacy`).
 async fn get_hls_audio_segment_legacy(
     State(state): State<AppState>,
-    // Upstream binds an unused `string itemId` here, not a `Guid`: kept on `Uuid`.
-    Path((_item_id, segment_id)): Path<(Uuid, String)>,
+    _item_id: RequiredRouteString<LegacyItemId>,
+    RequiredRouteString(segment_id, _): RequiredRouteString<LegacySegmentId>,
     request: Request,
 ) -> Result<Response, ApiError> {
     let ext = path_extension(request.uri().path());
@@ -962,6 +1002,15 @@ async fn stop_encoding_process(
     Ok(StatusCode::NO_CONTENT)
 }
 
+/// `{mediaSourceId}`, the `[FromRoute, Required] string` of `GetAttachment`,
+/// which the router registers as `{container}`.
+struct AttachmentMediaSourceId;
+
+impl RouteParameter for AttachmentMediaSourceId {
+    const NAME: &'static str = "mediaSourceId";
+    const ROUTE_NAME: &'static str = "container";
+}
+
 /// `GET /Videos/{videoId}/{mediaSourceId}/Attachments/{index}` — serve an
 /// embedded attachment.
 ///
@@ -973,7 +1022,8 @@ async fn stop_encoding_process(
 async fn get_video_attachment(
     State(state): State<AppState>,
     axum::Extension(auth): axum::Extension<ferrofin_traits::options::AuthorizationInfo>,
-    Path((DotnetGuid(video_id), media_source_id, index)): Path<(DotnetGuid, String, i32)>,
+    RequiredRouteString(media_source_id, _): RequiredRouteString<AttachmentMediaSourceId>,
+    Path((DotnetGuid(video_id), _, index)): Path<(DotnetGuid, String, i32)>,
     parts: axum::http::request::Parts,
 ) -> Result<Response, ApiError> {
     // No token on a font URL: anonymous, as upstream.

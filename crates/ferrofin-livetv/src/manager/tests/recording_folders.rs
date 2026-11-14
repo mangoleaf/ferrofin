@@ -22,8 +22,10 @@ use crate::manager::{FerrofinLiveTvManager, LiveTvPaths};
 
 /// The library, in memory.
 #[derive(Default)]
-struct FakeLibrary {
+pub(super) struct FakeLibrary {
     folders: Mutex<Vec<VirtualFolderInfo>>,
+    /// The items, in the order they were created.
+    items: Mutex<Vec<FakeItem>>,
     /// `add_virtual_folder` fails while set.
     refuse_adds: AtomicBool,
     /// Calls of `add_virtual_folder`, successful or not.
@@ -38,8 +40,16 @@ struct FakeLibrary {
     add_gate: Mutex<Option<Arc<tokio::sync::Notify>>>,
 }
 
+/// One library item.
+struct FakeItem {
+    id: Uuid,
+    path: String,
+    parent: Option<Uuid>,
+    is_folder: bool,
+}
+
 impl FakeLibrary {
-    fn with(folders: Vec<VirtualFolderInfo>) -> Arc<Self> {
+    pub(super) fn with(folders: Vec<VirtualFolderInfo>) -> Arc<Self> {
         Arc::new(Self {
             folders: Mutex::new(folders),
             ..Self::default()
@@ -58,6 +68,28 @@ impl FakeLibrary {
 
     fn refreshed(&self) -> Vec<String> {
         self.refreshed.lock().unwrap().clone()
+    }
+
+    /// Adds the item at `path` below `parent`, created after every other.
+    pub(super) fn add_item(&self, path: &Path, parent: Option<Uuid>, is_folder: bool) -> Uuid {
+        let id = Uuid::new_v4();
+        self.items.lock().unwrap().push(FakeItem {
+            id,
+            path: path.display().to_string(),
+            parent,
+            is_folder,
+        });
+        id
+    }
+
+    /// The paths of every item.
+    pub(super) fn item_paths(&self) -> Vec<String> {
+        self.items
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|item| item.path.clone())
+            .collect()
     }
 }
 
@@ -134,6 +166,51 @@ impl RecordingLibrary for FakeLibrary {
         self.refreshed.lock().unwrap().push(path.to_owned());
         Ok(())
     }
+
+    async fn find_by_path(
+        &self,
+        path: &str,
+        is_folder: bool,
+    ) -> Result<Option<Uuid>, ServiceError> {
+        Ok(self
+            .items
+            .lock()
+            .unwrap()
+            .iter()
+            .rev()
+            .find(|item| item.path == path && item.is_folder == is_folder)
+            .map(|item| item.id))
+    }
+
+    async fn files_under(&self, folder_id: Uuid) -> Result<Vec<(Uuid, String)>, ServiceError> {
+        let items = self.items.lock().unwrap();
+        let parent_of = |id: Uuid| items.iter().find(|item| item.id == id)?.parent;
+        let below = |item: &FakeItem| {
+            let mut parent = item.parent;
+            while let Some(id) = parent {
+                if id == folder_id {
+                    return true;
+                }
+                parent = parent_of(id);
+            }
+            false
+        };
+        Ok(items
+            .iter()
+            .rev()
+            .filter(|item| !item.is_folder && below(item))
+            .map(|item| (item.id, item.path.clone()))
+            .collect())
+    }
+
+    async fn delete_item(&self, id: Uuid) -> Result<(), ServiceError> {
+        let mut items = self.items.lock().unwrap();
+        if let Some(index) = items.iter().position(|item| item.id == id) {
+            let item = items.remove(index);
+            std::fs::remove_file(&item.path).expect("the item's file");
+        }
+        Ok(())
+    }
 }
 
 /// A library at `locations`.
@@ -146,7 +223,7 @@ fn library(name: &str, locations: &[&str]) -> VirtualFolderInfo {
 }
 
 /// A manager under `root` with `library` attached.
-async fn manager(root: &Path, library: &Arc<FakeLibrary>) -> FerrofinLiveTvManager {
+pub(super) async fn manager(root: &Path, library: &Arc<FakeLibrary>) -> FerrofinLiveTvManager {
     let mgr = manager_with_dvr(root).await;
     mgr.set_recording_library(library.clone(), Arc::default());
     mgr

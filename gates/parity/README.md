@@ -108,7 +108,8 @@ isolation snapshots): remove the directory when you are done with the run.
 |---|---|
 | `run.sh` | orchestration: preflight, boot, cap, teardown |
 | `reset.sh` | puts both servers back on the boot snapshot before a write (`diff.py` runs it) |
-| `lib.sh` | what `run.sh` and `reset.sh` share: the wait bounds and the readiness check |
+| `lib.sh` | what `run.sh` and `reset.sh` share: the wait bounds, and through `gates/isolation.sh` the readiness check |
+| `../isolation.sh` | the readiness check and the isolation steps (no WASM plugin, real-time monitoring off, plugins and task triggers off, the check that they stay off, the wait for idle tasks), shared with `gates/bench/run.sh` |
 | `diff.py` | the requests, the comparison, the ledger, the report (`diff.py --help`) |
 | `requests/*.jsonl`, `requests/sweep/`, `requests/edge/` | the request sets; `--requests` takes a file or a directory (every `*.jsonl` in it, in name order), and repeats to send several as one set |
 | `generate.py`, `sweep.toml` | build `requests/sweep/contract.jsonl` and `combos.jsonl` from the vendored contract (see below) |
@@ -140,7 +141,7 @@ sent and count as oracle failures too.
 
 A read-back may name a `settle` field (`"settle": "ProductionYear"`): a field the server fills in a background
 refresh the write only queues (both servers queue a new collection's first refresh). A server whose answer lacks
-it, or has it null or an empty list, is asked again every second (lib.sh's `POLL_S`) until it is there or the request
+it, or has it null or an empty list, is asked again every second (`gates/isolation.sh`'s `POLL_S`) until it is there or the request
 timeout has passed; then its last answer is compared. Each server settles on its own, so a slow refresh is
 compared once it is done and a refresh that never fills the field is still a difference.
 
@@ -305,7 +306,7 @@ resets (`results.json`: `timing.files`), so the edge cases read apart from the s
 ```bash
 python3 -m unittest discover -s gates/parity/tests     # the comparison, the ledger, the cap, the report, the sweep's coverage
 bats gates/parity/tests                                # the runner: refusals, the cap and its backstop, teardown, failure reports
-shellcheck -x gates/parity/lib.sh gates/parity/run.sh gates/parity/reset.sh && shellcheck -x -s bash gates/parity/tests/parity.bats
+shellcheck -x gates/isolation.sh gates/parity/lib.sh gates/parity/run.sh gates/parity/reset.sh && shellcheck -x -s bash gates/parity/tests/parity.bats
 ```
 
 CI runs all three. The runner's pinned-cpuset path needs the benchmark's core layout, so only a live run covers it.

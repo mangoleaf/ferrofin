@@ -14,11 +14,12 @@ firewall. A reverse proxy can provide the advertised HTTP URL, but ordinary HTTP
 proxying does not forward UDP discovery. Across routed networks or where broadcasts
 are blocked, connect the Jellyfin client manually using the server URL.
 
-When using `FERROFIN_BASE_URL` (for example `/jellyfin`), Ferrofin advertises and
-serves the API/web client under that prefix. The bootstrap `base_url` setting in
-`config.toml` is equivalent. A change to `config.toml` applies at the next restart, the
-dashboard's included; a change to the variable needs a restart of the process. The
-named network document's `BaseUrl` does not control the mount. Configure reverse
+With a base URL (for example `/jellyfin`), Ferrofin advertises and serves the API/web
+client under that prefix. It comes from `FERROFIN_BASE_URL` when that is set, else from
+**Base URL** on Dashboard → Networking, else from the bootstrap `base_url` setting in
+`config.toml`. A change on the Networking page or in `config.toml` applies at the next
+restart, the dashboard's included (a Networking page change also shows the restart as
+pending); a change to the variable needs a restart of the process. Configure reverse
 proxies to preserve the prefix. Requests missing it redirect to the web client. Ferrofin's deployment
 probes `/health/live` and `/health/ready` remain available at the root as well as
 under the prefix.

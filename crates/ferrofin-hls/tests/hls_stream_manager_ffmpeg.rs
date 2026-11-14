@@ -13,11 +13,11 @@
 //! `TranscodeManagerImpl` + `TokioSegmentTranscoder`).
 //!
 //! Excluded from the unit-coverage gate (integration `tests/` never count toward
-//! `cargo llvm-cov -p ferrofin-hls`) and gated on `FERROFIN_FFMPEG_TESTS` + `ffmpeg`
-//! on `PATH`, so ffmpeg-less CI stays green.
+//! `cargo llvm-cov -p ferrofin-hls`) and `#[ignore]`d, so a default run lists it
+//! as skipped; asked for, it needs `ffmpeg` on `PATH`.
 //!
 //! Run with:
-//! `FERROFIN_FFMPEG_TESTS=1 cargo test -p ferrofin-hls --test hls_stream_manager_ffmpeg`
+//! `cargo test -p ferrofin-hls --test hls_stream_manager_ffmpeg -- --include-ignored`
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -40,23 +40,16 @@ use ferrofin_traits::error::ServiceError;
 use ferrofin_traits::media_encoding::{HlsStreamManager, HlsStreamRequest, TranscodingJobType};
 use ferrofin_traits::system::ServerApplicationPaths;
 
-/// Whether the ffmpeg-gated suite should run: `FERROFIN_FFMPEG_TESTS` set AND
-/// `ffmpeg` on `PATH`. Prints a skip line and returns `false` otherwise.
-fn ffmpeg_gate() -> bool {
-    if std::env::var("FERROFIN_FFMPEG_TESTS").is_err() {
-        eprintln!("skipping: FERROFIN_FFMPEG_TESTS not set");
-        return false;
-    }
+/// Panics unless `ffmpeg` is on `PATH`: these tests are `#[ignore]`d, so a
+/// run that asks for them must not pass without it.
+fn require_ffmpeg() {
     let ok = std::process::Command::new("ffmpeg")
         .arg("-version")
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .status()
         .is_ok_and(|s| s.success());
-    if !ok {
-        eprintln!("skipping: ffmpeg not found on PATH");
-    }
-    ok
+    assert!(ok, "ffmpeg not found on PATH");
 }
 
 /// Generates a tiny 6-second `testsrc`+`sine` clip at `path`.
@@ -283,6 +276,7 @@ impl StreamStatePlanner for FfmpegPlanner {
             is_input_video: true,
             subtitle_delivery_method: SubtitleDeliveryMethod::Encode,
             trimmed_subtitle_path: None,
+            transcode_reasons: ferrofin_model::session::TranscodeReasons::empty(),
             run_time_ticks: Some(6 * 10_000_000),
             transcoding_type: TranscodingJobType::Hls,
             supported_video_codecs: Vec::new(),
@@ -364,10 +358,9 @@ fn request() -> HlsStreamRequest {
 /// file is a real, non-empty `.ts` with the `video/mp2t` content type — the
 /// bytes the HTTP layer would stream back.
 #[tokio::test]
+#[ignore = "runs the real ffmpeg; run with --ignored"]
 async fn end_to_end_master_variant_and_real_segment() {
-    if !ffmpeg_gate() {
-        return;
-    }
+    require_ffmpeg();
     let tmp = tempfile::tempdir().unwrap();
     let cache = tmp.path().join("transcodes");
     std::fs::create_dir_all(&cache).unwrap();
@@ -441,10 +434,9 @@ fn build_manager_fmp4(dir: &Path, clip: &Path) -> Mgr {
 /// segment files — that tears the fragments), return a complete `ftyp`-headed
 /// init, and the concurrent segment request must be served by that same job.
 #[tokio::test]
+#[ignore = "runs the real ffmpeg; run with --ignored"]
 async fn concurrent_init_and_segment_requests_share_one_job() {
-    if !ffmpeg_gate() {
-        return;
-    }
+    require_ffmpeg();
     let tmp = tempfile::tempdir().unwrap();
     let cache = tmp.path().join("transcodes");
     std::fs::create_dir_all(&cache).unwrap();
@@ -484,10 +476,9 @@ async fn concurrent_init_and_segment_requests_share_one_job() {
 /// files those URIs name are on disk. A second request serves the same file
 /// without starting a second transcode.
 #[tokio::test]
+#[ignore = "runs the real ffmpeg; run with --ignored"]
 async fn live_playlist_serves_the_event_playlist_ffmpeg_wrote() {
-    if !ffmpeg_gate() {
-        return;
-    }
+    require_ffmpeg();
     let tmp = tempfile::tempdir().unwrap();
     let cache = tmp.path().join("transcodes");
     std::fs::create_dir_all(&cache).unwrap();
@@ -534,10 +525,9 @@ async fn live_playlist_serves_the_event_playlist_ffmpeg_wrote() {
 /// rewrites exactly that one URI to the `hls/{playlistId}/` route while the
 /// segment URIs (already routed by ffmpeg) are untouched.
 #[tokio::test]
+#[ignore = "runs the real ffmpeg; run with --ignored"]
 async fn live_playlist_routes_the_real_fmp4_init_uri() {
-    if !ffmpeg_gate() {
-        return;
-    }
+    require_ffmpeg();
     let tmp = tempfile::tempdir().unwrap();
     let cache = tmp.path().join("transcodes");
     std::fs::create_dir_all(&cache).unwrap();
@@ -583,10 +573,9 @@ impl SegmentTranscoder for RecordingTranscoder {
 /// ffmpeg, and every sequential read waits on the running job. The jumps are
 /// wide because a killed ffmpeg keeps writing through its graceful `q` exit.
 #[tokio::test]
+#[ignore = "runs the real ffmpeg; run with --ignored"]
 async fn a_seek_back_below_a_killed_jobs_segments_keeps_the_running_job() {
-    if !ffmpeg_gate() {
-        return;
-    }
+    require_ffmpeg();
     let tmp = tempfile::tempdir().unwrap();
     let cache = tmp.path().join("transcodes");
     std::fs::create_dir_all(&cache).unwrap();
@@ -639,6 +628,72 @@ async fn a_seek_back_below_a_killed_jobs_segments_keeps_the_running_job() {
     mgr.stop_encoding(&req).await.expect("stop_encoding");
 }
 
+/// gl-1520 against a real ffmpeg encoding at the source's pace: play 0, seek
+/// forward to 5 and play 6 and 7, then seek back to 4, whose request the
+/// client drops while the job encodes it, and retry it. The killed job's 5 to 7
+/// adjoin 4, and ffmpeg writes nothing of 4 until it is finished, so the retry
+/// waits on the job started at 4 rather than restarting it.
+#[tokio::test]
+#[ignore = "runs the real ffmpeg; run with --ignored"]
+async fn a_retry_of_a_slow_first_segment_keeps_the_running_job() {
+    require_ffmpeg();
+    let tmp = tempfile::tempdir().unwrap();
+    let cache = tmp.path().join("transcodes");
+    std::fs::create_dir_all(&cache).unwrap();
+    let clip = tmp.path().join("clip.mp4");
+    make_clip_of(&clip, 60);
+
+    let planner = FfmpegPlanner {
+        dir: cache.clone(),
+        clip,
+        fmp4: false,
+        realtime: true,
+    };
+    let spawns = Arc::new(Mutex::new(Vec::new()));
+    let transcoder = RecordingTranscoder {
+        inner: TokioSegmentTranscoder::new(),
+        spawns: Arc::clone(&spawns),
+    };
+    let manager = Arc::new(TranscodeManagerImpl::new(NoopSessionReporter));
+    let cfg: Box<dyn Fn() -> EncodingOptions + Send + Sync> = Box::new(EncodingOptions::default);
+    let generator = Arc::new(DynamicHlsPlaylistGenerator::new(cfg, Vec::new()));
+    let paths = Arc::new(TempPaths {
+        transcode: cache.to_string_lossy().into_owned(),
+    });
+    let mgr = HlsStreamManagerImpl::new(planner, transcoder, manager, generator, paths, "ffmpeg");
+
+    let req = request();
+    for segment in [0, 5, 6, 7] {
+        mgr.dynamic_segment(&req, segment, false)
+            .await
+            .unwrap_or_else(|error| panic!("segment {segment}: {error:?}"));
+    }
+    let dropped = tokio::time::timeout(
+        std::time::Duration::from_millis(500),
+        mgr.dynamic_segment(&req, 4, false),
+    )
+    .await;
+    assert!(dropped.is_err(), "segment 4 was answered: {dropped:?}");
+    let served = mgr
+        .dynamic_segment(&req, 4, false)
+        .await
+        .expect("segment 4");
+    assert!(served.path.ends_with("out4.ts"), "served {}", served.path);
+
+    let start_numbers: Vec<String> = spawns
+        .lock()
+        .unwrap()
+        .iter()
+        .filter_map(|args| {
+            args.windows(2)
+                .find(|pair| pair[0] == "-start_number")
+                .map(|pair| pair[1].clone())
+        })
+        .collect();
+    assert_eq!(start_numbers, ["0", "5", "4"], "the retry restarted");
+    mgr.stop_encoding(&req).await.expect("stop_encoding");
+}
+
 /// The duration ffprobe reads from the media file at `path`, 0 when it reads none.
 fn probed_duration(path: &Path) -> f64 {
     let output = std::process::Command::new("ffprobe")
@@ -664,10 +719,9 @@ fn probed_duration(path: &Path) -> f64 {
 /// segment cut short under its normal name. The restart deletes it, so every
 /// finished segment left on disk is whole and none is served short.
 #[tokio::test]
+#[ignore = "runs the real ffmpeg; run with --ignored"]
 async fn a_seek_restart_leaves_no_cut_short_segment_on_disk() {
-    if !ffmpeg_gate() {
-        return;
-    }
+    require_ffmpeg();
     let tmp = tempfile::tempdir().unwrap();
     let cache = tmp.path().join("transcodes");
     std::fs::create_dir_all(&cache).unwrap();

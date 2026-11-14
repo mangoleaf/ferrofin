@@ -433,6 +433,46 @@ async fn a_file_arriving_for_a_placeholder_replaces_it() {
     assert!(lib.row(lib.provider_id(1, Some(2))).await.is_none());
 }
 
+/// A loose file for a placeholder season's number makes that season real.
+/// The scan takes the provider's season for the file's episodes
+/// (`CreateSeasonsAsync` reuses the season of the number and turns it
+/// non-virtual), the placeholder the file replaces goes, and the season stays,
+/// path-less, with its real episode: the empty-season removal keys on the
+/// path, not the flag (gl-1593).
+#[tokio::test]
+async fn a_loose_file_makes_a_placeholder_season_real() {
+    let tmp = tempfile::tempdir().expect("tmp");
+    let lib = Library::new(tmp.path()).await;
+    let base = spawn_tmdb();
+    lib.set(settings(true, true, &[lib.folder_id.as_str()]));
+    lib.scanner(&base).scan_all().await.expect("scan");
+    let season = lib.provider_id(2, None);
+    assert!(
+        lib.row(season)
+            .await
+            .expect("placeholder season")
+            .is_virtual_item
+    );
+    std::fs::write(
+        tmp.path().join("tv").join("Show").join("Show S02E01.mkv"),
+        b"0123456789",
+    )
+    .expect("write");
+
+    lib.scanner(&base).scan_all().await.expect("rescan");
+    let row = lib.row(season).await.expect("the season stays");
+    assert!(!row.is_virtual_item, "real episodes make it real");
+    assert_eq!(row.path, None, "still path-less");
+    assert_eq!(lib.virtual_episodes().await, vec![(1, 2), (1, 3)]);
+    // A rescan keeps it as it is.
+    lib.scanner(&base).scan_all().await.expect("again");
+    assert!(
+        lib.row(season)
+            .await
+            .is_some_and(|row| !row.is_virtual_item)
+    );
+}
+
 /// The "Refresh upcoming and missing episodes (TheMovieDb)" task refreshes a
 /// series that has not ended by its path: one scanned before the options
 /// were on gains its virtual episodes from the task alone.

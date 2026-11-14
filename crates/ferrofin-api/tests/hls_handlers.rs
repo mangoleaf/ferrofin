@@ -15,7 +15,7 @@ use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use ferrofin_api::create_router;
 use ferrofin_api::state::AppState;
-use ferrofin_api::test_support::minimal_base_item;
+use ferrofin_api::test_support::{FixedAuth, minimal_base_item};
 use ferrofin_db::entities::base_items::BaseItemEntity;
 use ferrofin_model::entities_media::MediaAttachment;
 use ferrofin_model::querying::QueryResult;
@@ -242,16 +242,8 @@ impl AttachmentExtractor for FakeAttachments {
 }
 
 /// An [`AuthService`]/[`AuthorizationContext`] that authenticates any request.
-struct OkAuth;
-
-#[async_trait]
-impl AuthorizationContext for OkAuth {
-    async fn get_authorization_info(
-        &self,
-        _request: &RequestContext,
-    ) -> Result<AuthorizationInfo, ServiceError> {
-        Ok(ok_auth_info())
-    }
+fn ok_auth() -> FixedAuth {
+    FixedAuth(ok_auth_info())
 }
 
 /// The authorization every request resolves to: authenticated, carrying the
@@ -269,16 +261,6 @@ fn ok_auth_info() -> AuthorizationInfo {
         })),
         is_authenticated: true,
         ..ferrofin_api::test_support::authenticated_user_info()
-    }
-}
-
-#[async_trait]
-impl AuthService for OkAuth {
-    async fn authenticate(
-        &self,
-        _request: &RequestContext,
-    ) -> Result<AuthorizationInfo, ServiceError> {
-        Ok(ok_auth_info())
     }
 }
 
@@ -328,13 +310,6 @@ impl LibraryManager for ItemLibrary {
         _query: &InternalItemsQuery,
         _collection_type: ferrofin_model::data::CollectionType,
     ) -> Result<Vec<BaseItemEntity>, ServiceError> {
-        unimplemented!("unused")
-    }
-    async fn create_items(
-        &self,
-        _items: &[BaseItemEntity],
-        _parent_id: Option<Uuid>,
-    ) -> Result<(), ServiceError> {
         unimplemented!("unused")
     }
     async fn update_items(
@@ -505,7 +480,7 @@ fn router_with(
 /// Like [`router_with`] but with a media-source manager that yields no static
 /// sources, so the direct-play stream routes fall through to transcode.
 fn router_no_static(hls: Arc<dyn HlsStreamManager>) -> axum::Router {
-    router_no_static_with_auth(hls, Arc::new(OkAuth))
+    router_no_static_with_auth(hls, Arc::new(ok_auth()))
 }
 
 fn router_no_static_with_auth(
@@ -589,8 +564,8 @@ fn build_state(
         Arc::new(t::FakeSimilarItems),
         Arc::new(t::FakeSearch),
         Arc::new(t::FakeDto),
-        Arc::new(OkAuth),
-        Arc::new(OkAuth),
+        Arc::new(ok_auth()),
+        Arc::new(ok_auth()),
         Arc::new(t::FakeQuickConnect),
         Arc::new(t::FakePlaylists),
         Arc::new(t::FakeCollections),
@@ -612,7 +587,7 @@ fn build_state(
 }
 
 /// An authorization context that rejects everything, so a route's auth gate is
-/// observable: with [`OkAuth`] every extractor succeeds and a missing gate looks
+/// observable: with [`ok_auth`] every extractor succeeds and a missing gate looks
 /// identical to a present one.
 struct DenyAuth;
 
@@ -667,30 +642,6 @@ impl AuthService for ApiKeyOrHeaderAuth {
         request: &RequestContext,
     ) -> Result<AuthorizationInfo, ServiceError> {
         Self::resolve(request).ok_or_else(|| ServiceError::unauthorized("no token"))
-    }
-}
-
-/// Resolves every request to this authorization.
-#[derive(Clone)]
-struct PolicyAuth(AuthorizationInfo);
-
-#[async_trait]
-impl AuthorizationContext for PolicyAuth {
-    async fn get_authorization_info(
-        &self,
-        _request: &RequestContext,
-    ) -> Result<AuthorizationInfo, ServiceError> {
-        Ok(self.0.clone())
-    }
-}
-
-#[async_trait]
-impl AuthService for PolicyAuth {
-    async fn authenticate(
-        &self,
-        _request: &RequestContext,
-    ) -> Result<AuthorizationInfo, ServiceError> {
-        Ok(self.0.clone())
     }
 }
 
@@ -825,37 +776,13 @@ fn starting_routes() -> [String; 5] {
 }
 
 /// An API key: authenticated, with no user behind it.
-struct UserlessApiKeyAuth;
-
-impl UserlessApiKeyAuth {
-    fn info() -> AuthorizationInfo {
-        AuthorizationInfo {
-            token: Some(ferrofin_model::secret::Secret::new("key")),
-            is_api_key: true,
-            is_authenticated: true,
-            ..AuthorizationInfo::default()
-        }
-    }
-}
-
-#[async_trait]
-impl AuthorizationContext for UserlessApiKeyAuth {
-    async fn get_authorization_info(
-        &self,
-        _request: &RequestContext,
-    ) -> Result<AuthorizationInfo, ServiceError> {
-        Ok(Self::info())
-    }
-}
-
-#[async_trait]
-impl AuthService for UserlessApiKeyAuth {
-    async fn authenticate(
-        &self,
-        _request: &RequestContext,
-    ) -> Result<AuthorizationInfo, ServiceError> {
-        Ok(Self::info())
-    }
+fn userless_api_key_auth() -> FixedAuth {
+    FixedAuth(AuthorizationInfo {
+        token: Some(ferrofin_model::secret::Secret::new("key")),
+        is_api_key: true,
+        is_authenticated: true,
+        ..AuthorizationInfo::default()
+    })
 }
 
 /// The transcode caps count the user the authorization names, through every
@@ -871,7 +798,7 @@ async fn a_transcode_is_the_authorizations_user_never_the_querys(#[case] api_key
     let hls = ok_hls(temp.path().to_str().unwrap(), rec.clone());
     let (router, expected) = if api_key {
         (
-            router_no_static_with_auth(hls, Arc::new(UserlessApiKeyAuth)),
+            router_no_static_with_auth(hls, Arc::new(userless_api_key_auth())),
             None,
         )
     } else {
@@ -1378,6 +1305,74 @@ async fn legacy_video_segment_and_playlist_and_audio() {
     assert!(resolved.iter().any(|(n, m)| n == "9.ts" && !m));
     assert!(resolved.iter().any(|(n, m)| n == "pl7.m3u8" && *m));
     assert!(resolved.iter().any(|(n, m)| n == "seg2.mp3" && !m));
+}
+
+/// The legacy `HlsSegmentController` actions bind `{itemId}` as a
+/// `[FromRoute, Required] string` they never read: any value serves the file,
+/// and only a blank one is the binder's 400, before the file is looked up.
+#[rstest]
+#[case::video_segment("/Videos/{id}/hls/pl7/9.ts", "9.ts")]
+#[case::playlist("/Videos/{id}/hls/pl7/stream.m3u8", "pl7.m3u8")]
+#[case::audio_aac("/Audio/{id}/hls/seg2/stream.aac", "seg2.aac")]
+#[case::audio_mp3("/Audio/{id}/hls/seg2/stream.mp3", "seg2.mp3")]
+#[tokio::test]
+async fn legacy_routes_take_any_item_id_but_a_blank_one(
+    #[case] template: &str,
+    #[case] file_name: &str,
+) {
+    let tmp = TempFile::new();
+    for (item_id, served) in [
+        ("not-a-guid", true),
+        ("urn:uuid:{ITEM_ID}", true),
+        ("%28{ITEM_ID}%29", true),
+        ("%20", false),
+    ] {
+        let rec = Arc::new(Recorded::default());
+        let router = router_with(
+            ok_hls(&tmp.path, rec.clone()),
+            Arc::new(FakeAttachments {
+                mime: None,
+                data: vec![],
+            }),
+            Arc::new(ItemLibrary { present: true }),
+        );
+        let uri = template.replace("{id}", &item_id.replace("{ITEM_ID}", &ITEM_ID.to_string()));
+        let resp = router.oneshot(authed("GET", &uri)).await.unwrap();
+        let status = resp.status();
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let resolved = rec.resolved.lock().unwrap().clone();
+        if served {
+            assert_eq!(status, StatusCode::OK, "{uri}");
+            assert_eq!(resolved.len(), 1, "{uri}");
+            assert_eq!(resolved[0].0, file_name, "{uri}");
+        } else {
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{uri}");
+            let body = String::from_utf8_lossy(&body);
+            assert!(
+                body.contains("The itemId field is required."),
+                "{uri}: {body}"
+            );
+            assert!(resolved.is_empty(), "{uri}: {resolved:?}");
+        }
+    }
+}
+
+/// Authorization runs before model binding upstream, so the authenticated
+/// legacy playlist route answers a refused caller 401 even for a blank
+/// `{itemId}`, and looks nothing up.
+#[tokio::test]
+async fn legacy_playlist_checks_auth_before_the_blank_item_id() {
+    let tmp = TempFile::new();
+    let rec = Arc::new(Recorded::default());
+    let router = router_denying_auth(ok_hls(&tmp.path, rec.clone()));
+    let resp = router
+        .oneshot(authed("GET", "/Videos/%20/hls/pl7/stream.m3u8"))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    assert!(rec.resolved.lock().unwrap().is_empty());
 }
 
 #[tokio::test]
@@ -1968,7 +1963,7 @@ async fn an_api_key_may_transcode() {
     let file = directory.path().join("output.mp4");
     std::fs::write(&file, b"progressive bytes").unwrap();
     let rec = Arc::new(Recorded::default());
-    let auth = PolicyAuth(AuthorizationInfo {
+    let auth = FixedAuth(AuthorizationInfo {
         is_authenticated: true,
         is_api_key: true,
         token: Some(ferrofin_model::secret::Secret::new("key")),
@@ -2022,7 +2017,7 @@ async fn a_token_does_not_override_the_account_policy(
     #[case] policy: ferrofin_model::users::UserPolicy,
     #[case] expected: StatusCode,
 ) {
-    let auth = PolicyAuth(AuthorizationInfo {
+    let auth = FixedAuth(AuthorizationInfo {
         user_policy: Some(Arc::new(policy)),
         ..ok_auth_info()
     });
@@ -2057,7 +2052,7 @@ async fn an_api_key_is_held_to_no_account() {
     let directory = tempfile::tempdir().unwrap();
     let file = directory.path().join("movie.mkv");
     std::fs::write(&file, b"bytes").unwrap();
-    let auth = PolicyAuth(AuthorizationInfo {
+    let auth = FixedAuth(AuthorizationInfo {
         is_api_key: true,
         user_policy: Some(Arc::new(ferrofin_model::users::UserPolicy {
             is_disabled: true,
@@ -2150,7 +2145,7 @@ async fn a_static_request_for_a_disc_folder_needs_a_caller_to_transcode() {
     let rec = Arc::new(Recorded::default());
     let app = router_with_sources(
         ok_hls(file.to_str().unwrap(), Arc::clone(&rec)),
-        Arc::new(OkAuth),
+        Arc::new(ok_auth()),
         disc(),
     );
     let response = app.oneshot(authed("GET", &path)).await.unwrap();

@@ -1032,13 +1032,10 @@ mod tests {
         );
     }
 
-    /// The real checks against the system ffmpeg (gated).
+    /// The real checks against the system ffmpeg (`#[ignore]`d).
     #[tokio::test]
+    #[ignore = "runs the real ffmpeg; run with --ignored"]
     async fn real_ffmpeg_check() {
-        if std::env::var_os("FERROFIN_FFMPEG_TESTS").is_none() {
-            eprintln!("skipped: set FERROFIN_FFMPEG_TESTS=1 to run");
-            return;
-        }
         let check = Ffmpeg::new("ffmpeg", "ffprobe").check().await;
         assert!(check.logs[0].1.contains("ffmpeg version"), "{check:?}");
         assert!(!check.logs[0].1.contains("Trailing option"), "{check:?}");
@@ -1176,14 +1173,11 @@ mod tests {
     }
 
     /// The real processes against a generated clip: 3 s of tone, 2 s of
-    /// silence, 3 s of tone, with a keyframe every second. Gated like the
-    /// other ffmpeg integration tests.
+    /// silence, 3 s of tone, with a keyframe every second. `#[ignore]`d like
+    /// the other ffmpeg integration tests.
     #[tokio::test]
+    #[ignore = "runs the real ffmpeg; run with --ignored"]
     async fn real_ffmpeg_detections() {
-        if std::env::var_os("FERROFIN_FFMPEG_TESTS").is_none() {
-            eprintln!("skipped: set FERROFIN_FFMPEG_TESTS=1 to run");
-            return;
-        }
         let dir = tempfile::tempdir().expect("dir");
         let clip = dir.path().join("clip.mkv");
         let clip = clip.to_str().expect("utf-8");
@@ -1285,11 +1279,8 @@ mod tests {
     /// The alternative credits analyzer's scans against generated clips: a
     /// test pattern and a black card (keyframe every second).
     #[tokio::test]
+    #[ignore = "runs the real ffmpeg; run with --ignored"]
     async fn real_ffmpeg_credit_scans() {
-        if std::env::var_os("FERROFIN_FFMPEG_TESTS").is_none() {
-            eprintln!("skipped: set FERROFIN_FFMPEG_TESTS=1 to run");
-            return;
-        }
         let dir = tempfile::tempdir().expect("dir");
         let make = |name: &str, source: &str| {
             let path = dir.path().join(name).to_string_lossy().into_owned();

@@ -291,5 +291,5 @@ pub fn register(router: Router<AppState>) -> Router<AppState> {
         )
 }
 crate::query::query_parameters! {
-    SplashscreenQuery {} => [("get", "/Branding/Css")];
+    SplashscreenQuery {} => [("get", "/Branding/Splashscreen")];
 }

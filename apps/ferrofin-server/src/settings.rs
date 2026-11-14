@@ -18,8 +18,12 @@
 //! Precedence is the loader's: a flag, else the variable, else `config.toml`,
 //! else the default. A value a flag or a variable sets is locked on the page
 //! (owner decision D1 of the settings-page milestone): one saved to
-//! `config.toml` underneath would not apply while it is set.
+//! `config.toml` underneath would not apply while it is set. A setting
+//! jellyfin-web's Networking page covers ([`SettingSpec::network`]) takes the
+//! page's saved value between the variable and `config.toml` (owner decisions
+//! on gl-554 and gl-555).
 
+use std::ops::RangeInclusive;
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -27,6 +31,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use ferrofin_core::system_manager::LifecycleController;
 use ferrofin_core::user_manager::LoginBackoffSettings;
 use ferrofin_drawing::ImageLimits;
+use ferrofin_mediaencoding::encoder::media_encoder::{
+    ANALYZE_DURATION_RANGE, FfmpegCount, PROBE_SIZE_RANGE,
+};
 use ferrofin_mediaencoding::transcoding::TranscodeLimits;
 use ferrofin_model::configuration::ServerConfiguration;
 use ferrofin_model::server_settings::{
@@ -35,6 +42,7 @@ use ferrofin_model::server_settings::{
     ServerSettingUnit as Unit, ServerSettingsDto, ServerSettingsUpdateDto,
     ServerSettingsUpdateResultDto,
 };
+use ferrofin_networking::NetworkConfiguration;
 use ferrofin_traits::configuration::ServerConfigurationManager;
 use ferrofin_traits::error::ServiceError;
 use ferrofin_traits::plugins::PluginManager;
@@ -191,6 +199,12 @@ pub struct SettingSpec {
     /// them, as on Jellyfin's plugin pages). `null` when unset and the
     /// default applies.
     pub running: fn(&Config) -> Value,
+    /// The value the Networking page saved in the network configuration a
+    /// server lifetime started with, which outranks `config.toml` but not a
+    /// flag or a variable; `null` when it sets none, or covers no such
+    /// setting. Only for a read-only row: a `config.toml` save would not apply
+    /// under it, and nothing locks the row for it.
+    pub network: fn(&NetworkConfiguration) -> Value,
     /// A rule a value the page saves must meet beyond its kind: one the
     /// server applies by warning and falling back to the default, which a save
     /// refuses instead, so a value the server would ignore is never saved.
@@ -334,6 +348,7 @@ const ROW: SettingSpec = SettingSpec {
     options: &[],
     store: SettingStore::ConfigFile,
     running: |_| Value::Null,
+    network: |_| Value::Null,
     check: |_| Ok(()),
 };
 
@@ -363,9 +378,8 @@ pub static SETTINGS: &[SettingSpec] = &[
         },
         ..ROW
     },
-    // The port, HTTPS port and base URL notes name their key and variable
-    // (owner decision D2a) until the Networking page drives them: gl-554,
-    // gl-335 and gl-555 switch each note to that page.
+    // The port, HTTPS port and base URL notes name the Networking page that
+    // drives them (owner decisions on gl-554 and gl-555).
     SettingSpec {
         key: "port",
         env: Some("FERROFIN_PORT"),
@@ -375,13 +389,18 @@ pub static SETTINGS: &[SettingSpec] = &[
         group: Group::Network,
         kind: PORT,
         access: SettingAccess::ReadOnly(
-            "Set it with the port key in config.toml, the FERROFIN_PORT environment variable or \
-             the --port flag. The port on Dashboard → Networking is not read yet; it will take \
-             over.",
+            "Dashboard → Networking → Local HTTP port number sets it, and a change there applies \
+             after a restart. While that holds the default, 8096, the port key in config.toml \
+             does. The FERROFIN_PORT environment variable and the --port flag outrank both.",
         ),
         default: "8096",
         description: "HTTP port.",
         running: |c| json!(c.port),
+        network: |n| {
+            crate::listen::page_ports(n)
+                .0
+                .map_or(Value::Null, |port| json!(port))
+        },
         ..ROW
     },
     SettingSpec {
@@ -392,13 +411,18 @@ pub static SETTINGS: &[SettingSpec] = &[
         group: Group::Network,
         kind: PORT,
         access: SettingAccess::ReadOnly(
-            "Set it with the https_port key in config.toml or the FERROFIN_HTTPS_PORT \
-             environment variable. The HTTPS port on Dashboard → Networking is not read yet; it \
-             will take over.",
+            "Dashboard → Networking → Local HTTPS port number sets it, and a change there \
+             applies after a restart. While that holds the default, 8920, the https_port key in \
+             config.toml does. The FERROFIN_HTTPS_PORT environment variable outranks both.",
         ),
         default: "8920",
         description: "HTTPS port, served when Dashboard → Networking enables HTTPS.",
         running: |c| json!(c.https_port),
+        network: |n| {
+            crate::listen::page_ports(n)
+                .1
+                .map_or(Value::Null, |port| json!(port))
+        },
         ..ROW
     },
     SettingSpec {
@@ -423,13 +447,21 @@ pub static SETTINGS: &[SettingSpec] = &[
         label: "Base URL",
         group: Group::Network,
         access: SettingAccess::ReadOnly(
-            "Set it with the base_url key in config.toml or the FERROFIN_BASE_URL environment \
-             variable. The base URL on Dashboard → Networking is not read yet; it will take \
-             over.",
+            "Dashboard → Networking → Base URL sets it, and a change there applies after a \
+             restart. While that is empty, the base_url key in config.toml does. The \
+             FERROFIN_BASE_URL environment variable outranks both.",
         ),
         default: "none",
         description: "URL path prefix the server is mounted under.",
         running: |c| json!(c.base_url),
+        network: |n| {
+            let base = crate::base_url::normalize(&n.base_url);
+            if base.is_empty() {
+                Value::Null
+            } else {
+                json!(base)
+            }
+        },
         ..ROW
     },
     SettingSpec {
@@ -592,6 +624,20 @@ pub static SETTINGS: &[SettingSpec] = &[
         running: |c| json!(c.scan_directory_cache_idle_secs),
         ..ROW
     },
+    SettingSpec {
+        key: "book_archive_max_entries",
+        env: Some("FERROFIN_BOOK_ARCHIVE_MAX_ENTRIES"),
+        env_read: PARSED_U32,
+        label: "Comic archive entry limit",
+        group: Group::Library,
+        kind: whole_numbers(config::BOOK_ARCHIVE_MAX_ENTRIES_RANGE),
+        unit: Some(Unit::Items),
+        default: "100000",
+        description: "Most entries a comic archive may hold for its pages to set the book's \
+                      runtime; a larger one is not counted.",
+        running: |c| json!(c.book_archive_max_entries),
+        ..ROW
+    },
     // ---- Trickplay ---------------------------------------------------------
     // The two rows stored in the server configuration (gl-1139): the same
     // `TrickplayOptions` the dashboard's Trickplay page edits.
@@ -750,7 +796,7 @@ pub static SETTINGS: &[SettingSpec] = &[
         kind: whole_numbers(ferrofin_providers::rate_limit::RequestLimits::DOWNLOAD_MAX_MB),
         unit: Some(Unit::Mebibytes),
         default: "64",
-        description: "Largest remote image downloaded, and largest OMDb or OpenSubtitles response; \
+        description: "Largest remote image downloaded, and largest metadata provider response; \
                       a larger one is refused and the read stops there.",
         running: |c| json!(c.image_download_max_mb),
         ..ROW
@@ -1032,6 +1078,41 @@ pub static SETTINGS: &[SettingSpec] = &[
                       idle job on the same device is ended, and a new one is refused if none \
                       is idle. 0 means no cap.",
         running: |c| json!(c.max_transcodes_per_user),
+        ..ROW
+    },
+    SettingSpec {
+        key: "ffmpeg_analyze_duration",
+        env: Some("FERROFIN_FFMPEG_ANALYZE_DURATION"),
+        env_read: EnvRead::Parsed(parses::<FfmpegCount>),
+        label: "ffmpeg analyze duration",
+        group: Group::Performance,
+        kind: SettingKind::Text,
+        default: "200M",
+        description: "How long ffmpeg analyses an input to find its streams, in microseconds: \
+                      lower starts a slow or remote source sooner, and can miss a late stream.",
+        note: "Jellyfin's FFmpeg:analyzeduration, for probes, transcodes and external \
+               subtitles, in ffmpeg's syntax: 200M is 200 seconds (K, M and G are powers of \
+               1000; Ki, Mi and Gi of 1024). 1M to 600M. A source's own duration, such as a \
+               Live TV channel's 3 seconds, wins.",
+        running: |c| json!(c.ffmpeg_analyze_duration.to_string()),
+        check: |value| ffmpeg_count_within(value, &ANALYZE_DURATION_RANGE),
+        ..ROW
+    },
+    SettingSpec {
+        key: "ffmpeg_probe_size",
+        env: Some("FERROFIN_FFMPEG_PROBE_SIZE"),
+        env_read: EnvRead::Parsed(parses::<FfmpegCount>),
+        label: "ffmpeg probe size",
+        group: Group::Performance,
+        kind: SettingKind::Text,
+        default: "1G",
+        description: "How many bytes of an input ffmpeg reads to find its streams: lower starts \
+                      a slow or remote source sooner, and can miss a late stream.",
+        note: "Jellyfin's FFmpeg:probesize, for probes, transcodes and external subtitles, in \
+               ffmpeg's syntax: 1G is 10^9 bytes (K, M and G are powers of 1000; Ki, Mi and Gi \
+               of 1024). 1M to 4G.",
+        running: |c| json!(c.ffmpeg_probe_size.to_string()),
+        check: |value| ffmpeg_count_within(value, &PROBE_SIZE_RANGE),
         ..ROW
     },
     SettingSpec {
@@ -1540,6 +1621,22 @@ fn parses<T: std::str::FromStr>(raw: &str) -> bool {
     config::parse_var::<T>(&OneValue(raw), "").is_some()
 }
 
+/// A save of an ffmpeg input-analysis value (`ffmpeg_analyze_duration`,
+/// `ffmpeg_probe_size`): blank for the default, else ffmpeg's syntax inside
+/// `range`, which the loader would otherwise ignore or clamp with a warning.
+fn ffmpeg_count_within(value: &Value, range: &RangeInclusive<FfmpegCount>) -> Result<(), String> {
+    let text = value.as_str().map(str::trim).unwrap_or_default();
+    if text.is_empty() {
+        return Ok(());
+    }
+    let count: FfmpegCount = text.parse().map_err(str::to_owned)?;
+    if range.contains(&count) {
+        Ok(())
+    } else {
+        Err(format!("is outside {} to {}", range.start(), range.end()))
+    }
+}
+
 /// [`EnvRead::Parsed`] for an on/off variable (`config::parse_bool_var`).
 fn parses_as_bool(raw: &str) -> bool {
     config::parse_bool_var(&OneValue(raw), "").is_some()
@@ -1657,7 +1754,11 @@ fn locked_reason(spec: &SettingSpec, source: Source, env: &dyn Env) -> Option<St
                  the server process."
             ))
         }
-        Source::ConfigFile | Source::ServerConfiguration | Source::Default => None,
+        // A row the Networking page covers says so in its note.
+        Source::NetworkConfiguration
+        | Source::ConfigFile
+        | Source::ServerConfiguration
+        | Source::Default => None,
     };
     match (note, set_by) {
         (Some(note), Some(set_by)) => Some(format!("{note} {set_by}")),
@@ -1684,7 +1785,8 @@ fn file_value(spec: &SettingSpec, file: &Config, in_use: Option<&Value>) -> Opti
 
 /// What the page receives for `spec`. `running` is the configuration in use;
 /// `saved` is `config.toml` as it is now, loaded alone, when it has keys;
-/// `configuration` is the server configuration, for a row stored there.
+/// `configuration` is the server configuration, for a row stored there;
+/// `network` the network configuration the lifetime started with.
 fn setting(
     spec: &SettingSpec,
     running: &Config,
@@ -1692,6 +1794,7 @@ fn setting(
     file_keys: &[String],
     saved: Option<&Config>,
     configuration: &ServerConfiguration,
+    network: &NetworkConfiguration,
 ) -> ServerSettingDto {
     let (kind, min, max) = spec.kind.to_dto();
     let mut dto = ServerSettingDto {
@@ -1726,7 +1829,9 @@ fn setting(
         custom: false,
     };
     match spec.store {
-        SettingStore::ConfigFile => from_the_file(spec, running, env, file_keys, saved, &mut dto),
+        SettingStore::ConfigFile => {
+            from_the_file(spec, running, env, file_keys, saved, network, &mut dto);
+        }
         SettingStore::ServerConfiguration(field) => {
             // Nothing outranks the server configuration, and the page may
             // always change it. A new server's value is its default.
@@ -1759,17 +1864,24 @@ fn fits_an_option(spec: &SettingSpec, text: &str) -> bool {
 /// Fills `dto` for `spec`, a row stored in `config.toml`: its value in use,
 /// the file's value when that differs, its source and whether the page may
 /// change it. A choice whose `config.toml` value fits no option reports that
-/// value as written, as Custom: the loader runs the default in its place.
+/// value as written, as Custom: the loader runs the default in its place. A
+/// value the Networking page saved in `network` outranks the file.
 fn from_the_file(
     spec: &SettingSpec,
     running: &Config,
     env: &dyn Env,
     file_keys: &[String],
     saved: Option<&Config>,
+    network: &NetworkConfiguration,
     dto: &mut ServerSettingDto,
 ) {
-    let source = source(spec, &running.cli, env, file_keys);
+    let mut source = source(spec, &running.cli, env, file_keys);
+    let on_the_page = present((spec.network)(network));
+    if on_the_page.is_some() && matches!(source, Source::ConfigFile | Source::Default) {
+        source = Source::NetworkConfiguration;
+    }
     let value = match spec.access {
+        _ if source == Source::NetworkConfiguration => on_the_page,
         SettingAccess::EnvOnly => spec
             .env
             .filter(|_| env_applies(spec, env))
@@ -1816,12 +1928,14 @@ fn no_longer_loads(path: &Path, err: &anyhow::Error) -> ServiceError {
 }
 
 /// Every one of `rows`, as the page receives them: those stored in
-/// `config.toml` as `running` holds them, the others as `configuration` does.
+/// `config.toml` as `running` holds them, unless `network` outranks it, the
+/// others as `configuration` does.
 fn snapshot(
     rows: &[SettingSpec],
     running: &Config,
     env: &dyn Env,
     configuration: &ServerConfiguration,
+    network: &NetworkConfiguration,
     restart_pending: bool,
 ) -> Result<ServerSettingsDto, ServiceError> {
     let path = &running.config_file;
@@ -1851,6 +1965,7 @@ fn snapshot(
                     &file_keys,
                     saved.as_ref(),
                     configuration,
+                    network,
                 )
             })
             .collect(),
@@ -1921,6 +2036,9 @@ pub struct FerrofinServerSettings {
     plugins: Arc<dyn PluginManager>,
     /// The server configuration, which the rows stored there read and save.
     configuration: Arc<dyn ServerConfigurationManager>,
+    /// The network configuration this lifetime started with, whose
+    /// Networking page values outrank `config.toml` ([`SettingSpec::network`]).
+    network: NetworkConfiguration,
     /// The rows it reports and saves: [`SETTINGS`].
     rows: &'static [SettingSpec],
 }
@@ -1945,8 +2063,17 @@ impl FerrofinServerSettings {
             lifecycle,
             plugins,
             configuration,
+            network: NetworkConfiguration::default(),
             rows: SETTINGS,
         }
+    }
+
+    /// The same, reporting the values the Networking page saved in
+    /// `network`, the network configuration this lifetime started with.
+    #[must_use]
+    pub fn with_network(mut self, network: NetworkConfiguration) -> Self {
+        self.network = network;
+        self
     }
 
     /// The same, with `env` in place of the process environment.
@@ -1977,6 +2104,7 @@ impl ServerSettingsManager for FerrofinServerSettings {
         let restart_pending = self.lifecycle.has_pending_restart();
         let configuration = self.configuration.configuration().await?;
         let running = self.config.clone();
+        let network = self.network.clone();
         let env = Arc::clone(&self.env);
         let rows = self.rows;
         // Reads config.toml and probes its directory.
@@ -1986,6 +2114,7 @@ impl ServerSettingsManager for FerrofinServerSettings {
                 &running,
                 env.as_ref(),
                 &configuration,
+                &network,
                 restart_pending,
             )
         })

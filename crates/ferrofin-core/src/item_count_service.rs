@@ -38,8 +38,19 @@ use crate::translate_query::{
 };
 
 /// Re-opens a bound aggregate and lets `push` add predicates before its
-/// GROUP BY. The suffix contains no parameters, so the original bind order is
-/// retained.
+/// outer GROUP BY, after the binds the statement already holds.
+///
+/// The statement is split at its last `GROUP BY` (gl-290). Only that
+/// spelling, upper case with one space between the words, is found; any
+/// other is taken for no GROUP BY at all, and the predicates would follow it.
+/// Besides:
+/// - the text after the `GROUP BY` must hold no bind, which would be numbered
+///   after the added ones, and no parenthesis, which may mean the split fell
+///   inside a subquery; either is refused with an error.
+/// - the text before it, or the whole statement when it has no GROUP BY,
+///   must end inside the outer `WHERE`, with its terms `AND`ed: `push` adds
+///   ` AND …` terms, and a top-level `OR` would take them on its last arm
+///   only. Nothing checks this; the caller keeps it.
 fn before_group_by<'q>(
     mut query: impl Execute<'q, Sqlite>,
     push: impl FnOnce(&mut QueryBuilder<Sqlite>),
@@ -51,22 +62,29 @@ fn before_group_by<'q>(
     let sql = query.sql();
     let (prefix, suffix) = sql
         .as_str()
-        .rsplit_once(" GROUP BY ")
+        .rsplit_once("GROUP BY")
         .map_or((sql.as_str(), None), |(prefix, suffix)| {
             (prefix, Some(suffix))
         });
+    if let Some(suffix) = suffix.filter(|suffix| suffix.contains(['?', '(', ')'])) {
+        return Err(ServiceError::backend(format!(
+            "cannot add predicates before a GROUP BY followed by a bind or a parenthesis: {}",
+            suffix.trim()
+        )));
+    }
     let mut qb = QueryBuilder::with_arguments(prefix, arguments);
     push(&mut qb);
     if let Some(suffix) = suffix {
-        qb.push(" GROUP BY ").push(suffix);
+        qb.push(" GROUP BY").push(suffix);
     }
     Ok(qb)
 }
 
 /// Adds the same rating predicate as browsing before an existing aggregate's
 /// GROUP BY ([`before_group_by`]). Related-id aggregates correlate a
-/// primary-key lookup; the child-count aggregates and the whole-server played
-/// arm already read the counted row as `bi`.
+/// primary-key lookup; without a `related_id` the statement must read the
+/// counted row as `bi`, as the child-count aggregates and the whole-server
+/// played arm do.
 fn restrict_count_query<'q>(
     query: impl Execute<'q, Sqlite>,
     filter: &InternalItemsQuery,
@@ -239,6 +257,9 @@ pub struct FerrofinItemCountService {
     /// The `IsVisible` evaluator the count's library scope asks about
     /// playlists and box sets (see [`FerrofinItemCountService::with_visibility`]).
     visibility: crate::item_repository::VisibilitySlot,
+    /// The user-view manager the count's library scope runs `GetUserViews`
+    /// through (see [`FerrofinItemCountService::with_user_views`]).
+    user_views: crate::item_repository::UserViewsSlot,
     /// Expands a library row stored tokenised before its options are read
     /// (see [`FerrofinItemCountService::with_virtual_paths`]).
     virtual_paths: crate::virtual_paths::VirtualPathExpander,
@@ -259,6 +280,7 @@ impl FerrofinItemCountService {
             db,
             roots: None,
             visibility: crate::item_repository::VisibilitySlot::default(),
+            user_views: crate::item_repository::UserViewsSlot::default(),
             virtual_paths: crate::virtual_paths::VirtualPathExpander::identity(),
         }
     }
@@ -286,6 +308,16 @@ impl FerrofinItemCountService {
         self
     }
 
+    /// Installs the slot the composition root binds to the server's user-view
+    /// manager, the same one the item repository holds, so a count's library
+    /// scope writes the user's views exactly when a query's does
+    /// (`AddUserToQuery`'s `GetUserViews`). Left empty, it writes none.
+    #[must_use]
+    pub fn with_user_views(mut self, slot: crate::item_repository::UserViewsSlot) -> Self {
+        self.user_views = slot;
+        self
+    }
+
     /// Injects the two root-folder ids resolved once at startup, so the user
     /// root's `ChildCount` includes the `AggregateFolder`'s virtual children.
     ///
@@ -310,6 +342,7 @@ impl FerrofinItemCountService {
             &self.db,
             &self.virtual_paths,
             visibility.as_deref(),
+            &self.user_views,
             filter,
         )
         .await
@@ -1894,7 +1927,10 @@ mod tests {
         crate::test_support::save_item(&db, &row).await;
         let svc = FerrofinItemCountService::new(db.clone());
         assert!(svc.get_extra_counts_batch(&[]).await.unwrap().is_empty());
-        let mut owners = vec![Uuid::new_v4(); ferrofin_db::BATCH_BIND_CHUNK + 1];
+        // Distinct fillers, so the list still spans two chunks once deduplicated.
+        let mut owners: Vec<Uuid> = (0..=ferrofin_db::BATCH_BIND_CHUNK)
+            .map(|_| Uuid::new_v4())
+            .collect();
         owners[0] = owner;
         owners[ferrofin_db::BATCH_BIND_CHUNK] = owner;
         let counts = svc.get_extra_counts_batch(&owners).await.unwrap();
@@ -1930,6 +1966,42 @@ mod tests {
 
     fn svc(db: &Database) -> FerrofinItemCountService {
         FerrofinItemCountService::new(db.clone())
+    }
+
+    /// [`before_group_by`] refuses a statement with a bind or a parenthesis
+    /// after its last `GROUP BY` (gl-290): a bind there would be numbered
+    /// after the predicates it adds, and a GROUP BY inside a subquery is not
+    /// the outer one.
+    #[rstest]
+    #[case::bind_after_group_by(
+        r#"SELECT "Type", COUNT(*) FROM "BaseItems" WHERE "Type" = ? GROUP BY "Type" HAVING "Type" > ?"#
+    )]
+    #[case::group_by_in_a_subquery(
+        r#"SELECT COUNT(*) FROM "BaseItems" WHERE "Type" = ? AND "ParentId" IN (SELECT "ParentId" FROM "BaseItems" GROUP BY "ParentId")"#
+    )]
+    fn before_group_by_refuses_a_suffix_it_cannot_keep(#[case] sql: &'static str) {
+        let query = sqlx::query(sql).bind("Movie");
+        let built = before_group_by(query, |qb| {
+            qb.push(r#" AND "IsFolder" = "#).push_bind(0);
+        });
+        assert!(built.is_err(), "{sql}");
+    }
+
+    /// [`before_group_by`] finds a GROUP BY that opens its own line, rather
+    /// than adding its predicates after it (gl-290).
+    #[test]
+    fn before_group_by_adds_before_a_group_by_on_its_own_line() {
+        let query =
+            sqlx::query("SELECT \"Type\" FROM \"BaseItems\" WHERE \"Type\" = ?\nGROUP BY \"Type\"")
+                .bind("Movie");
+        let built = before_group_by(query, |qb| {
+            qb.push(r#" AND "IsFolder" = "#).push_bind(0);
+        })
+        .expect("plain suffix");
+        assert_eq!(
+            built.sql().as_str(),
+            "SELECT \"Type\" FROM \"BaseItems\" WHERE \"Type\" = ?\n AND \"IsFolder\" = ? GROUP BY \"Type\""
+        );
     }
 
     /// The user root's `ChildCount` is its own children **plus** the

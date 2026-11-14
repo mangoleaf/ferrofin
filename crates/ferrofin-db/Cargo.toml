@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 publish.workspace = true
-description = "SQLite persistence for Ferrofin (port of Jellyfin.Database) — entities, migration, DTO conversions."
+description = "SQLite persistence for Ferrofin (port of Jellyfin.Database) — entities, migrations, the database handle."
 
 [lints]
 workspace = true
@@ -19,6 +19,7 @@ uuid.workspace = true
 chrono.workspace = true
 tokio = { workspace = true }
 tracing.workspace = true
+sha2.workspace = true
 
 [dev-dependencies]
 rstest.workspace = true

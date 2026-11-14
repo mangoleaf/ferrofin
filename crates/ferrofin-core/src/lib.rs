@@ -63,8 +63,7 @@
 //!   ([`ferrofin_traits::library::LibraryManager`]);
 //! - [`media_source_manager`] — [`FerrofinMediaSourceManager`]
 //!   ([`ferrofin_traits::library::MediaSourceManager`]), holding in-memory
-//!   live-stream state and injecting `Arc<dyn MediaEncoder>` / `Arc<dyn
-//!   ProviderManager>` for probing;
+//!   live-stream state and injecting `Arc<dyn MediaEncoder>` for probing;
 //! - [`user_view_manager`] — [`FerrofinUserViewManager`]
 //!   ([`ferrofin_traits::library::UserViewManager`]), with
 //!   [`user_view_repository`] holding the boot-time consolidation of
@@ -158,10 +157,13 @@
 //!   trait: the task registry over the `ferrofin-model` task DTOs, plus the
 //!   trigger scheduler ([`start_scheduler`](FerrofinTaskManager::start_scheduler)
 //!   fires daily/weekly/interval/startup triggers), live progress reporting,
-//!   abortable queued runs, and on-disk trigger-override persistence.
+//!   cooperative stops (a run's token, `Cancelling` until it returns), and
+//!   on-disk trigger-override persistence.
 //!
-//! Backup and restore (`BackupService`) live in `ferrofin-api`'s `Backup`
-//! handlers.
+//! Backup and restore ([`ferrofin_traits::backup::BackupService`]) live in
+//! [`backup`]: [`backup::FerrofinBackupService`] behind the `/Backup*` routes,
+//! and [`backup::apply_pending_restore`], which the composition root runs at
+//! boot.
 
 pub mod access_schedule_repository;
 pub mod activity_manager;
@@ -174,6 +176,7 @@ mod audio_tags;
 pub mod auth_cache;
 pub mod auth_providers;
 pub mod authorization_context;
+pub mod backup;
 pub mod by_name_store;
 pub mod cached_media_segment_provider;
 pub mod channel_manager;
@@ -183,6 +186,7 @@ pub mod chapter_repository;
 pub mod client_event_logger;
 pub mod collection_manager;
 mod collections_library;
+pub mod config_export;
 pub mod config_import;
 pub mod configuration_manager;
 pub mod db_error;
@@ -241,6 +245,7 @@ pub mod people_repository;
 pub mod playback_activity;
 pub mod playback_metrics;
 mod playback_sessions_repository;
+pub mod plugin_config_adoption;
 pub mod plugin_manager;
 pub mod plugin_offered_item_repository;
 mod query_restrictions;
@@ -309,7 +314,8 @@ pub use file_system::FerrofinFileSystem;
 pub use item_count_service::FerrofinItemCountService;
 pub use item_persistence_service::FerrofinItemPersistenceService;
 pub use item_repository::{
-    ActiveRecordingSlot, ActiveRecordingSource, FerrofinItemRepository, VisibilitySlot,
+    ActiveRecordingSlot, ActiveRecordingSource, FerrofinItemRepository, UserViewMaterialisation,
+    UserViewsSlot, VisibilitySlot,
 };
 pub use item_type_lookup::ItemTypeLookup;
 pub use keyframe_repository::FerrofinKeyframeRepository;

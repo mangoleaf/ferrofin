@@ -52,6 +52,10 @@ fn stream_type_probe_sql(ids: usize) -> String {
 #[derive(Clone)]
 pub struct FerrofinMediaStreamRepository {
     db: Database,
+    /// The virtual-path pair a stream's `Path` is stored and read with
+    /// (`MediaStreamRepository.GetPathToSave` / `RestorePath`): the identity
+    /// (unit tests) stores and reads it as given.
+    virtual_paths: crate::virtual_paths::VirtualPathExpander,
 }
 
 impl std::fmt::Debug for FerrofinMediaStreamRepository {
@@ -65,7 +69,30 @@ impl FerrofinMediaStreamRepository {
     /// Creates a media-stream repository over the given database.
     #[must_use]
     pub fn new(db: Database) -> Self {
-        Self { db }
+        Self {
+            db,
+            virtual_paths: crate::virtual_paths::VirtualPathExpander::identity(),
+        }
+    }
+
+    /// Wires the virtual-path tokens: a stream file in this server's data or
+    /// metadata directory (a downloaded subtitle, a recording's sidecar) is
+    /// stored as `%AppDataPath%/…` or `%MetadataPath%/…` and expanded on every
+    /// read, as upstream's `MediaStreamRepository` does (`:69-87,209`).
+    #[must_use]
+    pub fn with_virtual_paths(
+        mut self,
+        virtual_paths: crate::virtual_paths::VirtualPathExpander,
+    ) -> Self {
+        self.virtual_paths = virtual_paths;
+        self
+    }
+
+    /// `RestorePath`: the row's stored `Path` expanded to this server's
+    /// directories.
+    fn restore_path(&self, mut row: MediaStreamInfoEntity) -> MediaStreamInfoEntity {
+        self.virtual_paths.expand_in_place(&mut row.path);
+        row
     }
 
     /// The subset of `item_ids` carrying at least one stream of `stream_type`.
@@ -134,7 +161,13 @@ impl MediaStreamRepository for FerrofinMediaStreamRepository {
         if let Some(stream_type) = filter.stream_type {
             query = query.bind(i64::from(media_stream_type_disc(stream_type)));
         }
-        query.fetch_all(self.db.pool()).await.map_err(db_err)
+        Ok(query
+            .fetch_all(self.db.pool())
+            .await
+            .map_err(db_err)?
+            .into_iter()
+            .map(|row| self.restore_path(row))
+            .collect())
     }
 
     async fn get_media_streams_batch(
@@ -159,7 +192,7 @@ impl MediaStreamRepository for FerrofinMediaStreamRepository {
             }
             for row in query.fetch_all(self.db.pool()).await.map_err(db_err)? {
                 if let Ok(id) = Uuid::parse_str(&row.item_id) {
-                    map.entry(id).or_default().push(row);
+                    map.entry(id).or_default().push(self.restore_path(row));
                 }
             }
         }
@@ -265,7 +298,11 @@ impl MediaStreamRepository for FerrofinMediaStreamRepository {
                     .bind(&s.language)
                     .bind(s.level)
                     .bind(&s.nal_length_size)
-                    .bind(&s.path)
+                    .bind(
+                        s.path
+                            .as_deref()
+                            .map(|path| self.virtual_paths.reverse(path)),
+                    )
                     .bind(&s.pixel_format)
                     .bind(&s.profile)
                     .bind(s.real_frame_rate)
@@ -346,6 +383,52 @@ mod tests {
             title: None,
             width: None,
         }
+    }
+
+    /// gl-1581: a stream file in the metadata directory (a downloaded
+    /// subtitle) is stored `%MetadataPath%/…`, as upstream's
+    /// `MediaStreamRepository` writes it (`GetPathToSave`), and every read
+    /// gives the resolved path back (`RestorePath`), the batch read included.
+    #[tokio::test]
+    async fn a_stream_path_is_stored_tokenised_and_read_back_resolved() {
+        let db = test_db().await;
+        let item = Uuid::new_v4();
+        seed_item(&db, item, BaseItemKind::Movie).await;
+        let root = tempfile::tempdir().expect("tempdir");
+        let paths = crate::app_paths::test_paths(root.path());
+        let metadata =
+            ferrofin_traits::system::ServerApplicationPaths::internal_metadata_path(&*paths);
+        let repo = FerrofinMediaStreamRepository::new(db.clone()).with_virtual_paths(
+            crate::virtual_paths::VirtualPathExpander::from_paths(std::sync::Arc::clone(&paths)),
+        );
+        let resolved = format!("{metadata}/library/ab/abcd/movie.en.srt");
+        let mut subtitle = stream(0, 2, Some("eng"));
+        subtitle.path = Some(resolved.clone());
+        repo.save_media_streams(item, std::slice::from_ref(&subtitle))
+            .await
+            .expect("save");
+
+        let stored: Option<String> =
+            sqlx::query_scalar(r#"SELECT "Path" FROM "MediaStreamInfos" WHERE "ItemId" = ?1"#)
+                .bind(ferrofin_db::store::guid_to_db(item))
+                .fetch_one(db.pool())
+                .await
+                .expect("row");
+        assert_eq!(
+            stored.as_deref(),
+            Some("%MetadataPath%/library/ab/abcd/movie.en.srt")
+        );
+        let one = repo
+            .get_media_streams(&MediaStreamQuery {
+                item_id: item,
+                stream_type: None,
+                index: None,
+            })
+            .await
+            .expect("read");
+        assert_eq!(one[0].path.as_deref(), Some(resolved.as_str()));
+        let batch = repo.get_media_streams_batch(&[item]).await.expect("batch");
+        assert_eq!(batch[&item][0].path.as_deref(), Some(resolved.as_str()));
     }
 
     /// More streams than one statement's rows are saved whole, each with its

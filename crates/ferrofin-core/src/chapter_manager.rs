@@ -77,7 +77,10 @@ impl FerrofinChapterManager {
             start_position_ticks: entity.start_position_ticks,
             name: entity.name,
             image_path: entity.image_path,
-            image_date_modified: entity.image_date_modified.unwrap_or_default(),
+            // `GetValueOrDefault()` upstream: a NULL date reads as `MinValue`.
+            image_date_modified: entity
+                .image_date_modified
+                .unwrap_or_else(ferrofin_model::json::datetime::dotnet_min),
             image_tag: None,
         }
     }
@@ -191,6 +194,36 @@ mod tests {
         mgr.delete_chapter_data(item).await.expect("delete");
         let chapters = mgr.get_chapters(item).await.expect("get");
         assert!(chapters.is_empty(), "{chapters:?}");
+    }
+
+    /// gl-1590: an imageless chapter is stored and read back dated .NET's
+    /// `DateTime.MinValue`, as Jellyfin stores `0001-01-01` and serves it; a
+    /// NULL date reads as `MinValue` too (`GetValueOrDefault()`).
+    #[tokio::test]
+    async fn an_imageless_chapter_is_dated_min_value() {
+        use ferrofin_traits::persistence::ChapterRepository as _;
+        let db = test_db().await;
+        let item = Uuid::new_v4();
+        seed_item(&db, item, BaseItemKind::Movie).await;
+        let repo = Arc::new(FerrofinChapterRepository::new(db.clone()));
+        let mgr = FerrofinChapterManager::new(repo.clone(), library_manager_over(db.clone()));
+        let min = ferrofin_model::json::datetime::dotnet_min();
+
+        mgr.save_chapters(item, &[chapter("Intro", 0)])
+            .await
+            .expect("save");
+        let stored = repo.get_chapters(item).await.expect("rows");
+        assert_eq!(stored[0].image_date_modified, Some(min));
+        let read = mgr.get_chapters(item).await.expect("get");
+        assert_eq!(read[0].image_date_modified, min);
+
+        let mut undated = stored[0].clone();
+        undated.image_date_modified = None;
+        repo.save_chapters(item, &[undated])
+            .await
+            .expect("save NULL");
+        let read = mgr.get_chapters(item).await.expect("get");
+        assert_eq!(read[0].image_date_modified, min);
     }
 
     #[tokio::test]

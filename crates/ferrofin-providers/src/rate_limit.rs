@@ -75,7 +75,7 @@ pub struct RequestLimits {
     pub timeout: Duration,
     /// Longest pending pacing or quota wait before a lookup is skipped.
     pub max_wait: Duration,
-    /// Most bytes a body read as bytes may hold (`image_download_max_mb`).
+    /// Most bytes a provider response body may hold (`image_download_max_mb`).
     pub download_max_bytes: u64,
 }
 
@@ -361,7 +361,11 @@ impl RateLimiter {
                 Err(error) => {
                     let error = error.without_url();
                     if !error.is_timeout() && !error.is_connect() && !error.is_request() {
-                        tracing::warn!(provider = %self.provider, %context, "Metadata provider request failed");
+                        // A refused redirect names its reason only in its source.
+                        let cause = std::error::Error::source(&error)
+                            .map(ToString::to_string)
+                            .unwrap_or_default();
+                        tracing::warn!(provider = %self.provider, %context, %error, %cause, "Metadata provider request failed");
                         return Err(RequestError::Http(error.without_url()));
                     }
                     rate.failed(Duration::ZERO);
@@ -442,8 +446,14 @@ impl RateLimiter {
         let context = request_context(&self.provider, response.url());
         match response.counted_json().await {
             Ok(body) => Some(body),
+            // As an image past the limit is: at debug, since a library may
+            // hold any number of them.
+            Err(BodyError::TooLarge) => {
+                tracing::debug!(provider = %self.provider, %context, "Metadata provider response is over the download limit");
+                None
+            }
             Err(error) => {
-                tracing::warn!(provider = %self.provider, %context, error = %error.without_url(), "Metadata provider response could not be parsed");
+                tracing::warn!(provider = %self.provider, %context, %error, "Metadata provider response could not be parsed");
                 None
             }
         }
@@ -549,16 +559,17 @@ pub async fn count_request_failures<F: std::future::Future>(future: F) -> (F::Ou
 /// Body reads of a provider response that count a failed read or decode
 /// into the enclosing [`count_request_failures`] scope — a truncated or
 /// malformed `200` is a failure, not an answer. Every provider client in this
-/// crate reads its bodies through these.
+/// crate reads its bodies through these, under the download limit
+/// ([`request_limits`]; gl-1095, gl-76). Past the limit is an answer, not a
+/// failure: the next attempt would get the same body.
 pub(crate) trait CountedBody: Sized {
-    /// `Response::json`, counting an error.
-    async fn counted_json<T: serde::de::DeserializeOwned>(self) -> Result<T, reqwest::Error>;
-    /// The whole body, read under the download limit ([`request_limits`]),
-    /// counting a read error. Past the limit is an answer, not a failure: the
-    /// next attempt would get the same body.
+    /// The body as JSON (`Response::json`), counting a read or decode error.
+    async fn counted_json<T: serde::de::DeserializeOwned>(self) -> Result<T, BodyError>;
+    /// The whole body, counting a read error.
     async fn counted_bytes(self) -> Result<Vec<u8>, BodyError>;
-    /// `Response::text`, counting an error.
-    async fn counted_text(self) -> Result<String, reqwest::Error>;
+    /// The body as text (`Response::text`: UTF-8, a malformed sequence
+    /// replaced), counting a read error.
+    async fn counted_text(self) -> Result<String, BodyError>;
 }
 
 /// Counts `result`'s error, if any, and hands it back.
@@ -570,16 +581,21 @@ fn counted<T>(result: Result<T, reqwest::Error>) -> Result<T, reqwest::Error> {
 }
 
 impl CountedBody for reqwest::Response {
-    async fn counted_json<T: serde::de::DeserializeOwned>(self) -> Result<T, reqwest::Error> {
-        counted(self.json().await)
+    async fn counted_json<T: serde::de::DeserializeOwned>(self) -> Result<T, BodyError> {
+        serde_json::from_slice(&self.counted_bytes().await?).map_err(|error| {
+            note_request_failure();
+            BodyError::Decode(error)
+        })
     }
     async fn counted_bytes(self) -> Result<Vec<u8>, BodyError> {
         CappedBody::new(self, request_limits().download_max_bytes)?
             .read_to_end(Vec::new())
             .await
     }
-    async fn counted_text(self) -> Result<String, reqwest::Error> {
-        counted(self.text().await)
+    async fn counted_text(self) -> Result<String, BodyError> {
+        let body = self.counted_bytes().await?;
+        Ok(String::from_utf8(body)
+            .unwrap_or_else(|error| String::from_utf8_lossy(error.as_bytes()).into_owned()))
     }
 }
 
@@ -592,6 +608,9 @@ pub(crate) enum BodyError {
     /// The body declared, or turned out to hold, more than the limit.
     #[error("provider response is over the download limit")]
     TooLarge,
+    /// The body is not the JSON asked for.
+    #[error("provider response could not be decoded: {0}")]
+    Decode(serde_json::Error),
 }
 
 /// A response body read a chunk at a time under a byte limit, so nothing past
@@ -623,7 +642,12 @@ impl CappedBody {
 
     /// Appends the next chunk to `buffer`; `false` when the body has ended.
     pub(crate) async fn read_into(&mut self, buffer: &mut Vec<u8>) -> Result<bool, BodyError> {
-        let Some(chunk) = counted(self.response.chunk().await)? else {
+        let chunk = self
+            .response
+            .chunk()
+            .await
+            .map_err(reqwest::Error::without_url);
+        let Some(chunk) = counted(chunk)? else {
             return Ok(false);
         };
         self.read = self.read.saturating_add(chunk.len() as u64);
@@ -1509,6 +1533,32 @@ mod tests {
             };
             assert_eq!(request_result(&Ok(response), 1), expected);
         }
+    }
+
+    /// gl-76: a JSON or text body is read under the download limit, as one
+    /// read as bytes is (gl-1095). One that declares more is refused unread,
+    /// and that is an answer, not a failure.
+    #[tokio::test]
+    async fn a_json_or_text_body_past_the_limit_is_refused() {
+        use crate::mock_http::MockServer;
+        let over = request_limits().download_max_bytes + 1;
+        let server = MockServer::start_raw(vec![MockServer::raw_ok(
+            &format!("Content-Length: {over}\r\n"),
+            b"",
+        )])
+        .await;
+        let http = reqwest::Client::new();
+        let get = || async { http.get(&server.base_url).send().await.expect("headers") };
+
+        let ((json, text), failures) = count_request_failures(async {
+            let json = get().await.counted_json::<serde_json::Value>().await;
+            (json, get().await.counted_text().await)
+        })
+        .await;
+
+        assert!(matches!(json, Err(BodyError::TooLarge)), "{json:?}");
+        assert!(matches!(text, Err(BodyError::TooLarge)), "{text:?}");
+        assert_eq!(failures, 0);
     }
 
     #[tokio::test(start_paused = true)]

@@ -136,7 +136,7 @@ impl ListenBrainzClient {
     #[must_use]
     pub fn new(config: ListenBrainzConfig) -> Self {
         Self {
-            http: reqwest::Client::new(),
+            http: crate::http_client::client(),
             limiter: RateLimiter::new("listenbrainz"),
             config,
         }

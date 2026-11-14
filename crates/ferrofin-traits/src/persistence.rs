@@ -217,15 +217,72 @@ pub struct PlaylistAccessColumns {
     pub share_can_edit: Option<i64>,
 }
 
-/// A playlist's member rows in link order, plus the caller's access columns.
+/// A playlist's entries, each distinct member row held once.
+///
+/// A playlist may name one item any number of times, and any signed-in user
+/// can grow one, so a row per entry would let the repeats set a read's memory.
+/// Upstream's `Folder.ResolveLinkedChildren` likewise resolves each distinct id
+/// once and shares the item between the entries naming it.
+#[derive(Debug, Clone, Default)]
+pub struct PlaylistMembers {
+    /// Each distinct member row once, in the order it first appears.
+    pub items: Vec<BaseItemEntity>,
+    /// The entries in playlist (link) order, each an index into
+    /// [`items`](Self::items). An index past `items` names no row.
+    pub entries: Vec<usize>,
+}
+
+impl PlaylistMembers {
+    /// One row per entry, in link order, repeats kept.
+    ///
+    /// Entries naming each row at most once, in row order (any playlist of
+    /// distinct members, paged or filtered), keep their rows in place. Otherwise
+    /// a row moves into its last entry and is cloned for the earlier ones. A row
+    /// no entry names is dropped.
+    #[must_use]
+    pub fn into_entry_rows(self) -> Vec<BaseItemEntity> {
+        let mut items = self.items;
+        if self.entries.windows(2).all(|pair| pair[0] < pair[1]) {
+            let mut kept = self.entries.iter().peekable();
+            let mut position = 0;
+            items.retain(|_| {
+                let keep = kept.next_if_eq(&&position).is_some();
+                position += 1;
+                keep
+            });
+            return items;
+        }
+        let mut uses = vec![0_usize; items.len()];
+        for &index in &self.entries {
+            if let Some(count) = uses.get_mut(index) {
+                *count += 1;
+            }
+        }
+        let mut rows = Vec::with_capacity(self.entries.len());
+        for &index in &self.entries {
+            let (Some(count), Some(item)) = (uses.get_mut(index), items.get_mut(index)) else {
+                continue;
+            };
+            *count -= 1;
+            rows.push(if *count == 0 {
+                std::mem::take(item)
+            } else {
+                item.clone()
+            });
+        }
+        rows
+    }
+}
+
+/// A playlist's members, plus the caller's access columns.
 ///
 /// `access` is `None` exactly when the playlist has no member rows — the join
 /// then cannot tell "empty playlist" from "missing/invisible playlist", so the
 /// caller resolves access separately.
 #[derive(Debug, Clone)]
 pub struct PlaylistItemsWithAccess {
-    /// The member item rows, in playlist (link) order.
-    pub items: Vec<BaseItemEntity>,
+    /// The member rows, each distinct one once, and the entries in link order.
+    pub members: PlaylistMembers,
     /// The access columns repeated on every member row (`None` if there are none).
     pub access: Option<PlaylistAccessColumns>,
 }
@@ -603,9 +660,14 @@ pub trait ItemRepository: Send + Sync {
     /// when `GetImageInfo` returns `null`); so is a slot against itself, whose
     /// file copy onto itself would throw upstream.
     ///
+    /// The files are the rows' paths expanded (`%MetadataPath%`,
+    /// `%AppDataPath%`), as upstream's `info.Path` is.
+    ///
     /// Returns whether the two files were swapped — the only case in which
     /// upstream reaches its repository save. A missing slot, or a non-local
-    /// (remote) path on either side, is "nothing to do".
+    /// (remote) path on either side, is "nothing to do", and so is a Live TV
+    /// item's file outside the internal metadata directory
+    /// ([`live_tv_image_is_internal`](crate::options::live_tv_image_is_internal)).
     ///
     /// # Errors
     ///
@@ -728,7 +790,12 @@ pub trait ItemRepository: Send + Sync {
         Ok(self.get_query_filters_legacy(filter).await?.tags)
     }
 
-    /// Reports whether all children of `id` are played for the given user.
+    /// Reports whether everything under `id` is played for the given user, as
+    /// v12.4 `GetIsPlayed` (`Folder.IsPlayed`): with `recursive`, every
+    /// non-folder, non-virtual descendant through the `AncestorIds` closure
+    /// and `LinkedChildren`; without, every direct child. An item counts as
+    /// played when any version of its version group is; nothing is
+    /// access-filtered.
     async fn get_is_played(
         &self,
         user: &UserEntity,
@@ -736,9 +803,10 @@ pub trait ItemRepository: Send + Sync {
         recursive: bool,
     ) -> Result<bool, ServiceError>;
 
-    /// Reads a playlist's linked members of `child_type` in link order, each
-    /// joined with the caller's playlist-access columns, in a **single**
-    /// statement (`GET /Playlists/{id}/Items`).
+    /// Reads a playlist's linked members of `child_type` with the caller's
+    /// playlist-access columns, in a **single** statement
+    /// (`GET /Playlists/{id}/Items`): each distinct member row once, and the
+    /// entries in link order as indexes into them.
     ///
     /// One round-trip is load-bearing: the previous shape took one reader-pool
     /// connection for the access check, another for the child-id list, and
@@ -1704,10 +1772,9 @@ pub trait ItemPersistenceService: Send + Sync {
         Ok(false)
     }
 
-    /// Announces `ItemAdded` for a row created outside
-    /// [`crate::library::LibraryManager::create_items`] (which announces its
-    /// own), as `LibraryManager.CreateItem` raises it for every new item.
-    /// Returns whether the row exists.
+    /// Announces `ItemAdded` for a row created outside the library scan
+    /// (which announces its own), as `LibraryManager.CreateItem` raises it for
+    /// every new item. Returns whether the row exists.
     ///
     /// The default announces nothing (for stub/fake services).
     ///
@@ -2777,8 +2844,26 @@ pub trait PeopleRepository: Send + Sync {
     /// This is the read-only identity half of Jellyfin's GetPerson: it uses
     /// Person.GetPath and the configured item-id mode, never a credit-row id
     /// or a generic matching-name row. Callers must verify the derived item
-    /// exists and is a Person. An unwired identity yields missing slots.
+    /// exists and is a Person. An unwired identity yields missing slots. The
+    /// person reads use [`Self::find_person_item_ids`], which reads the rows.
     async fn get_person_item_ids(
+        &self,
+        names: &[String],
+    ) -> Result<Vec<Option<Uuid>>, ServiceError> {
+        Ok(vec![None; names.len()])
+    }
+
+    /// The stored `Person` item each name (trimmed) reads, in input order:
+    /// Jellyfin's `LibraryManager.GetPerson`, the item at the id the name
+    /// derives when it is a `Person`, so spellings sharing a clean name are
+    /// each their own person. It reads the rows, where
+    /// [`Self::get_person_item_ids`] (the NFO saver's) only derives the current
+    /// id: an item the write path keeps under the older derivation is the
+    /// name's too. With no item at either id, the name reads an item whose own
+    /// name derives the same id and shares its clean name (the same person,
+    /// in a database whose stored ids are not the derived ones). `None` where
+    /// there is none, or the name is blank.
+    async fn find_person_item_ids(
         &self,
         names: &[String],
     ) -> Result<Vec<Option<Uuid>>, ServiceError> {
@@ -2809,13 +2894,6 @@ pub trait PeopleRepository: Send + Sync {
         &self,
         filter: &InternalPeopleQuery,
     ) -> Result<Vec<String>, ServiceError>;
-
-    /// Batch-fetches the distinct people names per item, filtered by type.
-    async fn get_people_names_by_items(
-        &self,
-        item_ids: &[Uuid],
-        person_types: &[String],
-    ) -> Result<HashMap<Uuid, Vec<String>>, ServiceError>;
 }
 
 fn _assert_object_safe_people_repository(_: &dyn PeopleRepository) {}
@@ -2943,8 +3021,40 @@ fn _assert_object_safe_item_type_lookup(_: &dyn ItemTypeLookup) {}
 mod tests {
     use super::{
         MediaAttachmentQuery, MediaStreamQuery, NextUpEpisodeBatchResult, NextUpEpisodeUserData,
-        PlayedAndTotal,
+        PlayedAndTotal, PlaylistMembers,
     };
+    use ferrofin_db::entities::base_items::BaseItemEntity;
+
+    #[test]
+    fn entry_rows_repeat_a_shared_row_in_link_order() {
+        let row = |id: &str| BaseItemEntity {
+            id: id.to_owned(),
+            ..BaseItemEntity::default()
+        };
+        let members = PlaylistMembers {
+            items: vec![row("a"), row("b"), row("unused")],
+            entries: vec![1, 0, 1, 1, 9],
+        };
+        let ids: Vec<String> = members
+            .into_entry_rows()
+            .into_iter()
+            .map(|row| row.id)
+            .collect();
+        // An index past the rows names no row and is skipped.
+        assert_eq!(ids, ["b", "a", "b", "b"]);
+
+        // Each row at most once, in row order: the rows stay where they are.
+        let members = PlaylistMembers {
+            items: vec![row("a"), row("b"), row("c")],
+            entries: vec![0, 2, 9],
+        };
+        let ids: Vec<String> = members
+            .into_entry_rows()
+            .into_iter()
+            .map(|row| row.id)
+            .collect();
+        assert_eq!(ids, ["a", "c"]);
+    }
 
     #[test]
     fn played_and_total_defaults_to_zero() {

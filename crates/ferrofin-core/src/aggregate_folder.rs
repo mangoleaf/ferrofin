@@ -234,14 +234,29 @@ impl AggregateFolderStore {
         )
     }
 
+    /// The write half of [`Self::expand`] (`ReverseVirtualPath`,
+    /// ApplicationHost.cs:299-305): this server's data directory replaced by
+    /// `%AppDataPath%`, as upstream stores the playlists folder's path
+    /// (`CreateRootFolder` saves it through `BaseItemMapper.Map` →
+    /// `GetPathToSave`).
+    fn reverse(&self, path: &str) -> String {
+        ferrofin_util::string_extensions::replace_ignore_ascii_case(
+            path,
+            &self.data_path.to_string_lossy(),
+            crate::app_paths::FerrofinServerApplicationPaths::VIRTUAL_DATA_PATH,
+        )
+    }
+
     /// `folder.ParentId = rootFolder.Id` for the playlists folder, plus the
     /// one-shot rewrite of a legacy `ManualPlaylistsFolder` row onto 10.11.8's
     /// identity, the folder's row itself when there is none, its move to the
     /// data directory when the row is somewhere else, the retype of a folder
-    /// kept at the directory under an id of its own, and the playlists an
-    /// older Ferrofin left without a parent put into the folder.
+    /// kept at the directory under an id of its own, the playlists an older
+    /// Ferrofin left without a parent put into the folder, and the ancestors
+    /// of the folder and its playlists that are missing (earlier builds wrote
+    /// none, and the previous version during a rolling update still may not).
     ///
-    /// Each is idempotent, run once per process.
+    /// Each is idempotent, run once per process: so on every boot.
     async fn repair_playlists_folder(
         &self,
         aggregate: Uuid,
@@ -308,7 +323,9 @@ impl AggregateFolderStore {
                             "could not create the playlists directory");
                     }
                     let dir = tokio::fs::metadata(&path).await.ok();
-                    let row = playlists_folder_row(correct, &path, Some(aggregate), dir.as_ref());
+                    let mut row =
+                        playlists_folder_row(correct, &path, Some(aggregate), dir.as_ref());
+                    row.path = Some(self.reverse(&path_str));
                     crate::item_persistence_service::FerrofinItemPersistenceService::new(
                         self.db.clone(),
                     )
@@ -352,6 +369,13 @@ impl AggregateFolderStore {
             &self.db, correct, aggregate, user_root,
         )
         .await?;
+        self.settle_playlists(aggregate, user_root).await
+    }
+
+    /// The playlists in the folder a create finds: those an older Ferrofin
+    /// left without a parent adopted into it, and the ancestors the folder and
+    /// its playlists are missing recorded. Part of [`Self::repair_playlists_folder`].
+    async fn settle_playlists(&self, aggregate: Uuid, user_root: Uuid) -> Result<(), ServiceError> {
         // Playlists an older Ferrofin saved with neither parent nor top parent
         // go into the folder a create finds. Startup's repair, once per
         // process: upstream's lookup (`GetPlaylistsFolder`) writes nothing.
@@ -368,6 +392,16 @@ impl AggregateFolderStore {
                 folder,
             )
             .await?;
+            // `CreateRootFolder`'s save writes the folder's ancestors, and each
+            // playlist's save its own; rows earlier builds made have none.
+            let added =
+                crate::item_persistence_service::add_playlist_ancestors(&self.db, folder).await?;
+            if added > 0 {
+                tracing::info!(
+                    rows = added,
+                    "recorded the ancestors of the playlists folder and its playlists"
+                );
+            }
         }
         Ok(())
     }
@@ -404,7 +438,12 @@ impl AggregateFolderStore {
             .as_ref()
             .map_or((now, now), crate::library_scan::created_and_modified);
         crate::item_persistence_service::repath_virtual_child(
-            &self.db, id, &path_str, aggregate, dates, now,
+            &self.db,
+            id,
+            &self.reverse(&path_str),
+            aggregate,
+            dates,
+            now,
         )
         .await?;
         tracing::info!(item_id = %id, from = stored.unwrap_or_default(), path = %path_str,
@@ -533,10 +572,8 @@ mod tests {
         assert_eq!(row.name.as_deref(), Some("Playlists"));
         assert_eq!(row.parent_id, Some(db_guid(ids.aggregate)));
         assert_eq!(row.top_parent_id, Some(db_guid(id)), "its own top parent");
-        assert_eq!(
-            row.path.as_deref(),
-            Some(store.playlists_path().to_string_lossy().as_ref())
-        );
+        // stored tokenised, as `CreateRootFolder`'s save writes it (gl-1581)
+        assert_eq!(row.path.as_deref(), Some("%AppDataPath%/playlists"));
         assert!(store.playlists_path().is_dir());
         assert_eq!(store.ensure().await.expect("again"), ids);
     }
@@ -668,6 +705,56 @@ mod tests {
             fetch_item(&db, placed).await.parent_id,
             Some(db_guid(elsewhere)),
             "a playlist with a parent is left alone"
+        );
+    }
+
+    /// Startup writes the ancestors upstream's saves write: the Playlists
+    /// folder's (the root) when it is made, and those of a playlist under it
+    /// that an earlier build left without any (the folder and the root), on
+    /// the next boot. A playlist a scan found elsewhere keeps its own.
+    #[tokio::test]
+    async fn ensure_writes_the_playlists_missing_ancestors() {
+        use crate::library_structure_repository::ancestors_of;
+
+        let db = test_db().await;
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let store = store(&db, &tmp);
+        store.ensure().await.expect("ensure");
+        let folder = store.playlists_id().expect("playlists id");
+        let aggregate = store.id();
+        assert_eq!(ancestors_of(&db, folder).await, [db_guid(aggregate)]);
+
+        // As an earlier build left them: no ancestors at all.
+        let made = Uuid::from_u128(0x0A1);
+        seed_folder_item(&db, made, BaseItemKind::Playlist, "Made", Some(folder)).await;
+        let elsewhere = Uuid::from_u128(0xE15);
+        seed_folder_item(&db, elsewhere, BaseItemKind::Folder, "Elsewhere", None).await;
+        let scanned = Uuid::from_u128(0x5CA);
+        seed_folder_item(
+            &db,
+            scanned,
+            BaseItemKind::Playlist,
+            "Scanned",
+            Some(elsewhere),
+        )
+        .await;
+        assert_eq!(ancestors_of(&db, made).await, Vec::<String>::new());
+
+        store.ensure().await.expect("the next boot");
+        let mut chain = vec![db_guid(folder), db_guid(aggregate)];
+        chain.sort();
+        assert_eq!(ancestors_of(&db, made).await, chain);
+        assert_eq!(
+            ancestors_of(&db, scanned).await,
+            Vec::<String>::new(),
+            "a playlist outside the Playlists folder is left to the scan"
+        );
+        assert_eq!(
+            crate::item_persistence_service::add_playlist_ancestors(&db, folder)
+                .await
+                .expect("again"),
+            0,
+            "nothing is added twice"
         );
     }
 
@@ -905,7 +992,7 @@ mod tests {
         let row = fetch_item(&db, playlists).await;
         assert_eq!(
             row.path.as_deref(),
-            Some(dir.to_string_lossy().as_ref()),
+            Some("%AppDataPath%/playlists"),
             "the playlists folder is saved at the new path"
         );
         assert_eq!(row.parent_id, Some(db_guid(aggregate)));

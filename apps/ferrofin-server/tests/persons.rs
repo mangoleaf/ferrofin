@@ -450,3 +450,64 @@ async fn persons_lists_and_counts_only_people_credited_where_the_user_can_look()
     assert_eq!(names(&page), ["Bob", "Rae", "Sam"], "{page}");
     assert_eq!(page["TotalRecordCount"], 4, "{page}");
 }
+
+/// gl-1079: Jellyfin's `GetPerson(name)` reads the item whose id derives from
+/// that spelling (`GetItemByNameId<Person>(Person.GetPath(name))`), so two
+/// spellings whose clean names match are two people, each with an item of its
+/// own. Ferrofin read and wrote them through the first row with the clean name.
+#[tokio::test]
+async fn spellings_sharing_a_clean_name_are_two_people() {
+    let spellings = ["H Jon Benjamin", "H. Jon Benjamin"];
+    let harness = boot(&[
+        (
+            "First Film (2001)",
+            movie_nfo("First Film", &spellings[..1], ""),
+        ),
+        (
+            "Second Film (2002)",
+            movie_nfo("Second Film", &spellings[1..], ""),
+        ),
+    ])
+    .await;
+    let router = ferrofin_api::create_router(harness.wired.state.clone());
+    let auth = authenticate(&router).await;
+    add_library(&router, &auth, "Movies", &harness.media_dir).await;
+    scan(&router, &auth).await;
+
+    let (_, page) = send(&router, &auth, "GET", "/Persons").await;
+    assert_eq!(names(&page), spellings, "{page}");
+    assert_eq!(page["TotalRecordCount"], 2, "{page}");
+    let mut ids = Vec::new();
+    for spelling in spellings {
+        let uri = format!("/Persons/{}", urlencoding(spelling));
+        let (status, person) = send(&router, &auth, "GET", &uri).await;
+        assert_eq!(status, StatusCode::OK, "{person}");
+        assert_eq!(person["Name"], spelling, "{person}");
+        ids.push(person["Id"].clone());
+    }
+    assert_ne!(ids[0], ids[1]);
+    let listed: Vec<_> = page["Items"]
+        .as_array()
+        .expect("Items")
+        .iter()
+        .map(|person| person["Id"].clone())
+        .collect();
+    assert_eq!(listed, ids, "{page}");
+
+    // Each film's credit opens the item of its own spelling.
+    let (_, films) = send(
+        &router,
+        &auth,
+        "GET",
+        "/Items?recursive=true&includeItemTypes=Movie&sortBy=SortName&fields=People",
+    )
+    .await;
+    let films = films["Items"].as_array().expect("Items");
+    assert_eq!(films.len(), 2);
+    for (film, (spelling, id)) in films.iter().zip(spellings.iter().zip(&ids)) {
+        let people = film["People"].as_array().expect("People");
+        assert_eq!(people.len(), 1, "{film}");
+        assert_eq!(people[0]["Name"], *spelling, "{film}");
+        assert_eq!(people[0]["Id"], *id, "{film}");
+    }
+}

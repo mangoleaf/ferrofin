@@ -2,7 +2,8 @@
 //! directory-writability probe the extraction paths pre-flight with — and the
 //! atomic and private (`0600` on Unix) writes Ferrofin's config, state and
 //! backup files go through, and the [`FileStamp`] a cache of a file's parsed
-//! contents is checked against.
+//! contents is checked against. With the `tokio` feature, `read_head` reads a
+//! file's first bytes.
 
 use std::io;
 use std::path::Path;
@@ -228,6 +229,24 @@ pub fn ensure_writable_dir<P: AsRef<Path>>(dir: P) -> io::Result<()> {
     // failed unlink must not turn a writable directory into an error.
     let _ = std::fs::remove_file(&probe);
     Ok(())
+}
+
+/// Reads exactly the first `N` bytes of the file at `path` (.NET's
+/// `FileStream.ReadExactly` over a fresh stream), without blocking the runtime.
+///
+/// # Errors
+///
+/// The I/O error from opening or reading; a file shorter than `N` bytes is
+/// `UnexpectedEof`.
+#[cfg(feature = "tokio")]
+pub async fn read_head<const N: usize>(path: &str) -> io::Result<[u8; N]> {
+    use tokio::io::AsyncReadExt;
+    let mut head = [0u8; N];
+    tokio::fs::File::open(path)
+        .await?
+        .read_exact(&mut head)
+        .await?;
+    Ok(head)
 }
 
 #[cfg(test)]

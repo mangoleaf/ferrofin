@@ -643,26 +643,6 @@ impl LibraryMonitor for FerrofinLibraryMonitor {
         self.restart_wake.notify_one();
     }
 
-    async fn report_file_system_change_beginning(&self, path: &str) -> Result<(), ServiceError> {
-        if path.is_empty() {
-            return Err(ServiceError::invalid_input("path can't be empty"));
-        }
-        SelfWriteGuard::begin(self, path);
-        Ok(())
-    }
-
-    async fn report_file_system_change_complete(
-        &self,
-        path: &str,
-        refresh_path: bool,
-    ) -> Result<(), ServiceError> {
-        if path.is_empty() {
-            return Err(ServiceError::invalid_input("path can't be empty"));
-        }
-        SelfWriteGuard::complete(self, path, refresh_path);
-        Ok(())
-    }
-
     async fn report_file_system_changed(&self, path: &str) -> Result<(), ServiceError> {
         self.report_change(path, ScanTrigger::Watcher).await
     }
@@ -1201,18 +1181,12 @@ mod tests {
         let monitor = FerrofinLibraryMonitor::new(Arc::new(FakeWatcher::default()), vec![]);
         let dir = "/media/movies/Solaris";
 
-        monitor
-            .report_file_system_change_beginning(dir)
-            .await
-            .expect("begin");
+        SelfWriteGuard::begin(&monitor, dir);
         assert!(monitor.is_path_suppressed(dir));
         // A change under the suppressed directory is ignored.
         assert!(monitor.is_path_suppressed(&format!("{dir}/poster.jpg")));
 
-        monitor
-            .report_file_system_change_complete(dir, false)
-            .await
-            .expect("complete");
+        SelfWriteGuard::complete(&monitor, dir, false);
         assert!(
             monitor.is_path_suppressed(dir),
             "still, while events settle"
@@ -1694,14 +1668,8 @@ mod tests {
         let scans = || library.scans.load(std::sync::atomic::Ordering::SeqCst);
         let dir = "/media/movies/Solaris";
         let file = format!("{dir}/Solaris.en.srt");
-        monitor
-            .report_file_system_change_beginning(&file)
-            .await
-            .expect("begin");
-        monitor
-            .report_file_system_change_complete(&file, false)
-            .await
-            .expect("complete");
+        SelfWriteGuard::begin(&monitor, &file);
+        SelfWriteGuard::complete(&monitor, &file, false);
         for path in [file.clone(), dir.to_owned(), format!("{dir}/")] {
             monitor
                 .report_file_system_changed(&path)
@@ -1776,10 +1744,7 @@ mod tests {
         let monitor = FerrofinLibraryMonitor::new(Arc::new(FakeWatcher::default()), vec![])
             .with_refresh_target(library.clone());
         let dir = "/media/movies/Solaris";
-        monitor
-            .report_file_system_change_beginning(dir)
-            .await
-            .expect("begin");
+        SelfWriteGuard::begin(&monitor, dir);
         // A change under a server-write-suppressed dir must not trigger a rescan.
         monitor
             .report_file_system_changed(&format!("{dir}/poster.jpg"))

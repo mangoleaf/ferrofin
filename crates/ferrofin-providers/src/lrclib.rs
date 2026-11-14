@@ -240,7 +240,7 @@ impl LrcLibProvider {
     #[must_use]
     pub fn with_config(config: LrcLibConfig) -> Self {
         Self {
-            http: reqwest::Client::new(),
+            http: crate::http_client::client(),
             limiter: RateLimiter::new("lrclib"),
             config,
             base_url: BASE_URL.to_owned(),

@@ -152,6 +152,7 @@ impl CollectionsLibrary {
                     &self.db,
                     BaseItemKind::Folder,
                     &self.path,
+                    &self.virtual_paths.reverse(&self.path),
                     &self.mode,
                 )
                 .await?

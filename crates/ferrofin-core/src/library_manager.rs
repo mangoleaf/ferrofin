@@ -11,9 +11,9 @@
 //! pool directly, so the manager stays composition-root agnostic.
 //!
 //! Port simplifications, all faithful to the trait surface:
-//! - `create_items`/`update_items` collapse to `save_items` on the persistence
-//!   service (the row upsert is idempotent); the `parent_id` argument is accepted
-//!   for API parity but the parent linkage is already carried on each row's
+//! - `update_items` collapses to `save_items` on the persistence service (the
+//!   row upsert is idempotent); the `parent_id` argument is accepted for API
+//!   parity but the parent linkage is already carried on each row's
 //!   `ParentId` column. `update_items` is the edit's save, so first it does
 //!   what `UpdateItemsAsync` and the mapper do to a loaded item: it re-derives
 //!   `SortName` (a caller that must keep a key it supplies saves through the
@@ -2008,7 +2008,8 @@ impl FerrofinLibraryManager {
     /// [kind] }).FirstOrDefault()`). Shared by [`get_named_items`], which then
     /// adds the `CreateItemByName` write, and by `find_named_item`, which does
     /// not — the same split C# makes between `GetGenre` and
-    /// `GetItemFromSlugName`.
+    /// `GetItemFromSlugName`. A `Person` is read by id instead
+    /// ([`Self::resolve_person_rows`]).
     ///
     /// [`get_named_items`]: ferrofin_traits::library::LibraryManager::get_named_items
     async fn resolve_named_rows(
@@ -2016,6 +2017,9 @@ impl FerrofinLibraryManager {
         kind: BaseItemKind,
         trimmed: &[String],
     ) -> Result<Vec<Option<BaseItemEntity>>, ServiceError> {
+        if kind == BaseItemKind::Person {
+            return self.resolve_person_rows(trimmed).await;
+        }
         let lookup: Vec<String> = trimmed.iter().filter(|n| !n.is_empty()).cloned().collect();
         if lookup.is_empty() {
             return Ok(vec![None; trimmed.len()]);
@@ -2045,6 +2049,35 @@ impl FerrofinLibraryManager {
                     by_clean.get(&crate::text_util::get_clean_value(n)).cloned()
                 }
             })
+            .collect())
+    }
+
+    /// `LibraryManager.GetPerson` for each of `names`: the `Person` row at the
+    /// id the name derives
+    /// ([`find_person_item_ids`](ferrofin_traits::persistence::PeopleRepository::find_person_item_ids)),
+    /// one slot per name. Not the first row with the name's `CleanName`:
+    /// spellings sharing one are each their own person upstream.
+    async fn resolve_person_rows(
+        &self,
+        names: &[String],
+    ) -> Result<Vec<Option<BaseItemEntity>>, ServiceError> {
+        let ids = self.people.find_person_item_ids(names).await?;
+        let mut found: Vec<Uuid> = ids.iter().flatten().copied().collect();
+        found.sort_unstable();
+        found.dedup();
+        let rows: HashMap<Uuid, BaseItemEntity> = if found.is_empty() {
+            HashMap::new()
+        } else {
+            self.items
+                .retrieve_items(&found)
+                .await?
+                .into_iter()
+                .filter_map(|row| Some((Uuid::parse_str(&row.id).ok()?, row)))
+                .collect()
+        };
+        Ok(ids
+            .into_iter()
+            .map(|id| id.and_then(|id| rows.get(&id).cloned()))
             .collect())
     }
 
@@ -2130,9 +2163,10 @@ impl FerrofinLibraryManager {
 /// handled, is [`crate::item_deletion`]'s.
 impl FerrofinLibraryManager {
     /// A stored path with Jellyfin's `%AppDataPath%`/`%MetadataPath%` tokens
-    /// expanded (a collection's or playlist's folder is stored that way, an
-    /// adopted one's and one Ferrofin created alike); Ferrofin's other rows
-    /// carry resolved paths.
+    /// expanded: every row under the data or metadata directory is stored
+    /// that way, an adopted one's and one Ferrofin saved alike (gl-1581); a
+    /// row an earlier Ferrofin saved there may still carry the resolved path
+    /// (gl-1616).
     fn expand_path(&self, stored: &str) -> String {
         self.app_paths.as_ref().map_or_else(
             || stored.to_owned(),
@@ -2946,7 +2980,11 @@ impl LibraryManager for FerrofinLibraryManager {
         Ok(Some(ferrofin_traits::options::ItemImageInfo {
             path,
             image_type: ferrofin_model::entities::ImageType::Chapter,
-            date_modified: chapter.image_date_modified.unwrap_or_else(chrono::Utc::now),
+            // `GetValueOrDefault()` upstream: a NULL date is `MinValue`, the
+            // same date the chapter's DTO tag is computed from.
+            date_modified: chapter
+                .image_date_modified
+                .unwrap_or_else(ferrofin_model::json::datetime::dotnet_min),
             width: 0,
             height: 0,
             blur_hash: None,
@@ -3123,7 +3161,11 @@ impl LibraryManager for FerrofinLibraryManager {
         // same first-match-wins — over a two-column projection, because the
         // caller wants the id and nothing else. On a cast-heavy page this is the
         // difference between decoding one 72-column row per credited name and
-        // decoding two columns.
+        // decoding two columns. A `Person` is read by its derived id
+        // (`GetPerson`), never by clean name.
+        if kind == BaseItemKind::Person {
+            return self.people.find_person_item_ids(names).await;
+        }
         let trimmed: Vec<String> = names.iter().map(|n| n.trim().to_owned()).collect();
         let lookup: Vec<String> = trimmed.iter().filter(|n| !n.is_empty()).cloned().collect();
         if lookup.is_empty() {
@@ -3165,33 +3207,6 @@ impl LibraryManager for FerrofinLibraryManager {
         self.items
             .get_latest_item_list(query, collection_type)
             .await
-    }
-
-    async fn create_items(
-        &self,
-        items: &[BaseItemEntity],
-        _parent_id: Option<Uuid>,
-    ) -> Result<(), ServiceError> {
-        if items.is_empty() {
-            return Ok(());
-        }
-        // v12.2 `CreateItems` runs `OnMetadataChanged` on each item first: the
-        // parental filters read the stored score, so it must match the ratings
-        // saved.
-        let mut rated = items.to_vec();
-        if let Some(visibility) = &self.visibility {
-            visibility.update_rating_scores(&mut rated).await?;
-        }
-        // The parent linkage is already carried on each row's ParentId column; the
-        // upsert is the single persistence path (C# CreateItems == save + register).
-        self.persistence.save_items(&rated).await?;
-        // `ItemAdded` (LibraryChangedNotifier): announce only after the write
-        // succeeded, so a failed save never tells clients to fetch a row that
-        // is not there.
-        if let Some(changed) = &self.changed {
-            changed.record_added(&rated);
-        }
-        Ok(())
     }
 
     async fn update_items(
@@ -3275,11 +3290,15 @@ impl LibraryManager for FerrofinLibraryManager {
         item_id: Uuid,
         provider_ids: &[(String, String)],
     ) -> Result<(), ServiceError> {
-        // An assignment, not a merge (C# `item.ProviderIds = request.ProviderIds`):
-        // `replace_provider_ids` deletes the rows the new set lacks and upserts
-        // the rest in one transaction.
+        // `item.SetProviderIds(request.ProviderIds)` (v12.4
+        // `ItemUpdateController.UpdateItem`): an assignment, not a merge, of the
+        // pairs `TrySetProviderId` keeps. `replace_provider_ids` deletes the rows
+        // the new set lacks and upserts the rest in one transaction.
+        let provider_ids = ferrofin_providers::metadata_merge::set_provider_ids(
+            provider_ids.iter().map(|(k, v)| (k.as_str(), v.as_str())),
+        );
         self.persistence
-            .replace_provider_ids(item_id, provider_ids)
+            .replace_provider_ids(item_id, &provider_ids)
             .await?;
         self.edited([item_id]);
         // The edit's save copies the new ids to the item's local versions
@@ -4849,6 +4868,9 @@ mod tests {
 
         tasks.queue("RefreshLibrary").expect("queued");
         runner.started(1).await;
+        // The run reports 0 before the scan reports anything
+        // (`RefreshMediaLibraryTask`'s `progress.Report(0)`): 0 %, not none.
+        assert_eq!(info(&tasks).current_progress_percentage, Some(0.0));
         runner.release(1);
         for _ in 0..500 {
             if info(&tasks).current_progress_percentage == Some(48.0) {
@@ -4932,6 +4954,70 @@ mod tests {
             "a refused scan cancels the run"
         );
         assert_eq!(runner.runs().len(), 1, "nothing ran after shutdown");
+    }
+
+    /// `POST /Library/Refresh` over a running "Scan Media Library"
+    /// (`CancelIfRunningAndQueue`): the stop reaches the run's scan wait, so
+    /// the run ends Cancelled at once rather than after the stop's drop wait;
+    /// the scan it leaves stops at its next item; and the queued run's own
+    /// scan starts only after that one.
+    #[tokio::test]
+    async fn a_refresh_over_a_running_scan_task_cancels_it_and_scans_after_it() {
+        use crate::scheduled_tasks::{FerrofinTaskManager, RefreshLibraryTask};
+        use ferrofin_model::tasks::{TaskCompletionStatus, TaskState};
+        use ferrofin_traits::tasks::TaskManager as _;
+        let db = test_db().await;
+        let runner = GatedRunner::new();
+        let mgr = manager(&db).with_scan_runner(runner.clone());
+        let tasks = FerrofinTaskManager::new();
+        tasks.register(Arc::new(RefreshLibraryTask::new(Arc::new(mgr.clone()))));
+        let id = ferrofin_traits::tasks::task_id_for_key("RefreshLibrary");
+
+        tasks.queue("RefreshLibrary").expect("queued");
+        runner.started(1).await;
+        let stopped = std::time::Instant::now();
+        tasks
+            .cancel_if_running_and_queue(&id)
+            .await
+            .expect("refresh");
+        // The first run has recorded Cancelled and the queued one runs.
+        for _ in 0..500 {
+            let info = tasks.get("RefreshLibrary").expect("task");
+            if info.state == TaskState::Running
+                && info
+                    .last_execution_result
+                    .is_some_and(|r| r.status == TaskCompletionStatus::Cancelled)
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(
+            stopped.elapsed() < crate::scheduled_tasks::STOP_WAIT,
+            "the stop reached the scan wait, not the drop"
+        );
+        assert_eq!(runner.runs().len(), 1, "no scan beside the stopping one");
+
+        // The left scan finishes its item in progress, then stops; the
+        // replacement's scan runs after it.
+        runner.release(1);
+        runner.started(2).await;
+        runner.release(GatedRunner::ITEMS);
+        for _ in 0..500 {
+            if tasks.get("RefreshLibrary").expect("task").state == TaskState::Idle {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let done = tasks.get("RefreshLibrary").expect("task");
+        assert_eq!(done.state, TaskState::Idle);
+        assert_eq!(
+            done.last_execution_result.expect("result").status,
+            TaskCompletionStatus::Completed
+        );
+        let runs = runner.runs();
+        assert!(runs[0].stopped, "the left scan stopped at its next item");
+        assert_eq!(runs[1].items, GatedRunner::ITEMS);
     }
 
     /// The host's teardown: the running scan stops at its next item
@@ -5612,6 +5698,43 @@ mod tests {
         );
     }
 
+    /// gl-1590: a chapter image whose row carries no date is served dated
+    /// `MinValue`, as upstream reads it (`GetValueOrDefault()`), not "now".
+    #[tokio::test]
+    async fn a_chapter_image_without_a_date_is_dated_min_value() {
+        use ferrofin_traits::persistence::ChapterRepository as _;
+        let db = test_db().await;
+        let item = Uuid::new_v4();
+        seed_item(&db, item, BaseItemKind::Movie).await;
+        let chapters = Arc::new(crate::chapter_repository::FerrofinChapterRepository::new(
+            db.clone(),
+        ));
+        chapters
+            .save_chapters(
+                item,
+                &[ferrofin_db::entities::base_items::ChapterEntity {
+                    item_id: item.to_string(),
+                    chapter_index: 0,
+                    start_position_ticks: 0,
+                    name: None,
+                    image_path: Some("/meta/chapters/0.jpg".to_owned()),
+                    image_date_modified: None,
+                }],
+            )
+            .await
+            .expect("save");
+        let mgr = manager(&db).with_chapters(chapters);
+        let image = mgr
+            .get_chapter_image(item, 0)
+            .await
+            .expect("image")
+            .expect("present");
+        assert_eq!(
+            image.date_modified,
+            ferrofin_model::json::datetime::dotnet_min()
+        );
+    }
+
     /// Builds a manager backed by real repositories over the given database.
     fn manager(db: &Database) -> FerrofinLibraryManager {
         let lookup: Arc<dyn ferrofin_traits::persistence::ItemTypeLookup> =
@@ -5754,10 +5877,10 @@ mod tests {
         );
     }
 
-    /// v12.2 `CreateItems` and `UpdateItemsAsync` run `OnMetadataChanged` on
-    /// each item before it is saved (`ParentalRatingScoreTests`): a created
-    /// item stores its score, a custom rating wins over the official one, and
-    /// clearing the ratings clears the score.
+    /// v12.2 `UpdateItemsAsync` runs `OnMetadataChanged` on each item before
+    /// it is saved (`ParentalRatingScoreTests`): a saved item stores its
+    /// score, a custom rating wins over the official one, and clearing the
+    /// ratings clears the score.
     #[tokio::test]
     async fn saved_items_store_the_score_of_their_ratings() {
         let db = test_db().await;
@@ -5789,7 +5912,7 @@ mod tests {
             custom_rating: Some("NC-17".to_owned()),
             ..BaseItemEntity::default()
         };
-        mgr.create_items(&[movie], None).await.expect("create");
+        mgr.update_items(&[movie], None).await.expect("first save");
         assert_eq!(
             stored().await.inherited_parental_rating_value,
             score("NC-17")
@@ -6108,7 +6231,7 @@ mod tests {
     }
 
     /// The metadata editor's external ids reach the `BaseItemProviders` table and
-    /// REPLACE what was there — the write behind C# `item.ProviderIds = request.ProviderIds`.
+    /// REPLACE what was there — the write behind C# `item.SetProviderIds(request.ProviderIds)`.
     #[tokio::test]
     async fn update_item_provider_ids_replaces_the_stored_set() {
         let db = test_db().await;
@@ -6145,6 +6268,48 @@ mod tests {
             .await
             .expect("lookup by the replaced id");
         assert!(stale.is_empty(), "the replaced key is gone, not merged");
+    }
+
+    /// The editor's set goes through `SetProviderIds` (v12.4
+    /// `ItemUpdateController.UpdateItem`): trimmed, an empty or invalid id
+    /// dropped, a known name in its canonical spelling.
+    #[tokio::test]
+    async fn update_item_provider_ids_sanitizes_the_set() {
+        let db = test_db().await;
+        let id = Uuid::from_u128(0x7B);
+        seed_named_item(&db, id, BaseItemKind::Movie, "Heat").await;
+        let mgr = manager(&db);
+
+        let pairs = |list: &[(&str, &str)]| -> Vec<(String, String)> {
+            list.iter()
+                .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+                .collect()
+        };
+        mgr.update_item_provider_ids(
+            id,
+            &pairs(&[
+                ("Imdb", " tt0113277 "),
+                ("Tmdb", "nm0000123"),
+                ("TmdbCollection", "   "),
+                ("tvdb", "81189"),
+                ("Custom", " x "),
+            ]),
+        )
+        .await
+        .expect("write");
+
+        let store = FerrofinItemPersistenceService::new(db.clone());
+        let mut stored = store
+            .provider_ids_for_items(&[id])
+            .await
+            .expect("ids")
+            .remove(&id)
+            .unwrap_or_default();
+        stored.sort();
+        assert_eq!(
+            stored,
+            pairs(&[("Custom", "x"), ("Imdb", "tt0113277"), ("Tvdb", "81189")])
+        );
     }
 
     #[tokio::test]
@@ -6602,23 +6767,24 @@ mod tests {
     /// Two rows of the SAME kind sharing a `CleanName` must resolve to the same
     /// id every time — the resolver keeps the FIRST match.
     ///
-    /// Person rows have `SortName IS NULL`, so the resolver's bare
+    /// The seeded rows have `SortName IS NULL`, so the resolver's bare
     /// `ORDER BY SortName` is a total tie among duplicates and the row order is
     /// whatever the sorter emits. Keeping the first match is what makes the
     /// answer stable and makes it agree with `get_named_items`. Flipping
     /// `or_insert` to `insert` (last-match-wins) passed all 4,221 other tests.
+    /// (A `Person` is read by id instead, gl-1079.)
     #[tokio::test]
     async fn duplicate_names_of_one_kind_resolve_to_the_first_match() {
         let db = test_db().await;
         for n in [0x230u128, 0x231, 0x232] {
             let id = Uuid::from_u128(n);
-            seed_named_item(&db, id, BaseItemKind::Person, "Jane Doe").await;
+            seed_named_item(&db, id, BaseItemKind::Genre, "Jane Doe").await;
             set_clean_name(&db, id, "Jane Doe").await;
         }
         let mgr = manager(&db);
 
         let first = mgr
-            .get_named_item_ids(BaseItemKind::Person, &["Jane Doe".to_owned()])
+            .get_named_item_ids(BaseItemKind::Genre, &["Jane Doe".to_owned()])
             .await
             .expect("ids");
         assert_eq!(first.len(), 1, "one name in, one slot out");
@@ -6626,7 +6792,7 @@ mod tests {
 
         // It must be the same id the row-returning resolver picks...
         let rows = mgr
-            .get_named_items(BaseItemKind::Person, &["Jane Doe".to_owned()])
+            .get_named_items(BaseItemKind::Genre, &["Jane Doe".to_owned()])
             .await
             .expect("rows");
         assert_eq!(
@@ -6638,7 +6804,7 @@ mod tests {
         // ...and it must not drift between calls.
         for round in 0..5 {
             let again = mgr
-                .get_named_item_ids(BaseItemKind::Person, &["Jane Doe".to_owned()])
+                .get_named_item_ids(BaseItemKind::Genre, &["Jane Doe".to_owned()])
                 .await
                 .expect("ids");
             assert_eq!(
@@ -6647,6 +6813,78 @@ mod tests {
                 "round {round}: the resolved id must be stable across calls"
             );
         }
+    }
+
+    /// gl-1079: `GetPerson(name)` reads the item at the id that spelling
+    /// derives. Two rows sharing a clean name, as an adopted Jellyfin database
+    /// holds them, are two people to every person read: the listing, the
+    /// single lookup and the DTO's id-only lookup. Before, each name read the
+    /// first row with the clean name, so the listing showed one spelling twice.
+    #[tokio::test]
+    async fn person_reads_take_each_spellings_own_row() {
+        let db = test_db().await;
+        let people_root = tempfile::tempdir().expect("people root");
+        let mode = crate::item_type_lookup::IdDerivation::Jellyfin {
+            program_data_path: None,
+        };
+        let root = people_root.path().to_string_lossy().into_owned();
+        let lookup: Arc<dyn ferrofin_traits::persistence::ItemTypeLookup> =
+            Arc::new(ItemTypeLookup::new());
+        let mgr = FerrofinLibraryManager::new(
+            Arc::new(FerrofinItemRepository::new(db.clone(), lookup)),
+            Arc::new(FerrofinItemCountService::new(db.clone())),
+            Arc::new(FerrofinItemPersistenceService::new(db.clone())),
+            Arc::new(
+                FerrofinPeopleRepository::new(db.clone()).with_identity(mode.clone(), root.clone()),
+            ),
+        );
+        let spellings = ["H Jon Benjamin".to_owned(), "H. Jon Benjamin".to_owned()];
+        let movie = Uuid::from_u128(0x1079);
+        seed_item(&db, movie, BaseItemKind::Movie).await;
+        let mut ids = Vec::new();
+        for (offset, name) in (1u128..).zip(&spellings) {
+            let id = crate::item_type_lookup::person_item_id(&mode, &root, name).expect("id");
+            seed_named_item(&db, id, BaseItemKind::Person, name).await;
+            set_clean_name(&db, id, name).await;
+            crate::people_repository::seed_credit(
+                &db,
+                movie,
+                Uuid::from_u128(0x1079 + offset),
+                name,
+            )
+            .await;
+            ids.push(id);
+        }
+
+        let rows = mgr
+            .get_named_items(BaseItemKind::Person, &spellings)
+            .await
+            .expect("rows");
+        let row_ids: Vec<Option<String>> = rows
+            .iter()
+            .map(|r| r.as_ref().map(|r| r.id.clone()))
+            .collect();
+        let expected: Vec<Option<String>> = ids.iter().map(|id| Some(guid_to_db(*id))).collect();
+        assert_eq!(row_ids, expected);
+        assert_eq!(
+            mgr.get_named_item_ids(BaseItemKind::Person, &spellings)
+                .await
+                .expect("ids"),
+            ids.iter().copied().map(Some).collect::<Vec<_>>()
+        );
+        let second = mgr
+            .get_named_item(BaseItemKind::Person, " H. Jon Benjamin ")
+            .await
+            .expect("lookup")
+            .expect("the second spelling resolves");
+        assert_eq!(second.name.as_deref(), Some("H. Jon Benjamin"));
+
+        let page = mgr
+            .get_people_items(&InternalPeopleQuery::default())
+            .await
+            .expect("people");
+        let names: Vec<Option<&str>> = page.items.iter().map(|p| p.name.as_deref()).collect();
+        assert_eq!(names, [Some("H Jon Benjamin"), Some("H. Jon Benjamin")]);
     }
 
     // The id-only twin of the batch resolver: the DTO prefetch resolves a page's

@@ -84,6 +84,7 @@ fn a_path_needing_no_rewrite_allocates_nothing() {
         "/Items",
         "/Items/AbC-123/Images/Primary",
         "/Videos/AbC-123/hls1/main/segment.mp4",
+        "/Plugins/AbC-123/web/Dir/a.js",
         "/web/ConfigurationPage",
         "/web/index.html",
         "/web/assets/img/banner-light.png",

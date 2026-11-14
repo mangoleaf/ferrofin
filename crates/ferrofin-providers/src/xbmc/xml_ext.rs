@@ -1,11 +1,12 @@
 //! Value-parsing helpers for the NFO cursor — port of
 //! `MediaBrowser.Controller.Extensions.XmlReaderExtensions` plus the small
-//! `ProviderIdParsers` / `TvParserHelpers` / `TVUtils.GetAirDays` helpers the
-//! parsers call, and the internal `GetImageType` / `LeftPart` utilities.
+//! `TvParserHelpers` / `TVUtils.GetAirDays` helpers the parsers call, and the
+//! internal `GetImageType` / `LeftPart` utilities. The IMDb/TMDb/TVDb id
+//! scanners (`ProviderIdParsers`) are `ferrofin_common::providers`.
 //!
 //! These operate on the [`XmlCursor`] from [`super::xml_reader`] and re-create
 //! the C# extension-method semantics one-for-one (invariant-culture parsing,
-//! trimming, comma/pipe/semicolon splitting, the IMDb/TMDb/TVDb id scanners).
+//! trimming, comma/pipe/semicolon splitting).
 
 use chrono::{DateTime, NaiveDate, NaiveDateTime, TimeZone, Utc};
 use ferrofin_model::data::PersonKind;
@@ -276,76 +277,4 @@ pub fn try_parse_series_status(status: &str) -> Option<SeriesStatus> {
         return Some(SeriesStatus::Ended);
     }
     None
-}
-
-/// Provider-id URL scanners — port of `MediaBrowser.Common.Providers.ProviderIdParsers`.
-pub mod provider_id_parsers {
-    const IMDB_MIN_NUMBERS: usize = 7;
-    const IMDB_MAX_NUMBERS: usize = 8;
-    const IMDB_PREFIX: &str = "tt";
-
-    /// Finds an IMDb id (`tt` + 7–8 digits) anywhere in `text`
-    /// (`ProviderIdParsers.TryFindImdbId`).
-    #[must_use]
-    pub fn try_find_imdb_id(text: &str) -> Option<String> {
-        let chars: Vec<char> = text.chars().collect();
-        let mut slice: &[char] = &chars;
-
-        while slice.len() >= 2 + IMDB_MIN_NUMBERS {
-            let tt_pos = find_subslice(slice, IMDB_PREFIX)?;
-            slice = &slice[tt_pos..];
-
-            let mut i = 2;
-            let limit = slice.len().min(IMDB_MAX_NUMBERS + 2);
-            while i < limit && slice[i].is_ascii_digit() {
-                i += 1;
-            }
-
-            if (IMDB_MIN_NUMBERS + 2..=IMDB_MAX_NUMBERS + 2).contains(&i) {
-                return Some(slice[..i].iter().collect());
-            }
-
-            slice = &slice[i..];
-        }
-
-        None
-    }
-
-    /// Finds a TMDb movie id from a `themoviedb.org/movie/<id>` URL
-    /// (`ProviderIdParsers.TryFindTmdbMovieId`).
-    #[must_use]
-    pub fn try_find_tmdb_movie_id(text: &str) -> Option<String> {
-        try_find_provider_id(text, "themoviedb.org/movie/")
-    }
-
-    /// Finds a TMDb series id from a `themoviedb.org/tv/<id>` URL
-    /// (`ProviderIdParsers.TryFindTmdbSeriesId`).
-    #[must_use]
-    pub fn try_find_tmdb_series_id(text: &str) -> Option<String> {
-        try_find_provider_id(text, "themoviedb.org/tv/")
-    }
-
-    /// Finds a TVDb id from a `thetvdb.com/?tab=series&id=<id>` URL
-    /// (`ProviderIdParsers.TryFindTvdbId`).
-    #[must_use]
-    pub fn try_find_tvdb_id(text: &str) -> Option<String> {
-        try_find_provider_id(text, "thetvdb.com/?tab=series&id=")
-    }
-
-    /// Scans the digits immediately following `search` in `text`.
-    fn try_find_provider_id(text: &str, search: &str) -> Option<String> {
-        let idx = text.find(search)?;
-        let rest = &text[idx + search.len()..];
-        let id: String = rest.chars().take_while(char::is_ascii_digit).collect();
-        if id.is_empty() { None } else { Some(id) }
-    }
-
-    /// Finds the first index of `needle` in `haystack` (char-slice `IndexOf`).
-    fn find_subslice(haystack: &[char], needle: &str) -> Option<usize> {
-        let needle: Vec<char> = needle.chars().collect();
-        if needle.is_empty() || haystack.len() < needle.len() {
-            return None;
-        }
-        (0..=haystack.len() - needle.len()).find(|&i| haystack[i..i + needle.len()] == needle[..])
-    }
 }

@@ -1051,8 +1051,9 @@ impl FerrofinTrickplayManager {
         }
         Ok(())
     }
-    /// Scan callers supply the fresh probe context; scheduled tasks read it
-    /// from the repository. Both use one extraction and storage implementation.
+    /// The scan and Generate Trickplay Images hand in the row and streams
+    /// they hold; the by-id forms read them from the repository. All use one
+    /// extraction and storage implementation.
     ///
     /// `check` is a checking pass ([`TrickplayManager::check_trickplay_data`]),
     /// for which this returns whether the item's sets now match
@@ -1512,6 +1513,25 @@ impl TrickplayManager for FerrofinTrickplayManager {
     ) -> Result<bool, ServiceError> {
         self.refresh_stored(item_id, false, Some(check), library_options)
             .await
+    }
+
+    async fn check_trickplay_for_media(
+        &self,
+        item_id: Uuid,
+        entity: &BaseItemEntity,
+        streams: &[ferrofin_db::entities::base_items::MediaStreamInfoEntity],
+        check: &TrickplayCheck,
+        library_options: &LibraryOptions,
+    ) -> Result<bool, ServiceError> {
+        self.refresh_media(
+            item_id,
+            entity,
+            streams.iter().cloned().map(stream_to_dto).collect(),
+            false,
+            Some(check),
+            library_options,
+        )
+        .await
     }
 
     async fn finish_trickplay_pass(&self, check: &TrickplayCheck) -> Result<(), ServiceError> {

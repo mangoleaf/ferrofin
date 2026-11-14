@@ -411,10 +411,11 @@ impl<F: FileMeta> ImageProcessor<F> {
 }
 
 /// The 25 container/extension formats the processor advertises as readable
-/// input. Port of the C# `SupportedInputFormats` set (order preserved; the
-/// lookup itself is case-insensitive in C#, but the set is only ever surfaced,
-/// not matched against, in this unit).
-const SUPPORTED_INPUT_FORMATS: [&str; 25] = [
+/// input, without the dot. Port of `ImageProcessor.SupportedInputFormats`
+/// (order preserved), which `PhotoResolver.IsImageFile` tests a file's
+/// extension against, case-insensitively, to decide it is a photo. Not the
+/// encoder's list, which is `image_encoder`'s own.
+pub const SUPPORTED_INPUT_FORMATS: [&str; 25] = [
     "tiff", "tif", "jpeg", "jpg", "png", "cr2", "crw", "nef", "orf", "pef", "arw", "webp", "gif",
     "bmp", "erf", "raf", "rw2", "nrw", "dng", "ico", "astc", "ktx", "pkm", "wbmp", "avif",
 ];
@@ -832,8 +833,8 @@ impl<F: FileMeta + 'static> ImageProcessor<F> {
 mod tests {
     //! Round-trip cases transliterated from `ImageProcessor.cs`: the cache tag is
     //! a stable 32-char hex sensitive to path and ticks; the cache key changes per
-    //! option and carries `v=3`; default options pass the original through; a
-    //! resize produces then hits the cache.
+    //! option and carries `v=` and [`DEFAULT_CACHE_VERSION`]; default options pass
+    //! the original through; a resize produces then hits the cache.
     use super::*;
     use crate::error::DrawingError;
     use crate::image_encoder::ImageCrateEncoder;

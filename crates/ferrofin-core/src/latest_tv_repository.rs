@@ -46,7 +46,9 @@ struct EpisodeRow {
     id: String,
     series_name: Option<String>,
     date_created: Option<DateTime<Utc>>,
+    #[sqlx(try_from = "ferrofin_db::entities::unset::NonNilGuid")]
     season_id: Option<String>,
+    #[sqlx(try_from = "ferrofin_db::entities::unset::NonNilGuid")]
     series_id: Option<String>,
 }
 

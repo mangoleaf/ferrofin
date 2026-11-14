@@ -62,6 +62,9 @@ pub struct MockServer {
     handle: tokio::task::JoinHandle<()>,
     requests: Arc<AtomicUsize>,
     targets: Arc<Mutex<Vec<String>>>,
+    /// The head of each request a [`start_raw`](Self::start_raw) server had,
+    /// lower-cased.
+    heads: Arc<Mutex<Vec<String>>>,
     /// The port held on `::1` ([`loopback_listener`]).
     _ipv6: Option<TcpSocket>,
 }
@@ -140,6 +143,7 @@ impl MockServer {
             handle,
             requests: Arc::default(),
             targets,
+            heads: Arc::default(),
             _ipv6: ipv6,
         }
     }
@@ -190,6 +194,7 @@ impl MockServer {
             handle,
             requests: Arc::default(),
             targets: Arc::default(),
+            heads: Arc::default(),
             _ipv6: ipv6,
         }
     }
@@ -200,16 +205,20 @@ impl MockServer {
     async fn start_raw_inner(responses: Vec<Vec<u8>>, stall: bool) -> Self {
         let responses = Arc::new(responses);
         let requests = Arc::new(AtomicUsize::new(0));
+        let heads = Arc::new(Mutex::new(Vec::new()));
         let (listener, ipv6) = bind().await;
         let port = listener.local_addr().expect("addr").port();
         let handle = tokio::spawn({
-            let requests = Arc::clone(&requests);
+            let (requests, heads) = (Arc::clone(&requests), Arc::clone(&heads));
             async move {
                 while let Ok((mut sock, _)) = listener.accept().await {
                     let (responses, requests) = (Arc::clone(&responses), Arc::clone(&requests));
+                    let heads = Arc::clone(&heads);
                     tokio::spawn(async move {
                         let mut buf = vec![0u8; 16 * 1024];
-                        let _ = sock.read(&mut buf).await;
+                        let n = sock.read(&mut buf).await.unwrap_or(0);
+                        let head = String::from_utf8_lossy(&buf[..n]).to_ascii_lowercase();
+                        heads.lock().expect("lock").push(head);
                         let nth = requests.fetch_add(1, Ordering::SeqCst);
                         let response = &responses[nth.min(responses.len() - 1)];
                         let _ = sock.write_all(response).await;
@@ -226,6 +235,7 @@ impl MockServer {
             handle,
             requests,
             targets: Arc::default(),
+            heads,
             _ipv6: ipv6,
         }
     }
@@ -243,6 +253,12 @@ impl MockServer {
     /// The requests a [`start_raw`](Self::start_raw) server has had.
     pub fn requests(&self) -> usize {
         self.requests.load(Ordering::SeqCst)
+    }
+
+    /// The head of each request a [`start_raw`](Self::start_raw) server has
+    /// had, lower-cased, in order of arrival.
+    pub fn heads(&self) -> Vec<String> {
+        self.heads.lock().expect("lock").clone()
     }
 
     /// The decoded `key` query parameter of each request to `path`, in order of

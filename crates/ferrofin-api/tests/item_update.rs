@@ -18,7 +18,7 @@ use ferrofin_api::create_router;
 use ferrofin_api::state::AppState;
 use ferrofin_api::test_support::{
     FakeConfig, FakeMediaSources, FakeMusic, FakeSearch, FakeSessions, FakeSimilarItems,
-    FakeSystem, FakeUserData, FakeUserViews,
+    FakeSystem, FakeUserData, FakeUserViews, FixedAuth, fake_user_entity,
 };
 use ferrofin_db::entities::base_items::{BaseItemEntity, PeopleEntity};
 use ferrofin_db::entities::users::UserEntity;
@@ -31,7 +31,6 @@ use ferrofin_model::querying::QueryResult;
 use ferrofin_traits::dto::DtoService;
 use ferrofin_traits::error::ServiceError;
 use ferrofin_traits::library::{LibraryManager, ScanTarget, UserManager};
-use ferrofin_traits::net::{AuthService, AuthorizationContext, RequestContext};
 use ferrofin_traits::options::{
     AuthorizationInfo, DeleteOptions, DtoOptions, InternalItemsQuery, InternalPeopleQuery,
 };
@@ -51,38 +50,8 @@ const MISSING_ID: Uuid = Uuid::from_u128(0xDEAD);
 /// Builds a minimal [`UserEntity`] carrying the given id + username.
 fn user_entity(id: Uuid, username: &str) -> UserEntity {
     UserEntity {
-        id: id.to_string(),
-        audio_language_preference: None,
-        authentication_provider_id: String::new(),
-        cast_receiver_id: None,
-        display_collections_view: false,
-        display_missing_episodes: false,
-        enable_auto_login: false,
-        enable_local_password: false,
-        enable_next_episode_auto_play: false,
-        enable_user_preference_access: false,
-        hide_played_in_latest: false,
-        internal_id: 0,
-        invalid_login_attempt_count: 0,
-        last_activity_date: None,
-        last_login_date: None,
-        login_attempts_before_lockout: None,
-        max_active_sessions: 0,
-        max_parental_rating_score: None,
-        max_parental_rating_sub_score: None,
-        must_update_password: false,
         password: Some("hashed".to_owned()),
-        password_reset_provider_id: String::new(),
-        play_default_audio_track: false,
-        remember_audio_selections: false,
-        remember_subtitle_selections: false,
-        remote_client_bitrate_limit: None,
-        row_version: 0,
-        subtitle_language_preference: None,
-        subtitle_mode: 0,
-        sync_play_access: 0,
-        username: username.to_owned(),
-        normalized_username: username.to_uppercase(),
+        ..fake_user_entity(id, username)
     }
 }
 
@@ -165,42 +134,19 @@ fn base_item_entity(id: Uuid) -> BaseItemEntity {
     }
 }
 
-/// An [`AuthService`]/[`AuthorizationContext`] that authenticates as [`USER_ID`].
+/// An `AuthService`/`AuthorizationContext` that authenticates as [`USER_ID`].
 /// Every route this file covers — `POST /Items/{itemId}`, `ContentType`,
 /// `MetadataEditor`, `Refresh`, `ExternalIdInfos` — is `RequiresElevation` upstream,
 /// so this stub authenticates as an API key — which satisfies the policy
 /// without a user/policy lookup, exactly as C# does. The gate itself is pinned
 /// end to end in `apps/ferrofin-server/tests/elevation.rs`.
-struct OkAuth;
-
-#[async_trait]
-impl AuthService for OkAuth {
-    async fn authenticate(
-        &self,
-        _request: &RequestContext,
-    ) -> Result<AuthorizationInfo, ServiceError> {
-        Ok(AuthorizationInfo {
-            user: Some(Arc::new(user_entity(USER_ID, "alice"))),
-            is_api_key: true,
-            is_authenticated: true,
-            ..AuthorizationInfo::default()
-        })
-    }
-}
-
-#[async_trait]
-impl AuthorizationContext for OkAuth {
-    async fn get_authorization_info(
-        &self,
-        _request: &RequestContext,
-    ) -> Result<AuthorizationInfo, ServiceError> {
-        Ok(AuthorizationInfo {
-            user: Some(Arc::new(user_entity(USER_ID, "alice"))),
-            is_api_key: true,
-            is_authenticated: true,
-            ..AuthorizationInfo::default()
-        })
-    }
+fn ok_auth() -> FixedAuth {
+    FixedAuth(AuthorizationInfo {
+        user: Some(Arc::new(user_entity(USER_ID, "alice"))),
+        is_api_key: true,
+        is_authenticated: true,
+        ..AuthorizationInfo::default()
+    })
 }
 
 /// A [`UserManager`] resolving the fixed authenticated user.
@@ -212,9 +158,6 @@ impl UserManager for OkUsers {
         Ok((id == USER_ID).then(|| user_entity(USER_ID, "alice")))
     }
     async fn get_users(&self) -> Result<Vec<UserEntity>, ServiceError> {
-        unimplemented!()
-    }
-    async fn get_user_ids(&self) -> Result<Vec<Uuid>, ServiceError> {
         unimplemented!()
     }
     async fn initialize(&self) -> Result<(), ServiceError> {
@@ -501,13 +444,6 @@ impl LibraryManager for OkLibrary {
     ) -> Result<Vec<BaseItemEntity>, ServiceError> {
         unimplemented!()
     }
-    async fn create_items(
-        &self,
-        _items: &[BaseItemEntity],
-        _parent_id: Option<Uuid>,
-    ) -> Result<(), ServiceError> {
-        unimplemented!()
-    }
     async fn delete_item(&self, _id: Uuid, _o: &DeleteOptions) -> Result<(), ServiceError> {
         unimplemented!()
     }
@@ -605,12 +541,6 @@ fn entity_to_dto(item: &BaseItemEntity) -> ferrofin_model::dto::BaseItemDto {
 
 #[async_trait]
 impl DtoService for OkDto {
-    async fn get_primary_image_aspect_ratio(
-        &self,
-        _item_id: Uuid,
-    ) -> Result<Option<f64>, ServiceError> {
-        unimplemented!()
-    }
     async fn get_base_item_dto(
         &self,
         item: &BaseItemEntity,
@@ -629,15 +559,6 @@ impl DtoService for OkDto {
         _skip_visibility_check: bool,
     ) -> Result<Vec<ferrofin_model::dto::BaseItemDto>, ServiceError> {
         Ok(items.iter().map(entity_to_dto).collect())
-    }
-    async fn get_item_by_name_dto(
-        &self,
-        item: &BaseItemEntity,
-        _options: &DtoOptions,
-        _tagged_item_ids: Option<&[Uuid]>,
-        _user: Option<&UserEntity>,
-    ) -> Result<ferrofin_model::dto::BaseItemDto, ServiceError> {
-        Ok(entity_to_dto(item))
     }
 }
 
@@ -878,8 +799,8 @@ fn build_state(
         Arc::new(FakeSimilarItems),
         Arc::new(FakeSearch),
         Arc::new(OkDto),
-        Arc::new(OkAuth),
-        Arc::new(OkAuth),
+        Arc::new(ok_auth()),
+        Arc::new(ok_auth()),
         Arc::new(ferrofin_api::test_support::FakeQuickConnect),
         Arc::new(ferrofin_api::test_support::FakePlaylists),
         Arc::new(ferrofin_api::test_support::FakeCollections),
@@ -1798,10 +1719,12 @@ async fn unchanged_save_respects_unlock() {
     );
 }
 
-/// The editor's external ids are persisted, empty values are dropped, and the
-/// write REPLACES the stored set — C# `ItemUpdateController.UpdateItem` strips
-/// empty pairs and then assigns (`item.ProviderIds = request.ProviderIds`,
-/// v10.11.8 lines 402-410), so a key the client omitted is gone afterwards.
+/// The editor's external ids are persisted and the write REPLACES the stored
+/// set — C# `ItemUpdateController.UpdateItem` assigns them
+/// (`item.SetProviderIds(request.ProviderIds)`, v12.4 lines 435-438), so a key
+/// the client omitted is gone afterwards. The handler hands the request's whole
+/// set over; the manager applies `TrySetProviderId` (trim, drop blank or
+/// invalid ids, canonical names).
 /// Before this, the handler parsed the DTO and silently dropped `ProviderIds`,
 /// which lost the id every "Identify" and every hand-typed IMDb/TVDB id.
 #[tokio::test]
@@ -1844,8 +1767,9 @@ async fn update_item_replaces_the_external_ids() {
         vec![
             ("Imdb".to_owned(), "tt0111161".to_owned()),
             ("Tmdb".to_owned(), "278".to_owned()),
+            ("Tvdb".to_owned(), String::new()),
         ],
-        "empty values are stripped; the rest are written as the whole new set"
+        "the request's set is written as the whole new set"
     );
 }
 
@@ -2433,9 +2357,13 @@ async fn refresh_missing_item_is_404() {
     assert!(queued.lock().unwrap().is_empty());
 }
 
-/// `POST /Items/{itemId}/ContentType` for a missing item is a `404`.
+/// `POST /Items/{itemId}/ContentType` for a missing item is a `404`; for the
+/// nil id a `400`, as `GetItemById(Guid.Empty)` throws `ArgumentException`.
+#[rstest::rstest]
+#[case::missing(Uuid::from_u128(0xFEED), StatusCode::NOT_FOUND)]
+#[case::nil(Uuid::nil(), StatusCode::BAD_REQUEST)]
 #[tokio::test]
-async fn content_type_missing_item_is_404() {
+async fn content_type_unresolved_item(#[case] item_id: Uuid, #[case] expected: StatusCode) {
     let router = create_router(state(
         Uuid::from_u128(0x5D),
         Arc::new(Mutex::new(Vec::new())),
@@ -2444,17 +2372,14 @@ async fn content_type_missing_item_is_404() {
         .oneshot(
             Request::builder()
                 .method("POST")
-                .uri(format!(
-                    "/Items/{}/ContentType?contentType=movies",
-                    Uuid::from_u128(0xFEED)
-                ))
+                .uri(format!("/Items/{item_id}/ContentType?contentType=movies"))
                 .header("X-Emby-Token", "valid")
                 .body(Body::empty())
                 .unwrap(),
         )
         .await
         .unwrap();
-    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    assert_eq!(response.status(), expected);
 }
 
 // ---- from batch16_handlers.rs -------------------------------------------------

@@ -103,7 +103,8 @@ impl ScheduledTask for RefreshChannelsTask {
         vec![interval_hours(24)]
     }
     async fn execute(&self, progress: &TaskProgress) -> Result<(), ServiceError> {
-        progress.report(0.0);
+        // No report before the refresh: upstream's `RefreshChannels` gets its
+        // own `Progress<double>`, so the run shows none until the end.
         let channels = self.channels.get_channel_features(None).await?;
         // Feeds `is_hidden` — an empty set keeps the task off the dashboard.
         self.channel_count.store(channels.len(), Ordering::Relaxed);
@@ -274,6 +275,10 @@ mod tests {
         let task = RefreshChannelsTask::new(Arc::new(BrokenChannels)).await;
         assert!(task.is_hidden());
         // …and the run itself surfaces the error rather than reporting success.
-        assert!(task.execute(&TaskProgress::default()).await.is_err());
+        let progress = TaskProgress::default();
+        assert!(task.execute(&progress).await.is_err());
+        // Nor any progress: upstream's `RefreshChannels` gets its own
+        // `Progress<double>`, and only `ChannelPostScanTask` reports, at its end.
+        assert_eq!(progress.reported(), None);
     }
 }

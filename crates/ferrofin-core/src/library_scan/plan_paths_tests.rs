@@ -152,6 +152,7 @@ const MIXED: &[&str] = &[
     "Notes/season.nfo",
     "Notes/A.mkv",
     "song.mp3",
+    "Shows/track.mp3",
     "Mix.m3u",
     "Folder/list.m3u8",
     "Mixes/list.m3u8",
@@ -462,8 +463,8 @@ async fn plan_paths_matches_the_filtered_full_plan() {
     );
     let mut paths: Vec<String> = full.iter().filter_map(|p| p.entity.path.clone()).collect();
     let root = tmp.path().to_string_lossy().into_owned();
-    // A series inside a plain folder of the untyped library hangs off the
-    // folder, and what it holds sits below the folder too.
+    // A series or an audio file inside a plain folder of the untyped library
+    // hangs off the folder, and what the series holds sits below it too.
     let planned = |rel: &str| {
         let path = format!("{root}/{rel}");
         full.iter()
@@ -480,6 +481,12 @@ async fn plan_paths_matches_the_filtered_full_plan() {
             .ancestors
             .contains(&folder)
     );
+    let track = planned("mixed/Shows/track.mp3");
+    assert_eq!(
+        track.entity.parent_id,
+        Some(ferrofin_db::store::guid_to_db(folder))
+    );
+    assert!(track.ancestors.contains(&folder));
     for extra in [
         "movies",
         "movies/Heat (1995)/trailers",

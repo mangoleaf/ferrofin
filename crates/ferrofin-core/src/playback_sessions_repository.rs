@@ -62,6 +62,19 @@ pub(crate) mod test_rows {
         .await
         .expect("read playback sessions")
     }
+
+    /// The planner-statistics tables (`sqlite_stat*`) in the database, sorted.
+    /// Here, not in the optimize task's tests: `sql_boundary.rs` caps the SQL
+    /// in `maintenance.rs` and exempts repository files.
+    pub(crate) async fn stat_tables(db: &Database) -> Vec<String> {
+        sqlx::query_scalar(
+            "SELECT name FROM sqlite_master WHERE type = 'table' AND name LIKE 'sqlite_stat%' \
+             ORDER BY name",
+        )
+        .fetch_all(db.pool())
+        .await
+        .expect("read sqlite_master")
+    }
 }
 
 #[cfg(test)]

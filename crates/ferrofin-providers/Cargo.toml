@@ -53,6 +53,7 @@ unicode-normalization.workspace = true
 encoding_rs.workspace = true
 chardetng.workspace = true
 zip.workspace = true
+flate2.workspace = true
 tar.workspace = true
 sevenz-rust2.workspace = true
 uuid.workspace = true

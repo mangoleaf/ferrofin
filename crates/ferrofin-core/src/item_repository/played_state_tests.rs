@@ -3,15 +3,13 @@
 //! its leaves and a leaf up from its version group.
 //!
 //! The first two groups transliterate upstream's xUnit oracles (v12.2), fixture
-//! for fixture: all of `BaseItemRepositoryPlayedOrderingTests.cs`, and the four
-//! `IsPlayed` facts and the `IsResumable` fact of
-//! `BaseItemRepositoryPlayedVersionTests.cs`. Its remaining fact tests other
-//! code and is an open work item there:
-//! `GetIsPlayed_CountsASeriesWatchedThroughAnEpisodeAlternateVersion`
-//! (`ItemRepository::get_is_played`). The last group covers
+//! for fixture: all of `BaseItemRepositoryPlayedOrderingTests.cs`, and all of
+//! `BaseItemRepositoryPlayedVersionTests.cs`, whose `GetIsPlayed` fact tests
+//! `ItemRepository::get_is_played`. The last group covers
 //! what Ferrofin's data adds: a folder's own played row, a series reached
 //! through a box set, versions whose primary is in another library, the
-//! access-filtered leaf set, and the by-name counts scope.
+//! access-filtered leaf set, `get_is_played`'s item set, and the by-name
+//! counts scope.
 
 use super::*;
 use crate::test_support::{
@@ -454,6 +452,17 @@ async fn is_played_counts_a_series_watched_through_an_episode_alternate_version(
     assert_eq!(unplayed, HashSet::from([f, h]));
 }
 
+/// Upstream `GetIsPlayed_CountsASeriesWatchedThroughAnEpisodeAlternateVersion`:
+/// `Folder.IsPlayed`'s query reads a leaf's version group too.
+#[tokio::test]
+async fn get_is_played_counts_a_series_watched_through_an_episode_alternate_version() {
+    let lib = Versions::new().await;
+    let [e, f, ..] = lib.series;
+    let played = async |show| lib.repository.get_is_played(&lib.user, show, true).await;
+    assert!(played(e).await.expect("E"));
+    assert!(!played(f).await.expect("F"));
+}
+
 /// Upstream `IsResumable_DropsASeriesWhoseLastEpisodeWasPlayedThroughAnAlternateVersion`:
 /// the resumable roll-up's played and unplayed arms read the leaf's version
 /// group (`BuildLeafIsPlayedFilter`), so a series whose last episode was
@@ -629,6 +638,52 @@ async fn only_the_leaves_the_user_can_play_hold_a_folder_unplayed() {
             viewer.max_parental_rating_score
         );
     }
+}
+
+/// `GetIsPlayed` (`Folder.IsPlayed`) tests only the non-folder, non-virtual
+/// items of the recursive set, but every direct child: a series of one watched
+/// episode and one missing one, below a season, is played recursively, while
+/// the season, a folder with no played row, keeps the series' direct form
+/// unplayed, and the missing episode keeps the season's.
+#[tokio::test]
+async fn get_is_played_skips_folders_and_missing_items_only_when_recursive() {
+    let (db, repository, user, user_id) = library().await;
+    let mut seed = Seed::default();
+    let show = seed.folder(&db, BaseItemKind::Series, "Show").await;
+    let season = Uuid::new_v4();
+    seed_folder_item(&db, season, BaseItemKind::Season, "Season 1", Some(show)).await;
+    seed.items.push(season);
+    let watched = seed.leaf(&db, BaseItemKind::Episode, "Show 1").await;
+    let missing = seed.leaf(&db, BaseItemKind::Episode, "Show 2").await;
+    edit(&db, missing, |row| row.is_virtual_item = true).await;
+    for episode in [watched, missing] {
+        edit(&db, episode, |row| row.parent_id = Some(guid_to_db(season))).await;
+    }
+    seed.ancestors
+        .extend([(season, show), (watched, season), (missing, season)]);
+    seed.played.push(watched);
+    seed.write(&db, user_id).await;
+    let played = async |folder, recursive| {
+        repository
+            .get_is_played(&user, folder, recursive)
+            .await
+            .expect("played")
+    };
+    assert!(played(show, true).await);
+    assert!(!played(show, false).await, "the season is a direct child");
+    assert!(played(season, true).await);
+    assert!(!played(season, false).await, "the missing episode is too");
+}
+
+/// `GetIsPlayed` walks `GetAllDescendantIds`, which follows `LinkedChildren`:
+/// a box set's members hold it unplayed, where the `AncestorIds` closure alone
+/// is empty and reads played.
+#[tokio::test]
+async fn get_is_played_reaches_a_box_sets_members_through_its_links() {
+    let lib = Ordering::new().await;
+    let played = async |set| lib.repository.get_is_played(&lib.user, set, true).await;
+    assert!(played(lib.watched_set).await.expect("watched set"));
+    assert!(!played(lib.unwatched_set).await.expect("unwatched set"));
 }
 
 /// The resumable roll-up shares the leaf set: a version whose primary is in

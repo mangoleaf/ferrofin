@@ -45,16 +45,15 @@ use crate::handlers::items::effective_user_id;
 use crate::state::AppState;
 
 /// The rewind skip length (ms) stored when the `skipBackLength` custom pref is
-/// absent or empty (v10.11.8 `DisplayPreferencesController.cs`, `… : 10000`).
-///
-/// Upstream v12.0-rc3 unified both skip lengths to `15000`; Ferrofin pins the
-/// 10.11.8 contract, so the two values stay distinct here.
-const DEFAULT_SKIP_BACK_LENGTH_MS: i32 = 10_000;
+/// absent or empty (`DisplayPreferencesController.UpdateDisplayPreferences`,
+/// `… : 15000`; Jellyfin v12.0-rc1, PR 16739, unchanged at v12.4). A user with
+/// no stored row still reads the entity's 10000 (`display_preferences_manager`).
+const DEFAULT_SKIP_BACK_LENGTH_MS: i32 = 15_000;
 
 /// The fast-forward skip length (ms) stored when the `skipForwardLength` custom
-/// pref is absent or empty (v10.11.8 `DisplayPreferencesController.cs`,
-/// `… : 30000`). See [`DEFAULT_SKIP_BACK_LENGTH_MS`].
-const DEFAULT_SKIP_FORWARD_LENGTH_MS: i32 = 30_000;
+/// pref is absent or empty: `15000` as well since v12.0-rc1 (the entity's
+/// no-row default stays 30000). See [`DEFAULT_SKIP_BACK_LENGTH_MS`].
+const DEFAULT_SKIP_FORWARD_LENGTH_MS: i32 = 15_000;
 
 /// Query parameters for the display-preferences routes.
 #[derive(Debug, Default, serde::Deserialize)]

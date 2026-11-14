@@ -197,7 +197,8 @@ impl NowPlaying {
 
 /// What a session shows as playing (C# `SessionInfo.NowPlayingItem`): the
 /// library item a start or progress report named, as that report read its
-/// row, and the item built from it.
+/// row, and the item built from it; or the `Item` the report carried, shown
+/// as sent (gl-1062).
 ///
 /// Upstream's report builds the item before it returns. Here the first
 /// listing of the sessions that shows it builds it
@@ -209,24 +210,67 @@ impl NowPlaying {
 /// streams, images, chapters) is what the first listing finds.
 struct NowPlayingItem {
     report: NowPlaying,
-    row: BaseItemEntity,
+    /// The library item the report's `ItemId` names, as the report read its
+    /// row (C# `FullNowPlayingItem`): `None` only for a reported `Item` the
+    /// library does not have.
+    row: Option<BaseItemEntity>,
+    /// The `Item` the report carried, shown as sent in place of an item built
+    /// from `row` (C# `session.NowPlayingItem = info.Item`).
+    reported: Option<Arc<BaseItemDto>>,
     /// The built item, once a listing has built it: `None` when the build
     /// failed.
     built: tokio::sync::OnceCell<Option<Arc<BaseItemDto>>>,
 }
 
 impl NowPlayingItem {
-    /// The item `report` names, whose row the report read, not built yet.
-    fn new(row: BaseItemEntity, report: NowPlaying) -> Arc<Self> {
-        Arc::new(Self {
-            report,
+    /// What a start or progress report shows (C# `UpdateNowPlayingItem`'s
+    /// `info.Item`): the `Item` it carried, as sent; else, with `row`, the
+    /// library item its `ItemId` names, the `Item` an earlier report carried
+    /// that the session shows under that id (`shown`; `info.Item = current`),
+    /// or the item built from `row`, not built yet; `None` with neither `Item`
+    /// nor `row`.
+    fn of(
+        info: &PlaybackProgressInfo,
+        row: Option<BaseItemEntity>,
+        shown: Option<Arc<BaseItemDto>>,
+    ) -> Option<Arc<Self>> {
+        let reported = if let Some(item) = &info.item {
+            Some(Arc::new(item.clone()))
+        } else {
+            row.as_ref()?;
+            shown
+        };
+        Some(Arc::new(Self {
+            report: NowPlaying::of(info),
             row,
+            reported,
             built: tokio::sync::OnceCell::new(),
-        })
+        }))
     }
 
+    /// C# `NowPlayingItem.Id`: a reported `Item`'s own id, else the item the
+    /// report names.
     fn item_id(&self) -> Uuid {
-        self.report.item_id
+        self.reported
+            .as_ref()
+            .map_or(self.report.item_id, |item| item.id)
+    }
+
+    /// The shown item's name, for the log lines (C# `info.Item.Name`).
+    fn name(&self) -> Option<&str> {
+        match &self.reported {
+            Some(item) => item.name.as_deref(),
+            None => self.row.as_ref().and_then(|row| row.name.as_deref()),
+        }
+    }
+
+    /// The shown item as a playback event's `MediaInfo` (C#
+    /// `MediaInfo = info.Item`).
+    fn media_info(&self) -> Option<serde_json::Value> {
+        match &self.reported {
+            Some(item) => Some(reported_media_info(item)),
+            None => self.row.as_ref().map(playback_media_info),
+        }
     }
 
     /// Whether its build ran and failed: the session shows no item until a
@@ -303,9 +347,10 @@ impl SessionInfo {
     /// `SessionManager.UpdateNowPlayingItem`, which both `OnPlaybackStart` and
     /// `OnPlaybackProgress` call). A session recreated mid-playback gets its
     /// now-playing item back from the first progress report, since clients
-    /// never resend the start. `now_playing` is the reported item when the
-    /// library knows it, else `None` (C# leaves `NowPlayingItem` null for an
-    /// item it cannot resolve).
+    /// never resend the start. `now_playing` is what the report shows
+    /// ([`NowPlayingItem::of`]): `None` when it carried no `Item` and the
+    /// library does not have the item it names (C# leaves `NowPlayingItem`
+    /// null then).
     /// The report's play state replaces the session's whole `PlayState`, as
     /// upstream copies each member, so a report without a live stream clears
     /// it; a report without a media source gets the item's own id (C#
@@ -395,15 +440,78 @@ struct PlaybackSession {
 }
 
 impl PlaybackSession {
-    /// The item the session already shows, when a report names it again: C#
-    /// `UpdateNowPlayingItem` keeps it (`info.Item = current`) and builds
-    /// nothing. One whose build failed is not kept: the report replaces it, so
-    /// the next listing builds the item again, as upstream's next report does.
+    /// The item the session already shows, when a report naming the library
+    /// item it shows names it again: C# `UpdateNowPlayingItem` keeps it
+    /// (`info.Item = current`) and builds nothing. One whose build failed is
+    /// not kept: the report replaces it, so the next listing builds the item
+    /// again, as upstream's next report does. Kept only when the report that
+    /// named it named `item_id` too, so its row is that id's library item
+    /// (`libraryItem is not null`), and the item it shows has that id
+    /// (`current.Id == info.ItemId`); never for a nil id.
     fn kept_now_playing_item(&self, item_id: Uuid) -> Option<Arc<NowPlayingItem>> {
         self.now_playing_item
             .as_ref()
-            .filter(|item| item.item_id() == item_id && !item.failed())
+            .filter(|item| {
+                !item_id.is_nil()
+                    && item.report.item_id == item_id
+                    && item.item_id() == item_id
+                    && item.row.is_some()
+                    && !item.failed()
+            })
             .cloned()
+    }
+
+    /// The `Item` an earlier report carried that the session shows, when its
+    /// `Id` is `item_id` (C# `current.Id == info.ItemId`), though that report
+    /// named another `ItemId`: kept as the item shown while the library has
+    /// `item_id` (`info.Item = current`).
+    fn shown_reported_item(&self, item_id: Uuid) -> Option<Arc<BaseItemDto>> {
+        self.now_playing_item
+            .as_deref()
+            .filter(|item| item.item_id() == item_id)
+            .and_then(|item| item.reported.clone())
+    }
+
+    /// What a stop names, C# `OnPlaybackStopped`'s `info.Item`: the stop's own
+    /// `Item`, as sent; else, while the library has the item (`row`, the row
+    /// the stop read), the one the session shows when the stop names it
+    /// (`info.Item = current`), else `row`. Returned as its name and the
+    /// event's `MediaInfo`, both `None` with no such item, beside the event's
+    /// `Item` (C# `libraryItem`): the session's row when it shows the item,
+    /// else `row`.
+    fn stopped_item(
+        &self,
+        info: &PlaybackStopInfo,
+        row: Option<&BaseItemEntity>,
+    ) -> (
+        Option<String>,
+        Option<serde_json::Value>,
+        Option<serde_json::Value>,
+    ) {
+        let kept = row.and_then(|_| self.kept_now_playing_item(info.item_id));
+        let shown = row.and_then(|_| self.shown_reported_item(info.item_id));
+        let library_row = kept.as_deref().and_then(|item| item.row.as_ref()).or(row);
+        let (name, media_info) = match (&info.item, kept.as_deref(), shown.as_deref()) {
+            (Some(item), _, _) | (None, None, Some(item)) => {
+                (item.name.clone(), Some(reported_media_info(item)))
+            }
+            (None, Some(kept), _) => (kept.name().map(str::to_owned), kept.media_info()),
+            (None, None, None) => (
+                library_row.and_then(|row| row.name.clone()),
+                library_row.map(playback_media_info),
+            ),
+        };
+        (name, media_info, library_row.map(playback_library_item))
+    }
+
+    /// The library row the session holds for the item `item_id` names (C#
+    /// `GetNowPlayingItem`'s `FullNowPlayingItem`), read by the report that
+    /// named it, so the next report naming it reads it no more.
+    fn library_row(&self, item_id: Uuid) -> Option<&BaseItemEntity> {
+        self.now_playing_item
+            .as_deref()
+            .filter(|item| item.report.item_id == item_id)
+            .and_then(|item| item.row.as_ref())
     }
 
     fn of(session: &SessionInfo) -> Self {
@@ -701,6 +809,12 @@ impl FerrofinSessionManager {
                 })
                 .map(|s| {
                     let stop = PlaybackStopInfo {
+                        // C# `Item = session.NowPlayingItem`: a reported `Item`
+                        // as sent; the stop keeps a library one itself.
+                        item: s
+                            .now_playing_item
+                            .as_ref()
+                            .and_then(|item| item.reported.as_deref().cloned()),
                         item_id: s.now_playing_item_id.unwrap_or_default(),
                         session_id: Some(s.id.clone()),
                         media_source_id: s.play_state.media_source_id.clone(),
@@ -1684,14 +1798,19 @@ impl FerrofinSessionManager {
         Some(info)
     }
 
-    /// The `NowPlayingItem` a session shows for `playing`, built by the first
-    /// call and copied by the later ones; calls at the same moment share the
-    /// one build. `None` when the build failed.
+    /// The `NowPlayingItem` a session shows for `playing`: a reported `Item`
+    /// as sent, else the library item, built by the first call and copied by
+    /// the later ones; calls at the same moment share the one build. `None`
+    /// when the build failed.
     async fn shown_now_playing_item(&self, playing: &NowPlayingItem) -> Option<Arc<BaseItemDto>> {
+        if let Some(item) = &playing.reported {
+            return Some(Arc::clone(item));
+        }
+        let row = playing.row.as_ref()?;
         playing
             .built
             .get_or_init(|| async {
-                self.now_playing_item(&playing.row, &playing.report)
+                self.now_playing_item(row, &playing.report)
                     .await
                     .map(Arc::new)
             })
@@ -1833,6 +1952,17 @@ impl SessionManager for FerrofinSessionManager {
         Ok(())
     }
 
+    async fn on_device_options_updated(&self, device_id: &str, custom_name: Option<&str>) {
+        let custom_name = custom_name.filter(|name| !name.trim().is_empty());
+        let mut sessions = self.sessions.lock().await;
+        for session in sessions.values_mut().filter(|s| s.device_id == device_id) {
+            session.has_custom_device_name = custom_name.is_some();
+            if let Some(name) = custom_name {
+                session.device_name = Some(name.to_owned());
+            }
+        }
+    }
+
     async fn on_playback_start(&self, info: &PlaybackStartInfo) -> Result<(), ServiceError> {
         let session_id = info
             .session_id
@@ -1860,13 +1990,17 @@ impl SessionManager for FerrofinSessionManager {
             self.library_manager.get_item_by_id(info.item_id).await?
         };
 
-        // The row moves into the now-playing item, which a listing builds.
-        let is_library_item = item.is_some();
-        let now_playing = item.map(|row| {
-            session
-                .kept_now_playing_item(info.item_id)
-                .unwrap_or_else(|| NowPlayingItem::new(row, NowPlaying::of(info)))
-        });
+        // The row moves into the now-playing item, which a listing builds. A
+        // report naming the library item the session shows keeps it, unless
+        // it carries its own `Item` (C# `info.Item = current`).
+        let now_playing = match session.kept_now_playing_item(info.item_id) {
+            Some(kept) if info.item.is_none() && item.is_some() => Some(kept),
+            _ => NowPlayingItem::of(info, item, session.shown_reported_item(info.item_id)),
+        };
+        let library_row = now_playing.as_deref().and_then(|item| item.row.as_ref());
+        let is_library_item = library_row.is_some();
+        // C# `Item = libraryItem`.
+        let library_item = library_row.map(playback_library_item);
 
         // C# `OnPlaybackStart`: "User {0} started playback of '{1}' ({2} {3})",
         // logged here so every route that reports a start logs it once, named
@@ -1876,7 +2010,7 @@ impl SessionManager for FerrofinSessionManager {
                 user = session.user_name.as_deref(),
                 user_id = %session.user_id,
                 item_id = %info.item_id,
-                item = item.row.name.as_deref(),
+                item = item.name(),
                 device = session.device_name.as_deref(),
                 device_id = %session.device_id,
                 client = session.client.as_deref(),
@@ -1885,9 +2019,7 @@ impl SessionManager for FerrofinSessionManager {
             );
         }
         // C# `MediaInfo = info.Item`.
-        let media_info = now_playing
-            .as_deref()
-            .map(|item| playback_media_info(&item.row));
+        let media_info = now_playing.as_deref().and_then(NowPlayingItem::media_info);
 
         // Record the now-playing item + mark automatic progress started.
         {
@@ -1924,6 +2056,7 @@ impl SessionManager for FerrofinSessionManager {
             info.item_id,
             info.position_ticks,
             media_info.as_ref(),
+            library_item.as_ref(),
         );
         let _ = self.event_manager.publish("PlaybackStart", &payload).await;
         self.raise(SessionEvent::PlaybackStart);
@@ -1952,23 +2085,27 @@ impl SessionManager for FerrofinSessionManager {
             .await;
         }
 
-        // C# `GetNowPlayingItem` and `info.Item = current`: the item the
-        // session already shows is not looked up again, so a steady stream of
-        // reports costs no query.
-        let now_playing = if info.item_id.is_nil() {
-            None
-        } else if let Some(kept) = session.kept_now_playing_item(info.item_id) {
-            Some(kept)
-        } else {
-            self.library_manager
-                .get_item_by_id(info.item_id)
-                .await?
-                .map(|row| NowPlayingItem::new(row, NowPlaying::of(info)))
+        // C# `GetNowPlayingItem` and `info.Item = current`: the library item
+        // the session already shows is not looked up again, so a steady stream
+        // of reports costs no query. A report carrying its own `Item` shows
+        // that, as sent.
+        let now_playing = match session.kept_now_playing_item(info.item_id) {
+            Some(kept) if info.item.is_none() => Some(kept),
+            _ => {
+                let row = if info.item_id.is_nil() {
+                    None
+                } else if let Some(row) = session.library_row(info.item_id) {
+                    Some(row.clone())
+                } else {
+                    self.library_manager.get_item_by_id(info.item_id).await?
+                };
+                NowPlayingItem::of(info, row, session.shown_reported_item(info.item_id))
+            }
         };
-        let is_library_item = now_playing.is_some();
-        let media_info = now_playing
-            .as_deref()
-            .map(|item| playback_media_info(&item.row));
+        let library_row = now_playing.as_deref().and_then(|item| item.row.as_ref());
+        let is_library_item = library_row.is_some();
+        let library_item = library_row.map(playback_library_item);
+        let media_info = now_playing.as_deref().and_then(NowPlayingItem::media_info);
         {
             let mut sessions = self.sessions.lock().await;
             if let Some(s) = sessions.values_mut().find(|s| s.id == session_id) {
@@ -2010,6 +2147,7 @@ impl SessionManager for FerrofinSessionManager {
             info.item_id,
             info.position_ticks,
             media_info.as_ref(),
+            library_item.as_ref(),
         );
         let _ = self
             .event_manager
@@ -2088,24 +2226,18 @@ impl SessionManager for FerrofinSessionManager {
             Err(error) => (None, Err(error)),
         };
 
-        // C# `info.Item`: the item the session shows when the stop names it
-        // (`info.Item = current`), else the row read above; none when the
-        // library no longer has it.
-        let kept = session.kept_now_playing_item(info.item_id);
-        let stopped_item = stopped_item
-            .as_ref()
-            .map(|row| kept.as_ref().map_or(row, |item| &item.row));
+        let (name, media_info, library_item) = session.stopped_item(info, stopped_item.as_ref());
 
         // C# `OnPlaybackStopped`: "User {0} stopped playback of '{1}' at {2}ms
-        // ({3} {4})", for a stop whose item resolves, named from `info.Item`.
+        // ({3} {4})", for a stop with an `info.Item`, named from it.
         // `position_ms` is left out when the client sent no position (upstream
         // writes "unknown"; a numeric field cannot).
-        if let Some(item) = stopped_item {
+        if media_info.is_some() {
             info!(
                 user = session.user_name.as_deref(),
                 user_id = %session.user_id,
                 item_id = %info.item_id,
-                item = item.name.as_deref(),
+                item = name.as_deref(),
                 position_ms = info.position_ticks.map(|ticks| ticks / TICKS_PER_MILLISECOND),
                 device = session.device_name.as_deref(),
                 device_id = %session.device_id,
@@ -2126,13 +2258,13 @@ impl SessionManager for FerrofinSessionManager {
             None => Ok(()),
         };
 
-        // C# `MediaInfo = info.Item`.
-        let media_info = stopped_item.map(playback_media_info);
+        // C# `MediaInfo = info.Item`, `Item = libraryItem`.
         let payload = playback_event_payload(
             &session,
             info.item_id,
             info.position_ticks,
             media_info.as_ref(),
+            library_item.as_ref(),
         );
         let _ = self
             .event_manager
@@ -2343,18 +2475,6 @@ impl SessionManager for FerrofinSessionManager {
         // as the library/server notifiers use it.
         self.broadcast(message_type, data, |s| !s.user_id.is_nil())
             .await
-    }
-
-    async fn send_message_to_user_device_sessions(
-        &self,
-        device_id: &str,
-        message_type: SessionMessageType,
-        data: &str,
-    ) -> Result<(), ServiceError> {
-        self.broadcast(message_type, data, |s| {
-            s.device_id.eq_ignore_ascii_case(device_id)
-        })
-        .await
     }
 
     async fn send_restart_required_notification(&self) -> Result<(), ServiceError> {
@@ -2842,6 +2962,19 @@ impl SessionManager for FerrofinSessionManager {
         let sessions = self.sessions.lock().await;
         Ok(sessions.values().any(|s| s.now_playing_item_id.is_some()))
     }
+
+    async fn now_playing_library_item_id(
+        &self,
+        session_id: &str,
+    ) -> Result<Option<Uuid>, ServiceError> {
+        let sessions = self.sessions.lock().await;
+        Ok(sessions
+            .values()
+            .find(|s| s.id == session_id)
+            .and_then(|s| s.now_playing_item.as_deref())
+            .filter(|item| item.row.is_some())
+            .map(|item| item.report.item_id))
+    }
 }
 
 impl FerrofinSessionManager {
@@ -3181,16 +3314,18 @@ const TICKS_PER_MILLISECOND: i64 = 10_000;
 
 /// The JSON payload for a playback event. The user name, device name and
 /// client stand for `PlaybackProgressEventArgs`' `Users`, `DeviceName` and
-/// `ClientName`, and `MediaInfo` ([`playback_media_info`], `null` for an item
-/// the library does not have) for its `MediaInfo` and `Item`: the playback
-/// activity loggers read the user and device names and the item
-/// ([`crate::playback_activity`]), and plugins receive them all, as
-/// upstream's event consumers do.
+/// `ClientName`, `MediaInfo` ([`playback_media_info`],
+/// [`reported_media_info`]) for its `MediaInfo`, the item the report names or
+/// carries, and `Item` ([`playback_library_item`], `null` for an item the
+/// library does not have) for its `Item`: the playback activity loggers read
+/// the user and device names and the items ([`crate::playback_activity`]), and
+/// plugins receive them all, as upstream's event consumers do.
 fn playback_event_payload(
     session: &PlaybackSession,
     item_id: Uuid,
     position_ticks: Option<i64>,
     media_info: Option<&serde_json::Value>,
+    library_item: Option<&serde_json::Value>,
 ) -> String {
     serde_json::json!({
         "SessionId": session.id,
@@ -3201,20 +3336,43 @@ fn playback_event_payload(
         "ItemId": item_id,
         "PositionTicks": position_ticks,
         "MediaInfo": media_info,
+        "Item": library_item,
     })
     .to_string()
 }
 
 /// A playback event's `MediaInfo`, from the row the report read: the
 /// `BaseItemDto` fields upstream's `PlaybackStartLogger` and
-/// `PlaybackStopLogger` read from `eventArgs.MediaInfo` (and `ExtraType` for
-/// `eventArgs.Item.IsThemeMedia`), so the loggers read no row of their own.
+/// `PlaybackStopLogger` read from `eventArgs.MediaInfo`, and its `ExtraType`,
+/// so the loggers read no row of their own.
 fn playback_media_info(row: &BaseItemEntity) -> serde_json::Value {
     serde_json::json!({
         "Name": row.name,
         "SeriesName": row.series_name,
         "Artists": crate::dto_service::split_multi(row.artists.as_deref()),
         "MediaType": row.media_type,
+        "ExtraType": row.extra_type.and_then(crate::dto_service::extra_type_from_disc),
+    })
+}
+
+/// A playback event's `MediaInfo` for the `Item` a report carried, as sent:
+/// the members of [`playback_media_info`].
+fn reported_media_info(item: &BaseItemDto) -> serde_json::Value {
+    serde_json::json!({
+        "Name": item.name,
+        "SeriesName": item.series_name,
+        "Artists": item.artists.as_deref().unwrap_or_default(),
+        "MediaType": item.media_type,
+        "ExtraType": item.extra_type,
+    })
+}
+
+/// A playback event's `Item`, the library item (C# `eventArgs.Item`): the
+/// members the activity loggers read, its id for the entry's `ItemId` and its
+/// `ExtraType` for `IsThemeMedia`.
+fn playback_library_item(row: &BaseItemEntity) -> serde_json::Value {
+    serde_json::json!({
+        "Id": Uuid::parse_str(&row.id).ok(),
         "ExtraType": row.extra_type.and_then(crate::dto_service::extra_type_from_disc),
     })
 }
@@ -3281,12 +3439,6 @@ mod bus_fallback_tests {
 
     #[async_trait]
     impl DtoService for UnusedDtoService {
-        async fn get_primary_image_aspect_ratio(
-            &self,
-            _item_id: Uuid,
-        ) -> Result<Option<f64>, ServiceError> {
-            unreachable!("dto service is not exercised by broadcast")
-        }
         async fn get_base_item_dto(
             &self,
             _item: &BaseItemEntity,
@@ -3304,15 +3456,6 @@ mod bus_fallback_tests {
             _owner_id: Option<Uuid>,
             _skip_visibility_check: bool,
         ) -> Result<Vec<BaseItemDto>, ServiceError> {
-            unreachable!("dto service is not exercised by broadcast")
-        }
-        async fn get_item_by_name_dto(
-            &self,
-            _item: &BaseItemEntity,
-            _options: &DtoOptions,
-            _tagged_item_ids: Option<&[Uuid]>,
-            _user: Option<&ferrofin_db::entities::users::UserEntity>,
-        ) -> Result<BaseItemDto, ServiceError> {
             unreachable!("dto service is not exercised by broadcast")
         }
     }
@@ -3670,12 +3813,6 @@ mod broadcast_lock_tests {
 
     #[async_trait]
     impl DtoService for UnusedDtoService {
-        async fn get_primary_image_aspect_ratio(
-            &self,
-            _item_id: Uuid,
-        ) -> Result<Option<f64>, ServiceError> {
-            unreachable!("dto service is not exercised by these tests")
-        }
         async fn get_base_item_dto(
             &self,
             _item: &BaseItemEntity,
@@ -3693,15 +3830,6 @@ mod broadcast_lock_tests {
             _owner_id: Option<Uuid>,
             _skip_visibility_check: bool,
         ) -> Result<Vec<BaseItemDto>, ServiceError> {
-            unreachable!("dto service is not exercised by these tests")
-        }
-        async fn get_item_by_name_dto(
-            &self,
-            _item: &BaseItemEntity,
-            _options: &DtoOptions,
-            _tagged_item_ids: Option<&[Uuid]>,
-            _user: Option<&UserEntity>,
-        ) -> Result<BaseItemDto, ServiceError> {
             unreachable!("dto service is not exercised by these tests")
         }
     }

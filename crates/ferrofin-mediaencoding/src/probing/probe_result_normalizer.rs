@@ -1,8 +1,9 @@
 //! ffprobe JSON -> [`MediaInfo`] normalization — port of
 //! `MediaBrowser.MediaEncoding.Probing.ProbeResultNormalizer`.
 //!
-//! Pure transformation: no ffmpeg/ffprobe invocation, no file I/O beyond the
-//! MPEG-TS timestamp sniff (which is skipped for anything but a local TS file).
+//! Pure transformation: no ffmpeg/ffprobe invocation and no file I/O. The
+//! MPEG-TS timestamp sniff upstream's `ExtractTimestamp` does here is done by
+//! the async caller (`MediaEncoderImpl::get_media_info_full`).
 
 use std::sync::LazyLock;
 
@@ -343,14 +344,7 @@ impl<L: LocalizationManager> ProbeResultNormalizer<L> {
                     stream.bit_depth = Some(stream_info.bits_per_raw_sample);
                 }
 
-                if stream.title.as_deref().is_none_or(str::is_empty)
-                    && let Some(handler) = flat_tags
-                        .as_ref()
-                        .and_then(|t| get_dictionary_value(t, "handler_name"))
-                        .filter(|h| !h.is_empty() && !h.eq_ignore_ascii_case("SoundHandler"))
-                {
-                    stream.title = Some(handler.to_owned());
-                }
+                fill_empty_track_title(&mut stream, flat_tags.as_ref(), "SoundHandler");
             }
             Some(CodecType::Subtitle) => {
                 stream.stream_type = MediaStreamType::Subtitle;
@@ -367,14 +361,7 @@ impl<L: LocalizationManager> ProbeResultNormalizer<L> {
                     stream.localized_language = self.localization.get_language_display_name(lang);
                 }
 
-                if stream.title.as_deref().is_none_or(str::is_empty)
-                    && let Some(handler) = flat_tags
-                        .as_ref()
-                        .and_then(|t| get_dictionary_value(t, "handler_name"))
-                        .filter(|h| !h.is_empty() && !h.eq_ignore_ascii_case("SubtitleHandler"))
-                {
-                    stream.title = Some(handler.to_owned());
-                }
+                fill_empty_track_title(&mut stream, flat_tags.as_ref(), "SubtitleHandler");
             }
             Some(CodecType::Video) => {
                 // master `ProbeResultNormalizer.cs:794`.
@@ -812,6 +799,30 @@ fn set_anamorphic(stream: &mut MediaStream, info: &MediaStreamInfo) {
             ..Default::default()
         });
         stream.is_anamorphic = Some(dar != derived.as_deref());
+    }
+}
+
+/// The audio and subtitle title fallback (`ProbeResultNormalizer.cs:758-772`,
+/// `:788-802`): with no `title`, ffprobe's `name` tag (how it exposes an MP4
+/// track name), then `handler_name` unless it is the muxer's default.
+fn fill_empty_track_title(
+    stream: &mut MediaStream,
+    tags: Option<&CaseInsensitiveTags>,
+    default_handler: &str,
+) {
+    if stream.title.as_deref().is_some_and(|t| !t.is_empty()) {
+        return;
+    }
+    // Upstream assigns `name` unconditionally, so an empty `title` without one becomes null.
+    stream.title = tags
+        .and_then(|t| get_dictionary_value(t, "name"))
+        .map(str::to_owned);
+    if stream.title.as_deref().is_none_or(str::is_empty)
+        && let Some(handler) = tags
+            .and_then(|t| get_dictionary_value(t, "handler_name"))
+            .filter(|h| !h.is_empty() && !h.eq_ignore_ascii_case(default_handler))
+    {
+        stream.title = Some(handler.to_owned());
     }
 }
 
@@ -1531,5 +1542,40 @@ mod itunes_tests {
             &mut info,
         );
         assert_eq!(info.studios, vec!["Fish & Chips ! <live>"]);
+    }
+}
+
+#[cfg(test)]
+mod track_title_tests {
+    use rstest::rstest;
+
+    use super::{MediaStream, fill_empty_track_title};
+    use crate::probing::ff_probe_helpers::CaseInsensitiveTags;
+
+    // `ProbeResultNormalizer.cs:758-772`: title, then `name`, then a non-default `handler_name`.
+    #[rstest]
+    #[case::title_wins(Some("Main"), Some(&[("name", "SDH")][..]), Some("Main"))]
+    #[case::name_beats_custom_handler(None, Some(&[("name", "SDH"), ("handler_name", "Custom")][..]), Some("SDH"))]
+    #[case::empty_name_falls_to_handler(None, Some(&[("name", ""), ("handler_name", "Custom")][..]), Some("Custom"))]
+    #[case::default_handler_any_case(None, Some(&[("handler_name", "soundhandler")][..]), None)]
+    #[case::empty_title_without_name_is_null(Some(""), Some(&[("handler_name", "SoundHandler")][..]), None)]
+    #[case::empty_name_kept(Some(""), Some(&[("name", "")][..]), Some(""))]
+    #[case::no_tags(None, None, None)]
+    fn fills_title(
+        #[case] title: Option<&str>,
+        #[case] pairs: Option<&[(&str, &str)]>,
+        #[case] expected: Option<&str>,
+    ) {
+        let tags: Option<CaseInsensitiveTags> = pairs.map(|p| {
+            p.iter()
+                .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+                .collect()
+        });
+        let mut stream = MediaStream {
+            title: title.map(str::to_owned),
+            ..Default::default()
+        };
+        fill_empty_track_title(&mut stream, tags.as_ref(), "SoundHandler");
+        assert_eq!(stream.title.as_deref(), expected);
     }
 }

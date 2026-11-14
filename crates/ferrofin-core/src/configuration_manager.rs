@@ -72,7 +72,7 @@ use crate::config_import;
 /// set the library metadata-options editor lists. Verbatim port of the C#
 /// `ServerConfiguration.MetadataOptions` default array (an empty array here left
 /// the editor with no per-type rows).
-fn default_metadata_options() -> Vec<ferrofin_model::configuration::MetadataOptions> {
+pub(crate) fn default_metadata_options() -> Vec<ferrofin_model::configuration::MetadataOptions> {
     use ferrofin_model::configuration::MetadataOptions;
     let plain = |item_type: &str| MetadataOptions {
         item_type: Some(item_type.to_owned()),
@@ -292,33 +292,33 @@ impl std::fmt::Debug for FerrofinServerConfigurationManager {
 
 impl FerrofinServerConfigurationManager {
     /// The on-disk configuration file name (JSON counterpart of C# `system.xml`).
-    const CONFIG_FILE_NAME: &'static str = "system.json";
+    pub(crate) const CONFIG_FILE_NAME: &'static str = "system.json";
 
     /// The subdirectory of the user config dir holding named configs
     /// (`branding`/`encoding`), matching the `/System/Configuration/{key}` API.
-    const NAMED_SUBDIR: &'static str = "named";
+    pub(crate) const NAMED_SUBDIR: &'static str = "named";
 
     /// The on-disk branding configuration file name (Jellyfin's named
     /// `branding` configuration, stored as a sibling JSON document).
-    const BRANDING_FILE_NAME: &'static str = "branding.json";
+    pub(crate) const BRANDING_FILE_NAME: &'static str = "branding.json";
 
     /// The on-disk encoding configuration file name (Jellyfin's named
     /// `encoding` configuration, stored as a sibling JSON document).
-    const ENCODING_FILE_NAME: &'static str = "encoding.json";
+    pub(crate) const ENCODING_FILE_NAME: &'static str = "encoding.json";
 
     /// The on-disk network configuration file name (Jellyfin's named
     /// `network` configuration). This one is not merely served back: the
     /// request path enforces it (`ferrofin_api::ip_access`).
-    const NETWORK_FILE_NAME: &'static str = "network.json";
+    pub(crate) const NETWORK_FILE_NAME: &'static str = "network.json";
 
     /// The on-disk metadata configuration file name (Jellyfin's named
     /// `metadata` configuration, `MetadataConfigurationStore`): the "Date
     /// added behavior for new content" the library scan dates new items by.
-    const METADATA_FILE_NAME: &'static str = "metadata.json";
+    pub(crate) const METADATA_FILE_NAME: &'static str = "metadata.json";
 
     /// The on-disk NFO configuration file name (Jellyfin's named
     /// `xbmcmetadata` configuration, `XbmcMetadataOptions`).
-    const XBMC_METADATA_FILE_NAME: &'static str = "xbmcmetadata.json";
+    pub(crate) const XBMC_METADATA_FILE_NAME: &'static str = "xbmcmetadata.json";
 
     /// The on-disk Live TV configuration file name (Jellyfin's named `livetv`
     /// configuration): its scalar options, the tuners and listing providers

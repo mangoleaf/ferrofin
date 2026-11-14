@@ -168,9 +168,6 @@ impl LiveTvManager for CountingLiveTv {
     async fn refresh_guide(&self) -> Result<(), ServiceError> {
         unimplemented!("not probed by the gate tests")
     }
-    async fn get_channel_stream_url(&self, _id: Uuid) -> Result<Option<String>, ServiceError> {
-        unimplemented!("not probed by the gate tests")
-    }
     async fn get_timers(&self) -> Result<Vec<TimerInfoDto>, ServiceError> {
         unimplemented!("not probed by the gate tests")
     }

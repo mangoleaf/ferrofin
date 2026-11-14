@@ -258,14 +258,15 @@ async fn adoption_removes_orphaned_parent_chains(#[case] generation: &str, #[cas
     assert_eq!(detached, [("b-key", 3), ("shared", 1)]);
     for (_, key, _, retention) in &placeholder {
         let retention = retention.as_deref().expect("RetentionDate is set");
-        // Ferrofin's stored format (`store::datetime_to_db`): 7 fractional digits.
+        // The stored format (`store::datetime_to_db`, Jellyfin's): 0042 writes
+        // seven digits, and 0050 trims their trailing zeros as the store does.
+        let parsed = chrono::NaiveDateTime::parse_from_str(retention, "%Y-%m-%d %H:%M:%S%.f")
+            .expect("RetentionDate parses");
         assert_eq!(
-            retention.len(),
-            "2026-10-12 00:00:00.0000000".len(),
+            ferrofin_db::store::datetime_to_db(parsed.and_utc()),
+            retention,
             "{key}"
         );
-        chrono::NaiveDateTime::parse_from_str(retention, "%Y-%m-%d %H:%M:%S%.f")
-            .expect("RetentionDate parses");
     }
 
     let streams: Vec<String> = sqlx::query_scalar(r#"SELECT "ItemId" FROM "MediaStreamInfos""#)

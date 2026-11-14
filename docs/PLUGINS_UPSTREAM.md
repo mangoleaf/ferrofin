@@ -318,8 +318,9 @@ Conventions:
   `AuthenticationProviderId` is LDAP-Auth's (ignoring case), and otherwise stays off. The file
   is only read. A missing file is silent; one that cannot be read or parsed, or a write that
   fails, is a warning, and the next boot tries again (`config.json` is written last, so its
-  presence means the import finished). `scripts/migrate-jellyfin.sh` copies this one file of
-  Jellyfin's `plugins/`.
+  presence means the import finished). `scripts/migrate-jellyfin.sh` copies this file of
+  Jellyfin's `plugins/`, and the `Jellyfin.Plugin.*.xml` settings of the metadata plugins
+  Jellyfin builds in, which adoption imports the same way.
 - Profile images (v24, `d11c86a`): the profile-image block of `Authenticate`,
   `LdapUtils.TryDetermineAttributeFormat`, `ProfileImageUpdater.SetProfileImage` and
   `LdapProfileImageSyncTask`. While `EnableLdapProfileImageSync` is on, `LocateLdapUser` also

@@ -35,7 +35,7 @@ use uuid::Uuid;
 
 use crate::auth::{RequireAdmin, RequireAuth};
 use crate::error::ApiError;
-use crate::extract::{DotnetGuid, JsonBody, Query};
+use crate::extract::{DotnetGuid, JsonBody, Query, RequiredRouteString, RouteParameter};
 use crate::handlers::items::effective_user_id;
 use crate::handlers::query_parse::{parse_csv_enums_lenient, parse_csv_uuids};
 use crate::handlers::session_ctx::current_session_id;
@@ -109,6 +109,14 @@ struct DisplayContentQuery {
     item_name: String,
 }
 
+/// `{sessionId}`, the `[FromRoute, Required] string` of every
+/// `SessionController` action that names a session in its route.
+struct SessionId;
+
+impl RouteParameter for SessionId {
+    const NAME: &'static str = "sessionId";
+}
+
 /// `POST /Sessions/{sessionId}/Viewing` — browse a client to an item.
 ///
 /// Port of `SessionController.DisplayContent`.
@@ -122,7 +130,7 @@ struct DisplayContentQuery {
 async fn display_content(
     State(state): State<AppState>,
     RequireAuth(auth): RequireAuth,
-    Path(session_id): Path<String>,
+    RequiredRouteString(session_id, _): RequiredRouteString<SessionId>,
     Query(query): Query<DisplayContentQuery>,
 ) -> Result<StatusCode, ApiError> {
     let command = BrowseRequest {
@@ -186,7 +194,7 @@ struct PlayQuery {
 async fn play(
     State(state): State<AppState>,
     RequireAuth(auth): RequireAuth,
-    Path(session_id): Path<String>,
+    RequiredRouteString(session_id, _): RequiredRouteString<SessionId>,
     Query(query): Query<PlayQuery>,
 ) -> Result<StatusCode, ApiError> {
     let play_request = PlayRequest {
@@ -233,7 +241,8 @@ struct PlaystateQuery {
 async fn send_playstate_command(
     State(state): State<AppState>,
     RequireAuth(auth): RequireAuth,
-    Path((session_id, command)): Path<(String, PlaystateCommand)>,
+    RequiredRouteString(session_id, _): RequiredRouteString<SessionId>,
+    Path((_, command)): Path<(String, PlaystateCommand)>,
     Query(query): Query<PlaystateQuery>,
 ) -> Result<StatusCode, ApiError> {
     let request = PlaystateRequest {
@@ -266,7 +275,8 @@ async fn send_playstate_command(
 async fn send_system_command(
     State(state): State<AppState>,
     RequireAuth(auth): RequireAuth,
-    Path((session_id, command)): Path<(String, GeneralCommandType)>,
+    RequiredRouteString(session_id, _): RequiredRouteString<SessionId>,
+    Path((_, command)): Path<(String, GeneralCommandType)>,
 ) -> Result<StatusCode, ApiError> {
     send_named_command(&state, &auth, &session_id, command).await
 }
@@ -287,7 +297,8 @@ async fn send_system_command(
 async fn send_general_command(
     State(state): State<AppState>,
     RequireAuth(auth): RequireAuth,
-    Path((session_id, command)): Path<(String, GeneralCommandType)>,
+    RequiredRouteString(session_id, _): RequiredRouteString<SessionId>,
+    Path((_, command)): Path<(String, GeneralCommandType)>,
 ) -> Result<StatusCode, ApiError> {
     send_named_command(&state, &auth, &session_id, command).await
 }
@@ -306,7 +317,7 @@ async fn send_general_command(
 async fn send_full_general_command(
     State(state): State<AppState>,
     RequireAuth(auth): RequireAuth,
-    Path(session_id): Path<String>,
+    RequiredRouteString(session_id, _): RequiredRouteString<SessionId>,
     JsonBody(mut command): JsonBody<GeneralCommand>,
 ) -> Result<StatusCode, ApiError> {
     let controlling_id = controlling_session_id(&state, &auth).await?;
@@ -332,7 +343,7 @@ async fn send_full_general_command(
 async fn send_message_command(
     State(state): State<AppState>,
     RequireAuth(auth): RequireAuth,
-    Path(session_id): Path<String>,
+    RequiredRouteString(session_id, _): RequiredRouteString<SessionId>,
     JsonBody(mut command): JsonBody<MessageCommand>,
 ) -> Result<StatusCode, ApiError> {
     // C# defaults a blank header to "Message from Server".
@@ -363,7 +374,8 @@ async fn send_message_command(
 async fn add_user_to_session(
     State(state): State<AppState>,
     RequireAuth(auth): RequireAuth,
-    Path((session_id, DotnetGuid(user_id))): Path<(String, DotnetGuid)>,
+    RequiredRouteString(session_id, _): RequiredRouteString<SessionId>,
+    Path((_, DotnetGuid(user_id))): Path<(String, DotnetGuid)>,
 ) -> Result<StatusCode, ApiError> {
     let controlling_id = controlling_session_id(&state, &auth).await?;
     state
@@ -406,7 +418,8 @@ async fn add_user_to_session(
 async fn remove_user_from_session(
     State(state): State<AppState>,
     RequireAuth(auth): RequireAuth,
-    Path((session_id, DotnetGuid(user_id))): Path<(String, DotnetGuid)>,
+    RequiredRouteString(session_id, _): RequiredRouteString<SessionId>,
+    Path((_, DotnetGuid(user_id))): Path<(String, DotnetGuid)>,
 ) -> Result<StatusCode, ApiError> {
     let controlling_id = controlling_session_id(&state, &auth).await?;
     state

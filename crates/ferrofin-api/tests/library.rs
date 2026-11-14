@@ -190,13 +190,6 @@ impl LibraryManager for RecordingLibrary {
     ) -> Result<Vec<BaseItemEntity>, ServiceError> {
         unimplemented!("unused")
     }
-    async fn create_items(
-        &self,
-        _items: &[BaseItemEntity],
-        _parent_id: Option<Uuid>,
-    ) -> Result<(), ServiceError> {
-        unimplemented!("unused")
-    }
     async fn update_items(
         &self,
         _items: &[BaseItemEntity],
@@ -295,16 +288,6 @@ impl LibraryMonitor for RecordingMonitor {
         Ok(())
     }
     fn restart(&self) {}
-    async fn report_file_system_change_beginning(&self, _path: &str) -> Result<(), ServiceError> {
-        Ok(())
-    }
-    async fn report_file_system_change_complete(
-        &self,
-        _path: &str,
-        _refresh_path: bool,
-    ) -> Result<(), ServiceError> {
-        Ok(())
-    }
     async fn report_file_system_changed(&self, path: &str) -> Result<(), ServiceError> {
         self.watcher.lock().unwrap().push(path.to_owned());
         Ok(())
@@ -540,8 +523,9 @@ async fn refresh_library_returns_204() {
     // registry, which is the whole observable effect of the route. C#'s
     // `LibraryManager.ValidateMediaLibrary` is, verbatim,
     // `_taskManager.CancelIfRunningAndQueue<RefreshMediaLibraryTask>()`
-    // (v10.11.8 LibraryManager.cs:1117-1123): cancel first so a scan already in
-    // flight restarts rather than being rejected, then queue. That routing is
+    // (LibraryManager.ValidateMediaLibrary): a scan already in flight is
+    // cancelled and the new run queued behind it, rather than rejected while
+    // the cancelled run is still stopping. That routing is
     // what puts "Scan Media Library" into GET /ScheduledTasks as Running, which
     // is what jellyfin-web's "Scan all libraries" button reports to the operator.
     // Asserting only the 204 would pass just as well against a no-op handler.
@@ -558,7 +542,7 @@ async fn refresh_library_returns_204() {
     let router = ferrofin_api::create_router(state);
     let status = post(router, "/Library/Refresh", None).await;
     assert_eq!(status, StatusCode::NO_CONTENT);
-    // The WIRE ID, not the key. `TaskManager::start_task`/`cancel_task` address
+    // The WIRE ID, not the key. `TaskManager::cancel_if_running_and_queue` addresses
     // a task the way `POST /ScheduledTasks/Running/{taskId}` does — by the md5
     // of the C# type name — and the concrete registry looks the key up FROM
     // that id. Asserting the key here instead is what let this route ship
@@ -567,9 +551,9 @@ async fn refresh_library_returns_204() {
     // can catch it.
     let wire_id = ferrofin_traits::tasks::task_id_for_key("RefreshLibrary");
     assert_ne!(wire_id, "RefreshLibrary", "the id is derived, not the key");
-    assert_eq!(
-        *tasks.cancelled.lock().expect("cancelled"),
-        vec![wire_id.clone()]
-    );
-    assert_eq!(*tasks.started.lock().expect("started"), vec![wire_id]);
+    assert_eq!(*tasks.requeued.lock().expect("requeued"), vec![wire_id]);
+    // Not a cancel then a start: the start would be refused while the
+    // cancelled run is still stopping.
+    assert!(tasks.cancelled.lock().expect("cancelled").is_empty());
+    assert!(tasks.started.lock().expect("started").is_empty());
 }

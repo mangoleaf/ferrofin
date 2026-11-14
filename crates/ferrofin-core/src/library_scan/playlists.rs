@@ -59,7 +59,7 @@ use ferrofin_traits::providers::{MetadataRefreshMode, MetadataRefreshOptions};
 use unicode_normalization::UnicodeNormalization as _;
 use uuid::Uuid;
 
-use super::{LibraryScanner, PlanCtx, Planned, entry_name, file_stem, folder_name};
+use super::{LibraryScanner, PlanCtx, Planned, entry_name, file_stem};
 
 /// `PlaylistResolver`'s directory marker, matched case-insensitively.
 const FOLDER_MARKER: &str = "[playlist]";
@@ -68,23 +68,7 @@ const FOLDER_MARKER: &str = "[playlist]";
 /// none — the directory arm of `PlaylistResolver.Resolve`. `holds_xml` is
 /// asked only when the name alone does not decide.
 pub(super) fn playlist_folder_name(dir: &str, holds_xml: impl FnOnce() -> bool) -> Option<String> {
-    let name = folder_name(dir)?;
-    let lower = name.to_ascii_lowercase();
-    if lower.contains(FOLDER_MARKER) {
-        // `Replace("[playlist]", "", OrdinalIgnoreCase).Trim()` — one
-        // left-to-right pass — and `EnsureName` gives a name left empty the
-        // folder's own.
-        let mut cut = String::with_capacity(name.len());
-        let mut rest = 0;
-        for (at, _) in lower.match_indices(FOLDER_MARKER) {
-            cut.push_str(&name[rest..at]);
-            rest = at + FOLDER_MARKER.len();
-        }
-        cut.push_str(&name[rest..]);
-        let cut = cut.trim();
-        return Some(if cut.is_empty() { name } else { cut.to_owned() });
-    }
-    holds_xml().then_some(name)
+    crate::resolvers::marked_folder_name(dir, FOLDER_MARKER, holds_xml)
 }
 
 /// Whether a folder's `entries` hold a `playlist.xml` — `filePaths.Any(f =>

@@ -145,7 +145,6 @@ mod tests {
                     .expect("load config"),
             );
             let host = Arc::new(FerrofinServerApplicationHost::new(
-                paths,
                 configuration.clone(),
                 HostNetworkInfo {
                     published_server_url: Some("http://192.168.1.2:8096/jellyfin".into()),

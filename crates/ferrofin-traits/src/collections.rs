@@ -34,6 +34,7 @@ use ferrofin_model::playlists::{
 use uuid::Uuid;
 
 use crate::error::ServiceError;
+use crate::persistence::PlaylistMembers;
 
 /// The options for creating a collection (box set).
 ///
@@ -108,6 +109,18 @@ pub trait CollectionManager: Send + Sync {
         &self,
         create_if_needed: bool,
     ) -> Result<Option<BaseItemEntity>, ServiceError>;
+
+    /// `BoxSetResolver` for a scan of the library location `location`: stores
+    /// a box set for each of `folders` (the `[boxset]` and `collection.xml`
+    /// folders the scan found directly in it) that no box set holds yet, as
+    /// the resolver and `Folder.AddChild` would, and returns the ids stored.
+    /// `None` when `location` is not the folder box sets are created in, which
+    /// is the only one resolved.
+    async fn resolve_box_set_folders(
+        &self,
+        location: &str,
+        folders: &[String],
+    ) -> Result<Option<Vec<Uuid>>, ServiceError>;
 }
 
 fn _assert_object_safe_collection_manager(_: &dyn CollectionManager) {}
@@ -161,24 +174,17 @@ pub trait PlaylistManager: Send + Sync {
     /// [`PlaylistAccessLevel::Owner`] to every caller for
     /// back-compat. A nil `user_id` is [`ServiceError::InvalidInput`]
     /// (upstream's `GetUserById(Guid.Empty)` throw), here and in
-    /// [`get_playlist_for_user`](Self::get_playlist_for_user),
-    /// [`create_playlist`](Self::create_playlist),
-    /// [`get_playlists`](Self::get_playlists) and
+    /// [`create_playlist`](Self::create_playlist) and
     /// [`get_playlist_items`](Self::get_playlist_items).
+    ///
+    /// This is the controllers' `GetPlaylistForUser` gate. What else they read
+    /// off the playlist it returns (owner, shares, open access, members) comes
+    /// from the access level and the other methods here.
     async fn get_playlist_access(
         &self,
         playlist_id: Uuid,
         user_id: Uuid,
     ) -> Result<PlaylistAccess, ServiceError>;
-
-    /// Gets a playlist visible to the given user: the owner, a shared user, or —
-    /// when open-access — anyone. Invisible is [`ServiceError::NotFound`], like
-    /// [`get_playlist_access`](Self::get_playlist_access).
-    async fn get_playlist_for_user(
-        &self,
-        playlist_id: Uuid,
-        user_id: Uuid,
-    ) -> Result<BaseItemEntity, ServiceError>;
 
     /// Creates a new playlist, recording the requesting user as its owner,
     /// seeding shares from the request's `users`, and storing its open-access
@@ -193,11 +199,8 @@ pub trait PlaylistManager: Send + Sync {
     /// C# update path.
     async fn update_playlist(&self, request: &PlaylistUpdateRequest) -> Result<(), ServiceError>;
 
-    /// Gets all playlists visible to a user (owned, shared, open-access, or
-    /// predating owner tracking).
-    async fn get_playlists(&self, user_id: Uuid) -> Result<Vec<BaseItemEntity>, ServiceError>;
-
-    /// Gets the member items of a playlist, in playlist order.
+    /// Gets the members of a playlist: each distinct member row once, and the
+    /// entries in playlist order.
     ///
     /// Ports the read behind `PlaylistsController.GetPlaylistItems`; the C#
     /// `playlist.GetManageableItems()` walk over the playlist's children becomes
@@ -206,7 +209,7 @@ pub trait PlaylistManager: Send + Sync {
         &self,
         playlist_id: Uuid,
         user_id: Uuid,
-    ) -> Result<Vec<BaseItemEntity>, ServiceError>;
+    ) -> Result<PlaylistMembers, ServiceError>;
 
     /// The ids of the members [`get_playlist_items`](Self::get_playlist_items)
     /// lists, in playlist order, repeats kept, without its access check: the

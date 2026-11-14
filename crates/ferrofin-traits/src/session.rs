@@ -213,6 +213,18 @@ pub trait SessionManager: Send + Sync {
         reported_device_name: &str,
     ) -> Result<(), ServiceError>;
 
+    /// Applies a device's newly saved custom name to its live sessions (C#
+    /// `SessionManager.OnDeviceManagerDeviceOptionsUpdated`, raised by
+    /// `DeviceManager.UpdateDeviceOptions`). A non-blank `custom_name` becomes
+    /// each session's device name and marks it custom; a blank one only clears
+    /// the mark, so the next reported name replaces the old one.
+    ///
+    /// The default does nothing, so test fakes without sessions need no
+    /// change; the concrete session manager overrides it.
+    async fn on_device_options_updated(&self, device_id: &str, custom_name: Option<&str>) {
+        let _ = (device_id, custom_name);
+    }
+
     /// Reports that playback started for an item.
     async fn on_playback_start(&self, info: &PlaybackStartInfo) -> Result<(), ServiceError>;
 
@@ -308,14 +320,6 @@ pub trait SessionManager: Send + Sync {
         let _ = (message_type, data);
         Ok(())
     }
-
-    /// Sends a pre-serialized JSON message to all sessions of a specific device.
-    async fn send_message_to_user_device_sessions(
-        &self,
-        device_id: &str,
-        message_type: SessionMessageType,
-        data: &str,
-    ) -> Result<(), ServiceError>;
 
     /// Broadcasts a "restart required" notification to all sessions.
     async fn send_restart_required_notification(&self) -> Result<(), ServiceError>;
@@ -419,6 +423,29 @@ pub trait SessionManager: Send + Sync {
             .get_sessions(Uuid::nil(), None, None, None, true)
             .await?;
         Ok(sessions.iter().map(SessionSummary::from).collect())
+    }
+
+    /// The id of the library item the session `session_id` plays (C#
+    /// `SessionInfo.FullNowPlayingItem`), which SyncPlay seeds a new group
+    /// from: the item a playback report's `ItemId` names, `None` when it plays
+    /// nothing or the library does not have the item. It can differ from the
+    /// `NowPlayingItem` the session shows, which may be a client's own `Item`.
+    ///
+    /// The default reads the shown item's id from the elevated
+    /// [`Self::get_sessions`] view, so test fakes need no change. The concrete
+    /// manager overrides it to read the library item.
+    async fn now_playing_library_item_id(
+        &self,
+        session_id: &str,
+    ) -> Result<Option<Uuid>, ServiceError> {
+        let sessions = self
+            .get_sessions(Uuid::nil(), None, None, None, true)
+            .await?;
+        Ok(sessions
+            .into_iter()
+            .find(|s| s.id.as_deref() == Some(session_id))
+            .and_then(|s| s.now_playing_item)
+            .map(|item| item.id))
     }
 
     /// Resolves a session from its access token, returning the session DTO.

@@ -781,8 +781,9 @@ impl ScheduledTask for DetectSegmentsTask {
         }
         // The automatic analysis gives way, then this waits its turn for the
         // one-pass latch (`ScheduledTaskSemaphore.AcquireAsync`) — a rescan
-        // may hold it. The guard releases it even if the run is aborted
-        // mid-await (the task manager cancels a run by aborting its task).
+        // may hold it. The guard releases it even if the run is dropped
+        // mid-await (the task manager drops a run that does not stop in time,
+        // and aborts one at shutdown).
         self.cancel_automatic().await;
         let _release = self.running.acquire().await?;
         let config = self.load_config().await;
@@ -2983,11 +2984,9 @@ mod tests {
         }
     }
 
-    /// `TestBlackFrames.TestEndCreditDetection`: a 5:30 episode whose credits
-    /// go black at 300 s, bisected from 240 s from the end, is found within
-    /// 3 s — against the fake, and (`FERROFIN_FFMPEG_TESTS`) a generated clip.
-    #[tokio::test]
-    async fn end_credit_detection() {
+    /// `TestBlackFrames.TestEndCreditDetection`'s 5:30 episode, whose credits
+    /// go black at 300 s, with the settings it bisects under.
+    async fn end_credit_case() -> (Harness, IntroSkipperConfig, queue::QueuedEpisode) {
         let h = harness(&TWO_EPISODES, true, "{}", false).await;
         let config = IntroSkipperConfig {
             black_frame_minimum_percentage: 85,
@@ -3000,6 +2999,15 @@ mod tests {
             credits_fingerprint_start: 0.0,
             ..queued[0].1[0].clone()
         };
+        (h, config, entry)
+    }
+
+    /// `TestBlackFrames.TestEndCreditDetection`: the credits of
+    /// [`end_credit_case`], bisected from 240 s from the end, are found within
+    /// 3 s, against the fake.
+    #[tokio::test]
+    async fn end_credit_detection() {
+        let (h, config, entry) = end_credit_case().await;
         let fake = with_ffmpeg(
             &h,
             crate::ffmpeg::FakeFfmpeg {
@@ -3014,10 +3022,15 @@ mod tests {
             .expect("bisect")
             .expect("credits");
         assert!((297.0..=303.0).contains(&start), "{start}");
+    }
 
-        if std::env::var_os("FERROFIN_FFMPEG_TESTS").is_none() {
-            return;
-        }
+    /// [`end_credit_detection`] against a generated clip and the real ffmpeg,
+    /// on a harness of its own: the black-frame cache is keyed by episode, not
+    /// path, so after the fake's run every window would be read from it.
+    #[tokio::test]
+    #[ignore = "runs the real ffmpeg; run with --ignored"]
+    async fn real_ffmpeg_end_credit_detection() {
+        let (h, config, entry) = end_credit_case().await;
         let clip = h.cache.path().join("credits.mkv");
         let clip = clip.to_str().expect("utf-8").to_owned();
         let made = crate::ffmpeg::output(
@@ -3065,7 +3078,10 @@ mod tests {
             .await
             .expect("bisect")
             .expect("credits");
-        assert!((297.0..=303.0).contains(&start), "{start}");
+        // The bisection ends on the window at 303 s, the tolerance's edge: its
+        // halvings put that window's start at 303.0000000335, and ffmpeg reports
+        // the first frame at t=0 (the fake's tenths land on 303.0 exactly).
+        assert!((297.0..=303.0 + 1e-6).contains(&start), "{start}");
     }
 
     /// Black frames are cached as ffmpeg reported them; the

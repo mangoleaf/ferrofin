@@ -13,7 +13,7 @@ use ferrofin_api::create_router;
 use ferrofin_api::state::AppState;
 use ferrofin_api::test_support::{
     FakeAuthContext, FakeDto, FakeLibrary, FakeMediaSources, FakeMusic, FakeProviders, FakeSearch,
-    FakeSimilarItems, FakeSystem, FakeUserData, FakeUserViews,
+    FakeSimilarItems, FakeSystem, FakeUserData, FakeUserViews, FixedAuth, fake_user_entity,
 };
 use ferrofin_db::entities::security::DeviceEntity;
 use ferrofin_db::entities::users::UserEntity;
@@ -28,7 +28,6 @@ use ferrofin_model::users::UserPolicy;
 use ferrofin_traits::configuration::ServerConfigurationManager;
 use ferrofin_traits::error::ServiceError;
 use ferrofin_traits::library::UserManager;
-use ferrofin_traits::net::{AuthService, RequestContext};
 use ferrofin_traits::options::AuthorizationInfo;
 use ferrofin_traits::security::QuickConnect;
 use ferrofin_traits::session::{AuthenticationRequest, AuthenticationResultData, SessionManager};
@@ -43,56 +42,14 @@ const BOB_ID: Uuid = Uuid::from_u128(0x0B0B);
 /// Builds a neutral [`UserEntity`] with the given id + name (no `Default`).
 fn user_entity(id: Uuid, username: &str, password: Option<&str>) -> UserEntity {
     UserEntity {
-        id: id.to_string(),
-        audio_language_preference: None,
-        authentication_provider_id: String::new(),
-        cast_receiver_id: None,
-        display_collections_view: false,
-        display_missing_episodes: false,
-        enable_auto_login: false,
-        enable_local_password: false,
-        enable_next_episode_auto_play: false,
-        enable_user_preference_access: false,
-        hide_played_in_latest: false,
-        internal_id: 0,
-        invalid_login_attempt_count: 0,
-        last_activity_date: None,
-        last_login_date: None,
-        login_attempts_before_lockout: None,
-        max_active_sessions: 0,
-        max_parental_rating_score: None,
-        max_parental_rating_sub_score: None,
-        must_update_password: false,
         password: password.map(ToOwned::to_owned),
-        password_reset_provider_id: String::new(),
-        play_default_audio_track: false,
-        remember_audio_selections: false,
-        remember_subtitle_selections: false,
-        remote_client_bitrate_limit: None,
-        row_version: 0,
-        subtitle_language_preference: None,
-        subtitle_mode: 0,
-        sync_play_access: 0,
-        username: username.to_owned(),
-        normalized_username: username.to_uppercase(),
+        ..fake_user_entity(id, username)
     }
 }
 
-/// An [`AuthService`] authenticating as the admin user (so `RequireAuth` passes).
-struct AdminAuth;
-
-#[async_trait]
-impl AuthService for AdminAuth {
-    async fn authenticate(
-        &self,
-        _request: &RequestContext,
-    ) -> Result<AuthorizationInfo, ServiceError> {
-        Ok(AuthorizationInfo {
-            user: Some(Arc::new(user_entity(ADMIN_ID, "admin", Some("hash")))),
-            is_authenticated: true,
-            ..AuthorizationInfo::default()
-        })
-    }
+/// An `AuthService` authenticating as the admin user (so `RequireAuth` passes).
+fn admin_auth() -> FixedAuth {
+    FixedAuth::signed_in(user_entity(ADMIN_ID, "admin", Some("hash")))
 }
 
 /// A [`UserManager`] backed by an in-memory table, recording password/policy
@@ -125,9 +82,6 @@ fn mem_users() -> Vec<UserEntity> {
 impl UserManager for MemUsers {
     async fn get_users(&self) -> Result<Vec<UserEntity>, ServiceError> {
         Ok(mem_users())
-    }
-    async fn get_user_ids(&self) -> Result<Vec<Uuid>, ServiceError> {
-        Ok(vec![ADMIN_ID, BOB_ID])
     }
     async fn initialize(&self) -> Result<(), ServiceError> {
         Ok(())
@@ -401,14 +355,6 @@ impl SessionManager for NoopSessions {
     ) -> Result<(), ServiceError> {
         unimplemented!("fake")
     }
-    async fn send_message_to_user_device_sessions(
-        &self,
-        _device_id: &str,
-        _message_type: SessionMessageType,
-        _data: &str,
-    ) -> Result<(), ServiceError> {
-        unimplemented!("fake")
-    }
     async fn send_restart_required_notification(&self) -> Result<(), ServiceError> {
         unimplemented!("fake")
     }
@@ -504,11 +450,11 @@ impl SessionManager for NoopSessions {
 
 /// Assembles an [`AppState`] from the batch-6 fakes plus panic fakes elsewhere.
 fn state(users: Arc<MemUsers>, config: Arc<MemConfig>) -> AppState {
-    state_with_auth(users, config, Arc::new(AdminAuth))
+    state_with_auth(users, config, Arc::new(admin_auth()))
 }
 
 /// `state`, with the auth service chosen by the caller — the anonymous case
-/// needs one that REJECTS, since `AdminAuth` authenticates every request.
+/// needs one that REJECTS, since `admin_auth` authenticates every request.
 fn state_with_auth(
     users: Arc<MemUsers>,
     config: Arc<MemConfig>,

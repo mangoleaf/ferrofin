@@ -505,15 +505,19 @@ impl LibraryScanner {
             key,
             ancestors,
         };
-        // A season number's own season: a physical one over a virtual one,
-        // so a placeholder joins the season the library has. Ordered by
-        // number, as upstream's dictionary keeps the series' order.
+        // A season number's own season: a physical one (with a path,
+        // upstream's `LocationType != Virtual`) over a path-less one, so a
+        // placeholder joins the season the library has. Keyed on the path,
+        // not `IsVirtualItem`: a path-less season real episodes joined is
+        // non-virtual but still path-less (gl-1593). Ordered by number, as
+        // upstream's dictionary keeps the series' order.
+        let pathless = |row: &BaseItemEntity| row.path.as_deref().is_none_or(str::is_empty);
         let mut seasons: BTreeMap<i64, StoredSeason> = BTreeMap::new();
         for row in &season_rows {
             if let (Some(number), Ok(id)) = (row.index_number, Uuid::parse_str(&row.id)) {
                 let replaces = seasons
                     .get(&number)
-                    .is_none_or(|kept| kept.row.is_virtual_item && !row.is_virtual_item);
+                    .is_none_or(|kept| pathless(&kept.row) && !pathless(row));
                 if replaces {
                     seasons.insert(
                         number,
@@ -919,8 +923,11 @@ impl LibraryScanner {
         }
     }
 
-    /// `RemoveObsoleteSeasons`' empty-season rule over this provider's own
-    /// virtual seasons (path-less, with a TMDb id), as the same series
+    /// `RemoveObsoleteSeasons`' empty-season rule over the path-less seasons
+    /// with a TMDb id (this provider's, virtual or not once real episodes
+    /// joined one, and a loose-episode season the TMDb season provider
+    /// matched; the live no-child check below is what keeps one with
+    /// episodes), as the same series
     /// refresh deletes them upstream: one with no child left goes. Whether
     /// it has one is asked of the database right before the delete — a
     /// season's delete takes every row under it, so nothing the pass read
@@ -932,9 +939,12 @@ impl LibraryScanner {
         season_tmdb: &HashMap<String, Option<String>>,
         changes: &mut Changes,
     ) -> Result<(), ServiceError> {
+        // Path-less, as upstream's `LocationType == Virtual`, whatever the
+        // flag: a provider season real episodes joined is non-virtual, and
+        // still goes once it is empty (gl-1593).
         let candidates = season_rows
             .iter()
-            .filter(|s| s.is_virtual_item && s.path.as_deref().is_none_or(str::is_empty))
+            .filter(|s| s.path.as_deref().is_none_or(str::is_empty))
             .filter(|s| season_tmdb.get(&s.id).is_some_and(Option::is_some))
             .filter_map(|s| Uuid::parse_str(&s.id).ok());
         let mut empty = Vec::new();

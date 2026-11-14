@@ -16,7 +16,8 @@ use ferrofin_api::state::AppState;
 use ferrofin_api::test_support::{
     FakeAppHost, FakeCollections, FakeConfig, FakeMediaSegments, FakeMusic, FakePlaylists,
     FakeProviders, FakeQuickConnect, FakeSearch, FakeSessions, FakeSimilarItems, FakeSubtitles,
-    FakeSystem, FakeTrickplay, FakeTvSeries, FakeUserData, FakeUserViews, minimal_base_item,
+    FakeSystem, FakeTrickplay, FakeTvSeries, FakeUserData, FakeUserViews, FixedAuth,
+    fake_user_entity, minimal_base_item,
 };
 use ferrofin_db::entities::base_items::BaseItemEntity;
 use ferrofin_db::entities::users::UserEntity;
@@ -27,10 +28,7 @@ use ferrofin_model::media_info::{LiveStreamRequest, MediaProtocol};
 use ferrofin_model::querying::QueryResult;
 use ferrofin_traits::error::ServiceError;
 use ferrofin_traits::library::{LibraryManager, MediaSourceManager, UserManager};
-use ferrofin_traits::net::{AuthService, AuthorizationContext, RequestContext};
-use ferrofin_traits::options::{
-    AuthorizationInfo, DeleteOptions, InternalItemsQuery, InternalPeopleQuery,
-};
+use ferrofin_traits::options::{DeleteOptions, InternalItemsQuery, InternalPeopleQuery};
 use ferrofin_traits::persistence::ItemWithCounts;
 use ferrofin_traits::stubs::LyricManager;
 use tower::ServiceExt;
@@ -50,70 +48,14 @@ const STOPPED_TRACK: &str = "/music/Artist/Album/Stopped.flac";
 /// A minimal authenticated user for the stubs.
 fn user() -> UserEntity {
     UserEntity {
-        id: USER_ID.to_string(),
-        audio_language_preference: None,
-        authentication_provider_id: String::new(),
-        cast_receiver_id: None,
-        display_collections_view: false,
-        display_missing_episodes: false,
-        enable_auto_login: false,
-        enable_local_password: false,
-        enable_next_episode_auto_play: false,
-        enable_user_preference_access: false,
-        hide_played_in_latest: false,
-        internal_id: 0,
-        invalid_login_attempt_count: 0,
-        last_activity_date: None,
-        last_login_date: None,
-        login_attempts_before_lockout: None,
-        max_active_sessions: 0,
-        max_parental_rating_score: None,
-        max_parental_rating_sub_score: None,
-        must_update_password: false,
         password: Some("hashed".to_owned()),
-        password_reset_provider_id: String::new(),
-        play_default_audio_track: false,
-        remember_audio_selections: false,
-        remember_subtitle_selections: false,
-        remote_client_bitrate_limit: None,
-        row_version: 0,
-        subtitle_language_preference: None,
-        subtitle_mode: 0,
-        sync_play_access: 0,
-        username: "alice".to_owned(),
-        normalized_username: "ALICE".to_owned(),
+        ..fake_user_entity(USER_ID, "alice")
     }
 }
 
-/// An [`AuthService`]/[`AuthorizationContext`] that authenticates as [`USER_ID`].
-struct OkAuth;
-
-#[async_trait]
-impl AuthService for OkAuth {
-    async fn authenticate(
-        &self,
-        _request: &RequestContext,
-    ) -> Result<AuthorizationInfo, ServiceError> {
-        Ok(AuthorizationInfo {
-            user: Some(Arc::new(user())),
-            is_authenticated: true,
-            ..AuthorizationInfo::default()
-        })
-    }
-}
-
-#[async_trait]
-impl AuthorizationContext for OkAuth {
-    async fn get_authorization_info(
-        &self,
-        _request: &RequestContext,
-    ) -> Result<AuthorizationInfo, ServiceError> {
-        Ok(AuthorizationInfo {
-            user: Some(Arc::new(user())),
-            is_authenticated: true,
-            ..AuthorizationInfo::default()
-        })
-    }
+/// An `AuthService`/`AuthorizationContext` that authenticates as [`USER_ID`].
+fn ok_auth() -> FixedAuth {
+    FixedAuth::signed_in(user())
 }
 
 /// A [`UserManager`] resolving the fixed authenticated user. The flags are the
@@ -142,9 +84,6 @@ impl UserManager for OkUsers {
         })
     }
     async fn get_users(&self) -> Result<Vec<UserEntity>, ServiceError> {
-        unimplemented!()
-    }
-    async fn get_user_ids(&self) -> Result<Vec<Uuid>, ServiceError> {
         unimplemented!()
     }
     async fn initialize(&self) -> Result<(), ServiceError> {
@@ -381,13 +320,6 @@ impl LibraryManager for StreamLibrary {
     ) -> Result<Vec<BaseItemEntity>, ServiceError> {
         unimplemented!()
     }
-    async fn create_items(
-        &self,
-        _i: &[BaseItemEntity],
-        _p: Option<Uuid>,
-    ) -> Result<(), ServiceError> {
-        unimplemented!()
-    }
     async fn update_items(
         &self,
         _i: &[BaseItemEntity],
@@ -549,8 +481,8 @@ fn state_as(path: &str, lyrics: Arc<dyn LyricManager>, admin: bool, lyric: bool)
         Arc::new(FakeSimilarItems),
         Arc::new(FakeSearch),
         Arc::new(ferrofin_api::test_support::FakeDto),
-        Arc::new(OkAuth),
-        Arc::new(OkAuth),
+        Arc::new(ok_auth()),
+        Arc::new(ok_auth()),
         Arc::new(FakeQuickConnect),
         Arc::new(FakePlaylists),
         Arc::new(FakeCollections),
@@ -724,6 +656,33 @@ async fn lyrics_routes_404_on_a_non_audio_item() {
         assert_eq!(status, StatusCode::NOT_FOUND, "{method} {path}");
     }
     // …and nothing was deleted along the way.
+    assert!(!*deleted.lock().unwrap());
+}
+
+#[tokio::test]
+async fn lyrics_routes_400_on_a_nil_item_id() {
+    // `GetItemById<Audio>(Guid.Empty, …)` reaches `GetItemById(Guid)`, which
+    // throws `ArgumentException("Guid can't be empty")`: a 400, not a 404.
+    let deleted = Arc::new(Mutex::new(false));
+    let canned = || CannedLyrics {
+        stored: Some(LyricDto::default()),
+        remote: Some(("abc_1".to_owned(), LyricDto::default())),
+        deleted: deleted.clone(),
+        saved: Arc::default(),
+    };
+    let nil = Uuid::nil();
+    for (method, path) in [
+        ("GET", format!("/Audio/{nil}/Lyrics")),
+        ("POST", format!("/Audio/{nil}/Lyrics?fileName=x.lrc")),
+        ("DELETE", format!("/Audio/{nil}/Lyrics")),
+        ("GET", format!("/Audio/{nil}/RemoteSearch/Lyrics")),
+        ("POST", format!("/Audio/{nil}/RemoteSearch/Lyrics/abc_1")),
+    ] {
+        let (_dir, path_media) = temp_media();
+        let app = state(&path_media, Arc::new(canned()));
+        let (status, _) = call(app, method, &path).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{method} {path}");
+    }
     assert!(!*deleted.lock().unwrap());
 }
 

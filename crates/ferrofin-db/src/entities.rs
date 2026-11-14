@@ -3,13 +3,13 @@
 //!
 //! Each struct mirrors exactly one table: its fields map one-to-one onto that
 //! table's columns (see `migrations/0001_initial.sql`, which reflects the EF
-//! model snapshot). The structs are the raw storage shape; the `From<entity>`
-//! conversions into `ferrofin-model` DTOs live alongside the conversion layer.
+//! model snapshot). The structs are the raw storage shape; the crates that
+//! read them build the `ferrofin-model` DTOs.
 //!
 //! ## Column-to-Rust type conventions
 //! - `INTEGER` surrogate primary keys → [`i64`] (SQLite integer affinity).
 //! - `TEXT` `Guid` columns → [`String`], the hyphenated stored form
-//!   (`Option<String>` where nullable); the conversion layer parses them into
+//!   (`Option<String>` where nullable); callers parse them into
 //!   `Uuid`. (SQLite has no native `Guid`, and sqlx's `Uuid` decoder expects a
 //!   16-byte `BLOB`, so the faithful storage shape here is the `TEXT` string.)
 //! - `TEXT` `DateTime` columns → [`DateTime<Utc>`](chrono::DateTime).
@@ -17,8 +17,7 @@
 //!   rating and gain columns decode through [`finite_real::FiniteReal`], which
 //!   reads a non-finite value as `None` (Jellyfin 12.3's `FiniteOrNull`).
 //! - Enum-valued `INTEGER` columns are kept as [`i32`] discriminants here and
-//!   mapped onto the [`crate::enums`] / `ferrofin-model` enum types by the
-//!   conversion layer.
+//!   mapped onto the [`crate::enums`] / `ferrofin-model` enum types by callers.
 //! - `RowVersion` optimistic-concurrency tokens (`INTEGER`) → [`i64`].
 
 pub mod activity;
@@ -27,6 +26,7 @@ pub mod display_preferences;
 pub mod finite_real;
 pub mod playback;
 pub mod security;
+pub mod unset;
 pub mod users;
 
 #[cfg(test)]

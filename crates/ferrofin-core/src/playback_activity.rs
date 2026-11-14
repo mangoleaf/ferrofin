@@ -7,8 +7,8 @@
 //! `SessionManager.OnPlaybackStart` / `OnPlaybackStopped` publish. Because they
 //! hang off those events, every route that reports playback writes them: the
 //! `/Sessions/Playing` reports and the obsolete `/PlayingItems/{itemId}` forms
-//! alike. As upstream's read `eventArgs.MediaInfo`, they write from the item
-//! the event carries and read nothing.
+//! alike. As upstream's read `eventArgs.MediaInfo` and `eventArgs.Item`, they
+//! write from the items the event carries and read nothing.
 
 use std::sync::Arc;
 
@@ -40,13 +40,18 @@ struct PlaybackEvent {
     device_name: Option<String>,
     #[serde(default)]
     item_id: Option<Uuid>,
-    /// `null` when the library has no item of that id.
+    /// `null` when the report neither carried an `Item` nor named one the
+    /// library has.
     #[serde(default)]
     media_info: Option<MediaInfo>,
+    /// `null` when the library has no item of that id.
+    #[serde(default)]
+    item: Option<LibraryItem>,
 }
 
-/// The item a playback event names (`session_manager::playback_media_info`):
-/// C# `eventArgs.MediaInfo`, and its `ExtraType` for `eventArgs.Item.IsThemeMedia`.
+/// The item a playback event names (`session_manager::playback_media_info`,
+/// `reported_media_info`): the members of C# `eventArgs.MediaInfo` the loggers
+/// read.
 #[derive(Debug, Default, serde::Deserialize)]
 #[serde(rename_all = "PascalCase", default)]
 struct MediaInfo {
@@ -54,6 +59,15 @@ struct MediaInfo {
     series_name: Option<String>,
     artists: Vec<String>,
     media_type: Option<String>,
+}
+
+/// The library item a playback event names
+/// (`session_manager::playback_library_item`): C# `eventArgs.Item`, its `Id`
+/// and its `ExtraType` for `IsThemeMedia`.
+#[derive(Debug, Default, serde::Deserialize)]
+#[serde(rename_all = "PascalCase", default)]
+struct LibraryItem {
+    id: Option<Uuid>,
     extra_type: Option<String>,
 }
 
@@ -101,8 +115,14 @@ async fn record(activity: &dyn ActivityManager, event: PlaybackEvent, phase: Pha
         );
         return;
     };
-    // "Don't report theme song or local trailer playback."
-    if is_theme_media(item.extra_type.as_deref()) {
+    // `eventArgs.Item is not null && eventArgs.Item.IsThemeMedia`: "Don't
+    // report theme song or local trailer playback."
+    if is_theme_media(
+        event
+            .item
+            .as_ref()
+            .and_then(|item| item.extra_type.as_deref()),
+    ) {
         return;
     }
     let Some(type_) = notification_type(phase, item.media_type.as_deref()) else {
@@ -126,7 +146,8 @@ async fn record(activity: &dyn ActivityManager, event: PlaybackEvent, phase: Pha
         name,
         type_: type_.to_owned(),
         user_id: event.user_id.filter(|id| !id.is_nil()),
-        item_id,
+        // `ItemId = eventArgs.Item?.Id`: none for an item the library lacks.
+        item_id: event.item.and_then(|item| item.id),
         severity: LogLevel::Information,
         ..Default::default()
     };
@@ -190,9 +211,9 @@ mod tests {
     use super::{Phase, is_theme_media, item_name, notification_type, subscribe};
     use crate::event_manager::FerrofinEventManager;
 
-    /// The entries written, as (name, type).
+    /// The entries written, as (name, type, item id).
     #[derive(Default)]
-    struct Recorded(Mutex<Vec<(String, String)>>);
+    struct Recorded(Mutex<Vec<(String, String, Option<Uuid>)>>);
 
     #[async_trait]
     impl ActivityManager for Recorded {
@@ -203,7 +224,10 @@ mod tests {
             unreachable!("the loggers only write")
         }
         async fn create_entry(&self, entry: ActivityLogCreate) -> Result<(), ServiceError> {
-            self.0.lock().unwrap().push((entry.name, entry.type_));
+            self.0
+                .lock()
+                .unwrap()
+                .push((entry.name, entry.type_, entry.item_id));
             Ok(())
         }
         async fn clean(&self, _before: DateTime<Utc>) -> Result<u64, ServiceError> {
@@ -212,36 +236,57 @@ mod tests {
     }
 
     /// The loggers write from the event's `MediaInfo`, as upstream's read
-    /// `eventArgs.MediaInfo`: theme media writes nothing, and an audio item is
-    /// named from its first artist and its series.
+    /// `eventArgs.MediaInfo`: an audio item is named from its first artist and
+    /// its series. The library item (`eventArgs.Item`) gives the entry its
+    /// `ItemId`, none for an item the library does not have, and theme media
+    /// writes nothing.
     #[tokio::test]
     async fn the_loggers_write_from_the_events_media_info() {
         let bus = FerrofinEventManager::new();
         let recorded = Arc::new(Recorded::default());
         subscribe(&bus, &(Arc::clone(&recorded) as Arc<dyn ActivityManager>));
-        let event = |extra_type: serde_json::Value| {
+        let library_item = Uuid::new_v4();
+        let event = |item: serde_json::Value| {
             serde_json::json!({
                 "UserId": Uuid::new_v4(), "UserName": "viewer", "DeviceName": "TV",
                 "ItemId": Uuid::new_v4(),
                 "MediaInfo": {
                     "Name": "Track", "SeriesName": "Show", "Artists": ["A", "B"],
-                    "MediaType": "Audio", "ExtraType": extra_type,
+                    "MediaType": "Audio",
                 },
+                "Item": item,
             })
             .to_string()
         };
-        bus.publish("PlaybackStart", &event("ThemeSong".into()))
-            .await
-            .unwrap();
-        bus.publish("PlaybackStopped", &event(serde_json::Value::Null))
+        bus.publish(
+            "PlaybackStart",
+            &event(serde_json::json!({ "Id": library_item, "ExtraType": "ThemeSong" })),
+        )
+        .await
+        .unwrap();
+        bus.publish(
+            "PlaybackStopped",
+            &event(serde_json::json!({ "Id": library_item, "ExtraType": null })),
+        )
+        .await
+        .unwrap();
+        bus.publish("PlaybackStart", &event(serde_json::Value::Null))
             .await
             .unwrap();
         assert_eq!(
             *recorded.0.lock().unwrap(),
-            [(
-                "viewer has finished playing A - Show - Track on TV".to_owned(),
-                "AudioPlaybackStopped".to_owned()
-            )]
+            [
+                (
+                    "viewer has finished playing A - Show - Track on TV".to_owned(),
+                    "AudioPlaybackStopped".to_owned(),
+                    Some(library_item)
+                ),
+                (
+                    "viewer is playing A - Show - Track on TV".to_owned(),
+                    "AudioPlayback".to_owned(),
+                    None
+                )
+            ]
         );
     }
 

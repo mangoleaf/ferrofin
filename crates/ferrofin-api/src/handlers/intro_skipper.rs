@@ -44,7 +44,7 @@ use ferrofin_traits::options::InternalItemsQuery;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::auth::{RequireAdmin, RequireAuth};
+use crate::auth::{RequireAdmin, RequireAdminWithDefault, RequireAuth};
 use crate::error::ApiError;
 use crate::extract::{DotnetGuid, JsonBody, Query};
 use crate::state::AppState;
@@ -261,6 +261,11 @@ async fn timestamps_for(state: &AppState, item_id: Uuid) -> Result<TimeStamps, A
 // ---------------------------------------------------------------------------
 // SkipIntro controller
 // ---------------------------------------------------------------------------
+//
+// `SkipIntroController` is `[Authorize]` and its three writes add
+// `RequiresElevation`, so they need both: the administrator role and the
+// default policy's remote-access check, which bare elevation (the other four
+// controllers) skips.
 
 /// `POST /Episode/{Id}/Timestamps` — replace an episode/movie's user timestamps.
 ///
@@ -269,7 +274,7 @@ async fn timestamps_for(state: &AppState, item_id: Uuid) -> Result<TimeStamps, A
 /// item is not an Episode or Movie.
 async fn update_timestamps(
     State(state): State<AppState>,
-    RequireAdmin(_auth): RequireAdmin,
+    RequireAdminWithDefault(_auth): RequireAdminWithDefault,
     Path(DotnetGuid(id)): Path<DotnetGuid>,
     JsonBody(timestamps): JsonBody<TimeStamps>,
 ) -> Result<StatusCode, ApiError> {
@@ -356,7 +361,7 @@ async fn get_skippable_segments(
 /// Credits only, as upstream).
 async fn erase_timestamps(
     State(state): State<AppState>,
-    RequireAdmin(_auth): RequireAdmin,
+    RequireAdminWithDefault(_auth): RequireAdminWithDefault,
     Query(query): Query<EraseQuery>,
 ) -> Result<StatusCode, ApiError> {
     let mode = query.mode.unwrap_or(AnalysisMode::Introduction);
@@ -397,7 +402,7 @@ async fn erase_timestamps(
 /// prune of invalid segments. Not published, as upstream does not refresh.
 async fn rebuild_database(
     State(state): State<AppState>,
-    RequireAdmin(_auth): RequireAdmin,
+    RequireAdminWithDefault(_auth): RequireAdminWithDefault,
 ) -> Result<StatusCode, ApiError> {
     let pruned = state.intro_skipper.prune_invalid().await?;
     tracing::info!(pruned, "intro skipper: database rebuilt");

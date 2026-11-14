@@ -613,6 +613,44 @@ async fn a_photo_toggle_removes_existing_photos_and_rediscovers_them_when_enable
     assert!(lib.row(movie).await.is_some());
 }
 
+/// A photo row whose file `PhotoResolver.IsImageFile` no longer takes (an
+/// `.svg` an earlier scan listed) is removed by the next scan, as upstream's
+/// `Folder.ValidateChildrenInternal2` drops a child no resolver returns. Its
+/// file and the other photos stay.
+#[tokio::test]
+async fn a_photo_row_the_resolver_no_longer_takes_is_pruned() {
+    use ferrofin_traits::persistence::ItemPersistenceService;
+    let lib = Library::of_type(&["A.jpg", "B.svg"], CollectionTypeOptions::homevideos).await;
+    lib.scanner.scan_all().await.unwrap();
+    let jpg = derive_item_id(
+        BaseItemKind::Photo,
+        &lib.media.join("A.jpg").to_string_lossy(),
+    )
+    .unwrap();
+    let svg_path = lib.media.join("B.svg").to_string_lossy().into_owned();
+    let svg = derive_item_id(BaseItemKind::Photo, &svg_path).unwrap();
+    assert!(lib.row(svg).await.is_none(), "an .svg is no photo");
+    // The row an earlier scan, which took `.svg`, saved for it.
+    let mut row = lib.row(jpg).await.expect("the .jpg photo");
+    row.id = guid_to_db(svg);
+    row.path = Some(svg_path);
+    row.name = Some("B".to_owned());
+    row.presentation_unique_key = None;
+    FerrofinItemPersistenceService::new(lib.db.clone())
+        .save_items(&[row])
+        .await
+        .unwrap();
+    assert!(lib.row(svg).await.is_some());
+
+    lib.scanner.scan_all().await.unwrap();
+    assert!(
+        lib.row(svg).await.is_none(),
+        "the stale .svg photo is pruned"
+    );
+    assert!(lib.row(jpg).await.is_some());
+    assert!(lib.media.join("B.svg").is_file());
+}
+
 #[tokio::test]
 async fn disabling_photos_does_not_prune_an_unreachable_location() {
     let lib = Library::of_type(&["Album/A.jpg"], CollectionTypeOptions::homevideos).await;
@@ -1094,6 +1132,126 @@ async fn a_mixed_librarys_plain_folder_parents_the_series_in_it() {
             "{item}"
         );
     }
+}
+
+/// In a mixed library an audio file inside a plain folder hangs off that
+/// folder, as a video there does (`AudioResolver` with no collection type,
+/// under `Folder.GetNonCachedChildren`'s `ResolvePaths(…, this, …)`): the
+/// folder lists it, every folder above it is an ancestor, and a file at the
+/// top still hangs off the location. A song an older scan hung off the
+/// location moves to its folder on the next scan, keeping its one row.
+#[tokio::test]
+#[allow(clippy::too_many_lines)] // one tree, every property of it
+async fn a_mixed_librarys_plain_folder_parents_the_audio_in_it() {
+    let lib = Library::of_type(
+        &["Anime/song.mp3", "Anime/Classics/old.flac", "top.mp3"],
+        CollectionTypeOptions::mixed,
+    )
+    .await;
+    lib.scanner.scan_all().await.unwrap();
+    let id =
+        |kind, path: &str| derive_item_id(kind, &lib.media.join(path).to_string_lossy()).unwrap();
+    let anime = id(BaseItemKind::Folder, "Anime");
+    let classics = id(BaseItemKind::Folder, "Anime/Classics");
+    let song = id(BaseItemKind::Audio, "Anime/song.mp3");
+    let old = id(BaseItemKind::Audio, "Anime/Classics/old.flac");
+    let top = id(BaseItemKind::Audio, "top.mp3");
+    let location = lib.location();
+    let parent_of = |row: Option<BaseItemEntity>| {
+        let row = row.expect("scanned");
+        let id = |value: Option<String>| value.and_then(|p| Uuid::parse_str(&p).ok());
+        (id(row.parent_id), id(row.top_parent_id))
+    };
+    assert_eq!(
+        parent_of(lib.row(song).await),
+        (Some(anime), Some(location))
+    );
+    assert_eq!(
+        parent_of(lib.row(old).await),
+        (Some(classics), Some(location)),
+        "two plain folders down"
+    );
+    assert_eq!(
+        parent_of(lib.row(top).await),
+        (Some(location), Some(location)),
+        "at the top"
+    );
+    let above = [location, lib.cf, lib.aggregate].map(guid_to_db);
+    for (item, folders) in [(song, vec![anime]), (old, vec![classics, anime])] {
+        let ancestors = lib.ancestors(item).await;
+        for expected in folders.into_iter().map(guid_to_db).chain(above.clone()) {
+            assert!(
+                ancestors.contains(&expected),
+                "{item}: {expected} in {ancestors:?}"
+            );
+        }
+    }
+    assert!(!lib.ancestors(top).await.contains(&guid_to_db(anime)));
+    let children = |parent: Uuid| {
+        let items = Arc::clone(&lib.items);
+        async move {
+            let mut ids: Vec<Uuid> = items
+                .get_item_list(&InternalItemsQuery {
+                    parent_id: parent,
+                    ..Default::default()
+                })
+                .await
+                .unwrap()
+                .into_iter()
+                .filter_map(|row| Uuid::parse_str(&row.id).ok())
+                .collect();
+            ids.sort();
+            ids
+        }
+    };
+    let mut expected = vec![song, classics];
+    expected.sort();
+    assert_eq!(children(anime).await, expected);
+    let mut expected = vec![anime, top];
+    expected.sort();
+    assert_eq!(children(location).await, expected);
+
+    // A rescan changes nothing.
+    let again = lib.scanner.scan_all().await.unwrap();
+    assert_eq!(
+        (again.created, again.updated, again.removed),
+        (0, 0, 0),
+        "{again:?}"
+    );
+
+    // What an older scan stored: the song off the location, the folder in
+    // none of its ancestors. The next scan moves that row.
+    sqlx::query(r#"UPDATE "BaseItems" SET "ParentId" = ?1 WHERE "Id" = ?2"#)
+        .bind(guid_to_db(location))
+        .bind(guid_to_db(song))
+        .execute(lib.db.writer())
+        .await
+        .unwrap();
+    sqlx::query(r#"DELETE FROM "AncestorIds" WHERE "ParentItemId" = ?1 AND "ItemId" = ?2"#)
+        .bind(guid_to_db(anime))
+        .bind(guid_to_db(song))
+        .execute(lib.db.writer())
+        .await
+        .unwrap();
+    let moved = lib.scanner.scan_all().await.unwrap();
+    assert_eq!((moved.created, moved.removed), (0, 0), "{moved:?}");
+    assert_eq!(
+        parent_of(lib.row(song).await),
+        (Some(anime), Some(location)),
+        "moved on rescan"
+    );
+    assert!(lib.ancestors(song).await.contains(&guid_to_db(anime)));
+    let rows: i64 = sqlx::query_scalar(r#"SELECT COUNT(*) FROM "BaseItems" WHERE "Path" = ?1"#)
+        .bind(
+            lib.media
+                .join("Anime/song.mp3")
+                .to_string_lossy()
+                .into_owned(),
+        )
+        .fetch_one(lib.db.pool())
+        .await
+        .unwrap();
+    assert_eq!(rows, 1, "one row for the song");
 }
 
 /// A removed location's movie goes with its folder (the stale-row prune and

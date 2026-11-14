@@ -288,7 +288,13 @@ impl WebFileTransformationService {
             registrations: RwLock::new(Vec::new()),
             plugins,
             local_api,
-            http: reqwest::Client::new(),
+            // The plugin's `new HttpClient()` decodes no compressed body.
+            http: reqwest::Client::builder()
+                .no_gzip()
+                .no_brotli()
+                .no_deflate()
+                .build()
+                .unwrap_or_default(),
             endpoint_timeout: HTTP_CLIENT_DEFAULT_TIMEOUT,
             failing: Mutex::default(),
         }

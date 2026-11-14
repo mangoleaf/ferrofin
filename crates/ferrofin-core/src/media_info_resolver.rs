@@ -358,11 +358,14 @@ impl MediaInfoResolver {
     /// (`IDirectoryService.GetFilePaths`, non-recursive) whose stem starts
     /// with `prefix` (ignoring case): the only ones [`get_external_files`]
     /// can match, taken before the paths are copied out of the listing,
-    /// which a scan shares between every item in the folder.
+    /// which a scan shares between every item in the folder. Sorted as
+    /// upstream's `GetFilePaths` sorts its listing (`OrderBy(x => x)`), so
+    /// external streams are numbered in that order, not the directory's.
     ///
     /// [`get_external_files`]: Self::get_external_files
     fn file_paths(&self, folder: &str, prefix: &str) -> Vec<String> {
-        self.file_system
+        let mut paths: Vec<String> = self
+            .file_system
             .shared_file_system_entries(folder)
             .iter()
             .filter(|entry| entry.type_ == FileSystemEntryType::File)
@@ -374,7 +377,9 @@ impl MediaInfoResolver {
                 .is_some()
             })
             .map(|entry| entry.path.clone())
-            .collect()
+            .collect();
+        paths.sort_by(|a, b| ferrofin_naming::culture_cmp(a, b));
+        paths
     }
 
     /// Probes one external file as this resolver's media type. Port of the
@@ -1005,6 +1010,72 @@ mod tests {
         let paths = external_paths(video_files, metadata_files);
         let extensions: Vec<&str> = paths.iter().map(|p| naming_path::extension(p)).collect();
         assert_eq!(extensions, expected_extensions, "{paths:?}");
+    }
+
+    /// Upstream's `DirectoryService.GetFilePaths` hands each folder's files
+    /// over sorted (`OrderBy(x => x)`, the current culture), whatever order
+    /// the directory lists them in: case-blind first, lowercase before
+    /// uppercase on a tie, each folder on its own, the video folder first.
+    #[test]
+    fn get_external_files_sorts_each_folder_listing() {
+        let paths = external_paths(
+            &[
+                "My.Video.fr.srt",
+                "My.Video.EN.srt",
+                "My.Video.de.srt",
+                "My.Video.en.srt",
+                "My.Video.en.sdh.srt",
+            ],
+            &["My.Video.ja.srt", "My.Video.af.srt"],
+        );
+        let video = |f: &str| format!("{VIDEO_DIRECTORY_PATH}/{f}");
+        let metadata = |f: &str| format!("{METADATA_DIRECTORY_PATH}/{f}");
+        assert_eq!(
+            paths,
+            [
+                video("My.Video.de.srt"),
+                video("My.Video.en.sdh.srt"),
+                video("My.Video.en.srt"),
+                video("My.Video.EN.srt"),
+                video("My.Video.fr.srt"),
+                metadata("My.Video.af.srt"),
+                metadata("My.Video.ja.srt"),
+            ]
+        );
+    }
+
+    /// External streams are numbered in the sorted file order, not the
+    /// directory's.
+    #[tokio::test]
+    async fn get_external_streams_numbers_sidecars_in_sorted_order() {
+        let fs = FakeFs::new(
+            &[VIDEO_DIRECTORY_PATH],
+            vec![(
+                VIDEO_DIRECTORY_PATH,
+                ["My.Video.fr.srt", "My.Video.de.srt", "My.Video.en.srt"]
+                    .iter()
+                    .map(|f| format!("{VIDEO_DIRECTORY_PATH}/{f}"))
+                    .collect(),
+            )],
+        );
+        let subtitle = MediaStream {
+            stream_type: MediaStreamType::Subtitle,
+            ..MediaStream::default()
+        };
+        let resolver = resolver(DlnaProfileType::Subtitle, vec![subtitle], fs);
+
+        let streams = resolver
+            .get_external_streams(&video("My.Video.mkv"), 2)
+            .await;
+
+        let numbered: Vec<(i32, Option<&str>)> = streams
+            .iter()
+            .map(|s| (s.index, s.language.as_deref()))
+            .collect();
+        assert_eq!(
+            numbered,
+            [(2, Some("deu")), (3, Some("eng")), (4, Some("fra"))]
+        );
     }
 
     // GetExternalStreams_BadPaths_ReturnsNoSubtitles

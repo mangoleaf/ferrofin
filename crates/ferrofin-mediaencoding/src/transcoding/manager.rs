@@ -136,7 +136,7 @@ fn transcoding_info(
         height: state.output_height(),
         audio_channels: state.output_audio_channels,
         hardware_acceleration_type: Some(hardware_acceleration_type),
-        transcode_reasons: Vec::new(),
+        transcode_reasons: ferrofin_model::session::transcode_reason_list(state.transcode_reasons),
     }
 }
 
@@ -314,8 +314,8 @@ struct RunningJob {
     output_dir: PathBuf,
     /// The `.m3u8`/output path whose stem selects the files to delete.
     playlist_path: PathBuf,
-    /// The segment file extension (e.g. `.ts`), for diagnostics/index scans.
-    #[allow(dead_code)]
+    /// The segment file extension (e.g. `.ts`), which names the segment file
+    /// `wait_for_segment` waits for.
     segment_extension: String,
     /// The first segment this job's ffmpeg writes: its `-start_number`, or the
     /// hls muxer's default 0. Segments below it, or past a gap in its run, are
@@ -983,7 +983,8 @@ impl<S: SessionReporter, C: FileCleaner> TranscodeManagerImpl<S, C> {
     /// cannot both pass the check. The job enters with its start as a consumer,
     /// which the caller's [`TranscodeRequestGuard`] releases: under the same
     /// lock, so a concurrent start from the same user and device cannot take
-    /// it for idle.
+    /// it for idle. An exited job of the same output is dropped from the
+    /// registry, with no teardown: the new job writes that output.
     fn register_job_for_user(
         &self,
         handle: &TranscodingJobHandle,
@@ -996,6 +997,17 @@ impl<S: SessionReporter, C: FileCleaner> TranscodeManagerImpl<S, C> {
         } else {
             None
         };
+        // An exited job of the same output (a failed start, or one whose output
+        // is gone) gives way: every lookup is by output path, so it would
+        // answer for this one. Upstream adds the new job beside it.
+        jobs.retain(|job| {
+            !(job.handle.job_type == handle.job_type
+                && job.handle.path.eq_ignore_ascii_case(&handle.path)
+                && job
+                    .running
+                    .as_ref()
+                    .is_some_and(|running| running.child.has_exited()))
+        });
         jobs.push(RegisteredJob {
             ping_timeout_ms: RegisteredJob::ping_timeout_for(handle.job_type),
             display: String::new(),
@@ -1057,7 +1069,8 @@ impl<S: SessionReporter, C: FileCleaner> TranscodeManagerImpl<S, C> {
     /// [`StartFfmpegError::Failed`] if the output directory cannot be created,
     /// the process cannot be spawned, ffmpeg exits non-zero, the job is killed
     /// before its first segment appears, or that segment does not appear within
-    /// [`WAIT_FOR_FILE_TIMEOUT_MS`].
+    /// [`WAIT_FOR_FILE_TIMEOUT_MS`]. A job whose ffmpeg exited non-zero stays
+    /// registered, as upstream's does, until it is killed or reaped.
     ///
     /// # Panics
     ///
@@ -1295,6 +1308,11 @@ impl<S: SessionReporter, C: FileCleaner> TranscodeManagerImpl<S, C> {
 
     /// After the first-segment wait, turns an already-exited-nonzero ffmpeg into
     /// an error (and logs the silent death); a clean early exit logs at debug.
+    ///
+    /// The failed job stays registered with its exited process, as upstream's
+    /// `StartFfMpeg` throws without removing it: a retry finds its output
+    /// through it and ends at the output's end, and the stop report or the
+    /// idle reaper removes it with its output (gl-1373).
     fn fail_if_exited_nonzero(
         &self,
         handle: &TranscodingJobHandle,
@@ -1305,7 +1323,6 @@ impl<S: SessionReporter, C: FileCleaner> TranscodeManagerImpl<S, C> {
         }
         let code = self.with_running(handle, |r| r.child.exit_code()).flatten();
         if code.unwrap_or(0) != 0 {
-            self.remove_job_by_path(&handle.path, handle.job_type);
             // The bare exit code hides the actual cause (unreadable input, bad
             // args); ffmpeg's stderr in the transcode log names it.
             let tail = stderr_log_tail(stderr_log);
@@ -1403,6 +1420,28 @@ impl<S: SessionReporter, C: FileCleaner> TranscodeManagerImpl<S, C> {
     #[must_use]
     pub fn segment_start_number(&self, handle: &TranscodingJobHandle) -> Option<i32> {
         self.with_running(handle, |running| running.start_number)
+    }
+
+    /// Whether the running job behind `handle` has served a segment at or past
+    /// `index`, its own or one an earlier job left. Rolling deletion removes
+    /// segments only up to one the job has served, so until then every segment
+    /// it wrote from `index` on is still on disk. `false` when no process is
+    /// attached to it.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal job-registry mutex has been poisoned.
+    #[must_use]
+    pub fn has_served_segment_from(&self, handle: &TranscodingJobHandle, index: i32) -> bool {
+        self.with_running(handle, |running| {
+            running
+                .served_segments
+                .lock()
+                .expect("served_segments lock poisoned")
+                .keys()
+                .any(|&served| served >= i64::from(index))
+        })
+        .unwrap_or(false)
     }
 
     /// Kills the process behind `handle` (if any) and removes it, deleting its
@@ -2600,6 +2639,7 @@ mod start_ffmpeg_tests {
             is_input_video: true,
             subtitle_delivery_method: ferrofin_model::dlna::SubtitleDeliveryMethod::Encode,
             trimmed_subtitle_path: None,
+            transcode_reasons: ferrofin_model::session::TranscodeReasons::empty(),
             run_time_ticks: None,
             transcoding_type: TranscodingJobType::Hls,
             supported_video_codecs: Vec::new(),
@@ -2615,6 +2655,27 @@ mod start_ffmpeg_tests {
 
     fn manager() -> TranscodeManagerImpl<NoopSessionReporter> {
         TranscodeManagerImpl::new(NoopSessionReporter)
+    }
+
+    /// `ReportTranscodingProgress` publishes `TranscodeReasons =
+    /// state.TranscodeReasons`, as the JSON list in ascending bit order.
+    #[test]
+    fn the_session_info_reports_the_jobs_transcode_reasons() {
+        use ferrofin_model::session::{TranscodeReason, TranscodeReasons};
+        let mut st = state(Path::new("/transcodes/out.m3u8"), None);
+        st.transcode_reasons =
+            TranscodeReasons::AUDIO_CODEC_NOT_SUPPORTED | TranscodeReasons::CONTAINER_NOT_SUPPORTED;
+        let info = super::transcoding_info(
+            &st,
+            ferrofin_model::entities::HardwareAccelerationType::none,
+        );
+        assert_eq!(
+            info.transcode_reasons,
+            [
+                TranscodeReason::ContainerNotSupported,
+                TranscodeReason::AudioCodecNotSupported
+            ]
+        );
     }
 
     #[test]
@@ -2878,7 +2939,115 @@ mod start_ffmpeg_tests {
             .await
             .unwrap_err();
         assert!(err.to_string().contains("exited with code 1"), "got: {err}");
+        // The job stays registered, as upstream's `StartFfMpeg` throws
+        // without removing it (gl-1373).
+        assert_eq!(m.active_job_count(), 1);
+    }
+
+    /// A progressive `state` writing `output`, with no buffer wait.
+    fn progressive(output: &Path) -> EncodingJobInfo {
+        EncodingJobInfo {
+            transcoding_type: TranscodingJobType::Progressive,
+            is_input_video: false,
+            ..state(output, None)
+        }
+    }
+
+    /// A progressive start whose ffmpeg exits non-zero after writing some
+    /// output keeps its exited job, as upstream's `StartFfMpeg` does: a retry
+    /// of the same request serves the output through that job, so its body
+    /// ends at the output's end, and the stop report removes the job and
+    /// deletes the output (gl-1373).
+    #[tokio::test]
+    async fn a_progressive_start_that_exits_nonzero_keeps_its_job_for_the_retry_and_the_stop() {
+        let tmp = tempfile::tempdir().unwrap();
+        let output = tmp.path().join("s").join("out.mkv");
+        let fake = FakeSegmentTranscoder::new(FakeScript {
+            extra_files: vec!["out.mkv".to_owned()],
+            exit_code: 1,
+            exits_immediately: true,
+            ..FakeScript::default()
+        });
+        let m = Arc::new(manager());
+        let st = progressive(&output);
+        let err = m
+            .start_ffmpeg(&fake, ffmpeg_req(&st, &output, vec![]))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("exited with code 1"), "got: {err}");
+
+        let observer = m
+            .stream_progress(&output.to_string_lossy())
+            .expect("the retry is served through the exited job");
+        assert!(
+            observer.has_exited(),
+            "the retry's body ends at the output's end"
+        );
+        drop(observer);
+
+        m.kill_transcoding_jobs("dev", Some("sess"), true)
+            .await
+            .unwrap();
         assert_eq!(m.active_job_count(), 0);
+        assert!(!output.exists(), "the stop report deletes the output");
+    }
+
+    /// With no stop report, the idle reaper takes the failed start's job and
+    /// output at its ping timeout, where upstream's leaked request count keeps
+    /// them (gl-1373).
+    #[tokio::test]
+    async fn the_idle_reaper_takes_a_failed_start_and_its_output() {
+        let tmp = tempfile::tempdir().unwrap();
+        let output = tmp.path().join("s").join("out.mkv");
+        let fake = FakeSegmentTranscoder::new(FakeScript {
+            extra_files: vec!["out.mkv".to_owned()],
+            exit_code: 1,
+            exits_immediately: true,
+            ..FakeScript::default()
+        });
+        let m = manager();
+        let st = progressive(&output);
+        m.start_ffmpeg(&fake, ffmpeg_req(&st, &output, vec![]))
+            .await
+            .unwrap_err();
+        // The start's consumer mark ended with it: past the ping timeout
+        // (a fake clock: any elapsed time exceeds -1), the job is idle.
+        m.jobs.lock().unwrap()[0].ping_timeout_ms = -1;
+        assert_eq!(m.reap_idle_jobs().await.len(), 1);
+        assert_eq!(m.active_job_count(), 0);
+        assert!(!output.exists(), "the reaper deletes the output");
+    }
+
+    /// A start for the output of a job whose process has exited replaces that
+    /// job: every lookup is by output path, so the exited job would answer
+    /// for the new one.
+    #[tokio::test]
+    async fn a_start_replaces_the_exited_job_of_its_output() {
+        let tmp = tempfile::tempdir().unwrap();
+        let output = tmp.path().join("s").join("out.mkv");
+        let st = progressive(&output);
+        let m = Arc::new(manager());
+        let failing = FakeSegmentTranscoder::new(FakeScript {
+            exit_code: 1,
+            exits_immediately: true,
+            ..FakeScript::default()
+        });
+        m.start_ffmpeg(&failing, ffmpeg_req(&st, &output, vec![]))
+            .await
+            .unwrap_err();
+
+        let live = FakeSegmentTranscoder::new(FakeScript {
+            extra_files: vec!["out.mkv".to_owned()],
+            ..FakeScript::default()
+        });
+        m.start_ffmpeg(&live, ffmpeg_req(&st, &output, vec![]))
+            .await
+            .expect("the retry starts");
+        assert_eq!(m.active_job_count(), 1);
+        let observer = m
+            .stream_progress(&output.to_string_lossy())
+            .expect("the retry's job serves the output");
+        assert!(!observer.has_exited(), "the retry's own job answers");
     }
 
     #[tokio::test]
@@ -3729,6 +3898,7 @@ pub(super) mod throttle_tests {
             is_input_video: true,
             subtitle_delivery_method: ferrofin_model::dlna::SubtitleDeliveryMethod::Encode,
             trimmed_subtitle_path: None,
+            transcode_reasons: ferrofin_model::session::TranscodeReasons::empty(),
             run_time_ticks: Some(600 * TICKS_PER_SECOND),
             transcoding_type: TranscodingJobType::Hls,
             supported_video_codecs: Vec::new(),
@@ -4475,6 +4645,26 @@ pub(super) mod throttle_tests {
                 .download_position_ticks,
             Some(100 * TICKS_PER_SECOND)
         );
+    }
+
+    /// What the segment path reads to tell a job's first segments that rolling
+    /// deletion removed from ones it has not written yet (gl-1520).
+    #[tokio::test]
+    async fn a_job_reports_whether_it_served_a_segment_from_an_index() {
+        let (_directory, manager, _child, handle) = fixture(None).await;
+        assert!(
+            !manager.has_served_segment_from(&handle, 0),
+            "nothing served"
+        );
+        drop(
+            manager
+                .segment_progress(&handle.path, 6 * TICKS_PER_SECOND, 3)
+                .unwrap(),
+        );
+        assert!(manager.has_served_segment_from(&handle, 3));
+        assert!(!manager.has_served_segment_from(&handle, 4));
+        manager.kill_and_remove(&handle, false, false).await;
+        assert!(!manager.has_served_segment_from(&handle, 0), "no job");
     }
 
     #[tokio::test]

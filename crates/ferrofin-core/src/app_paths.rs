@@ -24,9 +24,9 @@
 //!   contract.
 //!
 //! The two virtual-path magic strings (`%AppDataPath%`, `%MetadataPath%`) are
-//! exposed as associated constants so the application host's
-//! [`expand_virtual_path`](ferrofin_traits::system::ServerApplicationHost::expand_virtual_path)
-//! and its reverse can share them.
+//! exposed as associated constants so
+//! [`VirtualPathExpander`](crate::virtual_paths::VirtualPathExpander)'s
+//! expansion and its reverse can share them.
 
 use std::path::{Path, PathBuf};
 use std::sync::RwLock;

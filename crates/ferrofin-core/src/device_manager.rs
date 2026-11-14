@@ -9,7 +9,10 @@
 //! Differences from upstream, all faithful simplifications:
 //! - The C# constructor eagerly loads every device into concurrent maps; this
 //!   port queries the tables on demand instead (no cache-coherency window).
-//! - The `DeviceOptionsUpdated` event is dropped (event wiring is out of scope).
+//! - The `DeviceOptionsUpdated` event is not raised here. Its one subscriber
+//!   (C# `SessionManager.OnDeviceManagerDeviceOptionsUpdated`) is
+//!   `SessionManager::on_device_options_updated`, which `POST /Devices/Options`
+//!   calls after the save.
 //! - `GetDeviceOptions` returns the [`DeviceOptionsEntity`] row; the API layer
 //!   maps it to the `DeviceOptionsDto` upstream returns.
 
@@ -390,20 +393,6 @@ impl DeviceManager for FerrofinDeviceManager {
         query: &DeviceQuery,
     ) -> Result<QueryResult<DeviceEntity>, ServiceError> {
         self.query_devices(query).await
-    }
-
-    async fn get_device_infos(
-        &self,
-        query: &DeviceQuery,
-    ) -> Result<QueryResult<DeviceInfo>, ServiceError> {
-        let devices = self.query_devices(query).await?;
-        let rows: Vec<&DeviceEntity> = devices.items.iter().collect();
-        let infos = self.device_infos_for(&rows).await?;
-        Ok(QueryResult::new(
-            Some(devices.start_index),
-            Some(devices.total_record_count),
-            infos,
-        ))
     }
 
     async fn get_devices_for_user(
@@ -922,21 +911,6 @@ mod tests {
         assert_eq!(listed.items[0].custom_name, None);
         assert_eq!(listed.items[1].last_user_name.as_deref(), Some("bee"));
         assert_eq!(listed.items[1].custom_name.as_deref(), Some("Living Room"));
-
-        // The un-filtered listing path (`GET /Devices/Info` bulk form) batches
-        // the same two reads and must agree.
-        let infos = mgr
-            .get_device_infos(&DeviceQuery::default())
-            .await
-            .expect("infos");
-        let by_id: HashMap<_, _> = infos
-            .items
-            .iter()
-            .map(|i| (i.id.clone().unwrap_or_default(), i))
-            .collect();
-        assert_eq!(by_id["dev-a"].last_user_name.as_deref(), Some("ay"));
-        assert_eq!(by_id["dev-b"].last_user_name.as_deref(), Some("bee"));
-        assert_eq!(by_id["dev-b"].custom_name.as_deref(), Some("Living Room"));
     }
 
     /// The wire paths must never carry a device's live bearer token: C# `ToDeviceInfo`
@@ -954,11 +928,6 @@ mod tests {
         assert!(listed.items.iter().all(|d| d.access_token.is_none()));
         let one = mgr.get_device("dev-tok").await.expect("get").expect("some");
         assert!(one.access_token.is_none());
-        let infos = mgr
-            .get_device_infos(&DeviceQuery::default())
-            .await
-            .expect("infos");
-        assert!(infos.items.iter().all(|d| d.access_token.is_none()));
     }
 
     /// A device whose owning `Users` row is missing is a `404`, not a silently

@@ -23,6 +23,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use ferrofin_traits::plugins::PluginManager;
+use ferrofin_util::string_extensions::ordinal_ignore_case_key;
 
 use crate::plugin_config::{ConfigSource, StudioImagesConfig};
 
@@ -119,7 +120,7 @@ impl StudiosClient {
     pub fn with_repo_url(repo_url: &str) -> Self {
         let trimmed = repo_url.trim_end_matches('/');
         Self {
-            http: reqwest::Client::new(),
+            http: crate::http_client::client(),
             limiter: RateLimiter::new("studios"),
             configured_repo_url: (!trimmed.is_empty()).then(|| trimmed.to_owned()),
             plugin: ConfigSource::new(),
@@ -166,12 +167,11 @@ impl StudiosClient {
             .collect()
     }
 
-    /// The manifest lookup key: [`Self::comparable_name`] lowercased in ASCII,
-    /// so equal keys are exactly the names `eq_ignore_ascii_case` matches.
+    /// The manifest lookup key: [`Self::comparable_name`] folded as
+    /// `OrdinalIgnoreCase` compares, so equal keys are exactly the names
+    /// `FindMatch` matches.
     fn match_key(name: &str) -> String {
-        let mut key = Self::comparable_name(name);
-        key.make_ascii_lowercase();
-        key
+        ordinal_ignore_case_key(&Self::comparable_name(name))
     }
 
     /// Indexes manifest entries by [`Self::match_key`], keeping the first entry
@@ -419,16 +419,18 @@ mod tests {
         ));
     }
 
-    /// A name with non-ASCII letters keeps them in its key and still matches
-    /// with its ASCII letters in another case.
+    /// `OrdinalIgnoreCase` folds non-ASCII letters too (`É`/`é`), through the
+    /// simple uppercase mapping only: `ß` has none (its full mapping is `SS`),
+    /// so `STRASSE` is not `Straße`.
     #[tokio::test]
-    async fn a_non_ascii_name_matches_with_its_ascii_letters_folded() {
+    async fn a_non_ascii_name_matches_in_any_case() {
+        let thumb = |name: &str| format!("{DEFAULT_REPO_URL}/images/{name}/thumb.jpg");
         let client = StudiosClient::new();
-        client.seed_manifest(vec!["Société".to_owned()]);
-        assert_eq!(
-            client.thumb_url("SOCIéTé").await,
-            Some(format!("{DEFAULT_REPO_URL}/images/Société/thumb.jpg"))
-        );
+        client.seed_manifest(vec!["Société".to_owned(), "Straße".to_owned()]);
+        assert_eq!(client.thumb_url("SOCIÉTÉ").await, Some(thumb("Société")));
+        assert_eq!(client.thumb_url("société").await, Some(thumb("Société")));
+        assert_eq!(client.thumb_url("STRAßE").await, Some(thumb("Straße")));
+        assert!(client.thumb_url("STRASSE").await.is_none());
     }
 
     #[tokio::test]

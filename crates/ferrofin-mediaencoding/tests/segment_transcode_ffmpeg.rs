@@ -8,11 +8,11 @@
 //! unit-coverage gate (integration `tests/` never count toward
 //! `cargo llvm-cov -p ferrofin-mediaencoding`, and the concrete spawn module carries
 //! a module-level `#![cfg_attr(coverage_nightly, coverage(off))]` carve-out)
-//! and skip themselves unless `FERROFIN_FFMPEG_TESTS` is set
-//! *and* both `ffmpeg` and `ffprobe` are on `PATH`, so ffmpeg-less CI stays green.
+//! and are `#[ignore]`d, so a default run lists them as skipped. Asked for, they
+//! need both `ffmpeg` and `ffprobe` on `PATH`.
 //!
 //! Run with:
-//! `FERROFIN_FFMPEG_TESTS=1 cargo test -p ferrofin-mediaencoding --test segment_transcode_ffmpeg`
+//! `cargo test -p ferrofin-mediaencoding --test segment_transcode_ffmpeg -- --include-ignored`
 
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
@@ -26,7 +26,7 @@ use ferrofin_mediaencoding::{
 };
 use ferrofin_model::dlna::SubtitleDeliveryMethod;
 use ferrofin_model::dto::MediaSourceInfo;
-use ferrofin_traits::media_encoding::TranscodingJobType;
+use ferrofin_traits::media_encoding::{TranscodeManager as _, TranscodingJobType};
 
 /// Whether a program is on `PATH` (via `<prog> -version`).
 fn on_path(program: &str) -> bool {
@@ -38,23 +38,12 @@ fn on_path(program: &str) -> bool {
         .is_ok_and(|s| s.success())
 }
 
-/// Whether the ffmpeg-gated suite should run: `FERROFIN_FFMPEG_TESTS` set AND both
-/// `ffmpeg` and `ffprobe` present. Prints a skip line and returns `false`
-/// otherwise so absent-ffmpeg CI stays green.
-fn ffmpeg_gate() -> bool {
-    if std::env::var("FERROFIN_FFMPEG_TESTS").is_err() {
-        eprintln!("skipping: FERROFIN_FFMPEG_TESTS not set");
-        return false;
+/// Panics unless `ffmpeg` and `ffprobe` are on `PATH`: these tests are
+/// `#[ignore]`d, so a run that asks for them must not pass without the tools.
+fn require_ffmpeg() {
+    for program in ["ffmpeg", "ffprobe"] {
+        assert!(on_path(program), "{program} not found on PATH");
     }
-    if !on_path("ffmpeg") {
-        eprintln!("skipping: ffmpeg not found on PATH");
-        return false;
-    }
-    if !on_path("ffprobe") {
-        eprintln!("skipping: ffprobe not found on PATH");
-        return false;
-    }
-    true
 }
 
 /// Generates a tiny 6-second `testsrc`+`sine` clip at `path` (matches the plan's
@@ -186,6 +175,7 @@ fn state(output_path: &Path, wait_for: &Path, segment_container: &str) -> Encodi
         is_input_video: true,
         subtitle_delivery_method: SubtitleDeliveryMethod::Encode,
         trimmed_subtitle_path: None,
+        transcode_reasons: ferrofin_model::session::TranscodeReasons::empty(),
         run_time_ticks: None,
         transcoding_type: TranscodingJobType::Hls,
         supported_video_codecs: Vec::new(),
@@ -244,10 +234,9 @@ fn extinf_count(playlist: &str) -> usize {
 /// non-empty file on disk, the job exited cleanly, and the finished VOD playlist
 /// is valid (`#EXTM3U` / `#EXT-X-ENDLIST` / ≥1 `#EXTINF`) with ≥2 `.ts` segments.
 #[tokio::test]
+#[ignore = "runs the real ffmpeg; run with --ignored"]
 async fn manager_start_ffmpeg_ts_waits_for_first_segment_then_completes() {
-    if !ffmpeg_gate() {
-        return;
-    }
+    require_ffmpeg();
     let tmp = tempfile::tempdir().unwrap();
     let clip = tmp.path().join("clip.mp4");
     make_clip(&clip);
@@ -330,10 +319,9 @@ async fn manager_start_ffmpeg_ts_waits_for_first_segment_then_completes() {
 /// yields an `out-1.mp4` init segment, `out0.mp4` media segments, and an
 /// `#EXT-X-VERSION:7` playlist that maps the init segment.
 #[tokio::test]
+#[ignore = "runs the real ffmpeg; run with --ignored"]
 async fn real_fmp4_transcode_produces_init_and_versioned_playlist() {
-    if !ffmpeg_gate() {
-        return;
-    }
+    require_ffmpeg();
     let tmp = tempfile::tempdir().unwrap();
     let clip = tmp.path().join("clip.mp4");
     make_clip(&clip);
@@ -377,10 +365,9 @@ async fn real_fmp4_transcode_produces_init_and_versioned_playlist() {
 /// manager's `kill_and_remove(delete_files=true)`; the child exits, the job is
 /// removed, and the partial segment files are cleaned from the cache dir.
 #[tokio::test]
+#[ignore = "runs the real ffmpeg; run with --ignored"]
 async fn manager_kill_stops_transcode_and_deletes_partial_files() {
-    if !ffmpeg_gate() {
-        return;
-    }
+    require_ffmpeg();
     let tmp = tempfile::tempdir().unwrap();
     let out_dir = tmp.path().join("live");
     let playlist = out_dir.join("out.m3u8");
@@ -437,10 +424,9 @@ async fn manager_kill_stops_transcode_and_deletes_partial_files() {
 /// Step 8 (failure): bogus args (a nonexistent input) surface as a `start_ffmpeg`
 /// error — ffmpeg exits non-zero before the wait target ever appears.
 #[tokio::test]
+#[ignore = "runs the real ffmpeg; run with --ignored"]
 async fn manager_start_ffmpeg_surfaces_nonzero_exit_as_error() {
-    if !ffmpeg_gate() {
-        return;
-    }
+    require_ffmpeg();
     let tmp = tempfile::tempdir().unwrap();
     let out_dir = tmp.path().join("bad");
     let playlist = out_dir.join("out.m3u8");
@@ -463,10 +449,17 @@ async fn manager_start_ffmpeg_surfaces_nonzero_exit_as_error() {
         .await
         .expect_err("bogus input should fail");
     assert!(
-        err.to_string().contains("exited with code") || err.to_string().contains("timed out"),
+        err.to_string().contains("exited with code"),
         "unexpected error: {err}"
     );
-    // The failed job left nothing registered (OnTranscodeFailedToStart).
+    // The exited job stays registered, as upstream's `StartFfMpeg` leaves it
+    // (`OnTranscodeFailedToStart` is for a process that never started), until
+    // a stop report removes it (gl-1373).
+    assert_eq!(manager.active_job_count(), 1);
+    manager
+        .kill_transcoding_jobs("dev", None, true)
+        .await
+        .expect("kill");
     assert_eq!(manager.active_job_count(), 0);
 }
 
@@ -508,10 +501,9 @@ fn ffmpeg_log(dir: &Path) -> PathBuf {
 /// nothing written about the job: its log (command line and ffmpeg's own
 /// stderr) and the startup error, whose tail is read back out of that log.
 #[tokio::test]
+#[ignore = "runs the real ffmpeg; run with --ignored"]
 async fn a_remote_source_reaches_ffmpeg_but_not_its_log_or_error() {
-    if !ffmpeg_gate() {
-        return;
-    }
+    require_ffmpeg();
     let tmp = tempfile::tempdir().unwrap();
     let out_dir = tmp.path().join("job");
     let playlist = out_dir.join("out.m3u8");
@@ -565,11 +557,10 @@ async fn a_remote_source_reaches_ffmpeg_but_not_its_log_or_error() {
 /// A file transcode's log is not filtered at all: a URL ffmpeg prints from the
 /// file's own tags, and the command line, stay exactly as they were.
 #[tokio::test]
+#[ignore = "runs the real ffmpeg; run with --ignored"]
 async fn an_ordinary_file_log_keeps_every_byte() {
     const TAG: &str = "https://someone:public@example.org/about?a=1";
-    if !ffmpeg_gate() {
-        return;
-    }
+    require_ffmpeg();
     let tmp = tempfile::tempdir().unwrap();
     let clip = tmp.path().join("clip.mp4");
     make_clip(&clip);
@@ -624,10 +615,9 @@ async fn an_ordinary_file_log_keeps_every_byte() {
 /// produces ≥2 `.ts` segments and a valid, closed playlist, and reports a clean
 /// exit through the [`TranscodeChild`] handle.
 #[tokio::test]
+#[ignore = "runs the real ffmpeg; run with --ignored"]
 async fn concrete_transcoder_hls_transcode_produces_segments_and_playlist() {
-    if !ffmpeg_gate() {
-        return;
-    }
+    require_ffmpeg();
     let tmp = tempfile::tempdir().unwrap();
     let clip: PathBuf = tmp.path().join("clip.mp4");
     make_clip(&clip);
@@ -655,10 +645,9 @@ async fn concrete_transcoder_hls_transcode_produces_segments_and_playlist() {
 
 /// The concrete transcoder's `kill` stops a running realtime transcode.
 #[tokio::test]
+#[ignore = "runs the real ffmpeg; run with --ignored"]
 async fn concrete_transcoder_kill_stops_running_transcode() {
-    if !ffmpeg_gate() {
-        return;
-    }
+    require_ffmpeg();
     let tmp = tempfile::tempdir().unwrap();
     let out_dir = tmp.path().join("live");
     std::fs::create_dir_all(&out_dir).unwrap();
@@ -694,10 +683,9 @@ async fn concrete_transcoder_kill_stops_running_transcode() {
 
 /// The concrete transcoder reports a non-zero exit for bogus input.
 #[tokio::test]
+#[ignore = "runs the real ffmpeg; run with --ignored"]
 async fn concrete_transcoder_nonzero_exit_is_reported() {
-    if !ffmpeg_gate() {
-        return;
-    }
+    require_ffmpeg();
     let tmp = tempfile::tempdir().unwrap();
     let out_dir = tmp.path().join("bad");
     std::fs::create_dir_all(&out_dir).unwrap();
@@ -730,10 +718,9 @@ async fn wait_until(budget: Duration, mut cond: impl FnMut() -> bool) {
 /// Statistics and interactive stdin are observed from a real ffmpeg process;
 /// this does not assume that a stock binary implements Jellyfin's pause keys.
 #[tokio::test]
+#[ignore = "runs the real ffmpeg; run with --ignored"]
 async fn concrete_transcoder_reports_stderr_progress_and_accepts_interactive_help() {
-    if !ffmpeg_gate() {
-        return;
-    }
+    require_ffmpeg();
     let directory = tempfile::tempdir().unwrap();
     let log = directory.path().join("progress.log");
     let req = SpawnRequest {

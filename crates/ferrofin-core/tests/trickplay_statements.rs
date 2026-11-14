@@ -8,6 +8,10 @@
 //! final match), four reads per unchanged video and seven on a checking pass
 //! (gl-1266). It now reads them once and keeps them up to date as it writes.
 //!
+//! Generate Trickplay Images also read each video's row and streams again,
+//! although its page already holds the row; it now hands each video its page
+//! row and the page's streams, read once (gl-1375).
+//!
 //! This binary records the statements one call runs ([`sql_statements`]).
 
 mod sql_statements;
@@ -15,19 +19,25 @@ mod sql_statements;
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
+use ferrofin_core::scheduled_tasks::library::TrickplayImagesTask;
 use ferrofin_core::{
-    FerrofinItemPersistenceService, FerrofinItemRepository, FerrofinMediaStreamRepository,
-    FerrofinPathManager, FerrofinServerApplicationPaths, FerrofinTrickplayManager, ItemTypeLookup,
+    FerrofinItemCountService, FerrofinItemPersistenceService, FerrofinItemRepository,
+    FerrofinLibraryManager, FerrofinMediaStreamRepository, FerrofinPathManager,
+    FerrofinPeopleRepository, FerrofinServerApplicationPaths, FerrofinTrickplayManager,
+    FerrofinVirtualFolderManager, ItemTypeLookup, ScheduledTask, TaskProgress,
 };
 use ferrofin_db::Database;
 use ferrofin_db::entities::base_items::{BaseItemEntity, MediaStreamInfoEntity};
 use ferrofin_db::entities::playback::TrickplayInfoEntity;
 use ferrofin_db::store::guid_to_db;
-use ferrofin_model::configuration::{LibraryOptions, ServerConfiguration, TrickplayOptions};
+use ferrofin_model::configuration::{
+    LibraryOptions, MediaPathInfo, ServerConfiguration, TrickplayOptions,
+};
 use ferrofin_model::data::BaseItemKind;
-use ferrofin_model::entities::MediaStreamType;
+use ferrofin_model::entities::{CollectionTypeOptions, MediaStreamType};
 use ferrofin_traits::configuration::ServerConfigurationManager;
 use ferrofin_traits::error::ServiceError;
+use ferrofin_traits::library::VirtualFolderManager;
 use ferrofin_traits::media_encoding::{TrickplayExtraction, TrickplayFrameExtractor};
 use ferrofin_traits::persistence::{ItemPersistenceService, MediaStreamRepository};
 use ferrofin_traits::system::{MediaLocation, PathManager, ServerApplicationPaths};
@@ -265,5 +275,120 @@ async fn a_checking_pass_reads_a_videos_rows_once() {
         row_reads(&statements),
         1,
         "the rows are read once: {statements:#?}"
+    );
+}
+
+/// How many statements read `MediaStreamInfos`.
+fn stream_reads(statements: &[String]) -> usize {
+    statements
+        .iter()
+        .filter(|s| s.contains("SELECT") && s.contains(r#"FROM "MediaStreamInfos""#))
+        .count()
+}
+
+/// How many statements read one `BaseItems` row by id
+/// (`ItemRepository::retrieve_item`).
+fn row_by_id_reads(statements: &[String]) -> usize {
+    statements
+        .iter()
+        .filter(|s| s.contains(r#"SELECT * FROM "BaseItems" WHERE "Id" = ?1"#))
+        .count()
+}
+
+// Generate Trickplay Images hands each video its page row and the page's
+// streams, read once, on a generating and on a checking pass.
+#[rstest::rstest]
+#[case::generating(false)]
+#[case::checking(true)]
+// A multi-thread runtime, so the folder probes run through `block_in_place`.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_task_reads_a_pages_streams_once_and_no_row_again(#[case] checking: bool) {
+    record_statements();
+    let db = Database::connect_in_memory().await.expect("connect");
+    db.run_migrations().await.expect("migrations");
+    let root = tempfile::tempdir().expect("tempdir");
+    let (manager, config, id) = movie_with_its_set(&db, root.path()).await;
+    // A second video, not probed yet: without streams it has nothing to make.
+    let unprobed = Uuid::new_v4();
+    let persistence = Arc::new(FerrofinItemPersistenceService::new(db.clone()));
+    persistence
+        .save_items(&[BaseItemEntity {
+            id: guid_to_db(unprobed),
+            type_: BaseItemKind::Movie
+                .stored_type_name()
+                .expect("a stored type")
+                .to_owned(),
+            path: Some(
+                root.path()
+                    .join("media/unprobed.mkv")
+                    .to_string_lossy()
+                    .into_owned(),
+            ),
+            media_type: Some("Video".to_owned()),
+            ..BaseItemEntity::default()
+        }])
+        .await
+        .expect("save the second movie");
+    if checking {
+        manager
+            .record_trickplay_settings_once()
+            .await
+            .expect("record settings");
+        *config.options.lock().expect("lock") = options(true);
+    }
+    let folders = Arc::new(
+        FerrofinVirtualFolderManager::new(root.path().join("libraries"))
+            .with_item_store(persistence.clone()),
+    );
+    folders
+        .add_virtual_folder(
+            "Movies",
+            Some(CollectionTypeOptions::movies),
+            &LibraryOptions {
+                path_infos: vec![MediaPathInfo {
+                    path: root.path().join("media").to_string_lossy().into_owned(),
+                }],
+                ..extraction_on()
+            },
+        )
+        .await
+        .expect("library");
+    let library = Arc::new(FerrofinLibraryManager::new(
+        Arc::new(FerrofinItemRepository::new(
+            db.clone(),
+            Arc::new(ItemTypeLookup::new()),
+        )),
+        Arc::new(FerrofinItemCountService::new(db.clone())),
+        persistence,
+        Arc::new(FerrofinPeopleRepository::new(db.clone())),
+    ));
+    let manager = Arc::new(manager);
+    let task = TrickplayImagesTask::new(
+        library,
+        folders,
+        manager.clone(),
+        Arc::new(FerrofinMediaStreamRepository::new(db.clone())),
+    );
+
+    let (ran, statements) = statements_of(task.execute(&TaskProgress::default())).await;
+
+    ran.expect("run");
+    assert_eq!(stored_widths(&manager, id).await, [320], "the set is kept");
+    assert_eq!(
+        stream_reads(&statements),
+        1,
+        "the page's streams are read once: {statements:#?}"
+    );
+    assert_eq!(
+        row_by_id_reads(&statements),
+        0,
+        "no video's row is read again: {statements:#?}"
+    );
+    // The probed video's streams reach the manager, which reads its rows
+    // once; the unprobed one is skipped before any.
+    assert_eq!(
+        row_reads(&statements),
+        1,
+        "one video's trickplay rows are read: {statements:#?}"
     );
 }

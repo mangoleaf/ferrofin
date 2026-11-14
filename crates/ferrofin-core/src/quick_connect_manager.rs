@@ -187,8 +187,7 @@ impl FerrofinQuickConnect {
     }
 
     /// A pseudo-random `CODE_LENGTH`-digit numeric code, derived from a v4 UUID's
-    /// entropy (the C# version fills random bytes; a fresh UUID is an equally
-    /// good CSPRNG source here and avoids adding a `rand` dependency).
+    /// 122 random bits (the C# version scales 4 random bytes into the same range).
     fn generate_code() -> String {
         let n = u128::from_be_bytes(*Uuid::new_v4().as_bytes());
         let min = 10u128.pow(CODE_LENGTH - 1);
@@ -196,15 +195,15 @@ impl FerrofinQuickConnect {
         value.to_string()
     }
 
-    /// A hex-encoded `SECRET_BYTES`-byte opaque secret.
+    /// `SECRET_BYTES` CSPRNG bytes as uppercase hex (C# `GenerateSecureRandom`:
+    /// `RandomNumberGenerator.Fill`, then `Convert.ToHexString`).
     fn generate_secret() -> String {
         use std::fmt::Write as _;
+        let mut bytes = [0u8; SECRET_BYTES];
+        rand::fill(&mut bytes[..]);
         let mut out = String::with_capacity(SECRET_BYTES * 2);
-        // Two UUIDs supply 32 bytes of entropy.
-        for uuid in [Uuid::new_v4(), Uuid::new_v4()] {
-            for byte in uuid.as_bytes() {
-                let _ = write!(out, "{byte:02X}");
-            }
+        for byte in bytes {
+            let _ = write!(out, "{byte:02X}");
         }
         out
     }
@@ -427,7 +426,9 @@ mod tests {
 
     use ferrofin_model::quick_connect::QuickConnectResult;
 
-    use super::{DEFAULT_PENDING_PER_IP, FerrofinQuickConnect, PendingRequest, draw_free_code};
+    use super::{
+        DEFAULT_PENDING_PER_IP, FerrofinQuickConnect, PendingRequest, SECRET_BYTES, draw_free_code,
+    };
 
     struct FixedConfig {
         enabled: bool,
@@ -579,14 +580,6 @@ mod tests {
         async fn send_message_to_user_sessions(
             &self,
             _user_ids: &[Uuid],
-            _message_type: SessionMessageType,
-            _data: &str,
-        ) -> Result<(), ServiceError> {
-            unimplemented!()
-        }
-        async fn send_message_to_user_device_sessions(
-            &self,
-            _device_id: &str,
             _message_type: SessionMessageType,
             _data: &str,
         ) -> Result<(), ServiceError> {
@@ -932,6 +925,32 @@ mod tests {
             mgr.check_request_status(secret).await.expect("exact").code,
             request.code
         );
+    }
+
+    /// A secret is 64 uppercase hex characters (upstream's `Convert.ToHexString`),
+    /// with none of a v4 UUID's fixed digits: the version at 12 and 44, the
+    /// variant at 16 and 48.
+    #[test]
+    fn secrets_are_uppercase_hex_with_no_fixed_uuid_digits() {
+        let secrets: Vec<String> = (0..256)
+            .map(|_| FerrofinQuickConnect::generate_secret())
+            .collect();
+        for secret in &secrets {
+            assert_eq!(secret.len(), SECRET_BYTES * 2);
+            assert!(
+                secret
+                    .bytes()
+                    .all(|b| matches!(b, b'0'..=b'9' | b'A'..=b'F')),
+                "not uppercase hex"
+            );
+        }
+        let fixed = |i: usize, digits: &str| secrets.iter().all(|s| digits.contains(&s[i..=i]));
+        for i in [12, 44] {
+            assert!(!fixed(i, "4"), "char {i} is always the UUID version");
+        }
+        for i in [16, 48] {
+            assert!(!fixed(i, "89AB"), "char {i} is always a UUID variant");
+        }
     }
 
     fn auth_from(ip: &str) -> AuthorizationInfo {

@@ -1,6 +1,8 @@
 //! The placeholder lists of the `IN (…)` queries and multi-row inserts.
 
+use std::collections::HashSet;
 use std::fmt::Write as _;
+use std::hash::Hash;
 use std::ops::RangeInclusive;
 
 /// The numbered SQL parameters `?first,…,?last`, comma-separated: what goes
@@ -57,10 +59,21 @@ pub fn padded_in_list<T>(items: &[T]) -> Vec<&T> {
         .collect()
 }
 
-/// The binds of the `IN (…)` reads over `items`, a chunk at a time: at most
-/// [`PADDED_LIST_MAX`] per chunk, each padded as [`padded_in_list`] pads.
-pub fn padded_in_chunks<T>(items: &[T]) -> impl Iterator<Item = Vec<&T>> {
-    items.chunks(PADDED_LIST_MAX).map(padded_in_list)
+/// The binds of the `IN (…)` reads over `items`, a chunk at a time: each
+/// distinct item once, in first-seen order, at most [`PADDED_LIST_MAX`] per
+/// chunk, each padded as [`padded_in_list`] pads.
+///
+/// An item repeated in two chunks would be read by two statements, so a
+/// caller collecting rows per chunk would hold its rows twice (gl-1678).
+pub fn padded_in_chunks<T: Eq + Hash>(items: &[T]) -> impl Iterator<Item = Vec<&T>> {
+    let mut seen = HashSet::with_capacity(items.len());
+    let distinct: Vec<&T> = items.iter().filter(|item| seen.insert(*item)).collect();
+    (0..distinct.len())
+        .step_by(PADDED_LIST_MAX)
+        .map(move |start| {
+            let chunk = &distinct[start..distinct.len().min(start + PADDED_LIST_MAX)];
+            padded_in_list(chunk).into_iter().copied().collect()
+        })
 }
 
 /// `items` in runs whose lengths are powers of two, largest first, none
@@ -121,6 +134,23 @@ mod tests {
             rest = tail;
         }
         assert_eq!(rest, [0_usize; 0]);
+    }
+
+    /// gl-1678: an item repeated past a chunk's end is bound once, in the
+    /// chunk of its first sight, so no two statements read its rows.
+    #[test]
+    fn padded_in_chunks_bind_a_repeated_item_once() {
+        let mut items: Vec<usize> = (0..PADDED_LIST_MAX).collect();
+        items.extend([0, PADDED_LIST_MAX, 0]);
+        let chunks: Vec<Vec<&usize>> = padded_in_chunks(&items).collect();
+        assert_eq!(chunks.len(), 2);
+        assert!(chunks[0].iter().copied().eq(&items[..PADDED_LIST_MAX]));
+        assert_eq!(chunks[1], [&PADDED_LIST_MAX]);
+        // Padded after the repeats are gone: two distinct items bind two.
+        let chunks: Vec<Vec<&u8>> = padded_in_chunks(&[1, 1, 1, 2]).collect();
+        assert_eq!(chunks, [[&1, &2]]);
+        let chunks: Vec<Vec<&u8>> = padded_in_chunks(&[7; PADDED_LIST_MAX + 1]).collect();
+        assert_eq!(chunks, [[&7]]);
     }
 
     /// A list up to 256 is the items in order, then the last repeated up to a

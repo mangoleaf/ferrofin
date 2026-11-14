@@ -6,8 +6,8 @@
 //! snapshot). Column-to-Rust type mapping follows the conventions in the
 //! [module docs](crate::entities):
 //! - `INTEGER` surrogate keys → [`i64`],
-//! - `TEXT` `Guid` columns → [`String`] (the hyphenated form as stored; the
-//!   conversion layer parses these into `Uuid`),
+//! - `TEXT` `Guid` columns → [`String`] (the hyphenated form as stored; callers
+//!   parse these into `Uuid`),
 //! - `TEXT` `DateTime` columns → [`DateTime<Utc>`](chrono::DateTime),
 //! - `INTEGER` booleans → [`bool`].
 

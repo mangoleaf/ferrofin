@@ -18,7 +18,7 @@ use ferrofin_api::test_support::{
     FakeDto, FakeLibrary, FakeLocalization, FakeLyrics, FakeMediaSegments, FakeMediaSources,
     FakeMusic, FakePlaylists, FakeProviders, FakeQuickConnect, FakeSearch, FakeSessions,
     FakeSimilarItems, FakeSubtitles, FakeTasks, FakeTrickplay, FakeTvSeries, FakeUserData,
-    FakeUserViews, FakeUsers,
+    FakeUserViews, FakeUsers, FixedAuth, fake_user_entity,
 };
 use ferrofin_db::entities::display_preferences::{
     DisplayPreferencesEntity, HomeSectionEntity, ItemDisplayPreferencesEntity,
@@ -29,7 +29,7 @@ use ferrofin_model::configuration::ServerConfiguration;
 use ferrofin_model::system::{FolderStorageInfo, PublicSystemInfo, SystemInfo, SystemStorageInfo};
 use ferrofin_traits::configuration::ServerConfigurationManager;
 use ferrofin_traits::error::ServiceError;
-use ferrofin_traits::net::{AuthService, AuthorizationContext, RequestContext};
+use ferrofin_traits::net::RequestContext;
 use ferrofin_traits::options::AuthorizationInfo;
 use ferrofin_traits::system::{ServerApplicationPaths, SystemManager};
 use tower::ServiceExt;
@@ -42,73 +42,17 @@ const OTHER_USER_ID: Uuid = Uuid::from_u128(0x00D1_0001);
 
 /// A minimal authenticated user.
 fn user() -> UserEntity {
-    UserEntity {
-        id: USER_ID.to_string(),
-        audio_language_preference: None,
-        authentication_provider_id: String::new(),
-        cast_receiver_id: None,
-        display_collections_view: false,
-        display_missing_episodes: false,
-        enable_auto_login: false,
-        enable_local_password: false,
-        enable_next_episode_auto_play: false,
-        enable_user_preference_access: false,
-        hide_played_in_latest: false,
-        internal_id: 0,
-        invalid_login_attempt_count: 0,
-        last_activity_date: None,
-        last_login_date: None,
-        login_attempts_before_lockout: None,
-        max_active_sessions: 0,
-        max_parental_rating_score: None,
-        max_parental_rating_sub_score: None,
-        must_update_password: false,
-        password: None,
-        password_reset_provider_id: String::new(),
-        play_default_audio_track: false,
-        remember_audio_selections: false,
-        remember_subtitle_selections: false,
-        remote_client_bitrate_limit: None,
-        row_version: 0,
-        subtitle_language_preference: None,
-        subtitle_mode: 0,
-        sync_play_access: 0,
-        username: "bob".to_owned(),
-        normalized_username: "BOB".to_owned(),
-    }
+    fake_user_entity(USER_ID, "bob")
 }
 
 /// An auth stub that authenticates as [`USER_ID`].
-struct OkAuth;
-
-#[async_trait]
-impl AuthService for OkAuth {
-    async fn authenticate(
-        &self,
-        _request: &RequestContext,
-    ) -> Result<AuthorizationInfo, ServiceError> {
-        Ok(AuthorizationInfo {
-            token: Some("tok".into()),
-            user: Some(Arc::new(user())),
-            is_authenticated: true,
-            ..Default::default()
-        })
-    }
-}
-
-#[async_trait]
-impl AuthorizationContext for OkAuth {
-    async fn get_authorization_info(
-        &self,
-        _request: &RequestContext,
-    ) -> Result<AuthorizationInfo, ServiceError> {
-        Ok(AuthorizationInfo {
-            token: Some("tok".into()),
-            user: Some(Arc::new(user())),
-            is_authenticated: true,
-            ..Default::default()
-        })
-    }
+fn ok_auth() -> FixedAuth {
+    FixedAuth(AuthorizationInfo {
+        token: Some("tok".into()),
+        user: Some(Arc::new(user())),
+        is_authenticated: true,
+        ..Default::default()
+    })
 }
 
 /// A configuration manager returning canned config + branding.
@@ -315,13 +259,6 @@ impl ferrofin_traits::configuration::DisplayPreferencesManager for StubDisplayPr
         self.wait_for_the_other_reads().await;
         Ok(canned_item_prefs())
     }
-    async fn list_item_display_preferences(
-        &self,
-        _user_id: Uuid,
-        _client: &str,
-    ) -> Result<Vec<ItemDisplayPreferencesEntity>, ServiceError> {
-        Ok(vec![canned_item_prefs()])
-    }
     async fn list_custom_item_display_preferences(
         &self,
         _user_id: Uuid,
@@ -388,7 +325,7 @@ fn state_with_display_prefs_as(
     prefs: Arc<dyn ferrofin_traits::configuration::DisplayPreferencesManager>,
     users: Arc<dyn ferrofin_traits::library::UserManager>,
 ) -> AppState {
-    let auth = Arc::new(OkAuth);
+    let auth = Arc::new(ok_auth());
     AppState::new(
         Arc::new(FakeLibrary),
         users,
@@ -561,15 +498,19 @@ async fn display_preferences_post_parses_scalars_back() {
     assert_eq!(sections, vec![(0, 4)]);
 }
 
-/// With no `skipBackLength`/`skipForwardLength` in `CustomPrefs`, the C#
-/// controller stores 10000/30000 — NOT one shared constant. (Upstream v12.0-rc3
-/// unified both to 15000; the pinned oracle is 10.11.8.)
+/// With `skipBackLength`/`skipForwardLength` missing from `CustomPrefs`, or
+/// empty, the C# controller stores 15000 for both (Jellyfin v12.0-rc1, PR
+/// 16739; unchanged at v12.4).
+#[rstest::rstest]
+#[case::absent(r#"{ "foo": "bar" }"#)]
+#[case::empty(r#"{ "foo": "bar", "skipBackLength": "", "skipForwardLength": "" }"#)]
 #[tokio::test]
-async fn display_preferences_post_skip_length_fallbacks_are_10000_and_30000() {
+async fn display_preferences_post_skip_length_fallbacks_are_15000(#[case] custom_prefs: &str) {
     let prefs = Arc::new(StubDisplayPreferences::default());
     let app = state_with_display_prefs(prefs.clone());
-    let body = r#"{
-        "CustomPrefs": { "foo": "bar" },
+    let body = format!(
+        r#"{{
+        "CustomPrefs": {custom_prefs},
         "ScrollDirection": "Horizontal",
         "SortOrder": "Ascending",
         "ShowBackdrop": false,
@@ -578,7 +519,8 @@ async fn display_preferences_post_skip_length_fallbacks_are_10000_and_30000() {
         "RememberSorting": true,
         "PrimaryImageHeight": 250,
         "PrimaryImageWidth": 250
-    }"#;
+    }}"#
+    );
     let (status, _) = send(
         app,
         "POST",
@@ -590,8 +532,8 @@ async fn display_preferences_post_skip_length_fallbacks_are_10000_and_30000() {
     assert_eq!(status, StatusCode::NO_CONTENT);
 
     let saved = prefs.row.lock().unwrap().clone().unwrap();
-    assert_eq!(saved.skip_backward_length, 10_000);
-    assert_eq!(saved.skip_forward_length, 30_000);
+    assert_eq!(saved.skip_backward_length, 15_000);
+    assert_eq!(saved.skip_forward_length, 15_000);
 }
 
 /// A partial body binds as upstream's `DisplayPreferencesDto` constructor
@@ -924,13 +866,6 @@ impl ferrofin_traits::configuration::DisplayPreferencesManager for RoundTripDisp
         _client: &str,
     ) -> Result<ItemDisplayPreferencesEntity, ServiceError> {
         Ok(canned_item_prefs())
-    }
-    async fn list_item_display_preferences(
-        &self,
-        _user_id: Uuid,
-        _client: &str,
-    ) -> Result<Vec<ItemDisplayPreferencesEntity>, ServiceError> {
-        Ok(vec![canned_item_prefs()])
     }
     async fn list_custom_item_display_preferences(
         &self,
@@ -1383,7 +1318,7 @@ async fn display_preferences_id_is_read_as_guid_try_parse_reads_it(
 #[case::skip_back_no_break_space(
     r#"{"CustomPrefs":{"skipBackLength":"5000 "}}"#,
     "/CustomPrefs/skipBackLength",
-    "10000"
+    "15000"
 )]
 #[case::overlay_padded(
     r#"{"CustomPrefs":{"enableNextVideoInfoOverlay":" False "}}"#,

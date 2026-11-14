@@ -150,8 +150,6 @@ pub struct InternalItemsQuery {
     /// Exact names (cleaned), matched as a set — the batch form of [`Self::name`]
     /// used to resolve many by-name items (people, years) in one query.
     pub names: Vec<String>,
-    /// Whether the raw (un-normalized) name is matched.
-    pub use_raw_name: Option<bool>,
 
     // --- person / id sets ---
     /// Restrict to items featuring this person (by name).
@@ -393,7 +391,10 @@ pub struct InternalItemsQuery {
     pub linked_child_ancestor_ids: Vec<Uuid>,
     /// Restrict to items under these top-level parents.
     pub top_parent_ids: Vec<Uuid>,
-    /// The preset library views to include.
+    /// The preset library views to include. Upstream's `UserRootFolder`
+    /// copies them into a `UserViewQuery`, but nothing sets them on a query,
+    /// so they are always empty; the `/UserViews` presets travel on
+    /// [`UserViewQuery`](crate::options::UserViewQuery).
     pub preset_views: Vec<Option<CollectionType>>,
     /// Restrict to these trailer types.
     pub trailer_types: Vec<TrailerType>,
@@ -570,7 +571,6 @@ impl Default for InternalItemsQuery {
             path: None,
             name: None,
             names: Vec::new(),
-            use_raw_name: None,
             person: None,
             person_ids: Vec::new(),
             item_ids: Vec::new(),

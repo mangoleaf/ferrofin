@@ -701,6 +701,47 @@ pub fn transcode_reasons_unique_names(reasons: TranscodeReasons) -> Vec<&'static
         .collect()
 }
 
+/// Reads a `TranscodeReasons` request value: comma-separated flag names, or a
+/// number.
+///
+/// Port of the `Enum.TryParse<TranscodeReason>` call in
+/// `EncodingJobInfo.TranscodeReasons`: names match case-sensitively after
+/// trimming, and a value it cannot read whole (an unknown name, an empty one,
+/// a trailing comma) yields no reasons rather than an error.
+#[must_use]
+pub fn parse_transcode_reasons(value: &str) -> TranscodeReasons {
+    let value = value.trim();
+    if let Ok(bits) = value.parse::<i32>() {
+        return TranscodeReasons::from_bits_truncate(bits.cast_unsigned());
+    }
+    value
+        .split(',')
+        .try_fold(TranscodeReasons::empty(), |reasons, name| {
+            let name = name.trim();
+            TRANSCODE_REASON_ORDERED_NAMES
+                .iter()
+                .find(|(_, known)| *known == name)
+                .map(|(flag, _)| reasons | *flag)
+        })
+        .unwrap_or_default()
+}
+
+/// The reasons set in `reasons` as the wire list, ordered by ascending bit:
+/// what C#'s `JsonFlagEnumConverter` writes for a `TranscodeReason` property
+/// such as `TranscodingInfo.TranscodeReasons`.
+#[must_use]
+pub fn transcode_reason_list(reasons: TranscodeReasons) -> Vec<TranscodeReason> {
+    transcode_reasons_unique_names(reasons)
+        .into_iter()
+        .filter_map(|name| {
+            TranscodeReason::deserialize(
+                serde::de::value::StrDeserializer::<serde::de::value::Error>::new(name),
+            )
+            .ok()
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -866,5 +907,50 @@ mod tests {
     fn unique_names_empty_for_empty_mask() {
         let found = transcode_reasons_unique_names(TranscodeReasons::empty());
         assert!(found.is_empty(), "{found:?}");
+    }
+
+    /// `Enum.TryParse<TranscodeReason>` as `EncodingJobInfo.TranscodeReasons`
+    /// calls it: all or nothing, case-sensitive, whitespace trimmed.
+    #[rstest::rstest]
+    #[case("ContainerNotSupported", TranscodeReasons::CONTAINER_NOT_SUPPORTED)]
+    #[case(
+        "ContainerNotSupported,AudioCodecNotSupported",
+        TranscodeReasons::CONTAINER_NOT_SUPPORTED.union(TranscodeReasons::AUDIO_CODEC_NOT_SUPPORTED)
+    )]
+    #[case(
+        " VideoCodecNotSupported , AudioCodecNotSupported ",
+        TranscodeReasons::VIDEO_CODEC_NOT_SUPPORTED.union(TranscodeReasons::AUDIO_CODEC_NOT_SUPPORTED)
+    )]
+    #[case("4", TranscodeReasons::AUDIO_CODEC_NOT_SUPPORTED)]
+    #[case("ContainerNotSupported,Bogus", TranscodeReasons::empty())]
+    #[case("containernotsupported", TranscodeReasons::empty())]
+    #[case("ContainerNotSupported,", TranscodeReasons::empty())]
+    #[case(
+        "ContainerNotSupported,,AudioCodecNotSupported",
+        TranscodeReasons::empty()
+    )]
+    #[case("", TranscodeReasons::empty())]
+    #[case("%%garbage", TranscodeReasons::empty())]
+    fn transcode_reasons_parse_as_enum_try_parse_does(
+        #[case] value: &str,
+        #[case] expected: TranscodeReasons,
+    ) {
+        assert_eq!(parse_transcode_reasons(value), expected);
+    }
+
+    #[test]
+    fn every_reason_flag_lists_as_its_wire_reason_in_bit_order() {
+        let listed = transcode_reason_list(TranscodeReasons::all());
+        assert_eq!(listed.len(), TRANSCODE_REASON_ORDERED_NAMES.len());
+        let names: Vec<_> = listed
+            .iter()
+            .map(|reason| serde_json::to_value(reason).unwrap())
+            .collect();
+        let expected: Vec<_> = TRANSCODE_REASON_ORDERED_NAMES
+            .iter()
+            .map(|(_, name)| serde_json::Value::from(*name))
+            .collect();
+        assert_eq!(names, expected);
+        assert_eq!(transcode_reason_list(TranscodeReasons::empty()), []);
     }
 }

@@ -244,10 +244,12 @@ fn every_editable_setting_saves_what_a_hand_written_line_holds() {
                 json!(sample(spec).parse::<i64>().expect("a number"))
             }
             (_, SettingKind::CountOrAuto) => json!(2),
-            (_, SettingKind::Text | SettingKind::Secret) => json!("sample"),
+            // As `sample`, unquoted.
+            (_, SettingKind::Text | SettingKind::Secret | SettingKind::Choice) => {
+                json!(sample(spec).trim_matches('"'))
+            }
             (_, SettingKind::Url) => json!("http://sample.invalid"),
             (_, SettingKind::NumberList) => json!([0.5, 1.0]),
-            (_, SettingKind::Choice) => json!(sample(spec).trim_matches('"')),
             (_, SettingKind::Path | SettingKind::PathList) => {
                 panic!("{}: no editable row holds paths", spec.key)
             }
@@ -618,6 +620,46 @@ fn a_transcode_cap_outside_its_range_is_refused() {
     }
 }
 
+/// gl-734: the ffmpeg input-analysis settings take ffmpeg's syntax inside
+/// their ranges, and blank for the default; saving refuses what the loader
+/// would ignore or clamp.
+#[test]
+fn an_ffmpeg_input_analysis_value_is_checked_on_save() {
+    let data = DataDir::new(&[]);
+    let env = FakeEnv::new();
+    for (key, value, why) in [
+        ("ffmpeg_analyze_duration", "601M", "is outside 1M to 600M"),
+        ("ffmpeg_probe_size", "999K", "is outside 1M to 4G"),
+        ("ffmpeg_probe_size", "1GB", "is not an ffmpeg value"),
+    ] {
+        let err = saved(&data, &env, &[(key, json!(value))]).expect_err("refused");
+        let message = refused(err);
+        assert!(message.contains(key) && message.contains(why), "{message}");
+    }
+    saved(
+        &data,
+        &env,
+        &[
+            ("ffmpeg_analyze_duration", json!("8M")),
+            ("ffmpeg_probe_size", json!("32Mi")),
+        ],
+    )
+    .expect("saved");
+    let file = contents(&data);
+    assert!(
+        file.contains("ffmpeg_analyze_duration = \"8M\"")
+            && file.contains("ffmpeg_probe_size = \"32Mi\""),
+        "{file}"
+    );
+    // The page sends an emptied field as blank: saved, and loaded as the default.
+    saved(&data, &env, &[("ffmpeg_probe_size", json!(""))]).expect("blank saved");
+    assert!(
+        contents(&data).contains("ffmpeg_probe_size = \"\""),
+        "{}",
+        contents(&data)
+    );
+}
+
 /// B1: a value outside a setting's range is refused naming the range, and the
 /// file is untouched. That includes `0` on the rows where the loader reads it
 /// as the default: Reset is how a value goes back to its default.
@@ -640,6 +682,11 @@ fn a_value_outside_a_settings_range_is_refused_naming_it() {
         ("scan_progress_every", json!(100_001), "from 0 to 100000"),
         (
             "scan_directory_cache_records",
+            json!(999),
+            "from 1000 to 10000000",
+        ),
+        (
+            "book_archive_max_entries",
             json!(999),
             "from 1000 to 10000000",
         ),

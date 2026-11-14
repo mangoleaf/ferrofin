@@ -1,0 +1,10 @@
+[16:44:10] [INF] [7] InternalDatabaseMigration: Perform migration 20260113102337_AddLinkedChildrenTable
+[16:44:10] [ERR] [7] Microsoft.EntityFrameworkCore.Database.Command: Failed executing DbCommand (1ms) [Parameters=[], CommandType='Text', CommandTimeout='60']
+CREATE TABLE "LinkedChildren" (
+    "ParentId" TEXT NOT NULL
+);
+[16:44:10] [FTL] [7] InternalDatabaseMigration: Error: SQLite Error 1: 'table "LinkedChildren" already exists'.
+[16:44:10] [ERR] [7] InternalDatabaseMigration: Migration 20260113102337_AddLinkedChildrenTable failed
+Microsoft.Data.Sqlite.SqliteException (0x80004005): SQLite Error 1: 'table "LinkedChildren" already exists'.
+   at Jellyfin.Server.Migrations.JellyfinMigrationService.InternalDatabaseMigration.PerformAsync(IStartupLogger logger)
+[16:44:10] [FTL] [7] Main: Error while starting server

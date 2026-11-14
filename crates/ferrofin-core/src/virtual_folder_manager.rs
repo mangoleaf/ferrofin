@@ -453,6 +453,7 @@ impl FerrofinVirtualFolderManager {
                 id,
                 *aggregate,
                 &self.id_derivation,
+                &self.virtual_paths,
             )
             .await?;
         }
@@ -1466,18 +1467,14 @@ impl FerrofinVirtualFolderManager {
 
     /// Deletes the `.mblink` shortcut in `folder_path` that resolves to `target`,
     /// if one exists (C# `RemoveMediaPath` shortcut cleanup). Returns whether a
-    /// shortcut was removed.
+    /// shortcut was removed. `target` is compared as given, untrimmed, with
+    /// each shortcut's one-separator-trimmed target, as upstream compares it,
+    /// so a trailing separator on a path other than the root matches nothing.
     async fn delete_shortcut_for(
         &self,
         folder_path: &Path,
         target: &str,
     ) -> Result<bool, ServiceError> {
-        // A filesystem root must retain its separator to match the shortcut.
-        let target = if Path::new(target).has_root() && Path::new(target).parent().is_none() {
-            target
-        } else {
-            target.trim_end_matches(['/', '\\'])
-        };
         let mut dir = tokio::fs::read_dir(folder_path)
             .await
             .map_err(|e| Self::io_err("read folder", &e))?;
@@ -2844,7 +2841,8 @@ mod tests {
     /// Every shortcut Jellyfin reads is a location: a dotfile `.mblink`
     /// (what a path entered with a trailing slash names) and any case of
     /// the extension count, and a target written with `ReverseVirtualPath`
-    /// is expanded; removing the path finds the shortcut the same way.
+    /// is expanded; removing the path, in any case, finds the shortcut the
+    /// same way.
     #[tokio::test]
     async fn jellyfin_shortcuts_resolve_as_jellyfin_reads_them() {
         let (tmp, mgr) = manager();
@@ -2880,7 +2878,7 @@ mod tests {
         want.sort();
         assert_eq!(folders[0].locations, want);
 
-        mgr.remove_media_path("Educational", &format!("{data}/Collections/"))
+        mgr.remove_media_path("Educational", &format!("{data}/Collections"))
             .await
             .expect("remove");
         assert!(!folder.join("collections.mblink").exists());
@@ -4502,6 +4500,34 @@ mod tests {
         let folders = mgr.get_virtual_folders().await.unwrap();
         let locations = &folders[0].locations;
         assert!(locations.is_empty(), "{locations:?}");
+    }
+
+    /// C# `RemoveMediaPath` compares the raw path with each resolved
+    /// shortcut and with each `PathInfos` entry, so a trailing separator
+    /// matches neither and the library is left whole (gl-1205).
+    #[tokio::test]
+    async fn remove_media_path_with_a_trailing_separator_changes_nothing() {
+        let (tmp, mgr) = manager();
+        let m1 = media_dir(&tmp, "one");
+        let m2 = media_dir(&tmp, "two");
+        mgr.add_virtual_folder("Lib", None, &opts_with_paths(&[m1.clone(), m2.clone()]))
+            .await
+            .unwrap();
+        mgr.remove_media_path("Lib", &format!("{m1}/"))
+            .await
+            .unwrap();
+        let folder = mgr.get_virtual_folders().await.unwrap().remove(0);
+        let mut locations = folder.locations;
+        locations.sort();
+        assert_eq!(locations, [m1.clone(), m2.clone()]);
+        let paths: Vec<String> = folder
+            .library_options
+            .unwrap()
+            .path_infos
+            .into_iter()
+            .map(|info| info.path)
+            .collect();
+        assert_eq!(paths, [m1, m2]);
     }
 
     /// A case-only rename that differs in a non-ASCII letter is case-only as

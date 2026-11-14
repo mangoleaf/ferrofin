@@ -132,22 +132,17 @@ async fn item_collections_lists_sorted_pages_and_guards() {
     let mut movies = Vec::new();
     for name in ["Collected", "Other", "Uncollected"] {
         let id = Uuid::new_v4();
-        wired
-            .state
-            .library
-            .create_items(
-                &[BaseItemEntity {
-                    id: guid_to_db(id),
-                    type_: "MediaBrowser.Controller.Entities.Movies.Movie".into(),
-                    name: Some(name.into()),
-                    sort_name: Some(name.to_lowercase()),
-                    media_type: Some("Video".into()),
-                    parent_id: Some(guid_to_db(parent_id)),
-                    top_parent_id: Some(guid_to_db(parent_id)),
-                    ..Default::default()
-                }],
-                None,
-            )
+        persistence
+            .save_items(&[BaseItemEntity {
+                id: guid_to_db(id),
+                type_: "MediaBrowser.Controller.Entities.Movies.Movie".into(),
+                name: Some(name.into()),
+                sort_name: Some(name.to_lowercase()),
+                media_type: Some("Video".into()),
+                parent_id: Some(guid_to_db(parent_id)),
+                top_parent_id: Some(guid_to_db(parent_id)),
+                ..Default::default()
+            }])
             .await
             .unwrap();
         persistence.set_ancestors(id, &[parent_id]).await.unwrap();

@@ -31,14 +31,15 @@ use ferrofin_model::dto::ItemCounts;
 use ferrofin_model::entities::ImageType;
 use ferrofin_model::entities::MediaStreamType;
 use ferrofin_model::querying::{QueryFiltersLegacy, QueryResult};
-use ferrofin_traits::options::ItemImageInfo;
+use ferrofin_traits::options::{ItemImageInfo, live_tv_image_is_internal};
 use uuid::Uuid;
 
 use ferrofin_traits::error::ServiceError;
+use ferrofin_traits::library::UserViewManager;
 use ferrofin_traits::options::{DescendantQueryRoots, InternalItemsQuery};
 use ferrofin_traits::persistence::{
     FolderChild, ItemRepository, ItemTypeLookup, ItemWithCounts, ParentalRestrictions,
-    PlaylistAccessColumns, PlaylistItemsWithAccess,
+    PlaylistAccessColumns, PlaylistItemsWithAccess, PlaylistMembers,
 };
 
 use crate::aggregate_folder::RootFolderIds;
@@ -73,7 +74,9 @@ struct EpisodeOrderRow {
     #[sqlx(rename = "Type")]
     type_: String,
     parent_id: Option<String>,
+    #[sqlx(try_from = "ferrofin_db::entities::unset::NonNilGuid")]
     season_id: Option<String>,
+    #[sqlx(try_from = "ferrofin_db::entities::unset::NonNilGuid")]
     channel_id: Option<String>,
     path: Option<String>,
     index_number: Option<i64>,
@@ -124,9 +127,16 @@ pub struct FerrofinItemRepository {
     /// sets, bound late by the composition root (see
     /// [`FerrofinItemRepository::with_visibility`]).
     visibility: VisibilitySlot,
+    /// The user-view manager the query scope runs `GetUserViews` through,
+    /// bound late by the composition root (see
+    /// [`FerrofinItemRepository::with_user_views`]).
+    user_views: UserViewsSlot,
 }
 
 /// What the files Live TV is recording right now are, asked when needed.
+///
+/// Live TV reads its timers from the reader pool to answer, so never await it
+/// while holding a pool connection or transaction.
 pub type ActiveRecordingSource = Arc<
     dyn Fn() -> std::pin::Pin<
             Box<dyn std::future::Future<Output = Result<Vec<String>, ServiceError>> + Send>,
@@ -158,6 +168,114 @@ pub(crate) fn bound_visibility(slot: &VisibilitySlot) -> Option<Arc<ItemVisibili
     }
     visibility
 }
+
+/// `AddUserToQuery`'s `GetUserViews` call (`LibraryManager.cs:2106-2111`).
+/// Every unscoped user query runs it, and it writes the views it returns on
+/// their first read (`GetNamedView`, `GetUserView`): the user's Playlists view,
+/// a grouped view, the Folders view, the Live TV folder.
+/// The user-view manager is built over this repository, so the composition root
+/// binds it late and it is held weakly; an unbound slot does nothing.
+///
+/// Upstream runs the whole call on every such query. Here, for the life of the
+/// process, it runs once per user and per set of root folders the user may
+/// see. The rows it writes usually change only when that set does, so a query
+/// over the same set writes nothing and costs no statement.
+#[derive(Default)]
+pub struct UserViewMaterialisation {
+    manager: std::sync::OnceLock<std::sync::Weak<dyn UserViewManager>>,
+    /// Per user, the sorted root folders their views were last written for.
+    written_for: std::sync::Mutex<HashMap<Uuid, Vec<Uuid>>>,
+}
+
+impl std::fmt::Debug for UserViewMaterialisation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("UserViewMaterialisation")
+            .field("bound", &self.manager.get().is_some())
+            .finish_non_exhaustive()
+    }
+}
+
+impl UserViewMaterialisation {
+    /// Binds the server's user-view manager; a second bind is ignored.
+    pub fn bind(&self, manager: &Arc<dyn UserViewManager>) {
+        let _ = self.manager.set(Arc::downgrade(manager));
+    }
+
+    /// The bound manager, while the server holds it. An unbound slot is
+    /// silent; a bound manager that is gone says so at `debug`, because the
+    /// scope then writes no view.
+    fn manager(&self) -> Option<Arc<dyn UserViewManager>> {
+        let manager = self.manager.get()?.upgrade();
+        if manager.is_none() {
+            tracing::debug!("the user-view manager is gone; a library query writes no view");
+        }
+        manager
+    }
+
+    /// Writes `user`'s views, as `GetUserViews` does, unless they were already
+    /// written for these root folders.
+    ///
+    /// The set is recorded first, so the queries the manager runs cannot
+    /// re-enter it and a concurrent query does not run it twice. A query
+    /// cancelled mid-write (its client gone) forgets it again, so the next
+    /// query writes what that one did not. A failure is logged once and the
+    /// record kept: the rows are a side effect of the scope, not part of its
+    /// answer, and the next `/UserViews` or change of the set writes them.
+    async fn materialise(&self, user: Uuid, mut roots: Vec<Uuid>) {
+        let Some(manager) = self.manager() else {
+            return;
+        };
+        roots.sort_unstable();
+        {
+            let mut written_for = self.written_for();
+            if written_for.get(&user) == Some(&roots) {
+                return;
+            }
+            written_for.insert(user, roots.clone());
+        }
+        let mut pending = PendingViewWrite {
+            slot: self,
+            user,
+            roots,
+            finished: false,
+        };
+        if let Err(err) = manager.get_user_views_with_hidden(user, true).await {
+            tracing::warn!(user_id = %user, %err, "could not write the user's views for a library query");
+        }
+        pending.finished = true;
+    }
+
+    fn written_for(&self) -> std::sync::MutexGuard<'_, HashMap<Uuid, Vec<Uuid>>> {
+        self.written_for
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
+
+/// A write [`UserViewMaterialisation`] has recorded and not finished: dropped
+/// unfinished (its query cancelled), it forgets the record, unless a later
+/// query has recorded another set since.
+struct PendingViewWrite<'a> {
+    slot: &'a UserViewMaterialisation,
+    user: Uuid,
+    roots: Vec<Uuid>,
+    finished: bool,
+}
+
+impl Drop for PendingViewWrite<'_> {
+    fn drop(&mut self) {
+        if !self.finished {
+            let mut written_for = self.slot.written_for();
+            if written_for.get(&self.user) == Some(&self.roots) {
+                written_for.remove(&self.user);
+            }
+        }
+    }
+}
+
+/// A late-bound [`UserViewMaterialisation`], shared by the item repository and
+/// the count service.
+pub type UserViewsSlot = Arc<UserViewMaterialisation>;
 
 impl std::fmt::Debug for FerrofinItemRepository {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -344,6 +462,7 @@ impl FerrofinItemRepository {
             virtual_paths: VirtualPathExpander::identity(),
             active_recordings: ActiveRecordingSlot::default(),
             visibility: VisibilitySlot::default(),
+            user_views: UserViewsSlot::default(),
             roots: None,
         }
     }
@@ -378,8 +497,9 @@ impl FerrofinItemRepository {
     /// whose `dto.Path = appHost.ExpandVirtualPath(entity.Path)` turns an
     /// adopted by-name item's `%MetadataPath%/Genre/Action`, or the playlists
     /// folder's `%AppDataPath%/playlists`, into a real path. Every row an
-    /// [`ItemRepository`] read returns goes through here; the save keeps the
-    /// stored token form (`FerrofinItemPersistenceService::upsert_item`).
+    /// [`ItemRepository`] read returns goes through here; the save stores the
+    /// token form again (`FerrofinItemPersistenceService::upsert_item`,
+    /// `GetPathToSave`).
     fn mapped(&self, mut row: BaseItemEntity) -> BaseItemEntity {
         self.virtual_paths.expand_in_place(&mut row.path);
         row
@@ -411,6 +531,16 @@ impl FerrofinItemRepository {
     #[must_use]
     pub fn with_visibility(mut self, slot: VisibilitySlot) -> Self {
         self.visibility = slot;
+        self
+    }
+
+    /// Installs the slot the composition root binds to the server's user-view
+    /// manager once it is built over this repository. An unscoped user query
+    /// then writes the user's views as `AddUserToQuery`'s `GetUserViews` does
+    /// ([`UserViewMaterialisation`]); left empty, it writes none.
+    #[must_use]
+    pub fn with_user_views(mut self, slot: UserViewsSlot) -> Self {
+        self.user_views = slot;
         self
     }
 
@@ -855,6 +985,20 @@ impl FerrofinItemRepository {
     ) -> Result<HashMap<String, ferrofin_db::entities::playback::UserDataEntity>, ServiceError>
     {
         use ferrofin_db::entities::playback::UserDataEntity;
+        // `Video.SourceType` is `LiveTV` while its file is being recorded, which
+        // takes the item out of the channel arm below. Asked only when a video
+        // could be keyed by its channel, and before the reader below is taken:
+        // Live TV reads its timers from the same pool.
+        let active = if rows.iter().any(|row| {
+            row.external_id.as_ref().is_some_and(|id| !id.is_empty())
+                && row.channel_id.is_some()
+                && row.path.is_some()
+                && crate::item_type_lookup::kind_from_type_name(&row.type_).is_some_and(is_video)
+        }) {
+            self.active_recording_paths().await?
+        } else {
+            std::collections::HashSet::new()
+        };
         let ids: Vec<_> = rows.iter().map(|row| row.id.clone()).collect();
         let mut connection = self.db.pool().acquire().await.map_err(db_err)?;
         let keys: HashMap<_, _> =
@@ -878,19 +1022,6 @@ impl FerrofinItemRepository {
                 .or_default()
                 .push(candidate);
         }
-        // `Video.SourceType` is `LiveTV` while its file is being recorded, which
-        // takes the item out of the channel arm below. Asked only when a video
-        // could be keyed by its channel.
-        let active = if rows.iter().any(|row| {
-            row.external_id.as_ref().is_some_and(|id| !id.is_empty())
-                && row.channel_id.is_some()
-                && row.path.is_some()
-                && crate::item_type_lookup::kind_from_type_name(&row.type_).is_some_and(is_video)
-        }) {
-            self.active_recording_paths().await?
-        } else {
-            std::collections::HashSet::new()
-        };
         let mut selected = HashMap::new();
         for row in rows {
             let Some(candidates) = by_item.remove(&row.id) else {
@@ -1001,8 +1132,9 @@ impl FerrofinItemRepository {
     /// That row went through [`Self::mapped`], so its `Path` is expanded where
     /// [`Self::query_view_row`] reads the stored one. Only a view's path is
     /// read, and only for its `/views/livetv` or `/views/folders` tail, which
-    /// the expansion leaves alone: Jellyfin stores a view under
-    /// `%MetadataPath%/views/`, Ferrofin under the expanded directory.
+    /// the expansion leaves alone: a view is stored under
+    /// `%MetadataPath%/views/` (an earlier Ferrofin stored the expanded
+    /// directory).
     /// Whether it has linked children is read only for a recursive browse of
     /// a box set or a playlist, the one browse that asks
     /// ([`Self::linked_container_scope`]); `filter` is the browse the row
@@ -1101,6 +1233,7 @@ impl FerrofinItemRepository {
                     &self.db,
                     &self.virtual_paths,
                     self.visibility().as_deref(),
+                    &self.user_views,
                     prepared,
                 )
                 .await?
@@ -1177,6 +1310,9 @@ impl FerrofinItemRepository {
                     &self.db,
                     &self.virtual_paths,
                     self.visibility().as_deref(),
+                    // upstream scopes this one by `AncestorIds`, so its
+                    // `AddUserToQuery` writes no view
+                    &UserViewMaterialisation::default(),
                     &resolved,
                 )
                 .await?
@@ -1229,6 +1365,7 @@ impl FerrofinItemRepository {
                 &self.db,
                 &self.virtual_paths,
                 self.visibility().as_deref(),
+                &self.user_views,
                 filter,
             )
             .await;
@@ -2019,6 +2156,7 @@ impl FerrofinItemRepository {
             &self.db,
             &self.virtual_paths,
             self.visibility().as_deref(),
+            &self.user_views,
             filter,
         )
         .await?;
@@ -2836,31 +2974,6 @@ const PLAYLIST_ITEMS_SQL: &str = r#"SELECT ch.*,
    WHERE lc."ParentId" = ?1 AND lc."ChildType" = ?3
    ORDER BY lc."SortOrder""#;
 
-/// One row of [`PLAYLIST_ITEMS_SQL`]: a member's `BaseItems` row plus the three
-/// access columns (identical on every row of a given playlist).
-struct PlaylistItemRow {
-    /// The member item row.
-    item: BaseItemEntity,
-    /// `FerrofinPlaylists.OwnerUserId` (NULL for a legacy playlist, an older
-    /// build's user-less API-key create, or a `Data` naming no owner).
-    owner: Option<String>,
-    /// `FerrofinPlaylists.OpenAccess` (NULL only when the meta row is absent).
-    open_access: Option<i64>,
-    /// The caller's `FerrofinPlaylistShares.CanEdit` (NULL when not shared).
-    can_edit: Option<i64>,
-}
-
-impl<'r> FromRow<'r, sqlx::sqlite::SqliteRow> for PlaylistItemRow {
-    fn from_row(row: &'r sqlx::sqlite::SqliteRow) -> Result<Self, sqlx::Error> {
-        Ok(Self {
-            item: BaseItemEntity::from_row(row)?,
-            owner: row.try_get("PlaylistOwnerUserId")?,
-            open_access: row.try_get("PlaylistOpenAccess")?,
-            can_edit: row.try_get("PlaylistShareCanEdit")?,
-        })
-    }
-}
-
 /// Appends the caller's name filters against the by-name `bi` row (C#
 /// `TranslateQuery`'s name predicates on the outer query).
 ///
@@ -3054,12 +3167,13 @@ pub(crate) async fn scope_to_user_libraries(
     db: &Database,
     paths: &VirtualPathExpander,
     visibility: Option<&ItemVisibility>,
+    user_views: &UserViewMaterialisation,
     filter: &InternalItemsQuery,
 ) -> Result<Option<InternalItemsQuery>, ServiceError> {
     let preferences = crate::query_restrictions::resolve(db, filter).await?;
     let prepared = preferences.as_ref().unwrap_or(filter);
     Ok(
-        scope_to_user_libraries_prepared(db, paths, visibility, prepared)
+        scope_to_user_libraries_prepared(db, paths, visibility, user_views, prepared)
             .await?
             .or(preferences),
     )
@@ -3069,6 +3183,7 @@ async fn scope_to_user_libraries_prepared(
     db: &Database,
     paths: &VirtualPathExpander,
     visibility: Option<&ItemVisibility>,
+    user_views: &UserViewMaterialisation,
     filter: &InternalItemsQuery,
 ) -> Result<Option<InternalItemsQuery>, ServiceError> {
     let Some(user) = filter.user.as_ref() else {
@@ -3090,6 +3205,14 @@ async fn scope_to_user_libraries_prepared(
     let ids: Vec<Uuid> = views.iter().map(|view| view.id).collect();
     let by_view = library_top_parents_by_view(db, &ids).await?;
     let views = without_itemless_linked_libraries(views, &by_view, visibility, user).await?;
+    // `GetUserViews` writes the views it returns as it scopes (gl-1584).
+    if let Ok(user_id) = Uuid::parse_str(&user.id) {
+        let roots = views
+            .iter()
+            .filter(|view| !view.user_view)
+            .map(|view| view.id);
+        user_views.materialise(user_id, roots.collect()).await;
+    }
     // `GetTopParentIdsForQuery` per view: a collection folder becomes its
     // physical folders plus itself (what the rows a Ferrofin scan saved
     // carry, [`library_top_parents_by_view`]), and anything else — a Live TV
@@ -3782,6 +3905,7 @@ impl ItemRepository for FerrofinItemRepository {
                 &self.db,
                 &self.virtual_paths,
                 self.visibility().as_deref(),
+                &self.user_views,
                 &filter,
             )
             .await?
@@ -4328,16 +4452,29 @@ impl ItemRepository for FerrofinItemRepository {
         index1: i32,
         index2: i32,
     ) -> Result<bool, ServiceError> {
+        /// An image row with whether its owner is a Live TV item.
+        #[derive(sqlx::FromRow)]
+        struct Row {
+            #[sqlx(flatten)]
+            image: BaseItemImageInfoEntity,
+            #[sqlx(rename = "IsLiveTv")]
+            is_live_tv: bool,
+        }
         // Load this item's rows for the requested type in the same stable order
         // get_image_infos exposes, so the caller's 0-based indices address the
         // same images the read side does.
         let disc = image_type_to_disc(image_type);
-        let rows = sqlx::query_as::<_, BaseItemImageInfoEntity>(
-            r#"SELECT * FROM "BaseItemImageInfos" WHERE "ItemId" = ?1 AND "ImageType" = ?2
-                ORDER BY rowid"#,
+        let rows = sqlx::query_as::<_, Row>(
+            r#"SELECT ii.*, bi."Type" IN (?3, ?4) AS "IsLiveTv"
+                FROM "BaseItemImageInfos" ii
+                JOIN "BaseItems" bi ON bi."Id" = ii."ItemId"
+                WHERE ii."ItemId" = ?1 AND ii."ImageType" = ?2
+                ORDER BY ii.rowid"#,
         )
         .bind(guid_to_db(item_id))
         .bind(disc)
+        .bind(BaseItemKind::LiveTvChannel.stored_type_name())
+        .bind(BaseItemKind::LiveTvProgram.stored_type_name())
         .fetch_all(self.db.pool())
         .await
         .map_err(db_err)?;
@@ -4351,19 +4488,46 @@ impl ItemRepository for FerrofinItemRepository {
             return Ok(false);
         };
         // `!info.IsLocalFile` on either side: "Not supported yet", nothing done.
-        if is_remote_image_path(&first.path) || is_remote_image_path(&second.path) {
+        if is_remote_image_path(&first.image.path) || is_remote_image_path(&second.image.path) {
             return Ok(false);
         }
+        // `info.Path` is expanded (`BaseItemRepository.Map`), so an adopted
+        // `%MetadataPath%` row names its file.
+        let (path1, path2) = (
+            self.virtual_paths.expand(&first.image.path),
+            self.virtual_paths.expand(&second.image.path),
+        );
 
         // The same file under two rows (or one slot against itself) has nothing
         // to exchange; upstream's copy onto itself would throw.
-        if first.path == second.path {
+        if path1 == path2 {
             return Ok(false);
+        }
+        // A Live TV item's row holds what a tuner or a guide supplied, so its
+        // file is written only in the internal metadata directory; otherwise
+        // nothing is done, as for a URL. Upstream swaps any local file.
+        if first.is_live_tv {
+            let root = self.virtual_paths.internal_metadata_path();
+            for path in [&path1, &path2] {
+                let internal = match &root {
+                    Some(root) => live_tv_image_is_internal(path, std::path::Path::new(root)).await,
+                    None => false,
+                };
+                if !internal {
+                    tracing::warn!(
+                        item_id = %item_id,
+                        // A source's value: a URL other than http keeps only its
+                        // scheme and host (LOGGING.md §5).
+                        path = %ferrofin_util::source_url::redact_url(path),
+                        "did not exchange the files of a Live TV image reorder: one is outside the metadata directory"
+                    );
+                    return Ok(false);
+                }
+            }
         }
         // `SwapImagesAsync` swaps the CONTENTS of the two files — the rows keep
         // their paths — and then clears the cached dimensions and re-reads each
         // modified time from its file.
-        let (path1, path2) = (first.path.clone(), second.path.clone());
         let modified = tokio::task::spawn_blocking(move || {
             swap_image_files(std::path::Path::new(&path1), std::path::Path::new(&path2))?;
             let stamp = |path: &str| {
@@ -4384,7 +4548,7 @@ impl ItemRepository for FerrofinItemRepository {
                     SET "Width" = 0, "Height" = 0, "Blurhash" = NULL, "DateModified" = ?2
                     WHERE "Id" = ?1"#,
             )
-            .bind(&row.id)
+            .bind(&row.image.id)
             .bind(datetime_to_db(modified))
             .execute(&mut *tx)
             .await
@@ -4590,31 +4754,23 @@ impl ItemRepository for FerrofinItemRepository {
         id: Uuid,
         recursive: bool,
     ) -> Result<bool, ServiceError> {
-        // Non-recursive: all direct, non-virtual leaf children played by the user.
-        // Recursive descent (via the AncestorIds/LinkedChildren closure) is the
-        // library manager's job; here the direct-children form is honored and the
-        // recursive flag widens to the ancestor closure where present.
-        let mut filter = InternalItemsQuery::default();
-        filter.set_user(Arc::new(user.clone()));
-        let filter = crate::query_restrictions::resolve(&self.db, &filter)
-            .await?
-            .unwrap_or(filter);
-        let mut qb = QueryBuilder::new(r#"SELECT NOT EXISTS (SELECT 1 FROM "BaseItems" bi "#);
-        if recursive {
-            qb.push(r#"JOIN "AncestorIds" a ON a."ItemId" = bi."Id" WHERE a."ParentItemId" = "#);
+        // v12.4 `GetIsPlayed`: the descendants `GetAllDescendantIds` resolves
+        // (closure and links), or the direct children.
+        let descendants = if recursive {
+            let filter = InternalItemsQuery {
+                descendant_of_id: Some(id),
+                ..Default::default()
+            };
+            resolve_descendant_query(&self.db, &filter).await?
         } else {
-            qb.push(r#"WHERE bi."ParentId" = "#);
-        }
-        qb.push_bind(guid_to_db(id))
-            .push(r#" AND bi."IsFolder" = 0 AND bi."IsVirtualItem" = 0"#);
-        crate::translate_query::append_parental_restrictions(&mut qb, &filter, "bi");
-        qb.push(r#" AND NOT EXISTS (SELECT 1 FROM "UserData" ud WHERE ud."ItemId" = bi."Id" AND ud."UserId" = "#)
-            .push_bind(user.id.clone()).push(r#" AND ud."Played" = 1))"#);
-        let all_played: i64 = qb
-            .build_query_scalar()
-            .fetch_one(self.db.pool())
-            .await
-            .map_err(db_err)?;
+            None
+        };
+        let all_played: i64 =
+            crate::translate_query::build_is_played_query(id, descendants.as_ref(), &user.id)
+                .build_query_scalar()
+                .fetch_one(self.db.pool())
+                .await
+                .map_err(db_err)?;
         Ok(all_played != 0)
     }
 
@@ -4624,25 +4780,39 @@ impl ItemRepository for FerrofinItemRepository {
         user_id: Uuid,
         child_type: i32,
     ) -> Result<PlaylistItemsWithAccess, ServiceError> {
-        let rows: Vec<PlaylistItemRow> = sqlx::query_as(PLAYLIST_ITEMS_SQL)
+        use futures_util::TryStreamExt;
+        let mut rows = sqlx::query(PLAYLIST_ITEMS_SQL)
             .bind(guid_to_db(playlist_id))
             .bind(guid_to_db(user_id))
             .bind(i64::from(child_type))
-            .fetch_all(self.db.pool())
-            .await
-            .map_err(db_err)?;
-        // Every row repeats the same access columns; the first carries them.
+            .fetch(self.db.pool());
+        let mut members = PlaylistMembers::default();
+        let mut index_of: HashMap<String, usize> = HashMap::new();
         // No rows at all means the join matched nothing — the caller decides
         // whether that is an empty playlist or a missing/invisible one.
-        let access = rows.first().map(|first| PlaylistAccessColumns {
-            owner_user_id: first.owner.clone(),
-            open_access: first.open_access,
-            share_can_edit: first.can_edit,
-        });
-        Ok(PlaylistItemsWithAccess {
-            items: rows.into_iter().map(|r| self.mapped(r.item)).collect(),
-            access,
-        })
+        let mut access = None;
+        while let Some(row) = rows.try_next().await.map_err(db_err)? {
+            // Every row repeats the same access columns; the first carries them.
+            if access.is_none() {
+                access = Some(PlaylistAccessColumns {
+                    owner_user_id: row.try_get("PlaylistOwnerUserId").map_err(db_err)?,
+                    open_access: row.try_get("PlaylistOpenAccess").map_err(db_err)?,
+                    share_can_edit: row.try_get("PlaylistShareCanEdit").map_err(db_err)?,
+                });
+            }
+            // A repeated member (gl-1523) costs a lookup, not another full row.
+            let id: &str = row.try_get("Id").map_err(db_err)?;
+            let index = if let Some(&seen) = index_of.get(id) {
+                seen
+            } else {
+                index_of.insert(id.to_owned(), members.items.len());
+                let item = BaseItemEntity::from_row(&row).map_err(db_err)?;
+                members.items.push(self.mapped(item));
+                members.items.len() - 1
+            };
+            members.entries.push(index);
+        }
+        Ok(PlaylistItemsWithAccess { members, access })
     }
 }
 
@@ -5031,6 +5201,12 @@ mod tests {
             };
             assert_eq!(paths(&batched[&id]), paths(&one), "{id}");
         }
+        // gl-1678: an id repeated past one IN chunk still reads its rows once.
+        let mut repeated = vec![first];
+        repeated.extend((0..ferrofin_db::PADDED_LIST_MAX).map(|_| Uuid::new_v4()));
+        repeated.push(first);
+        let once = repo.get_image_infos_batch(&repeated).await.unwrap();
+        assert_eq!(once[&first].len(), 3);
     }
 
     /// A page's artist and music-video album links resolve through one
@@ -8440,7 +8616,7 @@ mod tests {
         let repository = repo(&db);
 
         // Seeding a movie's genre also materializes the browsable by-name Genre
-        // row (id = ItemValueId), the way the scanner does.
+        // row (id = ItemValueId, as the scanner gives it with no identity wired).
         let movie = Uuid::from_u128(0x8002);
         seed_named_item(&db, movie, BaseItemKind::Movie, "A Drama Film").await;
         seed_item_genre(&db, movie, "Drama").await;
@@ -9359,7 +9535,7 @@ mod tests {
         let repository = repo(&db);
 
         // Two movies carrying one genre each; seeding materializes the browsable
-        // by-name Genre rows (id = ItemValueId).
+        // by-name Genre rows (id = ItemValueId, with no identity wired).
         //
         // They hang off a library, and the user holds the default permissions,
         // because the by-name tabs are confined to the user's libraries now
@@ -10337,8 +10513,8 @@ mod tests {
         let user = seed_user(&db, Uuid::from_u128(0xC0DE)).await;
         seed_user_data(&db, Uuid::from_u128(0xC0DE), child, true, None).await;
 
-        // The recursive branch runs its AncestorIds join. With an ancestor row
-        // present, the played child makes the closure fully played.
+        // The recursive form reads the descendants resolve_descendant_query
+        // finds: with an ancestor row present, the played child is all of them.
         sqlx::query(r#"INSERT INTO "AncestorIds" ("ItemId", "ParentItemId") VALUES (?1, ?2)"#)
             .bind(guid_to_db(child))
             .bind(guid_to_db(parent))
@@ -10386,12 +10562,58 @@ mod tests {
         .await
         .unwrap();
         assert!(
-            repository
+            !repository
                 .get_is_played(&user, parent, false)
                 .await
                 .unwrap(),
-            "hidden unrated episodes do not keep a folder unplayed"
+            "GetIsPlayed is not access-filtered: a hidden unrated episode keeps it unplayed"
         );
+    }
+
+    /// `get_is_played`'s statement reads one folder's rows by key: the
+    /// recursive form reads each resolved descendant by `Id` (the `+` pins of
+    /// `build_is_played_query`; unpinned, it reads every leaf through the
+    /// `IsFolder` index), the direct form `IX_BaseItems_ParentId`.
+    #[tokio::test]
+    async fn is_played_query_seeks_the_folders_rows() {
+        use sqlx::Execute;
+        let db = test_db().await;
+        let parent = Uuid::from_u128(0xC001);
+        let descendants = InternalItemsQuery {
+            descendant_of_id: Some(parent),
+            descendant_roots: Some(DescendantQueryRoots {
+                parent_id: parent,
+                closure_roots: vec![parent],
+                link_roots: vec![parent],
+            }),
+            ..Default::default()
+        };
+        for (descendants, seek) in [
+            (
+                Some(&descendants),
+                "SEARCH bi USING INDEX sqlite_autoindex_BaseItems_1 (Id=?)",
+            ),
+            (
+                None,
+                "SEARCH bi USING INDEX IX_BaseItems_ParentId (ParentId=?)",
+            ),
+        ] {
+            let mut builder =
+                crate::translate_query::build_is_played_query(parent, descendants, "user");
+            let mut query = builder.build();
+            let args = query.take_arguments().unwrap().unwrap();
+            let sql = format!("EXPLAIN QUERY PLAN {}", query.sql().as_str());
+            let plan = sqlx::query_with(sqlx::AssertSqlSafe(sql), args)
+                .fetch_all(db.pool())
+                .await
+                .unwrap()
+                .iter()
+                .map(|row| row.get::<String, _>("detail"))
+                .collect::<Vec<_>>()
+                .join(" | ");
+            assert!(plan.contains(seek), "{plan}");
+            assert!(!plan.contains("SCAN bi"), "{plan}");
+        }
     }
 
     /// Seeds a full row through the persistence service so `DateCreated`,
@@ -11726,6 +11948,192 @@ mod tests {
         .await;
         let user = seed_user_with_defaults(db, Uuid::from_u128(0x9805)).await;
         (first, second, Uuid::from_u128(0x9805), user)
+    }
+
+    /// A user-view manager that counts its `GetUserViews` calls (gl-1584).
+    /// With `hang_first` the first call signals `started` and never finishes;
+    /// with `fail` every call fails.
+    #[derive(Default)]
+    struct CountingViews {
+        calls: std::sync::atomic::AtomicUsize,
+        hang_first: bool,
+        fail: bool,
+        started: tokio::sync::Notify,
+    }
+
+    #[async_trait::async_trait]
+    impl UserViewManager for CountingViews {
+        async fn get_user_views(&self, _: Uuid) -> Result<Vec<BaseItemEntity>, ServiceError> {
+            Ok(Vec::new())
+        }
+
+        async fn get_user_views_with_hidden(
+            &self,
+            _: Uuid,
+            _: bool,
+        ) -> Result<Vec<BaseItemEntity>, ServiceError> {
+            let earlier = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if self.hang_first && earlier == 0 {
+                self.started.notify_one();
+                std::future::pending::<()>().await;
+            }
+            if self.fail {
+                return Err(ServiceError::backend("the view write fails"));
+            }
+            Ok(Vec::new())
+        }
+
+        async fn get_media_folders(&self) -> Result<Vec<BaseItemEntity>, ServiceError> {
+            Ok(Vec::new())
+        }
+
+        async fn get_user_root_children(
+            &self,
+            _: &UserEntity,
+        ) -> Result<Vec<BaseItemEntity>, ServiceError> {
+            Ok(Vec::new())
+        }
+
+        async fn get_latest_items(
+            &self,
+            _: &ferrofin_traits::options::LatestItemsQuery,
+            _: &ferrofin_traits::options::DtoOptions,
+        ) -> Result<Vec<(Option<BaseItemEntity>, Vec<BaseItemEntity>)>, ServiceError> {
+            Ok(Vec::new())
+        }
+    }
+
+    /// A repository whose scope reaches `views` through a bound slot, as the
+    /// composition root wires it.
+    fn repo_writing_views(db: &Database, views: &Arc<CountingViews>) -> FerrofinItemRepository {
+        let slot = UserViewsSlot::default();
+        let bound: Arc<dyn UserViewManager> = Arc::clone(views) as _;
+        slot.bind(&bound);
+        // the slot holds the manager weakly; the test keeps `views` alive
+        repo(db).with_user_views(slot)
+    }
+
+    /// gl-1584: `AddUserToQuery` runs `GetUserViews`, which writes the user's
+    /// views, on every unscoped query. Here the scope runs it once per user and
+    /// per set of root folders the user may see: a repeat or a scoped query runs
+    /// nothing, and a library joining the set runs it again.
+    #[tokio::test]
+    async fn the_scope_writes_a_users_views_once_per_set_of_root_folders() {
+        let db = test_db().await;
+        let (_, second, _, user) = two_libraries(&db).await;
+        let views = Arc::new(CountingViews::default());
+        let repository = repo_writing_views(&db, &views);
+        let calls = || views.calls.load(std::sync::atomic::Ordering::SeqCst);
+
+        assert_eq!(unscoped_names(&repository, &user).await.len(), 2);
+        assert_eq!(
+            calls(),
+            1,
+            "the user's first unscoped query writes their views"
+        );
+        unscoped_names(&repository, &user).await;
+        repository
+            .get_item_list(&InternalItemsQuery {
+                user: Some(Arc::new(user.clone())),
+                parent_id: second,
+                ..InternalItemsQuery::default()
+            })
+            .await
+            .expect("scoped");
+        assert_eq!(
+            calls(),
+            1,
+            "the same set, or a scoped query, writes nothing"
+        );
+
+        seed_named_item(
+            &db,
+            Uuid::from_u128(0x9806),
+            BaseItemKind::CollectionFolder,
+            "Third",
+        )
+        .await;
+        db.invalidate_libraries();
+        unscoped_names(&repository, &user).await;
+        assert_eq!(
+            calls(),
+            2,
+            "a library joining the user's set writes them again"
+        );
+    }
+
+    /// gl-1584: a query dropped while the views are being written (its client
+    /// gone) does not leave them recorded as written: the next query writes
+    /// them.
+    #[tokio::test]
+    async fn a_cancelled_view_write_is_retried_by_the_next_query() {
+        let db = test_db().await;
+        let (_, _, _, user) = two_libraries(&db).await;
+        let views = Arc::new(CountingViews {
+            hang_first: true,
+            ..CountingViews::default()
+        });
+        let repository = repo_writing_views(&db, &views);
+
+        // The first write starts and hangs; its query is dropped mid-write.
+        tokio::select! {
+            _ = unscoped_names(&repository, &user) => panic!("the first write hangs"),
+            () = views.started.notified() => {}
+        }
+        assert_eq!(unscoped_names(&repository, &user).await.len(), 2);
+        assert_eq!(
+            views.calls.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "the next query writes what the dropped one did not"
+        );
+    }
+
+    /// gl-1584: a view write that fails leaves the query's answer alone and
+    /// is not retried by every later query over the same set (one warning,
+    /// not one per request); the next `/UserViews` writes the views.
+    #[tokio::test]
+    async fn a_failed_view_write_answers_the_query_and_is_not_retried_per_query() {
+        let db = test_db().await;
+        let (_, _, _, user) = two_libraries(&db).await;
+        let views = Arc::new(CountingViews {
+            fail: true,
+            ..CountingViews::default()
+        });
+        let repository = repo_writing_views(&db, &views);
+        for _ in 0..3 {
+            assert_eq!(unscoped_names(&repository, &user).await.len(), 2);
+        }
+        assert_eq!(views.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    /// gl-1584: a browse of the aggregate root writes no view. Upstream
+    /// scopes it by `AncestorIds` (`SetAncestorIds`), so its `AddUserToQuery`
+    /// never reaches `GetUserViews`.
+    #[tokio::test]
+    async fn an_aggregate_root_browse_writes_no_view() {
+        use crate::aggregate_folder::RootFolderIds;
+        use crate::test_support::seed_folder_item;
+        let db = test_db().await;
+        let (_, _, _, user) = two_libraries(&db).await;
+        let (user_root, aggregate) = (Uuid::from_u128(0xE301), Uuid::from_u128(0xE302));
+        seed_folder_item(&db, aggregate, BaseItemKind::AggregateFolder, "root", None).await;
+        seed_folder_item(&db, user_root, BaseItemKind::UserRootFolder, "MF", None).await;
+        let views = Arc::new(CountingViews::default());
+        let repository = repo_writing_views(&db, &views).with_root_ids(RootFolderIds {
+            user_root,
+            aggregate,
+        });
+        repository
+            .get_item_list(&InternalItemsQuery {
+                user: Some(Arc::new(user)),
+                parent_id: aggregate,
+                recursive: true,
+                include_item_types: vec![BaseItemKind::Movie],
+                ..InternalItemsQuery::default()
+            })
+            .await
+            .expect("aggregate browse");
+        assert_eq!(views.calls.load(std::sync::atomic::Ordering::SeqCst), 0);
     }
 
     /// The names an unscoped browse returns for `user`.
@@ -14091,7 +14499,9 @@ mod tests {
             (BaseItemKind::Studio, "acme".to_owned()),
             (BaseItemKind::Studio, "nobody".to_owned()),
         ];
-        let ids = by_name_ids_by_clean_name(&db, &keys).await.expect("ids");
+        let ids = by_name_ids_by_clean_name(&db, &keys, true)
+            .await
+            .expect("ids");
         assert_eq!(ids[&BaseItemKind::Genre]["drama"], lo, "Min(Id) survivor");
         assert!(!ids.contains_key(&BaseItemKind::MusicGenre), "{ids:?}");
         assert_eq!(
@@ -14100,10 +14510,21 @@ mod tests {
             "no row: the value id"
         );
         assert!(!ids[&BaseItemKind::Studio].contains_key("nobody"));
+        // With an identity wired the caller derives a no-row id: no value-id
+        // fallback.
+        let derived = by_name_ids_by_clean_name(&db, &keys, false)
+            .await
+            .expect("ids");
+        assert!(
+            !derived
+                .get(&BaseItemKind::Studio)
+                .is_some_and(|ids| ids.contains_key("acme")),
+            "no row: no value id"
+        );
 
         let plan: Vec<(i64, i64, i64, String)> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
             "EXPLAIN QUERY PLAN {}",
-            by_name_ids_sql(1)
+            by_name_ids_sql(1, true)
         )))
         .bind("t")
         .bind(2)
@@ -15434,6 +15855,54 @@ mod folder_get_result_tests {
         assert_eq!(favorites().await, expected);
     }
 
+    /// Live TV answers `active_recording_paths` by reading its timers from the
+    /// same reader pool (`get_timer`), so the user-data filter must not hold a
+    /// reader across the call: with a one-reader pool (the in-memory test
+    /// database, a 1-CPU container, `db_pool = 1`) it waited for itself until
+    /// sqlx's 30 s acquire timeout.
+    #[tokio::test]
+    async fn the_recording_source_can_read_the_pool_while_folder_user_data_is_filtered() {
+        let db = test_db().await;
+        let user_id = Uuid::new_v4();
+        let user = seed_user_with_defaults(&db, user_id).await;
+        let slot = ActiveRecordingSlot::default();
+        let repo = repository(&db).with_active_recordings(Arc::clone(&slot));
+        let id = Uuid::new_v4();
+        seed_named_item(&db, id, BaseItemKind::Movie, "recording").await;
+        let mut entity = crate::test_support::fetch_item(&db, id).await;
+        entity.path = Some("/rec/active.ts".to_owned());
+        entity.channel_id = Some(guid_to_db(Uuid::new_v4()));
+        entity.external_id = Some("channel-key".to_owned());
+        crate::test_support::save_item(&db, &entity).await;
+        seed_user_data(&db, user_id, id, false, None).await;
+        sqlx::query(r#"INSERT INTO "UserData" ("ItemId","UserId","CustomDataKey","IsFavorite","PlayCount","PlaybackPositionTicks","Played") VALUES (?1,?2,'channel-key',1,0,0,0)"#)
+            .bind(guid_to_db(id)).bind(guid_to_db(user_id)).execute(db.writer()).await.unwrap();
+        let pool = db.pool().clone();
+        slot.set(Arc::new(move || {
+            let pool = pool.clone();
+            Box::pin(async move {
+                drop(pool.acquire().await.map_err(db_err)?);
+                Ok(vec!["/rec/active.ts".to_owned()])
+            })
+        }))
+        .ok();
+        let rows = ordered_rows(&repo, &[id]).await;
+        let query = InternalItemsQuery {
+            is_favorite: Some(true),
+            user: Some(Arc::new(user)),
+            ..Default::default()
+        };
+        let children = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            repo.filter_folder_children(rows, &query),
+        )
+        .await
+        .expect("the filter waited on the reader it was holding")
+        .unwrap();
+        // Recording, so keyed by its own id: the channel-keyed favorite is not its row.
+        assert!(children.is_empty(), "{children:?}");
+    }
+
     #[tokio::test]
     async fn adopted_channel_external_key_precedes_own_id_and_unmatched_rows_have_fallback() {
         let db = test_db().await;
@@ -16277,16 +16746,21 @@ fn item_ids_by_clean_name_sql(names: usize) -> String {
 
 /// The statement behind [`by_name_ids_by_clean_name`] for `keys` keys of three
 /// binds each (stored type name, `ItemValues.Type`, clean name).
-fn by_name_ids_sql(keys: usize) -> String {
+fn by_name_ids_sql(keys: usize, value_fallback: bool) -> String {
     let values = vec!["(?, ?, ?)"; keys].join(", ");
+    let fallback = if value_fallback {
+        r#"(SELECT iv."ItemValueId" FROM "ItemValues" iv
+                 WHERE iv."Type" = w."ValueType" AND iv."CleanValue" = w."CleanName"
+                 LIMIT 1)"#
+    } else {
+        "NULL"
+    };
     format!(
         r#"WITH "want"("Type", "ValueType", "CleanName") AS (VALUES {values})
            SELECT w."Type", w."CleanName", COALESCE(
                (SELECT MIN(bi."Id") FROM "BaseItems" bi
                  WHERE bi."Type" = w."Type" AND bi."CleanName" = w."CleanName"),
-               (SELECT iv."ItemValueId" FROM "ItemValues" iv
-                 WHERE iv."Type" = w."ValueType" AND iv."CleanValue" = w."CleanName"
-                 LIMIT 1))
+               {fallback})
            FROM "want" w"#
     )
 }
@@ -16299,10 +16773,12 @@ fn by_name_ids_sql(keys: usize) -> String {
 /// on an adopted database it carries Jellyfin's path-derived id, unrelated to
 /// the `ItemValues` id. When several rows share the name the lowest id wins,
 /// the survivor `GetItemValues`' `Min(Id)` collapse lists when they also share
-/// a `PresentationUniqueKey`, and a listed row otherwise. A `Genre`/`Studio` name
-/// with no row falls back to its `ItemValues` id, the id a scan or
-/// `ItemPersistenceService::ensure_by_name_item` gives the row; a key with
-/// neither is absent from the map.
+/// a `PresentationUniqueKey`, and a listed row otherwise. With
+/// `value_fallback`, a `Genre`/`Studio` name with no row falls back to its
+/// `ItemValues` id, the id a scan or `ItemPersistenceService::ensure_by_name_item`
+/// gives the row when no `ByNameIdentity` is wired; without it (an identity is
+/// wired, and the caller derives the id) such a key is absent, as is a key
+/// with neither.
 ///
 /// # Errors
 ///
@@ -16310,11 +16786,12 @@ fn by_name_ids_sql(keys: usize) -> String {
 pub(crate) async fn by_name_ids_by_clean_name(
     db: &Database,
     keys: &[(BaseItemKind, String)],
+    value_fallback: bool,
 ) -> Result<HashMap<BaseItemKind, HashMap<String, Uuid>>, ServiceError> {
     let mut ids: HashMap<BaseItemKind, HashMap<String, Uuid>> = HashMap::new();
     for chunk in keys.chunks(ferrofin_db::BATCH_BIND_CHUNK / 3) {
         let mut query = sqlx::query_as::<_, (String, String, Option<String>)>(sqlx::AssertSqlSafe(
-            by_name_ids_sql(chunk.len()),
+            by_name_ids_sql(chunk.len(), value_fallback),
         ));
         for (kind, clean) in chunk {
             let value_type = match kind {

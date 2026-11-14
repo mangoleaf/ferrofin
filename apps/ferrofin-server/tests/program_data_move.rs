@@ -270,7 +270,8 @@ async fn a_start_after_the_program_data_directory_moved_rewrites_the_moved_paths
     assert!(snapshot.is_file(), "the rewrite takes a snapshot first");
     let mut expected = vec![
         format!("{old}/metadata/library/gone/backdrop.png"),
-        format!("{pd}/data/playlists"),
+        // stored as upstream's save writes it, so a move leaves it alone (gl-1581)
+        "%AppDataPath%/playlists".to_owned(),
         format!("{pd}/metadata/library/me/poster.png"),
         format!("{pd}/root"),
         format!("{pd}/root/default"),

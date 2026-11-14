@@ -73,6 +73,17 @@ fn legacy_forms(token: &str) -> Vec<Form> {
             query: None,
         },
         Form {
+            label: "X-Emby-Authorization beside an empty Authorization",
+            headers: vec![
+                ("authorization", String::new()),
+                (
+                    "x-emby-authorization",
+                    format!(r#"MediaBrowser Token="{token}", {IDENTITY}"#),
+                ),
+            ],
+            query: None,
+        },
+        Form {
             label: "Authorization: Emby",
             headers: vec![(
                 "authorization",

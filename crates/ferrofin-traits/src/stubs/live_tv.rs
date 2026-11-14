@@ -466,10 +466,6 @@ pub trait LiveTvManager: Send + Sync {
     /// empty week.
     async fn get_guide_info(&self) -> Result<GuideInfo, ServiceError>;
 
-    /// Resolves a channel id to the tuner stream URL that plays it, or `None`
-    /// when the channel is unknown.
-    async fn get_channel_stream_url(&self, id: Uuid) -> Result<Option<String>, ServiceError>;
-
     /// Stamps the Live-TV-only fields onto already-projected channel DTOs,
     /// matching each by its own `Id`.
     ///

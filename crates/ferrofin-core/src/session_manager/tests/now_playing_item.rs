@@ -44,12 +44,6 @@ struct CountingDtoService {
 
 #[async_trait]
 impl DtoService for CountingDtoService {
-    async fn get_primary_image_aspect_ratio(
-        &self,
-        _item_id: Uuid,
-    ) -> Result<Option<f64>, ServiceError> {
-        unreachable!("not reached from a NowPlayingItem build")
-    }
     async fn get_base_item_dto(
         &self,
         _item: &BaseItemEntity,
@@ -80,15 +74,6 @@ impl DtoService for CountingDtoService {
                 ..BaseItemDto::default()
             })
             .collect())
-    }
-    async fn get_item_by_name_dto(
-        &self,
-        _item: &BaseItemEntity,
-        _options: &DtoOptions,
-        _tagged_item_ids: Option<&[Uuid]>,
-        _user: Option<&UserEntity>,
-    ) -> Result<BaseItemDto, ServiceError> {
-        unreachable!("not reached from a NowPlayingItem build")
     }
 }
 
@@ -201,6 +186,14 @@ impl Fixture {
         let summaries = self.mgr.get_session_summaries().await.expect("summaries");
         assert_eq!(summaries.len(), 1);
         summaries[0].now_playing_item_id
+    }
+
+    /// The library item the session plays (C# `FullNowPlayingItem`).
+    async fn library_item(&self) -> Option<Uuid> {
+        self.mgr
+            .now_playing_library_item_id(&self.session_id)
+            .await
+            .expect("library item")
     }
 
     fn builds(&self) -> usize {
@@ -392,4 +385,149 @@ async fn session_summaries_list_every_session_with_the_item_it_shows() {
         sorted(listed.iter().map(SessionSummary::from).collect()),
         summaries
     );
+}
+
+/// C# `UpdateNowPlayingItem` builds `info.Item` only when the report carries
+/// none, then shows it (`session.NowPlayingItem = info.Item`): a report's own
+/// `Item` is shown as sent, whether or not the library has the item, and
+/// builds nothing. Without one, an item the library lacks shows nothing, and
+/// a library item reported again keeps the item shown (`info.Item = current`)
+/// (gl-1062).
+#[tokio::test]
+async fn a_reports_own_item_is_shown_as_sent() {
+    let fixture = Fixture::new().await;
+    let reported = |id, name: &str| BaseItemDto {
+        id,
+        name: Some(name.to_owned()),
+        ..BaseItemDto::default()
+    };
+
+    let external = Uuid::new_v4();
+    fixture
+        .mgr
+        .on_playback_start(&PlaybackStartInfo {
+            item: Some(reported(external, "Broadcast")),
+            ..fixture.report(external)
+        })
+        .await
+        .expect("start");
+    assert_eq!(
+        fixture.shown().await,
+        Some((external, "Broadcast".to_owned()))
+    );
+    assert_eq!(fixture.summarised().await, Some(external));
+    fixture
+        .mgr
+        .on_playback_progress(
+            &PlaybackProgressInfo {
+                item: Some(reported(external, "Broadcast, part 2")),
+                ..fixture.report(external)
+            },
+            false,
+        )
+        .await
+        .expect("progress");
+    assert_eq!(
+        fixture.shown().await,
+        Some((external, "Broadcast, part 2".to_owned()))
+    );
+    fixture.progress(external).await;
+    assert_eq!(fixture.shown().await, None);
+    assert_eq!(fixture.summarised().await, None);
+
+    let film = fixture.item("Film").await;
+    fixture
+        .mgr
+        .on_playback_start(&PlaybackStartInfo {
+            item: Some(reported(film, "Client Title")),
+            ..fixture.report(film)
+        })
+        .await
+        .expect("start");
+    fixture.progress(film).await;
+    fixture.start(film).await;
+    assert_eq!(
+        fixture.shown().await,
+        Some((film, "Client Title".to_owned()))
+    );
+    assert_eq!(fixture.builds(), 0, "a reported item is never built");
+    assert_eq!(fixture.library_item().await, Some(film));
+    fixture.stop(film).await;
+    assert_eq!(fixture.shown().await, None);
+    assert_eq!(fixture.summarised().await, None);
+    assert_eq!(fixture.library_item().await, None);
+}
+
+/// The edges of a report's own `Item` whose `Id` is not its `ItemId`: it is
+/// shown with its own `Id` (C# `NowPlayingItem.Id`) while the library item is
+/// the `ItemId`'s (`FullNowPlayingItem`). A later report naming its `Id`
+/// keeps it only while the library has that id too (`info.Item = current`),
+/// and one naming the `ItemId` shows the library item built from the row the
+/// session holds (`current.Id` is not the `ItemId`). One with a nil `Id`, or
+/// sent with a nil `ItemId`, is shown as sent, and the nil `ItemId` names no
+/// library item.
+#[tokio::test]
+async fn a_reported_item_keeps_its_own_id() {
+    let fixture = Fixture::new().await;
+    let film = fixture.item("Film").await;
+    let sequel = fixture.item("Sequel").await;
+    let external = Uuid::new_v4();
+    let reported = |id, item_id| PlaybackStartInfo {
+        item: Some(BaseItemDto {
+            id,
+            name: Some("Client Title".to_owned()),
+            ..BaseItemDto::default()
+        }),
+        ..fixture.report(item_id)
+    };
+    let client_title = |id| Some((id, "Client Title".to_owned()));
+
+    for id in [external, sequel] {
+        fixture
+            .mgr
+            .on_playback_start(&reported(id, film))
+            .await
+            .expect("start");
+        assert_eq!(fixture.shown().await, client_title(id));
+        assert_eq!(fixture.summarised().await, Some(id));
+        assert_eq!(fixture.library_item().await, Some(film));
+        fixture.progress(id).await;
+        if id == external {
+            assert_eq!(fixture.shown().await, None);
+            assert_eq!(fixture.library_item().await, None);
+        } else {
+            assert_eq!(fixture.shown().await, client_title(sequel));
+            assert_eq!(fixture.library_item().await, Some(sequel));
+        }
+    }
+
+    // A start naming the shown Item's id keeps it too.
+    fixture
+        .mgr
+        .on_playback_start(&reported(sequel, film))
+        .await
+        .expect("start");
+    fixture.start(sequel).await;
+    assert_eq!(fixture.shown().await, client_title(sequel));
+    assert_eq!(fixture.library_item().await, Some(sequel));
+
+    fixture
+        .mgr
+        .on_playback_start(&reported(external, film))
+        .await
+        .expect("start");
+    fixture.rename(film, "Renamed").await;
+    fixture.progress(film).await;
+    assert_eq!(fixture.shown().await, Some((film, "Film".to_owned())));
+
+    for (id, item_id) in [(Uuid::nil(), film), (external, Uuid::nil())] {
+        fixture
+            .mgr
+            .on_playback_progress(&reported(id, item_id), false)
+            .await
+            .expect("progress");
+        assert_eq!(fixture.shown().await, client_title(id));
+        assert_eq!(fixture.summarised().await, Some(id));
+    }
+    assert_eq!(fixture.library_item().await, None);
 }

@@ -208,7 +208,13 @@ async fn concurrent_deletes_of_the_last_two_users_leave_one_behind() {
                 .await
                 .expect("create");
         }
-        let ids: Vec<Uuid> = mgr.get_user_ids().await.expect("ids");
+        let ids: Vec<Uuid> = mgr
+            .get_users()
+            .await
+            .expect("users")
+            .iter()
+            .map(|user| Uuid::parse_str(&user.id).expect("id"))
+            .collect();
         assert_eq!(ids.len(), 2, "round {round}: two accounts to contend over");
 
         let results = in_lockstep(2, |i| {
@@ -254,8 +260,8 @@ async fn concurrent_deletes_of_the_last_two_admins_leave_one_admin() {
                 .expect("create");
             make_admin(&db, &user.id).await;
         }
-        for id in mgr.get_user_ids().await.expect("ids") {
-            let user = mgr.get_user_by_id(id).await.expect("get").expect("present");
+        for user in mgr.get_users().await.expect("users") {
+            let id = Uuid::parse_str(&user.id).expect("id");
             if ferrofin_core::user_entity_ext::has_permission(
                 db.pool(),
                 &user.id,

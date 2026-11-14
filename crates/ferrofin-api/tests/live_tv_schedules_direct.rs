@@ -201,9 +201,6 @@ impl LiveTvManager for CountriesLiveTv {
     async fn refresh_guide(&self) -> Result<(), ServiceError> {
         Ok(())
     }
-    async fn get_channel_stream_url(&self, _id: Uuid) -> Result<Option<String>, ServiceError> {
-        unreachable!()
-    }
     async fn get_timers(&self) -> Result<Vec<TimerInfoDto>, ServiceError> {
         unreachable!()
     }
@@ -425,6 +422,31 @@ async fn pw_is_stored_as_its_lowercase_sha1_and_validate_listings_is_forwarded()
         Some("body")
     );
     assert_eq!((calls[1].1, calls[1].2), (false, false));
+}
+
+/// `ListingsProviderInfo` is `#nullable disable` upstream, so System.Text.Json
+/// binds `"EnabledTuners": null` and `"ChannelMappings": null` and the save
+/// answers 200 (measured on Jellyfin 12.4). Ferrofin binds them as the empty
+/// lists Jellyfin reads back from `livetv.xml`.
+#[tokio::test]
+async fn null_tuner_and_mapping_lists_bind_as_empty() {
+    let manager = CountriesLiveTv::serving(SD_COUNTRIES);
+    let state = elevated_fake_state().with_live_tv(manager.clone());
+    let (status, body) = send(
+        state,
+        "POST",
+        "/LiveTv/ListingProviders",
+        Some(r#"{"Type":"xmltv","Path":"http://example.invalid/a.xml","EnabledTuners":null,"ChannelMappings":null}"#),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+    let saved: serde_json::Value = serde_json::from_slice(&body).expect("json");
+    assert_eq!(saved["EnabledTuners"], serde_json::json!([]));
+    assert_eq!(saved["ChannelMappings"], serde_json::json!([]));
+
+    let calls = manager.saved.lock().unwrap();
+    assert_eq!(calls[0].0.enabled_tuners, Vec::<String>::new());
+    assert_eq!(calls[0].0.channel_mappings, Vec::new());
 }
 
 /// `RequiresElevation`: a plain user cannot save a provider.

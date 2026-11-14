@@ -442,6 +442,8 @@ expect_status = 404   # no backup exists
 expect_status = 400   # the corpus has no channels
 [op.GetChannelItems]
 expect_status = 400   # the corpus has no channels
+[op.DeleteSubtitle]
+expect_status = 400   # the movie's stream 0 is its video: DeleteSubtitles finds no subtitle there
 [op.GetDashboardConfigurationPage]
 expect_status = 404   # no plugin configuration page is installed
 [op.GetArtistImage]

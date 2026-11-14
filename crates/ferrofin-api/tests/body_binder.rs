@@ -22,7 +22,7 @@ use axum::body::Body;
 use axum::http::{Request, StatusCode, header};
 use ferrofin_api::create_router;
 use ferrofin_api::state::AppState;
-use ferrofin_api::test_support::authed_fake_state_with_policy;
+use ferrofin_api::test_support::{authed_fake_state_with_policy, elevated_fake_state};
 use ferrofin_model::users::UserPolicy;
 use tower::ServiceExt;
 
@@ -48,11 +48,21 @@ async fn post(
     content_type: Option<&str>,
     body: &'static str,
 ) -> (StatusCode, String, String) {
+    post_to(state(), uri, content_type, body).await
+}
+
+/// [`post`] on the router over `state`.
+async fn post_to(
+    state: AppState,
+    uri: &str,
+    content_type: Option<&str>,
+    body: &'static str,
+) -> (StatusCode, String, String) {
     let mut request = Request::builder().method("POST").uri(uri);
     if let Some(ct) = content_type {
         request = request.header(header::CONTENT_TYPE, ct);
     }
-    let response = create_router(state())
+    let response = create_router(state)
         .oneshot(request.body(Body::from(body)).unwrap())
         .await
         .unwrap();
@@ -92,10 +102,7 @@ async fn a_body_past_the_routes_limit_is_413_not_a_missing_body() {
             .await
             .unwrap();
         let text = String::from_utf8_lossy(&bytes);
-        assert!(
-            !text.contains("The body field is required."),
-            "{uri}: {text}"
-        );
+        assert!(!text.contains(" field is required."), "{uri}: {text}");
     }
 }
 
@@ -107,6 +114,105 @@ const ROUTES: &[&str] = &[
     "/Users/AuthenticateByName",
     "/Users/ForgotPassword",
 ];
+
+/// gl-1161: beside the complaint, ASP.NET files an entry under the action's C#
+/// `[FromBody]` parameter name, and none for a nullable parameter. Every case
+/// was measured on Jellyfin 12.4.0: the `errors` keys and the parameter's
+/// message are its own (the complaints' text is Ferrofin's).
+#[rstest::rstest]
+// `ForgotPassword([FromBody, Required] ForgotPasswordDto forgotPasswordRequest)`.
+#[case::empty(false, "/Users/ForgotPassword", "", "", Some("forgotPasswordRequest"))]
+// A left-out C# `required` member, refused by the handler's own check.
+#[case::member_left_out(
+    false,
+    "/Users/ForgotPassword",
+    "{}",
+    "$",
+    Some("forgotPasswordRequest")
+)]
+#[case::pin_member_left_out(
+    false,
+    "/Users/ForgotPassword/Pin",
+    r#"{"EnteredUsername":"bob"}"#,
+    "$",
+    Some("forgotPasswordPinRequest")
+)]
+#[case::wrong_kind(false, "/Users/AuthenticateByName", "5", "$", Some("request"))]
+// `GetPrograms([FromBody] GetProgramsDto body)`: implicitly required.
+#[case::named_body(false, "/LiveTv/Programs", "[]", "$", Some("body"))]
+// `[FromBody(EmptyBodyBehavior = EmptyBodyBehavior.Allow), Required]`.
+#[case::required_but_empty_allowed(
+    false,
+    "/Playlists/00000000000000000000000000000001/Users/00000000000000000000000000000002",
+    "[]",
+    "$",
+    Some("updatePlaylistUserRequest")
+)]
+// `[FromBody(EmptyBodyBehavior = EmptyBodyBehavior.Allow)] PlaybackInfoDto?`.
+#[case::nullable(
+    false,
+    "/Items/00000000000000000000000000000001/PlaybackInfo",
+    "[]",
+    "$",
+    None
+)]
+#[case::sequence(true, "/ScheduledTasks/task/Triggers", "", "", Some("triggerInfos"))]
+#[case::any_shape(true, "/System/Configuration/network", "{", "$", Some("configuration"))]
+#[tokio::test]
+async fn a_body_that_fails_to_bind_names_the_actions_parameter(
+    #[case] admin: bool,
+    #[case] uri: &str,
+    #[case] body: &'static str,
+    #[case] complaint: &str,
+    #[case] parameter: Option<&str>,
+) {
+    let state = if admin {
+        elevated_fake_state()
+    } else {
+        state()
+    };
+    let (status, _, payload) = post_to(state, uri, Some("application/json"), body).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{payload}");
+    let document: serde_json::Value = serde_json::from_str(&payload).expect("a problem document");
+    let errors = document["errors"].as_object().expect("errors");
+    let mut keys: Vec<&str> = errors.keys().map(String::as_str).collect();
+    keys.sort_unstable();
+    let mut expected: Vec<&str> = std::iter::once(complaint).chain(parameter).collect();
+    expected.sort_unstable();
+    assert_eq!(keys, expected, "{payload}");
+    if let Some(name) = parameter {
+        assert_eq!(
+            errors[name],
+            serde_json::json!([format!("The {name} field is required.")]),
+            "{payload}"
+        );
+    }
+}
+
+/// `StartRestoreBackup([FromBody, BindRequired] BackupRestoreRequestDto
+/// archiveRestoreDto)`: `[BindRequired]` words the entry its own way
+/// (measured on Jellyfin 12.4.0).
+#[tokio::test]
+async fn a_bind_required_body_names_its_parameter_in_its_own_words() {
+    let (status, _, payload) = post_to(
+        elevated_fake_state(),
+        "/Backup/Restore",
+        Some("application/json"),
+        "",
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{payload}");
+    let document: serde_json::Value = serde_json::from_str(&payload).expect("a problem document");
+    assert_eq!(
+        document["errors"],
+        serde_json::json!({
+            "": ["A non-empty request body is required."],
+            "archiveRestoreDto": [
+                "A value for the 'archiveRestoreDto' parameter or property was not provided."
+            ],
+        })
+    );
+}
 
 /// Every body whose SHAPE the binder refuses is `400` with a
 /// `ValidationProblemDetails` document — never axum's `422 text/plain`.

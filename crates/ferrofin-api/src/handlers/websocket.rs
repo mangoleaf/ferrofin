@@ -531,10 +531,11 @@ pub fn close_all_sockets() {
     CLOSE_ALL.send_modify(|generation| *generation += 1);
 }
 
-/// Server drain: the ServerShuttingDown push was queued just before the
-/// close-all fired and `select!` is unordered, so flush whatever is queued
-/// first, then say goodbye properly so the client reconnects. Every send is
-/// bounded by `send_frame`, so a stalled peer cannot pin the old host.
+/// Server drain: the ServerShuttingDown or ServerRestarting push was queued
+/// just before the close-all fired and `select!` is unordered, so flush
+/// whatever is queued first, then say goodbye properly so the client
+/// reconnects. Every send is bounded by `send_frame`, so a stalled peer
+/// cannot pin the old host.
 async fn say_goodbye(
     socket: &mut WebSocket,
     rx: &mut mpsc::Receiver<String>,

@@ -16,7 +16,7 @@ use ferrofin_api::create_router;
 use ferrofin_api::state::AppState;
 use ferrofin_api::test_support::{
     FakeAppHost, FakeConfig, FakeMediaSources, FakeMusic, FakeProviders, FakeSearch, FakeSessions,
-    FakeSimilarItems, FakeSystem, FakeUserData, FakeUserViews,
+    FakeSimilarItems, FakeSystem, FakeUserData, FakeUserViews, FixedAuth, fake_user_entity,
 };
 use ferrofin_db::entities::base_items::BaseItemEntity;
 use ferrofin_db::entities::users::UserEntity;
@@ -30,8 +30,7 @@ use ferrofin_traits::collections::{
 use ferrofin_traits::dto::DtoService;
 use ferrofin_traits::error::ServiceError;
 use ferrofin_traits::library::UserManager;
-use ferrofin_traits::net::{AuthService, AuthorizationContext, RequestContext};
-use ferrofin_traits::options::{AuthorizationInfo, DtoOptions};
+use ferrofin_traits::options::DtoOptions;
 use tower::ServiceExt;
 use uuid::Uuid;
 
@@ -45,38 +44,8 @@ const ITEM_B: Uuid = Uuid::from_u128(0xB2);
 /// read; every other column is a neutral zero value.
 fn user_entity(id: Uuid) -> UserEntity {
     UserEntity {
-        id: id.to_string(),
-        audio_language_preference: None,
-        authentication_provider_id: String::new(),
-        cast_receiver_id: None,
-        display_collections_view: false,
-        display_missing_episodes: false,
-        enable_auto_login: false,
-        enable_local_password: false,
-        enable_next_episode_auto_play: false,
-        enable_user_preference_access: false,
-        hide_played_in_latest: false,
-        internal_id: 0,
-        invalid_login_attempt_count: 0,
-        last_activity_date: None,
-        last_login_date: None,
-        login_attempts_before_lockout: None,
-        max_active_sessions: 0,
-        max_parental_rating_score: None,
-        max_parental_rating_sub_score: None,
-        must_update_password: false,
         password: Some("hashed".to_owned()),
-        password_reset_provider_id: String::new(),
-        play_default_audio_track: false,
-        remember_audio_selections: false,
-        remember_subtitle_selections: false,
-        remote_client_bitrate_limit: None,
-        row_version: 0,
-        subtitle_language_preference: None,
-        subtitle_mode: 0,
-        sync_play_access: 0,
-        username: "alice".to_owned(),
-        normalized_username: "ALICE".to_owned(),
+        ..fake_user_entity(id, "alice")
     }
 }
 
@@ -159,35 +128,9 @@ fn item_entity(id: Uuid) -> BaseItemEntity {
     }
 }
 
-/// An [`AuthService`]/[`AuthorizationContext`] that authenticates as [`USER_ID`].
-struct OkAuth;
-
-#[async_trait]
-impl AuthService for OkAuth {
-    async fn authenticate(
-        &self,
-        _request: &RequestContext,
-    ) -> Result<AuthorizationInfo, ServiceError> {
-        Ok(AuthorizationInfo {
-            user: Some(Arc::new(user_entity(USER_ID))),
-            is_authenticated: true,
-            ..AuthorizationInfo::default()
-        })
-    }
-}
-
-#[async_trait]
-impl AuthorizationContext for OkAuth {
-    async fn get_authorization_info(
-        &self,
-        _request: &RequestContext,
-    ) -> Result<AuthorizationInfo, ServiceError> {
-        Ok(AuthorizationInfo {
-            user: Some(Arc::new(user_entity(USER_ID))),
-            is_authenticated: true,
-            ..AuthorizationInfo::default()
-        })
-    }
+/// An `AuthService`/`AuthorizationContext` that authenticates as [`USER_ID`].
+fn ok_auth() -> FixedAuth {
+    FixedAuth::signed_in(user_entity(USER_ID))
 }
 
 /// A [`UserManager`] resolving the fixed authenticated user with `policy`.
@@ -212,9 +155,6 @@ impl UserManager for OkUsers {
         Ok((id == USER_ID).then(|| user_entity(USER_ID)))
     }
     async fn get_users(&self) -> Result<Vec<UserEntity>, ServiceError> {
-        unimplemented!()
-    }
-    async fn get_user_ids(&self) -> Result<Vec<Uuid>, ServiceError> {
         unimplemented!()
     }
     async fn initialize(&self) -> Result<(), ServiceError> {
@@ -298,12 +238,6 @@ struct OkDto;
 
 #[async_trait]
 impl DtoService for OkDto {
-    async fn get_primary_image_aspect_ratio(
-        &self,
-        _item_id: Uuid,
-    ) -> Result<Option<f64>, ServiceError> {
-        unimplemented!()
-    }
     async fn get_base_item_dto(
         &self,
         _item: &BaseItemEntity,
@@ -329,15 +263,6 @@ impl DtoService for OkDto {
                 ..BaseItemDto::default()
             })
             .collect())
-    }
-    async fn get_item_by_name_dto(
-        &self,
-        _item: &BaseItemEntity,
-        _options: &DtoOptions,
-        _tagged_item_ids: Option<&[Uuid]>,
-        _user: Option<&UserEntity>,
-    ) -> Result<BaseItemDto, ServiceError> {
-        unimplemented!()
     }
 }
 
@@ -391,17 +316,6 @@ impl PlaylistManager for RecordingPlaylists {
             Err(ServiceError::not_found("playlist"))
         }
     }
-    async fn get_playlist_for_user(
-        &self,
-        playlist_id: Uuid,
-        _user_id: Uuid,
-    ) -> Result<BaseItemEntity, ServiceError> {
-        if playlist_id == PLAYLIST_ID {
-            Ok(item_entity(playlist_id))
-        } else {
-            Err(ServiceError::not_found("playlist"))
-        }
-    }
     async fn create_playlist(
         &self,
         request: &PlaylistCreationRequest,
@@ -417,15 +331,15 @@ impl PlaylistManager for RecordingPlaylists {
     ) -> Result<(), ServiceError> {
         Ok(())
     }
-    async fn get_playlists(&self, _user_id: Uuid) -> Result<Vec<BaseItemEntity>, ServiceError> {
-        unimplemented!()
-    }
     async fn get_playlist_items(
         &self,
         _playlist_id: Uuid,
         _user_id: Uuid,
-    ) -> Result<Vec<BaseItemEntity>, ServiceError> {
-        Ok(vec![item_entity(ITEM_A), item_entity(ITEM_B)])
+    ) -> Result<ferrofin_traits::persistence::PlaylistMembers, ServiceError> {
+        Ok(ferrofin_traits::persistence::PlaylistMembers {
+            items: vec![item_entity(ITEM_A), item_entity(ITEM_B)],
+            entries: vec![0, 1],
+        })
     }
     async fn get_playlist_item_ids(&self, _playlist_id: Uuid) -> Result<Vec<Uuid>, ServiceError> {
         Ok(vec![ITEM_A, ITEM_B])
@@ -530,6 +444,14 @@ impl CollectionManager for RecordingCollections {
     ) -> Result<Option<BaseItemEntity>, ServiceError> {
         unimplemented!()
     }
+
+    async fn resolve_box_set_folders(
+        &self,
+        _location: &str,
+        _folders: &[String],
+    ) -> Result<Option<Vec<Uuid>>, ServiceError> {
+        unimplemented!()
+    }
 }
 
 /// Assembles an [`AppState`] over the recording playlist/collection fakes.
@@ -558,8 +480,8 @@ fn state_with_users(
         Arc::new(FakeSimilarItems),
         Arc::new(FakeSearch),
         Arc::new(OkDto),
-        Arc::new(OkAuth),
-        Arc::new(OkAuth),
+        Arc::new(ok_auth()),
+        Arc::new(ok_auth()),
         Arc::new(ferrofin_api::test_support::FakeQuickConnect),
         playlists,
         collections,

@@ -99,21 +99,37 @@ pub fn walk_forwarded_headers(
 
 /// Every `name` header's comma-separated entries, in order
 /// (`GetCommaSeparatedValues`: trimmed, unquoted, empty entries skipped).
+///
+/// A value is read as UTF-8, as Kestrel reads it, so one outside visible ASCII
+/// keeps its entries in their hops instead of dropping out and shifting the
+/// rest; an entry holding such a character fails every address, scheme and
+/// host check. Kestrel answers 400 to a value that is not UTF-8 (gl-1650);
+/// here its bytes read as replacement characters, which fail them too.
+///
+/// White space around an entry is trimmed, Unicode's included, except after
+/// the last entry of a value, which keeps it and so does not parse (measured
+/// on Jellyfin 12.4).
 pub(crate) fn comma_separated_values(headers: &axum::http::HeaderMap, name: &str) -> Vec<String> {
-    headers
-        .get_all(name)
-        .iter()
-        .filter_map(|v| v.to_str().ok())
-        .flat_map(|v| v.split(','))
-        .map(|v| {
-            let v = v.trim();
-            v.strip_prefix('"')
+    let mut entries = Vec::new();
+    for value in headers.get_all(name) {
+        let value = String::from_utf8_lossy(value.as_bytes());
+        let mut segments = value.split(',').peekable();
+        while let Some(segment) = segments.next() {
+            let segment = if segments.peek().is_some() {
+                segment.trim()
+            } else {
+                segment.trim_start()
+            };
+            let segment = segment
+                .strip_prefix('"')
                 .and_then(|v| v.strip_suffix('"'))
-                .unwrap_or(v)
-                .to_owned()
-        })
-        .filter(|v| !v.is_empty())
-        .collect()
+                .unwrap_or(segment);
+            if !segment.is_empty() {
+                entries.push(segment.to_owned());
+            }
+        }
+    }
+    entries
 }
 
 /// The entry `hop` places from the right of `entries`, the hop order.
@@ -436,10 +452,83 @@ mod tests {
     #[case::unknown_hop_ends_the_walk(&["198.51.100.7, 203.0.113.9, 192.0.2.4"], "192.0.2.4")]
     #[case::only_a_token(&["unknown"], "10.0.0.1")]
     #[case::bracketed_ipv6_with_a_port(&["unknown, [2001:db8::7]:41234"], "2001:db8::7")]
+    // `IPEndPoint.TryParse` takes a bracket pair only around an IPv6 address,
+    // with or without a port (measured on Jellyfin 12.4).
+    #[case::bracketed_ipv6(&["203.0.113.9, [::ffff:10.0.0.1]"], "203.0.113.9")]
+    #[case::bracketed_mapped_ipv6_with_a_port(&["203.0.113.9, [::ffff:10.0.0.1]:80"], "203.0.113.9")]
+    #[case::bracketed_ipv4(&["203.0.113.9, [10.0.0.1]"], "10.0.0.1")]
+    #[case::bracketed_ipv4_with_a_port(&["203.0.113.9, [10.0.0.1]:80"], "10.0.0.1")]
+    #[case::doubled_brackets(&["203.0.113.9, [[::ffff:10.0.0.1]]"], "10.0.0.1")]
+    #[case::unclosed_bracket(&["203.0.113.9, [::ffff:10.0.0.1"], "10.0.0.1")]
+    #[case::unopened_bracket(&["203.0.113.9, ::ffff:10.0.0.1]"], "10.0.0.1")]
     fn the_client_walk_stops_at_an_unparsable_entry(
         #[case] forwarded_for: &[&str],
         #[case] expected: &str,
     ) {
+        let pairs: Vec<(&'static str, &str)> = forwarded_for
+            .iter()
+            .map(|value| ("x-forwarded-for", *value))
+            .collect();
+        assert_eq!(
+            client_behind_known_proxy(&headers(&pairs)),
+            expected.parse::<IpAddr>().expect("expected")
+        );
+    }
+
+    /// Kestrel reads a header value as UTF-8, so a value outside visible ASCII
+    /// is an entry no address parse accepts, and the walk stops at it: Jellyfin
+    /// 12.4 stops at `café`, and refuses the request carrying the lone 0xE9
+    /// byte with a 400. Dropping the value would let the walk go on to the
+    /// entry the client wrote before it. A no-break space around an entry is
+    /// trimmed, but not after a value's last entry (also measured there).
+    #[rstest]
+    #[case::utf8_value(&[b"203.0.113.9".as_slice(), b"caf\xc3\xa9".as_slice()], "10.0.0.1")]
+    #[case::value_not_utf8(&[b"203.0.113.9".as_slice(), b"caf\xe9".as_slice()], "10.0.0.1")]
+    #[case::nbsp_before_an_entry(&[b"203.0.113.9,\xc2\xa010.0.0.1".as_slice()], "203.0.113.9")]
+    #[case::nbsp_after_an_entry(
+        &[b"203.0.113.9,10.0.0.1\xc2\xa0,10.0.0.1".as_slice()],
+        "203.0.113.9"
+    )]
+    #[case::nbsp_after_a_values_last_entry(
+        &[b"203.0.113.9, 10.0.0.1\xc2\xa0".as_slice()],
+        "10.0.0.1"
+    )]
+    fn header_values_are_read_as_kestrel_reads_them(
+        #[case] values: &[&[u8]],
+        #[case] expected: &str,
+    ) {
+        let mut headers = HeaderMap::new();
+        for value in values {
+            headers.append(
+                "x-forwarded-for",
+                axum::http::HeaderValue::from_bytes(value).expect("header value"),
+            );
+        }
+        assert_eq!(
+            client_behind_known_proxy(&headers),
+            expected.parse::<IpAddr>().expect("expected")
+        );
+    }
+
+    /// A value outside visible ASCII keeps its hop in the scheme list too, so
+    /// the scheme a client wrote left of it is not taken for the proxy's.
+    #[test]
+    fn a_value_outside_visible_ascii_keeps_its_hop() {
+        let mut headers = headers(&[
+            ("x-forwarded-for", "203.0.113.9"),
+            ("x-forwarded-proto", "https"),
+        ]);
+        headers.append(
+            "x-forwarded-proto",
+            axum::http::HeaderValue::from_bytes(b"caf\xc3\xa9").expect("header value"),
+        );
+        let forwarded =
+            walk_forwarded_headers("127.0.0.1".parse().expect("peer"), &headers, loopback);
+        assert_eq!(forwarded.scheme, None);
+    }
+
+    /// The client a request from 10.0.0.1, the one known proxy, resolves to.
+    fn client_behind_known_proxy(headers: &HeaderMap) -> IpAddr {
         let network = std::sync::RwLock::new(ferrofin_networking::NetworkManager::with_interfaces(
             ferrofin_networking::NetworkConfiguration {
                 known_proxies: vec!["10.0.0.1".to_owned()],
@@ -447,18 +536,12 @@ mod tests {
             },
             Vec::new(),
         ));
-        let pairs: Vec<(&'static str, &str)> = forwarded_for
-            .iter()
-            .map(|value| ("x-forwarded-for", *value))
-            .collect();
-        let chain = crate::state::forwarded_for(&headers(&pairs));
-        let client =
-            client_address_through(Some(&network), "10.0.0.1".parse().expect("peer"), &chain);
-        assert_eq!(client, expected.parse::<IpAddr>().expect("expected"));
+        let chain = crate::state::forwarded_for(headers);
+        client_address_through(Some(&network), "10.0.0.1".parse().expect("peer"), &chain)
     }
 
     /// The scheme a request has, as the API resolves it for the addresses it
-    /// publishes (`AppState::request_scheme`).
+    /// publishes (`handlers::system::context_from_parts`).
     fn request_scheme(
         known_proxy: Option<&str>,
         peer: Option<&str>,
@@ -491,7 +574,9 @@ mod tests {
         if let Some(transport) = transport {
             parts.extensions.insert(transport);
         }
-        state.request_scheme(&parts)
+        crate::handlers::system::context_from_parts(&state, &parts)
+            .scheme
+            .expect("a scheme")
     }
 
     #[rstest]

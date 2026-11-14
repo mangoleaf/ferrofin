@@ -145,43 +145,33 @@ async fn a_books_view_lists_every_book_and_audiobook_of_its_library() {
     ];
     for (id, kind, name, parent) in rows {
         let parent_id = parent.unwrap_or(library_id);
-        wired
-            .state
-            .library
-            .create_items(
-                &[BaseItemEntity {
-                    id: guid_to_db(id),
-                    type_: kind.stored_type_name().unwrap().into(),
-                    name: Some(name.into()),
-                    sort_name: Some(name.to_lowercase()),
-                    clean_name: Some(name.to_lowercase()),
-                    parent_id: Some(guid_to_db(parent_id)),
-                    top_parent_id: Some(stored_library.clone()),
-                    is_folder: kind == BaseItemKind::Folder,
-                    ..Default::default()
-                }],
-                None,
-            )
+        persistence
+            .save_items(&[BaseItemEntity {
+                id: guid_to_db(id),
+                type_: kind.stored_type_name().unwrap().into(),
+                name: Some(name.into()),
+                sort_name: Some(name.to_lowercase()),
+                clean_name: Some(name.to_lowercase()),
+                parent_id: Some(guid_to_db(parent_id)),
+                top_parent_id: Some(stored_library.clone()),
+                is_folder: kind == BaseItemKind::Folder,
+                ..Default::default()
+            }])
             .await
             .unwrap();
         let ancestors: Vec<Uuid> = parent.into_iter().chain([library_id]).collect();
         persistence.set_ancestors(id, &ancestors).await.unwrap();
     }
     let view = Uuid::new_v4();
-    wired
-        .state
-        .library
-        .create_items(
-            &[BaseItemEntity {
-                id: guid_to_db(view),
-                type_: BaseItemKind::UserView.stored_type_name().unwrap().into(),
-                name: Some("Books".into()),
-                is_folder: true,
-                data: Some(json!({"ViewType":"books","DisplayParentId":library}).to_string()),
-                ..Default::default()
-            }],
-            None,
-        )
+    persistence
+        .save_items(&[BaseItemEntity {
+            id: guid_to_db(view),
+            type_: BaseItemKind::UserView.stored_type_name().unwrap().into(),
+            name: Some("Books".into()),
+            is_folder: true,
+            data: Some(json!({"ViewType":"books","DisplayParentId":library}).to_string()),
+            ..Default::default()
+        }])
         .await
         .unwrap();
 

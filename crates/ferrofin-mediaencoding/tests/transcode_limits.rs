@@ -200,6 +200,7 @@ fn state(output_path: &Path, session: &str, streams: Streams) -> EncodingJobInfo
         is_input_video: streams.video.is_some(),
         subtitle_delivery_method: SubtitleDeliveryMethod::Encode,
         trimmed_subtitle_path: None,
+        transcode_reasons: ferrofin_model::session::TranscodeReasons::empty(),
         run_time_ticks: None,
         transcoding_type: TranscodingJobType::Hls,
         supported_video_codecs: Vec::new(),
@@ -716,6 +717,38 @@ async fn a_finished_job_holds_no_slot() {
     );
     fixture.start("a1", ALICE, TRANSCODE).await.unwrap();
     fixture.start("a2", ALICE, TRANSCODE).await.expect("room");
+    assert_eq!(fixture.manager.active_job_count(), 2);
+    assert_eq!(
+        fixture.killed(),
+        Vec::<String>::new(),
+        "nothing needed evicting"
+    );
+}
+
+/// A job whose ffmpeg exits non-zero at startup stays registered (gl-1373)
+/// and holds no slot either.
+#[tokio::test]
+async fn a_job_whose_ffmpeg_failed_at_startup_holds_no_slot() {
+    let fixture = Fixture::scripted(
+        0,
+        1,
+        FakeScript {
+            exit_code: 1,
+            exits_immediately: true,
+            ..FakeScript::default()
+        },
+    );
+    let failed = fixture.start("a1", ALICE, TRANSCODE).await;
+    assert!(
+        matches!(failed, Err(StartFfmpegError::Failed(_))),
+        "{failed:?}"
+    );
+    assert_eq!(fixture.manager.active_job_count(), 1);
+    let admitted = fixture.start("a2", ALICE, TRANSCODE).await;
+    assert!(
+        matches!(admitted, Err(StartFfmpegError::Failed(_))),
+        "admitted, then failed like the first: {admitted:?}"
+    );
     assert_eq!(fixture.manager.active_job_count(), 2);
     assert_eq!(
         fixture.killed(),

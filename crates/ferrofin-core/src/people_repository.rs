@@ -27,7 +27,7 @@ use std::collections::{HashMap, HashSet};
 use async_trait::async_trait;
 use ferrofin_db::Database;
 use ferrofin_db::entities::base_items::PeopleEntity;
-use ferrofin_db::store::{guid_to_db, opt_datetime_to_db};
+use ferrofin_db::store::{datetime_to_db, guid_to_db, opt_datetime_to_db};
 use ferrofin_model::data::BaseItemKind;
 use ferrofin_model::querying::QueryResult;
 use sqlx::QueryBuilder;
@@ -72,14 +72,30 @@ const PERSON_TYPE_NAME: &str = "MediaBrowser.Controller.Entities.Person";
 
 /// A `Person` item insert up to its `VALUES` list, whose rows are
 /// [`PERSON_ITEM_ROW`]s. `INSERT OR IGNORE`: an id already stored keeps its row.
-const PERSON_ITEM_INSERT: &str = r#"INSERT OR IGNORE INTO "BaseItems"
+const PERSON_ITEM_INSERT: &str = concat!(
+    r#"INSERT OR IGNORE INTO "BaseItems"
     ("Id","Type","Name","CleanName","SortName","PresentationUniqueKey","Path",
+     "DateCreated","DateModified","DateLastSaved",
      "IsFolder","IsInMixedFolder",
-     "IsLocked","IsMovie","IsRepeat","IsSeries","IsVirtualItem")
-    VALUES "#;
+     "IsLocked","IsMovie","IsRepeat","IsSeries","IsVirtualItem","UnratedType","#,
+    crate::item_persistence_service::unset_columns!(),
+    r#")
+    VALUES "#
+);
 
-/// One `Person` item's `VALUES` row: `Id` … `Path` bound, the flags 0.
-const PERSON_ITEM_ROW: &str = "(?, ?, ?, ?, ?, ?, ?, 0, 0, 0, 0, 0, 0, 0)";
+/// One `Person` item's `VALUES` row: `Id` … `Path` bound, the three dates bound
+/// (the creation time each: `GetOrCreatePerson` sets `DateCreated` and
+/// `DateModified`, and `SavePeopleMetadataAsync` stamps `DateLastSaved` before
+/// it saves, `LibraryManager.cs:1240-1264,3932`; nothing refreshes a person
+/// there, so `DateLastRefreshed` stays NULL until the people task's refresh,
+/// whose save clears `DateModified`), the flags 0, then what upstream
+/// writes for the columns a person has no value for. A `Person`'s `UnratedType`
+/// is `Other` (`BaseItem.GetBlockUnratedType`, which it does not override).
+const PERSON_ITEM_ROW: &str = concat!(
+    "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, 0, 0, 0, 0, 0, 'Other', ",
+    crate::item_persistence_service::unset_values!(),
+    ")"
+);
 
 /// The columns a `Peoples` insert writes, in bind order.
 const PEOPLES_COLUMNS: &str = r#""Id", "Name", "PersonType""#;
@@ -125,19 +141,21 @@ pub(crate) struct PersonPartition {
 ///
 /// - the id is the older derivation the write path keeps
 ///   ([`resolved_person_item_id`](FerrofinPeopleRepository::resolved_person_item_id));
-/// - the row carries the credit's exact name. That keeps a database whose
-///   stored ids are not the derived ones (a metadata path moved outside the
-///   data dir, a changed id setting) from reading every person as dead and
-///   new at once, and leaves what this deletes a subset of what the name-keyed
-///   sweep it replaced deleted;
-/// - the row is the one a credit's clean name resolves to
-///   ([`person_item_by_clean_name`]: the first by `SortName`, `Id`). The write
-///   path and every person read path treat spellings sharing a clean name as
-///   one person on that row. Upstream gives each spelling its own item, and
-///   `GetPerson` reads it by id; here a second row would be shown for the
-///   first by those paths, so no spelling gets one until they read by id
-///   (`MustHaveItem` still compares the exact name, so a spelling nobody else
-///   carries stays out of `/Persons`).
+/// - the row's own name derives the credit's id and its `CleanName` is the
+///   credit's: the same person under an id that is not the derived one (a
+///   case variant's older-derived id, a metadata path moved outside the data
+///   dir, a changed id setting); the first by `SortName`, `Id`. That keeps
+///   such a database from reading every person as dead and new at once.
+///
+/// These are the rows a credit's name reads
+/// ([`stored_person_item_ids`](FerrofinPeopleRepository::stored_person_item_ids)).
+/// A row carrying a credit's exact name also lives, though with the identity
+/// seam it is no credit's item when its `CleanName` is not the credit's
+/// (without the seam the exact name is the item, and nothing is created):
+/// that leaves what this deletes a subset of what the name-keyed sweep it
+/// replaced deleted.
+/// Spellings sharing a clean name are each their own person, as upstream, so
+/// a second spelling gets an item of its own.
 ///
 /// `stored` is in `SortName`, `Id` order. A blank credit needs no item and keeps
 /// only a row as blank as itself, which the name-keyed sweep kept too.
@@ -147,19 +165,21 @@ fn partition_credits_by_person_id(
     stored: &[StoredPerson],
 ) -> PersonPartition {
     let stored_ids: HashSet<Uuid> = stored.iter().map(|person| person.id).collect();
-    let stored_names: HashSet<&str> = stored
-        .iter()
-        .filter_map(|person| person.name.as_deref().map(str::trim))
-        .collect();
-    let mut by_clean_name: HashMap<&str, Uuid> = HashMap::new();
+    // Each row by its exact name, and by the id its own name derives with its
+    // `CleanName`, which the read reaches it by; the first by `SortName`, `Id`.
+    let mut by_name: HashMap<&str, Uuid> = HashMap::new();
+    let mut by_name_id: HashMap<(Uuid, &str), Uuid> = HashMap::new();
     for person in stored {
-        if let Some(clean_name) = person.clean_name.as_deref() {
-            by_clean_name.entry(clean_name).or_insert(person.id);
+        let Some(name) = person.name.as_deref().map(str::trim) else {
+            continue;
+        };
+        by_name.entry(name).or_insert(person.id);
+        if let (Some(&id), Some(clean)) = (person_ids(name).first(), person.clean_name.as_deref()) {
+            by_name_id.entry((id, clean)).or_insert(person.id);
         }
     }
 
     let mut new_names = Vec::new();
-    let mut new_clean_names: HashSet<String> = HashSet::new();
     let mut credited: HashSet<&str> = HashSet::new();
     let mut live_ids: HashSet<Uuid> = HashSet::new();
     for credit in credit_names {
@@ -168,20 +188,27 @@ fn partition_credits_by_person_id(
         if name.is_empty() {
             continue;
         }
-        let clean_name = crate::text_util::get_clean_value(name);
-        let resolved = by_clean_name.get(clean_name.as_str()).copied();
-        live_ids.extend(resolved);
         let ids = person_ids(name);
         // Distinct credit names can normalize onto one id; only the first of
         // them needs an item.
         let first_of_its_id = ids.first().is_some_and(|id| !live_ids.contains(id));
-        let has_item = resolved.is_some()
-            || stored_names.contains(name)
-            || ids.iter().any(|id| stored_ids.contains(id));
+        let own = ids.iter().any(|id| stored_ids.contains(id));
+        // The row the credit reads when none is stored under its ids.
+        let same_person = if own {
+            None
+        } else {
+            let clean = crate::text_util::get_clean_value(name);
+            ids.first()
+                .map_or_else(
+                    || by_name.get(name),
+                    |&id| by_name_id.get(&(id, clean.as_str())),
+                )
+                .copied()
+        };
+        let has_item = own || same_person.is_some();
+        live_ids.extend(same_person);
         live_ids.extend(ids);
-        // A spelling sharing a clean name with a credit just listed resolves to
-        // the item that credit gets.
-        if first_of_its_id && !has_item && new_clean_names.insert(clean_name) {
+        if first_of_its_id && !has_item {
             new_names.push(name.to_owned());
         }
     }
@@ -213,6 +240,9 @@ pub struct FerrofinPeopleRepository {
     /// ([`item_type_lookup::person_item_id`]). `None` (unit tests) falls back
     /// to per-(name, type) `Peoples` row ids — the pre-unification behavior.
     identity: Option<(item_type_lookup::IdDerivation, String)>,
+    /// How a person row's `Path` is stored (`ReverseVirtualPath`): the
+    /// identity (unit tests) stores it as derived.
+    virtual_paths: crate::virtual_paths::VirtualPathExpander,
 }
 
 impl std::fmt::Debug for FerrofinPeopleRepository {
@@ -226,7 +256,22 @@ impl FerrofinPeopleRepository {
     /// Creates a people repository over the given database.
     #[must_use]
     pub fn new(db: Database) -> Self {
-        Self { db, identity: None }
+        Self {
+            db,
+            identity: None,
+            virtual_paths: crate::virtual_paths::VirtualPathExpander::identity(),
+        }
+    }
+
+    /// Wires the virtual-path tokens a person row's `Path` is stored with
+    /// (`%MetadataPath%/People/…`, as upstream's mapper writes it).
+    #[must_use]
+    pub fn with_virtual_paths(
+        mut self,
+        virtual_paths: crate::virtual_paths::VirtualPathExpander,
+    ) -> Self {
+        self.virtual_paths = virtual_paths;
+        self
     }
 
     /// Wires the id derivation + People metadata path, so person by-name items
@@ -281,9 +326,9 @@ impl FerrofinPeopleRepository {
         Ok(Some(current))
     }
 
-    /// Reuse the library resolver's indexed clean-name match before minting
-    /// an ID. A refresh may change the spelling, so an old hash alone is not
-    /// sufficient to find every previously written item.
+    /// `GetOrCreatePerson`'s id: the stored item `name` reads
+    /// ([`stored_person_item_ids`](Self::stored_person_item_ids)), else the id
+    /// it derives, else (identity seam unwired) `fallback`.
     async fn person_item_id_for_write(
         &self,
         tx: &mut sqlx::Transaction<'_, Sqlite>,
@@ -291,14 +336,114 @@ impl FerrofinPeopleRepository {
         fallback: &str,
     ) -> Result<String, ServiceError> {
         if self.identity.is_some()
-            && let Some(stored) = person_item_by_clean_name(&mut **tx, name).await?
+            && let Some(Some(stored)) = self.stored_person_item_ids(tx, &[name]).await?.pop()
         {
             return Ok(stored);
         }
         Ok(self
-            .resolved_person_item_id(tx, name)
-            .await?
+            .person_item_id(name)
             .unwrap_or_else(|| fallback.to_owned()))
+    }
+
+    /// `LibraryManager.GetPerson` for each of `names` (trimmed), in order: the
+    /// stored `Person` item at the id the name derives, so spellings sharing a
+    /// clean name are each their own person. The older derivation's item wins
+    /// where it is stored, as the write path keeps it
+    /// ([`resolved_person_item_id`](Self::resolved_person_item_id)). Failing
+    /// both, the name's item is the first row (by `SortName`, `Id`) with the
+    /// name's `CleanName` whose own name derives the same id: the same person
+    /// to upstream, stored under an id that is not the derived one (a case
+    /// variant's older-derived id, a metadata path moved outside the data dir,
+    /// a changed id setting). Without the identity seam, only the exact name
+    /// is the same person. `None` where none is stored, or the name is blank.
+    ///
+    /// Two reads for the whole list (one each up to 256 ids or names): the
+    /// derived ids, then the rows sharing a clean name with the ones none of
+    /// them matched (every name deriving one id shares its clean name).
+    async fn stored_person_item_ids(
+        &self,
+        conn: &mut SqliteConnection,
+        names: &[&str],
+    ) -> Result<Vec<Option<String>>, ServiceError> {
+        // Each name's derived ids, in the order they win.
+        let candidates: Vec<Vec<String>> = names
+            .iter()
+            .map(|name| {
+                if name.is_empty() {
+                    return Vec::new();
+                }
+                let mut ids = self.person_ids(name);
+                ids.reverse();
+                ids.into_iter().map(guid_to_db).collect()
+            })
+            .collect();
+        // `padded_in_chunks` binds each distinct id once.
+        let ids: Vec<&String> = candidates.iter().flatten().collect();
+        let mut stored: HashSet<String> = HashSet::new();
+        for binds in ferrofin_db::padded_in_chunks(&ids) {
+            let mut query = sqlx::query_scalar::<_, String>(sqlx::AssertSqlSafe(
+                person_items_by_ids_sql(binds.len()),
+            ))
+            .bind(PERSON_TYPE_NAME);
+            for id in binds {
+                query = query.bind(*id);
+            }
+            stored.extend(query.fetch_all(&mut *conn).await.map_err(db_err)?);
+        }
+        let mut found: Vec<Option<String>> = candidates
+            .iter()
+            .map(|ids| ids.iter().find(|id| stored.contains(*id)).cloned())
+            .collect();
+
+        let missing: Vec<String> = names
+            .iter()
+            .zip(&found)
+            .filter(|(name, id)| id.is_none() && !name.is_empty())
+            .map(|(name, _)| crate::text_util::get_clean_value(name))
+            .collect();
+        // `(CleanName, Name, Id)`, each clean name's rows by `SortName`, `Id`.
+        let mut rows: Vec<(String, Option<String>, String)> = Vec::new();
+        for binds in ferrofin_db::padded_in_chunks(&missing) {
+            let mut query = sqlx::query_as::<_, (String, Option<String>, String)>(
+                sqlx::AssertSqlSafe(person_items_by_clean_names_sql(binds.len())),
+            )
+            .bind(PERSON_TYPE_NAME);
+            for clean in binds {
+                query = query.bind(clean.as_str());
+            }
+            rows.extend(query.fetch_all(&mut *conn).await.map_err(db_err)?);
+        }
+        if rows.is_empty() {
+            return Ok(found);
+        }
+        let mut by_clean: HashMap<&str, Vec<(Option<&str>, &str)>> = HashMap::new();
+        for (clean, name, id) in &rows {
+            by_clean
+                .entry(clean.as_str())
+                .or_default()
+                .push((name.as_deref(), id.as_str()));
+        }
+        for (name, slot) in names.iter().zip(&mut found) {
+            if slot.is_some() || name.is_empty() {
+                continue;
+            }
+            let clean = crate::text_util::get_clean_value(name);
+            let Some(candidates) = by_clean.get(clean.as_str()) else {
+                continue;
+            };
+            let own = self.person_item_id(name);
+            *slot = candidates
+                .iter()
+                .find(|(row_name, _)| {
+                    let row_name = row_name.map_or("", str::trim);
+                    match &own {
+                        Some(own) => self.person_item_id(row_name).as_ref() == Some(own),
+                        None => row_name == *name,
+                    }
+                })
+                .map(|(_, id)| (*id).to_owned());
+        }
+        Ok(found)
     }
 
     /// The `Path` column of `name`'s `Person` row — `Person.GetPath(name)`,
@@ -313,6 +458,15 @@ impl FerrofinPeopleRepository {
     fn person_metadata_path(&self, name: &str) -> Option<String> {
         let (_, people_path) = self.identity.as_ref()?;
         Some(item_type_lookup::person_path(people_path, name))
+    }
+
+    /// [`Self::person_metadata_path`] as the row stores it: through
+    /// `ReverseVirtualPath`, so `%MetadataPath%/People/…` as upstream's mapper
+    /// writes it (`BaseItemMapper.Map` → `GetPathToSave`). The id stays derived
+    /// from the resolved path, as upstream derives it before the save.
+    fn person_stored_path(&self, name: &str) -> Option<String> {
+        self.person_metadata_path(name)
+            .map(|path| self.virtual_paths.reverse(&path))
     }
 
     /// Every id `name`'s credit may have an item under: the current derivation
@@ -439,11 +593,18 @@ impl FerrofinPeopleRepository {
                 // `PresentationUniqueKey` too — `Person-{Name}` with the
                 // diacritics removed, exactly as Jellyfin writes it. This
                 // insert bypasses `upsert_item`, so nothing else would set it.
-                r#"INSERT OR IGNORE INTO "BaseItems"
+                concat!(
+                    r#"INSERT OR IGNORE INTO "BaseItems"
                    ("Id","Type","Name","CleanName","SortName","PresentationUniqueKey","Path",
+                    "DateCreated","DateModified","DateLastSaved",
                     "IsFolder","IsInMixedFolder",
-                    "IsLocked","IsMovie","IsRepeat","IsSeries","IsVirtualItem")
-                   VALUES (?1,?2,?3,?4,?5,?6,?7,0,0,0,0,0,0,0)"#,
+                    "IsLocked","IsMovie","IsRepeat","IsSeries","IsVirtualItem","UnratedType","#,
+                    crate::item_persistence_service::unset_columns!(),
+                    r#")
+                   VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?8,?8,0,0,0,0,0,0,0,'Other',"#,
+                    crate::item_persistence_service::unset_values!(),
+                    ")"
+                ),
             )
             .bind(target)
             .bind(person_type)
@@ -452,6 +613,7 @@ impl FerrofinPeopleRepository {
             .bind(person_sort_name(name))
             .bind(person_presentation_key(target, name))
             .bind(path)
+            .bind(datetime_to_db(chrono::Utc::now()))
             .execute(&mut **tx)
             .await
             .map_err(db_err)?;
@@ -464,8 +626,8 @@ impl FerrofinPeopleRepository {
                     (SELECT "PremiereDate" FROM "BaseItems" WHERE "Id" = ?1)),
                  "EndDate" = COALESCE("EndDate",
                     (SELECT "EndDate" FROM "BaseItems" WHERE "Id" = ?1)),
-                 "ProductionLocations" = COALESCE("ProductionLocations",
-                    (SELECT "ProductionLocations" FROM "BaseItems" WHERE "Id" = ?1))
+                 "ProductionLocations" = COALESCE(NULLIF("ProductionLocations", ''),
+                    (SELECT NULLIF("ProductionLocations", '') FROM "BaseItems" WHERE "Id" = ?1), '')
                WHERE "Id" = ?2"#,
         )
         .bind(old_id)
@@ -552,7 +714,7 @@ impl FerrofinPeopleRepository {
             // The target row must exist BEFORE any child rows repoint at it
             // (FK BaseItems.Id) — collapse_person_row handles the ordering.
             let create_target = seen_targets.insert(target.clone());
-            let path = self.person_metadata_path(name);
+            let path = self.person_stored_path(name);
             Self::collapse_person_row(
                 &mut tx,
                 person_type,
@@ -596,6 +758,7 @@ impl FerrofinPeopleRepository {
         name: &str,
         item_id: &str,
     ) -> Result<bool, ServiceError> {
+        let now = datetime_to_db(chrono::Utc::now());
         let inserted = sqlx::query(sqlx::AssertSqlSafe(format!(
             "{PERSON_ITEM_INSERT}{PERSON_ITEM_ROW}"
         )))
@@ -605,7 +768,10 @@ impl FerrofinPeopleRepository {
         .bind(crate::text_util::get_clean_value(name))
         .bind(person_sort_name(name))
         .bind(person_presentation_key(item_id, name))
-        .bind(self.person_metadata_path(name))
+        .bind(self.person_stored_path(name))
+        .bind(&now)
+        .bind(&now)
+        .bind(&now)
         .execute(&mut **tx)
         .await
         .map_err(db_err)?
@@ -619,14 +785,14 @@ impl FerrofinPeopleRepository {
     ///
     /// One person at a time this was [`person_item_id_for_write`], then
     /// [`insert_person_item`], then a biography read: three statements or
-    /// more per person. Here it is two reads (one each up to 256 people) and
-    /// an insert of the new items in power-of-two runs (gl-1181), plus, as
-    /// before, `resolved_person_item_id`'s existence read for a person whose
-    /// older-derived id differs from its current one. And the
-    /// answers stay the ones the sequence gave: a person whose clean name
-    /// matches an item an earlier person of the list creates takes that item,
-    /// as the earlier insert preceded the later lookup, and `INSERT OR IGNORE`
-    /// creates an item only when no row holds its id.
+    /// more per person. Here it is the reads of
+    /// [`stored_person_item_ids`](Self::stored_person_item_ids) and the
+    /// biography read (each one statement up to 256 people) and an insert of
+    /// the new items in power-of-two runs (gl-1181). And the answers stay the
+    /// ones the sequence gave: a person whose name derives the id of an item an
+    /// earlier person of the list creates takes that item, as the earlier
+    /// insert preceded the later lookup, and `INSERT OR IGNORE` creates an item
+    /// only when no row holds its id.
     ///
     /// [`person_item_id_for_write`]: Self::person_item_id_for_write
     /// [`insert_person_item`]: Self::insert_person_item
@@ -637,54 +803,42 @@ impl FerrofinPeopleRepository {
         people_ids: &[String],
     ) -> Result<Vec<(String, Option<String>)>, ServiceError> {
         let names: Vec<&str> = persons.iter().map(|person| person.name.trim()).collect();
-        let cleans: Vec<String> = names
-            .iter()
-            .map(|name| crate::text_util::get_clean_value(name))
-            .collect();
-        // The stored items by clean name: the first by `SortName`, `Id`, as
-        // `person_item_by_clean_name` reads one. Only with the identity seam
-        // wired, as `person_item_id_for_write` looks only then.
-        let mut by_clean = if self.identity.is_some() {
-            person_items_by_clean_names(tx, &cleans).await?
+        // The stored item each name reads, else the id it derives. Only with
+        // the identity seam wired, as `person_item_id_for_write` looks only
+        // then; unwired, a person's item is its `Peoples` row id.
+        let stored_ids = if self.identity.is_some() {
+            self.stored_person_item_ids(tx, &names).await?
         } else {
-            HashMap::new()
+            vec![None; names.len()]
         };
-        // Each person's item when no stored one matches its clean name.
-        let mut candidates: Vec<String> = Vec::with_capacity(persons.len());
-        for (index, name) in names.iter().enumerate() {
-            let candidate = match by_clean.get(&cleans[index]) {
-                Some(stored) => stored.clone(),
-                None => self
-                    .resolved_person_item_id(tx, name)
-                    .await?
-                    .unwrap_or_else(|| people_ids[index].clone()),
-            };
-            candidates.push(candidate);
-        }
+        let candidates: Vec<String> = names
+            .iter()
+            .zip(stored_ids)
+            .zip(people_ids)
+            .map(|((name, stored), people_id)| {
+                stored
+                    .or_else(|| self.person_item_id(name))
+                    .unwrap_or_else(|| people_id.clone())
+            })
+            .collect();
         // Which of them are stored, and their biographies.
         let mut stored = overviews_by_ids(tx, &candidates).await?;
         // In list order, as one person at a time: an item created here is
-        // stored, and found by clean name, for the persons after it.
+        // stored for the persons after it.
         let type_name = stored_type_name(BaseItemKind::Person);
         let mut items = Vec::with_capacity(persons.len());
-        let mut created: Vec<(String, &str, &str)> = Vec::new();
-        for (index, name) in names.iter().enumerate() {
-            let id = by_clean
-                .get(&cleans[index])
-                .unwrap_or(&candidates[index])
-                .clone();
+        let mut created: Vec<(String, &str, String)> = Vec::new();
+        for (name, id) in names.iter().zip(candidates) {
             let overview = stored.get(&id).cloned().flatten();
             if type_name.is_some() && !stored.contains_key(&id) {
                 stored.insert(id.clone(), None);
-                if self.identity.is_some() {
-                    by_clean.insert(cleans[index].clone(), id.clone());
-                }
-                created.push((id.clone(), *name, cleans[index].as_str()));
+                created.push((id.clone(), *name, crate::text_util::get_clean_value(name)));
             }
             items.push((id, overview));
         }
         if let Some(type_name) = type_name {
             let columns = PERSON_ITEM_ROW.matches('?').count();
+            let now = datetime_to_db(chrono::Utc::now());
             for chunk in
                 ferrofin_db::power_of_two_chunks(&created, ferrofin_db::BATCH_BIND_CHUNK / columns)
             {
@@ -693,15 +847,18 @@ impl FerrofinPeopleRepository {
                     vec![PERSON_ITEM_ROW; chunk.len()].join(", ")
                 );
                 let mut query = sqlx::query(sqlx::AssertSqlSafe(sql));
-                for &(ref id, name, clean) in chunk {
+                for (id, name, clean) in chunk {
                     query = query
                         .bind(id)
                         .bind(type_name)
-                        .bind(name)
+                        .bind(*name)
                         .bind(clean)
                         .bind(person_sort_name(name))
                         .bind(person_presentation_key(id, name))
-                        .bind(self.person_metadata_path(name));
+                        .bind(self.person_stored_path(name))
+                        .bind(&now)
+                        .bind(&now)
+                        .bind(&now);
                 }
                 query.execute(&mut **tx).await.map_err(db_err)?;
             }
@@ -767,7 +924,7 @@ impl FerrofinPeopleRepository {
                 continue;
             };
             let want_sort = person_sort_name(name);
-            let want_path = self.person_metadata_path(name);
+            let want_path = self.person_stored_path(name);
             let want_key = Uuid::parse_str(&id).ok().map(|pid| {
                 crate::kinds::presentation_unique_key(
                     BaseItemKind::Person,
@@ -814,8 +971,9 @@ impl FerrofinPeopleRepository {
         }
         tx.commit().await.map_err(db_err)?;
         for (_, _, path, _) in &pending {
-            if let Some(path) = path
-                && let Err(e) = tokio::fs::create_dir_all(path).await
+            // the row stores the token; the directory is made where it points
+            if let Some(path) = path.as_deref().map(|path| self.virtual_paths.expand(path))
+                && let Err(e) = tokio::fs::create_dir_all(&path).await
             {
                 tracing::debug!(%path, error = %e, "could not create person metadata directory");
             }
@@ -919,23 +1077,6 @@ fn credits_unchanged(stored: &[StoredCredit], credits: &[&PeopleEntity]) -> bool
     })
 }
 
-/// The `Person` item already stored under `name`'s clean name, the match the
-/// library resolver uses.
-async fn person_item_by_clean_name<'e>(
-    executor: impl sqlx::Executor<'e, Database = Sqlite>,
-    name: &str,
-) -> Result<Option<String>, ServiceError> {
-    sqlx::query_scalar(
-        r#"SELECT "Id" FROM "BaseItems" WHERE "Type" = ?1 AND "CleanName" = ?2
-           ORDER BY "SortName", "Id" LIMIT 1"#,
-    )
-    .bind(PERSON_TYPE_NAME)
-    .bind(crate::text_util::get_clean_value(name))
-    .fetch_optional(executor)
-    .await
-    .map_err(db_err)
-}
-
 /// What `update_people` hands back for one credited person: the item, whether
 /// it still lacks a biography, and the credit's artwork and provider id.
 fn written_person(
@@ -998,6 +1139,32 @@ async fn insert_credit_rows(
     Ok(())
 }
 
+/// Deletes the `Peoples` rows among `candidates` that no credit maps to any
+/// more: upstream's `DeleteCreditsWithoutMapping` over a candidate list
+/// (v12.4 `PeopleRepository.cs:263-275`). Their `Person` items stay for the
+/// "Refresh People" task, as upstream leaves them.
+pub(crate) async fn delete_credits_without_mapping(
+    conn: &mut SqliteConnection,
+    candidates: &[String],
+) -> Result<(), ServiceError> {
+    if candidates.is_empty() {
+        return Ok(());
+    }
+    // One JSON array bind, so a whole library's credits need no chunking.
+    let candidates =
+        serde_json::to_string(candidates).map_err(|e| ServiceError::Backend(e.to_string()))?;
+    sqlx::query(DELETE_CREDITS_WITHOUT_MAPPING_SQL)
+        .bind(candidates)
+        .execute(conn)
+        .await
+        .map_err(db_err)?;
+    Ok(())
+}
+
+const DELETE_CREDITS_WITHOUT_MAPPING_SQL: &str = r#"DELETE FROM "Peoples"
+   WHERE "Id" IN (SELECT value FROM json_each(?1))
+     AND NOT EXISTS (SELECT 1 FROM "PeopleBaseItemMap" m WHERE m."PeopleId" = "Peoples"."Id")"#;
+
 /// The stored `Peoples` rows (`Id`, `Name`, `PersonType`) whose name matches
 /// one of `count` names (`?1`…) under `COLLATE NOCASE`.
 fn peoples_by_names_sql(count: usize) -> String {
@@ -1008,11 +1175,21 @@ fn peoples_by_names_sql(count: usize) -> String {
     )
 }
 
-/// The stored items (`CleanName`, `Id`) of type `?1` under one of `count`
-/// clean names (`?2`…), first by `SortName`, `Id`.
+/// The stored items of type `?1` among `count` ids (`?2`…). `+"Type"` keeps
+/// the read on the primary key, one seek per id; it comes first so the text
+/// differs from other id reads, which `scan_statements` counts by prefix.
+fn person_items_by_ids_sql(count: usize) -> String {
+    format!(
+        r#"SELECT "Id" FROM "BaseItems" WHERE +"Type" = ?1 AND "Id" IN ({})"#,
+        ferrofin_db::numbered_placeholders(2..=count + 1)
+    )
+}
+
+/// The stored items (`CleanName`, `Name`, `Id`) of type `?1` under one of
+/// `count` clean names (`?2`…), first by `SortName`, `Id`.
 fn person_items_by_clean_names_sql(count: usize) -> String {
     format!(
-        r#"SELECT "CleanName", "Id" FROM "BaseItems"
+        r#"SELECT "CleanName", "Name", "Id" FROM "BaseItems"
            WHERE "Type" = ?1 AND "CleanName" IN ({})
            ORDER BY "SortName", "Id""#,
         ferrofin_db::numbered_placeholders(2..=count + 1)
@@ -1027,31 +1204,6 @@ fn overviews_by_ids_sql(count: usize) -> String {
     )
 }
 
-/// The stored `Person` item under each of `cleans` (clean names), keyed by
-/// clean name: the first by `SortName`, `Id`, as [`person_item_by_clean_name`]
-/// reads one, in one statement up to 256 names (gl-1181).
-async fn person_items_by_clean_names(
-    conn: &mut SqliteConnection,
-    cleans: &[String],
-) -> Result<HashMap<String, String>, ServiceError> {
-    let mut seen = HashSet::new();
-    let distinct: Vec<&String> = cleans.iter().filter(|c| seen.insert(*c)).collect();
-    let mut by_clean = HashMap::new();
-    for binds in ferrofin_db::padded_in_chunks(&distinct) {
-        let mut query = sqlx::query_as::<_, (String, String)>(sqlx::AssertSqlSafe(
-            person_items_by_clean_names_sql(binds.len()),
-        ))
-        .bind(PERSON_TYPE_NAME);
-        for clean in binds {
-            query = query.bind(*clean);
-        }
-        for (clean, id) in query.fetch_all(&mut *conn).await.map_err(db_err)? {
-            by_clean.entry(clean).or_insert(id);
-        }
-    }
-    Ok(by_clean)
-}
-
 /// The `Overview` of each stored item among `ids`, keyed by id (`None` when
 /// it has no biography, no entry when it is not stored), in one statement up
 /// to 256 ids (gl-1181).
@@ -1059,15 +1211,13 @@ async fn overviews_by_ids(
     conn: &mut SqliteConnection,
     ids: &[String],
 ) -> Result<HashMap<String, Option<String>>, ServiceError> {
-    let mut seen = HashSet::new();
-    let distinct: Vec<&String> = ids.iter().filter(|id| seen.insert(*id)).collect();
-    let mut stored = HashMap::with_capacity(distinct.len());
-    for binds in ferrofin_db::padded_in_chunks(&distinct) {
+    let mut stored = HashMap::with_capacity(ids.len());
+    for binds in ferrofin_db::padded_in_chunks(ids) {
         let mut query = sqlx::query_as::<_, (String, Option<String>)>(sqlx::AssertSqlSafe(
             overviews_by_ids_sql(binds.len()),
         ));
         for id in binds {
-            query = query.bind(*id);
+            query = query.bind(id);
         }
         stored.extend(query.fetch_all(&mut *conn).await.map_err(db_err)?);
     }
@@ -1616,10 +1766,10 @@ impl FerrofinPeopleRepository {
     /// biography state. `None` when one of them has no item yet, which only
     /// the write path creates.
     ///
-    /// Two reads for the whole cast (one each up to 256 people), the
-    /// clean-name match and the biographies, as the write path reads them
-    /// (gl-1194), not two per person; without the identity seam, only the
-    /// biographies.
+    /// A few reads for the whole cast (each one statement up to 256 people),
+    /// [`stored_person_item_ids`](Self::stored_person_item_ids) and the
+    /// biographies, as the write path reads them (gl-1194), not two per
+    /// person; without the identity seam, only the biographies.
     async fn unchanged_people(
         &self,
         credits: &[&PeopleEntity],
@@ -1636,14 +1786,10 @@ impl FerrofinPeopleRepository {
         }
         let mut conn = self.db.pool().acquire().await.map_err(db_err)?;
         let item_ids: Option<Vec<String>> = if self.identity.is_some() {
-            let cleans: Vec<String> = persons
-                .iter()
-                .map(|person| crate::text_util::get_clean_value(person.name.trim()))
-                .collect();
-            let by_clean = person_items_by_clean_names(&mut conn, &cleans).await?;
-            cleans
-                .iter()
-                .map(|clean| by_clean.get(clean).cloned())
+            let names: Vec<&str> = persons.iter().map(|person| person.name.trim()).collect();
+            self.stored_person_item_ids(&mut conn, &names)
+                .await?
+                .into_iter()
                 .collect()
         } else {
             // The unwired seam keys a person's item on its `Peoples` row.
@@ -1922,6 +2068,20 @@ impl PeopleRepository for FerrofinPeopleRepository {
             .collect())
     }
 
+    async fn find_person_item_ids(
+        &self,
+        names: &[String],
+    ) -> Result<Vec<Option<Uuid>>, ServiceError> {
+        let names: Vec<&str> = names.iter().map(|name| name.trim()).collect();
+        let mut conn = self.db.pool().acquire().await.map_err(db_err)?;
+        Ok(self
+            .stored_person_item_ids(&mut conn, &names)
+            .await?
+            .into_iter()
+            .map(|id| id.and_then(|id| Uuid::parse_str(&id).ok()))
+            .collect())
+    }
+
     async fn update_people(
         &self,
         item_id: Uuid,
@@ -1951,12 +2111,15 @@ impl PeopleRepository for FerrofinPeopleRepository {
         // first statement takes SQLite's write lock upfront, so a concurrent writer
         // (e.g. a page load's playstate update during a scan) can't invalidate a
         // read snapshot and trip `SQLITE_BUSY_SNAPSHOT` (which busy_timeout won't
-        // retry). The map is rebuilt below.
-        sqlx::query(r#"DELETE FROM "PeopleBaseItemMap" WHERE "ItemId" = ?1"#)
-            .bind(guid_to_db(item_id))
-            .execute(&mut *tx)
-            .await
-            .map_err(db_err)?;
+        // retry). The map is rebuilt below, then the persons it credited that
+        // no item credits any more are deleted (upstream's `droppedCredits`).
+        let unmapped: Vec<String> = sqlx::query_scalar(
+            r#"DELETE FROM "PeopleBaseItemMap" WHERE "ItemId" = ?1 RETURNING "PeopleId""#,
+        )
+        .bind(guid_to_db(item_id))
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(db_err)?;
 
         // Ensure a Peoples row exists for each (case-insensitive name + type),
         // reusing an existing id where present so credits share one person row.
@@ -1992,6 +2155,7 @@ impl PeopleRepository for FerrofinPeopleRepository {
         let people_ids: Vec<String> = slots.iter().map(|&slot| person_ids[slot].clone()).collect();
 
         insert_credit_rows(&mut tx, item_id, &people_ids, &deduped, &stored_roles).await?;
+        delete_credits_without_mapping(&mut tx, &unmapped).await?;
         tx.commit().await.map_err(db_err)?;
         self.create_person_directories(&deduped).await;
         Ok(written)
@@ -2003,9 +2167,10 @@ impl PeopleRepository for FerrofinPeopleRepository {
         metadata: PersonMetadata,
     ) -> Result<(), ServiceError> {
         sqlx::query(
+            // No birthplace is the joined empty list upstream's mapper writes, never NULL.
             r#"UPDATE "BaseItems"
                SET "Overview" = ?2, "PremiereDate" = ?3, "EndDate" = ?4,
-                   "ProductionLocations" = ?5
+                   "ProductionLocations" = coalesce(?5, '')
                WHERE "Id" = ?1"#,
         )
         .bind(guid_to_db(person_id))
@@ -2039,61 +2204,6 @@ impl PeopleRepository for FerrofinPeopleRepository {
             names.truncate(usize::try_from(filter.limit).unwrap_or(usize::MAX));
         }
         Ok(names)
-    }
-
-    async fn get_people_names_by_items(
-        &self,
-        item_ids: &[Uuid],
-        person_types: &[String],
-    ) -> Result<HashMap<Uuid, Vec<String>>, ServiceError> {
-        if item_ids.is_empty() {
-            return Ok(HashMap::new());
-        }
-        let mut qb = QueryBuilder::<Sqlite>::new(
-            r#"SELECT m."ItemId", p."Name" FROM "PeopleBaseItemMap" m
-               JOIN "Peoples" p ON p."Id" = m."PeopleId" WHERE m."ItemId" IN ("#,
-        );
-        {
-            let mut sep = qb.separated(", ");
-            for id in ferrofin_db::padded_in_list(item_ids) {
-                sep.push_bind(guid_to_db(*id));
-            }
-        }
-        qb.push(")");
-        let types: Vec<&String> = person_types
-            .iter()
-            .filter(|t| is_valid_person_type(t))
-            .collect();
-        if !types.is_empty() {
-            qb.push(r#" AND p."PersonType" IN ("#);
-            let mut sep = qb.separated(", ");
-            for t in types {
-                sep.push_bind(t.clone());
-            }
-            qb.push(")");
-        }
-        qb.push(r#" ORDER BY m."ListOrder""#);
-
-        let rows: Vec<(String, String)> = qb
-            .build_query_as::<(String, String)>()
-            .fetch_all(self.db.pool())
-            .await
-            .map_err(db_err)?;
-
-        let mut result: HashMap<Uuid, Vec<String>> = HashMap::new();
-        for (item_id, name) in rows {
-            if name.is_empty() {
-                continue;
-            }
-            let Ok(id) = Uuid::parse_str(&item_id) else {
-                continue;
-            };
-            let names = result.entry(id).or_default();
-            if !names.contains(&name) {
-                names.push(name);
-            }
-        }
-        Ok(result)
     }
 }
 
@@ -2427,36 +2537,43 @@ mod tests {
         );
     }
 
-    /// Spellings sharing a clean name are one person on one row, whichever of
-    /// them is credited: no second item, and the row lives while any is.
+    /// A case variant's row under another id (an older derivation, a moved
+    /// metadata folder): the credit derives the id the row's own name does, so
+    /// it is the same person, and the row is the credit's item and lives.
     #[test]
-    fn partition_keeps_a_second_spelling_on_the_row_it_resolves_to() {
+    fn partition_counts_a_row_of_the_same_person_under_another_id() {
+        let rows = [stored(Uuid::from_u128(0x0DC), "AURORA")];
+        assert_eq!(partition(&["aurora"], &rows), PersonPartition::default());
+    }
+
+    /// Spellings sharing a clean name are two people, as `GetPerson` reads
+    /// them (gl-1079): the credited spelling gets an item of its own, and the
+    /// other spelling's row, which nothing credits, is dead.
+    #[test]
+    fn partition_gives_a_second_spelling_an_item_of_its_own() {
         let first = stored(partition_id("H. Jon Benjamin"), "H. Jon Benjamin");
-        assert_eq!(
-            partition(&["H Jon Benjamin"], std::slice::from_ref(&first)),
-            PersonPartition::default()
-        );
+        let found = partition(&["H Jon Benjamin"], std::slice::from_ref(&first));
+        assert_eq!(found.new_names, ["H Jon Benjamin"]);
+        assert_eq!(found.dead, [first]);
     }
 
     /// Two rows share a clean name, as an adopted Jellyfin database holds them.
-    /// A credit keeps its own row by id, and the row it resolves to: the first
-    /// by `SortName`, `Id`, the order `stored` comes in.
+    /// Each is its own person: the credited spelling keeps its row by id, and
+    /// the row of the spelling nothing credits is dead.
     #[test]
-    fn partition_keeps_the_row_a_credit_resolves_to_beside_its_own() {
-        let resolved = stored(partition_id("Jose"), "Jose");
+    fn partition_keeps_only_the_credited_spellings_row() {
+        let other = stored(partition_id("Jose"), "Jose");
         let own = stored(partition_id("José"), "José");
-        assert_eq!(
-            partition(&["José"], &[resolved, own]),
-            PersonPartition::default()
-        );
+        let found = partition(&["José"], &[other.clone(), own]);
+        assert_eq!(found.new_names, Vec::<String>::new());
+        assert_eq!(found.dead, [other]);
     }
 
-    /// Two new credits sharing a clean name are one person, as they are with a
-    /// row behind them: one item, under the first of them.
+    /// Two new credits sharing a clean name are two people: an item each.
     #[test]
-    fn partition_creates_one_item_for_new_spellings_of_one_clean_name() {
+    fn partition_creates_an_item_per_spelling_of_one_clean_name() {
         let found = partition(&["H Jon Benjamin", "H. Jon Benjamin"], &[]);
-        assert_eq!(found.new_names, ["H Jon Benjamin"]);
+        assert_eq!(found.new_names, ["H Jon Benjamin", "H. Jon Benjamin"]);
     }
 
     /// A blank credit needs no item, and no other row lives by it.
@@ -2510,7 +2627,7 @@ mod tests {
                 "{dead:?} was kept by the name-keyed sweep"
             );
         }
-        assert_eq!(found.dead, [rows[5].clone(), nameless]);
+        assert_eq!(found.dead, [rows[4].clone(), rows[5].clone(), nameless]);
         assert_eq!(found.locked, 1);
     }
 
@@ -2535,19 +2652,55 @@ mod tests {
         assert_eq!(dead, [orphan]);
     }
 
+    /// A repository over a temp People folder, and the id `name` derives there.
+    fn identity_repo(
+        db: &ferrofin_db::Database,
+        people: &tempfile::TempDir,
+    ) -> (FerrofinPeopleRepository, impl Fn(&str) -> Uuid) {
+        let mode = crate::item_type_lookup::IdDerivation::Jellyfin {
+            program_data_path: None,
+        };
+        let root = people.path().to_string_lossy().into_owned();
+        let repo =
+            FerrofinPeopleRepository::new(db.clone()).with_identity(mode.clone(), root.clone());
+        let id_of = move |name: &str| {
+            crate::item_type_lookup::person_item_id(&mode, &root, name).expect("person id")
+        };
+        (repo, id_of)
+    }
+
     /// A scan made the person's row after the partition read: creating the
-    /// credit's item reuses it, as the write path does, whatever its spelling.
+    /// credit's item reuses it, as the write path does.
     #[tokio::test]
     async fn create_person_items_reuses_a_row_a_scan_made_meanwhile() {
         let db = test_db().await;
         let people = tempfile::tempdir().unwrap();
-        let repo = FerrofinPeopleRepository::new(db.clone()).with_identity(
-            crate::item_type_lookup::IdDerivation::Jellyfin {
-                program_data_path: None,
-            },
-            people.path().to_string_lossy().into_owned(),
-        );
-        let scanned = Uuid::from_u128(0x0DD);
+        let (repo, id_of) = identity_repo(&db, &people);
+        seed_named_item(
+            &db,
+            id_of("H Jon Benjamin"),
+            BaseItemKind::Person,
+            "H Jon Benjamin",
+        )
+        .await;
+
+        let created = repo
+            .create_person_items(&["H Jon Benjamin".to_owned()])
+            .await
+            .unwrap();
+
+        assert_eq!(created, 0);
+        assert_eq!(super::person_names(&db).await, ["H Jon Benjamin"]);
+    }
+
+    /// A row of another spelling sharing the clean name is another person
+    /// (gl-1079): the credit gets an item of its own, at the id it derives.
+    #[tokio::test]
+    async fn create_person_items_gives_a_second_spelling_an_item_of_its_own() {
+        let db = test_db().await;
+        let people = tempfile::tempdir().unwrap();
+        let (repo, id_of) = identity_repo(&db, &people);
+        let scanned = id_of("H. Jon Benjamin");
         seed_named_item(&db, scanned, BaseItemKind::Person, "H. Jon Benjamin").await;
         crate::test_support::set_clean_name(&db, scanned, "H. Jon Benjamin").await;
 
@@ -2556,8 +2709,184 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(created, 0);
-        assert_eq!(super::person_names(&db).await, ["H. Jon Benjamin"]);
+        assert_eq!(created, 1);
+        assert_eq!(
+            super::person_names(&db).await,
+            ["H Jon Benjamin", "H. Jon Benjamin"]
+        );
+        let found = repo
+            .find_person_item_ids(&["H Jon Benjamin".to_owned(), "H. Jon Benjamin".to_owned()])
+            .await
+            .unwrap();
+        assert_eq!(found, [Some(id_of("H Jon Benjamin")), Some(scanned)]);
+    }
+
+    /// `GetPerson` (gl-1079): each name reads the item its own spelling
+    /// derives, never the first with its clean name, and a row of the same
+    /// person under an id that is not the derived one, as a moved metadata
+    /// folder leaves it, is that name's item.
+    #[tokio::test]
+    async fn find_person_item_ids_reads_each_names_own_item() {
+        let db = test_db().await;
+        let people = tempfile::tempdir().unwrap();
+        let (repo, id_of) = identity_repo(&db, &people);
+        for name in ["H Jon Benjamin", "H. Jon Benjamin"] {
+            seed_named_item(&db, id_of(name), BaseItemKind::Person, name).await;
+            crate::test_support::set_clean_name(&db, id_of(name), name).await;
+        }
+        let moved = Uuid::from_u128(0x1079);
+        seed_named_item(&db, moved, BaseItemKind::Person, "Moved Mary").await;
+        crate::test_support::set_clean_name(&db, moved, "Moved Mary").await;
+
+        let names = [
+            "H. Jon Benjamin",
+            " H Jon Benjamin ",
+            "moved mary",
+            "Moved Mary",
+            "Nobody",
+            "  ",
+        ];
+        let names: Vec<String> = names.iter().map(|name| (*name).to_owned()).collect();
+        let found = repo.find_person_item_ids(&names).await.unwrap();
+
+        assert_eq!(
+            found,
+            [
+                Some(id_of("H. Jon Benjamin")),
+                Some(id_of("H Jon Benjamin")),
+                Some(moved),
+                Some(moved),
+                None,
+                None,
+            ]
+        );
+    }
+
+    /// The row an earlier Ferrofin wrote under the older derivation (Rust's
+    /// contextual `ΟΣ` → `ος`, where .NET's invariant mapping gives `οσ`) is
+    /// the name's item, as the write path keeps it, and its case variant's.
+    #[tokio::test]
+    async fn find_person_item_ids_reads_the_older_derivation() {
+        use crate::item_type_lookup::{IdDerivation, person_item_id, person_path};
+        let db = test_db().await;
+        let people = tempfile::tempdir().unwrap();
+        let (repo, _) = identity_repo(&db, &people);
+        let mode = IdDerivation::Jellyfin {
+            program_data_path: None,
+        };
+        let root = people.path().to_string_lossy().into_owned();
+        let old = crate::item_type_lookup::previous_by_name_item_id(
+            &mode,
+            BaseItemKind::Person,
+            &person_path(&root, "ΟΣ"),
+        )
+        .unwrap();
+        assert_ne!(Some(old), person_item_id(&mode, &root, "ΟΣ"));
+        seed_named_item(&db, old, BaseItemKind::Person, "ΟΣ").await;
+        crate::test_support::set_clean_name(&db, old, "ΟΣ").await;
+
+        let found = repo
+            .find_person_item_ids(&["ΟΣ".to_owned(), "οσ".to_owned()])
+            .await
+            .unwrap();
+
+        assert_eq!(found, [Some(old), Some(old)]);
+    }
+
+    /// Refresh People and the person reads agree on every credit: a credit
+    /// the partition creates no item for is one a read finds an item for, and
+    /// the other way round, whatever shape its row has.
+    #[tokio::test]
+    async fn the_partition_and_the_read_agree_on_each_credits_item() {
+        use crate::item_type_lookup::{IdDerivation, person_path, previous_by_name_item_id};
+        let db = test_db().await;
+        let people = tempfile::tempdir().unwrap();
+        let (repo, id_of) = identity_repo(&db, &people);
+        let root = people.path().to_string_lossy().into_owned();
+        let mode = IdDerivation::Jellyfin {
+            program_data_path: None,
+        };
+        let old = previous_by_name_item_id(&mode, BaseItemKind::Person, &person_path(&root, "ΟΣ"))
+            .unwrap();
+        // (row id, row name, whether it has its clean name)
+        let rows = [
+            (id_of("Own Olga"), "Own Olga", true),
+            (Uuid::from_u128(0x10A1), "Moved Mary", true),
+            (old, "ΟΣ", true),
+            (id_of("H Jon Benjamin"), "H Jon Benjamin", true),
+            (Uuid::from_u128(0x10A2), "Clean Less", false),
+        ];
+        for (id, name, clean) in rows {
+            seed_named_item(&db, id, BaseItemKind::Person, name).await;
+            if clean {
+                crate::test_support::set_clean_name(&db, id, name).await;
+            }
+        }
+        let movie = Uuid::from_u128(0x10A0);
+        seed_item(&db, movie, BaseItemKind::Movie).await;
+        let credits = [
+            "Own Olga",
+            "Moved Mary",
+            "ΟΣ",
+            "οσ",
+            "H. Jon Benjamin",
+            "Clean Less",
+            "Nobody Yet",
+        ];
+        for (offset, name) in (1u128..).zip(credits) {
+            super::seed_credit(&db, movie, Uuid::from_u128(0x10B0 + offset), name).await;
+        }
+
+        let partition = repo.partition_person_items().await.unwrap();
+        let names: Vec<String> = credits.iter().map(|name| (*name).to_owned()).collect();
+        let found = repo.find_person_item_ids(&names).await.unwrap();
+
+        for (name, found) in names.iter().zip(&found) {
+            assert_eq!(
+                found.is_none(),
+                partition.new_names.contains(name),
+                "{name}: read {found:?}, new {:?}",
+                partition.new_names
+            );
+        }
+        assert_eq!(
+            partition.new_names,
+            ["Clean Less", "H. Jon Benjamin", "Nobody Yet"]
+        );
+    }
+
+    /// A person stored under an id that is not the derived one (a moved
+    /// metadata folder) is the item a scan's credit write and its unchanged
+    /// re-read take, so no second item appears; without the identity seam, the
+    /// exact name reads it.
+    #[tokio::test]
+    async fn a_cast_write_takes_the_same_person_under_another_id() {
+        let db = test_db().await;
+        let people = tempfile::tempdir().unwrap();
+        let (repo, id_of) = identity_repo(&db, &people);
+        let moved = Uuid::from_u128(0x10C1);
+        seed_named_item(&db, moved, BaseItemKind::Person, "Moved Mary").await;
+        crate::test_support::set_clean_name(&db, moved, "Moved Mary").await;
+        assert_ne!(moved, id_of("Moved Mary"));
+        let movie = Uuid::from_u128(0x10C0);
+        seed_item(&db, movie, BaseItemKind::Movie).await;
+
+        for round in ["written", "unchanged"] {
+            let written = repo
+                .update_people(movie, &[person("moved mary", "Actor")])
+                .await
+                .unwrap();
+            assert_eq!(written.len(), 1, "{round}");
+            assert_eq!(written[0].id, moved, "{round}");
+        }
+        assert_eq!(super::person_names(&db).await, ["Moved Mary"]);
+
+        let unwired = FerrofinPeopleRepository::new(db.clone());
+        let found = unwired
+            .find_person_item_ids(&["Moved Mary".to_owned(), "moved mary".to_owned()])
+            .await
+            .unwrap();
+        assert_eq!(found, [Some(moved), None]);
     }
 
     /// A credit with no role round-trips as `Some("")`, NOT `None`.
@@ -2690,6 +3019,46 @@ mod tests {
             assert_eq!(result.items.len(), 1);
             assert_eq!(result.items[0].name, name);
         }
+    }
+
+    /// `PeopleRepositoryNameRangeTests.GetPeople_NameRange_IgnoresCase`
+    /// (v12.4): the letter picker's range ignores case, as the list's order
+    /// does, so a capitalised name does not sort below every lowercase bound.
+    #[rstest::rstest]
+    #[case(None, Some("A"), &["50 Cent"])]
+    #[case(None, Some("C"), &["50 Cent", "alpha centauri", "bob dylan", "Brad Pitt"])]
+    #[case(Some("B"), Some("C"), &["bob dylan", "Brad Pitt"])]
+    #[case(Some("Y"), None, &["Zoe Saldana"])]
+    #[tokio::test]
+    async fn get_people_name_range_ignores_case(
+        #[case] name_starts_with_or_greater: Option<&str>,
+        #[case] name_less_than: Option<&str>,
+        #[case] expected: &[&str],
+    ) {
+        let db = test_db().await;
+        for name in [
+            "50 Cent",
+            "alpha centauri",
+            "Brad Pitt",
+            "bob dylan",
+            "Zoe Saldana",
+        ] {
+            super::seed_people_row(&db, Uuid::new_v4(), name, "Actor").await;
+        }
+        let result = FerrofinPeopleRepository::new(db)
+            .get_people(&InternalPeopleQuery {
+                name_starts_with_or_greater: name_starts_with_or_greater.map(str::to_owned),
+                name_less_than: name_less_than.map(str::to_owned),
+                ..Default::default()
+            })
+            .await
+            .expect("people");
+        let names: Vec<&str> = result.items.iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(names, expected);
+        assert_eq!(
+            result.total_record_count,
+            i32::try_from(expected.len()).unwrap()
+        );
     }
 
     #[rstest::rstest]
@@ -2840,6 +3209,57 @@ mod tests {
         );
     }
 
+    /// gl-1581: with the server's directories wired, the `Person` row stores
+    /// its path as upstream's mapper writes it (`%MetadataPath%/People/A/…`,
+    /// `GetPathToSave`), the directory is still made at the resolved path, and
+    /// the id is still the one the resolved path derives.
+    #[tokio::test]
+    async fn a_person_row_stores_its_path_tokenised_under_the_metadata_directory() {
+        use crate::item_type_lookup::IdDerivation;
+
+        let db = test_db().await;
+        let tmp = tempfile::tempdir().expect("tmp");
+        let paths = crate::app_paths::test_paths(tmp.path());
+        let metadata =
+            ferrofin_traits::system::ServerApplicationPaths::internal_metadata_path(&*paths);
+        let people_path = format!("{metadata}/People");
+        let mode = IdDerivation::Jellyfin {
+            program_data_path: Some(tmp.path().to_string_lossy().into_owned()),
+        };
+        let repo = FerrofinPeopleRepository::new(db.clone())
+            .with_identity(mode.clone(), people_path.clone())
+            .with_virtual_paths(crate::virtual_paths::VirtualPathExpander::from_paths(
+                std::sync::Arc::clone(&paths),
+            ));
+        let movie = Uuid::from_u128(0x72);
+        seed_item(&db, movie, BaseItemKind::Movie).await;
+        repo.update_people(movie, &[person("Alice Parity", "Actor")])
+            .await
+            .expect("credits");
+
+        let (id, path): (String, Option<String>) = sqlx::query_as(
+            r#"SELECT "Id", "Path" FROM "BaseItems"
+                   WHERE "Type" = 'MediaBrowser.Controller.Entities.Person'"#,
+        )
+        .fetch_one(db.pool())
+        .await
+        .expect("person row");
+        assert_eq!(
+            path.as_deref(),
+            Some("%MetadataPath%/People/A/Alice Parity")
+        );
+        assert_eq!(
+            Some(id),
+            crate::item_type_lookup::person_item_id(&mode, &people_path, "Alice Parity")
+                .map(ferrofin_db::store::guid_to_db),
+            "the id is derived from the resolved path"
+        );
+        assert!(
+            std::path::Path::new(&format!("{people_path}/A/Alice Parity")).is_dir(),
+            "the person metadata directory is created at the resolved path"
+        );
+    }
+
     /// A row written by an older build — lower-cased `SortName`, NULL `Path`,
     /// NULL `PresentationUniqueKey` — is repaired at startup, and the repair is
     /// idempotent (which is also what makes it a no-op on a database adopted
@@ -2889,6 +3309,55 @@ mod tests {
             0,
             "idempotent: a correct row is not rewritten"
         );
+    }
+
+    /// gl-1581: with the server's directories wired, the repair fills the path
+    /// tokenised, as the row's save would, and makes the directory where the
+    /// token points — never a `%MetadataPath%` directory beside the process.
+    #[tokio::test]
+    async fn repair_person_items_stores_the_token_and_makes_the_resolved_directory() {
+        use crate::item_type_lookup::{IdDerivation, person_item_id};
+        use crate::test_support::seed_named_item;
+
+        let db = test_db().await;
+        let tmp = tempfile::tempdir().expect("tmp");
+        let paths = crate::app_paths::test_paths(tmp.path());
+        let metadata =
+            ferrofin_traits::system::ServerApplicationPaths::internal_metadata_path(&*paths);
+        let people_path = format!("{metadata}/People");
+        let mode = IdDerivation::Jellyfin {
+            program_data_path: Some(tmp.path().to_string_lossy().into_owned()),
+        };
+        let id = person_item_id(&mode, &people_path, "Alice Parity").expect("derived");
+        seed_named_item(&db, id, BaseItemKind::Person, "Alice Parity").await;
+        sqlx::query(r#"UPDATE "BaseItems" SET "Path" = NULL WHERE "Id" = ?1"#)
+            .bind(guid_to_db(id))
+            .execute(db.writer())
+            .await
+            .expect("pathless row");
+        // where the bug made it: relative to the process, named after the token
+        let stray = std::env::current_dir()
+            .expect("cwd")
+            .join("%MetadataPath%/People/A/Alice Parity");
+
+        let repo = FerrofinPeopleRepository::new(db.clone())
+            .with_identity(mode, people_path.clone())
+            .with_virtual_paths(crate::virtual_paths::VirtualPathExpander::from_paths(
+                std::sync::Arc::clone(&paths),
+            ));
+        assert_eq!(repo.repair_person_items().await.expect("repair"), 1);
+        let path: Option<String> =
+            sqlx::query_scalar(r#"SELECT "Path" FROM "BaseItems" WHERE "Id" = ?1"#)
+                .bind(guid_to_db(id))
+                .fetch_one(db.pool())
+                .await
+                .expect("person row");
+        assert_eq!(
+            path.as_deref(),
+            Some("%MetadataPath%/People/A/Alice Parity")
+        );
+        assert!(std::path::Path::new(&format!("{people_path}/A/Alice Parity")).is_dir());
+        assert!(!stray.exists(), "no directory named after the token");
     }
 
     /// …and it must NOT touch a row whose `SortName` came from the user's
@@ -2969,6 +3438,13 @@ mod tests {
         let dup_b = Uuid::from_u128(0xA2);
         seed_named_item(&db, dup_a, BaseItemKind::Person, "Uma Thurman").await;
         seed_named_item(&db, dup_b, BaseItemKind::Person, "Uma Thurman").await;
+        // A birthplace on one duplicate survives the collapse, though the survivor's own row
+        // is inserted with the empty list (gl-1580).
+        sqlx::query(r#"UPDATE "BaseItems" SET "ProductionLocations" = 'Paris' WHERE "Id" = ?1"#)
+            .bind(guid_to_db(dup_a))
+            .execute(db.writer())
+            .await
+            .expect("birthplace");
         // …one carrying a favorite.
         let user = crate::test_support::seed_user(&db, Uuid::from_u128(0x9)).await;
         let user_id = Uuid::parse_str(&user.id).unwrap();
@@ -2999,6 +3475,21 @@ mod tests {
             vec![target.clone()],
             "duplicates collapsed onto the derived id"
         );
+        // The survivor's row has upstream's values where the duplicates had none (gl-1580).
+        let survivor = Uuid::parse_str(&target).unwrap();
+        assert_eq!(
+            crate::item_persistence_service::null_mapper_columns(&db, survivor).await,
+            Vec::<&str>::new()
+        );
+        let birthplace: Option<String> =
+            sqlx::query_scalar(r#"SELECT "ProductionLocations" FROM "BaseItems" WHERE "Id" = ?1"#)
+                .bind(&target)
+                .fetch_one(db.pool())
+                .await
+                .expect("survivor");
+        assert_eq!(birthplace.as_deref(), Some("Paris"));
+        // The survivor row is a person created now (gl-1586).
+        assert_person_dated(&db, survivor).await;
         // The favorite followed the survivor.
         let fav: i64 = sqlx::query_scalar(
             r#"SELECT COUNT(*) FROM "UserData" WHERE "ItemId" = ?1 AND "IsFavorite" = 1"#,
@@ -3010,6 +3501,112 @@ mod tests {
         assert_eq!(fav, 1);
         // Idempotent: the marker short-circuits the second run.
         assert_eq!(repo.unify_person_identities().await.expect("again"), 0);
+    }
+
+    /// A person collapsed with no birthplace on any duplicate keeps the empty list, never NULL
+    /// (the collapse's `''` fallback, gl-1580).
+    #[tokio::test]
+    async fn a_collapse_without_a_birthplace_stores_the_empty_list() {
+        use crate::item_type_lookup::{IdDerivation, person_item_id};
+        let db = test_db().await;
+        let mode = IdDerivation::Jellyfin {
+            program_data_path: Some("/data".to_owned()),
+        };
+        crate::test_support::seed_named_item(
+            &db,
+            Uuid::from_u128(0xB1),
+            BaseItemKind::Person,
+            "Solo Person",
+        )
+        .await;
+        let repo = FerrofinPeopleRepository::new(db.clone())
+            .with_identity(mode.clone(), "/data/metadata/People".to_owned());
+        assert_eq!(repo.unify_person_identities().await.expect("unify"), 1);
+        let survivor =
+            person_item_id(&mode, "/data/metadata/People", "Solo Person").expect("derived");
+        assert_eq!(
+            crate::item_persistence_service::null_mapper_columns(&db, survivor).await,
+            Vec::<&str>::new()
+        );
+    }
+
+    /// A person row is written with upstream's values for the columns a person has none of:
+    /// no NULL, and `Other` for its unrated category (gl-1580).
+    #[tokio::test]
+    async fn a_created_person_row_has_the_mappers_defaults() {
+        let db = test_db().await;
+        let people = tempfile::tempdir().unwrap();
+        let repo = FerrofinPeopleRepository::new(db.clone()).with_identity(
+            crate::item_type_lookup::IdDerivation::Jellyfin {
+                program_data_path: None,
+            },
+            people.path().to_string_lossy().into_owned(),
+        );
+        assert_eq!(
+            repo.create_person_items(&["Ann Example".to_owned()])
+                .await
+                .unwrap(),
+            1
+        );
+        let (id, unrated): (String, Option<String>) = sqlx::query_as(
+            r#"SELECT "Id", "UnratedType" FROM "BaseItems" WHERE "Type" = ?1 AND "Name" = 'Ann Example'"#,
+        )
+        .bind(PERSON_TYPE_NAME)
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(unrated.as_deref(), Some("Other"));
+        assert_eq!(
+            crate::item_persistence_service::unrated_type_name(BaseItemKind::Person),
+            "Other",
+            "the literal in PERSON_ITEM_ROW"
+        );
+        let id = Uuid::parse_str(&id).unwrap();
+        assert_eq!(
+            crate::item_persistence_service::null_mapper_columns(&db, id).await,
+            Vec::<&str>::new()
+        );
+        assert_person_dated(&db, id).await;
+    }
+
+    /// A new person row has `GetOrCreatePerson`'s `DateCreated` and
+    /// `DateModified` and the `DateLastSaved` `SavePeopleMetadataAsync` stamps,
+    /// all the same instant, and no `DateLastRefreshed`: nothing refreshes it
+    /// (gl-1586).
+    async fn assert_person_dated(db: &ferrofin_db::Database, id: Uuid) {
+        let row: ferrofin_db::entities::base_items::BaseItemEntity =
+            crate::test_support::fetch_item(db, id).await;
+        let created = row.date_created.expect("DateCreated");
+        assert!(
+            (chrono::Utc::now() - created).num_seconds() < 60,
+            "{created} is the create time"
+        );
+        assert_eq!(row.date_modified, Some(created));
+        assert_eq!(row.date_last_saved, Some(created));
+        assert_eq!(row.date_last_refreshed, None);
+    }
+
+    /// The credits' person rows (`person_items_for_write`) are dated as the
+    /// single insert's are.
+    #[tokio::test]
+    async fn credited_person_rows_are_dated() {
+        let db = test_db().await;
+        let item = Uuid::new_v4();
+        seed_item(&db, item, BaseItemKind::Movie).await;
+        FerrofinPeopleRepository::new(db.clone())
+            .update_people(item, &[person("Alice", "Actor"), person("Bob", "Director")])
+            .await
+            .expect("update");
+        let ids: Vec<String> =
+            sqlx::query_scalar(r#"SELECT "Id" FROM "BaseItems" WHERE "Type" = ?1"#)
+                .bind(PERSON_TYPE_NAME)
+                .fetch_all(db.pool())
+                .await
+                .expect("people");
+        assert_eq!(ids.len(), 2);
+        for id in ids {
+            assert_person_dated(&db, Uuid::parse_str(&id).unwrap()).await;
+        }
     }
 
     #[tokio::test]
@@ -3220,6 +3817,80 @@ mod tests {
         assert_eq!(maps, [row("Person A", "Actor", "Hero")]);
     }
 
+    /// `UpdatePeople_CreditDroppedByTheProvider_LeavesNoCreditRowBehind`
+    /// (v12.4): the person row of a credit the refresh dropped goes in the
+    /// same write.
+    #[tokio::test]
+    async fn update_people_deletes_the_person_rows_it_leaves_uncredited() {
+        let (maps, people, ids, _) = update_people_runs(&[
+            &[
+                credit("Person A", "Actor", "Hero"),
+                credit("Person B", "Actor", "Villain"),
+            ],
+            &[credit("Person A", "Actor", "Hero")],
+        ])
+        .await;
+        assert_eq!(ids[0].len(), 2);
+        assert_eq!(maps, [row("Person A", "Actor", "Hero")]);
+        assert_eq!(people.len(), 1, "Person B's row went with its credit");
+    }
+
+    /// `UpdatePeople_CreditStillHeldByAnotherItem_IsKept` (v12.4).
+    #[tokio::test]
+    async fn update_people_keeps_a_person_row_another_item_credits() {
+        let db = test_db().await;
+        let (movie, other) = (Uuid::new_v4(), Uuid::new_v4());
+        let repo = FerrofinPeopleRepository::new(db.clone());
+        for item in [movie, other] {
+            seed_item(&db, item, BaseItemKind::Movie).await;
+            repo.update_people(item, &[credit("Person A", "Actor", "Hero")])
+                .await
+                .expect("credit");
+        }
+
+        repo.update_people(movie, &[]).await.expect("uncredit");
+
+        assert_eq!(super::people_row_count(&db).await, 1);
+        let maps: i64 = sqlx::query_scalar(r#"SELECT COUNT(*) FROM "PeopleBaseItemMap""#)
+            .fetch_one(db.pool())
+            .await
+            .expect("maps");
+        assert_eq!(maps, 1);
+    }
+
+    /// The uncredited-person delete seeks each candidate by its key and its
+    /// credits by `PeopleId`: it runs on every changed refresh and every
+    /// deletion, so it never scans `Peoples` or the credit rows.
+    #[tokio::test]
+    async fn the_uncredited_person_delete_seeks_by_key() {
+        let db = test_db().await;
+        let plan: Vec<(i64, i64, i64, String)> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+            "EXPLAIN QUERY PLAN {}",
+            super::DELETE_CREDITS_WITHOUT_MAPPING_SQL
+        )))
+        .bind("[]")
+        .fetch_all(db.pool())
+        .await
+        .expect("plan");
+        let plan: Vec<String> = plan.into_iter().map(|(.., detail)| detail).collect();
+        assert!(
+            plan.iter()
+                .any(|s| s.starts_with("SEARCH Peoples") && s.contains("(Id=?)")),
+            "the candidates sought by Id, got: {plan:?}"
+        );
+        assert!(
+            plan.iter()
+                .any(|s| s.starts_with("SEARCH m") && s.contains("(PeopleId=?)")),
+            "the credits sought by PeopleId, got: {plan:?}"
+        );
+        assert!(
+            !plan
+                .iter()
+                .any(|s| s.starts_with("SCAN Peoples") || s.starts_with("SCAN m")),
+            "never a scan, got: {plan:?}"
+        );
+    }
+
     /// A repository over a fresh database with one movie, whose person ids
     /// follow Jellyfin's derivation when `identity` is set (as the composition
     /// root wires it) and the `Peoples` row id otherwise (the unwired seam).
@@ -3399,6 +4070,11 @@ mod tests {
         )
         .await
         .expect("biography");
+        // A biography with no birthplace stores the empty list, not NULL (gl-1580).
+        assert_eq!(
+            crate::item_persistence_service::null_mapper_columns(&db, first[0].id).await,
+            Vec::<&str>::new()
+        );
         log_people_writes(&db).await;
 
         let again = repo.update_people(item, &credits).await.expect("again");
@@ -3409,8 +4085,8 @@ mod tests {
 
     /// Unchanged credits whose person item has gone (a by-name cleanup, a
     /// hand edit) take the write path, which recreates the item: only a write
-    /// creates one. With the identity seam the clean-name match misses;
-    /// without it, the biography read.
+    /// creates one. With the identity seam the person read misses
+    /// (`stored_person_item_ids`); without it, the biography read.
     #[rstest::rstest]
     #[case(false)]
     #[case(true)]
@@ -3565,39 +4241,6 @@ mod tests {
             .await
             .expect("names");
         assert_eq!(names, vec!["Alice".to_owned(), "Bob".to_owned()]);
-    }
-
-    #[tokio::test]
-    async fn names_by_items_groups_and_dedupes() {
-        let db = test_db().await;
-        let item_a = Uuid::new_v4();
-        let item_b = Uuid::new_v4();
-        seed_item(&db, item_a, BaseItemKind::Movie).await;
-        seed_item(&db, item_b, BaseItemKind::Movie).await;
-        let repo = FerrofinPeopleRepository::new(db);
-        repo.update_people(item_a, &[person("Alice", "Actor")])
-            .await
-            .expect("a");
-        repo.update_people(
-            item_b,
-            &[person("Alice", "Actor"), person("Bob", "Director")],
-        )
-        .await
-        .expect("b");
-
-        let map = repo
-            .get_people_names_by_items(&[item_a, item_b], &[])
-            .await
-            .expect("map");
-        assert_eq!(map.get(&item_a).map(Vec::len), Some(1));
-        assert_eq!(map.get(&item_b).map(Vec::len), Some(2));
-
-        // Filtering by a person type narrows the names.
-        let map = repo
-            .get_people_names_by_items(&[item_b], &["Director".to_owned()])
-            .await
-            .expect("filtered");
-        assert_eq!(map.get(&item_b).cloned(), Some(vec!["Bob".to_owned()]));
     }
 
     #[tokio::test]
@@ -4787,11 +5430,12 @@ mod tests {
         assert_eq!(project(&again), project(&written));
     }
 
-    /// Two spellings of one clean name in one cast share the person item the
-    /// first one creates, as they did while each person's insert preceded the
-    /// next one's clean-name lookup (gl-1181).
+    /// Two spellings of one clean name in one cast are two people, each with
+    /// an item of its own (gl-1079), and a name deriving the id of an item an
+    /// earlier person of the cast creates shares it, as it did while each
+    /// person's insert preceded the next one's lookup (gl-1181).
     #[tokio::test]
-    async fn spellings_of_one_clean_name_share_the_item_the_first_creates() {
+    async fn spellings_of_one_clean_name_each_get_their_own_item() {
         let (db, item, repo) = people_lab(true).await;
         let written = repo
             .update_people(
@@ -4799,21 +5443,24 @@ mod tests {
                 &[
                     person("Amélie Dupont", "Actor"),
                     person("Amelie Dupont", "Actor"),
+                    person("AMÉLIE DUPONT", "Director"),
                 ],
             )
             .await
             .expect("update");
-        assert_eq!(written.len(), 2, "{written:?}");
-        assert_eq!(written[0].id, written[1].id, "{written:?}");
+        assert_eq!(written.len(), 3, "{written:?}");
+        assert_ne!(written[0].id, written[1].id, "{written:?}");
+        assert_eq!(written[0].id, written[2].id, "{written:?}");
         let items: Vec<String> = sqlx::query_scalar(
-            r#"SELECT "Name" FROM "BaseItems" WHERE "Type" = ?1 AND "CleanName" = ?2"#,
+            r#"SELECT "Name" FROM "BaseItems" WHERE "Type" = ?1 AND "CleanName" = ?2
+               ORDER BY "Name""#,
         )
         .bind(PERSON_TYPE_NAME)
         .bind("amelie dupont")
         .fetch_all(db.pool())
         .await
         .expect("items");
-        assert_eq!(items, ["Amélie Dupont"]);
+        assert_eq!(items, ["Amelie Dupont", "Amélie Dupont"]);
     }
 
     /// A credit reuses the `Peoples` row its name matches under `COLLATE
@@ -4865,8 +5512,9 @@ mod tests {
     }
 
     /// The cast's batched reads (gl-1181) stay on their indexes: the name
-    /// match on `FerrofinIX_Peoples_NameNoCase_Cover`, the clean-name match on
-    /// the `Type`, `CleanName` index, and the biographies by primary key.
+    /// match on `FerrofinIX_Peoples_NameNoCase_Cover`, the person items by id
+    /// and the biographies by primary key, and the person items sharing a clean
+    /// name on the `Type`, `CleanName` index.
     #[tokio::test]
     async fn the_cast_reads_stay_on_their_indexes() {
         let db = test_db().await;
@@ -4875,6 +5523,7 @@ mod tests {
                 super::peoples_by_names_sql(4),
                 "FerrofinIX_Peoples_NameNoCase_Cover",
             ),
+            (super::person_items_by_ids_sql(4), "(Id=?)"),
             (
                 super::person_items_by_clean_names_sql(4),
                 "Type=? AND CleanName=?",

@@ -45,17 +45,22 @@ impl RouteParameter for LyricId {
     const NAME: &'static str = "lyricId";
 }
 
-/// Ensures the item exists **and is an audio item**, returning `404` otherwise.
+/// Ensures the item exists **and is an audio item**, returning `404` otherwise
+/// (a `400` for a nil id).
 ///
 /// Mirrors the C# `GetItemById<Audio>(itemId, User.GetUserId())` null check that
 /// every route in `LyricsController` performs first: a non-audio id is a `404`
 /// on all six routes, not an accepted target for a lyric write. `Audio` covers
-/// its `AudioBook` subclass, so both kinds pass.
+/// its `AudioBook` subclass, so both kinds pass. The nil id is refused first,
+/// as `GetItemById(Guid.Empty)` throws `ArgumentException`.
 async fn require_item(
     state: &AppState,
     item_id: Uuid,
     auth: &ferrofin_traits::options::AuthorizationInfo,
 ) -> Result<(), ApiError> {
+    if item_id.is_nil() {
+        return Err(ApiError::BadRequest("Guid can't be empty".to_owned()));
+    }
     let is_audio = state
         .library
         .get_item_by_id_for_user(item_id, auth.user.as_deref())
@@ -80,6 +85,7 @@ async fn require_item(
     params(("itemId" = String, Path, description = "Item id")),
     responses(
         (status = 200, description = "Lyrics returned", body = LyricDto),
+        (status = 400, description = "A nil item id"),
         (status = 404, description = "No lyrics found")
     ),
     tag = "ferrofin"
@@ -123,7 +129,7 @@ struct UploadLyricsQuery {
     ),
     responses(
         (status = 200, description = "Lyrics uploaded", body = LyricDto),
-        (status = 400, description = "Error processing upload"),
+        (status = 400, description = "Error processing upload, or a nil item id"),
         (status = 404, description = "Item not found")
     ),
     tag = "ferrofin"
@@ -197,6 +203,7 @@ fn upload_format(file_name: &str) -> &str {
     params(("itemId" = String, Path, description = "The item id")),
     responses(
         (status = 204, description = "Lyric deleted"),
+        (status = 400, description = "A nil item id"),
         (status = 404, description = "Item not found")
     ),
     tag = "ferrofin"
@@ -222,6 +229,7 @@ async fn delete_lyrics(
     params(("itemId" = String, Path, description = "The item id")),
     responses(
         (status = 200, description = "Lyrics retrieved", body = [RemoteLyricInfoDto]),
+        (status = 400, description = "A nil item id"),
         (status = 404, description = "Item not found")
     ),
     tag = "ferrofin"
@@ -251,6 +259,7 @@ async fn search_remote_lyrics(
     ),
     responses(
         (status = 200, description = "Lyric downloaded", body = LyricDto),
+        (status = 400, description = "A blank lyricId, or a nil item id"),
         (status = 404, description = "Item not found")
     ),
     tag = "ferrofin"

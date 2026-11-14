@@ -5,6 +5,7 @@ mod common;
 use std::net::{IpAddr, Ipv4Addr};
 
 use common::CapturingLogger;
+use ferrofin_model::net::{IpData, IpNetwork};
 use ferrofin_networking::net_utils;
 use ferrofin_networking::{
     NetworkConfiguration, NetworkManager, RemoteAccessPolicyResult, StartupConfig,
@@ -169,6 +170,64 @@ fn try_parse_to_subnets_polarity_mismatch_ipv6_does_not_warn() {
     assert_eq!(excluded.as_ref().map(Vec::len), Some(1));
 
     assert_eq!(logger.warning_count(), 0);
+}
+
+/// The live manager reports the LAN, exclusion and published-server entries
+/// it ignores (upstream's `InitializeLan` at Warning, `InitializeOverrides` at
+/// Error) once per settings load: at construction and at each save, never when
+/// it reads the interfaces again, which every `/System/Info` request does. An
+/// override naming an interface is not reported for the parse that runs before
+/// the interfaces are read, an override's URL shows only its scheme and host,
+/// and a network change reports the LAN entries again, as `OnNetworkChange`'s
+/// `InitializeLan` does.
+#[test]
+fn a_live_manager_reports_ignored_settings_once_per_load() {
+    let config = NetworkConfiguration {
+        local_network_subnets: split("192.168.1.0/24,fd23:184f:2029:0100/56,!lan-printer", ','),
+        published_server_uri_by_subnet: split(
+            "eth0=http://lan.example,nowhere=https://me:pw@wan.example/a,a=b=c",
+            ',',
+        ),
+        ..NetworkConfiguration::default()
+    };
+    let address: IpAddr = "192.168.1.2".parse().expect("address");
+    let mut eth0 = IpData::new(address, Some(IpNetwork::new(address, 24)), "eth0");
+    eth0.index = 2;
+    let logger = Arc::new(CapturingLogger::new());
+    let mut manager = NetworkManager::live_with_enumerator(
+        config.clone(),
+        Arc::new(move |_, _| vec![eth0.clone()]),
+        logger.clone(),
+    );
+
+    let warnings = [
+        "Invalid IPv6 subnet 'fd23:184f:2029:0100/56': IPv6 prefix-only notation is not \
+         supported. Use the full notation including '::' (e.g. 'fd23:184f:2029:0100::/56').",
+        "Invalid subnet '!lan-printer' will be ignored.",
+    ];
+    let errors = [
+        "Unable to parse bind override: nowhere=https://wan.example",
+        "Unable to parse bind override: a=b=c",
+    ];
+    assert_eq!(logger.warnings(), warnings);
+    assert_eq!(logger.errors(), errors);
+
+    manager.refresh_interfaces();
+    manager.refresh_interfaces();
+    assert_eq!(
+        logger.warnings(),
+        warnings,
+        "an interface refresh logs nothing"
+    );
+    assert_eq!(logger.errors(), errors);
+
+    manager.update_settings(&config);
+    assert_eq!(logger.warnings(), [warnings, warnings].concat());
+    assert_eq!(logger.errors(), [errors, errors].concat());
+
+    manager.on_network_change_with(|| true);
+    assert_eq!(logger.warnings(), [warnings, warnings, warnings].concat());
+    assert_eq!(logger.errors(), [errors, errors].concat());
 }
 
 /// `IPv4SubnetMaskMatchesValidIPAddress`.

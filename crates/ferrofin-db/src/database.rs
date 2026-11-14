@@ -48,9 +48,11 @@ pub struct ImageParentRow {
     pub parent_id: Option<String>,
     /// `OwnerId`, if any.
     pub owner_id: Option<String>,
-    /// `SeriesId`, if any (a season's display parent).
+    /// `SeriesId`, if any (a season's display parent; the zero GUID reads as `None`).
+    #[sqlx(try_from = "crate::entities::unset::NonNilGuid")]
     pub series_id: Option<String>,
-    /// `SeasonId`, if any (an episode's display parent).
+    /// `SeasonId`, if any (an episode's display parent; the zero GUID reads as `None`).
+    #[sqlx(try_from = "crate::entities::unset::NonNilGuid")]
     pub season_id: Option<String>,
     /// The pipe-joined album artists (`AlbumArtists`), if any.
     pub album_artists: Option<String>,
@@ -207,6 +209,21 @@ impl Database {
             adopt_jellyfin_database(&mut conn, path).await?;
             let snapshot = backup_before_migrations(&mut conn, path).await?;
             MIGRATOR.run(&mut conn).await?;
+            // Every boot, and never fatal (a failure warns and the next boot
+            // tries again): see `drop_planner_statistics`.
+            match drop_planner_statistics(&mut conn).await {
+                Ok(true) => tracing::info!(
+                    "dropped the planner statistics (sqlite_stat1, sqlite_stat4) an ANALYZE \
+                     left: an earlier version's Optimize Database task, a manual one, or the \
+                     Jellyfin this database came from"
+                ),
+                Ok(false) => {}
+                Err(error) => tracing::warn!(
+                    error = %error,
+                    "could not drop the planner statistics; queries may not follow their \
+                     pinned plans until a later boot drops them"
+                ),
+            }
             log_dangling_row_cleanup(&mut conn).await?;
             crate::normalized_usernames::repair(&mut conn).await?;
             foreign_key_check(&mut conn).await?;
@@ -1971,7 +1988,7 @@ fn log_is_empty(path: &std::path::Path) -> bool {
 /// The temporary name a snapshot is written under until it is complete
 /// (`backup` with `.partial` appended), after removing whatever an earlier,
 /// interrupted attempt left there.
-fn start_snapshot(backup: &std::path::Path) -> Result<std::path::PathBuf> {
+pub(crate) fn start_snapshot(backup: &std::path::Path) -> Result<std::path::PathBuf> {
     let mut partial = backup.as_os_str().to_owned();
     partial.push(".partial");
     let partial = std::path::PathBuf::from(partial);
@@ -1993,7 +2010,7 @@ fn start_snapshot(backup: &std::path::Path) -> Result<std::path::PathBuf> {
 /// crash. Until then only `partial` exists, so a snapshot that a full disk or a
 /// kill cut short is never taken for a complete one: the next attempt removes
 /// it and starts over.
-fn publish_snapshot(partial: &std::path::Path, backup: &std::path::Path) -> Result<()> {
+pub(crate) fn publish_snapshot(partial: &std::path::Path, backup: &std::path::Path) -> Result<()> {
     let failed = |source| crate::DbError::Backup {
         path: backup.display().to_string(),
         source,
@@ -2011,7 +2028,7 @@ fn publish_snapshot(partial: &std::path::Path, backup: &std::path::Path) -> Resu
 /// Passes `written` through, removing the half-written `partial` first when
 /// it failed: a copy cut short by a full disk must not keep holding the space
 /// the migrations after it need.
-fn abandon_on_error(partial: &std::path::Path, written: Result<()>) -> Result<()> {
+pub(crate) fn abandon_on_error(partial: &std::path::Path, written: Result<()>) -> Result<()> {
     if written.is_err()
         && let Err(error) = std::fs::remove_file(partial)
         && error.kind() != std::io::ErrorKind::NotFound
@@ -2055,7 +2072,7 @@ fn log_kept_snapshot(backup: &std::path::Path) {
 
 /// The `VACUUM INTO` statement that writes a copy of the database to `dest`,
 /// its quotes doubled for the SQL string literal.
-fn vacuum_into(dest: &std::path::Path) -> String {
+pub(crate) fn vacuum_into(dest: &std::path::Path) -> String {
     let dest = dest.to_string_lossy().replace('\'', "''");
     format!("VACUUM INTO '{dest}'")
 }
@@ -2215,6 +2232,29 @@ async fn log_dangling_row_cleanup(conn: &mut sqlx::SqliteConnection) -> Result<(
         .execute(&mut *conn)
         .await?;
     Ok(())
+}
+
+/// Drops the planner statistics `ANALYZE` writes, `sqlite_stat1` and
+/// `sqlite_stat4`, and says whether there were any. Ferrofin's plan pins and
+/// `EXPLAIN QUERY PLAN` tests assume the planner has none. `0033` dropped
+/// `sqlite_stat1` once, but the Optimize Database task's `PRAGMA optimize`
+/// recreated both on every server that ran long enough, and a manual
+/// `ANALYZE` would too, so this runs on every boot rather than as a
+/// migration. Beside a previous version still running, a statistics table its
+/// task writes after this ran stays until the next boot.
+async fn drop_planner_statistics(conn: &mut sqlx::SqliteConnection) -> Result<bool> {
+    let present: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' \
+         AND name IN ('sqlite_stat1', 'sqlite_stat4')",
+    )
+    .fetch_one(&mut *conn)
+    .await?;
+    if present > 0 {
+        sqlx::raw_sql("DROP TABLE IF EXISTS sqlite_stat1; DROP TABLE IF EXISTS sqlite_stat4;")
+            .execute(&mut *conn)
+            .await?;
+    }
+    Ok(present > 0)
 }
 
 /// How many prepared statements each pooled connection keeps when the
@@ -3843,6 +3883,31 @@ mod tests {
             > 0
     }
 
+    /// Statistics an earlier `OptimizeDatabaseTask` (`PRAGMA optimize`) or a
+    /// hand-run `ANALYZE` left behind are dropped on the next boot, `stat4`
+    /// with `stat1`, and a boot with none to drop opens as before.
+    #[tokio::test]
+    async fn every_boot_drops_the_planner_statistics() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let url = format!("sqlite://{}", dir.path().join("ferrofin.db").display());
+        let db = Database::connect(&url).await.expect("connect");
+        // The placeholder `BaseItems` row gives `ANALYZE` an indexed table to sample.
+        sqlx::query("ANALYZE")
+            .execute(db.writer())
+            .await
+            .expect("analyze");
+        assert!(table_exists(&db, "sqlite_stat1").await);
+        assert!(table_exists(&db, "sqlite_stat4").await);
+        db.close().await;
+
+        for _ in 0..2 {
+            let db = Database::connect(&url).await.expect("reopen");
+            assert!(!table_exists(&db, "sqlite_stat1").await);
+            assert!(!table_exists(&db, "sqlite_stat4").await);
+            db.close().await;
+        }
+    }
+
     #[test]
     fn the_convergence_migration_is_never_baselined() {
         for generation in &JELLYFIN_GENERATIONS {
@@ -4903,8 +4968,9 @@ mod tests {
                 membership_import_done: false
             })
         );
-        // 0033's hygiene ran on this path too.
+        // 0033's hygiene ran on this path too, and the boot drops stat4.
         assert!(!table_exists(&db, "sqlite_stat1").await);
+        assert!(!table_exists(&db, "sqlite_stat4").await);
         let ef_rows: i64 = sqlx::query_scalar(r#"SELECT COUNT(*) FROM "__EFMigrationsHistory""#)
             .fetch_one(db.pool())
             .await

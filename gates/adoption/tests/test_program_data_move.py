@@ -11,6 +11,7 @@ import sys
 import tempfile
 import threading
 import unittest
+import uuid
 
 sys.path.insert(0, str(Path(__file__).parents[1]))
 import program_data_move as move
@@ -192,6 +193,67 @@ class ProgramDataMoveTest(unittest.TestCase):
         self.assertIn(f"Chapters.ImagePath: 1 path(s) were written since under a previous directory; first {hexid(MOVIE)}/1: "
                       f"{OLD}/metadata/library/aa/aa/chapter.jpg", failures)
         self.assertIn(f"ImageInfos.Path: 1 path(s) are gone; first 1: {OLD_ETC}/users/admin/profile.png", failures)
+
+    def redraw(self, item, kind, path, file=True, gone=("11111111-1111-1111-1111-111111111111",)):
+        """What the scan's library-tile pass does once a tile is 7 days old: the `gone` image rows
+        replaced by one at a new id, here for `item` and `kind` at `path`, its file in the copy when
+        `file`."""
+        for key in gone:
+            self.sql("DELETE FROM BaseItemImageInfos WHERE Id = ?", key)
+        self.sql("INSERT INTO BaseItemImageInfos VALUES (?, ?, ?, ?)", str(uuid.uuid4()).upper(), item, path, kind)
+        for _, new, host in self.moves:
+            if file and path.startswith(new + "/"):
+                copy = Path(host, path[len(new) + 1:])
+                copy.parent.mkdir(parents=True, exist_ok=True)
+                copy.write_bytes(b"x")
+
+    def test_an_image_redrawn_since_at_a_new_id_in_the_copy_passes(self):
+        self.repair()
+        self.assertEqual(self.check(), [])
+        self.redraw(LIBRARY, 0, f"{NEW}/metadata/library/{LIBRARY}/primary.png")
+        self.assertEqual(self.check(), [])
+        self.assertEqual(self.check(), [])
+        # A baseline taken before the image rows' items and types were recorded is refused.
+        with self.assertRaisesRegex(CheckError, "unsupported program-data move baseline"):
+            move.validate({**self.baseline, "version": 1})
+
+    def test_an_image_row_gone_without_a_redraw_of_its_item_and_type_in_the_copy_fails(self):
+        tile = f"{NEW}/metadata/library/{LIBRARY}/primary.png"
+        gone = (f"BaseItemImageInfos.Path: 1 path(s) are gone; first 11111111111111111111111111111111: "
+                f"{OLD}/metadata/library/aa/aa/poster.png")
+        for name, redraw in (("its file missing", (LIBRARY, 0, tile, False)),
+                             ("another image type", (LIBRARY, 2, tile, True)),
+                             ("another item", (SHOWS, 0, tile, True)),
+                             ("outside the copy", (LIBRARY, 0, f"/media/movies/{LIBRARY}.png", True)),
+                             ("under a previous directory", (LIBRARY, 0, f"{OLD}/metadata/library/aa/aa/chapter.jpg", True))):
+            with self.subTest(name):
+                self.setUp()
+                self.repair()
+                self.redraw(*redraw)
+                self.assertIn(gone, self.check())
+        self.setUp()
+        self.repair()
+        self.sql("DELETE FROM BaseItemImageInfos WHERE Id = '11111111-1111-1111-1111-111111111111'")
+        self.assertEqual([line for line in self.check() if "BaseItemImageInfos" in line], [gone])
+
+    def test_a_redraw_must_replace_every_image_of_the_type_that_went(self):
+        for index in (0, 1):
+            (self.data / f"metadata/library/aa/aa/backdrop{index}.jpg").write_bytes(b"x")
+            self.sql("INSERT INTO BaseItemImageInfos VALUES (?, ?, ?, 2)", f"4444444{index}-4444-4444-4444-444444444444",
+                     LIBRARY, f"{OLD}/metadata/library/aa/aa/backdrop{index}.jpg")
+        self.baseline = move.snapshot(self.db, self.moves)
+        self.repair()
+        lines = lambda: [line for line in self.check() if "BaseItemImageInfos" in line]
+        # A backdrop lost: the other, still at its recorded id, does not stand in for it.
+        self.sql("DELETE FROM BaseItemImageInfos WHERE Id = '44444441-4444-4444-4444-444444444444'")
+        self.assertEqual(lines(), [f"BaseItemImageInfos.Path: 1 path(s) are gone; first 44444441444444444444444444444444: "
+                                   f"{OLD}/metadata/library/aa/aa/backdrop1.jpg"])
+        # Both gone, one saved again at a new id: still one short, so both are reported.
+        self.redraw(LIBRARY, 2, f"{NEW}/metadata/library/aa/aa/backdrop0.jpg", gone=("44444440-4444-4444-4444-444444444444",))
+        self.assertEqual(lines(), [f"BaseItemImageInfos.Path: 2 path(s) are gone; first 44444440444444444444444444444444: "
+                                   f"{OLD}/metadata/library/aa/aa/backdrop0.jpg"])
+        self.redraw(LIBRARY, 2, f"{NEW}/metadata/library/aa/aa/backdrop1.jpg", gone=())
+        self.assertEqual(self.check(), [])
 
     def test_a_library_added_or_lost_fails(self):
         self.repair()

@@ -1394,6 +1394,21 @@ fn kind_specific_rules() {
     assert_eq!(book.item.series_name.as_deref(), Some("Discworld"));
 }
 
+/// Upstream's `MergeData_MissingProviderSeasonKeepsExistingSeason`
+/// (`EpisodeMetadataServiceTests.cs`, from jellyfin/jellyfin PR 16702): a
+/// settings-carrying merge from an answer with no season keeps the episode's
+/// season (`EpisodeMetadataService.MergeData` takes only an explicit one).
+#[test]
+fn merge_data_missing_provider_season_keeps_existing_season() {
+    let source = MetadataResult::of(item(BaseItemKind::Episode));
+    let mut target = MetadataResult::of(BaseItemEntity {
+        parent_index_number: Some(1),
+        ..item(BaseItemKind::Episode)
+    });
+    merge_data(&source, &mut target, &[], false, true);
+    assert_eq!(target.item.parent_index_number, Some(1));
+}
+
 /// The dashboard's three refresh choices, as `RefreshWithProviders`
 /// (`MetadataService.cs:895-918`) makes its two `MergeData` calls for each:
 /// the stored values first fill the provider result (skipped under

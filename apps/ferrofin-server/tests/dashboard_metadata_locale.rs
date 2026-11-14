@@ -49,10 +49,16 @@ async fn provider(
             )
                 .into_response();
         }
+        "/infos/languages" => {
+            let codes = ["en", "fr", "es", "pt-PT", "de"].map(|code| json!({"language_code":code}));
+            return Json(json!({"data":codes})).into_response();
+        }
         "/subtitles" => {
-            return Json(
-                json!({"data":[{"attributes":{"moviehash_match":false,"files":[{"file_id":42}]}}]}),
-            )
+            return Json(json!({"total_pages":1,"page":1,"data":[{"attributes":{
+                "moviehash_match":false,
+                "feature_details":{"feature_type":"Movie","imdb_id":133_093},
+                "files":[{"file_id":42}]
+            }}]}))
             .into_response();
         }
         _ => {}
@@ -1910,6 +1916,29 @@ async fn await_subtitle_refresh(api: &Api, library: &Value, id: &str) {
     }
 }
 
+/// Waits until nothing scans `library` or is queued to. A refresh shows `Active`
+/// from before it lists the item's folders until after it saves, so by then
+/// every refresh that listed them before the caller's last write has saved.
+async fn await_library_idle(api: &Api, library: &Value) {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let folders = api.get("/Library/VirtualFolders").await;
+        if folders
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|folder| &folder["ItemId"] == library && folder["RefreshStatus"] == "Idle")
+        {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "library refresh did not finish: {folders}"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+}
+
 #[allow(clippy::too_many_lines, clippy::too_many_arguments)]
 async fn verify_automatic_subtitle_constraints(
     api: &Api,
@@ -1964,7 +1993,7 @@ async fn verify_automatic_subtitle_constraints(
             .iter()
             .any(|uri| uri.starts_with("/subtitles?")
                 && uri.contains("moviehash_match=only")
-                && uri.contains("imdb_id=0133093"))
+                && uri.contains("imdb_id=133093"))
     );
     assert!(
         !requests
@@ -1993,7 +2022,7 @@ async fn verify_automatic_subtitle_constraints(
             .iter()
             .any(|uri| uri.starts_with("/subtitles?")
                 && !uri.contains("moviehash_match=only")
-                && uri.contains("imdb_id=0133093"))
+                && uri.contains("imdb_id=133093"))
     );
 
     // Manual search candidates carry the upstream MD5 provider namespace, which
@@ -2199,13 +2228,16 @@ async fn verify_subtitle_destinations(
     assert_eq!(std::fs::read(&path).unwrap(), CONTENT);
     expected_paths.push(path);
     // Each upload records its stream and queues a refresh of the item. A refresh
-    // an earlier upload queued can still be running, listing the folder from
-    // before the newest sidecar, and save the set without it; the refresh queued
-    // behind it (the running scan is never joined) re-lists the folder and saves
-    // it again. So wait for the set to settle rather than read it mid-way
-    // (gl-1408); a stream that never comes back still fails below.
+    // an earlier upload queued can still be running: it listed the folders
+    // before the newest sidecars, reads the stored rows after them, and saves
+    // its older set over them (gl-1408, gl-1527); the refresh queued behind it
+    // (the running scan is never joined) re-lists the folders and saves them
+    // again. A matching set can be the uploads' own rows just before such a
+    // save, so read it only once the library is idle, and keep reading until
+    // it has settled; a stream that never comes back still fails below.
     let deadline = Instant::now() + Duration::from_secs(30);
     let item = loop {
+        await_library_idle(api, library).await;
         let item = api.get(&format!("/Items/{id}?Fields=MediaStreams")).await;
         let streams: Vec<_> = item["MediaStreams"]
             .as_array()
@@ -2279,6 +2311,9 @@ async fn verify_subtitle_destinations(
             .unwrap();
         assert_eq!(response.status(), reqwest::StatusCode::BAD_REQUEST);
     }
+    // Counted once no refresh is left running either, so the count is the set
+    // the refreshes leave rather than one read in the middle of a save.
+    await_library_idle(api, library).await;
     let item = api.get(&format!("/Items/{id}?Fields=MediaStreams")).await;
     assert_eq!(
         item["MediaStreams"]
@@ -3479,10 +3514,12 @@ async fn verify_by_name_metadata_languages(
                 .get(&format!("/Items/{id}/RemoteImages?providerName=TheMovieDb"))
                 .await;
             let images = images["Images"].as_array().unwrap();
-            assert_eq!(images.len(), 3, "preferred/untagged/English: {images:?}");
+            assert_eq!(images.len(), 3, "preferred/English/untagged: {images:?}");
             assert_eq!(images[0]["Language"], image_tag);
             assert_eq!(images[0]["Width"], 1600);
-            assert!(images[1]["Language"].is_null() || images[1]["Language"] == "");
+            // Jellyfin 12's ladder: English (3) before untagged (2).
+            assert_eq!(images[1]["Language"], "en", "{images:?}");
+            assert!(images[2]["Language"].is_null() || images[2]["Language"] == "");
             let image = api
                 .client
                 .get(format!("{}/Items/{id}/Images/Primary", api.base))

@@ -7,14 +7,10 @@
 //! image path reads `%MetadataPath%/library/ab/abcd…/poster.jpg`. That is what
 //! makes a Jellyfin database portable between data directories — and what
 //! makes an adopted one unreadable until the same expansion is applied on
-//! Ferrofin's side. Ferrofin writes resolved paths, except for the rows it
-//! makes in its data directory for the Collections library's folder, a box set
-//! and a created playlist, which it stores tokenised as upstream does
-//! ([`VirtualPathExpander::reverse`]), so they follow a move of that
-//! directory. Expanding on read is the identity for the other rows it wrote
-//! itself. A save of a row stored tokenised keeps its token form while the
-//! path saved is that form's expansion
-//! (`FerrofinItemPersistenceService::upsert_item`).
+//! Ferrofin's side. Ferrofin writes every `BaseItems.Path` the same way
+//! ([`VirtualPathExpander::reverse`]: `FerrofinItemPersistenceService`'s
+//! saves, the by-name, person, playlists-folder and user-view writers), so its
+//! rows follow a move of those directories as upstream's do.
 
 use std::borrow::Cow;
 use std::sync::Arc;
@@ -47,6 +43,15 @@ impl VirtualPathExpander {
         Self::default()
     }
 
+    /// This server's internal metadata directory, `None` for
+    /// [`Self::identity`].
+    #[must_use]
+    pub fn internal_metadata_path(&self) -> Option<String> {
+        self.paths
+            .as_ref()
+            .map(|paths| paths.internal_metadata_path())
+    }
+
     /// The stored path with both tokens replaced, case-insensitively, as
     /// `string.Replace(…, StringComparison.OrdinalIgnoreCase)` does upstream.
     #[must_use]
@@ -54,12 +59,12 @@ impl VirtualPathExpander {
         let Some(paths) = &self.paths else {
             return path.to_owned();
         };
-        let data = replace_ignore_ascii_case(
+        let data = substitute(
             path,
             FerrofinServerApplicationPaths::VIRTUAL_DATA_PATH,
             &paths.data_path(),
         );
-        replace_ignore_ascii_case(
+        substitute(
             &data,
             FerrofinServerApplicationPaths::VIRTUAL_INTERNAL_METADATA_PATH,
             &paths.internal_metadata_path(),
@@ -84,9 +89,9 @@ impl VirtualPathExpander {
     }
 
     /// [`Self::expand`] without a copy when there is nothing to expand: `path` itself, borrowed,
-    /// when it holds neither token in any case (every media path, and every path Ferrofin
-    /// writes but a box set's, a created playlist's and the Collections folder's),
-    /// else [`Self::expand`]'s string. The text is [`Self::expand`]'s either way.
+    /// when it holds neither token in any case (every path outside this server's data and
+    /// metadata directories: media, the root folders, libraries), else [`Self::expand`]'s
+    /// string. The text is [`Self::expand`]'s either way.
     #[must_use]
     pub fn expand_cow<'p>(&self, path: &'p str) -> Cow<'p, str> {
         let holds = |token: &str| {
@@ -105,24 +110,64 @@ impl VirtualPathExpander {
     }
 
     /// The write half, `ReverseVirtualPath` (`ApplicationHost.cs:299-305`):
-    /// this server's data directory, then its internal metadata directory,
-    /// replaced case-insensitively by their tokens.
+    /// a path at or under this server's data directory, else its internal
+    /// metadata directory, gets that directory's token in its place, compared
+    /// case-insensitively.
+    ///
+    /// ACCEPTED DIVERGENCE (Ferrofin is the more-correct side): upstream's
+    /// `string.Replace` swaps the directory wherever it occurs. Its directories
+    /// are absolute, so that is a prefix but for a path that merely contains
+    /// one (`/media/config/data/…` beside a `/config/data`); a relative
+    /// `--data-dir` (`data/data`) would match inside any path holding the
+    /// text. Only a whole leading directory is replaced here, so every stored
+    /// token starts the path, as upstream's do (gl-1581).
     #[must_use]
     pub fn reverse(&self, path: &str) -> String {
         let Some(paths) = &self.paths else {
             return path.to_owned();
         };
-        let data = replace_ignore_ascii_case(
-            path,
-            &paths.data_path(),
-            FerrofinServerApplicationPaths::VIRTUAL_DATA_PATH,
-        );
-        replace_ignore_ascii_case(
-            &data,
-            &paths.internal_metadata_path(),
-            FerrofinServerApplicationPaths::VIRTUAL_INTERNAL_METADATA_PATH,
-        )
+        [
+            (
+                paths.data_path(),
+                FerrofinServerApplicationPaths::VIRTUAL_DATA_PATH,
+            ),
+            (
+                paths.internal_metadata_path(),
+                FerrofinServerApplicationPaths::VIRTUAL_INTERNAL_METADATA_PATH,
+            ),
+        ]
+        .into_iter()
+        .find_map(|(dir, token)| under(path, &dir).map(|rest| format!("{token}{rest}")))
+        .unwrap_or_else(|| path.to_owned())
     }
+}
+
+/// `path` with `token` replaced by `dir`, case-insensitively. A `dir`
+/// configured with a trailing separator (`/mnt/meta/`) gives it once: the
+/// stored path already carries one after the token, as
+/// [`VirtualPathExpander::reverse`] keeps it.
+fn substitute(path: &str, token: &str, dir: &str) -> String {
+    let trimmed = dir.trim_end_matches(['/', '\\']);
+    if trimmed.len() == dir.len() || trimmed.is_empty() {
+        return replace_ignore_ascii_case(path, token, dir);
+    }
+    let path = replace_ignore_ascii_case(path, &format!("{token}/"), &format!("{trimmed}/"));
+    let path = replace_ignore_ascii_case(&path, &format!("{token}\\"), &format!("{trimmed}\\"));
+    replace_ignore_ascii_case(&path, token, dir)
+}
+
+/// What follows `dir` in `path` when `path` is `dir` or lies under it, the
+/// directory compared case-insensitively: empty, or the rest from its
+/// separator on.
+fn under<'p>(path: &'p str, dir: &str) -> Option<&'p str> {
+    let dir = dir.trim_end_matches(['/', '\\']);
+    if dir.is_empty() {
+        return None;
+    }
+    let rest = path.get(dir.len()..)?;
+    (path[..dir.len()].eq_ignore_ascii_case(dir)
+        && (rest.is_empty() || rest.starts_with(['/', '\\'])))
+    .then_some(rest)
 }
 
 pub(crate) use ferrofin_util::string_extensions::replace_ignore_ascii_case;
@@ -195,6 +240,39 @@ mod tests {
             "%AppDataPath%/metadata/a"
         );
         assert_eq!(nested.reverse("/srv/media"), "/srv/media");
+        // the directory itself, and a whole leading directory only (gl-1581)
+        assert_eq!(nested.reverse("/var/lib/ferrofin/data"), "%AppDataPath%");
+        assert_eq!(
+            nested.reverse("/var/lib/ferrofin/data2/x"),
+            "/var/lib/ferrofin/data2/x"
+        );
+        assert_eq!(
+            nested.reverse("/media/var/lib/ferrofin/data/x.mkv"),
+            "/media/var/lib/ferrofin/data/x.mkv"
+        );
+        assert_eq!(nested.reverse(""), "");
+        // a directory configured with a trailing separator round-trips
+        let slashed = Arc::new(FerrofinServerApplicationPaths::new(
+            "/data", "log", "config", "cache", "web",
+        ));
+        slashed.set_internal_metadata_path(Some("/mnt/meta/"));
+        let slashed = VirtualPathExpander::from_paths(slashed);
+        let stored = slashed.reverse("/mnt/meta/Genre/Action");
+        assert_eq!(stored, "%MetadataPath%/Genre/Action");
+        assert_eq!(slashed.expand(&stored), "/mnt/meta/Genre/Action");
+        assert_eq!(slashed.reverse("/mnt/meta"), "%MetadataPath%");
+        let relative = VirtualPathExpander::from_paths(Arc::new(
+            FerrofinServerApplicationPaths::new("data", "log", "config", "cache", "web"),
+        ));
+        assert_eq!(
+            relative.reverse("data/data/playlists"),
+            "%AppDataPath%/playlists"
+        );
+        assert_eq!(
+            relative.reverse("/mnt/data/data/movies/a.mkv"),
+            "/mnt/data/data/movies/a.mkv",
+            "a relative data directory never matches inside a path"
+        );
         let paths = Arc::new(FerrofinServerApplicationPaths::new(
             "/data", "log", "config", "cache", "web",
         ));

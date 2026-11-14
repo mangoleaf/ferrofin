@@ -6,10 +6,21 @@
 //! `0.0.0.0` for IPv4 only, the host's IPv6 addresses for IPv6 only). An
 //! address the operator pins at startup (`--bind`, `FERROFIN_BIND_ADDR`,
 //! `config.toml`) is an explicit deployment choice and stays the one listener.
+//!
+//! The ports are the dashboard's (`InternalHttpPort`, `InternalHttpsPort`)
+//! below a flag or a variable and above `config.toml` ([`ports`]).
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::sync::Arc;
 
 use anyhow::Context as _;
+use ferrofin_core::system_manager::LifecycleController;
+use ferrofin_networking::NetworkConfiguration;
+use ferrofin_networking::network_configuration::{DEFAULT_HTTP_PORT, DEFAULT_HTTPS_PORT};
+
+use ferrofin_traits::configuration::ConfigurationListener;
+
+use crate::config::Config;
 
 /// What `axum::serve` accepts: a TCP listener that sets the socket options of
 /// every accepted connection (`crate::configure_accepted`).
@@ -182,6 +193,59 @@ pub fn plan_addresses(
     }
 }
 
+/// The HTTP and HTTPS ports the Networking page sets in `network`, each
+/// `None` where it holds the default and so leaves the port to `config.toml`.
+/// Equal ports are both `None`, as `ApplicationHost.Init` resets them to the
+/// defaults.
+#[must_use]
+pub fn page_ports(network: &NetworkConfiguration) -> (Option<u16>, Option<u16>) {
+    let (http, https) = (network.internal_http_port, network.internal_https_port);
+    if http == https {
+        return (None, None);
+    }
+    (
+        (http != DEFAULT_HTTP_PORT).then_some(http),
+        (https != DEFAULT_HTTPS_PORT).then_some(https),
+    )
+}
+
+/// The HTTP and HTTPS ports a server lifetime listens on and advertises: a
+/// flag or variable, else the Networking page's port saved in `network`
+/// ([`page_ports`]), else `config.toml`'s, else the default (owner decision
+/// on gl-554). `config` holds the loader's pick of all but the page.
+#[must_use]
+pub fn ports(config: &Config, network: &NetworkConfiguration) -> (u16, u16) {
+    let (http, https) = page_ports(network);
+    (
+        http.filter(|_| !config.port_from_flag_or_env)
+            .unwrap_or(config.port),
+        https
+            .filter(|_| !config.https_port_from_env)
+            .unwrap_or(config.https_port),
+    )
+}
+
+/// Marks a restart pending in `lifecycle` when a saved network configuration
+/// resolves ([`ports`], over `config`) to other ports than `running`, the
+/// ones this lifetime listens on: `ApplicationHost.OnConfigurationUpdated`.
+/// A port a flag or variable sets is not changed by a save, so it takes none.
+///
+/// TODO(gl-1701): upstream also clears `IsPortAuthorized` and saves the server
+/// configuration when it flags this restart; that needs an atomic flag update
+/// outside the listener, which may not save.
+pub(crate) fn restart_listener(
+    running: (u16, u16),
+    config: Config,
+    lifecycle: Arc<dyn LifecycleController>,
+) -> Arc<ConfigurationListener> {
+    crate::state::network_restart_listener(
+        running,
+        move |saved| ports(&config, saved),
+        "listen on the new port",
+        lifecycle,
+    )
+}
+
 /// Binds every address. An unspecified IPv6 address (`::`) is bound dual-stack;
 /// where the host cannot do IPv6 at all it falls back to IPv4 (`0.0.0.0`) with
 /// a warning, as Jellyfin drops IPv6 when `Socket.OSSupportsIPv6` is false.
@@ -252,7 +316,89 @@ mod tests {
 
     use axum::serve::Listener as _;
 
-    use super::{BindInterface, bind, bind_all, plan_addresses};
+    use ferrofin_networking::NetworkConfiguration;
+
+    use super::{BindInterface, bind, bind_all, plan_addresses, ports};
+    use crate::config::Config;
+
+    /// gl-554: a flag or variable, else the Networking page, else
+    /// `config.toml` (here 5000/5443), else the default. The page's default
+    /// leaves the file's port, and so do equal page ports.
+    #[rstest::rstest]
+    #[case::page_outranks_the_file(8097, 8921, false, false, (8097, 8921))]
+    #[case::page_defaults_leave_the_file(8096, 8920, false, false, (5000, 5443))]
+    #[case::one_page_port_alone(8097, 8920, false, false, (8097, 5443))]
+    #[case::flag_or_variable_outranks_the_page(8097, 8921, true, false, (5000, 8921))]
+    #[case::https_variable_outranks_the_page(8097, 8921, false, true, (8097, 5443))]
+    #[case::equal_page_ports_are_the_defaults(8097, 8097, false, false, (5000, 5443))]
+    #[case::equal_default_http_port(8096, 8096, false, false, (5000, 5443))]
+    fn ports_follow_the_owners_precedence(
+        #[case] page_http: u16,
+        #[case] page_https: u16,
+        #[case] port_pinned: bool,
+        #[case] https_port_pinned: bool,
+        #[case] expected: (u16, u16),
+    ) {
+        let config = Config {
+            port: 5000,
+            port_from_flag_or_env: port_pinned,
+            https_port: 5443,
+            https_port_from_env: https_port_pinned,
+            ..Config::test_stub(std::path::Path::new("/nowhere"))
+        };
+        let network = NetworkConfiguration {
+            internal_http_port: page_http,
+            internal_https_port: page_https,
+            ..NetworkConfiguration::default()
+        };
+        assert_eq!(ports(&config, &network), expected);
+    }
+
+    /// gl-554: a Networking save marks a restart only when it changes a port
+    /// served (`OnConfigurationUpdated`); a flag or variable keeps the port.
+    #[test]
+    fn a_saved_port_change_marks_a_restart() {
+        use ferrofin_core::system_manager::LifecycleController as _;
+        use ferrofin_traits::configuration::ConfigurationUpdate;
+
+        let save = |port_pinned: bool, json: &str| {
+            let config = Config {
+                port: 5000,
+                port_from_flag_or_env: port_pinned,
+                https_port: 5443,
+                ..Config::test_stub(std::path::Path::new("/nowhere"))
+            };
+            let (tx, _rx) = tokio::sync::oneshot::channel();
+            let lifecycle = std::sync::Arc::new(crate::state::FerrofinLifecycleController::new(tx));
+            let listener = super::restart_listener((5000, 5443), config, lifecycle.clone());
+            listener(&ConfigurationUpdate::Named {
+                key: "network".to_owned(),
+                json: json.into(),
+            });
+            lifecycle.has_pending_restart()
+        };
+        assert!(save(false, r#"{"InternalHttpPort":8097}"#));
+        assert!(save(false, r#"{"InternalHttpsPort":8921}"#));
+        assert!(
+            save(true, r#"{"InternalHttpsPort":8921}"#),
+            "only HTTP is pinned"
+        );
+        assert!(
+            !save(true, r#"{"InternalHttpPort":8097}"#),
+            "the flag or variable"
+        );
+        assert!(
+            !save(false, r#"{"InternalHttpPort":8096}"#),
+            "config.toml's port"
+        );
+        assert!(
+            !save(
+                false,
+                r#"{"InternalHttpPort":8097,"InternalHttpsPort":8097}"#
+            ),
+            "equal ports are the defaults"
+        );
+    }
 
     #[test]
     fn an_operators_bind_wins_otherwise_the_network_settings_decide() {

@@ -13,17 +13,17 @@
 //! [module docs](crate::entities):
 //! - `INTEGER` surrogate keys → [`i64`]; other `INTEGER` numerics → [`i64`]
 //!   (`Option<i64>` where nullable).
-//! - `TEXT` `Guid` columns → [`String`] (the hyphenated form as stored; the
-//!   conversion layer parses these into `Uuid`). All foreign keys to
+//! - `TEXT` `Guid` columns → [`String`] (the hyphenated form as stored; callers
+//!   parse these into `Uuid`). All foreign keys to
 //!   `BaseItems` are bare `Guid` columns (there is no ORM navigation).
 //! - `TEXT` `DateTime` columns → [`DateTime<Utc>`](chrono::DateTime).
 //! - `REAL` columns → [`f64`]; `INTEGER` booleans → [`bool`].
 //! - Enum-valued `INTEGER` columns are kept as [`i32`] discriminants and mapped
 //!   onto the [`crate::enums`] types (`ItemValueType`, `LinkedChildType`,
 //!   `MediaStreamTypeEntity`), or for image types onto
-//!   `ferrofin_model::entities::ImageType`, by the conversion layer.
+//!   `ferrofin_model::entities::ImageType`, by callers.
 //! - The `Blurhash` `BLOB` → [`Vec<u8>`]; the `KeyframeTicks` JSON `TEXT` → a
-//!   [`String`] holding the raw JSON (parsed by the conversion layer).
+//!   [`String`] holding the raw JSON (parsed by callers).
 
 use chrono::{DateTime, Utc};
 
@@ -49,7 +49,9 @@ pub struct BaseItemEntity {
     pub artists: Option<String>,
     /// The program-audio discriminant (`Audio`), if any.
     pub audio: Option<i32>,
-    /// The owning channel's `Guid`, hyphenated (`ChannelId`), if any.
+    /// The owning channel's `Guid`, hyphenated (`ChannelId`), if any (the zero
+    /// GUID an item with no channel stores reads as `None`).
+    #[sqlx(try_from = "crate::entities::unset::NonNilGuid")]
     pub channel_id: Option<String>,
     /// The normalized (clean) name for lookups (`CleanName`), if any.
     pub clean_name: Option<String>,
@@ -89,7 +91,8 @@ pub struct BaseItemEntity {
     pub extra_type: Option<i32>,
     /// A forced sort name overriding `SortName` (`ForcedSortName`), if any.
     pub forced_sort_name: Option<String>,
-    /// The genres, as stored (`Genres`), if any.
+    /// The genres, as stored (`Genres`), if any (`''` reads as `None`).
+    #[sqlx(try_from = "crate::entities::unset::NonEmptyText")]
     pub genres: Option<String>,
     /// The pixel height (`Height`), if any.
     pub height: Option<i64>,
@@ -154,17 +157,23 @@ pub struct BaseItemEntity {
     pub presentation_unique_key: Option<String>,
     /// The primary version item's `Guid`, hyphenated (`PrimaryVersionId`).
     pub primary_version_id: Option<String>,
-    /// The production locations, as stored (`ProductionLocations`), if any.
+    /// The production locations, as stored (`ProductionLocations`), if any
+    /// (`''` reads as `None`).
+    #[sqlx(try_from = "crate::entities::unset::NonEmptyText")]
     pub production_locations: Option<String>,
     /// The production year (`ProductionYear`), if any.
     pub production_year: Option<i64>,
     /// The runtime in ticks (`RunTimeTicks`), if any.
     pub run_time_ticks: Option<i64>,
-    /// The owning season's `Guid`, hyphenated (`SeasonId`), if any.
+    /// The owning season's `Guid`, hyphenated (`SeasonId`), if any (the zero
+    /// GUID reads as `None`).
+    #[sqlx(try_from = "crate::entities::unset::NonNilGuid")]
     pub season_id: Option<String>,
     /// The season name (`SeasonName`), if any.
     pub season_name: Option<String>,
-    /// The owning series' `Guid`, hyphenated (`SeriesId`), if any.
+    /// The owning series' `Guid`, hyphenated (`SeriesId`), if any (the zero
+    /// GUID reads as `None`).
+    #[sqlx(try_from = "crate::entities::unset::NonNilGuid")]
     pub series_id: Option<String>,
     /// The series name (`SeriesName`), if any.
     pub series_name: Option<String>,
@@ -178,11 +187,13 @@ pub struct BaseItemEntity {
     pub sort_name: Option<String>,
     /// The item's start date (`StartDate`), if any.
     pub start_date: Option<DateTime<Utc>>,
-    /// The studios, as stored (`Studios`), if any.
+    /// The studios, as stored (`Studios`), if any (`''` reads as `None`).
+    #[sqlx(try_from = "crate::entities::unset::NonEmptyText")]
     pub studios: Option<String>,
     /// The tagline (`Tagline`), if any.
     pub tagline: Option<String>,
-    /// The tags, as stored (`Tags`), if any.
+    /// The tags, as stored (`Tags`), if any (`''` reads as `None`).
+    #[sqlx(try_from = "crate::entities::unset::NonEmptyText")]
     pub tags: Option<String>,
     /// The top-most parent's `Guid`, hyphenated (`TopParentId`), if any.
     pub top_parent_id: Option<String>,
@@ -520,7 +531,7 @@ pub struct MediaStreamInfoEntity {
 /// item.
 ///
 /// `KeyframeTicks` is a JSON `TEXT` column and kept here as a [`String`]
-/// holding the raw JSON (parsed by the conversion layer).
+/// holding the raw JSON (parsed by callers).
 #[derive(Debug, Clone, PartialEq, Eq, sqlx::FromRow)]
 #[sqlx(rename_all = "PascalCase")]
 pub struct KeyframeDataEntity {

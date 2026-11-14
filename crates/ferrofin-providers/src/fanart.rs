@@ -149,7 +149,7 @@ impl FanartClient {
     #[must_use]
     pub fn new(personal_key: Option<String>) -> Self {
         Self {
-            http: reqwest::Client::new(),
+            http: crate::http_client::client(),
             limiter: RateLimiter::new("fanart"),
             personal_key: personal_key.filter(|k| !k.is_empty()),
             language: "en".to_owned(),
@@ -445,6 +445,7 @@ fn populate_season(
             .filter(|language| !language.eq_ignore_ascii_case("00"))
             .map(str::to_owned);
         out.push(TmdbImage {
+            thumbnail_url: None,
             image_type,
             url: https_upgrade(url),
             width: Some(width),
@@ -501,6 +502,7 @@ fn populate(
             .map(str::to_owned);
         let community_rating = img.likes.as_deref().and_then(|l| l.parse::<f64>().ok());
         out.push(TmdbImage {
+            thumbnail_url: None,
             image_type,
             url: url.to_owned(),
             width: Some(width),
@@ -675,6 +677,7 @@ mod tests {
         let client = FanartClient::new(None); // language = en
         let mut images = vec![
             TmdbImage {
+                thumbnail_url: None,
                 image_type: ImageType::Primary,
                 url: "narrow-en".into(),
                 width: Some(500),
@@ -684,6 +687,7 @@ mod tests {
                 language: Some("en".into()),
             },
             TmdbImage {
+                thumbnail_url: None,
                 image_type: ImageType::Primary,
                 url: "wide-de".into(),
                 width: Some(1000),
@@ -693,6 +697,7 @@ mod tests {
                 language: Some("de".into()),
             },
             TmdbImage {
+                thumbnail_url: None,
                 image_type: ImageType::Primary,
                 url: "wide-en-low".into(),
                 width: Some(1000),
@@ -702,6 +707,7 @@ mod tests {
                 language: Some("en".into()),
             },
             TmdbImage {
+                thumbnail_url: None,
                 image_type: ImageType::Primary,
                 url: "wide-en-high".into(),
                 width: Some(1000),

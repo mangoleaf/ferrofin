@@ -33,7 +33,7 @@ use uuid::Uuid;
 
 use crate::auth::RequireAuth;
 use crate::error::ApiError;
-use crate::extract::{DotnetGuid, Query};
+use crate::extract::{DotnetGuid, Query, RequiredRouteString, RouteParameter};
 use crate::handlers::by_name::additional_dto_options;
 use crate::handlers::items::resolve_user_opt;
 use crate::state::AppState;
@@ -280,6 +280,16 @@ async fn from_item(
     instant_mix_from_item(&state, &auth, item_id, &query, None).await
 }
 
+/// `{name}`, the `[FromRoute, Required] string` of
+/// `GetInstantMixFromMusicGenreByName`, which the router registers as
+/// `{genreName}`.
+struct MusicGenreName;
+
+impl RouteParameter for MusicGenreName {
+    const NAME: &'static str = "name";
+    const ROUTE_NAME: &'static str = "genreName";
+}
+
 /// `GET /MusicGenres/{genreName}/InstantMix` — a mix seeded by a genre name.
 #[utoipa::path(
     get,
@@ -291,7 +301,7 @@ async fn from_item(
 async fn from_music_genre_name(
     State(state): State<AppState>,
     RequireAuth(auth): RequireAuth,
-    Path(name): Path<String>,
+    RequiredRouteString(name, _): RequiredRouteString<MusicGenreName>,
     Query(query): Query<InstantMixQuery>,
 ) -> Result<Json<QueryResult<BaseItemDto>>, ApiError> {
     let user = resolve_user_opt(&state, &auth, query.user_id).await?;
