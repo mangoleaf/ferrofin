@@ -476,8 +476,8 @@ async fn refresh_library(
 #[derive(Debug, Default, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct MediaFoldersQuery {
-    /// Optional. Filter by folders marked hidden. Ferrofin models no per-folder
-    /// hidden flag, so `true` matches nothing and `false`/absent matches all.
+    /// Optional. Filter by folders marked hidden (`BaseItem.IsHidden`), which
+    /// only the playlists folder is.
     #[serde(default)]
     is_hidden: Option<bool>,
 }
@@ -596,15 +596,15 @@ async fn get_available_options(
 
 /// `GET /Library/MediaFolders` — the server's media (collection) folders.
 ///
-/// Port of `LibraryController.GetMediaFolders`: the user-root collection folders,
-/// less the libraries whose options disable them, name-sorted, projected to
-/// [`BaseItemDto`] as a [`QueryResult`](ferrofin_model::querying::QueryResult).
+/// Port of `LibraryController.GetMediaFolders`: the user-root collection folders
+/// and the playlists folder, less the libraries whose options disable them,
+/// name-sorted, projected to [`BaseItemDto`] as a
+/// [`QueryResult`](ferrofin_model::querying::QueryResult).
 ///
 /// Upstream reads no user here: the folders are the same for every caller, an
-/// API key with no user included, and carry no user data. Ferrofin does not
-/// model a per-folder hidden flag, so no folder is hidden: an `isHidden=true`
-/// filter returns nothing, and
-/// `false`/absent returns them all (a faithful projection of "nothing hidden").
+/// API key with no user included, and carry no user data. `isHidden` compares
+/// `BaseItem.IsHidden`, which only `PlaylistsFolder` overrides (to `true`), so
+/// `true` keeps the playlists folder, `false` the libraries, and no value both.
 #[utoipa::path(
     get,
     path = "/Library/MediaFolders",
@@ -618,19 +618,25 @@ async fn get_media_folders(
     Query(query): Query<MediaFoldersQuery>,
 ) -> Result<Json<QueryResult<BaseItemDto>>, ApiError> {
     // The media folders are the user-root children — the collection folders plus
-    // the auto-provisioned Playlists folder — returned name-sorted by the view seam
-    // (C# GetUserRootFolder().Children).
-    let folders = if query.is_hidden == Some(true) {
-        // No folder carries a hidden flag, so none match `isHidden=true`.
-        Vec::new()
-    } else {
-        // Upstream reads no user here (`LibraryController.GetMediaFolders`),
-        // so an API key with none is served like an administrator.
-        state.user_views.get_media_folders().await?
-    };
+    // the auto-provisioned Playlists folder — returned sorted by the view seam
+    // (C# GetUserRootFolder().Children.Concat(RootFolder.VirtualChildren)).
+    //
+    // Upstream reads no user here (`LibraryController.GetMediaFolders`),
+    // so an API key with none is served like an administrator.
+    let mut folders = state.user_views.get_media_folders().await?;
+    if let Some(hidden) = query.is_hidden {
+        // `PlaylistsFolder.IsHidden => true` is the only override of
+        // `BaseItem.IsHidden => false`; both stored spellings are that folder.
+        folders.retain(|folder| {
+            matches!(
+                BaseItemKind::from_stored_type_name(&folder.type_),
+                Some(BaseItemKind::PlaylistsFolder | BaseItemKind::ManualPlaylistsFolder)
+            ) == hidden
+        });
+    }
     let options = DtoOptions::default();
     // NO user, matching C# `GetMediaFolders`:
-    //   var dtoOptions = new DtoOptions().AddClientFields(User);
+    //   var dtoOptions = new DtoOptions();
     //   var resultArray = _dtoService.GetBaseItemDtos(items, dtoOptions);
     //
     // `IDtoService.GetBaseItemDtos(items, options, User? user = null, ...)` —

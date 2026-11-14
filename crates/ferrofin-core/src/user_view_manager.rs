@@ -1102,13 +1102,32 @@ impl UserViewManager for FerrofinUserViewManager {
     }
 
     async fn get_media_folders(&self) -> Result<Vec<BaseItemEntity>, ServiceError> {
-        let folders = self.root_children().await?;
-        // An administrator's list, so a manager with no evaluator only skips
-        // the `Enabled` filter; `get_user_root_children` must refuse instead.
-        match &self.visibility {
-            Some(visibility) => visibility.without_disabled_libraries(folders).await,
-            None => Ok(folders),
+        let folders = self.enabled_root_children().await?;
+        if folders.len() < 2 {
+            return Ok(folders);
         }
+        // `Children.Concat(VirtualChildren).OrderBy(i => i.SortName)`: a stable
+        // sort by the request culture's `string.CompareTo`, where
+        // `root_children` compares ordinally.
+        let Ok(comparer) =
+            ferrofin_util::current_culture::comparer(&ferrofin_util::current_culture::capture())
+        else {
+            return Ok(folders);
+        };
+        // The `Concat` order, which the stable sort keeps on a tie: a library
+        // ahead of the playlists folder. `root_children`'s tie order is not it.
+        let (libraries, virtual_children): (Vec<_>, Vec<_>) =
+            folders.into_iter().partition(|folder| {
+                item_type_lookup::kind_from_type_name(&folder.type_)
+                    == Some(BaseItemKind::CollectionFolder)
+            });
+        let mut keyed: Vec<(String, BaseItemEntity)> = libraries
+            .into_iter()
+            .chain(virtual_children)
+            .map(|folder| (crate::item_repository::folder_sort_name(&folder), folder))
+            .collect();
+        keyed.sort_by(|(a, _), (b, _)| comparer.compare(a, b));
+        Ok(keyed.into_iter().map(|(_, folder)| folder).collect())
     }
 
     async fn get_user_root_children(
@@ -1475,6 +1494,18 @@ impl FerrofinUserViewManager {
             .collect())
     }
 
+    /// [`Self::root_children`] less the libraries whose options disable them
+    /// (`GetLibraryOptions(i).Enabled`), in its ordinal `SortName` order.
+    async fn enabled_root_children(&self) -> Result<Vec<BaseItemEntity>, ServiceError> {
+        let folders = self.root_children().await?;
+        // An administrator's list, so a manager with no evaluator only skips
+        // the `Enabled` filter; `get_user_root_children` must refuse instead.
+        match &self.visibility {
+            Some(visibility) => visibility.without_disabled_libraries(folders).await,
+            None => Ok(folders),
+        }
+    }
+
     /// Every user-root child, whoever asks: Jellyfin's
     /// `GetUserRootFolder().Children` sorted by `SortName` — the library
     /// collection folders plus the playlists plugin folder `CreateRootFolder()`
@@ -1571,7 +1602,7 @@ impl FerrofinUserViewManager {
             // `get_latest_media` always names one.
             let folders = match &query.user {
                 Some(user) => self.get_user_root_children(user).await?,
-                None => self.get_media_folders().await?,
+                None => self.enabled_root_children().await?,
             };
             parents = folders
                 .iter()
@@ -3920,6 +3951,46 @@ mod tests {
         assert_eq!(
             names(mgr.get_media_folders().await.expect("folders")),
             ["Movies", "Playlists", "TV Shows"]
+        );
+    }
+
+    /// `GetMediaFolders` sorts `Children.Concat(VirtualChildren)` with the
+    /// stable `OrderBy(i => i.SortName)`, the request culture's
+    /// `string.CompareTo`: `~`, which the sort name keeps, sorts before the
+    /// letters, where an ordinal comparison puts it after them; and a library
+    /// whose sort name ties with the playlists folder's stays ahead of it.
+    #[tokio::test]
+    async fn the_media_folders_sort_in_the_request_culture() {
+        let db = test_db().await;
+        let playlists = Uuid::from_u128(0xAA26);
+        seed_named_item(&db, playlists, BaseItemKind::PlaylistsFolder, "Playlists").await;
+        seed_named_item(&db, MOVIES, BaseItemKind::CollectionFolder, "Films").await;
+        seed_named_item(&db, SHOWS, BaseItemKind::CollectionFolder, "~Archive").await;
+        let library = Uuid::from_u128(0xAA27);
+        seed_named_item(&db, library, BaseItemKind::CollectionFolder, "Playlists").await;
+        let mgr = manager(&db).with_visibility(visibility(&db));
+
+        let folders =
+            ferrofin_util::current_culture::scope("en-US".to_owned(), mgr.get_media_folders())
+                .await
+                .expect("folders");
+        let listed: Vec<_> = folders
+            .iter()
+            .map(|row| {
+                (
+                    row.name.as_deref().unwrap_or_default(),
+                    item_type_lookup::kind_from_type_name(&row.type_),
+                )
+            })
+            .collect();
+        assert_eq!(
+            listed,
+            [
+                ("~Archive", Some(BaseItemKind::CollectionFolder)),
+                ("Films", Some(BaseItemKind::CollectionFolder)),
+                ("Playlists", Some(BaseItemKind::CollectionFolder)),
+                ("Playlists", Some(BaseItemKind::PlaylistsFolder)),
+            ]
         );
     }
 

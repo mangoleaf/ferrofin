@@ -500,13 +500,23 @@ impl UserViewManager for StubUserViews {
         self.get_media_folders().await
     }
     async fn get_media_folders(&self) -> Result<Vec<BaseItemEntity>, ServiceError> {
+        // The playlists folder as stored: no library behind it, so no
+        // virtual-folder entry.
+        let mut playlists = item_entity(
+            PLAYLISTS_VIEW_ID,
+            "Playlists",
+            BaseItemKind::PlaylistsFolder,
+        );
+        BaseItemKind::PlaylistsFolder
+            .stored_type_name()
+            .expect("stored name")
+            .clone_into(&mut playlists.type_);
         Ok(vec![
             item_entity(SHOWS_ID, "Shows", BaseItemKind::CollectionFolder),
             item_entity(MOVIES_ID, "Movies", BaseItemKind::CollectionFolder),
             item_entity(MUSIC_ID, "Music", BaseItemKind::CollectionFolder),
             item_entity(MIXED_ID, "Attic", BaseItemKind::CollectionFolder),
-            // A virtual view: no library behind it, so no virtual-folder entry.
-            item_entity(PLAYLISTS_VIEW_ID, "Playlists", BaseItemKind::UserView),
+            playlists,
         ])
     }
     async fn get_latest_items(
@@ -1092,7 +1102,7 @@ async fn media_folders_returns_collection_folders() {
     assert_eq!(result.items.len(), 5);
 
     // No `UserData`, because upstream projects these WITHOUT a user:
-    //   var dtoOptions = new DtoOptions().AddClientFields(User);
+    //   var dtoOptions = new DtoOptions();
     //   var resultArray = _dtoService.GetBaseItemDtos(items, dtoOptions);
     // and `IDtoService.GetBaseItemDtos(items, options, User? user = null, …)`
     // defaults the user to null. Passing one added a block Jellyfin never
@@ -1106,6 +1116,30 @@ async fn media_folders_returns_collection_folders() {
              with no user: {item}"
         );
     }
+}
+
+/// `isHidden` compares `BaseItem.IsHidden`, which upstream overrides only on
+/// the playlists folder (`PlaylistsFolder.IsHidden => true`): `true` lists
+/// just that folder, `false` just the libraries, and no value both.
+#[rstest::rstest]
+#[case::absent("", &[SHOWS_ID, MOVIES_ID, MUSIC_ID, MIXED_ID, PLAYLISTS_VIEW_ID])]
+#[case::hidden("?isHidden=true", &[PLAYLISTS_VIEW_ID])]
+#[case::not_hidden("?isHidden=false", &[SHOWS_ID, MOVIES_ID, MUSIC_ID, MIXED_ID])]
+#[tokio::test]
+async fn media_folders_is_hidden_selects_the_playlists_folder(
+    #[case] query: &str,
+    #[case] expected: &[Uuid],
+) {
+    let (status, body) = send_elevated(
+        "GET",
+        &format!("/Library/MediaFolders{query}"),
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let result: QueryResult<BaseItemDto> = serde_json::from_slice(&body).expect("folders");
+    let ids: Vec<Uuid> = result.items.iter().map(|item| item.id).collect();
+    assert_eq!(ids, expected);
 }
 
 /// A server API key carries no user, and upstream's `GetMediaFolders` reads
