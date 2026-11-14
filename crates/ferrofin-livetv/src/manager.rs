@@ -55,7 +55,7 @@ use crate::guide_repository::{PROGRAM_SELECT, UserRestrictions};
 use crate::mapping::{
     EpgChannel, EpgChannelData, TunerChannel, epg_channel_for_tuner_channel,
     eq_ordinal_ignore_case, is_listing_provider_enabled_for_tuner, m3u_channel_id,
-    tuner_channel_mapping,
+    ordinal_ignore_case_key, tuner_channel_mapping,
 };
 use crate::projection::{
     ChannelRow, ProgramImages, ProgramRow as GuideProgramRow, channel_entity,
@@ -2351,12 +2351,87 @@ impl FerrofinLiveTvManager {
         Ok(info)
     }
 
-    /// Every tuner channel this listings provider supplies listings for, with
-    /// its stored key alongside the external `ChannelInfo.Id` clients see.
+    /// Every tuner channel this listings provider supplies listings for, each
+    /// tuner read now.
     ///
-    /// Port of `ListingsManager.GetChannelsForListingsProvider`: each tuner
-    /// host's lineup, filtered by `IsListingProviderEnabledForTuner`.
+    /// Port of `ListingsManager.GetChannelsForListingsProvider` (v12.4
+    /// ListingsManager.cs:483-500): each registered host's
+    /// `GetChannels(enableCache: false)`, filtered by
+    /// `IsListingProviderEnabledForTuner`. `BaseTunerHost.GetChannels`
+    /// (BaseTunerHost.cs:77-135) fetches every configured tuner of the host's
+    /// type, leaves out a channel whose `Id` an earlier tuner of that type
+    /// listed, and logs and skips a tuner it cannot read.
     async fn channels_for_listings_provider(
+        &self,
+        info: &ListingsProviderInfo,
+    ) -> Result<Vec<TunerChannel>, ServiceError> {
+        let tuners = self.get_tuner_hosts().await?;
+        let mut out = Vec::new();
+        for host in self.hosts.iter().filter(|h| h.is_supported()) {
+            let mut listed = HashSet::new();
+            let of_host = tuners.iter().filter(|t| {
+                t.type_
+                    .as_deref()
+                    .is_some_and(|ty| ty.eq_ignore_ascii_case(host.type_id()))
+            });
+            for tuner in of_host {
+                // As the refresh: a tuner with no id has no stored channels either.
+                let Some(host_id) = tuner.id.as_deref() else {
+                    continue;
+                };
+                // Names the tuner on the host's own logs, as the refresh does.
+                let lineup = tracing::Instrument::instrument(
+                    host.get_channels(tuner),
+                    tracing::info_span!("tuner_lineup", tuner = %host_id),
+                );
+                let lineup = match lineup.await {
+                    Ok(lineup) => lineup,
+                    Err(e) => {
+                        tracing::warn!(
+                            tuner = %host_id,
+                            error = %e,
+                            "live tv: tuner lineup fetch failed; its channels are left out of the channel mapping"
+                        );
+                        continue;
+                    }
+                };
+                // `newChannels` is checked against the earlier tuners only, so
+                // one playlist's own repeats stay.
+                let new: Vec<_> = lineup
+                    .into_iter()
+                    .filter(|ch| !listed.contains(&ordinal_ignore_case_key(&ch.external_id)))
+                    .collect();
+                listed.extend(
+                    new.iter()
+                        .map(|ch| ordinal_ignore_case_key(&ch.external_id)),
+                );
+                if !is_listing_provider_enabled_for_tuner(info, host_id) {
+                    continue;
+                }
+                let url = tuner.url.as_deref().unwrap_or_default();
+                out.extend(new.into_iter().map(|ch| {
+                    matcher_channel(
+                        url,
+                        host_id,
+                        &ch.url,
+                        ch.guide_key,
+                        ch.number.unwrap_or_default(),
+                        ch.name,
+                    )
+                }));
+            }
+        }
+        Ok(out)
+    }
+
+    /// The tuner channels this listings provider supplies listings for, from
+    /// the lineup the guide refresh stored, with each channel's stored key
+    /// alongside the external `ChannelInfo.Id` clients see.
+    ///
+    /// [`Self::bind_guide_channels`] reads it right after the refresh's
+    /// `replace_channels`, where it equals the lineup just fetched, so the
+    /// guide write needs no second fetch of each tuner.
+    async fn stored_channels_for_listings_provider(
         &self,
         info: &ListingsProviderInfo,
     ) -> Result<Vec<(String, TunerChannel)>, ServiceError> {
@@ -2447,7 +2522,9 @@ impl FerrofinLiveTvManager {
     ) -> Result<HashMap<String, Vec<(String, String)>>, ServiceError> {
         let epg = EpgChannelData::new(epg_channels);
         let mut by_epg_channel: HashMap<String, Vec<(String, String)>> = HashMap::new();
-        for (stored_id, tuner_channel) in self.channels_for_listings_provider(provider).await? {
+        for (stored_id, tuner_channel) in
+            self.stored_channels_for_listings_provider(provider).await?
+        {
             if let Some(matched) =
                 epg_channel_for_tuner_channel(&provider.channel_mappings, &tuner_channel, &epg)
             {
@@ -3290,7 +3367,7 @@ impl LiveTvManager for FerrofinLiveTvManager {
         Ok(ChannelMappingOptionsDto {
             tuner_channels: tuner_channels
                 .iter()
-                .map(|(_, c)| tuner_channel_mapping(c, &info.channel_mappings, &epg))
+                .map(|c| tuner_channel_mapping(c, &info.channel_mappings, &epg))
                 .collect(),
             provider_channels: provider_channels
                 .into_iter()
@@ -3357,7 +3434,7 @@ impl LiveTvManager for FerrofinLiveTvManager {
 
         tuner_channels
             .iter()
-            .map(|(_, c)| tuner_channel_mapping(c, &info.channel_mappings, &epg))
+            .map(|c| tuner_channel_mapping(c, &info.channel_mappings, &epg))
             .find(|row| {
                 row.id
                     .as_deref()
@@ -3960,14 +4037,41 @@ impl LiveTvManager for FerrofinLiveTvManager {
         else {
             return Ok(Vec::new());
         };
-        let tuner = self.tuner_host(&tuner_host_id).await?;
         // Each host builds its own sources: the M3U host has exactly one, and
         // an HDHomeRun offers a source per transcode profile the device
         // supports (`BaseTunerHost.GetChannelStreamMediaSources`).
-        let host = self.host_for(&tuner)?;
-        let mut sources = host.channel_media_sources(&tuner, &channel).await?;
+        let mut sources = match self.tuner_host(&tuner_host_id).await {
+            Ok(tuner) => {
+                let mut sources = self
+                    .host_for(&tuner)?
+                    .channel_media_sources(&tuner, &channel)
+                    .await?;
+                sources.iter_mut().for_each(crate::stream::normalize);
+                sources
+            }
+            // The tuner was deleted, and its channels stay listed until the
+            // guide refresh prunes them (migration 0046).
+            Err(ServiceError::NotFound(_)) => Vec::new(),
+            Err(err) => return Err(err),
+        };
+        if sources.is_empty() {
+            // `DefaultLiveTvService.GetChannelStreamMediaSources` throws
+            // `NotImplementedException` when no tuner offers a source, and
+            // `GetMediaSourcesInternal` answers the item's own placeholder
+            // (`LiveTvChannel.GetMediaSources`, not normalized) forced to
+            // `RequiresOpening`, so the open is what fails: "Tuner not found.".
+            sources.push(MediaSourceInfo {
+                id: Some(id.simple().to_string()),
+                name: crate::guide_repository::channel_row(&self.db, id)
+                    .await?
+                    .map(|row| row.name),
+                // `RunTimeTicks is null`: a channel item has none.
+                is_infinite_stream: true,
+                requires_opening: true,
+                ..MediaSourceInfo::default()
+            });
+        }
         for source in &mut sources {
-            crate::stream::normalize(source);
             Self::stamp_source(source);
             // `LiveTvMediaSourceProvider.GetMediaSourcesInternal`: the open
             // token is `{item type}_{item id "N"}_{source id}`. The
@@ -4622,23 +4726,19 @@ impl LiveTvManager for FerrofinLiveTvManager {
     async fn live_tv_media_type(&self, id: Uuid) -> Result<Option<String>, ServiceError> {
         // `LiveTvChannel.MediaType => ChannelType == ChannelType.Radio ?
         // MediaType.Audio : MediaType.Video` — the same mapping
-        // `add_channel_info`/`add_recording_info` already apply to the DTO.
+        // `projection::channel_media_type` stores and `apply_program_info`
+        // gives a programme.
         if let Some(row) = crate::guide_repository::channel_row(&self.db, id).await? {
             return Ok(Some(radio_or_tv_media_type(&row.channel_type).to_owned()));
         }
-        // A recording is the capture of one channel's airing, so it carries
-        // that channel's media type (upstream's `RecordingHelper` builds an
-        // `Audio` item for a radio programme and a `Movie`/`Episode`/`Video`
-        // for a television one — all `MediaType.Video`).
-        let Some(recording) = crate::dvr_repository::recording_row(&self.db, id).await? else {
-            return Ok(None);
-        };
-        let Ok(channel_id) = Uuid::parse_str(&recording.channel_id) else {
-            return Ok(None);
-        };
-        Ok(crate::guide_repository::channel_row(&self.db, channel_id)
+        // A recording is `MediaType.Video` whatever its channel: upstream
+        // writes every capture as a `.ts` file (`RecordingsManager`,
+        // `EncodedRecorder`), which the library resolves as a video item, a
+        // radio programme's too. Its entity says the same
+        // (`projection::recording_entity`).
+        Ok(crate::dvr_repository::recording_row(&self.db, id)
             .await?
-            .map(|row| radio_or_tv_media_type(&row.channel_type).to_owned()))
+            .map(|_| "Video".to_owned()))
     }
 
     async fn get_recording_media_sources(
@@ -9237,17 +9337,38 @@ mod tests {
             1,
             "airings stay with their channel"
         );
-        // Meanwhile the channel has no tuner to open: "Tuner not found.".
-        let err = mgr
-            .open_channel_stream(chan_id, None)
-            .await
-            .expect_err("no tuner to open");
-        assert!(matches!(err, ServiceError::NotFound(_)), "{err:?}");
-        let err = mgr
+        // Meanwhile no tuner offers the channel a source, so its sources are
+        // the item's own placeholder, to be opened
+        // (`LiveTvMediaSourceProvider.GetMediaSourcesInternal`'s
+        // `NotImplementedException` arm over `LiveTvChannel.GetMediaSources`)…
+        let key = chan_id.simple().to_string();
+        let sources = mgr
             .get_channel_media_sources(chan_id)
             .await
-            .expect_err("no tuner to ask");
-        assert!(matches!(err, ServiceError::NotFound(_)), "{err:?}");
+            .expect("the placeholder source");
+        assert_eq!(
+            sources,
+            vec![ferrofin_model::dto::MediaSourceInfo {
+                id: Some(key.clone()),
+                name: Some("Channel One".to_owned()),
+                is_infinite_stream: true,
+                requires_opening: true,
+                open_token: Some(format!("LiveTvChannel_{key}_{key}")),
+                buffer_ms: Some(1500),
+                ..ferrofin_model::dto::MediaSourceInfo::default()
+            }]
+        );
+        // …and opening it is what fails: "Tuner not found.".
+        for source_id in [None, Some(key.as_str())] {
+            let err = mgr
+                .open_channel_stream(chan_id, source_id)
+                .await
+                .expect_err("no tuner to open");
+            assert!(
+                matches!(&err, ServiceError::NotFound(m) if m == "Tuner not found."),
+                "{err:?}"
+            );
+        }
         mgr.refresh_guide().await.expect("refresh3");
         assert_eq!(
             mgr.get_channels(&LiveTvChannelQuery::default(), &DtoOptions::default())
@@ -10874,9 +10995,10 @@ mod tests {
 
     /// `LiveTvChannel.MediaType` — what the media-source manager's per-user
     /// `SupportsTranscoding`/`SupportsDirectStream` overwrite branches on
-    /// (`MediaSourceManager.GetPlaybackMediaSources`, v10.11.8
-    /// MediaSourceManager.cs:204-217). A channel is not a `BaseItems` row here,
-    /// so the Live TV manager is the only thing that can answer.
+    /// (`MediaSourceManager.GetPlaybackMediaSources`, v12.4
+    /// MediaSourceManager.cs:409-417). A channel or a DVR recording is not a
+    /// `BaseItems` row here, so the Live TV manager is the only thing that can
+    /// answer.
     #[tokio::test]
     async fn a_channel_reports_the_media_type_of_its_kind() {
         let mgr = manager_with_relative_guide().await;
@@ -10910,6 +11032,43 @@ mod tests {
             radio_mgr.live_tv_media_type(radio).await.expect("type"),
             Some("Audio".to_owned()),
             "a radio channel is MediaType.Audio"
+        );
+        // A recording of that radio channel is a `.ts` capture, which upstream's
+        // library resolves as a video item: `MediaType.Video`, not the channel's.
+        let recording = Uuid::new_v4();
+        crate::dvr_repository::insert_recording(
+            &radio_mgr.db,
+            recording,
+            &crate::dvr::TimerRecordingInfo {
+                channel_id: radio,
+                ..crate::dvr::TimerRecordingInfo::default()
+            },
+            std::path::Path::new("/recordings/Jazz FM.ts"),
+            Utc::now(),
+        )
+        .await
+        .expect("recording");
+        assert_eq!(
+            radio_mgr.live_tv_media_type(recording).await.expect("type"),
+            Some("Video".to_owned()),
+            "a radio channel's recording is MediaType.Video"
+        );
+        // Its channel is not consulted: a recording whose channel is gone is a
+        // video item all the same.
+        let orphan = Uuid::new_v4();
+        crate::dvr_repository::insert_recording(
+            &radio_mgr.db,
+            orphan,
+            &crate::dvr::TimerRecordingInfo::default(),
+            std::path::Path::new("/recordings/Gone.ts"),
+            Utc::now(),
+        )
+        .await
+        .expect("recording");
+        assert_eq!(
+            radio_mgr.live_tv_media_type(orphan).await.expect("type"),
+            Some("Video".to_owned()),
+            "a recording of no stored channel is MediaType.Video"
         );
         // An id that is neither a channel nor a recording has no media type,
         // and the caller must then leave the source as it was built.
@@ -15338,6 +15497,142 @@ mod tests {
             mgr.set_channel_mapping("nope", &two, "one.tv").await,
             Err(ServiceError::NotFound(_))
         ));
+    }
+
+    /// `ListingsManager.GetChannelsForListingsProvider` reads every tuner live
+    /// (`GetChannels(enableCache: false)`), not the lineup the last guide
+    /// refresh stored: a channel or a tuner added since then can be mapped at
+    /// once, a tuner that cannot be read is skipped, and a channel an earlier
+    /// tuner of the same type listed is not listed twice.
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)] // one lineup change, every rule of the live read
+    async fn channel_mapping_reads_each_tuner_live() {
+        let mut sources = HashMap::new();
+        sources.insert("http://tuner/playlist.m3u".to_owned(), M3U.to_owned());
+        sources.insert("http://guide/xmltv.xml".to_owned(), dated(XMLTV));
+        let fetcher = Arc::new(SwappableFetcher(std::sync::Mutex::new(sources)));
+        let mgr = manager_with_fetcher(Arc::clone(&fetcher) as Arc<dyn SourceFetcher>).await;
+        let save_tuner = |url: &str| TunerHostInfo {
+            type_: Some("m3u".to_owned()),
+            url: Some(url.to_owned()),
+            ..TunerHostInfo::default()
+        };
+        mgr.save_tuner_host(save_tuner("http://tuner/playlist.m3u"))
+            .await
+            .expect("tuner");
+        let provider_id = mgr
+            .save_listing_provider(
+                as_xmltv(ListingsProviderInfo {
+                    path: Some("http://guide/xmltv.xml".to_owned()),
+                    ..ListingsProviderInfo::default()
+                }),
+                false,
+                false,
+            )
+            .await
+            .expect("provider")
+            .id
+            .expect("provider id");
+        mgr.refresh_guide().await.expect("refresh");
+
+        // After the refresh: a third channel joins the playlist, a second
+        // tuner is added, another tuner carries the same playlist again, and
+        // one more cannot be read at all.
+        {
+            let mut sources = fetcher.0.lock().unwrap();
+            sources.insert(
+                "http://tuner/playlist.m3u".to_owned(),
+                format!(
+                    "{M3U}#EXTINF:-1 tvg-id=\"three.tv\" tvg-chno=\"3\",Channel Three\nhttp://tuner/three\n"
+                ),
+            );
+            sources.insert(
+                "http://tuner/other.m3u".to_owned(),
+                // The same entry twice: one playlist's own repeats both stay.
+                "#EXTM3U\n#EXTINF:-1 tvg-chno=\"9\",Channel Nine\nhttp://tuner/nine\n\
+                 #EXTINF:-1 tvg-chno=\"9\",Channel Nine\nhttp://tuner/nine\n"
+                    .to_owned(),
+            );
+            sources.insert("http://tuner/down.m3u".to_owned(), M3U.to_owned());
+        }
+        for url in [
+            "http://tuner/other.m3u",
+            "http://tuner/playlist.m3u",
+            "http://tuner/down.m3u",
+        ] {
+            mgr.save_tuner_host(save_tuner(url)).await.expect("tuner");
+        }
+        // Saving reads the playlist; it goes down afterwards.
+        fetcher.0.lock().unwrap().remove("http://tuner/down.m3u");
+
+        let opts = mgr
+            .get_channel_mapping_options(&provider_id)
+            .await
+            .expect("options");
+        // Sorted: the tuners come back in id order (gl-762), not as added.
+        let mut names: Vec<_> = opts
+            .tuner_channels
+            .iter()
+            .map(|c| c.name.as_deref().unwrap_or_default())
+            .collect();
+        names.sort_unstable();
+        assert_eq!(
+            names,
+            [
+                "1 Channel One",
+                "2 Channel Two",
+                "3 Channel Three",
+                "9 Channel Nine",
+                "9 Channel Nine"
+            ]
+        );
+
+        // `IsListingProviderEnabledForTuner` filters after the de-dup: a
+        // provider taking only the later of the two tuners on the same
+        // playlist gets none of its channels, which the earlier one listed.
+        let hosts = mgr.get_tuner_hosts().await.expect("hosts");
+        let tuner_id = |url: &str, nth: usize| {
+            hosts
+                .iter()
+                .filter(|h| h.url.as_deref() == Some(url))
+                .nth(nth)
+                .and_then(|h| h.id.clone())
+                .expect("tuner id")
+        };
+        for (enabled, expected) in [
+            (tuner_id("http://tuner/other.m3u", 0), 2),
+            (tuner_id("http://tuner/playlist.m3u", 1), 0),
+        ] {
+            let narrow = mgr
+                .save_listing_provider(
+                    as_xmltv(ListingsProviderInfo {
+                        path: Some("http://guide/xmltv.xml".to_owned()),
+                        enable_all_tuners: false,
+                        enabled_tuners: vec![enabled],
+                        ..ListingsProviderInfo::default()
+                    }),
+                    false,
+                    false,
+                )
+                .await
+                .expect("provider")
+                .id
+                .expect("provider id");
+            let opts = mgr
+                .get_channel_mapping_options(&narrow)
+                .await
+                .expect("options");
+            assert_eq!(opts.tuner_channels.len(), expected, "{opts:?}");
+        }
+
+        let three =
+            crate::mapping::m3u_channel_id("http://tuner/playlist.m3u", "http://tuner/three");
+        let row = mgr
+            .set_channel_mapping(&provider_id, &three, "one.tv")
+            .await
+            .expect("map the new channel");
+        assert_eq!(row.name.as_deref(), Some("3 Channel Three"));
+        assert_eq!(row.provider_channel_id.as_deref(), Some("one.tv"));
     }
 
     /// A [`SourceFetcher`] that counts its fetches and fails while no body is

@@ -18,6 +18,7 @@
 //! logic) carries its own tests. Filled by the Wave 4 PortJob.
 
 pub mod activity;
+pub mod backup;
 pub mod chapters;
 pub mod collections;
 pub mod configuration;

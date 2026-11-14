@@ -2566,6 +2566,13 @@ impl LocalProviderManager {
         let Some(stored) = items.retrieve_item(item_id).await? else {
             return Err(ServiceError::not_found(format!("item {item_id}")));
         };
+        // `if (refreshOptions.RemoveOldMetadata &&
+        // refreshOptions.ReplaceAllImages) ImageProvider.RemoveImages(item)`
+        // (`MetadataService.cs:112-118`): before every provider, whatever the
+        // lock or the modes.
+        let removed_images = options.remove_old_metadata
+            && options.replace_all_images
+            && self.remove_own_images(item_id).await?;
         // The item's `LockedFields`: the merge leaves them as stored.
         let locked_fields = self.stored_locked_fields(item_id).await;
         let stored_ids = if options.search_result.is_some() {
@@ -2881,6 +2888,10 @@ impl LocalProviderManager {
                     &row,
                     &merged.provider_ids,
                     plan.remote_images,
+                    options
+                        .search_result
+                        .as_ref()
+                        .and_then(|r| r.search_provider_name.as_deref()),
                 ),
             ))
             .await;
@@ -2905,7 +2916,8 @@ impl LocalProviderManager {
                     || ids_changed
                     || image_saved
                     || generated
-                    || local_images,
+                    || local_images
+                    || removed_images,
                 failed: failures > 0,
             },
         );
@@ -2984,7 +2996,7 @@ impl LocalProviderManager {
             || request.options.replace_all_metadata
         {
             ItemUpdateType::MetadataDownload
-        } else if image_saved || generated || local_images {
+        } else if image_saved || generated || local_images || removed_images {
             ItemUpdateType::ImageUpdate
         } else {
             ItemUpdateType::None
@@ -2993,6 +3005,25 @@ impl LocalProviderManager {
             self.save_metadata(item_id, update).await?;
         }
         Ok(update)
+    }
+
+    /// [`remove_images`](crate::local_images::remove_images) over the item's
+    /// stored images in its own metadata folders, the rows it removed saved
+    /// at once so the providers after it see them gone. Returns whether any
+    /// image was removed.
+    async fn remove_own_images(&self, item_id: Uuid) -> Result<bool, ServiceError> {
+        let (Some(store), Some(root)) = (&self.image_store, &self.metadata_dir) else {
+            return Ok(false);
+        };
+        let Some(mut images) = self.stored_images(item_id).await else {
+            return Ok(false);
+        };
+        let folders = crate::local_images::internal_metadata_dirs(&root.resolve(), item_id);
+        if !crate::local_images::remove_images(&mut images, &folders, &item_id.to_string()) {
+            return Ok(false);
+        }
+        store.save_item_images(item_id, &images).await?;
+        Ok(true)
     }
 
     /// `ImageProvider.ValidateImages` for a season with no folder of its own:
@@ -3057,13 +3088,15 @@ impl LocalProviderManager {
         Ok(true)
     }
 
-    /// Remote and dynamic image providers share one ordered acquisition pass.
+    /// Remote and dynamic image providers share one ordered acquisition pass,
+    /// an Identify's chosen provider (`identified_by`) first.
     async fn refresh_ordered_images(
         &self,
         item_id: Uuid,
         row: &BaseItemEntity,
         ids: &[(String, String)],
         fetch: ImageFetch,
+        identified_by: Option<&str>,
     ) -> Result<bool, ServiceError> {
         let kind = short_kind(row);
         let library = self.library_options_for(row).await;
@@ -3095,14 +3128,12 @@ impl LocalProviderManager {
             })
         });
         sources.sort_by_key(|(name, _)| {
-            (
-                crate::library_options::image_fetcher_rank(
-                    library.as_ref(),
-                    global.as_ref(),
-                    kind,
-                    name,
-                ),
-                crate::library_options::default_image_order(kind, name),
+            crate::library_options::image_provider_order(
+                library.as_ref(),
+                global.as_ref(),
+                kind,
+                name,
+                identified_by,
             )
         });
         let lookup = ferrofin_traits::providers::DynamicMetadataLookup {
@@ -3547,6 +3578,7 @@ const NO_FILE: FileFacts = FileFacts {
     is_shortcut: false,
     is_file_protocol: false,
     is_placeholder: false,
+    is_photo: false,
     path_rebased: false,
     locations_changed: false,
 };
@@ -5216,14 +5248,15 @@ impl ProviderManager for LocalProviderManager {
         //
         // The reference item decides the gate: `ItemId` set → the real row and
         // ITS library's `LibraryOptions` (its "Metadata downloaders"
-        // checkboxes decide which fetchers may run, and its `IsLocked` flag can
-        // shut them all out); `ItemId` empty → the C# builds a dummy
-        // `new TItemType()` under a fresh `new LibraryOptions()`, where every
-        // type entry is absent and therefore every fetcher enabled, so an
-        // unattached search stays unfiltered. `typeOptions` is keyed on
-        // `item.GetType().Name`, i.e. the REFERENCE item's type — which for the
-        // dummy is the searched-for kind, whose `BaseItemKind` name is the same
-        // PascalCase string the checkbox list stores.
+        // checkboxes decide which fetchers may run, and its `IsLocked` flag or
+        // its `ExtraType` can shut them all out); `ItemId` empty → the C#
+        // builds a dummy `new TItemType()` under a fresh `new
+        // LibraryOptions()`, where every type entry is absent and therefore
+        // every fetcher enabled, so an unattached search stays unfiltered.
+        // `typeOptions` is keyed on `item.GetType().Name`, i.e. the REFERENCE
+        // item's type — which for the dummy is the searched-for kind, whose
+        // `BaseItemKind` name is the same PascalCase string the checkbox list
+        // stores.
         let reference = match (&self.items, request.item_id) {
             (Some(items), id) if !id.is_nil() => items.retrieve_item(id).await?,
             _ => None,
@@ -5237,14 +5270,18 @@ impl ProviderManager for LocalProviderManager {
             None => format!("{:?}", request.item_kind),
         };
         // `CanRefreshMetadata` (`ProviderManager.cs:571`): `includeDisabled`
-        // short-circuits to true before the locked and fetcher tests, and a
-        // LOCKED reference item drops every non-local provider outright.
+        // short-circuits to true before the locked, extra and fetcher tests; a
+        // LOCKED reference item drops every non-local provider outright, and
+        // so does an extra (`ExtraType` set, `:602-605`), which has no identity
+        // of its own online — every search provider is a remote one.
         let locked = reference.as_ref().is_some_and(|e| e.is_locked);
+        let extra = reference.as_ref().is_some_and(|e| e.extra_type.is_some());
         let global = self.global_metadata_options_for(&kind);
         let channel = reference.as_ref().and_then(channel_gate);
         let can_refresh = |name: &str| {
             request.include_disabled_providers
                 || (!locked
+                    && !extra
                     && channel.unwrap_or_else(|| {
                         metadata_fetcher_enabled(library.as_ref(), global.as_ref(), &kind, name)
                     }))
@@ -10211,6 +10248,52 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn remote_search_refuses_an_extra() {
+        // v12.4 `CanRefreshMetadata`: an extra (`ExtraType` set) has no identity
+        // of its own online, so every remote provider is dropped for it.
+        let search = |extra_type: Option<i32>, include_disabled: bool| async move {
+            let library_id = Uuid::new_v4();
+            let item_id = Uuid::new_v4();
+            let mut trailer = row("Trailer", "Making Of");
+            trailer.id = item_id.to_string();
+            trailer.top_parent_id = Some(library_id.to_string());
+            trailer.owner_id = Some(Uuid::new_v4().to_string());
+            trailer.extra_type = extra_type;
+            let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+            let items = Arc::new(FakeItems {
+                rows: HashMap::from([(item_id, trailer)]),
+                seen: tx,
+            });
+            let libraries = Arc::new(FakeLibraries {
+                item_id: library_id,
+                options: ferrofin_model::configuration::LibraryOptions::default(),
+            });
+            let provider: Arc<dyn RemoteSearchProvider> = Arc::new(FakeProvider {
+                name: "The Open Movie Database".to_owned(),
+                kind: BaseItemKind::Trailer,
+                results: vec![result_with(
+                    "The Open Movie Database",
+                    &[("Imdb", "tt1")],
+                    None,
+                )],
+                fail: false,
+            });
+            let mgr = gated_manager(vec![provider], items, libraries);
+            let mut req = request(BaseItemKind::Trailer);
+            req.item_id = item_id;
+            req.include_disabled_providers = include_disabled;
+            mgr.remote_search(&req).await.expect("search").len()
+        };
+        // `ExtraType.Trailer` is 2.
+        assert_eq!(search(Some(2), false).await, 0);
+        // The same row as a plain item is searched…
+        assert_eq!(search(None, false).await, 1);
+        // …and `includeDisabled` is tested before the extra, as upstream
+        // orders it.
+        assert_eq!(search(Some(2), true).await, 1);
+    }
+
+    #[tokio::test]
     async fn remote_search_without_an_item_id_is_ungated() {
         // C# builds a dummy item under a fresh `new LibraryOptions()` when
         // `ItemId` is empty, so an unattached search sees nothing disabled —
@@ -12141,6 +12224,110 @@ mod tests {
         assert_eq!(restamped, stamped);
     }
 
+    /// gl-592: "Replace all metadata" with "Replace existing images" removes
+    /// the item's images in its own metadata folders before any provider runs
+    /// (`MetadataService.cs:112-118`, `ItemImageProvider.RemoveImages`): the
+    /// first image of each singular type and every backdrop, in Ferrofin's
+    /// and Jellyfin's layout, whatever the lock. A second Primary, a
+    /// screenshot and an image stored elsewhere stay; either option alone
+    /// removes nothing.
+    #[rstest::rstest]
+    #[case::replace_all(true, true, false, true)]
+    #[case::locked(true, true, true, true)]
+    #[case::metadata_only(true, false, false, false)]
+    #[case::images_only(false, true, false, false)]
+    #[tokio::test]
+    async fn replacing_all_metadata_and_images_removes_the_items_own_images(
+        #[case] remove_old_metadata: bool,
+        #[case] replace_all_images: bool,
+        #[case] is_locked: bool,
+        #[case] removed: bool,
+    ) {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let item_id = Uuid::new_v4();
+        let [ours, _, jellyfins] = crate::local_images::internal_metadata_dirs(tmp.path(), item_id);
+        let elsewhere = tmp.path().join("Genre").join("Crime");
+        let image = |dir: &std::path::Path, name: &str, image_type| {
+            std::fs::create_dir_all(dir).expect("dir");
+            let path = dir.join(name);
+            std::fs::write(&path, b"x").expect("write");
+            ItemImageInfo {
+                path: path.to_string_lossy().into_owned(),
+                image_type,
+                date_modified: chrono::Utc::now(),
+                width: 0,
+                height: 0,
+                blur_hash: None,
+            }
+        };
+        let poster = image(&jellyfins, "poster.jpg", ImageType::Primary);
+        let second = image(&ours, "primary1.jpg", ImageType::Primary);
+        let backdrop = image(&ours, "backdrop.jpg", ImageType::Backdrop);
+        let screenshot = image(&ours, "screenshot.jpg", ImageType::Screenshot);
+        let logo = image(&elsewhere, "logo.png", ImageType::Logo);
+        let all = [&poster, &second, &backdrop, &screenshot, &logo];
+        let mut stored = row("Genre", "Crime");
+        stored.id = item_id.to_string();
+        stored.is_locked = is_locked;
+        stored.date_last_refreshed = Some(chrono::Utc::now());
+        // Settled as the refresh settles it, so only the images change.
+        crate::metadata_merge::settle_sort_name(&mut stored);
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let store = Arc::new(RecordingStore::default());
+        store
+            .images
+            .lock()
+            .expect("lock")
+            .extend(all.iter().map(|image| (item_id, (*image).clone())));
+        let mgr = LocalProviderManager::default()
+            .with_remote_images(
+                Arc::new(crate::tmdb::TmdbClient::new()),
+                Arc::new(FakeItems {
+                    rows: HashMap::from([(item_id, stored)]),
+                    seen: tx,
+                }),
+            )
+            .with_image_store(Arc::clone(&store) as _, tmp.path().to_path_buf());
+        let options = Opts {
+            remove_old_metadata,
+            replace_all_images,
+            ..Opts::default()
+        };
+        let update = mgr
+            .refresh_single_item(item_id, &options)
+            .await
+            .expect("refresh");
+        // The removal is the refresh's only change: an image update, saved.
+        let (expected_update, saves) = if removed {
+            (ItemUpdateType::ImageUpdate, true)
+        } else {
+            (ItemUpdateType::None, false)
+        };
+        assert_eq!(update, expected_update);
+        assert_eq!(!store.saved.lock().expect("lock").is_empty(), saves);
+        let kept: Vec<ItemImageInfo> = store
+            .images
+            .lock()
+            .expect("lock")
+            .iter()
+            .map(|(_, image)| image.clone())
+            .collect();
+        let expected: Vec<ItemImageInfo> = if removed {
+            vec![second.clone(), screenshot.clone(), logo.clone()]
+        } else {
+            all.iter().map(|image| (*image).clone()).collect()
+        };
+        assert_eq!(kept, expected);
+        for image in all {
+            assert_eq!(
+                std::path::Path::new(&image.path).exists(),
+                expected.contains(image),
+                "{}",
+                image.path
+            );
+        }
+    }
+
     /// A season with no folder of its own (a virtual season) refreshes here,
     /// through its series' TMDB season, by the refresh decision and mode: a
     /// Default refresh of a season already refreshed asks nothing, "Search
@@ -13433,21 +13620,27 @@ mod tests {
                 .collect())
         }
     }
+    /// `identified_by` is an Identify → Apply's `SearchProviderName`: that
+    /// provider runs first (`GetNonLocalImageProviders`).
     #[rstest::rstest]
-    #[case::none(&[], &[], None)]
-    #[case::plugin_only(&["ArtworkPlugin"], &[], Some("plugin"))]
-    #[case::plugin_first(&["ArtworkPlugin", "TheMovieDb"], &["ArtworkPlugin", "TheMovieDb"], Some("plugin"))]
-    #[case::plugin_last(&["ArtworkPlugin", "TheMovieDb"], &["TheMovieDb", "ArtworkPlugin"], Some("tmdb"))]
-    #[case::plugin_default(&["ArtworkPlugin", "TheMovieDb"], &[], Some("tmdb"))]
-    #[case::fanart_only(&["FanArt"], &[], Some("fanart"))]
-    #[case::tmdb_only(&["TheMovieDb"], &[], Some("tmdb"))]
-    #[case::fanart_first(&["FanArt", "TheMovieDb"], &["FanArt", "TheMovieDb"], Some("fanart"))]
-    #[case::tmdb_first(&["FanArt", "TheMovieDb"], &["TheMovieDb", "FanArt"], Some("tmdb"))]
-    #[case::default_order(&["FanArt", "TheMovieDb"], &[], Some("tmdb"))]
+    #[case::none(&[], &[], None, None)]
+    #[case::plugin_only(&["ArtworkPlugin"], &[], None, Some("plugin"))]
+    #[case::plugin_first(&["ArtworkPlugin", "TheMovieDb"], &["ArtworkPlugin", "TheMovieDb"], None, Some("plugin"))]
+    #[case::plugin_last(&["ArtworkPlugin", "TheMovieDb"], &["TheMovieDb", "ArtworkPlugin"], None, Some("tmdb"))]
+    #[case::plugin_default(&["ArtworkPlugin", "TheMovieDb"], &[], None, Some("tmdb"))]
+    #[case::fanart_only(&["FanArt"], &[], None, Some("fanart"))]
+    #[case::tmdb_only(&["TheMovieDb"], &[], None, Some("tmdb"))]
+    #[case::fanart_first(&["FanArt", "TheMovieDb"], &["FanArt", "TheMovieDb"], None, Some("fanart"))]
+    #[case::tmdb_first(&["FanArt", "TheMovieDb"], &["TheMovieDb", "FanArt"], None, Some("tmdb"))]
+    #[case::default_order(&["FanArt", "TheMovieDb"], &[], None, Some("tmdb"))]
+    #[case::identified_tmdb(&["FanArt", "TheMovieDb"], &["FanArt", "TheMovieDb"], Some("themoviedb"), Some("tmdb"))]
+    #[case::identified_plugin(&["ArtworkPlugin", "TheMovieDb"], &["TheMovieDb", "ArtworkPlugin"], Some("ArtworkPlugin"), Some("plugin"))]
+    #[case::identified_disabled(&["FanArt"], &[], Some("TheMovieDb"), Some("fanart"))]
     #[tokio::test]
     async fn pathless_refresh_obeys_image_selection_and_order(
         #[case] enabled: &[&str],
         #[case] order: &[&str],
+        #[case] identified_by: Option<&str>,
         #[case] expected: Option<&str>,
     ) {
         use ferrofin_model::configuration::{LibraryOptions, TypeOptions};
@@ -13516,6 +13709,11 @@ mod tests {
                 metadata_refresh_mode: MetadataRefreshMode::None,
                 image_refresh_mode: MetadataRefreshMode::FullRefresh,
                 replace_all_images: true,
+                search_result: identified_by.map(|name| RemoteSearchResult {
+                    provider_ids: Some(HashMap::from([("Tmdb".to_owned(), "603".to_owned())])),
+                    search_provider_name: Some(name.to_owned()),
+                    ..Default::default()
+                }),
                 ..Default::default()
             },
         )
@@ -13648,13 +13846,19 @@ mod tests {
                 .collect();
             assert_eq!(bytes, [b"GIF89afirst".to_vec(), b"GIF89asecond".to_vec()]);
             assert!(
-                !mgr.refresh_ordered_images(item_id, &movie, &ids, super::ImageFetch::MissingOnly)
-                    .await
-                    .unwrap()
+                !mgr.refresh_ordered_images(
+                    item_id,
+                    &movie,
+                    &ids,
+                    super::ImageFetch::MissingOnly,
+                    None
+                )
+                .await
+                .unwrap()
             );
             assert_eq!(*store.images.lock().unwrap(), first);
             assert!(
-                mgr.refresh_ordered_images(item_id, &movie, &ids, super::ImageFetch::All)
+                mgr.refresh_ordered_images(item_id, &movie, &ids, super::ImageFetch::All, None)
                     .await
                     .unwrap()
             );

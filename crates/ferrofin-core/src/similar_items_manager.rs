@@ -34,11 +34,10 @@
 //! ones). An empty `Genres`/`Tags` pair is NOT a predicate there, so an untagged
 //! seed matches every other item of its kind — as it does in C#.
 //!
-//! Accepted divergences from C#: `IsFavoriteOrLiked` is approximated as
-//! favorite-only (as elsewhere in the query layer); and the weighted path
-//! breaks equal scores **deterministically**, by (`SortName`, `Id`), where C# keeps whatever
-//! dictionary order the candidates arrived in, so a client sees a stable answer.
-//! The flat path orders by `Random`, as C# does.
+//! The weighted path lists equal scores by item `Id`, which in practice is the
+//! order Jellyfin's unordered candidate query returns them in, so the final cut
+//! through a tie keeps the same items (owner decision 2026-10-24). The flat
+//! path orders by `Random`, as C# does.
 
 use ferrofin_util::directory_path::DirectoryPath;
 use std::collections::HashMap;
@@ -3082,10 +3081,8 @@ mod tests {
 
         // Without a user there is no watch state to filter on (C# skips the
         // predicate when `User` is null). Both share the seed's one genre, so
-        // the similarity scores tie and the sort name breaks it — alphabetical,
-        // as upstream, where `BaseItem.SortName` is never null. This assertion
-        // read `["Unplayed", "Played"]` while the column was NULL for both and
-        // the tie fell through to insertion order.
+        // the similarity scores tie and the item id breaks it: `Unplayed`
+        // (0x403) before `Played` (0x404), whatever their names.
         let anonymous = mgr
             .get_similar_items(seed, &[], None, &DtoOptions::default(), None)
             .await
@@ -3093,7 +3090,7 @@ mod tests {
             .expect("seed resolves");
         assert_eq!(
             names(&anonymous),
-            vec!["Played".to_owned(), "Unplayed".to_owned()]
+            vec!["Unplayed".to_owned(), "Played".to_owned()]
         );
     }
 
@@ -3213,7 +3210,7 @@ mod tests {
         let user_id = Uuid::parse_str(&user.id).expect("user id");
         let seed = Uuid::from_u128(0x432);
         seed_movie(&db, seed, "Seed", "SciFi").await;
-        // Four played rows outrank (by sort name) the two unplayed ones.
+        // Four played rows outrank (by id) the two unplayed ones.
         for (id, name) in [(0x440, "A"), (0x441, "B"), (0x442, "C"), (0x443, "D")] {
             let id = Uuid::from_u128(id);
             seed_movie(&db, id, name, "SciFi").await;
