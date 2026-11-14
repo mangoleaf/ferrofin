@@ -740,35 +740,6 @@ kind = "value"
 issue = 851
 reason = "The user root's ChildCount counts the playlists folder."
 
-# Equal similarity scores are ordered by SortName on Ferrofin; the owner decided to order them by id, as Jellyfin returns them.
-[[entry]]
-request = "GetSimilarItems"
-path = "Items[].Id"
-kind = "value"
-issue = 710
-reason = "Equal similarity scores are ordered by SortName on Ferrofin; the owner decided to order them by id, as Jellyfin returns them."
-
-[[entry]]
-request = "GetSimilarMovies"
-path = "Items[].Id"
-kind = "value"
-issue = 710
-reason = "Equal similarity scores are ordered by SortName on Ferrofin; the owner decided to order them by id, as Jellyfin returns them."
-
-[[entry]]
-request = "GetSimilarTrailers"
-path = "Items[].Id"
-kind = "value"
-issue = 710
-reason = "Equal similarity scores are ordered by SortName on Ferrofin; the owner decided to order them by id, as Jellyfin returns them."
-
-[[entry]]
-request = "screen-detail-similar"
-path = "Items[].Id"
-kind = "value"
-issue = 710
-reason = "Equal similarity scores are ordered by SortName on Ferrofin; the owner decided to order them by id, as Jellyfin returns them."
-
 # Ferrofin compiles in TheTVDB, FanArt and OpenSubtitles (documented scope), which stock Jellyfin lacks.
 [[entry]]
 request = "GetLibraryOptionsInfo"
@@ -1003,55 +974,13 @@ kind = "value"
 issue = 428
 reason = "A task's raw key stands in for its name: its Name differs from Jellyfin's display name."
 
-# The obsolete SystemInfo members are not upstream's constants, and PackageName is set.
-[[entry]]
-request = "GetPublicSystemInfo"
-path = "OperatingSystem"
-kind = "value"
-issue = 838
-reason = "The obsolete SystemInfo members are not upstream's constants, and PackageName is set."
-
-[[entry]]
-request = "GetSystemInfo"
-path = "CanSelfRestart"
-kind = "value"
-issue = 838
-reason = "The obsolete SystemInfo members are not upstream's constants, and PackageName is set."
-
-[[entry]]
-request = "GetSystemInfo"
-path = "EncoderLocation"
-kind = "missing"
-issue = 838
-reason = "The obsolete SystemInfo members are not upstream's constants, and PackageName is set."
-
-[[entry]]
-request = "GetSystemInfo"
-path = "OperatingSystem"
-kind = "value"
-issue = 838
-reason = "The obsolete SystemInfo members are not upstream's constants, and PackageName is set."
-
-[[entry]]
-request = "GetSystemInfo"
-path = "OperatingSystemDisplayName"
-kind = "missing"
-issue = 838
-reason = "The obsolete SystemInfo members are not upstream's constants, and PackageName is set."
-
+# PackageName is a constant where upstream reports the --package-name startup option, unset by default.
 [[entry]]
 request = "GetSystemInfo"
 path = "PackageName"
 kind = "extra"
-issue = 838
-reason = "The obsolete SystemInfo members are not upstream's constants, and PackageName is set."
-
-[[entry]]
-request = "GetSystemInfo"
-path = "SystemArchitecture"
-kind = "missing"
-issue = 838
-reason = "The obsolete SystemInfo members are not upstream's constants, and PackageName is set."
+issue = 1755
+reason = "PackageName is a constant where upstream reports the --package-name startup option, unset by default."
 
 # Each server writes its own FFmpeg logs, named and split by kind differently (gl-835).
 [[entry]]
