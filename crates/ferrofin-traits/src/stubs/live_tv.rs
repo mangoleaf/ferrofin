@@ -739,14 +739,15 @@ pub trait LiveTvManager: Send + Sync {
     ///
     /// The media-source manager needs it for the per-user
     /// `SupportsTranscoding`/`SupportsDirectStream` overwrite
-    /// (`MediaSourceManager.GetPlaybackMediaSources`, v10.11.8
-    /// Emby.Server.Implementations/Library/MediaSourceManager.cs:204-217),
+    /// (`MediaSourceManager.GetPlaybackMediaSources`, v12.4
+    /// Emby.Server.Implementations/Library/MediaSourceManager.cs:409-417),
     /// which branches on `item.MediaType`. Upstream reads it off the
     /// `LiveTvChannel`/recording `BaseItem` it already has in hand; Ferrofin's
     /// channels and recordings are not `BaseItems` rows, so the Live TV
     /// manager answers for them. `LiveTvChannel.MediaType` is
-    /// `ChannelType == Radio ? Audio : Video`, and a recording inherits the
-    /// media type of the channel it was captured from.
+    /// `ChannelType == Radio ? Audio : Video`, and a recording, a `.ts`
+    /// capture the library resolves as a video item, is `Video` whatever its
+    /// channel.
     ///
     /// The default reports `None`, which leaves the source exactly as the
     /// tuner built it — upstream's `user is null` behaviour.
