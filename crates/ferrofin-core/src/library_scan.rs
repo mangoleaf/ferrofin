@@ -23077,7 +23077,8 @@ fn is_path_less(item: &BaseItemEntity) -> bool {
 ///
 /// Planner-owned: `Path`, the parent/top-parent/owner links, the
 /// series/season links and names (a `Book`'s series name is a provider
-/// field, see [`ResolverGuesses`]), `IsFolder`, `IsInMixedFolder`,
+/// field, see [`ResolverGuesses`]), `IsFolder`, a season's `IsVirtualItem`
+/// (none the scan plans is virtual), `IsInMixedFolder`,
 /// `MediaType`, `IsMovie`, `ExtraType`, the series presentation key a child
 /// inherits, and `Data`'s `VideoType`, `AdditionalParts` and
 /// `LocalAlternateVersions`. `IsInMixedFolder` and the three `Data` fields
@@ -23114,6 +23115,14 @@ fn overlay_file_facts(row: &mut BaseItemEntity, scanned: &BaseItemEntity, probe_
     row.owner_id.clone_from(&scanned.owner_id);
     row.extra_type = scanned.extra_type;
     row.is_folder = scanned.is_folder;
+    if is_season(scanned) {
+        // A season the scan plans has a folder or real episode files, so it
+        // is no virtual season: `CreateSeasonsAsync` turns a virtual one with
+        // real episodes non-virtual (`SeriesMetadataService.cs:404-411`), and
+        // `SaveIsVirtualItem` one with a path (`SeasonMetadataService.cs:
+        // 105-114`) (gl-1593).
+        row.is_virtual_item = false;
+    }
     if !is_stacked_part(scanned) {
         row.is_in_mixed_folder = scanned.is_in_mixed_folder;
     }
@@ -31162,6 +31171,36 @@ mod tests {
         };
         super::overlay_file_facts(&mut row, &BaseItemEntity::default(), true);
         assert_eq!(row.normalization_gain, Some(-9.0));
+    }
+
+    /// A stored virtual season the scan plans (its number's episode files
+    /// appeared, or it has a folder) is no virtual season any more, as
+    /// `CreateSeasonsAsync` and `SaveIsVirtualItem` make it; a virtual
+    /// episode, which the scan never plans over, keeps its flag (gl-1593).
+    #[test]
+    fn a_planned_season_is_never_virtual() {
+        let kind_row = |kind: BaseItemKind| BaseItemEntity {
+            type_: crate::item_type_lookup::stored_type_name(kind)
+                .expect("type")
+                .to_owned(),
+            ..BaseItemEntity::default()
+        };
+        let mut stored = BaseItemEntity {
+            is_virtual_item: true,
+            ..kind_row(BaseItemKind::Season)
+        };
+        super::overlay_file_facts(&mut stored, &kind_row(BaseItemKind::Season), false);
+        assert!(!stored.is_virtual_item, "the planned season is real");
+
+        let mut episode = BaseItemEntity {
+            is_virtual_item: true,
+            ..kind_row(BaseItemKind::Episode)
+        };
+        super::overlay_file_facts(&mut episode, &kind_row(BaseItemKind::Episode), false);
+        assert!(
+            episode.is_virtual_item,
+            "only a season's flag is the planner's"
+        );
     }
 
     #[test]
