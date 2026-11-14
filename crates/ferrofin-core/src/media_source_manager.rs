@@ -26,7 +26,7 @@ use ferrofin_db::entities::base_items::{
 use ferrofin_model::dto::{MediaSourceInfo, MediaSourceType};
 use ferrofin_model::entities::MediaStreamType;
 use ferrofin_model::entities_media::{MediaAttachment, MediaStream};
-use ferrofin_model::media_info::{LiveStreamRequest, MediaProtocol};
+use ferrofin_model::media_info::{LiveStreamRequest, MediaProtocol, TransportStreamTimestamp};
 use uuid::Uuid;
 
 use ferrofin_traits::error::ServiceError;
@@ -254,6 +254,7 @@ impl FerrofinMediaSourceManager {
                 enable_path_substitution,
                 Some(user_id),
                 user,
+                true,
             )
             .await?;
         // `GetPlaybackMediaSources`: a `.strm` shortcut, or an item whose main
@@ -265,7 +266,14 @@ impl FerrofinMediaSourceManager {
         {
             probe(path).await?;
             sources = self
-                .get_static_media_sources(item_id, enable_path_substitution, Some(user_id))
+                .static_sources(
+                    item_id,
+                    None,
+                    enable_path_substitution,
+                    Some(user_id),
+                    None,
+                    true,
+                )
                 .await?;
         }
         // `preferredId`: the first static source's id when it is a `Guid` —
@@ -283,6 +291,8 @@ impl FerrofinMediaSourceManager {
     /// `GetStaticMediaSources(item, enablePathSubstitution, user)`: the trait's
     /// [`get_static_media_sources`](MediaSourceManager::get_static_media_sources), over the
     /// item's row and the user's row when the caller has read them already (`known`, `user`).
+    /// `read_timestamps` (PlaybackInfo only: nothing on the streaming, session or
+    /// DTO paths reads the value) reads each local TS/M2TS source's `Timestamp`.
     async fn static_sources(
         &self,
         item_id: Uuid,
@@ -290,6 +300,7 @@ impl FerrofinMediaSourceManager {
         enable_path_substitution: bool,
         user_id: Option<Uuid>,
         user: Option<&ferrofin_db::entities::users::UserEntity>,
+        read_timestamps: bool,
     ) -> Result<Vec<MediaSourceInfo>, ServiceError> {
         let read;
         let stored = if known.is_some() {
@@ -407,6 +418,10 @@ impl FerrofinMediaSourceManager {
             crate::video_versions::put_resumed_version_first(item, &mut sources, |id| {
                 data.get(&id)
             });
+        }
+        // Before path substitution rewrites the paths it reads.
+        if read_timestamps {
+            read_source_timestamps(item_id, &group, &mut sources).await;
         }
         if enable_path_substitution {
             self.substitute_paths(&mut sources).await?;
@@ -1318,6 +1333,46 @@ fn estimated_video_bitrate(width: i32) -> Option<i32> {
     }
 }
 
+/// `GetVersionInfo`'s `Timestamp = video.Timestamp`: upstream's probe sets it
+/// on the in-memory item and never persists it, so PlaybackInfo reads it from
+/// each local TS/M2TS source's file. The container is the probed one
+/// (`BaseItem.Container`), as upstream's guard sees it, else the extension.
+async fn read_source_timestamps(
+    item_id: Uuid,
+    group: &[(&BaseItemEntity, MediaSourceType)],
+    sources: &mut [MediaSourceInfo],
+) {
+    for source in sources {
+        let container = group
+            .iter()
+            .find(|(row, _)| row.path == source.path)
+            .and_then(|(row, _)| crate::item_data::stored_container(row.data.as_deref()))
+            .or_else(|| source.container.clone());
+        if TransportStreamTimestamp::applies_to(
+            source.video_type,
+            source.protocol,
+            container.as_deref(),
+        ) && let Some(path) = source.path.as_deref()
+        {
+            source.timestamp = read_mpeg_timestamp(item_id, path).await;
+        }
+    }
+}
+
+/// `ExtractTimestamp`'s read: `GetMpegTimestamp` over the file's first bytes.
+/// Any read failure, a file shorter than the header included (`ReadExactly`
+/// throws), leaves the timestamp null; it is logged at debug, since this runs
+/// per PlaybackInfo request and the playback itself reports a missing file.
+async fn read_mpeg_timestamp(item_id: Uuid, path: &str) -> Option<TransportStreamTimestamp> {
+    match ferrofin_util::file_helper::read_head(path).await {
+        Ok(packet) => Some(TransportStreamTimestamp::from_mpeg_header(&packet)),
+        Err(error) => {
+            tracing::debug!(%item_id, path, %error, "error extracting timestamp info");
+            None
+        }
+    }
+}
+
 /// The container of an item, derived from its stored path extension when present.
 fn container_of(item: &BaseItemEntity) -> Option<String> {
     item.path
@@ -1917,8 +1972,15 @@ impl MediaSourceManager for FerrofinMediaSourceManager {
         enable_path_substitution: bool,
         user_id: Option<Uuid>,
     ) -> Result<Vec<MediaSourceInfo>, ServiceError> {
-        self.static_sources(item_id, None, enable_path_substitution, user_id, None)
-            .await
+        self.static_sources(
+            item_id,
+            None,
+            enable_path_substitution,
+            user_id,
+            None,
+            false,
+        )
+        .await
     }
 
     async fn get_static_media_sources_for(
@@ -1929,8 +1991,15 @@ impl MediaSourceManager for FerrofinMediaSourceManager {
     ) -> Result<Vec<MediaSourceInfo>, ServiceError> {
         let item_id = Uuid::parse_str(&item.id)
             .map_err(|_| ServiceError::invalid_input("the item's id is not a GUID"))?;
-        self.static_sources(item_id, Some(item), enable_path_substitution, user_id, None)
-            .await
+        self.static_sources(
+            item_id,
+            Some(item),
+            enable_path_substitution,
+            user_id,
+            None,
+            false,
+        )
+        .await
     }
 
     async fn open_live_stream(
@@ -2557,6 +2626,81 @@ mod tests {
         entity.data = Some(data.to_owned());
         entity.media_type = Some("Video".to_owned());
         crate::test_support::save_item(db, &entity).await;
+    }
+
+    /// `BaseItem.GetVersionInfo` copies `Video.Timestamp`, which upstream's
+    /// probe (`ExtractTimestamp`) sets on the in-memory item and never
+    /// persists. PlaybackInfo reads it from a local TS/M2TS video's file, before
+    /// path substitution rewrites the path, judging the container by the probed
+    /// one when the item has it; a remote source (jellyfin/jellyfin#16290), a
+    /// missing file and the static sources the streaming paths read are never
+    /// given one.
+    #[tokio::test]
+    async fn playback_reports_a_local_m2ts_sources_transport_stream_timestamp() {
+        use ferrofin_model::media_info::TransportStreamTimestamp;
+        let db = test_db().await;
+        let tmp = tempfile::tempdir().expect("tmp");
+        let mut m2ts = vec![0u8; 197];
+        m2ts[..4].copy_from_slice(&[0, 0, 1, 2]);
+        m2ts[4] = 0x47;
+        m2ts[196] = 0x47;
+        let dir = tmp.path().to_string_lossy().into_owned();
+        for name in ["clip.m2ts", "clip.mkv", "camera.mts"] {
+            std::fs::write(tmp.path().join(name), &m2ts).expect("write clip");
+        }
+        let mgr = manager(&db).with_configuration(
+            crate::test_support::configuration_with_path_substitution(
+                tmp.path(),
+                &dir,
+                "//nas/lib",
+            )
+            .await,
+        );
+        let ids: Vec<Uuid> = (0x311..0x316).map(Uuid::from_u128).collect();
+        seed_strm(&db, ids[0], &format!("{dir}/clip.m2ts"), "{}").await;
+        seed_strm(&db, ids[1], &format!("{dir}/clip.mkv"), "{}").await;
+        // AVCHD: the extension is `mts`, the probed container `ts`.
+        seed_strm(
+            &db,
+            ids[2],
+            &format!("{dir}/camera.mts"),
+            r#"{"Container":"ts"}"#,
+        )
+        .await;
+        seed_strm(&db, ids[3], &format!("{dir}/gone.m2ts"), "{}").await;
+        seed_strm(
+            &db,
+            ids[4],
+            &format!("{dir}/remote.strm"),
+            r#"{"IsShortcut":true,"ShortcutPath":"https://origin/a.m2ts","Container":"m2ts"}"#,
+        )
+        .await;
+        let user = Uuid::from_u128(0x3FF);
+        let played = |id| {
+            let mgr = &mgr;
+            async move {
+                mgr.get_playback_media_sources(id, user, false, true)
+                    .await
+                    .expect("sources")
+                    .remove(0)
+            }
+        };
+
+        let m2ts = played(ids[0]).await;
+        assert_eq!(m2ts.path.as_deref(), Some("//nas/lib/clip.m2ts"));
+        assert_eq!(m2ts.timestamp, Some(TransportStreamTimestamp::Valid));
+        assert_eq!(
+            played(ids[2]).await.timestamp,
+            Some(TransportStreamTimestamp::Valid)
+        );
+        for id in [ids[1], ids[3], ids[4]] {
+            assert_eq!(played(id).await.timestamp, None, "{id}");
+        }
+        let streamed = mgr
+            .get_static_media_sources(ids[0], false, None)
+            .await
+            .expect("sources");
+        assert_eq!(streamed[0].timestamp, None);
     }
 
     /// `GetVersionInfo`'s `Path = enablePathSubstitution ? GetMappedPath(...)`

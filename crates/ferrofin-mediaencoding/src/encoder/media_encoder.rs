@@ -25,7 +25,7 @@ use ferrofin_model::drawing::{ImageFormat, ImageResolution};
 use ferrofin_model::dto::MediaSourceInfo;
 use ferrofin_model::entities::{IsoType, MediaStreamType, Video3DFormat};
 use ferrofin_model::entities_media::MediaStream;
-use ferrofin_model::media_info::{MediaInfo, MediaProtocol};
+use ferrofin_model::media_info::{MediaInfo, MediaProtocol, TransportStreamTimestamp};
 use ferrofin_traits::error::ServiceError;
 use ferrofin_traits::media_encoding::{MediaEncoder, MediaInfoRequest};
 
@@ -797,6 +797,17 @@ impl<T: Transcoder> MediaEncoder for MediaEncoderImpl<T> {
             input_file,
             source.protocol,
         );
+        // `ExtractTimestamp`, which the normalizer calls after `FetchWtvInfo`;
+        // the read is here so the normalizer stays free of file I/O.
+        if !request.media_is_audio
+            && TransportStreamTimestamp::applies_to(
+                info.media_source.video_type,
+                info.media_source.protocol,
+                info.media_source.container.as_deref(),
+            )
+        {
+            info.media_source.timestamp = read_mpeg_timestamp(input_file).await;
+        }
         // Carry the probed chapters on the source (internal-only field) so the
         // scan can persist them; they were requested via `extract_chapters`.
         info.media_source.chapters = info.chapters.clone();
@@ -1116,6 +1127,23 @@ impl<T: Transcoder> MediaEncoder for MediaEncoderImpl<T> {
     }
 }
 
+/// `ExtractTimestamp`'s read: `GetMpegTimestamp` over the file's first bytes.
+/// Any read failure, a file shorter than the header included (`ReadExactly`
+/// throws), is logged and leaves the timestamp null.
+async fn read_mpeg_timestamp(path: &str) -> Option<TransportStreamTimestamp> {
+    match ferrofin_util::file_helper::read_head(path).await {
+        Ok(packet) => {
+            let timestamp = TransportStreamTimestamp::from_mpeg_header(&packet);
+            tracing::debug!(path, ?timestamp, "video has a transport stream timestamp");
+            Some(timestamp)
+        }
+        Err(error) => {
+            tracing::error!(path, %error, "error extracting timestamp info");
+            None
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{FfmpegVersion, MIN_FFMPEG_JPEG_MATRIX_CONVERSION, ProcessOutput};
@@ -1126,7 +1154,8 @@ mod tests {
 
     use ferrofin_model::drawing::{ImageFormat, ImageResolution};
     use ferrofin_model::dto::MediaSourceInfo;
-    use ferrofin_model::media_info::MediaProtocol;
+    use ferrofin_model::entities::VideoType;
+    use ferrofin_model::media_info::{MediaProtocol, TransportStreamTimestamp};
     use ferrofin_traits::media_encoding::{MediaEncoder, MediaInfoRequest};
 
     use super::{
@@ -3047,6 +3076,108 @@ mod tests {
         async fn get_process_exit_code(&self, _path: &str, _arguments: &str) -> bool {
             true
         }
+    }
+
+    /// ffprobe's answer for one video stream in the given container.
+    struct ContainerProbeTranscoder(&'static str);
+
+    #[async_trait]
+    impl Transcoder for ContainerProbeTranscoder {
+        async fn get_process_output(
+            &self,
+            _path: &str,
+            _arguments: &str,
+            _read_stderr: bool,
+            _test_key: Option<&str>,
+            _env: &[(String, String)],
+        ) -> Result<ProcessOutput, String> {
+            Ok(ProcessOutput {
+                output: format!(
+                    r#"{{"streams":[{{"index":0,"codec_type":"video","codec_name":"h264"}}],
+                        "format":{{"format_name":"{}"}}}}"#,
+                    self.0
+                ),
+                success: true,
+            })
+        }
+
+        async fn get_process_exit_code(&self, _path: &str, _arguments: &str) -> bool {
+            true
+        }
+    }
+
+    /// The first 197 bytes of a file whose 192-byte packets start with
+    /// `prefix` (an M2TS timecode) and a TS sync byte; no prefix is plain TS.
+    fn ts_header(prefix: Option<[u8; 4]>) -> Vec<u8> {
+        let mut bytes = vec![0u8; 197];
+        match prefix {
+            Some(prefix) => {
+                bytes[..4].copy_from_slice(&prefix);
+                bytes[4] = 0x47;
+                bytes[196] = 0x47;
+            }
+            None => bytes[0] = 0x47,
+        }
+        bytes
+    }
+
+    /// `ProbeResultNormalizer.ExtractTimestamp` + `GetMpegTimestamp`: a local
+    /// TS/M2TS video file reports its `TransportStreamTimestamp`; a read
+    /// failure (a file shorter than 197 bytes) is null; anything but a local
+    /// `VideoFile` in `mpeg2ts`/`m2ts`/`ts` is never read (jellyfin/jellyfin#16290).
+    #[rstest]
+    #[case::plain_ts(
+        "mpegts",
+        MediaProtocol::File,
+        ts_header(None),
+        Some(TransportStreamTimestamp::None)
+    )]
+    #[case::m2ts_zero_timecode("mpegts", MediaProtocol::File, ts_header(Some([0; 4])), Some(TransportStreamTimestamp::Zero))]
+    #[case::m2ts_valid_timecode("mpegts", MediaProtocol::File, ts_header(Some([0, 0, 1, 2])), Some(TransportStreamTimestamp::Valid))]
+    #[case::not_ts_aligned("mpegts", MediaProtocol::File, vec![1u8; 197], Some(TransportStreamTimestamp::None))]
+    #[case::second_packet_unaligned("mpegts", MediaProtocol::File, { let mut h = ts_header(Some([0, 0, 1, 2])); h[196] = 0; h }, Some(TransportStreamTimestamp::None))]
+    #[case::short_file("mpegts", MediaProtocol::File, vec![0x47u8; 196], None)]
+    #[case::remote("mpegts", MediaProtocol::Http, ts_header(Some([0, 0, 1, 2])), None)]
+    #[case::other_container("matroska", MediaProtocol::File, ts_header(Some([0, 0, 1, 2])), None)]
+    #[tokio::test]
+    async fn probe_reports_the_mpeg_ts_timestamp(
+        #[case] format_name: &'static str,
+        #[case] protocol: MediaProtocol,
+        #[case] header: Vec<u8>,
+        #[case] expected: Option<TransportStreamTimestamp>,
+    ) {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("clip.m2ts");
+        std::fs::write(&path, &header).expect("write clip");
+        let enc = MediaEncoderImpl::new(
+            Arc::new(ContainerProbeTranscoder(format_name)),
+            "/usr/bin/ffmpeg",
+            "/usr/bin/ffprobe",
+            MediaEncoderConfig::default(),
+        );
+        let request = MediaInfoRequest {
+            media_source: MediaSourceInfo {
+                path: Some(path.to_string_lossy().into_owned()),
+                protocol,
+                video_type: Some(VideoType::VideoFile),
+                ..MediaSourceInfo::default()
+            },
+            extract_chapters: false,
+            media_is_audio: false,
+        };
+        let source = enc.get_media_info(&request).await.expect("probe parses");
+        assert_eq!(source.timestamp, expected);
+
+        // The other two guards: a Blu-ray folder and an audio probe are never
+        // read.
+        let mut request = request;
+        request.media_source.video_type = Some(VideoType::BluRay);
+        let source = enc.get_media_info(&request).await.expect("probe parses");
+        assert_eq!(source.timestamp, None);
+        request.media_source.video_type = Some(VideoType::VideoFile);
+        request.media_is_audio = true;
+        let source = enc.get_media_info(&request).await.expect("probe parses");
+        assert_eq!(source.timestamp, None);
     }
 
     /// The server localization seam, knowing only `eng`.

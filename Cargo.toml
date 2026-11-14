@@ -99,7 +99,7 @@ httpdate = "1.0.3"
 # a response it just encoded), gzipped Live TV guides (ferrofin-livetv), and a
 # PDF's compressed cross-reference and object streams (ferrofin-providers books).
 flate2 = "1.1.11"
-zip = { version = "9", default-features = false, features = ["deflate"] }   # .cbz/.epub archives (ferrofin-providers books); backup archives (ferrofin-api, which adds `time`)
+zip = { version = "9", default-features = false, features = ["deflate"] }   # .cbz/.epub archives (ferrofin-providers books); backup archives (ferrofin-core, which adds `time`)
 tar = { version = "0.4.46", default-features = false }   # .cbt comic covers (ferrofin-providers books); read-only, so no `xattr`
 sevenz-rust2 = { version = "0.25.0", default-features = false, features = ["bzip2", "deflate", "ppmd"] }   # .cb7 comic covers (ferrofin-providers books)
 brotli = "9.1.1"

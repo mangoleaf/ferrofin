@@ -85,6 +85,47 @@ pub enum TransportStreamTimestamp {
     Unrecognized(i32),
 }
 
+impl TransportStreamTimestamp {
+    /// How many bytes [`from_mpeg_header`](Self::from_mpeg_header) reads:
+    /// `GetMpegTimestamp`'s buffer, through offset 196, the sync byte of the
+    /// second 192-byte M2TS packet (a 4-byte timecode and a 188-byte TS packet).
+    pub const MPEG_HEADER_LEN: usize = 197;
+
+    /// `ProbeResultNormalizer.GetMpegTimestamp` over a file's first
+    /// [`MPEG_HEADER_LEN`](Self::MPEG_HEADER_LEN) bytes: plain TS (a sync
+    /// byte first) and anything without M2TS-aligned sync bytes is `None`; an
+    /// M2TS whose first timecode is zero is `Zero`; any other M2TS is `Valid`.
+    #[must_use]
+    pub fn from_mpeg_header(packet: &[u8; Self::MPEG_HEADER_LEN]) -> Self {
+        const SYNC: u8 = 0x47;
+        if packet[0] == SYNC || packet[4] != SYNC || packet[196] != SYNC {
+            Self::None
+        } else if packet[..4] == [0; 4] {
+            Self::Zero
+        } else {
+            Self::Valid
+        }
+    }
+
+    /// `ProbeResultNormalizer.ExtractTimestamp`'s guards: only a local
+    /// (`MediaProtocol.File`, jellyfin/jellyfin#16290) `VideoFile` in an
+    /// `mpeg2ts`, `m2ts` or `ts` container is read.
+    #[must_use]
+    pub fn applies_to(
+        video_type: Option<crate::entities::VideoType>,
+        protocol: MediaProtocol,
+        container: Option<&str>,
+    ) -> bool {
+        video_type == Some(crate::entities::VideoType::VideoFile)
+            && protocol == MediaProtocol::File
+            && container.is_some_and(|c| {
+                ["mpeg2ts", "m2ts", "ts"]
+                    .iter()
+                    .any(|ts| c.eq_ignore_ascii_case(ts))
+            })
+    }
+}
+
 crate::json::enums::wire_enum! {
     TransportStreamTimestamp, None, {
         None => ("None", 0),
@@ -443,6 +484,97 @@ mod tests {
         assert_eq!(
             serde_json::to_string(&MediaProtocol::Http).unwrap(),
             "\"Http\""
+        );
+    }
+
+    /// `ProbeResultNormalizer.GetMpegTimestamp` and `ExtractTimestamp`'s guards.
+    #[rstest::rstest]
+    #[case::plain_ts(0x47, 0x47, 0x47, TransportStreamTimestamp::None)]
+    #[case::first_packet_unaligned(1, 0, 0x47, TransportStreamTimestamp::None)]
+    #[case::second_packet_unaligned(1, 0x47, 0, TransportStreamTimestamp::None)]
+    #[case::zero_timecode(0, 0x47, 0x47, TransportStreamTimestamp::Zero)]
+    #[case::valid_timecode(1, 0x47, 0x47, TransportStreamTimestamp::Valid)]
+    fn mpeg_header_classifies_like_get_mpeg_timestamp(
+        #[case] first: u8,
+        #[case] fifth: u8,
+        #[case] last: u8,
+        #[case] expected: TransportStreamTimestamp,
+    ) {
+        let mut packet = [0u8; TransportStreamTimestamp::MPEG_HEADER_LEN];
+        packet[0] = first;
+        packet[4] = fifth;
+        packet[196] = last;
+        assert_eq!(
+            TransportStreamTimestamp::from_mpeg_header(&packet),
+            expected
+        );
+    }
+
+    #[rstest::rstest]
+    #[case(
+        Some(crate::entities::VideoType::VideoFile),
+        MediaProtocol::File,
+        Some("mpeg2ts"),
+        true
+    )]
+    #[case(
+        Some(crate::entities::VideoType::VideoFile),
+        MediaProtocol::File,
+        Some("M2TS"),
+        true
+    )]
+    #[case(
+        Some(crate::entities::VideoType::VideoFile),
+        MediaProtocol::File,
+        Some("ts"),
+        true
+    )]
+    #[case(
+        Some(crate::entities::VideoType::VideoFile),
+        MediaProtocol::File,
+        Some("mkv"),
+        false
+    )]
+    #[case(
+        Some(crate::entities::VideoType::VideoFile),
+        MediaProtocol::File,
+        None,
+        false
+    )]
+    #[case(
+        Some(crate::entities::VideoType::BluRay),
+        MediaProtocol::File,
+        Some("ts"),
+        false
+    )]
+    #[case(None, MediaProtocol::File, Some("ts"), false)]
+    #[case(
+        Some(crate::entities::VideoType::VideoFile),
+        MediaProtocol::Http,
+        Some("ts"),
+        false
+    )]
+    #[case(
+        Some(crate::entities::VideoType::VideoFile),
+        MediaProtocol::Rtsp,
+        Some("ts"),
+        false
+    )]
+    #[case(
+        Some(crate::entities::VideoType::VideoFile),
+        MediaProtocol::Udp,
+        Some("ts"),
+        false
+    )]
+    fn the_timestamp_is_read_only_for_a_local_ts_video_file(
+        #[case] video_type: Option<crate::entities::VideoType>,
+        #[case] protocol: MediaProtocol,
+        #[case] container: Option<&str>,
+        #[case] expected: bool,
+    ) {
+        assert_eq!(
+            TransportStreamTimestamp::applies_to(video_type, protocol, container),
+            expected
         );
     }
 
