@@ -1418,11 +1418,20 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
                    download of a remote image: ferrofin-providers image_download.rs \
                    open_image (guarded_http.rs GuardedHttp::send, which follows and vets each \
                    redirect; destination.rs ImageDestinations), provider_manager.rs \
-                   cached_remote_image, compared with \
+                   cached_remote_image, and the scan's downloads of a credited person's \
+                   profile photo and a studio's thumb (ferrofin-core library_scan.rs \
+                   download_images and studio_thumb, named from the resolved type through \
+                   tmdb.rs TmdbClient::download and studios.rs StudiosClient::download), \
+                   compared with \
                    MediaBrowser.Providers/Manager/ProviderManager.cs (SaveImage), \
+                   MediaBrowser.Providers/Manager/ItemImageProvider.cs (EnableImageStub, \
+                   SaveImageStub: a Person and a Studio are IItemByName, so their remote \
+                   images reach SaveImage through a stub), \
+                   MediaBrowser.Providers/Manager/ImageSaver.cs (GetStandardSavePath), \
                    Jellyfin.Server/Startup.cs (the NamedClient.Default handler) and \
-                   Emby.Server.Implementations/Library/LibraryManager.cs (ConvertImageToLocal)",
-        date: "2026-11-13",
+                   Emby.Server.Implementations/Library/LibraryManager.cs (UpdateImagesAsync, \
+                   ConvertImageToLocal)",
+        date: "2026-11-14",
         divergences: &[
             "Decoding and resizing run under limits upstream does not have (owner decision \
              2026-10-31, gl-1097), the settings image_decode_max_megapixels, \
@@ -1443,6 +1452,11 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
              first file stored for a URL or an item stays there. The formats are listed in \
              image_download.rs is_image, with SVG and tvheadend's untyped /imagecache/ URLs \
              allowed.",
+            "A person's profile photo or a studio's thumb that the scan downloads is named \
+             from its type only when that is JPEG, PNG, WebP or GIF, the formats the scan's \
+             art-folder readers know (library_scan.rs ART_FILE_EXTENSIONS), and any other \
+             image is stored as .jpg. ImageSaver.GetStandardSavePath names every type from \
+             MimeTypes.ToExtension and throws for one it has no extension for.",
             "A remote image download refuses loopback, private, link-local, CGNAT and reserved \
              addresses, on its first request and on every redirect it follows (owner decision \
              2026-10-31, gl-1096), unless image_private_http_allow lists the host, its address \

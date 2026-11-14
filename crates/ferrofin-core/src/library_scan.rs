@@ -781,8 +781,9 @@ fn episode_in_season(
     details.episodes.iter().find(|e| e.episode_number == number)
 }
 
-/// Downloads each [`RemoteImage`] into `item_dir` (as `{type}.jpg`) and returns
-/// the persisted-image rows.
+/// Downloads each [`RemoteImage`] into `item_dir` (as `{type}` plus the
+/// extension of the type the response resolved to, as upstream's `ImageSaver`
+/// names it) and returns the persisted-image rows.
 ///
 /// Idempotent per file: an image already on disk is referenced without a
 /// re-download. Individual download/write failures are skipped (best-effort); a
@@ -806,10 +807,10 @@ async fn download_images(
         let dest = if let Some(existing) = existing_art_file(item_dir, stem) {
             existing
         } else {
-            let dest = item_dir.join(format!("{stem}.jpg"));
-            let Some(bytes) = tmdb.download(&image.url).await else {
+            let Some((bytes, content_type)) = tmdb.download(&image.url).await else {
                 continue;
             };
+            let dest = item_dir.join(format!("{stem}{}", art_extension(&content_type)));
             if let Err(err) =
                 off_runtime(|| ferrofin_util::file_helper::atomic_write_media(&dest, &bytes))
             {
@@ -1243,6 +1244,15 @@ fn store_extracted_art(
     stored.map(|()| dest)
 }
 
+/// The file extension, with its dot, for a downloaded image of `content_type`
+/// (`MimeTypes.ToExtension`) when the art-dir readers know it
+/// ([`ART_FILE_EXTENSIONS`]), `.jpg` otherwise.
+fn art_extension(content_type: &str) -> &'static str {
+    ferrofin_model::net::mime_types::to_extension(content_type)
+        .filter(|ext| ART_FILE_EXTENSIONS.contains(&ext.trim_start_matches('.')))
+        .unwrap_or(".jpg")
+}
+
 fn existing_art_file(dir: &Path, stem: &str) -> Option<PathBuf> {
     ART_FILE_EXTENSIONS
         .iter()
@@ -1284,15 +1294,15 @@ async fn studio_thumb(
     let Some(url) = url else {
         return StudioThumb::Answered;
     };
-    let (bytes, failures) = count_request_failures(studios.download(&url)).await;
-    let Some(bytes) = bytes else {
+    let (download, failures) = count_request_failures(studios.download(&url)).await;
+    let Some((bytes, content_type)) = download else {
         return if failures == 0 {
             StudioThumb::Answered
         } else {
             StudioThumb::Failed(None)
         };
     };
-    let dest = dir.join(format!("{stem}.jpg"));
+    let dest = dir.join(format!("{stem}{}", art_extension(&content_type)));
     match off_runtime(|| ferrofin_util::file_helper::atomic_write_media(&dest, &bytes)) {
         Ok(()) => StudioThumb::Found(dest),
         Err(err) => StudioThumb::Failed(Some(ServiceError::backend(format!(
@@ -24679,6 +24689,8 @@ mod trickplay;
 mod art_dir_images_tests;
 #[cfg(test)]
 mod directory_cache_tests;
+#[cfg(test)]
+mod downloaded_art_tests;
 #[cfg(test)]
 mod episode_images_tests;
 #[cfg(test)]
