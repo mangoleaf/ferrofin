@@ -2212,12 +2212,13 @@ fn user_view_uses_direct_items(view_type: Option<ferrofin_model::data::Collectio
 /// Re-roots a BoxSet/Playlist-typed browse onto the user root (port of
 /// `ItemsController.GetItems`'s `linkedChildAncestorIds` block): from a normal
 /// library parent with a linked-child-ancestor constraint, from the Playlists
-/// view without one (its collection type is the target's own).
+/// view or the `boxsets` library without one (its collection type is the
+/// target's own).
 ///
 /// Applies only when the request is for exactly `[BoxSet]` or `[Playlist]`,
-/// a parent is set, and that parent is neither itself a box set/playlist (nor,
-/// for a playlist browse, the playlists folder) nor the matching `boxsets`
-/// library. A re-rooted query takes the user root's folder policy. Best-effort:
+/// a parent is set, and that parent is not itself a box set/playlist (nor,
+/// for a playlist browse, the playlists folder). A re-rooted query takes the
+/// user root's folder policy. Best-effort:
 /// an unresolvable parent leaves the query untouched (the plain parent scoping
 /// then returns empty, as before).
 async fn redirect_container_browse(
@@ -2266,25 +2267,11 @@ async fn redirect_container_browse(
         reroot_to_user_root(internal);
         return;
     }
-    // A browse of the boxsets/playlists library itself keeps plain parent
-    // scoping (C# `itemCollectionType != targetCollectionType`).
-    let parent_collection_type =
-        state
-            .virtual_folders
-            .library_folders()
-            .await
-            .ok()
-            .and_then(|folders| {
-                folders
-                    .iter()
-                    .find(|vf| {
-                        vf.item_id
-                            .as_deref()
-                            .is_some_and(|id| id.eq_ignore_ascii_case(&parent.id))
-                    })
-                    .and_then(|vf| vf.collection_type)
-            });
-    if target_collection_type.is_some() && parent_collection_type == target_collection_type {
+    // The boxsets library's collection type is the target's own too
+    // (C# `itemCollectionType != targetCollectionType` is false), so a box-set
+    // browse of it re-roots with no linked-ancestor constraint.
+    if target_collection_type.is_some() && library_is_boxsets(&parent) == Some(true) {
+        reroot_to_user_root(internal);
         return;
     }
     internal.linked_child_ancestor_ids = vec![internal.parent_id];
