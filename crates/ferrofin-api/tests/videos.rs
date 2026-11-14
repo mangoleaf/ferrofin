@@ -211,6 +211,8 @@ struct StreamSources {
     /// Whether the item's own source is still being written
     /// (`IsInfiniteStream`).
     infinite: bool,
+    /// The item's own source's probed container, if any.
+    container: Option<String>,
 }
 
 impl StreamSources {
@@ -290,6 +292,7 @@ impl MediaSourceManager for StreamSources {
             encoder_protocol: self.encoder.as_ref().map(|_| MediaProtocol::Http),
             encoder_path: self.encoder.clone(),
             is_infinite_stream: self.infinite,
+            container: self.container.clone(),
             ..static_source(&self.path)
         }];
         if let Some(alternate) = &self.alternate {
@@ -1103,21 +1106,26 @@ async fn a_static_stream_of_a_growing_file_follows_the_file() {
 
 /// `StreamingHelpers.GetStreamingState`: a request for a file still being
 /// written that names no container is typed `ts`, whatever the file's own
-/// extension; a finished file keeps its own type. A `HEAD` answers the same
-/// headers and no body.
+/// extension or the source's container; a finished file is typed by its
+/// source's container, and with none by its own path. A `HEAD` answers the
+/// same headers and no body.
 #[rstest::rstest]
-#[case::growing("GET", true, "video/mp2t")]
-#[case::growing_head("HEAD", true, "video/mp2t")]
-#[case::finished("GET", false, "video/x-matroska")]
+#[case::growing("GET", true, None, "video/mp2t")]
+#[case::growing_head("HEAD", true, None, "video/mp2t")]
+#[case::growing_with_container("GET", true, Some("mkv"), "video/mp2t")]
+#[case::finished("GET", false, None, "video/x-matroska")]
+#[case::finished_with_container("GET", false, Some("avi"), "video/x-msvideo")]
 #[tokio::test]
 async fn a_static_stream_naming_no_container_is_typed_by_its_source(
     #[case] method: &str,
     #[case] infinite: bool,
+    #[case] container: Option<&str>,
     #[case] content_type: &str,
 ) {
     let file = TempMedia::new(b"some bytes");
     let sources = StreamSources {
         infinite,
+        container: container.map(ToOwned::to_owned),
         ..StreamSources::at(&file.path)
     };
     let router = create_router(
@@ -1154,6 +1162,132 @@ async fn a_static_stream_naming_no_container_is_typed_by_its_source(
         .unwrap();
         assert!(body.is_empty(), "{body:?}");
     }
+}
+
+/// `VideosController.GetVideoStream` / `AudioHelper.GetAudioStream`: a static
+/// file is typed by the request's output container, `GetMimeType("." +
+/// OutputContainer, false) ?? GetMimeType(MediaPath)`, never by the file's own
+/// extension (here `.mkv`), on a `206` as on the whole file. The container is
+/// the route's, else the `Container` query, else `ts` for an open live stream,
+/// else the source's probed one (universal audio names none); a container with
+/// no type of its own falls back to the path's, and a path the ported table
+/// does not know (`.aiff`) keeps the type guessed from it.
+#[rstest::rstest]
+#[case::route("GET", "/Videos/{id}/stream.mp4?static=true", None, "mkv", "video/mp4")]
+#[case::route_head(
+    "HEAD",
+    "/Videos/{id}/stream.mp4?static=true",
+    None,
+    "mkv",
+    "video/mp4"
+)]
+#[case::route_range(
+    "RANGE",
+    "/Videos/{id}/stream.mp4?static=true",
+    None,
+    "mkv",
+    "video/mp4"
+)]
+#[case::query(
+    "GET",
+    "/Videos/{id}/stream?static=true&container=webm",
+    None,
+    "mkv",
+    "video/webm"
+)]
+#[case::source(
+    "GET",
+    "/Videos/{id}/stream?static=true",
+    Some("avi"),
+    "mkv",
+    "video/x-msvideo"
+)]
+#[case::live(
+    "GET",
+    "/Videos/{id}/stream?static=true&liveStreamId=prov_service_live-1",
+    None,
+    "mkv",
+    "video/mp2t"
+)]
+#[case::universal(
+    "GET",
+    "/Audio/{id}/universal?deviceId=d1",
+    Some("mp3"),
+    "mkv",
+    "audio/mpeg"
+)]
+#[case::untyped_source(
+    "GET",
+    "/Videos/{id}/stream?static=true",
+    Some("mov,mp4,m4a"),
+    "mkv",
+    "video/x-matroska"
+)]
+#[case::untyped_route(
+    "GET",
+    "/Videos/{id}/stream.zzz?static=true",
+    None,
+    "mkv",
+    "video/x-matroska"
+)]
+#[case::untyped_path(
+    "GET",
+    "/Audio/{id}/stream.zzz?static=true",
+    None,
+    "aiff",
+    "audio/aiff"
+)]
+#[tokio::test]
+async fn a_static_stream_is_typed_by_its_output_container(
+    #[case] method: &str,
+    #[case] route: &str,
+    #[case] container: Option<&str>,
+    #[case] extension: &str,
+    #[case] content_type: &str,
+) {
+    let mut path = std::env::temp_dir();
+    path.push(format!(
+        "ferrofin-videos-{}-movie.{extension}",
+        Uuid::new_v4()
+    ));
+    std::fs::write(&path, b"some bytes").expect("write temp media");
+    let file = TempMedia {
+        path: path.to_string_lossy().into_owned(),
+    };
+    let sources = StreamSources {
+        container: container.map(ToOwned::to_owned),
+        live: Some(file.path.clone()),
+        ..StreamSources::at(&file.path)
+    };
+    let router = create_router(
+        state_with(
+            sources,
+            no_subtitles(),
+            false,
+            Arc::new(ferrofin_api::test_support::FakeDto),
+        )
+        .app,
+    );
+    let uri = route.replace("{id}", &ITEM_ID.to_string());
+    let (request, status) = if method == "RANGE" {
+        let mut request = authed("GET", &uri);
+        request
+            .headers_mut()
+            .insert(header::RANGE, "bytes=0-3".parse().unwrap());
+        (request, StatusCode::PARTIAL_CONTENT)
+    } else {
+        (authed(method, &uri), StatusCode::OK)
+    };
+    let response = router.oneshot(request).await.unwrap();
+    assert_eq!(response.status(), status, "{uri}");
+    assert_eq!(
+        response
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok()),
+        Some(content_type),
+        "{uri}"
+    );
 }
 
 /// `StreamingHelpers.GetStreamingState`: a `LiveStreamId` wins over the

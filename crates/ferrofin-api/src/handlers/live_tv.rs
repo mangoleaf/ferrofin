@@ -2837,6 +2837,7 @@ mod tests {
             is_live_stream: true,
             is_infinite_stream: false,
             user_agent: None,
+            container: None,
         };
 
         let response = serve_static_source(
