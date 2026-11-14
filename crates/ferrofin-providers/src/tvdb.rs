@@ -476,6 +476,8 @@ struct CharacterWire {
 #[derive(Debug, Deserialize)]
 struct ArtworkWire {
     image: Option<String>,
+    /// The preview `CreateRemoteImageInfo` returns as `ThumbnailUrl`.
+    thumbnail: Option<String>,
     #[serde(rename = "type")]
     type_: Option<i64>,
     language: Option<String>,
@@ -746,7 +748,7 @@ impl TvdbClient {
             api_key
         };
         Self {
-            http: reqwest::Client::new(),
+            http: crate::http_client::client(),
             limiter: RateLimiter::new("tvdb"),
             api_key: SecretString::from(key.to_owned()),
             pin: (!pin.is_empty()).then(|| pin.to_owned()),
@@ -1212,6 +1214,7 @@ impl TvdbClient {
                     Some(TmdbImage {
                         image_type,
                         url: art.image?,
+                        thumbnail_url: art.thumbnail,
                         width: Some(art.width.unwrap_or(0)),
                         height: Some(art.height.unwrap_or(0)),
                         language: art.language,
@@ -1419,6 +1422,7 @@ fn map_series(tvdb_id: i64, wire: SeriesExtendedWire, country_code: &str) -> Tvd
             Some(TmdbImage {
                 image_type,
                 url,
+                thumbnail_url: a.thumbnail,
                 language: a.language.filter(|l| !l.is_empty() && l != "null"),
                 community_rating: a.score,
                 width: a.width,
@@ -1632,7 +1636,7 @@ mod tests {
                 { "personName": "David Benioff", "peopleType": "Writer" }
               ],
               "artworks": [
-                { "image": "/poster.jpg", "type": 2, "language": "eng", "score": 9.0, "width": 680, "height": 1000 },
+                { "image": "/poster.jpg", "thumbnail": "/poster_t.jpg", "type": 2, "language": "eng", "score": 9.0, "width": 680, "height": 1000 },
                 { "image": "/bg.jpg", "type": 3, "language": null, "score": 5.0 },
                 { "image": "/unknown.jpg", "type": 999 }
               ]
@@ -1705,6 +1709,9 @@ mod tests {
         assert_eq!(d.images[0].language.as_deref(), Some("eng"));
         assert_eq!(d.images[1].image_type, ImageType::Backdrop);
         assert_eq!(d.images[1].language, None);
+        // The artwork's thumbnail is its preview (`CreateRemoteImageInfo`).
+        assert_eq!(d.images[0].thumbnail_url.as_deref(), Some("/poster_t.jpg"));
+        assert_eq!(d.images[1].thumbnail_url, None);
     }
 
     #[test]
@@ -2127,7 +2134,7 @@ mod tests {
             ("/artwork/types", r#"{"data":[{"id":71,"name":"Poster","recordType":"season"},{"id":72,"name":"Poster","recordType":"series"}]}"#.to_owned()),
             ("/series/5/extended", r#"{"data":{"seasons":[{"id":51,"number":1,"type":{"type":"dvd"}},{"id":52,"number":1,"type":{"type":"official"}}]}}"#.to_owned()),
             ("/seasons/51/extended", format!(r#"{{"data":{{"artwork":{alternate}}}}}"#)),
-            ("/seasons/52/extended", r#"{"data":{"artwork":[{"type":71,"image":"poster.jpg","language":"fre","width":800},{"type":72,"image":"wrong.jpg"}]}}"#.to_owned()),
+            ("/seasons/52/extended", r#"{"data":{"artwork":[{"type":71,"image":"poster.jpg","thumbnail":"poster_t.jpg","language":"fre","width":800},{"type":72,"image":"wrong.jpg"}]}}"#.to_owned()),
         ]).await;
         let client = TvdbClient::new().with_base_url(&server.base_url);
         let images = client.season_images(5, order, 1).await;
@@ -2136,6 +2143,7 @@ mod tests {
             assert_eq!(images[0].image_type, ImageType::Primary);
             assert_eq!(images[0].url, "poster.jpg");
             assert_eq!((images[0].width, images[0].height), (Some(800), Some(0)));
+            assert_eq!(images[0].thumbnail_url.as_deref(), Some("poster_t.jpg"));
         }
         assert!(client.artwork_types.lock().unwrap().is_some());
         let season_images = client.season_images(5, "official", 99).await;

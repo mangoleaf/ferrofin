@@ -183,7 +183,7 @@ support for every 10.11.x or 12.x release.
 > `root/default/` holds the library definitions and `metadata/` the images. On first start
 > Ferrofin imports the supported settings from `system.xml`, `encoding.xml`, `branding.xml`
 > and `network.xml` into JSON, once; omitting `network.xml` discards remote-access
-> restrictions and IP filters. Verify the imported settings and investigate import
+> restrictions, IP filters, the base URL and the listening ports. Verify the imported settings and investigate import
 > warnings before exposing the server. Jellyfin .NET plugins are not copied and need
 > Ferrofin-compatible replacements.
 >

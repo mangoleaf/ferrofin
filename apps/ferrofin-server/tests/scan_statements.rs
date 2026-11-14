@@ -406,20 +406,20 @@ async fn an_episode_reads_neither_the_library_listing_nor_its_row_twice() {
     // written, so the people pass ran.
     //
     // An episode's cast is written a few statements at a time, not one or
-    // more per guest (gl-1181): each read (the name match, the clean-name
-    // match, the biographies) is one statement up to 256 people, and each
-    // insert (the new `Peoples` rows, the new `Person` items, the credits) one
-    // per power-of-two run of its rows. With two guests, each step is one.
+    // more per guest (gl-1181): each read (the name match, the person items
+    // by derived id, then, for the guests with none, the same person under
+    // another id, and the biographies) is one statement up to 256 binds,
+    // and each insert (the new `Peoples` rows, the new `Person` items, the
+    // credits) one per power-of-two run of its rows. With two new guests,
+    // each step is one.
     for (step, prefix) in [
         (
             "name match",
             r#"SELECT "Id", "Name", "PersonType" FROM "Peoples""#,
         ),
         ("new people", r#"INSERT INTO "Peoples""#),
-        (
-            "clean-name match",
-            r#"SELECT "CleanName", "Id" FROM "BaseItems""#,
-        ),
+        ("person items by id", PERSON_ITEMS_BY_ID),
+        ("same-person match", SAME_PERSON_MATCH),
         ("biographies", r#"SELECT "Id", "Overview" FROM "BaseItems""#),
         (
             "new person items",
@@ -485,10 +485,18 @@ async fn an_episode_reads_neither_the_library_listing_nor_its_row_twice() {
     a_rescanned_episode_reads_its_cast_in_batches(&rescans);
 }
 
+/// The read of a cast's `Person` items by the ids their names derive (gl-1079).
+const PERSON_ITEMS_BY_ID: &str = r#"SELECT "Id" FROM "BaseItems" WHERE +"Type" = ?1 AND "Id" IN ("#;
+
+/// The read of the rows sharing a clean name with the names no derived id
+/// found: the same person under another id (gl-1079).
+const SAME_PERSON_MATCH: &str = r#"SELECT "CleanName", "Name", "Id" FROM "BaseItems""#;
+
 /// A re-scan finds every episode's cast unchanged (gl-443) and writes none of
 /// it. The people it hands the biography fetch are read a few statements at a
-/// time too (gl-1194), not two per guest: the clean-name match and the
-/// biographies, each one statement up to 256 people.
+/// time too (gl-1194), not two per guest: their items by derived id and the
+/// biographies, each one statement up to 256 binds; every guest has an item
+/// at its id by then, so the same-person match is never read.
 fn a_rescanned_episode_reads_its_cast_in_batches(rescans: &PerEpisode) {
     let relisting = rescans.listing();
     println!(
@@ -496,10 +504,7 @@ fn a_rescanned_episode_reads_its_cast_in_batches(rescans: &PerEpisode) {
         rescans.total_per_episode()
     );
     for (step, prefix) in [
-        (
-            "clean-name match",
-            r#"SELECT "CleanName", "Id" FROM "BaseItems""#,
-        ),
+        ("person items by id", PERSON_ITEMS_BY_ID),
         ("biographies", r#"SELECT "Id", "Overview" FROM "BaseItems""#),
     ] {
         assert_eq!(
@@ -508,22 +513,16 @@ fn a_rescanned_episode_reads_its_cast_in_batches(rescans: &PerEpisode) {
             "a re-scanned episode's {step} is one statement:\n{relisting}"
         );
     }
-    for (step, statement) in [
-        (
-            "clean-name match",
-            r#"SELECT "Id" FROM "BaseItems" WHERE "Type" = ?1 AND "CleanName" = ?2 ORDER BY "SortName", "Id" LIMIT 1"#,
-        ),
-        (
-            "biography",
-            r#"SELECT "Overview" FROM "BaseItems" WHERE "Id" = ?1"#,
-        ),
-    ] {
-        assert_eq!(
-            rescans.more(|s| s == statement),
-            0,
-            "a re-scanned episode reads no guest's {step} alone:\n{relisting}"
-        );
-    }
+    assert_eq!(
+        rescans.more(|s| s.starts_with(SAME_PERSON_MATCH)),
+        0,
+        "a re-scanned episode's guests are all found by id:\n{relisting}"
+    );
+    assert_eq!(
+        rescans.more(|s| s == r#"SELECT "Overview" FROM "BaseItems" WHERE "Id" = ?1"#),
+        0,
+        "a re-scanned episode reads no guest's biography alone:\n{relisting}"
+    );
     for (step, prefix) in [
         ("credit rewrite", r#"DELETE FROM "PeopleBaseItemMap""#),
         ("credits", r#"INSERT INTO "PeopleBaseItemMap""#),

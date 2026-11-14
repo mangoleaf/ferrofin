@@ -541,10 +541,11 @@ async fn on_playback_stopped_for_user(
     on_playback_stopped(state, auth, Path(DotnetGuid(item_id)), query).await
 }
 
-/// Kills the live transcode job(s) for a stopping playback session — matched by
-/// its `playSessionId` when present, else everything on the caller's device —
-/// deleting their partial files (C# `PlaystateController` →
-/// `_transcodeManager.KillTranscodingJobs(deviceId, playSessionId, _ => true)`).
+/// Kills the live transcode job(s) of a stopping playback session, matched by
+/// its `playSessionId`, deleting their partial files (C# `PlaystateController`
+/// → `_transcodeManager.KillTranscodingJobs(deviceId, playSessionId, _ => true)`).
+/// A stop with no play session id, or a blank one, kills nothing, as upstream
+/// calls it only `if (!string.IsNullOrWhiteSpace(PlaySessionId))`.
 ///
 /// Best-effort: a stop report must still record playstate even if the kill
 /// dispatch fails, so the error is logged, not returned.
@@ -553,8 +554,11 @@ async fn kill_session_transcodes(
     auth: &ferrofin_traits::options::AuthorizationInfo,
     play_session_id: Option<&str>,
 ) {
+    let Some(play_session_id) = play_session_id.filter(|id| !id.trim().is_empty()) else {
+        return;
+    };
     let request = ferrofin_traits::media_encoding::HlsStreamRequest {
-        play_session_id: play_session_id.map(str::to_owned),
+        play_session_id: Some(play_session_id.to_owned()),
         device_id: auth.device_id.clone(),
         ..Default::default()
     };

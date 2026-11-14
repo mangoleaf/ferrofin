@@ -178,6 +178,8 @@ pub(super) fn sample(spec: &SettingSpec) -> String {
         "bind_addr" => "\"127.0.0.2\"".to_owned(),
         "log_level" => "\"debug\"".to_owned(),
         "wasm_private_http_allow" => "\"*\"".to_owned(),
+        "ffmpeg_analyze_duration" => "\"8M\"".to_owned(),
+        "ffmpeg_probe_size" => "\"32M\"".to_owned(),
         _ => match spec.kind {
             // The value that is not the default, so setting it changes something.
             SettingKind::Bool => (spec.default != "true").to_string(),
@@ -220,6 +222,7 @@ fn report(config: &Config, env: &FakeEnv) -> ServerSettingsDto {
         config,
         env,
         &ServerConfiguration::default(),
+        &NetworkConfiguration::default(),
         false,
     )
     .expect("snapshot")
@@ -315,6 +318,7 @@ const TABS: &[(Group, &[&str])] = &[
             "scan_progress_every",
             "scan_directory_cache_records",
             "scan_directory_cache_idle_secs",
+            "book_archive_max_entries",
         ],
     ),
     (
@@ -363,6 +367,8 @@ const TABS: &[(Group, &[&str])] = &[
             "row_cache_ttl_secs",
             "max_transcodes",
             "max_transcodes_per_user",
+            "ffmpeg_analyze_duration",
+            "ffmpeg_probe_size",
             "playback_metrics_queue",
             "session_idle_hours",
         ],
@@ -796,6 +802,136 @@ fn each_source_is_reported_and_only_file_and_default_values_are_editable() {
     assert_eq!(report.settings.len(), SETTINGS.len());
 }
 
+/// gl-554: the Networking page's ports outrank `config.toml`, and a flag or a
+/// variable outranks them; each row reports the port the server listens on.
+#[test]
+fn the_networking_page_ports_outrank_the_file_but_not_a_flag_or_variable() {
+    let data = DataDir::new(&["port = 5000\nhttps_port = 5443".to_owned()]);
+    let page = NetworkConfiguration {
+        internal_http_port: 8097,
+        internal_https_port: 8921,
+        ..NetworkConfiguration::default()
+    };
+    let rows = |cli: Cli, env: &FakeEnv, network: &NetworkConfiguration| {
+        let running = load(cli, env);
+        let report = snapshot(
+            SETTINGS,
+            &running,
+            env,
+            &ServerConfiguration::default(),
+            network,
+            false,
+        )
+        .expect("report");
+        let (http, https) = crate::listen::ports(&running, network);
+        let rows = (
+            entry(&report, "port").clone(),
+            entry(&report, "https_port").clone(),
+        );
+        assert_eq!(rows.0.value, Some(json!(http)), "{rows:?}");
+        assert_eq!(rows.1.value, Some(json!(https)), "{rows:?}");
+        rows
+    };
+
+    let (http, https) = rows(data.cli(), &FakeEnv::new(), &page);
+    assert_eq!(
+        (http.source, http.value, http.saved_value),
+        (
+            Source::NetworkConfiguration,
+            Some(json!(8097)),
+            Some(json!(5000))
+        )
+    );
+    assert_eq!(
+        (https.source, https.value),
+        (Source::NetworkConfiguration, Some(json!(8921)))
+    );
+
+    let (http, _) = rows(
+        data.cli(),
+        &FakeEnv::new(),
+        &NetworkConfiguration::default(),
+    );
+    assert_eq!(
+        (http.source, http.value),
+        (Source::ConfigFile, Some(json!(5000)))
+    );
+
+    let flag = Cli {
+        port: Some(7000),
+        ..data.cli()
+    };
+    let (http, _) = rows(flag, &FakeEnv::new(), &page);
+    assert_eq!((http.source, http.value), (Source::Flag, Some(json!(7000))));
+    let variable = FakeEnv::new().with("FERROFIN_HTTPS_PORT", "7443");
+    let (_, https) = rows(data.cli(), &variable, &page);
+    assert_eq!(
+        (https.source, https.value),
+        (Source::Environment, Some(json!(7443)))
+    );
+}
+
+/// gl-555: the Networking page's base URL outranks `config.toml`, and the
+/// variable outranks it; the row reports the base URL the server serves under.
+#[test]
+fn the_networking_page_base_url_outranks_the_file_but_not_the_variable() {
+    let data = DataDir::new(&["base_url = \"/file\"".to_owned()]);
+    let page = NetworkConfiguration {
+        base_url: "/page/".to_owned(),
+        ..NetworkConfiguration::default()
+    };
+    let row = |env: &FakeEnv, network: &NetworkConfiguration| {
+        let running = load(data.cli(), env);
+        let report = snapshot(
+            SETTINGS,
+            &running,
+            env,
+            &ServerConfiguration::default(),
+            network,
+            false,
+        )
+        .expect("report");
+        let row = entry(&report, "base_url").clone();
+        let served =
+            crate::base_url::resolve(&running.base_url, running.base_url_from_env, network);
+        assert_eq!(row.value, Some(json!(served)), "{row:?}");
+        row
+    };
+
+    let from_page = row(&FakeEnv::new(), &page);
+    assert_eq!(from_page.source, Source::NetworkConfiguration);
+    assert_eq!(from_page.value, Some(json!("/page")));
+    assert_eq!(from_page.saved_value, Some(json!("/file")), "not in use");
+    assert!(!from_page.editable);
+
+    let from_file = row(&FakeEnv::new(), &NetworkConfiguration::default());
+    assert_eq!(from_file.source, Source::ConfigFile);
+    assert_eq!(from_file.value, Some(json!("/file")));
+
+    let from_variable = row(&FakeEnv::new().with("FERROFIN_BASE_URL", "/env"), &page);
+    assert_eq!(from_variable.source, Source::Environment);
+    assert_eq!(from_variable.value, Some(json!("/env")));
+
+    // The common install: no base_url in config.toml at all.
+    let no_file = DataDir::new(&[]);
+    let running = load(no_file.cli(), &FakeEnv::new());
+    let report = snapshot(
+        SETTINGS,
+        &running,
+        &FakeEnv::new(),
+        &ServerConfiguration::default(),
+        &page,
+        false,
+    )
+    .expect("report");
+    let page_alone = entry(&report, "base_url");
+    assert_eq!(page_alone.source, Source::NetworkConfiguration);
+    let served = crate::base_url::resolve(&running.base_url, running.base_url_from_env, &page);
+    assert_eq!(page_alone.value, Some(json!(served)));
+    assert_eq!(served, "/page");
+    assert_eq!(page_alone.saved_value, None);
+}
+
 #[test]
 fn a_flag_locks_an_editable_setting_and_names_itself() {
     let row = SettingSpec {
@@ -874,18 +1010,14 @@ fn read_only_settings_carry_their_note_whatever_sets_them() {
             "published_url",
             "Dashboard → Networking → Published server URIs",
         ),
-        // D2a: until the Networking page drives them.
+        ("base_url", "Dashboard → Networking → Base URL sets it"),
         (
             "port",
-            "Set it with the port key in config.toml, the FERROFIN_PORT",
+            "Dashboard → Networking → Local HTTP port number sets it",
         ),
         (
             "https_port",
-            "Set it with the https_port key in config.toml or the FERROFIN_HTTPS_PORT",
-        ),
-        (
-            "base_url",
-            "Set it with the base_url key in config.toml or the FERROFIN_BASE_URL",
+            "Dashboard → Networking → Local HTTPS port number sets it",
         ),
     ];
     for (key, note) in notes {
@@ -1078,6 +1210,7 @@ fn a_config_file_that_no_longer_loads_is_a_conflict_naming_it() {
         &running,
         &env,
         &ServerConfiguration::default(),
+        &NetworkConfiguration::default(),
         false,
     )
     .expect_err("refused");
@@ -1115,6 +1248,7 @@ fn a_config_file_that_no_longer_loads_quotes_no_secret() {
             &running,
             &env,
             &ServerConfiguration::default(),
+            &NetworkConfiguration::default(),
             false,
         )
         .expect_err("refused");
@@ -1194,6 +1328,28 @@ fn the_item_values_write_chunk_row_shows_the_library_default() {
         spec("item_values_write_chunk").default,
         ferrofin_core::library_manager::DEFAULT_ITEM_VALUES_WRITE_CHUNK.to_string()
     );
+}
+
+/// The ffmpeg input-analysis rows show Jellyfin's defaults as the encoder
+/// prints them, and their notes the encoder's ranges (gl-734).
+#[test]
+fn the_ffmpeg_input_analysis_rows_show_the_encoders_defaults_and_ranges() {
+    use ferrofin_mediaencoding::encoder::media_encoder::{
+        ANALYZE_DURATION_RANGE, DEFAULT_ANALYZE_DURATION, DEFAULT_PROBE_SIZE, PROBE_SIZE_RANGE,
+    };
+    for (key, default, range) in [
+        (
+            "ffmpeg_analyze_duration",
+            DEFAULT_ANALYZE_DURATION,
+            ANALYZE_DURATION_RANGE,
+        ),
+        ("ffmpeg_probe_size", DEFAULT_PROBE_SIZE, PROBE_SIZE_RANGE),
+    ] {
+        let row = spec(key);
+        assert_eq!(row.default, default.to_string(), "{key}");
+        let range = format!("{} to {}", range.start(), range.end());
+        assert!(row.note.contains(&range), "{key}: {range} in {}", row.note);
+    }
 }
 
 // ---- choices, notes and the server configuration (gl-1174) -----------------
@@ -1324,7 +1480,15 @@ fn stored_row(key: &str, trickplay: TrickplayOptions) -> ServerSettingDto {
         trickplay_options: trickplay,
         ..ServerConfiguration::default()
     };
-    let report = snapshot(SETTINGS, &running, &env, &configuration, false).expect("report");
+    let report = snapshot(
+        SETTINGS,
+        &running,
+        &env,
+        &configuration,
+        &NetworkConfiguration::default(),
+        false,
+    )
+    .expect("report");
     entry(&report, key).clone()
 }
 

@@ -185,13 +185,15 @@ pub trait SubtitleIo: Send + Sync {
     ) -> Option<String>;
 
     /// Runs an ffmpeg subtitle extraction/conversion, writing `output_paths`.
-    /// Port of `RunSubtitleExtractionProcess`.
+    /// Port of `RunSubtitleExtractionProcess`, which also returns what ffmpeg
+    /// wrote to stderr: for a caller that finds an output empty, the end of
+    /// it (empty when ffmpeg wrote nothing).
     ///
     /// # Errors
     ///
-    /// Returns an error message on ffmpeg failure, or when `args` does not
-    /// split into argv (unbalanced quoting).
-    async fn extract(&self, args: &str, output_paths: &[String]) -> Result<(), String>;
+    /// Returns an error message, ending with that stderr, on ffmpeg failure,
+    /// or when `args` does not split into argv (unbalanced quoting).
+    async fn extract(&self, args: &str, output_paths: &[String]) -> Result<String, String>;
 
     /// Whether a cached subtitle file already exists at `path`. Port of the
     /// `File.Exists` skip in `ExtractAllExtractableSubtitles` — without it every
@@ -943,13 +945,14 @@ impl<P: SubtitleParser, I: SubtitleIo> SubtitleEncoder<P, I> {
     ///
     /// Port of `SubtitleEncoder.ExtractSubtitlesForFile`: on ffmpeg failure,
     /// every output is deleted; on success, each output is checked individually
-    /// — missing/empty ones are deleted, successful `.ass` outputs get the
-    /// [`set_ass_font`](Self::set_ass_font) fix-up.
+    /// — missing/empty ones are logged with ffmpeg's stderr and deleted,
+    /// successful `.ass` outputs get the [`set_ass_font`](Self::set_ass_font)
+    /// fix-up.
     async fn validate_extraction(
         &self,
         source_path: &str,
         output_paths: &[String],
-        result: Result<(), String>,
+        result: Result<String, String>,
     ) {
         // A `.strm` source's path is its target URL, which can carry an account.
         let source_path = ferrofin_util::source_url::redact_url(source_path);
@@ -966,9 +969,10 @@ impl<P: SubtitleParser, I: SubtitleIo> SubtitleEncoder<P, I> {
                 }
                 tracing::error!(path = %source_path, %error, "ffmpeg subtitle extraction failed");
             }
-            Ok(()) => {
+            Ok(stderr) => {
                 // Check each output individually — ffmpeg may exit 0 yet
                 // still fail to produce some outputs.
+                let mut failed = false;
                 for path in output_paths {
                     match self.io.file_size(path) {
                         Some(size) if size > 0 => {
@@ -981,6 +985,7 @@ impl<P: SubtitleParser, I: SubtitleIo> SubtitleEncoder<P, I> {
                             );
                         }
                         _ => {
+                            failed = true;
                             tracing::error!(
                                 input = %source_path, output = %path,
                                 "ffmpeg subtitle extraction failed"
@@ -991,6 +996,10 @@ impl<P: SubtitleParser, I: SubtitleIo> SubtitleEncoder<P, I> {
                             }
                         }
                     }
+                }
+                // Once per run, after the outputs, as upstream logs `{FfmpegOutput}`.
+                if failed && !stderr.is_empty() {
+                    tracing::error!(input = %source_path, %stderr, "ffmpeg subtitle extraction failed");
                 }
             }
         }
@@ -1045,7 +1054,8 @@ impl<P: SubtitleParser, I: SubtitleIo> SubtitleEncoder<P, I> {
             quote(&input_path),
             quote(output_path)
         );
-        self.io
+        let stderr = self
+            .io
             .extract(&args, std::slice::from_ref(&output_path.to_owned()))
             .await?;
 
@@ -1059,9 +1069,12 @@ impl<P: SubtitleParser, I: SubtitleIo> SubtitleEncoder<P, I> {
             }
             _ => {
                 let _ = self.io.delete_file(output_path);
-                Err(MediaEncodingError::Process(format!(
-                    "ffmpeg subtitle conversion produced no output for {output_path}"
-                )))
+                let mut message =
+                    format!("ffmpeg subtitle conversion produced no output for {output_path}");
+                if !stderr.is_empty() {
+                    let _ = write!(message, ": {stderr}");
+                }
+                Err(MediaEncodingError::Process(message))
             }
         }
     }
@@ -1174,7 +1187,7 @@ impl SubtitleIo for NoopSubtitleIo {
         None
     }
 
-    async fn extract(&self, _args: &str, _output_paths: &[String]) -> Result<(), String> {
+    async fn extract(&self, _args: &str, _output_paths: &[String]) -> Result<String, String> {
         Err("no subtitle I/O configured".to_owned())
     }
 }
@@ -1227,9 +1240,9 @@ enum DetectedCharset {
 
 /// Detects the character set of `bytes`, replacing C# `UtfUnknown.CharsetDetector`.
 ///
-/// A UTF-8/UTF-16 BOM or valid-UTF-8 content short-circuits to UTF-8; otherwise
-/// [`chardetng`] guesses the legacy encoding. UTF-16 (with BOM) decodes through
-/// `encoding_rs` so wide files round-trip.
+/// A UTF-8/UTF-16 BOM or valid-UTF-8 content without an ESC byte short-circuits
+/// to UTF-8; otherwise [`chardetng`] guesses the encoding, ISO-2022-JP first.
+/// UTF-16 (with BOM) decodes through `encoding_rs` so wide files round-trip.
 fn detect_charset(bytes: &[u8]) -> DetectedCharset {
     if bytes.starts_with(&[0xEF, 0xBB, 0xBF]) {
         return DetectedCharset::Utf8OrAscii;
@@ -1248,12 +1261,15 @@ fn detect_charset(bytes: &[u8]) -> DetectedCharset {
     if let Some(encoding) = detect_bomless_utf16(bytes) {
         return DetectedCharset::Other(encoding);
     }
-    if std::str::from_utf8(bytes).is_ok() {
+    // 7-bit ISO-2022-JP is valid UTF-8 too, and `UtfUnknown`'s escape prober
+    // finds it first: an ESC, which starts its designations, leaves the choice
+    // to chardetng. It answers ISO-2022-JP only for ASCII that decodes as it,
+    // and UTF-8 for any other valid UTF-8. TODO(gl-1657): the prober's other
+    // 7-bit encodings, ISO-2022-KR and HZ-GB-2312, are not detected yet.
+    if !bytes.contains(&0x1B) && std::str::from_utf8(bytes).is_ok() {
         return DetectedCharset::Utf8OrAscii;
     }
 
-    // `Allow` keeps chardetng's pre-1.0 candidate set. It is inert today: 7-bit
-    // ISO-2022-JP is valid UTF-8, so the check above already served it.
     let mut detector = chardetng::EncodingDetector::new(chardetng::Iso2022JpDetection::Allow);
     detector.feed(bytes, true);
     let encoding = detector.guess(None, chardetng::Utf8Detection::Allow);

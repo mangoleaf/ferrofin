@@ -31,14 +31,14 @@ use ferrofin_model::dto::ItemCounts;
 use ferrofin_model::entities::ImageType;
 use ferrofin_model::entities::MediaStreamType;
 use ferrofin_model::querying::{QueryFiltersLegacy, QueryResult};
-use ferrofin_traits::options::ItemImageInfo;
+use ferrofin_traits::options::{ItemImageInfo, live_tv_image_is_internal};
 use uuid::Uuid;
 
 use ferrofin_traits::error::ServiceError;
 use ferrofin_traits::options::{DescendantQueryRoots, InternalItemsQuery};
 use ferrofin_traits::persistence::{
     FolderChild, ItemRepository, ItemTypeLookup, ItemWithCounts, ParentalRestrictions,
-    PlaylistAccessColumns, PlaylistItemsWithAccess,
+    PlaylistAccessColumns, PlaylistItemsWithAccess, PlaylistMembers,
 };
 
 use crate::aggregate_folder::RootFolderIds;
@@ -127,6 +127,9 @@ pub struct FerrofinItemRepository {
 }
 
 /// What the files Live TV is recording right now are, asked when needed.
+///
+/// Live TV reads its timers from the reader pool to answer, so never await it
+/// while holding a pool connection or transaction.
 pub type ActiveRecordingSource = Arc<
     dyn Fn() -> std::pin::Pin<
             Box<dyn std::future::Future<Output = Result<Vec<String>, ServiceError>> + Send>,
@@ -855,6 +858,20 @@ impl FerrofinItemRepository {
     ) -> Result<HashMap<String, ferrofin_db::entities::playback::UserDataEntity>, ServiceError>
     {
         use ferrofin_db::entities::playback::UserDataEntity;
+        // `Video.SourceType` is `LiveTV` while its file is being recorded, which
+        // takes the item out of the channel arm below. Asked only when a video
+        // could be keyed by its channel, and before the reader below is taken:
+        // Live TV reads its timers from the same pool.
+        let active = if rows.iter().any(|row| {
+            row.external_id.as_ref().is_some_and(|id| !id.is_empty())
+                && row.channel_id.is_some()
+                && row.path.is_some()
+                && crate::item_type_lookup::kind_from_type_name(&row.type_).is_some_and(is_video)
+        }) {
+            self.active_recording_paths().await?
+        } else {
+            std::collections::HashSet::new()
+        };
         let ids: Vec<_> = rows.iter().map(|row| row.id.clone()).collect();
         let mut connection = self.db.pool().acquire().await.map_err(db_err)?;
         let keys: HashMap<_, _> =
@@ -878,19 +895,6 @@ impl FerrofinItemRepository {
                 .or_default()
                 .push(candidate);
         }
-        // `Video.SourceType` is `LiveTV` while its file is being recorded, which
-        // takes the item out of the channel arm below. Asked only when a video
-        // could be keyed by its channel.
-        let active = if rows.iter().any(|row| {
-            row.external_id.as_ref().is_some_and(|id| !id.is_empty())
-                && row.channel_id.is_some()
-                && row.path.is_some()
-                && crate::item_type_lookup::kind_from_type_name(&row.type_).is_some_and(is_video)
-        }) {
-            self.active_recording_paths().await?
-        } else {
-            std::collections::HashSet::new()
-        };
         let mut selected = HashMap::new();
         for row in rows {
             let Some(candidates) = by_item.remove(&row.id) else {
@@ -2836,31 +2840,6 @@ const PLAYLIST_ITEMS_SQL: &str = r#"SELECT ch.*,
    WHERE lc."ParentId" = ?1 AND lc."ChildType" = ?3
    ORDER BY lc."SortOrder""#;
 
-/// One row of [`PLAYLIST_ITEMS_SQL`]: a member's `BaseItems` row plus the three
-/// access columns (identical on every row of a given playlist).
-struct PlaylistItemRow {
-    /// The member item row.
-    item: BaseItemEntity,
-    /// `FerrofinPlaylists.OwnerUserId` (NULL for a legacy playlist, an older
-    /// build's user-less API-key create, or a `Data` naming no owner).
-    owner: Option<String>,
-    /// `FerrofinPlaylists.OpenAccess` (NULL only when the meta row is absent).
-    open_access: Option<i64>,
-    /// The caller's `FerrofinPlaylistShares.CanEdit` (NULL when not shared).
-    can_edit: Option<i64>,
-}
-
-impl<'r> FromRow<'r, sqlx::sqlite::SqliteRow> for PlaylistItemRow {
-    fn from_row(row: &'r sqlx::sqlite::SqliteRow) -> Result<Self, sqlx::Error> {
-        Ok(Self {
-            item: BaseItemEntity::from_row(row)?,
-            owner: row.try_get("PlaylistOwnerUserId")?,
-            open_access: row.try_get("PlaylistOpenAccess")?,
-            can_edit: row.try_get("PlaylistShareCanEdit")?,
-        })
-    }
-}
-
 /// Appends the caller's name filters against the by-name `bi` row (C#
 /// `TranslateQuery`'s name predicates on the outer query).
 ///
@@ -4328,16 +4307,29 @@ impl ItemRepository for FerrofinItemRepository {
         index1: i32,
         index2: i32,
     ) -> Result<bool, ServiceError> {
+        /// An image row with whether its owner is a Live TV item.
+        #[derive(sqlx::FromRow)]
+        struct Row {
+            #[sqlx(flatten)]
+            image: BaseItemImageInfoEntity,
+            #[sqlx(rename = "IsLiveTv")]
+            is_live_tv: bool,
+        }
         // Load this item's rows for the requested type in the same stable order
         // get_image_infos exposes, so the caller's 0-based indices address the
         // same images the read side does.
         let disc = image_type_to_disc(image_type);
-        let rows = sqlx::query_as::<_, BaseItemImageInfoEntity>(
-            r#"SELECT * FROM "BaseItemImageInfos" WHERE "ItemId" = ?1 AND "ImageType" = ?2
-                ORDER BY rowid"#,
+        let rows = sqlx::query_as::<_, Row>(
+            r#"SELECT ii.*, bi."Type" IN (?3, ?4) AS "IsLiveTv"
+                FROM "BaseItemImageInfos" ii
+                JOIN "BaseItems" bi ON bi."Id" = ii."ItemId"
+                WHERE ii."ItemId" = ?1 AND ii."ImageType" = ?2
+                ORDER BY ii.rowid"#,
         )
         .bind(guid_to_db(item_id))
         .bind(disc)
+        .bind(BaseItemKind::LiveTvChannel.stored_type_name())
+        .bind(BaseItemKind::LiveTvProgram.stored_type_name())
         .fetch_all(self.db.pool())
         .await
         .map_err(db_err)?;
@@ -4351,19 +4343,46 @@ impl ItemRepository for FerrofinItemRepository {
             return Ok(false);
         };
         // `!info.IsLocalFile` on either side: "Not supported yet", nothing done.
-        if is_remote_image_path(&first.path) || is_remote_image_path(&second.path) {
+        if is_remote_image_path(&first.image.path) || is_remote_image_path(&second.image.path) {
             return Ok(false);
         }
+        // `info.Path` is expanded (`BaseItemRepository.Map`), so an adopted
+        // `%MetadataPath%` row names its file.
+        let (path1, path2) = (
+            self.virtual_paths.expand(&first.image.path),
+            self.virtual_paths.expand(&second.image.path),
+        );
 
         // The same file under two rows (or one slot against itself) has nothing
         // to exchange; upstream's copy onto itself would throw.
-        if first.path == second.path {
+        if path1 == path2 {
             return Ok(false);
+        }
+        // A Live TV item's row holds what a tuner or a guide supplied, so its
+        // file is written only in the internal metadata directory; otherwise
+        // nothing is done, as for a URL. Upstream swaps any local file.
+        if first.is_live_tv {
+            let root = self.virtual_paths.internal_metadata_path();
+            for path in [&path1, &path2] {
+                let internal = match &root {
+                    Some(root) => live_tv_image_is_internal(path, std::path::Path::new(root)).await,
+                    None => false,
+                };
+                if !internal {
+                    tracing::warn!(
+                        item_id = %item_id,
+                        // A source's value: a URL other than http keeps only its
+                        // scheme and host (LOGGING.md §5).
+                        path = %ferrofin_util::source_url::redact_url(path),
+                        "did not exchange the files of a Live TV image reorder: one is outside the metadata directory"
+                    );
+                    return Ok(false);
+                }
+            }
         }
         // `SwapImagesAsync` swaps the CONTENTS of the two files — the rows keep
         // their paths — and then clears the cached dimensions and re-reads each
         // modified time from its file.
-        let (path1, path2) = (first.path.clone(), second.path.clone());
         let modified = tokio::task::spawn_blocking(move || {
             swap_image_files(std::path::Path::new(&path1), std::path::Path::new(&path2))?;
             let stamp = |path: &str| {
@@ -4384,7 +4403,7 @@ impl ItemRepository for FerrofinItemRepository {
                     SET "Width" = 0, "Height" = 0, "Blurhash" = NULL, "DateModified" = ?2
                     WHERE "Id" = ?1"#,
             )
-            .bind(&row.id)
+            .bind(&row.image.id)
             .bind(datetime_to_db(modified))
             .execute(&mut *tx)
             .await
@@ -4590,31 +4609,23 @@ impl ItemRepository for FerrofinItemRepository {
         id: Uuid,
         recursive: bool,
     ) -> Result<bool, ServiceError> {
-        // Non-recursive: all direct, non-virtual leaf children played by the user.
-        // Recursive descent (via the AncestorIds/LinkedChildren closure) is the
-        // library manager's job; here the direct-children form is honored and the
-        // recursive flag widens to the ancestor closure where present.
-        let mut filter = InternalItemsQuery::default();
-        filter.set_user(Arc::new(user.clone()));
-        let filter = crate::query_restrictions::resolve(&self.db, &filter)
-            .await?
-            .unwrap_or(filter);
-        let mut qb = QueryBuilder::new(r#"SELECT NOT EXISTS (SELECT 1 FROM "BaseItems" bi "#);
-        if recursive {
-            qb.push(r#"JOIN "AncestorIds" a ON a."ItemId" = bi."Id" WHERE a."ParentItemId" = "#);
+        // v12.4 `GetIsPlayed`: the descendants `GetAllDescendantIds` resolves
+        // (closure and links), or the direct children.
+        let descendants = if recursive {
+            let filter = InternalItemsQuery {
+                descendant_of_id: Some(id),
+                ..Default::default()
+            };
+            resolve_descendant_query(&self.db, &filter).await?
         } else {
-            qb.push(r#"WHERE bi."ParentId" = "#);
-        }
-        qb.push_bind(guid_to_db(id))
-            .push(r#" AND bi."IsFolder" = 0 AND bi."IsVirtualItem" = 0"#);
-        crate::translate_query::append_parental_restrictions(&mut qb, &filter, "bi");
-        qb.push(r#" AND NOT EXISTS (SELECT 1 FROM "UserData" ud WHERE ud."ItemId" = bi."Id" AND ud."UserId" = "#)
-            .push_bind(user.id.clone()).push(r#" AND ud."Played" = 1))"#);
-        let all_played: i64 = qb
-            .build_query_scalar()
-            .fetch_one(self.db.pool())
-            .await
-            .map_err(db_err)?;
+            None
+        };
+        let all_played: i64 =
+            crate::translate_query::build_is_played_query(id, descendants.as_ref(), &user.id)
+                .build_query_scalar()
+                .fetch_one(self.db.pool())
+                .await
+                .map_err(db_err)?;
         Ok(all_played != 0)
     }
 
@@ -4624,25 +4635,39 @@ impl ItemRepository for FerrofinItemRepository {
         user_id: Uuid,
         child_type: i32,
     ) -> Result<PlaylistItemsWithAccess, ServiceError> {
-        let rows: Vec<PlaylistItemRow> = sqlx::query_as(PLAYLIST_ITEMS_SQL)
+        use futures_util::TryStreamExt;
+        let mut rows = sqlx::query(PLAYLIST_ITEMS_SQL)
             .bind(guid_to_db(playlist_id))
             .bind(guid_to_db(user_id))
             .bind(i64::from(child_type))
-            .fetch_all(self.db.pool())
-            .await
-            .map_err(db_err)?;
-        // Every row repeats the same access columns; the first carries them.
+            .fetch(self.db.pool());
+        let mut members = PlaylistMembers::default();
+        let mut index_of: HashMap<String, usize> = HashMap::new();
         // No rows at all means the join matched nothing — the caller decides
         // whether that is an empty playlist or a missing/invisible one.
-        let access = rows.first().map(|first| PlaylistAccessColumns {
-            owner_user_id: first.owner.clone(),
-            open_access: first.open_access,
-            share_can_edit: first.can_edit,
-        });
-        Ok(PlaylistItemsWithAccess {
-            items: rows.into_iter().map(|r| self.mapped(r.item)).collect(),
-            access,
-        })
+        let mut access = None;
+        while let Some(row) = rows.try_next().await.map_err(db_err)? {
+            // Every row repeats the same access columns; the first carries them.
+            if access.is_none() {
+                access = Some(PlaylistAccessColumns {
+                    owner_user_id: row.try_get("PlaylistOwnerUserId").map_err(db_err)?,
+                    open_access: row.try_get("PlaylistOpenAccess").map_err(db_err)?,
+                    share_can_edit: row.try_get("PlaylistShareCanEdit").map_err(db_err)?,
+                });
+            }
+            // A repeated member (gl-1523) costs a lookup, not another full row.
+            let id: &str = row.try_get("Id").map_err(db_err)?;
+            let index = if let Some(&seen) = index_of.get(id) {
+                seen
+            } else {
+                index_of.insert(id.to_owned(), members.items.len());
+                let item = BaseItemEntity::from_row(&row).map_err(db_err)?;
+                members.items.push(self.mapped(item));
+                members.items.len() - 1
+            };
+            members.entries.push(index);
+        }
+        Ok(PlaylistItemsWithAccess { members, access })
     }
 }
 
@@ -5031,6 +5056,12 @@ mod tests {
             };
             assert_eq!(paths(&batched[&id]), paths(&one), "{id}");
         }
+        // gl-1678: an id repeated past one IN chunk still reads its rows once.
+        let mut repeated = vec![first];
+        repeated.extend((0..ferrofin_db::PADDED_LIST_MAX).map(|_| Uuid::new_v4()));
+        repeated.push(first);
+        let once = repo.get_image_infos_batch(&repeated).await.unwrap();
+        assert_eq!(once[&first].len(), 3);
     }
 
     /// A page's artist and music-video album links resolve through one
@@ -10337,8 +10368,8 @@ mod tests {
         let user = seed_user(&db, Uuid::from_u128(0xC0DE)).await;
         seed_user_data(&db, Uuid::from_u128(0xC0DE), child, true, None).await;
 
-        // The recursive branch runs its AncestorIds join. With an ancestor row
-        // present, the played child makes the closure fully played.
+        // The recursive form reads the descendants resolve_descendant_query
+        // finds: with an ancestor row present, the played child is all of them.
         sqlx::query(r#"INSERT INTO "AncestorIds" ("ItemId", "ParentItemId") VALUES (?1, ?2)"#)
             .bind(guid_to_db(child))
             .bind(guid_to_db(parent))
@@ -10386,12 +10417,58 @@ mod tests {
         .await
         .unwrap();
         assert!(
-            repository
+            !repository
                 .get_is_played(&user, parent, false)
                 .await
                 .unwrap(),
-            "hidden unrated episodes do not keep a folder unplayed"
+            "GetIsPlayed is not access-filtered: a hidden unrated episode keeps it unplayed"
         );
+    }
+
+    /// `get_is_played`'s statement reads one folder's rows by key: the
+    /// recursive form reads each resolved descendant by `Id` (the `+` pins of
+    /// `build_is_played_query`; unpinned, it reads every leaf through the
+    /// `IsFolder` index), the direct form `IX_BaseItems_ParentId`.
+    #[tokio::test]
+    async fn is_played_query_seeks_the_folders_rows() {
+        use sqlx::Execute;
+        let db = test_db().await;
+        let parent = Uuid::from_u128(0xC001);
+        let descendants = InternalItemsQuery {
+            descendant_of_id: Some(parent),
+            descendant_roots: Some(DescendantQueryRoots {
+                parent_id: parent,
+                closure_roots: vec![parent],
+                link_roots: vec![parent],
+            }),
+            ..Default::default()
+        };
+        for (descendants, seek) in [
+            (
+                Some(&descendants),
+                "SEARCH bi USING INDEX sqlite_autoindex_BaseItems_1 (Id=?)",
+            ),
+            (
+                None,
+                "SEARCH bi USING INDEX IX_BaseItems_ParentId (ParentId=?)",
+            ),
+        ] {
+            let mut builder =
+                crate::translate_query::build_is_played_query(parent, descendants, "user");
+            let mut query = builder.build();
+            let args = query.take_arguments().unwrap().unwrap();
+            let sql = format!("EXPLAIN QUERY PLAN {}", query.sql().as_str());
+            let plan = sqlx::query_with(sqlx::AssertSqlSafe(sql), args)
+                .fetch_all(db.pool())
+                .await
+                .unwrap()
+                .iter()
+                .map(|row| row.get::<String, _>("detail"))
+                .collect::<Vec<_>>()
+                .join(" | ");
+            assert!(plan.contains(seek), "{plan}");
+            assert!(!plan.contains("SCAN bi"), "{plan}");
+        }
     }
 
     /// Seeds a full row through the persistence service so `DateCreated`,
@@ -15432,6 +15509,54 @@ mod folder_get_result_tests {
             .map(|(id, _)| *id)
             .collect();
         assert_eq!(favorites().await, expected);
+    }
+
+    /// Live TV answers `active_recording_paths` by reading its timers from the
+    /// same reader pool (`get_timer`), so the user-data filter must not hold a
+    /// reader across the call: with a one-reader pool (the in-memory test
+    /// database, a 1-CPU container, `db_pool = 1`) it waited for itself until
+    /// sqlx's 30 s acquire timeout.
+    #[tokio::test]
+    async fn the_recording_source_can_read_the_pool_while_folder_user_data_is_filtered() {
+        let db = test_db().await;
+        let user_id = Uuid::new_v4();
+        let user = seed_user_with_defaults(&db, user_id).await;
+        let slot = ActiveRecordingSlot::default();
+        let repo = repository(&db).with_active_recordings(Arc::clone(&slot));
+        let id = Uuid::new_v4();
+        seed_named_item(&db, id, BaseItemKind::Movie, "recording").await;
+        let mut entity = crate::test_support::fetch_item(&db, id).await;
+        entity.path = Some("/rec/active.ts".to_owned());
+        entity.channel_id = Some(guid_to_db(Uuid::new_v4()));
+        entity.external_id = Some("channel-key".to_owned());
+        crate::test_support::save_item(&db, &entity).await;
+        seed_user_data(&db, user_id, id, false, None).await;
+        sqlx::query(r#"INSERT INTO "UserData" ("ItemId","UserId","CustomDataKey","IsFavorite","PlayCount","PlaybackPositionTicks","Played") VALUES (?1,?2,'channel-key',1,0,0,0)"#)
+            .bind(guid_to_db(id)).bind(guid_to_db(user_id)).execute(db.writer()).await.unwrap();
+        let pool = db.pool().clone();
+        slot.set(Arc::new(move || {
+            let pool = pool.clone();
+            Box::pin(async move {
+                drop(pool.acquire().await.map_err(db_err)?);
+                Ok(vec!["/rec/active.ts".to_owned()])
+            })
+        }))
+        .ok();
+        let rows = ordered_rows(&repo, &[id]).await;
+        let query = InternalItemsQuery {
+            is_favorite: Some(true),
+            user: Some(Arc::new(user)),
+            ..Default::default()
+        };
+        let children = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            repo.filter_folder_children(rows, &query),
+        )
+        .await
+        .expect("the filter waited on the reader it was holding")
+        .unwrap();
+        // Recording, so keyed by its own id: the channel-keyed favorite is not its row.
+        assert!(children.is_empty(), "{children:?}");
     }
 
     #[tokio::test]

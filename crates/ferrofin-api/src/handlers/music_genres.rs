@@ -9,7 +9,7 @@
 //! The instant-mix and per-name image routes for music genres live in their own
 //! controllers (`instant_mix.rs`, `image.rs`) and are registered there.
 
-use axum::extract::{Path, State};
+use axum::extract::State;
 use axum::routing::get;
 use axum::{Json, Router};
 use ferrofin_model::data::BaseItemKind;
@@ -19,9 +19,9 @@ use ferrofin_traits::options::DtoOptions;
 
 use crate::auth::RequireAuth;
 use crate::error::{ApiError, ProblemStatus};
-use crate::extract::Query;
+use crate::extract::{Query, RequiredRouteString, RouteParameter};
 use crate::handlers::by_name::{
-    ByNameItemQuery, ByNameListQuery, project_query_result, resolve_by_name_or_slug,
+    ByNameItemQuery, ValueListQuery, project_query_result, resolve_by_name_or_slug,
 };
 use crate::handlers::items::resolve_user_or_api_key;
 use crate::state::AppState;
@@ -39,8 +39,9 @@ use crate::state::AppState;
 async fn get_music_genres(
     State(state): State<AppState>,
     RequireAuth(auth): RequireAuth,
-    Query(query): Query<ByNameListQuery>,
+    Query(query): Query<ValueListQuery>,
 ) -> Result<Json<QueryResult<BaseItemDto>>, ApiError> {
+    let query = query.genres();
     let user = resolve_user_or_api_key(&state, &auth, query.user_id).await?;
     // `GetParentItem`: an id naming no item is a 400.
     query.parent(&state, &auth, user.as_deref()).await?;
@@ -60,6 +61,13 @@ async fn get_music_genres(
     )
     .await?;
     Ok(Json(projected))
+}
+
+/// `{genreName}`, the `[FromRoute, Required] string` of `GetMusicGenre`.
+struct GenreName;
+
+impl RouteParameter for GenreName {
+    const NAME: &'static str = "genreName";
 }
 
 /// `GET /MusicGenres/{genreName}` — a single music genre by name.
@@ -85,7 +93,7 @@ async fn get_music_genres(
 async fn get_music_genre(
     State(state): State<AppState>,
     RequireAuth(auth): RequireAuth,
-    Path(genre_name): Path<String>,
+    RequiredRouteString(genre_name, _): RequiredRouteString<GenreName>,
     Query(query): Query<ByNameItemQuery>,
 ) -> Result<Json<BaseItemDto>, ApiError> {
     let user = resolve_user_or_api_key(&state, &auth, query.user_id).await?;

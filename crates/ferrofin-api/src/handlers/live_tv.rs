@@ -52,11 +52,10 @@ use ferrofin_traits::stubs::{LiveTvChannelQuery, RecordingVisibility};
 
 use crate::auth::{RequireAdmin, RequireLiveTvAccess, RequireLiveTvManagement};
 use crate::error::ApiError;
-use crate::extract::{DotnetGuid, JsonBody, Query};
+use crate::extract::{DotnetGuid, JsonBody, Query, RequiredRouteString, RouteParameter};
 use crate::handlers::items::{require_visible_item, resolve_user_opt};
 use crate::handlers::query_parse::{
-    de_comma_delimited, de_comma_delimited_guids, de_pipe_delimited, parse_csv_enums_lenient,
-    parse_csv_uuids, parse_pipe_strings,
+    get_order_by, parse_csv_enums_lenient, parse_csv_uuids, parse_order_by, parse_pipe_strings,
 };
 use crate::state::AppState;
 
@@ -340,10 +339,7 @@ impl ProgramsQuery {
             is_sports: self.is_sports,
             start_index: self.start_index,
             limit: self.limit,
-            order_by: pair_order_by(
-                parse_csv_enums_lenient(self.sort_by.as_deref()),
-                &parse_csv_enums_lenient(self.sort_order.as_deref()),
-            ),
+            order_by: parse_order_by(self.sort_by.as_deref(), self.sort_order.as_deref()),
             genres: parse_pipe_strings(self.genres.as_deref()),
             genre_ids: parse_csv_uuids(self.genre_ids.as_deref())?,
             series_timer_id: self.series_timer_id,
@@ -372,14 +368,14 @@ impl ProgramsQuery {
 /// `Genres`), so each also accepts the delimited-**string** spelling —
 /// `{"SortBy":"StartDate"}` as well as `{"SortBy":["StartDate"]}` — with
 /// unconvertible entries dropped rather than rejected. See
-/// [`de_comma_delimited`].
+/// [`ferrofin_model::json::delimited`].
 #[derive(Debug, Default, serde::Deserialize)]
 #[serde(rename_all = "PascalCase", default)]
 #[allow(clippy::struct_excessive_bools)] // one field per contract property
 #[cfg_attr(test, derive(serde::Serialize))]
 struct GetProgramsDto {
     /// The channels to return guide information for.
-    #[serde(deserialize_with = "de_comma_delimited_guids")]
+    #[serde(deserialize_with = "ferrofin_model::json::guid::comma_delimited::option::deserialize")]
     channel_ids: Option<Vec<Uuid>>,
     /// The target user. Unlike the query-string form this does *not* fall back
     /// to the authenticated caller (upstream reads the body id only).
@@ -425,17 +421,17 @@ struct GetProgramsDto {
     #[serde(default, deserialize_with = "ferrofin_model::json::value::nullable")]
     limit: Option<i32>,
     /// The sort columns.
-    #[serde(deserialize_with = "de_comma_delimited")]
+    #[serde(deserialize_with = "ferrofin_model::json::delimited::comma_option")]
     sort_by: Option<Vec<ItemSortBy>>,
     /// The sort orders, paired positionally with `SortBy`.
-    #[serde(deserialize_with = "de_comma_delimited")]
+    #[serde(deserialize_with = "ferrofin_model::json::delimited::comma_option")]
     sort_order: Option<Vec<SortOrder>>,
     /// The genre names to return guide information for. Upstream decorates
     /// this one — and only this one — with the *pipe* converter factory.
-    #[serde(deserialize_with = "de_pipe_delimited")]
+    #[serde(deserialize_with = "ferrofin_model::json::delimited::pipe_option")]
     genres: Option<Vec<String>>,
     /// The genre ids to return guide information for.
-    #[serde(deserialize_with = "de_comma_delimited_guids")]
+    #[serde(deserialize_with = "ferrofin_model::json::guid::comma_delimited::option::deserialize")]
     genre_ids: Option<Vec<Uuid>>,
     /// Whether image information is included.
     #[serde(default, deserialize_with = "ferrofin_model::json::value::nullable")]
@@ -444,7 +440,7 @@ struct GetProgramsDto {
     #[serde(default, deserialize_with = "ferrofin_model::json::value::nullable")]
     image_type_limit: Option<i32>,
     /// The image types to include.
-    #[serde(deserialize_with = "de_comma_delimited")]
+    #[serde(deserialize_with = "ferrofin_model::json::delimited::comma_option")]
     enable_image_types: Option<Vec<ImageType>>,
     /// Whether user data is included.
     #[serde(default, deserialize_with = "ferrofin_model::json::value::nullable")]
@@ -455,7 +451,7 @@ struct GetProgramsDto {
     #[serde(with = "ferrofin_model::json::guid::option")]
     library_series_id: Option<Uuid>,
     /// Additional DTO fields.
-    #[serde(deserialize_with = "de_comma_delimited")]
+    #[serde(deserialize_with = "ferrofin_model::json::delimited::comma_option")]
     fields: Option<Vec<ItemFields>>,
     /// Whether the total record count is computed (schema default `true`).
     #[serde(deserialize_with = "ferrofin_model::json::value::nullable")]
@@ -481,7 +477,7 @@ impl GetProgramsDto {
             is_sports: self.is_sports,
             start_index: self.start_index,
             limit: self.limit,
-            order_by: pair_order_by(
+            order_by: get_order_by(
                 self.sort_by.unwrap_or_default(),
                 &self.sort_order.unwrap_or_default(),
             ),
@@ -629,26 +625,6 @@ struct ProgramFilters {
     enable_total_record_count: bool,
 }
 
-/// Pairs sort columns with sort orders.
-///
-/// Mirrors `RequestHelpers.GetOrderBy`: each column takes the order at its own
-/// index, and columns beyond the supplied orders are padded with the **first**
-/// requested order (ascending when none was supplied).
-fn pair_order_by(columns: Vec<ItemSortBy>, orders: &[SortOrder]) -> Vec<(ItemSortBy, SortOrder)> {
-    columns
-        .into_iter()
-        .enumerate()
-        .map(|(i, column)| {
-            let order = orders
-                .get(i)
-                .or_else(|| orders.first())
-                .copied()
-                .unwrap_or(SortOrder::Ascending);
-            (column, order)
-        })
-        .collect()
-}
-
 /// Builds the [`DtoOptions`] for a program query.
 ///
 /// Mirrors C# `new DtoOptions { Fields = fields }.AddAdditionalDtoOptions(...)`:
@@ -739,6 +715,14 @@ async fn get_recommended_programs(
     ))
 }
 
+/// `{programId}`, the `[FromRoute, Required] string` of `GetProgram`: a blank
+/// one is the binder's `400`, before the GUID parse below.
+struct ProgramId;
+
+impl RouteParameter for ProgramId {
+    const NAME: &'static str = "programId";
+}
+
 /// `GET /LiveTv/Programs/{programId}` — a single programme.
 ///
 /// Port of `LiveTvController.GetProgram`: `new DtoOptions()` means every field,
@@ -747,6 +731,7 @@ async fn get_recommended_programs(
 async fn get_program(
     State(state): State<AppState>,
     RequireLiveTvAccess(auth): RequireLiveTvAccess,
+    _: RequiredRouteString<ProgramId>,
     Path(DotnetGuid(program_id)): Path<DotnetGuid>,
     Query(query): Query<UserIdQuery>,
 ) -> Result<Json<BaseItemDto>, ApiError> {
@@ -946,6 +931,13 @@ async fn delete_listing_provider(
     Ok(axum::http::StatusCode::NO_CONTENT)
 }
 
+/// `{tunerId}`, the `[FromRoute, Required] string` of `ResetTuner`.
+struct TunerId;
+
+impl RouteParameter for TunerId {
+    const NAME: &'static str = "tunerId";
+}
+
 /// `POST /LiveTv/Tuners/{tunerId}/Reset` — reset a tuner.
 ///
 /// Port of `LiveTvController.ResetTuner`. M3U tuners are stateless, so this is a
@@ -953,7 +945,7 @@ async fn delete_listing_provider(
 async fn reset_tuner(
     State(state): State<AppState>,
     RequireAdmin(_auth): RequireAdmin,
-    Path(tuner_id): Path<String>,
+    RequiredRouteString(tuner_id, _): RequiredRouteString<TunerId>,
 ) -> Result<axum::http::StatusCode, ApiError> {
     live_tv(&state)?.reset_tuner(&tuner_id).await?;
     Ok(axum::http::StatusCode::NO_CONTENT)
@@ -1435,6 +1427,13 @@ async fn get_schedules_direct_countries(
         .into_response())
 }
 
+/// `{recordingId}`, the `[FromRoute, Required] string` of `GetLiveRecordingFile`.
+struct RecordingId;
+
+impl RouteParameter for RecordingId {
+    const NAME: &'static str = "recordingId";
+}
+
 /// `GET /LiveTv/LiveRecordings/{recordingId}/stream` — a recording in flight.
 ///
 /// Port of `LiveTvController.GetLiveRecordingFile`: the id is the FIRING
@@ -1451,7 +1450,7 @@ async fn get_schedules_direct_countries(
 /// recording readable without a token.
 async fn get_live_recording_stream(
     State(state): State<AppState>,
-    Path(recording_id): Path<String>,
+    RequiredRouteString(recording_id, _): RequiredRouteString<RecordingId>,
 ) -> Result<Response, ApiError> {
     let Some(live_tv) = state.live_tv.as_ref() else {
         return Err(ApiError::NotFound("recording".into()));
@@ -1609,6 +1608,13 @@ fn route_container(segment: &str) -> Option<&str> {
     valid.then_some(container)
 }
 
+/// `{streamId}`, the `[FromRoute, Required] string` of `GetLiveStreamFile`.
+struct StreamId;
+
+impl RouteParameter for StreamId {
+    const NAME: &'static str = "streamId";
+}
+
 /// `GET /LiveTv/LiveStreamFiles/{streamId}/stream.{container}` — the buffered
 /// live-stream file.
 ///
@@ -1624,7 +1630,8 @@ fn route_container(segment: &str) -> Option<&str> {
 /// per-open GUID.
 async fn get_live_stream_file(
     State(state): State<AppState>,
-    Path((stream_id, container)): Path<(String, String)>,
+    RequiredRouteString(stream_id, _): RequiredRouteString<StreamId>,
+    Path((_, container)): Path<(String, String)>,
 ) -> Result<Response, ApiError> {
     let Some(container) = route_container(&container) else {
         return Err(ApiError::NotFound("live stream file".into()));
@@ -1747,11 +1754,20 @@ async fn get_timers(
     )))
 }
 
+/// `{timerId}`, the `[FromRoute, Required] string` of the timer and series
+/// timer actions (`GetTimer`, `UpdateTimer`, `CancelTimer` and their
+/// `SeriesTimer` siblings).
+struct TimerId;
+
+impl RouteParameter for TimerId {
+    const NAME: &'static str = "timerId";
+}
+
 /// `GET /LiveTv/Timers/{timerId}` — a single timer (`404` if absent).
 async fn get_timer(
     State(state): State<AppState>,
     RequireLiveTvAccess(_auth): RequireLiveTvAccess,
-    Path(timer_id): Path<String>,
+    RequiredRouteString(timer_id, _): RequiredRouteString<TimerId>,
 ) -> Result<Json<TimerInfoDto>, ApiError> {
     live_tv(&state)?
         .get_timer(&timer_id)
@@ -1803,7 +1819,7 @@ async fn notify_timer_event(
 async fn update_timer(
     State(state): State<AppState>,
     RequireLiveTvManagement(_auth): RequireLiveTvManagement,
-    Path(timer_id): Path<String>,
+    RequiredRouteString(timer_id, _): RequiredRouteString<TimerId>,
     JsonBody(timer): JsonBody<TimerInfoDto>,
 ) -> Result<axum::http::StatusCode, ApiError> {
     live_tv(&state)?.update_timer(&timer_id, timer).await?;
@@ -1814,7 +1830,7 @@ async fn update_timer(
 async fn cancel_timer(
     State(state): State<AppState>,
     RequireLiveTvManagement(_auth): RequireLiveTvManagement,
-    Path(timer_id): Path<String>,
+    RequiredRouteString(timer_id, _): RequiredRouteString<TimerId>,
 ) -> Result<axum::http::StatusCode, ApiError> {
     live_tv(&state)?.cancel_timer(&timer_id).await?;
     notify_timer_event(
@@ -1833,10 +1849,13 @@ async fn cancel_timer(
 struct TimerDefaultsQuery {
     /// The programme the new timer would record.
     ///
-    /// The contract declares this a plain string, and clients really do send
-    /// `?programId=` empty — binding it as a `Uuid` would turn that into a
-    /// `400` instead of the standing defaults.
-    program_id: Option<String>,
+    /// Upstream binds a `string?`, which reads an empty or blank value as null
+    /// (clients really do send `?programId=`), and hands anything else to
+    /// `new Guid(programId)`: the D, N, B, P and X spellings, trimmed.
+    /// [`empty_as_none_uuid`](crate::handlers::query_parse::empty_as_none_uuid)
+    /// binds the same set.
+    #[serde(deserialize_with = "crate::handlers::query_parse::empty_as_none_uuid")]
+    program_id: Option<Uuid>,
 }
 
 /// `GET /LiveTv/Timers/Defaults` — the values a new timer starts from.
@@ -1845,23 +1864,23 @@ struct TimerDefaultsQuery {
 /// from the Live TV configuration, every day, keep until deleted), plus the
 /// named programme's own name, channel, window and ids — which is what the
 /// client posts straight back to create the timer.
+///
+/// A `programId` that does not parse is the binder's `400`, where upstream's
+/// `new Guid` throws a `FormatException` (a `500`); the nil GUID is
+/// `GetItemById`'s `ArgumentException`, a `400`. An id naming no programme
+/// answers the standing defaults, where upstream dereferences the null
+/// programme (a `500`).
 async fn get_default_timer(
     State(state): State<AppState>,
     RequireLiveTvAccess(_auth): RequireLiveTvAccess,
     Query(query): Query<TimerDefaultsQuery>,
 ) -> Result<Json<SeriesTimerInfoDto>, ApiError> {
+    if query.program_id.is_some_and(|id| id.is_nil()) {
+        return Err(ApiError::BadRequest("Guid can't be empty".to_owned()));
+    }
     match state.live_tv.as_ref() {
         Some(manager) => Ok(Json(
-            manager
-                .get_new_timer_defaults(
-                    query
-                        .program_id
-                        .as_deref()
-                        .map(str::trim)
-                        .filter(|id| !id.is_empty())
-                        .and_then(|id| Uuid::parse_str(id).ok()),
-                )
-                .await?,
+            manager.get_new_timer_defaults(query.program_id).await?,
         )),
         // No Live TV configured: the padding-free standing defaults.
         None => Ok(Json(ferrofin_traits::stubs::new_timer_defaults(0, 0))),
@@ -1909,7 +1928,7 @@ async fn get_series_timers(
 async fn get_series_timer(
     State(state): State<AppState>,
     RequireLiveTvAccess(_auth): RequireLiveTvAccess,
-    Path(timer_id): Path<String>,
+    RequiredRouteString(timer_id, _): RequiredRouteString<TimerId>,
 ) -> Result<Json<SeriesTimerInfoDto>, ApiError> {
     live_tv(&state)?
         .get_series_timer(&timer_id)
@@ -1940,7 +1959,7 @@ async fn create_series_timer(
 async fn update_series_timer(
     State(state): State<AppState>,
     RequireLiveTvManagement(_auth): RequireLiveTvManagement,
-    Path(timer_id): Path<String>,
+    RequiredRouteString(timer_id, _): RequiredRouteString<TimerId>,
     JsonBody(timer): JsonBody<SeriesTimerInfoDto>,
 ) -> Result<axum::http::StatusCode, ApiError> {
     live_tv(&state)?
@@ -1953,7 +1972,7 @@ async fn update_series_timer(
 async fn cancel_series_timer(
     State(state): State<AppState>,
     RequireLiveTvManagement(_auth): RequireLiveTvManagement,
-    Path(timer_id): Path<String>,
+    RequiredRouteString(timer_id, _): RequiredRouteString<TimerId>,
 ) -> Result<axum::http::StatusCode, ApiError> {
     live_tv(&state)?.cancel_series_timer(&timer_id).await?;
     notify_timer_event(
@@ -2666,6 +2685,7 @@ mod tests {
         // anonymous and reports only "no such stream".
         let file = get_live_stream_file(
             State(fake_state()),
+            RequiredRouteString("s1".into(), std::marker::PhantomData),
             Path(("s1".into(), "stream.mp4".into())),
         )
         .await
@@ -2673,9 +2693,13 @@ mod tests {
         assert_eq!(file.status(), axum::http::StatusCode::NOT_FOUND);
         // A manager with nothing open says the same.
         let state = fake_state().with_live_tv(std::sync::Arc::new(FakeLiveTv::default()));
-        let file = get_live_stream_file(State(state), Path(("s1".into(), "stream.ts".into())))
-            .await
-            .unwrap_err();
+        let file = get_live_stream_file(
+            State(state),
+            RequiredRouteString("s1".into(), std::marker::PhantomData),
+            Path(("s1".into(), "stream.ts".into())),
+        )
+        .await
+        .unwrap_err();
         assert_eq!(file.status(), axum::http::StatusCode::NOT_FOUND);
     }
 
@@ -2725,6 +2749,7 @@ mod tests {
 
         let response = get_live_stream_file(
             State(state),
+            RequiredRouteString("uid-1".to_owned(), std::marker::PhantomData),
             Path(("uid-1".to_owned(), "stream.ts".to_owned())),
         )
         .await
@@ -2770,6 +2795,7 @@ mod tests {
 
         let response = get_live_stream_file(
             State(state),
+            RequiredRouteString("uid-1".to_owned(), std::marker::PhantomData),
             Path(("uid-1".to_owned(), "stream.ts".to_owned())),
         )
         .await
@@ -2811,6 +2837,7 @@ mod tests {
             is_live_stream: true,
             is_infinite_stream: false,
             user_agent: None,
+            container: None,
         };
 
         let response = serve_static_source(
@@ -2846,9 +2873,12 @@ mod tests {
         let state = fake_state();
         // The recording stream is anonymous upstream, so it reports only
         // "no such recording" — never 501, whatever is wired.
-        let rec = get_live_recording_stream(State(state.clone()), Path(Uuid::nil().to_string()))
-            .await
-            .unwrap_err();
+        let rec = get_live_recording_stream(
+            State(state.clone()),
+            RequiredRouteString(Uuid::nil().to_string(), std::marker::PhantomData),
+        )
+        .await
+        .unwrap_err();
         assert_eq!(rec.status(), axum::http::StatusCode::NOT_FOUND);
         let map = set_channel_mapping(
             State(state),
@@ -2907,6 +2937,8 @@ mod tests {
         discovery_duration_ms: std::sync::Mutex<Option<u64>>,
         /// The `newDevicesOnly` flag the handler forwarded.
         discovery_new_only: std::sync::Mutex<Option<bool>>,
+        /// The programme ids `get_new_timer_defaults` was asked for.
+        timer_defaults_asked: std::sync::Mutex<Vec<Option<Uuid>>>,
     }
 
     #[async_trait::async_trait]
@@ -3115,12 +3147,6 @@ mod tests {
             }
             Ok(())
         }
-        async fn get_channel_stream_url(
-            &self,
-            _id: Uuid,
-        ) -> Result<Option<String>, ferrofin_traits::error::ServiceError> {
-            unimplemented!()
-        }
         async fn get_timers(
             &self,
         ) -> Result<Vec<TimerInfoDto>, ferrofin_traits::error::ServiceError> {
@@ -3181,6 +3207,13 @@ mod tests {
             _id: &str,
         ) -> Result<(), ferrofin_traits::error::ServiceError> {
             unimplemented!()
+        }
+        async fn get_new_timer_defaults(
+            &self,
+            program_id: Option<Uuid>,
+        ) -> Result<SeriesTimerInfoDto, ferrofin_traits::error::ServiceError> {
+            self.timer_defaults_asked.lock().unwrap().push(program_id);
+            Ok(ferrofin_traits::stubs::new_timer_defaults(0, 0))
         }
         async fn get_recordings(
             &self,
@@ -3809,10 +3842,112 @@ mod tests {
         // recording is a library item behind the authenticated item routes, and
         // serving it from this anonymous route would make every recording
         // readable without a token.
-        let err = get_live_recording_stream(State(state), Path(Uuid::new_v4().to_string()))
-            .await
-            .unwrap_err();
+        let err = get_live_recording_stream(
+            State(state),
+            RequiredRouteString(Uuid::new_v4().to_string(), std::marker::PhantomData),
+        )
+        .await
+        .unwrap_err();
         assert_eq!(err.status(), axum::http::StatusCode::NOT_FOUND);
+    }
+
+    const PROGRAM: Uuid = Uuid::from_u128(0x9c4e_63f1_031b_4f25_988b_4f7d_78a8_b53e);
+
+    /// `GetDefaultTimer` hands a non-empty `programId` to `new Guid(programId)`
+    /// (`LibraryManagerExtensions.GetItemById`), which takes the D, N, B, P and
+    /// X spellings, trimmed. The binder reads an empty or blank value as null:
+    /// the standing defaults. A value that does not parse is a 400 (upstream's
+    /// `FormatException` is a 500), and so is the nil GUID (`GetItemById`'s
+    /// "Guid can't be empty").
+    #[rstest::rstest]
+    #[case::absent(None, Ok(None))]
+    #[case::empty(Some(""), Ok(None))]
+    #[case::blank(Some("  "), Ok(None))]
+    #[case::d(Some("9c4e63f1-031b-4f25-988b-4f7d78a8b53e"), Ok(Some(PROGRAM)))]
+    #[case::n(Some("9c4e63f1031b4f25988b4f7d78a8b53e"), Ok(Some(PROGRAM)))]
+    #[case::b(Some("{9c4e63f1-031b-4f25-988b-4f7d78a8b53e}"), Ok(Some(PROGRAM)))]
+    #[case::p(Some("(9c4e63f1-031b-4f25-988b-4f7d78a8b53e)"), Ok(Some(PROGRAM)))]
+    #[case::x(
+        Some("{0x9c4e63f1,0x031b,0x4f25,{0x98,0x8b,0x4f,0x7d,0x78,0xa8,0xb5,0x3e}}"),
+        Ok(Some(PROGRAM))
+    )]
+    #[case::padded(Some(" 9c4e63f1-031b-4f25-988b-4f7d78a8b53e "), Ok(Some(PROGRAM)))]
+    #[case::urn(
+        Some("urn:uuid:9c4e63f1-031b-4f25-988b-4f7d78a8b53e"),
+        Err("Failed to deserialize query string: programId: ")
+    )]
+    #[case::garbage(
+        Some("not-a-guid"),
+        Err("Failed to deserialize query string: programId: ")
+    )]
+    #[case::nil(
+        Some("00000000-0000-0000-0000-000000000000"),
+        Err("Guid can't be empty")
+    )]
+    #[tokio::test]
+    async fn timer_defaults_bind_the_program_id_like_new_guid(
+        #[case] program_id: Option<&str>,
+        #[case] expected: Result<Option<Uuid>, &str>,
+    ) {
+        let fake = std::sync::Arc::new(FakeLiveTv::default());
+        let state = crate::test_support::elevated_fake_state().with_live_tv(fake.clone());
+        let uri = timer_defaults_uri(program_id);
+        let (status, body) = get_timer_defaults(state, &uri).await;
+        let asked = fake.timer_defaults_asked.lock().unwrap().clone();
+        match expected {
+            Ok(forwarded) => {
+                assert_eq!(status, axum::http::StatusCode::OK, "{uri}: {body}");
+                assert_eq!(asked, vec![forwarded], "{uri}");
+            }
+            Err(message) => {
+                assert_eq!(status, axum::http::StatusCode::BAD_REQUEST, "{uri}: {body}");
+                assert!(body.contains(message), "{uri}: {body}");
+                assert!(asked.is_empty(), "{uri} reached the manager: {asked:?}");
+            }
+        }
+    }
+
+    /// With no Live TV configured, a nil `programId` is still `GetItemById`'s
+    /// 400, not the padding-free defaults.
+    #[tokio::test]
+    async fn a_nil_program_id_is_a_400_without_live_tv() {
+        let uri = timer_defaults_uri(Some("00000000-0000-0000-0000-000000000000"));
+        let (status, body) =
+            get_timer_defaults(crate::test_support::elevated_fake_state(), &uri).await;
+        assert_eq!(status, axum::http::StatusCode::BAD_REQUEST, "{body}");
+        assert!(body.contains("Guid can't be empty"), "{body}");
+    }
+
+    /// `/LiveTv/Timers/Defaults`, with `programId` percent-encoded when given.
+    fn timer_defaults_uri(program_id: Option<&str>) -> String {
+        let mut uri = "/LiveTv/Timers/Defaults".to_owned();
+        if let Some(value) = program_id {
+            uri.push_str("?programId=");
+            uri.extend(percent_encoding::utf8_percent_encode(
+                value,
+                percent_encoding::NON_ALPHANUMERIC,
+            ));
+        }
+        uri
+    }
+
+    /// GETs `uri` through the router over `state`: the status and the body.
+    async fn get_timer_defaults(state: AppState, uri: &str) -> (axum::http::StatusCode, String) {
+        use tower::ServiceExt;
+
+        let response = crate::create_router(state)
+            .oneshot(
+                axum::http::Request::get(uri)
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        (status, String::from_utf8_lossy(&body).into_owned())
     }
 }
 

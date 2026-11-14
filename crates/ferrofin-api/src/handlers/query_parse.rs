@@ -7,17 +7,12 @@
 //! `serde::Deserialize` (PascalCase) impls so the accepted spellings match the
 //! vendored contract exactly.
 //!
-//! The same module also carries the JSON-*body* twin of those binders —
-//! [`de_comma_delimited`] / [`de_pipe_delimited`], a port of
-//! `JsonDelimitedCollectionConverter<T>` — for the request DTOs whose
-//! collection properties upstream decorates with the delimited converter
-//! factories (e.g. `GetProgramsDto`).
+//! The JSON-*body* twin of those binders, `JsonDelimitedCollectionConverter<T>`,
+//! is `ferrofin_model::json::delimited`, beside the DTOs that carry it.
 
-use std::fmt;
-use std::marker::PhantomData;
-
-use serde::de::{self, DeserializeOwned, SeqAccess, Visitor};
-use serde::{Deserialize, Deserializer};
+use ferrofin_model::dto::SortOrder;
+use ferrofin_model::live_tv::ItemSortBy;
+use serde::Deserialize;
 use uuid::Uuid;
 
 use crate::error::ApiError;
@@ -44,6 +39,37 @@ where
         .filter(|s| !s.is_empty())
         .filter_map(deserialize_token)
         .collect()
+}
+
+/// Pairs each sort key with a sort order — `RequestHelpers.GetOrderBy` (v12.4
+/// Jellyfin.Api/Helpers/RequestHelpers.cs:35-59).
+///
+/// A key takes the order at its own index; the keys past the last order take
+/// the FIRST order, or ascending when none was given. Orders past the last key
+/// are ignored, where upstream, given a non-empty `sortBy`, indexes past it and
+/// answers 400.
+///
+/// Generic over the order type because the activity log has its own;
+/// `O::default()` is `Ascending` for both.
+pub(crate) fn get_order_by<K, O: Copy + Default>(sort_by: Vec<K>, sort_order: &[O]) -> Vec<(K, O)> {
+    let rest = sort_order.first().copied().unwrap_or_default();
+    sort_by
+        .into_iter()
+        .enumerate()
+        .map(|(i, key)| (key, sort_order.get(i).copied().unwrap_or(rest)))
+        .collect()
+}
+
+/// Binds `sortBy` / `sortOrder` with the comma-delimited binder
+/// ([`parse_csv_enums_lenient`]) and pairs them with [`get_order_by`].
+pub(crate) fn parse_order_by(
+    sort_by: Option<&str>,
+    sort_order: Option<&str>,
+) -> Vec<(ItemSortBy, SortOrder)> {
+    get_order_by(
+        parse_csv_enums_lenient(sort_by),
+        &parse_csv_enums_lenient(sort_order),
+    )
 }
 
 /// Converts one collection token as the element type's `TypeConverter` does
@@ -173,146 +199,6 @@ pub(crate) fn parse_csv_strings(raw: Option<&str>) -> Vec<String> {
         .collect()
 }
 
-/// Deserializes a **comma**-delimited JSON collection field.
-///
-/// Port of `JsonDelimitedCollectionConverter<T>.Read` (v10.11.8
-/// `src/Jellyfin.Extensions/Json/Converters/JsonDelimitedCollectionConverter.cs`)
-/// as reached through `JsonCommaDelimitedCollectionConverterFactory`: when the
-/// JSON token is a **string** it is split on the delimiter with
-/// `StringSplitOptions.RemoveEmptyEntries`, each entry is `Trim()`ed and
-/// converted, and an entry that fails to convert is *silently dropped*
-/// (`catch (FormatException) { /* Ignore unconvertible inputs */ }`). Any other
-/// token falls through to a strict array deserialize.
-///
-/// Jellyfin decorates seven `GetProgramsDto` properties with this factory, so
-/// `{"ChannelIds":"<id>,<id>"}` is as valid as `{"ChannelIds":["<id>","<id>"]}`.
-pub(crate) fn de_comma_delimited<'de, D, T>(deserializer: D) -> Result<Option<Vec<T>>, D::Error>
-where
-    D: Deserializer<'de>,
-    T: DeserializeOwned,
-{
-    deserializer.deserialize_option(DelimitedOption {
-        delimiter: ',',
-        marker: PhantomData,
-    })
-}
-
-/// The delimited GUID converter uses Guid.Parse for string entries and the
-/// global JSON GUID converter (including null-to-empty) for array entries.
-pub(crate) fn de_comma_delimited_guids<'de, D: Deserializer<'de>>(
-    deserializer: D,
-) -> Result<Option<Vec<Uuid>>, D::Error> {
-    #[derive(serde::Deserialize)]
-    #[serde(transparent)]
-    struct Guid(#[serde(with = "ferrofin_model::json::guid")] Uuid);
-    de_comma_delimited::<D, Guid>(deserializer)
-        .map(|values| values.map(|ids| ids.into_iter().map(|id| id.0).collect()))
-}
-
-/// Deserializes a **pipe**-delimited JSON collection field.
-///
-/// Same converter as [`de_comma_delimited`], reached through
-/// `JsonPipeDelimitedCollectionConverterFactory` — which upstream applies to
-/// `GetProgramsDto.Genres` only. Keeping the two apart matters: `"News,Sport"`
-/// is *one* genre here, exactly as upstream sees it.
-pub(crate) fn de_pipe_delimited<'de, D, T>(deserializer: D) -> Result<Option<Vec<T>>, D::Error>
-where
-    D: Deserializer<'de>,
-    T: DeserializeOwned,
-{
-    deserializer.deserialize_option(DelimitedOption {
-        delimiter: '|',
-        marker: PhantomData,
-    })
-}
-
-/// The `Option` layer of the delimited-collection converters: `null` and a
-/// missing property both collapse to `None`, as upstream's nullable
-/// `IReadOnlyList<T>?` does.
-struct DelimitedOption<T> {
-    /// The character the string form is split on.
-    delimiter: char,
-    /// Ties the visitor to the element type without owning one.
-    marker: PhantomData<fn() -> T>,
-}
-
-impl<'de, T> Visitor<'de> for DelimitedOption<T>
-where
-    T: DeserializeOwned,
-{
-    type Value = Option<Vec<T>>;
-
-    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            formatter,
-            "an array, or a {:?}-delimited string, or null",
-            self.delimiter
-        )
-    }
-
-    fn visit_none<E: de::Error>(self) -> Result<Self::Value, E> {
-        Ok(None)
-    }
-
-    fn visit_unit<E: de::Error>(self) -> Result<Self::Value, E> {
-        Ok(None)
-    }
-
-    fn visit_some<D: Deserializer<'de>>(self, deserializer: D) -> Result<Self::Value, D::Error> {
-        deserializer
-            .deserialize_any(DelimitedValue {
-                delimiter: self.delimiter,
-                marker: PhantomData,
-            })
-            .map(Some)
-    }
-}
-
-/// The value layer: the string arm splits leniently, the array arm stays strict.
-struct DelimitedValue<T> {
-    /// The character the string form is split on.
-    delimiter: char,
-    /// Ties the visitor to the element type without owning one.
-    marker: PhantomData<fn() -> T>,
-}
-
-impl<'de, T> Visitor<'de> for DelimitedValue<T>
-where
-    T: DeserializeOwned,
-{
-    type Value = Vec<T>;
-
-    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            formatter,
-            "an array or a {:?}-delimited string",
-            self.delimiter
-        )
-    }
-
-    fn visit_str<E: de::Error>(self, value: &str) -> Result<Self::Value, E> {
-        // `Split(Delimiter, RemoveEmptyEntries)` + `Trim()` + convert, dropping
-        // whatever the `TypeConverter` refuses. `deserialize_token` is the
-        // same token converter the query-string path uses, so a spelling that
-        // binds on `GET /LiveTv/Programs` binds identically on the `POST` form.
-        Ok(value
-            .split(self.delimiter)
-            .map(str::trim)
-            .filter(|token| !token.is_empty())
-            .filter_map(deserialize_token)
-            .collect())
-    }
-
-    fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
-        // `JsonSerializer.Deserialize<T[]>` — strict: an unknown member errors.
-        let mut values = Vec::new();
-        while let Some(value) = seq.next_element::<T>()? {
-            values.push(value);
-        }
-        Ok(values)
-    }
-}
-
 /// Applies the `locationTypes` / `excludeLocationTypes` query parameters to a
 /// query's `IsVirtualItem`, exactly as `ItemsController.GetItems` does.
 ///
@@ -352,9 +238,16 @@ pub(crate) fn apply_location_types(
 
 #[cfg(test)]
 mod tests {
-    use super::{empty_as_none_uuid, parse_csv_strings, parse_csv_uuids, parse_pipe_strings};
+    use super::{
+        empty_as_none_uuid, get_order_by, parse_csv_strings, parse_csv_uuids, parse_order_by,
+        parse_pipe_strings,
+    };
 
     use ferrofin_model::data::BaseItemKind;
+    use ferrofin_model::dto::SortOrder::{self, Ascending, Descending};
+    use ferrofin_model::live_tv::ItemSortBy::{
+        self, IsFavoriteOrLiked, Name, ProductionYear, Random, SortName,
+    };
     use rstest::rstest;
     use uuid::Uuid;
 
@@ -379,6 +272,50 @@ mod tests {
         #[case] expected: &[&str],
     ) {
         assert_eq!(parse_csv_strings(raw), expected);
+    }
+
+    /// The first three cases are upstream's `RequestHelpersTests.GetOrderBy_Success`
+    /// data; the rest pin the other arms of `GetOrderBy`.
+    #[rstest]
+    #[case(&[], &[], &[])]
+    #[case(
+        &[IsFavoriteOrLiked, Random],
+        &[],
+        &[(IsFavoriteOrLiked, Ascending), (Random, Ascending)]
+    )]
+    #[case(
+        &[SortName, ProductionYear],
+        &[Descending],
+        &[(SortName, Descending), (ProductionYear, Descending)]
+    )]
+    #[case(
+        &[SortName, ProductionYear, Name],
+        &[Descending, Ascending],
+        &[(SortName, Descending), (ProductionYear, Ascending), (Name, Descending)]
+    )]
+    #[case(&[], &[Descending], &[])]
+    // Upstream answers 400 here (it indexes past `sortBy`).
+    #[case(&[SortName], &[Descending, Ascending], &[(SortName, Descending)])]
+    fn order_by_pairs_like_get_order_by(
+        #[case] sort_by: &[ItemSortBy],
+        #[case] sort_order: &[SortOrder],
+        #[case] expected: &[(ItemSortBy, SortOrder)],
+    ) {
+        assert_eq!(get_order_by(sort_by.to_vec(), sort_order), expected);
+    }
+
+    /// The binder trims, ignores case and drops a token it cannot convert, so
+    /// a dropped order shifts the later ones down an index, as upstream.
+    #[test]
+    fn order_by_binds_like_the_comma_delimited_binder() {
+        assert_eq!(
+            parse_order_by(
+                Some(" sortname ,Bogus,,ProductionYear"),
+                Some("Nope, DESCENDING")
+            ),
+            [(SortName, Descending), (ProductionYear, Descending)]
+        );
+        assert_eq!(parse_order_by(None, Some("Descending")), []);
     }
 
     #[test]
@@ -413,7 +350,6 @@ mod tests {
 
     #[test]
     fn nullable_wire_enums_keep_csharp_values() {
-        use ferrofin_model::dto::SortOrder;
         // A wire enum maps numbers by C# value and keeps an undefined one.
         #[derive(Debug, serde::Deserialize)]
         struct W {
@@ -506,95 +442,6 @@ mod tests {
         let ids = parse_csv_uuids(Some(&format!("({id}), {}", id.simple()))).expect("P and N");
         assert_eq!(ids, vec![id, id]);
         assert!(parse_csv_uuids(Some(&format!("urn:uuid:{id}"))).is_err());
-    }
-
-    /// A stand-in for a request DTO property carrying the *comma* factory.
-    #[derive(Debug, serde::Deserialize)]
-    struct CommaHolder {
-        #[serde(default, deserialize_with = "super::de_comma_delimited")]
-        ids: Option<Vec<Uuid>>,
-        #[serde(default, deserialize_with = "super::de_comma_delimited")]
-        kinds: Option<Vec<BaseItemKind>>,
-    }
-
-    /// A stand-in for a property carrying the *pipe* factory.
-    #[derive(Debug, serde::Deserialize)]
-    struct PipeHolder {
-        #[serde(default, deserialize_with = "super::de_pipe_delimited")]
-        genres: Option<Vec<String>>,
-    }
-
-    #[test]
-    fn delimited_json_accepts_both_the_string_and_the_array_form() {
-        let id = Uuid::from_u128(11);
-        let from_str: CommaHolder =
-            serde_json::from_str(&format!(r#"{{"ids":"{id},{id}","kinds":"Movie,Series"}}"#))
-                .expect("binds");
-        assert_eq!(from_str.ids, Some(vec![id, id]));
-        assert_eq!(
-            from_str.kinds,
-            Some(vec![BaseItemKind::Movie, BaseItemKind::Series])
-        );
-        let from_arr: CommaHolder = serde_json::from_str(&format!(
-            r#"{{"ids":["{id}","{id}"],"kinds":["Movie","Series"]}}"#
-        ))
-        .expect("binds");
-        assert_eq!(from_arr.ids, from_str.ids);
-        assert_eq!(from_arr.kinds, from_str.kinds);
-    }
-
-    #[test]
-    fn delimited_json_string_form_drops_unconvertible_entries() {
-        // `catch (FormatException) { /* Ignore unconvertible inputs */ }`.
-        let id = Uuid::from_u128(12);
-        let holder: CommaHolder =
-            serde_json::from_str(&format!(r#"{{"ids":"zzz,{id}","kinds":"Nope,Movie"}}"#))
-                .expect("binds");
-        assert_eq!(holder.ids, Some(vec![id]));
-        assert_eq!(holder.kinds, Some(vec![BaseItemKind::Movie]));
-        // Case-insensitively, exactly as the query-string binder does.
-        let cased: CommaHolder = serde_json::from_str(r#"{"kinds":"movie"}"#).expect("binds");
-        assert_eq!(cased.kinds, Some(vec![BaseItemKind::Movie]));
-    }
-
-    #[test]
-    fn delimited_json_string_form_removes_empty_entries_and_trims() {
-        let holder: CommaHolder =
-            serde_json::from_str(r#"{"kinds":" Movie , ,Series,"}"#).expect("binds");
-        assert_eq!(
-            holder.kinds,
-            Some(vec![BaseItemKind::Movie, BaseItemKind::Series])
-        );
-        let empty: CommaHolder = serde_json::from_str(r#"{"kinds":",,"}"#).expect("binds");
-        assert_eq!(empty.kinds, Some(Vec::new()));
-    }
-
-    #[test]
-    fn delimited_json_array_form_is_strict() {
-        // The array arm is `JsonSerializer.Deserialize<T[]>`, which errors.
-        assert!(serde_json::from_str::<CommaHolder>(r#"{"kinds":["Nope"]}"#).is_err());
-        assert!(serde_json::from_str::<CommaHolder>(r#"{"ids":["zzz"]}"#).is_err());
-    }
-
-    #[test]
-    fn delimited_json_null_and_absent_are_none() {
-        let absent: CommaHolder = serde_json::from_str("{}").expect("binds");
-        assert!(absent.ids.is_none() && absent.kinds.is_none());
-        let nulled: CommaHolder =
-            serde_json::from_str(r#"{"ids":null,"kinds":null}"#).expect("binds");
-        assert!(nulled.ids.is_none() && nulled.kinds.is_none());
-    }
-
-    #[test]
-    fn pipe_delimited_json_splits_on_the_pipe_only() {
-        let piped: PipeHolder = serde_json::from_str(r#"{"genres":"News|Sport"}"#).expect("binds");
-        assert_eq!(
-            piped.genres,
-            Some(vec!["News".to_owned(), "Sport".to_owned()])
-        );
-        // A comma is just a character in a genre name for the pipe converter.
-        let commas: PipeHolder = serde_json::from_str(r#"{"genres":"News,Sport"}"#).expect("binds");
-        assert_eq!(commas.genres, Some(vec!["News,Sport".to_owned()]));
     }
 
     #[test]

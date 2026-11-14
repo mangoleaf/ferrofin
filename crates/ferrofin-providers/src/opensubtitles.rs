@@ -6,13 +6,16 @@
 //! ([`OpenSubtitlesConfig`] — account + optional API key override) are set through
 //! the dashboard plugin-configuration page (`POST /Plugins/{id}/Configuration`)
 //! and read back via the [`PluginManager`]. Jellyfin's shared application key is
-//! used by default. Downloads still require an OpenSubtitles account; with no
-//! account or explicit key configured, the provider remains inactive.
+//! used by default. Downloads and automated searches still require an
+//! OpenSubtitles account; with no account or explicit key configured, the
+//! provider remains inactive.
 //!
-//! Downloads share one session, as the plugin's downloader does: the login's
-//! token is reused until it expires or the configured account changes, and the
+//! Searches and downloads share one session, as the plugin's downloader does:
+//! an account logs in before its first search or download, the login's token
+//! is reused until it expires or the configured account changes, and the
 //! account's daily quota is tracked, so a spent quota stops downloads until its
-//! reset time instead of logging in again for every file.
+//! reset time, and automated searches until the session is renewed, instead
+//! of logging in again for every file.
 //!
 //! API shape (<https://opensubtitles.stoplight.io>): every call carries the
 //! `Api-Key` header and a descriptive `User-Agent`; `POST /login` exchanges the
@@ -29,7 +32,8 @@
 
 use crate::rate_limit::CountedBody as _;
 use crate::rate_limit::{BodyError, LimitedRequest as _, RateLimiter, RequestError};
-use std::sync::Arc;
+use std::collections::HashSet;
+use std::sync::{Arc, PoisonError};
 
 use crate::destination::PrivateAllowList;
 use crate::error::ProvidersError;
@@ -60,6 +64,10 @@ const DEFAULT_API_KEY: &str = "gUCLWGoAg2PmyseoTM0INFFVPcDCeDlT";
 /// The `User-Agent` OpenSubtitles requires (they reject generic agents).
 const USER_AGENT: &str = ferrofin_health::USER_AGENT;
 
+/// How often an automated search says the daily quota is spent: the
+/// plugin's `_lastRatelimitLog` interval.
+const LIMIT_LOG_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
+
 /// The download link's fetch, for its limiter and log lines.
 static LINK_FETCH: FetchKind = FetchKind::new(
     "opensubtitles",
@@ -86,7 +94,8 @@ pub struct OpenSubtitlesConfig {
 
 impl OpenSubtitlesConfig {
     /// Whether an account or explicit API key is configured. An account uses
-    /// the shared application key; an explicit key alone still permits searches.
+    /// the shared application key; an explicit key alone still permits manual
+    /// searches.
     #[must_use]
     pub fn is_configured(&self) -> bool {
         !self.api_key.expose_secret().trim().is_empty()
@@ -95,10 +104,18 @@ impl OpenSubtitlesConfig {
     }
 
     /// Whether an account is configured: both a username and a password
-    /// (`Login`'s `IsNullOrWhiteSpace` checks). Downloads need one.
+    /// (`Login`'s `IsNullOrWhiteSpace` checks). Downloads and automated
+    /// searches need one.
     #[must_use]
     pub fn has_account(&self) -> bool {
         !self.username.trim().is_empty() && !self.password.expose_secret().trim().is_empty()
+    }
+
+    /// Whether `other` names the same account and key.
+    fn same_account(&self, other: &Self) -> bool {
+        self.username == other.username
+            && self.password.expose_secret() == other.password.expose_secret()
+            && self.effective_api_key() == other.effective_api_key()
     }
 
     /// The operator's override, or Jellyfin's shared application key.
@@ -150,6 +167,19 @@ enum LoginFailure {
 }
 
 impl LoginFailure {
+    /// Whether the API refused the account itself, which `Login` marks as
+    /// `CredentialsInvalid`: a 401, or a 400 for an e-mail address given as
+    /// the username.
+    fn refuses_account(&self, cfg: &OpenSubtitlesConfig) -> bool {
+        match self {
+            Self::Rejected { status, .. } => {
+                *status == reqwest::StatusCode::UNAUTHORIZED
+                    || (*status == reqwest::StatusCode::BAD_REQUEST && cfg.username.contains('@'))
+            }
+            Self::Request(_) => false,
+        }
+    }
+
     /// The failure as the download path reports it.
     fn into_service_error(self) -> ServiceError {
         match self {
@@ -161,8 +191,13 @@ impl LoginFailure {
     }
 }
 
+/// One page of `GET /subtitles` (`SearchResult`).
 #[derive(Deserialize)]
 struct SearchResponse {
+    #[serde(default)]
+    total_pages: i32,
+    #[serde(default)]
+    page: i32,
     #[serde(default)]
     data: Vec<SearchItem>,
 }
@@ -173,6 +208,10 @@ struct SearchItem {
     attributes: SearchAttributes,
 }
 
+/// One result's `Attributes`. The plugin's non-nullable numbers
+/// (`DownloadCount`, `Ratings`, `Fps`) read an absent one as zero; an absent
+/// `upload_date` leaves the candidate's `DateCreated` out, where the plugin's
+/// non-nullable `DateTime` would send 0001-01-01.
 #[derive(Deserialize, Default)]
 struct SearchAttributes {
     #[serde(default)]
@@ -182,13 +221,42 @@ struct SearchAttributes {
     #[serde(default)]
     foreign_parts_only: Option<bool>,
     #[serde(default)]
+    machine_translated: Option<bool>,
+    #[serde(default)]
+    ai_translated: Option<bool>,
+    #[serde(default)]
+    from_trusted: Option<bool>,
+    #[serde(default)]
     release: Option<String>,
     #[serde(default)]
-    download_count: Option<i64>,
+    comments: Option<String>,
+    #[serde(default)]
+    download_count: Option<i32>,
+    #[serde(default)]
+    ratings: Option<f32>,
+    #[serde(default)]
+    fps: Option<f32>,
+    #[serde(default, deserialize_with = "lenient_time")]
+    upload_date: Option<chrono::DateTime<chrono::Utc>>,
     #[serde(default)]
     uploader: Option<Uploader>,
     #[serde(default)]
+    feature_details: Option<FeatureDetails>,
+    #[serde(default)]
     files: Vec<SubFile>,
+}
+
+/// What a result is for (`FeatureDetails`).
+#[derive(Deserialize, Default)]
+struct FeatureDetails {
+    #[serde(default)]
+    feature_type: Option<String>,
+    #[serde(default)]
+    imdb_id: Option<i64>,
+    #[serde(default)]
+    season_number: Option<i32>,
+    #[serde(default)]
+    episode_number: Option<i32>,
 }
 
 #[derive(Deserialize, Default)]
@@ -199,9 +267,22 @@ struct Uploader {
 
 #[derive(Deserialize, Default)]
 struct SubFile {
-    file_id: i64,
     #[serde(default)]
-    file_name: Option<String>,
+    file_id: Option<i64>,
+}
+
+/// `GET /infos/languages` (`EncapsulatedLanguageList`).
+#[derive(Deserialize)]
+struct LanguageList {
+    #[serde(default)]
+    data: Option<Vec<LanguageCode>>,
+}
+
+/// One language the API searches (`LanguageInfo`).
+#[derive(Deserialize)]
+struct LanguageCode {
+    #[serde(default)]
+    language_code: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -295,12 +376,17 @@ impl Session {
     }
 }
 
-/// What downloads share: the session and the quota's reset time (the
-/// plugin's `_login` and `_limitReset`).
+/// What searches and downloads share: the session, the quota's reset time,
+/// when an automated search last said the quota is spent, and the account
+/// the API refused (the plugin's `_login`, `_limitReset`, `_lastRatelimitLog`
+/// and `CredentialsInvalid`, which the plugin saves and this keeps for the
+/// process).
 #[derive(Default)]
 struct DownloadState {
     session: Option<Session>,
     limit_reset: Option<chrono::DateTime<chrono::Utc>>,
+    limit_logged: Option<std::time::Instant>,
+    rejected: Option<OpenSubtitlesConfig>,
 }
 
 impl DownloadState {
@@ -418,53 +504,190 @@ fn parse_subtitle_id(id: &str) -> Option<ParsedId> {
     })
 }
 
-/// Maps a search response into namespaced [`RemoteSubtitleInfo`] candidates.
+/// `Search`'s filters, order and mapping over every page's results.
 ///
-/// Each candidate's `id` is the provider-local id ([`build_subtitle_id`]); the
-/// subtitle manager namespaces it with the provider's MD5 id, as upstream
-/// `SubtitleManager.Normalize` does. As in the plugin, the
-/// language stamped on the candidate and into its id is the CALLER's 3-letter
-/// code (`request.Language`), never the API's own tag: the search was already
-/// filtered by it, and the API's tags (`pt-BR`, `zh-CN`) carry a `-` that would
-/// break the id. Pulled out as a pure function so it is unit-testable without a
-/// live API.
-fn map_search(response: &SearchResponse, language: &str) -> Vec<RemoteSubtitleInfo> {
-    let mut out = Vec::new();
-    for item in &response.data {
-        let attrs = &item.attributes;
-        // A result can carry several files; each downloadable file is a candidate.
-        for file in &attrs.files {
-            out.push(RemoteSubtitleInfo {
-                id: Some(build_subtitle_id(language, attrs, file.file_id)),
-                provider_name: Some(PLUGIN_NAME.to_owned()),
-                three_letter_iso_language_name: Some(language.to_owned()),
-                name: file.file_name.clone().or_else(|| attrs.release.clone()),
-                format: Some("srt".to_owned()),
-                author: attrs.uploader.as_ref().and_then(|u| u.name.clone()),
-                comment: attrs.release.clone(),
-                download_count: attrs.download_count.and_then(|c| i32::try_from(c).ok()),
-                is_hash_match: attrs.moviehash_match,
-                hearing_impaired: attrs.hearing_impaired,
-                forced: attrs.foreign_parts_only,
-                ..Default::default()
-            });
-        }
-    }
-    out
+/// A result is kept when its first file has an id that an automated search
+/// has not found empty (`BadSubtitleFilter`), when it is for the item's own
+/// feature (`MediaFilter`: the content type, an episode's season and number,
+/// a movie's IMDb id when it has one), and, for a perfect-match search, when
+/// it matches the file's hash (`MatchFilter`). The results are ordered by hash
+/// match, download count, rating and trusted uploader, and each becomes one
+/// candidate.
+///
+/// Each candidate's `id` is the provider-local id ([`build_subtitle_id`]) of
+/// the result's first file; the subtitle manager namespaces it with the
+/// provider's MD5 id, as upstream `SubtitleManager.Normalize` does. As in the
+/// plugin, the language stamped on the candidate and into its id is the
+/// CALLER's 3-letter code (`request.Language`), never the API's own tag: the
+/// search was already filtered by it, and the API's tags (`pt-BR`, `zh-CN`)
+/// carry a `-` that would break the id.
+fn map_search(
+    items: Vec<SearchItem>,
+    request: &SubtitleSearchRequest,
+    imdb_id: i64,
+    bad_ids: &HashSet<i64>,
+) -> Vec<RemoteSubtitleInfo> {
+    let episode = request.content_type == SubtitleMediaType::Episode;
+    let feature_type = if episode { "Episode" } else { "Movie" };
+    let mut kept: Vec<(i64, SearchAttributes)> = items
+        .into_iter()
+        .filter_map(|item| {
+            let attrs = item.attributes;
+            let file_id = attrs.files.first().and_then(|file| file.file_id)?;
+            if request.is_automated && bad_ids.contains(&file_id) {
+                return None;
+            }
+            let details = attrs.feature_details.as_ref()?;
+            let own_feature = details.feature_type.as_deref() == Some(feature_type)
+                && if episode {
+                    details.season_number == request.parent_index_number
+                        && details.episode_number == request.index_number
+                } else {
+                    imdb_id == 0 || details.imdb_id == Some(imdb_id)
+                };
+            let matched =
+                request.is_perfect_match != Some(true) || attrs.moviehash_match.unwrap_or(false);
+            (own_feature && matched).then_some((file_id, attrs))
+        })
+        .collect();
+    kept.sort_by(|(_, a), (_, b)| {
+        b.moviehash_match
+            .unwrap_or(false)
+            .cmp(&a.moviehash_match.unwrap_or(false))
+            .then(
+                b.download_count
+                    .unwrap_or(0)
+                    .cmp(&a.download_count.unwrap_or(0)),
+            )
+            .then(
+                b.ratings
+                    .unwrap_or(0.0)
+                    .total_cmp(&a.ratings.unwrap_or(0.0)),
+            )
+            .then(b.from_trusted.cmp(&a.from_trusted))
+    });
+    kept.into_iter()
+        .map(|(file_id, attrs)| RemoteSubtitleInfo {
+            id: Some(build_subtitle_id(&request.language, &attrs, file_id)),
+            provider_name: Some(PLUGIN_NAME.to_owned()),
+            three_letter_iso_language_name: Some(request.language.clone()),
+            name: attrs.release,
+            format: Some("srt".to_owned()),
+            author: attrs.uploader.and_then(|uploader| uploader.name),
+            comment: attrs.comments,
+            date_created: attrs.upload_date,
+            community_rating: Some(attrs.ratings.unwrap_or(0.0)),
+            frame_rate: Some(attrs.fps.unwrap_or(0.0)),
+            download_count: Some(attrs.download_count.unwrap_or(0)),
+            is_hash_match: attrs.moviehash_match,
+            ai_translated: attrs.ai_translated,
+            machine_translated: attrs.machine_translated,
+            forced: attrs.foreign_parts_only,
+            hearing_impaired: attrs.hearing_impaired,
+        })
+        .collect()
 }
 
-/// The search `languages` value (`OpenSubtitleDownloader.GetLanguage`): the
-/// request's two-letter code, which the subtitle manager fills in, with the
-/// regioned tags the API lists in place of bare `zh` and `pt`. `None` for a
-/// language with no two-letter code, which upstream refuses with a
-/// `NotSupportedException`.
-fn search_language(request: &SubtitleSearchRequest) -> Option<&str> {
-    match request.two_letter_iso_language_name.as_deref() {
-        Some("zh") => Some("zh-CN"),
-        Some("pt") => Some("pt-PT"),
-        Some(code) if !code.is_empty() => Some(code),
-        _ => None,
+/// The item's IMDb number, as the plugin reads it (`long.TryParse` of the id
+/// without its leading `t`s), or `0` when it has none.
+fn imdb_number(imdb_id: Option<&str>) -> i64 {
+    imdb_id
+        .and_then(|id| id.trim_start_matches('t').trim().parse().ok())
+        .unwrap_or(0)
+}
+
+/// `Search`'s parameters: the language, the content `type`, the file's hash
+/// (and `moviehash_match=only` for a perfect match), then the IMDb id when
+/// the item has one, or else the file's name and an episode's numbers.
+fn search_options(
+    request: &SubtitleSearchRequest,
+    language: String,
+    hash: Option<String>,
+    imdb_id: i64,
+    media_path: &str,
+) -> Vec<(&'static str, String)> {
+    let episode = request.content_type == SubtitleMediaType::Episode;
+    let content_type = if episode { "episode" } else { "movie" };
+    let mut options = vec![("languages", language), ("type", content_type.to_owned())];
+    if let Some(hash) = hash {
+        options.push(("moviehash", hash));
+        if request.is_perfect_match == Some(true) {
+            options.push(("moviehash_match", "only".to_owned()));
+        }
     }
+    if imdb_id != 0 {
+        options.push(("imdb_id", imdb_id.to_string()));
+        return options;
+    }
+    // `Path.GetFileName`: after the platform's last separator.
+    let file_name = media_path
+        .rsplit(std::path::is_separator)
+        .next()
+        .unwrap_or(media_path);
+    options.push(("query", file_name.to_owned()));
+    if episode {
+        options.extend(
+            request
+                .parent_index_number
+                .map(|n| ("season_number", n.to_string())),
+        );
+        options.extend(
+            request
+                .index_number
+                .map(|n| ("episode_number", n.to_string())),
+        );
+    }
+    options
+}
+
+/// `RequestHandler.AddQueryString`: `path` with `params` sorted by name, each
+/// name and value lowercased (`ToLowerInvariant`) and encoded as
+/// `HttpUtility.UrlEncode` encodes it.
+fn add_query_string(path: &str, params: &[(&str, String)]) -> String {
+    use ferrofin_util::string_extensions::lower_invariant;
+    if params.is_empty() {
+        return path.to_owned();
+    }
+    let mut sorted: Vec<_> = params.iter().collect();
+    sorted.sort_by_key(|(name, _)| *name);
+    let pairs: Vec<String> = sorted
+        .into_iter()
+        .map(|(name, value)| {
+            format!(
+                "{}={}",
+                url_encode(&lower_invariant(name)),
+                url_encode(&lower_invariant(value)),
+            )
+        })
+        .collect();
+    format!("{path}?{}", pairs.join("&"))
+}
+
+/// `HttpUtility.UrlEncode`: the UTF-8 bytes, with a space as `+`, ASCII
+/// letters, digits and `-_.!*()` as they are, and every other byte as `%xx`
+/// in lowercase hex.
+fn url_encode(text: &str) -> String {
+    use std::fmt::Write as _;
+    let mut encoded = String::with_capacity(text.len());
+    for byte in text.bytes() {
+        match byte {
+            b' ' => encoded.push('+'),
+            b'a'..=b'z'
+            | b'A'..=b'Z'
+            | b'0'..=b'9'
+            | b'-'
+            | b'_'
+            | b'.'
+            | b'!'
+            | b'*'
+            | b'('
+            | b')' => encoded.push(char::from(byte)),
+            _ => {
+                let _ = write!(encoded, "%{byte:02x}");
+            }
+        }
+    }
+    encoded
 }
 
 /// The OpenSubtitles-backed subtitle provider.
@@ -476,8 +699,14 @@ pub struct OpenSubtitlesProvider {
     limiter: RateLimiter,
     plugins: Arc<dyn PluginManager>,
     base_url: String,
-    /// Held across a login, so concurrent downloads share one.
+    /// Held across a login, so concurrent searches and downloads share one.
     state: tokio::sync::Mutex<DownloadState>,
+    /// The language codes the API searches, read once (the plugin's
+    /// `_languages`).
+    languages: tokio::sync::Mutex<Vec<String>>,
+    /// The files whose link served an empty subtitle, which automated
+    /// searches skip (the plugin's `_badSubtitleIds`).
+    bad_subtitle_ids: std::sync::Mutex<HashSet<i64>>,
 }
 
 impl std::fmt::Debug for OpenSubtitlesProvider {
@@ -494,12 +723,14 @@ impl OpenSubtitlesProvider {
     #[must_use]
     pub fn new(plugins: Arc<dyn PluginManager>) -> Self {
         Self {
-            http: reqwest::Client::new(),
+            http: crate::http_client::client(),
             link_http: Self::link_http(PrivateAllowList::default()),
             limiter: RateLimiter::new("opensubtitles"),
             plugins,
             base_url: API_BASE.to_owned(),
             state: tokio::sync::Mutex::new(DownloadState::default()),
+            languages: tokio::sync::Mutex::new(Vec::new()),
+            bad_subtitle_ids: std::sync::Mutex::new(HashSet::new()),
         }
     }
 
@@ -533,14 +764,6 @@ impl OpenSubtitlesProvider {
         Ok(serde_json::from_slice(&bytes).unwrap_or_default())
     }
 
-    /// Exchanges the account credentials for a bearer token.
-    async fn login(&self, cfg: &OpenSubtitlesConfig) -> Result<String, ServiceError> {
-        self.login_reply(cfg)
-            .await
-            .map(|reply| reply.token)
-            .map_err(LoginFailure::into_service_error)
-    }
-
     /// `OpenSubtitlesApi.LogInAsync`: the login reply, or why there is none.
     async fn login_reply(&self, cfg: &OpenSubtitlesConfig) -> Result<LoginResponse, LoginFailure> {
         let resp = self
@@ -563,7 +786,7 @@ impl OpenSubtitlesProvider {
         }
         resp.counted_json()
             .await
-            .map_err(|e| LoginFailure::Request(net_err(e)))
+            .map_err(|e| LoginFailure::Request(body_err(e)))
     }
 
     /// `OpenSubtitlesApi.LogOutAsync`: ends the session `token` opened. Best
@@ -603,7 +826,22 @@ impl OpenSubtitlesProvider {
             return Ok(session.token.clone());
         }
         state.session = None;
-        let token = self.login(cfg).await?;
+        let token = match self.login_reply(cfg).await {
+            Ok(reply) => {
+                state.rejected = None;
+                reply.token
+            }
+            Err(failure) => {
+                if failure.refuses_account(cfg) {
+                    tracing::warn!(
+                        "OpenSubtitles refused the account; until it logs in again or changes, \
+                         manual searches go on without a login and automated ones find nothing"
+                    );
+                    state.rejected = Some(cfg.clone());
+                }
+                return Err(failure.into_service_error());
+            }
+        };
         let expires_at = token_expiry(&token);
         if expires_at <= chrono::Utc::now() {
             tracing::debug!(
@@ -677,8 +915,8 @@ impl OpenSubtitlesProvider {
     /// Past the reset time, a session whose token has expired, or whose
     /// quota read is refused, is dropped instead, so the login that follows
     /// reads the quota afresh. Upstream re-reads with the stale token, which a
-    /// refusal leaves spent for good; there, a search's `Login` replaces the
-    /// session, and Ferrofin's search does not log in.
+    /// refusal leaves spent until a later `Login` (a search's, once the token
+    /// has expired) replaces the session.
     async fn ensure_quota(
         &self,
         state: &mut DownloadState,
@@ -710,6 +948,209 @@ impl OpenSubtitlesProvider {
         Err(download_limit_reached())
     }
 
+    /// The start of `Search`: an account logs in, or reuses its session,
+    /// before every search, and an automated search goes on only while the
+    /// account has downloads left.
+    ///
+    /// Without a login an automated search finds nothing and a manual one
+    /// searches on the key alone: upstream's `Login` skips an account it marked
+    /// invalid, leaving `_login` null. With no account at all it throws, and a
+    /// manual search on an API key alone still searches here (gl-808).
+    async fn may_search(
+        &self,
+        request: &SubtitleSearchRequest,
+        cfg: &OpenSubtitlesConfig,
+    ) -> Result<bool, ServiceError> {
+        let without_login = || {
+            if request.is_automated {
+                tracing::debug!(item_id = %request.item_id, "no OpenSubtitles login; automated search skipped");
+            }
+            Ok(!request.is_automated)
+        };
+        if !cfg.has_account() {
+            return without_login();
+        }
+        let mut state = self.state.lock().await;
+        if state
+            .rejected
+            .as_ref()
+            .is_some_and(|rejected| rejected.same_account(cfg))
+        {
+            return without_login();
+        }
+        self.session_token(&mut state, cfg).await?;
+        if !request.is_automated || !state.session.as_ref().is_some_and(Session::quota_spent) {
+            return Ok(true);
+        }
+        if state
+            .limit_logged
+            .is_none_or(|logged| logged.elapsed() > LIMIT_LOG_INTERVAL)
+        {
+            tracing::info!(
+                "OpenSubtitles daily download limit reached; automated searches find nothing"
+            );
+            state.limit_logged = Some(std::time::Instant::now());
+        }
+        Ok(false)
+    }
+
+    /// `GetLanguage`: the search's `languages` value. It is the request's
+    /// two-letter code, with the regioned tags the plugin uses for bare `zh`
+    /// and `pt`, spelled as the API's language list spells it; a regioned
+    /// code the list lacks falls back to its language. `None` for a language
+    /// with no two-letter code or one the list lacks, which upstream refuses
+    /// with an exception.
+    ///
+    /// The list is read once and kept; a failed read fails the search, and
+    /// the next search reads it again.
+    async fn search_language(
+        &self,
+        request: &SubtitleSearchRequest,
+        cfg: &OpenSubtitlesConfig,
+    ) -> Result<Option<String>, ServiceError> {
+        let mut code = match request.two_letter_iso_language_name.as_deref() {
+            Some("zh") => "zh-CN",
+            Some("pt") => "pt-PT",
+            Some(code) if !code.is_empty() => code,
+            _ => return Ok(None),
+        };
+        let mut languages = self.languages.lock().await;
+        if languages.is_empty() {
+            *languages = self.language_list(cfg).await?;
+        }
+        loop {
+            if let Some(found) = languages
+                .iter()
+                .find(|listed| listed.eq_ignore_ascii_case(code))
+            {
+                return Ok(Some(found.clone()));
+            }
+            // Not rewritten again: upstream's recursion would turn `pt` back
+            // into `pt-PT` forever when the list lacks it.
+            let Some((language, _)) = code.split_once('-') else {
+                return Ok(None);
+            };
+            code = language;
+        }
+    }
+
+    /// `OpenSubtitlesApi.GetLanguageList`: the language codes the API
+    /// searches.
+    async fn language_list(&self, cfg: &OpenSubtitlesConfig) -> Result<Vec<String>, ServiceError> {
+        let response = self
+            .http
+            .get(format!("{}/infos/languages", self.base_url))
+            .header("Api-Key", cfg.effective_api_key())
+            .header(reqwest::header::USER_AGENT, USER_AGENT)
+            .header(reqwest::header::ACCEPT, "application/json")
+            .send_limited(&self.limiter)
+            .await
+            .map_err(request_err)?;
+        let status = response.status();
+        let list = if status.is_success() {
+            response
+                .counted_json::<LanguageList>()
+                .await
+                .map_err(body_err)?
+                .data
+        } else {
+            None
+        };
+        let list = list.ok_or_else(|| {
+            ServiceError::backend(format!("Failed to get language list: {status}"))
+        })?;
+        Ok(list
+            .into_iter()
+            .filter_map(|language| language.language_code)
+            .filter(|code| !code.trim().is_empty())
+            .collect())
+    }
+
+    /// `OpenSubtitlesApi.SearchSubtitlesAsync`: every page's results, the
+    /// pages after the first asked for by `page`.
+    async fn search_pages(
+        &self,
+        cfg: &OpenSubtitlesConfig,
+        options: &[(&str, String)],
+    ) -> Result<Vec<SearchItem>, ServiceError> {
+        let mut items = Vec::new();
+        let mut current = 1;
+        let mut last = None;
+        loop {
+            let mut params = options.to_vec();
+            if current > 1 {
+                params.push(("page", current.to_string()));
+            }
+            let response = self
+                .http
+                .get(format!(
+                    "{}{}",
+                    self.base_url,
+                    add_query_string("/subtitles", &params)
+                ))
+                .header("Api-Key", cfg.effective_api_key())
+                .header(reqwest::header::USER_AGENT, USER_AGENT)
+                .header(reqwest::header::ACCEPT, "application/json")
+                .send_limited(&self.limiter)
+                .await
+                .map_err(request_err)?;
+            if !response.status().is_success() {
+                return Err(ServiceError::backend(format!(
+                    "OpenSubtitles search failed: HTTP {}",
+                    response.status()
+                )));
+            }
+            let page: SearchResponse = response.counted_json().await.map_err(body_err)?;
+            if page.total_pages == 0 {
+                break;
+            }
+            let last = *last.get_or_insert(page.total_pages);
+            let next = page.page.saturating_add(1);
+            // A page that does not move on ends the search; upstream would
+            // ask for it again forever.
+            if next <= current {
+                break;
+            }
+            items.extend(page.data);
+            if next > last {
+                break;
+            }
+            current = next;
+        }
+        Ok(items)
+    }
+
+    /// The subtitle file at `link`, a destination OpenSubtitles chose: vetted
+    /// on every hop (gl-1160). An empty file fails the download and is most
+    /// likely broken at OpenSubtitles, so automated searches skip `file_id`
+    /// from then on (`GetSubtitlesInternal`).
+    async fn download_link(&self, link: &str, file_id: i64) -> Result<Vec<u8>, ServiceError> {
+        let content = self
+            .link_http
+            .send(link)
+            .await
+            .map_err(link_err)?
+            .response
+            .error_for_status()
+            // The link is a one-time capability URL: keep it out of the error text (LOGGING.md §5).
+            .map_err(|error| net_err(error.without_url()))?
+            .counted_bytes()
+            .await
+            .map_err(body_err)?;
+        if String::from_utf8_lossy(&content).trim().is_empty() {
+            self.bad_subtitle_ids
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .insert(file_id);
+            return Err(ServiceError::backend(format!(
+                "Subtitle with Id {file_id} could not be downloaded: OK - this is most likely a \
+                 broken subtitle, report at opensubtitles.com/contact and make sure to include \
+                 the id"
+            )));
+        }
+        Ok(content)
+    }
+
     /// Validates the supplied credentials by attempting a login, then logs the
     /// session it opened out again and reports the account's allowed downloads
     /// (the plugin's `ValidateLoginInfo`).
@@ -729,6 +1170,8 @@ impl OpenSubtitlesProvider {
         }
         match self.login_reply(cfg).await {
             Ok(reply) => {
+                // The settings page's validation clears `CredentialsInvalid`.
+                self.state.lock().await.rejected = None;
                 self.logout(cfg, &reply.token).await;
                 Ok(ProviderLogin {
                     allowed_downloads: reply
@@ -837,6 +1280,7 @@ fn body_err(e: BodyError) -> ServiceError {
         BodyError::TooLarge => {
             ServiceError::backend("OpenSubtitles sent more than image_download_max_mb")
         }
+        BodyError::Decode(e) => ServiceError::backend(format!("OpenSubtitles request failed: {e}")),
     }
 }
 
@@ -891,7 +1335,28 @@ impl SubtitleProvider for OpenSubtitlesProvider {
             // Unconfigured provider contributes no candidates (not an error).
             return Ok(Vec::new());
         }
-        let Some(language) = search_language(request) else {
+        if !self.may_search(request, &cfg).await? {
+            return Ok(Vec::new());
+        }
+        let imdb_id = imdb_number(request.imdb_id.as_deref());
+        let episode = request.content_type == SubtitleMediaType::Episode;
+        if episode
+            && (request.index_number.is_none()
+                || request.parent_index_number.is_none()
+                || request.series_name.as_deref().is_none_or(str::is_empty))
+        {
+            tracing::debug!(item_id = %request.item_id, "episode information missing; not searched");
+            return Ok(Vec::new());
+        }
+        let Some(media_path) = request
+            .media_path
+            .as_deref()
+            .filter(|path| !path.is_empty())
+        else {
+            tracing::debug!(item_id = %request.item_id, "no media path; not searched");
+            return Ok(Vec::new());
+        };
+        let Some(language) = self.search_language(request, &cfg).await? else {
             // Not searched, as upstream; at debug, since the scheduled task asks once per video.
             tracing::debug!(
                 item_id = %request.item_id,
@@ -901,80 +1366,21 @@ impl SubtitleProvider for OpenSubtitlesProvider {
             return Ok(Vec::new());
         };
 
-        let hash = match request.media_path.as_deref() {
-            Some(path) if !path.to_ascii_lowercase().ends_with(".strm") => {
-                movie_hash(path).await.map_err(|e| {
-                    ServiceError::backend(format!("subtitle movie hash failed: {e}"))
-                })?
-            }
-            _ => None,
+        let hash = if media_path.to_ascii_lowercase().ends_with(".strm") {
+            None
+        } else {
+            movie_hash(media_path)
+                .await
+                .map_err(|e| ServiceError::backend(format!("subtitle movie hash failed: {e}")))?
         };
-        // A perfect match requires a file hash, never a title-only guess.
-        if request.is_perfect_match == Some(true) && hash.is_none() {
-            return Ok(Vec::new());
-        }
-        // Build the query params from the enriched request.
-        let mut query: Vec<(String, String)> = Vec::new();
-        if let Some(hash) = hash {
-            query.push(("moviehash".to_owned(), hash));
-            if request.is_perfect_match == Some(true) {
-                query.push(("moviehash_match".to_owned(), "only".to_owned()));
-            }
-        }
-        query.push(("languages".to_owned(), language.to_owned()));
-        if let Some(imdb) = request
-            .imdb_id
-            .as_deref()
-            .map(|s| s.trim_start_matches("tt"))
-            .filter(|s| !s.is_empty())
-        {
-            query.push(("imdb_id".to_owned(), imdb.to_owned()));
-        }
-        match request.content_type {
-            SubtitleMediaType::Episode => {
-                if let Some(series) = request.series_name.as_deref().filter(|s| !s.is_empty()) {
-                    query.push(("query".to_owned(), series.to_owned()));
-                }
-                if let Some(s) = request.parent_index_number {
-                    query.push(("season_number".to_owned(), s.to_string()));
-                }
-                if let Some(e) = request.index_number {
-                    query.push(("episode_number".to_owned(), e.to_string()));
-                }
-            }
-            SubtitleMediaType::Movie => {
-                if let Some(name) = request.name.as_deref().filter(|s| !s.is_empty()) {
-                    query.push(("query".to_owned(), name.to_owned()));
-                }
-                if let Some(year) = request.production_year {
-                    query.push(("year".to_owned(), year.to_string()));
-                }
-            }
-        }
+        let options = search_options(request, language, hash, imdb_id, media_path);
 
-        let resp = self
-            .http
-            .get(format!("{}/subtitles", self.base_url))
-            .header("Api-Key", cfg.effective_api_key())
-            .header(reqwest::header::USER_AGENT, USER_AGENT)
-            .header(reqwest::header::ACCEPT, "application/json")
-            .query(&query)
-            .send_limited(&self.limiter)
-            .await
-            .map_err(request_err)?;
-        if !resp.status().is_success() {
-            return Err(ServiceError::backend(format!(
-                "OpenSubtitles search failed: HTTP {}",
-                resp.status()
-            )));
-        }
-        let body: SearchResponse = resp.counted_json().await.map_err(net_err)?;
-        let mut results = map_search(&body, &request.language);
-        if request.is_perfect_match == Some(true) {
-            results.retain(|r| r.is_hash_match == Some(true));
-        }
-        results.sort_by_key(|r| r.is_hash_match != Some(true));
-        Ok(results)
+        let items = self.search_pages(&cfg, &options).await?;
+        let bad_ids = self
+            .bad_subtitle_ids
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        Ok(map_search(items, request, imdb_id, &bad_ids))
     }
 
     async fn validate_login(&self, config_json: &[u8]) -> Result<ProviderLogin, ServiceError> {
@@ -1067,19 +1473,7 @@ impl SubtitleProvider for OpenSubtitlesProvider {
                 })?;
         };
 
-        // Fetch the subtitle bytes from the link, a destination OpenSubtitles
-        // chose: vetted on every hop (gl-1160).
-        let content = self
-            .link_http
-            .send(&link)
-            .await
-            .map_err(link_err)?
-            .response
-            .error_for_status()
-            .map_err(net_err)?
-            .counted_bytes()
-            .await
-            .map_err(body_err)?;
+        let content = self.download_link(&link, file_id).await?;
 
         Ok(SubtitleResponse {
             language: parsed.language,
@@ -1615,6 +2009,44 @@ mod tests {
         assert_eq!(secret.requests(), 0, "the hop was never sent");
     }
 
+    /// A link that answers an error status fails the download without naming
+    /// the link: it is a one-time capability URL, and the error reaches the
+    /// server log (gl-178).
+    #[tokio::test]
+    async fn a_failed_link_fetch_keeps_the_link_out_of_the_error() {
+        use crate::mock_http::MockServer;
+        let source = MockServer::start_raw(vec![MockServer::raw_status("404 Not Found")]).await;
+        let source_port = source.base_url.rsplit(':').next().unwrap().to_owned();
+        let mock = ApiMock::start(move |_| {
+            vec![
+                ("/login", vec![login_reply(FUTURE_PAYLOAD)]),
+                ("/infos/user", vec![user_reply(20, "2100-01-01T00:00:00Z")]),
+                (
+                    "/download",
+                    vec![(
+                        200,
+                        format!(
+                            r#"{{"link":"http://localhost:{source_port}/file/one-time-token.srt","remaining":19}}"#
+                        ),
+                    )],
+                ),
+            ]
+        })
+        .await;
+        let (provider, _) = account_provider(&mock, "user");
+        let provider = provider.with_link_destinations(PrivateAllowList::parse("localhost").0);
+
+        let error = provider
+            .get_subtitles("srt-en-1")
+            .await
+            .expect_err("a 404 link fails the download");
+
+        let text = format!("{error} {error:?}");
+        assert!(text.contains("404"), "{text}");
+        assert!(!text.contains("one-time-token"), "{text}");
+        assert_eq!(source.requests(), 1, "the link was fetched");
+    }
+
     /// `HttpStatusCode.Unauthorized` on `/download`: the token is dropped and
     /// the download tried again with a fresh login.
     #[tokio::test]
@@ -2077,39 +2509,16 @@ mod tests {
     }
 
     #[test]
-    fn search_response_maps_to_namespaced_candidates() {
-        let json = r#"{
-            "data": [
-              {"attributes": {
-                 "language": "en",
-                 "release": "Movie.2021.1080p",
-                 "download_count": 42,
-                 "hearing_impaired": false,
-                 "uploader": {"name": "alice"},
-                 "files": [{"file_id": 998877, "file_name": "movie.en.srt"}]
-              }}
-            ]
-        }"#;
-        let parsed: SearchResponse = serde_json::from_str(json).unwrap();
-        let mapped = map_search(&parsed, "eng");
-        assert_eq!(mapped.len(), 1);
-        let c = &mapped[0];
-        assert_eq!(c.id.as_deref(), Some("srt-eng-998877"));
-        assert_eq!(c.hearing_impaired, Some(false));
-        assert_eq!(c.forced, None);
-        assert_eq!(c.provider_name.as_deref(), Some("opensubtitles"));
-        assert_eq!(c.three_letter_iso_language_name.as_deref(), Some("eng"));
-        assert_eq!(c.author.as_deref(), Some("alice"));
-        assert_eq!(c.download_count, Some(42));
-    }
-
-    #[test]
     fn candidate_language_is_the_requested_code_not_the_api_tag() {
         // The API tags pt-BR/zh-CN carry a '-'; the plugin stamps request.Language instead.
         let json = r#"{"data": [{"attributes": {"language": "pt-BR",
-            "files": [{"file_id": 5}]}}]}"#;
+            "feature_details": {"feature_type": "Movie"}, "files": [{"file_id": 5}]}}]}"#;
         let parsed: SearchResponse = serde_json::from_str(json).unwrap();
-        let c = &map_search(&parsed, "por")[0];
+        let request = SubtitleSearchRequest {
+            language: "por".to_owned(),
+            ..Default::default()
+        };
+        let c = &map_search(parsed.data, &request, 0, &HashSet::new())[0];
         assert_eq!(c.id.as_deref(), Some("srt-por-5"));
         assert_eq!(c.three_letter_iso_language_name.as_deref(), Some("por"));
         let p = parse_subtitle_id("srt-por-5").unwrap();
@@ -2137,61 +2546,638 @@ mod tests {
         assert!(parse_subtitle_id("srt-eng-x").is_none());
     }
 
-    /// A search for `language` whose culture has `two_letter`, over a
-    /// configured account, and the request lines the API saw.
-    async fn search_for(
-        language: &str,
-        two_letter: Option<&str>,
-    ) -> (Result<Vec<RemoteSubtitleInfo>, ServiceError>, Vec<String>) {
-        let mock =
-            ApiMock::start(|_| vec![("/subtitles", vec![(200, r#"{"data":[]}"#.to_owned())])])
-                .await;
-        let (provider, _) = account_provider(&mock, "user");
-        let result = provider
-            .search(&SubtitleSearchRequest {
-                language: language.to_owned(),
-                two_letter_iso_language_name: two_letter.map(str::to_owned),
-                ..Default::default()
-            })
-            .await;
-        let seen = mock.requests.lock().unwrap().clone();
-        (result, seen)
+    use serde_json::json;
+
+    /// The API's `/infos/languages` reply, listing `codes`.
+    fn languages_reply(codes: &[&str]) -> (u16, String) {
+        let data: Vec<_> = codes
+            .iter()
+            .map(|code| json!({ "language_code": code }))
+            .collect();
+        (200, json!({ "data": data }).to_string())
+    }
+
+    /// One `/subtitles` page of `total_pages`, holding `items` (each one
+    /// result's attributes).
+    fn search_page(page: i32, total_pages: i32, items: &[serde_json::Value]) -> (u16, String) {
+        let data: Vec<_> = items
+            .iter()
+            .map(|attributes| json!({ "attributes": attributes }))
+            .collect();
+        let body = json!({ "total_pages": total_pages, "page": page, "data": data });
+        (200, body.to_string())
+    }
+
+    /// A `/subtitles` reply with no results.
+    fn no_results() -> Vec<(u16, String)> {
+        vec![(200, r#"{"data":[]}"#.to_owned())]
+    }
+
+    /// One search result's attributes: `attributes` with one file, `file_id`.
+    fn result(file_id: i64, mut attributes: serde_json::Value) -> serde_json::Value {
+        attributes["files"] = json!([{ "file_id": file_id }]);
+        attributes
+    }
+
+    /// A result for a movie, with no IMDb id.
+    fn movie_result(file_id: i64) -> serde_json::Value {
+        result(
+            file_id,
+            json!({ "feature_details": { "feature_type": "Movie" } }),
+        )
+    }
+
+    /// An API whose account logs in with `remaining` downloads left, which
+    /// lists `languages` and answers searches with `pages`, in order.
+    async fn search_api(remaining: i32, languages: &[&str], pages: Vec<(u16, String)>) -> ApiMock {
+        let languages = languages_reply(languages);
+        ApiMock::start(move |_| {
+            vec![
+                ("/login", vec![login_reply(FUTURE_PAYLOAD)]),
+                (
+                    "/infos/user",
+                    vec![user_reply(remaining, "2100-01-01T00:00:00Z")],
+                ),
+                ("/infos/languages", vec![languages]),
+                ("/subtitles", pages),
+            ]
+        })
+        .await
+    }
+
+    /// A manual movie search in `two_letter`'s language (`eng` as the
+    /// three-letter code) for the file at `path`.
+    fn movie_request(two_letter: &str, path: &str) -> SubtitleSearchRequest {
+        SubtitleSearchRequest {
+            language: "eng".to_owned(),
+            two_letter_iso_language_name: Some(two_letter.to_owned()),
+            media_path: Some(path.to_owned()),
+            ..Default::default()
+        }
+    }
+
+    /// An episode search, S02E05 of "Show", for the file at `path`.
+    fn episode_request(path: &str) -> SubtitleSearchRequest {
+        SubtitleSearchRequest {
+            content_type: SubtitleMediaType::Episode,
+            series_name: Some("Show".to_owned()),
+            parent_index_number: Some(2),
+            index_number: Some(5),
+            ..movie_request("en", path)
+        }
+    }
+
+    /// The `/subtitles` request lines `mock` saw.
+    fn searches(mock: &ApiMock) -> Vec<String> {
+        mock.requests
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|request| request.starts_with("GET /subtitles"))
+            .cloned()
+            .collect()
+    }
+
+    /// The ids of `found`, in order.
+    fn ids(found: &[RemoteSubtitleInfo]) -> Vec<&str> {
+        found.iter().filter_map(|info| info.id.as_deref()).collect()
+    }
+
+    /// The plugin's `RequestHandlerTests.ComputeHash_Success` (which tests
+    /// `AddQueryString`), plus `HttpUtility.UrlEncode`'s lowercase escapes of
+    /// UTF-8 and of `/`, and the characters it keeps.
+    #[rstest::rstest]
+    #[case("/subtitles", &[("b", "c and d"), ("a", "1")], "/subtitles?a=1&b=c+and+d")]
+    #[case("/subtitles", &[], "/subtitles")]
+    #[case(
+        "/subtitles",
+        &[("Query", "Amélie/A_B-C.D!*(2001).MKV")],
+        "/subtitles?query=am%c3%a9lie%2fa_b-c.d!*(2001).mkv"
+    )]
+    fn query_strings_are_built_as_the_plugin_builds_them(
+        #[case] path: &str,
+        #[case] params: &[(&str, &str)],
+        #[case] expected: &str,
+    ) {
+        let params: Vec<_> = params
+            .iter()
+            .map(|&(name, value)| (name, value.to_owned()))
+            .collect();
+        assert_eq!(add_query_string(path, &params), expected);
     }
 
     /// gl-1462: `OpenSubtitleDownloader.GetLanguage` searches the request's
     /// two-letter code, with the regioned tags the API lists for bare `zh`
-    /// and `pt`.
+    /// and `pt`; `AddQueryString` lowercases it.
     #[rstest::rstest]
-    #[case("est", "et", "et")]
-    #[case("ces", "cs", "cs")]
-    #[case("slk", "sk", "sk")]
-    #[case("bos", "bs", "bs")]
-    #[case("eng", "en", "en")]
-    #[case("chi", "zh", "zh-CN")]
-    #[case("por", "pt", "pt-PT")]
+    #[case("et", "et")]
+    #[case("cs", "cs")]
+    #[case("sk", "sk")]
+    #[case("bs", "bs")]
+    #[case("en", "en")]
+    #[case("zh", "zh-cn")]
+    #[case("pt", "pt-pt")]
     #[tokio::test]
-    async fn search_sends_the_two_letter_language(
-        #[case] language: &str,
-        #[case] two_letter: &str,
-        #[case] sent: &str,
-    ) {
-        let (result, seen) = search_for(language, Some(two_letter)).await;
-        result.expect("search");
-        assert_eq!(seen, [format!("GET /subtitles?languages={sent}")]);
+    async fn search_sends_the_two_letter_language(#[case] two_letter: &str, #[case] sent: &str) {
+        let languages = ["et", "cs", "sk", "bs", "en", "zh-CN", "pt-PT"];
+        let mock = search_api(10, &languages, no_results()).await;
+        let (provider, _) = account_provider(&mock, "user");
+        provider
+            .search(&movie_request(two_letter, "/films/movie.strm"))
+            .await
+            .expect("search");
+        assert_eq!(
+            searches(&mock),
+            [format!(
+                "GET /subtitles?languages={sent}&query=movie.strm&type=movie"
+            )]
+        );
     }
 
-    /// A language with no two-letter code is not supported: upstream's
-    /// `GetLanguage` throws before the search, so nothing is searched.
-    #[rstest::rstest]
-    #[case("xyz", None)]
-    #[case("und", Some(""))]
+    /// `GetLanguage` takes a code as the API's language list spells it, a
+    /// regioned code falling back to its language. A code the list lacks,
+    /// or a language with no two-letter code, is not searched. The list is
+    /// read once; a refused read fails the search and is tried again next
+    /// time.
     #[tokio::test]
-    async fn search_skips_a_language_without_a_two_letter_code(
-        #[case] language: &str,
-        #[case] two_letter: Option<&str>,
+    async fn search_checks_the_language_against_the_apis_list() {
+        let mock = ApiMock::start(|_| {
+            vec![
+                ("/login", vec![login_reply(FUTURE_PAYLOAD)]),
+                ("/infos/user", vec![user_reply(10, "2100-01-01T00:00:00Z")]),
+                (
+                    "/infos/languages",
+                    vec![
+                        (403, "{}".to_owned()),
+                        languages_reply(&["en", "pt", "zh-CN"]),
+                    ],
+                ),
+                ("/subtitles", no_results()),
+            ]
+        })
+        .await;
+        let (provider, _) = account_provider(&mock, "user");
+        provider
+            .search(&movie_request("en", "/films/a.strm"))
+            .await
+            .expect_err("no language list");
+        for two_letter in ["en", "pt", "zh", "et", ""] {
+            let found = provider
+                .search(&movie_request(two_letter, "/films/a.strm"))
+                .await
+                .expect("search");
+            assert_eq!(found, [], "{two_letter}");
+        }
+        let unknown = SubtitleSearchRequest {
+            two_letter_iso_language_name: None,
+            ..movie_request("", "/films/a.strm")
+        };
+        assert_eq!(provider.search(&unknown).await.expect("search"), []);
+        assert_eq!(
+            searches(&mock),
+            [
+                "GET /subtitles?languages=en&query=a.strm&type=movie",
+                "GET /subtitles?languages=pt&query=a.strm&type=movie",
+                "GET /subtitles?languages=zh-cn&query=a.strm&type=movie",
+            ]
+        );
+        assert_eq!(mock.count("GET /infos/languages"), 2);
+    }
+
+    /// `Search`'s parameters: the content `type`, then the IMDb id when the
+    /// item has one, or else the media file's name and an episode's
+    /// numbers, sorted by name and lowercased as `AddQueryString` builds
+    /// them.
+    #[rstest::rstest]
+    #[case::movie_by_imdb_id(
+        false,
+        Some("tt0133093"),
+        "GET /subtitles?imdb_id=133093&languages=en&type=movie"
+    )]
+    #[case::movie_by_file_name(
+        false,
+        None,
+        "GET /subtitles?languages=en&query=the+matrix+(1999).strm&type=movie"
+    )]
+    #[case::episode_by_imdb_id(
+        true,
+        Some("tt0000042"),
+        "GET /subtitles?imdb_id=42&languages=en&type=episode"
+    )]
+    #[case::episode_by_file_name(
+        true,
+        Some("not-a-number"),
+        "GET /subtitles?episode_number=5&languages=en&query=the+matrix+(1999).strm&season_number=2&type=episode"
+    )]
+    #[tokio::test]
+    async fn search_asks_for_the_imdb_id_or_the_file_name(
+        #[case] episode: bool,
+        #[case] imdb: Option<&str>,
+        #[case] sent: &str,
     ) {
-        let (result, seen) = search_for(language, two_letter).await;
-        assert_eq!(result.expect("search"), []);
-        assert!(seen.is_empty(), "{seen:?}");
+        let mock = search_api(10, &["en"], no_results()).await;
+        let (provider, _) = account_provider(&mock, "user");
+        let path = "/media/Films/The Matrix (1999).strm";
+        let request = SubtitleSearchRequest {
+            imdb_id: imdb.map(str::to_owned),
+            ..if episode {
+                episode_request(path)
+            } else {
+                movie_request("en", path)
+            }
+        };
+        provider.search(&request).await.expect("search");
+        assert_eq!(searches(&mock), [sent]);
+    }
+
+    /// A hashed file sends `moviehash`, and a perfect-match search adds
+    /// `moviehash_match=only` and keeps only the hash matches
+    /// (`MatchFilter`).
+    #[tokio::test]
+    async fn a_perfect_match_search_sends_the_hash_and_keeps_its_matches() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("Movie.mkv");
+        let mut bytes = vec![0u8; 131_072];
+        bytes[..8].copy_from_slice(&u64::MAX.to_le_bytes());
+        bytes[131_064..].copy_from_slice(&2u64.to_le_bytes());
+        std::fs::write(&path, &bytes).unwrap();
+        let page = search_page(
+            1,
+            1,
+            &[
+                movie_result(1),
+                result(
+                    2,
+                    json!({ "feature_details": { "feature_type": "Movie" }, "moviehash_match": true }),
+                ),
+            ],
+        );
+        let mock = search_api(10, &["en"], vec![page]).await;
+        let (provider, _) = account_provider(&mock, "user");
+        let request = SubtitleSearchRequest {
+            is_perfect_match: Some(true),
+            ..movie_request("en", path.to_str().unwrap())
+        };
+
+        let found = provider.search(&request).await.expect("search");
+
+        assert_eq!(ids(&found), ["srt-eng-2"]);
+        assert_eq!(
+            searches(&mock),
+            [
+                "GET /subtitles?languages=en&moviehash=0000000000020001&moviehash_match=only&query=movie.mkv&type=movie"
+            ]
+        );
+    }
+
+    /// `Search` reads every page and keeps a result only for a file of the
+    /// item's own feature (`BadSubtitleFilter`, `MediaFilter`). It orders
+    /// them by hash match, download count, rating and trusted uploader, and
+    /// maps each result once, from its first file.
+    #[tokio::test]
+    async fn search_filters_orders_and_maps_every_page() {
+        let movie = |imdb: i64| json!({ "feature_type": "Movie", "imdb_id": imdb });
+        let pages = vec![
+            search_page(
+                1,
+                2,
+                &[
+                    result(
+                        1,
+                        json!({ "feature_details": movie(133_093), "download_count": 5 }),
+                    ),
+                    result(
+                        2,
+                        json!({ "feature_details": { "feature_type": "Episode", "imdb_id": 133_093 } }),
+                    ),
+                    result(3, json!({ "feature_details": movie(42) })),
+                    json!({ "feature_details": movie(133_093), "files": [] }),
+                    json!({ "feature_details": movie(133_093), "files": [{ "file_name": "a.srt" }] }),
+                    result(4, json!({ "download_count": 9 })),
+                ],
+            ),
+            search_page(
+                2,
+                2,
+                &[
+                    result(
+                        5,
+                        json!({ "feature_details": movie(133_093), "moviehash_match": true, "download_count": 1 }),
+                    ),
+                    result(
+                        6,
+                        json!({ "feature_details": movie(133_093), "download_count": 5, "ratings": 8.0 }),
+                    ),
+                    json!({
+                        "feature_details": movie(133_093),
+                        "download_count": 5,
+                        "ratings": 8.0,
+                        "from_trusted": true,
+                        "release": "The.Matrix.1999.1080p",
+                        "comments": "synced",
+                        "uploader": { "name": "alice" },
+                        "upload_date": "2024-05-01T10:20:30Z",
+                        "fps": 23.976,
+                        "hearing_impaired": true,
+                        "foreign_parts_only": false,
+                        "machine_translated": false,
+                        "ai_translated": true,
+                        "files": [
+                            { "file_id": 7, "file_name": "a.srt" },
+                            { "file_id": 8, "file_name": "b.srt" }
+                        ]
+                    }),
+                ],
+            ),
+        ];
+        let mock = search_api(10, &["en"], pages).await;
+        let (provider, _) = account_provider(&mock, "user");
+        let request = SubtitleSearchRequest {
+            imdb_id: Some("tt0133093".to_owned()),
+            ..movie_request("en", "/films/movie.strm")
+        };
+
+        let found = provider.search(&request).await.expect("search");
+
+        assert_eq!(
+            ids(&found),
+            ["srt-eng-5", "srt-eng-7-sdh", "srt-eng-6", "srt-eng-1"]
+        );
+        assert_eq!(
+            found[1],
+            RemoteSubtitleInfo {
+                three_letter_iso_language_name: Some("eng".to_owned()),
+                id: Some("srt-eng-7-sdh".to_owned()),
+                provider_name: Some(PLUGIN_NAME.to_owned()),
+                name: Some("The.Matrix.1999.1080p".to_owned()),
+                format: Some("srt".to_owned()),
+                author: Some("alice".to_owned()),
+                comment: Some("synced".to_owned()),
+                date_created: Some("2024-05-01T10:20:30Z".parse().unwrap()),
+                community_rating: Some(8.0),
+                frame_rate: Some(23.976),
+                download_count: Some(5),
+                is_hash_match: None,
+                ai_translated: Some(true),
+                machine_translated: Some(false),
+                forced: Some(false),
+                hearing_impaired: Some(true),
+            }
+        );
+        // The plugin's non-nullable counts read an absent one as zero.
+        assert_eq!(found[3].community_rating, Some(0.0));
+        assert_eq!(found[3].frame_rate, Some(0.0));
+        assert_eq!(
+            searches(&mock),
+            [
+                "GET /subtitles?imdb_id=133093&languages=en&type=movie",
+                "GET /subtitles?imdb_id=133093&languages=en&page=2&type=movie",
+            ]
+        );
+    }
+
+    /// A page that does not move on ends the search, where upstream would ask
+    /// for it again forever. A page after the first that the API refuses fails
+    /// the search, dropping the pages before it, as the plugin's failed
+    /// `SearchSubtitlesAsync` does.
+    #[tokio::test]
+    async fn search_stops_at_a_page_that_does_not_move_on_or_fails() {
+        let stuck = search_api(10, &["en"], vec![search_page(1, 3, &[movie_result(1)])]).await;
+        let (provider, _) = account_provider(&stuck, "user");
+        let found = provider
+            .search(&movie_request("en", "/films/a.strm"))
+            .await
+            .expect("search");
+        assert_eq!(ids(&found), ["srt-eng-1"]);
+        assert_eq!(searches(&stuck).len(), 2);
+
+        let pages = vec![
+            search_page(1, 2, &[movie_result(1)]),
+            (403, "{}".to_owned()),
+        ];
+        let failing = search_api(10, &["en"], pages).await;
+        let (provider, _) = account_provider(&failing, "user");
+        provider
+            .search(&movie_request("en", "/films/a.strm"))
+            .await
+            .expect_err("a refused page");
+        assert_eq!(searches(&failing).len(), 2);
+    }
+
+    /// An episode search keeps the results for its own season and episode.
+    #[tokio::test]
+    async fn an_episode_search_keeps_its_own_episode() {
+        let episode = |season: i32, number: i32| json!({ "feature_type": "Episode", "season_number": season, "episode_number": number });
+        let page = search_page(
+            1,
+            1,
+            &[
+                result(1, json!({ "feature_details": episode(2, 5) })),
+                result(2, json!({ "feature_details": episode(2, 6) })),
+                result(3, json!({ "feature_details": episode(1, 5) })),
+                result(
+                    4,
+                    json!({ "feature_details": { "feature_type": "Movie", "season_number": 2, "episode_number": 5 } }),
+                ),
+            ],
+        );
+        let mock = search_api(10, &["en"], vec![page]).await;
+        let (provider, _) = account_provider(&mock, "user");
+
+        let found = provider
+            .search(&episode_request("/tv/Show/e.strm"))
+            .await
+            .expect("search");
+
+        assert_eq!(ids(&found), ["srt-eng-1"]);
+    }
+
+    /// `Search`'s early returns: an episode without its season, its number
+    /// or its series name, or a video without a path, is not searched.
+    #[tokio::test]
+    async fn search_skips_an_episode_without_its_numbers_or_a_video_without_a_path() {
+        let mock = search_api(10, &["en"], no_results()).await;
+        let (provider, _) = account_provider(&mock, "user");
+        let episode = episode_request("/tv/Show/e.strm");
+        let skipped = [
+            SubtitleSearchRequest {
+                parent_index_number: None,
+                ..episode.clone()
+            },
+            SubtitleSearchRequest {
+                index_number: None,
+                ..episode.clone()
+            },
+            SubtitleSearchRequest {
+                series_name: Some(String::new()),
+                ..episode.clone()
+            },
+            movie_request("en", ""),
+            SubtitleSearchRequest {
+                media_path: None,
+                ..movie_request("en", "")
+            },
+        ];
+        for request in &skipped {
+            assert_eq!(provider.search(request).await.expect("search"), []);
+        }
+        assert_eq!(mock.count("GET /infos/languages"), 0);
+        assert_eq!(mock.count("GET /subtitles"), 0);
+
+        provider.search(&episode).await.expect("search");
+        assert_eq!(
+            mock.count("GET /subtitles"),
+            1,
+            "the whole episode is searched"
+        );
+    }
+
+    /// `Search` logs the account in first, once for every search while the
+    /// token lasts. An automated search finds nothing while the account's
+    /// quota is spent, and nothing without an account, where upstream's
+    /// `Login` throws; a manual search with an API key and no account
+    /// still searches (gl-808).
+    #[tokio::test]
+    async fn automated_searches_stop_at_a_spent_quota_or_without_an_account() {
+        let automated = SubtitleSearchRequest {
+            is_automated: true,
+            ..movie_request("en", "/films/a.strm")
+        };
+        let manual = movie_request("en", "/films/a.strm");
+        let page = || vec![search_page(1, 1, &[movie_result(1)])];
+
+        let spent = search_api(0, &["en"], page()).await;
+        let (provider, _) = account_provider(&spent, "user");
+        assert_eq!(provider.search(&automated).await.expect("search"), []);
+        assert_eq!(spent.count("GET /subtitles"), 0);
+        let logged = provider.state.lock().await.limit_logged;
+        assert!(logged.is_some(), "the spent quota is logged");
+        assert_eq!(provider.search(&automated).await.expect("search"), []);
+        assert_eq!(
+            provider.state.lock().await.limit_logged,
+            logged,
+            "at most once a minute"
+        );
+        let found = provider.search(&manual).await.expect("search");
+        assert_eq!(ids(&found), ["srt-eng-1"], "a manual search still searches");
+        assert_eq!(spent.count("POST /login"), 1);
+        assert_eq!(spent.count("GET /infos/user"), 1);
+
+        let keyed = search_api(10, &["en"], page()).await;
+        let plugins = crate::plugin_config::tests_support::manager_with(
+            PLUGIN_ID,
+            br#"{"ApiKey":"key"}"#.to_vec(),
+        );
+        let provider = OpenSubtitlesProvider::new(plugins).with_base_url(&keyed.base_url);
+        assert_eq!(provider.search(&automated).await.expect("search"), []);
+        assert_eq!(keyed.count(""), 0);
+        let found = provider.search(&manual).await.expect("search");
+        assert_eq!(ids(&found), ["srt-eng-1"]);
+        assert_eq!(keyed.count("POST /login"), 0);
+    }
+
+    /// `Login`: a login the API refuses fails the search. A refusal of the
+    /// account itself (`CredentialsInvalid`: a 401, or a 400 for an e-mail
+    /// username) stops the logins with that account: a manual search then goes
+    /// on without one and an automated search finds nothing, until the
+    /// settings page validates the account again (or the account changes).
+    /// Any other refusal is tried again by the next search.
+    #[rstest::rstest]
+    #[case::unauthorized(401, "user", true)]
+    #[case::email_username(400, "user@example.com", true)]
+    #[case::bad_request(400, "user", false)]
+    #[case::forbidden(403, "user", false)]
+    #[tokio::test]
+    async fn a_refused_login_fails_the_search(
+        #[case] status: u16,
+        #[case] username: &str,
+        #[case] refuses_account: bool,
+    ) {
+        let mock = ApiMock::start(move |_| {
+            vec![
+                (
+                    "/login",
+                    vec![(status, "{}".to_owned()), login_reply(FUTURE_PAYLOAD)],
+                ),
+                ("/infos/languages", vec![languages_reply(&["en"])]),
+                ("/subtitles", vec![search_page(1, 1, &[movie_result(1)])]),
+            ]
+        })
+        .await;
+        let (provider, _) = account_provider(&mock, username);
+        let manual = movie_request("en", "/films/a.strm");
+
+        let error = provider.search(&manual).await.expect_err("refused login");
+        assert!(matches!(error, ServiceError::Unauthorized(_)), "{error:?}");
+        assert_eq!(mock.count("GET /subtitles"), 0);
+
+        let found = provider.search(&manual).await.expect("search");
+        assert_eq!(ids(&found), ["srt-eng-1"]);
+        if !refuses_account {
+            assert_eq!(mock.count("POST /login"), 2, "logged in again");
+            return;
+        }
+        let automated = SubtitleSearchRequest {
+            is_automated: true,
+            ..manual.clone()
+        };
+        assert_eq!(provider.search(&automated).await.expect("search"), []);
+        assert_eq!(
+            mock.count("POST /login"),
+            1,
+            "no login with a refused account"
+        );
+
+        let config = format!(r#"{{"Username":"{username}","Password":"secret"}}"#);
+        provider
+            .validate_login(config.as_bytes())
+            .await
+            .expect("validated");
+        provider.search(&automated).await.expect("search");
+        assert_eq!(mock.count("POST /login"), 3, "validation and the search");
+        assert_eq!(mock.count("GET /subtitles"), 2);
+    }
+
+    /// `GetSubtitlesInternal`: a link that answers with an empty file fails
+    /// the download, and from then on automated searches skip that file
+    /// (`BadSubtitleFilter`); a manual search still lists it.
+    #[tokio::test]
+    async fn an_empty_download_is_skipped_by_automated_searches() {
+        let mock = ApiMock::start(|base| {
+            vec![
+                ("/login", vec![login_reply(FUTURE_PAYLOAD)]),
+                ("/infos/user", vec![user_reply(10, "2100-01-01T00:00:00Z")]),
+                ("/infos/languages", vec![languages_reply(&["en"])]),
+                ("/download", vec![download_reply(base, 9)]),
+                ("/file/", vec![(200, " \r\n".to_owned())]),
+                (
+                    "/subtitles",
+                    vec![search_page(1, 1, &[movie_result(1), movie_result(2)])],
+                ),
+            ]
+        })
+        .await;
+        let (provider, _) = account_provider(&mock, "user");
+
+        let error = provider
+            .get_subtitles("srt-eng-1")
+            .await
+            .expect_err("empty file");
+
+        assert!(
+            error
+                .to_string()
+                .contains("Subtitle with Id 1 could not be downloaded: OK - this is most likely a broken subtitle"),
+            "{error}"
+        );
+        let manual = movie_request("en", "/films/a.strm");
+        let found = provider.search(&manual).await.expect("search");
+        assert_eq!(ids(&found), ["srt-eng-1", "srt-eng-2"]);
+        let automated = SubtitleSearchRequest {
+            is_automated: true,
+            ..manual
+        };
+        let found = provider.search(&automated).await.expect("search");
+        assert_eq!(ids(&found), ["srt-eng-2"]);
     }
 }

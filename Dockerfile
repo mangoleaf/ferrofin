@@ -1,6 +1,7 @@
 # Release image of the Ferrofin server:
 #   - the ferrofin-server binary (built from this workspace),
 #   - ffmpeg/ffprobe (scan probes with ffprobe, transcode needs ffmpeg),
+#   - 7z with Debian's non-free RAR plugin (7zip-rar), which reads RAR comic covers,
 #   - jellyfin-web (served at /web).
 #
 # A plain `docker build .` is fully self-contained: the `web-build` and
@@ -49,15 +50,18 @@ COPY --from=web-source /web/dist /dist
 # separate FFmpeg libraries. Keep this runtime in sync with ci/runtime.Dockerfile.
 # curl and gnupg are only needed to import the repository key; purge them and
 # their unused dependencies in the installation layer.
+# 7z reads RAR comic covers; Debian ships its RAR decoders in 7zip-rar, from the
+# non-free component. Ferrofin runs 7z as a separate program and links nothing.
 FROM debian:trixie-slim AS runtime-build
-RUN apt-get update \
+RUN sed -i 's/^Components: main$/Components: main non-free/' /etc/apt/sources.list.d/debian.sources \
+ && apt-get update \
  && apt-get install -y --no-install-recommends ca-certificates curl gnupg \
  && curl -fsSL https://repo.jellyfin.org/jellyfin_team.gpg.key \
       | gpg --dearmor -o /usr/share/keyrings/jellyfin.gpg \
  && echo "deb [signed-by=/usr/share/keyrings/jellyfin.gpg] https://repo.jellyfin.org/debian trixie main" \
       > /etc/apt/sources.list.d/jellyfin.list \
  && apt-get update \
- && apt-get install -y --no-install-recommends jellyfin-ffmpeg8 \
+ && apt-get install -y --no-install-recommends jellyfin-ffmpeg8 7zip 7zip-rar \
  && ln -s /usr/lib/jellyfin-ffmpeg/ffmpeg /usr/local/bin/ffmpeg \
  && ln -s /usr/lib/jellyfin-ffmpeg/ffprobe /usr/local/bin/ffprobe \
  && apt-get purge -y --auto-remove -o APT::AutoRemove::RecommendsImportant=false curl gnupg \

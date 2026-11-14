@@ -84,18 +84,28 @@ pub fn forwarded_for(headers: &axum::http::HeaderMap) -> Vec<std::net::IpAddr> {
     reachable
 }
 
-/// One `X-Forwarded-For` entry as an address.
+/// One `X-Forwarded-For` entry as an address, in the shapes .NET's
+/// `IPEndPoint.TryParse` takes: an address, `v4:port`, or an IPv6 address in
+/// one pair of brackets, with or without a port. A bracketed IPv4 address and
+/// unbalanced or doubled brackets do not parse.
+///
+/// .NET also reads the old numeric IPv4 spellings (`2130706434`, `127.2`)
+/// and an IPv6 scope id without a port (`[fe80::1%2]`), which this does not,
+/// so the walk stops at one where Jellyfin's goes on. Fix path: gl-1642.
 #[must_use]
 pub(crate) fn parse_forwarded_entry(entry: &str) -> Option<std::net::IpAddr> {
     if let Ok(ip) = entry.parse::<std::net::IpAddr>() {
         return Some(normalize_ip(ip));
     }
-    // `host:port`, or `[v6]:port`.
+    // `v4:port`, or `[v6]:port`.
     if let Ok(socket) = entry.parse::<std::net::SocketAddr>() {
         return Some(normalize_ip(socket.ip()));
     }
-    let trimmed = entry.trim_start_matches('[').trim_end_matches(']');
-    trimmed.parse::<std::net::IpAddr>().ok().map(normalize_ip)
+    entry
+        .strip_prefix('[')
+        .and_then(|v6| v6.strip_suffix(']'))
+        .and_then(|v6| v6.parse::<std::net::Ipv6Addr>().ok())
+        .map(|v6| normalize_ip(std::net::IpAddr::V6(v6)))
 }
 
 /// The managers behind [`AppState`], held once and shared via [`Arc`].
@@ -296,6 +306,11 @@ pub struct Inner {
     /// unset those routes report the plugin unavailable (`404`, like a
     /// Jellyfin server without the plugin's controller).
     pub ldap: Option<Arc<dyn ferrofin_traits::ldap::LdapManager>>,
+
+    /// The backup engine behind the `/Backup*` routes. `None` until the
+    /// composition root wires it via [`AppState::with_backup`]; while unset
+    /// those routes answer `500`.
+    pub backup: Option<Arc<dyn ferrofin_traits::backup::BackupService>>,
 }
 
 /// How many [`FileSystem`] calls handlers may have on the blocking pool at once
@@ -464,6 +479,7 @@ impl AppState {
             playback_metrics: None,
             merge_versions: None,
             ldap: None,
+            backup: None,
             music,
             similar_items,
             search,
@@ -863,40 +879,27 @@ impl AppState {
     }
 
     /// [`walk_forwarded_headers`](crate::forwarded_headers::walk_forwarded_headers)
-    /// under the configured known proxies. Nothing is forwarded without a
-    /// network policy, as Jellyfin forwards nothing without known proxies.
+    /// from `parts`' peer under the configured known proxies: the scheme and
+    /// host `ForwardedHeadersMiddleware` gives the request. Nothing is
+    /// forwarded without a network policy, as Jellyfin forwards nothing
+    /// without known proxies, nor without a peer to start the walk from.
     #[must_use]
     pub fn forwarded_request(
         &self,
-        peer: std::net::IpAddr,
-        headers: &axum::http::HeaderMap,
+        parts: &axum::http::request::Parts,
     ) -> crate::forwarded_headers::ForwardedRequest {
         use crate::forwarded_headers::{ForwardedRequest, forwarded_through};
-        self.inner
-            .network
-            .as_deref()
-            .map_or_else(ForwardedRequest::default, |network| {
-                forwarded_through(network, peer, headers)
-            })
-    }
-
-    /// The scheme `parts`' request has (`HttpRequest.Scheme`), lowercased as
-    /// `UriBuilder` writes it: the one known proxies forwarded, else its
-    /// listener's ([`Transport`](crate::forwarded_headers::Transport)), else
-    /// `http`.
-    #[must_use]
-    pub fn request_scheme(&self, parts: &axum::http::request::Parts) -> String {
-        use crate::forwarded_headers::{Transport, effective_scheme};
-        let forwarded = parts
-            .extensions
-            .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
-            .and_then(|axum::extract::ConnectInfo(peer)| {
-                self.forwarded_request(peer.ip(), &parts.headers).scheme
-            });
-        effective_scheme(
-            forwarded.as_deref(),
-            parts.extensions.get::<Transport>().copied(),
-        )
+        match (
+            self.inner.network.as_deref(),
+            parts
+                .extensions
+                .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>(),
+        ) {
+            (Some(network), Some(axum::extract::ConnectInfo(peer))) => {
+                forwarded_through(network, peer.ip(), &parts.headers)
+            }
+            _ => ForwardedRequest::default(),
+        }
     }
 
     /// [`Self::client_address`] over an already-extracted peer and chain, so the
@@ -1087,6 +1090,22 @@ impl AppState {
         let inner = Arc::get_mut(&mut self.inner)
             .expect("with_ldap must be called before the state is shared");
         inner.ldap = Some(ldap);
+        self
+    }
+
+    /// Wires the backup engine behind the `/Backup*` routes.
+    ///
+    /// [`new`](Self::new) leaves it unset (the routes answer `500`); the
+    /// composition root calls this with the `ferrofin-core` implementation.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the inner state is already shared (cloned).
+    #[must_use]
+    pub fn with_backup(mut self, backup: Arc<dyn ferrofin_traits::backup::BackupService>) -> Self {
+        let inner = Arc::get_mut(&mut self.inner)
+            .expect("with_backup must be called before the state is shared");
+        inner.backup = Some(backup);
         self
     }
 

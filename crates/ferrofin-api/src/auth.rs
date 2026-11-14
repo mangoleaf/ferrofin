@@ -94,9 +94,10 @@ pub(crate) fn auth_request_context(
 /// which Jellyfin's ASCII header grammar never uses) and carries the raw query
 /// string.
 ///
-/// The scheme is left unresolved (`None`, read as `http`). A context that
-/// builds addresses comes from `handlers::system::context_from_parts`, which
-/// resolves it.
+/// The scheme is left unresolved (`None`, read as `http`), and the `Host` is
+/// the request's own. A context that builds addresses comes from
+/// `handlers::system::context_from_parts`, which resolves the scheme and puts
+/// a known proxy's `X-Forwarded-Host` in place of the `Host`.
 pub(crate) fn request_context(
     headers: &HeaderMap,
     query: Option<&str>,
@@ -286,7 +287,8 @@ impl FromRequestParts<AppState> for RequireAuthIgnoringSchedule {
 }
 
 /// Elevation combined with a controller-level default policy, as on
-/// ConfigurationController and ItemLookupController. Unlike bare elevation,
+/// ConfigurationController, ItemLookupController and the Intro Skipper
+/// plugin's SkipIntroController writes. Unlike bare elevation,
 /// these routes also enforce the user's remote-access restriction.
 #[derive(Debug, Clone)]
 pub struct RequireAdminWithDefault(pub AuthorizationInfo);

@@ -18,7 +18,7 @@ use ferrofin_api::test_support::{
     FakeConfig, FakeDevices, FakeDisplayPreferences, FakeDto, FakeFileSystem, FakeLibrary,
     FakeLocalization, FakeLyrics, FakeMediaSegments, FakeMediaSources, FakeMusic, FakePlaylists,
     FakeProviders, FakeQuickConnect, FakeSearch, FakeSessions, FakeSimilarItems, FakeSubtitles,
-    FakeSystem, FakeTrickplay, FakeTvSeries, FakeUserData, FakeUserViews, FakeUsers,
+    FakeSystem, FakeTrickplay, FakeTvSeries, FakeUserData, FakeUserViews, FakeUsers, FixedAuth,
     fake_user_entity,
 };
 use ferrofin_model::tasks::TaskInfo;
@@ -35,29 +35,11 @@ const CALLER_ID: Uuid = Uuid::from_u128(0x00C4_0000);
 const OTHER_USER_ID: Uuid = Uuid::from_u128(0x00C4_0001);
 
 /// An auth pair that authenticates every request.
-struct OkAuth;
-
-#[async_trait]
-impl AuthService for OkAuth {
-    async fn authenticate(&self, _r: &RequestContext) -> Result<AuthorizationInfo, ServiceError> {
-        Ok(AuthorizationInfo {
-            is_authenticated: true,
-            ..ferrofin_api::test_support::authenticated_user_info()
-        })
-    }
-}
-
-#[async_trait]
-impl AuthorizationContext for OkAuth {
-    async fn get_authorization_info(
-        &self,
-        _r: &RequestContext,
-    ) -> Result<AuthorizationInfo, ServiceError> {
-        Ok(AuthorizationInfo {
-            is_authenticated: true,
-            ..ferrofin_api::test_support::authenticated_user_info()
-        })
-    }
+fn ok_auth() -> FixedAuth {
+    FixedAuth(AuthorizationInfo {
+        is_authenticated: true,
+        ..ferrofin_api::test_support::authenticated_user_info()
+    })
 }
 
 /// An auth pair authenticating as a concrete user, so the cross-user gate has a
@@ -147,7 +129,7 @@ impl TaskManager for StubTasks {
 /// Builds an [`AppState`] whose task manager is `tasks` with always-ok auth; every
 /// other manager is a panic fake.
 fn state(tasks: Arc<StubTasks>) -> AppState {
-    let auth = Arc::new(OkAuth);
+    let auth = Arc::new(ok_auth());
     state_as(tasks, Arc::new(FakeUsers), auth.clone(), auth)
 }
 
@@ -393,4 +375,62 @@ async fn oneshot(router: axum::Router, uri: &str) -> (StatusCode, Vec<u8>) {
         .expect("body")
         .to_vec();
     (status, bytes)
+}
+
+/// v12.4 `ChannelsController.GetLatestChannelItems` binds `startIndex`,
+/// `limit` and `filters` and calls `query.ApplyFilters(filters)` after
+/// `GetUserId` (gl-408): a contradictory pair is upstream's
+/// `ArgumentException`, a `400`, and so is a paging value the binder refuses.
+#[tokio::test]
+async fn latest_channel_items_apply_their_filters() {
+    for (uri, expected) in [
+        (
+            "/Channels/Items/Latest?filters=IsPlayed,IsUnplayed",
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            "/Channels/Items/Latest?filters=IsFolder,IsNotFolder",
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            "/Channels/Items/Latest?filters=Likes,Dislikes",
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            "/Channels/Items/Latest?startIndex=abc",
+            StatusCode::BAD_REQUEST,
+        ),
+        ("/Channels/Items/Latest?limit=abc", StatusCode::BAD_REQUEST),
+        (
+            "/Channels/Items/Latest?filters=IsPlayed,Bogus&startIndex=0&limit=5&fields=Bogus&channelIds=nope",
+            StatusCode::OK,
+        ),
+    ] {
+        let (status, body) = send(Arc::new(StubTasks::new(Vec::new())), "GET", uri).await;
+        assert_eq!(status, expected, "{uri}");
+        if status == StatusCode::OK {
+            // `new QueryResult(query.StartIndex, total, items)`.
+            let body: serde_json::Value = serde_json::from_slice(&body).expect("json");
+            assert_eq!(body["StartIndex"], 0);
+        }
+    }
+    let uri = "/Channels/Items/Latest?startIndex=20";
+    let (_, body) = send(Arc::new(StubTasks::new(Vec::new())), "GET", uri).await;
+    let body: serde_json::Value = serde_json::from_slice(&body).expect("json");
+    assert_eq!(
+        (body["StartIndex"].clone(), body["TotalRecordCount"].clone()),
+        (20.into(), 0.into())
+    );
+
+    // `GetUserId` runs first: another user's id is the 403, not the filter's 400.
+    let auth = Arc::new(UserAuth(CALLER_ID));
+    let router = create_router(state_as(
+        Arc::new(StubTasks::new(Vec::new())),
+        Arc::new(FakeUsers),
+        auth.clone(),
+        auth,
+    ));
+    let uri = format!("/Channels/Items/Latest?userId={OTHER_USER_ID}&filters=IsPlayed,IsUnplayed");
+    let (status, _) = oneshot(router, &uri).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{uri}");
 }

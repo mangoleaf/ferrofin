@@ -13,7 +13,7 @@
 //! older-ffmpeg case hides the version from the server instead:
 //!
 //! ```bash
-//! FERROFIN_FFMPEG_TESTS=1 cargo test -p ferrofin-server --test subtitle_streams_ffmpeg
+//! cargo test -p ferrofin-server --test subtitle_streams_ffmpeg -- --include-ignored
 //! ```
 
 use std::path::{Path, PathBuf};
@@ -548,22 +548,16 @@ fn has_input_sync(ffmpeg: &Path) -> bool {
         .is_ok_and(|out| String::from_utf8_lossy(&out.stdout).contains("-isync"))
 }
 
-/// The real ffmpeg and ffprobe, or `None` (saying why) when this run skips:
-/// `FERROFIN_FFMPEG_TESTS` unset, a tool missing, no libx264, or an ffmpeg
-/// older than 5.1.
+/// The real ffmpeg and ffprobe, or `None` (saying why) when this run skips
+/// because the ffmpeg is older than 5.1. The tests are `#[ignore]`d, so a run
+/// that asks for them fails when a tool or libx264 is missing.
 fn tools() -> Option<(PathBuf, PathBuf)> {
-    if std::env::var("FERROFIN_FFMPEG_TESTS").as_deref() != Ok("1") {
-        eprintln!("skipping: set FERROFIN_FFMPEG_TESTS=1 to run");
-        return None;
-    }
-    let (Some(ffmpeg), Some(ffprobe)) = (tool("ffmpeg"), tool("ffprobe")) else {
-        eprintln!("skipping: ffmpeg/ffprobe not on PATH");
-        return None;
-    };
-    if !can_generate(&ffmpeg) {
-        eprintln!("skipping: this ffmpeg has no libx264 to generate the media");
-        return None;
-    }
+    let ffmpeg = tool("ffmpeg").expect("ffmpeg not found on PATH");
+    let ffprobe = tool("ffprobe").expect("ffprobe not found on PATH");
+    assert!(
+        can_generate(&ffmpeg),
+        "this ffmpeg has no libx264 to generate the media"
+    );
     if !has_input_sync(&ffmpeg) {
         eprintln!("skipping: this ffmpeg is older than 5.1 (no -isync)");
         return None;
@@ -598,6 +592,7 @@ impl Server {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "runs the real ffmpeg; run with --ignored"]
 #[allow(clippy::too_many_lines)]
 async fn bitmap_subtitles_embed_and_burn_in_from_the_movie_and_a_sidecar() {
     let Some((real_ffmpeg, real_ffprobe)) = tools() else {
@@ -698,6 +693,7 @@ async fn bitmap_subtitles_embed_and_burn_in_from_the_movie_and_a_sidecar() {
 /// is a path is written inside the cache folder all the same, by its leaf
 /// (gl-414): nothing lands where the tag points.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "runs the real ffmpeg; run with --ignored"]
 async fn a_burned_ass_track_reads_the_fonts_its_file_ships_from_the_cache() {
     let Some((real_ffmpeg, real_ffprobe)) = tools() else {
         return;
@@ -878,6 +874,7 @@ async fn seeked_text_embeds_start_on_time(
 /// it is the 8.5-11 s cue, still on screen, which moved every stream 0.5 s
 /// later; now it shows from 0 for the 2 s it has left.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "runs the real ffmpeg; run with --ignored"]
 async fn a_seeked_embed_of_a_text_sidecar_starts_every_stream_on_time() {
     let Some((real_ffmpeg, real_ffprobe)) = tools() else {
         return;
@@ -902,6 +899,7 @@ async fn a_seeked_embed_of_a_text_sidecar_starts_every_stream_on_time() {
 /// copy lives beside the job's output and goes with it when the job is
 /// stopped.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "runs the real ffmpeg; run with --ignored"]
 async fn without_a_readable_version_a_seeked_text_embed_reads_a_copy_cut_to_the_start() {
     let Some((real_ffmpeg, real_ffprobe)) = tools() else {
         return;
@@ -977,6 +975,7 @@ async fn without_a_readable_version_a_seeked_text_embed_reads_a_copy_cut_to_the_
 /// 3.5 s. Seeked instead, the sidecar lost its first display set there, and
 /// unsynced its cues came 3.5 s early.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "runs the real ffmpeg; run with --ignored"]
 async fn without_isync_a_bitmap_sidecar_stays_on_the_movies_clock() {
     let Some((real_ffmpeg, real_ffprobe)) = tools() else {
         return;
@@ -1063,6 +1062,7 @@ async fn without_isync_a_bitmap_sidecar_stays_on_the_movies_clock() {
 /// the whole display set an embed from the movie's start holds, at its time on
 /// the movie's clock.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "runs the real ffmpeg; run with --ignored"]
 async fn a_seeked_embed_of_a_bitmap_sidecar_keeps_its_first_display_set() {
     let Some((real_ffmpeg, real_ffprobe)) = tools() else {
         return;

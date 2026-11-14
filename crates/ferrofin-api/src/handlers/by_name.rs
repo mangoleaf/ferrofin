@@ -23,16 +23,14 @@ use ferrofin_traits::options::{AuthorizationInfo, DtoOptions};
 use ferrofin_traits::persistence::ItemWithCounts;
 
 use crate::error::ApiError;
-use crate::handlers::items::{parse_order_by, require_scope_visible};
+use crate::handlers::items::require_scope_visible;
+use crate::handlers::query_parse::parse_order_by;
 use crate::state::AppState;
 
-/// The paging + name-range query parameters shared by every by-name **list**
-/// endpoint.
-///
-/// The full Jellyfin query is far wider (image/user-data toggles, sort orders,
-/// media types); the remaining parameters are accepted by the per-controller
-/// query structs but only these paging/name filters change which rows come back,
-/// so they live here and feed [`base_query`].
+/// The query of the by-name **list** endpoints: what `GET /Artists` and
+/// `GET /Artists/AlbumArtists` bind, and what [`ValueListQuery`] fills for
+/// Genres, `MusicGenres` and Studios with only the parameters they declare.
+/// It feeds [`base_query`].
 #[derive(Debug, Default, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct ByNameListQuery {
@@ -105,8 +103,8 @@ pub(crate) struct ByNameListQuery {
     /// populate. Empty ⇒ every type, as upstream.
     #[serde(default)]
     pub enable_image_types: Option<String>,
-    /// Whether user data is populated. Ignored by the controllers that pin it
-    /// (Genres / `MusicGenres` hardcode `false` upstream).
+    /// Whether user data is populated. Genres and `MusicGenres` hardcode
+    /// `false` upstream and do not bind it ([`ValueListQuery::genres`]).
     #[serde(default)]
     pub enable_user_data: Option<bool>,
     /// Pipe-delimited genre names the by-name row itself must carry
@@ -131,9 +129,147 @@ pub(crate) struct ByNameListQuery {
     /// Pipe-delimited studio **names** (`ArtistsController` only). Non-empty,
     /// they replace [`Self::studio_ids`] with the named studios' ids — see
     /// [`Self::artists_query`]. The Genres, `MusicGenres` and Studios
-    /// controllers declare no such parameter, so their handlers ignore it.
+    /// controllers declare no such parameter: [`ValueListQuery`] never sets it.
     #[serde(default)]
     pub studios: Option<String>,
+    /// `[FromQuery] double? minCommunityRating`, which only the
+    /// `ArtistsController` actions declare: bound raw ([`ValueListQuery`]
+    /// never sets it), and checked by
+    /// [`Self::check_min_community_rating`] on the Artists routes. A valid value
+    /// is never read: `GetItemValues` copies it onto neither filter.
+    #[serde(default)]
+    pub min_community_rating: Option<String>,
+}
+
+/// The query `GET /Genres`, `GET /MusicGenres` and `GET /Studios` bind: only
+/// the parameters their v12.4 actions declare (`GenresController.GetGenres`,
+/// `MusicGenresController.GetMusicGenres`, `StudiosController.GetStudios`).
+/// ASP.NET never binds any other, so a value there, valid or not, changes
+/// nothing. `sortBy`/`sortOrder` (Genres and `MusicGenres` only) and
+/// `enableUserData` (Studios only) bind raw; [`Self::genres`] and
+/// [`Self::studios`] keep the ones each action declares.
+#[derive(Debug, Default, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ValueListQuery {
+    /// The target user; defaults to the authenticated caller when absent.
+    #[serde(
+        default,
+        deserialize_with = "crate::handlers::query_parse::empty_as_none_uuid"
+    )]
+    user_id: Option<uuid::Uuid>,
+    /// The index of the first record to return.
+    #[serde(default)]
+    start_index: Option<i32>,
+    /// The maximum number of records to return.
+    #[serde(default)]
+    limit: Option<i32>,
+    /// A search term the name must match.
+    #[serde(default)]
+    search_term: Option<String>,
+    /// Names sorted at or after this value.
+    #[serde(default)]
+    name_starts_with_or_greater: Option<String>,
+    /// Names starting with this value.
+    #[serde(default)]
+    name_starts_with: Option<String>,
+    /// Names sorted before this value.
+    #[serde(default)]
+    name_less_than: Option<String>,
+    /// The parent item the browse is scoped to.
+    #[serde(
+        default,
+        deserialize_with = "crate::handlers::query_parse::empty_as_none_uuid"
+    )]
+    parent_id: Option<uuid::Uuid>,
+    /// Comma-delimited `BaseItemKind`s the inner content query includes.
+    #[serde(default)]
+    include_item_types: Option<String>,
+    /// Comma-delimited `BaseItemKind`s the inner content query excludes.
+    #[serde(default)]
+    exclude_item_types: Option<String>,
+    /// Comma-delimited sort keys; Genres and `MusicGenres` only.
+    #[serde(default)]
+    sort_by: Option<String>,
+    /// Comma-delimited sort directions; Genres and `MusicGenres` only.
+    #[serde(default)]
+    sort_order: Option<String>,
+    /// Whether a total record count is requested.
+    #[serde(default)]
+    enable_total_record_count: Option<bool>,
+    /// Restrict to items the caller has (not) favourited.
+    #[serde(default)]
+    is_favorite: Option<bool>,
+    /// Comma-delimited fields to populate on each DTO.
+    #[serde(default)]
+    fields: Option<String>,
+    /// Whether image information is populated.
+    #[serde(default)]
+    enable_images: Option<bool>,
+    /// The maximum number of images to return, per image type.
+    #[serde(default)]
+    image_type_limit: Option<i32>,
+    /// Comma-delimited image types to populate.
+    #[serde(default)]
+    enable_image_types: Option<String>,
+    /// `bool? enableUserData`, which only `GetStudios` declares: raw here,
+    /// converted by [`Self::studios`].
+    #[serde(default)]
+    enable_user_data: Option<String>,
+}
+
+impl ValueListQuery {
+    /// The Genres and `MusicGenres` browse: sorted as asked, `enableUserData`
+    /// not bound (the controllers pass a literal `false`).
+    pub(crate) fn genres(self) -> ByNameListQuery {
+        self.into_list(true, None)
+    }
+
+    /// The Studios browse: no `sortBy`/`sortOrder`, and `enableUserData`
+    /// converted as the query binder converts a `bool?` (blank is absent).
+    ///
+    /// # Errors
+    ///
+    /// `400` for an `enableUserData` that is not a boolean.
+    pub(crate) fn studios(self) -> Result<ByNameListQuery, ApiError> {
+        let enable_user_data = match self.enable_user_data.as_deref() {
+            None => None,
+            Some(raw) => <Option<bool> as serde::Deserialize>::deserialize(
+                crate::query::value::Value::nullable(raw),
+            )
+            .map_err(|_| {
+                ApiError::BadRequest(format!(
+                    "The value '{raw}' is not valid for enableUserData."
+                ))
+            })?,
+        };
+        Ok(self.into_list(false, enable_user_data))
+    }
+
+    /// The shared by-name query with only the declared parameters set.
+    fn into_list(self, sorted: bool, enable_user_data: Option<bool>) -> ByNameListQuery {
+        ByNameListQuery {
+            user_id: self.user_id,
+            start_index: self.start_index,
+            limit: self.limit,
+            search_term: self.search_term,
+            name_starts_with_or_greater: self.name_starts_with_or_greater,
+            name_starts_with: self.name_starts_with,
+            name_less_than: self.name_less_than,
+            parent_id: self.parent_id,
+            include_item_types: self.include_item_types,
+            exclude_item_types: self.exclude_item_types,
+            sort_by: self.sort_by.filter(|_| sorted),
+            sort_order: self.sort_order.filter(|_| sorted),
+            enable_total_record_count: self.enable_total_record_count,
+            is_favorite: self.is_favorite,
+            fields: self.fields,
+            enable_images: self.enable_images,
+            image_type_limit: self.image_type_limit,
+            enable_image_types: self.enable_image_types,
+            enable_user_data,
+            ..ByNameListQuery::default()
+        }
+    }
 }
 
 /// Builds the projection options a by-name browse hands to the DTO service.
@@ -175,6 +311,23 @@ pub(crate) fn additional_dto_options(
 }
 
 impl ByNameListQuery {
+    /// The `400` the query binder answers on `/Artists` and
+    /// `/Artists/AlbumArtists` for a `minCommunityRating` that does not convert
+    /// to `double?`. It binds as the query binder binds one (blank is absent),
+    /// only later, as `ImageQuery`'s `imageIndex` does.
+    pub(crate) fn check_min_community_rating(&self) -> Result<(), ApiError> {
+        let Some(raw) = self.min_community_rating.as_deref() else {
+            return Ok(());
+        };
+        <Option<f64> as serde::Deserialize>::deserialize(crate::query::value::Value::nullable(raw))
+            .map(drop)
+            .map_err(|_| {
+                ApiError::BadRequest(format!(
+                    "The value '{raw}' is not valid for minCommunityRating."
+                ))
+            })
+    }
+
     /// This browse's [`DtoOptions`], with `enable_user_data` supplied by the
     /// caller — see [`additional_dto_options`] for why it is not read off the
     /// query.
@@ -406,11 +559,6 @@ pub(crate) struct ByNameItemQuery {
     pub user_id: Option<uuid::Uuid>,
 }
 
-/// Projects a page of already-resolved by-name item rows into a
-/// [`QueryResult<BaseItemDto>`] via [`DtoService::get_item_by_name_dto`].
-///
-/// Used by the browses whose manager call already yields the item rows (Persons,
-/// Years) rather than count-carrying [`ItemWithCounts`] aggregates.
 /// Strips `ItemCounts` from a by-name **list**'s options.
 ///
 /// C# `DtoService.GetItemByNameDto` only stamps the ten count fields when
@@ -440,6 +588,11 @@ fn without_item_counts(options: &DtoOptions) -> DtoOptions {
     trimmed
 }
 
+/// Projects a page of already-resolved by-name item rows into a
+/// [`QueryResult<BaseItemDto>`], as `DtoService.GetItemByNameDto` does upstream.
+///
+/// Used by the browses whose manager call already yields the item rows (Persons,
+/// Years) rather than count-carrying [`ItemWithCounts`] aggregates.
 pub(crate) async fn project_item_rows(
     state: &AppState,
     result: QueryResult<ferrofin_db::entities::base_items::BaseItemEntity>,
@@ -448,10 +601,10 @@ pub(crate) async fn project_item_rows(
 ) -> Result<QueryResult<BaseItemDto>, ApiError> {
     let start_index = Some(result.start_index);
     let total = Some(result.total_record_count);
-    // With no pre-supplied tagged ids and no `ItemCounts` field requested (the
-    // by-name list options), `get_item_by_name_dto` reduces to `build_dto` — the
-    // same thing `get_base_item_dtos` does, but batching the per-item image and
-    // user-data loads into two queries instead of 2×N. Same rows, same order.
+    // With no tagged items and no `ItemCounts` field (the by-name list
+    // options), C# `GetItemByNameDto` is `GetBaseItemDtoInternal`: what
+    // `get_base_item_dtos` does, batching the per-item image and user-data
+    // loads into two queries instead of 2×N. Same rows, same order.
     let options = without_item_counts(options);
     let dtos = state
         .dto
@@ -618,10 +771,11 @@ pub(crate) async fn resolve_album_ids(
 /// Projects a page of [`ItemWithCounts`] aggregates into a
 /// [`QueryResult<BaseItemDto>`], mirroring `RequestHelpers.CreateQueryResult`.
 ///
-/// Each aggregate's item row is projected through
-/// [`DtoService::get_item_by_name_dto`]; when `include_item_types` — the
-/// caller's [`ByNameListQuery::should_include_item_types`] — is set, the
-/// per-kind counts are copied onto the DTO's count fields (`ChildCount`,
+/// Each aggregate's item row is projected as `DtoService.GetItemByNameDto`
+/// projects it, without `ItemCounts` (see [`project_item_rows`]); when
+/// `include_item_types` — the caller's
+/// [`ByNameListQuery::should_include_item_types`] — is set, the per-kind
+/// counts are copied onto the DTO's count fields (`ChildCount`,
 /// `ProgramCount`, …) exactly as Jellyfin does.
 pub(crate) async fn project_query_result(
     state: &AppState,
@@ -683,40 +837,33 @@ crate::query::query_parameters! {
         "years" => ',',
         "studioIds" => ',',
         "studios" => '|',
-    } => [("get", "/Genres"), ("get", "/MusicGenres"), ("get", "/Studios"), ("get", "/Artists"), ("get", "/Artists/AlbumArtists")];
+    } => [("get", "/Artists"), ("get", "/Artists/AlbumArtists")];
+    ValueListQuery {
+        "includeItemTypes" => ',',
+        "excludeItemTypes" => ',',
+        "sortBy" => ',',
+        "sortOrder" => ',',
+        "fields" => ',',
+        "enableImageTypes" => ',',
+    } => [("get", "/Genres"), ("get", "/MusicGenres"), ("get", "/Studios")];
     ByNameItemQuery {} => [("get", "/Genres/{genreName}"), ("get", "/MusicGenres/{genreName}"), ("get", "/Persons/{name}"), ("get", "/Studios/{name}"), ("get", "/Artists/{name}")];
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{ByNameListQuery, additional_dto_options};
+    use super::{ByNameListQuery, ValueListQuery, additional_dto_options};
     use ferrofin_model::entities::ImageType;
     use ferrofin_model::querying::ItemFields;
 
-    /// Every query parameter the vendored contracts give the five list routes
-    /// that bind [`ByNameListQuery`] is one of its fields, except the four
-    /// `/Artists` parameters v12.2 accepts and ignores: `GetItemValues` copies
-    /// `MinCommunityRating`, `Person`, `PersonIds` and `PersonTypes` onto
-    /// neither of its filters (`ByName.cs:180-233`). serde drops an unknown
-    /// key without a word, so a missing field is a filter the client asked for
-    /// and never got: `studios` was one, and every artist came back.
-    #[test]
-    fn by_name_list_query_binds_every_contract_parameter() {
-        const UPSTREAM_NO_OPS: [&str; 4] =
-            ["minCommunityRating", "person", "personIds", "personTypes"];
+    /// The query parameters the vendored contracts give `routes`.
+    fn contract_parameters(routes: &[&str]) -> std::collections::BTreeSet<String> {
         let mut contract = std::collections::BTreeSet::new();
         for raw in [
             include_str!("../../../../contracts/jellyfin-openapi-10.11.8.json"),
             include_str!("../../../../contracts/jellyfin-openapi-12.1.0.json"),
         ] {
             let spec: serde_json::Value = serde_json::from_str(raw).expect("contract parses");
-            for route in [
-                "/Genres",
-                "/MusicGenres",
-                "/Studios",
-                "/Artists",
-                "/Artists/AlbumArtists",
-            ] {
+            for route in routes {
                 // Jellyfin 12 drops `/MusicGenres`; 10.11.8 still lists it.
                 let Some(parameters) = spec["paths"][route]["get"]["parameters"].as_array() else {
                     continue;
@@ -729,6 +876,22 @@ mod tests {
                 );
             }
         }
+        contract
+    }
+
+    /// Every query parameter the vendored contracts give the two artist list
+    /// routes is one of [`ByNameListQuery`]'s fields, except the three
+    /// `/Artists` parameters v12.4 accepts and ignores and whose binding never
+    /// fails: `GetItemValues` copies `Person`, `PersonIds` and `PersonTypes`
+    /// onto neither of its filters (`ByName.cs:180-233`), and a string or a
+    /// comma-delimited list binds whatever is sent. serde drops an unknown key
+    /// without a word, so a missing field is a filter the client asked for and
+    /// never got (`studios` was one, and every artist came back), or a value
+    /// the binder refuses and Ferrofin let through (`minCommunityRating`).
+    #[test]
+    fn by_name_list_query_binds_every_contract_parameter() {
+        const UPSTREAM_NO_OPS: [&str; 3] = ["person", "personIds", "personTypes"];
+        let contract = contract_parameters(&["/Artists", "/Artists/AlbumArtists"]);
         assert!(contract.contains("studios"), "contract read: {contract:?}");
         let keys = crate::query::fields::<ByNameListQuery>();
         let unbound: std::collections::BTreeSet<&str> = contract
@@ -739,9 +902,52 @@ mod tests {
         assert_eq!(
             unbound,
             UPSTREAM_NO_OPS.into_iter().collect(),
-            "left: the contract parameters ByNameListQuery drops; right: v12.2's no-ops. \
+            "left: the contract parameters ByNameListQuery drops; right: v12.4's no-ops. \
              A newly dropped parameter must be bound, not listed"
         );
+    }
+
+    /// [`ValueListQuery`] binds exactly the parameters the Genres,
+    /// `MusicGenres` and Studios actions declare (gl-408): one it drops is a
+    /// filter the client never got, one it adds is a value ASP.NET ignores
+    /// that Ferrofin would act on or refuse.
+    #[test]
+    fn value_list_query_binds_exactly_the_contract_parameters() {
+        let contract = contract_parameters(&["/Genres", "/MusicGenres", "/Studios"]);
+        let keys: std::collections::BTreeSet<String> = crate::query::fields::<ValueListQuery>()
+            .iter()
+            .map(|k| (*k).to_owned())
+            .collect();
+        assert_eq!(keys, contract);
+    }
+
+    /// Studios declares no `sortBy`/`sortOrder` and Genres no
+    /// `enableUserData`; only Studios converts `enableUserData`, as a `bool?`.
+    #[test]
+    fn each_value_list_keeps_only_what_its_action_declares() {
+        let query = || ValueListQuery {
+            sort_by: Some("Name".into()),
+            sort_order: Some("Descending".into()),
+            enable_user_data: Some("abc".into()),
+            ..ValueListQuery::default()
+        };
+        let genres = query().genres();
+        assert_eq!(genres.sort_by.as_deref(), Some("Name"));
+        assert_eq!(genres.enable_user_data, None);
+        assert!(query().studios().is_err(), "a bool? the binder refuses");
+        let studios = ValueListQuery {
+            enable_user_data: Some("False".into()),
+            ..query()
+        }
+        .studios()
+        .expect("binds");
+        assert_eq!((studios.sort_by, studios.sort_order), (None, None));
+        assert_eq!(studios.enable_user_data, Some(false));
+        let blank = ValueListQuery {
+            enable_user_data: Some(String::new()),
+            ..ValueListQuery::default()
+        };
+        assert_eq!(blank.studios().expect("blank").enable_user_data, None);
     }
 
     #[test]

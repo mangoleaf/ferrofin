@@ -1,9 +1,9 @@
 //! What a library scan may and may not touch on a **metadata-locked** item.
 //!
-//! The scan reads the locked-item set once per scan
-//! (`ItemRepository::locked_item_ids`) rather than hydrating every item's row
-//! to read one boolean. These tests pin the behaviour that read feeds: the
-//! loop's `locked` flag still has to mean `IsLocked`.
+//! The walk's `locked` flag is the item's stored row's `IsLocked`; the
+//! locked-item set the scan reads once (`ItemRepository::locked_item_ids`)
+//! serves only the items whose row it did not read. These tests pin that the
+//! flag still means `IsLocked`.
 //!
 //! The NFO is the assertion with teeth. The user-owned *metadata* columns are
 //! protected a second time inside the scan upsert (`CASE WHEN "IsLocked" = 1
@@ -17,9 +17,10 @@
 //! images like any other's (`CanRefreshImages` enables `ILocalImageProvider`
 //! before its `IsLocked` check), so the scan rediscovers them.
 //!
-//! A lock or an edit made while the scan runs (`PriorityLane::edited`) is
-//! seen by the walk before it reaches the item: upstream's metadata editor
-//! changes the cached item the refresh merges onto.
+//! A lock, an unlock or an edit made while the scan runs
+//! (`PriorityLane::edited`) is seen by the walk before it reaches the item:
+//! upstream's metadata editor changes the cached item the refresh merges
+//! onto.
 
 use std::path::Path;
 use std::sync::{Arc, Mutex};
@@ -365,6 +366,47 @@ async fn a_lock_applied_mid_scan_keeps_the_nfo_from_the_item_not_reached_yet() {
 
     // Control: unlocked, the same (changed) NFOs are read.
     set_locked(&db, 0).await;
+    scanner.scan_all().await.expect("rescan while unlocked");
+    let mut ids = tmdb_ids(&db).await;
+    ids.sort();
+    assert_eq!(ids, ["601", "602"]);
+}
+
+/// An unlock applied over the API while a scan runs is honoured for the item
+/// the scan has not reached yet: it reads its changed NFO in this scan, not
+/// the next one. The one reached before the unlock stays locked.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_unlock_applied_mid_scan_lets_the_item_not_reached_yet_read_its_nfo() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (scanner, db) = one_movie_library(tmp.path()).await;
+    add_second_movie(tmp.path());
+    scanner.scan_all().await.expect("first scan");
+    set_locked(&db, 1).await;
+
+    for (movie, id) in [("Movie 0001 (2020)", 601), ("Movie 0002 (2020)", 602)] {
+        let nfo = tmp
+            .path()
+            .join("movies")
+            .join(movie)
+            .join(format!("{movie}.nfo"));
+        std::fs::write(&nfo, format!("<movie><tmdbid>{id}</tmdbid></movie>")).expect("nfo");
+        touch_ahead(&nfo);
+    }
+    rescan_with_edit_mid_walk(
+        &scanner,
+        &db,
+        &MetadataRefreshOptions::default(),
+        r#"UPDATE "BaseItems" SET "IsLocked" = 0
+           WHERE "Type" LIKE '%Movies.Movie' RETURNING "Id""#,
+    )
+    .await;
+    assert_eq!(
+        tmdb_ids(&db).await.len(),
+        1,
+        "only the movie reached after the unlock read its NFO"
+    );
+
+    // Control: the movie reached first skipped its NFO only for its lock.
     scanner.scan_all().await.expect("rescan while unlocked");
     let mut ids = tmdb_ids(&db).await;
     ids.sort();

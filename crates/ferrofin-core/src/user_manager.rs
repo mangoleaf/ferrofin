@@ -550,6 +550,7 @@ impl FerrofinUserManager {
             LazyLock::new(|| {
                 ferrofin_networking::NetworkManager::live(
                     ferrofin_networking::NetworkConfiguration::default(),
+                    Arc::new(ferrofin_networking::TracingLogger),
                 )
             });
         match &self.network {
@@ -1105,18 +1106,6 @@ impl UserManager for FerrofinUserManager {
             .fetch_all(self.db.pool())
             .await
             .map_err(db_err)
-    }
-
-    async fn get_user_ids(&self) -> Result<Vec<Uuid>, ServiceError> {
-        let ids: Vec<String> =
-            sqlx::query_scalar(r#"SELECT "Id" FROM "Users" ORDER BY "Username""#)
-                .fetch_all(self.db.pool())
-                .await
-                .map_err(db_err)?;
-        Ok(ids
-            .into_iter()
-            .filter_map(|id| Uuid::parse_str(&id).ok())
-            .collect())
     }
 
     async fn initialize(&self) -> Result<(), ServiceError> {

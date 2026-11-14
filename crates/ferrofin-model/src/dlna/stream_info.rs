@@ -257,7 +257,7 @@ impl StreamInfo {
         if let Some(codec) = target.first()
             && !codec.is_empty()
             && let Some(value) = self.get_option(Some(codec), "rangetype")
-            && let Some(rt) = super::condition_processor::parse_video_range_type_pub(value)
+            && let Some(rt) = super::condition_processor::parse_video_range_type(value)
         {
             return rt;
         }
@@ -819,10 +819,11 @@ impl StreamInfo {
             ));
             info.is_external_url = false;
 
-            let is_absolute_http = stream
-                .path
-                .as_deref()
-                .is_some_and(|p| p.starts_with("http://") || p.starts_with("https://"));
+            // Upstream's `Uri.TryCreate(path, UriKind.Absolute)`: surrounding
+            // white space ignored, the scheme in any case, a host required.
+            let is_absolute_http = stream.path.as_deref().is_some_and(|p| {
+                url::Url::parse(p).is_ok_and(|u| matches!(u.scheme(), "http" | "https"))
+            });
 
             if stream.is_external
                 && stream.supports_external_stream

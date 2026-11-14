@@ -8,6 +8,7 @@
 //! (v12.2), whose expected values are the oracle; the rest pin what the maps
 //! assume about the inputs.
 
+use ferrofin_mediaencoding::encoder::media_encoder::InputAnalysis;
 use ferrofin_mediaencoding::encoding_helper::helper::external_stream_input_arguments;
 use ferrofin_mediaencoding::{
     BaseEncodingJobOptions, EncodingHelper, EncodingJobInfo, FfmpegVersion, NoOptionalEncoders,
@@ -77,6 +78,7 @@ fn build_state(
         is_input_video: true,
         subtitle_delivery_method: method.unwrap_or(SubtitleDeliveryMethod::Drop),
         trimmed_subtitle_path: None,
+        transcode_reasons: ferrofin_model::session::TranscodeReasons::empty(),
         run_time_ticks: None,
         transcoding_type: TranscodingJobType::Progressive,
         supported_video_codecs: Vec::new(),
@@ -194,8 +196,12 @@ fn get_input_argument_vob_sub_uses_correct_path(
         std::fs::write(dir.path().join("movie.idx"), "dummy").unwrap();
     }
     let sub = external_subtitle(2, "dvdsub", &sub_file.to_string_lossy());
-    let input_args =
-        external_stream_input_arguments(&build_state(Some(sub), Some(method), None), None, None);
+    let input_args = external_stream_input_arguments(
+        &build_state(Some(sub), Some(method), None),
+        None,
+        None,
+        &InputAnalysis::default(),
+    );
     assert!(
         input_args.last().unwrap().ends_with(expected_file_name),
         "{input_args:?}"
@@ -216,6 +222,7 @@ fn an_upper_case_vob_sub_is_read_through_its_idx() {
         &build_state(Some(sub), Some(SubtitleDeliveryMethod::Encode), None),
         None,
         None,
+        &InputAnalysis::default(),
     );
     assert!(
         input_args.last().unwrap().ends_with("MOVIE.idx"),
@@ -236,7 +243,12 @@ fn a_burned_external_bitmap_is_input_1_on_its_canvas() {
     let mut state = build_state(Some(sub), Some(SubtitleDeliveryMethod::Encode), None);
     state.media_source.analyze_duration_ms = Some(3000);
     assert_eq!(
-        external_stream_input_arguments(&state, Some("00:01:02.500"), None),
+        external_stream_input_arguments(
+            &state,
+            Some("00:01:02.500"),
+            None,
+            &InputAnalysis::default()
+        ),
         [
             "-analyzeduration",
             "3000000",
@@ -269,7 +281,8 @@ fn a_burned_external_bitmap_is_read_from_its_start_on_the_media_files_clock() {
         external_stream_input_arguments(
             &state,
             Some("00:01:02.500"),
-            Some(FfmpegVersion::new(7, 0))
+            Some(FfmpegVersion::new(7, 0)),
+            &InputAnalysis::default()
         ),
         [
             "-analyzeduration",
@@ -301,7 +314,12 @@ fn an_embedded_external_bitmap_is_read_from_its_start_and_synced(#[case] seek: O
     let sub = external_subtitle(2, "PGSSUB", "/media/movie.en.sup");
     let state = build_state(Some(sub), Some(SubtitleDeliveryMethod::Embed), None);
     assert_eq!(
-        external_stream_input_arguments(&state, seek, Some(FfmpegVersion::new(7, 0))),
+        external_stream_input_arguments(
+            &state,
+            seek,
+            Some(FfmpegVersion::new(7, 0)),
+            &InputAnalysis::default()
+        ),
         [
             "-analyzeduration",
             "200M",
@@ -325,8 +343,12 @@ fn an_embedded_vob_sub_is_read_from_its_start_and_synced() {
     std::fs::write(dir.path().join("movie.idx"), "dummy").unwrap();
     let sub = external_subtitle(2, "dvdsub", &sub_file.to_string_lossy());
     let state = build_state(Some(sub), Some(SubtitleDeliveryMethod::Embed), None);
-    let input_args =
-        external_stream_input_arguments(&state, Some("10"), Some(FfmpegVersion::new(5, 1)));
+    let input_args = external_stream_input_arguments(
+        &state,
+        Some("10"),
+        Some(FfmpegVersion::new(5, 1)),
+        &InputAnalysis::default(),
+    );
     assert_eq!(
         input_args[4..6],
         ["-isync", "0"],
@@ -342,7 +364,7 @@ fn an_embedded_external_text_track_is_input_1_without_a_canvas() {
     let sub = external_subtitle(2, "srt", "/media/movie.en.srt");
     let state = build_state(Some(sub), Some(SubtitleDeliveryMethod::Embed), None);
     assert_eq!(
-        external_stream_input_arguments(&state, None, None),
+        external_stream_input_arguments(&state, None, None, &InputAnalysis::default()),
         [
             "-analyzeduration",
             "200M",
@@ -351,6 +373,57 @@ fn an_embedded_external_text_track_is_input_1_without_a_canvas() {
             "-i",
             "file:/media/movie.en.srt",
         ]
+    );
+}
+
+/// A sidecar whose path is a URL is read from the URL, embedded or burned in:
+/// a `file:` prefix would have ffmpeg open a local file named after it
+/// (gl-1722, a Jellyfin bug).
+#[rstest]
+#[case(
+    "srt",
+    SubtitleDeliveryMethod::Embed,
+    "http://relay.example/remote.en.srt"
+)]
+#[case(
+    "PGSSUB",
+    SubtitleDeliveryMethod::Encode,
+    "https://relay.example/remote en.sup"
+)]
+fn a_url_sidecar_is_input_1_as_its_url(
+    #[case] codec: &str,
+    #[case] method: SubtitleDeliveryMethod,
+    #[case] url: &str,
+) {
+    let sub = external_subtitle(2, codec, url);
+    let state = build_state(Some(sub), Some(method), None);
+    let input_args = external_stream_input_arguments(&state, None, None, &InputAnalysis::default());
+    assert_eq!(input_args[input_args.len() - 2..], ["-i", url]);
+}
+
+/// A configured `FFmpeg:analyzeduration` / `FFmpeg:probesize` reaches the
+/// subtitle input as it reaches the media file (`GetInputArgument`'s
+/// `NeedsExternalSubtitleMuxing` branch), and a source's own analyze
+/// duration still wins.
+#[test]
+fn an_external_subtitle_input_reads_with_the_configured_analysis() {
+    let configured = InputAnalysis {
+        analyze_duration: "8M".parse().unwrap(),
+        probe_size: "32M".parse().unwrap(),
+    };
+    let sub = external_subtitle(2, "srt", "/media/movie.en.srt");
+    let mut state = build_state(Some(sub), Some(SubtitleDeliveryMethod::Embed), None);
+    let flags = |state: &EncodingJobInfo| {
+        external_stream_input_arguments(state, None, None, &configured)[..4].to_vec()
+    };
+    assert_eq!(
+        flags(&state),
+        ["-analyzeduration", "8M", "-probesize", "32M"]
+    );
+    state.media_source.analyze_duration_ms = Some(3000);
+    assert_eq!(
+        flags(&state),
+        ["-analyzeduration", "3000000", "-probesize", "32M"]
     );
 }
 
@@ -367,7 +440,12 @@ fn other_external_subtitles_add_no_input(
 ) {
     let sub = external_subtitle(2, codec, "/media/movie.en.sub");
     let state = build_state(Some(sub), Some(method), None);
-    let found = external_stream_input_arguments(&state, Some("10"), Some(FfmpegVersion::new(7, 0)));
+    let found = external_stream_input_arguments(
+        &state,
+        Some("10"),
+        Some(FfmpegVersion::new(7, 0)),
+        &InputAnalysis::default(),
+    );
     assert!(found.is_empty(), "{found:?}");
 }
 
@@ -407,7 +485,8 @@ fn external_inputs_are_synced_to_the_media_files_clock(
     };
     let sub = external_subtitle(2, codec, path);
     let state = build_state(Some(sub), Some(SubtitleDeliveryMethod::Embed), None);
-    let inputs = external_stream_input_arguments(&state, Some("10"), version);
+    let inputs =
+        external_stream_input_arguments(&state, Some("10"), version, &InputAnalysis::default());
     let mut expected = vec!["-analyzeduration", "200M", "-probesize", "1G"];
     expected.extend(timing);
     let input = format!("file:{path}");
@@ -438,7 +517,8 @@ fn a_trimmed_copy_of_a_text_sidecar_is_read_unseeked(#[case] version: Option<Ffm
     state.audio_stream = Some(audio);
     state.trimmed_subtitle_path = Some("/cache/transcodes/abc-stream.90000000.srt".into());
 
-    let inputs = external_stream_input_arguments(&state, Some("9"), version);
+    let inputs =
+        external_stream_input_arguments(&state, Some("9"), version, &InputAnalysis::default());
 
     let sync: &[&str] = if version.is_some_and(|v| v >= FfmpegVersion::new(5, 1)) {
         &["-isync", "0"]
@@ -488,7 +568,12 @@ fn a_seek_clamped_to_the_start_offsets_a_bitmap_by_nothing() {
     let sub = external_subtitle(2, "PGSSUB", "/media/movie.en.sup");
     let state = build_state(Some(sub), Some(SubtitleDeliveryMethod::Embed), None);
     assert_eq!(
-        external_stream_input_arguments(&state, Some("00:00:00.000"), None),
+        external_stream_input_arguments(
+            &state,
+            Some("00:00:00.000"),
+            None,
+            &InputAnalysis::default()
+        ),
         [
             "-analyzeduration",
             "200M",
@@ -523,7 +608,12 @@ fn without_isync_a_burned_bitmap_is_read_from_its_start(
     expected.extend(timing);
     expected.extend(["-i", "file:/media/movie.en.sup"]);
     assert_eq!(
-        external_stream_input_arguments(&state, seek, Some(FfmpegVersion::new(5, 0))),
+        external_stream_input_arguments(
+            &state,
+            seek,
+            Some(FfmpegVersion::new(5, 0)),
+            &InputAnalysis::default()
+        ),
         expected
     );
 }
@@ -544,7 +634,7 @@ fn without_isync_an_external_audio_track_is_seeked_as_upstream(
     let mut state = build_state(None, None, Some(vec![audio.clone()]));
     state.audio_stream = Some(audio);
     assert_eq!(
-        external_stream_input_arguments(&state, Some("10"), version),
+        external_stream_input_arguments(&state, Some("10"), version, &InputAnalysis::default()),
         ["-ss", "10", "-i", "/media/movie.commentary.mka"]
     );
 }
@@ -566,8 +656,12 @@ fn an_external_audio_track_is_the_next_input(#[case] with_subtitle: bool, #[case
     let mut state = build_state(sub, Some(SubtitleDeliveryMethod::Embed), Some(additional));
     state.audio_stream = Some(audio);
 
-    let inputs =
-        external_stream_input_arguments(&state, Some("10"), Some(FfmpegVersion::new(7, 0)));
+    let inputs = external_stream_input_arguments(
+        &state,
+        Some("10"),
+        Some(FfmpegVersion::new(7, 0)),
+        &InputAnalysis::default(),
+    );
     assert_eq!(
         inputs[inputs.len() - 6..],
         [

@@ -375,6 +375,41 @@ pub(crate) fn build_leaf_played_and_total_query(
     qb
 }
 
+/// v12.4 `GetIsPlayed` (`BaseItemRepository.Querying.cs:586-600`), the query
+/// behind `Folder.IsPlayed`: whether every item it ranges over passes
+/// `BuildLeafIsPlayedFilter` for the user (`.All`, so an empty set is played).
+/// With `descendants`, `parent`'s [`resolve_descendant_query`] filter, those
+/// are the non-folder, non-virtual items of `GetAllDescendantIds`: the
+/// `AncestorIds` closure and the `LinkedChildren`, transitively. Without, they
+/// are `parent`'s direct children (`ParentId`), folders and virtual items
+/// included. Nothing is access-filtered, as upstream. One folder's anchored
+/// set, so the leaf test is the per-row form.
+///
+/// `+`: a plan pin on both flags. Unpinned, the planner reads every leaf of
+/// the server through `IX_BaseItems_IsFolder_TopParentId_…` and tests each
+/// against the descendant list, instead of seeking the list's rows by `Id`
+/// (`is_played_query_seeks_the_folders_rows`).
+///
+/// [`resolve_descendant_query`]: crate::item_repository::resolve_descendant_query
+#[must_use]
+pub(crate) fn build_is_played_query(
+    parent: Uuid,
+    descendants: Option<&InternalItemsQuery>,
+    user_id: &str,
+) -> QueryBuilder<Sqlite> {
+    let mut qb = QueryBuilder::new(r#"SELECT NOT EXISTS (SELECT 1 FROM "BaseItems" bi WHERE "#);
+    if let Some(filter) = descendants {
+        qb.push(r#"+bi."IsFolder" = 0 AND +bi."IsVirtualItem" = 0"#);
+        append_linked_descendant_predicate(&mut qb, filter, parent);
+    } else {
+        qb.push(r#"bi."ParentId" = "#).push_bind(guid_to_db(parent));
+    }
+    qb.push(" AND NOT ");
+    push_leaf_is_played_per_row(&mut qb, "bi", user_id);
+    qb.push(")");
+    qb
+}
+
 /// A grouped movie grid currently sorts full rows (including metadata blobs)
 /// before discarding OFFSET rows. Sort only keys, then hydrate the final page.
 /// Keep other orderings on their existing plans: search, random and user-data
@@ -1639,13 +1674,8 @@ fn append_name_predicates(
     _exclude_tags: &[String],
 ) {
     if let Some(name) = non_blank(filter.name.as_ref()) {
-        if filter.use_raw_name == Some(true) {
-            qb.push(r#" AND ferrofin_lower_invariant(bi."Name") = "#)
-                .push_bind(lower_invariant(name));
-        } else {
-            qb.push(r#" AND bi."CleanName" = "#)
-                .push_bind(get_clean_value(name));
-        }
+        qb.push(r#" AND bi."CleanName" = "#)
+            .push_bind(get_clean_value(name));
     }
 
     // Batch form of the exact-name match: `CleanName IN (…)`. Used to resolve a
@@ -2330,9 +2360,10 @@ fn push_version_group_played(qb: &mut QueryBuilder<Sqlite>, user_id: &str) {
 ///
 /// Only for small anchored row sets, where the lists cost more to build than
 /// the rows cost to test: one folder's closure
-/// ([`build_leaf_played_and_total_query`]) and the newest series' recent
-/// episodes ([`build_latest_tv_episodes_query`]). Each statement run alone,
-/// outside the server, on a copy of the bench corpus database (a 4,031-row
+/// ([`build_leaf_played_and_total_query`]), one folder's descendants or
+/// children ([`build_is_played_query`]) and the newest series' recent
+/// episodes ([`build_latest_tv_episodes_query`]). The folder count was run
+/// alone, outside the server, on a copy of the bench corpus database (a 4,031-row
 /// history): for a 39-leaf series the list-form played count took 0.33 ms,
 /// and one statement counting both this way 0.06 ms. On folders of 3,001 and
 /// 7,490 leaves the one statement measured within 5 % in either form, since

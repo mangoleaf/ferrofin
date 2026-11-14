@@ -15,7 +15,10 @@ one real clients (jellyfin-web, Swiftfin, Findroid, Wolphin, …) are built agai
     registered table must not contain paths outside the spec, and a live probe checks
     nothing 404s.
   - `crates/ferrofin-api/src/contract_routes.rs` — generated from this file.
-  - `apps/ferrofin-server` — embeds it and serves it at `/api-docs/openapi.json`.
+  - `apps/ferrofin-server` — embeds it to label metrics with each operation's controller and
+    action. `/api-docs/openapi.json` serves `ferrofin-api`'s own utoipa document instead, under
+    upstream's `info`: title `Jellyfin API`, and `version` and `x-jellyfin-version` set to the
+    version `/System/Info` reports.
   - DTO work in `ferrofin-model`: `jq '.components.schemas.<Type>' contracts/jellyfin-openapi-10.11.8.json`
     is the oracle for field names, casing and nullability.
 
@@ -31,7 +34,8 @@ one real clients (jellyfin-web, Swiftfin, Findroid, Wolphin, …) are built agai
     `crates/ferrofin-api/src/handlers/items.rs`, which checks `GET /Items` parameters
     against the union of both contracts — 12.1.0 adds `audioLanguages` and
     `subtitleLanguages` to 10.11.8's 86;
-  - the `query_parameters!` metadata check (`crates/ferrofin-api/src/query.rs`);
+  - the `query_parameters!` metadata check and the body-parameter table's coverage test
+    (`crates/ferrofin-api/src/query.rs`);
   - `newer_contract_operations_never_404` in `crates/ferrofin-api/tests/contract_superset.rs`,
     which probes every operation 12.1.0 has and 10.11.8 lacks (today only
     `GET /Items/{itemId}/Collections`) on the live router.

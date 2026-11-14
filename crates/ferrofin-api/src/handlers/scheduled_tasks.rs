@@ -8,8 +8,8 @@
 //! - `POST /ScheduledTasks/Running/{taskId}` — run a task now (`204`; `404` when
 //!   missing).
 //! - `DELETE /ScheduledTasks/Running/{taskId}` — cancel a task (`204`; `404` when
-//!   missing). A running task's spawned run is aborted and recorded as
-//!   `Cancelled`, matching the C# `StopTask`.
+//!   missing). A running task is asked to stop and reads `Cancelling` until its
+//!   run returns and records its result, matching the C# `StopTask`.
 //! - `POST /ScheduledTasks/{taskId}/Triggers` — replace a task's configured
 //!   triggers (`204`; `404` when missing). The triggers are persisted, surfaced
 //!   on the task's next read, and acted on by the registry's scheduler.
@@ -20,7 +20,7 @@
 //! Names, descriptions and categories come back in the request's UI culture:
 //! the core registry localizes them (`ScheduledTask::is_localized`).
 
-use axum::extract::{Path, State};
+use axum::extract::State;
 use axum::http::StatusCode;
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -28,7 +28,7 @@ use ferrofin_model::tasks::{TaskInfo, TaskTriggerInfo};
 
 use crate::auth::RequireAdmin;
 use crate::error::ApiError;
-use crate::extract::{JsonSeqBody, Query};
+use crate::extract::{JsonSeqBody, Query, RequiredRouteString, RouteParameter};
 use crate::state::AppState;
 
 /// Query parameters for `GET /ScheduledTasks` — the hidden/enabled filters.
@@ -75,6 +75,14 @@ async fn get_tasks(
     Ok(Json(tasks))
 }
 
+/// `{taskId}`, the `[FromRoute, Required] string` of `GetTask`, `StartTask`,
+/// `StopTask` and `UpdateTask`.
+struct TaskId;
+
+impl RouteParameter for TaskId {
+    const NAME: &'static str = "taskId";
+}
+
 /// `GET /ScheduledTasks/{taskId}` — a single task by id.
 ///
 /// Port of `ScheduledTasksController.GetTask`: returns the task, or `404` when
@@ -92,7 +100,7 @@ async fn get_tasks(
 async fn get_task(
     State(state): State<AppState>,
     RequireAdmin(_auth): RequireAdmin,
-    Path(task_id): Path<String>,
+    RequiredRouteString(task_id, _): RequiredRouteString<TaskId>,
 ) -> Result<Json<TaskInfo>, ApiError> {
     let task = state
         .tasks
@@ -123,7 +131,7 @@ async fn get_task(
 async fn start_task(
     State(state): State<AppState>,
     RequireAdmin(_auth): RequireAdmin,
-    Path(task_id): Path<String>,
+    RequiredRouteString(task_id, _): RequiredRouteString<TaskId>,
 ) -> Result<StatusCode, ApiError> {
     // Mirror the C# 404-before-run: report a missing task as `404` rather than
     // the registry's `NotFound`-mapped `404` from `start_task` (same status, but
@@ -138,8 +146,9 @@ async fn start_task(
 /// `DELETE /ScheduledTasks/Running/{taskId}` — cancel a task.
 ///
 /// Port of `ScheduledTasksController.StopTask` → `ITaskManager.Cancel`. Returns
-/// `204 No Content`; a missing task is `404`. A running task's spawned run is
-/// aborted and recorded as `Cancelled`; an idle task is left idle.
+/// `204 No Content`; a missing task is `404`. A running task is asked to stop
+/// and reads `Cancelling` until its run returns and records its result; an
+/// idle task is left idle.
 #[utoipa::path(
     delete,
     path = "/ScheduledTasks/Running/{taskId}",
@@ -153,7 +162,7 @@ async fn start_task(
 async fn stop_task(
     State(state): State<AppState>,
     RequireAdmin(_auth): RequireAdmin,
-    Path(task_id): Path<String>,
+    RequiredRouteString(task_id, _): RequiredRouteString<TaskId>,
 ) -> Result<StatusCode, ApiError> {
     state.tasks.cancel_task(&task_id).await?;
     Ok(StatusCode::NO_CONTENT)
@@ -178,7 +187,7 @@ async fn stop_task(
 async fn update_task_triggers(
     State(state): State<AppState>,
     RequireAdmin(_auth): RequireAdmin,
-    Path(task_id): Path<String>,
+    RequiredRouteString(task_id, _): RequiredRouteString<TaskId>,
     JsonSeqBody(triggers): JsonSeqBody<Vec<TaskTriggerInfo>>,
 ) -> Result<StatusCode, ApiError> {
     state.tasks.update_triggers(&task_id, &triggers).await?;

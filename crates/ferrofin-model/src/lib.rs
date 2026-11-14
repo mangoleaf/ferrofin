@@ -8,12 +8,12 @@
 
 pub mod activity;
 pub mod api_client;
+pub mod backup;
 pub mod branding;
 pub mod channels;
 pub mod collections;
 pub mod configuration;
 pub mod content_type_overrides;
-pub mod cryptography;
 pub mod data;
 pub mod devices;
 pub mod dlna;

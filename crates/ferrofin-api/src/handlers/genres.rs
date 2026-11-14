@@ -11,7 +11,7 @@
 //! tab empty. Both run the same query; only the by-name row kind returned
 //! differs (`BaseItemRepository.ByName.cs:44-54`).
 
-use axum::extract::{Path, State};
+use axum::extract::State;
 use axum::routing::get;
 use axum::{Json, Router};
 use ferrofin_db::entities::base_items::BaseItemEntity;
@@ -22,9 +22,9 @@ use ferrofin_traits::options::DtoOptions;
 
 use crate::auth::RequireAuth;
 use crate::error::ApiError;
-use crate::extract::Query;
+use crate::extract::{Query, RequiredRouteString, RouteParameter};
 use crate::handlers::by_name::{
-    ByNameItemQuery, ByNameListQuery, project_query_result, resolve_by_name_or_slug,
+    ByNameItemQuery, ValueListQuery, project_query_result, resolve_by_name_or_slug,
 };
 use crate::handlers::items::resolve_user_or_api_key;
 use crate::state::AppState;
@@ -44,8 +44,9 @@ use crate::state::AppState;
 async fn get_genres(
     State(state): State<AppState>,
     RequireAuth(auth): RequireAuth,
-    Query(query): Query<ByNameListQuery>,
+    Query(query): Query<ValueListQuery>,
 ) -> Result<Json<QueryResult<BaseItemDto>>, ApiError> {
+    let query = query.genres();
     let user = resolve_user_or_api_key(&state, &auth, query.user_id).await?;
     let parent = query.parent(&state, &auth, user.as_deref()).await?;
     let internal = query.base_query(user.clone())?;
@@ -95,6 +96,13 @@ fn is_music_collection_folder(parent: Option<&BaseItemEntity>) -> bool {
         })
 }
 
+/// `{genreName}`, the `[FromRoute, Required] string` of `GetGenre`.
+struct GenreName;
+
+impl RouteParameter for GenreName {
+    const NAME: &'static str = "genreName";
+}
+
 /// `GET /Genres/{genreName}` — a single genre by name.
 ///
 /// Port of `GenresController.GetGenre` (v10.11.8 and master carry the same
@@ -118,7 +126,7 @@ fn is_music_collection_folder(parent: Option<&BaseItemEntity>) -> bool {
 async fn get_genre(
     State(state): State<AppState>,
     RequireAuth(auth): RequireAuth,
-    Path(genre_name): Path<String>,
+    RequiredRouteString(genre_name, _): RequiredRouteString<GenreName>,
     Query(query): Query<ByNameItemQuery>,
 ) -> Result<Json<BaseItemDto>, ApiError> {
     let user = resolve_user_or_api_key(&state, &auth, query.user_id).await?;

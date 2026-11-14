@@ -19,8 +19,7 @@ use axum::routing::get;
 use axum::{Json, Router};
 use ferrofin_db::entities::users::UserEntity;
 use ferrofin_model::data::BaseItemKind;
-use ferrofin_model::dto::{BaseItemDto, SortOrder};
-use ferrofin_model::live_tv::ItemSortBy;
+use ferrofin_model::dto::BaseItemDto;
 use ferrofin_model::querying::QueryResult;
 use ferrofin_traits::options::{DtoOptions, InternalItemsQuery};
 use uuid::Uuid;
@@ -30,7 +29,7 @@ use crate::error::ApiError;
 use crate::extract::Query;
 use crate::handlers::items::{apply_media_stream_filter_rules, resolve_user};
 use crate::handlers::query_parse::{
-    parse_csv_enums_lenient, parse_csv_strings, parse_csv_uuids, parse_pipe_strings,
+    parse_csv_enums_lenient, parse_csv_strings, parse_csv_uuids, parse_order_by, parse_pipe_strings,
 };
 use crate::state::AppState;
 
@@ -65,10 +64,10 @@ struct TrailersQuery {
         deserialize_with = "crate::handlers::query_parse::empty_as_none_uuid"
     )]
     parent_id: Option<Uuid>,
-    /// Comma-delimited [`ItemSortBy`] columns.
+    /// Comma-delimited [`ItemSortBy`](ferrofin_model::live_tv::ItemSortBy) columns.
     #[serde(default)]
     sort_by: Option<String>,
-    /// Comma-delimited [`SortOrder`] directions.
+    /// Comma-delimited [`SortOrder`](ferrofin_model::dto::SortOrder) directions.
     #[serde(default)]
     sort_order: Option<String>,
     /// Comma-delimited [`ItemFilter`](ferrofin_model::querying::ItemFilter) flags.
@@ -108,28 +107,6 @@ struct TrailersQuery {
     /// Comma-delimited subtitle-stream languages (12.1 `subtitleLanguages`).
     #[serde(default)]
     subtitle_languages: Option<String>,
-}
-
-/// Builds the `order_by` list from parallel `sort_by`/`sort_order` lists.
-///
-/// Mirrors `RequestHelpers.GetOrderBy`: each column pairs with the order at its
-/// index, falling back to the last supplied order (then ascending).
-fn parse_order_by(sort_by: Option<&str>, sort_order: Option<&str>) -> Vec<(ItemSortBy, SortOrder)> {
-    let columns: Vec<ItemSortBy> = parse_csv_enums_lenient(sort_by);
-    let orders: Vec<SortOrder> = parse_csv_enums_lenient(sort_order);
-    columns
-        .into_iter()
-        .enumerate()
-        .map(|(i, column)| {
-            let order = orders
-                .get(i)
-                // C# pads missing orders with the FIRST requested order.
-                .or_else(|| orders.first())
-                .copied()
-                .unwrap_or(SortOrder::Ascending);
-            (column, order)
-        })
-        .collect()
 }
 
 /// Maps the trailer query onto an [`InternalItemsQuery`] pinned to the

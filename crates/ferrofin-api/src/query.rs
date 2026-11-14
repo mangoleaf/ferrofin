@@ -138,9 +138,9 @@ impl<T> DerefMut for Query<T> {
     }
 }
 
-/// A generated per-action table of query member names
-/// (`contracts/gen_query_nullability.py`, which reads every upstream action's
-/// own route attributes).
+/// A generated per-action table of query member names, or of the body
+/// parameter ([`BODY`]). `contracts/gen_query_nullability.py` writes them from
+/// every upstream action's own route attributes and parameters.
 struct RouteTable {
     /// The generated JSON, keyed `METHOD /Upstream/{route}`.
     json: &'static str,
@@ -159,6 +159,14 @@ static NON_NULLABLE: RouteTable = RouteTable {
 /// without a default): absent, `CheckModel` answers "The X field is required.".
 static REQUIRED: RouteTable = RouteTable {
     json: include_str!("query/required.json"),
+    parsed: OnceLock::new(),
+};
+
+/// Each action's `[FromBody]` parameter: `[name, message]`, the entry ASP.NET
+/// files beside the complaint when a required body fails to bind, or empty for
+/// a nullable (`X?`) parameter, which gets none.
+static BODY: RouteTable = RouteTable {
+    json: include_str!("query/body.json"),
     parsed: OnceLock::new(),
 };
 
@@ -221,6 +229,17 @@ fn members(method: &Method, route: &str) -> Members {
 #[cfg(any(test, feature = "test-util"))]
 pub(crate) fn required_members(method: &Method, route: &str) -> &'static [String] {
     lookup(&REQUIRED, method, route)
+}
+
+/// The `(key, message)` ASP.NET adds for the action's `[FromBody]` parameter
+/// at `method` + `route` (the matched axum template) when its body fails to
+/// bind: the C# parameter's name and "The {name} field is required.". `None`
+/// for a nullable parameter and for a route upstream does not serve.
+pub(crate) fn body_parameter(method: &Method, route: &str) -> Option<(&'static str, &'static str)> {
+    match lookup(&BODY, method, route) {
+        [name, message] => Some((name, message)),
+        _ => None,
+    }
 }
 
 /// A route template with every parameter segment erased and literals
@@ -499,6 +518,92 @@ pub(crate) mod tests {
         );
         let found = super::lookup(&super::NON_NULLABLE, &Method::GET, "/NotAContractRoute");
         assert!(found.is_empty(), "{found:?}");
+    }
+
+    #[test]
+    fn the_generated_body_table_names_each_actions_parameter() {
+        use axum::http::Method;
+        assert_eq!(
+            super::body_parameter(&Method::POST, "/Users/ForgotPassword"),
+            Some((
+                "forgotPasswordRequest",
+                "The forgotPasswordRequest field is required."
+            ))
+        );
+        // The router's own parameter names and literal case.
+        assert_eq!(
+            super::body_parameter(&Method::POST, "/users/{user_id}/items/{item_id}/userdata")
+                .map(|(name, _)| name),
+            Some("userDataDto")
+        );
+        assert_eq!(
+            super::body_parameter(&Method::POST, "/Backup/Restore").map(|(_, message)| message),
+            Some("A value for the 'archiveRestoreDto' parameter or property was not provided.")
+        );
+        // A nullable parameter, a route with no body and an unknown route.
+        for route in [
+            "/Items/{itemId}/PlaybackInfo",
+            "/Items/{itemId}/Refresh",
+            "/Nope",
+        ] {
+            assert_eq!(super::body_parameter(&Method::POST, route), None, "{route}");
+        }
+    }
+
+    /// Every JSON body in the vendored contracts has a row, so each Jellyfin
+    /// body route either names its parameter or is known to be nullable. The
+    /// plugin operations are not Jellyfin's controllers: their names are not
+    /// in this table yet (gl-1673 derives them from each plugin's source),
+    /// and one that gains a row must leave the list.
+    #[test]
+    fn every_contract_json_body_has_a_body_table_row() {
+        const PLUGIN_OPERATIONS: &[&str] = &[
+            "POST /Episode/{Id}/Timestamps",
+            "POST /FileTransformation/RegisterTransformation",
+            "POST /Intros/AnalyzerActions/UpdateSeason",
+            "POST /Jellyfin.Plugin.OpenSubtitles/ValidateLoginInfo",
+            "POST /MediaSegmentsApi/{itemId}",
+        ];
+        let rows: std::collections::HashSet<String> = serde_json::from_str::<
+            std::collections::HashMap<String, Vec<String>>,
+        >(super::BODY.json)
+        .expect("generated body table is valid")
+        .into_keys()
+        .map(|operation| shape_of(&operation))
+        .collect();
+        for operation in PLUGIN_OPERATIONS {
+            assert!(
+                !rows.contains(&shape_of(operation)),
+                "{operation} now has a row: remove it from PLUGIN_OPERATIONS"
+            );
+        }
+        let mut missing = Vec::new();
+        for spec in [
+            include_str!("../../../contracts/jellyfin-openapi-10.11.8.json"),
+            include_str!("../../../contracts/jellyfin-openapi-12.1.0.json"),
+        ] {
+            let spec: serde_json::Value = serde_json::from_str(spec).expect("contract");
+            for (path, operations) in spec["paths"].as_object().expect("paths") {
+                for (method, operation) in operations.as_object().expect("operations") {
+                    if operation["requestBody"]["content"]["application/json"].is_null() {
+                        continue;
+                    }
+                    let operation = format!("{} {path}", method.to_ascii_uppercase());
+                    if !PLUGIN_OPERATIONS.contains(&operation.as_str())
+                        && !rows.contains(&shape_of(&operation))
+                    {
+                        missing.push(operation);
+                    }
+                }
+            }
+        }
+        assert!(missing.is_empty(), "no body table row: {missing:?}");
+    }
+
+    /// `METHOD /route` with the route reduced to its [`super::route_shape`].
+    fn shape_of(operation: &str) -> String {
+        let (method, path) = operation.split_once(' ').expect("METHOD /route");
+        format!("{method} {}", super::route_shape(path))
     }
 
     #[test]

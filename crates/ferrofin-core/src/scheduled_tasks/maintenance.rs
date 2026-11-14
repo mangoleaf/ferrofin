@@ -11,8 +11,11 @@
 //! - [`OptimizeDatabaseTask`] — `OptimizeDatabaseTask` (`OptimizeDatabaseTask`)
 //! - [`CleanupUserDataTask`] — `CleanupUserDataTask` (`CleanupUserDataTask`)
 //!
-//! The C# `IProgress<double>` maps to [`TaskProgress`]; `CancellationToken`s are
-//! dropped (a queued run is cancelled by aborting its tokio task).
+//! The C# `IProgress<double>` and `CancellationToken` both map to
+//! [`TaskProgress`]: the file sweeps check
+//! [`TaskProgress::stop_requested`] before each file, as upstream's
+//! `ThrowIfCancellationRequested` does, since a sweep on the blocking pool
+//! outlives a dropped body.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -122,6 +125,7 @@ pub fn delete_encoded_media_cache(paths: &dyn ServerApplicationPaths) -> u64 {
 /// empty subdirectories (the root is kept). Returns how many files were
 /// deleted. Per-file failures are logged and skipped (the C# helper's
 /// swallow-and-log behavior). `keep` filters which file names are eligible.
+/// A stop request ends the sweep before its next file, the pruning skipped.
 fn delete_files_older_than(
     dir: &Path,
     cutoff: SystemTime,
@@ -130,6 +134,9 @@ fn delete_files_older_than(
     progress_span: f64,
     keep: &dyn Fn(&Path) -> bool,
 ) -> u64 {
+    if progress.stop_requested() {
+        return 0;
+    }
     let candidates = files_under(dir, &|f| {
         !keep(f)
             && std::fs::metadata(f)
@@ -139,6 +146,9 @@ fn delete_files_older_than(
     let total = candidates.len();
     let mut deleted = 0u64;
     for (index, file) in candidates.iter().enumerate() {
+        if progress.stop_requested() {
+            return deleted;
+        }
         match std::fs::remove_file(file) {
             Ok(()) => deleted += 1,
             Err(e) => tracing::warn!(path = %file.display(), error = %e, "failed to delete file"),
@@ -327,20 +337,23 @@ impl ScheduledTask for DeleteCacheFileTask {
 /// Port of `DeleteLogFileTask`.
 pub struct DeleteLogFileTask {
     config: Arc<dyn ServerConfigurationManager>,
-    /// The retention formatted into the description, read at boot (the C#
-    /// formats `TaskCleanLogsDescription` with the live value on every read;
-    /// the sync accessor cannot read the async configuration seam).
-    retention_days: i32,
+    /// Reads the live retention the description is formatted with, as the C#
+    /// formats `TaskCleanLogsDescription` with `LogFileRetentionDays` on every
+    /// read (the async configuration seam has no synchronous read).
+    retention_days: Box<dyn Fn() -> i32 + Send + Sync>,
 }
 
 impl DeleteLogFileTask {
-    /// Builds the task over the config seam; `retention_days` (the boot-time
-    /// `log_file_retention_days`) is formatted into the description.
+    /// Builds the task over the config seam; `retention_days` reads the live
+    /// `log_file_retention_days` formatted into the description.
     #[must_use]
-    pub fn new(config: Arc<dyn ServerConfigurationManager>, retention_days: i32) -> Self {
+    pub fn new(
+        config: Arc<dyn ServerConfigurationManager>,
+        retention_days: impl Fn() -> i32 + Send + Sync + 'static,
+    ) -> Self {
         Self {
             config,
-            retention_days,
+            retention_days: Box::new(retention_days),
         }
     }
 }
@@ -364,7 +377,7 @@ impl ScheduledTask for DeleteLogFileTask {
         "TaskCleanLogsDescription"
     }
     fn description_argument(&self) -> Option<String> {
-        Some(self.retention_days.to_string())
+        Some((self.retention_days)().to_string())
     }
     fn category(&self) -> &str {
         MAINTENANCE
@@ -475,9 +488,19 @@ impl ScheduledTask for DeleteTranscodeFileTask {
 
 /// "Optimize database" — compacts the database and truncates free space. Port
 /// of `OptimizeDatabaseTask` + the SQLite provider's `RunScheduledOptimisation`
-/// (`PRAGMA optimize`, `VACUUM`, WAL checkpoint truncation). Before the vacuum
-/// it also prunes Ferrofin's own `FerrofinPlaybackSessions` rows (no upstream
-/// equivalent) older than `ActivityLogRetentionDays`.
+/// (`VACUUM`, WAL checkpoint truncation). Before the vacuum it also prunes
+/// Ferrofin's own `FerrofinPlaybackSessions` rows (no upstream equivalent)
+/// older than `ActivityLogRetentionDays`.
+///
+/// Accepted divergence (owner decision, 2026-11-11): Jellyfin 12.x's
+/// `OptimizeAsync` also runs a full `ANALYZE` (under `analysis_limit=0`, once
+/// the library holds items), as its `RefreshDatabaseStatisticsPostScanTask`
+/// does after every library scan, and Ferrofin deliberately does neither. Its
+/// plan pins and `EXPLAIN QUERY PLAN` tests assume the planner has no
+/// statistics (`sqlite_stat1` never exists). `PRAGMA optimize` is not run
+/// either: it analyses every populated, indexed table that has none.
+/// Statistics an earlier version left behind are dropped at boot
+/// (`ferrofin-db`'s `Database::connect_tuned`).
 pub struct OptimizeDatabaseTask {
     db: Database,
     sessions: Arc<dyn SessionManager>,
@@ -585,13 +608,13 @@ impl ScheduledTask for OptimizeDatabaseTask {
             }
         }
         tracing::info!("optimizing and vacuuming the database");
-        for (statement, pct) in [("PRAGMA optimize", 25.0), ("VACUUM", 75.0)] {
-            sqlx::query(statement)
-                .execute(self.db.writer())
-                .await
-                .map_err(db_err)?;
-            progress.report(pct);
-        }
+        // Unlike upstream, no `ANALYZE`, and no `PRAGMA optimize` either: see
+        // the type's doc.
+        sqlx::query("VACUUM")
+            .execute(self.db.writer())
+            .await
+            .map_err(db_err)?;
+        progress.report(75.0);
         // `PRAGMA wal_checkpoint(TRUNCATE)`, in turn with the background
         // checkpoints: the vacuum's commit has just started one, which the
         // truncation would otherwise answer busy against.
@@ -775,6 +798,25 @@ mod tests {
     /// unreachable (the tasks only consult the guard).
     struct FakePlaybackSessions(bool);
 
+    /// A stop request ends a sweep before its next file, the empty-folder
+    /// pruning included, as upstream's `ThrowIfCancellationRequested` before
+    /// each delete does: a sweep on the blocking pool outlives its dropped body.
+    #[test]
+    fn a_sweep_stops_before_its_next_file_once_asked() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("old.tmp"), b"x").expect("write");
+        std::fs::create_dir(dir.path().join("empty")).expect("mkdir");
+        let progress = TaskProgress::default();
+        progress.cancel_token().cancel();
+        let everything = SystemTime::now() + std::time::Duration::from_secs(3600);
+        let deleted =
+            delete_files_older_than(dir.path(), everything, &progress, 0.0, 100.0, &|_| false);
+        assert_eq!(deleted, 0);
+        assert!(dir.path().join("old.tmp").exists());
+        assert!(dir.path().join("empty").exists(), "nothing pruned either");
+        assert!(progress.was_stopped(), "the run is recorded Cancelled");
+    }
+
     #[allow(unused_variables)] // stub bodies are unreachable!(), params deliberately unused
     #[async_trait]
     impl ferrofin_traits::session::SessionManager for FakePlaybackSessions {
@@ -857,14 +899,6 @@ mod tests {
         async fn send_message_to_user_sessions(
             &self,
             user_ids: &[Uuid],
-            message_type: SessionMessageType,
-            data: &str,
-        ) -> Result<(), ServiceError> {
-            unreachable!("not used by maintenance tasks")
-        }
-        async fn send_message_to_user_device_sessions(
-            &self,
-            device_id: &str,
             message_type: SessionMessageType,
             data: &str,
         ) -> Result<(), ServiceError> {
@@ -1202,7 +1236,7 @@ mod tests {
         backdate(&managed, 40);
         let fresh = touch(&logs, "ferrofin-today.log");
 
-        let task = Arc::new(DeleteLogFileTask::new(config, 3));
+        let task = Arc::new(DeleteLogFileTask::new(config, || 3));
         assert_eq!(task.key(), "CleanLogFiles");
         // `string.Format(GetLocalizedString("TaskCleanLogsDescription"), days)`.
         let registry = crate::scheduled_tasks::FerrofinTaskManager::new();
@@ -1302,6 +1336,30 @@ mod tests {
         let progress = TaskProgress::default();
         task.execute(&progress).await.expect("run");
         assert!((progress.current() - 100.0).abs() < f64::EPSILON);
+    }
+
+    /// Ferrofin's plan pins assume the planner has no statistics, so the
+    /// run takes none, over populated, indexed tables (Jellyfin 12.x runs a
+    /// full `ANALYZE` here).
+    #[tokio::test]
+    async fn optimize_database_leaves_no_planner_statistics() {
+        let db = test_db().await;
+        // The placeholder `BaseItems` row is there too.
+        seed_old_session(&db).await;
+        test_rows::insert(&db, "recent", Utc::now()).await;
+        let task = OptimizeDatabaseTask::new(
+            db.clone(),
+            idle_sessions(),
+            crate::test_support::library_manager_over(db.clone()),
+            retention_days(Some(30)),
+        );
+        task.execute(&TaskProgress::default()).await.expect("run");
+        assert_eq!(
+            test_rows::remaining(&db).await,
+            ["recent"],
+            "the run went through"
+        );
+        assert_eq!(test_rows::stat_tables(&db).await, Vec::<String>::new());
     }
 
     #[tokio::test]

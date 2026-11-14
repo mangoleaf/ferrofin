@@ -658,13 +658,6 @@ pub trait LibraryManager: Send + Sync {
         collection_type: CollectionType,
     ) -> Result<Vec<BaseItemEntity>, ServiceError>;
 
-    /// Persists (inserts or updates) the given item rows under a parent.
-    async fn create_items(
-        &self,
-        items: &[BaseItemEntity],
-        parent_id: Option<Uuid>,
-    ) -> Result<(), ServiceError>;
-
     /// Updates the given item rows under a parent.
     async fn update_items(
         &self,
@@ -676,10 +669,12 @@ pub trait LibraryManager: Send + Sync {
     /// `provider_ids`.
     ///
     /// The write behind C# `ItemUpdateController.UpdateItem`'s
-    /// `item.ProviderIds = request.ProviderIds` (v10.11.8
-    /// `Jellyfin.Api/Controllers/ItemUpdateController.cs:402-410`): an
-    /// **assignment**, so a key the request omits is removed, not merged. The
-    /// caller strips empty values first, exactly as the C# does.
+    /// `item.SetProviderIds(request.ProviderIds)` (v12.4
+    /// `Jellyfin.Api/Controllers/ItemUpdateController.cs:435-438`): an
+    /// **assignment**, so a key the request omits is removed, not merged. Each
+    /// pair goes through `TrySetProviderId`: trimmed, dropped when blank, when
+    /// its name holds `=` or when the id cannot belong to its provider, and a
+    /// known provider's name stored in its canonical spelling.
     ///
     /// External ids live in their own table, not on [`BaseItemEntity`], so they
     /// cannot ride along with [`update_items`](Self::update_items) — hence a
@@ -991,7 +986,9 @@ pub trait LibraryManager: Send + Sync {
     ///
     /// Matching is by cleaned name (Jellyfin's item-by-name id is derived from
     /// the name), delegating to [`Self::get_item_list`] filtered to `kind`; the
-    /// first match wins, mirroring C# `FirstOrDefault`.
+    /// first match wins, mirroring C# `FirstOrDefault`. The concrete manager
+    /// reads a `Person` by the id its name derives instead, as `GetPerson`
+    /// does, so spellings sharing a clean name are each their own person.
     async fn get_named_item(
         &self,
         kind: BaseItemKind,
@@ -1056,7 +1053,9 @@ pub trait LibraryManager: Send + Sync {
     ///
     /// The default loops [`Self::get_named_item`]; the concrete manager overrides
     /// it with a single `CleanName IN (…)` query — resolving a whole page of
-    /// people/years in one round-trip instead of N.
+    /// by-name items in one round-trip instead of N — and a page of people with the
+    /// people repository's `GetPerson` reads by id
+    /// ([`PeopleRepository::find_person_item_ids`](crate::persistence::PeopleRepository::find_person_item_ids)).
     async fn get_named_items(
         &self,
         kind: BaseItemKind,
@@ -1076,7 +1075,8 @@ pub trait LibraryManager: Send + Sync {
     /// The DTO prefetch resolves a whole page's cast through this and reads
     /// nothing but the id, so the concrete manager overrides it with a
     /// two-column projection rather than materializing a full item row per
-    /// credited name. The default delegates to [`Self::get_named_items`], so
+    /// credited name, and for a `Person` with the people repository's id-only
+    /// `GetPerson` reads. The default delegates to [`Self::get_named_items`], so
     /// every implementation gets it for free with identical results.
     async fn get_named_item_ids(
         &self,
@@ -1560,9 +1560,6 @@ pub fn policy_update_refusal(state: PolicyGuardState, policy: &UserPolicy) -> Op
 pub trait UserManager: Send + Sync {
     /// Gets all user rows.
     async fn get_users(&self) -> Result<Vec<UserEntity>, ServiceError>;
-
-    /// Gets the ids of all users.
-    async fn get_user_ids(&self) -> Result<Vec<Uuid>, ServiceError>;
 
     /// Ensures at least one user exists (first-run bootstrap).
     async fn initialize(&self) -> Result<(), ServiceError>;
@@ -2407,16 +2404,19 @@ pub trait UserViewManager: Send + Sync {
     /// Gets the top-level views for a user.
     async fn get_user_views(&self, user_id: Uuid) -> Result<Vec<BaseItemEntity>, ServiceError>;
 
-    /// Gets the top-level views including any the user hid from their home
-    /// screen. Used by profile settings so hidden views can be re-enabled.
-    /// Managers that do not implement hidden-view filtering can use the
-    /// ordinary view list for both requests.
-    async fn get_user_views_with_hidden(
+    /// Gets the top-level views `query` asks for: port of
+    /// `UserViewManager.GetUserViews(UserViewQuery)`. `include_hidden` keeps
+    /// the views the user hid from their home screen (profile settings use it
+    /// so hidden views can be re-enabled), `include_external_content` the
+    /// Live TV view, and `preset_views` lists a library of a named type as its
+    /// shadow view. Managers that implement none of them can use the ordinary
+    /// view list for every request.
+    async fn get_user_views_with_query(
         &self,
         user_id: Uuid,
-        include_hidden: bool,
+        query: &crate::options::UserViewQuery,
     ) -> Result<Vec<BaseItemEntity>, ServiceError> {
-        let _ = include_hidden;
+        let _ = query;
         self.get_user_views(user_id).await
     }
 
@@ -2426,8 +2426,9 @@ pub trait UserViewManager: Send + Sync {
     /// [`get_user_root_children`](Self::get_user_root_children) instead.
     ///
     /// Port of `LibraryController.GetMediaFolders`, which returns
-    /// `GetUserRootFolder().Children` sorted by `SortName`, less the libraries
-    /// whose options disable them. Unlike
+    /// `GetUserRootFolder().Children` and the playlists folder sorted by
+    /// `SortName` in the request culture, less the libraries whose options
+    /// disable them. Unlike
     /// [`get_user_views`](Self::get_user_views) (the library collection folders
     /// only), this also includes the playlists folder
     /// ([`BaseItemKind`]`::PlaylistsFolder`, `ManualPlaylistsFolder` to
@@ -2880,16 +2881,6 @@ pub trait LibraryMonitor: Send + Sync {
     /// watches end up matching the latest one.
     fn restart(&self);
 
-    /// Signals that a change at `path` is beginning (suppress self-triggering).
-    async fn report_file_system_change_beginning(&self, path: &str) -> Result<(), ServiceError>;
-
-    /// Signals that a change at `path` is complete, optionally refreshing it.
-    async fn report_file_system_change_complete(
-        &self,
-        path: &str,
-        refresh_path: bool,
-    ) -> Result<(), ServiceError>;
-
     /// Signals that `path` changed on disk, as the filesystem watcher saw it
     /// (a refresh it starts is labelled [`ScanTrigger::Watcher`]).
     async fn report_file_system_changed(&self, path: &str) -> Result<(), ServiceError>;
@@ -2940,6 +2931,22 @@ pub trait RecordingLibrary: Send + Sync {
     /// `RecordingsManager.TriggerRefresh(path)`: queues the refresh of the item
     /// nearest `path`, which also drops the item of a file that has gone.
     async fn refresh_path(&self, path: &str) -> Result<(), ServiceError>;
+
+    /// `ILibraryManager.FindByPath(path, isFolder)`: the id of the item at
+    /// exactly `path` (stored as it is, or in its `%AppDataPath%` form), a
+    /// folder or not as `is_folder` says, the newest `DateCreated` first.
+    async fn find_by_path(&self, path: &str, is_folder: bool)
+    -> Result<Option<Uuid>, ServiceError>;
+
+    /// The files below the folder `folder_id`, with their paths, newest
+    /// `DateCreated` first: what `RecordingsManager.EnforceKeepUpTo` asks of a
+    /// series folder (`GetItemList` with `Recursive`, `IsFolder = false` and
+    /// `IsVirtualItem = false`, then `IsFileProtocol`).
+    async fn files_under(&self, folder_id: Uuid) -> Result<Vec<(Uuid, String)>, ServiceError>;
+
+    /// `ILibraryManager.DeleteItem(item, new DeleteOptions { DeleteFileLocation
+    /// = true }, true)`: the item goes, with its files.
+    async fn delete_item(&self, id: Uuid) -> Result<(), ServiceError>;
 }
 
 fn _assert_object_safe_recording_library(_: &dyn RecordingLibrary) {}

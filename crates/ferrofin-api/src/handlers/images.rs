@@ -68,7 +68,7 @@ use uuid::Uuid;
 
 use crate::auth::{AuthenticatedIdentity, RequireAdmin, RequireAuth};
 use crate::error::ApiError;
-use crate::extract::{DotnetGuid, Query, upload_body_limit};
+use crate::extract::{DotnetGuid, Query, RequiredRouteString, RouteParameter, upload_body_limit};
 use crate::handlers::image_upload::{decode_base64, try_get_image_extension_from_content_type};
 use crate::handlers::items::resolve_user;
 use crate::handlers::users::UserIdQuery;
@@ -424,11 +424,12 @@ fn bind_query_image_format(format: Option<&str>) -> Result<Option<ImageFormat>, 
     }
 }
 
-/// Binds one required numeric route segment, mapping a bind failure onto the
-/// `400` ASP.NET's model binder produces for `[FromRoute, Required] int`/`double`.
-fn bind_route_number<T: std::str::FromStr>(raw: &str, name: &str) -> Result<T, ApiError> {
-    raw.trim()
-        .parse::<T>()
+/// Binds one required numeric route segment as ASP.NET binds a route value:
+/// with the converter the query binder ports (trimmed; an integer also takes
+/// the `0x`, `#` and `&h` hex forms, measured on 12.4), a failure being the
+/// `400` its model binder produces for `[FromRoute, Required] int`/`double`.
+fn bind_route_number<T: serde::de::DeserializeOwned>(raw: &str, name: &str) -> Result<T, ApiError> {
+    T::deserialize(crate::query::value::Value::nullable(raw))
         .map_err(|_| ApiError::BadRequest(format!("The value '{raw}' is not valid for {name}.")))
 }
 
@@ -940,16 +941,17 @@ async fn get_item_image_by_index(
 ///
 /// Port of Jellyfin's positional-parameter image URL (used by some clients that
 /// bake the transform into the path). Every segment binds exactly as C#
-/// `GetItemImage2`/`HeadItemImage2` binds it — `[FromRoute, Required] ImageFormat
-/// format`, `int maxWidth`, `int maxHeight`, `double percentPlayed`,
-/// `int unplayedCount` — so an unbindable value is a model-binding failure
-/// (`400`), never a silent fallback to an unrequested format. The bound
-/// `format`/`maxWidth`/`maxHeight`/`tag` are set on the request's
-/// [`ImageQuery`], over any same-named query parameter, so the transform is
-/// applied just as the query-string form would. The transforms the path does
-/// not carry (`width`, `height`, `quality`, `fillWidth`, `fillHeight`,
-/// `blur`, `backgroundColor`, `foregroundLayer`) come from the query string, as
-/// `GetItemImage2` takes them.
+/// `GetItemImage2`/`HeadItemImage2` binds it — `[FromRoute, Required] int
+/// imageIndex`, `ImageFormat format`, `int maxWidth`, `int maxHeight`, `double
+/// percentPlayed`, `int unplayedCount` — so an unbindable value is a
+/// model-binding failure (`400`), never a silent fallback to an unrequested
+/// format, and a blank `tag` is the binder's `400` too ([`ImageTag`]). The
+/// route's `format`, `maxWidth`, `maxHeight` and `tag` are passed on as given, as
+/// `GetImageInternal` receives them: a `0` size is a size, which
+/// `HasDefaultOptions` counts, and a tag of `0` is a tag. The transforms the path
+/// does not carry come from the query string ([`PositionalImageQuery`]), the only
+/// query members `GetItemImage2` declares, so a same-named query parameter of a
+/// route member is never read.
 ///
 /// TODO(overlays): `percentPlayed`/`unplayedCount` bind and are validated, but
 /// the overlays themselves are not drawn yet — Jellyfin renders them in
@@ -967,7 +969,7 @@ async fn get_item_image_parametrized(
         DotnetGuid(item_id),
         image_type,
         image_index,
-        tag,
+        _,
         format,
         max_width,
         max_height,
@@ -976,7 +978,7 @@ async fn get_item_image_parametrized(
     )): Path<(
         DotnetGuid,
         String,
-        i32,
+        String,
         String,
         String,
         String,
@@ -984,10 +986,12 @@ async fn get_item_image_parametrized(
         String,
         String,
     )>,
-    Query(mut query): Query<ImageQuery>,
+    RequiredRouteString(tag, _): RequiredRouteString<ImageTag>,
+    Query(transforms): Query<PositionalImageQuery>,
     request: Request,
 ) -> Result<Response, ApiError> {
     let image_type = parse_image_type(&image_type)?;
+    let image_index: i32 = bind_route_number(&image_index, "imageIndex")?;
     let format = parse_image_format(&format)
         .ok_or_else(|| ApiError::BadRequest(format!("The value '{format}' is not valid.")))?;
     let max_width: i32 = bind_route_number(&max_width, "maxWidth")?;
@@ -996,13 +1000,21 @@ async fn get_item_image_parametrized(
     // overlay TODO on this handler for why they are not forwarded yet.
     let _percent_played: f64 = bind_route_number(&percent_played, "percentPlayed")?;
     let _unplayed_count: i32 = bind_route_number(&unplayed_count, "unplayedCount")?;
-    // The positional transform segments override the query string's. A `0`
-    // dimension is the "unset" spelling clients bake into the path for a
-    // partial transform.
-    query.format = Some(image_format_name(format).to_owned());
-    query.max_width = Some(max_width).filter(|w| *w > 0);
-    query.max_height = Some(max_height).filter(|h| *h > 0);
-    query.tag = Some(tag).filter(|t| !t.is_empty() && !t.eq_ignore_ascii_case("0"));
+    let query = ImageQuery {
+        format: Some(image_format_name(format).to_owned()),
+        max_width: Some(max_width),
+        max_height: Some(max_height),
+        tag: Some(tag),
+        width: transforms.width,
+        height: transforms.height,
+        quality: transforms.quality,
+        fill_width: transforms.fill_width,
+        fill_height: transforms.fill_height,
+        blur: transforms.blur,
+        background_color: transforms.background_color,
+        foreground_layer: transforms.foreground_layer,
+        ..ImageQuery::default()
+    };
     let resolved = authorize_image_item(&state, item_id, auth).await?;
     serve_item_image(
         &state,
@@ -1014,6 +1026,31 @@ async fn get_item_image_parametrized(
         resolved,
     )
     .await
+}
+
+/// `{tag}`, the `[FromRoute, Required] string` of `GetItemImage2`: a blank one
+/// is the binder's `400` (measured on 12.4); any other is a tag, `0` included.
+struct ImageTag;
+
+impl RouteParameter for ImageTag {
+    const NAME: &'static str = "tag";
+}
+
+/// The query members `GetItemImage2` declares: the transforms its route does
+/// not carry, as [`ImageQuery`] binds them. The action's other members are
+/// route members, so a same-named query parameter, even a malformed one, is not
+/// read (measured on 12.4).
+#[derive(Debug, Default, serde::Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+struct PositionalImageQuery {
+    width: Option<i32>,
+    height: Option<i32>,
+    quality: Option<i32>,
+    fill_width: Option<i32>,
+    fill_height: Option<i32>,
+    blur: Option<i32>,
+    background_color: Option<String>,
+    foreground_layer: Option<String>,
 }
 
 /// `GET /Items/{itemId}/Images` — the item's image infos.
@@ -1207,7 +1244,33 @@ async fn serve_named_image(
     .await
 }
 
-/// Builds a `GET`/`HEAD` handler pair for a by-name image controller of `kind`.
+/// `{name}`, the `[FromRoute, Required] string` of the by-name image routes,
+/// registered as `{name}` (Persons, Studios).
+struct ImageName;
+
+impl RouteParameter for ImageName {
+    const NAME: &'static str = "name";
+}
+
+/// [`ImageName`] on the Genres and `MusicGenres` routes, registered as
+/// `{genreName}`.
+struct GenreImageName;
+
+impl RouteParameter for GenreImageName {
+    const NAME: &'static str = "name";
+    const ROUTE_NAME: &'static str = "genreName";
+}
+
+/// [`ImageName`] on the Artists route, registered as `{itemId}`.
+struct ArtistImageName;
+
+impl RouteParameter for ArtistImageName {
+    const NAME: &'static str = "name";
+    const ROUTE_NAME: &'static str = "itemId";
+}
+
+/// Builds a `GET`/`HEAD` handler pair for a by-name image controller of `kind`,
+/// binding the name through the `$name` [`RouteParameter`].
 ///
 /// Each by-name controller (Genres, Studios, Persons, Artists, `MusicGenres`) has
 /// the same two routes — `…/{name}/Images/{imageType}` and the `/{imageIndex}`
@@ -1215,14 +1278,15 @@ async fn serve_named_image(
 /// both handlers so the six controllers reuse one code path instead of copying
 /// it, matching the shared `GetImageInternal` fan-in in C#.
 macro_rules! by_name_image_handlers {
-    ($kind:expr, $base:ident, $indexed:ident) => {
+    ($kind:expr, $name:ty, $base:ident, $indexed:ident) => {
         // The Artists controller exposes only the indexed route, so its `$base`
         // handler is generated-but-unused; the others use both. One `allow`
         // keeps the shared macro simple rather than forking it per controller.
         #[allow(dead_code)]
         async fn $base(
             State(state): State<AppState>,
-            Path((name, image_type)): Path<(String, String)>,
+            RequiredRouteString(name, _): RequiredRouteString<$name>,
+            Path((_, image_type)): Path<(String, String)>,
             Query(query): Query<ImageQuery>,
             request: Request,
         ) -> Result<Response, ApiError> {
@@ -1233,7 +1297,8 @@ macro_rules! by_name_image_handlers {
 
         async fn $indexed(
             State(state): State<AppState>,
-            Path((name, image_type, image_index)): Path<(String, String, i32)>,
+            RequiredRouteString(name, _): RequiredRouteString<$name>,
+            Path((_, image_type, image_index)): Path<(String, String, i32)>,
             Query(query): Query<ImageQuery>,
             request: Request,
         ) -> Result<Response, ApiError> {
@@ -1254,26 +1319,31 @@ macro_rules! by_name_image_handlers {
 
 by_name_image_handlers!(
     BaseItemKind::Genre,
+    GenreImageName,
     get_genre_image,
     get_genre_image_by_index
 );
 by_name_image_handlers!(
     BaseItemKind::MusicGenre,
+    GenreImageName,
     get_music_genre_image,
     get_music_genre_image_by_index
 );
 by_name_image_handlers!(
     BaseItemKind::Studio,
+    ImageName,
     get_studio_image,
     get_studio_image_by_index
 );
 by_name_image_handlers!(
     BaseItemKind::Person,
+    ImageName,
     get_person_image,
     get_person_image_by_index
 );
 by_name_image_handlers!(
     BaseItemKind::MusicArtist,
+    ArtistImageName,
     get_artist_image,
     get_artist_image_by_index
 );
@@ -1334,12 +1404,12 @@ impl LegacyUserImageQuery {
     }
 }
 
-/// `GetUserImageLegacy`'s `[FromQuery] int? imageIndex`, bound and dropped. The
-/// indexed form takes it from the route, so there `?imageIndex=x` is not read.
-#[allow(dead_code)] // Only the binder reads it.
+/// `[FromQuery] int? imageIndex` as the action's only query member: what
+/// `DeleteItemImage` declares, and what `GetUserImageLegacy` binds and drops. The
+/// indexed forms take it from the route, so there `?imageIndex=x` is not read.
 #[derive(Debug, Default, serde::Deserialize)]
 #[serde(default, rename_all = "camelCase")]
-struct LegacyImageIndexQuery {
+struct ImageIndexQuery {
     image_index: Option<i32>,
 }
 
@@ -1488,7 +1558,7 @@ async fn get_user_image_legacy(
     auth: Result<AuthenticatedIdentity, ApiError>,
     Path((DotnetGuid(user_id), image_type)): Path<(DotnetGuid, String)>,
     Query(query): Query<LegacyUserImageQuery>,
-    Query(_): Query<LegacyImageIndexQuery>,
+    Query(_): Query<ImageIndexQuery>,
     request: Request,
 ) -> Result<Response, ApiError> {
     // `[FromRoute, Required] ImageType`: bound (400 when invalid), then ignored.
@@ -1682,7 +1752,9 @@ async fn set_item_image_by_index(
 ///
 /// Port of `ImageController.DeleteItemImage`. A missing item is `404`; the image
 /// index comes from the optional `imageIndex` query parameter (default `0`, as in
-/// C#'s `imageIndex ?? 0`). On success the handler returns `204`.
+/// C#'s `imageIndex ?? 0`), the action's only query member: a malformed one is
+/// the binder's `400` before the item is read, and no other is read. On success
+/// the handler returns `204`.
 #[utoipa::path(
     delete,
     path = "/Items/{itemId}/Images/{imageType}",
@@ -1701,15 +1773,13 @@ async fn delete_item_image(
     State(state): State<AppState>,
     RequireAdmin(auth): RequireAdmin,
     Path((DotnetGuid(item_id), image_type)): Path<(DotnetGuid, String)>,
-    Query(query): Query<ImageQuery>,
+    Query(query): Query<ImageIndexQuery>,
 ) -> Result<StatusCode, ApiError> {
     let image_type = parse_image_type(&image_type)?;
-    // Bound before the item is read, as the binder's `400` comes first upstream.
-    let index = query.query_image_index()?;
     require_item(&state, item_id, auth.user.as_deref()).await?;
     state
         .providers
-        .delete_image(item_id, image_type, Some(index))
+        .delete_image(item_id, image_type, Some(query.image_index.unwrap_or(0)))
         .await?;
     Ok(StatusCode::NO_CONTENT)
 }
@@ -1760,7 +1830,8 @@ pub(crate) struct UpdateImageIndexQuery {
 /// image type that does not allow multiple images (anything but Backdrop and
 /// Chapter, per C# `AllowsMultipleImages`) is a `400`; otherwise the image at
 /// `imageIndex` is swapped with the one at `newIndex` and the handler returns
-/// `204` (an out-of-range index is a faithful no-op, still `204`).
+/// `204` (an out-of-range index or a URL row is a faithful no-op, still `204`,
+/// and so is a Live TV item's file outside the internal metadata directory).
 #[utoipa::path(
     post,
     path = "/Items/{itemId}/Images/{imageType}/{imageIndex}/Index",
@@ -1906,10 +1977,14 @@ pub fn register(router: Router<AppState>) -> Router<AppState> {
 }
 
 crate::query::query_parameters! {
-    ImageQuery {} => [("get", "/Items/{itemId}/Images/{imageType}"), ("get", "/Items/{itemId}/Images/{imageType}/{imageIndex}"), ("delete", "/Items/{itemId}/Images/{imageType}")];
+    ImageQuery {} => [("get", "/Items/{itemId}/Images/{imageType}"), ("get", "/Items/{itemId}/Images/{imageType}/{imageIndex}")];
     UserImageQuery {} => [("get", "/UserImage")];
     LegacyUserImageQuery {} => [];
-    LegacyImageIndexQuery {} => [];
+    ImageIndexQuery {} => [("delete", "/Items/{itemId}/Images/{imageType}")];
+    PositionalImageQuery {} => [(
+        "get",
+        "/Items/{itemId}/Images/{imageType}/{imageIndex}/{tag}/{format}/{maxWidth}/{maxHeight}/{percentPlayed}/{unplayedCount}",
+    )];
     LegacyDeleteIndexQuery {} => [];
     UpdateImageIndexQuery {} => [("post", "/Items/{itemId}/Images/{imageType}/{imageIndex}/Index")];
 }
@@ -2125,6 +2200,11 @@ mod tests {
         );
         assert!(bind_route_number::<i32>("abc", "unplayedCount").is_err());
         assert!(bind_route_number::<f64>("xyz", "percentPlayed").is_err());
+        // The binder's forms, measured on 12.4.
+        assert_eq!(bind_route_number::<i32>("0x10", "maxWidth").ok(), Some(16));
+        assert_eq!(bind_route_number::<i32>(" #10 ", "maxWidth").ok(), Some(16));
+        assert_eq!(bind_route_number::<i32>("&h10", "maxWidth").ok(), Some(16));
+        assert!(bind_route_number::<i32>("2147483648", "maxWidth").is_err());
     }
 
     fn img(path: String) -> ItemImageInfo {

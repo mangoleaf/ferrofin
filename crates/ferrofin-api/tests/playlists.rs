@@ -16,7 +16,7 @@ use ferrofin_api::create_router;
 use ferrofin_api::state::AppState;
 use ferrofin_api::test_support::{
     FakeAppHost, FakeConfig, FakeMediaSources, FakeMusic, FakeProviders, FakeSearch, FakeSessions,
-    FakeSimilarItems, FakeSystem, FakeUserData, FakeUserViews,
+    FakeSimilarItems, FakeSystem, FakeUserData, FakeUserViews, FixedAuth, fake_user_entity,
 };
 use ferrofin_db::entities::base_items::BaseItemEntity;
 use ferrofin_db::entities::users::UserEntity;
@@ -30,8 +30,8 @@ use ferrofin_traits::collections::{
 use ferrofin_traits::dto::DtoService;
 use ferrofin_traits::error::ServiceError;
 use ferrofin_traits::library::UserManager;
-use ferrofin_traits::net::{AuthService, AuthorizationContext, RequestContext};
-use ferrofin_traits::options::{AuthorizationInfo, DtoOptions};
+use ferrofin_traits::net::{AuthService, AuthorizationContext};
+use ferrofin_traits::options::DtoOptions;
 use tower::ServiceExt;
 use uuid::Uuid;
 
@@ -45,38 +45,8 @@ const ITEM_B: Uuid = Uuid::from_u128(0xB2);
 /// read; every other column is a neutral zero value.
 fn user_entity(id: Uuid) -> UserEntity {
     UserEntity {
-        id: id.to_string(),
-        audio_language_preference: None,
-        authentication_provider_id: String::new(),
-        cast_receiver_id: None,
-        display_collections_view: false,
-        display_missing_episodes: false,
-        enable_auto_login: false,
-        enable_local_password: false,
-        enable_next_episode_auto_play: false,
-        enable_user_preference_access: false,
-        hide_played_in_latest: false,
-        internal_id: 0,
-        invalid_login_attempt_count: 0,
-        last_activity_date: None,
-        last_login_date: None,
-        login_attempts_before_lockout: None,
-        max_active_sessions: 0,
-        max_parental_rating_score: None,
-        max_parental_rating_sub_score: None,
-        must_update_password: false,
         password: Some("hashed".to_owned()),
-        password_reset_provider_id: String::new(),
-        play_default_audio_track: false,
-        remember_audio_selections: false,
-        remember_subtitle_selections: false,
-        remote_client_bitrate_limit: None,
-        row_version: 0,
-        subtitle_language_preference: None,
-        subtitle_mode: 0,
-        sync_play_access: 0,
-        username: "alice".to_owned(),
-        normalized_username: "ALICE".to_owned(),
+        ..fake_user_entity(id, "alice")
     }
 }
 
@@ -160,34 +130,8 @@ fn item_entity(id: Uuid) -> BaseItemEntity {
 }
 
 /// An [`AuthService`]/[`AuthorizationContext`] that authenticates as [`USER_ID`].
-struct OkAuth;
-
-#[async_trait]
-impl AuthService for OkAuth {
-    async fn authenticate(
-        &self,
-        _request: &RequestContext,
-    ) -> Result<AuthorizationInfo, ServiceError> {
-        Ok(AuthorizationInfo {
-            user: Some(Arc::new(user_entity(USER_ID))),
-            is_authenticated: true,
-            ..AuthorizationInfo::default()
-        })
-    }
-}
-
-#[async_trait]
-impl AuthorizationContext for OkAuth {
-    async fn get_authorization_info(
-        &self,
-        _request: &RequestContext,
-    ) -> Result<AuthorizationInfo, ServiceError> {
-        Ok(AuthorizationInfo {
-            user: Some(Arc::new(user_entity(USER_ID))),
-            is_authenticated: true,
-            ..AuthorizationInfo::default()
-        })
-    }
+fn ok_auth() -> FixedAuth {
+    FixedAuth::signed_in(user_entity(USER_ID))
 }
 
 /// A [`UserManager`] resolving the fixed authenticated user.
@@ -199,9 +143,6 @@ impl UserManager for OkUsers {
         Ok((id == USER_ID).then(|| user_entity(USER_ID)))
     }
     async fn get_users(&self) -> Result<Vec<UserEntity>, ServiceError> {
-        unimplemented!()
-    }
-    async fn get_user_ids(&self) -> Result<Vec<Uuid>, ServiceError> {
         unimplemented!()
     }
     async fn initialize(&self) -> Result<(), ServiceError> {
@@ -299,12 +240,6 @@ struct OkDto {
 
 #[async_trait]
 impl DtoService for OkDto {
-    async fn get_primary_image_aspect_ratio(
-        &self,
-        _item_id: Uuid,
-    ) -> Result<Option<f64>, ServiceError> {
-        unimplemented!()
-    }
     async fn get_base_item_dto(
         &self,
         _item: &BaseItemEntity,
@@ -345,15 +280,6 @@ impl DtoService for OkDto {
             .store(true, std::sync::atomic::Ordering::SeqCst);
         self.get_base_item_dtos(items, options, user, None, true)
             .await
-    }
-    async fn get_item_by_name_dto(
-        &self,
-        _item: &BaseItemEntity,
-        _options: &DtoOptions,
-        _tagged_item_ids: Option<&[Uuid]>,
-        _user: Option<&UserEntity>,
-    ) -> Result<BaseItemDto, ServiceError> {
-        unimplemented!()
     }
 }
 
@@ -409,17 +335,6 @@ impl PlaylistManager for RecordingPlaylists {
             Err(ServiceError::not_found("playlist"))
         }
     }
-    async fn get_playlist_for_user(
-        &self,
-        playlist_id: Uuid,
-        _user_id: Uuid,
-    ) -> Result<BaseItemEntity, ServiceError> {
-        if playlist_id == PLAYLIST_ID {
-            Ok(item_entity(playlist_id))
-        } else {
-            Err(ServiceError::not_found("playlist"))
-        }
-    }
     async fn create_playlist(
         &self,
         request: &PlaylistCreationRequest,
@@ -436,21 +351,21 @@ impl PlaylistManager for RecordingPlaylists {
         *self.updated.lock().unwrap() = Some(request.clone());
         Ok(())
     }
-    async fn get_playlists(&self, _user_id: Uuid) -> Result<Vec<BaseItemEntity>, ServiceError> {
-        unimplemented!()
-    }
     async fn get_playlist_items(
         &self,
         _playlist_id: Uuid,
         _user_id: Uuid,
-    ) -> Result<Vec<BaseItemEntity>, ServiceError> {
+    ) -> Result<ferrofin_traits::persistence::PlaylistMembers, ServiceError> {
         // Dashed upper case, as a Jellyfin-scanned database stores `Id`.
-        Ok([ITEM_A, ITEM_B]
-            .map(|id| BaseItemEntity {
-                id: id.to_string().to_uppercase(),
-                ..item_entity(id)
-            })
-            .into())
+        Ok(ferrofin_traits::persistence::PlaylistMembers {
+            items: [ITEM_A, ITEM_B]
+                .map(|id| BaseItemEntity {
+                    id: id.to_string().to_uppercase(),
+                    ..item_entity(id)
+                })
+                .into(),
+            entries: vec![0, 1],
+        })
     }
     async fn get_playlist_item_ids(&self, _playlist_id: Uuid) -> Result<Vec<Uuid>, ServiceError> {
         Ok(vec![ITEM_A, ITEM_B])
@@ -559,6 +474,14 @@ impl CollectionManager for RecordingCollections {
     ) -> Result<Option<BaseItemEntity>, ServiceError> {
         unimplemented!()
     }
+
+    async fn resolve_box_set_folders(
+        &self,
+        _location: &str,
+        _folders: &[String],
+    ) -> Result<Option<Vec<Uuid>>, ServiceError> {
+        unimplemented!()
+    }
 }
 
 /// Assembles an [`AppState`] over the recording playlist/collection fakes.
@@ -584,11 +507,11 @@ fn state_full(
     dto: Arc<OkDto>,
     users: Arc<dyn ferrofin_traits::library::UserManager>,
 ) -> AppState {
-    let auth = Arc::new(OkAuth);
+    let auth = Arc::new(ok_auth());
     state_authed(playlists, collections, dto, users, (auth.clone(), auth))
 }
 
-/// [`state_full`] with the caller's credentials chosen by the test: [`OkAuth`]
+/// [`state_full`] with the caller's credentials chosen by the test: [`ok_auth`]
 /// is the fixed user, `FakeAuthContext` + `ApiKeyAuthService` an API key (no
 /// user).
 fn state_authed(
@@ -739,6 +662,73 @@ async fn create_playlist_rejects_bodies_upstream_binding_refuses() {
     }
 }
 
+/// `Ids` carries `JsonCommaDelimitedCollectionConverterFactory` (v12.4
+/// CreatePlaylistDto.cs:23): a string is split on `,`, each piece trimmed and
+/// dropped when `GuidConverter` refuses it, and `""` is no ids; an array stays
+/// strict, and `null` is MVC's implicit `[Required]` 400 (`IReadOnlyList<Guid>
+/// Ids` is non-nullable). Each case was measured on a live Jellyfin 12.4.
+#[tokio::test]
+async fn create_playlist_ids_bind_a_comma_delimited_string() {
+    let (a, b) = (ITEM_A.simple(), ITEM_B);
+    for (body, expected) in [
+        (
+            format!(r#"{{"Name":"Mix","Ids":"{a},{b}"}}"#),
+            vec![ITEM_A, ITEM_B],
+        ),
+        (
+            format!(r#"{{"Name":"Mix","Ids":" {a} , not-a-guid,"}}"#),
+            vec![ITEM_A],
+        ),
+        (r#"{"Name":"Mix","Ids":""}"#.to_owned(), vec![]),
+    ] {
+        let pl = Arc::new(RecordingPlaylists::default());
+        let app = state(pl.clone(), Arc::new(RecordingCollections::default()));
+        let (status, _) = send(app, "POST", "/Playlists", Body::from(body.clone())).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let created = pl.created.lock().unwrap().clone().expect("recorded");
+        assert_eq!(created.item_id_list, expected, "{body}");
+    }
+    for body in [
+        r#"{"Name":"Mix","Ids":null}"#.to_owned(),
+        format!(r#"{{"Name":"Mix","Ids":["{a}","not-a-guid"]}}"#),
+    ] {
+        let pl = Arc::new(RecordingPlaylists::default());
+        let app = state(pl.clone(), Arc::new(RecordingCollections::default()));
+        let (status, _) = send(app, "POST", "/Playlists", Body::from(body.clone())).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert!(pl.created.lock().unwrap().is_none(), "{body}");
+    }
+}
+
+/// `UpdatePlaylistDto.Ids` carries the same converter (v12.4
+/// UpdatePlaylistDto.cs:22) but is nullable: `null` leaves the entries alone,
+/// while `""` or a string whose every piece is malformed replaces them with
+/// none (`UpdatePlaylist` clears `LinkedChildren` whenever `Ids` is not null).
+/// Each case was measured on a live Jellyfin 12.4.
+#[tokio::test]
+async fn update_playlist_ids_bind_a_comma_delimited_string() {
+    let uri = format!("/Playlists/{PLAYLIST_ID}");
+    for (body, expected) in [
+        (format!(r#"{{"Ids":"{ITEM_B}"}}"#), Some(vec![ITEM_B])),
+        (r#"{"Ids":""}"#.to_owned(), Some(vec![])),
+        (r#"{"Ids":"zzz"}"#.to_owned(), Some(vec![])),
+        (r#"{"Ids":null}"#.to_owned(), None),
+    ] {
+        let pl = Arc::new(RecordingPlaylists::default());
+        let app = state(pl.clone(), Arc::new(RecordingCollections::default()));
+        let (status, bytes) = send(app, "POST", &uri, Body::from(body.clone())).await;
+        let text = String::from_utf8_lossy(&bytes);
+        assert_eq!(status, StatusCode::NO_CONTENT, "{body}: {text}");
+        let updated = pl.updated.lock().unwrap().clone().expect("recorded");
+        assert_eq!(updated.ids, expected, "{body}");
+    }
+    let pl = Arc::new(RecordingPlaylists::default());
+    let app = state(pl.clone(), Arc::new(RecordingCollections::default()));
+    let (status, _) = send(app, "POST", &uri, Body::from(r#"{"Ids":["zzz"]}"#)).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(pl.updated.lock().unwrap().is_none());
+}
+
 /// A `Users` entry binds through upstream's `PlaylistUserPermissions(Guid
 /// userId, bool canEdit = false)` constructor on create and update alike: a
 /// missing `CanEdit` is `false`, a missing or null `UserId` the empty GUID,
@@ -823,7 +813,7 @@ async fn get_missing_playlist_is_404() {
 #[tokio::test]
 async fn playlist_items_projects_the_fields_the_client_asked_for() {
     // C# builds the options from the REQUEST:
-    //   var dtoOptions = new DtoOptions { Fields = fields }.AddClientFields(User)
+    //   var dtoOptions = new DtoOptions { Fields = fields }
     //       .AddAdditionalDtoOptions(enableImages, enableUserData, …);
     // Ferrofin hardcoded `DtoOptions::default()` — every field, always — and the
     // query struct did not even accept `fields`. A 50-item playlist came back as
@@ -888,6 +878,42 @@ async fn get_playlist_items_pages_and_tags_entry_id() {
         result.items[0].playlist_item_id.as_deref(),
         Some(ITEM_A.simple().to_string().as_str())
     );
+}
+
+/// `GetPlaylistItems` pages with LINQ: `Skip(startIndex)` skips nothing for a
+/// negative index, `Take(limit)` takes nothing for a negative limit, and the
+/// total is counted before either. `StartIndex` echoes the request.
+#[rstest::rstest]
+#[case::negative_limit("limit=-1", &[], 0)]
+#[case::zero_limit("limit=0", &[], 0)]
+#[case::negative_start("startIndex=-1", &[ITEM_A, ITEM_B], -1)]
+#[case::negative_start_with_limit("startIndex=-1&limit=1", &[ITEM_A], -1)]
+#[case::limit_past_the_end("startIndex=1&limit=5", &[ITEM_B], 1)]
+#[case::start_past_the_end("startIndex=5", &[], 5)]
+#[case::start_with_negative_limit("startIndex=1&limit=-3", &[], 1)]
+#[tokio::test]
+async fn get_playlist_items_pages_as_skip_and_take(
+    #[case] paging: &str,
+    #[case] expected: &[Uuid],
+    #[case] start_index: i32,
+) {
+    let app = state(
+        Arc::new(RecordingPlaylists::default()),
+        Arc::new(RecordingCollections::default()),
+    );
+    let (status, bytes) = send(
+        app,
+        "GET",
+        &format!("/Playlists/{PLAYLIST_ID}/Items?{paging}"),
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let result: QueryResult<BaseItemDto> = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(result.total_record_count, 2);
+    assert_eq!(result.start_index, start_index);
+    let ids: Vec<Uuid> = result.items.iter().map(|dto| dto.id).collect();
+    assert_eq!(ids, expected);
 }
 
 /// `GET /Playlists/{id}/Items?userId=` is `RequestHelpers.GetUserId`: a
