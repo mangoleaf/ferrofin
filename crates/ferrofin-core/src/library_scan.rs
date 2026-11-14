@@ -14495,17 +14495,10 @@ impl LibraryScanner {
         }
     }
 
-    /// `ItemImageProvider.RemoveImages` (`ItemImageProvider.cs:74-103`, run
-    /// by `MetadataService.cs:112-118` for `RemoveOldMetadata` with
-    /// `ReplaceAllImages`): deletes the item's images that live in its own
-    /// metadata folder — the first image of each singular type
-    /// (`_singularImages`, `:42-53`) and every backdrop — so the pass
-    /// supplies them afresh. Screenshots, chapter images and anything stored
-    /// with the media stay (upstream deletes the latter only when it saves
-    /// metadata next to the media, which Ferrofin never does). The metadata
-    /// folder is Ferrofin's (`{metadata}/library/{id}`) or, on a database
-    /// adopted from Jellyfin, Jellyfin's (`{metadata}/library/{xx}/{id:N}`,
-    /// `BaseItem.GetInternalMetadataPath`, `BaseItem.cs:927-937`).
+    /// `ItemImageProvider.RemoveImages` for the scan, by the shared
+    /// [`remove_images`](ferrofin_providers::local_images::remove_images):
+    /// the item's images in its own metadata folders go, so the pass supplies
+    /// them afresh.
     fn remove_item_images(&self, entity: &BaseItemEntity, stored: Option<&[ItemImageInfo]>) {
         let (Some(meta_root), Some(stored)) = (&self.metadata_dir, stored) else {
             return;
@@ -14514,39 +14507,8 @@ impl LibraryScanner {
             |_| vec![meta_root.join(&entity.id)],
             |id| crate::dynamic_images::internal_metadata_dirs(&meta_root.resolve(), id).to_vec(),
         );
-        let mut seen: Vec<ImageType> = Vec::new();
-        for image in stored {
-            let singular = matches!(
-                image.image_type,
-                ImageType::Primary
-                    | ImageType::Art
-                    | ImageType::Banner
-                    | ImageType::Box
-                    | ImageType::BoxRear
-                    | ImageType::Disc
-                    | ImageType::Logo
-                    | ImageType::Menu
-                    | ImageType::Thumb
-            );
-            // `GetImageInfo(type, 0)`: a singular type's first image only.
-            let removable = image.image_type == ImageType::Backdrop
-                || (singular && !seen.contains(&image.image_type));
-            if singular {
-                seen.push(image.image_type);
-            }
-            let path = Path::new(&image.path);
-            if !removable || !folders.iter().any(|folder| path.starts_with(folder)) {
-                continue;
-            }
-            match std::fs::remove_file(path) {
-                // Two image types can share one file (see
-                // `image_type_file_stem`).
-                Err(err) if err.kind() != std::io::ErrorKind::NotFound => {
-                    tracing::warn!(%err, item_id = %entity.id, "failed to remove an image to replace");
-                }
-                _ => {}
-            }
-        }
+        // The rows are rewritten from what the pass finds.
+        ferrofin_providers::local_images::remove_images(&mut stored.to_vec(), &folders, &entity.id);
     }
 
     /// Appends rows for art files already sitting in the item's metadata art
