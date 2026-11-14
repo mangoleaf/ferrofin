@@ -54,8 +54,8 @@ use crate::fetch::SourceFetcher;
 use crate::guide_repository::{PROGRAM_SELECT, UserRestrictions};
 use crate::mapping::{
     EpgChannel, EpgChannelData, TunerChannel, epg_channel_for_tuner_channel,
-    eq_ordinal_ignore_case, is_listing_provider_enabled_for_tuner, m3u_channel_id,
-    ordinal_ignore_case_key, tuner_channel_mapping,
+    eq_ordinal_ignore_case, is_listing_provider_enabled_for_tuner, ordinal_ignore_case_key,
+    tuner_channel_mapping,
 };
 use crate::projection::{
     ChannelRow, ProgramImages, ProgramRow as GuideProgramRow, channel_entity,
@@ -303,7 +303,7 @@ fn epg_channel(c: &XmltvChannel) -> EpgChannel {
 /// the playlist's logo again, and the guide's returns with it, as upstream.
 /// A guide logo that is not a URL never replaces a playlist's that is one.
 fn add_provider_metadata(
-    lineups: &mut [(String, String, Vec<crate::tuner_host::TunerChannel>)],
+    lineups: &mut [(String, Vec<crate::tuner_host::TunerChannel>)],
     guides: &[(ListingsProviderInfo, GuideSource)],
 ) {
     for (provider, source) in guides {
@@ -313,7 +313,7 @@ fn add_provider_metadata(
             }
             GuideSource::SchedulesDirect { channels, .. } => EpgChannelData::new(channels),
         };
-        for (host_id, _, lineup) in lineups.iter_mut() {
+        for (host_id, lineup) in lineups.iter_mut() {
             if !is_listing_provider_enabled_for_tuner(provider, host_id) {
                 continue;
             }
@@ -674,18 +674,18 @@ impl ListingsBackend {
 }
 
 /// A tuner channel as the match ladder sees it (`ChannelInfo`'s `Id`,
-/// `TunerChannelId`, `Number` and `Name`), from its lineup entry: the stream
-/// URL, the guide key the tuner stores as `TvgId`, the number and the name.
+/// `TunerChannelId`, `Number` and `Name`), from its lineup entry: the external
+/// id its host minted (`m3u_…`, `hdhr_{GuideNumber}`), the guide key the tuner
+/// stores as `TvgId`, the number and the name.
 fn matcher_channel(
-    tuner_url: &str,
+    external_id: String,
     tuner_host_id: &str,
-    stream_url: &str,
     guide_key: String,
     number: String,
     name: String,
 ) -> TunerChannel {
     TunerChannel {
-        id: m3u_channel_id(tuner_url, stream_url),
+        id: external_id,
         tuner_channel_id: guide_key,
         number,
         name,
@@ -2408,12 +2408,10 @@ impl FerrofinLiveTvManager {
                 if !is_listing_provider_enabled_for_tuner(info, host_id) {
                     continue;
                 }
-                let url = tuner.url.as_deref().unwrap_or_default();
                 out.extend(new.into_iter().map(|ch| {
                     matcher_channel(
-                        url,
+                        ch.external_id,
                         host_id,
-                        &ch.url,
                         ch.guide_key,
                         ch.number.unwrap_or_default(),
                         ch.name,
@@ -2437,7 +2435,7 @@ impl FerrofinLiveTvManager {
     ) -> Result<Vec<(String, TunerChannel)>, ServiceError> {
         let mut out = Vec::new();
         for tuner in self.get_tuner_hosts().await? {
-            let (Some(host_id), Some(url)) = (tuner.id.as_deref(), tuner.url.as_deref()) else {
+            let Some(host_id) = tuner.id.as_deref() else {
                 continue;
             };
             if !is_listing_provider_enabled_for_tuner(info, host_id) {
@@ -2446,14 +2444,7 @@ impl FerrofinLiveTvManager {
             for row in crate::guide_repository::tuner_lineup(&self.db, host_id).await? {
                 out.push((
                     row.id,
-                    matcher_channel(
-                        url,
-                        host_id,
-                        &row.stream_url,
-                        row.tvg_id,
-                        row.number,
-                        row.name,
-                    ),
+                    matcher_channel(row.external_id, host_id, row.tvg_id, row.number, row.name),
                 ));
             }
         }
@@ -2709,7 +2700,7 @@ impl FerrofinLiveTvManager {
     async fn fetch_guide_source(
         &self,
         provider: &ListingsProviderInfo,
-        tuner_lineups: &[(String, String, Vec<crate::tuner_host::TunerChannel>)],
+        tuner_lineups: &[(String, Vec<crate::tuner_host::TunerChannel>)],
         window: (DateTime<Utc>, DateTime<Utc>),
         generation: u64,
     ) -> Result<(Option<GuideSource>, bool), ServiceError> {
@@ -2799,7 +2790,7 @@ impl FerrofinLiveTvManager {
     async fn fetch_schedules_direct_guide(
         &self,
         provider: &ListingsProviderInfo,
-        tuner_lineups: &[(String, String, Vec<crate::tuner_host::TunerChannel>)],
+        tuner_lineups: &[(String, Vec<crate::tuner_host::TunerChannel>)],
         window: (DateTime<Utc>, DateTime<Utc>),
         generation: u64,
     ) -> Result<Option<(GuideSource, bool)>, ServiceError> {
@@ -2810,15 +2801,14 @@ impl FerrofinLiveTvManager {
         let epg = EpgChannelData::new(&channels);
 
         let mut bound = std::collections::BTreeSet::new();
-        for (host_id, url, lineup) in tuner_lineups {
+        for (host_id, lineup) in tuner_lineups {
             if !is_listing_provider_enabled_for_tuner(provider, host_id) {
                 continue;
             }
             for channel in lineup {
                 let tuner_channel = matcher_channel(
-                    url,
+                    channel.external_id.clone(),
                     host_id,
-                    &channel.url,
                     channel.guide_key.clone(),
                     channel.number.clone().unwrap_or_default(),
                     channel.name.clone(),
@@ -3748,10 +3738,7 @@ impl LiveTvManager for FerrofinLiveTvManager {
         // when nothing threw: its catch sets `cleanDatabase = false`, so a
         // tuner or guide that could not be read never empties the cache.
         let mut clean_database = true;
-        // `(tuner id, tuner url, lineup)`: the url is half of each channel's
-        // external id, which the Schedules Direct binding below needs.
-        let mut tuner_lineups: Vec<(String, String, Vec<crate::tuner_host::TunerChannel>)> =
-            Vec::new();
+        let mut tuner_lineups: Vec<(String, Vec<crate::tuner_host::TunerChannel>)> = Vec::new();
         for tuner in self.get_tuner_hosts().await? {
             let Some(id) = tuner.id.clone() else {
                 clean_database = false;
@@ -3780,7 +3767,7 @@ impl LiveTvManager for FerrofinLiveTvManager {
             );
             match lineup.await {
                 Ok(channels) => {
-                    tuner_lineups.push((id, tuner.url.clone().unwrap_or_default(), channels));
+                    tuner_lineups.push((id, channels));
                 }
                 Err(e) => {
                     // `BaseTunerHost.GetChannels` logs and falls back to its
@@ -3838,7 +3825,7 @@ impl LiveTvManager for FerrofinLiveTvManager {
         }
         let guard = self.guide_lock.lock().await;
         let mut kept_channels: HashSet<String> = HashSet::new();
-        for (id, _, channels) in &tuner_lineups {
+        for (id, channels) in &tuner_lineups {
             kept_channels.extend(self.replace_channels(id, channels).await?);
         }
         // The airings this pass wrote, with the artwork their listing gave
@@ -8641,12 +8628,10 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn a_hdhomerun_tuner_refreshes_through_the_hdhomerun_host() {
-        // The dispatch bug this replaces: `refresh_guide` fed EVERY tuner's URL
-        // to the M3U parser, so an HDHomeRun's `discover.json` parsed as a
-        // playlist with no channels and no error at all.
-        let device = HashMap::from([
+    /// An HDHomeRun at `http://192.168.1.182`: its `discover.json` and a
+    /// lineup of 4.1 `WCMH-DT` (HD), 4.2 `MeTV` and a DRM channel 9.9.
+    fn hdhr_device() -> HashMap<String, String> {
+        HashMap::from([
             (
                 "http://192.168.1.182/discover.json".to_owned(),
                 r#"{"FriendlyName":"HDHomeRun PRIME","ModelNumber":"HDHR3-CC","DeviceID":"FFFFFFFF",
@@ -8666,16 +8651,25 @@ mod tests {
                      "URL":"http://192.168.1.111:5004/auto/v9.9"}]"#
                     .to_owned(),
             ),
-        ]);
-        let mgr = manager_with(FakeFetcher(device)).await;
-        let saved = mgr
-            .save_tuner_host(TunerHostInfo {
-                type_: Some("hdhomerun".to_owned()),
-                url: Some("http://192.168.1.182".to_owned()),
-                ..TunerHostInfo::default()
-            })
-            .await
-            .expect("save");
+        ])
+    }
+
+    /// The HDHomeRun [`hdhr_device`] as the dashboard saves it.
+    fn hdhr_tuner() -> TunerHostInfo {
+        TunerHostInfo {
+            type_: Some("hdhomerun".to_owned()),
+            url: Some("http://192.168.1.182".to_owned()),
+            ..TunerHostInfo::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn a_hdhomerun_tuner_refreshes_through_the_hdhomerun_host() {
+        // The dispatch bug this replaces: `refresh_guide` fed EVERY tuner's URL
+        // to the M3U parser, so an HDHomeRun's `discover.json` parsed as a
+        // playlist with no channels and no error at all.
+        let mgr = manager_with(FakeFetcher(hdhr_device())).await;
+        let saved = mgr.save_tuner_host(hdhr_tuner()).await.expect("save");
         // `IConfigurableTunerHost.Validate` ran and adopted the device id.
         assert_eq!(saved.device_id.as_deref(), Some("FFFFFFFF"));
 
@@ -8692,6 +8686,8 @@ mod tests {
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].name, "WCMH-DT");
         assert_eq!(rows[0].number.as_deref(), Some("4.1"));
+        // No `TunerChannelId`, so no guide key is stored for the match.
+        assert_eq!(rows[0].tvg_id, "");
         assert_eq!(rows[1].name, "MeTV");
         for (guide_number, is_hd) in [("4.1", Some(true)), ("4.2", Some(false))] {
             let external = format!("hdhr_{guide_number}");
@@ -10863,7 +10859,6 @@ mod tests {
         };
         let mut lineups = vec![(
             "tuner-a".to_owned(),
-            String::new(),
             vec![crate::tuner_host::TunerChannel {
                 external_id: "m3u_1".to_owned(),
                 guide_key: "one.tv".to_owned(),
@@ -10872,8 +10867,8 @@ mod tests {
                 ..crate::tuner_host::TunerChannel::default()
             }],
         )];
-        let logo = |lineups: &[(String, String, Vec<crate::tuner_host::TunerChannel>)]| {
-            lineups[0].2[0].image_url.clone()
+        let logo = |lineups: &[(String, Vec<crate::tuner_host::TunerChannel>)]| {
+            lineups[0].1[0].image_url.clone()
         };
         let xmltv = |channel: XmltvChannel| GuideSource::XmlTv {
             document: crate::xmltv_cache::XmlTvDocument::empty_for_test(),
@@ -15633,6 +15628,69 @@ mod tests {
             .expect("map the new channel");
         assert_eq!(row.name.as_deref(), Some("3 Channel Three"));
         assert_eq!(row.provider_channel_id.as_deref(), Some("one.tv"));
+    }
+
+    /// An HDHomeRun channel is mapped under the id its host mints,
+    /// `hdhr_{GuideNumber}` (v12.4 `HdHomerunHost.GetChannelId`), never the M3U
+    /// shape: the dialog lists it so, a mapping keyed on it (as Jellyfin saves
+    /// one) applies, and the guide's airing is bound and keyed under it
+    /// (`ListingsManager.GetProgramsAsync`'s `program.Id += "_" + channel.Id`).
+    #[tokio::test]
+    async fn hdhomerun_channels_map_under_their_hdhr_id() {
+        let mut sources = hdhr_device();
+        sources.insert("http://guide/xmltv.xml".to_owned(), dated(XMLTV));
+        let mgr = manager_with(FakeFetcher(sources)).await;
+        mgr.save_tuner_host(hdhr_tuner()).await.expect("tuner");
+        let provider_id = mgr
+            .save_listing_provider(
+                as_xmltv(ListingsProviderInfo {
+                    path: Some("http://guide/xmltv.xml".to_owned()),
+                    ..ListingsProviderInfo::default()
+                }),
+                false,
+                false,
+            )
+            .await
+            .expect("provider")
+            .id
+            .expect("provider id");
+        mgr.refresh_guide().await.expect("refresh");
+
+        let opts = mgr
+            .get_channel_mapping_options(&provider_id)
+            .await
+            .expect("options");
+        let ids: Vec<_> = opts
+            .tuner_channels
+            .iter()
+            .map(|c| (c.id.as_deref(), c.name.as_deref()))
+            .collect();
+        assert_eq!(
+            ids,
+            [
+                (Some("hdhr_4.1"), Some("4.1 WCMH-DT")),
+                (Some("hdhr_4.2"), Some("4.2 MeTV"))
+            ]
+        );
+
+        let row = mgr
+            .set_channel_mapping(&provider_id, "hdhr_4.2", "one.tv")
+            .await
+            .expect("map");
+        assert_eq!(row.id.as_deref(), Some("hdhr_4.2"));
+        assert_eq!(row.provider_channel_id.as_deref(), Some("one.tv"));
+
+        mgr.refresh_guide().await.expect("queued refresh");
+        let programs = crate::guide_repository::test_support::program_rows(&mgr.db)
+            .await
+            .expect("programmes");
+        assert_eq!(programs.len(), 1, "{programs:?}");
+        assert_eq!(
+            Uuid::parse_str(&programs[0].channel_id).expect("channel guid"),
+            super::internal_channel_id("hdhr_4.2")
+        );
+        let external = programs[0].external_id.as_deref().unwrap_or_default();
+        assert!(external.ends_with("_hdhr_4.2"), "{external}");
     }
 
     /// A [`SourceFetcher`] that counts its fetches and fails while no body is
