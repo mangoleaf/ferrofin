@@ -737,6 +737,24 @@ pub trait LiveTvManager: Send + Sync {
         Ok(Vec::new())
     }
 
+    /// `Video.IsActiveRecording`: whether a live capture is writing `path`
+    /// right now (`RecordingsManager.GetActiveRecordingInfo(Path) is not
+    /// null`), by an exact match against
+    /// [`active_recording_paths`](Self::active_recording_paths). A blank path
+    /// is never one, and is not looked up, as upstream returns `null` for it.
+    /// A lookup error is the caller's to handle: each caller keeps its own
+    /// policy.
+    async fn is_active_recording(&self, path: &str) -> Result<bool, ServiceError> {
+        if path.trim().is_empty() {
+            return Ok(false);
+        }
+        Ok(self
+            .active_recording_paths()
+            .await?
+            .iter()
+            .any(|recording| recording == path))
+    }
+
     /// `BaseItem.MediaType` of a Live TV channel or DVR recording — `"Video"`,
     /// `"Audio"`, or `None` when `id` is neither.
     ///
