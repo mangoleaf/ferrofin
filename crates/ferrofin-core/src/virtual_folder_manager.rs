@@ -4277,9 +4277,21 @@ mod tests {
 
     #[tokio::test]
     async fn add_rejects_missing_media_path_and_empty_name() {
-        let (_tmp, mgr) = manager();
+        let (tmp, mgr) = manager();
         let bad = opts_with_paths(&["/does/not/exist".to_owned()]);
         assert!(mgr.add_virtual_folder("X", None, &bad).await.is_err());
+        // A blank `paths` piece binds as "" (`CommaDelimitedCollectionModelBinder`),
+        // and upstream's `Directory.Exists("")` refuses it.
+        let blank = opts_with_paths(&[media_dir(&tmp, "real"), String::new()]);
+        assert!(matches!(
+            mgr.add_virtual_folder("Y", None, &blank).await,
+            Err(ServiceError::InvalidInput(_))
+        ));
+        assert_eq!(
+            mgr.get_virtual_folders().await.unwrap().len(),
+            0,
+            "no library"
+        );
         assert!(
             mgr.add_virtual_folder("   ", None, &LibraryOptions::default())
                 .await

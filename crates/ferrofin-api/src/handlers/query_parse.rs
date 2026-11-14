@@ -101,6 +101,24 @@ pub(crate) fn parse_csv_uuids(raw: Option<&str>) -> Result<Vec<Uuid>, ApiError> 
         .collect()
 }
 
+/// Parses a comma-delimited list of `i32` values (Jellyfin's `years`). A
+/// malformed token is a `400` — stricter than v12's
+/// `CommaDelimitedCollectionModelBinder`, which logs and drops the token, and
+/// the same strictness as [`parse_csv_uuids`].
+pub(crate) fn parse_csv_i32(raw: Option<&str>) -> Result<Vec<i32>, ApiError> {
+    let Some(raw) = raw else {
+        return Ok(Vec::new());
+    };
+    raw.split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| {
+            s.parse::<i32>()
+                .map_err(|_| ApiError::BadRequest(format!("invalid integer {s:?}")))
+        })
+        .collect()
+}
+
 /// Deserializes an optional [`Uuid`] query parameter the way ASP.NET binds a
 /// `Guid?`: an **empty or whitespace-only** value is *absent*, not malformed.
 ///

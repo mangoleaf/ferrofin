@@ -51,7 +51,7 @@ use crate::extract::{
     DotnetGuid, JsonBody, Query, RequiredRouteString, RouteParameter, blank_route_values,
 };
 use crate::handlers::items::effective_user_id;
-use crate::handlers::query_parse::parse_csv_uuids;
+use crate::handlers::query_parse::{parse_csv_strings, parse_csv_uuids};
 use crate::state::AppState;
 
 /// Gates an edit action: owner or a `CanEdit` share passes, anything else is the
@@ -471,17 +471,7 @@ async fn remove_item_from_playlist(
                 .await?,
         )?;
     }
-    let entry_ids: Vec<String> = query
-        .entry_ids
-        .as_deref()
-        .map(|raw| {
-            raw.split(',')
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .map(ToOwned::to_owned)
-                .collect()
-        })
-        .unwrap_or_default();
+    let entry_ids = parse_csv_strings(query.entry_ids.as_deref());
     // C# `catch (ArgumentException) { return NotFound(); }`: the manager's
     // "no such playlist" is a bare `404` here, which is how an API key, past
     // no gate above, hears that the id names no playlist.
