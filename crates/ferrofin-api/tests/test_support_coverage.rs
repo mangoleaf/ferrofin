@@ -15,7 +15,7 @@ use std::sync::Arc;
 
 use ferrofin_api::test_support::{
     FakeAppHost, FakeConfig, FakeDto, FakeLibrary, FakeMediaSources, FakePaths, FakeSessions,
-    FakeSystem, FakeUserData, FakeUserViews, FakeUsers,
+    FakeSystem, FakeUserData, FakeUserViews, FakeUsers, fake_user_entity,
 };
 use ferrofin_db::entities::base_items::BaseItemEntity;
 use ferrofin_db::entities::users::UserEntity;
@@ -49,40 +49,7 @@ fn assert_panics<F: Future>(fut: F) {
 
 /// A minimal [`UserEntity`] for methods that take one by reference.
 fn user() -> UserEntity {
-    UserEntity {
-        id: Uuid::nil().to_string(),
-        audio_language_preference: None,
-        authentication_provider_id: String::new(),
-        cast_receiver_id: None,
-        display_collections_view: false,
-        display_missing_episodes: false,
-        enable_auto_login: false,
-        enable_local_password: false,
-        enable_next_episode_auto_play: false,
-        enable_user_preference_access: false,
-        hide_played_in_latest: false,
-        internal_id: 0,
-        invalid_login_attempt_count: 0,
-        last_activity_date: None,
-        last_login_date: None,
-        login_attempts_before_lockout: None,
-        max_active_sessions: 0,
-        max_parental_rating_score: None,
-        max_parental_rating_sub_score: None,
-        must_update_password: false,
-        password: None,
-        password_reset_provider_id: String::new(),
-        play_default_audio_track: false,
-        remember_audio_selections: false,
-        remember_subtitle_selections: false,
-        remote_client_bitrate_limit: None,
-        row_version: 0,
-        subtitle_language_preference: None,
-        subtitle_mode: 0,
-        sync_play_access: 0,
-        username: String::new(),
-        normalized_username: String::new(),
-    }
+    fake_user_entity(Uuid::nil(), "")
 }
 
 #[test]

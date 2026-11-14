@@ -18,7 +18,7 @@ use ferrofin_api::create_router;
 use ferrofin_api::state::AppState;
 use ferrofin_api::test_support::{
     FakeAppHost, FakeConfig, FakeMediaSources, FakeMusic, FakeProviders, FakeSearch, FakeSessions,
-    FakeSimilarItems, FakeSystem,
+    FakeSimilarItems, FakeSystem, FixedAuth, fake_user_entity,
 };
 use ferrofin_db::entities::base_items::{BaseItemEntity, PeopleEntity};
 use ferrofin_db::entities::security::DeviceEntity;
@@ -63,39 +63,10 @@ const PLAYLISTS_VIEW_ID: Uuid = Uuid::from_u128(0x105);
 /// Builds a minimal [`UserEntity`] with the given id/name; neutral zero fields.
 fn user_entity(id: Uuid, username: &str) -> UserEntity {
     UserEntity {
-        id: id.to_string(),
-        audio_language_preference: None,
-        authentication_provider_id: String::new(),
-        cast_receiver_id: None,
-        display_collections_view: false,
-        display_missing_episodes: false,
-        enable_auto_login: false,
-        enable_local_password: false,
-        enable_next_episode_auto_play: false,
         // Jellyfin's default for a new user.
         enable_user_preference_access: true,
-        hide_played_in_latest: false,
-        internal_id: 0,
-        invalid_login_attempt_count: 0,
-        last_activity_date: None,
-        last_login_date: None,
-        login_attempts_before_lockout: None,
-        max_active_sessions: 0,
-        max_parental_rating_score: None,
-        max_parental_rating_sub_score: None,
-        must_update_password: false,
         password: Some("hashed".to_owned()),
-        password_reset_provider_id: String::new(),
-        play_default_audio_track: false,
-        remember_audio_selections: false,
-        remember_subtitle_selections: false,
-        remote_client_bitrate_limit: None,
-        row_version: 0,
-        subtitle_language_preference: None,
-        subtitle_mode: 0,
-        sync_play_access: 0,
-        username: username.to_owned(),
-        normalized_username: username.to_uppercase(),
+        ..fake_user_entity(id, username)
     }
 }
 
@@ -1434,38 +1405,10 @@ impl DtoService for LatestDto {
 
 /// An [`AuthService`] / [`AuthorizationContext`] whose user hides played
 /// items from "latest" (`HidePlayedInLatest`).
-struct HidingAuth;
-
-impl HidingAuth {
-    fn info() -> AuthorizationInfo {
-        let mut user = user_entity(USER_ID, "alice");
-        user.hide_played_in_latest = true;
-        AuthorizationInfo {
-            user: Some(Arc::new(user)),
-            is_authenticated: true,
-            ..AuthorizationInfo::default()
-        }
-    }
-}
-
-#[async_trait]
-impl AuthService for HidingAuth {
-    async fn authenticate(
-        &self,
-        _request: &RequestContext,
-    ) -> Result<AuthorizationInfo, ServiceError> {
-        Ok(Self::info())
-    }
-}
-
-#[async_trait]
-impl AuthorizationContext for HidingAuth {
-    async fn get_authorization_info(
-        &self,
-        _request: &RequestContext,
-    ) -> Result<AuthorizationInfo, ServiceError> {
-        Ok(Self::info())
-    }
+fn hiding_auth() -> FixedAuth {
+    let mut user = user_entity(USER_ID, "alice");
+    user.hide_played_in_latest = true;
+    FixedAuth::signed_in(user)
 }
 
 /// The user-library state with the latest fakes swapped in.
@@ -1476,7 +1419,7 @@ fn latest_state(
 ) -> AppState {
     let (auth_context, auth_service): (Arc<dyn AuthorizationContext>, Arc<dyn AuthService>) =
         if hide_played {
-            (Arc::new(HidingAuth), Arc::new(HidingAuth))
+            (Arc::new(hiding_auth()), Arc::new(hiding_auth()))
         } else {
             (
                 Arc::new(OkAuth {
