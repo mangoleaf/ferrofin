@@ -2480,9 +2480,26 @@ mod tests {
     /// one page of items from a single list query. The long-running tasks run
     /// ffmpeg or network work per item, so a task that loads the whole library
     /// at once holds every row for hours; over this fake it fails instead.
+    ///
+    /// Every other method, defaulted ones included, forwards to the real
+    /// manager, so a task test runs the real body, never a trait default;
+    /// `missing_trait_methods` fails clippy when a method is left out.
     struct OnePageAtATime(Arc<dyn LibraryManager>);
 
+    impl OnePageAtATime {
+        fn one_page(items: Vec<BaseItemEntity>) -> Result<Vec<BaseItemEntity>, ServiceError> {
+            if items.len() > usize::try_from(PAGE_SIZE).expect("page size") {
+                return Err(ServiceError::backend(format!(
+                    "{} items in one list: page the query",
+                    items.len()
+                )));
+            }
+            Ok(items)
+        }
+    }
+
     #[async_trait]
+    #[deny(clippy::missing_trait_methods)]
     impl LibraryManager for OnePageAtATime {
         async fn get_item_by_id(&self, id: Uuid) -> Result<Option<BaseItemEntity>, ServiceError> {
             self.0.get_item_by_id(id).await
@@ -2503,14 +2520,7 @@ mod tests {
             &self,
             query: &InternalItemsQuery,
         ) -> Result<Vec<BaseItemEntity>, ServiceError> {
-            let items = self.0.get_item_list(query).await?;
-            if items.len() > usize::try_from(PAGE_SIZE).expect("page size") {
-                return Err(ServiceError::backend(format!(
-                    "{} items in one list: page the query",
-                    items.len()
-                )));
-            }
-            Ok(items)
+            Self::one_page(self.0.get_item_list(query).await?)
         }
         async fn get_latest_item_list(
             &self,
@@ -2614,6 +2624,304 @@ mod tests {
         }
         async fn queue_library_scan(&self) -> Result<(), ServiceError> {
             self.0.queue_library_scan().await
+        }
+        async fn get_item_by_id_for_user(
+            &self,
+            id: Uuid,
+            user: Option<&ferrofin_db::entities::users::UserEntity>,
+        ) -> Result<Option<BaseItemEntity>, ServiceError> {
+            self.0.get_item_by_id_for_user(id, user).await
+        }
+        async fn get_item_by_id_for_user_with_chain(
+            &self,
+            id: Uuid,
+            user: Option<&ferrofin_db::entities::users::UserEntity>,
+        ) -> Result<Option<(BaseItemEntity, Vec<BaseItemEntity>)>, ServiceError> {
+            self.0.get_item_by_id_for_user_with_chain(id, user).await
+        }
+        async fn containing_folder_path(&self, item: &BaseItemEntity) -> Option<String> {
+            self.0.containing_folder_path(item).await
+        }
+        async fn get_inherited_content_type(
+            &self,
+            item: &BaseItemEntity,
+        ) -> Result<Option<ferrofin_model::data::CollectionType>, ServiceError> {
+            self.0.get_inherited_content_type(item).await
+        }
+        async fn get_configured_content_type(
+            &self,
+            item: &BaseItemEntity,
+        ) -> Result<Option<ferrofin_model::data::CollectionType>, ServiceError> {
+            self.0.get_configured_content_type(item).await
+        }
+        async fn build_access_filter(
+            &self,
+            user: &ferrofin_db::entities::users::UserEntity,
+        ) -> Result<Option<InternalItemsQuery>, ServiceError> {
+            self.0.build_access_filter(user).await
+        }
+        async fn is_item_visible(
+            &self,
+            item: &BaseItemEntity,
+            user: &ferrofin_db::entities::users::UserEntity,
+        ) -> Result<bool, ServiceError> {
+            self.0.is_item_visible(item, user).await
+        }
+        async fn filter_visible_items(
+            &self,
+            items: Vec<BaseItemEntity>,
+            user: &ferrofin_db::entities::users::UserEntity,
+        ) -> Result<Vec<BaseItemEntity>, ServiceError> {
+            self.0.filter_visible_items(items, user).await
+        }
+        async fn is_item_visible_standalone(
+            &self,
+            item: &BaseItemEntity,
+            user: &ferrofin_db::entities::users::UserEntity,
+        ) -> Result<bool, ServiceError> {
+            self.0.is_item_visible_standalone(item, user).await
+        }
+        async fn get_visible_item_ids(
+            &self,
+            ids: &[Uuid],
+            user: &ferrofin_db::entities::users::UserEntity,
+        ) -> Result<Vec<Uuid>, ServiceError> {
+            self.0.get_visible_item_ids(ids, user).await
+        }
+        async fn filter_visible_items_standalone(
+            &self,
+            items: Vec<BaseItemEntity>,
+            user: &ferrofin_db::entities::users::UserEntity,
+        ) -> Result<Vec<BaseItemEntity>, ServiceError> {
+            self.0.filter_visible_items_standalone(items, user).await
+        }
+        async fn get_parentally_allowed_item_ids(
+            &self,
+            ids: &[Uuid],
+            user: &ferrofin_db::entities::users::UserEntity,
+        ) -> Result<Vec<Uuid>, ServiceError> {
+            self.0.get_parentally_allowed_item_ids(ids, user).await
+        }
+        async fn get_extra_owner_ids_batch(
+            &self,
+            items: &[BaseItemEntity],
+        ) -> Result<std::collections::HashMap<Uuid, Vec<Uuid>>, ServiceError> {
+            self.0.get_extra_owner_ids_batch(items).await
+        }
+        async fn item_exists(&self, id: Uuid) -> Result<bool, ServiceError> {
+            self.0.item_exists(id).await
+        }
+        async fn get_item_images(
+            &self,
+            item_id: Uuid,
+        ) -> Result<Vec<ferrofin_traits::options::ItemImageInfo>, ServiceError> {
+            self.0.get_item_images(item_id).await
+        }
+        async fn get_item_images_to_serve(
+            &self,
+            item_id: Uuid,
+        ) -> Result<ferrofin_traits::options::ItemImagesToServe, ServiceError> {
+            self.0.get_item_images_to_serve(item_id).await
+        }
+        async fn get_chapter_image(
+            &self,
+            item_id: Uuid,
+            index: i32,
+        ) -> Result<Option<ferrofin_traits::options::ItemImageInfo>, ServiceError> {
+            self.0.get_chapter_image(item_id, index).await
+        }
+        async fn swap_images(
+            &self,
+            item_id: Uuid,
+            image_type: ferrofin_model::entities::ImageType,
+            index1: i32,
+            index2: i32,
+        ) -> Result<bool, ServiceError> {
+            self.0
+                .swap_images(item_id, image_type, index1, index2)
+                .await
+        }
+        async fn get_ancestors(
+            &self,
+            item_id: Uuid,
+        ) -> Result<Option<Vec<BaseItemEntity>>, ServiceError> {
+            self.0.get_ancestors(item_id).await
+        }
+        async fn get_user_root_folder(&self) -> Result<Option<BaseItemEntity>, ServiceError> {
+            self.0.get_user_root_folder().await
+        }
+        async fn get_episode_order_rows(
+            &self,
+            query: &InternalItemsQuery,
+        ) -> Result<Vec<BaseItemEntity>, ServiceError> {
+            Self::one_page(self.0.get_episode_order_rows(query).await?)
+        }
+        async fn update_item_provider_ids(
+            &self,
+            item_id: Uuid,
+            provider_ids: &[(String, String)],
+        ) -> Result<(), ServiceError> {
+            self.0.update_item_provider_ids(item_id, provider_ids).await
+        }
+        async fn update_item_rating(&self, item: BaseItemEntity) -> Result<(), ServiceError> {
+            self.0.update_item_rating(item).await
+        }
+        async fn get_locked_fields_batch(
+            &self,
+            item_ids: &[Uuid],
+        ) -> Result<
+            std::collections::HashMap<Uuid, Vec<ferrofin_model::entities::MetadataField>>,
+            ServiceError,
+        > {
+            self.0.get_locked_fields_batch(item_ids).await
+        }
+        async fn update_item_locked_fields(
+            &self,
+            item_id: Uuid,
+            field_ids: &[i32],
+        ) -> Result<(), ServiceError> {
+            self.0.update_item_locked_fields(item_id, field_ids).await
+        }
+        async fn merge_versions(&self, ids: &[Uuid]) -> Result<(), ServiceError> {
+            self.0.merge_versions(ids).await
+        }
+        async fn remove_alternate_sources(&self, item_id: Uuid) -> Result<(), ServiceError> {
+            self.0.remove_alternate_sources(item_id).await
+        }
+        async fn get_additional_parts(
+            &self,
+            video: &BaseItemEntity,
+            user: Option<&ferrofin_db::entities::users::UserEntity>,
+        ) -> Result<Vec<BaseItemEntity>, ServiceError> {
+            self.0.get_additional_parts(video, user).await
+        }
+        async fn update_people(
+            &self,
+            item: &BaseItemEntity,
+            people: &[ferrofin_db::entities::base_items::PeopleEntity],
+        ) -> Result<(), ServiceError> {
+            self.0.update_people(item, people).await
+        }
+        async fn get_people_page(
+            &self,
+            query: &ferrofin_traits::options::InternalPeopleQuery,
+        ) -> Result<
+            ferrofin_model::querying::QueryResult<ferrofin_db::entities::base_items::PeopleEntity>,
+            ServiceError,
+        > {
+            self.0.get_people_page(query).await
+        }
+        async fn get_people_batch(
+            &self,
+            item_ids: &[Uuid],
+        ) -> Result<
+            std::collections::HashMap<Uuid, Vec<ferrofin_db::entities::base_items::PeopleEntity>>,
+            ServiceError,
+        > {
+            self.0.get_people_batch(item_ids).await
+        }
+        fn empty_by_name_item(&self, kind: BaseItemKind) -> BaseItemEntity {
+            self.0.empty_by_name_item(kind)
+        }
+        async fn find_named_item(
+            &self,
+            kind: BaseItemKind,
+            name: &str,
+        ) -> Result<Option<BaseItemEntity>, ServiceError> {
+            self.0.find_named_item(kind, name).await
+        }
+        async fn get_named_item(
+            &self,
+            kind: BaseItemKind,
+            name: &str,
+        ) -> Result<Option<BaseItemEntity>, ServiceError> {
+            self.0.get_named_item(kind, name).await
+        }
+        async fn get_people_items(
+            &self,
+            query: &ferrofin_traits::options::InternalPeopleQuery,
+        ) -> Result<ferrofin_model::querying::QueryResult<BaseItemEntity>, ServiceError> {
+            self.0.get_people_items(query).await
+        }
+        async fn get_named_items(
+            &self,
+            kind: BaseItemKind,
+            names: &[String],
+        ) -> Result<Vec<Option<BaseItemEntity>>, ServiceError> {
+            self.0.get_named_items(kind, names).await
+        }
+        async fn get_named_item_ids(
+            &self,
+            kind: BaseItemKind,
+            names: &[String],
+        ) -> Result<Vec<Option<Uuid>>, ServiceError> {
+            self.0.get_named_item_ids(kind, names).await
+        }
+        async fn get_years(
+            &self,
+            query: &InternalItemsQuery,
+        ) -> Result<ferrofin_model::querying::QueryResult<BaseItemEntity>, ServiceError> {
+            self.0.get_years(query).await
+        }
+        async fn get_distinct_years(
+            &self,
+            query: &InternalItemsQuery,
+        ) -> Result<Vec<i32>, ServiceError> {
+            self.0.get_distinct_years(query).await
+        }
+        async fn get_tag_names(
+            &self,
+            query: &InternalItemsQuery,
+        ) -> Result<Vec<String>, ServiceError> {
+            self.0.get_tag_names(query).await
+        }
+        async fn get_media_stream_languages_by_type(
+            &self,
+            stream_types: &[ferrofin_model::entities::MediaStreamType],
+            query: &InternalItemsQuery,
+        ) -> Result<
+            std::collections::HashMap<ferrofin_model::entities::MediaStreamType, Vec<String>>,
+            ServiceError,
+        > {
+            self.0
+                .get_media_stream_languages_by_type(stream_types, query)
+                .await
+        }
+        async fn queue_library_scan_with_trigger(
+            &self,
+            trigger: ferrofin_traits::library::ScanTrigger,
+        ) -> Result<(), ServiceError> {
+            self.0.queue_library_scan_with_trigger(trigger).await
+        }
+        async fn queue_library_scan_scoped(&self, library_id: Uuid) -> Result<(), ServiceError> {
+            self.0.queue_library_scan_scoped(library_id).await
+        }
+        async fn queue_refresh_scan(
+            &self,
+            target: ferrofin_traits::library::ScanTarget,
+            options: &MetadataRefreshOptions,
+        ) -> Result<(), ServiceError> {
+            self.0.queue_refresh_scan(target, options).await
+        }
+        async fn run_refresh_scan(
+            &self,
+            target: ferrofin_traits::library::ScanTarget,
+            options: &MetadataRefreshOptions,
+        ) -> Result<bool, ServiceError> {
+            self.0.run_refresh_scan(target, options).await
+        }
+        async fn run_library_scan(
+            &self,
+            trigger: ferrofin_traits::library::ScanTrigger,
+            progress: Option<ferrofin_traits::library::ScanProgressSink>,
+        ) -> Result<bool, ServiceError> {
+            self.0.run_library_scan(trigger, progress).await
+        }
+        fn is_scan_running(&self) -> bool {
+            self.0.is_scan_running()
+        }
+        async fn shutdown_scans(&self) {
+            self.0.shutdown_scans().await;
         }
     }
 
