@@ -5216,14 +5216,15 @@ impl ProviderManager for LocalProviderManager {
         //
         // The reference item decides the gate: `ItemId` set → the real row and
         // ITS library's `LibraryOptions` (its "Metadata downloaders"
-        // checkboxes decide which fetchers may run, and its `IsLocked` flag can
-        // shut them all out); `ItemId` empty → the C# builds a dummy
-        // `new TItemType()` under a fresh `new LibraryOptions()`, where every
-        // type entry is absent and therefore every fetcher enabled, so an
-        // unattached search stays unfiltered. `typeOptions` is keyed on
-        // `item.GetType().Name`, i.e. the REFERENCE item's type — which for the
-        // dummy is the searched-for kind, whose `BaseItemKind` name is the same
-        // PascalCase string the checkbox list stores.
+        // checkboxes decide which fetchers may run, and its `IsLocked` flag or
+        // its `ExtraType` can shut them all out); `ItemId` empty → the C#
+        // builds a dummy `new TItemType()` under a fresh `new
+        // LibraryOptions()`, where every type entry is absent and therefore
+        // every fetcher enabled, so an unattached search stays unfiltered.
+        // `typeOptions` is keyed on `item.GetType().Name`, i.e. the REFERENCE
+        // item's type — which for the dummy is the searched-for kind, whose
+        // `BaseItemKind` name is the same PascalCase string the checkbox list
+        // stores.
         let reference = match (&self.items, request.item_id) {
             (Some(items), id) if !id.is_nil() => items.retrieve_item(id).await?,
             _ => None,
@@ -5237,14 +5238,18 @@ impl ProviderManager for LocalProviderManager {
             None => format!("{:?}", request.item_kind),
         };
         // `CanRefreshMetadata` (`ProviderManager.cs:571`): `includeDisabled`
-        // short-circuits to true before the locked and fetcher tests, and a
-        // LOCKED reference item drops every non-local provider outright.
+        // short-circuits to true before the locked, extra and fetcher tests; a
+        // LOCKED reference item drops every non-local provider outright, and
+        // so does an extra (`ExtraType` set, `:602-605`), which has no identity
+        // of its own online — every search provider is a remote one.
         let locked = reference.as_ref().is_some_and(|e| e.is_locked);
+        let extra = reference.as_ref().is_some_and(|e| e.extra_type.is_some());
         let global = self.global_metadata_options_for(&kind);
         let channel = reference.as_ref().and_then(channel_gate);
         let can_refresh = |name: &str| {
             request.include_disabled_providers
                 || (!locked
+                    && !extra
                     && channel.unwrap_or_else(|| {
                         metadata_fetcher_enabled(library.as_ref(), global.as_ref(), &kind, name)
                     }))
@@ -10208,6 +10213,52 @@ mod tests {
         // …unless the caller explicitly asked for disabled providers.
         req.include_disabled_providers = true;
         assert_eq!(mgr.remote_search(&req).await.expect("search").len(), 1);
+    }
+
+    #[tokio::test]
+    async fn remote_search_refuses_an_extra() {
+        // v12.4 `CanRefreshMetadata`: an extra (`ExtraType` set) has no identity
+        // of its own online, so every remote provider is dropped for it.
+        let search = |extra_type: Option<i32>, include_disabled: bool| async move {
+            let library_id = Uuid::new_v4();
+            let item_id = Uuid::new_v4();
+            let mut trailer = row("Trailer", "Making Of");
+            trailer.id = item_id.to_string();
+            trailer.top_parent_id = Some(library_id.to_string());
+            trailer.owner_id = Some(Uuid::new_v4().to_string());
+            trailer.extra_type = extra_type;
+            let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+            let items = Arc::new(FakeItems {
+                rows: HashMap::from([(item_id, trailer)]),
+                seen: tx,
+            });
+            let libraries = Arc::new(FakeLibraries {
+                item_id: library_id,
+                options: ferrofin_model::configuration::LibraryOptions::default(),
+            });
+            let provider: Arc<dyn RemoteSearchProvider> = Arc::new(FakeProvider {
+                name: "The Open Movie Database".to_owned(),
+                kind: BaseItemKind::Trailer,
+                results: vec![result_with(
+                    "The Open Movie Database",
+                    &[("Imdb", "tt1")],
+                    None,
+                )],
+                fail: false,
+            });
+            let mgr = gated_manager(vec![provider], items, libraries);
+            let mut req = request(BaseItemKind::Trailer);
+            req.item_id = item_id;
+            req.include_disabled_providers = include_disabled;
+            mgr.remote_search(&req).await.expect("search").len()
+        };
+        // `ExtraType.Trailer` is 2.
+        assert_eq!(search(Some(2), false).await, 0);
+        // The same row as a plain item is searched…
+        assert_eq!(search(None, false).await, 1);
+        // …and `includeDisabled` is tested before the extra, as upstream
+        // orders it.
+        assert_eq!(search(Some(2), true).await, 1);
     }
 
     #[tokio::test]

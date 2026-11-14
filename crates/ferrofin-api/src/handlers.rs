@@ -4449,12 +4449,14 @@ pub const VERIFIED: &[Verified] = &[
                the [Required] body; to_request: AlbumInfo's AlbumArtists, ArtistProviderIds and \
                SongInfos ride along) → ferrofin-providers provider_manager.rs remote_search \
                (ProviderManager.GetRemoteSearchResults: the reference item's library options, \
-               or none for no ItemId; CanRefreshMetadata with IncludeDisabledProviders; \
-               SearchProviderName ignoring case; the configured then default order; the server's \
-               language and country for blank ones; each provider's results stamped with its \
-               name and merged by a shared provider id, ImageUrl filled; a failing provider \
-               logged and skipped. The providers run together and merge in provider order, \
-               which gives the C# loop's list) → MusicBrainzAlbumSearchProvider \
+               or none for no ItemId; CanRefreshMetadata: IncludeDisabledProviders first, then \
+               a locked item or an extra (ExtraType set) refuses every provider, then the \
+               fetcher checkboxes; SearchProviderName ignoring case; the configured then \
+               default order; the server's language and country for blank ones; each \
+               provider's results stamped with its name and merged by a shared provider id, \
+               ImageUrl filled; a failing provider logged and skipped. The providers run \
+               together and merge in provider order, which gives the C# loop's list) → \
+               MusicBrainzAlbumSearchProvider \
                (MusicBrainzAlbumProvider.GetSearchResults: album_id_or_song_id and \
                album_artist_mbid are AlbumInfoExtensions' GetReleaseId, GetReleaseGroupId and \
                GetMusicBrainzArtistId, each id through IsValidProviderId; or_failed fails the \
@@ -4466,7 +4468,7 @@ pub const VERIFIED: &[Verified] = &[
                and stops at one that fails otherwise, keeping the releases before it, as \
                GetRemoteSearchResults keeps what it added before the exception) and \
                AudioDbSearchProvider (AudioDbAlbumProvider: no results)",
-        date: "2026-11-11",
+        date: "2026-11-14",
         divergences: &[
             "The search by album and artist name drops the stray `c` the C# appends after the \
          artist phrase (`artist:\"…\"c`), a typo that adds a bare term to the lucene query.",
