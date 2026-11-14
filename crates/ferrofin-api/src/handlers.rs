@@ -986,6 +986,38 @@ pub struct VerifiedSubsystem {
 /// [`VERIFIED`]. Subsystem rows never count towards the operation parity line.
 pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
     VerifiedSubsystem {
+        key: "paging-sort",
+        upstream_file: "Jellyfin.Api/Helpers/RequestHelpers.cs",
+        upstream_method: "GetOrderBy",
+        ferrofin: "How sortBy and sortOrder pair into an order: handlers/query_parse.rs \
+                   get_order_by (no keys, no pairs; a key takes the order at its index, the \
+                   keys past the last order the first order, else Ascending) and \
+                   parse_order_by (CommaDelimitedCollectionModelBinder's single-value arm, \
+                   parse_csv_enums_lenient: split on commas with empty entries dropped, each \
+                   trimmed, a name in any case or a C# value, a token that does not convert \
+                   dropped), for /Items, /Trailers, /Years, /Artists, /Artists/AlbumArtists, \
+                   /Genres, /MusicGenres, /Items/{itemId}/ThemeSongs, ThemeVideos and \
+                   ThemeMedia and GET /LiveTv/Programs; get_order_by alone after POST \
+                   /LiveTv/Programs' JSON body and after activity_log.rs's strict binder for \
+                   /System/ActivityLog/Entries. Compared with GetOrderBy, \
+                   RequestHelpersTests.GetOrderBy_Success, CommaDelimitedCollectionModelBinder \
+                   and the GetOrderBy calls in ItemsController (TrailersController through it), \
+                   YearsController, ArtistsController, GenresController, \
+                   MusicGenresController, LibraryController, LiveTvController and \
+                   ActivityLogController at the pinned v12.4 tag. ChannelsController's call has \
+                   no counterpart: with no channel provider ported, GET \
+                   /Channels/{channelId}/Items answers 400 whatever the sort, as upstream does \
+                   after pairing. A key repeated in the query is the \
+                   shared query extractor's (crate::query), and paging (startIndex, limit) and \
+                   what each key sorts by are not part of this row.",
+        date: "2026-11-13",
+        divergences: &[
+            "A sortOrder with more entries than a non-empty sortBy has keys has the extra \
+             entries ignored; upstream's GetOrderBy indexes past the sortBy array, which \
+             throws ArgumentOutOfRangeException, and answers 400. Jellyfin bug not ported.",
+        ],
+    },
+    VerifiedSubsystem {
         key: "recording-keep-up-to",
         upstream_file: "src/Jellyfin.LiveTv/Recordings/RecordingsManager.cs",
         upstream_method: "EnforceKeepUpTo",
@@ -1919,7 +1951,7 @@ pub const VERIFIED: &[Verified] = &[
                (item_values_with_counts, item_counts_by_clean_name)",
         date: "2026-10-25",
         divergences: BY_NAME_DIVERGENCES_ARTISTS,
-        refs: &["images", "access-filtering"],
+        refs: &["images", "access-filtering", "paging-sort"],
     },
     Verified {
         method: "get",
@@ -1932,7 +1964,7 @@ pub const VERIFIED: &[Verified] = &[
                item_repository.rs get_album_artists (item_values_with_counts)",
         date: "2026-10-25",
         divergences: BY_NAME_DIVERGENCES_ARTISTS,
-        refs: &["images", "access-filtering"],
+        refs: &["images", "access-filtering", "paging-sort"],
     },
     Verified {
         method: "get",
@@ -1945,7 +1977,7 @@ pub const VERIFIED: &[Verified] = &[
                (item_values_with_counts)",
         date: "2026-10-25",
         divergences: BY_NAME_DIVERGENCES_GENRES_STUDIOS,
-        refs: &["images", "access-filtering"],
+        refs: &["images", "access-filtering", "paging-sort"],
     },
     Verified {
         method: "get",
@@ -1957,7 +1989,7 @@ pub const VERIFIED: &[Verified] = &[
                item_repository.rs get_music_genres (item_values_with_counts)",
         date: "2026-10-25",
         divergences: BY_NAME_DIVERGENCES_GENRES_STUDIOS,
-        refs: &["images", "access-filtering"],
+        refs: &["images", "access-filtering", "paging-sort"],
     },
     Verified {
         method: "get",
@@ -2865,7 +2897,7 @@ pub const VERIFIED: &[Verified] = &[
         upstream_file: "Jellyfin.Api/Controllers/LiveTvController.cs",
         upstream_method: "GetLiveTvPrograms",
         ferrofin: "handlers/live_tv.rs get_programs (ProgramsQuery::into_parts: parse_csv_uuids, \
-               parse_pipe_strings, parse_csv_enums_lenient, pair_order_by, \
+               parse_pipe_strings, parse_csv_enums_lenient, query_parse.rs parse_order_by, \
                program_dto_options; items.rs resolve_user_opt) → query_programs_inner (the \
                StartDate default order, the librarySeriesId block) → ferrofin-livetv \
                manager.rs get_programs (stored_series_timer for seriesTimerId, \
@@ -2899,9 +2931,6 @@ pub const VERIFIED: &[Verified] = &[
          score, DateCreated, PremiereDate, CommunityRating, Runtime and the rest by their \
          columns, drops Default (SortName when no key is left) and breaks ties on the sort \
          name. Fix path: gl-1688.",
-            "A sortOrder with more entries than a non-empty sortBy has keys has the extra \
-         entries ignored; upstream's GetOrderBy indexes past the sortBy array and answers \
-         500 (IndexOutOfRangeException). Jellyfin bug not ported.",
             "enableTotalRecordCount=false with a startIndex reports the page's length plus \
          startIndex as TotalRecordCount; upstream's QueryItems reads GetItemList and \
          reports the page's length. Fix path: gl-1689.",
@@ -2927,7 +2956,7 @@ pub const VERIFIED: &[Verified] = &[
          without the administrator role) bodies are Ferrofin's error shape, not upstream's. \
          Fix path: gl-666.",
         ],
-        refs: &["access-filtering", "images"],
+        refs: &["access-filtering", "images", "paging-sort"],
     },
     Verified {
         method: "post",
@@ -2935,7 +2964,7 @@ pub const VERIFIED: &[Verified] = &[
         upstream_file: "Jellyfin.Api/Controllers/LiveTvController.cs",
         upstream_method: "GetPrograms",
         ferrofin: "handlers/live_tv.rs post_programs (GetProgramsDto::into_parts, \
-               pair_order_by, program_dto_options; items.rs resolve_user_opt for a non-nil \
+               get_order_by, program_dto_options; items.rs resolve_user_opt for a non-nil \
                body UserId only) → query_programs_inner (the StartDate default order, the \
                LibrarySeriesId block) → ferrofin-livetv manager.rs get_programs \
                (stored_series_timer for SeriesTimerId, user_restrictions, program_rows_query \
@@ -2978,9 +3007,6 @@ pub const VERIFIED: &[Verified] = &[
          score, DateCreated, PremiereDate, CommunityRating, Runtime and the rest by their \
          columns, drops Default (SortName when no key is left) and breaks ties on the sort \
          name. Fix path: gl-1688.",
-            "A SortOrder with more entries than a non-empty SortBy has keys has the extra \
-         entries ignored; upstream's GetOrderBy indexes past the SortBy array and answers \
-         500 (IndexOutOfRangeException). Jellyfin bug not ported.",
             "EnableTotalRecordCount=false with a StartIndex reports the page's length plus \
          StartIndex as TotalRecordCount; upstream's QueryItems reads GetItemList and \
          reports the page's length. Fix path: gl-1689.",
@@ -3003,7 +3029,7 @@ pub const VERIFIED: &[Verified] = &[
             "The 400 (a body that does not bind) body is Ferrofin's error shape, not \
          upstream's. Fix path: gl-666.",
         ],
-        refs: &["access-filtering", "images"],
+        refs: &["access-filtering", "images", "paging-sort"],
     },
     Verified {
         method: "delete",
