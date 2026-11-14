@@ -391,7 +391,10 @@ pub struct InternalItemsQuery {
     pub linked_child_ancestor_ids: Vec<Uuid>,
     /// Restrict to items under these top-level parents.
     pub top_parent_ids: Vec<Uuid>,
-    /// The preset library views to include.
+    /// The preset library views to include. Upstream's `UserRootFolder`
+    /// copies them into a `UserViewQuery`, but nothing sets them on a query,
+    /// so they are always empty; the `/UserViews` presets travel on
+    /// [`UserViewQuery`](crate::options::UserViewQuery).
     pub preset_views: Vec<Option<CollectionType>>,
     /// Restrict to these trailer types.
     pub trailer_types: Vec<TrailerType>,
