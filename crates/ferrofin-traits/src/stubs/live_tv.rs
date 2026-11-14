@@ -543,7 +543,10 @@ pub trait LiveTvManager: Send + Sync {
     /// `M3UTunerHost.CreateMediaSourceInfo` + `Normalize`: an unopened tuner
     /// source (`RequiresOpening`/`RequiresClosing`, placeholder `Index = -1`
     /// streams, the tuner's `RequiredHttpHeaders`), which the media-source
-    /// manager then stamps with the provider-prefixed `OpenToken`.
+    /// manager then stamps with the provider-prefixed `OpenToken`. A channel
+    /// no tuner offers a source for (its tuner was deleted) gets the item's
+    /// own placeholder source instead, still to be opened
+    /// (`GetMediaSourcesInternal`'s fallback), and the open is what fails.
     ///
     /// The default reports no sources — the "no tuner configured" state.
     async fn get_channel_media_sources(
