@@ -383,6 +383,35 @@ async fn update_media_path_requires_name_and_path_info() {
     assert_eq!(bad.status(), StatusCode::BAD_REQUEST);
 }
 
+/// `"PathInfo": {}` binds as upstream's `MediaPathInfo()` does, with `Path` set to
+/// `""`, and `UpdateMediaPath` only null-checks the `PathInfo`, so the request is a
+/// 204 (gl-1206).
+#[tokio::test]
+async fn update_media_path_binds_an_empty_path_info() {
+    let (state, vf) = working_state();
+    ferrofin_traits::library::VirtualFolderManager::add_virtual_folder(
+        &*vf,
+        "Lib",
+        None,
+        &ferrofin_model::configuration::LibraryOptions::default(),
+    )
+    .await
+    .unwrap();
+    let response = create_router(state)
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/Library/VirtualFolders/Paths/Update")
+                .header("X-Emby-Token", TOKEN)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(r#"{"Name":"Lib","PathInfo":{}}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+}
+
 #[tokio::test]
 async fn remove_media_path_validates_and_removes() {
     let (state, vf) = working_state();
@@ -544,6 +573,40 @@ async fn update_library_options_without_options_is_400_and_writes_nothing() {
     )
     .await;
     assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+/// Without a `Name`, a missing, null or all-zero `Id` is a 400 that writes nothing:
+/// upstream binds a missing `Id` as `Guid.Empty`, which `GetItemById` refuses with
+/// `ArgumentException("Guid can't be empty")`, and a null one fails to bind
+/// (gl-1206).
+#[tokio::test]
+async fn update_library_options_without_an_id_is_400_and_writes_nothing() {
+    let (state, vf) = working_state();
+    ferrofin_traits::library::VirtualFolderManager::add_virtual_folder(
+        &*vf,
+        "Lib",
+        None,
+        &ferrofin_model::configuration::LibraryOptions::default(),
+    )
+    .await
+    .unwrap();
+    let router = create_router(state);
+    let before = folders(&router).await;
+    for body in [
+        r#"{"LibraryOptions":{"Enabled":false,"PathInfos":[]}}"#,
+        r#"{"Id":null,"LibraryOptions":{"Enabled":false,"PathInfos":[]}}"#,
+        r#"{"Id":"00000000-0000-0000-0000-000000000000","LibraryOptions":{"Enabled":false,"PathInfos":[]}}"#,
+        "{}",
+    ] {
+        let (status, error) = post_options_body(&router, body.to_owned()).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert_eq!(
+            error,
+            serde_json::json!({"error": "bad request: Guid can't be empty"}),
+            "{body}"
+        );
+        assert_eq!(folders(&router).await, before, "{body}");
+    }
 }
 
 /// `GET /Library/VirtualFolders` as JSON, for tests that key off the projected `ItemId`.

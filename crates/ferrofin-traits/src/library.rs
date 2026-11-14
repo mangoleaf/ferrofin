@@ -3220,7 +3220,9 @@ pub trait VirtualFolderManager: Send + Sync {
     /// (`CollectionFolder.UpdateLibraryOptions`): looks the library up by its
     /// item id, creates a shortcut for any newly-referenced media path, then
     /// persists the supplied [`LibraryOptions`] to `options.xml`. A library id
-    /// that resolves to no folder is a [`ServiceError::NotFound`].
+    /// that resolves to no folder is a [`ServiceError::NotFound`]; a new media
+    /// path that is empty or blank is a [`ServiceError::InvalidInput`], and
+    /// nothing is written.
     ///
     /// The lookup is by name here: at this filesystem seam the DB item-id of a
     /// collection folder is not modeled, so the caller resolves the id to the

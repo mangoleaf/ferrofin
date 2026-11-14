@@ -3668,11 +3668,11 @@ pub const VERIFIED: &[Verified] = &[
                no monitor restart, as upstream's) → ferrofin-core virtual_folder_manager.rs \
                update_media_path (LibraryManager.UpdateMediaPath: require_folder, load_options, \
                sync_options_to_locations for SyncLibraryOptionsToLocations, save_options, \
-               record_changed_locations; the posted PathInfo is not applied, as upstream's is not)",
-        date: "2026-11-03",
+               record_changed_locations; the posted PathInfo is not applied, as upstream's is not) \
+               → ferrofin-model configuration.rs MediaPathInfo (a missing Path binds as \"\", \
+               as MediaPathInfo() sets it)",
+        date: "2026-11-14",
         divergences: &[
-            "\"PathInfo\": {} is a 400, since MediaPathInfo binds Path without a default; upstream's \
-         MediaPathInfo() defaults Path to \"\" and the request answers 204. Fix path: gl-1206.",
             "The 400 and 404 bodies are Ferrofin's error shape, not upstream's. Fix path: gl-666.",
         ],
         refs: &[],
@@ -3716,14 +3716,16 @@ pub const VERIFIED: &[Verified] = &[
         upstream_file: "Jellyfin.Api/Controllers/LibraryStructureController.cs",
         upstream_method: "UpdateLibraryOptions",
         ferrofin: "handlers/library_structure.rs update_library_options (Name, else Id resolved \
-               against the listing's parsed ItemId; 404 for neither; then 400 for a missing or \
-               null LibraryOptions, before any write) → after_structure_change \
+               against the listing's parsed ItemId; 400 for a missing, null or all-zero Id, as \
+               GetItemById(Guid.Empty) throws; 404 for an Id naming no library; then 400 for a \
+               missing or null LibraryOptions, before any write) → after_structure_change \
                (LibraryMonitor::restart) → ferrofin-core virtual_folder_manager.rs \
-               update_library_options (CollectionFolder.UpdateLibraryOptions: create_shortcut and \
-               remove_content_type_overrides for each path not already in PathInfos, then \
-               save_options of the posted options, record_changed_locations) → \
-               library_monitor.rs restart and run",
-        date: "2026-11-03",
+               update_library_options (CollectionFolder.UpdateLibraryOptions: an empty or blank \
+               new path refused first, then create_shortcut and remove_content_type_overrides \
+               for each path not already in PathInfos, then save_options of the posted options, \
+               record_changed_locations) → library_monitor.rs restart and run; ferrofin-model \
+               configuration.rs MediaPathInfo (a missing Path binds as \"\")",
+        date: "2026-11-14",
         divergences: &[
             "The library monitor is asked to restart after the save, so an EnableRealtimeMonitor \
          toggle or a new location is watched at once; upstream's UpdateLibraryOptions does not \
@@ -3734,10 +3736,12 @@ pub const VERIFIED: &[Verified] = &[
          and before any write; upstream's request.LibraryOptions! dereference throws a \
          NullReferenceException at the same point, a 500 having written nothing. A 400 names \
          the field the client must send; a 500 says the server failed.",
-            "A body with no Id and no Name is a 404; upstream's GetItemById(Guid.Empty) throws \
-         ArgumentException, a 400. A new PathInfo with an empty Path writes an empty shortcut \
-         and answers 204; upstream's CreateShortcut throws before anything is saved, a 400. Fix \
-         path: gl-1206.",
+            "A new PathInfo whose Path is empty or blank is a 400 before any shortcut is written. \
+         Upstream also answers 400 without saving the options, but it throws inside its \
+         CreateShortcut loop (ManagedFileSystem.CreateShortcut on an empty target, \
+         RemoveContentTypeOverrides on a blank path after writing its shortcut), so the \
+         shortcuts of the new paths before it, and a blank path's own, stay in the library \
+         folder and become its locations. Jellyfin bug not ported.",
             "A Name in the body is accepted and wins over Id; UpdateLibraryOptionsDto has no Name.",
             "The 400 and 404 bodies are Ferrofin's error shape, not upstream's. Fix path: gl-666.",
         ],

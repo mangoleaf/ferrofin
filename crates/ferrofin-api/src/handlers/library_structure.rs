@@ -540,7 +540,8 @@ struct UpdateLibraryOptionsBody {
 /// **parsed** `Uuid` — comparing `id.to_string()` (hyphenated) against the
 /// projected string can never succeed. Parsing also makes the route
 /// format-agnostic the way C#'s `Guid` lookup is. `Name` is still honored when
-/// supplied; a request matching no library (by either) is a `404`.
+/// supplied; without it, a missing, null or all-zero `Id` is a `400` (upstream's
+/// `GetItemById(Guid.Empty)` throws), and an `Id` matching no library is a `404`.
 ///
 /// **Missing options.** A body without `LibraryOptions` (or with `null`) is a
 /// `400` and writes nothing. Upstream fails the same request after its lookup,
@@ -552,7 +553,7 @@ struct UpdateLibraryOptionsBody {
     request_body = UpdateLibraryOptionsBody,
     responses(
         (status = 204, description = "Library updated"),
-        (status = 400, description = "LibraryOptions missing or null"),
+        (status = 400, description = "Id empty, or LibraryOptions missing or null"),
         (status = 404, description = "Item not found")
     ),
     tag = "ferrofin"
@@ -567,9 +568,11 @@ async fn update_library_options(
     let name = if let Some(name) = body.name.filter(|n| !n.trim().is_empty()) {
         name
     } else {
+        // A missing Id binds as `Guid.Empty` upstream, which `GetItemById` refuses.
         let id = body
             .id
-            .ok_or_else(|| ApiError::NotFound("library (no Id or Name supplied)".to_owned()))?;
+            .filter(|id| !id.is_nil())
+            .ok_or_else(|| ApiError::BadRequest("Guid can't be empty".to_owned()))?;
         state
             .virtual_folders
             .get_virtual_folders()
