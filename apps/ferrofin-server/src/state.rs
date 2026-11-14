@@ -2340,6 +2340,8 @@ pub async fn build_app_state(
         .with_self_writes(Arc::clone(&self_writes_guard))
         // Each playlist change announced as `ItemAdded`/`ItemUpdated`.
         .with_item_persistence(Arc::clone(&item_persistence_service))
+        // The scan's playlist sync and deletion wait for an entry edit.
+        .with_entry_edits(item_persistence_impl.playlist_entry_edits())
         // A new playlist's folder stored as `%AppDataPath%/playlists/<name>`.
         .with_virtual_paths(virtual_paths.clone()),
     );
