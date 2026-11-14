@@ -11546,10 +11546,8 @@ mod tests {
     }
 
     /// `UserRootFolder` is not a view, so `GetChildCountSourceIds` makes it its
-    /// own source (v12.2 `DtoService.cs:750-760`). Its children are the
-    /// libraries plus the playlists plugin folder `CreateRootFolder()` parents
-    /// to it, and getting this wrong is what made `GET /Items/Root` report 3
-    /// where 10.11.8 reports 4.
+    /// own source (v12.4 `DtoService.cs:750-760`): its own rows, the
+    /// libraries.
     #[tokio::test]
     async fn child_count_is_real_for_the_user_root_folder() {
         let db = test_db().await;
@@ -11562,13 +11560,12 @@ mod tests {
             None,
         )
         .await;
-        // The children upstream's root has: the libraries plus the playlists
-        // plugin folder. (`FakeCounts` reports a fixed 4 per parent, so what is
-        // under test is that the root is counted as itself, not the sum.)
+        // The root's own rows, its libraries. (`FakeCounts` reports a fixed 4
+        // per parent, so what is under test is that the root is counted as
+        // itself, not the sum.)
         for (kind, name) in [
             (BaseItemKind::CollectionFolder, "Movies"),
             (BaseItemKind::CollectionFolder, "Shows"),
-            (BaseItemKind::PlaylistsFolder, "Playlists"),
         ] {
             seed_folder_item(&db, Uuid::new_v4(), kind, name, Some(root)).await;
         }

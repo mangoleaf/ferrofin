@@ -718,28 +718,6 @@ kind = "type"
 issue = 666
 reason = "Jellyfin answers this error with its message as a bare JSON string; Ferrofin with an object."
 
-# The user root's ChildCount counts the playlists folder.
-[[entry]]
-request = "GetAncestors"
-path = "[].ChildCount"
-kind = "value"
-issue = 851
-reason = "The user root's ChildCount counts the playlists folder."
-
-[[entry]]
-request = "GetRootFolder"
-path = "ChildCount"
-kind = "value"
-issue = 851
-reason = "The user root's ChildCount counts the playlists folder."
-
-[[entry]]
-request = "edge-non-null-root"
-path = "ChildCount"
-kind = "value"
-issue = 851
-reason = "The user root's ChildCount counts the playlists folder."
-
 # Equal similarity scores are ordered by SortName on Ferrofin; the owner decided to order them by id, as Jellyfin returns them.
 [[entry]]
 request = "GetSimilarItems"

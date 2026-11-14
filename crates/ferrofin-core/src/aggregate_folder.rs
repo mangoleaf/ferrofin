@@ -23,8 +23,9 @@
 //! `UserRootFolder.GetEligibleChildrenForRecursiveChildren`
 //! (`UserRootFolder.cs:96-102`) concatenates
 //! `LibraryManager.RootFolder.VirtualChildren` onto its own children — the
-//! concat this crate ports in [`crate::item_repository`] (browse) and
-//! [`crate::item_count_service`] (`ChildCount`).
+//! concat this crate ports in [`crate::item_repository`] (browse). The DTO's
+//! `ChildCount` does not take it: v12.4 counts the user root's own rows
+//! (`DtoService.GetChildCount`, [`crate::item_count_service`]).
 //!
 //! Everything here runs **once**, from the composition root, never from a
 //! request path: it is a small pile of writes and existence probes, and a

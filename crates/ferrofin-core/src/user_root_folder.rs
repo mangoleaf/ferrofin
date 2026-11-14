@@ -17,8 +17,9 @@
 //! `UserRootFolder.GetEligibleChildrenForRecursiveChildren`
 //! (`UserRootFolder.cs:96-102`). Ferrofin ports that split in
 //! [`crate::aggregate_folder::AggregateFolderStore`] (provisioning) and in
-//! [`crate::item_repository`]/[`crate::item_count_service`] (the read-time
-//! concat), so this store owns the `UserRootFolder` row and nothing else.
+//! [`crate::item_repository`] (the read-time concat of a browse; the DTO's
+//! `ChildCount` counts this row's own children), so this store owns the
+//! `UserRootFolder` row and nothing else.
 //!
 //! Jellyfin renames the row from its directory name (`default`) to
 //! `Media Folders` on its first metadata refresh (`UserRootFolder.
