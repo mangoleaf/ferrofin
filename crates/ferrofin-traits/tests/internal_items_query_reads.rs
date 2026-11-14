@@ -21,11 +21,6 @@ const UNREAD: &[(&str, &str)] = &[
         "v12.2 reads `MinSortName` nowhere outside `HasFilters` either",
     ),
     (
-        "preset_views",
-        "v12.2's `UserRootFolder` copies `PresetViews` into a `UserViewQuery`, but nothing \
-         sets it on an `InternalItemsQuery`, so it is always empty there",
-    ),
-    (
         "source_types",
         "v12.2's scheduled tasks set `SourceTypes`, and nothing reads it",
     ),

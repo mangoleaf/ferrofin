@@ -1645,7 +1645,12 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
                    literal, in any case, as ASP.NET matches it), static_or_transcode and \
                    serve_static_source (the static branches of VideosController.GetVideoStream \
                    and AudioHelper.GetAudioStream: open live stream, remote source, other \
-                   protocol, file, and for video alone the disc-folder exception) and \
+                   protocol, file, and for video alone the disc-folder exception), with \
+                   static_content_type, the type a file answers with (GetMimeType(\".\" + \
+                   OutputContainer, false) ?? GetMimeType(MediaPath), the container as \
+                   StreamingHelpers.GetStreamingState sets it, compared 2026-11-13; a type \
+                   the ported MimeTypes table lacks keeps tower-http's guess from the path, \
+                   gl-1750) and \
                    handlers/hls.rs transcode_stream_fallback \
                    (FileStreamResponseHelpers.GetTranscodedFile, which answers a HEAD before \
                    ffmpeg), which the transcode branch of /Audio/{itemId}/universal also \

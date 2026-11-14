@@ -229,6 +229,8 @@ it is not all-endpoint coverage or a deep-parity score.
   plus a 30 s settle before measurements. Fixture creation and the explicit Jellyfin 12
   preparation scan remain enabled outside benchmark runs, and Ferrofin's one explicit
   library scan runs during provisioning, followed by a restart, before every measured phase.
+  These steps and checks are `gates/isolation.sh`, shared with `gates/parity/run.sh`, so the
+  two harnesses describe the same server state; only the plugin policy below differs.
 - Ferrofin runs as **core Ferrofin**, with every plugin/compiled-in extension disabled;
   WASM files in the disposable config are rejected. Installed Jellyfin plugins are also
   disabled. Jellyfin's non-uninstallable bundled providers (AudioDB, MusicBrainz, OMDb,
