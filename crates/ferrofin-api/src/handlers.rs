@@ -4597,6 +4597,45 @@ pub const VERIFIED: &[Verified] = &[
         ],
         refs: &[],
     },
+    Verified {
+        method: "post",
+        path: "/Startup/User",
+        upstream_file: "Jellyfin.Api/Controllers/StartupController.cs",
+        upstream_method: "UpdateStartupUser",
+        ferrofin: "handlers/startup.rs update_startup_user (FirstTimeSetupOrElevated, the \
+               controller's [Authorize]; JsonBody binds StartupUserDto, a missing or null Name \
+               as None) → get_first_user, NotFound()'s ProblemDetails 404 when there is none → \
+               403 when its password is neither null nor empty (Forbid) → 400 for a missing or \
+               whitespace password (IsNullOrWhiteSpace) → ferrofin-core user_manager.rs \
+               update_user (UpdateUserAsync) → rename_user (RenameUser, announcing \
+               UserUpdated) only when the sent name differs from the stored one under \
+               ferrofin-util string_extensions.rs equals_invariant_ignore_case \
+               (InvariantCultureIgnoreCase) → change_password (ChangePassword) → 204",
+        date: "2026-11-14",
+        divergences: &[
+            "The 403 (a password already set), 400 (no password, or a name the rename refuses \
+         as invalid or taken) and, once the wizard is complete, 401 (no or bad token) and 403 \
+         (not an administrator) bodies are Ferrofin's error shape, where upstream sends an \
+         empty 401 and 403, the JSON string \"Password must not be empty\", and its exception \
+         middleware's text/plain \"Error processing request.\" for the rename's 400. Fix \
+         path: gl-666.",
+            "A name ending in a newline (\"alice\\n\") is refused as invalid. Upstream's \
+         ValidUsernameRegex ends in $, which .NET also matches before a final newline, so it \
+         saves the name. Jellyfin bug not ported.",
+            "A rename moves a profile image stored in the old name's directory to the new \
+         name's directory, and a move that fails answers 500 and rolls the rename back. \
+         Upstream's RenameUser leaves the file where it is, and a later user given the old \
+         name then overwrites the renamed user's image. Jellyfin bug not ported.",
+            "Setting the password writes no UserPasswordChanged activity entry, where \
+         ChangePassword publishes UserPasswordChangedEventArgs. Fix path: gl-1602.",
+            "The save ahead of the rename bumps Users.RowVersion, where UpdateUserAsync saves \
+         the unchanged user without bumping it. Fix path: gl-1607.",
+            "Names that differ only in character width or kana type (ｂｏｂ and bob, あき \
+         and アキ) compare equal, so the stored name is kept, where .NET's ICU tailoring \
+         tells them apart and upstream renames. Fix path: gl-1793.",
+        ],
+        refs: &[],
+    },
 ];
 
 /// What `/Artists` and `/Artists/AlbumArtists` do differently from v12's
