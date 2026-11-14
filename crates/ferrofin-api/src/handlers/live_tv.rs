@@ -1818,10 +1818,11 @@ async fn create_timer(
 }
 
 /// Pushes a timer lifecycle message (`TimerCreated` / `TimerCancelled` /
-/// `SeriesTimerCreated` / `SeriesTimerCancelled`) to every signed-in session,
-/// carrying the C# `TimerEventInfo` shape (`Id` + optional `ProgramId`) — the
-/// push Jellyfin's `RecordingNotifier` sends so clients refresh their
-/// recording views. Best-effort: delivery must not fail the request.
+/// `SeriesTimerCreated` / `SeriesTimerCancelled`) to the sessions of the users
+/// holding `EnableLiveTvAccess`, carrying the C# `TimerEventInfo` shape (`Id` +
+/// optional `ProgramId`) — the push Jellyfin's `RecordingNotifier.SendMessage`
+/// sends so clients refresh their recording views. Best-effort: delivery must
+/// not fail the request.
 async fn notify_timer_event(
     state: &AppState,
     message_type: ferrofin_model::session::SessionMessageType,
@@ -1832,10 +1833,18 @@ async fn notify_timer_event(
     if let Some(program_id) = program_id {
         data["ProgramId"] = serde_json::Value::String(program_id.to_owned());
     }
-    let _ = state
+    if let Err(error) = state
         .sessions
-        .send_message_to_all_sessions(message_type, &data.to_string())
-        .await;
+        .send_message_to_sessions_with_permission(
+            ferrofin_db::enums::PermissionKind::EnableLiveTvAccess,
+            message_type,
+            &data.to_string(),
+        )
+        .await
+    {
+        // `RecordingNotifier.SendMessage` logs the failure and carries on.
+        tracing::debug!(%error, "live tv: could not push a timer event");
+    }
 }
 
 /// `POST /LiveTv/Timers/{timerId}` — update a recording timer.

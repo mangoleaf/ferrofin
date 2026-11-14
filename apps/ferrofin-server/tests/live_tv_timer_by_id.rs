@@ -43,6 +43,7 @@ struct Fixture {
     router: axum::Router,
     token: String,
     socket: ClientSocket,
+    addr: std::net::SocketAddr,
 }
 
 /// Boots the composition root with a passwordless administrator, signs them in
@@ -98,6 +99,7 @@ async fn fixture() -> Fixture {
         router,
         token,
         socket,
+        addr,
     }
 }
 
@@ -561,4 +563,128 @@ async fn the_defaults_without_a_programme_carry_no_artwork() {
     for key in PARENT_ART {
         assert!(defaults.get(key).is_none(), "{defaults}");
     }
+}
+
+/// The `MessageType` of each frame `socket` receives, up to and including the
+/// first of type `last` (10 s cap).
+async fn message_types_until(socket: &mut ClientSocket, last: &str) -> Vec<String> {
+    use futures_util::StreamExt as _;
+    let mut types = Vec::new();
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        loop {
+            let frame = socket
+                .next()
+                .await
+                .expect("a frame")
+                .expect("a readable frame");
+            let Ok(text) = frame.to_text() else { continue };
+            let Ok(json) = serde_json::from_str::<Value>(text) else {
+                continue;
+            };
+            let message_type = json["MessageType"].as_str().unwrap_or_default().to_owned();
+            let done = message_type == last;
+            types.push(message_type);
+            if done {
+                return;
+            }
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("no {last} in time: {types:?}"));
+    types
+}
+
+impl Fixture {
+    /// Creates the user `name` with Live TV access as `live_tv` says, signs
+    /// them in and returns their socket, their id and the policy saved for them.
+    async fn viewer(&self, name: &str, live_tv: bool) -> (ClientSocket, String, Value) {
+        let (status, body) = self
+            .call(
+                "POST",
+                "/Users/New",
+                Some(json!({ "Name": name, "Password": "pw" })),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let user: Value = serde_json::from_str(&body).expect("json");
+        let id = user["Id"].as_str().expect("an id").to_owned();
+        let mut policy = user["Policy"].clone();
+        assert_eq!(policy["EnableLiveTvAccess"], true, "the default grants it");
+        policy["EnableLiveTvAccess"] = json!(live_tv);
+        self.save_policy(&id, &policy).await;
+
+        let res = self
+            .router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/Users/AuthenticateByName")
+                    .header(
+                        header::AUTHORIZATION,
+                        format!(
+                            r#"MediaBrowser Client="test", Device="v", DeviceId="{name}", Version="1""#
+                        ),
+                    )
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        json!({ "Username": name, "Pw": "pw" }).to_string(),
+                    ))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(res.status(), StatusCode::OK, "{name} signs in");
+        let bytes = axum::body::to_bytes(res.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        let token = serde_json::from_slice::<Value>(&bytes).expect("json")["AccessToken"]
+            .as_str()
+            .expect("token")
+            .to_owned();
+        let (socket, _) =
+            tokio_tungstenite::connect_async(format!("ws://{}/socket?ApiKey={token}", self.addr))
+                .await
+                .expect("socket upgrades");
+        (socket, id, policy)
+    }
+
+    /// Saves `policy` for the user `id`, which pushes them `UserUpdated`.
+    async fn save_policy(&self, id: &str, policy: &Value) {
+        let (status, body) = self
+            .call("POST", &format!("/Users/{id}/Policy"), Some(policy.clone()))
+            .await;
+        assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+    }
+}
+
+/// `RecordingNotifier.SendMessage` sends the timer pushes only to the sessions
+/// of the users holding `EnableLiveTvAccess` (gl-1746): the administrator and
+/// a user with Live TV access hear a timer created and cancelled, a user kept
+/// out of Live TV hears neither.
+#[tokio::test]
+async fn timer_pushes_reach_only_the_users_with_live_tv_access() {
+    let mut f = fixture().await;
+    let (mut viewer, viewer_id, policy) = f.viewer("viewer", false).await;
+    let (mut watcher, watcher_id, watcher_policy) = f.viewer("watcher", true).await;
+    // A push each user does get: once it arrives, their socket is listening.
+    f.save_policy(&viewer_id, &policy).await;
+    message_types_until(&mut viewer, "UserUpdated").await;
+    f.save_policy(&watcher_id, &watcher_policy).await;
+    message_types_until(&mut watcher, "UserUpdated").await;
+
+    let id = f.create(json!({ "Name": "pushed" })).await;
+    let (status, body) = f
+        .call("DELETE", &format!("/LiveTv/Timers/{id}"), None)
+        .await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+    for socket in [&mut f.socket, &mut watcher] {
+        let heard = message_types_until(socket, "TimerCancelled").await;
+        assert!(heard.iter().any(|t| t == "TimerCreated"), "{heard:?}");
+    }
+
+    // Sent after the timer pushes, so any meant for the viewer came before it.
+    f.save_policy(&viewer_id, &policy).await;
+    let heard = message_types_until(&mut viewer, "UserUpdated").await;
+    assert!(!heard.iter().any(|t| t.contains("Timer")), "{heard:?}");
 }

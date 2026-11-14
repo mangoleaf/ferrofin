@@ -3297,16 +3297,16 @@ pub const VERIFIED: &[Verified] = &[
                CancelTimerAsync → CancelTimerInternal(id, false, true): Cancelled and manual, \
                deleted without a SeriesTimerId, else kept; disarm_timer and cancel_recording for \
                RecordingsManager.CancelRecording) → notify_timer_event TimerCancelled only when \
-               the status was not already Cancelled (statusChanging)",
-        date: "2026-11-13",
+               the status was not already Cancelled (statusChanging), to the sessions of the \
+               users holding EnableLiveTvAccess (RecordingNotifier.SendMessage: ferrofin-core \
+               session_manager.rs send_message_to_sessions_with_permission)",
+        date: "2026-11-14",
         divergences: &[
             "TimerCancelled carries the timer's own Id, as Ferrofin's TimerCreated does. \
          Upstream's default service relays its external id for both \
          (OnEmbyTvTimerCancelled, OnEmbyTvTimerCreated), so jellyfin-web's onTimerCancelled \
          clears only a card its own TimerCreated push marked, never one rendered with the \
          programme's TimerId (cardBuilder's data-timerid). Jellyfin bug not ported.",
-            "TimerCancelled reaches every signed-in session, not only users with \
-         EnableLiveTvAccess (RecordingNotifier.SendMessage). Fix path: gl-1746.",
             "The 404 body is Ferrofin's error shape, not upstream's. Fix path: gl-666.",
         ],
         refs: &[],
