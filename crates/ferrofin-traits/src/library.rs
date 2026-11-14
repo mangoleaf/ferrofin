@@ -669,10 +669,12 @@ pub trait LibraryManager: Send + Sync {
     /// `provider_ids`.
     ///
     /// The write behind C# `ItemUpdateController.UpdateItem`'s
-    /// `item.ProviderIds = request.ProviderIds` (v10.11.8
-    /// `Jellyfin.Api/Controllers/ItemUpdateController.cs:402-410`): an
-    /// **assignment**, so a key the request omits is removed, not merged. The
-    /// caller strips empty values first, exactly as the C# does.
+    /// `item.SetProviderIds(request.ProviderIds)` (v12.4
+    /// `Jellyfin.Api/Controllers/ItemUpdateController.cs:435-438`): an
+    /// **assignment**, so a key the request omits is removed, not merged. Each
+    /// pair goes through `TrySetProviderId`: trimmed, dropped when blank, when
+    /// its name holds `=` or when the id cannot belong to its provider, and a
+    /// known provider's name stored in its canonical spelling.
     ///
     /// External ids live in their own table, not on [`BaseItemEntity`], so they
     /// cannot ride along with [`update_items`](Self::update_items) — hence a

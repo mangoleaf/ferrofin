@@ -1773,10 +1773,12 @@ async fn unchanged_save_respects_unlock() {
     );
 }
 
-/// The editor's external ids are persisted, empty values are dropped, and the
-/// write REPLACES the stored set — C# `ItemUpdateController.UpdateItem` strips
-/// empty pairs and then assigns (`item.ProviderIds = request.ProviderIds`,
-/// v10.11.8 lines 402-410), so a key the client omitted is gone afterwards.
+/// The editor's external ids are persisted and the write REPLACES the stored
+/// set — C# `ItemUpdateController.UpdateItem` assigns them
+/// (`item.SetProviderIds(request.ProviderIds)`, v12.4 lines 435-438), so a key
+/// the client omitted is gone afterwards. The handler hands the request's whole
+/// set over; the manager applies `TrySetProviderId` (trim, drop blank or
+/// invalid ids, canonical names).
 /// Before this, the handler parsed the DTO and silently dropped `ProviderIds`,
 /// which lost the id every "Identify" and every hand-typed IMDb/TVDB id.
 #[tokio::test]
@@ -1819,8 +1821,9 @@ async fn update_item_replaces_the_external_ids() {
         vec![
             ("Imdb".to_owned(), "tt0111161".to_owned()),
             ("Tmdb".to_owned(), "278".to_owned()),
+            ("Tvdb".to_owned(), String::new()),
         ],
-        "empty values are stripped; the rest are written as the whole new set"
+        "the request's set is written as the whole new set"
     );
 }
 
