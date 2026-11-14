@@ -4469,6 +4469,17 @@ pub struct LibraryScanner {
     /// shortcut: held in memory, so a restart asks each never-refreshed
     /// person once more; persist a marker if that ever costs real quota.
     biographies_asked: std::sync::Mutex<std::collections::HashSet<Uuid>>,
+    /// The profile-photo URLs [`enrich_people`](Self::enrich_people)
+    /// downloaded and got no photo from (gl-1477): not asked again by later
+    /// credits, which would otherwise ask once per item crediting the
+    /// person. Keyed by URL, so a credit with another URL still asks; the
+    /// person's own refresh and the people task's missing-image refresh do
+    /// not read it.
+    ///
+    /// shortcut: kept for the process and never pruned (one URL per person
+    /// whose photo failed); give it image_negative_cache_ttl_secs if an outage
+    /// should stop holding photos back before a restart.
+    photos_failed: std::sync::Mutex<std::collections::HashSet<String>>,
 }
 
 /// The source an album's shared cover was hashed from, with the stamp it had
@@ -4681,6 +4692,7 @@ impl LibraryScanner {
             album_cover_sources: std::sync::Mutex::new(HashMap::new()),
             swept_at_epoch: std::sync::Mutex::new(None),
             biographies_asked: std::sync::Mutex::default(),
+            photos_failed: std::sync::Mutex::default(),
         }
     }
 
@@ -12881,7 +12893,8 @@ impl LibraryScanner {
     /// touches no other image. The biography is a Ferrofin head start on the
     /// person's first refresh (upstream fetches it only there, from
     /// `PeopleValidator`), so it asks only for a person never refreshed, and
-    /// each person once per process ([`Self::biographies_asked`]).
+    /// each person once per process ([`Self::biographies_asked`]). A photo URL
+    /// that gave no photo is not asked again either ([`Self::photos_failed`]).
     ///
     /// ponytail: runs serially — a large cast makes the first scan slower, but
     /// a person already seen costs neither the network nor the writer. Batch if
@@ -12897,6 +12910,11 @@ impl LibraryScanner {
         };
         let asked = || {
             self.biographies_asked
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+        };
+        let photos_failed = || {
+            self.photos_failed
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
         };
@@ -12936,7 +12954,10 @@ impl LibraryScanner {
             let has_primary = with_primary
                 .as_ref()
                 .is_none_or(|people| people.contains(&person.id));
-            if let Some(url) = person.image_url.filter(|_| !has_primary) {
+            if let Some(url) = person
+                .image_url
+                .filter(|url| !has_primary && !photos_failed().contains(url))
+            {
                 let dir = art_dir_for(
                     &meta_root.resolve(),
                     person.id,
@@ -12948,11 +12969,14 @@ impl LibraryScanner {
                     &id,
                     vec![RemoteImage {
                         image_type: ImageType::Primary,
-                        url,
+                        url: url.clone(),
                         ..Default::default()
                     }],
                 )
                 .await;
+                if infos.is_empty() {
+                    photos_failed().insert(url);
+                }
                 // `ConvertImageToLocal` saves it through `ImageSaver`, which
                 // keeps a person's art beside its own folder.
                 let row = match &self.item_repository {

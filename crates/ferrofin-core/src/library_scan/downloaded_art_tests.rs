@@ -8,7 +8,7 @@
 //! which keeps a person's and a studio's artwork beside its own folder
 //! (gl-787).
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use ferrofin_db::entities::base_items::BaseItemEntity;
 use ferrofin_model::data::BaseItemKind;
@@ -32,14 +32,16 @@ const PNG: &[u8] = b"\x89PNG\r\n\x1a\nIMAGE";
 
 /// A profile-photo and studio-artwork host on loopback: `/png/…` answers a
 /// PNG as `image/png`, `/html/…` and Lenfilm's thumb the same bytes as
-/// `text/html`, and `thumbs.txt` the studio manifest `Mosfilm`, `Lenfilm`.
-/// Returns its base URL.
-fn spawn_image_host() -> String {
+/// `text/html`, `/missing/…` 404, and `thumbs.txt` the studio manifest
+/// `Mosfilm`, `Lenfilm`. Returns its base URL and every request line.
+fn spawn_image_host() -> (String, Arc<Mutex<Vec<String>>>) {
     use std::io::{Read as _, Write as _};
     // Images are served on loopback, which downloads refuse by default.
     ferrofin_providers::destination::test_support::allow_loopback_images();
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
     let addr = listener.local_addr().expect("addr");
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let log = Arc::clone(&requests);
     std::thread::spawn(move || {
         for stream in listener.incoming() {
             let Ok(mut s) = stream else { break };
@@ -47,6 +49,12 @@ fn spawn_image_host() -> String {
             let n = s.read(&mut buf).unwrap_or(0);
             let request = String::from_utf8_lossy(&buf[..n]).into_owned();
             let line = request.lines().next().unwrap_or_default().to_owned();
+            log.lock().expect("log").push(line.clone());
+            let status = if line.contains("/missing/") {
+                "404 Not Found"
+            } else {
+                "200 OK"
+            };
             let (content_type, body): (&str, &[u8]) = if line.contains("thumbs.txt") {
                 ("text/plain", b"Mosfilm\nLenfilm")
             } else if line.contains("/html/") || line.contains("/Lenfilm/") {
@@ -56,13 +64,13 @@ fn spawn_image_host() -> String {
             };
             let _ = write!(
                 s,
-                "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
                 body.len()
             );
             let _ = s.write_all(body);
         }
     });
-    format!("http://{addr}")
+    (format!("http://{addr}"), requests)
 }
 
 /// A scanner over an in-memory database holding one `Person` and one
@@ -77,6 +85,8 @@ struct Fixture {
     /// A studio whose thumb the host serves as `text/html`.
     refused_studio: Uuid,
     host: String,
+    /// Every request line the host answered.
+    requests: Arc<Mutex<Vec<String>>>,
 }
 
 impl Fixture {
@@ -115,6 +125,7 @@ impl Fixture {
             .save_items(&[person.clone(), studio.clone(), refused_studio.clone()])
             .await
             .expect("seed");
+        let (host, requests) = spawn_image_host();
         Self {
             persistence,
             items,
@@ -122,7 +133,8 @@ impl Fixture {
             person: Uuid::parse_str(&person.id).expect("id"),
             studio: Uuid::parse_str(&studio.id).expect("id"),
             refused_studio: Uuid::parse_str(&refused_studio.id).expect("id"),
-            host: spawn_image_host(),
+            host,
+            requests,
             tmp,
         }
     }
@@ -183,6 +195,17 @@ impl Fixture {
             image_url: Some(format!("{}{path}", self.host)),
             provider_id: None,
         }
+    }
+
+    /// How many times the host was asked for `path`.
+    fn asked(&self, path: &str) -> usize {
+        let request = format!("GET {path} ");
+        self.requests
+            .lock()
+            .expect("log")
+            .iter()
+            .filter(|line| line.starts_with(&request))
+            .count()
     }
 
     async fn images(&self, id: Uuid) -> Vec<ItemImageInfo> {
@@ -252,6 +275,32 @@ async fn a_studio_thumb_is_named_by_its_type_and_a_non_image_is_refused() {
         .expect("read")
         .expect("row");
     assert!(refused.date_last_refreshed.is_some(), "answered");
+}
+
+/// gl-1477: a profile photo that cannot be downloaded is asked for once, not
+/// again on every later save of an item crediting the person; a credit with
+/// another URL still asks.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_profile_photo_that_failed_is_not_asked_for_again() {
+    let f = Fixture::new().await;
+    let scanner = f.scanner();
+
+    for _ in 0..3 {
+        scanner
+            .enrich_people(&f.people, vec![f.credit("/missing/ada.jpg")])
+            .await;
+    }
+    assert_eq!(f.asked("/missing/ada.jpg"), 1);
+    assert_eq!(f.images(f.person).await, [], "no photo");
+
+    scanner
+        .enrich_people(&f.people, vec![f.credit("/png/ada.jpg")])
+        .await;
+    assert_eq!(
+        stored(&f.images(f.person).await, ImageType::Primary),
+        [("png".to_owned(), PNG.to_vec())],
+        "another URL still asks"
+    );
 }
 
 /// The files in `dir`, none when it does not exist.

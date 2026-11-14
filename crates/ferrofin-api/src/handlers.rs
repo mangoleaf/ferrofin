@@ -1435,8 +1435,8 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
                    MediaBrowser.Providers/Manager/ImageSaver.cs (SaveImage, \
                    GetStandardSavePath), \
                    Jellyfin.Server/Startup.cs (the NamedClient.Default handler) and \
-                   Emby.Server.Implementations/Library/LibraryManager.cs (UpdateImagesAsync, \
-                   ConvertImageToLocal)",
+                   Emby.Server.Implementations/Library/LibraryManager.cs \
+                   (SavePeopleMetadataAsync, UpdateImagesAsync, ConvertImageToLocal)",
         date: "2026-11-14",
         divergences: &[
             "Decoding and resizing run under limits upstream does not have (owner decision \
@@ -1463,6 +1463,14 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
              art-folder readers know (library_scan.rs ART_FILE_EXTENSIONS), and any other \
              image is stored as .jpg. ImageSaver.GetStandardSavePath names every type from \
              MimeTypes.ToExtension and throws for one it has no extension for.",
+            "A credited person's profile-photo URL that gave the scan no photo, whatever the \
+             failure, is not asked again by a later credit until a restart (gl-1477, decided at \
+             triage; it counts a 404, a 403 and a non-image as answers, as gl-1095 does for a \
+             remote image): the person's own refresh and the people task's missing-image \
+             refresh still ask. Upstream's SavePeopleMetadataAsync stores the URL as a remote \
+             Primary, which ConvertImageToLocal removes after a 404, a 403 or a non-image, so \
+             the next crediting save asks again, and keeps after any other HTTP or I/O \
+             failure, so no later credit asks.",
             "A remote image download refuses loopback, private, link-local, CGNAT and reserved \
              addresses, on its first request and on every redirect it follows (owner decision \
              2026-10-31, gl-1096), unless image_private_http_allow lists the host, its address \
