@@ -2299,7 +2299,7 @@ impl FerrofinLiveTvManager {
 
     /// Stores a listings provider, the configuration half of
     /// `ListingsManager.SaveListingProvider` (and of `SetChannelMapping`,
-    /// which saves without validating).
+    /// which saves without validating or dropping the cached guide).
     ///
     /// The id rule is upstream's: a posted id that matches a configured
     /// provider ignoring case replaces it, keeping the posted spelling
@@ -2341,13 +2341,6 @@ impl FerrofinLiveTvManager {
             &data,
         )
         .await?;
-
-        // `InvalidateListingsProviderCache(info.Id)`: a changed Path must not
-        // keep serving the old document.
-        if let Some(stored) = stored.as_deref().filter(|stored| *stored != id) {
-            self.xmltv.invalidate(stored).await;
-        }
-        self.xmltv.invalidate(&id).await;
         Ok(info)
     }
 
@@ -3285,6 +3278,12 @@ impl LiveTvManager for FerrofinLiveTvManager {
             }
         }
         let saved = self.store_listing_provider(info).await?;
+        // `InvalidateListingsProviderCache(info.Id)`: a changed Path must not
+        // keep serving the old document. The cache file is named by the parsed
+        // GUID, so this also drops one cached under another casing of the id.
+        if let Some(id) = saved.id.as_deref() {
+            self.xmltv.invalidate(id).await;
+        }
         self.spawn_recording_folders();
         Ok(saved)
     }
@@ -3376,7 +3375,7 @@ impl LiveTvManager for FerrofinLiveTvManager {
         provider_id: &str,
         tuner_channel_id: &str,
         provider_channel_id: &str,
-    ) -> Result<TunerChannelMapping, ServiceError> {
+    ) -> Result<Option<TunerChannelMapping>, ServiceError> {
         // Port of `ListingsManager.SetChannelMapping`. The pair list is
         // rebuilt, not upserted: every pair keyed on this tuner channel is
         // removed first, and a replacement is stored only when the two ids
@@ -3422,18 +3421,17 @@ impl LiveTvManager for FerrofinLiveTvManager {
         // configuration and the tuner lineup, exactly as the C# computes it —
         // it never depended on the refresh having finished.
 
-        tuner_channels
+        // `None` where C#'s `.First(...)` throws `InvalidOperationException`
+        // (500) for a tuner channel not in the lineup, after the refresh is
+        // queued: the caller queues it too, then answers 404.
+        Ok(tuner_channels
             .iter()
             .map(|c| tuner_channel_mapping(c, &info.channel_mappings, &epg))
             .find(|row| {
                 row.id
                     .as_deref()
                     .is_some_and(|id| eq_ordinal_ignore_case(id, tuner_channel_id))
-            })
-            // C# `.First(...)` throws `InvalidOperationException` (500) for a
-            // tuner channel that is not in the lineup; 404 is the honest answer
-            // for an id that names nothing.
-            .ok_or_else(|| ServiceError::not_found(format!("tuner channel {tuner_channel_id}")))
+            }))
     }
 
     async fn get_channels(
@@ -15406,7 +15404,8 @@ mod tests {
         let row = mgr
             .set_channel_mapping(&provider_id, &two, "one.tv")
             .await
-            .expect("map");
+            .expect("map")
+            .expect("a lineup channel");
         // The response is the RESOLVED row, not an echo of the request.
         assert_eq!(row.id.as_deref(), Some(two.as_str()));
         assert_eq!(row.name.as_deref(), Some("2 Channel Two"));
@@ -15482,12 +15481,19 @@ mod tests {
             1
         );
 
-        // A tuner channel that is not in the lineup cannot be mapped.
+        // A tuner channel that is not in the lineup has no row to answer
+        // with (the handler's 404), though its pair is stored as upstream's is.
         assert!(matches!(
             mgr.set_channel_mapping(&provider_id, "m3u_bogus", "one.tv")
                 .await,
-            Err(ServiceError::NotFound(_))
+            Ok(None)
         ));
+        assert!(
+            mgr.get_listing_providers().await.expect("p")[0]
+                .channel_mappings
+                .iter()
+                .any(|pair| pair.name.as_deref() == Some("m3u_bogus"))
+        );
         assert!(matches!(
             mgr.set_channel_mapping("nope", &two, "one.tv").await,
             Err(ServiceError::NotFound(_))
@@ -15625,7 +15631,8 @@ mod tests {
         let row = mgr
             .set_channel_mapping(&provider_id, &three, "one.tv")
             .await
-            .expect("map the new channel");
+            .expect("map the new channel")
+            .expect("a lineup channel");
         assert_eq!(row.name.as_deref(), Some("3 Channel Three"));
         assert_eq!(row.provider_channel_id.as_deref(), Some("one.tv"));
     }
@@ -15676,7 +15683,8 @@ mod tests {
         let row = mgr
             .set_channel_mapping(&provider_id, "hdhr_4.2", "one.tv")
             .await
-            .expect("map");
+            .expect("map")
+            .expect("a lineup channel");
         assert_eq!(row.id.as_deref(), Some("hdhr_4.2"));
         assert_eq!(row.provider_channel_id.as_deref(), Some("one.tv"));
 
@@ -15767,6 +15775,29 @@ mod tests {
             .await
             .expect("lineups after save");
         assert_eq!(fetcher.fetches(), 2);
+    }
+
+    /// `SetChannelMapping` saves the configuration without
+    /// `InvalidateListingsProviderCache`, so mapping a channel reads the cached
+    /// guide: no second download, and it works while the guide host is down.
+    #[tokio::test]
+    async fn a_channel_mapping_keeps_the_cached_guide() {
+        let fetcher = Arc::new(CountingFetcher::default());
+        *fetcher.body.lock().unwrap() = Some(XMLTV.to_owned());
+        let (mgr, provider) = cached_guide_manager(&fetcher).await;
+        let id = provider.id.expect("id");
+        mgr.get_channel_mapping_options(&id).await.expect("options");
+        assert_eq!(fetcher.fetches(), 1);
+
+        *fetcher.body.lock().unwrap() = None;
+        // No tuner lists the channel, so no row answers (the handler's 404),
+        // which comes only after the pair is stored and the guide's channels
+        // are read.
+        assert!(matches!(
+            mgr.set_channel_mapping(&id, "m3u_x", "one.tv").await,
+            Ok(None)
+        ));
+        assert_eq!(fetcher.fetches(), 1);
     }
 
     /// A failed download falls back to the previous document, and a remote

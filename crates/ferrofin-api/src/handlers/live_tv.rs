@@ -42,7 +42,7 @@ use ferrofin_model::entities::ImageType;
 use ferrofin_model::entities_media::{VirtualFolderInfo, libraries_holding};
 use ferrofin_model::live_tv::{
     ChannelMappingOptionsDto, GuideInfo, ItemSortBy, ListingsProviderInfo, LiveTvInfo,
-    SeriesTimerInfoDto, TimerInfoDto, TunerChannelMapping, TunerHostInfo,
+    SeriesTimerInfoDto, TimerInfoDto, TunerHostInfo,
 };
 use ferrofin_model::querying::{ItemFields, QueryResult};
 use ferrofin_traits::options::{DtoOptions, InternalItemsQuery};
@@ -52,7 +52,9 @@ use ferrofin_traits::stubs::{LiveTvChannelQuery, RecordingVisibility};
 
 use crate::auth::{RequireAdmin, RequireLiveTvAccess, RequireLiveTvManagement};
 use crate::error::ApiError;
-use crate::extract::{DotnetGuid, JsonBody, Query, RequiredRouteString, RouteParameter};
+use crate::extract::{
+    DotnetGuid, JsonBody, ProblemDetails, Query, RequiredRouteString, RouteParameter,
+};
 use crate::handlers::items::{require_visible_item, resolve_user_opt};
 use crate::handlers::query_parse::{
     get_order_by, parse_csv_enums_lenient, parse_csv_uuids, parse_order_by, parse_pipe_strings,
@@ -1664,20 +1666,54 @@ pub(crate) async fn live_stream_buffer(
 /// The `POST /LiveTv/ChannelMappings` request body.
 ///
 /// Port of `SetChannelMappingDto`: a tuner channel mapped to a listings-provider
-/// channel, for the given listings provider.
+/// channel, for the given listings provider. Each member is a `[Required]`
+/// string defaulting to `string.Empty`, so one left out or sent `null` binds as
+/// `""` and is refused by [`Self::validation`].
 #[derive(Debug, serde::Deserialize)]
 #[serde(rename_all = "PascalCase")]
 #[allow(clippy::struct_field_names)] // mirrors the vendored `SetChannelMappingDto`
 struct SetChannelMappingDto {
     /// The listings provider id the mapping belongs to.
-    #[serde(default)]
+    #[serde(
+        default,
+        deserialize_with = "ferrofin_model::json::value::null_as_default"
+    )]
     provider_id: String,
     /// The tuner channel id being mapped.
-    #[serde(default)]
+    #[serde(
+        default,
+        deserialize_with = "ferrofin_model::json::value::null_as_default"
+    )]
     tuner_channel_id: String,
     /// The provider channel id it maps to.
-    #[serde(default)]
+    #[serde(
+        default,
+        deserialize_with = "ferrofin_model::json::value::null_as_default"
+    )]
     provider_channel_id: String,
+}
+
+impl SetChannelMappingDto {
+    /// ASP.NET's model validation of the three `[Required]` members, before the
+    /// action runs: one `400` naming each that is empty or blank
+    /// (`IsNullOrWhiteSpace`), so nothing is stored.
+    fn validation(&self) -> Option<ProblemDetails> {
+        ProblemDetails::members_validation(
+            [
+                ("ProviderId", &self.provider_id),
+                ("TunerChannelId", &self.tuner_channel_id),
+                ("ProviderChannelId", &self.provider_channel_id),
+            ]
+            .into_iter()
+            .filter(|(_, value)| value.trim().is_empty())
+            .map(|(member, _)| {
+                (
+                    member.to_owned(),
+                    format!("The {member} field is required."),
+                )
+            }),
+        )
+    }
 }
 
 /// `POST /LiveTv/ChannelMappings` — map a tuner channel to a provider channel.
@@ -1685,14 +1721,18 @@ struct SetChannelMappingDto {
 /// Port of `LiveTvController.SetChannelMapping` → `ListingsManager.SetChannelMapping`:
 /// stores the `tunerChannelId -> providerChannelId` pair on the listings
 /// provider, QUEUES the guide refresh that rebuilds the listings through it, and
-/// returns that tuner channel's
-/// recomputed [`TunerChannelMapping`]. `404` when the provider id or the tuner
-/// channel id names nothing.
+/// returns that tuner channel's recomputed
+/// [`TunerChannelMapping`](ferrofin_model::live_tv::TunerChannelMapping).
+/// `400` when an id is missing or blank, `404` when the provider id or the
+/// tuner channel id names nothing.
 async fn set_channel_mapping(
     State(state): State<AppState>,
     RequireAdmin(_auth): RequireAdmin,
     JsonBody(dto): JsonBody<SetChannelMappingDto>,
-) -> Result<Json<TunerChannelMapping>, ApiError> {
+) -> Result<Response, ApiError> {
+    if let Some(problem) = dto.validation() {
+        return Ok(problem.into_response());
+    }
     let m = live_tv(&state)?;
     let mapping = m
         .set_channel_mapping(
@@ -1702,9 +1742,14 @@ async fn set_channel_mapping(
         )
         .await?;
     // The stored pair only MOVES listings once the guide is rebuilt through it,
-    // and upstream leaves that to the queued task (ListingsManager.cs:251-262).
+    // and upstream leaves that to the queued task (ListingsManager.cs:272),
+    // queued before its `.First(...)` throws for a tuner channel not in the
+    // lineup (a 500 there, the 404 here).
     queue_guide_refresh(m);
-    Ok(Json(mapping))
+    let mapping = mapping.ok_or_else(|| {
+        ServiceError::not_found(format!("tuner channel {}", dto.tuner_channel_id))
+    })?;
+    Ok(Json(mapping).into_response())
 }
 
 /// `GET /LiveTv/Recordings/Series` — series recordings (deprecated; empty).
@@ -2242,6 +2287,7 @@ mod tests {
 
     use super::*;
     use crate::test_support::fake_state;
+    use ferrofin_model::live_tv::TunerChannelMapping;
 
     /// A `RequireAuth` for an authenticated (default) caller.
     fn auth() -> RequireLiveTvAccess {
@@ -3032,7 +3078,7 @@ mod tests {
             provider_id: &str,
             tuner_channel_id: &str,
             provider_channel_id: &str,
-        ) -> Result<TunerChannelMapping, ferrofin_traits::error::ServiceError> {
+        ) -> Result<Option<TunerChannelMapping>, ferrofin_traits::error::ServiceError> {
             if self
                 .providers
                 .lock()
@@ -3047,12 +3093,13 @@ mod tests {
                 tuner_channel_id.to_owned(),
                 provider_channel_id.to_owned(),
             ));
-            Ok(TunerChannelMapping {
+            // `gone`: stored, but no lineup channel has that id.
+            Ok((tuner_channel_id != "gone").then(|| TunerChannelMapping {
                 name: Some(format!("10 {tuner_channel_id}")),
                 provider_channel_name: Some("HBO East".into()),
                 provider_channel_id: Some(provider_channel_id.to_owned()),
                 id: Some(tuner_channel_id.to_owned()),
-            })
+            }))
         }
         async fn get_schedules_direct_countries(
             &self,
@@ -3249,7 +3296,7 @@ mod tests {
     async fn set_channel_mapping_forwards_the_dto_and_returns_the_resolved_row() {
         let fake = fake_with_provider();
         let state = fake_state().with_live_tv(fake.clone());
-        let mapping = set_channel_mapping(
+        let response = set_channel_mapping(
             State(state),
             admin_auth(),
             JsonBody(SetChannelMappingDto {
@@ -3259,8 +3306,12 @@ mod tests {
             }),
         )
         .await
-        .unwrap()
-        .0;
+        .unwrap();
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        let mapping: TunerChannelMapping = serde_json::from_slice(&body).expect("json");
         // The three ids reach the manager as sent — the upsert semantics
         // themselves are `ListingsManager.SetChannelMapping`'s, tested in
         // `ferrofin-livetv`.
@@ -3407,7 +3458,7 @@ mod tests {
     #[tokio::test]
     async fn set_channel_mapping_unknown_provider_is_404() {
         let fake = std::sync::Arc::new(FakeLiveTv::default());
-        let state = fake_state().with_live_tv(fake);
+        let state = fake_state().with_live_tv(fake.clone());
         let err = set_channel_mapping(
             State(state),
             admin_auth(),
@@ -3420,6 +3471,71 @@ mod tests {
         .await
         .unwrap_err();
         assert_eq!(err.status(), axum::http::StatusCode::NOT_FOUND);
+        // Upstream's `.First(...)` throws before anything is saved or queued.
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(200),
+                fake.refresh_started.notified()
+            )
+            .await
+            .is_err(),
+            "no guide refresh for an unknown provider"
+        );
+    }
+
+    /// A tuner channel no lineup channel has: upstream stores the pair, queues
+    /// the guide refresh, and only then throws from `.First(...)` (a 500, the
+    /// 404 here), so the refresh is queued here too.
+    #[tokio::test]
+    async fn set_channel_mapping_queues_the_refresh_before_an_unknown_channels_404() {
+        let fake = fake_with_provider();
+        let state = fake_state().with_live_tv(fake.clone());
+        let err = set_channel_mapping(
+            State(state),
+            admin_auth(),
+            JsonBody(SetChannelMappingDto {
+                provider_id: "prov1".into(),
+                tuner_channel_id: "gone".into(),
+                provider_channel_id: "HBO".into(),
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.status(), axum::http::StatusCode::NOT_FOUND);
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            fake.refresh_started.notified(),
+        )
+        .await
+        .expect("the stored pair must queue a guide refresh");
+    }
+
+    /// `SetChannelMappingDto`'s three `[Required]` members: one left out, sent
+    /// `null` or blank is a `400` naming each, before anything is stored.
+    #[tokio::test]
+    async fn set_channel_mapping_requires_the_three_ids() {
+        let fake = fake_with_provider();
+        let state = fake_state().with_live_tv(fake.clone());
+        let dto: SetChannelMappingDto =
+            serde_json::from_str(r#"{"TunerChannelId":" ","ProviderChannelId":null}"#)
+                .expect("binds");
+        let response = set_channel_mapping(State(state), admin_auth(), JsonBody(dto))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), axum::http::StatusCode::BAD_REQUEST);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        let problem: serde_json::Value = serde_json::from_slice(&body).expect("json");
+        assert_eq!(
+            problem["errors"],
+            serde_json::json!({
+                "ProviderChannelId": ["The ProviderChannelId field is required."],
+                "ProviderId": ["The ProviderId field is required."],
+                "TunerChannelId": ["The TunerChannelId field is required."],
+            })
+        );
+        assert_eq!(*fake.mapping_args.lock().unwrap(), None);
     }
 
     // ---- program queries carry the contract's filters --------------------
