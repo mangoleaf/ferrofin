@@ -1830,7 +1830,8 @@ pub(crate) struct UpdateImageIndexQuery {
 /// image type that does not allow multiple images (anything but Backdrop and
 /// Chapter, per C# `AllowsMultipleImages`) is a `400`; otherwise the image at
 /// `imageIndex` is swapped with the one at `newIndex` and the handler returns
-/// `204` (an out-of-range index is a faithful no-op, still `204`).
+/// `204` (an out-of-range index or a URL row is a faithful no-op, still `204`,
+/// and so is a Live TV item's file outside the internal metadata directory).
 #[utoipa::path(
     post,
     path = "/Items/{itemId}/Images/{imageType}/{imageIndex}/Index",
