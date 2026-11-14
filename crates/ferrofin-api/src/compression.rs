@@ -139,10 +139,10 @@ impl Predicate for JellyfinCompressible {
 /// gated on [`JellyfinCompressible`], so only Jellyfin's allow-listed media
 /// types are ever encoded.
 ///
-/// The router applies this to the API surface; the composition root applies it
-/// to the static `/web` bundle, which is served by a separate service. A
-/// response that already carries a `Content-Encoding` is never re-encoded, so
-/// the two never compound.
+/// [`crate::startup_layers`] applies it, with the response-time and CORS
+/// layers, to the API surface and to each router the composition root mounts
+/// beside it (the `/web` bundle, `/metrics`); nothing else should. A response
+/// that already carries a `Content-Encoding` is never re-encoded.
 #[must_use]
 pub fn compression_layer() -> CompressionLayer<JellyfinCompressible> {
     CompressionLayer::new()

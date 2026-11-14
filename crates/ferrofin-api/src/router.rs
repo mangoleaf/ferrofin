@@ -53,7 +53,6 @@ fn stub_for(method: &str) -> Option<MethodRouter<AppState>> {
 /// runtime input.
 pub fn create_router(state: AppState) -> Router {
     let health_checkers = state.health_checkers.clone();
-    let config = state.config.clone();
     let mut api: Router<AppState> = Router::new();
     for (method, path) in axum_routes() {
         // Skip the shared `501` stub for any `(method, path)` a real handler
@@ -82,66 +81,81 @@ pub fn create_router(state: AppState) -> Router {
         crate::ip_access::ip_access_layer,
     ));
 
-    let response_time_state = state.clone();
-    api.layer(middleware::from_fn_with_state(
-        state.clone(),
-        auth_context_layer,
-    ))
-    // The IP filter runs BEFORE authentication, as upstream's does: a peer the
-    // operator has excluded should not reach a login attempt at all.
-    .layer(middleware::from_fn_with_state(
-        state.clone(),
-        crate::ip_access::ip_access_layer,
-    ))
-    // Startup's localization middleware precedes authentication and captures
-    // the formatting culture inherited by metadata saves and queued refreshes.
-    .layer(middleware::from_fn_with_state(
-        state.request_culture(),
-        crate::request_culture::request_culture_layer,
-    ))
-    .with_state(state)
-    .merge(health_check)
-    .merge(health_probes)
-    .merge(spec_router())
-    // `ExceptionMiddleware`: a panic below is answered `500` instead of
-    // dropping the connection. Startup runs it outside the response-time,
-    // compression and CORS middleware, which still dress its answer (theirs
-    // apply at `OnStarting`); inside them and the request span, its `500`
-    // gets the same headers and is traced like any other.
-    .layer(middleware::from_fn(
-        crate::panic_boundary::panic_boundary_layer,
-    ))
-    // Route-templated per-request span (traces group by endpoint, not raw URL);
-    // a sampled request's `trace_id` is stamped on for log↔trace correlation.
-    // With OTLP export off the OTel context is invalid, so no `trace_id` is
-    // recorded and the layer degrades to plain per-request spans as before.
-    // `record_status` logs a 5xx nothing has logged yet, so the default
-    // `on_failure`, which logs every 5xx again, is off: for an HTTP response
-    // a 5xx status is the only failure it ever reports.
-    .layer(
-        TraceLayer::new_for_http()
-            .make_span_with(make_request_span)
-            .on_request(record_trace_id)
-            .on_response(record_status)
-            .on_failure(()),
-    )
-    // `UseCors()` with `CorsPolicyProvider`: the policy follows the live
-    // `CorsHosts` on every request.
-    .layer(middleware::from_fn_with_state(
-        config,
-        crate::cors::cors_layer,
-    ))
-    // Jellyfin's `UseResponseCompression()`. Outermost so it also covers the
-    // health and OpenAPI routes, exactly as ASP.NET's middleware covers
-    // everything mounted under the base URL. Only the allow-listed media types
-    // are touched, so images and the streaming paths are unaffected.
-    .layer(compression_layer())
-    // `ResponseTimeMiddleware` sits outside compression in Startup, so every
-    // response, health and OpenAPI included, carries `X-Response-Time-ms`.
-    .layer(middleware::from_fn_with_state(
-        response_time_state,
-        crate::response_time::response_time_layer,
-    ))
+    let outer_state = state.clone();
+    let api = api
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            auth_context_layer,
+        ))
+        // The IP filter runs BEFORE authentication, as upstream's does: a peer the
+        // operator has excluded should not reach a login attempt at all.
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            crate::ip_access::ip_access_layer,
+        ))
+        // Startup's localization middleware precedes authentication and captures
+        // the formatting culture inherited by metadata saves and queued refreshes.
+        .layer(middleware::from_fn_with_state(
+            state.request_culture(),
+            crate::request_culture::request_culture_layer,
+        ))
+        .with_state(state)
+        .merge(health_check)
+        .merge(health_probes)
+        .merge(spec_router())
+        // `ExceptionMiddleware`: a panic below is answered `500` instead of
+        // dropping the connection. Startup runs it outside the response-time,
+        // compression and CORS middleware, which still dress its answer (theirs
+        // apply at `OnStarting`); inside them and the request span, its `500`
+        // gets the same headers and is traced like any other.
+        .layer(middleware::from_fn(
+            crate::panic_boundary::panic_boundary_layer,
+        ))
+        // Route-templated per-request span (traces group by endpoint, not raw URL);
+        // a sampled request's `trace_id` is stamped on for log↔trace correlation.
+        // With OTLP export off the OTel context is invalid, so no `trace_id` is
+        // recorded and the layer degrades to plain per-request spans as before.
+        // `record_status` logs a 5xx nothing has logged yet, so the default
+        // `on_failure`, which logs every 5xx again, is off: for an HTTP response
+        // a 5xx status is the only failure it ever reports.
+        .layer(
+            TraceLayer::new_for_http()
+                .make_span_with(make_request_span)
+                .on_request(record_trace_id)
+                .on_response(record_status)
+                .on_failure(()),
+        );
+    startup_layers(api, &outer_state)
+}
+
+/// Startup's outermost middleware over `router`, in its order
+/// (`Jellyfin.Server/Startup.cs:187-193`, inside the base-URL `Map`):
+/// `ResponseTimeMiddleware`, then `UseResponseCompression`, then `UseCors`.
+///
+/// [`create_router`] puts them over the API; the composition root puts them
+/// over each router it mounts beside it (the web client, `/metrics`), since
+/// `Router::layer` wraps only the routes already present. Such a router is
+/// merged as `mounted.merge(api)`: `Router::merge` keeps the second router's
+/// default fallback, so the API router's layered fallback stays the one every
+/// unmatched path gets.
+pub fn startup_layers(router: Router, state: &AppState) -> Router {
+    router
+        // `UseCors()` with `CorsPolicyProvider`: the policy follows the live
+        // `CorsHosts` on every request.
+        .layer(middleware::from_fn_with_state(
+            state.config.clone(),
+            crate::cors::cors_layer,
+        ))
+        // Jellyfin's `UseResponseCompression()`, over everything mounted under
+        // the base URL. Only the allow-listed media types are touched, so
+        // images and the streaming paths are unaffected.
+        .layer(compression_layer())
+        // `ResponseTimeMiddleware` sits outside compression in Startup, so
+        // every response carries `X-Response-Time-ms`.
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            crate::response_time::response_time_layer,
+        ))
 }
 
 /// Whether an OTLP endpoint is configured, i.e. whether a span exporter will
