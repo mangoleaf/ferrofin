@@ -2946,16 +2946,15 @@ impl FerrofinDtoService {
         if options.contains_field(ItemFields::ParentId) {
             // `dto.ParentId = item.DisplayParentId` (`DtoService.cs:1237-1240`):
             // an episode's season (a virtual season's episode is stored under
-            // the series), a season's series, else the stored parent. An
-            // empty id is written as null.
+            // the series), a season's series, else the stored parent. The
+            // `Guid` is non-nullable, so an item with none sends `Guid.Empty`,
+            // which the serializer writes as `null`: the key is kept.
             let display_parent = match BaseItemKind::from_stored_type_name(&item.type_) {
                 Some(BaseItemKind::Episode) => item.season_id.as_deref(),
                 Some(BaseItemKind::Season) => item.series_id.as_deref(),
                 _ => item.parent_id.as_deref(),
             };
-            dto.parent_id = display_parent
-                .and_then(|s| Uuid::parse_str(s).ok())
-                .filter(|id| !id.is_nil());
+            dto.parent_id = Some(stored_id(display_parent).unwrap_or_default());
         }
         if options.contains_field(ItemFields::Path) {
             // `DtoService.GetMappedPath` (`DtoService.cs:1827`): a file-protocol
@@ -3260,14 +3259,10 @@ impl FerrofinDtoService {
             }
             dto.series_name = item.series_name.clone();
             dto.season_name = item.season_name.clone();
-            dto.season_id = item
-                .season_id
-                .as_deref()
-                .and_then(|s| Uuid::parse_str(s).ok());
-            dto.series_id = item
-                .series_id
-                .as_deref()
-                .and_then(|s| Uuid::parse_str(s).ok());
+            // `dto.SeasonId = episode.SeasonId; dto.SeriesId = episode.SeriesId`
+            // (`DtoService.cs:1531-1532`): non-nullable, so an empty one is `null`.
+            dto.season_id = Some(stored_id(item.season_id.as_deref()).unwrap_or_default());
+            dto.series_id = Some(stored_id(item.series_id.as_deref()).unwrap_or_default());
 
             // v12 DtoService.cs:1430-1464. "this block will add the series
             // poster for episodes without a poster" — ungated by fields or
@@ -3324,10 +3319,8 @@ impl FerrofinDtoService {
         // Season extras.
         if kind == BaseItemKind::Season {
             dto.series_name = item.series_name.clone();
-            dto.series_id = item
-                .series_id
-                .as_deref()
-                .and_then(|s| Uuid::parse_str(s).ok());
+            // `dto.SeriesId = season.SeriesId` (`DtoService.cs:1594`).
+            dto.series_id = Some(stored_id(item.series_id.as_deref()).unwrap_or_default());
             Self::attach_series_studio(dto, item, options, prefetched);
             // v12 DtoService.cs:1503-1516 — the series poster for seasons
             // without a poster, same shape as the episode block, and no
@@ -13253,6 +13246,74 @@ mod tests {
         assert_eq!(dto.run_time_ticks, Some(36_000_000_000));
         assert_eq!(dto.genres, Some(vec!["News".to_owned()]));
         assert_eq!(dto.tags, Some(vec!["News".to_owned()]));
+    }
+
+    /// gl-850: `dto.ParentId = item.DisplayParentId` (`DtoService.cs:1237-1240`),
+    /// `dto.SeasonId`/`SeriesId = episode.SeasonId`/`SeriesId` (`:1531-1532`) and
+    /// `dto.SeriesId = season.SeriesId` (`:1594`) assign a non-nullable `Guid`,
+    /// so an empty one is kept and `JsonNullableGuidConverter` writes it as
+    /// `null`: the key is there, valued `null`. Not requested, `ParentId` is left
+    /// out.
+    #[tokio::test]
+    async fn an_empty_parent_season_or_series_id_is_sent_as_null() {
+        let svc = service(test_db().await);
+        let row = |type_: &str| BaseItemEntity {
+            id: ferrofin_db::store::guid_to_db(Uuid::new_v4()),
+            type_: type_.to_owned(),
+            name: Some("Parentless".to_owned()),
+            ..BaseItemEntity::default()
+        };
+        let json = |dto: &BaseItemDto| serde_json::to_value(dto).expect("serialises");
+
+        let genre = row("MediaBrowser.Controller.Entities.Genre");
+        let dto = svc
+            .get_base_item_dto(&genre, &DtoOptions::default(), None, None)
+            .await
+            .unwrap();
+        assert_eq!(json(&dto).get("ParentId"), Some(&serde_json::Value::Null));
+        let without = DtoOptions {
+            fields: Vec::new(),
+            ..DtoOptions::default()
+        };
+        let dto = svc
+            .get_base_item_dto(&genre, &without, None, None)
+            .await
+            .unwrap();
+        assert_eq!(json(&dto).get("ParentId"), None, "not requested");
+
+        let episode = row("MediaBrowser.Controller.Entities.TV.Episode");
+        let dto = svc
+            .get_base_item_dto(&episode, &without, None, None)
+            .await
+            .unwrap();
+        let episode = json(&dto);
+        assert_eq!(episode.get("SeasonId"), Some(&serde_json::Value::Null));
+        assert_eq!(episode.get("SeriesId"), Some(&serde_json::Value::Null));
+
+        let season = row("MediaBrowser.Controller.Entities.TV.Season");
+        let dto = svc
+            .get_base_item_dto(&season, &without, None, None)
+            .await
+            .unwrap();
+        assert_eq!(json(&dto).get("SeriesId"), Some(&serde_json::Value::Null));
+
+        // A stored id is still sent as itself.
+        let (season_id, series_id) = (Uuid::new_v4(), Uuid::new_v4());
+        let mut episode = row("MediaBrowser.Controller.Entities.TV.Episode");
+        episode.season_id = Some(ferrofin_db::store::guid_to_db(season_id));
+        episode.series_id = Some(ferrofin_db::store::guid_to_db(series_id));
+        let parent_only = DtoOptions {
+            fields: vec![ItemFields::ParentId],
+            ..DtoOptions::default()
+        };
+        let dto = svc
+            .get_base_item_dto(&episode, &parent_only, None, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            (dto.parent_id, dto.season_id, dto.series_id),
+            (Some(season_id), Some(season_id), Some(series_id))
+        );
     }
 
     /// `BaseItem.DisplayPreferencesId` is `thisType.FullName.GetMD5()`, so it is
