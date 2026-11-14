@@ -736,8 +736,8 @@ reason = "Ferrofin compiles in TheTVDB, FanArt and OpenSubtitles (documented sco
 request = "GetSeriesRemoteSearchResults"
 path = "$"
 kind = "length"
-issue = 862
-reason = "Ferrofin compiles in TheTVDB, FanArt and OpenSubtitles (documented scope), which stock Jellyfin lacks."
+verified = "POST /Items/RemoteSearch/Series"
+reason = "Ferrofin compiles TheTVDB in (documented scope), so a series Identify also lists TheTVDB's results, which stock Jellyfin lacks."
 
 # Libraries are listed by name, not in directory-enumeration order.
 [[entry]]

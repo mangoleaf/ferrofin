@@ -4571,6 +4571,233 @@ pub const VERIFIED: &[Verified] = &[
         refs: &[],
     },
     Verified {
+        method: "post",
+        path: "/Items/RemoteSearch/Movie",
+        upstream_file: "Jellyfin.Api/Controllers/ItemLookupController.cs",
+        upstream_method: "GetMovieRemoteSearchResults",
+        ferrofin: "handlers/item_lookup.rs movie_remote_search (RequireAuth, the controller's \
+               [Authorize]; JsonBody for the [Required] body, MovieInfo adding nothing to \
+               ItemLookupInfo; to_request) → ferrofin-providers provider_manager.rs \
+               remote_search (as for MusicAlbum: ProviderManager.GetRemoteSearchResults) → \
+               TmdbSearchProvider for TmdbKind::Movie (TmdbMovieProvider.GetSearchResults, \
+               Order 1: a Tmdb id pins the title through tmdb.rs details_for_locale \
+               (GetMovieAsync: Title ?? OriginalTitle, the poster, the overview, PremiereDate \
+               and ProductionYear from the release date, the Tmdb id and the Imdb id TMDb \
+               knows), a failed lookup going on; else an Imdb, then a Tvdb id through \
+               find_by_external_id (FindByExternalIdAsync with GetImageLanguagesParam, which it \
+               passes through NormalizeLanguage once more), whose \
+               movie_results answer even when empty, a failed request going on; else the name \
+               search with Year (SearchMovieAsync, include_adult from the plugin settings), \
+               each row with its Tmdb id only) and OmdbSearchProvider for OmdbKind::Movie \
+               (OmdbItemProvider.GetSearchResults, Order 2: a non-blank Imdb id asks i= for \
+               the one record; else the name through ParseName, whose year fills a missing \
+               Year, asks s= with type=movie; each row's Title, Imdb id, ProductionYear from \
+               Year's first four characters, PremiereDate from Released, the poster unless \
+               N/A, and the lookup's IndexNumber and ParentIndexNumber)",
+        date: "2026-11-14",
+        divergences: &[
+            "A TMDb id with surrounding whitespace or a leading sign (` 603 `, `+603`) pins \
+         the title, where v12.4's TryParseTmdbId (NumberStyles.None) reads it as no id and \
+         goes on to the IMDb and TVDB ids and the name search; and a padded IMDb or TVDB id \
+         is trimmed before TMDb's /find and OMDb's i=, where v12.4 sends it as typed. Fix \
+         path: gl-1774.",
+            "A TMDb result's PremiereDate is the release date at UTC midnight; upstream's \
+         ToUniversalTime reads it as the server's local midnight, so on a host not on UTC \
+         the instant differs by the offset, and on one east of UTC a 1 January release's \
+         ProductionYear is the year before. Fix path: gl-490.",
+            "TheTVDB's movie search (jellyfin-plugin-tvdb TvdbMovieProvider.GetSearchResults) \
+         is not ported, so a movie Identify lists no TheTVDB candidates where Jellyfin with the \
+         plugin does. Fix path: gl-1405.",
+            "A TMDb title TMDb has no overview for gets no Overview member; upstream's is \
+         \"\" (TMDb's empty string, kept). Fix path: gl-1798.",
+            "A body with no SearchInfo is searched as an empty lookup (200); upstream \
+         dereferences the null SearchInfo and answers 500.",
+            "The 401 (no or bad token) body is Ferrofin's error shape, not upstream's. Fix \
+         path: gl-666.",
+        ],
+        refs: &[],
+    },
+    Verified {
+        method: "post",
+        path: "/Items/RemoteSearch/Trailer",
+        upstream_file: "Jellyfin.Api/Controllers/ItemLookupController.cs",
+        upstream_method: "GetTrailerRemoteSearchResults",
+        ferrofin: "handlers/item_lookup.rs trailer_remote_search (RequireAuth, the controller's \
+               [Authorize]; JsonBody for the [Required] body, TrailerInfo adding nothing to \
+               ItemLookupInfo; to_request) → ferrofin-providers provider_manager.rs \
+               remote_search (as for MusicAlbum: ProviderManager.GetRemoteSearchResults) → \
+               OmdbSearchProvider::for_trailers, the one trailer provider (OmdbItemProvider's \
+               IRemoteMetadataProvider<Trailer, TrailerInfo>, Order 2: GetSearchResultsInternal's \
+               `_ => \"movie\"` arm, so type=movie, the search otherwise as Movie's OMDb one)",
+        date: "2026-11-14",
+        divergences: &[
+            "A padded IMDb id is trimmed before OMDb's i=; v12.4 sends it as typed. Fix \
+         path: gl-1774.",
+            "A body with no SearchInfo is searched as an empty lookup (200); upstream \
+         dereferences the null SearchInfo and answers 500.",
+            "The 401 (no or bad token) body is Ferrofin's error shape, not upstream's. Fix \
+         path: gl-666.",
+        ],
+        refs: &[],
+    },
+    Verified {
+        method: "post",
+        path: "/Items/RemoteSearch/MusicVideo",
+        upstream_file: "Jellyfin.Api/Controllers/ItemLookupController.cs",
+        upstream_method: "GetMusicVideoRemoteSearchResults",
+        ferrofin: "handlers/item_lookup.rs music_video_remote_search (RequireAuth, the \
+               controller's [Authorize]; JsonBody for the [Required] body; to_request carries \
+               MusicVideoInfo's Artists) → ferrofin-providers provider_manager.rs \
+               remote_search (as for MusicAlbum: ProviderManager.GetRemoteSearchResults), where \
+               no registered provider supports MusicVideo, so the answer is []: v12.4 has no \
+               IRemoteSearchProvider<MusicVideoInfo>",
+        date: "2026-11-14",
+        divergences: &[
+            "A body with no SearchInfo is searched as an empty lookup (200); upstream \
+         dereferences the null SearchInfo and answers 500.",
+            "The 401 (no or bad token) body is Ferrofin's error shape, not upstream's. Fix \
+         path: gl-666.",
+        ],
+        refs: &[],
+    },
+    Verified {
+        method: "post",
+        path: "/Items/RemoteSearch/Series",
+        upstream_file: "Jellyfin.Api/Controllers/ItemLookupController.cs",
+        upstream_method: "GetSeriesRemoteSearchResults",
+        ferrofin: "handlers/item_lookup.rs series_remote_search (RequireAuth, the controller's \
+               [Authorize]; JsonBody for the [Required] body, SeriesInfo adding nothing to \
+               ItemLookupInfo; to_request) → ferrofin-providers provider_manager.rs \
+               remote_search (as for MusicAlbum: ProviderManager.GetRemoteSearchResults) → \
+               TmdbSearchProvider for TmdbKind::Series (TmdbSeriesProvider.GetSearchResults, \
+               Order 1: a Tmdb id pins the series through tmdb.rs details_for_locale \
+               (GetSeriesAsync, MapTvShowToRemoteSearchResult: Name ?? OriginalName, the \
+               poster, the overview, the Tmdb id and the Imdb and Tvdb ids from external_ids, \
+               PremiereDate and ProductionYear from the first air date), a failed lookup going \
+               on; else an Imdb, then a Tvdb id through find_by_external_id with the bare \
+               normalized language, whose tv_results answer even when empty, each row stamped \
+               with the id searched by; else the name search with no year, SearchSeriesAsync's \
+               year left at 0), OmdbSearchProvider for OmdbKind::Series (as for Movie, \
+               type=series) and the compiled-in TvdbSearchProvider (jellyfin-plugin-tvdb \
+               5c4592f TvdbSeriesProvider.GetSearchResults, no IHasOrder so 50: a Tvdb id, \
+               else an Imdb, Zap2It or Tmdb id resolved through /search/remoteid, pins the \
+               series' extended record; else tvdb.rs search, the parsed comparable name, five \
+               results ranked as FindSeriesInternal ranks them and kept within a year of Year)",
+        date: "2026-11-14",
+        divergences: &[
+            "TheTVDB's results are listed too (SearchProviderName TheTVDB, ProviderIds.Tvdb): \
+         Ferrofin compiles its remote providers in (CLAUDE.md, Current scope), where stock \
+         v12.4 lists TheTVDB only with jellyfin-plugin-tvdb installed.",
+            "TheTVDB's search differs from the plugin's: a lookup whose only id is Tmdb is \
+         resolved by that id instead of searched by name, a non-numeric or zero Tvdb id is \
+         passed over where the plugin's search fails, a remote id pins the first series among \
+         its hits where the plugin reads only the first hit, the pinned result has the \
+         record's own-language name and overview, no PremiereDate, the first poster artwork \
+         and Tmdb and Zap2It ids, and name-search hits carry an overview but no Imdb, Zap2It \
+         or Tmdb id, so none merges into TheMovieDb's row for the same show. Fix path: \
+         gl-1775.",
+            "A TMDb id with surrounding whitespace or a leading sign (` 1396 `, `+1396`) pins \
+         the series, where v12.4's TryParseTmdbId (NumberStyles.None) reads it as no id and \
+         goes on to the IMDb and TVDB ids and the name search. A padded IMDb or TVDB id is \
+         trimmed before TMDb's /find, an IMDb one before OMDb's i=, and an IMDb, Zap2It or \
+         TMDb one before TheTVDB's remote-id search, where v12.4 and the plugin send them as \
+         typed; the /find rows are stamped with the id untrimmed, where SetProviderId trims. \
+         Fix path: gl-1774.",
+            "A TMDb result's PremiereDate is the first air date at UTC midnight; upstream's \
+         ToUniversalTime reads it as the server's local midnight, so on a host not on UTC \
+         the instant differs by the offset. Fix path: gl-490.",
+            "A TMDb title TMDb has no overview for gets no Overview member; upstream's is \
+         \"\" (TMDb's empty string, kept). Fix path: gl-1798.",
+            "A body with no SearchInfo is searched as an empty lookup (200); upstream \
+         dereferences the null SearchInfo and answers 500.",
+            "The 401 (no or bad token) body is Ferrofin's error shape, not upstream's. Fix \
+         path: gl-666.",
+        ],
+        refs: &[],
+    },
+    Verified {
+        method: "post",
+        path: "/Items/RemoteSearch/BoxSet",
+        upstream_file: "Jellyfin.Api/Controllers/ItemLookupController.cs",
+        upstream_method: "GetBoxSetRemoteSearchResults",
+        ferrofin: "handlers/item_lookup.rs box_set_remote_search (RequireAuth, the controller's \
+               [Authorize]; JsonBody for the [Required] body, BoxSetInfo adding nothing to \
+               ItemLookupInfo; to_request) → ferrofin-providers provider_manager.rs \
+               remote_search (as for MusicAlbum: ProviderManager.GetRemoteSearchResults) → \
+               TmdbBoxSetSearchProvider (TmdbBoxSetProvider.GetSearchResults, no IHasOrder so \
+               50: a Tmdb id above 0 pins the collection through tmdb.rs collection \
+               (GetCollectionAsync with GetImageLanguagesParam): its Name, the poster_path \
+               poster and its Tmdb id, or nothing when TMDb has no such collection; else \
+               search_collection by name in the normalized language (SearchCollectionAsync), \
+               each row's Name, poster and Tmdb id, with no Overview)",
+        date: "2026-11-14",
+        divergences: &[
+            "A TMDb id with surrounding whitespace or a leading `+` (` 119 `, `+119`) pins \
+         the collection, and one past the 32-bit range answers nothing; v12.4's \
+         TryParseTmdbId (NumberStyles.None into an int) reads both as no id and searches by \
+         name. Fix path: gl-1774.",
+            "A body with no SearchInfo is searched as an empty lookup (200); upstream \
+         dereferences the null SearchInfo and answers 500.",
+            "The 401 (no or bad token) body is Ferrofin's error shape, not upstream's. Fix \
+         path: gl-666.",
+        ],
+        refs: &[],
+    },
+    Verified {
+        method: "post",
+        path: "/Items/RemoteSearch/Person",
+        upstream_file: "Jellyfin.Api/Controllers/ItemLookupController.cs",
+        upstream_method: "GetPersonRemoteSearchResults",
+        ferrofin: "handlers/item_lookup.rs person_remote_search (RequireAdminWithDefault: the \
+               controller's [Authorize] and the action's Policies.RequiresElevation; JsonBody \
+               for the [Required] body, PersonLookupInfo adding nothing to ItemLookupInfo; \
+               to_request) → ferrofin-providers provider_manager.rs remote_search (as for \
+               MusicAlbum: ProviderManager.GetRemoteSearchResults) → TmdbPersonSearchProvider \
+               (TmdbPersonProvider.GetSearchResults, no IHasOrder so 50: a Tmdb id pins the \
+               person through tmdb.rs person_lookup (GetPersonAsync in the normalized \
+               language: Name, Biography as Overview, the first profile image, the Tmdb id and \
+               the Imdb id TMDb knows), a failed lookup going on; else search_person by name \
+               with no language (SearchPersonAsync, include_adult from the plugin settings), \
+               each row's Name, profile image and Tmdb id)",
+        date: "2026-11-14",
+        divergences: &[
+            "A TMDb id with surrounding whitespace or a leading sign (` 31 `, `+31`) pins the \
+         person; v12.4's TryParseTmdbId (NumberStyles.None) reads it as no id and searches by \
+         name. Fix path: gl-1774.",
+            "TheTVDB's person search (jellyfin-plugin-tvdb TvdbPersonProvider.GetSearchResults) \
+         is not ported, so a person Identify lists no TheTVDB candidates where Jellyfin with \
+         the plugin does. Fix path: gl-1124.",
+            "A person TMDb has no biography for gets no Overview member; upstream's is \"\" \
+         (TMDb's empty string, kept). Fix path: gl-1798.",
+            "A body with no SearchInfo is searched as an empty lookup (200); upstream \
+         dereferences the null SearchInfo and answers 500.",
+            "The 401 (no or bad token) and 403 (not an administrator) bodies are Ferrofin's \
+         error shape, not upstream's. Fix path: gl-666.",
+        ],
+        refs: &[],
+    },
+    Verified {
+        method: "post",
+        path: "/Items/RemoteSearch/Book",
+        upstream_file: "Jellyfin.Api/Controllers/ItemLookupController.cs",
+        upstream_method: "GetBookRemoteSearchResults",
+        ferrofin: "handlers/item_lookup.rs book_remote_search (RequireAuth, the controller's \
+               [Authorize]; JsonBody for the [Required] body; to_request carries BookInfo's \
+               SeriesName) → ferrofin-providers provider_manager.rs remote_search (as for \
+               MusicAlbum: ProviderManager.GetRemoteSearchResults), where no registered \
+               provider supports Book, so the answer is []: v12.4's book providers \
+               (MediaBrowser.Providers/Books) are local readers, with no \
+               IRemoteSearchProvider<BookInfo>",
+        date: "2026-11-14",
+        divergences: &[
+            "A body with no SearchInfo is searched as an empty lookup (200); upstream \
+         dereferences the null SearchInfo and answers 500.",
+            "The 401 (no or bad token) body is Ferrofin's error shape, not upstream's. Fix \
+         path: gl-666.",
+        ],
+        refs: &[],
+    },
+    Verified {
         method: "get",
         path: "/Playback/BitrateTest",
         upstream_file: "Jellyfin.Api/Controllers/MediaInfoController.cs",
