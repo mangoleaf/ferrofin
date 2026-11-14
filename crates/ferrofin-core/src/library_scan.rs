@@ -19461,14 +19461,44 @@ fn parent_folder_name(path: &str) -> Option<String> {
         .map(str::to_owned)
 }
 
+/// Sorts an album's `tracks` into the order upstream's
+/// `GetRecursiveChildren(i => i is Audio)` walks them
+/// (`AlbumMetadataService.GetChildrenForMetadataUpdates`): depth first from
+/// the album, each level's tracks and disc folders sorted together by
+/// `SortName` (`GetCachedChildren` sets no order, so `ApplyOrder` sorts by
+/// it), a folder's tracks following the folder at once.
+///
+/// Upstream's disc folders are `Folder` rows; Ferrofin folds their tracks
+/// into the album (`plan_music_album`), so the folders between `album_path`
+/// and a track's file stand in for them, each sorting by the `SortName` a
+/// `Folder` of that name has. A track outside `album_path` sorts as a loose
+/// one. The sort is stable, so equal keys keep the order they came in.
+fn album_walk_order(album_path: Option<&str>, tracks: &mut [BaseItemEntity]) {
+    tracks.sort_by_cached_key(|track| {
+        let folders = album_path
+            .zip(track.path.as_deref())
+            .and_then(|(album, file)| Path::new(file).parent()?.strip_prefix(album).ok())
+            .into_iter()
+            .flat_map(Path::components)
+            .map(|folder| {
+                let name = folder.as_os_str().to_string_lossy().into_owned();
+                // The name keeps two folders with one `SortName` apart.
+                (
+                    crate::kinds::sort_name_for(BaseItemKind::Folder, &name),
+                    name,
+                )
+            });
+        let own = (track.sort_name.clone().unwrap_or_default(), String::new());
+        folders.chain(std::iter::once(own)).collect::<Vec<_>>()
+    });
+}
+
 /// The first track's `Album` tag, in the order `tracks` come in
 /// (`children.Select(i => i.Album).FirstOrDefault(i =>
 /// !string.IsNullOrEmpty(i))`, `AlbumMetadataService.cs:83`).
 ///
-/// The music pass loads an album's tracks in `SortName` order, which is
-/// disc and track order for numbered tracks. TODO(gl-812): upstream walks
-/// disc folders depth-first instead, which differs for unnumbered tracks in
-/// disc folders and for loose tracks beside them.
+/// The music pass hands an album's tracks over in upstream's walk order
+/// ([`album_walk_order`]).
 fn first_album_tag(tracks: &[BaseItemEntity]) -> Option<String> {
     tracks
         .iter()
@@ -29882,6 +29912,154 @@ mod tests {
             by_genre.iter().map(|r| r.id.clone()).collect::<Vec<_>>(),
             vec![ferrofin_db::store::guid_to_db(album_id)]
         );
+    }
+
+    /// [`super::album_walk_order`] over bare rows: each `(path, SortName)`
+    /// below `/m/Album`, in the order the walk must put them.
+    #[rstest::rstest]
+    // Nested folders walk depth first, and a track sorts among its level's
+    // folders by its own SortName (`x` after `extra`, `zz` after `disc …`).
+    #[case(Some("/m/Album"), &[
+        ("/m/Album/a.mp3", "a"),
+        ("/m/Album/Disc 1/Extra/b.mp3", "b"),
+        ("/m/Album/Disc 1/x.mp3", "x"),
+        ("/m/Album/Disc 2/a.mp3", "a"),
+        ("/m/Album/zz.mp3", "zz"),
+    ])]
+    // Two folders with one SortName (`CD1`, `cd1`) stay apart.
+    #[case(Some("/m/Album"), &[
+        ("/m/Album/CD1/b.mp3", "b"),
+        ("/m/Album/CD1/d.mp3", "d"),
+        ("/m/Album/cd1/a.mp3", "a"),
+        ("/m/Album/cd1/c.mp3", "c"),
+    ])]
+    // No album path, or a track outside it: sorted as loose tracks.
+    #[case(None, &[("/m/Album/Disc 2/a.mp3", "a"), ("/m/Album/Disc 1/b.mp3", "b")])]
+    #[case(Some("/m/Album"), &[
+        ("/elsewhere/Disc 9/a.mp3", "a"),
+        ("/m/Album/b.mp3", "b"),
+        ("/m/Album/Disc 1/a.mp3", "a"),
+    ])]
+    fn album_walk_order_walks_disc_folders_depth_first(
+        #[case] album_path: Option<&str>,
+        #[case] expected: &[(&str, &str)],
+    ) {
+        use ferrofin_db::entities::base_items::BaseItemEntity;
+        let row = |(path, sort): &(&str, &str)| BaseItemEntity {
+            path: Some((*path).to_owned()),
+            sort_name: Some((*sort).to_owned()),
+            ..BaseItemEntity::default()
+        };
+        let mut tracks: Vec<BaseItemEntity> = expected.iter().rev().map(row).collect();
+        super::album_walk_order(album_path, &mut tracks);
+        let got: Vec<_> = tracks.iter().map(|t| t.path.as_deref().unwrap()).collect();
+        let want: Vec<_> = expected.iter().map(|(path, _)| *path).collect();
+        assert_eq!(got, want);
+    }
+
+    /// A track of [`an_album_is_named_in_its_depth_first_track_order`]: its
+    /// path below the album, name, disc, track number and `Album` tag.
+    type AlbumTrack = (
+        &'static str,
+        &'static str,
+        Option<i64>,
+        Option<i64>,
+        &'static str,
+    );
+
+    /// `AlbumMetadataService.GetChildrenForMetadataUpdates` is
+    /// `GetRecursiveChildren(i => i is Audio)`, a depth-first walk whose every
+    /// level is sorted by `SortName` with disc folders and loose tracks
+    /// together, so the album's name is the first tag in THAT order, not in
+    /// one flat `SortName` order over every track (gl-812).
+    #[rstest::rstest]
+    // Unnumbered tracks in disc folders: all of `Disc 1` comes first, though
+    // `Disc 2`'s track sorts first by its own name.
+    #[case(&[
+        ("Disc 2/a.mp3", "a", None, None, "From Disc 2"),
+        ("Disc 1/b.mp3", "b", None, None, "From Disc 1"),
+    ], "From Disc 1")]
+    // A loose track beside a disc folder sorts by its own name against the
+    // folder's ("Bonus" before "disc 1"), not against the folder's tracks.
+    #[case(&[
+        ("Disc 1/01.mp3", "Intro", Some(1), Some(1), "From Disc 1"),
+        ("Bonus.mp3", "Bonus", None, None, "From the root"),
+    ], "From the root")]
+    #[tokio::test]
+    async fn an_album_is_named_in_its_depth_first_track_order(
+        #[case] tracks: &[AlbumTrack],
+        #[case] expected: &str,
+    ) {
+        use crate::item_persistence_service::FerrofinItemPersistenceService;
+        use crate::item_repository::FerrofinItemRepository;
+        use crate::item_type_lookup::{ItemTypeLookup, stored_type_name};
+        use crate::test_support::test_db;
+        use ferrofin_db::entities::base_items::BaseItemEntity;
+        use ferrofin_db::store::guid_to_db;
+        use ferrofin_model::data::BaseItemKind;
+        use ferrofin_traits::persistence::{ItemPersistenceService, ItemRepository};
+
+        let db = test_db().await;
+        let persistence = Arc::new(FerrofinItemPersistenceService::new(db.clone()));
+        let items: Arc<dyn ItemRepository> = Arc::new(FerrofinItemRepository::new(
+            db.clone(),
+            Arc::new(ItemTypeLookup::new()),
+        ));
+        let album_path = "/music/Artist/Album";
+        let album_id = uuid::Uuid::new_v4();
+        let mut rows = vec![BaseItemEntity {
+            id: guid_to_db(album_id),
+            type_: stored_type_name(BaseItemKind::MusicAlbum)
+                .unwrap()
+                .to_owned(),
+            name: Some("Album".into()),
+            path: Some(album_path.into()),
+            is_folder: true,
+            ..Default::default()
+        }];
+        let mut track_ids = Vec::new();
+        for (path, name, disc, track, album) in tracks {
+            let id = uuid::Uuid::new_v4();
+            track_ids.push(id);
+            rows.push(BaseItemEntity {
+                id: guid_to_db(id),
+                type_: stored_type_name(BaseItemKind::Audio).unwrap().to_owned(),
+                name: Some((*name).to_owned()),
+                path: Some(format!("{album_path}/{path}")),
+                parent_id: Some(guid_to_db(album_id)),
+                parent_index_number: *disc,
+                index_number: *track,
+                album: Some((*album).to_owned()),
+                ..Default::default()
+            });
+        }
+        persistence.save_items(&rows).await.expect("seed");
+        for id in track_ids {
+            persistence
+                .set_ancestors(id, &[album_id])
+                .await
+                .expect("ancestors");
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        let vf: Arc<dyn VirtualFolderManager> = Arc::new(
+            FerrofinVirtualFolderManager::new(tmp.path().join("default"))
+                .with_item_store(persistence.clone()),
+        );
+        LibraryScanner::new(vf, Arc::new(FerrofinFileSystem::new()), persistence)
+            .with_music(
+                Arc::new(ferrofin_providers::MusicBrainzClient::new("", "test")),
+                Arc::clone(&items),
+            )
+            .music_pass_for_test(
+                &[(album_id, super::music::MusicKind::Album)],
+                super::FetcherPolicy::default(),
+                false,
+            )
+            .await;
+
+        let album = items.retrieve_item(album_id).await.unwrap().unwrap();
+        assert_eq!(album.name.as_deref(), Some(expected));
     }
 
     /// `Audio.CreateSortName` (v10.11.8
