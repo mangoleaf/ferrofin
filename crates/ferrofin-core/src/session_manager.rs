@@ -1800,8 +1800,10 @@ impl FerrofinSessionManager {
 
     /// The `NowPlayingItem` a session shows for `playing`: a reported `Item`
     /// as sent, else the library item, built by the first call and copied by
-    /// the later ones; calls at the same moment share the one build. `None`
-    /// when the build failed.
+    /// the later ones; calls at the same moment share the one build, which
+    /// reads the item's version group once for its media-source lookup and
+    /// its DTO ([`crate::video_versions::reading_groups_once`]). `None` when
+    /// the build failed.
     async fn shown_now_playing_item(&self, playing: &NowPlayingItem) -> Option<Arc<BaseItemDto>> {
         if let Some(item) = &playing.reported {
             return Some(Arc::clone(item));
@@ -1810,9 +1812,11 @@ impl FerrofinSessionManager {
         playing
             .built
             .get_or_init(|| async {
-                self.now_playing_item(row, &playing.report)
-                    .await
-                    .map(Arc::new)
+                crate::video_versions::reading_groups_once(
+                    self.now_playing_item(row, &playing.report),
+                )
+                .await
+                .map(Arc::new)
             })
             .await
             .clone()
