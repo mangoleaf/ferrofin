@@ -426,22 +426,6 @@ impl FerrofinSystemManager {
     }
 }
 
-/// The host OS name in Jellyfin's `SystemInfo.OperatingSystem` vocabulary
-/// (`Windows` / `OSX` / `BSD` / `Linux`).
-///
-/// jellyfin-web's directory browser calls `.toLowerCase()` on this field
-/// unconditionally when opening the folder picker, so it must never be null —
-/// a `None` here throws `undefined.toLowerCase()` and the picker never opens.
-fn host_operating_system() -> &'static str {
-    match std::env::consts::OS {
-        "linux" => "Linux",
-        "macos" => "OSX",
-        "windows" => "Windows",
-        "freebsd" | "openbsd" | "netbsd" | "dragonfly" => "BSD",
-        other => other,
-    }
-}
-
 #[async_trait]
 impl ferrofin_traits::system::SystemManager for FerrofinSystemManager {
     async fn get_system_info(&self, request: &RequestContext) -> Result<SystemInfo, ServiceError> {
@@ -472,7 +456,7 @@ impl ferrofin_traits::system::SystemManager for FerrofinSystemManager {
             log_path: Some(self.paths.log_directory_path()),
             transcoding_temp_path: Some(transcode),
             cast_receiver_applications: Some(cfg.cast_receiver_applications.clone()),
-            operating_system: Some(host_operating_system().to_owned()),
+            // The obsolete members keep upstream's initialisers (`SystemInfo::default`).
             ..Default::default()
         })
     }
@@ -483,7 +467,6 @@ impl ferrofin_traits::system::SystemManager for FerrofinSystemManager {
     ) -> Result<PublicSystemInfo, ServiceError> {
         let cfg = self.configuration_manager.configuration().await?;
         let local_address = self.application_host.get_smart_api_url(request).await.ok();
-        #[allow(deprecated)]
         Ok(PublicSystemInfo {
             version: self.facts.version.clone(),
             product_name: self.facts.product_name.clone(),
@@ -491,7 +474,8 @@ impl ferrofin_traits::system::SystemManager for FerrofinSystemManager {
             server_name: Some(self.application_host.friendly_name()),
             local_address,
             startup_wizard_completed: Some(cfg.is_startup_wizard_completed),
-            operating_system: Some(host_operating_system().to_owned()),
+            // `OperatingSystem` keeps upstream's `""` (`PublicSystemInfo::default`).
+            ..Default::default()
         })
     }
 
@@ -713,6 +697,36 @@ mod tests {
         assert_eq!(info.version.as_deref(), Some("10.9.0"));
         assert_eq!(info.product_name.as_deref(), Some("Ferrofin"));
         assert_eq!(info.server_name.as_deref(), Some("test-machine"));
+    }
+
+    /// `SystemInfo.cs`/`PublicSystemInfo.cs`: the obsolete members the server
+    /// never sets go out at their initialisers, not the host's facts.
+    #[tokio::test]
+    async fn obsolete_members_keep_upstreams_fixed_values() {
+        let (mgr, _) = build().await;
+        let info = serde_json::to_value(
+            mgr.get_system_info(&RequestContext::default())
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        for (field, value) in [
+            ("OperatingSystem", serde_json::json!("")),
+            ("OperatingSystemDisplayName", serde_json::json!("")),
+            ("CanSelfRestart", serde_json::json!(true)),
+            ("CanLaunchWebBrowser", serde_json::json!(false)),
+            ("EncoderLocation", serde_json::json!("System")),
+            ("SystemArchitecture", serde_json::json!("X64")),
+        ] {
+            assert_eq!(info[field], value, "{field}");
+        }
+        let public = serde_json::to_value(
+            mgr.get_public_system_info(&RequestContext::default())
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(public["OperatingSystem"], serde_json::json!(""));
     }
 
     #[tokio::test]

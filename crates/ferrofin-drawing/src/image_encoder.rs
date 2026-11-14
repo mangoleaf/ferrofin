@@ -19,7 +19,8 @@
 //!   `ArgumentException`, `InvalidOperationException`) become
 //!   [`ServiceError`] variants: [`ServiceError::NotFound`] for a missing input,
 //!   [`ServiceError::InvalidInput`] for a bad argument/undecodable image, and
-//!   [`ServiceError::Backend`] for an I/O/encode failure.
+//!   [`ServiceError::BackendSource`] for an I/O/encode failure (a
+//!   [`DrawingError`](crate::error::DrawingError), its cause kept as the source).
 //! - `GetImageSize` returns [`ImageDimensions::default`] (`0×0`) on a zero-byte or
 //!   undecodable file, exactly like the Skia `return default;` fallbacks.
 //! - `CreateSplashscreen` builds `{DataPath}/splashscreen.png` (see
