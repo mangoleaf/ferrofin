@@ -1126,7 +1126,9 @@ pub struct FerrofinPlaylistManager {
     /// do not take it (`update_playlist` writes its shares under the guard):
     /// the re-rate after an edit saves only its rating columns, never
     /// `Data`, and every `Data` sync reads and writes in one writer
-    /// transaction, so neither can put an older `Shares` back.
+    /// transaction, so neither can put an older `Shares` back. The scan's
+    /// playlist sync and item deletion take it too
+    /// ([`Self::with_entry_edits`]).
     // ponytail: one lock for every playlist; key it by playlist if edits ever contend.
     entry_edits: Arc<tokio::sync::Mutex<()>>,
     /// Queues the playlist's refresh after its entries change
@@ -1183,6 +1185,17 @@ impl FerrofinPlaylistManager {
         virtual_paths: crate::virtual_paths::VirtualPathExpander,
     ) -> Self {
         self.virtual_paths = virtual_paths;
+        self
+    }
+
+    /// Shares the entry-edit lock with the persistence service's playlist
+    /// sync and deletion
+    /// (`FerrofinItemPersistenceService::playlist_entry_edits`), so neither
+    /// writes a playlist's entries between an edit's read and its rewrite.
+    /// Called once by the composition root.
+    #[must_use]
+    pub fn with_entry_edits(mut self, lock: Arc<tokio::sync::Mutex<()>>) -> Self {
+        self.entry_edits = lock;
         self
     }
 
@@ -5207,6 +5220,50 @@ mod tests {
             result.expect("add");
         }
         assert_eq!(rows(&db, playlist).await.len(), 9);
+    }
+
+    /// The scan's playlist sync and an item deletion wait while an entry edit
+    /// holds the lock, so neither lands between its read and its rewrite: the
+    /// rewrite would drop the scan's members, or re-insert a deleted member
+    /// and fail on its foreign key (gl-357).
+    #[tokio::test]
+    async fn playlist_sync_and_deletion_wait_for_an_entry_edit() {
+        use ferrofin_traits::persistence::ItemPersistenceService as _;
+        let db = test_db().await;
+        let (a, b) = (Uuid::new_v4(), Uuid::new_v4());
+        let (mgr, playlist, _, _root) = seeded_playlist(&db, &[a, b]).await;
+        let persistence =
+            crate::item_persistence_service::FerrofinItemPersistenceService::new(db.clone());
+        let mgr = mgr.with_entry_edits(persistence.playlist_entry_edits());
+        let edit = mgr.entry_edits.lock().await;
+        let scanned = [ferrofin_traits::persistence::ScannedPlaylist {
+            id: playlist,
+            members: Some(vec![ferrofin_traits::persistence::PlaylistMember {
+                item_id: Some(b),
+                ..Default::default()
+            }]),
+            from_file: false,
+            replace: true,
+        }];
+        let sync = persistence.sync_scanned_playlists(&scanned);
+        let gone = [a];
+        let delete = persistence.delete_items(&gone);
+        tokio::pin!(sync, delete);
+        let wait = std::time::Duration::from_millis(200);
+        assert!(
+            tokio::time::timeout(wait, &mut sync).await.is_err(),
+            "the playlist sync wrote during an entry edit"
+        );
+        assert!(
+            tokio::time::timeout(wait, &mut delete).await.is_err(),
+            "the deletion wrote during an entry edit"
+        );
+        drop(edit);
+        // Both polled: the lock goes to whichever queued first.
+        let (synced, deleted) = tokio::join!(&mut sync, &mut delete);
+        synced.expect("sync");
+        assert_eq!(deleted.expect("delete"), vec![a]);
+        assert_eq!(rows(&db, playlist).await, vec![b]);
     }
 
     /// C# `RemoveItemFromPlaylistAsync`: every occurrence of the item goes.
