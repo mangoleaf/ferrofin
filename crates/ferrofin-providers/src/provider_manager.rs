@@ -555,11 +555,9 @@ impl RemoteSearchProvider for OmdbSearchProvider {
         // that branch is unreachable until both exist.
         let is_episode = self.kind == crate::OmdbKind::Episode;
         let known = crate::OmdbSearchKey {
-            imdb_id: search_info
-                .provider_ids
-                .as_ref()
-                .and_then(|ids| ids.iter().find(|(key, _)| key.eq_ignore_ascii_case("Imdb")))
-                .map(|(_, value)| value.as_str())
+            // A blank id is no id (`string.IsNullOrWhiteSpace(imdbId)`); jellyfin-web
+            // sends "" for every id field left empty.
+            imdb_id: provider_id_of(search_info.provider_ids.as_ref(), "Imdb")
                 .filter(|_| !is_episode),
             season: is_episode
                 .then_some(search_info.parent_index_number)
@@ -6718,6 +6716,17 @@ mod tests {
         // `ResultToMetadataResult` echoes the caller's index numbers.
         assert_eq!(results[0].index_number, Some(3));
         assert_eq!(results[0].parent_index_number, Some(7));
+
+        // jellyfin-web sends every id field it shows, a blank one as "": a
+        // blank id is no id (`string.IsNullOrWhiteSpace(imdbId)`), so the
+        // name is still parsed.
+        let mut req = named_request(BaseItemKind::Trailer, "Inception (2010)");
+        req.search_info.provider_ids = Some(HashMap::from([("Imdb".to_owned(), " ".to_owned())]));
+        assert_eq!(
+            provider.get_search_results(&req).await.expect("ok").len(),
+            1,
+            "a blank Imdb id must not skip ParseName"
+        );
 
         // An explicit `Year` wins over the one in the title (C# `year ??=`).
         let mut req = named_request(BaseItemKind::Trailer, "Inception (2010)");
