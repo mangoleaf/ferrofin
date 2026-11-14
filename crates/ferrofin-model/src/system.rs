@@ -44,7 +44,7 @@ pub struct LogFile {
 }
 
 /// The public system information (unauthenticated view).
-#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize, ToSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "PascalCase")]
 pub struct PublicSystemInfo {
     /// Gets or sets the local address.
@@ -80,7 +80,7 @@ pub struct PublicSystemInfo {
 
 /// The full system information (authenticated view). Flattens
 /// [`PublicSystemInfo`].
-#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize, ToSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "PascalCase")]
 #[allow(deprecated)]
 #[allow(clippy::struct_excessive_bools)]
@@ -205,6 +205,61 @@ pub struct SystemInfo {
     pub system_architecture: Option<String>,
 }
 
+/// The initialisers of `PublicSystemInfo.cs`: the obsolete `OperatingSystem`
+/// is never set by the server and serialises as `""`.
+#[allow(deprecated)]
+impl Default for PublicSystemInfo {
+    fn default() -> Self {
+        Self {
+            local_address: None,
+            server_name: None,
+            version: None,
+            product_name: None,
+            operating_system: Some(String::new()),
+            id: None,
+            startup_wizard_completed: None,
+        }
+    }
+}
+
+/// The initialisers of `SystemInfo.cs` and its base: the obsolete members the
+/// server never sets keep these fixed values on the wire (`""`, `true`,
+/// `false`, `"System"`, `"X64"`).
+#[allow(deprecated)]
+impl Default for SystemInfo {
+    fn default() -> Self {
+        Self {
+            local_address: None,
+            server_name: None,
+            version: None,
+            product_name: None,
+            operating_system: Some(String::new()),
+            id: None,
+            startup_wizard_completed: None,
+            operating_system_display_name: Some(String::new()),
+            package_name: None,
+            has_pending_restart: false,
+            is_shutting_down: false,
+            supports_library_monitor: false,
+            web_socket_port_number: 0,
+            completed_installations: Vec::new(),
+            can_self_restart: true,
+            can_launch_web_browser: false,
+            program_data_path: None,
+            web_path: None,
+            items_by_name_path: None,
+            cache_path: None,
+            log_path: None,
+            internal_metadata_path: None,
+            transcoding_temp_path: None,
+            cast_receiver_applications: None,
+            has_update_available: false,
+            encoder_location: Some("System".to_owned()),
+            system_architecture: Some("X64".to_owned()),
+        }
+    }
+}
+
 /// Contains information about a specific folder.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "PascalCase")]
@@ -274,4 +329,28 @@ pub struct SystemStorageInfo {
 
     /// Gets or sets the storage information of all libraries.
     pub libraries: Vec<LibraryStorageInfo>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{PublicSystemInfo, SystemInfo};
+
+    /// The obsolete members go out at `SystemInfo.cs`/`PublicSystemInfo.cs`'s
+    /// initialisers.
+    #[test]
+    fn defaults_are_upstreams_initialisers() {
+        let info = serde_json::to_value(SystemInfo::default()).unwrap();
+        for (field, value) in [
+            ("OperatingSystem", serde_json::json!("")),
+            ("OperatingSystemDisplayName", serde_json::json!("")),
+            ("CanSelfRestart", serde_json::json!(true)),
+            ("CanLaunchWebBrowser", serde_json::json!(false)),
+            ("EncoderLocation", serde_json::json!("System")),
+            ("SystemArchitecture", serde_json::json!("X64")),
+        ] {
+            assert_eq!(info[field], value, "{field}");
+        }
+        let public = serde_json::to_value(PublicSystemInfo::default()).unwrap();
+        assert_eq!(public["OperatingSystem"], serde_json::json!(""));
+    }
 }

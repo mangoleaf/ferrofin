@@ -15,6 +15,7 @@
 //! | `Library/DeleteOptions` | [`DeleteOptions`] |
 //! | `Entities/ItemImageInfo` | [`ItemImageInfo`] |
 //! | `Net/AuthorizationInfo` | [`AuthorizationInfo`] |
+//! | `Model/Library/UserViewQuery` | [`UserViewQuery`] |
 //!
 //! Port rules applied throughout: C# domain `BaseItem` arguments become
 //! [`uuid::Uuid`] identities (plus an [`ItemImageInfo`] where the image row is
@@ -29,6 +30,7 @@ mod internal_items_query;
 mod internal_people_query;
 mod item_image_info;
 mod latest_items_query;
+mod user_view_query;
 
 pub use authorization_info::AuthorizationInfo;
 pub use delete_options::DeleteOptions;
@@ -40,3 +42,4 @@ pub use internal_items_query::{
 pub use internal_people_query::InternalPeopleQuery;
 pub use item_image_info::{ItemImageInfo, ItemImagesToServe, live_tv_image_is_internal};
 pub use latest_items_query::{LATEST_ITEMS_FALLBACK_LIMIT, LatestItemsQuery};
+pub use user_view_query::UserViewQuery;

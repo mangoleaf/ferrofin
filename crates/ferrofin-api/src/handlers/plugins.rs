@@ -587,6 +587,7 @@ impl RouteParameter for PackageName {
 /// Port of `PackageController.GetPackageInfo`:
 ///
 /// ```text
+/// if (IsBundledPlugin(name, assemblyGuid)) return NotFound();   // before any repository fetch
 /// var packages = await _installationManager.GetAvailablePackages();
 /// var result = _installationManager.FilterPackages(packages, name, assemblyGuid ?? default).FirstOrDefault();
 /// if (result is null) return NotFound();
@@ -656,6 +657,9 @@ struct InstallPackageQuery {
 
 /// `POST /Packages/Installed/{name}` — install a package from the configured
 /// repositories.
+///
+/// A plugin bundled with the server (`CanUninstall: false`) is a `404` before
+/// any repository is fetched (`PackageController.IsBundledPlugin`).
 ///
 /// The manager downloads, verifies (checksum + component validation), and
 /// stages the WASM plugin; it activates on the next restart

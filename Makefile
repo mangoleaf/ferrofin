@@ -50,7 +50,7 @@ publish-results:
 
 # The gates' own tests, which need no docker, server or fixtures: shellcheck, the bats tests and the
 # standard-library Python tests of every gate. CI's shell-tests job runs this target.
-GATE_SCRIPTS = gates/lib.sh gates/run gates/verify/run.sh gates/verify/lib.sh gates/verify/scan-behaviour.sh gates/bench/run.sh \
+GATE_SCRIPTS = gates/lib.sh gates/isolation.sh gates/run gates/verify/run.sh gates/verify/lib.sh gates/verify/scan-behaviour.sh gates/bench/run.sh \
 	gates/adoption/lib.sh gates/adoption/run.sh gates/adoption/smoke.sh gates/adoption/build-fixtures.sh \
 	gates/parity/lib.sh gates/parity/run.sh gates/parity/reset.sh gates/bench/testdata/build.sh
 GATE_TESTS = gates/tests gates/verify/tests gates/adoption/tests gates/parity/tests

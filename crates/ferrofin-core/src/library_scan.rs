@@ -12469,7 +12469,9 @@ impl LibraryScanner {
     ///
     /// It resolves under the series' `Tvdb` id — this scan's TVDB match, else
     /// the recorded one (TMDB's answer for the series hands its TVDB id on
-    /// to the record) — and without one there is no answer and no request.
+    /// to the record) — and without one there is no answer and no request;
+    /// neither is there when the series row cannot be read
+    /// ([`series_display_order`](Self::series_display_order)).
     /// A failed request counts as a provider failure, as upstream counts it
     /// for this provider: `TvdbSeasonProvider.GetMetadata` has no try/catch
     /// (the series and episode providers' swallow is the divergence
@@ -15157,14 +15159,19 @@ impl LibraryScanner {
 
     /// The series' stored `DisplayOrder`, as the plugin's `SeriesDisplayOrder`
     /// carries it: raw, and empty when the row has none or no repository is
-    /// attached. A failed read is counted as a failed request and answers
-    /// `None`, so the caller skips its lookup instead of guessing an order.
+    /// attached. A row that fails to read answers `None`, and the caller skips
+    /// its TheTVDB lookup rather than guess an order that could fetch the
+    /// wrong episode: upstream gives a child of a series it cannot see no
+    /// `SeriesProviderIds` (`Episode.GetLookupInfo`), and the plugin answers
+    /// that with an empty result. No failure is counted, so this read no
+    /// longer keeps the child unstamped and refreshed again on every scan; a
+    /// transient read error costs the pass's children TheTVDB's answer until
+    /// a full refresh.
     async fn series_display_order(&self, cache: &ArtworkCache, series_id: &str) -> Option<String> {
         if let Some(order) = cache.display_orders.get(series_id) {
             return Some(order.clone());
         }
         if cache.unread_parents.contains(series_id) {
-            ferrofin_providers::rate_limit::note_request_failure();
             return None;
         }
         let (Some(items), Ok(id)) = (&self.item_repository, Uuid::parse_str(series_id)) else {
@@ -15176,7 +15183,6 @@ impl LibraryScanner {
             )),
             Err(err) => {
                 tracing::warn!(%err, item_id = %series_id, "could not read series display order");
-                ferrofin_providers::rate_limit::note_request_failure();
                 None
             }
         }
@@ -24642,6 +24648,8 @@ mod person_biography_tests;
 mod person_image_tests;
 #[cfg(test)]
 mod plan_paths_tests;
+#[cfg(test)]
+mod unread_series_tests;
 
 #[cfg(test)]
 mod tests {

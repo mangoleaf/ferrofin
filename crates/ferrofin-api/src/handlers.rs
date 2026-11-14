@@ -1157,7 +1157,10 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
                    sync_season_name, remember_series_folder, locale_parent (GetParents, \
                    GetCollectionFolders, read by resolve_metadata_locale); \
                    apply_parental_rating_score and \
-                   inherit_stored_rating; keep_stored_series_key. Compared with \
+                   inherit_stored_rating; keep_stored_series_key; series_display_order \
+                   (an unread series skips its children's TheTVDB lookups, counting no \
+                   failure). Compared with \
+                   MediaBrowser.Controller/Entities/TV/Episode.cs (GetLookupInfo), \
                    MediaBrowser.Controller/LibraryTaskScheduler/\
                    LimitedConcurrencyLibraryScheduler.cs (ProcessItem), \
                    MediaBrowser.Controller/Entities/Folder.cs (RunTasks, \
@@ -1166,10 +1169,10 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
                    GetPreferredMetadataLanguage, GetPreferredMetadataCountryCode, GetParents), \
                    MediaBrowser.Providers/Manager/ProviderManager.cs (RefreshItem), \
                    MediaBrowser.Providers/Manager/MetadataService.cs (RefreshMetadata), \
-                   MediaBrowser.Controller/Entities/TV/Season.cs (FindSeriesName), \
+                   MediaBrowser.Controller/Entities/TV/Season.cs (FindSeriesName, GetLookupInfo), \
                    MediaBrowser.Controller/Entities/BaseItem.cs (GetParentalRatingScore) and \
                    MediaBrowser.Providers/TV/EpisodeMetadataService.cs (BeforeSaveInternal)",
-        date: "2026-11-09",
+        date: "2026-11-13",
         divergences: &[
             "An item whose parent chain cannot be read is scored from its own rating and \
              country, an ancestor's custom rating not counting, else takes the score stored on \
@@ -1182,6 +1185,12 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
              the server, so an override on the unreadable row or above it goes unused and the \
              child is fetched, and stamped, in that locale, where upstream's read of such a \
              row would throw into the per-child catch and the item would not refresh.",
+            "An episode, or a season whose refresh reaches its TheTVDB lookups, whose series \
+             row cannot be read is refreshed and stamped without TheTVDB's answer, as \
+             upstream treats a child with no series (GetLookupInfo sets no \
+             SeriesProviderIds, and jellyfin-plugin-tvdb 5c4592f returns an empty result), \
+             where upstream's read of such a row would throw into the per-child catch and \
+             the item would not refresh.",
             "A stored item whose refresh stops after its row was saved (a failed write, a \
              cancel, a crash) is left with no DateLastRefreshed, which the scan clears for the \
              save and writes back last, so the next scan retries it as a first refresh where \
@@ -1636,7 +1645,12 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
                    literal, in any case, as ASP.NET matches it), static_or_transcode and \
                    serve_static_source (the static branches of VideosController.GetVideoStream \
                    and AudioHelper.GetAudioStream: open live stream, remote source, other \
-                   protocol, file, and for video alone the disc-folder exception) and \
+                   protocol, file, and for video alone the disc-folder exception), with \
+                   static_content_type, the type a file answers with (GetMimeType(\".\" + \
+                   OutputContainer, false) ?? GetMimeType(MediaPath), the container as \
+                   StreamingHelpers.GetStreamingState sets it, compared 2026-11-13; a type \
+                   the ported MimeTypes table lacks keeps tower-http's guess from the path, \
+                   gl-1750) and \
                    handlers/hls.rs transcode_stream_fallback \
                    (FileStreamResponseHelpers.GetTranscodedFile, which answers a HEAD before \
                    ffmpeg), which the transcode branch of /Audio/{itemId}/universal also \
@@ -4544,6 +4558,33 @@ pub const VERIFIED: &[Verified] = &[
          dereferences the null SearchInfo and answers 500.",
             "The 401 (no or bad token) body is Ferrofin's error shape, not upstream's. Fix \
          path: gl-666.",
+        ],
+        refs: &[],
+    },
+    Verified {
+        method: "get",
+        path: "/Playback/BitrateTest",
+        upstream_file: "Jellyfin.Api/Controllers/MediaInfoController.cs",
+        upstream_method: "GetBitrateTestBytes",
+        ferrofin: "handlers/media_info.rs get_bitrate_test (RequireAuth, the controller's \
+               [Authorize]; crate::query::Query binds size case-insensitively, an empty value \
+               refused as for the non-nullable int) → size defaults to 102400 and must be in \
+               [1, 100000000] ([Range]), else 400 → size random bytes (rand::fill, \
+               Random.Shared.NextBytes) as application/octet-stream \
+               (MediaTypeNames.Application.Octet), which the response compression skips as \
+               ResponseCompressionDefaults.MimeTypes does",
+        date: "2026-11-13",
+        divergences: &[
+            "The body is exactly size bytes. Upstream sends the whole buffer it rents from \
+         ArrayPool<byte>.Shared, which is rounded up to a power of two (about 131072 bytes \
+         for the default 102400), so a client dividing the requested size by the download \
+         time under-reports its bandwidth. Jellyfin bug not ported.",
+            "Upstream returns that buffer to the pool in a finally before the File result is \
+         written, so a concurrent request can rent and overwrite it mid-response. Ferrofin's \
+         buffer belongs to its response. Jellyfin bug not ported.",
+            "The 400 for a size out of range or that does not bind (upstream's \
+         ValidationProblemDetails), and the 401 body, are Ferrofin's error shape, not \
+         upstream's. Fix path: gl-666.",
         ],
         refs: &[],
     },

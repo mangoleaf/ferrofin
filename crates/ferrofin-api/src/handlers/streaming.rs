@@ -51,6 +51,9 @@ pub(crate) struct StaticSource {
     /// The `User-Agent` the source requires (an IPTV tuner's), sent when a
     /// remote target is relayed.
     pub user_agent: Option<String>,
+    /// The source's container (`MediaSourceInfo.Container`, upstream's
+    /// `state.InputContainer`), which types a file when the request names none.
+    pub container: Option<String>,
 }
 
 /// Holds a request that names a user to that user's account and libraries,
@@ -222,6 +225,7 @@ pub(crate) async fn static_source(
         is_live_stream: source.live_stream_id.is_some(),
         is_infinite_stream: source.is_infinite_stream,
         user_agent,
+        container: source.container,
     })
 }
 
@@ -274,9 +278,9 @@ pub(crate) async fn static_or_transcode(
 /// `AudioHelper.GetAudioStream`: the `DirectStreamProvider` is read as
 /// `file.ts`, an HTTP input goes through `GetStaticRemoteStreamResult`, any
 /// other non-file protocol is `400 Input protocol … cannot be streamed
-/// statically`, and a file with `IsInfiniteStream` is a `ProgressiveFileStream`
-/// typed by `output_container` (an in-progress recording names an encoder
-/// path, so it is relayed instead).
+/// statically`, and a file, or with `IsInfiniteStream` a `ProgressiveFileStream`
+/// (an in-progress recording names an encoder path, so it is relayed instead),
+/// is typed by [`static_content_type`].
 pub(crate) async fn serve_static_source(
     state: &AppState,
     source: StaticSource,
@@ -294,10 +298,24 @@ pub(crate) async fn serve_static_source(
             Ok(crate::handlers::live_tv::progressive_response(
                 std::path::PathBuf::from(&source.path),
                 0,
-                infinite_stream_content_type(output_container, &source.path),
+                static_content_type(output_container, &source)
+                    .unwrap_or(ferrofin_model::net::mime_types::DEFAULT_MIME_TYPE),
             ))
         }
-        MediaProtocol::File => serve_static_file(&source.path, request).await,
+        MediaProtocol::File => {
+            let mut response = serve_static_file(&source.path, request).await?;
+            // `GetStaticFileResult(path, contentType)`: the type ServeFile guessed
+            // from the path gives way to the request's. A type the ported table
+            // does not know keeps that guess, nearer upstream's full MimeTypes
+            // table than `application/octet-stream` (gl-1750).
+            if let Some(value) = response.headers_mut().get_mut(header::CONTENT_TYPE)
+                && let Some(Ok(typed)) = static_content_type(output_container, &source)
+                    .map(header::HeaderValue::from_str)
+            {
+                *value = typed;
+            }
+            Ok(response)
+        }
         MediaProtocol::Http => {
             serve_remote_static(
                 &source.path,
@@ -313,14 +331,27 @@ pub(crate) async fn serve_static_source(
     }
 }
 
-/// The type of a file stream still being written: `state.GetMimeType("." +
-/// state.OutputContainer, false) ?? state.GetMimeType(state.MediaPath)`, where
-/// the container of a request naming none is `ts`, as
-/// `StreamingHelpers.GetStreamingState` sets it for an infinite source.
-fn infinite_stream_content_type(output_container: Option<&str>, path: &str) -> &'static str {
-    use ferrofin_model::net::mime_types::{get_mime_type, get_mime_type_or};
-    let container = output_container.filter(|c| !c.is_empty()).unwrap_or("ts");
-    get_mime_type_or(&format!(".{container}"), None).unwrap_or_else(|| get_mime_type(path))
+/// The type of a static file stream: `state.GetMimeType("." +
+/// state.OutputContainer, false) ?? state.GetMimeType(state.MediaPath)`. The
+/// container is the request's (the `stream.{container}` route's, else the
+/// `Container` query); naming none, it is `ts` for a live or infinite source
+/// and the source's input container otherwise, as
+/// `StreamingHelpers.GetStreamingState` sets it (its URL-extension step never
+/// fires: it takes the extension of what follows the path's last `.`).
+/// `None` when neither the container nor the path has a type in the ported
+/// table, where upstream's last resort is `application/octet-stream`.
+fn static_content_type(
+    output_container: Option<&str>,
+    source: &StaticSource,
+) -> Option<&'static str> {
+    use ferrofin_model::net::mime_types::get_mime_type_or;
+    let container = output_container
+        .filter(|c| !c.is_empty())
+        .or_else(|| (source.is_live_stream || source.is_infinite_stream).then_some("ts"))
+        .or(source.container.as_deref())
+        .unwrap_or_default();
+    get_mime_type_or(&format!(".{container}"), None)
+        .or_else(|| get_mime_type_or(&source.path, None))
 }
 
 /// The unique id of the shared buffer a live source reads, from the
