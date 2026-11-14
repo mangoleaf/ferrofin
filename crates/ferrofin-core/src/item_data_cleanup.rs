@@ -11,19 +11,23 @@
 //! attachment and subtitle caches, trickplay tiles in both locations, chapter
 //! images), then the rows. [`ItemDataCleanup`] is that cleanup, shared by the
 //! library manager's delete and the scan's removals so the two cannot drift.
+//! The scan also prunes a video whose file changed of what was extracted from
+//! the old one ([`ItemDataCleanup::prune_extracted_data`]).
 
 use std::sync::{Arc, OnceLock};
 
 use ferrofin_db::entities::base_items::BaseItemEntity;
+use ferrofin_traits::error::ServiceError;
 use ferrofin_traits::system::{ExternalDataManager, MediaLocation, ServerApplicationPaths as _};
 use uuid::Uuid;
 
 use crate::app_paths::FerrofinServerApplicationPaths;
 use crate::virtual_paths::VirtualPathExpander;
 
-/// Removes deleted items' metadata folders and extracted data. Every removal
-/// is best-effort, as upstream's: a folder that cannot be removed is logged
-/// and passed over, and the delete goes on.
+/// Removes deleted items' metadata folders and extracted data, and a changed
+/// video's extracted data. Every folder removal is best-effort, as upstream's:
+/// a folder that cannot be removed is logged and passed over, and the delete
+/// goes on.
 pub struct ItemDataCleanup {
     /// The server's directories: the internal metadata root, read at each
     /// delete (an admin can move it), whose per-item folders go.
@@ -141,18 +145,10 @@ impl ItemDataCleanup {
             let Ok(id) = Uuid::parse_str(&row.id) else {
                 continue;
             };
-            let path = if media_kept(row) {
-                String::new()
+            let (path, containing_folder) = if media_kept(row) {
+                (String::new(), String::new())
             } else {
-                row.path
-                    .as_deref()
-                    .map(|p| self.virtual_paths.expand(p))
-                    .unwrap_or_default()
-            };
-            let containing_folder = if path.is_empty() {
-                String::new()
-            } else {
-                crate::video_versions::containing_folder_path_at(row, &path)
+                self.media_of(row)
             };
             let media = MediaLocation {
                 path: &path,
@@ -162,6 +158,57 @@ impl ItemDataCleanup {
                 tracing::warn!(item_id = %id, %err, "could not delete a deleted item's extracted data");
             }
         }
+    }
+
+    /// `ExternalDataManager.DeleteExternalItemDataAsync` for a video whose
+    /// file changed (`MetadataService.BeforeSaveInternal`,
+    /// `MetadataService.cs:391-395`): what was extracted from the old file,
+    /// its folders and its keyframe, media-segment, trickplay and chapter
+    /// rows, goes before the refresh extracts from the new one. A segment
+    /// provider's own store is its `cleanup`'s to clear (Intro Skipper's
+    /// keeps the old analysis, as upstream's plugin does: gl-1696).
+    ///
+    /// # Errors
+    ///
+    /// A row deletion's error, as upstream lets it fail the refresh; a
+    /// folder that cannot be removed is logged and passed over.
+    pub(crate) async fn prune_extracted_data(
+        &self,
+        row: &BaseItemEntity,
+    ) -> Result<(), ServiceError> {
+        let Some(external) = self.external.get() else {
+            tracing::debug!(
+                item_id = row.id,
+                "no extracted-data manager bound yet; a changed file's extracted data stays"
+            );
+            return Ok(());
+        };
+        let Ok(id) = Uuid::parse_str(&row.id) else {
+            return Ok(());
+        };
+        let (path, containing_folder) = self.media_of(row);
+        tracing::debug!(item_id = %id, path, "file changed, pruning extracted data");
+        let media = MediaLocation {
+            path: &path,
+            containing_folder: &containing_folder,
+        };
+        external.delete_external_item_data(id, media).await
+    }
+
+    /// `row`'s media path, expanded, and the folder holding it; both empty
+    /// for a row with no path.
+    fn media_of(&self, row: &BaseItemEntity) -> (String, String) {
+        let path = row
+            .path
+            .as_deref()
+            .map(|p| self.virtual_paths.expand(p))
+            .unwrap_or_default();
+        let containing_folder = if path.is_empty() {
+            String::new()
+        } else {
+            crate::video_versions::containing_folder_path_at(row, &path)
+        };
+        (path, containing_folder)
     }
 }
 

@@ -11,7 +11,9 @@
 //!
 //! Upstream follows redirects anywhere with a default `HttpClient`, both for
 //! images and in the OpenSubtitles plugin; the guard is an accepted
-//! divergence (owner decisions 2026-10-31 and 2026-11-03).
+//! divergence (owner decisions 2026-10-31 and 2026-11-03). Like that client,
+//! a fetch never follows a redirect from https to http, and its clients have
+//! the provider defaults ([`crate::http_client`]).
 
 use crate::destination::{self, DestinationPolicy, DestinationRefused, PublicOnlyResolver};
 use crate::rate_limit::{LimitedRequest as _, RateLimiter, RequestError, request_limits};
@@ -22,7 +24,8 @@ use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 
 /// Most redirects one fetch follows: reqwest's default policy
 /// (`redirect::Policy::default()`), which downloads went by until they followed
-/// redirects themselves, to vet each hop.
+/// redirects themselves, to vet each hop, and which the provider client
+/// ([`crate::http_client`]) keeps.
 pub(crate) const MAX_REDIRECTS: usize = 10;
 
 /// Image/CDN quotas are independent of metadata API quotas. Share a gate by
@@ -141,8 +144,9 @@ pub(crate) enum SendError {
     /// or a cooldown.
     Request(RequestError),
     /// No request could be made: a URL that does not parse, a redirect to
-    /// another scheme or past [`MAX_REDIRECTS`], a name a proxy would resolve
-    /// that the server cannot, or a client that could not be built.
+    /// another scheme, from https to http or past [`MAX_REDIRECTS`], a name a
+    /// proxy would resolve that the server cannot, or a client that could not
+    /// be built.
     Failed(&'static str),
 }
 
@@ -241,7 +245,7 @@ impl GuardedHttp {
         proxy: bool,
         kind: &'static FetchKind,
     ) -> Self {
-        let vetted = reqwest::Client::builder()
+        let vetted = crate::http_client::builder()
             .no_proxy()
             .redirect(reqwest::redirect::Policy::none())
             .dns_resolver(Arc::new(PublicOnlyResolver::new(Arc::clone(&policy))))
@@ -249,7 +253,7 @@ impl GuardedHttp {
             .ok();
         let pinned = Arc::new(VettedAddresses::default());
         let proxied = proxy.then(|| {
-            reqwest::Client::builder()
+            crate::http_client::builder()
                 .redirect(reqwest::redirect::Policy::none())
                 .dns_resolver(Arc::clone(&pinned))
                 .build()
@@ -283,7 +287,8 @@ impl GuardedHttp {
         let limiter = limiter_for(url, self.kind.label);
         let mut current =
             reqwest::Url::parse(url).map_err(|_| SendError::Failed("a URL that does not parse"))?;
-        let mut redirects = 0;
+        // Every URL asked for so far, as reqwest's redirect policy sees them.
+        let mut previous = vec![current.clone()];
         loop {
             let client = self.client_for(&current).await?;
             let mut request = client.get(current.clone());
@@ -303,13 +308,14 @@ impl GuardedHttp {
                 }
                 return Ok(Fetched {
                     response,
-                    redirected: redirects > 0,
+                    redirected: previous.len() > 1,
                 });
             };
-            if redirects == MAX_REDIRECTS {
-                return Err(self.kind.unsent("too many redirects"));
+            // The provider client's rule: past MAX_REDIRECTS, or https to http.
+            if let Some(reason) = crate::http_client::redirect_refusal(&previous, &next) {
+                return Err(self.kind.unsent(reason));
             }
-            redirects += 1;
+            previous.push(next.clone());
             current = next;
         }
     }

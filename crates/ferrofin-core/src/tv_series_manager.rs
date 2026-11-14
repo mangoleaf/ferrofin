@@ -130,8 +130,10 @@ impl FerrofinTvSeriesManager {
     /// Resolves the parents the next-up scan is scoped to.
     ///
     /// When `parent_id` is set, that single parent is the scope (the C#
-    /// `parents = [parent]` branch). Otherwise the scope is the user's library
-    /// folders: `GetUserRootFolder().GetChildren(user, true)` — the user root's
+    /// `parents = [parent]` branch); the nil id is `InvalidInput`, as
+    /// `GetItemById(Guid.Empty)` throws `ArgumentException`. Otherwise the
+    /// scope is the user's library folders:
+    /// `GetUserRootFolder().GetChildren(user, true)` — the user root's
     /// children the user may see — kept to `Folder`s and minus the views the
     /// user excluded from "latest" (`PreferenceKind.LatestItemExcludes`).
     ///
@@ -149,6 +151,10 @@ impl FerrofinTvSeriesManager {
         user: &UserEntity,
     ) -> Result<Vec<uuid::Uuid>, ServiceError> {
         if let Some(parent) = parent_id {
+            // `GetItemById(Guid.Empty)` throws `ArgumentException`: a 400.
+            if parent.is_nil() {
+                return Err(ServiceError::invalid_input("Guid can't be empty"));
+            }
             // Only scope to it if it actually exists (C# `parent is not null`).
             if self.library_manager.get_item_by_id(parent).await?.is_some() {
                 return Ok(vec![parent]);
@@ -677,9 +683,6 @@ mod tests {
         async fn get_users(&self) -> Result<Vec<UserEntity>, ServiceError> {
             Ok(vec![self.user.clone()])
         }
-        async fn get_user_ids(&self) -> Result<Vec<Uuid>, ServiceError> {
-            Ok(vec![Uuid::parse_str(&self.user.id).unwrap()])
-        }
         async fn initialize(&self) -> Result<(), ServiceError> {
             Ok(())
         }
@@ -820,13 +823,6 @@ mod tests {
             _collection_type: ferrofin_model::data::CollectionType,
         ) -> Result<Vec<BaseItemEntity>, ServiceError> {
             Ok(Vec::new())
-        }
-        async fn create_items(
-            &self,
-            _items: &[BaseItemEntity],
-            _parent_id: Option<Uuid>,
-        ) -> Result<(), ServiceError> {
-            Ok(())
         }
         async fn update_items(
             &self,
@@ -989,12 +985,6 @@ mod tests {
     struct FakeDtoService;
     #[async_trait]
     impl DtoService for FakeDtoService {
-        async fn get_primary_image_aspect_ratio(
-            &self,
-            _item_id: Uuid,
-        ) -> Result<Option<f64>, ServiceError> {
-            Ok(None)
-        }
         async fn get_base_item_dto(
             &self,
             item: &BaseItemEntity,
@@ -1022,15 +1012,6 @@ mod tests {
                     ..BaseItemDto::default()
                 })
                 .collect())
-        }
-        async fn get_item_by_name_dto(
-            &self,
-            _item: &BaseItemEntity,
-            _options: &DtoOptions,
-            _tagged_item_ids: Option<&[Uuid]>,
-            _user: Option<&UserEntity>,
-        ) -> Result<BaseItemDto, ServiceError> {
-            Ok(BaseItemDto::default())
         }
     }
 
@@ -1798,6 +1779,47 @@ mod tests {
             );
         } else {
             assert!(keys_query.is_none(), "a missing parent scopes to nothing");
+        }
+    }
+
+    /// A nil `parentId` reaches `GetItemById(Guid.Empty)`, which throws
+    /// `ArgumentException` (a 400), unless a `seriesId` naming a series
+    /// answers first.
+    #[rstest]
+    #[case::alone(false)]
+    #[case::after_a_series(true)]
+    #[tokio::test]
+    async fn a_nil_parent_is_invalid_input(#[case] with_series: bool) {
+        let db = test_db().await;
+        let user_id = Uuid::new_v4();
+        let user = seed_user(&db, user_id).await;
+        let series = Uuid::new_v4();
+        let (_, mut library) = one_library();
+        library
+            .items
+            .insert(series, item(series, BaseItemKind::Series));
+        let next_up = Arc::new(FakeNextUpService::new(Vec::new(), HashMap::new()));
+        let mgr = manager(user, library, Arc::clone(&next_up), false);
+
+        let result = mgr
+            .get_next_up(
+                &NextUpQuery {
+                    user_id,
+                    parent_id: Some(Uuid::nil()),
+                    series_id: with_series.then_some(series),
+                    ..NextUpQuery::default()
+                },
+                &DtoOptions::default(),
+            )
+            .await;
+        if with_series {
+            result.expect("the series answers before the parent is read");
+        } else {
+            assert!(
+                matches!(result, Err(ServiceError::InvalidInput(ref why)) if why == "Guid can't be empty"),
+                "{result:?}"
+            );
+            assert!(next_up.keys_query.lock().unwrap().is_none());
         }
     }
 

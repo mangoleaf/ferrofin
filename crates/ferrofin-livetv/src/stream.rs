@@ -61,8 +61,9 @@ pub const DEFAULT_TUNER_USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64;
 /// This is `reqwest`'s per-read timeout, so it bounds the endless response body
 /// too: a tuner that stops producing for this long is treated as dead and the
 /// copy task tears the stream down. That is a deliberate divergence — upstream
-/// inherits `HttpClient`'s 100 s and would ride out a longer stall — chosen
-/// because a silent tuner otherwise pins a connection and a buffer for ever.
+/// waits `HttpClient`'s 100 s for the answer and, reading the body after
+/// `ResponseHeadersRead`, rides out any stall — chosen because a silent tuner
+/// otherwise pins a connection and a buffer for ever.
 const TUNER_RESPONSE_TIMEOUT_SECONDS: u64 = 30;
 
 /// How long the caller waits for the tuner's first byte before giving up.

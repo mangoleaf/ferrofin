@@ -1,10 +1,9 @@
 //! End-to-end test against the REAL example guest (`examples/wasm-hello`),
 //! built from source at test time — no committed `.wasm` (artifact policy).
 //!
-//! Gated behind `FERROFIN_WASM_GUEST_TESTS=1` (the `FERROFIN_FFMPEG_TESTS`
-//! pattern) because the guest build needs the wasm32-wasip2 target and a few
-//! minutes of cold compile. CI always sets it; locally it skips with a
-//! message unless opted in.
+//! Gated behind `FERROFIN_WASM_GUEST_TESTS=1` because the guest build needs
+//! the wasm32-wasip2 target and a few minutes of cold compile. CI always sets
+//! it; locally it skips with a message unless opted in.
 //!
 //! This test also produces the **measured RSS-per-plugin** number that
 //! validates (or corrects) the `FERROFIN_WASM_MEMORY_LIMIT_MB=128` default —

@@ -478,7 +478,9 @@ fn add_common_nodes(
     }
 
     if let Some(ticks) = item.run_time_ticks {
-        let minutes = ticks / TICKS_PER_MINUTE;
+        // `Convert.ToInt64(timespan.TotalMinutes)`: rounds, a half minute to the even one.
+        #[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
+        let minutes = (ticks as f64 / TICKS_PER_MINUTE as f64).round_ties_even() as i64;
         writer.element("runtime", &minutes.to_string());
     }
 
@@ -1030,6 +1032,28 @@ fn people_slice(result: &MetadataResult<NfoBaseItem>) -> &[PersonInfo] {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rstest::rstest;
+
+    /// `<runtime>` is `Convert.ToInt64(timespan.TotalMinutes)`: the nearest
+    /// whole minute, and a half minute goes to the even one.
+    #[rstest]
+    #[case::under_half_a_minute(29, 0)]
+    #[case::half_a_minute_ties_to_zero(30, 0)]
+    #[case::just_under_a_minute_and_a_half(89, 1)]
+    #[case::a_minute_and_a_half_ties_to_two(90, 2)]
+    #[case::two_and_a_half_minutes_tie_to_two(150, 2)]
+    #[case::three_and_a_half_minutes_tie_to_four(210, 4)]
+    #[case::fifteen_seconds_short_of_two_hours(7185, 120)]
+    #[case::exact_minutes(7200, 120)]
+    fn runtime_rounds_minutes_half_to_even(#[case] seconds: i64, #[case] minutes: i64) {
+        let mut result = MetadataResult::new(NfoBaseItem::new(NfoItemKind::Movie));
+        result.item.run_time_ticks = Some(seconds * 10_000_000);
+        let xml = save_movie(&result, &NfoConfiguration::default());
+        assert!(
+            xml.contains(&format!("<runtime>{minutes}</runtime>")),
+            "{xml}"
+        );
+    }
 
     /// `<type>` is `person.Type.ToString()`: a member's name, or an undeclared
     /// value's integer; an `Unknown` credit writes no `<type>` at all.

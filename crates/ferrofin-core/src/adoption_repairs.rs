@@ -21,6 +21,7 @@ use ferrofin_db::Database;
 use ferrofin_db::entities::playback::UserDataEntity;
 use ferrofin_db::store::guid_to_db;
 use ferrofin_model::data::BaseItemKind;
+use ferrofin_traits::collections::PlaylistManager;
 use ferrofin_traits::error::ServiceError;
 use ferrofin_util::string_extensions::upper_invariant;
 use serde_json::{Map, Value};
@@ -1624,6 +1625,163 @@ pub async fn run_rekey_pathless_playlists(
     Ok(())
 }
 
+/// The extension of the database snapshot [`expand_saved_playlist_containers`]
+/// takes (`ferrofin.db.pre-playlist-containers`).
+const PLAYLIST_CONTAINERS_SNAPSHOT_EXTENSION: &str = "db.pre-playlist-containers";
+
+/// What [`expand_saved_playlist_containers`] did.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ExpandedPlaylists {
+    /// Playlists whose container entries were replaced by their contents.
+    pub expanded: usize,
+    /// Playlists given a media type.
+    pub stamped: usize,
+    /// Playlists left for the next boot: one failed, one has no folder yet,
+    /// or the previous version changed its entries while they were read.
+    pub pending: usize,
+}
+
+/// Ferrofin before 1.4.0 stored a container a playlist create or add named
+/// (an album, artist, genre, season, series, box set or folder) as one entry,
+/// and gave a new playlist no media type (gl-6). Jellyfin's
+/// `AddToPlaylistInternal` stores the container's tracks or episodes
+/// (`Playlist.GetPlaylistItems`) and `CreatePlaylist` always stores a media
+/// type, so a client queueing such a playlist got an album as one track, and
+/// a `MediaTypes` filter dropped the playlist. This brings each playlist to
+/// what a create or add stores today (the playlist manager's
+/// `saved_container_plan`): each container entry
+/// replaced in place by its contents as the playlist's owner sees them, and
+/// the media type the entries give.
+///
+/// Only a playlist a create made is changed, one in the playlists folder: a
+/// playlist the scan found in a library takes its entries and media type
+/// from its file or folder. A playlist with no folder yet waits for
+/// [`rekey_pathless_playlists`], which runs first, to give it one. Entry ids
+/// (the items' ids) and the positions after an expanded entry change, so the
+/// file is snapshotted first. Runs once; a playlist that failed, or that the
+/// previous version changed while it was read, keeps its entries, and the
+/// repair runs again on the next boot.
+///
+/// # Errors
+/// Returns [`ServiceError`] if the playlists cannot be listed, the snapshot
+/// cannot be written (nothing is changed then) or the marker write fails.
+pub async fn expand_saved_playlist_containers(
+    db: &Database,
+    playlists: &crate::FerrofinPlaylistManager,
+) -> Result<ExpandedPlaylists, ServiceError> {
+    const KEY: &str = "playlist_containers_expanded_v1";
+    let mut result = ExpandedPlaylists::default();
+    if !once(db, KEY).await? {
+        return Ok(result);
+    }
+    let rows: Vec<(String, Option<String>, Option<String>)> = sqlx::query_as(
+        r#"SELECT p."Id", p."Path", fp."OwnerUserId" FROM "BaseItems" p
+           LEFT JOIN "FerrofinPlaylists" fp ON fp."PlaylistId" = p."Id"
+           WHERE p."Type" = ?1 ORDER BY p.rowid"#,
+    )
+    .bind(stored_type_name(BaseItemKind::Playlist).unwrap_or_default())
+    .fetch_all(db.pool())
+    .await
+    .map_err(db_err)?;
+    let mut plans = Vec::new();
+    for (id, path, owner) in rows {
+        let Ok(id) = Uuid::parse_str(&id) else {
+            continue;
+        };
+        let Some(path) = path.filter(|path| !path.is_empty()) else {
+            result.pending += 1;
+            continue;
+        };
+        if !playlists.in_playlists_folder(&path) {
+            continue;
+        }
+        let owner = owner
+            .as_deref()
+            .and_then(|owner| Uuid::parse_str(owner).ok())
+            .unwrap_or_else(Uuid::nil);
+        match playlists.saved_container_plan(id, owner).await {
+            Ok(Some(plan)) => plans.push(plan),
+            Ok(None) => {}
+            Err(err) => {
+                tracing::warn!(
+                    %err,
+                    item_id = %id,
+                    "could not read a playlist an older Ferrofin saved; \
+                     the repair runs again on the next boot"
+                );
+                result.pending += 1;
+            }
+        }
+    }
+    if !plans.is_empty()
+        && let Some(backup) = db
+            .snapshot_once(PLAYLIST_CONTAINERS_SNAPSHOT_EXTENSION)
+            .await?
+    {
+        tracing::info!(
+            backup = %backup.display(),
+            "database snapshot taken before expanding playlist container entries"
+        );
+    }
+    for plan in &plans {
+        match playlists.apply_saved_container_plan(plan).await {
+            Ok(true) => {
+                result.expanded += usize::from(plan.expands());
+                result.stamped += usize::from(plan.stamps());
+            }
+            Ok(false) => {
+                tracing::debug!(
+                    item_id = %plan.playlist(),
+                    "a playlist changed while its container entries were read; \
+                     the repair runs again on the next boot"
+                );
+                result.pending += 1;
+            }
+            Err(err) => {
+                tracing::warn!(
+                    %err,
+                    item_id = %plan.playlist(),
+                    "could not expand a playlist's container entries; \
+                     the repair runs again on the next boot"
+                );
+                result.pending += 1;
+            }
+        }
+    }
+    if result.pending == 0 {
+        done(db, KEY).await?;
+    }
+    Ok(result)
+}
+
+/// [`expand_saved_playlist_containers`] and its log line, for the
+/// composition root. A failure is logged, not returned: the repair is not
+/// needed to serve, and it runs again on the next boot.
+pub async fn run_expand_saved_playlist_containers(
+    db: &Database,
+    playlists: &crate::FerrofinPlaylistManager,
+) {
+    match expand_saved_playlist_containers(db, playlists).await {
+        Ok(ExpandedPlaylists {
+            expanded: 0,
+            stamped: 0,
+            pending: 0,
+        }) => {}
+        Ok(did) => tracing::info!(
+            expanded = did.expanded,
+            stamped = did.stamped,
+            pending = did.pending,
+            "brought playlists an older Ferrofin saved to what a create or add stores: \
+             container entries expanded, media types stamped"
+        ),
+        Err(err) => tracing::warn!(
+            %err,
+            "could not expand the container entries of playlists an older Ferrofin saved; \
+             the repair runs again on the next boot"
+        ),
+    }
+}
+
 /// The extension of the database snapshot
 /// [`merge_legacy_collections_library`] takes
 /// (`jellyfin.db.pre-collections-library`).
@@ -1751,6 +1909,214 @@ pub async fn run_merge_legacy_collections_library(
         Err(err) => tracing::warn!(
             %err,
             "could not move the collections library; box sets stay where they are, \
+             and the next boot tries again"
+        ),
+    }
+}
+
+/// The extension of the database snapshot [`rekey_pathless_box_sets`]
+/// takes (`jellyfin.db.pre-box-set-folders`).
+const BOX_SET_SNAPSHOT_EXTENSION: &str = "db.pre-box-set-folders";
+
+/// Gives each box set an older Ferrofin (before 1.4.0) created with no folder
+/// the one `CollectionManager.CreateCollectionAsync` makes,
+/// `<collections>/<name> [boxset]`, and moves it to the id `Folder.AddChild`
+/// derives from that path (`crate::collection_manager::new_box_set_folder_and_id`,
+/// gl-738), as [`rekey_pathless_playlists`] does for playlists.
+///
+/// `<collections>` is where a new box set goes: the Collections library's
+/// folder (`CollectionsLibrary::find`, `FindFolders`), else
+/// `{data}/collections`. The path is stored as a create stores it
+/// (`%AppDataPath%/collections/…`, `ReverseVirtualPath`), together with the
+/// new id in the move's own savepoint (`rekey_rows_at`). Its members, the
+/// playlists holding it, users' favourites and played state, and its images
+/// move with it; a client holding the old id has to look it up again. Its
+/// metadata folder is renamed to the new id, and the artwork an older
+/// Ferrofin saved there stays in it, not beside the box set. One never
+/// refreshed gets a refresh stamp without being refreshed, so the next scan
+/// keeps its name.
+///
+/// Box sets are taken in the order they were stored, one move each, so of two
+/// with one name the older gets the plain folder. A box set with a path is
+/// never touched. Runs once; a move that fails is undone and the repair runs
+/// again on the next boot.
+///
+/// # Errors
+/// Returns [`ServiceError`] if the underlying queries fail.
+pub async fn rekey_pathless_box_sets(
+    db: &Database,
+    derivation: &IdDerivation,
+    (data_path, root_folder_path): (&str, &str),
+    virtual_paths: &VirtualPathExpander,
+    art_root: Option<&Path>,
+    path_manager: Option<&dyn PathManager>,
+) -> Result<usize, ServiceError> {
+    const KEY: &str = "box_set_folders_v1";
+    if !once(db, KEY).await? {
+        return Ok(0);
+    }
+    let box_set_type = stored_type_name(BaseItemKind::BoxSet).unwrap_or_default();
+    let rows: Vec<(String, Option<String>)> = sqlx::query_as(
+        r#"SELECT "Id", "Name" FROM "BaseItems"
+           WHERE "Type" = ?1 AND ("Path" IS NULL OR "Path" = '')
+           ORDER BY rowid"#,
+    )
+    .bind(box_set_type)
+    .fetch_all(db.pool())
+    .await
+    .map_err(db_err)?;
+    if rows.is_empty() {
+        done(db, KEY).await?;
+        return Ok(0);
+    }
+    if let Some(backup) = db.snapshot_once(BOX_SET_SNAPSHOT_EXTENSION).await? {
+        tracing::info!(
+            backup = %backup.display(),
+            "database snapshot taken before giving box sets their folders"
+        );
+    }
+    let collections = crate::collections_library::CollectionsLibrary::new(
+        db.clone(),
+        derivation.clone(),
+        data_path,
+        root_folder_path,
+        virtual_paths.clone(),
+    )
+    .find()
+    .await?
+    .map_or_else(|| format!("{data_path}/collections"), |folder| folder.path);
+    let (mut moved, mut failed, mut first_error) = (0_usize, 0_usize, None);
+    for (id, name) in rows {
+        let Ok(from) = Uuid::parse_str(&id) else {
+            continue;
+        };
+        // One move at a time: the next name's id is free only once the row
+        // before it stands at its own.
+        let item = (from, name.as_deref().unwrap_or_default());
+        let folders = (art_root, path_manager);
+        match give_box_set_its_folder(db, derivation, &collections, virtual_paths, folders, item)
+            .await
+        {
+            Ok(()) => moved += 1,
+            Err(err) => {
+                tracing::debug!(%err, item_id = %from, "could not give a box set its folder");
+                failed += 1;
+                first_error.get_or_insert(err);
+            }
+        }
+    }
+    match first_error {
+        None => done(db, KEY).await?,
+        Some(err) => tracing::warn!(
+            %err,
+            failed,
+            "could not give some box sets their folders; they keep their ids, \
+             and the repair runs again on the next boot"
+        ),
+    }
+    Ok(moved)
+}
+
+/// One [`rekey_pathless_box_sets`] move: box set `from`, named `name`, gets
+/// its folder in `collections` and the id that folder derives, or, when the
+/// move fails, keeps its id, its folders, and no new folder (only the refresh
+/// stamp stays, which only an explicit refresh of that box set reads).
+///
+/// # Errors
+/// The [`ServiceError`] that kept the folder from being made or the row from
+/// being moved.
+async fn give_box_set_its_folder(
+    db: &Database,
+    derivation: &IdDerivation,
+    collections: &str,
+    virtual_paths: &VirtualPathExpander,
+    (art_root, path_manager): (Option<&Path>, Option<&dyn PathManager>),
+    (from, name): (Uuid, &str),
+) -> Result<(), ServiceError> {
+    // An older Ferrofin's create queued no refresh, and the scan refreshes a
+    // box set only once it has a folder: its first refresh would be the
+    // scan's, in `Default` mode, which takes the provider's name over the
+    // user's (`MetadataService` `shouldReplace`). Upstream's create with
+    // members refreshes it at once in `FullRefresh`, which keeps the name.
+    // TODO(gl-1717, open work item): queue that create-time refresh; the
+    // stamp only keeps the scan's first refresh from renaming it.
+    sqlx::query(
+        r#"UPDATE "BaseItems" SET "DateLastRefreshed" = ?2
+           WHERE "Id" = ?1 AND "DateLastRefreshed" IS NULL"#,
+    )
+    .bind(guid_to_db(from))
+    .bind(ferrofin_db::store::datetime_to_db(chrono::Utc::now()))
+    .execute(db.writer())
+    .await
+    .map_err(db_err)?;
+    let (path, to) =
+        crate::collection_manager::new_box_set_folder_and_id(db, derivation, collections, name)
+            .await?;
+    let (folders, dirs) = move_item_folders(art_root, path_manager, (from, to), "", false);
+    let rekey = ItemRekey {
+        from,
+        to,
+        type_name: stored_type_name(BaseItemKind::BoxSet)
+            .unwrap_or_default()
+            .to_owned(),
+        dirs,
+        merged: Vec::new(),
+        extra: false,
+    };
+    let stored = virtual_paths.reverse(&path);
+    let moved = rekey_rows_at(db, &[rekey], &[stored], RekeyKind::Represented).await;
+    if matches!(&moved, Ok(done) if !done.is_empty()) {
+        folders.commit();
+        return Ok(());
+    }
+    folders.undo();
+    // A row stored at the id meanwhile (the previous version's create of the
+    // same name) owns the folder; when that cannot be read, it is kept.
+    let owned = match crate::item_persistence_service::row_exists(db, to).await {
+        Ok(owned) => owned,
+        Err(err) => {
+            tracing::debug!(%err, item_id = %to, "could not look for a row at a box set's new id");
+            true
+        }
+    };
+    if !owned && let Err(err) = tokio::fs::remove_dir(&path).await {
+        tracing::debug!(%err, path = %path, "could not remove an unused box set folder");
+    }
+    moved?;
+    Err(ServiceError::backend(format!(
+        "box set {from} was not moved to {to}"
+    )))
+}
+
+/// [`rekey_pathless_box_sets`] and its log line, for the composition root. A
+/// failure is a warning and never stops the boot: the box sets keep their ids
+/// and work as before, and the next boot tries again.
+pub async fn run_rekey_pathless_box_sets(
+    db: &Database,
+    derivation: &IdDerivation,
+    directories: (&str, &str),
+    virtual_paths: &VirtualPathExpander,
+    art_root: Option<&Path>,
+    path_manager: Option<&dyn PathManager>,
+) {
+    match rekey_pathless_box_sets(
+        db,
+        derivation,
+        directories,
+        virtual_paths,
+        art_root,
+        path_manager,
+    )
+    .await
+    {
+        Ok(0) => {}
+        Ok(moved) => tracing::info!(
+            items = moved,
+            "gave box sets with no folder their folders and the ids Jellyfin keys them by"
+        ),
+        Err(err) => tracing::warn!(
+            %err,
+            "could not give box sets their folders; they keep their ids, \
              and the next boot tries again"
         ),
     }
@@ -1885,6 +2251,139 @@ pub async fn run_sweep_missing_items(
     }
     Ok(())
 }
+
+/// The extension of the database snapshot [`remove_orphaned_playlists`]
+/// takes (`jellyfin.db.pre-orphaned-playlists`).
+const ORPHANED_PLAYLISTS_SNAPSHOT_EXTENSION: &str = "db.pre-orphaned-playlists";
+
+/// Disposes of the playlists whose owner has no `Users` row as if that
+/// owner's deletion had just run (owner decision on gl-577): `remove_playlists`
+/// for each such owner, which hands a playlist shared with users who exist
+/// to the first of them with edit rights, else the first of them, and
+/// deletes any other unless it is open access.
+///
+/// Before the fix for gl-131, deleting a user left their playlists to a
+/// deleted owner; a hand-over that fails after the user row is gone still
+/// can. Upstream has no repair: its deletion makes one only when it hands a
+/// playlist to the share of a user already gone, so adopted databases can
+/// hold a few too. Unowned
+/// playlists (no owner, or the empty GUID: made with an API key or resolved
+/// from files) are left alone. Ids are compared parsed, so an owner stored
+/// in another spelling of a user's id is not taken for a missing one.
+///
+/// Runs once. Before the first change the database file is copied once to
+/// `<db>.pre-orphaned-playlists`, as before a table-rebuilding migration;
+/// the private playlists it deletes come back only from that copy. When an
+/// owner's playlists cannot all be disposed of, the repair is not marked
+/// done and the next boot finds what is left.
+///
+/// Returns how many missing owners' playlists were disposed of.
+///
+/// # Errors
+/// Returns [`ServiceError`] if a query, the snapshot or the marker write
+/// fails.
+pub async fn remove_orphaned_playlists(
+    db: &Database,
+    playlists: &dyn PlaylistManager,
+) -> Result<usize, ServiceError> {
+    const KEY: &str = "orphaned_playlist_owners_v1";
+    if !once(db, KEY).await? {
+        return Ok(0);
+    }
+    // Owners before users: a user the previous version adds meanwhile is
+    // read with the users, so their new playlist never looks orphaned.
+    let owners: BTreeSet<Uuid> = sqlx::query_scalar::<_, String>(
+        r#"SELECT DISTINCT p."OwnerUserId" FROM "FerrofinPlaylists" p
+           JOIN "BaseItems" bi ON bi."Id" = p."PlaylistId"
+           WHERE p."OwnerUserId" IS NOT NULL"#,
+    )
+    .fetch_all(db.pool())
+    .await
+    .map_err(db_err)?
+    .iter()
+    .filter_map(|id| Uuid::parse_str(id).ok())
+    .filter(|owner| !owner.is_nil())
+    .collect();
+    if owners.is_empty() {
+        done(db, KEY).await?;
+        return Ok(0);
+    }
+    let users: HashSet<Uuid> = sqlx::query_scalar::<_, String>(r#"SELECT "Id" FROM "Users""#)
+        .fetch_all(db.pool())
+        .await
+        .map_err(db_err)?
+        .iter()
+        .filter_map(|id| Uuid::parse_str(id).ok())
+        .collect();
+    if users.is_empty() {
+        // Every owner would look missing: never delete on that.
+        tracing::warn!(
+            "playlists have owners but no user could be read; \
+             the playlists of missing owners are left until the next boot"
+        );
+        return Ok(0);
+    }
+    let owners: Vec<Uuid> = owners
+        .into_iter()
+        .filter(|owner| !users.contains(owner))
+        .collect();
+    if owners.is_empty() {
+        done(db, KEY).await?;
+        return Ok(0);
+    }
+    if let Some(backup) = db
+        .snapshot_once(ORPHANED_PLAYLISTS_SNAPSHOT_EXTENSION)
+        .await?
+    {
+        tracing::info!(
+            backup = %backup.display(),
+            "database snapshot taken before disposing of playlists whose owner no longer exists"
+        );
+    }
+    let mut disposed = 0;
+    for &owner in &owners {
+        match playlists.remove_playlists(owner).await {
+            Ok(()) => {
+                tracing::debug!(
+                    user_id = %owner,
+                    "disposed of the playlists of a user who no longer exists"
+                );
+                disposed += 1;
+            }
+            Err(err) => tracing::warn!(
+                %err,
+                user_id = %owner,
+                "could not hand over or delete every playlist of a user who no longer \
+                 exists; the next boot tries again"
+            ),
+        }
+    }
+    if disposed == owners.len() {
+        done(db, KEY).await?;
+    }
+    Ok(disposed)
+}
+
+/// [`remove_orphaned_playlists`] and its log line, for the composition root.
+/// A failure is a warning and never stops the boot: the playlists stay as
+/// they were, and the next boot tries again.
+pub async fn run_remove_orphaned_playlists(db: &Database, playlists: &dyn PlaylistManager) {
+    match remove_orphaned_playlists(db, playlists).await {
+        Ok(0) => {}
+        Ok(users) => tracing::info!(
+            users,
+            "disposed of the playlists of users who no longer exist"
+        ),
+        Err(err) => tracing::warn!(
+            %err,
+            "could not dispose of the playlists of users who no longer exist; \
+             the next boot tries again"
+        ),
+    }
+}
+
+#[cfg(test)]
+mod orphaned_playlists_tests;
 
 /// The folders Jellyfin 12.0's `CleanupOrphanedExternalData`
 /// (`Jellyfin.Server/Migrations/Routines/20260525010000_CleanupOrphanedExternalData.cs`)
@@ -7964,5 +8463,125 @@ mod program_data_tests {
         let mut expected = vec![missing, format!("{pd}/config/users/gilesw/profile.png")];
         expected.sort();
         assert_eq!(paths, expected);
+    }
+}
+
+#[cfg(test)]
+mod playlist_container_tests {
+    use std::sync::Arc;
+
+    use ferrofin_model::data::BaseItemKind;
+    use ferrofin_traits::system::ServerApplicationPaths;
+
+    use super::*;
+    use crate::test_support::{
+        item_repository_over, library_manager_over, seed_named_item, seed_video_item,
+        set_item_path, test_db,
+    };
+
+    const KEY: &str = "playlist_containers_expanded_v1";
+
+    async fn media_type(db: &Database, id: Uuid) -> Option<String> {
+        sqlx::query_scalar(r#"SELECT "MediaType" FROM "BaseItems" WHERE "Id" = ?1"#)
+            .bind(guid_to_db(id))
+            .fetch_one(db.pool())
+            .await
+            .unwrap()
+    }
+
+    /// A write goes ahead only over the entries its plan read: an entry the
+    /// previous version added in between leaves the playlist as it was. A
+    /// playlist with no folder yet holds the marker back until it has one,
+    /// and a playlist the scan found in a library is never changed. An empty
+    /// playlist takes `CreatePlaylist`'s default, `Audio`.
+    #[tokio::test]
+    async fn a_playlist_changed_meanwhile_or_with_no_folder_waits_for_the_next_boot() {
+        let db = test_db().await;
+        let root = tempfile::tempdir().unwrap();
+        let paths: Arc<dyn ServerApplicationPaths> =
+            Arc::new(crate::app_paths::FerrofinServerApplicationPaths::new(
+                root.path(),
+                root.path().join("log"),
+                root.path().join("config"),
+                root.path().join("cache"),
+                root.path().join("web"),
+            ));
+        let manager = crate::FerrofinPlaylistManager::new(
+            db.clone(),
+            library_manager_over(db.clone()),
+            item_repository_over(db.clone()),
+            Arc::clone(&paths),
+        );
+        let (made, scanned, unfiled, movie) = (
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+        );
+        for (id, name) in [(made, "Made"), (scanned, "Scanned"), (unfiled, "Unfiled")] {
+            seed_named_item(&db, id, BaseItemKind::Playlist, name).await;
+        }
+        let in_playlists = |name: &str| format!("{}/playlists/{name}", paths.data_path());
+        assert!(manager.in_playlists_folder(&in_playlists("Made")));
+        assert!(!manager.in_playlists_folder(&format!("{}/playlists", paths.data_path())));
+        assert!(!manager.in_playlists_folder(&format!("{}/playlists2/Made", paths.data_path())));
+        set_item_path(&db, made, &in_playlists("Made")).await;
+        let library = root.path().join("media/Scanned").display().to_string();
+        set_item_path(&db, scanned, &library).await;
+        seed_video_item(&db, movie, BaseItemKind::Movie).await;
+
+        let plan = manager
+            .saved_container_plan(made, Uuid::nil())
+            .await
+            .unwrap()
+            .expect("a media type is owed");
+        assert!(plan.stamps() && !plan.expands());
+        sqlx::query(
+            r#"INSERT INTO "LinkedChildren" ("ParentId", "SortOrder", "ChildId", "ChildType")
+               VALUES (?1, 0, ?2, 0)"#,
+        )
+        .bind(guid_to_db(made))
+        .bind(guid_to_db(movie))
+        .execute(db.writer())
+        .await
+        .unwrap();
+        assert!(!manager.apply_saved_container_plan(&plan).await.unwrap());
+        assert_eq!(media_type(&db, made).await, None);
+
+        let ran = expand_saved_playlist_containers(&db, &manager)
+            .await
+            .unwrap();
+        assert_eq!(
+            ran,
+            ExpandedPlaylists {
+                expanded: 0,
+                stamped: 1,
+                pending: 1
+            }
+        );
+        assert_eq!(media_type(&db, made).await.as_deref(), Some("Video"));
+        assert_eq!(media_type(&db, scanned).await, None);
+        assert!(db.meta_get(KEY).await.unwrap().is_none());
+
+        set_item_path(&db, unfiled, &in_playlists("Unfiled")).await;
+        let ran = expand_saved_playlist_containers(&db, &manager)
+            .await
+            .unwrap();
+        assert_eq!(
+            ran,
+            ExpandedPlaylists {
+                expanded: 0,
+                stamped: 1,
+                pending: 0
+            }
+        );
+        assert_eq!(media_type(&db, unfiled).await.as_deref(), Some("Audio"));
+        assert!(db.meta_get(KEY).await.unwrap().is_some());
+        assert_eq!(
+            expand_saved_playlist_containers(&db, &manager)
+                .await
+                .unwrap(),
+            ExpandedPlaylists::default()
+        );
     }
 }

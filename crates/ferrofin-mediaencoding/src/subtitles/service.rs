@@ -216,8 +216,8 @@ mod tests {
         ) -> Option<String> {
             None
         }
-        async fn extract(&self, _args: &str, _output_paths: &[String]) -> Result<(), String> {
-            Ok(())
+        async fn extract(&self, _args: &str, _output_paths: &[String]) -> Result<String, String> {
+            Ok(String::new())
         }
     }
 
@@ -375,8 +375,8 @@ mod tests {
                 "/cache/{media_source_id}-{subtitle_stream_index}{output_extension}"
             ))
         }
-        async fn extract(&self, _args: &str, _output_paths: &[String]) -> Result<(), String> {
-            Ok(())
+        async fn extract(&self, _args: &str, _output_paths: &[String]) -> Result<String, String> {
+            Ok(String::new())
         }
         fn file_exists(&self, _path: &str) -> bool {
             false

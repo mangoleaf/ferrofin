@@ -8,7 +8,7 @@
 //! The per-name image routes (`/Studios/{name}/Images/{imageType}`) are
 //! registered by the image controller ([`images`](super::images)).
 
-use axum::extract::{Path, State};
+use axum::extract::State;
 use axum::routing::get;
 use axum::{Json, Router};
 use ferrofin_model::data::BaseItemKind;
@@ -18,8 +18,8 @@ use ferrofin_traits::options::DtoOptions;
 
 use crate::auth::RequireAuth;
 use crate::error::ApiError;
-use crate::extract::Query;
-use crate::handlers::by_name::{ByNameItemQuery, ByNameListQuery, project_query_result};
+use crate::extract::{Query, RequiredRouteString, RouteParameter};
+use crate::handlers::by_name::{ByNameItemQuery, ValueListQuery, project_query_result};
 use crate::handlers::items::resolve_user_or_api_key;
 use crate::state::AppState;
 
@@ -36,12 +36,13 @@ use crate::state::AppState;
 async fn get_studios(
     State(state): State<AppState>,
     RequireAuth(auth): RequireAuth,
-    Query(query): Query<ByNameListQuery>,
+    Query(query): Query<ValueListQuery>,
 ) -> Result<Json<QueryResult<BaseItemDto>>, ApiError> {
+    let query = query.studios()?;
     let user = resolve_user_or_api_key(&state, &auth, query.user_id).await?;
     // `GetParentItem`: an id naming no item is a 400.
-    query.parent(&state, &auth, user.as_deref()).await?;
-    let internal = query.base_query(user.clone())?;
+    let parent = query.parent(&state, &auth, user.as_deref()).await?;
+    let internal = query.base_query(user.clone(), parent.as_ref())?;
     let result = state.library.get_studios(&internal).await?;
     let options = query.dto_options(query.enable_user_data);
     let projected = project_query_result(
@@ -53,6 +54,13 @@ async fn get_studios(
     )
     .await?;
     Ok(Json(projected))
+}
+
+/// `{name}`, the `[FromRoute, Required] string` of `GetStudio`.
+struct Name;
+
+impl RouteParameter for Name {
+    const NAME: &'static str = "name";
 }
 
 /// `GET /Studios/{name}` — a single studio by name.
@@ -82,7 +90,7 @@ async fn get_studios(
 async fn get_studio(
     State(state): State<AppState>,
     RequireAuth(auth): RequireAuth,
-    Path(name): Path<String>,
+    RequiredRouteString(name, _): RequiredRouteString<Name>,
     Query(query): Query<ByNameItemQuery>,
 ) -> Result<Json<BaseItemDto>, ApiError> {
     let user = resolve_user_or_api_key(&state, &auth, query.user_id).await?;

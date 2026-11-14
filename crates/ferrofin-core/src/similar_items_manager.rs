@@ -34,11 +34,10 @@
 //! ones). An empty `Genres`/`Tags` pair is NOT a predicate there, so an untagged
 //! seed matches every other item of its kind — as it does in C#.
 //!
-//! Accepted divergences from C#: `IsFavoriteOrLiked` is approximated as
-//! favorite-only (as elsewhere in the query layer); and the weighted path
-//! breaks equal scores **deterministically**, by (`SortName`, `Id`), where C# keeps whatever
-//! dictionary order the candidates arrived in, so a client sees a stable answer.
-//! The flat path orders by `Random`, as C# does.
+//! The weighted path lists equal scores by item `Id`, which in practice is the
+//! order Jellyfin's unordered candidate query returns them in, so the final cut
+//! through a tie keeps the same items (owner decision 2026-10-24). The flat
+//! path orders by `Random`, as C# does.
 
 use ferrofin_util::directory_path::DirectoryPath;
 use std::collections::HashMap;
@@ -70,10 +69,10 @@ use crate::similar_items_repository::SimilarItemsRepository;
 
 /// Reads an unexpired reference cache, or `None` when it is missing, stale or
 /// unparseable.
-fn read_reference_cache(path: &Path) -> Option<Vec<SimilarItemReference>> {
+async fn read_reference_cache(path: &Path) -> Option<Vec<SimilarItemReference>> {
     // A missing entry is the normal cache miss and says nothing; an entry that
     // exists but will not parse is worth one warning (C# logs the same).
-    let raw = std::fs::read_to_string(path).ok()?;
+    let raw = tokio::fs::read_to_string(path).await.ok()?;
     let cache: SimilarItemsCache = match serde_json::from_str(&raw) {
         Ok(cache) => cache,
         Err(err) => {
@@ -99,13 +98,11 @@ fn read_reference_cache(path: &Path) -> Option<Vec<SimilarItemReference>> {
 
 /// Writes a reference cache entry, best-effort — a cache that cannot be written
 /// only costs a re-fetch next time.
-fn write_reference_cache(path: &Path, references: &[SimilarItemReference], ttl: Duration) {
-    let Some(parent) = path.parent() else {
-        return;
-    };
-    if std::fs::create_dir_all(parent).is_err() {
-        return;
-    }
+///
+/// The new entry is renamed over the old one whole, on a blocking worker, as
+/// `SaveSimilarItemsCacheAsync` moves its temporary file over it, so a request
+/// reading the entry meanwhile never sees a partial one.
+async fn write_reference_cache(path: &Path, references: &[SimilarItemReference], ttl: Duration) {
     let Ok(ttl) = chrono::Duration::from_std(ttl) else {
         return;
     };
@@ -120,9 +117,16 @@ fn write_reference_cache(path: &Path, references: &[SimilarItemReference], ttl: 
             .collect(),
         expires_at: chrono::Utc::now() + ttl,
     };
-    if let Ok(json) = serde_json::to_string(&cache)
-        && let Err(err) = std::fs::write(path, json)
-    {
+    let Ok(json) = serde_json::to_vec(&cache) else {
+        return;
+    };
+    let target = path.to_path_buf();
+    let written = tokio::task::spawn_blocking(move || {
+        ferrofin_util::file_helper::atomic_write(&target, &json)
+    })
+    .await
+    .unwrap_or_else(|err| Err(std::io::Error::other(err)));
+    if let Err(err) = written {
         tracing::warn!(%err, path = %path.display(), "could not write similar-items cache");
     }
 }
@@ -892,7 +896,7 @@ impl FerrofinSimilarItemsManager {
         let (kind, user) = (request.kind, request.user);
         let cache_path = self.cache_path(provider.name(), request.seed);
         if let Some(path) = cache_path.as_deref()
-            && let Some(cached) = read_reference_cache(path)
+            && let Some(cached) = read_reference_cache(path).await
         {
             return self
                 .resolve_remote_references(&cached, provider_order, kind, user, claimed)
@@ -954,7 +958,7 @@ impl FerrofinSimilarItemsManager {
             provider.cache_duration(),
             collected.is_empty(),
         ) {
-            write_reference_cache(path, &collected, ttl);
+            write_reference_cache(path, &collected, ttl).await;
         }
         results
     }
@@ -2357,6 +2361,7 @@ mod tests {
             .expect("seed row");
         let cached =
             read_reference_cache(&mgr.cache_path("TheMovieDb", &seed_row).expect("cache path"))
+                .await
                 .expect("cached references");
         assert_eq!(cached, tmdb_references(500));
     }
@@ -2817,20 +2822,56 @@ mod tests {
             provider_id: "348".to_owned(),
             score: Some(0.5),
         }];
-        super::write_reference_cache(&path, &references, Duration::from_mins(1));
+        super::write_reference_cache(&path, &references, Duration::from_mins(1)).await;
         assert_eq!(
-            super::read_reference_cache(&path).as_deref(),
+            super::read_reference_cache(&path).await.as_deref(),
             Some(&references[..])
         );
 
         // An expired entry is ignored rather than served stale.
-        super::write_reference_cache(&path, &references, Duration::from_secs(0));
-        assert_eq!(super::read_reference_cache(&path), None);
+        super::write_reference_cache(&path, &references, Duration::from_secs(0)).await;
+        assert_eq!(super::read_reference_cache(&path).await, None);
         // A missing file is simply a miss.
         assert_eq!(
-            super::read_reference_cache(dir.path().join("nope.json").as_path()),
+            super::read_reference_cache(dir.path().join("nope.json").as_path()).await,
             None
         );
+    }
+
+    /// A rewrite renames a complete new entry over the old one, as
+    /// `SaveSimilarItemsCacheAsync` does, so a reader that opened the entry
+    /// before it keeps reading the whole previous entry. An in-place write
+    /// changes the bytes under that reader, which is how a concurrent request
+    /// read a truncated entry.
+    #[tokio::test]
+    async fn a_cache_rewrite_leaves_an_open_entry_whole() {
+        use std::io::Read as _;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("themoviedb-similar-movie").join("x.json");
+        let reference = |id: &str| SimilarItemReference {
+            provider_name: "Tmdb".to_owned(),
+            provider_id: id.to_owned(),
+            score: None,
+        };
+        super::write_reference_cache(&path, &[reference("348")], Duration::from_mins(1)).await;
+        let mut held = std::fs::File::open(&path).expect("open the entry");
+        super::write_reference_cache(&path, &[reference("1091")], Duration::from_mins(1)).await;
+
+        let mut before = String::new();
+        held.read_to_string(&mut before)
+            .expect("read the open entry");
+        let before: super::SimilarItemsCache =
+            serde_json::from_str(&before).expect("the open entry parses");
+        assert_eq!(before.references[0].provider_id, "348");
+        assert_eq!(
+            super::read_reference_cache(&path).await.as_deref(),
+            Some(&[reference("1091")][..])
+        );
+        // No temporary file is left beside the entry.
+        let entries = std::fs::read_dir(dir.path().join("themoviedb-similar-movie"))
+            .expect("list the cache directory")
+            .count();
+        assert_eq!(entries, 1);
     }
 
     #[tokio::test]
@@ -3040,10 +3081,8 @@ mod tests {
 
         // Without a user there is no watch state to filter on (C# skips the
         // predicate when `User` is null). Both share the seed's one genre, so
-        // the similarity scores tie and the sort name breaks it — alphabetical,
-        // as upstream, where `BaseItem.SortName` is never null. This assertion
-        // read `["Unplayed", "Played"]` while the column was NULL for both and
-        // the tie fell through to insertion order.
+        // the similarity scores tie and the item id breaks it: `Unplayed`
+        // (0x403) before `Played` (0x404), whatever their names.
         let anonymous = mgr
             .get_similar_items(seed, &[], None, &DtoOptions::default(), None)
             .await
@@ -3051,7 +3090,7 @@ mod tests {
             .expect("seed resolves");
         assert_eq!(
             names(&anonymous),
-            vec!["Played".to_owned(), "Unplayed".to_owned()]
+            vec!["Unplayed".to_owned(), "Played".to_owned()]
         );
     }
 
@@ -3171,7 +3210,7 @@ mod tests {
         let user_id = Uuid::parse_str(&user.id).expect("user id");
         let seed = Uuid::from_u128(0x432);
         seed_movie(&db, seed, "Seed", "SciFi").await;
-        // Four played rows outrank (by sort name) the two unplayed ones.
+        // Four played rows outrank (by id) the two unplayed ones.
         for (id, name) in [(0x440, "A"), (0x441, "B"), (0x442, "C"), (0x443, "D")] {
             let id = Uuid::from_u128(id);
             seed_movie(&db, id, name, "SciFi").await;

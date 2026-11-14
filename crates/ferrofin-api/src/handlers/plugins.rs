@@ -46,7 +46,7 @@ use uuid::Uuid;
 
 use crate::auth::{RequireAdmin, RequireAuth};
 use crate::error::ApiError;
-use crate::extract::{DotnetGuid, JsonSeqBody, Query};
+use crate::extract::{DotnetGuid, JsonSeqBody, Query, RequiredRouteString, RouteParameter};
 use crate::state::AppState;
 
 /// Ports Jellyfin's `RequiresElevation` policy for the plugin-mutating
@@ -574,11 +574,20 @@ fn parse_assembly_guid(raw: Option<&str>) -> Result<Option<Uuid>, ApiError> {
     }
 }
 
+/// `{name}`, the `[FromRoute, Required] string` of `GetPackageInfo` and
+/// `InstallPackage`.
+struct PackageName;
+
+impl RouteParameter for PackageName {
+    const NAME: &'static str = "name";
+}
+
 /// `GET /Packages/{name}` — a package by name or assembly GUID.
 ///
 /// Port of `PackageController.GetPackageInfo`:
 ///
 /// ```text
+/// if (IsBundledPlugin(name, assemblyGuid)) return NotFound();   // before any repository fetch
 /// var packages = await _installationManager.GetAvailablePackages();
 /// var result = _installationManager.FilterPackages(packages, name, assemblyGuid ?? default).FirstOrDefault();
 /// if (result is null) return NotFound();
@@ -609,7 +618,7 @@ fn parse_assembly_guid(raw: Option<&str>) -> Result<Option<Uuid>, ApiError> {
 async fn get_package_info(
     State(state): State<AppState>,
     RequireAdmin(_auth): RequireAdmin,
-    Path(name): Path<String>,
+    RequiredRouteString(name, _): RequiredRouteString<PackageName>,
     Query(query): Query<PackageInfoQuery>,
 ) -> Result<Json<PackageInfo>, ApiError> {
     let assembly_guid = parse_assembly_guid(query.assembly_guid.as_deref())?;
@@ -649,6 +658,9 @@ struct InstallPackageQuery {
 /// `POST /Packages/Installed/{name}` — install a package from the configured
 /// repositories.
 ///
+/// A plugin bundled with the server (`CanUninstall: false`) is a `404` before
+/// any repository is fetched (`PackageController.IsBundledPlugin`).
+///
 /// The manager downloads, verifies (checksum + component validation), and
 /// stages the WASM plugin; it activates on the next restart
 /// (`SystemInfo.HasPendingRestart` flips true, matching Jellyfin's flow).
@@ -670,7 +682,7 @@ struct InstallPackageQuery {
 async fn install_package(
     State(state): State<AppState>,
     RequireAdmin(auth): RequireAdmin,
-    Path(name): Path<String>,
+    RequiredRouteString(name, _): RequiredRouteString<PackageName>,
     Query(query): Query<InstallPackageQuery>,
 ) -> Result<StatusCode, ApiError> {
     require_admin(&state, &auth).await?;

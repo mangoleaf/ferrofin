@@ -465,3 +465,68 @@ fn a_subtitle_delivery_follows_the_streams_sub_protocol(
         .collect();
     assert_eq!(delivered, vec![expected]);
 }
+
+/// `GetSubtitleStreamInfo` hands the client an external subtitle's own path
+/// only when `Uri.TryCreate(path, UriKind.Absolute)` gives an `http` or `https`
+/// scheme (`StreamInfo.cs`, v12.4): the scheme in any case, surrounding white
+/// space ignored, a host required. The URL it hands out is the path as stored.
+/// Jellyfin 12.4's answers over PlaybackInfo are the oracle for the first four
+/// rows. Not one of upstream's `StreamInfoTests`.
+#[rstest]
+#[case::http("http://relay/remote.en.srt", true)]
+#[case::https("https://relay/remote.en.srt", true)]
+#[case::upper_case_scheme("HTTP://relay/remote.en.srt", true)]
+#[case::leading_space(" http://relay/remote.en.srt", true)]
+#[case::no_host("http://", false)]
+#[case::local_path("/media/a.srt", false)]
+#[case::windows_path("C:\\media\\a.srt", false)]
+#[case::file_url("file:///media/a.srt", false)]
+#[case::ftp("ftp://host/a.srt", false)]
+fn an_external_subtitle_url_is_handed_out_when_it_parses_as_http(
+    #[case] path: &str,
+    #[case] handed_out: bool,
+) {
+    use ferrofin_model::dlna::SubtitleProfile;
+    use ferrofin_model::dto::MediaSourceInfo;
+    use ferrofin_model::entities::MediaStreamType;
+    use ferrofin_model::entities_media::MediaStream;
+
+    let profile = DeviceProfile {
+        subtitle_profiles: vec![SubtitleProfile {
+            format: Some("subrip".to_owned()),
+            method: SubtitleDeliveryMethod::External,
+            ..SubtitleProfile::default()
+        }],
+        ..DeviceProfile::default()
+    };
+    let mut si = StreamInfo::new(profile);
+    si.media_type = DlnaProfileType::Video;
+    si.play_method = PlayMethod::DirectPlay;
+    si.subtitle_stream_index = Some(2);
+    si.media_source = Some(MediaSourceInfo {
+        id: Some("source".to_owned()),
+        media_streams: vec![MediaStream {
+            stream_type: MediaStreamType::Subtitle,
+            index: 2,
+            codec: Some("subrip".to_owned()),
+            is_external: true,
+            supports_external_stream: true,
+            path: Some(path.to_owned()),
+            ..MediaStream::default()
+        }],
+        ..MediaSourceInfo::default()
+    });
+
+    let infos = si.get_subtitle_profiles(&ExtractsSubtitles, true, false, "", None);
+    let [info] = infos.as_slice() else {
+        panic!("expected one subtitle, got {infos:?}");
+    };
+    assert_eq!(info.delivery_method, SubtitleDeliveryMethod::External);
+    assert_eq!(info.is_external_url, handed_out);
+    if handed_out {
+        assert_eq!(info.url.as_deref(), Some(path));
+    } else {
+        let url = info.url.as_deref().unwrap_or_default();
+        assert!(url.ends_with("/Subtitles/2/0/Stream.subrip"), "{url}");
+    }
+}

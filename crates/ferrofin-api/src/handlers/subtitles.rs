@@ -1,8 +1,8 @@
 //! `SubtitleController` — subtitle management + fallback fonts.
 //!
 //! Ports the portable slice of Jellyfin's `SubtitleController`:
-//! - `DELETE /Videos/{itemId}/Subtitles/{index}` — delete a stored external
-//!   subtitle stream (+ its sidecar file).
+//! - `DELETE /Videos/{itemId}/Subtitles/{index}` — delete an external
+//!   subtitle file, then refresh the item.
 //! - `POST /Videos/{itemId}/Subtitles` — upload an external subtitle file.
 //! - `GET /Items/{itemId}/RemoteSearch/Subtitles/{language}` — search providers.
 //! - `POST /Items/{itemId}/RemoteSearch/Subtitles/{subtitleId}` — download one.
@@ -39,19 +39,24 @@ use ferrofin_model::entities_media::MediaStream;
 use ferrofin_model::providers::RemoteSubtitleInfo;
 use ferrofin_model::secret::Secret;
 use ferrofin_model::subtitles::FontFile;
+use ferrofin_traits::error::ServiceError;
 use ferrofin_traits::subtitles::{SubtitleResponse, SubtitleSearchRequest};
 use ferrofin_util::string_extensions::equals_ordinal_ignore_case;
 use uuid::Uuid;
 
 use crate::auth::{RequireAdmin, RequireAuth, RequireSubtitleManagement};
-use crate::error::ApiError;
-use crate::extract::{DotnetGuid, JsonBody, Query, upload_body_limit};
+use crate::error::{ApiError, ProblemStatus};
+use crate::extract::{
+    DotnetGuid, JsonBody, Query, RequiredRouteString, RouteParameter, blank_route_values,
+    upload_body_limit,
+};
 use crate::handlers::image_upload::decode_base64;
 use crate::handlers::items::resolve_user_opt;
-use crate::handlers::queue_high_priority_refresh;
 use crate::handlers::streaming::{
     opened_file_response, physical_file_precondition, require_streamable_item,
+    stream_route_container,
 };
+use crate::handlers::{queue_high_priority_refresh, run_item_refresh};
 use crate::state::AppState;
 
 /// The MIME type Jellyfin serves an HLS subtitle playlist with
@@ -71,8 +76,8 @@ const FALLBACK_FONT_MAX_TOTAL_BYTES: i64 = 20 * 1024 * 1024;
 /// (`.woff`/`.woff2`/`.ttf`/`.otf`).
 const FALLBACK_FONT_EXTENSIONS: &[&str] = &[".woff", ".woff2", ".ttf", ".otf"];
 
-/// Ensures an item exists, returning `404` otherwise
-/// (`GetItemById<BaseItem>`, as `DeleteSubtitle` resolves it).
+/// Ensures an item exists, returning `NotFound()`'s `ProblemDetails` `404`
+/// otherwise (`GetItemById<BaseItem>`, as `DeleteSubtitle` resolves it).
 async fn require_item(
     state: &AppState,
     item_id: Uuid,
@@ -84,7 +89,7 @@ async fn require_item(
         .await?
         .is_none()
     {
-        return Err(ApiError::NotFound(format!("item {item_id}")));
+        return Err(ApiError::Problem(ProblemStatus::NotFound));
     }
     Ok(())
 }
@@ -111,12 +116,18 @@ async fn require_video(
     Ok(())
 }
 
-/// `DELETE /Videos/{itemId}/Subtitles/{index}` — delete a stored subtitle.
+/// `DELETE /Videos/{itemId}/Subtitles/{index}` — delete an external subtitle.
 ///
-/// Port of `SubtitleController.DeleteSubtitle`: `404` when the item is missing,
-/// else `204`. The manager drops the external subtitle stream at `index` and its
-/// sidecar file (deleting a non-existent index is idempotent). Upstream requires
-/// elevation here, independently of the subtitle-management permission.
+/// Port of `SubtitleController.DeleteSubtitle`, which requires elevation,
+/// independently of the subtitle-management permission: `NotFound()` when the
+/// item is missing, else `204` once `SubtitleManager.DeleteSubtitles` has
+/// deleted the subtitle's file and awaited the item's refresh, whose re-probe
+/// drops that stream and renumbers the rest. A nil id (`GetItemById`) and an
+/// index with no subtitle file (no subtitle stream there, or an embedded one)
+/// throw `ArgumentException`s upstream, and a subtitle whose folder is missing
+/// throws `File.Delete`'s `DirectoryNotFoundException`, before the refresh. So
+/// every failure but the missing item is answered as `ExceptionMiddleware`
+/// answers a throw: `400` or `404`, `text/plain`, "Error processing request.".
 #[utoipa::path(
     delete,
     path = "/Videos/{itemId}/Subtitles/{index}",
@@ -126,7 +137,8 @@ async fn require_video(
     ),
     responses(
         (status = 204, description = "Subtitle deleted"),
-        (status = 404, description = "Item not found")
+        (status = 400, description = "No subtitle file at that index"),
+        (status = 404, description = "Item not found, or the subtitle's folder is missing")
     ),
     tag = "ferrofin"
 )]
@@ -134,10 +146,32 @@ async fn delete_subtitle(
     State(state): State<AppState>,
     RequireAdmin(auth): RequireAdmin,
     Path((DotnetGuid(item_id), index)): Path<(DotnetGuid, i32)>,
-) -> Result<StatusCode, ApiError> {
-    require_item(&state, item_id, &auth).await?;
-    state.subtitles.delete_subtitles(item_id, index).await?;
-    Ok(StatusCode::NO_CONTENT)
+) -> Response {
+    let deleted = async move {
+        if item_id.is_nil() {
+            return Err(ApiError::BadRequest("Guid can't be empty".to_owned()));
+        }
+        require_item(&state, item_id, &auth).await?;
+        // Upstream finishes the delete and its refresh for a client that hangs
+        // up, so they run on a task of their own, in the request's span.
+        tokio::spawn(tracing::Instrument::in_current_span(async move {
+            state.subtitles.delete_subtitles(item_id, index).await?;
+            run_item_refresh(&state, item_id).await
+        }))
+        .await
+        .unwrap_or_else(|err| {
+            Err(ApiError::Service(ServiceError::backend(format!(
+                "subtitle delete task failed: {err}"
+            ))))
+        })
+    }
+    .await;
+    match deleted {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        // `NotFound()` is an action result, not a throw.
+        Err(error @ ApiError::Problem(_)) => error.into_response(),
+        Err(error) => error.into_exception_response(),
+    }
 }
 
 /// The `POST /Videos/{itemId}/Subtitles` request body — a base64-encoded subtitle
@@ -207,6 +241,13 @@ struct RemoteSearchQuery {
     is_perfect_match: Option<bool>,
 }
 
+/// `{language}`, the `[FromRoute, Required] string` of `SearchRemoteSubtitles`.
+struct Language;
+
+impl RouteParameter for Language {
+    const NAME: &'static str = "language";
+}
+
 /// `GET /Items/{itemId}/RemoteSearch/Subtitles/{language}` — search providers.
 ///
 /// Port of `SubtitleController.SearchRemoteSubtitles`: `404` for a missing item,
@@ -228,7 +269,8 @@ struct RemoteSearchQuery {
 async fn search_remote_subtitles(
     State(state): State<AppState>,
     RequireSubtitleManagement(auth): RequireSubtitleManagement,
-    Path((DotnetGuid(item_id), language)): Path<(DotnetGuid, String)>,
+    RequiredRouteString(language, _): RequiredRouteString<Language>,
+    Path((DotnetGuid(item_id), _)): Path<(DotnetGuid, String)>,
     Query(query): Query<RemoteSearchQuery>,
 ) -> Result<Json<Vec<RemoteSubtitleInfo>>, ApiError> {
     require_video(&state, item_id, &auth).await?;
@@ -245,12 +287,22 @@ async fn search_remote_subtitles(
     Ok(Json(results))
 }
 
+/// `{subtitleId}`, the `[FromRoute, Required] string` of
+/// `DownloadRemoteSubtitles`, which the router registers as `{language}`.
+struct DownloadedSubtitleId;
+
+impl RouteParameter for DownloadedSubtitleId {
+    const NAME: &'static str = "subtitleId";
+    const ROUTE_NAME: &'static str = "language";
+}
+
 /// `POST /Items/{itemId}/RemoteSearch/Subtitles/{subtitleId}` — download one.
 ///
 /// Port of `SubtitleController.DownloadRemoteSubtitles`: `404` for a missing
-/// item, else `204` after attempting the download (the C# swallows download
-/// errors and still returns `204`; a metadata refresh is queued). After router
-/// normalization the trailing id segment is captured as `{language}`.
+/// item, else `204` after attempting the download and queueing a metadata
+/// refresh. Like the C# `try`, a failure of either is logged at error and still
+/// answered `204`. After router normalization the trailing id segment is
+/// captured as `{language}`.
 #[utoipa::path(
     post,
     path = "/Items/{itemId}/RemoteSearch/Subtitles/{language}",
@@ -267,20 +319,29 @@ async fn search_remote_subtitles(
 async fn download_remote_subtitles(
     State(state): State<AppState>,
     RequireSubtitleManagement(auth): RequireSubtitleManagement,
-    Path((DotnetGuid(item_id), subtitle_id)): Path<(DotnetGuid, String)>,
+    RequiredRouteString(subtitle_id, _): RequiredRouteString<DownloadedSubtitleId>,
+    Path((DotnetGuid(item_id), _)): Path<(DotnetGuid, String)>,
 ) -> Result<StatusCode, ApiError> {
     require_video(&state, item_id, &auth).await?;
-    // The C# logs-and-continues on a provider failure, still returning 204, then
-    // queues a refresh. A download that succeeds queues the refresh too.
-    if state
-        .subtitles
-        .download_subtitles(item_id, &subtitle_id)
-        .await
-        .is_ok()
-    {
-        queue_high_priority_refresh(&state, item_id).await?;
+    let downloaded = async {
+        state
+            .subtitles
+            .download_subtitles(item_id, &subtitle_id)
+            .await?;
+        queue_high_priority_refresh(&state, item_id).await
+    }
+    .await;
+    if let Err(error) = downloaded {
+        tracing::error!(%item_id, ?subtitle_id, %error, "Error downloading subtitles");
     }
     Ok(StatusCode::NO_CONTENT)
+}
+
+/// `{subtitleId}`, the `[FromRoute, Required] string` of `GetRemoteSubtitles`.
+struct RemoteSubtitleId;
+
+impl RouteParameter for RemoteSubtitleId {
+    const NAME: &'static str = "subtitleId";
 }
 
 /// `GET /Providers/Subtitles/Subtitles/{subtitleId}` — fetch a remote subtitle.
@@ -299,7 +360,7 @@ async fn download_remote_subtitles(
 async fn get_remote_subtitles(
     State(state): State<AppState>,
     RequireSubtitleManagement(_auth): RequireSubtitleManagement,
-    Path(subtitle_id): Path<String>,
+    RequiredRouteString(subtitle_id, _): RequiredRouteString<RemoteSubtitleId>,
 ) -> Result<Response, ApiError> {
     let result = state.subtitles.get_remote_subtitles(&subtitle_id).await?;
     let mime = subtitle_mime(&result.format);
@@ -480,6 +541,15 @@ async fn serve_graphical_subtitle(
     Ok(Some(response))
 }
 
+/// `{routeMediaSourceId}`, the `[FromRoute, Required] string` of `GetSubtitle`
+/// and `GetSubtitleWithTicks`, which the router registers as `{container}`.
+struct RouteMediaSourceId;
+
+impl RouteParameter for RouteMediaSourceId {
+    const NAME: &'static str = "routeMediaSourceId";
+    const ROUTE_NAME: &'static str = "container";
+}
+
 /// `GET /Videos/{itemId}/{container}/Subtitles/{index}/{routeFormat}` — convert a
 /// subtitle stream to the requested format on the fly.
 ///
@@ -509,15 +579,18 @@ async fn serve_graphical_subtitle(
 async fn get_subtitle(
     State(state): State<AppState>,
     axum::Extension(auth): axum::Extension<ferrofin_traits::options::AuthorizationInfo>,
-    Path((DotnetGuid(item_id), media_source_id, index, route_format)): Path<(
-        DotnetGuid,
-        String,
-        i32,
-        String,
-    )>,
+    RequiredRouteString(media_source_id, _): RequiredRouteString<RouteMediaSourceId>,
+    Path((DotnetGuid(item_id), _, index, route_format)): Path<(DotnetGuid, String, i32, String)>,
     Query(query): Query<SubtitleStreamQuery>,
     request: Request,
 ) -> Result<Response, ApiError> {
+    // `Stream.{routeFormat}`: a required string after the literal, which
+    // matches only with something after it (the same `stream.` literal).
+    if let Some(value) = stream_route_container(&route_format)
+        && let Some(rejection) = blank_route_values([("routeFormat", value)])
+    {
+        return Ok(rejection);
+    }
     require_streamable_item(
         &state,
         &auth,
@@ -561,12 +634,24 @@ async fn get_subtitle(
 async fn get_subtitle_with_ticks(
     State(state): State<AppState>,
     axum::Extension(auth): axum::Extension<ferrofin_traits::options::AuthorizationInfo>,
-    Path((DotnetGuid(item_id), media_source_id, index, start_position_ticks, route_format)): Path<
-        (DotnetGuid, String, i32, i64, String),
-    >,
+    RequiredRouteString(media_source_id, _): RequiredRouteString<RouteMediaSourceId>,
+    Path((DotnetGuid(item_id), _, index, start_position_ticks, route_format)): Path<(
+        DotnetGuid,
+        String,
+        i32,
+        i64,
+        String,
+    )>,
     Query(mut query): Query<SubtitleStreamQuery>,
     request: Request,
 ) -> Result<Response, ApiError> {
+    // `Stream.{routeFormat}`: a required string after the literal, which
+    // matches only with something after it (the same `stream.` literal).
+    if let Some(value) = stream_route_container(&route_format)
+        && let Some(rejection) = blank_route_values([("routeFormat", value)])
+    {
+        return Ok(rejection);
+    }
     require_streamable_item(
         &state,
         &auth,
@@ -599,6 +684,15 @@ struct SubtitlePlaylistQuery {
     segment_length: i32,
 }
 
+/// `{mediaSourceId}`, the `[FromRoute, Required] string` of
+/// `GetSubtitlePlaylist`, which the router registers as `{container}`.
+struct PlaylistMediaSourceId;
+
+impl RouteParameter for PlaylistMediaSourceId {
+    const NAME: &'static str = "mediaSourceId";
+    const ROUTE_NAME: &'static str = "container";
+}
+
 /// `GET /Videos/{itemId}/{container}/Subtitles/{index}/subtitles.m3u8` — the HLS
 /// subtitle playlist for a stream.
 ///
@@ -628,7 +722,8 @@ async fn get_subtitle_playlist(
     // The subtitle stream index is part of the URL but does not affect the
     // playlist body (the segments all point at the same `stream.vtt`); the C#
     // suppresses the same unused parameter (CA1801).
-    Path((DotnetGuid(item_id), media_source_id, _index)): Path<(DotnetGuid, String, i32)>,
+    RequiredRouteString(media_source_id, _): RequiredRouteString<PlaylistMediaSourceId>,
+    Path((DotnetGuid(item_id), _, _index)): Path<(DotnetGuid, String, i32)>,
     Query(query): Query<SubtitlePlaylistQuery>,
     parts: axum::http::request::Parts,
 ) -> Result<Response, ApiError> {
@@ -787,6 +882,13 @@ async fn get_fallback_font_list(
     Ok(Json(fonts))
 }
 
+/// `{name}`, the `[FromRoute, Required] string` of `GetFallbackFont`.
+struct FontName;
+
+impl RouteParameter for FontName {
+    const NAME: &'static str = "name";
+}
+
 /// `GET /FallbackFont/Fonts/{name}` — serve a single fallback font file.
 ///
 /// Port of `SubtitleController.GetFallbackFont`: locate the named file under
@@ -809,12 +911,9 @@ async fn get_fallback_font_list(
 async fn get_fallback_font(
     State(state): State<AppState>,
     RequireAuth(_auth): RequireAuth,
-    Path(name): Path<String>,
+    RequiredRouteString(name, _): RequiredRouteString<FontName>,
     headers: HeaderMap,
 ) -> Result<Response, ApiError> {
-    if name.trim().is_empty() {
-        return Err(ApiError::BadRequest("missing required 'name'".to_owned()));
-    }
     let options = state.config.get_encoding_options().await?;
     let Some(path) = options.fallback_font_path.filter(|p| !p.is_empty()) else {
         return Ok(StatusCode::OK.into_response());

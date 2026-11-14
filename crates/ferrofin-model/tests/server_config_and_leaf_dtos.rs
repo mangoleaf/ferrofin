@@ -285,7 +285,7 @@ fn group_update_is_internally_tagged_on_type() {
     let gid = Uuid::nil();
     let update = GroupUpdate::UserJoined(UserJoinedUpdate {
         group_id: gid,
-        data: "alice".into(),
+        data: Some("alice".into()),
     });
     let v = serde_json::to_value(&update).expect("serialize");
     assert_eq!(

@@ -6,8 +6,8 @@ use thiserror::Error;
 ///
 /// Wraps the underlying [`sqlx::Error`] (connection, query, and pool
 /// failures) and [`sqlx::migrate::MigrateError`] (schema-migration
-/// failures), plus variants for values read from the database that do not
-/// map onto a known enum discriminant or a valid `Guid`.
+/// failures), plus a variant for values read from the database that do not
+/// map onto a known enum discriminant.
 #[derive(Debug, Error)]
 pub enum DbError {
     /// Two existing accounts would share the same invariant username key.
@@ -72,15 +72,6 @@ pub enum DbError {
         path: String,
         /// The underlying filesystem failure.
         source: std::io::Error,
-    },
-
-    /// A stored `Guid` column did not parse as a hyphenated UUID.
-    #[error("invalid guid in column `{column}`: {source}")]
-    InvalidGuid {
-        /// The entity column whose stored `Guid` string was malformed.
-        column: &'static str,
-        /// The underlying UUID parse failure.
-        source: uuid::Error,
     },
 }
 

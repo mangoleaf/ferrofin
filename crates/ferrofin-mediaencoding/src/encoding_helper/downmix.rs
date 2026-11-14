@@ -288,6 +288,7 @@ mod tests {
             is_input_video: false,
             subtitle_delivery_method: SubtitleDeliveryMethod::Encode,
             trimmed_subtitle_path: None,
+            transcode_reasons: ferrofin_model::session::TranscodeReasons::empty(),
             run_time_ticks: None,
             transcoding_type: ferrofin_traits::media_encoding::TranscodingJobType::Hls,
             supported_video_codecs: Vec::new(),

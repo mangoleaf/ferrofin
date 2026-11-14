@@ -16,7 +16,7 @@ use ferrofin_api::state::AppState;
 use ferrofin_api::test_support::{
     FakeAppHost, FakeCollections, FakeConfig, FakeMusic, FakePlaylists, FakeProviders,
     FakeQuickConnect, FakeSearch, FakeSessions, FakeSimilarItems, FakeSystem, FakeTvSeries,
-    FakeUserData, FakeUserViews, minimal_base_item,
+    FakeUserData, FakeUserViews, FixedAuth, fake_user_entity, minimal_base_item,
 };
 use ferrofin_db::entities::base_items::BaseItemEntity;
 use ferrofin_db::entities::users::UserEntity;
@@ -26,10 +26,7 @@ use ferrofin_model::media_info::{LiveStreamRequest, MediaProtocol};
 use ferrofin_model::querying::QueryResult;
 use ferrofin_traits::error::ServiceError;
 use ferrofin_traits::library::{LibraryManager, MediaSourceManager, UserManager};
-use ferrofin_traits::net::{AuthService, AuthorizationContext, RequestContext};
-use ferrofin_traits::options::{
-    AuthorizationInfo, DeleteOptions, InternalItemsQuery, InternalPeopleQuery,
-};
+use ferrofin_traits::options::{DeleteOptions, InternalItemsQuery, InternalPeopleQuery};
 use ferrofin_traits::persistence::ItemWithCounts;
 use tower::ServiceExt;
 use uuid::Uuid;
@@ -40,70 +37,14 @@ const ITEM_ID: Uuid = Uuid::from_u128(0x00A1_0001);
 /// A minimal authenticated user for the stubs.
 fn user() -> UserEntity {
     UserEntity {
-        id: USER_ID.to_string(),
-        audio_language_preference: None,
-        authentication_provider_id: String::new(),
-        cast_receiver_id: None,
-        display_collections_view: false,
-        display_missing_episodes: false,
-        enable_auto_login: false,
-        enable_local_password: false,
-        enable_next_episode_auto_play: false,
-        enable_user_preference_access: false,
-        hide_played_in_latest: false,
-        internal_id: 0,
-        invalid_login_attempt_count: 0,
-        last_activity_date: None,
-        last_login_date: None,
-        login_attempts_before_lockout: None,
-        max_active_sessions: 0,
-        max_parental_rating_score: None,
-        max_parental_rating_sub_score: None,
-        must_update_password: false,
         password: Some("hashed".to_owned()),
-        password_reset_provider_id: String::new(),
-        play_default_audio_track: false,
-        remember_audio_selections: false,
-        remember_subtitle_selections: false,
-        remote_client_bitrate_limit: None,
-        row_version: 0,
-        subtitle_language_preference: None,
-        subtitle_mode: 0,
-        sync_play_access: 0,
-        username: "alice".to_owned(),
-        normalized_username: "ALICE".to_owned(),
+        ..fake_user_entity(USER_ID, "alice")
     }
 }
 
-/// An [`AuthService`]/[`AuthorizationContext`] that authenticates as [`USER_ID`].
-struct OkAuth;
-
-#[async_trait]
-impl AuthService for OkAuth {
-    async fn authenticate(
-        &self,
-        _request: &RequestContext,
-    ) -> Result<AuthorizationInfo, ServiceError> {
-        Ok(AuthorizationInfo {
-            user: Some(Arc::new(user())),
-            is_authenticated: true,
-            ..AuthorizationInfo::default()
-        })
-    }
-}
-
-#[async_trait]
-impl AuthorizationContext for OkAuth {
-    async fn get_authorization_info(
-        &self,
-        _request: &RequestContext,
-    ) -> Result<AuthorizationInfo, ServiceError> {
-        Ok(AuthorizationInfo {
-            user: Some(Arc::new(user())),
-            is_authenticated: true,
-            ..AuthorizationInfo::default()
-        })
-    }
+/// An `AuthService`/`AuthorizationContext` that authenticates as [`USER_ID`].
+fn ok_auth() -> FixedAuth {
+    FixedAuth::signed_in(user())
 }
 
 /// A [`UserManager`] resolving the fixed authenticated user.
@@ -115,9 +56,6 @@ impl UserManager for OkUsers {
         Ok((id == USER_ID).then(user))
     }
     async fn get_users(&self) -> Result<Vec<UserEntity>, ServiceError> {
-        unimplemented!()
-    }
-    async fn get_user_ids(&self) -> Result<Vec<Uuid>, ServiceError> {
         unimplemented!()
     }
     async fn initialize(&self) -> Result<(), ServiceError> {
@@ -326,13 +264,6 @@ impl LibraryManager for StreamLibrary {
     ) -> Result<Vec<BaseItemEntity>, ServiceError> {
         unimplemented!()
     }
-    async fn create_items(
-        &self,
-        _i: &[BaseItemEntity],
-        _p: Option<Uuid>,
-    ) -> Result<(), ServiceError> {
-        unimplemented!()
-    }
     async fn update_items(
         &self,
         _i: &[BaseItemEntity],
@@ -428,9 +359,6 @@ struct DownloadDto(bool);
 
 #[async_trait]
 impl ferrofin_traits::dto::DtoService for DownloadDto {
-    async fn get_primary_image_aspect_ratio(&self, _id: Uuid) -> Result<Option<f64>, ServiceError> {
-        unimplemented!()
-    }
     async fn get_base_item_dto(
         &self,
         _item: &BaseItemEntity,
@@ -451,15 +379,6 @@ impl ferrofin_traits::dto::DtoService for DownloadDto {
         _owner: Option<Uuid>,
         _skip: bool,
     ) -> Result<Vec<ferrofin_model::dto::BaseItemDto>, ServiceError> {
-        unimplemented!()
-    }
-    async fn get_item_by_name_dto(
-        &self,
-        _item: &BaseItemEntity,
-        _options: &ferrofin_traits::options::DtoOptions,
-        _ids: Option<&[Uuid]>,
-        _user: Option<&UserEntity>,
-    ) -> Result<ferrofin_model::dto::BaseItemDto, ServiceError> {
         unimplemented!()
     }
     async fn can_delete(
@@ -514,8 +433,8 @@ fn state_with_download(
         Arc::new(FakeSimilarItems),
         Arc::new(FakeSearch),
         Arc::new(DownloadDto(downloadable)),
-        Arc::new(OkAuth),
-        Arc::new(OkAuth),
+        Arc::new(ok_auth()),
+        Arc::new(ok_auth()),
         Arc::new(FakeQuickConnect),
         Arc::new(FakePlaylists),
         Arc::new(FakeCollections),
@@ -680,8 +599,13 @@ async fn administrator_download_still_honors_the_item_permission() {
     assert!(!response.headers().contains_key("content-disposition"));
 }
 
+/// The body is `size` random bytes (`Random.Shared.NextBytes`), which a
+/// compressing proxy or VPN between server and client cannot shrink: a body it
+/// could would download faster than the link allows and inflate the bitrate the
+/// client measures.
 #[tokio::test]
-async fn bitrate_test_returns_requested_size() {
+async fn bitrate_test_returns_requested_size_of_incompressible_bytes() {
+    use std::io::Write as _;
     let (_dir, path) = temp_media();
     let app = state(&path).app;
     let router = create_router(app);
@@ -694,6 +618,31 @@ async fn bitrate_test_returns_requested_size() {
         .await
         .unwrap();
     assert_eq!(body.len(), 2048);
+    let mut gzip = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+    gzip.write_all(&body).unwrap();
+    let compressed = gzip.finish().unwrap().len();
+    assert!(
+        compressed >= body.len(),
+        "gzip shrank the {} bytes to {compressed}",
+        body.len()
+    );
+}
+
+/// No `size` is the C# default, 102400 bytes, exactly: not the power of two
+/// upstream's `ArrayPool` rental rounds it up to.
+#[tokio::test]
+async fn bitrate_test_defaults_to_102400_bytes() {
+    let (_dir, path) = temp_media();
+    let router = create_router(state(&path).app);
+    let resp = router
+        .oneshot(authed("GET", "/Playback/BitrateTest"))
+        .await
+        .expect("response");
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    assert_eq!(body.len(), 102_400);
 }
 
 #[tokio::test]

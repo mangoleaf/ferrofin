@@ -103,7 +103,7 @@ pub struct CreatePlaylistDto {
     /// Gets or sets item ids to add to the playlist.
     #[serde(default)]
     #[schema(value_type = Vec<String>, format = "uuid")]
-    #[serde(with = "crate::json::guid::vec")]
+    #[serde(with = "crate::json::guid::comma_delimited")]
     pub ids: Vec<Uuid>,
 
     /// Gets or sets the user id.
@@ -170,7 +170,7 @@ pub struct UpdatePlaylistDto {
     /// Gets or sets item ids of the playlist.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schema(value_type = Option<Vec<String>>, format = "uuid")]
-    #[serde(with = "crate::json::guid::option_vec")]
+    #[serde(with = "crate::json::guid::comma_delimited::option")]
     pub ids: Option<Vec<Uuid>>,
 
     /// Gets or sets the playlist users.

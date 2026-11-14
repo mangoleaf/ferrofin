@@ -224,13 +224,6 @@ impl LibraryManager for AudioLibrary {
     ) -> Result<Vec<BaseItemEntity>, ServiceError> {
         unimplemented!("unused")
     }
-    async fn create_items(
-        &self,
-        _i: &[BaseItemEntity],
-        _p: Option<Uuid>,
-    ) -> Result<(), ServiceError> {
-        unimplemented!("unused")
-    }
     async fn update_items(
         &self,
         _i: &[BaseItemEntity],
@@ -668,6 +661,25 @@ async fn an_unsupported_hls_segment_container_falls_back_to_ts() {
     .await;
     assert_eq!(resp.status(), StatusCode::OK);
     assert_eq!(master(&served).segment_container.as_deref(), Some("ts"));
+}
+
+/// gl-1041: an `audioCodec` this ffmpeg cannot encode leaves the builder with
+/// no transcoding profile, so the source keeps the client's protocol
+/// (`SetStreamInfoOptionsFromTranscodingProfile` never runs), and
+/// `transcodingProtocol=hls` still answers with the master playlist.
+#[tokio::test]
+async fn an_unencodable_codec_keeps_the_clients_hls_protocol() {
+    let file = temp_file();
+    let (app, served) = router(vec![flac_source(ITEM_ID, &file.path, 900_000)], &file.path);
+    let resp = get(
+        app,
+        "container=mp3&transcodingContainer=ts&transcodingProtocol=hls&audioCodec=truehd",
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let req = master(&served);
+    assert_eq!(req.segment_container.as_deref(), Some("ts"));
+    assert_eq!(req.audio_codec.as_deref(), Some("truehd"));
 }
 
 /// A remote direct-playable source is redirected to when the client allows it.

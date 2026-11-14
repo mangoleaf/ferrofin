@@ -4,6 +4,8 @@
 //! neither. Upstream reads the custom name on every request, but from a
 //! dictionary (`DeviceManager._deviceOptions`); here it is a SQLite statement,
 //! which a playing client's progress report every few seconds would pay.
+//! The other way round, renaming a device renames its live sessions (C#
+//! `OnDeviceManagerDeviceOptionsUpdated`).
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -12,7 +14,6 @@ use async_trait::async_trait;
 use ferrofin_db::Database;
 use ferrofin_db::entities::security::{DeviceEntity, DeviceOptionsEntity};
 use ferrofin_db::entities::users::UserEntity;
-use ferrofin_model::devices::DeviceInfo;
 use ferrofin_model::dto::{ClientCapabilitiesDto, DeviceInfoDto};
 use ferrofin_model::querying::QueryResult;
 use ferrofin_model::session::{
@@ -89,12 +90,6 @@ impl DeviceManager for CountingDevices {
         query: &DeviceQuery,
     ) -> Result<QueryResult<DeviceEntity>, ServiceError> {
         self.inner.get_devices(query).await
-    }
-    async fn get_device_infos(
-        &self,
-        query: &DeviceQuery,
-    ) -> Result<QueryResult<DeviceInfo>, ServiceError> {
-        self.inner.get_device_infos(query).await
     }
     async fn get_devices_for_user(
         &self,
@@ -363,5 +358,80 @@ async fn the_id_path_logs_the_same_activity() {
     assert!(
         matches!(refused, Err(ServiceError::InvalidInput(_))),
         "{refused:?}"
+    );
+}
+
+/// Renaming a device renames its live sessions at once (C#
+/// `OnDeviceManagerDeviceOptionsUpdated`), not only the next new one, and
+/// leaves another device's sessions alone. Clearing the name only clears the
+/// mark, so the session keeps the custom name until its next request reports
+/// the device's own.
+#[tokio::test]
+async fn renaming_a_device_renames_its_live_sessions() {
+    let db = test_db().await;
+    let devices = CountingDevices::new(&db, None);
+    let mgr = manager_over(&db, Arc::clone(&devices));
+    let alice = seed_named_user(&db, Uuid::new_v4(), "alice").await;
+    let bob = seed_named_user(&db, Uuid::new_v4(), "bob").await;
+    mgr.log_session_activity("Web", "1.0", "dev-1", "TV", "e", Some(&alice))
+        .await
+        .unwrap();
+    mgr.log_session_activity("Web", "1.0", "dev-1", "TV", "e", Some(&bob))
+        .await
+        .unwrap();
+    mgr.log_session_activity("Web", "1.0", "dev-2", "Phone", "e", Some(&alice))
+        .await
+        .unwrap();
+    // The device id is matched ordinally, as in C#.
+    mgr.log_session_activity("Web", "1.0", "DEV-1", "Tablet", "e", Some(&alice))
+        .await
+        .unwrap();
+    let names = || async {
+        let mut names: Vec<_> = mgr
+            .get_sessions(Uuid::nil(), None, None, None, true)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|s| {
+                (
+                    s.device_id.unwrap(),
+                    s.device_name.unwrap(),
+                    s.has_custom_device_name,
+                )
+            })
+            .collect();
+        names.sort();
+        names
+    };
+
+    devices
+        .update_device_options("dev-1", Some("Den"))
+        .await
+        .unwrap();
+    mgr.on_device_options_updated("dev-1", Some("Den")).await;
+    assert_eq!(
+        names().await,
+        [
+            ("DEV-1".to_owned(), "Tablet".to_owned(), false),
+            ("dev-1".to_owned(), "Den".to_owned(), true),
+            ("dev-1".to_owned(), "Den".to_owned(), true),
+            ("dev-2".to_owned(), "Phone".to_owned(), false),
+        ]
+    );
+
+    mgr.on_device_options_updated("dev-1", Some("  ")).await;
+    assert_eq!(
+        names().await[1],
+        ("dev-1".to_owned(), "Den".to_owned(), false),
+        "a blank name clears only the mark"
+    );
+    mgr.log_session_activity("Web", "1.0", "dev-1", "TV", "e", Some(&alice))
+        .await
+        .unwrap();
+    assert!(
+        names()
+            .await
+            .contains(&("dev-1".to_owned(), "TV".to_owned(), false)),
+        "the next request reports the device's own name"
     );
 }

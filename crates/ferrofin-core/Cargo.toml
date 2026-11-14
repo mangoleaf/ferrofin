@@ -27,10 +27,12 @@ tokio = { workspace = true }
 notify.workspace = true
 sqlx.workspace = true
 serde.workspace = true
-serde_json.workspace = true
+serde_json = { workspace = true, features = ["raw_value"] }
 quick-xml.workspace = true
 thiserror.workspace = true
 uuid.workspace = true
+# QuickConnect secrets (the thread-local CSPRNG, as ferrofin-common's salts).
+rand.workspace = true
 chrono.workspace = true
 # Root linguistic comparison for UserViewBuilder literal name filters.
 icu_collator.workspace = true
@@ -47,6 +49,9 @@ sha2.workspace = true
 ferrofin-drawing.workspace = true
 # Embedded lyrics (SYLT, file order) for the scan's lyric pick.
 lofty.workspace = true
+# Backup archives (`time` stamps entries with now); also the comic-archive
+# fixtures of the book runtime tests.
+zip = { workspace = true, features = ["time"] }
 
 [target.'cfg(unix)'.dependencies]
 libc.workspace = true

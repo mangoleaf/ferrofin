@@ -2,19 +2,18 @@
 //!
 //! Port of the *server-relevant* subset of
 //! `Emby.Server.Implementations.ApplicationHost`: the network-facing facts
-//! (ports, HTTPS, friendly name), the two URL builders, and the virtual-path
-//! expand/reverse pair. The DI container, plugin loader, assembly scanning, and
-//! lifetime plumbing that dominate the C# class are intentionally dropped (they
-//! belong to the Wave 8 composition root).
+//! (ports, HTTPS, friendly name) and the URL builders. The DI container, plugin
+//! loader, assembly scanning, and lifetime plumbing that dominate the C# class
+//! are intentionally dropped (they belong to the Wave 8 composition root).
 //!
 //! The composition root injects the listener facts and shared network manager.
 //! Peer-aware URLs resolve against current interfaces and published subnet overrides;
 //! HTTP requests may additionally use their Host header when configured. The friendly
 //! name derives from the live server configuration.
 //!
-//! `expand_virtual_path`/`reverse_virtual_path` reproduce the two-step
-//! `String.Replace` chain over the `%AppDataPath%`/`%MetadataPath%` placeholders,
-//! reading the live data/metadata paths off the shared application paths.
+//! `ExpandVirtualPath`/`ReverseVirtualPath` are not here: the item and image
+//! paths that use them read and write through
+//! [`VirtualPathExpander`](crate::virtual_paths::VirtualPathExpander).
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::atomic::{AtomicU16, Ordering};
@@ -28,10 +27,7 @@ use ferrofin_traits::configuration::{
 };
 use ferrofin_traits::error::ServiceError;
 use ferrofin_traits::net::RequestContext;
-use ferrofin_traits::system::{LocalApiAccess, ServerApplicationHost, ServerApplicationPaths};
-
-use crate::app_paths::FerrofinServerApplicationPaths;
-use crate::virtual_paths::replace_ignore_ascii_case;
+use ferrofin_traits::system::{LocalApiAccess, ServerApplicationHost};
 
 /// The application product name (`ApplicationHost.ApplicationProductName`).
 ///
@@ -83,11 +79,9 @@ impl Default for HostNetworkInfo {
 
 /// The concrete server application host.
 ///
-/// Holds the shared application paths (for virtual-path expansion), the injected
-/// configuration manager (for the friendly name), the network facts, and the
-/// startup-completed flag.
+/// Holds the injected configuration manager (for the friendly name), the
+/// network facts, and the startup-completed flag.
 pub struct FerrofinServerApplicationHost {
-    paths: Arc<FerrofinServerApplicationPaths>,
     configuration_manager: Arc<dyn ServerConfigurationManager>,
     network: HostNetworkInfo,
     network_manager: Option<Arc<RwLock<NetworkManager>>>,
@@ -111,14 +105,12 @@ impl std::fmt::Debug for FerrofinServerApplicationHost {
 }
 
 impl FerrofinServerApplicationHost {
-    /// Creates a host over the given paths, configuration manager, and network
-    /// facts.
+    /// Creates a host over the given configuration manager and network facts.
     ///
     /// `machine_name` is the fallback friendly name used when
     /// `Configuration.ServerName` is blank (C# `Environment.MachineName`).
     #[must_use]
     pub fn new(
-        paths: Arc<FerrofinServerApplicationPaths>,
         configuration_manager: Arc<dyn ServerConfigurationManager>,
         network: HostNetworkInfo,
         machine_name: impl Into<String>,
@@ -128,7 +120,6 @@ impl FerrofinServerApplicationHost {
             ..network
         };
         Self {
-            paths,
             configuration_manager,
             bound_http_port: AtomicU16::new(network.http_port),
             bound_https_port: AtomicU16::new(network.https_port),
@@ -337,13 +328,13 @@ impl FerrofinServerApplicationHost {
         )
     }
 
-    /// Parses the `Host` header of a request into `(host, port)`.
+    /// Parses the `Host` header of a request into `(host, port)`: upstream's
+    /// `request.Host`, which the API layer has already replaced with a known
+    /// proxy's `X-Forwarded-Host`, as `ForwardedHeadersMiddleware` does.
     ///
     /// The port is `None` when absent or unparseable. IPv6 literals in
     /// brackets (`[::1]:8096`) are handled.
     fn parse_request_host(request: &RequestContext) -> Option<(String, Option<u16>)> {
-        // TODO(gl-813): behind a known proxy, upstream's `request.Host` (host
-        // and port) is the proxy's `X-Forwarded-Host` (ForwardedHeadersMiddleware).
         let host = request.header("host")?;
         if let Some(rest) = host.strip_prefix('[') {
             // IPv6 literal: [addr]:port
@@ -499,43 +490,6 @@ impl ServerApplicationHost for FerrofinServerApplicationHost {
         };
         Ok(self.build_local_api_url(&hostname, None, port))
     }
-
-    async fn get_local_api_url(
-        &self,
-        hostname: &str,
-        scheme: Option<&str>,
-        port: Option<u16>,
-    ) -> Result<String, ServiceError> {
-        Ok(self.build_local_api_url(hostname, scheme, port))
-    }
-
-    fn expand_virtual_path(&self, path: &str) -> String {
-        let data = self.paths.data_path();
-        let metadata = self.paths.internal_metadata_path();
-        replace_ignore_ascii_case(
-            &replace_ignore_ascii_case(
-                path,
-                FerrofinServerApplicationPaths::VIRTUAL_DATA_PATH,
-                &data,
-            ),
-            FerrofinServerApplicationPaths::VIRTUAL_INTERNAL_METADATA_PATH,
-            &metadata,
-        )
-    }
-
-    fn reverse_virtual_path(&self, path: &str) -> String {
-        let data = self.paths.data_path();
-        let metadata = self.paths.internal_metadata_path();
-        replace_ignore_ascii_case(
-            &replace_ignore_ascii_case(
-                path,
-                &data,
-                FerrofinServerApplicationPaths::VIRTUAL_DATA_PATH,
-            ),
-            &metadata,
-            FerrofinServerApplicationPaths::VIRTUAL_INTERNAL_METADATA_PATH,
-        )
-    }
 }
 
 #[cfg(test)]
@@ -555,22 +509,18 @@ mod tests {
                 .await
                 .expect("load config"),
         );
-        FerrofinServerApplicationHost::new(paths, cfg, network, "test-machine")
+        FerrofinServerApplicationHost::new(cfg, network, "test-machine")
     }
 
     #[tokio::test]
     async fn local_api_url_builds_scheme_host_port() {
         let h = host(HostNetworkInfo::default()).await;
         assert_eq!(
-            h.get_local_api_url("192.168.1.5", None, None)
-                .await
-                .unwrap(),
+            h.build_local_api_url("192.168.1.5", None, None),
             "http://192.168.1.5:8096"
         );
         assert_eq!(
-            h.get_local_api_url("192.168.1.5", Some("https"), Some(443))
-                .await
-                .unwrap(),
+            h.build_local_api_url("192.168.1.5", Some("https"), Some(443)),
             "https://192.168.1.5"
         );
     }
@@ -579,9 +529,7 @@ mod tests {
     async fn local_api_url_passes_through_full_url() {
         let h = host(HostNetworkInfo::default()).await;
         assert_eq!(
-            h.get_local_api_url("https://jelly.example.com/", None, None)
-                .await
-                .unwrap(),
+            h.build_local_api_url("https://jelly.example.com/", None, None),
             "https://jelly.example.com"
         );
     }
@@ -619,7 +567,7 @@ mod tests {
         };
         let h = host(net).await;
         assert_eq!(
-            h.get_local_api_url("host", None, Some(8096)).await.unwrap(),
+            h.build_local_api_url("host", None, Some(8096)),
             "http://host:8096/jellyfin"
         );
     }
@@ -736,9 +684,7 @@ mod tests {
     async fn http_named_machine_is_a_hostname_not_a_complete_url() {
         let h = host(HostNetworkInfo::default()).await;
         assert_eq!(
-            h.get_local_api_url("http-media", None, None)
-                .await
-                .expect("url"),
+            h.build_local_api_url("http-media", None, None),
             "http://http-media:8096"
         );
     }
@@ -985,25 +931,11 @@ mod tests {
     async fn local_url_formats_unbracketed_ipv6_literal() {
         let h = host(HostNetworkInfo::default()).await;
         assert_eq!(
-            h.get_local_api_url("fd12::2", None, None)
-                .await
-                .expect("url"),
+            h.build_local_api_url("fd12::2", None, None),
             "http://[fd12::2]:8096"
         );
     }
 
-    #[tokio::test]
-    async fn virtual_path_expand_and_reverse_roundtrip() {
-        let h = host(HostNetworkInfo::default()).await;
-        let data = h.paths.data_path();
-        let virtual_path = format!(
-            "{}/subtitles/x.srt",
-            FerrofinServerApplicationPaths::VIRTUAL_DATA_PATH
-        );
-        let expanded = h.expand_virtual_path(&virtual_path);
-        assert_eq!(expanded, format!("{data}/subtitles/x.srt"));
-        assert_eq!(h.reverse_virtual_path(&expanded), virtual_path);
-    }
     #[tokio::test]
     async fn saved_names_update_the_host_and_empty_names_restore_the_fallback() {
         let directory = tempfile::tempdir().unwrap();
@@ -1014,7 +946,6 @@ mod tests {
                 .unwrap(),
         );
         let host = Arc::new(FerrofinServerApplicationHost::new(
-            paths,
             configuration.clone(),
             HostNetworkInfo::default(),
             "fixture-machine",

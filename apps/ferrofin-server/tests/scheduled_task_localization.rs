@@ -1,4 +1,5 @@
-//! `GET /ScheduledTasks` in the request's culture, end to end.
+//! `GET /ScheduledTasks` names and descriptions in the request's culture, and
+//! formatted with the live configuration, end to end.
 //!
 //! Boots the real composition root, so the request localization, the
 //! administrator gate, the handler and the core task registry with the real
@@ -84,6 +85,22 @@ fn bearer(token: &str) -> String {
     format!(r#"MediaBrowser Token="{token}", {IDENT}"#)
 }
 
+/// Signs the seeded administrator in and returns the access token.
+async fn login(router: &axum::Router) -> String {
+    let login = get_json(
+        router,
+        Request::post("/Users/AuthenticateByName")
+            .header(header::AUTHORIZATION, format!("MediaBrowser {IDENT}"))
+            .header(header::CONTENT_TYPE, "application/json"),
+        Body::from(serde_json::json!({ "Username": "admin", "Pw": ADMIN_PASSWORD }).to_string()),
+    )
+    .await;
+    login["AccessToken"]
+        .as_str()
+        .expect("AccessToken")
+        .to_owned()
+}
+
 /// `GET /ScheduledTasks` as the administrator, with `language` as the
 /// request's `Accept-Language` when given, keyed by task key.
 async fn tasks(
@@ -108,15 +125,7 @@ async fn scheduled_tasks_answer_in_the_request_culture() {
     let temp = tempfile::tempdir().expect("temp dir");
     let wired = boot(&temp).await;
     let router = ferrofin_api::create_router(wired.state.clone());
-    let login = get_json(
-        &router,
-        Request::post("/Users/AuthenticateByName")
-            .header(header::AUTHORIZATION, format!("MediaBrowser {IDENT}"))
-            .header(header::CONTENT_TYPE, "application/json"),
-        Body::from(serde_json::json!({ "Username": "admin", "Pw": ADMIN_PASSWORD }).to_string()),
-    )
-    .await;
-    let token = login["AccessToken"].as_str().expect("AccessToken");
+    let token = &login(&router).await;
 
     let english = tasks(&router, token, None).await;
     let task = |tasks: &std::collections::HashMap<String, serde_json::Value>, key: &str| {
@@ -198,6 +207,52 @@ async fn scheduled_tasks_answer_in_the_request_culture() {
         .expect("RefreshLibrary");
     assert_eq!(library.name.as_deref(), Some("Medien-Bibliothek scannen"));
     assert_eq!(library.category.as_deref(), Some("Bibliothek"));
+
+    for task in wired.background {
+        task.abort();
+    }
+}
+
+/// Upstream's `DeleteLogFileTask.Description` formats `TaskCleanLogsDescription`
+/// with the live `LogFileRetentionDays` on every read, so a saved retention
+/// shows at once, without a restart.
+#[tokio::test]
+async fn clean_log_directory_description_follows_the_saved_retention() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let wired = boot(&temp).await;
+    let router = ferrofin_api::create_router(wired.state.clone());
+    let token = &login(&router).await;
+    let description = |tasks: &std::collections::HashMap<String, serde_json::Value>| {
+        tasks["CleanLogFiles"]["Description"]
+            .as_str()
+            .expect("Description")
+            .to_owned()
+    };
+    assert_eq!(
+        description(&tasks(&router, token, None).await),
+        "Deletes log files that are more than 3 days old."
+    );
+
+    let mut settings = get_json(
+        &router,
+        Request::get("/System/Configuration").header(header::AUTHORIZATION, bearer(token)),
+        Body::empty(),
+    )
+    .await;
+    settings["LogFileRetentionDays"] = serde_json::json!(9);
+    send(
+        &router,
+        Request::post("/System/Configuration")
+            .header(header::AUTHORIZATION, bearer(token))
+            .header(header::CONTENT_TYPE, "application/json"),
+        Body::from(settings.to_string()),
+        StatusCode::NO_CONTENT,
+    )
+    .await;
+    assert_eq!(
+        description(&tasks(&router, token, None).await),
+        "Deletes log files that are more than 9 days old."
+    );
 
     for task in wired.background {
         task.abort();

@@ -160,6 +160,35 @@ pub fn should_ignore_path(path: &str) -> bool {
         .any(|rule| rule.matches(&lower, &segments, file_name))
 }
 
+/// The name the directory `dir` resolves with when its name holds `marker`
+/// (lower case, matched in any case) or, failing that, `holds_file()` says it
+/// holds its resolver's metadata file; `None` when neither. The directory arm
+/// of `PlaylistResolver` (`[playlist]`, `playlist.xml`) and of
+/// `BoxSetResolver` (`[boxset]`, `collection.xml`): the name is the folder's
+/// with the marker cut (`Replace(marker, "", OrdinalIgnoreCase).Trim()`, one
+/// left-to-right pass), and `EnsureName` gives a name left empty the folder's
+/// own.
+pub(crate) fn marked_folder_name(
+    dir: &str,
+    marker: &str,
+    holds_file: impl FnOnce() -> bool,
+) -> Option<String> {
+    let name = std::path::Path::new(dir).file_name()?.to_str()?.to_owned();
+    let lower = name.to_ascii_lowercase();
+    if lower.contains(marker) {
+        let mut cut = String::with_capacity(name.len());
+        let mut rest = 0;
+        for (at, _) in lower.match_indices(marker) {
+            cut.push_str(&name[rest..at]);
+            rest = at + marker.len();
+        }
+        cut.push_str(&name[rest..]);
+        let cut = cut.trim();
+        return Some(if cut.is_empty() { name } else { cut.to_owned() });
+    }
+    holds_file().then_some(name)
+}
+
 /// The provider ids a new item's resolver reads from its own name, as
 /// `TrySetProviderId` keeps them (trimmed, valid for their provider):
 ///

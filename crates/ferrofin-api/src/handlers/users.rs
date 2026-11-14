@@ -62,7 +62,7 @@ use crate::auth::{
     is_administrator_identity,
 };
 use crate::error::ApiError;
-use crate::extract::{DotnetGuid, JsonBody, ProblemDetails, Query, RequiredString};
+use crate::extract::{DotnetGuid, JsonBody, ProblemDetails, Query, RequiredString, body_parameter};
 use crate::handlers::items::user_uuid;
 use crate::panic_boundary::ERROR_BODY;
 use crate::state::AppState;
@@ -424,10 +424,12 @@ async fn authentication_result(
     } = result;
     // Build the full User DTO exactly as `GET /Users/Me` does — real policy,
     // configuration, and `ServerId`. jellyfin-web caches `result.User` from login
-    // and drives the whole UI off it, so a bare id/name DTO with a default
-    // (all-false) policy and null `ServerId` locks the client out of its own
-    // libraries/dashboard and throws `getApiClient(null)`. Fall back to the bare
-    // DTO only if the row somehow can't be reloaded post-auth.
+    // and drives the whole UI off it: an all-false policy hides its libraries
+    // and dashboard, and a null `ServerId` throws `getApiClient(null)`. Fall
+    // back to a bare DTO only if the row somehow can't be reloaded post-auth:
+    // the token is minted by then, and upstream always answers with it, so the
+    // fallback carries the session's `ServerId` and `new UserDto()`'s policy
+    // (`new UserPolicy()`) rather than failing the sign-in.
     let user = match load_user(state, session.user_id).await {
         Ok(entity) => state.users.get_user_dto(&entity, None).await.ok(),
         Err(_) => None,
@@ -435,6 +437,7 @@ async fn authentication_result(
     .unwrap_or_else(|| UserDto {
         id: session.user_id,
         name: session.user_name.clone(),
+        server_id: session.server_id.clone(),
         ..UserDto::default()
     });
     let server_id = session.server_id.clone();
@@ -995,6 +998,7 @@ async fn forgot_password(
     let entered_username = match body.entered_username.require(
         "Jellyfin.Api.Models.UserDtos.ForgotPasswordDto",
         "EnteredUsername",
+        || body_parameter(&parts.method, parts.extensions.get()),
     ) {
         Ok(name) => name,
         Err(problem) => return Ok(problem.into_response()),
@@ -1039,12 +1043,14 @@ async fn forgot_password(
 )]
 async fn forgot_password_pin(
     State(state): State<AppState>,
+    parts: Parts,
     JsonBody(body): JsonBody<ForgotPasswordPinDto>,
 ) -> Result<Response, ApiError> {
-    let pin = match body
-        .pin
-        .require("Jellyfin.Api.Models.UserDtos.ForgotPasswordPinDto", "Pin")
-    {
+    let pin = match body.pin.require(
+        "Jellyfin.Api.Models.UserDtos.ForgotPasswordPinDto",
+        "Pin",
+        || body_parameter(&parts.method, parts.extensions.get()),
+    ) {
         Ok(pin) => pin,
         Err(problem) => return Ok(problem.into_response()),
     };

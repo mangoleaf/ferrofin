@@ -177,9 +177,9 @@ Its settings page, the Settings link under Dashboard → Plugins → Ferrofin Se
 menu's **Ferrofin Settings** entry, lists every setting that route reports, in a tab per group in a
 pane on the left, with a search box across every tab and filters (changed, hide read-only) above
 the tabs. Each setting has a readable name with the `config.toml` key, environment variable, flag
-and default below it, a badge for what sets it (`config.toml`, environment or flag) when anything
-does, and, for a setting the page may not change, its value as text with a lock, the reason and
-where it is changed instead. Secrets are shown to the administrator, marked as secrets. A setting
+and default below it, a badge for what sets it (`config.toml`, the Networking page, environment
+or flag) when anything does, and, for a setting the page may not change, its value as text with a
+lock, the reason and where it is changed instead. Secrets are shown to the administrator, marked as secrets. A setting
 the page may change is edited on one line: a field for its kind showing the default, muted, when
 nothing sets it, its unit and **Reset to default**. Each tab counts its unsaved edits; Save posts
 the changed ones of every tab, a refused value shows the server's message next to it, and **Restart

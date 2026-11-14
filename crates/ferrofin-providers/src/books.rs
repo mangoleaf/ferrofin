@@ -29,6 +29,13 @@ use serde::Deserialize;
 
 use crate::xbmc::xml_reader::XmlCursor;
 
+mod page_count;
+
+pub use page_count::{
+    DEFAULT_ARCHIVE_MAX_ENTRIES, NOMINAL_BOOK_RUN_TIME_TICKS, book_run_time_ticks,
+    has_countable_pages,
+};
+
 /// The comic-archive extensions Jellyfin recognizes
 /// (`ComicImageProvider._comicBookExtensions`).
 pub const COMIC_EXTENSIONS: [&str; 4] = ["cb7", "cbr", "cbt", "cbz"];
@@ -38,6 +45,11 @@ pub const COMIC_EXTENSIONS: [&str; 4] = ["cb7", "cbr", "cbt", "cbz"];
 /// A cover page or an OPF document is kilobytes; the cap is what stops a
 /// malicious `.cbz`/`.epub` from turning a scan into an OOM abort.
 const MAX_ARCHIVE_ENTRY_BYTES: u64 = 128 * 1024 * 1024;
+
+/// How long one run of the archive tool that reads a RAR comic may take
+/// (`7z i`, listing the entries, or writing out the cover) before it is
+/// killed.
+const ARCHIVE_TOOL_TIMEOUT: std::time::Duration = std::time::Duration::from_mins(1);
 
 /// A tar block, the size of a tar header and of the head [`read_comic_cover`]
 /// sniffs the archive format from.
@@ -781,15 +793,30 @@ pub fn read_book_cover(path: &str) -> Option<(String, Vec<u8>)> {
 
 /// A comic archive's cover (`ComicImageProvider`): an entry named
 /// `cover.<ext>`, else its first page in key order (`pick_cover`). The
-/// archive is opened as what its content is — ZIP, 7z or tar — whatever its
-/// comic extension says. `None` for anything else, a RAR archive included,
-/// or an archive with no image.
+/// archive is opened as what its content is — ZIP, 7z, tar or RAR — whatever
+/// its comic extension says; RAR through an external tool (`RarReader`).
+/// `None` for anything else, a RAR archive with no tool to read it, or an
+/// archive with no image.
 #[must_use]
 pub fn read_comic_cover(path: &str) -> Option<(String, Vec<u8>)> {
-    use std::io::{Read as _, Seek as _};
     if !COMIC_EXTENSIONS.contains(&extension_of(path).as_str()) {
         return None;
     }
+    let (file, format) = open_comic(path)?;
+    match format {
+        ArchiveFormat::Zip => zip_cover(file),
+        ArchiveFormat::SevenZip => seven_zip_cover(file),
+        ArchiveFormat::Tar => tar_cover(file),
+        ArchiveFormat::Rar => rar_cover(RarReader::get()?, path),
+    }
+}
+
+/// The archive at `path`, opened at its start, and the format its first bytes
+/// show (SharpCompress's `ArchiveFactory` reads the format from the content,
+/// whatever the extension says). `None` for a file that is no archive known
+/// here.
+fn open_comic(path: &str) -> Option<(std::fs::File, ArchiveFormat)> {
+    use std::io::{Read as _, Seek as _};
     let mut file = std::fs::File::open(path).ok()?;
     let mut head = Vec::with_capacity(TAR_BLOCK_BYTES);
     (&mut file)
@@ -797,23 +824,7 @@ pub fn read_comic_cover(path: &str) -> Option<(String, Vec<u8>)> {
         .read_to_end(&mut head)
         .ok()?;
     file.rewind().ok()?;
-    match archive_format(&head)? {
-        ArchiveFormat::Zip => zip_cover(file),
-        ArchiveFormat::SevenZip => seven_zip_cover(file),
-        ArchiveFormat::Tar => tar_cover(file),
-        // TODO(parity, open work item — NOT an accepted divergence; gl-747):
-        // SharpCompress reads RAR4 and RAR5, and no pure-Rust reader does;
-        // which reader Ferrofin takes is the owner's decision. Un-defer path:
-        // the chosen reader lists the entries for `pick_cover` and reads the
-        // chosen one through `read_stream_capped`, with a RAR fixture test.
-        ArchiveFormat::Rar => {
-            tracing::debug!(
-                path,
-                "cover not read: RAR comic archives are not supported yet"
-            );
-            None
-        }
-    }
+    Some((file, archive_format(&head)?))
 }
 
 /// What a comic archive really is, read from its first bytes as
@@ -935,6 +946,199 @@ fn tar_cover(mut file: std::fs::File) -> Option<(String, Vec<u8>)> {
     let size = entry.size();
     let bytes = read_stream_capped(&cover, size, entry, MAX_ARCHIVE_ENTRY_BYTES)?;
     Some((cover, bytes))
+}
+
+/// The cover of a RAR comic ([`pick_cover`]): one run of the tool lists the
+/// entries, a second writes the chosen one to its stdout.
+fn rar_cover(reader: &RarReader, path: &str) -> Option<(String, Vec<u8>)> {
+    let program = reader.program();
+    let listing = run_archive_tool(program, &reader.list_args(path), path)?;
+    let cover = pick_cover(&reader.entries(&String::from_utf8_lossy(&listing)))?;
+    let bytes = run_archive_tool(program, &reader.extract_args(path, &cover), &cover)?;
+    // A name the tool did not match is written as nothing, and 7z exits 0.
+    Some((cover, bytes)).filter(|(_, bytes)| !bytes.is_empty())
+}
+
+/// The external program RAR comics are read with. `ComicImageProvider` reads
+/// RAR4 and RAR5 through SharpCompress; no pure-Rust reader does, and the
+/// `unrar` bindings' licence is not compatible with GPL-3.0-only, so Ferrofin
+/// runs a tool found on `$PATH`, as it finds ffmpeg, and links nothing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RarReader {
+    /// 7-Zip's `7z`.
+    SevenZip(std::path::PathBuf),
+    /// libarchive's `bsdtar`.
+    Bsdtar(std::path::PathBuf),
+}
+
+impl RarReader {
+    /// The tool on `$PATH`, looked for once, on the first RAR comic.
+    fn get() -> Option<&'static Self> {
+        static READER: std::sync::OnceLock<Option<RarReader>> = std::sync::OnceLock::new();
+        READER
+            .get_or_init(|| Self::find(std::env::var_os("PATH").as_deref()))
+            .as_ref()
+    }
+
+    /// `7z` when it decodes RAR, else `bsdtar`, else a `7z` that reads only
+    /// uncompressed entries. Logs once when no tool decodes RAR.
+    fn find(path_var: Option<&std::ffi::OsStr>) -> Option<Self> {
+        use ferrofin_util::program_path::which_in;
+        let seven_zip = which_in("7z", path_var);
+        if seven_zip.as_deref().is_some_and(seven_zip_decodes_rar) {
+            return seven_zip.map(Self::SevenZip);
+        }
+        if let Some(bsdtar) = which_in("bsdtar", path_var) {
+            return Some(Self::Bsdtar(bsdtar));
+        }
+        if seven_zip.is_some() {
+            tracing::warn!(
+                "7z lists no RAR decoder (Debian and Ubuntu ship it as 7zip-rar or p7zip-rar) \
+                 and bsdtar is not on PATH: compressed RAR comics get no cover"
+            );
+        } else {
+            tracing::warn!("neither 7z nor bsdtar is on PATH: RAR comics get no cover");
+        }
+        seven_zip.map(Self::SevenZip)
+    }
+
+    fn program(&self) -> &Path {
+        match self {
+            Self::SevenZip(program) | Self::Bsdtar(program) => program,
+        }
+    }
+
+    /// The arguments that list `archive`'s entries; 7z with wildcards off
+    /// (`-spd`), or `What?.cbr` would list its siblings too.
+    fn list_args(&self, archive: &str) -> Vec<String> {
+        let args: &[&str] = match self {
+            Self::SevenZip(_) => &["l", "-slt", "-spd", "--", archive],
+            Self::Bsdtar(_) => &["-t", "-f", archive],
+        };
+        args.iter().map(|arg| (*arg).to_owned()).collect()
+    }
+
+    /// The entry names in the tool's listing: `7z l -slt` gives a `Path = `
+    /// line per entry, after the archive's own block and a `----------` line;
+    /// bsdtar a name per line.
+    fn entries(&self, listing: &str) -> Vec<String> {
+        match self {
+            Self::SevenZip(_) => listing
+                .lines()
+                .skip_while(|line| *line != "----------")
+                .filter_map(|line| line.strip_prefix("Path = "))
+                .map(str::to_owned)
+                .collect(),
+            Self::Bsdtar(_) => listing.lines().map(str::to_owned).collect(),
+        }
+    }
+
+    /// The arguments that write the entry named exactly `entry` to stdout:
+    /// 7z with wildcards off (`-spd`), bsdtar (which matches shell patterns)
+    /// with the pattern characters escaped, stopping at the first match.
+    fn extract_args(&self, archive: &str, entry: &str) -> Vec<String> {
+        let mut pattern = String::with_capacity(entry.len());
+        for c in entry.chars() {
+            if matches!(c, '*' | '?' | '[' | '\\') {
+                pattern.push('\\');
+            }
+            pattern.push(c);
+        }
+        let args: &[&str] = match self {
+            Self::SevenZip(_) => &["x", "-so", "-spd", "-bd", "-y", "--", archive, entry],
+            Self::Bsdtar(_) => &["-x", "-q", "-O", "-f", archive, "--", &pattern],
+        };
+        args.iter().map(|arg| (*arg).to_owned()).collect()
+    }
+}
+
+/// Whether `7z i` lists the RAR5 decoder. Debian and Ubuntu leave the RAR
+/// decoders out of their 7-Zip and ship them in a non-free plugin; without
+/// it 7z lists a RAR archive but extracts only its uncompressed entries.
+fn seven_zip_decodes_rar(program: &Path) -> bool {
+    run_archive_tool(program, &["i".to_owned()], "7z i")
+        .is_some_and(|info| lists_rar_decoder(&String::from_utf8_lossy(&info)))
+}
+
+/// Whether `7z i`'s output has the RAR5 codec line (` 1   D     40305 Rar5`),
+/// which ends in the codec's name; the RAR5 format's line ends in its
+/// signature bytes.
+fn lists_rar_decoder(info: &str) -> bool {
+    info.lines()
+        .any(|line| line.split_whitespace().last() == Some("Rar5"))
+}
+
+/// What an archive tool writes to stdout, when it exits successfully within
+/// [`ARCHIVE_TOOL_TIMEOUT`]: at most [`MAX_ARCHIVE_ENTRY_BYTES`]
+/// ([`read_stream_capped`]), past which, or past the timeout, the tool is
+/// killed. `what` names the output in log lines. The tool runs with no shell
+/// and a UTF-8 locale, so entry names are listed and matched as they are
+/// stored.
+fn run_archive_tool(program: &Path, args: &[String], what: &str) -> Option<Vec<u8>> {
+    run_archive_tool_within(
+        program,
+        args,
+        what,
+        ARCHIVE_TOOL_TIMEOUT,
+        MAX_ARCHIVE_ENTRY_BYTES,
+    )
+}
+
+/// [`run_archive_tool`] with an explicit timeout and cap, so both can be
+/// exercised without a minute's wait or 128 MiB of output.
+fn run_archive_tool_within(
+    program: &Path,
+    args: &[String],
+    what: &str,
+    timeout: std::time::Duration,
+    cap: u64,
+) -> Option<Vec<u8>> {
+    use std::process::Stdio;
+    let mut child = std::process::Command::new(program)
+        .args(args)
+        .env("LC_ALL", "C.UTF-8")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .inspect_err(|err| {
+            tracing::debug!(%err, program = %program.display(), "archive tool did not start");
+        })
+        .ok()?;
+    let stdout = child.stdout.take();
+    let name = what.to_owned();
+    let (sender, receiver) = std::sync::mpsc::channel();
+    // A thread that cannot start drops the sender, and the tool is killed below.
+    if let Err(err) = std::thread::Builder::new().spawn(move || {
+        let output = stdout.and_then(|stdout| read_stream_capped(&name, 0, stdout, cap));
+        // The receiver is gone after a timeout: there is no one left to tell.
+        let _ = sender.send(output);
+    }) {
+        tracing::debug!(%err, "archive tool output reader did not start");
+    }
+    let output = match receiver.recv_timeout(timeout) {
+        Ok(output) => output,
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+            tracing::warn!(program = %program.display(), ?args, "archive tool timed out; killed");
+            None
+        }
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => None,
+    };
+    if output.is_none() {
+        // Ignored: a tool that has already exited cannot be killed, and is reaped below.
+        let _ = child.kill();
+    }
+    // With its stdout read to the end the tool is exiting; its status says
+    // whether what it wrote is whole.
+    let status = child
+        .wait()
+        .inspect_err(|err| tracing::debug!(%err, "archive tool could not be waited for"))
+        .ok()?;
+    if !status.success() {
+        tracing::debug!(program = %program.display(), ?args, %status, "archive tool failed");
+        return None;
+    }
+    output
 }
 
 /// `ComicImageProvider.FindCoverEntryInArchiveAsync`: the entry named exactly
@@ -2066,6 +2270,47 @@ mod tests {
         assert!(read_book_metadata(&path).is_none());
     }
 
+    // Transliterated from Jellyfin v12.4 `ComicBookInfoProviderTests`, whose
+    // archive bundles an empty `<ComicInfo />` (no metadata either), so the
+    // result is the comment reader's alone. Upstream also asserts its Debug
+    // log lines; Ferrofin's reader logs nothing here yet (gl-1667).
+    #[rstest::rstest]
+    // `ReadMetadata_EmptyArchiveComment_SkipsWithoutDeserializing`; the first
+    // is an archive written without ever touching its comment.
+    #[case::no_comment(None)]
+    #[case::empty(Some(""))]
+    #[case::whitespace(Some("   "))]
+    // `ReadMetadata_ArchiveCommentIsNotComicBookInfo_SkipsWithoutError`.
+    #[case::not_comic_book_info(Some("Created by some packer"))]
+    fn an_archive_comment_without_comic_book_info_has_no_metadata(#[case] comment: Option<&str>) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = write_archive(
+            &dir,
+            "comic.cbz",
+            &[("ComicInfo.xml", b"<ComicInfo />")],
+            comment,
+        );
+        assert!(read_book_metadata(&path).is_none());
+    }
+
+    // `ReadMetadata_ValidComicBookInfoComment_ReturnsMetadata`.
+    #[test]
+    fn a_valid_comic_book_info_comment_is_read() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = write_archive(
+            &dir,
+            "comic.cbz",
+            &[("ComicInfo.xml", b"<ComicInfo />")],
+            Some(
+                r#"{"appID":"test","ComicBookInfo/1.0":{"series":"Jungle Juice","title":"Episode 36","issue":175}}"#,
+            ),
+        );
+        let book = read_book_metadata(&path).expect("metadata");
+        assert_eq!(book.name.as_deref(), Some("Episode 36"));
+        assert_eq!(book.series_name.as_deref(), Some("Jungle Juice"));
+        assert_eq!(book.index_number, Some(175));
+    }
+
     #[test]
     fn an_epub_is_read_through_its_container_and_opf() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -2238,6 +2483,221 @@ mod tests {
         let junk = dir.path().join("g.cbz");
         std::fs::write(&junk, b"not an archive").expect("write");
         assert!(read_comic_cover(&junk.to_string_lossy()).is_none());
+    }
+
+    /// The 7z and bsdtar on `PATH` that can list the fixture (a 7z without
+    /// the RAR format cannot), so the tests that run the real tools skip the
+    /// ones that cannot read RAR.
+    fn rar_readers(fixture: &str) -> Vec<RarReader> {
+        use ferrofin_util::program_path::which_on_path;
+        let readers: Vec<RarReader> = [
+            which_on_path("7z").map(RarReader::SevenZip),
+            which_on_path("bsdtar").map(RarReader::Bsdtar),
+        ]
+        .into_iter()
+        .flatten()
+        .filter(|reader| {
+            run_archive_tool(reader.program(), &reader.list_args(fixture), fixture).is_some_and(
+                |listing| {
+                    !reader
+                        .entries(&String::from_utf8_lossy(&listing))
+                        .is_empty()
+                },
+            )
+        })
+        .collect();
+        if readers.is_empty() {
+            eprintln!("skipped: no 7z or bsdtar on PATH reads RAR");
+        }
+        readers
+    }
+
+    /// A RAR comic's cover is read through 7z, or bsdtar. The fixture is a RAR 4
+    /// archive written byte by byte from the format, with no rar tool: the
+    /// marker block, the main header, then per entry a file header (method
+    /// 0x30, stored; header CRC = the low 16 bits of the CRC-32 of the header
+    /// after its CRC field) followed by the entry's bytes, and the end block.
+    /// It holds two 1x1 PNGs, `page002.png` then `[Scans] 001.png`. The cover
+    /// is the second, the first in key order, whose name is no pattern to
+    /// match.
+    #[test]
+    fn a_rar_comic_cover_is_read_through_the_archive_tool() {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/data/stored-pages.cbr");
+        let archive = std::fs::read(path).expect("read the fixture");
+        let readers = rar_readers(path);
+        for reader in &readers {
+            let (name, bytes) = rar_cover(reader, path).expect("the cover");
+            assert_eq!(name, "[Scans] 001.png", "{reader:?}");
+            let at = archive
+                .windows(bytes.len())
+                .position(|window| window == bytes)
+                .expect("the cover is stored as is");
+            assert!(bytes.starts_with(b"\x89PNG"), "{reader:?}");
+            assert!(archive[..at].ends_with(b"[Scans] 001.png"), "{reader:?}");
+        }
+        // And through the tool `read_comic_cover` finds, when it reads RAR.
+        if RarReader::get().is_some_and(|reader| readers.contains(reader)) {
+            assert_eq!(
+                read_comic_cover(path).map(|(name, _)| name).as_deref(),
+                Some("[Scans] 001.png")
+            );
+        }
+    }
+
+    /// Each tool writes out only the entry named exactly: a decoy that a
+    /// wildcard, an unanchored or a recursive match would also take comes
+    /// first in the archive. The tools read tar as well, which the test
+    /// writes; a non-ASCII name is read and matched as UTF-8.
+    #[test]
+    fn an_archive_tool_extracts_only_the_entry_named_exactly() {
+        let fixture = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/data/stored-pages.cbr");
+        let dir = tempfile::tempdir().expect("tempdir");
+        for reader in &rar_readers(fixture) {
+            for (decoy, cover) in [
+                ("abc.png", "a*.png"),
+                ("a.png", "?.png"),
+                ("sub/001.png", "001.png"),
+                ("notes.txt", "Café 表紙 001.png"),
+            ] {
+                let path = write_tar(&dir, "names.cbt", &[(decoy, b"decoy"), (cover, b"cover")]);
+                assert_eq!(
+                    rar_cover(reader, &path),
+                    Some((cover.to_owned(), b"cover".to_vec())),
+                    "{reader:?}"
+                );
+            }
+            // The archive's own name is no pattern either: a sibling it would
+            // match, whose page comes first, is not listed with it.
+            let sibling = write_tar(&dir, "What!.cbt", &[("page1.png", b"sibling")]);
+            let path = write_tar(&dir, "What?.cbt", &[("page2.png", b"mine")]);
+            assert_eq!(
+                rar_cover(reader, &path),
+                Some(("page2.png".to_owned(), b"mine".to_vec())),
+                "{reader:?} beside {sibling}"
+            );
+        }
+    }
+
+    /// A 7z whose `7z i` lists the RAR5 decoder is preferred to bsdtar.
+    #[cfg(unix)]
+    #[test]
+    fn a_7z_that_decodes_rar_is_preferred() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let seven_zip = dir.path().join("7z");
+        std::fs::write(&seven_zip, "#!/bin/sh\necho ' 1   D     40305 Rar5'\n").expect("write");
+        std::fs::set_permissions(&seven_zip, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod");
+        std::fs::write(dir.path().join("bsdtar"), b"").expect("write");
+        // Another test thread that forks while the script is open for writing
+        // holds it open until its child execs, and running it fails meanwhile
+        // (ETXTBSY): run it once it runs.
+        while std::process::Command::new(&seven_zip)
+            .output()
+            .is_err_and(|err| err.kind() == std::io::ErrorKind::ExecutableFileBusy)
+        {
+            std::thread::yield_now();
+        }
+        assert_eq!(
+            RarReader::find(Some(dir.path().as_os_str())),
+            Some(RarReader::SevenZip(seven_zip))
+        );
+    }
+
+    /// 7z is preferred when it decodes RAR, else bsdtar, else a 7z that reads
+    /// only uncompressed entries. The files here cannot run, so 7z never
+    /// shows a RAR decoder ([`a_7z_that_decodes_rar_is_preferred`] runs one).
+    #[test]
+    fn the_rar_reader_is_bsdtar_unless_7z_decodes_rar() {
+        let only = |names: &[&str]| {
+            let dir = tempfile::tempdir().expect("tempdir");
+            for name in names {
+                std::fs::write(dir.path().join(name), b"").expect("write");
+            }
+            let found = RarReader::find(Some(dir.path().as_os_str()));
+            (found, dir)
+        };
+        let (found, dir) = only(&["7z", "bsdtar"]);
+        assert_eq!(found, Some(RarReader::Bsdtar(dir.path().join("bsdtar"))));
+        let (found, dir) = only(&["7z"]);
+        assert_eq!(found, Some(RarReader::SevenZip(dir.path().join("7z"))));
+        let (found, dir) = only(&["bsdtar"]);
+        assert_eq!(found, Some(RarReader::Bsdtar(dir.path().join("bsdtar"))));
+        assert_eq!(only(&[]).0, None);
+        assert_eq!(RarReader::find(None), None);
+    }
+
+    /// Debian's 7-Zip without its RAR plugin lists the RAR formats but no
+    /// RAR codecs (`7z i`, 7-Zip 25.01).
+    #[test]
+    fn a_7z_decodes_rar_only_with_the_rar5_codec() {
+        let formats = " 0  ...F..................  Rar      rar r00       R a r ! 1A 07 00\n \
+                       0  ...F..................  Rar5     rar r00       R a r ! 1A 07 01 00\n";
+        assert!(!lists_rar_decoder(formats));
+        assert!(lists_rar_decoder(&format!(
+            "{formats}\nCodecs:\n 1   D     40303 Rar3\n 1   D     40305 Rar5\n"
+        )));
+    }
+
+    #[test]
+    fn rar_listings_name_every_entry() {
+        let seven_zip = RarReader::SevenZip("7z".into());
+        let listing = "Listing archive: a.cbr\n\n--\nPath = a.cbr\nType = Rar\n\n----------\n\
+                       Path = page002.png\nFolder = -\nSize = 69\n\nPath = sub/[Scans] 001.png\n\
+                       Folder = -\n";
+        assert_eq!(
+            seven_zip.entries(listing),
+            ["page002.png", "sub/[Scans] 001.png"]
+        );
+        let bsdtar = RarReader::Bsdtar("bsdtar".into());
+        assert_eq!(
+            bsdtar.entries("page002.png\nsub/[Scans] 001.png\n"),
+            ["page002.png", "sub/[Scans] 001.png"]
+        );
+        assert_eq!(
+            bsdtar
+                .extract_args("a.cbr", r"a*?[\b.png")
+                .last()
+                .map(String::as_str),
+            Some(r"a\*\?\[\\b.png")
+        );
+        assert_eq!(
+            seven_zip
+                .extract_args("a.cbr", "a*.png")
+                .last()
+                .map(String::as_str),
+            Some("a*.png")
+        );
+    }
+
+    /// The archive tool's output is what it wrote, only when it exits
+    /// successfully, and only within the timeout: a tool that runs past it is
+    /// killed.
+    #[cfg(unix)]
+    #[test]
+    fn an_archive_tool_is_bounded_and_must_succeed() {
+        let sh = ferrofin_util::program_path::which_on_path("sh").expect("sh on PATH");
+        let run = |script: &str, timeout| {
+            let args = ["-c".to_owned(), script.to_owned()];
+            run_archive_tool_within(&sh, &args, "x", timeout, 1024)
+        };
+        let long = std::time::Duration::from_secs(30);
+        assert_eq!(run("printf cover", long), Some(b"cover".to_vec()));
+        assert_eq!(run("printf partial; exit 2", long), None);
+        let started = std::time::Instant::now();
+        assert_eq!(run("sleep 30", std::time::Duration::from_millis(200)), None);
+        assert!(
+            started.elapsed() < long,
+            "the tool was killed at the timeout"
+        );
+        // Past the cap and still running: only the cap's kill stops it.
+        let started = std::time::Instant::now();
+        assert_eq!(run("head -c 4096 /dev/zero; exec sleep 30", long), None);
+        assert!(started.elapsed() < long, "the tool was killed at the cap");
+        assert!(
+            run_archive_tool(Path::new("/nonexistent/7z"), &[], "x").is_none(),
+            "a tool that cannot start"
+        );
     }
 
     /// A damaged block after the cover's own does not cost the cover: nothing
@@ -2504,5 +2964,148 @@ mod tests {
         assert_eq!(extension_of("/b/Book.EPUB"), "epub");
         assert_eq!(extension_of("/b/comic.cbz"), "cbz");
         assert_eq!(extension_of("/b/no-extension"), "");
+    }
+
+    /// `ProbeProvider.FetchAsync(Book)`: a comic's runtime is its
+    /// non-directory entries × 10000 whatever the archive format, read by its
+    /// content; an EPUB and the Kindle formats get one second; a RAR is not
+    /// counted yet (gl-747).
+    #[test]
+    fn a_comic_runtime_counts_its_non_directory_entries() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let files: &[(&str, &[u8])] = &[
+            ("pages/001.jpg", b"one"),
+            ("pages/002.jpg", b"two"),
+            ("ComicInfo.xml", b"<ComicInfo/>"),
+        ];
+        let cbz = {
+            let path = dir.path().join("a.cbz");
+            let mut writer = zip::ZipWriter::new(std::fs::File::create(&path).expect("create"));
+            let options = zip::write::SimpleFileOptions::default();
+            writer.add_directory("pages/", options).expect("dir");
+            for (name, bytes) in files {
+                writer.start_file(*name, options).expect("start");
+                std::io::Write::write_all(&mut writer, bytes).expect("write");
+            }
+            writer.finish().expect("finish");
+            path.to_string_lossy().into_owned()
+        };
+        let cbt = {
+            let path = write_tar(&dir, "b.cbt", files);
+            let mut header = tar::Header::new_gnu();
+            header.set_entry_type(tar::EntryType::Directory);
+            header.set_size(0);
+            header.set_mode(0o755);
+            header.set_cksum();
+            let mut bytes = std::fs::read(&path).expect("read tar");
+            // Rewrite with the directory first: `append_data` after `finish`
+            // would land behind the end-of-archive blocks.
+            let mut builder = tar::Builder::new(Vec::new());
+            builder
+                .append_data(&mut header, "pages/", std::io::empty())
+                .expect("dir");
+            let mut archive = tar::Archive::new(bytes.as_slice());
+            for entry in archive.entries().expect("entries") {
+                let mut entry = entry.expect("entry");
+                let mut header = entry.header().clone();
+                let name = entry.path().expect("path").into_owned();
+                builder
+                    .append_data(&mut header, name, &mut entry)
+                    .expect("copy");
+            }
+            bytes = builder.into_inner().expect("finish");
+            std::fs::write(&path, bytes).expect("write tar");
+            path
+        };
+        let cb7 = {
+            let path = dir.path().join("c.cb7");
+            let mut writer =
+                sevenz_rust2::ArchiveWriter::new(std::fs::File::create(&path).expect("create"))
+                    .expect("7z writer");
+            writer
+                .push_archive_entry::<&[u8]>(
+                    sevenz_rust2::ArchiveEntry::new_directory("pages"),
+                    None,
+                )
+                .expect("dir");
+            for (name, bytes) in files {
+                writer
+                    .push_archive_entry(sevenz_rust2::ArchiveEntry::new_file(name), Some(*bytes))
+                    .expect("push");
+            }
+            writer.finish().expect("finish");
+            path.to_string_lossy().into_owned()
+        };
+        // A ZIP named `.cbr` is read as the ZIP it is.
+        let zip_as_cbr = dir.path().join("d.cbr");
+        std::fs::copy(&cbz, &zip_as_cbr).expect("copy");
+        for path in [&cbz, &cbt, &cb7, &zip_as_cbr.to_string_lossy().into_owned()] {
+            assert_eq!(book_run_time_ticks(path, 100_000), Some(30_000), "{path}");
+        }
+        // The cap counts every entry, directories too: four fit in four.
+        assert_eq!(book_run_time_ticks(&cbz, 4), Some(30_000));
+        for path in [&cbz, &cbt, &cb7] {
+            assert_eq!(book_run_time_ticks(path, 3), None, "{path} is past the cap");
+        }
+        let write = |name: &str, bytes: &[u8]| {
+            let path = dir.path().join(name);
+            std::fs::write(&path, bytes).expect("write");
+            path.to_string_lossy().into_owned()
+        };
+        assert_eq!(
+            book_run_time_ticks(&write("f.cbz", b"not an archive"), 100_000),
+            None
+        );
+        for name in ["g.epub", "h.mobi", "i.azw", "j.AZW3"] {
+            assert_eq!(
+                book_run_time_ticks(&write(name, b"any"), 100_000),
+                Some(NOMINAL_BOOK_RUN_TIME_TICKS),
+                "{name}"
+            );
+        }
+        assert_eq!(book_run_time_ticks(&write("k.txt", b"any"), 100_000), None);
+        assert_eq!(
+            book_run_time_ticks(&write("l.pdf", b"%PDF-1.4 broken"), 100_000),
+            None
+        );
+    }
+
+    /// Archives at the edges: a real RAR is not counted until gl-747, so the
+    /// item keeps its runtime; an empty archive has no pages (upstream stores
+    /// 0 too); and a ZIP folder written with a backslash is a folder.
+    #[test]
+    fn edge_case_comic_archives_count_as_upstream_counts_them() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let write = |name: &str, bytes: &[u8]| {
+            let path = dir.path().join(name);
+            std::fs::write(&path, bytes).expect("write");
+            path.to_string_lossy().into_owned()
+        };
+        assert_eq!(
+            book_run_time_ticks(&write("e.cbr", b"Rar!\x1A\x07\x01\x00rest"), 100_000),
+            None
+        );
+        // An empty archive has no pages (upstream stores 0 too), and a ZIP
+        // directory written with a backslash is a directory.
+        let empty = dir.path().join("m.cbz");
+        zip::ZipWriter::new(std::fs::File::create(&empty).expect("create"))
+            .finish()
+            .expect("finish");
+        assert_eq!(
+            book_run_time_ticks(&empty.to_string_lossy(), 100_000),
+            Some(0)
+        );
+        let backslash = dir.path().join("n.cbz");
+        let mut writer = zip::ZipWriter::new(std::fs::File::create(&backslash).expect("create"));
+        for name in ["scans\\", "scans\\001.jpg"] {
+            writer
+                .start_file(name, zip::write::SimpleFileOptions::default())
+                .expect("entry");
+        }
+        writer.finish().expect("finish");
+        assert_eq!(
+            book_run_time_ticks(&backslash.to_string_lossy(), 100_000),
+            Some(10_000)
+        );
     }
 }

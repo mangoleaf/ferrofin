@@ -223,7 +223,7 @@ pub async fn timers_for_program(
 /// Fails when the read fails, or when the ids cannot be serialized.
 pub async fn scheduled_timers_for_programs(
     db: &Database,
-    program_ids: &[&str],
+    program_ids: &[String],
 ) -> Result<Vec<(String, String)>, ServiceError> {
     let ids = serde_json::to_string(program_ids).map_err(|e| {
         ServiceError::from(crate::error::LiveTvError::serialize(

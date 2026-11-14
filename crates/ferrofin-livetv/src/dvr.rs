@@ -49,6 +49,12 @@ pub(crate) const COPY_POLL_MS: u64 = 50;
 /// quiet for this long is not coming back within this programme.
 const COPY_IDLE_TIMEOUT_MS: u64 = 30_000;
 
+/// How often the direct recorder checks its cancel while it waits on a tuner
+/// URL (a pending read, or a stream that has ended cleanly), in milliseconds.
+///
+/// Port of `StreamHelper.CopyUntilCancelled`'s `Task.Delay(100)`.
+const CANCEL_POLL_MS: u64 = 100;
+
 /// How long after a failed recording the timer is retried, in seconds.
 ///
 /// Port of `RecordingsManager.RecordStream`'s `RetryIntervalSeconds`.
@@ -270,16 +276,17 @@ impl RecordingInput {
     }
 }
 
-/// Copies a live source into `target` until `duration` elapses, the source goes
-/// quiet, or `cancel` is set.
+/// Copies a live source into `target` until `duration` elapses or `cancel` is
+/// set, or until the live-stream buffer goes quiet.
 ///
 /// Port of `DirectRecorder`: the target is created fresh, then the bytes are
 /// copied verbatim. The source is infinite, so the recorder owns the stopping.
 ///
 /// # Errors
 ///
-/// Fails when the target cannot be created or written, or when the source
-/// cannot be opened.
+/// Fails when the target cannot be created or written, when the source cannot
+/// be opened, or when a tuner URL's stream fails partway (what it copied stays
+/// in the target).
 pub async fn record_direct(
     tuner: &dyn TunerStreamSource,
     input: &RecordingInput,
@@ -299,8 +306,16 @@ pub async fn record_direct(
         }
         RecordingInput::Url { url, headers } => {
             let mut body = tuner.open(url, headers).await?;
+            // Upstream's token cancels a pending read too (`CopyUntilCancelled`),
+            // which `RecordStream` settles as Completed. The body is dropped
+            // unread after that, so a chunk the read held is lost, as there.
+            let mut stopped = std::pin::pin!(until_stopped(deadline, cancel));
             while tokio::time::Instant::now() < deadline && !cancel.load(Ordering::SeqCst) {
-                match body.next_chunk().await {
+                let read = tokio::select! {
+                    read = body.next_chunk() => read,
+                    () = stopped.as_mut() => break,
+                };
+                match read {
                     Ok(Some(chunk)) => {
                         if chunk.is_empty() {
                             // Yield, as the shared-stream copy does, so a body
@@ -313,10 +328,29 @@ pub async fn record_direct(
                             LiveTvError::io(format!("write {}", target.display()), e)
                         })?;
                     }
-                    Ok(None) => break,
-                    Err(error) => {
-                        tracing::warn!(%error, "live tv: the recording source ended");
+                    // An ended source reads nothing until the duration or the
+                    // cancel stops the copy (`CopyUntilCancelled`). The body
+                    // is not read again: the seam promises nothing after `None`.
+                    Ok(None) => {
+                        stopped.as_mut().await;
                         break;
+                    }
+                    // A read that fails between the stop and its next cancel
+                    // check is the stop all the same.
+                    Err(error)
+                        if cancel.load(Ordering::SeqCst)
+                            || tokio::time::Instant::now() >= deadline =>
+                    {
+                        tracing::debug!(%error, "live tv: the recording source failed after the stop");
+                    }
+                    // `CopyUntilCancelled` lets the read's exception out, so
+                    // `RecordStream` records an error and retries; its `await
+                    // using` flushes what was copied first, which stays on disk.
+                    Err(error) => {
+                        output.flush().await.map_err(|e| {
+                            LiveTvError::io(format!("flush {}", target.display()), e)
+                        })?;
+                        return Err(error);
                     }
                 }
             }
@@ -328,6 +362,15 @@ pub async fn record_direct(
         .await
         .map_err(|e| LiveTvError::io(format!("flush {}", target.display()), e))?;
     Ok(())
+}
+
+/// Resolves once `deadline` passes or `cancel` is set, checking the cancel
+/// every [`CANCEL_POLL_MS`].
+async fn until_stopped(deadline: tokio::time::Instant, cancel: &AtomicBool) {
+    while tokio::time::Instant::now() < deadline && !cancel.load(Ordering::SeqCst) {
+        let pause = Duration::from_millis(CANCEL_POLL_MS);
+        tokio::time::sleep_until((tokio::time::Instant::now() + pause).min(deadline)).await;
+    }
 }
 
 /// Tails the live stream's buffer into `output` until the deadline, the
@@ -1306,6 +1349,178 @@ mod tests {
             reads < 100,
             "{reads} empty reads went by before the cancel got a turn"
         );
+    }
+
+    /// A tuner that sends one packet and then hangs up: with a transport error
+    /// (a `Content-Length` it never met), or cleanly.
+    #[derive(Clone, Default)]
+    struct HangUpTuner {
+        fails: bool,
+        /// How long the failing read takes.
+        fails_after: std::time::Duration,
+        /// A stop that lands while the failing read is pending.
+        stop: Option<Arc<AtomicBool>>,
+    }
+
+    struct HangUpBody {
+        sent: bool,
+        tuner: HangUpTuner,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::stream::TunerStreamBody for HangUpBody {
+        async fn next_chunk(
+            &mut self,
+        ) -> Result<Option<Vec<u8>>, ferrofin_traits::error::ServiceError> {
+            if !std::mem::replace(&mut self.sent, true) {
+                return Ok(Some(vec![0x47_u8; 188]));
+            }
+            if self.tuner.fails {
+                tokio::time::sleep(self.tuner.fails_after).await;
+                if let Some(stop) = &self.tuner.stop {
+                    stop.store(true, Ordering::SeqCst);
+                }
+                return Err(ferrofin_traits::error::ServiceError::backend(
+                    "read tuner stream: error decoding response body".to_owned(),
+                ));
+            }
+            Ok(None)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl crate::stream::TunerStreamSource for HangUpTuner {
+        async fn open(
+            &self,
+            _url: &str,
+            _headers: &std::collections::HashMap<String, String>,
+        ) -> Result<Box<dyn crate::stream::TunerStreamBody>, ferrofin_traits::error::ServiceError>
+        {
+            Ok(Box::new(HangUpBody {
+                sent: false,
+                tuner: self.clone(),
+            }))
+        }
+
+        async fn content_type(
+            &self,
+            _url: &str,
+            _headers: &std::collections::HashMap<String, String>,
+        ) -> Option<String> {
+            None
+        }
+    }
+
+    /// `CopyUntilCancelled` lets the read's exception out, so `RecordStream`
+    /// records an error and retries; the bytes already copied stay on disk.
+    #[tokio::test]
+    async fn a_direct_recording_cut_off_by_its_tuner_fails_and_keeps_its_bytes() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let target = dir.path().join("Cut.ts");
+        let outcome = record_direct(
+            &HangUpTuner {
+                fails: true,
+                ..HangUpTuner::default()
+            },
+            &RecordingInput::Url {
+                url: "http://tuner/live".to_owned(),
+                headers: std::collections::HashMap::new(),
+            },
+            &target,
+            std::time::Duration::from_secs(30),
+            &AtomicBool::new(false),
+        )
+        .await;
+
+        assert!(outcome.is_err(), "a transport error must fail the capture");
+        let recorded = tokio::fs::read(&target).await.expect("recording");
+        assert_eq!(recorded, vec![0x47_u8; 188], "the captured bytes stay");
+    }
+
+    /// A stop that lands while a read is pending, just before that read fails,
+    /// is still the stop (upstream's token would have cancelled the read, a
+    /// Completed): the failure must not turn a cancelled recording into a retry.
+    #[tokio::test]
+    async fn a_direct_recording_whose_read_fails_as_it_is_cancelled_completes() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let target = dir.path().join("Stopped.ts");
+        let cancel = Arc::new(AtomicBool::new(false));
+        record_direct(
+            &HangUpTuner {
+                fails: true,
+                fails_after: std::time::Duration::ZERO,
+                stop: Some(Arc::clone(&cancel)),
+            },
+            &RecordingInput::Url {
+                url: "http://tuner/live".to_owned(),
+                headers: std::collections::HashMap::new(),
+            },
+            &target,
+            std::time::Duration::from_secs(30),
+            &cancel,
+        )
+        .await
+        .expect("a read failing after the stop is the stop");
+
+        let recorded = tokio::fs::read(&target).await.expect("recording");
+        assert_eq!(recorded, vec![0x47_u8; 188]);
+    }
+
+    /// `CopyUntilCancelled` keeps reading an ended source until the duration
+    /// or the cancel stops it, and the same token cancels a read the tuner
+    /// never answers, so the recording ends when it was due to either way.
+    #[rstest::rstest]
+    #[case::at_its_duration(std::time::Duration::from_millis(300), None)]
+    #[case::at_its_cancel(
+        std::time::Duration::from_secs(30),
+        Some(std::time::Duration::from_millis(300))
+    )]
+    #[tokio::test]
+    async fn a_direct_recording_whose_tuner_ends_or_goes_silent_stops_when_due(
+        #[case] duration: std::time::Duration,
+        #[case] cancel_after: Option<std::time::Duration>,
+        #[values(false, true)] silent: bool,
+    ) {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let target = dir.path().join("Ended.ts");
+        let cancel = Arc::new(AtomicBool::new(false));
+        if let Some(after) = cancel_after {
+            let stopper = Arc::clone(&cancel);
+            tokio::spawn(async move {
+                tokio::time::sleep(after).await;
+                stopper.store(true, Ordering::SeqCst);
+            });
+        }
+        let started = std::time::Instant::now();
+        record_direct(
+            &HangUpTuner {
+                // A read that stays pending for an hour, then fails.
+                fails: silent,
+                fails_after: std::time::Duration::from_secs(3600),
+                stop: None,
+            },
+            &RecordingInput::Url {
+                url: "http://tuner/live".to_owned(),
+                headers: std::collections::HashMap::new(),
+            },
+            &target,
+            duration,
+            &cancel,
+        )
+        .await
+        .expect("record");
+
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed >= std::time::Duration::from_millis(300),
+            "stopped after {elapsed:?}, before it was due to"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(10),
+            "the stop never landed: {elapsed:?}"
+        );
+        let recorded = tokio::fs::read(&target).await.expect("recording");
+        assert_eq!(recorded, vec![0x47_u8; 188]);
     }
 
     #[test]

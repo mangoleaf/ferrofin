@@ -219,6 +219,104 @@ async fn restart_recreates_the_host_in_process_and_shutdown_exits() {
     );
 }
 
+/// A client side of the session WebSocket.
+type ClientSocket =
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
+
+/// Opens `token`'s session socket and waits for its `ForceKeepAlive` greeting,
+/// so its session is registered before the caller stops the server.
+async fn open_session_socket(base: &str, token: &str) -> ClientSocket {
+    let url = format!("{}/socket?ApiKey={token}", base.replacen("http", "ws", 1));
+    let (mut socket, _) = tokio_tungstenite::connect_async(url)
+        .await
+        .expect("socket opens");
+    message_types(&mut socket, Some("ForceKeepAlive")).await;
+    socket
+}
+
+/// The `MessageType` of every text frame `socket` receives, until one of type
+/// `until` arrives or, with `None`, until the server closes the socket.
+async fn message_types(socket: &mut ClientSocket, until: Option<&str>) -> Vec<String> {
+    use futures_util::StreamExt as _;
+    use tokio_tungstenite::tungstenite::Message;
+    let mut seen = Vec::new();
+    loop {
+        let frame = tokio::time::timeout(Duration::from_secs(10), socket.next())
+            .await
+            .unwrap_or_else(|_| panic!("no frame in time; saw {seen:?}"));
+        match frame {
+            Some(Ok(Message::Text(text))) => {
+                let json: serde_json::Value = serde_json::from_str(&text).expect("json frame");
+                let kind = json["MessageType"].as_str().unwrap_or_default().to_owned();
+                let done = until == Some(kind.as_str());
+                seen.push(kind);
+                if done {
+                    return seen;
+                }
+            }
+            Some(Ok(Message::Close(_)) | Err(_)) | None => {
+                assert!(until.is_none(), "closed before {until:?}; saw {seen:?}");
+                return seen;
+            }
+            Some(Ok(_)) => {}
+        }
+    }
+}
+
+/// gl-1123: connected clients are told whether the server comes back, as
+/// `SessionManager.OnApplicationStopping` tells them from `ShouldRestart`:
+/// `ServerRestarting` for `POST /System/Restart` (a backup restore restarts
+/// through the same call) and `ServerShuttingDown` for `POST /System/Shutdown`.
+///
+/// shortcut: `close_all_sockets` is process-global, so under plain `cargo test`
+/// another test's drain can close this socket before its push; nextest runs each
+/// test in its own process. Serialize the draining tests if plain `cargo test`
+/// must pass.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn connected_clients_are_told_a_restart_apart_from_a_shutdown() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let client = reqwest::Client::builder()
+        .timeout(REQUEST_TIMEOUT)
+        .build()
+        .expect("client");
+    let (server, base, config) = spawn_server(&client, |port| Config {
+        admin_user: ADMIN_USER.to_owned(),
+        admin_password: ADMIN_PASSWORD.to_owned(),
+        port,
+        ..Config::test_stub(tmp.path())
+    })
+    .await;
+    let tok = token(&client, &base).await;
+
+    let mut socket = open_session_socket(&base, &tok).await;
+    assert_eq!(post(&client, &base, "/System/Restart", &tok).await, 204);
+    let pushed = message_types(&mut socket, None).await;
+    assert!(
+        pushed.iter().any(|t| t == "ServerRestarting")
+            && !pushed.iter().any(|t| t == "ServerShuttingDown"),
+        "a restart pushes ServerRestarting; pushed {pushed:?}"
+    );
+
+    wait_for_new_lifetime(&client, &base, &config.server_name, &tok).await;
+    let mut socket = open_session_socket(&base, &tok).await;
+    assert_eq!(post(&client, &base, "/System/Shutdown", &tok).await, 204);
+    let pushed = message_types(&mut socket, None).await;
+    assert!(
+        pushed.iter().any(|t| t == "ServerShuttingDown")
+            && !pushed.iter().any(|t| t == "ServerRestarting"),
+        "a shutdown pushes ServerShuttingDown; pushed {pushed:?}"
+    );
+    tokio::time::timeout(
+        Duration::from_mins(1),
+        tokio::task::spawn_blocking(move || server.join()),
+    )
+    .await
+    .expect("run returns after shutdown")
+    .expect("join task")
+    .expect("server thread did not panic")
+    .expect("run exits cleanly");
+}
+
 /// No environment variables: what the test's own environment holds
 /// (`FERROFIN_SERVER_NAME`, say) must not override its `config.toml`.
 fn no_vars(_: &str) -> Option<String> {
@@ -297,6 +395,133 @@ async fn restart_loads_config_toml_again_and_keeps_the_last_one_that_loaded() {
     );
 
     assert_eq!(post(&client, &base, "/System/Shutdown", &tok).await, 204);
+    tokio::task::spawn_blocking(move || server.join())
+        .await
+        .expect("join task")
+        .expect("server thread did not panic")
+        .expect("run exits cleanly");
+}
+
+/// gl-555: a base URL saved on the Networking page marks a restart pending,
+/// changes nothing before it, and the next lifetime mounts, redirects to and
+/// advertises it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_networking_page_base_url_applies_on_the_restart() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let client = reqwest::Client::builder()
+        .timeout(REQUEST_TIMEOUT)
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .expect("client");
+    let (server, base, config) = spawn_server(&client, |port| Config {
+        server_name: "ferrofin-base-url".to_owned(),
+        admin_user: ADMIN_USER.to_owned(),
+        admin_password: ADMIN_PASSWORD.to_owned(),
+        port,
+        ..Config::test_stub(tmp.path())
+    })
+    .await;
+    let tok = token(&client, &base).await;
+    let auth = format!("{CLIENT}, Token=\"{tok}\"");
+    let url = format!("{base}/System/Configuration/network");
+    let mut network: serde_json::Value = client
+        .get(&url)
+        .header("Authorization", &auth)
+        .send()
+        .await
+        .expect("network request")
+        .json()
+        .await
+        .expect("network JSON");
+    // As jellyfin-web's Networking page saves it: the whole document back.
+    network["BaseUrl"] = "/jellyfin".into();
+    let saved = client
+        .post(&url)
+        .header("Authorization", &auth)
+        .json(&network)
+        .send()
+        .await
+        .expect("save request")
+        .status();
+    assert!(saved.is_success(), "{saved}");
+    let info = system_info(&client, &base, &tok).await.expect("info");
+    assert_eq!(info["HasPendingRestart"], true, "the save marks a restart");
+
+    assert_eq!(post(&client, &base, "/System/Restart", &tok).await, 204);
+    let mounted = format!("{base}/jellyfin");
+    wait_for_new_lifetime(&client, &mounted, &config.server_name, &tok).await;
+    let outside = client
+        .get(format!("{base}/System/Info/Public"))
+        .send()
+        .await
+        .expect("request outside the mount");
+    assert_eq!(outside.status(), 302);
+    assert_eq!(outside.headers()["location"], "/jellyfin/web/");
+    let public: serde_json::Value = client
+        .get(format!("{mounted}/System/Info/Public"))
+        .send()
+        .await
+        .expect("public info")
+        .json()
+        .await
+        .expect("public JSON");
+    assert_eq!(public["LocalAddress"], mounted.as_str());
+
+    assert_eq!(post(&client, &mounted, "/System/Shutdown", &tok).await, 204);
+    tokio::task::spawn_blocking(move || server.join())
+        .await
+        .expect("join task")
+        .expect("server thread did not panic")
+        .expect("run exits cleanly");
+}
+
+/// gl-554: a Local HTTP port saved on the Networking page marks a restart
+/// pending, and the next lifetime listens on and advertises it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_networking_page_port_applies_on_the_restart() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let client = reqwest::Client::builder()
+        .timeout(REQUEST_TIMEOUT)
+        .build()
+        .expect("client");
+    let (server, base, config) = spawn_server(&client, |port| Config {
+        server_name: "ferrofin-page-port".to_owned(),
+        admin_user: ADMIN_USER.to_owned(),
+        admin_password: ADMIN_PASSWORD.to_owned(),
+        port,
+        ..Config::test_stub(tmp.path())
+    })
+    .await;
+    let tok = token(&client, &base).await;
+    let mut network = get_json(&client, &base, "/System/Configuration/network", &tok).await;
+    let page_port = std::iter::repeat_with(free_port)
+        .find(|&page_port| page_port != config.port)
+        .expect("another free port");
+    // As jellyfin-web's Networking page saves it: the whole document back.
+    network["InternalHttpPort"] = page_port.into();
+    let (saved, _) = post_json(
+        &client,
+        &base,
+        "/System/Configuration/network",
+        &tok,
+        &network,
+    )
+    .await;
+    assert_eq!(saved, 204);
+    let info = system_info(&client, &base, &tok).await.expect("info");
+    assert_eq!(info["HasPendingRestart"], true, "the save marks a restart");
+
+    assert_eq!(post(&client, &base, "/System/Restart", &tok).await, 204);
+    let moved = format!("http://127.0.0.1:{page_port}");
+    wait_for_new_lifetime(&client, &moved, &config.server_name, &tok).await;
+    let info = system_info(&client, &moved, &tok).await.expect("info");
+    assert_eq!(info["LocalAddress"], moved.as_str(), "the advertised URL");
+    assert!(
+        !is_up(&client, &base, &config.server_name).await,
+        "the old port is closed"
+    );
+
+    assert_eq!(post(&client, &moved, "/System/Shutdown", &tok).await, 204);
     tokio::task::spawn_blocking(move || server.join())
         .await
         .expect("join task")
@@ -443,6 +668,8 @@ async fn backup_restore_applies_on_the_in_process_restart() {
     )
     .await;
     assert_eq!(st, 200, "{manifest}");
+    // The release that wrote it, not the crate's placeholder version (gl-235).
+    assert_eq!(manifest["ServerVersion"], ferrofin_health::RELEASE_VERSION);
     let archive = manifest["Path"].as_str().expect("archive path").to_owned();
     // A DATABASE change after the backup: a user that must be gone after restore.
     let (st, created) = post_json(

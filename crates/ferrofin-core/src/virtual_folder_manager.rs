@@ -1466,18 +1466,14 @@ impl FerrofinVirtualFolderManager {
 
     /// Deletes the `.mblink` shortcut in `folder_path` that resolves to `target`,
     /// if one exists (C# `RemoveMediaPath` shortcut cleanup). Returns whether a
-    /// shortcut was removed.
+    /// shortcut was removed. `target` is compared as given, untrimmed, with
+    /// each shortcut's one-separator-trimmed target, as upstream compares it,
+    /// so a trailing separator on a path other than the root matches nothing.
     async fn delete_shortcut_for(
         &self,
         folder_path: &Path,
         target: &str,
     ) -> Result<bool, ServiceError> {
-        // A filesystem root must retain its separator to match the shortcut.
-        let target = if Path::new(target).has_root() && Path::new(target).parent().is_none() {
-            target
-        } else {
-            target.trim_end_matches(['/', '\\'])
-        };
         let mut dir = tokio::fs::read_dir(folder_path)
             .await
             .map_err(|e| Self::io_err("read folder", &e))?;
@@ -2065,15 +2061,26 @@ impl VirtualFolderManager for FerrofinVirtualFolderManager {
         let _snapshot = self.invalidate_on_drop();
         let folder_path = self.require_folder(virtual_folder_name).await?;
         let existing = self.load_options(&folder_path).await;
+        let new_paths = || {
+            options
+                .path_infos
+                .iter()
+                .filter(|p| !existing.path_infos.iter().any(|i| i.path == p.path))
+        };
+
+        // Upstream's CreateShortcut throws on an empty target and
+        // RemoveContentTypeOverrides on a blank path, so the options are never
+        // saved; refusing before the loop also keeps the earlier new paths'
+        // shortcuts unwritten.
+        if new_paths().any(|p| p.path.trim().is_empty()) {
+            return Err(ServiceError::invalid_input("path must not be empty"));
+        }
 
         // Create a shortcut for any newly-referenced media path (C# loops the
         // request's PathInfos and `CreateShortcut`s the ones not already present).
-        for path_info in &options.path_infos {
-            let already = existing.path_infos.iter().any(|i| i.path == path_info.path);
-            if !already {
-                self.create_shortcut(&folder_path, path_info).await?;
-                self.remove_content_type_overrides(&path_info.path).await?;
-            }
+        for path_info in new_paths() {
+            self.create_shortcut(&folder_path, path_info).await?;
+            self.remove_content_type_overrides(&path_info.path).await?;
         }
 
         Self::save_options(&folder_path, options).await?;
@@ -2844,7 +2851,8 @@ mod tests {
     /// Every shortcut Jellyfin reads is a location: a dotfile `.mblink`
     /// (what a path entered with a trailing slash names) and any case of
     /// the extension count, and a target written with `ReverseVirtualPath`
-    /// is expanded; removing the path finds the shortcut the same way.
+    /// is expanded; removing the path, in any case, finds the shortcut the
+    /// same way.
     #[tokio::test]
     async fn jellyfin_shortcuts_resolve_as_jellyfin_reads_them() {
         let (tmp, mgr) = manager();
@@ -2880,7 +2888,7 @@ mod tests {
         want.sort();
         assert_eq!(folders[0].locations, want);
 
-        mgr.remove_media_path("Educational", &format!("{data}/Collections/"))
+        mgr.remove_media_path("Educational", &format!("{data}/Collections"))
             .await
             .expect("remove");
         assert!(!folder.join("collections.mblink").exists());
@@ -4280,9 +4288,21 @@ mod tests {
 
     #[tokio::test]
     async fn add_rejects_missing_media_path_and_empty_name() {
-        let (_tmp, mgr) = manager();
+        let (tmp, mgr) = manager();
         let bad = opts_with_paths(&["/does/not/exist".to_owned()]);
         assert!(mgr.add_virtual_folder("X", None, &bad).await.is_err());
+        // A blank `paths` piece binds as "" (`CommaDelimitedCollectionModelBinder`),
+        // and upstream's `Directory.Exists("")` refuses it.
+        let blank = opts_with_paths(&[media_dir(&tmp, "real"), String::new()]);
+        assert!(matches!(
+            mgr.add_virtual_folder("Y", None, &blank).await,
+            Err(ServiceError::InvalidInput(_))
+        ));
+        assert_eq!(
+            mgr.get_virtual_folders().await.unwrap().len(),
+            0,
+            "no library"
+        );
         assert!(
             mgr.add_virtual_folder("   ", None, &LibraryOptions::default())
                 .await
@@ -4504,6 +4524,34 @@ mod tests {
         assert!(locations.is_empty(), "{locations:?}");
     }
 
+    /// C# `RemoveMediaPath` compares the raw path with each resolved
+    /// shortcut and with each `PathInfos` entry, so a trailing separator
+    /// matches neither and the library is left whole (gl-1205).
+    #[tokio::test]
+    async fn remove_media_path_with_a_trailing_separator_changes_nothing() {
+        let (tmp, mgr) = manager();
+        let m1 = media_dir(&tmp, "one");
+        let m2 = media_dir(&tmp, "two");
+        mgr.add_virtual_folder("Lib", None, &opts_with_paths(&[m1.clone(), m2.clone()]))
+            .await
+            .unwrap();
+        mgr.remove_media_path("Lib", &format!("{m1}/"))
+            .await
+            .unwrap();
+        let folder = mgr.get_virtual_folders().await.unwrap().remove(0);
+        let mut locations = folder.locations;
+        locations.sort();
+        assert_eq!(locations, [m1.clone(), m2.clone()]);
+        let paths: Vec<String> = folder
+            .library_options
+            .unwrap()
+            .path_infos
+            .into_iter()
+            .map(|info| info.path)
+            .collect();
+        assert_eq!(paths, [m1, m2]);
+    }
+
     /// A case-only rename that differs in a non-ASCII letter is case-only as
     /// C#'s `OrdinalIgnoreCase` sees it, so a case-insensitive filesystem,
     /// where the target spelling already exists, is not a conflict. (On a
@@ -4654,6 +4702,62 @@ mod tests {
         expected.sort();
         assert_eq!(locs, expected);
         assert!(folder.library_options.unwrap().enable_realtime_monitor);
+    }
+
+    /// A new path that is empty or blank is refused, and nothing is written:
+    /// upstream's `CreateShortcut` throws on an empty target and
+    /// `RemoveContentTypeOverrides` on a blank path, so its options are never
+    /// saved (gl-1206). A blank path the stored options already hold is skipped
+    /// as upstream skips it, so such a library can still be saved.
+    #[tokio::test]
+    async fn update_library_options_refuses_a_blank_new_path_and_writes_nothing() {
+        let (tmp, mgr) = manager();
+        let m1 = media_dir(&tmp, "one");
+        let m2 = media_dir(&tmp, "two");
+        mgr.add_virtual_folder("Lib", None, &opts_with_paths(std::slice::from_ref(&m1)))
+            .await
+            .unwrap();
+        let folder = tmp.path().join("default").join("Lib");
+        let before = mgr.get_virtual_folders().await.unwrap();
+        let options_before = std::fs::read(folder.join(OPTIONS_FILE)).unwrap();
+        for blank in ["", "  "] {
+            let mut new_opts = opts_with_paths(&[m1.clone(), m2.clone(), blank.to_owned()]);
+            new_opts.enable_realtime_monitor = !new_opts.enable_realtime_monitor;
+            let error = mgr
+                .update_library_options("Lib", &new_opts)
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(error, ServiceError::InvalidInput(_)),
+                "{blank:?}: {error:?}"
+            );
+            assert_eq!(
+                mgr.get_virtual_folders().await.unwrap(),
+                before,
+                "{blank:?}"
+            );
+            assert_eq!(
+                std::fs::read(folder.join(OPTIONS_FILE)).unwrap(),
+                options_before,
+                "{blank:?}"
+            );
+            let mut files: Vec<_> = std::fs::read_dir(&folder)
+                .unwrap()
+                .map(|e| e.unwrap().file_name().into_string().unwrap())
+                .collect();
+            files.sort();
+            assert_eq!(files, ["one.mblink", OPTIONS_FILE], "{blank:?}");
+        }
+
+        // A blank path already stored is not new, so it neither fails nor gets a shortcut.
+        let stored = opts_with_paths(&[m1.clone(), String::new()]);
+        std::fs::write(
+            folder.join(OPTIONS_FILE),
+            serde_json::to_vec(&stored).unwrap(),
+        )
+        .unwrap();
+        mgr.update_library_options("Lib", &stored).await.unwrap();
+        assert_eq!(std::fs::read_dir(&folder).unwrap().count(), 2);
     }
 
     #[tokio::test]

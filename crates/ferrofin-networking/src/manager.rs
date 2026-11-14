@@ -11,6 +11,7 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::sync::Arc;
 
 use ferrofin_model::net::{AddressFamily, IpData, IpNetwork, PublishedServerUriOverride};
+use ferrofin_util::source_url::redact_urls_in;
 
 use crate::config_keys;
 use crate::known_proxies::KnownProxies;
@@ -239,24 +240,35 @@ impl NetworkManager {
         )
     }
 
-    /// Constructs a manager that enumerates live OS interfaces.
+    /// Constructs a manager that enumerates live OS interfaces and reports the
+    /// settings it ignores to `logger`.
     #[must_use]
-    pub fn live(config: NetworkConfiguration) -> Self {
-        Self::live_with_enumerator(config, Arc::new(crate::interfaces::enumerate))
+    pub fn live(config: NetworkConfiguration, logger: Arc<dyn Logger>) -> Self {
+        Self::live_with_enumerator(config, Arc::new(crate::interfaces::enumerate), logger)
     }
 
     /// Constructs a live manager that reads its interfaces from `enumerator`
     /// instead of the operating system, every time [`Self::live`] would
     /// enumerate them: at construction, [`Self::refresh_interfaces`],
     /// [`Self::update_settings`] and [`Self::on_network_change`].
+    ///
+    /// The settings it ignores go to `logger` at construction, at each
+    /// [`Self::update_settings`] and after a network change (as
+    /// [`Self::on_network_change`] describes), never on
+    /// [`Self::refresh_interfaces`].
     #[must_use]
     pub fn live_with_enumerator(
         config: NetworkConfiguration,
         enumerator: InterfaceEnumerator,
+        logger: Arc<dyn Logger>,
     ) -> Self {
         let mut manager = Self::with_defaults(config, "");
         manager.interface_source = InterfaceSource::Live(enumerator);
-        manager.refresh_interfaces();
+        // Only the parse that sees the interfaces reports, or an override
+        // naming one would be reported as unparsable.
+        manager.logger = logger;
+        let config = manager.config.clone();
+        manager.update_settings(&config);
         manager
     }
 
@@ -302,10 +314,15 @@ impl NetworkManager {
     }
 
     /// Refreshes live interfaces and dependent settings; injected snapshots stay fixed.
+    ///
+    /// The settings' ignored entries were reported when they were loaded, so
+    /// a refresh, which request paths run, does not report them again.
     pub fn refresh_interfaces(&mut self) {
         if matches!(self.interface_source, InterfaceSource::Live(_)) {
             let config = self.config.clone();
+            let logger = std::mem::replace(&mut self.logger, Arc::new(NullLogger));
             self.update_settings(&config);
+            self.logger = logger;
         }
     }
 
@@ -318,8 +335,10 @@ impl NetworkManager {
     /// filter, `KnownProxies` and the published-server overrides are left as
     /// they are, except when IPv6 is enabled but the operating system has no
     /// IPv6 (`Socket.OSSupportsIPv6`), where upstream runs the whole
-    /// `UpdateSettings`. The network information is then logged at debug
-    /// (`PrintNetworkInformation`). Mock and provided snapshots stay fixed.
+    /// `UpdateSettings`. Either way, as upstream's `InitializeLan` does, the
+    /// LAN entries it ignores are reported again. The network information is
+    /// then logged at debug (`PrintNetworkInformation`). Mock and provided
+    /// snapshots stay fixed.
     pub fn on_network_change(&mut self) {
         self.on_network_change_with(os_supports_ipv6);
     }
@@ -750,8 +769,10 @@ impl NetworkManager {
         for entry in &config.published_server_uri_by_subnet {
             let parts: Vec<&str> = entry.split('=').collect();
             if parts.len() != 2 {
-                self.logger
-                    .warn(&format!("Unable to parse bind override: {entry}"));
+                self.logger.error(&format!(
+                    "Unable to parse bind override: {}",
+                    redact_urls_in(entry)
+                ));
                 return;
             }
 
@@ -816,8 +837,10 @@ impl NetworkManager {
                     ));
                 }
             } else {
-                self.logger
-                    .warn(&format!("Unable to parse bind override: {entry}"));
+                self.logger.error(&format!(
+                    "Unable to parse bind override: {}",
+                    redact_urls_in(entry)
+                ));
             }
         }
 

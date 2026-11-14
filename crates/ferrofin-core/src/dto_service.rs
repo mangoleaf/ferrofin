@@ -117,7 +117,7 @@ struct Prefetched {
     /// The configured `PathSubstitutions`, read once per page when the `Path`
     /// or `MediaSources` field is requested.
     path_substitutions: Vec<PathSubstitution>,
-    /// Image rows per item id (same order as [`FerrofinDtoService::load_images`]).
+    /// Image rows per item id, by type then insertion order (`rowid`).
     images: HashMap<Uuid, Vec<ItemImageInfo>>,
     /// The requesting user's play-state per item id.
     user_data: HashMap<Uuid, UserItemDataDto>,
@@ -1468,28 +1468,11 @@ impl FerrofinDtoService {
         self
     }
 
-    /// Loads an item's image rows from `BaseItemImageInfos`, ordered by type then
-    /// by insertion order (`rowid`), the order the image routes address them.
-    async fn load_images(&self, item_id: Uuid) -> Result<Vec<ItemImageInfo>, ServiceError> {
-        let rows = sqlx::query_as::<_, BaseItemImageInfoEntity>(
-            r#"SELECT * FROM "BaseItemImageInfos"
-               WHERE "ItemId" = ?1 ORDER BY "ImageType", rowid"#,
-        )
-        .bind(guid_to_db(item_id))
-        .fetch_all(self.db.pool())
-        .await
-        .map_err(db_err)?;
-
-        Ok(rows
-            .iter()
-            .map(|row| to_image_info(row, &self.virtual_paths))
-            .collect())
-    }
-
-    /// Batch form of [`Self::load_images`]: all image rows for `item_ids` in one
-    /// query per chunk, keyed by item id (per-item ordering preserved).
+    /// All image rows for `item_ids` in one query per chunk, keyed by item id,
+    /// each item's ordered by type then by insertion order (`rowid`), the order
+    /// the image routes address them.
     ///
-    /// The per-item form is an N+1 that dominates list-endpoint latency under
+    /// A per-item read is an N+1 that dominates list-endpoint latency under
     /// concurrent load; list callers prefetch through this instead.
     async fn load_images_batch(
         &self,
@@ -1907,7 +1890,7 @@ impl FerrofinDtoService {
     ) -> Result<(), ServiceError> {
         let item_id = row_id(item);
         // The page's credits and their images were bulk-loaded once by the
-        // prefetch (the per-item get_people + per-person load_images was the
+        // prefetch (a per-item get_people and per-person image read was the
         // N+1 cost of a large-cast item).
         let people = attach_order(
             prefetched
@@ -2941,7 +2924,6 @@ impl FerrofinDtoService {
         }
 
         dto.name = item.name.clone();
-        dto.original_title = item.original_title.clone();
         dto.official_rating = item.official_rating.clone();
         // `Container` has no dedicated column on the row at this layer (it lives in
         // the serialized `Data` blob, not yet parsed here), so it stays `None`.
@@ -2964,16 +2946,15 @@ impl FerrofinDtoService {
         if options.contains_field(ItemFields::ParentId) {
             // `dto.ParentId = item.DisplayParentId` (`DtoService.cs:1237-1240`):
             // an episode's season (a virtual season's episode is stored under
-            // the series), a season's series, else the stored parent. An
-            // empty id is written as null.
+            // the series), a season's series, else the stored parent. The
+            // `Guid` is non-nullable, so an item with none sends `Guid.Empty`,
+            // which the serializer writes as `null`: the key is kept.
             let display_parent = match BaseItemKind::from_stored_type_name(&item.type_) {
                 Some(BaseItemKind::Episode) => item.season_id.as_deref(),
                 Some(BaseItemKind::Season) => item.series_id.as_deref(),
                 _ => item.parent_id.as_deref(),
             };
-            dto.parent_id = display_parent
-                .and_then(|s| Uuid::parse_str(s).ok())
-                .filter(|id| !id.is_nil());
+            dto.parent_id = Some(stored_id(display_parent).unwrap_or_default());
         }
         if options.contains_field(ItemFields::Path) {
             // `DtoService.GetMappedPath` (`DtoService.cs:1827`): a file-protocol
@@ -3222,14 +3203,18 @@ impl FerrofinDtoService {
         // is on the DTO and is read instead, so the map is not read here: that
         // block may already have moved the entry into the source. When it did
         // not run, there was no earlier read at all.)
-        if options.contains_field(ItemFields::MediaStreams) {
+        //
+        // C# assigns for every `IHasMediaSources` item, empty list or not, and
+        // for no other kind (`DtoService.cs:1467-1494`): a programme, a book
+        // or a photo never gets the field, even with stream rows.
+        if options.contains_field(ItemFields::MediaStreams)
+            && kinds::implements_has_media_sources(kind)
+        {
             if is_live_tv_channel(kind) {
-                // C# assigns for every `IHasMediaSources`, and a channel's
-                // `GetMediaStreams()` override is always `[]` — the field is
-                // present-and-empty on the channel detail, never probed rows.
+                // A channel's `GetMediaStreams()` override is always `[]` — the
+                // field is present-and-empty on the channel detail, never
+                // probed rows.
                 dto.media_streams = Some(Vec::new());
-            } else if is_live_tv_program(kind) {
-                // A programme is not `IHasMediaSources`; C# never assigns.
             } else {
                 // With the item's sources on the DTO, C# reads the streams
                 // off the item's own source (`DtoService.cs:1473-1485`) — the
@@ -3253,9 +3238,8 @@ impl FerrofinDtoService {
                             .unwrap_or_default()
                     }
                 };
-                if !streams.is_empty() {
-                    dto.media_streams = Some(streams);
-                }
+                // An unprobed or unreadable file has no rows: `[]`, not absent.
+                dto.media_streams = Some(streams);
             }
         }
 
@@ -3275,14 +3259,10 @@ impl FerrofinDtoService {
             }
             dto.series_name = item.series_name.clone();
             dto.season_name = item.season_name.clone();
-            dto.season_id = item
-                .season_id
-                .as_deref()
-                .and_then(|s| Uuid::parse_str(s).ok());
-            dto.series_id = item
-                .series_id
-                .as_deref()
-                .and_then(|s| Uuid::parse_str(s).ok());
+            // `dto.SeasonId = episode.SeasonId; dto.SeriesId = episode.SeriesId`
+            // (`DtoService.cs:1531-1532`): non-nullable, so an empty one is `null`.
+            dto.season_id = Some(stored_id(item.season_id.as_deref()).unwrap_or_default());
+            dto.series_id = Some(stored_id(item.series_id.as_deref()).unwrap_or_default());
 
             // v12 DtoService.cs:1430-1464. "this block will add the series
             // poster for episodes without a poster" — ungated by fields or
@@ -3339,10 +3319,8 @@ impl FerrofinDtoService {
         // Season extras.
         if kind == BaseItemKind::Season {
             dto.series_name = item.series_name.clone();
-            dto.series_id = item
-                .series_id
-                .as_deref()
-                .and_then(|s| Uuid::parse_str(s).ok());
+            // `dto.SeriesId = season.SeriesId` (`DtoService.cs:1594`).
+            dto.series_id = Some(stored_id(item.series_id.as_deref()).unwrap_or_default());
             Self::attach_series_studio(dto, item, options, prefetched);
             // v12 DtoService.cs:1503-1516 — the series poster for seasons
             // without a poster, same shape as the episode block, and no
@@ -3587,25 +3565,6 @@ impl FerrofinDtoService {
             }
         }
         Ok(map)
-    }
-
-    /// Populates the item-by-name counts on a DTO (port of `SetItemByNameInfo`)
-    /// using the injected [`ItemCountService`].
-    async fn set_item_by_name_info(
-        &self,
-        dto: &mut BaseItemDto,
-        user: Option<&UserEntity>,
-    ) -> Result<(), ServiceError> {
-        let Some(related) = related_item_kinds(dto.type_) else {
-            return Ok(());
-        };
-        let access_filter = access_filter_for(user);
-        let counts = self
-            .item_counts
-            .get_item_counts_for_name_item(dto.type_, dto.id, related, &access_filter)
-            .await?;
-        apply_name_counts(dto, &counts);
-        Ok(())
     }
 
     /// Resolves by-name item counts for the whole page: groups the by-name rows
@@ -3896,22 +3855,6 @@ pub(crate) async fn primary_image_aspect_ratio(
 
 #[async_trait]
 impl ferrofin_traits::dto::DtoService for FerrofinDtoService {
-    async fn get_primary_image_aspect_ratio(
-        &self,
-        item_id: Uuid,
-    ) -> Result<Option<f64>, ServiceError> {
-        let images = self.load_images(item_id).await?;
-        // The kind decides the fallback ratio for a remote/unreadable image
-        // (`GetDefaultPrimaryImageAspectRatio`); an item that no longer
-        // exists takes the `BaseItem` default of 0.
-        let kind = self
-            .library
-            .get_item_by_id(item_id)
-            .await?
-            .map_or(BaseItemKind::Folder, |row| row_kind(&row));
-        Ok(self.primary_aspect_ratio(item_id, kind, &images).await)
-    }
-
     async fn get_base_item_dto(
         &self,
         item: &BaseItemEntity,
@@ -3972,41 +3915,6 @@ impl ferrofin_traits::dto::DtoService for FerrofinDtoService {
     ) -> Result<Vec<BaseItemDto>, ServiceError> {
         self.project(items, options, user, None, RowRead::LinkedChildren)
             .await
-    }
-
-    async fn get_item_by_name_dto(
-        &self,
-        item: &BaseItemEntity,
-        options: &DtoOptions,
-        tagged_item_ids: Option<&[Uuid]>,
-        user: Option<&UserEntity>,
-    ) -> Result<BaseItemDto, ServiceError> {
-        let mut prefetched = self
-            .prefetch(
-                std::slice::from_ref(item),
-                options,
-                user,
-                None,
-                false,
-                false,
-            )
-            .await?;
-        // Single-item page: the id cannot repeat, so every entry moves.
-        let mut dto = self
-            .build_dto(item, options, user, None, &mut prefetched, false)
-            .await?;
-
-        // When the caller pre-supplies the tagged items, count them by kind
-        // (port of the static `SetItemByNameInfo` overload); otherwise fall back
-        // to the count-service path.
-        if options.contains_field(ItemFields::ItemCounts) {
-            if let Some(ids) = tagged_item_ids.filter(|ids| !ids.is_empty()) {
-                self.set_tagged_counts(&mut dto, ids).await?;
-            } else {
-                self.set_item_by_name_info(&mut dto, user).await?;
-            }
-        }
-        Ok(dto)
     }
 
     async fn can_download(&self, item: &BaseItemEntity) -> Result<bool, ServiceError> {
@@ -4837,24 +4745,17 @@ impl FerrofinDtoService {
             // (C# AttachPeople: `People[].Id` is the per-name item id, the
             // one favorites are written against — never the per-credit
             // `Peoples` row id, which fragments a person across types).
-            // One clean key per distinct spelling, not one per credit per
-            // item: `slot_by_name` maps every RAW spelling seen to the slot
-            // of the name it resolves through using the same clean key as the database, so
-            // the projection can look the id up by the stored string.
+            // One lookup per distinct spelling, not one per credit per item,
+            // and not one per clean name: `GetPerson` reads each spelling's
+            // own item. `slot_by_name` maps every RAW spelling to its slot,
+            // so the projection can look the id up by the stored string.
             let mut names: Vec<String> = Vec::new();
-            let mut slot_by_clean: HashMap<String, usize> = HashMap::new();
             let mut slot_by_name: HashMap<String, usize> = HashMap::new();
             for person in people.values().flatten() {
-                if slot_by_name.contains_key(person.name.as_str()) {
-                    continue;
+                if !slot_by_name.contains_key(person.name.as_str()) {
+                    slot_by_name.insert(person.name.clone(), names.len());
+                    names.push(person.name.clone());
                 }
-                let slot = *slot_by_clean
-                    .entry(crate::text_util::get_clean_value(&person.name))
-                    .or_insert_with(|| {
-                        names.push(person.name.clone());
-                        names.len() - 1
-                    });
-                slot_by_name.insert(person.name.clone(), slot);
             }
             // The id is the ONLY thing this resolution needs, so it asks for the
             // id — not the row. Materializing a full `BaseItemEntity` per
@@ -5480,38 +5381,6 @@ impl FerrofinDtoService {
         }
         Ok(())
     }
-
-    /// Counts pre-supplied tagged items by kind onto a by-name DTO (port of the
-    /// static `SetItemByNameInfo(item, dto, taggedItems)` overload). The kinds of
-    /// the tagged items are read from their rows.
-    async fn set_tagged_counts(
-        &self,
-        dto: &mut BaseItemDto,
-        tagged_item_ids: &[Uuid],
-    ) -> Result<(), ServiceError> {
-        let mut kinds_vec = Vec::with_capacity(tagged_item_ids.len());
-        for id in tagged_item_ids {
-            if let Some(row) = self.library.get_item_by_id(*id).await? {
-                kinds_vec.push(row_kind(&row));
-            }
-        }
-
-        let count = |target: BaseItemKind| {
-            i32::try_from(kinds_vec.iter().filter(|k| **k == target).count()).unwrap_or(i32::MAX)
-        };
-
-        dto.artist_count = Some(count(BaseItemKind::MusicArtist));
-        dto.album_count = Some(count(BaseItemKind::MusicAlbum));
-        dto.episode_count = Some(count(BaseItemKind::Episode));
-        dto.movie_count = Some(count(BaseItemKind::Movie));
-        dto.trailer_count = Some(count(BaseItemKind::Trailer));
-        dto.music_video_count = Some(count(BaseItemKind::MusicVideo));
-        dto.series_count = Some(count(BaseItemKind::Series));
-        dto.program_count = Some(count(BaseItemKind::LiveTvProgram));
-        dto.song_count = Some(count(BaseItemKind::Audio));
-        dto.child_count = Some(i32::try_from(tagged_item_ids.len()).unwrap_or(i32::MAX));
-        Ok(())
-    }
 }
 
 #[cfg(test)]
@@ -5640,10 +5509,11 @@ mod tests {
         ) -> Result<Vec<BaseItemEntity>, ServiceError> {
             // Only the by-name lookup is served (`get_named_item` filters
             // `get_item_list` by name). Match the way the real by-name resolver
-            // does — on the CLEAN value (`LibraryManager::get_named_items`
-            // compares `get_clean_value(name)` against the stored `CleanName`),
-            // so accents, punctuation, spacing and case all fold exactly as they
-            // do against a real database.
+            // does for the other kinds — on the CLEAN value
+            // (`LibraryManager::get_named_items` compares `get_clean_value(name)`
+            // against the stored `CleanName`), so accents, punctuation, spacing
+            // and case all fold. The real manager reads a `Person` by the id its
+            // spelling derives instead (gl-1079); these tests pin the prefetch.
             let Some(name) = query.name.as_deref() else {
                 return Ok(vec![]);
             };
@@ -5665,13 +5535,6 @@ mod tests {
             _collection_type: ferrofin_model::data::CollectionType,
         ) -> Result<Vec<BaseItemEntity>, ServiceError> {
             Ok(vec![])
-        }
-        async fn create_items(
-            &self,
-            _items: &[BaseItemEntity],
-            _parent_id: Option<Uuid>,
-        ) -> Result<(), ServiceError> {
-            Ok(())
         }
         async fn update_items(
             &self,
@@ -9269,6 +9132,33 @@ mod tests {
         assert!((dto.primary_image_aspect_ratio.unwrap() - 2.0).abs() < 1e-9);
     }
 
+    /// gl-1678: a series on the page is also its episodes' image parent, so
+    /// its id is in the page's image read twice. On a page past one IN-list
+    /// chunk the two copies fall in different chunks, and each must still
+    /// read its one backdrop once, as Jellyfin lists it.
+    #[tokio::test]
+    async fn a_series_on_a_page_past_one_chunk_lists_its_backdrop_once() {
+        let db = test_db().await;
+        let (episode, _season_id, series_id) = seed_episode_tree(&db).await;
+        let mut page = vec![fetch_item(&db, series_id).await, episode.clone()];
+        for _ in 0..ferrofin_db::PADDED_LIST_MAX {
+            let mut other = episode.clone();
+            other.id = guid_to_db(Uuid::new_v4());
+            page.push(other);
+        }
+        let svc = service(db);
+        let dtos = svc
+            .get_base_item_dtos(&page, &DtoOptions::default(), None, None, true)
+            .await
+            .unwrap();
+        let fanart = ["tag:/shows/fanart.jpg".to_owned()];
+        assert_eq!(dtos[0].backdrop_image_tags.as_deref(), Some(&fanart[..]));
+        assert_eq!(
+            dtos[1].parent_backdrop_image_tags.as_deref(),
+            Some(&fanart[..])
+        );
+    }
+
     /// Audio → MusicAlbum → MusicArtist (by album-artist name): `AlbumId`,
     /// `AlbumPrimaryImageTag`, `AlbumNormalizationGain` from the album row
     /// (:1207-1222), the album's Logo as the parent logo, and the artist's
@@ -10601,6 +10491,96 @@ mod tests {
         );
     }
 
+    /// `dto.MediaStreams = mediaStreams` runs for every `IHasMediaSources`
+    /// item, empty or not (v12.4 `DtoService.cs:1467-1494`): a video with no
+    /// stream rows (a file ffprobe could not read) carries `[]`, whether the
+    /// streams come off its own source or straight from the rows.
+    #[tokio::test]
+    async fn a_video_with_no_streams_gets_an_empty_media_streams_list() {
+        let db = test_db().await;
+        let id = Uuid::new_v4();
+        seed_named_item(&db, id, BaseItemKind::Movie, "Broken Reel").await;
+        let item = fetch_item(&db, id).await;
+        let svc = service_with_sources(
+            db,
+            FakeSources {
+                streams: Some(Vec::new()),
+                ..FakeSources::default()
+            },
+        );
+
+        for fields in [
+            vec![ItemFields::MediaStreams],
+            vec![ItemFields::MediaSources, ItemFields::MediaStreams],
+        ] {
+            let options = DtoOptions {
+                fields: fields.clone(),
+                ..DtoOptions::default()
+            };
+            let dto = svc
+                .get_base_item_dto(&item, &options, None, None)
+                .await
+                .unwrap();
+            assert_eq!(dto.media_streams, Some(Vec::new()), "fields {fields:?}");
+        }
+    }
+
+    /// A kind that is not `IHasMediaSources` upstream (a `Book`) never gets
+    /// `MediaStreams`, even when it owns stream rows.
+    #[tokio::test]
+    async fn a_book_with_stream_rows_gets_no_media_streams() {
+        let db = test_db().await;
+        let id = Uuid::new_v4();
+        seed_named_item(&db, id, BaseItemKind::Book, "Read Me").await;
+        let item = fetch_item(&db, id).await;
+        let svc = service(db);
+        let options = DtoOptions {
+            fields: vec![ItemFields::MediaStreams],
+            ..DtoOptions::default()
+        };
+
+        let dto = svc
+            .get_base_item_dto(&item, &options, None, None)
+            .await
+            .unwrap();
+
+        assert_eq!(dto.media_streams, None);
+    }
+
+    /// `dto.OriginalTitle = item.OriginalTitle` only under
+    /// `ItemFields.OriginalTitle` (v12.4 `DtoService.cs:1230-1233`), unlike
+    /// the `Name` and `OfficialRating` beside it.
+    #[tokio::test]
+    async fn original_title_needs_its_field() {
+        let db = test_db().await;
+        let id = Uuid::new_v4();
+        seed_named_item(&db, id, BaseItemKind::Movie, "Spirited Away").await;
+        let mut item = fetch_item(&db, id).await;
+        item.original_title = Some("Sen to Chihiro".to_owned());
+        let svc = service(db);
+
+        let bare = DtoOptions {
+            fields: Vec::new(),
+            ..DtoOptions::default()
+        };
+        let dto = svc
+            .get_base_item_dto(&item, &bare, None, None)
+            .await
+            .unwrap();
+        assert_eq!(dto.name.as_deref(), Some("Spirited Away"));
+        assert_eq!(dto.original_title, None);
+
+        let asked = DtoOptions {
+            fields: vec![ItemFields::OriginalTitle],
+            ..DtoOptions::default()
+        };
+        let dto = svc
+            .get_base_item_dto(&item, &asked, None, None)
+            .await
+            .unwrap();
+        assert_eq!(dto.original_title.as_deref(), Some("Sen to Chihiro"));
+    }
+
     /// The item DTO's sources run `GetStaticMediaSources(item, true, user)`'s
     /// per-user tail (v12.2 `DtoService.cs:410` → `MediaSourceManager.cs:
     /// 397-421`), from page-wide reads: an episode with no original language
@@ -11049,22 +11029,6 @@ mod tests {
             .as_ref()
             .expect("ImageBlurHashes must be present");
         assert!(hashes.is_empty(), "empty blurhash map, not null");
-    }
-
-    #[tokio::test]
-    async fn primary_aspect_ratio_endpoint_matches_processor() {
-        let db = test_db().await;
-        let id = Uuid::new_v4();
-        seed_named_item(&db, id, BaseItemKind::Movie, "M").await;
-        seed_images(
-            &db,
-            id,
-            &[image_info(ImageType::Primary, "/primary.jpg", None)],
-        )
-        .await;
-        let svc = service(db);
-        let ratio = svc.get_primary_image_aspect_ratio(id).await.unwrap();
-        assert_eq!(ratio, Some(2.0));
     }
 
     #[tokio::test]
@@ -11575,10 +11539,8 @@ mod tests {
     }
 
     /// `UserRootFolder` is not a view, so `GetChildCountSourceIds` makes it its
-    /// own source (v12.2 `DtoService.cs:750-760`). Its children are the
-    /// libraries plus the playlists plugin folder `CreateRootFolder()` parents
-    /// to it, and getting this wrong is what made `GET /Items/Root` report 3
-    /// where 10.11.8 reports 4.
+    /// own source (v12.4 `DtoService.cs:750-760`): its own rows, the
+    /// libraries.
     #[tokio::test]
     async fn child_count_is_real_for_the_user_root_folder() {
         let db = test_db().await;
@@ -11591,13 +11553,12 @@ mod tests {
             None,
         )
         .await;
-        // The children upstream's root has: the libraries plus the playlists
-        // plugin folder. (`FakeCounts` reports a fixed 4 per parent, so what is
-        // under test is that the root is counted as itself, not the sum.)
+        // The root's own rows, its libraries. (`FakeCounts` reports a fixed 4
+        // per parent, so what is under test is that the root is counted as
+        // itself, not the sum.)
         for (kind, name) in [
             (BaseItemKind::CollectionFolder, "Movies"),
             (BaseItemKind::CollectionFolder, "Shows"),
-            (BaseItemKind::PlaylistsFolder, "Playlists"),
         ] {
             seed_folder_item(&db, Uuid::new_v4(), kind, name, Some(root)).await;
         }
@@ -11712,37 +11673,8 @@ mod tests {
         assert_eq!(client_kind(BaseItemKind::Movie), BaseItemKind::Movie);
     }
 
-    #[tokio::test]
-    async fn item_by_name_dto_counts_supplied_tagged_items() {
-        let db = test_db().await;
-        // The genre item plus two tagged movies and a series it groups.
-        let genre = Uuid::new_v4();
-        seed_named_item(&db, genre, BaseItemKind::Genre, "Action").await;
-        let m1 = Uuid::new_v4();
-        let m2 = Uuid::new_v4();
-        let s1 = Uuid::new_v4();
-        seed_named_item(&db, m1, BaseItemKind::Movie, "A").await;
-        seed_named_item(&db, m2, BaseItemKind::Movie, "B").await;
-        seed_named_item(&db, s1, BaseItemKind::Series, "C").await;
-
-        let item = fetch_item(&db, genre).await;
-        // Library fake must resolve the tagged ids to rows.
-        let library = Arc::new(DbBackedLibrary { db: db.clone() });
-        let svc = service_with(db, library);
-        let dto = svc
-            .get_item_by_name_dto(&item, &DtoOptions::default(), Some(&[m1, m2, s1]), None)
-            .await
-            .unwrap();
-
-        assert_eq!(dto.movie_count, Some(2));
-        assert_eq!(dto.series_count, Some(1));
-        assert_eq!(dto.child_count, Some(3));
-    }
-
-    /// A [`LibraryManager`] fake whose `get_item_by_id` hits the real DB — used by
-    /// the tagged-items count test, which needs each id resolved to its kind,
-    /// and by `an_off_page_version_in_progress_leads_the_sources`, whose user
-    /// may open every item that exists.
+    /// A [`LibraryManager`] fake whose `get_item_by_id` hits the real DB, for
+    /// the tests whose user may open every item that exists.
     struct DbBackedLibrary {
         db: Database,
     }
@@ -11795,13 +11727,6 @@ mod tests {
             _collection_type: ferrofin_model::data::CollectionType,
         ) -> Result<Vec<BaseItemEntity>, ServiceError> {
             Ok(vec![])
-        }
-        async fn create_items(
-            &self,
-            _items: &[BaseItemEntity],
-            _parent_id: Option<Uuid>,
-        ) -> Result<(), ServiceError> {
-            Ok(())
         }
         async fn update_items(
             &self,
@@ -12645,7 +12570,10 @@ mod tests {
     /// Credit spellings whose *stored* form differs from every "tidy" convention
     /// a test would otherwise use: mixed case, leading/trailing and doubled
     /// internal whitespace, punctuation, accents, and non-Latin script. Paired
-    /// with the name of the ONE by-name `Person` item that backs each.
+    /// with the name of the ONE by-name `Person` item that backs each in the
+    /// tests' `FakeLibrary`, which resolves by clean value; the real manager
+    /// reads a person by the id each spelling derives (`GetPerson`), so these
+    /// pairs pin the prefetch's key convention, not which item a name opens.
     ///
     /// The clean value folds case and diacritics and NOTHING else (C#
     /// `GetCleanValue` is `RemoveDiacritics().ToLowerInvariant()`), so each
@@ -13315,6 +13243,74 @@ mod tests {
         assert_eq!(dto.run_time_ticks, Some(36_000_000_000));
         assert_eq!(dto.genres, Some(vec!["News".to_owned()]));
         assert_eq!(dto.tags, Some(vec!["News".to_owned()]));
+    }
+
+    /// gl-850: `dto.ParentId = item.DisplayParentId` (`DtoService.cs:1237-1240`),
+    /// `dto.SeasonId`/`SeriesId = episode.SeasonId`/`SeriesId` (`:1531-1532`) and
+    /// `dto.SeriesId = season.SeriesId` (`:1594`) assign a non-nullable `Guid`,
+    /// so an empty one is kept and `JsonNullableGuidConverter` writes it as
+    /// `null`: the key is there, valued `null`. Not requested, `ParentId` is left
+    /// out.
+    #[tokio::test]
+    async fn an_empty_parent_season_or_series_id_is_sent_as_null() {
+        let svc = service(test_db().await);
+        let row = |type_: &str| BaseItemEntity {
+            id: ferrofin_db::store::guid_to_db(Uuid::new_v4()),
+            type_: type_.to_owned(),
+            name: Some("Parentless".to_owned()),
+            ..BaseItemEntity::default()
+        };
+        let json = |dto: &BaseItemDto| serde_json::to_value(dto).expect("serialises");
+
+        let genre = row("MediaBrowser.Controller.Entities.Genre");
+        let dto = svc
+            .get_base_item_dto(&genre, &DtoOptions::default(), None, None)
+            .await
+            .unwrap();
+        assert_eq!(json(&dto).get("ParentId"), Some(&serde_json::Value::Null));
+        let without = DtoOptions {
+            fields: Vec::new(),
+            ..DtoOptions::default()
+        };
+        let dto = svc
+            .get_base_item_dto(&genre, &without, None, None)
+            .await
+            .unwrap();
+        assert_eq!(json(&dto).get("ParentId"), None, "not requested");
+
+        let episode = row("MediaBrowser.Controller.Entities.TV.Episode");
+        let dto = svc
+            .get_base_item_dto(&episode, &without, None, None)
+            .await
+            .unwrap();
+        let episode = json(&dto);
+        assert_eq!(episode.get("SeasonId"), Some(&serde_json::Value::Null));
+        assert_eq!(episode.get("SeriesId"), Some(&serde_json::Value::Null));
+
+        let season = row("MediaBrowser.Controller.Entities.TV.Season");
+        let dto = svc
+            .get_base_item_dto(&season, &without, None, None)
+            .await
+            .unwrap();
+        assert_eq!(json(&dto).get("SeriesId"), Some(&serde_json::Value::Null));
+
+        // A stored id is still sent as itself.
+        let (season_id, series_id) = (Uuid::new_v4(), Uuid::new_v4());
+        let mut episode = row("MediaBrowser.Controller.Entities.TV.Episode");
+        episode.season_id = Some(ferrofin_db::store::guid_to_db(season_id));
+        episode.series_id = Some(ferrofin_db::store::guid_to_db(series_id));
+        let parent_only = DtoOptions {
+            fields: vec![ItemFields::ParentId],
+            ..DtoOptions::default()
+        };
+        let dto = svc
+            .get_base_item_dto(&episode, &parent_only, None, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            (dto.parent_id, dto.season_id, dto.series_id),
+            (Some(season_id), Some(season_id), Some(series_id))
+        );
     }
 
     /// `BaseItem.DisplayPreferencesId` is `thisType.FullName.GetMD5()`, so it is

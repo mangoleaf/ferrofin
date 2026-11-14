@@ -22,15 +22,20 @@
 //! manager; live interfaces refresh at boot, on save and before peer URL resolution.
 //!
 //! `AutoDiscovery` is captured at the start of each server lifetime and controls
-//! the UDP 7359 listener. Changing it requires a restart. HTTP listener ports, the
-//! advertised global URL and the mounted base URL come from the server's bootstrap
-//! configuration (CLI/environment/config.toml), not this DTO's corresponding fields.
-//! In particular, use `FERROFIN_BASE_URL` or bootstrap `base_url` for the mounted
-//! prefix; saving `BaseUrl` here does not remount routes. Bootstrap settings require
-//! a process restart to reload. `EnableHttps`, `RequireHttps` and the certificate
-//! fields do apply: at startup the server listens with HTTPS on its bootstrap HTTPS
-//! port when HTTPS is enabled and the certificate loads, and a new certificate path
-//! flags a restart. `EnablePublishedServerUriByRequest` is read live.
+//! the UDP 7359 listener. Changing it requires a restart. `BaseUrl` is read the same
+//! way: the server mounts, redirects to and advertises it for the whole lifetime,
+//! below `FERROFIN_BASE_URL` and above bootstrap `base_url`, and saving a different
+//! one flags a restart. `InternalHttpPort` and `InternalHttpsPort` are too: the server
+//! listens on and advertises them below `--port`/`FERROFIN_PORT` (HTTPS:
+//! `FERROFIN_HTTPS_PORT`) and above bootstrap `port`/`https_port`. A port at its
+//! default leaves the bootstrap one, and so do equal ports (`ApplicationHost.Init`
+//! resets them to the defaults); saving a different port flags a restart. The
+//! advertised global URL comes from the server's bootstrap configuration
+//! (CLI/environment/config.toml), not this DTO's corresponding fields. `EnableHttps`,
+//! `RequireHttps` and the certificate fields do apply: at startup the server listens
+//! with HTTPS on its HTTPS port when HTTPS is enabled and the certificate loads, and a
+//! new certificate path flags a restart. `EnablePublishedServerUriByRequest` is read
+//! live.
 //!
 //! `EnableUPnP` is a different case, and not a Ferrofin gap: upstream marks it
 //! `[Obsolete("No longer supported")]`

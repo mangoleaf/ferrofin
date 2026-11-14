@@ -5,11 +5,12 @@
 //! accepts, or whether the strings we match for are the strings it prints.
 //! Those are exactly the two things that cannot be checked without running it.
 //!
-//! Gated behind `FERROFIN_FFMPEG_TESTS=1` and skipped when there is no ffmpeg
-//! or no `/dev/dri` render node, matching the other `*_ffmpeg` tests:
+//! `#[ignore]`d like the other `*_ffmpeg` tests. Asked for, they fail without
+//! ffmpeg, and the real-node probe returns early, saying so, without a
+//! `/dev/dri` render node:
 //!
 //! ```text
-//! FERROFIN_FFMPEG_TESTS=1 cargo test -p ferrofin-server --test vaapi_probe_ffmpeg
+//! cargo test -p ferrofin-server --test vaapi_probe_ffmpeg -- --include-ignored
 //! ```
 
 use std::path::PathBuf;
@@ -40,13 +41,11 @@ fn ffmpeg() -> Option<PathBuf> {
 }
 
 #[tokio::test]
+#[ignore = "runs the real ffmpeg; run with --ignored"]
 async fn the_probe_runs_against_a_real_render_node() {
-    if std::env::var("FERROFIN_FFMPEG_TESTS").is_err() {
-        eprintln!("skipping: set FERROFIN_FFMPEG_TESTS=1 to run");
-        return;
-    }
-    let (Some(ffmpeg), Some(node)) = (ffmpeg(), render_node()) else {
-        eprintln!("skipping: needs ffmpeg and a /dev/dri render node");
+    let ffmpeg = ffmpeg().expect("ffmpeg not found on PATH");
+    let Some(node) = render_node() else {
+        eprintln!("skipping: needs a /dev/dri render node");
         return;
     };
 
@@ -98,15 +97,9 @@ async fn the_probe_runs_against_a_real_render_node() {
 }
 
 #[tokio::test]
+#[ignore = "runs the real ffmpeg; run with --ignored"]
 async fn a_nonexistent_render_node_probes_clean_rather_than_hanging() {
-    if std::env::var("FERROFIN_FFMPEG_TESTS").is_err() {
-        eprintln!("skipping: set FERROFIN_FFMPEG_TESTS=1 to run");
-        return;
-    }
-    let Some(ffmpeg) = ffmpeg() else {
-        eprintln!("skipping: needs ffmpeg");
-        return;
-    };
+    let ffmpeg = ffmpeg().expect("ffmpeg not found on PATH");
     // A misconfigured dashboard path is the common failure, and it must leave
     // every flag clear rather than error out of the plan.
     let prober = VaapiProber::new(

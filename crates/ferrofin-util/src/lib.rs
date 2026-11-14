@@ -4,7 +4,8 @@
 //! translated to idiomatic Rust while preserving observable behavior (the
 //! upstream xUnit tests are ported verbatim as the oracle). [`process_priority`]
 //! is the OS process priority Jellyfin sets through .NET's
-//! `Process.PriorityClass`, [`http_client`] holds the .NET `HttpClient`
+//! `Process.PriorityClass`, [`program_path`] finds a program on `$PATH`,
+//! [`http_client`] holds the .NET `HttpClient`
 //! defaults Jellyfin's outbound requests inherit, [`source_url`] is what a log
 //! line may say about a source's URL, [`panic`](mod@panic)
 //! reads a caught panic's message where upstream's `catch` reads
@@ -14,15 +15,11 @@
 //! feature, `keyed_locks` is the async keyed lock the C# takes from
 //! `AsyncKeyedLock`.
 
-pub mod copy_to_extensions;
 pub mod current_culture;
-pub mod dictionary_extensions;
 pub mod directory_path;
-pub mod enumerable_extensions;
 pub mod error;
 pub mod file_helper;
 pub mod finite;
-pub mod formatting_stream_writer;
 pub mod guid_extensions;
 pub mod http_client;
 #[cfg(feature = "tokio")]
@@ -31,6 +28,7 @@ pub mod panic;
 pub mod path_extensions;
 pub mod path_helper;
 pub mod process_priority;
+pub mod program_path;
 pub mod read_only_list_extension;
 pub mod shuffle_extensions;
 pub mod sort_name;
@@ -38,5 +36,4 @@ pub mod source_url;
 pub mod split_string_extensions;
 pub mod stable_sort;
 pub mod stream_extensions;
-pub mod string_builder_extensions;
 pub mod string_extensions;

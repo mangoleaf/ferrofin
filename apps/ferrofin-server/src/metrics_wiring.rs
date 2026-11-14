@@ -76,20 +76,27 @@ const UPTIME_SECONDS: &str = "ferrofin_uptime_seconds";
 ///
 /// `/metrics` sits behind the same IP-access gate as the API
 /// ([`ferrofin_api::ip_access::ip_access_layer`]), as upstream's `MapMetrics`
-/// runs after `UseIPBasedAccessValidation` (`Startup.cs`). Merged beside the
-/// API router it was outside that gate, so `RemoteIPFilter` and
-/// `EnableRemoteAccess = false` did not cover it. `route_layer`, because `layer`
-/// would also take over the merged router's fallback, so turning metrics on
-/// would change what a refused peer gets for an unknown path.
+/// runs after `UseIPBasedAccessValidation` (`Startup.cs`), and under Startup's
+/// response-time, compression and CORS middleware
+/// ([`ferrofin_api::startup_layers`]), which the API router's own layers never
+/// reach. It is merged as `metrics.merge(api)` so the API router's layered
+/// fallback stays the one an unknown path gets: `Router::merge` keeps the
+/// second router's, and merged the other way round turning metrics on dropped
+/// every layer from a 404. The gate is a `route_layer`, so it covers the
+/// `/metrics` route and not the method router's `405`, as before.
 pub fn mount(router: Router, metrics: &MetricsHandle, state: &ferrofin_api::AppState) -> Router {
     let gated = metrics
         .router()
         .route_layer(axum::middleware::from_fn_with_state(
             state.clone(),
             ferrofin_api::ip_access::ip_access_layer,
+        ))
+        // `ExceptionMiddleware`, inside the layers below as in `create_router`.
+        .layer(axum::middleware::from_fn(
+            ferrofin_api::panic_boundary::panic_boundary_layer,
         ));
-    router
-        .merge(gated)
+    ferrofin_api::startup_layers(gated, state)
+        .merge(router)
         .layer(axum::middleware::from_fn(ferrofin_metrics::track_http))
 }
 

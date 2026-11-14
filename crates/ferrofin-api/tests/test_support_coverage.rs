@@ -15,7 +15,7 @@ use std::sync::Arc;
 
 use ferrofin_api::test_support::{
     FakeAppHost, FakeConfig, FakeDto, FakeLibrary, FakeMediaSources, FakePaths, FakeSessions,
-    FakeSystem, FakeUserData, FakeUserViews, FakeUsers,
+    FakeSystem, FakeUserData, FakeUserViews, FakeUsers, fake_user_entity,
 };
 use ferrofin_db::entities::base_items::BaseItemEntity;
 use ferrofin_db::entities::users::UserEntity;
@@ -49,40 +49,7 @@ fn assert_panics<F: Future>(fut: F) {
 
 /// A minimal [`UserEntity`] for methods that take one by reference.
 fn user() -> UserEntity {
-    UserEntity {
-        id: Uuid::nil().to_string(),
-        audio_language_preference: None,
-        authentication_provider_id: String::new(),
-        cast_receiver_id: None,
-        display_collections_view: false,
-        display_missing_episodes: false,
-        enable_auto_login: false,
-        enable_local_password: false,
-        enable_next_episode_auto_play: false,
-        enable_user_preference_access: false,
-        hide_played_in_latest: false,
-        internal_id: 0,
-        invalid_login_attempt_count: 0,
-        last_activity_date: None,
-        last_login_date: None,
-        login_attempts_before_lockout: None,
-        max_active_sessions: 0,
-        max_parental_rating_score: None,
-        max_parental_rating_sub_score: None,
-        must_update_password: false,
-        password: None,
-        password_reset_provider_id: String::new(),
-        play_default_audio_track: false,
-        remember_audio_selections: false,
-        remember_subtitle_selections: false,
-        remote_client_bitrate_limit: None,
-        row_version: 0,
-        subtitle_language_preference: None,
-        subtitle_mode: 0,
-        sync_play_access: 0,
-        username: String::new(),
-        normalized_username: String::new(),
-    }
+    fake_user_entity(Uuid::nil(), "")
 }
 
 #[test]
@@ -95,7 +62,6 @@ fn fake_library_methods_panic() {
     assert_panics(f.get_item_ids(q));
     assert_panics(f.get_item_list(q));
     assert_panics(f.get_latest_item_list(q, ferrofin_model::data::CollectionType::movies));
-    assert_panics(f.create_items(&[], None));
     assert_panics(f.update_items(&[], None));
     assert_panics(f.delete_item(Uuid::nil(), &DeleteOptions::default()));
     assert_panics(f.get_people(people));
@@ -113,7 +79,6 @@ fn fake_library_methods_panic() {
 fn fake_users_methods_panic() {
     let f = FakeUsers;
     assert_panics(f.get_users());
-    assert_panics(f.get_user_ids());
     assert_panics(f.initialize());
     assert_panics(f.get_first_user());
     assert_panics(f.get_user_by_name("x"));
@@ -217,11 +182,6 @@ fn fake_sessions_methods_panic() {
             ))
             .is_ok()
     );
-    assert_panics(f.send_message_to_user_device_sessions(
-        "d",
-        ferrofin_model::session::SessionMessageType::ForceKeepAlive,
-        "d",
-    ));
     assert_panics(f.send_restart_required_notification());
     assert_panics(f.add_additional_user("s", Uuid::nil()));
     assert_panics(f.remove_additional_user("s", Uuid::nil()));
@@ -288,7 +248,7 @@ fn fake_system_methods_run_and_panic() {
         .unwrap();
     assert!(rt.block_on(f.get_system_info(&ctx)).is_ok());
     assert!(rt.block_on(f.get_public_system_info(&ctx)).is_ok());
-    // `restart` accepts the request (the backup-restore handler schedules one);
+    // `restart` accepts the request;
     // shutdown/storage stay `unimplemented!`.
     assert!(rt.block_on(f.restart()).is_ok());
     assert_panics(f.shutdown());
@@ -304,8 +264,6 @@ fn fake_app_host_methods_run() {
     assert!(!f.listen_with_https());
     assert_eq!(f.friendly_name(), "ferrofin-test");
     assert_eq!(f.name(), "Jellyfin Server");
-    assert_eq!(f.expand_virtual_path("/p"), "/p");
-    assert_eq!(f.reverse_virtual_path("/p"), "/p");
     assert_eq!(f.base_url(), "");
     let ctx = RequestContext {
         headers: Vec::new(),
@@ -320,7 +278,6 @@ fn fake_app_host_methods_run() {
         rt.block_on(f.get_smart_api_url(&ctx)).unwrap(),
         "http://localhost:8096"
     );
-    assert_panics(f.get_local_api_url("host", None, None));
 }
 
 #[test]
@@ -345,7 +302,7 @@ fn fake_paths_are_empty_except_the_writable_data_root() {
         assert_eq!(s, "");
     }
     // `program_data_path`/`data_path` return a real temp dir so path-backed
-    // handlers (Backup) have somewhere writable to work in tests.
+    // handlers have somewhere writable to work in tests.
     assert_ne!(p.program_data_path(), "");
     assert_eq!(p.data_path(), p.program_data_path());
 }
@@ -369,10 +326,8 @@ fn fake_dto_methods_panic() {
     let f = FakeDto;
     let opts = DtoOptions::with_all_fields(false);
     let item = base_item();
-    assert_panics(f.get_primary_image_aspect_ratio(Uuid::nil()));
     assert_panics(f.get_base_item_dto(&item, &opts, None, None));
     assert_panics(f.get_base_item_dtos(&[], &opts, None, None, true));
-    assert_panics(f.get_item_by_name_dto(&item, &opts, None, None));
 }
 
 /// A minimal [`BaseItemEntity`] for the DTO fakes.

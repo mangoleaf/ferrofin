@@ -157,19 +157,25 @@ impl FerrofinAuthorizationContext {
         None
     }
 
-    /// Reads the (single) authorization header, honouring the legacy
-    /// `X-Emby-Authorization` header when legacy auth is enabled.
+    /// Reads the (single) authorization header C# `GetAuthorizationDictionary`
+    /// parses: `Authorization`, or `X-Emby-Authorization` when legacy auth is
+    /// enabled and `Authorization` is absent or empty.
     ///
     /// Takes the pre-resolved `legacy` flag for the same reason as
     /// [`Self::resolve_token`].
     fn authorization_header(request: &RequestContext, legacy: bool) -> Option<&str> {
-        if let Some(value) = request.header("Authorization") {
-            return Some(value);
-        }
-        if legacy {
+        // `string.IsNullOrEmpty(StringValues)` joins the nonempty values, so a
+        // repeated `Authorization` is empty only when every copy is.
+        if legacy
+            && request
+                .headers
+                .iter()
+                .filter(|(name, _)| name.eq_ignore_ascii_case("Authorization"))
+                .all(|(_, value)| value.is_empty())
+        {
             return request.header("X-Emby-Authorization");
         }
-        None
+        request.header("Authorization")
     }
 
     /// Resolves a device token from the database into the auth info,
@@ -747,20 +753,6 @@ mod tests {
         ) -> Result<String, ServiceError> {
             self.get_smart_api_url(&RequestContext::default()).await
         }
-        async fn get_local_api_url(
-            &self,
-            _hostname: &str,
-            _scheme: Option<&str>,
-            _port: Option<u16>,
-        ) -> Result<String, ServiceError> {
-            unreachable!()
-        }
-        fn expand_virtual_path(&self, path: &str) -> String {
-            path.to_owned()
-        }
-        fn reverse_virtual_path(&self, path: &str) -> String {
-            path.to_owned()
-        }
     }
 
     #[test]
@@ -1060,11 +1052,72 @@ mod tests {
                 header_request("X-Emby-Authorization", r#"MediaBrowser Token="dev-tok""#),
             ),
             (
+                "X-Emby-Authorization header beside an empty Authorization",
+                RequestContext {
+                    headers: vec![
+                        ("Authorization".to_owned(), String::new()),
+                        (
+                            "X-Emby-Authorization".to_owned(),
+                            r#"MediaBrowser Token="dev-tok""#.to_owned(),
+                        ),
+                    ],
+                    ..Default::default()
+                },
+            ),
+            (
                 "Emby authorization scheme",
                 header_request("Authorization", r#"Emby Token="dev-tok""#),
             ),
             ("api_key query parameter", query_request("api_key=dev-tok")),
         ]
+    }
+
+    /// Which header `GetAuthorizationDictionary` parses: `Authorization`
+    /// unless legacy authorization is on and `string.IsNullOrEmpty` holds for
+    /// it, which `StringValues` answers on its nonempty values joined.
+    #[test]
+    fn authorization_header_falls_back_only_when_every_authorization_is_empty() {
+        let request = |headers: &[(&str, &str)]| RequestContext {
+            headers: headers
+                .iter()
+                .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+                .collect(),
+            ..Default::default()
+        };
+        let pick = FerrofinAuthorizationContext::authorization_header;
+        let emby = ("X-Emby-Authorization", "emby");
+
+        assert_eq!(
+            pick(&request(&[("Authorization", ""), emby]), true),
+            Some("emby")
+        );
+        assert_eq!(
+            pick(&request(&[("Authorization", ""), emby]), false),
+            Some("")
+        );
+        assert_eq!(pick(&request(&[emby]), true), Some("emby"));
+        assert_eq!(pick(&request(&[emby]), false), None);
+        assert_eq!(
+            pick(
+                &request(&[("Authorization", ""), ("Authorization", ""), emby]),
+                true
+            ),
+            Some("emby"),
+            "two empty values are empty"
+        );
+        // A nonempty second value makes the header present; C# then parses
+        // its first value, the empty one (Jellyfin 12.4 answers 401).
+        assert_eq!(
+            pick(
+                &request(&[("Authorization", ""), ("Authorization", "a"), emby]),
+                true
+            ),
+            Some("")
+        );
+        assert_eq!(
+            pick(&request(&[("Authorization", "a"), emby]), true),
+            Some("a")
+        );
     }
 
     /// The modern (non-legacy) credential forms, presenting the same token.

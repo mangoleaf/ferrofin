@@ -18,7 +18,7 @@ use ferrofin_api::create_router;
 use ferrofin_api::state::AppState;
 use ferrofin_api::test_support::{
     FakeAppHost, FakeConfig, FakeMediaSources, FakeMusic, FakeProviders, FakeSearch, FakeSessions,
-    FakeSimilarItems, FakeSystem,
+    FakeSimilarItems, FakeSystem, FixedAuth, fake_user_entity,
 };
 use ferrofin_db::entities::base_items::{BaseItemEntity, PeopleEntity};
 use ferrofin_db::entities::security::DeviceEntity;
@@ -42,6 +42,7 @@ use ferrofin_traits::library::{LibraryManager, UserDataManager, UserManager, Use
 use ferrofin_traits::net::{AuthService, AuthorizationContext, RequestContext};
 use ferrofin_traits::options::{
     AuthorizationInfo, DeleteOptions, DtoOptions, InternalItemsQuery, InternalPeopleQuery,
+    UserViewQuery,
 };
 use ferrofin_traits::session::{
     AuthenticationRequest, AuthenticationResultData, SessionManager, SessionSummary,
@@ -63,39 +64,10 @@ const PLAYLISTS_VIEW_ID: Uuid = Uuid::from_u128(0x105);
 /// Builds a minimal [`UserEntity`] with the given id/name; neutral zero fields.
 fn user_entity(id: Uuid, username: &str) -> UserEntity {
     UserEntity {
-        id: id.to_string(),
-        audio_language_preference: None,
-        authentication_provider_id: String::new(),
-        cast_receiver_id: None,
-        display_collections_view: false,
-        display_missing_episodes: false,
-        enable_auto_login: false,
-        enable_local_password: false,
-        enable_next_episode_auto_play: false,
         // Jellyfin's default for a new user.
         enable_user_preference_access: true,
-        hide_played_in_latest: false,
-        internal_id: 0,
-        invalid_login_attempt_count: 0,
-        last_activity_date: None,
-        last_login_date: None,
-        login_attempts_before_lockout: None,
-        max_active_sessions: 0,
-        max_parental_rating_score: None,
-        max_parental_rating_sub_score: None,
-        must_update_password: false,
         password: Some("hashed".to_owned()),
-        password_reset_provider_id: String::new(),
-        play_default_audio_track: false,
-        remember_audio_selections: false,
-        remember_subtitle_selections: false,
-        remote_client_bitrate_limit: None,
-        row_version: 0,
-        subtitle_language_preference: None,
-        subtitle_mode: 0,
-        sync_play_access: 0,
-        username: username.to_owned(),
-        normalized_username: username.to_uppercase(),
+        ..fake_user_entity(id, username)
     }
 }
 
@@ -247,9 +219,6 @@ impl UserManager for OkUsers {
         Ok((id == USER_ID).then(|| user_entity(USER_ID, "alice")))
     }
     async fn get_users(&self) -> Result<Vec<UserEntity>, ServiceError> {
-        unimplemented!()
-    }
-    async fn get_user_ids(&self) -> Result<Vec<Uuid>, ServiceError> {
         unimplemented!()
     }
     async fn initialize(&self) -> Result<(), ServiceError> {
@@ -419,13 +388,6 @@ impl LibraryManager for StubLibrary {
     ) -> Result<Vec<BaseItemEntity>, ServiceError> {
         unimplemented!()
     }
-    async fn create_items(
-        &self,
-        _items: &[BaseItemEntity],
-        _parent_id: Option<Uuid>,
-    ) -> Result<(), ServiceError> {
-        unimplemented!()
-    }
     async fn update_items(
         &self,
         _items: &[BaseItemEntity],
@@ -515,15 +477,16 @@ struct StubUserViews {
 #[async_trait]
 impl UserViewManager for StubUserViews {
     async fn get_user_views(&self, user_id: Uuid) -> Result<Vec<BaseItemEntity>, ServiceError> {
-        self.get_user_views_with_hidden(user_id, false).await
+        self.get_user_views_with_query(user_id, &UserViewQuery::default())
+            .await
     }
-    async fn get_user_views_with_hidden(
+    async fn get_user_views_with_query(
         &self,
         _user_id: Uuid,
-        include_hidden: bool,
+        query: &UserViewQuery,
     ) -> Result<Vec<BaseItemEntity>, ServiceError> {
         let mut views = self.get_media_folders().await?;
-        if !include_hidden {
+        if !query.include_hidden {
             views.retain(|view| {
                 !self
                     .hidden
@@ -539,13 +502,23 @@ impl UserViewManager for StubUserViews {
         self.get_media_folders().await
     }
     async fn get_media_folders(&self) -> Result<Vec<BaseItemEntity>, ServiceError> {
+        // The playlists folder as stored: no library behind it, so no
+        // virtual-folder entry.
+        let mut playlists = item_entity(
+            PLAYLISTS_VIEW_ID,
+            "Playlists",
+            BaseItemKind::PlaylistsFolder,
+        );
+        BaseItemKind::PlaylistsFolder
+            .stored_type_name()
+            .expect("stored name")
+            .clone_into(&mut playlists.type_);
         Ok(vec![
             item_entity(SHOWS_ID, "Shows", BaseItemKind::CollectionFolder),
             item_entity(MOVIES_ID, "Movies", BaseItemKind::CollectionFolder),
             item_entity(MUSIC_ID, "Music", BaseItemKind::CollectionFolder),
             item_entity(MIXED_ID, "Attic", BaseItemKind::CollectionFolder),
-            // A virtual view: no library behind it, so no virtual-folder entry.
-            item_entity(PLAYLISTS_VIEW_ID, "Playlists", BaseItemKind::UserView),
+            playlists,
         ])
     }
     async fn get_latest_items(
@@ -657,12 +630,6 @@ fn entity_to_dto(item: &BaseItemEntity) -> BaseItemDto {
 
 #[async_trait]
 impl DtoService for OkDto {
-    async fn get_primary_image_aspect_ratio(
-        &self,
-        _item_id: Uuid,
-    ) -> Result<Option<f64>, ServiceError> {
-        unimplemented!()
-    }
     async fn get_base_item_dto(
         &self,
         item: &BaseItemEntity,
@@ -694,15 +661,6 @@ impl DtoService for OkDto {
                 dto
             })
             .collect())
-    }
-    async fn get_item_by_name_dto(
-        &self,
-        item: &BaseItemEntity,
-        _options: &DtoOptions,
-        _tagged_item_ids: Option<&[Uuid]>,
-        _user: Option<&UserEntity>,
-    ) -> Result<BaseItemDto, ServiceError> {
-        Ok(entity_to_dto(item))
     }
 }
 
@@ -1146,7 +1104,7 @@ async fn media_folders_returns_collection_folders() {
     assert_eq!(result.items.len(), 5);
 
     // No `UserData`, because upstream projects these WITHOUT a user:
-    //   var dtoOptions = new DtoOptions().AddClientFields(User);
+    //   var dtoOptions = new DtoOptions();
     //   var resultArray = _dtoService.GetBaseItemDtos(items, dtoOptions);
     // and `IDtoService.GetBaseItemDtos(items, options, User? user = null, …)`
     // defaults the user to null. Passing one added a block Jellyfin never
@@ -1160,6 +1118,30 @@ async fn media_folders_returns_collection_folders() {
              with no user: {item}"
         );
     }
+}
+
+/// `isHidden` compares `BaseItem.IsHidden`, which upstream overrides only on
+/// the playlists folder (`PlaylistsFolder.IsHidden => true`): `true` lists
+/// just that folder, `false` just the libraries, and no value both.
+#[rstest::rstest]
+#[case::absent("", &[SHOWS_ID, MOVIES_ID, MUSIC_ID, MIXED_ID, PLAYLISTS_VIEW_ID])]
+#[case::hidden("?isHidden=true", &[PLAYLISTS_VIEW_ID])]
+#[case::not_hidden("?isHidden=false", &[SHOWS_ID, MOVIES_ID, MUSIC_ID, MIXED_ID])]
+#[tokio::test]
+async fn media_folders_is_hidden_selects_the_playlists_folder(
+    #[case] query: &str,
+    #[case] expected: &[Uuid],
+) {
+    let (status, body) = send_elevated(
+        "GET",
+        &format!("/Library/MediaFolders{query}"),
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let result: QueryResult<BaseItemDto> = serde_json::from_slice(&body).expect("folders");
+    let ids: Vec<Uuid> = result.items.iter().map(|item| item.id).collect();
+    assert_eq!(ids, expected);
 }
 
 /// A server API key carries no user, and upstream's `GetMediaFolders` reads
@@ -1420,12 +1402,6 @@ struct LatestDto;
 
 #[async_trait]
 impl DtoService for LatestDto {
-    async fn get_primary_image_aspect_ratio(
-        &self,
-        _item_id: Uuid,
-    ) -> Result<Option<f64>, ServiceError> {
-        unimplemented!()
-    }
     async fn get_base_item_dto(
         &self,
         item: &BaseItemEntity,
@@ -1461,51 +1437,14 @@ impl DtoService for LatestDto {
             })
             .collect())
     }
-    async fn get_item_by_name_dto(
-        &self,
-        item: &BaseItemEntity,
-        _options: &DtoOptions,
-        _tagged_item_ids: Option<&[Uuid]>,
-        _user: Option<&UserEntity>,
-    ) -> Result<BaseItemDto, ServiceError> {
-        Ok(entity_to_dto(item))
-    }
 }
 
 /// An [`AuthService`] / [`AuthorizationContext`] whose user hides played
 /// items from "latest" (`HidePlayedInLatest`).
-struct HidingAuth;
-
-impl HidingAuth {
-    fn info() -> AuthorizationInfo {
-        let mut user = user_entity(USER_ID, "alice");
-        user.hide_played_in_latest = true;
-        AuthorizationInfo {
-            user: Some(Arc::new(user)),
-            is_authenticated: true,
-            ..AuthorizationInfo::default()
-        }
-    }
-}
-
-#[async_trait]
-impl AuthService for HidingAuth {
-    async fn authenticate(
-        &self,
-        _request: &RequestContext,
-    ) -> Result<AuthorizationInfo, ServiceError> {
-        Ok(Self::info())
-    }
-}
-
-#[async_trait]
-impl AuthorizationContext for HidingAuth {
-    async fn get_authorization_info(
-        &self,
-        _request: &RequestContext,
-    ) -> Result<AuthorizationInfo, ServiceError> {
-        Ok(Self::info())
-    }
+fn hiding_auth() -> FixedAuth {
+    let mut user = user_entity(USER_ID, "alice");
+    user.hide_played_in_latest = true;
+    FixedAuth::signed_in(user)
 }
 
 /// The user-library state with the latest fakes swapped in.
@@ -1516,7 +1455,7 @@ fn latest_state(
 ) -> AppState {
     let (auth_context, auth_service): (Arc<dyn AuthorizationContext>, Arc<dyn AuthService>) =
         if hide_played {
-            (Arc::new(HidingAuth), Arc::new(HidingAuth))
+            (Arc::new(hiding_auth()), Arc::new(hiding_auth()))
         } else {
             (
                 Arc::new(OkAuth {
@@ -1897,13 +1836,6 @@ impl LibraryManager for RecordingResumeLibrary {
     ) -> Result<Vec<BaseItemEntity>, ServiceError> {
         unimplemented!()
     }
-    async fn create_items(
-        &self,
-        _items: &[BaseItemEntity],
-        _parent_id: Option<Uuid>,
-    ) -> Result<(), ServiceError> {
-        unimplemented!()
-    }
     async fn update_items(
         &self,
         _items: &[BaseItemEntity],
@@ -2065,14 +1997,6 @@ impl SessionManager for ResumeSessions {
     async fn send_message_to_user_sessions(
         &self,
         _user_ids: &[Uuid],
-        _message_type: SessionMessageType,
-        _data: &str,
-    ) -> Result<(), ServiceError> {
-        unimplemented!("fake")
-    }
-    async fn send_message_to_user_device_sessions(
-        &self,
-        _device_id: &str,
         _message_type: SessionMessageType,
         _data: &str,
     ) -> Result<(), ServiceError> {

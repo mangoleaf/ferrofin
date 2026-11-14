@@ -81,7 +81,7 @@ impl SubtitleIo for FakeIo {
         ))
     }
 
-    async fn extract(&self, args: &str, output_paths: &[String]) -> Result<(), String> {
+    async fn extract(&self, args: &str, output_paths: &[String]) -> Result<String, String> {
         self.extract_args.lock().unwrap().push(args.to_owned());
         // Simulate file creation so post-extraction checks see non-empty outputs.
         let mut files = self.files.lock().unwrap();
@@ -90,7 +90,7 @@ impl SubtitleIo for FakeIo {
                 .entry(path.clone())
                 .or_insert_with(|| b"extracted".to_vec());
         }
-        Ok(())
+        Ok(String::new())
     }
 
     fn file_size(&self, path: &str) -> Option<u64> {
@@ -361,6 +361,65 @@ async fn get_subtitle_stream_bomless_utf16be_keeps_music_notes() {
     assert_bomless_utf16_decoded(true).await;
 }
 
+// ---- GetSubtitleStream ISO-2022-JP detection --------------------------------
+//
+// ISO-2022-JP is 7-bit: every byte is ASCII and ESC sequences switch the
+// character set, so the file is also valid UTF-8. `UtfUnknown`'s escape prober
+// detects it before any UTF-8 answer, and so must the port (gl-1422).
+
+const JAPANESE_TEXT: &str = "日本語の字幕です。";
+
+fn encoder_for_srt(
+    path: &str,
+    bytes: Vec<u8>,
+) -> (SubtitleEncoder<SubtitleEditParser, FakeIo>, SubtitleInfo) {
+    let encoder = SubtitleEncoder::new(SubtitleEditParser::new(), FakeIo::with_file(path, bytes));
+    let file_info = SubtitleInfo {
+        path: path.to_owned(),
+        protocol: MediaProtocol::File,
+        format: "srt".to_owned(),
+        is_external: true,
+    };
+    (encoder, file_info)
+}
+
+#[tokio::test]
+async fn get_subtitle_stream_iso_2022_jp_is_converted() {
+    let srt = format!("1\n00:00:01,000 --> 00:00:02,000\n{JAPANESE_TEXT}\n\n");
+    let (jis, _, _) = encoding_rs::ISO_2022_JP.encode(&srt);
+    assert!(jis.is_ascii(), "the fixture is 7-bit");
+    let (encoder, file_info) = encoder_for_srt("/media/japanese.srt", jis.into_owned());
+
+    let stream = encoder.get_subtitle_stream(&file_info).await.unwrap();
+
+    assert!(stream.is_converted(), "ISO-2022-JP must be re-encoded");
+    let text = String::from_utf8(stream.into_bytes()).unwrap();
+    assert!(text.contains(JAPANESE_TEXT), "{text:?}");
+    assert!(
+        !text.contains('\u{1B}'),
+        "no escape sequences left: {text:?}"
+    );
+}
+
+#[tokio::test]
+async fn get_subtitle_stream_utf8_with_or_without_an_escape_is_preserved() {
+    // Plain ASCII stays on the shortcut; `ESC [` is no ISO-2022-JP designation,
+    // and non-ASCII UTF-8 is never ISO-2022-JP, so the detector answers UTF-8.
+    for cue in [
+        "red".to_owned(),
+        "\u{1B}[31mred\u{1B}[0m".to_owned(),
+        format!("\u{1B}[31m{JAPANESE_TEXT}\u{1B}[0m"),
+    ] {
+        let srt = format!("1\n00:00:01,000 --> 00:00:02,000\n{cue}\n\n");
+        let (encoder, file_info) = encoder_for_srt("/media/utf8.srt", srt.clone().into_bytes());
+
+        let stream = encoder.get_subtitle_stream(&file_info).await.unwrap();
+
+        assert!(!stream.is_converted(), "{cue:?}");
+        assert_eq!(stream.bytes(), srt.as_bytes());
+    }
+}
+
 // ---- ConvertTextSubtitleToSrt charset hint ----------------------------------
 //
 // Port of the C# arg construction: `-y{charenc} -i "{in}" -c:s srt "{out}"`.
@@ -394,6 +453,17 @@ async fn convert_text_subtitle_passes_charenc_for_legacy_encoding() {
     let args = convert_smi_and_capture_args(legacy.into_owned()).await;
     assert!(
         args.contains("-sub_charenc windows-1253"),
+        "expected charset hint in: {args}"
+    );
+}
+
+#[tokio::test]
+async fn convert_text_subtitle_passes_charenc_for_iso_2022_jp() {
+    let smi = format!("<SAMI><BODY><SYNC Start=1000><P>{JAPANESE_TEXT}</BODY></SAMI>\n");
+    let (jis, _, _) = encoding_rs::ISO_2022_JP.encode(&smi);
+    let args = convert_smi_and_capture_args(jis.into_owned()).await;
+    assert!(
+        args.contains("-sub_charenc iso-2022-jp"),
         "expected charset hint in: {args}"
     );
 }

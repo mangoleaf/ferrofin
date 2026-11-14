@@ -15,6 +15,7 @@ use ferrofin_api::create_router;
 use ferrofin_api::state::AppState;
 use ferrofin_api::test_support::{
     FakeConfig, FakeMusic, FakeProviders, FakeSearch, FakeSimilarItems, FakeSystem, FakeUserData,
+    FixedAuth, fake_user_entity,
 };
 use ferrofin_db::entities::base_items::{BaseItemEntity, PeopleEntity};
 use ferrofin_db::entities::users::UserEntity;
@@ -23,7 +24,7 @@ use ferrofin_model::querying::QueryResult;
 use ferrofin_traits::dto::DtoService;
 use ferrofin_traits::error::ServiceError;
 use ferrofin_traits::library::{LibraryManager, MediaSourceManager, UserManager, UserViewManager};
-use ferrofin_traits::net::{AuthService, AuthorizationContext, RequestContext};
+use ferrofin_traits::net::{AuthService, AuthorizationContext};
 use ferrofin_traits::options::{
     AuthorizationInfo, DtoOptions, InternalItemsQuery, InternalPeopleQuery,
 };
@@ -37,77 +38,27 @@ const USER_ID: Uuid = Uuid::from_u128(0x1234_5678);
 /// Builds a minimal [`UserEntity`] carrying the given id + username.
 fn user_entity(id: Uuid, username: &str) -> UserEntity {
     UserEntity {
-        id: id.to_string(),
-        audio_language_preference: None,
-        authentication_provider_id: String::new(),
-        cast_receiver_id: None,
-        display_collections_view: false,
-        display_missing_episodes: false,
-        enable_auto_login: false,
-        enable_local_password: false,
-        enable_next_episode_auto_play: false,
-        enable_user_preference_access: false,
-        hide_played_in_latest: false,
-        internal_id: 0,
-        invalid_login_attempt_count: 0,
-        last_activity_date: None,
-        last_login_date: None,
-        login_attempts_before_lockout: None,
-        max_active_sessions: 0,
-        max_parental_rating_score: None,
-        max_parental_rating_sub_score: None,
-        must_update_password: false,
         password: Some("hashed".to_owned()),
-        password_reset_provider_id: String::new(),
-        play_default_audio_track: false,
-        remember_audio_selections: false,
-        remember_subtitle_selections: false,
-        remote_client_bitrate_limit: None,
-        row_version: 0,
-        subtitle_language_preference: None,
-        subtitle_mode: 0,
-        sync_play_access: 0,
-        username: username.to_owned(),
-        normalized_username: username.to_uppercase(),
+        ..fake_user_entity(id, username)
     }
 }
 
 /// An [`AuthService`] that always authenticates as [`USER_ID`].
-struct OkAuthService;
-
-#[async_trait]
-impl AuthService for OkAuthService {
-    async fn authenticate(
-        &self,
-        _request: &RequestContext,
-    ) -> Result<AuthorizationInfo, ServiceError> {
-        Ok(AuthorizationInfo {
-            user: Some(Arc::new(user_entity(USER_ID, "alice"))),
-            is_authenticated: true,
-            ..AuthorizationInfo::default()
-        })
-    }
+fn ok_auth_service() -> FixedAuth {
+    FixedAuth::signed_in(user_entity(USER_ID, "alice"))
 }
 
 /// An [`AuthorizationContext`] that resolves the same authenticated user.
-struct OkAuthContext;
-
-#[async_trait]
-impl AuthorizationContext for OkAuthContext {
-    async fn get_authorization_info(
-        &self,
-        _request: &RequestContext,
-    ) -> Result<AuthorizationInfo, ServiceError> {
-        Ok(AuthorizationInfo {
-            user: Some(Arc::new(user_entity(USER_ID, "alice"))),
-            client: Some("Wolphin".to_owned()),
-            version: Some("1.0".to_owned()),
-            device_id: Some("dev-1".to_owned()),
-            device: Some("Test Device".to_owned()),
-            is_authenticated: true,
-            ..AuthorizationInfo::default()
-        })
-    }
+fn ok_auth_context() -> FixedAuth {
+    FixedAuth(AuthorizationInfo {
+        user: Some(Arc::new(user_entity(USER_ID, "alice"))),
+        client: Some("Wolphin".to_owned()),
+        version: Some("1.0".to_owned()),
+        device_id: Some("dev-1".to_owned()),
+        device: Some("Test Device".to_owned()),
+        is_authenticated: true,
+        ..AuthorizationInfo::default()
+    })
 }
 
 /// A [`UserManager`] whose `get_user_by_id` returns the fixed user.
@@ -119,9 +70,6 @@ impl UserManager for OkUsers {
         Ok((id == USER_ID).then(|| user_entity(USER_ID, "alice")))
     }
     async fn get_users(&self) -> Result<Vec<UserEntity>, ServiceError> {
-        unimplemented!()
-    }
-    async fn get_user_ids(&self) -> Result<Vec<Uuid>, ServiceError> {
         unimplemented!()
     }
     async fn initialize(&self) -> Result<(), ServiceError> {
@@ -188,6 +136,8 @@ impl UserManager for OkUsers {
             id: Uuid::parse_str(&user.id).unwrap_or_else(|_| Uuid::nil()),
             name: Some(user.username.clone()),
             server_id,
+            // All-false: these tests' user may not transcode or remux.
+            policy: Some(ferrofin_model::users::UserPolicy::default()),
             ..ferrofin_model::dto::UserDto::default()
         })
     }
@@ -335,13 +285,6 @@ impl LibraryManager for OkLibrary {
     ) -> Result<Vec<BaseItemEntity>, ServiceError> {
         unimplemented!()
     }
-    async fn create_items(
-        &self,
-        _items: &[BaseItemEntity],
-        _parent_id: Option<Uuid>,
-    ) -> Result<(), ServiceError> {
-        unimplemented!()
-    }
     async fn update_items(
         &self,
         _items: &[BaseItemEntity],
@@ -466,12 +409,6 @@ fn entity_to_dto(item: &BaseItemEntity) -> BaseItemDto {
 
 #[async_trait]
 impl DtoService for OkDto {
-    async fn get_primary_image_aspect_ratio(
-        &self,
-        _item_id: Uuid,
-    ) -> Result<Option<f64>, ServiceError> {
-        unimplemented!()
-    }
     async fn get_base_item_dto(
         &self,
         item: &BaseItemEntity,
@@ -490,15 +427,6 @@ impl DtoService for OkDto {
         _skip_visibility_check: bool,
     ) -> Result<Vec<BaseItemDto>, ServiceError> {
         Ok(items.iter().map(entity_to_dto).collect())
-    }
-    async fn get_item_by_name_dto(
-        &self,
-        item: &BaseItemEntity,
-        _options: &DtoOptions,
-        _tagged_item_ids: Option<&[Uuid]>,
-        _user: Option<&UserEntity>,
-    ) -> Result<BaseItemDto, ServiceError> {
-        Ok(entity_to_dto(item))
     }
 }
 
@@ -681,14 +609,6 @@ impl SessionManager for OkSessions {
     ) -> Result<(), ServiceError> {
         unimplemented!()
     }
-    async fn send_message_to_user_device_sessions(
-        &self,
-        _device_id: &str,
-        _message_type: ferrofin_model::session::SessionMessageType,
-        _data: &str,
-    ) -> Result<(), ServiceError> {
-        unimplemented!()
-    }
     async fn send_restart_required_notification(&self) -> Result<(), ServiceError> {
         unimplemented!()
     }
@@ -803,8 +723,8 @@ fn ok_state_full(
         item_id,
         media_sources,
         users,
-        Arc::new(OkAuthContext),
-        Arc::new(OkAuthService),
+        Arc::new(ok_auth_context()),
+        Arc::new(ok_auth_service()),
     )
 }
 
@@ -1377,8 +1297,8 @@ fn versions_state(
         item_id,
         sources,
         Arc::new(OkUsers),
-        Arc::new(OkAuthContext),
-        Arc::new(OkAuthService),
+        Arc::new(ok_auth_context()),
+        Arc::new(ok_auth_service()),
         devices,
     )
 }
@@ -1658,8 +1578,8 @@ async fn an_administrator_keeps_a_tuner_url() {
         item_id,
         versioned(vec![tuner_source(TUNER_URL)]),
         Arc::new(ferrofin_api::test_support::FakeAdminUsers),
-        Arc::new(OkAuthContext),
-        Arc::new(OkAuthService),
+        Arc::new(ok_auth_context()),
+        Arc::new(ok_auth_service()),
         Arc::new(ferrofin_api::test_support::FakeDevices),
     );
     let json = post_playback(state, item_id, Some(&serde_json::json!({}))).await;
@@ -1814,12 +1734,6 @@ impl ferrofin_traits::devices::DeviceManager for ProfileDevices {
         &self,
         _query: &ferrofin_traits::devices::DeviceQuery,
     ) -> Result<QueryResult<ferrofin_db::entities::security::DeviceEntity>, ServiceError> {
-        unimplemented!()
-    }
-    async fn get_device_infos(
-        &self,
-        _query: &ferrofin_traits::devices::DeviceQuery,
-    ) -> Result<QueryResult<ferrofin_model::devices::DeviceInfo>, ServiceError> {
         unimplemented!()
     }
     async fn get_devices_for_user(
@@ -2060,43 +1974,19 @@ impl ferrofin_traits::configuration::ServerConfigurationManager for ExtractionCo
 }
 
 /// The authenticated user, with a policy that allows every transcode.
-struct TranscodingAuth;
-
-impl TranscodingAuth {
-    fn info() -> AuthorizationInfo {
-        AuthorizationInfo {
-            user: Some(Arc::new(user_entity(USER_ID, "alice"))),
-            user_policy: Some(Arc::new(ferrofin_model::users::UserPolicy {
-                enable_audio_playback_transcoding: true,
-                enable_video_playback_transcoding: true,
-                enable_playback_remuxing: true,
-                ..ferrofin_model::users::UserPolicy::default()
-            })),
-            device_id: Some("dev-1".to_owned()),
-            is_authenticated: true,
-            ..AuthorizationInfo::default()
-        }
-    }
-}
-
-#[async_trait]
-impl AuthService for TranscodingAuth {
-    async fn authenticate(
-        &self,
-        _request: &RequestContext,
-    ) -> Result<AuthorizationInfo, ServiceError> {
-        Ok(Self::info())
-    }
-}
-
-#[async_trait]
-impl AuthorizationContext for TranscodingAuth {
-    async fn get_authorization_info(
-        &self,
-        _request: &RequestContext,
-    ) -> Result<AuthorizationInfo, ServiceError> {
-        Ok(Self::info())
-    }
+fn transcoding_auth() -> FixedAuth {
+    FixedAuth(AuthorizationInfo {
+        user: Some(Arc::new(user_entity(USER_ID, "alice"))),
+        user_policy: Some(Arc::new(ferrofin_model::users::UserPolicy {
+            enable_audio_playback_transcoding: true,
+            enable_video_playback_transcoding: true,
+            enable_playback_remuxing: true,
+            ..ferrofin_model::users::UserPolicy::default()
+        })),
+        device_id: Some("dev-1".to_owned()),
+        is_authenticated: true,
+        ..AuthorizationInfo::default()
+    })
 }
 
 /// `MediaEncoder.CanExtractSubtitles` answers `EnableSubtitleExtraction`
@@ -2116,8 +2006,8 @@ async fn the_subtitle_extraction_setting_decides_external_delivery_in_a_transcod
             item_id,
             versioned(vec![source]),
             Arc::new(OkUsers),
-            Arc::new(TranscodingAuth),
-            Arc::new(TranscodingAuth),
+            Arc::new(transcoding_auth()),
+            Arc::new(transcoding_auth()),
             Arc::new(ferrofin_api::test_support::FakeDevices),
             Arc::new(ExtractionConfig(extraction)),
         )
@@ -2211,8 +2101,8 @@ async fn negotiate(source: MediaSourceInfo, body: &serde_json::Value) -> serde_j
         item_id,
         versioned(vec![source]),
         Arc::new(OkUsers),
-        Arc::new(TranscodingAuth),
-        Arc::new(TranscodingAuth),
+        Arc::new(transcoding_auth()),
+        Arc::new(transcoding_auth()),
         Arc::new(ferrofin_api::test_support::FakeDevices),
     )
     .with_encoder_support(Arc::new(ferrofin_api::test_support::CommonEncoders));

@@ -114,14 +114,30 @@ pub trait TaskManager: Send + Sync {
     /// Cancels a running task.
     ///
     /// Ports `ScheduledTasksController.StopTask` → `ITaskManager.Cancel`: a
-    /// running task is aborted and recorded `Cancelled`; cancelling an idle task
-    /// is a no-op. A missing task is [`ServiceError::NotFound`], otherwise it
-    /// succeeds.
+    /// running task is asked to stop and shows `Cancelling` until its run
+    /// returns and records its result; cancelling an idle task is a no-op. A
+    /// missing task is [`ServiceError::NotFound`], otherwise it succeeds.
     ///
     /// # Errors
     ///
     /// [`ServiceError::NotFound`] when no task has that id.
     async fn cancel_task(&self, task_id: &str) -> Result<(), ServiceError>;
+
+    /// Cancels the task if it runs and queues a new run, which starts once
+    /// the cancelled one has ended: `ITaskManager.CancelIfRunningAndQueue`,
+    /// what `POST /Library/Refresh` does to the library-scan task.
+    ///
+    /// The default cancels, then starts, for a registry whose cancel ends a
+    /// run at once.
+    ///
+    /// # Errors
+    ///
+    /// [`ServiceError::NotFound`] when no task has that id, or whatever
+    /// [`start_task`](TaskManager::start_task) returns.
+    async fn cancel_if_running_and_queue(&self, task_id: &str) -> Result<(), ServiceError> {
+        self.cancel_task(task_id).await?;
+        self.start_task(task_id).await
+    }
 
     /// Replaces a task's configured triggers.
     ///

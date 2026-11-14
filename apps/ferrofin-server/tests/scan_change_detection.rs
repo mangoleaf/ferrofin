@@ -255,13 +255,19 @@ fn subtitle_answer(target: &str, addr: std::net::SocketAddr) -> Option<String> {
         "/opensubtitles/download" => {
             json!({"link":format!("http://{addr}/subtitle-file"),"remaining":19}).to_string()
         }
+        "/opensubtitles/infos/languages" => json!({"data":[
+            {"language_code":"en"},{"language_code":"fr"},{"language_code":"es"}
+        ]})
+        .to_string(),
         "/opensubtitles/subtitles" => {
             assert!(target.contains("moviehash="));
             assert!(target.contains("moviehash_match=only"));
             // A nonmatching candidate first must never win perfect-match mode.
-            json!({"data":[
-                {"attributes":{"moviehash_match":false,"files":[{"file_id":99}]}},
-                {"attributes":{"moviehash_match":true,"files":[{"file_id":42}]}}
+            json!({"total_pages":1,"page":1,"data":[
+                {"attributes":{"moviehash_match":false,"feature_details":{"feature_type":"Movie"},
+                               "files":[{"file_id":99}]}},
+                {"attributes":{"moviehash_match":true,"feature_details":{"feature_type":"Movie"},
+                               "files":[{"file_id":42}]}}
             ]})
             .to_string()
         }
@@ -2718,11 +2724,11 @@ async fn subtitles_are_downloaded_during_scan(h: &Harness) {
     let subtitles = of(&first.requests, "opensubtitles");
     assert_eq!(
         subtitles.len(),
-        4,
-        "search + login + quota + download: {:?}",
+        5,
+        "login + quota + languages + search + download: {:?}",
         first.requests
     );
-    for path in ["/login", "/infos/user", "/download"] {
+    for path in ["/login", "/infos/user", "/infos/languages", "/download"] {
         assert!(
             subtitles
                 .iter()
@@ -2771,7 +2777,7 @@ async fn subtitles_are_downloaded_during_scan(h: &Harness) {
     assert_eq!(
         subtitles.len(),
         2,
-        "search + download, on the first download's login: {:?}",
+        "search + download, on the first search's login: {:?}",
         repaired.requests
     );
     assert!(
@@ -2784,7 +2790,7 @@ async fn subtitles_are_downloaded_during_scan(h: &Harness) {
         !subtitles
             .iter()
             .any(|r| r.contains("/opensubtitles/login") || r.contains("/opensubtitles/infos/user")),
-        "the first download's login is reused: {subtitles:?}"
+        "the first search's login is reused: {subtitles:?}"
     );
     assert_eq!(std::fs::read(&english).unwrap(), content);
 

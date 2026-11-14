@@ -22,7 +22,7 @@ use ferrofin_api::test_support::{
     FakeAppHost, FakeCollections, FakeDevices, FakeDto, FakeLibrary, FakeLyrics, FakeMediaSegments,
     FakeMediaSources, FakeMusic, FakePlaylists, FakeQuickConnect, FakeSearch, FakeSessions,
     FakeSimilarItems, FakeSubtitles, FakeSystem, FakeTrickplay, FakeTvSeries, FakeUserData,
-    FakeUserViews,
+    FakeUserViews, fake_user_entity,
 };
 use ferrofin_db::entities::security::{DeviceEntity, DeviceOptionsEntity};
 use ferrofin_db::entities::users::UserEntity;
@@ -46,40 +46,7 @@ const USER_ID: Uuid = Uuid::from_u128(0x00C1_0000);
 
 /// A minimal authenticated user.
 fn user() -> UserEntity {
-    UserEntity {
-        id: USER_ID.to_string(),
-        audio_language_preference: None,
-        authentication_provider_id: String::new(),
-        cast_receiver_id: None,
-        display_collections_view: false,
-        display_missing_episodes: false,
-        enable_auto_login: false,
-        enable_local_password: false,
-        enable_next_episode_auto_play: false,
-        enable_user_preference_access: false,
-        hide_played_in_latest: false,
-        internal_id: 0,
-        invalid_login_attempt_count: 0,
-        last_activity_date: None,
-        last_login_date: None,
-        login_attempts_before_lockout: None,
-        max_active_sessions: 0,
-        max_parental_rating_score: None,
-        max_parental_rating_sub_score: None,
-        must_update_password: false,
-        password: None,
-        password_reset_provider_id: String::new(),
-        play_default_audio_track: false,
-        remember_audio_selections: false,
-        remember_subtitle_selections: false,
-        remote_client_bitrate_limit: None,
-        row_version: 0,
-        subtitle_language_preference: None,
-        subtitle_mode: 0,
-        sync_play_access: 0,
-        username: "bob".to_owned(),
-        normalized_username: "BOB".to_owned(),
-    }
+    fake_user_entity(USER_ID, "bob")
 }
 
 /// An auth stub that authenticates as [`USER_ID`], carrying client/version so the
@@ -167,12 +134,6 @@ impl DeviceManager for StubDevices {
         // No live sessions to log out — the delete handler's per-device loop is a
         // no-op (so the panic `FakeSessions.logout_device` is never reached).
         Ok(QueryResult::from_items(Vec::new()))
-    }
-    async fn get_device_infos(
-        &self,
-        _query: &DeviceQuery,
-    ) -> Result<QueryResult<ferrofin_model::devices::DeviceInfo>, ServiceError> {
-        unimplemented!()
     }
     async fn get_devices_for_user(
         &self,

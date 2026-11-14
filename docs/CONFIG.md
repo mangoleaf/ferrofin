@@ -29,8 +29,8 @@ Each setting has exactly one key; the variable's stem is not accepted for these 
 `FERROFIN_CONFIG_FILE` has no key: it names the file. A key the file cannot hold is ignored with
 a warning at startup that names it, and a key spelled as its variable's stem (`tvdb_pin`) is
 told the key to use (`tvdb_subscriber_pin`). A number or on/off variable whose value does not
-parse (`FERROFIN_PORT=80g`) is ignored with a warning naming it, so the file's value or the
-default applies, and a blank one counts as unset; the rows that say so (`FERROFIN_DB_POOL`,
+parse (`FERROFIN_PORT=80g`) is ignored with a warning naming it, so what it would outrank
+applies, and a blank one counts as unset; the rows that say so (`FERROFIN_DB_POOL`,
 `FERROFIN_DB_STATEMENT_CACHE`, the cache lifetimes, `FERROFIN_TRICKPLAY_CONCURRENCY`, the login
 backoff's numbers) stop the server on a bad value instead.
 
@@ -48,10 +48,12 @@ boots.
 
 `GET /Ferrofin/Settings` (administrators only) reports every setting below with its readable
 name (`Label`), its tab (`Group`), the value in use and its unit (`Unit`, when it has one), its
-default, and where that value comes from: a flag, a variable, `config.toml` or the default. A
-value `config.toml` holds that is not in use (the file changed since the server started, or a flag
-or variable outranks it) is reported beside it. A choice lists its options (`Options`, each with
-its `Value`, `Label` and `Note`) and says when the stored value fits none (`Custom: true`, the
+default, and where that value comes from: a flag, a variable, the Networking page (`port`,
+`https_port` and `base_url` only), `config.toml` or the default. A value `config.toml` holds
+that is not in use (the file
+changed since the server started, or a flag, a variable or the Networking page outranks it) is
+reported beside it. A choice lists its options (`Options`, each with its `Value`, `Label` and
+`Note`) and says when the stored value fits none (`Custom: true`, the
 value as written in `Value`); a setting may carry a longer `Note`; and each says where it is
 stored (`Store`: `ConfigFile`, or `ServerConfiguration` for one the server configuration holds,
 which applies at once, `Applies: Immediately`). Each setting also says
@@ -72,8 +74,8 @@ Trickplay, Images, Providers, Performance, Logging, Plugins, System), the first 
 on the left (a row above the settings on a narrow screen). Each setting
 is headed by a readable name, with its `config.toml` key, variable, flag and default on a small
 line below, then its description. A badge beside the name says what sets it, when anything does
-(`config.toml`, a variable or a flag), and secrets are marked as secrets. Disabling the plugin
-hides the page and the menu entry.
+(`config.toml`, the Networking page, a variable or a flag), and secrets are marked as secrets.
+Disabling the plugin hides the page and the menu entry.
 
 ### Editing settings from the dashboard
 
@@ -113,8 +115,8 @@ A search box and two filters sit above the tabs, since they reach every tab:
 - the search matches a setting's name, description, `config.toml` key, variable and flag,
   ignoring case, and each word typed must match. It lists the matches of every tab, each tab's
   under its name with their count, and dims the tabs with none (so does **Changed**);
-- **Changed** lists, from every tab, the settings something sets (a flag, a variable or
-  `config.toml`) and those holding an edit not saved yet;
+- **Changed** lists, from every tab, the settings something sets (a flag, a variable, the
+  Networking page or `config.toml`) and those holding an edit not saved yet;
 - **Hide read-only** leaves out the settings the page may not change, on a tab and in a list.
 
 Opening a tab ends a search and **Changed**. Each tab shows how many edits it
@@ -143,8 +145,7 @@ changed. These have no field whatever sets them, each with its reason on the pag
   it lists, so it is set the same way, for the same reason;
 - the settings jellyfin-web's own pages cover: `bind_addr`, `published_url`, `port`, `https_port`
   and `base_url` under Dashboard → Networking, `server_name` and `enable_metrics` under
-  Dashboard → General (Networking does not drive `port`, `https_port` and `base_url` yet, so their
-  notes say to set them by hand in `config.toml`, or with their variable or flag);
+  Dashboard → General;
 - the OpenTelemetry variables, which `config.toml` has no key for.
 
 A saved change [applies at the next restart](#when-a-change-applies). After a save the line below
@@ -195,7 +196,8 @@ key: an unknown key, a setting that may not be changed here (with the reason
 saved underneath it would not apply), or an invalid value. The result is then loaded the way a
 start loads it, under the server's environment and flags, before it replaces `config.toml`. Rules
 that only warn at a start (`tvdb_cache_hours`, `tvdb_token_days`, `log_level`, `log_format`,
-`metrics_scan_duration_buckets`, the provider time limits) refuse the value here instead, so a
+`metrics_scan_duration_buckets`, the provider time limits, `ffmpeg_analyze_duration`,
+`ffmpeg_probe_size`) refuse the value here instead, so a
 value the server would ignore is never saved. A URL setting must be an `http` or `https` URL, or
 blank for its default, and is saved trimmed.
 
@@ -224,6 +226,8 @@ the report, the route answers `404` while the **Ferrofin Settings** plugin is di
 | `FERROFIN_WEB_DIR` | `{data_dir}/web` | Built jellyfin-web `dist/` served at `/web`. Absent → API-only. |
 | `FERROFIN_CONFIG_FILE` | `{data_dir}/config.toml` | Path to the optional bootstrap `config.toml`. |
 
+A relative data, configuration, cache or web directory (`--data-dir ./data`) is resolved against the working directory once, at startup, as Jellyfin does: the server uses, logs and reports the absolute path (keeping any `..`). A blank one stops the server, naming it.
+
 The data, configuration and cache directories must be different directories: startup checks each against its Jellyfin marker file (`.jellyfin-data`, `.jellyfin-config`, `.jellyfin-cache`) and stops when two of them are one directory (see `docs/UPGRADING.md`).
 
 The database file is `{data_dir}/ferrofin.db`. For drop-in adoption Ferrofin also opens a
@@ -234,10 +238,10 @@ Jellyfin `jellyfin.db` (root or `data/jellyfin.db`) found in the data dir — se
 | Variable | Default | Purpose |
 |---|---|---|
 | `FERROFIN_BIND_ADDR` | `0.0.0.0` | Address the HTTP listener binds to. |
-| `FERROFIN_PORT` | `8096` | HTTP port. |
-| `FERROFIN_HTTPS_PORT` | `8920` | HTTPS port (parity value). Served beside the HTTP port when the dashboard's Networking settings enable HTTPS and the PKCS#12 (`.pfx`) certificate at their certificate path loads; see [HTTPS](#https). |
+| `FERROFIN_PORT` | `8096` | HTTP port. It and the `--port` flag outrank **Local HTTP port number** on Dashboard → Networking, which outranks the `config.toml` key `port` unless it holds the default, `8096`. A change on the Networking page applies after a restart, and the dashboard shows the restart as pending. The container image sets `FERROFIN_PORT=8096`, so in a container the Networking page's port applies only once the variable is set blank (`FERROFIN_PORT=`), and the port mapping must follow it. |
+| `FERROFIN_HTTPS_PORT` | `8920` | HTTPS port (parity value). Served beside the HTTP port when the dashboard's Networking settings enable HTTPS and the PKCS#12 (`.pfx`) certificate at their certificate path loads; see [HTTPS](#https). It outranks **Local HTTPS port number** on Dashboard → Networking, which outranks the `config.toml` key `https_port` unless it holds the default, `8920`. A change on the Networking page applies after a restart. When the Networking page gives both ports the same number, it sets neither (Jellyfin resets both to the defaults). |
 | `FERROFIN_PUBLISHED_URL` | auto-detect | Public base URL advertised to clients. |
-| `FERROFIN_BASE_URL` | none | URL path prefix the server is mounted under. |
+| `FERROFIN_BASE_URL` | none | URL path prefix the server is mounted under. It outranks **Base URL** on Dashboard → Networking, which outranks the `config.toml` key `base_url`. A blank value is set: it serves at the root and still outranks the Networking page. A change on the Networking page applies after a restart, and the dashboard shows the restart as pending. |
 | `FERROFIN_SERVER_NAME` | host name | Server name reported to clients. |
 | `FERROFIN_LOG` | `info` | Log filter, `RUST_LOG`/`EnvFilter` syntax; `RUST_LOG` wins when set. The `config.toml` key is `log_level`. |
 | `FERROFIN_LOG_FORMAT` | `json` | Stdout log lines: `json` (one JSON object per line, with the request's `trace_id`, for a log pipeline) or `text` (human-readable, for running the server by hand). Any other value logs a warning and is `json`. The log file under `{data_dir}/log` is always plain text. The `config.toml` key is `log_format`. |
@@ -257,7 +261,7 @@ Ferrofin serves HTTPS itself, as Jellyfin does, from the dashboard's **Networkin
 
 - **Enable HTTPS** with a **Custom SSL certificate path** to a PKCS#12 (`.pfx`/`.p12`) file holding
   the certificate and its private key, plus its password if it has one. At startup the server
-  listens with HTTPS on `FERROFIN_HTTPS_PORT` on every address it listens with HTTP on.
+  listens with HTTPS on its HTTPS port on every address it listens with HTTP on.
   If the certificate does not load, the server logs why and serves HTTP only.
   A certificate without a password must use the usual empty-password form, as OpenSSL writes
   it. The rarer NULL-password form, which .NET loads, does not load yet (gl-815). To rewrite
@@ -271,15 +275,17 @@ Ferrofin serves HTTPS itself, as Jellyfin does, from the dashboard's **Networkin
   `X-Forwarded-Proto: https` counts as HTTPS.
 - A new certificate path takes effect after a restart; the dashboard shows the restart as
   pending. A path to a missing file saves but is answered `404`.
-- The ports are `FERROFIN_PORT` and `FERROFIN_HTTPS_PORT`; the port fields on the Networking
-  page are not read yet (gl-554). When both name the same port, HTTPS is not served and the
-  log says so.
+- The ports are the Networking page's **Local HTTP port number** and **Local HTTPS port
+  number**, below `FERROFIN_PORT` (or `--port`) and `FERROFIN_HTTPS_PORT` (see the table above).
+  An adopted Jellyfin install keeps its ports from its first boot, unless a flag or a variable
+  pins them (the container image sets `FERROFIN_PORT`). When a variable, a flag or
+  `config.toml` leaves both on the same port, HTTPS is not served and the log says so.
 - Adoption keeps Jellyfin's **Enable HTTPS** and **Require HTTPS**, but not its certificate
   path and password, which point into Jellyfin's filesystem.
 
 A reverse proxy that terminates TLS needs none of this. List it under **Known proxies** instead.
 Addresses published from each request (**Enable published server URI by request**) take the
-proxy's `X-Forwarded-Proto`, but not yet its `X-Forwarded-Host` (gl-813).
+proxy's `X-Forwarded-Proto` and `X-Forwarded-Host`.
 
 ## Admin seeding (fresh database only)
 
@@ -295,6 +301,8 @@ proxy's `X-Forwarded-Proto`, but not yet its `X-Forwarded-Host` (gl-813).
 | `FERROFIN_FFMPEG_PATH` | auto-discovered on `$PATH` | Path to `ffmpeg`. Absent ffmpeg only disables transcode. |
 | `FERROFIN_FFPROBE_PATH` | auto-discovered on `$PATH` | Path to `ffprobe` (scan probes). |
 | `FERROFIN_FFMPEG_IMG_EXTRACT_PERF_TRADEOFF` | `false` | Jellyfin's `FFmpeg:imgExtractPerfTradeoff`: trade frame quality for speed when extracting chapter images, video thumbnails and embedded pictures. On, the first attempt decodes keyframes only and takes the first one, instead of picking the most representative of 24 frames; extraction is faster, and the image may be less typical of the scene. The `config.toml` key is `ffmpeg_img_extract_perf_tradeoff`. |
+| `FERROFIN_FFMPEG_ANALYZE_DURATION` | `200M` | Jellyfin's `FFmpeg:analyzeduration`: how long, in microseconds, ffmpeg and ffprobe analyse an input to find its streams when its source names no duration of its own (a Live TV channel's 3 seconds wins). It applies to every probe, scans included, to the media file of every transcode, and to an external subtitle a transcode reads. The value is in ffmpeg's syntax, as Jellyfin takes it: digits, then `K`, `M` or `G` for powers of 1000, or `Ki`, `Mi` or `Gi` for powers of 1024, so `200M` is 200 seconds. A smaller value starts a transcode of a slow or remote source (a `.strm` URL) sooner, because ffmpeg reads the input before the first segment on every job start, a restart after an idle job is ended included; it can also miss a stream that starts late, and a scan keeps what its probe found. `1M` to `600M` (a value outside logs a warning and is clamped; one that does not parse logs a warning and is ignored). Blank is the default (for a blank value Jellyfin drops the flag; Ferrofin does not); `5M` is ffmpeg's own default. The `config.toml` key is `ffmpeg_analyze_duration`. |
+| `FERROFIN_FFMPEG_PROBE_SIZE` | `1G` | Jellyfin's `FFmpeg:probesize`: how many bytes of an input ffmpeg and ffprobe read to find its streams, on the same inputs as `FERROFIN_FFMPEG_ANALYZE_DURATION`, in the same syntax, with the same trade-off. `1M` to `4G` (a value outside logs a warning and is clamped; one that does not parse logs a warning and is ignored). Blank is the default (for a blank value Jellyfin drops the flag; Ferrofin does not); `5M` is ffmpeg's own default. The `config.toml` key is `ffmpeg_probe_size`. |
 | `FERROFIN_MAX_TRANSCODES` | `0` | The most streaming jobs that re-encode the whole server runs at once, `0` to `1024` (a value outside logs a warning and is clamped). `0` means no cap. A job counts when it re-encodes any stream, video or audio, so a copied video with re-encoded audio counts and so does a music transcode; only a job copying every stream, a direct stream or remux, is free. It counts until its ffmpeg exits. Trickplay, chapter images, recordings and library analysis are other work and are not counted. Past the cap, a new job of a signed-in user first ends an idle job of that user on the same device (see `FERROFIN_MAX_TRANSCODES_PER_USER`). If that makes no room the request is refused with `503` and `Retry-After: 10`, before anything is started, and the stream can play once a job ends. Refusals log at `debug`. A job started with an API key counts here, and has no user whose jobs could be ended. Jellyfin has no such cap. The `config.toml` key is `max_transcodes`. |
 | `FERROFIN_MAX_TRANSCODES_PER_USER` | `0` | The most streaming jobs that re-encode one signed-in user runs at once, `0` to `1024`, counted as for `FERROFIN_MAX_TRANSCODES`. `0` means no cap. The user comes from the sign-in, never the request's `userId`, so accounts shared between devices share this cap. An API key has no user and is outside it. Past the cap, the user's idle jobs on the same device are ended first, longest idle first and no more than needed, so "next episode" works while the last episode's job waits to be reaped; if none is idle the request is refused with `503` and `Retry-After: 10`. Idle means no request is reading from the job at that moment. The device is the request's `DeviceId`, which the stream URL from playback info carries from the client's sign-in; a request without one ends nothing. Another device's job is never ended, since a player between two segment requests is idle too: with a cap below the number of devices playing on one account, the next device is refused until a stream ends (a stopped one at once, an abandoned one when it is reaped, about a minute for HLS). Players that share one `DeviceId`, such as two tabs of one browser, count as one device and can still end each other's idle job. Jellyfin has no such cap. The `config.toml` key is `max_transcodes_per_user`. |
 
@@ -313,6 +321,7 @@ proxy's `X-Forwarded-Proto`, but not yet its `X-Forwarded-Host` (gl-813).
 | `FERROFIN_AUTH_CACHE_TTL_SECS` | `30` | Seconds a resolved access token (its device, user and policy, or an API key's name, or the rejection of a token that matched nothing) is served from memory before the database is read again. Every change made through the server applies at once; this only bounds how long a change made outside it, in the database itself, goes unseen. `5` to `300`. The `config.toml` key is `auth_cache_ttl_secs`. |
 | `FERROFIN_ROW_CACHE_TTL_SECS` | `30` | Seconds the per-user access check serves a user's permissions and preferences, the libraries' rows and options, and the views' and the playlists folder's rows, from memory. Queries scoped to the user's libraries, the home screen's views and every lookup of a library's physical folders read the same cached rows and options. Whether a Live TV tuner is configured, which decides whether Live TV is offered, is cached the same way. As for the auth cache, every change made through the server applies at once, and this only bounds changes made outside it (the database, a library's `options.json`). `5` to `300`. The `config.toml` key is `row_cache_ttl_secs`. |
 | `FERROFIN_SCAN_DIRECTORY_CACHE_IDLE_SECS` | `300` | Seconds a library scan's directory listings survive unread before they are dropped. The default is Jellyfin's (`DirectoryService.IdleTimeoutMs`). `30` to `3600` (a value outside, `0` included, logs a warning and is clamped). The `config.toml` key is `scan_directory_cache_idle_secs`. |
+| `FERROFIN_BOOK_ARCHIVE_MAX_ENTRIES` | `100000` | The most entries a comic archive (`.cbz`, `.cb7`, `.cbt`) may hold for its pages to set the book's runtime. A book's runtime is its pages × 10000 ticks, which is what jellyfin-web's comic and PDF readers report as the position: a comic counts its archive's entries other than folders, a PDF its pages, as Jellyfin does. The count reads only the archive's directory, never a page; an archive with more entries than this is not counted and its book keeps the runtime it has (one second for a new one). Every entry counts towards the limit, folders included. Jellyfin has no such limit. A book is counted when it is added, when its file changes, when its metadata is refreshed ("Search for missing metadata" or "Replace all metadata"), and on any scan while a `.cbz`, `.cb7`, `.cbt` or PDF still has the one-second runtime (as a book added by an older release does); a counted book whose file has not changed is not opened again, while one whose pages cannot be counted is opened again on each scan but not saved. `1000` to `10000000` (a value outside, `0` included, logs a warning and is clamped). The `config.toml` key is `book_archive_max_entries`. |
 | `FERROFIN_TRICKPLAY_CONCURRENCY` | `auto` | How many videos generate trickplay images at once (each one's selected widths in turn: for each, an ffmpeg frame extraction, then tile packing). A video keeps its place until all of its widths are made, so with **Both** selected a scan makes each video's 320 and 640 sets together. A library scan generates several at once; the **Generate Trickplay Images** task goes one item at a time but shares this cap when it overlaps a scan. `auto` allows as many as the image-encoding limit: **Parallel image encoding limit** on the dashboard (`ParallelImageEncodingLimit`), else one per CPU. An integer sets a lower cap; `0`, a negative number, or a value above the auto value means `auto`. Each generation is an ffmpeg process with its own memory, and with hardware acceleration its own GPU memory (about 1 GiB for a 4K HEVC video on an NVIDIA GPU). Packing its tiles then takes about 60 MiB of server memory at the default tile grid, at 320 or 640, because a wider set packs fewer previews into each tile ([Trickplay](#trickplay)). Jellyfin generates one at a time; `1` does the same. The `config.toml` key `trickplay_concurrency` takes an integer or `"auto"`. |
 
 ## Trickplay
@@ -422,11 +431,13 @@ in-process restart included.
 
 Artwork that lives at a URL, such as a channel logo from an M3U playlist, is downloaded the first
 time a client asks for it. These settings bound what that can cost, and where a download may go.
-One URL is downloaded by one request at a time, and the others wait for the result.
+One URL is downloaded by one request at a time, and the others wait for the result. As in
+Jellyfin, a download never follows a redirect from https to http (logged at `debug`). It follows
+at most 10 redirects, where Jellyfin follows 50.
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `FERROFIN_IMAGE_DOWNLOAD_MAX_MB` | `64` | The largest remote image Ferrofin downloads, in MiB, clamped to `16`–`256` (a value outside logs a warning). A response that declares more is refused unread, and a read stops at the limit whatever the response declared. The limit covers everything downloaded from a metadata provider as bytes: channel logos, scan artwork, the **Download** button in the image editor, an LDAP user's picture given as a URL, and OMDb and OpenSubtitles responses. For OMDb and OpenSubtitles this setting is only the size limit: the private-address rule of `FERROFIN_IMAGE_PRIVATE_HTTP_ALLOW` applies to image downloads alone, and an OpenSubtitles download link follows its own, `FERROFIN_SUBTITLE_PRIVATE_HTTP_ALLOW`. The scan moves on to the provider's next image, saying so at log level `debug`. Each request of a download, each redirect it follows counting as one, also has to finish within `FERROFIN_PROVIDER_TIMEOUT_SECONDS`, so raising the limit may need that raised too. The `config.toml` key is `image_download_max_mb`. |
+| `FERROFIN_IMAGE_DOWNLOAD_MAX_MB` | `64` | The largest remote image Ferrofin downloads, in MiB, clamped to `16`–`256` (a value outside logs a warning). A response that declares more is refused unread, and a read stops at the limit whatever the response declared. The limit covers everything downloaded from a metadata provider: channel logos, scan artwork, the **Download** button in the image editor, an LDAP user's picture given as a URL, and every provider's answer (TMDb, TheTVDB, OMDb, fanart.tv, TheAudioDB, MusicBrainz, ListenBrainz, LRCLIB, OpenSubtitles and the Studio Images list). For those answers this setting is only the size limit: the private-address rule of `FERROFIN_IMAGE_PRIVATE_HTTP_ALLOW` applies to image downloads alone, and an OpenSubtitles download link follows its own, `FERROFIN_SUBTITLE_PRIVATE_HTTP_ALLOW`. The scan moves on to the provider's next image, saying so at log level `debug`. Each request of a download, each redirect it follows counting as one, also has to finish within `FERROFIN_PROVIDER_TIMEOUT_SECONDS`, so raising the limit may need that raised too. The `config.toml` key is `image_download_max_mb`. |
 | `FERROFIN_IMAGE_PRIVATE_HTTP_ALLOW` | none | The private hosts and networks image downloads may reach, comma-separated: host names (`nas.lan`), addresses (`192.168.1.20`, `fd00::5`) and networks in CIDR form (`192.168.1.0/24`). Every image download (channel and programme artwork, scan artwork, studio thumbs, the **Download** button in the image editor, an LDAP user's picture given as a URL) refuses loopback, private, link-local (cloud metadata services among them), CGNAT and reserved addresses, on its first request and on every redirect, unless this lists the host or its address, or the host is a configured Live TV tuner's, so tvheadend's `/imagecache/` logos and an HDHomeRun's keep working without it. A tuner's host is allowed by its name, on every port and path, whatever led there and at whatever address the name resolves to: a service on the same machine as a tuner is reachable too, and so is any address a tuner whose name's DNS someone else controls (a remote IPTV playlist, say) points that name at. A host name allows that host at any address; a network allows every address in it, and `0.0.0.0/0, ::/0` every address there is. An entry that is none of these logs a warning and allows nothing. The first refused download logs a warning naming this setting, and later ones log at `debug`. A guide's (XMLTV) host is not a tuner's: list it here when its artwork is on your network; list a host serving LDAP users' pictures here too (LDAP-Auth's `Url` profile image format, which Jellyfin fetches from anywhere). Behind an HTTP proxy (`HTTP_PROXY`, `HTTPS_PROXY` or `ALL_PROXY`), the server checks a host on its own DNS answer before the request, so it must be able to resolve it, and the proxy, which resolves the host again, is trusted to reach the same address. After a redirect, a response that names no image type is refused, where the URL's file extension names it otherwise (a tvheadend `/imagecache/` URL still counts as PNG, as without a redirect). Jellyfin checks none of this. The settings page shows it but does not change it: set it in `config.toml` or the variable. The `config.toml` key is `image_private_http_allow`. |
 | `FERROFIN_IMAGE_NEGATIVE_CACHE_TTL_SECS` | `3600` | How long a logo URL that gave no image is left alone before it is tried again, in seconds, clamped to `300`–`86400` (a value outside logs a warning). That is a `404` or `403`, a response that is not an image, an empty one included, one over the limit, or one on a private address image downloads may not reach (`FERROFIN_IMAGE_PRIVATE_HTTP_ALLOW`), which stays refused until the time is up even if a tuner on that host is added meanwhile. A connection failure, a timeout, another status or a provider cooldown is not remembered, so it cannot hide a good image. Until the time is up the client gets a `404`, and Ferrofin keeps the image's row, where Jellyfin removes it. The memory is held per process and a restart clears it. The `config.toml` key is `image_negative_cache_ttl_secs`. |
 
@@ -455,7 +466,8 @@ Jellyfin's shared keys. The settings below are optional overrides or additions.
 TMDB's `TmdbApiKey` plugin setting overrides its shared key. OpenSubtitles uses
 Jellyfin's shared application key with the username/password configured in its
 plugin settings; its `ApiKey` field is an optional override. The shared key does
-not replace the account needed for subtitle downloads.
+not replace the account needed for subtitle downloads and for the subtitle
+searches a scan or the scheduled task makes.
 
 ## Extensions
 
@@ -495,7 +507,6 @@ Not runtime config, listed for completeness:
   fixture library. `FERROFIN_SCAN_BENCH_{MOVIES,SERIES,EPISODES}` size it,
   `FERROFIN_SCAN_BENCH_PROBE=1` turns on the real ffprobe, and
   `FERROFIN_SCAN_BENCH_{MEDIA,POSTER}` point it at real sample files.
-- `FERROFIN_FFMPEG_TESTS=1` — run the env-gated real-ffmpeg integration tests.
 - `FERROFIN_LDAP_TESTS=1` — run the LDAP-Auth directory test against OpenLDAP in
   containers (`crates/ferrofin-extensions/tests/ldap_directory.rs`; needs docker).
 - `FERROFIN_WASM_GUEST_TESTS=1` — build `examples/wasm-hello` from source (needs the

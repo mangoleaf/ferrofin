@@ -91,7 +91,7 @@ impl SubtitleIo for RecordingIo {
         ))
     }
 
-    async fn extract(&self, args: &str, output_paths: &[String]) -> Result<(), String> {
+    async fn extract(&self, args: &str, output_paths: &[String]) -> Result<String, String> {
         self.extract_calls
             .lock()
             .unwrap()
@@ -103,7 +103,7 @@ impl SubtitleIo for RecordingIo {
                 .entry(path.clone())
                 .or_insert_with(|| b"extracted".to_vec());
         }
-        Ok(())
+        Ok(String::new())
     }
 
     fn file_size(&self, path: &str) -> Option<u64> {
@@ -354,6 +354,60 @@ async fn extract_all_records_ffmpeg_args() {
     assert!(outputs.iter().any(|o| o.ends_with("/1.srt")));
 }
 
+/// `GetInputPathArgument`: a DVD rip's embedded tracks are read from its
+/// primary playlist and a Blu-ray ISO through the `bluray:` protocol. A rip
+/// whose playlist cannot be read extracts nothing, its `.mks` tracks
+/// included, as upstream's throw ends the whole batch.
+#[tokio::test]
+async fn extract_all_reads_a_disc_rip_through_its_playlist() {
+    use ferrofin_model::entities::{IsoType, VideoType};
+
+    let rip = tempfile::tempdir().unwrap();
+    let video_ts = rip.path().join("VIDEO_TS");
+    std::fs::create_dir_all(&video_ts).unwrap();
+    // Two parts of a main feature: "big" VOBs, sparse so they cost no disk.
+    for vob in ["VTS_01_1.VOB", "VTS_01_2.VOB"] {
+        let file = std::fs::File::create(video_ts.join(vob)).unwrap();
+        file.set_len(900 * 1024 * 1024).unwrap();
+    }
+    let dvdsub = sub_stream(3, "dvdsub", None, false);
+    let mut dvd = source_with(
+        "guid10",
+        &rip.path().to_string_lossy(),
+        vec![dvdsub.clone()],
+    );
+    dvd.video_type = Some(VideoType::Dvd);
+    let mut iso = source_with("guid11", "/media/disc.iso", vec![dvdsub.clone()]);
+    iso.iso_type = Some(IsoType::BluRay);
+    let mks = sub_stream(4, "subrip", Some("/media/subs.mks"), true);
+    let mut broken = source_with("guid12", "/media/not-a-disc", vec![dvdsub, mks]);
+    broken.video_type = Some(VideoType::BluRay);
+    let recorder = std::sync::Arc::new(RecordingIo::default());
+    let encoder = SubtitleEncoder::new(SubtitleEditParser::new(), ArcIo(recorder.clone()));
+
+    for source in [&dvd, &iso, &broken] {
+        encoder.extract_all_extractable_subtitles(source).await;
+    }
+
+    let calls = recorder.calls();
+    assert_eq!(calls.len(), 2, "nothing for the unreadable rip: {calls:?}");
+    let vob = |name: &str| video_ts.join(name).to_string_lossy().into_owned();
+    assert!(
+        calls[0].0.starts_with(&format!(
+            "-y -i concat:\"{}|{}\" -map 0:0 ",
+            vob("VTS_01_1.VOB"),
+            vob("VTS_01_2.VOB")
+        )),
+        "{}",
+        calls[0].0
+    );
+    assert!(
+        calls[1].0.starts_with("-y -i bluray:\"/media/disc.iso\" "),
+        "{}",
+        calls[1].0
+    );
+}
+
 /// `ExtractAllExtractableSubtitlesMKS`: an external `.mks` is its own ffmpeg
 /// input, each of its tracks mapped by its position inside that file, and a
 /// VobSub track re-muxed as Matroska (no `.idx`/`.sub` muxer). The embedded
@@ -476,7 +530,7 @@ impl SubtitleIo for ArcIo {
         self.0
             .subtitle_cache_path(media_source_id, subtitle_stream_index, output_extension)
     }
-    async fn extract(&self, args: &str, output_paths: &[String]) -> Result<(), String> {
+    async fn extract(&self, args: &str, output_paths: &[String]) -> Result<String, String> {
         self.0.extract(args, output_paths).await
     }
     fn file_size(&self, path: &str) -> Option<u64> {
@@ -988,6 +1042,8 @@ struct FailableIo {
     extract_fails: bool,
     /// Output paths that should be created as empty (zero-byte) files.
     empty_outputs: Mutex<Vec<String>>,
+    /// What a successful `extract` reports ffmpeg wrote to stderr.
+    stderr: String,
 }
 
 #[async_trait]
@@ -1010,7 +1066,7 @@ impl SubtitleIo for FailableIo {
         self.inner
             .subtitle_cache_path(media_source_id, subtitle_stream_index, output_extension)
     }
-    async fn extract(&self, args: &str, output_paths: &[String]) -> Result<(), String> {
+    async fn extract(&self, args: &str, output_paths: &[String]) -> Result<String, String> {
         if self.extract_fails {
             // Record the call but return an error.
             self.inner
@@ -1027,7 +1083,7 @@ impl SubtitleIo for FailableIo {
         for path in empties.iter() {
             files.insert(path.clone(), Vec::new());
         }
-        Ok(())
+        Ok(self.stderr.clone())
     }
     fn file_exists(&self, path: &str) -> bool {
         self.inner.file_exists(path)
@@ -1061,7 +1117,7 @@ impl SubtitleIo for ArcFailable {
     fn subtitle_cache_path(&self, id: &str, idx: i32, ext: &str) -> Option<String> {
         self.0.subtitle_cache_path(id, idx, ext)
     }
-    async fn extract(&self, a: &str, o: &[String]) -> Result<(), String> {
+    async fn extract(&self, a: &str, o: &[String]) -> Result<String, String> {
         self.0.extract(a, o).await
     }
     fn file_exists(&self, p: &str) -> bool {
@@ -1099,7 +1155,7 @@ impl SubtitleIo for ContentIo {
     fn subtitle_cache_path(&self, id: &str, idx: i32, ext: &str) -> Option<String> {
         self.inner.subtitle_cache_path(id, idx, ext)
     }
-    async fn extract(&self, a: &str, output_paths: &[String]) -> Result<(), String> {
+    async fn extract(&self, a: &str, output_paths: &[String]) -> Result<String, String> {
         self.inner
             .extract_calls
             .lock()
@@ -1109,7 +1165,7 @@ impl SubtitleIo for ContentIo {
         for path in output_paths {
             files.insert(path.clone(), self.content.clone());
         }
-        Ok(())
+        Ok(String::new())
     }
     fn file_exists(&self, p: &str) -> bool {
         self.inner.file_exists(p)
@@ -1450,6 +1506,33 @@ async fn an_embedded_track_is_mapped_past_a_subtitle_sidecar() {
     assert_eq!(calls[0].1, ["/cache/guid14/2.srt"]);
 }
 
+/// A Blu-ray folder rip under `root` whose one playlist plays one clip,
+/// `00001.m2ts`, laid out as BDInfo reads an `.mpls` (header, play list, one
+/// play item with an empty stream table) and a `.clpi` (its type header).
+fn one_clip_blu_ray(root: &std::path::Path) {
+    let bdmv = root.join("BDMV");
+    for dir in ["PLAYLIST", "CLIPINF", "STREAM"] {
+        std::fs::create_dir_all(bdmv.join(dir)).unwrap();
+    }
+    let mut item = b"00001M2TS\0\0\0".to_vec();
+    item.extend(0u32.to_be_bytes());
+    item.extend((60u32 * 45_000).to_be_bytes());
+    item.extend([0u8; 12]);
+    item.extend(16u16.to_be_bytes());
+    item.extend([0u8; 16]);
+    let mut mpls = b"MPLS0200".to_vec();
+    mpls.extend(0x3Au32.to_be_bytes());
+    mpls.resize(0x3A, 0);
+    let mut list = vec![0, 0, 0, 1, 0, 0];
+    list.extend(u16::try_from(item.len()).unwrap().to_be_bytes());
+    list.extend(item);
+    mpls.extend(u32::try_from(list.len()).unwrap().to_be_bytes());
+    mpls.extend(list);
+    std::fs::write(bdmv.join("PLAYLIST/00000.mpls"), mpls).unwrap();
+    std::fs::write(bdmv.join("CLIPINF/00001.clpi"), b"HDMV0200").unwrap();
+    std::fs::write(bdmv.join("STREAM/00001.m2ts"), b"").unwrap();
+}
+
 /// On a Blu-ray source, the TrueHD and Atmos audio streams before the track,
 /// which ffprobe hides but ffmpeg counts, shift its index.
 #[tokio::test]
@@ -1467,7 +1550,13 @@ async fn a_blu_ray_track_counts_the_hidden_truehd_streams_before_it() {
         ..MediaStream::default()
     };
     let subtitle = sub_stream(2, "subrip", None, false);
-    let mut source = source_with("guid15", "/media/disc", vec![video, truehd, subtitle]);
+    let rip = tempfile::tempdir().unwrap();
+    one_clip_blu_ray(rip.path());
+    let mut source = source_with(
+        "guid15",
+        &rip.path().to_string_lossy(),
+        vec![video, truehd, subtitle],
+    );
     source.video_type = Some(ferrofin_model::entities::VideoType::BluRay);
     let recorder = std::sync::Arc::new(RecordingIo::default());
     let encoder = SubtitleEncoder::new(SubtitleEditParser::new(), ArcIo(recorder.clone()));
@@ -1476,6 +1565,15 @@ async fn a_blu_ray_track_counts_the_hidden_truehd_streams_before_it() {
 
     let calls = recorder.calls();
     assert_eq!(calls.len(), 1, "{calls:?}");
+    // The rip is read through its playlist's clip, never as a folder.
+    let clip = rip.path().join("BDMV/STREAM/00001.m2ts");
+    assert!(
+        calls[0]
+            .0
+            .starts_with(&format!("-y -i file:\"{}\" ", clip.display())),
+        "{}",
+        calls[0].0
+    );
     assert!(calls[0].0.contains("-map 0:3 -an -vn"), "{}", calls[0].0);
 }
 
@@ -1544,4 +1642,91 @@ async fn a_remote_source_is_logged_by_its_host(
     for secret in ACCOUNT {
         assert!(!text.contains(secret), "{secret} logged: {text}");
     }
+}
+
+// -- ffmpeg's stderr explains an empty output (gl-479) -----------------------
+
+/// What ffmpeg 9 writes when a sidecar parses to no cues and it exits 0.
+const NOTHING_ENCODED: &str = "Output file is empty, nothing was encoded";
+
+/// A run that left outputs empty logs what ffmpeg wrote to stderr once, after
+/// each empty output's own line, as upstream's `ExtractSubtitlesForFile` logs
+/// `{FfmpegOutput}` once for a failed run; a run that failed nothing does not.
+#[rstest::rstest]
+#[case::two_outputs_empty(&["/cache/guid-stderr/1.srt", "/cache/guid-stderr/2.srt"], 2, 1)]
+#[case::nothing_empty(&[], 0, 0)]
+#[tokio::test]
+async fn ffmpegs_stderr_is_logged_once_for_a_run_that_left_outputs_empty(
+    #[case] empty: &[&str],
+    #[case] output_lines: usize,
+    #[case] stderr_lines: usize,
+) {
+    let logs = Logs::default();
+    let _guard = tracing::subscriber::set_default(
+        tracing_subscriber::fmt()
+            .with_writer(logs.clone())
+            .with_ansi(false)
+            .finish(),
+    );
+    let source = source_with(
+        "guid-stderr",
+        "/media/movie.mkv",
+        vec![
+            sub_stream(1, "subrip", None, false),
+            sub_stream(2, "subrip", None, false),
+        ],
+    );
+    let io = FailableIo {
+        empty_outputs: Mutex::new(empty.iter().map(|path| (*path).to_owned()).collect()),
+        stderr: NOTHING_ENCODED.to_owned(),
+        ..FailableIo::default()
+    };
+    SubtitleEncoder::new(SubtitleEditParser::new(), io)
+        .extract_all_extractable_subtitles(&source)
+        .await;
+
+    let text = String::from_utf8_lossy(&logs.0.lock().unwrap()).into_owned();
+    let failures: Vec<&str> = text
+        .lines()
+        .filter(|line| {
+            line.contains(" ERROR ") && line.contains("ffmpeg subtitle extraction failed")
+        })
+        .collect();
+    let with_stderr = failures
+        .iter()
+        .filter(|line| line.contains(NOTHING_ENCODED))
+        .count();
+    assert_eq!(failures.len() - with_stderr, output_lines, "{text}");
+    assert_eq!(with_stderr, stderr_lines, "{text}");
+}
+
+/// A conversion ffmpeg left empty fails with what ffmpeg wrote to stderr.
+#[tokio::test]
+async fn an_empty_conversion_fails_with_ffmpegs_stderr() {
+    let io = FailableIo {
+        empty_outputs: Mutex::new(vec!["/cache/guid-sami/2.srt".to_owned()]),
+        stderr: NOTHING_ENCODED.to_owned(),
+        ..FailableIo::default()
+    };
+    io.inner
+        .files
+        .lock()
+        .unwrap()
+        .insert("/media/movie.en.smi".to_owned(), b"not SAMI".to_vec());
+    let stream = sidecar("sami", "/media/movie.en.smi");
+    let source = source_with("guid-sami", "/media/movie.mkv", vec![stream.clone()]);
+
+    let error = SubtitleEncoder::new(SubtitleEditParser::new(), io)
+        .get_subtitles(&source, &stream, "vtt", 0, 0, false)
+        .await
+        .unwrap_err()
+        .to_string();
+
+    assert!(
+        error.contains(&format!(
+            "ffmpeg subtitle conversion produced no output for /cache/guid-sami/2.srt: \
+             {NOTHING_ENCODED}"
+        )),
+        "{error}"
+    );
 }

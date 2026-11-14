@@ -240,12 +240,6 @@ mod tests {
         async fn reset_tuner(&self, _id: &str) -> Result<(), ServiceError> {
             unimplemented!()
         }
-        async fn get_channel_stream_url(
-            &self,
-            _id: uuid::Uuid,
-        ) -> Result<Option<String>, ServiceError> {
-            unimplemented!()
-        }
         async fn get_timers(
             &self,
         ) -> Result<Vec<ferrofin_model::live_tv::TimerInfoDto>, ServiceError> {

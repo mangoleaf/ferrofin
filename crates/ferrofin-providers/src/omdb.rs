@@ -21,6 +21,7 @@
 //!   assignment commented out, so nothing observable is lost.
 
 use ferrofin_util::directory_path::DirectoryPath;
+use ferrofin_util::string_extensions::equals_ordinal_ignore_case;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
@@ -90,7 +91,7 @@ impl OmdbClient {
             api_key
         };
         Self {
-            http: reqwest::Client::new(),
+            http: crate::http_client::client(),
             limiter: crate::rate_limit::RateLimiter::new("omdb"),
             api_key: SecretString::from(api_key),
             base_url: API_BASE.to_owned(),
@@ -578,24 +579,90 @@ impl OmdbItem {
         split_list(self.language.as_deref()).into_iter().next()
     }
 
-    /// The credited people in C# order: the director, the writer, then each
-    /// actor. Director/writer are added whole (upstream does not split them).
+    /// The credited people in C# order: each director, each writer, then each
+    /// actor (`ParseAdditionalMetadata`'s three `AddPeople` calls).
     #[must_use]
     pub fn people(&self) -> Vec<(String, OmdbPersonKind)> {
         let mut out = Vec::new();
-        if let Some(director) = trimmed(self.director.as_deref()) {
-            out.push((director, OmdbPersonKind::Director));
-        }
-        if let Some(writer) = trimmed(self.writer.as_deref()) {
-            out.push((writer, OmdbPersonKind::Writer));
-        }
-        out.extend(
-            split_list(self.actors.as_deref())
-                .into_iter()
-                .map(|actor| (actor, OmdbPersonKind::Actor)),
-        );
+        add_people(&mut out, self.director.as_deref(), OmdbPersonKind::Director);
+        add_people(&mut out, self.writer.as_deref(), OmdbPersonKind::Writer);
+        add_people(&mut out, self.actors.as_deref(), OmdbPersonKind::Actor);
         out
     }
+}
+
+/// Generational suffixes OMDb separates from the name with a comma
+/// (C# `OmdbProvider.NameSuffixes`).
+const NAME_SUFFIXES: [&str; 8] = ["Jr", "Jnr", "Sr", "Snr", "II", "III", "IV", "V"];
+
+/// Adds the people of one comma-separated OMDb credit list — port of
+/// `OmdbProvider.AddPeople`. Each credit is cut at its role note (`"Mari Okada
+/// (screenplay)"`), a generational suffix rejoins the name before it
+/// (`"Jack Salvatore, Jr."`), and a name `out` already credits as `kind` is
+/// skipped, as `PeopleHelper.AddPerson` de-duplicates (`OrdinalIgnoreCase`
+/// name, same type).
+fn add_people(
+    out: &mut Vec<(String, OmdbPersonKind)>,
+    credits: Option<&str>,
+    kind: OmdbPersonKind,
+) {
+    let mut names: Vec<String> = Vec::new();
+    for credit in split_credits(credits.unwrap_or_default()) {
+        let name = credit
+            .split_once('(')
+            .map_or(credit, |(name, _)| name)
+            .trim();
+        if name.is_empty() {
+            continue;
+        }
+        if is_name_suffix(name)
+            && let Some(previous) = names.last_mut()
+        {
+            previous.push_str(", ");
+            previous.push_str(name);
+            continue;
+        }
+        names.push(name.to_owned());
+    }
+    for name in names {
+        if !out
+            .iter()
+            .any(|(n, k)| *k == kind && equals_ordinal_ignore_case(n, &name))
+        {
+            out.push((name, kind));
+        }
+    }
+}
+
+/// Splits a credit list on the commas outside parentheses — port of
+/// `OmdbProvider.SplitCredits`, so `"Jerry Siegel (created by: Superman,
+/// Superboy)"` stays one credit. A stray `)` never takes the depth below zero.
+fn split_credits(credits: &str) -> Vec<&str> {
+    let mut depth = 0_usize;
+    let mut start = 0;
+    let mut out = Vec::new();
+    for (i, c) in credits.char_indices() {
+        match c {
+            '(' => depth += 1,
+            ')' => depth = depth.saturating_sub(1),
+            ',' if depth == 0 => {
+                out.push(&credits[start..i]);
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    out.push(&credits[start..]);
+    out
+}
+
+/// Whether a credit is only a generational suffix (`Jr`, `III.`, …) — port
+/// of `OmdbProvider.IsNameSuffix`.
+fn is_name_suffix(value: &str) -> bool {
+    let suffix = value.strip_suffix('.').unwrap_or(value);
+    NAME_SUFFIXES
+        .iter()
+        .any(|s| equals_ordinal_ignore_case(s, suffix))
 }
 
 /// The three credit kinds OMDb supplies.
@@ -850,6 +917,125 @@ mod tests {
         assert_eq!(people.len(), 5, "three actors follow the two crew credits");
         assert!(people[2..].iter().all(|(_, k)| *k == OmdbPersonKind::Actor));
         assert_eq!(people[4].0, "Elliot Page");
+    }
+
+    // `ParseAdditionalMetadata` sends all three lists through `AddPeople`:
+    // the director and writer are split per person like the actors.
+    #[test]
+    fn every_credit_list_is_split_per_person() {
+        let item: OmdbItem = serde_json::from_str(
+            r#"{"Director":"Joel Coen, Ethan Coen",
+                "Writer":"Mario Puzo (story), David Newman (screenplay), Mario Puzo (screenplay)",
+                "Actors":"Tom Hanks, Sammy Davis, Jr, Mario Puzo"}"#,
+        )
+        .expect("parse");
+        let people = item.people();
+        let expected = [
+            ("Joel Coen", OmdbPersonKind::Director),
+            ("Ethan Coen", OmdbPersonKind::Director),
+            ("Mario Puzo", OmdbPersonKind::Writer),
+            ("David Newman", OmdbPersonKind::Writer),
+            ("Tom Hanks", OmdbPersonKind::Actor),
+            ("Sammy Davis, Jr", OmdbPersonKind::Actor),
+            ("Mario Puzo", OmdbPersonKind::Actor),
+        ]
+        .map(|(name, kind)| (name.to_owned(), kind));
+        assert_eq!(people, expected);
+    }
+
+    /// The names [`add_people`] adds for `credits`, each checked to be `kind`.
+    fn added_names(credits: Option<&str>, kind: OmdbPersonKind) -> Vec<String> {
+        let mut out = Vec::new();
+        add_people(&mut out, credits, kind);
+        assert!(out.iter().all(|(_, k)| *k == kind), "{out:?}");
+        out.into_iter().map(|(name, _)| name).collect()
+    }
+
+    // Transliterated from upstream v12.4
+    // `tests/Jellyfin.Providers.Tests/Omdb/OmdbProviderTests.cs`.
+    #[test]
+    fn add_people_comma_separated_list_splits_into_individual_people() {
+        assert_eq!(
+            added_names(
+                Some("Philip G. Epstein, Julius J. Epstein, Howard Koch"),
+                OmdbPersonKind::Writer
+            ),
+            ["Philip G. Epstein", "Julius J. Epstein", "Howard Koch"]
+        );
+    }
+
+    #[test]
+    fn add_people_role_annotations_are_stripped_and_deduplicated() {
+        assert_eq!(
+            added_names(
+                Some(
+                    "Mari Okada (screenplay), Mari Okada (story), Jun'ichi Satô (screenplay), Jun'ichi Satô (story)"
+                ),
+                OmdbPersonKind::Writer
+            ),
+            ["Mari Okada", "Jun'ichi Satô"]
+        );
+    }
+
+    #[rstest::rstest]
+    #[case(
+        "Jerry Siegel (created by: Superman, Superboy), Bob Kane (created by: Batman)",
+        "Jerry Siegel|Bob Kane"
+    )]
+    #[case("Alan Moore (created by: John Constantine)", "Alan Moore")]
+    fn add_people_comma_inside_an_annotation_stays_one_credit(
+        #[case] credits: &str,
+        #[case] expected: &str,
+    ) {
+        assert_eq!(
+            added_names(Some(credits), OmdbPersonKind::Writer),
+            expected.split('|').collect::<Vec<_>>()
+        );
+    }
+
+    #[rstest::rstest]
+    #[case("Jack Salvatore, Jr.", "Jack Salvatore, Jr.")]
+    #[case("Efrem Zimbalist, Jr., Tom Hanks", "Efrem Zimbalist, Jr.|Tom Hanks")]
+    #[case("Tom Hanks, Sammy Davis, Jr", "Tom Hanks|Sammy Davis, Jr")]
+    #[case(
+        "Harold Ramis, Ken Griffey, III (voice)",
+        "Harold Ramis|Ken Griffey, III"
+    )]
+    #[case(
+        "Robert Downey Jr., Gwyneth Paltrow",
+        "Robert Downey Jr.|Gwyneth Paltrow"
+    )]
+    #[case("Jr., Tom Hanks", "Jr.|Tom Hanks")]
+    fn add_people_generational_suffix_stays_with_its_name(
+        #[case] credits: &str,
+        #[case] expected: &str,
+    ) {
+        assert_eq!(
+            added_names(Some(credits), OmdbPersonKind::Actor),
+            expected.split('|').collect::<Vec<_>>()
+        );
+    }
+
+    #[rstest::rstest]
+    #[case(None)]
+    #[case(Some(""))]
+    #[case(Some("   "))]
+    #[case(Some("(uncredited)"))]
+    fn add_people_no_usable_name_adds_nothing(#[case] credits: Option<&str>) {
+        let names = added_names(credits, OmdbPersonKind::Actor);
+        assert!(names.is_empty(), "{names:?}");
+    }
+
+    // Beyond upstream's cases: a stray `)` cannot take the depth below zero,
+    // and the de-duplication folds case as `OrdinalIgnoreCase` does.
+    #[rstest::rstest]
+    #[case("A), B", "A)|B")]
+    #[case("Jun'ichi Satô (screenplay), JUN'ICHI SATÔ (story)", "Jun'ichi Satô")]
+    fn add_people_edge_cases(#[case] credits: &str, #[case] expected: &str) {
+        assert_eq!(
+            added_names(Some(credits), OmdbPersonKind::Writer),
+            expected.split('|').collect::<Vec<_>>()
+        );
     }
 
     #[test]
