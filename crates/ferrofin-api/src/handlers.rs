@@ -4233,7 +4233,8 @@ pub const VERIFIED: &[Verified] = &[
                GetItemById<Video>(itemId, User.GetUserId()): a missing, hidden or non-video \
                item is a 404; isPerfectMatch) → ferrofin-core subtitle_manager.rs \
                search_subtitles and enrich (SubtitleManager.SearchSubtitles, both overloads: \
-               the language's two-letter code from FindLanguageInfo, the request filled from \
+               the language's two-letter code from FindLanguageInfo; [] unless the video's \
+               VideoType is VideoFile; the request filled from \
                a Movie or an Episode and [] for any other kind; every provider that supports \
                the content type searched, results in provider order, a failing provider \
                contributing none; Normalize's MD5 provider-name prefix on each id; \
@@ -4254,10 +4255,8 @@ pub const VERIFIED: &[Verified] = &[
                downloads, rating and trusted uploader; one candidate per result, its first \
                file's id, with Release, Comments, Ratings, UploadDate, Fps and the machine and \
                AI translation flags)",
-        date: "2026-11-11",
+        date: "2026-11-14",
         divergences: &[
-            "A DVD or Blu-ray rip or an ISO is searched; upstream returns [] unless the \
-         video's VideoType is VideoFile. Fix path: gl-1524.",
             "With an OpenSubtitles API key and no account, a manual search still searches; \
          the plugin's Login throws without an account, so it finds nothing. Fix path: gl-808 \
          (owner decision).",
