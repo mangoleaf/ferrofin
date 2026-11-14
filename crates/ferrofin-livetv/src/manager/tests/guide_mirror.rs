@@ -384,10 +384,14 @@ async fn a_logo_that_is_no_url_leaves_no_row_and_takes_the_stored_one(
     )
     .await;
     lab.mgr.refresh_guide().await.expect("first refresh");
-    let channels =
-        crate::guide_repository::channel_rows(&lab.mgr.db, &LiveTvChannelQuery::default(), None)
-            .await
-            .expect("channels");
+    let channels = crate::guide_repository::channel_rows(
+        &lab.mgr.db,
+        &LiveTvChannelQuery::default(),
+        None,
+        false,
+    )
+    .await
+    .expect("channels");
     assert_eq!(channels.len(), 1);
     assert_eq!(channels[0].image_url.as_deref(), Some(logo));
     let channel = Uuid::parse_str(&channels[0].id).expect("guid");

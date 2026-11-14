@@ -16,6 +16,9 @@ use ferrofin_traits::stubs::{LiveTvChannelQuery, LiveTvManager as _};
 
 use super::{CLASSIFIED_XMLTV, M3U, dated};
 
+/// The plan step that keeps only the channels whose item is stored.
+const STORED_PROBE: &str =
+    "SEARCH bi EXISTS USING COVERING INDEX sqlite_autoindex_BaseItems_1 (Id=?)";
 /// The plan step of a movie/series filter's probe of the channel item.
 const ITEM_PROBE: &str = "SEARCH bi USING INDEX sqlite_autoindex_BaseItems_1 (Id=?)";
 /// The plan step of a kids/news/sports filter's probe of the channel's tag
@@ -27,13 +30,14 @@ const TAG_PROBE: &str =
 async fn plan(query: &LiveTvChannelQuery) -> Vec<String> {
     let db = Database::connect_in_memory().await.expect("db");
     db.run_migrations().await.expect("migrate");
-    crate::guide_repository::test_support::channel_rows_plan(&db, query, None)
+    crate::guide_repository::test_support::channel_rows_plan(&db, query, None, true)
         .await
         .expect("plan")
 }
 
-/// Without a kind filter the read is the channel table alone, and no kind
-/// filter reads the guide's airings.
+/// Without a kind filter the read is the channel table and one probe of each
+/// channel's item by its key (gl-1623), and no kind filter reads the guide's
+/// airings.
 #[tokio::test]
 async fn no_lineup_read_touches_the_guide() {
     let unfiltered = plan(&LiveTvChannelQuery {
@@ -42,12 +46,11 @@ async fn no_lineup_read_touches_the_guide() {
         ..LiveTvChannelQuery::default()
     })
     .await;
-    assert!(
-        unfiltered
-            .iter()
-            .all(|step| !step.contains("SUBQUERY") && !step.contains("SEARCH")),
-        "{unfiltered:?}"
-    );
+    let searches: Vec<&String> = unfiltered
+        .iter()
+        .filter(|step| step.contains("SEARCH") || step.contains("SUBQUERY"))
+        .collect();
+    assert_eq!(searches, [STORED_PROBE], "{unfiltered:?}");
     let every_kind = plan(&LiveTvChannelQuery {
         is_movie: Some(true),
         is_series: Some(false),
@@ -298,13 +301,18 @@ async fn the_lineup_hides_what_a_users_parental_restrictions_hide() {
     super::set_preference(mgr, &kid, PreferenceKind::AllowedTags, &["Sports"]).await;
     assert_eq!(lineup(mgr, &kid, None).await, two_only);
 
-    // A channel whose item is not stored is listed only to a user nothing
-    // restricts.
+    // gl-1623: a channel whose item is not stored is listed to no one, as
+    // upstream lists only the items.
     super::set_preference(mgr, &kid, PreferenceKind::AllowedTags, &[]).await;
     lab.persistence.delete_items(&[one]).await.expect("delete");
-    let free = (vec!["Channel One".to_owned(), "Channel Two".to_owned()], 2);
-    assert_eq!(lineup(mgr, &kid, None).await, free);
+    assert_eq!(lineup(mgr, &kid, None).await, two_only);
     assert_eq!(lineup(mgr, &limited, None).await, two_only);
+    // Nor does a negated kind filter, which a missing item would satisfy.
+    let not_kids = LiveTvChannelQuery {
+        is_kids: Some(false),
+        ..LiveTvChannelQuery::default()
+    };
+    assert_eq!(names(mgr, not_kids).await, ["Channel Two"]);
 }
 
 /// What the user does to Channel Two before the list is read.
@@ -416,8 +424,9 @@ async fn a_channel_the_user_played_leads_on_each_play_state_key(
 
 /// A restricted lineup read, with every rule on (a maximum rating, a blocked
 /// unrated kind, a blocked tag) and with a kind filter or without, probes each
-/// channel's item by its key and keeps every step of the unrestricted plan:
-/// the restriction is a correlated `EXISTS`, never a scan.
+/// channel's item by its key and keeps every step of the plan that lists the
+/// whole lineup: the restriction is a correlated `EXISTS`, never a scan, and
+/// stands in for the stored-item probe.
 #[tokio::test]
 async fn a_restricted_lineup_read_probes_the_channel_item_by_key() {
     use crate::guide_repository::test_support::channel_rows_plan;
@@ -446,10 +455,10 @@ async fn a_restricted_lineup_read_probes_the_channel_item_by_key() {
             ..LiveTvChannelQuery::default()
         },
     ] {
-        let restricted = channel_rows_plan(&mgr.db, &query, Some(&restrictions))
+        let restricted = channel_rows_plan(&mgr.db, &query, Some(&restrictions), true)
             .await
             .expect("plan");
-        let unrestricted = channel_rows_plan(&mgr.db, &query, None)
+        let unrestricted = channel_rows_plan(&mgr.db, &query, None, false)
             .await
             .expect("plan");
         for step in &unrestricted {
