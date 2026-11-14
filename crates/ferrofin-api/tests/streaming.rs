@@ -599,8 +599,13 @@ async fn administrator_download_still_honors_the_item_permission() {
     assert!(!response.headers().contains_key("content-disposition"));
 }
 
+/// The body is `size` random bytes (`Random.Shared.NextBytes`), which a
+/// compressing proxy or VPN between server and client cannot shrink: a body it
+/// could would download faster than the link allows and inflate the bitrate the
+/// client measures.
 #[tokio::test]
-async fn bitrate_test_returns_requested_size() {
+async fn bitrate_test_returns_requested_size_of_incompressible_bytes() {
+    use std::io::Write as _;
     let (_dir, path) = temp_media();
     let app = state(&path).app;
     let router = create_router(app);
@@ -613,6 +618,31 @@ async fn bitrate_test_returns_requested_size() {
         .await
         .unwrap();
     assert_eq!(body.len(), 2048);
+    let mut gzip = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+    gzip.write_all(&body).unwrap();
+    let compressed = gzip.finish().unwrap().len();
+    assert!(
+        compressed >= body.len(),
+        "gzip shrank the {} bytes to {compressed}",
+        body.len()
+    );
+}
+
+/// No `size` is the C# default, 102400 bytes, exactly: not the power of two
+/// upstream's `ArrayPool` rental rounds it up to.
+#[tokio::test]
+async fn bitrate_test_defaults_to_102400_bytes() {
+    let (_dir, path) = temp_media();
+    let router = create_router(state(&path).app);
+    let resp = router
+        .oneshot(authed("GET", "/Playback/BitrateTest"))
+        .await
+        .expect("response");
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    assert_eq!(body.len(), 102_400);
 }
 
 #[tokio::test]

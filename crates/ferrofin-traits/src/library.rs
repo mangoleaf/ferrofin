@@ -2404,16 +2404,19 @@ pub trait UserViewManager: Send + Sync {
     /// Gets the top-level views for a user.
     async fn get_user_views(&self, user_id: Uuid) -> Result<Vec<BaseItemEntity>, ServiceError>;
 
-    /// Gets the top-level views including any the user hid from their home
-    /// screen. Used by profile settings so hidden views can be re-enabled.
-    /// Managers that do not implement hidden-view filtering can use the
-    /// ordinary view list for both requests.
-    async fn get_user_views_with_hidden(
+    /// Gets the top-level views `query` asks for: port of
+    /// `UserViewManager.GetUserViews(UserViewQuery)`. `include_hidden` keeps
+    /// the views the user hid from their home screen (profile settings use it
+    /// so hidden views can be re-enabled), `include_external_content` the
+    /// Live TV view, and `preset_views` lists a library of a named type as its
+    /// shadow view. Managers that implement none of them can use the ordinary
+    /// view list for every request.
+    async fn get_user_views_with_query(
         &self,
         user_id: Uuid,
-        include_hidden: bool,
+        query: &crate::options::UserViewQuery,
     ) -> Result<Vec<BaseItemEntity>, ServiceError> {
-        let _ = include_hidden;
+        let _ = query;
         self.get_user_views(user_id).await
     }
 

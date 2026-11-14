@@ -42,6 +42,7 @@ use ferrofin_traits::library::{LibraryManager, UserDataManager, UserManager, Use
 use ferrofin_traits::net::{AuthService, AuthorizationContext, RequestContext};
 use ferrofin_traits::options::{
     AuthorizationInfo, DeleteOptions, DtoOptions, InternalItemsQuery, InternalPeopleQuery,
+    UserViewQuery,
 };
 use ferrofin_traits::session::{
     AuthenticationRequest, AuthenticationResultData, SessionManager, SessionSummary,
@@ -476,15 +477,16 @@ struct StubUserViews {
 #[async_trait]
 impl UserViewManager for StubUserViews {
     async fn get_user_views(&self, user_id: Uuid) -> Result<Vec<BaseItemEntity>, ServiceError> {
-        self.get_user_views_with_hidden(user_id, false).await
+        self.get_user_views_with_query(user_id, &UserViewQuery::default())
+            .await
     }
-    async fn get_user_views_with_hidden(
+    async fn get_user_views_with_query(
         &self,
         _user_id: Uuid,
-        include_hidden: bool,
+        query: &UserViewQuery,
     ) -> Result<Vec<BaseItemEntity>, ServiceError> {
         let mut views = self.get_media_folders().await?;
-        if !include_hidden {
+        if !query.include_hidden {
             views.retain(|view| {
                 !self
                     .hidden
