@@ -65,7 +65,7 @@ use uuid::Uuid;
 
 use crate::db_error::db_err;
 
-use super::{ScheduledTask, TaskProgress};
+use super::{ScheduledTask, TaskProgress, interval_hours};
 
 /// 100-nanosecond ticks per second (the `TaskTriggerInfo` time unit).
 const TICKS_PER_SECOND: i64 = 10_000_000;
@@ -78,28 +78,55 @@ pub(super) const LIBRARY: &str = "TasksLibraryCategory";
 /// pages of the same size.
 pub const PAGE_SIZE: i32 = 100;
 
-/// An interval trigger firing every `hours` hours.
-fn interval_hours(hours: i64) -> TaskTriggerInfo {
-    TaskTriggerInfo {
-        type_: TaskTriggerInfoType::IntervalTrigger,
-        interval_ticks: Some(hours * 3600 * TICKS_PER_SECOND),
-        ..TaskTriggerInfo::default()
-    }
+/// A query's items read [`PAGE_SIZE`] at a time, counting those done:
+/// upstream's `GetCount`, then `StartIndex += Pagesize` until the count is
+/// walked, `numComplete++` before each progress report.
+struct Pages<'a> {
+    library: &'a Arc<dyn LibraryManager>,
+    query: &'a InternalItemsQuery,
+    total: i32,
+    start_index: i32,
+    done: i32,
 }
 
-/// Fetches one page of items for a query.
-async fn page(
-    library: &Arc<dyn LibraryManager>,
-    base: &InternalItemsQuery,
-    start_index: i32,
-) -> Result<Vec<BaseItemEntity>, ServiceError> {
-    library
-        .get_item_list(&InternalItemsQuery {
-            start_index: Some(start_index),
-            limit: Some(PAGE_SIZE),
-            ..base.clone()
+impl<'a> Pages<'a> {
+    /// Counts the query's items; no page is read yet.
+    async fn new(
+        library: &'a Arc<dyn LibraryManager>,
+        query: &'a InternalItemsQuery,
+    ) -> Result<Self, ServiceError> {
+        Ok(Self {
+            library,
+            query,
+            total: library.get_count(query).await?.max(0),
+            start_index: 0,
+            done: 0,
         })
-        .await
+    }
+
+    /// The next page, or `None` once the count is walked or a page comes
+    /// back empty (items removed since the count).
+    async fn next(&mut self) -> Result<Option<Vec<BaseItemEntity>>, ServiceError> {
+        if self.start_index >= self.total {
+            return Ok(None);
+        }
+        let items = self
+            .library
+            .get_item_list(&InternalItemsQuery {
+                start_index: Some(self.start_index),
+                limit: Some(PAGE_SIZE),
+                ..self.query.clone()
+            })
+            .await?;
+        self.start_index += PAGE_SIZE;
+        Ok((!items.is_empty()).then_some(items))
+    }
+
+    /// Counts one item done and returns the fraction of the count now done.
+    fn complete_one(&mut self) -> f64 {
+        self.done += 1;
+        f64::from(self.done) / f64::from(self.total.max(1))
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -179,27 +206,27 @@ impl ScheduledTask for KeyframeExtractionTask {
             include_owned_items: true,
             ..InternalItemsQuery::default()
         };
-        let total = self.library.get_count(&query).await?.max(0);
-        let mut done = 0i32;
-        let mut start_index = 0i32;
-        while start_index < total {
-            let items = page(&self.library, &query, start_index).await?;
-            if items.is_empty() {
-                break;
-            }
+        let mut pages = Pages::new(&self.library, &query).await?;
+        while let Some(items) = pages.next().await? {
             for item in &items {
                 if progress.stop_requested() {
                     return Ok(());
                 }
-                done += 1;
-                progress.report(100.0 * f64::from(done) / f64::from(total.max(1)));
+                progress.report(100.0 * pages.complete_one());
                 let Ok(item_id) = Uuid::parse_str(&item.id) else {
                     continue;
                 };
-                // Only local files supported.
-                let Some(path) = item.path.as_deref().filter(|p| Path::new(p).exists()) else {
+                // Only local files supported: `File.Exists`, false for a disc
+                // rip's folder. `tokio::fs`, as the media-segment task stats.
+                let Some(path) = item.path.as_deref() else {
                     continue;
                 };
+                if !tokio::fs::metadata(path)
+                    .await
+                    .is_ok_and(|meta| meta.is_file())
+                {
+                    continue;
+                }
                 for extractor in &self.extractors {
                     // The cache stores what an extractor extracts.
                     if extractor
@@ -211,7 +238,6 @@ impl ScheduledTask for KeyframeExtractionTask {
                     }
                 }
             }
-            start_index += PAGE_SIZE;
         }
         progress.report(100.0);
         Ok(())
@@ -402,23 +428,16 @@ impl AudioNormalizationTask {
             ancestor_ids: folder_ids.to_vec(),
             ..InternalItemsQuery::default()
         };
-        let total = self.library.get_count(&query).await?.max(0);
-        let mut done = 0i32;
-        let mut start_index = 0i32;
-        while start_index < total {
-            let albums = page(&self.library, &query, start_index).await?;
-            if albums.is_empty() {
-                break;
-            }
+        let mut pages = Pages::new(&self.library, &query).await?;
+        while let Some(albums) = pages.next().await? {
             for album in &albums {
                 if progress.stop_requested() {
                     return Ok(());
                 }
-                done += 1;
+                let fraction = pages.complete_one();
                 self.normalize_album(album, progress).await?;
-                progress.report(base + span * f64::from(done) / f64::from(total.max(1)));
+                progress.report(base + span * fraction);
             }
-            start_index += PAGE_SIZE;
         }
         Ok(())
     }
@@ -519,19 +538,13 @@ impl AudioNormalizationTask {
             ancestor_ids: folder_ids.to_vec(),
             ..InternalItemsQuery::default()
         };
-        let total = self.library.get_count(&query).await?.max(0);
-        let mut done = 0i32;
-        let mut start_index = 0i32;
-        while start_index < total {
-            let tracks = page(&self.library, &query, start_index).await?;
-            if tracks.is_empty() {
-                break;
-            }
+        let mut pages = Pages::new(&self.library, &query).await?;
+        while let Some(tracks) = pages.next().await? {
             for track in &tracks {
                 if progress.stop_requested() {
                     return Ok(());
                 }
-                done += 1;
+                let fraction = pages.complete_one();
                 if track.lufs.is_none()
                     && track.normalization_gain.is_none()
                     && let Some(path) = track.path.clone()
@@ -540,9 +553,8 @@ impl AudioNormalizationTask {
                 {
                     self.save_lufs(&track.id, lufs).await?;
                 }
-                progress.report(base + span * f64::from(done) / f64::from(total.max(1)));
+                progress.report(base + span * fraction);
             }
-            start_index += PAGE_SIZE;
         }
         Ok(())
     }
@@ -789,14 +801,8 @@ impl ScheduledTask for ChapterImagesTask {
             recursive: true,
             ..InternalItemsQuery::default()
         };
-        let total = self.library.get_count(&query).await?.max(0);
-        let mut done = 0i32;
-        let mut start_index = 0i32;
-        while start_index < total {
-            let videos = page(&self.library, &query, start_index).await?;
-            if videos.is_empty() {
-                break;
-            }
+        let mut pages = Pages::new(&self.library, &query).await?;
+        while let Some(videos) = pages.next().await? {
             // The page's streams in one read rather than one per video
             // (gl-1279); like the page's rows, they are not written back.
             // The filter is the loop's skips below.
@@ -810,8 +816,7 @@ impl ScheduledTask for ChapterImagesTask {
                 if progress.stop_requested() {
                     return Ok(());
                 }
-                progress.report(100.0 * f64::from(done) / f64::from(total.max(1)));
-                done += 1;
+                progress.report(100.0 * pages.complete_one());
                 let Some(path) = video.path.as_deref().filter(|path| !path.is_empty()) else {
                     continue;
                 };
@@ -846,7 +851,6 @@ impl ScheduledTask for ChapterImagesTask {
                     failed.insert(history_key);
                 }
             }
-            start_index += PAGE_SIZE;
         }
         progress.report(100.0);
         Ok(())
@@ -1249,20 +1253,13 @@ impl ScheduledTask for SubtitleDownloadTask {
             include_owned_items: true,
             ..InternalItemsQuery::default()
         };
-        let total = self.library.get_count(&query).await?.max(0);
-        let mut done = 0i32;
-        let mut start_index = 0i32;
-        while start_index < total {
-            let videos = page(&self.library, &query, start_index).await?;
-            if videos.is_empty() {
-                break;
-            }
+        let mut pages = Pages::new(&self.library, &query).await?;
+        while let Some(videos) = pages.next().await? {
             for video in &videos {
                 if progress.stop_requested() {
                     return Ok(());
                 }
-                progress.report(100.0 * f64::from(done) / f64::from(total.max(1)));
-                done += 1;
+                progress.report(100.0 * pages.complete_one());
                 let Some(options) = ferrofin_model::entities_media::owning_library(
                     &folders,
                     video.top_parent_id.as_deref(),
@@ -1278,7 +1275,6 @@ impl ScheduledTask for SubtitleDownloadTask {
                     .download_missing(video, options, progress.cancel_token())
                     .await;
             }
-            start_index += PAGE_SIZE;
         }
         progress.report(100.0);
         Ok(())
@@ -1344,14 +1340,8 @@ impl ScheduledTask for LyricDownloadTask {
             recursive: true,
             ..InternalItemsQuery::default()
         };
-        let total = self.library.get_count(&query).await?.max(0);
-        let mut done = 0i32;
-        let mut start_index = 0i32;
-        while start_index < total {
-            let items = page(&self.library, &query, start_index).await?;
-            if items.is_empty() {
-                break;
-            }
+        let mut pages = Pages::new(&self.library, &query).await?;
+        while let Some(items) = pages.next().await? {
             let ids: Vec<Uuid> = items
                 .iter()
                 .filter_map(|item| Uuid::parse_str(&item.id).ok())
@@ -1364,8 +1354,7 @@ impl ScheduledTask for LyricDownloadTask {
                 .into_iter()
                 .collect();
             for item in &items {
-                done += 1;
-                progress.report(100.0 * f64::from(done) / f64::from(total.max(1)));
+                progress.report(100.0 * pages.complete_one());
                 let Ok(item_id) = Uuid::parse_str(&item.id) else {
                     continue;
                 };
@@ -1385,7 +1374,6 @@ impl ScheduledTask for LyricDownloadTask {
                     }
                 }
             }
-            start_index += PAGE_SIZE;
         }
         progress.report(100.0);
         Ok(())
@@ -1692,14 +1680,8 @@ impl ScheduledTask for TrickplayImagesTask {
             );
         }
         let mut complete = true;
-        let total = self.library.get_count(&query).await?.max(0);
-        let mut done = 0i32;
-        let mut start_index = 0i32;
-        while start_index < total {
-            let items = page(&self.library, &query, start_index).await?;
-            if items.is_empty() {
-                break;
-            }
+        let mut pages = Pages::new(&self.library, &query).await?;
+        while let Some(items) = pages.next().await? {
             // Each video gets its page row, as upstream hands over the page's
             // `Video`, and the page's streams, read once (gl-1375). The filter
             // is the loop's skips below.
@@ -1710,7 +1692,7 @@ impl ScheduledTask for TrickplayImagesTask {
                 .collect();
             let page_streams = self.streams.get_media_streams_batch(&ids).await?;
             for item in &items {
-                done += 1;
+                let fraction = pages.complete_one();
                 // The pin declares SourceTypes but never consumes it in query
                 // translation. Retain physical Video kinds, including channel
                 // VOD rows; the manager checks live-stream completion.
@@ -1750,9 +1732,8 @@ impl ScheduledTask for TrickplayImagesTask {
                         tracing::warn!(item_id = %item.id, error = %e, "trickplay generation failed");
                     }
                 }
-                progress.report(100.0 * f64::from(done) / f64::from(total.max(1)));
+                progress.report(100.0 * fraction);
             }
-            start_index += PAGE_SIZE;
         }
         if let Some(check) = check {
             if complete {
@@ -1842,17 +1823,11 @@ impl ScheduledTask for MediaSegmentExtractionTask {
             include_owned_items: true,
             ..InternalItemsQuery::default()
         };
-        let total = self.library.get_count(&query).await?.max(0);
-        let mut done = 0i32;
-        let mut start_index = 0i32;
+        let mut pages = Pages::new(&self.library, &query).await?;
         let mut providers_run = 0usize;
-        while start_index < total {
-            let items = page(&self.library, &query, start_index).await?;
-            if items.is_empty() {
-                break;
-            }
+        while let Some(items) = pages.next().await? {
             for item in &items {
-                done += 1;
+                let fraction = pages.complete_one();
                 // Only local files are supported (upstream's `IsFileProtocol
                 // && File.Exists`); a missing file — or a directory, a disc
                 // rip's, which `File.Exists` is false for — is skipped, not an
@@ -1883,11 +1858,14 @@ impl ScheduledTask for MediaSegmentExtractionTask {
                         }
                     }
                 }
-                progress.report(100.0 * f64::from(done) / f64::from(total.max(1)));
+                progress.report(100.0 * fraction);
             }
-            start_index += PAGE_SIZE;
         }
-        tracing::info!(items = done, providers_run, "media segment scan finished");
+        tracing::info!(
+            items = pages.done,
+            providers_run,
+            "media segment scan finished"
+        );
         progress.report(100.0);
         Ok(())
     }
@@ -2183,11 +2161,14 @@ mod tests {
         }
     }
 
-    /// A [`SubtitleManager`] fake recording searches/downloads.
+    /// A [`SubtitleManager`] fake recording searches/downloads, and the
+    /// run's progress as each search starts.
     #[derive(Default)]
     struct FakeSubtitles {
         searches: Mutex<Vec<SubtitleSearchRequest>>,
         downloads: Mutex<Vec<(Uuid, String)>>,
+        progress: TaskProgress,
+        progress_at_search: Mutex<Vec<f64>>,
     }
 
     #[async_trait]
@@ -2197,6 +2178,10 @@ mod tests {
             request: &SubtitleSearchRequest,
         ) -> Result<Vec<RemoteSubtitleInfo>, ServiceError> {
             self.searches.lock().expect("lock").push(request.clone());
+            self.progress_at_search
+                .lock()
+                .expect("lock")
+                .push(self.progress.current());
             Ok(vec![RemoteSubtitleInfo {
                 id: Some("sub-1".to_owned()),
                 is_hash_match: Some(true),
@@ -3295,6 +3280,48 @@ mod tests {
         task.execute(&TaskProgress::default()).await.expect("run");
 
         assert_eq!(subtitles.searches.lock().expect("lock").len(), count);
+    }
+
+    /// `SubtitleScheduledTask.cs:156-160` counts a video before it reports
+    /// it, so the last video reads n/n, not (n-1)/n.
+    #[tokio::test]
+    async fn subtitle_download_counts_a_video_before_reporting_it() {
+        let db = test_db().await;
+        let media = tempfile::tempdir().expect("tempdir");
+        for n in 0..2u128 {
+            let movie = Uuid::from_u128(0x2000 + n);
+            seed_named_item(&db, movie, BaseItemKind::Movie, "Film").await;
+            let path = media.path().join(format!("{n}.mkv"));
+            std::fs::write(&path, b"x").expect("write");
+            set_path(&db, movie, &path.to_string_lossy()).await;
+            set_media_type(&db, movie, "Video").await;
+        }
+        let progress = TaskProgress::default();
+        let subtitles = Arc::new(FakeSubtitles {
+            progress: progress.clone(),
+            ..FakeSubtitles::default()
+        });
+        let task = SubtitleDownloadTask::new(
+            library_manager_over(db.clone()),
+            Arc::new(folder_with(
+                LibraryOptions {
+                    subtitle_download_languages: Some(vec!["eng".to_owned()]),
+                    ..LibraryOptions::default()
+                },
+                None,
+                &media.path().to_string_lossy(),
+            )),
+            Arc::new(crate::subtitle_downloader::SubtitleDownloader::new(
+                &(subtitles.clone() as Arc<dyn SubtitleManager>),
+                Arc::new(FakeStreams::new(Vec::new())),
+            )),
+        );
+        task.execute(&progress).await.expect("run");
+
+        assert_eq!(
+            *subtitles.progress_at_search.lock().expect("lock"),
+            [50.0, 100.0]
+        );
     }
 
     // -- Download missing lyrics ---------------------------------------------
@@ -4515,6 +4542,14 @@ mod tests {
         seed_item(&db, gone, BaseItemKind::Episode).await;
         set_media_type(&db, gone, "Video").await;
         set_path(&db, gone, &media.path().join("gone.mkv").to_string_lossy()).await;
+        // A disc rip's folder: `File.Exists` is false for a directory, so it
+        // is skipped too.
+        let rip = Uuid::from_u128(0xB8);
+        let rip_dir = media.path().join("rip.mkv");
+        std::fs::create_dir(&rip_dir).expect("rip folder");
+        seed_item(&db, rip, BaseItemKind::Movie).await;
+        set_media_type(&db, rip, "Video").await;
+        set_path(&db, rip, &rip_dir.to_string_lossy()).await;
 
         let log = Arc::new(Mutex::new(Vec::new()));
         // Registered ffprobe first, as upstream registers them.
@@ -4540,7 +4575,8 @@ mod tests {
         let mut calls = log.lock().expect("log").clone();
         calls.sort();
         // The Matroska extractor answers for the `.mkv`, so ffprobe never sees
-        // it; the `.mp4` falls through to ffprobe; the missing file is skipped.
+        // it; the `.mp4` falls through to ffprobe; the missing file and the
+        // rip's folder are skipped.
         assert_eq!(calls, ["ffprobe:b.mp4", "matroska:a.mkv", "matroska:b.mp4"]);
     }
 
