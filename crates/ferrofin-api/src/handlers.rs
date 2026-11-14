@@ -3982,9 +3982,11 @@ pub const VERIFIED: &[Verified] = &[
                get_playlist_access + require_edit: \
                GetPlaylistForUser and the owner-or-editing-share check) → ferrofin-core \
                collection_manager.rs FerrofinPlaylistManager::move_item \
-               (PlaylistManager.MoveItemAsync: the first occurrence moves, the index counts \
-               the caller's list, no write when it is already there) and visible_entries",
-        date: "2026-11-01",
+               (PlaylistManager.MoveItemAsync: the item id names an entry only in its N \
+               form, either case, as the string compare with ItemId.ToString(\"N\") \
+               ignoring case does; the first occurrence moves, the index counts the \
+               caller's list, no write when it is already there) and visible_entries",
+        date: "2026-11-14",
         divergences: &[
             "The index counts the members GET /Playlists/{id}/Items gave the caller, so the \
          standalone check, library included, where upstream's accessibleChildren take \
@@ -3996,7 +3998,9 @@ pub const VERIFIED: &[Verified] = &[
          (DetermineAdjustedIndex) and lands one place short. Jellyfin bug not ported.",
             "An index beyond the length of the caller's list goes to the end; upstream's \
          accessibleChildren[newPriorItemIndex] throws (500), as it does at any index when \
-         the caller's list is empty. Jellyfin bug not ported.",
+         the caller's list is empty. It throws before it looks the entry up, so an item id \
+         that names no entry is a 500 there at such an index, and a 204 that moves nothing \
+         here. Jellyfin bug not ported.",
             "A malformed playlist id is a 400; upstream's Guid.Parse throws FormatException, \
          which ExceptionMiddleware answers with a 500. Jellyfin bug not ported.",
             "The 400 (a malformed index), 403 (no editing share) and 404 (no playlist the \
