@@ -1337,8 +1337,9 @@ pub fn normalize_language(language: Option<&str>, country_code: Option<&str>) ->
 /// comma separated (`"fr,null,en"`, `"en,null"`).
 ///
 /// `TmdbMovieProvider` hands exactly this string to `FindByExternalIdAsync`'s
-/// `language` argument (`TmdbMovieProvider.cs:96-101` and `:106-111` at v10.11.8), so
-/// TMDB's `/find` sees `language=en,null` for a movie. `TmdbSeriesProvider.cs:73` passes
+/// `language` argument (`TmdbMovieProvider.cs:96-101` and `:106-111` at v10.11.8), and
+/// that method runs [`normalize_language`] over it, so TMDB's `/find` sees
+/// `language=en,null` for a movie (`pt-BR,NULL,EN` for `pt-BR`). `TmdbSeriesProvider.cs:73` passes
 /// the bare `MetadataLanguage` instead. That asymmetry is upstream's, and it is ported
 /// rather than smoothed over: `/find` is the branch an IMDb/TVDB Identify search takes,
 /// and sending TMDB a different `language` than the oracle does is how the two servers

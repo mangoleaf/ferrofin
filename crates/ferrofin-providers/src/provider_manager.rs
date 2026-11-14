@@ -139,12 +139,19 @@ impl RemoteSearchProvider for TmdbSearchProvider {
         // the two providers: `TmdbMovieProvider.cs:96-101`/`:106-111` pass
         // `TmdbUtils.GetImageLanguagesParam(...)` (so TMDB's `/find` sees
         // `language=en,null`), while `TmdbSeriesProvider.cs:73` passes the bare
-        // `MetadataLanguage`. Upstream's asymmetry, ported as-is.
+        // `MetadataLanguage`. Upstream's asymmetry, ported as-is, and so is
+        // `FindByExternalIdAsync`'s own `NormalizeLanguage` over the whole
+        // string, which upper-cases what follows a region's hyphen
+        // (`pt-BR,null,en` → `pt-BR,NULL,EN`).
+        let country = search_info.metadata_country_code.as_deref();
         let find_language = match self.kind {
-            TmdbKind::Movie => Some(crate::tmdb::image_languages_param(
-                search_info.metadata_language.as_deref(),
-                search_info.metadata_country_code.as_deref(),
-            )),
+            TmdbKind::Movie => crate::tmdb::normalize_language(
+                Some(&crate::tmdb::image_languages_param(
+                    search_info.metadata_language.as_deref(),
+                    country,
+                )),
+                country,
+            ),
             TmdbKind::Series => language.map(ToOwned::to_owned),
         };
         for (key, source) in [("Imdb", "imdb_id"), ("Tvdb", "tvdb_id")] {
@@ -6530,9 +6537,11 @@ mod tests {
         use super::{TmdbKind, TmdbSearchProvider};
 
         let body = r#"{"movie_results":[{"id":603,"title":"Resolved movie"}]}"#;
+        // `FindByExternalIdAsync` runs `NormalizeLanguage` over the whole
+        // list, which upper-cases everything after a region's hyphen.
         let server = crate::mock_http::MockServer::start(vec![
-            ("language=pt-BR%2Cnull%2Cen", body.to_owned()),
-            ("language=es-AR%2Cnull%2Cen", body.to_owned()),
+            ("language=pt-BR%2CNULL%2CEN", body.to_owned()),
+            ("language=es-AR%2CNULL%2CEN", body.to_owned()),
             ("language=null%2Cen", body.to_owned()),
         ])
         .await;
