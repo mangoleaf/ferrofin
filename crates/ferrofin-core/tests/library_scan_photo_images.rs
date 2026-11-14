@@ -393,3 +393,69 @@ async fn a_rescan_of_settled_photos_measures_nothing() {
     );
     assert_eq!(library.primary().await, settled);
 }
+
+/// gl-1530: `PhotoProvider.HasChanged` runs the photo's reader whenever the
+/// file's mtime drifted from the stored `DateModified`, below `Default` too
+/// (`GetProviders` runs the monitors that fired), and against an unset
+/// `DateModified` (`DateTime.MinValue`), which `RequiresRefresh` skips. Either
+/// way the photo's own size follows the rewritten file.
+#[rstest::rstest]
+#[case::validation_only(MetadataRefreshMode::ValidationOnly, false)]
+#[case::no_stored_date(MetadataRefreshMode::Default, true)]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_changed_photo_is_read_again_by_its_change_monitor(
+    #[case] mode: MetadataRefreshMode,
+    #[case] unset_date: bool,
+) {
+    let library = Library::new().await;
+    library.scanner.scan_all().await.expect("scan");
+    let read = || async {
+        let row = library
+            .items
+            .retrieve_item(library.id())
+            .await
+            .expect("read the photo")
+            .expect("the photo's row");
+        (row.width, row.height)
+    };
+    assert_eq!(read().await, (Some(40), Some(60)));
+    if unset_date {
+        let mut row = library
+            .items
+            .retrieve_item(library.id())
+            .await
+            .expect("read the photo")
+            .expect("the photo's row");
+        row.date_modified = None;
+        library
+            .persistence
+            .save_items(std::slice::from_ref(&row))
+            .await
+            .expect("unset DateModified");
+        library.edit_keeping_mtime();
+    } else {
+        write_photo(&library.photo, 90, 30, BLUE);
+        library.touch();
+    }
+
+    let options = MetadataRefreshOptions {
+        metadata_refresh_mode: mode,
+        image_refresh_mode: mode,
+        ..MetadataRefreshOptions::default()
+    };
+    library
+        .scanner
+        .scan_with(None, &options)
+        .await
+        .expect("rescan");
+    assert_eq!(read().await, (Some(90), Some(30)));
+
+    // The read stored the file's date, so the monitor settles.
+    let before = library.measured();
+    library
+        .scanner
+        .scan_with(None, &options)
+        .await
+        .expect("rescan");
+    assert_eq!(library.measured(), before, "a settled photo is not read");
+}

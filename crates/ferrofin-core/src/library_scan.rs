@@ -3051,6 +3051,7 @@ const UNWALKED_FACTS: FileFacts = FileFacts {
     is_shortcut: false,
     is_file_protocol: true,
     is_placeholder: false,
+    is_photo: false,
     path_rebased: false,
     locations_changed: false,
 };
@@ -11112,6 +11113,7 @@ impl LibraryScanner {
                 .is_some_and(|ext| ext.eq_ignore_ascii_case("strm")),
             is_file_protocol: !path.is_empty()
                 && crate::media_info_resolver::is_file_protocol(path),
+            is_photo: kind == Some(BaseItemKind::Photo),
             // The scan resolves no disc stubs; a stored row that carries the
             // flag (an adopted Jellyfin one) is honoured.
             is_placeholder: stored.is_some_and(|row| {
