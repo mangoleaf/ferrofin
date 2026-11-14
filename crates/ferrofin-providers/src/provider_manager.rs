@@ -1242,7 +1242,14 @@ pub struct LocalProviderManager {
     /// `POST /System/Configuration` applies without a restart. Absent → an
     /// empty global array, i.e. no server-wide ranking.
     metadata_options: Option<Arc<dyn Fn() -> Vec<MetadataOptions> + Send + Sync>>,
+    /// `GetRebasedPath` of a by-name Genre, MusicGenre, Person, Studio or
+    /// Year at a path (`None` for any other kind). Absent → no by-name item
+    /// is ever rebased by a refresh.
+    by_name_rebase: Option<ByNameRebase>,
 }
+
+/// [`LocalProviderManager::with_by_name_rebase`]'s reader, stored.
+type ByNameRebase = Arc<dyn Fn(BaseItemKind, &str) -> Option<String> + Send + Sync>;
 
 /// What every [`ProviderManager::cached_remote_image`] shares, so that one
 /// image URL costs one download however many ask, and one that gave no image
@@ -1334,6 +1341,7 @@ impl std::fmt::Debug for LocalProviderManager {
             .field("has_image_saver", &self.image_saver.is_some())
             .field("has_image_store", &self.image_store.is_some())
             .field("metadata_dir", &self.metadata_dir)
+            .field("has_by_name_rebase", &self.by_name_rebase.is_some())
             .field("remote_image_cache", &self.remote_image_cache)
             .field("remote_image_requests", &self.remote_image_requests)
             .field("has_tmdb", &self.tmdb.is_some())
@@ -1431,6 +1439,7 @@ impl LocalProviderManager {
             server_metadata_language: None,
             server_metadata_country: None,
             metadata_options: None,
+            by_name_rebase: None,
         }
     }
 
@@ -1462,6 +1471,28 @@ impl LocalProviderManager {
     ) -> Self {
         self.server_metadata_country = Some(server_country);
         self
+    }
+
+    /// Wires the by-name `GetRebasedPath` the single-item refresh asks
+    /// (`Genre`/`MusicGenre`/`Person`/`Studio`/`Year` `RequiresRefresh` and
+    /// `BeforeMetadataRefresh`): a by-name item whose `Path` is not the
+    /// rebased one is refreshed and saved there.
+    #[must_use]
+    pub fn with_by_name_rebase(
+        mut self,
+        rebase: impl Fn(BaseItemKind, &str) -> Option<String> + Send + Sync + 'static,
+    ) -> Self {
+        self.by_name_rebase = Some(Arc::new(rebase));
+        self
+    }
+
+    /// The path a by-name `stored` item moves to (`GetRebasedPath`) when it
+    /// differs from its `Path` (ordinal); [`None`] while it is in place, for
+    /// a row with no path, a kind with no such arm, or with no reader wired.
+    fn rebased_by_name_path(&self, stored: &BaseItemEntity) -> Option<String> {
+        let path = stored.path.as_deref()?;
+        let kind = BaseItemKind::from_stored_type_name(&stored.type_)?;
+        (self.by_name_rebase.as_ref()?)(kind, path).filter(|rebased| rebased != path)
     }
 
     /// `ServerConfiguration.PreferredMetadataLanguage`, or the C# default
@@ -2629,6 +2660,9 @@ impl LocalProviderManager {
             options,
             force_save: options.force_save,
         };
+        // A by-name item off its rebased path is required to refresh
+        // (`Genre.RequiresRefresh` and its kin, `MetadataService.cs:99-110`).
+        let rebased = self.rebased_by_name_path(&stored);
         let plan = plan_item_refresh(
             Some(&StoredState {
                 date_last_refreshed: stored.date_last_refreshed,
@@ -2639,7 +2673,10 @@ impl LocalProviderManager {
                 is_virtual_item: stored.is_virtual_item,
                 is_locked: stored.is_locked,
             }),
-            &NO_FILE,
+            &FileFacts {
+                path_rebased: rebased.is_some(),
+                ..NO_FILE
+            },
             &request,
             library.as_ref(),
             Utc::now(),
@@ -2853,6 +2890,16 @@ impl LocalProviderManager {
             _ => current,
         };
         let mut row = merged.item;
+        // `BeforeMetadataRefresh` (`MetadataService.cs:162-169`): the moved
+        // by-name item takes its rebased path in every mode but `None` (a moved
+        // path makes the refresh required), whatever the lock, before the
+        // images and the save use the path.
+        if options.metadata_refresh_mode != MetadataRefreshMode::None
+            && let Some(rebased) = rebased
+        {
+            tracing::debug!(%item_id, path = %rebased, "the item's path has changed; moving it");
+            row.path = Some(rebased);
+        }
         // `OnMetadataChanged` (`BaseItem.cs:2968-3000`): every refresh, of any
         // kind and whatever the lock, re-derives the stored parental score
         // (and the `UnratedType` its kind blocks under) from the row it saves,
@@ -3179,7 +3226,7 @@ impl LocalProviderManager {
             }
         }
         if saved {
-            self.persist_acquired_images(item_id, &mut images, &stored, fetch)
+            self.persist_acquired_images(item_id, row, &mut images, &stored, fetch)
                 .await?;
         }
         Ok(saved)
@@ -3188,6 +3235,7 @@ impl LocalProviderManager {
     async fn persist_acquired_images(
         &self,
         item_id: Uuid,
+        row: &BaseItemEntity,
         images: &mut Vec<ItemImageInfo>,
         stored: &[ItemImageInfo],
         fetch: ImageFetch,
@@ -3203,9 +3251,12 @@ impl LocalProviderManager {
             );
         }
         let published = if let (Some(saver), Some(items)) = (&self.image_saver, &self.items)
-            && let Some(row) = items.retrieve_item(item_id).await?
+            && let Some(mut owner) = items.retrieve_item(item_id).await?
         {
-            saver.save_all(&row, images, stored).await
+            // At the path this refresh gives the item: `BeforeMetadataRefresh`
+            // may have moved a by-name item, and its art goes beside it there.
+            owner.path.clone_from(&row.path);
+            saver.save_all(&owner, images, stored).await
         } else {
             Ok(())
         };
@@ -12137,6 +12188,148 @@ mod tests {
             assert!(
                 !store.saved.lock().expect("lock").is_empty(),
                 "a drawn image saves the row"
+            );
+        }
+    }
+
+    /// gl-1209: a by-name genre (and its kin) off its rebased path is required
+    /// to refresh (`Genre.RequiresRefresh`) and is saved at the rebased path
+    /// (`BeforeMetadataRefresh`) in every mode but `None`, locked or not. One
+    /// already in place, refreshed just now, saves nothing.
+    #[rstest::rstest]
+    #[case::default(
+        MetadataRefreshMode::Default,
+        "/old/Genre/Crime",
+        false,
+        Some("/new/Genre/Crime")
+    )]
+    #[case::validation_only(
+        MetadataRefreshMode::ValidationOnly,
+        "/old/Genre/Crime",
+        false,
+        Some("/new/Genre/Crime")
+    )]
+    #[case::locked(
+        MetadataRefreshMode::Default,
+        "/old/Genre/Crime",
+        true,
+        Some("/new/Genre/Crime")
+    )]
+    #[case::mode_none(MetadataRefreshMode::None, "/old/Genre/Crime", false, None)]
+    #[case::in_place(MetadataRefreshMode::Default, "/new/Genre/Crime", false, None)]
+    #[tokio::test]
+    async fn a_moved_by_name_item_is_saved_at_its_rebased_path(
+        #[case] mode: MetadataRefreshMode,
+        #[case] stored_path: &str,
+        #[case] is_locked: bool,
+        #[case] moved_to: Option<&str>,
+    ) {
+        let item_id = Uuid::new_v4();
+        let mut stored = row("Genre", "Crime");
+        stored.id = item_id.to_string();
+        stored.path = Some(stored_path.to_owned());
+        stored.is_locked = is_locked;
+        // Refreshed just now: only a moved path asks for this refresh.
+        stored.date_last_refreshed = Some(chrono::Utc::now());
+        crate::metadata_merge::settle_sort_name(&mut stored);
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let store = Arc::new(RecordingStore::default());
+        let mgr = LocalProviderManager::default()
+            .with_remote_images(
+                Arc::new(crate::tmdb::TmdbClient::new()),
+                Arc::new(FakeItems {
+                    rows: HashMap::from([(item_id, stored)]),
+                    seen: tx,
+                }),
+            )
+            .with_image_store(Arc::clone(&store) as _, std::env::temp_dir())
+            .with_by_name_rebase(|kind, path: &str| {
+                (kind == BaseItemKind::Genre)
+                    .then(|| format!("/new/Genre/{}", path.rsplit('/').next().unwrap_or(path)))
+            });
+        let options = MetadataRefreshOptions {
+            metadata_refresh_mode: mode,
+            ..MetadataRefreshOptions::default()
+        };
+        mgr.refresh_single_item(item_id, &options)
+            .await
+            .expect("refresh succeeds");
+        let saved: Vec<String> = store
+            .saved
+            .lock()
+            .expect("lock")
+            .iter()
+            .filter_map(|row| row.path.clone())
+            .collect();
+        match moved_to {
+            Some(path) => assert_eq!(saved.last().map(String::as_str), Some(path), "{saved:?}"),
+            None => assert!(saved.iter().all(|path| path == stored_path), "{saved:?}"),
+        }
+    }
+
+    /// gl-1209: the moved path makes the refresh required
+    /// (`Person.RequiresRefresh`), so a person refreshed just now still asks
+    /// its remote provider in the default mode, as a first refresh would. In
+    /// place, or with no path, it asks nothing.
+    #[rstest::rstest]
+    #[case::moved(Some("/old/People/B/Brad Pitt"), true)]
+    #[case::in_place(Some("/new/People/B/Brad Pitt"), false)]
+    #[case::no_path(None, false)]
+    #[tokio::test]
+    async fn a_moved_person_is_required_to_refresh(
+        #[case] stored_path: Option<&str>,
+        #[case] asks_tmdb: bool,
+    ) {
+        let server = crate::mock_http::MockServer::start(vec![
+            (
+                "/search/person",
+                r#"{"results":[{"id":287,"name":"Brad Pitt","profile_path":"/bp.jpg"}]}"#
+                    .to_owned(),
+            ),
+            (
+                "/person/287",
+                r#"{"id":287,"name":"Brad Pitt","biography":"An actor.","images":{"profiles":[]}}"#
+                    .to_owned(),
+            ),
+        ])
+        .await;
+        let tmdb = Arc::new(crate::tmdb::TmdbClient::new().with_base_url(&server.base_url));
+        let store = Arc::new(RecordingStore::default());
+        let item_id = Uuid::new_v4();
+        let mut person = row("Person", "Brad Pitt");
+        person.id = item_id.to_string();
+        person.sort_name = Some("Brad Pitt".to_owned());
+        person.path = stored_path.map(str::to_owned);
+        person.date_last_refreshed = Some(chrono::Utc::now());
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mgr = LocalProviderManager::default()
+            .with_remote_images(
+                tmdb,
+                Arc::new(FakeItems {
+                    rows: HashMap::from([(item_id, person)]),
+                    seen: tx,
+                }),
+            )
+            .with_image_store(Arc::clone(&store) as _, std::env::temp_dir())
+            .with_by_name_rebase(|kind, path: &str| {
+                (kind == BaseItemKind::Person)
+                    .then(|| format!("/new/People/B/{}", path.rsplit('/').next().unwrap_or(path)))
+            });
+        mgr.refresh_single_item(item_id, &MetadataRefreshOptions::default())
+            .await
+            .expect("refresh");
+        assert_eq!(
+            !server
+                .query_values("/person/287", "append_to_response")
+                .is_empty(),
+            asks_tmdb,
+            "TMDB asked for the person"
+        );
+        if asks_tmdb {
+            let saved = store.saved.lock().expect("lock");
+            assert_eq!(
+                saved.last().and_then(|row| row.path.as_deref()),
+                Some("/new/People/B/Brad Pitt")
             );
         }
     }

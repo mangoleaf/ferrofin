@@ -1530,6 +1530,18 @@ pub async fn build_app_state(
             .with_metadata_country({
                 let config_mgr = Arc::clone(&config_mgr);
                 Arc::new(move || config_mgr.snapshot_shared().metadata_country_code.clone())
+            })
+            // `GetRebasedPath` of the by-name kinds the item refresh moves
+            // (`Genre`/`MusicGenre`/`Person`/`Studio`/`Year.RequiresRefresh`).
+            .with_by_name_rebase({
+                let paths = Arc::clone(&paths);
+                move |kind, path: &str| {
+                    ferrofin_core::item_type_lookup::rebased_by_name_path(
+                        paths.as_ref(),
+                        kind,
+                        path,
+                    )
+                }
             }),
     );
 
