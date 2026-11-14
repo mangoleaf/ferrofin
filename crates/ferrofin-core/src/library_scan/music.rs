@@ -46,9 +46,9 @@ use uuid::Uuid;
 
 use super::{
     FetcherPolicy, LibraryScanner, RefreshReach, RemoteAnswer, RemoteFold, RemoteImage, ScanCancel,
-    ScanOutcome, ScanRun, Served, append_fanart, apply_album_child_metadata, first_album_tag,
-    images_changed, item_values_of, preferred_language, provider_order, search_result_ids,
-    split_pipe,
+    ScanOutcome, ScanRun, Served, album_walk_order, append_fanart, apply_album_child_metadata,
+    first_album_tag, images_changed, item_values_of, preferred_language, provider_order,
+    search_result_ids, split_pipe,
 };
 use crate::item_type_lookup;
 use crate::refresh_plan::{
@@ -1051,11 +1051,16 @@ impl LibraryScanner {
             // Its tagged items give it its runtime, never an id.
             MusicKind::ByNameArtist => work.aggregate,
         };
-        let children = if children_needed {
+        let mut children = if children_needed {
             items.get_item_list(&Self::music_children(work)).await?
         } else {
             Vec::new()
         };
+        // `GetRecursiveChildren`' depth-first walk; the query's order only
+        // breaks its ties.
+        if work.kind == MusicKind::Album {
+            album_walk_order(stored.path.as_deref(), &mut children);
+        }
         let child_ids = if children.is_empty() {
             HashMap::new()
         } else {
@@ -1372,7 +1377,8 @@ impl LibraryScanner {
     }
 
     /// The query for `work`'s children: an album's tracks (recursive, so a
-    /// multi-disc album aggregates), a folder artist's tracks, a by-name
+    /// multi-disc album aggregates; the caller puts them in upstream's walk
+    /// order, [`album_walk_order`]), a folder artist's tracks, a by-name
     /// artist's tagged items.
     fn music_children(work: &MusicRefresh<'_>) -> InternalItemsQuery {
         match work.kind {
