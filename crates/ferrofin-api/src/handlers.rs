@@ -811,6 +811,48 @@ pub const PLUGIN_ROUTES: &[(&str, &str, &str)] = &[
     ("post", "/Ldap/LdapUserSearch", "ldap-auth"),
 ];
 
+/// Every path a handler registers that is neither a contract route nor in
+/// [`PLUGIN_ROUTES`]: the obsolete routes upstream leaves out of its OpenAPI
+/// document (`/Users/{userId}/Items`, …), extension extras, and Ferrofin's own.
+///
+/// ASP.NET matches every route ignoring case, so
+/// [`canonicalize_path`](crate::routes::canonicalize_path) reads this list
+/// too; a test in `routes.rs` keeps it in step with the handlers' route calls.
+pub const UNLISTED_ROUTES: &[&str] = &[
+    "/Ferrofin/Settings",
+    "/Intros/DisabledEpisodes/Update",
+    "/Intros/DisabledEpisodes/{SeasonId}",
+    "/Intros/ExcludedTimestamps/Clear",
+    "/Intros/Show/{MovieId}",
+    "/Items/{itemId}/Collections",
+    "/MediaSegments/Provider/{providerId}",
+    "/Plugins/{pluginId}/web/{*path}",
+    "/Users/{userId}/Authenticate",
+    "/Users/{userId}/Configuration",
+    "/Users/{userId}/FavoriteItems/{itemId}",
+    "/Users/{userId}/GroupingOptions",
+    "/Users/{userId}/Images/{imageType}",
+    "/Users/{userId}/Images/{imageType}/{imageIndex}",
+    "/Users/{userId}/Items",
+    "/Users/{userId}/Items/Latest",
+    "/Users/{userId}/Items/Resume",
+    "/Users/{userId}/Items/Root",
+    "/Users/{userId}/Items/{itemId}",
+    "/Users/{userId}/Items/{itemId}/Intros",
+    "/Users/{userId}/Items/{itemId}/LocalTrailers",
+    "/Users/{userId}/Items/{itemId}/Rating",
+    "/Users/{userId}/Items/{itemId}/SpecialFeatures",
+    "/Users/{userId}/Items/{itemId}/UserData",
+    "/Users/{userId}/Password",
+    "/Users/{userId}/PlayedItems/{itemId}",
+    "/Users/{userId}/PlayingItems/{itemId}",
+    "/Users/{userId}/PlayingItems/{itemId}/Progress",
+    "/Users/{userId}/Suggestions",
+    "/Users/{userId}/Views",
+    "/embywebsocket",
+    "/socket",
+];
+
 /// `(method, path, extension-id)` for every route owned by a **compiled-in
 /// extension** (`ferrofin-extensions`); core routes are everything in
 /// [`REAL_ROUTES`] not listed here.
@@ -4717,7 +4759,9 @@ const _: () = assert!(
 ///
 /// Called by [`create_router`](crate::router::create_router) after its stub
 /// loop, which skips the `501` stub for each [`REAL_ROUTES`] row, so a real
-/// handler is the sole route for its `(method, path)`.
+/// handler is the sole route for its `(method, path)`. A path outside the
+/// contract is listed in [`UNLISTED_ROUTES`] (or [`PLUGIN_ROUTES`]), so it
+/// matches ignoring case.
 pub fn register(router: Router<AppState>) -> Router<AppState> {
     let router = users::register(router);
     let router = user_views::register(router);

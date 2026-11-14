@@ -130,7 +130,8 @@ enum Seg {
     Literal(String),
     /// A single-segment parameter, e.g. `{itemId}` — matches any one segment.
     Param,
-    /// A catch-all parameter, e.g. `{*path}` — matches the remaining segments.
+    /// A catch-all parameter, e.g. `{*path}` — matches one or more remaining
+    /// segments.
     Wildcard,
 }
 
@@ -141,9 +142,10 @@ enum Seg {
 /// request is a binary search rather than a walk of the table. The search
 /// compares case-insensitively, so the path needs no lowercased copy.
 struct RouteIndex {
-    /// Every route, in registration order. Where two routes fit a path the
-    /// earlier one wins, which makes a literal outrank a parameter at the same
-    /// position: [`axum_routes`] sorts by path, and `{` sorts after every letter.
+    /// Every route, in table order. Where two routes fit a path the earlier
+    /// one wins, which makes a literal outrank a parameter at the same
+    /// position: [`registered_paths`] sorts by path, and `{` sorts after every
+    /// letter.
     routes: Vec<Vec<Seg>>,
     /// `(first literal lowercased, segment count, index into routes)`, sorted.
     keyed: Vec<(String, usize, usize)>,
@@ -153,7 +155,7 @@ struct RouteIndex {
 }
 
 impl RouteIndex {
-    /// Indexes `paths`, given in registration order; a repeat is dropped.
+    /// Indexes `paths`, given in table order; a repeat is dropped.
     fn new(paths: impl IntoIterator<Item = String>) -> Self {
         let mut seen = BTreeSet::new();
         let mut routes = Vec::new();
@@ -192,7 +194,7 @@ impl RouteIndex {
         }
     }
 
-    /// The first route in registration order that `path` fits.
+    /// The first route in table order that `path` fits.
     fn find(&self, path: &str) -> Option<&[Seg]> {
         let head = segments(path).next().unwrap_or_default();
         let count = segments(path).count();
@@ -213,16 +215,32 @@ impl RouteIndex {
     /// [`canonicalize_path`] over this table.
     fn canonicalize(&self, path: &str) -> Option<String> {
         let route = self.find(path)?;
-        if spells(path, canonical_segments(route, path)) {
+        // A catch-all's tail belongs to its handler and passes on byte for byte.
+        let (head, tail) = match route.split_last() {
+            Some((Seg::Wildcard, prefix)) => split_after(path, prefix.len()),
+            _ => (path, ""),
+        };
+        if spells(head, canonical_segments(route, head)) {
             return None;
         }
         let mut rebuilt = String::with_capacity(path.len());
-        for segment in canonical_segments(route, path) {
+        for segment in canonical_segments(route, head) {
             rebuilt.push('/');
             rebuilt.push_str(segment);
         }
+        rebuilt.push_str(tail);
         Some(rebuilt)
     }
+}
+
+/// `path` split after its first `count` non-empty segments.
+fn split_after(path: &str, count: usize) -> (&str, &str) {
+    let mut rest = path;
+    for _ in 0..count {
+        let segment = rest.trim_start_matches('/');
+        rest = &segment[segment.find('/').unwrap_or(segment.len())..];
+    }
+    path.split_at(path.len() - rest.len())
 }
 
 /// The non-empty segments of `path`.
@@ -239,12 +257,13 @@ fn case_insensitive_order(a: &str, b: &str) -> Ordering {
 }
 
 /// Whether `path` fits `route`: every literal in any case, one segment per
-/// parameter, and any remainder for a catch-all.
+/// parameter, and a non-empty remainder for a catch-all (axum matches no
+/// empty one).
 fn fits(route: &[Seg], path: &str) -> bool {
     let mut incoming = segments(path);
     for seg in route {
         match (seg, incoming.next()) {
-            (Seg::Wildcard, _) => return true,
+            (Seg::Wildcard, Some(_)) => return true,
             (Seg::Param, Some(_)) => {}
             (Seg::Literal(literal), Some(segment)) if segment.eq_ignore_ascii_case(literal) => {}
             _ => return false,
@@ -253,27 +272,19 @@ fn fits(route: &[Seg], path: &str) -> bool {
     incoming.next().is_none()
 }
 
-/// The segments of `path`, which fits `route`, with the route's literals in
-/// their registered case and everything else as sent.
+/// The segments of `path`, which fits `route` up to any catch-all (the caller
+/// passes on a catch-all's tail itself), with the route's literals in their
+/// registered case and parameter values as sent.
 fn canonical_segments<'a>(route: &'a [Seg], path: &'a str) -> impl Iterator<Item = &'a str> {
     let mut incoming = segments(path);
     let mut route = route.iter();
-    let mut in_catch_all = false;
-    std::iter::from_fn(move || {
-        if in_catch_all {
-            return incoming.next();
+    std::iter::from_fn(move || match route.next()? {
+        Seg::Literal(literal) => {
+            incoming.next();
+            Some(literal.as_str())
         }
-        match route.next()? {
-            Seg::Literal(literal) => {
-                incoming.next();
-                Some(literal.as_str())
-            }
-            Seg::Param => incoming.next(),
-            Seg::Wildcard => {
-                in_catch_all = true;
-                incoming.next()
-            }
-        }
+        Seg::Param => incoming.next(),
+        Seg::Wildcard => None,
     })
 }
 
@@ -297,8 +308,9 @@ fn spells<'a>(path: &str, spelled: impl Iterator<Item = &'a str>) -> bool {
 /// and clients (including jellyfin-web) call some paths in non-canonical case.
 ///
 /// Only literal segments are re-cased; parameter values (item ids, names, …) are
-/// preserved verbatim. Returns `Some(canonical)` when a differently-cased match is
-/// found, or `None` when the path is already canonical or matches no API route
+/// preserved verbatim, and so is a catch-all's tail, byte for byte. Returns
+/// `Some(canonical)` when a differently-cased match is found, or `None` when
+/// the path is already canonical or matches no API route
 /// (so `/web/*` assets, health, and unknown paths pass through untouched — their
 /// case is significant).
 ///
@@ -307,21 +319,33 @@ fn spells<'a>(path: &str, spelled: impl Iterator<Item = &'a str>) -> bool {
 pub fn canonicalize_path(path: &str) -> Option<String> {
     static INDEX: OnceLock<RouteIndex> = OnceLock::new();
     INDEX
-        .get_or_init(|| {
-            RouteIndex::new(
-                axum_routes().into_iter().map(|(_, path)| path).chain(
-                    crate::handlers::PLUGIN_ROUTES
-                        .iter()
-                        .map(|(_, path, _)| (*path).to_owned()),
-                ),
-            )
-        })
+        .get_or_init(|| RouteIndex::new(registered_paths()))
         .canonicalize(path)
+}
+
+/// Every route path, sorted: the contract's, the ported plugins' own and
+/// the handlers' others. A case-variant spelling a handler also registers
+/// (`/web/configurationpage`) needs no entry: its contract spelling stands for it.
+fn registered_paths() -> BTreeSet<String> {
+    let plugin = crate::handlers::PLUGIN_ROUTES
+        .iter()
+        .map(|(_, path, _)| *path);
+    axum_routes()
+        .into_iter()
+        .map(|(_, path)| path)
+        .chain(
+            plugin
+                .chain(crate::handlers::UNLISTED_ROUTES.iter().copied())
+                .map(str::to_owned),
+        )
+        .collect()
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{RouteIndex, VENDORED_ROUTES, axum_routes, canonicalize_path, to_axum_path};
+    use super::{
+        RouteIndex, VENDORED_ROUTES, axum_routes, canonicalize_path, registered_paths, to_axum_path,
+    };
     use std::collections::BTreeMap;
 
     fn one(path: &str) -> String {
@@ -365,6 +389,79 @@ mod tests {
             canonicalize_path("/ldap/LdapUserSearch").as_deref(),
             Some("/Ldap/LdapUserSearch")
         );
+    }
+
+    /// Routes a handler registers outside the contract, such as the obsolete
+    /// ones upstream leaves out of its OpenAPI document, are matched ignoring
+    /// case like every ASP.NET route.
+    #[test]
+    fn canonicalize_recases_routes_outside_the_contract() {
+        for (path, expected) in [
+            ("/users/AbC/items", "/Users/AbC/Items"),
+            ("/users/AbC/views", "/Users/AbC/Views"),
+            ("/USERS/AbC/ITEMS/LATEST", "/Users/AbC/Items/Latest"),
+            (
+                "/users/AbC/items/DeF/userdata",
+                "/Users/AbC/Items/DeF/UserData",
+            ),
+            ("/ferrofin/settings", "/Ferrofin/Settings"),
+            ("/Socket", "/socket"),
+            ("/EmbyWebSocket", "/embywebsocket"),
+            // A plugin's page tail is its own: case, slashes and all.
+            ("/plugins/AbC/WEB/Page.JS", "/Plugins/AbC/web/Page.JS"),
+            ("/plugins/AbC/web/Dir/", "/Plugins/AbC/web/Dir/"),
+            ("/plugins/AbC/web/a//B", "/Plugins/AbC/web/a//B"),
+            // Not the contract's `/Plugins/{pluginId}/{version}/Image`: axum prefers `web`.
+            ("/plugins/AbC/web/image", "/Plugins/AbC/web/image"),
+        ] {
+            assert_eq!(canonicalize_path(path).as_deref(), Some(expected), "{path}");
+        }
+        for path in ["/Plugins/AbC/web/Dir/", "/Plugins/AbC/web/a//B"] {
+            assert_eq!(canonicalize_path(path), None, "{path}");
+        }
+    }
+
+    /// Every path a handler registers is in the case-insensitive index:
+    /// `UNLISTED_ROUTES` names each one outside the contract and
+    /// `PLUGIN_ROUTES`, and each of its rows is registered.
+    #[test]
+    fn every_registered_path_is_matched_ignoring_case() {
+        let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/src/handlers");
+        let mut files: Vec<std::path::PathBuf> = std::fs::read_dir(dir)
+            .expect("handlers dir")
+            .map(|entry| entry.expect("dir entry").path())
+            .collect();
+        files.push(format!("{dir}.rs").into());
+        let mut registered = std::collections::BTreeSet::new();
+        for file in files {
+            let source = std::fs::read_to_string(&file).expect("handler source");
+            for call in source.split(".route(").skip(1) {
+                let literal = call.trim_start().strip_prefix('"').unwrap_or_else(|| {
+                    panic!("{}: a route's path must be a literal", file.display())
+                });
+                registered.insert(literal.split('"').next().unwrap_or_default().to_owned());
+            }
+        }
+        // The registered spelling, with its parameter values as uppercased.
+        let expected = |path: &str| filled(path).replace("AbC-123", "ABC-123");
+        for path in &registered {
+            let found = canonicalize_path(&filled(path).to_ascii_uppercase());
+            // `/web/configurationpage` re-cases to its contract spelling.
+            assert!(
+                registered
+                    .iter()
+                    .any(|other| other.eq_ignore_ascii_case(path)
+                        && found.as_deref() == Some(expected(other).as_str())),
+                "{path} is registered but not matched ignoring case (got {found:?}): \
+                 add it to handlers::UNLISTED_ROUTES"
+            );
+        }
+        for path in crate::handlers::UNLISTED_ROUTES {
+            assert!(
+                registered.contains(*path),
+                "UNLISTED_ROUTES row {path} is not registered by a handler"
+            );
+        }
     }
 
     #[test]
@@ -412,13 +509,11 @@ mod tests {
         None
     }
 
-    /// The router's patterns in registration order, split into segments.
+    /// The router's patterns in table order, split into segments.
     fn route_table() -> Vec<Vec<String>> {
-        let mut seen = std::collections::BTreeSet::new();
-        axum_routes()
+        registered_paths()
             .into_iter()
-            .filter(|(_, path)| seen.insert(path.clone()))
-            .map(|(_, path)| {
+            .map(|path| {
                 path.split('/')
                     .filter(|s| !s.is_empty())
                     .map(ToOwned::to_owned)
@@ -549,7 +644,7 @@ mod tests {
         for (path, expected) in [
             ("/alpha/beta", Some("/Alpha/Beta")),
             ("/alpha/other/Tail", Some("/Alpha/other/Tail")),
-            ("/alpha", Some("/Alpha")),
+            ("/alpha", None),
             ("/Value/gamma", Some("/Value/Gamma")),
             ("/ZETA/", Some("/Zeta")),
             ("/Alpha/Tail", None),
