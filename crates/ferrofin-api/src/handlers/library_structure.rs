@@ -40,6 +40,7 @@ use uuid::Uuid;
 use crate::auth::FirstTimeSetupOrElevated;
 use crate::error::ApiError;
 use crate::extract::{JsonBody, Query};
+use crate::handlers::query_parse::parse_csv_strings;
 use crate::state::AppState;
 
 /// Asks the library monitor to restart so its watch set matches the
@@ -205,16 +206,12 @@ async fn add_virtual_folder(
     // The query `paths` (comma-delimited) override the body's PathInfos, exactly
     // as the C# controller assigns `libraryOptions.PathInfos` when `paths` is
     // non-empty.
-    if let Some(raw) = query.paths.as_deref() {
-        let paths: Vec<MediaPathInfo> = raw
-            .split(',')
-            .map(str::trim)
-            .filter(|p| !p.is_empty())
-            .map(|p| MediaPathInfo { path: p.to_owned() })
+    let paths = parse_csv_strings(query.paths.as_deref());
+    if !paths.is_empty() {
+        options.path_infos = paths
+            .into_iter()
+            .map(|path| MediaPathInfo { path })
             .collect();
-        if !paths.is_empty() {
-            options.path_infos = paths;
-        }
     }
 
     // Scope by the id the add returns, never by `name`: the stored name can

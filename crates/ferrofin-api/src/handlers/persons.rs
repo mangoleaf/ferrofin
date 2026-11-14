@@ -23,7 +23,7 @@ use crate::error::ApiError;
 use crate::extract::{Query, RequiredRouteString, RouteParameter};
 use crate::handlers::by_name::{ByNameItemQuery, additional_dto_options, project_item_rows};
 use crate::handlers::items::{resolve_user_or_api_key, user_uuid};
-use crate::handlers::query_parse::parse_csv_enums_lenient;
+use crate::handlers::query_parse::{parse_csv_enums_lenient, parse_csv_strings};
 use crate::state::AppState;
 
 /// The query parameters honoured by `GET /Persons`.
@@ -100,19 +100,6 @@ struct PersonsQuery {
     enable_user_data: Option<bool>,
 }
 
-/// Splits a comma-delimited query value into trimmed, non-empty items.
-fn comma_list(value: Option<&str>) -> Vec<String> {
-    value
-        .map(|v| {
-            v.split(',')
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .map(str::to_owned)
-                .collect()
-        })
-        .unwrap_or_default()
-}
-
 /// `GET /Persons` — the library's people.
 ///
 /// Port of `PersonsController.GetPersons`.
@@ -144,8 +131,8 @@ async fn get_persons(
         start_index: query.start_index,
         limit: query.limit.unwrap_or(0),
         parent_id: query.parent_id,
-        person_types: comma_list(query.person_types.as_deref()),
-        exclude_person_types: comma_list(query.exclude_person_types.as_deref()),
+        person_types: parse_csv_strings(query.person_types.as_deref()),
+        exclude_person_types: parse_csv_strings(query.exclude_person_types.as_deref()),
         appears_in_item_id: query.appears_in_item_id.unwrap_or_else(Uuid::nil),
         name_contains: query.search_term.clone(),
         name_starts_with: query.name_starts_with.clone(),
