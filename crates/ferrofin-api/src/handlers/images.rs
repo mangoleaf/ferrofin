@@ -1124,7 +1124,9 @@ async fn project_image_infos(
 ) -> Vec<ImageInfo> {
     let mut list = Vec::with_capacity(images.len());
     for image in images {
-        if !allows_multiple_images(image.image_type) && !hidden.contains(&image) {
+        if !ferrofin_traits::library::image_type_allows_multiple(image.image_type)
+            && !hidden.contains(&image)
+        {
             list.push(image_info_dto(image, None, processor, item_path).await);
         }
     }
@@ -1149,14 +1151,6 @@ async fn project_image_infos(
         }
     }
     list
-}
-
-/// Whether an image type may have several instances on one item.
-///
-/// Port of `BaseItem.AllowsMultipleImages`: only Backdrop and Chapter images are
-/// multi-instance in the ported surface.
-fn allows_multiple_images(image_type: ImageType) -> bool {
-    matches!(image_type, ImageType::Backdrop | ImageType::Chapter)
 }
 
 /// Builds one [`ImageInfo`] DTO from an image row and its optional index.

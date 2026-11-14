@@ -78,6 +78,7 @@ use ferrofin_traits::drawing::ImageProcessor;
 use ferrofin_traits::error::ServiceError;
 use ferrofin_traits::library::{
     ContentPermissions, LibraryManager, MediaSourceManager, UserDataManager,
+    image_type_allows_multiple,
 };
 use ferrofin_traits::options::{
     DtoOptions, InternalItemsQuery, ItemImageInfo, live_tv_image_is_internal,
@@ -364,57 +365,6 @@ fn genre_kind(item: &BaseItemEntity) -> BaseItemKind {
         BaseItemKind::MusicGenre
     } else {
         BaseItemKind::Genre
-    }
-}
-
-/// The `ImageType` discriminants that the C# `ItemImageInfo` marks as "allows
-/// multiple" (backdrops/chapters) — the single-image loop skips
-/// these so they are handled by their own limited fetch.
-///
-/// Mirrors `BaseItem.AllowsMultipleImages`.
-fn allows_multiple_images(image_type: ImageType) -> bool {
-    matches!(image_type, ImageType::Backdrop | ImageType::Chapter)
-}
-
-/// Reads an [`ImageType`] from its stored `BaseItemImageInfos.ImageType`
-/// discriminant (0-based, matching the C# `ImageType` declaration order).
-///
-/// A stored row should never carry an out-of-range value; an unknown one maps to
-/// [`ImageType::Primary`] rather than failing the whole projection.
-fn image_type_from_disc(disc: i32) -> ImageType {
-    match disc {
-        1 => ImageType::Art,
-        2 => ImageType::Backdrop,
-        3 => ImageType::Banner,
-        4 => ImageType::Logo,
-        5 => ImageType::Thumb,
-        6 => ImageType::Disc,
-        7 => ImageType::Box,
-        8 => ImageType::Screenshot,
-        9 => ImageType::Menu,
-        10 => ImageType::Chapter,
-        11 => ImageType::BoxRear,
-        12 => ImageType::Profile,
-        _ => ImageType::Primary,
-    }
-}
-
-/// Maps a stored `BaseItemImageInfos` row onto the in-flight [`ItemImageInfo`]
-/// the image processor and tag helpers consume.
-fn to_image_info(
-    row: &BaseItemImageInfoEntity,
-    virtual_paths: &VirtualPathExpander,
-) -> ItemImageInfo {
-    ItemImageInfo {
-        path: virtual_paths.expand(&row.path),
-        image_type: image_type_from_disc(row.image_type),
-        date_modified: row.date_modified.unwrap_or_default(),
-        width: i32::try_from(row.width).unwrap_or(0),
-        height: i32::try_from(row.height).unwrap_or(0),
-        blur_hash: row
-            .blurhash
-            .as_ref()
-            .map(|bytes| String::from_utf8_lossy(bytes).into_owned()),
     }
 }
 
@@ -1488,11 +1438,11 @@ impl FerrofinDtoService {
                 query = query.bind(guid_to_db(*id));
             }
             let rows = query.fetch_all(self.db.pool()).await.map_err(db_err)?;
-            for row in &rows {
+            for row in rows {
                 if let Ok(item_id) = Uuid::parse_str(&row.item_id) {
-                    map.entry(item_id)
-                        .or_default()
-                        .push(to_image_info(row, &self.virtual_paths));
+                    map.entry(item_id).or_default().push(
+                        crate::item_repository::image_info_from_row(row, &self.virtual_paths),
+                    );
                 }
             }
         }
@@ -2095,7 +2045,7 @@ impl FerrofinDtoService {
             let mut image_tags = HashMap::new();
             for image in images
                 .iter()
-                .filter(|i| !allows_multiple_images(i.image_type))
+                .filter(|i| !image_type_allows_multiple(i.image_type))
                 .filter(|i| options.image_limit(i.image_type) > 0)
             {
                 if let Some(tag) = self.tag_and_fill_blur_hash(dto, item_path, image).await {

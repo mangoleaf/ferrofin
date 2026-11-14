@@ -1269,7 +1269,9 @@ pub trait ItemPersistenceService: Send + Sync {
     ///
     /// The default is a no-op (for stub/fake services). The real service keeps
     /// identical rows, updates changed image metadata, inserts new images and
-    /// deletes only images absent from the supplied set.
+    /// deletes only images absent from the supplied set. A stored row is
+    /// matched by its path expanded (`%MetadataPath%`, as every read hands it
+    /// out), and an adopted row so matched keeps its stored form.
     ///
     /// # Errors
     ///
@@ -2498,7 +2500,8 @@ fn _assert_object_safe_media_attachment_repository(_: &dyn MediaAttachmentReposi
 /// [`ItemPersistenceService::scan_stored_links`] reads them.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct StoredItemLinks {
-    /// The item's `BaseItemImageInfos` rows, in type-then-row order.
+    /// The item's `BaseItemImageInfos` rows, in type-then-row order, their
+    /// paths expanded as every image read expands them.
     pub images: Vec<ItemImageInfo>,
     /// The item's `AncestorIds` closure.
     pub ancestors: Vec<Uuid>,
@@ -2764,7 +2767,8 @@ pub struct StoredImageMetadata {
     pub item_id: Uuid,
     /// The row's image type.
     pub image_type: ImageType,
-    /// The image file's path — the identity of the artwork on disk.
+    /// The image file's path — the identity of the artwork on disk —
+    /// expanded as every image read expands it.
     pub path: String,
     /// The stored pixel width (`0` when never probed).
     pub width: i32,
