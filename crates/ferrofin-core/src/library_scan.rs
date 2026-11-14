@@ -4567,6 +4567,7 @@ impl LibraryScanner {
     /// Publish the selected destinations before measuring their image metadata.
     async fn finish_artwork(
         &self,
+        item_id: Uuid,
         row: &BaseItemEntity,
         images: &mut [ItemImageInfo],
         previous: Option<&[ItemImageInfo]>,
@@ -4576,7 +4577,7 @@ impl LibraryScanner {
             .publish_media_artwork(row, images, previous.unwrap_or_default(), dirs)
             .await
             > 0;
-        self.fill_image_metadata(images).await;
+        self.fill_image_metadata(item_id, images).await;
         failed
     }
 
@@ -9495,7 +9496,7 @@ impl LibraryScanner {
                 && let Some(mut cover) = off_runtime(|| self.shared_album_cover(id, primary))
             {
                 adopt_stored_image_metadata(std::slice::from_mut(&mut cover), &cache.stored_images);
-                self.fill_image_metadata(std::slice::from_mut(&mut cover))
+                self.fill_image_metadata(id, std::slice::from_mut(&mut cover))
                     .await;
                 cache.album_covers.insert(id, cover);
             }
@@ -9636,7 +9637,7 @@ impl LibraryScanner {
             return Vec::new();
         };
         adopt_stored_image_metadata(std::slice::from_mut(&mut cover), &cache.stored_images);
-        self.fill_image_metadata(std::slice::from_mut(&mut cover))
+        self.fill_image_metadata(album, std::slice::from_mut(&mut cover))
             .await;
         cache.album_covers.insert(album, cover.clone());
         vec![cover]
@@ -10932,13 +10933,14 @@ impl LibraryScanner {
     /// Fills each image's pixel dimensions + blurhash via the image-processor seam, so the
     /// DTO layer can surface Width/Height and ImageBlurHashes. Dimensions are read once and
     /// reused for the blurhash. Best-effort per image; a no-op when no processor is wired
-    /// (unit tests) or a decode fails (the image stays browsable with 0×0 / no hash).
+    /// (unit tests), and a failure is logged with `item_id`, the item owning the images;
+    /// the image stays browsable with 0×0 / no hash.
     ///
     /// The file read is the expanded path, as upstream's `ItemImageInfo.Path`
     /// is once the row is read (`ExpandVirtualPath`): a kept row an adopted
     /// database stores as `%MetadataPath%/…` keeps that form, and is measured
     /// from the file it names.
-    async fn fill_image_metadata(&self, images: &mut [ItemImageInfo]) {
+    async fn fill_image_metadata(&self, item_id: Uuid, images: &mut [ItemImageInfo]) {
         let Some(processor) = self.image_processor.as_ref() else {
             return;
         };
@@ -10949,15 +10951,9 @@ impl LibraryScanner {
             if image_metadata_is_complete(image) {
                 continue;
             }
-            let path = self.virtual_paths.expand_cow(&image.path);
-            let Ok(dims) = processor.get_image_dimensions(&path).await else {
-                continue;
-            };
-            image.width = dims.width;
-            image.height = dims.height;
-            if let Ok(hash) = processor.get_image_blur_hash_sized(&path, dims).await {
-                image.blur_hash = Some(hash);
-            }
+            let path = self.virtual_paths.expand_cow(&image.path).into_owned();
+            crate::dynamic_images::fill_image_metadata(processor.as_ref(), item_id, &path, image)
+                .await;
         }
     }
 
@@ -12938,7 +12934,7 @@ impl LibraryScanner {
                 // it writes the result back onto its in-memory BaseItem; Ferrofin
                 // reloads image rows from the DB each time, so the DB is where the
                 // answer has to live.)
-                self.fill_image_metadata(&mut infos).await;
+                self.fill_image_metadata(person.id, &mut infos).await;
                 if let Some(primary) = infos.first() {
                     // Added only while the person still has no Primary, by the
                     // write itself: one stored during the download is kept.
@@ -13127,7 +13123,7 @@ impl LibraryScanner {
                 height: 0,
                 blur_hash: None,
             }];
-            self.fill_image_metadata(&mut images).await;
+            self.fill_image_metadata(id, &mut images).await;
             match self.persistence.save_item_images(id, &images).await {
                 Ok(()) => refreshed.push(id),
                 Err(err) => skipped.note(id, &err),
@@ -13382,7 +13378,7 @@ impl LibraryScanner {
         else {
             return;
         };
-        self.fill_image_metadata(std::slice::from_mut(&mut cover))
+        self.fill_image_metadata(album_uuid, std::slice::from_mut(&mut cover))
             .await;
         let mut album_cover = cover.clone();
         if let Some(saver) = &self.image_saver
@@ -13537,7 +13533,7 @@ impl LibraryScanner {
                 adopt_stored_image_metadata(std::slice::from_mut(image), &art_cache.stored_images);
             }
             cut_short |= self
-                .finish_artwork(entity, &mut images, stored, dirs.as_deref())
+                .finish_artwork(item_id, entity, &mut images, stored, dirs.as_deref())
                 .await;
             return (Some(images), cut_short);
         }
@@ -13601,7 +13597,7 @@ impl LibraryScanner {
         }
         adopt_stored_image_metadata(&mut images, &art_cache.stored_images);
         cut_short |= self
-            .finish_artwork(entity, &mut images, stored, dirs.as_deref())
+            .finish_artwork(item_id, entity, &mut images, stored, dirs.as_deref())
             .await;
         for image in &images {
             remember_settled_image(&mut art_cache.stored_images, image);
@@ -14276,7 +14272,13 @@ impl LibraryScanner {
             height: options.height,
             blur_hash: None,
         };
-        crate::dynamic_images::fill_image_metadata(processor.as_ref(), &mut info).await;
+        crate::dynamic_images::fill_image_metadata(
+            processor.as_ref(),
+            cf,
+            &options.output_path,
+            &mut info,
+        )
+        .await;
         // `ProviderManager.SaveImage` replaces the Primary only; the
         // library's other images stay.
         let mut images = match items.get_image_infos(cf).await {
@@ -44938,10 +44940,9 @@ mod tests {
     }
 
     impl PosterFixture {
-        /// The stored Primary image row of the fixture's single movie.
-        async fn primary(&self) -> ferrofin_traits::options::ItemImageInfo {
+        /// The id of the fixture's single movie.
+        async fn movie_id(&self) -> uuid::Uuid {
             use ferrofin_model::data::BaseItemKind;
-            use ferrofin_model::entities::ImageType;
             use ferrofin_traits::options::InternalItemsQuery;
 
             let movies = self
@@ -44953,9 +44954,15 @@ mod tests {
                 })
                 .await
                 .expect("movie rows");
-            let id = uuid::Uuid::parse_str(&movies[0].id).expect("movie id");
+            uuid::Uuid::parse_str(&movies[0].id).expect("movie id")
+        }
+
+        /// The stored Primary image row of the fixture's single movie.
+        async fn primary(&self) -> ferrofin_traits::options::ItemImageInfo {
+            use ferrofin_model::entities::ImageType;
+
             self.repo
-                .get_image_infos(id)
+                .get_image_infos(self.movie_id().await)
                 .await
                 .expect("image rows")
                 .into_iter()
@@ -45076,6 +45083,45 @@ mod tests {
         assert_eq!(rescanned.width, cold.width);
         assert_eq!(rescanned.height, cold.height);
         assert_eq!(rescanned.blur_hash, cold.blur_hash);
+    }
+
+    /// A poster the scan cannot measure is logged (`debug!`) with its movie,
+    /// the image type and the file (gl-384, `LibraryManager.UpdateImagesAsync`),
+    /// and is still stored, 0x0. A current-thread runtime keeps the scan on
+    /// the thread the capturing subscriber is set on.
+    #[tokio::test]
+    async fn an_undecodable_poster_is_logged_with_its_movie_and_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let fx = poster_fixture(tmp.path(), 40, 60).await;
+        std::fs::write(&fx.poster, b"not an image").unwrap();
+
+        let logs = crate::test_support::CapturedLogs::default();
+        {
+            let _guard = tracing::subscriber::set_default(
+                tracing_subscriber::fmt()
+                    .with_writer(logs.clone())
+                    .with_ansi(false)
+                    .with_max_level(tracing::Level::DEBUG)
+                    .finish(),
+            );
+            fx.scanner.scan_all().await.unwrap();
+        }
+
+        let primary = fx.primary().await;
+        assert_eq!((primary.width, primary.height), (0, 0));
+        let text = logs.text();
+        let line = text
+            .lines()
+            .find(|line| line.contains("unable to determine image dimensions"))
+            .unwrap_or_else(|| panic!("the undecodable poster was not logged: {text}"));
+        for expected in [
+            "DEBUG".to_owned(),
+            format!("item_id={}", fx.movie_id().await),
+            "image_type=Primary".to_owned(),
+            format!("path={}", fx.poster.display()),
+        ] {
+            assert!(line.contains(&expected), "{expected} missing: {line}");
+        }
     }
 
     // The same past one stored-row window: the probes a rescan adopts are read
