@@ -39,7 +39,8 @@ use crate::auth::RequireAuth;
 use crate::error::ApiError;
 use crate::extract::{DotnetGuid, Query};
 use crate::handlers::query_parse::{
-    parse_csv_enums_lenient, parse_csv_strings, parse_csv_uuids, parse_order_by, parse_pipe_strings,
+    parse_csv_enums_lenient, parse_csv_i32, parse_csv_strings, parse_csv_uuids, parse_order_by,
+    parse_pipe_strings,
 };
 use crate::state::AppState;
 
@@ -1967,21 +1968,6 @@ async fn get_resume_items(
         Some(result.total_record_count),
         dtos,
     )))
-}
-
-/// Parses a comma-delimited list of `i32` values (Jellyfin's `years`).
-fn parse_csv_i32(raw: Option<&str>) -> Result<Vec<i32>, ApiError> {
-    let Some(raw) = raw else {
-        return Ok(Vec::new());
-    };
-    raw.split(',')
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(|s| {
-            s.parse::<i32>()
-                .map_err(|_| ApiError::BadRequest(format!("invalid integer {s:?}")))
-        })
-        .collect()
 }
 
 /// Whether a parent row is itself a container of the requested kind, so the

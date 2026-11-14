@@ -145,6 +145,33 @@ async fn add_virtual_folder_without_body_uses_query_paths() {
     assert_eq!(folders[0].locations, vec!["/a".to_owned(), "/b".to_owned()]);
 }
 
+/// `paths` binds through `CommaDelimitedCollectionModelBinder`: it drops the
+/// empty pieces, then trims each one, so a whitespace-only piece reaches the
+/// manager as `""`.
+#[tokio::test]
+async fn add_virtual_folder_keeps_a_blank_query_path_as_the_binder_does() {
+    let (state, vf) = working_state();
+    let response = create_router(state)
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/Library/VirtualFolders?name=Music&paths=/a,,%20/b,%20")
+                .header("X-Emby-Token", TOKEN)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    let folders = ferrofin_traits::library::VirtualFolderManager::get_virtual_folders(&*vf)
+        .await
+        .unwrap();
+    assert_eq!(
+        folders[0].locations,
+        vec!["/a".to_owned(), "/b".to_owned(), String::new()]
+    );
+}
+
 #[tokio::test]
 async fn add_virtual_folder_rejects_names_outside_the_upstream_regex() {
     let (state, vf) = working_state();

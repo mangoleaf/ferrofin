@@ -24,7 +24,7 @@ use ferrofin_traits::persistence::ItemWithCounts;
 
 use crate::error::ApiError;
 use crate::handlers::items::require_scope_visible;
-use crate::handlers::query_parse::parse_order_by;
+use crate::handlers::query_parse::{parse_csv_i32, parse_order_by};
 use crate::state::AppState;
 
 /// The query of the by-name **list** endpoints: what `GET /Artists` and
@@ -527,24 +527,6 @@ pub(crate) async fn resolve_parent(
             "Invalid parent id: {parent_id}"
         ))),
     }
-}
-
-/// Parses a comma-delimited list of `i32` values (Jellyfin's `years`). A
-/// malformed token is a `400` — stricter than v12's
-/// `CommaDelimitedCollectionModelBinder`, which logs and drops the token, and
-/// the same strictness as this crate's `parse_csv_uuids`.
-fn parse_csv_i32(raw: Option<&str>) -> Result<Vec<i32>, ApiError> {
-    let Some(raw) = raw else {
-        return Ok(Vec::new());
-    };
-    raw.split(',')
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(|s| {
-            s.parse::<i32>()
-                .map_err(|_| ApiError::BadRequest(format!("invalid integer {s:?}")))
-        })
-        .collect()
 }
 
 /// The single-item query parameters shared by every by-name `{name}` endpoint.
