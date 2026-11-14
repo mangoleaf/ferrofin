@@ -7,7 +7,21 @@
 //! Jellyfin spec, of which the registered route table is a superset (enforced
 //! by `tests/contract_superset.rs`).
 
-use utoipa::OpenApi;
+use utoipa::openapi::extensions::ExtensionsBuilder;
+use utoipa::openapi::{self, InfoBuilder};
+use utoipa::{Modify, OpenApi};
+
+/// The **Jellyfin server version Ferrofin reports** in `SystemInfo`/`PublicSystemInfo`
+/// (`Version`) and as this document's `info.version`: the newest Jellyfin release
+/// Ferrofin adopts (12.4.0, whose database carries 12.2's migration-id set and adopts
+/// as generation `12.2.0`; handlers are ported from `UPSTREAM_TAG`) — NOT Ferrofin's own
+/// release version (`ferrofin_health::RELEASE_VERSION`, sent in User-Agents and backups).
+/// Clients gate on it: jellyfin-web's SDK refuses any server below
+/// `MINIMUM_VERSION = 10.10.0` with an "Update Required" screen, and jellyfin-sdk-kotlin
+/// (Android TV and friends) flags anything below `Jellyfin.minimumVersion = 12.0.0`
+/// as unsupported. The route gate stays pinned to the 10.11.8 contract, which covers
+/// every 12.x operation except `GET /Items/{itemId}/Collections` (added in 12.1).
+pub const JELLYFIN_API_VERSION: &str = "12.4.0";
 
 /// OpenAPI document for `ferrofin-api`'s ported handlers.
 ///
@@ -16,10 +30,7 @@ use utoipa::OpenApi;
 /// endpoints in the published spec.
 #[derive(OpenApi)]
 #[openapi(
-    info(
-        title = "ferrofin-api",
-        description = "Ferrofin media server HTTP API — a Rust port of Jellyfin.Api."
-    ),
+    modifiers(&JellyfinInfo),
     paths(
         crate::handlers::system::get_system_info,
         crate::handlers::system::get_public_system_info,
@@ -103,6 +114,25 @@ use utoipa::OpenApi;
 )]
 pub struct ApiDoc;
 
+/// Upstream's document identity (`AddJellyfinApiSwagger`): title `Jellyfin API`, and
+/// `version` and `x-jellyfin-version` set to the server version, with no other `info`
+/// field. It replaces the `CARGO_PKG_*` values utoipa fills in by default.
+struct JellyfinInfo;
+
+impl Modify for JellyfinInfo {
+    fn modify(&self, doc: &mut openapi::OpenApi) {
+        doc.info = InfoBuilder::new()
+            .title("Jellyfin API")
+            .version(JELLYFIN_API_VERSION)
+            .extensions(Some(
+                ExtensionsBuilder::new()
+                    .add("x-jellyfin-version", JELLYFIN_API_VERSION)
+                    .build(),
+            ))
+            .build();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::ApiDoc;
@@ -111,6 +141,6 @@ mod tests {
     #[test]
     fn api_doc_renders() {
         let json = ApiDoc::openapi().to_pretty_json().unwrap();
-        assert!(json.contains("ferrofin-api"));
+        assert!(json.contains("\"Jellyfin API\""));
     }
 }

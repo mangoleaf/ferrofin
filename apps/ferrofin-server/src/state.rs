@@ -18,6 +18,7 @@ use std::sync::Arc;
 
 use anyhow::Context as _;
 use ferrofin_api::AppState;
+use ferrofin_api::openapi::JELLYFIN_API_VERSION;
 use ferrofin_core::application_host::HostNetworkInfo;
 use ferrofin_core::system_manager::{LifecycleController, SystemHostFacts};
 use ferrofin_core::{
@@ -200,18 +201,6 @@ fn num_cpus_for_analysis() -> usize {
 
 /// The package name reported in system info (`IStartupOptions.PackageName`).
 const PACKAGE_NAME: &str = "ferrofin-server";
-
-/// The **Jellyfin server version Ferrofin reports** in `SystemInfo`/`PublicSystemInfo`
-/// (`Version`): the newest Jellyfin release Ferrofin adopts (12.4.0, whose database
-/// carries 12.2's migration-id set and adopts as generation `12.2.0`; handlers are
-/// ported from `UPSTREAM_TAG`) — NOT Ferrofin's own release version
-/// (`ferrofin_health::RELEASE_VERSION`, sent in User-Agents and backups).
-/// Clients gate on it: jellyfin-web's SDK refuses any server below
-/// `MINIMUM_VERSION = 10.10.0` with an "Update Required" screen, and jellyfin-sdk-kotlin
-/// (Android TV and friends) flags anything below `Jellyfin.minimumVersion = 12.0.0`
-/// as unsupported. The route gate stays pinned to the 10.11.8 contract, which covers
-/// every 12.x operation except `GET /Items/{itemId}/Collections` (added in 12.1).
-const JELLYFIN_API_VERSION: &str = "12.4.0";
 
 /// The assembled application state plus the handles the composition root still
 /// needs after wiring (the concrete host, to flip its startup flag and drive
