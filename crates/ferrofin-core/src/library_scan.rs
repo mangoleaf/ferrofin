@@ -30616,6 +30616,67 @@ mod tests {
         );
     }
 
+    /// An album outside an artist folder takes its artist's ids from the
+    /// artist its album-artist tag names, as Jellyfin 12.2's `GetArtist(name)`
+    /// finds it (PR 18005, `ArtistNameLookupTests`): matched on `CleanName`,
+    /// a folder artist before one known only by name. The folder's
+    /// `Miles-Davis` is the tag's `Miles Davis`, so its id wins over the
+    /// by-name `Miles Davis` row's.
+    #[tokio::test]
+    async fn an_albums_artist_is_matched_on_its_clean_name_folder_first() {
+        use crate::item_type_lookup::stored_type_name;
+        use ferrofin_traits::persistence::ItemPersistenceService as _;
+        let fx = MusicFixture::new(false, false, None).await;
+        let (folder, artist) = (Uuid::new_v4(), Uuid::new_v4());
+        fx.persistence
+            .save_items(&[
+                BaseItemEntity {
+                    id: ferrofin_db::store::guid_to_db(folder),
+                    type_: stored_type_name(BaseItemKind::Folder).unwrap().to_owned(),
+                    name: Some("Music".into()),
+                    is_folder: true,
+                    ..Default::default()
+                },
+                BaseItemEntity {
+                    id: ferrofin_db::store::guid_to_db(artist),
+                    type_: stored_type_name(BaseItemKind::MusicArtist)
+                        .unwrap()
+                        .to_owned(),
+                    name: Some("Miles-Davis".into()),
+                    parent_id: Some(ferrofin_db::store::guid_to_db(folder)),
+                    is_folder: true,
+                    ..Default::default()
+                },
+            ])
+            .await
+            .expect("folder artist");
+        fx.persistence
+            .save_provider_id(artist, "MusicBrainzArtist", MB_ARTIST)
+            .await
+            .expect("folder artist id");
+        fx.persistence
+            .save_provider_id(
+                fx.artist_id,
+                "MusicBrainzArtist",
+                "44444444-4444-4444-8444-444444444444",
+            )
+            .await
+            .expect("by-name artist id");
+        let (base, hits) = spawn_music_stub();
+        fx.scanner(&base)
+            .music_pass_for_test(
+                &[(fx.album_id, super::music::MusicKind::Album)],
+                super::FetcherPolicy::default(),
+                true,
+            )
+            .await;
+        let lines = hits.search_lines();
+        assert!(
+            lines.len() == 1 && lines[0].contains(MB_ARTIST) && !lines[0].contains("44444444"),
+            "one album search, naming the folder artist's id: {lines:?}"
+        );
+    }
+
     /// Without tags and without a stored id, the album is searched once by
     /// name and album artist and dated by its release group; the artist
     /// searched by name. A stored match is then never searched again: the
@@ -30766,7 +30827,7 @@ mod tests {
         );
     }
 
-    /// `GetArtist(name)` → `CreateItemByName` (`LibraryManager.cs:1348-1362`)
+    /// `GetArtist(name)` → `CreateItemByName` (`LibraryManager.cs:1348-1361`)
     /// orders a folder artist before one known only by name: the album's
     /// search takes the folder artist's MusicBrainz id, though a by-name
     /// artist of the same name (without one) exists.

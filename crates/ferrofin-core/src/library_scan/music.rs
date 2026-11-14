@@ -1305,8 +1305,9 @@ impl LibraryScanner {
     /// `:142-147`): the first `MusicArtist` among the album's parents,
     /// walked up from its own; else the artist named by the album's first
     /// album artist — `LibraryManager.GetArtist(name)` → `CreateItemByName`
-    /// (`LibraryManager.cs:1348-1362`): the `MusicArtist` rows of that raw
-    /// name (`UseRawName`), a folder artist before one known only by name
+    /// (`LibraryManager.cs:1348-1361`): the `MusicArtist` rows of that name's
+    /// `CleanName` (12.2 dropped `UseRawName`, PR 18005), a folder artist
+    /// before one known only by name
     /// (`OrderBy(i => i.IsAccessedByName ? 1 : 0)`). A parent that cannot be
     /// read ends the walk.
     ///
@@ -1348,7 +1349,6 @@ impl LibraryScanner {
                 .get_item_list(&InternalItemsQuery {
                     include_item_types: vec![BaseItemKind::MusicArtist],
                     name: Some(name),
-                    use_raw_name: Some(true),
                     ..InternalItemsQuery::default()
                 })
                 .await?;
