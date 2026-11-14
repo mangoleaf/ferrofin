@@ -2061,15 +2061,26 @@ impl VirtualFolderManager for FerrofinVirtualFolderManager {
         let _snapshot = self.invalidate_on_drop();
         let folder_path = self.require_folder(virtual_folder_name).await?;
         let existing = self.load_options(&folder_path).await;
+        let new_paths = || {
+            options
+                .path_infos
+                .iter()
+                .filter(|p| !existing.path_infos.iter().any(|i| i.path == p.path))
+        };
+
+        // Upstream's CreateShortcut throws on an empty target and
+        // RemoveContentTypeOverrides on a blank path, so the options are never
+        // saved; refusing before the loop also keeps the earlier new paths'
+        // shortcuts unwritten.
+        if new_paths().any(|p| p.path.trim().is_empty()) {
+            return Err(ServiceError::invalid_input("path must not be empty"));
+        }
 
         // Create a shortcut for any newly-referenced media path (C# loops the
         // request's PathInfos and `CreateShortcut`s the ones not already present).
-        for path_info in &options.path_infos {
-            let already = existing.path_infos.iter().any(|i| i.path == path_info.path);
-            if !already {
-                self.create_shortcut(&folder_path, path_info).await?;
-                self.remove_content_type_overrides(&path_info.path).await?;
-            }
+        for path_info in new_paths() {
+            self.create_shortcut(&folder_path, path_info).await?;
+            self.remove_content_type_overrides(&path_info.path).await?;
         }
 
         Self::save_options(&folder_path, options).await?;
@@ -4679,6 +4690,62 @@ mod tests {
         expected.sort();
         assert_eq!(locs, expected);
         assert!(folder.library_options.unwrap().enable_realtime_monitor);
+    }
+
+    /// A new path that is empty or blank is refused, and nothing is written:
+    /// upstream's `CreateShortcut` throws on an empty target and
+    /// `RemoveContentTypeOverrides` on a blank path, so its options are never
+    /// saved (gl-1206). A blank path the stored options already hold is skipped
+    /// as upstream skips it, so such a library can still be saved.
+    #[tokio::test]
+    async fn update_library_options_refuses_a_blank_new_path_and_writes_nothing() {
+        let (tmp, mgr) = manager();
+        let m1 = media_dir(&tmp, "one");
+        let m2 = media_dir(&tmp, "two");
+        mgr.add_virtual_folder("Lib", None, &opts_with_paths(std::slice::from_ref(&m1)))
+            .await
+            .unwrap();
+        let folder = tmp.path().join("default").join("Lib");
+        let before = mgr.get_virtual_folders().await.unwrap();
+        let options_before = std::fs::read(folder.join(OPTIONS_FILE)).unwrap();
+        for blank in ["", "  "] {
+            let mut new_opts = opts_with_paths(&[m1.clone(), m2.clone(), blank.to_owned()]);
+            new_opts.enable_realtime_monitor = !new_opts.enable_realtime_monitor;
+            let error = mgr
+                .update_library_options("Lib", &new_opts)
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(error, ServiceError::InvalidInput(_)),
+                "{blank:?}: {error:?}"
+            );
+            assert_eq!(
+                mgr.get_virtual_folders().await.unwrap(),
+                before,
+                "{blank:?}"
+            );
+            assert_eq!(
+                std::fs::read(folder.join(OPTIONS_FILE)).unwrap(),
+                options_before,
+                "{blank:?}"
+            );
+            let mut files: Vec<_> = std::fs::read_dir(&folder)
+                .unwrap()
+                .map(|e| e.unwrap().file_name().into_string().unwrap())
+                .collect();
+            files.sort();
+            assert_eq!(files, ["one.mblink", OPTIONS_FILE], "{blank:?}");
+        }
+
+        // A blank path already stored is not new, so it neither fails nor gets a shortcut.
+        let stored = opts_with_paths(&[m1.clone(), String::new()]);
+        std::fs::write(
+            folder.join(OPTIONS_FILE),
+            serde_json::to_vec(&stored).unwrap(),
+        )
+        .unwrap();
+        mgr.update_library_options("Lib", &stored).await.unwrap();
+        assert_eq!(std::fs::read_dir(&folder).unwrap().count(), 2);
     }
 
     #[tokio::test]
