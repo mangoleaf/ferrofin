@@ -49,7 +49,7 @@ async fn get_genres(
     let query = query.genres();
     let user = resolve_user_or_api_key(&state, &auth, query.user_id).await?;
     let parent = query.parent(&state, &auth, user.as_deref()).await?;
-    let internal = query.base_query(user.clone())?;
+    let internal = query.base_query(user.clone(), parent.as_ref())?;
     let result = if is_music_collection_folder(parent.as_ref()) {
         state.library.get_music_genres(&internal).await?
     } else {

@@ -32,7 +32,7 @@ use uuid::Uuid;
 use crate::auth::RequireAuth;
 use crate::error::ApiError;
 use crate::extract::Query;
-use crate::handlers::by_name::resolve_parent;
+use crate::handlers::by_name::{is_folder, resolve_parent};
 use crate::handlers::items::resolve_user_opt;
 use crate::handlers::query_parse::parse_csv_enums_lenient;
 use crate::state::AppState;
@@ -132,19 +132,20 @@ async fn get_query_filters_legacy(
         parse_csv_enums_lenient(query.include_item_types.as_deref());
     let media_types: Vec<MediaType> = parse_csv_enums_lenient(query.media_types.as_deref());
 
-    // v12.2 `FilterController.cs:66-77`: a lone Trailer/Program type set skips
+    // v12.4 `FilterController.cs:66-77`: a lone Trailer/Program type set skips
     // `GetParentItem`, which leaves the item null, and null `is not Folder`:
     // empty filters. Otherwise a `parentId` naming no item is `GetParentItem`'s
-    // 400, and the parent's subtree is the scope (upstream answers empty
-    // filters for a parent that is no `Folder`; the subtree of one is empty
-    // unless rows hang below it, the same non-folder gap gl-971 records for
-    // the by-name lists). No `parentId` keeps the user's whole
+    // 400, a parent that is no `Folder` answers empty filters too, and a
+    // folder's subtree is the scope. No `parentId` keeps the user's whole
     // library (the root's empty answer upstream is a Jellyfin bug not ported,
     // owner decision gl-862).
     if is_trailer_or_program(&include_item_types) {
         return Ok(Json(QueryFiltersLegacy::default()));
     }
-    resolve_parent(&state, &auth, query.parent_id, user.as_deref()).await?;
+    let parent = resolve_parent(&state, &auth, query.parent_id, user.as_deref()).await?;
+    if parent.as_ref().is_some_and(|row| !is_folder(row)) {
+        return Ok(Json(QueryFiltersLegacy::default()));
+    }
     let ancestor_ids: Vec<Uuid> = query.parent_id.into_iter().collect();
 
     let internal = InternalItemsQuery {

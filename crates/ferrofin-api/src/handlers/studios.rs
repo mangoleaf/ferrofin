@@ -41,8 +41,8 @@ async fn get_studios(
     let query = query.studios()?;
     let user = resolve_user_or_api_key(&state, &auth, query.user_id).await?;
     // `GetParentItem`: an id naming no item is a 400.
-    query.parent(&state, &auth, user.as_deref()).await?;
-    let internal = query.base_query(user.clone())?;
+    let parent = query.parent(&state, &auth, user.as_deref()).await?;
+    let internal = query.base_query(user.clone(), parent.as_ref())?;
     let result = state.library.get_studios(&internal).await?;
     let options = query.dto_options(query.enable_user_data);
     let projected = project_query_result(

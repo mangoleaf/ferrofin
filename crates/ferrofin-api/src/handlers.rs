@@ -4591,9 +4591,6 @@ const BY_NAME_DIVERGENCES_ARTISTS: &[&str] = &[
     "`studios` names resolve without writing: v12's LibraryManager.GetStudio CREATES a row \
      for an unknown name on this GET; Ferrofin's lookup creates none and gives the name a \
      no-match id (by_name::resolve_by_name_ids), the same empty answer.",
-    "A `parentId` that is not a folder: v12 puts it in ItemIds (the value is carried by \
-     that one item); Ferrofin scopes by AncestorIds in every case, so a non-folder parent \
-     answers with nothing. Fix path: gl-971.",
     NO_USER_USER_DATA_FILTER_DIVERGENCE,
     "A `userId` naming no user: v12's GetUserById returns null and the query runs with no \
      user — unscoped, every library on the server; Ferrofin answers 404. Jellyfin bug not \
@@ -4626,9 +4623,6 @@ const BY_NAME_DIVERGENCES_GENRES_STUDIOS: &[&str] = &[
     "A `userId` naming no user: v12's GetUserById returns null and the query runs with no \
      user — unscoped, every library on the server; Ferrofin answers 404. Jellyfin bug not \
      ported.",
-    "A `parentId` that is not a folder: v12 puts it in ItemIds; Ferrofin scopes by \
-     AncestorIds in every case, so a non-folder parent answers with nothing. Fix path: \
-     gl-971.",
     NO_USER_USER_DATA_FILTER_DIVERGENCE,
     "`searchTerm` is not v12.2 TranslateQuery's search branch: the wildcard branch is \
      chosen on, and matches CleanName with, the raw lower-cased term rather than the \

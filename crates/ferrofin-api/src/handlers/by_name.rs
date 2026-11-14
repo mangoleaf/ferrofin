@@ -16,6 +16,7 @@
 
 use std::sync::Arc;
 
+use ferrofin_db::entities::base_items::BaseItemEntity;
 use ferrofin_db::entities::users::UserEntity;
 use ferrofin_model::dto::BaseItemDto;
 use ferrofin_model::querying::QueryResult;
@@ -343,9 +344,10 @@ impl ByNameListQuery {
 
     /// Builds the [`InternalItemsQuery`](ferrofin_traits::options::InternalItemsQuery)
     /// the manager runs, translating the shared name/paging filters and the
-    /// resolved user. The `parent_id` localizes the browse the way Jellyfin's
-    /// `AncestorIds`/`ItemIds` split does (folders scope by ancestor, non-folders
-    /// by item); here it always scopes by ancestor, the common case.
+    /// resolved user. `parent` is the row `parentId` names ([`Self::parent`]):
+    /// v12.4's controllers put a `Folder` in `AncestorIds` and any other item in
+    /// `ItemIds` (`GenresController.cs:128-138`, and its by-name siblings), so a
+    /// non-folder parent lists the values it carries itself.
     ///
     /// # Errors
     ///
@@ -354,10 +356,15 @@ impl ByNameListQuery {
     pub(crate) fn base_query(
         &self,
         user: Option<Arc<UserEntity>>,
+        parent: Option<&BaseItemEntity>,
     ) -> Result<ferrofin_traits::options::InternalItemsQuery, ApiError> {
-        let mut ancestor_ids = Vec::new();
-        if let Some(parent) = self.parent_id {
-            ancestor_ids.push(parent);
+        let (mut ancestor_ids, mut item_ids) = (Vec::new(), Vec::new());
+        if let Some(parent_id) = self.parent_id {
+            if parent.is_none_or(is_folder) {
+                ancestor_ids.push(parent_id);
+            } else {
+                item_ids.push(parent_id);
+            }
         }
         // C# `query.ApplyFilters(filters)` runs after the explicit `isFavorite`
         // is set, so a `filters ∋ IsFavorite` wins over `isFavorite=false`
@@ -418,6 +425,7 @@ impl ByNameListQuery {
             years,
             studio_ids,
             ancestor_ids,
+            item_ids,
             enable_total_record_count: self.enable_total_record_count.unwrap_or(true),
             ..ferrofin_traits::options::InternalItemsQuery::default()
         };
@@ -437,7 +445,7 @@ impl ByNameListQuery {
         state: &AppState,
         auth: &AuthorizationInfo,
         user: Option<&UserEntity>,
-    ) -> Result<Option<ferrofin_db::entities::base_items::BaseItemEntity>, ApiError> {
+    ) -> Result<Option<BaseItemEntity>, ApiError> {
         resolve_parent(state, auth, self.parent_id, user).await
     }
 
@@ -455,8 +463,9 @@ impl ByNameListQuery {
         &self,
         state: &AppState,
         user: Option<Arc<UserEntity>>,
+        parent: Option<&BaseItemEntity>,
     ) -> Result<ferrofin_traits::options::InternalItemsQuery, ApiError> {
-        let mut query = self.base_query(user)?;
+        let mut query = self.base_query(user, parent)?;
         if let Some(ids) = resolve_by_name_ids(
             state,
             ferrofin_model::data::BaseItemKind::Studio,
@@ -494,6 +503,15 @@ impl ByNameListQuery {
         }
         fields
     }
+}
+
+/// C# `item is Folder`: the stored `IsFolder` (`BaseItem.IsFolder`, `true` on
+/// every `Folder`), except on a by-name `MusicArtist`, a `Folder` whose
+/// `IsFolder` override answers `false` (`MusicArtist.cs:33`).
+pub(crate) fn is_folder(item: &BaseItemEntity) -> bool {
+    item.is_folder
+        || ferrofin_model::data::BaseItemKind::from_stored_type_name(&item.type_)
+            == Some(ferrofin_model::data::BaseItemKind::MusicArtist)
 }
 
 /// v12.2 `LibraryManager.GetParentItem` (`LibraryManager.cs:3276-3289`) for a
@@ -988,7 +1006,7 @@ mod tests {
         assert!(!plain.should_include_item_types());
         assert!(
             !plain
-                .base_query(None)
+                .base_query(None, None)
                 .expect("query")
                 .dto_options
                 .contains_field(ItemFields::ItemCounts)
@@ -1000,7 +1018,7 @@ mod tests {
         };
         assert!(typed.should_include_item_types());
         let fields = typed
-            .base_query(None)
+            .base_query(None, None)
             .expect("query")
             .dto_options
             .fields
@@ -1037,7 +1055,7 @@ mod tests {
             studio_ids: Some("00000000000000000000000000000002".to_owned()),
             ..ByNameListQuery::default()
         };
-        let internal = query.base_query(None).expect("query");
+        let internal = query.base_query(None, None).expect("query");
         assert_eq!(internal.is_played, Some(true));
         assert_eq!(
             internal.is_favorite,
@@ -1056,12 +1074,12 @@ mod tests {
             filters: Some("IsPlayed,IsUnplayed".to_owned()),
             ..ByNameListQuery::default()
         };
-        assert!(contradictory.base_query(None).is_err());
+        assert!(contradictory.base_query(None, None).is_err());
         let malformed = ByNameListQuery {
             genre_ids: Some("not-a-guid".to_owned()),
             ..ByNameListQuery::default()
         };
-        assert!(malformed.base_query(None).is_err());
+        assert!(malformed.base_query(None, None).is_err());
     }
 
     #[test]
