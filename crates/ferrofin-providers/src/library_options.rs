@@ -9,11 +9,11 @@
 //!
 //! The registry reflects what is actually compiled into this build: the local
 //! Kodi/XBMC **Nfo** reader/saver and **Local Images** provider are always
-//! present; **The Open Movie Database** (OMDb) and **IntroSkipper** segments are
-//! always compiled (shared API keys are supplied where required);
-//! **TheMovieDb** and **Open Subtitles** appear only when their crate features
-//! are enabled. Nothing here is a placeholder — a provider is listed iff its
-//! code is in the binary.
+//! present, and every remote provider (**TheMovieDb**, **The Open Movie
+//! Database**, **Open Subtitles**, …) and the **IntroSkipper** segments are
+//! always compiled (shared API keys are supplied where required) and gated per
+//! library at runtime. Nothing here is a placeholder — a provider is listed iff
+//! its code is in the binary.
 
 use ferrofin_model::configuration::{
     LibraryOptionInfoDto, LibraryOptionsResultDto, LibraryTypeOptionsDto, MetadataPlugin,
@@ -460,7 +460,8 @@ struct Provider {
     /// Item types the provider applies to; empty means every type.
     types: &'static [&'static str],
     default_enabled: bool,
-    /// Whether this provider's code is compiled into the build.
+    /// Whether this provider's code is compiled into the build. No provider
+    /// has a cargo feature, so every row is `true` today.
     compiled: bool,
     /// The image types this provider can supply for an item type — the port of
     /// each provider's `GetSupportedImages(item)`. `None` for providers that
@@ -595,7 +596,7 @@ fn default_enabled_for(
     }
 }
 
-/// The compiled-in provider registry (features resolved for this build).
+/// The compiled-in provider registry.
 fn providers() -> Vec<Provider> {
     let mut provs = local_providers();
     provs.extend(remote_providers());
@@ -621,6 +622,17 @@ fn local_providers() -> Vec<Provider> {
         compiled: true,
         images: NO_IMAGES,
     }];
+    // `BoxSetXmlProvider` and `BoxSetXmlSaver` (`XmlProviderUtils.Name`):
+    // `GetPluginSummary<BoxSet>` lists both, so a Collections library's
+    // options offer the saver its `MetadataSavers` list must name.
+    providers.push(Provider {
+        name: crate::box_set_xml::SAVER_NAME,
+        caps: &[Cap::LocalMetadata, Cap::MetadataSaver],
+        types: &["BoxSet"],
+        default_enabled: true,
+        compiled: true,
+        images: NO_IMAGES,
+    });
     providers.extend(
         [
             fetcher_names::COMIC,
@@ -671,7 +683,7 @@ fn metadata_providers() -> Vec<Provider> {
     vec![
         Provider {
             // Always wired by the composition root (its client is created
-            // unconditionally); the `tmdb` cargo feature gates nothing.
+            // unconditionally).
             name: "TheMovieDb",
             caps: &[Cap::MetadataFetcher, Cap::ImageFetcher],
             types: &["Movie", "Series", "Season", "Episode", "Person", "BoxSet"],
@@ -776,7 +788,7 @@ fn extractor_and_local_providers() -> Vec<Provider> {
             caps: &[Cap::Subtitle],
             types: &["Movie", "Episode"],
             default_enabled: true,
-            compiled: cfg!(feature = "opensubtitles"),
+            compiled: true,
             images: NO_IMAGES,
         },
         Provider {
@@ -1734,7 +1746,7 @@ mod tests {
     }
 
     #[test]
-    fn tmdb_listed_for_series_and_opensubtitles_gated_by_feature() {
+    fn tmdb_listed_for_series_and_opensubtitles_always_listed() {
         let info = library_options_info(
             &["Series".to_owned(), "Episode".to_owned()],
             false,
@@ -1749,12 +1761,47 @@ mod tests {
                 .iter()
                 .any(|o| o.name.as_deref() == Some("TheMovieDb"))
         );
-        // Open Subtitles is genuinely module-gated by its crate feature.
-        let has_os = info
+        // Open Subtitles is always compiled in, like every remote provider.
+        assert!(
+            info.subtitle_fetchers
+                .iter()
+                .any(|o| o.name.as_deref() == Some("Open Subtitles"))
+        );
+    }
+
+    /// jellyfin-web saves the advertised name in a library's
+    /// `DisabledSubtitleFetchers` and `SubtitleFetcherOrder`, which the
+    /// subtitle manager compares with the provider's `name()`.
+    #[test]
+    fn advertised_subtitle_fetcher_is_the_provider_name() {
+        let info = library_options_info(&["Movie".to_owned()], false, &[], &[]);
+        let names: Vec<_> = info
             .subtitle_fetchers
             .iter()
-            .any(|o| o.name.as_deref() == Some("Open Subtitles"));
-        assert_eq!(has_os, cfg!(feature = "opensubtitles"));
+            .filter_map(|o| o.name.as_deref())
+            .collect();
+        assert!(
+            names.contains(&crate::opensubtitles::PLUGIN_NAME),
+            "{names:?}"
+        );
+    }
+
+    /// jellyfin-web saves the advertised name in a library's
+    /// `DisabledSubtitleFetchers` and `SubtitleFetcherOrder`, which the
+    /// subtitle manager compares with the provider's `name()`.
+    #[cfg(feature = "opensubtitles")]
+    #[test]
+    fn advertised_subtitle_fetcher_is_the_provider_name() {
+        let info = library_options_info(&["Movie".to_owned()], false, &[], &[]);
+        let names: Vec<_> = info
+            .subtitle_fetchers
+            .iter()
+            .filter_map(|o| o.name.as_deref())
+            .collect();
+        assert!(
+            names.contains(&crate::opensubtitles::PLUGIN_NAME),
+            "{names:?}"
+        );
     }
 
     /// `SupportedImageTypes` is the union of the compiled image providers'

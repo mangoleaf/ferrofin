@@ -20,6 +20,7 @@ use ferrofin_traits::library::LibraryManager;
 use ferrofin_traits::media_segments::MediaSegmentManager;
 use ferrofin_traits::options::InternalItemsQuery;
 use ferrofin_util::file_helper::FileStamp;
+use ferrofin_util::ticks::TICKS_PER_SECOND_F64;
 
 use crate::bindings::types::{HttpRequest, HttpResponse, ItemQuery, ItemSummary, MediaSegment};
 
@@ -579,7 +580,7 @@ pub(crate) fn summarize(
     ItemSummary {
         id: Uuid::parse_str(&e.id).map_or_else(|_| e.id.clone(), |u| u.to_string()),
         name: e.name.clone().unwrap_or_default(),
-        kind: ferrofin_core::item_type_lookup::kind_from_type_name(&e.type_)
+        kind: ferrofin_model::data::BaseItemKind::from_stored_type_name(&e.type_)
             .map_or_else(|| e.type_.clone(), |k| format!("{k:?}")),
         path: e.path.clone(),
         parent_id: e
@@ -785,7 +786,7 @@ fn write_media_segments_using_provider(
                 return Ok(SegmentWriteOutcome::PolicySkipped);
             }
             Some(std::sync::Arc::new(
-                ferrofin_core::CachedMediaSegmentProvider::new(
+                ferrofin_providers::cached_media_segment_provider::CachedMediaSegmentProvider::new(
                     provider_name.to_owned(),
                     id,
                     std::sync::Arc::clone(&cx.plugins),
@@ -834,8 +835,6 @@ const AUDIO_WINDOW_MAX_SECS: f64 = 60.0;
 const FRAMES_PER_CALL_MAX: usize = 16;
 /// Longest output edge for a sampled frame, in pixels.
 const FRAME_DIMENSION_MAX: u32 = 320;
-/// Ticks per second (Jellyfin's 100 ns unit).
-const TICKS_PER_SEC: f64 = 10_000_000.0;
 
 /// Resolves a guest-named library item to its filesystem path — the ONLY
 /// way media bytes are ever addressed (a guest never supplies paths).
@@ -920,7 +919,7 @@ pub fn extract_audio(
     memory_limit_bytes: usize,
     window: &crate::bindings::types::AudioWindow,
 ) -> Result<crate::bindings::types::AudioChunk, String> {
-    let duration_secs = window.duration_ticks as f64 / TICKS_PER_SEC;
+    let duration_secs = window.duration_ticks as f64 / TICKS_PER_SECOND_F64;
     if !(0.0..=AUDIO_WINDOW_MAX_SECS).contains(&duration_secs) || duration_secs == 0.0 {
         return Err(format!(
             "audio window must be 0..{AUDIO_WINDOW_MAX_SECS} seconds (got {duration_secs:.1})"
@@ -941,7 +940,7 @@ pub fn extract_audio(
         ));
     }
     let path = resolve_media_path(cx, deadline, &window.item_id)?;
-    let start_secs = (window.start_ticks.max(0)) as f64 / TICKS_PER_SEC;
+    let start_secs = (window.start_ticks.max(0)) as f64 / TICKS_PER_SECOND_F64;
     let samples = block_on_until(cx, deadline, async {
         let _permit = cx.analysis.acquire().await;
         cx.extractor
@@ -986,7 +985,7 @@ pub fn extract_frames(
     let timestamps: Vec<f64> = request
         .timestamps_ticks
         .iter()
-        .map(|t| (*t).max(0) as f64 / TICKS_PER_SEC)
+        .map(|t| (*t).max(0) as f64 / TICKS_PER_SECOND_F64)
         .collect();
     let frames = block_on_until(cx, deadline, async {
         let _permit = cx.analysis.acquire().await;
@@ -998,7 +997,7 @@ pub fn extract_frames(
     Ok(frames
         .into_iter()
         .map(|f| crate::bindings::types::VideoFrame {
-            ticks: (f.seconds * TICKS_PER_SEC) as i64,
+            ticks: (f.seconds * TICKS_PER_SECOND_F64) as i64,
             width: f.width,
             height: f.height,
             format: if f.jpeg {

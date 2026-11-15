@@ -2977,6 +2977,31 @@ async fn a_known_user_is_refused_what_it_cannot_open_on_every_stream_route() {
     }
 }
 
+/// A value outside its `[RegularExpression]` pattern is the model-state `400`
+/// before the item is looked up, as upstream's filter answers it before the
+/// action: the same for an item the user may not open as for one it may.
+#[tokio::test]
+async fn a_pattern_failure_comes_before_the_item_check_on_every_stream_route() {
+    let f = fixture().await;
+    for id in [&f.hidden, &f.allowed] {
+        for uri in [
+            format!("/Videos/{id}/stream?static=false&level=abc"),
+            format!("/Videos/{id}/stream.a%24b"),
+            format!("/Audio/{id}/stream?subtitleCodec=a%24b"),
+            format!("/Audio/{id}/stream.mp3?audioCodec=a%24b"),
+            format!("/Audio/{id}/universal?transcodingContainer=a%24b"),
+            format!("/Videos/{id}/master.m3u8?MediaSourceId={id}&videoCodec=a%24b"),
+            format!("/Audio/{id}/main.m3u8?MediaSourceId={id}&segmentContainer=a%24b"),
+            format!("/Videos/{id}/hls1/main/0.a%24b?MediaSourceId={id}&{SEGMENT_QUERY}"),
+        ] {
+            let (status, body) = call(&f.router, "GET", &uri, Some(&f.viewer), None).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{uri}: {body}");
+            let errors = body["errors"].as_object().map(serde_json::Map::len);
+            assert_eq!(errors, Some(1), "{uri}: {body}");
+        }
+    }
+}
+
 /// The owner's boundary stops at a known user: no credential, an API key, and a
 /// token that names nobody read these routes as they did (gl-1090). A token in
 /// a form the server does not read names nobody either: `api_key` counts only

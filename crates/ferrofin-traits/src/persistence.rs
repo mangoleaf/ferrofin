@@ -1048,6 +1048,29 @@ pub trait ItemPersistenceService: Send + Sync {
         Ok(())
     }
 
+    /// Joins the members a box set's `collection.xml` names to its links, as
+    /// `BoxSetMetadataService.MergeData` merges a box set outside the data
+    /// directory and the save writes them: the file's entries first, in file
+    /// order, each resolved as a playlist entry is ([`PlaylistMember`]: its
+    /// path, else its id) and dropped when it names no stored item, then the
+    /// links already stored that the file does not name, each child once, as
+    /// manual links. Returns whether the links changed.
+    ///
+    /// The default is a no-op (for stub/fake services).
+    ///
+    /// # Errors
+    ///
+    /// [`ServiceError::Backend`] on a storage failure; nothing is written
+    /// then.
+    async fn merge_box_set_members(
+        &self,
+        box_set: Uuid,
+        members: &[PlaylistMember],
+    ) -> Result<bool, ServiceError> {
+        let _ = (box_set, members);
+        Ok(false)
+    }
+
     /// Copies each owner video's metadata onto the videos it owns, as a save
     /// (or refresh) of the owner does upstream, and returns how many owned
     /// rows were written.
@@ -1265,7 +1288,9 @@ pub trait ItemPersistenceService: Send + Sync {
     ///
     /// The default is a no-op (for stub/fake services). The real service keeps
     /// identical rows, updates changed image metadata, inserts new images and
-    /// deletes only images absent from the supplied set.
+    /// deletes only images absent from the supplied set. A stored row is
+    /// matched by its path expanded (`%MetadataPath%`, as every read hands it
+    /// out), and an adopted row so matched keeps its stored form.
     ///
     /// # Errors
     ///
@@ -2499,7 +2524,8 @@ fn _assert_object_safe_media_attachment_repository(_: &dyn MediaAttachmentReposi
 /// [`ItemPersistenceService::scan_stored_links`] reads them.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct StoredItemLinks {
-    /// The item's `BaseItemImageInfos` rows, in type-then-row order.
+    /// The item's `BaseItemImageInfos` rows, in type-then-row order, their
+    /// paths expanded as every image read expands them.
     pub images: Vec<ItemImageInfo>,
     /// The item's `AncestorIds` closure.
     pub ancestors: Vec<Uuid>,
@@ -2765,7 +2791,8 @@ pub struct StoredImageMetadata {
     pub item_id: Uuid,
     /// The row's image type.
     pub image_type: ImageType,
-    /// The image file's path — the identity of the artwork on disk.
+    /// The image file's path — the identity of the artwork on disk —
+    /// expanded as every image read expands it.
     pub path: String,
     /// The stored pixel width (`0` when never probed).
     pub width: i32,

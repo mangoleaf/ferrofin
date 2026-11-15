@@ -701,13 +701,89 @@ where
 pub(crate) fn blank_route_values<'a>(
     values: impl IntoIterator<Item = (&'a str, &'a str)>,
 ) -> Option<Response> {
-    ProblemDetails::members_validation(
+    validation_failure(
         values
             .into_iter()
-            .filter(|(_, value)| value.trim().is_empty())
-            .map(|(name, _)| (name.to_owned(), format!("The {name} field is required."))),
+            .filter_map(|(name, value)| blank_complaint(name, value)),
     )
-    .map(IntoResponse::into_response)
+}
+
+/// `[Required]`'s `(name, complaint)` about a blank route value, for a
+/// handler that files it beside other complaints; `None` when it has text.
+pub(crate) fn blank_complaint(name: &str, value: &str) -> Option<(String, String)> {
+    value
+        .trim()
+        .is_empty()
+        .then(|| (name.to_owned(), format!("The {name} field is required.")))
+}
+
+/// The model-state `400` naming every `(name, complaint)` in one body, as the
+/// filter reports every failing parameter; `None` when there are none.
+pub(crate) fn validation_failure(
+    complaints: impl IntoIterator<Item = (String, String)>,
+) -> Option<Response> {
+    ProblemDetails::members_validation(complaints).map(IntoResponse::into_response)
+}
+
+/// A `[RegularExpression]` pattern the stream routes bind a parameter with.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum StreamPattern {
+    /// `EncodingHelper.ContainerValidationRegexStr`, on the containers and codecs.
+    Container,
+    /// `EncodingHelper.LevelValidationRegexStr`, on `level`.
+    Level,
+}
+
+impl StreamPattern {
+    /// The pattern, verbatim as upstream declares it and ASP.NET quotes it.
+    const fn regex(self) -> &'static str {
+        match self {
+            Self::Container => r"^[a-zA-Z0-9\-\._,|]{0,40}$",
+            Self::Level => r"-?[0-9]+(?:\.[0-9]+)?",
+        }
+    }
+
+    /// Whether the pattern matches all of `value`: `RegularExpressionAttribute`
+    /// takes only a match that starts at 0 and spans the whole value, so the
+    /// unanchored level pattern is anchored too.
+    fn matches(self, value: &str) -> bool {
+        match self {
+            Self::Container => ferrofin_model::media_info::is_valid_stream_identifier(value),
+            Self::Level => {
+                let digits =
+                    |part: &str| !part.is_empty() && part.bytes().all(|b| b.is_ascii_digit());
+                let unsigned = value.strip_prefix('-').unwrap_or(value);
+                match unsigned.split_once('.') {
+                    Some((whole, fraction)) => digits(whole) && digits(fraction),
+                    None => digits(unsigned),
+                }
+            }
+        }
+    }
+}
+
+/// The `(name, complaint)` the model-state filter files, after authorization
+/// and before the action, about a parameter bound with a `[RegularExpression]`
+/// ([`StreamPattern`]) whose value fails it, keyed by the parameter's declared
+/// name whatever case the query spelled it in ([`validation_failure`] answers
+/// with them). An absent or empty value passes, as the attribute passes one,
+/// and so does a blank query value, which the binder made `null`.
+pub(crate) fn pattern_complaint(
+    name: &str,
+    value: Option<&str>,
+    pattern: StreamPattern,
+) -> Option<(String, String)> {
+    value
+        .filter(|value| !value.is_empty() && !pattern.matches(value))
+        .map(|_| {
+            (
+                name.to_owned(),
+                format!(
+                    "The field {name} must match the regular expression '{}'.",
+                    pattern.regex()
+                ),
+            )
+        })
 }
 
 /// A route or query `Guid`, bound the way ASP.NET binds one. Extract it as
@@ -1000,6 +1076,42 @@ mod tests {
                 "errors": { "name": ["The name field is required."] },
             })
         );
+    }
+
+    /// Each value as stock Jellyfin 12.4 judged it on `master.m3u8` (`true`:
+    /// the action ran; `false`: the pattern's `400`).
+    #[rstest::rstest]
+    #[case::level_decimal(StreamPattern::Level, "4.1", true)]
+    #[case::level_negative(StreamPattern::Level, "-41", true)]
+    #[case::level_word(StreamPattern::Level, "abc", false)]
+    #[case::level_exponent(StreamPattern::Level, "1e1", false)]
+    #[case::level_leading_space(StreamPattern::Level, " 41", false)]
+    #[case::level_trailing_dot(StreamPattern::Level, "41.", false)]
+    #[case::level_two_dots(StreamPattern::Level, "4.1.2", false)]
+    #[case::level_line_break(StreamPattern::Level, "41\n", false)]
+    #[case::container_forty(StreamPattern::Container, &"a".repeat(40), true)]
+    #[case::container_forty_one(StreamPattern::Container, &"a".repeat(41), false)]
+    #[case::container_line_break(StreamPattern::Container, "ts\n", false)]
+    #[case::container_leading_space(StreamPattern::Container, " mp4", false)]
+    fn a_pattern_matches_the_whole_value(
+        #[case] pattern: StreamPattern,
+        #[case] value: &str,
+        #[case] matches: bool,
+    ) {
+        assert_eq!(pattern.matches(value), matches, "{value:?}");
+        assert_eq!(
+            pattern_complaint("v", Some(value), pattern).is_none(),
+            matches,
+            "{value:?}"
+        );
+    }
+
+    #[test]
+    fn an_absent_or_empty_value_passes_every_pattern() {
+        for pattern in [StreamPattern::Container, StreamPattern::Level] {
+            assert!(pattern_complaint("v", None, pattern).is_none());
+            assert!(pattern_complaint("v", Some(""), pattern).is_none());
+        }
     }
 
     #[tokio::test]

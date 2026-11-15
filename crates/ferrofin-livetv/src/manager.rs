@@ -3835,7 +3835,7 @@ impl LiveTvManager for FerrofinLiveTvManager {
         // By value: each document goes as soon as its airings are written,
         // rather than living through the item mirror below.
         for (provider, source) in guides {
-            kept_programs.extend(match source {
+            let written = match source {
                 GuideSource::XmlTv { document, channels } => {
                     self.insert_programs(document, &channels, &provider, window)
                         .await?
@@ -3844,7 +3844,14 @@ impl LiveTvManager for FerrofinLiveTvManager {
                     self.insert_schedules_direct_programs(&channels, &programs, &provider)
                         .await?
                 }
-            });
+            };
+            // Extending an empty map reserves a second table the size of
+            // `written` while `written` still holds the first.
+            if kept_programs.is_empty() {
+                kept_programs = written;
+            } else {
+                kept_programs.extend(written);
+            }
         }
         if clean_database {
             self.clean_guide(&kept_channels, &kept_programs).await?;
@@ -8127,8 +8134,7 @@ fn derive_show_id(
 /// A UTC instant as .NET `DateTime.Ticks`: 100-nanosecond intervals since
 /// `0001-01-01T00:00:00`, which is what `ShowId`'s uniqueness suffix appends.
 pub(crate) fn dotnet_ticks(at: DateTime<Utc>) -> i64 {
-    /// Ticks between `0001-01-01` and the Unix epoch.
-    const UNIX_EPOCH_TICKS: i64 = 621_355_968_000_000_000;
+    use ferrofin_util::ticks::UNIX_EPOCH_TICKS;
     UNIX_EPOCH_TICKS + at.timestamp_micros() * 10
 }
 

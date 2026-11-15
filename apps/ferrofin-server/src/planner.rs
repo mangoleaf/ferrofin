@@ -60,6 +60,7 @@ use ferrofin_traits::media_encoding::{
     AttachmentExtractor, HlsStreamRequest, MediaEncoder, SubtitleEncoder, TranscodingJobType,
 };
 use ferrofin_traits::system::{PathManager, ServerApplicationPaths};
+use ferrofin_util::ticks::TICKS_PER_SECOND;
 
 use crate::encoding_options::EncodingOptionsReader;
 
@@ -132,14 +133,10 @@ const DEFAULT_ENCODER_PRESET: EncoderPreset = EncoderPreset::veryfast;
 /// `DynamicHlsController.DefaultEventEncoderPreset = EncoderPreset.superfast`.
 const DEFAULT_EVENT_ENCODER_PRESET: EncoderPreset = EncoderPreset::superfast;
 
-/// The number of ffmpeg ticks per second (100 ns units). Port of
-/// `TimeSpan.TicksPerSecond`.
-const TICKS_PER_SECOND: i64 = 10_000_000;
-
 /// How far past an HLS remux segment's start the input seek goes: upstream's
 /// 0.5 s (`GetFastSeekCommandLineParameter`), so ffmpeg lands on the
 /// keyframe the segment starts at rather than the one before it.
-const HLS_REMUX_SEEK_OFFSET_TICKS: i64 = 5_000_000;
+const HLS_REMUX_SEEK_OFFSET_TICKS: i64 = TICKS_PER_SECOND / 2;
 
 /// The number of milliseconds per second.
 const MS_PER_SECOND: i32 = 1000;
@@ -650,18 +647,13 @@ fn progressive_container(
         .ok_or_else(|| ServiceError::backend("failed to find a progressive output container"))
 }
 
-/// The file extension for `segment_container` (`ts` → `ts`, `mp4` → `mp4`).
-///
-/// Port of `GetSegmentFileExtension`: the extension is the container name
-/// (`"." + container`), so fMP4 segments are `.mp4` — matching the playlist
-/// generator's `#EXT-X-MAP`/segment URIs and the served-file resolver. (An
-/// earlier `.m4s` here disagreed with both, so fMP4 segments 404'd.)
-fn segment_file_extension(segment_container: &str) -> &'static str {
-    if segment_container.eq_ignore_ascii_case("mp4") {
-        "mp4"
-    } else {
-        "ts"
-    }
+/// The extension, without its dot, of the segments ffmpeg writes for
+/// `segment_container`: the shared
+/// [`segment_file_extension`](ferrofin_mediaencoding::encoding_helper::helper::segment_file_extension),
+/// which the stream and transcode managers read too.
+fn segment_extension_without_dot(segment_container: &str) -> &'static str {
+    ferrofin_mediaencoding::encoding_helper::helper::segment_file_extension(segment_container)
+        .trim_start_matches('.')
 }
 
 /// Whether `codec` is HEVC (H.265), which needs the `hvc1` codec tag + fMP4 to
@@ -687,7 +679,8 @@ fn dolby_vision_hevc_codec_tag(stream: Option<&MediaStream>) -> &'static str {
 ///
 /// Port of the `hls_segment_type` selection: `mp4` → `fmp4`, else `mpegts`.
 fn hls_segment_type(segment_container: &str) -> &'static str {
-    if segment_container.eq_ignore_ascii_case("mp4") {
+    if ferrofin_mediaencoding::encoding_helper::helper::is_mp4_segment_container(segment_container)
+    {
         "fmp4"
     } else {
         "mpegts"
@@ -834,7 +827,7 @@ impl StreamStatePlanner for FerrofinStreamStatePlanner {
         // `StreamingHelpers.GetStreamingState`: a non-blank `subtitleCodec`
         // becomes `SupportedSubtitleCodecs`, split on commas with empty entries
         // dropped (`Split(',', RemoveEmptyEntries)`, which trims nothing). The
-        // ordinary stream routes validate it (`validate_stream_request`), and
+        // stream and HLS routes validate it (`stream_pattern_failures`), and
         // the embed arguments check it again before writing it.
         let supported_subtitle_codecs: Vec<String> = request
             .subtitle_codec
@@ -1207,7 +1200,7 @@ impl StreamStatePlanner for FerrofinStreamStatePlanner {
             segment_path(
                 &playlist_path,
                 segment_id.unwrap_or(0),
-                segment_file_extension(&segment_container),
+                segment_extension_without_dot(&segment_container),
             )
         };
 
@@ -1953,7 +1946,7 @@ impl FerrofinStreamStatePlanner {
             }
         }
         // `GetInputModifier`: timestamp sync, then pacing, then the options
-        // the live-TV source settings drive (ignore DTS, stream looping).
+        // the source drives (RTSP transport, `-fflags`, stream looping).
         args.extend(
             ferrofin_mediaencoding::transcoding::segment_cleaner::input_sync_arguments(
                 state,
@@ -2120,7 +2113,11 @@ impl FerrofinStreamStatePlanner {
         };
         let output_is_hevc = output_codec.is_some_and(is_hevc);
         let output_is_av1 = output_codec.is_some_and(|c| c.eq_ignore_ascii_case("av1"));
-        if (output_is_hevc || output_is_av1) && segment_container.eq_ignore_ascii_case("mp4") {
+        if (output_is_hevc || output_is_av1)
+            && ferrofin_mediaencoding::encoding_helper::helper::is_mp4_segment_container(
+                segment_container,
+            )
+        {
             let video_is_dovi = hw::tonemap::is_dovi(state.video_stream.as_ref());
             let actual_codec = state.actual_output_video_codec();
             let client_supports_dovi = actual_codec
@@ -2245,7 +2242,7 @@ impl FerrofinStreamStatePlanner {
         // re-encode alike). Keyed on the NORMALISED container, as upstream's
         // `outputExtension.TrimStart('.')` is — an unknown container falls back
         // to mpegts there and must here too.
-        if is_event_playlist && segment_file_extension(segment_container) == "ts" {
+        if is_event_playlist && segment_extension_without_dot(segment_container) == "ts" {
             push_split(&mut args, "-flags -global_header");
         }
 
@@ -2511,7 +2508,7 @@ impl FerrofinStreamStatePlanner {
         let stem = playlist_path
             .file_stem()
             .map_or_else(String::new, |s| s.to_string_lossy().into_owned());
-        let ext = segment_file_extension(segment_container);
+        let ext = segment_extension_without_dot(segment_container);
         // `GetCommandLineArguments`' `-avoid_negative_ts disabled`, kept
         // without its `-copyts` (see `-output_ts_offset` below). A job from the
         // start begins below zero (B-frame reorder delay, AAC priming), and
@@ -2543,7 +2540,9 @@ impl FerrofinStreamStatePlanner {
         // the .m3u8 output dir, so a bare `{stem}-1.mp4` lands beside the media
         // segments where the init-segment route serves it. Port of
         // `DynamicHlsController`'s `-hls_fmp4_init_filename`.
-        if segment_container.eq_ignore_ascii_case("mp4") {
+        if ferrofin_mediaencoding::encoding_helper::helper::is_mp4_segment_container(
+            segment_container,
+        ) {
             push_split(&mut args, "-hls_fmp4_init_filename");
             args.push(format!("{stem}-1.{ext}"));
             // fMP4 with video (`DynamicHlsController.cs:1610-1617`, PR 17501):
@@ -2816,13 +2815,16 @@ fn output_id(request: &HlsStreamRequest, segment_container: &str, is_audio: bool
     format!("{:016x}", hasher.finish())
 }
 
-/// The request's `SegmentContainer`, `ts` when absent or empty.
+/// The request's `SegmentContainer` without surrounding whitespace, `ts` when
+/// absent or blank. Every later use (the arguments, the output id, the
+/// playlist, the files waited for) reads this one value.
 fn requested_segment_container(request: &HlsStreamRequest) -> String {
     request
         .segment_container
-        .clone()
+        .as_deref()
+        .map(str::trim)
         .filter(|c| !c.is_empty())
-        .unwrap_or_else(|| DEFAULT_SEGMENT_CONTAINER.to_owned())
+        .map_or_else(|| DEFAULT_SEGMENT_CONTAINER.to_owned(), str::to_owned)
 }
 
 /// The on-disk path of segment `index` for `playlist` (`GetSegmentPath`).
@@ -3243,6 +3245,8 @@ mod tests {
     #[case(Some("mp4"), false, PlaylistKind::Vod)]
     #[case(Some("mp4"), false, PlaylistKind::Event)]
     #[case(Some("ts"), true, PlaylistKind::Vod)]
+    #[case(Some(" mp4 "), false, PlaylistKind::Vod)]
+    #[case(Some("   "), true, PlaylistKind::Event)]
     #[tokio::test]
     async fn hls_output_names_the_planned_playlist(
         #[case] container: Option<&str>,
@@ -3259,6 +3263,54 @@ mod tests {
         let (playlist_path, segment_container) = p.hls_output(&req, is_audio).await.unwrap();
         assert_eq!(playlist_path, plan.playlist_path);
         assert_eq!(segment_container, plan.segment_container);
+    }
+
+    /// The planner, the stream manager and the transcode manager read one
+    /// segment-container rule: a padded or upper-case `mp4` still has ffmpeg
+    /// write the fMP4 `.mp4` segments the other two wait for, under the
+    /// container they are handed.
+    #[rstest]
+    #[case(" mp4")]
+    #[case("MP4 ")]
+    #[tokio::test]
+    async fn a_padded_mp4_segment_container_is_fmp4_throughout(#[case] container: &str) {
+        let p = planner(vec![source(
+            "abc",
+            vec![video_stream("h264"), audio_stream("aac")],
+        )]);
+        let mut req = request("abc");
+        req.segment_container = Some(container.to_owned());
+        let plan = p
+            .plan(&req, false, Some(0), PlaylistKind::Vod)
+            .await
+            .unwrap();
+        let after = |flag: &str| {
+            plan.arguments
+                .windows(2)
+                .find(|w| w[0] == flag)
+                .map(|w| w[1].clone())
+        };
+        assert_eq!(
+            after("-hls_segment_type").as_deref(),
+            Some("fmp4"),
+            "{:?}",
+            plan.arguments
+        );
+        assert!(
+            after("-hls_segment_filename").is_some_and(|name| {
+                std::path::Path::new(&name)
+                    .extension()
+                    .is_some_and(|ext| ext == "mp4")
+            }),
+            "{:?}",
+            plan.arguments
+        );
+        assert_eq!(plan.segment_container, container.trim());
+        assert_eq!(
+            plan.state.segment_container.as_deref(),
+            Some(container.trim()),
+            "the transcode manager polls for the files this names"
+        );
     }
 
     /// A starting transcode's log label names the library from the snapshot
@@ -6648,7 +6700,8 @@ mod tests {
     }
 
     /// The live-TV tuner settings reach the transcode's input options in
-    /// `GetInputModifier`'s order: timestamp sync, pacing, `-fflags +igndts`,
+    /// `GetInputModifier`'s order: timestamp sync, pacing, one `-fflags`
+    /// (ignore DTS, ignore the index, and generate PTS for the copied video),
     /// then the looping reconnect options — all ahead of `-i`, none after.
     #[tokio::test]
     async fn tuner_input_settings_become_ordered_input_options() {
@@ -6657,6 +6710,7 @@ mod tests {
         let mut src = source("abc", vec![video_stream("h264"), audio_stream("aac")]);
         src.read_at_native_framerate = true;
         src.ignore_dts = true;
+        src.ignore_index = true;
         src.requires_looping = true;
         let capabilities = FfmpegCapabilities::builder()
             .ffmpeg_version(FfmpegVersion::new(5, 0))
@@ -6673,6 +6727,8 @@ mod tests {
             .plan(&request("abc"), false, Some(0), PlaylistKind::Vod)
             .await
             .unwrap();
+        // The copied video is what adds `+genpts`.
+        assert!(plan.is_remuxing_video);
         let input = plan
             .arguments
             .iter()
@@ -6680,12 +6736,12 @@ mod tests {
             .unwrap();
         let before = plan.arguments[..input].join(" ");
         // Version 5.0 has neither `-fps_mode` nor the read-rate catch-up.
-        let expected = "-async 1 -vsync -1 -re -fflags +igndts -stream_loop -1 \
+        let expected = "-async 1 -vsync -1 -re -fflags +igndts+ignidx+genpts -stream_loop -1 \
             -reconnect_at_eof 1 -reconnect_streamed 1 -reconnect_delay_max 2";
         assert!(before.contains(expected), "{before}");
         let after = without_temp_dir(&plan.arguments[input + 1..].join(" "));
         assert!(
-            !after.contains("igndts") && !after.contains("stream_loop"),
+            !after.contains("fflags") && !after.contains("stream_loop"),
             "{after}"
         );
     }
@@ -7573,10 +7629,12 @@ mod tests {
 
     #[test]
     fn segment_helpers_map_containers() {
-        assert_eq!(segment_file_extension("ts"), "ts");
-        assert_eq!(segment_file_extension("mp4"), "mp4");
+        assert_eq!(segment_extension_without_dot("ts"), "ts");
+        assert_eq!(segment_extension_without_dot("mp4"), "mp4");
         assert_eq!(hls_segment_type("ts"), "mpegts");
         assert_eq!(hls_segment_type("mp4"), "fmp4");
+        assert_eq!(hls_segment_type("MP4"), "fmp4");
+        assert_eq!(hls_segment_type("webm"), "mpegts");
     }
 
     /// Gives `video` the metadata of an out-of-spec Dolby Vision stream on a
