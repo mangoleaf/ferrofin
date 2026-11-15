@@ -2200,8 +2200,12 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
                    and its image providers, the other providers (TheTVDB, OMDb, MusicBrainz, \
                    TheAudioDB; gl-1815) and the merge onto the item (gl-1813) are not part of \
                    this row.",
-        date: "2026-11-14",
+        date: "2026-11-15",
         divergences: &[
+            "A movie, series, season or episode TMDb has no overview for answers the \
+             refresh no Overview, so Identify → Apply and a Replace all metadata refresh \
+             store none; upstream's provider answers TMDb's \"\", which those refreshes \
+             store (RemoveOldMetadata skips the refill from the item). Fix path: gl-1843.",
             "A TMDb video with no key is dropped where upstream stores the dead link \
              https://www.youtube.com/watch?v=, and an episode's trailer URL already added is \
              compared exactly where upstream's AddTrailerUrl ignores case (YouTube keys are \
@@ -5729,7 +5733,7 @@ pub const VERIFIED: &[Verified] = &[
                Year, asks s= with type=movie; each row's Title, Imdb id, ProductionYear from \
                Year's first four characters, PremiereDate from Released, the poster unless \
                N/A, and the lookup's IndexNumber and ParentIndexNumber)",
-        date: "2026-11-14",
+        date: "2026-11-15",
         divergences: &[
             "A TMDb id with surrounding whitespace or a leading sign (` 603 `, `+603`) pins \
          the title, where v12.4's TryParseTmdbId (NumberStyles.None) reads it as no id and \
@@ -5743,8 +5747,6 @@ pub const VERIFIED: &[Verified] = &[
             "TheTVDB's movie search (jellyfin-plugin-tvdb TvdbMovieProvider.GetSearchResults) \
          is not ported, so a movie Identify lists no TheTVDB candidates where Jellyfin with the \
          plugin does. Fix path: gl-1405.",
-            "A TMDb title TMDb has no overview for gets no Overview member; upstream's is \
-         \"\" (TMDb's empty string, kept). Fix path: gl-1798.",
             "A body with no SearchInfo is searched as an empty lookup (200); upstream \
          dereferences the null SearchInfo and answers 500.",
             "The 401 (no or bad token) body is Ferrofin's error shape, not upstream's. Fix \
@@ -5818,7 +5820,7 @@ pub const VERIFIED: &[Verified] = &[
                else an Imdb, Zap2It or Tmdb id resolved through /search/remoteid, pins the \
                series' extended record; else tvdb.rs search, the parsed comparable name, five \
                results ranked as FindSeriesInternal ranks them and kept within a year of Year)",
-        date: "2026-11-14",
+        date: "2026-11-15",
         divergences: &[
             "TheTVDB's results are listed too (SearchProviderName TheTVDB, ProviderIds.Tvdb): \
          Ferrofin compiles its remote providers in (CLAUDE.md, Current scope), where stock \
@@ -5841,8 +5843,6 @@ pub const VERIFIED: &[Verified] = &[
             "A TMDb result's PremiereDate is the first air date at UTC midnight; upstream's \
          ToUniversalTime reads it as the server's local midnight, so on a host not on UTC \
          the instant differs by the offset. Fix path: gl-490.",
-            "A TMDb title TMDb has no overview for gets no Overview member; upstream's is \
-         \"\" (TMDb's empty string, kept). Fix path: gl-1798.",
             "A body with no SearchInfo is searched as an empty lookup (200); upstream \
          dereferences the null SearchInfo and answers 500.",
             "The 401 (no or bad token) body is Ferrofin's error shape, not upstream's. Fix \
@@ -5894,7 +5894,7 @@ pub const VERIFIED: &[Verified] = &[
                the Imdb id TMDb knows), a failed lookup going on; else search_person by name \
                with no language (SearchPersonAsync, include_adult from the plugin settings), \
                each row's Name, profile image and Tmdb id)",
-        date: "2026-11-14",
+        date: "2026-11-15",
         divergences: &[
             "A TMDb id with surrounding whitespace or a leading sign (` 31 `, `+31`) pins the \
          person; v12.4's TryParseTmdbId (NumberStyles.None) reads it as no id and searches by \
@@ -5902,8 +5902,6 @@ pub const VERIFIED: &[Verified] = &[
             "TheTVDB's person search (jellyfin-plugin-tvdb TvdbPersonProvider.GetSearchResults) \
          is not ported, so a person Identify lists no TheTVDB candidates where Jellyfin with \
          the plugin does. Fix path: gl-1124.",
-            "A person TMDb has no biography for gets no Overview member; upstream's is \"\" \
-         (TMDb's empty string, kept). Fix path: gl-1798.",
             "A body with no SearchInfo is searched as an empty lookup (200); upstream \
          dereferences the null SearchInfo and answers 500.",
             "The 401 (no or bad token) and 403 (not an administrator) bodies are Ferrofin's \

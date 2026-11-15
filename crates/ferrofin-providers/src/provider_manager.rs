@@ -6403,6 +6403,88 @@ mod tests {
         assert!(results[0].premiere_date.is_some());
     }
 
+    /// TMDb's empty overview or biography is kept, so the result answers
+    /// `"Overview": ""` as upstream's does (`Overview = movie.Overview`,
+    /// `movieResult.Overview`, `series.Overview`, `personResult.Biography`).
+    #[tokio::test]
+    async fn tmdb_identify_keeps_an_empty_overview() {
+        use super::{TmdbKind, TmdbPersonSearchProvider, TmdbSearchProvider};
+        let server = crate::mock_http::MockServer::start(vec![
+            (
+                "/search/movie",
+                r#"{"results":[{"id":603,"title":"The Matrix","overview":""}]}"#.to_owned(),
+            ),
+            (
+                "/search/tv",
+                r#"{"results":[{"id":1396,"name":"Breaking Bad","overview":""}]}"#.to_owned(),
+            ),
+            (
+                "/find/tt0133093",
+                r#"{"movie_results":[{"id":603,"title":"The Matrix","overview":""}],
+                    "tv_results":[{"id":1396,"name":"Breaking Bad","overview":""}]}"#
+                    .to_owned(),
+            ),
+            (
+                "/movie/603",
+                r#"{"id":603,"title":"The Matrix","overview":""}"#.to_owned(),
+            ),
+            (
+                "/tv/1396",
+                r#"{"id":1396,"name":"Breaking Bad","overview":""}"#.to_owned(),
+            ),
+            (
+                "/person/31",
+                r#"{"id":31,"name":"Tom Hanks","biography":""}"#.to_owned(),
+            ),
+            ("/movie/604", r#"{"id":604,"title":"No Plot"}"#.to_owned()),
+            ("/person/32", r#"{"id":32,"name":"No Bio"}"#.to_owned()),
+        ])
+        .await;
+        let tmdb = Arc::new(crate::tmdb::TmdbClient::new().with_base_url(&server.base_url));
+        let movie = TmdbSearchProvider::new(tmdb.clone(), TmdbKind::Movie);
+        let series = TmdbSearchProvider::new(tmdb.clone(), TmdbKind::Series);
+        let person = TmdbPersonSearchProvider::new(tmdb);
+        let cases: [(&dyn super::RemoteSearchProvider, RemoteSearchRequest); 7] = [
+            (&movie, named_request(BaseItemKind::Movie, "The Matrix")),
+            (&movie, id_request(BaseItemKind::Movie, &[("Tmdb", "603")])),
+            (
+                &movie,
+                id_request(BaseItemKind::Movie, &[("Imdb", "tt0133093")]),
+            ),
+            (&series, named_request(BaseItemKind::Series, "Breaking Bad")),
+            (
+                &series,
+                id_request(BaseItemKind::Series, &[("Tmdb", "1396")]),
+            ),
+            (
+                &series,
+                id_request(BaseItemKind::Series, &[("Imdb", "tt0133093")]),
+            ),
+            (&person, id_request(BaseItemKind::Person, &[("Tmdb", "31")])),
+        ];
+        for (provider, req) in cases {
+            let results = provider.get_search_results(&req).await.expect("results");
+            let label = (req.item_kind, &req.search_info.provider_ids);
+            assert_eq!(results.len(), 1, "{label:?}");
+            assert_eq!(results[0].overview.as_deref(), Some(""), "{label:?}");
+            let json = serde_json::to_value(&results[0]).expect("json");
+            assert_eq!(json["Overview"], "", "{label:?}");
+        }
+
+        // No overview at all stays out of the result.
+        let none: [(&dyn super::RemoteSearchProvider, RemoteSearchRequest); 2] = [
+            (&movie, id_request(BaseItemKind::Movie, &[("Tmdb", "604")])),
+            (&person, id_request(BaseItemKind::Person, &[("Tmdb", "32")])),
+        ];
+        for (provider, req) in none {
+            let results = provider.get_search_results(&req).await.expect("results");
+            assert_eq!(results.len(), 1, "{:?}", req.item_kind);
+            assert_eq!(results[0].overview, None, "{:?}", req.item_kind);
+            let json = serde_json::to_value(&results[0]).expect("json");
+            assert!(json.get("Overview").is_none(), "{json}");
+        }
+    }
+
     /// A provider id with surrounding whitespace must still pin the title.
     ///
     /// `int.Parse(id, CultureInfo.InvariantCulture)` and

@@ -23452,7 +23452,8 @@ fn apply_details(entity: &mut BaseItemEntity, d: &TmdbDetails) {
     if entity.overview.is_none() {
         // `Overview?.Replace("\n\n", "\n")` for a movie
         // (`TmdbMovieProvider.cs:205`); a series' is kept as TMDb sent it.
-        entity.overview = d.overview.as_ref().map(|o| {
+        // An empty one, kept for the Identify result, is not stored (gl-1843).
+        entity.overview = d.overview.as_ref().filter(|o| !o.is_empty()).map(|o| {
             if entity.type_.ends_with(".Movie") {
                 o.replace("\n\n", "\n")
             } else {
@@ -27471,6 +27472,18 @@ mod tests {
         };
         super::apply_details(&mut row, &details);
         assert_eq!(row.overview.as_deref(), Some(expected));
+    }
+
+    /// TMDb's empty overview, which the Identify results keep, is not stored.
+    #[test]
+    fn an_empty_tmdb_overview_is_not_stored() {
+        let mut row = ferrofin_db::entities::base_items::BaseItemEntity::default();
+        let details = ferrofin_providers::TmdbDetails {
+            overview: Some(String::new()),
+            ..Default::default()
+        };
+        super::apply_details(&mut row, &details);
+        assert_eq!(row.overview, None);
     }
 
     /// `Series.Status` comes from `<status>` (SeriesNfoParser.cs:75-90), TMDB's
