@@ -32,12 +32,7 @@ use ferrofin_model::entities_media::{ChapterInfo, MediaStream};
 use ferrofin_model::media_info::MediaProtocol;
 use ferrofin_traits::error::ServiceError;
 use ferrofin_traits::media_encoding::{MediaEncoder, MediaInfoRequest};
-
-/// Ticks per second (100 ns units), matching .NET `TimeSpan.TicksPerSecond`.
-///
-/// Port of the implicit `TimeSpan.FromSeconds` conversion the C# uses when it
-/// turns `DummyChapterDuration` (seconds) into ticks.
-const TICKS_PER_SECOND: i64 = 10_000_000;
+use ferrofin_util::ticks::TICKS_PER_SECOND;
 
 /// The upper runtime bound `CreateDummyChapters` treats as valid, in ticks
 /// (`TimeSpan.FromHours(12).Ticks`). Runtimes above this are assumed corrupt.
@@ -250,13 +245,11 @@ mod tests {
     use ferrofin_model::media_info::MediaProtocol;
     use ferrofin_traits::error::ServiceError;
     use ferrofin_traits::media_encoding::{MediaEncoder, MediaInfoRequest};
+    use ferrofin_util::ticks::TICKS_PER_MINUTE;
 
     /// The `DummyChapterDuration` the xUnit fixture injects:
     /// `TimeSpan.FromMinutes(5).TotalSeconds` == 300 seconds.
     const DUMMY_CHAPTER_DURATION_SECONDS: i32 = 5 * 60;
-
-    /// One .NET minute, in ticks (`TimeSpan.TicksPerMinute`).
-    const TICKS_PER_MINUTE: i64 = 60 * 10_000_000;
 
     /// A fake ffprobe seam. For the sync parity tests (`create_dummy_chapters`,
     /// `fetch`) probing is never reached. The `get_media_info` seam records the

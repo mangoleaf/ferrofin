@@ -1298,6 +1298,7 @@ fn import_system_xml(xml: &str) -> Result<ServerConfiguration, ServiceError> {
         "ServerConfiguration",
         config_import::SYSTEM_XML_DENY,
     )
+    .map_err(ServiceError::from)
 }
 
 /// Serializes and writes a configuration to `path` (creating the parent dir).

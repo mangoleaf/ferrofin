@@ -26,6 +26,8 @@
 //!
 //! Every trait is object-safe and carries an `_assert_object_safe_*` assertion.
 
+use std::sync::Arc;
+
 use async_trait::async_trait;
 use ferrofin_db::entities::users::UserEntity;
 use ferrofin_model::quick_connect::QuickConnectResult;
@@ -161,6 +163,20 @@ pub trait PasswordResetManager: Send + Sync {
 }
 
 fn _assert_object_safe_password_reset_manager(_: &dyn PasswordResetManager) {}
+
+/// Where the authentication and password-reset providers compiled-in
+/// extensions contribute are registered: the user manager's late slots,
+/// filled once by the composition root after the extensions are wired.
+pub trait AuthProviderRegistry: Send + Sync {
+    /// Registers the extensions' authentication providers, consulted after
+    /// the built-in ones, in the order given. A second call is a no-op.
+    fn set_extension_providers(&self, providers: Vec<Arc<dyn AuthenticationManager>>);
+    /// Registers the extensions' password-reset providers, offered after the
+    /// built-in one, in the order given. A second call is a no-op.
+    fn set_extension_reset_providers(&self, providers: Vec<Arc<dyn PasswordResetManager>>);
+}
+
+fn _assert_object_safe_auth_provider_registry(_: &dyn AuthProviderRegistry) {}
 
 /// Drives the Quick Connect pairing flow.
 ///

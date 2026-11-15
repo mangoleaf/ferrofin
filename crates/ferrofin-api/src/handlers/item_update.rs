@@ -1423,11 +1423,7 @@ async fn offers_content_type(state: &AppState, item: &BaseItemEntity) -> Result<
     });
     if video
         && let (Some(live_tv), Some(path)) = (&state.live_tv, item.path.as_deref())
-        && live_tv
-            .active_recording_paths()
-            .await?
-            .iter()
-            .any(|recording| recording == path)
+        && live_tv.is_active_recording(path).await?
     {
         return Ok(false);
     }
