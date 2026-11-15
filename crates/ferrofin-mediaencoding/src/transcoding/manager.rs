@@ -1337,7 +1337,7 @@ impl<S: SessionReporter, C: FileCleaner> TranscodeManagerImpl<S, C> {
             // propagates and is logged once at the request boundary.
             tracing::warn!(
                 exit_code = code.unwrap_or(-1),
-                log = %stderr_log.display(),
+                log = ?stderr_log,
                 "ffmpeg exited non-zero during transcode startup"
             );
             return Err(format!(
@@ -1407,7 +1407,7 @@ impl<S: SessionReporter, C: FileCleaner> TranscodeManagerImpl<S, C> {
                 tracing::warn!(
                     segment = index,
                     exit_code = code.unwrap_or(-1),
-                    log = %log.display(),
+                    log = ?log,
                     "transcode exited before producing segment{}",
                     stderr_log_tail(&log)
                 );
@@ -1886,15 +1886,15 @@ fn prepare_ffmpeg_log(log_dir: &Path, state: &EncodingJobInfo) -> Result<PathBuf
     std::fs::create_dir_all(log_dir)
         .map_err(|e| format!("create log dir {}: {e}", log_dir.display()))?;
     let path = log_dir.join(ffmpeg_log_file_name(state));
-    tracing::debug!(log = %path.display(), "ffmpeg stderr log");
+    tracing::debug!(log = ?path, "ffmpeg stderr log");
     Ok(path)
 }
 
 /// The ffmpeg stderr log file name for `state`, inside the server log directory.
 ///
 /// Port of the naming block of `TranscodeManager.StartFfMpeg`
-/// (`MediaBrowser.MediaEncoding/Transcoding/TranscodeManager.cs:450-467` at
-/// `v10.11.8`):
+/// (`MediaBrowser.MediaEncoding/Transcoding/TranscodeManager.cs:451-467` at
+/// `v12.4`):
 ///
 /// ```text
 /// var logFilePrefix = "FFmpeg.Transcode-";
@@ -1905,11 +1905,12 @@ fn prepare_ffmpeg_log(log_dir: &Path, state: &EncodingJobInfo) -> Result<PathBuf
 /// … $"{logFilePrefix}{DateTime.Now:yyyy-MM-dd_HH-mm-ss}_{state.Request.MediaSourceId}_{Guid.NewGuid().ToString()[..8]}.log"
 /// ```
 ///
-/// Two faithful substitutions, both because the value C# reads does not exist
-/// under that name here: `state.VideoRequest is not null` is
-/// [`EncodingJobInfo::is_input_video`] (the same predicate the hardware-decode
-/// port already spells that way), and `Request.MediaSourceId` is read from the
-/// resolved `MediaSource.Id`, which is the id the request pinned.
+/// `state.VideoRequest is not null` is [`EncodingJobInfo::is_input_video`]
+/// (the same predicate the hardware-decode port already spells that way).
+/// `Request.MediaSourceId` is the id the request sent, never the source it
+/// resolved to, so a request that named none leaves the middle part empty
+/// (`FFmpeg.Remux-2026-10-23_22-06-33__46340374.log`). It is not filtered, as
+/// upstream's is not: an id a file name cannot hold fails the log's creation.
 ///
 /// `DateTime.Now` is **local** time upstream, and stays local here — these names
 /// are read by a human next to `log_*.log` files stamped the same way.
@@ -1929,7 +1930,11 @@ pub fn ffmpeg_log_file_name(state: &EncodingJobInfo) -> String {
         "FFmpeg.Transcode-"
     };
     let stamp = chrono::Local::now().format("%Y-%m-%d_%H-%M-%S");
-    let media_source_id = state.media_source.id.clone().unwrap_or_default();
+    let media_source_id = state
+        .base_request
+        .media_source_id
+        .as_deref()
+        .unwrap_or_default();
     // `Guid.NewGuid().ToString()[..8]` — the first 8 chars of the dashed form,
     // i.e. 8 hex digits, purely to keep two same-second jobs apart.
     let unique: String = uuid::Uuid::new_v4().simple().to_string()[..8].to_owned();
@@ -2675,16 +2680,13 @@ mod start_ffmpeg_tests {
 
     #[test]
     fn the_ffmpeg_log_name_is_jellyfins_prefix_stamp_source_unique() {
-        // `TranscodeManager.StartFfMpeg` (v10.11.8:450-467). The whole point of
+        // `TranscodeManager.StartFfMpeg` (v12.4:451-467). The whole point of
         // the name is that it lands in the LOG directory and is recognisable
         // there: `GET /System/Logs` lists it and the dashboard downloads it.
         let tmp = tempfile::tempdir().unwrap();
         let playlist = tmp.path().join("out.m3u8");
         let mut st = state(&playlist, None);
-        st.media_source = MediaSourceInfo {
-            id: Some("abc123".to_owned()),
-            ..MediaSourceInfo::default()
-        };
+        st.base_request.media_source_id = Some("abc123".to_owned());
 
         // Video job, nothing copied -> full transcode.
         st.output_video_codec = Some("libx264".to_owned());
@@ -2730,6 +2732,27 @@ mod start_ffmpeg_tests {
 
         // Two jobs in the same second do not collide.
         assert_ne!(ffmpeg_log_file_name(&st), ffmpeg_log_file_name(&st));
+    }
+
+    /// gl-835: the middle part is the `MediaSourceId` the request sent
+    /// (`state.Request.MediaSourceId`), not the source it resolved to, so a
+    /// request that named none leaves it empty, as Jellyfin's
+    /// `FFmpeg.Remux-2026-10-23_22-06-33__46340374.log` does.
+    #[rstest::rstest]
+    #[case::sent(Some("4b8c8f"), "_4b8c8f_")]
+    #[case::not_sent(None, "__")]
+    fn the_ffmpeg_log_name_carries_the_requests_media_source_id(
+        #[case] sent: Option<&str>,
+        #[case] middle: &str,
+    ) {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut st = state(&tmp.path().join("out.m3u8"), None);
+        st.base_request.media_source_id = sent.map(str::to_owned);
+        st.media_source.id = Some("002a86e8320dd967eb3cf853deacafc4".to_owned());
+        let name = ffmpeg_log_file_name(&st);
+        let stamp_end = "FFmpeg.Transcode-".len() + "0000-00-00_00-00-00".len();
+        assert_eq!(&name[stamp_end..stamp_end + middle.len()], middle, "{name}");
+        assert!(!name.contains("002a86e8"), "{name}");
     }
 
     #[tokio::test]

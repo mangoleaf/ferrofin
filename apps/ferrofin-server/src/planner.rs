@@ -993,6 +993,9 @@ impl StreamStatePlanner for FerrofinStreamStatePlanner {
             // live MPEG-TS usually probes with no bitrate, so leaving it unset
             // software-transcodes every channel that could have been copied.
             live_stream_id: request.live_stream_id.clone(),
+            // As sent, never the resolved source: the ffmpeg log name carries
+            // it (`state.Request.MediaSourceId`), empty when none was sent.
+            media_source_id: request.media_source_id.clone(),
             // Only the video HLS actions bind `alwaysBurnInSubtitleWhenTranscoding`
             // upstream; the audio HLS actions pin it false and the progressive
             // stream actions never read it.
@@ -7212,6 +7215,31 @@ mod tests {
             "seek segment must set -output_ts_offset to its playlist time: {:?}",
             plan.arguments
         );
+    }
+
+    /// gl-835: the job keeps the `MediaSourceId` the request sent, which the
+    /// ffmpeg log's name carries, and none when the request named none, even
+    /// though the job reads the item's first source then.
+    #[tokio::test]
+    async fn the_job_keeps_the_media_source_id_the_request_sent() {
+        let p = planner(vec![source(
+            "abc",
+            vec![video_stream("h264"), audio_stream("aac")],
+        )]);
+        // "ABC" names the source "abc" too: the job keeps the spelling sent.
+        for sent in [Some("ABC"), None] {
+            let req = HlsStreamRequest {
+                media_source_id: sent.map(str::to_owned),
+                video_codec: Some("h264".to_owned()),
+                ..request("abc")
+            };
+            let plan = p
+                .plan(&req, false, Some(0), PlaylistKind::Vod)
+                .await
+                .unwrap();
+            assert_eq!(plan.state.media_source.id.as_deref(), Some("abc"));
+            assert_eq!(plan.state.base_request.media_source_id.as_deref(), sent);
+        }
     }
 
     #[tokio::test]

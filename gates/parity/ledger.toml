@@ -932,13 +932,13 @@ kind = "length"
 issue = 835
 reason = "Each server writes its own FFmpeg logs, named and split by kind differently (gl-835)."
 
-# FFmpeg log names carry the resolved media source id, and the main log is named differently (gl-847).
+# FFmpeg log names carry each job's own start time and random part, and the main log is named differently (gl-847).
 [[entry]]
 request = "GetServerLogs"
 path = "[].Name"
 kind = "value"
 issue = 835
-reason = "FFmpeg log names carry the resolved media source id, and the main log is named differently (gl-847)."
+reason = "FFmpeg log names carry each job's own start time and random part, and the main log is named differently (gl-847)."
 
 # Ferrofin names its log files differently, so the oracle's log name is not found.
 [[entry]]

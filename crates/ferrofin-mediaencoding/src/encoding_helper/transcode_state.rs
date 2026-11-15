@@ -162,6 +162,9 @@ pub struct BaseEncodingJobOptions {
     pub cpu_core_limit: Option<i32>,
     /// The live-stream id, if this is a live source (`LiveStreamId`).
     pub live_stream_id: Option<String>,
+    /// The media source id as the request sent it (`MediaSourceId`), before
+    /// it is resolved; `None` when the request named none.
+    pub media_source_id: Option<String>,
     /// Whether MPEG-TS M2TS mode is enabled (`EnableMpegtsM2TsMode`).
     pub enable_mpegts_m2ts_mode: bool,
     /// The encoding context (`Context`).
@@ -213,6 +216,7 @@ impl Default for BaseEncodingJobOptions {
             require_non_anamorphic: false,
             cpu_core_limit: None,
             live_stream_id: None,
+            media_source_id: None,
             enable_mpegts_m2ts_mode: false,
             stream_options: Vec::new(),
             always_burn_in_subtitle_when_transcoding: false,
