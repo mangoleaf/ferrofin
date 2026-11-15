@@ -125,22 +125,6 @@ const EXCEPTIONS: &[Exception] = &[
         "Stricter by owner decision (gl-1090): a request naming a user is held to \
          that user's account rules on the anonymous stream routes",
     ),
-    (
-        &[
-            ("GET", "/Plugins"),
-            ("DELETE", "/Plugins/{pluginId}"),
-            ("GET", "/Plugins/{pluginId}/Configuration"),
-            ("POST", "/Plugins/{pluginId}/Configuration"),
-            ("POST", "/Plugins/{pluginId}/Manifest"),
-            ("DELETE", "/Plugins/{pluginId}/{version}"),
-            ("POST", "/Plugins/{pluginId}/{version}/Disable"),
-            ("POST", "/Plugins/{pluginId}/{version}/Enable"),
-        ],
-        &["remote admin"],
-        Outcome::Forbidden,
-        "Known divergence, gl-1699: these run the default policy's remote-access \
-         check, which PluginsController's bare RequiresElevation does not",
-    ),
 ];
 
 /// A kind of caller each operation is sent. Every signed-in caller's other
