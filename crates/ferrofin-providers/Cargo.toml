@@ -56,6 +56,11 @@ zip.workspace = true
 flate2.workspace = true
 tar.workspace = true
 sevenz-rust2.workspace = true
+# A PDF's Standard security handler (`books/page_count/crypt.rs`), opened with
+# the empty user password to read its encrypted object streams.
+aes.workspace = true
+md-5.workspace = true
+sha2.workspace = true
 uuid.workspace = true
 chrono.workspace = true
 tokio.workspace = true
