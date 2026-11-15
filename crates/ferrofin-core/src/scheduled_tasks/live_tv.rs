@@ -303,12 +303,6 @@ mod tests {
         ) -> Result<Option<ferrofin_model::dto::BaseItemDto>, ServiceError> {
             unimplemented!()
         }
-        async fn get_recording_path(
-            &self,
-            _id: uuid::Uuid,
-        ) -> Result<Option<String>, ServiceError> {
-            unimplemented!()
-        }
         async fn delete_recording(&self, _id: uuid::Uuid) -> Result<(), ServiceError> {
             unimplemented!()
         }

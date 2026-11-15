@@ -432,6 +432,10 @@ impl EncoderCapabilities for FfmpegCapabilities {
         self.is_vaapi_device_intel_ihd
     }
 
+    fn is_vaapi_device_intel_i965(&self) -> bool {
+        self.is_vaapi_device_intel_i965
+    }
+
     fn supports_bsf_with_option(&self, option: BsfOption) -> bool {
         // The inherent method of the same name, which callers holding the
         // concrete type reach directly.

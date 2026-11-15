@@ -16,16 +16,11 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use ferrofin_keyframes::keyframe_data::KeyframeData;
 use ferrofin_model::configuration::EncodingOptions;
+use ferrofin_util::ticks::{TICKS_PER_MS, TICKS_PER_SECOND_F64};
 use uuid::Uuid;
 
 use crate::create_main_playlist_request::CreateMainPlaylistRequest;
 use crate::error::HlsError;
-
-/// The number of ticks in a second (1 tick = 100ns; mirrors `TimeSpan.TicksPerSecond`).
-pub const TICKS_PER_SECOND: i64 = 10_000_000;
-
-/// The number of ticks in a millisecond (mirrors `TimeSpan.TicksPerMillisecond`).
-pub const TICKS_PER_MILLISECOND: i64 = 10_000;
 
 pub use ferrofin_traits::media_encoding::KeyframeExtractor;
 
@@ -102,7 +97,10 @@ impl<C: EncodingOptionsProvider> DynamicHlsPlaylistGenerator<C> {
         let segment_extension = get_segment_file_extension(&request.segment_container);
 
         // http://ffmpeg.org/ffmpeg-all.html#toc-hls-2
-        let is_hls_in_fmp4 = segment_extension.eq_ignore_ascii_case(".mp4");
+        let is_hls_in_fmp4 =
+            ferrofin_mediaencoding::encoding_helper::helper::is_mp4_segment_container(
+                &request.segment_container,
+            );
         let hls_version = if is_hls_in_fmp4 { "7" } else { "3" };
 
         // `Math.Ceiling(max)` — the target duration is the ceiling of the
@@ -228,8 +226,7 @@ impl<C: EncodingOptionsProvider> DynamicHlsPlaylistGenerator<C> {
 /// A segment length in seconds as the playlist's ticks: converted by hand, as
 /// upstream does, to avoid the precision loss of converting the double.
 fn segment_length_ticks(length: f64) -> i64 {
-    #[allow(clippy::cast_precision_loss)]
-    convert_to_i64(length * TICKS_PER_SECOND as f64)
+    convert_to_i64(length * TICKS_PER_SECOND_F64)
 }
 
 /// Where each segment of a playlist with `segments` (lengths in seconds)
@@ -249,7 +246,10 @@ pub fn segment_start_ticks(segments: &[f64]) -> Vec<i64> {
 }
 
 /// Mirrors `EncodingHelper.GetSegmentFileExtension`: `"." + container`, or
-/// `".ts"` when the container is null/empty/whitespace.
+/// `".ts"` when the container is null/empty/whitespace. Only the playlist's
+/// segment URIs read it, as upstream's do; the segment routes ignore that
+/// extension, and the files themselves follow the shared
+/// [`segment_file_extension`](ferrofin_mediaencoding::encoding_helper::helper::segment_file_extension).
 fn get_segment_file_extension(segment_container: &str) -> String {
     if segment_container.trim().is_empty() {
         ".ts".to_string()
@@ -315,7 +315,7 @@ pub fn compute_segments(keyframe_data: &KeyframeData, desired_segment_length_ms:
     let mut result: Vec<f64> = Vec::new();
 
     // Scale the segment length to ticks to match the keyframes.
-    let desired_segment_length_ticks = i64::from(desired_segment_length_ms) * TICKS_PER_MILLISECOND;
+    let desired_segment_length_ticks = i64::from(desired_segment_length_ms) * TICKS_PER_MS;
     let mut desired_cut_time = desired_segment_length_ticks;
 
     for &keyframe in ticks {
@@ -356,7 +356,7 @@ pub fn compute_equal_length_segments(
         });
     }
 
-    let segment_length_ticks = i64::from(desired_segment_length_ms) * TICKS_PER_MILLISECOND;
+    let segment_length_ticks = i64::from(desired_segment_length_ms) * TICKS_PER_MS;
     let whole_segments = total_runtime_ticks / segment_length_ticks;
     let remaining_ticks = total_runtime_ticks % segment_length_ticks;
 
@@ -382,7 +382,7 @@ pub fn compute_equal_length_segments(
 #[must_use]
 #[allow(clippy::cast_precision_loss)]
 fn ticks_to_total_seconds(ticks: i64) -> f64 {
-    ticks as f64 / TICKS_PER_SECOND as f64
+    ticks as f64 / TICKS_PER_SECOND_F64
 }
 
 /// Mirrors C# `Convert.ToInt64(double)`: round-half-to-even (banker's rounding).
@@ -421,7 +421,7 @@ mod tests {
 
     /// Mirrors the C# test helper `MsToTicks`: `TimeSpan.FromMilliseconds(v).Ticks`.
     fn ms_to_ticks(value: i64) -> i64 {
-        value * TICKS_PER_MILLISECOND
+        value * TICKS_PER_MS
     }
 
     // === ComputeSegments_Valid_Success (Theory data verbatim) ===============
@@ -710,9 +710,14 @@ hls1/main/2.ts?api_key=abc&runtimeTicks=120000000&actualSegmentLengthTicks=10000
         );
     }
 
+    /// fMP4 is chosen by the shared segment-container rule, so `MP4` is
+    /// fMP4 too; the URIs echo the container as upstream's do.
+    #[rstest::rstest]
+    #[case("mp4")]
+    #[case("MP4")]
     #[tokio::test]
-    async fn create_main_playlist_fmp4_emits_version7_and_map_line() {
-        // Single keyframe → compute_segments yields [10.0]; container "mp4".
+    async fn create_main_playlist_fmp4_emits_version7_and_map_line(#[case] container: &str) {
+        // Single keyframe → compute_segments yields [10.0].
         let kd = KeyframeData::new(ms_to_ticks(10000), vec![0]);
         let generator = DynamicHlsPlaylistGenerator::new(
             config_with_extensions(owned(&["mkv"])),
@@ -723,23 +728,25 @@ hls1/main/2.ts?api_key=abc&runtimeTicks=120000000&actualSegmentLengthTicks=10000
             "/media/movie.mkv",
             6000,
             ms_to_ticks(10000),
-            "mp4",
+            container,
             "hls1/main/",
             "?api_key=abc",
             true,
         );
 
-        let expected = "\
+        let expected = format!(
+            "\
 #EXTM3U
 #EXT-X-PLAYLIST-TYPE:VOD
 #EXT-X-VERSION:7
 #EXT-X-TARGETDURATION:10
 #EXT-X-MEDIA-SEQUENCE:0
-#EXT-X-MAP:URI=\"hls1/main/-1.mp4?api_key=abc&runtimeTicks=0&actualSegmentLengthTicks=0\"
+#EXT-X-MAP:URI=\"hls1/main/-1.{container}?api_key=abc&runtimeTicks=0&actualSegmentLengthTicks=0\"
 #EXTINF:10.000000, nodesc
-hls1/main/0.mp4?api_key=abc&runtimeTicks=0&actualSegmentLengthTicks=100000000
+hls1/main/0.{container}?api_key=abc&runtimeTicks=0&actualSegmentLengthTicks=100000000
 #EXT-X-ENDLIST
-";
+"
+        );
 
         assert_eq!(
             generator.create_main_playlist(&request).await.unwrap(),

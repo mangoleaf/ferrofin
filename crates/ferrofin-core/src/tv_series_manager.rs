@@ -53,11 +53,11 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use ferrofin_db::entities::base_items::BaseItemEntity;
+use ferrofin_db::entities::base_items::{BaseItemEntity, presentation_key};
 use ferrofin_db::entities::users::UserEntity;
 use ferrofin_model::data::BaseItemKind;
 use ferrofin_model::dto::BaseItemDto;
-use ferrofin_model::entities_media::AiredEpisodeOrder as AiredOrder;
+use ferrofin_model::entities_media::{AiredEpisodeOrder as AiredOrder, airs_numbers};
 use ferrofin_model::querying::QueryResult;
 
 use ferrofin_traits::configuration::ServerConfigurationManager;
@@ -114,17 +114,6 @@ impl FerrofinTvSeriesManager {
             dto_service,
             configuration_manager,
         }
-    }
-
-    /// The presentation unique key of a series row: its explicit
-    /// `PresentationUniqueKey` when set, else its id (mirrors
-    /// `Series.GetPresentationUniqueKey()`).
-    fn series_presentation_key(series: &BaseItemEntity) -> String {
-        series
-            .presentation_unique_key
-            .clone()
-            .filter(|k| !k.is_empty())
-            .unwrap_or_else(|| series.id.clone())
     }
 
     /// Resolves the parents the next-up scan is scoped to.
@@ -466,7 +455,8 @@ fn last_watched_date(result: &NextUpEpisodeBatchResult, rewatching: bool) -> Dat
         .unwrap_or_else(|| min + chrono::Duration::days(1))
 }
 
-/// Read source aired-order fields once per entity.
+/// Read source aired-order fields once per entity. Only a special's `Airs*`
+/// numbers are read: [`AiredOrder::compare`] reads them for specials only.
 pub(crate) fn aired_order(episode: &BaseItemEntity) -> AiredOrder {
     let mut order = AiredOrder {
         season: episode.parent_index_number,
@@ -484,23 +474,6 @@ pub(crate) fn aired_order(episode: &BaseItemEntity) -> AiredOrder {
         ] = airs_numbers(episode.data.as_deref());
     }
     order
-}
-
-/// The `AirsBeforeSeasonNumber`, `AirsAfterSeasonNumber` and
-/// `AirsBeforeEpisodeNumber` members of an episode's `Data` blob, in that
-/// order: each one an integer in `i64` range, else `None`, and all three
-/// `None` when the blob is missing or no JSON. Only a special's are read
-/// ([`aired_order`], and the next-up batch's specials).
-pub(crate) fn airs_numbers(data: Option<&str>) -> [Option<i64>; 3] {
-    let Some(blob) = data.and_then(|d| serde_json::from_str::<serde_json::Value>(d).ok()) else {
-        return [None; 3];
-    };
-    let number = |key: &str| blob.get(key).and_then(serde_json::Value::as_i64);
-    [
-        number("AirsBeforeSeasonNumber"),
-        number("AirsAfterSeasonNumber"),
-        number("AirsBeforeEpisodeNumber"),
-    ]
 }
 
 /// A batch episode's operand for the aired-order sort. Only a special carries
@@ -537,7 +510,7 @@ impl TvSeriesManager for FerrofinTvSeriesManager {
             && let Some(series) = self.library_manager.get_item_by_id(series_id).await?
             && kind_from_type_name(&series.type_) == Some(BaseItemKind::Series)
         {
-            let key = Self::series_presentation_key(&series);
+            let key = presentation_key(&series).to_owned();
             return self.next_up_batched(query, &user, &[key], options).await;
         }
 

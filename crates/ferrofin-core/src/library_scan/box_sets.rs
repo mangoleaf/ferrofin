@@ -31,12 +31,12 @@
 //! database, are lost. Here a box set already holding the folder keeps it,
 //! whatever its id.
 //!
-//! TODO(parity, open work item): `collection.xml` is still neither read
-//! (`BoxSetXmlProvider`) nor written (`BoxSetXmlSaver`); a folder holding
-//! one resolves all the same, but its title, overview and locks are not
-//! applied. Port path: gl-1711. And the resolver runs only here, in the
-//! folder box sets are made in: not in other libraries, not for legacy box
-//! sets with children on disk, not below a plain folder. Port path: gl-1712.
+//! A box set's `collection.xml` is read by its refresh and written by its
+//! saves (`ferrofin_providers::box_set_xml`).
+//!
+//! TODO(parity, open work item): the resolver runs only here, in the folder
+//! box sets are made in: not in other libraries, not for legacy box sets
+//! with children on disk, not below a plain folder. Port path: gl-1712.
 
 use std::collections::HashSet;
 use std::path::PathBuf;

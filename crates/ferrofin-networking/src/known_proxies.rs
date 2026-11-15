@@ -52,7 +52,7 @@ impl KnownProxies {
             ..Self::default()
         };
         for entry in &config.known_proxies {
-            if let Ok(address) = entry.trim().parse::<IpAddr>() {
+            if let Some(address) = net_utils::try_parse_ip_address(entry.trim()) {
                 proxies.add_ip_address(address, single_host_prefix(address));
             } else if let Some(subnet) =
                 net_utils::try_parse_to_subnet(entry, false).map(|data| data.subnet)

@@ -270,17 +270,6 @@ impl MusicManager for FerrofinMusicManager {
         }
     }
 
-    async fn get_instant_mix_from_artist(
-        &self,
-        artist_id: Uuid,
-        user_id: Option<Uuid>,
-        dto_options: &DtoOptions,
-    ) -> Result<Vec<BaseItemEntity>, ServiceError> {
-        // `GetInstantMixFromArtist` is the MusicArtist arm of the dispatch.
-        self.get_instant_mix_from_item(artist_id, user_id, dto_options)
-            .await
-    }
-
     async fn get_instant_mix_from_genres(
         &self,
         genres: &[String],

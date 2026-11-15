@@ -152,7 +152,11 @@ fn folder_media_type(dir: &str) -> &'static str {
     let declared = std::fs::read(ferrofin_providers::playlist_xml_path(dir, false))
         .ok()
         .and_then(|bytes| {
-            ferrofin_providers::parse_container_xml(&ferrofin_providers::decode_playlist(&bytes))
+            ferrofin_providers::parse_container_xml(
+                &ferrofin_providers::decode_playlist(&bytes),
+                BaseItemKind::Playlist,
+                &[],
+            )
         })
         .and_then(|xml| xml.playlist_media_type);
     ["Video", "Audio", "Photo", "Book"]
@@ -193,6 +197,8 @@ fn read_members(path: &str, roots: &[String]) -> Option<Vec<PlaylistMember>> {
         let xml = ferrofin_providers::playlist_xml_path(path, false);
         let parsed = ferrofin_providers::parse_container_xml(
             &ferrofin_providers::decode_playlist(&std::fs::read(xml).ok()?),
+            BaseItemKind::Playlist,
+            &[],
         )?;
         return Some(
             parsed

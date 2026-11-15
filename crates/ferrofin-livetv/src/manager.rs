@@ -68,10 +68,6 @@ use crate::stream::{LiveStreamHandle, LiveStreamKind, TunerStreamSource};
 use crate::xmltv::{Xmltv, XmltvChannel, XmltvProgramme, read_xmltv_each};
 use crate::xmltv_cache::XmlTvDocument;
 
-/// SQLite's conservative default bind-parameter limit (`SQLITE_MAX_VARIABLE_NUMBER`
-/// is 999 before 3.32, 32766 after); multi-row inserts chunk to stay under it.
-const SQLITE_BIND_LIMIT: usize = 999;
-
 /// How many programme item rows one `save_items`/`delete_items`/
 /// `save_item_values_for_items` call carries.
 ///
@@ -2170,12 +2166,13 @@ impl FerrofinLiveTvManager {
 
         // 14 columns per row; chunked multi-row insert instead of one round-trip
         // per channel.
-        for (chunk_index, chunk) in channels.chunks(SQLITE_BIND_LIMIT / 14).enumerate() {
+        let rows_per_statement = ferrofin_db::BATCH_BIND_CHUNK / 14;
+        for (chunk_index, chunk) in channels.chunks(rows_per_statement).enumerate() {
             let mut qb: QueryBuilder<Sqlite> = QueryBuilder::new(
                 r#"INSERT INTO "FerrofinLiveTvChannels"
                    ("Id","TunerHostId","TvgId","Name","Number","ImageUrl","ChannelType","StreamUrl","SortIndex","DateCreated","ExternalId","IsHd","VideoCodec","AudioCodec") "#,
             );
-            let base = chunk_index * (SQLITE_BIND_LIMIT / 14);
+            let base = chunk_index * rows_per_statement;
             qb.push_values(chunk.iter().enumerate(), |mut b, (offset, ch)| {
                 // `GuideManager.GetChannel` stores the item under
                 // `GetInternalChannelId(serviceName, channelInfo.Id)`, where
@@ -2253,7 +2250,34 @@ impl FerrofinLiveTvManager {
                 .map(sd_epg_channel)
                 .collect());
         }
-        let document = self.xmltv.get_xml(info).await?;
+        // `GetXml` rethrows what failed when no copy is cached. A file or
+        // directory that is not there, the guide or the cache file it writes,
+        // is `FileNotFoundException` or `DirectoryNotFoundException`, a 404
+        // (`ExceptionMiddleware.GetStatusCode`); an empty path is
+        // `ArgumentException`, a 400. A missing `Path` keeps its 500, the
+        // `NullReferenceException` upstream throws. `GetXml` logs the failure
+        // before it rethrows; the answer leaves the path out, as Lineups is
+        // open to users who are not administrators.
+        let document = self.xmltv.get_xml(info).await.map_err(|e| {
+            let Some(path) = info.path.as_deref() else {
+                return e;
+            };
+            let e = crate::fetch::missing_file_is_not_found(e);
+            let ServiceError::NotFound(cause) = &e else {
+                return e;
+            };
+            tracing::warn!(
+                listings_provider = info.id.as_deref().unwrap_or_default(),
+                path = %crate::fetch::redact_url(path),
+                error = %cause,
+                "live tv: XMLTV guide read failed"
+            );
+            if path.is_empty() {
+                ServiceError::InvalidInput("listing provider Path is empty".into())
+            } else {
+                ServiceError::not_found("XMLTV guide")
+            }
+        })?;
         // The channels only: every airing's children are read past, unbuilt.
         let (_, guide) = parse_guide(document, self.guide_language(info)).await?;
         // Upstream's `GetChannels` throws on a bad document, so the mapping
@@ -2897,9 +2921,9 @@ impl FerrofinLiveTvManager {
 /// The columns of one programme row in [`GuideWrite::upsert`]'s insert.
 const PROGRAM_COLUMNS: usize = 27;
 
-/// The programme rows one insert statement carries: as many as fit under
-/// [`SQLITE_BIND_LIMIT`].
-const PROGRAM_ROWS_PER_STATEMENT: usize = SQLITE_BIND_LIMIT / PROGRAM_COLUMNS;
+/// The programme rows one insert statement carries: as many as fit in
+/// [`ferrofin_db::BATCH_BIND_CHUNK`] binds.
+const PROGRAM_ROWS_PER_STATEMENT: usize = ferrofin_db::BATCH_BIND_CHUNK / PROGRAM_COLUMNS;
 
 /// One listings provider's write of its airings, in one transaction: an
 /// upsert of every airing it emits for the channels it binds, then the removal
@@ -3586,8 +3610,10 @@ impl LiveTvManager for FerrofinLiveTvManager {
             .program_dtos(&rows, &list_options, query.user.as_deref())
             .await?;
 
-        // Same rule as the item repository: the count is only bought when
-        // paging actually truncated the result.
+        // `BaseItemRepository.GetItems`' rule: the count is only bought when
+        // paging may have truncated the result. Otherwise the total is the
+        // page's length, also with the count off (`QueryItems` reads
+        // `GetItemList`, and `QueryResult` totals its items).
         let total = if query.enable_total_record_count && (query.limit.is_some() || start_index > 0)
         {
             let mut cb: QueryBuilder<Sqlite> = QueryBuilder::new(PROGRAM_COUNT);
@@ -3599,7 +3625,7 @@ impl LiveTvManager for FerrofinLiveTvManager {
                 .map_err(db_err)?;
             i32::try_from(count).unwrap_or(i32::MAX)
         } else {
-            i32::try_from(items.len()).unwrap_or(i32::MAX) + start_index
+            i32::try_from(items.len()).unwrap_or(i32::MAX)
         };
         Ok(QueryResult::new(Some(start_index), Some(total), items))
     }
@@ -3835,7 +3861,7 @@ impl LiveTvManager for FerrofinLiveTvManager {
         // By value: each document goes as soon as its airings are written,
         // rather than living through the item mirror below.
         for (provider, source) in guides {
-            kept_programs.extend(match source {
+            let written = match source {
                 GuideSource::XmlTv { document, channels } => {
                     self.insert_programs(document, &channels, &provider, window)
                         .await?
@@ -3844,7 +3870,14 @@ impl LiveTvManager for FerrofinLiveTvManager {
                     self.insert_schedules_direct_programs(&channels, &programs, &provider)
                         .await?
                 }
-            });
+            };
+            // Extending an empty map reserves a second table the size of
+            // `written` while `written` still holds the first.
+            if kept_programs.is_empty() {
+                kept_programs = written;
+            } else {
+                kept_programs.extend(written);
+            }
         }
         if clean_database {
             self.clean_guide(&kept_channels, &kept_programs).await?;
@@ -4687,14 +4720,6 @@ impl LiveTvManager for FerrofinLiveTvManager {
             )
             .await?
             .pop())
-    }
-
-    async fn get_recording_path(&self, id: Uuid) -> Result<Option<String>, ServiceError> {
-        let Some(row) = crate::dvr_repository::recording_row(&self.db, id).await? else {
-            return Ok(None);
-        };
-        // Only report a path that actually points at a captured file.
-        Ok(row.path.filter(|p| !p.is_empty()))
     }
 
     async fn get_active_recording_path(
@@ -7506,15 +7531,18 @@ fn series_programs_query(stored: &StoredSeriesTimer, now: DateTime<Utc>) -> Inte
 }
 
 /// The statement [`FerrofinLiveTvManager::query_program_rows`] runs for
-/// `query`: [`PROGRAM_SELECT`] with its filters, order and page.
+/// `query`: [`PROGRAM_SELECT`] with its filters, order and page. Each guide row
+/// is joined to the programme item the guide refresh stores under its id, which
+/// the order reads as upstream's `ApplyOrder` reads the `LiveTvProgram` items.
 fn program_rows_query(
     query: &InternalItemsQuery,
     now: DateTime<Utc>,
     restrictions: UserRestrictions<'_>,
 ) -> QueryBuilder<Sqlite> {
     let mut qb = QueryBuilder::new(PROGRAM_SELECT);
+    qb.push(r#" LEFT JOIN "BaseItems" item ON item."Id" = p."Id""#);
     push_program_filters(&mut qb, query, now, restrictions);
-    push_program_order(&mut qb, &query.order_by);
+    push_program_order(&mut qb, query);
     push_program_paging(&mut qb, query.limit, query.start_index.unwrap_or(0));
     qb
 }
@@ -7532,14 +7560,15 @@ fn push_separator(qb: &mut QueryBuilder<Sqlite>, first: &mut bool) {
 /// `BaseItemRepository.TranslateQuery`: the channel scope, the start/end date
 /// window (with `HasAired` *overriding* the end-date bounds exactly as upstream
 /// does), the airing flag, the exact-name scope `librarySeriesId` sets, and the
-/// genre scope.
+/// genre scopes, by name and by id.
 ///
 /// The classification flags (`IsMovie`/`IsSeries`/`IsNews`/`IsKids`/`IsSports`)
-/// match the columns the guide refresh derives per listings provider.
-/// `GenreIds` is deliberately not faked — it needs genre identity rows the
-/// guide cache does not hold — and `SeriesTimerId` never reaches this builder:
-/// `get_programs` answers it with the empty result upstream returns when the
-/// series-timer scope cannot be built.
+/// match the columns the guide refresh derives per listings provider:
+/// `IsMovie`/`IsSeries` each their own, and `IsNews`/`IsKids`/`IsSports` as
+/// upstream's tags, any one of the `true` ones and none of the `false` ones.
+/// `SeriesTimerId` never reaches this builder: `get_programs` answers it with
+/// the empty result upstream returns when the series-timer scope cannot be
+/// built.
 ///
 /// `restrictions` are the user's parental restrictions, from
 /// [`FerrofinLiveTvManager::user_restrictions`].
@@ -7642,9 +7671,6 @@ fn push_program_filters(
     for (column, wanted) in [
         (r#"p."IsMovie""#, query.is_movie),
         (r#"p."IsSeries""#, query.is_series),
-        (r#"p."IsNews""#, query.is_news),
-        (r#"p."IsKids""#, query.is_kids),
-        (r#"p."IsSports""#, query.is_sports),
     ] {
         if let Some(wanted) = wanted {
             push_separator(qb, &mut first);
@@ -7652,11 +7678,52 @@ fn push_program_filters(
         }
     }
 
+    push_program_tags(qb, query, &mut first);
+    push_program_genres(qb, query, &mut first);
+
+    if let Some(restrictions) = restrictions {
+        push_separator(qb, &mut first);
+        crate::guide_repository::push_item_restrictions(qb, r#"p."Id""#, restrictions);
+    }
+}
+
+/// Pushes the `IsNews`/`IsKids`/`IsSports` scopes of a program query. They are
+/// tag sugar upstream (v12.4 `TranslateQuery.cs:224-258`): a programme carries
+/// ANY of the `true` flags' tags (`:665-670`) and none of the `false` ones'
+/// (`:672-677`).
+fn push_program_tags(qb: &mut QueryBuilder<Sqlite>, query: &InternalItemsQuery, first: &mut bool) {
+    let tags = [
+        (r#"p."IsNews""#, query.is_news),
+        (r#"p."IsKids""#, query.is_kids),
+        (r#"p."IsSports""#, query.is_sports),
+    ];
+    if tags.iter().any(|(_, wanted)| *wanted == Some(true)) {
+        push_separator(qb, first);
+        qb.push("(");
+        let mut any = qb.separated(" OR ");
+        for (column, _) in tags.iter().filter(|(_, wanted)| *wanted == Some(true)) {
+            any.push(*column).push_unseparated(" = 1");
+        }
+        qb.push(")");
+    }
+    for (column, _) in tags.iter().filter(|(_, wanted)| *wanted == Some(false)) {
+        push_separator(qb, first);
+        qb.push(*column).push(" = 0");
+    }
+}
+
+/// Pushes the genre scopes of a program query: by name and by id, each
+/// keeping the airings with any one of the requested genres.
+fn push_program_genres(
+    qb: &mut QueryBuilder<Sqlite>,
+    query: &InternalItemsQuery,
+    first: &mut bool,
+) {
     if !query.genres.is_empty() {
         // `Genres` holds the XMLTV `<category>` list as a JSON array; upstream
         // matches any one of the requested genres by clean value
         // (`TranslateQuery.cs:658-662`).
-        push_separator(qb, &mut first);
+        push_separator(qb, first);
         qb.push(
             r#"EXISTS (SELECT 1 FROM json_each(p."Genres") WHERE ferrofin_clean_value("value") IN ("#,
         );
@@ -7667,48 +7734,179 @@ fn push_program_filters(
         qb.push("))");
     }
 
-    if let Some(restrictions) = restrictions {
-        push_separator(qb, &mut first);
-        crate::guide_repository::push_item_restrictions(qb, r#"p."Id""#, restrictions);
+    if !query.genre_ids.is_empty() {
+        // `WhereReferencedItem(Genre, GenreIds)` (v12.4 TranslateQuery.cs:653-656,
+        // JellyfinQueryHelperExtensions.cs:130-152): the airings whose stored
+        // item has a genre value equal to the clean name of a referenced item.
+        // The guide refresh writes an airing's genres as `ItemValues` under the
+        // guide row's id, so an airing whose item is not stored yet is not
+        // listed, as upstream lists only the stored items.
+        push_separator(qb, first);
+        qb.push(
+            r#"EXISTS (SELECT 1 FROM "ItemValuesMap" ivm JOIN "ItemValues" iv ON iv."ItemValueId" = ivm."ItemValueId" WHERE ivm."ItemId" = p."Id" AND iv."Type" = "#,
+        )
+        .push_bind(i32::from(ferrofin_db::enums::ItemValueType::Genre))
+        .push(r#" AND iv."CleanValue" IN (SELECT ref."CleanName" FROM "BaseItems" ref WHERE ref."Id" IN ("#);
+        let mut list = qb.separated(",");
+        for id in ferrofin_db::padded_in_list(&query.genre_ids) {
+            list.push_bind(guid_to_db(*id));
+        }
+        qb.push(")))");
     }
 }
 
-/// The guide column a sort key reads, or `None` when the guide cache holds
-/// nothing to sort by (those keys are skipped rather than faked).
-fn program_sort_column(sort: ItemSortBy) -> Option<&'static str> {
-    match sort {
-        ItemSortBy::Default | ItemSortBy::StartDate => Some(r#"p."StartDate""#),
-        ItemSortBy::Name | ItemSortBy::SortName => Some(r#"p."Title""#),
-        ItemSortBy::OfficialRating => Some(r#"p."OfficialRating""#),
-        ItemSortBy::ProductionYear => Some(r#"p."ProductionYear""#),
-        ItemSortBy::Random => Some("RANDOM()"),
-        _ => None,
-    }
-}
-
-/// Pushes the `ORDER BY` clause, falling back to start-date ascending — the
-/// order C# `LiveTvManager.GetPrograms` relies on ("order by start date to take
-/// advantage of a specialized index"). The id tiebreaker makes paging stable
-/// across requests.
-fn push_program_order(qb: &mut QueryBuilder<Sqlite>, order_by: &[(ItemSortBy, SortOrder)]) {
-    let mut wrote = false;
-    for (column, order) in order_by {
-        let Some(sql) = program_sort_column(*column) else {
-            continue;
-        };
-        qb.push(if wrote { ", " } else { " ORDER BY " })
-            .push(sql)
-            .push(if *order == SortOrder::Descending {
-                " DESC"
-            } else {
+/// Pushes the `ORDER BY` clause. With no key sent, C#
+/// `LiveTvManager.GetPrograms` orders by start date "to take advantage of a
+/// specialized index"; then `BaseItemRepository.ApplyOrder` (v12.4
+/// QueryBuilding.cs:306-384) orders the stored programme items:
+/// - `Default` is dropped, and no key left sorts by `SortName` alone;
+/// - a leading `SortName` is followed by `Name` in its direction;
+/// - `SortName` ascending breaks the last ties unless `SortName` or `Name` was
+///   asked for;
+/// - a `SeriesDatePlayed` key hands the order to `ApplySeriesDatePlayedOrder`:
+///   the played date of the series the row is, which no programme is, then
+///   `SortName` ascending.
+///
+/// Each key is [`push_program_sort_key`]. No id key follows, as none does
+/// upstream: a third key after `StartDate, SortName` tips SQLite's sort-cost
+/// estimate, and the default order then scans and sorts the whole guide
+/// instead of walking its start-date index and sorting each start's ties.
+fn push_program_order(qb: &mut QueryBuilder<Sqlite>, query: &InternalItemsQuery) {
+    let start_date = [(ItemSortBy::StartDate, SortOrder::Ascending)];
+    let requested = if query.order_by.is_empty() {
+        &start_date[..]
+    } else {
+        &query.order_by[..]
+    };
+    let keys: Vec<&(ItemSortBy, SortOrder)> = requested
+        .iter()
+        .filter(|(by, _)| *by != ItemSortBy::Default)
+        .collect();
+    qb.push(" ORDER BY ");
+    if keys.is_empty()
+        || keys
+            .iter()
+            .any(|(by, _)| *by == ItemSortBy::SeriesDatePlayed)
+    {
+        qb.push(r#"item."SortName""#);
+    } else {
+        let user = query.user_id().map(guid_to_db);
+        for (index, (by, order)) in keys.iter().enumerate() {
+            if index > 0 {
+                qb.push(", ");
+            }
+            // `SortOrder == Ascending ? ThenBy : ThenByDescending`.
+            let direction = if *order == SortOrder::Ascending {
                 " ASC"
-            });
-        wrote = true;
+            } else {
+                " DESC"
+            };
+            push_program_sort_key(qb, *by, user.as_deref());
+            qb.push(direction);
+            if index == 0 && *by == ItemSortBy::SortName {
+                qb.push(r#", item."Name""#).push(direction);
+            }
+        }
+        if keys
+            .iter()
+            .all(|(by, _)| !matches!(by, ItemSortBy::SortName | ItemSortBy::Name))
+        {
+            qb.push(r#", item."SortName" ASC"#);
+        }
     }
-    if !wrote {
-        qb.push(r#" ORDER BY p."StartDate" ASC"#);
+}
+
+/// Pushes what C# `OrderMapper.MapOrderByField` (v12.4 OrderMapper.cs:30-90)
+/// sorts `by` on, over the stored programme item `item`, as the item
+/// repository's `translate_query` maps it for `/Items`.
+///
+/// `StartDate` reads the guide row, which holds the same instant and carries
+/// the index the default order walks. The user-data keys read `user`'s rows;
+/// without a user, `DatePlayed` reads every user's, as upstream's does, and
+/// the others fall back to `SortName` as `/Items` does (upstream reads the
+/// missing user's id and fails). A programme is never a folder and has no
+/// alternate versions, so its played date is its own rows' and it is played
+/// when its own row says so.
+fn push_program_sort_key(qb: &mut QueryBuilder<Sqlite>, by: ItemSortBy, user: Option<&str>) {
+    use ferrofin_db::enums::ItemValueType;
+
+    if by == ItemSortBy::DatePlayed {
+        qb.push(
+            r#"(SELECT MAX(ud."LastPlayedDate") FROM "UserData" ud WHERE ud."ItemId" = item."Id""#,
+        );
+        if let Some(user) = user {
+            qb.push(r#" AND ud."UserId" = "#).push_bind(user.to_owned());
+        }
+        qb.push(")");
+        return;
     }
-    qb.push(r#", p."Id""#);
+    if let Some(user) = user {
+        let (head, tail) = match by {
+            ItemSortBy::IsPlayed => ("(SELECT COUNT(*) > 0", r#" AND ud."Played" = 1)"#),
+            ItemSortBy::IsUnplayed => ("(SELECT COUNT(*) = 0", r#" AND ud."Played" = 1)"#),
+            // `UserData.Where(user).OrderBy(CustomDataKey).FirstOrDefault()`.
+            ItemSortBy::PlayCount => (
+                r#"(SELECT ud."PlayCount""#,
+                r#" ORDER BY ud."CustomDataKey" LIMIT 1)"#,
+            ),
+            // `… .Select((bool?)f.IsFavorite).FirstOrDefault() ?? false`.
+            ItemSortBy::IsFavoriteOrLiked => (
+                r#"COALESCE((SELECT ud."IsFavorite""#,
+                r#" ORDER BY ud."CustomDataKey" LIMIT 1), 0)"#,
+            ),
+            _ => ("", ""),
+        };
+        if !head.is_empty() {
+            qb.push(head)
+                .push(r#" FROM "UserData" ud WHERE ud."ItemId" = item."Id" AND ud."UserId" = "#)
+                .push_bind(user.to_owned())
+                .push(tail);
+            return;
+        }
+    }
+    // The first value of the type by its clean text.
+    let value_type = match by {
+        ItemSortBy::Artist => Some(ItemValueType::Artist),
+        ItemSortBy::AlbumArtist => Some(ItemValueType::AlbumArtist),
+        ItemSortBy::Studio => Some(ItemValueType::Studios),
+        _ => None,
+    };
+    if let Some(value_type) = value_type {
+        qb.push(format_args!(
+            r#"(SELECT iv."CleanValue" FROM "ItemValuesMap" ivm
+                CROSS JOIN "ItemValues" iv ON iv."ItemValueId" = ivm."ItemValueId"
+                WHERE ivm."ItemId" = item."Id" AND iv."Type" = {}
+                ORDER BY iv."CleanValue" LIMIT 1)"#,
+            i32::from(value_type)
+        ));
+        return;
+    }
+    qb.push(match by {
+        ItemSortBy::StartDate => r#"p."StartDate""#,
+        ItemSortBy::Random => ferrofin_db::sqlite_random::RANDOM_SQL_EXPR,
+        ItemSortBy::Runtime => r#"item."RunTimeTicks""#,
+        ItemSortBy::DateCreated => r#"item."DateCreated""#,
+        ItemSortBy::DateLastContentAdded => r#"item."DateLastMediaAdded""#,
+        // `PremiereDate ?? MinValue.AddYears(ProductionYear - 1)`.
+        ItemSortBy::PremiereDate => {
+            r#"COALESCE(item."PremiereDate",
+                CASE WHEN item."ProductionYear" IS NOT NULL
+                     THEN printf('%04d-01-01 00:00:00.0000000', item."ProductionYear") END)"#
+        }
+        ItemSortBy::Album => r#"item."Album""#,
+        ItemSortBy::CommunityRating => r#"item."CommunityRating""#,
+        ItemSortBy::CriticRating => r#"item."CriticRating""#,
+        ItemSortBy::ProductionYear => r#"item."ProductionYear""#,
+        ItemSortBy::VideoBitRate => r#"item."TotalBitrate""#,
+        ItemSortBy::ParentIndexNumber => r#"item."ParentIndexNumber""#,
+        ItemSortBy::IndexNumber => r#"item."IndexNumber""#,
+        ItemSortBy::IsFolder => r#"item."IsFolder""#,
+        ItemSortBy::OfficialRating => r#"item."InheritedParentalRatingValue""#,
+        ItemSortBy::SeriesSortName => r#"item."SeriesName""#,
+        ItemSortBy::Name => r#"item."CleanName""#,
+        // `AirTime`'s arm and `_ => e.SortName`.
+        _ => r#"item."SortName""#,
+    });
 }
 
 /// Pushes `LIMIT`/`OFFSET` for the requested page.
@@ -7979,8 +8177,7 @@ fn derive_show_id(
 /// A UTC instant as .NET `DateTime.Ticks`: 100-nanosecond intervals since
 /// `0001-01-01T00:00:00`, which is what `ShowId`'s uniqueness suffix appends.
 pub(crate) fn dotnet_ticks(at: DateTime<Utc>) -> i64 {
-    /// Ticks between `0001-01-01` and the Unix epoch.
-    const UNIX_EPOCH_TICKS: i64 = 621_355_968_000_000_000;
+    use ferrofin_util::ticks::UNIX_EPOCH_TICKS;
     UNIX_EPOCH_TICKS + at.timestamp_micros() * 10
 }
 
@@ -8279,6 +8476,7 @@ mod tests {
     mod channel_list;
     mod guide_mirror;
     mod keep_up_to;
+    mod program_list;
     mod recording_folders;
     mod schedules_direct;
 
@@ -9032,6 +9230,94 @@ mod tests {
         assert!(listing_providers.is_empty(), "{listing_providers:?}");
     }
 
+    /// `XmlTvListingsProvider.GetXml` (v12.4 :63-161) rethrows what failed
+    /// when no copy is cached: a file or directory that is not there is
+    /// `FileNotFoundException` or `DirectoryNotFoundException`, a `404`
+    /// (`ExceptionMiddleware.GetStatusCode`), and an empty path
+    /// `ArgumentException`, a `400`. A directory (`UnauthorizedAccessException`)
+    /// and a missing `Path` (`NullReferenceException`) stay `500`s. The
+    /// lineups, the mapping options and a mapping save all read the guide's
+    /// channels through it; the save stores the pair first. The answer leaves
+    /// the path out, and a stale cached copy is still read. Stored directly: a
+    /// save refuses these paths (`Validate`), an adopted `livetv.xml` does not.
+    #[tokio::test]
+    async fn a_local_guide_that_is_gone_is_not_found_and_an_empty_path_is_invalid() {
+        let mgr = manager_with_fetcher(Arc::new(crate::fetch::ReqwestFetcher::new())).await;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let at = |name: &str| Some(dir.path().join(name).to_str().expect("utf-8").to_owned());
+        let store = |path: Option<String>| {
+            let mgr = mgr.clone();
+            async move {
+                mgr.store_listing_provider(as_xmltv(ListingsProviderInfo {
+                    path,
+                    ..ListingsProviderInfo::default()
+                }))
+                .await
+                .expect("stored")
+                .id
+                .expect("id")
+            }
+        };
+        for (path, status) in [
+            (at("gone.xml"), 404),
+            (at("gone/guide.xml"), 404),
+            (Some(" ".to_owned()), 404),
+            (Some(String::new()), 400),
+            (None, 500),
+            (Some(dir.path().to_str().expect("utf-8").to_owned()), 500),
+        ] {
+            let id = store(path.clone()).await;
+            let errors = [
+                mgr.get_lineups(Some(&id), Some("xmltv"), None, None)
+                    .await
+                    .expect_err("lineups"),
+                mgr.get_channel_mapping_options(&id)
+                    .await
+                    .expect_err("options"),
+                mgr.set_channel_mapping(&id, "1", "2")
+                    .await
+                    .expect_err("mapping"),
+            ];
+            for err in errors {
+                let got = match err {
+                    ServiceError::NotFound(_) => 404,
+                    ServiceError::InvalidInput(_) => 400,
+                    ServiceError::BackendSource(_) => 500,
+                    _ => 0,
+                };
+                assert_eq!(got, status, "{path:?}: {err:?}");
+                // A user who is not an administrator may read Lineups.
+                if status == 404 {
+                    assert!(!err.to_string().contains("gone"), "{err}");
+                }
+            }
+            let stored = mgr.listing_provider_by_id(&id).await.expect("provider");
+            assert_eq!(
+                stored.channel_mappings.len(),
+                1,
+                "{path:?}: the pair is stored first"
+            );
+        }
+
+        // A stale copy is read in place of a file that is gone, as upstream's
+        // catch returns the cached file.
+        let id = store(at("gone.xml")).await;
+        let cache_file = mgr.xmltv.cache_file_for_test(&id);
+        std::fs::create_dir_all(cache_file.parent().expect("dir")).expect("cache dir");
+        std::fs::write(&cache_file, XMLTV).expect("cached copy");
+        std::fs::File::options()
+            .write(true)
+            .open(&cache_file)
+            .expect("open")
+            .set_modified(std::time::SystemTime::now() - std::time::Duration::from_hours(2))
+            .expect("stale");
+        let lineups = mgr
+            .get_lineups(Some(&id), Some("xmltv"), None, None)
+            .await
+            .expect("the stale copy");
+        assert_eq!(lineups.len(), 1, "{lineups:?}");
+    }
+
     /// `XmlTvListingsProvider.GetLanguage`: a guide is read in its provider's
     /// `PreferredLanguage`, else in the server's `PreferredMetadataLanguage`,
     /// read as it is when the guide is read.
@@ -9722,6 +10008,93 @@ mod tests {
             .await
             .expect("progs");
         assert_eq!(programs.total_record_count, 5000);
+    }
+
+    /// One channel and one airing more than [`ferrofin_db::BATCH_BIND_CHUNK`]:
+    /// the channel and programme upserts and the deletes by id each take more
+    /// than one statement, and the lineup keeps its playlist order across the
+    /// channel upsert's statements (gl-279).
+    #[tokio::test]
+    async fn guide_writes_and_deletes_cross_the_bind_chunk() {
+        use std::fmt::Write as _;
+        let count = ferrofin_db::BATCH_BIND_CHUNK + 1;
+        // Names descend down the playlist, so only `SortIndex` keeps its order.
+        let name = |c: usize| format!("Channel {:04}", count - c);
+        let day = guide_day(0);
+        let mut m3u = String::from("#EXTM3U\n");
+        let mut xmltv = String::from("<tv>");
+        for c in 0..count {
+            let _ = write!(
+                m3u,
+                "#EXTINF:-1 tvg-id=\"ch{c}.tv\" tvg-chno=\"{c}\",{}\nhttp://tuner/{c}\n",
+                name(c)
+            );
+            let _ = write!(
+                xmltv,
+                "<channel id=\"ch{c}.tv\"><display-name>{}</display-name></channel>\
+                 <programme start=\"{day}060000 +0000\" stop=\"{day}070000 +0000\" \
+                 channel=\"ch{c}.tv\"><title>Show {c}</title></programme>",
+                name(c)
+            );
+        }
+        xmltv.push_str("</tv>");
+        let mut sources = HashMap::new();
+        sources.insert("http://tuner/playlist.m3u".to_owned(), m3u);
+        sources.insert("http://guide/xmltv.xml".to_owned(), xmltv);
+        let mgr = manager_with(FakeFetcher(sources)).await;
+        let host = mgr
+            .save_tuner_host(TunerHostInfo {
+                type_: Some("m3u".to_owned()),
+                url: Some("http://tuner/playlist.m3u".to_owned()),
+                ..TunerHostInfo::default()
+            })
+            .await
+            .expect("tuner")
+            .id
+            .expect("tuner id");
+        mgr.save_listing_provider(
+            as_xmltv(ListingsProviderInfo {
+                path: Some("http://guide/xmltv.xml".to_owned()),
+                ..ListingsProviderInfo::default()
+            }),
+            false,
+            false,
+        )
+        .await
+        .expect("provider");
+        mgr.refresh_guide().await.expect("refresh");
+
+        let lineup = crate::guide_repository::tuner_lineup(&mgr.db, &host)
+            .await
+            .expect("lineup");
+        let names: Vec<String> = lineup.into_iter().map(|row| row.name).collect();
+        assert_eq!(names, (0..count).map(name).collect::<Vec<_>>());
+
+        let programs = crate::guide_repository::all_program_ids(&mgr.db)
+            .await
+            .expect("programmes");
+        assert_eq!(programs.len(), count);
+        let mut conn = mgr.db.writer().acquire().await.expect("connection");
+        crate::guide_repository::delete_programs_in(&mut conn, &programs)
+            .await
+            .expect("delete programmes");
+        drop(conn);
+        let left = crate::guide_repository::all_program_ids(&mgr.db)
+            .await
+            .expect("programmes left");
+        assert!(left.is_empty(), "{} programmes left", left.len());
+
+        let channels = crate::guide_repository::all_channel_ids(&mgr.db)
+            .await
+            .expect("channels");
+        assert_eq!(channels.len(), count);
+        crate::guide_repository::delete_channels(&mgr.db, &channels)
+            .await
+            .expect("delete channels");
+        let left = crate::guide_repository::all_channel_ids(&mgr.db)
+            .await
+            .expect("channels left");
+        assert!(left.is_empty(), "{} channels left", left.len());
     }
 
     /// Builds a two-channel guide whose airings sit at fixed offsets from *now*,
@@ -11956,8 +12329,30 @@ mod tests {
         let expected = dir.path().join("recording.ts").display().to_string();
         assert_eq!(
             mgr.active_recording_paths().await.expect("paths"),
-            vec![expected]
+            vec![expected.clone()]
         );
+        // `Video.IsActiveRecording`, the one check every caller makes.
+        for (path, recording) in [
+            (expected, true),
+            (dir.path().join("stopping.ts").display().to_string(), false),
+            (dir.path().join("finished.ts").display().to_string(), false),
+            (dir.path().join("elsewhere.ts").display().to_string(), false),
+            (String::new(), false),
+        ] {
+            assert_eq!(
+                mgr.is_active_recording(&path).await.expect("lookup"),
+                recording,
+                "{path:?}"
+            );
+        }
+        // A failed lookup is the caller's to handle; a blank path is never
+        // looked up, as upstream returns null for it.
+        mgr.db.pool().close().await;
+        let recording = dir.path().join("recording.ts").display().to_string();
+        assert!(mgr.is_active_recording(&recording).await.is_err());
+        for blank in ["", "  "] {
+            assert!(!mgr.is_active_recording(blank).await.expect("no lookup"));
+        }
     }
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn cancelling_a_timer_mid_capture_releases_it_on_a_real_runtime() {
@@ -12674,13 +13069,12 @@ mod tests {
                 limit: Some(100),
                 ..InternalItemsQuery::default()
             };
-            let mut qb = sqlx::QueryBuilder::new(super::PROGRAM_SELECT);
-            super::push_program_filters(&mut qb, &query, now, None);
-            super::push_program_order(&mut qb, &query.order_by);
-            super::push_program_paging(&mut qb, query.limit, 0);
-            let plan = crate::guide_repository::test_support::plan(&mgr.db, qb)
-                .await
-                .expect("plan");
+            let plan = crate::guide_repository::test_support::plan(
+                &mgr.db,
+                super::program_rows_query(&query, now, None),
+            )
+            .await
+            .expect("plan");
             plans.push((n, plan));
         }
         assert!(
@@ -12891,16 +13285,20 @@ mod tests {
         assert_eq!(all.start_index, 0);
     }
 
+    /// The sort reads the stored programme items, as upstream's does, so the
+    /// guide is refreshed with an item store.
     #[tokio::test]
     async fn program_query_sorts_filters_by_genre_and_by_name() {
-        let mgr = manager_with_relative_guide().await;
+        let lab = item_lab(M3U, Some(relative_guide())).await;
+        lab.mgr.refresh_guide().await.expect("refresh");
+        let mgr = &lab.mgr;
 
         let descending = InternalItemsQuery {
             order_by: vec![(ItemSortBy::StartDate, SortOrder::Descending)],
             ..InternalItemsQuery::default()
         };
         assert_eq!(
-            titles(&mgr, &descending).await,
+            titles(mgr, &descending).await,
             ["Later", "Two Now", "Now Playing", "Aired"]
         );
 
@@ -12909,7 +13307,7 @@ mod tests {
             ..InternalItemsQuery::default()
         };
         assert_eq!(
-            titles(&mgr, &by_title).await,
+            titles(mgr, &by_title).await,
             ["Aired", "Later", "Now Playing", "Two Now"]
         );
 
@@ -12918,14 +13316,14 @@ mod tests {
             genres: vec!["news".to_owned()],
             ..InternalItemsQuery::default()
         };
-        assert_eq!(titles(&mgr, &news).await, ["Aired", "Two Now"]);
+        assert_eq!(titles(mgr, &news).await, ["Aired", "Two Now"]);
 
         // The exact-name scope `librarySeriesId` sets.
         let named = InternalItemsQuery {
             name: Some("two now".to_owned()),
             ..InternalItemsQuery::default()
         };
-        assert_eq!(titles(&mgr, &named).await, ["Two Now"]);
+        assert_eq!(titles(mgr, &named).await, ["Two Now"]);
     }
 
     /// Name and genre filters compare clean values on both sides, as upstream
