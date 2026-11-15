@@ -2102,8 +2102,10 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
                    CanRefreshMetadata keeps the forced providers and RefreshWithProviders \
                    returns after them, so only the probe runs), scan_item's run_local gate \
                    (RefreshWithProviders runs \
-                   no local reader when SearchResult is set, nor under ReplaceAllMetadata for \
-                   an item a saver rewrites), ApplySearchResult \
+                   no local reader when SearchResult is set (the NFO, and a book's embedded \
+                   readers in enrich_from_file), nor under ReplaceAllMetadata for an item a \
+                   saver rewrites (the NFO); a photo's PhotoProvider is a custom provider and \
+                   runs whatever the options), ApplySearchResult \
                    (ResolverGuesses::pin_search's name and year and search_result_ids for the \
                    lookup; a season or an episode keeps none of its own ids, \
                    RefreshContext::identified), remote_sources and provider_order \
@@ -2146,8 +2148,6 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
              heuristics pick, merging their answers fill-only; upstream runs no remote \
              provider on an unchanged Default refresh. Kept by owner decision 2026-09-24 \
              until the effect of removing the heuristics is understood.",
-            "A book's embedded metadata readers still run under an Identify. Fix path: \
-             gl-1698.",
             "A movie, series, season or episode Identify moves the chosen provider first \
              only for TheTVDB, TheMovieDb and OMDb, so a SearchProviderName naming a \
              plugin's metadata source keeps the \
