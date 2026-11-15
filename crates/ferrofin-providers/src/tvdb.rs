@@ -1290,11 +1290,6 @@ impl TvdbClient {
             birthplace: wire.birthplace,
         })
     }
-
-    /// Downloads an image by absolute URL, returning its bytes.
-    pub async fn download(&self, url: &str) -> Option<Vec<u8>> {
-        crate::image_download::download_bytes(url).await
-    }
 }
 
 /// `TvdbUtils.GetComparableName`: lower-cased (NFC), `", the"` and `"the "`
@@ -1975,7 +1970,6 @@ mod tests {
                 "/people/",
                 r#"{"data":{"biography":"An actress.","birthDate":"1986-10-23","birthPlace":"London"}}"#.to_owned(),
             ),
-            ("/img.jpg", "GIF89aIMAGEBYTES".to_owned()),
         ])
         .await;
         let c = TvdbClient::new().with_base_url(&server.base_url);
@@ -2003,12 +1997,6 @@ mod tests {
         let person = c.person_details(1).await.expect("person");
         assert_eq!(person.biography.as_deref(), Some("An actress."));
         assert_eq!(person.birthplace.as_deref(), Some("London"));
-
-        let bytes = c
-            .download(&format!("{}/img.jpg", server.base_url))
-            .await
-            .expect("download");
-        assert_eq!(bytes, b"GIF89aIMAGEBYTES");
     }
 
     #[tokio::test]

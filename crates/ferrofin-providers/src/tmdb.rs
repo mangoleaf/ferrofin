@@ -2800,9 +2800,10 @@ impl TmdbClient {
         crate::image_download::download_artwork(url).await
     }
 
-    /// Downloads an image URL's bytes, or `None` on any failure.
-    pub async fn download(&self, url: &str) -> Option<Vec<u8>> {
-        crate::image_download::download_bytes(url).await
+    /// Downloads an image URL: its bytes and the media type they are stored
+    /// under, or `None` on any failure, a response that is no image included.
+    pub async fn download(&self, url: &str) -> Option<(Vec<u8>, String)> {
+        crate::image_download::download_image_or_none(url).await
     }
 }
 
