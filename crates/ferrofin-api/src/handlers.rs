@@ -1925,21 +1925,27 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
                    its declared name, whatever case the query spelled it in), each answered after \
                    authorization (RequireAuth on the HLS and universal routes; the stream routes \
                    are anonymous upstream) and before the item is looked up. handlers/hls.rs \
-                   stream_pattern_failures and segment_pattern_failures in the seven \
-                   DynamicHlsController actions (GetMasterHlsVideoPlaylist, \
+                   stream_pattern_failures, route_container_failures and segment_pattern_failures \
+                   in the seven DynamicHlsController actions (GetMasterHlsVideoPlaylist, \
                    GetVariantHlsVideoPlaylist, GetLiveHlsStream, GetMasterHlsAudioPlaylist, \
                    GetVariantHlsAudioPlaylist, GetHlsVideoSegment, GetHlsAudioSegment): \
                    segmentContainer, audioCodec, level, videoCodec and subtitleCodec on each, and \
                    container on GetLiveHlsStream's query and on a segment's route {container} (the \
-                   text after the last dot of {segmentId}.{container}, where a blank one is \
-                   [Required]'s complaint, filed beside the others); the playlists declare no \
-                   container, so their container query is not read. The same stream_pattern_failures \
-                   in handlers/videos.rs and audio.rs get_video_stream, \
-                   get_video_stream_by_container, get_audio_stream and get_audio_stream_by_container \
-                   (VideosController.GetVideoStream and GetVideoStreamByContainer, \
-                   AudioController.GetAudioStream and GetAudioStreamByContainer), with container the \
-                   query's or the stream.{container} route's, for anonymous and Static=true requests \
-                   too, and again in transcode_stream_fallback; and audio.rs \
+                   text after the last dot of {segmentId}.{container}); the playlists declare no \
+                   container, so their container query is not read. A route container is \
+                   [Required] too: extract.rs route_container_complaint answers a blank one with \
+                   [Required]'s complaint alone (the pattern passes the null the binder makes of \
+                   it), filed beside the others. The same stream_pattern_failures in \
+                   handlers/videos.rs and audio.rs get_video_stream and get_audio_stream, and \
+                   route_container_failures in get_video_stream_by_container and \
+                   get_audio_stream_by_container (VideosController.GetVideoStream and \
+                   GetVideoStreamByContainer, AudioController.GetAudioStream and \
+                   GetAudioStreamByContainer), with container the query's or the \
+                   stream.{container} route's, for anonymous and Static=true requests too, and \
+                   again in transcode_stream_fallback; live_tv.rs get_live_stream_file \
+                   (LiveTvController.GetLiveStreamFile, anonymous: its route container, beside a \
+                   blank streamId in one body, and a segment without the stream. literal no match, \
+                   a 404); and audio.rs \
                    get_universal_audio_stream (UniversalAudioController.GetUniversalAudioStream: \
                    audioCodec and transcodingContainer only). Compared with those actions' parameter \
                    attributes at the pinned v12.4 tag, and settled against a stock 12.4 container \
@@ -1949,13 +1955,16 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
                    {container} blank (alone and beside a failing segmentContainer) and outside the \
                    pattern, level spellings (4.1, -41, abc, 1e1, a leading space, 41., 4.1.2), a \
                    HEAD of the master playlist, an anonymous stream request, Static=true, and the 401 \
-                   of an HLS request with no token coming first; a stream.{container} route value \
-                   outside the pattern was probed on 12.4 for gl-1671 (2026-11-11). Not part of this \
+                   of an HLS request with no token coming first; and (2026-11-15) a \
+                   stream.{container} blank (space, tab, beside a failing audioCodec, anonymous, an \
+                   anonymous HEAD), outside the pattern (a$b, a leading space) and empty, the \
+                   Stream. literal in another case, and a live stream file's container blank and \
+                   outside the pattern (anonymous too), each beside a blank streamId, and its \
+                   segment without the literal or empty after it. Not part of this \
                    row: merging these complaints with another \
                    parameter's binding failure into one body (gl-1672), the segments' {segmentId} \
-                   binding, a blank or empty stream.{container} (gl-1671), and the rest of each \
-                   operation",
-        date: "2026-11-14",
+                   binding, and the rest of each operation",
+        date: "2026-11-15",
         divergences: &[],
     },
     VerifiedSubsystem {
