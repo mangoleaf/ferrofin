@@ -2417,19 +2417,32 @@ impl SessionManager for FerrofinSessionManager {
         message_type: SessionMessageType,
         data: &str,
     ) -> Result<(), ServiceError> {
-        // C# takes every administrator, then the sessions holding one. Only the
-        // users of a session that can receive decide who gets it, so only theirs
-        // are read, from the policy cache: a scan pushes RefreshProgress once a
-        // second per library (gl-1312).
-        let mut admin_ids = Vec::new();
+        self.send_message_to_sessions_with_permission(
+            PermissionKind::IsAdministrator,
+            message_type,
+            data,
+        )
+        .await
+    }
+
+    async fn send_message_to_sessions_with_permission(
+        &self,
+        permission: PermissionKind,
+        message_type: SessionMessageType,
+        data: &str,
+    ) -> Result<(), ServiceError> {
+        // C# takes every user holding the permission, then the sessions holding
+        // one. Only the users of a session that can receive decide who gets it,
+        // so only theirs are read, from the policy cache: a scan pushes
+        // RefreshProgress to administrators once a second per library (gl-1312).
+        let mut ids = Vec::new();
         for id in self.receiving_user_ids().await {
-            if cached_permission(&self.db, &guid_to_db(id), PermissionKind::IsAdministrator).await?
-            {
-                admin_ids.push(id);
+            if cached_permission(&self.db, &guid_to_db(id), permission).await? {
+                ids.push(id);
             }
         }
         self.broadcast(message_type, data, |s| {
-            admin_ids.iter().any(|id| s.contains_user(*id))
+            ids.iter().any(|id| s.contains_user(*id))
         })
         .await
     }
