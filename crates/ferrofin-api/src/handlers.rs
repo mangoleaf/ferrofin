@@ -3078,17 +3078,17 @@ pub const VERIFIED: &[Verified] = &[
         ferrofin: concat!(
             "handlers/images.rs get_item_image_parametrized (the route's imageIndex, maxWidth, \
              maxHeight and unplayedCount bind with the query binder's int rules, trimmed and \
-             with the 0x, # and &h hex forms, percentPlayed with its double rules (no hex; \
-             gl-1665: Rust's inf binds and a thousands separator, 1,000, is a 400, the other \
-             way round from upstream's), format as the ImageFormat enum and tag as a required \
-             string (RequiredRouteString: a blank one is the 400), so a malformed member is a \
-             400; tag, format and both sizes are passed on as given, a 0 or negative size and \
-             a tag of 0 included; PositionalImageQuery binds only the query members the action \
-             declares, so a malformed maxWidth, percentPlayed or imageIndex in the query is not \
-             read; measured on 12.4) → ",
+             with the 0x, # and &h hex forms, percentPlayed with its double rules \
+             (DoubleModelBinder: NumberStyles.Float | AllowThousands in the invariant culture, \
+             so 1,000 binds and inf is a 400; no hex), format as the ImageFormat enum and tag \
+             as a required string (RequiredRouteString: a blank one is the 400), so a malformed \
+             member is a 400; tag, format and both sizes are passed on as given, a 0 or \
+             negative size and a tag of 0 included; PositionalImageQuery binds only the query \
+             members the action declares, so a malformed maxWidth, percentPlayed or imageIndex \
+             in the query is not read; measured on 12.4) → ",
             item_image_tail!()
         ),
-        date: "2026-11-11",
+        date: "2026-11-15",
         divergences: ITEM_IMAGE_DIVERGENCES,
         refs: &["images"],
     },
@@ -6273,9 +6273,7 @@ const BY_NAME_DIVERGENCES_ARTISTS: &[&str] = &[
      Un-defer path: make `ItemWithCounts.counts` an `Option` in ferrofin-traits.",
     "`person`, `personIds`, `personTypes` and a valid `minCommunityRating` are accepted \
      and ignored, exactly as v12 — GetItemValues copies none of them onto either filter; a \
-     `minCommunityRating` that is not a double is the binder's 400 in both, except that the \
-     shared float binder takes `inf` (a 400 upstream) and refuses a thousands separator \
-     such as `1,5` (bound upstream). Fix path: gl-1665.",
+     `minCommunityRating` that is not a double is the binder's 400 in both.",
     "The 400 (a value the query binder cannot convert, a parentId naming no item, or a \
      conflicting `filters` pair) and 403 (another user's id without the administrator \
      role) bodies are Ferrofin's error shape, not upstream's. Fix path: gl-666.",

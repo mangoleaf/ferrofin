@@ -2186,7 +2186,7 @@ impl FerrofinStreamStatePlanner {
                 &hw::quality::hardware_quality_preamble(&decode_ctx, options, &video_encoder),
             );
             // The probed capabilities, not the helper's boot ones: only the
-            // probe knows whether the VAAPI driver is iHD.
+            // probe knows whether the VAAPI driver is iHD or i965.
             push_split(
                 &mut args,
                 &self.encoding_helper.video_quality_param_with(
@@ -8431,6 +8431,45 @@ mod tests {
 
         assert!(args.contains("-c:v h264_vaapi"), "{args}");
         assert!(args.contains(" -compression_level 3"), "{args}");
+    }
+
+    /// `GetVideoBitrateParam`'s VAAPI arm keys on `IsVaapiDeviceInteli965`,
+    /// which only the per-job probe learns: VBR, but CBR on an i965 device.
+    #[tokio::test]
+    async fn a_probed_vaapi_driver_picks_the_rate_control_mode() {
+        for (driver, rc_mode) in [
+            ("Intel iHD driver", "VBR"),
+            ("Intel i965 driver", "CBR"),
+            ("Mesa Gallium driver 24.0.0 for AMD Radeon", "VBR"),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            stub_vaapi_ffmpeg(dir.path(), driver);
+            let p = planner_over_caps(
+                Arc::new(FakeMediaSources {
+                    sources: vec![source(
+                        "abc",
+                        vec![nvdec_decodable_video_stream(), audio_stream("aac")],
+                    )],
+                    live_streams: HashMap::new(),
+                }),
+                vaapi_caps(),
+                vaapi_options(),
+            );
+            let mut req = request("abc");
+            req.video_codec = Some("h264".to_owned());
+            req.allow_video_stream_copy = false;
+            req.video_bitrate = Some(3_000_000);
+            let plan = p.plan(&req, false, None, PlaylistKind::Vod).await.unwrap();
+            let args = plan.arguments.join(" ");
+
+            assert!(args.contains("-c:v h264_vaapi"), "{driver}: {args}");
+            assert!(
+                args.contains(&format!(
+                    " -rc_mode {rc_mode} -b:v 3000000 -maxrate 3000000 -bufsize 6000000"
+                )),
+                "{driver}: {args}"
+            );
+        }
     }
 
     #[tokio::test]
