@@ -19,7 +19,9 @@
 //! access policy and peer-aware address advertisement. It applies configured LAN
 //! subnets, trusted proxies, remote-IP filters, interface selection and published
 //! subnet URL overrides. Saving the named network configuration updates this
-//! manager; live interfaces refresh at boot, on save and before peer URL resolution.
+//! manager; live interfaces are read at boot, on save and after an operating-system
+//! network change (with `DetectNetworkChange` on, the default), and a peer URL is
+//! resolved from that snapshot.
 //!
 //! `AutoDiscovery` is captured at the start of each server lifetime and controls
 //! the UDP 7359 listener. Changing it requires a restart. `BaseUrl` is read the same

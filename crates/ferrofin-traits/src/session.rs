@@ -292,6 +292,23 @@ pub trait SessionManager: Send + Sync {
         data: &str,
     ) -> Result<(), ServiceError>;
 
+    /// Sends a pre-serialized JSON message to the sessions of every user who
+    /// holds `permission`, read as upstream's `User.HasPermission` reads it:
+    /// the permission itself, so an administrator without it gets nothing
+    /// (`RecordingNotifier.SendMessage` with `EnableLiveTvAccess`).
+    ///
+    /// Defaulted to a no-op so lightweight test doubles need not implement
+    /// delivery; the concrete session manager overrides it.
+    async fn send_message_to_sessions_with_permission(
+        &self,
+        permission: ferrofin_db::enums::PermissionKind,
+        message_type: SessionMessageType,
+        data: &str,
+    ) -> Result<(), ServiceError> {
+        let _ = (permission, message_type, data);
+        Ok(())
+    }
+
     /// Sends a pre-serialized JSON message to all sessions of the given users.
     async fn send_message_to_user_sessions(
         &self,
