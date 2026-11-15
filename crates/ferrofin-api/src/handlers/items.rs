@@ -2536,38 +2536,6 @@ mod tests {
         }
     }
 
-    /// The query keys [`ItemsQuery`] binds: the field list serde hands
-    /// `deserialize_struct`, captured by a deserializer that reads nothing.
-    fn items_query_keys() -> &'static [&'static str] {
-        struct Keys<'a>(&'a mut &'static [&'static str]);
-        impl<'de> serde::Deserializer<'de> for Keys<'_> {
-            type Error = serde::de::value::Error;
-            fn deserialize_any<V: serde::de::Visitor<'de>>(
-                self,
-                _: V,
-            ) -> Result<V::Value, Self::Error> {
-                Err(serde::de::Error::custom("not a struct"))
-            }
-            fn deserialize_struct<V: serde::de::Visitor<'de>>(
-                self,
-                _: &'static str,
-                fields: &'static [&'static str],
-                _: V,
-            ) -> Result<V::Value, Self::Error> {
-                *self.0 = fields;
-                Err(serde::de::Error::custom("keys captured"))
-            }
-            serde::forward_to_deserialize_any! {
-                bool i8 i16 i32 i64 i128 u8 u16 u32 u64 u128 f32 f64 char str string bytes
-                byte_buf option unit unit_struct newtype_struct seq tuple tuple_struct map
-                enum identifier ignored_any
-            }
-        }
-        let mut keys: &'static [&'static str] = &[];
-        let _ = <ItemsQuery as serde::Deserialize>::deserialize(Keys(&mut keys));
-        keys
-    }
-
     /// `GET /Items` parameters in the vendored contracts that [`ItemsQuery`]
     /// does not bind yet. Each is an open port from `ItemsController.GetItems`
     /// — bind it, honour it, and delete it here; the guard below fails on a
@@ -2604,7 +2572,7 @@ mod tests {
                     .filter_map(|p| p["name"].as_str().map(str::to_owned)),
             );
         }
-        let keys = items_query_keys();
+        let keys = crate::query::fields::<ItemsQuery>();
         assert!(keys.contains(&"albumArtistIds"), "keys captured: {keys:?}");
         let unbound: BTreeSet<&str> = contract
             .iter()
