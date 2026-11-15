@@ -18,10 +18,17 @@ fancy-regex.workspace = true
 ferrofin-chromaprint.workspace = true
 ferrofin-common.workspace = true
 ferrofin-traits.workspace = true
-# A few concrete items (the task and user registries, the core media-segment
-# task and `PAGE_SIZE`, `config_import`, the `video_versions` and `item_data`
-# helpers) until they move behind traits (gl-1829); then a dev-dependency, as
-# in ferrofin-wasm.
+# TODO(gl-1829): two imports are left, each beside lines an open GitHub PR
+# changes, so they switch once those PRs merge:
+# - `file_transformation.rs`: `use ferrofin_core::{PluginConfigPage,
+#   ScheduledTask}` (GitHub PR #1144). That PR adds `FerrofinEventManager`
+#   (take `&dyn ferrofin_traits::events::EventSubscriber` instead) and
+#   `PLUGIN_CONFIGURATION_CHANGED` (move it beside `ITEMS_CHANGED` in
+#   `ferrofin_traits::events`, re-exported from core).
+# - `intro_skipper/engine.rs`: `use ferrofin_core::TaskProgress` (GitHub PRs
+#   #1146 and #1154) becomes `ferrofin_traits::tasks::TaskProgress`.
+# Then this moves to `[dev-dependencies]`, and the notes about it in
+# `docs/ARCHITECTURE.md` and `docs/EXTENSIONS.md` go.
 ferrofin-core.workspace = true
 ferrofin-model.workspace = true
 ferrofin-naming.workspace = true

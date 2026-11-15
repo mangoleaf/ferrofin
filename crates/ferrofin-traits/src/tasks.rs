@@ -450,6 +450,20 @@ pub trait ScheduledTask: Send + Sync {
 
 fn _assert_object_safe_scheduled_task(_: &dyn ScheduledTask) {}
 
+/// Where scheduled tasks are registered: the task manager, as a crate that
+/// only contributes tasks (the compiled-in extensions) sees it.
+pub trait TaskRegistry: Send + Sync {
+    /// Registers `task`, replacing any registered task with the same key.
+    fn register(&self, task: Arc<dyn ScheduledTask>);
+}
+
+fn _assert_object_safe_task_registry(_: &dyn TaskRegistry) {}
+
+/// Items examined per page by the library tasks (the upstream
+/// `QueryPageLimit`). The extensions' library walks (Intro Skipper's queue,
+/// Merge Versions) read their rows in pages of the same size.
+pub const PAGE_SIZE: i32 = 100;
+
 // ---------------------------------------------------------------------------
 // Task id derivation (`ScheduledTaskWorker.Id`)
 // ---------------------------------------------------------------------------

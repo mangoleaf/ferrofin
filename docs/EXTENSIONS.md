@@ -46,14 +46,16 @@ An extension receives **only manager trait objects**, never concrete types — a
 `MergeVersionsManager`, `UserManager`, the `ExternalIdentityStore` (which outside identity,
 such as an LDAP uid, belongs to which user), the `RemoteImageFetcher` (image downloads under
 the server's limits: no private address unless `image_private_http_allow` lists it, and
-`image_download_max_mb`), an optional audio `Fingerprinter`, and a per-extension cache dir. It
-is the same dependency-injection seam the rest of the server uses (see
+`image_download_max_mb`), an optional audio `Fingerprinter`, a per-extension cache dir, and
+the core "Media Segment Scan" task as a `ScheduledTask` (the Intro Skipper's scan runs it
+after detection). It is the same dependency-injection seam the rest of the server uses (see
 [`ARCHITECTURE.md`](ARCHITECTURE.md)), so an extension can do real work — scan the library,
 persist media segments, register background tasks — without reaching into implementation
 crates. The contracts an extension implements (`Extension`'s `ScheduledTask` and
-`PluginConfigPage`) come from `ferrofin-traits`; the few concrete `ferrofin-core` items the
-crate still calls are listed in [`ARCHITECTURE.md`](ARCHITECTURE.md), and a new extension adds
-none.
+`PluginConfigPage`) come from `ferrofin-traits`, and so does every manager an extension calls;
+the helpers it shares with core sit below core (`ferrofin-common`, `ferrofin-db`). A new
+extension adds no `ferrofin-core` import (the two left are listed in
+[`ARCHITECTURE.md`](ARCHITECTURE.md)).
 
 The curated set is registered **statically** in one place (`builtin_extensions()`); there is
 no discovery, no filesystem scan, no dynamic loading. Consequences:

@@ -1727,6 +1727,12 @@ impl ScheduledTask for RefreshLibraryTask {
     }
 }
 
+impl ferrofin_traits::tasks::TaskRegistry for FerrofinTaskManager {
+    fn register(&self, task: Arc<dyn ScheduledTask>) {
+        FerrofinTaskManager::register(self, task);
+    }
+}
+
 /// Bridges the concrete registry onto the `ferrofin-traits` `TaskManager` seam
 /// the API layer depends on.
 ///

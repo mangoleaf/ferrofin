@@ -28,7 +28,6 @@ notify.workspace = true
 sqlx.workspace = true
 serde.workspace = true
 serde_json = { workspace = true, features = ["raw_value"] }
-quick-xml.workspace = true
 thiserror.workspace = true
 uuid.workspace = true
 # QuickConnect secrets (the thread-local CSPRNG, as ferrofin-common's salts).
