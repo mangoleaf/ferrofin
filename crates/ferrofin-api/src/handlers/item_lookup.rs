@@ -279,7 +279,8 @@ fn default_true() -> bool {
 /// `POST /Items/RemoteSearch/Apply/{itemId}` — apply a chosen result + refresh.
 ///
 /// Port of `ItemLookupController.ApplySearchCriteria`: resolves the item (`404`
-/// when absent), replaces its provider ids with the result's
+/// when absent, `400` for the all-zero id, as `GetItemById(Guid.Empty)`
+/// throws), replaces its provider ids with the result's
 /// (`item.SetProviderIds(searchResult.ProviderIds)`), then drives a
 /// `FullRefresh` (`ReplaceAllMetadata = true`, `RemoveOldMetadata = true`,
 /// `ReplaceAllImages = <query>`) carrying the chosen result and returns once
@@ -303,6 +304,7 @@ fn default_true() -> bool {
     request_body = RemoteSearchResult,
     responses(
         (status = 204, description = "Item metadata refreshed"),
+        (status = 400, description = "A nil item id"),
         (status = 404, description = "Item not found")
     ),
     tag = "ferrofin"
@@ -314,6 +316,10 @@ async fn apply_search_criteria(
     Query(query): Query<ApplyQuery>,
     JsonBody(search_result): JsonBody<RemoteSearchResult>,
 ) -> Result<axum::http::StatusCode, ApiError> {
+    // `GetItemById(Guid.Empty)` throws `ArgumentException`, a 400.
+    if item_id.is_nil() {
+        return Err(ApiError::BadRequest("Guid can't be empty".to_owned()));
+    }
     let Some(item) = state
         .library
         .get_item_by_id_for_user(item_id, auth.user.as_deref())
@@ -378,16 +384,8 @@ async fn apply_search_criteria(
             // the scan queue's priority lane — inside a running scan, between
             // two of its items — so it never waits for a library scan.
             let library = std::sync::Arc::clone(&state.library);
-            // In the request's span: the request awaits it (LOGGING.md §4).
-            let ran = tokio::spawn(tracing::Instrument::in_current_span(async move {
-                library.run_refresh_scan(target, &options).await
-            }))
-            .await
-            .map_err(|err| {
-                ApiError::Service(ServiceError::backend(format!(
-                    "identify refresh task failed: {err}"
-                )))
-            })??;
+            let ran = run_detached(async move { library.run_refresh_scan(target, &options).await })
+                .await?;
             if !ran {
                 // Logged once, by the error boundary (a 5xx).
                 return Err(ApiError::ServiceUnavailable(format!(
@@ -405,10 +403,35 @@ async fn apply_search_criteria(
                 "item {item_id} belongs to no library, so it cannot be refreshed"
             )));
         }
-        None => state.providers.refresh_full_item(item_id, &options).await?,
+        None => {
+            // On a task of its own too (`CancellationToken.None`).
+            let providers = std::sync::Arc::clone(&state.providers);
+            run_detached(async move { providers.refresh_full_item(item_id, &options).await })
+                .await?;
+        }
     }
 
     Ok(axum::http::StatusCode::NO_CONTENT)
+}
+
+/// Runs an Identify refresh on a task of its own and awaits it, so a client
+/// that hangs up does not stop it (upstream's `CancellationToken.None`). The
+/// task keeps the request's span (the request awaits it, LOGGING.md §4) and
+/// its culture, which a spawned task does not inherit.
+async fn run_detached<T: Send + 'static>(
+    refresh: impl std::future::Future<Output = Result<T, ServiceError>> + Send + 'static,
+) -> Result<T, ApiError> {
+    let culture = ferrofin_util::current_culture::capture();
+    tokio::spawn(tracing::Instrument::in_current_span(
+        ferrofin_util::current_culture::scope(culture, refresh),
+    ))
+    .await
+    .map_err(|err| {
+        ApiError::Service(ServiceError::backend(format!(
+            "identify refresh task failed: {err}"
+        )))
+    })?
+    .map_err(ApiError::from)
 }
 
 /// Whether `item`'s metadata comes only from the library scan: a file- or

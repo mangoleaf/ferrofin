@@ -15,12 +15,11 @@ use ferrofin_traits::media_encoding::MediaEncoder;
 use ferrofin_traits::persistence::{MediaStreamQuery, MediaStreamRepository};
 use ferrofin_traits::stubs::LiveTvManager;
 use ferrofin_traits::system::PathManager;
+use ferrofin_util::ticks::{TICKS_PER_SECOND, UNIX_EPOCH_TICKS};
 use uuid::Uuid;
 
 use crate::ScanCancel;
 use crate::library_scan::off_runtime;
-
-const TICKS_PER_SECOND: i64 = 10_000_000;
 
 /// Extraction and reconciliation without ownership of the library or chapters.
 /// This can be shared with the scanner without a library ownership cycle.
@@ -267,8 +266,11 @@ impl ChapterImageExtractor {
         let Some(live_tv) = self.live_tv.as_ref().and_then(Weak::upgrade) else {
             return false;
         };
-        match live_tv.active_recording_paths().await {
-            Ok(paths) => paths.iter().any(|path| video.path.as_ref() == Some(path)),
+        match live_tv
+            .is_active_recording(video.path.as_deref().unwrap_or_default())
+            .await
+        {
+            Ok(recording) => recording,
             Err(error) => {
                 tracing::warn!(item_id = %video.id, %error, "active recording lookup failed");
                 true
@@ -446,7 +448,7 @@ fn average_chapter_duration(chapters: &[ChapterInfo]) -> i64 {
 /// `0001-01-01`); unset is `DateTime.MinValue`, 0 ticks.
 pub(crate) fn date_modified_ticks(date: Option<DateTime<Utc>>) -> i64 {
     date.map_or(0, |date| {
-        621_355_968_000_000_000
+        UNIX_EPOCH_TICKS
             + date.timestamp() * TICKS_PER_SECOND
             + i64::from(date.timestamp_subsec_nanos() / 100)
     })

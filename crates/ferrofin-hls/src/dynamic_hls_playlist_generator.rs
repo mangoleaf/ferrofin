@@ -16,16 +16,11 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use ferrofin_keyframes::keyframe_data::KeyframeData;
 use ferrofin_model::configuration::EncodingOptions;
+use ferrofin_util::ticks::{TICKS_PER_MS, TICKS_PER_SECOND_F64};
 use uuid::Uuid;
 
 use crate::create_main_playlist_request::CreateMainPlaylistRequest;
 use crate::error::HlsError;
-
-/// The number of ticks in a second (1 tick = 100ns; mirrors `TimeSpan.TicksPerSecond`).
-pub const TICKS_PER_SECOND: i64 = 10_000_000;
-
-/// The number of ticks in a millisecond (mirrors `TimeSpan.TicksPerMillisecond`).
-pub const TICKS_PER_MILLISECOND: i64 = 10_000;
 
 pub use ferrofin_traits::media_encoding::KeyframeExtractor;
 
@@ -228,8 +223,7 @@ impl<C: EncodingOptionsProvider> DynamicHlsPlaylistGenerator<C> {
 /// A segment length in seconds as the playlist's ticks: converted by hand, as
 /// upstream does, to avoid the precision loss of converting the double.
 fn segment_length_ticks(length: f64) -> i64 {
-    #[allow(clippy::cast_precision_loss)]
-    convert_to_i64(length * TICKS_PER_SECOND as f64)
+    convert_to_i64(length * TICKS_PER_SECOND_F64)
 }
 
 /// Where each segment of a playlist with `segments` (lengths in seconds)
@@ -315,7 +309,7 @@ pub fn compute_segments(keyframe_data: &KeyframeData, desired_segment_length_ms:
     let mut result: Vec<f64> = Vec::new();
 
     // Scale the segment length to ticks to match the keyframes.
-    let desired_segment_length_ticks = i64::from(desired_segment_length_ms) * TICKS_PER_MILLISECOND;
+    let desired_segment_length_ticks = i64::from(desired_segment_length_ms) * TICKS_PER_MS;
     let mut desired_cut_time = desired_segment_length_ticks;
 
     for &keyframe in ticks {
@@ -356,7 +350,7 @@ pub fn compute_equal_length_segments(
         });
     }
 
-    let segment_length_ticks = i64::from(desired_segment_length_ms) * TICKS_PER_MILLISECOND;
+    let segment_length_ticks = i64::from(desired_segment_length_ms) * TICKS_PER_MS;
     let whole_segments = total_runtime_ticks / segment_length_ticks;
     let remaining_ticks = total_runtime_ticks % segment_length_ticks;
 
@@ -382,7 +376,7 @@ pub fn compute_equal_length_segments(
 #[must_use]
 #[allow(clippy::cast_precision_loss)]
 fn ticks_to_total_seconds(ticks: i64) -> f64 {
-    ticks as f64 / TICKS_PER_SECOND as f64
+    ticks as f64 / TICKS_PER_SECOND_F64
 }
 
 /// Mirrors C# `Convert.ToInt64(double)`: round-half-to-even (banker's rounding).
@@ -421,7 +415,7 @@ mod tests {
 
     /// Mirrors the C# test helper `MsToTicks`: `TimeSpan.FromMilliseconds(v).Ticks`.
     fn ms_to_ticks(value: i64) -> i64 {
-        value * TICKS_PER_MILLISECOND
+        value * TICKS_PER_MS
     }
 
     // === ComputeSegments_Valid_Success (Theory data verbatim) ===============

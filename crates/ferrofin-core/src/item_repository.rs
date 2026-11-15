@@ -277,6 +277,25 @@ struct ViewRow {
     has_linked_children: bool,
 }
 
+/// Where a fetch's rows come from ([`FerrofinItemRepository::fetch_scope`]).
+#[allow(
+    clippy::large_enum_variant,
+    reason = "built once per fetch and destructured at once; the resolved filter was already returned by value, and boxing it would add an allocation to every browse"
+)]
+enum FetchScope {
+    /// A folders view, answered from the user root's children: already
+    /// filtered, sorted, trimmed to the `AdjacentTo` window and paged.
+    FoldersView(QueryResult<BaseItemEntity>),
+    /// The SQL path.
+    Sql {
+        /// The filter with its views resolved, or `None` when resolving
+        /// changed nothing and the caller's own filter applies.
+        resolved: Option<InternalItemsQuery>,
+        /// The `AdjacentTo` window, or `None` when the filter asks for none.
+        window: Option<Vec<Uuid>>,
+    },
+}
+
 impl FerrofinItemRepository {
     /// v12's movies arm of `GetLatestItemList` (`GetLatestMovieItems`,
     /// `Querying.cs:233-256`): stream the caller's rows newest first and keep
@@ -1588,23 +1607,40 @@ impl FerrofinItemRepository {
             .filter(|collection_type| collection_type != "mixed"))
     }
 
+    /// The scope [`Self::fetch_rows`], [`Self::fetch_ids`],
+    /// [`Self::fetch_id_clean_names`] and `get_items` each run on, worked out
+    /// in this one place so the four cannot drift apart: a folders view's own
+    /// result, or the filter with its views resolved and its `AdjacentTo`
+    /// window, which `GetItems`, `GetItemList` and `GetItemIdsList` all apply
+    /// before paging.
+    async fn fetch_scope(&self, filter: &InternalItemsQuery) -> Result<FetchScope, ServiceError> {
+        let parent = self.query_parent_row(filter).await?;
+        if let Some(result) = self.folders_view_result(filter, parent.as_ref()).await? {
+            return Ok(FetchScope::FoldersView(result));
+        }
+        let resolved = self
+            .resolve_views_with_parent(filter, parent.as_ref())
+            .await?;
+        let window = self
+            .adjacent_ids_resolved(resolved.as_ref().unwrap_or(filter))
+            .await?;
+        Ok(FetchScope::Sql { resolved, window })
+    }
+
     /// Runs a translated query in the requested shape, returning full rows.
     async fn fetch_rows(
         &self,
         filter: &InternalItemsQuery,
         shape: QueryShape,
     ) -> Result<Vec<BaseItemEntity>, ServiceError> {
-        let parent = self.query_parent_row(filter).await?;
-        if let Some(result) = self.folders_view_result(filter, parent.as_ref()).await? {
-            return Ok(result.items);
-        }
-        let resolved = self
-            .resolve_views_with_parent(filter, parent.as_ref())
-            .await?;
+        let (resolved, window) = match self.fetch_scope(filter).await? {
+            FetchScope::FoldersView(result) => return Ok(result.items),
+            FetchScope::Sql { resolved, window } => (resolved, window),
+        };
         let filter = resolved.as_ref().unwrap_or(filter);
         // The window is whole rows whatever the shape: a `FullRows` caller
         // needs them, and an `EpisodeOrder` caller reads a subset of them.
-        if let Some(window) = self.adjacent_ids_resolved(filter).await? {
+        if let Some(window) = window {
             return Ok(sql_page(self.rows_in_order(&window).await?, filter));
         }
         self.fetch_rows_resolved(filter, shape).await
@@ -1684,23 +1720,28 @@ impl FerrofinItemRepository {
     ///
     /// Same statement as [`Self::fetch_rows`] but for the projection, so the
     /// rows — and their order — are identical to what `get_item_list` would
-    /// have returned.
+    /// have returned. An `AdjacentTo` window (a few rows) is read as whole
+    /// rows, as `fetch_rows` reads it.
     async fn fetch_id_clean_names(
         &self,
         filter: &InternalItemsQuery,
     ) -> Result<Vec<(String, Option<String>)>, ServiceError> {
-        let parent = self.query_parent_row(filter).await?;
-        if let Some(result) = self.folders_view_result(filter, parent.as_ref()).await? {
-            return Ok(result
-                .items
-                .into_iter()
+        let id_clean_names = |rows: Vec<BaseItemEntity>| {
+            rows.into_iter()
                 .map(|row| (row.id, row.clean_name))
-                .collect());
-        }
-        let resolved = self
-            .resolve_views_with_parent(filter, parent.as_ref())
-            .await?;
+                .collect()
+        };
+        let (resolved, window) = match self.fetch_scope(filter).await? {
+            FetchScope::FoldersView(result) => return Ok(id_clean_names(result.items)),
+            FetchScope::Sql { resolved, window } => (resolved, window),
+        };
         let filter = resolved.as_ref().unwrap_or(filter);
+        if let Some(window) = window {
+            return Ok(id_clean_names(sql_page(
+                self.rows_in_order(&window).await?,
+                filter,
+            )));
+        }
         let mut qb = build_query(filter, QueryShape::IdAndCleanName);
         qb.build_query_as::<(String, Option<String>)>()
             .fetch_all(self.db.pool())
@@ -1710,19 +1751,18 @@ impl FerrofinItemRepository {
 
     /// Runs a translated query returning only the id column.
     async fn fetch_ids(&self, filter: &InternalItemsQuery) -> Result<Vec<Uuid>, ServiceError> {
-        let parent = self.query_parent_row(filter).await?;
-        if let Some(result) = self.folders_view_result(filter, parent.as_ref()).await? {
-            return Ok(result
-                .items
-                .iter()
-                .filter_map(|row| Uuid::parse_str(&row.id).ok())
-                .collect());
-        }
-        let resolved = self
-            .resolve_views_with_parent(filter, parent.as_ref())
-            .await?;
+        let (resolved, window) = match self.fetch_scope(filter).await? {
+            FetchScope::FoldersView(result) => {
+                return Ok(result
+                    .items
+                    .iter()
+                    .filter_map(|row| Uuid::parse_str(&row.id).ok())
+                    .collect());
+            }
+            FetchScope::Sql { resolved, window } => (resolved, window),
+        };
         let filter = resolved.as_ref().unwrap_or(filter);
-        if let Some(window) = self.adjacent_ids_resolved(filter).await? {
+        if let Some(window) = window {
             return Ok(sql_page(window, filter));
         }
         let mut qb = build_query(filter, QueryShape::IdsOnly);
@@ -3013,8 +3053,9 @@ const ALL_ARTIST_TYPES: &[ItemValueType] = &[ItemValueType::Artist, ItemValueTyp
 
 /// Maps the `BaseItemImageInfos.ImageType` integer discriminant to the wire
 /// [`ImageType`]. The discriminants are the fixed `ImageInfoImageType` values and
-/// line up 1:1 with [`ImageType`]; an out-of-range value falls back to
-/// [`ImageType::Primary`] (the C# default when parsing a legacy row).
+/// line up 1:1 with [`ImageType`]; an out-of-range value is kept as
+/// [`ImageType::Unrecognized`], as upstream's `(ImageType)e.ImageType` cast
+/// keeps it (`BaseItemMapper.MapImageFromEntity`).
 pub(crate) fn image_type_from_disc(disc: i32) -> ImageType {
     ImageType::from_json_value(disc)
 }
@@ -3042,12 +3083,14 @@ pub(crate) fn images_of_items_sql(placeholders: &str) -> String {
 }
 
 /// Projects a persisted [`BaseItemImageInfoEntity`] row into an
-/// [`ItemImageInfo`].
+/// [`ItemImageInfo`], its `%MetadataPath%`-style path expanded: upstream's
+/// `BaseItemMapper.MapImageFromEntity`, which every reader of an image row
+/// goes through (the repository, the DTO batch read, the scan's reads).
 ///
 /// The stored `Blurhash` is a UTF-8 byte blob; an empty blob (or one that is not
 /// valid UTF-8) becomes [`None`]. A zero/negative width or height (the "unknown"
 /// sentinel) is preserved as-is; the API layer nulls those out per Jellyfin.
-fn image_info_from_row(
+pub(crate) fn image_info_from_row(
     row: BaseItemImageInfoEntity,
     virtual_paths: &VirtualPathExpander,
 ) -> ItemImageInfo {
@@ -3952,19 +3995,16 @@ impl ItemRepository for FerrofinItemRepository {
                 children,
             ));
         }
-        let parent = self.query_parent_row(filter).await?;
-        if let Some(result) = self.folders_view_result(filter, parent.as_ref()).await? {
-            return Ok(result);
-        }
         // Resolve once for both statements below: the page and its count share
         // one scope, and asking the database twice for the same library's
         // folders is a round trip on every paged browse.
-        let resolved = self
-            .resolve_views_with_parent(filter, parent.as_ref())
-            .await?;
+        let (resolved, window) = match self.fetch_scope(filter).await? {
+            FetchScope::FoldersView(result) => return Ok(result),
+            FetchScope::Sql { resolved, window } => (resolved, window),
+        };
         let filter = resolved.as_ref().unwrap_or(filter);
         let start_index = filter.start_index.unwrap_or(0);
-        if let Some(window) = self.adjacent_ids_resolved(filter).await? {
+        if let Some(window) = window {
             // `GetItems` counts the trimmed set, then pages it.
             let window_len = window.len();
             let items = sql_page(self.rows_in_order(&window).await?, filter);
@@ -4078,7 +4118,9 @@ impl ItemRepository for FerrofinItemRepository {
         &self,
         filter: &InternalItemsQuery,
     ) -> Result<Vec<(String, Option<String>)>, ServiceError> {
-        self.fetch_id_clean_names(filter).await
+        let prepared = grouped_by_metadata_key(filter);
+        self.fetch_id_clean_names(prepared.as_ref().unwrap_or(filter))
+            .await
     }
 
     async fn get_latest_item_list(
@@ -5085,6 +5127,40 @@ mod tests {
     use ferrofin_model::data::BaseItemKind;
     use ferrofin_model::entities::ExtraType;
     use ferrofin_traits::persistence::ItemPersistenceService;
+
+    /// `MapImageFromEntity`: the type is cast as stored, an unknown one kept;
+    /// an empty or non-UTF-8 blurhash reads as none; no stored date is the
+    /// epoch.
+    #[rstest::rstest]
+    #[case::known_type(1, Some(b"LKO2".to_vec()), ImageType::Art, Some("LKO2"))]
+    #[case::unknown_type_kept(99, None, ImageType::Unrecognized(99), None)]
+    #[case::empty_blurhash(0, Some(Vec::new()), ImageType::Primary, None)]
+    #[case::non_utf8_blurhash(0, Some(vec![0xFF, 0xFE]), ImageType::Primary, None)]
+    fn an_image_row_maps_as_upstream_reads_it(
+        #[case] disc: i32,
+        #[case] blurhash: Option<Vec<u8>>,
+        #[case] image_type: ImageType,
+        #[case] blur_hash: Option<&str>,
+    ) {
+        let row = BaseItemImageInfoEntity {
+            id: "id".to_owned(),
+            blurhash,
+            date_modified: None,
+            height: 2,
+            image_type: disc,
+            item_id: "item".to_owned(),
+            path: "/m/poster.jpg".to_owned(),
+            width: 3,
+        };
+        let image = image_info_from_row(row, &VirtualPathExpander::identity());
+        assert_eq!(image.image_type, image_type);
+        assert_eq!(image.blur_hash.as_deref(), blur_hash);
+        assert_eq!(image.date_modified, default_epoch());
+        assert_eq!(
+            (image.path.as_str(), image.width, image.height),
+            ("/m/poster.jpg", 3, 2)
+        );
+    }
 
     /// The batched image read answers each item exactly as `get_image_infos`
     /// does (by type, then insertion order), and leaves out an item with no
@@ -6401,6 +6477,33 @@ mod tests {
             repository.get_item_ids(&adjacent(bravo)).await.unwrap(),
             [alpha, bravo, charlie]
         );
+        let clean_ids = |rows: Vec<(String, Option<String>)>| -> Vec<String> {
+            rows.into_iter().map(|(id, _)| id).collect()
+        };
+        assert_eq!(
+            clean_ids(
+                repository
+                    .get_item_id_clean_names(&adjacent(bravo))
+                    .await
+                    .unwrap()
+            ),
+            [alpha, bravo, charlie].map(guid_to_db),
+            "the clean-name projection trims to the same window as get_item_list"
+        );
+        assert_eq!(
+            clean_ids(
+                repository
+                    .get_item_id_clean_names(&InternalItemsQuery {
+                        start_index: Some(1),
+                        limit: Some(1),
+                        ..adjacent(charlie)
+                    })
+                    .await
+                    .unwrap()
+            ),
+            [guid_to_db(charlie)],
+            "and pages the window as the other projections do"
+        );
         // A nil id is no adjacency request at all.
         assert_eq!(
             repository
@@ -7583,6 +7686,10 @@ mod tests {
 
         let list = repository.get_item_list(&query).await.expect("list");
         let ids = repository.get_item_ids(&query).await.expect("ids");
+        let clean = repository
+            .get_item_id_clean_names(&query)
+            .await
+            .expect("clean names");
         let page = repository
             .get_items(&InternalItemsQuery {
                 enable_total_record_count: true,
@@ -7592,8 +7699,8 @@ mod tests {
             .expect("page");
         assert_eq!(page.total_record_count, 10, "the total counts every match");
         assert_eq!(
-            (list.len(), ids.len(), page.items.len()),
-            (rows, rows, rows)
+            (list.len(), ids.len(), clean.len(), page.items.len()),
+            (rows, rows, rows, rows)
         );
     }
 

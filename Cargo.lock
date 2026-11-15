@@ -1272,13 +1272,18 @@ dependencies = [
 name = "ferrofin-common"
 version = "0.4.1"
 dependencies = [
+ "ferrofin-model",
  "pbkdf2",
+ "quick-xml",
  "rand 0.10.3",
  "regex",
  "rstest",
+ "serde",
+ "serde_json",
  "sha1 0.11.0",
  "sha2 0.11.1",
  "thiserror",
+ "tracing",
  "uuid",
 ]
 
@@ -1306,7 +1311,6 @@ dependencies = [
  "notify",
  "opentelemetry",
  "opentelemetry_sdk",
- "quick-xml",
  "rand 0.10.3",
  "regex",
  "reqwest",
@@ -1335,6 +1339,7 @@ dependencies = [
  "ferrofin-util",
  "libsqlite3-sys",
  "rstest",
+ "serde_json",
  "sqlx",
  "tempfile",
  "thiserror",
@@ -1431,6 +1436,7 @@ dependencies = [
  "ferrofin-mediaencoding",
  "ferrofin-model",
  "ferrofin-traits",
+ "ferrofin-util",
  "rstest",
  "tempfile",
  "thiserror",

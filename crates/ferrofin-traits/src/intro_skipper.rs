@@ -376,6 +376,12 @@ pub trait IntroSkipperStore: Send + Sync {
         modes: &[AnalysisMode],
     ) -> Result<(), ServiceError>;
 
+    /// Deletes the items' automatic segments and drops them from every
+    /// season's analysed lists, together, so the next pass analyses them
+    /// again; user-provided segments stay. Used when an item's file changed;
+    /// upstream's plugin keeps the old analysis.
+    async fn forget_items(&self, item_ids: &[Uuid]) -> Result<(), ServiceError>;
+
     /// Deletes every segment that is not valid (`End <= 0`) — what upstream's
     /// `RebuildDatabaseAsync` leaves behind when it restores its backup; how
     /// many went.
@@ -847,6 +853,17 @@ impl IntroSkipperStore for InMemoryIntroSkipperStore {
             if *season == season_id && modes.contains(mode) {
                 state.episode_ids.clear();
             }
+        }
+        Ok(())
+    }
+
+    async fn forget_items(&self, item_ids: &[Uuid]) -> Result<(), ServiceError> {
+        let mut memory = self.lock()?;
+        memory
+            .segments
+            .retain(|s| s.is_user_provided || !item_ids.contains(&s.item_id));
+        for state in memory.states.values_mut() {
+            state.episode_ids.retain(|id| !item_ids.contains(id));
         }
         Ok(())
     }
