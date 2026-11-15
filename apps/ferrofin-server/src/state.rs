@@ -3858,6 +3858,15 @@ mod tests {
         async fn support_bundle(&self) -> String {
             String::new()
         }
+        fn operating_system(&self) -> String {
+            String::new()
+        }
+        async fn create_or_replace_segment(
+            &self,
+            _segment: &ferrofin_model::media_segments::MediaSegmentDto,
+        ) -> Result<(), ferrofin_traits::error::ServiceError> {
+            Ok(())
+        }
         async fn hides_intros(&self, _item_id: uuid::Uuid) -> bool {
             false
         }

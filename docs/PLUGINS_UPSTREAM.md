@@ -32,7 +32,9 @@ Conventions:
     `ChromaprintAnalyzer`, `TimeAdjustmentHelper`), `chapter_analyzer.rs`,
     `black_frame.rs` (`BlackFrameAnalyzer`, recaps), `credit_scenes.rs`
     (`CreditsBlackFrameAnalyzer` and `Analyzers/Credits`), `automatic.rs`
-    (`Entrypoint`), `config_hash.rs` (`ConfigHasher`), test data `testdata/`;
+    (`Entrypoint`), `config_hash.rs` (`ConfigHasher`), `editor.rs`
+    (`MediaSegmentEditorService`), `platform.rs` (`Helper/OperatingSystem`),
+    test data `testdata/`;
   - processes: `crates/ferrofin-extensions/src/ffmpeg.rs` (`FFmpegService`,
     `FFmpegOutputParser`), `fingerprint.rs` (Chromaprint);
   - paged library reads: `crates/ferrofin-extensions/src/library_pages.rs`
