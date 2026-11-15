@@ -340,6 +340,7 @@ impl QuickConnect for OkQuickConnect {
         _secret: &str,
     ) -> Result<AuthenticationResultData, ServiceError> {
         Ok(AuthenticationResultData {
+            user: UserDto::default(),
             session: SessionInfoDto {
                 user_id: ADMIN_ID,
                 user_name: Some("admin".to_owned()),
@@ -1110,6 +1111,20 @@ impl MediaSourceManager for OkMediaSources {
     }
 }
 
+/// The administrator [`OkSessions`] signs in: the `User` its result carries.
+fn authenticated_user() -> UserDto {
+    UserDto {
+        id: USER_ID,
+        name: Some("alice".to_owned()),
+        server_id: Some("server-1".to_owned()),
+        policy: Some(UserPolicy {
+            is_administrator: true,
+            ..UserPolicy::default()
+        }),
+        ..UserDto::default()
+    }
+}
+
 /// A [`SessionManager`] whose `authenticate_new_session` returns a canned
 /// session for [`USER_ID`]; every other method is unused.
 ///
@@ -1133,6 +1148,7 @@ impl SessionManager for OkSessions {
             .expect("lock")
             .push(request.remote_endpoint.clone());
         Ok(AuthenticationResultData {
+            user: authenticated_user(),
             session: SessionInfoDto {
                 id: Some("session-1".to_owned()),
                 user_id: USER_ID,
@@ -2275,12 +2291,12 @@ async fn authenticate_by_name_returns_authentication_result() {
     assert_eq!(json["AccessToken"], "canned-token");
 }
 
-/// A sign-in whose user cannot be reloaded afterwards (here: gone from the
-/// store) still answers with the minted token, and its bare `User` carries
-/// the session's `ServerId` and `new UserDto()`'s policy, `new UserPolicy()`,
-/// not an all-false one that tells the client the user may not play anything.
+/// A sign-in answers the `User` the session manager authenticated, as
+/// `AuthenticateNewSessionInternal` builds it from the user it holds. The
+/// handler never reloads the user, so one the store no longer has (here) is
+/// still answered as themselves, not as a bare DTO with another policy.
 #[tokio::test]
-async fn sign_in_fallback_user_carries_the_constructor_policy() {
+async fn sign_in_answers_the_user_it_authenticated() {
     let router = create_router(state_with_sessions(
         Arc::new(MemUsers::default()),
         Arc::new(MemConfig::new(true)),
@@ -2302,19 +2318,11 @@ async fn sign_in_fallback_user_carries_the_constructor_policy() {
     assert_eq!(response.status(), StatusCode::OK);
     let json = json_body(response).await;
     assert_eq!(json["AccessToken"], "canned-token");
-    assert_eq!(json["User"]["Name"], "alice");
-    assert_eq!(json["User"]["ServerId"], "server-1");
-    let policy = &json["User"]["Policy"];
-    // `UserPolicy.cs`'s constructor values.
-    assert_eq!(policy["EnableMediaPlayback"], true);
-    assert_eq!(policy["EnableAllFolders"], true);
-    assert_eq!(policy["IsHidden"], true);
-    assert_eq!(policy["IsAdministrator"], false);
-    assert_eq!(policy["LoginAttemptsBeforeLockout"], -1);
-    assert_eq!(policy["SyncPlayAccess"], "CreateAndJoinGroups");
-    // Every member: an empty body binds the constructor policy.
-    let constructor: UserPolicy = serde_json::from_str("{}").unwrap();
-    assert_eq!(*policy, serde_json::to_value(constructor).unwrap());
+    assert_eq!(json["User"]["Policy"]["IsAdministrator"], true);
+    assert_eq!(
+        json["User"],
+        serde_json::to_value(authenticated_user()).unwrap()
+    );
 }
 
 /// The obsolete `UserController.AuthenticateUser` (`POST /Users/{userId}/

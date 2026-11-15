@@ -797,6 +797,10 @@ async fn authenticate_new_session_enforces_password_and_returns_the_token() {
         !result.access_token.expose().is_empty(),
         "authenticate_new_session returns a non-empty token"
     );
+    // `User` is the signed-in user's DTO, carrying this login's stamp.
+    assert_eq!(result.user.id, user_id);
+    assert_eq!(result.user.name.as_deref(), Some("bob"));
+    assert!(result.user.last_login_date.is_some());
 
     let persisted: String =
         sqlx::query_scalar(r#"SELECT "AccessToken" FROM "Devices" WHERE "DeviceId" = ?1"#)

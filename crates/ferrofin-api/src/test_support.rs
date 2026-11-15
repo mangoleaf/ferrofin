@@ -1380,6 +1380,7 @@ impl SessionManager for FakeSessions {
         _request: &AuthenticationRequest,
     ) -> Result<AuthenticationResultData, ServiceError> {
         Ok(AuthenticationResultData {
+            user: UserDto::default(),
             session: SessionInfoDto::default(),
             access_token: FAKE_ACCESS_TOKEN.into(),
         })
@@ -1389,6 +1390,7 @@ impl SessionManager for FakeSessions {
         _request: &AuthenticationRequest,
     ) -> Result<AuthenticationResultData, ServiceError> {
         Ok(AuthenticationResultData {
+            user: UserDto::default(),
             session: SessionInfoDto::default(),
             access_token: FAKE_ACCESS_TOKEN.into(),
         })

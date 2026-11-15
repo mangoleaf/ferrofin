@@ -69,6 +69,8 @@ struct MemUsers {
     updated_policy: Mutex<Option<(Uuid, UserPolicy)>>,
     /// Records whether `delete_user` was called and for whom.
     deleted: Mutex<Option<Uuid>>,
+    /// Makes `get_user_dto` fail, as a database read error does.
+    unreadable: bool,
 }
 
 /// The fixed two-user table shared by [`MemUsers`] and the assertions.
@@ -141,6 +143,9 @@ impl UserManager for MemUsers {
         user: &UserEntity,
         server_id: Option<String>,
     ) -> Result<UserDto, ServiceError> {
+        if self.unreadable {
+            return Err(ServiceError::backend("disk"));
+        }
         // The admin user reports IsAdministrator; everyone else does not.
         let is_admin = user.id == ADMIN_ID.to_string();
         Ok(UserDto {
@@ -224,6 +229,8 @@ impl ServerConfigurationManager for MemConfig {
 struct OkQuickConnect {
     /// The user id the last `authorize_request` was made for.
     authorized_for: Mutex<Option<Uuid>>,
+    /// The stored session's user, when not the admin.
+    session_user: Option<Uuid>,
 }
 
 #[async_trait]
@@ -256,10 +263,18 @@ impl QuickConnect for OkQuickConnect {
         &self,
         _secret: &str,
     ) -> Result<AuthenticationResultData, ServiceError> {
+        // The authorize-time snapshot, answered only when `User` cannot be
+        // built at the exchange.
         Ok(AuthenticationResultData {
+            user: UserDto {
+                id: self.session_user.unwrap_or(ADMIN_ID),
+                name: Some("stale".to_owned()),
+                ..UserDto::default()
+            },
             session: SessionInfoDto {
-                user_id: ADMIN_ID,
+                user_id: self.session_user.unwrap_or(ADMIN_ID),
                 user_name: Some("admin".to_owned()),
+                server_id: Some("server-1".to_owned()),
                 ..SessionInfoDto::default()
             },
             access_token: "qc-token".into(),
@@ -689,6 +704,52 @@ async fn authenticate_with_quick_connect_returns_the_authorized_session() {
     let body = body_json(response).await;
     assert_eq!(body["AccessToken"], "qc-token");
     assert_eq!(body["SessionInfo"]["UserName"], "admin");
+    // `User` is built at the exchange, from the user as they are now, not the
+    // authorize-time snapshot upstream answers (Jellyfin bug not ported).
+    assert_eq!(body["User"]["Name"], "admin");
+    assert_eq!(body["User"]["Policy"]["IsAdministrator"], true);
+}
+
+/// A user deleted after their code was authorized, or whose DTO cannot be
+/// read, still gets the token minted then, with the `User` snapshotted at
+/// authorization: the one upstream always answers, here only when the user
+/// cannot be built at the exchange.
+#[rstest::rstest]
+#[case::deleted(Uuid::from_u128(0xdead), false)]
+#[case::unreadable(ADMIN_ID, true)]
+#[tokio::test]
+async fn quick_connect_exchange_that_cannot_build_the_user_answers_the_snapshot(
+    #[case] session_user: Uuid,
+    #[case] unreadable: bool,
+) {
+    let router = create_router(state_full(
+        Arc::new(MemUsers {
+            unreadable,
+            ..MemUsers::default()
+        }),
+        Arc::new(MemConfig::new(true)),
+        Arc::new(admin_auth()),
+        Arc::new(OkQuickConnect {
+            session_user: Some(session_user),
+            ..OkQuickConnect::default()
+        }),
+    ));
+    let response = router
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/Users/AuthenticateWithQuickConnect")
+                .header("Content-Type", "application/json")
+                .body(Body::from(r#"{"Secret":"sec"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let json = body_json(response).await;
+    assert_eq!(json["AccessToken"], "qc-token");
+    assert_eq!(json["User"]["Id"], session_user.simple().to_string());
+    assert_eq!(json["User"]["Name"], "stale");
 }
 
 /// `QuickConnectDto.Secret` is `[Required]`: a missing, `null` or blank secret

@@ -512,6 +512,7 @@ impl SessionManager for OkSessions {
         _request: &AuthenticationRequest,
     ) -> Result<AuthenticationResultData, ServiceError> {
         Ok(AuthenticationResultData {
+            user: ferrofin_model::dto::UserDto::default(),
             session: SessionInfoDto {
                 id: Some("session-1".to_owned()),
                 user_id: USER_ID,
