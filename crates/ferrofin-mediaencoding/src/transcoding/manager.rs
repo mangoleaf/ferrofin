@@ -2113,54 +2113,6 @@ impl<S: SessionReporter, C: FileCleaner> TranscodeManager for TranscodeManagerIm
         }
         Ok(())
     }
-
-    async fn report_transcoding_progress(
-        &self,
-        job: &TranscodingJobHandle,
-        progress: TranscodingProgress,
-    ) -> Result<(), ServiceError> {
-        if let Some(shared) =
-            self.with_running(job, |running| std::sync::Arc::clone(&running.progress))
-        {
-            shared.lock().expect("progress lock poisoned").encoded = progress;
-        }
-        self.reporter.report_progress(job, progress).await;
-        Ok(())
-    }
-
-    async fn on_transcode_begin_request(
-        &self,
-        path: &str,
-        job_type: TranscodingJobType,
-    ) -> Result<Option<TranscodingJobHandle>, ServiceError> {
-        let mut jobs = self.jobs.lock().expect("jobs lock poisoned");
-        let job = jobs
-            .iter_mut()
-            .find(|j| j.handle.job_type == job_type && j.handle.path.eq_ignore_ascii_case(path));
-        Ok(job.map(|j| {
-            // A new consumer arrived: bump the active-request count so the idle
-            // reaper does not fire (OnTranscodeBeginRequest).
-            j.active_request_count += 1;
-            j.last_activity = std::time::Instant::now();
-            j.handle.clone()
-        }))
-    }
-
-    async fn on_transcode_end_request(
-        &self,
-        job: &TranscodingJobHandle,
-    ) -> Result<(), ServiceError> {
-        let mut jobs = self.jobs.lock().expect("jobs lock poisoned");
-        if let Some(registered) = jobs.iter_mut().find(|j| {
-            j.handle.job_type == job.job_type && j.handle.path.eq_ignore_ascii_case(&job.path)
-        }) {
-            // Mirror OnTranscodeEndRequest decrementing ActiveRequestCount; the
-            // idle countdown starts from this moment.
-            registered.active_request_count = (registered.active_request_count - 1).max(0);
-            registered.last_activity = std::time::Instant::now();
-        }
-        Ok(())
-    }
 }
 
 #[cfg(test)]
@@ -2392,33 +2344,6 @@ mod tests {
                 .on_job_killed(job, delete_files, close_live_stream)
                 .await;
         }
-    }
-
-    #[tokio::test]
-    async fn begin_and_end_request_track_active_count() {
-        let m = manager();
-        m.register_job(handle("s1", "/t/a.m3u8", TranscodingJobType::Hls, "dev1"));
-        let begun = m
-            .on_transcode_begin_request("/t/a.m3u8", TranscodingJobType::Hls)
-            .await
-            .unwrap();
-        assert!(begun.is_some());
-        let job = begun.unwrap();
-        m.on_transcode_end_request(&job).await.unwrap();
-        // Job is still registered (end just decrements the request count).
-        assert_eq!(m.active_job_count(), 1);
-    }
-
-    #[tokio::test]
-    async fn report_progress_is_ok() {
-        let m = manager();
-        let h = handle("s1", "/t/a.m3u8", TranscodingJobType::Hls, "dev1");
-        m.register_job(h.clone());
-        assert!(
-            m.report_transcoding_progress(&h, TranscodingProgress::default())
-                .await
-                .is_ok()
-        );
     }
 
     /// A reporter whose first `panics` teardowns panic, as a fault part-way
