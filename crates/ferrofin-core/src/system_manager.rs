@@ -137,7 +137,8 @@ pub trait StorageProbe: Send + Sync {
 /// the mount table cannot be read (only `/proc/mounts` and `/etc/mtab` are
 /// read, which macOS lacks), a chroot hides `/`, or a Windows folder is a UNC
 /// path (`\\server\share`) no drive letter holds, and there the `-1` would
-/// also refuse every backup (`free_space_of`).
+/// also refuse every backup (`free_space_of`) and every boot
+/// (`test_common_paths_for_storage_capacity`).
 #[derive(Debug, Clone, Copy, Default)]
 pub struct FsStorageProbe;
 
@@ -238,14 +239,15 @@ pub const TWO_GIGABYTE: i64 = 2_147_483_647;
 /// `StorageHelper.TestCommonPathsForStorageCapacity`, which Jellyfin runs at
 /// startup and again before it applies a restore.
 ///
-/// Free space the probe cannot read (`-1`: a failed `statvfs` or
-/// `GetDiskFreeSpaceExW`) is logged and passed, where upstream's `DriveInfo`
-/// throws.
+/// A path that is not valid UTF-8 is not checked, with a warning: the probe
+/// takes a `&str`, and .NET could not name that folder either.
 ///
 /// # Errors
 ///
 /// A [`ServiceError`] with upstream's message when a path has less than the
-/// minimum free, or when a path cannot be created.
+/// minimum free; one with this port's own message when its free space cannot
+/// be read (the probe's `-1`), where upstream's `DriveInfo` throws; or when a
+/// path cannot be created.
 pub fn test_common_paths_for_storage_capacity(
     probe: &dyn StorageProbe,
     data_path: &std::path::Path,
@@ -267,13 +269,19 @@ fn test_data_directory_size(
     tracing::debug!(path = %path.display(), "checking a path for storage capacity");
     std::fs::create_dir_all(path)
         .map_err(|e| ServiceError::backend(format!("cannot create `{}`: {e}", path.display())))?;
-    let info = probe.probe(&path.to_string_lossy());
-    if info.free_space < 0 {
+    let Some(utf8) = path.to_str() else {
         tracing::warn!(
             path = %path.display(),
-            "the free space of a storage path cannot be read, so its capacity is not checked"
+            "a storage path that is not valid UTF-8 cannot be probed, so it is not checked"
         );
         return Ok(());
+    };
+    let info = probe.probe(utf8);
+    if info.free_space < 0 {
+        return Err(ServiceError::backend(format!(
+            "The free space of the path `{}` cannot be read.",
+            path.display()
+        )));
     }
     if info.free_space < threshold {
         return Err(ServiceError::backend(format!(
@@ -1228,20 +1236,47 @@ mod tests {
         );
     }
 
-    /// Free space the probe cannot read is not a refusal.
+    /// Free space that cannot be read refuses the boot, as upstream's
+    /// `DriveInfo.AvailableFreeSpace` throws there.
     #[test]
-    fn unreadable_free_space_does_not_refuse_the_boot() {
+    fn unreadable_free_space_refuses_the_boot() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let probe = FreeSpaceProbe {
             free: -1,
             low: None,
         };
-        test_common_paths_for_storage_capacity(
+        let data = tmp.path().join("data");
+        let err = test_common_paths_for_storage_capacity(
             &probe,
-            &tmp.path().join("data"),
+            &data,
             &tmp.path().join("cache"),
             tmp.path(),
         )
-        .expect("unknown free space is not checked");
+        .expect_err("unknown free space is refused");
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "backend error: The free space of the path `{}` cannot be read.",
+                data.display()
+            )
+        );
+    }
+
+    /// A path that is not valid UTF-8 cannot reach the `&str` probe: it is not
+    /// checked, rather than refused as unreadable. Linux only: macOS
+    /// filesystems refuse such a name.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_non_utf8_storage_path_is_not_checked() {
+        use std::os::unix::ffi::OsStrExt;
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let probe = FreeSpaceProbe {
+            free: -1,
+            low: None,
+        };
+        let odd = tmp.path().join(std::ffi::OsStr::from_bytes(b"data-\xff"));
+        test_common_paths_for_storage_capacity(&probe, &odd, &odd, &odd)
+            .expect("a path the probe cannot name is not refused");
+        assert!(odd.is_dir());
     }
 }
