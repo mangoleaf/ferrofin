@@ -17,6 +17,7 @@ use ferrofin_common::providers;
 use ferrofin_model::data::PersonKind;
 use ferrofin_model::entities::MetadataField;
 use ferrofin_util::finite::finite_or_none;
+use ferrofin_util::ticks::TICKS_PER_SECOND;
 
 use crate::container_types::{FileSystemMetadata, LocalImageInfo, MetadataResult, PersonInfo};
 
@@ -38,8 +39,6 @@ const YOUTUBE_WATCH_URL: &str = "https://www.youtube.com/watch?v=";
 
 /// Minimum production year accepted from a `<year>` tag (upstream `> 1850`).
 const MIN_PRODUCTION_YEAR: i32 = 1850;
-/// .NET ticks per second (100-ns units); used for run-time conversions.
-const TICKS_PER_SECOND: i64 = 10_000_000;
 /// Seconds per minute; used for the `<runtime>` (minutes) conversion.
 const SECONDS_PER_MINUTE: i64 = 60;
 

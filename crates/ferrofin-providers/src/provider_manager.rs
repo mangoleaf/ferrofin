@@ -31,7 +31,7 @@ use ferrofin_traits::error::ServiceError;
 use ferrofin_traits::library::VirtualFolderManager;
 use ferrofin_traits::options::ItemImageInfo;
 use ferrofin_traits::persistence::{
-    ItemPersistenceService, ItemRepository, ItemTypeLookup, OwnerExtrasRefresh,
+    ItemPersistenceService, ItemRepository, ItemTypeLookup, OwnerExtrasRefresh, PlaylistMember,
 };
 use ferrofin_traits::providers::{
     GeneratedImageProvider, ItemUpdateType, MetadataRefreshMode, MetadataRefreshOptions,
@@ -45,8 +45,8 @@ use crate::library_options::{
     channel_fetcher_override, fetcher_names, image_fetcher_enabled, metadata_fetcher_enabled,
 };
 use crate::refresh_plan::{
-    FileFacts, ImageFetch, PassOutcome, ProbeKind, RefreshRequest, StoredState, decide_save,
-    plan_item_refresh,
+    FileFacts, ImageFetch, ItemRefreshPlan, LocalMetadataFile, LocalMetadataFormat, PassOutcome,
+    ProbeKind, RefreshRequest, StoredState, decide_save, plan_item_refresh,
 };
 use crate::tmdb::{TmdbClient, TmdbDetails, TmdbImage, TmdbKind};
 use ferrofin_db::entities::base_items::{BaseItemEntity, item_values_of};
@@ -1136,6 +1136,9 @@ pub struct LocalProviderManager {
     /// Refreshes waiting for the serial worker (`ProviderManager._refreshQueue`).
     refresh_queue: Arc<std::sync::Mutex<RefreshQueue>>,
     nfo_saver: Option<Arc<crate::nfo_save::NfoSaver>>,
+    /// A box set's `collection.xml` saver (`BoxSetXmlSaver`); with it the
+    /// box set's refresh reads the file too (`BoxSetXmlProvider`).
+    box_set_xml: Option<Arc<crate::box_set_xml::BoxSetXmlSaver>>,
     image_saver: Option<Arc<crate::image_save::ImageFileSaver>>,
     external_id_infos: Vec<ExternalIdInfo>,
     /// Runtime-registered named metadata providers (WASM plugins) as
@@ -1313,6 +1316,7 @@ impl std::fmt::Debug for LocalProviderManager {
                 &self.remote_search_providers.len(),
             )
             .field("has_nfo_saver", &self.nfo_saver.is_some())
+            .field("has_box_set_xml", &self.box_set_xml.is_some())
             .field("has_image_saver", &self.image_saver.is_some())
             .field("has_image_store", &self.image_store.is_some())
             .field("metadata_dir", &self.metadata_dir)
@@ -1356,6 +1360,14 @@ impl LocalProviderManager {
         self
     }
 
+    /// Attaches the box set `collection.xml` saver, which also makes a box
+    /// set's refresh read the file ([`crate::box_set_xml`]).
+    #[must_use]
+    pub fn with_box_set_xml(mut self, saver: Arc<crate::box_set_xml::BoxSetXmlSaver>) -> Self {
+        self.box_set_xml = Some(saver);
+        self
+    }
+
     /// Attaches the providers that draw an item's Primary from other items'
     /// artwork (upstream's `BaseDynamicImageProvider` family), so a refresh of
     /// a genre, music genre or playlist redraws its collage.
@@ -1387,6 +1399,7 @@ impl LocalProviderManager {
         Self {
             refresh_queue: Arc::default(),
             nfo_saver: None,
+            box_set_xml: None,
             image_saver: None,
             external_id_infos,
             dynamic_fetchers: Vec::new(),
@@ -2020,6 +2033,69 @@ impl LocalProviderManager {
         Ok(Some(ids))
     }
 
+    /// `RefreshWithProviders`' local metadata provider for a box set,
+    /// `BoxSetXmlProvider`: its `collection.xml` ([`crate::box_set_xml`]),
+    /// read when the plan runs the local readers — never when identifying,
+    /// nor under "Replace all metadata" while a metadata saver is enabled for
+    /// the item (`isSavingMetadata`, `MetadataService.cs:803`). Its provider
+    /// id elements are the box set's external ids
+    /// (`GetExternalIdInfos(item)`).
+    async fn read_local_xml(
+        &self,
+        stored: &BaseItemEntity,
+        file: Option<&crate::box_set_xml::LocalXmlFile>,
+        plan: &ItemRefreshPlan,
+        options: &MetadataRefreshOptions,
+    ) -> Option<crate::local_xml::LocalContainerXml> {
+        let (saver, file) = (self.box_set_xml.as_ref()?, file?);
+        if !plan.local_metadata || options.search_result.is_some() {
+            return None;
+        }
+        if options.replace_all_metadata {
+            // `IsSaverEnabledForItem` logs a failure and counts the saver
+            // as disabled.
+            match saver
+                .is_enabled_for(stored, ItemUpdateType::MetadataEdit)
+                .await
+            {
+                Ok(true) => return None,
+                Ok(false) => {}
+                Err(err) => {
+                    tracing::warn!(item_id = %stored.id, %err, "could not tell whether the box set's collection.xml is saved");
+                }
+            }
+        }
+        let keys: Vec<String> = crate::external_ids::external_id_infos(BaseItemKind::BoxSet)
+            .into_iter()
+            .chain(self.external_id_infos.iter().cloned())
+            .filter_map(|info| info.key)
+            .collect();
+        crate::box_set_xml::read(&file.path, &keys).await
+    }
+
+    /// `ProviderManager.SaveMetadataAsync` with the NFO saver. A failure is
+    /// logged, never returned: the metadata is already committed.
+    async fn save_nfo(&self, item_id: Uuid, update: ItemUpdateType) {
+        if let Some(saver) = &self.nfo_saver
+            && let Err(error) = saver.save(item_id, update).await
+        {
+            tracing::warn!(%item_id, %error, "NFO metadata saver failed");
+        }
+    }
+
+    /// `ProviderManager.SaveMetadataAsync` with the `collection.xml` saver:
+    /// whether it wrote the file. A failure is logged, never returned: the
+    /// metadata is already committed.
+    async fn save_box_set_xml(&self, item_id: Uuid, update: ItemUpdateType) -> bool {
+        let Some(saver) = &self.box_set_xml else {
+            return false;
+        };
+        saver.save(item_id, update).await.unwrap_or_else(|error| {
+            tracing::warn!(%item_id, %error, "collection.xml metadata saver failed");
+            false
+        })
+    }
+
     /// The item's locked metadata fields. Without a store nothing is
     /// persisted, so nothing is locked; a failed read locks every field
     /// rather than let a refresh overwrite one the user locked.
@@ -2618,6 +2694,19 @@ impl LocalProviderManager {
             options,
             force_save: options.force_save,
         };
+        // A box set's local metadata provider, `BoxSetXmlProvider`: its
+        // `collection.xml`, which its change monitor watches.
+        let xml_file = match &self.box_set_xml {
+            Some(_) => crate::box_set_xml::local_file(&stored).await,
+            None => None,
+        };
+        let file = FileFacts {
+            local_metadata: xml_file.as_ref().map(|file| LocalMetadataFile {
+                mtime: file.mtime,
+                format: LocalMetadataFormat::Xml,
+            }),
+            ..NO_FILE
+        };
         let plan = plan_item_refresh(
             Some(&StoredState {
                 date_last_refreshed: stored.date_last_refreshed,
@@ -2628,7 +2717,7 @@ impl LocalProviderManager {
                 is_virtual_item: stored.is_virtual_item,
                 is_locked: stored.is_locked,
             }),
-            &NO_FILE,
+            &file,
             &request,
             library.as_ref(),
             Utc::now(),
@@ -2638,8 +2727,17 @@ impl LocalProviderManager {
         // `CanRefreshImages`): the owning library's fetcher checkboxes and the
         // item's `IsLocked` flag.
         let gated = self.gated_options(&stored, options).await;
+        let local = self
+            .read_local_xml(&stored, xml_file.as_ref(), &plan, options)
+            .await;
+        // `isLocalLocked`: a file that locks the item runs no remote provider.
+        let local_locked = local
+            .as_ref()
+            .is_some_and(|local| local.item.item.is_locked);
         let fetch = Fetch {
-            metadata: plan.remote_metadata && wants_fetch(gated.metadata_refresh_mode),
+            metadata: plan.remote_metadata
+                && wants_fetch(gated.metadata_refresh_mode)
+                && !local_locked,
             images: !local_images_failed
                 && plan.remote_images != ImageFetch::None
                 && wants_fetch(gated.image_refresh_mode),
@@ -2760,6 +2858,9 @@ impl LocalProviderManager {
             _ => None,
         };
         let mut base = stored.clone();
+        // Whether the members changed a value `UpdateMetadataFromChildren`
+        // reports as `MetadataEdit` (the date, year, genres, studios, rating).
+        let mut members_edited = false;
         // `BeforeSave` → `UpdateMetadataFromChildren` (`MetadataService.cs:
         // 404-483`): past the `isFullRefresh` gate a box set or playlist takes
         // its runtime, genres, studios, date and rating from its members
@@ -2783,6 +2884,7 @@ impl LocalProviderManager {
                 )
                 .map(str::to_owned);
             }
+            members_edited = crate::metadata_merge::members_edited(&stored, &base);
         }
         // `BoxSetMetadataService.BeforeSaveInternal`: on every refresh, past
         // any gate or lock, a box set's `LibraryFolderIds` — the libraries
@@ -2801,17 +2903,29 @@ impl LocalProviderManager {
         // when a provider answered (`UpdateType > None`).
         let current = MetadataResult {
             provider_ids: stored_ids.clone(),
+            locked_fields: locked_fields.clone(),
             ..MetadataResult::of(base)
         };
+        let downloaded = fetched.item.is_some();
+        // `hasRemoteMetadata`: with only the local file answering and a
+        // remote provider failing, "Replace all metadata" keeps the stored
+        // values (`MetadataService.cs:898-902`).
         let merge = RefreshMerge::of(
             options,
             RefreshAnswers {
                 any: true,
                 failed: failures > 0,
-                remote: true,
-                local_locked: false,
+                remote: downloaded,
+                local_locked,
             },
         );
+        // The file's links, kept for after the save: they count only for a
+        // box set outside the data directory (`BoxSetMetadataService.MergeData`).
+        let mut local = local;
+        let local_members = local
+            .as_mut()
+            .map(|local| std::mem::take(&mut local.children));
+        let local_people = local.as_mut().and_then(|local| local.item.people.take());
         // The credits the answers carried, as the scan folds them
         // ([`pass_credits`](crate::metadata_merge::pass_credits)): `None`
         // keeps the stored ones. A locked item and a `Cast` lock keep them
@@ -2819,10 +2933,39 @@ impl LocalProviderManager {
         let credits = if stored.is_locked || locked_fields.contains(&MetadataField::Cast) {
             None
         } else {
-            crate::metadata_merge::pass_credits(None, &fetched.credits, merge.keep_existing)
+            crate::metadata_merge::pass_credits(local_people, &fetched.credits, merge.keep_existing)
         };
-        let merged = match fetched.item {
-            Some(mut item) if !stored.is_locked => {
+        let merged = match (local, fetched.item) {
+            // `RefreshWithProviders` with a local result: `temp` starts with
+            // the item's path, ids, `ParentIndexNumber` and preferred
+            // language and country (`MetadataService.cs:790-795`), takes the
+            // file's values (`MergeData(localItem, temp, [], false, true)`,
+            // `:850`), then the remote answer fills what the file left empty
+            // (`MergeData(result, temp, [], false, false)`, `:1003`).
+            (Some(local), remote) if !stored.is_locked => {
+                let mut temp = MetadataResult::of(BaseItemEntity {
+                    id: stored.id.clone(),
+                    type_: stored.type_.clone(),
+                    path: stored.path.clone(),
+                    parent_index_number: stored.parent_index_number,
+                    preferred_metadata_language: stored.preferred_metadata_language.clone(),
+                    preferred_metadata_country_code: stored.preferred_metadata_country_code.clone(),
+                    ..BaseItemEntity::default()
+                });
+                let mut local = local.item;
+                local.item.type_.clone_from(&stored.type_);
+                crate::metadata_merge::merge_data(&local, &mut temp, &[], false, true);
+                if let Some(mut item) = remote {
+                    item.type_.clone_from(&stored.type_);
+                    let answer = MetadataResult {
+                        provider_ids: fetched.provider_ids,
+                        ..MetadataResult::of(item)
+                    };
+                    crate::metadata_merge::merge_data(&answer, &mut temp, &[], false, false);
+                }
+                crate::metadata_merge::merge_refresh(&current, temp, &locked_fields, merge)
+            }
+            (_, Some(mut item)) if !stored.is_locked => {
                 item.id.clone_from(&stored.id);
                 item.type_.clone_from(&stored.type_);
                 item.path.clone_from(&stored.path);
@@ -2908,12 +3051,21 @@ impl LocalProviderManager {
         // rule, decided as the library scan decides them.
         let metadata_changed = row != stored;
         let ids_changed = merged.provider_ids != stored_ids;
+        // A local file unions its `LockedFields` into the item's
+        // (`MergeBaseItemData`, `:1372-1379`).
+        let locks_changed = merged.locked_fields != locked_fields;
+        // A local reader that answered is `MetadataImport`, which upstream
+        // saves whatever it changed (`updateType > None`): the save's stamp
+        // settles the file's change monitor.
+        let read_local = local_members.is_some();
         let decision = decide_save(
             plan,
             &request,
             PassOutcome {
                 changed: metadata_changed
                     || ids_changed
+                    || locks_changed
+                    || read_local
                     || image_saved
                     || generated
                     || local_images
@@ -2940,6 +3092,38 @@ impl LocalProviderManager {
                 store
                     .replace_provider_ids(item_id, &merged.provider_ids)
                     .await?;
+            }
+            if locks_changed {
+                let added: Vec<i32> = merged
+                    .locked_fields
+                    .iter()
+                    .filter(|field| !locked_fields.contains(field))
+                    .map(|field| field.json_value())
+                    .collect();
+                store.add_locked_fields(item_id, &added).await?;
+            }
+            // `BoxSetMetadataService.MergeData`: the file's members join the
+            // links of a box set outside the data directory; in it, the
+            // `LinkedChildren` table is the source of truth (v12.4).
+            if let (Some(members), Some(saver)) = (&local_members, &self.box_set_xml)
+                && row.path.as_deref().is_some_and(|path| {
+                    crate::box_set_xml::takes_members_from_file(
+                        &saver.data_path(),
+                        std::path::Path::new(path),
+                    )
+                })
+            {
+                let members: Vec<PlaylistMember> = members
+                    .iter()
+                    .map(|child| PlaylistMember {
+                        item_id: child
+                            .item_id
+                            .as_deref()
+                            .and_then(|id| Uuid::parse_str(id).ok()),
+                        path: child.path.clone(),
+                    })
+                    .collect();
+                store.merge_box_set_members(item_id, &members).await?;
             }
             // The refresh of a video copies its title metadata to its parts
             // (`BaseItem.RefreshMetadataForOwnedItem`) and its save gives its
@@ -2988,16 +3172,27 @@ impl LocalProviderManager {
         {
             tracing::warn!(%item_id, %err, "could not copy the item's metadata to its extras");
         }
-        // What changed: the row's metadata beats an image save, which beats
-        // nothing — the closest single value to the C# `ItemUpdateType` flags.
-        let update = if metadata_changed
-            || ids_changed
-            || request.force_save
-            || request.options.replace_all_metadata
-        {
+        // What changed, as the closest single value to the C#
+        // `ItemUpdateType` flags the savers are gated on: `MetadataEdit` when
+        // the members changed the date, genres, studios or rating
+        // (`UpdatePremiereDate` and its siblings, `MetadataService.cs:543-635`),
+        // `MetadataDownload` when a remote provider answered, changed or not
+        // (`ExecuteRemoteProviders`), or the options force it (`ForceSave`,
+        // `ReplaceAllMetadata`, `:258-262`), else an image save, else
+        // `MetadataImport` for what the local file or the rest of
+        // `BeforeSave` (the runtime, the library folders, the rating score,
+        // the sort name) changed. The savers write nothing back from an
+        // import, so a file the user edited stays as they wrote it.
+        let forced = request.force_save || request.options.replace_all_metadata;
+        let metadata = metadata_changed || ids_changed || locks_changed;
+        let update = if members_edited {
+            ItemUpdateType::MetadataEdit
+        } else if forced || downloaded {
             ItemUpdateType::MetadataDownload
         } else if image_saved || generated || local_images || removed_images {
             ItemUpdateType::ImageUpdate
+        } else if metadata || read_local {
+            ItemUpdateType::MetadataImport
         } else {
             ItemUpdateType::None
         };
@@ -5193,10 +5388,16 @@ impl ProviderManager for LocalProviderManager {
     ) -> Result<(), ServiceError> {
         // ProviderManager.SaveMetadataAsync logs saver failures; metadata has
         // already been committed and an unwritable sidecar must not undo it.
-        if let Some(saver) = &self.nfo_saver
-            && let Err(error) = saver.save(item_id, update_type).await
+        self.save_nfo(item_id, update_type).await;
+        // "Modify again, so saved value is after write time of externally
+        // saved metadata" (`LibraryManager.UpdateItemsAsync`): the XML
+        // reader's change monitor has no tolerance, so the server's own write
+        // must not read as a change.
+        if self.save_box_set_xml(item_id, update_type).await
+            && let Some(store) = &self.image_store
+            && let Err(error) = store.touch_item_updated(item_id).await
         {
-            tracing::warn!(%item_id, %error, "NFO metadata saver failed");
+            tracing::warn!(%item_id, %error, "could not stamp the box set's save time after writing its collection.xml");
         }
         Ok(())
     }
@@ -5208,8 +5409,9 @@ impl ProviderManager for LocalProviderManager {
     ) -> Result<(), ServiceError> {
         // `LibraryManager.UpdateItemsAsync` runs the savers, then the save
         // re-stamps `DateLastSaved` "after write time of externally saved
-        // metadata" and `ItemUpdated` fires.
-        self.save_metadata(item_id, update_type).await?;
+        // metadata" and `ItemUpdated` fires, once.
+        self.save_nfo(item_id, update_type).await;
+        self.save_box_set_xml(item_id, update_type).await;
         if let Some(store) = &self.image_store {
             store.touch_item_updated(item_id).await?;
             // A video's save gives its local versions its images and
@@ -8189,9 +8391,6 @@ mod tests {
             _item_id: Uuid,
             _ancestor_ids: &[Uuid],
         ) -> Result<(), ServiceError> {
-            unimplemented!()
-        }
-        async fn save_images(&self, _item: &BaseItemEntity) -> Result<(), ServiceError> {
             unimplemented!()
         }
         async fn locked_fields_for_items(

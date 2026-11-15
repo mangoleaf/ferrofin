@@ -42,6 +42,7 @@ use ferrofin_model::subtitles::FontFile;
 use ferrofin_traits::error::ServiceError;
 use ferrofin_traits::subtitles::{SubtitleResponse, SubtitleSearchRequest};
 use ferrofin_util::string_extensions::equals_ordinal_ignore_case;
+use ferrofin_util::ticks::TICKS_PER_SECOND;
 use uuid::Uuid;
 
 use crate::auth::{RequireAdmin, RequireAuth, RequireSubtitleManagement};
@@ -62,11 +63,6 @@ use crate::state::AppState;
 /// The MIME type Jellyfin serves an HLS subtitle playlist with
 /// (`MimeTypes.GetMimeType("playlist.m3u8")`).
 const HLS_PLAYLIST_CONTENT_TYPE: &str = "application/vnd.apple.mpegurl";
-
-/// The number of 100-ns ticks in one second (`TimeSpan.TicksPerSecond`), used to
-/// convert the `segmentLength` (seconds) into the tick space the playlist math
-/// and the subtitle encoder operate in.
-const TICKS_PER_SECOND: i64 = 10_000_000;
 
 /// The maximum total size of fallback fonts served by `GET /FallbackFont/Fonts`
 /// (Jellyfin's hard-coded 20 MiB cap; fonts past it are dropped).

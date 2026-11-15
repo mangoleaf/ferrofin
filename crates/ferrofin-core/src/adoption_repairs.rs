@@ -4958,12 +4958,6 @@ mod tests {
         async fn set_ancestors(&self, _: Uuid, _: &[Uuid]) -> Result<(), ServiceError> {
             unused()
         }
-        async fn save_images(
-            &self,
-            _: &ferrofin_db::entities::base_items::BaseItemEntity,
-        ) -> Result<(), ServiceError> {
-            unused()
-        }
         async fn reattach_user_data(
             &self,
             _: &ferrofin_db::entities::base_items::BaseItemEntity,

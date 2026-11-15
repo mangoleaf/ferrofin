@@ -2,18 +2,13 @@
 //!
 //! Port of `Jellyfin.MediaEncoding.Keyframes.FfProbe.FfProbeKeyframeExtractor`.
 
+use ferrofin_util::ticks::{TICKS_PER_MS, TICKS_PER_SECOND};
 use std::io::{BufRead, Read};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::error::KeyframesError;
 use crate::keyframe_data::KeyframeData;
-
-/// The number of ticks in a second. 1 tick = 100ns (mirrors `TimeSpan.TicksPerSecond`).
-const TICKS_PER_SECOND: i64 = 10_000_000;
-
-/// The number of ticks in a millisecond (mirrors `TimeSpan.TicksPerMillisecond`).
-const TICKS_PER_MILLISECOND: i64 = 10_000;
 
 /// Extracts the keyframes using the ffprobe executable at the specified path.
 ///
@@ -180,7 +175,7 @@ fn convert_to_i64(value: f64) -> i64 {
 fn time_span_from_seconds_ticks(value: f64) -> i64 {
     let millis = value * 1000.0;
     let rounded_millis = convert_to_i64(millis);
-    rounded_millis * TICKS_PER_MILLISECOND
+    rounded_millis * TICKS_PER_MS
 }
 
 #[cfg(test)]

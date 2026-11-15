@@ -50,6 +50,27 @@ struct Settings {
     extra_thumbs: bool,
 }
 
+/// Whether `path` lies in one of the server's own directories rather than in
+/// a media library: the data directory (a playlist in `{data}/playlists`, a
+/// box set in `{data}/collections`), the internal metadata directory (a
+/// genre's `{metadata}/Genre/<name>`, a person's `{metadata}/People/…`) or the
+/// libraries' root folder (a library's own `root/default/<name>`). The check
+/// is lexical, so a path it cannot match falls back to the library's setting.
+/// It decides where the always-true `IsSaveLocalMetadataEnabled` overrides
+/// hold (owner decision 2026-10-17).
+pub(crate) fn in_server_directories(
+    paths: &dyn ferrofin_traits::system::ServerApplicationPaths,
+    path: &Path,
+) -> bool {
+    [
+        paths.data_path(),
+        paths.internal_metadata_path(),
+        paths.root_folder_path(),
+    ]
+    .iter()
+    .any(|root| !root.is_empty() && path.starts_with(root))
+}
+
 /// Publishes acquired artwork beside media when the owning library requests it.
 /// Inputs are complete staged images; an unwritable local destination retains
 /// that internal image as the ordinary ImageSaver fallback.
@@ -180,25 +201,14 @@ impl ImageFileSaver {
         failure.map_or(Ok(()), Err)
     }
 
-    /// Whether the item's own path lies in one of the server's own
-    /// directories rather than in a media library: the data directory (a
-    /// playlist in `{data}/playlists`, a box set in `{data}/collections`), the
-    /// internal metadata directory (a genre's `{metadata}/Genre/<name>`, a
-    /// person's `{metadata}/People/…`) or the libraries' root folder (a
-    /// library's own `root/default/<name>`). The check is lexical, so a path
-    /// it cannot match falls back to the library's setting.
+    /// [`in_server_directories`] for the item's own path.
     fn in_server_directories(&self, item: &BaseItemEntity) -> bool {
-        let Some(path) = item.path.as_deref().map(Path::new) else {
-            return false;
-        };
-        let paths = self.configuration.application_paths();
-        [
-            paths.data_path(),
-            paths.internal_metadata_path(),
-            paths.root_folder_path(),
-        ]
-        .iter()
-        .any(|root| !root.is_empty() && path.starts_with(root))
+        item.path.as_deref().is_some_and(|path| {
+            in_server_directories(
+                self.configuration.application_paths().as_ref(),
+                Path::new(path),
+            )
+        })
     }
 
     async fn settings(&self, item: &BaseItemEntity) -> Result<Option<Settings>, ServiceError> {

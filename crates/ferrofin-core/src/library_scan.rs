@@ -615,6 +615,9 @@ struct LocalNfo {
     is_locked: bool,
     /// `<lockedfields>`: unioned into the item's `LockedFields`.
     locked_fields: Vec<MetadataField>,
+    /// The artwork the file names by URL (`<thumb>`, `<fanart><thumb>`), the
+    /// first of each type: upstream's `localItem.RemoteImages`.
+    remote_images: Vec<(String, ImageType)>,
 }
 
 /// The `People` of an answer from a provider that only ever `AddPerson`s
@@ -1092,7 +1095,7 @@ fn stored_media_source(data: &serde_json::Map<String, serde_json::Value>) -> Med
 }
 
 /// `VideoImageProvider`'s offset when the runtime is unknown: 10 s, in ticks.
-const SCREEN_GRAB_DEFAULT_OFFSET_TICKS: i64 = 10 * 10_000_000;
+const SCREEN_GRAB_DEFAULT_OFFSET_TICKS: i64 = 10 * ferrofin_util::ticks::TICKS_PER_SECOND;
 
 /// `GetVideoImage`'s stream: the one at `DefaultVideoStreamIndex` (any type,
 /// as its first `GetMediaStreams` query asks), else the first video stream.
@@ -1841,7 +1844,8 @@ impl<'a> ProbePipeline<'a> {
             {
                 let shortcut = self.shortcuts.get(&index);
                 if let Some(target) = shortcut {
-                    request.media_source.protocol = shortcut::path_protocol(target);
+                    request.media_source.protocol =
+                        ferrofin_model::media_info::path_protocol(target);
                     request.media_source.path = Some(target.clone());
                 }
                 let permit = if self.current == Some(index) {
@@ -2028,64 +2032,7 @@ fn dynamic_answer(
     answer
 }
 
-/// Stops a running scan cooperatively, as upstream's `CancellationToken`
-/// does. The scan checks it between two items, around each stored-row
-/// window it reads and plans, between its closing passes and inside the
-/// long ones. It races it against every wait of the item in progress: the
-/// ones before anything is written (its probe, its metadata providers) end
-/// the item unwritten, and a cancel inside its artwork pass (image
-/// providers, cover extraction) stops the fetches where they stand and
-/// saves the item with the artwork already on disk. A cancel after the
-/// item's row was saved leaves the row without its refresh stamp, so an item
-/// is written whole, not at all, or as far as it got for the next scan to
-/// redo; and a hung ffprobe or provider cannot keep a cancelled scan alive.
-#[derive(Debug, Clone)]
-pub struct ScanCancel(Arc<tokio::sync::watch::Sender<bool>>);
-
-impl Default for ScanCancel {
-    fn default() -> Self {
-        Self(Arc::new(tokio::sync::watch::Sender::new(false)))
-    }
-}
-
-impl ScanCancel {
-    /// A token nobody has cancelled yet.
-    #[must_use]
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// Asks the scan to stop.
-    pub fn cancel(&self) {
-        self.0.send_replace(true);
-    }
-
-    /// Whether the scan was asked to stop.
-    #[must_use]
-    pub fn is_cancelled(&self) -> bool {
-        *self.0.borrow()
-    }
-
-    /// Resolves once the scan is asked to stop.
-    pub async fn cancelled(&self) {
-        let mut asked = self.0.subscribe();
-        // The sender lives as long as `self`, so this never errors.
-        let _ = asked.wait_for(|cancelled| *cancelled).await;
-    }
-
-    /// Runs `work` unless the scan is asked to stop first; `None` when it
-    /// was (and `work` is dropped where it stood).
-    pub(crate) async fn unless_cancelled<T>(
-        &self,
-        work: impl std::future::Future<Output = T>,
-    ) -> Option<T> {
-        tokio::select! {
-            biased;
-            () = self.cancelled() => None,
-            done = work => Some(done),
-        }
-    }
-}
+pub use ferrofin_traits::tasks::ScanCancel;
 
 /// Where a scan reports how far it got, in percent: the items take 0–96 %
 /// and the closing passes 96–100 %, as upstream's `PerformLibraryValidation`
@@ -4458,8 +4405,11 @@ pub struct LibraryScanner {
     /// see. Absent in unit tests that don't exercise it; nothing is announced.
     change_notifier: Option<Arc<crate::library_changed_notifier::LibraryChangedNotifier>>,
     /// Expands the `%MetadataPath%`/`%AppDataPath%` tokens adopted Jellyfin
-    /// image rows store, for the local image validation's existence check.
-    /// Identity until [`with_virtual_paths`](Self::with_virtual_paths).
+    /// image rows store, for the local image validation's existence check and
+    /// the image measuring: the stored rows reach the scan expanded already
+    /// when its persistence service has the server's paths, so this matters
+    /// for one that has not. Identity until
+    /// [`with_virtual_paths`](Self::with_virtual_paths).
     virtual_paths: crate::virtual_paths::VirtualPathExpander,
     /// The `AggregateFolder` (`CreateRootFolder()`), which each library
     /// location's `Folder` row hangs off. `None` until
@@ -8666,6 +8616,7 @@ impl LibraryScanner {
             streams: &rows.streams,
             policy,
             embedded_images,
+            nfo_images: local.remote_images,
             remote: plan.remote_images,
             // `if (refreshOptions.RemoveOldMetadata &&
             // refreshOptions.ReplaceAllImages) ImageProvider.RemoveImages(item)`
@@ -8735,15 +8686,17 @@ impl LibraryScanner {
         //
         // TODO(parity, open work item — NOT an accepted divergence): upstream
         // counts only the local image validation (`RemoveImages`,
-        // `ValidateImages`); `images_changed` also counts the remote image
-        // providers' downloads. The two differ only on an image full refresh
-        // without a full metadata refresh (`ImageRefreshMode=FullRefresh` with
-        // `MetadataRefreshMode=Default`, which no jellyfin-web refresh choice
-        // sends): a season whose new artwork came only from a remote image
-        // provider takes its episodes' date here, where upstream leaves it.
-        // Un-defer path: have `collect_artwork` report whether its local
-        // validation (before `run_ordered_artwork`) changed the stored set,
-        // and gate on that.
+        // `ValidateImages`); `images_changed` also counts the NFO's artwork
+        // (`save_nfo_images`, which upstream saves after `BeforeSave`) and the
+        // remote image providers' downloads. The two differ when a changed
+        // `season.nfo` names artwork the season had none of, and on an image
+        // full refresh without a full metadata refresh
+        // (`ImageRefreshMode=FullRefresh` with `MetadataRefreshMode=Default`,
+        // which no jellyfin-web refresh choice sends): a season whose new
+        // artwork came only from its NFO or a remote image provider takes its
+        // episodes' date here, where upstream leaves it. Un-defer path: have
+        // `collect_artwork` report whether its local validation (before
+        // `save_nfo_images`) changed the stored set, and gate on that.
         if images_changed
             && season_base.is_none()
             && !locked
@@ -10036,6 +9989,12 @@ impl LibraryScanner {
             return false;
         }
         timings.log(work.music.len(), phase.elapsed());
+        // `RunPostScanTasks`' last step (`LibraryManager.cs:1597`). Upstream's
+        // failure fails the validation; here it would also skip recording the
+        // libraries as scanned, over rows nothing reads, so it only warns.
+        if let Err(err) = self.persistence.update_inherited_values().await {
+            tracing::warn!(%err, "failed to delete the InheritedTags item value links");
+        }
         // Every pass ran: a cancellation landing now skipped nothing.
         self.between_passes(run, &mut done).await;
         true
@@ -11575,6 +11534,12 @@ impl LibraryScanner {
             .into_iter()
             .filter_map(|info| info.key),
         );
+        // TODO(parity, open work item — gl-1818): a `<thumb>` that names a
+        // local file resolves to nothing here, so it never becomes the item's
+        // image (upstream's `GetFile`, then `MergeImages(item,
+        // localItem.Images)`). Un-defer path: the owner decides which files an
+        // NFO may name, then a stat-backed service and a `MergeImages` port
+        // beside `save_nfo_images`.
         let ds = NoDirectoryService;
         let mut result = xbmc::new_result(kind);
         // `BaseNfoProvider.GetMetadata` seeds the item with the library item's
@@ -11642,6 +11607,7 @@ impl LibraryScanner {
             found: true,
             is_locked: result.item.is_locked,
             locked_fields: result.item.locked_fields.clone(),
+            remote_images: result.remote_images,
         }
     }
 
@@ -13655,6 +13621,7 @@ impl LibraryScanner {
             streams,
             policy,
             embedded_images,
+            nfo_images,
             remote: fetch,
             remove_existing,
             dynamic_images,
@@ -13730,6 +13697,15 @@ impl LibraryScanner {
                 keep_stored_images(&mut images, stored, &self.virtual_paths);
             }
         }
+        // The NFO's artwork URLs, before any image provider runs.
+        // TODO(parity, open work item — gl-1818): an album's or an artist's
+        // are not saved. Un-defer path: save them in the music pass, before
+        // `music_images`, keeping an NFO Primary ahead of an album's shared
+        // embedded cover (which replaces the Primary below).
+        if !nfo_images.is_empty() && !music::owns_providers(short) {
+            let saved = self.save_nfo_images(entity, nfo_images, &mut images);
+            cut_short |= cancel.unless_cancelled(Box::pin(saved)).await.is_none();
+        }
         let fetched = self.run_ordered_artwork(
             item_id,
             entity,
@@ -13791,6 +13767,67 @@ impl LibraryScanner {
             (!images.is_empty() || stale_rows).then_some(images),
             cut_short,
         )
+    }
+
+    /// The artwork the item's NFO names by URL (`<thumb>`, `<fanart><thumb>`),
+    /// saved as the local-provider pass of `MetadataService.
+    /// RefreshWithProviders` saves `localItem.RemoteImages`
+    /// (`MetadataService.cs:818-838`): each one whose type the item has no
+    /// image of is downloaded (`ProviderManager.SaveImage`, through the
+    /// same checks as the image providers' downloads) into the item's art
+    /// folder, where the image saver publishes it with the item's other art.
+    ///
+    /// `images` is what the item has when the pass starts. Under "Replace
+    /// existing images" that is only what local discovery found beside the
+    /// media, the types `ValidateImages` takes out of the replace set
+    /// (`MergeImages` → `UpdateReplaceImages`), so every other type is
+    /// saved again, as `IsReplacingImage` has it. That is the image
+    /// providers' replace rule here too, with its approximations: upstream
+    /// skips that validation when the library saves artwork into media
+    /// folders, and protects only images inside the item's
+    /// `ContainingFolderPath`. A type saved here joins
+    /// `images`, which every image provider after it counts, so none replaces
+    /// it (`UpdateReplaceImages(options, foundImageTypes)`), and only a
+    /// Backdrop is added to, up to the library's limit, as upstream adds to
+    /// one. As upstream, the library's image fetchers and per-type limits do
+    /// not apply to the NFO's own artwork. A URL that gives no image is
+    /// skipped and fails no refresh, as upstream logs and goes on past its
+    /// `HttpRequestException`.
+    async fn save_nfo_images(
+        &self,
+        entity: &BaseItemEntity,
+        urls: Vec<(String, ImageType)>,
+        images: &mut Vec<ItemImageInfo>,
+    ) {
+        let (Some(client), Some(meta_root)) = (&self.tmdb, &self.metadata_dir) else {
+            return;
+        };
+        let item_dir = meta_root.join(&entity.id);
+        for (url, image_type) in urls {
+            if images.iter().any(|image| image.image_type == image_type) {
+                continue;
+            }
+            // `download` logs why a URL gave no image, at debug: NFO links are
+            // the library's content, and dead ones are common. Its own failure
+            // scope: an NFO URL that fails is no failed refresh, as upstream
+            // catches the `HttpRequestException`.
+            let (download, _failed) =
+                ferrofin_providers::rate_limit::count_request_failures(client.download(&url)).await;
+            let Some((bytes, content_type)) = download else {
+                continue;
+            };
+            let download = ferrofin_providers::ArtworkDownload {
+                bytes,
+                content_type,
+                content_length: None,
+            };
+            match off_runtime(|| artwork::write_acquired_image(&item_dir, image_type, &download)) {
+                Ok(image) => images.push(image),
+                Err(err) => {
+                    tracing::warn!(%err, item_id = %entity.id, ?image_type, "failed to write NFO artwork");
+                }
+            }
+        }
     }
 
     /// Run remote, embedded, frame-grab and plugin artwork in one configured
@@ -19760,6 +19797,9 @@ struct ArtworkPass<'a> {
     /// The image embedded in the item's own file — a photo (the file itself)
     /// or a book cover — when the row has one.
     embedded_images: Vec<ItemImageInfo>,
+    /// The artwork the item's NFO names by URL, when the local readers ran
+    /// and read one ([`LocalNfo::remote_images`]).
+    nfo_images: Vec<(String, ImageType)>,
     /// Whether this refresh runs the remote image providers (and the dynamic
     /// ones), and whether they replace what the item already has.
     remote: ImageFetch,
@@ -19819,7 +19859,9 @@ fn keep_stored_images(
 ///
 /// An adopted Jellyfin row stores `%MetadataPath%`-style tokens;
 /// `ValidateImages` checks the expanded path (`BaseItem.cs` `File.Exists`
-/// over `ExpandVirtualPath`), and so does this. A path still carrying a
+/// over `ExpandVirtualPath`), and so does this. The scan reads the stored
+/// rows expanded already, and a save keeps a row's token form while it
+/// expands to the path saved. A path still carrying a
 /// virtual-path token after expansion (a scanner not wired with
 /// `with_virtual_paths`) can't be checked, so it is kept as stored rather
 /// than dropped as missing. A remote image (not a local file) is kept as
@@ -20642,7 +20684,7 @@ fn retype(walk: MovieWalk, content_type: Option<ferrofin_model::data::Collection
         || content_type
             == walk
                 .collection_type
-                .and_then(crate::kinds::collection_type_of)
+                .and_then(CollectionTypeOptions::collection_type)
     {
         return Retype::Same;
     }
@@ -20687,7 +20729,7 @@ fn children_content_type(
     use ferrofin_model::content_type_overrides::content_type_override;
     content_type_override(content_types, dir, false)
         .or_else(|| content_type_override(content_types, dir, true))
-        .or_else(|| library.and_then(crate::kinds::collection_type_of))
+        .or_else(|| library.and_then(CollectionTypeOptions::collection_type))
 }
 
 /// The collection type a folder of an untyped walk resolves with:
@@ -23397,17 +23439,31 @@ fn renamed_extra(
 }
 
 /// Maps an NFO-parsed [`PersonInfo`](ferrofin_providers::container_types::PersonInfo)
-/// to a persistable [`PeopleEntity`]. NFO people carry no remote id/image, so those
-/// are left empty; the person-type key is the Jellyfin `PersonType` name
-/// (`PersonInfo.Type.ToString()`, `PeopleRepository.cs:122`): the member name,
-/// or the C# integer of an undeclared value.
+/// to a persistable [`PeopleEntity`]. The person-type key is the Jellyfin
+/// `PersonType` name (`PersonInfo.Type.ToString()`, `PeopleRepository.cs:122`):
+/// the member name, or the C# integer of an undeclared value. The actor's
+/// `<thumb>` URL is the credit's photo URL (`GetPersonFromXmlNode`'s
+/// `ImageUrl`), which [`LibraryScanner::enrich_people`] gives a person with no
+/// Primary, as `SavePeopleMetadataAsync` does. An NFO credit has no provider
+/// id: `GetPersonFromXmlNode` reads none.
+///
+/// TODO(parity, open work item — gl-1818): a `<thumb>` that names a local file
+/// (the path an NFO saver writes, Kodi's `.actors` folder) is left out, so the
+/// remote providers' photo URL for the credit fills it (`merge_people`) and the
+/// scan, which downloads only from a URL, still gets a photo. Upstream stores
+/// the path as the person's Primary. Un-defer path: the owner decides which
+/// files an NFO may name, then `enrich_people` sets such a path as the Primary.
 fn person_to_entity(p: ferrofin_providers::container_types::PersonInfo) -> PeopleEntity {
+    let is_http = |url: &String| {
+        let url = url.to_ascii_lowercase();
+        url.starts_with("http://") || url.starts_with("https://")
+    };
     PeopleEntity {
         id: guid_to_db(Uuid::new_v4()),
         name: p.name,
         person_type: Some(p.type_.json_name().into_owned()),
         role: p.role,
-        primary_image_url: None,
+        primary_image_url: p.image_url.filter(is_http),
         provider_id: None,
         // `<sortorder>` / `<order>` (`XmlReaderExtensions.GetPersonFromXmlNode`).
         sort_order: p.sort_order.map(i64::from),
@@ -24844,6 +24900,8 @@ mod directory_cache_tests;
 mod downloaded_art_tests;
 #[cfg(test)]
 mod episode_images_tests;
+#[cfg(test)]
+mod nfo_artwork_tests;
 #[cfg(test)]
 mod person_biography_tests;
 #[cfg(test)]
@@ -27182,10 +27240,10 @@ mod tests {
     #[case::default_time(None, 10)]
     #[case::calculated_time(Some(500), 50)]
     fn the_grab_selects_its_time(#[case] run_time_seconds: Option<i64>, #[case] expected: i64) {
-        const TICKS: i64 = 10_000_000;
+        use ferrofin_util::ticks::TICKS_PER_SECOND;
         assert_eq!(
-            super::screen_grab_offset(run_time_seconds.map(|s| s * TICKS)),
-            expected * TICKS
+            super::screen_grab_offset(run_time_seconds.map(|s| s * TICKS_PER_SECOND)),
+            expected * TICKS_PER_SECOND
         );
     }
 
@@ -38228,7 +38286,8 @@ mod tests {
         );
     }
 
-    // PersonInfo → PeopleEntity: type key is the Jellyfin PersonType name; no remote id/image.
+    // PersonInfo → PeopleEntity: type key is the Jellyfin PersonType name, the
+    // `<thumb>` the photo URL (gl-74); no remote id.
     #[test]
     fn person_to_entity_maps_type_name() {
         use ferrofin_model::data::PersonKind;
@@ -38236,6 +38295,7 @@ mod tests {
         let p = PersonInfo {
             type_: PersonKind::Director,
             role: Some("Self".into()),
+            image_url: Some("https://img/jane.jpg".into()),
             ..PersonInfo::new("Jane Doe")
         };
         let e = super::person_to_entity(p);
@@ -38243,7 +38303,46 @@ mod tests {
         assert_eq!(e.person_type.as_deref(), Some("Director"));
         assert_eq!(e.role.as_deref(), Some("Self"));
         assert!(e.provider_id.is_none());
-        assert!(e.primary_image_url.is_none());
+        assert_eq!(e.primary_image_url.as_deref(), Some("https://img/jane.jpg"));
+        // No `<thumb>`, or one naming a local file (gl-1818), carries none.
+        for thumb in [
+            None,
+            Some("/config/metadata/People/J/Jane Doe/folder.jpg"),
+            Some("file:///media/.actors/Jane_Doe.jpg"),
+            Some(r"C:\media\.actors\Jane_Doe.jpg"),
+        ] {
+            let e = super::person_to_entity(PersonInfo {
+                image_url: thumb.map(str::to_owned),
+                ..PersonInfo::new("Jane Doe")
+            });
+            assert!(e.primary_image_url.is_none(), "{thumb:?}");
+        }
+        let upper = super::person_to_entity(PersonInfo {
+            image_url: Some("HTTP://img/jane.jpg".into()),
+            ..PersonInfo::new("Jane Doe")
+        });
+        assert_eq!(
+            upper.primary_image_url.as_deref(),
+            Some("HTTP://img/jane.jpg")
+        );
+        // So an NFO saver's local-path `<thumb>` still lets a remote
+        // provider's photo URL fill the credit (`MergePeople`).
+        let mut nfo = [super::person_to_entity(PersonInfo {
+            image_url: Some("/config/metadata/People/J/Jane Doe/folder.jpg".into()),
+            ..PersonInfo::new("Jane Doe")
+        })];
+        ferrofin_providers::metadata_merge::merge_people(
+            &[ferrofin_db::entities::base_items::PeopleEntity {
+                name: "Jane Doe".into(),
+                primary_image_url: Some("https://tmdb/jane.jpg".into()),
+                ..Default::default()
+            }],
+            &mut nfo,
+        );
+        assert_eq!(
+            nfo[0].primary_image_url.as_deref(),
+            Some("https://tmdb/jane.jpg")
+        );
 
         // An NFO `<type>27</type>` (or `Director,Narrator`) parses to an
         // undeclared value, which C#'s `ToString()` stores as its integer.
@@ -45292,6 +45391,7 @@ mod tests {
     /// built over a one-movie library with a `poster.jpg` beside the media file.
     struct PosterFixture {
         scanner: LibraryScanner,
+        db: Database,
         repo: Arc<dyn ferrofin_traits::persistence::ItemRepository>,
         poster: std::path::PathBuf,
         dimensions: Arc<std::sync::atomic::AtomicUsize>,
@@ -45384,6 +45484,7 @@ mod tests {
 
         PosterFixture {
             scanner,
+            db,
             repo,
             poster: poster_path,
             dimensions,
@@ -45493,6 +45594,31 @@ mod tests {
             .find(|line| line.contains("post-scan passes complete"))
             .unwrap_or_else(|| panic!("no summary: {text}"));
         assert!(summary.contains("elapsed_ms="), "{summary}");
+    }
+
+    /// Once its closing passes are done, a library validation deletes every
+    /// `InheritedTags` link, as upstream's `UpdateInheritedValues` does after
+    /// `RunPostScanTasks`: the ones an adopted database holds go on its first
+    /// scan, and an item's other values stay.
+    #[tokio::test]
+    async fn a_library_scan_deletes_the_inherited_tag_links() {
+        use crate::test_support::{item_values, seed_item_value};
+        use ferrofin_db::enums::ItemValueType;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let fx = poster_fixture(tmp.path(), 8, 12).await;
+        fx.scanner.scan_all().await.unwrap();
+        let movie = fx.movie_id().await;
+        seed_item_value(&fx.db, movie, ItemValueType::InheritedTags, "Inherited").await;
+        seed_item_value(&fx.db, movie, ItemValueType::Tags, "Kept").await;
+
+        // The rescan leaves the unchanged movie's values alone.
+        fx.scanner.scan_all().await.unwrap();
+
+        assert_eq!(
+            item_values(&fx.db, movie).await,
+            [(i32::from(ItemValueType::Tags), "Kept".to_owned())]
+        );
     }
 
     /// A closing pass ends `completed`, `failed` when its work answers false

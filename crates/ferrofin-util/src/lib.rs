@@ -39,3 +39,4 @@ pub mod split_string_extensions;
 pub mod stable_sort;
 pub mod stream_extensions;
 pub mod string_extensions;
+pub mod ticks;
