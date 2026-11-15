@@ -12105,8 +12105,30 @@ mod tests {
         let expected = dir.path().join("recording.ts").display().to_string();
         assert_eq!(
             mgr.active_recording_paths().await.expect("paths"),
-            vec![expected]
+            vec![expected.clone()]
         );
+        // `Video.IsActiveRecording`, the one check every caller makes.
+        for (path, recording) in [
+            (expected, true),
+            (dir.path().join("stopping.ts").display().to_string(), false),
+            (dir.path().join("finished.ts").display().to_string(), false),
+            (dir.path().join("elsewhere.ts").display().to_string(), false),
+            (String::new(), false),
+        ] {
+            assert_eq!(
+                mgr.is_active_recording(&path).await.expect("lookup"),
+                recording,
+                "{path:?}"
+            );
+        }
+        // A failed lookup is the caller's to handle; a blank path is never
+        // looked up, as upstream returns null for it.
+        mgr.db.pool().close().await;
+        let recording = dir.path().join("recording.ts").display().to_string();
+        assert!(mgr.is_active_recording(&recording).await.is_err());
+        for blank in ["", "  "] {
+            assert!(!mgr.is_active_recording(blank).await.expect("no lookup"));
+        }
     }
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn cancelling_a_timer_mid_capture_releases_it_on_a_real_runtime() {
