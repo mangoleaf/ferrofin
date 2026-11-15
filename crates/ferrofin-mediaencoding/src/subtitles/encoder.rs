@@ -1187,7 +1187,7 @@ impl SubtitleIo for NoopSubtitleIo {
     }
 
     fn path_protocol(&self, path: &str) -> MediaProtocol {
-        path_protocol(path)
+        ferrofin_model::media_info::path_protocol(path)
     }
 
     fn subtitle_cache_path(
@@ -1321,21 +1321,6 @@ fn detect_bomless_utf16(bytes: &[u8]) -> Option<&'static encoding_rs::Encoding> 
     None
 }
 
-/// The delivery protocol for `path`. Port of `MediaSourceManager.GetPathProtocol`.
-fn path_protocol(path: &str) -> MediaProtocol {
-    if path.is_empty() {
-        MediaProtocol::File
-    } else if starts_with_ignore_ascii_case(path, "rtsp") {
-        MediaProtocol::Rtsp
-    } else if starts_with_ignore_ascii_case(path, "rtmp") {
-        MediaProtocol::Rtmp
-    } else if starts_with_ignore_ascii_case(path, "http") {
-        MediaProtocol::Http
-    } else {
-        MediaProtocol::File
-    }
-}
-
 /// Maps an ffmpeg codec name to the extension the parser is keyed on.
 ///
 /// Port of `SubtitleEncoder.NormalizeCodecToParserExtension`.
@@ -1416,11 +1401,6 @@ fn set_ass_font_text(text: &str) -> Option<String> {
 fn ends_with_ignore_ascii_case(haystack: &str, suffix: &str) -> bool {
     haystack.len() >= suffix.len()
         && haystack[haystack.len() - suffix.len()..].eq_ignore_ascii_case(suffix)
-}
-
-/// Case-insensitive `str::starts_with`.
-fn starts_with_ignore_ascii_case(haystack: &str, prefix: &str) -> bool {
-    haystack.len() >= prefix.len() && haystack[..prefix.len()].eq_ignore_ascii_case(prefix)
 }
 
 #[cfg(test)]

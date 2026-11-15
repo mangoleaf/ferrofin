@@ -72,23 +72,10 @@ impl ExternalMediaTarget {
     }
 }
 
-/// Whether a path is a local file rather than a network stream — the port of
-/// `MediaSourceManager.GetPathProtocol(path) == MediaProtocol.File`, which
-/// `BaseItem.IsFileProtocol` reads. External files are only ever looked for
-/// next to a local file.
-#[must_use]
-pub fn is_file_protocol(path: &str) -> bool {
-    const STREAM_SCHEMES: [&str; 6] = ["rtsp", "rtmp", "http", "rtp", "ftp", "udp"];
-    let lower = path.to_ascii_lowercase();
-    if STREAM_SCHEMES
-        .iter()
-        .any(|scheme| lower.starts_with(scheme))
-    {
-        return false;
-    }
-    // `IFileSystem.IsPathFile`: a scheme other than `file://` is not a file.
-    !lower.contains("://") || lower.starts_with("file://")
-}
+/// Whether a path is a local file rather than a network stream
+/// (`BaseItem.IsFileProtocol`). External files are only ever looked for next to
+/// a local file.
+pub use ferrofin_model::media_info::is_file_protocol;
 
 /// Resolves external files of one [`DlnaProfileType`] (subtitle or audio)
 /// for a video. Port of the abstract `MediaInfoResolver`; the
@@ -1556,18 +1543,6 @@ mod tests {
                 .is_some_and(|p| p.ends_with("My.Video.good.mka"))
         );
         assert_eq!(streams[0].index, 0);
-    }
-
-    #[rstest]
-    #[case("/media/Movie.mkv", true)]
-    #[case("file:///media/Movie.mkv", true)]
-    #[case("C:\\media\\Movie.mkv", true)]
-    #[case("https://url.com/My.Video.mkv", false)]
-    #[case("HTTP://url.com/My.Video.mkv", false)]
-    #[case("rtsp://cam/stream", false)]
-    #[case("smb://nas/share/Movie.mkv", false)]
-    fn is_file_protocol_matches_get_path_protocol(#[case] path: &str, #[case] is_file: bool) {
-        assert_eq!(is_file_protocol(path), is_file);
     }
 
     // `GetExternalStreams(Audio, …)`: every lyric sidecar whose stem is the

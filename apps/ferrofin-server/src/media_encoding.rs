@@ -462,12 +462,7 @@ impl SubtitleIo for FfmpegSubtitleIo {
     }
 
     fn path_protocol(&self, path: &str) -> MediaProtocol {
-        let lower = path.trim_start().to_ascii_lowercase();
-        if lower.starts_with("http://") || lower.starts_with("https://") {
-            MediaProtocol::Http
-        } else {
-            MediaProtocol::File
-        }
+        ferrofin_model::media_info::path_protocol(path)
     }
 
     fn subtitle_cache_path(
@@ -876,6 +871,21 @@ mod tests {
         .expect_err("nothing listens there");
 
         assert_eq!(error, "GET http://127.0.0.1:0: error sending request");
+    }
+
+    /// A subtitle URL on another scheme is read over HTTP, as upstream reads
+    /// it, and fails there without naming its account or path either.
+    #[tokio::test]
+    async fn a_subtitle_url_on_another_scheme_names_only_the_host() {
+        let error = http_get_bytes("smb://acct-user:info-secret@nas/path-secret/en.srt")
+            .await
+            .expect_err("no smb client");
+
+        assert!(error.starts_with("GET smb://nas"), "{error}");
+        assert!(
+            !error.contains("secret") && !error.contains("acct"),
+            "{error}"
+        );
     }
 
     /// A fake [`MediaSourceManager`] returning fixed sources + attachments.
@@ -1830,6 +1840,20 @@ mod tests {
             config: Arc::new(FakeConfig(paths, options)),
             encoding_reader: EncodingOptionsReader::new("subtitle extraction"),
         }
+    }
+
+    /// The real subtitle I/O reads a path over the protocol
+    /// `GetPathProtocol` gives it: a non-HTTP URL is no local file.
+    #[cfg(unix)]
+    #[rstest::rstest]
+    #[case("/media/Movie.en.srt", MediaProtocol::File)]
+    #[case("https://subs.example/a.srt", MediaProtocol::Http)]
+    #[case("ftp://subs.example/a.srt", MediaProtocol::Ftp)]
+    #[case("smb://nas/share/a.srt", MediaProtocol::Http)]
+    fn subtitle_paths_take_upstreams_protocol(#[case] path: &str, #[case] expected: MediaProtocol) {
+        let tmp = tempfile::tempdir().unwrap();
+        let io = subtitle_io(tmp.path(), "ffmpeg".to_owned(), 1);
+        assert_eq!(io.path_protocol(path), expected);
     }
 
     /// A sidecar gone from disk keeps its I/O kind through the real read, so the

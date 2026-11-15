@@ -69,6 +69,43 @@ crate::json::enums::wire_enum! {
     }
 }
 
+/// `MediaSourceManager.GetPathProtocol`: the protocol a path or URL is read
+/// over. An empty path is a file; then the first of `rtsp`, `rtmp`, `http`,
+/// `rtp`, `ftp` and `udp` the path starts with, in any case; then a path that
+/// `IFileSystem.IsPathFile` says is no file (a `scheme://` other than
+/// `file://`) is HTTP.
+#[must_use]
+pub fn path_protocol(path: &str) -> MediaProtocol {
+    const PREFIXES: [(&str, MediaProtocol); 6] = [
+        ("rtsp", MediaProtocol::Rtsp),
+        ("rtmp", MediaProtocol::Rtmp),
+        ("http", MediaProtocol::Http),
+        ("rtp", MediaProtocol::Rtp),
+        ("ftp", MediaProtocol::Ftp),
+        ("udp", MediaProtocol::Udp),
+    ];
+    let starts_with = |prefix: &str| {
+        path.as_bytes()
+            .get(..prefix.len())
+            .is_some_and(|head| head.eq_ignore_ascii_case(prefix.as_bytes()))
+    };
+    if let Some((_, protocol)) = PREFIXES.iter().find(|(prefix, _)| starts_with(prefix)) {
+        *protocol
+    } else if !path.contains("://") || starts_with("file://") {
+        MediaProtocol::File
+    } else {
+        MediaProtocol::Http
+    }
+}
+
+/// Whether [`path_protocol`] reads `path` as a local file (the
+/// `GetPathProtocol(path) == MediaProtocol.File` behind
+/// `BaseItem.IsFileProtocol`).
+#[must_use]
+pub fn is_file_protocol(path: &str) -> bool {
+    path_protocol(path) == MediaProtocol::File
+}
+
 /// The type of timestamps used in a transport stream.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, ToSchema)]
 #[serde(rename_all = "PascalCase")]
@@ -447,6 +484,37 @@ pub struct MediaInfo {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// v12.4 `MediaSourceManager.GetPathProtocol` (:240-278) over
+    /// `ManagedFileSystem.IsPathFile` (:533-542): a prefix match, not a scheme
+    /// match, so `httpfoo` is HTTP and `ftps://` FTP, and any other
+    /// `scheme://` is HTTP.
+    #[rstest::rstest]
+    #[case("", MediaProtocol::File)]
+    #[case("/media/a.mkv", MediaProtocol::File)]
+    #[case("C:\\media\\a.mkv", MediaProtocol::File)]
+    #[case("file:///media/a.mkv", MediaProtocol::File)]
+    #[case("FILE:///media/a.mkv", MediaProtocol::File)]
+    #[case("http://h/a", MediaProtocol::Http)]
+    #[case("HTTPS://h/a", MediaProtocol::Http)]
+    #[case("httpfoo", MediaProtocol::Http)]
+    #[case("rtsp://h/a", MediaProtocol::Rtsp)]
+    #[case("rtspu://h/a", MediaProtocol::Rtsp)]
+    #[case("rtmp://h/a", MediaProtocol::Rtmp)]
+    #[case("RTMPS://h/a", MediaProtocol::Rtmp)]
+    #[case("rtp://h/a", MediaProtocol::Rtp)]
+    #[case("ftp://h/a", MediaProtocol::Ftp)]
+    #[case("ftps://h/a", MediaProtocol::Ftp)]
+    #[case("udp://239.0.0.1:1234", MediaProtocol::Udp)]
+    #[case("smb://nas/share/a.mkv", MediaProtocol::Http)]
+    #[case("mms://h/a", MediaProtocol::Http)]
+    #[case(" http://h/a", MediaProtocol::Http)]
+    #[case("é://h/a", MediaProtocol::Http)]
+    #[case("r", MediaProtocol::File)]
+    fn the_protocol_follows_the_path_prefix(#[case] path: &str, #[case] expected: MediaProtocol) {
+        assert_eq!(path_protocol(path), expected);
+        assert_eq!(is_file_protocol(path), expected == MediaProtocol::File);
+    }
 
     #[test]
     fn stream_identifiers_preserve_native_boundary_and_reject_path_separators() {
