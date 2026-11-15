@@ -2495,6 +2495,10 @@ pub async fn build_app_state(
             Arc::clone(&chapters),
         ));
     item_data_cleanup.set_external_data(external_data);
+    // The rows the repairs deleted while the database opened (orphaned
+    // extras, path duplicates) take their metadata folders and extracted
+    // data, now that the configured directories and the cleanup are known.
+    ferrofin_core::adoption_repairs::run_cleanup_deleted_item_data(db, &item_data_cleanup).await;
     // Jellyfin 12.0's sweeps of a 10.11 database's items whose library or
     // file is gone delete through the library manager, so they run once it
     // removes extracted data too, and before a startup trigger can scan.
