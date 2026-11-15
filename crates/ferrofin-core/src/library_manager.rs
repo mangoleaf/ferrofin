@@ -3109,9 +3109,10 @@ impl LibraryManager for FerrofinLibraryManager {
         let mut resolved = self.resolve_named_rows(kind, &trimmed).await?;
         // `CreateItemByName<T>`: a by-name lookup MATERIALIZES the item
         // upstream (directory + row) rather than reporting it missing, so this
-        // is the read path's write. Deliberately not done in
-        // `get_named_item_ids`, the per-credit hot path — C# splits it the same
-        // way (`GetItemByNameId` derives, `CreateItemByName` writes).
+        // is the read path's write. Never done in `get_named_item_ids`: its
+        // trait contract is that it creates no row, and read paths rely on it —
+        // C# splits it the same way (`GetItemByNameId` derives,
+        // `CreateItemByName` writes).
         self.create_missing_by_name(kind, &trimmed, &mut resolved)
             .await?;
         Ok(resolved)
