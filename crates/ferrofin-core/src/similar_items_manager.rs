@@ -366,8 +366,8 @@ struct LocalFilter {
 /// Which C# local similarity provider serves a seed's kind — the two shapes
 /// upstream ships.
 ///
-/// `MovieSimilarItemsProvider` (the `Movie`/`Trailer` seeds) is the only
-/// weighted one; `SeriesSimilarItemsProvider`,
+/// `MovieSimilarItemsProvider` (the `Movie`/`Trailer` seeds, and every
+/// recommendation baseline) is the only weighted one; `SeriesSimilarItemsProvider`,
 /// `MusicAlbum`/`MusicArtist`/`AudioSimilarItemsProvider` and
 /// `LiveTvProgramSimilarItemsProvider` are each one flat `InternalItemsQuery`
 /// over the seed's genres and tags.
@@ -387,7 +387,8 @@ struct LocalRequest<'a> {
     seed: &'a BaseItemEntity,
     /// The seed's id, parsed.
     seed_id: Uuid,
-    /// The seed's kind.
+    /// The kind whose local provider serves the request: the seed's own, or
+    /// `Movie` for a recommendation baseline.
     kind: BaseItemKind,
     /// The request's `ExcludeArtistIds`.
     exclude_artist_ids: &'a [Uuid],
@@ -655,8 +656,9 @@ impl FerrofinSimilarItemsManager {
     /// gets an empty filter, i.e. no local results.
     async fn local_filter(&self, seed: &BaseItemEntity, kind: BaseItemKind) -> LocalFilter {
         match kind {
-            // `MovieSimilarItemsProvider` (Movie + Trailer seeds): movie kinds,
-            // `IsMovie = true`, `IsPlayed = false`.
+            // `MovieSimilarItemsProvider` (Movie + Trailer seeds, and every
+            // recommendation baseline): movie kinds, `IsMovie = true`,
+            // `IsPlayed = false`.
             BaseItemKind::Movie | BaseItemKind::Trailer => LocalFilter {
                 scorer: LocalScorer::Weighted,
                 include_item_types: self.movie_candidate_kinds().await,
@@ -1172,11 +1174,13 @@ impl FerrofinSimilarItemsManager {
         // `IBatchLocalSimilarItemsProvider` and calls that alone — remote
         // providers never take part, so a category never fans out to TMDB
         // once per baseline — and hands it the user, so the movie provider's
-        // unplayed/access filter applies here too.
+        // unplayed/access filter applies here too. That provider,
+        // `MovieSimilarItemsProvider`, scores every baseline, whatever its
+        // kind: a liked Live TV programme is weighted like a movie.
         let request = LocalRequest {
             seed,
             seed_id,
-            kind: kind_of(seed),
+            kind: BaseItemKind::Movie,
             exclude_artist_ids: &[],
             user: Some(user),
             wanted: item_limit,
@@ -4334,6 +4338,66 @@ mod tests {
             12,
             "all twelve liked movies fit in 10 + 4 rows"
         );
+    }
+
+    #[tokio::test]
+    async fn a_liked_movie_like_programme_baseline_is_scored_as_a_movie() {
+        // C# `GetSimilarItemsRecommendationsAsync` hands every baseline to the
+        // one batch provider, `MovieSimilarItemsProvider`: weighted, unplayed
+        // only. The programme's own flat genre/tag provider would answer the
+        // played genre match and miss the director match.
+        use ferrofin_traits::library::UserDataManager as _;
+        let db = test_db().await;
+        let user = seed_user(&db, Uuid::from_u128(0xE200)).await;
+        grant_all_folders(&db, &user).await;
+        let user_id = Uuid::parse_str(&user.id).expect("user id");
+        let programme = Uuid::from_u128(0xE201);
+        let genre_match = Uuid::from_u128(0xE202);
+        let director_match = Uuid::from_u128(0xE203);
+        seed_kind(
+            &db,
+            programme,
+            BaseItemKind::LiveTvProgram,
+            "Liked Airing",
+            "SciFi",
+        )
+        .await;
+        let mut row = crate::test_support::fetch_item(&db, programme).await;
+        row.is_movie = true;
+        crate::test_support::save_item(&db, &row).await;
+        seed_movie(&db, genre_match, "Genre Match", "SciFi").await;
+        seed_movie(&db, director_match, "Director Match", "Drama").await;
+        credit_person(&db, programme, "Shared Director", "Director").await;
+        credit_person(&db, director_match, "Shared Director", "Director").await;
+        crate::test_support::seed_library_over(&db, &[programme, genre_match, director_match])
+            .await;
+        seed_user_data(&db, user_id, genre_match, true, Some(chrono::Utc::now())).await;
+        let config: Arc<dyn ServerConfigurationManager> = Arc::new(FakeConfig {
+            external: std::sync::atomic::AtomicBool::new(true),
+        });
+        crate::user_data_manager::FerrofinUserDataManager::new(db.clone(), config.clone())
+            .save_user_data(
+                user_id,
+                programme,
+                &ferrofin_model::dto::UpdateUserItemDataDto {
+                    is_favorite: Some(true),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("favourite");
+
+        let recs = manager(&db)
+            .with_configuration(config)
+            .get_movie_recommendations(Some(user_id), Uuid::nil(), 20, 8, &DtoOptions::default())
+            .await
+            .expect("recommendations");
+        let liked = recs
+            .iter()
+            .find(|c| c.recommendation_type == RecommendationType::SimilarToLikedItem)
+            .expect("a category for the liked programme");
+        assert_eq!(liked.baseline_item_name, "Liked Airing");
+        assert_eq!(names(&liked.items), ["Director Match"]);
     }
 
     #[tokio::test]

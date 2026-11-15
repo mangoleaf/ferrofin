@@ -2239,14 +2239,14 @@ const SIMILAR_ITEMS_DIVERGENCES: &[&str] = &[
 ];
 
 /// How a movie or trailer seed's score pass differs from upstream's, for the
-/// similar-items rows and the recommendations row.
-const SIMILAR_SCORE_WINDOW_DIVERGENCE: &str = "A movie or trailer seed's score pass keeps \
-     its top limit * 3 among the result kinds without the excluded ids, cuts a tie at that \
-     boundary by Id (the owner's tie rule, gl-710), and matches genres, tags and studios by \
-     stored value; upstream's keeps the top limit * 3 of every item it scored (an episode or \
-     series sharing an actor included) before it filters kinds and excluded ids, cuts a tie \
-     in the order the scores were added, and matches clean values, so its page can hold \
-     fewer or other movies. Fix path: gl-1786.";
+/// similar-items rows and the recommendations row (whose baselines all take it).
+const SIMILAR_SCORE_WINDOW_DIVERGENCE: &str = "A movie or trailer seed's score pass (every \
+     recommendation baseline's too) keeps its top limit * 3 among the result kinds without \
+     the excluded ids, cuts a tie at that boundary by Id (the owner's tie rule, gl-710), and \
+     matches genres, tags and studios by stored value; upstream's keeps the top limit * 3 of \
+     every item it scored (an episode or series sharing an actor included) before it filters \
+     kinds and excluded ids, cuts a tie in the order the scores were added, and matches clean \
+     values, so its page can hold fewer or other movies. Fix path: gl-1786.";
 
 /// The 12.1 alternate-version rule the score pass still lacks (gl-392).
 const SIMILAR_ALTERNATE_VERSIONS_DIVERGENCE: &str = "The score pass scores an alternate \
@@ -2401,16 +2401,16 @@ pub const VERIFIED: &[Verified] = &[
                more; similar_items_repository.rs people_names_of over the first 6 played, \
                GetPeopleNamesByItems in ListOrder per item, distinct; each baseline capped to \
                categoryLimit and scored by similar_category through local_similar, the \
-               MovieSimilarItemsProvider path of the similar-items rows (a programme \
-               baseline takes its own kind's path) with the user and Limit = itemLimit, no \
-               remote provider; next_person_category, the lazy GetPersonRecommendations: \
-               Person = name, Limit = itemLimit + 2 grouped by metadata key, PersonTypes \
+               MovieSimilarItemsProvider path of the similar-items rows for every baseline, \
+               whatever its kind, with the user and Limit = itemLimit, no remote provider; \
+               next_person_category, the lazy GetPersonRecommendations: Person = name, \
+               Limit = itemLimit + 2 grouped by metadata key, PersonTypes \
                Director for the director stream and none for the \
                actor stream, IsMovie, IsPlayed = false, DistinctBy the IMDb id, Take(itemLimit), \
                CategoryId = name.GetMD5(); round_robin_categories: recently played, recently \
                played, liked, liked, directors, actors until categoryLimit or a pass adds \
                nothing, then a stable OrderBy RecommendationType)",
-        date: "2026-11-14",
+        date: "2026-11-15",
         divergences: &[
             SIMILAR_SCORE_WINDOW_DIVERGENCE,
             SIMILAR_ALTERNATE_VERSIONS_DIVERGENCE,
@@ -2432,10 +2432,6 @@ pub const VERIFIED: &[Verified] = &[
          (another copy of the baseline); upstream's batch provider excludes only the \
          baseline's own id and can recommend that copy under its own name. Jellyfin bug not \
          ported.",
-            "A liked movie-like Live TV programme baseline is scored by the flat genre and tag \
-         query of the similar-items rows (Random order, no IsMovie or IsPlayed filter); \
-         upstream's batch provider weights every baseline, whatever its kind, and applies the \
-         movie filter. Fix path: gl-1802.",
             "A request with no user (an API key naming none, or an administrator naming a \
          userId with no account) answers an empty list; upstream's recently-played query \
          throws on IsPlayed without a user (BuildIsPlayedFilter dereferences it), a 500. \
