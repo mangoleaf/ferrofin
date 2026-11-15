@@ -361,7 +361,7 @@ fn movie_answer(id: &str) -> Option<String> {
     Some(format!(
         r#"{{"id": {id}, "title": "{title}", "overview": "About {title}.", "vote_average": 8.0,
                 "release_date": "1999-03-30", {poster} "videos": {}, "credits": {{"cast": {cast}, "crew": []}},
-                "release_dates": {{"results": []}}}}"#,
+                "releases": {{"countries": []}}}}"#,
         trailer(title)
     ))
 }

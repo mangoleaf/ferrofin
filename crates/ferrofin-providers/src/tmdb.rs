@@ -621,7 +621,7 @@ struct DetailsResponse {
     #[serde(default)]
     created_by: Option<Vec<CreatedByEntry>>,
     #[serde(default)]
-    release_dates: Option<ReleaseDatesResults>,
+    releases: Option<ReleasesResults>,
     #[serde(default)]
     content_ratings: Option<ContentRatingResults>,
     #[serde(default)]
@@ -860,22 +860,18 @@ struct CrewEntry {
     profile_path: Option<String>,
 }
 
+/// The legacy `releases` append (TMDbLib's `MovieMethods.Releases`): every
+/// release of the movie in one list, each with its country.
 #[derive(Debug, Default, Deserialize)]
-struct ReleaseDatesResults {
+struct ReleasesResults {
     #[serde(default)]
-    results: Vec<ReleaseDatesCountry>,
+    countries: Vec<ReleaseCountry>,
 }
 
 #[derive(Debug, Deserialize)]
-struct ReleaseDatesCountry {
+struct ReleaseCountry {
     #[serde(default)]
     iso_3166_1: Option<String>,
-    #[serde(default)]
-    release_dates: Vec<ReleaseDatesEntry>,
-}
-
-#[derive(Debug, Deserialize)]
-struct ReleaseDatesEntry {
     #[serde(default)]
     certification: Option<String>,
 }
@@ -1138,21 +1134,20 @@ fn crew_person_type(department: Option<&str>, job: Option<&str>) -> Option<&'sta
 /// Requested-country certification, with Jellyfin's US fallback and prefix.
 fn certification(
     kind: TmdbKind,
-    release_dates: Option<ReleaseDatesResults>,
+    releases: Option<ReleasesResults>,
     content_ratings: Option<ContentRatingResults>,
     country: Option<&str>,
 ) -> Option<String> {
     let country = country.filter(|c| !c.is_empty()).unwrap_or("US");
     let ratings: Vec<(String, String)> = match kind {
-        TmdbKind::Movie => release_dates?
-            .results
+        TmdbKind::Movie => releases?
+            .countries
             .into_iter()
             .filter_map(|entry| {
-                let rating = entry
-                    .release_dates
-                    .into_iter()
-                    .find_map(|r| r.certification.filter(|c| !c.trim().is_empty()))?;
-                Some((entry.iso_3166_1?, rating))
+                Some((
+                    entry.iso_3166_1?,
+                    entry.certification.filter(|c| !c.trim().is_empty())?,
+                ))
             })
             .collect(),
         TmdbKind::Series => content_ratings?
@@ -2432,7 +2427,7 @@ impl TmdbClient {
 
     /// Fetches full metadata for a title (overview, tagline, genres, studios,
     /// rating, certification, premiere date, runtime, and cast + key crew) via
-    /// `/movie|tv/{id}?append_to_response=credits,release_dates|content_ratings`.
+    /// `/movie|tv/{id}?append_to_response=credits,releases|content_ratings`.
     /// `None` on any network/parse error.
     pub async fn details(
         &self,
@@ -2462,7 +2457,7 @@ impl TmdbClient {
             // carries `imdb_id` directly, so only the series arm asks for it.
             TmdbKind::Movie => (
                 "movie",
-                "credits,release_dates,images,videos",
+                "credits,releases,images,videos",
                 cfg.exclude_tags_movies,
             ),
             TmdbKind::Series => (
@@ -2570,7 +2565,7 @@ impl TmdbClient {
             genres: d.genres.into_iter().filter_map(|g| g.name).collect(),
             studios: resolve_studios(d.networks, d.production_companies),
             community_rating: d.vote_average.filter(|v| *v > 0.0),
-            official_rating: certification(kind, d.release_dates, d.content_ratings, country),
+            official_rating: certification(kind, d.releases, d.content_ratings, country),
             production_year: year_from(premiere.as_deref()),
             premiere_date: premiere,
             runtime_minutes: match kind {
@@ -3063,6 +3058,37 @@ mod tests {
             (asks_keywords("/movie/1"), asks_keywords("/tv/2")),
             (movie_keywords, series_keywords)
         );
+    }
+
+    /// A movie's certification comes from the legacy `releases` append
+    /// (`MovieMethods.Releases`, `TmdbClientManager.cs:77`): the first
+    /// non-blank entry for the metadata country (`TmdbMovieProvider.cs:226-244`).
+    /// `release_dates` orders a country's releases otherwise: a fixture
+    /// modelled on Blade Runner's (TMDb 78) Korean ratings on 2026-11-14,
+    /// first 19 in one payload and 15 in the other.
+    #[tokio::test]
+    async fn movie_certification_reads_the_releases_payload() {
+        let server = crate::mock_http::MockServer::start(vec![(
+            "/movie/78",
+            r#"{"releases":{"countries":[
+                {"iso_3166_1":"KR","certification":" "},
+                {"iso_3166_1":"KR","certification":"19"},
+                {"iso_3166_1":"KR","certification":"15"}]},
+              "release_dates":{"results":[{"iso_3166_1":"KR","release_dates":[
+                {"certification":"15"},{"certification":"19"}]}]}}"#
+                .to_owned(),
+        )])
+        .await;
+        let client = TmdbClient::new().with_base_url(&server.base_url);
+        let movie = client
+            .details_for_locale(TmdbKind::Movie, 78, None, Some("KR"))
+            .await
+            .unwrap();
+        assert_eq!(movie.official_rating.as_deref(), Some("KR-19"));
+        let append = server.query_values("/movie/78", "append_to_response");
+        let methods: Vec<&str> = append[0].split(',').collect();
+        assert!(methods.contains(&"releases"), "{append:?}");
+        assert!(!methods.contains(&"release_dates"), "{append:?}");
     }
 
     /// A series' studios are its networks then its production companies
@@ -4197,19 +4223,15 @@ mod tests {
 
     #[test]
     fn us_certification_prefers_us_entry() {
-        let rd = ReleaseDatesResults {
-            results: vec![
-                ReleaseDatesCountry {
+        let rd = ReleasesResults {
+            countries: vec![
+                ReleaseCountry {
                     iso_3166_1: Some("GB".to_owned()),
-                    release_dates: vec![ReleaseDatesEntry {
-                        certification: Some("15".to_owned()),
-                    }],
+                    certification: Some("15".to_owned()),
                 },
-                ReleaseDatesCountry {
+                ReleaseCountry {
                     iso_3166_1: Some("US".to_owned()),
-                    release_dates: vec![ReleaseDatesEntry {
-                        certification: Some("R".to_owned()),
-                    }],
+                    certification: Some("R".to_owned()),
                 },
             ],
         };
@@ -4240,10 +4262,11 @@ mod tests {
         #[case] country: &str,
         #[case] expected: &str,
     ) {
-        let releases = serde_json::from_value(serde_json::json!({"results":[
-            {"iso_3166_1":"DE","release_dates":[{"certification":""},{"certification":"12"}]},
-            {"iso_3166_1":"US","release_dates":[{"certification":"R"}]},
-            {"iso_3166_1":"GB","release_dates":[{"certification":"15"}]}
+        let releases = serde_json::from_value(serde_json::json!({"countries":[
+            {"iso_3166_1":"DE","certification":""},
+            {"iso_3166_1":"DE","certification":"12"},
+            {"iso_3166_1":"US","certification":"R"},
+            {"iso_3166_1":"GB","certification":"15"}
         ]}))
         .unwrap();
         assert_eq!(

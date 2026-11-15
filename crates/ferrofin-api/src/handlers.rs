@@ -2206,9 +2206,6 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
              keeps double newlines upstream collapses; a trailer with an empty key is \
              dropped and a nameless one, or an episode's, named where upstream keeps the \
              video's name or none. Fix path: gl-1782.",
-            "A movie's certification is read from TMDb's release_dates; upstream reads the \
-             legacy releases payload, so a country with several releases can yield another \
-             certification. Fix path: gl-1812.",
             "A blank content rating is skipped; upstream takes a blank own-country series \
              rating (storing a bare country prefix such as GB-) and lets a blank US one \
              block its first-entry fallback. Jellyfin bug not ported.",
