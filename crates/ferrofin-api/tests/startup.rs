@@ -263,6 +263,7 @@ impl QuickConnect for OkQuickConnect {
         _secret: &str,
     ) -> Result<AuthenticationResultData, ServiceError> {
         Ok(AuthenticationResultData {
+            user: UserDto::default(),
             session: SessionInfoDto {
                 user_id: ADMIN_ID,
                 user_name: Some("admin".to_owned()),

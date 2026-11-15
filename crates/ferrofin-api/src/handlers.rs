@@ -3155,16 +3155,19 @@ pub const VERIFIED: &[Verified] = &[
                user's rows for the device id in Id order, then Logout(Device) of each) and \
                session activity, and that upstream has no login rate limit. \
                The UserDto and SessionInfoDto \
-               builders are shared with other routes and not compared here; \
-               authentication_result's fallback User, compared on 2026-11-11 (gl-1106), \
-               carries new UserDto()'s policy, as UserPolicy.cs's constructor sets it",
+               builders are shared with other routes and not compared here. User, compared on \
+               2026-11-15 (gl-1719), is user_manager.rs get_user_dto of the user \
+               authenticate_internal signed in, as upstream's is GetUserDto of the user it \
+               holds; it reads the database where upstream's reads memory, so it is built \
+               before the token is minted and a read error fails the sign-in with nothing \
+               minted, as a store error elsewhere in the sign-in fails it upstream",
         date: "2026-11-05",
         divergences: &[
-            "When the user cannot be reloaded once the token is minted (a database read error, or \
-         the user deleted in that moment), User is a bare DTO: the session's id, name and \
-         ServerId with new UserDto()'s configuration and policy, not the user's own. Upstream \
-         builds User from the in-memory user it already holds, which cannot fail there; the \
-         sign-in succeeds on both. Fix path: gl-1719.",
+            "User reads the database (the user's permissions, preferences, access schedules \
+         and profile image) where upstream's GetUserDto reads the user it holds in memory, \
+         so a read error there answers 500 with nothing minted; upstream cannot fail at that \
+         step. Ferrofin keeps users in the database, not in memory (no domain-object \
+         hierarchy, CLAUDE.md).",
             "The 400 (no client identity, an empty username) and 500 bodies are Ferrofin's error \
          shape, not upstream's. Fix path: gl-666.",
             "MaxActiveSessions counts the user's sessions in the pool, as upstream \
@@ -3201,16 +3204,18 @@ pub const VERIFIED: &[Verified] = &[
         upstream_file: "Jellyfin.Api/Controllers/UserController.cs",
         upstream_method: "AuthenticateWithQuickConnect",
         ferrofin: "handlers/users.rs authenticate_with_quick_connect, login_failure, \
-               authentication_result → ferrofin-core quick_connect_manager.rs \
-               get_authorized_request (the result authorize_request stored)",
+               quick_connect_user, authentication_result → ferrofin-core \
+               quick_connect_manager.rs get_authorized_request (the result authorize_request \
+               stored); the fallback to the stored User compared on 2026-11-15 (gl-1719) \
+               against QuickConnectManager.GetAuthorizedRequest",
         date: "2026-11-01",
         divergences: &[
             "The User member is built at the exchange, from the user as it is then, where \
          upstream returns the UserDto it snapshotted when the code was authorized, up to \
-         10 minutes stale (a user deleted meanwhile gets the bare DTO: id, name, the \
-         session's ServerId and new UserDto()'s configuration and policy); the \
-         session, token and ServerId are the stored ones on both. Jellyfin bug not \
-         ported.",
+         10 minutes stale; a user deleted meanwhile, or whose DTO cannot be read, gets \
+         that snapshot, as upstream answers, though its LastActivityDate can predate the \
+         session's activity stamp upstream's carries (built before it). The session, \
+         token and ServerId are the stored ones on both. Jellyfin bug not ported.",
             "The 404 (unknown or expired secret) body is Ferrofin's error shape, not \
          upstream's. Fix path: gl-666.",
         ],

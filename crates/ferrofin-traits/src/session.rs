@@ -9,10 +9,9 @@
 //! - The in-memory `SessionInfo` domain object is **not** ported; session reads
 //!   surface as the [`SessionInfoDto`] wire DTO. The `AuthenticateNewSession` /
 //!   `AuthenticateDirect` methods return an [`AuthenticationResultData`] — the
-//!   session DTO plus the minted access token — mirroring Jellyfin's
-//!   `AuthenticationResult` carrying its `AccessToken`. The full
-//!   `{ UserDto, SessionInfoDto, AccessToken, ServerId }` wire envelope is
-//!   assembled at the API layer from this data. The `ToSessionInfoDto` /
+//!   authenticated user's DTO, the session DTO and the minted access token —
+//!   mirroring Jellyfin's `AuthenticationResult`. The API layer adds `ServerId`
+//!   to make the wire envelope. The `ToSessionInfoDto` /
 //!   `OnSessionControllerConnected` mapping helpers that take the un-ported
 //!   `SessionInfo` are dropped.
 //! - The .NET `event`s `SessionInfoWebSocketListener` subscribes to
@@ -33,7 +32,7 @@
 use async_trait::async_trait;
 use ferrofin_db::entities::security::DeviceEntity;
 use ferrofin_db::entities::users::UserEntity;
-use ferrofin_model::dto::SessionInfoDto;
+use ferrofin_model::dto::{SessionInfoDto, UserDto};
 use ferrofin_model::secret::Secret;
 use ferrofin_model::session::{
     ClientCapabilities, GeneralCommand, MessageCommand, PlayMethod, PlayRequest,
@@ -44,16 +43,19 @@ use uuid::Uuid;
 
 use crate::error::ServiceError;
 
-/// The outcome of authenticating and opening a session: the session DTO plus
-/// the freshly minted access token the client must present on subsequent
-/// requests.
+/// The outcome of authenticating and opening a session: the user it
+/// authenticated, the session DTO and the freshly minted access token the
+/// client must present on subsequent requests.
 ///
-/// Port shape of the token-carrying half of Jellyfin's `AuthenticationResult`
-/// (`SessionManager.AuthenticateNewSession` returns the result *with* its
-/// `AccessToken`). The full `{ UserDto, SessionInfoDto, AccessToken, ServerId }`
-/// envelope is assembled at the API layer from this data.
+/// Port of Jellyfin's `AuthenticationResult` as
+/// `SessionManager.AuthenticateNewSessionInternal` builds it. The API layer
+/// adds `ServerId` (the session's) to make the wire envelope.
 #[derive(Debug, Clone, PartialEq)]
 pub struct AuthenticationResultData {
+    /// The authenticated user (C# `User = _userManager.GetUserDto(user, …)`),
+    /// built from the user this sign-in authenticated, not reloaded after it.
+    pub user: UserDto,
+
     /// The opened session.
     pub session: SessionInfoDto,
 
@@ -158,7 +160,7 @@ impl From<&SessionInfoDto> for SessionSummary {
 ///
 /// Port of `ISessionManager` (the object-safe, domain-`SessionInfo`-free
 /// subset). Reads return [`SessionInfoDto`]; the authenticate methods return an
-/// [`AuthenticationResultData`] (session DTO + minted access token).
+/// [`AuthenticationResultData`] (user DTO, session DTO and minted access token).
 #[async_trait]
 pub trait SessionManager: Send + Sync {
     /// Records session activity for a client, returning the session DTO.
@@ -378,9 +380,9 @@ pub trait SessionManager: Send + Sync {
 
     /// Authenticates a request and opens a new session.
     ///
-    /// Returns the opened session together with the minted access token (see
-    /// [`AuthenticationResultData`]) so the API layer can echo the token in the
-    /// `AuthenticationResult` body.
+    /// Returns the authenticated user, the opened session and the minted access
+    /// token (see [`AuthenticationResultData`]) so the API layer can answer them
+    /// in the `AuthenticationResult` body.
     async fn authenticate_new_session(
         &self,
         request: &AuthenticationRequest,
@@ -389,8 +391,8 @@ pub trait SessionManager: Send + Sync {
     /// Authenticates directly (bypassing the interactive flow), opening a
     /// session.
     ///
-    /// Returns the opened session together with the minted access token (see
-    /// [`AuthenticationResultData`]).
+    /// Returns the authenticated user, the opened session and the minted access
+    /// token (see [`AuthenticationResultData`]).
     async fn authenticate_direct(
         &self,
         request: &AuthenticationRequest,

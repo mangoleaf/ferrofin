@@ -28,9 +28,10 @@
 //!   directly (gl-248). The `SessionControllers`/`WebSocketController`
 //!   indirection of the C# collapses into "the session's connection handles".
 //! - **`AuthenticationResult`** now lands in `ferrofin-model`; the authenticate
-//!   methods return an [`AuthenticationResultData`] (the [`SessionInfoDto`] plus
-//!   the minted access token) from which the API layer assembles the wire
-//!   envelope. The access token is minted via [`DeviceManager`].
+//!   methods return an [`AuthenticationResultData`] (the user's DTO, the
+//!   [`SessionInfoDto`] and the minted access token) from which the API layer
+//!   assembles the wire envelope. The access token is minted via
+//!   [`DeviceManager`].
 //! - **The idle and inactive checks** (`StartCheckTimers`) run from
 //!   [`FerrofinSessionManager::run_playback_checks`], which the composition root
 //!   starts with the host and aborts with it: a session playing without a
@@ -3132,6 +3133,15 @@ impl FerrofinSessionManager {
         let user_uuid = parse_user_id(&user.id)?;
         let _limit_gate = self.admit_session(&user, user_uuid).await?;
 
+        // C# builds `User = _userManager.GetUserDto(user, …)` from the user it
+        // authenticated, after `LogSessionActivity`. Ferrofin's DTO reads the
+        // database where upstream's reads memory, so it is built before
+        // anything is minted: a read error leaves no token, session or
+        // `AuthenticationSucceeded` behind. The session's activity stamp skips
+        // a password sign-in (`authenticate_user` has just stamped the user),
+        // and Quick Connect, the direct path, rebuilds `User` at its exchange.
+        let user_dto = self.user_manager.get_user_dto(&user, None).await?;
+
         // Mint a fresh access token: log out existing device rows for this
         // user/device, then create a new device (C# `GetAuthorizationToken`).
         let existing = self
@@ -3174,10 +3184,9 @@ impl FerrofinSessionManager {
             )
             .await?;
         dto.server_id = Some(self.server_id.clone());
-        // The full `AuthenticationResult` envelope (UserDto + ServerId) is
-        // assembled by the caller from this data; the freshly minted token
-        // (persisted on the created `Device` row) is returned so the caller can
-        // echo it back to the client.
+        // The caller adds `ServerId` to make the `AuthenticationResult`; the
+        // freshly minted token (persisted on the created `Device` row) is
+        // returned so the caller can echo it back to the client.
         let access_token = Secret::from(created.access_token);
 
         // C# `AuthenticateNewSessionInternal` publishes
@@ -3194,6 +3203,7 @@ impl FerrofinSessionManager {
             )
             .await;
         Ok(AuthenticationResultData {
+            user: user_dto,
             session: dto,
             access_token,
         })

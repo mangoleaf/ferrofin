@@ -19,8 +19,8 @@
 //!   becomes [`AuthenticationManager::id`], beside the display
 //!   [`name`](AuthenticationManager::name).
 //! - [`QuickConnect::get_authorized_request`] returns the
-//!   [`AuthenticationResultData`] (session and token) of the C#
-//!   `AuthenticationResult`; the API layer adds its `User` and `ServerId`.
+//!   [`AuthenticationResultData`] of the C# `AuthenticationResult`; the API
+//!   layer rebuilds its `User` at the exchange and adds `ServerId`.
 //! - `Task<T>` → `async fn -> Result<T, ServiceError>`; the `IsEnabled` property
 //!   becomes an `async fn` so implementations may consult live configuration.
 //!
@@ -183,9 +183,10 @@ pub trait QuickConnect: Send + Sync {
     /// Authorizes a request to connect as the given user, by its short code.
     async fn authorize_request(&self, user_id: Uuid, code: &str) -> Result<bool, ServiceError>;
 
-    /// Gets the authentication result (session and access token) opened when
-    /// the request's code was authorized (C# `GetAuthorizedRequest`). The
-    /// secret exchange returns it as is and never authenticates again.
+    /// Gets the authentication result (user, session and access token) opened
+    /// when the request's code was authorized (C# `GetAuthorizedRequest`). The
+    /// secret exchange answers its session and token as they are and never
+    /// authenticates again.
     async fn get_authorized_request(
         &self,
         secret: &str,
