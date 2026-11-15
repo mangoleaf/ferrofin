@@ -2155,7 +2155,9 @@ pub const VERIFIED: &[Verified] = &[
                handlers/by_name.rs (ByNameListQuery check_min_community_rating, \
                artists_query, resolve_by_name_ids, \
                project_query_result) → ferrofin-core item_repository.rs get_artists \
-               (item_values_with_counts, item_counts_by_clean_name)",
+               (item_values_with_counts, item_counts_by_clean_name); \
+               its scope rewrite top_parent_or_ancestor_scope \
+               (LibraryManager.SetTopParentOrAncestorIds) compared at v12.4 on 2026-11-13",
         date: "2026-10-25",
         divergences: BY_NAME_DIVERGENCES_ARTISTS,
         refs: &["images", "access-filtering", "paging-sort"],
@@ -2168,7 +2170,9 @@ pub const VERIFIED: &[Verified] = &[
         ferrofin: "handlers/artists.rs get_album_artists (items.rs resolve_user_or_api_key) → \
                handlers/by_name.rs (check_min_community_rating, artists_query, \
                resolve_by_name_ids) → ferrofin-core \
-               item_repository.rs get_album_artists (item_values_with_counts)",
+               item_repository.rs get_album_artists (item_values_with_counts); \
+               its scope rewrite top_parent_or_ancestor_scope \
+               (LibraryManager.SetTopParentOrAncestorIds) compared at v12.4 on 2026-11-13",
         date: "2026-10-25",
         divergences: BY_NAME_DIVERGENCES_ARTISTS,
         refs: &["images", "access-filtering", "paging-sort"],
@@ -2182,7 +2186,8 @@ pub const VERIFIED: &[Verified] = &[
                declared parameters only; items.rs resolve_user_or_api_key; \
                music/musicvideos library parent → get_music_genres) → handlers/by_name.rs → \
                ferrofin-core item_repository.rs get_genres / get_music_genres \
-               (item_values_with_counts)",
+               (item_values_with_counts, \
+               top_parent_or_ancestor_scope: LibraryManager.SetTopParentOrAncestorIds)",
         date: "2026-11-13",
         divergences: BY_NAME_DIVERGENCES_GENRES_STUDIOS,
         refs: &["images", "access-filtering", "paging-sort"],
@@ -2195,7 +2200,8 @@ pub const VERIFIED: &[Verified] = &[
         ferrofin: "handlers/music_genres.rs get_music_genres (by_name.rs \
                ValueListQuery::genres: the declared parameters only; items.rs \
                resolve_user_or_api_key) → handlers/by_name.rs → ferrofin-core \
-               item_repository.rs get_music_genres (item_values_with_counts)",
+               item_repository.rs get_music_genres (item_values_with_counts, \
+               top_parent_or_ancestor_scope: LibraryManager.SetTopParentOrAncestorIds)",
         date: "2026-11-13",
         divergences: BY_NAME_DIVERGENCES_GENRES_STUDIOS,
         refs: &["images", "access-filtering", "paging-sort"],
@@ -2208,7 +2214,8 @@ pub const VERIFIED: &[Verified] = &[
         ferrofin: "handlers/studios.rs get_studios (by_name.rs ValueListQuery::studios: \
                the declared parameters only; items.rs resolve_user_or_api_key) → \
                handlers/by_name.rs → ferrofin-core item_repository.rs get_studios \
-               (item_values_with_counts)",
+               (item_values_with_counts, \
+               top_parent_or_ancestor_scope: LibraryManager.SetTopParentOrAncestorIds)",
         date: "2026-11-13",
         divergences: BY_NAME_DIVERGENCES_GENRES_STUDIOS,
         refs: &["images", "access-filtering"],
@@ -3400,6 +3407,50 @@ pub const VERIFIED: &[Verified] = &[
             "SortName compares ordinally rather than through OrderBy's culture comparer.",
             "The 403 (another user's id without elevation) body is Ferrofin's error shape, not \
          upstream's. Fix path: gl-666.",
+        ],
+        refs: &[],
+    },
+    Verified {
+        method: "get",
+        path: "/LiveTv/Timers/{timerId}",
+        upstream_file: "Jellyfin.Api/Controllers/LiveTvController.cs",
+        upstream_method: "GetTimer",
+        ferrofin: "handlers/live_tv.rs get_timer (RequiredRouteString: a blank timerId is a 400) → \
+               find_timer (LiveTvManager.GetTimer: GetTimers with TimerQuery.Id, then the first \
+               whose Id equals timerId ignoring case; none is 200 null, unchecked as upstream) → \
+               ferrofin-traits live_tv.rs get_timers_matching and filter_timers → \
+               ferrofin-livetv manager.rs get_timers (DefaultLiveTvService.GetTimersAsync: every \
+               timer but a Completed one)",
+        date: "2026-11-13",
+        divergences: &[
+            "The timer is the DTO stored at its creation or last change, not one \
+         GetTimerInfoDto builds on each read: no ProgramInfo, no ChannelPrimaryImageTag, and \
+         the guide's ChannelName at creation. Fix path: gl-1745 (then gl-853 for the artwork).",
+        ],
+        refs: &[],
+    },
+    Verified {
+        method: "delete",
+        path: "/LiveTv/Timers/{timerId}",
+        upstream_file: "Jellyfin.Api/Controllers/LiveTvController.cs",
+        upstream_method: "CancelTimer",
+        ferrofin: "handlers/live_tv.rs cancel_timer (RequiredRouteString) → find_timer \
+               (LiveTvManager.CancelTimer's GetTimer: none is a 404) → ferrofin-livetv \
+               manager.rs cancel_timer → cancel_timer_internal (DefaultLiveTvService.\
+               CancelTimerAsync → CancelTimerInternal(id, false, true): Cancelled and manual, \
+               deleted without a SeriesTimerId, else kept; disarm_timer and cancel_recording for \
+               RecordingsManager.CancelRecording) → notify_timer_event TimerCancelled only when \
+               the status was not already Cancelled (statusChanging)",
+        date: "2026-11-13",
+        divergences: &[
+            "TimerCancelled carries the timer's own Id, as Ferrofin's TimerCreated does. \
+         Upstream's default service relays its external id for both \
+         (OnEmbyTvTimerCancelled, OnEmbyTvTimerCreated), so jellyfin-web's onTimerCancelled \
+         clears only a card its own TimerCreated push marked, never one rendered with the \
+         programme's TimerId (cardBuilder's data-timerid). Jellyfin bug not ported.",
+            "TimerCancelled reaches every signed-in session, not only users with \
+         EnableLiveTvAccess (RecordingNotifier.SendMessage). Fix path: gl-1746.",
+            "The 404 body is Ferrofin's error shape, not upstream's. Fix path: gl-666.",
         ],
         refs: &[],
     },

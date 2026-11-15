@@ -461,6 +461,12 @@ impl RuntimeHandle {
                 out = &mut step => return Ok(out),
                 () = tokio::time::sleep_until(self.watch.next_check().into()) => {}
             }
+            // Read `dead` before `lost()`, never `is_dead()` after it (that
+            // re-runs `lost()` a moment later). A waiter that found the call
+            // lost set `dead`, and `lost_at` does not move while the thread is
+            // stuck, so `lost()` below is still true: the caller is told the
+            // call was lost, not merely that the plugin is disabled.
+            let dead = self.dead.load(Ordering::Relaxed);
             if self.lost() {
                 return Err(format!(
                     "plugin `{}` did not finish a call within its deadline plus the {} s \
@@ -469,8 +475,8 @@ impl RuntimeHandle {
                     self.watch.grace().as_secs()
                 ));
             }
-            // Lost by another waiter: the thread may never answer.
-            if self.is_dead() {
+            // Disabled otherwise (the breaker): fail as the thread itself would.
+            if dead {
                 return Err(self.disabled());
             }
         }
