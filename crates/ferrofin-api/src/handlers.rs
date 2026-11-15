@@ -981,7 +981,9 @@ pub const VERIFIED_SUBSYSTEMS_AGAINST_EARLIER_PIN: &[(&str, &str)] = &[];
 /// retried), which no HTTP response describes either. `metadata-refresh` is
 /// which metadata and image providers an item's refresh runs, in which order
 /// and with what lookup, the Identify case first, shared by Identify → Apply,
-/// the item refresh and the library scan.
+/// the item refresh and the library scan, and `metadata-providers` what
+/// TheMovieDb's movie, series, season and episode providers write onto an item
+/// from TMDb's answer.
 pub const SUBSYSTEM_KEYS: &[&str] = &[
     "query-translation",
     "dto-fields",
@@ -999,6 +1001,7 @@ pub const SUBSYSTEM_KEYS: &[&str] = &[
     "recording-keep-up-to",
     "direct-recording",
     "metadata-refresh",
+    "metadata-providers",
 ];
 
 /// One shared subsystem whose Ferrofin implementation was compared against the
@@ -1898,9 +1901,10 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
                    ApplySearchResult, GetProviders, RefreshWithProviders, \
                    GetNonLocalImageProviders, ProviderManager.RefreshItem, \
                    GetMetadataProvidersInternal and GetImageProvidersInternal, and \
-                   ItemImageProvider.RefreshImages at the pinned v12.4 tag. What each provider \
-                   answers (gl-1726) and how the answers merge field by field are not part of \
-                   this row.",
+                   ItemImageProvider.RefreshImages at the pinned v12.4 tag. What TheMovieDb's \
+                   movie, series, season and episode providers answer is the \
+                   metadata-providers row's; what the other providers answer (gl-1815) and how \
+                   the answers merge field by field (gl-1813) are not part of this row.",
         date: "2026-11-14",
         divergences: &[
             "An album below an identified artist is looked up by its own ids, name and year; \
@@ -1919,7 +1923,8 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
             "A book's embedded metadata readers still run under an Identify. Fix path: \
              gl-1698.",
             "A movie, series, season or episode Identify moves the chosen provider first \
-             only for TheTVDB, TheMovieDb and OMDb, so a SearchProviderName naming a plugin's metadata source keeps the \
+             only for TheTVDB, TheMovieDb and OMDb, so a SearchProviderName naming a \
+             plugin's metadata source keeps the \
              configured order. Fix path: gl-1772.",
             "An item the provider manager refreshes (a box set, person, genre, studio, or \
              virtual season or episode) asks no plugin metadata source. Fix path: gl-1773.",
@@ -1933,6 +1938,78 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
              saves artwork into media folders, nor beside any other kind whose \
              IsSaveLocalMetadataEnabled upstream overrides (a box set, playlist, person, \
              genre, studio, year…). Fix path: gl-1741.",
+        ],
+    },
+    VerifiedSubsystem {
+        key: "metadata-providers",
+        upstream_file: "MediaBrowser.Providers/Plugins/Tmdb/Movies/TmdbMovieProvider.cs",
+        upstream_method: "GetMetadata",
+        ferrofin: "What TheMovieDb's metadata providers write for a movie, a series, a season \
+                   and an episode. ferrofin-providers tmdb.rs details_for_locale \
+                   (TmdbClientManager.GetMovieAsync and GetSeriesAsync: the language, the \
+                   image languages and the append_to_response) and details_from_response (the \
+                   names, overview, tagline, genres, studios by resolve_studios, production \
+                   countries, release, air and end dates, status, vote average, certification \
+                   by country, tags from keywords, trailers by youtube_trailers, the series \
+                   runtime, home page, collection id and name, external ids and original \
+                   language), credits_to_people with billed_cast, map_cast, \
+                   map_aggregate_cast, crew_people and crew_person_type (MapCrewToPersonType, \
+                   the MaxCastMembers and MaxCrewMembers caps, HideMissingCastMembers and \
+                   HideMissingCrewMembers), series_people (the creators, outside the caps), \
+                   season_details_for_language and season_details_from, \
+                   episode_extras_for_language and episode_people_from (guest stars); \
+                   ferrofin-core library_scan.rs fetch_tmdb_metadata (a pinned TMDb id, else \
+                   find_tmdb_id's /find by an IMDb id, a series also by its TVDB id, else the \
+                   parsed-name search and find_best_match), apply_details, fetch_tmdb_season \
+                   with ferrofin-providers season.rs tmdb_answer (ImportSeasonName), and \
+                   fetch_tmdb_episode with apply_tmdb_episode; for an episode the provider \
+                   manager refreshes that has a path, episode.rs tmdb_answer (a path-less one \
+                   is not asked, as TmdbEpisodeProvider returns nothing for \
+                   IsMissingEpisode). Compared with TmdbMovieProvider, TmdbSeriesProvider \
+                   (MapTvShowToSeries), TmdbSeasonProvider and TmdbEpisodeProvider \
+                   GetMetadata, TmdbClientManager and TmdbUtils at the pinned v12.4 tag. \
+                   TheMovieDb's box-set, person, missing-episode and similar-items providers \
+                   and its image providers, the other providers (TheTVDB, OMDb, MusicBrainz, \
+                   TheAudioDB; gl-1815) and the merge onto the item (gl-1813) are not part of \
+                   this row.",
+        date: "2026-11-14",
+        divergences: &[
+            "The ExcludeTagsMovies and ExcludeTagsSeries settings are not applied: TMDb \
+             keywords always become tags. Fix path: gl-1781.",
+            "A series takes TMDb's tagline and production countries, which upstream sets \
+             for a movie only; a series rated in neither the preferred country nor the US \
+             gets no rating where upstream takes the first country's; a movie's overview \
+             keeps double newlines upstream collapses; a trailer with an empty key is \
+             dropped and a nameless one, or an episode's, named where upstream keeps the \
+             video's name or none. Fix path: gl-1782.",
+            "A movie's certification is read from TMDb's release_dates; upstream reads the \
+             legacy releases payload, so a country with several releases can yield another \
+             certification. Fix path: gl-1812.",
+            "A blank content rating is skipped; upstream takes a blank own-country series \
+             rating (storing a bare country prefix such as GB-) and lets a blank US one \
+             block its first-entry fallback. Jellyfin bug not ported.",
+            "A movie whose IMDb id TMDb's /find cannot resolve is searched by name; upstream \
+             returns no metadata for it. Fix path: gl-1783.",
+            "An episode is looked up in aired order whatever the series' display order; \
+             upstream maps an absolute, DVD, digital, story-arc, production, TV or \
+             original-air-date order through TMDb's episode group. Fix path: gl-1784.",
+            "A multi-episode file takes the first episode's name and overview; upstream \
+             fetches every episode up to IndexNumberEnd and joins theirs, and looks up an \
+             episode with no season number in season 1. Fix path: gl-1785.",
+            "A date-only value (premiere, end and air dates) is stored as midnight UTC; \
+             upstream stores the server's local midnight. Pending an owner decision \
+             (gl-490).",
+            "A season's or an episode's series TMDb id, and a path-less item's TMDb id, \
+             are read with surrounding whitespace or a sign; upstream's TryParseTmdbId \
+             reads digits only. Fix path: gl-1774.",
+            "A series whose stored TMDb id is not plain digits is looked up through /find \
+             and the name search; upstream's series provider parses it as an integer \
+             (pinning a padded or signed id) and returns no metadata when it is not one. \
+             Fix path: gl-1774.",
+            "A vote average of 0 is stored as no community rating, and a series whose \
+             episode_run_time is empty as no runtime; upstream stores 0 for both, which \
+             keeps a later provider (OMDb, TheTVDB) from filling them. Jellyfin bug not \
+             ported.",
         ],
     },
 ];
@@ -4593,6 +4670,55 @@ pub const VERIFIED: &[Verified] = &[
         ],
         refs: &[
             "metadata-refresh",
+            "metadata-providers",
+            "images",
+            "access-filtering",
+            "scan-failure-isolation",
+            "trickplay",
+        ],
+    },
+    Verified {
+        method: "post",
+        path: "/Items/{itemId}/Refresh",
+        upstream_file: "Jellyfin.Api/Controllers/ItemRefreshController.cs",
+        upstream_method: "RefreshItem",
+        ferrofin: "handlers/item_update.rs refresh_item (RequireAdmin, \
+               Policies.RequiresElevation; the item by GetItemById(itemId, \
+               User.GetUserId()), a 404 when it is missing or the caller cannot see it and \
+               a 400 for a nil id; metadataRefreshMode and imageRefreshMode default to None \
+               and replaceAllMetadata, replaceAllImages and regenerateTrickplay to false; \
+               MetadataRefreshOptions::for_item_refresh: ForceSave for a FullRefresh of \
+               either kind or either replace, RemoveOldMetadata = replaceAllMetadata, \
+               IsAutomated false, RegenerateTrickplay) → queue_item_refresh by \
+               refresh_route (QueueRefresh at High priority, then the queue's RefreshItem \
+               or RefreshArtist): a CollectionFolder's physical folders \
+               (RefreshCollectionFolderChildren), every library for the root, another \
+               folder's subtree (the folder, then ValidateChildren with the same options) \
+               and a file's own path (RefreshSingleItem's metadata service), each as a scan \
+               through LibraryManager::queue_refresh_scan; a music artist by \
+               artist_refresh_route (RefreshArtist: the artist folders above its credited \
+               albums validate their children, then the artist refreshes); a box set, \
+               playlist, view, virtual season, person, genre, studio or channel through \
+               ProviderManager::queue_refresh at High priority → 204 without waiting for \
+               the refresh.",
+        date: "2026-11-14",
+        divergences: &[
+            "An item whose path no library location covers is answered 204 and not \
+         refreshed; upstream refreshes it. Fix path: gl-1770.",
+            "Upstream runs every queued item refresh on one queue, started at once and one \
+         after another; Ferrofin runs a file's refresh in the scan queue's priority lane \
+         (ahead of queued scans, inside a running one), queues a folder's like a scan, \
+         behind a running or queued library scan, and an item no scan covers (a box \
+         set, playlist, view, virtual season, person, genre, studio or channel) on the \
+         provider manager's queue, so refreshes on different lanes can run at once or in \
+         another order. Fix path: gl-1814.",
+            "The 400 (a value the binder cannot read, or the nil id), 401 (no or bad \
+         token), 403 (not an administrator) and 404 bodies are Ferrofin's error shape, not \
+         upstream's. Fix path: gl-666.",
+        ],
+        refs: &[
+            "metadata-refresh",
+            "metadata-providers",
             "images",
             "access-filtering",
             "scan-failure-isolation",
