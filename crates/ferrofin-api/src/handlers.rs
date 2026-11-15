@@ -1767,7 +1767,9 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
                    transcoding/manager.rs start_ffmpeg, compared with \
                    MediaBrowser.MediaEncoding/Transcoding/TranscodeManager.cs (StartFfMpeg, \
                    PingTimer, KillTranscodingJobs; a start whose ffmpeg exits non-zero, with \
-                   OnTranscodeBeginRequest, compared 2026-11-11) and \
+                   OnTranscodeBeginRequest, compared 2026-11-11; the ffmpeg log's name, \
+                   ffmpeg_log_file_name, with the request's MediaSourceId as sent, compared \
+                   2026-11-14) and \
                    Emby.Server.Implementations/Session/SessionManager.cs (MaxActiveSessions)",
         date: "2026-11-02",
         divergences: &[
