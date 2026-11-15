@@ -267,8 +267,11 @@ impl ChapterImageExtractor {
         let Some(live_tv) = self.live_tv.as_ref().and_then(Weak::upgrade) else {
             return false;
         };
-        match live_tv.active_recording_paths().await {
-            Ok(paths) => paths.iter().any(|path| video.path.as_ref() == Some(path)),
+        match live_tv
+            .is_active_recording(video.path.as_deref().unwrap_or_default())
+            .await
+        {
+            Ok(recording) => recording,
             Err(error) => {
                 tracing::warn!(item_id = %video.id, %error, "active recording lookup failed");
                 true
