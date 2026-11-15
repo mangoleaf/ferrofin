@@ -881,6 +881,154 @@ async fn video_stream_ignores_several_ranges_and_a_failed_if_range() {
     }
 }
 
+/// An expected answer: status, `Content-Range` and body.
+type Answer<'a> = (StatusCode, Option<&'a str>, &'a [u8]);
+
+/// How `RangeHelper.ParseRange`, `NormalizeRange` and the `RangeHeaderValue`
+/// parser read one range: a value that does not parse is ignored for the whole
+/// file, spaces and leading zeros are fine, and a suffix longer than the file
+/// is all of it.
+#[tokio::test]
+async fn video_stream_reads_one_range_as_aspnet_does() {
+    let media = TempMedia::new(b"0123456789");
+    let router = create_router(state(&media.path, no_subtitles()).app);
+    let (_, served, _) = static_stream(&router, "GET", &[]).await;
+    let modified = served[header::LAST_MODIFIED].to_str().unwrap().to_owned();
+    let passes = ("if-range", modified.as_str());
+    let stale = ("if-range", "Mon, 01 Jan 2001 00:00:00 GMT");
+    let whole = (StatusCode::OK, None, b"0123456789".as_slice());
+    let unsatisfiable = (
+        StatusCode::RANGE_NOT_SATISFIABLE,
+        Some("bytes */10"),
+        b"".as_slice(),
+    );
+    let middle = (
+        StatusCode::PARTIAL_CONTENT,
+        Some("bytes 2-5/10"),
+        b"2345".as_slice(),
+    );
+    let all = (
+        StatusCode::PARTIAL_CONTENT,
+        Some("bytes 0-9/10"),
+        b"0123456789".as_slice(),
+    );
+    let head_all = (
+        StatusCode::PARTIAL_CONTENT,
+        Some("bytes 0-9/10"),
+        b"".as_slice(),
+    );
+    check_answers(
+        &router,
+        &[
+            ("GET", &[("range", "bytes=abc")], whole),
+            ("GET", &[("range", "bytes=5-2")], whole),
+            ("GET", &[("range", "bytes=-")], whole),
+            ("GET", &[("range", "bytes=")], whole),
+            ("GET", &[("range", "")], whole),
+            ("GET", &[("range", "items=2-5")], whole),
+            ("GET", &[("range", "bytes=1 2-5")], whole),
+            ("GET", &[("range", "bytes=+2-5")], whole),
+            ("GET", &[("range", "bytes=99999999999999999999-")], whole),
+            ("GET", &[("range", "bytes=00000000000000000002-")], whole),
+            ("GET", &[("range", "bytes=9223372036854775808-")], whole),
+            (
+                "GET",
+                &[("range", "bytes=9223372036854775807-")],
+                unsatisfiable,
+            ),
+            ("GET", &[("range", "bytes=0-")], all),
+            (
+                "GET",
+                &[("range", "bytes=3-")],
+                (
+                    StatusCode::PARTIAL_CONTENT,
+                    Some("bytes 3-9/10"),
+                    b"3456789",
+                ),
+            ),
+            ("GET", &[("range", "bytes=0000000000000000002-5")], middle),
+            ("GET", &[("range", "bytes=2-5")], middle),
+            ("GET", &[("range", "Bytes = 2 - 5")], middle),
+            ("GET", &[("range", "bytes=\t2\t-\t5\t")], middle),
+            ("GET", &[("range", "bytes=002-005")], middle),
+            (
+                "GET",
+                &[("range", "bytes=7-99")],
+                (StatusCode::PARTIAL_CONTENT, Some("bytes 7-9/10"), b"789"),
+            ),
+            (
+                "GET",
+                &[("range", "bytes=-4")],
+                (StatusCode::PARTIAL_CONTENT, Some("bytes 6-9/10"), b"6789"),
+            ),
+            ("GET", &[("range", "bytes=-25")], all),
+            ("HEAD", &[("range", "bytes=-25")], head_all),
+            ("GET", &[("range", "bytes=-25"), passes], all),
+            ("GET", &[("range", "bytes=-25"), stale], whole),
+            ("GET", &[("range", "bytes=-0")], unsatisfiable),
+            ("GET", &[("range", "bytes=10-")], unsatisfiable),
+        ],
+    )
+    .await;
+}
+
+/// `RangeHelper.ParseRange`: no range of an empty file is satisfiable, where
+/// `ServeFile` answers one starting at 0 with an empty `206`; a failed
+/// `If-Range` still serves the (empty) whole file.
+#[tokio::test]
+async fn video_stream_range_of_an_empty_file_is_unsatisfiable() {
+    let stale = ("if-range", "Mon, 01 Jan 2001 00:00:00 GMT");
+    let empty = TempMedia::new(b"");
+    let router = create_router(state(&empty.path, no_subtitles()).app);
+    let (_, served, _) = static_stream(&router, "GET", &[]).await;
+    let modified = served[header::LAST_MODIFIED].to_str().unwrap().to_owned();
+    let passes = ("if-range", modified.as_str());
+    let none = (
+        StatusCode::RANGE_NOT_SATISFIABLE,
+        Some("bytes */0"),
+        b"".as_slice(),
+    );
+    let nothing = (StatusCode::OK, None, b"".as_slice());
+    check_answers(
+        &router,
+        &[
+            ("GET", &[("range", "bytes=0-")], none),
+            ("GET", &[("range", "bytes=0-0")], none),
+            ("GET", &[("range", "bytes=-5")], none),
+            ("GET", &[("range", "bytes=3-")], none),
+            ("HEAD", &[("range", "bytes=0-")], none),
+            ("GET", &[("range", "bytes=0-"), passes], none),
+            ("GET", &[("range", "bytes=0-"), stale], nothing),
+            ("GET", &[], nothing),
+        ],
+    )
+    .await;
+}
+
+/// Sends each `(method, headers)` and checks its status, `Content-Range` and
+/// body, and for a `GET` that `Content-Length` is the body's.
+async fn check_answers(router: &axum::Router, cases: &[(&str, Headers<'_>, Answer<'_>)]) {
+    for &(method, headers, (status, content_range, body)) in cases {
+        let (got, served, got_body) = static_stream(router, method, headers).await;
+        assert_eq!(got, status, "{method} {headers:?}");
+        assert_eq!(
+            served
+                .get(header::CONTENT_RANGE)
+                .map(|v| v.to_str().unwrap()),
+            content_range,
+            "{method} {headers:?}"
+        );
+        assert_eq!(got_body, body, "{method} {headers:?}");
+        if method == "GET" {
+            assert_eq!(
+                served[header::CONTENT_LENGTH],
+                body.len().to_string(),
+                "{method} {headers:?}"
+            );
+        }
+    }
+}
+
 #[tokio::test]
 async fn video_stream_missing_file_is_404() {
     // The media source resolves (the DB has a path) but the file is gone —

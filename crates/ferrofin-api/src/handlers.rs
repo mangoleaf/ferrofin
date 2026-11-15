@@ -957,7 +957,11 @@ pub const VERIFIED_SUBSYSTEMS_AGAINST_EARLIER_PIN: &[(&str, &str)] = &[];
 
 /// The subsystems a [`VERIFIED_SUBSYSTEMS`] row may cover, by key. Every
 /// operation crosses several of them, so one row states their divergences once
-/// and operation rows name it in [`Verified::refs`]. `websocket-streams` is
+/// and operation rows name it in [`Verified::refs`]. `static-file-ranges` is
+/// how a file served with range processing on answers `Range` and `If-Range`,
+/// shared by direct play, the download and file routes, the HLS segments and
+/// a graphical subtitle's file, whose operations have no row of their own yet.
+/// `websocket-streams` is
 /// the `/socket` dashboard streams, which no contract operation describes;
 /// `trickplay-extraction` is the ffmpeg run that writes a video's trickplay
 /// frames, which the tile operations serve but no response shows;
@@ -990,6 +994,7 @@ pub const SUBSYSTEM_KEYS: &[&str] = &[
     "user-data",
     "access-filtering",
     "images",
+    "static-file-ranges",
     "paging-sort",
     "websocket-streams",
     "scan-failure-isolation",
@@ -1059,6 +1064,48 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
             "A sortOrder with more entries than a non-empty sortBy has keys has the extra \
              entries ignored; upstream's GetOrderBy indexes past the sortBy array, which \
              throws ArgumentOutOfRangeException, and answers 400. Jellyfin bug not ported.",
+        ],
+    },
+    VerifiedSubsystem {
+        key: "static-file-ranges",
+        upstream_file: "Jellyfin.Api/Helpers/FileStreamResponseHelpers.cs",
+        upstream_method: "GetStaticFileResult",
+        ferrofin: "Which bytes, status and Content-Range a Range and an If-Range get from a \
+                   file served with range processing on: handlers/streaming.rs \
+                   serve_static_file (one_byte_range, if_range_valid, complete_length, then \
+                   tower-http's ServeFile through serve_file), behind direct play (the /Videos \
+                   and /Audio stream routes and universal audio), /Items/{itemId}/Download and \
+                   /File, the HLS segment routes and a graphical subtitle's file. Compared with \
+                   GetStaticFileResult (VideosController, AudioHelper, HlsSegmentController, \
+                   DynamicHlsController) and the PhysicalFile(..., true) calls in \
+                   LibraryController (GetFile, GetDownload) and SubtitleController at the \
+                   pinned v12.4 tag, and the ASP.NET Core 10 code they reach: \
+                   FileResultHelper.SetHeadersAndLog, IfRangeValid and SetRangeHeaders, \
+                   RangeHelper.ParseRange and NormalizeRange, and the RangeHeaderValue, \
+                   RangeItemHeaderValue and RangeConditionHeaderValue parsers. Several ranges \
+                   (a second Range value or any comma) and a value that does not parse (a \
+                   reversed range, a part that is not digits, has more than 19 digits or is \
+                   past i64::MAX) are ignored and the whole file served; one range takes \
+                   spaces and tabs around its parts and leading zeros; an end past the file is \
+                   cut to it, a suffix longer than the file is the whole file, a start at or \
+                   past the end and a zero suffix are 416 with bytes */length, and no range of \
+                   an empty file is satisfiable. If-Range is read only beside a Range that \
+                   stands: a date fails once the file's Last-Modified (whole seconds) is later, \
+                   a tag fails unless strongly equal to the ETag of the answer (upstream's \
+                   answer has none, so it passes every tag; this holds until gl-1823 drops \
+                   ServeFile's ETag), a value that parses as neither passes, and a failed one \
+                   serves the whole file even where the range would be 416; HEAD answers the \
+                   same with no body. The other validators and preconditions (the ETag itself, \
+                   If-Match, If-None-Match, If-Modified-Since, If-Unmodified-Since), the date \
+                   forms .NET's TryStringToDate reads beyond httpdate's IMF-fixdate, RFC 850 \
+                   and asctime (If-Range's included) and each answer's Content-Type are \
+                   gl-1823's and gl-1801's; they are not part of this row.",
+        date: "2026-11-14",
+        divergences: &[
+            "A Range in a unit other than bytes is ignored and the whole file served, as RFC \
+             9110 section 14.2 requires of a unit the server does not understand; ASP.NET's \
+             RangeHelper never checks the unit and serves any as a byte range. ASP.NET bug \
+             not ported.",
         ],
     },
     VerifiedSubsystem {

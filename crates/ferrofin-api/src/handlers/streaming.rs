@@ -493,44 +493,72 @@ pub(crate) async fn serve_static_file_without_ranges(
 ///
 /// Where ASP.NET's `RangeHelper.ParseRange` and `FileResultHelper.IfRangeValid`
 /// answer otherwise, the request is changed first or served again. Several
-/// ranges, in one header or in several, are ignored and the whole file served,
-/// where `ServeFile` answers `416` (or `206` for the first header). A `Range`
-/// whose `If-Range` no longer holds is ignored too: `ServeFile` never reads
-/// `If-Range`, so it is checked against the validators of its answer, and the
-/// file is served again without the range when it fails.
+/// ranges, in one header or in several, and a range that does not parse are
+/// ignored and the whole file served, where `ServeFile` answers `416` (or `206`
+/// for the first header); one range is read as [`one_byte_range`] does. A
+/// `Range` whose `If-Range` no longer holds is ignored too: `ServeFile` never
+/// reads `If-Range`, so it is checked against the validators of its answer, and
+/// the file is served again without the range when it fails. A suffix longer
+/// than the file is served again as the whole file in a `206`, and a range of
+/// an empty file is a `416`.
 pub(crate) async fn serve_static_file(
     path: &str,
     mut request: Request,
 ) -> Result<Response, ApiError> {
     let headers = request.headers_mut();
-    let mut ranges = headers.get_all(header::RANGE).iter();
-    if ranges
-        .next()
-        .is_some_and(|range| range.as_bytes().contains(&b','))
-        || ranges.next().is_some()
-    {
-        headers.remove(header::RANGE);
-    }
+    let range = one_byte_range(headers);
+    // Handed on in the one form ServeFile parses, which is stricter than
+    // ASP.NET's: it answers 416 to a value ASP.NET ignores or reads.
+    match range.and_then(|(first, last)| {
+        let bound = |n: Option<u64>| n.map_or_else(String::new, |n| n.to_string());
+        header::HeaderValue::try_from(format!("bytes={}-{}", bound(first), bound(last))).ok()
+    }) {
+        Some(value) => headers.insert(header::RANGE, value),
+        None => headers.remove(header::RANGE),
+    };
     let if_range = headers
         .remove(header::IF_RANGE)
         .filter(|_| headers.contains_key(header::RANGE));
-    let whole_file = if_range.is_some().then(|| {
-        let mut whole_file = Request::new(Body::empty());
-        *whole_file.method_mut() = request.method().clone();
-        *whole_file.uri_mut() = request.uri().clone();
-        *whole_file.headers_mut() = request.headers().clone();
-        whole_file.headers_mut().remove(header::RANGE);
-        whole_file
+    // What ServeFile cannot settle before it opens the file: whether an
+    // If-Range holds, and whether a suffix is longer than the file.
+    let again = (if_range.is_some() || matches!(range, Some((None, _)))).then(|| {
+        let mut again = Request::new(Body::empty());
+        *again.method_mut() = request.method().clone();
+        *again.uri_mut() = request.uri().clone();
+        *again.headers_mut() = request.headers().clone();
+        again
     });
     let mut response = serve_file(path, request).await?;
-    if let (Some(if_range), Some(whole_file)) = (if_range, whole_file)
-        && matches!(
-            response.status(),
+    if let Some(mut again) = again {
+        let status = response.status();
+        if matches!(
+            status,
             StatusCode::PARTIAL_CONTENT | StatusCode::RANGE_NOT_SATISFIABLE
-        )
-        && !if_range_valid(&if_range, response.headers())
+        ) && if_range.is_some_and(|if_range| !if_range_valid(&if_range, response.headers()))
+        {
+            again.headers_mut().remove(header::RANGE);
+            response = serve_file(path, again).await?;
+        } else if status == StatusCode::RANGE_NOT_SATISFIABLE
+            && matches!(range, Some((None, Some(suffix))) if suffix > 0)
+            && complete_length(response.headers()).is_some_and(|length| length > 0)
+        {
+            // NormalizeRange: a suffix longer than the file is all of it.
+            again
+                .headers_mut()
+                .insert(header::RANGE, header::HeaderValue::from_static("bytes=0-"));
+            response = serve_file(path, again).await?;
+        }
+    }
+    if response.status() == StatusCode::PARTIAL_CONTENT
+        && complete_length(response.headers()) == Some(0)
     {
-        response = serve_file(path, whole_file).await?;
+        // ParseRange: no range of an empty file is satisfiable, where
+        // ServeFile answers one that starts at 0 with an empty 206.
+        *response.status_mut() = StatusCode::RANGE_NOT_SATISFIABLE;
+        response.headers_mut().insert(
+            header::CONTENT_RANGE,
+            header::HeaderValue::from_static("bytes */0"),
+        );
     }
     // A path the database resolved but the filesystem rejects otherwise
     // surfaces as a bare 404 indistinguishable from a missing route — name the
@@ -558,6 +586,58 @@ async fn serve_file(path: &str, request: Request) -> Result<Response, ApiError> 
         .await
         .map_err(|e| ApiError::NotFound(e.to_string()))?;
     Ok(response.map(Body::new))
+}
+
+/// The most digits `RangeItemHeaderValue` reads in a range part
+/// (`HttpRuleParser.MaxInt64Digits`), leading zeros included.
+const MAX_INT64_DIGITS: usize = 19;
+
+/// The one byte range of `headers`' `Range`, as `RangeHelper.ParseRange`
+/// reads it through `RangeHeaderValue`: `(first, last)`, `first` `None` for a
+/// suffix and `last` `None` for an open end. `None` when it ignores the header:
+/// several values, a `,`, or a value that does not parse (a reversed range, a
+/// part that is not digits, longer than [`MAX_INT64_DIGITS`] or past
+/// `i64::MAX`). Spaces and tabs may surround each part, and numbers may have
+/// leading zeros. The unit must be `bytes`, in any case: ASP.NET never checks
+/// it and reads any unit as bytes, where RFC 9110 section 14.2 says to ignore
+/// one not understood.
+fn one_byte_range(headers: &HeaderMap) -> Option<(Option<u64>, Option<u64>)> {
+    let mut values = headers.get_all(header::RANGE).iter();
+    let (Some(value), None) = (values.next(), values.next()) else {
+        return None;
+    };
+    let value = value.to_str().ok()?;
+    let (unit, spec) = value.split_once('=')?;
+    let space = [' ', '\t'];
+    if value.contains(',') || !unit.trim_matches(space).eq_ignore_ascii_case("bytes") {
+        return None;
+    }
+    let (first, last) = spec.split_once('-')?;
+    let bound = |part: &str| -> Option<Option<u64>> {
+        let part = part.trim_matches(space);
+        if part.is_empty() {
+            return Some(None);
+        }
+        if part.len() > MAX_INT64_DIGITS || !part.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+        part.parse::<i64>()
+            .ok()
+            .and_then(|n| u64::try_from(n).ok())
+            .map(Some)
+    };
+    match (bound(first)?, bound(last)?) {
+        (None, None) => None,
+        (Some(first), Some(last)) if first > last => None,
+        range => Some(range),
+    }
+}
+
+/// The complete length a `Content-Range` names: `10` in `bytes 2-5/10` and
+/// in `bytes */10`.
+fn complete_length(served: &HeaderMap) -> Option<u64> {
+    let value = served.get(header::CONTENT_RANGE)?.to_str().ok()?;
+    value.rsplit_once('/')?.1.parse().ok()
 }
 
 /// `FileResultHelper.IfRangeValid` against the validators `served` carries: a
