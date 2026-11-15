@@ -6064,10 +6064,7 @@ const BY_NAME_DIVERGENCES_ARTISTS: &[&str] = &[
     "The 400 (a value the query binder cannot convert, a parentId naming no item, or a \
      conflicting `filters` pair) and 403 (another user's id without the administrator \
      role) bodies are Ferrofin's error shape, not upstream's. Fix path: gl-666.",
-    "`searchTerm` is not v12.2 TranslateQuery's search branch: the wildcard branch is \
-     chosen on, and matches CleanName with, the raw lower-cased term rather than the \
-     cleaned one, a whitespace-only term filters nothing (upstream's IsNullOrEmpty applies \
-     it), and there is no OriginalTitle arm. Fix path: gl-957.",
+    SEARCH_TERM_ORIGINAL_TITLE_DIVERGENCE,
 ];
 
 /// What `/Genres`, `/MusicGenres` and `/Studios` do differently from their v12
@@ -6081,11 +6078,19 @@ const BY_NAME_DIVERGENCES_GENRES_STUDIOS: &[&str] = &[
      user — unscoped, every library on the server; Ferrofin answers 404. Jellyfin bug not \
      ported.",
     NO_USER_USER_DATA_FILTER_DIVERGENCE,
-    "`searchTerm` is not v12.2 TranslateQuery's search branch: the wildcard branch is \
-     chosen on, and matches CleanName with, the raw lower-cased term rather than the \
-     cleaned one, a whitespace-only term filters nothing (upstream's IsNullOrEmpty applies \
-     it), and there is no OriginalTitle arm. Fix path: gl-957.",
+    SEARCH_TERM_ORIGINAL_TITLE_DIVERGENCE,
 ];
+
+/// `searchTerm`'s `OriginalTitle` arm (`translate_query::push_search_term`),
+/// shared by a browse and the by-name lists (gl-957). Otherwise the predicate
+/// is v12.4's, checked against a stock 12.4's `/Genres` for `%`, `_`, `^`,
+/// `[`/`]`, a whitespace-only term, terms that clean to nothing and an
+/// `OriginalTitle` match.
+const SEARCH_TERM_ORIGINAL_TITLE_DIVERGENCE: &str = "`searchTerm`'s OriginalTitle arm \
+     lower-cases both sides (Unicode); v12.4 TranslateQuery matches the raw term with SQLite \
+     LIKE, which folds ASCII case only, so an OriginalTitle whose non-ASCII letters differ in \
+     case from the term matches here and not upstream (a Name match folds them on both, \
+     through CleanName). Jellyfin bug not ported (gl-957).";
 
 /// Included in the divergence lists of the five by-name VERIFIED rows: an API
 /// key with no `userId` lists them with no user.
@@ -6188,10 +6193,7 @@ const RESUME_DIVERGENCES: &[&str] = &[
     "Resume positions that Ferrofin builds before gl-46 saved for songs and for Sample, \
      ThemeVideo and Trailer extras (kinds v12 never lets resume) keep those items listed \
      until they are played again; new plays no longer save one. Fix path: gl-717.",
-    "`searchTerm`'s OriginalTitle arm lower-cases both sides (Unicode); v12.4 \
-     TranslateQuery matches the raw term with SQLite LIKE, which folds ASCII case only, so \
-     an OriginalTitle whose non-ASCII letters differ in case from the term matches here and \
-     not upstream. Fix path: gl-957.",
+    SEARCH_TERM_ORIGINAL_TITLE_DIVERGENCE,
     "The 400 (an API key with no userId, or a value the query binder cannot convert), \
      403 (another user's id without the administrator role) and 404 (a userId naming no \
      account) bodies are Ferrofin's error shape, not upstream's. Fix path: gl-666.",

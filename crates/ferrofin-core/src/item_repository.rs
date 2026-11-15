@@ -11,9 +11,7 @@
 //! not taken as a field (it would be injected at the composition root if a later
 //! method needs it).
 
-use ferrofin_util::string_extensions::{
-    equals_ordinal_ignore_case, lower_invariant, ordinal_ignore_case_key,
-};
+use ferrofin_util::string_extensions::{equals_ordinal_ignore_case, ordinal_ignore_case_key};
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -2921,11 +2919,6 @@ fn parse_physical_folder_ids(blob: &str) -> Vec<Uuid> {
         .unwrap_or_default()
 }
 
-/// The characters C# `BaseItemRepository.SearchWildcardTerms` treats as "the
-/// caller is doing a wildcard search" — their presence routes `SearchTerm` to a
-/// raw (unescaped) `LIKE` instead of a literal contains-match.
-const SEARCH_WILDCARD_TERMS: &[char] = &['%', '_', '[', ']', '^'];
-
 /// Hard cap on the ancestor-chain CTE depth — prevents unbounded recursion on
 /// a cyclic `ParentId` chain (real libraries are <10 levels deep).
 const MAX_ANCESTOR_DEPTH: i32 = 32;
@@ -2959,13 +2952,9 @@ const PLAYLIST_ITEMS_SQL: &str = r#"SELECT ch.*,
 /// Appends the caller's name filters against the by-name `bi` row (C#
 /// `TranslateQuery`'s name predicates on the outer query).
 ///
-/// - `SearchTerm` ports the C# two-branch shape (v12 `TranslateQuery.cs:250-265`):
-///   a term containing a wildcard character goes through `LIKE '%term%'`
-///   **unescaped** (client wildcards pass through, as upstream intends); a plain
-///   term is cleaned (`get_clean_value`, as v12's `GetCleanValue`) and matched
-///   as a literal contains on `CleanName`. It still differs from v12.2: the
-///   wildcard branch is chosen on, and matched with, the raw term rather than
-///   the cleaned one, and there is no `OriginalTitle` arm (gl-957).
+/// - `SearchTerm` is the browse's predicate
+///   ([`crate::translate_query::push_search_term`]), as v12.4 runs the same
+///   `TranslateQuery` on the outer query (gl-957).
 /// - `NameStartsWith`, `NameStartsWithOrGreater` and `NameLessThan` are the
 ///   browse's v12.2 `ApplyNameFilters` ([`append_name_ranges`]): a literal
 ///   `SortName` prefix and full-string comparisons against the lowercased,
@@ -2985,18 +2974,7 @@ fn append_by_name_filters(
 ) {
     append_predicates(qb, outer);
     if let Some(term) = non_blank(filter.search_term.as_ref()) {
-        let lowered = lower_invariant(term);
-        if lowered.contains(SEARCH_WILDCARD_TERMS) {
-            let like = format!("%{}%", lowered.trim_matches('%'));
-            qb.push(r#" AND ferrofin_lower_invariant(bi."CleanName") LIKE "#)
-                .push_bind(like);
-        } else {
-            let like = format!(
-                "%{}%",
-                crate::text_util::get_clean_value(term).trim_matches('%')
-            );
-            qb.push(r#" AND bi."CleanName" LIKE "#).push_bind(like);
-        }
+        crate::translate_query::push_search_term(qb, term);
     }
     append_name_ranges(qb, filter);
 }
@@ -5127,6 +5105,7 @@ mod tests {
     use ferrofin_model::data::BaseItemKind;
     use ferrofin_model::entities::ExtraType;
     use ferrofin_traits::persistence::ItemPersistenceService;
+    use ferrofin_util::string_extensions::lower_invariant;
 
     /// `MapImageFromEntity`: the type is cast as stored, an unknown one kept;
     /// an empty or non-UTF-8 blurhash reads as none; no stored date is the
@@ -9243,16 +9222,54 @@ mod tests {
         assert_eq!(s.items[0].item.name.as_deref(), Some("Drama"));
         assert_eq!(s.items[0].counts.movie_count, 2);
         assert_eq!(s.items[0].counts.item_count, 2);
+    }
 
-        // A searchTerm carrying a wildcard character routes through raw LIKE —
-        // the `_` matches any one character (C# SearchWildcardTerms branch).
-        let wild = InternalItemsQuery {
-            search_term: Some("dr_ma".to_owned()),
-            ..Default::default()
-        };
-        let w = repository.get_genres(&wild).await.expect("wild");
-        assert_eq!(w.items.len(), 1);
-        assert_eq!(w.items[0].item.name.as_deref(), Some("Drama"));
+    /// gl-957: a by-name list's `searchTerm` is `TranslateQuery`'s search
+    /// branch, as a browse's. The cases are a stock Jellyfin 12.4's `/Genres`
+    /// answers over the same five genres: a wildcard character is cleaned to a
+    /// space like any punctuation (upstream's wildcard branch is unreachable),
+    /// a term that cleans to nothing matches every row, and a row's
+    /// `OriginalTitle` matches, ASCII case folded.
+    #[rstest::rstest]
+    #[case("rock", &["Rock Roll", "Rock and Roll"])]
+    #[case("rock%roll", &["Rock Roll"])]
+    #[case("a_b", &["A B"])]
+    #[case("sci^fi", &["Sci-Fi"])]
+    #[case("[a]", &["A B", "Acb", "Rock and Roll"])]
+    #[case("quixotic", &["Acb"])]
+    #[case("QUIXOTIC", &["Acb"])]
+    #[case("!!", &["A B", "Acb", "Rock Roll", "Rock and Roll", "Sci-Fi"])]
+    #[case("%%", &["A B", "Acb", "Rock Roll", "Rock and Roll", "Sci-Fi"])]
+    #[tokio::test]
+    async fn by_name_search_term_is_translate_querys_search_branch(
+        #[case] term: &str,
+        #[case] expected: &[&str],
+    ) {
+        let db = test_db().await;
+        let movie = Uuid::from_u128(0x0957);
+        seed_named_item(&db, movie, BaseItemKind::Movie, "One").await;
+        for genre in ["Rock and Roll", "Acb", "Rock Roll", "A B", "Sci-Fi"] {
+            seed_item_genre(&db, movie, genre).await;
+        }
+        sqlx::query(r#"UPDATE "BaseItems" SET "OriginalTitle" = 'Quixotic' WHERE "Name" = 'Acb'"#)
+            .execute(db.writer())
+            .await
+            .unwrap();
+
+        let genres = repo(&db)
+            .get_genres(&InternalItemsQuery {
+                search_term: Some(term.to_owned()),
+                ..Default::default()
+            })
+            .await
+            .expect("genres");
+        let mut names: Vec<_> = genres
+            .items
+            .iter()
+            .filter_map(|i| i.item.name.clone())
+            .collect();
+        names.sort();
+        assert_eq!(names, expected);
     }
 
     /// `NameStartsWith` on a by-name list is v12.2 `ApplyNameFilters`, the
