@@ -1380,33 +1380,46 @@ fn default_probe_concurrency() -> usize {
 }
 
 /// The ffprobe request for a leaf media item, or `None` when the row must not
-/// be probed at all: a folder, a non-media row, or a row with no path.
+/// be probed at all: a folder, a non-media row, a row with no path, or a
+/// Blu-ray folder rip.
 ///
 /// This is the *deciding* half of the probe — exactly the eligibility test the
 /// inline probe applied — split out so the whole plan can be classified up
 /// front, before any ffprobe runs.
 ///
-/// TODO(parity, open work item): a disc rip's `Video` (its path a
+/// A video's request carries its `VideoType` and `IsoType`, as
+/// `FFProbeVideoInfo.GetMediaInfo` sends them: a Blu-ray ISO is read through
+/// `bluray:`, and a DVD folder rip through its title's `.vob` files (the
+/// encoder's DVD branch of `ProbeVideo`), whose probe also gives the size.
+///
+/// TODO(parity, gl-1834): a Blu-ray folder rip's `Video` (its path a
 /// directory, [`crate::item_data::path_is_directory`]) is not probed.
-/// Upstream probes a DVD through its title set's `.vob` files and a Blu-ray
-/// through its playlist (`FFProbeVideoInfo.ProbeVideo`, `FFProbeVideoInfo.
-/// cs:89-140`) and stores the size of what it probed (`:208-211`); the
-/// request here carries a path only, which ffprobe cannot open for a
-/// directory. Port path: carry the row's `VideoType`/`IsoType` into the
-/// request (as `VideoProbeInput` does), port `GetPrimaryPlaylistVobFiles`
-/// and the Blu-ray playlist probe in the encoder, then drop the directory
-/// gate here.
+/// Upstream takes its streams, chapters and run time from BDInfo
+/// (`BdInfoExaminer.GetDiscInfo`) and probes its first `.m2ts` for
+/// `FetchBdInfo` (`FFProbeVideoInfo.ProbeVideo`). Port path: BDInfo's
+/// playlist stream table, chapters and `.m2ts` scan beside the play-item
+/// reader in `ferrofin-mediaencoding`'s `disc/bdrom.rs`, the Blu-ray branch
+/// in the encoder's probe, then drop the Blu-ray gate here.
 fn probe_request(entity: &BaseItemEntity) -> Option<MediaInfoRequest> {
     let is_audio = entity.media_type.as_deref() == Some("Audio");
     let is_media = is_audio || entity.media_type.as_deref() == Some("Video");
     // A folder is never probed — a playlist file's `MediaType` is its
     // `PlaylistMediaType`, `Audio`, and it is still no track.
-    if entity.is_folder || crate::item_data::path_is_directory(entity) || !is_media {
+    if entity.is_folder || !is_media {
+        return None;
+    }
+    let format = (!is_audio).then(|| crate::item_data::video_format(entity.data.as_deref()));
+    // Of the disc rips at a directory, only a DVD is.
+    if crate::item_data::path_is_directory(entity)
+        && format.is_none_or(|f| f.video_type != VideoType::Dvd)
+    {
         return None;
     }
     Some(MediaInfoRequest {
         media_source: MediaSourceInfo {
             path: Some(entity.path.clone()?),
+            video_type: format.map(|f| f.video_type),
+            iso_type: format.and_then(|f| f.iso_type),
             ..Default::default()
         },
         // Extract embedded chapter markers so they show on the playback
@@ -1420,15 +1433,14 @@ fn probe_request(entity: &BaseItemEntity) -> Option<MediaInfoRequest> {
     })
 }
 
-/// The external-stream half of one video's probe: the sidecar resolvers plus
-/// the item's internal metadata folder (the second place upstream looks for
-/// sidecars — where an upload against a read-only library was written).
+/// The external-stream half of one item's probe: the sidecar resolvers and
+/// what they search for — the item at its own path (a `.strm` shortcut's file,
+/// while ffprobe reads its remote target) and its internal metadata folder
+/// (the second place upstream looks for sidecars — where an upload against a
+/// read-only library was written).
 struct ExternalProbe {
     resolvers: Arc<ExternalStreamResolvers>,
-    internal_metadata_path: Option<String>,
-    /// The file the sidecars sit beside when it is not the one probed: a
-    /// `.strm` shortcut's own path, while ffprobe reads its remote target.
-    sidecar_path: Option<String>,
+    target: crate::media_info_resolver::ExternalMediaTarget,
 }
 
 /// The scan-wide external-stream seam handed to the probe pipeline: the
@@ -1442,20 +1454,31 @@ struct ExternalProbeSeam {
 }
 
 impl ExternalProbeSeam {
-    /// The per-item half for `id`'s probe: the item's internal metadata
-    /// folder is `{metadata}/library/{id2}/{id}` (the same derivation the
-    /// subtitle manager writes its read-only-library fallback to).
-    fn for_item(&self, id: Uuid) -> ExternalProbe {
+    /// Item `id`'s internal metadata folder, `{metadata}/library/{id2}/{id}`
+    /// (the same derivation the subtitle manager writes its
+    /// read-only-library fallback to).
+    fn internal_metadata_path(&self, id: Uuid) -> Option<String> {
         let dashless = id.simple().to_string();
-        ExternalProbe {
+        self.metadata_dir
+            .as_ref()
+            .map(|root| root.join(&dashless[..2]).join(&dashless))
+            .map(|p| p.to_string_lossy().into_owned())
+    }
+
+    /// The per-item half of `item`'s probe (item `id`): a video's sidecars
+    /// are looked for as `Video` finds them, a track's beside its file.
+    fn for_item(&self, id: Uuid, item: &BaseItemEntity, is_audio: bool) -> Option<ExternalProbe> {
+        let path = item.path.as_deref()?;
+        let internal = self.internal_metadata_path(id);
+        let target = if is_audio {
+            self.resolvers.target_for(path, internal)
+        } else {
+            crate::media_info_resolver::ExternalMediaTarget::for_video(item, path, internal)
+        };
+        Some(ExternalProbe {
             resolvers: Arc::clone(&self.resolvers),
-            internal_metadata_path: self
-                .metadata_dir
-                .as_ref()
-                .map(|root| root.join(&dashless[..2]).join(&dashless))
-                .map(|p| p.to_string_lossy().into_owned()),
-            sidecar_path: None,
-        }
+            target,
+        })
     }
 }
 
@@ -1533,26 +1556,15 @@ fn spawn_probe(
                 return None;
             }
         };
-        let sidecar_path = external
-            .as_ref()
-            .and_then(|external| external.sidecar_path.clone());
-        if let (Some(external), Some(path)) = (
-            external,
-            sidecar_path
-                .as_deref()
-                .or(request.media_source.path.as_deref()),
-        ) {
-            let target = external
-                .resolvers
-                .target_for(path, external.internal_metadata_path);
+        if let Some(ExternalProbe { resolvers, target }) = external {
             if request.media_is_audio {
-                add_external_lyrics(&external.resolvers, &target, &mut probed);
+                add_external_lyrics(&resolvers, &target, &mut probed);
                 return Some(probed);
             }
-            let externals = external.resolvers.external_streams(&target, 0).await;
+            let externals = resolvers.external_streams(&target, 0).await;
             if !externals.is_empty() {
                 tracing::debug!(
-                    path,
+                    path = target.path,
                     count = externals.len(),
                     "external media streams resolved"
                 );
@@ -1639,7 +1651,7 @@ fn extract_embedded_lyrics(
     let Some(lyrics) = lyrics else {
         return Ok(());
     };
-    let internal = seam.for_item(id).internal_metadata_path;
+    let internal = seam.internal_metadata_path(id);
     let targets = crate::lyric_manager::save_targets(
         std::path::Path::new(path),
         save_with_media,
@@ -1858,14 +1870,12 @@ impl<'a> ProbePipeline<'a> {
                 // A video's sidecars are subtitles and audio tracks
                 // (`FFProbeVideoInfo`), an audio track's are its lyrics
                 // (`AudioFileProber.AddExternalLyrics`).
-                let external = self.externals.as_ref().map(|seam| {
-                    let mut external = seam.for_item(self.planned[index].id);
-                    // The sidecars sit beside the `.strm`, not its target.
-                    external.sidecar_path =
-                        shortcut.and_then(|_| self.planned[index].entity.path.clone());
-                    external
-                });
+                // The sidecars sit beside the `.strm`, not its target.
                 let is_audio = request.media_is_audio;
+                let external = self.externals.as_ref().and_then(|seam| {
+                    let planned = &self.planned[index];
+                    seam.for_item(planned.id, &planned.entity.to_entity(), is_audio)
+                });
                 self.inflight.push_back((
                     index,
                     is_audio,
@@ -3108,14 +3118,17 @@ pub(crate) fn unwalked_refresh_plan(
 fn sidecars_changed(
     seam: &ExternalProbeSeam,
     item: &Planned,
+    entity: &BaseItemEntity,
     links: Option<&StoredItemLinks>,
 ) -> bool {
-    let (Some(links), Some(path)) = (links, item.entity.path.as_deref()) else {
+    let (Some(links), Some(path)) = (links, entity.path.as_deref()) else {
         return true;
     };
-    let target = seam
-        .resolvers
-        .target_for(path, seam.for_item(item.id).internal_metadata_path);
+    let target = crate::media_info_resolver::ExternalMediaTarget::for_video(
+        entity,
+        path,
+        seam.internal_metadata_path(item.id),
+    );
     let differs = |resolver: &crate::media_info_resolver::MediaInfoResolver, stored: &[String]| {
         let now: std::collections::HashSet<String> = resolver
             .get_external_files(&target)
@@ -3149,7 +3162,7 @@ fn lyrics_changed(
     };
     let target = seam
         .resolvers
-        .target_for(path, seam.for_item(item.id).internal_metadata_path);
+        .target_for(path, seam.internal_metadata_path(item.id));
     let now: std::collections::HashSet<String> = seam
         .resolvers
         .lyrics()
@@ -11230,7 +11243,7 @@ impl LibraryScanner {
         };
         let path = entity.path.as_deref().unwrap_or_default();
         let sidecars_changed = matches!(probe, ProbeKind::Video { .. })
-            && externals.is_some_and(|seam| sidecars_changed(seam, item, links));
+            && externals.is_some_and(|seam| sidecars_changed(seam, item, entity, links));
         let kind = item_type_lookup::kind_from_type_name(&entity.type_);
         FileFacts {
             mtime: entity.date_modified,
@@ -45809,6 +45822,42 @@ mod chapter_image_refresh_tests {
             let request = probe_request(&fixture_item(kind, media_type)).expect("probed");
             assert_eq!(request.extract_chapters, expected, "{kind:?}");
         }
+    }
+
+    /// `FFProbeVideoInfo.GetMediaInfo`: a video's request carries its
+    /// `VideoType` and `IsoType`, an audio track's neither; a DVD folder rip
+    /// is probed at its folder, a Blu-ray folder rip not yet (gl-1834).
+    #[test]
+    fn a_video_probe_carries_its_video_type_and_iso_type() {
+        use ferrofin_model::entities::IsoType;
+        let probed = |kind: BaseItemKind, media_type: &str, data: Option<&str>| {
+            probe_request(&BaseItemEntity {
+                id: Uuid::new_v4().to_string(),
+                type_: crate::item_type_lookup::stored_type_name(kind)
+                    .unwrap()
+                    .to_owned(),
+                media_type: Some(media_type.to_owned()),
+                path: Some("/media/film".to_owned()),
+                data: data.map(str::to_owned),
+                ..BaseItemEntity::default()
+            })
+            .map(|r| (r.media_source.video_type, r.media_source.iso_type))
+        };
+        let movie = |data| probed(BaseItemKind::Movie, "Video", data);
+        assert_eq!(movie(None), Some((Some(VideoType::VideoFile), None)));
+        assert_eq!(
+            movie(Some(r#"{"VideoType":"Iso","IsoType":"BluRay"}"#)),
+            Some((Some(VideoType::Iso), Some(IsoType::BluRay)))
+        );
+        assert_eq!(
+            movie(Some(r#"{"VideoType":"Dvd"}"#)),
+            Some((Some(VideoType::Dvd), None))
+        );
+        assert_eq!(movie(Some(r#"{"VideoType":"BluRay"}"#)), None);
+        assert_eq!(
+            probed(BaseItemKind::Audio, "Audio", None),
+            Some((None, None))
+        );
     }
 
     #[tokio::test]
