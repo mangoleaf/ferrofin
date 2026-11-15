@@ -2463,9 +2463,13 @@ const SIMILAR_ITEMS_DIVERGENCES: &[&str] = &[
     SIMILAR_ALTERNATE_VERSIONS_DIVERGENCE,
     SIMILAR_SCORE_GROUPING_DIVERGENCE,
     SIMILAR_IS_VISIBLE_DIVERGENCE,
-    "The reference-cache read swallows an I/O error silently and warns on an empty entry or \
-     one whose References is null, where upstream warns on an IOException and treats both \
-     as a silent miss. Fix path: gl-1652.",
+    "A reference-cache entry that exists but cannot be read (a directory at its path, an \
+     entry or cache directory the server may not read) warns once with its path and is \
+     fetched again from the provider. Upstream reads a directory, or an entry under a \
+     directory it may not search, as a silent miss, and an unreadable entry file throws an \
+     UnauthorizedAccessException, not an IOException, so the provider's catch warns and its \
+     results drop out of the response. Jellyfin bug not ported: a silent miss hides a disk \
+     problem while every request pays a provider call.",
     "A library adopted from Jellyfin 10.11, or saved before similarity providers were \
      configurable, keeps the empty SimilarItemProviders that Jellyfin 12's \
      EnableLocalSimilarityProviders routine fills with Local Genre/Tag, so a client that then \
