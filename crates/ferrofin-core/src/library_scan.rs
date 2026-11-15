@@ -9403,16 +9403,11 @@ impl LibraryScanner {
                 )
         });
         if duration > 0 && chapters.len() <= 1 && video_stream {
-            let encoder = self.media_encoder.as_ref().ok_or_else(|| {
-                ServiceError::backend("a successful video probe requires its media encoder")
-            })?;
-            chapters =
-                ferrofin_providers::mediainfo::FFProbeVideoInfo::new(encoder.as_ref(), duration)
-                    .create_dummy_chapters(&ferrofin_providers::mediainfo::VideoProbeInput {
-                        name: video.name.clone(),
-                        run_time_ticks: video.run_time_ticks,
-                        ..Default::default()
-                    })?;
+            chapters = ferrofin_providers::mediainfo::FFProbeVideoInfo::new(duration)
+                .create_dummy_chapters(&ferrofin_providers::mediainfo::VideoProbeInput {
+                    name: video.name.clone(),
+                    run_time_ticks: video.run_time_ticks,
+                })?;
         }
         // `NormalizeChapterNames`, over probed and dummy chapters alike: blank
         // names and names `TimeSpan.TryParse` accepts become "Chapter N".

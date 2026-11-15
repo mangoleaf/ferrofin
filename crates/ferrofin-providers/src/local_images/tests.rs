@@ -55,7 +55,6 @@ impl FakeDirectoryService {
             name: name.to_owned(),
             extension,
             length,
-            last_write_time_utc: None,
             is_directory,
         };
         self.dirs.entry(dir.to_owned()).or_default().push(meta);
