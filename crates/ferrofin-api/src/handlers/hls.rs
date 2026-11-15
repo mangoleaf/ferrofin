@@ -952,6 +952,17 @@ fn path_extension(uri_path: &str) -> String {
         .unwrap_or_default()
 }
 
+/// A legacy route value as ASP.NET binds it: Kestrel decodes every escape of
+/// the path but `%2F`, so an encoded slash stays three literal characters of
+/// the file name, inside the transcode folder, where the router here has
+/// decoded it.
+///
+/// shortcut: a lowercase `%2f` comes back uppercase; only a file named with
+/// it could tell, and the transcode folder holds none.
+fn kestrel_route_value(value: &str) -> String {
+    value.replace('/', "%2F")
+}
+
 /// `{itemId}` of the legacy `HlsSegmentController` routes, a
 /// `[FromRoute, Required] string` the actions never read: a blank one is the
 /// binder's `400`, and any other value binds, GUID or not.
@@ -972,33 +983,43 @@ impl RouteParameter for LegacySegmentId {
 /// `GET /Videos/{itemId}/hls/{playlistId}/{segmentId}.{segmentContainer}` — the
 /// legacy video segment serve (`HlsSegmentController.GetHlsVideoSegmentLegacy`).
 ///
-/// Serves the already-produced segment file `<segmentId><ext>` from the transcode
-/// cache; `400` on a traversal/miss (mapped from [`ServiceError::InvalidInput`]).
-/// The route captures `{segmentId}.{segmentContainer}` as one segment, split at
-/// its last `.` as ASP.NET splits it; each half is a required string. A half
-/// that is empty is no match for ASP.NET's complex segment (a 404 on Jellyfin
-/// 12.4), not a blank value.
+/// Serves the already-produced segment file `<segmentId>.<segmentContainer>`
+/// from the transcode cache: `400` for a name that escapes it, `404` when the
+/// cache holds no file of `{playlistId}` ("Hls segment not found.") or no such
+/// segment. The route captures `{segmentId}.{segmentContainer}` as one segment,
+/// split at its last `.` as ASP.NET splits it; each part is a required string.
+/// A half that is empty is no match for ASP.NET's complex segment (an empty 404
+/// on Jellyfin 12.4), not a blank value, and route matching comes before the
+/// binder's 400 for a blank `{itemId}` or `{playlistId}`.
 async fn get_hls_video_segment_legacy(
     State(state): State<AppState>,
-    _item_id: RequiredRouteString<LegacyItemId>,
-    _: RequiredRouteString<PlaylistId>,
-    Path((_, _, segment_id)): Path<(String, String, String)>,
+    Path((item_id, playlist_id, segment_id)): Path<(String, String, String)>,
     request: Request,
 ) -> Result<Response, ApiError> {
-    if let Some((id, container)) = segment_id.rsplit_once('.')
-        && !id.is_empty()
-        && !container.is_empty()
-        && let Some(rejection) =
-            blank_route_values([("segmentId", id), ("segmentContainer", container)])
-    {
+    let Some((id, container)) = segment_id
+        .rsplit_once('.')
+        .filter(|(id, container)| !id.is_empty() && !container.is_empty())
+    else {
+        return Ok(StatusCode::NOT_FOUND.into_response());
+    };
+    if let Some(rejection) = blank_route_values([
+        ("itemId", item_id.as_str()),
+        ("playlistId", playlist_id.as_str()),
+        ("segmentId", id),
+        ("segmentContainer", container),
+    ]) {
         return Ok(rejection);
     }
-    let ext = path_extension(request.uri().path());
-    let file_name = format!(
-        "{}{ext}",
-        segment_id.split('.').next().unwrap_or(&segment_id)
-    );
-    let file = state.hls.resolve_transcode_file(&file_name, false).await?;
+    // `string.Concat(segmentId, Path.GetExtension(Request.Path))`: the whole
+    // captured value, dots and all.
+    let file = state
+        .hls
+        .resolve_transcode_file(
+            &kestrel_route_value(&segment_id),
+            false,
+            Some(&kestrel_route_value(&playlist_id)),
+        )
+        .await?;
     served_file_response(file, request).await
 }
 
@@ -1006,7 +1027,7 @@ async fn get_hls_video_segment_legacy(
 /// playlist serve (`HlsSegmentController.GetHlsPlaylistLegacy`).
 ///
 /// Resolves `<playlistId>.m3u8` inside the transcode cache and serves it as a
-/// playlist; a non-playlist match is `400`.
+/// playlist; `404` when it does not exist.
 async fn get_hls_playlist_legacy(
     State(state): State<AppState>,
     RequireAuth(_auth): RequireAuth,
@@ -1014,16 +1035,17 @@ async fn get_hls_playlist_legacy(
     RequiredRouteString(playlist_id, _): RequiredRouteString<PlaylistId>,
     request: Request,
 ) -> Result<Response, ApiError> {
-    let file_name = format!(
-        "{}.m3u8",
-        playlist_id.split('.').next().unwrap_or(&playlist_id)
-    );
-    let file = state.hls.resolve_transcode_file(&file_name, true).await?;
+    let file_name = format!("{}.m3u8", kestrel_route_value(&playlist_id));
+    let file = state
+        .hls
+        .resolve_transcode_file(&file_name, true, None)
+        .await?;
     served_file_response(file, request).await
 }
 
 /// `GET /Audio/{itemId}/hls/{segmentId}/stream.{aac,mp3}` — the legacy audio
-/// segment serve (`HlsSegmentController.GetHlsAudioSegmentLegacy`).
+/// segment serve (`HlsSegmentController.GetHlsAudioSegmentLegacy`): the file
+/// `<segmentId>.<aac|mp3>` of the transcode cache, `404` when it does not exist.
 async fn get_hls_audio_segment_legacy(
     State(state): State<AppState>,
     _item_id: RequiredRouteString<LegacyItemId>,
@@ -1031,11 +1053,11 @@ async fn get_hls_audio_segment_legacy(
     request: Request,
 ) -> Result<Response, ApiError> {
     let ext = path_extension(request.uri().path());
-    let file_name = format!(
-        "{}{ext}",
-        segment_id.split('.').next().unwrap_or(&segment_id)
-    );
-    let file = state.hls.resolve_transcode_file(&file_name, false).await?;
+    let file_name = format!("{}{ext}", kestrel_route_value(&segment_id));
+    let file = state
+        .hls
+        .resolve_transcode_file(&file_name, false, None)
+        .await?;
     served_file_response(file, request).await
 }
 

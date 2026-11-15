@@ -44,7 +44,7 @@ use ferrofin_model::updates::{PackageInfo, RepositoryInfo};
 use ferrofin_traits::plugins::PluginDescriptor;
 use uuid::Uuid;
 
-use crate::auth::{RequireAdmin, RequireAuth};
+use crate::auth::RequireAdmin;
 use crate::error::ApiError;
 use crate::extract::{DotnetGuid, JsonSeqBody, Query, RequiredRouteString, RouteParameter};
 use crate::state::AppState;
@@ -55,12 +55,18 @@ use crate::state::AppState;
 /// Without this gate, any authenticated account (a guest profile, a stolen
 /// playback token) could stage arbitrary code for the next boot.
 ///
-/// Deliberate: this controller gates **in-handler**. Most of its routes take
-/// [`RequireAuth`] and call this check, and the mutating routes that take
-/// [`RequireAdmin`] call it too (the read-only ones rely on the extractor, as
-/// other admin controllers do) — staging executable code is not mutating
-/// metadata, and the gate must hold even if a route's extractor changes.
+/// Deliberate: this controller gates **in-handler**. Its elevated routes take
+/// [`RequireAdmin`], and the eight elevated `PluginsController` routes and the
+/// mutating package routes call this check too (the read-only package routes rely on
+/// the extractor, as other admin controllers do) — staging executable code is
+/// not mutating metadata, and the gate must hold even if a route's extractor
+/// changes.
 /// Don't drop it for consistency.
+///
+/// The extractor is [`RequireAdmin`], not [`RequireAuth`](crate::auth::RequireAuth):
+/// a bare `RequiresElevation` runs no `DefaultAuthorizationRequirement`, so an
+/// administrator whose policy has remote access off is still served from a
+/// remote address (v12.4 `ApiServiceCollectionExtensions.cs:86-89`).
 async fn require_admin(
     state: &AppState,
     auth: &ferrofin_traits::options::AuthorizationInfo,
@@ -187,7 +193,7 @@ fn to_plugin_info(d: PluginDescriptor) -> PluginInfo {
 )]
 async fn get_plugins(
     State(state): State<AppState>,
-    RequireAuth(auth): RequireAuth,
+    RequireAdmin(auth): RequireAdmin,
 ) -> Result<Json<Vec<PluginInfo>>, ApiError> {
     require_admin(&state, &auth).await?;
     let mut plugins = state.plugins.list_plugins().await?;
@@ -218,7 +224,7 @@ async fn get_plugins(
 )]
 async fn get_plugin_configuration(
     State(state): State<AppState>,
-    RequireAuth(auth): RequireAuth,
+    RequireAdmin(auth): RequireAdmin,
     Path(DotnetGuid(plugin_id)): Path<DotnetGuid>,
 ) -> Result<Response, ApiError> {
     // A plugin's configuration is where its credentials live; the C# gates this
@@ -288,7 +294,7 @@ fn without_nulls(bytes: Vec<u8>) -> Vec<u8> {
 )]
 async fn update_plugin_configuration(
     State(state): State<AppState>,
-    RequireAuth(auth): RequireAuth,
+    RequireAdmin(auth): RequireAdmin,
     Path(DotnetGuid(plugin_id)): Path<DotnetGuid>,
     body: Bytes,
 ) -> Result<StatusCode, ApiError> {
@@ -317,7 +323,7 @@ async fn update_plugin_configuration(
 )]
 async fn enable_plugin(
     State(state): State<AppState>,
-    RequireAuth(auth): RequireAuth,
+    RequireAdmin(auth): RequireAdmin,
     Path((DotnetGuid(plugin_id), version)): Path<(DotnetGuid, String)>,
 ) -> Result<StatusCode, ApiError> {
     require_admin(&state, &auth).await?;
@@ -343,7 +349,7 @@ async fn enable_plugin(
 )]
 async fn disable_plugin(
     State(state): State<AppState>,
-    RequireAuth(auth): RequireAuth,
+    RequireAdmin(auth): RequireAdmin,
     Path((DotnetGuid(plugin_id), version)): Path<(DotnetGuid, String)>,
 ) -> Result<StatusCode, ApiError> {
     require_admin(&state, &auth).await?;
@@ -374,7 +380,7 @@ async fn disable_plugin(
 )]
 async fn uninstall_plugin(
     State(state): State<AppState>,
-    RequireAuth(auth): RequireAuth,
+    RequireAdmin(auth): RequireAdmin,
     Path(DotnetGuid(plugin_id)): Path<DotnetGuid>,
 ) -> Result<StatusCode, ApiError> {
     require_admin(&state, &auth).await?;
@@ -399,7 +405,7 @@ async fn uninstall_plugin(
 )]
 async fn uninstall_plugin_by_version(
     State(state): State<AppState>,
-    RequireAuth(auth): RequireAuth,
+    RequireAdmin(auth): RequireAdmin,
     Path((DotnetGuid(plugin_id), version)): Path<(DotnetGuid, String)>,
 ) -> Result<StatusCode, ApiError> {
     require_admin(&state, &auth).await?;
@@ -469,7 +475,7 @@ async fn get_plugin_image(
 )]
 async fn get_plugin_manifest(
     State(state): State<AppState>,
-    RequireAuth(auth): RequireAuth,
+    RequireAdmin(auth): RequireAdmin,
     Path(DotnetGuid(plugin_id)): Path<DotnetGuid>,
 ) -> Result<Json<PluginManifest>, ApiError> {
     require_admin(&state, &auth).await?;

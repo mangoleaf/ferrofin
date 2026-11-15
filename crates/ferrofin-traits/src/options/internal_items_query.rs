@@ -424,7 +424,11 @@ pub struct InternalItemsQuery {
     pub group_by_presentation_unique_key: bool,
     /// Whether results are grouped by series presentation unique key.
     pub group_by_series_presentation_unique_key: bool,
-    /// Whether a total record count is computed (defaults `true`).
+    /// Whether a total record count is computed (defaults `true`). What a
+    /// path answers without one is upstream's: the page's length from the
+    /// repository's own query (`GetItems`), `0` from `QueryWithPostFiltering`
+    /// and the by-name listings, and every row still from the listings
+    /// upstream pages with `SortAndPage`.
     pub enable_total_record_count: bool,
     /// Whether the query is forced to run directly against the store.
     pub force_direct: bool,

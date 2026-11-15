@@ -1293,6 +1293,7 @@ version = "0.4.1"
 dependencies = [
  "async-trait",
  "chrono",
+ "dunce",
  "ferrofin-common",
  "ferrofin-db",
  "ferrofin-drawing",
@@ -1327,6 +1328,7 @@ dependencies = [
  "tracing-subscriber",
  "unicode-normalization",
  "uuid",
+ "windows-sys 0.61.2",
  "zip",
 ]
 
