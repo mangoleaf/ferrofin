@@ -8262,7 +8262,7 @@ impl LibraryScanner {
         let known_ids = match search {
             Some(_) if series_child => Vec::new(),
             Some(result) => search_result_ids(result),
-            None => merge_provider_ids(
+            None => prefer_local_ids(
                 known_provider_ids(&local_reader_ids, state.art_cache, &entity.id),
                 resolved_ids.clone(),
             ),
@@ -8305,7 +8305,7 @@ impl LibraryScanner {
             // pre-refresh provider, `AudioFileProber`) has already given its
             // tag ids where the item had none: `GetLookupInfo` shares the
             // item's `ProviderIds`.
-            let lookup_ids = merge_provider_ids(known_ids.clone(), tag_provider_ids.clone());
+            let lookup_ids = prefer_local_ids(known_ids.clone(), tag_provider_ids.clone());
             // Boxed: the provider fold below this is the deepest branch of
             // the per-item future.
             let fetched = cancel
@@ -8340,7 +8340,7 @@ impl LibraryScanner {
         // The ids the pass's readers and providers answered with, the local
         // reader's first; the probe's tag ids settle apart from them
         // (`AudioFileProber`'s own rule).
-        let pass_ids = merge_provider_ids(local_reader_ids, remote.provider_ids);
+        let pass_ids = prefer_local_ids(local_reader_ids, remote.provider_ids);
         // An existing item is saved as its stored row with this scan's
         // file facts and provider results merged on (upstream's Default
         // refresh), never as the row rebuilt from disk.
@@ -23536,7 +23536,7 @@ fn known_provider_ids(
     art_cache: &ArtworkCache,
     entity_id: &str,
 ) -> Vec<(String, String)> {
-    merge_provider_ids(
+    prefer_local_ids(
         local_ids.to_vec(),
         art_cache
             .item_provider_ids
@@ -23676,7 +23676,12 @@ fn settle_provider_ids(
 ///
 /// NFO ids lead: `save_provider_id` is INSERT OR REPLACE, so a user's pinned
 /// id must not be overwritten by one a remote search guessed for the same key.
-fn merge_provider_ids(
+///
+/// It checks no id's validity: the ids it builds are what the fetchers look an
+/// item up by, and the pass's set is filtered when it settles onto the item
+/// ([`settle_provider_ids`], `MergeBaseItemData`'s rule in
+/// `metadata_merge::merge_provider_ids`).
+fn prefer_local_ids(
     mut local: Vec<(String, String)>,
     remote: Vec<(String, String)>,
 ) -> Vec<(String, String)> {
