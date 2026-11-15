@@ -7532,14 +7532,13 @@ fn push_separator(qb: &mut QueryBuilder<Sqlite>, first: &mut bool) {
 /// `BaseItemRepository.TranslateQuery`: the channel scope, the start/end date
 /// window (with `HasAired` *overriding* the end-date bounds exactly as upstream
 /// does), the airing flag, the exact-name scope `librarySeriesId` sets, and the
-/// genre scope.
+/// genre scopes, by name and by id.
 ///
 /// The classification flags (`IsMovie`/`IsSeries`/`IsNews`/`IsKids`/`IsSports`)
 /// match the columns the guide refresh derives per listings provider.
-/// `GenreIds` is deliberately not faked — it needs genre identity rows the
-/// guide cache does not hold — and `SeriesTimerId` never reaches this builder:
-/// `get_programs` answers it with the empty result upstream returns when the
-/// series-timer scope cannot be built.
+/// `SeriesTimerId` never reaches this builder: `get_programs` answers it with
+/// the empty result upstream returns when the series-timer scope cannot be
+/// built.
 ///
 /// `restrictions` are the user's parental restrictions, from
 /// [`FerrofinLiveTvManager::user_restrictions`].
@@ -7652,11 +7651,26 @@ fn push_program_filters(
         }
     }
 
+    push_program_genres(qb, query, &mut first);
+
+    if let Some(restrictions) = restrictions {
+        push_separator(qb, &mut first);
+        crate::guide_repository::push_item_restrictions(qb, r#"p."Id""#, restrictions);
+    }
+}
+
+/// Pushes the genre scopes of a program query: by name and by id, each
+/// keeping the airings with any one of the requested genres.
+fn push_program_genres(
+    qb: &mut QueryBuilder<Sqlite>,
+    query: &InternalItemsQuery,
+    first: &mut bool,
+) {
     if !query.genres.is_empty() {
         // `Genres` holds the XMLTV `<category>` list as a JSON array; upstream
         // matches any one of the requested genres by clean value
         // (`TranslateQuery.cs:658-662`).
-        push_separator(qb, &mut first);
+        push_separator(qb, first);
         qb.push(
             r#"EXISTS (SELECT 1 FROM json_each(p."Genres") WHERE ferrofin_clean_value("value") IN ("#,
         );
@@ -7667,9 +7681,24 @@ fn push_program_filters(
         qb.push("))");
     }
 
-    if let Some(restrictions) = restrictions {
-        push_separator(qb, &mut first);
-        crate::guide_repository::push_item_restrictions(qb, r#"p."Id""#, restrictions);
+    if !query.genre_ids.is_empty() {
+        // `WhereReferencedItem(Genre, GenreIds)` (v12.4 TranslateQuery.cs:653-656,
+        // JellyfinQueryHelperExtensions.cs:130-152): the airings whose stored
+        // item has a genre value equal to the clean name of a referenced item.
+        // The guide refresh writes an airing's genres as `ItemValues` under the
+        // guide row's id, so an airing whose item is not stored yet is not
+        // listed, as upstream lists only the stored items.
+        push_separator(qb, first);
+        qb.push(
+            r#"EXISTS (SELECT 1 FROM "ItemValuesMap" ivm JOIN "ItemValues" iv ON iv."ItemValueId" = ivm."ItemValueId" WHERE ivm."ItemId" = p."Id" AND iv."Type" = "#,
+        )
+        .push_bind(i32::from(ferrofin_db::enums::ItemValueType::Genre))
+        .push(r#" AND iv."CleanValue" IN (SELECT ref."CleanName" FROM "BaseItems" ref WHERE ref."Id" IN ("#);
+        let mut list = qb.separated(",");
+        for id in ferrofin_db::padded_in_list(&query.genre_ids) {
+            list.push_bind(guid_to_db(*id));
+        }
+        qb.push(")))");
     }
 }
 
@@ -8279,6 +8308,7 @@ mod tests {
     mod channel_list;
     mod guide_mirror;
     mod keep_up_to;
+    mod program_list;
     mod recording_folders;
     mod schedules_direct;
 

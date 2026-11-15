@@ -3430,11 +3430,8 @@ pub const VERIFIED: &[Verified] = &[
                BaseItemRepository.TranslateQuery and ApplyOrder, RemoveFields, \
                DtoService.GetBaseItemDtos, AddInfoToProgramDto, AddRecordingInfo, \
                GetTimersInternal, DefaultLiveTvService.GetTimersAsync)",
-        date: "2026-11-11",
+        date: "2026-11-14",
         divergences: &[
-            "genreIds is bound but filters nothing: every programme the other filters keep is \
-         listed, where upstream's TranslateQuery keeps only those with one of the genres \
-         (WhereReferencedItem over the Genre item values). Fix path: gl-1686.",
             "isSports, isNews and isKids each match the programme's own flag, so when two or \
          more are true a programme must have them all; upstream turns each true one into a \
          tag and keeps a programme with any of those tags, so isSports=true&isKids=true \
@@ -3496,7 +3493,7 @@ pub const VERIFIED: &[Verified] = &[
                LibraryManager.QueryItems, BaseItemRepository.TranslateQuery and ApplyOrder, \
                RemoveFields, DtoService.GetBaseItemDtos, AddInfoToProgramDto, \
                AddRecordingInfo, GetTimersInternal, DefaultLiveTvService.GetTimersAsync)",
-        date: "2026-11-11",
+        date: "2026-11-14",
         divergences: &[
             "A body UserId naming another user, sent without the administrator role, is a 403 \
          (the RequestHelpers.GetUserId rule GET applies); upstream's GetPrograms reads \
@@ -3509,9 +3506,6 @@ pub const VERIFIED: &[Verified] = &[
          does. Fix path: gl-1033.",
             "A null EnableTotalRecordCount reads as true; upstream's member is a non-nullable \
          bool, which System.Text.Json refuses to bind from null (a 400). Fix path: gl-1691.",
-            "GenreIds is bound but filters nothing: every programme the other filters keep is \
-         listed, where upstream's TranslateQuery keeps only those with one of the genres \
-         (WhereReferencedItem over the Genre item values). Fix path: gl-1686.",
             "IsSports, IsNews and IsKids each match the programme's own flag, so when two or \
          more are true a programme must have them all; upstream turns each true one into a \
          tag and keeps a programme with any of those tags. A false one excludes its flag in \
