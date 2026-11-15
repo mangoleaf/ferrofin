@@ -29,8 +29,8 @@ const MIN_RUNTIME_TICKS: i64 = 300 * 10_000_000;
 /// The input timestamp-sync options `EncodingHelper.AttachMediaSourceInfo`
 /// selects and `GetInputModifier` emits ahead of the pacing: a native-rate
 /// source that is not a segmented live stream (and a local `wtv` file) syncs
-/// audio with `-async 1` and, below ffmpeg 5.1 (where `-fps_mode` cannot be an
-/// input option), video with `-vsync -1`.
+/// audio with `-async 1` and, below ffmpeg 5.1 or on a version that cannot be
+/// read (`-fps_mode` cannot be an input option), video with `-vsync -1`.
 #[must_use]
 pub fn input_sync_arguments(
     state: &EncodingJobInfo,
@@ -46,7 +46,7 @@ pub fn input_sync_arguments(
         return Vec::new();
     }
     let mut arguments = vec!["-async".to_owned(), "1".to_owned()];
-    if version.is_some_and(|version| version < MIN_FFMPEG_FPS_MODE_OPTION) {
+    if version.is_none_or(|version| version < MIN_FFMPEG_FPS_MODE_OPTION) {
         arguments.extend(["-vsync".to_owned(), "-1".to_owned()]);
     }
     arguments
@@ -641,7 +641,8 @@ mod tests {
 
     /// `AttachMediaSourceInfo` + `GetInputModifier`: a native-rate source that
     /// is not a segmented live stream (or a local `wtv` file) syncs audio with
-    /// `-async 1`, and video with `-vsync -1` only below ffmpeg 5.1.
+    /// `-async 1`, and video with `-vsync -1` only below ffmpeg 5.1, which an
+    /// unreadable version counts as (C#'s `null < version` is true).
     #[test]
     fn native_rate_sources_sync_their_input_timestamps() {
         let mut state = state();
@@ -651,7 +652,10 @@ mod tests {
 
         state.media_source.read_at_native_framerate = true;
         state.run_time_ticks = Some(600 * 10_000_000);
-        assert_eq!(input_sync_arguments(&state, None), ["-async", "1"]);
+        assert_eq!(
+            input_sync_arguments(&state, None),
+            ["-async", "1", "-vsync", "-1"]
+        );
         assert_eq!(
             input_sync_arguments(&state, Some(FfmpegVersion::new(5, 0))),
             ["-async", "1", "-vsync", "-1"]
@@ -670,7 +674,10 @@ mod tests {
         state.media_source.read_at_native_framerate = false;
         state.media_source.protocol = MediaProtocol::File;
         state.media_source.container = Some("WTV".to_owned());
-        assert_eq!(input_sync_arguments(&state, None), ["-async", "1"]);
+        assert_eq!(
+            input_sync_arguments(&state, None),
+            ["-async", "1", "-vsync", "-1"]
+        );
         state.media_source.protocol = MediaProtocol::Http;
         let found = input_sync_arguments(&state, None);
         assert!(found.is_empty(), "{found:?}");

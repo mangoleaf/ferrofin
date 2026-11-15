@@ -1306,6 +1306,11 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
             "AMF, VideoToolbox, RKMPP and V4L2M2M have no ported filter chain, so a job \
              configured for one takes the software path. That is the owner's hardware scope \
              decision (CLAUDE.md, Current scope).",
+            "A git build (ffmpeg version N-…) is read as the release its libavutil names \
+             (encoder_validator.rs get_ffmpeg_version_internal) and gets -fps_mode from 5.1 \
+             on, where upstream's GetFFmpegVersionInternal reads every such build as 4.4 and \
+             passes -vsync, which ffmpeg 9 rejects, so no frame is made. Jellyfin bug not \
+             ported (gl-1796).",
         ],
     },
     VerifiedSubsystem {
@@ -1370,6 +1375,11 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
             "The temp directory is checked to be writable before ffmpeg runs, and the error \
              names it, where upstream creates it and lets ffmpeg fail to write the image; a \
              failed attempt's partial or empty file is deleted, where upstream leaves it there.",
+            "A git build (ffmpeg version N-…) is read as the release its libavutil names \
+             (encoder_validator.rs get_ffmpeg_version_internal) and gets -fps_mode from 5.1 \
+             on, where upstream's GetFFmpegVersionInternal reads every such build as 4.4 and \
+             passes -vsync, which ffmpeg 9 rejects, so no image is made. Jellyfin bug not \
+             ported (gl-1796).",
         ],
     },
     VerifiedSubsystem {
@@ -1912,11 +1922,12 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
             "A seek of 24 hours or more is written in total hours; upstream's TimeSpan format \
              hh:mm:ss.fff drops the whole days, so it seeks to that time of the first day. \
              Jellyfin bug not ported.",
-            "An ffmpeg whose version cannot be read at all (any required library older than \
-             4.4's or not listed) gets no -vsync -1 for a native-rate or wtv source, where \
-             upstream's EncoderVersion < 5.1 is true for a null version and passes it. A git \
-             build, read as 4.4 from its libraries as upstream reads it, gets -vsync -1, as \
-             upstream does, which ffmpeg 9 rejects. Fix path: gl-1796.",
+            "A git build (ffmpeg version N-…) is read as the newest release whose libavutil \
+             version its own has reached (encoder_validator.rs get_ffmpeg_version_internal), \
+             where upstream's GetFFmpegVersionInternal reads every such build as 4.4, so \
+             upstream passes -vsync -1 for a native-rate or wtv source on a current one, which \
+             ffmpeg 9 rejects, and never -readrate (5.0) or -readrate_catchup (8.0). Jellyfin \
+             bug not ported (gl-1796).",
             "The analyze duration and probe size are Ferrofin settings (ffmpeg_analyze_duration, \
              ffmpeg_probe_size) with upstream's defaults, clamped to 1M-600M and 1M-4G, and a \
              blank value is the default, so the flags are always passed; Jellyfin drops a flag \

@@ -357,8 +357,8 @@ impl<T: Transcoder> TrickplayFrameExtractorImpl<T> {
     /// `transcoder`.
     ///
     /// `ffmpeg_version` is the probed version, which decides `-fps_mode` versus
-    /// the deprecated `-vsync`; `None` means "unprobed" and takes the
-    /// conservative `-vsync`, which every supported build still understands.
+    /// the deprecated `-vsync`; `None` means "unprobed" and takes `-vsync`, as
+    /// upstream does for a version it cannot read (ffmpeg 9 no longer has it).
     ///
     /// Without capabilities and a configuration handle there is nothing to
     /// build a hardware pipeline from, so every job takes the software path.

@@ -1750,7 +1750,8 @@ const MIN_FFMPEG_INPUT_SYNC: FfmpegVersion = FfmpegVersion::new(5, 1);
 ///
 /// Third divergence (gl-929): an ffmpeg older than 5.1 has no `-isync`, and
 /// one whose version cannot be read counts as the oldest supported, as for
-/// every version gate (static and git builds print `ffmpeg version N-…`).
+/// every version gate (a git build's `ffmpeg version N-…` is read from its
+/// libraries instead).
 /// Upstream's unsynced form, which Ferrofin kept there until then, moved a
 /// bitmap sidecar earlier by its first cue's time and seeked it that much too
 /// far: embedded, its cues came 3.5 s early; burned into a segment seeked to
@@ -3659,7 +3660,7 @@ mod tests {
         assert_eq!(video_sync_option("0", v(7, 0)), " -fps_mode passthrough");
         assert_eq!(video_sync_option("0", v(5, 1)), " -fps_mode passthrough");
         assert_eq!(video_sync_option("0", v(5, 0)), " -vsync 0");
-        // Unprobed: the option every supported build still understands.
+        // Unprobed counts as the oldest, as upstream's null version does.
         assert_eq!(video_sync_option("0", None), " -vsync 0");
         // The rest of the table.
         assert_eq!(video_sync_option("-1", v(7, 0)), " -fps_mode auto");

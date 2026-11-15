@@ -1192,9 +1192,9 @@ pub fn persisted_encoder_app_path(config_dir: &Path) -> Option<String> {
 /// build is rejected the same way the runtime validator would.
 ///
 /// The parsed version comes from the same captured output, so learning it costs
-/// no extra spawn. It is `None` only for a build that validated on its library
-/// versions alone without naming a version — every version gate then reads as
-/// unmet, which is the conservative direction.
+/// no extra spawn. A build that names no release (a git build's
+/// `ffmpeg version N-…`) reads as the release its libavutil names; one whose
+/// version cannot be read at all fails validation.
 ///
 /// # Errors
 ///
