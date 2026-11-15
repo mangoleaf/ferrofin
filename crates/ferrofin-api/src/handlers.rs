@@ -3072,7 +3072,9 @@ pub const VERIFIED: &[Verified] = &[
         upstream_method: "UploadLyrics",
         ferrofin: "handlers/lyrics.rs upload_lyrics (require_item with GetItemById's 400 for \
                a nil id, an empty body by its size hint, upload_format, then the Bytes read \
-               under upload_body_limit; queue_high_priority_refresh) → ferrofin-core \
+               under upload_body_limit; the save and queue_high_priority_refresh on \
+               handlers.rs run_detached's task, so they finish for a client that hangs up \
+               once the body is read, as SaveLyricAsync takes no token) → ferrofin-core \
                lyric_manager.rs save_lyric \
                (decode_stream_text, parse_by_format on the format as given, save_targets \
                with save_extension, try_save_to_files)",
@@ -3099,7 +3101,10 @@ pub const VERIFIED: &[Verified] = &[
         upstream_file: "Jellyfin.Api/Controllers/LyricsController.cs",
         upstream_method: "DeleteLyrics",
         ferrofin: "handlers/lyrics.rs delete_lyrics (require_item: GetItemById's 400 for a \
-               nil id; run_item_refresh) → ferrofin-core lyric_manager.rs delete_lyrics",
+               nil id; the delete and run_item_refresh on handlers.rs run_detached's task, so \
+               they finish for a client that hangs up, as DeleteLyricsAsync's \
+               RefreshMetadata(CancellationToken.None) does) → ferrofin-core lyric_manager.rs \
+               delete_lyrics",
         date: "2026-11-11",
         divergences: &[
             "The 400 (nil item id) and 404 (no such item, or one the caller may not see) bodies \
@@ -3129,8 +3134,11 @@ pub const VERIFIED: &[Verified] = &[
         upstream_method: "DownloadRemoteLyrics",
         ferrofin: "handlers/lyrics.rs download_remote_lyrics (RequiredRouteString lyricId: \
                ConvertEmptyStringToNull, then [Required]; require_item: GetItemById's 400 for \
-               a nil id; queue_high_priority_refresh) → ferrofin-core lyric_manager.rs \
-               download_lyrics (fetch_remote, save_targets, try_save_to_files)",
+               a nil id; the download and queue_high_priority_refresh on handlers.rs \
+               run_detached's task, so they finish for a client that hangs up, as \
+               DownloadLyricsAsync gets CancellationToken.None) → ferrofin-core \
+               lyric_manager.rs download_lyrics (fetch_remote, save_targets, \
+               try_save_to_files)",
         date: "2026-11-11",
         divergences: &[
             "The 400 (nil item id) and 404 (no such item, one the caller may not see, or no \
@@ -5318,8 +5326,11 @@ pub const VERIFIED: &[Verified] = &[
                GetItemById<Video>(itemId, User.GetUserId()): a missing, hidden or non-video \
                item is a 404; the download and the refresh queued after it share one try, \
                whose failure is logged at error as \"Error downloading subtitles\" and still \
-               answered 204) → ferrofin-core subtitle_manager.rs download_subtitles, route and \
-               attach (SubtitleManager.DownloadSubtitles, GetProvider and GetRemoteSubtitles' \
+               answered 204; the try runs on handlers.rs run_detached's task, so for a client \
+               that hangs up both still finish and a failure is still logged, as \
+               DownloadSubtitles gets CancellationToken.None) → ferrofin-core \
+               subtitle_manager.rs download_subtitles, route and attach \
+               (SubtitleManager.DownloadSubtitles, GetProvider and GetRemoteSubtitles' \
                Split('_', 2): an id naming no provider fails the download; TrySaveSubtitle and \
                TrySaveToFiles: the library's SaveSubtitlesWithMedia picks the folder beside the \
                media path or the item's internal-metadata folder, \
@@ -5342,9 +5353,6 @@ pub const VERIFIED: &[Verified] = &[
             "The subtitle is recorded as an external stream as soon as it is written; upstream \
          leaves that to the queued refresh's probe, so the item lists it here before the \
          refresh has run, and also when queueing the refresh failed. Fix path: gl-1641.",
-            "A client that hangs up stops the download, the write or the refresh where it \
-         is, unlogged; upstream passes CancellationToken.None and finishes them. Fix path: \
-         gl-1645.",
             "A nil itemId is a 404, not GetItemById's 400. Fix path: gl-1695.",
             "A whitespace-only subtitleId is taken (a logged failed download and a 204, or a \
          404 for a missing or hidden item); upstream's model validation answers 400 before \
