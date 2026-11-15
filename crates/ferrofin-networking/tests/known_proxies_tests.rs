@@ -134,8 +134,7 @@ fn unparsable_entries_are_reported() {
 }
 
 /// A settings reload that leaves the entries and the address families alone
-/// (every live interface refresh) looks no host name up again; a changed
-/// family does.
+/// looks no host name up again; a changed family does.
 #[test]
 fn host_names_are_resolved_again_only_when_their_inputs_change() {
     static LOOKUPS: AtomicUsize = AtomicUsize::new(0);
