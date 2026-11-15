@@ -30,39 +30,64 @@ const MIN_RUNTIME_TICKS: i64 = 300 * 10_000_000;
 /// selects and `GetInputModifier` emits ahead of the pacing: a native-rate
 /// source that is not a segmented live stream (and a local `wtv` file) syncs
 /// audio with `-async 1` and, below ffmpeg 5.1 (where `-fps_mode` cannot be an
-/// input option), video with `-vsync -1`.
+/// input option), video with `-vsync -1`; a `wma` or `asf` container syncs
+/// its audio only.
 #[must_use]
 pub fn input_sync_arguments(
     state: &EncodingJobInfo,
     version: Option<FfmpegVersion>,
 ) -> Vec<String> {
     let source = &state.media_source;
-    let wtv_file = source.protocol == MediaProtocol::File
-        && source
+    let container_is = |name: &str| {
+        source
             .container
             .as_deref()
-            .is_some_and(|container| container.eq_ignore_ascii_case("wtv"));
-    if !((source.read_at_native_framerate && !state.is_segmented_live_stream()) || wtv_file) {
-        return Vec::new();
+            .is_some_and(|container| container.eq_ignore_ascii_case(name))
+    };
+    let video_sync = (source.read_at_native_framerate && !state.is_segmented_live_stream())
+        || (source.protocol == MediaProtocol::File && container_is("wtv"));
+    let mut arguments = Vec::new();
+    // Upstream: "Seeing some stuttering when transcoding wma to audio-only HLS".
+    if video_sync || container_is("wma") || container_is("asf") {
+        arguments.extend(["-async".to_owned(), "1".to_owned()]);
     }
-    let mut arguments = vec!["-async".to_owned(), "1".to_owned()];
-    if version.is_some_and(|version| version < MIN_FFMPEG_FPS_MODE_OPTION) {
+    if video_sync && version.is_some_and(|version| version < MIN_FFMPEG_FPS_MODE_OPTION) {
         arguments.extend(["-vsync".to_owned(), "-1".to_owned()]);
     }
     arguments
 }
 
-/// The input options `GetInputModifier` emits after the pacing and that the
-/// live-TV tuner settings drive: `-fflags +igndts` for a source that ignores
-/// input DTS (`IgnoreInputDts`), then the looping reconnect options for a
-/// source that `RequiresLooping` (an M3U tuner with stream looping).
+/// The input options `GetInputModifier` emits that the source itself drives:
+/// an RTSP input's transport options (preferring TCP, as the probe does), one
+/// `-fflags` joining `+igndts` (`IgnoreInputDts`), `+ignidx`
+/// (`IgnoreInputIndex`, an in-progress recording) and `+genpts`
+/// (`GenPtsInput`, or a copied video stream), then the looping reconnect
+/// options for a source that `RequiresLooping` (an M3U tuner with stream
+/// looping).
 #[must_use]
 pub fn input_source_arguments(state: &EncodingJobInfo) -> Vec<String> {
+    let source = &state.media_source;
     let mut arguments = Vec::new();
-    if state.media_source.ignore_dts {
-        arguments.extend(["-fflags".to_owned(), "+igndts".to_owned()]);
+    if effective_input_protocol(state) == MediaProtocol::Rtsp {
+        arguments
+            .extend(["-rtsp_transport", "tcp+udp", "-rtsp_flags", "prefer_tcp"].map(str::to_owned));
     }
-    if state.media_source.requires_looping {
+    let flags: String = [
+        (source.ignore_dts, "+igndts"),
+        (source.ignore_index, "+ignidx"),
+        (
+            source.gen_pts_input
+                || EncodingJobInfo::is_copy_codec(state.output_video_codec.as_deref()),
+            "+genpts",
+        ),
+    ]
+    .into_iter()
+    .filter_map(|(set, flag)| set.then_some(flag))
+    .collect();
+    if !flags.is_empty() {
+        arguments.extend(["-fflags".to_owned(), flags]);
+    }
+    if source.requires_looping {
         arguments.extend(
             [
                 "-stream_loop",
@@ -676,11 +701,86 @@ mod tests {
         assert!(found.is_empty(), "{found:?}");
     }
 
+    /// `AttachMediaSourceInfo`: a `wma` or `asf` container ("Seeing some
+    /// stuttering when transcoding wma to audio-only HLS") syncs its audio
+    /// with `-async 1` whatever its protocol, but never its video.
+    #[rstest::rstest]
+    #[case::wma("wma")]
+    #[case::asf("ASF")]
+    fn wma_and_asf_sources_sync_their_audio(#[case] container: &str) {
+        let mut state = state();
+        state.media_source.container = Some(container.to_owned());
+        for protocol in [MediaProtocol::File, MediaProtocol::Http] {
+            state.media_source.protocol = protocol;
+            assert_eq!(
+                input_sync_arguments(&state, Some(FfmpegVersion::new(5, 0))),
+                ["-async", "1"]
+            );
+        }
+    }
+
+    /// `GetInputModifier`'s `-fflags`, one option joining every flag that
+    /// applies: `IgnoreInputDts`, `IgnoreInputIndex`, then `GenPtsInput` or a
+    /// copied video stream.
+    #[rstest::rstest]
+    #[case::none(false, false, false, "libx264", None)]
+    #[case::ignore_dts(true, false, false, "libx264", Some("+igndts"))]
+    #[case::ignore_index(false, true, false, "libx264", Some("+ignidx"))]
+    #[case::gen_pts_input(false, false, true, "libx264", Some("+genpts"))]
+    #[case::copied_video(false, false, false, "COPY", Some("+genpts"))]
+    #[case::recording(true, true, false, "copy", Some("+igndts+ignidx+genpts"))]
+    fn input_fflags_join_every_source_flag(
+        #[case] ignore_dts: bool,
+        #[case] ignore_index: bool,
+        #[case] gen_pts_input: bool,
+        #[case] output_video_codec: &str,
+        #[case] expected: Option<&str>,
+    ) {
+        let mut state = state();
+        state.media_source.ignore_dts = ignore_dts;
+        state.media_source.ignore_index = ignore_index;
+        state.media_source.gen_pts_input = gen_pts_input;
+        state.output_video_codec = Some(output_video_codec.to_owned());
+        let found = input_source_arguments(&state);
+        match expected {
+            Some(flags) => assert_eq!(found, ["-fflags", flags]),
+            None => assert!(found.is_empty(), "{found:?}"),
+        }
+    }
+
+    /// An audio-only output has no video codec, so nothing is copied.
+    #[test]
+    fn audio_only_output_generates_no_input_pts() {
+        let mut state = state();
+        state.output_video_codec = None;
+        let found = input_source_arguments(&state);
+        assert!(found.is_empty(), "{found:?}");
+    }
+
+    /// `GetInputModifier`: an RTSP input (after the encoder-path override)
+    /// prefers TCP, as the probe does.
+    #[test]
+    fn rtsp_input_prefers_tcp() {
+        let mut state = state();
+        state.output_video_codec = None;
+        state.media_source.protocol = MediaProtocol::Rtsp;
+        assert_eq!(
+            input_source_arguments(&state),
+            ["-rtsp_transport", "tcp+udp", "-rtsp_flags", "prefer_tcp"]
+        );
+        // A buffered copy the encoder reads from a file is not RTSP.
+        state.media_source.encoder_path = Some("/owned/buffer.ts".to_owned());
+        state.media_source.encoder_protocol = Some(MediaProtocol::File);
+        let found = input_source_arguments(&state);
+        assert!(found.is_empty(), "{found:?}");
+    }
+
     /// `IgnoreInputDts` → `-fflags +igndts`; `RequiresLooping` → the loop and
     /// reconnect options, in that order.
     #[test]
     fn ignore_dts_and_stream_looping_reach_the_input_options() {
         let mut state = state();
+        state.output_video_codec = None;
         let found = input_source_arguments(&state);
         assert!(found.is_empty(), "{found:?}");
         state.media_source.ignore_dts = true;

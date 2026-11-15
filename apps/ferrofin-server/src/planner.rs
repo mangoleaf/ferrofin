@@ -1953,7 +1953,7 @@ impl FerrofinStreamStatePlanner {
             }
         }
         // `GetInputModifier`: timestamp sync, then pacing, then the options
-        // the live-TV source settings drive (ignore DTS, stream looping).
+        // the source drives (RTSP transport, `-fflags`, stream looping).
         args.extend(
             ferrofin_mediaencoding::transcoding::segment_cleaner::input_sync_arguments(
                 state,
@@ -6648,7 +6648,8 @@ mod tests {
     }
 
     /// The live-TV tuner settings reach the transcode's input options in
-    /// `GetInputModifier`'s order: timestamp sync, pacing, `-fflags +igndts`,
+    /// `GetInputModifier`'s order: timestamp sync, pacing, one `-fflags`
+    /// (ignore DTS, ignore the index, and generate PTS for the copied video),
     /// then the looping reconnect options — all ahead of `-i`, none after.
     #[tokio::test]
     async fn tuner_input_settings_become_ordered_input_options() {
@@ -6657,6 +6658,7 @@ mod tests {
         let mut src = source("abc", vec![video_stream("h264"), audio_stream("aac")]);
         src.read_at_native_framerate = true;
         src.ignore_dts = true;
+        src.ignore_index = true;
         src.requires_looping = true;
         let capabilities = FfmpegCapabilities::builder()
             .ffmpeg_version(FfmpegVersion::new(5, 0))
@@ -6673,6 +6675,8 @@ mod tests {
             .plan(&request("abc"), false, Some(0), PlaylistKind::Vod)
             .await
             .unwrap();
+        // The copied video is what adds `+genpts`.
+        assert!(plan.is_remuxing_video);
         let input = plan
             .arguments
             .iter()
@@ -6680,12 +6684,12 @@ mod tests {
             .unwrap();
         let before = plan.arguments[..input].join(" ");
         // Version 5.0 has neither `-fps_mode` nor the read-rate catch-up.
-        let expected = "-async 1 -vsync -1 -re -fflags +igndts -stream_loop -1 \
+        let expected = "-async 1 -vsync -1 -re -fflags +igndts+ignidx+genpts -stream_loop -1 \
             -reconnect_at_eof 1 -reconnect_streamed 1 -reconnect_delay_max 2";
         assert!(before.contains(expected), "{before}");
         let after = without_temp_dir(&plan.arguments[input + 1..].join(" "));
         assert!(
-            !after.contains("igndts") && !after.contains("stream_loop"),
+            !after.contains("fflags") && !after.contains("stream_loop"),
             "{after}"
         );
     }

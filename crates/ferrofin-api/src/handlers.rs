@@ -1828,8 +1828,11 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
                    transcoding/segment_cleaner.rs \
                    input_sync_arguments, input_rate_arguments and input_source_arguments \
                    (GetInputModifier's -async and -vsync from AttachMediaSourceInfo's \
-                   InputAudioSync and InputVideoSync, -re, -readrate and -readrate_catchup, \
-                   -fflags +igndts and the looping reconnect options) over \
+                   InputAudioSync and InputVideoSync, a wma or asf container's audio sync \
+                   among them, -re, -readrate and -readrate_catchup, an RTSP input's \
+                   -rtsp_transport tcp+udp -rtsp_flags prefer_tcp, one -fflags joining \
+                   +igndts, +ignidx and +genpts (GenPtsInput or a copied video), and the \
+                   looping reconnect options) over \
                    transcoding/throttler.rs effective_input_protocol (AttachMediaSourceInfo's \
                    EncoderPath and EncoderProtocol), encoding_helper/hw/input_args.rs \
                    graphical_sub_canvas_size (GetGraphicalSubCanvasSize), concat_input with \
@@ -1859,12 +1862,6 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
                    among them, gl-1768",
         date: "2026-11-14",
         divergences: &[
-            "Four GetInputModifier rules are not ported: -fflags +genpts for every job \
-             copying the video (IsCopyCodec(OutputVideoCodec)) or reading a source with \
-             GenPtsInput, +ignidx for a source with IgnoreIndex (an in-progress recording), \
-             -rtsp_transport tcp+udp -rtsp_flags prefer_tcp for an RTSP input, and \
-             AttachMediaSourceInfo's -async 1 for a wma or asf container. Fix path: \
-             gl-1779.",
             "A job reading a video file with hardware acceleration configured passes no -f \
              with the container's input format (GetInputFormat). Fix path: gl-1676.",
             "A job behind a hardware decoder passes no -noautoscale. Fix path: gl-928.",
