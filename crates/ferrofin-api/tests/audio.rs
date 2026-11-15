@@ -238,8 +238,8 @@ impl MediaSourceManager for StreamSources {
 /// A [`LibraryManager`] that resolves [`ITEM_ID`] and 404s everything else.
 struct StreamLibrary;
 
-/// The refreshes [`StreamLibrary`] ran to completion for a caller that
-/// awaited them (`run_refresh_scan`), as debug-printed targets.
+/// The refreshes [`StreamLibrary`] ran for a caller that awaited them
+/// (`refresh_item_metadata`), as the items' paths.
 static AWAITED_REFRESHES: Mutex<Vec<String>> = Mutex::new(Vec::new());
 
 #[async_trait]
@@ -272,7 +272,7 @@ impl LibraryManager for StreamLibrary {
                 ..minimal_base_item(STOPPED_ID, "Stopped", "Audio")
             }));
         }
-        // A library track: the refresh a lyric write queues is its path's scan.
+        // A library track: the refresh a lyric delete awaits is of its file.
         Ok((id == ITEM_ID).then(|| BaseItemEntity {
             path: Some("/music/Artist/Album/A Song.flac".to_owned()),
             top_parent_id: Some(Uuid::from_u128(0x11b).to_string()),
@@ -280,22 +280,22 @@ impl LibraryManager for StreamLibrary {
         }))
     }
 
-    async fn queue_refresh_scan(
+    async fn queue_item_refresh(
         &self,
-        _target: ferrofin_traits::library::ScanTarget,
+        _item: &BaseItemEntity,
         _options: &ferrofin_traits::providers::MetadataRefreshOptions,
     ) -> Result<(), ServiceError> {
         Ok(())
     }
-    async fn run_refresh_scan(
+    async fn refresh_item_metadata(
         &self,
-        target: ferrofin_traits::library::ScanTarget,
+        item: &BaseItemEntity,
         _options: &ferrofin_traits::providers::MetadataRefreshOptions,
     ) -> Result<bool, ServiceError> {
-        let target = format!("{target:?}");
+        let path = item.path.clone().unwrap_or_default();
         // The shutdown stopping a refresh before it finished.
-        let finished = !target.contains(STOPPED_TRACK);
-        AWAITED_REFRESHES.lock().unwrap().push(target);
+        let finished = path != STOPPED_TRACK;
+        AWAITED_REFRESHES.lock().unwrap().push(path);
         Ok(finished)
     }
     async fn query_items(

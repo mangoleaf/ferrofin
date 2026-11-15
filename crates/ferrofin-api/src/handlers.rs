@@ -26,64 +26,48 @@ use crate::state::AppState;
 /// RefreshPriority.High)` call the subtitle/lyric upload+download handlers make
 /// after mutating an item's sidecar files, so the freshly added stream is picked
 /// up. Uses [`MetadataRefreshOptions::default`] (the C# constructor with only a
-/// directory service: `Default` modes, nothing replaced). A file item refreshes
-/// through the library scan of its path, whose probe re-runs because its
-/// sidecar set changed (`ProbeProvider.HasChanged`); an item with no file of
-/// its own through the provider manager.
+/// directory service: `Default` modes, nothing replaced), and refreshes as
+/// [`LibraryManager::queue_item_refresh`] says: a file item through the
+/// library scan of its path, whose probe re-runs because its sidecar set
+/// changed (`ProbeProvider.HasChanged`). An item no longer stored is not
+/// refreshed, as the refresh queue skips it.
+///
+/// [`MetadataRefreshOptions::default`]: ferrofin_traits::providers::MetadataRefreshOptions::default
+/// [`LibraryManager::queue_item_refresh`]: ferrofin_traits::library::LibraryManager::queue_item_refresh
 pub(crate) async fn queue_high_priority_refresh(
     state: &AppState,
     item_id: Uuid,
 ) -> Result<(), ApiError> {
-    use ferrofin_traits::library::ScanTarget;
-    use ferrofin_traits::providers::{MetadataRefreshOptions, RefreshPriority};
-    let options = MetadataRefreshOptions::default();
-    let item = state.library.get_item_by_id(item_id).await?;
-    if let Some(path) = item.as_ref().and_then(refresh_scan_path) {
-        state
-            .library
-            .queue_refresh_scan(ScanTarget::Items(vec![path]), &options)
-            .await?;
+    use ferrofin_traits::providers::MetadataRefreshOptions;
+    let Some(item) = state.library.get_item_by_id(item_id).await? else {
         return Ok(());
-    }
+    };
     state
-        .providers
-        .queue_refresh(item_id, &options, RefreshPriority::High)
+        .library
+        .queue_item_refresh(&item, &MetadataRefreshOptions::default())
         .await?;
     Ok(())
 }
 
 /// Runs an item's default metadata refresh and returns once it has run —
 /// `item.RefreshMetadata(CancellationToken.None)`, which a handler awaits
-/// rather than queues. A file item refreshes through the scan queue's
-/// priority lane ([`LibraryManager::run_refresh_scan`]), on a task of its own
-/// so a client that hangs up does not withdraw it; an item with no file of
-/// its own is queued as [`queue_high_priority_refresh`] does.
+/// rather than queues ([`LibraryManager::refresh_item_metadata`]), on a task
+/// of its own so a client that hangs up does not withdraw it. An item no
+/// longer stored is not refreshed.
 ///
-/// [`LibraryManager::run_refresh_scan`]: ferrofin_traits::library::LibraryManager::run_refresh_scan
+/// [`LibraryManager::refresh_item_metadata`]: ferrofin_traits::library::LibraryManager::refresh_item_metadata
 pub(crate) async fn run_item_refresh(state: &AppState, item_id: Uuid) -> Result<(), ApiError> {
-    use ferrofin_traits::error::ServiceError;
-    use ferrofin_traits::library::ScanTarget;
     use ferrofin_traits::providers::MetadataRefreshOptions;
-    let item = state.library.get_item_by_id(item_id).await?;
-    let Some(path) = item.as_ref().and_then(refresh_scan_path) else {
-        return queue_high_priority_refresh(state, item_id).await;
+    let Some(item) = state.library.get_item_by_id(item_id).await? else {
+        return Ok(());
     };
     let library = std::sync::Arc::clone(&state.library);
-    // In the request's span: the request awaits it (LOGGING.md §4).
-    let ran = tokio::spawn(tracing::Instrument::in_current_span(async move {
+    let ran = run_detached(async move {
         library
-            .run_refresh_scan(
-                ScanTarget::Items(vec![path]),
-                &MetadataRefreshOptions::default(),
-            )
+            .refresh_item_metadata(&item, &MetadataRefreshOptions::default())
             .await
-    }))
-    .await
-    .map_err(|err| {
-        ApiError::Service(ServiceError::backend(format!(
-            "item refresh task failed: {err}"
-        )))
-    })??;
+    })
+    .await?;
     if !ran {
         return Err(ApiError::ServiceUnavailable(format!(
             "the refresh of item {item_id} was stopped before it finished"
@@ -92,52 +76,26 @@ pub(crate) async fn run_item_refresh(state: &AppState, item_id: Uuid) -> Result<
     Ok(())
 }
 
-/// Whether the library scan can reach `target`: every path of it lies under
-/// a location of a configured library (the scan plans nothing anywhere
-/// else). A library or the root always can.
-pub(crate) async fn scan_reaches(
-    state: &AppState,
-    target: &ferrofin_traits::library::ScanTarget,
-) -> Result<bool, ApiError> {
-    use ferrofin_traits::library::ScanTarget;
-    let (ScanTarget::Paths(paths) | ScanTarget::Items(paths)) = target else {
-        return Ok(true);
-    };
-    let folders = state.virtual_folders.get_virtual_folders().await?;
-    Ok(paths.iter().all(|path| {
-        folders.iter().any(|folder| {
-            folder
-                .locations
-                .iter()
-                .any(|location| path_is_under(path, location))
-        })
-    }))
-}
-
-/// Whether `path` is `root` or lies under it, component-wise.
-fn path_is_under(path: &str, root: &str) -> bool {
-    let root = root.trim_end_matches('/');
-    path == root
-        || path
-            .strip_prefix(root)
-            .is_some_and(|rest| rest.starts_with('/'))
-}
-
-/// The path an item refreshes through the library scan by: its own
-/// filesystem path, when it has one inside a library. `None` for an item
-/// with no file of its own — a person, a genre or studio, a channel or
-/// live-TV item streamed from a URL, a row outside every library — which the
-/// provider manager refreshes.
-pub(crate) fn refresh_scan_path(
-    item: &ferrofin_db::entities::base_items::BaseItemEntity,
-) -> Option<String> {
-    let in_library = item
-        .top_parent_id
-        .as_deref()
-        .is_some_and(|top| !top.is_empty());
-    item.path
-        .clone()
-        .filter(|path| in_library && !path.is_empty() && !path.contains("://"))
+/// Runs a refresh a handler awaits on a task of its own, so a client that
+/// hangs up does not stop it (upstream's `CancellationToken.None`). The task
+/// keeps the request's span (the request awaits it, LOGGING.md §4) and its
+/// culture, which a spawned task does not inherit.
+pub(crate) async fn run_detached<T: Send + 'static>(
+    refresh: impl std::future::Future<Output = Result<T, ferrofin_traits::error::ServiceError>>
+    + Send
+    + 'static,
+) -> Result<T, ApiError> {
+    let culture = ferrofin_util::current_culture::capture();
+    tokio::spawn(tracing::Instrument::in_current_span(
+        ferrofin_util::current_culture::scope(culture, refresh),
+    ))
+    .await
+    .map_err(|err| {
+        ApiError::Service(ferrofin_traits::error::ServiceError::backend(format!(
+            "refresh task failed: {err}"
+        )))
+    })?
+    .map_err(ApiError::from)
 }
 
 pub mod activity_log;
@@ -4699,9 +4657,10 @@ pub const VERIFIED: &[Verified] = &[
                id) → MetadataRefreshOptions \
                with FullRefresh for metadata and images, ReplaceAllMetadata, \
                RemoveOldMetadata, ReplaceAllImages = replaceAllImages and SearchResult = the \
-               body → RefreshFullItem awaited on a task of its own (CancellationToken.None): \
-               an item with a path through LibraryManager::run_refresh_scan of \
-               item_update.rs refresh_scan_target in the scan queue's priority lane \
+               body → LibraryManager::refresh_full_item (RefreshFullItem) awaited on a \
+               task of its own (CancellationToken.None), routed by ferrofin-core \
+               library_manager/item_refresh.rs identify_target: an item with a path \
+               through run_refresh_scan of scan_target in the scan queue's priority lane \
                (RefreshItem: the item, then ValidateChildren with the same options, so a \
                folder's children refresh under the chosen result too), an artist known only \
                by name through the scanner's ScanTarget::Artist, any other item through \
@@ -4740,15 +4699,18 @@ pub const VERIFIED: &[Verified] = &[
                and replaceAllMetadata, replaceAllImages and regenerateTrickplay to false; \
                MetadataRefreshOptions::for_item_refresh: ForceSave for a FullRefresh of \
                either kind or either replace, RemoveOldMetadata = replaceAllMetadata, \
-               IsAutomated false, RegenerateTrickplay) → queue_item_refresh by \
-               refresh_route (QueueRefresh at High priority, then the queue's RefreshItem \
-               or RefreshArtist): a CollectionFolder's physical folders \
+               IsAutomated false, RegenerateTrickplay) → \
+               LibraryManager::queue_item_refresh, routed by ferrofin-core \
+               library_manager/item_refresh.rs refresh_target (QueueRefresh at High \
+               priority, then the queue's RefreshItem or RefreshArtist): a \
+               CollectionFolder's physical folders \
                (RefreshCollectionFolderChildren), every library for the root, another \
                folder's subtree (the folder, then ValidateChildren with the same options) \
                and a file's own path (RefreshSingleItem's metadata service), each as a scan \
-               through LibraryManager::queue_refresh_scan; a music artist by \
-               artist_refresh_route (RefreshArtist: the artist folders above its credited \
-               albums validate their children, then the artist refreshes); a box set, \
+               through queue_refresh_scan; a music artist by artist_target \
+               (RefreshArtist: the artist folders above its credited albums, found from \
+               one read of the ancestors per album folder as MusicAlbum.GetMusicArtist \
+               walks them, validate their children, then the artist refreshes); a box set, \
                playlist, view, virtual season, person, genre, studio or channel through \
                ProviderManager::queue_refresh at High priority → 204 without waiting for \
                the refresh.",

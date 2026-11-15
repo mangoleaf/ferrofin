@@ -60,14 +60,13 @@ const SERIES_ID: Uuid = Uuid::from_u128(0x00B5_0002);
 /// which [`OneItemLibrary`] can run and await but not queue, so queueing it
 /// fails.
 const FILED_ITEM_ID: Uuid = Uuid::from_u128(0x00B5_0003);
-/// [`FILED_ITEM_ID`]'s file: the refresh a subtitle delete awaits is its
-/// path's scan.
+/// [`FILED_ITEM_ID`]'s file: the refresh a subtitle delete awaits is of it.
 const FILED_ITEM_PATH: &str = "/media/Film.mkv";
 
 // ---- Fakes -----------------------------------------------------------------
 
 /// The refreshes [`OneItemLibrary`] ran for a caller that awaited them
-/// (`run_refresh_scan`), as debug-printed targets.
+/// (`refresh_item_metadata`), as the items' paths.
 static AWAITED_REFRESHES: Mutex<Vec<String>> = Mutex::new(Vec::new());
 
 /// A library where only [`ITEM_ID`] and [`FILED_ITEM_ID`] (Movies) and
@@ -103,15 +102,29 @@ impl LibraryManager for OneItemLibrary {
             _ => None,
         })
     }
-    async fn run_refresh_scan(
+    async fn queue_item_refresh(
         &self,
-        target: ferrofin_traits::library::ScanTarget,
+        item: &BaseItemEntity,
+        _options: &ferrofin_traits::providers::MetadataRefreshOptions,
+    ) -> Result<(), ServiceError> {
+        // A file's queued refresh is the library scan's, which this library
+        // has none of.
+        if item.path.is_some() {
+            return Err(ServiceError::backend(
+                "queue_item_refresh needs a library scanner",
+            ));
+        }
+        Ok(())
+    }
+    async fn refresh_item_metadata(
+        &self,
+        item: &BaseItemEntity,
         _options: &ferrofin_traits::providers::MetadataRefreshOptions,
     ) -> Result<bool, ServiceError> {
         AWAITED_REFRESHES
             .lock()
             .unwrap()
-            .push(format!("{target:?}"));
+            .push(item.path.clone().unwrap_or_default());
         Ok(true)
     }
     async fn query_items(

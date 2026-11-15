@@ -35,13 +35,11 @@ use ferrofin_db::entities::base_items::{BaseItemEntity, PeopleEntity};
 use ferrofin_model::data::{BaseItemKind, CollectionType, PersonKind};
 use ferrofin_model::dto::{DayOfWeek, MetadataEditorInfo, NameGuidPair, NameValuePair};
 use ferrofin_model::entities::{MetadataField, SeriesStatus, Video3DFormat};
-use ferrofin_traits::library::ScanTarget;
 use ferrofin_traits::options::InternalItemsQuery;
-use ferrofin_traits::providers::{MetadataRefreshMode, MetadataRefreshOptions, RefreshPriority};
+use ferrofin_traits::providers::{MetadataRefreshMode, MetadataRefreshOptions};
 use ferrofin_util::finite::finite_or_none;
 use ferrofin_util::string_extensions::equals_ordinal_ignore_case;
 
-use crate::handlers::refresh_scan_path;
 use serde::Deserialize;
 use uuid::Uuid;
 
@@ -147,7 +145,7 @@ pub(crate) async fn update_item(
             replace_all_metadata: true,
             ..MetadataRefreshOptions::default()
         };
-        queue_item_refresh(&state, &item, item_id, &options).await?;
+        state.library.queue_item_refresh(&item, &options).await?;
     }
     // `if (isLockedChanged && item.IsFolder)`: every descendant takes the
     // new lock (`ItemUpdateController.cs:104-113`).
@@ -988,182 +986,6 @@ struct RefreshQuery {
     regenerate_trickplay: Option<bool>,
 }
 
-/// How `POST /Items/{itemId}/Refresh` refreshes an item — upstream's
-/// `ProviderManager.RefreshItem` and `RefreshArtist`
-/// (`ProviderManager.cs:1211-1290`).
-struct RefreshRoute {
-    /// The folders validated, or the file refreshed, with the request's
-    /// options, as a scan.
-    scan: Option<ScanTarget>,
-    /// The item's own refresh through the provider manager (an item with no
-    /// file of its own).
-    item: bool,
-}
-
-impl RefreshRoute {
-    /// A scan of `target`, which refreshes the item too.
-    fn scan(target: ScanTarget) -> Self {
-        Self {
-            scan: Some(target),
-            item: false,
-        }
-    }
-
-    /// The item's own refresh only.
-    fn item_only() -> Self {
-        Self {
-            scan: None,
-            item: true,
-        }
-    }
-}
-
-/// Routes an item's refresh. A music artist refreshes as
-/// [`artist_refresh_route`] says; everything else as
-/// [`refresh_scan_target`] says, and the item refreshes itself through the
-/// provider manager when no scan covers it.
-async fn refresh_route(
-    state: &AppState,
-    item: &BaseItemEntity,
-    item_id: Uuid,
-) -> Result<RefreshRoute, ApiError> {
-    if BaseItemKind::from_stored_type_name(&item.type_) == Some(BaseItemKind::MusicArtist) {
-        return artist_refresh_route(state, item, item_id).await;
-    }
-    Ok(match refresh_scan_target(item, item_id) {
-        Some(target) => RefreshRoute::scan(target),
-        None => RefreshRoute::item_only(),
-    })
-}
-
-/// The scan an item's refresh is (`ProviderManager.RefreshItem`), if any. A
-/// CollectionFolder refreshes its physical folders
-/// (`RefreshCollectionFolderChildren`), the root every library, and any
-/// other folder validates its own children — its subtree, not its whole
-/// library — which the scan refreshes along with the folder itself.
-///
-/// A file item (a movie, an episode, a track, a book, a photo, a video…)
-/// refreshes itself (`RefreshSingleItem`) through the same metadata service
-/// the scan runs: here the scan of its one path, so it gets the scan's
-/// refresh decision, merge, field locks, probe, NFO and every metadata
-/// provider, and nothing else of its library is walked.
-///
-/// No scan covers an item upstream validates no children for and that has
-/// no file of its own: a box set's members and a playlist's entries are
-/// linked, not physical (`BoxSet.GetNonCachedChildren` returns none,
-/// `Playlist.ValidateChildrenInternal` is a no-op), a view's folder holds
-/// none, a folder with no path of its own — a virtual season, whose episodes
-/// sit in the series folder — is not `IsFileProtocol`, so
-/// `ValidateChildrenInternal2` validates and refreshes no child
-/// (`Folder.cs:430-436,780-812`), and a person, genre, studio or channel
-/// item has no file. Those refresh through the provider manager.
-pub(crate) fn refresh_scan_target(item: &BaseItemEntity, item_id: Uuid) -> Option<ScanTarget> {
-    if !item.is_folder {
-        return refresh_scan_path(item).map(|path| ScanTarget::Items(vec![path]));
-    }
-    match BaseItemKind::from_stored_type_name(&item.type_) {
-        Some(BaseItemKind::CollectionFolder) => Some(ScanTarget::Library(item_id)),
-        Some(BaseItemKind::AggregateFolder | BaseItemKind::UserRootFolder) => Some(ScanTarget::All),
-        Some(
-            BaseItemKind::BoxSet
-            | BaseItemKind::Playlist
-            | BaseItemKind::ManualPlaylistsFolder
-            | BaseItemKind::PlaylistsFolder
-            | BaseItemKind::UserView,
-        ) => None,
-        _ => item
-            .path
-            .clone()
-            .filter(|p| !p.is_empty())
-            .map(|path| ScanTarget::Paths(vec![path])),
-    }
-}
-
-/// `ProviderManager.RefreshArtist` (`ProviderManager.cs:1258-1290`): the
-/// albums credited to the artist (`ArtistIds`) each name their
-/// `MusicArtist` — the nearest artist folder above them
-/// (`MusicAlbum.GetMusicArtist`) — and those artist folders validate their
-/// CHILDREN with the request's options (`ValidateChildren` refreshes a
-/// folder's children, never the folder itself, `Folder.cs:831-870`); then
-/// the artist refreshes itself (`item.RefreshMetadata`).
-///
-/// A folder-backed artist refreshes itself in the same scan
-/// ([`ScanTarget::Artist`]'s `path`); its own folder is validated only when
-/// one of its credited albums sits under it. An artist known only by name
-/// has no folder (`MusicArtist.ValidateChildrenInternal` returns on
-/// `IsAccessedByName`): the scanner refreshes it after its albums' folders
-/// (a `path` of `None`), its music providers under the request's options —
-/// through the scan queue's priority lane when there is no folder to
-/// validate, so it runs inside a running scan and never beside one. An album
-/// with no artist folder above it names the by-name artist, whose validation
-/// is that no-op, so it is not scanned — as upstream.
-async fn artist_refresh_route(
-    state: &AppState,
-    item: &BaseItemEntity,
-    item_id: Uuid,
-) -> Result<RefreshRoute, ApiError> {
-    let own_folder = item
-        .path
-        .clone()
-        .filter(|p| !p.is_empty())
-        .filter(|_| item.top_parent_id.as_deref().is_some_and(|t| !t.is_empty()));
-    let albums = state
-        .library
-        .get_item_list(&InternalItemsQuery {
-            include_item_types: vec![BaseItemKind::MusicAlbum],
-            artist_ids: vec![item_id],
-            ..InternalItemsQuery::default()
-        })
-        .await?;
-    let mut folders: Vec<String> = Vec::new();
-    for album in &albums {
-        if let Some(path) = artist_folder_above(state, album).await?
-            && !folders.contains(&path)
-        {
-            folders.push(path);
-        }
-    }
-    Ok(RefreshRoute::scan(ScanTarget::Artist {
-        id: item_id,
-        path: own_folder,
-        folders,
-    }))
-}
-
-/// The path of the nearest folder-backed `MusicArtist` above `album` (the
-/// parent chain `MusicAlbum.GetMusicArtist` walks), if any.
-async fn artist_folder_above(
-    state: &AppState,
-    album: &BaseItemEntity,
-) -> Result<Option<String>, ApiError> {
-    let mut seen: Vec<String> = vec![album.id.clone()];
-    let mut next = album.parent_id.clone();
-    while let Some(parent_id) = next.take() {
-        let Ok(parent_uuid) = Uuid::parse_str(&parent_id) else {
-            break;
-        };
-        if seen.contains(&parent_id) {
-            break;
-        }
-        seen.push(parent_id);
-        let Some(parent) = state.library.get_item_by_id(parent_uuid).await? else {
-            break;
-        };
-        match BaseItemKind::from_stored_type_name(&parent.type_) {
-            Some(BaseItemKind::MusicArtist) => {
-                return Ok(parent.path.filter(|p| !p.is_empty()));
-            }
-            Some(
-                BaseItemKind::CollectionFolder
-                | BaseItemKind::AggregateFolder
-                | BaseItemKind::UserRootFolder,
-            ) => break,
-            _ => next = parent.parent_id,
-        }
-    }
-    Ok(None)
-}
-
 /// The wire spelling of the refresh-mode query enum. Mirrors the vendored
 /// contract's `MetadataRefreshMode` (PascalCase), mapped onto the service-layer
 /// [`MetadataRefreshMode`].
@@ -1240,40 +1062,11 @@ async fn refresh_item(
         query.replace_all_images.unwrap_or(false),
         query.regenerate_trickplay.unwrap_or(false),
     );
-    // Refreshing a folder (a library's CollectionFolder, a series, a season,
-    // an album…) means "validate its children" — `folder.ValidateChildren(…,
-    // options)` — so it drives the filesystem scan over that folder's subtree,
-    // and every item in it refreshes with those options. A file item's
-    // refresh is the scan of its own path: the scan's refresh decision and
-    // merge, with the probe (upstream probes inside `RefreshMetadata`, so a
-    // "Search for missing metadata" re-probes the file and a Default refresh
-    // of an unchanged one does not), the NFO and every metadata provider.
-    queue_item_refresh(&state, &item, item_id, &options).await?;
+    // `_providerManager.QueueRefresh(item.Id, refreshOptions,
+    // RefreshPriority.High)`: a folder validates its subtree, a file
+    // refreshes through the scan of its own path (`queue_item_refresh`).
+    state.library.queue_item_refresh(&item, &options).await?;
     Ok(StatusCode::NO_CONTENT)
-}
-
-/// Queues the refresh `options` ask of `item`: the scan that covers it (a
-/// folder's subtree, a file's own path), and for an item with no file of its
-/// own — a box set, a playlist, a view, a virtual season, a person, a by-name
-/// artist — the provider queue, which spawns the refresh and returns at once,
-/// like the C# queued refresh.
-async fn queue_item_refresh(
-    state: &AppState,
-    item: &BaseItemEntity,
-    item_id: Uuid,
-    options: &MetadataRefreshOptions,
-) -> Result<(), ApiError> {
-    let route = refresh_route(state, item, item_id).await?;
-    if let Some(target) = route.scan {
-        state.library.queue_refresh_scan(target, options).await?;
-    }
-    if route.item {
-        state
-            .providers
-            .queue_refresh(item_id, options, RefreshPriority::High)
-            .await?;
-    }
-    Ok(())
 }
 
 /// Registers the item-refresh + content-type routes.
