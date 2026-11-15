@@ -2794,7 +2794,7 @@ async fn subtitles_are_downloaded_during_scan(h: &Harness) {
     );
     assert_eq!(std::fs::read(&english).unwrap(), content);
 
-    options["DisabledSubtitleFetchers"] = json!(["opensubtitles"]);
+    options["DisabledSubtitleFetchers"] = json!(["Open Subtitles"]);
     options["SubtitleDownloadLanguages"] = json!(["spa"]);
     h.change_structure(
         "/Library/VirtualFolders/LibraryOptions",

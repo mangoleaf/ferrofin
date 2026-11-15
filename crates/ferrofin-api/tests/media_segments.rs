@@ -460,6 +460,15 @@ impl ferrofin_traits::intro_skipper::IntroSkipperAnalysis for HidesIntros {
     async fn support_bundle(&self) -> String {
         String::new()
     }
+    fn operating_system(&self) -> String {
+        String::new()
+    }
+    async fn create_or_replace_segment(
+        &self,
+        _segment: &MediaSegmentDto,
+    ) -> Result<(), ServiceError> {
+        Ok(())
+    }
     async fn hides_intros(&self, _item_id: Uuid) -> bool {
         self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         true
