@@ -316,6 +316,36 @@ pub fn ordinal_ignore_case_key(text: &str) -> String {
     text.chars().map(to_upper_ordinal).collect()
 }
 
+/// `string.Equals(a, b, StringComparison.InvariantCultureIgnoreCase)` as .NET
+/// computes it with ICU: root collation at the secondary strength that
+/// `CompareOptions.IgnoreCase` selects. Case alone never differs (`ärne`,
+/// `Ärne`), and neither do canonically equivalent spellings, ignorable
+/// characters or compatibility variants (`ﬁ`, `fi`); accents, `ß` against `ss`
+/// and the dotless `ı` against `I` do. Unlike .NET, character width and kana
+/// type do not count (`ｂ` against `b`, `あ` against `ア`): see gl-1793.
+///
+/// The collator reads ICU4X's baked root data; a build without it compares
+/// as [`equals_ordinal_ignore_case`] rather than failing.
+#[must_use]
+pub fn equals_invariant_ignore_case(left: &str, right: &str) -> bool {
+    // shortcut: .NET adds tailoring rules that keep character width and kana type apart
+    // (`ｂ` and `b`, `あ` and `ア` differ there, equal here); ICU4X takes no runtime rules,
+    // so porting them needs their tables; replace this when gl-1793 lands.
+    static COLLATOR: OnceLock<Option<icu_collator::CollatorBorrowed<'static>>> = OnceLock::new();
+    COLLATOR
+        .get_or_init(|| {
+            let mut options = icu_collator::options::CollatorOptions::default();
+            options.strength = Some(icu_collator::options::Strength::Secondary);
+            icu_collator::Collator::try_new(icu_collator::CollatorPreferences::default(), options)
+                .ok()
+        })
+        .as_ref()
+        .map_or_else(
+            || equals_ordinal_ignore_case(left, right),
+            |collator| collator.compare(left, right).is_eq(),
+        )
+}
+
 /// .NET invariant uppercase for a string, using ICU's simple mappings.
 ///
 /// Not an `OrdinalIgnoreCase` key: that is [`ordinal_ignore_case_key`].
@@ -679,6 +709,41 @@ mod tests {
         assert!(!equals_ordinal_ignore_case("straße", "STRASSE"));
         assert!(!equals_ordinal_ignore_case("\u{212a}elvin", "kelvin"));
         assert_eq!("\u{212a}".to_lowercase(), "k", "the trap this avoids");
+    }
+
+    // Expected values from .NET 10.0.13's native ICU collation
+    // (`GlobalizationNative_CompareString` on the invariant sort handle with
+    // `CompareOptions.IgnoreCase`, ICU 78.3), which `string.Equals` with
+    // `InvariantCultureIgnoreCase` returns.
+    #[rstest]
+    #[case("ärne", "Ärne", true)]
+    #[case("admin", "Admin", true)]
+    #[case("ΣΊΣΥΦΟΣ", "σίσυφος", true)] // the final sigma too
+    #[case("\u{1c4}", "\u{1c6}", true)]
+    #[case("\u{10428}", "\u{10400}", true)] // a supplementary-plane letter (Deseret)
+    #[case("\u{212a}", "k", true)] // the Kelvin sign, unlike OrdinalIgnoreCase
+    #[case("ﬁ", "fi", true)]
+    #[case("²", "2", true)]
+    #[case("a\u{301}", "á", true)] // canonically equivalent
+    #[case("Bob\u{200b}", "Bob", true)] // an ignorable character
+    #[case("Ab\u{ad}", "ab", true)]
+    #[case("Bob", "Bób", false)]
+    #[case("Ärne", "Arne", false)]
+    #[case("bob", "bob ", false)]
+    #[case("ß", "ss", false)]
+    #[case("straße", "STRASSE", false)]
+    #[case("\u{17f}", "s", false)]
+    #[case("\u{131}", "I", false)]
+    #[case("i", "\u{130}", false)]
+    #[case("æ", "AE", false)]
+    #[case("Œ", "oe", false)]
+    fn invariant_ignore_case_matches_dotnet(
+        #[case] left: &str,
+        #[case] right: &str,
+        #[case] equal: bool,
+    ) {
+        assert_eq!(equals_invariant_ignore_case(left, right), equal);
+        assert_eq!(equals_invariant_ignore_case(right, left), equal);
     }
 
     /// `string.Equals(a, b, StringComparison.OrdinalIgnoreCase)` as .NET 10.0.14

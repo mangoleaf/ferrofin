@@ -269,48 +269,50 @@ impl FerrofinServerApplicationHost {
     ///
     /// If `hostname` already looks like a URL (`http…`) it is returned trimmed.
     /// Otherwise the scheme defaults to the HTTPS/HTTP listen mode, the port
-    /// defaults to the matching listen port (omitted for the scheme's default
-    /// port), and the base URL is appended. The trailing slash is always trimmed.
+    /// defaults to the matching listen port, and the base URL is appended. The
+    /// trailing slash is always trimmed.
     fn build_local_api_url(
         &self,
         hostname: &str,
         scheme: Option<&str>,
         port: Option<u16>,
     ) -> String {
-        if hostname.to_ascii_lowercase().starts_with("http://")
-            || hostname.to_ascii_lowercase().starts_with("https://")
-        {
-            return hostname.trim_end_matches('/').to_owned();
-        }
-
         let scheme = scheme.unwrap_or(if self.network.listen_with_https {
             "https"
         } else {
             "http"
         });
-        let is_https = scheme.eq_ignore_ascii_case("https");
         let port = port.unwrap_or_else(|| {
-            if is_https {
+            if scheme.eq_ignore_ascii_case("https") {
                 self.https_port()
             } else {
                 self.http_port()
             }
         });
+        self.format_api_url(scheme, hostname, Some(port))
+    }
 
-        // Omit the port when it is the scheme's default (80/443), matching the
-        // `UriBuilder` behavior of not rendering a default port.
-        let default_port = if is_https { 443 } else { 80 };
-        // The public builder also accepts unbracketed IPv6 literals.
-        let hostname = hostname
-            .parse::<std::net::Ipv6Addr>()
-            .map_or_else(|_| hostname.to_owned(), |address| format!("[{address}]"));
-        let base = self.network.base_url.trim_end_matches('/');
-        let url = if port == default_port {
-            format!("{scheme}://{hostname}{base}")
+    /// `GetLocalApiUrl` once its scheme and port are known: a `hostname` that
+    /// is already a URL (`http…`) is returned trimmed; otherwise its
+    /// `UriBuilder` brackets a host containing `:` and not already bracketed,
+    /// and writes a port whenever one is given, the scheme's default (`:80`,
+    /// `:443`) included; `None` is `UriBuilder.Port = -1`, no port.
+    fn format_api_url(&self, scheme: &str, hostname: &str, port: Option<u16>) -> String {
+        if hostname.to_ascii_lowercase().starts_with("http://")
+            || hostname.to_ascii_lowercase().starts_with("https://")
+        {
+            return hostname.trim_end_matches('/').to_owned();
+        }
+        let hostname = if hostname.contains(':') && !hostname.starts_with('[') {
+            format!("[{hostname}]")
         } else {
-            format!("{scheme}://{hostname}:{port}{base}")
+            hostname.to_owned()
         };
-        url.trim_end_matches('/').to_owned()
+        let port = port.map(|port| format!(":{port}")).unwrap_or_default();
+        let base = self.network.base_url.trim_end_matches('/');
+        format!("{scheme}://{hostname}{port}{base}")
+            .trim_end_matches('/')
+            .to_owned()
     }
 
     /// `EnablePublishedServerUriByRequest`, read per request
@@ -445,16 +447,15 @@ impl ServerApplicationHost for FerrofinServerApplicationHost {
             && let Some((host, req_port)) = Self::parse_request_host(request)
         {
             let scheme = Self::request_scheme(request);
-            // C# passes -1 when Host omits the port, so UriBuilder omits it
-            // rather than substituting the server's internal listen port.
-            let port = Some(req_port.unwrap_or_else(|| {
-                if scheme.eq_ignore_ascii_case("https") {
-                    443
-                } else {
-                    80
-                }
-            }));
-            return Ok(self.build_local_api_url(&host, Some(&scheme), port));
+            // C# passes -1 when Host omits the port or names 80 over http or
+            // 443 over https, so UriBuilder writes none rather than the listen port.
+            let port = req_port.filter(|port| {
+                !matches!(
+                    (*port, scheme.to_ascii_lowercase().as_str()),
+                    (80, "http") | (443, "https")
+                )
+            });
+            return Ok(self.format_api_url(&scheme, &host, port));
         }
 
         let peer = request
@@ -481,13 +482,12 @@ impl ServerApplicationHost for FerrofinServerApplicationHost {
         let Some(manager) = &self.network_manager else {
             return Ok(self.build_local_api_url("localhost", None, None));
         };
-        let (hostname, port) = {
-            let mut manager = manager
-                .write()
-                .map_err(|_| ServiceError::backend("network manager lock poisoned"))?;
-            manager.refresh_interfaces();
-            manager.get_bind_address_for_peer(peer, self.http_bind)
-        };
+        // The snapshot a settings save or a network change refreshed, as
+        // upstream's `GetBindAddress` reads it.
+        let (hostname, port) = manager
+            .read()
+            .map_err(|_| ServiceError::backend("network manager lock poisoned"))?
+            .get_bind_address_for_peer(peer, self.http_bind);
         Ok(self.build_local_api_url(&hostname, None, port))
     }
 }
@@ -512,6 +512,7 @@ mod tests {
         FerrofinServerApplicationHost::new(cfg, network, "test-machine")
     }
 
+    /// `UriBuilder` writes any port it is given, the scheme's default too.
     #[tokio::test]
     async fn local_api_url_builds_scheme_host_port() {
         let h = host(HostNetworkInfo::default()).await;
@@ -521,7 +522,29 @@ mod tests {
         );
         assert_eq!(
             h.build_local_api_url("192.168.1.5", Some("https"), Some(443)),
-            "https://192.168.1.5"
+            "https://192.168.1.5:443"
+        );
+    }
+
+    /// An override naming the scheme's default port keeps it, as Jellyfin
+    /// 12.4 answers `all=example.com:80` with `http://example.com:80`.
+    #[tokio::test]
+    async fn a_published_override_keeps_an_explicit_default_port() {
+        let network = test_network();
+        network.write().expect("lock").update_settings(
+            &ferrofin_networking::NetworkConfiguration {
+                published_server_uri_by_subnet: vec!["all=example.com:80".into()],
+                ..Default::default()
+            },
+        );
+        let h = host(HostNetworkInfo::default())
+            .await
+            .with_network(network, None);
+        assert_eq!(
+            h.get_smart_api_url_for_peer("192.168.1.45".parse().expect("peer"))
+                .await
+                .expect("url"),
+            "http://example.com:80"
         );
     }
 
@@ -678,6 +701,27 @@ mod tests {
                 "https://media.example.test"
             );
         }
+        // Only the request scheme's own default port is dropped.
+        for (scheme, host, expected) in [
+            (
+                "https",
+                "media.example.test:80",
+                "https://media.example.test:80",
+            ),
+            ("http", "media.example.test:80", "http://media.example.test"),
+            (
+                "http",
+                "media.example.test:443",
+                "http://media.example.test:443",
+            ),
+        ] {
+            let request = RequestContext {
+                headers: vec![("Host".into(), host.into())],
+                scheme: Some(scheme.into()),
+                ..Default::default()
+            };
+            assert_eq!(h.get_smart_api_url(&request).await.expect("url"), expected);
+        }
     }
 
     #[tokio::test]
@@ -724,6 +768,40 @@ mod tests {
             h.get_smart_api_url(&request).await.expect("url"),
             "http://10.20.0.2:8096"
         );
+    }
+
+    /// `GetSmartApiUrl` → `GetBindAddress` reads the interface snapshot: a
+    /// smart URL enumerates no interfaces. A settings save or a network change
+    /// refreshes the snapshot, not a request.
+    #[tokio::test]
+    async fn a_smart_url_reads_the_interface_snapshot() {
+        use ferrofin_model::net::{IpData, IpNetwork};
+        let enumerations = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = Arc::clone(&enumerations);
+        let address: IpAddr = "192.168.1.2".parse().expect("address");
+        let manager = NetworkManager::live_with_enumerator(
+            ferrofin_networking::NetworkConfiguration::default(),
+            Arc::new(move |_, _| {
+                counted.fetch_add(1, Ordering::SeqCst);
+                let mut eth0 = IpData::new(address, Some(IpNetwork::new(address, 24)), "eth0");
+                eth0.index = 2;
+                vec![eth0]
+            }),
+            Arc::new(ferrofin_networking::NullLogger),
+        );
+        let at_start = enumerations.load(Ordering::SeqCst);
+        let h = host(HostNetworkInfo::default())
+            .await
+            .with_network(Arc::new(RwLock::new(manager)), None);
+        for _ in 0..2 {
+            assert_eq!(
+                h.get_smart_api_url_for_peer("192.168.1.45".parse().expect("peer"))
+                    .await
+                    .expect("url"),
+                "http://192.168.1.2:8096"
+            );
+        }
+        assert_eq!(enumerations.load(Ordering::SeqCst), at_start);
     }
 
     #[tokio::test]
@@ -933,6 +1011,15 @@ mod tests {
         assert_eq!(
             h.build_local_api_url("fd12::2", None, None),
             "http://[fd12::2]:8096"
+        );
+        // `UriBuilder.Host` brackets any host with a colon not already bracketed.
+        assert_eq!(
+            h.build_local_api_url("fe80::1%eth0", None, None),
+            "http://[fe80::1%eth0]:8096"
+        );
+        assert_eq!(
+            h.build_local_api_url("[::1]", None, None),
+            "http://[::1]:8096"
         );
     }
 
