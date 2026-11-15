@@ -1763,17 +1763,40 @@ impl RouteParameter for TimerId {
     const NAME: &'static str = "timerId";
 }
 
-/// `GET /LiveTv/Timers/{timerId}` — a single timer (`404` if absent).
+/// Port of `LiveTvManager.GetTimer`: the first timer `GetTimers` lists (so
+/// never a `Completed` one) whose id equals `timer_id` ignoring case.
+async fn find_timer(
+    manager: &dyn ferrofin_traits::stubs::LiveTvManager,
+    timer_id: &str,
+) -> Result<Option<TimerInfoDto>, ApiError> {
+    let query = ferrofin_model::live_tv::TimerQuery {
+        id: Some(timer_id.to_owned()),
+        ..ferrofin_model::live_tv::TimerQuery::default()
+    };
+    Ok(manager
+        .get_timers_matching(&query)
+        .await?
+        .into_iter()
+        .find(|timer| {
+            timer
+                .base
+                .id
+                .as_deref()
+                .is_some_and(|id| id.eq_ignore_ascii_case(timer_id))
+        }))
+}
+
+/// `GET /LiveTv/Timers/{timerId}` — a single timer, or `200` with `null` for
+/// an id [`find_timer`] does not find: upstream returns `GetTimer`'s answer
+/// unchecked.
 async fn get_timer(
     State(state): State<AppState>,
     RequireLiveTvAccess(_auth): RequireLiveTvAccess,
     RequiredRouteString(timer_id, _): RequiredRouteString<TimerId>,
-) -> Result<Json<TimerInfoDto>, ApiError> {
-    live_tv(&state)?
-        .get_timer(&timer_id)
-        .await?
-        .map(Json)
-        .ok_or_else(|| ApiError::NotFound("timer".into()))
+) -> Result<Json<Option<TimerInfoDto>>, ApiError> {
+    Ok(Json(
+        find_timer(live_tv(&state)?.as_ref(), &timer_id).await?,
+    ))
 }
 
 /// `POST /LiveTv/Timers` — create a recording timer.
@@ -1827,19 +1850,32 @@ async fn update_timer(
 }
 
 /// `DELETE /LiveTv/Timers/{timerId}` — cancel a recording timer.
+///
+/// Port of `LiveTvManager.CancelTimer`: an id [`find_timer`] does not find is
+/// a `404`, and `TimerCancelled` goes out only when the cancel changed the
+/// timer's status (`CancelTimerInternal`'s `statusChanging`).
 async fn cancel_timer(
     State(state): State<AppState>,
     RequireLiveTvManagement(_auth): RequireLiveTvManagement,
     RequiredRouteString(timer_id, _): RequiredRouteString<TimerId>,
 ) -> Result<axum::http::StatusCode, ApiError> {
-    live_tv(&state)?.cancel_timer(&timer_id).await?;
-    notify_timer_event(
-        &state,
-        ferrofin_model::session::SessionMessageType::TimerCancelled,
-        &timer_id,
-        None,
-    )
-    .await;
+    let manager = live_tv(&state)?;
+    let Some(timer) = find_timer(manager.as_ref(), &timer_id).await? else {
+        return Err(ApiError::NotFound(format!(
+            "Timer with Id {timer_id} not found"
+        )));
+    };
+    let id = timer.base.id.as_deref().unwrap_or(&timer_id);
+    manager.cancel_timer(id).await?;
+    if timer.status != ferrofin_model::live_tv::RecordingStatus::Cancelled {
+        notify_timer_event(
+            &state,
+            ferrofin_model::session::SessionMessageType::TimerCancelled,
+            id,
+            None,
+        )
+        .await;
+    }
     Ok(axum::http::StatusCode::NO_CONTENT)
 }
 
