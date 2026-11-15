@@ -9,14 +9,11 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use ferrofin_model::tasks::{TaskTriggerInfo, TaskTriggerInfoType};
+use ferrofin_model::tasks::TaskTriggerInfo;
 use ferrofin_traits::error::ServiceError;
 use ferrofin_traits::stubs::LiveTvManager;
 
-use super::{ScheduledTask, TaskProgress};
-
-/// 100-nanosecond ticks per second (the `TaskTriggerInfo` time unit).
-const TICKS_PER_SECOND: i64 = 10_000_000;
+use super::{ScheduledTask, TaskProgress, interval_hours};
 
 /// The Live TV category display string. Unlike the Library/Maintenance
 /// categories (which upstream localizes via `TasksLibraryCategory` /
@@ -76,11 +73,7 @@ impl ScheduledTask for RefreshGuideTask {
 
     fn default_triggers(&self) -> Vec<TaskTriggerInfo> {
         // `IntervalTrigger` at `TimeSpan.FromHours(24).Ticks`.
-        vec![TaskTriggerInfo {
-            type_: TaskTriggerInfoType::IntervalTrigger,
-            interval_ticks: Some(24 * 3600 * TICKS_PER_SECOND),
-            ..TaskTriggerInfo::default()
-        }]
+        vec![interval_hours(24)]
     }
 
     async fn execute(&self, progress: &TaskProgress) -> Result<(), ServiceError> {
@@ -98,6 +91,7 @@ impl ScheduledTask for RefreshGuideTask {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ferrofin_model::tasks::TaskTriggerInfoType;
     use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
     /// A [`LiveTvManager`] fake recording `refresh_guide` calls; every other
