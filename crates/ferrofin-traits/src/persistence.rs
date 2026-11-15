@@ -1222,6 +1222,14 @@ pub trait ItemPersistenceService: Send + Sync {
     /// `CollectionFolder` row before parenting scanned children to it).
     async fn item_exists(&self, id: Uuid) -> Result<bool, ServiceError>;
 
+    /// The stored `Path` of the item row with this id: `None` when there is no
+    /// such row, `Some(None)` when the row has no path. One read, for a caller
+    /// that needs both answers (the user root's provisioning). The default
+    /// asks [`item_exists`](Self::item_exists) and knows no path.
+    async fn item_path(&self, id: Uuid) -> Result<Option<Option<String>>, ServiceError> {
+        Ok(self.item_exists(id).await?.then_some(None))
+    }
+
     /// Get-or-create the by-name item row for `(kind, name)`, returning its id.
     ///
     /// The write half of C# `LibraryManager.CreateItemByName<T>`

@@ -280,6 +280,21 @@ async fn replacing_a_genres_or_librarys_images_redraws_its_collage() {
     harness
         .wait_for_primary_colour("the scan's genre collage", genre, RED)
         .await;
+    // Library validation refreshes the user root at its opening
+    // (`ValidateTopLibraryFolders`), so the tile the first one drew reaches
+    // the root on the next.
+    harness.wait_for_libraries_idle().await;
+    assert_eq!(
+        harness.send("POST", "/Library/Refresh").await,
+        StatusCode::NO_CONTENT
+    );
+    let root = harness
+        .row_id(BaseItemKind::UserRootFolder, "Media Folders")
+        .await;
+    harness
+        .wait_for_primary_colour("the next scan's root image", root, dimmed(RED))
+        .await;
+    harness.wait_for_libraries_idle().await;
 
     write_png(&movie.join("poster.png"), BLUE);
     assert_eq!(
@@ -320,9 +335,6 @@ async fn replacing_a_genres_or_librarys_images_redraws_its_collage() {
     // A library's refresh, once its closing passes are done, has not
     // reached the root; the root's own refresh does.
     harness.wait_for_libraries_idle().await;
-    let root = harness
-        .row_id(BaseItemKind::UserRootFolder, "Media Folders")
-        .await;
     harness
         .wait_for_primary_colour("the scan's root image", root, dimmed(RED))
         .await;

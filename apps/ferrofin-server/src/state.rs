@@ -1263,6 +1263,9 @@ pub async fn build_app_state(
     // every holder: the store memoizes its pass in an `Arc<OnceCell>` that
     // survives cloning, so the virtual-folder, user-view and library managers
     // settle the root together instead of each re-probing it per request.
+    // No holder may call its `ensure()` before `rebase_program_data_paths`
+    // above: the first pass resets a moved root's path, one of the anchors
+    // that repair reads.
     let user_root_store = ferrofin_core::UserRootFolderStore::new(
         Arc::clone(&item_persistence_service),
         id_derivation.clone(),

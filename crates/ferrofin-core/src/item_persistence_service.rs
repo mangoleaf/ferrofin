@@ -3099,6 +3099,14 @@ impl ItemPersistenceService for FerrofinItemPersistenceService {
         Ok(exists.is_some())
     }
 
+    async fn item_path(&self, id: Uuid) -> Result<Option<Option<String>>, ServiceError> {
+        sqlx::query_scalar(r#"SELECT "Path" FROM "BaseItems" WHERE "Id" = ?1"#)
+            .bind(guid_to_db(id))
+            .fetch_optional(self.db.pool())
+            .await
+            .map_err(db_err)
+    }
+
     async fn set_ancestors(
         &self,
         item_id: Uuid,
