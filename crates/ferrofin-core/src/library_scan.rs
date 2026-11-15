@@ -24116,7 +24116,8 @@ fn dedup_images_by_type(images: Vec<RemoteImage>) -> Vec<RemoteImage> {
 
 /// Maps TVDB credited people to persistable [`PeopleEntity`] rows. TVDB carries
 /// no numeric person provider id (so `provider_id` is `None`, and the TMDB bio
-/// enrichment skips them); their profile image URL is preserved.
+/// enrichment skips them); a series credit's profile image URL is preserved
+/// (an episode credit carries none, as the plugin's episode loop sets none).
 fn tvdb_people(people: &[ferrofin_providers::TvdbPerson]) -> Vec<PeopleEntity> {
     ferrofin_providers::episode::tvdb_people(people)
 }
