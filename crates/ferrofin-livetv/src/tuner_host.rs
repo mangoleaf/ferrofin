@@ -35,14 +35,13 @@ pub struct TunerChannel {
     /// the channel's internal GUID. A pure function of the tuner and the
     /// lineup entry, never of this server instance.
     pub external_id: String,
-    /// The key the XMLTV guide joins on.
+    /// `ChannelInfo.TunerChannelId`, the second key the guide match tries.
     ///
-    /// `ListingsManager.GetEpgChannelFromTunerChannel` (v10.11.8
-    /// ListingsManager.cs:353-400) tries `ChannelInfo.Id`, then
-    /// `TunerChannelId`, then `Number`. Ferrofin stores the one key that can
-    /// actually match — `tvg-id` for M3U (which is upstream's
-    /// `TunerChannelId`), the guide number for HDHomeRun (whose `ChannelInfo`
-    /// leaves `TunerChannelId` unset, so `Number` is the leg that fires).
+    /// `ListingsManager.GetEpgChannelFromTunerChannel` (v12.4
+    /// ListingsManager.cs:390-458) tries `ChannelInfo.Id`, then
+    /// `TunerChannelId`, then `Number`, then the name. It is the playlist's
+    /// guide id for M3U (`tvg-id` first), and empty for HDHomeRun, whose
+    /// `ChannelInfo` leaves it unset.
     pub guide_key: String,
     /// `ChannelInfo.Name`.
     pub name: String,

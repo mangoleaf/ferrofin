@@ -942,7 +942,7 @@ async fn get_fallback_font(
     if let Some(status) = physical_file_precondition(&headers, file.date_modified) {
         return Ok((status, [(header::LAST_MODIFIED, last_modified)]).into_response());
     }
-    let mime = font_mime(&file.name);
+    let mime = ferrofin_model::net::mime_types::get_mime_type(&file.name);
     let opened = state
         .blocking_file_system(move |file_system| file_system.open_file(&file.full_name))
         .await??;
@@ -953,18 +953,6 @@ async fn get_fallback_font(
             .map_err(|error| ApiError::BadRequest(error.to_string()))?,
     );
     Ok(response)
-}
-
-/// The MIME type of a font file, keyed on its extension: `MimeTypes.GetMimeType`
-/// (`get_mime_type`), plus the font rows of the `MimeTypes` package it falls
-/// back to, which that port does not carry.
-fn font_mime(name: &str) -> &'static str {
-    match name.rsplit_once('.').map(|(_, e)| e.to_ascii_lowercase()) {
-        Some(ext) if ext == "otf" => "font/otf",
-        Some(ext) if ext == "ttc" => "font/collection",
-        Some(ext) if ext == "pfb" => "application/x-font-type1",
-        _ => ferrofin_model::net::mime_types::get_mime_type(name),
-    }
 }
 
 /// Registers this controller's real routes onto `router`.
