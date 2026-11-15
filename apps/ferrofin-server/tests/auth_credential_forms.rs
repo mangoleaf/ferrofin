@@ -395,3 +395,49 @@ async fn repeated_and_empty_credential_headers_keep_their_order() {
         .status();
     assert_eq!(status, StatusCode::OK, "an empty header is no token");
 }
+
+/// A device name outside ASCII is read as Kestrel reads it, as UTF-8: the
+/// device signs in under it, and a later request naming it in another case
+/// leaves the device as it was (`AuthorizationContext.cs` compares the names
+/// with `StringComparison.OrdinalIgnoreCase`).
+#[tokio::test]
+async fn a_utf8_device_name_signs_in_and_keeps_its_case() {
+    let harness = boot().await;
+    let router = ferrofin_api::create_router(harness.wired.state.clone());
+    let identity =
+        |device: &str| format!(r#"Client="test", Device="{device}", DeviceId="utf8", Version="1""#);
+    let sign_in = Request::builder()
+        .method("POST")
+        .uri("/Users/AuthenticateByName")
+        .header(
+            header::AUTHORIZATION,
+            format!("MediaBrowser {}", identity("Salle de séjour’s TV")),
+        )
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(
+            serde_json::json!({ "Username": ADMIN_USER, "Pw": ADMIN_PASSWORD }).to_string(),
+        ))
+        .expect("request");
+    let response = router.clone().oneshot(sign_in).await.expect("response");
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = json_body(response).await;
+    assert_eq!(body["SessionInfo"]["DeviceName"], "Salle de séjour’s TV");
+    let token = body["AccessToken"].as_str().expect("AccessToken");
+
+    let authorization =
+        |device: &str| format!(r#"MediaBrowser Token="{token}", {}"#, identity(device));
+    let me = Request::builder()
+        .uri("/Users/Me")
+        .header(header::AUTHORIZATION, authorization("SALLE DE SÉJOUR’S TV"))
+        .body(Body::empty())
+        .expect("request");
+    let status = router.clone().oneshot(me).await.expect("response").status();
+    assert_eq!(status, StatusCode::OK);
+    let info = Request::builder()
+        .uri("/Devices/Info?id=utf8")
+        .header(header::AUTHORIZATION, authorization("SALLE DE SÉJOUR’S TV"))
+        .body(Body::empty())
+        .expect("request");
+    let info = json_body(router.clone().oneshot(info).await.expect("response")).await;
+    assert_eq!(info["Name"], "Salle de séjour’s TV");
+}

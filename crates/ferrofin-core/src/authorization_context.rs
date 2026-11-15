@@ -36,6 +36,7 @@ use chrono::Utc;
 use ferrofin_db::Database;
 use ferrofin_db::entities::security::{ApiKeyEntity, DeviceEntity};
 use ferrofin_db::store::datetime_to_db;
+use ferrofin_util::string_extensions::equals_ordinal_ignore_case;
 use uuid::Uuid;
 
 use ferrofin_traits::configuration::ServerConfigurationManager;
@@ -218,7 +219,9 @@ impl FerrofinAuthorizationContext {
 
         match info.device.as_deref().map(str::trim) {
             None | Some("") => info.device = Some(device.device_name.clone()),
-            Some(name) if !name.eq_ignore_ascii_case(&device.device_name) && allow_update => {
+            Some(name)
+                if !equals_ordinal_ignore_case(name, &device.device_name) && allow_update =>
+            {
                 update = true;
                 device.device_name = name.to_owned();
             }
@@ -227,7 +230,9 @@ impl FerrofinAuthorizationContext {
 
         match info.version.as_deref().map(str::trim) {
             None | Some("") => info.version = Some(device.app_version.clone()),
-            Some(version) if !version.eq_ignore_ascii_case(&device.app_version) && allow_update => {
+            Some(version)
+                if !equals_ordinal_ignore_case(version, &device.app_version) && allow_update =>
+            {
                 update = true;
                 device.app_version = version.to_owned();
             }

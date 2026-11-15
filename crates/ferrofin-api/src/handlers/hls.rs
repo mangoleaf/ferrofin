@@ -355,7 +355,7 @@ impl HlsRequestContext {
             user_agent: parts
                 .headers
                 .get(header::USER_AGENT)
-                .and_then(|value| value.to_str().ok())
+                .and_then(crate::auth::header_text)
                 .map(str::to_owned),
             ..Self::from_extensions(
                 state,
