@@ -1095,7 +1095,7 @@ fn stored_media_source(data: &serde_json::Map<String, serde_json::Value>) -> Med
 }
 
 /// `VideoImageProvider`'s offset when the runtime is unknown: 10 s, in ticks.
-const SCREEN_GRAB_DEFAULT_OFFSET_TICKS: i64 = 10 * 10_000_000;
+const SCREEN_GRAB_DEFAULT_OFFSET_TICKS: i64 = 10 * ferrofin_util::ticks::TICKS_PER_SECOND;
 
 /// `GetVideoImage`'s stream: the one at `DefaultVideoStreamIndex` (any type,
 /// as its first `GetMediaStreams` query asks), else the first video stream.
@@ -2031,64 +2031,7 @@ fn dynamic_answer(
     answer
 }
 
-/// Stops a running scan cooperatively, as upstream's `CancellationToken`
-/// does. The scan checks it between two items, around each stored-row
-/// window it reads and plans, between its closing passes and inside the
-/// long ones. It races it against every wait of the item in progress: the
-/// ones before anything is written (its probe, its metadata providers) end
-/// the item unwritten, and a cancel inside its artwork pass (image
-/// providers, cover extraction) stops the fetches where they stand and
-/// saves the item with the artwork already on disk. A cancel after the
-/// item's row was saved leaves the row without its refresh stamp, so an item
-/// is written whole, not at all, or as far as it got for the next scan to
-/// redo; and a hung ffprobe or provider cannot keep a cancelled scan alive.
-#[derive(Debug, Clone)]
-pub struct ScanCancel(Arc<tokio::sync::watch::Sender<bool>>);
-
-impl Default for ScanCancel {
-    fn default() -> Self {
-        Self(Arc::new(tokio::sync::watch::Sender::new(false)))
-    }
-}
-
-impl ScanCancel {
-    /// A token nobody has cancelled yet.
-    #[must_use]
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// Asks the scan to stop.
-    pub fn cancel(&self) {
-        self.0.send_replace(true);
-    }
-
-    /// Whether the scan was asked to stop.
-    #[must_use]
-    pub fn is_cancelled(&self) -> bool {
-        *self.0.borrow()
-    }
-
-    /// Resolves once the scan is asked to stop.
-    pub async fn cancelled(&self) {
-        let mut asked = self.0.subscribe();
-        // The sender lives as long as `self`, so this never errors.
-        let _ = asked.wait_for(|cancelled| *cancelled).await;
-    }
-
-    /// Runs `work` unless the scan is asked to stop first; `None` when it
-    /// was (and `work` is dropped where it stood).
-    pub(crate) async fn unless_cancelled<T>(
-        &self,
-        work: impl std::future::Future<Output = T>,
-    ) -> Option<T> {
-        tokio::select! {
-            biased;
-            () = self.cancelled() => None,
-            done = work => Some(done),
-        }
-    }
-}
+pub use ferrofin_traits::tasks::ScanCancel;
 
 /// Where a scan reports how far it got, in percent: the items take 0–96 %
 /// and the closing passes 96–100 %, as upstream's `PerformLibraryValidation`
@@ -27296,10 +27239,10 @@ mod tests {
     #[case::default_time(None, 10)]
     #[case::calculated_time(Some(500), 50)]
     fn the_grab_selects_its_time(#[case] run_time_seconds: Option<i64>, #[case] expected: i64) {
-        const TICKS: i64 = 10_000_000;
+        use ferrofin_util::ticks::TICKS_PER_SECOND;
         assert_eq!(
-            super::screen_grab_offset(run_time_seconds.map(|s| s * TICKS)),
-            expected * TICKS
+            super::screen_grab_offset(run_time_seconds.map(|s| s * TICKS_PER_SECOND)),
+            expected * TICKS_PER_SECOND
         );
     }
 

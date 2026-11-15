@@ -2268,9 +2268,9 @@ mod tests {
             image: &ItemImageInfo,
         ) -> Result<Option<String>, ferrofin_traits::error::ServiceError> {
             // .NET ticks: 100-ns intervals since 0001-01-01, offset from the Unix epoch.
-            const UNIX_EPOCH_TICKS: i64 = 621_355_968_000_000_000;
+            use ferrofin_util::ticks::{TICKS_PER_SECOND, UNIX_EPOCH_TICKS};
             let ticks = UNIX_EPOCH_TICKS
-                + image.date_modified.timestamp() * 10_000_000
+                + image.date_modified.timestamp() * TICKS_PER_SECOND
                 + i64::from(image.date_modified.timestamp_subsec_nanos()) / 100;
             let key = format!("{}{ticks}", item_path.unwrap_or_default());
             Ok(Some(

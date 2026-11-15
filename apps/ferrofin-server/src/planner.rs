@@ -60,6 +60,7 @@ use ferrofin_traits::media_encoding::{
     AttachmentExtractor, HlsStreamRequest, MediaEncoder, SubtitleEncoder, TranscodingJobType,
 };
 use ferrofin_traits::system::{PathManager, ServerApplicationPaths};
+use ferrofin_util::ticks::TICKS_PER_SECOND;
 
 use crate::encoding_options::EncodingOptionsReader;
 
@@ -132,14 +133,10 @@ const DEFAULT_ENCODER_PRESET: EncoderPreset = EncoderPreset::veryfast;
 /// `DynamicHlsController.DefaultEventEncoderPreset = EncoderPreset.superfast`.
 const DEFAULT_EVENT_ENCODER_PRESET: EncoderPreset = EncoderPreset::superfast;
 
-/// The number of ffmpeg ticks per second (100 ns units). Port of
-/// `TimeSpan.TicksPerSecond`.
-const TICKS_PER_SECOND: i64 = 10_000_000;
-
 /// How far past an HLS remux segment's start the input seek goes: upstream's
 /// 0.5 s (`GetFastSeekCommandLineParameter`), so ffmpeg lands on the
 /// keyframe the segment starts at rather than the one before it.
-const HLS_REMUX_SEEK_OFFSET_TICKS: i64 = 5_000_000;
+const HLS_REMUX_SEEK_OFFSET_TICKS: i64 = TICKS_PER_SECOND / 2;
 
 /// The number of milliseconds per second.
 const MS_PER_SECOND: i32 = 1000;

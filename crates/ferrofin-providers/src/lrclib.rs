@@ -24,6 +24,7 @@ use async_trait::async_trait;
 use ferrofin_model::lyrics::{LyricMetadata, LyricSearchRequest};
 use ferrofin_traits::error::ServiceError;
 use ferrofin_traits::stubs::{LyricProvider, LyricResponse, RemoteLyricInfo};
+use ferrofin_util::ticks::TICKS_PER_SECOND;
 use serde::Deserialize;
 
 /// The provider's display name. Port of `LrcLibPlugin.Name` — the lyric
@@ -50,9 +51,6 @@ static USER_AGENT: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
         ferrofin_health::USER_AGENT
     )
 });
-
-/// The number of .NET ticks (100 ns) per second.
-const TICKS_PER_SECOND: i64 = 10_000_000;
 
 /// The provider's search behavior. Port of the plugin's `PluginConfiguration`
 /// (upstream defaults: strict search on, artist/album included).

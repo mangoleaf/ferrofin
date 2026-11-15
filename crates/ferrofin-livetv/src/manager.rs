@@ -8127,8 +8127,7 @@ fn derive_show_id(
 /// A UTC instant as .NET `DateTime.Ticks`: 100-nanosecond intervals since
 /// `0001-01-01T00:00:00`, which is what `ShowId`'s uniqueness suffix appends.
 pub(crate) fn dotnet_ticks(at: DateTime<Utc>) -> i64 {
-    /// Ticks between `0001-01-01` and the Unix epoch.
-    const UNIX_EPOCH_TICKS: i64 = 621_355_968_000_000_000;
+    use ferrofin_util::ticks::UNIX_EPOCH_TICKS;
     UNIX_EPOCH_TICKS + at.timestamp_micros() * 10
 }
 

@@ -1099,6 +1099,15 @@ fn require_valid_username(name: &str) -> Result<(), ServiceError> {
     }
 }
 
+impl ferrofin_traits::security::AuthProviderRegistry for FerrofinUserManager {
+    fn set_extension_providers(&self, providers: Vec<Arc<dyn AuthenticationManager>>) {
+        FerrofinUserManager::set_extension_providers(self, providers);
+    }
+    fn set_extension_reset_providers(&self, providers: Vec<Arc<dyn PasswordResetManager>>) {
+        FerrofinUserManager::set_extension_reset_providers(self, providers);
+    }
+}
+
 #[async_trait]
 impl UserManager for FerrofinUserManager {
     async fn get_users(&self) -> Result<Vec<UserEntity>, ServiceError> {

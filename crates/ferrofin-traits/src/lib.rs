@@ -15,7 +15,9 @@
 //!
 //! **Coverage:** this is a definitions crate (trait bodies live in `ferrofin-core`),
 //! so it is exempt from the 80% line-coverage gate; the `options` module (real
-//! logic) carries its own tests. Filled by the Wave 4 PortJob.
+//! logic) carries its own tests, and the task contract's run handles
+//! ([`tasks::TaskProgress`], [`tasks::ScanCancel`]) are exercised by the
+//! `ferrofin-core` registry's tests. Filled by the Wave 4 PortJob.
 
 pub mod activity;
 pub mod backup;

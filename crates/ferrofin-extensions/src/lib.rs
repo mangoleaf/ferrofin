@@ -17,14 +17,16 @@
 
 use std::sync::Arc;
 
-use ferrofin_core::{
-    FerrofinTaskManager, FerrofinUserManager, PluginConfigPage, RegisteredPlugin, ScheduledTask,
-};
 use ferrofin_traits::library::{LibraryManager, UserManager};
 use ferrofin_traits::media_segments::{MediaSegmentManager, MediaSegmentProvider};
 use ferrofin_traits::merge_versions::MergeVersionsManager;
-use ferrofin_traits::plugins::{PluginDescriptor, PluginManager};
-use ferrofin_traits::security::{AuthenticationManager, PasswordResetManager};
+use ferrofin_traits::plugins::{
+    PluginConfigPage, PluginDescriptor, PluginManager, RegisteredPlugin,
+};
+use ferrofin_traits::security::{
+    AuthProviderRegistry, AuthenticationManager, PasswordResetManager,
+};
+use ferrofin_traits::tasks::{ScheduledTask, TaskRegistry};
 use uuid::Uuid;
 
 use crate::fingerprint::Fingerprinter;
@@ -87,6 +89,10 @@ pub struct ExtensionContext {
     /// extension fetches a picture it was given as a URL, such as an LDAP
     /// user's.
     pub remote_images: Arc<dyn ferrofin_traits::remote_images::RemoteImageFetcher>,
+    /// The core "Media Segment Scan" task (`TaskExtractMediaSegments`), which
+    /// runs every registered segment provider. The Intro Skipper registers its
+    /// own scan in its place, which runs detection and then this one.
+    pub media_segment_scan: Arc<dyn ScheduledTask>,
 }
 
 /// A curated, compiled-in capability that surfaces as a Jellyfin plugin.
@@ -183,7 +189,7 @@ pub fn registered_plugins(extensions: &[Arc<dyn Extension>]) -> Vec<RegisteredPl
 pub fn register_tasks(
     extensions: &[Arc<dyn Extension>],
     cx: &ExtensionContext,
-    task_manager: &FerrofinTaskManager,
+    task_manager: &dyn TaskRegistry,
 ) {
     for ext in extensions {
         for task in ext.tasks(cx) {
@@ -195,12 +201,12 @@ pub fn register_tasks(
 /// Hands every extension's authentication and password-reset providers to the
 /// user manager, in extension order. The manager is built long before the
 /// extensions, so this fills its late slots
-/// ([`FerrofinUserManager::set_extension_providers`],
-/// [`FerrofinUserManager::set_extension_reset_providers`]); call it once.
+/// ([`AuthProviderRegistry::set_extension_providers`],
+/// [`AuthProviderRegistry::set_extension_reset_providers`]); call it once.
 pub fn register_auth_providers(
     extensions: &[Arc<dyn Extension>],
     cx: &ExtensionContext,
-    users: &FerrofinUserManager,
+    users: &dyn AuthProviderRegistry,
 ) {
     users.set_extension_providers(
         extensions
@@ -219,10 +225,11 @@ pub fn register_auth_providers(
 #[cfg(test)]
 mod tests {
     use async_trait::async_trait;
+    use ferrofin_core::{FerrofinTaskManager, FerrofinUserManager};
     use ferrofin_traits::error::ServiceError;
     use ferrofin_traits::merge_versions::{MergeProgress, MergeVersionsManager};
     use ferrofin_traits::plugins::DisabledPluginManager;
-    use ferrofin_traits::tasks::TaskManager;
+    use ferrofin_traits::tasks::{TaskManager, TaskProgress};
 
     use super::*;
 
@@ -240,6 +247,30 @@ mod tests {
             Ok(())
         }
         async fn split_episodes(&self, _p: Option<MergeProgress<'_>>) -> Result<(), ServiceError> {
+            Ok(())
+        }
+    }
+
+    /// A "Media Segment Scan" that does nothing, for the extension contexts
+    /// these tests build without the core task.
+    pub(crate) struct NoScan;
+
+    #[allow(clippy::unnecessary_literal_bound)]
+    #[async_trait]
+    impl ScheduledTask for NoScan {
+        fn key(&self) -> &str {
+            "TaskExtractMediaSegments"
+        }
+        fn name(&self) -> &str {
+            "Media Segment Scan"
+        }
+        fn description(&self) -> &str {
+            ""
+        }
+        fn category(&self) -> &str {
+            "Library"
+        }
+        async fn execute(&self, _progress: &TaskProgress) -> Result<(), ServiceError> {
             Ok(())
         }
     }
@@ -334,6 +365,7 @@ mod tests {
             remote_images: Arc::new(
                 crate::ldap_auth::provider::profile_image::FakeImages::default(),
             ),
+            media_segment_scan: Arc::new(NoScan),
         };
         (cx, users)
     }
@@ -457,7 +489,7 @@ mod tests {
     async fn an_extensions_reset_provider_is_listed_and_answers_its_users() {
         let (cx, users) = context_with_users().await;
         let extensions: Vec<Arc<dyn Extension>> = vec![Arc::new(DirectoryExtension)];
-        register_auth_providers(&extensions, &cx, &users);
+        register_auth_providers(&extensions, &cx, users.as_ref());
 
         let ids: Vec<Option<String>> = cx
             .users
@@ -507,7 +539,7 @@ mod tests {
     async fn an_extensions_auth_provider_is_listed_and_signs_its_users_in() {
         let (cx, users) = context_with_users().await;
         let extensions: Vec<Arc<dyn Extension>> = vec![Arc::new(DirectoryExtension)];
-        register_auth_providers(&extensions, &cx, &users);
+        register_auth_providers(&extensions, &cx, users.as_ref());
 
         let pair = |name: &str, id: &str| ferrofin_model::dto::NameIdPair {
             name: Some(name.to_owned()),
@@ -603,7 +635,7 @@ mod tests {
             "Jellyfin.Plugin.LDAP_Auth.LdapAuthenticationProviderPlugin"
         );
         assert!(!providers[0].is_enabled().await.expect("enabled"));
-        register_auth_providers(std::slice::from_ref(&ldap), &cx, &users);
+        register_auth_providers(std::slice::from_ref(&ldap), &cx, users.as_ref());
         let listed: Vec<Option<String>> = cx
             .users
             .get_authentication_providers()

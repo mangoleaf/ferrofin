@@ -21,6 +21,7 @@ use ferrofin_model::dto::MediaSourceInfo;
 use ferrofin_model::entities_media::MediaStream;
 use ferrofin_model::media_info::{MediaProtocol, subtitle_format};
 use ferrofin_traits::media_encoding::TrimmedSubtitle;
+use ferrofin_util::ticks::UNIX_EPOCH_TICKS;
 
 use crate::encoder::media_encoder::source_input_argument;
 use crate::encoder::quote;
@@ -299,9 +300,6 @@ fn read_error(path: &str, error: std::io::Error) -> MediaEncodingError {
         _ => MediaEncodingError::io(format!("read {path}"), error),
     }
 }
-
-/// .NET ticks (100 ns intervals since 0001-01-01 UTC) at the Unix epoch.
-const UNIX_EPOCH_TICKS: i64 = 621_355_968_000_000_000;
 
 /// `SubtitleEncoder.GetCacheMetaPath`: the sidecar recording which revision
 /// of its source a subtitle cache file was built from.

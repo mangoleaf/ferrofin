@@ -3753,12 +3753,13 @@ mod start_ffmpeg_tests {
 #[cfg(test)]
 pub(super) mod throttle_tests {
     use super::super::progress::FfmpegProgress;
-    use super::super::throttler::{PauseKeys, TICKS_PER_SECOND, ThrottleProgress};
+    use super::super::throttler::{PauseKeys, ThrottleProgress};
     use super::*;
     use crate::{BaseEncodingJobOptions, TranscodeDisplayNames};
     use ferrofin_model::branding::BrandingOptions;
     use ferrofin_model::configuration::{EncodingOptions, ServerConfiguration};
     use ferrofin_model::dto::MediaSourceInfo;
+    use ferrofin_util::ticks::TICKS_PER_SECOND;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 

@@ -24,7 +24,6 @@ use std::sync::atomic::Ordering;
 
 use async_trait::async_trait;
 use ferrofin_chromaprint::AnalysisMode;
-use ferrofin_core::{PluginConfigPage, ScheduledTask, TaskProgress};
 use ferrofin_db::entities::base_items::BaseItemEntity;
 use ferrofin_model::data::BaseItemKind;
 use ferrofin_model::intro_skipper::AnalysisMode as WireMode;
@@ -35,7 +34,8 @@ use ferrofin_traits::intro_skipper::{
 };
 use ferrofin_traits::library::{LibraryManager, VirtualFolderManager};
 use ferrofin_traits::media_segments::{MediaSegmentManager, MediaSegmentProvider};
-use ferrofin_traits::plugins::{PluginDescriptor, PluginManager};
+use ferrofin_traits::plugins::{PluginConfigPage, PluginDescriptor, PluginManager};
+use ferrofin_traits::tasks::{ScheduledTask, TaskProgress};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -129,10 +129,7 @@ impl Extension for IntroSkipperExtension {
             Arc::clone(&detect) as Arc<dyn ScheduledTask>,
             Arc::new(MediaSegmentScanTask {
                 detect: Arc::clone(&detect),
-                providers: ferrofin_core::scheduled_tasks::library::MediaSegmentExtractionTask::new(
-                    Arc::clone(&cx.library),
-                    Arc::clone(&cx.media_segments),
-                ),
+                providers: Arc::clone(&cx.media_segment_scan),
             }),
             Arc::new(CleanCacheTask { detect }),
         ]
@@ -362,12 +359,13 @@ impl IntroSkipperAnalysis for DetectSegmentsTask {
 /// The "Media Segment Scan" task (`TaskExtractMediaSegments`), which this
 /// extension registers in place of the core one while it is loaded: the
 /// detection pass first (owner decision D5: the scan keeps running
-/// detection), then the core `MediaSegmentExtractionTask`, which runs every
-/// registered segment provider — this plugin's [`SegmentProvider`], which
-/// publishes what detection stored, and any other — over the library.
+/// detection), then the core task
+/// ([`ExtensionContext::media_segment_scan`]), which runs every registered
+/// segment provider — this plugin's [`SegmentProvider`], which publishes what
+/// detection stored, and any other — over the library.
 struct MediaSegmentScanTask {
     detect: Arc<DetectSegmentsTask>,
-    providers: ferrofin_core::scheduled_tasks::library::MediaSegmentExtractionTask,
+    providers: Arc<dyn ScheduledTask>,
 }
 
 #[async_trait]
@@ -2118,9 +2116,11 @@ mod tests {
     fn scan_task(h: &Harness) -> MediaSegmentScanTask {
         MediaSegmentScanTask {
             detect: Arc::new(h.task.clone()),
-            providers: ferrofin_core::scheduled_tasks::library::MediaSegmentExtractionTask::new(
-                Arc::clone(&h.task.library),
-                Arc::clone(&h.segments),
+            providers: Arc::new(
+                ferrofin_core::scheduled_tasks::library::MediaSegmentExtractionTask::new(
+                    Arc::clone(&h.task.library),
+                    Arc::clone(&h.segments),
+                ),
             ),
         }
     }
