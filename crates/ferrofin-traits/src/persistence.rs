@@ -1048,6 +1048,29 @@ pub trait ItemPersistenceService: Send + Sync {
         Ok(())
     }
 
+    /// Joins the members a box set's `collection.xml` names to its links, as
+    /// `BoxSetMetadataService.MergeData` merges a box set outside the data
+    /// directory and the save writes them: the file's entries first, in file
+    /// order, each resolved as a playlist entry is ([`PlaylistMember`]: its
+    /// path, else its id) and dropped when it names no stored item, then the
+    /// links already stored that the file does not name, each child once, as
+    /// manual links. Returns whether the links changed.
+    ///
+    /// The default is a no-op (for stub/fake services).
+    ///
+    /// # Errors
+    ///
+    /// [`ServiceError::Backend`] on a storage failure; nothing is written
+    /// then.
+    async fn merge_box_set_members(
+        &self,
+        box_set: Uuid,
+        members: &[PlaylistMember],
+    ) -> Result<bool, ServiceError> {
+        let _ = (box_set, members);
+        Ok(false)
+    }
+
     /// Copies each owner video's metadata onto the videos it owns, as a save
     /// (or refresh) of the owner does upstream, and returns how many owned
     /// rows were written.

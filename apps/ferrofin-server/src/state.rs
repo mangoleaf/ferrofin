@@ -1391,6 +1391,19 @@ pub async fn build_app_state(
         .with_self_writes(Arc::clone(&self_writes_guard)),
     );
     let nfo_listener: Arc<dyn ferrofin_traits::library::UserDataSaveListener> = nfo_saver.clone();
+    // A box set's `collection.xml`: written by the metadata save, read by
+    // the box set's refresh.
+    let box_set_xml = Arc::new(
+        ferrofin_providers::box_set_xml::BoxSetXmlSaver::new(
+            Arc::clone(&item_repository),
+            Arc::clone(&item_persistence_service),
+            Arc::clone(&people_repository),
+            Arc::clone(&linked_children_service),
+            Arc::clone(&virtual_folders),
+            Arc::clone(&config_trait),
+        )
+        .with_self_writes(Arc::clone(&self_writes_guard)),
+    );
     user_data_impl.set_save_listener(Arc::downgrade(&nfo_listener))?;
     let item_visibility = Arc::new(
         ferrofin_core::item_visibility::ItemVisibility::new(
@@ -1408,6 +1421,7 @@ pub async fn build_app_state(
         LocalProviderManager::new(Vec::new())
             .with_image_saver(Arc::clone(&image_saver))
             .with_nfo_saver(Arc::clone(&nfo_saver))
+            .with_box_set_xml(box_set_xml)
             .with_image_store(
                 Arc::clone(&item_persistence_service),
                 metadata_library.clone(),

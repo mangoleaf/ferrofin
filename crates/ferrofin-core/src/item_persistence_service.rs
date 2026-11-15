@@ -2717,6 +2717,39 @@ impl ItemPersistenceService for FerrofinItemPersistenceService {
         Ok(())
     }
 
+    async fn merge_box_set_members(
+        &self,
+        box_set: Uuid,
+        members: &[PlaylistMember],
+    ) -> Result<bool, ServiceError> {
+        // Resolved on a reader, before the writer is taken, as a playlist's
+        // entries are. `ItemPersistenceService` keeps one entry per child of
+        // any container but a playlist.
+        let mut ids: Vec<Uuid> = Vec::with_capacity(members.len());
+        {
+            let mut conn = self.db.pool().acquire().await.map_err(db_err)?;
+            for member in members {
+                if let Some(id) = resolve_playlist_member(&mut conn, member)
+                    .await
+                    .map_err(db_err)?
+                    && !ids.contains(&id)
+                {
+                    ids.push(id);
+                }
+            }
+        }
+        // The stored members stay: a file naming none adds nothing.
+        if ids.is_empty() {
+            return Ok(false);
+        }
+        let mut tx = self.db.writer().begin().await.map_err(db_err)?;
+        let written = write_scanned_members(&mut tx, &guid_to_db(box_set), ids, false)
+            .await
+            .map_err(db_err)?;
+        tx.commit().await.map_err(db_err)?;
+        Ok(written.is_some())
+    }
+
     async fn provider_ids_for_items(
         &self,
         item_ids: &[Uuid],
