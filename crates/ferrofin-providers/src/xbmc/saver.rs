@@ -17,7 +17,9 @@ use std::fmt::Write as _;
 use chrono::{DateTime, Utc};
 use ferrofin_model::data::PersonKind;
 use ferrofin_model::entities_media::MetadataProvider;
-use ferrofin_util::string_extensions::{equals_ordinal_ignore_case, lower_invariant};
+use ferrofin_util::string_extensions::{
+    equals_ordinal_ignore_case, lower_invariant, replace_ignore_ascii_case,
+};
 
 use crate::container_types::{MetadataResult, PersonInfo};
 
@@ -226,17 +228,13 @@ pub fn release_date_format_error(item: &NfoBaseItem, config: &NfoConfiguration) 
     })
 }
 
-/// The Kodi output form of a trailer URL (`BaseNfoSaver.GetOutputTrailerUrl`).
-///
-/// Replaces the YouTube watch prefix with the plugin prefix Kodi expects.
+/// The Kodi output form of a trailer URL (`BaseNfoSaver.GetOutputTrailerUrl`):
+/// `url.Replace(YouTubeWatchUrl, …, OrdinalIgnoreCase)`, every occurrence of
+/// the YouTube watch prefix replaced with the plugin prefix Kodi expects. Only
+/// ASCII characters match an ASCII needle under ordinal casing (it keeps the
+/// long `ſ`, see `to_upper_ordinal`), so the ASCII fold is exact.
 fn output_trailer_url(url: &str) -> String {
-    if url.len() >= YOUTUBE_WATCH_URL.len()
-        && url[..YOUTUBE_WATCH_URL.len()].eq_ignore_ascii_case(YOUTUBE_WATCH_URL)
-    {
-        format!("{YOUTUBE_PLUGIN_URL}{}", &url[YOUTUBE_WATCH_URL.len()..])
-    } else {
-        url.to_owned()
-    }
+    replace_ignore_ascii_case(url, YOUTUBE_WATCH_URL, YOUTUBE_PLUGIN_URL)
 }
 
 /// The lowercase `<key>id` tag `BaseNfoSaver.GetTagForProviderKey` derives.
@@ -1077,6 +1075,30 @@ mod tests {
             output_trailer_url("https://example.com/x"),
             "https://example.com/x"
         );
+    }
+
+    /// `Replace(…, OrdinalIgnoreCase)` rewrites every occurrence, in any case,
+    /// anywhere in the URL; a multibyte character where the prefix would end
+    /// (byte 32) is no prefix and no panic.
+    #[rstest]
+    #[case(
+        "HTTPS://WWW.YOUTUBE.COM/WATCH?V=abc",
+        "plugin://plugin.video.youtube/play/?video_id=abc"
+    )]
+    #[case(
+        "https://t.example/?u=https://www.youtube.com/watch?v=a&w=https://WWW.youtube.com/watch?v=b",
+        "https://t.example/?u=plugin://plugin.video.youtube/play/?video_id=a&w=plugin://plugin.video.youtube/play/?video_id=b"
+    )]
+    #[case(
+        "http\u{17F}://www.youtube.com/watch?v=abc",
+        "http\u{17F}://www.youtube.com/watch?v=abc"
+    )]
+    #[case(
+        "https://www.youtube.com/watch?v\u{E9}abc",
+        "https://www.youtube.com/watch?v\u{E9}abc"
+    )]
+    fn output_trailer_url_replaces_like_dotnet(#[case] url: &str, #[case] expected: &str) {
+        assert_eq!(output_trailer_url(url), expected);
     }
 
     #[test]
