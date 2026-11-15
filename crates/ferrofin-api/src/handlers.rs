@@ -986,16 +986,16 @@ pub const VERIFIED_SUBSYSTEMS_AGAINST_EARLIER_PIN: &[(&str, &str)] = &[];
 /// `video-stream-copy` is whether a transcode job copies the source video and
 /// what dynamic HDR metadata the copy strips, which the HLS and stream routes
 /// share; `recording-postprocessing` is the executable run after a retained
-/// DVR capture, which no HTTP response describes; `recording-keep-up-to` is
+/// DVR capture, which no HTTP response describes; `recording-images` is the
+/// guide artwork a starting capture copies beside its recording, which none
+/// describes either; `recording-keep-up-to` is
 /// which of a series timer's recordings a starting capture deletes past its
 /// "Keep up to", and `direct-recording` how the DVR copies an unshared tuner
 /// URL and how that copy's end settles the timer (completed, or failed and
 /// retried), which no HTTP response describes either. `metadata-refresh` is
 /// which metadata and image providers an item's refresh runs, in which order
 /// and with what lookup, the Identify case first, shared by Identify → Apply,
-/// the item refresh and the library scan. `recording-images` is the guide
-/// artwork a starting DVR capture copies beside its recording, which no HTTP
-/// response describes.
+/// the item refresh and the library scan.
 pub const SUBSYSTEM_KEYS: &[&str] = &[
     "query-translation",
     "dto-fields",
@@ -1014,10 +1014,10 @@ pub const SUBSYSTEM_KEYS: &[&str] = &[
     "trickplay",
     "video-stream-copy",
     "recording-postprocessing",
+    "recording-images",
     "recording-keep-up-to",
     "direct-recording",
     "metadata-refresh",
-    "recording-images",
 ];
 
 /// One shared subsystem whose Ferrofin implementation was compared against the
