@@ -4317,6 +4317,35 @@ pub const VERIFIED: &[Verified] = &[
         refs: &[],
     },
     Verified {
+        method: "get",
+        path: "/Items/Filters2",
+        upstream_file: "Jellyfin.Api/Controllers/FilterController.cs",
+        upstream_method: "GetQueryFilters",
+        ferrofin: "handlers/filter.rs get_query_filters (items.rs resolve_user_opt for \
+               RequestHelpers.GetUserId and GetUserById, an id naming no account leaving no \
+               user; is_trailer_or_program skipping GetItemById; the nil parentId's 400 and \
+               require_scope_visible; parent_scope for the AncestorIds-or-Parent choice, Parent \
+               as physical_children_only's strict ParentId; is_music_type_set, \
+               stream_language_types, has_language_facets, and language_pairs for \
+               FindLanguageInfo and OrderBy(Name) under CurrentCulture) → ferrofin-core \
+               item_repository.rs get_genres / get_music_genres (item_values_with_counts, as \
+               the /Genres and /MusicGenres rows), get_tag_names (BaseItemRepository.GetTagNames: \
+               item_values_statement) and get_media_stream_languages_by_type \
+               (GetMediaStreamLanguages: stream_language_query, stream_languages_statement, one \
+               statement for both stream types), each after top_parent_or_ancestor_scope \
+               (LibraryManager.SetTopParentOrAncestorIds) and AddUserToQuery \
+               (scope_to_user_libraries, through resolve_views on the tag and language \
+               facets); translate_query.rs append_predicates for the TranslateQuery fields these \
+               queries set, which no query-translation row covers yet (gl-1769)",
+        date: "2026-11-14",
+        divergences: &[
+            "The 400 (a nil parentId, or a value the query binder cannot convert) and 403 \
+             (another user's id without the administrator role) bodies are Ferrofin's error \
+             shape, not upstream's. Fix path: gl-666.",
+        ],
+        refs: &["access-filtering"],
+    },
+    Verified {
         method: "post",
         path: "/Library/VirtualFolders/Name",
         upstream_file: "Jellyfin.Api/Controllers/LibraryStructureController.cs",
