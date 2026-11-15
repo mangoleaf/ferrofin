@@ -1,23 +1,12 @@
 //! Configuration abstractions ported from `MediaBrowser.Common.Configuration`.
 //!
 //! Jellyfin registers a set of *configuration stores* at startup, each keyed by
-//! a name and a .NET `Type`. Rust has no runtime `Type`, so the store's type is
-//! represented as a `type_key` string (e.g. the fully-qualified config type
-//! name) that the host resolves. Only the portable value/interface shapes live
-//! here: the runtime `IConfigurationManager` is the `ServerConfigurationManager`
-//! trait in `ferrofin-traits`, implemented in `ferrofin-core`.
-
-/// Describes a single entry in the application configuration.
-///
-/// Port of `ConfigurationStore`. The C# `Type ConfigurationType` field becomes
-/// a `type_key` string because Rust carries no runtime type token.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct ConfigurationStore {
-    /// The unique identifier for the configuration.
-    pub key: String,
-    /// A key identifying the type used to store this configuration entry.
-    pub type_key: String,
-}
+//! a name and a .NET `Type`, through `IConfigurationFactory`. Ferrofin matches
+//! each named store by its key instead (reads in `ferrofin-core`'s configuration
+//! manager, saves in `ferrofin-api`'s `handlers/config.rs`), so only the
+//! validation and post-save check interfaces live here: the runtime
+//! `IConfigurationManager` is the `ServerConfigurationManager` trait in
+//! `ferrofin-traits`, implemented in `ferrofin-core`.
 
 /// A configuration store that can validate a proposed change before saving.
 ///
