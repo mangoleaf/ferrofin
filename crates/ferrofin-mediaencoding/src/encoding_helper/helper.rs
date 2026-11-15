@@ -1243,7 +1243,7 @@ pub fn normalize_subtitle_embed(
 /// `GetProgressiveVideoFullCommandLine` appends it after the audio arguments.
 ///
 /// The stream routes reject a `subtitleCodec` outside the container pattern
-/// before a job exists (`validate_stream_request`, upstream's
+/// before a job exists (`stream_pattern_failures` in the API crate, upstream's
 /// `[RegularExpression(ContainerValidationRegexStr)]`). Because the value is
 /// written into the command line, a name outside that pattern is also treated
 /// as no name here, so a caller that skipped the route check cannot add
