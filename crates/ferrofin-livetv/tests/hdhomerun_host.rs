@@ -190,6 +190,9 @@ async fn the_lineup_becomes_hdhr_prefixed_channels() {
     assert_eq!(channels.len(), 6);
     // `ChannelIdPrefix + i.GuideNumber` with the OVERRIDDEN prefix.
     assert_eq!(channels[0].external_id, "hdhr_4.1");
+    // `TunerChannelId` is never set, so the guide match goes from the id to
+    // the number.
+    assert_eq!(channels[0].guide_key, "");
     assert_eq!(channels[0].name, "WCMH-DT");
     assert_eq!(channels[0].number.as_deref(), Some("4.1"));
     assert_eq!(channels[0].is_hd, Some(true));
