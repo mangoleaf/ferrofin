@@ -781,8 +781,9 @@ fn episode_in_season(
     details.episodes.iter().find(|e| e.episode_number == number)
 }
 
-/// Downloads each [`RemoteImage`] into `item_dir` (as `{type}.jpg`) and returns
-/// the persisted-image rows.
+/// Downloads each [`RemoteImage`] into `item_dir` (as `{type}` plus the
+/// extension of the type the response resolved to, as upstream's `ImageSaver`
+/// names it) and returns the persisted-image rows.
 ///
 /// Idempotent per file: an image already on disk is referenced without a
 /// re-download. Individual download/write failures are skipped (best-effort); a
@@ -806,10 +807,10 @@ async fn download_images(
         let dest = if let Some(existing) = existing_art_file(item_dir, stem) {
             existing
         } else {
-            let dest = item_dir.join(format!("{stem}.jpg"));
-            let Some(bytes) = tmdb.download(&image.url).await else {
+            let Some((bytes, content_type)) = tmdb.download(&image.url).await else {
                 continue;
             };
+            let dest = item_dir.join(format!("{stem}{}", art_extension(&content_type)));
             if let Err(err) =
                 off_runtime(|| ferrofin_util::file_helper::atomic_write_media(&dest, &bytes))
             {
@@ -1243,6 +1244,15 @@ fn store_extracted_art(
     stored.map(|()| dest)
 }
 
+/// The file extension, with its dot, for a downloaded image of `content_type`
+/// (`MimeTypes.ToExtension`) when the art-dir readers know it
+/// ([`ART_FILE_EXTENSIONS`]), `.jpg` otherwise.
+fn art_extension(content_type: &str) -> &'static str {
+    ferrofin_model::net::mime_types::to_extension(content_type)
+        .filter(|ext| ART_FILE_EXTENSIONS.contains(&ext.trim_start_matches('.')))
+        .unwrap_or(".jpg")
+}
+
 fn existing_art_file(dir: &Path, stem: &str) -> Option<PathBuf> {
     ART_FILE_EXTENSIONS
         .iter()
@@ -1284,15 +1294,15 @@ async fn studio_thumb(
     let Some(url) = url else {
         return StudioThumb::Answered;
     };
-    let (bytes, failures) = count_request_failures(studios.download(&url)).await;
-    let Some(bytes) = bytes else {
+    let (download, failures) = count_request_failures(studios.download(&url)).await;
+    let Some((bytes, content_type)) = download else {
         return if failures == 0 {
             StudioThumb::Answered
         } else {
             StudioThumb::Failed(None)
         };
     };
-    let dest = dir.join(format!("{stem}.jpg"));
+    let dest = dir.join(format!("{stem}{}", art_extension(&content_type)));
     match off_runtime(|| ferrofin_util::file_helper::atomic_write_media(&dest, &bytes)) {
         Ok(()) => StudioThumb::Found(dest),
         Err(err) => StudioThumb::Failed(Some(ServiceError::backend(format!(
@@ -4507,6 +4517,17 @@ pub struct LibraryScanner {
     /// shortcut: held in memory, so a restart asks each never-refreshed
     /// person once more; persist a marker if that ever costs real quota.
     biographies_asked: std::sync::Mutex<std::collections::HashSet<Uuid>>,
+    /// The profile-photo URLs [`enrich_people`](Self::enrich_people)
+    /// downloaded and got no photo from (gl-1477): not asked again by later
+    /// credits, which would otherwise ask once per item crediting the
+    /// person. Keyed by URL, so a credit with another URL still asks; the
+    /// person's own refresh and the people task's missing-image refresh do
+    /// not read it.
+    ///
+    /// shortcut: kept for the process and never pruned (one URL per person
+    /// whose photo failed); give it image_negative_cache_ttl_secs if an outage
+    /// should stop holding photos back before a restart.
+    photos_failed: std::sync::Mutex<std::collections::HashSet<String>>,
 }
 
 /// The source an album's shared cover was hashed from, with the stamp it had
@@ -4719,6 +4740,7 @@ impl LibraryScanner {
             album_cover_sources: std::sync::Mutex::new(HashMap::new()),
             swept_at_epoch: std::sync::Mutex::new(None),
             biographies_asked: std::sync::Mutex::default(),
+            photos_failed: std::sync::Mutex::default(),
         }
     }
 
@@ -12978,7 +13000,8 @@ impl LibraryScanner {
     /// touches no other image. The biography is a Ferrofin head start on the
     /// person's first refresh (upstream fetches it only there, from
     /// `PeopleValidator`), so it asks only for a person never refreshed, and
-    /// each person once per process ([`Self::biographies_asked`]).
+    /// each person once per process ([`Self::biographies_asked`]). A photo URL
+    /// that gave no photo is not asked again either ([`Self::photos_failed`]).
     ///
     /// ponytail: runs serially — a large cast makes the first scan slower, but
     /// a person already seen costs neither the network nor the writer. Batch if
@@ -12994,6 +13017,11 @@ impl LibraryScanner {
         };
         let asked = || {
             self.biographies_asked
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+        };
+        let photos_failed = || {
+            self.photos_failed
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
         };
@@ -13033,7 +13061,10 @@ impl LibraryScanner {
             let has_primary = with_primary
                 .as_ref()
                 .is_none_or(|people| people.contains(&person.id));
-            if let Some(url) = person.image_url.filter(|_| !has_primary) {
+            if let Some(url) = person
+                .image_url
+                .filter(|url| !has_primary && !photos_failed().contains(url))
+            {
                 let dir = art_dir_for(
                     &meta_root.resolve(),
                     person.id,
@@ -13045,11 +13076,26 @@ impl LibraryScanner {
                     &id,
                     vec![RemoteImage {
                         image_type: ImageType::Primary,
-                        url,
+                        url: url.clone(),
                         ..Default::default()
                     }],
                 )
                 .await;
+                if infos.is_empty() {
+                    photos_failed().insert(url);
+                }
+                // `ConvertImageToLocal` saves it through `ImageSaver`, which
+                // keeps a person's art beside its own folder.
+                let row = match &self.item_repository {
+                    Some(items) if self.image_saver.is_some() && !infos.is_empty() => items
+                        .retrieve_item(person.id)
+                        .await
+                        .unwrap_or_else(|err| {
+                            tracing::warn!(%err, item_id = %person.id, "could not read person to save their image");
+                            None
+                        }),
+                    _ => None,
+                };
                 // Probe the file once, here, exactly as every other image-persisting
                 // path does. Without it a person image is stored 0x0, and because
                 // nothing caches a probed dimension, `DtoService` re-opens and
@@ -13059,7 +13105,12 @@ impl LibraryScanner {
                 // it writes the result back onto its in-memory BaseItem; Ferrofin
                 // reloads image rows from the DB each time, so the DB is where the
                 // answer has to live.)
-                self.fill_image_metadata(person.id, &mut infos).await;
+                if let Some(row) = &row {
+                    self.finish_artwork(person.id, row, &mut infos, None, None)
+                        .await;
+                } else {
+                    self.fill_image_metadata(person.id, &mut infos).await;
+                }
                 if let Some(primary) = infos.first() {
                     // Added only while the person still has no Primary, by the
                     // write itself: one stored during the download is kept.
@@ -13248,7 +13299,9 @@ impl LibraryScanner {
                 height: 0,
                 blur_hash: None,
             }];
-            self.fill_image_metadata(id, &mut images).await;
+            // Saved beside the studio's own folder, as `ImageSaver` keeps it.
+            self.finish_artwork(id, &entity, &mut images, None, None)
+                .await;
             match self.persistence.save_item_images(id, &images).await {
                 Ok(()) => refreshed.push(id),
                 Err(err) => skipped.note(id, &err),
@@ -24116,7 +24169,8 @@ fn dedup_images_by_type(images: Vec<RemoteImage>) -> Vec<RemoteImage> {
 
 /// Maps TVDB credited people to persistable [`PeopleEntity`] rows. TVDB carries
 /// no numeric person provider id (so `provider_id` is `None`, and the TMDB bio
-/// enrichment skips them); their profile image URL is preserved.
+/// enrichment skips them); a series credit's profile image URL is preserved
+/// (an episode credit carries none, as the plugin's episode loop sets none).
 fn tvdb_people(people: &[ferrofin_providers::TvdbPerson]) -> Vec<PeopleEntity> {
     ferrofin_providers::episode::tvdb_people(people)
 }
@@ -24786,6 +24840,8 @@ mod trickplay;
 mod art_dir_images_tests;
 #[cfg(test)]
 mod directory_cache_tests;
+#[cfg(test)]
+mod downloaded_art_tests;
 #[cfg(test)]
 mod episode_images_tests;
 #[cfg(test)]

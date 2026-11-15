@@ -1337,8 +1337,9 @@ pub fn normalize_language(language: Option<&str>, country_code: Option<&str>) ->
 /// comma separated (`"fr,null,en"`, `"en,null"`).
 ///
 /// `TmdbMovieProvider` hands exactly this string to `FindByExternalIdAsync`'s
-/// `language` argument (`TmdbMovieProvider.cs:96-101` and `:106-111` at v10.11.8), so
-/// TMDB's `/find` sees `language=en,null` for a movie. `TmdbSeriesProvider.cs:73` passes
+/// `language` argument (`TmdbMovieProvider.cs:96-101` and `:106-111` at v10.11.8), and
+/// that method runs [`normalize_language`] over it, so TMDB's `/find` sees
+/// `language=en,null` for a movie (`pt-BR,NULL,EN` for `pt-BR`). `TmdbSeriesProvider.cs:73` passes
 /// the bare `MetadataLanguage` instead. That asymmetry is upstream's, and it is ported
 /// rather than smoothed over: `/find` is the branch an IMDb/TVDB Identify search takes,
 /// and sending TMDB a different `language` than the oracle does is how the two servers
@@ -1457,6 +1458,9 @@ pub struct TmdbCollection {
     pub name: String,
     /// The collection's overview.
     pub overview: Option<String>,
+    /// TMDB's own poster pick (`poster_path`) as an absolute URL at the
+    /// configured poster size, if it has one.
+    pub poster_url: Option<String>,
     /// Poster/backdrop candidates, TMDB's own pick first.
     pub images: Vec<RemoteImage>,
 }
@@ -1905,6 +1909,8 @@ impl TmdbClient {
                 &cfg,
             )
             .await?;
+        let poster_url = non_empty(parsed.poster_path.clone())
+            .map(|p| cfg.image_url(crate::plugin_config::TmdbImageKind::Poster, &p));
         // Preserve the legacy metadata result's single default images. The
         // remote image provider uses `collection_images` instead, because the
         // pinned source converts only the appended candidate lists.
@@ -1930,6 +1936,7 @@ impl TmdbClient {
             tmdb_id: parsed.id,
             name: parsed.name.unwrap_or_default(),
             overview: non_empty(parsed.overview),
+            poster_url,
             images,
         })
     }
@@ -2800,9 +2807,10 @@ impl TmdbClient {
         crate::image_download::download_artwork(url).await
     }
 
-    /// Downloads an image URL's bytes, or `None` on any failure.
-    pub async fn download(&self, url: &str) -> Option<Vec<u8>> {
-        crate::image_download::download_bytes(url).await
+    /// Downloads an image URL: its bytes and the media type they are stored
+    /// under, or `None` on any failure, a response that is no image included.
+    pub async fn download(&self, url: &str) -> Option<(Vec<u8>, String)> {
+        crate::image_download::download_image_or_none(url).await
     }
 }
 
