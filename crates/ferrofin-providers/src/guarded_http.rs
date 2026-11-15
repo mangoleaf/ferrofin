@@ -15,10 +15,12 @@
 //! a fetch never follows a redirect from https to http, and its clients have
 //! the provider defaults ([`crate::http_client`]).
 
-use crate::destination::{self, DestinationPolicy, DestinationRefused, PublicOnlyResolver};
+use crate::destination::{
+    self, DestinationPolicy, DestinationRefused, PublicOnlyResolver, VettedAddresses,
+};
 use crate::rate_limit::{LimitedRequest as _, RateLimiter, RequestError, request_limits};
 use std::collections::HashMap;
-use std::net::{IpAddr, SocketAddr};
+use std::net::IpAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 
@@ -179,62 +181,6 @@ pub(crate) struct GuardedHttp {
     pinned: Arc<VettedAddresses>,
     policy: Arc<dyn DestinationPolicy>,
     kind: &'static FetchKind,
-}
-
-/// The proxied client's resolver: a name resolves to the addresses
-/// [`GuardedHttp::client_for`] last vetted for it, which is where a host the
-/// proxy settings exclude is reached. A name never vetted, which is the
-/// proxy's own, gets the system's answer unchecked, since a proxy may well be
-/// private. A client per request with `resolve_to_addrs` did the same, but
-/// loaded the root certificates and connected afresh each time.
-///
-/// An entry is replaced by the next request to its host and never removed:
-/// a connection the pool finishes after its request has ended must still
-/// find it. So the map holds one entry per host fetched through the proxy.
-#[derive(Default)]
-struct VettedAddresses(Mutex<HashMap<String, Vec<SocketAddr>>>);
-
-impl VettedAddresses {
-    /// Sends `host` to `addresses`, just vetted for it, from now on. The port
-    /// is dropped: each connection takes its own URL's port. (Hosts compare
-    /// in lower case on both sides, so that a miss never falls through to the
-    /// unchecked lookup.)
-    fn pin(&self, host: &str, addresses: &[SocketAddr]) {
-        let addresses = addresses
-            .iter()
-            .map(|address| {
-                // `set_port`, not a new address: an IPv6 zone stays.
-                let mut address = *address;
-                address.set_port(0);
-                address
-            })
-            .collect();
-        self.0
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .insert(host.to_ascii_lowercase(), addresses);
-    }
-}
-
-impl reqwest::dns::Resolve for VettedAddresses {
-    fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
-        let pinned = self
-            .0
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .get(&name.as_str().to_ascii_lowercase())
-            .cloned();
-        let host = name.as_str().to_owned();
-        Box::pin(async move {
-            let addresses = match pinned {
-                Some(addresses) => addresses,
-                None => destination::lookup(&host, 0).await.map_err(|failed| {
-                    Box::new(failed) as Box<dyn std::error::Error + Send + Sync>
-                })?,
-            };
-            Ok(Box::new(addresses.into_iter()) as reqwest::dns::Addrs)
-        })
-    }
 }
 
 impl GuardedHttp {
@@ -467,39 +413,13 @@ mod tests {
         server.abort();
         assert_eq!(connections.load(Ordering::SeqCst), 1);
         // It went to the addresses vetted for the name, pinned without a port.
-        let pins = http.pinned.0.lock().expect("pins");
-        let vetted = pins.get("localhost").expect("a pin for the name");
+        let vetted = http.pinned.pinned("localhost").expect("a pin for the name");
         assert!(
             vetted
                 .iter()
                 .all(|address| address.ip().is_loopback() && address.port() == 0),
             "{vetted:?}"
         );
-    }
-
-    /// The proxied client's resolver answers a vetted name with the addresses
-    /// vetted for it, without their port, so that a request to another port
-    /// of the host still takes its own; any other name, the proxy's, with the
-    /// system's answer.
-    #[tokio::test]
-    async fn the_proxied_resolver_answers_a_vetted_name_with_its_vetted_addresses() {
-        use reqwest::dns::Resolve as _;
-        let pinned = super::VettedAddresses::default();
-        pinned.pin(
-            "Images.Example",
-            &["203.0.113.7:8080".parse().expect("address")],
-        );
-        let vetted: Vec<std::net::SocketAddr> = pinned
-            .resolve("images.example".parse().expect("name"))
-            .await
-            .expect("pinned")
-            .collect();
-        assert_eq!(vetted, ["203.0.113.7:0".parse().expect("address")]);
-        let mut proxy = pinned
-            .resolve("localhost".parse().expect("name"))
-            .await
-            .expect("the system's answer");
-        assert!(proxy.all(|address| address.ip().is_loopback()));
     }
 
     /// The proxied client reaches a named host at the addresses last pinned

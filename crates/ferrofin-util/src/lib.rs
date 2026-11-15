@@ -11,7 +11,8 @@
 //! reads a caught panic's message where upstream's `catch` reads
 //! `Exception.Message`, and [`stable_sort`] is LINQ `OrderBy`'s tolerance of a
 //! comparer that is not a total order. [`finite`] is `BaseItem.FiniteOrNull`,
-//! shared by every crate that assigns a rating or gain. With the `tokio`
+//! shared by every crate that assigns a rating or gain, and
+//! [`numeric_collation`] is the name order Jellyfin 12 sorts with. With the `tokio`
 //! feature, `keyed_locks` is the async keyed lock the C# takes from
 //! `AsyncKeyedLock`.
 
@@ -24,6 +25,7 @@ pub mod guid_extensions;
 pub mod http_client;
 #[cfg(feature = "tokio")]
 pub mod keyed_locks;
+pub mod numeric_collation;
 pub mod panic;
 pub mod path_extensions;
 pub mod path_helper;
