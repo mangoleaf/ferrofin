@@ -1953,6 +1953,10 @@ pub async fn build_app_state(
     // managers exist, and the scheduler starts after registration.
     let task_manager = FerrofinTaskManager::new();
     task_manager.set_trigger_store(config.config_dir.join("task_triggers.json"));
+    // A task with no override there takes an adopted Jellyfin's saved
+    // `{ConfigurationDirectoryPath}/ScheduledTasks/{id}.js` (read only).
+    task_manager
+        .set_jellyfin_config_path(std::path::Path::new(&paths.configuration_directory_path()));
     // Last run outcomes persist too (upstream keeps a per-task history file
     // under the data directory), so the dashboard's "Last ran" column and the
     // `LastExecutionResult` field survive a restart.
