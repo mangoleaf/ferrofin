@@ -33,22 +33,6 @@ use crate::extract::{DotnetGuid, Query};
 use crate::handlers::items::{resolve_user, user_uuid};
 use crate::state::AppState;
 
-/// Maps a library's [`CollectionTypeOptions`] to the DTO [`CollectionType`] the
-/// web client keys presentation off. `mixed` has no single type → `None` (a
-/// generic view), matching Jellyfin.
-fn map_collection_type(options: CollectionTypeOptions) -> Option<CollectionType> {
-    Some(match options {
-        CollectionTypeOptions::movies => CollectionType::movies,
-        CollectionTypeOptions::tvshows => CollectionType::tvshows,
-        CollectionTypeOptions::music => CollectionType::music,
-        CollectionTypeOptions::musicvideos => CollectionType::musicvideos,
-        CollectionTypeOptions::homevideos => CollectionType::homevideos,
-        CollectionTypeOptions::boxsets => CollectionType::boxsets,
-        CollectionTypeOptions::books => CollectionType::books,
-        CollectionTypeOptions::mixed => return None,
-    })
-}
-
 /// The collection type of every configured library, keyed by its folder item id.
 ///
 /// A `mixed` library has no single type and maps to `None` — which is still an
@@ -66,7 +50,11 @@ async fn collection_types_by_id(
                 .item_id
                 .as_deref()
                 .and_then(|s| Uuid::parse_str(s).ok())?;
-            Some((id, vf.collection_type.and_then(map_collection_type)))
+            Some((
+                id,
+                vf.collection_type
+                    .and_then(CollectionTypeOptions::collection_type),
+            ))
         })
         .collect())
 }
@@ -279,22 +267,6 @@ crate::query::query_parameters! {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn collection_type_maps_library_options_to_dto_type() {
-        // A tvshows library must surface as CollectionType::tvshows so the web
-        // client renders it as a Shows view (the bug: it was unset → generic).
-        assert_eq!(
-            map_collection_type(CollectionTypeOptions::tvshows),
-            Some(CollectionType::tvshows)
-        );
-        assert_eq!(
-            map_collection_type(CollectionTypeOptions::movies),
-            Some(CollectionType::movies)
-        );
-        // A mixed library has no single type → None (a generic view).
-        assert_eq!(map_collection_type(CollectionTypeOptions::mixed), None);
-    }
 
     #[test]
     fn user_views_can_request_hidden_views() {

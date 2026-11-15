@@ -1613,7 +1613,11 @@ impl FerrofinUserViewManager {
                     .item_id
                     .as_deref()
                     .and_then(|s| Uuid::parse_str(s).ok())?;
-                Some((id, vf.collection_type.and_then(kinds::collection_type_of)))
+                Some((
+                    id,
+                    vf.collection_type
+                        .and_then(ferrofin_model::entities::CollectionTypeOptions::collection_type),
+                ))
             })
             .collect())
     }
