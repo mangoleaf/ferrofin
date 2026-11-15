@@ -535,7 +535,9 @@ impl MergeVersionsService {
                     .await?;
             }
         }
-        tracing::info!(
+        // One per group, and the episode merge passes merged groups again on
+        // every run: the scan's line counts them at info (LOGGING.md rule 1).
+        tracing::debug!(
             merged = group.len() - 1,
             primary = %primary_id,
             "merge versions: merged alternate versions into primary"
@@ -715,6 +717,11 @@ impl MergeVersionsManager for MergeVersionsService {
             .filter(|(_, (ids, any_unmerged))| ids.len() > 1 && *any_unmerged)
             .map(|((library, _), (ids, _))| (library, ids))
             .collect();
+        tracing::info!(
+            movies = movies.len(),
+            duplicate_groups = duplicates.len(),
+            "merge versions: movie scan"
+        );
 
         for (index, (library, ids)) in duplicates.iter().enumerate() {
             report(progress, percent(index, duplicates.len()));
@@ -1546,6 +1553,20 @@ mod tests {
 
     // ---- service over a real database --------------------------------------
 
+    /// An in-memory sink for a scoped `fmt` subscriber.
+    #[derive(Clone, Default)]
+    struct Logs(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for Logs {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().expect("logs").extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
     #[tokio::test]
     async fn merge_movies_groups_by_tmdb() {
         let db = test_db().await;
@@ -1562,7 +1583,25 @@ mod tests {
         set_provider_id(&db, lonely, "Tmdb", "604").await;
         let svc = service_over(&db, FakePlugins::enabled(), Vec::new());
 
-        svc.merge_movies(None).await.expect("merge movies");
+        // gl-275: the run's info lines are its own, never one per group.
+        let logs = Logs::default();
+        {
+            let writer = logs.clone();
+            let _guard = tracing::subscriber::set_default(
+                tracing_subscriber::fmt()
+                    .with_writer(move || writer.clone())
+                    .with_ansi(false)
+                    .with_max_level(tracing::Level::INFO)
+                    .finish(),
+            );
+            svc.merge_movies(None).await.expect("merge movies");
+        }
+        let text = String::from_utf8_lossy(&logs.0.lock().expect("logs")).into_owned();
+        assert!(!text.contains("merged alternate versions"), "{text}");
+        assert!(
+            text.contains("merge versions: movie scan movies=4 duplicate_groups=1"),
+            "{text}"
+        );
 
         // a (widest) is the primary; b links to it; the rest are untouched.
         assert_eq!(primary_of(&db, &svc, a).await, None);

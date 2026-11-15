@@ -8,7 +8,9 @@
 //! progress, and — once [`FerrofinTaskManager::start_scheduler`] is called —
 //! fires each task's configured triggers on its own. Trigger overrides set via
 //! [`FerrofinTaskManager::set_triggers`] persist to a JSON file (the C# stores a
-//! `<key>.js` per task; one file for the whole map is equivalent and simpler).
+//! `{id}.js` per task; one file for the whole map is equivalent and simpler),
+//! and so do run outcomes. An adopted Jellyfin's own per-task files are read,
+//! never written, for a task those stores know nothing of.
 //!
 //! Reused verbatim from `ferrofin-model`: [`TaskInfo`], [`TaskResult`],
 //! [`TaskState`], [`TaskCompletionStatus`], [`TaskTriggerInfo`] — no new DTOs
@@ -118,9 +120,14 @@ struct Registration {
     id: String,
     state: TaskState,
     last_result: Option<TaskResult>,
-    /// Triggers set via [`FerrofinTaskManager::set_triggers`], overriding the
-    /// task's [`default_triggers`](ScheduledTask::default_triggers). `None`
-    /// until a client configures them.
+    /// An adopted Jellyfin's last result, shown while this task has none of
+    /// its own. Kept apart so no interval trigger anchors on it: an adopted
+    /// install's tasks keep the first-run spread instead of all firing at once.
+    adopted_result: Option<TaskResult>,
+    /// Triggers set via [`FerrofinTaskManager::set_triggers`] (or restored
+    /// from the trigger store, else an adopted Jellyfin's file), overriding
+    /// the task's [`default_triggers`](ScheduledTask::default_triggers).
+    /// `None` until a client configures them.
     triggers_override: Option<Vec<TaskTriggerInfo>>,
     /// The current run's live progress handle and token (meaningful while
     /// not `Idle`).
@@ -221,7 +228,10 @@ impl Registration {
                 .reported()
                 .filter(|_| self.state != TaskState::Idle),
             id: Some(self.id.clone()),
-            last_execution_result: self.last_result.clone(),
+            last_execution_result: self
+                .last_result
+                .clone()
+                .or_else(|| self.adopted_result.clone()),
             triggers: self.effective_triggers(),
             is_hidden: self.task.is_hidden(),
             key: Some(key),
@@ -307,6 +317,13 @@ pub struct FerrofinTaskManager {
     stored_results: Arc<Mutex<HashMap<String, TaskResult>>>,
     /// Where run outcomes persist (`None` = in-memory only).
     result_store_path: Arc<Mutex<Option<PathBuf>>>,
+    /// An adopted Jellyfin's history directory (`{DataPath}/ScheduledTasks`),
+    /// read for a task the history store has no result for (`None` = unset).
+    jellyfin_history_dir: Arc<Mutex<Option<PathBuf>>>,
+    /// An adopted Jellyfin's trigger directory
+    /// (`{ConfigurationDirectoryPath}/ScheduledTasks`), read for a task the
+    /// trigger store has no override for (`None` = unset).
+    jellyfin_triggers_dir: Arc<Mutex<Option<PathBuf>>>,
     /// Whether [`start_scheduler`](Self::start_scheduler) has run. A task
     /// registered *after* that moment fires its own `StartupTrigger` on
     /// registration (upstream arms each task's triggers when its worker is
@@ -458,8 +475,9 @@ fn adopt_renamed_keys<T>(map: &mut HashMap<String, T>, adopt: impl Fn(&mut T, &s
     }
 }
 
-/// Reads a JSON store written by [`write_store`], returning an empty map when
-/// the file does not exist (a first boot) and warning — loudly, as upstream's
+/// Reads a JSON store written by [`write_store`] (or an adopted Jellyfin's
+/// per-task file), returning `T::default()` when the file does not exist (a
+/// first boot) or is empty, and warning — loudly, as upstream's
 /// `Error deserializing {File}` does — when it exists but cannot be parsed, so
 /// a corrupt store is never mistaken for "nothing has run yet".
 fn read_store<T: serde::de::DeserializeOwned + Default>(path: &std::path::Path, store: &str) -> T {
@@ -483,6 +501,33 @@ fn read_store<T: serde::de::DeserializeOwned + Default>(path: &std::path::Path, 
         );
         T::default()
     })
+}
+
+/// Reads an adopted Jellyfin's per-task file `{dir}/{new Guid(Id)}.js` for
+/// the task whose wire id is `id`, as [`read_store`] does; `T::default()` when
+/// `dir` is unset.
+fn read_jellyfin_task_file<T: serde::de::DeserializeOwned + Default>(
+    dir: &Mutex<Option<PathBuf>>,
+    id: &str,
+    store: &str,
+) -> T {
+    let Some(dir) = lock(dir).clone() else {
+        return T::default();
+    };
+    // `new Guid(Id)`: the 32-digit id in its dashed form.
+    let Ok(guid) = uuid::Uuid::parse_str(id) else {
+        return T::default();
+    };
+    read_store(&dir.join(format!("{}.js", guid.hyphenated())), store)
+}
+
+/// A trigger no `ITaskTrigger` exists for: C#'s `GetTrigger` throws for an
+/// unnamed trigger type, and a weekly trigger with an impossible weekday
+/// fails while computing its next date.
+fn unusable_trigger(trigger: &TaskTriggerInfo) -> bool {
+    matches!(trigger.type_, TaskTriggerInfoType::Unrecognized(_))
+        || (trigger.type_ == TaskTriggerInfoType::WeeklyTrigger
+            && matches!(trigger.day_of_week, Some(DayOfWeek::Unrecognized(_))))
 }
 
 impl FerrofinTaskManager {
@@ -525,7 +570,9 @@ impl FerrofinTaskManager {
     ///
     /// Call before [`register`](Self::register). A missing file is treated as
     /// empty (first boot); an unparseable one is warned about and treated as
-    /// empty, rather than silently resetting every configured schedule.
+    /// empty, rather than silently resetting every configured schedule. A task
+    /// this store has no override for falls back to an adopted Jellyfin's own
+    /// file (see [`set_jellyfin_config_path`](Self::set_jellyfin_config_path)).
     pub fn set_trigger_store(&self, path: PathBuf) {
         let mut overrides: HashMap<String, Vec<TaskTriggerInfo>> =
             read_store(&path, "task triggers");
@@ -563,13 +610,9 @@ impl FerrofinTaskManager {
     /// empty. Port of upstream's per-task history file
     /// (`{DataPath}/ScheduledTasks/{id}.js`, read back into
     /// `ScheduledTaskWorker.LastExecutionResult`); one file for the whole map
-    /// is equivalent and simpler, matching the trigger store next to it.
-    ///
-    /// Accepted divergence for drop-in adoption: upstream names those files by
-    /// the MD5 of the task *type*, so a data directory adopted from a real
-    /// Jellyfin install starts with an empty "Last ran" column here — each
-    /// task fills it in on its first Ferrofin run. Nothing is lost: Jellyfin's
-    /// own files stay untouched for a swap back.
+    /// is equivalent and simpler, matching the trigger store next to it. A
+    /// task this store has no result for falls back to an adopted Jellyfin's
+    /// own file (see [`set_jellyfin_data_path`](Self::set_jellyfin_data_path)).
     pub fn set_result_store(&self, path: PathBuf) {
         let mut results: HashMap<String, TaskResult> = read_store(&path, "task history");
         adopt_renamed_keys(&mut results, |result, key, name| {
@@ -578,6 +621,57 @@ impl FerrofinTaskManager {
         });
         *lock(&self.stored_results) = results;
         *lock(&self.result_store_path) = Some(path);
+    }
+
+    /// Points the registry at the server's `DataPath`, where an adopted
+    /// Jellyfin kept each task's last run in `ScheduledTasks/{id}.js`.
+    ///
+    /// Call before [`register`](Self::register). A task the history store has
+    /// no result for answers that file's as its `LastExecutionResult`, until
+    /// it runs here: upstream's getter reads
+    /// `{DataPath}/ScheduledTasks/{new Guid(Id)}.js` once, skipping an empty
+    /// or malformed file. The file is only read, never written: adoption is
+    /// one-way and Jellyfin's files stay as they are. The result is only
+    /// shown: interval triggers treat the task as never run here, so an
+    /// adopted install keeps the first-run spread (see
+    /// `FIRST_RUN_SPREAD_MINUTES`).
+    pub fn set_jellyfin_data_path(&self, data_path: &std::path::Path) {
+        *lock(&self.jellyfin_history_dir) = Some(data_path.join("ScheduledTasks"));
+    }
+
+    /// Points the registry at the server's `ConfigurationDirectoryPath`, where
+    /// an adopted Jellyfin kept the triggers its dashboard saved for a task in
+    /// `ScheduledTasks/{id}.js`.
+    ///
+    /// Call before [`register`](Self::register). A task the trigger store has
+    /// no override for takes that file's triggers, until triggers are saved
+    /// here: upstream's `LoadTriggerSettings` reads
+    /// `{ConfigurationDirectoryPath}/ScheduledTasks/{new Guid(Id)}.js`, drops
+    /// its `null` entries, and falls back to the task's defaults when there is
+    /// no file or it holds `null`. The file is only read, never written.
+    pub fn set_jellyfin_config_path(&self, config_path: &std::path::Path) {
+        *lock(&self.jellyfin_triggers_dir) = Some(config_path.join("ScheduledTasks"));
+    }
+
+    /// The triggers an adopted Jellyfin saved for the task `key`, whose wire
+    /// id is `id`, or `None` for the task's defaults.
+    ///
+    /// A file Ferrofin cannot use, malformed or naming a trigger type or
+    /// weekday no trigger has, is skipped with a warning: upstream's read
+    /// throws there and Jellyfin does not start.
+    fn jellyfin_triggers(&self, key: &str, id: &str) -> Option<Vec<TaskTriggerInfo>> {
+        let saved: Option<Vec<Option<TaskTriggerInfo>>> =
+            read_jellyfin_task_file(&self.jellyfin_triggers_dir, id, "Jellyfin task triggers");
+        let triggers: Vec<TaskTriggerInfo> = saved?.into_iter().flatten().collect();
+        if triggers.iter().any(unusable_trigger) {
+            tracing::warn!(
+                task = key,
+                "an adopted Jellyfin trigger file names an unknown trigger type or weekday; \
+                 using the task's default triggers"
+            );
+            return None;
+        }
+        Some(triggers)
     }
 
     /// Records a task's last run outcome in the history store and persists it,
@@ -600,21 +694,32 @@ impl FerrofinTaskManager {
     ///
     /// Mirrors the C# `AddTasks`: the new registration starts
     /// [`Idle`](TaskState::Idle), picking up any persisted trigger override
-    /// **and** last run result for its key. If the scheduler is already
-    /// running and the task has a `StartupTrigger`, that trigger fires here —
+    /// **and** last run result for its key (else an adopted Jellyfin's, see
+    /// [`set_jellyfin_config_path`](Self::set_jellyfin_config_path) and
+    /// [`set_jellyfin_data_path`](Self::set_jellyfin_data_path)). If the
+    /// scheduler is already running and the task has a `StartupTrigger`, that
+    /// trigger fires here —
     /// upstream arms a task's triggers when its worker is constructed, so a
     /// task registered late (after
     /// [`start_scheduler`](Self::start_scheduler)) must not silently lose its
     /// startup run.
     pub fn register(&self, task: Arc<dyn ScheduledTask>) {
         let key = task.key().to_string();
-        let triggers_override = lock(&self.stored_overrides).get(&key).cloned();
+        let id = ferrofin_traits::tasks::task_id_for_key(&key);
+        let stored_triggers = lock(&self.stored_overrides).get(&key).cloned();
+        let triggers_override = stored_triggers.or_else(|| self.jellyfin_triggers(&key, &id));
         let last_result = lock(&self.stored_results).get(&key).cloned();
+        let adopted_result = if last_result.is_none() {
+            read_jellyfin_task_file(&self.jellyfin_history_dir, &id, "Jellyfin task history")
+        } else {
+            None
+        };
         let mut registration = Registration {
-            id: ferrofin_traits::tasks::task_id_for_key(&key),
+            id,
             task,
             state: TaskState::Idle,
             last_result,
+            adopted_result,
             triggers_override,
             progress: TaskProgress::default(),
             run: None,
@@ -1227,13 +1332,7 @@ impl FerrofinTaskManager {
         key: &str,
         triggers: &[TaskTriggerInfo],
     ) -> Result<(), ServiceError> {
-        // C# GetTrigger throws for unnamed trigger types; a weekly trigger
-        // with an impossible weekday also fails while computing its next date.
-        if triggers.iter().any(|trigger| {
-            matches!(trigger.type_, TaskTriggerInfoType::Unrecognized(_))
-                || (trigger.type_ == TaskTriggerInfoType::WeeklyTrigger
-                    && matches!(trigger.day_of_week, Some(DayOfWeek::Unrecognized(_))))
-        }) {
+        if triggers.iter().any(unusable_trigger) {
             return Err(ServiceError::backend(
                 "unrecognized task trigger type or weekday",
             ));
@@ -3552,6 +3651,239 @@ mod tests {
             .last_execution_result
             .expect("restored result");
         assert_eq!(restored.status, TaskCompletionStatus::Cancelled);
+    }
+
+    /// What Jellyfin 12.4 wrote for its "Scan Media Library" run on a fresh
+    /// install, verbatim.
+    const JELLYFIN_HISTORY: &str = r#"{"StartTimeUtc":"2026-11-04T07:54:06.825283Z","EndTimeUtc":"2026-11-04T07:54:07.7650739Z","Status":"Completed","Name":"Scan Media Library","Key":"RefreshLibrary","Id":"7738148ffcd07979c7ceb148e06b3aed"}"#;
+
+    /// Writes `body` where Jellyfin keeps that task's file under `root` (its
+    /// history under `DataPath`, its saved triggers under
+    /// `ConfigurationDirectoryPath`), returning the file.
+    fn write_jellyfin_task_file(root: &std::path::Path, body: &[u8]) -> std::path::PathBuf {
+        let dir = root.join("ScheduledTasks");
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let file = dir.join("7738148f-fcd0-7979-c7ce-b148e06b3aed.js");
+        std::fs::write(&file, body).expect("write");
+        file
+    }
+
+    /// An adopted Jellyfin's history file answers a task's last result until
+    /// the task runs here; from then on Ferrofin's own result wins, across a
+    /// restart, and the file is never written.
+    #[tokio::test]
+    async fn an_adopted_jellyfin_history_file_answers_until_the_task_runs_here() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let data = dir.path().join("data");
+        let file = write_jellyfin_task_file(&data, JELLYFIN_HISTORY.as_bytes());
+        let store = dir.path().join("task_results.json");
+        let boot = |mgr: &FerrofinTaskManager| {
+            mgr.set_result_store(store.clone());
+            mgr.set_jellyfin_data_path(&data);
+            mgr.register(Arc::new(KeyedTask("RefreshLibrary")));
+        };
+
+        let mgr = FerrofinTaskManager::new();
+        boot(&mgr);
+        let info = mgr.get("RefreshLibrary").expect("info");
+        assert_eq!(info.id.as_deref(), Some("7738148ffcd07979c7ceb148e06b3aed"));
+        let imported = info.last_execution_result.expect("Jellyfin's result");
+        assert_eq!(imported.status, TaskCompletionStatus::Completed);
+        assert_eq!(imported.name.as_deref(), Some("Scan Media Library"));
+        assert_eq!(imported.key.as_deref(), Some("RefreshLibrary"));
+        assert_eq!(
+            imported.id.as_deref(),
+            Some("7738148ffcd07979c7ceb148e06b3aed")
+        );
+        assert_eq!(
+            imported.end_time_utc,
+            Utc.with_ymd_and_hms(2026, 11, 4, 7, 54, 7).unwrap()
+                + chrono::Duration::nanoseconds(765_073_900)
+        );
+        assert!(imported.error_message.is_none());
+
+        mgr.run_now("RefreshLibrary").await.expect("run");
+        let own = mgr
+            .get("RefreshLibrary")
+            .expect("info")
+            .last_execution_result
+            .expect("own result");
+        assert!(own.start_time_utc > imported.end_time_utc);
+
+        let restarted = FerrofinTaskManager::new();
+        boot(&restarted);
+        let after_restart = restarted
+            .get("RefreshLibrary")
+            .expect("info")
+            .last_execution_result
+            .expect("restored result");
+        assert_eq!(
+            (after_restart.start_time_utc - own.start_time_utc).num_milliseconds(),
+            0
+        );
+        assert_eq!(
+            std::fs::read(&file).expect("read"),
+            JELLYFIN_HISTORY.as_bytes()
+        );
+    }
+
+    /// An adopted result is shown but anchors no interval trigger: an overdue
+    /// task keeps the never-run first-run spread instead of firing on the
+    /// first sweep with every other adopted task.
+    #[tokio::test]
+    async fn an_adopted_result_does_not_make_an_interval_task_due() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_jellyfin_task_file(dir.path(), JELLYFIN_HISTORY.as_bytes());
+        let mgr = FerrofinTaskManager::new();
+        mgr.set_jellyfin_data_path(dir.path());
+        mgr.register(Arc::new(KeyedTask("RefreshLibrary")));
+        let hourly = TaskTriggerInfo {
+            type_: TaskTriggerInfoType::IntervalTrigger,
+            interval_ticks: Some(3600 * TICKS_PER_SECOND),
+            ..TaskTriggerInfo::default()
+        };
+        mgr.set_triggers("RefreshLibrary", &[hourly]).expect("set");
+        let adopted = mgr
+            .get("RefreshLibrary")
+            .expect("info")
+            .last_execution_result;
+        assert!(adopted.is_some(), "the adopted result is shown");
+        let settle = || tokio::time::sleep(std::time::Duration::from_millis(20));
+
+        let now = Utc::now();
+        mgr.scheduler_sweep(now, now);
+        settle().await;
+        let info = mgr.get("RefreshLibrary").expect("info");
+        assert_eq!(info.state, TaskState::Idle);
+        assert_eq!(info.last_execution_result, adopted);
+
+        // Once its spread slot has passed it runs, and its own result shows.
+        let later = now + first_run_delay("RefreshLibrary");
+        mgr.scheduler_sweep(now, later);
+        let own = idle_result(&mgr, "RefreshLibrary").await;
+        assert_ne!(Some(own), adopted);
+    }
+
+    /// An empty or malformed Jellyfin history file is skipped, as upstream's
+    /// read skips it, and the task still registers.
+    #[test]
+    fn an_unreadable_jellyfin_history_file_is_skipped() {
+        for body in [&b""[..], b"{not json"] {
+            let dir = tempfile::tempdir().expect("tempdir");
+            write_jellyfin_task_file(dir.path(), body);
+            let mgr = FerrofinTaskManager::new();
+            mgr.set_jellyfin_data_path(dir.path());
+            mgr.register(Arc::new(KeyedTask("RefreshLibrary")));
+            let info = mgr.get("RefreshLibrary").expect("registered");
+            assert!(info.last_execution_result.is_none(), "{body:?}");
+        }
+    }
+
+    /// A history file missing a time or the status reads them as upstream's
+    /// `JsonSerializer` does: `DateTime.MinValue` and `Completed`.
+    #[test]
+    fn a_jellyfin_history_file_missing_members_reads_their_defaults() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_jellyfin_task_file(dir.path(), br#"{"Name":"Scan Media Library"}"#);
+        let mgr = FerrofinTaskManager::new();
+        mgr.set_jellyfin_data_path(dir.path());
+        mgr.register(Arc::new(KeyedTask("RefreshLibrary")));
+        let result = mgr
+            .get("RefreshLibrary")
+            .expect("info")
+            .last_execution_result
+            .expect("result");
+        let min = ferrofin_model::json::datetime::dotnet_min();
+        assert_eq!(
+            (result.start_time_utc, result.end_time_utc, result.status),
+            (min, min, TaskCompletionStatus::Completed)
+        );
+        assert_eq!(result.name.as_deref(), Some("Scan Media Library"));
+    }
+
+    /// What Jellyfin 12.4 saved for "Scan Media Library" after its dashboard
+    /// set a weekly and an interval trigger, verbatim.
+    const JELLYFIN_TRIGGERS: &str = r#"[{"Type":"WeeklyTrigger","TimeOfDayTicks":36000000000,"DayOfWeek":"Tuesday","MaxRuntimeTicks":72000000000},{"Type":"IntervalTrigger","IntervalTicks":216000000000}]"#;
+
+    /// An adopted Jellyfin's saved triggers are the task's until they are
+    /// saved here; from then on Ferrofin's own win, across a restart, and the
+    /// file is never written.
+    #[tokio::test]
+    async fn an_adopted_jellyfin_trigger_file_applies_until_triggers_are_saved_here() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = dir.path().join("config");
+        let file = write_jellyfin_task_file(&config, JELLYFIN_TRIGGERS.as_bytes());
+        let store = config.join("task_triggers.json");
+        let boot = |mgr: &FerrofinTaskManager| {
+            mgr.set_trigger_store(store.clone());
+            mgr.set_jellyfin_config_path(&config);
+            mgr.register(Arc::new(KeyedTask("RefreshLibrary")));
+        };
+
+        let mgr = FerrofinTaskManager::new();
+        boot(&mgr);
+        let adopted: Vec<TaskTriggerInfo> =
+            serde_json::from_str(JELLYFIN_TRIGGERS).expect("triggers");
+        assert_eq!(mgr.get("RefreshLibrary").expect("info").triggers, adopted);
+        assert_eq!(
+            adopted[0].day_of_week,
+            Some(ferrofin_model::dto::DayOfWeek::Tuesday)
+        );
+
+        let own = vec![TaskTriggerInfo {
+            type_: TaskTriggerInfoType::StartupTrigger,
+            ..TaskTriggerInfo::default()
+        }];
+        mgr.set_triggers("RefreshLibrary", &own).expect("set");
+        let restarted = FerrofinTaskManager::new();
+        boot(&restarted);
+        assert_eq!(restarted.get("RefreshLibrary").expect("info").triggers, own);
+        assert_eq!(
+            std::fs::read(&file).expect("read"),
+            JELLYFIN_TRIGGERS.as_bytes()
+        );
+    }
+
+    /// `LoadTriggerSettings`: a `null` file means the defaults, a `null`
+    /// entry is dropped and `[]` means no triggers. A file Ferrofin cannot
+    /// use (malformed, or naming a trigger type or weekday no trigger has) is
+    /// skipped for the defaults, where upstream fails to start.
+    #[rstest::rstest]
+    #[case::null_file(b"null", &[TaskTriggerInfoType::StartupTrigger])]
+    #[case::null_entry(
+        br#"[null,{"Type":"IntervalTrigger","IntervalTicks":36000000000}]"#,
+        &[TaskTriggerInfoType::IntervalTrigger]
+    )]
+    #[case::empty_list(b"[]", &[])]
+    #[case::empty_file(b"", &[TaskTriggerInfoType::StartupTrigger])]
+    #[case::malformed(b"{not json", &[TaskTriggerInfoType::StartupTrigger])]
+    #[case::unnamed_type_name(br#"[{"Type":"BogusTrigger"}]"#, &[TaskTriggerInfoType::StartupTrigger])]
+    #[case::unnamed_type_value(br#"[{"Type":7}]"#, &[TaskTriggerInfoType::StartupTrigger])]
+    #[case::unnamed_weekday(
+        br#"[{"Type":"WeeklyTrigger","DayOfWeek":9}]"#,
+        &[TaskTriggerInfoType::StartupTrigger]
+    )]
+    fn an_adopted_jellyfin_trigger_file_is_read_as_upstream_reads_it(
+        #[case] body: &[u8],
+        #[case] types: &[TaskTriggerInfoType],
+    ) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let id = ferrofin_traits::tasks::task_id_for_key("startup");
+        let name = uuid::Uuid::parse_str(&id)
+            .expect("id")
+            .hyphenated()
+            .to_string();
+        let tasks = dir.path().join("ScheduledTasks");
+        std::fs::create_dir_all(&tasks).expect("mkdir");
+        std::fs::write(tasks.join(format!("{name}.js")), body).expect("write");
+        let mgr = FerrofinTaskManager::new();
+        mgr.set_jellyfin_config_path(dir.path());
+        mgr.register(Arc::new(StartupTask {
+            runs: Arc::new(AtomicU32::new(0)),
+        }));
+        let triggers = mgr.get("startup").expect("registered").triggers;
+        let got: Vec<_> = triggers.iter().map(|t| t.type_).collect();
+        assert_eq!(got, types);
     }
 
     /// A restart must not reset the interval clock.

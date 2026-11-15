@@ -792,6 +792,16 @@ fn extractor_and_local_providers() -> Vec<Provider> {
             images: NO_IMAGES,
         },
         Provider {
+            // `LyricManager.GetSupportedProviders` is `item is Audio`, which
+            // takes `AudioBook : Audio` too.
+            name: crate::lrclib::PROVIDER_NAME,
+            caps: &[Cap::Lyric],
+            types: &["Audio", "AudioBook"],
+            default_enabled: true,
+            compiled: true,
+            images: NO_IMAGES,
+        },
+        Provider {
             name: "Local Images",
             caps: &[Cap::LocalImage],
             types: &[],
@@ -1068,8 +1078,14 @@ pub fn library_options_info(
         provs
             .iter()
             .filter(|p| p.compiled && p.caps.contains(&cap))
+            // Upstream takes every list from the representative types' plugin
+            // summaries only (`LibraryController.cs:876-879`). shortcut: the
+            // saver list stays unfiltered until the `Nfo` row's types match
+            // upstream's savers, and the handler replaces the media-segment
+            // list unfiltered (gl-1830).
             .filter(|p| {
-                cap != Cap::LocalMetadata || item_types.iter().any(|kind| p.applies_to(kind))
+                !matches!(cap, Cap::LocalMetadata | Cap::Subtitle | Cap::Lyric)
+                    || item_types.iter().any(|kind| p.applies_to(kind))
             })
             // The saver/reader lists are not per-type, so the saver rule sees
             // the whole request (C# `IsSaverEnabledByDefault(name, itemTypes,
@@ -1786,22 +1802,42 @@ mod tests {
         );
     }
 
-    /// jellyfin-web saves the advertised name in a library's
-    /// `DisabledSubtitleFetchers` and `SubtitleFetcherOrder`, which the
-    /// subtitle manager compares with the provider's `name()`.
-    #[cfg(feature = "opensubtitles")]
-    #[test]
-    fn advertised_subtitle_fetcher_is_the_provider_name() {
-        let info = library_options_info(&["Movie".to_owned()], false, &[], &[]);
-        let names: Vec<_> = info
-            .subtitle_fetchers
-            .iter()
-            .filter_map(|o| o.name.as_deref())
-            .collect();
-        assert!(
-            names.contains(&crate::opensubtitles::PLUGIN_NAME),
-            "{names:?}"
-        );
+    /// `GetLibraryOptionsInfo` lists only the plugins of the library's
+    /// representative types (`LibraryController.cs:876-879`), each ticked: the
+    /// lyric providers for `Audio` and `AudioBook`
+    /// (`LyricManager.GetSupportedProviders`), the subtitle providers for
+    /// `Movie` and `Episode` (`SubtitleManager.GetSupportedProviders`).
+    /// jellyfin-web saves these names in `DisabledLyricFetchers` and
+    /// `LyricFetcherOrder`, which the lyric manager compares with the
+    /// provider's `name()`.
+    #[rstest::rstest]
+    #[case::music(&["MusicArtist", "MusicAlbum", "Audio", "MusicVideo"], &[crate::lrclib::PROVIDER_NAME], &[])]
+    #[case::books(&["Book", "AudioBook"], &[crate::lrclib::PROVIDER_NAME], &[])]
+    #[case::movies(&["Movie"], &[], &[crate::opensubtitles::PLUGIN_NAME])]
+    #[case::tvshows(&["Series", "Season", "Episode"], &[], &[crate::opensubtitles::PLUGIN_NAME])]
+    #[case::homevideos(&["Video", "Photo"], &[], &[])]
+    fn lyric_and_subtitle_fetchers_follow_the_library_types(
+        #[case] types: &[&str],
+        #[case] lyric: &[&str],
+        #[case] subtitle: &[&str],
+    ) {
+        let types: Vec<String> = types.iter().map(|t| (*t).to_owned()).collect();
+        let listed = |list: &[ferrofin_model::configuration::LibraryOptionInfoDto]| {
+            list.iter()
+                .map(|o| (o.name.clone().unwrap_or_default(), o.default_enabled))
+                .collect::<Vec<_>>()
+        };
+        let ticked = |names: &[&str]| {
+            names
+                .iter()
+                .map(|n| ((*n).to_owned(), true))
+                .collect::<Vec<_>>()
+        };
+        for is_new_library in [true, false] {
+            let info = library_options_info(&types, is_new_library, &[], &[]);
+            assert_eq!(listed(&info.lyric_fetchers), ticked(lyric));
+            assert_eq!(listed(&info.subtitle_fetchers), ticked(subtitle));
+        }
     }
 
     /// `SupportedImageTypes` is the union of the compiled image providers'
@@ -2163,6 +2199,18 @@ mod tests {
             "{:?}",
             audiobook.plugins
         );
+        // `GetPluginSummary` adds the lyric providers for `item is Audio` only.
+        let lyric_types: Vec<_> = plugins
+            .iter()
+            .filter(|s| {
+                s.plugins.iter().any(|p| {
+                    p.name.as_deref() == Some(crate::lrclib::PROVIDER_NAME)
+                        && p.type_ == MetadataPluginType::LyricFetcher
+                })
+            })
+            .filter_map(|s| s.item_type.as_deref())
+            .collect();
+        assert_eq!(lyric_types, ["Audio", "AudioBook"]);
     }
 
     /// `typeOptions?.MetadataFetcherOrder ?? globalMetadataOptions.

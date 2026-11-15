@@ -263,6 +263,7 @@ impl QuickConnect for OkQuickConnect {
         _secret: &str,
     ) -> Result<AuthenticationResultData, ServiceError> {
         Ok(AuthenticationResultData {
+            user: UserDto::default(),
             session: SessionInfoDto {
                 user_id: ADMIN_ID,
                 user_name: Some("admin".to_owned()),
@@ -288,13 +289,6 @@ impl SessionManager for NoopSessions {
         _remote_endpoint: &str,
         _user: Option<&UserEntity>,
     ) -> Result<SessionInfoDto, ServiceError> {
-        unimplemented!("fake")
-    }
-    async fn update_device_name(
-        &self,
-        _session_id: &str,
-        _reported_device_name: &str,
-    ) -> Result<(), ServiceError> {
         unimplemented!("fake")
     }
     async fn on_playback_start(&self, _info: &PlaybackStartInfo) -> Result<(), ServiceError> {
