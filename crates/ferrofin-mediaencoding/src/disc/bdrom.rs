@@ -11,7 +11,7 @@
 //! `.clpi`, which is all the file list depends on. A playlist's stream table
 //! and chapter marks, and a clip-info file's body, are not read, so a disc
 //! damaged only there plays here where BDInfo throws on the whole disc. The
-//! probe half of disc-rip support (gl-87) extends this reader with them.
+//! Blu-ray probe (gl-1834) extends this reader with them.
 
 use std::collections::HashMap;
 use std::io::Read as _;
