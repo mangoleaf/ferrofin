@@ -76,26 +76,40 @@ pub(crate) async fn run_item_refresh(state: &AppState, item_id: Uuid) -> Result<
     Ok(())
 }
 
-/// Runs a refresh a handler awaits on a task of its own, so a client that
-/// hangs up does not stop it (upstream's `CancellationToken.None`). The task
-/// keeps the request's span (the request awaits it, LOGGING.md §4) and its
-/// culture, which a spawned task does not inherit.
-pub(crate) async fn run_detached<T: Send + 'static>(
-    refresh: impl std::future::Future<Output = Result<T, ferrofin_traits::error::ServiceError>>
-    + Send
-    + 'static,
-) -> Result<T, ApiError> {
+/// Runs work a handler awaits on a task of its own, so a client that hangs up
+/// does not stop it: upstream passes `CancellationToken.None`, or no token,
+/// and never reads `RequestAborted`. The task keeps the request's span (the
+/// request awaits it, LOGGING.md §4) and its culture, which a spawned task
+/// does not inherit (.NET's `ExecutionContext` flows it). Once the client has
+/// gone, no answer carries the work's error, so the task logs it as the
+/// error boundary would have (LOGGING.md §2).
+pub(crate) async fn run_detached<T, E>(
+    work: impl std::future::Future<Output = Result<T, E>> + Send + 'static,
+) -> Result<T, ApiError>
+where
+    T: Send + 'static,
+    E: Into<ApiError> + Send + 'static,
+{
+    let (answer, answered) = tokio::sync::oneshot::channel();
     let culture = ferrofin_util::current_culture::capture();
     tokio::spawn(tracing::Instrument::in_current_span(
-        ferrofin_util::current_culture::scope(culture, refresh),
-    ))
-    .await
-    .map_err(|err| {
-        ApiError::Service(ferrofin_traits::error::ServiceError::backend(format!(
-            "refresh task failed: {err}"
-        )))
-    })?
-    .map_err(ApiError::from)
+        ferrofin_util::current_culture::scope(culture, async move {
+            if let Err(Err(error)) = answer.send(work.await.map_err(Into::into)) {
+                // The client has gone: building its answer logs a 5xx once, as
+                // the error boundary does for a client still connected.
+                drop(axum::response::IntoResponse::into_response(error));
+            }
+        }),
+    ));
+    // No answer: the work panicked, which the panic hook logged (LOGGING.md §7),
+    // or the shutdown dropped it.
+    answered.await.unwrap_or_else(|_| {
+        Err(ApiError::Service(
+            ferrofin_traits::error::ServiceError::backend(
+                "the request's task stopped before it answered",
+            ),
+        ))
+    })
 }
 
 pub mod activity_log;
@@ -3832,7 +3846,9 @@ pub const VERIFIED: &[Verified] = &[
         upstream_method: "UpdateNamedConfiguration",
         ferrofin: "handlers/config.rs update_named_configuration (RequiredRouteString key: \
                ConvertEmptyStringToNull, then [Required]; normalize_named_configuration: \
-               GetConfigurationType and Deserialize) → save_named_configuration \
+               GetConfigurationType and Deserialize) → save_named_configuration, on \
+               handlers.rs run_detached's task so it finishes for a client that hangs up, in \
+               the request's span and culture \
                (BaseConfigurationManager.SaveConfiguration: the validating store, the write, \
                the live network policy (ferrofin-networking NetworkManager::update_settings: \
                UpdateSettings, warning of each LAN or exclusion entry InitializeLan ignores \
@@ -5157,8 +5173,9 @@ pub const VERIFIED: &[Verified] = &[
                NotFound()'s ProblemDetails 404; every other failure answered as \
                ExceptionMiddleware answers a throw, its status with text/plain \"Error \
                processing request.\" (error.rs into_exception_response); the delete and the \
-               refresh on a task of their own, as upstream finishes them for a client that \
-               hangs up) → ferrofin-core subtitle_manager.rs delete_subtitles \
+               refresh on handlers.rs run_detached's task, in the request's span and culture, \
+               as upstream finishes them for a client that hangs up, logging a failure no \
+               answer carries) → ferrofin-core subtitle_manager.rs delete_subtitles \
                (SubtitleManager.DeleteSubtitles: GetMediaStreams for the subtitle stream at \
                index, none or one with no or an empty path the 400; a row not marked \
                external is skipped too, which changes no answer, since neither server stores \
@@ -5500,8 +5517,9 @@ pub const VERIFIED: &[Verified] = &[
                id) → MetadataRefreshOptions \
                with FullRefresh for metadata and images, ReplaceAllMetadata, \
                RemoveOldMetadata, ReplaceAllImages = replaceAllImages and SearchResult = the \
-               body → LibraryManager::refresh_full_item (RefreshFullItem) awaited on a \
-               task of its own (CancellationToken.None), routed by ferrofin-core \
+               body → LibraryManager::refresh_full_item (RefreshFullItem) awaited on \
+               handlers.rs run_detached's task (CancellationToken.None; the request's span \
+               and culture, a failure after a hang-up logged), routed by ferrofin-core \
                library_manager/item_refresh.rs identify_target: an item with a path \
                through run_refresh_scan of scan_target in the scan queue's priority lane \
                (RefreshItem: the item, then ValidateChildren with the same options, so a \
@@ -6255,4 +6273,32 @@ pub fn register(router: Router<AppState>) -> Router<AppState> {
     // The session WebSocket (`/socket`) — not in the OpenAPI contract; jellyfin-web
     // needs it to establish a connection or it reports "Connection Failure".
     websocket::register(router)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::run_detached;
+
+    /// The detached work runs inside the request's span, so its logs and
+    /// spans stay under `http_request` (LOGGING.md §4), and under the
+    /// request's culture.
+    #[tokio::test]
+    async fn detached_work_keeps_the_requests_span_and_culture() {
+        use tracing::Instrument as _;
+        let _subscriber = tracing::subscriber::set_default(tracing_subscriber::registry());
+        let span = tracing::info_span!("http_request");
+        let seen = ferrofin_util::current_culture::scope(
+            "sv".to_owned(),
+            run_detached(async {
+                let span = tracing::Span::current()
+                    .metadata()
+                    .map(tracing::Metadata::name);
+                Ok::<_, crate::error::ApiError>((span, ferrofin_util::current_culture::capture()))
+            }),
+        )
+        .instrument(span)
+        .await
+        .expect("ran");
+        assert_eq!(seen, (Some("http_request"), "sv".to_owned()));
+    }
 }

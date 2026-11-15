@@ -39,7 +39,6 @@ use ferrofin_model::entities_media::MediaStream;
 use ferrofin_model::providers::RemoteSubtitleInfo;
 use ferrofin_model::secret::Secret;
 use ferrofin_model::subtitles::FontFile;
-use ferrofin_traits::error::ServiceError;
 use ferrofin_traits::subtitles::{SubtitleResponse, SubtitleSearchRequest};
 use ferrofin_util::string_extensions::equals_ordinal_ignore_case;
 use uuid::Uuid;
@@ -56,7 +55,7 @@ use crate::handlers::streaming::{
     opened_file_response, physical_file_precondition, require_streamable_item,
     stream_route_container,
 };
-use crate::handlers::{queue_high_priority_refresh, run_item_refresh};
+use crate::handlers::{queue_high_priority_refresh, run_detached, run_item_refresh};
 use crate::state::AppState;
 
 /// The MIME type Jellyfin serves an HLS subtitle playlist with
@@ -152,18 +151,12 @@ async fn delete_subtitle(
             return Err(ApiError::BadRequest("Guid can't be empty".to_owned()));
         }
         require_item(&state, item_id, &auth).await?;
-        // Upstream finishes the delete and its refresh for a client that hangs
-        // up, so they run on a task of their own, in the request's span.
-        tokio::spawn(tracing::Instrument::in_current_span(async move {
+        // Upstream finishes the delete and its refresh for a client that hangs up.
+        run_detached(async move {
             state.subtitles.delete_subtitles(item_id, index).await?;
             run_item_refresh(&state, item_id).await
-        }))
-        .await
-        .unwrap_or_else(|err| {
-            Err(ApiError::Service(ServiceError::backend(format!(
-                "subtitle delete task failed: {err}"
-            ))))
         })
+        .await
     }
     .await;
     match deleted {

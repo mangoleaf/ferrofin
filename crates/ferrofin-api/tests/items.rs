@@ -328,6 +328,10 @@ struct OkLibrary {
     /// When set, `delete_item` signals it has started and waits to be
     /// released before it records the delete.
     gate: Option<Arc<DeleteGate>>,
+    /// The culture each `delete_item` call ran under.
+    delete_cultures: Arc<std::sync::Mutex<Vec<String>>>,
+    /// When set, `delete_item` fails with this backend error instead.
+    delete_error: Option<&'static str>,
     /// A Person item `get_item_by_id` also resolves, shared with the
     /// provider fake that refreshes it, and its images.
     person: SharedRow,
@@ -590,6 +594,13 @@ impl LibraryManager for OkLibrary {
         if let Some(gate) = &self.gate {
             gate.started.notify_one();
             gate.release.notified().await;
+        }
+        self.delete_cultures
+            .lock()
+            .expect("lock")
+            .push(ferrofin_util::current_culture::capture());
+        if let Some(error) = self.delete_error {
+            return Err(ServiceError::Backend(error.to_owned()));
         }
         self.deleted
             .lock()
@@ -3289,6 +3300,101 @@ async fn a_dropped_request_still_finishes_its_delete() {
             tokio::time::sleep(std::time::Duration::from_millis(5)).await;
         }
         assert_eq!(*deleted.lock().unwrap(), vec![(item_id, true)]);
+    }
+}
+
+/// The delete's own task runs under the request's culture, as the delete
+/// upstream's action awaits does (.NET's `ExecutionContext` flows
+/// `CurrentCulture`), not under the system locale a spawned task starts with
+/// (gl-1808).
+#[tokio::test]
+async fn the_delete_runs_under_the_requests_culture() {
+    let item_id = Uuid::from_u128(0xAB56);
+    for uri in [format!("/Items/{item_id}"), format!("/Items?ids={item_id}")] {
+        let library = OkLibrary {
+            item_id,
+            ..Default::default()
+        };
+        let cultures = Arc::clone(&library.delete_cultures);
+        let state = ok_state_full(library, Arc::new(OkUsers), Arc::new(OkDto), alice())
+            // A culture no CI host runs under, so the system locale cannot pass.
+            .with_request_culture("sv")
+            .expect("culture");
+        assert_eq!(delete(state, &uri).await, StatusCode::NO_CONTENT, "{uri}");
+        assert_eq!(*cultures.lock().unwrap(), ["sv"], "{uri}");
+    }
+}
+
+/// Everything a `tracing` fmt subscriber writes while a test runs.
+#[derive(Clone, Default)]
+struct CapturedLog(Arc<std::sync::Mutex<Vec<u8>>>);
+
+impl std::io::Write for CapturedLog {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().expect("log").extend_from_slice(buf);
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// A delete that fails is logged once whether or not its client waited for
+/// the answer: the error boundary logs the `500` a connected client gets, and
+/// once the client has hung up the delete's own task logs the error no
+/// answer carries (gl-1808, LOGGING.md §2).
+#[tokio::test]
+async fn a_failed_delete_is_logged_once_even_after_the_client_hung_up() {
+    const CAUSE: &str = "the disk went away";
+    let item_id = Uuid::from_u128(0xAB57);
+    for hang_up in [false, true] {
+        let log = CapturedLog::default();
+        let writer = log.clone();
+        let _guard = tracing::subscriber::set_default(
+            tracing_subscriber::fmt()
+                .with_ansi(false)
+                .with_writer(move || writer.clone())
+                .finish(),
+        );
+        let gate = Arc::new(DeleteGate::default());
+        let library = OkLibrary {
+            item_id,
+            gate: Some(Arc::clone(&gate)),
+            delete_error: Some(CAUSE),
+            ..Default::default()
+        };
+        let state = ok_state_full(library, Arc::new(OkUsers), Arc::new(OkDto), alice());
+        let uri = format!("/Items/{item_id}");
+        let request = tokio::spawn(async move { delete(state, &uri).await });
+        gate.started.notified().await;
+        let errors = || {
+            String::from_utf8(log.0.lock().expect("log").clone())
+                .expect("utf-8")
+                .lines()
+                .filter(|line| line.contains("ERROR") && line.contains(CAUSE))
+                .count()
+        };
+        if hang_up {
+            request.abort();
+            assert!(
+                request.await.is_err_and(|e| e.is_cancelled()),
+                "the request was dropped"
+            );
+            gate.release.notify_one();
+            for _ in 0..200 {
+                if errors() > 0 {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        } else {
+            gate.release.notify_one();
+            assert_eq!(
+                request.await.expect("answered"),
+                StatusCode::INTERNAL_SERVER_ERROR
+            );
+        }
+        assert_eq!(errors(), 1, "hang_up={hang_up}");
     }
 }
 

@@ -69,6 +69,9 @@ const FILED_ITEM_PATH: &str = "/media/Film.mkv";
 /// (`refresh_item_metadata`), as the items' paths.
 static AWAITED_REFRESHES: Mutex<Vec<String>> = Mutex::new(Vec::new());
 
+/// The culture each of [`AWAITED_REFRESHES`] ran under.
+static AWAITED_REFRESH_CULTURES: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
 /// A library where only [`ITEM_ID`] and [`FILED_ITEM_ID`] (Movies) and
 /// [`SERIES_ID`] exist.
 struct OneItemLibrary;
@@ -125,6 +128,10 @@ impl LibraryManager for OneItemLibrary {
             .lock()
             .unwrap()
             .push(item.path.clone().unwrap_or_default());
+        AWAITED_REFRESH_CULTURES
+            .lock()
+            .unwrap()
+            .push(ferrofin_util::current_culture::capture());
         Ok(true)
     }
     async fn query_items(
@@ -754,6 +761,29 @@ async fn delete_subtitle_awaits_the_items_refresh_before_204() {
             .iter()
             .any(|target| target.contains(FILED_ITEM_PATH)),
         "the refresh ran before the answer"
+    );
+}
+
+/// The delete and the refresh it awaits run under the request's culture, as
+/// upstream's awaited `DeleteSubtitles` does, so the refresh's NFO save orders
+/// names as the request asked, not as the system locale would (gl-1808).
+#[tokio::test]
+async fn delete_subtitle_refreshes_under_the_requests_culture() {
+    let app = admin_state(Arc::new(CannedSubtitles::default()))
+        // A culture no CI host runs under, so the system locale cannot pass.
+        .with_request_culture("sv")
+        .expect("culture");
+    let (status, body, _) = call_method(
+        app,
+        "DELETE",
+        &format!("/Videos/{FILED_ITEM_ID}/Subtitles/3"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{body:?}");
+    let cultures = AWAITED_REFRESH_CULTURES.lock().unwrap();
+    assert!(
+        cultures.iter().any(|culture| culture == "sv"),
+        "{cultures:?}"
     );
 }
 
