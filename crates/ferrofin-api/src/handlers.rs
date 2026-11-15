@@ -3464,13 +3464,8 @@ pub const VERIFIED: &[Verified] = &[
                BaseItemRepository.TranslateQuery and ApplyOrder, OrderMapper, RemoveFields, \
                DtoService.GetBaseItemDtos, AddInfoToProgramDto, AddRecordingInfo, \
                GetTimersInternal, DefaultLiveTvService.GetTimersAsync)",
-        date: "2026-11-14",
+        date: "2026-11-15",
         divergences: &[
-            "isSports, isNews and isKids each match the programme's own flag, so when two or \
-         more are true a programme must have them all; upstream turns each true one into a \
-         tag and keeps a programme with any of those tags, so isSports=true&isKids=true \
-         lists sports and kids programmes alike. A false one excludes its flag in both. Fix \
-         path: gl-1687.",
             "With no user (an API key), sortBy PlayCount, IsFavoriteOrLiked, IsPlayed or \
          IsUnplayed sorts by SortName, as /Items does; upstream's OrderMapper reads the \
          missing user's id (query.User!.Id), which throws. Jellyfin bug not ported.",
@@ -3522,7 +3517,7 @@ pub const VERIFIED: &[Verified] = &[
                LibraryManager.QueryItems, BaseItemRepository.TranslateQuery and ApplyOrder, \
                OrderMapper, RemoveFields, DtoService.GetBaseItemDtos, AddInfoToProgramDto, \
                AddRecordingInfo, GetTimersInternal, DefaultLiveTvService.GetTimersAsync)",
-        date: "2026-11-14",
+        date: "2026-11-15",
         divergences: &[
             "A body UserId naming another user, sent without the administrator role, is a 403 \
          (the RequestHelpers.GetUserId rule GET applies); upstream's GetPrograms reads \
@@ -3535,10 +3530,6 @@ pub const VERIFIED: &[Verified] = &[
          does. Fix path: gl-1033.",
             "A null EnableTotalRecordCount reads as true; upstream's member is a non-nullable \
          bool, which System.Text.Json refuses to bind from null (a 400). Fix path: gl-1691.",
-            "IsSports, IsNews and IsKids each match the programme's own flag, so when two or \
-         more are true a programme must have them all; upstream turns each true one into a \
-         tag and keeps a programme with any of those tags. A false one excludes its flag in \
-         both. Fix path: gl-1687.",
             "With no body UserId, SortBy PlayCount, IsFavoriteOrLiked, IsPlayed or \
          IsUnplayed sorts by SortName, as /Items does; upstream's OrderMapper reads the \
          missing user's id (query.User!.Id), which throws. Jellyfin bug not ported.",

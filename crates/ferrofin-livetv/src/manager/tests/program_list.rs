@@ -417,3 +417,120 @@ async fn the_guide_order_reads_each_airing_item_by_its_id() {
     let by_name = plan_of(vec![(By::SortName, ASC)]).await.expect("plan");
     assert!(by_name.iter().any(|d| d == item_by_id), "{by_name:?}");
 }
+
+/// Two airings on now and three later, over the categories the guide refresh
+/// turns into flags (sports, kids, news) and one with none.
+fn category_guide() -> String {
+    super::guide_of(&[
+        ("one.tv", -10, 50, "Match", "Sports"),
+        ("two.tv", -10, 50, "Cartoons", "Kids"),
+        ("one.tv", 60, 90, "Bulletin", "News"),
+        ("two.tv", 60, 90, "Play", "Drama"),
+        ("one.tv", 90, 120, "Late Game", "Sports"),
+    ])
+}
+
+/// `IsSports`, `IsNews` and `IsKids` are tag sugar upstream
+/// (`TranslateQuery.cs:224-258`): each `true` one adds its tag to the tags an
+/// airing must carry ANY of, each `false` one to the tags it must carry none
+/// of (`:665-677`). So two `true` flags list both kinds, and the total counts
+/// the same set.
+#[rstest::rstest]
+#[case::sports_or_kids(Some(true), None, Some(true), &["Cartoons", "Match", "Late Game"])]
+#[case::any_of_three(Some(true), Some(true), Some(true), &["Cartoons", "Match", "Bulletin", "Late Game"])]
+#[case::sports_not_kids(Some(true), None, Some(false), &["Match", "Late Game"])]
+#[case::neither(Some(false), None, Some(false), &["Bulletin", "Play"])]
+#[case::news_only(None, Some(true), None, &["Bulletin"])]
+#[tokio::test]
+async fn the_category_flags_list_airings_with_any_true_one(
+    #[case] is_sports: Option<bool>,
+    #[case] is_news: Option<bool>,
+    #[case] is_kids: Option<bool>,
+    #[case] expected: &[&str],
+) {
+    let lab = item_lab(M3U, Some(category_guide())).await;
+    lab.mgr.refresh_guide().await.expect("refresh");
+    let query = InternalItemsQuery {
+        is_sports,
+        is_news,
+        is_kids,
+        limit: Some(10),
+        enable_total_record_count: true,
+        ..InternalItemsQuery::default()
+    };
+    let (titles, total) = listed(&lab, &query).await;
+    assert_eq!(titles, expected);
+    assert_eq!(usize::try_from(total).unwrap(), expected.len());
+}
+
+/// The Recommended airing branch reads its pool through the same filter, the
+/// airing scope applying to the whole group: the sports airing that starts
+/// later stays out.
+#[tokio::test]
+async fn the_recommended_airing_pool_takes_any_true_category() {
+    let lab = item_lab(M3U, Some(category_guide())).await;
+    lab.mgr.refresh_guide().await.expect("refresh");
+    let query = InternalItemsQuery {
+        is_airing: Some(true),
+        is_sports: Some(true),
+        is_kids: Some(true),
+        ..InternalItemsQuery::default()
+    };
+    let (mut titles, total) = listed(&lab, &query).await;
+    titles.sort();
+    assert_eq!(
+        (titles, total),
+        (vec!["Cartoons".to_owned(), "Match".to_owned()], 2)
+    );
+}
+
+/// The category flags leave the guide's plans where the column predicates
+/// had them: one `true` flag (each jellyfin-web suggestion row) or every one
+/// `false` still filters a scan of the guide and sorts what is left, as an
+/// `IsMovie` predicate does, and two `true` ones, an `OR` group SQLite rates
+/// as less selective, walk the start-date index as the unfiltered guide does.
+/// None turns into a multi-index union, and each airing's item is still read
+/// by its key.
+#[rstest::rstest]
+#[case::one_true(Some(true), None, None, "SCAN p")]
+#[case::all_false(Some(false), Some(false), Some(false), "SCAN p")]
+#[case::two_true(
+    Some(true),
+    None,
+    Some(true),
+    "SCAN p USING INDEX FerrofinIX_LiveTvPrograms_StartDate"
+)]
+#[tokio::test]
+async fn the_category_flags_keep_the_guide_plans(
+    #[case] is_sports: Option<bool>,
+    #[case] is_news: Option<bool>,
+    #[case] is_kids: Option<bool>,
+    #[case] guide_step: &str,
+) {
+    let lab = item_lab(M3U, Some(category_guide())).await;
+    let now = chrono::Utc::now();
+    let query = InternalItemsQuery {
+        is_sports,
+        is_news,
+        is_kids,
+        min_end_date: Some(now),
+        limit: Some(20),
+        ..InternalItemsQuery::default()
+    };
+    let plan = crate::guide_repository::test_support::plan(
+        &lab.mgr.db,
+        super::super::program_rows_query(&query, now, None),
+    )
+    .await
+    .expect("plan");
+    for step in [
+        guide_step,
+        "SEARCH item USING INDEX sqlite_autoindex_BaseItems_1 (Id=?) LEFT-JOIN",
+    ] {
+        assert!(plan.iter().any(|d| d == step), "{step}: {plan:?}");
+    }
+    assert!(
+        plan.iter().all(|d| !d.starts_with("MULTI-INDEX")),
+        "{plan:?}"
+    );
+}
