@@ -22,7 +22,7 @@ use axum::routing::get;
 use axum::{Json, Router};
 use ferrofin_model::data::CollectionType;
 use ferrofin_model::dto::{BaseItemDto, SpecialViewOptionDto};
-use ferrofin_model::entities::CollectionTypeOptions;
+use ferrofin_model::entities_media::VirtualFolderInfo;
 use ferrofin_model::querying::QueryResult;
 use ferrofin_traits::options::{DtoOptions, UserViewQuery};
 use uuid::Uuid;
@@ -33,30 +33,14 @@ use crate::extract::{DotnetGuid, Query};
 use crate::handlers::items::{resolve_user, user_uuid};
 use crate::state::AppState;
 
-/// The collection type of every configured library, keyed by its folder item id.
-///
-/// A `mixed` library has no single type and maps to `None` — which is still an
-/// entry, because C# treats an unset `CollectionType` as grouping-eligible.
+/// The collection type of every configured library, keyed by its folder item id
+/// ([`VirtualFolderInfo::collection_types_by_id`]).
 async fn collection_types_by_id(
     state: &AppState,
 ) -> Result<HashMap<Uuid, Option<CollectionType>>, ApiError> {
-    Ok(state
-        .virtual_folders
-        .library_folders()
-        .await?
-        .iter()
-        .filter_map(|vf| {
-            let id = vf
-                .item_id
-                .as_deref()
-                .and_then(|s| Uuid::parse_str(s).ok())?;
-            Some((
-                id,
-                vf.collection_type
-                    .and_then(CollectionTypeOptions::collection_type),
-            ))
-        })
-        .collect())
+    Ok(VirtualFolderInfo::collection_types_by_id(
+        &state.virtual_folders.library_folders().await?,
+    ))
 }
 
 /// C#'s `UserView.IsEligibleForGrouping`: only `movies`, `tvshows` and an unset

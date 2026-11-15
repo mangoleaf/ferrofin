@@ -366,6 +366,31 @@ pub struct VirtualFolderInfo {
 }
 
 impl VirtualFolderInfo {
+    /// The [`CollectionType`](crate::data::CollectionType) of each library in
+    /// `folders`, keyed by its folder item id; a library whose item id does
+    /// not parse is left out. A `mixed` library has no single type and maps to
+    /// `None`, which is still an entry: C# treats an unset `CollectionType` as
+    /// grouping-eligible.
+    #[must_use]
+    pub fn collection_types_by_id(
+        folders: &[Self],
+    ) -> HashMap<Uuid, Option<crate::data::CollectionType>> {
+        folders
+            .iter()
+            .filter_map(|vf| {
+                let id = vf
+                    .item_id
+                    .as_deref()
+                    .and_then(|s| Uuid::parse_str(s).ok())?;
+                Some((
+                    id,
+                    vf.collection_type
+                        .and_then(CollectionTypeOptions::collection_type),
+                ))
+            })
+            .collect()
+    }
+
     /// Whether one of this library's locations holds `path` — the location
     /// itself or anything under it, compared as upstream compares physical
     /// locations (`OrdinalIgnoreCase`).
@@ -1689,6 +1714,40 @@ impl<'de> serde::de::Visitor<'de> for AnyValue {
 
 #[cfg(test)]
 mod tests {
+
+    /// Each library's type by its folder id: a mixed library is an entry with
+    /// no type, and one whose id does not parse is left out.
+    #[test]
+    fn collection_types_are_keyed_by_the_library_folder_id() {
+        use crate::data::CollectionType;
+        use crate::entities::CollectionTypeOptions;
+        let library = |id: Option<&str>, kind| super::VirtualFolderInfo {
+            item_id: id.map(str::to_owned),
+            collection_type: kind,
+            ..Default::default()
+        };
+        let tv = uuid::Uuid::from_u128(1);
+        let mixed = uuid::Uuid::from_u128(2);
+        let unset = uuid::Uuid::from_u128(3);
+        let found = super::VirtualFolderInfo::collection_types_by_id(&[
+            library(
+                Some(&tv.simple().to_string()),
+                Some(CollectionTypeOptions::tvshows),
+            ),
+            library(Some(&mixed.to_string()), Some(CollectionTypeOptions::mixed)),
+            library(Some(&unset.to_string()), None),
+            library(Some("not an id"), Some(CollectionTypeOptions::movies)),
+            library(None, Some(CollectionTypeOptions::music)),
+        ]);
+        assert_eq!(
+            found,
+            std::collections::HashMap::from([
+                (tv, Some(CollectionType::tvshows)),
+                (mixed, None),
+                (unset, None),
+            ])
+        );
+    }
 
     #[test]
     fn the_library_owning_an_item_is_found_by_its_collection_folder_or_location() {
