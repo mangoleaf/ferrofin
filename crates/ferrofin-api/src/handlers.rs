@@ -1683,7 +1683,9 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
                    listings that can hold a playlist (Folder.QueryRecursive, \
                    Folder.QueryWithPostFiltering, Playlist.IsVisible); dto_service.rs \
                    get_base_item_dtos' IsVisible pass (DtoService.GetBaseItemDtos), which of \
-                   the handlers only GET /Items/Suggestions asks for, as its controller does; \
+                   the handlers GET /Items/Suggestions and the six /{kind}/{itemId}/Similar \
+                   routes ask for, as their controllers do, and GET /Movies/Recommendations \
+                   runs through filter_visible_items before its one projection; \
                    handlers/live_tv.rs query_programs_inner \
                    (LiveTvController.GetLiveTvPrograms, GetPrograms)",
         date: "2026-11-01",
@@ -2200,7 +2202,8 @@ macro_rules! similar_items_path {
          FilterByLibraryAccessAsync pass, as every query is already user-scoped) → \
          ferrofin-providers similarity.rs (TmdbMovieSimilarProvider, \
          TmdbSeriesSimilarProvider, ListenBrainzSimilarArtistProvider) → dto_service.rs \
-         get_base_item_dtos; QueryResult(0, the item count, the DTOs)"
+         get_base_item_dtos with its IsVisible pass for a user; QueryResult(0, the item count \
+         before that pass, the DTOs)"
     };
 }
 
@@ -2209,7 +2212,6 @@ const SIMILAR_ITEMS_DIVERGENCES: &[&str] = &[
     SIMILAR_SCORE_WINDOW_DIVERGENCE,
     SIMILAR_ALTERNATE_VERSIONS_DIVERGENCE,
     SIMILAR_SCORE_GROUPING_DIVERGENCE,
-    SIMILAR_IS_VISIBLE_DIVERGENCE,
     "The reference-cache read swallows an I/O error silently and warns on an empty entry or \
      one whose References is null, where upstream warns on an IOException and treats both \
      as a silent miss. Fix path: gl-1652.",
@@ -2261,12 +2263,6 @@ const SIMILAR_SCORE_GROUPING_DIVERGENCE: &str = "With a user, the score pass's f
      provider filters through TranslateQuery alone and keeps each key's best-scoring row, \
      the primary on a tie, keyless programmes folding into their best-scoring one. Fix path: \
      gl-1800.";
-
-/// The `IsVisible` pass the similar-items and recommendations handlers skip.
-const SIMILAR_IS_VISIBLE_DIVERGENCE: &str = "The rows are projected without GetBaseItemDtos' \
-     IsVisible pass, which upstream runs for a user; every row came through a user-scoped \
-     query, so this differs only where IsParentalAllowed and that query disagree (and \
-     upstream's similar-items count is the one before the pass). Fix path: gl-1787.";
 
 /// **The API-parity record.** One row per contract operation whose Ferrofin
 /// implementation has been compared against the upstream Jellyfin C#
@@ -2391,8 +2387,10 @@ pub const VERIFIED: &[Verified] = &[
         ferrofin: "handlers/movies.rs get_movie_recommendations (userId through \
                resolve_user_opt: RequestHelpers.GetUserId, then GetUserById; parentId ?? \
                Guid.Empty through require_scope_id_visible; fields; categoryLimit = 5 and \
-               itemLimit = 8 by default; one get_base_item_dtos pass over every category's \
-               items, split back per category in order) → ferrofin-core \
+               itemLimit = 8 by default; GetBaseItemDtos' IsVisible pass per category as one \
+               filter_visible_items pass over every category's distinct items, a category it \
+               empties kept with no items, then one get_base_item_dtos pass over what is \
+               left, split back per category in order) → ferrofin-core \
                similar_items_manager.rs get_movie_recommendations \
                (GetMovieRecommendationsAsync: recently_played_query, played movies by \
                DatePlayed then Random, Limit 7, and liked_query, IsFavoriteOrLiked movie kinds \
@@ -2427,7 +2425,6 @@ pub const VERIFIED: &[Verified] = &[
             "An itemLimit above 715827882 overflows upstream's limit * 3 to a negative Take, so \
          every similar-to category is empty; the oversample saturates here. Jellyfin bug not \
          ported.",
-            SIMILAR_IS_VISIBLE_DIVERGENCE,
             "A similar-to category leaves out a film sharing its baseline's presentation key \
          (another copy of the baseline); upstream's batch provider excludes only the \
          baseline's own id and can recommend that copy under its own name. Jellyfin bug not \

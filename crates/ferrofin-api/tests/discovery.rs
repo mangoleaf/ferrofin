@@ -46,6 +46,16 @@ const ITEM_ID: Uuid = Uuid::from_u128(0x00A1_7E11);
 /// `/Similar` route resolves to, the way C# falls back to `GetUserRootFolder()`.
 const ROOT_FOLDER_ID: Uuid = Uuid::from_u128(0x0000_0007);
 
+/// A row the user-scoped similar and recommendation queries return but
+/// `IsVisible` rejects: the stub library's `is_item_visible` and the stub DTO
+/// service's visibility pass both drop it.
+const HIDDEN_ID: Uuid = Uuid::from_u128(0x00A3);
+
+/// Whether `item` is [`HIDDEN_ID`].
+fn is_hidden(item: &BaseItemEntity) -> bool {
+    Uuid::parse_str(&item.id).is_ok_and(|id| id == HIDDEN_ID)
+}
+
 /// Builds a minimal [`UserEntity`] with the given id/name; every other field is a
 /// neutral zero value ([`UserEntity`] has no `Default`).
 fn user_entity(id: Uuid, username: &str) -> UserEntity {
@@ -252,11 +262,17 @@ impl DtoService for OkDto {
         &self,
         items: &[BaseItemEntity],
         _options: &DtoOptions,
-        _user: Option<&UserEntity>,
+        user: Option<&UserEntity>,
         _owner_id: Option<Uuid>,
-        _skip_visibility_check: bool,
+        skip_visibility_check: bool,
     ) -> Result<Vec<BaseItemDto>, ServiceError> {
-        Ok(items.iter().map(to_dto).collect())
+        // The real service's `items.Where(x => x.IsVisible(user))` pass.
+        let check = user.is_some() && !skip_visibility_check;
+        Ok(items
+            .iter()
+            .filter(|item| !(check && is_hidden(item)))
+            .map(to_dto)
+            .collect())
     }
 }
 
@@ -274,10 +290,10 @@ impl LibraryManager for StubLibrary {
     }
     async fn is_item_visible(
         &self,
-        _item: &ferrofin_db::entities::base_items::BaseItemEntity,
+        item: &ferrofin_db::entities::base_items::BaseItemEntity,
         _user: &ferrofin_db::entities::users::UserEntity,
     ) -> Result<bool, ferrofin_traits::error::ServiceError> {
-        Ok(true)
+        Ok(!is_hidden(item))
     }
 
     async fn get_item_by_id(&self, id: Uuid) -> Result<Option<BaseItemEntity>, ServiceError> {
@@ -492,6 +508,7 @@ impl SimilarItemsManager for StubSimilar {
         }
         Ok(Some(vec![
             item_entity(Uuid::from_u128(0xA1), "Similar A"),
+            item_entity(HIDDEN_ID, "Hidden"),
             item_entity(Uuid::from_u128(0xA2), "Similar B"),
         ]))
     }
@@ -516,10 +533,17 @@ impl SimilarItemsManager for StubSimilar {
                 recommendation_type: RecommendationType::SimilarToLikedItem,
                 items: vec![
                     item_entity(Uuid::from_u128(0x44), "Ronin"),
+                    item_entity(HIDDEN_ID, "Hidden"),
                     // The same item may recommend under several categories; the
                     // single-pass projection must keep the duplicate in place.
                     item_entity(Uuid::from_u128(0x42), "Aliens"),
                 ],
+            },
+            SimilarItemsRecommendation {
+                baseline_item_name: "Because you liked Hidden".to_owned(),
+                category_id: Uuid::from_u128(0x45),
+                recommendation_type: RecommendationType::SimilarToLikedItem,
+                items: vec![item_entity(HIDDEN_ID, "Hidden")],
             },
         ])
     }
@@ -647,7 +671,7 @@ async fn movie_recommendations_returns_categories() {
     let (status, body) = get("/Movies/Recommendations").await;
     assert_eq!(status, StatusCode::OK);
     let recs: Vec<RecommendationDto> = serde_json::from_slice(&body).expect("recommendations");
-    assert_eq!(recs.len(), 2);
+    assert_eq!(recs.len(), 3);
     assert_eq!(
         recs[0].baseline_item_name.as_deref(),
         Some("Because you watched Alien")
@@ -661,7 +685,11 @@ async fn movie_recommendations_returns_categories() {
             .map(|items| items.iter().map(|d| d.name.as_deref()).collect::<Vec<_>>())
     };
     assert_eq!(names(0), Some(vec![Some("Aliens")]));
+    // C# projects each category with `GetBaseItemDtos(r.Items, dtoOptions,
+    // user)`, whose `IsVisible` pass drops the hidden row; a category it
+    // empties stays in the list with no items.
     assert_eq!(names(1), Some(vec![Some("Ronin"), Some("Aliens")]));
+    assert_eq!(names(2), Some(Vec::new()));
 }
 
 #[tokio::test]
@@ -692,8 +720,12 @@ async fn similar_items_returns_two() {
         let (status, body) = get(&format!("/{kind}/{ITEM_ID}/Similar")).await;
         assert_eq!(status, StatusCode::OK, "{kind}");
         let result: QueryResult<BaseItemDto> = serde_json::from_slice(&body).expect("similar");
-        assert_eq!(result.items.len(), 2, "{kind}");
-        assert_eq!(result.items[0].name.as_deref(), Some("Similar A"));
+        // C# `GetBaseItemDtos(itemsResult, dtoOptions, user)` runs `IsVisible`
+        // and drops the hidden row; `TotalRecordCount` is `itemsResult.Count`,
+        // the count before that pass.
+        let names: Vec<_> = result.items.iter().map(|d| d.name.as_deref()).collect();
+        assert_eq!(names, [Some("Similar A"), Some("Similar B")], "{kind}");
+        assert_eq!(result.total_record_count, 3, "{kind}");
     }
 }
 
