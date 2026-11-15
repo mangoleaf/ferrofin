@@ -4242,13 +4242,13 @@ pub const VERIFIED: &[Verified] = &[
                (LibraryManager.GetVirtualFolders(true) and GetVirtualFolderInfo: \
                is_directory for Directory.EnumerateDirectories, resolve_locations and \
                resolve_shortcut for the Locations and their culture sort, \
-               read_collection_type, load_options and stored_options for \
-               CollectionFolder.GetLibraryOptions and LoadLibraryOptions (its defaults, \
-               its error log, its ExpandVirtualPath), scan_progress for \
-               RefreshProgress and RefreshStatus) → ferrofin-model entities_media.rs \
-               VirtualFolderInfo, configuration.rs LibraryOptions, TypeOptions, \
-               ImageOption, MediaPathInfo",
-        date: "2026-11-09",
+               read_collection_type, load_options, stored_options and \
+               adopt_jellyfin_options for CollectionFolder.GetLibraryOptions and \
+               LoadLibraryOptions (its defaults, its error log, its ExpandVirtualPath), \
+               scan_progress for RefreshProgress and RefreshStatus) → ferrofin-model \
+               entities_media.rs VirtualFolderInfo, configuration.rs LibraryOptions, \
+               TypeOptions, ImageOption, MediaPathInfo",
+        date: "2026-11-14",
         divergences: &[
             "An unreadable shortcut is logged at error the first time a listing meets it and \
          at debug while it stays unreadable; upstream logs it at error on every listing. \
@@ -4272,6 +4272,13 @@ pub const VERIFIED: &[Verified] = &[
          failure (an IOException) not at all. The listing reads the file on every \
          dashboard load, and docs/conventions/LOGGING.md rule 1 keeps a level whose \
          volume scales with the request rate out of error.",
+            "An adopted options.xml that cannot be read or does not convert, with no \
+         options.json beside it, serves the defaults and is read again on every listing, \
+         logged at error the first time a read meets it and at debug while it stays so (at \
+         error again after it has converted or been removed, or after an options.json that \
+         took over is gone). Upstream logs a parse or permission failure at error once per fill of its \
+         options cache, which a library-structure change clears, and any other I/O failure \
+         not at all; the same LOGGING.md rule applies.",
             "The 401 and 403 bodies are Ferrofin's error shape, not upstream's. Fix path: \
          gl-666.",
         ],
