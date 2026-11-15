@@ -22,6 +22,13 @@
 //! - Episode ordering: TVDB has multiple orderings (`official` = aired, `dvd`,
 //!   `absolute`, …). The episode lookup takes a `season_type`, defaulting to
 //!   `official`; season 0 is specials.
+//! - Credits: an episode's and a series' `characters` map as the plugin's two
+//!   loops do, and each answer goes through `PeopleHelper.AddPerson`
+//!   ([`crate::episode::tvdb_people`]). One divergence is kept: the plugin's
+//!   `MapActorsToResult` types every series credit `Actor`, a series'
+//!   director, writer and guest star included, which is wrong data; Ferrofin
+//!   keeps TVDB's type for those three, as the TMDb series provider types its
+//!   crew.
 
 use crate::rate_limit::CountedBody as _;
 use crate::rate_limit::{LimitedRequest as _, RateLimiter};
@@ -137,11 +144,13 @@ struct TvdbSeasonRef {
 pub struct TvdbPerson {
     /// The actor/crew member's name.
     pub name: String,
-    /// The Jellyfin person type (`Actor`, `Director`, `Writer`, `GuestStar`).
+    /// The Jellyfin person type (`Actor`, `Director`, `Writer`, `GuestStar`,
+    /// or `Unknown` for an episode credit of any other type).
     pub person_type: String,
     /// The character/role name, if any.
     pub role: Option<String>,
-    /// The profile image URL, if any.
+    /// The profile image URL, if any (a series credit's only: an episode's
+    /// is `None`).
     pub image_url: Option<String>,
 }
 
@@ -1038,7 +1047,7 @@ impl TvdbClient {
             aired: wire.aired,
             production_year,
             image_url: wire.image,
-            people: map_characters(wire.characters),
+            people: map_characters(wire.characters, true),
         })
     }
 
@@ -1281,11 +1290,6 @@ impl TvdbClient {
             birthplace: wire.birthplace,
         })
     }
-
-    /// Downloads an image by absolute URL, returning its bytes.
-    pub async fn download(&self, url: &str) -> Option<Vec<u8>> {
-        crate::image_download::download_bytes(url).await
-    }
 }
 
 /// `TvdbUtils.GetComparableName`: lower-cased (NFC), `", the"` and `"the "`
@@ -1333,26 +1337,45 @@ fn artwork_image_type(type_id: Option<i64>) -> Option<ImageType> {
     }
 }
 
-/// Maps the `characters` array to [`TvdbPerson`]s (empty name skipped). The
-/// `peopleType` names align with Jellyfin's person kinds; default to `Actor`.
-fn map_characters(characters: Option<Vec<CharacterWire>>) -> Vec<TvdbPerson> {
+/// Maps the `characters` array to [`TvdbPerson`]s (empty name skipped), the
+/// `peopleType` matched case-insensitively against the four the plugin names.
+///
+/// An episode's (`TvdbEpisodeProvider.MapEpisodeToResult`): any other type is
+/// `Unknown`, only an actor or a guest star keeps the character as its role,
+/// and no person image is kept. A series' keeps every role and image, and any
+/// other type is `Actor`, as `TvdbSeriesProvider.MapActorsToResult` types
+/// every series credit; Ferrofin keeps a director, writer or guest star as
+/// such (see the module's port notes).
+fn map_characters(characters: Option<Vec<CharacterWire>>, episode: bool) -> Vec<TvdbPerson> {
     characters
         .unwrap_or_default()
         .into_iter()
         .filter_map(|c| {
             let name = c.person_name.filter(|n| !n.trim().is_empty())?;
-            let person_type = match c.people_type.as_deref() {
-                Some("Director") => "Director",
-                Some("Writer") => "Writer",
-                Some("Guest Star" | "Guest") => "GuestStar",
-                _ => "Actor",
-            }
-            .to_owned();
+            let named = c.people_type.as_deref().and_then(|tvdb| {
+                [
+                    ("Actor", "Actor"),
+                    ("Director", "Director"),
+                    ("Writer", "Writer"),
+                    ("Guest Star", "GuestStar"),
+                ]
+                .into_iter()
+                .find_map(|(wire, kind)| wire.eq_ignore_ascii_case(tvdb).then_some(kind))
+            });
+            let role = c.name.filter(|r| !r.is_empty());
+            let (person_type, role, image_url) = if episode {
+                let kind = named.unwrap_or("Unknown");
+                let plays = matches!(kind, "Actor" | "GuestStar");
+                (kind, role.filter(|_| plays), None)
+            } else {
+                let image = c.person_img_url.filter(|u| !u.is_empty());
+                (named.unwrap_or("Actor"), role, image)
+            };
             Some(TvdbPerson {
                 name,
-                person_type,
-                role: c.name.filter(|r| !r.is_empty()),
-                image_url: c.person_img_url.filter(|u| !u.is_empty()),
+                person_type: person_type.to_owned(),
+                role,
+                image_url,
             })
         })
         .collect()
@@ -1463,7 +1486,7 @@ fn map_series(tvdb_id: i64, wire: SeriesExtendedWire, country_code: &str) -> Tvd
         tmdb_id: find_remote("TheMovieDB.com")
             .map(|id| id.split('-').next().unwrap_or_default().to_owned()),
         zap2it_id: find_remote("Zap2It"),
-        people: map_characters(wire.characters),
+        people: map_characters(wire.characters, false),
         images,
     }
 }
@@ -1714,6 +1737,68 @@ mod tests {
         assert_eq!(d.images[1].thumbnail_url, None);
     }
 
+    /// An episode's credits as `MapEpisodeToResult` maps them
+    /// (`TvdbEpisodeProvider.cs:272-306`): the four types it names matched
+    /// case-insensitively, a role only for an actor or a guest star, any other
+    /// type unknown, and no person image. A series' credits keep TVDB's type
+    /// (`Actor` for any other), their role and their image.
+    #[test]
+    fn characters_map_per_record_as_the_plugin_does() {
+        let characters = || -> Option<Vec<CharacterWire>> {
+            serde_json::from_str(
+                r#"[
+                  {"personName":"Ann","name":"Hero","personImgURL":"/a.jpg","peopleType":"actor"},
+                  {"personName":"Bo","name":"Bo","peopleType":"DIRECTOR"},
+                  {"personName":"Cy","name":"Cy","peopleType":"Writer"},
+                  {"personName":"Di","name":"Villain","peopleType":"guest star"},
+                  {"personName":"Ed","name":"Himself","peopleType":"Host"},
+                  {"personName":"Fay","name":"Fay","peopleType":"Guest"},
+                  {"personName":"Gus","name":"Extra"}
+                ]"#,
+            )
+            .ok()
+        };
+        let rows =
+            |people: Vec<TvdbPerson>| -> Vec<(String, String, Option<String>, Option<String>)> {
+                people
+                    .into_iter()
+                    .map(|p| (p.name, p.person_type, p.role, p.image_url))
+                    .collect()
+            };
+        let row = |name: &str, kind: &str, role: Option<&str>, image: Option<&str>| {
+            (
+                name.to_owned(),
+                kind.to_owned(),
+                role.map(str::to_owned),
+                image.map(str::to_owned),
+            )
+        };
+        assert_eq!(
+            rows(map_characters(characters(), true)),
+            [
+                row("Ann", "Actor", Some("Hero"), None),
+                row("Bo", "Director", None, None),
+                row("Cy", "Writer", None, None),
+                row("Di", "GuestStar", Some("Villain"), None),
+                row("Ed", "Unknown", None, None),
+                row("Fay", "Unknown", None, None),
+                row("Gus", "Unknown", None, None),
+            ]
+        );
+        assert_eq!(
+            rows(map_characters(characters(), false)),
+            [
+                row("Ann", "Actor", Some("Hero"), Some("/a.jpg")),
+                row("Bo", "Director", Some("Bo"), None),
+                row("Cy", "Writer", Some("Cy"), None),
+                row("Di", "GuestStar", Some("Villain"), None),
+                row("Ed", "Actor", Some("Himself"), None),
+                row("Fay", "Actor", Some("Fay"), None),
+                row("Gus", "Actor", Some("Extra"), None),
+            ]
+        );
+    }
+
     #[test]
     fn map_series_prefers_country_rating_then_usa_fallback() {
         // gbr requested → gets the UK rating.
@@ -1885,7 +1970,6 @@ mod tests {
                 "/people/",
                 r#"{"data":{"biography":"An actress.","birthDate":"1986-10-23","birthPlace":"London"}}"#.to_owned(),
             ),
-            ("/img.jpg", "GIF89aIMAGEBYTES".to_owned()),
         ])
         .await;
         let c = TvdbClient::new().with_base_url(&server.base_url);
@@ -1913,12 +1997,6 @@ mod tests {
         let person = c.person_details(1).await.expect("person");
         assert_eq!(person.biography.as_deref(), Some("An actress."));
         assert_eq!(person.birthplace.as_deref(), Some("London"));
-
-        let bytes = c
-            .download(&format!("{}/img.jpg", server.base_url))
-            .await
-            .expect("download");
-        assert_eq!(bytes, b"GIF89aIMAGEBYTES");
     }
 
     #[tokio::test]

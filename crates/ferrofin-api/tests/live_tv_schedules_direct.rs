@@ -158,7 +158,7 @@ impl LiveTvManager for CountriesLiveTv {
         _provider_id: &str,
         _tuner_channel_id: &str,
         _provider_channel_id: &str,
-    ) -> Result<ferrofin_model::live_tv::TunerChannelMapping, ServiceError> {
+    ) -> Result<Option<ferrofin_model::live_tv::TunerChannelMapping>, ServiceError> {
         unreachable!()
     }
     async fn delete_listing_provider(&self, _id: &str) -> Result<(), ServiceError> {
