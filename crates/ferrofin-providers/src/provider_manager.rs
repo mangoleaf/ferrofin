@@ -139,12 +139,19 @@ impl RemoteSearchProvider for TmdbSearchProvider {
         // the two providers: `TmdbMovieProvider.cs:96-101`/`:106-111` pass
         // `TmdbUtils.GetImageLanguagesParam(...)` (so TMDB's `/find` sees
         // `language=en,null`), while `TmdbSeriesProvider.cs:73` passes the bare
-        // `MetadataLanguage`. Upstream's asymmetry, ported as-is.
+        // `MetadataLanguage`. Upstream's asymmetry, ported as-is, and so is
+        // `FindByExternalIdAsync`'s own `NormalizeLanguage` over the whole
+        // string, which upper-cases what follows a region's hyphen
+        // (`pt-BR,null,en` → `pt-BR,NULL,EN`).
+        let country = search_info.metadata_country_code.as_deref();
         let find_language = match self.kind {
-            TmdbKind::Movie => Some(crate::tmdb::image_languages_param(
-                search_info.metadata_language.as_deref(),
-                search_info.metadata_country_code.as_deref(),
-            )),
+            TmdbKind::Movie => crate::tmdb::normalize_language(
+                Some(&crate::tmdb::image_languages_param(
+                    search_info.metadata_language.as_deref(),
+                    country,
+                )),
+                country,
+            ),
             TmdbKind::Series => language.map(ToOwned::to_owned),
         };
         for (key, source) in [("Imdb", "imdb_id"), ("Tvdb", "tvdb_id")] {
@@ -431,13 +438,8 @@ impl RemoteSearchProvider for TmdbBoxSetSearchProvider {
             };
             return Ok(vec![RemoteSearchResult {
                 name: Some(collection.name),
-                // `GetPosterUrl(collection.PosterPath)` — TMDB's own pick, which
-                // `TmdbClient::collection` pushes first as the Primary image.
-                image_url: collection
-                    .images
-                    .iter()
-                    .find(|image| image.image_type == ImageType::Primary)
-                    .map(|image| image.url.clone()),
+                // `GetPosterUrl(collection.PosterPath)` — TMDB's own pick only.
+                image_url: collection.poster_url,
                 provider_ids: Some(HashMap::from([(
                     "Tmdb".to_owned(),
                     collection.tmdb_id.to_string(),
@@ -555,11 +557,9 @@ impl RemoteSearchProvider for OmdbSearchProvider {
         // that branch is unreachable until both exist.
         let is_episode = self.kind == crate::OmdbKind::Episode;
         let known = crate::OmdbSearchKey {
-            imdb_id: search_info
-                .provider_ids
-                .as_ref()
-                .and_then(|ids| ids.iter().find(|(key, _)| key.eq_ignore_ascii_case("Imdb")))
-                .map(|(_, value)| value.as_str())
+            // A blank id is no id (`string.IsNullOrWhiteSpace(imdbId)`); jellyfin-web
+            // sends "" for every id field left empty.
+            imdb_id: provider_id_of(search_info.provider_ids.as_ref(), "Imdb")
                 .filter(|_| !is_episode),
             season: is_episode
                 .then_some(search_info.parent_index_number)
@@ -6537,9 +6537,11 @@ mod tests {
         use super::{TmdbKind, TmdbSearchProvider};
 
         let body = r#"{"movie_results":[{"id":603,"title":"Resolved movie"}]}"#;
+        // `FindByExternalIdAsync` runs `NormalizeLanguage` over the whole
+        // list, which upper-cases everything after a region's hyphen.
         let server = crate::mock_http::MockServer::start(vec![
-            ("language=pt-BR%2Cnull%2Cen", body.to_owned()),
-            ("language=es-AR%2Cnull%2Cen", body.to_owned()),
+            ("language=pt-BR%2CNULL%2CEN", body.to_owned()),
+            ("language=es-AR%2CNULL%2CEN", body.to_owned()),
             ("language=null%2Cen", body.to_owned()),
         ])
         .await;
@@ -6718,6 +6720,17 @@ mod tests {
         // `ResultToMetadataResult` echoes the caller's index numbers.
         assert_eq!(results[0].index_number, Some(3));
         assert_eq!(results[0].parent_index_number, Some(7));
+
+        // jellyfin-web sends every id field it shows, a blank one as "": a
+        // blank id is no id (`string.IsNullOrWhiteSpace(imdbId)`), so the
+        // name is still parsed.
+        let mut req = named_request(BaseItemKind::Trailer, "Inception (2010)");
+        req.search_info.provider_ids = Some(HashMap::from([("Imdb".to_owned(), " ".to_owned())]));
+        assert_eq!(
+            provider.get_search_results(&req).await.expect("ok").len(),
+            1,
+            "a blank Imdb id must not skip ParseName"
+        );
 
         // An explicit `Year` wins over the one in the title (C# `year ??=`).
         let mut req = named_request(BaseItemKind::Trailer, "Inception (2010)");
@@ -9917,6 +9930,13 @@ mod tests {
                     "poster_path":"/lotr.jpg"}"#
                     .to_owned(),
             ),
+            // No poster of TMDB's own pick, only alternatives.
+            (
+                "/collection/120",
+                r#"{"id":120,"name":"Untitled Collection",
+                    "images":{"posters":[{"file_path":"/alt.jpg"}],"backdrops":[]}}"#
+                    .to_owned(),
+            ),
             // TMDB has no collection 999999 — the mock stands in for that with
             // a body the client cannot read, so `collection()` yields `None`.
             ("/collection/999999", "<not json>".to_owned()),
@@ -9944,6 +9964,15 @@ mod tests {
             Some("https://image.tmdb.org/t/p/original/lotr.jpg")
         );
         assert!(results[0].overview.is_none());
+
+        // The image is `GetPosterUrl(collection.PosterPath)` alone: with no
+        // poster_path there is none, whatever alternatives the images list.
+        let results = provider
+            .get_search_results(&id_request(BaseItemKind::BoxSet, &[("Tmdb", "120")]))
+            .await
+            .expect("results");
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].image_url, None);
 
         // An id TMDB does not answer for returns nothing — C# returns
         // `Enumerable.Empty` rather than falling back to the name search, which
