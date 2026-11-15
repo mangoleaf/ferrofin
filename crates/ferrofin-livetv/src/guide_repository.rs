@@ -418,7 +418,8 @@ pub async fn all_program_ids(db: &Database) -> Result<Vec<String>, ServiceError>
 /// Deletes the programmes whose ids are listed.
 ///
 /// The second half of the [`all_program_ids`] pair: `CleanDatabase` deletes the
-/// stale rows one item at a time upstream; here they go in bind-limit chunks.
+/// stale rows one item at a time upstream; here they go in
+/// [`ferrofin_db::BATCH_BIND_CHUNK`]-sized chunks.
 ///
 /// # Errors
 ///
@@ -488,7 +489,7 @@ pub(crate) async fn delete_programs_in(
     conn: &mut sqlx::SqliteConnection,
     ids: &[String],
 ) -> Result<(), ServiceError> {
-    for chunk in ids.chunks(IDS_PER_DELETE) {
+    for chunk in ids.chunks(ferrofin_db::BATCH_BIND_CHUNK) {
         delete_by_id_statement("FerrofinLiveTvPrograms", chunk)
             .build()
             .execute(&mut *conn)
@@ -498,7 +499,7 @@ pub(crate) async fn delete_programs_in(
     Ok(())
 }
 
-/// Deletes rows of `table` by id, in bind-limit chunks.
+/// Deletes rows of `table` by id, in [`ferrofin_db::BATCH_BIND_CHUNK`]-sized chunks.
 ///
 /// `table` is one of two crate-private literals, never caller input.
 async fn delete_by_id(
@@ -506,7 +507,7 @@ async fn delete_by_id(
     table: &'static str,
     ids: &[String],
 ) -> Result<(), ServiceError> {
-    for chunk in ids.chunks(IDS_PER_DELETE) {
+    for chunk in ids.chunks(ferrofin_db::BATCH_BIND_CHUNK) {
         delete_by_id_statement(table, chunk)
             .build()
             .execute(db.writer())
@@ -515,10 +516,6 @@ async fn delete_by_id(
     }
     Ok(())
 }
-
-/// How many ids one delete-by-id statement binds, under SQLite's
-/// 999-parameter limit.
-const IDS_PER_DELETE: usize = 500;
 
 /// The statement deleting the rows of `table` whose ids are `ids`.
 fn delete_by_id_statement(table: &'static str, ids: &[String]) -> sqlx::QueryBuilder<sqlx::Sqlite> {
