@@ -3742,7 +3742,7 @@ mod tests {
         assert_eq!(mime_for_extension("ts"), "video/mp2t");
         assert_eq!(mime_for_extension(".aac"), "audio/aac");
         assert_eq!(mime_for_extension(".mp3"), "audio/mpeg");
-        assert_eq!(mime_for_extension(".xyz"), "application/octet-stream");
+        assert_eq!(mime_for_extension(".zzz"), "application/octet-stream");
     }
 
     #[test]

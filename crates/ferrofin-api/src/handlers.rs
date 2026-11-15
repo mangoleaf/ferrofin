@@ -1751,9 +1751,10 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
                    protocol, file, and for video alone the disc-folder exception), with \
                    static_content_type, the type a file answers with (GetMimeType(\".\" + \
                    OutputContainer, false) ?? GetMimeType(MediaPath), the container as \
-                   StreamingHelpers.GetStreamingState sets it, compared 2026-11-13; a type \
-                   the ported MimeTypes table lacks keeps tower-http's guess from the path, \
-                   gl-1750) and \
+                   StreamingHelpers.GetStreamingState sets it, compared 2026-11-13; with \
+                   the MimeTypes package's whole table and GetMimeType(MediaPath)'s \
+                   application/octet-stream when neither names a type, compared \
+                   2026-11-14) and \
                    handlers/hls.rs transcode_stream_fallback \
                    (FileStreamResponseHelpers.GetTranscodedFile, which answers a HEAD before \
                    ffmpeg), which the transcode branch of /Audio/{itemId}/universal also \
@@ -4716,16 +4717,14 @@ pub const VERIFIED: &[Verified] = &[
         ferrofin: "handlers/subtitles.rs get_fallback_font (RequiredRouteString name: \
                ConvertEmptyStringToNull, then [Required]) → ferrofin-core file_system.rs \
                get_files, open_file → handlers/streaming.rs opened_file_response, \
-               physical_file_precondition",
+               physical_file_precondition; the type from ferrofin-model mime_types.rs \
+               get_mime_type (GetMimeType(fontFile.FullName), compared 2026-11-14)",
         date: "2026-10-30",
         divergences: &[
             "A precondition date outside HTTP's three formats or before 1970 is ignored; \
          ASP.NET's date parser takes both (a numeric offset, for one). No client sends one, \
          short of echoing the Last-Modified of a font dated before 1970, which then gets a \
          200 where upstream sends a 304.",
-            "The MIME type comes from mime_types.rs plus the font rows of the MimeTypes \
-         package; a font under an extension that package knows and this list does not is \
-         application/octet-stream. The list route serves four extensions, all covered.",
             "The EnableFallbackFont side effect of a missing FallbackFontPath is not ported, as \
          on GET /FallbackFont/Fonts.",
             "The 404 and 500 of a font that cannot be opened have Ferrofin's error shape, not \
