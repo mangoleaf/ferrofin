@@ -213,6 +213,17 @@ pub(crate) async fn resolve_descendant_query(
     Ok(Some(resolved))
 }
 
+/// Whether `parent` has any `LinkedChildren` row: C# `folder.LinkedChildren.Length > 0`,
+/// the test `SetTopParentIdsOrAncestors` makes before it scopes a box set or
+/// playlist by its descendant set.
+pub(crate) async fn has_linked_children(db: &Database, parent: Uuid) -> Result<bool, ServiceError> {
+    sqlx::query_scalar(r#"SELECT EXISTS (SELECT 1 FROM "LinkedChildren" WHERE "ParentId" = ?1)"#)
+        .bind(guid_to_db(parent))
+        .fetch_one(db.pool())
+        .await
+        .map_err(db_err)
+}
+
 /// One batched frontier query; all link kinds qualify, and only actual folders
 /// become new roots. Canonical JSON IDs avoid a bind per leaf or a variable cap.
 async fn discover_linked_roots(
@@ -1016,20 +1027,14 @@ impl FerrofinItemRepository {
         filter: &InternalItemsQuery,
         row: &BaseItemEntity,
     ) -> Result<ViewRow, ServiceError> {
-        let has_linked_children = filter.recursive
+        let linked = filter.recursive
             && matches!(
                 crate::item_type_lookup::kind_from_type_name(&row.type_),
                 Some(BaseItemKind::BoxSet | BaseItemKind::Playlist)
             )
-            && sqlx::query_scalar(
-                r#"SELECT EXISTS (SELECT 1 FROM "LinkedChildren" WHERE "ParentId" = ?1)"#,
-            )
-            .bind(guid_to_db(filter.parent_id))
-            .fetch_one(db.pool())
-            .await
-            .map_err(db_err)?;
+            && has_linked_children(db, filter.parent_id).await?;
         Ok(ViewRow {
-            has_linked_children,
+            has_linked_children: linked,
             ..view_row(row)
         })
     }
