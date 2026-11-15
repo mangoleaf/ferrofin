@@ -1312,12 +1312,14 @@ impl Harness {
         Scrape::parse(&response.text().await.expect("metrics text"))
     }
 
-    /// The settle window, MusicBrainz's pace, and the libraries: movies, a
-    /// series, a watched series and music, each with only the remote
-    /// fetchers the stand-in answers for ticked — TMDb's image fetcher for
-    /// movies, every other image fetcher off. The series library runs
-    /// TheTVDB after TheMovieDb for series and episodes, so the first scan
-    /// shows every provider answering, one after the other.
+    /// The settle window, MusicBrainz's pace, no task started by the time of
+    /// day (Intro Skipper's midnight run analysed every season inside a row
+    /// when a run crossed it, gl-1649) nor by Intro Skipper's own timer, and
+    /// the libraries: movies, a series, a watched series and music, each with
+    /// only the remote fetchers the stand-in answers for ticked — TMDb's
+    /// image fetcher for movies, every other image fetcher off. The series
+    /// library runs TheTVDB after TheMovieDb for series and episodes, so the
+    /// first scan shows every provider answering, one after the other.
     async fn configure(&mut self) {
         let mut config = self.get("/System/Configuration").await;
         config["LibraryMonitorDelay"] = json!(SETTLE_SECONDS);
@@ -1328,6 +1330,15 @@ impl Harness {
         self.post(
             &format!("/Plugins/{musicbrainz}/Configuration"),
             Some(&json!({"RateLimit": MUSICBRAINZ_RATE_LIMIT})),
+        )
+        .await;
+        boot::drop_wall_clock_triggers(&self.client, &self.base, &self.auth()).await;
+        // Intro Skipper's automatic analysis starts one to two minutes after
+        // the last video change, so a slow run could see it inside a row too.
+        let intro_skipper = "c83d86bba1e04c35a113e2101cf4ee6b";
+        self.post(
+            &format!("/Plugins/{intro_skipper}/Configuration"),
+            Some(&json!({"AutoDetectIntros": false})),
         )
         .await;
 
