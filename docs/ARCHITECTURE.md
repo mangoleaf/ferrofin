@@ -15,16 +15,28 @@ keyframes        networking   ├─ traits ─┬─ mediaencoding ─ hls
 chromaprint      health       │          ├─ drawing
                  metrics      │          ├─ providers
                               │          ├─ livetv
-                              │          └─ extensions
+                              │          ├─ extensions
+                              │          └─ wasm (plugin host)
                               └──────────────► core ─► api ─► server (bin)
 ```
 
-`ferrofin-traits` is the keystone: nothing above it imports `ferrofin-core`.
+`ferrofin-traits` is the keystone: nothing above it imports `ferrofin-core`
+(one exception is left, below).
 Jellyfin's C# has a reference cycle (implementations ↔ API) that is legal
 under .NET runtime DI but **forbidden by Cargo**. Porting
 `MediaBrowser.Controller`'s interfaces into a trait-only crate that both
 handlers and implementations depend on breaks the cycle, and lets the server
 run on stub implementations while a subsystem is unfinished.
+
+The plugin contracts live in `ferrofin-traits` too (`ScheduledTask`,
+`TaskProgress`, `RegisteredPlugin`, `PluginConfigPage`, the event consumer
+types), so the WASM plugin host takes `ferrofin-core` only as a dev-dependency
+for its tests. The exception is `ferrofin-extensions`, which still calls a few
+concrete `ferrofin-core` items: the task and user registries it registers
+with, the core media-segment task the Intro Skipper wraps and its page size
+(`PAGE_SIZE`), the Jellyfin XML importer (`config_import`), and the
+`video_versions` and `item_data` helpers Merge Versions reads. They are to move
+behind traits as well.
 
 Every manager trait is object-safe (`Arc<dyn Trait>`); `apps/ferrofin-server`
 is the composition root that constructs the concrete implementations and

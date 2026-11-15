@@ -24,7 +24,6 @@ use std::sync::atomic::Ordering;
 
 use async_trait::async_trait;
 use ferrofin_chromaprint::AnalysisMode;
-use ferrofin_core::{PluginConfigPage, ScheduledTask, TaskProgress};
 use ferrofin_db::entities::base_items::BaseItemEntity;
 use ferrofin_model::data::BaseItemKind;
 use ferrofin_model::intro_skipper::AnalysisMode as WireMode;
@@ -35,7 +34,8 @@ use ferrofin_traits::intro_skipper::{
 };
 use ferrofin_traits::library::{LibraryManager, VirtualFolderManager};
 use ferrofin_traits::media_segments::{MediaSegmentManager, MediaSegmentProvider};
-use ferrofin_traits::plugins::{PluginDescriptor, PluginManager};
+use ferrofin_traits::plugins::{PluginConfigPage, PluginDescriptor, PluginManager};
+use ferrofin_traits::tasks::{ScheduledTask, TaskProgress};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 

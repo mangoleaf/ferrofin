@@ -17,14 +17,15 @@
 
 use std::sync::Arc;
 
-use ferrofin_core::{
-    FerrofinTaskManager, FerrofinUserManager, PluginConfigPage, RegisteredPlugin, ScheduledTask,
-};
+use ferrofin_core::{FerrofinTaskManager, FerrofinUserManager};
 use ferrofin_traits::library::{LibraryManager, UserManager};
 use ferrofin_traits::media_segments::{MediaSegmentManager, MediaSegmentProvider};
 use ferrofin_traits::merge_versions::MergeVersionsManager;
-use ferrofin_traits::plugins::{PluginDescriptor, PluginManager};
+use ferrofin_traits::plugins::{
+    PluginConfigPage, PluginDescriptor, PluginManager, RegisteredPlugin,
+};
 use ferrofin_traits::security::{AuthenticationManager, PasswordResetManager};
+use ferrofin_traits::tasks::ScheduledTask;
 use uuid::Uuid;
 
 use crate::fingerprint::Fingerprinter;

@@ -18,6 +18,10 @@ fancy-regex.workspace = true
 ferrofin-chromaprint.workspace = true
 ferrofin-common.workspace = true
 ferrofin-traits.workspace = true
+# A few concrete items (the task and user registries, the core media-segment
+# task and `PAGE_SIZE`, `config_import`, the `video_versions` and `item_data`
+# helpers) until they move behind traits (gl-1829); then a dev-dependency, as
+# in ferrofin-wasm.
 ferrofin-core.workspace = true
 ferrofin-model.workspace = true
 ferrofin-naming.workspace = true

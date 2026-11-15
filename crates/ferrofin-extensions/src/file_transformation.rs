@@ -29,11 +29,11 @@ use std::sync::{Arc, Mutex, PoisonError, RwLock};
 use std::time::Duration;
 
 use async_trait::async_trait;
-use ferrofin_core::{PluginConfigPage, ScheduledTask};
 use ferrofin_traits::plugins::{
-    FileTransformationService, FileTransformer, PluginDescriptor, PluginManager,
+    FileTransformationService, FileTransformer, PluginConfigPage, PluginDescriptor, PluginManager,
 };
 use ferrofin_traits::system::LocalApiAccess;
+use ferrofin_traits::tasks::ScheduledTask;
 use ferrofin_util::http_client::HTTP_CLIENT_DEFAULT_TIMEOUT;
 use serde::Deserialize;
 use uuid::Uuid;

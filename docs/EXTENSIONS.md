@@ -50,7 +50,10 @@ the server's limits: no private address unless `image_private_http_allow` lists 
 is the same dependency-injection seam the rest of the server uses (see
 [`ARCHITECTURE.md`](ARCHITECTURE.md)), so an extension can do real work — scan the library,
 persist media segments, register background tasks — without reaching into implementation
-crates.
+crates. The contracts an extension implements (`Extension`'s `ScheduledTask` and
+`PluginConfigPage`) come from `ferrofin-traits`; the few concrete `ferrofin-core` items the
+crate still calls are listed in [`ARCHITECTURE.md`](ARCHITECTURE.md), and a new extension adds
+none.
 
 The curated set is registered **statically** in one place (`builtin_extensions()`); there is
 no discovery, no filesystem scan, no dynamic loading. Consequences:

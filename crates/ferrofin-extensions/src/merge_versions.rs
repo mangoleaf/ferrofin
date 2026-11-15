@@ -75,7 +75,6 @@ use std::path::Path;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use ferrofin_core::{PluginConfigPage, ScheduledTask, TaskProgress};
 use ferrofin_db::entities::base_items::BaseItemEntity;
 use ferrofin_model::data::BaseItemKind;
 use ferrofin_model::entities_media::VirtualFolderInfo;
@@ -87,7 +86,8 @@ use ferrofin_traits::library::{LibraryManager, VirtualFolderManager};
 use ferrofin_traits::merge_versions::{MergeProgress, MergeVersionsManager};
 use ferrofin_traits::options::InternalItemsQuery;
 use ferrofin_traits::persistence::{ItemPersistenceService, ItemRepository};
-use ferrofin_traits::plugins::{PluginDescriptor, PluginManager};
+use ferrofin_traits::plugins::{PluginConfigPage, PluginDescriptor, PluginManager};
+use ferrofin_traits::tasks::{ScheduledTask, TaskProgress};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
