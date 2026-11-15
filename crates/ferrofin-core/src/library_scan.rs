@@ -8650,6 +8650,10 @@ impl LibraryScanner {
             remove_existing: options.remove_old_metadata && options.replace_all_images,
             dynamic_images,
             stored: links.map(|l| l.images.as_slice()),
+            // The season premiere-date gate below, its one reader.
+            judge_local_images: season_base.is_none()
+                && !locked
+                && stored_row.is_some_and(is_season),
             cancel,
         };
         // Nothing of the item is touched yet: a cancel here leaves it whole.
@@ -8679,9 +8683,9 @@ impl LibraryScanner {
                 .probe_attachments
                 .insert(item.id, rows.attachments.clone());
         }
-        let ((artwork, cut_short), failed) = count_request_failures(Box::pin(
-            self.collect_artwork(item.id, art, state.art_cache),
-        ))
+        let ((artwork, cut_short, local_images_changed), failed) = count_request_failures(
+            Box::pin(self.collect_artwork(item.id, art, state.art_cache)),
+        )
         .await;
         state.art_cache.probe_attachments.remove(&item.id);
         // A cancel inside the artwork pass stops its fetches where they
@@ -8698,36 +8702,24 @@ impl LibraryScanner {
         // `UpdateImagesAsync` over a current child writes only the image rows
         // (`SaveImagesAsync`). Un-defer path: tell a measurement-only change
         // apart, write its rows, and leave `changed` and the saver update
-        // type to a changed set (keeping the season gate below in step).
+        // type to a changed set, and judge the season gate below the same
+        // way (its `image_files_changed` counts a moved date too).
         let images_changed = artwork
             .as_deref()
             .is_some_and(|images| images_changed(images, links.map(|l| l.images.as_slice())));
         // The other half of `UpdateMetadataFromChildren`'s gate for a season
         // (`isFullRefresh || updateType > None`, `MetadataService.cs:457`):
         // what `RefreshMetadata` adds to `updateType` before `BeforeSave` is
-        // the image validation (`:112-143`). Upstream derives the date onto
-        // the item before the providers, whose answer then replaces it field
-        // by field (`MergeBaseItemData`): so the derived date fills only the
-        // fields this pass's providers left unanswered (`supplied_dates`).
-        //
-        // TODO(parity, open work item — NOT an accepted divergence): upstream
-        // counts only the local image validation (`RemoveImages`,
-        // `ValidateImages`); `images_changed` also counts the NFO's artwork
-        // (`save_nfo_images`, which upstream saves after `BeforeSave`) and the
-        // remote image providers' downloads. The two differ when a changed
-        // `season.nfo` names artwork the season had none of, and on an image
-        // full refresh without a full metadata refresh
-        // (`ImageRefreshMode=FullRefresh` with `MetadataRefreshMode=Default`,
-        // which no jellyfin-web refresh choice sends): a season whose new
-        // artwork came only from its NFO or a remote image provider takes its
-        // episodes' date here, where upstream leaves it. Un-defer path: have
-        // `collect_artwork` report whether its local validation (before
-        // `save_nfo_images`) changed the stored set, and gate on that.
-        if images_changed
-            && season_base.is_none()
-            && !locked
-            && let Some(stored) = stored_row.filter(|row| is_season(row))
-        {
+        // the local image validation (`:112-143`), so the NFO's artwork and
+        // the remote image providers' downloads, saved after `BeforeSave`, do
+        // not open it (the item refresh route's image full refresh carries
+        // `ForceSave`, which is a full refresh). Upstream derives the date
+        // onto the item before the providers, whose answer then replaces it
+        // field by field (`MergeBaseItemData`): so the derived date fills only
+        // the fields this pass's providers left unanswered (`supplied_dates`).
+        // `local_images_changed` is set only for a stored, unlocked season
+        // outside a full refresh (`judge_local_images` above).
+        if local_images_changed && let Some(stored) = stored_row {
             let mut derived = stored.clone();
             if self.update_season_premiere_date(&mut derived).await? {
                 let (date_supplied, year_supplied) = supplied_dates;
@@ -13647,13 +13639,22 @@ impl LibraryScanner {
     /// a cancel cut one short. Each file is written whole between awaits, so
     /// the returned set (the art dir re-read after a cut-short remote fetch)
     /// is exactly the artwork on disk.
+    ///
+    /// The third says whether the local image validation changed the stored
+    /// images: `RemoveImages` removed some, or `ValidateImages` (local
+    /// discovery, the art dir and the kept stored images, before the NFO's
+    /// artwork and every image provider) names other files than the stored
+    /// set ([`image_files_changed`]). That is the `ImageUpdate` upstream's
+    /// `RefreshMetadata` has before `BeforeSave` (`MetadataService.cs:112-143`).
+    /// It is worked out only when `art.judge_local_images` asks for it, and is
+    /// `false` otherwise.
     #[allow(clippy::too_many_lines)]
     async fn collect_artwork(
         &self,
         item_id: Uuid,
         art: ArtworkPass<'_>,
         art_cache: &mut ArtworkCache,
-    ) -> (Option<Vec<ItemImageInfo>>, bool) {
+    ) -> (Option<Vec<ItemImageInfo>>, bool, bool) {
         let ArtworkPass {
             entity,
             streams,
@@ -13664,13 +13665,12 @@ impl LibraryScanner {
             remove_existing,
             dynamic_images,
             stored,
+            judge_local_images,
             cancel,
         } = art;
         let mut cut_short = false;
         let dirs = art_cache.dirs.clone();
-        if remove_existing {
-            self.remove_item_images(entity, stored);
-        }
+        let removed = remove_existing && self.remove_item_images(entity, stored);
         let remote = fetch != ImageFetch::None;
         let short = entity.type_.rsplit('.').next().unwrap_or(&entity.type_);
         // A photo's own file IS its Primary image (C# `PhotoProvider` sets it
@@ -13718,7 +13718,8 @@ impl LibraryScanner {
             cut_short |= self
                 .finish_artwork(item_id, entity, &mut images, stored, dirs.as_deref())
                 .await;
-            return (Some(images), cut_short);
+            // Embedded images are a photo's or a book's, never a season's.
+            return (Some(images), cut_short, false);
         }
         // "Local Images" is the media-adjacent discovery (poster.jpg next to the
         // file). Like the metadata art dir below, it is never gated: upstream's
@@ -13735,6 +13736,17 @@ impl LibraryScanner {
                 keep_stored_images(&mut images, stored, &self.virtual_paths);
             }
         }
+        // `ValidateImages`' set: an image full refresh adds the art dir and
+        // the kept images only after its fetch, so they are added here.
+        let local_changed = judge_local_images
+            && (removed || {
+                let mut local = images.clone();
+                if fetch == ImageFetch::All {
+                    self.append_art_dir_images(entity, &mut local);
+                    keep_stored_images(&mut local, stored, &self.virtual_paths);
+                }
+                image_files_changed(&local, stored)
+            });
         // The NFO's artwork URLs, before any image provider runs.
         // TODO(parity, open work item — gl-1818): an album's or an artist's
         // are not saved. Un-defer path: save them in the music pass, before
@@ -13804,6 +13816,7 @@ impl LibraryScanner {
         (
             (!images.is_empty() || stale_rows).then_some(images),
             cut_short,
+            local_changed,
         )
     }
 
@@ -14751,17 +14764,21 @@ impl LibraryScanner {
     /// `ItemImageProvider.RemoveImages` for the scan, by the shared
     /// [`remove_images`](ferrofin_providers::local_images::remove_images):
     /// the item's images in its own metadata folders go, so the pass supplies
-    /// them afresh.
-    fn remove_item_images(&self, entity: &BaseItemEntity, stored: Option<&[ItemImageInfo]>) {
+    /// them afresh. Returns whether any was removed (upstream's result).
+    fn remove_item_images(
+        &self,
+        entity: &BaseItemEntity,
+        stored: Option<&[ItemImageInfo]>,
+    ) -> bool {
         let (Some(meta_root), Some(stored)) = (&self.metadata_dir, stored) else {
-            return;
+            return false;
         };
         let folders = Uuid::parse_str(&entity.id).map_or_else(
             |_| vec![meta_root.join(&entity.id)],
             |id| crate::dynamic_images::internal_metadata_dirs(&meta_root.resolve(), id).to_vec(),
         );
         // The rows are rewritten from what the pass finds.
-        ferrofin_providers::local_images::remove_images(&mut stored.to_vec(), &folders, &entity.id);
+        ferrofin_providers::local_images::remove_images(&mut stored.to_vec(), &folders, &entity.id)
     }
 
     /// Appends rows for art files already sitting in the item's metadata art
@@ -19756,6 +19773,10 @@ struct ArtworkPass<'a> {
     dynamic_images: bool,
     /// The item's stored image rows, when known.
     stored: Option<&'a [ItemImageInfo]>,
+    /// Whether to work out if the local image validation changed the stored
+    /// images: only the season premiere-date gate reads it, for a stored,
+    /// unlocked season outside a full refresh.
+    judge_local_images: bool,
     /// The scan's cancellation, raced against every fetch and extraction.
     cancel: &'a ScanCancel,
 }
@@ -19866,10 +19887,7 @@ fn has_virtual_path_token(path: &str) -> bool {
 /// `save_item_images` writes (type, path, dimensions, blurhash and the
 /// `DateModified` text), so a rescan that finds the same files writes nothing.
 fn images_changed(images: &[ItemImageInfo], stored: Option<&[ItemImageInfo]>) -> bool {
-    let Some(stored) = stored else {
-        return true;
-    };
-    let key = |image: &ItemImageInfo| {
+    image_rows_differ(images, stored, |image| {
         (
             crate::item_repository::image_type_to_disc(image.image_type),
             image.path.clone(),
@@ -19878,9 +19896,36 @@ fn images_changed(images: &[ItemImageInfo], stored: Option<&[ItemImageInfo]>) ->
             image.blur_hash.clone(),
             ferrofin_db::store::datetime_to_db(image.date_modified),
         )
+    })
+}
+
+/// Whether `images` name other files than `stored`, or the same files at
+/// another date: what `ItemImageProvider.MergeImages` counts as a change (a
+/// new type or path, a stored file gone, a moved date), without the
+/// measurements, which the pass has not taken yet. `stored` is `None` when
+/// the rows could not be read.
+fn image_files_changed(images: &[ItemImageInfo], stored: Option<&[ItemImageInfo]>) -> bool {
+    image_rows_differ(images, stored, |image| {
+        (
+            crate::item_repository::image_type_to_disc(image.image_type),
+            image.path.clone(),
+            ferrofin_db::store::datetime_to_db(image.date_modified),
+        )
+    })
+}
+
+/// Whether `images` and `stored` differ as sets of `key`; always when
+/// `stored` is `None`.
+fn image_rows_differ<K: Ord>(
+    images: &[ItemImageInfo],
+    stored: Option<&[ItemImageInfo]>,
+    key: impl Fn(&ItemImageInfo) -> K,
+) -> bool {
+    let Some(stored) = stored else {
+        return true;
     };
-    let mut new: Vec<_> = images.iter().map(key).collect();
-    let mut old: Vec<_> = stored.iter().map(key).collect();
+    let mut new: Vec<_> = images.iter().map(&key).collect();
+    let mut old: Vec<_> = stored.iter().map(&key).collect();
     new.sort_unstable();
     old.sort_unstable();
     new != old
