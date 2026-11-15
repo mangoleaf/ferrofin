@@ -706,6 +706,18 @@ async fn verify_media_segment_library_options(api: &Api, item: &str) {
             usize::from(!disabled),
             "{served}"
         );
+        if !disabled {
+            let segment = &served["Items"][0];
+            assert_eq!(
+                (
+                    &segment["Type"],
+                    &segment["StartTicks"],
+                    &segment["EndTicks"]
+                ),
+                (&json!("Intro"), &json!(0), &json!(10_000_000)),
+                "the edit is published as posted: {served}"
+            );
+        }
         assert!(
             api.get(&format!("/Episode/{item}/Timestamps")).await["Introduction"].is_object(),
             "management access preserves hidden detections"
