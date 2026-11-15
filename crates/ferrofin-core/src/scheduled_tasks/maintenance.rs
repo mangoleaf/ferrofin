@@ -593,18 +593,27 @@ impl ScheduledTask for OptimizeDatabaseTask {
             }
         }
         tracing::info!("optimizing and vacuuming the database");
-        // Unlike upstream, no `ANALYZE`, and no `PRAGMA optimize` either: see
-        // the type's doc.
-        sqlx::query("VACUUM")
-            .execute(self.db.writer())
-            .await
-            .map_err(db_err)?;
-        progress.report(75.0);
-        // `PRAGMA wal_checkpoint(TRUNCATE)`, in turn with the background
-        // checkpoints: the vacuum's commit has just started one, which the
-        // truncation would otherwise answer busy against.
-        self.db.truncate_wal().await.map_err(ServiceError::from)?;
-        progress.report(100.0);
+        let optimized: Result<(), ServiceError> = async {
+            // Unlike upstream, no `ANALYZE`, and no `PRAGMA optimize` either:
+            // see the type's doc.
+            sqlx::query("VACUUM")
+                .execute(self.db.writer())
+                .await
+                .map_err(db_err)?;
+            progress.report(75.0);
+            // `PRAGMA wal_checkpoint(TRUNCATE)`, in turn with the background
+            // checkpoints: the vacuum's commit has just started one, which the
+            // truncation would otherwise answer busy against.
+            self.db.truncate_wal().await.map_err(ServiceError::from)?;
+            progress.report(100.0);
+            Ok(())
+        }
+        .await;
+        // `ExecuteAsync` catches whatever the optimisation throws and logs it,
+        // so a failed vacuum or checkpoint still ends the run `Completed`.
+        if let Err(error) = optimized {
+            tracing::error!(%error, "could not optimize the database");
+        }
         Ok(())
     }
 }
@@ -1431,6 +1440,43 @@ mod tests {
         let progress = TaskProgress::default();
         task.execute(&progress).await.expect("run");
         assert!((progress.current() - 100.0).abs() < f64::EPSILON);
+    }
+
+    /// `OptimizeDatabaseTask.ExecuteAsync` catches whatever the optimisation
+    /// throws and logs it, so a failed vacuum still ends the run `Completed`.
+    #[tokio::test]
+    async fn optimize_database_completes_when_the_vacuum_fails() {
+        let db = test_db().await;
+        let task = OptimizeDatabaseTask::new(
+            db.clone(),
+            idle_sessions(),
+            crate::test_support::library_manager_over(db.clone()),
+            retention_days(Some(30)),
+        );
+        db.writer().close().await;
+        let logs = crate::test_support::CapturedLogs::default();
+        let _guard = tracing::subscriber::set_default(
+            tracing_subscriber::fmt()
+                .with_writer(logs.clone())
+                .with_ansi(false)
+                .finish(),
+        );
+        let progress = TaskProgress::default();
+        task.execute(&progress)
+            .await
+            .expect("a failed vacuum is logged, not returned");
+        assert_eq!(progress.reported(), None, "the vacuum did not go through");
+        let failures: Vec<String> = logs
+            .text()
+            .lines()
+            .filter(|line| line.contains("could not optimize the database"))
+            .map(str::to_owned)
+            .collect();
+        assert_eq!(failures.len(), 1, "logged once: {failures:?}");
+        assert!(
+            failures[0].contains("ERROR") && failures[0].contains("closed pool"),
+            "at error, with the error: {failures:?}"
+        );
     }
 
     /// Ferrofin's playback-decision rows expire with the activity log: the
