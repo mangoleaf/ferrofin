@@ -2340,6 +2340,32 @@ pub struct Verified {
     pub refs: &'static [&'static str],
 }
 
+/// The code path the two scheduled-task read rows share after their handler:
+/// `ScheduledTaskHelpers.GetTaskInfo` over the task's worker.
+macro_rules! scheduled_task_info {
+    () => {
+        "Registration::to_info (ScheduledTaskHelpers.GetTaskInfo: Name, Description and \
+         Category through GetLocalizedString, in the request's CurrentUICulture, where the task \
+         localizes (every core task but RefreshGuide and TmdbRefreshUpcomingEpisodes, whose \
+         upstream text is literal; an extension or WASM task shows its own text); State; \
+         CurrentProgress only while a run is live, as ExecuteInternal nulls it after; Id, the \
+         MD5 of the C# task type (a WASM plugin task's: of Ferrofin.ScheduledTasks.<key>); \
+         IsHidden, which can be true only for RefreshGuide (no tuner host) and \
+         RefreshInternetChannels (no channel), as GetTaskInfo reads it only from an \
+         IConfigurableScheduledTask and no other configurable task hides; Key; \
+         Triggers, the saved ones else the task's defaults, saved meaning Ferrofin's trigger \
+         store, else an adopted Jellyfin's {ConfigurationDirectoryPath}/ScheduledTasks/\
+         {new Guid(Id)}.js read as LoadTriggerSettings reads a file Jellyfin wrote, null \
+         entries dropped; LastExecutionResult, the history store's, else an adopted Jellyfin's \
+         {DataPath}/ScheduledTasks/{new Guid(Id)}.js read once at registration as the \
+         LastExecutionResult getter reads a file Jellyfin wrote, a missing time or status as its \
+         default, an empty or malformed file skipped). The registry also holds the compiled-in \
+         extensions' tasks and any WASM plugin's (the plugin tiers, docs/EXTENSIONS.md), as \
+         upstream lists an installed plugin's: a disabled plugin's stay listed, their runs \
+         no-ops, and FERROFIN_DISABLE_EXTENSIONS leaves the compiled-in ones out"
+    };
+}
+
 /// The code path the item image rows share after their handler.
 macro_rules! item_image_tail {
     () => {
@@ -5588,6 +5614,49 @@ pub const VERIFIED: &[Verified] = &[
         refs: &[],
     },
     Verified {
+        method: "get",
+        path: "/ScheduledTasks",
+        upstream_file: "Jellyfin.Api/Controllers/ScheduledTasksController.cs",
+        upstream_method: "GetTasks",
+        ferrofin: concat!(
+            "handlers/scheduled_tasks.rs get_tasks (RequireAdmin, Policies.RequiresElevation; \
+             isHidden and isEnabled as bool?) → ferrofin-core scheduled_tasks.rs list_filtered \
+             (ScheduledTasks.OrderBy(o => o.Name) in the current culture; the two filters only \
+             on an IConfigurableScheduledTask) → ",
+            scheduled_task_info!()
+        ),
+        date: "2026-11-15",
+        divergences: &[
+            ADOPTED_TRIGGER_FILE_DIVERGENCE,
+            ADOPTED_FILE_LENIENCY_DIVERGENCE,
+            "The 400 (an isHidden or isEnabled value the query binder cannot convert), 401 (no \
+         or bad token) and 403 (not an administrator) bodies are Ferrofin's error shape, not \
+         upstream's. Fix path: gl-666.",
+        ],
+        refs: &[],
+    },
+    Verified {
+        method: "get",
+        path: "/ScheduledTasks/{taskId}",
+        upstream_file: "Jellyfin.Api/Controllers/ScheduledTasksController.cs",
+        upstream_method: "GetTask",
+        ferrofin: concat!(
+            "handlers/scheduled_tasks.rs get_task (RequireAdmin, Policies.RequiresElevation; \
+             RequiredRouteString taskId: ConvertEmptyStringToNull, then [Required]) → \
+             ferrofin-core scheduled_tasks.rs get_task (the Id matched ignoring case, as \
+             OrdinalIgnoreCase; none is the 404) → ",
+            scheduled_task_info!()
+        ),
+        date: "2026-11-15",
+        divergences: &[
+            ADOPTED_TRIGGER_FILE_DIVERGENCE,
+            ADOPTED_FILE_LENIENCY_DIVERGENCE,
+            "The 401 (no or bad token), 403 (not an administrator) and 404 (no task has that \
+         id) bodies are Ferrofin's error shape, not upstream's. Fix path: gl-666.",
+        ],
+        refs: &[],
+    },
+    Verified {
         method: "delete",
         path: "/ScheduledTasks/Running/{taskId}",
         upstream_file: "Jellyfin.Api/Controllers/ScheduledTasksController.cs",
@@ -6159,6 +6228,22 @@ pub const VERIFIED: &[Verified] = &[
         refs: &[],
     },
 ];
+
+/// The two scheduled-task read rows: an adopted trigger file upstream cannot
+/// load.
+const ADOPTED_TRIGGER_FILE_DIVERGENCE: &str = "An adopted trigger file upstream's LoadTriggers \
+     throws on does not stop Ferrofin: an empty file, malformed JSON (a syntax error, or a \
+     value of the wrong shape), or a trigger type or weekday no enum member names leaves the task on its default triggers \
+     (with a warning, except for an empty file), and a trigger without the time of day, \
+     weekday or interval its type needs is kept and never fires; Jellyfin fails to start. \
+     Jellyfin bug not ported.";
+
+/// The two scheduled-task read rows: the System.Text.Json leniencies a file
+/// read here does not mirror.
+const ADOPTED_FILE_LENIENCY_DIVERGENCE: &str = "An adopted task file that leans on \
+     System.Text.Json's leniency (a trigger without Type, a numeric Status, a number written \
+     as a string) is skipped as unreadable, where upstream reads it; Jellyfin never writes \
+     one. Fix path: gl-1845.";
 
 /// What `/Artists` and `/Artists/AlbumArtists` do differently from v12's
 /// `ArtistsController` + `BaseItemRepository.GetItemValues`.

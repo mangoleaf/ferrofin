@@ -893,14 +893,6 @@ kind = "length"
 issue = 539
 reason = "Ferrofin's own plugin, its settings, is listed beside the in-tree ones, so the list is one longer."
 
-# Ferrofin does not read the task history an adopted Jellyfin data directory keeps.
-[[entry]]
-request = "GetTasks"
-path = "[].LastExecutionResult"
-kind = "missing"
-issue = 870
-reason = "Ferrofin does not read the task history an adopted Jellyfin data directory keeps."
-
 # A task's raw key stands in for its name, so it sorts elsewhere and the task rows shift.
 [[entry]]
 request = "GetTasks"
