@@ -370,7 +370,13 @@ impl PrivateAllowList {
 
     /// One entry: a network in CIDR form, an address, or a host name.
     fn entry(entry: &str) -> Result<Entry, &'static str> {
-        if entry.contains('/') {
+        if let Some((address, _)) = entry.split_once('/') {
+            // As strict as a bare address below: an old numeric spelling
+            // (`0x7f.1`, octal `010`) that the network parser reads as .NET
+            // does is refused, not taken for another network.
+            if address.trim_matches(['[', ']']).parse::<IpAddr>().is_err() {
+                return Err("is not a network in CIDR form (address/prefix length)");
+            }
             return ferrofin_networking::net_utils::try_parse_to_subnet(entry, false)
                 .map(|data| Entry::Network(data.subnet))
                 .ok_or("is not a network in CIDR form (address/prefix length)");
@@ -622,6 +628,7 @@ mod tests {
     #[case::address("192.168.1.20", "nas.lan", "192.168.1.20", true)]
     #[case::other_address("192.168.1.20", "nas.lan", "192.168.1.21", false)]
     #[case::bracketed_v6("[fd00::5]", "x", "fd00::5", true)]
+    #[case::bracketed_v6_network("[fd00::]/8", "x", "fd12::1", true)]
     #[case::host_name_any_address("NAS.lan", "nas.LAN", "10.9.9.9", true)]
     #[case::host_name_trailing_dot("nas.lan", "nas.lan.", "10.9.9.9", true)]
     #[case::other_host_name("nas.lan", "router.lan", "10.9.9.9", false)]
@@ -653,6 +660,11 @@ mod tests {
     #[case::unspecified("0.0.0.0")]
     #[case::unspecified_v6("::")]
     #[case::rewritten_by_a_url("0x7f.1")]
+    #[case::numeric_network("0x7f.1/8")]
+    #[case::octal_network("192.168.010.0/24")]
+    #[case::bare_integer_network("0/0")]
+    #[case::scoped_network("fe80::%eth0/10")]
+    #[case::network_with_a_port("[fd00::]:80/8")]
     #[case::wildcard("*")]
     #[case::wildcard_domain("*.lan")]
     fn a_bad_entry_is_refused_and_allows_nothing(#[case] entry: &str) {

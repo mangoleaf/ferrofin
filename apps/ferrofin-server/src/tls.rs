@@ -391,7 +391,7 @@ pub async fn redirect_to_https(
         );
         HeaderValue::from_str(&format!(
             "https://{authority}{}{path}{query}",
-            redirect.base
+            ferrofin_networking::escape_base_url(&redirect.base)
         ))
         .ok()
     });
@@ -418,8 +418,8 @@ pub async fn redirect_to_https(
     let network = redirect.network.as_deref();
     ferrofin_api::response_time::with_response_time(
         config,
-        |peer, forwarded_for| {
-            ferrofin_api::forwarded_headers::client_address_through(network, peer, forwarded_for)
+        |peer, headers| {
+            ferrofin_api::forwarded_headers::client_address_through(network, peer, headers)
         },
         request,
         cors,
@@ -979,6 +979,13 @@ mod tests {
         "example.com:8096",
         "/System/Info/Public?x=1",
         "https://example.com:8920/jf/System/Info/Public?x=1"
+    )]
+    #[case::base_escaped(
+        8920,
+        "/my jellyfin",
+        "example.com:8096",
+        "/web/",
+        "https://example.com:8920/my%20jellyfin/web/"
     )]
     #[case::default_port_left_out(
         443,

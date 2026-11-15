@@ -67,16 +67,46 @@ use crate::item_type_lookup::stored_type_name;
 use crate::kinds::supports_similarity;
 use crate::similar_items_repository::SimilarItemsRepository;
 
-/// Reads an unexpired reference cache, or `None` when it is missing, stale or
-/// unparseable.
-async fn read_reference_cache(path: &Path) -> Option<Vec<SimilarItemReference>> {
-    // A missing entry is the normal cache miss and says nothing; an entry that
-    // exists but will not parse is worth one warning (C# logs the same).
-    let raw = tokio::fs::read_to_string(path).await.ok()?;
-    let cache: SimilarItemsCache = match serde_json::from_str(&raw) {
-        Ok(cache) => cache,
+/// Reads an unexpired reference cache, or `None` when it is missing, empty,
+/// stale or unreadable — C# `TryReadSimilarItemsCacheAsync`.
+///
+/// A missing or empty entry, or one without references, is the normal cache
+/// miss and says nothing. An entry that exists but cannot be read (permission
+/// denied, a directory at its path, an I/O error) or will not parse is a miss
+/// worth one warning, as upstream's `IOException` and `JsonException` arms log.
+async fn read_reference_cache(
+    path: &Path,
+    provider: &str,
+    item_id: Uuid,
+) -> Option<Vec<SimilarItemReference>> {
+    let raw = match tokio::fs::read(path).await {
+        Ok(raw) => raw,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return None,
         Err(err) => {
-            tracing::warn!(%err, path = %path.display(), "similar-items cache is unreadable");
+            tracing::warn!(
+                %err,
+                provider,
+                %item_id,
+                path = %path.display(),
+                "could not read similar-items cache"
+            );
+            return None;
+        }
+    };
+    if raw.is_empty() {
+        return None;
+    }
+    // A JSON `null` entry is C#'s null cache: a silent miss.
+    let cache: SimilarItemsCache = match serde_json::from_slice::<Option<SimilarItemsCache>>(&raw) {
+        Ok(cache) => cache?,
+        Err(err) => {
+            tracing::warn!(
+                %err,
+                provider,
+                %item_id,
+                path = %path.display(),
+                "could not parse similar-items cache"
+            );
             return None;
         }
     };
@@ -85,7 +115,7 @@ async fn read_reference_cache(path: &Path) -> Option<Vec<SimilarItemReference>> 
     }
     Some(
         cache
-            .references
+            .references?
             .into_iter()
             .map(|r| SimilarItemReference {
                 provider_name: r.provider_name,
@@ -107,14 +137,16 @@ async fn write_reference_cache(path: &Path, references: &[SimilarItemReference],
         return;
     };
     let cache = SimilarItemsCache {
-        references: references
-            .iter()
-            .map(|r| CachedReference {
-                provider_name: r.provider_name.clone(),
-                provider_id: r.provider_id.clone(),
-                score: r.score,
-            })
-            .collect(),
+        references: Some(
+            references
+                .iter()
+                .map(|r| CachedReference {
+                    provider_name: r.provider_name.clone(),
+                    provider_id: r.provider_id.clone(),
+                    score: r.score,
+                })
+                .collect(),
+        ),
         expires_at: chrono::Utc::now() + ttl,
     };
     let Ok(json) = serde_json::to_vec(&cache) else {
@@ -174,9 +206,12 @@ const PROVIDER_ORDER_BOOST: f32 = 0.005;
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "PascalCase")]
 struct SimilarItemsCache {
-    /// The cached references.
-    references: Vec<CachedReference>,
-    /// When the entry stops being usable.
+    /// The cached references; a missing or `null` list is a miss, as C#'s
+    /// `cache?.References is not null` check makes it.
+    references: Option<Vec<CachedReference>>,
+    /// When the entry stops being usable; a missing one is C#'s
+    /// `default(DateTime)`, already expired.
+    #[serde(default)]
     expires_at: chrono::DateTime<chrono::Utc>,
 }
 
@@ -357,13 +392,17 @@ struct LocalFilter {
     unplayed_only: bool,
     /// Whether the request's `ExcludeArtistIds` apply (the music providers).
     honours_exclude_artist_ids: bool,
+    /// C# `EnableGroupByMetadataKey` on the flat query, which only the
+    /// movie-like programme branch sets: the repository then reads 4 rows past
+    /// the limit, to replace the ones the id-and-key claim drops.
+    enable_group_by_metadata_key: bool,
 }
 
 /// Which C# local similarity provider serves a seed's kind — the two shapes
 /// upstream ships.
 ///
-/// `MovieSimilarItemsProvider` (the `Movie`/`Trailer` seeds) is the only
-/// weighted one; `SeriesSimilarItemsProvider`,
+/// `MovieSimilarItemsProvider` (the `Movie`/`Trailer` seeds, and every
+/// recommendation baseline) is the only weighted one; `SeriesSimilarItemsProvider`,
 /// `MusicAlbum`/`MusicArtist`/`AudioSimilarItemsProvider` and
 /// `LiveTvProgramSimilarItemsProvider` are each one flat `InternalItemsQuery`
 /// over the seed's genres and tags.
@@ -383,7 +422,8 @@ struct LocalRequest<'a> {
     seed: &'a BaseItemEntity,
     /// The seed's id, parsed.
     seed_id: Uuid,
-    /// The seed's kind.
+    /// The kind whose local provider serves the request: the seed's own, or
+    /// `Movie` for a recommendation baseline.
     kind: BaseItemKind,
     /// The request's `ExcludeArtistIds`.
     exclude_artist_ids: &'a [Uuid],
@@ -397,6 +437,8 @@ struct LocalRequest<'a> {
 struct RemoteRequest<'a> {
     /// The seed row.
     seed: &'a BaseItemEntity,
+    /// The seed's id.
+    seed_id: Uuid,
     /// The seed's external ids, which key a remote provider's lookup.
     seed_provider_ids: &'a HashMap<String, String>,
     /// The query the provider is handed.
@@ -651,14 +693,15 @@ impl FerrofinSimilarItemsManager {
     /// gets an empty filter, i.e. no local results.
     async fn local_filter(&self, seed: &BaseItemEntity, kind: BaseItemKind) -> LocalFilter {
         match kind {
-            // `MovieSimilarItemsProvider` (Movie + Trailer seeds): movie kinds,
-            // `IsMovie = true`, `IsPlayed = false`.
+            // `MovieSimilarItemsProvider` (Movie + Trailer seeds, and every
+            // recommendation baseline): movie kinds, `IsMovie = true`,
+            // `IsPlayed = false`.
             BaseItemKind::Movie | BaseItemKind::Trailer => LocalFilter {
                 scorer: LocalScorer::Weighted,
                 include_item_types: self.movie_candidate_kinds().await,
                 is_movie: Some(true),
                 unplayed_only: true,
-                honours_exclude_artist_ids: false,
+                ..LocalFilter::default()
             },
             BaseItemKind::Series => LocalFilter::of_kinds(vec![BaseItemKind::Series]),
             BaseItemKind::MusicAlbum => LocalFilter::music(BaseItemKind::MusicAlbum),
@@ -669,9 +712,10 @@ impl FerrofinSimilarItemsManager {
             }
             // `LiveTvProgramSimilarItemsProvider` picks the list by the
             // program's own flags; it sets neither `IsMovie` nor `IsPlayed`.
-            BaseItemKind::LiveTvProgram if seed.is_movie => {
-                LocalFilter::of_kinds(self.movie_candidate_kinds().await)
-            }
+            BaseItemKind::LiveTvProgram if seed.is_movie => LocalFilter {
+                enable_group_by_metadata_key: true,
+                ..LocalFilter::of_kinds(self.movie_candidate_kinds().await)
+            },
             BaseItemKind::LiveTvProgram if seed.is_series => {
                 LocalFilter::of_kinds(vec![BaseItemKind::Series])
             }
@@ -711,7 +755,8 @@ impl FerrofinSimilarItemsManager {
     /// new InternalItemsQuery(query.User) {
     ///     Genres = item.Genres, Tags = item.Tags, Limit = query.Limit,
     ///     ExcludeItemIds = [..query.ExcludeItemIds], IncludeItemTypes = [<kind>],
-    ///     EnableGroupByMetadataKey = false, EnableTotalRecordCount = true,
+    ///     EnableGroupByMetadataKey = false, EnableTotalRecordCount = true
+    ///     (true and false for a movie-like programme),
     ///     OrderBy = [(ItemSortBy.Random, SortOrder.Ascending)] }
     /// ```
     ///
@@ -755,6 +800,7 @@ impl FerrofinSimilarItemsManager {
             // `OrderBy = [(ItemSortBy.Random, SortOrder.Ascending)]` — see the
             // doc comment above for the five C# call sites that emit it.
             order_by: vec![(ItemSortBy::Random, SortOrder::Ascending)],
+            enable_group_by_metadata_key: filter.enable_group_by_metadata_key,
             ..InternalItemsQuery::default()
         };
         if let Some(user) = request.user
@@ -846,22 +892,39 @@ impl FerrofinSimilarItemsManager {
 
     /// Runs the local provider and appends its results at `provider_order`,
     /// skipping anything already taken.
+    ///
+    /// A failure is logged and adds nothing, so the request goes on with the
+    /// remote providers: C# `GetSimilarItemsAsync` catches every provider's
+    /// exception and logs "Similar items provider {ProviderName} failed for
+    /// item {ItemId}". The request then succeeds, so this is the one place the
+    /// error is logged.
     async fn push_local_results(
         &self,
         request: &LocalRequest<'_>,
         provider_order: usize,
         claimed: &mut Seen,
         scored: &mut Vec<(BaseItemEntity, f32)>,
-    ) -> Result<(), ServiceError> {
+    ) {
         let remaining = request.wanted - i32::try_from(scored.len()).unwrap_or(0);
         if remaining <= 0 {
-            return Ok(());
+            return;
         }
         // C# hands the local provider `ExcludeItemIds`, so its `Limit` yields
         // that many *new* rows. Filtering in Rust instead would let each
         // duplicate burn a slot and under-fill the requested limit.
         let exclude: Vec<Uuid> = claimed.ids();
-        let by_overlap = self.local_similar(request, &exclude, remaining).await?;
+        let by_overlap = match self.local_similar(request, &exclude, remaining).await {
+            Ok(rows) => rows,
+            Err(error) => {
+                tracing::warn!(
+                    provider = LOCAL_SIMILARITY_PROVIDER,
+                    item_id = %request.seed_id,
+                    error = %error,
+                    "similar items provider failed for item"
+                );
+                return;
+            }
+        };
         let wanted_len = usize::try_from(request.wanted).unwrap_or(0);
         for (position, entity) in by_overlap.into_iter().enumerate() {
             if scored.len() >= wanted_len {
@@ -873,7 +936,6 @@ impl FerrofinSimilarItemsManager {
                 scored.push((entity, calculate_score(None, provider_order, position)));
             }
         }
-        Ok(())
     }
 
     /// One remote provider's results for the request, resolved against the
@@ -903,7 +965,7 @@ impl FerrofinSimilarItemsManager {
         let (kind, user) = (request.kind, request.user);
         let cache_path = self.cache_path(provider.name(), request.seed);
         if let Some(path) = cache_path.as_deref()
-            && let Some(cached) = read_reference_cache(path).await
+            && let Some(cached) = read_reference_cache(path, provider.name(), request.seed_id).await
         {
             return self
                 .resolve_remote_references(&cached, provider_order, kind, user, claimed)
@@ -1165,11 +1227,13 @@ impl FerrofinSimilarItemsManager {
         // `IBatchLocalSimilarItemsProvider` and calls that alone — remote
         // providers never take part, so a category never fans out to TMDB
         // once per baseline — and hands it the user, so the movie provider's
-        // unplayed/access filter applies here too.
+        // unplayed/access filter applies here too. That provider,
+        // `MovieSimilarItemsProvider`, scores every baseline, whatever its
+        // kind: a liked Live TV programme is weighted like a movie.
         let request = LocalRequest {
             seed,
             seed_id,
-            kind: kind_of(seed),
+            kind: BaseItemKind::Movie,
             exclude_artist_ids: &[],
             user: Some(user),
             wanted: item_limit,
@@ -1398,7 +1462,20 @@ impl SimilarItemsManager for FerrofinSimilarItemsManager {
         let seed_provider_ids = if providers.is_empty() {
             HashMap::new()
         } else {
-            self.repo.provider_ids(item_id).await.unwrap_or_default()
+            // Upstream reads the ids off the loaded item, so it cannot fail
+            // here; the remote providers then run without them, which must not
+            // be silent.
+            self.repo
+                .provider_ids(item_id)
+                .await
+                .unwrap_or_else(|error| {
+                    tracing::warn!(
+                        item_id = %item_id,
+                        error = %error,
+                        "reading the seed's provider ids failed; the remote similar items providers run without them"
+                    );
+                    HashMap::new()
+                })
         };
 
         // Resolved once: every provider's queries share it.
@@ -1424,7 +1501,7 @@ impl SimilarItemsManager for FerrofinSimilarItemsManager {
             if !ran_local && local_order <= index {
                 ran_local = true;
                 self.push_local_results(&local, index, &mut claimed, &mut scored)
-                    .await?;
+                    .await;
             }
             if scored.len() >= wanted_len {
                 break;
@@ -1440,6 +1517,7 @@ impl SimilarItemsManager for FerrofinSimilarItemsManager {
             };
             let request = RemoteRequest {
                 seed: &seed,
+                seed_id: item_id,
                 seed_provider_ids: &seed_provider_ids,
                 query: &query,
                 kind,
@@ -1456,7 +1534,7 @@ impl SimilarItemsManager for FerrofinSimilarItemsManager {
             // number of remote providers ahead of it, which still earns the
             // rank boost C# gives it.
             self.push_local_results(&local, remote_count, &mut claimed, &mut scored)
-                .await?;
+                .await;
         }
 
         // Highest score first. The sort is deliberately left STABLE with no
@@ -2153,6 +2231,71 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_failing_local_scorer_is_logged_and_the_remote_matches_still_answer() {
+        // C# `GetSimilarItemsAsync` runs each provider inside a catch that logs
+        // "Similar items provider {ProviderName} failed for item {ItemId}" and
+        // goes on, so the request answers the other providers' matches.
+        let db = test_db().await;
+        let library = Uuid::from_u128(0x9ab_cdf);
+        let seed = Uuid::from_u128(0x921);
+        let remote_match = Uuid::from_u128(0x922);
+        seed_movie_in(&db, seed, "Alien", "SciFi", Some(library)).await;
+        seed_movie_in(&db, remote_match, "Solaris", "Drama", Some(library)).await;
+        FerrofinItemPersistenceService::new(db.clone())
+            .save_provider_id(remote_match, "Tmdb", "348")
+            .await
+            .expect("save id");
+        crate::similar_items_repository::test_hooks::break_the_score_pass(&db).await;
+
+        // The local scorer ranked last, then first: both call sites.
+        for providers in [vec!["TheMovieDb"], vec!["Local Genre/Tag", "TheMovieDb"]] {
+            let mgr = manager(&db).with_remote_providers(
+                vec![Arc::new(FakeRemote {
+                    name: "TheMovieDb",
+                    kind: BaseItemKind::Movie,
+                    references: vec![SimilarItemReference {
+                        provider_name: "Tmdb".to_owned(),
+                        provider_id: "348".to_owned(),
+                        score: None,
+                    }],
+                    cache: None,
+                    calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                })],
+                Arc::new(FakeFolders {
+                    library_id: library,
+                    providers: providers.iter().map(|&p| p.to_owned()).collect(),
+                }),
+            );
+            let logs = crate::test_support::CapturedLogs::default();
+            let similar = {
+                let _guard = tracing::subscriber::set_default(
+                    tracing_subscriber::fmt()
+                        .with_writer(logs.clone())
+                        .with_ansi(false)
+                        .finish(),
+                );
+                mgr.get_similar_items(seed, &[], None, &DtoOptions::default(), None)
+                    .await
+                    .expect("a failing local scorer does not fail the request")
+                    .expect("seed resolves")
+            };
+            assert_eq!(names(&similar), ["Solaris"], "{providers:?}");
+            let text = logs.text();
+            let warned = text
+                .lines()
+                .filter(|line| line.contains("similar items provider failed"))
+                .collect::<Vec<_>>();
+            assert_eq!(warned.len(), 1, "logged once: {providers:?}: {text}");
+            assert!(
+                warned[0].contains("WARN")
+                    && warned[0].contains(r#"provider="Local Genre/Tag""#)
+                    && warned[0].contains(&format!("item_id={seed}")),
+                "{providers:?}: {text}"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn external_content_switch_keeps_the_selected_remote_provider_running() {
         let db = test_db().await;
         let library = Uuid::from_u128(0xD049);
@@ -2375,10 +2518,13 @@ mod tests {
             .await
             .expect("seed")
             .expect("seed row");
-        let cached =
-            read_reference_cache(&mgr.cache_path("TheMovieDb", &seed_row).expect("cache path"))
-                .await
-                .expect("cached references");
+        let cached = read_reference_cache(
+            &mgr.cache_path("TheMovieDb", &seed_row).expect("cache path"),
+            "TheMovieDb",
+            seed,
+        )
+        .await
+        .expect("cached references");
         assert_eq!(cached, tmdb_references(500));
     }
 
@@ -2895,16 +3041,26 @@ mod tests {
         }];
         super::write_reference_cache(&path, &references, Duration::from_mins(1)).await;
         assert_eq!(
-            super::read_reference_cache(&path).await.as_deref(),
+            super::read_reference_cache(&path, "TheMovieDb", Uuid::nil())
+                .await
+                .as_deref(),
             Some(&references[..])
         );
 
         // An expired entry is ignored rather than served stale.
         super::write_reference_cache(&path, &references, Duration::from_secs(0)).await;
-        assert_eq!(super::read_reference_cache(&path).await, None);
+        assert_eq!(
+            super::read_reference_cache(&path, "TheMovieDb", Uuid::nil()).await,
+            None
+        );
         // A missing file is simply a miss.
         assert_eq!(
-            super::read_reference_cache(dir.path().join("nope.json").as_path()).await,
+            super::read_reference_cache(
+                dir.path().join("nope.json").as_path(),
+                "TheMovieDb",
+                Uuid::nil()
+            )
+            .await,
             None
         );
     }
@@ -2933,9 +3089,11 @@ mod tests {
             .expect("read the open entry");
         let before: super::SimilarItemsCache =
             serde_json::from_str(&before).expect("the open entry parses");
-        assert_eq!(before.references[0].provider_id, "348");
+        assert_eq!(before.references.expect("references")[0].provider_id, "348");
         assert_eq!(
-            super::read_reference_cache(&path).await.as_deref(),
+            super::read_reference_cache(&path, "TheMovieDb", Uuid::nil())
+                .await
+                .as_deref(),
             Some(&[reference("1091")][..])
         );
         // No temporary file is left beside the entry.
@@ -2943,6 +3101,95 @@ mod tests {
             .expect("list the cache directory")
             .count();
         assert_eq!(entries, 1);
+    }
+
+    /// Reads a cache entry under a scoped subscriber, returning the result
+    /// and the lines that read logged at warn.
+    async fn read_logging(path: &Path) -> (Option<Vec<SimilarItemReference>>, Vec<String>) {
+        let logs = crate::test_support::CapturedLogs::default();
+        let read = {
+            let _guard = tracing::subscriber::set_default(
+                tracing_subscriber::fmt()
+                    .with_writer(logs.clone())
+                    .with_ansi(false)
+                    .finish(),
+            );
+            super::read_reference_cache(path, "TheMovieDb", Uuid::from_u128(0x1652)).await
+        };
+        let warned = logs
+            .text()
+            .lines()
+            .filter(|line| line.contains("WARN"))
+            .map(str::to_owned)
+            .collect();
+        (read, warned)
+    }
+
+    /// `TryReadSimilarItemsCacheAsync`'s cases (gl-1652): a missing, empty or
+    /// `null` entry, or one without references or expiry, is a silent miss; a
+    /// non-empty entry that will not parse is a miss that warns once.
+    #[rstest::rstest]
+    #[case::missing(None, None)]
+    #[case::empty(Some(""), None)]
+    #[case::null(Some("null"), None)]
+    #[case::null_references(
+        Some(r#"{"References":null,"ExpiresAt":"2999-01-01T00:00:00Z"}"#),
+        None
+    )]
+    #[case::no_references(Some(r#"{"ExpiresAt":"2999-01-01T00:00:00Z"}"#), None)]
+    #[case::no_expiry(Some(r#"{"References":[]}"#), None)]
+    #[case::truncated(
+        Some(r#"{"References":["#),
+        Some("could not parse similar-items cache")
+    )]
+    #[tokio::test]
+    async fn a_cache_read_warns_only_when_an_entry_fails(
+        #[case] content: Option<&str>,
+        #[case] warning: Option<&str>,
+    ) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("x.json");
+        if let Some(content) = content {
+            std::fs::write(&path, content).expect("write the entry");
+        }
+        let (read, warned) = read_logging(&path).await;
+        assert_eq!(read, None);
+        match warning {
+            None => assert!(warned.is_empty(), "{warned:?}"),
+            Some(message) => {
+                assert_eq!(warned.len(), 1, "{warned:?}");
+                assert!(warned[0].contains(message), "{warned:?}");
+                assert!(
+                    warned[0].contains(&path.display().to_string()),
+                    "{warned:?}"
+                );
+            }
+        }
+    }
+
+    /// An entry that exists but cannot be read is an I/O error, not a miss to
+    /// keep quiet about: a directory at the entry's path (as an unreadable
+    /// cache directory would) warns once with the path, provider and item, and
+    /// the request goes on as a miss.
+    #[tokio::test]
+    async fn an_unreadable_cache_entry_warns_with_its_context() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("x.json");
+        std::fs::create_dir(&path).expect("a directory at the entry's path");
+        let (read, warned) = read_logging(&path).await;
+        assert_eq!(read, None);
+        assert_eq!(warned.len(), 1, "{warned:?}");
+        let line = &warned[0];
+        assert!(
+            line.contains("could not read similar-items cache"),
+            "{line}"
+        );
+        assert!(line.contains(&path.display().to_string()), "{line}");
+        assert!(line.contains(r#"provider="TheMovieDb""#), "{line}");
+        assert!(
+            line.contains(&format!("item_id={}", Uuid::from_u128(0x1652))),
+            "{line}"
+        );
     }
 
     #[tokio::test]
@@ -4008,6 +4255,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_movie_like_programme_reads_four_rows_past_its_limit() {
+        // C# `LiveTvProgramSimilarItemsProvider`: the `IsMovie` branch sets
+        // `EnableGroupByMetadataKey`, which `PrepareFilterQuery` turns into
+        // `Limit + 4`, so the 4 other airings the claim drops (they share the
+        // seed's presentation key) are replaced. No user, so the query does not
+        // group them itself. Without the 4, a Random read of 6 of these 10
+        // rows fills the page only 1 time in 210.
+        let db = test_db().await;
+        let seed = Uuid::from_u128(0xE100);
+        let mut airings = vec![seed];
+        airings.extend((0..4).map(|i| Uuid::from_u128(0xE110 + i)));
+        for &id in &airings {
+            seed_kind(&db, id, BaseItemKind::LiveTvProgram, "Airing", "SciFi").await;
+            let mut row = crate::test_support::fetch_item(&db, id).await;
+            row.is_movie = true;
+            row.presentation_unique_key = Some("one-film".to_owned());
+            crate::test_support::save_item(&db, &row).await;
+        }
+        let films: Vec<String> = (0..6).map(|i| format!("Film {i}")).collect();
+        for (i, name) in (0..).zip(&films) {
+            seed_movie(&db, Uuid::from_u128(0xE120 + i), name, "SciFi").await;
+        }
+
+        let rows = manager(&db)
+            .get_similar_items(seed, &[], None, &DtoOptions::default(), Some(6))
+            .await
+            .expect("similar")
+            .expect("seed resolves");
+        assert_eq!(sorted_names(&rows), films);
+    }
+
+    #[tokio::test]
     async fn recommendations_skip_the_users_played_movies() {
         // The batch provider is handed the user, so a category never
         // recommends a film the user already watched.
@@ -4295,6 +4574,66 @@ mod tests {
             12,
             "all twelve liked movies fit in 10 + 4 rows"
         );
+    }
+
+    #[tokio::test]
+    async fn a_liked_movie_like_programme_baseline_is_scored_as_a_movie() {
+        // C# `GetSimilarItemsRecommendationsAsync` hands every baseline to the
+        // one batch provider, `MovieSimilarItemsProvider`: weighted, unplayed
+        // only. The programme's own flat genre/tag provider would answer the
+        // played genre match and miss the director match.
+        use ferrofin_traits::library::UserDataManager as _;
+        let db = test_db().await;
+        let user = seed_user(&db, Uuid::from_u128(0xE200)).await;
+        grant_all_folders(&db, &user).await;
+        let user_id = Uuid::parse_str(&user.id).expect("user id");
+        let programme = Uuid::from_u128(0xE201);
+        let genre_match = Uuid::from_u128(0xE202);
+        let director_match = Uuid::from_u128(0xE203);
+        seed_kind(
+            &db,
+            programme,
+            BaseItemKind::LiveTvProgram,
+            "Liked Airing",
+            "SciFi",
+        )
+        .await;
+        let mut row = crate::test_support::fetch_item(&db, programme).await;
+        row.is_movie = true;
+        crate::test_support::save_item(&db, &row).await;
+        seed_movie(&db, genre_match, "Genre Match", "SciFi").await;
+        seed_movie(&db, director_match, "Director Match", "Drama").await;
+        credit_person(&db, programme, "Shared Director", "Director").await;
+        credit_person(&db, director_match, "Shared Director", "Director").await;
+        crate::test_support::seed_library_over(&db, &[programme, genre_match, director_match])
+            .await;
+        seed_user_data(&db, user_id, genre_match, true, Some(chrono::Utc::now())).await;
+        let config: Arc<dyn ServerConfigurationManager> = Arc::new(FakeConfig {
+            external: std::sync::atomic::AtomicBool::new(true),
+        });
+        crate::user_data_manager::FerrofinUserDataManager::new(db.clone(), config.clone())
+            .save_user_data(
+                user_id,
+                programme,
+                &ferrofin_model::dto::UpdateUserItemDataDto {
+                    is_favorite: Some(true),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("favourite");
+
+        let recs = manager(&db)
+            .with_configuration(config)
+            .get_movie_recommendations(Some(user_id), Uuid::nil(), 20, 8, &DtoOptions::default())
+            .await
+            .expect("recommendations");
+        let liked = recs
+            .iter()
+            .find(|c| c.recommendation_type == RecommendationType::SimilarToLikedItem)
+            .expect("a category for the liked programme");
+        assert_eq!(liked.baseline_item_name, "Liked Airing");
+        assert_eq!(names(&liked.items), ["Director Match"]);
     }
 
     #[tokio::test]

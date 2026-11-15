@@ -285,8 +285,10 @@ async fn publish_live_stream_path(
 /// `MediaInfoHelper.GetPublishedLiveStreamPath`: `local_path` re-based on
 /// `smart_api_url`, or `None` when it is not a server-hosted HTTP
 /// `[base_url]/LiveTv/LiveStreamFiles/…` URL. The query is kept and a fragment
-/// dropped; `base_url` is appended to the smart URL unless its path already
-/// ends with it.
+/// dropped; `base_url` is appended (escaped) to the smart URL unless its path
+/// already ends with it. The base matches in either spelling (`/my jellyfin`,
+/// `/my%20jellyfin`), where upstream compares one spelling with the other:
+/// Jellyfin bug not ported (gl-1821).
 fn published_live_stream_path(
     smart_api_url: &str,
     local_path: Option<&str>,
@@ -301,14 +303,8 @@ fn published_live_stream_path(
     local.scheme()?;
     let mut relative = local.path_and_query()?.as_str();
     if !base_url.is_empty() {
-        let prefix = format!("{base_url}/");
-        if !relative
-            .get(..prefix.len())
-            .is_some_and(|head| head.eq_ignore_ascii_case(&prefix))
-        {
-            return None;
-        }
-        relative = &relative[base_url.len()..];
+        let at = ferrofin_networking::base_url_prefix_len(relative, base_url)?;
+        relative = relative.get(at..)?;
     }
     if !relative
         .get(..LIVE_STREAM_FILES_ROUTE.len())
@@ -325,13 +321,14 @@ fn published_live_stream_path(
             .is_some_and(|uri| {
                 let path = percent_encoding::percent_decode_str(uri.path()).decode_utf8_lossy();
                 let path = path.trim_end_matches('/');
+                let base = percent_encoding::percent_decode_str(base_url).decode_utf8_lossy();
                 path.len()
-                    .checked_sub(base_url.len())
+                    .checked_sub(base.len())
                     .and_then(|at| path.get(at..))
-                    .is_some_and(|tail| tail.eq_ignore_ascii_case(base_url))
+                    .is_some_and(|tail| tail.eq_ignore_ascii_case(&base))
             });
         if !includes_base_url {
-            published.push_str(base_url);
+            published.push_str(&ferrofin_networking::escape_base_url(base_url));
         }
     }
     published.push_str(relative);
@@ -1797,6 +1794,76 @@ mod published_live_stream_path_tests {
         assert_eq!(
             published_live_stream_path(smart_api_url, Some(local_path), protocol, base_url),
             expected
+        );
+    }
+
+    /// gl-1821: a base URL clients escape, saved plain or escaped, is found in
+    /// the local path in either spelling and appended escaped, once. Upstream
+    /// compares one spelling with the other, so it never rewrites the plain one
+    /// and doubles the escaped one.
+    #[rstest::rstest]
+    #[case::plain_base(
+        "https://media.example.com",
+        "/my%20jellyfin",
+        "/my jellyfin",
+        "https://media.example.com/my%20jellyfin"
+    )]
+    #[case::escaped_base(
+        "https://media.example.com",
+        "/my%20jellyfin",
+        "/my%20jellyfin",
+        "https://media.example.com/my%20jellyfin"
+    )]
+    #[case::smart_url_ends_with_it(
+        "http://172.19.0.3:8096/my%20jellyfin",
+        "/my%20jellyfin",
+        "/my%20jellyfin",
+        "http://172.19.0.3:8096/my%20jellyfin"
+    )]
+    #[case::smart_url_ends_with_the_plain_one(
+        "http://172.19.0.3:8096/my%20jellyfin",
+        "/my%20jellyfin",
+        "/my jellyfin",
+        "http://172.19.0.3:8096/my%20jellyfin"
+    )]
+    #[case::non_ascii(
+        "https://media.example.com",
+        "/m%C3%A9dias",
+        "/m\u{e9}dias",
+        "https://media.example.com/m%C3%A9dias"
+    )]
+    #[case::raw_in_the_local_path(
+        "https://media.example.com",
+        "/a|b",
+        "/a|b",
+        "https://media.example.com/a%7Cb"
+    )]
+    fn a_base_url_clients_escape_matches_in_either_spelling(
+        #[case] smart_api_url: &str,
+        #[case] local_base: &str,
+        #[case] base_url: &str,
+        #[case] published_base: &str,
+    ) {
+        let local = format!("http://172.19.0.3:8096{local_base}{LIVE}");
+        assert_eq!(
+            published_live_stream_path(smart_api_url, Some(&local), MediaProtocol::Http, base_url),
+            Some(format!("{published_base}{LIVE}"))
+        );
+    }
+
+    /// gl-1821: the escaped spelling of a base is still matched on a segment
+    /// boundary.
+    #[test]
+    fn a_longer_segment_than_an_escaped_base_is_left_alone() {
+        let local = format!("http://172.19.0.3:8096/my%20jellyfin2{LIVE}");
+        assert_eq!(
+            published_live_stream_path(
+                "https://media.example.com",
+                Some(&local),
+                MediaProtocol::Http,
+                "/my%20jellyfin"
+            ),
+            None
         );
     }
 
