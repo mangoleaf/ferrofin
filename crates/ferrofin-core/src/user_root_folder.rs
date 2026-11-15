@@ -26,7 +26,8 @@
 //! BeforeMetadataRefresh`); a 10.11.8 database carries that name, so the row
 //! is created with it directly. The derived id is identical to the one an
 //! adopted Jellyfin database already holds, so on such a database this store
-//! finds the existing row and writes nothing.
+//! finds the existing row and writes nothing, unless the row's path names
+//! another program data directory: then it resets the path, as upstream does.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -125,7 +126,8 @@ impl UserRootFolderStore {
         }
     }
 
-    /// Ensures the directory and the row exist, returning the root row's id.
+    /// Ensures the directory and the row exist, re-pathing a row left under a
+    /// moved program data directory, and returns the root row's id.
     ///
     /// Runs at most **once** per process: the result is memoized the way C#
     /// caches `_userRootFolder`, so every later call is a field read with no
@@ -147,14 +149,29 @@ impl UserRootFolderStore {
     /// The one-shot body behind [`ensure`](Self::ensure).
     async fn provision(&self) -> Result<Uuid, ServiceError> {
         let id = self.id();
-        if !self.persistence.item_exists(id).await? {
-            tokio::fs::create_dir_all(&self.path)
-                .await
-                .map_err(|e| ServiceError::backend(format!("create user root directory: {e}")))?;
-            self.persistence
-                .save_items(std::slice::from_ref(&self.entity(id)))
-                .await?;
-            tracing::info!(item_id = %id, path = %self.path.display(), "created the user root folder");
+        tokio::fs::create_dir_all(&self.path)
+            .await
+            .map_err(|e| ServiceError::backend(format!("create user root directory: {e}")))?;
+        let path = self.path.to_string_lossy();
+        match self.persistence.item_path(id).await? {
+            None => {
+                self.persistence
+                    .save_items(std::slice::from_ref(&self.entity(id)))
+                    .await?;
+                tracing::info!(item_id = %id, path = %path, "created the user root folder");
+            }
+            // "In case program data folder was moved" (`GetUserRootFolder`,
+            // LibraryManager.cs:1184-1188, compared ordinally): a Jellyfin-
+            // derived id comes from the program-data-relative key, so it
+            // survives the move; the path does not. The composition root
+            // builds this store after the boot's program-data rebase, which
+            // reads this row's old path as one of its anchors.
+            Some(stored) if stored.as_deref() != Some(path.as_ref()) => {
+                self.persistence.set_item_path(id, &path).await?;
+                tracing::info!(item_id = %id, from = stored.as_deref().unwrap_or_default(),
+                    path = %path, "rewrote the user root folder's path");
+            }
+            Some(_) => {}
         }
         Ok(id)
     }
@@ -219,5 +236,41 @@ mod tests {
             .await
             .expect("list");
         assert_eq!(roots.len(), 1);
+    }
+
+    /// gl-923: after the program data directory moves, the same row (its id
+    /// is data-dir relative) is re-pathed to this server's directory, as
+    /// `GetUserRootFolder` resets it; a later process finds it there and
+    /// writes nothing.
+    #[tokio::test]
+    async fn ensure_repaths_a_root_left_under_a_moved_program_data_directory() {
+        let old = tempfile::tempdir().expect("old");
+        let new = tempfile::tempdir().expect("new");
+        let (db, before) = store(&old).await;
+        let id = before.ensure().await.expect("seed at the old directory");
+        let logs = crate::test_support::CapturedLogs::default();
+        let _guard = tracing::subscriber::set_default(
+            tracing_subscriber::fmt()
+                .with_writer(logs.clone())
+                .with_ansi(false)
+                .finish(),
+        );
+
+        assert_eq!(store_over(&db, &new).ensure().await.expect("moved"), id);
+        let expected = new.path().join("root/default");
+        assert_eq!(
+            fetch_item(&db, id).await.path.as_deref(),
+            Some(expected.to_string_lossy().as_ref())
+        );
+        assert!(expected.is_dir(), "the directory is created as upstream's");
+        assert!(logs.text().contains("rewrote the user root folder's path"));
+
+        let logged = logs.text().len();
+        store_over(&db, &new).ensure().await.expect("next start");
+        assert!(
+            !logs.text()[logged..].contains("rewrote"),
+            "a root at this server's directory is left alone: {}",
+            logs.text()
+        );
     }
 }

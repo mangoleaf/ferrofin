@@ -122,6 +122,29 @@ const ROUTES: &[&str] = &[
 #[rstest::rstest]
 // `ForgotPassword([FromBody, Required] ForgotPasswordDto forgotPasswordRequest)`.
 #[case::empty(false, "/Users/ForgotPassword", "", "", Some("forgotPasswordRequest"))]
+// gl-1674: a blank body is read and is no JSON, so it is a syntax error, not
+// an empty body, required or not.
+#[case::blank(
+    false,
+    "/Users/ForgotPassword",
+    "   ",
+    "$",
+    Some("forgotPasswordRequest")
+)]
+#[case::blank_required_but_empty_allowed(
+    false,
+    "/Playlists/00000000000000000000000000000001/Users/00000000000000000000000000000002",
+    "\n",
+    "$",
+    Some("updatePlaylistUserRequest")
+)]
+#[case::blank_nullable(
+    false,
+    "/Items/00000000000000000000000000000001/PlaybackInfo",
+    "   ",
+    "$",
+    None
+)]
 // A left-out C# `required` member, refused by the handler's own check.
 #[case::member_left_out(
     false,
@@ -310,6 +333,8 @@ async fn a_wrong_content_type_is_an_unsupported_media_type_problem() {
 /// Measured on Jellyfin 10.11.8, `POST /Items/{id}/PlaybackInfo`
 /// (`[FromBody] PlaybackInfoDto?`): `text/plain` with an empty body is 200,
 /// `text/plain` with `{}` is 415, `null` and `{}` are both 200, `[]` is 400.
+/// A blank body is something to read (gl-1674, measured on Jellyfin 12.4.0):
+/// 400 with a JSON content type, 415 with `text/plain`.
 /// This test drives the extractor directly, because the optional-body routes in
 /// the router all need a real item behind them.
 #[tokio::test]
@@ -339,13 +364,20 @@ async fn an_optional_body_binds_nothing_to_none_whatever_the_content_type() {
 
     // Nothing to read → null, whatever the content type claims.
     for content_type in ["application/json", "text/plain"] {
-        for body in ["", "   "] {
-            assert!(
-                optional(content_type, body).await.expect("bound").is_none(),
-                "{content_type} with {body:?} binds to null"
-            );
-        }
+        assert!(
+            optional(content_type, "").await.expect("bound").is_none(),
+            "{content_type} with an empty body binds to null"
+        );
     }
+    // A blank body is something to read: no JSON in it, or no formatter.
+    assert_eq!(
+        optional("application/json", "   ").await.unwrap_err(),
+        StatusCode::BAD_REQUEST
+    );
+    assert_eq!(
+        optional("text/plain", "   ").await.unwrap_err(),
+        StatusCode::UNSUPPORTED_MEDIA_TYPE
+    );
     // …and `null` is "nothing" too, on a JSON content type.
     assert!(
         optional("application/json", "null")
