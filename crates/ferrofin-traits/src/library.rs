@@ -1239,18 +1239,6 @@ pub trait LibraryManager: Send + Sync {
     /// Queues a full library scan.
     async fn queue_library_scan(&self) -> Result<(), ServiceError>;
 
-    /// Queues a full library scan, tagging the run's root span, its log lines
-    /// and its metrics with why it was triggered ([`ScanTrigger`]). Defaults
-    /// to the plain [`queue_library_scan`](Self::queue_library_scan) so
-    /// existing implementations need no change; the real manager overrides it
-    /// to record the `trigger`.
-    async fn queue_library_scan_with_trigger(
-        &self,
-        _trigger: ScanTrigger,
-    ) -> Result<(), ServiceError> {
-        self.queue_library_scan().await
-    }
-
     /// Queues a scan restricted to one library. `library_id` is the library's
     /// CollectionFolder id — what jellyfin-web's per-library "Scan Library"
     /// button refreshes via `POST /Items/{id}/Refresh`. Defaults to the full
@@ -2832,14 +2820,6 @@ pub trait MusicManager: Send + Sync {
     async fn get_instant_mix_from_item(
         &self,
         item_id: Uuid,
-        user_id: Option<Uuid>,
-        dto_options: &DtoOptions,
-    ) -> Result<Vec<BaseItemEntity>, ServiceError>;
-
-    /// Builds an instant mix seeded by an artist item.
-    async fn get_instant_mix_from_artist(
-        &self,
-        artist_id: Uuid,
         user_id: Option<Uuid>,
         dto_options: &DtoOptions,
     ) -> Result<Vec<BaseItemEntity>, ServiceError>;

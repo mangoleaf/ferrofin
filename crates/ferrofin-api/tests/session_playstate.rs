@@ -637,9 +637,6 @@ impl SessionManager for RecordingSessions {
         self.calls.lock().unwrap().logged_out = Some(access_token.to_owned());
         Ok(())
     }
-    async fn update_device_name(&self, _s: &str, _n: &str) -> Result<(), ServiceError> {
-        unimplemented!()
-    }
     async fn report_session_ended(&self, _s: &str) -> Result<(), ServiceError> {
         unimplemented!()
     }

@@ -872,11 +872,6 @@ pub trait LiveTvManager: Send + Sync {
         Ok(None)
     }
 
-    /// The on-disk path of a recording's captured file, or `None` when the
-    /// recording is unknown or has no file yet. Backs
-    /// `GET /LiveTv/LiveRecordings/{recordingId}/stream`.
-    async fn get_recording_path(&self, id: Uuid) -> Result<Option<String>, ServiceError>;
-
     /// Deletes a recording (its DB row and, when present, its file).
     async fn delete_recording(&self, id: Uuid) -> Result<(), ServiceError>;
 

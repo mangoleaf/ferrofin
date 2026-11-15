@@ -28,8 +28,8 @@ use ferrofin_model::configuration::{
 };
 use ferrofin_model::data::CollectionType;
 use ferrofin_model::dto::{
-    BaseItemDto, ClientCapabilitiesDto, DeviceInfoDto, ItemCounts, MediaSourceInfo, NameIdPair,
-    SessionInfoDto, UpdateUserItemDataDto, UserDto, UserItemDataDto,
+    BaseItemDto, DeviceInfoDto, ItemCounts, MediaSourceInfo, NameIdPair, SessionInfoDto,
+    UpdateUserItemDataDto, UserDto, UserItemDataDto,
 };
 use ferrofin_model::entities::ImageType;
 use ferrofin_model::entities_media::PlaylistUserPermissions;
@@ -1281,13 +1281,6 @@ impl SessionManager for FakeSessions {
     ) -> Result<SessionInfoDto, ServiceError> {
         unimplemented!("fake")
     }
-    async fn update_device_name(
-        &self,
-        _session_id: &str,
-        _reported_device_name: &str,
-    ) -> Result<(), ServiceError> {
-        unimplemented!("fake")
-    }
     async fn on_playback_start(&self, _info: &PlaybackStartInfo) -> Result<(), ServiceError> {
         unimplemented!("fake")
     }
@@ -1721,14 +1714,6 @@ impl MusicManager for FakeMusic {
     async fn get_instant_mix_from_item(
         &self,
         _item_id: Uuid,
-        _user_id: Option<Uuid>,
-        _dto_options: &DtoOptions,
-    ) -> Result<Vec<BaseItemEntity>, ServiceError> {
-        unimplemented!("fake")
-    }
-    async fn get_instant_mix_from_artist(
-        &self,
-        _artist_id: Uuid,
         _user_id: Option<Uuid>,
         _dto_options: &DtoOptions,
     ) -> Result<Vec<BaseItemEntity>, ServiceError> {
@@ -2224,12 +2209,6 @@ impl DeviceManager for FakeDevices {
         &self,
         _device_id: &str,
     ) -> Result<Option<DeviceOptionsEntity>, ServiceError> {
-        unimplemented!("fake")
-    }
-    async fn to_client_capabilities_dto(
-        &self,
-        _capabilities: &ClientCapabilities,
-    ) -> Result<ClientCapabilitiesDto, ServiceError> {
         unimplemented!("fake")
     }
 }

@@ -1942,20 +1942,6 @@ impl SessionManager for FerrofinSessionManager {
         .await
     }
 
-    async fn update_device_name(
-        &self,
-        session_id: &str,
-        reported_device_name: &str,
-    ) -> Result<(), ServiceError> {
-        let mut sessions = self.sessions.lock().await;
-        let session = sessions
-            .values_mut()
-            .find(|s| s.id == session_id)
-            .ok_or_else(|| ServiceError::not_found(format!("session {session_id}")))?;
-        session.device_name = Some(reported_device_name.to_owned());
-        Ok(())
-    }
-
     async fn on_device_options_updated(&self, device_id: &str, custom_name: Option<&str>) {
         let custom_name = custom_name.filter(|name| !name.trim().is_empty());
         let mut sessions = self.sessions.lock().await;

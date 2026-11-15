@@ -206,13 +206,6 @@ pub trait SessionManager: Send + Sync {
             .id)
     }
 
-    /// Updates the reported device name of a session.
-    async fn update_device_name(
-        &self,
-        session_id: &str,
-        reported_device_name: &str,
-    ) -> Result<(), ServiceError>;
-
     /// Applies a device's newly saved custom name to its live sessions (C#
     /// `SessionManager.OnDeviceManagerDeviceOptionsUpdated`, raised by
     /// `DeviceManager.UpdateDeviceOptions`). A non-blank `custom_name` becomes
