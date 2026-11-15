@@ -47,7 +47,9 @@ mod black_frame;
 mod chapter_analyzer;
 mod config_hash;
 mod credit_scenes;
+mod editor;
 mod engine;
+mod platform;
 mod queue;
 
 use crate::{Extension, ExtensionContext};
@@ -214,7 +216,7 @@ fn detector(cx: &ExtensionContext) -> DetectSegmentsTask {
 }
 
 /// The Intro Skipper's analysis runtime for the plugin routes (`ScanSeason`,
-/// `ScanStatus`, `eraseCache`).
+/// `ScanStatus`, `eraseCache`, the segment editor, the support bundle).
 #[must_use]
 pub fn analysis(cx: &ExtensionContext) -> Arc<dyn IntroSkipperAnalysis> {
     Arc::new(detector(cx))
@@ -313,6 +315,17 @@ impl IntroSkipperAnalysis for DetectSegmentsTask {
             self.runtime.warnings(),
             check.report(),
         )
+    }
+
+    fn operating_system(&self) -> String {
+        platform::operating_system()
+    }
+
+    async fn create_or_replace_segment(
+        &self,
+        segment: &MediaSegmentDto,
+    ) -> Result<(), ServiceError> {
+        editor::create_or_replace_segment(self.media_segments.as_ref(), segment).await
     }
 
     async fn clear_excluded(&self) -> Result<intro_store::ExcludedClear, ServiceError> {
@@ -870,7 +883,7 @@ impl DetectSegmentsTask {
                 return;
             }
         };
-        let stored = self.analyze_queue(&queue, config, progress).await;
+        let stored = self.analyze_queue(queue, config, progress).await;
         progress.report(100.0);
         tracing::info!(analyzed = stored, "intro skipper: analysis complete");
     }
@@ -1082,7 +1095,11 @@ impl DetectSegmentsTask {
         }
         // `AnalyzeItemsAsync(seasonsToAnalyze: [seasonId])`.
         let stored = self
-            .analyze_queue(&[(season_id, entries)], &config, &TaskProgress::default())
+            .analyze_queue(
+                vec![(season_id, entries)],
+                &config,
+                &TaskProgress::default(),
+            )
             .await;
         tracing::info!(%season_id, analyzed = stored, "intro skipper: season rescanned");
     }
@@ -3429,6 +3446,37 @@ mod tests {
         assert_eq!(h.calls.load(Ordering::SeqCst), 0);
         let found = intros_of(&h.segments, EP_A).await;
         assert!(found.is_empty(), "{found:?}");
+    }
+
+    /// `AnalyzeItemsAsync` analyses only the queue's non-excluded items: an
+    /// excluded episode is never fingerprinted or given a segment. The last
+    /// run excludes nothing, so both episodes are compared and each gets an
+    /// intro.
+    #[tokio::test]
+    async fn excluded_queue_entries_are_not_analysed() {
+        let h = harness(&TWO_EPISODES, true, "{}", true).await;
+        let config = h.task.load_config().await;
+        let queue = h.task.queue(&config, None).await.expect("queue");
+        let excluding = |excluded: &[Uuid]| {
+            let mut queue = queue.clone();
+            for (_, entries) in &mut queue {
+                for entry in entries {
+                    entry.is_excluded = excluded.contains(&entry.episode_id);
+                }
+            }
+            queue
+        };
+        let progress = TaskProgress::default();
+        let run = |queue| h.task.analyze_queue(queue, &config, &progress);
+        assert_eq!(run(excluding(&[EP_A, EP_B])).await, 0);
+        assert_eq!(h.calls.load(Ordering::SeqCst), 0);
+        run(excluding(&[EP_B])).await;
+        let b = h.actions.segments(EP_B).await.expect("tier");
+        assert!(b.is_empty(), "{b:?}");
+        assert!(run(excluding(&[])).await > 0);
+        for id in [EP_A, EP_B] {
+            assert_eq!(intros_of(&h.segments, id).await.len(), 1, "{id}");
+        }
     }
 
     /// The only episode still needing analysis is compared with its analysed
