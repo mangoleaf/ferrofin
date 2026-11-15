@@ -1844,7 +1844,8 @@ impl<'a> ProbePipeline<'a> {
             {
                 let shortcut = self.shortcuts.get(&index);
                 if let Some(target) = shortcut {
-                    request.media_source.protocol = shortcut::path_protocol(target);
+                    request.media_source.protocol =
+                        ferrofin_model::media_info::path_protocol(target);
                     request.media_source.path = Some(target.clone());
                 }
                 let permit = if self.current == Some(index) {

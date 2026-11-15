@@ -69,11 +69,7 @@ impl SubtitleIo for RecordingIo {
     }
 
     fn path_protocol(&self, path: &str) -> MediaProtocol {
-        if path.to_ascii_lowercase().starts_with("http") {
-            MediaProtocol::Http
-        } else {
-            MediaProtocol::File
-        }
+        ferrofin_model::media_info::path_protocol(path)
     }
 
     fn subtitle_cache_path(
