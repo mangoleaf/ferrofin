@@ -8190,9 +8190,6 @@ mod tests {
         ) -> Result<(), ServiceError> {
             unimplemented!()
         }
-        async fn save_images(&self, _item: &BaseItemEntity) -> Result<(), ServiceError> {
-            unimplemented!()
-        }
         async fn locked_fields_for_items(
             &self,
             item_ids: &[Uuid],

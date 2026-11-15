@@ -168,17 +168,17 @@ impl SubtitleDownloader {
             return;
         }
         if let Some(live_tv) = self.live_tv.as_ref().and_then(Weak::upgrade) {
-            let Some(recordings) = cancel
-                .unless_cancelled(live_tv.active_recording_paths())
+            let Some(recording) = cancel
+                .unless_cancelled(
+                    live_tv.is_active_recording(video.path.as_deref().unwrap_or_default()),
+                )
                 .await
             else {
                 return;
             };
-            match recordings {
-                Ok(paths) if paths.iter().any(|path| video.path.as_ref() == Some(path)) => {
-                    return;
-                }
-                Ok(_) => {}
+            match recording {
+                Ok(true) => return,
+                Ok(false) => {}
                 Err(error) => {
                     tracing::warn!(item_id = %video.id, %error, "subtitle recording lookup failed");
                     return;
