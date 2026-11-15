@@ -215,7 +215,7 @@ fn folder_items_query(
     }
     if kind == BaseItemKind::Series {
         query.series_presentation_unique_key =
-            Some(crate::library_manager::episode_presentation_key(folder));
+            Some(ferrofin_db::entities::base_items::presentation_key(folder).to_owned());
         query.include_item_types = vec![BaseItemKind::Episode, BaseItemKind::Season];
         query.order_by = vec![(ItemSortBy::SortName, SortOrder::Ascending)];
         query.is_virtual_item = Some(false);

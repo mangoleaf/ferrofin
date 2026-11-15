@@ -1609,9 +1609,9 @@ fn member_query(
             recursive: true,
             is_folder: Some(false),
             is_virtual_item: Some(false),
-            series_presentation_unique_key: Some(crate::library_manager::episode_presentation_key(
-                folder,
-            )),
+            series_presentation_unique_key: Some(
+                ferrofin_db::entities::base_items::presentation_key(folder).to_owned(),
+            ),
             include_item_types: vec![BaseItemKind::Episode, BaseItemKind::Season],
             user: user_entity,
             enable_total_record_count: false,
