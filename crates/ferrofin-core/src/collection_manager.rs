@@ -1829,6 +1829,9 @@ impl PlaylistManager for FerrofinPlaylistManager {
         &self,
         request: &PlaylistUserUpdateRequest,
     ) -> Result<(), ServiceError> {
+        // `GetPlaylistForUser(request.Id, userId)` looks the target user up
+        // first, and `GetUserById(Guid.Empty)` throws.
+        require_user(request.user_id)?;
         // The share row, committed with its `Data` sync, so `Data` stays an
         // exact copy of the tables.
         let mut tx = self.db.writer().begin().await.map_err(db_err)?;
@@ -4067,6 +4070,44 @@ mod tests {
             .unwrap();
         let playlist_shares = mgr.get_playlist_shares(playlist_id).await.unwrap();
         assert!(playlist_shares.is_empty(), "{playlist_shares:?}");
+    }
+
+    /// A share for the nil user is refused before anything is written:
+    /// upstream's `AddUserToShares` looks the playlist up for the target user,
+    /// and `GetUserById(Guid.Empty)` throws `ArgumentException` (a 400).
+    #[tokio::test]
+    async fn a_share_for_the_nil_user_is_refused() {
+        use ferrofin_model::playlists::PlaylistUserUpdateRequest;
+
+        let db = test_db().await;
+        let (mgr, _root) = playlist_manager(&db).await;
+        let playlist_id = Uuid::parse_str(
+            &mgr.create_playlist(&PlaylistCreationRequest {
+                name: Some("Nil".to_owned()),
+                user_id: Uuid::new_v4(),
+                ..PlaylistCreationRequest::default()
+            })
+            .await
+            .expect("create")
+            .id,
+        )
+        .expect("uuid");
+        let refused = mgr
+            .add_user_to_shares(&PlaylistUserUpdateRequest {
+                id: playlist_id,
+                user_id: Uuid::nil(),
+                can_edit: Some(true),
+            })
+            .await;
+        assert!(
+            matches!(
+                refused,
+                Err(ferrofin_traits::error::ServiceError::InvalidInput(_))
+            ),
+            "{refused:?}"
+        );
+        let shares = mgr.get_playlist_shares(playlist_id).await.unwrap();
+        assert!(shares.is_empty(), "{shares:?}");
     }
 
     /// Shares keep the order they were given, as upstream's `Shares` list
