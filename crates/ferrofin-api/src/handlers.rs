@@ -2200,8 +2200,6 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
                    this row.",
         date: "2026-11-14",
         divergences: &[
-            "The ExcludeTagsMovies and ExcludeTagsSeries settings are not applied: TMDb \
-             keywords always become tags. Fix path: gl-1781.",
             "A series takes TMDb's tagline and production countries, which upstream sets \
              for a movie only; a series rated in neither the preferred country nor the US \
              gets no rating where upstream takes the first country's; a movie's overview \

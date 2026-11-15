@@ -2457,19 +2457,31 @@ impl TmdbClient {
         // `Plugin.Instance.Configuration` is (`TmdbClientManager`).
         let cfg = self.settings().await;
         let key = cfg.api_key(self.api_key.expose_secret());
-        let (path, append) = match kind {
+        let (path, append, exclude_tags) = match kind {
             // The movie Identify branch needs `external_ids` too — `/movie/{id}`
             // carries `imdb_id` directly, so only the series arm asks for it.
-            TmdbKind::Movie => ("movie", "credits,release_dates,images,videos,keywords"),
+            TmdbKind::Movie => (
+                "movie",
+                "credits,release_dates,images,videos",
+                cfg.exclude_tags_movies,
+            ),
             TmdbKind::Series => (
                 "tv",
-                "credits,aggregate_credits,images,content_ratings,videos,external_ids,keywords",
+                "credits,aggregate_credits,images,content_ratings,videos,external_ids",
+                cfg.exclude_tags_series,
             ),
+        };
+        // "Exclude tags" keeps TMDb's keywords off the item's Tags
+        // (`TmdbClientManager.cs:78-81`, `:152-155`).
+        let append = if exclude_tags {
+            append.to_owned()
+        } else {
+            format!("{append},keywords")
         };
         let req = self
             .http
             .get(format!("{}/{path}/{tmdb_id}", self.base_url))
-            .query(&[("api_key", key), ("append_to_response", append)]);
+            .query(&[("api_key", key), ("append_to_response", append.as_str())]);
         let req = req.query(&[(
             "include_image_language",
             image_languages_param(language, country),
@@ -3017,6 +3029,39 @@ mod tests {
                 .unwrap()
                 .people
                 .is_none()
+        );
+    }
+
+    /// `ExcludeTagsMovies` / `ExcludeTagsSeries` keep `keywords` out of the
+    /// kind's `append_to_response`, so TMDb sends no keywords to become Tags
+    /// (`TmdbClientManager.cs:78-81`, `:152-155`); each flag gates only its
+    /// own kind.
+    #[rstest::rstest]
+    #[case::neither(r"{}", true, true)]
+    #[case::movies(r#"{"ExcludeTagsMovies":true}"#, false, true)]
+    #[case::series(r#"{"ExcludeTagsSeries":true}"#, true, false)]
+    #[tokio::test]
+    async fn exclude_tags_settings_drop_keywords_from_the_append(
+        #[case] config: &str,
+        #[case] movie_keywords: bool,
+        #[case] series_keywords: bool,
+    ) {
+        let server = crate::mock_http::MockServer::start(vec![]).await;
+        let client = TmdbClient::new().with_base_url(&server.base_url);
+        client.attach_plugin_manager(crate::plugin_config::tests_support::manager_with(
+            crate::builtin_plugins::TMDB.id,
+            config.as_bytes().to_vec(),
+        ));
+        client.details(TmdbKind::Movie, 1, None).await.unwrap();
+        client.details(TmdbKind::Series, 2, None).await.unwrap();
+        let asks_keywords = |path| {
+            server.query_values(path, "append_to_response")[0]
+                .split(',')
+                .any(|m| m == "keywords")
+        };
+        assert_eq!(
+            (asks_keywords("/movie/1"), asks_keywords("/tv/2")),
+            (movie_keywords, series_keywords)
         );
     }
 
