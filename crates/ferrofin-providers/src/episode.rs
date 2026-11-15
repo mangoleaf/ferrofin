@@ -128,7 +128,7 @@ pub fn tmdb_answer(
         let trailers: Vec<_> = extras
             .trailers
             .iter()
-            .map(|trailer| (Some(trailer.name.clone()), trailer.url.clone()))
+            .map(|trailer| (trailer.name.clone(), trailer.url.clone()))
             .collect();
         if let Some(data) = data_with_trailers(&item, &trailers) {
             item.data = Some(data);
@@ -158,15 +158,19 @@ fn data_with_trailers(
     if trailers.is_empty() {
         return None;
     }
-    let list: Vec<_> = trailers
-        .iter()
-        .map(|(name, url)| {
-            serde_json::json!({
-                "Url": url,
-                "Name": name,
-            })
-        })
-        .collect();
+    let mut list: Vec<serde_json::Value> = Vec::new();
+    for (name, url) in trailers {
+        // `AddTrailerUrl` skips a URL already added; upstream ignores case,
+        // but YouTube keys are case-sensitive.
+        if list.iter().any(|entry| entry["Url"] == *url) {
+            continue;
+        }
+        // A nameless trailer has no `Name`, as Jellyfin writes no null.
+        list.push(match name {
+            Some(name) => serde_json::json!({ "Url": url, "Name": name }),
+            None => serde_json::json!({ "Url": url }),
+        });
+    }
     let mut data: serde_json::Map<String, serde_json::Value> = item
         .data
         .as_deref()
@@ -477,10 +481,20 @@ mod tests {
 
         let extras = EpisodeExtras {
             provider_ids: vec![("Imdb".to_owned(), "tt1".to_owned())],
-            trailers: vec![crate::tmdb::TmdbTrailer {
-                name: "Clip".to_owned(),
-                url: "https://youtu.be/x".to_owned(),
-            }],
+            trailers: vec![
+                crate::tmdb::TmdbTrailer {
+                    name: Some("Clip".to_owned()),
+                    url: "https://youtu.be/x".to_owned(),
+                },
+                crate::tmdb::TmdbTrailer {
+                    name: None,
+                    url: "https://youtu.be/y".to_owned(),
+                },
+                crate::tmdb::TmdbTrailer {
+                    name: None,
+                    url: "https://youtu.be/x".to_owned(),
+                },
+            ],
             people: Some(vec![TmdbPerson {
                 tmdb_id: 31,
                 name: "Guest".to_owned(),
@@ -498,8 +512,16 @@ mod tests {
                 .contains(&("Imdb".to_owned(), "tt1".to_owned()))
         );
         assert_eq!(answer.result.people.as_ref().map(Vec::len), Some(1));
-        let data = answer.result.item.data.expect("trailers");
-        assert!(data.contains("RemoteTrailers") && data.contains("https://youtu.be/x"));
+        // Each URL once, and a nameless trailer has no `Name` key.
+        let data: serde_json::Value =
+            serde_json::from_str(&answer.result.item.data.expect("trailers")).unwrap();
+        assert_eq!(
+            data["RemoteTrailers"],
+            serde_json::json!([
+                {"Url":"https://youtu.be/x","Name":"Clip"},
+                {"Url":"https://youtu.be/y"}
+            ])
+        );
         // A credits payload that was unavailable is a null list, not an empty one.
         let missing = EpisodeExtras {
             people: None,

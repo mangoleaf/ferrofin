@@ -12537,7 +12537,7 @@ impl LibraryScanner {
             .map(|e| {
                 e.trailers
                     .iter()
-                    .map(|t| (Some(t.name.clone()), t.url.clone()))
+                    .map(|t| (t.name.clone(), t.url.clone()))
                     .collect::<Vec<_>>()
             })
             .unwrap_or_default();
@@ -23450,7 +23450,15 @@ fn apply_details(entity: &mut BaseItemEntity, d: &TmdbDetails) {
         d.collection_name.as_ref().map(|v| serde_json::json!(v)),
     );
     if entity.overview.is_none() {
-        entity.overview.clone_from(&d.overview);
+        // `Overview?.Replace("\n\n", "\n")` for a movie
+        // (`TmdbMovieProvider.cs:205`); a series' is kept as TMDb sent it.
+        entity.overview = d.overview.as_ref().map(|o| {
+            if entity.type_.ends_with(".Movie") {
+                o.replace("\n\n", "\n")
+            } else {
+                o.clone()
+            }
+        });
     }
     if entity.tagline.is_none() {
         entity.tagline.clone_from(&d.tagline);
@@ -23485,7 +23493,7 @@ fn apply_details(entity: &mut BaseItemEntity, d: &TmdbDetails) {
     let trailers: Vec<(Option<String>, String)> = d
         .trailers
         .iter()
-        .map(|t| (Some(t.name.clone()), t.url.clone()))
+        .map(|t| (t.name.clone(), t.url.clone()))
         .collect();
     if let Some(data) = crate::item_data::merge_remote_trailers(entity.data.as_deref(), &trailers) {
         entity.data = Some(data);
@@ -27438,6 +27446,31 @@ mod tests {
         let data = crate::item_data::parse_data(e.data.as_deref());
         assert_eq!(e.index_number, Some(1));
         assert_eq!(data.get("IndexNumberEnd"), Some(&serde_json::json!(2)));
+    }
+
+    /// A movie's TMDb overview has its blank lines collapsed
+    /// (`Overview?.Replace("\n\n", "\n")`, `TmdbMovieProvider.cs:205`); a
+    /// series' is stored as TMDb sent it (`MapTvShowToSeries`).
+    #[rstest::rstest]
+    #[case::movie(
+        "MediaBrowser.Controller.Entities.Movies.Movie",
+        "One.\nTwo.\n\nThree."
+    )]
+    #[case::series(
+        "MediaBrowser.Controller.Entities.TV.Series",
+        "One.\n\nTwo.\n\n\n\nThree."
+    )]
+    fn a_movies_tmdb_overview_collapses_blank_lines(#[case] type_: &str, #[case] expected: &str) {
+        let mut row = ferrofin_db::entities::base_items::BaseItemEntity {
+            type_: type_.into(),
+            ..Default::default()
+        };
+        let details = ferrofin_providers::TmdbDetails {
+            overview: Some("One.\n\nTwo.\n\n\n\nThree.".into()),
+            ..Default::default()
+        };
+        super::apply_details(&mut row, &details);
+        assert_eq!(row.overview.as_deref(), Some(expected));
     }
 
     /// `Series.Status` comes from `<status>` (SeriesNfoParser.cs:75-90), TMDB's

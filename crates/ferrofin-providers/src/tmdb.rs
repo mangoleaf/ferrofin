@@ -394,7 +394,8 @@ pub struct TmdbDetails {
     pub original_language: Option<String>,
     /// Keyword tags attached to this movie or series.
     pub tags: Vec<String>,
-    /// Movie production-country names.
+    /// Movie production-country names; empty for a series, which upstream
+    /// gives none (`TmdbMovieProvider.cs:207`).
     pub production_locations: Vec<String>,
     /// Series home page.
     pub home_page_url: Option<String>,
@@ -408,7 +409,8 @@ pub struct TmdbDetails {
     pub tvrage_id: Option<String>,
     /// Plot synopsis.
     pub overview: Option<String>,
-    /// Marketing tagline.
+    /// A movie's marketing tagline; `None` for a series, which upstream gives
+    /// none (`TmdbMovieProvider.cs:206`).
     pub tagline: Option<String>,
     /// Genre names.
     pub genres: Vec<String>,
@@ -417,7 +419,9 @@ pub struct TmdbDetails {
     pub studios: Vec<String>,
     /// Community rating (`vote_average`, 0–10), when non-zero.
     pub community_rating: Option<f64>,
-    /// US content certification (e.g. `R`, `TV-MA`), when available.
+    /// The content certification: the metadata country's, prefixed
+    /// (`GB-15`, `FSK-12`), else the US one (`R`, `TV-MA`), else for a series
+    /// the first country's.
     pub official_rating: Option<String>,
     /// Release/first-air year.
     pub production_year: Option<i32>,
@@ -523,8 +527,10 @@ pub struct TmdbPersonHit {
 /// A trailer/video link for a title (name + URL).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TmdbTrailer {
-    /// The video's display name.
-    pub name: String,
+    /// The video's display name as TMDb sends it, if any (`Name = video.Name`,
+    /// `TmdbMovieProvider.cs:380`); always `None` for an episode's trailer,
+    /// which upstream stores as a bare URL (`AddTrailerUrl`).
+    pub name: Option<String>,
     /// The absolute (YouTube) URL.
     pub url: String,
 }
@@ -544,12 +550,11 @@ fn youtube_trailers(videos: Option<VideosResults>) -> Vec<TmdbTrailer> {
                 && (is_video_type(v, "trailer") || is_video_type(v, "teaser"))
         })
         .filter_map(|v| {
+            // Upstream formats a missing key into a dead link
+            // (`watch?v=`); a Jellyfin bug not ported.
             let key = v.key.filter(|k| !k.is_empty())?;
             Some(TmdbTrailer {
-                name: v
-                    .name
-                    .filter(|n| !n.is_empty())
-                    .unwrap_or_else(|| "Trailer".to_owned()),
+                name: v.name,
                 url: format!("https://www.youtube.com/watch?v={key}"),
             })
         })
@@ -639,7 +644,7 @@ struct DetailsResponse {
 pub struct EpisodeExtras {
     /// IMDb, TVDB and TVRage identities for this episode.
     pub provider_ids: Vec<(String, String)>,
-    /// Episode trailers.
+    /// Episode trailers, each a bare URL with no name (`AddTrailerUrl`).
     pub trailers: Vec<TmdbTrailer>,
     /// Credits, absent when the appended credits payload was unavailable.
     pub people: Option<Vec<TmdbPerson>>,
@@ -1131,7 +1136,8 @@ fn crew_person_type(department: Option<&str>, job: Option<&str>) -> Option<&'sta
     }
 }
 
-/// Requested-country certification, with Jellyfin's US fallback and prefix.
+/// Requested-country certification, with Jellyfin's prefix, its US fallback
+/// and, for a series, its first-country fallback.
 fn certification(
     kind: TmdbKind,
     releases: Option<ReleasesResults>,
@@ -1174,10 +1180,13 @@ fn certification(
         };
         return Some(format!("{prefix}{rating}"));
     }
-    ratings
-        .into_iter()
-        .find(|(code, _)| code.eq_ignore_ascii_case("US"))
-        .map(|(_, rating)| rating)
+    let us = ratings
+        .iter()
+        .find(|(code, _)| code.eq_ignore_ascii_case("US"));
+    // A series rated in neither takes the first country's rating, bare
+    // (`TmdbSeriesProvider.cs:318,328-331`); a movie has no such fallback.
+    us.or_else(|| ratings.first().filter(|_| kind == TmdbKind::Series))
+        .map(|(_, rating)| rating.clone())
 }
 
 #[derive(Debug, Deserialize)]
@@ -2356,7 +2365,12 @@ impl TmdbClient {
         }
         Some(EpisodeExtras {
             provider_ids,
-            trailers: youtube_trailers(response.videos),
+            // `AddTrailerUrl(url)`: an episode's trailers carry no name
+            // (`TmdbEpisodeProvider.cs:202-211`).
+            trailers: youtube_trailers(response.videos)
+                .into_iter()
+                .map(|t| TmdbTrailer { name: None, ..t })
+                .collect(),
             people: response.credits.map(|c| episode_people_from(c, &cfg)),
         })
     }
@@ -2439,7 +2453,8 @@ impl TmdbClient {
     }
 
     /// Fetches localized metadata and selects the requested country's rating,
-    /// falling back to the US rating when no local certification is available.
+    /// falling back to the US rating when no local certification is available
+    /// and, for a series, to the first country's.
     pub async fn details_for_locale(
         &self,
         kind: TmdbKind,
@@ -2537,12 +2552,17 @@ impl TmdbClient {
                 .flat_map(|k| k.keywords)
                 .filter_map(|k| non_empty(k.name))
                 .collect(),
-            production_locations: d
-                .production_countries
-                .unwrap_or_default()
-                .into_iter()
-                .filter_map(|c| non_empty(c.name))
-                .collect(),
+            // A movie's only (`TmdbMovieProvider.cs:206-207`): `MapTvShowToSeries`
+            // sets neither production locations nor a tagline.
+            production_locations: match kind {
+                TmdbKind::Movie => d
+                    .production_countries
+                    .unwrap_or_default()
+                    .into_iter()
+                    .filter_map(|c| non_empty(c.name))
+                    .collect(),
+                TmdbKind::Series => Vec::new(),
+            },
             home_page_url: (kind == TmdbKind::Series)
                 .then(|| non_empty(d.homepage))
                 .flatten(),
@@ -2561,7 +2581,9 @@ impl TmdbClient {
                 .filter(|id| *id > 0)
                 .map(|id| id.to_string()),
             overview: d.overview.filter(|s| !s.is_empty()),
-            tagline: d.tagline.filter(|s| !s.is_empty()),
+            tagline: (kind == TmdbKind::Movie)
+                .then(|| non_empty(d.tagline))
+                .flatten(),
             genres: d.genres.into_iter().filter_map(|g| g.name).collect(),
             studios: resolve_studios(d.networks, d.production_companies),
             community_rating: d.vote_average.filter(|v| *v > 0.0),
@@ -2978,8 +3000,8 @@ mod tests {
     #[tokio::test]
     async fn maps_collection_keywords_countries_and_series_fields() {
         let server = crate::mock_http::MockServer::start(vec![
-            ("/movie/1", r#"{"belongs_to_collection":{"id":7,"name":"Collection"},"production_countries":[{"name":"Japan"}],"keywords":{"keywords":[{"name":"samurai"}]}}"#.into()),
-            ("/tv/2?", r#"{"episode_run_time":[42,45],"last_air_date":"2020-01-02","homepage":"https://example.org/show","keywords":{"results":[{"name":"drama"}]},"external_ids":{"tvdb_id":3,"tvrage_id":4},"networks":[{"name":"HBO"}],"production_companies":[{"name":"Bad Wolf"}]}"#.into()),
+            ("/movie/1", r#"{"belongs_to_collection":{"id":7,"name":"Collection"},"production_countries":[{"name":"Japan"}],"tagline":"Seven ronin.","keywords":{"keywords":[{"name":"samurai"}]}}"#.into()),
+            ("/tv/2?", r#"{"tagline":"Winter is coming.","production_countries":[{"name":"United Kingdom"}],"episode_run_time":[42,45],"last_air_date":"2020-01-02","homepage":"https://example.org/show","keywords":{"results":[{"name":"drama"}]},"external_ids":{"tvdb_id":3,"tvrage_id":4},"networks":[{"name":"HBO"}],"production_companies":[{"name":"Bad Wolf"}]}"#.into()),
             ("/episode/1", r#"{"external_ids":{"imdb_id":"tt123","tvdb_id":5,"tvrage_id":6},"videos":{"results":[{"site":"YouTube","type":"Trailer","key":"abc","name":"Trailer"}]},"credits":{"cast":[{"id":7,"name":"Actor"}]}}"#.into()),
         ]).await;
         let client = TmdbClient::new().with_base_url(&server.base_url);
@@ -2988,7 +3010,12 @@ mod tests {
         assert_eq!(movie.collection_name.as_deref(), Some("Collection"));
         assert_eq!(movie.tags, ["samurai"]);
         assert_eq!(movie.production_locations, ["Japan"]);
+        assert_eq!(movie.tagline.as_deref(), Some("Seven ronin."));
         let series = client.details(TmdbKind::Series, 2, None).await.unwrap();
+        // A tagline and production countries are a movie's only
+        // (`TmdbMovieProvider.cs:206-207`); `MapTvShowToSeries` sets neither.
+        assert_eq!(series.tagline, None);
+        assert_eq!(series.production_locations, Vec::<String>::new());
         assert_eq!(series.runtime_minutes, Some(42));
         assert_eq!(series.end_date.as_deref(), Some("2020-01-02"));
         assert_eq!(
@@ -3122,6 +3149,42 @@ mod tests {
         assert_eq!(
             resolve_studios(entries(networks), entries(companies)),
             expected
+        );
+    }
+
+    /// A movie's and a series' trailers keep TMDb's video name, a missing one
+    /// included (`Name = video.Name`, `TmdbMovieProvider.cs:380`,
+    /// `TmdbSeriesProvider.cs:350`); an episode's carry only their URL
+    /// (`AddTrailerUrl`, `TmdbEpisodeProvider.cs:202-211`).
+    #[tokio::test]
+    async fn trailers_keep_tmdbs_name_and_an_episodes_have_none() {
+        let videos = r#"{"videos":{"results":[
+            {"site":"YouTube","type":"Trailer","key":"a"},
+            {"site":"YouTube","type":"Trailer","key":"b","name":"Official Trailer"}]}}"#;
+        let server = crate::mock_http::MockServer::start(vec![
+            ("/movie/1", videos.to_owned()),
+            ("/tv/2?", videos.to_owned()),
+            ("/episode/1", videos.to_owned()),
+        ])
+        .await;
+        let client = TmdbClient::new().with_base_url(&server.base_url);
+        let trailer_names = |trailers: Vec<TmdbTrailer>| -> Vec<Option<String>> {
+            trailers.into_iter().map(|t| t.name).collect()
+        };
+        let movie = client.details(TmdbKind::Movie, 1, None).await.unwrap();
+        let series = client.details(TmdbKind::Series, 2, None).await.unwrap();
+        let episode = client
+            .episode_extras_for_language(2, 1, 1, None)
+            .await
+            .unwrap();
+        let named = vec![None, Some("Official Trailer".to_owned())];
+        assert_eq!(
+            [
+                trailer_names(movie.trailers),
+                trailer_names(series.trailers),
+                trailer_names(episode.trailers)
+            ],
+            [named.clone(), named, vec![None, None]]
         );
     }
 
@@ -4282,6 +4345,32 @@ mod tests {
         assert_eq!(
             certification(TmdbKind::Series, None, Some(ratings), Some(country)).as_deref(),
             Some(expected)
+        );
+    }
+
+    /// A series rated in neither the metadata country nor the US takes the
+    /// first country's rating, bare (`TmdbSeriesProvider.cs:318,328-331`),
+    /// skipping blank ones; a movie has no such fallback
+    /// (`TmdbMovieProvider.cs:226-244`).
+    #[test]
+    fn a_series_rated_elsewhere_takes_the_first_countrys_rating() {
+        let ratings = serde_json::from_value(serde_json::json!({"results":[
+            {"iso_3166_1":"BR","rating":" "},
+            {"iso_3166_1":"GB","rating":"15"},
+            {"iso_3166_1":"FR","rating":"12"}
+        ]}))
+        .unwrap();
+        assert_eq!(
+            certification(TmdbKind::Series, None, Some(ratings), Some("DE")).as_deref(),
+            Some("15")
+        );
+        let releases = serde_json::from_value(serde_json::json!({"countries":[
+            {"iso_3166_1":"GB","certification":"15"}
+        ]}))
+        .unwrap();
+        assert_eq!(
+            certification(TmdbKind::Movie, Some(releases), None, Some("DE")),
+            None
         );
     }
 

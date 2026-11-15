@@ -2174,9 +2174,10 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
                    and an episode. ferrofin-providers tmdb.rs details_for_locale \
                    (TmdbClientManager.GetMovieAsync and GetSeriesAsync: the language, the \
                    image languages and the append_to_response) and details_from_response (the \
-                   names, overview, tagline, genres, studios by resolve_studios, production \
-                   countries, release, air and end dates, status, vote average, certification \
-                   by country, tags from keywords, trailers by youtube_trailers, the series \
+                   names, overview, a movie's tagline and production countries, genres, \
+                   studios by resolve_studios, release, air and end dates, status, vote \
+                   average, certification by country, tags from keywords, trailers by \
+                   youtube_trailers, the series \
                    runtime, home page, collection id and name, external ids and original \
                    language), credits_to_people with billed_cast, map_cast, \
                    map_aggregate_cast, crew_people and crew_person_type (MapCrewToPersonType, \
@@ -2186,7 +2187,8 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
                    episode_extras_for_language and episode_people_from (guest stars); \
                    ferrofin-core library_scan.rs fetch_tmdb_metadata (a pinned TMDb id, else \
                    find_tmdb_id's /find by an IMDb id, a series also by its TVDB id, else the \
-                   parsed-name search and find_best_match), apply_details, fetch_tmdb_season \
+                   parsed-name search and find_best_match), apply_details (a movie's overview \
+                   with its blank lines collapsed), fetch_tmdb_season \
                    with ferrofin-providers season.rs tmdb_answer (ImportSeasonName), and \
                    fetch_tmdb_episode with apply_tmdb_episode; for an episode the provider \
                    manager refreshes that has a path, episode.rs tmdb_answer (a path-less one \
@@ -2200,12 +2202,10 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
                    this row.",
         date: "2026-11-14",
         divergences: &[
-            "A series takes TMDb's tagline and production countries, which upstream sets \
-             for a movie only; a series rated in neither the preferred country nor the US \
-             gets no rating where upstream takes the first country's; a movie's overview \
-             keeps double newlines upstream collapses; a trailer with an empty key is \
-             dropped and a nameless one, or an episode's, named where upstream keeps the \
-             video's name or none. Fix path: gl-1782.",
+            "A TMDb video with no key is dropped where upstream stores the dead link \
+             https://www.youtube.com/watch?v=, and an episode's trailer URL already added is \
+             compared exactly where upstream's AddTrailerUrl ignores case (YouTube keys are \
+             case-sensitive). Jellyfin bugs not ported.",
             "A blank content rating is skipped; upstream takes a blank own-country series \
              rating (storing a bare country prefix such as GB-) and lets a blank US one \
              block its first-entry fallback. Jellyfin bug not ported.",
