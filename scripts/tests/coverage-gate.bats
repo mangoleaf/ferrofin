@@ -66,6 +66,12 @@ gated() { awk '{print $4}' "$BATS_TEST_TMPDIR/calls" | sort | paste -sd' '; }
     "$BATS_TEST_TMPDIR/calls"
 }
 
+@test "ferrofin-api's test doubles never count toward its total" {
+  run "$SCRIPT" heavy
+  grep -F -- '-p ferrofin-api ' "$BATS_TEST_TMPDIR/calls" |
+    grep -qF -- '|apps)/|crates/ferrofin-api/src/test_support\.rs'
+}
+
 @test "a failing crate fails the shard but the others still run" {
   FAIL_CRATE=ferrofin-api run "$SCRIPT" heavy
   [ "$status" -eq 1 ]

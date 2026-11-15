@@ -548,9 +548,9 @@ fn representative_item_types(
 /// compiled-in provider registry (via the
 /// [`ProviderManager`](ferrofin_traits::providers::ProviderManager)) into the
 /// available metadata/image/subtitle/lyric/segment providers, grouped by the
-/// representative item types of `libraryContentType`. A provider is listed iff
-/// its code is in the build (e.g. Open Subtitles only with the `opensubtitles`
-/// feature).
+/// representative item types of `libraryContentType`: the subtitle and lyric
+/// fetchers only when one of those types is theirs (Open Subtitles for movies
+/// and episodes, LrcLib for audio and audiobooks).
 #[utoipa::path(
     get,
     path = "/Libraries/AvailableOptions",

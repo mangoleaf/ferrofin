@@ -434,7 +434,8 @@ impl ferrofin_traits::library::UserManager for StubUsers {
     }
 }
 
-/// Panic-on-call stub — only the methods a test exercises matter.
+/// Panic-on-call stub — only the methods a test exercises matter. A save
+/// succeeds and keeps nothing.
 pub struct StubUserData;
 
 #[async_trait::async_trait]
@@ -445,7 +446,7 @@ impl ferrofin_traits::library::UserDataManager for StubUserData {
         _item_id: Uuid,
         _user_data: &UpdateUserItemDataDto,
     ) -> Result<(), ServiceError> {
-        unimplemented!("stub")
+        Ok(())
     }
     async fn get_user_data_dto(
         &self,

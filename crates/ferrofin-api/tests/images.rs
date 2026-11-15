@@ -3034,6 +3034,8 @@ async fn the_positional_route_passes_a_zero_size_and_tag_on() {
 #[case::malformed_max_width("0/tag/jpg/x/100/0/0", StatusCode::BAD_REQUEST)]
 #[case::malformed_percent_played("0/tag/jpg/100/100/x/0", StatusCode::BAD_REQUEST)]
 #[case::hex_percent_played("0/tag/jpg/100/100/0x0/0", StatusCode::BAD_REQUEST)]
+#[case::inf_percent_played("0/tag/jpg/100/100/inf/0", StatusCode::BAD_REQUEST)]
+#[case::thousands_percent_played("0/tag/jpg/100/100/1%2C000/0", StatusCode::OK)]
 #[case::blank_tag("0/%20/jpg/100/100/0/0", StatusCode::BAD_REQUEST)]
 #[case::padded_tag("0/%20tag%20/jpg/100/100/0/0", StatusCode::OK)]
 #[tokio::test]

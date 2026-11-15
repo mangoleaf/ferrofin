@@ -7,14 +7,16 @@
 //! fake matching the C# `Mock<IDirectoryService>` setup.
 
 use std::fs;
+use std::sync::Arc;
 
 use ferrofin_model::data::PersonKind;
 use ferrofin_model::dto::DayOfWeek;
 use ferrofin_model::entities::{ImageType, SeriesStatus, Video3DFormat};
 
+use ferrofin_providers::DirectoryService;
 use ferrofin_providers::container_types::{FileSystemMetadata, MetadataResult};
 use ferrofin_providers::xbmc::base_parser::FetchError;
-use ferrofin_providers::xbmc::base_parser::{DirectoryService, NoDirectoryService};
+use ferrofin_providers::xbmc::base_parser::NoDirectoryService;
 use ferrofin_providers::xbmc::config::NfoConfiguration;
 use ferrofin_providers::xbmc::item::{NfoBaseItem, NfoItemKind};
 use ferrofin_providers::xbmc::{
@@ -37,6 +39,10 @@ struct FakeDirectoryService {
 }
 
 impl DirectoryService for FakeDirectoryService {
+    fn file_system_entries(&self, _path: &str) -> Arc<[FileSystemMetadata]> {
+        Arc::from([])
+    }
+
     fn get_file(&self, path: &str) -> Option<FileSystemMetadata> {
         if path == self.full_name {
             Some(FileSystemMetadata {
@@ -54,6 +60,16 @@ impl DirectoryService for FakeDirectoryService {
             None
         }
     }
+}
+
+// The service the scan parses NFOs with resolves no path, even an existing
+// file: an NFO's local `<thumb>` must not reach the item until gl-1818 decides
+// which files an NFO may name.
+#[test]
+fn no_directory_service_resolves_no_file() {
+    let existing = concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml");
+    assert!(std::path::Path::new(existing).is_file());
+    assert_eq!(NoDirectoryService.get_file(existing), None);
 }
 
 fn get_provider_id<'a>(item: &'a NfoBaseItem, provider: &str) -> Option<&'a str> {
