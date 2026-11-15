@@ -1464,13 +1464,20 @@ impl TmdbUpcomingEpisodesTask {
             .library
             .get_item_ids(&virtual_of(BaseItemKind::Episode))
             .await?;
+        let mut removed = 0;
         for (i, id) in episodes.iter().enumerate() {
-            tracing::info!(
+            // Information upstream; debug here, one per episode: the count
+            // below is the info line (LOGGING.md rule 1), as the scan's own
+            // removals are.
+            tracing::debug!(
                 item_id = %id,
                 "removing a virtual episode: the TMDb missing episode provider is disabled"
             );
-            if let Err(err) = self.library.delete_item(*id, &options).await {
-                tracing::warn!(item_id = %id, %err, "could not remove the virtual episode");
+            match self.library.delete_item(*id, &options).await {
+                Ok(()) => removed += 1,
+                Err(err) => {
+                    tracing::warn!(item_id = %id, %err, "could not remove the virtual episode");
+                }
             }
             #[allow(clippy::cast_precision_loss)] // a progress ratio
             progress.report(95.0 * (i + 1) as f64 / episodes.len() as f64);
@@ -1495,6 +1502,12 @@ impl TmdbUpcomingEpisodesTask {
             {
                 tracing::warn!(item_id = %season, %err, "could not remove the virtual season");
             }
+        }
+        if removed > 0 {
+            tracing::info!(
+                removed,
+                "removed the virtual episodes: the TMDb missing episode provider is disabled"
+            );
         }
         progress.report(100.0);
         Ok(())
@@ -5490,7 +5503,31 @@ mod tests {
             Arc::clone(&library),
         );
         assert_eq!(task.key(), "TmdbRefreshUpcomingEpisodes");
-        task.execute(&TaskProgress::default()).await.expect("run");
+        // gl-275: one info line for the run, each episode's at debug.
+        let logs = crate::test_support::CapturedLogs::default();
+        {
+            let _guard = tracing::subscriber::set_default(
+                tracing_subscriber::fmt()
+                    .with_writer(logs.clone())
+                    .with_ansi(false)
+                    .with_max_level(tracing::Level::INFO)
+                    .finish(),
+            );
+            task.execute(&TaskProgress::default()).await.expect("run");
+            // Nothing left to remove: no line.
+            task.execute(&TaskProgress::default()).await.expect("rerun");
+        }
+        let text = logs.text();
+        assert!(!text.contains("removing a virtual episode"), "{text}");
+        let summaries: Vec<&str> = text
+            .lines()
+            .filter(|line| line.contains("removed the virtual episodes"))
+            .collect();
+        assert_eq!(summaries.len(), 1, "{text}");
+        assert!(
+            summaries[0].ends_with("the TMDb missing episode provider is disabled removed=1"),
+            "{text}"
+        );
 
         let alive = |id| {
             let library = Arc::clone(&library);
