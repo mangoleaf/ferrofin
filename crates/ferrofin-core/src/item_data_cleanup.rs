@@ -166,7 +166,7 @@ impl ItemDataCleanup {
     /// its folders and its keyframe, media-segment, trickplay and chapter
     /// rows, goes before the refresh extracts from the new one. A segment
     /// provider's own store is its `cleanup`'s to clear (Intro Skipper's
-    /// keeps the old analysis, as upstream's plugin does: gl-1696).
+    /// forgets the old analysis, which upstream's plugin keeps: gl-1696).
     ///
     /// # Errors
     ///

@@ -250,9 +250,6 @@ impl LiveTvManager for CountriesLiveTv {
     async fn get_recording(&self, _id: Uuid) -> Result<Option<BaseItemDto>, ServiceError> {
         unreachable!()
     }
-    async fn get_recording_path(&self, _id: Uuid) -> Result<Option<String>, ServiceError> {
-        unreachable!()
-    }
     async fn delete_recording(&self, _id: Uuid) -> Result<(), ServiceError> {
         unreachable!()
     }

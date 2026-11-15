@@ -8,6 +8,8 @@
 //! negotiation; here it is a [`StreamBuilderError`], never a panic, since the
 //! conditions come from the client's device profile.
 
+use ferrofin_util::invariant_float;
+
 use super::enums::{ProfileConditionType, ProfileConditionValue};
 use super::profile_condition::ProfileCondition;
 use crate::data::VideoRangeType;
@@ -302,14 +304,14 @@ fn is_double_satisfied(
 
     if condition.condition == ProfileConditionType::EqualsAny {
         for single in condition.value.split('|') {
-            if single.trim().parse::<f64>() == Ok(current_value) {
+            if invariant_float::parse::<f64>(single) == Some(current_value) {
                 return Ok(true);
             }
         }
         return Ok(false);
     }
 
-    if let Ok(expected) = condition.value.parse::<f64>() {
+    if let Some(expected) = invariant_float::parse::<f64>(&condition.value) {
         return match condition.condition {
             ProfileConditionType::Equals => Ok(current_value == expected),
             ProfileConditionType::GreaterThanEqual => Ok(current_value >= expected),
@@ -433,6 +435,29 @@ mod tests {
             condition, None, None, None, None, profile, None, None, None, None, timestamp, None,
             None, None, 1, None, None, None, None, None,
         )
+    }
+
+    /// `IsConditionSatisfied(condition, double?)` reads the value with
+    /// `double.TryParse(…, NumberStyles.Float | NumberStyles.AllowThousands,
+    /// CultureInfo.InvariantCulture, …)` (`ConditionProcessor.cs:293`, `:303`):
+    /// a group separator and ASCII white space are a number, Rust's `inf` and
+    /// an NBSP are not, so that condition is unsatisfied.
+    #[test]
+    fn a_double_condition_reads_its_value_as_dotnet_does() {
+        let level = |kind, value: &str, current| {
+            is_double_satisfied(
+                &condition(kind, ProfileConditionValue::VideoLevel, value),
+                Some(current),
+            )
+        };
+        assert_eq!(level(LessThanEqual, "1,000", 999.0), Ok(true));
+        assert_eq!(level(LessThanEqual, " 51 ", 41.0), Ok(true));
+        assert_eq!(level(LessThanEqual, "Infinity", 41.0), Ok(true));
+        assert_eq!(level(LessThanEqual, "inf", 41.0), Ok(false));
+        assert_eq!(level(EqualsAny, "1,000|50", 1000.0), Ok(true));
+        assert_eq!(level(EqualsAny, " 50 |1", 50.0), Ok(true));
+        assert_eq!(level(EqualsAny, "inf|50", f64::INFINITY), Ok(false));
+        assert_eq!(level(EqualsAny, "\u{a0}50|1", 50.0), Ok(false));
     }
 
     /// A property an audio file or track has none of is upstream's

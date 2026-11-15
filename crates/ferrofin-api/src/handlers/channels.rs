@@ -45,8 +45,11 @@
 //! reject, matching the C# on both trees. Measured on the parity pair
 //! 2026-08-30: before, F `200` vs J `400`; after, `400` on both.
 //!
-//! ponytail: no `ChannelManager` trait for a subsystem with no providers — add
-//! one only if channel providers are ever introduced.
+//! These handlers answer that state themselves. The `ChannelManager` trait
+//! exists, but only the "Refresh Channels" task reads it (its
+//! `get_channel_features`). TODO(parity, gl-298): route this controller through
+//! `ChannelManager`, as upstream's goes through `IChannelManager`, together with
+//! the channel provider seam that would give it something to answer.
 //!
 //! Ports `ChannelsController`:
 //! - `GET /Channels` — the user's channels (empty).

@@ -134,10 +134,7 @@ impl Pending {
     }
 }
 
-/// The in-process event every debounced change set is published as, its
-/// payload the unfiltered `LibraryUpdateInfo`; never forwarded to clients
-/// (`LibraryChanged` is, filtered per user).
-pub const ITEMS_CHANGED: &str = "ItemsChanged";
+pub use ferrofin_traits::events::ITEMS_CHANGED;
 
 /// Accumulates library changes and pushes a folded `LibraryChanged` at the
 /// end of each batch's window.

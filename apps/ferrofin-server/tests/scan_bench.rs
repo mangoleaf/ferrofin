@@ -8,8 +8,8 @@
 //! Wiring mirrors the composition root's scanner (`state.rs`) for the pieces
 //! that run offline: the real ffprobe seam (`FERROFIN_SCAN_BENCH_PROBE=1`), the
 //! real image processor, people/chapters/stream repositories, and a file-backed
-//! WAL database. The keyed remote providers stay off — they are feature-gated
-//! off by default in production too.
+//! WAL database. The remote providers stay off, so the timing covers only the
+//! offline scan.
 //!
 //! ```text
 //! FERROFIN_SCAN_BENCH=1 FERROFIN_SCAN_BENCH_MOVIES=1000 \

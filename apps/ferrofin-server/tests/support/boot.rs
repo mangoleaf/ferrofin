@@ -1,4 +1,5 @@
-//! Boots [`ferrofin_server::run`] on a free port for the real-HTTP tests.
+//! Boots [`ferrofin_server::run`] on a free port for the real-HTTP tests, and
+//! the setup those tests share.
 
 #![allow(dead_code)] // Each test binary uses its own subset.
 
@@ -119,4 +120,43 @@ where
         assert!(lost_the_port, "server never became reachable on {base}");
     }
     panic!("no free port survived long enough to bind");
+}
+
+/// Removes every scheduled task's daily and weekly triggers on the server at
+/// `base`, keeping its startup and interval ones.
+///
+/// Those fire at a local time of day (Intro Skipper's analysis at midnight,
+/// chapter images at 02:00, trickplay at 03:00), so a run that crosses one
+/// gets a task's writes and ffmpeg runs inside whatever it is measuring. The
+/// server keeps the change across a restart.
+pub async fn drop_wall_clock_triggers(client: &reqwest::Client, base: &str, auth: &str) {
+    let tasks: serde_json::Value = client
+        .get(format!("{base}/ScheduledTasks"))
+        .header("Authorization", auth)
+        .send()
+        .await
+        .and_then(reqwest::Response::error_for_status)
+        .expect("GET /ScheduledTasks")
+        .json()
+        .await
+        .expect("tasks json");
+    for task in tasks.as_array().expect("task list") {
+        let triggers = task["Triggers"].as_array().expect("task triggers");
+        let kept: Vec<&serde_json::Value> = triggers
+            .iter()
+            .filter(|t| !matches!(t["Type"].as_str(), Some("DailyTrigger" | "WeeklyTrigger")))
+            .collect();
+        if kept.len() == triggers.len() {
+            continue;
+        }
+        let id = task["Id"].as_str().expect("task id");
+        client
+            .post(format!("{base}/ScheduledTasks/{id}/Triggers"))
+            .header("Authorization", auth)
+            .json(&kept)
+            .send()
+            .await
+            .and_then(reqwest::Response::error_for_status)
+            .unwrap_or_else(|e| panic!("POST /ScheduledTasks/{id}/Triggers: {e}"));
+    }
 }

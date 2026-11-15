@@ -74,7 +74,7 @@ pub(super) async fn acquire_images(
 
 /// Backdrops use a free slot so a failed replacement cannot destroy an old
 /// image. Singular images are atomically replaced only after a full download.
-fn write_acquired_image(
+pub(super) fn write_acquired_image(
     directory: &Path,
     kind: ImageType,
     download: &ferrofin_providers::ArtworkDownload,
