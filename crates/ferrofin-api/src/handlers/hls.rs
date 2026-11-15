@@ -42,7 +42,10 @@ use uuid::Uuid;
 
 use crate::auth::RequireAuth;
 use crate::error::ApiError;
-use crate::extract::{DotnetGuid, Query, RequiredRouteString, RouteParameter, blank_route_values};
+use crate::extract::{
+    DotnetGuid, Query, RequiredRouteString, RouteParameter, StreamPattern, blank_complaint,
+    blank_route_values, pattern_complaint, validation_failure,
+};
 use crate::handlers::streaming::{opened_file_response, require_streamable_item};
 use crate::state::AppState;
 
@@ -494,28 +497,66 @@ fn build_audio_request(
     build_request(item_id, query, raw_query, ctx)
 }
 
-/// The ordinary stream controllers validate these query/route identifiers
-/// before dispatch, including Static=true requests.
-pub(crate) fn validate_stream_request(request: &HlsStreamRequest) -> Result<(), ApiError> {
-    for value in [
-        &request.output_container,
-        &request.segment_container,
-        &request.video_codec,
-        &request.audio_codec,
-        // `[RegularExpression(ContainerValidationRegexStr)]` on `subtitleCodec`
-        // too: its first entry is written into the ffmpeg command line.
-        &request.subtitle_codec,
+/// The [`pattern_complaint`]s about the `[RegularExpression]` parameters of a
+/// `DynamicHlsController` action or a `/Videos|Audio/{itemId}/stream[.{container}]`
+/// one: `segmentContainer`, `audioCodec`, `level`, `videoCodec` and
+/// `subtitleCodec` on each, and `container` where the action declares one (a
+/// stream route's query or route value, the live playlist's query, a
+/// segment's route `{container}`). The master and variant playlists declare
+/// none, so they pass `None` and leave a `container` query unread, as
+/// upstream does.
+fn stream_pattern_complaints<'a>(
+    request: &'a HlsStreamRequest,
+    container: Option<&'a str>,
+) -> impl Iterator<Item = (String, String)> + 'a {
+    use StreamPattern::{Container, Level};
+    [
+        ("container", container, Container),
+        (
+            "segmentContainer",
+            request.segment_container.as_deref(),
+            Container,
+        ),
+        ("audioCodec", request.audio_codec.as_deref(), Container),
+        ("level", request.level.as_deref(), Level),
+        ("videoCodec", request.video_codec.as_deref(), Container),
+        (
+            "subtitleCodec",
+            request.subtitle_codec.as_deref(),
+            Container,
+        ),
     ]
     .into_iter()
-    .flatten()
-    {
-        if !ferrofin_model::media_info::is_valid_stream_identifier(value) {
-            return Err(ApiError::BadRequest(
-                "invalid streaming container or codec".to_owned(),
-            ));
-        }
-    }
-    Ok(())
+    .filter_map(|(name, value, pattern)| pattern_complaint(name, value, pattern))
+}
+
+/// The model-state `400` for [`stream_pattern_complaints`]; `None` when each
+/// value passes. Shared with the `videos` and `audio` stream handlers.
+pub(crate) fn stream_pattern_failures(
+    request: &HlsStreamRequest,
+    container: Option<&str>,
+) -> Option<Response> {
+    validation_failure(stream_pattern_complaints(request, container))
+}
+
+/// [`stream_pattern_failures`] for an `hls1` segment, whose `[Required]`
+/// `{container}` is the text after the last `.` of `{segmentId}.{container}`,
+/// as ASP.NET splits it: a blank one is the required-field complaint, filed
+/// beside the other parameters' in one body.
+fn segment_pattern_failures(request: &HlsStreamRequest, segment_id: &str) -> Option<Response> {
+    // Either half empty is no match for upstream's route (its 404), so there is
+    // no container to check; the `{segmentId}` binding itself is not ported.
+    let container = segment_id
+        .rsplit_once('.')
+        .filter(|(id, container)| !id.is_empty() && !container.is_empty())
+        .map(|(_, container)| container);
+    let blank = container.and_then(|container| blank_complaint("container", container));
+    let patterned = container.filter(|_| blank.is_none());
+    validation_failure(
+        blank
+            .into_iter()
+            .chain(stream_pattern_complaints(request, patterned)),
+    )
 }
 
 /// Serves the transcode branch of a direct-play stream route.
@@ -548,7 +589,10 @@ pub(crate) async fn transcode_stream_fallback(
 ) -> Result<Response, ApiError> {
     let mut req = query;
     req.item_id = item_id;
-    validate_stream_request(&req)?;
+    // The handlers refused these already; the request reaching ffmpeg is checked again.
+    if let Some(rejection) = stream_pattern_failures(&req, req.output_container.as_deref()) {
+        return Ok(rejection);
+    }
     req.requested_url = Some(request.uri().path().to_owned());
     req.is_head_request = request.method() == axum::http::Method::HEAD;
     let request = if req.is_head_request {
@@ -703,21 +747,20 @@ fn master_playlist_response(method: &axum::http::Method, playlist: String) -> Re
     response
 }
 
-/// [`require_streamable_item`] for the version an HLS query names.
+/// [`require_streamable_item`] for the version an HLS request names.
 async fn require_query_item(
     state: &AppState,
     auth: &ferrofin_traits::options::AuthorizationInfo,
     parts: &axum::http::request::Parts,
-    item_id: Uuid,
-    query: &HlsQuery,
+    request: &HlsStreamRequest,
 ) -> Result<(), ApiError> {
     require_streamable_item(
         state,
         auth,
         &parts.extensions,
         &parts.headers,
-        item_id,
-        query.media_source_id.as_deref(),
+        request.item_id,
+        request.media_source_id.as_deref(),
     )
     .await
 }
@@ -731,9 +774,12 @@ async fn get_video_master_playlist(
     RawQuery(raw): RawQuery,
     parts: axum::http::request::Parts,
 ) -> Result<Response, ApiError> {
-    require_query_item(&state, &auth, &parts, item_id, &query).await?;
     let ctx = HlsRequestContext::from_parts(&state, &auth, &parts, false);
     let req = build_request(item_id, query, raw, ctx);
+    if let Some(rejection) = stream_pattern_failures(&req, None) {
+        return Ok(rejection);
+    }
+    require_query_item(&state, &auth, &parts, &req).await?;
     let playlist = state.hls.master_playlist(&req, false).await?;
     Ok(master_playlist_response(&parts.method, playlist))
 }
@@ -747,9 +793,12 @@ async fn get_video_variant_playlist(
     RawQuery(raw): RawQuery,
     parts: axum::http::request::Parts,
 ) -> Result<Response, ApiError> {
-    require_query_item(&state, &auth, &parts, item_id, &query).await?;
     let ctx = HlsRequestContext::from_parts(&state, &auth, &parts, false);
     let req = build_request(item_id, query, raw, ctx);
+    if let Some(rejection) = stream_pattern_failures(&req, None) {
+        return Ok(rejection);
+    }
+    require_query_item(&state, &auth, &parts, &req).await?;
     let playlist = state.hls.variant_playlist(&req, false).await?;
     Ok(playlist_response(playlist))
 }
@@ -763,10 +812,13 @@ async fn get_video_live_playlist(
     RawQuery(raw): RawQuery,
     parts: axum::http::request::Parts,
 ) -> Result<Response, ApiError> {
-    require_query_item(&state, &auth, &parts, item_id, &query).await?;
     // `GetLiveHlsStream` defaults `EnableSubtitlesInManifest` to true.
     let ctx = HlsRequestContext::from_parts(&state, &auth, &parts, true);
     let req = build_request(item_id, query, raw, ctx);
+    if let Some(rejection) = stream_pattern_failures(&req, req.output_container.as_deref()) {
+        return Ok(rejection);
+    }
+    require_query_item(&state, &auth, &parts, &req).await?;
     let playlist = state.hls.live_playlist(&req).await?;
     Ok(playlist_response(playlist))
 }
@@ -780,9 +832,12 @@ async fn get_audio_master_playlist(
     RawQuery(raw): RawQuery,
     parts: axum::http::request::Parts,
 ) -> Result<Response, ApiError> {
-    require_query_item(&state, &auth, &parts, item_id, &query).await?;
     let ctx = HlsRequestContext::from_parts(&state, &auth, &parts, false);
     let req = build_audio_request(item_id, query, raw, ctx);
+    if let Some(rejection) = stream_pattern_failures(&req, None) {
+        return Ok(rejection);
+    }
+    require_query_item(&state, &auth, &parts, &req).await?;
     let playlist = state.hls.master_playlist(&req, true).await?;
     Ok(master_playlist_response(&parts.method, playlist))
 }
@@ -796,19 +851,24 @@ async fn get_audio_variant_playlist(
     RawQuery(raw): RawQuery,
     parts: axum::http::request::Parts,
 ) -> Result<Response, ApiError> {
-    require_query_item(&state, &auth, &parts, item_id, &query).await?;
     let ctx = HlsRequestContext::from_parts(&state, &auth, &parts, false);
     let req = build_audio_request(item_id, query, raw, ctx);
+    if let Some(rejection) = stream_pattern_failures(&req, None) {
+        return Ok(rejection);
+    }
+    require_query_item(&state, &auth, &parts, &req).await?;
     let playlist = state.hls.variant_playlist(&req, true).await?;
     Ok(playlist_response(playlist))
 }
 
-/// Parses the axum-captured `{segmentId}` segment (the `.container` suffix was
-/// dropped by path normalization) into a segment index, `400` on a bad value.
-/// Shared with the trickplay tile handler (`{index}.jpg`).
+/// Parses the axum-captured `{segmentId}` segment into a segment index, `400`
+/// on a bad value. The router registers the route without its `.{container}`
+/// literal, so the capture is the whole `{segmentId}.{container}` path segment
+/// ([`segment_pattern_failures`] reads the container from it). Shared with the
+/// trickplay tile handler (`{index}.jpg`).
 pub(super) fn parse_segment_index(segment_id: &str) -> Result<i32, ApiError> {
-    // The captured value can be `<index>` or `<index>.<ext>` when the client hit
-    // the un-normalized form; take the leading integer either way.
+    // The captured value is `<index>.<ext>`, or `<index>` alone; take the
+    // leading integer either way.
     let head = segment_id.split('.').next().unwrap_or(segment_id);
     head.parse::<i32>()
         .map_err(|_| ApiError::BadRequest(format!("invalid segment id {segment_id:?}")))
@@ -842,11 +902,14 @@ async fn get_video_hls_segment(
     request: Request,
 ) -> Result<Response, ApiError> {
     let (parts, body) = request.into_parts();
-    require_query_item(&state, &auth, &parts, item_id, &query).await?;
-    let index = parse_segment_index(&segment_id)?;
     let ctx = HlsRequestContext::from_parts(&state, &auth, &parts, false);
-    let request = Request::from_parts(parts, body);
     let req = build_request(item_id, query, raw, ctx);
+    if let Some(rejection) = segment_pattern_failures(&req, &segment_id) {
+        return Ok(rejection);
+    }
+    require_query_item(&state, &auth, &parts, &req).await?;
+    let index = parse_segment_index(&segment_id)?;
+    let request = Request::from_parts(parts, body);
     let file = state.hls.dynamic_segment(&req, index, false).await?;
     served_file_response(file, request).await
 }
@@ -863,11 +926,14 @@ async fn get_audio_hls_segment(
     request: Request,
 ) -> Result<Response, ApiError> {
     let (parts, body) = request.into_parts();
-    require_query_item(&state, &auth, &parts, item_id, &query).await?;
-    let index = parse_segment_index(&segment_id)?;
     let ctx = HlsRequestContext::from_parts(&state, &auth, &parts, false);
-    let request = Request::from_parts(parts, body);
     let req = build_audio_request(item_id, query, raw, ctx);
+    if let Some(rejection) = segment_pattern_failures(&req, &segment_id) {
+        return Ok(rejection);
+    }
+    require_query_item(&state, &auth, &parts, &req).await?;
+    let index = parse_segment_index(&segment_id)?;
+    let request = Request::from_parts(parts, body);
     let file = state.hls.dynamic_segment(&req, index, true).await?;
     served_file_response(file, request).await
 }

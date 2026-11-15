@@ -102,6 +102,7 @@ use ferrofin_traits::session::{
     AuthenticationRequest, AuthenticationResultData, SessionEvent, SessionManager, SessionSummary,
 };
 use ferrofin_traits::session_bus::SessionMessageBus;
+use ferrofin_util::ticks::TICKS_PER_MS;
 
 use crate::db_error::db_err;
 use crate::user_entity_ext::{cached_permission, has_permission};
@@ -2247,7 +2248,7 @@ impl SessionManager for FerrofinSessionManager {
                 user_id = %session.user_id,
                 item_id = %info.item_id,
                 item = name.as_deref(),
-                position_ms = info.position_ticks.map(|ticks| ticks / TICKS_PER_MILLISECOND),
+                position_ms = info.position_ticks.map(|ticks| ticks / TICKS_PER_MS),
                 device = session.device_name.as_deref(),
                 device_id = %session.device_id,
                 client = session.client.as_deref(),
@@ -3327,9 +3328,6 @@ fn envelope_bytes(message_type: SessionMessageType, data: &str) -> Result<Vec<u8
 fn session_started_payload(session: &SessionInfo) -> String {
     serde_json::to_string(&session_info_to_dto(session)).unwrap_or_else(|_| "{}".to_owned())
 }
-
-/// .NET ticks (100 ns each) in a millisecond.
-const TICKS_PER_MILLISECOND: i64 = 10_000;
 
 /// The JSON payload for a playback event. The user name, device name and
 /// client stand for `PlaybackProgressEventArgs`' `Users`, `DeviceName` and

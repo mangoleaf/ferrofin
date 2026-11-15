@@ -81,6 +81,37 @@ pub fn input_format(container: &str) -> Option<String> {
     .then_some(container)
 }
 
+/// Whether an HLS `segmentContainer` asks for fMP4 segments: `mp4` in any
+/// case, surrounding whitespace ignored. Every site that turns the container
+/// into a segment file extension, an `-hls_segment_type` or an fMP4 decision
+/// reads this one rule, so the segments ffmpeg is told to write are the ones
+/// the playlist, the stream manager and the transcode manager look for.
+#[must_use]
+pub fn is_mp4_segment_container(segment_container: &str) -> bool {
+    segment_container.trim().eq_ignore_ascii_case("mp4")
+}
+
+/// The extension of the HLS segment files for `segment_container`: `.mp4`
+/// for fMP4 ([`is_mp4_segment_container`]), else `.ts`.
+///
+/// ACCEPTED DIVERGENCE, deliberately: upstream's `GetSegmentFileExtension`
+/// (`EncodingHelper.cs:1625`) is `"." + segmentContainer`, the client's raw
+/// string. ffmpeg only ever writes mpegts or fMP4 segments
+/// (`DynamicHlsController` maps any other container to mpegts), so echoing
+/// `segmentContainer=TS` or an unknown container would have the segment routes
+/// look for `out0.TS` while ffmpeg wrote `out0.ts`: a permanent miss on a
+/// case-sensitive filesystem, which a client sees as a dead transcode. The
+/// playlist's segment URIs keep upstream's echo; the routes ignore that
+/// extension.
+#[must_use]
+pub fn segment_file_extension(segment_container: &str) -> &'static str {
+    if is_mp4_segment_container(segment_container) {
+        ".mp4"
+    } else {
+        ".ts"
+    }
+}
+
 /// Infers an audio codec from the actual URL suffix.
 /// Port of EncodingHelper.InferAudioCodec; a bare URL retains its odd native
 /// whole-path fallback, while an empty/whitespace suffix uses AAC.
@@ -1216,7 +1247,7 @@ pub fn normalize_subtitle_embed(
 /// `GetProgressiveVideoFullCommandLine` appends it after the audio arguments.
 ///
 /// The stream routes reject a `subtitleCodec` outside the container pattern
-/// before a job exists (`validate_stream_request`, upstream's
+/// before a job exists (`stream_pattern_failures` in the API crate, upstream's
 /// `[RegularExpression(ContainerValidationRegexStr)]`). Because the value is
 /// written into the command line, a name outside that pattern is also treated
 /// as no name here, so a caller that skipped the route check cannot add
@@ -3919,6 +3950,23 @@ mod tests {
     #[case("", "aac")]
     fn infer_audio_codec_maps_containers(#[case] container: &str, #[case] expected: &str) {
         assert_eq!(infer_audio_codec(container), expected);
+    }
+
+    #[rstest]
+    #[case("mp4", ".mp4")]
+    #[case("MP4", ".mp4")]
+    #[case(" mp4 ", ".mp4")]
+    #[case("ts", ".ts")]
+    #[case("TS", ".ts")]
+    #[case("webm", ".ts")]
+    #[case("", ".ts")]
+    #[case("   ", ".ts")]
+    fn segment_containers_map_to_the_files_ffmpeg_writes(
+        #[case] container: &str,
+        #[case] extension: &str,
+    ) {
+        assert_eq!(segment_file_extension(container), extension);
+        assert_eq!(is_mp4_segment_container(container), extension == ".mp4");
     }
 
     fn subtitle(codec: Option<&str>) -> MediaStream {

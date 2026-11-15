@@ -166,7 +166,7 @@ const EXTINF: &str = "#EXTINF:";
 ///
 /// Two checks are stricter than .NET's `Uri.TryCreate`, and neither drops a
 /// real stream URL. The line must start with `scheme://`, so
-/// [`path_protocol`](crate::stream::path_protocol) never reads an accepted line
+/// [`path_protocol`](ferrofin_model::media_info::path_protocol) never reads an accepted line
 /// as a file path. It must also hold no `"`, `\` or control character (never
 /// valid unescaped in a URL), because the raw line reaches ffmpeg inside a
 /// quoted argument.

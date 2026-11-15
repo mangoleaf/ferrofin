@@ -71,14 +71,11 @@ use ferrofin_traits::options::ImageCollageOptions;
 use ferrofin_traits::persistence::{ItemRepository, MediaStreamQuery, MediaStreamRepository};
 use ferrofin_traits::system::{MediaLocation, PathManager};
 use ferrofin_traits::trickplay::{TrickplayCheck, TrickplayManager};
+use ferrofin_util::ticks::TICKS_PER_MS;
 
 use crate::db_error::db_err;
 use crate::library_scan::off_runtime;
 use crate::media_source_manager::stream_to_dto;
-
-/// The number of 100-nanosecond ticks per millisecond
-/// (`TimeSpan.TicksPerMillisecond`).
-const TICKS_PER_MS: i64 = 10_000;
 
 /// The minimum valid trickplay interval, in milliseconds — smaller configured
 /// values are reset to this, mirroring the C# guard in
@@ -2281,8 +2278,8 @@ mod tests {
 
     use super::FerrofinTrickplayManager;
 
-    /// One hour, as runtime ticks.
-    const HOUR_TICKS: i64 = 3_600_000 * 10_000;
+    // These tests name the unit HOUR_TICKS.
+    use ferrofin_util::ticks::TICKS_PER_HOUR as HOUR_TICKS;
 
     /// A config manager returning the [`TrickplayOptions`] a test sets.
     struct FixedConfig {

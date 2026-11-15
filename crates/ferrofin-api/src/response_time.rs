@@ -38,7 +38,7 @@ pub async fn response_time_layer(
 ) -> Response {
     with_response_time(
         state.config.as_ref(),
-        |peer, forwarded_for| state.client_address_for(peer, forwarded_for),
+        |peer, headers| state.client_address_for(peer, headers),
         request,
         next,
     )
@@ -46,9 +46,9 @@ pub async fn response_time_layer(
 }
 
 /// Answers `request` with `inner` as [`response_time_layer`] does: the
-/// settings come from `config`, and `client_address` turns the peer and its
-/// `X-Forwarded-For` chain into the client the slow-response line names
-/// ([`AppState::client_address_for`] in the router).
+/// settings come from `config`, and `client_address` turns the peer and the
+/// request's headers (its `X-Forwarded-For` chain) into the client the
+/// slow-response line names ([`AppState::client_address_for`] in the router).
 ///
 /// Public so middleware the server runs in front of the router, like the HTTPS
 /// redirect, can answer under it, as Jellyfin runs `ResponseTimeMiddleware`
@@ -62,7 +62,7 @@ pub async fn with_response_time<S, C>(
 where
     S: Service<Request, Response = Response, Error = Infallible> + Send,
     S::Future: Send,
-    C: FnOnce(IpAddr, &[IpAddr]) -> IpAddr + Send,
+    C: FnOnce(IpAddr, &axum::http::HeaderMap) -> IpAddr + Send,
 {
     let start = Instant::now();
     // A configuration that cannot be read only loses the slow-response line;
@@ -84,7 +84,7 @@ where
                 .map_or(IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), |ci| {
                     crate::state::normalize_ip(ci.0.ip())
                 });
-            let client = client_address(peer, &crate::state::forwarded_for(request.headers()));
+            let client = client_address(peer, request.headers());
             (
                 threshold_ms,
                 request.method().clone(),

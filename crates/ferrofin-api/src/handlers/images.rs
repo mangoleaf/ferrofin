@@ -1130,7 +1130,9 @@ async fn project_image_infos(
 ) -> Vec<ImageInfo> {
     let mut list = Vec::with_capacity(images.len());
     for image in images {
-        if !allows_multiple_images(image.image_type) && !hidden.contains(&image) {
+        if !ferrofin_traits::library::image_type_allows_multiple(image.image_type)
+            && !hidden.contains(&image)
+        {
             list.push(image_info_dto(image, None, processor, item_path).await);
         }
     }
@@ -1155,14 +1157,6 @@ async fn project_image_infos(
         }
     }
     list
-}
-
-/// Whether an image type may have several instances on one item.
-///
-/// Port of `BaseItem.AllowsMultipleImages`: only Backdrop and Chapter images are
-/// multi-instance in the ported surface.
-fn allows_multiple_images(image_type: ImageType) -> bool {
-    matches!(image_type, ImageType::Backdrop | ImageType::Chapter)
 }
 
 /// Builds one [`ImageInfo`] DTO from an image row and its optional index.
@@ -2288,9 +2282,9 @@ mod tests {
             image: &ItemImageInfo,
         ) -> Result<Option<String>, ferrofin_traits::error::ServiceError> {
             // .NET ticks: 100-ns intervals since 0001-01-01, offset from the Unix epoch.
-            const UNIX_EPOCH_TICKS: i64 = 621_355_968_000_000_000;
+            use ferrofin_util::ticks::{TICKS_PER_SECOND, UNIX_EPOCH_TICKS};
             let ticks = UNIX_EPOCH_TICKS
-                + image.date_modified.timestamp() * 10_000_000
+                + image.date_modified.timestamp() * TICKS_PER_SECOND
                 + i64::from(image.date_modified.timestamp_subsec_nanos()) / 100;
             let key = format!("{}{ticks}", item_path.unwrap_or_default());
             Ok(Some(
