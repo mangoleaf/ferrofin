@@ -68,10 +68,6 @@ use crate::stream::{LiveStreamHandle, LiveStreamKind, TunerStreamSource};
 use crate::xmltv::{Xmltv, XmltvChannel, XmltvProgramme, read_xmltv_each};
 use crate::xmltv_cache::XmlTvDocument;
 
-/// SQLite's conservative default bind-parameter limit (`SQLITE_MAX_VARIABLE_NUMBER`
-/// is 999 before 3.32, 32766 after); multi-row inserts chunk to stay under it.
-const SQLITE_BIND_LIMIT: usize = 999;
-
 /// How many programme item rows one `save_items`/`delete_items`/
 /// `save_item_values_for_items` call carries.
 ///
@@ -2170,12 +2166,13 @@ impl FerrofinLiveTvManager {
 
         // 14 columns per row; chunked multi-row insert instead of one round-trip
         // per channel.
-        for (chunk_index, chunk) in channels.chunks(SQLITE_BIND_LIMIT / 14).enumerate() {
+        let rows_per_statement = ferrofin_db::BATCH_BIND_CHUNK / 14;
+        for (chunk_index, chunk) in channels.chunks(rows_per_statement).enumerate() {
             let mut qb: QueryBuilder<Sqlite> = QueryBuilder::new(
                 r#"INSERT INTO "FerrofinLiveTvChannels"
                    ("Id","TunerHostId","TvgId","Name","Number","ImageUrl","ChannelType","StreamUrl","SortIndex","DateCreated","ExternalId","IsHd","VideoCodec","AudioCodec") "#,
             );
-            let base = chunk_index * (SQLITE_BIND_LIMIT / 14);
+            let base = chunk_index * rows_per_statement;
             qb.push_values(chunk.iter().enumerate(), |mut b, (offset, ch)| {
                 // `GuideManager.GetChannel` stores the item under
                 // `GetInternalChannelId(serviceName, channelInfo.Id)`, where
@@ -2897,9 +2894,9 @@ impl FerrofinLiveTvManager {
 /// The columns of one programme row in [`GuideWrite::upsert`]'s insert.
 const PROGRAM_COLUMNS: usize = 27;
 
-/// The programme rows one insert statement carries: as many as fit under
-/// [`SQLITE_BIND_LIMIT`].
-const PROGRAM_ROWS_PER_STATEMENT: usize = SQLITE_BIND_LIMIT / PROGRAM_COLUMNS;
+/// The programme rows one insert statement carries: as many as fit in
+/// [`ferrofin_db::BATCH_BIND_CHUNK`] binds.
+const PROGRAM_ROWS_PER_STATEMENT: usize = ferrofin_db::BATCH_BIND_CHUNK / PROGRAM_COLUMNS;
 
 /// One listings provider's write of its airings, in one transaction: an
 /// upsert of every airing it emits for the channels it binds, then the removal
@@ -9869,6 +9866,93 @@ mod tests {
             .await
             .expect("progs");
         assert_eq!(programs.total_record_count, 5000);
+    }
+
+    /// One channel and one airing more than [`ferrofin_db::BATCH_BIND_CHUNK`]:
+    /// the channel and programme upserts and the deletes by id each take more
+    /// than one statement, and the lineup keeps its playlist order across the
+    /// channel upsert's statements (gl-279).
+    #[tokio::test]
+    async fn guide_writes_and_deletes_cross_the_bind_chunk() {
+        use std::fmt::Write as _;
+        let count = ferrofin_db::BATCH_BIND_CHUNK + 1;
+        // Names descend down the playlist, so only `SortIndex` keeps its order.
+        let name = |c: usize| format!("Channel {:04}", count - c);
+        let day = guide_day(0);
+        let mut m3u = String::from("#EXTM3U\n");
+        let mut xmltv = String::from("<tv>");
+        for c in 0..count {
+            let _ = write!(
+                m3u,
+                "#EXTINF:-1 tvg-id=\"ch{c}.tv\" tvg-chno=\"{c}\",{}\nhttp://tuner/{c}\n",
+                name(c)
+            );
+            let _ = write!(
+                xmltv,
+                "<channel id=\"ch{c}.tv\"><display-name>{}</display-name></channel>\
+                 <programme start=\"{day}060000 +0000\" stop=\"{day}070000 +0000\" \
+                 channel=\"ch{c}.tv\"><title>Show {c}</title></programme>",
+                name(c)
+            );
+        }
+        xmltv.push_str("</tv>");
+        let mut sources = HashMap::new();
+        sources.insert("http://tuner/playlist.m3u".to_owned(), m3u);
+        sources.insert("http://guide/xmltv.xml".to_owned(), xmltv);
+        let mgr = manager_with(FakeFetcher(sources)).await;
+        let host = mgr
+            .save_tuner_host(TunerHostInfo {
+                type_: Some("m3u".to_owned()),
+                url: Some("http://tuner/playlist.m3u".to_owned()),
+                ..TunerHostInfo::default()
+            })
+            .await
+            .expect("tuner")
+            .id
+            .expect("tuner id");
+        mgr.save_listing_provider(
+            as_xmltv(ListingsProviderInfo {
+                path: Some("http://guide/xmltv.xml".to_owned()),
+                ..ListingsProviderInfo::default()
+            }),
+            false,
+            false,
+        )
+        .await
+        .expect("provider");
+        mgr.refresh_guide().await.expect("refresh");
+
+        let lineup = crate::guide_repository::tuner_lineup(&mgr.db, &host)
+            .await
+            .expect("lineup");
+        let names: Vec<String> = lineup.into_iter().map(|row| row.name).collect();
+        assert_eq!(names, (0..count).map(name).collect::<Vec<_>>());
+
+        let programs = crate::guide_repository::all_program_ids(&mgr.db)
+            .await
+            .expect("programmes");
+        assert_eq!(programs.len(), count);
+        let mut conn = mgr.db.writer().acquire().await.expect("connection");
+        crate::guide_repository::delete_programs_in(&mut conn, &programs)
+            .await
+            .expect("delete programmes");
+        drop(conn);
+        let left = crate::guide_repository::all_program_ids(&mgr.db)
+            .await
+            .expect("programmes left");
+        assert!(left.is_empty(), "{} programmes left", left.len());
+
+        let channels = crate::guide_repository::all_channel_ids(&mgr.db)
+            .await
+            .expect("channels");
+        assert_eq!(channels.len(), count);
+        crate::guide_repository::delete_channels(&mgr.db, &channels)
+            .await
+            .expect("delete channels");
+        let left = crate::guide_repository::all_channel_ids(&mgr.db)
+            .await
+            .expect("channels left");
+        assert!(left.is_empty(), "{} channels left", left.len());
     }
 
     /// Builds a two-channel guide whose airings sit at fixed offsets from *now*,

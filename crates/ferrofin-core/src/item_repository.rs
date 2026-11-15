@@ -16866,7 +16866,8 @@ pub(crate) async fn by_name_ids_by_clean_name(
     // Padded as the `IN` reads are, so the `VALUES` list is one of a few
     // lengths in each connection's statement cache, not one per key count
     // (gl-1403). A repeated key returns its row again; the map keeps one.
-    // Three binds a key: a full chunk binds 768, under SQLite's 999 floor.
+    // Three binds a key: a full chunk binds 768, above `BATCH_BIND_CHUNK` on
+    // purpose (padded shapes, gl-1403) and far under SQLite's 32,766 limit.
     for chunk in ferrofin_db::padded_in_chunks(keys) {
         let mut query = sqlx::query_as::<_, (String, String, Option<String>)>(sqlx::AssertSqlSafe(
             by_name_ids_sql(chunk.len()),
