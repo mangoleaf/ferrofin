@@ -3971,6 +3971,28 @@ mod tests {
         }
     }
 
+    /// A history file missing a time or the status reads them as upstream's
+    /// `JsonSerializer` does: `DateTime.MinValue` and `Completed`.
+    #[test]
+    fn a_jellyfin_history_file_missing_members_reads_their_defaults() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_jellyfin_task_file(dir.path(), br#"{"Name":"Scan Media Library"}"#);
+        let mgr = FerrofinTaskManager::new();
+        mgr.set_jellyfin_data_path(dir.path());
+        mgr.register(Arc::new(KeyedTask("RefreshLibrary")));
+        let result = mgr
+            .get("RefreshLibrary")
+            .expect("info")
+            .last_execution_result
+            .expect("result");
+        let min = ferrofin_model::json::datetime::dotnet_min();
+        assert_eq!(
+            (result.start_time_utc, result.end_time_utc, result.status),
+            (min, min, TaskCompletionStatus::Completed)
+        );
+        assert_eq!(result.name.as_deref(), Some("Scan Media Library"));
+    }
+
     /// What Jellyfin 12.4 saved for "Scan Media Library" after its dashboard
     /// set a weekly and an interval trigger, verbatim.
     const JELLYFIN_TRIGGERS: &str = r#"[{"Type":"WeeklyTrigger","TimeOfDayTicks":36000000000,"DayOfWeek":"Tuesday","MaxRuntimeTicks":72000000000},{"Type":"IntervalTrigger","IntervalTicks":216000000000}]"#;
