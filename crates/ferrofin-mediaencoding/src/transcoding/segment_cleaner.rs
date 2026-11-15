@@ -24,7 +24,7 @@ use super::throttler::effective_input_protocol;
 
 const CLEAN_INTERVAL: Duration = Duration::from_secs(20);
 const DELETE_DELAY: Duration = Duration::from_millis(1500);
-const MIN_RUNTIME_TICKS: i64 = 300 * 10_000_000;
+const MIN_RUNTIME_TICKS: i64 = 300 * ferrofin_util::ticks::TICKS_PER_SECOND;
 
 /// The input timestamp-sync options `EncodingHelper.AttachMediaSourceInfo`
 /// selects and `GetInputModifier` emits ahead of the pacing: a native-rate

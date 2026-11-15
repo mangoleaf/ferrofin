@@ -17,6 +17,7 @@ use std::fmt::Write as _;
 use chrono::{DateTime, Utc};
 use ferrofin_model::data::PersonKind;
 use ferrofin_model::entities_media::MetadataProvider;
+use ferrofin_util::ticks::TICKS_PER_MINUTE;
 
 use crate::container_types::{MetadataResult, PersonInfo};
 
@@ -94,9 +95,6 @@ const YOUTUBE_WATCH_URL: &str = "https://www.youtube.com/watch?v=";
 /// The Kodi trailer plugin prefix that replaces [`YOUTUBE_WATCH_URL`] on save
 /// (`BaseNfoSaver.GetOutputTrailerUrl`).
 const YOUTUBE_PLUGIN_URL: &str = "plugin://plugin.video.youtube/play/?video_id=";
-
-/// .NET ticks per minute; used to convert `RunTimeTicks` back to `<runtime>`.
-const TICKS_PER_MINUTE: i64 = 600_000_000;
 
 /// A minimal, in-memory XML writer mirroring the subset of `System.Xml.XmlWriter`
 /// the NFO savers use (indented start-document, element strings, nested

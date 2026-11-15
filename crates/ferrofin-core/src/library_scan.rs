@@ -1095,7 +1095,7 @@ fn stored_media_source(data: &serde_json::Map<String, serde_json::Value>) -> Med
 }
 
 /// `VideoImageProvider`'s offset when the runtime is unknown: 10 s, in ticks.
-const SCREEN_GRAB_DEFAULT_OFFSET_TICKS: i64 = 10 * 10_000_000;
+const SCREEN_GRAB_DEFAULT_OFFSET_TICKS: i64 = 10 * ferrofin_util::ticks::TICKS_PER_SECOND;
 
 /// `GetVideoImage`'s stream: the one at `DefaultVideoStreamIndex` (any type,
 /// as its first `GetMediaStreams` query asks), else the first video stream.
@@ -27291,10 +27291,10 @@ mod tests {
     #[case::default_time(None, 10)]
     #[case::calculated_time(Some(500), 50)]
     fn the_grab_selects_its_time(#[case] run_time_seconds: Option<i64>, #[case] expected: i64) {
-        const TICKS: i64 = 10_000_000;
+        use ferrofin_util::ticks::TICKS_PER_SECOND;
         assert_eq!(
-            super::screen_grab_offset(run_time_seconds.map(|s| s * TICKS)),
-            expected * TICKS
+            super::screen_grab_offset(run_time_seconds.map(|s| s * TICKS_PER_SECOND)),
+            expected * TICKS_PER_SECOND
         );
     }
 

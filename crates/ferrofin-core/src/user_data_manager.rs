@@ -45,6 +45,7 @@ use ferrofin_traits::library::{
     ContentPermissions, LibraryManager, UserDataManager, UserDataSaveListener,
 };
 use ferrofin_traits::persistence::ItemCountService;
+use ferrofin_util::ticks::TICKS_PER_SECOND;
 
 use crate::db_error::db_err;
 use crate::dto_service::parse_media_type;
@@ -67,10 +68,6 @@ struct PlayStateItem {
     /// `SupportsPositionTicksResume`.
     resume: bool,
 }
-
-/// One tick is 100 nanoseconds; there are 10,000,000 ticks per second (the
-/// .NET `TimeSpan.TicksPerSecond` the C# resume math uses).
-const TICKS_PER_SECOND: i64 = 10_000_000;
 
 /// The rating from which an item counts as liked (`UserItemData.MinLikeValue`).
 const MIN_LIKE_VALUE: f64 = 6.5;

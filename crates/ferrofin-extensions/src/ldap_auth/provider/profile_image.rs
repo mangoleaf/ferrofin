@@ -56,6 +56,7 @@ use ferrofin_traits::external_identities::ExternalIdentity;
 use ferrofin_traits::library::UserManager;
 use ferrofin_traits::remote_images::{RemoteImageError, RemoteImageFetcher};
 use ferrofin_util::source_url::redact_url;
+use ferrofin_util::ticks::TICKS_PER_DAY;
 
 use super::{LdapAuthProvider, PROVIDER_ID, locate_ldap_user};
 use crate::ldap_auth::{BoundSearchError, LdapConfig, LdapEntry, LdapError, ProfileImageFormat};
@@ -415,9 +416,6 @@ impl LdapAuthProvider {
     }
 }
 
-/// 100-nanosecond ticks in 24 hours, the task's default interval.
-const DAY_TICKS: i64 = 24 * 3600 * 10_000_000;
-
 /// The "LDAP - Synchronize profile images" task, `LdapProfileImageSyncTask`:
 /// [`LdapAuthProvider::sync_profile_images`] every 24 hours.
 pub(crate) struct ProfileImageSyncTask {
@@ -454,7 +452,7 @@ impl ScheduledTask for ProfileImageSyncTask {
     fn default_triggers(&self) -> Vec<TaskTriggerInfo> {
         vec![TaskTriggerInfo {
             type_: TaskTriggerInfoType::IntervalTrigger,
-            interval_ticks: Some(DAY_TICKS),
+            interval_ticks: Some(TICKS_PER_DAY),
             ..TaskTriggerInfo::default()
         }]
     }

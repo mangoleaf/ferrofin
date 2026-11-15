@@ -31,6 +31,7 @@ use ferrofin_model::tasks::{
 
 use ferrofin_traits::error::ServiceError;
 use ferrofin_traits::localization::LocalizationManager;
+use ferrofin_util::ticks::TICKS_PER_SECOND;
 use tracing::Instrument as _;
 
 pub mod application;
@@ -38,9 +39,6 @@ pub mod channels;
 pub mod library;
 pub mod live_tv;
 pub mod maintenance;
-
-/// 100-nanosecond ticks per second (the `TaskTriggerInfo` time unit).
-const TICKS_PER_SECOND: i64 = 10_000_000;
 
 /// How often the scheduler evaluates triggers.
 const SCHEDULER_PERIOD: Duration = Duration::from_secs(30);

@@ -88,6 +88,7 @@ use ferrofin_traits::merge_versions::{MergeProgress, MergeVersionsManager};
 use ferrofin_traits::options::InternalItemsQuery;
 use ferrofin_traits::persistence::{ItemPersistenceService, ItemRepository};
 use ferrofin_traits::plugins::{PluginDescriptor, PluginManager};
+use ferrofin_util::ticks::TICKS_PER_DAY;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -167,9 +168,6 @@ impl Extension for MergeVersionsExtension {
     }
 }
 
-/// One day as scheduler ticks (100 ns) — the upstream tasks' default interval.
-const DAY_TICKS: i64 = 24 * 3600 * 10_000_000;
-
 /// The merge tasks' shared default trigger: every 24 hours, as upstream.
 ///
 /// There used to be a `StartupTrigger` here as well, justified by "the interval
@@ -192,7 +190,7 @@ const DAY_TICKS: i64 = 24 * 3600 * 10_000_000;
 fn default_triggers() -> Vec<TaskTriggerInfo> {
     vec![TaskTriggerInfo {
         type_: TaskTriggerInfoType::IntervalTrigger,
-        interval_ticks: Some(DAY_TICKS),
+        interval_ticks: Some(TICKS_PER_DAY),
         ..TaskTriggerInfo::default()
     }]
 }
@@ -2603,7 +2601,7 @@ mod tests {
         for task in &tasks {
             assert_eq!(task.category(), "Merge Versions");
             let triggers = task.default_triggers();
-            assert_eq!(triggers[0].interval_ticks, Some(DAY_TICKS));
+            assert_eq!(triggers[0].interval_ticks, Some(TICKS_PER_DAY));
             // Daily and ONLY daily, as upstream. A `StartupTrigger` used to sit
             // beside it, compensating for an interval clock that restarted on
             // every boot; the scheduler anchors on the last completion now, so

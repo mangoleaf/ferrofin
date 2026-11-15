@@ -480,9 +480,11 @@ fn row_id(item: &BaseItemEntity) -> Uuid {
 /// etag values — the base list is just `DateLastSaved.Ticks` (100 ns units since
 /// 0001-01-01; a never-saved row matches C#'s `DateTime.MinValue` = 0 ticks).
 fn compute_etag(date_last_saved: Option<chrono::DateTime<chrono::Utc>>) -> String {
-    const UNIX_EPOCH_TICKS: i64 = 621_355_968_000_000_000;
+    use ferrofin_util::ticks::{TICKS_PER_SECOND, UNIX_EPOCH_TICKS};
     let ticks = date_last_saved.map_or(0, |d| {
-        UNIX_EPOCH_TICKS + d.timestamp() * 10_000_000 + i64::from(d.timestamp_subsec_nanos() / 100)
+        UNIX_EPOCH_TICKS
+            + d.timestamp() * TICKS_PER_SECOND
+            + i64::from(d.timestamp_subsec_nanos() / 100)
     });
     ferrofin_common::extensions::get_md5(&ticks.to_string())
         .simple()
