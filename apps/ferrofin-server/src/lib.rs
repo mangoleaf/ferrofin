@@ -954,7 +954,9 @@ fn lifetime_app(
 /// - a header value that is not UTF-8: Kestrel reads a value as ASCII, then as
 ///   strict UTF-8 (its default header encoding, which Jellyfin keeps), and
 ///   fails one that is neither, where hyper takes bytes 0x80-0xFF as
-///   `obs-text`.
+///   `obs-text`;
+/// - a target form or a `Host` Kestrel refuses ([`target_and_host_refusal`]),
+///   which hyper never checks.
 ///
 /// hyper itself refuses, with the same answer, the rest of what was measured
 /// refused on both: a NUL or a lone CR in a value, a header name outside the
@@ -978,6 +980,8 @@ async fn kestrel_refusals(request: Request, next: Next) -> Response {
         .any(|value| std::str::from_utf8(value.as_bytes()).is_err())
     {
         "a header value that is not UTF-8"
+    } else if let Some(reason) = target_and_host_refusal(&request) {
+        reason
     } else {
         return next.run(request).await;
     };
@@ -987,6 +991,138 @@ async fn kestrel_refusals(request: Request, next: Next) -> Response {
         [(axum::http::header::CONNECTION, "close")],
     )
         .into_response()
+}
+
+/// Why Kestrel refuses a request's target form or its `Host`, if it does
+/// (ASP.NET Core 10.0.14, the runtime Jellyfin 12.4 ships, which keeps
+/// `AllowHostHeaderOverride` off).
+///
+/// `Http1Connection.OnStartLine` reads a target with a scheme other than
+/// `http` or `https` as authority-form, whose bytes `OnAuthorityFormTarget`
+/// holds to `:.-[]@` and alphanumerics. `EnsureHostHeaderExists` then wants
+/// one `Host` on HTTP/1.1 and at most one on HTTP/1.0, a host Kestrel takes
+/// ([`host_is_valid`]) that names an absolute- or authority-form target's
+/// authority.
+fn target_and_host_refusal(request: &Request) -> Option<&'static str> {
+    use axum::http::Version;
+    // Ported for HTTP/1 only: HTTP/2 (gl-814) carries `:authority` instead.
+    if !matches!(request.version(), Version::HTTP_10 | Version::HTTP_11) {
+        return None;
+    }
+    let uri = request.uri();
+    match (uri.scheme_str(), uri.authority()) {
+        (Some("http" | "https"), _) | (None, None) => {}
+        (None, Some(authority))
+            if authority
+                .as_str()
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || b":.-[]@".contains(&byte)) => {}
+        _ => return Some("a request target Kestrel cannot read"),
+    }
+    let mut hosts = request.headers().get_all(axum::http::header::HOST).iter();
+    let Some(host) = hosts.next() else {
+        return (request.version() == Version::HTTP_11).then_some("a missing Host header");
+    };
+    if hosts.next().is_some() {
+        return Some("more than one Host header");
+    }
+    let host = host.as_bytes();
+    let names_target = match (uri.scheme_str(), uri.authority()) {
+        // Absolute-form: `System.Uri.Authority`, the host canonical and a
+        // default port left out, or that with the default port written.
+        (Some(scheme), Some(authority)) => {
+            let default = if scheme == "http" { 80 } else { 443 };
+            let name = uri_host(authority.host());
+            match authority.port_u16().filter(|&port| port != default) {
+                Some(port) => host == format!("{name}:{port}").as_bytes(),
+                None => host == name.as_bytes() || host == format!("{name}:{default}").as_bytes(),
+            }
+        }
+        // Authority-form: the target as sent.
+        (None, Some(authority)) => host == authority.as_str().as_bytes(),
+        _ => true,
+    };
+    (!names_target || !host_is_valid(host)).then_some("an invalid Host header")
+}
+
+/// A host as `System.Uri` writes it: an IPv4 address in dotted decimal
+/// ([`uri_ipv4`]), an IPv6 literal in its canonical form, a name lower-cased.
+fn uri_host(host: &str) -> String {
+    if let Some(address) = uri_ipv4(host) {
+        return address.to_string();
+    }
+    match host
+        .strip_prefix('[')
+        .and_then(|literal| literal.strip_suffix(']'))
+        .and_then(|literal| literal.parse::<std::net::Ipv6Addr>().ok())
+    {
+        Some(address) => format!("[{address}]"),
+        None => host.to_ascii_lowercase(),
+    }
+}
+
+/// `System.Uri`'s reading of an IPv4 host (`IPv4AddressHelper`, measured on
+/// Jellyfin 12.4): one to four dot-separated numbers, each decimal, octal
+/// after a leading `0` or hexadecimal after `0x`, the last one filling the
+/// bytes the others leave (`127.1` is `127.0.0.1`, `0x7f.1` too). Anything
+/// else (`256.1.1.1`, `08.1.1.1`, a trailing dot) is a name.
+fn uri_ipv4(host: &str) -> Option<std::net::Ipv4Addr> {
+    let mut values = Vec::with_capacity(4);
+    for part in host.split('.') {
+        let (digits, radix) = match part.strip_prefix("0x").or_else(|| part.strip_prefix("0X")) {
+            Some(hex) => (hex, 16),
+            None if part.len() > 1 && part.starts_with('0') => (&part[1..], 8),
+            None => (part, 10),
+        };
+        if digits.is_empty() || !digits.chars().all(|digit| digit.is_digit(radix)) {
+            return None;
+        }
+        values.push(u64::from_str_radix(digits, radix).ok()?);
+    }
+    let (last, leading) = values.split_last()?;
+    // The bytes the last number fills: four for one number, one for four.
+    let last_bytes = 4_usize
+        .checked_sub(leading.len())
+        .filter(|&bytes| bytes > 0)?;
+    if leading.iter().any(|&value| value > 255) || *last >> (8 * last_bytes) != 0 {
+        return None;
+    }
+    let leading = leading
+        .iter()
+        .fold(0, |address, &value| (address << 8) | value);
+    let address = (leading << (8 * last_bytes)) | last;
+    u32::try_from(address).ok().map(std::net::Ipv4Addr::from)
+}
+
+/// Kestrel's `HttpUtilities.IsHostHeaderValid`: empty, or a name of
+/// `HttpCharacters`' host characters or a bracketed IPv6 address, then
+/// optionally `:` and a port of at least one digit.
+fn host_is_valid(host: &[u8]) -> bool {
+    // RFC 3986's reg-name without "*+,;=" and percent-encoding, as Http.Sys.
+    let in_name = |byte: &u8| byte.is_ascii_alphanumeric() || b"!$&'()-._~".contains(byte);
+    let port_is_valid = |rest: &[u8]| match rest {
+        [b':', digits @ ..] => !digits.is_empty() && digits.iter().all(u8::is_ascii_digit),
+        _ => false,
+    };
+    match host {
+        [] => true,
+        [b'[', rest @ ..] => rest
+            .iter()
+            .position(|&byte| byte == b']')
+            .is_some_and(|end| {
+                // `[::1]` is the shortest.
+                end >= 3
+                    && rest[..end]
+                        .iter()
+                        .all(|byte| byte.is_ascii_hexdigit() || b":.".contains(byte))
+                    && (end + 1 == rest.len() || port_is_valid(&rest[end + 1..]))
+            }),
+        [b':', ..] => false,
+        _ => host
+            .iter()
+            .position(|byte| !in_name(byte))
+            .is_none_or(|end| port_is_valid(&host[end..])),
+    }
 }
 
 /// Where the requests refused before routing depart from Kestrel's, each with
@@ -1007,6 +1143,10 @@ const KESTREL_REFUSAL_DIVERGENCES: &[&str] = &[
      the version token is gone once hyper has refused the request, so the answer has \
      to come from below it, at the socket, where the connection limits already see \
      the request's bytes.",
+    "hyper takes a Content-Length sent twice with the same value, keeping one; Kestrel \
+     refuses it (400). Fix path: gl-1848; hyper drops the second line before any of \
+     Ferrofin's code runs (proto/h1/role.rs), so the refusal has to come from hyper or \
+     from below it.",
     "hyper refuses a Content-Length with a sign (+1) with 400; Kestrel takes it. Fix \
      path: gl-1848; the refusal is hyper's own Content-Length reading \
      (hyper::headers::from_digits), not httparse's.",
@@ -1014,6 +1154,18 @@ const KESTREL_REFUSAL_DIVERGENCES: &[&str] = &[
      so the request is served on the path before it; Kestrel keeps the fragment in the \
      path (404) and refuses one holding a byte outside ASCII (400). Fix path: gl-1848; \
      only the raw request line still holds the fragment.",
+    "http reads a target's scheme ignoring case, so HTTP://a/... is served as an \
+     absolute-form target; Kestrel takes only a lower-case http:// or https:// as \
+     one and refuses HTTP://a/... (400) as an authority-form target holding a '/'. \
+     Fix path: gl-1850; the scheme's case is gone before any of Ferrofin's code runs.",
+    "An asterisk-form target with a method other than OPTIONS, and an authority-form \
+     one with a method other than CONNECT, are routed (404) where Kestrel answers 405 \
+     with Allow; OPTIONS * and CONNECT reach Jellyfin's pipeline with an empty path \
+     (302 to web/), where Ferrofin answers them 404. Fix path: gl-1850.",
+    "An absolute-form IPv6 host embedding an IPv4 address other than ::ffff:a.b.c.d \
+     (::1.2.3.4, ::ffff:0:1.2.3.4, ISATAP) is compared in Rust's hexadecimal form; \
+     System.Uri writes it dotted, so Host must name it dotted on Jellyfin. Fix path: \
+     gl-1850.",
 ];
 
 /// A lifetime's serve loops, one per listening address, all stopped by the
@@ -1654,7 +1806,7 @@ mod tests {
     use axum::Router;
 
     use axum::body::Body;
-    use axum::http::{Request, StatusCode};
+    use axum::http::{Request, StatusCode, Version};
     use ferrofin_traits::plugins::FileTransformationService;
     use std::sync::Arc;
     use tower::ServiceExt as _;
@@ -1744,9 +1896,10 @@ mod tests {
     /// A path holding a NUL, a request target outside ASCII (its path or its
     /// query) and a header value that is not UTF-8 are Kestrel's empty `400`,
     /// and the connection closes after it, on the startup server and the
-    /// lifetime's router alike, as are the heads hyper refuses itself; a NUL
-    /// in the query, a percent-encoded target and a UTF-8 header value reach
-    /// the route (measured on Jellyfin 12.4).
+    /// lifetime's router alike, as are a `Host` Kestrel refuses and the heads
+    /// hyper refuses itself; a NUL in the query, a percent-encoded target, a
+    /// UTF-8 header value and a `Host` Kestrel takes reach the route (measured
+    /// on Jellyfin 12.4).
     #[rstest::rstest]
     #[case::starting(true)]
     #[case::ready(false)]
@@ -1766,7 +1919,7 @@ mod tests {
         let _serving =
             super::Serving::start(vec![crate::listen::ServedListener::Plain(listener)], &app);
         // Each a request line and its headers.
-        let refused: [&[u8]; 12] = [
+        let refused: [&[u8]; 25] = [
             b"GET /jellyfin/echo/1%00 HTTP/1.1\r\nHost: x\r\n",
             b"GET /System/Info/Public%00 HTTP/1.1\r\nHost: x\r\n",
             b"GET /x%00 HTTP/1.1\r\nHost: x\r\n",
@@ -1780,11 +1933,37 @@ mod tests {
             b"GET /x HTTP/1.1\r\nHost: x\r\nX-Test: a\x00b\r\n",
             b"GET /x HTTP/1.1\r\nHost: x\r\nX-Test : a\r\n",
             b"GET /x HTTP/1.1\r\nHost: x\r\nX-Test: a\r\n b\r\n",
+            // `Host`: missing, sent twice, invalid, not naming the target.
+            b"GET /x HTTP/1.1\r\n",
+            b"GET /x HTTP/1.1\r\nHost: x\r\nHost: y\r\n",
+            b"GET /x HTTP/1.0\r\nHost: a\r\nHost: b\r\n",
+            b"GET /x HTTP/1.1\r\nHost: a b\r\n",
+            b"GET /x HTTP/1.0\r\nHost: u@x\r\n",
+            b"GET http://a:8096/jellyfin/echo/1 HTTP/1.1\r\nHost: a\r\n",
+            b"GET http://A/jellyfin/echo/1 HTTP/1.1\r\nHost: A\r\n",
+            b"GET http://[0:0::1]/jellyfin/echo/1 HTTP/1.1\r\nHost: [0:0::1]\r\n",
+            b"GET ftp://a/jellyfin/echo/1 HTTP/1.1\r\nHost: a\r\n",
+            b"CONNECT x:80 HTTP/1.1\r\nHost: y:80\r\n",
+            b"CONNECT a_b:80 HTTP/1.1\r\nHost: a_b:80\r\n",
+            b"GET http://0x7f.1/jellyfin/echo/1 HTTP/1.1\r\nHost: 0x7f.1\r\n",
+            b"GET http://1.2.3.4./jellyfin/echo/1 HTTP/1.1\r\nHost: 1.2.3.4\r\n",
         ];
-        let served: [&[u8]; 3] = [
+        let served: [&[u8]; 15] = [
             b"GET /jellyfin/echo/1?limit=1%00 HTTP/1.1\r\nHost: x\r\n",
             b"GET /jellyfin/echo/1%2500 HTTP/1.1\r\nHost: x\r\n",
             b"GET /jellyfin/echo/caf%C3%A9?q=caf%C3%A9 HTTP/1.1\r\nHost: x\r\nX-Test: caf\xC3\xA9\r\n",
+            b"GET /jellyfin/echo/1 HTTP/1.0\r\n",
+            b"GET /jellyfin/echo/1 HTTP/1.1\r\nHost:\r\n",
+            b"GET /jellyfin/echo/1 HTTP/1.1\r\nHost: [::1]:8096\r\n",
+            b"GET http://A:80/jellyfin/echo/1 HTTP/1.1\r\nHost: a\r\n",
+            b"GET http://a/jellyfin/echo/1 HTTP/1.1\r\nHost: a:80\r\n",
+            b"GET https://u@a/jellyfin/echo/1 HTTP/1.1\r\nHost: a:443\r\n",
+            b"GET http://[0:0::1]/jellyfin/echo/1 HTTP/1.1\r\nHost: [::1]\r\n",
+            b"GET http://a:8096/jellyfin/echo/1 HTTP/1.1\r\nHost: a:8096\r\n",
+            b"GET http://[::1]:8096/jellyfin/echo/1 HTTP/1.1\r\nHost: [::1]:8096\r\n",
+            b"GET http://0x7f.1/jellyfin/echo/1 HTTP/1.1\r\nHost: 127.0.0.1\r\n",
+            b"GET http://010.1.1.1/jellyfin/echo/1 HTTP/1.1\r\nHost: 8.1.1.1\r\n",
+            b"GET http://256.1.1.1/jellyfin/echo/1 HTTP/1.1\r\nHost: 256.1.1.1\r\n",
         ];
         let cases = refused.iter().map(|head| (head, true)).chain(
             served
@@ -1840,6 +2019,150 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Kestrel's own valid hosts (`HttpUtilitiesTest.HostHeaderData`, ASP.NET
+    /// Core v10.0.14), then the ones measured served on Jellyfin 12.4.
+    #[rstest::rstest]
+    #[case("z")]
+    #[case("1")]
+    #[case("y:1")]
+    #[case("1:1")]
+    #[case("[ABCdef]")]
+    #[case("[abcDEF]:0")]
+    #[case("[abcdef:127.2355.1246.114]:0")]
+    #[case("[::1]:80")]
+    #[case("127.0.0.1:80")]
+    #[case("900.900.900.900:9523547852")]
+    #[case("foo")]
+    #[case("foo:234")]
+    #[case("foo.bar.baz")]
+    #[case("foo.BAR.baz:46245")]
+    #[case("foo.ba-ar.baz:46245")]
+    #[case("-foo:1234")]
+    #[case("xn--asdfaf:134")]
+    #[case("-")]
+    #[case("_")]
+    #[case("~")]
+    #[case("!")]
+    #[case("$")]
+    #[case("'")]
+    #[case("(")]
+    #[case(")")]
+    #[case("")]
+    #[case("[::1]:8096")]
+    #[case("a!$&'()-._~")]
+    fn kestrel_takes_the_host(#[case] host: &str) {
+        assert!(super::host_is_valid(host.as_bytes()));
+    }
+
+    /// Kestrel's own invalid hosts (`HttpUtilitiesTest.HostHeaderInvalidData`),
+    /// then the ones measured refused on Jellyfin 12.4.
+    #[rstest::rstest]
+    #[case("[]")]
+    #[case("[::]")]
+    #[case("[ghijkl]")]
+    #[case("[afd:adf:123")]
+    #[case("[afd:adf]123")]
+    #[case("[afd:adf]:")]
+    #[case("[afd adf]")]
+    #[case("[ad-314]")]
+    #[case(":1234")]
+    #[case("a:b:c")]
+    #[case("::1")]
+    #[case("::")]
+    #[case("abcd:1abcd")]
+    #[case("abcd:1.2")]
+    #[case("1.2.3.4:")]
+    #[case("1.2 .4")]
+    #[case("a b")]
+    #[case("café")]
+    #[case("[bad")]
+    #[case("u@x")]
+    #[case("[fe80::1%25eth0]")]
+    #[case("a:")]
+    #[case(":80")]
+    #[case("a*b")]
+    #[case("a%41")]
+    fn kestrel_refuses_the_host(#[case] host: &str) {
+        assert!(!super::host_is_valid(host.as_bytes()));
+    }
+
+    /// The rest of `HostHeaderInvalidData`: each character it lists, alone,
+    /// inside brackets and as a port.
+    #[test]
+    fn kestrel_refuses_the_characters_it_lists() {
+        let alone = "\"#%*+,/;<=>?@[]\\^`{}|".chars().map(String::from);
+        let bracketed = "!\"#$%&'()*+,/;<=>?@[]\\^_`{}|~-"
+            .chars()
+            .map(|ch| format!("[abd{ch}]:1234"));
+        let ports = "!\"#$%&'()*+,/;<=>?@[]\\^_`{}|~:abcABC-."
+            .chars()
+            .map(|ch| format!("a.b.c:{ch}"));
+        for host in alone.chain(bracketed).chain(ports) {
+            assert!(!super::host_is_valid(host.as_bytes()), "{host}");
+        }
+    }
+
+    /// What the end-to-end test cannot show, as these requests reach no
+    /// route: an authority-form target its `Host` names passes, and HTTP/2
+    /// carries no `Host` to check.
+    #[rstest::rstest]
+    #[case("CONNECT", "x:80", Version::HTTP_11, Some("x:80"), None)]
+    #[case(
+        "CONNECT",
+        "x:80",
+        Version::HTTP_11,
+        Some("y:80"),
+        Some("an invalid Host header")
+    )]
+    #[case(
+        "GET",
+        "a_b:80",
+        Version::HTTP_10,
+        None,
+        Some("a request target Kestrel cannot read")
+    )]
+    #[case("GET", "/x", Version::HTTP_11, None, Some("a missing Host header"))]
+    #[case("GET", "/x", Version::HTTP_2, None, None)]
+    fn target_and_host_refusal_reads_the_target_forms(
+        #[case] method: &str,
+        #[case] target: &str,
+        #[case] version: Version,
+        #[case] host: Option<&str>,
+        #[case] refusal: Option<&str>,
+    ) {
+        let mut request = axum::http::Request::builder()
+            .method(method)
+            .uri(target)
+            .version(version);
+        if let Some(host) = host {
+            request = request.header(axum::http::header::HOST, host);
+        }
+        let request = request.body(axum::body::Body::empty()).expect("request");
+        assert_eq!(super::target_and_host_refusal(&request), refusal);
+    }
+
+    /// An absolute-form target's host as `System.Uri` writes it before Kestrel
+    /// compares `Host` with it (each measured on Jellyfin 12.4).
+    #[rstest::rstest]
+    #[case("010.1.1.1", "8.1.1.1")]
+    #[case("0177.0.0.1", "127.0.0.1")]
+    #[case("127.1", "127.0.0.1")]
+    #[case("0x7f.1", "127.0.0.1")]
+    #[case("2130706433", "127.0.0.1")]
+    #[case("1.256", "1.0.1.0")]
+    #[case("256.1.1.1", "256.1.1.1")]
+    #[case("1.2.3.4.5", "1.2.3.4.5")]
+    #[case("1.2.3.4.", "1.2.3.4.")]
+    #[case("08.1.1.1", "08.1.1.1")]
+    #[case("0x", "0x")]
+    #[case("cafe.de", "cafe.de")]
+    #[case("A", "a")]
+    #[case("[0:0::1]", "[::1]")]
+    #[case("[::FFFF:1.2.3.4]", "[::ffff:1.2.3.4]")]
+    fn uri_host_is_the_host_system_uri_writes(#[case] host: &str, #[case] written: &str) {
+        assert_eq!(super::uri_host(host), written);
     }
 
     #[test]
