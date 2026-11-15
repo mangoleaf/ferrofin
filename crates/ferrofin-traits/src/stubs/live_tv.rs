@@ -378,12 +378,17 @@ pub trait LiveTvManager: Send + Sync {
     /// refresh task's work, not this call's: the caller queues it
     /// (`CancelIfRunningAndQueue<RefreshGuideScheduledTask>()`), and the row
     /// returned here is computed from the saved configuration either way.
+    ///
+    /// `Ok(None)` is a pair stored for a tuner channel id no lineup channel
+    /// has. Upstream queues the refresh there too (the pair can still move a
+    /// channel matched by its number or tuner channel id) and only then
+    /// throws from `.First(...)`; an `Err` comes before the refresh is due.
     async fn set_channel_mapping(
         &self,
         provider_id: &str,
         tuner_channel_id: &str,
         provider_channel_id: &str,
-    ) -> Result<TunerChannelMapping, ServiceError>;
+    ) -> Result<Option<TunerChannelMapping>, ServiceError>;
 
     /// Queries Live TV channels as `BaseItemDto`s (`Type = "TvChannel"`).
     ///
