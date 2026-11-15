@@ -28,7 +28,6 @@ notify.workspace = true
 sqlx.workspace = true
 serde.workspace = true
 serde_json = { workspace = true, features = ["raw_value"] }
-quick-xml.workspace = true
 thiserror.workspace = true
 uuid.workspace = true
 # QuickConnect secrets (the thread-local CSPRNG, as ferrofin-common's salts).
@@ -52,9 +51,19 @@ lofty.workspace = true
 # Backup archives (`time` stamps entries with now); also the comic-archive
 # fixtures of the book runtime tests.
 zip = { workspace = true, features = ["time"] }
+# The storage probe's link targets without Windows' `\\?\` prefix.
+dunce.workspace = true
 
 [target.'cfg(unix)'.dependencies]
 libc.workspace = true
+
+# The drive letters, their types and sizes (`mount_table`), and the process's
+# error mode around them.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { workspace = true, features = [
+    "Win32_Storage_FileSystem",
+    "Win32_System_Diagnostics_Debug",
+] }
 
 [dev-dependencies]
 # Paused-clock debounce tests (tokio::time::pause / start_paused).

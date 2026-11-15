@@ -831,6 +831,114 @@ async fn a_created_playlist_takes_its_media_type_from_its_items() {
     assert_eq!(item["MediaType"], "Video", "{item}");
 }
 
+/// Saves a folder named `name` under `parent` (the library when `None`).
+async fn seed_folder(fx: &Fixture, name: &str, parent: Option<Uuid>) -> Uuid {
+    let mut folder = row(
+        "MediaBrowser.Controller.Entities.Folder",
+        name,
+        &name.to_lowercase(),
+    );
+    folder.is_folder = true;
+    folder.parent_id = parent.map(guid_to_db);
+    fx.seed(folder, parent.as_slice()).await
+}
+
+/// Saves a playable item of `type_` and `media_type` under `ancestors`
+/// (nearest first), its sort name `name` as given.
+async fn seed_member(fx: &Fixture, type_: &str, media_type: &str, name: &str, ancestors: &[Uuid]) {
+    let mut member = row(type_, name, name);
+    member.media_type = Some(media_type.to_owned());
+    member.parent_id = ancestors.first().copied().map(guid_to_db);
+    fx.seed(member, ancestors).await;
+}
+
+const VIDEO_TYPE: &str = "MediaBrowser.Controller.Entities.Video";
+const AUDIO_TYPE: &str = "MediaBrowser.Controller.Entities.Audio.Audio";
+
+/// The `MediaType` of a playlist `POST /Playlists` creates from `ids` alone.
+async fn created_media_type(fx: &Fixture, ids: &[Uuid]) -> String {
+    let (status, created) = fx
+        .call(
+            "POST",
+            "/Playlists",
+            Some(json!({"Name": "Inferred", "Ids": ids})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{created}");
+    let (status, item) = fx
+        .call(
+            "GET",
+            &format!("/Items/{}", created["Id"].as_str().unwrap()),
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{item}");
+    item["MediaType"].as_str().unwrap().to_owned()
+}
+
+/// gl-588: a folder answers with its first playable member in tree order
+/// (`GetRecursiveChildren` → `AddChildrenToList`, `PlaylistManager.cs:109-114`):
+/// each level in sort-name order, a subfolder walked where it is met. In
+/// `Mixed` the subfolder `aardvark` sorts ahead of the song beside it, so its
+/// clip decides, though the song sorts ahead of the clip among all the
+/// folder's members; Jellyfin 12.4 types the same tree `Video`. In `Mixed
+/// too` the song sorts ahead of the subfolder, so it decides: files are not
+/// taken after folders, nor folders first.
+#[tokio::test]
+async fn a_folder_answers_with_its_first_member_in_tree_order() {
+    let fx = fixture().await;
+    let mixed = seed_folder(&fx, "Mixed", None).await;
+    let sub = seed_folder(&fx, "Aardvark", Some(mixed)).await;
+    seed_member(&fx, VIDEO_TYPE, "Video", "xray clip", &[sub, mixed]).await;
+    seed_member(&fx, AUDIO_TYPE, "Audio", "bravo song", &[mixed]).await;
+    assert_eq!(created_media_type(&fx, &[mixed]).await, "Video");
+
+    let mixed_too = seed_folder(&fx, "Mixed too", None).await;
+    let sub = seed_folder(&fx, "Zulu", Some(mixed_too)).await;
+    seed_member(&fx, VIDEO_TYPE, "Video", "bravo clip", &[sub, mixed_too]).await;
+    seed_member(&fx, AUDIO_TYPE, "Audio", "alpha song", &[mixed_too]).await;
+    assert_eq!(created_media_type(&fx, &[mixed_too]).await, "Audio");
+}
+
+/// gl-588: a box set answers with its first linked member that is no folder,
+/// in link order (not name order), never looking inside a linked folder. A
+/// box set whose members are all folders answers with the first member of
+/// its flat listing, a clip: Jellyfin 12.4 types that playlist `Audio`, though
+/// every entry is a clip (Jellyfin bug not ported).
+#[tokio::test]
+async fn a_box_set_answers_with_its_linked_members_then_its_listing() {
+    let fx = fixture().await;
+    let clips = seed_folder(&fx, "Clips", None).await;
+    seed_member(&fx, VIDEO_TYPE, "Video", "alpha clip", &[clips]).await;
+    seed_member(&fx, AUDIO_TYPE, "Audio", "zulu song", &[]).await;
+    seed_member(&fx, AUDIO_TYPE, "Audio", "yankee song", &[]).await;
+    seed_member(&fx, VIDEO_TYPE, "Video", "able clip", &[]).await;
+    let song = id_of(&fx, "zulu song").await;
+    let (yankee, able) = (
+        id_of(&fx, "yankee song").await,
+        id_of(&fx, "able clip").await,
+    );
+    let mut box_sets = Vec::new();
+    for (name, ids) in [
+        ("Mixed", format!("{clips},{song}")),
+        ("Only clips", clips.to_string()),
+        ("Linked order", format!("{yankee},{able}")),
+    ] {
+        let (status, created) = fx
+            .call(
+                "POST",
+                &format!("/Collections?name={}&ids={ids}", name.replace(' ', "%20")),
+                None,
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{created}");
+        box_sets.push(created["Id"].as_str().unwrap().parse::<Uuid>().unwrap());
+    }
+    assert_eq!(created_media_type(&fx, &[box_sets[0]]).await, "Audio");
+    assert_eq!(created_media_type(&fx, &[box_sets[1]]).await, "Video");
+    assert_eq!(created_media_type(&fx, &[box_sets[2]]).await, "Audio");
+}
+
 /// The obsolete query form names the media type too, in any case, and wins
 /// over the body and over inference (`mediaType ?? body.MediaType`), as its
 /// name wins over the body's. The body still carries the `Name` upstream's

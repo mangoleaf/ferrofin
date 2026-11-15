@@ -233,6 +233,9 @@ impl Server {
                 "{CLIENT}, Token=\"{}\"",
                 login["AccessToken"].as_str().unwrap()
             );
+            // The test runs the tasks itself; one started by the time of day
+            // would land in a round.
+            boot::drop_wall_clock_triggers(&server.client, &server.base, &server.auth).await;
             return server;
         }
         panic!("no free port survived long enough to bind");

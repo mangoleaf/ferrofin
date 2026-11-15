@@ -290,9 +290,6 @@ impl SessionManager for StreamingSessions {
     ) -> Result<SessionInfoDto, ServiceError> {
         unimplemented!("fake")
     }
-    async fn update_device_name(&self, _session_id: &str, _name: &str) -> Result<(), ServiceError> {
-        unimplemented!("fake")
-    }
     async fn on_playback_start(&self, _info: &PlaybackStartInfo) -> Result<(), ServiceError> {
         unimplemented!("fake")
     }

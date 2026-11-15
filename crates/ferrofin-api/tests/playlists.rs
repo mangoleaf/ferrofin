@@ -301,6 +301,7 @@ struct RecordingPlaylists {
     removed: Mutex<Option<RemoveCall>>,
     moved: Mutex<Option<MoveCall>>,
     updated: Mutex<Option<ferrofin_model::playlists::PlaylistUpdateRequest>>,
+    shared: Mutex<Option<ferrofin_model::playlists::PlaylistUserUpdateRequest>>,
     access: PlaylistAccess,
     shares: Vec<ferrofin_model::entities_media::PlaylistUserPermissions>,
 }
@@ -313,6 +314,7 @@ impl Default for RecordingPlaylists {
             removed: Mutex::default(),
             moved: Mutex::default(),
             updated: Mutex::default(),
+            shared: Mutex::default(),
             access: PlaylistAccess {
                 level: PlaylistAccessLevel::Owner,
                 open_access: false,
@@ -372,8 +374,9 @@ impl PlaylistManager for RecordingPlaylists {
     }
     async fn add_user_to_shares(
         &self,
-        _request: &ferrofin_model::playlists::PlaylistUserUpdateRequest,
+        request: &ferrofin_model::playlists::PlaylistUserUpdateRequest,
     ) -> Result<(), ServiceError> {
+        *self.shared.lock().unwrap() = Some(request.clone());
         Ok(())
     }
     async fn remove_user_from_shares(
@@ -1149,6 +1152,115 @@ async fn playlist_users_routes_are_owner_only() {
     )
     .await;
     assert_eq!(status, StatusCode::FORBIDDEN);
+}
+
+/// gl-1674: `UpdatePlaylistUser` binds its body
+/// `[FromBody(EmptyBodyBehavior = EmptyBodyBehavior.Allow), Required]`, so an
+/// empty body whatever the content type, or `null` with a JSON one, binds null,
+/// and `[Required]` refuses it before the action runs: a 400 keyed `""`, ahead
+/// of the playlist's 404 and the owner check's 403, and no share written.
+/// Measured on Jellyfin 12.4.0.
+#[rstest::rstest]
+#[case::empty(PlaylistAccessLevel::Owner, PLAYLIST_ID, "", Some("application/json"))]
+#[case::null(
+    PlaylistAccessLevel::Owner,
+    PLAYLIST_ID,
+    "null",
+    Some("application/json")
+)]
+#[case::no_content_type(PlaylistAccessLevel::Owner, PLAYLIST_ID, "", None)]
+#[case::text_plain(PlaylistAccessLevel::Owner, PLAYLIST_ID, "", Some("text/plain"))]
+#[case::not_the_owner(
+    PlaylistAccessLevel::CanEdit,
+    PLAYLIST_ID,
+    "",
+    Some("application/json")
+)]
+#[case::unknown_playlist(
+    PlaylistAccessLevel::Owner,
+    Uuid::from_u128(0xDEAD),
+    "null",
+    Some("application/json")
+)]
+#[tokio::test]
+async fn a_share_update_without_a_body_is_the_required_400(
+    #[case] level: PlaylistAccessLevel,
+    #[case] playlist: Uuid,
+    #[case] body: &'static str,
+    #[case] content_type: Option<&str>,
+) {
+    let pl = playlists_with_access(level, false);
+    let app = state(pl.clone(), Arc::new(RecordingCollections::default()));
+    let mut request = Request::builder()
+        .method("POST")
+        .uri(format!("/Playlists/{playlist}/Users/{USER_ID}"))
+        .header("Authorization", "Token abc");
+    if let Some(content_type) = content_type {
+        request = request.header("Content-Type", content_type);
+    }
+    let response = create_router(app)
+        .oneshot(request.body(Body::from(body)).expect("request"))
+        .await
+        .expect("response");
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("body");
+    let document: serde_json::Value = serde_json::from_slice(&bytes).expect("a problem document");
+    assert_eq!(
+        document["errors"],
+        serde_json::json!({ "": ["The updatePlaylistUserRequest field is required."] })
+    );
+    assert!(pl.shared.lock().unwrap().is_none());
+}
+
+/// A present body writes the share: `{}` binds a null `CanEdit`
+/// (`request.CanEdit ?? false` upstream). Both 204 on Jellyfin 12.4.0.
+#[rstest::rstest]
+#[case::empty_object("{}", None)]
+#[case::can_edit(r#"{"CanEdit":true}"#, Some(true))]
+#[tokio::test]
+async fn a_share_update_with_a_body_writes_the_share(
+    #[case] body: &'static str,
+    #[case] can_edit: Option<bool>,
+) {
+    let pl = playlists_with_access(PlaylistAccessLevel::Owner, false);
+    let app = state(pl.clone(), Arc::new(RecordingCollections::default()));
+    let (status, _) = send(
+        app,
+        "POST",
+        &format!("/Playlists/{PLAYLIST_ID}/Users/{USER_ID}"),
+        Body::from(body),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let shared = pl.shared.lock().unwrap().clone().expect("a share written");
+    assert_eq!(
+        (shared.id, shared.user_id, shared.can_edit),
+        (PLAYLIST_ID, USER_ID, can_edit)
+    );
+}
+
+/// `null` is something to read: with no JSON content type no formatter takes
+/// it, so it is the 415, not the `[Required]` 400 (Jellyfin 12.4.0 too).
+#[tokio::test]
+async fn a_share_update_with_null_as_text_is_unsupported() {
+    let pl = playlists_with_access(PlaylistAccessLevel::Owner, false);
+    let app = state(pl.clone(), Arc::new(RecordingCollections::default()));
+    let response = create_router(app)
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/Playlists/{PLAYLIST_ID}/Users/{USER_ID}"))
+                .header("Authorization", "Token abc")
+                .header("Content-Type", "text/plain")
+                .body(Body::from("null"))
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    assert_eq!(response.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
+    assert!(pl.shared.lock().unwrap().is_none());
 }
 
 #[tokio::test]
