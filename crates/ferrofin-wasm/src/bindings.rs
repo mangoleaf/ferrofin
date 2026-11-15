@@ -56,9 +56,8 @@ pub struct HostState {
     /// The shared blocking HTTP client behind `http-fetch` (per host, with
     /// the call timeout baked in at construction).
     pub http: std::sync::Arc<crate::capabilities::GuestHttp>,
-    /// The per-call timeout, needed when `http-fetch` builds a one-off
-    /// DNS-pinned client (the shared client's timeout is not readable). A
-    /// fetch gets the smaller of it and the time left in the call
+    /// The per-call timeout (the shared clients' is not readable). A fetch
+    /// gets the smaller of it and the time left in the call
     /// ([`fetch_timeout`]).
     pub http_timeout: std::time::Duration,
     /// The operator-configured total state cap, in bytes

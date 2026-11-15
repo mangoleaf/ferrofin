@@ -280,7 +280,7 @@ fn presentation_key(key: &str) -> String {
 struct SimilarityPlan {
     /// The enabled remote providers, in the library's configured order.
     remote: Vec<Arc<dyn RemoteSimilarItemsProvider>>,
-    /// The local scorer's position in that same order; `0` when the library
+    /// How many of `remote` run before the local scorer; `0` when the library
     /// expressed no preference.
     local_order: usize,
 }
@@ -605,12 +605,19 @@ impl FerrofinSimilarItemsManager {
             .map(Arc::clone)
             .collect();
         remote.sort_by_key(|p| provider_rank(order, p.name()));
+        // C# `GetConfiguredSimilarProviderOrder` returns `int.MaxValue` for a
+        // provider absent from a non-empty order list, i.e. LAST — not first.
+        // An admin who lists only TheMovieDb has unticked the local box, and
+        // local must not then jump ahead of it.
+        let local_rank = provider_rank(order, LOCAL_SIMILARITY_PROVIDER);
         SimilarityPlan {
-            // C# `GetConfiguredSimilarProviderOrder` returns `int.MaxValue` for
-            // a provider absent from a non-empty order list, i.e. LAST — not
-            // first. An admin who lists only TheMovieDb has unticked the local
-            // box, and local must not then jump ahead of it.
-            local_order: provider_rank(order, LOCAL_SIMILARITY_PROVIDER),
+            // C#'s stable `OrderBy` over [local, remote…] runs local ahead of
+            // every remote provider ranked at or after it. Ranks index the
+            // configured list, which may name providers that are not here.
+            local_order: remote
+                .iter()
+                .take_while(|p| provider_rank(order, p.name()) < local_rank)
+                .count(),
             remote,
         }
     }
@@ -1447,7 +1454,7 @@ impl SimilarItemsManager for FerrofinSimilarItemsManager {
         if !ran_local {
             // Local ranked last: its position in the combined list is the
             // number of remote providers ahead of it, which still earns the
-            // rank boost C# gives it — `usize::MAX` would zero it out.
+            // rank boost C# gives it.
             self.push_local_results(&local, remote_count, &mut claimed, &mut scored)
                 .await?;
         }
@@ -1946,6 +1953,7 @@ mod tests {
         }
     }
 
+    #[allow(clippy::too_many_lines)]
     #[tokio::test]
     async fn physical_library_selection_and_order_change_without_restart() {
         use ferrofin_model::configuration::{LibraryOptions, MediaPathInfo, TypeOptions};
@@ -2032,7 +2040,15 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["Alpha", "Beta"]
         );
-        assert_eq!(plan.local_order, usize::MAX);
+        assert_eq!(plan.local_order, 2, "local is unlisted: after both");
+        // Naming none of them ties all last: C#'s stable sort keeps local first.
+        options.type_options[0].similar_item_provider_order = vec!["Other".into()];
+        folders
+            .update_library_options("Movies", &options)
+            .await
+            .unwrap();
+        let plan = manager.similarity_plan(&seed, BaseItemKind::Movie).await;
+        assert_eq!(plan.local_order, 0);
         options.type_options[0].similar_item_providers.clear();
         folders
             .update_library_options("Movies", &options)
@@ -2435,6 +2451,61 @@ mod tests {
             names,
             ["Solaris"],
             "the remote provider was ranked first, so its match wins the single slot"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_order_naming_an_absent_provider_still_ranks_the_local_scorer_first() {
+        // C# sorts local and remote providers as one list by their rank in the
+        // configured order. A name no compiled provider answers to (a plugin
+        // an adopted library listed) holds rank 0 here, so "Local Genre/Tag"
+        // (rank 1) still runs before TheMovieDb (rank 2).
+        let db = test_db().await;
+        let library = Uuid::from_u128(0x9ab_ce6);
+        let seed = Uuid::from_u128(0x9ab_ce7);
+        let local_match = Uuid::from_u128(0x9ab_ce8);
+        let remote_match = Uuid::from_u128(0x9ab_ce9);
+        seed_movie_in(&db, seed, "Alien", "SciFi", Some(library)).await;
+        seed_movie_in(&db, local_match, "Aliens", "SciFi", Some(library)).await;
+        seed_movie_in(&db, remote_match, "Solaris", "Drama", Some(library)).await;
+        FerrofinItemPersistenceService::new(db.clone())
+            .save_provider_id(remote_match, "Tmdb", "348")
+            .await
+            .expect("save id");
+
+        let mgr = manager(&db).with_remote_providers(
+            vec![Arc::new(FakeRemote {
+                name: "TheMovieDb",
+                kind: BaseItemKind::Movie,
+                references: vec![SimilarItemReference {
+                    provider_name: "Tmdb".to_owned(),
+                    provider_id: "348".to_owned(),
+                    score: None,
+                }],
+                cache: None,
+                calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            })],
+            Arc::new(FakeFolders {
+                library_id: library,
+                providers: vec![
+                    "Some Plugin".to_owned(),
+                    "Local Genre/Tag".to_owned(),
+                    "TheMovieDb".to_owned(),
+                ],
+            }),
+        );
+        let names: Vec<_> = mgr
+            .get_similar_items(seed, &[], None, &DtoOptions::default(), Some(1))
+            .await
+            .expect("similar")
+            .expect("seed resolves")
+            .iter()
+            .filter_map(|r| r.name.clone())
+            .collect();
+        assert_eq!(
+            names,
+            ["Aliens"],
+            "the local scorer ranks before TheMovieDb"
         );
     }
 

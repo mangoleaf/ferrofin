@@ -19,7 +19,7 @@ fn empty_inputs_never_enumerate_the_host() {
         NetworkManager::with_defaults(NetworkConfiguration::default(), ""),
         NetworkManager::with_interfaces(NetworkConfiguration::default(), Vec::new()),
     ] {
-        manager.refresh_interfaces();
+        manager.update_settings(&NetworkConfiguration::default());
         let all_bind_interfaces = manager.get_all_bind_interfaces(true);
         assert!(all_bind_interfaces.is_empty(), "{all_bind_interfaces:?}");
         assert_eq!(manager.get_bind_address_for_peer(peer, None).0, "127.0.0.1");
