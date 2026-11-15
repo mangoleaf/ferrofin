@@ -670,25 +670,6 @@ fn percent_of_ticks(position: i64, runtime: i64) -> f64 {
     100.0 * (position as f64 / runtime as f64)
 }
 
-/// An empty (never-played) [`UserItemDataDto`] for `item_id` — the shape
-/// `UserDataManager` returns for an item with no stored row, used when a folder
-/// needs a UserData object solely to carry `UnplayedItemCount`.
-fn empty_user_data_dto(item_id: Uuid) -> UserItemDataDto {
-    UserItemDataDto {
-        rating: None,
-        played_percentage: None,
-        unplayed_item_count: None,
-        playback_position_ticks: 0,
-        play_count: 0,
-        is_favorite: false,
-        likes: None,
-        last_played_date: None,
-        played: false,
-        key: item_id.to_string(),
-        item_id,
-    }
-}
-
 /// Sets `ChildCount` on a folder DTO from the prefetched per-folder counts
 /// ([`FerrofinDtoService::child_count_batch`]).
 ///
@@ -2398,15 +2379,17 @@ impl FerrofinDtoService {
                     if options.contains_field(ItemFields::RecursiveItemCount) {
                         dto.recursive_item_count = Some(c.total);
                     }
+                    // Upstream fills the dto `GetUserDataDto` built, keyed by
+                    // the item's first user-data key. The page's batch holds
+                    // it for every item; none is made up here, so a folder
+                    // the manager answered nothing for is never keyed by its
+                    // guid.
                     if kinds::supports_played_status(
                         kind,
                         parse_media_type(item.media_type.as_deref()),
-                    ) {
-                        fill_folder_played(
-                            dto.user_data
-                                .get_or_insert_with(|| empty_user_data_dto(item_id)),
-                            c,
-                        );
+                    ) && let Some(user_data) = dto.user_data.as_mut()
+                    {
+                        fill_folder_played(user_data, c);
                     }
                 }
             }
@@ -5953,6 +5936,41 @@ mod tests {
             assert_eq!(ud.unplayed_item_count.is_some(), counted, "{media_type}");
             assert_eq!(ud.played_percentage.is_some(), counted, "{media_type}");
         }
+    }
+
+    /// `FillUserDataDtoValues` fills the user data `GetUserDataDto` built. A
+    /// folder the manager answered none for gets no stand-in keyed by its
+    /// guid, and its field-gated `RecursiveItemCount` still lands.
+    #[tokio::test]
+    async fn a_folder_without_user_data_gets_no_stand_in() {
+        let db = test_db().await;
+        let season_id = Uuid::new_v4();
+        seed_folder_item(&db, season_id, BaseItemKind::Season, "Season 1", None).await;
+        let season = fetch_item(&db, season_id).await;
+        let user = seed_user(&db, Uuid::new_v4()).await;
+        let svc = service_with_counts(db, FakeCounts::default());
+        let options = DtoOptions {
+            fields: vec![ItemFields::RecursiveItemCount],
+            ..DtoOptions::default()
+        };
+        let mut prefetched = Prefetched {
+            played_counts: [(
+                season_id,
+                ferrofin_traits::persistence::PlayedAndTotal {
+                    played: 1,
+                    total: 3,
+                },
+            )]
+            .into_iter()
+            .collect(),
+            ..Prefetched::default()
+        };
+        let dto = svc
+            .build_dto(&season, &options, Some(&user), None, &mut prefetched, false)
+            .await
+            .unwrap();
+        assert_eq!(dto.recursive_item_count, Some(3));
+        assert!(dto.user_data.is_none(), "{:?}", dto.user_data);
     }
 
     /// `if (dto.RecursiveItemCount > 0) dto.ChildCount = dto.RecursiveItemCount;`

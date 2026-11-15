@@ -518,11 +518,10 @@ impl FerrofinUserDataManager {
         user_id: Uuid,
     ) -> UserDataEntity {
         Self::preferred_row(rows, keys).unwrap_or_else(|| {
-            let mut row = Self::empty_row(item_id, user_id);
-            if let Some(first) = keys.first() {
-                row.custom_data_key.clone_from(first);
-            }
-            row
+            // Jellyfin stores an id key in the LOWERCASE hyphenated form even
+            // though ItemId is uppercase (verified against a real 10.11.8 DB).
+            let key = keys.first().cloned().unwrap_or_else(|| item_id.to_string());
+            Self::empty_row(item_id, user_id, key)
         })
     }
 
@@ -755,14 +754,15 @@ impl FerrofinUserDataManager {
         Ok(())
     }
 
-    /// A default (empty) user-data row for an item/user, used when none exists.
-    fn empty_row(item_id: Uuid, user_id: Uuid) -> UserDataEntity {
+    /// A default (empty) user-data row for an item/user, used when none exists,
+    /// under `custom_data_key`: the item's first user-data key
+    /// (`GetUserDataKeys()[0]`), which only the caller can derive, so there is
+    /// no default for it.
+    fn empty_row(item_id: Uuid, user_id: Uuid, custom_data_key: String) -> UserDataEntity {
         UserDataEntity {
             item_id: guid_to_db(item_id),
             user_id: guid_to_db(user_id),
-            // Jellyfin stores the key in the LOWERCASE hyphenated form even
-            // though ItemId is uppercase (verified against a real 10.11.8 DB).
-            custom_data_key: item_id.to_string(),
+            custom_data_key,
             audio_stream_index: None,
             is_favorite: false,
             last_played_date: None,
@@ -1086,11 +1086,19 @@ impl FerrofinUserDataManager {
         container: &Container,
     ) -> Result<UserItemDataDto, ServiceError> {
         // Providers hydrated: the controller loads the item by id.
-        let mut dto = self
+        let from_row = self
             .get_user_data_dtos_for_rows(std::slice::from_ref(&container.root), user_id, true)
             .await?
-            .remove(&container.id)
-            .unwrap_or_else(|| to_dto(Self::empty_row(container.id, user_id), container.id));
+            .remove(&container.id);
+        // The batch answers every root whose id parses; one it did not is read
+        // by id, which keys an unwritten row as `GetUserData` does.
+        let mut dto = match from_row {
+            Some(dto) => dto,
+            None => to_dto(
+                self.read_or_unwritten_row(container.id, user_id).await?,
+                container.id,
+            ),
+        };
         if let Some(members) = self.members.get()
             && kind_from_type_name(&container.root.type_).is_some_and(|kind| {
                 crate::kinds::supports_user_data_from_children(kind)
@@ -1918,11 +1926,12 @@ impl UserDataManager for FerrofinUserDataManager {
             .collect();
         for &item_id in item_ids {
             map.entry(item_id).or_insert_with(|| {
-                let mut row = Self::empty_row(item_id, user_id);
-                if let Some(first) = keys.get(&guid_to_db(item_id)).and_then(|keys| keys.first()) {
-                    row.custom_data_key.clone_from(first);
-                }
-                to_dto(row, item_id)
+                let key = keys
+                    .get(&guid_to_db(item_id))
+                    .and_then(|keys| keys.first())
+                    .cloned()
+                    .unwrap_or_else(|| item_id.to_string());
+                unwritten_dto(item_id, key)
             });
         }
         Ok(map)
@@ -3664,12 +3673,36 @@ mod tests {
     #[test]
     fn an_unwritten_dto_is_the_empty_rows_dto() {
         let item = Uuid::from_u128(2);
-        let mut row = FerrofinUserDataManager::empty_row(item, Uuid::from_u128(1));
-        row.custom_data_key = "Year-2021".to_owned();
+        let row =
+            FerrofinUserDataManager::empty_row(item, Uuid::from_u128(1), "Year-2021".to_owned());
         assert_eq!(
             unwritten_dto(item, "Year-2021".to_owned()),
             to_dto(row, item)
         );
+    }
+
+    /// A container whose root the page batch cannot key (its id does not
+    /// parse) is read by id, so its unwritten row still carries the item's
+    /// first user-data key, never its guid.
+    #[tokio::test]
+    async fn a_container_the_batch_misses_keeps_its_first_key() {
+        let db = test_db().await;
+        let user = Uuid::from_u128(1);
+        let year = Uuid::from_u128(0xF105);
+        let user_row = seed_user(&db, user).await;
+        seed_named_item(&db, year, BaseItemKind::Year, "2021").await;
+        let mut root = fetch_item(&db, year).await;
+        root.id = "not-a-guid".to_owned();
+        let container = Container {
+            id: year,
+            root,
+            user: user_row,
+            leaves: Vec::new(),
+        };
+        let mgr = FerrofinUserDataManager::new(db, config());
+
+        let dto = mgr.container_dto(user, &container).await.expect("dto");
+        assert_eq!((dto.key.as_str(), dto.item_id), ("Year-2021", year));
     }
 
     /// C# `GetUserData(User, BaseItem)` synthesizes the missing row with

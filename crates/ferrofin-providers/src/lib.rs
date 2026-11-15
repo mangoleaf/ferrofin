@@ -9,6 +9,7 @@
 
 pub mod audiodb;
 pub mod books;
+pub mod box_set_xml;
 pub mod builtin_plugins;
 pub mod cached_media_segment_provider;
 pub mod chapter_names;

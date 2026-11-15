@@ -974,6 +974,9 @@ pub const VERIFIED_SUBSYSTEMS_AGAINST_EARLIER_PIN: &[(&str, &str)] = &[];
 /// whose operations have no row of their own yet, when the progressive body
 /// they answer with ends, and how many jobs ffmpeg may run for them and the
 /// HLS routes;
+/// `stream-parameter-patterns` is which container, codec and level values the
+/// HLS and stream routes refuse before their action runs, whose operations
+/// have no row of their own yet;
 /// `transcode-arguments` is the ffmpeg command line of a job on the stream
 /// routes and the HLS routes, in the parts its row names;
 /// `video-stream-copy` is whether a transcode job copies the source video and
@@ -997,6 +1000,7 @@ pub const SUBSYSTEM_KEYS: &[&str] = &[
     "websocket-streams",
     "scan-failure-isolation",
     "progressive-transcode",
+    "stream-parameter-patterns",
     "transcode-arguments",
     "trickplay-extraction",
     "image-extraction",
@@ -1857,6 +1861,52 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
         ],
     },
     VerifiedSubsystem {
+        key: "stream-parameter-patterns",
+        upstream_file: "Jellyfin.Api/Controllers/DynamicHlsController.cs",
+        upstream_method: "GetMasterHlsVideoPlaylist",
+        ferrofin: "Which values of the HLS and stream routes' [RegularExpression] parameters are \
+                   refused, and the 400 they answer with. extract.rs StreamPattern \
+                   (EncodingHelper.ContainerValidationRegexStr and LevelValidationRegexStr, matched \
+                   over the whole value as RegularExpressionAttribute matches them, with an empty \
+                   value passing), pattern_complaint and validation_failure (the [ApiController] \
+                   model-state ValidationProblemDetails: one body naming every failing parameter by \
+                   its declared name, whatever case the query spelled it in), each answered after \
+                   authorization (RequireAuth on the HLS and universal routes; the stream routes \
+                   are anonymous upstream) and before the item is looked up. handlers/hls.rs \
+                   stream_pattern_failures and segment_pattern_failures in the seven \
+                   DynamicHlsController actions (GetMasterHlsVideoPlaylist, \
+                   GetVariantHlsVideoPlaylist, GetLiveHlsStream, GetMasterHlsAudioPlaylist, \
+                   GetVariantHlsAudioPlaylist, GetHlsVideoSegment, GetHlsAudioSegment): \
+                   segmentContainer, audioCodec, level, videoCodec and subtitleCodec on each, and \
+                   container on GetLiveHlsStream's query and on a segment's route {container} (the \
+                   text after the last dot of {segmentId}.{container}, where a blank one is \
+                   [Required]'s complaint, filed beside the others); the playlists declare no \
+                   container, so their container query is not read. The same stream_pattern_failures \
+                   in handlers/videos.rs and audio.rs get_video_stream, \
+                   get_video_stream_by_container, get_audio_stream and get_audio_stream_by_container \
+                   (VideosController.GetVideoStream and GetVideoStreamByContainer, \
+                   AudioController.GetAudioStream and GetAudioStreamByContainer), with container the \
+                   query's or the stream.{container} route's, for anonymous and Static=true requests \
+                   too, and again in transcode_stream_fallback; and audio.rs \
+                   get_universal_audio_stream (UniversalAudioController.GetUniversalAudioStream: \
+                   audioCodec and transcodingContainer only). Compared with those actions' parameter \
+                   attributes at the pinned v12.4 tag, and settled against a stock 12.4 container \
+                   (2026-11-14): bodies and keys for each parameter, an encoded line break, a leading \
+                   space, 41 and 40 characters, a blank value, a later repeat of the key, the \
+                   undeclared container query of the playlists and of universal, the segment route \
+                   {container} blank (alone and beside a failing segmentContainer) and outside the \
+                   pattern, level spellings (4.1, -41, abc, 1e1, a leading space, 41., 4.1.2), a \
+                   HEAD of the master playlist, an anonymous stream request, Static=true, and the 401 \
+                   of an HLS request with no token coming first; a stream.{container} route value \
+                   outside the pattern was probed on 12.4 for gl-1671 (2026-11-11). Not part of this \
+                   row: merging these complaints with another \
+                   parameter's binding failure into one body (gl-1672), the segments' {segmentId} \
+                   binding, a blank or empty stream.{container} (gl-1671), and the rest of each \
+                   operation",
+        date: "2026-11-14",
+        divergences: &[],
+    },
+    VerifiedSubsystem {
         key: "transcode-arguments",
         upstream_file: "MediaBrowser.Controller/MediaEncoding/EncodingHelper.cs",
         upstream_method: "GetInputArgument",
@@ -1877,8 +1927,11 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
                    transcoding/segment_cleaner.rs \
                    input_sync_arguments, input_rate_arguments and input_source_arguments \
                    (GetInputModifier's -async and -vsync from AttachMediaSourceInfo's \
-                   InputAudioSync and InputVideoSync, -re, -readrate and -readrate_catchup, \
-                   -fflags +igndts and the looping reconnect options) over \
+                   InputAudioSync and InputVideoSync, a wma or asf container's audio sync \
+                   among them, -re, -readrate and -readrate_catchup, an RTSP input's \
+                   -rtsp_transport tcp+udp -rtsp_flags prefer_tcp, one -fflags joining \
+                   +igndts, +ignidx and +genpts (GenPtsInput or a copied video), and the \
+                   looping reconnect options) over \
                    transcoding/throttler.rs effective_input_protocol (AttachMediaSourceInfo's \
                    EncoderPath and EncoderProtocol), encoding_helper/hw/input_args.rs \
                    graphical_sub_canvas_size (GetGraphicalSubCanvasSize), concat_input with \
@@ -1908,12 +1961,6 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
                    among them, gl-1768",
         date: "2026-11-14",
         divergences: &[
-            "Four GetInputModifier rules are not ported: -fflags +genpts for every job \
-             copying the video (IsCopyCodec(OutputVideoCodec)) or reading a source with \
-             GenPtsInput, +ignidx for a source with IgnoreIndex (an in-progress recording), \
-             -rtsp_transport tcp+udp -rtsp_flags prefer_tcp for an RTSP input, and \
-             AttachMediaSourceInfo's -async 1 for a wma or asf container. Fix path: \
-             gl-1779.",
             "A job reading a video file with hardware acceleration configured passes no -f \
              with the container's input format (GetInputFormat). Fix path: gl-1676.",
             "A job behind a hardware decoder passes no -noautoscale. Fix path: gl-928.",
@@ -4319,12 +4366,18 @@ pub const VERIFIED: &[Verified] = &[
                under box_set_folders, which a Collections scan storing the box sets of \
                the folders it found (resolve_box_set_folders, BoxSetResolver) holds too, \
                AddToCollectionAsync's refusal of an id naming no item after the box set \
-               is stored) and \
+               is stored, then its UpdateToRepositoryAsync(MetadataEdit) through \
+               save_membership → ProviderManager::update_to_repository, whose \
+               ferrofin-providers box_set_xml.rs BoxSetXmlSaver writes the box set's \
+               collection.xml (BoxSetXmlSaver, BaseXmlSaver.AddCommonNodesAsync and \
+               AddLinkedChildren in local_xml.rs save_collection_xml, \
+               ProviderManager.IsSaverEnabledForItem) and stamps DateLastSaved after it \
+               (LibraryManager.UpdateItemsAsync)) and \
                ensure_collections_folder → collections_library.rs (EnsureLibraryFolder: \
                physical_folder for FindFolders, ensure_library for AddVirtualFolder with its \
                LibraryOptions, ensure_folder for the Folder row ValidateTopLibraryFolders \
                makes)",
-        date: "2026-11-11",
+        date: "2026-11-14",
         divergences: &[
             "A missing name makes a box set with an empty name, where upstream's \
          GetValidFilename dereferences the null and answers 500. Jellyfin bug not ported.",
@@ -4337,6 +4390,20 @@ pub const VERIFIED: &[Verified] = &[
          AddChild overwrites it. Jellyfin bug not ported.",
             "The 400 bodies (a malformed id, an id naming no item) are Ferrofin's error \
          shape, not upstream's. Fix path: gl-666.",
+            "collection.xml writes <Added> and <PremiereDate> in UTC and reads both <Taglines> \
+         and <TagLines>; upstream writes the dates in the server's local time and reads \
+         them back as UTC, which shifts them on every round trip on a server outside UTC, \
+         and reads only the <TagLines> it never writes. On a UTC server both write the \
+         same dates. Jellyfin bug not ported (owner decision 2026-11-14).",
+            "A box set's refresh takes the <DisplayOrder> its collection.xml carries, and no \
+         refresh resets the display order. Upstream starts the provider result from a new \
+         BoxSet, whose DisplayOrder defaults to PremiereDate, so the file's value never \
+         applies and every refresh a provider answered resets the box set's display order \
+         to PremiereDate. Jellyfin bug not ported (owner decision 2026-11-14).",
+            "The always-true BoxSet.IsSaveLocalMetadataEnabled holds only for a box set whose \
+         folder is in the server's own directories; one in a media library is written only \
+         when that library saves into its media folders, or by an edit or member change when \
+         its file already exists (owner decision 2026-10-17).",
         ],
         refs: &[],
     },
@@ -5038,7 +5105,9 @@ pub const VERIFIED: &[Verified] = &[
                get_bind_address_for_peer, GetBindAddress: the subnet overrides, the address a \
                listener pinned at startup is bound to, as the one interface a \
                LocalNetworkAddresses bind leaves upstream, then the interfaces) and \
-               format_api_url (GetLocalApiUrl's UriBuilder, which writes any port it is given), \
+               format_api_url (GetLocalApiUrl's UriBuilder, which writes any port it is given \
+               and escapes the base URL as UriBuilder.Path does, a backslash aside: \
+               ferrofin-networking escape_base_url, checked against 12.4's discovery Address), \
                friendly_name (FriendlyName: the saved ServerName unless empty), the emulated \
                version, PRODUCT_NAME (Name), the system id (DeviceId), the startup-wizard flag, \
                the lifecycle's restart-pending and shutting-down flags (which operations raise \
@@ -5077,6 +5146,9 @@ pub const VERIFIED: &[Verified] = &[
             "LocalAddress carries the base URL this lifetime serves under; upstream's \
          GetLocalApiUrl reads a saved BaseUrl at once, while its mount keeps the old one \
          (owner decision on gl-555).",
+            "A backslash in the base URL is escaped (%5C) in LocalAddress; upstream's \
+         UriBuilder.Path turns it into a /, an address its mount does not answer (12.4's \
+         discovery Address, probed). Jellyfin bug not ported.",
             "After a save that turns HTTPS off, LocalAddress keeps the https scheme this \
          lifetime listens with until the restart; upstream's ListenWithHttps reads the saved \
          EnableHttps at once and advertises http. Fix path: gl-1791.",
@@ -5130,6 +5202,9 @@ pub const VERIFIED: &[Verified] = &[
             "LocalAddress carries the base URL this lifetime serves under; upstream's \
          GetLocalApiUrl reads a saved BaseUrl at once, while its mount keeps the old one \
          (owner decision on gl-555).",
+            "A backslash in the base URL is escaped (%5C) in LocalAddress; upstream's \
+         UriBuilder.Path turns it into a /, an address its mount does not answer (12.4's \
+         discovery Address, probed). Jellyfin bug not ported.",
             "After a save that turns HTTPS off, LocalAddress keeps the https scheme this \
          lifetime listens with until the restart; upstream's ListenWithHttps reads the saved \
          EnableHttps at once and advertises http. Fix path: gl-1791.",
@@ -5303,16 +5378,20 @@ pub const VERIFIED: &[Verified] = &[
                {stem}.{language}[.forced][.sdh].{format} with the language lowercased and a \
                path separator refused, the format checked against \
                NamingOptions.SubtitleFileExtensions, a taken name moved to {name}.{n}.{format}, \
-               the name written bracketed as a self-write) → handlers.rs \
+               the name written bracketed as a self-write; a failed fetch or save, but a \
+               RateLimitExceeded, raises SubtitleDownloadFailure, which \
+               SubtitleDownloadFailureLogger records: SubtitleDownloadFailureFromForItem with \
+               the provider's name and GetItemName, type SubtitleDownloadFailure, no user, the \
+               item id, the error message as ShortOverview) → handlers.rs \
                queue_high_priority_refresh (QueueRefresh at RefreshPriority.High) → \
                ferrofin-providers opensubtitles.rs get_subtitles (the OpenSubtitles plugin's \
                GetSubtitles: a plugin outside the Jellyfin tree, not compared yet, gl-1644)",
-        date: "2026-11-10",
+        date: "2026-11-14",
         divergences: &[
-            "A download that fails once its provider is found writes no activity entry: \
-         upstream's DownloadSubtitles raises SubtitleDownloadFailure for any failure but a \
-         RateLimitExceededException, which SubtitleDownloadFailureLogger records as \
-         SubtitleDownloadFailureFromForItem. Fix path: gl-1640.",
+            "The failed download's activity entry is written in English, not the server's UI \
+         culture. Fix path: gl-429.",
+            "The entry names the OpenSubtitles provider opensubtitles; the plugin's Name, which \
+         upstream's entry shows, is Open Subtitles. Fix path: gl-1704.",
             "A DVD or Blu-ray folder rip's subtitle is written beside the rip's folder; \
          upstream's Video.ContainingFolderPath is the rip's folder itself, so it lands \
          inside it there. Fix path: gl-1643.",

@@ -440,7 +440,7 @@ pub fn audio_bit_stream_arguments(
     if let Some(ref f) = noise {
         filters.push(f);
     }
-    let segment_is_mp4 = segment_container.eq_ignore_ascii_case("mp4");
+    let segment_is_mp4 = super::helper::is_mp4_segment_container(segment_container);
     if segment_is_mp4
         && (media_source_container.eq_ignore_ascii_case("ts")
             || media_source_container.eq_ignore_ascii_case("aac")

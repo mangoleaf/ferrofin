@@ -157,6 +157,14 @@ Conventions:
     a callback's whole answer and applies every search/replace. Ferrofin reads no more than
     16 MiB of an answer, and skips a step that would grow the file past 16 MiB, because the
     pipeline runs on every anonymous `/web` request. jellyfin-web's bundles are a few MiB.
+  - **A matched file no step would change is served from disk.** The plugin's middleware runs
+    the pipeline for every file a registration matches, so on a default install
+    `main.jellyfin.bundle.js` goes through Intro Skipper's skip-button step, which changes
+    nothing while `UseFileTransformationPlugin` is off. Ferrofin asks each in-process step
+    (`FileTransformer::would_transform`) and, while none would change the file, lets the
+    static server send it: its own `ETag`, `Last-Modified`, `Range` and `text/javascript`, with
+    the pipeline's `Cache-Control: no-cache` kept, so a step that turns on reaches a browser
+    at its next load. The bytes are the same.
 
 ### Merge Versions
 - Ferrofin files: `crates/ferrofin-extensions/src/merge_versions.rs` (the whole
