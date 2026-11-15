@@ -86,6 +86,7 @@ use ferrofin_model::session::{
     SessionUserInfo, TranscodingInfo,
 };
 use ferrofin_util::shuffle_extensions::shuffle;
+use ferrofin_util::string_extensions::{equals_ordinal_ignore_case, ordinal_ignore_case_key};
 
 use ferrofin_traits::configuration::ServerConfigurationManager;
 use ferrofin_traits::devices::{DeviceManager, DeviceQuery};
@@ -584,8 +585,9 @@ pub struct FerrofinSessionManager {
     db: Database,
     /// This server's stable id, stamped onto each session (C# `SystemId`).
     server_id: String,
-    /// The pool of active sessions keyed by session key (`app + deviceId`),
-    /// matching the C# `_activeConnections` keying.
+    /// The pool of active sessions keyed by session key (`app + deviceId +
+    /// userId`) ignoring case, matching the C# `_activeConnections` keying
+    /// (`StringComparer.OrdinalIgnoreCase`).
     sessions: Arc<Mutex<HashMap<String, SessionInfo>>>,
     /// Which sessions are still holding each open live stream, keyed by
     /// `LiveStreamId`; the inner map pairs each session id with its play-session
@@ -1024,7 +1026,10 @@ impl FerrofinSessionManager {
             None => Uuid::nil(),
             Some(u) => parse_user_id(&u.id)?,
         };
-        let key = Self::session_key(app_name, device_id, user_id);
+        let first_seen_key = Self::session_key(app_name, device_id, user_id);
+        // The pool's key ignores case; a new session's id comes from the key
+        // as sent, as C#'s `GetOrAdd` keeps the first casing.
+        let key = ordinal_ignore_case_key(&first_seen_key);
         let user_name = || user.map(|u| u.username.clone());
         let user_primary_image_tag = self.user_primary_image_tag(user).await;
         let reported_device_name = if device_name.is_empty() {
@@ -1099,7 +1104,7 @@ impl FerrofinSessionManager {
                     _ => (reported_device_name.to_owned(), false),
                 };
                 SessionInfo {
-                    id: Self::session_id_for_key(&key),
+                    id: Self::session_id_for_key(&first_seen_key),
                     user_id,
                     user_name: user_name(),
                     client: Some(app_name.to_owned()),
@@ -2709,7 +2714,7 @@ impl SessionManager for FerrofinSessionManager {
         let mut result = Vec::new();
         for session in sessions.values() {
             if let Some(want) = device_id
-                && !session.device_id.eq_ignore_ascii_case(want)
+                && !equals_ordinal_ignore_case(&session.device_id, want)
             {
                 continue;
             }
@@ -2868,7 +2873,7 @@ impl SessionManager for FerrofinSessionManager {
             let sessions = self.sessions.lock().await;
             sessions
                 .values()
-                .filter(|s| s.device_id.eq_ignore_ascii_case(&device.device_id))
+                .filter(|s| equals_ordinal_ignore_case(&s.device_id, &device.device_id))
                 .map(|s| s.id.clone())
                 .collect()
         };
@@ -2893,10 +2898,7 @@ impl SessionManager for FerrofinSessionManager {
             })
             .await?;
         for device in devices.items {
-            if !device
-                .access_token
-                .eq_ignore_ascii_case(current_access_token)
-            {
+            if !equals_ordinal_ignore_case(&device.access_token, current_access_token) {
                 self.logout_device(&device).await?;
             }
         }
@@ -3292,7 +3294,7 @@ fn set_device_transcoding_info(
 ) {
     if let Some(session) = sessions
         .values_mut()
-        .filter(|s| s.device_id.eq_ignore_ascii_case(device_id))
+        .filter(|s| equals_ordinal_ignore_case(&s.device_id, device_id))
         .max_by_key(|s| s.last_activity_date)
     {
         session.transcoding_info = info;

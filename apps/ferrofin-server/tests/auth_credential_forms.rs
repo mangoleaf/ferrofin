@@ -441,3 +441,56 @@ async fn a_utf8_device_name_signs_in_and_keeps_its_case() {
     let info = json_body(router.clone().oneshot(info).await.expect("response")).await;
     assert_eq!(info["Name"], "Salle de séjour’s TV");
 }
+
+/// A device renamed with spaces around its name keeps them, as
+/// `AuthorizationContext.cs` compares and stores the value as sent; a blank
+/// one (`string.IsNullOrWhiteSpace`) leaves the stored name. Each token's
+/// first request is the one that reads the device (later ones hit the
+/// authorization cache).
+#[tokio::test]
+async fn a_device_name_keeps_its_spaces() {
+    let harness = boot().await;
+    let router = ferrofin_api::create_router(harness.wired.state.clone());
+    let identity = |device: &str, id: &str| {
+        format!(r#"Client="test", Device="{device}", DeviceId="{id}", Version="1""#)
+    };
+    for (id, renamed, stored) in [
+        ("spaces", "  Den TV  ", "  Den TV  "),
+        ("blank", "   ", "TV"),
+    ] {
+        let sign_in = Request::builder()
+            .method("POST")
+            .uri("/Users/AuthenticateByName")
+            .header(
+                header::AUTHORIZATION,
+                format!("MediaBrowser {}", identity("TV", id)),
+            )
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                serde_json::json!({ "Username": ADMIN_USER, "Pw": ADMIN_PASSWORD }).to_string(),
+            ))
+            .expect("request");
+        let response = router.clone().oneshot(sign_in).await.expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let token = json_body(response).await["AccessToken"]
+            .as_str()
+            .expect("AccessToken")
+            .to_owned();
+        let authorization =
+            |device: &str| format!(r#"MediaBrowser Token="{token}", {}"#, identity(device, id));
+        let me = Request::builder()
+            .uri("/Users/Me")
+            .header(header::AUTHORIZATION, authorization(renamed))
+            .body(Body::empty())
+            .expect("request");
+        let status = router.clone().oneshot(me).await.expect("response").status();
+        assert_eq!(status, StatusCode::OK, "{renamed:?}");
+        let info = Request::builder()
+            .uri(format!("/Devices/Info?id={id}"))
+            .header(header::AUTHORIZATION, authorization(renamed))
+            .body(Body::empty())
+            .expect("request");
+        let info = json_body(router.clone().oneshot(info).await.expect("response")).await;
+        assert_eq!(info["Name"], stored, "{renamed:?}");
+    }
+}

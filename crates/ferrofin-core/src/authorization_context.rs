@@ -217,8 +217,14 @@ impl FerrofinAuthorizationContext {
             .to_ascii_lowercase()
             .contains("chromecast");
 
-        match info.device.as_deref().map(str::trim) {
-            None | Some("") => info.device = Some(device.device_name.clone()),
+        // `string.IsNullOrWhiteSpace` picks the stored value; any other is
+        // compared and kept as sent, its spaces included.
+        match info
+            .device
+            .as_deref()
+            .filter(|name| !name.trim().is_empty())
+        {
+            None => info.device = Some(device.device_name.clone()),
             Some(name)
                 if !equals_ordinal_ignore_case(name, &device.device_name) && allow_update =>
             {
@@ -228,8 +234,12 @@ impl FerrofinAuthorizationContext {
             _ => {}
         }
 
-        match info.version.as_deref().map(str::trim) {
-            None | Some("") => info.version = Some(device.app_version.clone()),
+        match info
+            .version
+            .as_deref()
+            .filter(|version| !version.trim().is_empty())
+        {
+            None => info.version = Some(device.app_version.clone()),
             Some(version)
                 if !equals_ordinal_ignore_case(version, &device.app_version) && allow_update =>
             {
