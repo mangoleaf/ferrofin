@@ -1999,7 +1999,9 @@ pub const VERIFIED: &[Verified] = &[
                handlers/by_name.rs (ByNameListQuery check_min_community_rating, \
                artists_query, resolve_by_name_ids, \
                project_query_result) → ferrofin-core item_repository.rs get_artists \
-               (item_values_with_counts, item_counts_by_clean_name)",
+               (item_values_with_counts, item_counts_by_clean_name); \
+               its scope rewrite top_parent_or_ancestor_scope \
+               (LibraryManager.SetTopParentOrAncestorIds) compared at v12.4 on 2026-11-13",
         date: "2026-10-25",
         divergences: BY_NAME_DIVERGENCES_ARTISTS,
         refs: &["images", "access-filtering", "paging-sort"],
@@ -2012,7 +2014,9 @@ pub const VERIFIED: &[Verified] = &[
         ferrofin: "handlers/artists.rs get_album_artists (items.rs resolve_user_or_api_key) → \
                handlers/by_name.rs (check_min_community_rating, artists_query, \
                resolve_by_name_ids) → ferrofin-core \
-               item_repository.rs get_album_artists (item_values_with_counts)",
+               item_repository.rs get_album_artists (item_values_with_counts); \
+               its scope rewrite top_parent_or_ancestor_scope \
+               (LibraryManager.SetTopParentOrAncestorIds) compared at v12.4 on 2026-11-13",
         date: "2026-10-25",
         divergences: BY_NAME_DIVERGENCES_ARTISTS,
         refs: &["images", "access-filtering", "paging-sort"],
@@ -2026,7 +2030,8 @@ pub const VERIFIED: &[Verified] = &[
                declared parameters only; items.rs resolve_user_or_api_key; \
                music/musicvideos library parent → get_music_genres) → handlers/by_name.rs → \
                ferrofin-core item_repository.rs get_genres / get_music_genres \
-               (item_values_with_counts)",
+               (item_values_with_counts, \
+               top_parent_or_ancestor_scope: LibraryManager.SetTopParentOrAncestorIds)",
         date: "2026-11-13",
         divergences: BY_NAME_DIVERGENCES_GENRES_STUDIOS,
         refs: &["images", "access-filtering", "paging-sort"],
@@ -2039,7 +2044,8 @@ pub const VERIFIED: &[Verified] = &[
         ferrofin: "handlers/music_genres.rs get_music_genres (by_name.rs \
                ValueListQuery::genres: the declared parameters only; items.rs \
                resolve_user_or_api_key) → handlers/by_name.rs → ferrofin-core \
-               item_repository.rs get_music_genres (item_values_with_counts)",
+               item_repository.rs get_music_genres (item_values_with_counts, \
+               top_parent_or_ancestor_scope: LibraryManager.SetTopParentOrAncestorIds)",
         date: "2026-11-13",
         divergences: BY_NAME_DIVERGENCES_GENRES_STUDIOS,
         refs: &["images", "access-filtering", "paging-sort"],
@@ -2052,7 +2058,8 @@ pub const VERIFIED: &[Verified] = &[
         ferrofin: "handlers/studios.rs get_studios (by_name.rs ValueListQuery::studios: \
                the declared parameters only; items.rs resolve_user_or_api_key) → \
                handlers/by_name.rs → ferrofin-core item_repository.rs get_studios \
-               (item_values_with_counts)",
+               (item_values_with_counts, \
+               top_parent_or_ancestor_scope: LibraryManager.SetTopParentOrAncestorIds)",
         date: "2026-11-13",
         divergences: BY_NAME_DIVERGENCES_GENRES_STUDIOS,
         refs: &["images", "access-filtering"],
