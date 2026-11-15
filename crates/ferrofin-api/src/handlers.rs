@@ -957,7 +957,11 @@ pub const VERIFIED_SUBSYSTEMS_AGAINST_EARLIER_PIN: &[(&str, &str)] = &[];
 
 /// The subsystems a [`VERIFIED_SUBSYSTEMS`] row may cover, by key. Every
 /// operation crosses several of them, so one row states their divergences once
-/// and operation rows name it in [`Verified::refs`]. `websocket-streams` is
+/// and operation rows name it in [`Verified::refs`]. `static-file-ranges` is
+/// how a file served with range processing on answers `Range` and `If-Range`,
+/// shared by direct play, the download and file routes, the HLS segments and
+/// a graphical subtitle's file, whose operations have no row of their own yet.
+/// `websocket-streams` is
 /// the `/socket` dashboard streams, which no contract operation describes;
 /// `trickplay-extraction` is the ffmpeg run that writes a video's trickplay
 /// frames, which the tile operations serve but no response shows;
@@ -996,6 +1000,7 @@ pub const SUBSYSTEM_KEYS: &[&str] = &[
     "user-data",
     "access-filtering",
     "images",
+    "static-file-ranges",
     "paging-sort",
     "websocket-streams",
     "scan-failure-isolation",
@@ -1067,6 +1072,48 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
             "A sortOrder with more entries than a non-empty sortBy has keys has the extra \
              entries ignored; upstream's GetOrderBy indexes past the sortBy array, which \
              throws ArgumentOutOfRangeException, and answers 400. Jellyfin bug not ported.",
+        ],
+    },
+    VerifiedSubsystem {
+        key: "static-file-ranges",
+        upstream_file: "Jellyfin.Api/Helpers/FileStreamResponseHelpers.cs",
+        upstream_method: "GetStaticFileResult",
+        ferrofin: "Which bytes, status and Content-Range a Range and an If-Range get from a \
+                   file served with range processing on: handlers/streaming.rs \
+                   serve_static_file (one_byte_range, if_range_valid, complete_length, then \
+                   tower-http's ServeFile through serve_file), behind direct play (the /Videos \
+                   and /Audio stream routes and universal audio), /Items/{itemId}/Download and \
+                   /File, the HLS segment routes and a graphical subtitle's file. Compared with \
+                   GetStaticFileResult (VideosController, AudioHelper, HlsSegmentController, \
+                   DynamicHlsController) and the PhysicalFile(..., true) calls in \
+                   LibraryController (GetFile, GetDownload) and SubtitleController at the \
+                   pinned v12.4 tag, and the ASP.NET Core 10 code they reach: \
+                   FileResultHelper.SetHeadersAndLog, IfRangeValid and SetRangeHeaders, \
+                   RangeHelper.ParseRange and NormalizeRange, and the RangeHeaderValue, \
+                   RangeItemHeaderValue and RangeConditionHeaderValue parsers. Several ranges \
+                   (a second Range value or any comma) and a value that does not parse (a \
+                   reversed range, a part that is not digits, has more than 19 digits or is \
+                   past i64::MAX) are ignored and the whole file served; one range takes \
+                   spaces and tabs around its parts and leading zeros; an end past the file is \
+                   cut to it, a suffix longer than the file is the whole file, a start at or \
+                   past the end and a zero suffix are 416 with bytes */length, and no range of \
+                   an empty file is satisfiable. If-Range is read only beside a Range that \
+                   stands: a date fails once the file's Last-Modified (whole seconds) is later, \
+                   a tag fails unless strongly equal to the ETag of the answer (upstream's \
+                   answer has none, so it passes every tag; this holds until gl-1823 drops \
+                   ServeFile's ETag), a value that parses as neither passes, and a failed one \
+                   serves the whole file even where the range would be 416; HEAD answers the \
+                   same with no body. The other validators and preconditions (the ETag itself, \
+                   If-Match, If-None-Match, If-Modified-Since, If-Unmodified-Since), the date \
+                   forms .NET's TryStringToDate reads beyond httpdate's IMF-fixdate, RFC 850 \
+                   and asctime (If-Range's included) and each answer's Content-Type are \
+                   gl-1823's and gl-1801's; they are not part of this row.",
+        date: "2026-11-14",
+        divergences: &[
+            "A Range in a unit other than bytes is ignored and the whole file served, as RFC \
+             9110 section 14.2 requires of a unit the server does not understand; ASP.NET's \
+             RangeHelper never checks the unit and serves any as a byte range. ASP.NET bug \
+             not ported.",
         ],
     },
     VerifiedSubsystem {
@@ -2041,6 +2088,9 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
                    each video gets its page's row, as upstream hands over the page's Video, \
                    and its stored streams from one read per page, where upstream's \
                    GetMediaStreams reads them at the video's turn. \
+                   Also when the library scan refreshes a video: library_scan/trickplay.rs \
+                   ScanTrickplay and library_scan.rs scan_item, compared with \
+                   MediaBrowser.Providers/Trickplay/TrickplayProvider.cs (FetchInternal). \
                    Also the sets a changed video loses before its refresh: library_scan.rs \
                    scan_item and file_changed, item_data_cleanup.rs prune_extracted_data, \
                    external_data_manager.rs delete_external_item_data and \
@@ -2066,7 +2116,7 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
                    Emby.Server.Implementations/Dto/DtoService.cs (the Trickplay field), \
                    MediaBrowser.Controller/Entities/BaseItem.cs (GetMediaSources) and \
                    MediaBrowser.Controller/Entities/Video.cs (GetAllItemsForMediaSources)",
-        date: "2026-11-11",
+        date: "2026-11-14",
         divergences: &[
             "An explicit Replace does not delete the item's trickplay folder and rows first: \
              each selected width is generated in the work directory and swapped in, so the old \
@@ -2123,6 +2173,13 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
              logged and leaves the other widths as upstream's catch does. Order and the \
              number of decodes only: the widths made, and each width's checks, frames and \
              tiles, are unchanged (gl-1228).",
+            "With the NonBlocking scan behaviour, the library scan detaches a video's refresh \
+             once the item's save has written its row and its probe's streams, by id, so the \
+             refresh reads both back as it starts instead of carrying the scan's copies; \
+             upstream's TrickplayProvider starts it among the custom providers, from the \
+             in-memory Video, before RefreshMetadata's final SaveItemAsync. Timing only: it \
+             reads what the save and the subtitle downloads wrote, and Blocking is unchanged. \
+             Owner decision (gl-233, option A).",
             "A set wider than 320 is made at a smaller tile grid than TileWidth x TileHeight \
              (options_at_width): each is multiplied by 320 / width, rounded down, at least 1, \
              so 640 gets 5 x 5 at the default 10 x 10 and a tile holds no more pixels than a \
@@ -5394,8 +5451,9 @@ pub const VERIFIED: &[Verified] = &[
                query; every page of SearchSubtitlesAsync; BadSubtitleFilter, with the files a \
                download found empty, MediaFilter and MatchFilter; the order by hash match, \
                downloads, rating and trusted uploader; one candidate per result, its first \
-               file's id, with Release, Comments, Ratings, UploadDate, Fps and the machine and \
-               AI translation flags)",
+               file's id, with ProviderName \"Open Subtitles\" (the plugin's Name, also the \
+               fetcher name DisabledSubtitleFetchers and SubtitleFetcherOrder hold), Release, \
+               Comments, Ratings, UploadDate, Fps and the machine and AI translation flags)",
         date: "2026-11-14",
         divergences: &[
             "With an OpenSubtitles API key and no account, a manual search still searches; \
@@ -5406,9 +5464,6 @@ pub const VERIFIED: &[Verified] = &[
          validation included), and a download still tries to log in with it; \
          the plugin saves the flag to its configuration until its settings page validates new \
          credentials, and fails such a download at once (Unable to login). Fix path: gl-1644.",
-            "OpenSubtitles candidates carry ProviderName \"opensubtitles\" and the MD5 of that \
-         name as their id prefix; the plugin's Name, and so upstream's, is \"Open Subtitles\". \
-         Fix path: gl-1704.",
             "The 401 (no or bad token), 403 (no subtitle management) and 404 bodies are \
          Ferrofin's error shape, not upstream's. Fix path: gl-666.",
         ],
