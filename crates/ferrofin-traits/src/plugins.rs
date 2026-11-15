@@ -13,7 +13,12 @@
 //! The trait traffics only in plain data ([`PluginDescriptor`], [`PluginImage`],
 //! and the `ferrofin-model` `RepositoryInfo`/`PackageInfo` wire DTOs) so it stays
 //! object-safe and implementable in `ferrofin-core` without any knowledge of the
-//! `ferrofin-api` router or `AppState`.
+//! `ferrofin-api` router or `AppState`. The registry entries the composition
+//! root builds from every plugin, [`RegisteredPlugin`] and its
+//! [`PluginConfigPage`]s, are defined here too, so the plugin crates that
+//! produce them need no `ferrofin-core`.
+
+use std::path::PathBuf;
 
 use async_trait::async_trait;
 use ferrofin_model::updates::{PackageInfo, RepositoryInfo};
@@ -79,6 +84,108 @@ pub struct PluginImage {
     pub content_type: String,
     /// The raw image bytes.
     pub data: Vec<u8>,
+}
+
+/// A compiled-in plugin registered with the manager at the composition root.
+///
+/// Plain data only (no `ferrofin-api`/router types) so the manager stays below the
+/// dependency arrow; the composition root maps its richer `FerrofinPlugin` trait
+/// objects down to these entries.
+#[derive(Debug, Clone)]
+pub struct RegisteredPlugin {
+    /// The plugin's presentation metadata.
+    pub descriptor: PluginDescriptor,
+    /// The plugin's bundled image, if any.
+    pub image: Option<PluginImage>,
+    /// The plugin's default configuration (JSON bytes), returned until the admin
+    /// writes a value.
+    pub default_config: Vec<u8>,
+    /// The plugin's dashboard pages/resources — projected into
+    /// `GET /web/ConfigurationPages` + served by
+    /// `GET /web/ConfigurationPage?name=…` so the dashboard shows a Settings
+    /// link. The first page is the plugin's main settings page (jellyfin-web
+    /// links the first page whose `PluginId` matches); the rest are typically
+    /// the JS/CSS resources that page loads by name.
+    pub config_pages: Vec<PluginConfigPage>,
+    /// The file a runtime-loaded (WASM) plugin was loaded from, whatever its
+    /// name; uninstalling the plugin deletes it. `None` for a compiled-in one.
+    pub artifact: Option<PathBuf>,
+}
+
+/// One dashboard page (or page resource) a plugin ships. Mirrors the C#
+/// `PluginPageInfo`: a name the dashboard fetches by, the bytes, and whether the
+/// page gets a main-menu (drawer) link.
+#[derive(Debug, Clone)]
+pub struct PluginConfigPage {
+    /// The name the page is fetched by (`?name=…`); resources keep their file
+    /// extension (e.g. `introskipper.js`) so the server picks the MIME type.
+    pub name: String,
+    /// The raw page/resource bytes.
+    pub bytes: Vec<u8>,
+    /// Whether the dashboard drawer shows a direct link to this page
+    /// (`EnableInMainMenu`).
+    pub enable_in_main_menu: bool,
+}
+
+impl RegisteredPlugin {
+    /// Builds a registration, normalizing `has_image`/`can_uninstall` on the
+    /// descriptor. Image presence drives `has_image`.
+    ///
+    /// `can_uninstall` is forced **`true`** even though a compiled-in extension
+    /// can't actually be removed at runtime. jellyfin-web gates the dashboard
+    /// enable/disable toggle on `CanUninstall` — the *same* flag as the uninstall
+    /// button, with no separate "can be disabled" field — so reporting `false`
+    /// hides the toggle entirely and the extension is stuck showing "Active".
+    /// We report `true` to surface the toggle;
+    /// [`remove_plugin`](PluginManager::remove_plugin) still honestly rejects
+    /// the uninstall itself.
+    #[must_use]
+    pub fn new(mut descriptor: PluginDescriptor, image: Option<PluginImage>) -> Self {
+        descriptor.has_image = image.is_some();
+        descriptor.can_uninstall = true;
+        Self {
+            descriptor,
+            image,
+            default_config: b"{}".to_vec(),
+            config_pages: Vec::new(),
+            artifact: None,
+        }
+    }
+
+    /// Records the file a runtime-loaded plugin came from (see
+    /// [`Self::artifact`]).
+    #[must_use]
+    pub fn with_artifact(mut self, path: PathBuf) -> Self {
+        self.artifact = Some(path);
+        self
+    }
+
+    /// Reports `CanUninstall: false`, undoing the `true` [`Self::new`] forces.
+    ///
+    /// That `true` exists to surface jellyfin-web's enable/disable toggle for a
+    /// compiled-in **extension**. Jellyfin's own in-tree provider plugins
+    /// (TMDb, OMDb, MusicBrainz, AudioDB, Studio Images) report `false`, and
+    /// they are the row `GET /Plugins` is diffed against, so they opt back out.
+    #[must_use]
+    pub fn non_removable(mut self) -> Self {
+        self.descriptor.can_uninstall = false;
+        self
+    }
+
+    /// Sets the plugin's default configuration JSON.
+    #[must_use]
+    pub fn with_default_config(mut self, config: Vec<u8>) -> Self {
+        self.default_config = config;
+        self
+    }
+
+    /// Appends a dashboard page/resource. Call once per page; the first call
+    /// registers the plugin's main settings page.
+    #[must_use]
+    pub fn with_config_page(mut self, page: PluginConfigPage) -> Self {
+        self.config_pages.push(page);
+        self
+    }
 }
 
 /// Manages the server's compiled-in plugins and package repositories.

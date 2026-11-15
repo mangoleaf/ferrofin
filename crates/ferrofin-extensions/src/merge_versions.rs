@@ -75,7 +75,6 @@ use std::path::Path;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use ferrofin_core::{PluginConfigPage, ScheduledTask, TaskProgress};
 use ferrofin_db::entities::base_items::BaseItemEntity;
 use ferrofin_model::data::BaseItemKind;
 use ferrofin_model::entities_media::VirtualFolderInfo;
@@ -87,7 +86,8 @@ use ferrofin_traits::library::{LibraryManager, VirtualFolderManager};
 use ferrofin_traits::merge_versions::{MergeProgress, MergeVersionsManager};
 use ferrofin_traits::options::InternalItemsQuery;
 use ferrofin_traits::persistence::{ItemPersistenceService, ItemRepository};
-use ferrofin_traits::plugins::{PluginDescriptor, PluginManager};
+use ferrofin_traits::plugins::{PluginConfigPage, PluginDescriptor, PluginManager};
+use ferrofin_traits::tasks::{ScheduledTask, TaskProgress};
 use ferrofin_util::ticks::TICKS_PER_DAY;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -510,9 +510,7 @@ impl MergeVersionsService {
         let primary = items
             .iter()
             .find(|i| i.primary_version_id.is_none() && owns_alternates(i))
-            .unwrap_or_else(|| {
-                &items[ferrofin_core::video_versions::preferred_primary_version(&items)]
-            });
+            .unwrap_or_else(|| &items[ferrofin_db::item_data::preferred_primary_version(&items)]);
         let primary_id = primary.id.clone();
 
         // Targeted single-column writes: the group rows were loaded to decide
@@ -897,8 +895,8 @@ fn episode_merge_key(ep: &BaseItemEntity, provider_id: impl Fn(&str) -> Option<S
     if let (Some(parent), Some(index)) = (ep.parent_index_number, ep.index_number) {
         // `IndexNumberEnd` lives in the `Data` blob; a null renders as
         // nothing, as in the C# interpolation.
-        let end = ferrofin_core::item_data::read_data_i32(
-            &ferrofin_core::item_data::parse_data(ep.data.as_deref()),
+        let end = ferrofin_db::item_data::read_data_i32(
+            &ferrofin_db::item_data::parse_data(ep.data.as_deref()),
             "IndexNumberEnd",
         )
         .map(|end| end.to_string())
@@ -2593,6 +2591,7 @@ mod tests {
             remote_images: Arc::new(
                 crate::ldap_auth::provider::profile_image::FakeImages::default(),
             ),
+            media_segment_scan: Arc::new(crate::tests::NoScan),
         };
 
         let tasks = MergeVersionsExtension.tasks(&cx);

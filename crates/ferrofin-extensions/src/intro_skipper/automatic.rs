@@ -13,9 +13,9 @@ use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use ferrofin_core::TaskProgress;
 use ferrofin_model::data::BaseItemKind;
 use ferrofin_traits::error::ServiceError;
+use ferrofin_traits::tasks::TaskProgress;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio::task::JoinHandle;
 use uuid::Uuid;

@@ -19,8 +19,8 @@
 //! This module is plain data: the ids, names, descriptions, configuration file
 //! names, default configuration JSON, and the **verbatim** `config.html` bytes
 //! taken from the 10.11.8 tag (both projects are GPL-3.0-only). The composition
-//! root turns each [`BuiltinPlugin`] into a `ferrofin_core::RegisteredPlugin`,
-//! because `RegisteredPlugin` lives above this crate in the dependency graph.
+//! root turns each [`BuiltinPlugin`] into a
+//! `ferrofin_traits::plugins::RegisteredPlugin`.
 //!
 //! **The configurations are live.** The composition root
 //! (`apps/ferrofin-server/src/state.rs`) hands the plugin manager to

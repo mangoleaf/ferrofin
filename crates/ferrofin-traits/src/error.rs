@@ -134,6 +134,14 @@ impl ServiceError {
     }
 }
 
+/// A Jellyfin XML configuration that could not be imported is a
+/// [`ServiceError::Backend`] with the importer's message.
+impl From<ferrofin_common::config_import::ConfigImportError> for ServiceError {
+    fn from(err: ferrofin_common::config_import::ConfigImportError) -> Self {
+        Self::Backend(err.to_string())
+    }
+}
+
 /// Wraps a `sqlx` error as a [`ServiceError::Db`], keeping it as the source.
 ///
 /// The one `sqlx` → [`ServiceError`] conversion for every crate that runs

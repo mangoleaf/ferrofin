@@ -12,11 +12,13 @@
 //!
 //! Reused verbatim from `ferrofin-model`: [`TaskInfo`], [`TaskResult`],
 //! [`TaskState`], [`TaskCompletionStatus`], [`TaskTriggerInfo`] — no new DTOs
-//! are defined here.
+//! are defined here. The task contract, [`ScheduledTask`] and [`TaskProgress`],
+//! lives in `ferrofin-traits` (re-exported here), so extensions and WASM
+//! plugins implement it without this crate.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -39,6 +41,8 @@ pub mod channels;
 pub mod library;
 pub mod live_tv;
 pub mod maintenance;
+
+pub use ferrofin_traits::tasks::{ScheduledTask, TaskProgress};
 
 /// How often the scheduler evaluates triggers.
 const SCHEDULER_PERIOD: Duration = Duration::from_secs(30);
@@ -103,200 +107,6 @@ fn first_run_delay(task_key: &str) -> chrono::TimeDelta {
     FIRST_RUN_DELAY + chrono::TimeDelta::minutes(offset)
 }
 
-/// A live handle a running task uses to report its completion percentage.
-///
-/// Port of the C# `IProgress<double>` each `IScheduledTask.ExecuteAsync`
-/// receives; the registry surfaces the last reported value as
-/// [`TaskInfo::current_progress_percentage`] while the task is running, and
-/// nothing before its first report (upstream's `CurrentProgress` stays null
-/// until `ScheduledTaskWorker.OnProgressChanged` sets it).
-#[derive(Clone, Debug, Default)]
-pub struct TaskProgress {
-    /// The current percentage, stored as `f64` bits.
-    percent: Arc<AtomicU64>,
-    /// Set by the first [`report`](Self::report).
-    reported: Arc<AtomicBool>,
-    /// Set by [`stopped`](Self::stopped).
-    stopped: Arc<AtomicBool>,
-    /// The run's cancellation token (upstream's `CurrentCancellationTokenSource`),
-    /// cancelled by Stop, the run's max runtime and shutdown.
-    cancel: crate::ScanCancel,
-    /// Why the run started (`api`, `schedule`, `startup`); empty for a
-    /// test's foreground `FerrofinTaskManager::run_now`.
-    trigger: &'static str,
-    /// The registry's progress signal, raised by [`report`](Self::report)
-    /// (upstream's `TaskProgress` event); `None` outside a registry run.
-    progressed: Option<tokio::sync::broadcast::Sender<()>>,
-}
-
-impl TaskProgress {
-    /// Why this run started: the registry's trigger tag (`api` for the
-    /// dashboard or `StartTask`, `schedule` for a configured trigger,
-    /// `startup` for a startup trigger), or `""` when it has none (a test's
-    /// foreground `FerrofinTaskManager::run_now`).
-    #[must_use]
-    pub fn trigger(&self) -> &'static str {
-        self.trigger
-    }
-
-    /// Marks the run as stopped before its work finished, so it is recorded
-    /// [`Cancelled`](TaskCompletionStatus::Cancelled) rather than
-    /// `Completed` — upstream's `ExecuteAsync` throwing
-    /// `OperationCanceledException` (`ScheduledTaskWorker.ExecuteInternal`).
-    pub fn stopped(&self) {
-        self.stopped.store(true, Ordering::Relaxed);
-    }
-
-    fn was_stopped(&self) -> bool {
-        self.stopped.load(Ordering::Relaxed)
-    }
-
-    /// The run's cancellation token, for the work a body hands it to (the
-    /// chapter-image extractor, the subtitle downloader): upstream's
-    /// `CancellationToken` argument of `ExecuteAsync`.
-    #[must_use]
-    pub fn cancel_token(&self) -> &crate::ScanCancel {
-        &self.cancel
-    }
-
-    /// Whether the run was asked to stop (Stop, its max runtime, shutdown).
-    /// Once it says so the run counts as [`stopped`](Self::stopped), so a
-    /// body that then returns `Ok` is recorded `Cancelled`: upstream's
-    /// `cancellationToken.ThrowIfCancellationRequested()`.
-    #[must_use]
-    pub fn stop_requested(&self) -> bool {
-        let requested = self.cancel.is_cancelled();
-        if requested {
-            self.stopped();
-        }
-        requested
-    }
-
-    /// Reports the task's completion percentage, capped at 100 with no lower
-    /// bound, and raises the registry's progress signal, as upstream's
-    /// `ScheduledTaskWorker.OnProgressChanged` caps it (`Math.Min(e, 100)`,
-    /// which keeps a NaN) and raises `TaskProgress` on every report.
-    pub fn report(&self, percent: f64) {
-        // Not `f64::min`, which turns a NaN into 100.
-        let capped = if percent > 100.0 { 100.0 } else { percent };
-        self.percent.store(capped.to_bits(), Ordering::Relaxed);
-        // Release: whoever sees the flag sees this report's percentage.
-        self.reported.store(true, Ordering::Release);
-        if let Some(progressed) = &self.progressed {
-            // Nobody subscribed is not an error.
-            let _ = progressed.send(());
-        }
-    }
-
-    /// Reads the last reported percentage.
-    #[must_use]
-    pub fn current(&self) -> f64 {
-        f64::from_bits(self.percent.load(Ordering::Relaxed))
-    }
-
-    /// The last reported percentage, or `None` before the first report.
-    fn reported(&self) -> Option<f64> {
-        self.reported
-            .load(Ordering::Acquire)
-            .then(|| self.current())
-    }
-}
-
-/// A unit of background work the registry can enumerate, schedule and run.
-///
-/// Port of `MediaBrowser.Model.Tasks.IScheduledTask`. A task advertises stable
-/// metadata, default triggers and an idempotent
-/// [`execute`](ScheduledTask::execute) body; the registry — not the task — owns
-/// run state, history and scheduling.
-#[async_trait]
-pub trait ScheduledTask: Send + Sync {
-    /// A stable, unique key identifying the task (the C# `ScheduledTask.Key`).
-    ///
-    /// Used as the registry map key and echoed into [`TaskInfo::key`]/`id`.
-    fn key(&self) -> &str;
-
-    /// The task's human-readable display name, or its localization key when
-    /// [`is_localized`](ScheduledTask::is_localized).
-    fn name(&self) -> &str;
-
-    /// A one-line description of what the task does, or its localization key
-    /// when [`is_localized`](ScheduledTask::is_localized).
-    fn description(&self) -> &str;
-
-    /// The category the task is grouped under in the UI, or its localization
-    /// key when [`is_localized`](ScheduledTask::is_localized).
-    fn category(&self) -> &str;
-
-    /// Whether [`name`](ScheduledTask::name),
-    /// [`description`](ScheduledTask::description) and
-    /// [`category`](ScheduledTask::category) are keys into the core
-    /// localization dictionaries rather than display text.
-    ///
-    /// The registry then shows each in the ambient UI culture, as upstream's
-    /// core tasks return `_localization.GetLocalizedString("<key>")`. Defaults
-    /// to `false`: extension and WASM tasks show their own strings, as
-    /// upstream plugins localize themselves, and so do the two core tasks
-    /// upstream leaves as literals (`RefreshGuide`,
-    /// `TmdbRefreshUpcomingEpisodes`).
-    fn is_localized(&self) -> bool {
-        false
-    }
-
-    /// The value formatted into a localized description's `{0}`, as
-    /// upstream's `string.Format(GetLocalizedString(key), value)`. Only
-    /// `CleanLogFiles` has one.
-    fn description_argument(&self) -> Option<String> {
-        None
-    }
-
-    /// Whether the task is hidden from the normal task listing.
-    ///
-    /// Defaults to `false`; hidden tasks are still runnable by key.
-    fn is_hidden(&self) -> bool {
-        false
-    }
-
-    /// Whether this task implements C# `IConfigurableScheduledTask`.
-    ///
-    /// Load-bearing for `GET /ScheduledTasks`: `ScheduledTasksController.GetTasks`
-    /// applies the `isHidden`/`isEnabled` filters **only** inside
-    /// `if (task.ScheduledTask is IConfigurableScheduledTask scheduledTask)`, so
-    /// a task that does not implement the interface is yielded whatever the
-    /// caller asked for. Exactly nine of Jellyfin 10.11.8's twenty tasks do
-    /// (`CleanActivityLog`, `DeleteCacheFiles`, `CleanLogFiles`,
-    /// `DeleteTranscodeFiles`, `OptimizeDatabaseTask`, `RefreshPeople`,
-    /// `PluginUpdates`, `RefreshGuide`, `RefreshInternetChannels`), so this
-    /// defaults to `false`.
-    fn is_configurable(&self) -> bool {
-        false
-    }
-
-    /// C# `IConfigurableScheduledTask.IsEnabled`.
-    ///
-    /// Only consulted when [`is_configurable`](ScheduledTask::is_configurable)
-    /// is `true`, and only by the `isEnabled` query filter — `TaskInfo` has no
-    /// `IsEnabled` field, so this never reaches the wire. Every configurable
-    /// task in 10.11.8 returns `true`.
-    fn is_enabled(&self) -> bool {
-        true
-    }
-
-    /// The task's default triggers, fired by the scheduler unless overridden
-    /// via [`FerrofinTaskManager::set_triggers`].
-    fn default_triggers(&self) -> Vec<TaskTriggerInfo> {
-        Vec::new()
-    }
-
-    /// Runs the task to completion, reporting progress through `progress`.
-    ///
-    /// Errors surface as a [`TaskCompletionStatus::Failed`] result recorded by
-    /// the registry; the returned `Result` also propagates to the caller of
-    /// the test-only `FerrofinTaskManager::run_now`. A panic in the body is recorded the
-    /// same way, as a failure whose error names the panic's message (upstream
-    /// catches every exception the body throws as `Failed`).
-    async fn execute(&self, progress: &TaskProgress) -> Result<(), ServiceError>;
-}
-
 /// One registered task plus the registry-owned run state and last result.
 struct Registration {
     task: Arc<dyn ScheduledTask>,
@@ -355,7 +165,7 @@ impl Registration {
     /// was recorded already (shut down), or replaced since, no longer
     /// matches. A run asked to stop is live until it returns.
     fn is_live(&self, run: &TaskProgress) -> bool {
-        self.state != TaskState::Idle && Arc::ptr_eq(&self.progress.stopped, &run.stopped)
+        self.state != TaskState::Idle && self.progress.is_same_run(run)
     }
 
     /// `ScheduledTaskWorker.CancelIfRunning`: asks a `Running` run to stop by
@@ -366,7 +176,7 @@ impl Registration {
         if self.state != TaskState::Running {
             return false;
         }
-        self.progress.cancel.cancel();
+        self.progress.cancel_token().cancel();
         self.state = TaskState::Cancelling;
         true
     }
@@ -1149,10 +959,7 @@ impl FerrofinTaskManager {
         max_runtime_ticks: Option<i64>,
     ) -> Result<(), ServiceError> {
         let (task, progress) = self.claim(key, max_runtime_ticks)?;
-        let progress = TaskProgress {
-            trigger,
-            ..progress
-        };
+        let progress = progress.with_trigger(trigger);
         let run = progress.clone();
         let this = self.clone();
         let key_owned = key.to_owned();
@@ -1228,10 +1035,7 @@ impl FerrofinTaskManager {
             )));
         }
         reg.state = TaskState::Running;
-        reg.progress = TaskProgress {
-            progressed: Some(self.updates.progress.clone()),
-            ..TaskProgress::default()
-        };
+        reg.progress = TaskProgress::for_run(self.updates.progress.clone());
         reg.started_at = Some(Utc::now());
         reg.run_max_ticks = max_runtime_ticks;
         let claimed = (Arc::clone(&reg.task), reg.progress.clone());
@@ -1336,7 +1140,7 @@ impl FerrofinTaskManager {
                     (
                         key.clone(),
                         reg.run.take(),
-                        reg.progress.cancel.clone(),
+                        reg.progress.cancel_token().clone(),
                         was_running,
                     )
                 })
@@ -1584,7 +1388,7 @@ async fn execute_contained(
     let body =
         futures_util::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(task.execute(progress)));
     let overdue = async {
-        progress.cancel.cancelled().await;
+        progress.cancel_token().cancelled().await;
         tokio::time::sleep(STOP_WAIT).await;
     };
     let outcome = tokio::select! {
@@ -1918,6 +1722,12 @@ impl ScheduledTask for RefreshLibraryTask {
             progress.stopped();
         }
         Ok(())
+    }
+}
+
+impl ferrofin_traits::tasks::TaskRegistry for FerrofinTaskManager {
+    fn register(&self, task: Arc<dyn ScheduledTask>) {
+        FerrofinTaskManager::register(self, task);
     }
 }
 

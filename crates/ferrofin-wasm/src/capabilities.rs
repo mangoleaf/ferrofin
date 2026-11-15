@@ -580,7 +580,7 @@ pub(crate) fn summarize(
     ItemSummary {
         id: Uuid::parse_str(&e.id).map_or_else(|_| e.id.clone(), |u| u.to_string()),
         name: e.name.clone().unwrap_or_default(),
-        kind: ferrofin_core::item_type_lookup::kind_from_type_name(&e.type_)
+        kind: ferrofin_model::data::BaseItemKind::from_stored_type_name(&e.type_)
             .map_or_else(|| e.type_.clone(), |k| format!("{k:?}")),
         path: e.path.clone(),
         parent_id: e
@@ -786,7 +786,7 @@ fn write_media_segments_using_provider(
                 return Ok(SegmentWriteOutcome::PolicySkipped);
             }
             Some(std::sync::Arc::new(
-                ferrofin_core::CachedMediaSegmentProvider::new(
+                ferrofin_providers::cached_media_segment_provider::CachedMediaSegmentProvider::new(
                     provider_name.to_owned(),
                     id,
                     std::sync::Arc::clone(&cx.plugins),

@@ -2260,6 +2260,14 @@ pub async fn build_app_state(
     let intro_skipper: Arc<dyn ferrofin_traits::intro_skipper::IntroSkipperStore> = Arc::new(
         ferrofin_core::intro_skipper_repository::FerrofinIntroSkipperStore::new(db.clone()),
     );
+    // The core "Media Segment Scan", registered below; the Intro Skipper's
+    // scan, registered after it under the same key, runs it after detection.
+    let media_segment_scan: Arc<dyn ferrofin_traits::tasks::ScheduledTask> = Arc::new(
+        ferrofin_core::scheduled_tasks::library::MediaSegmentExtractionTask::new(
+            Arc::clone(&library),
+            Arc::clone(&media_segments),
+        ),
+    );
     let extension_cx = ferrofin_extensions::ExtensionContext {
         library: Arc::clone(&library),
         media_segments: Arc::clone(&media_segments),
@@ -2284,11 +2292,12 @@ pub async fn build_app_state(
         // The providers' own download path, so an extension's image fetch keeps
         // the destination policy and size limit set above.
         remote_images: Arc::new(ferrofin_providers::remote_images::LimitedImageFetcher),
+        media_segment_scan: Arc::clone(&media_segment_scan),
     };
     // The user manager was built long before the extensions: their
     // authentication and password-reset providers fill its late slots now,
     // before the server takes a request. Every clone of the manager shares them.
-    ferrofin_extensions::register_auth_providers(&extensions, &extension_cx, &users_impl);
+    ferrofin_extensions::register_auth_providers(&extensions, &extension_cx, users_impl.as_ref());
     // One-shot, before the server takes a request: an adopted Jellyfin's
     // LDAP-Auth settings and uid map come across from the plugin's XML, so its
     // directory users sign in with no admin action (B7).
@@ -2320,12 +2329,7 @@ pub async fn build_app_state(
     for provider in wasm_host.media_segment_providers(&plugins) {
         media_segments.register_segment_provider(provider);
     }
-    task_manager.register(Arc::new(
-        ferrofin_core::scheduled_tasks::library::MediaSegmentExtractionTask::new(
-            Arc::clone(&library),
-            Arc::clone(&media_segments),
-        ),
-    ));
+    task_manager.register(media_segment_scan);
     ferrofin_extensions::register_tasks(&extensions, &extension_cx, &task_manager);
     // Tier-1b WASM plugin tasks and event delivery. Tasks self-gate on the
     // plugin's enabled flag (the Tier-1a pattern); event delivery is

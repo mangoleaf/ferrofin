@@ -71,10 +71,7 @@ use super::{ScheduledTask, TaskProgress, interval_hours};
 /// The upstream Library category's localization key.
 pub(super) const LIBRARY: &str = "TasksLibraryCategory";
 
-/// Items examined per page (the upstream `QueryPageLimit`). The extensions'
-/// library walks (Intro Skipper's queue, Merge Versions) read their rows in
-/// pages of the same size.
-pub const PAGE_SIZE: i32 = 100;
+pub use ferrofin_traits::tasks::PAGE_SIZE;
 
 /// A query's items read [`PAGE_SIZE`] at a time, counting those done:
 /// upstream's `GetCount`, then `StartIndex += Pagesize` until the count is
