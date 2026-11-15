@@ -2099,7 +2099,9 @@ pub type ScanProgress = dyn Fn(f64) + Send + Sync;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ScanPasses {
     /// Every post-scan pass — library validation's `RunPostScanTasks` (the
-    /// scheduled scan, `POST /Library/Refresh`, a library change).
+    /// scheduled scan, `POST /Library/Refresh`, a library change) — and,
+    /// before the walk, the two root folders' refresh its
+    /// `ValidateTopLibraryFolders` opens with.
     Library,
     /// Only what is scoped to the items this scan touched: the music
     /// refresh of the albums and artists among them, their album covers, the
@@ -3071,7 +3073,8 @@ const UNWALKED_FACTS: FileFacts = FileFacts {
 
 /// The refresh plan of `row`, a row a library or root refresh reaches
 /// without the walk planning it: a library tile (`library` is its options)
-/// or the user root (no library, so upstream's default options). Its
+/// or a root folder, the user root or the aggregate root (no library, so
+/// upstream's default options). Its
 /// `run_all_providers` forces the row's dynamic image as
 /// `MetadataService.GetProviders` does: "Replace all metadata", a full
 /// refresh, or at `Default` or above the row's own first refresh or its
@@ -5703,6 +5706,35 @@ impl LibraryScanner {
         }
     }
 
+    /// Library validation's opening refresh of the two root folders,
+    /// `ValidateTopLibraryFolders`' (`RootFolder.RefreshMetadata`, then
+    /// `GetUserRootFolder().RefreshMetadata()`, LibraryManager.cs:1436-1452):
+    /// default options whatever the scan's, before any library is walked, so
+    /// each copies the art the earlier validations left. A failure is logged.
+    async fn refresh_root_folders(&self, run: ScanRun<'_>) {
+        if run.cancel.is_cancelled() {
+            return;
+        }
+        let Some(providers) = self.dynamic_image_providers() else {
+            return;
+        };
+        let between = || -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
+            Box::pin(async move {
+                Box::pin(self.serve_lane(run)).await;
+            })
+        };
+        if let Err(err) = providers
+            .refresh_roots_between(
+                &[BaseItemKind::AggregateFolder, BaseItemKind::UserRootFolder],
+                &MetadataRefreshOptions::default(),
+                &between,
+            )
+            .await
+        {
+            tracing::warn!(%err, "root folder image pass failed");
+        }
+    }
+
     /// The library-wide half of [`scan_target`](Self::scan_target).
     async fn scan_libraries(
         &self,
@@ -5710,6 +5742,9 @@ impl LibraryScanner {
         run: ScanRun<'_>,
     ) -> Result<ScanOutcome, ServiceError> {
         let options = run.options;
+        if run.passes == ScanPasses::Library {
+            self.refresh_root_folders(run).await;
+        }
         // `LibraryManager.PerformLibraryValidation` opens with
         // `ValidateTopLibraryFolders`, whose tail deletes the library rows whose
         // directory no longer exists. Do the same here so a library removed
@@ -7942,7 +7977,7 @@ impl LibraryScanner {
             if runs
                 && run.from_root
                 && let Err(err) = providers
-                    .refresh_user_root_between(run.options, &between)
+                    .refresh_roots_between(&[BaseItemKind::UserRootFolder], run.options, &between)
                     .await
             {
                 tracing::warn!(%err, "root image pass failed");
@@ -9801,7 +9836,7 @@ impl LibraryScanner {
     /// | by-name paths | the by-name rows with no `Path` | `CreateItemByName` sets it at insert |
     /// | studio images | the studios never refreshed | `StudiosValidator.cs:69-84` (new studios) |
     /// | library tiles | their own 7-day staleness (`HasChangedByDate`), every tile when the validation runs every provider; never a locked library's | `CollectionFolderImageProvider` |
-    /// | dynamic images | first the photo albums, folders and playlist files the walk refreshed with every provider (`runAllProviders`), forced; then per item: no generated Primary yet, or its file changed (`HasChangedByDate`); never a locked row | `BaseDynamicImageProvider.HasChanged`, `MetadataService.GetProviders` |
+    /// | dynamic images | first the photo albums, folders and playlist files the walk refreshed with every provider (`runAllProviders`), forced; then per item: no generated Primary yet, or its file changed (`HasChangedByDate`); never a locked row; never the two root folders, which the validation refreshes at its opening | `BaseDynamicImageProvider.HasChanged`, `MetadataService.GetProviders`; `ValidateTopLibraryFolders` |
     /// | collections | movies in libraries with automatic collections enabled | `CollectionPostScanTask` |
     /// | splashscreen | 30 random movies and series rated at most 13, for posters and thumbs (backdrops when no thumb); rebuilt on every validation, as upstream's | `SplashscreenPostScanTask` |
     // One straight sequence of the closing passes, each timed and logged by
@@ -45578,6 +45613,11 @@ mod tests {
         );
         let cold = fx.primary().await;
         assert!(cold.width > 0 && cold.blur_hash.is_some());
+        // The next validation copies the library tile to the root folders
+        // at its opening (`ValidateTopLibraryFolders`), measured from here.
+        fx.scanner.scan_all().await.unwrap();
+        fx.dimensions.store(0, Ordering::Relaxed);
+        fx.blur_hashes.store(0, Ordering::Relaxed);
 
         fx.scanner.scan_all().await.unwrap();
         assert_eq!(
@@ -45782,6 +45822,10 @@ mod tests {
             cold >= movies,
             "the first scan probes every poster ({cold})"
         );
+        // The root folders' first copies, measured from here.
+        fx.scanner.scan_all().await.unwrap();
+        fx.dimensions.store(0, Ordering::Relaxed);
+        fx.blur_hashes.store(0, Ordering::Relaxed);
 
         fx.scanner.scan_all().await.unwrap();
         assert_eq!(

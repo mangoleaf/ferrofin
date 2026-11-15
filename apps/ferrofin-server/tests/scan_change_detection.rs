@@ -40,6 +40,7 @@
 //! | # | Scenario | Expect |
 //! |---|---|---|
 //! | 1 | first scan | all created; every ticked provider called, in order |
+//! | 1b | the next rescan | only the two root folders' images, which validation draws at its opening |
 //! | 2 | rescan, nothing changed | 0 probes, 0 provider requests, 0 writes, all unchanged |
 //! | 3 | touch one file's mtime, rescan | exactly that item: probe + providers + save |
 //! | 4 | NFO newer than DateLastSaved + 1 min | that item's local metadata re-read only |
@@ -2004,6 +2005,21 @@ async fn rows(h: &Harness) {
             .written_items()
             .contains(&"Person:Ada Actor".to_owned()),
         "row 1: {first:?}"
+    );
+
+    // ---- 1b: the next validation draws the two root folders' images ----
+    // Library validation refreshes them at its opening, as upstream's
+    // `ValidateTopLibraryFolders` does: the first found no art to copy yet.
+    let roots = h.rescan("1b").await;
+    assert_eq!(
+        roots.written_items(),
+        ["AggregateFolder:root", "UserRootFolder:Media Folders"],
+        "row 1b: {roots:?}"
+    );
+    assert_eq!(
+        roots.item_tables(),
+        BTreeMap::from([("BaseItemImageInfos", 2), ("BaseItems", 2)]),
+        "row 1b: {roots:?}"
     );
 
     // ---- 2: an unchanged rescan does nothing ----
