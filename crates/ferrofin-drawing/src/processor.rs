@@ -43,7 +43,9 @@ use ferrofin_traits::drawing::{
     ImageEncoder, ImageProcessor as ImageProcessorTrait, ProcessedImage,
 };
 use ferrofin_traits::error::ServiceError;
-use ferrofin_traits::options::{ImageCollageOptions, ImageProcessingOptions, ItemImageInfo};
+use ferrofin_traits::options::{
+    ImageCollageOptions, ImageProcessingOptions, ItemImageInfo, file_date_modified,
+};
 use uuid::Uuid;
 
 /// The cache-invalidation version stamped into every resized-image cache key.
@@ -108,15 +110,12 @@ impl FileMeta for StdFileMeta {
         Path::new(path).exists()
     }
 
-    /// Port of `IFileSystem.GetLastWriteTimeUtc`. Falls back to [`Utc::now`] when
-    /// the file cannot be stat'd (mirroring the C# fallback to `DateTime.MinValue`
-    /// only loosely — the value is used solely as the returned
-    /// [`ProcessedImage::date_modified`], never re-hashed).
+    /// Port of `IFileSystem.GetLastWriteTimeUtc`: [`file_date_modified`], which
+    /// falls back to [`Utc::now`] when the file cannot be stat'd (mirroring the
+    /// C# fallback to `DateTime.MinValue` only loosely — the value is used solely
+    /// as the returned [`ProcessedImage::date_modified`], never re-hashed).
     fn last_write_time_utc(&self, path: &str) -> DateTime<Utc> {
-        match std::fs::metadata(path).and_then(|m| m.modified()) {
-            Ok(modified) => DateTime::<Utc>::from(modified),
-            Err(_) => Utc::now(),
-        }
+        file_date_modified(Path::new(path))
     }
 }
 

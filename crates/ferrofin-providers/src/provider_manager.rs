@@ -29,7 +29,7 @@ use ferrofin_model::providers::{
 };
 use ferrofin_traits::error::ServiceError;
 use ferrofin_traits::library::VirtualFolderManager;
-use ferrofin_traits::options::ItemImageInfo;
+use ferrofin_traits::options::{ItemImageInfo, file_date_modified};
 use ferrofin_traits::persistence::{
     ItemPersistenceService, ItemRepository, ItemTypeLookup, OwnerExtrasRefresh,
 };
@@ -3403,7 +3403,7 @@ impl LocalProviderManager {
         let dest = item_dir.join(format!("{stem}.{ext}"));
         let content: Vec<u8> = content.into();
         // `atomic_write` fsyncs: keep the disk work off the async workers.
-        let (dest, modified) = tokio::task::spawn_blocking(move || {
+        let (dest, date_modified) = tokio::task::spawn_blocking(move || {
             std::fs::create_dir_all(&item_dir).map_err(|e| {
                 ProvidersError::io(format!("create image dir {}", item_dir.display()), e)
             })?;
@@ -3414,14 +3414,13 @@ impl LocalProviderManager {
                     let _ = std::fs::remove_file(item_dir.join(format!("{stem}.{other}")));
                 }
             }
-            let modified = std::fs::metadata(&dest).and_then(|info| info.modified());
+            // `SetImagePath(…, FileInfo)`: the file's own modification time, so
+            // the dynamic image providers' date gate sees an upload as current.
+            let modified = file_date_modified(&dest);
             Ok::<_, ServiceError>((dest, modified))
         })
         .await
         .map_err(|error| ServiceError::backend(error.to_string()))??;
-        // `SetImagePath(…, FileInfo)`: the file's own modification time, so
-        // the dynamic image providers' date gate sees an upload as current.
-        let date_modified = modified.map_or_else(|_| Utc::now(), chrono::DateTime::from);
         Ok(ItemImageInfo {
             path: dest.to_string_lossy().into_owned(),
             image_type,

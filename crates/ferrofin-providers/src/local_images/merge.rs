@@ -8,10 +8,9 @@
 
 use std::path::{Path, PathBuf};
 
-use chrono::{DateTime, Utc};
 use ferrofin_db::store::guid_to_db;
 use ferrofin_model::entities::ImageType;
-use ferrofin_traits::options::ItemImageInfo;
+use ferrofin_traits::options::{ItemImageInfo, file_date_modified};
 use uuid::Uuid;
 
 use crate::container_types::LocalImageInfo;
@@ -125,22 +124,6 @@ fn refresh_found(current: &mut ItemImageInfo, new: &ItemImageInfo) -> bool {
         return true;
     }
     false
-}
-
-/// The image file's mtime as UTC, falling back to [`Utc::now`] when the stat
-/// fails. Port of Jellyfin's `IFileSystem.GetLastWriteTimeUtc`, which stamps
-/// `ItemImageInfo.DateModified`.
-///
-/// This MUST be the file's mtime, not the scan time: `date_modified` feeds both
-/// the client-facing `ImageTags` (`md5(path + ticks)`) and the resized-image
-/// cache key. A rescan of an unchanged file has to reproduce the same timestamp,
-/// or every scan changes every poster URL (busting the clients' year-long
-/// immutable image caches) and invalidates the entire server-side resize cache.
-#[must_use]
-pub fn file_date_modified(path: &Path) -> DateTime<Utc> {
-    std::fs::metadata(path)
-        .and_then(|m| m.modified())
-        .map_or_else(|_| Utc::now(), DateTime::<Utc>::from)
 }
 
 /// An item's own art folders under the metadata `root`: Ferrofin's
