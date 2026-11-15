@@ -423,7 +423,8 @@ const PROGRAM_UPSERT_CONFLICT: &str = r#" ON CONFLICT("Id") DO UPDATE SET
 /// Ports the three application paths the C# Live TV code reaches for:
 /// `IConfigurationManager.GetTranscodePath()` (the live-stream buffer),
 /// `CommonApplicationPaths.DataPath` (`livetv/recordings`), and the
-/// `livetv` named-configuration file that holds `LiveTvOptions`.
+/// `livetv` named-configuration file that holds `LiveTvOptions`; and the
+/// internal metadata directory, which only Ferrofin's own rule reads.
 #[derive(Debug, Clone, Default)]
 pub struct LiveTvPaths {
     /// Where a shared live stream's `{uniqueId}.ts` buffer is written
@@ -434,6 +435,10 @@ pub struct LiveTvPaths {
     pub data_dir: PathBuf,
     /// The `named/livetv.json` file holding the dashboard's `LiveTvOptions`.
     pub options_file: PathBuf,
+    /// The internal metadata directory, the only place a Live TV image row's
+    /// local file is read from
+    /// ([`live_tv_image_is_internal`](ferrofin_traits::options::live_tv_image_is_internal)).
+    pub metadata_dir: ferrofin_util::directory_path::DirectoryPath,
 }
 
 /// Concrete Live TV manager backed by [`Database`] and a [`SourceFetcher`].
@@ -6605,30 +6610,42 @@ impl FerrofinLiveTvManager {
         timer.status = RecordingStatus::InProgress;
         self.persist_timer(timer).await?;
         // `SaveRecordingMetadata`, which upstream's `async void OnStarted`
-        // runs without the recorder waiting on it. A failure is logged, as
-        // its catch-all logs it: a sidecar never fails a recording.
-        if options.save_recording_nfo {
+        // runs without the recorder waiting on it: the NFO, then the images.
+        // A failure is logged, as its catch-all logs it: a sidecar never fails
+        // a recording, and a failed NFO leaves the images unsaved.
+        let (save_nfo, save_images) = (options.save_recording_nfo, options.save_recording_images);
+        if save_nfo || save_images {
+            let manager = self.clone();
             let info = info.clone();
             let target = target.to_path_buf();
             let series = series.map(std::path::Path::to_path_buf);
-            let release_date = Arc::clone(&self.release_date_format);
-            let span = tracing::info_span!("recording_nfo", timer_id = %info.id);
+            let span = tracing::info_span!(
+                parent: None,
+                "recording_metadata",
+                trigger = "schedule",
+                timer_id = %info.id
+            );
             tokio::spawn(tracing::Instrument::instrument(
                 async move {
-                    if let Err(error) = crate::recording_metadata::save_recording_nfo(
-                        &info,
-                        &target,
-                        series.as_deref(),
-                        &release_date,
-                        Utc::now(),
-                    )
-                    .await
+                    if save_nfo
+                        && let Err(error) = crate::recording_metadata::save_recording_nfo(
+                            &info,
+                            &target,
+                            series.as_deref(),
+                            &manager.release_date_format,
+                            Utc::now(),
+                        )
+                        .await
                     {
                         tracing::warn!(
                             path = %target.display(),
                             %error,
                             "live tv: could not save the recording's NFO"
                         );
+                        return;
+                    }
+                    if save_images {
+                        manager.save_recording_images(&info, &target).await;
                     }
                 },
                 span,
@@ -6673,13 +6690,74 @@ impl FerrofinLiveTvManager {
                 timer_id = %info.id
             ),
         ));
-        // TODO(parity, open work item — NOT an accepted divergence; gl-749):
-        // with `save_recording_images`, upstream also copies the programme's
-        // artwork beside the recording (`SaveRecordingImages`), but the guide
-        // carries no programme images yet (gl-367). Un-defer path: once it
-        // does, port `SaveRecordingImages` into `recording_metadata` and call
-        // it here, gated on that option.
         Ok((recording_id, cancel))
+    }
+
+    /// `SaveRecordingImages`: the guide programme's artwork copied beside the
+    /// recording ([`recording_images`](crate::recording_metadata::recording_images)),
+    /// each image made local first through the remote-image cache (the
+    /// download half of `ConvertImageToLocal`). A failure is logged and the
+    /// next image tried, as upstream's catch around each does.
+    async fn save_recording_images(&self, info: &TimerRecordingInfo, recording: &std::path::Path) {
+        let (Some(program), Some(store), Some(images)) = (
+            info.program_item_id,
+            self.item_store.get(),
+            self.images.get(),
+        ) else {
+            return;
+        };
+        let rows = match store.items.get_image_infos(program).await {
+            Ok(rows) => rows,
+            Err(error) => {
+                tracing::warn!(item_id = %program, %error, "live tv: could not read the programme images to save beside the recording");
+                return;
+            }
+        };
+        let chosen =
+            crate::recording_metadata::recording_images(recording, info.is_program_series, &rows);
+        for (image, name) in chosen {
+            // A Live TV row holds what a guide supplied, so its local file is
+            // read only in the metadata directory; upstream copies any.
+            let local = if !image.is_local_file() {
+                images
+                    .providers
+                    .cached_remote_image(&image.path)
+                    .await
+                    .map_err(|error| error.to_string())
+            } else if ferrofin_traits::options::live_tv_image_is_internal(
+                &image.path,
+                &self.paths.metadata_dir.resolve(),
+            )
+            .await
+            {
+                Ok(image.path.clone())
+            } else {
+                Err("its file is outside the metadata directory".to_owned())
+            };
+            let local = match local {
+                Ok(local) => local,
+                Err(error) => {
+                    tracing::warn!(
+                        item_id = %program,
+                        image_type = ?image.image_type,
+                        %error,
+                        "live tv: could not make a programme image local to save beside the recording"
+                    );
+                    continue;
+                }
+            };
+            if let Err(error) =
+                crate::recording_metadata::copy_recording_image(std::path::Path::new(&local), &name)
+                    .await
+            {
+                tracing::warn!(
+                    path = %name.display(),
+                    image_type = ?image.image_type,
+                    %error,
+                    "live tv: could not copy a programme image beside the recording"
+                );
+            }
+        }
     }
 
     /// Runs the recorder upstream's `GetRecorder` would have chosen.
@@ -8377,6 +8455,7 @@ fn apply_program_to_recording_info(program: &GuideProgramRow, info: &mut TimerRe
     info.is_live = program.is_live;
     info.is_repeat = program.is_repeat;
     info.is_premiere = program.is_premiere;
+    info.program_item_id = Uuid::parse_str(&program.id).ok();
     info.external_program_id.clone_from(&program.external_id);
     info.genres = program
         .genres
@@ -8428,6 +8507,7 @@ mod tests {
     mod keep_up_to;
     mod program_list;
     mod recording_folders;
+    mod recording_images;
     mod schedules_direct;
 
     use std::collections::HashMap;
@@ -10923,6 +11003,11 @@ mod tests {
     #[derive(Default)]
     struct ArtServices {
         cached: std::sync::Mutex<Vec<String>>,
+        /// With a folder, a fetched URL is "downloaded" into it, named by its
+        /// last segment and holding the URL, and the cache answers that file.
+        downloads: Option<std::path::PathBuf>,
+        /// URLs the cache fails to download.
+        refused: Vec<String>,
     }
 
     #[async_trait::async_trait]
@@ -10960,7 +11045,15 @@ mod tests {
         }
         async fn cached_remote_image(&self, path: &str) -> Result<String, ServiceError> {
             self.cached.lock().expect("cache log").push(path.to_owned());
-            Ok(format!("/cache/{}", path.len()))
+            if self.refused.iter().any(|url| url == path) {
+                return Err(ServiceError::backend("refused"));
+            }
+            let Some(folder) = &self.downloads else {
+                return Ok(format!("/cache/{}", path.len()));
+            };
+            let file = folder.join(path.rsplit('/').next().unwrap_or(path));
+            std::fs::write(&file, path).map_err(|e| ServiceError::backend(e.to_string()))?;
+            Ok(file.display().to_string())
         }
         async fn save_image(
             &self,
@@ -11684,6 +11777,7 @@ mod tests {
                 transcode_dir: root.join("transcodes").into(),
                 data_dir: root.join("data"),
                 options_file: root.join("named").join("livetv.json"),
+                ..LiveTvPaths::default()
             });
         mgr.set_local_api_access(Arc::new(LoopbackApi));
         mgr
@@ -11849,6 +11943,7 @@ mod tests {
                 transcode_dir: root.join("transcodes").into(),
                 data_dir: root.join("data"),
                 options_file: named.join("livetv.json"),
+                ..LiveTvPaths::default()
             })
     }
 
@@ -17672,6 +17767,7 @@ mod tests {
             transcode_dir: dir.path().join("transcodes").into(),
             data_dir: dir.path().join("data"),
             options_file,
+            ..LiveTvPaths::default()
         };
         let mgr = manager_with(FakeFetcher(HashMap::new()))
             .await

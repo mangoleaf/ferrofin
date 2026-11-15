@@ -986,7 +986,9 @@ pub const VERIFIED_SUBSYSTEMS_AGAINST_EARLIER_PIN: &[(&str, &str)] = &[];
 /// retried), which no HTTP response describes either. `metadata-refresh` is
 /// which metadata and image providers an item's refresh runs, in which order
 /// and with what lookup, the Identify case first, shared by Identify → Apply,
-/// the item refresh and the library scan.
+/// the item refresh and the library scan. `recording-images` is the guide
+/// artwork a starting DVR capture copies beside its recording, which no HTTP
+/// response describes.
 pub const SUBSYSTEM_KEYS: &[&str] = &[
     "query-translation",
     "dto-fields",
@@ -1006,6 +1008,7 @@ pub const SUBSYSTEM_KEYS: &[&str] = &[
     "recording-keep-up-to",
     "direct-recording",
     "metadata-refresh",
+    "recording-images",
 ];
 
 /// One shared subsystem whose Ferrofin implementation was compared against the
@@ -1098,6 +1101,46 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
             "Where the library refuses a delete (a protected folder, or a library this \
              version has not fully scanned yet), the recording and its timer stay and the \
              error is logged; upstream's DeleteItem has no such refusal.",
+        ],
+    },
+    VerifiedSubsystem {
+        key: "recording-images",
+        upstream_file: "src/Jellyfin.LiveTv/Recordings/RecordingsMetadataManager.cs",
+        upstream_method: "SaveRecordingImages",
+        ferrofin: "ferrofin-livetv manager.rs start_capture (OnStarted's SaveRecordingMetadata: \
+                   spawned, as its async void does not hold the recorder up; the NFO when \
+                   SaveRecordingNFO is on, then the images when SaveRecordingImages is on, a \
+                   failed NFO ending the task as the catch-all does) -> save_recording_images: \
+                   the guide programme item the timer's facts came from \
+                   (TimerRecordingInfo.program_item_id, set by apply_program_to_recording_info; \
+                   none, like upstream's stand-in programme, saves nothing), its image rows -> \
+                   recording_metadata.rs recording_images (a series programme: Thumb ?? \
+                   Primary; otherwise Primary ?? Thumb, Backdrop, Thumb, Logo, each by \
+                   GetImageInfo(type, 0); named by the chosen image's type: Primary and Thumb \
+                   {recording stem}-thumb for a series, else poster and landscape, Backdrop \
+                   fanart, Logo logo, in the recording's folder) -> a remote image made local \
+                   through ProviderManager::cached_remote_image (ConvertImageToLocal's \
+                   download), a local one only from the internal metadata directory \
+                   (LiveTvPaths.metadata_dir) -> copy_recording_image (File.Copy with overwrite, the local \
+                   file's extension); each image's failure logged and the next one tried. \
+                   Compared with SaveRecordingMetadata, SaveRecordingImages, \
+                   SaveRecordingImage, RecordingsManager.RecordStream's OnStarted and \
+                   LibraryManager.ConvertImageToLocal at the pinned v12.4 tag.",
+        date: "2026-11-15",
+        divergences: &[
+            "The image's extension is appended to the saved name; upstream's \
+             Path.ChangeExtension cuts the name at its last dot, so an episode recorded as \
+             Dr. Who S01E01 saved its thumb as Dr.jpg, and an image file without an \
+             extension was saved with a trailing dot. Jellyfin bug not ported.",
+            "A remote image is copied from the remote-image cache and its row keeps the URL, \
+             where upstream's ConvertImageToLocal rewrites the programme's row to the \
+             downloaded file (the cache's reason is on ProviderManager::cached_remote_image); \
+             a row none of whose URLs gave an image stays, where removeOnFailure removes it, \
+             as the images row records (owner decision 2026-10-31, gl-1095).",
+            "A programme's local image row is copied only when its file is in the internal \
+             metadata directory (live_tv_image_is_internal), the rule every other read of a \
+             Live TV image row follows, since a guide supplied it; upstream copies any local \
+             file. The row is skipped and logged, and the next image tried.",
         ],
     },
     VerifiedSubsystem {
