@@ -791,6 +791,96 @@ async fn video_stream_range_request_is_206_with_content_range() {
     assert_eq!(&bytes[..], b"2345");
 }
 
+/// Headers added to a request, by name.
+type Headers<'a> = &'a [(&'static str, &'a str)];
+
+/// A static stream request (`method`) with `headers` added: status, headers
+/// and body.
+async fn static_stream(
+    router: &axum::Router,
+    method: &str,
+    headers: Headers<'_>,
+) -> (StatusCode, axum::http::HeaderMap, Vec<u8>) {
+    let mut request = authed(method, &format!("/Videos/{ITEM_ID}/stream?static=true"));
+    for (name, value) in headers {
+        request
+            .headers_mut()
+            .append(*name, value.parse().expect("header value"));
+    }
+    let (parts, body) = router.clone().oneshot(request).await.unwrap().into_parts();
+    let body = axum::body::to_bytes(body, usize::MAX).await.unwrap();
+    (parts.status, parts.headers, body.to_vec())
+}
+
+/// `PhysicalFile(…, enableRangeProcessing: true)`: `RangeHelper.ParseRange`
+/// ignores several ranges, in one header or in two, and
+/// `FileResultHelper.IfRangeValid` ignores a range whose `If-Range` no longer
+/// matches the file; either way the whole file is the answer, for `HEAD` too.
+#[tokio::test]
+async fn video_stream_ignores_several_ranges_and_a_failed_if_range() {
+    let media = TempMedia::new(b"0123456789");
+    let router = create_router(state(&media.path, no_subtitles()).app);
+    let (_, served, _) = static_stream(&router, "GET", &[("range", "bytes=2-5")]).await;
+    let modified = served[header::LAST_MODIFIED].to_str().unwrap().to_owned();
+    let etag = served[header::ETAG].to_str().unwrap().to_owned();
+    let weak = format!("W/{etag}");
+    let lower_weak = format!("w/{etag}");
+    let range = ("range", "bytes=2-5");
+    let stale = ("if-range", "Mon, 01 Jan 2001 00:00:00 GMT");
+    let (partial, whole) = (StatusCode::PARTIAL_CONTENT, StatusCode::OK);
+    let cases: &[(&str, Headers<'_>, StatusCode)] = &[
+        ("GET", &[("range", "bytes=0-1,5-6")], whole),
+        ("GET", &[("range", "bytes=0-1,abc")], whole),
+        (
+            "GET",
+            &[("range", "bytes=0-1"), ("range", "bytes=5-6")],
+            whole,
+        ),
+        ("GET", &[("range", "bytes=0-1,5-6"), stale], whole),
+        ("GET", &[range, ("if-range", &modified)], partial),
+        (
+            "GET",
+            &[range, ("if-range", "Thu, 01 Jan 2099 00:00:00 GMT")],
+            partial,
+        ),
+        ("GET", &[range, stale], whole),
+        ("HEAD", &[range, stale], whole),
+        ("HEAD", &[range, ("if-range", &modified)], partial),
+        ("GET", &[range, ("if-range", &etag)], partial),
+        ("GET", &[range, ("if-range", "\"another-file\"")], whole),
+        ("GET", &[range, ("if-range", &weak)], whole),
+        ("GET", &[range, ("if-range", &lower_weak)], whole),
+        ("GET", &[range, ("if-range", "\"unclosed")], partial),
+        ("GET", &[range, ("if-range", "W/unquoted")], partial),
+        ("GET", &[range, ("if-range", "neither")], partial),
+        ("GET", &[("range", "bytes=50-"), stale], whole),
+        ("GET", &[stale], whole),
+    ];
+    for &(method, headers, status) in cases {
+        let (got, response, body) = static_stream(&router, method, headers).await;
+        assert_eq!(got, status, "{method} {headers:?}");
+        let (length, content_range) = if status == whole {
+            (b"0123456789".as_slice(), None)
+        } else {
+            (b"2345".as_slice(), Some("bytes 2-5/10"))
+        };
+        assert_eq!(
+            response
+                .get(header::CONTENT_RANGE)
+                .map(|v| v.to_str().unwrap()),
+            content_range,
+            "{method} {headers:?}"
+        );
+        assert_eq!(
+            response[header::CONTENT_LENGTH],
+            length.len().to_string(),
+            "{method} {headers:?}"
+        );
+        let expected: &[u8] = if method == "HEAD" { b"" } else { length };
+        assert_eq!(body, expected, "{method} {headers:?}");
+    }
+}
+
 #[tokio::test]
 async fn video_stream_missing_file_is_404() {
     // The media source resolves (the DB has a path) but the file is gone —

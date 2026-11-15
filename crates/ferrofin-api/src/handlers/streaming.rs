@@ -484,16 +484,54 @@ pub(crate) async fn serve_static_file_without_ranges(
     Ok(response)
 }
 
-/// Serves the file at `path` for `request`, honouring `Range`/`HEAD`.
+/// Serves the file at `path` for `request`, honouring `Range`/`HEAD` as
+/// `PhysicalFile(…, enableRangeProcessing: true)` does.
 ///
-/// Delegates to [`tower_http::services::ServeFile`], which performs the
-/// `Range`/`HEAD`/`206 Partial Content`/`404` handling; its infallible response is
-/// mapped into an axum body. A resolution/IO failure surfaces as `404`.
-pub(crate) async fn serve_static_file(path: &str, request: Request) -> Result<Response, ApiError> {
-    let response = ServeFile::new(path)
-        .oneshot(request)
-        .await
-        .map_err(|e| ApiError::NotFound(e.to_string()))?;
+/// Delegates to [`tower_http::services::ServeFile`] (through [`serve_file`]),
+/// which performs the `Range`/`HEAD`/`206 Partial Content`/`404` handling. A
+/// resolution/IO failure surfaces as `404`.
+///
+/// Where ASP.NET's `RangeHelper.ParseRange` and `FileResultHelper.IfRangeValid`
+/// answer otherwise, the request is changed first or served again. Several
+/// ranges, in one header or in several, are ignored and the whole file served,
+/// where `ServeFile` answers `416` (or `206` for the first header). A `Range`
+/// whose `If-Range` no longer holds is ignored too: `ServeFile` never reads
+/// `If-Range`, so it is checked against the validators of its answer, and the
+/// file is served again without the range when it fails.
+pub(crate) async fn serve_static_file(
+    path: &str,
+    mut request: Request,
+) -> Result<Response, ApiError> {
+    let headers = request.headers_mut();
+    let mut ranges = headers.get_all(header::RANGE).iter();
+    if ranges
+        .next()
+        .is_some_and(|range| range.as_bytes().contains(&b','))
+        || ranges.next().is_some()
+    {
+        headers.remove(header::RANGE);
+    }
+    let if_range = headers
+        .remove(header::IF_RANGE)
+        .filter(|_| headers.contains_key(header::RANGE));
+    let whole_file = if_range.is_some().then(|| {
+        let mut whole_file = Request::new(Body::empty());
+        *whole_file.method_mut() = request.method().clone();
+        *whole_file.uri_mut() = request.uri().clone();
+        *whole_file.headers_mut() = request.headers().clone();
+        whole_file.headers_mut().remove(header::RANGE);
+        whole_file
+    });
+    let mut response = serve_file(path, request).await?;
+    if let (Some(if_range), Some(whole_file)) = (if_range, whole_file)
+        && matches!(
+            response.status(),
+            StatusCode::PARTIAL_CONTENT | StatusCode::RANGE_NOT_SATISFIABLE
+        )
+        && !if_range_valid(&if_range, response.headers())
+    {
+        response = serve_file(path, whole_file).await?;
+    }
     // A path the database resolved but the filesystem rejects otherwise
     // surfaces as a bare 404 indistinguishable from a missing route — name the
     // fs-level cause (stale NFS handle, permissions, moved file) in the log.
@@ -509,7 +547,45 @@ pub(crate) async fn serve_static_file(path: &str, request: Request) -> Result<Re
             .map_or_else(|| "unreadable".to_owned(), |e| e.to_string());
         tracing::warn!(path, error = reason, "direct-stream file is not accessible");
     }
+    Ok(response)
+}
+
+/// One [`ServeFile`] answer for `request`, its infallible response mapped into
+/// an axum body.
+async fn serve_file(path: &str, request: Request) -> Result<Response, ApiError> {
+    let response = ServeFile::new(path)
+        .oneshot(request)
+        .await
+        .map_err(|e| ApiError::NotFound(e.to_string()))?;
     Ok(response.map(Body::new))
+}
+
+/// `FileResultHelper.IfRangeValid` against the validators `served` carries: a
+/// date fails once the file's `Last-Modified` is later, an entity tag when it
+/// is not strongly equal to the `ETag`, and a value that parses as neither
+/// passes. `PhysicalFile` sends no `ETag`, so upstream never fails a tag;
+/// `ServeFile` sends one, which a client may send back.
+fn if_range_valid(if_range: &header::HeaderValue, served: &HeaderMap) -> bool {
+    let Ok(value) = if_range.to_str() else {
+        return true;
+    };
+    let weak = value.get(..2).is_some_and(|w| w.eq_ignore_ascii_case("w/"));
+    let tag = if weak { &value[2..] } else { value };
+    if tag.len() >= 2 && tag.starts_with('"') && tag.ends_with('"') {
+        return served
+            .get(header::ETAG)
+            .is_none_or(|etag| !weak && etag.as_bytes() == tag.as_bytes());
+    }
+    let date = |value: &str| httpdate::parse_http_date(value).ok();
+    match (
+        date(value),
+        served
+            .get(header::LAST_MODIFIED)
+            .and_then(|modified| date(modified.to_str().ok()?)),
+    ) {
+        (Some(since), Some(modified)) => modified <= since,
+        _ => true,
+    }
 }
 
 /// How much of a file one blocking-pool hop of [`opened_file_response`] reads.
