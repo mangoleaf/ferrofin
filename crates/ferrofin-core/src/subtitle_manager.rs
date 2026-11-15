@@ -564,21 +564,7 @@ impl SubtitleManager for FerrofinSubtitleManager {
         if !file.is_absolute() {
             return Err(folder_missing("relative path"));
         }
-        match tokio::fs::remove_file(file).await {
-            Ok(()) => Ok(()),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                let folder = file.parent().unwrap_or(file);
-                if tokio::fs::metadata(folder).await.is_ok_and(|m| m.is_dir()) {
-                    Ok(())
-                } else {
-                    Err(folder_missing("no such folder"))
-                }
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::NotADirectory => {
-                Err(folder_missing("a folder in the path is a file"))
-            }
-            Err(e) => Err(ServiceError::backend(e.to_string())),
-        }
+        settle_unlink(file, tokio::fs::remove_file(file).await, folder_missing).await
     }
 
     async fn get_supported_providers(
@@ -613,6 +599,39 @@ impl SubtitleManager for FerrofinSubtitleManager {
             .find(|p| p.name() == provider_name)
             .ok_or_else(|| ServiceError::not_found(format!("subtitle provider {provider_name}")))?;
         provider.validate_login(config_json).await
+    }
+}
+
+/// Answers an `unlink` of a subtitle file as `File.Delete` does on Linux
+/// (dotnet/runtime `FileSystem.Unix.cs` `DeleteFile`).
+async fn settle_unlink(
+    file: &Path,
+    unlinked: std::io::Result<()>,
+    folder_missing: impl Fn(&str) -> ServiceError,
+) -> Result<(), ServiceError> {
+    match unlinked {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            let folder = file.parent().unwrap_or(file);
+            if tokio::fs::metadata(folder).await.is_ok_and(|m| m.is_dir()) {
+                Ok(())
+            } else {
+                Err(folder_missing("no such folder"))
+            }
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotADirectory => {
+            Err(folder_missing("a folder in the path is a file"))
+        }
+        // A read-only mount answers `EROFS` before it looks the file up, so a
+        // file already gone is no error when an `lstat` finds nothing either
+        // (dotnet/runtime issue 22382); anything else at the path still fails.
+        Err(e) if e.kind() == std::io::ErrorKind::ReadOnlyFilesystem => {
+            match tokio::fs::symlink_metadata(file).await {
+                Err(stat) if stat.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                _ => Err(ServiceError::backend(e.to_string())),
+            }
+        }
+        Err(e) => Err(ServiceError::backend(e.to_string())),
     }
 }
 
@@ -1842,6 +1861,39 @@ mod tests {
             [format!("begin {path}"), format!("complete {path} false")]
         );
         assert!(media.exists(), "no other file is deleted");
+    }
+
+    /// gl-1724: on a read-only mount `unlink` fails a file already gone with
+    /// `EROFS`, not `ENOENT`. `File.Delete` then returns when an `lstat` of
+    /// the path fails with `ENOENT`, and throws (a `500`) for anything else:
+    /// a file, a dangling link, or an `lstat` failing otherwise (`ENOTDIR`).
+    #[cfg(unix)]
+    #[rstest::rstest]
+    #[case::file_missing("movie.fre.srt", true)]
+    #[case::file_present("movie.mkv", false)]
+    #[case::dangling_link("dangling.srt", false)]
+    #[case::folder_is_a_file("movie.mkv/missing.srt", false)]
+    #[tokio::test]
+    async fn read_only_unlink_succeeds_only_for_a_file_already_gone(
+        #[case] name: &str,
+        #[case] succeeds: bool,
+    ) {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::write(tmp.path().join("movie.mkv"), b"media").expect("write media");
+        std::os::unix::fs::symlink(tmp.path().join("gone.srt"), tmp.path().join("dangling.srt"))
+            .expect("symlink");
+        let erofs = std::io::Error::from(std::io::ErrorKind::ReadOnlyFilesystem);
+
+        let settled = settle_unlink(&tmp.path().join(name), Err(erofs), |reason: &str| {
+            ServiceError::not_found(reason)
+        })
+        .await;
+        if succeeds {
+            settled.expect("a file already gone is no error");
+        } else {
+            let error = settled.expect_err("something is at the path");
+            assert!(matches!(error, ServiceError::Backend(_)), "{error:?}");
+        }
     }
 
     /// gl-846: `DeleteSubtitles` throws an `ArgumentException`, a `400`, for an

@@ -5164,7 +5164,11 @@ pub const VERIFIED: &[Verified] = &[
                DirectoryNotFoundException 404 before any refresh; an http(s) row, which \
                Path.GetFullPath resolves against the working directory (from /, \
                http://h/a.srt → /http:/h/a.srt, a missing folder), is that 404 without \
-               touching the disk) → \
+               touching the disk; on a read-only mount, where unlink answers EROFS before \
+               it looks the file up, the file is already gone when an lstat of the path \
+               fails with ENOENT, and anything else is the 500 (DeleteFile's EROFS arm over \
+               FileSystem.Exists.Unix FileExists, dotnet/runtime issue 22382; read on \
+               release/10.0, not measured on 12.4)) → \
                handlers.rs run_item_refresh (the awaited \
                item.RefreshMetadata, whose re-probe drops the stream and renumbers the rest; \
                queued instead for an item outside every library, as for the lyrics delete). \
@@ -5173,7 +5177,7 @@ pub const VERIFIED: &[Verified] = &[
                missing and a video stream's index, a nil id, an unknown id and an external \
                sidecar's index; and that sidecar's row pointed at a missing file (204), a \
                missing folder (404, row kept) and an http URL (404, row kept)",
-        date: "2026-11-12",
+        date: "2026-11-15",
         divergences: &[
             "A hex (0x, #, &h) or padded index is a 400; upstream's route binder reads it as \
          a number. Fix path: gl-1664.",
@@ -5189,9 +5193,6 @@ pub const VERIFIED: &[Verified] = &[
          resolves one against its working directory, so a relative row whose folder exists \
          there answers 204 and deletes the file it names beside the server process (gl-1723). \
          A Jellyfin bug, deliberately not ported.",
-            "A file already gone from a read-only mount (EROFS) is a 500; File.Delete checks \
-         that the file is absent and answers it as any missing file, 204 and the refresh. Fix \
-         path: gl-1724.",
         ],
         refs: &["access-filtering"],
     },
