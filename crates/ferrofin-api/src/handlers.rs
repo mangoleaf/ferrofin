@@ -1474,7 +1474,13 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
                    handlers/images.rs image_info_dto; ferrofin-livetv manager.rs \
                    channel_image_tags (a channel has no path); user_manager.rs get_user_dto \
                    (the profile image's own path). Item paths as item_repository.rs mapped \
-                   reads them (BaseItemMapper.Map's ExpandVirtualPath). Compared with \
+                   reads them (BaseItemMapper.Map's ExpandVirtualPath), and every stored \
+                   image row through item_repository.rs image_info_from_row (the DTO page \
+                   read, GET /Items/{itemId}/Images and the scan's change detection; \
+                   BaseItemMapper.MapImageFromEntity: the path expanded, the type cast as \
+                   stored). Compared with \
+                   Jellyfin.Server.Implementations/Item/BaseItemMapper.cs \
+                   (MapImageFromEntity), \
                    Emby.Server.Implementations/Dto/DtoService.cs (GetImageCacheTag, \
                    GetPrimaryImageAspectRatio, \
                    GetTagAndFillBlurhash, GetTagsAndFillBlurhashes, AddInheritedImages, \
@@ -1529,6 +1535,12 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
                    (SavePeopleMetadataAsync, UpdateImagesAsync, ConvertImageToLocal)",
         date: "2026-11-14",
         divergences: &[
+            "A stored blurhash that is not UTF-8 reads as none, and the scan computes it \
+             again, where MapImageFromEntity's Encoding.UTF8.GetString replaces the \
+             invalid bytes with U+FFFD and sends the garbled hash. An empty one reads as \
+             none too: \
+             GetTagAndFillBlurhash drops it as well, so only GET /Items/{itemId}/Images \
+             differs, its BlurHash absent instead of \"\". Jellyfin bug not ported.",
             "Decoding and resizing run under limits upstream does not have (owner decision \
              2026-10-31, gl-1097), the settings image_decode_max_megapixels, \
              image_decode_max_memory_mb and image_resize_budget_mb, because a failed allocation, \

@@ -4461,8 +4461,11 @@ pub struct LibraryScanner {
     /// see. Absent in unit tests that don't exercise it; nothing is announced.
     change_notifier: Option<Arc<crate::library_changed_notifier::LibraryChangedNotifier>>,
     /// Expands the `%MetadataPath%`/`%AppDataPath%` tokens adopted Jellyfin
-    /// image rows store, for the local image validation's existence check.
-    /// Identity until [`with_virtual_paths`](Self::with_virtual_paths).
+    /// image rows store, for the local image validation's existence check and
+    /// the image measuring: the stored rows reach the scan expanded already
+    /// when its persistence service has the server's paths, so this matters
+    /// for one that has not. Identity until
+    /// [`with_virtual_paths`](Self::with_virtual_paths).
     virtual_paths: crate::virtual_paths::VirtualPathExpander,
     /// The `AggregateFolder` (`CreateRootFolder()`), which each library
     /// location's `Folder` row hangs off. `None` until
@@ -19912,7 +19915,9 @@ fn keep_stored_images(
 ///
 /// An adopted Jellyfin row stores `%MetadataPath%`-style tokens;
 /// `ValidateImages` checks the expanded path (`BaseItem.cs` `File.Exists`
-/// over `ExpandVirtualPath`), and so does this. A path still carrying a
+/// over `ExpandVirtualPath`), and so does this. The scan reads the stored
+/// rows expanded already, and a save keeps a row's token form while it
+/// expands to the path saved. A path still carrying a
 /// virtual-path token after expansion (a scanner not wired with
 /// `with_virtual_paths`) can't be checked, so it is kept as stored rather
 /// than dropped as missing. A remote image (not a local file) is kept as

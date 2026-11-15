@@ -53,10 +53,15 @@ fn written() -> DateTime<Utc> {
 /// Jellyfin: a poster under the metadata directory and a remote banner.
 struct Library {
     _tmp: tempfile::TempDir,
+    /// The persistence service as the server wires it, with its paths.
     persistence: Arc<FerrofinItemPersistenceService>,
+    /// The same database read without the paths: the rows as stored.
+    raw: FerrofinItemPersistenceService,
     scanner: LibraryScanner,
     processor: Arc<CountingImages>,
     movie: Uuid,
+    /// [`POSTER`] expanded, the path every read hands out.
+    poster_path: String,
 }
 
 impl Library {
@@ -82,7 +87,10 @@ impl Library {
         paths.set_internal_metadata_path(Some(metadata.to_str().expect("a UTF-8 path")));
         let db = Database::connect_in_memory().await.expect("connect");
         db.run_migrations().await.expect("migrate");
-        let persistence = Arc::new(FerrofinItemPersistenceService::new(db.clone()));
+        let persistence = Arc::new(
+            FerrofinItemPersistenceService::new(db.clone())
+                .with_virtual_paths(VirtualPathExpander::from_paths(Arc::clone(&paths))),
+        );
         let vf: Arc<dyn VirtualFolderManager> = Arc::new(
             FerrofinVirtualFolderManager::new(tmp.path().join("views"))
                 .with_item_store(persistence.clone()),
@@ -121,9 +129,11 @@ impl Library {
         Self {
             _tmp: tmp,
             persistence,
+            raw: FerrofinItemPersistenceService::new(db),
             scanner,
             processor,
             movie,
+            poster_path: poster.to_string_lossy().into_owned(),
         }
     }
 
@@ -135,21 +145,46 @@ impl Library {
             .expect("store the image rows");
     }
 
-    /// The movie's stored image rows, as stored (the scan reads them so).
+    /// The movie's stored image rows as the scan reads them: expanded.
     async fn rows(&self) -> Vec<ItemImageInfo> {
-        let mut rows = self
-            .persistence
-            .scan_stored_links(&[self.movie])
+        Self::rows_of(&self.persistence, self.movie).await
+    }
+
+    /// The poster row's path as stored.
+    async fn stored_poster_path(&self) -> String {
+        Self::rows_of(&self.raw, self.movie)
+            .await
+            .into_iter()
+            .find(|image| image.image_type == ImageType::Primary)
+            .expect("the poster row")
+            .path
+    }
+
+    async fn rows_of(store: &FerrofinItemPersistenceService, movie: Uuid) -> Vec<ItemImageInfo> {
+        let mut rows = store
+            .scan_stored_links(&[movie])
             .await
             .expect("read the rows")
-            .and_then(|mut links| links.remove(&self.movie))
+            .and_then(|mut links| links.remove(&movie))
             .map(|links| links.images)
             .unwrap_or_default();
         rows.sort_by_key(|image| image.path.clone());
         rows
     }
 
-    /// The row stored for `path`.
+    /// `image` as a read hands it out: [`POSTER`] expanded.
+    fn read(&self, image: ItemImageInfo) -> ItemImageInfo {
+        if image.path == POSTER {
+            ItemImageInfo {
+                path: self.poster_path.clone(),
+                ..image
+            }
+        } else {
+            image
+        }
+    }
+
+    /// The row read for `path`.
     async fn row(&self, path: &str) -> ItemImageInfo {
         self.rows()
             .await
@@ -206,8 +241,9 @@ fn write_image(path: &Path, width: u32, height: u32) {
 }
 
 /// The poster file was replaced since Jellyfin measured it: the rescan reads
-/// it through the expanded path, measures it and stores the file's date,
-/// with the path still in its token form. The banner is left as stored.
+/// it through the expanded path, measures it and stores the file's date in
+/// the same row, its path still in its token form. The banner is left as
+/// stored.
 #[tokio::test(flavor = "multi_thread")]
 async fn an_adopted_poster_whose_file_changed_is_measured_through_its_token() {
     let library = Library::new().await;
@@ -216,7 +252,7 @@ async fn an_adopted_poster_whose_file_changed_is_measured_through_its_token() {
 
     library.scanner.scan_all().await.expect("rescan");
 
-    let row = library.row(POSTER).await;
+    let row = library.row(&library.poster_path).await;
     assert_eq!((row.width, row.height), (40, 60));
     assert_eq!(row.date_modified, written());
     assert!(
@@ -224,6 +260,7 @@ async fn an_adopted_poster_whose_file_changed_is_measured_through_its_token() {
             .is_some_and(|hash| Some(hash) != before.blur_hash)
     );
     assert_eq!(library.row(BANNER).await, banner());
+    assert_eq!(library.stored_poster_path().await, POSTER);
 }
 
 /// Rows that agree with their files are not measured, the first rescan
@@ -242,7 +279,7 @@ async fn a_rescan_of_settled_rows_measures_nothing() {
         before,
         "a current row is kept"
     );
-    assert_eq!(library.rows().await, vec![current, banner()]);
+    assert_eq!(library.rows().await, vec![library.read(current), banner()]);
 
     library
         .adopt(&poster(300, 450, written() - chrono::Duration::days(30)))

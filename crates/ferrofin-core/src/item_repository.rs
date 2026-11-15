@@ -3013,8 +3013,9 @@ const ALL_ARTIST_TYPES: &[ItemValueType] = &[ItemValueType::Artist, ItemValueTyp
 
 /// Maps the `BaseItemImageInfos.ImageType` integer discriminant to the wire
 /// [`ImageType`]. The discriminants are the fixed `ImageInfoImageType` values and
-/// line up 1:1 with [`ImageType`]; an out-of-range value falls back to
-/// [`ImageType::Primary`] (the C# default when parsing a legacy row).
+/// line up 1:1 with [`ImageType`]; an out-of-range value is kept as
+/// [`ImageType::Unrecognized`], as upstream's `(ImageType)e.ImageType` cast
+/// keeps it (`BaseItemMapper.MapImageFromEntity`).
 pub(crate) fn image_type_from_disc(disc: i32) -> ImageType {
     ImageType::from_json_value(disc)
 }
@@ -3042,12 +3043,14 @@ pub(crate) fn images_of_items_sql(placeholders: &str) -> String {
 }
 
 /// Projects a persisted [`BaseItemImageInfoEntity`] row into an
-/// [`ItemImageInfo`].
+/// [`ItemImageInfo`], its `%MetadataPath%`-style path expanded: upstream's
+/// `BaseItemMapper.MapImageFromEntity`, which every reader of an image row
+/// goes through (the repository, the DTO batch read, the scan's reads).
 ///
 /// The stored `Blurhash` is a UTF-8 byte blob; an empty blob (or one that is not
 /// valid UTF-8) becomes [`None`]. A zero/negative width or height (the "unknown"
 /// sentinel) is preserved as-is; the API layer nulls those out per Jellyfin.
-fn image_info_from_row(
+pub(crate) fn image_info_from_row(
     row: BaseItemImageInfoEntity,
     virtual_paths: &VirtualPathExpander,
 ) -> ItemImageInfo {
@@ -5085,6 +5088,40 @@ mod tests {
     use ferrofin_model::data::BaseItemKind;
     use ferrofin_model::entities::ExtraType;
     use ferrofin_traits::persistence::ItemPersistenceService;
+
+    /// `MapImageFromEntity`: the type is cast as stored, an unknown one kept;
+    /// an empty or non-UTF-8 blurhash reads as none; no stored date is the
+    /// epoch.
+    #[rstest::rstest]
+    #[case::known_type(1, Some(b"LKO2".to_vec()), ImageType::Art, Some("LKO2"))]
+    #[case::unknown_type_kept(99, None, ImageType::Unrecognized(99), None)]
+    #[case::empty_blurhash(0, Some(Vec::new()), ImageType::Primary, None)]
+    #[case::non_utf8_blurhash(0, Some(vec![0xFF, 0xFE]), ImageType::Primary, None)]
+    fn an_image_row_maps_as_upstream_reads_it(
+        #[case] disc: i32,
+        #[case] blurhash: Option<Vec<u8>>,
+        #[case] image_type: ImageType,
+        #[case] blur_hash: Option<&str>,
+    ) {
+        let row = BaseItemImageInfoEntity {
+            id: "id".to_owned(),
+            blurhash,
+            date_modified: None,
+            height: 2,
+            image_type: disc,
+            item_id: "item".to_owned(),
+            path: "/m/poster.jpg".to_owned(),
+            width: 3,
+        };
+        let image = image_info_from_row(row, &VirtualPathExpander::identity());
+        assert_eq!(image.image_type, image_type);
+        assert_eq!(image.blur_hash.as_deref(), blur_hash);
+        assert_eq!(image.date_modified, default_epoch());
+        assert_eq!(
+            (image.path.as_str(), image.width, image.height),
+            ("/m/poster.jpg", 3, 2)
+        );
+    }
 
     /// The batched image read answers each item exactly as `get_image_infos`
     /// does (by type, then insertion order), and leaves out an item with no
