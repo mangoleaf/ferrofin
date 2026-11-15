@@ -4800,6 +4800,50 @@ pub const VERIFIED: &[Verified] = &[
         refs: &["access-filtering"],
     },
     Verified {
+        method: "post",
+        path: "/Playlists/{itemId}/Users/{userId}",
+        upstream_file: "Jellyfin.Api/Controllers/PlaylistsController.cs",
+        upstream_method: "UpdatePlaylistUser",
+        ferrofin: "handlers/playlists.rs update_playlist_user (the body through \
+               Option<JsonBody>, as [FromBody(EmptyBodyBehavior = EmptyBodyBehavior.Allow), \
+               Required] binds it: an empty body whatever the content type, or null with a \
+               JSON one, binds null and is [Required]'s 400 keyed \"\" before the action; \
+               with a JSON content type a blank or malformed body is the binder's 400 with \
+               the parameter's entry, and any non-empty body with another content type is \
+               the 415; get_playlist_access: GetPlaylistForUser for the caller, a nil \
+               caller id a 400; the owner check's Forbid) → ferrofin-model playlists.rs \
+               UpdatePlaylistUserDto (CanEdit bool?) → ferrofin-core collection_manager.rs \
+               FerrofinPlaylistManager::add_user_to_shares (PlaylistManager.AddUserToShares: \
+               require_user, GetUserById(Guid.Empty)'s 400 for a nil target; \
+               item_data::share_playlist_in removes the user's share and appends one with \
+               CanEdit ?? false; the Data sync and announce_updated for \
+               UpdateToRepositoryAsync. UpdatePlaylistInternal's SavePlaylistFile is \
+               unreachable on both: a scanned playlist file has no owner, so the owner check \
+               refuses it first)",
+        date: "2026-11-15",
+        divergences: &[
+            "A target user the playlist is hidden from (a private playlist not shared with \
+         them, a parental rating limit no member passes) or one that does not exist is given \
+         the share. Upstream's AddUserToShares looks the playlist up for the target user \
+         (GetPlaylistForUser(request.Id, userId)), finds none and throws \
+         NullReferenceException, so it answers 500 and writes nothing: only a user who can \
+         already see the playlist can be added there (measured on Jellyfin 12.4.0 for a \
+         private playlist and an unknown id). Jellyfin bug not ported.",
+            "UpdateToRepositoryAsync runs the metadata savers, and PlaylistXmlSaver (enabled \
+         for a Playlist at MetadataEdit) rewrites the playlist folder's playlist.xml with the \
+         new Shares (measured on Jellyfin 12.4.0); Ferrofin writes no playlist.xml. Fix path: \
+         gl-341.",
+            "A user named twice in the shares has one entry here, which a re-share replaces; \
+         upstream removes only the first of their entries and appends the new one, so the \
+         second keeps its permission. Fix path: gl-949.",
+            "The 400 (a nil target user id, an API key naming no user), 403 (not the owner) \
+         and 404 (no playlist the caller can see) bodies are Ferrofin's error shape, not \
+         upstream's (\"Error processing request.\", an empty Forbid and a \"Playlist not \
+         found\" string). Fix path: gl-666.",
+        ],
+        refs: &[],
+    },
+    Verified {
         method: "get",
         path: "/Environment/DirectoryContents",
         upstream_file: "Jellyfin.Api/Controllers/EnvironmentController.cs",
