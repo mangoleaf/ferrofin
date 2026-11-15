@@ -108,6 +108,43 @@ fn try_parse_invalid_ip_strings_false(#[case] address: &str) {
     assert!(net_utils::try_parse_to_subnet(address, false).is_none());
 }
 
+/// `TryParseToSubnet` reads an address with `IPAddress.TryParse`, so the old
+/// numeric IPv4 spellings name the same networks they do on Jellyfin, and an
+/// unspecified one is the whole address space, as `IPAddress.Any` is there.
+#[rstest]
+#[case("10.6", "10.0.0.6/32")]
+#[case("0x0a000005", "10.0.0.5/32")]
+#[case("10.0.0.07", "10.0.0.7/32")]
+#[case("0xa.0x2.0/16", "10.2.0.0/16")]
+#[case("0", "0.0.0.0/0")]
+fn numeric_ipv4_spellings_parse_to_subnets(#[case] value: &str, #[case] expected: &str) {
+    let (address, prefix) = expected.split_once('/').expect("a network");
+    let subnet = net_utils::try_parse_to_subnet(value, false)
+        .expect("parses")
+        .subnet;
+    assert_eq!(
+        (subnet.base_address, subnet.prefix_length),
+        (
+            address.parse::<IpAddr>().expect("address"),
+            prefix.parse::<u8>().expect("prefix")
+        ),
+        "{value}"
+    );
+}
+
+/// `TryParseHost` reads an address, with or without a port, the same way.
+#[rstest]
+#[case("10.6", "10.0.0.6")]
+#[case("10.6:8096", "10.0.0.6")]
+#[case("0x0a000005", "10.0.0.5")]
+fn numeric_ipv4_spellings_parse_as_hosts(#[case] host: &str, #[case] expected: &str) {
+    assert_eq!(
+        net_utils::try_parse_host_with(host, true, false, |_| None),
+        Some(vec![expected.parse::<IpAddr>().expect("expected")]),
+        "{host}"
+    );
+}
+
 /// `TryParseToSubnets_InvalidEntries_LogsWarnings`.
 #[test]
 fn try_parse_to_subnets_invalid_entries_logs_warnings() {
@@ -495,6 +532,14 @@ fn get_bind_address_published_server_override_parses_host_and_port(
 )]
 #[case("185.10.10.10", "185.10.10.10", RemoteAccessPolicyResult::Allow)]
 #[case("", "100.100.100.100", RemoteAccessPolicyResult::Allow)]
+// Not upstream's cases: `InitializeRemote` reads a bare entry with
+// `IPAddress.TryParse`, so an old numeric spelling names its address.
+#[case("185.2570", "185.0.10.10", RemoteAccessPolicyResult::Allow)]
+#[case(
+    "185.2570",
+    "185.0.10.11",
+    RemoteAccessPolicyResult::RejectDueToNotAllowlistedRemoteIp
+)]
 fn has_remote_access_given_whitelist_allows_only_ips_in_whitelist(
     #[case] addresses: &str,
     #[case] remote_ip: &str,
