@@ -54,34 +54,30 @@ pub fn normalize_ip(ip: std::net::IpAddr) -> std::net::IpAddr {
     }
 }
 
-/// The `X-Forwarded-For` entries the client-address walk can reach, left to
-/// right as sent: the ones right of the rightmost entry that does not parse as
-/// an address.
+/// The `X-Forwarded-For` chain the client-address walk steps through, nearest
+/// hop first: the entries from the right, up to the first that does not parse
+/// as an address.
 ///
 /// ASP.NET's `ApplyForwarders` walks the entries from the right while the
 /// address it trusts so far is a known proxy, and stops at the first one that
 /// does not parse ("Stop at the first unparsable IP"), keeping the last
 /// address it trusted. No entry left of that one is ever reached, so none is
-/// returned. A known proxy that writes an obfuscated token for its client
+/// yielded. A known proxy that writes an obfuscated token for its client
 /// (Squid's `unknown`) therefore leaves the proxy as the client, and the
 /// entries before the token, which that client wrote itself, cannot be taken
 /// for its address.
 ///
 /// The entries are split and unquoted as `GetCommaSeparatedValues` does, the
 /// list [`walk_forwarded_headers`](crate::forwarded_headers::walk_forwarded_headers)
-/// walks for the scheme and host. A port may be appended to an entry
-/// (`203.0.113.9:41234`), and an IPv6 entry may be bracketed; both spellings
-/// are read.
-#[must_use]
-pub fn forwarded_for(headers: &axum::http::HeaderMap) -> Vec<std::net::IpAddr> {
-    let entries = crate::forwarded_headers::comma_separated_values(headers, "x-forwarded-for");
-    let mut reachable: Vec<std::net::IpAddr> = entries
-        .iter()
-        .rev()
-        .map_while(|entry| parse_forwarded_entry(entry))
-        .collect();
-    reachable.reverse();
-    reachable
+/// walks for the scheme and host, and read lazily: the walk reads only the
+/// entries it reaches, none for a peer that is not a known proxy. A port may
+/// be appended to an entry (`203.0.113.9:41234`), and an IPv6 entry may be
+/// bracketed; both spellings are read.
+pub fn forwarded_for(
+    headers: &axum::http::HeaderMap,
+) -> impl Iterator<Item = std::net::IpAddr> + '_ {
+    crate::forwarded_headers::entries_from_right(headers, "x-forwarded-for")
+        .map_while(|entry| parse_forwarded_entry(&entry))
 }
 
 /// One `X-Forwarded-For` entry as an address: port of .NET's
@@ -880,7 +876,7 @@ impl AppState {
             .map_or(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), |ci| {
                 normalize_ip(ci.0.ip())
             });
-        self.client_address_for(peer, &forwarded_for(headers))
+        self.client_address_for(peer, headers)
     }
 
     /// [`walk_forwarded_headers`](crate::forwarded_headers::walk_forwarded_headers)
@@ -907,18 +903,19 @@ impl AppState {
         }
     }
 
-    /// [`Self::client_address`] over an already-extracted peer and chain, so the
-    /// middleware (which holds a `Request`, not `Parts`) shares the one rule.
+    /// [`Self::client_address`] over an already-extracted peer and the request's
+    /// headers, so the middleware (which holds a `Request`, not `Parts`) shares
+    /// the one rule.
     #[must_use]
     pub fn client_address_for(
         &self,
         peer: std::net::IpAddr,
-        forwarded_for: &[std::net::IpAddr],
+        headers: &axum::http::HeaderMap,
     ) -> std::net::IpAddr {
         crate::forwarded_headers::client_address_through(
             self.inner.network.as_deref(),
             peer,
-            forwarded_for,
+            headers,
         )
     }
 

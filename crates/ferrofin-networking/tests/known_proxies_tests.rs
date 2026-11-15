@@ -69,7 +69,7 @@ fn known_proxies_parse_as_add_proxy_addresses_does(
 fn a_proxy_named_by_host_name_vouches_for_its_client() {
     let nm = manager_with(&["localhost"], true, true);
     assert_eq!(
-        nm.client_address(ip("127.0.0.1"), &[ip("203.0.113.7")]),
+        nm.client_address(ip("127.0.0.1"), [ip("203.0.113.7")]),
         ip("203.0.113.7")
     );
 }
@@ -108,7 +108,7 @@ fn a_configured_list_also_trusts_the_loopback_defaults() {
         let nm = manager_with(proxies, true, true);
         for loopback in ["127.0.0.1", "127.8.9.10", "::1"] {
             assert_eq!(
-                nm.client_address(ip(loopback), &[ip("203.0.113.7")]),
+                nm.client_address(ip(loopback), [ip("203.0.113.7")]),
                 ip("203.0.113.7"),
                 "{proxies:?} {loopback}"
             );
@@ -116,7 +116,7 @@ fn a_configured_list_also_trusts_the_loopback_defaults() {
     }
     let nm = manager_with(&[], true, true);
     assert_eq!(
-        nm.client_address(ip("127.0.0.1"), &[ip("203.0.113.7")]),
+        nm.client_address(ip("127.0.0.1"), [ip("203.0.113.7")]),
         ip("127.0.0.1")
     );
 }
@@ -232,7 +232,7 @@ fn an_ipv4_mapped_proxy_is_recognised() {
 fn without_known_proxies_the_chain_is_ignored() {
     let nm = manager(&[]);
     assert_eq!(
-        nm.client_address(ip("10.4.0.9"), &[ip("203.0.113.7")]),
+        nm.client_address(ip("10.4.0.9"), [ip("203.0.113.7")]),
         ip("10.4.0.9")
     );
 }
@@ -242,7 +242,7 @@ fn without_known_proxies_the_chain_is_ignored() {
 fn a_known_proxy_s_client_is_the_client() {
     let nm = manager(&["10.0.0.0/8"]);
     assert_eq!(
-        nm.client_address(ip("10.4.0.9"), &[ip("203.0.113.7")]),
+        nm.client_address(ip("10.4.0.9"), [ip("203.0.113.7")]),
         ip("203.0.113.7")
     );
 }
@@ -253,13 +253,13 @@ fn a_known_proxy_s_client_is_the_client() {
 fn the_walk_stops_at_the_first_unknown_hop() {
     let nm = manager(&["10.0.0.0/8"]);
     assert_eq!(
-        nm.client_address(ip("10.4.0.9"), &[ip("198.51.100.1"), ip("203.0.113.7")]),
+        nm.client_address(ip("10.4.0.9"), [ip("203.0.113.7"), ip("198.51.100.1")]),
         ip("203.0.113.7"),
-        "the rightmost entry is the one the proxy vouched for"
+        "the nearest hop (the rightmost entry) is the one the proxy vouched for"
     );
     // A chain of proxies IS walked through, to the client behind them.
     assert_eq!(
-        nm.client_address(ip("10.4.0.9"), &[ip("203.0.113.7"), ip("10.9.9.9")]),
+        nm.client_address(ip("10.4.0.9"), [ip("10.9.9.9"), ip("203.0.113.7")]),
         ip("203.0.113.7"),
         "a hop that is itself a proxy keeps the walk going"
     );
@@ -270,7 +270,7 @@ fn the_walk_stops_at_the_first_unknown_hop() {
 fn a_stranger_cannot_forge_its_own_address() {
     let nm = manager(&["10.0.0.0/8"]);
     assert_eq!(
-        nm.client_address(ip("198.51.100.4"), &[ip("203.0.113.7")]),
+        nm.client_address(ip("198.51.100.4"), [ip("203.0.113.7")]),
         ip("198.51.100.4")
     );
 }
@@ -280,5 +280,5 @@ fn a_stranger_cannot_forge_its_own_address() {
 #[test]
 fn a_known_proxy_with_no_chain_is_itself() {
     let nm = manager(&["10.0.0.0/8"]);
-    assert_eq!(nm.client_address(ip("10.4.0.9"), &[]), ip("10.4.0.9"));
+    assert_eq!(nm.client_address(ip("10.4.0.9"), []), ip("10.4.0.9"));
 }
