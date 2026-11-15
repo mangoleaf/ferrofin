@@ -239,13 +239,7 @@ fn static_source(path: &str) -> MediaSourceInfo {
         id: Some(ITEM_ID.to_string()),
         path: Some(path.to_owned()),
         // A remote target (a `.strm` shortcut's) is read over its own protocol.
-        protocol: if path.starts_with("http") {
-            MediaProtocol::Http
-        } else if path.starts_with("rtsp") {
-            MediaProtocol::Rtsp
-        } else {
-            MediaProtocol::File
-        },
+        protocol: ferrofin_model::media_info::path_protocol(path),
         is_remote: !path.starts_with('/'),
         type_: MediaSourceType::Default,
         supports_direct_play: true,

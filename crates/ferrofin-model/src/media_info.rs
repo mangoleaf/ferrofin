@@ -72,8 +72,8 @@ crate::json::enums::wire_enum! {
 /// `MediaSourceManager.GetPathProtocol`: the protocol a path or URL is read
 /// over. An empty path is a file; then the first of `rtsp`, `rtmp`, `http`,
 /// `rtp`, `ftp` and `udp` the path starts with, in any case; then a path that
-/// `IFileSystem.IsPathFile` says is no file (a `scheme://` other than
-/// `file://`) is HTTP.
+/// `IFileSystem.IsPathFile` says is no file (it contains `://` anywhere and
+/// does not start with `file://`) is HTTP.
 #[must_use]
 pub fn path_protocol(path: &str) -> MediaProtocol {
     const PREFIXES: [(&str, MediaProtocol); 6] = [
@@ -487,8 +487,8 @@ mod tests {
 
     /// v12.4 `MediaSourceManager.GetPathProtocol` (:240-278) over
     /// `ManagedFileSystem.IsPathFile` (:533-542): a prefix match, not a scheme
-    /// match, so `httpfoo` is HTTP and `ftps://` FTP, and any other
-    /// `scheme://` is HTTP.
+    /// match, so `httpfoo` is HTTP and `ftps://` FTP, and any other path
+    /// containing `://` (not after a leading `file`) is HTTP.
     #[rstest::rstest]
     #[case("", MediaProtocol::File)]
     #[case("/media/a.mkv", MediaProtocol::File)]
@@ -510,6 +510,7 @@ mod tests {
     #[case("mms://h/a", MediaProtocol::Http)]
     #[case(" http://h/a", MediaProtocol::Http)]
     #[case("é://h/a", MediaProtocol::Http)]
+    #[case("/media/a://b.mkv", MediaProtocol::Http)]
     #[case("r", MediaProtocol::File)]
     fn the_protocol_follows_the_path_prefix(#[case] path: &str, #[case] expected: MediaProtocol) {
         assert_eq!(path_protocol(path), expected);
