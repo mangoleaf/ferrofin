@@ -12334,10 +12334,14 @@ impl LibraryScanner {
     /// The title is fetched by the `Tmdb` id in the lookup, else resolved
     /// through `/find` by its IMDb id (a series also by its TVDB id), and
     /// searched by its parsed name ([`video_resolver::parse_name`]) only
-    /// without any of them — so a `Tmdb` id a provider that ran before it found
-    /// (TVDB's remote ids) spares the search. Its answer carries the title's
-    /// IMDb id and, for a series, its TVDB id (`TmdbSeriesProvider.cs:306-312`),
-    /// which the providers after it resolve by.
+    /// when that resolves nothing — so a `Tmdb` id a provider that ran before
+    /// it found (TVDB's remote ids) spares the search. A movie is searched only
+    /// without an IMDb id: one `/find` does not resolve leaves it without
+    /// TMDB's metadata (`TmdbMovieProvider.cs:160,178-190`), where a series
+    /// goes on to the search (`TmdbSeriesProvider.cs:178-213`). Its answer
+    /// carries the title's IMDb id and, for a series, its TVDB id
+    /// (`TmdbSeriesProvider.cs:306-312`), which the providers after it
+    /// resolve by.
     async fn fetch_tmdb_metadata(
         &self,
         row: &BaseItemEntity,
@@ -12375,6 +12379,12 @@ impl LibraryScanner {
         };
         let tmdb_id = if let Some(id) = pinned {
             id
+        } else if kind == TmdbKind::Movie
+            && imdb_id_in(known_ids).is_some_and(|id| !id.trim().is_empty())
+        {
+            // An IMDb id TMDB cannot resolve is no reason to guess the film by
+            // its title: `GetMetadata` returns an empty result.
+            return None;
         } else {
             // "ParseName is required here" (`TmdbMovieProvider.cs:162-170`,
             // `TmdbSeriesProvider.cs:201-208`): the name is a file or folder

@@ -2187,7 +2187,8 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
                    episode_extras_for_language and episode_people_from (guest stars); \
                    ferrofin-core library_scan.rs fetch_tmdb_metadata (a pinned TMDb id, else \
                    find_tmdb_id's /find by an IMDb id, a series also by its TVDB id, else the \
-                   parsed-name search and find_best_match), apply_details (a movie's overview \
+                   parsed-name search and find_best_match, for a movie only without an IMDb \
+                   id), apply_details (a movie's overview \
                    with its blank lines collapsed), fetch_tmdb_season \
                    with ferrofin-providers season.rs tmdb_answer (ImportSeasonName), and \
                    fetch_tmdb_episode with apply_tmdb_episode; for an episode the provider \
@@ -2200,7 +2201,7 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
                    and its image providers, the other providers (TheTVDB, OMDb, MusicBrainz, \
                    TheAudioDB; gl-1815) and the merge onto the item (gl-1813) are not part of \
                    this row.",
-        date: "2026-11-14",
+        date: "2026-11-15",
         divergences: &[
             "A TMDb video with no key is dropped where upstream stores the dead link \
              https://www.youtube.com/watch?v=, and an episode's trailer URL already added is \
@@ -2209,8 +2210,6 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
             "A blank content rating is skipped; upstream takes a blank own-country series \
              rating (storing a bare country prefix such as GB-) and lets a blank US one \
              block its first-entry fallback. Jellyfin bug not ported.",
-            "A movie whose IMDb id TMDb's /find cannot resolve is searched by name; upstream \
-             returns no metadata for it. Fix path: gl-1783.",
             "An episode is looked up in aired order whatever the series' display order; \
              upstream maps an absolute, DVD, digital, story-arc, production, TV or \
              original-air-date order through TMDb's episode group. Fix path: gl-1784.",
