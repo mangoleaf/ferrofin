@@ -60,6 +60,8 @@ use ferrofin_util::stable_sort::stable_sort_by;
 use crate::library_scan::{LaneRefresh, PriorityLane, ScanCancel, ScanPasses, ScanRun};
 use ferrofin_traits::library::ScanProgressSink;
 
+mod user_view_builder;
+
 /// The placeholder item row seeded by the initial migration, which every real
 /// item query excludes (the `Uuid` form of
 /// [`PLACEHOLDER_ID`](crate::translate_query::PLACEHOLDER_ID),
@@ -3023,6 +3025,14 @@ impl LibraryManager for FerrofinLibraryManager {
             return Ok(result);
         }
         self.items.get_items(query).await
+    }
+
+    async fn apply_user_view_builder(
+        &self,
+        query: &mut InternalItemsQuery,
+        view: &BaseItemEntity,
+    ) -> Result<(Option<BaseItemKind>, bool), ServiceError> {
+        self.user_view_builder(query, view).await
     }
 
     async fn get_item_ids(&self, query: &InternalItemsQuery) -> Result<Vec<Uuid>, ServiceError> {

@@ -628,6 +628,48 @@ pub trait LibraryManager: Send + Sync {
         query: &InternalItemsQuery,
     ) -> Result<QueryResult<BaseItemEntity>, ServiceError>;
 
+    /// `UserView.GetItemsInternal` → `UserViewBuilder.GetUserItems`
+    /// (`UserView.cs:96-109`) for a browse whose parent is the user view
+    /// `view`: rewrites `query` as the view's builder runs it, and returns the
+    /// kind the browse reports as its parent ([`InternalItemsQuery::parent_type`])
+    /// and whether Folder's display policy applies
+    /// ([`InternalItemsQuery::apply_folder_display_options`]). The folder a
+    /// view shows is its `DisplayParentId`, else its `ParentId`. By `ViewType`:
+    ///
+    /// - a direct builder (`GetMovieMovies`, `GetTvSeries`, `GetBooks`, and
+    ///   the other builders that select items without Folder's policy) sets
+    ///   its own kinds and recursion, if it has any, and reports the view
+    ///   itself, with no Folder policy;
+    /// - a `movies` or `tvshows` view browsed recursively runs Folder's
+    ///   recursive query, with the view's default kinds when the request
+    ///   names none, and reports the kind of the folder it shows (the view's
+    ///   own when there is none), with Folder policy. Browsed without
+    ///   `recursive` it is left as asked and reports itself, with no Folder
+    ///   policy;
+    /// - any other view reports the kind of the folder it shows, with Folder
+    ///   policy unless that folder is a channel or in one. A non-recursive
+    ///   browse, and any browse of a Season, moves `query` onto that folder
+    ///   (`parent_id` and `parent_row`, clearing `user_root_children`); a
+    ///   recursive one stays on the view.
+    ///   With no such folder, or one that is gone, the view is left as asked
+    ///   and reports itself, with no Folder policy.
+    ///
+    /// The caller has checked that the user may open `view`. `GET /Items`
+    /// runs this before the controller's own rewrites (the container re-root,
+    /// the playlists and library defaults), which read what it leaves.
+    ///
+    /// Managers must supply the builders; the default fails closed.
+    async fn apply_user_view_builder(
+        &self,
+        query: &mut InternalItemsQuery,
+        view: &BaseItemEntity,
+    ) -> Result<(Option<BaseItemKind>, bool), ServiceError> {
+        let _ = (query, view);
+        Err(ServiceError::backend(
+            "user view browsing is not configured",
+        ))
+    }
+
     /// Returns just the ids of the items matching the query.
     async fn get_item_ids(&self, query: &InternalItemsQuery) -> Result<Vec<Uuid>, ServiceError>;
 

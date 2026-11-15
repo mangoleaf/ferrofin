@@ -765,7 +765,7 @@ async fn get_items(
     // Reuse the already-loaded parent for SourceType and UserView dispatch;
     // only source consumers that call Folder's policy inherit global flags.
     internal.apply_folder_display_options = folder_policy;
-    redirect_container_browse(&state, &mut internal).await;
+    redirect_container_browse(&mut internal);
     // After the re-root, as upstream: it decides on the requested types and
     // these rewrites on the folder that results.
     list_playlists_folder_as_playlists(&mut internal);
@@ -1995,14 +1995,15 @@ fn is_direct_children_browse(short_type_name: &str) -> bool {
 /// `IsVisible`. A container-only browse is held to the parent it names too.
 /// Whether the parent is itself a library, and a `boxsets` one, is left in
 /// `library` for the library browse defaults ([`apply_library_browse_defaults`]).
+/// A user view's browse runs its builder in the library manager
+/// ([`LibraryManager::apply_user_view_builder`](ferrofin_traits::library::LibraryManager::apply_user_view_builder)),
+/// which rewrites the query and answers the parent kind and folder policy.
 async fn check_parent_visibility(
     state: &AppState,
     auth: &AuthorizationInfo,
     query: &mut InternalItemsQuery,
     library: &mut Option<bool>,
 ) -> Result<(Option<BaseItemKind>, bool), ApiError> {
-    use ferrofin_model::data::CollectionType;
-
     if query.parent_id.is_nil() {
         return Ok((None, true));
     }
@@ -2052,101 +2053,10 @@ async fn check_parent_visibility(
         *library = library_is_boxsets(&parent);
         return Ok((kind_from(&parent), !is_channel(&parent)));
     }
-
-    // UserViewBuilder's movie/TV recursive base views call QueryRecursive;
-    // folders/direct repository/subnavigation builders do not auto-collapse.
-    // ViewType belongs to the parent row already read for access, including
-    // adopted numeric values; it is never a new client preference.
-    let (view_type, parent_id) = user_view_browse_context(&parent);
-    let direct = user_view_uses_direct_items(view_type);
-    if direct {
-        // These simple direct builders (`GetMovieMovies`, `GetTvSeries`,
-        // `GetBooks`) set their kinds and recursive mode regardless of the
-        // request, then forward explicit collapse to SQL. Their automatic
-        // global grouping policy is intentionally absent.
-        if let Some(kinds) = match view_type {
-            Some(CollectionType::Moviemovies) => Some(vec![BaseItemKind::Movie]),
-            Some(CollectionType::Tvshowseries) => Some(vec![BaseItemKind::Series]),
-            Some(CollectionType::books) => Some(vec![BaseItemKind::Book, BaseItemKind::AudioBook]),
-            _ => None,
-        } {
-            query.include_item_types = kinds;
-            query.recursive = true;
-            query.user_root_children = false;
-        }
-        return Ok((kind_from(&parent), false));
-    }
-    if matches!(
-        view_type,
-        Some(CollectionType::movies | CollectionType::tvshows)
-    ) {
-        if !query.recursive {
-            return Ok((kind_from(&parent), false));
-        }
-        query.folder_query_recursive = true;
-        if query.include_item_types.is_empty() {
-            query.include_item_types = if view_type == Some(CollectionType::movies) {
-                vec![BaseItemKind::Movie]
-            } else {
-                vec![
-                    BaseItemKind::Series,
-                    BaseItemKind::Season,
-                    BaseItemKind::Episode,
-                ]
-            };
-        }
-        if let Some(parent_id) = parent_id
-            && let Some(query_parent) = state.library.get_item_by_id(parent_id).await?
-        {
-            return Ok((kind_from(&query_parent), true));
-        }
-        return Ok((kind_from(&parent), true));
-    }
-    // The default builder delegates to its actual display/relational parent
-    // when one exists; an unparented UserView uses GetResult over media-folder
-    // children and has no automatic grouping policy.
-    if let Some(parent_id) = parent_id
-        && let Some(query_parent) = state.library.get_item_by_id(parent_id).await?
-    {
-        let (kind, folder_policy) = (kind_from(&query_parent), !is_channel(&query_parent));
-        if !query.recursive || kind == Some(BaseItemKind::Season) {
-            // A default view delegates to that Season's GetItemsInternal even
-            // for recursive requests; its aired selection needs the real row.
-            query.parent_id = parent_id;
-            query.user_root_children = false;
-            query.parent_row = Some(Arc::new(query_parent));
-        }
-        return Ok((kind, folder_policy));
-    }
-    Ok((kind_from(&parent), false))
-}
-
-/// Read UserView dispatch data from the parent already loaded for visibility.
-fn user_view_browse_context(
-    parent: &BaseItemEntity,
-) -> (Option<ferrofin_model::data::CollectionType>, Option<Uuid>) {
-    use ferrofin_model::data::CollectionType;
-    let data: serde_json::Value = parent
-        .data
-        .as_deref()
-        .and_then(|data| serde_json::from_str(data).ok())
-        .unwrap_or_default();
-    let view_type = data
-        .get("ViewType")
-        .and_then(CollectionType::from_data_member);
-    let parent_id = data
-        .get("DisplayParentId")
-        .and_then(serde_json::Value::as_str)
-        .and_then(|id| Uuid::parse_str(id).ok())
-        .filter(|id| !id.is_nil())
-        .or_else(|| {
-            parent
-                .parent_id
-                .as_deref()
-                .and_then(|id| Uuid::parse_str(id).ok())
-                .filter(|id| !id.is_nil())
-        });
-    (view_type, parent_id)
+    Ok(state
+        .library
+        .apply_user_view_builder(query, &parent)
+        .await?)
 }
 
 /// When the requested parent is itself a library (`ICollectionFolder`),
@@ -2161,33 +2071,6 @@ fn library_is_boxsets(parent: &BaseItemEntity) -> Option<bool> {
     })
 }
 
-/// These UserView builders use direct item selection rather than Folder policy.
-fn user_view_uses_direct_items(view_type: Option<ferrofin_model::data::CollectionType>) -> bool {
-    use ferrofin_model::data::CollectionType;
-    matches!(
-        view_type,
-        Some(
-            CollectionType::folders
-                | CollectionType::books
-                | CollectionType::Tvshowseries
-                | CollectionType::Tvgenres
-                | CollectionType::Tvgenre
-                | CollectionType::Tvlatest
-                | CollectionType::Tvnextup
-                | CollectionType::Tvresume
-                | CollectionType::Tvfavoriteseries
-                | CollectionType::Tvfavoriteepisodes
-                | CollectionType::Movielatest
-                | CollectionType::Movieresume
-                | CollectionType::Moviemovies
-                | CollectionType::Moviecollection
-                | CollectionType::Moviefavorites
-                | CollectionType::Moviegenres
-                | CollectionType::Moviegenre
-        )
-    )
-}
-
 /// Re-roots a BoxSet/Playlist-typed browse onto the user root (port of
 /// `ItemsController.GetItems`'s `linkedChildAncestorIds` block): from a normal
 /// library parent with a linked-child-ancestor constraint, from the Playlists
@@ -2197,13 +2080,10 @@ fn user_view_uses_direct_items(view_type: Option<ferrofin_model::data::Collectio
 /// Applies only when the request is for exactly `[BoxSet]` or `[Playlist]`,
 /// a parent is set, and that parent is not itself a box set/playlist (nor,
 /// for a playlist browse, the playlists folder). A re-rooted query takes the
-/// user root's folder policy. Best-effort:
-/// an unresolvable parent leaves the query untouched (the plain parent scoping
-/// then returns empty, as before).
-async fn redirect_container_browse(
-    state: &AppState,
-    internal: &mut ferrofin_traits::options::InternalItemsQuery,
-) {
+/// user root's folder policy. It works on the parent row
+/// [`check_parent_visibility`] left on the query (which refuses a parent that
+/// does not exist).
+fn redirect_container_browse(internal: &mut ferrofin_traits::options::InternalItemsQuery) {
     use ferrofin_model::data::BaseItemKind;
     use ferrofin_model::entities::CollectionTypeOptions;
 
@@ -2215,16 +2095,8 @@ async fn redirect_container_browse(
         [BaseItemKind::Playlist] => None,
         _ => return,
     };
-    if internal.parent_id.is_nil() {
+    let Some(parent) = internal.known_parent_row().map(Arc::clone) else {
         return;
-    }
-    let parent = if let Some(row) = internal.known_parent_row() {
-        Arc::clone(row)
-    } else {
-        let Ok(Some(row)) = state.library.get_item_by_id(internal.parent_id).await else {
-            return;
-        };
-        Arc::new(row)
     };
     // The parent is itself a container of the requested kind → a direct
     // children browse, no re-rooting (C# `item is not BoxSet/Playlist`).
@@ -2240,7 +2112,7 @@ async fn redirect_container_browse(
     // so a playlist browse of it re-roots with no linked-ancestor constraint.
     if target_collection_type.is_none()
         && short == "UserView"
-        && user_view_browse_context(&parent).0
+        && ferrofin_model::data::CollectionType::from_item_data(parent.data.as_deref(), "ViewType")
             == Some(ferrofin_model::data::CollectionType::playlists)
     {
         reroot_to_user_root(internal);
