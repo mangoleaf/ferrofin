@@ -95,7 +95,7 @@ pub struct TranscodingJobHandle {
 /// A snapshot of a transcode's progress, reported to the session layer.
 ///
 /// Port of the `ReportTranscodingProgress` argument bundle; grouped into one
-/// struct so the trait method stays object-safe and readable.
+/// struct so the session reporter's progress call takes one argument.
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub struct TranscodingProgress {
     /// The current transcoding position, in ticks (100 ns units).
@@ -405,13 +405,19 @@ pub trait KeyframeExtractor: Send + Sync {
 /// Compile-time assertion that [`KeyframeExtractor`] is object-safe.
 fn _assert_object_safe_keyframe_extractor(_: &dyn KeyframeExtractor) {}
 
-/// Manages live transcode jobs: lookup, keep-alive pings, progress, teardown.
+/// Manages live transcode jobs: lookup, keep-alive pings, teardown.
 ///
 /// Port of the object-safe subset of `ITranscodeManager`. `StartFfMpeg` and
 /// `LockAsync` are not on this seam: `ferrofin-mediaencoding`'s
 /// `TranscodeManagerImpl::start_ffmpeg` starts a job from a
 /// `StartFfMpegRequest`, and the HLS stream manager holds the per-playlist lock
-/// `LockAsync` takes upstream.
+/// `LockAsync` takes upstream. Nor are the request and progress hooks, which
+/// live only on `TranscodeManagerImpl`. `OnTranscodeBeginRequest` /
+/// `OnTranscodeEndRequest` are its `begin_request_guard` and the
+/// `stream_progress` / `segment_progress` observers of a progressive stream,
+/// each ending the request when dropped (a disconnect included).
+/// `ReportTranscodingProgress` is its `update_transcoding_jobs` pass over each
+/// job's ffmpeg progress.
 #[async_trait]
 pub trait TranscodeManager: Send + Sync {
     /// Looks up a running job by its playback-session id. Port of the
@@ -446,31 +452,6 @@ pub trait TranscodeManager: Send + Sync {
         device_id: &str,
         play_session_id: Option<&str>,
         delete_files: bool,
-    ) -> Result<(), ServiceError>;
-
-    /// Reports a job's current progress to the session layer. Port of
-    /// `ReportTranscodingProgress(job, state, …)`; the progress arguments are
-    /// bundled into [`TranscodingProgress`].
-    async fn report_transcoding_progress(
-        &self,
-        job: &TranscodingJobHandle,
-        progress: TranscodingProgress,
-    ) -> Result<(), ServiceError>;
-
-    /// Called when a client begins requesting a transcode output, returning the
-    /// (existing) job serving that path. Port of `OnTranscodeBeginRequest(path,
-    /// type)`.
-    async fn on_transcode_begin_request(
-        &self,
-        path: &str,
-        job_type: TranscodingJobType,
-    ) -> Result<Option<TranscodingJobHandle>, ServiceError>;
-
-    /// Called when a transcode output is finished with, allowing teardown. Port
-    /// of `OnTranscodeEndRequest(job)`.
-    async fn on_transcode_end_request(
-        &self,
-        job: &TranscodingJobHandle,
     ) -> Result<(), ServiceError>;
 }
 

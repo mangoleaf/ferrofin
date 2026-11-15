@@ -3637,14 +3637,6 @@ impl LibraryManager for FerrofinLibraryManager {
         Ok(())
     }
 
-    async fn queue_library_scan_with_trigger(
-        &self,
-        trigger: ScanTrigger,
-    ) -> Result<(), ServiceError> {
-        self.spawn_scan(ScanRequest::defaults(trigger, ScanTarget::All));
-        Ok(())
-    }
-
     async fn queue_library_scan_scoped(&self, library_id: Uuid) -> Result<(), ServiceError> {
         self.spawn_scan(ScanRequest::defaults(
             ScanTrigger::Api,

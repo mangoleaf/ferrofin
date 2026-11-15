@@ -4696,14 +4696,6 @@ impl LiveTvManager for FerrofinLiveTvManager {
             .pop())
     }
 
-    async fn get_recording_path(&self, id: Uuid) -> Result<Option<String>, ServiceError> {
-        let Some(row) = crate::dvr_repository::recording_row(&self.db, id).await? else {
-            return Ok(None);
-        };
-        // Only report a path that actually points at a captured file.
-        Ok(row.path.filter(|p| !p.is_empty()))
-    }
-
     async fn get_active_recording_path(
         &self,
         timer_id: &str,

@@ -3006,7 +3006,6 @@ mod tests {
     #[derive(Default)]
     struct FakeLiveTv {
         providers: std::sync::Mutex<Vec<ListingsProviderInfo>>,
-        recording_path: Option<String>,
         /// The one open live stream, keyed by its unique id.
         live_stream: Option<(String, ferrofin_traits::stubs::LiveStreamFile)>,
         programs_query: std::sync::Mutex<Option<InternalItemsQuery>>,
@@ -3082,12 +3081,6 @@ mod tests {
             let mut g = self.providers.lock().unwrap();
             *g = vec![info.clone()];
             Ok(info)
-        }
-        async fn get_recording_path(
-            &self,
-            _id: Uuid,
-        ) -> Result<Option<String>, ferrofin_traits::error::ServiceError> {
-            Ok(self.recording_path.clone())
         }
         async fn get_live_stream_file(
             &self,

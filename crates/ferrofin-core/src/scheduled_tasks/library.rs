@@ -2895,12 +2895,6 @@ mod tests {
                 .get_media_stream_languages_by_type(stream_types, query)
                 .await
         }
-        async fn queue_library_scan_with_trigger(
-            &self,
-            trigger: ferrofin_traits::library::ScanTrigger,
-        ) -> Result<(), ServiceError> {
-            self.0.queue_library_scan_with_trigger(trigger).await
-        }
         async fn queue_library_scan_scoped(&self, library_id: Uuid) -> Result<(), ServiceError> {
             self.0.queue_library_scan_scoped(library_id).await
         }

@@ -819,13 +819,6 @@ mod tests {
         ) -> Result<SessionInfoDto, ServiceError> {
             unreachable!("not used by maintenance tasks")
         }
-        async fn update_device_name(
-            &self,
-            session_id: &str,
-            reported_device_name: &str,
-        ) -> Result<(), ServiceError> {
-            unreachable!("not used by maintenance tasks")
-        }
         async fn on_playback_start(&self, info: &PlaybackStartInfo) -> Result<(), ServiceError> {
             unreachable!("not used by maintenance tasks")
         }

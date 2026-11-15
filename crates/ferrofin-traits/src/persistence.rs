@@ -2261,20 +2261,6 @@ pub trait ItemCountService: Send + Sync {
         Ok(out)
     }
 
-    /// Counts played descendants of `ancestor_id`.
-    async fn get_played_count(
-        &self,
-        filter: &InternalItemsQuery,
-        ancestor_id: Uuid,
-    ) -> Result<i32, ServiceError>;
-
-    /// Counts all descendants of `ancestor_id`.
-    async fn get_total_count(
-        &self,
-        filter: &InternalItemsQuery,
-        ancestor_id: Uuid,
-    ) -> Result<i32, ServiceError>;
-
     /// Gets both played and total descendant counts of `ancestor_id`.
     async fn get_played_and_total_count(
         &self,

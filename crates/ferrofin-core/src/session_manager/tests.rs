@@ -2760,14 +2760,6 @@ impl ferrofin_traits::library::MusicManager for CannedMix {
             })
             .collect())
     }
-    async fn get_instant_mix_from_artist(
-        &self,
-        _artist_id: Uuid,
-        _user_id: Option<Uuid>,
-        _dto_options: &DtoOptions,
-    ) -> Result<Vec<BaseItemEntity>, ServiceError> {
-        Ok(Vec::new())
-    }
     async fn get_instant_mix_from_genres(
         &self,
         _genres: &[String],
