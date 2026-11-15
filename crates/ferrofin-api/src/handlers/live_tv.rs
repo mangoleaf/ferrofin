@@ -455,8 +455,15 @@ struct GetProgramsDto {
     /// Additional DTO fields.
     #[serde(deserialize_with = "ferrofin_model::json::delimited::comma_option")]
     fields: Option<Vec<ItemFields>>,
-    /// Whether the total record count is computed (schema default `true`).
-    #[serde(deserialize_with = "ferrofin_model::json::value::nullable")]
+    /// Whether the total record count is computed. C#'s non-nullable
+    /// `bool EnableTotalRecordCount = true`: absent is `true`, and `null` fails
+    /// the bind (`400`).
+    // The test-only `Serialize` feeds `contract_numbers::check_model`, which
+    // binds the serialized default again: a `null` there would now fail.
+    #[serde(
+        deserialize_with = "ferrofin_model::json::value::non_nullable",
+        skip_serializing_if = "Option::is_none"
+    )]
     enable_total_record_count: Option<bool>,
 }
 
@@ -1724,7 +1731,8 @@ impl SetChannelMappingDto {
 /// returns that tuner channel's recomputed
 /// [`TunerChannelMapping`](ferrofin_model::live_tv::TunerChannelMapping).
 /// `400` when an id is missing or blank, `404` when the provider id or the
-/// tuner channel id names nothing.
+/// tuner channel id names nothing, or, after the pair is stored, when a local
+/// XMLTV guide file is not there and no copy is cached.
 async fn set_channel_mapping(
     State(state): State<AppState>,
     RequireAdmin(_auth): RequireAdmin,
@@ -2101,7 +2109,8 @@ struct ChannelMappingOptionsQuery {
 /// Port of `LiveTvController.GetChannelMappingOptions` →
 /// `ListingsManager.GetChannelMappingOptions`. `404` when `providerId` is
 /// absent or names no configured provider (upstream's unguarded `.First(...)`
-/// throws there, which the middleware turns into a 500).
+/// throws there, which the middleware turns into a 500), or when a local XMLTV
+/// guide file is not there and no copy is cached (`FileNotFoundException`).
 async fn get_channel_mapping_options(
     State(state): State<AppState>,
     RequireAdmin(_auth): RequireAdmin,
@@ -2144,7 +2153,8 @@ struct LineupsQuery {
 ///
 /// Port of `LiveTvController.GetLineups` → `ListingsManager.GetLineups`. `404`
 /// when the provider cannot be resolved, which is what the C#
-/// `ResourceNotFoundException` maps to.
+/// `ResourceNotFoundException` maps to, or when a local XMLTV guide file is not
+/// there and no copy is cached (`FileNotFoundException`).
 ///
 /// `[Authorize(Policy = Policies.LiveTvAccess)]` upstream
 /// (`LiveTvController.cs:1075` @ v10.11.8), and [`RequireLiveTvAccess`] is the
@@ -3006,7 +3016,6 @@ mod tests {
     #[derive(Default)]
     struct FakeLiveTv {
         providers: std::sync::Mutex<Vec<ListingsProviderInfo>>,
-        recording_path: Option<String>,
         /// The one open live stream, keyed by its unique id.
         live_stream: Option<(String, ferrofin_traits::stubs::LiveStreamFile)>,
         programs_query: std::sync::Mutex<Option<InternalItemsQuery>>,
@@ -3082,12 +3091,6 @@ mod tests {
             let mut g = self.providers.lock().unwrap();
             *g = vec![info.clone()];
             Ok(info)
-        }
-        async fn get_recording_path(
-            &self,
-            _id: Uuid,
-        ) -> Result<Option<String>, ferrofin_traits::error::ServiceError> {
-            Ok(self.recording_path.clone())
         }
         async fn get_live_stream_file(
             &self,
@@ -3803,6 +3806,56 @@ mod tests {
         let state = fake_state().with_live_tv(std::sync::Arc::new(FakeLiveTv::default()));
         let err = get_programs(State(state), auth(), query).await.unwrap_err();
         assert_eq!(err.status(), axum::http::StatusCode::BAD_REQUEST);
+    }
+
+    /// `GetProgramsDto.EnableTotalRecordCount` is C#'s non-nullable
+    /// `bool EnableTotalRecordCount = true`, bound by the body's JSON options
+    /// with no `bool` converter: absent counts, `false` turns the count off,
+    /// and `null`, `""` or a quoted `"true"` fails the bind with a 400 naming
+    /// the member, which never reaches the guide.
+    #[rstest::rstest]
+    #[case::absent(r"{}", Some(true))]
+    #[case::true_(r#"{"EnableTotalRecordCount":true}"#, Some(true))]
+    #[case::false_(r#"{"EnableTotalRecordCount":false}"#, Some(false))]
+    #[case::null(r#"{"EnableTotalRecordCount":null}"#, None)]
+    #[case::empty(r#"{"EnableTotalRecordCount":""}"#, None)]
+    #[case::quoted(r#"{"EnableTotalRecordCount":"true"}"#, None)]
+    #[tokio::test]
+    async fn post_programs_binds_enable_total_record_count_as_a_bool(
+        #[case] body: &'static str,
+        #[case] counted: Option<bool>,
+    ) {
+        use tower::ServiceExt;
+
+        let fake = std::sync::Arc::new(FakeLiveTv::default());
+        let state = crate::test_support::elevated_fake_state().with_live_tv(fake.clone());
+        let response = crate::create_router(state)
+            .oneshot(
+                axum::http::Request::post("/LiveTv/Programs")
+                    .header(axum::http::header::CONTENT_TYPE, "application/json")
+                    .body(axum::body::Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let text = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let text = String::from_utf8_lossy(&text);
+        let asked = fake.programs_query.lock().unwrap().clone();
+        if counted.is_some() {
+            assert_eq!(status, axum::http::StatusCode::OK, "{body}: {text}");
+        } else {
+            assert_eq!(status, axum::http::StatusCode::BAD_REQUEST, "{body}");
+            assert!(text.contains("$.EnableTotalRecordCount"), "{body}: {text}");
+        }
+        // A refused body never reaches the guide.
+        assert_eq!(
+            asked.map(|query| query.enable_total_record_count),
+            counted,
+            "{body}"
+        );
     }
 
     #[tokio::test]

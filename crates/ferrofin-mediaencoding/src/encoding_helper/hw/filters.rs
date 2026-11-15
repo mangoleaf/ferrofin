@@ -177,8 +177,8 @@ pub fn alpha_src_filter(
 /// `Error opening input: Invalid argument`; the single quotes around the value
 /// do not protect it. Verified against ffmpeg n9.0.1 both ways.
 fn format_ticks_as_timestamp(ticks: i64) -> String {
-    const TICKS_PER_MILLISECOND: i64 = 10_000;
-    let total_ms = ticks / TICKS_PER_MILLISECOND;
+    use ferrofin_util::ticks::TICKS_PER_MS;
+    let total_ms = ticks / TICKS_PER_MS;
     let ms = total_ms % 1000;
     let total_seconds = total_ms / 1000;
     let seconds = total_seconds % 60;

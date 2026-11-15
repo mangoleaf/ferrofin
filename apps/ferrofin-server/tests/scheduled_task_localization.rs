@@ -1,5 +1,6 @@
 //! `GET /ScheduledTasks` names and descriptions in the request's culture, and
-//! formatted with the live configuration, end to end.
+//! formatted with the live configuration, end to end; and an adopted
+//! Jellyfin's last results and saved triggers read from its own directories.
 //!
 //! Boots the real composition root, so the request localization, the
 //! administrator gate, the handler and the core task registry with the real
@@ -253,6 +254,49 @@ async fn clean_log_directory_description_follows_the_saved_retention() {
         description(&tasks(&router, token, None).await),
         "Deletes log files that are more than 9 days old."
     );
+
+    for task in wired.background {
+        task.abort();
+    }
+}
+
+/// An adopted Jellyfin's history file, under its `DataPath`
+/// (`{program data}/data`), answers the task's `LastExecutionResult`, and its
+/// saved triggers, under its `ConfigurationDirectoryPath`, are the task's
+/// `Triggers`; both files are left as they were. Upstream's
+/// `ScheduledTaskWorker` reads `{DataPath}/ScheduledTasks/{new Guid(Id)}.js`
+/// and `{ConfigurationDirectoryPath}/ScheduledTasks/{new Guid(Id)}.js`.
+#[tokio::test]
+async fn an_adopted_jellyfin_task_history_and_triggers_answer() {
+    // What Jellyfin 12.4 wrote for its "Scan Media Library" run, and for the
+    // triggers its dashboard saved, verbatim.
+    const HISTORY: &str = r#"{"StartTimeUtc":"2026-11-04T07:54:06.825283Z","EndTimeUtc":"2026-11-04T07:54:07.7650739Z","Status":"Completed","Name":"Scan Media Library","Key":"RefreshLibrary","Id":"7738148ffcd07979c7ceb148e06b3aed"}"#;
+    const TRIGGERS: &str = r#"[{"Type":"WeeklyTrigger","TimeOfDayTicks":36000000000,"DayOfWeek":"Tuesday","MaxRuntimeTicks":72000000000},{"Type":"IntervalTrigger","IntervalTicks":216000000000}]"#;
+    const FILE: &str = "7738148f-fcd0-7979-c7ce-b148e06b3aed.js";
+    let temp = tempfile::tempdir().expect("temp dir");
+    // `Config::test_stub` puts the program data at `{temp}/data` and the
+    // configuration at `{temp}/config`.
+    let write = |dir: &str, body: &str| {
+        let dir = temp.path().join(dir);
+        std::fs::create_dir_all(&dir).expect("dir");
+        std::fs::write(dir.join(FILE), body).expect("write");
+        dir.join(FILE)
+    };
+    let history = write("data/data/ScheduledTasks", HISTORY);
+    let triggers = write("config/ScheduledTasks", TRIGGERS);
+    let wired = boot(&temp).await;
+    let router = ferrofin_api::create_router(wired.state.clone());
+    let token = &login(&router).await;
+
+    let tasks = tasks(&router, token, None).await;
+    let json = |text: &str| serde_json::from_str::<serde_json::Value>(text).expect("json");
+    assert_eq!(
+        tasks["RefreshLibrary"]["LastExecutionResult"],
+        json(HISTORY)
+    );
+    assert_eq!(tasks["RefreshLibrary"]["Triggers"], json(TRIGGERS));
+    assert_eq!(std::fs::read(&history).expect("read"), HISTORY.as_bytes());
+    assert_eq!(std::fs::read(&triggers).expect("read"), TRIGGERS.as_bytes());
 
     for task in wired.background {
         task.abort();

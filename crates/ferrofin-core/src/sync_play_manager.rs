@@ -39,12 +39,10 @@ use ferrofin_traits::stubs::{
     PlaybackRequest, SyncPlayManager, SyncPlayNowPlaying, SyncPlaySession,
 };
 use ferrofin_util::shuffle_extensions::shuffle;
+use ferrofin_util::ticks::TICKS_PER_MS;
 
 use crate::collection_manager::require_user;
 
-/// .NET tick resolution: 100-nanosecond units, so 10_000 ticks per millisecond.
-/// Clients expect `PositionTicks`/`When` on the wire in these units.
-const TICKS_PER_MS: i64 = 10_000;
 /// Default latency cushion added when scheduling a command's `When`, in ms.
 /// ponytail: Jellyfin's `Group.DefaultPing`; surface as a setting if tuned.
 const DEFAULT_PING_MS: i64 = 500;

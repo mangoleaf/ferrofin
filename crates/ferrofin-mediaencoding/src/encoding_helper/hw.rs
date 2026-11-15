@@ -8,9 +8,9 @@
 //! `EncoderValidator`, and `MediaEncoder`.
 //!
 //! **All of it is ported and wired**, for the three accelerators Ferrofin
-//! supports, except the VAAPI `-rc_mode` arm of `GetVideoBitrateParam`, which
-//! lives with the bitrate code in `helper` (TODO(parity, gl-1516): open work
-//! item: port it):
+//! supports. The per-vendor arms of `GetEncoderParam` and
+//! `GetVideoBitrateParam` live with the quality and bitrate code in `helper`;
+//! the rest is here:
 //!
 //! - [`capabilities`] — the resolved environment: what the running ffmpeg can
 //!   do, which OS it is on, and which kernel is underneath.

@@ -8,7 +8,7 @@
 //! `{program data}/plugins/configurations/LDAP-Auth.xml`, the plugin
 //! assembly's name with `.xml` (`BasePlugin<T>.ConfigurationFilePath`), written
 //! by .NET's `XmlSerializer`. Ferrofin reads it with the server configuration's
-//! importer ([`ferrofin_core::config_import`]) and never changes or removes it.
+//! importer ([`ferrofin_common::config_import`]) and never changes or removes it.
 //!
 //! The import is a one-shot boot step that runs only while the plugin has no
 //! `config.json`, so a second boot, or an admin's later edit, is never
@@ -25,7 +25,7 @@
 
 use std::path::Path;
 
-use ferrofin_core::config_import;
+use ferrofin_common::config_import;
 use ferrofin_traits::error::ServiceError;
 use ferrofin_traits::external_identities::ExternalIdentityStore;
 use ferrofin_traits::library::UserManager;
@@ -213,7 +213,7 @@ fn parse(xml: &str) -> Result<AdoptedConfiguration, ServiceError> {
         config: LdapConfig::default(),
         ldap_users: vec![AdoptedLink::default()],
     };
-    config_import::import_over(&shape, xml, "PluginConfiguration", &[])
+    config_import::import_over(&shape, xml, "PluginConfiguration", &[]).map_err(ServiceError::from)
 }
 
 #[cfg(test)]

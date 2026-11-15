@@ -38,11 +38,14 @@ use std::sync::{Arc, Mutex, PoisonError};
 use async_trait::async_trait;
 use tracing::Instrument as _;
 
-use ferrofin_db::entities::base_items::{BaseItemEntity, PeopleEntity};
+use ferrofin_db::entities::base_items::{
+    BaseItemEntity, PeopleEntity, aired_episode_order, is_virtual_location, presentation_key,
+    relation_id,
+};
 use ferrofin_db::store::guid_to_db;
 use ferrofin_model::data::{BaseItemKind, CollectionType};
 use ferrofin_model::dto::ItemCounts;
-use ferrofin_model::entities::{ImageType, MediaStreamType, MetadataField};
+use ferrofin_model::entities::{CollectionTypeOptions, ImageType, MediaStreamType, MetadataField};
 use ferrofin_model::querying::{QueryFiltersLegacy, QueryResult};
 use uuid::Uuid;
 
@@ -271,52 +274,6 @@ fn folder_name_matches(item: &BaseItemEntity, query: &InternalItemsQuery) -> boo
             .is_none_or(|bound| folder_ordinal_compare(Some(&sort), Some(bound)).is_lt())
 }
 
-fn episode_relation_id(value: Option<&str>) -> Option<Uuid> {
-    value
-        .and_then(|value| Uuid::parse_str(value).ok())
-        .filter(|id| !id.is_nil())
-}
-
-/// A series' or season's `GetPresentationUniqueKey()`: its stored key, else
-/// its id — the key its episodes are queried under.
-pub(crate) fn episode_presentation_key(item: &BaseItemEntity) -> String {
-    item.presentation_unique_key
-        .as_ref()
-        .filter(|key| !key.is_empty())
-        .cloned()
-        .unwrap_or_else(|| item.id.clone())
-}
-
-fn episode_virtual_location(item: &BaseItemEntity) -> bool {
-    let kind = item.type_.rsplit('.').next().unwrap_or(&item.type_);
-    let channel = kind == "Channel"
-        || (!matches!(
-            kind,
-            "LiveTvChannel" | "TvChannel" | "LiveTvProgram" | "TvProgram"
-        ) && episode_relation_id(item.channel_id.as_deref()).is_some());
-    item.path.as_deref().is_none_or(str::is_empty) && !channel
-}
-
-fn episode_air_order(item: &BaseItemEntity) -> ferrofin_model::entities_media::AiredEpisodeOrder {
-    let data = item
-        .data
-        .as_deref()
-        .and_then(|data| serde_json::from_str::<serde_json::Value>(data).ok());
-    let number = |key| {
-        data.as_ref()
-            .and_then(|data| data.get(key))
-            .and_then(serde_json::Value::as_i64)
-    };
-    ferrofin_model::entities_media::AiredEpisodeOrder {
-        season: item.parent_index_number,
-        episode: item.index_number,
-        premiere: item.premiere_date,
-        airs_before_season: number("AirsBeforeSeasonNumber"),
-        airs_after_season: number("AirsAfterSeasonNumber"),
-        airs_before_episode: number("AirsBeforeEpisodeNumber"),
-    }
-}
-
 /// `Season.GetEpisodes` → `Series.GetSeasonEpisodes(parentSeason, user, options,
 /// shouldIncludeMissingEpisodes: true)`: the series' episodes (its seasons
 /// alongside, to resolve each episode's parent) narrowed to `season`'s by
@@ -336,8 +293,8 @@ pub(crate) async fn season_episode_rows(
     query: &InternalItemsQuery,
     include_specials: bool,
 ) -> Result<Vec<BaseItemEntity>, ServiceError> {
-    let series_id = episode_relation_id(season.series_id.as_deref())
-        .or_else(|| episode_relation_id(season.parent_id.as_deref()));
+    let series_id = relation_id(season.series_id.as_deref())
+        .or_else(|| relation_id(season.parent_id.as_deref()));
     let series = match series_id {
         Some(id) => items.retrieve_item(id).await?,
         None => None,
@@ -349,7 +306,7 @@ pub(crate) async fn season_episode_rows(
     let rows = items
         .get_episode_order_rows(&InternalItemsQuery {
             user: query.user.clone(),
-            series_presentation_unique_key: Some(episode_presentation_key(&series)),
+            series_presentation_unique_key: Some(presentation_key(&series).to_owned()),
             include_item_types: vec![BaseItemKind::Episode, BaseItemKind::Season],
             order_by: vec![(
                 ferrofin_model::live_tv::ItemSortBy::SortName,
@@ -367,14 +324,14 @@ pub(crate) async fn season_episode_rows(
         .collect();
     let mut seasons: HashMap<_, _> = series_seasons
         .iter()
-        .filter_map(|row| episode_relation_id(Some(&row.id)).map(|id| (id, row.clone())))
+        .filter_map(|row| relation_id(Some(&row.id)).map(|id| (id, row.clone())))
         .collect();
     seasons.insert(season_id, season.clone());
     let mut unknown = std::collections::HashSet::new();
     for row in &rows {
         if row.type_.rsplit('.').next() == Some("Episode")
-            && let Some(id) = episode_relation_id(row.season_id.as_deref())
-                .or_else(|| episode_relation_id(row.parent_id.as_deref()))
+            && let Some(id) = relation_id(row.season_id.as_deref())
+                .or_else(|| relation_id(row.parent_id.as_deref()))
             && !seasons.contains_key(&id)
         {
             unknown.insert(id);
@@ -386,13 +343,13 @@ pub(crate) async fn season_episode_rows(
             .await?
         {
             if row.type_.rsplit('.').next() == Some("Season")
-                && let Some(id) = episode_relation_id(Some(&row.id))
+                && let Some(id) = relation_id(Some(&row.id))
             {
                 seasons.insert(id, row);
             }
         }
     }
-    let key = episode_presentation_key(&season);
+    let key = presentation_key(&season);
     let number = season.index_number;
     let support_specials = include_specials && number.is_some_and(|number| number != 0);
     let mut matches = Vec::new();
@@ -400,11 +357,11 @@ pub(crate) async fn season_episode_rows(
         .into_iter()
         .filter(|row| row.type_.rsplit('.').next() == Some("Episode"))
     {
-        let parent = episode_relation_id(row.season_id.as_deref())
-            .or_else(|| episode_relation_id(row.parent_id.as_deref()))
+        let parent = relation_id(row.season_id.as_deref())
+            .or_else(|| relation_id(row.parent_id.as_deref()))
             .and_then(|id| seasons.get(&id))
             .or_else(|| {
-                (episode_relation_id(row.parent_id.as_deref()) == series_id)
+                (relation_id(row.parent_id.as_deref()) == series_id)
                     .then(|| {
                         series_seasons
                             .iter()
@@ -414,8 +371,8 @@ pub(crate) async fn season_episode_rows(
             });
         let same_season = parent.is_some_and(|parent| {
             ferrofin_util::string_extensions::equals_ordinal_ignore_case(
-                &episode_presentation_key(parent),
-                &key,
+                presentation_key(parent),
+                key,
             )
         });
         // The disabled source query is restricted to the season's
@@ -423,7 +380,7 @@ pub(crate) async fn season_episode_rows(
         if !include_specials && !same_season {
             continue;
         }
-        let order = episode_air_order(&row);
+        let order = aired_episode_order(&row);
         let current = if support_specials {
             order
                 .airs_after_season
@@ -435,8 +392,8 @@ pub(crate) async fn season_episode_rows(
         let matches_number = current.is_some() && number.is_some() && current == number;
         let matches_virtual = current.is_none()
             && number.is_none()
-            && episode_virtual_location(&season)
-            && parent.is_none_or(episode_virtual_location);
+            && is_virtual_location(&season)
+            && parent.is_none_or(is_virtual_location);
         if matches_number || matches_virtual || same_season {
             matches.push((order, row));
         }
@@ -1666,12 +1623,15 @@ impl FerrofinLibraryManager {
 
     /// A box set's, album's or artist's own listing: the repository query,
     /// with no collection substitution, less the box-set members the user may
-    /// not see ([`Self::hidden_box_set_members`]).
+    /// not see ([`Self::hidden_box_set_members`]). It always counts, whatever
+    /// the request says: upstream's `PostFilterAndSort` → `SortAndPage` totals
+    /// every child before it pages.
     async fn direct_children(
         &self,
         mut resolved: InternalItemsQuery,
     ) -> Result<QueryResult<BaseItemEntity>, ServiceError> {
         resolved.collapse_box_set_items = None;
+        resolved.enable_total_record_count = true;
         let hidden = self.hidden_box_set_members(&resolved).await?;
         resolved.exclude_item_ids.extend(hidden);
         self.items.get_items(&resolved).await
@@ -2622,7 +2582,7 @@ impl FerrofinLibraryManager {
                 .iter()
                 .find(|library| library.is_collection_folder(&item.id))
                 .and_then(|library| library.collection_type)
-                .and_then(crate::kinds::collection_type_of);
+                .and_then(CollectionTypeOptions::collection_type);
         }
         ferrofin_model::content_type_overrides::content_type_override(
             overrides,
@@ -2758,7 +2718,7 @@ impl LibraryManager for FerrofinLibraryManager {
             .find_map(|library| {
                 library
                     .collection_type
-                    .and_then(crate::kinds::collection_type_of)
+                    .and_then(CollectionTypeOptions::collection_type)
             });
         if top_type.is_some() {
             return Ok(top_type);
@@ -3109,9 +3069,10 @@ impl LibraryManager for FerrofinLibraryManager {
         let mut resolved = self.resolve_named_rows(kind, &trimmed).await?;
         // `CreateItemByName<T>`: a by-name lookup MATERIALIZES the item
         // upstream (directory + row) rather than reporting it missing, so this
-        // is the read path's write. Deliberately not done in
-        // `get_named_item_ids`, the per-credit hot path — C# splits it the same
-        // way (`GetItemByNameId` derives, `CreateItemByName` writes).
+        // is the read path's write. Never done in `get_named_item_ids`: its
+        // trait contract is that it creates no row, and read paths rely on it —
+        // C# splits it the same way (`GetItemByNameId` derives,
+        // `CreateItemByName` writes).
         self.create_missing_by_name(kind, &trimmed, &mut resolved)
             .await?;
         Ok(resolved)
@@ -3677,14 +3638,6 @@ impl LibraryManager for FerrofinLibraryManager {
 
     async fn queue_library_scan(&self) -> Result<(), ServiceError> {
         self.spawn_scan(ScanRequest::defaults(ScanTrigger::Api, ScanTarget::All));
-        Ok(())
-    }
-
-    async fn queue_library_scan_with_trigger(
-        &self,
-        trigger: ScanTrigger,
-    ) -> Result<(), ServiceError> {
-        self.spawn_scan(ScanRequest::defaults(trigger, ScanTarget::All));
         Ok(())
     }
 
@@ -8287,7 +8240,8 @@ mod tests {
     /// `DisplayOrder` (default `PremiereDate`; `Default` keeps the order the
     /// members were added in; an unparseable one is `PremiereDate`) unless the
     /// request orders them itself — read off a Jellyfin 12.2 oracle on a set
-    /// created from Zeta (2001), Alpha (2003), Mid (1999), Beta (2002).
+    /// created from Zeta (2001), Alpha (2003), Mid (1999), Beta (2002). Its own
+    /// listing totals every member even with the count off.
     #[tokio::test]
     #[allow(clippy::too_many_lines)] // one set, every display order
     async fn a_box_set_lists_its_members_by_its_display_order() {
@@ -8436,6 +8390,29 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(names(around), ["Zeta", "Alpha", "Mid"]);
+        // With the count off, the set's own listing still totals every member
+        // (`PostFilterAndSort` → `SortAndPage` counts before it pages), and a
+        // recursive one, the repository's `GetItemList`, totals its page.
+        let uncounted = |recursive: bool| {
+            let query = InternalItemsQuery {
+                user: Some(Arc::new(user.clone())),
+                parent_id: set_id,
+                parent_type: Some(BaseItemKind::BoxSet),
+                recursive,
+                apply_folder_display_options: true,
+                start_index: Some(1),
+                limit: Some(2),
+                enable_total_record_count: false,
+                ..Default::default()
+            };
+            let library = Arc::clone(&library);
+            async move {
+                let result = library.query_items(&query).await.unwrap();
+                (result.items.len(), result.total_record_count)
+            }
+        };
+        assert_eq!(uncounted(false).await, (2, 4));
+        assert_eq!(uncounted(true).await, (2, 2));
     }
 
     #[tokio::test]

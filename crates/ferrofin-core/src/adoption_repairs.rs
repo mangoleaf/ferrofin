@@ -18,6 +18,7 @@
 use std::path::{Path, PathBuf};
 
 use ferrofin_db::Database;
+use ferrofin_db::entities::base_items::BaseItemEntity;
 use ferrofin_db::entities::playback::UserDataEntity;
 use ferrofin_db::store::guid_to_db;
 use ferrofin_model::data::BaseItemKind;
@@ -40,6 +41,7 @@ use crate::item_data::{
     LINKED_ALTERNATE_VERSION, LOCAL_ALTERNATE_VERSION, import_membership, item_by_path, parse_data,
     read_linked_children, resolve_linked_child,
 };
+use crate::item_data_cleanup::ItemDataCleanup;
 use crate::item_folders::{MovedFolders, move_item_folders};
 use crate::item_persistence_service::{
     FerrofinItemPersistenceService, REPAIR_PARTITION, RekeyKind, alternate_version_child_type,
@@ -57,7 +59,9 @@ use ferrofin_traits::persistence::ItemPersistenceService;
 /// owners at, and `CleanupOrphanedExtras` then deletes the owned rows of.
 const PLACEHOLDER_ID: &str = "00000000-0000-0000-0000-000000000001";
 
-/// Runs every repair in this module, in upstream's order.
+/// Runs every repair in this module, in upstream's order. The rows they
+/// delete are noted for [`cleanup_deleted_item_data`], which the composition
+/// root runs once the server's directories are known.
 ///
 /// # Errors
 /// Returns [`ServiceError`] if a repair's queries fail.
@@ -379,6 +383,8 @@ async fn append_link(
 /// `CleanupOrphanedExtras`: delete every item whose `OwnerId` is the
 /// placeholder — where 0032 (`AddForeignKeyToOwnerId`) re-pointed owners that
 /// no longer exist. Links are cleared first; the rows' children cascade.
+/// The deleted rows' folders go later in the boot
+/// ([`cleanup_deleted_item_data`]).
 ///
 /// # Errors
 /// Returns [`ServiceError`] if the underlying queries fail.
@@ -397,9 +403,18 @@ pub async fn cleanup_orphaned_extras(db: &Database) -> Result<usize, ServiceErro
         .iter()
         .map(|id| Uuid::parse_str(id).map_err(|e| ServiceError::Backend(e.to_string())))
         .collect::<Result<Vec<_>, _>>()?;
-    FerrofinItemPersistenceService::new(db.clone())
-        .delete_items(&parsed)
-        .await?;
+    let persistence = FerrofinItemPersistenceService::new(db.clone());
+    // Every row the delete takes (descendants and owned extras too) is noted
+    // before it goes, for [`cleanup_deleted_item_data`].
+    let closure = persistence.deletion_closure(&parsed).await?;
+    let mut tx = db
+        .writer()
+        .begin_with("BEGIN IMMEDIATE")
+        .await
+        .map_err(db_err)?;
+    note_deleted_rows(&mut tx, closure.into_iter().map(DeletedRow::from).collect()).await?;
+    tx.commit().await.map_err(db_err)?;
+    persistence.delete_items(&parsed).await?;
     done(db, KEY).await?;
     Ok(ids.len())
 }
@@ -415,6 +430,9 @@ pub async fn cleanup_orphaned_extras(db: &Database) -> Result<usize, ServiceErro
 /// extra's directory, literally and ignoring case (`StartsWith(dir,
 /// OrdinalIgnoreCase)`), else loses its owner; one with no path is left alone.
 /// Step 4: every version link's child gets `PrimaryVersionId = ParentId`.
+/// The rows step 1 deletes lose their folders later in the boot
+/// ([`cleanup_deleted_item_data`]), all but the trickplay folder beside the
+/// media, which is the keeper's.
 ///
 /// # Errors
 /// Returns [`ServiceError`] if the underlying queries fail.
@@ -576,6 +594,7 @@ async fn dedupe_paths(
     .await
     .map_err(db_err)?;
     let mut deleted = 0usize;
+    let mut gone: Vec<DeletedRow> = Vec::new();
     let mut by_path: Vec<(String, Vec<(String, String)>)> = Vec::new();
     for (path, id, type_, _) in dups {
         match by_path.last_mut() {
@@ -609,35 +628,43 @@ async fn dedupe_paths(
         // Highest flags win; equal flags → lowest index (newest DateCreated).
         ranked.sort_by(|a, b| (b.0, b.1, b.2, a.3).cmp(&(a.0, a.1, a.2, b.3)));
         for (_, _, _, _, id) in ranked.iter().skip(1) {
-            fold_into(tx, id, &ranked[0].4).await?;
+            gone.extend(fold_into(tx, id, &ranked[0].4).await?);
             deleted += 1;
         }
     }
+    note_deleted_rows(tx, gone).await?;
     Ok(deleted)
 }
 
 /// Deletes the row `id` in favour of `keeper`, the way upstream's step 1
 /// drops a duplicate: its user data moves to `keeper`, its descendants'
 /// user data is detached, its version links go and the extras it owns are
-/// left unowned.
+/// left unowned. Returns the rows deleted (`id` and its descendants), for
+/// the caller to note ([`note_deleted_rows`]).
 async fn fold_into(
     tx: &mut sqlx::SqliteConnection,
     id: &str,
     keeper: &str,
-) -> Result<(), ServiceError> {
+) -> Result<Vec<DeletedRow>, ServiceError> {
     move_user_data(tx, id, keeper).await?;
     // ParentId cascades may reach children even though the repair keeps
     // owned extras by clearing OwnerId below.
-    let descendants: Vec<String> = sqlx::query_scalar(
-        r#"WITH RECURSIVE gone("Id") AS (
+    let gone: Vec<DeletedRow> =
+        sqlx::query_as::<_, (String, Option<String>, bool, Option<String>)>(
+            r#"WITH RECURSIVE gone("Id") AS (
             SELECT "Id" FROM "BaseItems" WHERE "Id" = ?1
             UNION SELECT b."Id" FROM "BaseItems" b JOIN gone g ON b."ParentId" = g."Id"
-        ) SELECT "Id" FROM gone"#,
-    )
-    .bind(id)
-    .fetch_all(&mut *tx)
-    .await
-    .map_err(db_err)?;
+        ) SELECT b."Id", b."Path", b."IsFolder", b."Data"
+          FROM gone JOIN "BaseItems" b ON b."Id" = gone."Id""#,
+        )
+        .bind(id)
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(db_err)?
+        .into_iter()
+        .map(|(id, path, is_folder, data)| DeletedRow::new(id, path, is_folder, data))
+        .collect();
+    let descendants: Vec<String> = gone.iter().map(|row| row.id.clone()).collect();
     detach_user_data(tx, &descendants).await?;
 
     sqlx::query(r#"DELETE FROM "LinkedChildren" WHERE "ParentId" = ?1 OR "ChildId" = ?1"#)
@@ -655,7 +682,189 @@ async fn fold_into(
         .execute(&mut *tx)
         .await
         .map_err(db_err)?;
+    Ok(gone)
+}
+
+/// The `FerrofinMeta` key listing the rows [`run_all`]'s repairs deleted
+/// whose metadata folders and extracted data are still on disk, as a JSON
+/// list of [`DeletedRow`]s. The repairs run before the server's directories
+/// are loaded, so [`cleanup_deleted_item_data`] removes the folders later in
+/// the boot. A row is noted before its delete commits, so a boot that stops
+/// in between leaves the work to the next one.
+const DELETED_ROWS_KEY: &str = "repair_deleted_rows_v1";
+
+/// A row a repair deleted, as much of it as finding its folders takes: its
+/// id and where its media is. Upstream rebuilds each orphaned extra from its
+/// `Id`, `Path` and `Type` for the same purpose (`CleanupOrphanedExtras`).
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "PascalCase")]
+struct DeletedRow {
+    id: String,
+    path: Option<String>,
+    is_folder: bool,
+    /// A disc rip's `Data`, which puts its trickplay folder inside its
+    /// folder ([`crate::video_versions::containing_folder_path_at`]); `None`
+    /// for any other row.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    data: Option<String>,
+}
+
+impl DeletedRow {
+    fn new(id: String, path: Option<String>, is_folder: bool, data: Option<String>) -> Self {
+        Self {
+            id,
+            path,
+            is_folder,
+            data: data.filter(|data| crate::item_data::is_disc_folder(Some(data))),
+        }
+    }
+}
+
+impl From<BaseItemEntity> for DeletedRow {
+    fn from(row: BaseItemEntity) -> Self {
+        Self::new(row.id, row.path, row.is_folder, row.data)
+    }
+}
+
+/// Adds `rows` to [`DELETED_ROWS_KEY`] on `conn`, inside the caller's
+/// transaction.
+async fn note_deleted_rows(
+    conn: &mut sqlx::SqliteConnection,
+    rows: Vec<DeletedRow>,
+) -> Result<(), ServiceError> {
+    if rows.is_empty() {
+        return Ok(());
+    }
+    let noted: Option<String> =
+        sqlx::query_scalar(r#"SELECT "Value" FROM "FerrofinMeta" WHERE "Key" = ?1"#)
+            .bind(DELETED_ROWS_KEY)
+            .fetch_optional(&mut *conn)
+            .await
+            .map_err(db_err)?;
+    // An unreadable note never fails the boot: its rows' folders stay.
+    let mut all = noted.map_or_else(Vec::new, |noted| {
+        parse_deleted_rows(&noted).unwrap_or_else(|err| {
+            tracing::warn!(%err, "discarding an unreadable note of rows the repairs deleted");
+            Vec::new()
+        })
+    });
+    all.extend(rows);
+    let value = serde_json::to_string(&all).map_err(|e| ServiceError::Backend(e.to_string()))?;
+    sqlx::query(
+        r#"INSERT INTO "FerrofinMeta" ("Key", "Value") VALUES (?1, ?2)
+           ON CONFLICT("Key") DO UPDATE SET "Value" = excluded."Value""#,
+    )
+    .bind(DELETED_ROWS_KEY)
+    .bind(value)
+    .execute(&mut *conn)
+    .await
+    .map_err(db_err)?;
     Ok(())
+}
+
+/// [`DELETED_ROWS_KEY`]'s value, parsed.
+fn parse_deleted_rows(value: &str) -> Result<Vec<DeletedRow>, ServiceError> {
+    serde_json::from_str(value)
+        .map_err(|err| ServiceError::Backend(format!("FerrofinMeta {DELETED_ROWS_KEY}: {err}")))
+}
+
+/// Removes what the rows [`run_all`]'s repairs deleted left on disk, as
+/// upstream's `LibraryManager.DeleteItemsUnsafeFast` (`LibraryManager.cs:
+/// 361-419`) does for the items `CleanupOrphanedExtras` and
+/// `FixIncorrectOwnerIdRelationships` delete: each noted row's metadata
+/// folders and extracted data ([`ItemDataCleanup`]), then the note
+/// (`repair_deleted_rows_v1` in `FerrofinMeta`). Upstream removes them before the rows; here the
+/// rows go first, because the repairs run before the configured directories
+/// and the extracted-data manager exist. Every row a delete took is
+/// cleaned, its descendants included, where upstream cleans the items it
+/// was given only, as the scan's removals do here.
+///
+/// A row whose id is stored again (the previous version saved it during a
+/// rolling update) keeps its folders. The trickplay folder beside a row's
+/// media stays while a stored row has the same path: a path duplicate's
+/// keeper is at that path and the tiles are its own, where upstream's
+/// delete takes them. The row's other folders are keyed by its id and go.
+///
+/// Returns how many rows' folders were removed.
+///
+/// # Errors
+/// Returns [`ServiceError`] if the note or the stored rows cannot be read,
+/// or the note cannot be cleared; it stays then, and the next boot tries
+/// again.
+pub async fn cleanup_deleted_item_data(
+    db: &Database,
+    cleanup: &ItemDataCleanup,
+) -> Result<usize, ServiceError> {
+    let Some(value) = db.meta_get(DELETED_ROWS_KEY).await? else {
+        return Ok(0);
+    };
+    let noted = parse_deleted_rows(&value)?;
+    let json = |values: Vec<&str>| {
+        serde_json::to_string(&values).map_err(|e| ServiceError::Backend(e.to_string()))
+    };
+    let stored: HashSet<String> = sqlx::query_scalar(
+        r#"SELECT "Id" FROM "BaseItems" WHERE "Id" IN (SELECT "value" FROM json_each(?1))"#,
+    )
+    .bind(json(noted.iter().map(|row| row.id.as_str()).collect())?)
+    .fetch_all(db.pool())
+    .await
+    .map_err(db_err)?
+    .into_iter()
+    .collect();
+    let in_use: HashSet<String> = sqlx::query_scalar(
+        r#"SELECT DISTINCT "Path" FROM "BaseItems"
+           WHERE "Path" IN (SELECT "value" FROM json_each(?1))"#,
+    )
+    .bind(json(
+        noted.iter().filter_map(|row| row.path.as_deref()).collect(),
+    )?)
+    .fetch_all(db.pool())
+    .await
+    .map_err(db_err)?
+    .into_iter()
+    .collect();
+    let mut seen = HashSet::new();
+    let rows: Vec<BaseItemEntity> = noted
+        .into_iter()
+        .filter(|row| !stored.contains(&row.id) && seen.insert(row.id.clone()))
+        .map(|row| BaseItemEntity {
+            id: row.id,
+            path: row.path,
+            is_folder: row.is_folder,
+            data: row.data,
+            ..BaseItemEntity::default()
+        })
+        .collect();
+    let refs: Vec<&BaseItemEntity> = rows.iter().collect();
+    cleanup
+        .delete_item_data(&refs, &|row: &BaseItemEntity| {
+            row.path.as_ref().is_some_and(|path| in_use.contains(path))
+        })
+        .await;
+    sqlx::query(r#"DELETE FROM "FerrofinMeta" WHERE "Key" = ?1"#)
+        .bind(DELETED_ROWS_KEY)
+        .execute(db.writer())
+        .await
+        .map_err(db_err)?;
+    Ok(rows.len())
+}
+
+/// [`cleanup_deleted_item_data`] and its log line, for the composition root.
+/// A failure is a warning and never stops the boot: the folders stay, and
+/// the next boot tries again.
+pub async fn run_cleanup_deleted_item_data(db: &Database, cleanup: &ItemDataCleanup) {
+    match cleanup_deleted_item_data(db, cleanup).await {
+        Ok(0) => {}
+        Ok(items) => tracing::info!(
+            items,
+            "removed the metadata folders and extracted data of items the adoption repairs deleted"
+        ),
+        Err(err) => tracing::warn!(
+            %err,
+            "could not remove the folders of items the adoption repairs deleted; \
+             the next boot tries again"
+        ),
+    }
 }
 
 /// Reunites the local alternate versions a Ferrofin v1.0.0 scan split off
@@ -704,6 +913,7 @@ pub async fn reunite_split_versions(db: &Database) -> Result<usize, ServiceError
     .await
     .map_err(db_err)?;
     let mut folded: BTreeSet<String> = BTreeSet::new();
+    let mut gone: Vec<DeletedRow> = Vec::new();
     let mut lists: BTreeMap<String, (Option<String>, Vec<String>)> = BTreeMap::new();
     for (stale, standalone, primary, path, primary_path, data) in splits {
         // Two rows of the primary's type at one path: the first (by id) is
@@ -711,7 +921,7 @@ pub async fn reunite_split_versions(db: &Database) -> Result<usize, ServiceError
         if !same_folder(&primary_path, &path) || !folded.insert(stale.clone()) {
             continue;
         }
-        fold_into(&mut tx, &stale, &standalone).await?;
+        gone.extend(fold_into(&mut tx, &stale, &standalone).await?);
         lists
             .entry(primary)
             .or_insert_with(|| (data, Vec::new()))
@@ -746,6 +956,7 @@ pub async fn reunite_split_versions(db: &Database) -> Result<usize, ServiceError
             .await
             .map_err(db_err)?;
     }
+    note_deleted_rows(&mut tx, gone).await?;
     tx.commit().await.map_err(db_err)?;
     done(db, KEY).await?;
     Ok(folded.len())
@@ -5755,6 +5966,269 @@ mod tests {
         assert_eq!(kept, 2, "history survives for the extra and its descendant");
     }
 
+    /// Records each `DeleteExternalItemFiles` call's id, media path and
+    /// containing folder.
+    #[derive(Default)]
+    struct RecordingExternalData {
+        calls: std::sync::Mutex<Vec<(Uuid, String, String)>>,
+    }
+
+    impl RecordingExternalData {
+        /// The calls so far, sorted by id.
+        fn sorted(&self) -> Vec<(Uuid, String, String)> {
+            let mut calls = self.calls.lock().expect("lock").clone();
+            calls.sort();
+            calls
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ferrofin_traits::system::ExternalDataManager for RecordingExternalData {
+        async fn delete_external_item_data(
+            &self,
+            _item_id: Uuid,
+            _media: ferrofin_traits::system::MediaLocation<'_>,
+        ) -> Result<(), ServiceError> {
+            unimplemented!("a delete only removes the files")
+        }
+
+        async fn delete_external_item_files(
+            &self,
+            item_id: Uuid,
+            media: ferrofin_traits::system::MediaLocation<'_>,
+        ) -> Result<(), ServiceError> {
+            self.calls.lock().expect("lock").push((
+                item_id,
+                media.path.to_owned(),
+                media.containing_folder.to_owned(),
+            ));
+            Ok(())
+        }
+    }
+
+    /// A cleanup over the test directories under `root`, recording its
+    /// extracted-data deletes.
+    fn recording_cleanup(root: &Path) -> (ItemDataCleanup, std::sync::Arc<RecordingExternalData>) {
+        let cleanup = ItemDataCleanup::new(crate::app_paths::test_paths(root));
+        let external = std::sync::Arc::new(RecordingExternalData::default());
+        cleanup.set_external_data(external.clone());
+        (cleanup, external)
+    }
+
+    /// `id`'s art folder (`{metadata}/library/{GUID}`) under `root`'s test
+    /// directories, written with a file.
+    fn planted_art_folder(root: &Path, id: Uuid) -> PathBuf {
+        let art = root.join("program/metadata/library");
+        let folder = crate::item_folders::item_art_folders(&art, id)[0].clone();
+        std::fs::create_dir_all(&folder).expect("art folder");
+        std::fs::write(folder.join("poster.jpg"), b"x").expect("poster");
+        folder
+    }
+
+    async fn set_parent(db: &Database, id: Uuid, parent: Uuid) {
+        sqlx::query(r#"UPDATE "BaseItems" SET "ParentId" = ?2 WHERE "Id" = ?1"#)
+            .bind(guid_to_db(id))
+            .bind(guid_to_db(parent))
+            .execute(db.writer())
+            .await
+            .expect("parent");
+    }
+
+    async fn own_by_placeholder(db: &Database, id: Uuid) {
+        sqlx::query(r#"UPDATE "BaseItems" SET "OwnerId" = ?2 WHERE "Id" = ?1"#)
+            .bind(guid_to_db(id))
+            .bind(PLACEHOLDER_ID)
+            .execute(db.writer())
+            .await
+            .expect("own");
+    }
+
+    /// The rows the boot repairs delete (gl-420) lose their metadata folders
+    /// and extracted data later in the boot, as upstream's
+    /// `DeleteItemsUnsafeFast` removes them with the rows; the trickplay
+    /// folder beside a path duplicate's media is the keeper's and stays.
+    #[tokio::test]
+    async fn deleted_rows_lose_their_folders_and_the_keepers_trickplay_beside_the_media_stays() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let db = test_db().await;
+        let [extra, live, keeper, dup] = [(); 4].map(|()| Uuid::new_v4());
+        // A child of each, which the delete takes with it (the keeper's stays).
+        let [extra_child, keeper_child, dup_child] = [(); 3].map(|()| Uuid::new_v4());
+        seed_item(&db, extra, BaseItemKind::Trailer).await;
+        for id in [live, keeper, dup] {
+            seed_item(&db, id, BaseItemKind::Movie).await;
+        }
+        for (child, parent) in [
+            (extra_child, extra),
+            (keeper_child, keeper),
+            (dup_child, dup),
+        ] {
+            seed_item(&db, child, BaseItemKind::Video).await;
+            set_parent(&db, child, parent).await;
+        }
+        // An extra whose owner 0032 re-pointed at the placeholder.
+        set_path(&db, extra, "/m/film/trailer.mkv").await;
+        own_by_placeholder(&db, extra).await;
+        set_path(&db, live, "/m/film/film.mkv").await;
+        // Two rows at one path, both with a child: the newer is the keeper.
+        for (id, created) in [
+            (keeper, "2026-02-01 00:00:00"),
+            (dup, "2026-01-01 00:00:00"),
+        ] {
+            set_path(&db, id, "/m/dup/dup.mkv").await;
+            sqlx::query(r#"UPDATE "BaseItems" SET "DateCreated" = ?2 WHERE "Id" = ?1"#)
+                .bind(guid_to_db(id))
+                .bind(created)
+                .execute(db.writer())
+                .await
+                .expect("created");
+        }
+        let all = [
+            extra,
+            extra_child,
+            live,
+            keeper,
+            keeper_child,
+            dup,
+            dup_child,
+        ];
+        let folders: Vec<PathBuf> = all
+            .into_iter()
+            .map(|id| planted_art_folder(tmp.path(), id))
+            .collect();
+
+        assert_eq!(cleanup_orphaned_extras(&db).await.expect("extras"), 1);
+        assert!(fix_owner_id_relationships(&db).await.expect("owners") >= 1);
+        assert!(
+            folders.iter().all(|f| f.exists()),
+            "nothing goes before the boot cleans up"
+        );
+
+        let (cleanup, external) = recording_cleanup(tmp.path());
+        assert_eq!(
+            cleanup_deleted_item_data(&db, &cleanup)
+                .await
+                .expect("cleanup"),
+            4
+        );
+        let present: Vec<bool> = folders.iter().map(|f| f.exists()).collect();
+        assert_eq!(
+            present,
+            [false, false, true, true, true, false, false],
+            "{all:?}"
+        );
+        let mut expected = vec![
+            // The extra's own trickplay folder beside its media goes.
+            (
+                extra,
+                "/m/film/trailer.mkv".to_owned(),
+                "/m/film".to_owned(),
+            ),
+            (extra_child, String::new(), String::new()),
+            // The duplicate's is the keeper's: only its id-keyed data goes.
+            (dup, String::new(), String::new()),
+            (dup_child, String::new(), String::new()),
+        ];
+        expected.sort();
+        assert_eq!(external.sorted(), expected);
+        assert_eq!(
+            cleanup_deleted_item_data(&db, &cleanup)
+                .await
+                .expect("again"),
+            0,
+            "the note is cleared"
+        );
+    }
+
+    /// The stale `Video` row [`reunite_split_versions`] folds into its
+    /// standalone twin loses its own folders; the twin, at the same path,
+    /// keeps its own and the trickplay folder beside the media.
+    #[tokio::test]
+    async fn a_reunited_versions_stale_row_loses_its_folders() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let db = test_db().await;
+        let [primary, stale, twin] = [(); 3].map(|()| Uuid::new_v4());
+        seed_item(&db, primary, BaseItemKind::Movie).await;
+        seed_item(&db, stale, BaseItemKind::Video).await;
+        seed_item(&db, twin, BaseItemKind::Movie).await;
+        set_path(&db, primary, "/m/arc/Arc - 2160p.mkv").await;
+        for id in [stale, twin] {
+            set_path(&db, id, "/m/arc/Arc - 480p.mkv").await;
+        }
+        sqlx::query(r#"UPDATE "BaseItems" SET "OwnerId" = ?2 WHERE "Id" = ?1"#)
+            .bind(guid_to_db(stale))
+            .bind(guid_to_db(primary))
+            .execute(db.writer())
+            .await
+            .expect("own");
+        let (stale_art, twin_art) = (
+            planted_art_folder(tmp.path(), stale),
+            planted_art_folder(tmp.path(), twin),
+        );
+        assert_eq!(reunite_split_versions(&db).await.expect("reunite"), 1);
+
+        let (cleanup, external) = recording_cleanup(tmp.path());
+        assert_eq!(
+            cleanup_deleted_item_data(&db, &cleanup)
+                .await
+                .expect("cleanup"),
+            1
+        );
+        assert!(!stale_art.exists() && twin_art.exists());
+        assert_eq!(external.sorted(), [(stale, String::new(), String::new())]);
+    }
+
+    /// A disc rip's trickplay folder is inside its own folder, so the noted
+    /// row keeps the `Data` that says it is one; and a note that cannot be
+    /// read is replaced, not a failed boot.
+    #[tokio::test]
+    async fn a_noted_disc_rip_is_cleaned_inside_its_folder_and_a_bad_note_is_replaced() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let db = test_db().await;
+        db.meta_set(DELETED_ROWS_KEY, "not json")
+            .await
+            .expect("bad note");
+        let extra = Uuid::new_v4();
+        seed_item(&db, extra, BaseItemKind::Trailer).await;
+        set_path(&db, extra, "/m/film/Making.Of").await;
+        set_data(&db, extra, r#"{"VideoType":"Dvd"}"#).await;
+        own_by_placeholder(&db, extra).await;
+        assert_eq!(cleanup_orphaned_extras(&db).await.expect("extras"), 1);
+
+        let (cleanup, external) = recording_cleanup(tmp.path());
+        assert_eq!(
+            cleanup_deleted_item_data(&db, &cleanup)
+                .await
+                .expect("cleanup"),
+            1
+        );
+        let rip = "/m/film/Making.Of".to_owned();
+        assert_eq!(external.sorted(), [(extra, rip.clone(), rip)]);
+    }
+
+    #[tokio::test]
+    async fn a_noted_row_stored_again_keeps_its_folders() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let db = test_db().await;
+        let extra = Uuid::new_v4();
+        seed_item(&db, extra, BaseItemKind::Trailer).await;
+        own_by_placeholder(&db, extra).await;
+        let folder = planted_art_folder(tmp.path(), extra);
+        assert_eq!(cleanup_orphaned_extras(&db).await.expect("extras"), 1);
+        // The previous version, still running, saves the item again.
+        seed_item(&db, extra, BaseItemKind::Trailer).await;
+
+        let (cleanup, external) = recording_cleanup(tmp.path());
+        assert_eq!(
+            cleanup_deleted_item_data(&db, &cleanup)
+                .await
+                .expect("cleanup"),
+            0
+        );
+        assert!(folder.exists());
+        assert!(external.calls.lock().expect("lock").is_empty());
+    }
+
     #[tokio::test]
     async fn owner_id_relationships_are_repaired_like_upstream() {
         let db = test_db().await;
@@ -7552,9 +8026,10 @@ pub struct Rebased {
 /// whole.
 ///
 /// Returns `None` when nothing was rewritten. A server that did not move only
-/// reads its root and library rows. A root or library row whose own folder was
-/// not copied keeps naming the old directory, so each start checks again until
-/// it is.
+/// reads its root and library rows. A library row whose own folder was not
+/// copied keeps naming the old directory, so each start checks again until it
+/// is; the two root rows are re-pathed after this pass on the start that finds
+/// them moved (`AggregateFolderStore::ensure`, `UserRootFolderStore::ensure`).
 ///
 /// # Errors
 /// Returns [`ServiceError`] if a query or the snapshot fails; no row is
@@ -7706,11 +8181,12 @@ async fn apply_rebase(db: &Database, plan: &RebasePlan) -> Result<Option<Rebased
 /// Each is read from a row whose id survives a move, by the place that row's
 /// path has under program data: the aggregate root (`root`), the user root
 /// (`root/default`) and each library folder whose id is the one its name
-/// derives under this server's root (`root/default/<name>`). `ensure()`
-/// re-paths the aggregate root on the first start after a move (since v1.4.0),
-/// so on a database started since, the user root and the libraries are what
-/// still name the old directory. Empty when no row names a directory other
-/// than this server's program data, and for a database with
+/// derives under this server's root (`root/default/<name>`). The aggregate
+/// root's `ensure()` re-paths it on the first start after a move (since
+/// v1.4.0), and the user root's `ensure()` re-paths that one, so on a database
+/// started since, the libraries are what still name the old directory. Both
+/// run after this pass, which reads them first. Empty when no row names a
+/// directory other than this server's program data, and for a database with
 /// [`IdDerivation::LegacyLowercase`] ids: they embed the absolute path, so
 /// after a move none is the id derived here.
 async fn previous_program_data_dirs(
