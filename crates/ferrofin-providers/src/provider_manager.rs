@@ -2444,13 +2444,10 @@ impl LocalProviderManager {
         let record = omdb
             .episode(series, season_number, episode_number, own_imdb)
             .await?;
-        let subtag = language
-            .split_once('-')
-            .map_or(language, |(subtag, _)| subtag);
         let mut answer = crate::episode::omdb_answer(
             &record,
             crate::episode::OmdbGates {
-                english: subtag.eq_ignore_ascii_case("en"),
+                english: crate::metadata_merge::language_subtag(language) == "en",
                 us: country.eq_ignore_ascii_case("US"),
                 cast_and_crew: omdb.cast_and_crew().await,
             },
@@ -4815,8 +4812,10 @@ fn wants_fetch(mode: MetadataRefreshMode) -> bool {
     )
 }
 
-/// Parses a TMDB `YYYY-MM-DD` date into a UTC midnight timestamp.
-pub(crate) fn parse_ymd(s: &str) -> Option<chrono::DateTime<Utc>> {
+/// Parses a TMDB `YYYY-MM-DD` date into a UTC midnight timestamp — the one
+/// parse both refresh engines store a provider's date-only value with.
+#[must_use]
+pub fn parse_ymd(s: &str) -> Option<chrono::DateTime<Utc>> {
     let date = chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d").ok()?;
     Some(chrono::DateTime::from_naive_utc_and_offset(
         date.and_hms_opt(0, 0, 0)?,
