@@ -136,6 +136,19 @@ fn merged_equals_new(
     field.get(&target.item).as_deref() == new
 }
 
+/// `MatchesPreferredLanguage`: the language subtags compare, and an unknown
+/// language on either side matches.
+#[test]
+fn languages_match_on_their_subtag() {
+    assert_eq!(language_subtag("ES-es"), "es");
+    assert!(matches_preferred_language(Some("es"), "es-ES"));
+    assert!(matches_preferred_language(Some("EN-us"), "en"));
+    assert!(!matches_preferred_language(Some("en"), "de"));
+    assert!(matches_preferred_language(None, "de"));
+    assert!(matches_preferred_language(Some(""), "de"));
+    assert!(matches_preferred_language(Some("en"), ""));
+}
+
 /// `MergeBaseItemData_StringField_ReplacesAppropriately` (on a `Series`, so
 /// `DisplayOrder` is reachable).
 #[rstest]
@@ -2015,17 +2028,4 @@ fn rating_to_items_takes_the_least_restrictive_member(
         super::rating_to_items(current, members.iter().copied(), test_score),
         expected
     );
-}
-
-/// `MatchesPreferredLanguage`: the language subtags compare, and an unknown
-/// language on either side matches.
-#[test]
-fn languages_match_on_their_subtag() {
-    assert_eq!(language_subtag("ES-es"), "es");
-    assert!(matches_preferred_language(Some("es"), "es-ES"));
-    assert!(matches_preferred_language(Some("EN-us"), "en"));
-    assert!(!matches_preferred_language(Some("en"), "de"));
-    assert!(matches_preferred_language(None, "de"));
-    assert!(matches_preferred_language(Some(""), "de"));
-    assert!(matches_preferred_language(Some("en"), ""));
 }
