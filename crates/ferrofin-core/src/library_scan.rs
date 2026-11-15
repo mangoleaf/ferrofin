@@ -51,8 +51,10 @@ use ferrofin_providers::local_images::{
 use ferrofin_providers::metadata_merge::audio_sort_name;
 use ferrofin_providers::metadata_merge::{
     ALL_LOCKABLE_FIELDS, RefreshAnswers, RefreshMerge, derived_sort_name, episode_sort_name,
-    forced_sort_name, season_sort_name, settle_sort_name,
+    forced_sort_name, language_subtag, matches_preferred_language, season_sort_name,
+    settle_sort_name,
 };
+use ferrofin_providers::provider_manager::parse_ymd;
 use ferrofin_providers::{
     EpisodeLocalImageProvider, FsDirectoryService, ImageItem, ImageItemKind, LocalImageProvider,
     RemoteImage, TmdbClient, TmdbDetails, TmdbImage, TmdbKind,
@@ -426,28 +428,6 @@ enum RemoteSource {
     ///
     /// [`DynamicMetadataProvider`]: ferrofin_traits::providers::DynamicMetadataProvider
     Dynamic(usize),
-}
-
-/// `MetadataLanguageUtils.GetLanguageSubtag`: the language subtag of a
-/// language tag, lowercased (`es` for `es-ES`).
-fn language_subtag(language: &str) -> String {
-    language
-        .split_once('-')
-        .map_or(language, |(subtag, _)| subtag)
-        .to_lowercase()
-}
-
-/// `MetadataLanguageUtils.MatchesPreferredLanguage`: whether an answer in
-/// `result` counts as being in the `preferred` language — either one is
-/// unknown ("a provider that doesn't report a language cannot be judged,
-/// assume it honored the request"), or both share a language subtag.
-fn matches_preferred_language(result: Option<&str>, preferred: &str) -> bool {
-    match result.filter(|r| !r.is_empty()) {
-        Some(result) if !preferred.is_empty() => {
-            language_subtag(result) == language_subtag(preferred)
-        }
-        _ => true,
-    }
 }
 
 /// A saved preferred metadata language, trimmed and lowercased; `None` when
@@ -24411,15 +24391,6 @@ fn chapter_to_entity(
     }
 }
 
-/// Parses a TMDB `YYYY-MM-DD` date to a UTC timestamp at midnight.
-fn parse_ymd(s: &str) -> Option<chrono::DateTime<Utc>> {
-    let date = chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d").ok()?;
-    Some(chrono::DateTime::from_naive_utc_and_offset(
-        date.and_hms_opt(0, 0, 0)?,
-        Utc,
-    ))
-}
-
 /// Port of C# `BaseItem.CreateSortName` + `ModifySortChunks`; the shared
 /// implementation lives in `ferrofin-util` so the metadata providers (Identify
 /// renames) and the Live TV guide compute the same sort key as the scanner.
@@ -28076,18 +28047,6 @@ mod tests {
                 .await,
             ("fr".into(), "FR".into())
         );
-    }
-
-    /// `MatchesPreferredLanguage`: the language subtags compare, and an
-    /// unknown language on either side matches.
-    #[test]
-    fn languages_match_on_their_subtag() {
-        assert!(super::matches_preferred_language(Some("es"), "es-ES"));
-        assert!(super::matches_preferred_language(Some("EN-us"), "en"));
-        assert!(!super::matches_preferred_language(Some("en"), "de"));
-        assert!(super::matches_preferred_language(None, "de"));
-        assert!(super::matches_preferred_language(Some(""), "de"));
-        assert!(super::matches_preferred_language(Some("en"), ""));
     }
 
     /// The fold's ids: the first valid id of a name stays and a later answer

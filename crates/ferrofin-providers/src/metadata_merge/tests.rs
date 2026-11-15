@@ -18,8 +18,9 @@ use rstest::rstest;
 use ferrofin_traits::providers::{MetadataRefreshMode, MetadataRefreshOptions};
 
 use super::{
-    MetadataResult, RefreshAnswers, RefreshMerge, is_valid_provider_id, merge_data, merge_people,
-    merge_provider_ids, merge_refresh, pass_credits, set_provider_ids, settle_sort_name,
+    MetadataResult, RefreshAnswers, RefreshMerge, is_valid_provider_id, language_subtag,
+    matches_preferred_language, merge_data, merge_people, merge_provider_ids, merge_refresh,
+    pass_credits, set_provider_ids, settle_sort_name,
 };
 
 /// The stored `Type` name for `kind`.
@@ -2014,4 +2015,17 @@ fn rating_to_items_takes_the_least_restrictive_member(
         super::rating_to_items(current, members.iter().copied(), test_score),
         expected
     );
+}
+
+/// `MatchesPreferredLanguage`: the language subtags compare, and an unknown
+/// language on either side matches.
+#[test]
+fn languages_match_on_their_subtag() {
+    assert_eq!(language_subtag("ES-es"), "es");
+    assert!(matches_preferred_language(Some("es"), "es-ES"));
+    assert!(matches_preferred_language(Some("EN-us"), "en"));
+    assert!(!matches_preferred_language(Some("en"), "de"));
+    assert!(matches_preferred_language(None, "de"));
+    assert!(matches_preferred_language(Some(""), "de"));
+    assert!(matches_preferred_language(Some("en"), ""));
 }
