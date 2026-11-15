@@ -205,32 +205,6 @@ impl TunerStreamSource for ReqwestTunerSource {
     }
 }
 
-/// The protocol a tuner path is read over.
-///
-/// Port of `MediaSourceManager.GetPathProtocol`: the URI scheme names the
-/// protocol, and anything without one of the known schemes is a file path.
-#[must_use]
-pub fn path_protocol(path: &str) -> MediaProtocol {
-    let lower = path.to_ascii_lowercase();
-    for (scheme, protocol) in [
-        ("rtmp://", MediaProtocol::Rtmp),
-        ("rtmps://", MediaProtocol::Rtmp),
-        ("rtsp://", MediaProtocol::Rtsp),
-        ("rtspu://", MediaProtocol::Rtsp),
-        ("rtspt://", MediaProtocol::Rtsp),
-        ("ftp://", MediaProtocol::Ftp),
-        ("rtp://", MediaProtocol::Rtp),
-        ("udp://", MediaProtocol::Udp),
-        ("http://", MediaProtocol::Http),
-        ("https://", MediaProtocol::Http),
-    ] {
-        if lower.starts_with(scheme) {
-            return protocol;
-        }
-    }
-    MediaProtocol::File
-}
-
 /// `NetworkManager.IsInLocalNetwork(string)`: whether a tuner URL's host
 /// (an IP literal or a host name, which the real check resolves) is on the
 /// local network as the server's network policy defines it. The composition
@@ -304,7 +278,7 @@ pub fn create_media_source_info(
     if is_manifest_path(path) {
         supports_direct_play = false;
     }
-    let protocol = path_protocol(path);
+    let protocol = ferrofin_model::media_info::path_protocol(path);
 
     let mut required_http_headers = std::collections::HashMap::new();
     if protocol == MediaProtocol::Http {
@@ -699,7 +673,6 @@ pub(crate) mod tests {
     };
     use async_trait::async_trait;
     use ferrofin_model::live_tv::TunerHostInfo;
-    use ferrofin_model::media_info::MediaProtocol;
     use ferrofin_traits::error::ServiceError;
     use std::collections::HashMap;
     use std::sync::Arc;
@@ -802,21 +775,31 @@ pub(crate) mod tests {
     }
 
     /// Every HTTP source is private wherever its host is: a LAN address is no
-    /// sign that a URL holds no credentials.
+    /// sign that a URL holds no credentials. The cases cover every scheme
+    /// [`is_valid_channel_url`](crate::m3u::is_valid_channel_url) lets a
+    /// channel play from, the only paths that reach this function, and the
+    /// tuner User-Agent goes with the same sources.
     #[rstest::rstest]
     #[case("http://iptv.example/live/user/pass/1.ts", false, true)]
     #[case("https://iptv.example/live/user/pass/1.ts", false, true)]
     #[case("http://192.168.1.20:5004/auto/v1", true, true)]
+    #[case("HTTP://iptv.example/live/1.ts", false, true)]
     #[case("rtsp://192.168.1.20/stream", true, false)]
+    #[case("rtp://239.0.0.1:5000", true, false)]
     #[case("udp://239.0.0.1:1234", true, false)]
     fn an_http_source_is_private(
         #[case] path: &str,
         #[case] is_local: bool,
         #[case] private: bool,
     ) {
+        assert!(crate::m3u::is_valid_channel_url(path), "{path}");
         let tuner = TunerHostInfo::default();
         let source = create_media_source_info(path, &tuner, !is_local);
         assert_eq!(source.path_is_private, private);
+        assert_eq!(
+            source.required_http_headers.contains_key("User-Agent"),
+            private
+        );
     }
 
     #[test]
@@ -968,19 +951,6 @@ pub(crate) mod tests {
             "the dead stream must clear its sharing flag"
         );
         assert!(!opened.temp_path.exists(), "the buffer must be deleted");
-    }
-
-    #[test]
-    fn the_protocol_table_covers_every_scheme_upstream_knows() {
-        use super::path_protocol;
-        assert_eq!(path_protocol("http://t/live"), MediaProtocol::Http);
-        assert_eq!(path_protocol("HTTPS://t/live"), MediaProtocol::Http);
-        assert_eq!(path_protocol("rtsp://t/live"), MediaProtocol::Rtsp);
-        assert_eq!(path_protocol("rtmp://t/live"), MediaProtocol::Rtmp);
-        assert_eq!(path_protocol("udp://239.0.0.1:1234"), MediaProtocol::Udp);
-        assert_eq!(path_protocol("rtp://t/live"), MediaProtocol::Rtp);
-        assert_eq!(path_protocol("ftp://t/live"), MediaProtocol::Ftp);
-        assert_eq!(path_protocol("/media/live.ts"), MediaProtocol::File);
     }
 
     #[tokio::test]

@@ -17,7 +17,7 @@ use std::path::{Path, PathBuf};
 
 use ferrofin_model::dto::MediaSourceInfo;
 use ferrofin_model::entities::VideoType;
-use ferrofin_model::media_info::MediaProtocol;
+use ferrofin_model::media_info::{MediaInfo, MediaProtocol};
 use ferrofin_traits::error::ServiceError;
 use ferrofin_traits::media_encoding::{MediaEncoder, MediaInfoRequest};
 
@@ -142,6 +142,53 @@ pub fn primary_playlist_vob_files(path: &Path, title_number: Option<u32>) -> Vec
     }
     vobs.retain(|(p, _)| titles.contains(&vob_title(p)));
     full(&vobs)
+}
+
+/// The probe of a DVD folder rip at `path`: its main feature's first `.vob`
+/// with that file's streams and chapters, and the run times of every `.vob`
+/// of the feature added up. Port of `FFProbeVideoInfo.ProbeVideo`'s DVD
+/// branch, which probes each file as a plain video (`new Video { Path = vob }`).
+///
+/// # Errors
+///
+/// A rip with no playable `.vob` (upstream's `GetPrimaryPlaylistVobFiles`
+/// throws then, so the provider fails and stores nothing), or a `.vob` that
+/// does not probe.
+pub(crate) async fn probe_dvd(
+    encoder: &dyn MediaEncoder,
+    path: &str,
+) -> Result<MediaInfo, ServiceError> {
+    let dir = PathBuf::from(path);
+    let vobs = tokio::task::spawn_blocking(move || primary_playlist_vob_files(&dir, None))
+        .await
+        .map_err(|e| MediaEncodingError::process(e.to_string()))?;
+    let Some((first, rest)) = vobs.split_first() else {
+        return Err(MediaEncodingError::process(format!(
+            "no playable .vob files in the DVD structure {path}, skipping ffprobe"
+        ))
+        .into());
+    };
+    let vob = |file: &str| MediaInfoRequest {
+        media_source: MediaSourceInfo {
+            path: Some(file.to_owned()),
+            protocol: MediaProtocol::File,
+            video_type: Some(VideoType::VideoFile),
+            ..MediaSourceInfo::default()
+        },
+        extract_chapters: true,
+        media_is_audio: false,
+    };
+    let mut info = encoder.get_media_info_full(&vob(first)).await?;
+    for file in rest {
+        let ticks = encoder.get_media_info(&vob(file)).await?.run_time_ticks;
+        // `long?` addition: one unknown run time makes the total unknown.
+        info.media_source.run_time_ticks = info
+            .media_source
+            .run_time_ticks
+            .zip(ticks)
+            .map(|(total, ticks)| total + ticks);
+    }
+    Ok(info)
 }
 
 /// The primary playlist's files of a disc-rip source read from `path`, or

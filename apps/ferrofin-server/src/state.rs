@@ -625,11 +625,12 @@ pub async fn build_app_state(
             tracing::warn!(%err, "person identity unification failed; person favorites may not round-trip");
         }
     }
-    // One-shot: rewrite `Person` rows missing their metadata `Path` /
-    // `PresentationUniqueKey`, or carrying the generic lower-cased sort key
-    // instead of the verbatim name Jellyfin sorts people by. C# recomputes all
-    // three on every save; Ferrofin's person inserts are `INSERT OR IGNORE`, so
-    // without this a row written by an older build stays wrong forever.
+    // One-shot: rewrite `Person` rows missing their metadata `Path`, or
+    // carrying the generic lower-cased sort key instead of the verbatim name
+    // Jellyfin sorts people by. C# recomputes both on every save; Ferrofin's
+    // person inserts are `INSERT OR IGNORE`, so without this a row written by
+    // an older build stays wrong forever. (A keyless row's
+    // `PresentationUniqueKey` was already written by `run_migrations`.)
     match people_repository_impl.repair_person_items().await {
         Ok(0) => {}
         Ok(repaired) => {
@@ -1263,6 +1264,9 @@ pub async fn build_app_state(
     // every holder: the store memoizes its pass in an `Arc<OnceCell>` that
     // survives cloning, so the virtual-folder, user-view and library managers
     // settle the root together instead of each re-probing it per request.
+    // No holder may call its `ensure()` before `rebase_program_data_paths`
+    // above: the first pass resets a moved root's path, one of the anchors
+    // that repair reads.
     let user_root_store = ferrofin_core::UserRootFolderStore::new(
         Arc::clone(&item_persistence_service),
         id_derivation.clone(),
@@ -1400,6 +1404,19 @@ pub async fn build_app_state(
         .with_self_writes(Arc::clone(&self_writes_guard)),
     );
     let nfo_listener: Arc<dyn ferrofin_traits::library::UserDataSaveListener> = nfo_saver.clone();
+    // A box set's `collection.xml`: written by the metadata save, read by
+    // the box set's refresh.
+    let box_set_xml = Arc::new(
+        ferrofin_providers::box_set_xml::BoxSetXmlSaver::new(
+            Arc::clone(&item_repository),
+            Arc::clone(&item_persistence_service),
+            Arc::clone(&people_repository),
+            Arc::clone(&linked_children_service),
+            Arc::clone(&virtual_folders),
+            Arc::clone(&config_trait),
+        )
+        .with_self_writes(Arc::clone(&self_writes_guard)),
+    );
     user_data_impl.set_save_listener(Arc::downgrade(&nfo_listener))?;
     let item_visibility = Arc::new(
         ferrofin_core::item_visibility::ItemVisibility::new(
@@ -1417,6 +1434,7 @@ pub async fn build_app_state(
         LocalProviderManager::new(Vec::new())
             .with_image_saver(Arc::clone(&image_saver))
             .with_nfo_saver(Arc::clone(&nfo_saver))
+            .with_box_set_xml(box_set_xml)
             .with_image_store(
                 Arc::clone(&item_persistence_service),
                 metadata_library.clone(),
@@ -1955,10 +1973,17 @@ pub async fn build_app_state(
     // managers exist, and the scheduler starts after registration.
     let task_manager = FerrofinTaskManager::new();
     task_manager.set_trigger_store(config.config_dir.join("task_triggers.json"));
+    // A task with no override there takes an adopted Jellyfin's saved
+    // `{ConfigurationDirectoryPath}/ScheduledTasks/{id}.js` (read only).
+    task_manager
+        .set_jellyfin_config_path(std::path::Path::new(&paths.configuration_directory_path()));
     // Last run outcomes persist too (upstream keeps a per-task history file
     // under the data directory), so the dashboard's "Last ran" column and the
     // `LastExecutionResult` field survive a restart.
     task_manager.set_result_store(config.data_dir.join("task_results.json"));
+    // A task with no result there answers an adopted Jellyfin's own
+    // `{DataPath}/ScheduledTasks/{id}.js` until it runs here (read only).
+    task_manager.set_jellyfin_data_path(std::path::Path::new(&paths.data_path()));
     // Run outcomes publish `TaskCompleted` → forwarded to admin sessions as
     // the `ScheduledTaskEnded` push the dashboard's task page listens for.
     task_manager.set_event_manager(Arc::clone(&event_manager));
@@ -2130,8 +2155,8 @@ pub async fn build_app_state(
     config_mgr.add_configuration_listener(certificate_check.configuration_listener());
     // The install-time artifact validator (component + descriptor checks) —
     // built from the same settings as the host so limits match.
-    let wasm_validator: Arc<dyn ferrofin_traits::plugins::PluginArtifactValidator> = Arc::new(
-        ferrofin_wasm::WasmArtifactValidator::new(
+    let wasm_validator: Arc<dyn ferrofin_traits::plugins::PluginArtifactValidator> =
+        Arc::new(ferrofin_wasm::WasmArtifactValidator::new(
             &ferrofin_wasm::WasmSettings::resolve(
                 config.wasm_call_timeout_secs,
                 config.wasm_memory_limit_mb,
@@ -2144,9 +2169,7 @@ pub async fn build_app_state(
             .with_image_timeout_secs(config.wasm_image_timeout_secs)
             .with_write_content_mb(config.wasm_write_content_mb)
             .with_subtitle_extract_mb(config.wasm_subtitle_extract_mb),
-        )
-        .map_err(|e| anyhow::anyhow!("wasm artifact validator init: {e}"))?,
-    );
+        ));
     // Which items the "Plugin media analysis" pass offered to which plugin:
     // the pass reads and writes it, an uninstall forgets the plugin's.
     let plugin_offered_items: Arc<dyn ferrofin_traits::plugins::PluginOfferedItemStore> = Arc::new(
@@ -2206,7 +2229,8 @@ pub async fn build_app_state(
             metadata_root.clone(),
         )
         .with_virtual_folders(Arc::clone(&virtual_folders))
-        .with_self_writes(Arc::clone(&self_writes_guard)),
+        .with_self_writes(Arc::clone(&self_writes_guard))
+        .with_activity(Arc::clone(&activity)),
     );
     let subtitle_downloader = Arc::new(
         ferrofin_core::subtitle_downloader::SubtitleDownloader::new(
@@ -2262,6 +2286,14 @@ pub async fn build_app_state(
     let intro_skipper: Arc<dyn ferrofin_traits::intro_skipper::IntroSkipperStore> = Arc::new(
         ferrofin_core::intro_skipper_repository::FerrofinIntroSkipperStore::new(db.clone()),
     );
+    // The core "Media Segment Scan", registered below; the Intro Skipper's
+    // scan, registered after it under the same key, runs it after detection.
+    let media_segment_scan: Arc<dyn ferrofin_traits::tasks::ScheduledTask> = Arc::new(
+        ferrofin_core::scheduled_tasks::library::MediaSegmentExtractionTask::new(
+            Arc::clone(&library),
+            Arc::clone(&media_segments),
+        ),
+    );
     let extension_cx = ferrofin_extensions::ExtensionContext {
         library: Arc::clone(&library),
         media_segments: Arc::clone(&media_segments),
@@ -2286,11 +2318,12 @@ pub async fn build_app_state(
         // The providers' own download path, so an extension's image fetch keeps
         // the destination policy and size limit set above.
         remote_images: Arc::new(ferrofin_providers::remote_images::LimitedImageFetcher),
+        media_segment_scan: Arc::clone(&media_segment_scan),
     };
     // The user manager was built long before the extensions: their
     // authentication and password-reset providers fill its late slots now,
     // before the server takes a request. Every clone of the manager shares them.
-    ferrofin_extensions::register_auth_providers(&extensions, &extension_cx, &users_impl);
+    ferrofin_extensions::register_auth_providers(&extensions, &extension_cx, users_impl.as_ref());
     // One-shot, before the server takes a request: an adopted Jellyfin's
     // LDAP-Auth settings and uid map come across from the plugin's XML, so its
     // directory users sign in with no admin action (B7).
@@ -2322,12 +2355,7 @@ pub async fn build_app_state(
     for provider in wasm_host.media_segment_providers(&plugins) {
         media_segments.register_segment_provider(provider);
     }
-    task_manager.register(Arc::new(
-        ferrofin_core::scheduled_tasks::library::MediaSegmentExtractionTask::new(
-            Arc::clone(&library),
-            Arc::clone(&media_segments),
-        ),
-    ));
+    task_manager.register(media_segment_scan);
     ferrofin_extensions::register_tasks(&extensions, &extension_cx, &task_manager);
     // Tier-1b WASM plugin tasks and event delivery. Tasks self-gate on the
     // plugin's enabled flag (the Tier-1a pattern); event delivery is
@@ -2497,6 +2525,10 @@ pub async fn build_app_state(
             Arc::clone(&chapters),
         ));
     item_data_cleanup.set_external_data(external_data);
+    // The rows the repairs deleted while the database opened (orphaned
+    // extras, path duplicates) take their metadata folders and extracted
+    // data, now that the configured directories and the cleanup are known.
+    ferrofin_core::adoption_repairs::run_cleanup_deleted_item_data(db, &item_data_cleanup).await;
     // Jellyfin 12.0's sweeps of a 10.11 database's items whose library or
     // file is gone delete through the library manager, so they run once it
     // removes extracted data too, and before a startup trigger can scan.
@@ -3197,13 +3229,16 @@ pub async fn build_app_state(
     // compiled-in registration (the upstream plugin registers it via .NET
     // reflection); both transformers self-gate on their plugin's enabled flag
     // and configuration, so dashboard toggles apply live.
+    let file_transformation_service = Arc::new(
+        ferrofin_extensions::file_transformation::WebFileTransformationService::new(
+            Arc::clone(&plugins),
+            Arc::clone(&app_host) as Arc<_>,
+        ),
+    );
+    // A save of the admin-defined transformations applies from the next request.
+    ferrofin_extensions::file_transformation::subscribe(&event_bus, &file_transformation_service);
     let file_transformations: Arc<dyn ferrofin_traits::plugins::FileTransformationService> =
-        Arc::new(
-            ferrofin_extensions::file_transformation::WebFileTransformationService::new(
-                Arc::clone(&plugins),
-                Arc::clone(&app_host) as Arc<_>,
-            ),
-        );
+        file_transformation_service;
     ferrofin_extensions::file_transformation::register_skip_button_transformer(
         file_transformations.as_ref(),
         Arc::clone(&plugins),
@@ -3859,6 +3894,15 @@ mod tests {
         }
         async fn support_bundle(&self) -> String {
             String::new()
+        }
+        fn operating_system(&self) -> String {
+            String::new()
+        }
+        async fn create_or_replace_segment(
+            &self,
+            _segment: &ferrofin_model::media_segments::MediaSegmentDto,
+        ) -> Result<(), ferrofin_traits::error::ServiceError> {
+            Ok(())
         }
         async fn hides_intros(&self, _item_id: uuid::Uuid) -> bool {
             false

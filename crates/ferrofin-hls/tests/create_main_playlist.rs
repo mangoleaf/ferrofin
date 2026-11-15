@@ -14,6 +14,7 @@ use ferrofin_hls::{
 };
 use ferrofin_keyframes::keyframe_data::KeyframeData;
 use ferrofin_model::configuration::EncodingOptions;
+use ferrofin_util::ticks::TICKS_PER_MS;
 use uuid::Uuid;
 
 /// Fake extractor: yields preset keyframe data (or nothing) regardless of input.
@@ -43,10 +44,8 @@ fn config_with_extensions(extensions: Vec<String>) -> impl EncodingOptionsProvid
     }
 }
 
-const TICKS_PER_MILLISECOND: i64 = 10_000;
-
 fn ms_to_ticks(ms: i64) -> i64 {
-    ms * TICKS_PER_MILLISECOND
+    ms * TICKS_PER_MS
 }
 
 #[tokio::test]

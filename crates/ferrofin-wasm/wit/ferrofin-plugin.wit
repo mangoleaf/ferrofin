@@ -503,8 +503,9 @@ interface host {
     /// Updates a user's watch state for one item (played/favorite/resume).
     /// TRUST NOTE: this mutates REAL user data for ANY user — the strongest
     /// write a plugin has (it exists for scrobble-sync plugins like Trakt).
-    /// It is logged per call with the plugin named; install plugins that
-    /// declare it in their documentation and that you trust.
+    /// Each plugin call that writes logs one info line naming the plugin and
+    /// how many writes it made, and each write is logged at debug; install
+    /// plugins that declare it in their documentation and that you trust.
     set-user-data: func(user-id: string, item-id: string, update: user-data-update) -> result<_, string>;
 
     /// Saves lyrics for an audio item (replacing existing ones). `format`

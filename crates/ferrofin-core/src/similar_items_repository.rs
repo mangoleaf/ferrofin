@@ -350,6 +350,22 @@ fn weighted_similar_sql(type_count: usize, exclude_count: usize) -> String {
     sql
 }
 
+/// Test hooks for the manager's tests.
+#[cfg(test)]
+pub(crate) mod test_hooks {
+    use ferrofin_db::Database;
+
+    /// Drops `PeopleBaseItemMap`, so the score pass fails while the item and
+    /// provider-id reads still work: a database error confined to the local
+    /// scorer.
+    pub(crate) async fn break_the_score_pass(db: &Database) {
+        sqlx::query(r#"DROP TABLE "PeopleBaseItemMap""#)
+            .execute(db.writer())
+            .await
+            .expect("drop PeopleBaseItemMap");
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use ferrofin_db::Database;

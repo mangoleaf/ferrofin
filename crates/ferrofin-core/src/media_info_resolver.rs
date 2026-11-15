@@ -19,7 +19,7 @@ use std::sync::Arc;
 
 use ferrofin_model::dlna::DlnaProfileType;
 use ferrofin_model::dto::MediaSourceInfo;
-use ferrofin_model::entities::MediaStreamType;
+use ferrofin_model::entities::{MediaStreamType, VideoType};
 use ferrofin_model::entities_media::MediaStream;
 use ferrofin_model::io::FileSystemEntryType;
 use ferrofin_model::media_info::MediaProtocol;
@@ -45,9 +45,33 @@ pub struct ExternalMediaTarget {
     /// also searched — subtitles uploaded against a read-only library are
     /// written there. `None` when the caller has no metadata root.
     pub internal_metadata_path: Option<String>,
+    /// Whether the video is a DVD or Blu-ray rip, whose sidecars are named
+    /// after its whole path name (`Video.FileNameWithoutExtension`).
+    pub disc: bool,
 }
 
 impl ExternalMediaTarget {
+    /// The target for `video` at `path`, as `Video` overrides the base item:
+    /// the folder is its `ContainingFolderPath` (a disc rip's own folder, a
+    /// stacked set's parent folder, else the file's directory), and a DVD or
+    /// Blu-ray is named by its whole path name.
+    #[must_use]
+    pub fn for_video(
+        video: &ferrofin_db::entities::base_items::BaseItemEntity,
+        path: &str,
+        internal_metadata_path: Option<String>,
+    ) -> Self {
+        Self {
+            path: path.to_owned(),
+            containing_folder: crate::video_versions::containing_folder_path_at(video, path),
+            internal_metadata_path,
+            disc: matches!(
+                crate::item_data::video_format(video.data.as_deref()).video_type,
+                VideoType::Dvd | VideoType::BluRay
+            ),
+        }
+    }
+
     /// A target for a plain video **file**: the containing folder is the
     /// file's directory (`Path.GetDirectoryName`).
     #[cfg(test)]
@@ -61,34 +85,28 @@ impl ExternalMediaTarget {
             path,
             containing_folder,
             internal_metadata_path,
+            disc: false,
         }
     }
 
     /// The video's file name without extension — the prefix every external
-    /// file's name must start with (`Video.FileNameWithoutExtension`).
+    /// file's name must start with (`Video.FileNameWithoutExtension`). A DVD
+    /// or Blu-ray keeps its whole name (`GetFileName`), so a rip folder's
+    /// dots stay.
     #[must_use]
     pub fn file_name_without_extension(&self) -> &str {
-        naming_path::file_name_without_extension(&self.path)
+        if self.disc {
+            naming_path::file_name(&self.path)
+        } else {
+            naming_path::file_name_without_extension(&self.path)
+        }
     }
 }
 
-/// Whether a path is a local file rather than a network stream — the port of
-/// `MediaSourceManager.GetPathProtocol(path) == MediaProtocol.File`, which
-/// `BaseItem.IsFileProtocol` reads. External files are only ever looked for
-/// next to a local file.
-#[must_use]
-pub fn is_file_protocol(path: &str) -> bool {
-    const STREAM_SCHEMES: [&str; 6] = ["rtsp", "rtmp", "http", "rtp", "ftp", "udp"];
-    let lower = path.to_ascii_lowercase();
-    if STREAM_SCHEMES
-        .iter()
-        .any(|scheme| lower.starts_with(scheme))
-    {
-        return false;
-    }
-    // `IFileSystem.IsPathFile`: a scheme other than `file://` is not a file.
-    !lower.contains("://") || lower.starts_with("file://")
-}
+/// Whether a path is a local file rather than a network stream
+/// (`BaseItem.IsFileProtocol`). External files are only ever looked for next to
+/// a local file.
+pub use ferrofin_model::media_info::is_file_protocol;
 
 /// Resolves external files of one [`DlnaProfileType`] (subtitle or audio)
 /// for a video. Port of the abstract `MediaInfoResolver`; the
@@ -553,9 +571,8 @@ impl ExternalStreamResolvers {
         &self.lyrics
     }
 
-    /// The search target for a video at `path`: its containing folder is the
-    /// file's directory, or the folder itself for a disc rip (see
-    /// [`containing_folder_for`]).
+    /// The search target for an audio track at `path`: its containing folder
+    /// is the file's directory (see [`containing_folder_for`]).
     #[must_use]
     pub fn target_for(
         &self,
@@ -566,6 +583,7 @@ impl ExternalStreamResolvers {
             path: path.to_owned(),
             containing_folder: containing_folder_for(path, self.subtitles.file_system.as_ref()),
             internal_metadata_path,
+            disc: false,
         }
     }
 
@@ -608,8 +626,9 @@ impl ExternalStreamResolvers {
     }
 }
 
-/// Whether `path` names a directory on disk — a disc rip's containing folder
-/// is the rip folder itself (`Video.ContainingFolderPath` for BluRay/DVD).
+/// The folder of the file at `path` (`BaseItem.ContainingFolderPath`), or
+/// `path` itself when it names a directory on disk. A video's folder is
+/// [`ExternalMediaTarget::for_video`]'s.
 #[must_use]
 pub fn containing_folder_for(path: &str, file_system: &dyn FileSystem) -> String {
     if file_system.directory_exists(path) {
@@ -869,6 +888,7 @@ mod tests {
             path: format!("{VIDEO_DIRECTORY_PATH}/My.Video.mkv"),
             containing_folder: containing_folder.to_owned(),
             internal_metadata_path: Some(metadata_path.to_owned()),
+            disc: false,
         };
 
         let _ignored = resolver.get_external_files(&video);
@@ -913,6 +933,58 @@ mod tests {
         let actual = &streams[0];
         assert_eq!(actual.language.as_deref(), language);
         assert_eq!(actual.title, None);
+    }
+
+    /// `Video.ContainingFolderPath` and `FileNameWithoutExtension` of a DVD
+    /// rip: a single rip's sidecars sit inside its folder, a stacked set's in
+    /// the set's folder, both named after the whole disc folder name, dots
+    /// included.
+    #[rstest]
+    #[case::rip("The.Film.2020", None, "The.Film.2020")]
+    #[case::stacked_set("Set.2020 - Disc 1", Some("Set.2020 - Disc 2"), VIDEO_DIRECTORY_PATH)]
+    fn a_disc_rips_sidecars_are_named_after_its_whole_folder(
+        #[case] disc: &str,
+        #[case] next_part: Option<&str>,
+        #[case] folder: &str,
+    ) {
+        let rip = format!("{VIDEO_DIRECTORY_PATH}/{disc}");
+        let folder = if folder == VIDEO_DIRECTORY_PATH {
+            folder.to_owned()
+        } else {
+            format!("{VIDEO_DIRECTORY_PATH}/{folder}")
+        };
+        let stem = disc.split('.').next().unwrap();
+        let fs = FakeFs::new(
+            &[VIDEO_DIRECTORY_PATH, rip.as_str()],
+            vec![(
+                folder.as_str(),
+                vec![
+                    format!("{folder}/{disc}.en.srt"),
+                    format!("{folder}/{stem}.srt"),
+                ],
+            )],
+        );
+        let data = match next_part {
+            Some(part) => serde_json::json!({
+                "VideoType": "Dvd",
+                "AdditionalParts": [format!("{VIDEO_DIRECTORY_PATH}/{part}")],
+            }),
+            None => serde_json::json!({ "VideoType": "Dvd" }),
+        };
+        let row = ferrofin_db::entities::base_items::BaseItemEntity {
+            path: Some(rip.clone()),
+            data: Some(data.to_string()),
+            ..Default::default()
+        };
+        let resolver = resolver(DlnaProfileType::Subtitle, vec![MediaStream::default()], fs);
+        let video = ExternalMediaTarget::for_video(&row, &rip, None);
+
+        assert_eq!(video.containing_folder, folder);
+        assert_eq!(video.file_name_without_extension(), disc);
+        let streams = resolver.get_external_files(&video);
+        assert_eq!(streams.len(), 1, "{streams:?}");
+        assert_eq!(streams[0].language.as_deref(), Some("eng"));
+        assert_eq!(streams[0].title, None);
     }
 
     // GetExternalFiles_NameMatching_RejectsNonMatches
@@ -1556,18 +1628,6 @@ mod tests {
                 .is_some_and(|p| p.ends_with("My.Video.good.mka"))
         );
         assert_eq!(streams[0].index, 0);
-    }
-
-    #[rstest]
-    #[case("/media/Movie.mkv", true)]
-    #[case("file:///media/Movie.mkv", true)]
-    #[case("C:\\media\\Movie.mkv", true)]
-    #[case("https://url.com/My.Video.mkv", false)]
-    #[case("HTTP://url.com/My.Video.mkv", false)]
-    #[case("rtsp://cam/stream", false)]
-    #[case("smb://nas/share/Movie.mkv", false)]
-    fn is_file_protocol_matches_get_path_protocol(#[case] path: &str, #[case] is_file: bool) {
-        assert_eq!(is_file_protocol(path), is_file);
     }
 
     // `GetExternalStreams(Audio, …)`: every lyric sidecar whose stem is the

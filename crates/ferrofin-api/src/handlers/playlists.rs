@@ -48,7 +48,8 @@ use uuid::Uuid;
 use crate::auth::RequireAuth;
 use crate::error::{ApiError, ProblemStatus};
 use crate::extract::{
-    DotnetGuid, JsonBody, Query, RequiredRouteString, RouteParameter, blank_route_values,
+    DotnetGuid, JsonBody, ProblemDetails, Query, RequiredRouteString, RouteParameter,
+    blank_route_values,
 };
 use crate::handlers::items::effective_user_id;
 use crate::handlers::query_parse::{parse_csv_strings, parse_csv_uuids};
@@ -641,6 +642,11 @@ async fn get_playlist_user(
 /// Port of `PlaylistsController.UpdatePlaylistUser`: **owner-only** (`403` for
 /// any other caller); a missing/invisible playlist is `404`. The upsert persists
 /// to the `PlaylistShares` table.
+///
+/// The body is `[FromBody(EmptyBodyBehavior = EmptyBodyBehavior.Allow),
+/// Required]`: an empty body whatever the content type, or `null` with a JSON
+/// one, binds null, and `[Required]` refuses it before the action runs, so it
+/// is a `400` ahead of the `404` and the `403`.
 #[utoipa::path(
     post,
     path = "/Playlists/{playlistId}/Users/{userId}",
@@ -651,6 +657,7 @@ async fn get_playlist_user(
     ),
     responses(
         (status = 204, description = "User's permissions modified"),
+        (status = 400, description = "No body, one that does not bind, or a nil user id"),
         (status = 403, description = "Access forbidden"),
         (status = 404, description = "Playlist not found")
     ),
@@ -661,8 +668,16 @@ async fn update_playlist_user(
     RequireAuth(auth): RequireAuth,
     Path((DotnetGuid(playlist_id), DotnetGuid(user_id))): Path<(DotnetGuid, DotnetGuid)>,
     body: Option<JsonBody<UpdatePlaylistUserDto>>,
-) -> Result<StatusCode, ApiError> {
-    let body = body.map(|JsonBody(b)| b).unwrap_or_default();
+) -> Result<Response, ApiError> {
+    // The one `[Required]` body upstream binds with `EmptyBodyBehavior.Allow`,
+    // so its entry is spelled here, not looked up in `query/body.json`.
+    let Some(JsonBody(body)) = body else {
+        return Ok(ProblemDetails::validation(
+            "",
+            "The updatePlaylistUserRequest field is required.",
+        )
+        .into_response());
+    };
     let access = state
         .playlists
         .get_playlist_access(playlist_id, auth.user_id())
@@ -678,7 +693,7 @@ async fn update_playlist_user(
         can_edit: body.can_edit,
     };
     state.playlists.add_user_to_shares(&request).await?;
-    Ok(StatusCode::NO_CONTENT)
+    Ok(StatusCode::NO_CONTENT.into_response())
 }
 
 /// `DELETE /Playlists/{playlistId}/Users/{userId}` — revokes a user's share.
