@@ -15,7 +15,7 @@ use axum::extract::State;
 use axum::routing::get;
 use axum::{Json, Router};
 use ferrofin_db::entities::base_items::BaseItemEntity;
-use ferrofin_model::data::BaseItemKind;
+use ferrofin_model::data::{BaseItemKind, CollectionType};
 use ferrofin_model::dto::BaseItemDto;
 use ferrofin_model::querying::QueryResult;
 use ferrofin_traits::options::DtoOptions;
@@ -75,8 +75,9 @@ async fn get_genres(
 /// `musicvideos` (`GenresController.cs:141-150`).
 ///
 /// A library's collection type is stored in its row's `Data` blob, the same
-/// field its DTO's `CollectionType` comes from. Another kind of parent, no
-/// stored type, or no parent keeps the plain genres answer.
+/// field its DTO's `CollectionType` comes from, and binds the same way
+/// ([`CollectionType::from_item_data`]). Another kind of parent, no stored
+/// type, or no parent keeps the plain genres answer.
 fn is_music_collection_folder(parent: Option<&BaseItemEntity>) -> bool {
     let Some(parent) = parent else {
         return false;
@@ -84,16 +85,10 @@ fn is_music_collection_folder(parent: Option<&BaseItemEntity>) -> bool {
     if parent.type_.rsplit('.').next() != Some("CollectionFolder") {
         return false;
     }
-    let data: serde_json::Value = parent
-        .data
-        .as_deref()
-        .and_then(|data| serde_json::from_str(data).ok())
-        .unwrap_or_default();
-    data.get("CollectionType")
-        .and_then(serde_json::Value::as_str)
-        .is_some_and(|kind| {
-            kind.eq_ignore_ascii_case("music") || kind.eq_ignore_ascii_case("musicvideos")
-        })
+    matches!(
+        CollectionType::from_item_data(parent.data.as_deref(), "CollectionType"),
+        Some(CollectionType::music | CollectionType::musicvideos)
+    )
 }
 
 /// `{genreName}`, the `[FromRoute, Required] string` of `GetGenre`.
@@ -149,4 +144,26 @@ pub fn register(router: Router<AppState>) -> Router<AppState> {
     router
         .route("/Genres", get(get_genres))
         .route("/Genres/{genreName}", get(get_genre))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A music library's type binds as its DTO's does: a padded name or the
+    /// number (`3`, `4`) counts as music too.
+    #[rstest::rstest]
+    #[case(r#"{"CollectionType":"Music"}"#, true)]
+    #[case(r#"{"CollectionType":3}"#, true)]
+    #[case(r#"{"CollectionType":" musicvideos "}"#, true)]
+    #[case(r#"{"CollectionType":"movies"}"#, false)]
+    #[case(r#"{"CollectionType":"mixed"}"#, false)]
+    fn a_music_library_is_found_by_its_bound_type(#[case] data: &str, #[case] music: bool) {
+        let library = BaseItemEntity {
+            type_: "MediaBrowser.Controller.Entities.CollectionFolder".to_owned(),
+            data: Some(data.to_owned()),
+            ..BaseItemEntity::default()
+        };
+        assert_eq!(is_music_collection_folder(Some(&library)), music);
+    }
 }

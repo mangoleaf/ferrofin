@@ -105,14 +105,14 @@ pub fn parse_data(data: Option<&str>) -> Map<String, Value> {
         .unwrap_or_default()
 }
 
-/// The `CollectionType` a row's `Data` stores, lower-cased: how a library's
-/// type (`CollectionFolder.CollectionType`) is read case-insensitively.
-/// `mixed` comes back as stored; callers that read it as no type filter it.
+/// A library's type (`CollectionFolder.CollectionType`) from its row's `Data`,
+/// bound as Jellyfin binds it ([`CollectionType::from_item_data`]), by its C#
+/// `ToString()` name. A mixed library (`mixed`, no member) has none.
+///
+/// [`CollectionType::from_item_data`]: ferrofin_model::data::CollectionType::from_item_data
 pub(crate) fn stored_collection_type(data: Option<&str>) -> Option<String> {
-    parse_data(data)
-        .get("CollectionType")
-        .and_then(Value::as_str)
-        .map(str::to_ascii_lowercase)
+    ferrofin_model::data::CollectionType::from_item_data(data, "CollectionType")
+        .map(|kind| kind.json_name().into_owned())
 }
 
 /// A library row's `PhysicalLocationsList` from its `Data`, as stored: a virtual-path token stays
@@ -1415,6 +1415,23 @@ mod tests {
         #[case] expected: &[&str],
     ) {
         assert_eq!(stored_physical_locations(data), expected);
+    }
+
+    /// A library's type reads by Jellyfin's binding and comes back by name: a
+    /// number or a padded name classifies, an unknown name or `mixed` is none.
+    #[rstest::rstest]
+    #[case(Some(r#"{"CollectionType":"Movies"}"#), Some("movies"))]
+    #[case(Some(r#"{"CollectionType":" boxsets "}"#), Some("boxsets"))]
+    #[case(Some(r#"{"CollectionType":11}"#), Some("playlists"))]
+    #[case(Some(r#"{"CollectionType":"mixed"}"#), None)]
+    #[case(Some(r#"{"CollectionType":"nonsense"}"#), None)]
+    #[case(Some(r#"{"ViewType":"movies"}"#), None)]
+    #[case(None, None)]
+    fn stored_collection_type_binds_as_jellyfin(
+        #[case] data: Option<&str>,
+        #[case] expected: Option<&str>,
+    ) {
+        assert_eq!(stored_collection_type(data).as_deref(), expected);
     }
 
     /// `Video.UpdateFromResolvedItem` (`Video.cs:500-526`) over the `Data`

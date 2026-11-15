@@ -104,7 +104,7 @@ use std::sync::Arc;
 use chrono::{DateTime, Utc};
 use ferrofin_db::entities::base_items::BaseItemEntity;
 use ferrofin_db::store::datetime_to_db;
-use ferrofin_model::data::BaseItemKind;
+use ferrofin_model::data::{BaseItemKind, CollectionType};
 use ferrofin_model::dto::SortOrder;
 use ferrofin_model::entities::ImageType;
 use ferrofin_model::live_tv::ItemSortBy;
@@ -675,7 +675,10 @@ impl DynamicImageProviders {
     /// no `ParentId` (the two roots) is answered without a query.
     async fn folder_supported(&self, item: &BaseItemEntity) -> Result<bool, ServiceError> {
         let kind = kind_from_type_name(&item.type_);
-        let collection_type = row_collection_type(item);
+        // The `IHasCollectionType` value `BaseItem.IsTopParent` tests for `livetv`.
+        let collection_type = kind
+            .and_then(|kind| crate::dto_service::collection_type_of(item, kind))
+            .map(CollectionType::json_name);
         if let Some(kind) = kind
             && crate::kinds::is_top_parent(kind, None, collection_type.as_deref())
         {
@@ -1075,18 +1078,6 @@ fn remove_other_primaries(item_dir: &Path, keep: &Path) {
             tracing::debug!(%err, path = %candidate.display(), "stale primary not removed");
         }
     }
-}
-
-/// The row's `CollectionType`, read out of the serialized `Data` blob (where
-/// `ItemRepository` keeps it) — the `IHasCollectionType` value
-/// `BaseItem.IsTopParent` tests for `livetv`.
-fn row_collection_type(item: &BaseItemEntity) -> Option<String> {
-    let data = item.data.as_deref()?;
-    let value: serde_json::Value = serde_json::from_str(data).ok()?;
-    value
-        .get("CollectionType")
-        .and_then(serde_json::Value::as_str)
-        .map(str::to_owned)
 }
 
 #[cfg(test)]
@@ -1678,6 +1669,30 @@ mod tests {
         let primary = fx.primary_of(playlist).await.expect("playlist primary");
         let decoded = image::open(&primary.path).expect("png");
         assert_eq!((decoded.width(), decoded.height()), (600, 600));
+    }
+
+    /// `IsTopParent`'s `livetv` test reads `IHasCollectionType.CollectionType`,
+    /// never a stray `CollectionType` member on a plain folder, which is no
+    /// `IHasCollectionType`. [`DynamicImageKind::for_entity`] routes only the
+    /// plain folder kinds here; the user-view case pins the kind-aware read
+    /// (its bound `ViewType`, a number included) for a kind it may add.
+    #[tokio::test]
+    async fn the_live_tv_top_parent_test_reads_the_collection_type_of_the_kind() {
+        let fx = fixture().await;
+        let row = |kind: BaseItemKind, data: &str| BaseItemEntity {
+            type_: stored_type_name(kind).expect("type name").to_owned(),
+            data: Some(data.to_owned()),
+            ..Default::default()
+        };
+        let folder = row(BaseItemKind::Folder, r#"{"CollectionType":"livetv"}"#);
+        assert!(
+            fx.providers
+                .folder_supported(&folder)
+                .await
+                .expect("folder")
+        );
+        let live_tv = row(BaseItemKind::UserView, r#"{"ViewType":10}"#);
+        assert!(!fx.providers.folder_supported(&live_tv).await.expect("view"));
     }
 
     /// `FolderImageProvider` (`FolderImageProvider.cs` +

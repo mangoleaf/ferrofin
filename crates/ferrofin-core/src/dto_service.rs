@@ -790,8 +790,12 @@ fn enables_original_folder(view_type: Option<&str>) -> bool {
 /// - `PlaylistsFolder`/`ManualPlaylistsFolder` (PlaylistsFolder.cs:29) — the
 ///   constant `playlists`, a property on the type with nothing stored.
 ///
-/// An unparseable or absent value leaves the field unset, exactly as a C# null.
-fn collection_type_of(item: &BaseItemEntity, kind: BaseItemKind) -> Option<CollectionType> {
+/// The stored value binds as Jellyfin binds it ([`CollectionType::from_item_data`]);
+/// one that does not bind, or none, leaves the field unset, exactly as a C# null.
+pub(crate) fn collection_type_of(
+    item: &BaseItemEntity,
+    kind: BaseItemKind,
+) -> Option<CollectionType> {
     let key = match kind {
         BaseItemKind::ManualPlaylistsFolder | BaseItemKind::PlaylistsFolder => {
             return Some(CollectionType::playlists);
@@ -800,9 +804,7 @@ fn collection_type_of(item: &BaseItemEntity, kind: BaseItemKind) -> Option<Colle
         BaseItemKind::UserView => "ViewType",
         _ => return None,
     };
-    let parsed: serde_json::Value = serde_json::from_str(item.data.as_deref()?).ok()?;
-    let name = parsed.get(key)?.as_str()?.to_ascii_lowercase();
-    serde_json::from_value(serde_json::Value::String(name)).ok()
+    CollectionType::from_item_data(item.data.as_deref(), key)
 }
 
 /// Splits a stored pipe-delimited multi-value column into a list, dropping
@@ -1307,14 +1309,12 @@ impl ImageParentGraph {
 /// The `DisplayParentId` a `UserView` carries in its `Data` blob, when the
 /// view is the playlists view (`UserView { ViewType: CollectionType.playlists }`).
 fn playlists_view_display_parent(item: &BaseItemEntity) -> Option<Uuid> {
-    let blob = item.data.as_deref()?;
-    if !blob.contains("playlists") {
-        return None;
-    }
-    let data = crate::item_data::parse_data(Some(blob));
-    let is_playlists = crate::item_data::read_data_string(&data, "ViewType")
-        .is_some_and(|v| v.eq_ignore_ascii_case("playlists"));
-    if !is_playlists {
+    let data = crate::item_data::parse_data(item.data.as_deref());
+    if data
+        .get("ViewType")
+        .and_then(CollectionType::from_data_member)
+        != Some(CollectionType::playlists)
+    {
         return None;
     }
     stored_id(crate::item_data::read_data_string(&data, "DisplayParentId").as_deref())
@@ -13747,5 +13747,69 @@ mod tests {
         let (svc, _tmp) = service_with_real_permissions(&db).await;
         let item = fetch_item(&db, movie).await;
         assert!(!svc.can_delete(&item, &entity).await.expect("can delete"));
+    }
+
+    /// `IHasCollectionType.CollectionType` binds from `Data` as Jellyfin binds
+    /// it: a padded name and a number set the field, as they do upstream.
+    #[rstest::rstest]
+    #[case(
+        BaseItemKind::CollectionFolder,
+        r#"{"CollectionType":" Movies "}"#,
+        Some(CollectionType::movies)
+    )]
+    #[case(
+        BaseItemKind::CollectionFolder,
+        r#"{"CollectionType":2}"#,
+        Some(CollectionType::tvshows)
+    )]
+    #[case(BaseItemKind::CollectionFolder, r#"{"CollectionType":"mixed"}"#, None)]
+    #[case(
+        BaseItemKind::UserView,
+        r#"{"ViewType":11}"#,
+        Some(CollectionType::playlists)
+    )]
+    #[case(
+        BaseItemKind::UserView,
+        r#"{"ViewType":"MovieResume"}"#,
+        Some(CollectionType::Movieresume)
+    )]
+    #[case(BaseItemKind::UserView, r#"{"CollectionType":"movies"}"#, None)]
+    #[case(BaseItemKind::Folder, r#"{"CollectionType":"movies"}"#, None)]
+    fn collection_type_binds_from_data(
+        #[case] kind: BaseItemKind,
+        #[case] data: &str,
+        #[case] expected: Option<CollectionType>,
+    ) {
+        let item = BaseItemEntity {
+            data: Some(data.to_owned()),
+            ..BaseItemEntity::default()
+        };
+        assert_eq!(collection_type_of(&item, kind), expected);
+    }
+
+    /// The playlists view is found by the same binding: a numeric `ViewType`
+    /// (`11`) is the playlists view too.
+    #[rstest::rstest]
+    #[case(
+        r#"{"ViewType":"Playlists","DisplayParentId":"00000000000000000000000000000abc"}"#,
+        true
+    )]
+    #[case(
+        r#"{"ViewType":11,"DisplayParentId":"00000000000000000000000000000abc"}"#,
+        true
+    )]
+    #[case(
+        r#"{"ViewType":"movies","DisplayParentId":"00000000000000000000000000000abc"}"#,
+        false
+    )]
+    fn playlists_view_is_found_by_its_bound_view_type(#[case] data: &str, #[case] found: bool) {
+        let item = BaseItemEntity {
+            data: Some(data.to_owned()),
+            ..BaseItemEntity::default()
+        };
+        assert_eq!(
+            playlists_view_display_parent(&item),
+            found.then_some(Uuid::from_u128(0xabc))
+        );
     }
 }
