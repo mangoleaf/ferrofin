@@ -223,13 +223,25 @@ pub(crate) async fn download_image(url: &str) -> Result<(Vec<u8>, String), Image
     Ok((image.into_bytes().await?, content_type))
 }
 
-/// GETs `url` for a caller that names the file itself, so it needs no media
-/// type and only the bytes have to be an image. `None` on any failure.
-pub(crate) async fn download_bytes(url: &str) -> Option<Vec<u8>> {
-    fetch_image_bytes(url).await.ok()
+/// [`download_image`] for a caller that goes on without the image (the scan's
+/// download of a person's profile photo or a studio's thumb): `None` on any
+/// failure, its reason logged at debug. A refusal counts no request failure.
+pub(crate) async fn download_image_or_none(url: &str) -> Option<(Vec<u8>, String)> {
+    match download_image(url).await {
+        Ok(image) => Some(image),
+        Err(error) => {
+            tracing::debug!(
+                url = %ferrofin_util::source_url::redact_url(url),
+                ?error,
+                "remote image dropped"
+            );
+            None
+        }
+    }
 }
 
-/// [`download_bytes`] with the reason it found no image: `404`/`403` is
+/// GETs `url` for a caller that names the file itself, so it needs no media
+/// type and only the bytes have to be an image: `404`/`403` is
 /// [`Missing`](ImageFetchError::Missing), another status that is not a
 /// success [`Unavailable`](ImageFetchError::Unavailable), and a body whose
 /// first bytes are no image [`NotAnImage`](ImageFetchError::NotAnImage).
@@ -559,17 +571,27 @@ mod body_tests {
         assert_eq!(failures, 1);
     }
 
-    /// A scan's direct download keeps an image and drops anything else, with
+    /// A scan's direct download (a person's photo, a studio's thumb) keeps an
+    /// image with the type it is stored under, and drops anything else with
     /// no failure counted, so a studio's thumb is not asked for forever.
+    /// gl-219: an image-looking body the response calls `text/html` is no
+    /// image either, as upstream's `SaveImage` refuses it.
+    #[rstest]
+    #[case::an_image(PNG_TYPE, png_of(16), Some((png_of(16), "image/png".to_owned())))]
+    #[case::an_html_type("Content-Type: text/html\r\n", png_of(16), None)]
+    #[case::an_html_body(PNG_TYPE, b"<html></html>".to_vec(), None)]
     #[tokio::test]
-    async fn a_direct_download_keeps_only_an_image() {
-        let server = MockServer::start_raw(vec![MockServer::raw_ok("", &png_of(16))]).await;
-        assert_eq!(download_bytes(&server.base_url).await, Some(png_of(16)));
-
-        let server = MockServer::start_raw(vec![MockServer::raw_ok("", b"<html></html>")]).await;
-        let (bytes, failures) =
-            crate::rate_limit::count_request_failures(download_bytes(&server.base_url)).await;
-        assert_eq!(bytes, None);
+    async fn a_direct_download_keeps_only_an_image(
+        #[case] headers: &str,
+        #[case] body: Vec<u8>,
+        #[case] expected: Option<(Vec<u8>, String)>,
+    ) {
+        let server = MockServer::start_raw(vec![MockServer::raw_ok(headers, &body)]).await;
+        let (download, failures) = crate::rate_limit::count_request_failures(
+            crate::StudiosClient::new().download(&server.base_url),
+        )
+        .await;
+        assert_eq!(download, expected);
         assert_eq!(failures, 0);
     }
 
@@ -940,7 +962,7 @@ mod destination_tests {
             crate::rate_limit::count_request_failures(download_artwork(private)).await;
         assert!(matches!(outcome, Err(ArtworkDownloadFailure::Skip)));
         assert_eq!(failures, 0);
-        assert_eq!(download_bytes(private).await, None);
+        assert!(download_image(private).await.is_err());
     }
 
     /// The resolver refuses at connect time too: a name whose answer turns

@@ -19,7 +19,7 @@
 
 use super::dotnet::int_try_parse;
 use super::model::{Paragraph, Subtitle, TimeCode, dotnet_int};
-use super::srt::NEWLINE;
+use super::srt::{ErrorText, NEWLINE};
 use super::ssa_style::{
     DEFAULT_ASS_STYLE_FORMAT, SsaStyle, ssa_style_from_header, styles_from_header,
 };
@@ -43,22 +43,22 @@ enum Variant {
     Ass,
 }
 
-/// Parses ASS `lines` into `subtitle`, returning the number of errors.
+/// Parses ASS `lines` into `subtitle`, returning libse's `ErrorCount` and `Errors`.
 ///
 /// Port of `AdvancedSubStationAlpha.LoadSubtitle`: the header is every line before
 /// the events, the `[Fonts]`/`[Graphics]`/`[Aegisub Extradata]` sections are the
 /// footer, and each event keeps its style, actor, margins, effect and layer. The text
 /// keeps its override tags; only `\N`/`\n` become line breaks.
-pub fn load_ass(subtitle: &mut Subtitle, lines: &[String]) -> i32 {
+pub fn load_ass(subtitle: &mut Subtitle, lines: &[String]) -> (i32, String) {
     load(subtitle, lines, Variant::Ass)
 }
 
-/// Parses SSA `lines` into `subtitle`, returning the number of errors.
+/// Parses SSA `lines` into `subtitle`, returning libse's `ErrorCount` and `Errors`.
 ///
 /// Port of `SubStationAlpha.LoadSubtitle`: as [`load_ass`], but the style, name and
 /// effect columns keep their spacing, and the text goes through `GetFormattedText`
 /// (override tags to `<i>`/`<b>`/`<u>`/`<font>`).
-pub fn load_ssa(subtitle: &mut Subtitle, lines: &[String]) -> i32 {
+pub fn load_ssa(subtitle: &mut Subtitle, lines: &[String]) -> (i32, String) {
     load(subtitle, lines, Variant::Ssa)
 }
 
@@ -98,8 +98,9 @@ impl EventColumns {
 }
 
 #[allow(clippy::too_many_lines)] // one loop, kept in libse's order
-fn load(subtitle: &mut Subtitle, lines: &[String], variant: Variant) -> i32 {
+fn load(subtitle: &mut Subtitle, lines: &[String], variant: Variant) -> (i32, String) {
     let mut errors = 0;
+    let mut messages = ErrorText::default();
     let mut events_started = false;
     let mut fonts_started = false;
     let mut graphics_started = false;
@@ -108,7 +109,7 @@ fn load(subtitle: &mut Subtitle, lines: &[String], variant: Variant) -> i32 {
     let mut header = String::new();
     let mut footer = String::new();
 
-    for line in lines {
+    for (i, line) in lines.iter().enumerate() {
         let trimmed = line.trim();
         let section = |name: &str| trimmed.eq_ignore_ascii_case(name);
         match variant {
@@ -180,9 +181,20 @@ fn load(subtitle: &mut Subtitle, lines: &[String], variant: Variant) -> i32 {
                 footer.push_str(line);
                 footer.push_str(NEWLINE);
             } else if !s.is_empty() {
-                match read_event(line, &s, &columns, variant) {
-                    Some(paragraph) => subtitle.paragraphs.push(paragraph),
-                    None => errors += 1,
+                if let Some(paragraph) = read_event(line, &s, &columns, variant) {
+                    subtitle.paragraphs.push(paragraph);
+                } else {
+                    errors += 1;
+                    // `FormatLanguage.LineNumberXErrorReadingTimeCodeFromSourceLineY`.
+                    // Once the messages are full, a script with no cue loaded yet is
+                    // given up on.
+                    let line_number = i + 1;
+                    if !messages.append(format_args!(
+                        "Line {line_number} - error reading time code: {line}"
+                    )) && subtitle.paragraphs.is_empty()
+                    {
+                        break;
+                    }
                 }
             }
         }
@@ -195,7 +207,7 @@ fn load(subtitle: &mut Subtitle, lines: &[String], variant: Variant) -> i32 {
         footer.trim().clone_into(&mut subtitle.footer);
     }
     number_cues(subtitle);
-    errors
+    (errors, messages.text)
 }
 
 /// libse's `Renumber()`, but counting only the cues that are not `Comment:` events

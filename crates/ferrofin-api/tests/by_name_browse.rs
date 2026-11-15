@@ -154,6 +154,10 @@ const MUSIC_LIBRARY_ID: Uuid = Uuid::from_u128(0xBB01);
 const MUSIC_VIDEOS_LIBRARY_ID: Uuid = Uuid::from_u128(0xBB02);
 const MOVIES_LIBRARY_ID: Uuid = Uuid::from_u128(0xBB03);
 const MUSIC_FOLDER_ID: Uuid = Uuid::from_u128(0xBB04);
+/// A movie: a parent that is not a folder.
+const MOVIE_ID: Uuid = Uuid::from_u128(0xBB05);
+/// A by-name artist: a C# `Folder` whose `IsFolder` is false.
+const BY_NAME_ARTIST_ID: Uuid = Uuid::from_u128(0xBB06);
 
 fn one_aggregate(id: Uuid, name: &str) -> QueryResult<ItemWithCounts> {
     QueryResult::new(
@@ -316,8 +320,18 @@ impl LibraryManager for ByNameLibrary {
     }
 
     /// The `/Genres?parentId=` parents: libraries of each collection type, plus
-    /// a plain folder whose `Data` claims music (not an `ICollectionFolder`).
+    /// a plain folder whose `Data` claims music (not an `ICollectionFolder`),
+    /// and two parents stored `IsFolder = 0`: a movie and a by-name artist.
     async fn get_item_by_id(&self, id: Uuid) -> Result<Option<BaseItemEntity>, ServiceError> {
+        if let Some(type_) = match id {
+            MOVIE_ID => Some("MediaBrowser.Controller.Entities.Movies.Movie"),
+            BY_NAME_ARTIST_ID => Some("MediaBrowser.Controller.Entities.Audio.MusicArtist"),
+            _ => None,
+        } {
+            let mut row = named_entity(id, "Not a folder");
+            type_.clone_into(&mut row.type_);
+            return Ok(Some(row));
+        }
         let (type_, collection_type) = match id {
             MUSIC_LIBRARY_ID => ("CollectionFolder", "music"),
             MUSIC_VIDEOS_LIBRARY_ID => ("CollectionFolder", "musicvideos"),
@@ -327,6 +341,7 @@ impl LibraryManager for ByNameLibrary {
         };
         let mut row = named_entity(id, "Library");
         row.type_ = format!("MediaBrowser.Controller.Entities.{type_}");
+        row.is_folder = true;
         row.data = Some(format!(r#"{{"CollectionType":"{collection_type}"}}"#));
         Ok(Some(row))
     }
@@ -1268,6 +1283,57 @@ async fn an_api_key_reads_a_by_name_item_with_no_user(#[case] uri: &str, #[case]
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK, "{uri}");
     assert_eq!(json_body(response).await["Name"], name, "{uri}");
+}
+
+/// gl-971: v12.4's by-name controllers put a `Folder` parent in `AncestorIds`
+/// and any other item in `ItemIds` (`GenresController.cs:128-138`, and the
+/// Studios, `MusicGenres` and both Artists actions), so a movie lists the values
+/// it carries. A by-name artist is a `Folder` whose `IsFolder` is false: it
+/// still scopes by ancestor. `/Years` tests `IsFolder` instead
+/// (`YearsController.cs:111-128`): a parent stored as no folder, the by-name
+/// artist included, is its only item.
+#[rstest::rstest]
+#[case::genres("/Genres")]
+#[case::music_genres("/MusicGenres")]
+#[case::studios("/Studios")]
+#[case::artists("/Artists")]
+#[case::album_artists("/Artists/AlbumArtists")]
+#[case::years("/Years")]
+#[tokio::test]
+async fn a_parent_that_is_not_a_folder_lists_its_own_values(#[case] route: &str) {
+    let library = ByNameLibrary::default();
+    let state = by_name_state_with_library(library.clone());
+    for (parent, by_item) in [
+        (MOVIE_ID, true),
+        (BY_NAME_ARTIST_ID, route == "/Years"),
+        (MOVIES_LIBRARY_ID, false),
+    ] {
+        let uri = format!("{route}?parentId={}", parent.simple());
+        let response = create_router(state.clone())
+            .oneshot(Request::builder().uri(&uri).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK, "{uri}");
+        let seen = library.seen.lock().expect("lock");
+        let query = seen.last().expect("the list ran");
+        let (items, scope): (&[Uuid], &[Uuid]) = if by_item {
+            (&[parent], &[])
+        } else {
+            (&[], &[parent])
+        };
+        assert_eq!(query.item_ids, items, "{uri}");
+        if route == "/Years" {
+            assert_eq!(
+                query.parent_id,
+                scope.first().copied().unwrap_or_default(),
+                "{uri}"
+            );
+            assert!(query.ancestor_ids.is_empty(), "{uri}");
+            assert_eq!(query.include_owned_items, by_item, "{uri}");
+        } else {
+            assert_eq!(query.ancestor_ids, scope, "{uri}");
+        }
+    }
 }
 
 /// v12.2 `LibraryManager.GetParentItem` (`LibraryManager.cs:3276-3289`), which

@@ -39,7 +39,8 @@ use crate::auth::RequireAuth;
 use crate::error::ApiError;
 use crate::extract::{DotnetGuid, Query};
 use crate::handlers::query_parse::{
-    parse_csv_enums_lenient, parse_csv_strings, parse_csv_uuids, parse_order_by, parse_pipe_strings,
+    parse_csv_enums_lenient, parse_csv_i32, parse_csv_strings, parse_csv_uuids, parse_order_by,
+    parse_pipe_strings,
 };
 use crate::state::AppState;
 
@@ -1969,21 +1970,6 @@ async fn get_resume_items(
     )))
 }
 
-/// Parses a comma-delimited list of `i32` values (Jellyfin's `years`).
-fn parse_csv_i32(raw: Option<&str>) -> Result<Vec<i32>, ApiError> {
-    let Some(raw) = raw else {
-        return Ok(Vec::new());
-    };
-    raw.split(',')
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(|s| {
-            s.parse::<i32>()
-                .map_err(|_| ApiError::BadRequest(format!("invalid integer {s:?}")))
-        })
-        .collect()
-}
-
 /// Whether a parent row is itself a container of the requested kind, so the
 /// browse is a plain direct-children read and must NOT be re-rooted (C#
 /// `item is not BoxSet/Playlist`, plus the playlists library itself).
@@ -2212,12 +2198,13 @@ fn user_view_uses_direct_items(view_type: Option<ferrofin_model::data::Collectio
 /// Re-roots a BoxSet/Playlist-typed browse onto the user root (port of
 /// `ItemsController.GetItems`'s `linkedChildAncestorIds` block): from a normal
 /// library parent with a linked-child-ancestor constraint, from the Playlists
-/// view without one (its collection type is the target's own).
+/// view or the `boxsets` library without one (its collection type is the
+/// target's own).
 ///
 /// Applies only when the request is for exactly `[BoxSet]` or `[Playlist]`,
-/// a parent is set, and that parent is neither itself a box set/playlist (nor,
-/// for a playlist browse, the playlists folder) nor the matching `boxsets`
-/// library. A re-rooted query takes the user root's folder policy. Best-effort:
+/// a parent is set, and that parent is not itself a box set/playlist (nor,
+/// for a playlist browse, the playlists folder). A re-rooted query takes the
+/// user root's folder policy. Best-effort:
 /// an unresolvable parent leaves the query untouched (the plain parent scoping
 /// then returns empty, as before).
 async fn redirect_container_browse(
@@ -2266,25 +2253,11 @@ async fn redirect_container_browse(
         reroot_to_user_root(internal);
         return;
     }
-    // A browse of the boxsets/playlists library itself keeps plain parent
-    // scoping (C# `itemCollectionType != targetCollectionType`).
-    let parent_collection_type =
-        state
-            .virtual_folders
-            .library_folders()
-            .await
-            .ok()
-            .and_then(|folders| {
-                folders
-                    .iter()
-                    .find(|vf| {
-                        vf.item_id
-                            .as_deref()
-                            .is_some_and(|id| id.eq_ignore_ascii_case(&parent.id))
-                    })
-                    .and_then(|vf| vf.collection_type)
-            });
-    if target_collection_type.is_some() && parent_collection_type == target_collection_type {
+    // The boxsets library's collection type is the target's own too
+    // (C# `itemCollectionType != targetCollectionType` is false), so a box-set
+    // browse of it re-roots with no linked-ancestor constraint.
+    if target_collection_type.is_some() && library_is_boxsets(&parent) == Some(true) {
+        reroot_to_user_root(internal);
         return;
     }
     internal.linked_child_ancestor_ids = vec![internal.parent_id];

@@ -247,70 +247,6 @@ kind = "value"
 issue = 225
 reason = "The page follows the difference gl-225 tracks."
 
-# Ferrofin leaves out ParentId where Jellyfin writes it as null.
-[[entry]]
-request = "Get*.fields.parentid"
-path = "Items[].ParentId"
-kind = "missing"
-issue = 850
-reason = "Ferrofin leaves out ParentId where Jellyfin writes it as null."
-
-[[entry]]
-request = "GetAncestors"
-path = "[].ParentId"
-kind = "missing"
-issue = 850
-reason = "Ferrofin leaves out ParentId where Jellyfin writes it as null."
-
-[[entry]]
-request = "GetGenre"
-path = "ParentId"
-kind = "missing"
-issue = 850
-reason = "Ferrofin leaves out ParentId where Jellyfin writes it as null."
-
-[[entry]]
-request = "GetMusicGenre"
-path = "ParentId"
-kind = "missing"
-issue = 850
-reason = "Ferrofin leaves out ParentId where Jellyfin writes it as null."
-
-[[entry]]
-request = "GetPerson"
-path = "ParentId"
-kind = "missing"
-issue = 850
-reason = "Ferrofin leaves out ParentId where Jellyfin writes it as null."
-
-[[entry]]
-request = "GetRootFolder"
-path = "ParentId"
-kind = "missing"
-issue = 850
-reason = "Ferrofin leaves out ParentId where Jellyfin writes it as null."
-
-[[entry]]
-request = "GetStudio"
-path = "ParentId"
-kind = "missing"
-issue = 850
-reason = "Ferrofin leaves out ParentId where Jellyfin writes it as null."
-
-[[entry]]
-request = "GetYear"
-path = "ParentId"
-kind = "missing"
-issue = 850
-reason = "Ferrofin leaves out ParentId where Jellyfin writes it as null."
-
-[[entry]]
-request = "edge-non-null-root"
-path = "ParentId"
-kind = "missing"
-issue = 850
-reason = "Ferrofin leaves out ParentId where Jellyfin writes it as null."
-
 # Paths of by-name items are answered with %MetadataPath% unexpanded.
 [[entry]]
 request = "GetGenre"
@@ -718,28 +654,6 @@ kind = "type"
 issue = 666
 reason = "Jellyfin answers this error with its message as a bare JSON string; Ferrofin with an object."
 
-# The user root's ChildCount counts the playlists folder.
-[[entry]]
-request = "GetAncestors"
-path = "[].ChildCount"
-kind = "value"
-issue = 851
-reason = "The user root's ChildCount counts the playlists folder."
-
-[[entry]]
-request = "GetRootFolder"
-path = "ChildCount"
-kind = "value"
-issue = 851
-reason = "The user root's ChildCount counts the playlists folder."
-
-[[entry]]
-request = "edge-non-null-root"
-path = "ChildCount"
-kind = "value"
-issue = 851
-reason = "The user root's ChildCount counts the playlists folder."
-
 # Ferrofin compiles in TheTVDB, FanArt and OpenSubtitles (documented scope), which stock Jellyfin lacks.
 [[entry]]
 request = "GetLibraryOptionsInfo"
@@ -822,8 +736,8 @@ reason = "Ferrofin compiles in TheTVDB, FanArt and OpenSubtitles (documented sco
 request = "GetSeriesRemoteSearchResults"
 path = "$"
 kind = "length"
-issue = 862
-reason = "Ferrofin compiles in TheTVDB, FanArt and OpenSubtitles (documented scope), which stock Jellyfin lacks."
+verified = "POST /Items/RemoteSearch/Series"
+reason = "Ferrofin compiles TheTVDB in (documented scope), so a series Identify also lists TheTVDB's results, which stock Jellyfin lacks."
 
 # Libraries are listed by name, not in directory-enumeration order.
 [[entry]]
@@ -890,34 +804,34 @@ kind = "status"
 issue = 843
 reason = "Live TV timer routes answer an unknown id with a different status."
 
-# Timers carry no artwork: FillImages is not ported.
+# The new-timer defaults without a programId carry no artwork; upstream's FillImages with no name takes the library's first series'.
 [[entry]]
 request = "GetDefaultTimer"
 path = "ParentBackdropImageTags"
 kind = "missing"
-issue = 853
-reason = "Timers carry no artwork: FillImages is not ported."
+issue = 1790
+reason = "The new-timer defaults without a programId carry no artwork; upstream's FillImages with no name takes the library's first series'."
 
 [[entry]]
 request = "GetDefaultTimer"
 path = "ParentBackdropItemId"
 kind = "missing"
-issue = 853
-reason = "Timers carry no artwork: FillImages is not ported."
+issue = 1790
+reason = "The new-timer defaults without a programId carry no artwork; upstream's FillImages with no name takes the library's first series'."
 
 [[entry]]
 request = "GetDefaultTimer"
 path = "ParentPrimaryImageItemId"
 kind = "missing"
-issue = 853
-reason = "Timers carry no artwork: FillImages is not ported."
+issue = 1790
+reason = "The new-timer defaults without a programId carry no artwork; upstream's FillImages with no name takes the library's first series'."
 
 [[entry]]
 request = "GetDefaultTimer"
 path = "ParentPrimaryImageTag"
 kind = "missing"
-issue = 853
-reason = "Timers carry no artwork: FillImages is not ported."
+issue = 1790
+reason = "The new-timer defaults without a programId carry no artwork; upstream's FillImages with no name takes the library's first series'."
 
 # Both bitrate test bodies are random bytes, and Jellyfin's is longer.
 [[entry]]

@@ -1190,6 +1190,13 @@ pub struct FerrofinItemPersistenceService {
     /// How by-name `Genre`, `MusicGenre` and `Studio` rows take their ids
     /// ([`FerrofinItemPersistenceService::with_by_name_identity`]).
     by_name_identity: Option<crate::item_type_lookup::ByNameIdentity>,
+    /// The playlist manager's entry-edit lock
+    /// ([`Self::playlist_entry_edits`]), held by the two writers of a
+    /// playlist's entries outside it: the scan's playlist sync and an item
+    /// deletion. Either landing between an edit's read and its rewrite would
+    /// lose the scan's members, or fail the rewrite on a deleted member.
+    /// Taken before the writer, as the manager takes it.
+    playlist_entry_edits: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl std::fmt::Debug for FerrofinItemPersistenceService {
@@ -1213,6 +1220,7 @@ impl FerrofinItemPersistenceService {
             localization: std::sync::OnceLock::new(),
             virtual_paths: crate::virtual_paths::VirtualPathExpander::identity(),
             by_name_identity: None,
+            playlist_entry_edits: Arc::default(),
         }
     }
 
@@ -1228,6 +1236,14 @@ impl FerrofinItemPersistenceService {
     ) -> Self {
         self.by_name_identity = identity;
         self
+    }
+
+    /// The lock the playlist manager holds across an entry edit's read and
+    /// rewrite, which this service's playlist sync and deletion also take.
+    /// The composition root hands it to the playlist manager.
+    #[must_use]
+    pub fn playlist_entry_edits(&self) -> Arc<tokio::sync::Mutex<()>> {
+        Arc::clone(&self.playlist_entry_edits)
     }
 
     /// Installs the server's [`VirtualPathExpander`], so a save keeps the
@@ -2426,6 +2442,7 @@ pub(crate) async fn remove_person_items(
     db: &Database,
     ids: &[Uuid],
 ) -> Result<usize, ServiceError> {
+    // A service of its own, so not the playlist edits' lock: a person is never a playlist entry.
     Ok(FerrofinItemPersistenceService::new(db.clone())
         .delete_items(ids)
         .await?
@@ -2585,6 +2602,7 @@ impl ItemPersistenceService for FerrofinItemPersistenceService {
         if given.is_empty() {
             return Ok(Vec::new());
         }
+        let _edits = self.playlist_entry_edits.lock().await;
         let mut tx = self.db.writer().begin().await.map_err(db_err)?;
         // Two BaseItems references have no `ON DELETE CASCADE`: an extra's
         // `OwnerId`, and `LinkedChildren` (the item as a playlist or
@@ -2899,6 +2917,7 @@ impl ItemPersistenceService for FerrofinItemPersistenceService {
                 }
                 None => None,
             };
+            let _edits = self.playlist_entry_edits.lock().await;
             let mut tx = self.db.writer().begin().await.map_err(db_err)?;
             // `PlaylistResolver` creates `new Playlist { OpenAccess = true }`:
             // `OwnerUserId` is `Guid.Empty` — a user no caller is, so nobody

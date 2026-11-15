@@ -15,6 +15,7 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use ferrofin_db::Database;
 use ferrofin_db::store::{datetime_to_db, guid_to_db, opt_datetime_to_db};
+use ferrofin_util::numeric_collation::invariant_numeric_cmp;
 use sqlx::{QueryBuilder, Row, Sqlite};
 use uuid::Uuid;
 
@@ -54,8 +55,8 @@ use crate::fetch::SourceFetcher;
 use crate::guide_repository::{PROGRAM_SELECT, UserRestrictions};
 use crate::mapping::{
     EpgChannel, EpgChannelData, TunerChannel, epg_channel_for_tuner_channel,
-    eq_ordinal_ignore_case, is_listing_provider_enabled_for_tuner, m3u_channel_id,
-    ordinal_ignore_case_key, tuner_channel_mapping,
+    eq_ordinal_ignore_case, is_listing_provider_enabled_for_tuner, ordinal_ignore_case_key,
+    tuner_channel_mapping,
 };
 use crate::projection::{
     ChannelAggregate, ChannelRow, ProgramImages, ProgramRow as GuideProgramRow, carries_tags,
@@ -307,7 +308,7 @@ fn epg_channel(c: &XmltvChannel) -> EpgChannel {
 /// the playlist's logo again, and the guide's returns with it, as upstream.
 /// A guide logo that is not a URL never replaces a playlist's that is one.
 fn add_provider_metadata(
-    lineups: &mut [(String, String, Vec<crate::tuner_host::TunerChannel>)],
+    lineups: &mut [(String, Vec<crate::tuner_host::TunerChannel>)],
     guides: &[(ListingsProviderInfo, GuideSource)],
 ) {
     for (provider, source) in guides {
@@ -317,7 +318,7 @@ fn add_provider_metadata(
             }
             GuideSource::SchedulesDirect { channels, .. } => EpgChannelData::new(channels),
         };
-        for (host_id, _, lineup) in lineups.iter_mut() {
+        for (host_id, lineup) in lineups.iter_mut() {
             if !is_listing_provider_enabled_for_tuner(provider, host_id) {
                 continue;
             }
@@ -678,18 +679,18 @@ impl ListingsBackend {
 }
 
 /// A tuner channel as the match ladder sees it (`ChannelInfo`'s `Id`,
-/// `TunerChannelId`, `Number` and `Name`), from its lineup entry: the stream
-/// URL, the guide key the tuner stores as `TvgId`, the number and the name.
+/// `TunerChannelId`, `Number` and `Name`), from its lineup entry: the external
+/// id its host minted (`m3u_…`, `hdhr_{GuideNumber}`), the guide key the tuner
+/// stores as `TvgId`, the number and the name.
 fn matcher_channel(
-    tuner_url: &str,
+    external_id: String,
     tuner_host_id: &str,
-    stream_url: &str,
     guide_key: String,
     number: String,
     name: String,
 ) -> TunerChannel {
     TunerChannel {
-        id: m3u_channel_id(tuner_url, stream_url),
+        id: external_id,
         tuner_channel_id: guide_key,
         number,
         name,
@@ -1525,16 +1526,16 @@ impl FerrofinLiveTvManager {
         }
     }
 
-    /// The `ChannelPrimaryImageTag` of each channel among `rows` that has a
+    /// The `ChannelPrimaryImageTag` of each of the channels `ids` that has a
     /// Primary image (`LiveTvDtoService.GetImageTag`), by channel id.
-    async fn channel_image_tags(&self, rows: &[&GuideProgramRow]) -> HashMap<Uuid, String> {
+    async fn channel_image_tags(&self, ids: &[Uuid]) -> HashMap<Uuid, String> {
         let mut tags = HashMap::new();
         let (Some(store), Some(images)) = (self.item_store.get(), self.images.get()) else {
             return tags;
         };
-        let ids: Vec<Uuid> = rows
+        let ids: Vec<Uuid> = ids
             .iter()
-            .filter_map(|row| Uuid::parse_str(&row.channel_id).ok())
+            .copied()
             .collect::<HashSet<_>>()
             .into_iter()
             .collect();
@@ -2108,7 +2109,7 @@ impl FerrofinLiveTvManager {
     /// get their pass.
     async fn refresh_series_timers(&self) -> Result<(), ServiceError> {
         let timers = self
-            .get_series_timers(&ferrofin_model::live_tv::SeriesTimerQuery::default())
+            .stored_series_timers(&ferrofin_model::live_tv::SeriesTimerQuery::default())
             .await?;
         for timer in timers {
             let Some(id) = timer.base.id.as_deref() else {
@@ -2403,7 +2404,7 @@ impl FerrofinLiveTvManager {
 
     /// Stores a listings provider, the configuration half of
     /// `ListingsManager.SaveListingProvider` (and of `SetChannelMapping`,
-    /// which saves without validating).
+    /// which saves without validating or dropping the cached guide).
     ///
     /// The id rule is upstream's: a posted id that matches a configured
     /// provider ignoring case replaces it, keeping the posted spelling
@@ -2445,13 +2446,6 @@ impl FerrofinLiveTvManager {
             &data,
         )
         .await?;
-
-        // `InvalidateListingsProviderCache(info.Id)`: a changed Path must not
-        // keep serving the old document.
-        if let Some(stored) = stored.as_deref().filter(|stored| *stored != id) {
-            self.xmltv.invalidate(stored).await;
-        }
-        self.xmltv.invalidate(&id).await;
         Ok(info)
     }
 
@@ -2512,12 +2506,10 @@ impl FerrofinLiveTvManager {
                 if !is_listing_provider_enabled_for_tuner(info, host_id) {
                     continue;
                 }
-                let url = tuner.url.as_deref().unwrap_or_default();
                 out.extend(new.into_iter().map(|ch| {
                     matcher_channel(
-                        url,
+                        ch.external_id,
                         host_id,
-                        &ch.url,
                         ch.guide_key,
                         ch.number.unwrap_or_default(),
                         ch.name,
@@ -2541,7 +2533,7 @@ impl FerrofinLiveTvManager {
     ) -> Result<Vec<(String, TunerChannel)>, ServiceError> {
         let mut out = Vec::new();
         for tuner in self.get_tuner_hosts().await? {
-            let (Some(host_id), Some(url)) = (tuner.id.as_deref(), tuner.url.as_deref()) else {
+            let Some(host_id) = tuner.id.as_deref() else {
                 continue;
             };
             if !is_listing_provider_enabled_for_tuner(info, host_id) {
@@ -2550,14 +2542,7 @@ impl FerrofinLiveTvManager {
             for row in crate::guide_repository::tuner_lineup(&self.db, host_id).await? {
                 out.push((
                     row.id,
-                    matcher_channel(
-                        url,
-                        host_id,
-                        &row.stream_url,
-                        row.tvg_id,
-                        row.number,
-                        row.name,
-                    ),
+                    matcher_channel(row.external_id, host_id, row.tvg_id, row.number, row.name),
                 ));
             }
         }
@@ -2813,7 +2798,7 @@ impl FerrofinLiveTvManager {
     async fn fetch_guide_source(
         &self,
         provider: &ListingsProviderInfo,
-        tuner_lineups: &[(String, String, Vec<crate::tuner_host::TunerChannel>)],
+        tuner_lineups: &[(String, Vec<crate::tuner_host::TunerChannel>)],
         window: (DateTime<Utc>, DateTime<Utc>),
         generation: u64,
     ) -> Result<(Option<GuideSource>, bool), ServiceError> {
@@ -2903,7 +2888,7 @@ impl FerrofinLiveTvManager {
     async fn fetch_schedules_direct_guide(
         &self,
         provider: &ListingsProviderInfo,
-        tuner_lineups: &[(String, String, Vec<crate::tuner_host::TunerChannel>)],
+        tuner_lineups: &[(String, Vec<crate::tuner_host::TunerChannel>)],
         window: (DateTime<Utc>, DateTime<Utc>),
         generation: u64,
     ) -> Result<Option<(GuideSource, bool)>, ServiceError> {
@@ -2914,15 +2899,14 @@ impl FerrofinLiveTvManager {
         let epg = EpgChannelData::new(&channels);
 
         let mut bound = std::collections::BTreeSet::new();
-        for (host_id, url, lineup) in tuner_lineups {
+        for (host_id, lineup) in tuner_lineups {
             if !is_listing_provider_enabled_for_tuner(provider, host_id) {
                 continue;
             }
             for channel in lineup {
                 let tuner_channel = matcher_channel(
-                    url,
+                    channel.external_id.clone(),
                     host_id,
-                    &channel.url,
                     channel.guide_key.clone(),
                     channel.number.clone().unwrap_or_default(),
                     channel.name.clone(),
@@ -3399,6 +3383,12 @@ impl LiveTvManager for FerrofinLiveTvManager {
             }
         }
         let saved = self.store_listing_provider(info).await?;
+        // `InvalidateListingsProviderCache(info.Id)`: a changed Path must not
+        // keep serving the old document. The cache file is named by the parsed
+        // GUID, so this also drops one cached under another casing of the id.
+        if let Some(id) = saved.id.as_deref() {
+            self.xmltv.invalidate(id).await;
+        }
         self.spawn_recording_folders();
         Ok(saved)
     }
@@ -3490,7 +3480,7 @@ impl LiveTvManager for FerrofinLiveTvManager {
         provider_id: &str,
         tuner_channel_id: &str,
         provider_channel_id: &str,
-    ) -> Result<TunerChannelMapping, ServiceError> {
+    ) -> Result<Option<TunerChannelMapping>, ServiceError> {
         // Port of `ListingsManager.SetChannelMapping`. The pair list is
         // rebuilt, not upserted: every pair keyed on this tuner channel is
         // removed first, and a replacement is stored only when the two ids
@@ -3536,18 +3526,17 @@ impl LiveTvManager for FerrofinLiveTvManager {
         // configuration and the tuner lineup, exactly as the C# computes it —
         // it never depended on the refresh having finished.
 
-        tuner_channels
+        // `None` where C#'s `.First(...)` throws `InvalidOperationException`
+        // (500) for a tuner channel not in the lineup, after the refresh is
+        // queued: the caller queues it too, then answers 404.
+        Ok(tuner_channels
             .iter()
             .map(|c| tuner_channel_mapping(c, &info.channel_mappings, &epg))
             .find(|row| {
                 row.id
                     .as_deref()
                     .is_some_and(|id| eq_ordinal_ignore_case(id, tuner_channel_id))
-            })
-            // C# `.First(...)` throws `InvalidOperationException` (500) for a
-            // tuner channel that is not in the lineup; 404 is the honest answer
-            // for an id that names nothing.
-            .ok_or_else(|| ServiceError::not_found(format!("tuner channel {tuner_channel_id}")))
+            }))
     }
 
     async fn get_channels(
@@ -3857,10 +3846,7 @@ impl LiveTvManager for FerrofinLiveTvManager {
         // when nothing threw: its catch sets `cleanDatabase = false`, so a
         // tuner or guide that could not be read never empties the cache.
         let mut clean_database = true;
-        // `(tuner id, tuner url, lineup)`: the url is half of each channel's
-        // external id, which the Schedules Direct binding below needs.
-        let mut tuner_lineups: Vec<(String, String, Vec<crate::tuner_host::TunerChannel>)> =
-            Vec::new();
+        let mut tuner_lineups: Vec<(String, Vec<crate::tuner_host::TunerChannel>)> = Vec::new();
         for tuner in self.get_tuner_hosts().await? {
             let Some(id) = tuner.id.clone() else {
                 clean_database = false;
@@ -3889,7 +3875,7 @@ impl LiveTvManager for FerrofinLiveTvManager {
             );
             match lineup.await {
                 Ok(channels) => {
-                    tuner_lineups.push((id, tuner.url.clone().unwrap_or_default(), channels));
+                    tuner_lineups.push((id, channels));
                 }
                 Err(e) => {
                     // `BaseTunerHost.GetChannels` logs and falls back to its
@@ -3947,7 +3933,7 @@ impl LiveTvManager for FerrofinLiveTvManager {
         }
         let guard = self.guide_lock.lock().await;
         let mut kept_channels: HashSet<String> = HashSet::new();
-        for (id, _, channels) in &tuner_lineups {
+        for (id, channels) in &tuner_lineups {
             kept_channels.extend(self.replace_channels(id, channels).await?);
         }
         // The airings this pass wrote, with the artwork their listing gave
@@ -4027,7 +4013,7 @@ impl LiveTvManager for FerrofinLiveTvManager {
         let has_channel_info = options.fields.contains(&ItemFields::ChannelInfo);
         let has_channel_image = options.fields.contains(&ItemFields::ChannelImage);
         let tags = if has_channel_image {
-            self.channel_image_tags(&rows.values().collect::<Vec<_>>())
+            self.channel_image_tags(&program_channel_ids(rows.values()))
                 .await
         } else {
             HashMap::new()
@@ -4149,14 +4135,41 @@ impl LiveTvManager for FerrofinLiveTvManager {
         else {
             return Ok(Vec::new());
         };
-        let tuner = self.tuner_host(&tuner_host_id).await?;
         // Each host builds its own sources: the M3U host has exactly one, and
         // an HDHomeRun offers a source per transcode profile the device
         // supports (`BaseTunerHost.GetChannelStreamMediaSources`).
-        let host = self.host_for(&tuner)?;
-        let mut sources = host.channel_media_sources(&tuner, &channel).await?;
+        let mut sources = match self.tuner_host(&tuner_host_id).await {
+            Ok(tuner) => {
+                let mut sources = self
+                    .host_for(&tuner)?
+                    .channel_media_sources(&tuner, &channel)
+                    .await?;
+                sources.iter_mut().for_each(crate::stream::normalize);
+                sources
+            }
+            // The tuner was deleted, and its channels stay listed until the
+            // guide refresh prunes them (migration 0046).
+            Err(ServiceError::NotFound(_)) => Vec::new(),
+            Err(err) => return Err(err),
+        };
+        if sources.is_empty() {
+            // `DefaultLiveTvService.GetChannelStreamMediaSources` throws
+            // `NotImplementedException` when no tuner offers a source, and
+            // `GetMediaSourcesInternal` answers the item's own placeholder
+            // (`LiveTvChannel.GetMediaSources`, not normalized) forced to
+            // `RequiresOpening`, so the open is what fails: "Tuner not found.".
+            sources.push(MediaSourceInfo {
+                id: Some(id.simple().to_string()),
+                name: crate::guide_repository::channel_row(&self.db, id)
+                    .await?
+                    .map(|row| row.name),
+                // `RunTimeTicks is null`: a channel item has none.
+                is_infinite_stream: true,
+                requires_opening: true,
+                ..MediaSourceInfo::default()
+            });
+        }
         for source in &mut sources {
-            crate::stream::normalize(source);
             Self::stamp_source(source);
             // `LiveTvMediaSourceProvider.GetMediaSourcesInternal`: the open
             // token is `{item type}_{item id "N"}_{source id}`. The
@@ -4338,6 +4351,19 @@ impl LiveTvManager for FerrofinLiveTvManager {
             .await
     }
 
+    async fn get_timers_matching(
+        &self,
+        query: &ferrofin_model::live_tv::TimerQuery,
+    ) -> Result<Vec<TimerInfoDto>, ServiceError> {
+        // `LiveTvManager.GetTimers`: the service's timers, filtered, each built
+        // by `GetTimerInfoDto` as it is read.
+        let mut timers = ferrofin_traits::stubs::filter_timers(self.get_timers().await?, query);
+        for timer in &mut timers {
+            self.build_timer_dto(timer).await?;
+        }
+        Ok(timers)
+    }
+
     async fn create_timer(&self, mut timer: TimerInfoDto) -> Result<String, ServiceError> {
         // `LiveTvDtoService.GetTimerInfo` turns the posted ids into the
         // programme's listing id before `CreateTimer` looks for its timer. Here
@@ -4467,6 +4493,12 @@ impl LiveTvManager for FerrofinLiveTvManager {
             .base
             .external_program_id
             .clone_from(&program.external_id);
+        // `GetSeriesTimerInfoDto`'s `FillImages(dto, info.Name, info.SeriesId)`.
+        // The defaults take the programme's name, but no series id:
+        // `GetNewTimerDefaultsInternal` builds its `ProgramInfo` without one.
+        self.fill_images(Some(&program.title), None, true, false)
+            .await?
+            .onto_series_timer(&mut defaults);
         Ok(defaults)
     }
 
@@ -4474,12 +4506,15 @@ impl LiveTvManager for FerrofinLiveTvManager {
         &self,
         query: &ferrofin_model::live_tv::SeriesTimerQuery,
     ) -> Result<Vec<SeriesTimerInfoDto>, ServiceError> {
-        let mut timers: Vec<SeriesTimerInfoDto> = self
-            .json_list(
-                "FerrofinLiveTvSeriesTimers",
-                r#"SELECT "Id", "Data" FROM "FerrofinLiveTvSeriesTimers""#,
-            )
-            .await?;
+        let mut timers = Vec::new();
+        for (id, data, series_id) in crate::dvr_repository::series_timer_rows(&self.db).await? {
+            if let Some(mut timer) = self.parse_stored_row("FerrofinLiveTvSeriesTimers", &id, &data)
+            {
+                self.build_series_timer_dto(&mut timer, series_id.as_deref())
+                    .await?;
+                timers.push(timer);
+            }
+        }
         sort_series_timers(&mut timers, query);
         Ok(timers)
     }
@@ -4811,23 +4846,19 @@ impl LiveTvManager for FerrofinLiveTvManager {
     async fn live_tv_media_type(&self, id: Uuid) -> Result<Option<String>, ServiceError> {
         // `LiveTvChannel.MediaType => ChannelType == ChannelType.Radio ?
         // MediaType.Audio : MediaType.Video` — the same mapping
-        // `add_channel_info`/`add_recording_info` already apply to the DTO.
+        // `projection::channel_media_type` stores and `apply_program_info`
+        // gives a programme.
         if let Some(row) = crate::guide_repository::channel_row(&self.db, id).await? {
             return Ok(Some(radio_or_tv_media_type(&row.channel_type).to_owned()));
         }
-        // A recording is the capture of one channel's airing, so it carries
-        // that channel's media type (upstream's `RecordingHelper` builds an
-        // `Audio` item for a radio programme and a `Movie`/`Episode`/`Video`
-        // for a television one — all `MediaType.Video`).
-        let Some(recording) = crate::dvr_repository::recording_row(&self.db, id).await? else {
-            return Ok(None);
-        };
-        let Ok(channel_id) = Uuid::parse_str(&recording.channel_id) else {
-            return Ok(None);
-        };
-        Ok(crate::guide_repository::channel_row(&self.db, channel_id)
+        // A recording is `MediaType.Video` whatever its channel: upstream
+        // writes every capture as a `.ts` file (`RecordingsManager`,
+        // `EncodedRecorder`), which the library resolves as a video item, a
+        // radio programme's too. Its entity says the same
+        // (`projection::recording_entity`).
+        Ok(crate::dvr_repository::recording_row(&self.db, id)
             .await?
-            .map(|row| radio_or_tv_media_type(&row.channel_type).to_owned()))
+            .map(|_| "Video".to_owned()))
     }
 
     async fn get_recording_media_sources(
@@ -5133,7 +5164,7 @@ impl FerrofinLiveTvManager {
         let has_channel_info = options.fields.contains(&ItemFields::ChannelInfo);
         let has_channel_image = options.fields.contains(&ItemFields::ChannelImage);
         let tags = if has_channel_image {
-            self.channel_image_tags(&rows.iter().collect::<Vec<_>>())
+            self.channel_image_tags(&program_channel_ids(rows.iter()))
                 .await
         } else {
             HashMap::new()
@@ -5279,6 +5310,175 @@ impl FerrofinLiveTvManager {
         if let Some(series_timer_id) = timer.series_timer_id.as_deref().filter(|s| !s.is_empty()) {
             dto.series_timer_id = Some(series_timer_id.to_owned());
         }
+    }
+
+    /// The read half of `LiveTvDtoService.GetTimerInfoDto` (v12.4
+    /// LiveTvDtoService.cs:52-110), which upstream runs on every read of a
+    /// timer (`LiveTvManager.GetTimers`), so the stored row is never changed.
+    ///
+    /// The guide programme the timer names becomes `ProgramInfo`
+    /// (`GetBaseItemDto(program, new DtoOptions())`), with the timer's id and
+    /// status unless it is cancelled or failed, its series timer, and for a
+    /// series timer's timer the artwork [`Self::fill_images`] finds by the
+    /// timer's name and the programme's series (`TimerInfo.SeriesId` is the
+    /// programme's, `CopyProgramInfoToTimerInfo`). The channel gives its
+    /// current name and logo tag, and the run time is the timer's window.
+    async fn build_timer_dto(&self, timer: &mut TimerInfoDto) -> Result<(), ServiceError> {
+        // `GetTimerInfoDto` builds a new DTO: the programme and the channel's
+        // name and logo come only from this read, and it sets no parent
+        // backdrop, so a stored or posted value of any of them is dropped.
+        timer.program_info = None;
+        timer.base.channel_name = None;
+        timer.base.channel_primary_image_tag = None;
+        timer.base.parent_backdrop_item_id = None;
+        timer.base.parent_backdrop_image_tags = None;
+        timer.run_time_ticks =
+            Some((timer.base.end_date - timer.base.start_date).num_milliseconds() * 10_000);
+        // `string.IsNullOrEmpty(info.SeriesTimerId) ? null : …`.
+        timer.series_timer_id = timer.series_timer_id.take().filter(|id| !id.is_empty());
+        if let Some(program) = self.program_row_for_timer(&timer.base).await?
+            && let Some(mut info) = self
+                .program_dtos(std::slice::from_ref(&program), &DtoOptions::default(), None)
+                .await?
+                .pop()
+        {
+            if !matches!(
+                timer.status,
+                RecordingStatus::Cancelled | RecordingStatus::Error
+            ) {
+                info.timer_id.clone_from(&timer.base.id);
+                info.status = Some(recording_status_name(timer.status));
+            }
+            info.series_timer_id.clone_from(&timer.series_timer_id);
+            if timer.series_timer_id.is_some() {
+                let has_backdrop = info
+                    .parent_backdrop_image_tags
+                    .as_ref()
+                    .is_some_and(|tags| !tags.is_empty());
+                self.fill_images(
+                    timer.base.name.as_deref(),
+                    program.external_series_id.as_deref(),
+                    false,
+                    has_backdrop,
+                )
+                .await?
+                .onto_item(&mut info);
+            }
+            timer.program_info = Some(Box::new(info));
+        }
+        let channel_id = timer.base.channel_id;
+        if !channel_id.is_nil()
+            && let Some(channel) =
+                crate::guide_repository::channel_row(&self.db, channel_id).await?
+        {
+            timer.base.channel_name = Some(channel.name);
+            timer.base.channel_primary_image_tag = self
+                .channel_image_tags(&[channel_id])
+                .await
+                .remove(&channel_id);
+        }
+        Ok(())
+    }
+
+    /// The read half of `LiveTvManager.GetSeriesTimers` and
+    /// `LiveTvDtoService.GetSeriesTimerInfoDto` (v12.4 LiveTvManager.cs:909-955,
+    /// LiveTvDtoService.cs:113-159), which build each series timer as it is
+    /// read: the channel's current name (none without a channel), and the
+    /// artwork [`Self::fill_images`] finds by the timer's name and `series_id`,
+    /// its stored `SeriesTimerInfo.SeriesId`.
+    async fn build_series_timer_dto(
+        &self,
+        timer: &mut SeriesTimerInfoDto,
+        series_id: Option<&str>,
+    ) -> Result<(), ServiceError> {
+        // `GetSeriesTimerInfoDto` builds a new DTO, and sets neither.
+        timer.base.channel_primary_image_tag = None;
+        timer.image_tags.clear();
+        timer.base.channel_name = if timer.base.channel_id.is_nil() {
+            None
+        } else {
+            crate::guide_repository::channel_row(&self.db, timer.base.channel_id)
+                .await?
+                .map(|channel| channel.name)
+        };
+        self.fill_images(timer.base.name.as_deref(), series_id, true, false)
+            .await?
+            .onto_series_timer(timer);
+        Ok(())
+    }
+
+    /// Port of `LiveTvDtoService.FillImages` (v12.4 LiveTvDtoService.cs:161-360,
+    /// both overloads): the artwork of the library series named `name`, for a
+    /// timer card.
+    ///
+    /// The first `Series` of that name with a Thumb gives its Thumb and its
+    /// Backdrop. The Primary is the first `Series` of that name with one when
+    /// `series_primary` (the `SeriesTimerInfoDto` overload); otherwise, or
+    /// failing that, the first guide programme with one in the listings series
+    /// `series_id` (by `name` when there is none), whose Backdrop is taken too
+    /// when neither the series nor the DTO (`has_backdrop`) has one. An image
+    /// whose tag cannot be computed is left out, as upstream's catch does.
+    ///
+    /// A lookup whose only filter would be a blank name is not run: upstream's
+    /// query then filters on nothing and takes the library's first series or
+    /// programme. Whether to port that waits on the owner (gl-1790).
+    async fn fill_images(
+        &self,
+        name: Option<&str>,
+        series_id: Option<&str>,
+        series_primary: bool,
+        has_backdrop: bool,
+    ) -> Result<ParentArtwork, ServiceError> {
+        let mut art = ParentArtwork::default();
+        let (Some(store), Some(images)) = (self.item_store.get(), self.images.get()) else {
+            return Ok(art);
+        };
+        let processor = images.processor.as_ref();
+        let name = name.map(str::trim).filter(|name| !name.is_empty());
+        let series_id = series_id.map(str::trim).filter(|id| !id.is_empty());
+        if let Some(name) = name
+            && let Some(series) = first_with_image(
+                store,
+                BaseItemKind::Series,
+                ImageType::Thumb,
+                Some(name),
+                None,
+            )
+            .await?
+        {
+            let stored = item_images(store, &series).await?;
+            art.thumb = image_tag(processor, &series, &stored, ImageType::Thumb).await;
+            art.backdrop = image_tag(processor, &series, &stored, ImageType::Backdrop).await;
+        }
+        let mut primary = None;
+        if series_primary && let Some(name) = name {
+            primary = first_with_image(
+                store,
+                BaseItemKind::Series,
+                ImageType::Primary,
+                Some(name),
+                None,
+            )
+            .await?;
+        }
+        if primary.is_none() && (name.is_some() || series_id.is_some()) {
+            primary = first_with_image(
+                store,
+                BaseItemKind::LiveTvProgram,
+                ImageType::Primary,
+                if series_id.is_none() { name } else { None },
+                series_id,
+            )
+            .await?;
+        }
+        if let Some(item) = primary {
+            let stored = item_images(store, &item).await?;
+            art.primary = image_tag(processor, &item, &stored, ImageType::Primary).await;
+            if !has_backdrop && art.backdrop.is_none() {
+                art.backdrop = image_tag(processor, &item, &stored, ImageType::Backdrop).await;
+            }
+        }
+        Ok(art)
     }
 
     // ---- DVR ------------------------------------------------------------
@@ -5665,6 +5865,23 @@ impl FerrofinLiveTvManager {
                         series_id,
                     })
             }))
+    }
+
+    /// Every stored series timer as stored, in the query's order: upstream's
+    /// `GetSeriesTimersInternal`, which the guide refresh walks, with none of
+    /// what [`Self::build_series_timer_dto`] adds on a read.
+    async fn stored_series_timers(
+        &self,
+        query: &ferrofin_model::live_tv::SeriesTimerQuery,
+    ) -> Result<Vec<SeriesTimerInfoDto>, ServiceError> {
+        let mut timers: Vec<SeriesTimerInfoDto> = self
+            .json_list(
+                "FerrofinLiveTvSeriesTimers",
+                r#"SELECT "Id", "Data" FROM "FerrofinLiveTvSeriesTimers""#,
+            )
+            .await?;
+        sort_series_timers(&mut timers, query);
+        Ok(timers)
     }
 
     /// Writes a series timer through, DTO and identity columns together.
@@ -7711,107 +7928,9 @@ fn day_pattern(days: &[DayOfWeek]) -> Option<ferrofin_model::live_tv::DayPattern
     }
 }
 
-/// The CLDR root collator the name segments compare through, built once.
-///
-/// `Collator::try_new` reads ICU4X's *baked* root collation data, so the only
-/// way it can fail is a build without that data — in which case the sort
-/// degrades to code-point order rather than taking the process down, and says
-/// so once.
-fn invariant_collator() -> Option<&'static icu_collator::CollatorBorrowed<'static>> {
-    static COLLATOR: std::sync::OnceLock<Option<icu_collator::CollatorBorrowed<'static>>> =
-        std::sync::OnceLock::new();
-    COLLATOR
-        .get_or_init(|| {
-            match icu_collator::Collator::try_new(
-                icu_collator::CollatorPreferences::default(),
-                icu_collator::options::CollatorOptions::default(),
-            ) {
-                Ok(collator) => Some(collator),
-                Err(error) => {
-                    tracing::error!(
-                        %error,
-                        "live tv: CLDR root collation data is unavailable; \
-                         name sorting falls back to code-point order"
-                    );
-                    None
-                }
-            }
-        })
-        .as_ref()
-}
-
-/// Compares two names the way every Jellyfin name sort does.
-///
-/// Port of `AlphanumericComparator.CompareValues` (v10.11.8
-/// Jellyfin.Extensions/AlphanumericComparator.cs): the strings are walked in
-/// alternating digit/non-digit runs, digit runs compare as numbers (leading
-/// zeros trimmed, then by length) and every run then compares as *text* under
-/// `StringComparison.InvariantCulture` — CLDR root collation, which is what
-/// [`invariant_collator`] supplies. Master replaced the whole class with
-/// `StringComparer.Create(CultureInfo.InvariantCulture, CompareOptions.NumericOrdering)`
-/// (MediaBrowser.Controller/Sorting/SortExtensions.cs:13, commit 098e8c6fed),
-/// so both trees demand invariant collation; only the run segmentation differs
-/// between them, and this keeps 10.11.8's, which is what the contract is pinned
-/// to (`"Show 007" > "Show 7"` via the trailing length tie-break).
-///
-/// Code-point order is NOT a stand-in for it even on plain ASCII: root
-/// collation orders by letter at the primary level and puts lowercase before
-/// uppercase at the tertiary level, so `"apple" < "Banana"` where
-/// `'B'(0x42) < 'a'(0x61)` says the opposite.
-fn alphanumeric_compare(a: &str, b: &str) -> std::cmp::Ordering {
-    use std::cmp::Ordering;
-    // The C# `len1`/`len2` are UTF-16 lengths, used for the empty checks and
-    // the trailing `len1 - len2` tie-break; a char count carries the same
-    // meaning here.
-    let (bytes_a, bytes_b) = (a.as_bytes(), b.as_bytes());
-    let by_length = || a.chars().count().cmp(&b.chars().count());
-    if bytes_a.is_empty() || bytes_b.is_empty() {
-        return by_length();
-    }
-    // Run boundaries are always char boundaries: `is_ascii_digit` is false for
-    // every byte of a multi-byte sequence, so a digit run can neither start nor
-    // end inside one.
-    let (mut pos_a, mut pos_b) = (0_usize, 0_usize);
-    loop {
-        let (start_a, start_b) = (pos_a, pos_b);
-        let is_num_a = bytes_a[pos_a].is_ascii_digit();
-        let is_num_b = bytes_b[pos_b].is_ascii_digit();
-        pos_a += 1;
-        pos_b += 1;
-        while pos_a < bytes_a.len() && bytes_a[pos_a].is_ascii_digit() == is_num_a {
-            pos_a += 1;
-        }
-        while pos_b < bytes_b.len() && bytes_b[pos_b].is_ascii_digit() == is_num_b {
-            pos_b += 1;
-        }
-        let mut span_a = &a[start_a..pos_a];
-        let mut span_b = &b[start_b..pos_b];
-        if is_num_a && is_num_b {
-            // "Trim leading zeros so we can compare the length of the strings
-            // to find the largest number" — and the C# keeps the TRIMMED spans
-            // for the text compare that follows.
-            span_a = span_a.trim_start_matches('0');
-            span_b = span_b.trim_start_matches('0');
-            match span_a.len().cmp(&span_b.len()) {
-                Ordering::Equal => {}
-                other => return other,
-            }
-        }
-        let ordering = match invariant_collator() {
-            Some(collator) => collator.compare(span_a, span_b),
-            None => span_a.cmp(span_b),
-        };
-        if ordering != Ordering::Equal {
-            return ordering;
-        }
-        if pos_a >= bytes_a.len() || pos_b >= bytes_b.len() {
-            return by_length();
-        }
-    }
-}
-
-/// Orders series timers the way `LiveTvManager.GetSeriesTimers` does (v10.11.8
-/// LiveTvManager.cs:919-934).
+/// Orders series timers the way `LiveTvManager.GetSeriesTimers` and
+/// `GetSeriesTimersInternal` do (v12.4 LiveTvManager.cs:927-937 and 889-899),
+/// comparing names with `SortExtensions`' invariant-culture numeric comparer.
 ///
 /// The `Priority` branch's ascending arm really is `OrderByDescending(Priority)`
 /// and its descending arm `OrderBy(Priority)` — upstream's inversion, ported
@@ -7826,7 +7945,14 @@ fn sort_series_timers(
         .sort_by
         .as_deref()
         .is_some_and(|s| s.eq_ignore_ascii_case("Priority"));
-    let name = |t: &SeriesTimerInfoDto| t.base.name.clone().unwrap_or_default();
+    let by_name = |a: &SeriesTimerInfoDto, b: &SeriesTimerInfoDto| {
+        let order = match (a.base.name.as_deref(), b.base.name.as_deref()) {
+            (Some(x), Some(y)) => invariant_numeric_cmp(x, y),
+            // `StringComparer.Compare` puts a null name before every string.
+            (x, y) => x.is_some().cmp(&y.is_some()),
+        };
+        if descending { order.reverse() } else { order }
+    };
     if by_priority {
         timers.sort_by(|a, b| {
             let priority = if descending {
@@ -7834,24 +7960,10 @@ fn sort_series_timers(
             } else {
                 b.base.priority.cmp(&a.base.priority)
             };
-            priority.then_with(|| {
-                let by_name = alphanumeric_compare(&name(a), &name(b));
-                if descending {
-                    by_name.reverse()
-                } else {
-                    by_name
-                }
-            })
+            priority.then_with(|| by_name(a, b))
         });
     } else {
-        timers.sort_by(|a, b| {
-            let by_name = alphanumeric_compare(&name(a), &name(b));
-            if descending {
-                by_name.reverse()
-            } else {
-                by_name
-            }
-        });
+        timers.sort_by(by_name);
     }
 }
 
@@ -8073,6 +8185,109 @@ fn series_child_timer(
     timer
 }
 
+/// What [`FerrofinLiveTvManager::fill_images`] found for a timer card:
+/// `(item id, tag)` of its parent Thumb, Backdrop and Primary.
+#[derive(Debug, Default)]
+struct ParentArtwork {
+    thumb: Option<(Uuid, String)>,
+    backdrop: Option<(Uuid, String)>,
+    primary: Option<(Uuid, String)>,
+}
+
+impl ParentArtwork {
+    /// Writes the artwork onto a series timer, which `GetSeriesTimerInfoDto`
+    /// builds new, so a field nothing was found for is cleared.
+    fn onto_series_timer(self, timer: &mut SeriesTimerInfoDto) {
+        let n = |(id, tag): (Uuid, String)| (id.simple().to_string(), tag);
+        (timer.parent_thumb_item_id, timer.parent_thumb_image_tag) = self.thumb.map(n).unzip();
+        let (id, tag) = self.backdrop.map(n).unzip();
+        timer.base.parent_backdrop_item_id = id;
+        timer.base.parent_backdrop_image_tags = tag.map(|tag| vec![tag]);
+        (
+            timer.parent_primary_image_item_id,
+            timer.parent_primary_image_tag,
+        ) = self.primary.map(n).unzip();
+    }
+
+    /// Writes the artwork onto a programme's DTO, which keeps what it has
+    /// where nothing was found: `FillImages(BaseItemDto, …)` only assigns.
+    fn onto_item(self, dto: &mut BaseItemDto) {
+        if let Some((id, tag)) = self.thumb {
+            dto.parent_thumb_item_id = Some(id);
+            dto.parent_thumb_image_tag = Some(tag);
+        }
+        if let Some((id, tag)) = self.backdrop {
+            dto.parent_backdrop_item_id = Some(id);
+            dto.parent_backdrop_image_tags = Some(vec![tag]);
+        }
+        if let Some((id, tag)) = self.primary {
+            dto.parent_primary_image_item_id = Some(id);
+            dto.parent_primary_image_tag = Some(tag);
+        }
+    }
+}
+
+/// `GetItemList(new InternalItemsQuery { IncludeItemTypes = [kind], Name,
+/// ExternalSeriesId, ImageTypes = [image], Limit = 1 }).FirstOrDefault()`, with
+/// no user, as `FillImages` asks it.
+async fn first_with_image(
+    store: &LiveTvItemStore,
+    kind: BaseItemKind,
+    image: ImageType,
+    name: Option<&str>,
+    series_id: Option<&str>,
+) -> Result<Option<BaseItemEntity>, ServiceError> {
+    let query = InternalItemsQuery {
+        include_item_types: vec![kind],
+        name: name.map(str::to_owned),
+        external_series_id: series_id.map(str::to_owned),
+        image_types: vec![image],
+        limit: Some(1),
+        ..InternalItemsQuery::default()
+    };
+    Ok(store.items.get_item_list(&query).await?.into_iter().next())
+}
+
+/// The stored image rows of `item`.
+async fn item_images(
+    store: &LiveTvItemStore,
+    item: &BaseItemEntity,
+) -> Result<Vec<ItemImageInfo>, ServiceError> {
+    match Uuid::parse_str(&item.id) {
+        Ok(id) => store.items.get_image_infos(id).await,
+        Err(_) => Ok(Vec::new()),
+    }
+}
+
+/// `(item id, tag)` of `item`'s first `image_type` image among `images`
+/// (`GetImageInfo(type, 0)`), or `None` when it has none or the tag cannot be
+/// computed: upstream logs that and leaves the field unset.
+async fn image_tag(
+    processor: &dyn ImageProcessor,
+    item: &BaseItemEntity,
+    images: &[ItemImageInfo],
+    image_type: ImageType,
+) -> Option<(Uuid, String)> {
+    let id = Uuid::parse_str(&item.id).ok()?;
+    let image = images.iter().find(|image| image.image_type == image_type)?;
+    match processor
+        .get_image_cache_tag(item.path.as_deref(), image)
+        .await
+    {
+        Ok(tag) => tag.map(|tag| (id, tag)),
+        Err(error) => {
+            tracing::debug!(%error, item_id = %id, "live tv: could not tag a timer's series image");
+            None
+        }
+    }
+}
+
+/// The channels `rows` air on, for [`FerrofinLiveTvManager::channel_image_tags`].
+fn program_channel_ids<'a>(rows: impl Iterator<Item = &'a GuideProgramRow>) -> Vec<Uuid> {
+    rows.filter_map(|row| Uuid::parse_str(&row.channel_id).ok())
+        .collect()
+}
+
 /// Copies what the guide knows about a programme onto the timer that records it.
 ///
 /// Port of `DefaultLiveTvService.CopyProgramInfoToTimerInfo`, restricted to the
@@ -8186,8 +8401,8 @@ mod tests {
     use uuid::Uuid;
 
     use super::{
-        DEFAULT_LIVE_STREAM_BUFFER_MS, GuideProgramRow, LiveTvPaths, alphanumeric_compare,
-        day_pattern, duplicate_showings_to_cancel, live_tv_service_key, sort_series_timers,
+        DEFAULT_LIVE_STREAM_BUFFER_MS, GuideProgramRow, LiveTvPaths, day_pattern,
+        duplicate_showings_to_cancel, live_tv_service_key, sort_series_timers,
     };
     use ferrofin_model::live_tv::{
         BaseTimerInfoDto, RecordingStatus, SeriesTimerInfoDto, TimerInfoDto,
@@ -8730,12 +8945,10 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn a_hdhomerun_tuner_refreshes_through_the_hdhomerun_host() {
-        // The dispatch bug this replaces: `refresh_guide` fed EVERY tuner's URL
-        // to the M3U parser, so an HDHomeRun's `discover.json` parsed as a
-        // playlist with no channels and no error at all.
-        let device = HashMap::from([
+    /// An HDHomeRun at `http://192.168.1.182`: its `discover.json` and a
+    /// lineup of 4.1 `WCMH-DT` (HD), 4.2 `MeTV` and a DRM channel 9.9.
+    fn hdhr_device() -> HashMap<String, String> {
+        HashMap::from([
             (
                 "http://192.168.1.182/discover.json".to_owned(),
                 r#"{"FriendlyName":"HDHomeRun PRIME","ModelNumber":"HDHR3-CC","DeviceID":"FFFFFFFF",
@@ -8755,16 +8968,25 @@ mod tests {
                      "URL":"http://192.168.1.111:5004/auto/v9.9"}]"#
                     .to_owned(),
             ),
-        ]);
-        let mgr = manager_with(FakeFetcher(device)).await;
-        let saved = mgr
-            .save_tuner_host(TunerHostInfo {
-                type_: Some("hdhomerun".to_owned()),
-                url: Some("http://192.168.1.182".to_owned()),
-                ..TunerHostInfo::default()
-            })
-            .await
-            .expect("save");
+        ])
+    }
+
+    /// The HDHomeRun [`hdhr_device`] as the dashboard saves it.
+    fn hdhr_tuner() -> TunerHostInfo {
+        TunerHostInfo {
+            type_: Some("hdhomerun".to_owned()),
+            url: Some("http://192.168.1.182".to_owned()),
+            ..TunerHostInfo::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn a_hdhomerun_tuner_refreshes_through_the_hdhomerun_host() {
+        // The dispatch bug this replaces: `refresh_guide` fed EVERY tuner's URL
+        // to the M3U parser, so an HDHomeRun's `discover.json` parsed as a
+        // playlist with no channels and no error at all.
+        let mgr = manager_with(FakeFetcher(hdhr_device())).await;
+        let saved = mgr.save_tuner_host(hdhr_tuner()).await.expect("save");
         // `IConfigurableTunerHost.Validate` ran and adopted the device id.
         assert_eq!(saved.device_id.as_deref(), Some("FFFFFFFF"));
 
@@ -8785,6 +9007,8 @@ mod tests {
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].name, "WCMH-DT");
         assert_eq!(rows[0].number.as_deref(), Some("4.1"));
+        // No `TunerChannelId`, so no guide key is stored for the match.
+        assert_eq!(rows[0].tvg_id, "");
         assert_eq!(rows[1].name, "MeTV");
         for (guide_number, is_hd) in [("4.1", Some(true)), ("4.2", Some(false))] {
             let external = format!("hdhr_{guide_number}");
@@ -9430,17 +9654,38 @@ mod tests {
             1,
             "airings stay with their channel"
         );
-        // Meanwhile the channel has no tuner to open: "Tuner not found.".
-        let err = mgr
-            .open_channel_stream(chan_id, None)
-            .await
-            .expect_err("no tuner to open");
-        assert!(matches!(err, ServiceError::NotFound(_)), "{err:?}");
-        let err = mgr
+        // Meanwhile no tuner offers the channel a source, so its sources are
+        // the item's own placeholder, to be opened
+        // (`LiveTvMediaSourceProvider.GetMediaSourcesInternal`'s
+        // `NotImplementedException` arm over `LiveTvChannel.GetMediaSources`)…
+        let key = chan_id.simple().to_string();
+        let sources = mgr
             .get_channel_media_sources(chan_id)
             .await
-            .expect_err("no tuner to ask");
-        assert!(matches!(err, ServiceError::NotFound(_)), "{err:?}");
+            .expect("the placeholder source");
+        assert_eq!(
+            sources,
+            vec![ferrofin_model::dto::MediaSourceInfo {
+                id: Some(key.clone()),
+                name: Some("Channel One".to_owned()),
+                is_infinite_stream: true,
+                requires_opening: true,
+                open_token: Some(format!("LiveTvChannel_{key}_{key}")),
+                buffer_ms: Some(1500),
+                ..ferrofin_model::dto::MediaSourceInfo::default()
+            }]
+        );
+        // …and opening it is what fails: "Tuner not found.".
+        for source_id in [None, Some(key.as_str())] {
+            let err = mgr
+                .open_channel_stream(chan_id, source_id)
+                .await
+                .expect_err("no tuner to open");
+            assert!(
+                matches!(&err, ServiceError::NotFound(m) if m == "Tuner not found."),
+                "{err:?}"
+            );
+        }
         mgr.refresh_guide().await.expect("refresh3");
         assert_eq!(
             mgr.get_channels(&LiveTvChannelQuery::default(), &DtoOptions::default())
@@ -10935,7 +11180,6 @@ mod tests {
         };
         let mut lineups = vec![(
             "tuner-a".to_owned(),
-            String::new(),
             vec![crate::tuner_host::TunerChannel {
                 external_id: "m3u_1".to_owned(),
                 guide_key: "one.tv".to_owned(),
@@ -10944,8 +11188,8 @@ mod tests {
                 ..crate::tuner_host::TunerChannel::default()
             }],
         )];
-        let logo = |lineups: &[(String, String, Vec<crate::tuner_host::TunerChannel>)]| {
-            lineups[0].2[0].image_url.clone()
+        let logo = |lineups: &[(String, Vec<crate::tuner_host::TunerChannel>)]| {
+            lineups[0].1[0].image_url.clone()
         };
         let xmltv = |channel: XmltvChannel| GuideSource::XmlTv {
             document: crate::xmltv_cache::XmlTvDocument::empty_for_test(),
@@ -11067,9 +11311,10 @@ mod tests {
 
     /// `LiveTvChannel.MediaType` — what the media-source manager's per-user
     /// `SupportsTranscoding`/`SupportsDirectStream` overwrite branches on
-    /// (`MediaSourceManager.GetPlaybackMediaSources`, v10.11.8
-    /// MediaSourceManager.cs:204-217). A channel is not a `BaseItems` row here,
-    /// so the Live TV manager is the only thing that can answer.
+    /// (`MediaSourceManager.GetPlaybackMediaSources`, v12.4
+    /// MediaSourceManager.cs:409-417). A channel or a DVR recording is not a
+    /// `BaseItems` row here, so the Live TV manager is the only thing that can
+    /// answer.
     #[tokio::test]
     async fn a_channel_reports_the_media_type_of_its_kind() {
         let mgr = manager_with_relative_guide().await;
@@ -11103,6 +11348,43 @@ mod tests {
             radio_mgr.live_tv_media_type(radio).await.expect("type"),
             Some("Audio".to_owned()),
             "a radio channel is MediaType.Audio"
+        );
+        // A recording of that radio channel is a `.ts` capture, which upstream's
+        // library resolves as a video item: `MediaType.Video`, not the channel's.
+        let recording = Uuid::new_v4();
+        crate::dvr_repository::insert_recording(
+            &radio_mgr.db,
+            recording,
+            &crate::dvr::TimerRecordingInfo {
+                channel_id: radio,
+                ..crate::dvr::TimerRecordingInfo::default()
+            },
+            std::path::Path::new("/recordings/Jazz FM.ts"),
+            Utc::now(),
+        )
+        .await
+        .expect("recording");
+        assert_eq!(
+            radio_mgr.live_tv_media_type(recording).await.expect("type"),
+            Some("Video".to_owned()),
+            "a radio channel's recording is MediaType.Video"
+        );
+        // Its channel is not consulted: a recording whose channel is gone is a
+        // video item all the same.
+        let orphan = Uuid::new_v4();
+        crate::dvr_repository::insert_recording(
+            &radio_mgr.db,
+            orphan,
+            &crate::dvr::TimerRecordingInfo::default(),
+            std::path::Path::new("/recordings/Gone.ts"),
+            Utc::now(),
+        )
+        .await
+        .expect("recording");
+        assert_eq!(
+            radio_mgr.live_tv_media_type(orphan).await.expect("type"),
+            Some("Video".to_owned()),
+            "a recording of no stored channel is MediaType.Video"
         );
         // An id that is neither a channel nor a recording has no media type,
         // and the caller must then leave the source as it was built.
@@ -13942,50 +14224,8 @@ mod tests {
         assert!(found.is_empty(), "{found:?}");
     }
 
-    /// `AlphanumericComparator.CompareValues`, against the C# as the oracle.
-    ///
-    /// The digit-run arms are v10.11.8's (`Jellyfin.Extensions/AlphanumericComparator.cs`),
-    /// including the trailing `len1 - len2` tie-break master dropped when it
-    /// moved to `CompareOptions.NumericOrdering`; the text arm is the
-    /// `StringComparison.InvariantCulture` BOTH trees ask for.
-    #[test]
-    fn alphanumeric_compare_matches_the_upstream_comparator() {
-        // Numbers sort as numbers, not as text.
-        assert_eq!(
-            alphanumeric_compare("Show 2", "Show 10"),
-            std::cmp::Ordering::Less
-        );
-        // Leading zeros do not change the NUMBER, but upstream's final
-        // `return len1 - len2` still breaks the tie on the raw lengths.
-        assert_eq!(
-            alphanumeric_compare("Show 007", "Show 7"),
-            std::cmp::Ordering::Greater
-        );
-        assert_eq!(
-            alphanumeric_compare("Show", "Show 1"),
-            std::cmp::Ordering::Less
-        );
-        assert_eq!(alphanumeric_compare("", "a"), std::cmp::Ordering::Less);
-        // `StringComparison.InvariantCulture` is CLDR root collation, not
-        // code-point order: the primary level orders by letter, so a lowercase
-        // 'a' sorts before an uppercase 'B' even though 'B'(0x42) < 'a'(0x61).
-        assert_eq!(
-            alphanumeric_compare("apple parity", "Banana parity"),
-            std::cmp::Ordering::Less
-        );
-        assert_eq!(alphanumeric_compare("a", "B"), std::cmp::Ordering::Less);
-        // …and the tertiary level puts lowercase before uppercase within a
-        // letter, which code-point order has backwards.
-        assert_eq!(alphanumeric_compare("a", "A"), std::cmp::Ordering::Less);
-        // A multi-byte run is segmented on char boundaries, not byte ones.
-        assert_eq!(
-            alphanumeric_compare("Café 2", "Café 10"),
-            std::cmp::Ordering::Less
-        );
-    }
-
-    /// `GetDayPattern`, `AlphanumericComparator` and `GetSeriesTimers`' ordering,
-    /// against the C# as the oracle — including upstream's inverted priority arm.
+    /// `GetDayPattern` and `GetSeriesTimers`' ordering, against the C# as the
+    /// oracle — including upstream's inverted priority arm.
     #[test]
     fn day_pattern_and_series_timer_ordering_match_upstream() {
         use ferrofin_model::live_tv::{DayPattern, SeriesTimerQuery};
@@ -14072,6 +14312,55 @@ mod tests {
             names(&v),
             ["B", "C", "A"],
             "…and its descending arm is OrderBy(Priority).ThenByStringDescending(Name)"
+        );
+    }
+
+    /// v12.4's `SortExtensions` compares whole names under invariant-culture
+    /// numeric ordering (gl-510): leading zeros tie, so the stable sort keeps
+    /// their order either way, a later number outranks an earlier difference
+    /// of case, and a null name comes first.
+    #[test]
+    fn series_timer_names_sort_by_invariant_numeric_ordering() {
+        use ferrofin_model::live_tv::SeriesTimerQuery;
+        let timer = |name: &str| SeriesTimerInfoDto {
+            base: ferrofin_model::live_tv::BaseTimerInfoDto {
+                name: Some(name.to_owned()),
+                ..ferrofin_model::live_tv::BaseTimerInfoDto::default()
+            },
+            ..SeriesTimerInfoDto::default()
+        };
+        let names = |v: &[SeriesTimerInfoDto]| {
+            v.iter()
+                .map(|t| t.base.name.clone().unwrap_or_default())
+                .collect::<Vec<_>>()
+        };
+        let mut v = vec![
+            timer("Show 007"),
+            timer("the Show 2"),
+            timer("Show 7"),
+            timer("The Show 1"),
+        ];
+        sort_series_timers(&mut v, &SeriesTimerQuery::default());
+        assert_eq!(
+            names(&v),
+            ["Show 007", "Show 7", "The Show 1", "the Show 2"]
+        );
+        sort_series_timers(
+            &mut v,
+            &SeriesTimerQuery {
+                sort_by: None,
+                sort_order: SortOrder::Descending,
+            },
+        );
+        assert_eq!(
+            names(&v),
+            ["the Show 2", "The Show 1", "Show 007", "Show 7"]
+        );
+        let mut v = vec![timer(""), SeriesTimerInfoDto::default()];
+        sort_series_timers(&mut v, &SeriesTimerQuery::default());
+        assert_eq!(
+            v[0].base.name, None,
+            "a null name sorts before an empty one"
         );
     }
 
@@ -15100,6 +15389,282 @@ mod tests {
         assert_eq!(links(&programs, &manual), (None, None, None));
     }
 
+    /// gl-1745: `get_timers_matching` builds each timer as `GetTimerInfoDto`
+    /// does, from the guide and the channel as they are now. A live timer's
+    /// programme carries the timer's id and status, a cancelled one's only its
+    /// series timer. A timer whose programme left the guide has no
+    /// `ProgramInfo`, one whose channel is gone no `ChannelName`, and an empty
+    /// series timer id is none. The run time is the window's, and the stored
+    /// row keeps none of what the read added.
+    #[tokio::test]
+    async fn timers_are_built_from_the_guide_and_the_channel_on_read() {
+        let mgr = manager_with_series_guide().await;
+        let future = airings_of(&mgr, "Recurring")
+            .await
+            .into_iter()
+            .find(|r| parse_dt(&r.start_date).is_some_and(|s| s > Utc::now()))
+            .expect("a future airing");
+        let st_id = mgr
+            .create_series_timer(defaults_for(&mgr, &future).await)
+            .await
+            .expect("series timer");
+        let ids: Vec<String> = mgr
+            .get_timers()
+            .await
+            .expect("timers")
+            .into_iter()
+            .filter_map(|t| t.base.id)
+            .collect();
+        let [live, cancelled, orphan, ..] = ids.as_slice() else {
+            panic!("the fan-out schedules three airings: {ids:?}");
+        };
+        mgr.cancel_timer(cancelled).await.expect("cancel");
+        let mut gone = mgr.get_timer(orphan).await.expect("read").expect("row");
+        gone.base.program_id = Some(Uuid::new_v4().simple().to_string());
+        gone.base.external_program_id = None;
+        gone.base.channel_id = Uuid::new_v4();
+        gone.series_timer_id = Some(String::new());
+        assert!(
+            gone.base.channel_name.is_some(),
+            "the stored name, copied at creation"
+        );
+        mgr.persist_timer(&gone).await.expect("store");
+
+        let listed = mgr
+            .get_timers_matching(&ferrofin_model::live_tv::TimerQuery::default())
+            .await
+            .expect("timers");
+        let find = |id: &str| {
+            listed
+                .iter()
+                .find(|t| t.base.id.as_deref() == Some(id))
+                .expect("listed")
+        };
+        let timer = find(live);
+        let info = timer.program_info.as_deref().expect("the programme");
+        assert_eq!(
+            (info.timer_id.as_deref(), info.status.as_deref()),
+            (Some(live.as_str()), Some("New"))
+        );
+        assert_eq!(info.series_timer_id.as_deref(), Some(st_id.as_str()));
+        let channel = crate::guide_repository::channel_row(&mgr.db, timer.base.channel_id)
+            .await
+            .expect("read")
+            .expect("the channel");
+        assert_eq!(
+            timer.base.channel_name.as_deref(),
+            Some(channel.name.as_str())
+        );
+        assert_eq!(
+            timer.run_time_ticks,
+            Some((timer.base.end_date - timer.base.start_date).num_milliseconds() * 10_000)
+        );
+
+        let info = find(cancelled)
+            .program_info
+            .as_deref()
+            .expect("the programme");
+        assert_eq!(
+            (info.timer_id.as_deref(), info.status.as_deref()),
+            (None, None)
+        );
+        assert_eq!(info.series_timer_id.as_deref(), Some(st_id.as_str()));
+
+        let timer = find(orphan);
+        assert!(timer.program_info.is_none());
+        assert!(timer.base.channel_name.is_none());
+        assert!(timer.series_timer_id.is_none());
+
+        let stored = mgr.get_timer(live).await.expect("read").expect("row");
+        assert!(
+            stored.program_info.is_none(),
+            "the read writes nothing back"
+        );
+    }
+
+    /// gl-853: `fill_images` over the real item repository, branch by branch.
+    /// A library series with only a Thumb gives its Thumb; the Primary and
+    /// the Backdrop then come from the airing of the listings series (the
+    /// series-timer overload looks for a series Primary first and finds
+    /// none), by its series id or, without one, by its name. A DTO with a
+    /// backdrop of its own keeps it. A blank name runs no lookup by name, so
+    /// only a series id finds anything. Once the series has a Primary, the
+    /// series-timer overload takes it, and with it no airing backdrop.
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)] // one fixture, every branch
+    async fn fill_images_finds_the_series_and_airing_artwork() {
+        use super::ParentArtwork;
+        use ferrofin_db::store::guid_to_db;
+        use ferrofin_model::data::BaseItemKind;
+        use ferrofin_model::entities::ImageType;
+        use ferrofin_traits::options::ItemImageInfo;
+        let xmltv = dated(
+            "<tv><channel id=\"one.tv\"><display-name>Channel One</display-name></channel>\
+             <programme start=\"20260725060000 +0000\" stop=\"20260725070000 +0000\" \
+             channel=\"one.tv\"><title>Show</title>\
+             <episode-num system=\"xmltv_ns\">0.1.</episode-num>\
+             <icon src=\"http://img/show.png\"/>\
+             <image type=\"backdrop\">http://img/back.jpg</image></programme></tv>",
+        );
+        let lab = item_lab(M3U, Some(xmltv)).await;
+        let art = Arc::new(ArtServices::default());
+        lab.mgr.set_images(art.clone(), art.clone());
+        lab.mgr.refresh_guide().await.expect("refresh");
+        let airing = lab
+            .items
+            .get_item_list(&InternalItemsQuery {
+                include_item_types: vec![BaseItemKind::LiveTvProgram],
+                ..InternalItemsQuery::default()
+            })
+            .await
+            .expect("programmes")
+            .remove(0);
+        let airing_id = Uuid::parse_str(&airing.id).expect("guid");
+        let series_id = airing
+            .external_series_id
+            .clone()
+            .expect("an episode's series");
+        let show = Uuid::new_v4();
+        lab.persistence
+            .save_items(&[BaseItemEntity {
+                id: guid_to_db(show),
+                type_: "MediaBrowser.Controller.Entities.TV.Series".to_owned(),
+                name: Some("Show".to_owned()),
+                clean_name: Some("show".to_owned()),
+                sort_name: Some("show".to_owned()),
+                is_folder: true,
+                ..BaseItemEntity::default()
+            }])
+            .await
+            .expect("series");
+        let image = |path: &str, image_type| ItemImageInfo {
+            path: path.to_owned(),
+            image_type,
+            ..ItemImageInfo::default()
+        };
+        let thumb = image("http://img/thumb.png", ImageType::Thumb);
+        lab.persistence
+            .save_item_images(show, std::slice::from_ref(&thumb))
+            .await
+            .expect("thumb");
+
+        let ids = |art: &ParentArtwork| {
+            (
+                art.thumb.as_ref().map(|found| found.0),
+                art.backdrop.as_ref().map(|found| found.0),
+                art.primary.as_ref().map(|found| found.0),
+            )
+        };
+        let lookup = |name, series, series_primary, has_backdrop| {
+            lab.mgr
+                .fill_images(name, series, series_primary, has_backdrop)
+        };
+        let full = lookup(Some("Show"), Some(series_id.as_str()), true, false)
+            .await
+            .expect("art");
+        assert_eq!(ids(&full), (Some(show), Some(airing_id), Some(airing_id)));
+        assert_eq!(
+            full.thumb.as_ref().map(|found| found.1.as_str()),
+            Some("tag:http://img/thumb.png")
+        );
+        assert!(
+            full.primary
+                .as_ref()
+                .is_some_and(|found| found.1.starts_with("tag:http://img/show.png")),
+            "{full:?}"
+        );
+        assert!(
+            full.backdrop
+                .as_ref()
+                .is_some_and(|found| found.1.starts_with("tag:http://img/back.jpg")),
+            "{full:?}"
+        );
+        let by_name = lookup(Some("Show"), None, false, false).await.expect("art");
+        assert_eq!(
+            ids(&by_name),
+            (Some(show), Some(airing_id), Some(airing_id))
+        );
+        let kept = lookup(Some("Show"), Some(series_id.as_str()), false, true)
+            .await
+            .expect("art");
+        assert_eq!(ids(&kept), (Some(show), None, Some(airing_id)));
+        let blank = lookup(Some("  "), Some(series_id.as_str()), true, false)
+            .await
+            .expect("art");
+        assert_eq!(ids(&blank), (None, Some(airing_id), Some(airing_id)));
+        let nothing = lookup(Some(""), None, true, false).await.expect("art");
+        assert_eq!(ids(&nothing), (None, None, None));
+
+        lab.persistence
+            .save_item_images(
+                show,
+                &[thumb, image("http://img/poster.png", ImageType::Primary)],
+            )
+            .await
+            .expect("primary");
+        let series_primary = lookup(Some("Show"), Some(series_id.as_str()), true, false)
+            .await
+            .expect("art");
+        assert_eq!(ids(&series_primary), (Some(show), None, Some(show)));
+        let program_primary = lookup(Some("Show"), Some(series_id.as_str()), false, false)
+            .await
+            .expect("art");
+        assert_eq!(
+            ids(&program_primary),
+            (Some(show), Some(airing_id), Some(airing_id))
+        );
+    }
+
+    /// A series timer is built new, so what nothing was found for is cleared;
+    /// a programme's DTO keeps its own values where nothing was found.
+    #[test]
+    fn parent_artwork_clears_a_series_timer_and_assigns_onto_an_item() {
+        use super::ParentArtwork;
+        let id = Uuid::from_u128(7);
+        let mut timer = SeriesTimerInfoDto {
+            parent_thumb_item_id: Some("stale".to_owned()),
+            parent_primary_image_tag: Some("stale".to_owned()),
+            ..SeriesTimerInfoDto::default()
+        };
+        timer.base.parent_backdrop_image_tags = Some(vec!["stale".to_owned()]);
+        ParentArtwork {
+            thumb: Some((id, "t".to_owned())),
+            ..ParentArtwork::default()
+        }
+        .onto_series_timer(&mut timer);
+        assert_eq!(
+            (
+                timer.parent_thumb_item_id.as_deref(),
+                timer.parent_thumb_image_tag.as_deref()
+            ),
+            (Some("00000000000000000000000000000007"), Some("t"))
+        );
+        assert_eq!(timer.parent_primary_image_tag, None);
+        assert_eq!(timer.base.parent_backdrop_image_tags, None);
+
+        let mut item = BaseItemDto {
+            parent_backdrop_item_id: Some(id),
+            parent_backdrop_image_tags: Some(vec!["own".to_owned()]),
+            ..BaseItemDto::default()
+        };
+        ParentArtwork {
+            primary: Some((id, "p".to_owned())),
+            ..ParentArtwork::default()
+        }
+        .onto_item(&mut item);
+        assert_eq!(
+            item.parent_backdrop_image_tags,
+            Some(vec!["own".to_owned()])
+        );
+        assert_eq!(
+            (
+                item.parent_primary_image_item_id,
+                item.parent_primary_image_tag.as_deref()
+            ),
+            (Some(id), Some("p"))
+        );
+    }
+
     /// gl-1256: a programme page parses only the timers it can link, the
     /// scheduled (not `Completed`) ones for its own programmes. The other
     /// rows are corrupt here, so any read of them would be recorded as a row
@@ -15426,7 +15991,8 @@ mod tests {
         let row = mgr
             .set_channel_mapping(&provider_id, &two, "one.tv")
             .await
-            .expect("map");
+            .expect("map")
+            .expect("a lineup channel");
         // The response is the RESOLVED row, not an echo of the request.
         assert_eq!(row.id.as_deref(), Some(two.as_str()));
         assert_eq!(row.name.as_deref(), Some("2 Channel Two"));
@@ -15502,12 +16068,19 @@ mod tests {
             1
         );
 
-        // A tuner channel that is not in the lineup cannot be mapped.
+        // A tuner channel that is not in the lineup has no row to answer
+        // with (the handler's 404), though its pair is stored as upstream's is.
         assert!(matches!(
             mgr.set_channel_mapping(&provider_id, "m3u_bogus", "one.tv")
                 .await,
-            Err(ServiceError::NotFound(_))
+            Ok(None)
         ));
+        assert!(
+            mgr.get_listing_providers().await.expect("p")[0]
+                .channel_mappings
+                .iter()
+                .any(|pair| pair.name.as_deref() == Some("m3u_bogus"))
+        );
         assert!(matches!(
             mgr.set_channel_mapping("nope", &two, "one.tv").await,
             Err(ServiceError::NotFound(_))
@@ -15645,9 +16218,74 @@ mod tests {
         let row = mgr
             .set_channel_mapping(&provider_id, &three, "one.tv")
             .await
-            .expect("map the new channel");
+            .expect("map the new channel")
+            .expect("a lineup channel");
         assert_eq!(row.name.as_deref(), Some("3 Channel Three"));
         assert_eq!(row.provider_channel_id.as_deref(), Some("one.tv"));
+    }
+
+    /// An HDHomeRun channel is mapped under the id its host mints,
+    /// `hdhr_{GuideNumber}` (v12.4 `HdHomerunHost.GetChannelId`), never the M3U
+    /// shape: the dialog lists it so, a mapping keyed on it (as Jellyfin saves
+    /// one) applies, and the guide's airing is bound and keyed under it
+    /// (`ListingsManager.GetProgramsAsync`'s `program.Id += "_" + channel.Id`).
+    #[tokio::test]
+    async fn hdhomerun_channels_map_under_their_hdhr_id() {
+        let mut sources = hdhr_device();
+        sources.insert("http://guide/xmltv.xml".to_owned(), dated(XMLTV));
+        let mgr = manager_with(FakeFetcher(sources)).await;
+        mgr.save_tuner_host(hdhr_tuner()).await.expect("tuner");
+        let provider_id = mgr
+            .save_listing_provider(
+                as_xmltv(ListingsProviderInfo {
+                    path: Some("http://guide/xmltv.xml".to_owned()),
+                    ..ListingsProviderInfo::default()
+                }),
+                false,
+                false,
+            )
+            .await
+            .expect("provider")
+            .id
+            .expect("provider id");
+        mgr.refresh_guide().await.expect("refresh");
+
+        let opts = mgr
+            .get_channel_mapping_options(&provider_id)
+            .await
+            .expect("options");
+        let ids: Vec<_> = opts
+            .tuner_channels
+            .iter()
+            .map(|c| (c.id.as_deref(), c.name.as_deref()))
+            .collect();
+        assert_eq!(
+            ids,
+            [
+                (Some("hdhr_4.1"), Some("4.1 WCMH-DT")),
+                (Some("hdhr_4.2"), Some("4.2 MeTV"))
+            ]
+        );
+
+        let row = mgr
+            .set_channel_mapping(&provider_id, "hdhr_4.2", "one.tv")
+            .await
+            .expect("map")
+            .expect("a lineup channel");
+        assert_eq!(row.id.as_deref(), Some("hdhr_4.2"));
+        assert_eq!(row.provider_channel_id.as_deref(), Some("one.tv"));
+
+        mgr.refresh_guide().await.expect("queued refresh");
+        let programs = crate::guide_repository::test_support::program_rows(&mgr.db)
+            .await
+            .expect("programmes");
+        assert_eq!(programs.len(), 1, "{programs:?}");
+        assert_eq!(
+            Uuid::parse_str(&programs[0].channel_id).expect("channel guid"),
+            super::internal_channel_id("hdhr_4.2")
+        );
+        let external = programs[0].external_id.as_deref().unwrap_or_default();
+        assert!(external.ends_with("_hdhr_4.2"), "{external}");
     }
 
     /// A [`SourceFetcher`] that counts its fetches and fails while no body is
@@ -15724,6 +16362,29 @@ mod tests {
             .await
             .expect("lineups after save");
         assert_eq!(fetcher.fetches(), 2);
+    }
+
+    /// `SetChannelMapping` saves the configuration without
+    /// `InvalidateListingsProviderCache`, so mapping a channel reads the cached
+    /// guide: no second download, and it works while the guide host is down.
+    #[tokio::test]
+    async fn a_channel_mapping_keeps_the_cached_guide() {
+        let fetcher = Arc::new(CountingFetcher::default());
+        *fetcher.body.lock().unwrap() = Some(XMLTV.to_owned());
+        let (mgr, provider) = cached_guide_manager(&fetcher).await;
+        let id = provider.id.expect("id");
+        mgr.get_channel_mapping_options(&id).await.expect("options");
+        assert_eq!(fetcher.fetches(), 1);
+
+        *fetcher.body.lock().unwrap() = None;
+        // No tuner lists the channel, so no row answers (the handler's 404),
+        // which comes only after the pair is stored and the guide's channels
+        // are read.
+        assert!(matches!(
+            mgr.set_channel_mapping(&id, "m3u_x", "one.tv").await,
+            Ok(None)
+        ));
+        assert_eq!(fetcher.fetches(), 1);
     }
 
     /// A failed download falls back to the previous document, and a remote

@@ -53,14 +53,16 @@ use crate::config::Config;
 use crate::media_encoding::build_media_encoding;
 
 /// Starts the task that reads the network interfaces again after the
-/// operating system reports a network change ([`ferrofin_networking::network_change`]).
-/// Where the listener cannot be opened the server goes on without it, as
+/// operating system reports a network change ([`ferrofin_networking::network_change`]),
+/// from `source`, the listener `build_app_state` opened as it built the
+/// manager. Where it could not be opened the server goes on without it, as
 /// with the setting off, and says so.
 fn start_network_change_monitor(
+    source: std::io::Result<ferrofin_networking::network_change::OsNetworkChanges>,
     network: &Arc<std::sync::RwLock<ferrofin_networking::NetworkManager>>,
 ) -> Option<tokio::task::JoinHandle<()>> {
     use ferrofin_networking::network_change;
-    match network_change::os_source() {
+    match source {
         Ok(source) => Some(tokio::spawn(tracing::Instrument::instrument(
             network_change::monitor(
                 source,
@@ -1050,6 +1052,13 @@ pub async fn build_app_state(
             Arc::new(ferrofin_networking::TracingLogger),
         ),
     ));
+    // `DetectNetworkChange` subscribes as the manager is built (upstream's
+    // `NetworkManager` constructor): a request reads the manager's snapshot,
+    // so the listener opens now, and a change made during the rest of the
+    // wiring waits in it for the monitor started last.
+    let network_changes = config
+        .detect_network_change
+        .then(ferrofin_networking::network_change::os_source);
 
     let users_impl = Arc::new(
         FerrofinUserManager::new(db.clone())
@@ -2399,6 +2408,8 @@ pub async fn build_app_state(
         .with_self_writes(Arc::clone(&self_writes_guard))
         // Each playlist change announced as `ItemAdded`/`ItemUpdated`.
         .with_item_persistence(Arc::clone(&item_persistence_service))
+        // The scan's playlist sync and deletion wait for an entry edit.
+        .with_entry_edits(item_persistence_impl.playlist_entry_edits())
         // A new playlist's folder stored as `%AppDataPath%/playlists/<name>`.
         .with_virtual_paths(virtual_paths.clone()),
     );
@@ -3338,8 +3349,8 @@ pub async fn build_app_state(
     // `NetworkManager` constructor and unsubscribes in `Dispose`). Started
     // last: a `background` handle dropped by an early return would not stop
     // a task that never ends on its own.
-    if config.detect_network_change {
-        background.extend(start_network_change_monitor(&changing_network));
+    if let Some(source) = network_changes {
+        background.extend(start_network_change_monitor(source, &changing_network));
     }
 
     Ok(WiredApp {

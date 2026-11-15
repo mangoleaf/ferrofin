@@ -139,12 +139,19 @@ impl RemoteSearchProvider for TmdbSearchProvider {
         // the two providers: `TmdbMovieProvider.cs:96-101`/`:106-111` pass
         // `TmdbUtils.GetImageLanguagesParam(...)` (so TMDB's `/find` sees
         // `language=en,null`), while `TmdbSeriesProvider.cs:73` passes the bare
-        // `MetadataLanguage`. Upstream's asymmetry, ported as-is.
+        // `MetadataLanguage`. Upstream's asymmetry, ported as-is, and so is
+        // `FindByExternalIdAsync`'s own `NormalizeLanguage` over the whole
+        // string, which upper-cases what follows a region's hyphen
+        // (`pt-BR,null,en` → `pt-BR,NULL,EN`).
+        let country = search_info.metadata_country_code.as_deref();
         let find_language = match self.kind {
-            TmdbKind::Movie => Some(crate::tmdb::image_languages_param(
-                search_info.metadata_language.as_deref(),
-                search_info.metadata_country_code.as_deref(),
-            )),
+            TmdbKind::Movie => crate::tmdb::normalize_language(
+                Some(&crate::tmdb::image_languages_param(
+                    search_info.metadata_language.as_deref(),
+                    country,
+                )),
+                country,
+            ),
             TmdbKind::Series => language.map(ToOwned::to_owned),
         };
         for (key, source) in [("Imdb", "imdb_id"), ("Tvdb", "tvdb_id")] {
@@ -431,13 +438,8 @@ impl RemoteSearchProvider for TmdbBoxSetSearchProvider {
             };
             return Ok(vec![RemoteSearchResult {
                 name: Some(collection.name),
-                // `GetPosterUrl(collection.PosterPath)` — TMDB's own pick, which
-                // `TmdbClient::collection` pushes first as the Primary image.
-                image_url: collection
-                    .images
-                    .iter()
-                    .find(|image| image.image_type == ImageType::Primary)
-                    .map(|image| image.url.clone()),
+                // `GetPosterUrl(collection.PosterPath)` — TMDB's own pick only.
+                image_url: collection.poster_url,
                 provider_ids: Some(HashMap::from([(
                     "Tmdb".to_owned(),
                     collection.tmdb_id.to_string(),
@@ -555,11 +557,9 @@ impl RemoteSearchProvider for OmdbSearchProvider {
         // that branch is unreachable until both exist.
         let is_episode = self.kind == crate::OmdbKind::Episode;
         let known = crate::OmdbSearchKey {
-            imdb_id: search_info
-                .provider_ids
-                .as_ref()
-                .and_then(|ids| ids.iter().find(|(key, _)| key.eq_ignore_ascii_case("Imdb")))
-                .map(|(_, value)| value.as_str())
+            // A blank id is no id (`string.IsNullOrWhiteSpace(imdbId)`); jellyfin-web
+            // sends "" for every id field left empty.
+            imdb_id: provider_id_of(search_info.provider_ids.as_ref(), "Imdb")
                 .filter(|_| !is_episode),
             season: is_episode
                 .then_some(search_info.parent_index_number)
@@ -3643,6 +3643,7 @@ const NO_FILE: FileFacts = FileFacts {
     is_shortcut: false,
     is_file_protocol: false,
     is_placeholder: false,
+    is_photo: false,
     path_rebased: false,
     locations_changed: false,
 };
@@ -4844,16 +4845,38 @@ impl RefreshQueue {
     }
 }
 
-/// Stands the worker down if it unwinds, so a panicking refresh cannot leave
-/// the queue claimed forever.
-struct WorkerGuard(Arc<std::sync::Mutex<RefreshQueue>>);
+/// A worker's claim on the queue. Dropping it while the worker still holds the
+/// claim (a panicking refresh, an aborted task) stands the worker down, so the
+/// queue is never left claimed forever. Once [`Self::next_refresh`] has stood
+/// the worker down the guard holds nothing, so dropping it cannot clear the
+/// claim of a worker a later request started.
+struct WorkerGuard(Option<Arc<std::sync::Mutex<RefreshQueue>>>);
+
+impl WorkerGuard {
+    /// The next refresh, or `None` once the queue ran dry and the worker stood
+    /// down ([`RefreshQueue::pop_or_stand_down`]).
+    fn next_refresh(&mut self) -> Option<(Uuid, MetadataRefreshOptions)> {
+        let next = self
+            .0
+            .as_ref()?
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .pop_or_stand_down();
+        if next.is_none() {
+            self.0 = None;
+        }
+        next
+    }
+}
 
 impl Drop for WorkerGuard {
     fn drop(&mut self) {
-        self.0
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .processing = false;
+        if let Some(queue) = self.0.take() {
+            queue
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .processing = false;
+        }
     }
 }
 
@@ -4862,21 +4885,12 @@ impl LocalProviderManager {
     /// priority first, until the queue is empty. A failed refresh is logged and
     /// the queue keeps draining.
     async fn drain_refresh_queue(&self) {
-        let guard = WorkerGuard(Arc::clone(&self.refresh_queue));
-        loop {
-            let next = self
-                .refresh_queue
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .pop_or_stand_down();
-            let Some((item_id, options)) = next else {
-                break;
-            };
+        let mut worker = WorkerGuard(Some(Arc::clone(&self.refresh_queue)));
+        while let Some((item_id, options)) = worker.next_refresh() {
             if let Err(err) = self.refresh_full_item(item_id, &options).await {
                 tracing::warn!(%item_id, %err, "queued metadata refresh failed");
             }
         }
-        drop(guard);
     }
 }
 
@@ -5312,14 +5326,15 @@ impl ProviderManager for LocalProviderManager {
         //
         // The reference item decides the gate: `ItemId` set → the real row and
         // ITS library's `LibraryOptions` (its "Metadata downloaders"
-        // checkboxes decide which fetchers may run, and its `IsLocked` flag can
-        // shut them all out); `ItemId` empty → the C# builds a dummy
-        // `new TItemType()` under a fresh `new LibraryOptions()`, where every
-        // type entry is absent and therefore every fetcher enabled, so an
-        // unattached search stays unfiltered. `typeOptions` is keyed on
-        // `item.GetType().Name`, i.e. the REFERENCE item's type — which for the
-        // dummy is the searched-for kind, whose `BaseItemKind` name is the same
-        // PascalCase string the checkbox list stores.
+        // checkboxes decide which fetchers may run, and its `IsLocked` flag or
+        // its `ExtraType` can shut them all out); `ItemId` empty → the C#
+        // builds a dummy `new TItemType()` under a fresh `new
+        // LibraryOptions()`, where every type entry is absent and therefore
+        // every fetcher enabled, so an unattached search stays unfiltered.
+        // `typeOptions` is keyed on `item.GetType().Name`, i.e. the REFERENCE
+        // item's type — which for the dummy is the searched-for kind, whose
+        // `BaseItemKind` name is the same PascalCase string the checkbox list
+        // stores.
         let reference = match (&self.items, request.item_id) {
             (Some(items), id) if !id.is_nil() => items.retrieve_item(id).await?,
             _ => None,
@@ -5333,14 +5348,18 @@ impl ProviderManager for LocalProviderManager {
             None => format!("{:?}", request.item_kind),
         };
         // `CanRefreshMetadata` (`ProviderManager.cs:571`): `includeDisabled`
-        // short-circuits to true before the locked and fetcher tests, and a
-        // LOCKED reference item drops every non-local provider outright.
+        // short-circuits to true before the locked, extra and fetcher tests; a
+        // LOCKED reference item drops every non-local provider outright, and
+        // so does an extra (`ExtraType` set, `:602-605`), which has no identity
+        // of its own online — every search provider is a remote one.
         let locked = reference.as_ref().is_some_and(|e| e.is_locked);
+        let extra = reference.as_ref().is_some_and(|e| e.extra_type.is_some());
         let global = self.global_metadata_options_for(&kind);
         let channel = reference.as_ref().and_then(channel_gate);
         let can_refresh = |name: &str| {
             request.include_disabled_providers
                 || (!locked
+                    && !extra
                     && channel.unwrap_or_else(|| {
                         metadata_fetcher_enabled(library.as_ref(), global.as_ref(), &kind, name)
                     }))
@@ -6596,9 +6615,11 @@ mod tests {
         use super::{TmdbKind, TmdbSearchProvider};
 
         let body = r#"{"movie_results":[{"id":603,"title":"Resolved movie"}]}"#;
+        // `FindByExternalIdAsync` runs `NormalizeLanguage` over the whole
+        // list, which upper-cases everything after a region's hyphen.
         let server = crate::mock_http::MockServer::start(vec![
-            ("language=pt-BR%2Cnull%2Cen", body.to_owned()),
-            ("language=es-AR%2Cnull%2Cen", body.to_owned()),
+            ("language=pt-BR%2CNULL%2CEN", body.to_owned()),
+            ("language=es-AR%2CNULL%2CEN", body.to_owned()),
             ("language=null%2Cen", body.to_owned()),
         ])
         .await;
@@ -6777,6 +6798,17 @@ mod tests {
         // `ResultToMetadataResult` echoes the caller's index numbers.
         assert_eq!(results[0].index_number, Some(3));
         assert_eq!(results[0].parent_index_number, Some(7));
+
+        // jellyfin-web sends every id field it shows, a blank one as "": a
+        // blank id is no id (`string.IsNullOrWhiteSpace(imdbId)`), so the
+        // name is still parsed.
+        let mut req = named_request(BaseItemKind::Trailer, "Inception (2010)");
+        req.search_info.provider_ids = Some(HashMap::from([("Imdb".to_owned(), " ".to_owned())]));
+        assert_eq!(
+            provider.get_search_results(&req).await.expect("ok").len(),
+            1,
+            "a blank Imdb id must not skip ParseName"
+        );
 
         // An explicit `Year` wins over the one in the title (C# `year ??=`).
         let mut req = named_request(BaseItemKind::Trailer, "Inception (2010)");
@@ -9756,6 +9788,61 @@ mod tests {
         assert_eq!(next_seen(&mut rx).await, ids[1]);
     }
 
+    /// A request that arrives after a worker stood down, but before that
+    /// worker's guard is dropped, starts a new worker. Dropping the old guard
+    /// must leave the new worker's claim alone, or a third request starts a
+    /// second worker beside it.
+    #[test]
+    fn a_stood_down_worker_leaves_the_next_workers_claim_alone() {
+        let queue = claimed_queue();
+        let mut worker = super::WorkerGuard(Some(Arc::clone(&queue)));
+        assert!(worker.next_refresh().is_none());
+        assert!(
+            !queue.lock().unwrap().processing,
+            "stood down under the lock"
+        );
+        let started = {
+            let mut queue = queue.lock().unwrap();
+            queue.push(
+                Uuid::from_u128(31),
+                MetadataRefreshOptions::default(),
+                RefreshPriority::Low,
+            );
+            !std::mem::replace(&mut queue.processing, true)
+        };
+        assert!(started, "the request starts a new worker");
+        drop(worker);
+        assert!(
+            queue.lock().unwrap().processing,
+            "the new worker's claim survives the old guard"
+        );
+    }
+
+    /// A worker dropped mid-drain (a panicking refresh, an aborted task) still
+    /// holds the claim, and dropping its guard releases it.
+    #[test]
+    fn a_worker_dropped_mid_drain_releases_its_claim() {
+        let queue = claimed_queue();
+        queue.lock().unwrap().push(
+            Uuid::from_u128(32),
+            MetadataRefreshOptions::default(),
+            RefreshPriority::Low,
+        );
+        let mut worker = super::WorkerGuard(Some(Arc::clone(&queue)));
+        assert!(worker.next_refresh().is_some());
+        assert!(queue.lock().unwrap().processing, "still draining");
+        drop(worker);
+        assert!(!queue.lock().unwrap().processing, "the claim is released");
+    }
+
+    /// A queue a worker has claimed, as `queue_refresh` leaves it.
+    fn claimed_queue() -> Arc<std::sync::Mutex<super::RefreshQueue>> {
+        Arc::new(std::sync::Mutex::new(super::RefreshQueue {
+            processing: true,
+            ..super::RefreshQueue::default()
+        }))
+    }
+
     /// The worker, and so every refresh it runs, carries the culture of the
     /// request that started it — and a failing refresh does not stop it.
     #[tokio::test]
@@ -10009,6 +10096,13 @@ mod tests {
                     "poster_path":"/lotr.jpg"}"#
                     .to_owned(),
             ),
+            // No poster of TMDB's own pick, only alternatives.
+            (
+                "/collection/120",
+                r#"{"id":120,"name":"Untitled Collection",
+                    "images":{"posters":[{"file_path":"/alt.jpg"}],"backdrops":[]}}"#
+                    .to_owned(),
+            ),
             // TMDB has no collection 999999 — the mock stands in for that with
             // a body the client cannot read, so `collection()` yields `None`.
             ("/collection/999999", "<not json>".to_owned()),
@@ -10036,6 +10130,15 @@ mod tests {
             Some("https://image.tmdb.org/t/p/original/lotr.jpg")
         );
         assert!(results[0].overview.is_none());
+
+        // The image is `GetPosterUrl(collection.PosterPath)` alone: with no
+        // poster_path there is none, whatever alternatives the images list.
+        let results = provider
+            .get_search_results(&id_request(BaseItemKind::BoxSet, &[("Tmdb", "120")]))
+            .await
+            .expect("results");
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].image_url, None);
 
         // An id TMDB does not answer for returns nothing — C# returns
         // `Enumerable.Empty` rather than falling back to the name search, which
@@ -10337,6 +10440,52 @@ mod tests {
         // …unless the caller explicitly asked for disabled providers.
         req.include_disabled_providers = true;
         assert_eq!(mgr.remote_search(&req).await.expect("search").len(), 1);
+    }
+
+    #[tokio::test]
+    async fn remote_search_refuses_an_extra() {
+        // v12.4 `CanRefreshMetadata`: an extra (`ExtraType` set) has no identity
+        // of its own online, so every remote provider is dropped for it.
+        let search = |extra_type: Option<i32>, include_disabled: bool| async move {
+            let library_id = Uuid::new_v4();
+            let item_id = Uuid::new_v4();
+            let mut trailer = row("Trailer", "Making Of");
+            trailer.id = item_id.to_string();
+            trailer.top_parent_id = Some(library_id.to_string());
+            trailer.owner_id = Some(Uuid::new_v4().to_string());
+            trailer.extra_type = extra_type;
+            let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+            let items = Arc::new(FakeItems {
+                rows: HashMap::from([(item_id, trailer)]),
+                seen: tx,
+            });
+            let libraries = Arc::new(FakeLibraries {
+                item_id: library_id,
+                options: ferrofin_model::configuration::LibraryOptions::default(),
+            });
+            let provider: Arc<dyn RemoteSearchProvider> = Arc::new(FakeProvider {
+                name: "The Open Movie Database".to_owned(),
+                kind: BaseItemKind::Trailer,
+                results: vec![result_with(
+                    "The Open Movie Database",
+                    &[("Imdb", "tt1")],
+                    None,
+                )],
+                fail: false,
+            });
+            let mgr = gated_manager(vec![provider], items, libraries);
+            let mut req = request(BaseItemKind::Trailer);
+            req.item_id = item_id;
+            req.include_disabled_providers = include_disabled;
+            mgr.remote_search(&req).await.expect("search").len()
+        };
+        // `ExtraType.Trailer` is 2.
+        assert_eq!(search(Some(2), false).await, 0);
+        // The same row as a plain item is searched…
+        assert_eq!(search(None, false).await, 1);
+        // …and `includeDisabled` is tested before the extra, as upstream
+        // orders it.
+        assert_eq!(search(Some(2), true).await, 1);
     }
 
     #[tokio::test]

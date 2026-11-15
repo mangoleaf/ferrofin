@@ -536,8 +536,8 @@ destinations** (your LAN, cloud metadata services, Tailscale/tailnet ranges, Fer
 itself), which
 removes the server-as-network-pivot risk; grant a specific trusted plugin private-network
 access with `FERROFIN_WASM_PRIVATE_HTTP_ALLOW` (comma-separated plugin UUIDs, or `*`).
-The private-address check also **pins the vetted address on the connection
-itself** (the request resolves to the address that was checked, not a second
+The private-address check also **pins the vetted addresses on the connection
+itself** (the request resolves to the addresses that were checked, not a second
 DNS answer), closing the classic DNS-rebinding TOCTOU. When the server's
 environment sets an HTTP proxy (`HTTP_PROXY`, `HTTPS_PROXY` or `ALL_PROXY`), the proxy
 resolves the destination itself: the check then runs on the server's own DNS answer before

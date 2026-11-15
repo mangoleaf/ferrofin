@@ -2170,11 +2170,7 @@ fn private_allow_list(raw: Option<&str>) -> ferrofin_providers::destination::Pri
 /// `text` match in any case; anything else warns ([`Env::warn`]) and is JSON,
 /// as it always was.
 fn resolve_log_format(env: &dyn Env, file: Option<String>) -> LogFormat {
-    let Some(raw) = env
-        .var("FERROFIN_LOG_FORMAT")
-        .filter(|raw| !raw.trim().is_empty())
-        .or(file)
-    else {
+    let Some(raw) = non_blank(env, "FERROFIN_LOG_FORMAT").or(file) else {
         return LogFormat::Json;
     };
     match raw.trim().to_ascii_lowercase().as_str() {
@@ -2225,7 +2221,7 @@ fn parse_bucket_list(raw: &str) -> Vec<f64> {
 /// ignored typo here would change performance, not correctness, and never be
 /// noticed.
 fn resolve_db_pool(env: &dyn Env, file: Option<DbPoolFileValue>) -> anyhow::Result<Option<u32>> {
-    if let Some(raw) = env.var("FERROFIN_DB_POOL").filter(|s| !s.is_empty()) {
+    if let Some(raw) = non_blank(env, "FERROFIN_DB_POOL") {
         if raw.eq_ignore_ascii_case("auto") {
             return Ok(None);
         }
@@ -2254,16 +2250,16 @@ fn resolve_db_pool(env: &dyn Env, file: Option<DbPoolFileValue>) -> anyhow::Resu
 /// Resolves a count that must be positive: the `env_key` env var > `file_key`
 /// in `config.toml` > `None` (the default). Zero and anything that is not a
 /// non-negative integer are errors, so a typo or a `0` meant as "off" is
-/// noticed instead of silently disabling a cache. An empty env value is
-/// unset.
+/// noticed instead of silently disabling a cache. A blank env value is
+/// unset ([`non_blank`]).
 fn resolve_positive(
     env: &dyn Env,
     env_key: &str,
     file_key: &str,
     file: Option<u32>,
 ) -> anyhow::Result<Option<u32>> {
-    if let Some(raw) = env.var(env_key).filter(|s| !s.trim().is_empty()) {
-        let n: u32 = raw.trim().parse().map_err(|_| {
+    if let Some(raw) = non_blank(env, env_key) {
+        let n: u32 = raw.parse().map_err(|_| {
             anyhow::anyhow!("invalid {env_key} `{raw}`: expected a positive integer")
         })?;
         anyhow::ensure!(n > 0, "invalid {env_key} `0`: expected a positive integer");
@@ -2278,8 +2274,8 @@ fn resolve_positive(
 
 /// Resolves a whole number that must lie within `range`: the `env_key` env
 /// var > `file_key` in `config.toml` > `default`. Anything else is an error,
-/// so a typo is noticed instead of silently changing a security setting. An
-/// empty env value is unset.
+/// so a typo is noticed instead of silently changing a security setting. A
+/// blank env value is unset ([`non_blank`]).
 fn resolve_ranged(
     env: &dyn Env,
     env_key: &str,
@@ -2288,9 +2284,8 @@ fn resolve_ranged(
     default: u32,
     range: std::ops::RangeInclusive<u32>,
 ) -> anyhow::Result<u32> {
-    let value = match env.var(env_key).filter(|s| !s.trim().is_empty()) {
+    let value = match non_blank(env, env_key) {
         Some(raw) => raw
-            .trim()
             .parse()
             .map_err(|_| anyhow::anyhow!("invalid {env_key} `{raw}`: expected a whole number"))?,
         None => file.unwrap_or(default),
@@ -2367,14 +2362,11 @@ fn resolve_trickplay_concurrency(
 ) -> anyhow::Result<Option<u32>> {
     // Huge values saturate; state.rs caps every value at the auto value anyway.
     let positive = |n: i64| (n > 0).then(|| u32::try_from(n).unwrap_or(u32::MAX));
-    if let Some(raw) = env
-        .var("FERROFIN_TRICKPLAY_CONCURRENCY")
-        .filter(|s| !s.is_empty())
-    {
+    if let Some(raw) = non_blank(env, "FERROFIN_TRICKPLAY_CONCURRENCY") {
         if raw.eq_ignore_ascii_case("auto") {
             return Ok(None);
         }
-        let n: i64 = raw.trim().parse().map_err(|_| {
+        let n: i64 = raw.parse().map_err(|_| {
             anyhow::anyhow!(
                 "invalid FERROFIN_TRICKPLAY_CONCURRENCY `{raw}`: expected an integer or `auto`"
             )
@@ -2631,6 +2623,15 @@ impl Env for WarningEnv<'_> {
     fn warn(&self, warning: String) {
         self.warnings.borrow_mut().push(warning);
     }
+}
+
+/// `key`'s value with the blanks around it trimmed, or `None` when it is
+/// unset or blank: `docs/CONFIG.md`'s "a blank one counts as unset", as the
+/// settings page reads it (`EnvRead::NonBlank`).
+fn non_blank(env: &dyn Env, key: &str) -> Option<String> {
+    env.var(key)
+        .map(|raw| raw.trim().to_owned())
+        .filter(|value| !value.is_empty())
 }
 
 /// Reads `key` from `env` and parses it as `T` (blanks around the value
@@ -4326,6 +4327,36 @@ mod tests {
         let env = FakeEnv::new().with("FERROFIN_DB_POOL", "many");
         let err = Config::load_from(Cli::default(), &env).unwrap_err();
         assert!(err.to_string().contains("invalid FERROFIN_DB_POOL"));
+    }
+
+    /// `docs/CONFIG.md`: a blank value counts as unset, for the variables that
+    /// stop the server on a bad value too, and blanks around a value are
+    /// ignored; the settings page reads them so (`EnvRead::NonBlank`).
+    #[rstest::rstest]
+    #[case::db_pool("FERROFIN_DB_POOL", "4")]
+    #[case::db_pool_auto("FERROFIN_DB_POOL", "auto")]
+    #[case::statement_cache("FERROFIN_DB_STATEMENT_CACHE", "128")]
+    #[case::auth_cache_ttl("FERROFIN_AUTH_CACHE_TTL_SECS", "30")]
+    #[case::row_cache_ttl("FERROFIN_ROW_CACHE_TTL_SECS", "30")]
+    #[case::trickplay_concurrency("FERROFIN_TRICKPLAY_CONCURRENCY", "4")]
+    #[case::trickplay_concurrency_auto("FERROFIN_TRICKPLAY_CONCURRENCY", "auto")]
+    #[case::login_backoff_attempts("FERROFIN_LOGIN_BACKOFF_ATTEMPTS", "8")]
+    fn a_blank_variable_is_unset_and_blanks_around_a_value_are_ignored(
+        #[case] var: &str,
+        #[case] value: &str,
+    ) {
+        let load = |raw: Option<&str>| {
+            let env = raw.map_or_else(FakeEnv::new, |raw| FakeEnv::new().with(var, raw));
+            format!("{:?}", Config::load_from(Cli::default(), &env).expect(var))
+        };
+        for blank in ["", " ", "\t "] {
+            assert_eq!(load(Some(blank)), load(None), "{var}={blank:?}");
+        }
+        assert_eq!(
+            load(Some(&format!(" {value} "))),
+            load(Some(value)),
+            "{var}"
+        );
     }
 
     #[test]

@@ -2239,7 +2239,8 @@ async fn playlists_view_browses_list_its_playlists() {
 /// - an item-typed browse of a library that did not choose `recursive` is
 ///   recursive, while an explicit `recursive=false` or an untyped browse
 ///   lists direct children;
-/// - a `boxsets` library browsed untyped lists its box sets, recursively.
+/// - a `boxsets` library browsed untyped lists its box sets, recursively;
+///   browsed for `BoxSet`, it re-roots to the user root with no constraint.
 #[tokio::test]
 async fn filtered_user_root_and_typed_library_browses_run_recursively() {
     use ferrofin_model::data::BaseItemKind;
@@ -2299,6 +2300,20 @@ async fn filtered_user_root_and_typed_library_browses_run_recursively() {
     assert_eq!(rerooted.parent_id, Uuid::nil());
     assert_eq!(rerooted.linked_child_ancestor_ids, [TV_LIBRARY_ID]);
     assert!(rerooted.recursive);
+    // gl-1073: a BoxSet browse of the boxsets library re-roots too, with no
+    // linked-ancestor constraint: its collection type is the target's own.
+    let library = query_for(&format!(
+        "parentId={BOXSETS_LIBRARY_ID}&includeItemTypes=BoxSet"
+    ))
+    .await;
+    assert_eq!(library.parent_id, Uuid::nil());
+    assert!(library.apply_folder_display_options);
+    assert!(
+        library.linked_child_ancestor_ids.is_empty(),
+        "{:?}",
+        library.linked_child_ancestor_ids
+    );
+    assert!(library.recursive);
     // A view is no library (`ICollectionFolder`), even one delegating to a
     // library: a typed browse of it stays a direct one.
     let view = query_for(&format!("parentId={TV_VIEW_ID}&includeItemTypes=Episode")).await;

@@ -340,8 +340,6 @@ pub struct TunerLineupRow {
     pub name: String,
     /// The channel number, or empty when the playlist carried none.
     pub number: String,
-    /// The stream URL the channel plays from.
-    pub stream_url: String,
     /// The tuner host's `ChannelInfo.Id` for this channel.
     pub external_id: String,
 }
@@ -401,7 +399,7 @@ pub async fn tuner_lineup(
     tuner_host_id: &str,
 ) -> Result<Vec<TunerLineupRow>, ServiceError> {
     let rows = sqlx::query(
-        r#"SELECT "Id","TvgId","Name","Number","StreamUrl","ExternalId" FROM "FerrofinLiveTvChannels"
+        r#"SELECT "Id","TvgId","Name","Number","ExternalId" FROM "FerrofinLiveTvChannels"
            WHERE "TunerHostId" = ?1 COLLATE NOCASE ORDER BY "SortIndex", "Name""#,
     )
     .bind(tuner_host_id)
@@ -415,7 +413,6 @@ pub async fn tuner_lineup(
             tvg_id: r.get("TvgId"),
             name: r.get("Name"),
             number: r.get::<Option<String>, _>("Number").unwrap_or_default(),
-            stream_url: r.get("StreamUrl"),
             external_id: r.get("ExternalId"),
         })
         .collect())

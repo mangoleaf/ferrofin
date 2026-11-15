@@ -1225,7 +1225,9 @@ pub struct FerrofinPlaylistManager {
     /// do not take it (`update_playlist` writes its shares under the guard):
     /// the re-rate after an edit saves only its rating columns, never
     /// `Data`, and every `Data` sync reads and writes in one writer
-    /// transaction, so neither can put an older `Shares` back.
+    /// transaction, so neither can put an older `Shares` back. The scan's
+    /// playlist sync and item deletion take it too
+    /// ([`Self::with_entry_edits`]).
     // ponytail: one lock for every playlist; key it by playlist if edits ever contend.
     entry_edits: Arc<tokio::sync::Mutex<()>>,
     /// Queues the playlist's refresh after its entries change
@@ -1282,6 +1284,17 @@ impl FerrofinPlaylistManager {
         virtual_paths: crate::virtual_paths::VirtualPathExpander,
     ) -> Self {
         self.virtual_paths = virtual_paths;
+        self
+    }
+
+    /// Shares the entry-edit lock with the persistence service's playlist
+    /// sync and deletion
+    /// (`FerrofinItemPersistenceService::playlist_entry_edits`), so neither
+    /// writes a playlist's entries between an edit's read and its rewrite.
+    /// Called once by the composition root.
+    #[must_use]
+    pub fn with_entry_edits(mut self, lock: Arc<tokio::sync::Mutex<()>>) -> Self {
+        self.entry_edits = lock;
         self
     }
 
@@ -2080,14 +2093,16 @@ impl PlaylistManager for FerrofinPlaylistManager {
         let pid = guid_to_db(playlist);
         let mut entries = read_entries(self.db.pool(), &pid).await?;
 
-        // `entry_id` arrives dashless (`Guid('N')`); `ChildId` is stored in the
-        // canonical dashed uppercase form. Normalise before locating the entry
-        // position (see `remove_item_from_playlist`). With duplicates legal,
-        // the FIRST occurrence moves (C# `MoveItemAsync`: `FirstOrDefault`).
-        let Ok(child_id) = Uuid::parse_str(entry_id) else {
-            return Ok(()); // not a GUID — nothing to move
+        // C# `MoveItemAsync` compares `entry_id` as a string with each entry's
+        // `ItemId.ToString("N")`, ignoring case, so only the 32-digit spelling
+        // names an entry: a hyphenated, braced or urn id moves nothing.
+        // `ChildId` is stored in the canonical dashed uppercase form, so the
+        // id is normalised to it before locating the entry. With duplicates
+        // legal, the FIRST occurrence moves (`FirstOrDefault`).
+        let Ok(child_id) = entry_id.parse::<uuid::fmt::Simple>() else {
+            return Ok(()); // no entry has that id — nothing to move
         };
-        let needle = guid_to_db(child_id);
+        let needle = guid_to_db(child_id.into_uuid());
         let Some(pos) = entries.iter().position(|(c, _)| *c == needle) else {
             return Ok(()); // entry not in the playlist — nothing to move
         };
@@ -3820,7 +3835,7 @@ mod tests {
         assert_eq!(read(owner).await, vec![c, b, a], "link order, not id order");
 
         // Move the middle entry to the end: [C, A, B].
-        mgr.move_item(&created.id, &b.to_string(), 2, owner)
+        mgr.move_item(&created.id, &b.simple().to_string(), 2, owner)
             .await
             .expect("move");
         assert_eq!(
@@ -5347,6 +5362,50 @@ mod tests {
         assert_eq!(rows(&db, playlist).await.len(), 9);
     }
 
+    /// The scan's playlist sync and an item deletion wait while an entry edit
+    /// holds the lock, so neither lands between its read and its rewrite: the
+    /// rewrite would drop the scan's members, or re-insert a deleted member
+    /// and fail on its foreign key (gl-357).
+    #[tokio::test]
+    async fn playlist_sync_and_deletion_wait_for_an_entry_edit() {
+        use ferrofin_traits::persistence::ItemPersistenceService as _;
+        let db = test_db().await;
+        let (a, b) = (Uuid::new_v4(), Uuid::new_v4());
+        let (mgr, playlist, _, _root) = seeded_playlist(&db, &[a, b]).await;
+        let persistence =
+            crate::item_persistence_service::FerrofinItemPersistenceService::new(db.clone());
+        let mgr = mgr.with_entry_edits(persistence.playlist_entry_edits());
+        let edit = mgr.entry_edits.lock().await;
+        let scanned = [ferrofin_traits::persistence::ScannedPlaylist {
+            id: playlist,
+            members: Some(vec![ferrofin_traits::persistence::PlaylistMember {
+                item_id: Some(b),
+                ..Default::default()
+            }]),
+            from_file: false,
+            replace: true,
+        }];
+        let sync = persistence.sync_scanned_playlists(&scanned);
+        let gone = [a];
+        let delete = persistence.delete_items(&gone);
+        tokio::pin!(sync, delete);
+        let wait = std::time::Duration::from_millis(200);
+        assert!(
+            tokio::time::timeout(wait, &mut sync).await.is_err(),
+            "the playlist sync wrote during an entry edit"
+        );
+        assert!(
+            tokio::time::timeout(wait, &mut delete).await.is_err(),
+            "the deletion wrote during an entry edit"
+        );
+        drop(edit);
+        // Both polled: the lock goes to whichever queued first.
+        let (synced, deleted) = tokio::join!(&mut sync, &mut delete);
+        synced.expect("sync");
+        assert_eq!(deleted.expect("delete"), vec![a]);
+        assert_eq!(rows(&db, playlist).await, vec![b]);
+    }
+
     /// C# `RemoveItemFromPlaylistAsync`: every occurrence of the item goes.
     #[tokio::test]
     async fn remove_item_from_playlist_removes_every_occurrence() {
@@ -5379,6 +5438,31 @@ mod tests {
         .await
         .expect("move");
         assert_eq!(rows(&db, playlist).await, vec![b, a, a]);
+    }
+
+    /// C# `MoveItemAsync` finds the entry by comparing `entryId` with each
+    /// `ItemId.ToString("N")`, ignoring case: the 32-digit spelling moves in
+    /// either case, and any other GUID spelling names no entry, so nothing
+    /// moves.
+    #[rstest::rstest]
+    #[case::n_form(|id: Uuid| id.simple().to_string(), true)]
+    #[case::n_form_upper_case(|id: Uuid| id.simple().to_string().to_uppercase(), true)]
+    #[case::d_form(|id: Uuid| id.hyphenated().to_string(), false)]
+    #[case::braced(|id: Uuid| id.braced().to_string(), false)]
+    #[case::urn(|id: Uuid| id.urn().to_string(), false)]
+    #[tokio::test]
+    async fn move_item_matches_the_entry_id_as_its_n_form(
+        #[case] spell: fn(Uuid) -> String,
+        #[case] moves: bool,
+    ) {
+        let db = test_db().await;
+        let (a, b) = (Uuid::new_v4(), Uuid::new_v4());
+        let (mgr, playlist, _, _root) = seeded_playlist(&db, &[a, b]).await;
+        mgr.move_item(&playlist.to_string(), &spell(a), 1, Uuid::nil())
+            .await
+            .expect("move");
+        let expected = if moves { vec![b, a] } else { vec![a, b] };
+        assert_eq!(rows(&db, playlist).await, expected);
     }
 
     /// C# `UpdatePlaylist` with `Ids` replaces the entries rather than adding.
