@@ -27,6 +27,8 @@ pub mod library_options;
 pub mod listenbrainz;
 pub mod local_images;
 pub mod local_xml;
+#[cfg(test)]
+mod log_capture;
 #[cfg(feature = "lrclib")]
 pub mod lrclib;
 pub mod mediainfo;

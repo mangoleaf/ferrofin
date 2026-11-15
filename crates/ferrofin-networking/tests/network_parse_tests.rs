@@ -174,12 +174,14 @@ fn try_parse_to_subnets_polarity_mismatch_ipv6_does_not_warn() {
 
 /// The live manager reports the LAN, exclusion and published-server entries
 /// it ignores (upstream's `InitializeLan` at Warning, `InitializeOverrides` at
-/// Error) once per settings load: at construction and at each save, never when
-/// it reads the interfaces again, which every `/System/Info` request does. An
-/// override naming an interface is not reported for the parse that runs before
-/// the interfaces are read, an override's URL shows only its scheme and host,
-/// and a network change reports the LAN entries again, as `OnNetworkChange`'s
-/// `InitializeLan` does.
+/// Error) and its network information (`PrintNetworkInformation(config,
+/// false)` at Information) once per settings load: at construction and at each
+/// save. An override naming an interface is not reported for the parse that
+/// runs before the interfaces are read, an override's URL shows only its scheme
+/// and host, and a network change reports the LAN entries again, as
+/// `OnNetworkChange`'s `InitializeLan` does, but its network information only
+/// at debug (unless IPv6 is enabled and the operating system has none, where
+/// upstream runs the whole `UpdateSettings`).
 #[test]
 fn a_live_manager_reports_ignored_settings_once_per_load() {
     let config = NetworkConfiguration {
@@ -211,23 +213,25 @@ fn a_live_manager_reports_ignored_settings_once_per_load() {
     ];
     assert_eq!(logger.warnings(), warnings);
     assert_eq!(logger.errors(), errors);
-
-    manager.refresh_interfaces();
-    manager.refresh_interfaces();
-    assert_eq!(
-        logger.warnings(),
-        warnings,
-        "an interface refresh logs nothing"
-    );
-    assert_eq!(logger.errors(), errors);
+    let infos = logger.infos();
+    assert_eq!(infos.len(), 7, "{infos:?}");
+    assert_eq!(infos[0], r#"Defined LAN subnets: ["192.168.1.0/24"]"#);
+    assert_eq!(infos[1], "Defined LAN exclusions: []");
+    assert_eq!(infos[2], r#"Used LAN subnets: ["192.168.1.0/24"]"#);
+    assert_eq!(infos[3], "Filtered interface addresses: [192.168.1.2]");
+    assert!(infos[4].starts_with("Bind Addresses ["), "{infos:?}");
+    assert_eq!(infos[5], "Remote IP filter is Allowlist");
+    assert_eq!(infos[6], "Filtered subnets: []");
 
     manager.update_settings(&config);
     assert_eq!(logger.warnings(), [warnings, warnings].concat());
     assert_eq!(logger.errors(), [errors, errors].concat());
+    assert_eq!(logger.infos(), [infos.clone(), infos.clone()].concat());
 
     manager.on_network_change_with(|| true);
     assert_eq!(logger.warnings(), [warnings, warnings, warnings].concat());
     assert_eq!(logger.errors(), [errors, errors].concat());
+    assert_eq!(logger.infos(), [infos.clone(), infos].concat());
 }
 
 /// `IPv4SubnetMaskMatchesValidIPAddress`.

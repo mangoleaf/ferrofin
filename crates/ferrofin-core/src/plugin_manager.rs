@@ -1332,7 +1332,7 @@ impl PluginManager for FerrofinPluginManager {
         let Some(plugin) = self.find(id) else {
             return Err(ServiceError::not_found(format!("plugin {id}")));
         };
-        match std::fs::read(self.config_path(id)) {
+        match tokio::fs::read(self.config_path(id)).await {
             // Overlay the stored values onto the current defaults, so a config
             // saved by an older plugin version (missing newly-added keys) still
             // returns every field at its default — matching how C# deserializes a

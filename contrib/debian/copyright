@@ -37,6 +37,17 @@ Comment: The Merge Versions plugin's settings page, copied from
  https://github.com/danieladov/jellyfin-plugin-mergeversions at the
  revision pinned in crates/ferrofin-extensions/build.rs.
 
+Files: crates/ferrofin-model/src/net/mime_types/base_type_map.rs
+Copyright: 2024 Kristian Hellang
+           2014 Jonathan Ong
+           2015-2022 Douglas Christopher Wilson
+License: Apache-2.0 and Expat
+Comment: The extension to MIME type table of the MimeTypes NuGet package,
+ version 2.5.2 (https://github.com/khellang/MimeTypes, Apache-2.0), which
+ Jellyfin uses; that package generates it from mime-db
+ (https://github.com/jshttp/mime-db, Expat). Both notices are kept beside
+ the file.
+
 License: GPL-3
  This program is free software: you can redistribute it and/or modify
  it under the terms of the GNU General Public License as published by
@@ -71,3 +82,7 @@ License: Expat
  LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
  OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
  SOFTWARE.
+
+License: Apache-2.0
+ On Debian systems, the complete text of the Apache License, Version 2.0
+ can be found in "/usr/share/common-licenses/Apache-2.0".
