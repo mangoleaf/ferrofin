@@ -9,11 +9,11 @@
 //!
 //! The registry reflects what is actually compiled into this build: the local
 //! Kodi/XBMC **Nfo** reader/saver and **Local Images** provider are always
-//! present; **The Open Movie Database** (OMDb) and **IntroSkipper** segments are
-//! always compiled (shared API keys are supplied where required);
-//! **TheMovieDb** and **Open Subtitles** appear only when their crate features
-//! are enabled. Nothing here is a placeholder — a provider is listed iff its
-//! code is in the binary.
+//! present, and every remote provider (**TheMovieDb**, **The Open Movie
+//! Database**, **Open Subtitles**, …) and the **IntroSkipper** segments are
+//! always compiled (shared API keys are supplied where required) and gated per
+//! library at runtime. Nothing here is a placeholder — a provider is listed iff
+//! its code is in the binary.
 
 use ferrofin_model::configuration::{
     LibraryOptionInfoDto, LibraryOptionsResultDto, LibraryTypeOptionsDto, MetadataPlugin,
@@ -460,7 +460,8 @@ struct Provider {
     /// Item types the provider applies to; empty means every type.
     types: &'static [&'static str],
     default_enabled: bool,
-    /// Whether this provider's code is compiled into the build.
+    /// Whether this provider's code is compiled into the build. No provider
+    /// has a cargo feature, so every row is `true` today.
     compiled: bool,
     /// The image types this provider can supply for an item type — the port of
     /// each provider's `GetSupportedImages(item)`. `None` for providers that
@@ -595,7 +596,7 @@ fn default_enabled_for(
     }
 }
 
-/// The compiled-in provider registry (features resolved for this build).
+/// The compiled-in provider registry.
 fn providers() -> Vec<Provider> {
     let mut provs = local_providers();
     provs.extend(remote_providers());
@@ -621,6 +622,17 @@ fn local_providers() -> Vec<Provider> {
         compiled: true,
         images: NO_IMAGES,
     }];
+    // `BoxSetXmlProvider` and `BoxSetXmlSaver` (`XmlProviderUtils.Name`):
+    // `GetPluginSummary<BoxSet>` lists both, so a Collections library's
+    // options offer the saver its `MetadataSavers` list must name.
+    providers.push(Provider {
+        name: crate::box_set_xml::SAVER_NAME,
+        caps: &[Cap::LocalMetadata, Cap::MetadataSaver],
+        types: &["BoxSet"],
+        default_enabled: true,
+        compiled: true,
+        images: NO_IMAGES,
+    });
     providers.extend(
         [
             fetcher_names::COMIC,
@@ -671,7 +683,7 @@ fn metadata_providers() -> Vec<Provider> {
     vec![
         Provider {
             // Always wired by the composition root (its client is created
-            // unconditionally); the `tmdb` cargo feature gates nothing.
+            // unconditionally).
             name: "TheMovieDb",
             caps: &[Cap::MetadataFetcher, Cap::ImageFetcher],
             types: &["Movie", "Series", "Season", "Episode", "Person", "BoxSet"],
@@ -776,7 +788,17 @@ fn extractor_and_local_providers() -> Vec<Provider> {
             caps: &[Cap::Subtitle],
             types: &["Movie", "Episode"],
             default_enabled: true,
-            compiled: cfg!(feature = "opensubtitles"),
+            compiled: true,
+            images: NO_IMAGES,
+        },
+        Provider {
+            // `LyricManager.GetSupportedProviders` is `item is Audio`, which
+            // takes `AudioBook : Audio` too.
+            name: crate::lrclib::PROVIDER_NAME,
+            caps: &[Cap::Lyric],
+            types: &["Audio", "AudioBook"],
+            default_enabled: true,
+            compiled: true,
             images: NO_IMAGES,
         },
         Provider {
@@ -1056,8 +1078,14 @@ pub fn library_options_info(
         provs
             .iter()
             .filter(|p| p.compiled && p.caps.contains(&cap))
+            // Upstream takes every list from the representative types' plugin
+            // summaries only (`LibraryController.cs:876-879`). shortcut: the
+            // saver list stays unfiltered until the `Nfo` row's types match
+            // upstream's savers, and the handler replaces the media-segment
+            // list unfiltered (gl-1830).
             .filter(|p| {
-                cap != Cap::LocalMetadata || item_types.iter().any(|kind| p.applies_to(kind))
+                !matches!(cap, Cap::LocalMetadata | Cap::Subtitle | Cap::Lyric)
+                    || item_types.iter().any(|kind| p.applies_to(kind))
             })
             // The saver/reader lists are not per-type, so the saver rule sees
             // the whole request (C# `IsSaverEnabledByDefault(name, itemTypes,
@@ -1734,7 +1762,7 @@ mod tests {
     }
 
     #[test]
-    fn tmdb_listed_for_series_and_opensubtitles_gated_by_feature() {
+    fn tmdb_listed_for_series_and_opensubtitles_always_listed() {
         let info = library_options_info(
             &["Series".to_owned(), "Episode".to_owned()],
             false,
@@ -1749,12 +1777,67 @@ mod tests {
                 .iter()
                 .any(|o| o.name.as_deref() == Some("TheMovieDb"))
         );
-        // Open Subtitles is genuinely module-gated by its crate feature.
-        let has_os = info
+        // Open Subtitles is always compiled in, like every remote provider.
+        assert!(
+            info.subtitle_fetchers
+                .iter()
+                .any(|o| o.name.as_deref() == Some("Open Subtitles"))
+        );
+    }
+
+    /// jellyfin-web saves the advertised name in a library's
+    /// `DisabledSubtitleFetchers` and `SubtitleFetcherOrder`, which the
+    /// subtitle manager compares with the provider's `name()`.
+    #[test]
+    fn advertised_subtitle_fetcher_is_the_provider_name() {
+        let info = library_options_info(&["Movie".to_owned()], false, &[], &[]);
+        let names: Vec<_> = info
             .subtitle_fetchers
             .iter()
-            .any(|o| o.name.as_deref() == Some("Open Subtitles"));
-        assert_eq!(has_os, cfg!(feature = "opensubtitles"));
+            .filter_map(|o| o.name.as_deref())
+            .collect();
+        assert!(
+            names.contains(&crate::opensubtitles::PLUGIN_NAME),
+            "{names:?}"
+        );
+    }
+
+    /// `GetLibraryOptionsInfo` lists only the plugins of the library's
+    /// representative types (`LibraryController.cs:876-879`), each ticked: the
+    /// lyric providers for `Audio` and `AudioBook`
+    /// (`LyricManager.GetSupportedProviders`), the subtitle providers for
+    /// `Movie` and `Episode` (`SubtitleManager.GetSupportedProviders`).
+    /// jellyfin-web saves these names in `DisabledLyricFetchers` and
+    /// `LyricFetcherOrder`, which the lyric manager compares with the
+    /// provider's `name()`.
+    #[rstest::rstest]
+    #[case::music(&["MusicArtist", "MusicAlbum", "Audio", "MusicVideo"], &[crate::lrclib::PROVIDER_NAME], &[])]
+    #[case::books(&["Book", "AudioBook"], &[crate::lrclib::PROVIDER_NAME], &[])]
+    #[case::movies(&["Movie"], &[], &[crate::opensubtitles::PLUGIN_NAME])]
+    #[case::tvshows(&["Series", "Season", "Episode"], &[], &[crate::opensubtitles::PLUGIN_NAME])]
+    #[case::homevideos(&["Video", "Photo"], &[], &[])]
+    fn lyric_and_subtitle_fetchers_follow_the_library_types(
+        #[case] types: &[&str],
+        #[case] lyric: &[&str],
+        #[case] subtitle: &[&str],
+    ) {
+        let types: Vec<String> = types.iter().map(|t| (*t).to_owned()).collect();
+        let listed = |list: &[ferrofin_model::configuration::LibraryOptionInfoDto]| {
+            list.iter()
+                .map(|o| (o.name.clone().unwrap_or_default(), o.default_enabled))
+                .collect::<Vec<_>>()
+        };
+        let ticked = |names: &[&str]| {
+            names
+                .iter()
+                .map(|n| ((*n).to_owned(), true))
+                .collect::<Vec<_>>()
+        };
+        for is_new_library in [true, false] {
+            let info = library_options_info(&types, is_new_library, &[], &[]);
+            assert_eq!(listed(&info.lyric_fetchers), ticked(lyric));
+            assert_eq!(listed(&info.subtitle_fetchers), ticked(subtitle));
+        }
     }
 
     /// `SupportedImageTypes` is the union of the compiled image providers'
@@ -2116,6 +2199,18 @@ mod tests {
             "{:?}",
             audiobook.plugins
         );
+        // `GetPluginSummary` adds the lyric providers for `item is Audio` only.
+        let lyric_types: Vec<_> = plugins
+            .iter()
+            .filter(|s| {
+                s.plugins.iter().any(|p| {
+                    p.name.as_deref() == Some(crate::lrclib::PROVIDER_NAME)
+                        && p.type_ == MetadataPluginType::LyricFetcher
+                })
+            })
+            .filter_map(|s| s.item_type.as_deref())
+            .collect();
+        assert_eq!(lyric_types, ["Audio", "AudioBook"]);
     }
 
     /// `typeOptions?.MetadataFetcherOrder ?? globalMetadataOptions.

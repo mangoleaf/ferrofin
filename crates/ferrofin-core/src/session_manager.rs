@@ -28,9 +28,10 @@
 //!   directly (gl-248). The `SessionControllers`/`WebSocketController`
 //!   indirection of the C# collapses into "the session's connection handles".
 //! - **`AuthenticationResult`** now lands in `ferrofin-model`; the authenticate
-//!   methods return an [`AuthenticationResultData`] (the [`SessionInfoDto`] plus
-//!   the minted access token) from which the API layer assembles the wire
-//!   envelope. The access token is minted via [`DeviceManager`].
+//!   methods return an [`AuthenticationResultData`] (the user's DTO, the
+//!   [`SessionInfoDto`] and the minted access token) from which the API layer
+//!   assembles the wire envelope. The access token is minted via
+//!   [`DeviceManager`].
 //! - **The idle and inactive checks** (`StartCheckTimers`) run from
 //!   [`FerrofinSessionManager::run_playback_checks`], which the composition root
 //!   starts with the host and aborts with it: a session playing without a
@@ -101,6 +102,7 @@ use ferrofin_traits::session::{
     AuthenticationRequest, AuthenticationResultData, SessionEvent, SessionManager, SessionSummary,
 };
 use ferrofin_traits::session_bus::SessionMessageBus;
+use ferrofin_util::ticks::TICKS_PER_MS;
 
 use crate::db_error::db_err;
 use crate::user_entity_ext::{cached_permission, has_permission};
@@ -1942,20 +1944,6 @@ impl SessionManager for FerrofinSessionManager {
         .await
     }
 
-    async fn update_device_name(
-        &self,
-        session_id: &str,
-        reported_device_name: &str,
-    ) -> Result<(), ServiceError> {
-        let mut sessions = self.sessions.lock().await;
-        let session = sessions
-            .values_mut()
-            .find(|s| s.id == session_id)
-            .ok_or_else(|| ServiceError::not_found(format!("session {session_id}")))?;
-        session.device_name = Some(reported_device_name.to_owned());
-        Ok(())
-    }
-
     async fn on_device_options_updated(&self, device_id: &str, custom_name: Option<&str>) {
         let custom_name = custom_name.filter(|name| !name.trim().is_empty());
         let mut sessions = self.sessions.lock().await;
@@ -2242,7 +2230,7 @@ impl SessionManager for FerrofinSessionManager {
                 user_id = %session.user_id,
                 item_id = %info.item_id,
                 item = name.as_deref(),
-                position_ms = info.position_ticks.map(|ticks| ticks / TICKS_PER_MILLISECOND),
+                position_ms = info.position_ticks.map(|ticks| ticks / TICKS_PER_MS),
                 device = session.device_name.as_deref(),
                 device_id = %session.device_id,
                 client = session.client.as_deref(),
@@ -3132,6 +3120,15 @@ impl FerrofinSessionManager {
         let user_uuid = parse_user_id(&user.id)?;
         let _limit_gate = self.admit_session(&user, user_uuid).await?;
 
+        // C# builds `User = _userManager.GetUserDto(user, …)` from the user it
+        // authenticated, after `LogSessionActivity`. Ferrofin's DTO reads the
+        // database where upstream's reads memory, so it is built before
+        // anything is minted: a read error leaves no token, session or
+        // `AuthenticationSucceeded` behind. The session's activity stamp skips
+        // a password sign-in (`authenticate_user` has just stamped the user),
+        // and Quick Connect, the direct path, rebuilds `User` at its exchange.
+        let user_dto = self.user_manager.get_user_dto(&user, None).await?;
+
         // Mint a fresh access token: log out existing device rows for this
         // user/device, then create a new device (C# `GetAuthorizationToken`).
         let existing = self
@@ -3174,10 +3171,9 @@ impl FerrofinSessionManager {
             )
             .await?;
         dto.server_id = Some(self.server_id.clone());
-        // The full `AuthenticationResult` envelope (UserDto + ServerId) is
-        // assembled by the caller from this data; the freshly minted token
-        // (persisted on the created `Device` row) is returned so the caller can
-        // echo it back to the client.
+        // The caller adds `ServerId` to make the `AuthenticationResult`; the
+        // freshly minted token (persisted on the created `Device` row) is
+        // returned so the caller can echo it back to the client.
         let access_token = Secret::from(created.access_token);
 
         // C# `AuthenticateNewSessionInternal` publishes
@@ -3194,6 +3190,7 @@ impl FerrofinSessionManager {
             )
             .await;
         Ok(AuthenticationResultData {
+            user: user_dto,
             session: dto,
             access_token,
         })
@@ -3325,9 +3322,6 @@ fn envelope_bytes(message_type: SessionMessageType, data: &str) -> Result<Vec<u8
 fn session_started_payload(session: &SessionInfo) -> String {
     serde_json::to_string(&session_info_to_dto(session)).unwrap_or_else(|_| "{}".to_owned())
 }
-
-/// .NET ticks (100 ns each) in a millisecond.
-const TICKS_PER_MILLISECOND: i64 = 10_000;
 
 /// The JSON payload for a playback event. The user name, device name and
 /// client stand for `PlaybackProgressEventArgs`' `Users`, `DeviceName` and

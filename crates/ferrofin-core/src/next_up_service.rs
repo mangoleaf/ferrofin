@@ -60,6 +60,7 @@ use ferrofin_db::entities::base_items::BaseItemEntity;
 use ferrofin_db::entities::users::UserEntity;
 use ferrofin_db::store::{datetime_to_db, guid_to_db};
 use ferrofin_model::data::BaseItemKind;
+use ferrofin_model::entities_media::airs_numbers;
 use uuid::Uuid;
 
 use ferrofin_traits::error::ServiceError;
@@ -75,7 +76,6 @@ use crate::db_error::db_err;
 use crate::item_repository::{library_top_parents_by_view, view_top_parent_ids};
 use crate::item_type_lookup::stored_type_name;
 use crate::translate_query::{PLACEHOLDER_ID, TopParentTerm, push_access_filter};
-use crate::tv_series_manager::airs_numbers;
 
 /// The concrete next-up service.
 #[derive(Clone)]

@@ -20,6 +20,7 @@ use ferrofin_model::entities_media::MetadataProvider;
 use ferrofin_util::string_extensions::{
     equals_ordinal_ignore_case, lower_invariant, replace_ignore_ascii_case,
 };
+use ferrofin_util::ticks::TICKS_PER_MINUTE;
 
 use crate::container_types::{MetadataResult, PersonInfo};
 
@@ -83,24 +84,22 @@ const YOUTUBE_WATCH_URL: &str = "https://www.youtube.com/watch?v=";
 /// (`BaseNfoSaver.GetOutputTrailerUrl`).
 const YOUTUBE_PLUGIN_URL: &str = "plugin://plugin.video.youtube/play/?video_id=";
 
-/// .NET ticks per minute; used to convert `RunTimeTicks` back to `<runtime>`.
-const TICKS_PER_MINUTE: i64 = 600_000_000;
-
 /// A minimal, in-memory XML writer mirroring the subset of `System.Xml.XmlWriter`
 /// the NFO savers use (indented start-document, element strings, nested
 /// start/end elements, and a single attribute-carrying `<url>`).
 ///
-/// Kept private: the savers drive it and hand back the finished string. Output is
+/// The savers drive it and hand back the finished string; the
+/// `collection.xml` saver ([`crate::local_xml`]) writes with it too. Output is
 /// UTF-8, two-space indented, with the same `<?xml version="1.0" ...?>` prolog
 /// `XmlWriter.WriteStartDocument(true)` emits.
-struct NfoWriter {
+pub(crate) struct NfoWriter {
     buf: String,
     depth: usize,
 }
 
 impl NfoWriter {
     /// Starts a document with the standalone XML declaration `XmlWriter` writes.
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             buf: String::from("<?xml version=\"1.0\" encoding=\"utf-8\" standalone=\"yes\"?>\n"),
             depth: 0,
@@ -115,7 +114,7 @@ impl NfoWriter {
     }
 
     /// Opens an element `<name>` on its own indented line and descends a level.
-    fn start_element(&mut self, name: &str) {
+    pub(crate) fn start_element(&mut self, name: &str) {
         self.indent();
         let _ = write!(self.buf, "<{name}>");
         self.buf.push('\n');
@@ -123,7 +122,7 @@ impl NfoWriter {
     }
 
     /// Closes the most recently opened element.
-    fn end_element(&mut self, name: &str) {
+    pub(crate) fn end_element(&mut self, name: &str) {
         self.depth -= 1;
         self.indent();
         let _ = write!(self.buf, "</{name}>");
@@ -133,7 +132,7 @@ impl NfoWriter {
     /// Writes a leaf element `<name>value</name>` (`WriteElementString`).
     ///
     /// An empty value is written as `<name />`, matching `XmlWriter`.
-    fn element(&mut self, name: &str, value: &str) {
+    pub(crate) fn element(&mut self, name: &str, value: &str) {
         self.indent();
         if value.is_empty() {
             let _ = write!(self.buf, "<{name} />");
@@ -156,7 +155,7 @@ impl NfoWriter {
     }
 
     /// Finishes the document and returns the accumulated XML.
-    fn finish(self) -> String {
+    pub(crate) fn finish(self) -> String {
         self.buf
     }
 }

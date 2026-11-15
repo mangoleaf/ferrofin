@@ -24,7 +24,7 @@
 use async_trait::async_trait;
 use ferrofin_db::entities::security::{DeviceEntity, DeviceOptionsEntity};
 use ferrofin_db::entities::users::UserEntity;
-use ferrofin_model::dto::{ClientCapabilitiesDto, DeviceInfoDto};
+use ferrofin_model::dto::DeviceInfoDto;
 use ferrofin_model::querying::QueryResult;
 use ferrofin_model::session::ClientCapabilities;
 use uuid::Uuid;
@@ -129,12 +129,6 @@ pub trait DeviceManager: Send + Sync {
         &self,
         device_id: &str,
     ) -> Result<Option<DeviceOptionsEntity>, ServiceError>;
-
-    /// Maps recorded capabilities to their client-facing DTO.
-    async fn to_client_capabilities_dto(
-        &self,
-        capabilities: &ClientCapabilities,
-    ) -> Result<ClientCapabilitiesDto, ServiceError>;
 }
 
 fn _assert_object_safe_device_manager(_: &dyn DeviceManager) {}

@@ -8,11 +8,10 @@
 #![allow(clippy::float_cmp)]
 
 use ferrofin_mediaencoding::MediaEncodingError;
-use ferrofin_mediaencoding::subtitles::model::{
-    Paragraph, Subtitle, TICKS_PER_MILLISECOND, TimeCode,
-};
+use ferrofin_mediaencoding::subtitles::model::{Paragraph, Subtitle, TimeCode};
 use ferrofin_mediaencoding::subtitles::{SubtitleEditParser, SubtitleParser};
 use ferrofin_mediaencoding::subtitles::{json_writer, srt, ssa, ssa_tags, vtt};
+use ferrofin_util::ticks::TICKS_PER_MS;
 use rstest::rstest;
 
 fn subtitle_with(cues: &[(&str, f64, f64)]) -> Subtitle {
@@ -38,7 +37,7 @@ fn lines(text: &str) -> Vec<String> {
 fn timecode_tick_roundtrip() {
     let tc = TimeCode::from_milliseconds(1_234.0);
     assert_eq!(tc.total_milliseconds(), 1_234.0);
-    assert_eq!(tc.ticks(), 1_234 * TICKS_PER_MILLISECOND);
+    assert_eq!(tc.ticks(), 1_234 * TICKS_PER_MS);
     // `TimeSpan.FromTicks(...).TotalMilliseconds` keeps the sub-millisecond part.
     let back = TimeCode::from_ticks(12_345_678);
     assert_eq!(back.total_milliseconds(), 1_234.567_8);
@@ -476,11 +475,8 @@ fn json_writer_emits_track_events_envelope() {
     assert_eq!(events.len(), 1);
     assert_eq!(events[0]["Id"], "1");
     assert_eq!(events[0]["Text"], "Hello");
-    assert_eq!(
-        events[0]["StartPositionTicks"],
-        1_000 * TICKS_PER_MILLISECOND
-    );
-    assert_eq!(events[0]["EndPositionTicks"], 2_000 * TICKS_PER_MILLISECOND);
+    assert_eq!(events[0]["StartPositionTicks"], 1_000 * TICKS_PER_MS);
+    assert_eq!(events[0]["EndPositionTicks"], 2_000 * TICKS_PER_MS);
 }
 
 #[test]
@@ -567,6 +563,6 @@ fn parser_to_track_info_projects_cues() {
     assert_eq!(info.track_events[0].text, "hi");
     assert_eq!(
         info.track_events[0].start_position_ticks,
-        1_000 * TICKS_PER_MILLISECOND
+        1_000 * TICKS_PER_MS
     );
 }

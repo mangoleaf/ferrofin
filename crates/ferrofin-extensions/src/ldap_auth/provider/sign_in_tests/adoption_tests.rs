@@ -116,8 +116,8 @@ fn capture() -> (CapturedLogs, tracing::subscriber::DefaultGuard) {
         tracing_subscriber::fmt()
             .with_writer(logs.clone())
             .with_ansi(false)
-            // `ferrofin_core` too: the XML importer logs a rejected field.
-            .with_env_filter("ferrofin_extensions=debug,ferrofin_core=debug")
+            // `ferrofin_common` too: the XML importer logs a rejected field.
+            .with_env_filter("ferrofin_extensions=debug,ferrofin_common=debug")
             .finish(),
     );
     (logs, guard)

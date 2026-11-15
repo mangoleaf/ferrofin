@@ -176,12 +176,6 @@ impl DeviceManager for StubDevices {
     ) -> Result<Option<DeviceOptionsEntity>, ServiceError> {
         Ok(self.options.clone())
     }
-    async fn to_client_capabilities_dto(
-        &self,
-        _capabilities: &ferrofin_model::session::ClientCapabilities,
-    ) -> Result<ferrofin_model::dto::ClientCapabilitiesDto, ServiceError> {
-        unimplemented!()
-    }
 }
 
 /// An [`ApiKeyManager`] over an in-memory list, capturing create/delete calls.

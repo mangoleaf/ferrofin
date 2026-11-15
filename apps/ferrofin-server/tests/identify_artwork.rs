@@ -52,7 +52,7 @@ fn answer(endpoint: &str, path: &str) -> axum::response::Response {
         "/tmdb/movie/949" => json(json!({"id":949,"title":"Heat","imdb_id":"tt0113277",
             "overview":"From TheMovieDb.","release_date":"1995-12-15",
             "poster_path":"/tmdb-poster.png","videos":{"results":[]},
-            "credits":{"cast":[],"crew":[]},"release_dates":{"results":[]}})),
+            "credits":{"cast":[],"crew":[]},"releases":{"countries":[]}})),
         "/tmdb/movie/949/images" => json(json!({"posters":[{"file_path":"/tmdb-poster.png",
             "width":TMDB_POSTER.0,"height":TMDB_POSTER.1}],"backdrops":[],"logos":[]})),
         "/omdb/" => json(json!({"Response":"True","Title":"Heat","Year":"1995",
