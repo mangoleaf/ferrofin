@@ -1192,14 +1192,16 @@ impl From<RefreshMode> for MetadataRefreshMode {
 
 /// `POST /Items/{itemId}/Refresh` — queues a metadata/image refresh.
 ///
-/// Port of `ItemRefreshController.RefreshItem`. A missing item is a `404`; on
-/// success the refresh is queued at high priority and the handler returns `204`.
+/// Port of `ItemRefreshController.RefreshItem`. A missing item is a `404`, the
+/// all-zero id a `400` (`GetItemById(Guid.Empty)` throws); on success the
+/// refresh is queued at high priority and the handler returns `204`.
 #[utoipa::path(
     post,
     path = "/Items/{itemId}/Refresh",
     params(("itemId" = String, Path, description = "The item id")),
     responses(
         (status = 204, description = "Refresh queued"),
+        (status = 400, description = "A nil item id"),
         (status = 404, description = "Item not found")
     ),
     tag = "ferrofin"
@@ -1210,6 +1212,9 @@ async fn refresh_item(
     Path(DotnetGuid(item_id)): Path<DotnetGuid>,
     Query(query): Query<RefreshQuery>,
 ) -> Result<StatusCode, ApiError> {
+    if item_id.is_nil() {
+        return Err(ApiError::BadRequest("Guid can't be empty".to_owned()));
+    }
     let item = state
         .library
         .get_item_by_id_for_user(item_id, auth.user.as_deref())
@@ -1418,11 +1423,7 @@ async fn offers_content_type(state: &AppState, item: &BaseItemEntity) -> Result<
     });
     if video
         && let (Some(live_tv), Some(path)) = (&state.live_tv, item.path.as_deref())
-        && live_tv
-            .active_recording_paths()
-            .await?
-            .iter()
-            .any(|recording| recording == path)
+        && live_tv.is_active_recording(path).await?
     {
         return Ok(false);
     }

@@ -12,7 +12,11 @@
 //! `Exception.Message`, and [`stable_sort`] is LINQ `OrderBy`'s tolerance of a
 //! comparer that is not a total order. [`finite`] is `BaseItem.FiniteOrNull`,
 //! shared by every crate that assigns a rating or gain, and
-//! [`numeric_collation`] is the name order Jellyfin 12 sorts with. With the `tokio`
+//! [`numeric_collation`] is the name order Jellyfin 12 sorts with.
+//! [`invariant_float`] is .NET's `double`/`float` parse in the invariant
+//! culture, which ASP.NET's query binder, the DLNA profile conditions, the
+//! requested transcode level, the Live TV channel numbers and the image
+//! foreground layer use. With the `tokio`
 //! feature, `keyed_locks` is the async keyed lock the C# takes from
 //! `AsyncKeyedLock`, and `change_watch` tells a run whether its key changed
 //! while it ran.
@@ -26,6 +30,7 @@ pub mod file_helper;
 pub mod finite;
 pub mod guid_extensions;
 pub mod http_client;
+pub mod invariant_float;
 #[cfg(feature = "tokio")]
 pub mod keyed_locks;
 pub mod numeric_collation;
@@ -42,3 +47,4 @@ pub mod split_string_extensions;
 pub mod stable_sort;
 pub mod stream_extensions;
 pub mod string_extensions;
+pub mod ticks;

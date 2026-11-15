@@ -11,8 +11,9 @@ workspace = true
 
 [dependencies]
 # Live task lifecycle snapshots for WebSocket subscribers; `rt` for the
-# transcode-directory preparation that runs on the blocking pool.
-tokio = { workspace = true, features = ["sync", "rt"] }
+# transcode-directory preparation that runs on the blocking pool; `macros` for
+# `ScanCancel::unless_cancelled`'s `select!`.
+tokio = { workspace = true, features = ["sync", "rt", "macros"] }
 ferrofin-model.workspace = true
 ferrofin-db.workspace = true
 ferrofin-common.workspace = true

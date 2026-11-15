@@ -95,7 +95,6 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use ferrofin_core::{PluginConfigPage, ScheduledTask};
 use ferrofin_model::ldap::{
     LdapFilterResponse, LdapTestErrorResponse, ServerConnectionInfo, ServerTestResponse,
     UserFilterInfo, UserSearchAttributes, UserSearchResponse,
@@ -103,8 +102,9 @@ use ferrofin_model::ldap::{
 use ferrofin_model::secret::Secret;
 use ferrofin_traits::error::ServiceError;
 use ferrofin_traits::ldap::{LdapManager, LdapTestAnswer};
-use ferrofin_traits::plugins::{PluginDescriptor, PluginManager};
+use ferrofin_traits::plugins::{PluginConfigPage, PluginDescriptor, PluginManager};
 use ferrofin_traits::security::{AuthenticationManager, PasswordResetManager};
+use ferrofin_traits::tasks::ScheduledTask;
 use serde::{Deserialize, Deserializer, Serialize};
 use uuid::Uuid;
 

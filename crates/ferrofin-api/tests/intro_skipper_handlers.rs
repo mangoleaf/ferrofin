@@ -394,6 +394,15 @@ impl ferrofin_traits::intro_skipper::IntroSkipperAnalysis for FakeAnalysis {
     async fn support_bundle(&self) -> String {
         String::new()
     }
+    fn operating_system(&self) -> String {
+        String::new()
+    }
+    async fn create_or_replace_segment(
+        &self,
+        _segment: &MediaSegmentDto,
+    ) -> Result<(), ServiceError> {
+        Ok(())
+    }
     /// The extension's typed settings, as its parse of the plugin config
     /// above (`SkipbuttonHideDelay` 11) gives them.
     async fn settings(&self) -> ferrofin_traits::intro_skipper::IntroSkipperSettings {

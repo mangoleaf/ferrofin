@@ -2358,6 +2358,54 @@ async fn an_album_under_an_identified_artist_reads_no_nfo() {
     );
 }
 
+/// gl-1744: the chosen result the copied options carry also runs its
+/// provider first for the albums below the identified artist ("When
+/// identifying, run the provider the user picked first",
+/// `MetadataService.cs:876-882`, on `options.SearchResult`), not only for the
+/// artist: with the plugin ranked last, an Identify through it makes its
+/// overview and genres win the album's fields over TheAudioDB's and
+/// MusicBrainz's.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_album_under_an_identified_artist_runs_the_chosen_provider_first() {
+    let plugin = PluginDb::new();
+    let tmp = tempfile::tempdir().expect("tmp");
+    let fx = Fixture::with_plugins(tmp.path(), plugin_ranked(false), plugin.source()).await;
+    fx.scan().await;
+    let album = fx.row(fx.album_id()).await;
+    assert_eq!(
+        album.genres.as_deref(),
+        Some("jazz|modal jazz"),
+        "ranked last"
+    );
+
+    let options = MetadataRefreshOptions {
+        search_result: Some(RemoteSearchResult {
+            name: Some("Miles Davis".to_owned()),
+            search_provider_name: Some(PLUGIN.to_owned()),
+            ..RemoteSearchResult::default()
+        }),
+        ..replace_all()
+    };
+    let none = MetadataRefreshOptions {
+        metadata_refresh_mode: MetadataRefreshMode::None,
+        image_refresh_mode: MetadataRefreshMode::None,
+        ..MetadataRefreshOptions::default()
+    };
+    let cancel = ScanCancel::new();
+    fx.scanner
+        .scan_target(
+            &ScanTarget::Paths(vec![fx.artist_dir.to_string_lossy().into_owned()]),
+            ScanRun::new(&options, &none, &cancel).with_passes(ScanPasses::Touched),
+        )
+        .await
+        .expect("identify");
+    let artist = fx.row(fx.artist_id()).await;
+    assert_eq!(artist.genres.as_deref(), Some("Hard bop"), "the artist's");
+    let album = fx.row(fx.album_id()).await;
+    assert_eq!(album.overview.as_deref(), Some("PluginDb album text."));
+    assert_eq!(album.genres.as_deref(), Some("Cool jazz"));
+}
+
 /// A refresh of an album served inside a scan after the walk decided the
 /// album's refresh leaves the album to that refresh only when it went as
 /// far as the scan's own: a Default refresh served inside a "Search for

@@ -24,7 +24,7 @@ use ferrofin_util::change_watch::Watch;
 use futures_util::StreamExt as _;
 use uuid::Uuid;
 
-use super::queue::{Category, QueuedEpisode};
+use super::queue::{Category, Queue, QueuedEpisode};
 use super::{DetectSegmentsTask, IntroSkipperConfig, chapter_analyzer, config_hash};
 use crate::ffmpeg::ProcessOptions;
 use crate::fingerprint::Fingerprinter;
@@ -472,30 +472,23 @@ fn print_mode(mode: Mode) -> Option<PrintMode> {
 }
 
 impl DetectSegmentsTask {
-    /// `AnalyzeItemsAsync(progress, seasonsToAnalyze)`: every non-excluded
-    /// season of `queue`, `MaxParallelism` at a time; how many items were
-    /// newly analysed.
+    /// `AnalyzeItemsAsync(progress, seasonsToAnalyze)`: the non-excluded items
+    /// of each season in the queue (`seasons`), `MaxParallelism` seasons at a
+    /// time; how many items were newly analysed.
+    ///
+    /// The queue is taken whole and filtered in place, so the pass holds one
+    /// copy of it, which shrinks as each season's task ends.
     pub(super) async fn analyze_queue(
         &self,
-        queue: &[(Uuid, Vec<QueuedEpisode>)],
+        mut seasons: Queue,
         config: &IntroSkipperConfig,
         progress: &TaskProgress,
     ) -> usize {
         let modes = modes(config);
-        let seasons: Vec<(Uuid, Vec<QueuedEpisode>)> = queue
-            .iter()
-            .map(|(season, entries)| {
-                (
-                    *season,
-                    entries
-                        .iter()
-                        .filter(|e| !e.is_excluded)
-                        .cloned()
-                        .collect::<Vec<_>>(),
-                )
-            })
-            .filter(|(_, entries)| !entries.is_empty())
-            .collect();
+        seasons.retain_mut(|(_, entries)| {
+            entries.retain(|e| !e.is_excluded);
+            !entries.is_empty()
+        });
         let total = seasons.iter().map(|(_, e)| e.len()).sum::<usize>() * modes.len();
         if total == 0 {
             tracing::info!(

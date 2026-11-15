@@ -917,6 +917,121 @@ async fn a_library_whose_locations_changed_redraws_its_tile() {
     );
 }
 
+/// The `UserRootFolder` row the library hangs under.
+async fn user_root_of(lib: &PhotoLibrary) -> BaseItemEntity {
+    lib.items
+        .get_item_list(&InternalItemsQuery {
+            include_item_types: vec![BaseItemKind::UserRootFolder],
+            ..InternalItemsQuery::default()
+        })
+        .await
+        .expect("query")
+        .into_iter()
+        .next()
+        .expect("the root the library hangs under")
+}
+
+/// gl-950: library validation refreshes the user root at its opening, as
+/// upstream's `ValidateTopLibraryFolders` does, before any library is walked:
+/// a fresh library's first validation finds no tile to copy and records the
+/// refresh; the next validation copies the tile the first one drew.
+#[tokio::test(flavor = "multi_thread")]
+async fn library_validation_refreshes_the_user_root_before_the_walk() {
+    let lib = PhotoLibrary::scanned(RED).await;
+    let root = user_root_of(&lib).await;
+    let root_id = uuid::Uuid::parse_str(&root.id).expect("id");
+    assert!(
+        root.date_last_refreshed.is_some(),
+        "the first validation records the root's refresh"
+    );
+    assert!(
+        lib.items
+            .get_image_infos(root_id)
+            .await
+            .expect("images")
+            .is_empty(),
+        "no library tile existed when the root was refreshed"
+    );
+
+    lib.scanner.scan_all().await.expect("scan");
+    let copy = primary_of(&lib.items, root_id).await;
+    assert_eq!(
+        image::open(&copy.path)
+            .expect("decodable")
+            .to_rgb8()
+            .get_pixel(10, 10)
+            .0,
+        dimmed(RED),
+        "the next validation copies the library's tile"
+    );
+}
+
+/// gl-950: every library validation refreshes the user root, as upstream's
+/// `ValidateTopLibraryFolders` does (`GetUserRootFolder().RefreshMetadata()`,
+/// Default options). A root never refreshed runs every provider, so its
+/// current image is recopied from the library tile past the date gate, and
+/// its `DateLastRefreshed` is stamped; the next validation leaves both.
+#[tokio::test(flavor = "multi_thread")]
+async fn library_validation_refreshes_the_user_root() {
+    const GREEN: [u8; 3] = [30, 180, 30];
+    let lib = PhotoLibrary::scanned(RED).await;
+    let root = uuid::Uuid::parse_str(&user_root_of(&lib).await.id).expect("id");
+    let colour = || async {
+        image::open(primary_of(&lib.items, root).await.path)
+            .expect("decodable")
+            .to_rgb8()
+            .get_pixel(10, 10)
+            .0
+    };
+    // A root whose current copy was drawn before it was ever refreshed (a
+    // root row written by an older Ferrofin carries no stamp).
+    let mut row = user_root_of(&lib).await;
+    row.date_last_refreshed = None;
+    lib.persistence
+        .save_items(std::slice::from_ref(&row))
+        .await
+        .expect("unstamp");
+    let dir = jellyfin_art_dir(lib.tmp.path(), root);
+    std::fs::create_dir_all(&dir).expect("art dir");
+    let copy = dir.join("primary.png");
+    let draw_green = || async {
+        image::RgbImage::from_pixel(40, 60, image::Rgb(GREEN))
+            .save(&copy)
+            .expect("copy");
+        set_primary_of(
+            &lib.items,
+            &lib.persistence,
+            root,
+            &copy.to_string_lossy(),
+            // Its file's time: an image touched on disk since is redrawn.
+            std::fs::metadata(&copy)
+                .and_then(|meta| meta.modified())
+                .expect("mtime")
+                .into(),
+        )
+        .await;
+    };
+    draw_green().await;
+
+    lib.scanner.scan_all().await.expect("scan");
+    assert_eq!(
+        colour().await,
+        dimmed(RED),
+        "the root's first refresh runs every provider"
+    );
+    let stamped = user_root_of(&lib).await.date_last_refreshed;
+    assert!(stamped.is_some(), "the root's refresh is recorded");
+
+    draw_green().await;
+    lib.scanner.scan_all().await.expect("scan");
+    assert_eq!(
+        colour().await,
+        GREEN,
+        "a refreshed root's current image is behind its gate"
+    );
+    assert_eq!(user_root_of(&lib).await.date_last_refreshed, stamped);
+}
+
 /// The row's Primary image row.
 async fn primary_of(
     items: &Arc<dyn ItemRepository>,

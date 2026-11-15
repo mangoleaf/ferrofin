@@ -13,6 +13,7 @@ pub mod database;
 pub mod entities;
 pub mod enums;
 pub mod error;
+pub mod item_data;
 pub mod normalized_usernames;
 mod placeholders;
 pub mod presentation_key;
@@ -29,9 +30,16 @@ pub use database::{
 };
 
 /// How many ids one unpadded `IN (…)` query binds at a time, and the most
-/// parameters one multi-row insert binds: stays far below SQLite's conservative
-/// 999-host-variable floor (`SQLITE_MAX_VARIABLE_NUMBER` on old builds). The
-/// request-path reads pad their lists instead and chunk by [`PADDED_LIST_MAX`].
+/// parameters one multi-row insert binds (`BATCH_BIND_CHUNK / columns` rows a
+/// statement). The request-path reads pad their lists instead and chunk by
+/// [`PADDED_LIST_MAX`].
+///
+/// SQLite's own ceiling is far higher: sqlx links the bundled SQLite
+/// (`libsqlite3-sys`'s `bundled` feature), which keeps the default
+/// `SQLITE_MAX_VARIABLE_NUMBER` of 32,766. This value was sized for the 999 of
+/// SQLite before 3.32. A larger one makes longer statements and, through
+/// [`PADDED_LIST_MAX`], re-shapes every padded read in the statement cache, so
+/// measure it before raising it.
 pub const BATCH_BIND_CHUNK: usize = 500;
 
 /// The placeholder item row the initial migration seeds (C# `PlaceholderId`),

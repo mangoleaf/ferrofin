@@ -10,13 +10,12 @@
 //! - `GetDrives` is a port of `ManagedFileSystem.GetDrives`
 //!   (`Emby.Server.Implementations/IO/ManagedFileSystem.cs`): every mount
 //!   `DriveInfo.GetDrives()` reports, kept when its `DriveType` is
-//!   `Fixed | Network | Removable`, it `IsReady` (on Unix: the mount point is a
-//!   directory) and its `TotalSize != 0`. Order is `getmntent` order — never
-//!   sorted, never de-duplicated. See [`crate::mount_table`] for the filesystem
-//!   classification table. Windows lettered-volume enumeration is a separate
-//!   platform concern; the Linux path is fully ported. One deliberate
-//!   difference: a mount that does not answer in time is left out
-//!   (see `drive_probe`).
+//!   `Fixed | Network | Removable`, it `IsReady` (its root is a directory) and
+//!   its `TotalSize != 0`. Order is `getmntent` order on Unix and drive-letter
+//!   order on Windows (`GetLogicalDrives`) — never sorted, never
+//!   de-duplicated. See [`crate::mount_table`] for the drive table and the
+//!   filesystem classification. One deliberate difference: a mount that does
+//!   not answer in time is left out (see `drive_probe`).
 //! - `IFileSystem.GetFiles` skips only directories, and it gives a link the
 //!   length of what it points at: `DirectoryInfo.EnumerateFiles`, and
 //!   `ManagedFileSystem.GetFileSystemMetadata` on the entries.
@@ -133,16 +132,16 @@ fn root_drive() -> FileSystemEntryInfo {
 /// unit-testable without a real mount table.
 ///
 /// The order of the mount table is preserved: C# enumerates `getmntent` output
-/// and never sorts. `Name` and `FullName` are both the mount point on Unix
-/// (`DriveInfo.Name` is the normalized ctor argument and
-/// `RootDirectory.FullName` resolves to the same string).
+/// and never sorts. `Name` and `FullName` are both the mount point on Unix, or
+/// the drive root (`C:\`) on Windows (`DriveInfo.Name` is the normalized ctor
+/// argument and `RootDirectory.FullName` resolves to the same string).
 fn drives_from(
     mounts: &[MountEntry],
     ready: impl FnOnce(&[&str]) -> Vec<bool>,
 ) -> Vec<FileSystemEntryInfo> {
     let browsable: Vec<&str> = mounts
         .iter()
-        .filter(|m| mount_table::drive_type(&m.fs_type).is_browsable_drive())
+        .filter(|m| m.drive_type.is_browsable_drive())
         .map(|m| m.target.as_str())
         .collect();
     let ready = ready(&browsable);
@@ -158,7 +157,7 @@ fn drives_from(
         .collect()
 }
 
-/// `d.IsReady && d.TotalSize != 0`. `IsReady` on Unix is
+/// `d.IsReady && d.TotalSize != 0`. `IsReady` is
 /// `Directory.Exists(Name)`, which is what drops Docker's `/etc/hosts`-style
 /// single-file bind mounts; the size clause drops mounts with no capacity.
 fn mount_is_ready(target: &str) -> bool {
@@ -167,28 +166,8 @@ fn mount_is_ready(target: &str) -> bool {
 
 /// Total bytes of the filesystem at `path` (C# `DriveInfo.TotalSize`), or `0`
 /// when it cannot be queried — which is also what the `!= 0` filter drops.
-#[cfg(unix)]
 fn total_size(path: &str) -> u64 {
-    use std::os::unix::ffi::OsStrExt;
-
-    let Ok(c_path) = std::ffi::CString::new(Path::new(path).as_os_str().as_bytes()) else {
-        return 0;
-    };
-    // SAFETY: `stat` is fully written by `statvfs` before it is read, and
-    // `c_path` is a valid NUL-terminated C string that outlives the call.
-    let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
-    if unsafe { libc::statvfs(c_path.as_ptr(), std::ptr::from_mut(&mut stat)) } != 0 {
-        return 0;
-    }
-    // statvfs field widths differ per platform (u64 on Linux, u32 on macOS).
-    #[allow(clippy::useless_conversion)]
-    u64::from(stat.f_blocks).saturating_mul(u64::from(stat.f_frsize))
-}
-
-/// Non-unix fallback: no `statvfs`, so the size filter cannot reject anything.
-#[cfg(not(unix))]
-fn total_size(_path: &str) -> u64 {
-    u64::MAX
+    mount_table::disk_space(path).map_or(0, |(_, total)| total)
 }
 
 /// Whether the symlink at `path` lists as a directory.

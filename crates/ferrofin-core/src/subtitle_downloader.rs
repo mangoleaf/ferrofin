@@ -10,7 +10,9 @@ use ferrofin_model::entities_media::MediaStream;
 use ferrofin_traits::error::ServiceError;
 use ferrofin_traits::persistence::{MediaStreamQuery, MediaStreamRepository};
 use ferrofin_traits::stubs::LiveTvManager;
-use ferrofin_traits::subtitles::{SubtitleManager, SubtitleMediaType, SubtitleSearchRequest};
+use ferrofin_traits::subtitles::{
+    SubtitleManager, SubtitleMediaType, SubtitleSearchRequest, is_rate_limit_exceeded,
+};
 use uuid::Uuid;
 
 use crate::ScanCancel;
@@ -168,17 +170,17 @@ impl SubtitleDownloader {
             return;
         }
         if let Some(live_tv) = self.live_tv.as_ref().and_then(Weak::upgrade) {
-            let Some(recordings) = cancel
-                .unless_cancelled(live_tv.active_recording_paths())
+            let Some(recording) = cancel
+                .unless_cancelled(
+                    live_tv.is_active_recording(video.path.as_deref().unwrap_or_default()),
+                )
                 .await
             else {
                 return;
             };
-            match recordings {
-                Ok(paths) if paths.iter().any(|path| video.path.as_ref() == Some(path)) => {
-                    return;
-                }
-                Ok(_) => {}
+            match recording {
+                Ok(true) => return,
+                Ok(false) => {}
                 Err(error) => {
                     tracing::warn!(item_id = %video.id, %error, "subtitle recording lookup failed");
                     return;
@@ -220,31 +222,58 @@ impl SubtitleDownloader {
                 ..SubtitleSearchRequest::default()
             };
             // Only reads and network requests can be dropped on cancellation.
-            let fetched = cancel
-                .unless_cancelled(self.fetch_missing(manager.as_ref(), &request, options, probed))
+            let found = cancel
+                .unless_cancelled(self.find_missing(manager.as_ref(), &request, options, probed))
                 .await;
-            match fetched {
+            let id = match found {
                 None => break,
-                Some(Ok(None)) => {}
-                Some(Ok(Some(response))) => {
-                    if let Err(error) = manager.upload_subtitle(item_id, &response).await {
-                        tracing::warn!(%item_id, language, %error, "subtitle save failed");
-                    }
-                }
+                Some(Ok(None)) => continue,
+                Some(Ok(Some(id))) => id,
                 Some(Err(error)) => {
                     tracing::warn!(%item_id, language, %error, "subtitle download failed");
+                    continue;
                 }
-            }
+            };
+            // Upstream's cancelled fetch throws into `catch (Exception)` and so
+            // records a failure; a cancelled scan or task records none here.
+            let Some(fetched) = cancel
+                .unless_cancelled(manager.get_remote_subtitles(&id))
+                .await
+            else {
+                break;
+            };
+            // `SubtitleManager.DownloadSubtitles`, its fetch and save apart.
+            let error = match fetched {
+                Ok(response) => match manager.upload_subtitle(item_id, &response).await {
+                    Ok(()) => continue,
+                    Err(error) => {
+                        tracing::warn!(%item_id, language, %error, "subtitle save failed");
+                        error
+                    }
+                },
+                // `catch (RateLimitExceededException) { }`: upstream logs nothing.
+                Err(error) if is_rate_limit_exceeded(&error) => {
+                    tracing::debug!(%item_id, language, %error, "subtitle download quota spent");
+                    continue;
+                }
+                Err(error) => {
+                    tracing::warn!(%item_id, language, %error, "subtitle download failed");
+                    error
+                }
+            };
+            manager.report_download_failure(item_id, &id, &error).await;
         }
     }
 
-    async fn fetch_missing(
+    /// The id of the first acceptable remote subtitle for the request's
+    /// language, when the item still lacks it.
+    async fn find_missing(
         &self,
         manager: &dyn SubtitleManager,
         request: &SubtitleSearchRequest,
         options: &LibraryOptions,
         probed: Option<&[MediaStreamInfoEntity]>,
-    ) -> Result<Option<ferrofin_traits::subtitles::SubtitleResponse>, ServiceError> {
+    ) -> Result<Option<String>, ServiceError> {
         let mut streams = self
             .streams
             .get_media_streams(&MediaStreamQuery {
@@ -264,14 +293,10 @@ impl SubtitleDownloader {
             return Ok(None);
         }
         let results = manager.search_subtitles(request).await?;
-        let Some(id) = results
-            .iter()
+        Ok(results
+            .into_iter()
             .filter(|r| !options.require_perfect_subtitle_match || r.is_hash_match == Some(true))
-            .find_map(|r| r.id.as_deref())
-        else {
-            return Ok(None);
-        };
-        manager.get_remote_subtitles(id).await.map(Some)
+            .find_map(|r| r.id))
     }
 }
 
@@ -374,6 +399,7 @@ mod tests {
     use super::*;
     use async_trait::async_trait;
     use ferrofin_model::providers::RemoteSubtitleInfo;
+    use ferrofin_traits::activity::ActivityManager as _;
     use ferrofin_traits::persistence::ItemPersistenceService;
     use ferrofin_traits::subtitles::{SubtitleProvider, SubtitleResponse};
     use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
@@ -439,6 +465,8 @@ mod tests {
         non_matching: AtomicBool,
         requests: std::sync::Mutex<Vec<SubtitleSearchRequest>>,
         hang: AtomicU8,
+        /// 1: a refused account, 2: the quota spent, 3: a format no sidecar takes.
+        fail: AtomicU8,
         entered: tokio::sync::Notify,
     }
 
@@ -469,9 +497,23 @@ mod tests {
                 self.entered.notify_one();
                 std::future::pending::<()>().await;
             }
+            match self.fail.load(Ordering::SeqCst) {
+                1 => return Err(ServiceError::unauthorized("account not set up")),
+                2 => {
+                    return Err(ServiceError::backend_source(
+                        ferrofin_traits::subtitles::RateLimitExceeded("quota spent".to_owned()),
+                    ));
+                }
+                _ => {}
+            }
             Ok(SubtitleResponse {
                 language: id.to_owned(),
-                format: "srt".to_owned(),
+                format: if self.fail.load(Ordering::SeqCst) == 3 {
+                    "nfo"
+                } else {
+                    "srt"
+                }
+                .to_owned(),
                 content: b"subtitle".to_vec(),
                 ..Default::default()
             })
@@ -484,6 +526,7 @@ mod tests {
         db: ferrofin_db::Database,
         downloader: SubtitleDownloader,
         provider: Arc<Provider>,
+        activity: Arc<crate::FerrofinActivityManager>,
         video: BaseItemEntity,
         options: LibraryOptions,
     }
@@ -509,19 +552,24 @@ mod tests {
         let streams: Arc<dyn MediaStreamRepository> =
             Arc::new(crate::FerrofinMediaStreamRepository::new(db.clone()));
         let provider = Arc::new(Provider::default());
-        let manager: Arc<dyn SubtitleManager> = Arc::new(crate::FerrofinSubtitleManager::new(
-            db.clone(),
-            crate::test_support::library_manager_over(db.clone()),
-            streams.clone(),
-            vec![provider.clone()],
-            temp.path().join("metadata"),
-        ));
+        let activity = Arc::new(crate::FerrofinActivityManager::new(db.clone()));
+        let manager: Arc<dyn SubtitleManager> = Arc::new(
+            crate::FerrofinSubtitleManager::new(
+                db.clone(),
+                crate::test_support::library_manager_over(db.clone()),
+                streams.clone(),
+                vec![provider.clone()],
+                temp.path().join("metadata"),
+            )
+            .with_activity(activity.clone()),
+        );
         Harness {
             downloader: SubtitleDownloader::new(&manager, streams),
             _manager: manager,
             temp,
             db,
             provider,
+            activity,
             video,
             options: LibraryOptions {
                 subtitle_download_languages: Some(vec!["eng".to_owned(), "ENG".to_owned()]),
@@ -1001,5 +1049,55 @@ mod tests {
             .download_missing(&h.video, &h.options, &cancel)
             .await;
         assert_eq!(h.provider.searches.load(Ordering::SeqCst), 0);
+    }
+
+    /// `SubtitleDownloader` downloads through `SubtitleManager.DownloadSubtitles`,
+    /// so a failed fetch or save writes the `SubtitleDownloadFailure` entry,
+    /// and a spent quota writes none (and is swallowed silently there).
+    #[rstest::rstest]
+    #[case::refused_account(1, Some("account not set up"))]
+    #[case::spent_quota(2, None)]
+    #[case::unsaveable_format(3, Some("unsupported subtitle format: nfo"))]
+    #[tokio::test]
+    async fn a_failed_automatic_download_records_an_activity_entry(
+        #[case] fail: u8,
+        #[case] overview: Option<&str>,
+    ) {
+        let h = harness().await;
+        h.provider.fail.store(fail, Ordering::SeqCst);
+        h.downloader
+            .download_missing(&h.video, &h.options, &ScanCancel::new())
+            .await;
+        assert_eq!(h.provider.downloads.load(Ordering::SeqCst), 1);
+        let entries = h
+            .activity
+            .get_paged_result(&ferrofin_traits::activity::ActivityLogQuery::default())
+            .await
+            .unwrap()
+            .items;
+        let recorded: Vec<_> = entries
+            .iter()
+            .map(|entry| {
+                (
+                    entry.name.as_str(),
+                    entry.type_.as_str(),
+                    entry.short_overview.as_deref(),
+                    entry.item_id.as_deref(),
+                )
+            })
+            .collect();
+        let item_id = Uuid::parse_str(&h.video.id).unwrap().simple().to_string();
+        let expected: Vec<_> = overview
+            .map(|overview| {
+                (
+                    "Subtitles failed to download from fake for Movie",
+                    "SubtitleDownloadFailure",
+                    Some(overview),
+                    Some(item_id.as_str()),
+                )
+            })
+            .into_iter()
+            .collect();
+        assert_eq!(recorded, expected);
     }
 }
