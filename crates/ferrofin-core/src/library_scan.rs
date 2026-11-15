@@ -19,6 +19,7 @@
 
 use ferrofin_traits::providers::ItemUpdateType;
 use ferrofin_util::directory_path::DirectoryPath;
+use ferrofin_util::string_extensions::ordinal_ignore_case_key;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -16230,8 +16231,9 @@ impl LibraryScanner {
                     // `StringComparison.OrdinalIgnoreCase`, which folds
                     // case beyond ASCII (`Léon` and `LÉON`).
                     owner_name.is_some_and(|owner| {
-                        ferrofin_util::string_extensions::upper_invariant(&resolved)
-                            == ferrofin_util::string_extensions::upper_invariant(owner)
+                        ferrofin_util::string_extensions::equals_ordinal_ignore_case(
+                            &resolved, owner,
+                        )
                     })
                 }
                 _ => false,
@@ -21605,9 +21607,7 @@ fn extra_matches_owner(
     naming: &NamingOptions,
 ) -> bool {
     fn trimmed(value: &str, delimiters: &[char]) -> String {
-        ferrofin_util::string_extensions::upper_invariant(
-            value.trim_end().trim_end_matches(delimiters).trim_end(),
-        )
+        ordinal_ignore_case_key(value.trim_end().trim_end_matches(delimiters).trim_end())
     }
     let extra = video_resolver::clean_date_time(&file_stem(path), naming);
     let extra_name = trimmed(&extra.name, &naming.video_flag_delimiters);
@@ -24404,11 +24404,6 @@ fn distinct_ignoring_case<'a>(columns: impl Iterator<Item = Option<&'a str>>) ->
     out
 }
 
-/// The invariant simple-uppercase key shared with username normalization.
-fn ordinal_ignore_case_key(value: &str) -> String {
-    ferrofin_util::string_extensions::upper_invariant(value)
-}
-
 /// The distinct values of a `|`-joined column across a set of children, ordered
 /// by descending frequency with ties keeping first-appearance order.
 ///
@@ -26669,6 +26664,8 @@ mod tests {
         assert_ne!(key("\u{130}"), key("i"));
         // Sharp s does not expand: `ToUpperInvariant` cannot map it 1:1 to `SS`.
         assert_ne!(key("\u{df}"), key("ss"));
+        // The long s keeps its case: `ToUpperInvariant` maps it to `S`, ordinal casing does not.
+        assert_ne!(key("\u{17f}"), key("s"));
         // Frequency ordering itself is unaffected by the change.
         let rows = [Some("B|a"), Some("A"), Some("b")];
         assert_eq!(

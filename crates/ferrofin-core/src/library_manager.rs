@@ -255,13 +255,15 @@ fn folder_allows_collapsing(query: &InternalItemsQuery) -> bool {
 
 fn folder_name_matches(item: &BaseItemEntity, query: &InternalItemsQuery) -> bool {
     use crate::item_repository::{folder_ordinal_compare, folder_sort_name};
-    use ferrofin_util::string_extensions::upper_invariant;
+    use ferrofin_util::string_extensions::ordinal_ignore_case_key;
     let sort = folder_sort_name(item);
     query
         .name_starts_with
         .as_ref()
         .filter(|value| !value.trim().is_empty())
-        .is_none_or(|prefix| upper_invariant(&sort).starts_with(&upper_invariant(prefix)))
+        .is_none_or(|prefix| {
+            ordinal_ignore_case_key(&sort).starts_with(&ordinal_ignore_case_key(prefix))
+        })
         && query
             .name_starts_with_or_greater
             .as_ref()
@@ -7983,6 +7985,18 @@ mod tests {
             &row,
             &InternalItemsQuery {
                 name_starts_with: Some("Alpha%".into()),
+                ..Default::default()
+            }
+        ));
+        // The long s keeps its case: `ToUpperInvariant` maps it to `S`, ordinal casing does not.
+        let row = BaseItemEntity {
+            sort_name: Some("ſtar".into()),
+            ..Default::default()
+        };
+        assert!(!super::folder_name_matches(
+            &row,
+            &InternalItemsQuery {
+                name_starts_with: Some("S".into()),
                 ..Default::default()
             }
         ));

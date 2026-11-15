@@ -72,7 +72,9 @@ fn distinct_names(names: Vec<String>) -> Vec<String> {
         .into_iter()
         .filter(|n| {
             let key = ferrofin_util::string_extensions::remove_diacritics(n);
-            seen.insert(ferrofin_util::string_extensions::upper_invariant(&key))
+            seen.insert(ferrofin_util::string_extensions::ordinal_ignore_case_key(
+                &key,
+            ))
         })
         .collect()
 }
@@ -306,6 +308,7 @@ mod tests {
     #[case("é", "E", true)]
     #[case("𐐨", "𐐀", true)]
     #[case("ı", "I", false)]
+    #[case("ſ", "s", false)]
     fn unicode_distinct_names(#[case] first: &str, #[case] second: &str, #[case] equal: bool) {
         let expected = if equal {
             vec![first]
