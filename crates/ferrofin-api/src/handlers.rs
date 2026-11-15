@@ -1559,9 +1559,13 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
              and a non-image, plus a body past the limit or failing the content check. Any \
              other failure throws there and moves on to the next URL here, and neither removes \
              the row or remembers the URL.",
-            "Timers, series timers and the new-timer defaults carry no image tags: \
-             LiveTvDtoService.FillImages (the program's and the library series' Primary, Thumb \
-             and Backdrop tags) is not ported. Fix path: gl-853.",
+            "A timer with a blank name (the new-timer defaults without a programId, or a \
+             series timer, a series timer's timer or a programme whose name is blank) runs no \
+             lookup by name: ferrofin-livetv manager.rs fill_images finds artwork only by a \
+             listings series id then, where LiveTvDtoService.FillImages filters on nothing and \
+             takes the library's first series' Thumb and Backdrop, and the first series' Primary \
+             (a series timer's) or the guide's first programme's (a programme's). Fix path: \
+             gl-1790, an owner decision.",
             "A tuner's or guide's artwork is kept only as an absolute http or https URL, and a \
              channel's or programme's stored row that is neither a URL nor a file in the \
              internal metadata directory is neither served nor listed. Upstream's SetImagePath \
@@ -3484,16 +3488,32 @@ pub const VERIFIED: &[Verified] = &[
         ferrofin: "handlers/live_tv.rs get_timer (RequiredRouteString: a blank timerId is a 400) → \
                find_timer (LiveTvManager.GetTimer: GetTimers with TimerQuery.Id, then the first \
                whose Id equals timerId ignoring case; none is 200 null, unchecked as upstream) → \
-               ferrofin-traits live_tv.rs get_timers_matching and filter_timers → \
-               ferrofin-livetv manager.rs get_timers (DefaultLiveTvService.GetTimersAsync: every \
-               timer but a Completed one)",
-        date: "2026-11-13",
+               ferrofin-livetv manager.rs get_timers_matching (get_timers, \
+               DefaultLiveTvService.GetTimersAsync: every timer but a Completed one; \
+               ferrofin-traits live_tv.rs filter_timers) → build_timer_dto for each \
+               (LiveTvDtoService.GetTimerInfoDto: program_row_for_timer and program_dtos with \
+               DtoOptions::default and no user for ProgramInfo, GetBaseItemDto(program, new \
+               DtoOptions()) with AddInfoToProgramDto, then TimerId and Status unless Cancelled \
+               or Error, SeriesTimerId, and for a series timer's timer fill_images, \
+               FillImages(BaseItemDto, …) by the timer's name and the programme's \
+               ExternalSeriesId over first_with_image, item_images and image_tag; \
+               guide_repository.rs channel_row and manager.rs channel_image_tags for ChannelName and \
+               ChannelPrimaryImageTag, none without the channel; RunTimeTicks from the window)",
+        date: "2026-11-14",
         divergences: &[
-            "The timer is the DTO stored at its creation or last change, not one \
-         GetTimerInfoDto builds on each read: no ProgramInfo, no ChannelPrimaryImageTag, and \
-         the guide's ChannelName at creation. Fix path: gl-1745 (then gl-853 for the artwork).",
+            "ProgramInfo is the programme DTO GET /LiveTv/Programs projects from the guide's \
+         own table, so it lacks what that table has no column for (CommunityRating, \
+         PremiereDate, Audio, an HD listing's Width and Height, the ProgramEtag and \
+         SeriesZap2It provider ids) and shows the listing's fields, not a change saved to \
+         the programme's item. Fix path: gl-763, gl-1591, gl-1690.",
+            "A series timer's timer whose name is blank runs no lookup by name, so its \
+         ProgramInfo takes no Thumb or Backdrop from a library series, and without a listings \
+         series id no Primary from a guide programme; upstream's FillImages then filters on \
+         nothing and takes the library's first series with a Thumb and the guide's first \
+         programme with a Primary. Fix path: gl-1790, an owner decision.",
+            "The 400 body is Ferrofin's error shape, not upstream's. Fix path: gl-666.",
         ],
-        refs: &[],
+        refs: &["images"],
     },
     Verified {
         method: "delete",
@@ -3519,6 +3539,125 @@ pub const VERIFIED: &[Verified] = &[
             "The 404 body is Ferrofin's error shape, not upstream's. Fix path: gl-666.",
         ],
         refs: &[],
+    },
+    Verified {
+        method: "get",
+        path: "/LiveTv/Timers",
+        upstream_file: "Jellyfin.Api/Controllers/LiveTvController.cs",
+        upstream_method: "GetTimers",
+        ferrofin: "handlers/live_tv.rs get_timers (TimersQuery: channelId, seriesTimerId, \
+               isActive, isScheduled) → ferrofin-livetv manager.rs get_timers_matching \
+               (LiveTvManager.GetTimers: get_timers, DefaultLiveTvService.GetTimersAsync's every \
+               timer but a Completed one; ferrofin-traits live_tv.rs filter_timers: isActive as \
+               InProgress, isScheduled as New, channelId and seriesTimerId compared as GUIDs, \
+               ordered by StartDate) → build_timer_dto for each \
+               (LiveTvDtoService.GetTimerInfoDto: program_row_for_timer and program_dtos with \
+               DtoOptions::default and no user for ProgramInfo, GetBaseItemDto(program, new \
+               DtoOptions()) with AddInfoToProgramDto, then TimerId and Status unless Cancelled \
+               or Error, SeriesTimerId, and for a series timer's timer fill_images, \
+               FillImages(BaseItemDto, …) by the timer's name and the programme's \
+               ExternalSeriesId over first_with_image, item_images and image_tag; \
+               guide_repository.rs channel_row and manager.rs channel_image_tags for ChannelName and \
+               ChannelPrimaryImageTag, none without the channel; RunTimeTicks from the window)",
+        date: "2026-11-14",
+        divergences: &[
+            "A channelId or seriesTimerId that is no GUID matches no timer; upstream's new Guid \
+         throws a FormatException, a 500. Jellyfin bug not ported.",
+            "A seriesTimerId naming the id an empty series timer id hashes to (the new-timer \
+         defaults' Id) matches no timer; upstream hashes each timer's empty SeriesTimerId to \
+         that id (GetInternalSeriesTimerId), so it lists every timer of no series timer. \
+         Jellyfin bug not ported.",
+            "ProgramInfo is the programme DTO GET /LiveTv/Programs projects from the guide's \
+         own table, so it lacks what that table has no column for (CommunityRating, \
+         PremiereDate, Audio, an HD listing's Width and Height, the ProgramEtag and \
+         SeriesZap2It provider ids) and shows the listing's fields, not a change saved to \
+         the programme's item. Fix path: gl-763, gl-1591, gl-1690.",
+            "A series timer's timer whose name is blank runs no lookup by name, so its \
+         ProgramInfo takes no Thumb or Backdrop from a library series, and without a listings \
+         series id no Primary from a guide programme; upstream's FillImages then filters on \
+         nothing and takes the library's first series with a Thumb and the guide's first \
+         programme with a Primary. Fix path: gl-1790, an owner decision.",
+            "The 400 body (a value the query binder cannot convert) is Ferrofin's error shape, \
+         not upstream's. Fix path: gl-666.",
+        ],
+        refs: &["images"],
+    },
+    Verified {
+        method: "get",
+        path: "/LiveTv/Timers/Defaults",
+        upstream_file: "Jellyfin.Api/Controllers/LiveTvController.cs",
+        upstream_method: "GetDefaultTimer",
+        ferrofin: "handlers/live_tv.rs get_default_timer (TimerDefaultsQuery: \
+               empty_as_none_uuid, so an empty or blank programId is none; a nil one is \
+               GetItemById's 400) → ferrofin-livetv manager.rs get_new_timer_defaults \
+               (LiveTvManager.GetNewTimerDefaults and GetNewTimerDefaultsInternal: \
+               ferrofin-traits live_tv.rs new_timer_defaults for \
+               DefaultLiveTvService.GetNewTimerDefaultsAsync, with live_tv_options' padding; for \
+               a programme, program_row and its name, overview, channel, window, RecordNewOnly \
+               and SkipEpisodesInLibrary from IsRepeat, ProgramId and ExternalProgramId; then \
+               GetSeriesTimerInfoDto's FillImages(dto, program.Name, null) through fill_images: \
+               first_with_image, item_images and image_tag)",
+        date: "2026-11-14",
+        divergences: &[
+            "A programId that does not parse is the binder's 400; upstream's new Guid throws a \
+         FormatException, a 500. Jellyfin bug not ported.",
+            "A programId naming no programme (an unknown id, or another kind of item) answers \
+         the standing defaults; upstream dereferences the null programme or fails the cast, \
+         a 500. Jellyfin bug not ported.",
+            "Without a programId, or for a programme whose title is blank, the defaults carry \
+         no artwork; upstream's FillImages with no name filters on nothing and gives them the \
+         library's first series' Thumb, Backdrop and Primary. Fix path: gl-1790, an owner \
+         decision.",
+            "The 400 body is Ferrofin's error shape, not upstream's. Fix path: gl-666.",
+        ],
+        refs: &["images"],
+    },
+    Verified {
+        method: "get",
+        path: "/LiveTv/SeriesTimers",
+        upstream_file: "Jellyfin.Api/Controllers/LiveTvController.cs",
+        upstream_method: "GetSeriesTimers",
+        ferrofin: "handlers/live_tv.rs get_series_timers (SeriesTimersQuery: sortBy, \
+               sortOrder, Ascending when absent) → ferrofin-livetv manager.rs get_series_timers \
+               (LiveTvManager.GetSeriesTimers: dvr_repository.rs series_timer_rows; \
+               sort_series_timers, Priority then the name, else the name; \
+               build_series_timer_dto for each: the channel's current name from \
+               guide_repository.rs channel_row, none without a channel, and \
+               GetSeriesTimerInfoDto's FillImages(dto, info.Name, info.SeriesId) through \
+               fill_images with the stored SeriesId: first_with_image, item_images and \
+               image_tag)",
+        date: "2026-11-14",
+        divergences: &[
+            "Names sort with v10.11.8's AlphanumericComparator runs; v12.4's SortExtensions \
+         compares with invariant culture under NumericOrdering, so names whose numbers differ \
+         only in leading zeros order differently. Fix path: gl-510.",
+            "A series timer whose name is blank runs no lookup by name: it takes no Thumb or \
+         Backdrop from a library series, and its Primary only from an airing of its listings \
+         series. Upstream's FillImages then filters on nothing and takes the library's first \
+         series' Thumb, Backdrop and Primary. Fix path: gl-1790, an owner decision.",
+        ],
+        refs: &["images"],
+    },
+    Verified {
+        method: "get",
+        path: "/LiveTv/SeriesTimers/{timerId}",
+        upstream_file: "Jellyfin.Api/Controllers/LiveTvController.cs",
+        upstream_method: "GetSeriesTimer",
+        ferrofin: "handlers/live_tv.rs get_series_timer (RequiredRouteString: a blank timerId \
+               is a 400; LiveTvManager.GetSeriesTimer: GetSeriesTimers with a default query, \
+               then the first whose Id equals timerId ignoring case; none is a 404) → \
+               ferrofin-livetv manager.rs get_series_timers (as GET /LiveTv/SeriesTimers: \
+               series_timer_rows, build_series_timer_dto and fill_images)",
+        date: "2026-11-14",
+        divergences: &[
+            "A series timer whose name is blank runs no lookup by name: it takes no Thumb or \
+         Backdrop from a library series, and its Primary only from an airing of its listings \
+         series. Upstream's FillImages then filters on nothing and takes the library's first \
+         series' Thumb, Backdrop and Primary. Fix path: gl-1790, an owner decision.",
+            "The 400 and 404 bodies are Ferrofin's error shape, not upstream's. Fix path: \
+         gl-666.",
+        ],
+        refs: &["images"],
     },
     Verified {
         method: "post",

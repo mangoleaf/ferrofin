@@ -1,20 +1,32 @@
 //! `GET` and `DELETE /LiveTv/Timers/{timerId}` over the real composition root
-//! and a real session WebSocket (gl-843).
+//! and a real session WebSocket (gl-843), and the timer and series-timer DTOs
+//! as every read builds them (gl-1745, gl-853).
 //!
 //! Upstream's `GetTimer` returns `LiveTvManager.GetTimer` unchecked, so an id
 //! it does not list answers `200 null`; `CancelTimer` throws
 //! `ResourceNotFoundException` for one, a `404`, and only a cancel that changed
 //! the timer's status raises `TimerCancelled`.
+//!
+//! `LiveTvDtoService.GetTimerInfoDto` adds the guide programme
+//! (`ProgramInfo`) and the channel's name and logo tag on each read, and
+//! `FillImages` gives series timers, the new-timer defaults and a series
+//! timer's programmes the artwork of the library series of that name.
 
 use std::path::PathBuf;
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode, header};
 use ferrofin_db::Database;
+use ferrofin_db::entities::base_items::BaseItemEntity;
+use ferrofin_db::store::guid_to_db;
+use ferrofin_model::entities::ImageType;
 use ferrofin_server::config::Config;
 use ferrofin_server::state::{WiredApp, build_app_state};
+use ferrofin_traits::options::ItemImageInfo;
+use ferrofin_traits::persistence::ItemPersistenceService as _;
 use serde_json::{Value, json};
 use tower::ServiceExt as _;
+use uuid::Uuid;
 
 const ADMIN_USER: &str = "admin";
 const UNKNOWN: &str = "00000000000000000000000000000001";
@@ -25,9 +37,9 @@ type ClientSocket =
 
 /// A served server whose administrator holds a socket.
 struct Fixture {
-    _wired: WiredApp,
+    wired: WiredApp,
     db: Database,
-    _temp: tempfile::TempDir,
+    temp: tempfile::TempDir,
     router: axum::Router,
     token: String,
     socket: ClientSocket,
@@ -80,9 +92,9 @@ async fn fixture() -> Fixture {
             .await
             .expect("socket upgrades");
     Fixture {
-        _wired: wired,
+        wired,
         db,
-        _temp: temp,
+        temp,
         router,
         token,
         socket,
@@ -271,4 +283,282 @@ async fn an_unknown_timer_is_200_null_to_get_and_404_to_delete_with_no_push() {
     );
     let (status, body) = f.call("DELETE", &uri, None).await;
     assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+}
+
+/// How long a lineup may take to appear after its tuner is saved.
+const LINEUP_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
+/// The six fields `FillImages` writes.
+const PARENT_ART: [&str; 6] = [
+    "ParentThumbItemId",
+    "ParentThumbImageTag",
+    "ParentBackdropItemId",
+    "ParentBackdropImageTags",
+    "ParentPrimaryImageItemId",
+    "ParentPrimaryImageTag",
+];
+
+impl Fixture {
+    /// `GET uri` as the administrator, as JSON.
+    async fn get(&self, uri: &str) -> Value {
+        let (status, body) = self.call("GET", uri, None).await;
+        assert_eq!(status, StatusCode::OK, "{uri}: {body}");
+        serde_json::from_str(&body).expect("json")
+    }
+
+    /// Configures a playlist whose channel `one` has a logo and a guide airing
+    /// `one show` on it tomorrow (an episode, with an icon), refreshes the
+    /// guide, and returns the channel's and the programme's ids.
+    async fn guide(&self) -> (String, String) {
+        let day = (chrono::Utc::now() + chrono::Duration::days(1))
+            .format("%Y%m%d")
+            .to_string();
+        let playlist = self.temp.path().join("playlist.m3u");
+        let guide = self.temp.path().join("guide.xml");
+        std::fs::write(
+            &playlist,
+            "#EXTM3U\n#EXTINF:-1 tvg-id=\"one\" tvg-chno=\"1\" \
+             tvg-logo=\"http://art.invalid/logo.png\",one\nhttp://tuner.invalid/one\n",
+        )
+        .expect("playlist");
+        std::fs::write(
+            &guide,
+            format!(
+                "<tv><channel id=\"one\"><display-name>one</display-name></channel>\
+                 <programme start=\"{day}060000 +0000\" stop=\"{day}070000 +0000\" \
+                 channel=\"one\"><title>one show</title>\
+                 <episode-num system=\"xmltv_ns\">0.1.</episode-num>\
+                 <icon src=\"http://art.invalid/show.png\"/></programme></tv>"
+            ),
+        )
+        .expect("guide");
+        let (status, body) = self
+            .call(
+                "POST",
+                "/LiveTv/TunerHosts",
+                Some(json!({ "Type": "m3u", "Url": playlist.to_string_lossy() })),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let (status, body) = self
+            .call(
+                "POST",
+                "/LiveTv/ListingProviders",
+                Some(json!({
+                    "Type": "xmltv",
+                    "Path": guide.to_string_lossy(),
+                    "EnableAllTuners": true,
+                })),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        // Each save queued a refresh, and a later one supersedes an earlier
+        // one's write: once the lineup is listed they have all started, so the
+        // refresh below is the newest and has finished when it returns.
+        let deadline = std::time::Instant::now() + LINEUP_DEADLINE;
+        while self.get("/LiveTv/Channels").await["Items"]
+            .as_array()
+            .is_none_or(Vec::is_empty)
+        {
+            assert!(std::time::Instant::now() < deadline, "no lineup appeared");
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        self.wired
+            .state
+            .live_tv
+            .as_ref()
+            .expect("live tv is wired")
+            .refresh_guide()
+            .await
+            .expect("guide refresh");
+        let id = |page: Value| page["Items"][0]["Id"].as_str().expect("an id").to_owned();
+        (
+            id(self.get("/LiveTv/Channels").await),
+            id(self.get("/LiveTv/Programs").await),
+        )
+    }
+
+    /// Stores a library series named `name` with a Thumb, a Backdrop and a
+    /// Primary image, and returns its id.
+    async fn library_series(&self, name: &str) -> String {
+        let id = Uuid::new_v4();
+        let persistence = ferrofin_core::FerrofinItemPersistenceService::new(self.db.clone());
+        persistence
+            .save_items(&[BaseItemEntity {
+                id: guid_to_db(id),
+                type_: "MediaBrowser.Controller.Entities.TV.Series".into(),
+                name: Some(name.into()),
+                sort_name: Some(name.into()),
+                clean_name: Some(name.into()),
+                is_folder: true,
+                ..Default::default()
+            }])
+            .await
+            .expect("save the series");
+        // A day apart, so each image has a tag of its own.
+        let images: Vec<ItemImageInfo> =
+            [ImageType::Thumb, ImageType::Backdrop, ImageType::Primary]
+                .into_iter()
+                .zip(1..)
+                .map(|(image_type, day)| ItemImageInfo {
+                    path: format!("http://art.invalid/series-{day}.png"),
+                    image_type,
+                    date_modified: chrono::DateTime::from_timestamp(
+                        1_767_225_600 + day * 86_400,
+                        0,
+                    )
+                    .expect("a date"),
+                    width: 2,
+                    height: 2,
+                    ..ItemImageInfo::default()
+                })
+                .collect();
+        persistence
+            .save_item_images(id, &images)
+            .await
+            .expect("store the images");
+        id.simple().to_string()
+    }
+}
+
+/// Each read builds the timer from the guide as `GetTimerInfoDto` does: the
+/// programme as `ProgramInfo` (with the timer's id and status while it is
+/// live), and the channel's current name and logo tag (gl-1745).
+#[tokio::test]
+async fn a_timer_carries_its_programme_and_channel_as_they_are_now() {
+    let f = fixture().await;
+    let (channel, program) = f.guide().await;
+    let (status, body) = f
+        .call(
+            "POST",
+            "/LiveTv/Timers",
+            Some(json!({ "ProgramId": program, "ChannelId": channel })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+    let listed = f.get("/LiveTv/Timers").await["Items"][0].clone();
+    let id = listed["Id"].as_str().expect("the timer").to_owned();
+    let logo = f.get(&format!("/LiveTv/Channels/{channel}")).await["ImageTags"]["Primary"].clone();
+    assert!(logo.is_string(), "the channel has a logo");
+
+    let by_id = f.get(&format!("/LiveTv/Timers/{id}")).await;
+    for timer in [&listed, &by_id] {
+        let info = &timer["ProgramInfo"];
+        assert_eq!(info["Id"], program.as_str(), "{timer}");
+        assert_eq!(info["Name"], "one show", "{timer}");
+        assert_eq!(info["Type"], "Program", "{timer}");
+        assert_eq!(info["TimerId"], id.as_str(), "{timer}");
+        assert_eq!(info["Status"], "New", "{timer}");
+        assert!(info.get("SeriesTimerId").is_none(), "{timer}");
+        for key in PARENT_ART {
+            assert!(
+                info.get(key).is_none(),
+                "no series timer, no artwork: {timer}"
+            );
+        }
+        assert_eq!(timer["ChannelName"], "one", "{timer}");
+        assert_eq!(timer["ChannelPrimaryImageTag"], logo, "{timer}");
+    }
+
+    // The channel's name is read with the timer, not copied into it.
+    sqlx::query(r#"UPDATE "FerrofinLiveTvChannels" SET "Name" = 'renamed'"#)
+        .execute(f.db.pool())
+        .await
+        .expect("rename the channel");
+    assert_eq!(
+        f.get(&format!("/LiveTv/Timers/{id}")).await["ChannelName"],
+        "renamed"
+    );
+}
+
+/// `FillImages`: the defaults for a programme, a series timer and the
+/// timers it schedules carry the library series' Thumb and Backdrop, and a
+/// Primary: the series' for the first two, the guide programme's for a
+/// timer's `ProgramInfo` (gl-853). A cancelled timer's programme keeps its
+/// series timer but loses the timer's id and status.
+#[tokio::test]
+async fn series_timers_and_their_programmes_carry_the_library_series_artwork() {
+    let f = fixture().await;
+    let (_, program) = f.guide().await;
+    let series = f.library_series("one show").await;
+    let art = f.get(&format!("/Items/{series}")).await;
+    let thumb = art["ImageTags"]["Thumb"].clone();
+    let backdrop = art["BackdropImageTags"].clone();
+    let primary = art["ImageTags"]["Primary"].clone();
+    assert!(thumb.is_string() && primary.is_string() && thumb != primary);
+    let program_primary =
+        f.get(&format!("/LiveTv/Programs/{program}")).await["ImageTags"]["Primary"].clone();
+    assert!(program_primary.is_string(), "the programme has its icon");
+    let series_art = |dto: &Value| {
+        assert_eq!(dto["ParentThumbItemId"], series.as_str(), "{dto}");
+        assert_eq!(dto["ParentThumbImageTag"], thumb, "{dto}");
+        assert_eq!(dto["ParentBackdropItemId"], series.as_str(), "{dto}");
+        assert_eq!(dto["ParentBackdropImageTags"], backdrop, "{dto}");
+    };
+
+    let defaults = f
+        .get(&format!("/LiveTv/Timers/Defaults?programId={program}"))
+        .await;
+    series_art(&defaults);
+    assert_eq!(defaults["ParentPrimaryImageItemId"], series.as_str());
+    assert_eq!(defaults["ParentPrimaryImageTag"], primary);
+
+    // A client posts the body back with values only the read may set.
+    let mut posted = defaults;
+    posted["ChannelPrimaryImageTag"] = json!("stale");
+    posted["ImageTags"] = json!({ "Primary": "stale" });
+    let (status, body) = f.call("POST", "/LiveTv/SeriesTimers", Some(posted)).await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+    let listed = f.get("/LiveTv/SeriesTimers").await["Items"][0].clone();
+    let series_timer = listed["Id"].as_str().expect("the series timer").to_owned();
+    // `GetSeriesTimer` matches the listed ids ignoring case.
+    let upper = series_timer.to_ascii_uppercase();
+    let by_id = f.get(&format!("/LiveTv/SeriesTimers/{upper}")).await;
+    for dto in [&listed, &by_id] {
+        series_art(dto);
+        assert_eq!(dto["ParentPrimaryImageItemId"], series.as_str(), "{dto}");
+        assert_eq!(dto["ParentPrimaryImageTag"], primary, "{dto}");
+        assert_eq!(dto["ChannelName"], "one", "{dto}");
+        assert!(dto.get("ChannelPrimaryImageTag").is_none(), "{dto}");
+        assert_eq!(dto["ImageTags"], json!({}), "{dto}");
+    }
+
+    let timer = f
+        .get(&format!("/LiveTv/Timers?seriesTimerId={series_timer}"))
+        .await["Items"][0]
+        .clone();
+    let id = timer["Id"].as_str().expect("a scheduled airing").to_owned();
+    let info = &timer["ProgramInfo"];
+    series_art(info);
+    assert_eq!(
+        info["ParentPrimaryImageItemId"],
+        program.as_str(),
+        "{timer}"
+    );
+    assert_eq!(info["ParentPrimaryImageTag"], program_primary, "{timer}");
+    assert_eq!(info["SeriesTimerId"], series_timer.as_str(), "{timer}");
+    assert_eq!(info["TimerId"], id.as_str(), "{timer}");
+
+    let (status, body) = f
+        .call("DELETE", &format!("/LiveTv/Timers/{id}"), None)
+        .await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+    let cancelled = f.get(&format!("/LiveTv/Timers/{id}")).await;
+    let info = &cancelled["ProgramInfo"];
+    assert_eq!(cancelled["Status"], "Cancelled", "{cancelled}");
+    assert_eq!(info["SeriesTimerId"], series_timer.as_str(), "{cancelled}");
+    assert!(info.get("TimerId").is_none(), "{cancelled}");
+    assert!(info.get("Status").is_none(), "{cancelled}");
+}
+
+/// Without a programme the defaults have no name, and upstream's `FillImages`
+/// then matches any library series. Whether to port that waits on the owner
+/// (gl-1790), so until then the defaults carry no artwork.
+#[tokio::test]
+async fn the_defaults_without_a_programme_carry_no_artwork() {
+    let f = fixture().await;
+    f.library_series("one show").await;
+    let defaults = f.get("/LiveTv/Timers/Defaults").await;
+    for key in PARENT_ART {
+        assert!(defaults.get(key).is_none(), "{defaults}");
+    }
 }
