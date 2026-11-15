@@ -1820,7 +1820,7 @@ impl FerrofinPeopleRepository {
     /// The pre-paging shape materialized the ENTIRE deduped table through sqlx
     /// on every request (7k rows for a `limit=100` page) and sliced in Rust —
     /// 28 ms of SQL+decode per request that collapsed `/Persons` to a 29.8 s
-    /// p50 at its calibrated 608 req/s in the benchmark (P0.5 family).
+    /// p50 at its calibrated 608 req/s in the benchmark.
     ///
     /// Pushing the page into SQL left a second cost behind: `COUNT(*) OVER()`
     /// made SQLite re-materialize every deduped row through a second aggregate

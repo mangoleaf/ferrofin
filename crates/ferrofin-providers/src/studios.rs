@@ -196,8 +196,8 @@ impl StudiosClient {
     /// without a restart. A request that FAILED (a transport error, a `5xx`)
     /// is counted as a provider failure by the limiter and not cached, so the
     /// next studio asks again and the scan does not record every studio as
-    /// "the repository has nothing for it" (owner decision D1 of
-    /// `PLAN_SCAN_CHANGE_DETECTION`: a failure is retried, a miss is not).
+    /// "the repository has nothing for it" (owner decision D1 of the scan's
+    /// change-detection design: a failure is retried, a miss is not).
     async fn manifest(&self, repo_url: &str) -> Arc<HashMap<String, String>> {
         if let Ok(guard) = self.manifest.lock()
             && let Some(cached) = guard.as_ref()
@@ -445,8 +445,8 @@ mod tests {
     /// swallowed to an empty manifest and counted as a provider failure, but
     /// NOT cached: the next lookup asks again, so a scan never records every
     /// studio as "the repository has nothing for it" on a network blip (owner
-    /// decision D1 of `PLAN_SCAN_CHANGE_DETECTION`: a failed lookup is
-    /// retried, a miss is not). A `404` is an answer, and is cached.
+    /// decision D1 of the scan's change-detection design: a failed lookup
+    /// is retried, a miss is not). A `404` is an answer, and is cached.
     #[tokio::test]
     async fn a_failed_manifest_fetch_is_counted_and_not_cached_a_404_is() {
         use crate::rate_limit::count_request_failures;

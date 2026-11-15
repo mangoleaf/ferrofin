@@ -984,7 +984,7 @@ fn codec_specific_quality_args(
             // libx264 (and any other software encoder reaching here) accepts
             // the level as written. libx265 takes its level through
             // `-x265-params` only. The remaining per-vendor hardware remaps are
-            // the work items of the hardware-transcoding roadmap phases 4-7.
+            // open work items.
             let _ = write!(param, " -level {level}");
         }
     }

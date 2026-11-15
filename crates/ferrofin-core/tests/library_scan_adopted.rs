@@ -1,5 +1,4 @@
-//! A library adopted from Jellyfin, scanned by Ferrofin
-//! (`PLAN_SCAN_CHANGE_DETECTION` 6A).
+//! A library adopted from Jellyfin, scanned by Ferrofin.
 //!
 //! Jellyfin stores a library item's `TopParentId` (and a top-level item's
 //! `ParentId`) as the library's *physical* folder — the `Folder` row at the

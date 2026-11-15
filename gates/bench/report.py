@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Render a run (or several) as the full tables (docs/BENCHMARKS.md), or as an HTML page for comparing
-(PLAN_BENCHMARK_V3 §7). stdlib only. The README's Results section and its graphs are gates/publish.py's,
+runs. stdlib only. The README's Results section and its graphs are gates/publish.py's,
 drawn from the result.json this writes.
 
     report.py RUN_DIR [RUN_DIR ...]          markdown on stdout (the full tables, docs/BENCHMARKS.md style)

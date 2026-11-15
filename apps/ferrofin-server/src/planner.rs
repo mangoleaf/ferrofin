@@ -8621,7 +8621,7 @@ mod tests {
     #[tokio::test]
     async fn the_i915_workaround_reaches_the_command_line_at_last() {
         use ferrofin_mediaencoding::encoding_helper::hw::Platform;
-        // Ported in phase 4c but unreachable until QSV was wired: the hang
+        // Ported earlier but unreachable until QSV was wired: the hang
         // needs an Intel decode feeding an OpenCL tonemap on kernel 5.18-6.1.3.
         let args = qsv_plan(Platform::Linux, true).await;
         assert!(args.contains("-async_depth 1"), "{args}");

@@ -1,5 +1,4 @@
-//! Per-item change detection, end to end through a real scan
-//! (`PLAN_SCAN_CHANGE_DETECTION` Phase 4): the port of
+//! Per-item change detection, end to end through a real scan: the port of
 //! `MetadataService.RefreshMetadata`'s provider selection and save rule.
 //!
 //! Over the real scanner, repositories and SQLite schema, with an ffprobe
@@ -15,18 +14,18 @@
 //! - a provider that fails leaves the item unstamped (retried next scan), one
 //!   that finds nothing stamps it (owner decision D1).
 //!
-//! And the Phase 3L lock rules on the same path: an unlocked edit survives a
+//! And the lock rules on the same path: an unlocked edit survives a
 //! quiet rescan, a provider pass replaces only the fields outside the item's
 //! `LockedFields`, and `LockData` refuses the remote providers while a new
 //! local poster is still discovered.
 //!
-//! And the Phase 5 refresh modes a folder refresh scans with (the dashboard's
+//! And the refresh modes a folder refresh scans with (the dashboard's
 //! three choices, `ValidationOnly`, `None`): which providers run, how their
 //! answer merges onto a stored row carrying an edited and an empty field, and
 //! what is stamped and saved — and that a locked item is left alone in every
 //! one of them.
 //!
-//! And Phase 5b: a file item's `POST /Items/{id}/Refresh` is the scan of its
+//! And a file item's `POST /Items/{id}/Refresh` is the scan of its
 //! own path — the same decision, merge, locks, probe, NFO and providers,
 //! touching nothing else of its library — and "Identify → Apply" is that
 //! scan with the chosen result pinning the lookup and the NFO skipped.
@@ -1263,7 +1262,7 @@ async fn rating_and_overview(fx: &Fixture, path: &Path) -> (Option<f64>, Option<
         .expect("row")
 }
 
-/// Phase 3L: an edit made without `LockData` survives a rescan that runs no
+/// Lock rules: an edit made without `LockData` survives a rescan that runs no
 /// provider (the item is unchanged). A rescan whose providers run (the file
 /// changed) replaces the unlocked fields with the provider's values, as
 /// upstream's Default merge does, but leaves a field in the item's
@@ -1317,7 +1316,7 @@ async fn an_edit_survives_a_quiet_rescan_and_a_provider_pass_only_where_locked()
     );
 }
 
-/// Phase 3L: `LockData` refuses every remote provider — even when the file
+/// Lock rules: `LockData` refuses every remote provider — even when the file
 /// changed, which would run them all for an unlocked item — but the local
 /// image validation still runs, so a new `poster.jpg` is discovered
 /// (`ProviderManager.CanRefreshImages` enables every `ILocalImageProvider`
@@ -1360,7 +1359,7 @@ async fn a_locked_item_asks_no_provider_but_discovers_a_new_local_poster() {
     assert!(found[0].ends_with("poster.jpg"));
 }
 
-/// Phase 3L: a `Cast` field lock keeps the stored credits through a
+/// Lock rules: a `Cast` field lock keeps the stored credits through a
 /// provider pass that returns a different cast (upstream leaves
 /// `metadata.People` null under the lock, and `SaveItemAsync` writes people
 /// only when non-null). Unlocked, the next pass takes the provider's cast.
@@ -1440,7 +1439,7 @@ async fn a_cast_lock_keeps_the_stored_credits_through_a_provider_pass() {
     );
 }
 
-/// Phase 3L: an NFO's `<lockdata>` and `<lockedfields>` (the parser reads
+/// Lock rules: an NFO's `<lockdata>` and `<lockedfields>` (the parser reads
 /// both, as `BaseNfoParser` does). `<lockdata>true` makes the pass
 /// `isLocalLocked` — no remote provider runs for it — and the merge's
 /// metadata-settings half locks the item; `<lockedfields>` are unioned into

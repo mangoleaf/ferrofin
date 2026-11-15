@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Seed a fresh Jellyfin 10.11.8 over its own API so the resulting config dir is the
-benchmark test data (PLAN_BENCHMARK_V3 §3.2). Run by build.sh; stdlib only.
+benchmark test data (gates/bench/README.md, "Test data"). Run by build.sh; stdlib only.
 
     seed.py URL OUT_JSON
 

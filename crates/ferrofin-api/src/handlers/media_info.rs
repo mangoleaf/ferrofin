@@ -463,7 +463,7 @@ async fn playback_info(
         .await?;
         // Upstream sorts on the client's own limit, not the policy-capped one.
         sort_media_sources(&mut media_sources, request.max_streaming_bitrate, item_id);
-        // Record the decision for the metrics track (Track A). Clients play the
+        // Record the decision for the playback-decision metrics. Clients play the
         // first/default source; multi-version items are the rare exception, so
         // one row per play session (not per source) keeps the data readable.
         let first_decision = media_sources.first().and_then(|first| {

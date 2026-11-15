@@ -4,7 +4,7 @@
 //! A `ferrofin:plugin@0.2.0` component (the shared inline-WAT fixture from
 //! `ferrofin-wasm` — no committed `.wasm`, no wasm toolchain needed) is
 //! dropped into `{data_dir}/plugins/` before boot. The test then proves the
-//! plan's E1 claim — "to the API a WASM plugin is indistinguishable from a
+//! claim that "to the API a WASM plugin is indistinguishable from a
 //! compiled-in one":
 //!
 //! 1. `GET  /Plugins` — the WASM plugin is listed with its guest-reported

@@ -55,7 +55,7 @@ use crate::runtime::{EPOCH_TICK, InstanceSpec, RuntimeHandle};
 
 /// The domain events forwarded to every enabled plugin's `on-event` export —
 /// exactly the set `FerrofinEventManager` publishes today. Extend this list
-/// as new publish sites land (plan §3).
+/// as new publish sites land.
 pub const FORWARDED_EVENTS: [&str; 9] = [
     "LibraryChanged",
     "RefreshProgress",
@@ -80,7 +80,7 @@ fn bus_event(event_name: &'static str) -> &'static str {
     }
 }
 
-/// Resolved host settings, with the plan's defaults applied.
+/// Resolved host settings, with the defaults applied.
 ///
 /// All three are `FERROFIN_*` bootstrap knobs (settings-over-constants,
 /// decided 2026-08-06/07); `None`s from the config layer land on the

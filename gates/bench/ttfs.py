@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Time to first playable segment (PLAN_BENCHMARK_V3 D2). stdlib only.
+"""Time to first playable segment ("HLS first segment" in gates/bench/README.md, "Definitions"). stdlib only.
 
     ttfs.py URL IDS_JSON OUT_JSON [REPS=5]
 

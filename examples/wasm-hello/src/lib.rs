@@ -258,7 +258,7 @@ fn run_greet() -> Result<(), String> {
     Ok(())
 }
 
-/// The E2 capability demo: read the library (query-items), persist a result
+/// The capability demo: read the library (query-items), persist a result
 /// (write-media-segments), and report out (http-fetch).
 fn run_analyze() -> Result<(), String> {
     use ferrofin::plugin::types::{HttpRequest, ItemQuery, MediaSegment};

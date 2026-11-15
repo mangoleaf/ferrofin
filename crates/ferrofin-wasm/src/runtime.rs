@@ -324,7 +324,7 @@ pub struct InstanceSpec {
     pub http: Arc<crate::capabilities::GuestHttp>,
     /// Whether this plugin may reach private/loopback HTTP destinations.
     pub private_http_allowed: bool,
-    /// The manager handles behind the E2 capabilities (installed post-load).
+    /// The manager handles behind the host capabilities (installed post-load).
     pub collaborators: Arc<std::sync::OnceLock<crate::capabilities::Collaborators>>,
     /// Where the plugin's key/value state persists (`None` until the id is
     /// known / in validation stores).

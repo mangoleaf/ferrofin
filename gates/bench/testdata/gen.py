@@ -13,7 +13,7 @@ Host requirements: ffmpeg/ffprobe (libx264, libx265) and Pillow (`python3 -c "im
 for the image pool. Pillow's default bitmap font makes image bytes host-dependent, which
 only changes blurhash values, never structure.
 
-Cases (see PLAN_BENCHMARK_V3 §3):
+Cases (see "Test data" in gates/bench/README.md):
   C1  multi-version movies      "Title (Y) - 1080p.mkv" + "Title (Y) - 2160p.mkv"
   C2  HDR10 4K 5.1 movies       hevc_2160p_hdr10_51 template
   C3  multi-track movies        2 audio languages + 2 SRT + chapters
@@ -32,7 +32,7 @@ import sys
 from pathlib import Path
 from xml.sax.saxutils import escape
 
-# ── scale-1 counts (D5) ──────────────────────────────────────────────────────
+# ── scale-1 counts ───────────────────────────────────────────────────────────
 MOVIES = 3000
 SERIES = 250
 ARTISTS = 300

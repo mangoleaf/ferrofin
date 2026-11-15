@@ -1,5 +1,5 @@
-//! Where the scanner's row reshaping (PLAN_ITEM_FILE_DELETION: folds,
-//! rip/set exclusions, released versions) meets user-data retention
+//! Where the scanner's row reshaping (folds, rip/set exclusions, released
+//! versions) meets user-data retention
 //! (`docs/reviews/user-data-retention.md`): every path that removes a row
 //! keeps its users' history exactly once.
 //!

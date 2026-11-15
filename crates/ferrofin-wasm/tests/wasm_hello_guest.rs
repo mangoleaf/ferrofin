@@ -141,7 +141,7 @@ async fn real_guest_loads_runs_and_reports_rss() {
         .expect("the greet task must succeed");
     let rss_after_run = rss_kib();
 
-    // ── E2: the analyze task drives all three capabilities ─────────────
+    // ── The analyze task drives all three capabilities ─────────────────
     let segment_store = Arc::new(RecordingSegments::default());
     host.set_runtime_collaborators(Collaborators {
         lyrics: std::sync::Arc::new(common::StubLyrics::default()),
@@ -196,7 +196,7 @@ async fn real_guest_loads_runs_and_reports_rss() {
     assert!(raw.starts_with("POST /hook"), "report posted: {raw}");
     assert!(raw.contains("analyzed 1 movie(s)"), "report body: {raw}");
 
-    // ── E3: the metadata-lookup export through the scanner's seam ──────
+    // ── The metadata-lookup export through the scanner's seam ──────────
     let providers = host.metadata_providers();
     assert_eq!(providers.len(), 1);
     let offer = providers[0]
@@ -249,7 +249,7 @@ async fn real_guest_loads_runs_and_reports_rss() {
     .unwrap();
     let rss_after_second = rss_kib();
 
-    // The E1 deliverable: measured, printed, compared against the limit.
+    // The RSS measurement: measured, printed, compared against the limit.
     println!("== WASM plugin RSS measurement (validates FERROFIN_WASM_MEMORY_LIMIT_MB) ==");
     println!(".wasm artifact size:            {wasm_size_kib} KiB");
     println!(

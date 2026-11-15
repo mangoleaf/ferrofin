@@ -5968,8 +5968,8 @@ impl LibraryScanner {
     /// subtree take the scan's options, and its pruning.
     ///
     /// One case is narrower than upstream, as the owner requires a changed
-    /// path never to rescan its library (`PLAN_SCAN_CHANGE_DETECTION` Phase
-    /// 6W): a path with no stored item above it short of the library.
+    /// path never to rescan its library: a path with no stored item above
+    /// it short of the library.
     /// Upstream's nearest item there is the library's own folder, whose
     /// refresh validates the whole library; here the root is the nearest
     /// folder at or above the path that is still on disk (a new movie's
@@ -14212,7 +14212,7 @@ impl LibraryScanner {
             path: entity.path.clone(),
             provider_ids: Vec::new(),
         };
-        // Artwork is a NAMED-provider surface (the plan scopes it to plugins
+        // Artwork is a NAMED-provider surface (it is scoped to plugins
         // that declared provider-info — everything else always returns `[]`,
         // so asking would be a wasted guest round-trip per item per scan),
         // under the same admin control as the metadata pass: the library's
@@ -29002,7 +29002,7 @@ mod tests {
         );
     }
 
-    /// Phase 3L: a person's biography fetch is a remote provider, so it
+    /// Lock rules: a person's biography fetch is a remote provider, so it
     /// writes nothing onto a locked `Person`, and a field lock keeps the
     /// stored overview or birthplace.
     #[tokio::test(flavor = "multi_thread")]
@@ -30786,7 +30786,7 @@ mod tests {
         }
     }
 
-    /// The music post-pass under Phase 3L's lock rules, over one album with
+    /// The music post-pass under the lock rules, over one album with
     /// one tagged track and its artist: `(album, artist, TheAudioDb
     /// requests, album MusicBrainz id stored, artist MusicBrainz id stored)`
     /// after the pass.
@@ -30829,7 +30829,7 @@ mod tests {
         )
     }
 
-    /// Phase 3L, music post-pass: a locked album or artist runs no remote
+    /// Lock rules, music post-pass: a locked album or artist runs no remote
     /// source (MusicBrainz, AudioDb, fanart) and takes no ids from its
     /// tracks (`AlbumMetadataService.UpdateMetadataFromChildren` returns on
     /// `IsLocked` before `SetAlbumFromSongs`); an unlocked one with
@@ -33579,7 +33579,7 @@ mod tests {
         assert!(!refresh.context_only(), "the defaults refresh the context");
     }
 
-    /// Phase 3L: a rescan whose providers run (Default mode's
+    /// Lock rules: a rescan whose providers run (Default mode's
     /// replace-with-fallback merge) replaces the unlocked fields and leaves
     /// the locked ones as stored (`MergeData(temp, metadata,
     /// item.LockedFields, shouldReplace, true)`).

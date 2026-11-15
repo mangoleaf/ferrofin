@@ -181,7 +181,7 @@ fn trailer_urls(row: &BaseItemEntity) -> Vec<String> {
 }
 
 /// A no-NFO movie keeps everything TMDB supplied when a later scan runs
-/// without TMDB (an outage, an unticked fetcher, or — from Phase 4 — a scan
+/// without TMDB (an outage, an unticked fetcher, or a scan
 /// that has no reason to ask again). When TMDB does answer again, its values
 /// win: the Default refresh replaces, with the stored row as the fallback.
 #[tokio::test]

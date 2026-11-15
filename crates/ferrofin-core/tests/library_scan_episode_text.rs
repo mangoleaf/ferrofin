@@ -84,7 +84,7 @@ fn spawn_tmdb_with(series_details: &'static str) -> (String, Arc<AtomicUsize>, A
             let n = s.read(&mut buf).unwrap_or(0);
             let req = String::from_utf8_lossy(&buf[..n]).into_owned();
             // Image-list requests share the episode prefix but are not metadata
-            // requests. L14 acquires artwork independently of season text.
+            // requests. Artwork is acquired independently of season text.
             let (status, payload) = if req.contains("/images") {
                 ("200 OK", r#"{"posters":[],"backdrops":[],"stills":[]}"#)
             } else if req.contains("/episode/") {

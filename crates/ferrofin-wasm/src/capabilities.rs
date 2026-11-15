@@ -1,4 +1,4 @@
-//! The E2 capability implementations behind the `ferrofin:plugin/host`
+//! The capability implementations behind the `ferrofin:plugin/host`
 //! interface: host-mediated HTTP, read-only item queries, and media-segment
 //! writes. Each is called synchronously from a plugin's runtime thread (a
 //! plain OS thread — safe to block); async manager calls go through the
@@ -827,7 +827,7 @@ fn parse_segment_type(name: &str) -> Result<MediaSegmentType, String> {
     }
 }
 
-/// Analysis caps — hardcoded abuse guards (PLAN_MEDIA_ANALYSIS_CAPABILITY):
+/// Analysis caps — hardcoded abuse guards on the media-analysis host calls:
 /// longest audio window per call, in seconds.
 const AUDIO_WINDOW_MAX_SECS: f64 = 60.0;
 /// Most frames per `extract-frames` call.

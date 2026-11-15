@@ -1,5 +1,5 @@
-//! Stacked parts and local alternate versions as the movie walk plans them
-//! (PLAN_ITEM_FILE_DELETION step 12 S4): `MovieResolver.ResolveVideos` /
+//! Stacked parts and local alternate versions as the movie walk plans them:
+//! `MovieResolver.ResolveVideos` /
 //! `FindMovie` make one item of a stack or a version group
 //! (`MovieResolver.cs:287-317,472-494`), the primary carries the others'
 //! paths (`AdditionalParts`, `LocalAlternateVersions`), a part is a `Video`
@@ -1046,7 +1046,7 @@ async fn an_adopted_alternate_takes_its_primarys_rating_at_boot() {
 
 /// An older Ferrofin scan stored a stack's second part as a `Movie` of its
 /// own: the scan moves it to the `Video` id a part derives, owned by the
-/// primary, with its user data (S2's re-key). When the stack breaks — the
+/// primary, with its user data (the re-key). When the stack breaks — the
 /// primary's file goes — the part is a movie again and moves back, its user
 /// data still with it, while the old primary is pruned.
 #[tokio::test]
@@ -1424,7 +1424,7 @@ async fn a_stub_headed_alternates_other_file_stands_alone() {
     assert_eq!(f.rows_at("Movie/Movie - 1080p cd1.disc").await, 0);
 }
 
-/// Step 12 S6. A saved primary gives its local versions its metadata
+/// A saved primary gives its local versions its metadata
 /// (`Video.UpdateToRepositoryAsync`, `Video.cs:704-726`: overview, year,
 /// premiere date, community and official rating, genres, provider ids,
 /// images) and its stacked parts its title metadata (`copyTitleMetadata`,
@@ -1775,7 +1775,7 @@ async fn the_scan_scores_the_custom_rating_first_and_clears_a_lost_one() {
     assert_eq!(item_writes(&f.db).await, 0);
 }
 
-// ── TV episode stacks and versions (step 12 S8) ──────────────────────────
+// ── TV episode stacks and versions ───────────────────────────────────────
 //
 // A tvshows library resolves a season's (or a series folder's) files through
 // `ResolveVideos<Episode>` (`MovieResolver.cs:231-234,287-317`): a stack is one

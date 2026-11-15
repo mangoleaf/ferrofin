@@ -62,7 +62,7 @@ sha2.workspace = true         # the `ETag` of a File Transformation-rewritten /w
 tracing.workspace = true
 tracing-subscriber.workspace = true
 tracing-appender.workspace = true
-# OTLP trace export (off unless OTEL_EXPORTER_OTLP_ENDPOINT is set); see PLAN_TRACES.
+# OTLP trace export (off unless OTEL_EXPORTER_OTLP_ENDPOINT is set); see docs/conventions/TRACING.md.
 opentelemetry.workspace = true
 opentelemetry_sdk.workspace = true
 opentelemetry-otlp.workspace = true

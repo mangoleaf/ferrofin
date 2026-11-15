@@ -1,5 +1,5 @@
-//! The music pass and the closing passes under the per-item refresh decision
-//! (`PLAN_SCAN_CHANGE_DETECTION` Phase 6), end to end through a real scan.
+//! The music pass and the closing passes under the per-item refresh decision,
+//! end to end through a real scan.
 //!
 //! Over the real scanner, repositories and SQLite schema, with a MusicBrainz
 //! and TheAudioDB stand-in recording every request:

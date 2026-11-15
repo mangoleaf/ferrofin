@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# The comparison run (PLAN_BENCHMARK_V3 §5). For each server, alone on its cores:
+# The comparison run (gates/bench/README.md, "Running it"). For each server, alone on its cores:
 #   provision (fresh copy of the test data) → drain → counts → shape → cold start
 #   → unloaded / loaded / stress windows (+ memory sampler) → steady window → TTFS.
 # Every phase writes its file the moment it ends and fails on its own: a broken phase
@@ -34,7 +34,7 @@ source gates/lib.sh
 source gates/isolation.sh   # the readiness wait and the isolation steps, shared with gates/parity/run.sh (gl-754)
 gates_supervise "$CALLER" "$0" "$@"   # the run itself goes to a worker (gates/lib.sh, gl-968)
 
-# ── tunables (§2) ──────────────────────────────────────────────────────────
+# ── tunables ───────────────────────────────────────────────────────────────
 WARMUP_S=${WARMUP_S:-30}        # discarded seconds at the same rate before each window
 WINDOW_S=${WINDOW_S:-120}       # measured seconds per load level
 SETTLE_S=${SETTLE_S:-30}        # idle after scheduled tasks report idle, before any window

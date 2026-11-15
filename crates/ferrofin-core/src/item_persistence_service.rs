@@ -5828,7 +5828,7 @@ const LOCKED_FILLABLE_COLUMNS: &[&str] = &[
 /// [`RESOLVED_VIDEO_PATH_LISTS`] it carries that differs from the stored
 /// list (a stored list absent or `null`, or a resolved `null` or non-list,
 /// is `[]`; one the incoming blob does not carry is left as stored, until
-/// the planner writes both, PLAN_ITEM_FILE_DELETION step 12 S4) — and every other key kept
+/// the planner writes both) — and every other key kept
 /// with its value and place (`json_patch` re-renders the document
 /// minified). Left as stored when the incoming blob names no `VideoType`
 /// (it is no `Video`), nothing differs, or either is not valid JSON (the
@@ -11024,7 +11024,7 @@ mod tests {
                 .expect("row");
         assert_eq!(pvid, None, "full save still clears the merge link");
 
-        // ── The dates and `Data` (scan plan, Phase 3) ────────────────────
+        // ── The dates and `Data` ─────────────────────────────────────────
         type Dates = (
             Option<String>,
             Option<String>,

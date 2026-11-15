@@ -1,6 +1,5 @@
-//! The scan change-detection matrix, end to end over real HTTP
-//! (`PLAN_SCAN_CHANGE_DETECTION` Phase V, layer V1): a library scan
-//! reprocesses only what changed, unless the request asked for more.
+//! The scan change-detection matrix, end to end over real HTTP: a library
+//! scan reprocesses only what changed, unless the request asked for more.
 //!
 //! The test boots the real server — [`ferrofin_server::run`], the binary's
 //! own boot, with `/metrics` enabled — on a temp data dir, over a small
@@ -35,7 +34,7 @@
 //!   `ItemId` (streams, ancestors, item values, images, people links…)
 //!   belongs to, by path.
 //!
-//! The rows are the plan's table:
+//! One row per scenario:
 //!
 //! | # | Scenario | Expect |
 //! |---|---|---|

@@ -445,7 +445,7 @@ async fn saved_locales_change_provider_requests_without_restarting() {
     verify_by_name_metadata_languages(&api, &mut config, &requests).await;
     verify_server_metadata_country(&api, &mut config, &refresh).await;
     verify_by_name_metadata_countries(&api, &mut config).await;
-    // L12: Identify uses the same saved enable lists and exact-name order as
+    // Identify uses the same saved enable lists and exact-name order as
     // automatic refresh. Shared IMDb ids make the first provider's result win.
     for (fetchers, order, expected) in [
         (json!([]), json!([]), None),
@@ -506,7 +506,7 @@ async fn saved_locales_change_provider_requests_without_restarting() {
     )
     .await;
     verify_subtitle_destinations(&api, library, &mut options, id, &media, tmp.path()).await;
-    // L13: both physical and path-less seasons use the selected TVDB image
+    // Both physical and path-less seasons use the selected TVDB image
     // provider with all metadata downloaders disabled. Manual selection still
     // lists images before enabling automatic acquisition.
     let mut tv_options = json!({"PathInfos":[{"Path":tv}],
@@ -698,7 +698,7 @@ async fn verify_media_segment_library_options(api: &Api, item: &str) {
         let started = Instant::now();
         let served = api.get(&format!("/MediaSegments/{item}")).await;
         println!(
-            "L27 disabled={disabled}: segment GET {} ms",
+            "disabled={disabled}: segment GET {} ms",
             started.elapsed().as_secs_f64() * 1000.0
         );
         assert_eq!(
@@ -1115,7 +1115,7 @@ async fn upload_artwork(api: &Api, id: &str, kind: &str) {
     );
 }
 
-// Keep N04's next append slot stable across its independent configuration phases.
+// Keep the next backdrop append slot stable across the scenario's independent configuration phases.
 async fn prepare_backdrop_append(api: &Api, id: &str, index: usize) {
     let endpoint = format!("/Items/{id}/Images");
     let images = api.get(&endpoint).await;
@@ -1579,7 +1579,7 @@ async fn verify_artwork_destinations(
     );
     verify_extra_thumbs_duplication(api, library, options, id, media).await;
     // Keep the stored Primary out of the media folder first: replacing a file
-    // that cannot be deleted fails the upload (see S36), whereas this checks
+    // that cannot be deleted fails the upload, whereas this checks
     // that an unwritable *destination* falls back to the internal image.
     options["SaveLocalMetadata"] = json!(false);
     api.post(
@@ -1624,7 +1624,7 @@ async fn verify_artwork_destinations(
     .await;
 }
 
-// Verify the live option independently of L17's enabled-destination coverage.
+// Verify the live option independently of the enabled-destination coverage.
 #[allow(clippy::too_many_lines)]
 async fn verify_extra_thumbs_duplication(
     api: &Api,
@@ -2162,7 +2162,7 @@ async fn verify_subtitle_destinations(
     root: &std::path::Path,
 ) {
     const CONTENT: &[u8] = b"1\n00:00:00,000 --> 00:00:01,000\nSubtitle fixture\n";
-    // L20 removes its fixture sidecars; reconcile their persisted streams
+    // An earlier scenario removes its fixture sidecars; reconcile their persisted streams
     // before this independent destination scenario starts.
     await_subtitle_refresh(api, library, id).await;
     let initial = api.get(&format!("/Items/{id}?Fields=MediaStreams")).await;

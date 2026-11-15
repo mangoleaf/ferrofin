@@ -680,7 +680,7 @@ mod tests {
 
     /// `ItemRefreshController.cs:76-89`: `ForceSave` is any full refresh or
     /// any replace, `RemoveOldMetadata` is `replaceAllMetadata`. The three
-    /// dashboard choices (`refreshdialog.js:76-90`) map as the plan's table.
+    /// dashboard choices (`refreshdialog.js:76-90`) map as the cases below show.
     #[test]
     fn item_refresh_options_follow_the_controller_rule() {
         use MetadataRefreshMode::{Default, FullRefresh, None as NoRefresh};

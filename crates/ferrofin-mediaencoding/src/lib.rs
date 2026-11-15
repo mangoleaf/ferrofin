@@ -8,8 +8,8 @@
 //! Ported: the software transcode path, ffprobe parsing, subtitle/attachment
 //! extraction, and the hardware environment probe ([`encoding_helper::hw`]).
 //! The hardware argument builders themselves — device-init graphs, hardware
-//! decoder selection, tonemapping, and the per-vendor filter chains — are the
-//! named work items of the hardware-transcoding roadmap. DVD and Blu-ray
+//! decoder selection, tonemapping, and the per-vendor filter chains — are
+//! open work items. DVD and Blu-ray
 //! folder rips are read through their primary playlist ([`disc`]).
 
 pub mod analysis;

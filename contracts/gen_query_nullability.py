@@ -186,7 +186,9 @@ def actions(repo, tag, enums):
 
 
 def main():
-    repo = sys.argv[1] if len(sys.argv) > 1 else str(Path.home() / "dev/3rdparty/jellyfin")
+    if len(sys.argv) != 2:
+        sys.exit(f"usage: {sys.argv[0]} /path/to/jellyfin")
+    repo = sys.argv[1]
     merged = {}
     for tag in TAGS:
         merged.update(actions(repo, tag, enum_names(repo, tag)))

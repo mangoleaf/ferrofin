@@ -1,5 +1,5 @@
 //! The library monitor's scan — the disk watcher and the *arr webhooks —
-//! end to end through a real scan (`PLAN_SCAN_CHANGE_DETECTION` Phase 6W):
+//! end to end through a real scan:
 //! a reported path refreshes the nearest existing item at or above it and
 //! validates that item's subtree, as upstream's `FileRefresher` does
 //! (`FileRefresher.cs:135-208`: `GetAffectedBaseItem` → `ChangedExternally`

@@ -1,4 +1,4 @@
-//! [`PlaybackMetrics`] — records playback decisions for the metrics track.
+//! [`PlaybackMetrics`] — records playback decisions as metrics.
 //!
 //! Not a port of a Jellyfin interface: upstream throws the per-request
 //! `StreamInfo` decision away, which is exactly why avoidable transcodes are

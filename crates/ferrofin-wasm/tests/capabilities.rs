@@ -1,4 +1,4 @@
-//! Unit-level tests for the E2 host capabilities (`http-fetch`,
+//! Unit-level tests for the host capabilities (`http-fetch`,
 //! `query-items`, `write-media-segments`) — driven directly against the
 //! capability functions with stub managers and a loopback HTTP listener.
 //! No wasm involved: the guest-visible plumbing is covered by the fixture

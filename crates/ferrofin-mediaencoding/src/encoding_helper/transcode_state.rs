@@ -7,8 +7,8 @@
 //! methods actually read. The full C# types carry ~150 members spanning the
 //! hardware-acceleration matrix, HDR/tonemap plumbing, and session wiring; only
 //! the fields the *core software transcode + direct-play decision* touches are
-//! ported here. The rest arrive with the phases of
-//! the hardware-transcoding roadmap that need them.
+//! ported here. The rest arrive with the hardware-transcoding work that
+//! needs them.
 //!
 //! Value types (`MediaStream`, `MediaSourceInfo`, codec/range/context enums) are
 //! **reused from `ferrofin-model`** rather than re-declared, per

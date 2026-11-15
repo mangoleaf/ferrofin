@@ -1,5 +1,5 @@
-//! Disc rips and multi-disc sets as the movie walk plans them
-//! (PLAN_ITEM_FILE_DELETION step 12 S7): `FindMovie`'s folder-rip search
+//! Disc rips and multi-disc sets as the movie walk plans them:
+//! `FindMovie`'s folder-rip search
 //! (`MovieResolver.cs:420-470`) makes a folder holding a DVD's `VIDEO_TS`
 //! folder or `VIDEO_TS.IFO` file, or a Blu-ray's `BDMV` folder, ONE video
 //! whose path is the folder; `GetMultiDiscMovie` (`:511-582`) makes a
@@ -403,7 +403,7 @@ impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Logs {
 
 /// A row inside a rip that a library this scan does not plan also holds —
 /// its location is the rip's disc folder — is never folded into the rip
-/// (`held_by_unscanned`, as S2's re-key guards) nor pruned with what the
+/// (`held_by_unscanned`, as the re-key guards) nor pruned with what the
 /// rip excludes: it and its user data are that library's.
 #[tokio::test]
 async fn a_row_another_library_holds_is_never_folded() {

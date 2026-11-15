@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Sample a container's memory — and the interference on its cores — from the host
-cgroup v2 tree and /proc/stat (PLAN_BENCHMARK_V3 §1).
+cgroup v2 tree and /proc/stat (the memory and CPU definitions in gates/bench/README.md).
 
     mem_sample.py CONTAINER OUT_CSV [INTERVAL_MS=100] [CPUSET=8-15]
 

@@ -1,6 +1,6 @@
 //! "Date added behavior for new content" (`MetadataConfiguration.
 //! UseFileCreationTimeForDateAdded`, Dashboard → Libraries → Display) end to
-//! end through real scans (`PLAN_SCAN_CHANGE_DETECTION` 6D):
+//! end through real scans:
 //!
 //! - "Use date scanned into the library" dates a new episode by the moment
 //!   Ferrofin first detects it — a library scan and a watcher/webhook scan

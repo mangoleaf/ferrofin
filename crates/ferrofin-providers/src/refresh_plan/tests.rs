@@ -1,5 +1,5 @@
-//! The refresh decision, table by table: the "Target behaviour" rows of
-//! `PLAN_SCAN_CHANGE_DETECTION`, the change monitors' edges, and the
+//! The refresh decision, table by table: the scan's change-detection target
+//! behaviour, the change monitors' edges, and the
 //! `MetadataServiceRefreshTests` cases (`tests/Jellyfin.Providers.Tests/
 //! Manager/MetadataServiceRefreshTests.cs`) that exercise the decision rather
 //! than the merge — their C# expected values are the oracle. Its

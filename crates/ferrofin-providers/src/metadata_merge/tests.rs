@@ -1445,7 +1445,7 @@ fn refresh(
     target.item
 }
 
-/// Phase 3L: a user's edit made without `LockData` against a provider that
+/// Lock rules: a user's edit made without `LockData` against a provider that
 /// says otherwise, in each refresh mode, with and without a lock on the
 /// edited field. Only a lock protects it from a replacing merge; the
 /// fill-missing "Search for missing metadata" keeps it either way.

@@ -644,8 +644,7 @@ fn spawn_pool_sampler(db: &Database) {
 /// `SetFFmpegPath`'s `CheckSupportedRuntimeKey` (the transcode-throttle pause
 /// key) is [`probe_pause_keys`], run in the background after boot because the
 /// upstream probe is a real-time job. Its `CheckSupportedProberOption` call is
-/// outside the hardware matrix and is recorded as a numbered work item in the
-/// hardware-transcoding roadmap.
+/// outside the hardware matrix and is an open work item.
 ///
 /// # Errors
 ///
@@ -1028,7 +1027,7 @@ async fn probe_hwaccel_flag(ffmpeg: &Path, flag: &str) -> bool {
 /// consult. `None` when the file cannot be read, which fails both gates — the
 /// same outcome .NET reaches from its unparseable-release `0.0.0.0`.
 ///
-/// **Open work item (PLAN_HWACCEL phase 6):** on macOS this must return the
+/// **Open work item:** on macOS this must return the
 /// macOS release, because `GetHardwareVideoDecoder` gates H.264 Hi10P
 /// VideoToolbox decoding on `>= 14.6`. Until that lands a Mac reports `None`
 /// and so declines Hi10P hardware decoding — correct, but conservative.
@@ -1976,7 +1975,7 @@ mod tests {
         assert_eq!(
             caps.os_version().is_some(),
             cfg!(target_os = "linux"),
-            "the OS version is read on Linux and, until phase 6, nowhere else"
+            "the OS version is read on Linux and, for now, nowhere else"
         );
     }
 

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Build the benchmark test data (PLAN_BENCHMARK_V3 §3):
+# Build the benchmark test data (gates/bench/README.md, "Test data"):
 #   gen.py media tree → Jellyfin 10.11.8 scans it and is seeded over its API → drained
 #   → stopped. The resulting DIR/{config,media,ids.json} is what run.sh boots copies of.
 #

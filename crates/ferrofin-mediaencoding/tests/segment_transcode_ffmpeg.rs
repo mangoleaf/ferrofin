@@ -46,8 +46,7 @@ fn require_ffmpeg() {
     }
 }
 
-/// Generates a tiny 6-second `testsrc`+`sine` clip at `path` (matches the plan's
-/// generator command).
+/// Generates a tiny 6-second `testsrc`+`sine` clip at `path`.
 fn make_clip(path: &Path) {
     let status = std::process::Command::new("ffmpeg")
         .args([
@@ -228,7 +227,7 @@ fn extinf_count(playlist: &str) -> usize {
         .count()
 }
 
-/// Steps 1–5 + the VOD playlist assertions of the plan: drive the real
+/// The VOD transcode, end to end: drive the real
 /// [`TranscodeManagerImpl::start_ffmpeg`] with a `wait_for_path=out0.ts` target
 /// and the real [`TokioSegmentTranscoder`], then assert the first segment is a
 /// non-empty file on disk, the job exited cleanly, and the finished VOD playlist
@@ -257,7 +256,7 @@ async fn manager_start_ffmpeg_ts_waits_for_first_segment_then_completes() {
         .await
         .expect("start_ffmpeg");
 
-    // Step 4: start_ffmpeg waits for creation; ffmpeg may not have flushed
+    // start_ffmpeg waits for creation; ffmpeg may not have flushed
     // bytes yet. Wait for data before checking the first segment's contents.
     assert!(first_segment.exists(), "out0.ts should exist");
     wait_until(Duration::from_secs(20), || {
@@ -271,7 +270,7 @@ async fn manager_start_ffmpeg_ts_waits_for_first_segment_then_completes() {
     assert_eq!(manager.active_job_count(), 1, "job registered");
     assert_eq!(handle.job_type, TranscodingJobType::Hls);
 
-    // Step 5: let the VOD transcode finish, then assert a valid playlist.
+    // Let the VOD transcode finish, then assert a valid playlist.
     let served = manager.wait_for_segment(&handle, &playlist, 0).await;
     assert!(served, "segment 0 should be served");
 
@@ -315,7 +314,7 @@ async fn manager_start_ffmpeg_ts_waits_for_first_segment_then_completes() {
     assert!(log.contains("ffmpeg"), "log missing command header");
 }
 
-/// Step 6 (fMP4 variant): a real fMP4 transcode via the concrete transcoder
+/// The fMP4 variant: a real fMP4 transcode via the concrete transcoder
 /// yields an `out-1.mp4` init segment, `out0.mp4` media segments, and an
 /// `#EXT-X-VERSION:7` playlist that maps the init segment.
 #[tokio::test]
@@ -361,7 +360,7 @@ async fn real_fmp4_transcode_produces_init_and_versioned_playlist() {
     assert!(playlist.contains("#EXT-X-ENDLIST"), "playlist: {playlist}");
 }
 
-/// Step 7 (kill): a long realtime transcode is killed mid-flight through the
+/// Kill: a long realtime transcode is killed mid-flight through the
 /// manager's `kill_and_remove(delete_files=true)`; the child exits, the job is
 /// removed, and the partial segment files are cleaned from the cache dir.
 #[tokio::test]
@@ -421,7 +420,7 @@ async fn manager_kill_stops_transcode_and_deletes_partial_files() {
     assert_eq!(count_ext(&out_dir, "ts"), 0, "no .ts segments remain");
 }
 
-/// Step 8 (failure): bogus args (a nonexistent input) surface as a `start_ffmpeg`
+/// Failure: bogus args (a nonexistent input) surface as a `start_ffmpeg`
 /// error — ffmpeg exits non-zero before the wait target ever appears.
 #[tokio::test]
 #[ignore = "runs the real ffmpeg; run with --ignored"]

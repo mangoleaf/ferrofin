@@ -1,5 +1,5 @@
 // The six screens a jellyfin-web user waits for, as the request sets the web
-// client issues (PLAN_BENCHMARK_V3 §2 D3). Each iteration = "a user opens screen X",
+// client issues (gates/bench/README.md, "What is measured"). Each iteration = "a user opens screen X",
 // requests issued concurrently as the browser does (http.batch), dependent requests
 // (images of the returned cards) after. Sources are cited per screen.
 //
@@ -33,7 +33,7 @@ function headers(json) {
 }
 const IMAGES_PER_SCREEN = 12;
 
-// weighted mix (D4): home 3 : movies 2 : detail 2 : series 1 : search 1 : playback 1
+// weighted mix: home 3 : movies 2 : detail 2 : series 1 : search 1 : playback 1
 const MIX = ['home', 'movies', 'detail', 'home', 'movies', 'detail', 'home', 'series', 'search', 'playback'];
 
 export const options = SHAPE

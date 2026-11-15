@@ -22,8 +22,8 @@
 //! (`ferrofin-core`) and the single-item refresh
 //! ([`provider_manager`](crate::provider_manager)) decide by the one rule. Upstream has no
 //! Ferrofin-style backfill rule; the scan passes its own (kept by owner
-//! decision D2 of `PLAN_SCAN_CHANGE_DETECTION`) in as an extra trigger for
-//! the remote metadata providers only.
+//! decision D2 of the scan's change-detection design) in as an extra
+//! trigger for the remote metadata providers only.
 
 use chrono::{DateTime, TimeDelta, Utc};
 use ferrofin_model::configuration::LibraryOptions;

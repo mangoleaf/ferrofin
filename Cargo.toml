@@ -115,7 +115,7 @@ tokio-tungstenite = "0.30.0"
 futures-util = "0.3.34"
 notify = "8.2"
 
-# ── persistence: sqlx + SQLite (speed-first; see plan) ─────────────
+# ── persistence: sqlx + SQLite (speed-first) ───────────────────────
 # SQLite has no network transport, so no TLS; `macros` stays only because it carries `migrate!`.
 sqlx = { version = "0.9.0", default-features = false, features = ["sqlite", "runtime-tokio", "macros", "migrate", "chrono", "uuid"] }
 # Direct handle on the SQLite C API, pinned to the exact version sqlx resolves so
@@ -297,8 +297,8 @@ debug = "line-tables-only"
 debug = false
 
 # Release-speed binary with full debug info, for samply/perf/heaptrack
-# symbolization (PLAN_OPTIMIZE_HOTSPOTS phase 0). Never shipped: release
-# stays lean; this exists so profiling is one flag, not a Cargo.toml edit.
+# symbolization. Never shipped: release stays lean; this exists so
+# profiling is one flag, not a Cargo.toml edit.
 [profile.profiling]
 inherits = "release"
 debug = true
