@@ -5221,8 +5221,11 @@ pub const VERIFIED: &[Verified] = &[
         upstream_file: "Jellyfin.Api/Controllers/EnvironmentController.cs",
         upstream_method: "GetDrives",
         ferrofin: "handlers/environment.rs get_drives → ferrofin-core file_system.rs get_drives, \
-               drive_probe.rs, mount_table.rs",
-        date: "2026-10-30",
+               drive_probe.rs, mount_table.rs (read_mount_table for DriveInfo.GetDrives(): \
+               /proc/mounts, or on Windows GetLogicalDrives' roots with GetDriveTypeW; IsReady \
+               as Directory.Exists(Name); disk_space for TotalSize, statvfs or \
+               GetDiskFreeSpaceExW; Name and FullName the mount point or C:\\)",
+        date: "2026-11-15",
         divergences: &[
             "A mount that does not answer in time (drive_probe.rs DRIVE_PROBE_TIMEOUT) is left \
          out of that listing, a hung one and one merely that slow, where upstream's request \
@@ -5397,6 +5400,51 @@ pub const VERIFIED: &[Verified] = &[
             "The 401 (no or bad token, a disabled user), 403 (no remote access) and 500 (a \
          transcode path that cannot be prepared) bodies are Ferrofin's error shape, not \
          upstream's. Fix path: gl-666.",
+        ],
+        refs: &[],
+    },
+    Verified {
+        method: "get",
+        path: "/System/Info/Storage",
+        upstream_file: "Jellyfin.Api/Controllers/SystemController.cs",
+        upstream_method: "GetSystemStorage",
+        ferrofin: "handlers/system.rs get_system_storage (auth.rs RequireAdmin: RequiresElevation, \
+               an API key or an administrator, else 403) → ferrofin-core system_manager.rs \
+               get_system_storage_info (SystemManager.GetSystemStorageInfo: the program-data, \
+               web, image-cache, cache, log and internal-metadata paths and the live transcode \
+               path prepared as GetTranscodePath, then each library's locations from \
+               apps/ferrofin-server state.rs VirtualFolderStorage, GetVirtualFolders with an \
+               empty ItemId left out and the locations in Locations.Order()) → FsStorageProbe \
+               probe_all (StorageHelper.GetFreeSpaceOf: resolve_path for ResolvePath, each link \
+               component replaced by its final target and a missing component the catch arm, \
+               which reports the path as given with -1 and no type or id; mount_table.rs \
+               read_mount_table for DriveInfo.GetDrives(), /proc/mounts or, on Windows, \
+               GetLogicalDrives' roots with GetDriveTypeW; mount_for_path for bestMatch, the \
+               deepest drive holding the resolved path; disk_space on that drive's Name for \
+               AvailableFreeSpace and TotalSize, statvfs's f_bavail and f_blocks or \
+               GetDiskFreeSpaceExW's caller and total bytes; DeviceId the drive's Name, a mount \
+               point or C:\\) → ferrofin-model \
+               system_info_dtos.rs SystemStorageDto::from_system_storage_info \
+               (FromSystemStorageInfo, without ResolvedPath)",
+        date: "2026-11-15",
+        divergences: &[
+            "A folder no drive holds (no readable mount table, as on macOS; a chroot that hides \
+         `/`; a Windows UNC path no drive letter maps) reports its own filesystem's free and \
+         used bytes with StorageType Unknown and no DeviceId, where upstream's \
+         bestMatch-is-null throw reports -1 and neither.",
+            "The drive match is component-wise, so a mount at /mnt/media never holds \
+         /mnt/media2, and case-sensitive outside Windows; upstream's StartsWith is a raw prefix \
+         that ignores case everywhere.",
+            "ResolvePath resolves a relative path from the working directory, and a `..` from \
+         the folder resolved so far on Unix (on Windows std::path::absolute folds it first, as \
+         Win32 does), where upstream keeps both as written and then no drive root prefixes the \
+         path.",
+            "A link is resolved with canonicalize, which also resolves links inside its target \
+         and fails on a dangling one (the catch arm), where .NET's GetFinalLinkTarget follows \
+         only the chain of links and returns a missing last target, whose drive upstream \
+         reports.",
+            "A library whose ItemId is not a GUID is left out, where upstream's Guid.Parse throws \
+         and the request fails.",
         ],
         refs: &[],
     },
