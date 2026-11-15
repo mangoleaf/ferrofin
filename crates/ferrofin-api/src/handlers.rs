@@ -2534,6 +2534,34 @@ macro_rules! similar_items_path {
     };
 }
 
+/// What `GET /Trailers` does unlike upstream, beyond the subsystems its row
+/// refs. Every entry but the first two is `GetItems`' own, so a `GET /Items`
+/// row would carry them too.
+const TRAILERS_DIVERGENCES: &[&str] = &[
+    "Upstream answers 500 to every request: GetTrailers calls an ItemsController the service \
+     container built, which has no HttpContext, so GetItems' User.GetIsApiKey() throws a \
+     NullReferenceException (seen on 12.4). Jellyfin bug not ported: Ferrofin answers what that \
+     GetItems call is written to, through GET /Items' own binding, so an indexNumber (a member \
+     GetTrailers does not take) still binds and one that is no number answers 400.",
+    "studios, artists and albums split on pipes, as GetItems binds them and as the published \
+     OpenAPI documents them for this route; GetTrailers' own binder splits them on commas. \
+     Jellyfin bug not ported.",
+    "maxOfficialRating can lower a rating-limited user's ceiling but never raise it: the \
+     stricter of the request's and the user's applies, where upstream's replaces the user's and \
+     an unrecognized rating clears it. Jellyfin bug not ported (gl-809).",
+    "An albums name no album has matches nothing, where upstream drops it, so a list of only \
+     unknown names filters nothing there. Jellyfin bug not ported.",
+    "A searchTerm is ranked and paged by the repository's search (relevance, then SortName), \
+     not by the search providers' scores with their 3 × limit candidates paged in memory, and \
+     explicit ids are intersected with the term rather than joined to its matches. Fix path: \
+     gl-450.",
+    "An API key without a userId runs at the user root, so a non-recursive request lists every \
+     trailer where upstream's parent is the root folder, whose direct children hold none; a \
+     parentId naming an item that is not a folder stays the parent, where upstream answers at \
+     the user root; and contradictory filters answer 400 before the parent's visibility is \
+     checked. Fix path: gl-1851.",
+];
+
 /// The divergences the six `/{kind}/{itemId}/Similar` rows share.
 const SIMILAR_ITEMS_DIVERGENCES: &[&str] = &[
     SIMILAR_SCORE_WINDOW_DIVERGENCE,
@@ -2725,6 +2753,32 @@ pub const VERIFIED: &[Verified] = &[
         date: "2026-11-15",
         divergences: SIMILAR_ITEMS_DIVERGENCES,
         refs: &["images", "access-filtering"],
+    },
+    Verified {
+        method: "get",
+        path: "/Trailers",
+        upstream_file: "Jellyfin.Api/Controllers/TrailersController.cs",
+        upstream_method: "GetTrailers",
+        ferrofin: "handlers/trailers.rs get_trailers (GetTrailers: GetItems' parameters bound \
+                   with GetItems' table, includeItemTypes replaced by [Trailer] and indexNumber \
+                   by none; enableTotalRecordCount and enableImages default true) → \
+                   handlers/items.rs get_items, the GetItems port compared with it: \
+                   resolve_user_or_api_key and effective_user_id, whitelists_tags (AllowedTags \
+                   adds Tags), ItemsQuery::dto_options (AddAdditionalDtoOptions), \
+                   items_query_options, official_rating_score, resolve_name_filters, \
+                   apply_media_stream_filter_rules, apply_location_types, apply_filters, \
+                   check_parent_visibility (GetParentItem, IsVisible, and a UserView parent's \
+                   dispatch through user_view_browse_context), redirect_container_browse \
+                   (the BoxSet and Playlist re-root), list_playlists_folder_as_playlists, \
+                   apply_library_browse_defaults (recursive ??= true for a typed library \
+                   browse), apply_albums_by_artist_order, order_search_by_sort_name, the \
+                   UserRootFolder and HasFilters dispatch, retain_visible_ids, \
+                   sort_items_by_request (Folder.GetItems' request order) → LibraryManager \
+                   query_items and DtoService get_base_item_dtos, or get_linked_children_dtos \
+                   for a box set's or playlist's own non-recursive listing",
+        date: "2026-11-15",
+        divergences: TRAILERS_DIVERGENCES,
+        refs: &["access-filtering", "images", "paging-sort", "user-data"],
     },
     Verified {
         method: "get",

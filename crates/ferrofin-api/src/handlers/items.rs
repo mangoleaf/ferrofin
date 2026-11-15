@@ -123,7 +123,7 @@ pub(crate) async fn require_scope_id_visible(
 /// request named ids and none is left: the caller must answer an empty page,
 /// because an empty `item_ids` means no id filter and the query would list the
 /// whole library.
-pub(crate) async fn retain_visible_ids(
+async fn retain_visible_ids(
     state: &AppState,
     auth: &AuthorizationInfo,
     query: &mut InternalItemsQuery,
@@ -142,7 +142,7 @@ pub(crate) async fn retain_visible_ids(
 }
 
 /// The page [`retain_visible_ids`] calls for when no id is left.
-pub(crate) fn empty_page(query: &InternalItemsQuery) -> QueryResult<BaseItemDto> {
+fn empty_page(query: &InternalItemsQuery) -> QueryResult<BaseItemDto> {
     QueryResult::new(Some(query.start_index.unwrap_or(0)), Some(0), Vec::new())
 }
 
@@ -309,7 +309,8 @@ pub(crate) async fn resolve_user_opt(
     Ok(state.users.get_user_by_id(effective).await?.map(Arc::new))
 }
 
-/// The query parameters honoured by `GET /Items`.
+/// The query parameters honoured by `GET /Items`, and by `GET /Trailers`,
+/// which hands them to the same handler (`crate::handlers::trailers`).
 ///
 /// Every field is optional. Comma/pipe-delimited multi-value parameters arrive as
 /// a raw [`String`] and are split + parsed in [`get_items`]; this keeps the serde
@@ -317,7 +318,7 @@ pub(crate) async fn resolve_user_opt(
 /// model binders.
 #[derive(Debug, Default, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct ItemsQuery {
+pub(crate) struct ItemsQuery {
     /// The target user; defaults to the authenticated caller when absent.
     #[serde(
         default,
@@ -347,7 +348,7 @@ struct ItemsQuery {
     parent_id: Option<Uuid>,
     /// Comma-delimited [`BaseItemKind`](ferrofin_model::data::BaseItemKind) set to include.
     #[serde(default)]
-    include_item_types: Option<String>,
+    pub(crate) include_item_types: Option<String>,
     /// Comma-delimited item kinds to exclude.
     #[serde(default)]
     exclude_item_types: Option<String>,
@@ -554,7 +555,7 @@ struct ItemsQuery {
     has_theme_video: Option<bool>,
     /// Exact index number.
     #[serde(default)]
-    index_number: Option<i32>,
+    pub(crate) index_number: Option<i32>,
     /// Exact parent index number.
     #[serde(default)]
     parent_index_number: Option<i32>,
@@ -699,7 +700,7 @@ where
     responses((status = 200, description = "Items returned (QueryResult<BaseItemDto>)")),
     tag = "ferrofin"
 )]
-async fn get_items(
+pub(crate) async fn get_items(
     State(state): State<AppState>,
     RequireAuth(auth): RequireAuth,
     Query(query): Query<ItemsQuery>,
@@ -959,7 +960,7 @@ fn apply_albums_by_artist_order(internal: &mut InternalItemsQuery) {
 /// provider score until those providers are ported (gl-450). The extra `Name`
 /// term only reorders rows tied on `SortName`. Upstream falls back to `ApplyOrder` alone when no provider
 /// returns a candidate; that fallback belongs to the same port.
-pub(crate) fn order_search_by_sort_name(internal: &mut InternalItemsQuery) {
+fn order_search_by_sort_name(internal: &mut InternalItemsQuery) {
     use ferrofin_model::dto::SortOrder;
     use ferrofin_model::live_tv::ItemSortBy;
     if internal
@@ -984,7 +985,7 @@ pub(crate) fn order_search_by_sort_name(internal: &mut InternalItemsQuery) {
 /// (the repository drops it later). A search already leads its keys with
 /// `SortName` ([`order_search_by_sort_name`]), standing in for the score sort
 /// upstream applies after this one, so it keeps that order.
-pub(crate) fn sort_items_by_request(query: &InternalItemsQuery, items: &mut [BaseItemEntity]) {
+fn sort_items_by_request(query: &InternalItemsQuery, items: &mut [BaseItemEntity]) {
     if !query.order_by.is_empty() || query.item_ids.len() <= 1 {
         return;
     }
@@ -1130,7 +1131,7 @@ fn items_query_options(
 /// linked versions" — the alternate versions and owned non-extras a general
 /// query hides stay in, and the `PresentationUniqueKey` grouping folds them
 /// back onto their primary.
-pub(crate) fn apply_media_stream_filter_rules(internal: &mut InternalItemsQuery) {
+fn apply_media_stream_filter_rules(internal: &mut InternalItemsQuery) {
     if !internal.subtitle_languages.is_empty() {
         match internal.has_subtitles {
             Some(true) => internal.has_subtitles = None,
@@ -2378,7 +2379,9 @@ crate::query::query_parameters! {
         "albums" => '|',
         "artists" => '|',
         "studios" => '|',
-    } => [("get", "/Items")];
+    // `/Trailers` keeps these pipe delimiters, which the OpenAPI documents for
+    // it, though `GetTrailers` binds studios, artists and albums on commas.
+    } => [("get", "/Items"), ("get", "/Trailers")];
     ItemQuery {} => [("get", "/Items/{itemId}")];
     DeleteItemsQuery {
         "ids" => ',',
