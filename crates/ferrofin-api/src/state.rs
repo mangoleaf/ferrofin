@@ -84,28 +84,33 @@ pub fn forwarded_for(headers: &axum::http::HeaderMap) -> Vec<std::net::IpAddr> {
     reachable
 }
 
-/// One `X-Forwarded-For` entry as an address, in the shapes .NET's
-/// `IPEndPoint.TryParse` takes: an address, `v4:port`, or an IPv6 address in
-/// one pair of brackets, with or without a port. A bracketed IPv4 address and
-/// unbalanced or doubled brackets do not parse.
+/// One `X-Forwarded-For` entry as an address: port of .NET's
+/// `IPEndPoint.TryParse`, which `ApplyForwarders` reads each entry with.
 ///
-/// .NET also reads the old numeric IPv4 spellings (`2130706434`, `127.2`)
-/// and an IPv6 scope id without a port (`[fe80::1%2]`), which this does not,
-/// so the walk stops at one where Jellyfin's goes on. Fix path: gl-1642.
+/// A port follows the last colon when a `]` comes just before it or no other
+/// colon does; it is digits only and at most 65535. The rest is read by
+/// `IPAddress.TryParse`
+/// ([`try_parse_ip_address`](ferrofin_networking::net_utils::try_parse_ip_address)),
+/// so the old numeric IPv4 spellings (`2130706434`, `127.2:80`) and an IPv6
+/// scope (`[fe80::1%2]`) parse, and a bracketed IPv4 address and unbalanced or
+/// doubled brackets do not.
+///
+/// The scope is dropped, where Jellyfin keeps it in the client address it
+/// reports (a session's `RemoteEndPoint` reads `fe80::1%2`). Fix path: gl-1822.
 #[must_use]
 pub(crate) fn parse_forwarded_entry(entry: &str) -> Option<std::net::IpAddr> {
-    if let Ok(ip) = entry.parse::<std::net::IpAddr>() {
-        return Some(normalize_ip(ip));
-    }
-    // `v4:port`, or `[v6]:port`.
-    if let Ok(socket) = entry.parse::<std::net::SocketAddr>() {
-        return Some(normalize_ip(socket.ip()));
-    }
-    entry
-        .strip_prefix('[')
-        .and_then(|v6| v6.strip_suffix(']'))
-        .and_then(|v6| v6.parse::<std::net::Ipv6Addr>().ok())
-        .map(|v6| normalize_ip(std::net::IpAddr::V6(v6)))
+    let (address, port) = match entry.rfind(':') {
+        Some(colon)
+            if colon > 0 && (entry[..colon].ends_with(']') || !entry[..colon].contains(':')) =>
+        {
+            (&entry[..colon], Some(&entry[colon + 1..]))
+        }
+        _ => (entry, None),
+    };
+    let address = ferrofin_networking::net_utils::try_parse_ip_address(address)?;
+    // `uint.TryParse` with `NumberStyles.None`, then at most `MaxPort`.
+    port.is_none_or(|port| port.bytes().all(|b| b.is_ascii_digit()) && port.parse::<u16>().is_ok())
+        .then(|| normalize_ip(address))
 }
 
 /// The managers behind [`AppState`], held once and shared via [`Arc`].

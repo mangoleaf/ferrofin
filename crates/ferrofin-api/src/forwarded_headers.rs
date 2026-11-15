@@ -527,17 +527,119 @@ mod tests {
         assert_eq!(forwarded.scheme, None);
     }
 
+    /// `IPEndPoint.TryParse` over `IPAddress.TryParse`, as measured on Jellyfin
+    /// 12.4 with known proxies 127.0.0.1 and 127.0.0.2: from 127.0.0.1,
+    /// `X-Forwarded-For: 8.8.8.8, <entry>` reaches 8.8.8.8 when `<entry>`
+    /// reads as 127.0.0.2, the address it reads as when that is no known
+    /// proxy, and stays at 127.0.0.1 when it does not parse.
+    #[rstest]
+    #[case("127.0.0.2", "8.8.8.8")]
+    #[case("2130706434", "8.8.8.8")]
+    #[case("127.2", "8.8.8.8")]
+    #[case("127.0.2", "8.8.8.8")]
+    #[case("0x7f.2", "8.8.8.8")]
+    #[case("0X7F.2", "8.8.8.8")]
+    #[case("0x7F000002", "8.8.8.8")]
+    #[case("017700000002", "8.8.8.8")]
+    #[case("0177.0.0.2", "8.8.8.8")]
+    #[case("127.0.0.02", "8.8.8.8")]
+    #[case("127.0.0.002", "8.8.8.8")]
+    #[case("127.000.000.002", "8.8.8.8")]
+    #[case("127.0x0.0.2", "8.8.8.8")]
+    #[case("127.0.0.0x2", "8.8.8.8")]
+    #[case("127.0.0.0x02", "8.8.8.8")]
+    // Octal 0127 is 87.
+    #[case("00000000000127.0.0.2", "87.0.0.2")]
+    #[case("127.0.0.08", "127.0.0.1")]
+    #[case("127.0.0.0x", "127.0.0.1")]
+    #[case("127.0.0.2.", "127.0.0.1")]
+    #[case("127..0.2", "127.0.0.1")]
+    #[case("127.0.0.2.0", "127.0.0.1")]
+    #[case(".127.0.0.2", "127.0.0.1")]
+    #[case("+127.0.0.2", "127.0.0.1")]
+    #[case("127.0.0.258", "127.0.0.1")]
+    #[case("127.0.0.2/32", "127.0.0.1")]
+    #[case("0x", "127.0.0.1")]
+    #[case("4294967296", "127.0.0.1")]
+    #[case("127.16777216", "127.0.0.1")]
+    #[case("127.0.65538", "127.0.0.1")]
+    #[case("1 27.0.0.2", "127.0.0.1")]
+    #[case("2130706434:80", "8.8.8.8")]
+    #[case("127.2:80", "8.8.8.8")]
+    #[case("127.0.0.2:080", "8.8.8.8")]
+    #[case("127.0.0.2:+80", "127.0.0.1")]
+    #[case("127.0.0.2:65536", "127.0.0.1")]
+    #[case("127.0.0.2:", "127.0.0.1")]
+    #[case("127.0.0.2:0x50", "127.0.0.1")]
+    #[case("127.0.0.2:000000000000080", "8.8.8.8")]
+    #[case(":127.0.0.2", "127.0.0.1")]
+    #[case("::ffff:127.0.0.2", "8.8.8.8")]
+    #[case("::ffff:7f00:2", "8.8.8.8")]
+    #[case("::ffff:127.0.0.2%1", "8.8.8.8")]
+    #[case("[::ffff:127.0.0.2%1]", "8.8.8.8")]
+    #[case("[::ffff:127.0.0.2%1]:80", "8.8.8.8")]
+    #[case("::ffff:127.0.0.2%eth0", "8.8.8.8")]
+    #[case("::ffff:127.0.0.2%lo", "8.8.8.8")]
+    #[case("::ffff:127.0.0.2%", "8.8.8.8")]
+    #[case("[::ffff:127.0.0.2%]", "8.8.8.8")]
+    #[case("::ffff:127.0.0.2%1/64", "127.0.0.1")]
+    #[case("::ffff:127.0.0.2/64", "127.0.0.1")]
+    #[case("::ffff:127.0.0.2%x]", "127.0.0.1")]
+    #[case("[::ffff:127.0.0.2%x]y", "127.0.0.1")]
+    #[case("::ffff:127.0.0.2%1:80", "8.8.8.8")]
+    #[case("[::ffff:127.0.0.2%1:80]", "8.8.8.8")]
+    #[case("::ffff:127.0.0.2%[x", "8.8.8.8")]
+    #[case("::ffff:127.0.0.2%a b", "8.8.8.8")]
+    #[case("[::ffff:127.0.0.2%a]b]", "127.0.0.1")]
+    #[case("[::ffff:127.0.0.2]:0x50", "127.0.0.1")]
+    #[case("[::ffff:127.0.0.2]:080", "8.8.8.8")]
+    #[case("::ffff:127.0.0.02", "8.8.8.8")]
+    #[case("::ffff:127.0.0.002", "127.0.0.1")]
+    #[case("::ffff:127.0.00.2", "127.0.0.1")]
+    #[case("::ffff:0127.0.0.2", "127.0.0.1")]
+    #[case("::ffff:127.0.0.2:80", "127.0.0.1")]
+    #[case("::ffff:127.2", "127.0.0.1")]
+    #[case("::ffff:2130706434", "127.0.0.1")]
+    #[case("[::ffff:127.0.0.2%1]:+80", "127.0.0.1")]
+    #[case("[::ffff:127.0.0.2]%1", "127.0.0.1")]
+    #[case("::FFFF:127.0.0.2", "8.8.8.8")]
+    #[case("0:0:0:0:0:ffff:127.0.0.2", "8.8.8.8")]
+    #[case("::ffff:00127.0.0.2", "127.0.0.1")]
+    fn entries_are_read_as_ip_end_point_try_parse_reads_them(
+        #[case] entry: &str,
+        #[case] expected: &str,
+    ) {
+        let forwarded_for = format!("8.8.8.8, {entry}");
+        assert_eq!(
+            client_from(
+                &["127.0.0.1", "127.0.0.2"],
+                "127.0.0.1",
+                &headers(&[("x-forwarded-for", &forwarded_for)])
+            ),
+            expected.parse::<IpAddr>().expect("expected"),
+            "{entry}"
+        );
+    }
+
     /// The client a request from 10.0.0.1, the one known proxy, resolves to.
     fn client_behind_known_proxy(headers: &HeaderMap) -> IpAddr {
+        client_from(&["10.0.0.1"], "10.0.0.1", headers)
+    }
+
+    /// The client a request from `peer` resolves to under `known_proxies`.
+    fn client_from(known_proxies: &[&str], peer: &str, headers: &HeaderMap) -> IpAddr {
         let network = std::sync::RwLock::new(ferrofin_networking::NetworkManager::with_interfaces(
             ferrofin_networking::NetworkConfiguration {
-                known_proxies: vec!["10.0.0.1".to_owned()],
+                known_proxies: known_proxies
+                    .iter()
+                    .map(|&proxy| proxy.to_owned())
+                    .collect(),
                 ..ferrofin_networking::NetworkConfiguration::default()
             },
             Vec::new(),
         ));
         let chain = crate::state::forwarded_for(headers);
-        client_address_through(Some(&network), "10.0.0.1".parse().expect("peer"), &chain)
+        client_address_through(Some(&network), peer.parse().expect("peer"), &chain)
     }
 
     /// The scheme a request has, as the API resolves it for the addresses it
