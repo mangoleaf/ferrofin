@@ -2262,12 +2262,12 @@ mod tests {
         let (series, season, specials, other) = (id(0x51), id(0x52), id(0x53), id(0x54));
         let episode =
             |n: u128, path: &str, season_id: Uuid, series_id: Uuid, number: i64| BaseItemEntity {
-                id: id(n).to_string(),
+                id: guid_to_db(id(n)),
                 type_: ty(BaseItemKind::Episode).to_owned(),
                 path: Some(path.to_owned()),
                 run_time_ticks: Some(1_800 * 10_000_000),
-                season_id: Some(season_id.to_string()),
-                series_id: Some(series_id.to_string()),
+                season_id: Some(guid_to_db(season_id)),
+                series_id: Some(guid_to_db(series_id)),
                 series_name: Some(if series_id == other { "Other" } else { "Show" }.to_owned()),
                 parent_index_number: Some(number),
                 ..BaseItemEntity::default()
@@ -2276,7 +2276,7 @@ mod tests {
         special.data = Some(r#"{"AirsBeforeSeasonNumber":1}"#.to_owned());
         let rows = vec![
             BaseItemEntity {
-                id: series.to_string(),
+                id: guid_to_db(series),
                 type_: ty(BaseItemKind::Series).to_owned(),
                 genres: Some("Anime".to_owned()),
                 ..BaseItemEntity::default()
@@ -2287,7 +2287,7 @@ mod tests {
             episode(0x64, "/media/other/s01e01.mkv", id(0x55), other, 1),
             episode(0x65, "/disabled/show/s01e01.mkv", id(0x56), series, 1),
             BaseItemEntity {
-                id: id(0x66).to_string(),
+                id: guid_to_db(id(0x66)),
                 type_: ty(BaseItemKind::Movie).to_owned(),
                 path: Some("/media/movies/film.mkv".to_owned()),
                 name: Some("Film".to_owned()),
