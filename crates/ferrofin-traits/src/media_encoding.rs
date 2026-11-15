@@ -592,6 +592,15 @@ pub trait AttachmentExtractor: Send + Sync {
         input_file: &str,
         media_source: &MediaSourceInfo,
     ) -> Result<(), ServiceError>;
+
+    /// Stops the extractions still running as the host tears down (a shutdown
+    /// or a restart), killing their ffmpeg and deleting the outputs each one
+    /// names, refuses new ones, and returns once they are gone, so no ffmpeg outlives
+    /// the server lifetime that started it.
+    ///
+    /// An extractor that runs no extraction of its own has nothing to stop, so
+    /// the default does nothing.
+    async fn shutdown(&self) {}
 }
 
 /// Compile-time assertion that [`AttachmentExtractor`] is object-safe.
