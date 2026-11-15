@@ -5050,7 +5050,9 @@ pub const VERIFIED: &[Verified] = &[
                LocalNetworkAddresses bind leaves upstream, then the interfaces) and \
                format_api_url (GetLocalApiUrl's UriBuilder, which writes any port it is given \
                and escapes the base URL as UriBuilder.Path does, a backslash aside: \
-               ferrofin-networking escape_base_url, checked against 12.4's discovery Address), \
+               ferrofin-networking escape_base_url, checked against 12.4's discovery Address; \
+               its default scheme from listen_with_https, ListenWithHttps: the certificate \
+               this lifetime loaded and the saved EnableHttps, read on every call), \
                friendly_name (FriendlyName: the saved ServerName unless empty), the emulated \
                version, PRODUCT_NAME (Name), the system id (DeviceId), the startup-wizard flag, \
                the lifecycle's restart-pending and shutting-down flags (which operations raise \
@@ -5063,7 +5065,7 @@ pub const VERIFIED: &[Verified] = &[
                kept), SupportsLibraryMonitor true and the obsolete members' fixed values. \
                Probed on Jellyfin 12.4: LocalAddress for a published override naming port 80, \
                ServerName with no name saved, the body with the wizard incomplete",
-        date: "2026-11-14",
+        date: "2026-11-15",
         divergences: &[
             "Version is the Jellyfin release Ferrofin emulates (openapi.rs \
          JELLYFIN_API_VERSION, 12.4.0), not Ferrofin's own release version, which upstream's \
@@ -5092,9 +5094,6 @@ pub const VERIFIED: &[Verified] = &[
             "A backslash in the base URL is escaped (%5C) in LocalAddress; upstream's \
          UriBuilder.Path turns it into a /, an address its mount does not answer (12.4's \
          discovery Address, probed). Jellyfin bug not ported.",
-            "After a save that turns HTTPS off, LocalAddress keeps the https scheme this \
-         lifetime listens with until the restart; upstream's ListenWithHttps reads the saved \
-         EnableHttps at once and advertises http. Fix path: gl-1791.",
             "After a save that turns HTTPS on, LocalAddress stays http until the restart; \
          upstream's ListenWithHttps, over a certificate it loaded at startup with HTTPS off, \
          advertises https on a port that listens only after the restart. Jellyfin bug not \
@@ -5125,7 +5124,7 @@ pub const VERIFIED: &[Verified] = &[
                (SystemManager.GetPublicSystemInfo): the LocalAddress, ServerName, Version, \
                ProductName, Id and StartupWizardCompleted of the get /System/Info row, and \
                OperatingSystem's fixed empty string. Probed on Jellyfin 12.4 as that row was",
-        date: "2026-11-14",
+        date: "2026-11-15",
         divergences: &[
             "Version is the Jellyfin release Ferrofin emulates (openapi.rs \
          JELLYFIN_API_VERSION, 12.4.0), not Ferrofin's own release version, which upstream's \
@@ -5148,9 +5147,6 @@ pub const VERIFIED: &[Verified] = &[
             "A backslash in the base URL is escaped (%5C) in LocalAddress; upstream's \
          UriBuilder.Path turns it into a /, an address its mount does not answer (12.4's \
          discovery Address, probed). Jellyfin bug not ported.",
-            "After a save that turns HTTPS off, LocalAddress keeps the https scheme this \
-         lifetime listens with until the restart; upstream's ListenWithHttps reads the saved \
-         EnableHttps at once and advertises http. Fix path: gl-1791.",
             "After a save that turns HTTPS on, LocalAddress stays http until the restart; \
          upstream's ListenWithHttps, over a certificate it loaded at startup with HTTPS off, \
          advertises https on a port that listens only after the restart. Jellyfin bug not \
