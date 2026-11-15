@@ -8261,12 +8261,14 @@ impl LibraryScanner {
         // Photos and books carry their metadata inside the file, not on any
         // remote provider — local readers, run with the NFO and before the
         // remote providers (a book's readers are upstream's
-        // `ILocalMetadataProvider`s), so a remote provider fills only what
-        // they left. A photo's Primary image is the file itself; a book's is
-        // the cover extracted from its archive.
+        // `ILocalMetadataProvider`s and run under `run_local`, as the NFO
+        // does), so a remote provider fills only what they left. A photo's
+        // Primary image is the file itself; a book's is the cover extracted
+        // from its archive.
         let (embedded_people, embedded_ids, embedded_images, embedded_read) = if plan.local_metadata
         {
-            self.enrich_from_file(&mut entity, locked, policy).await
+            self.enrich_from_file(&mut entity, locked, run_local, policy)
+                .await
         } else {
             (Vec::new(), Vec::new(), Vec::new(), false)
         };
@@ -8274,14 +8276,10 @@ impl LibraryScanner {
             embedded_read || !embedded_people.is_empty() || !embedded_images.is_empty();
         // The first local reader that found metadata supplies `temp`'s ids,
         // as it does the credits (below): the NFO's, else the file's (a
-        // book's OPF identifiers, `OpfReader.CreateBookFromOpf`). Like the
-        // NFO's, they count only when the local readers run (`run_local`):
-        // identifying keeps the chosen result's ids.
-        let local_reader_ids = match (local.found, run_local) {
-            (true, _) => local.ids,
-            (false, true) => embedded_ids,
-            (false, false) => Vec::new(),
-        };
+        // book's OPF identifiers, `OpfReader.CreateBookFromOpf`). Both are
+        // read only under `run_local`, so identifying keeps the chosen
+        // result's ids.
+        let local_reader_ids = if local.found { local.ids } else { embedded_ids };
         // A new item's resolver read the ids its name carries
         // (`SetProviderIdsFromPath`): the item's own before any provider
         // runs.
@@ -18564,10 +18562,16 @@ impl LibraryScanner {
     /// provider ids, the image extracted from the file, for the artwork pass,
     /// and whether a book's reader found metadata at all (a text-only OPF
     /// answers too: `MetadataImport`).
+    ///
+    /// The book readers run only when `run_local`: they are upstream's
+    /// `ILocalMetadataProvider<Book>`s, which identifying skips
+    /// (`MetadataService.cs:802-803`). A photo's reader is `PhotoProvider`, an
+    /// `ICustomMetadataProvider`, which runs whatever the options.
     async fn enrich_from_file(
         &self,
         entity: &mut BaseItemEntity,
         locked: bool,
+        run_local: bool,
         policy: FetcherPolicy<'_>,
     ) -> (
         Vec<PeopleEntity>,
@@ -18576,7 +18580,11 @@ impl LibraryScanner {
         bool,
     ) {
         let images = self.enrich_photo(entity, locked).await;
-        let (people, ids, book_found) = self.enrich_book(entity, locked, policy).await;
+        let (people, ids, book_found) = if run_local {
+            self.enrich_book(entity, locked, policy).await
+        } else {
+            (Vec::new(), Vec::new(), false)
+        };
         (people, ids, images, book_found)
     }
 
