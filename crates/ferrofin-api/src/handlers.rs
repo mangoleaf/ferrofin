@@ -4316,12 +4316,18 @@ pub const VERIFIED: &[Verified] = &[
                under box_set_folders, which a Collections scan storing the box sets of \
                the folders it found (resolve_box_set_folders, BoxSetResolver) holds too, \
                AddToCollectionAsync's refusal of an id naming no item after the box set \
-               is stored) and \
+               is stored, then its UpdateToRepositoryAsync(MetadataEdit) through \
+               save_membership → ProviderManager::update_to_repository, whose \
+               ferrofin-providers box_set_xml.rs BoxSetXmlSaver writes the box set's \
+               collection.xml (BoxSetXmlSaver, BaseXmlSaver.AddCommonNodesAsync and \
+               AddLinkedChildren in local_xml.rs save_collection_xml, \
+               ProviderManager.IsSaverEnabledForItem) and stamps DateLastSaved after it \
+               (LibraryManager.UpdateItemsAsync)) and \
                ensure_collections_folder → collections_library.rs (EnsureLibraryFolder: \
                physical_folder for FindFolders, ensure_library for AddVirtualFolder with its \
                LibraryOptions, ensure_folder for the Folder row ValidateTopLibraryFolders \
                makes)",
-        date: "2026-11-11",
+        date: "2026-11-14",
         divergences: &[
             "A missing name makes a box set with an empty name, where upstream's \
          GetValidFilename dereferences the null and answers 500. Jellyfin bug not ported.",
@@ -4334,6 +4340,20 @@ pub const VERIFIED: &[Verified] = &[
          AddChild overwrites it. Jellyfin bug not ported.",
             "The 400 bodies (a malformed id, an id naming no item) are Ferrofin's error \
          shape, not upstream's. Fix path: gl-666.",
+            "collection.xml writes <Added> and <PremiereDate> in UTC and reads both <Taglines> \
+         and <TagLines>; upstream writes the dates in the server's local time and reads \
+         them back as UTC, which shifts them on every round trip on a server outside UTC, \
+         and reads only the <TagLines> it never writes. On a UTC server both write the \
+         same dates. Jellyfin bug not ported (owner decision 2026-11-14).",
+            "A box set's refresh takes the <DisplayOrder> its collection.xml carries, and no \
+         refresh resets the display order. Upstream starts the provider result from a new \
+         BoxSet, whose DisplayOrder defaults to PremiereDate, so the file's value never \
+         applies and every refresh a provider answered resets the box set's display order \
+         to PremiereDate. Jellyfin bug not ported (owner decision 2026-11-14).",
+            "The always-true BoxSet.IsSaveLocalMetadataEnabled holds only for a box set whose \
+         folder is in the server's own directories; one in a media library is written only \
+         when that library saves into its media folders, or by an edit or member change when \
+         its file already exists (owner decision 2026-10-17).",
         ],
         refs: &[],
     },

@@ -621,6 +621,17 @@ fn local_providers() -> Vec<Provider> {
         compiled: true,
         images: NO_IMAGES,
     }];
+    // `BoxSetXmlProvider` and `BoxSetXmlSaver` (`XmlProviderUtils.Name`):
+    // `GetPluginSummary<BoxSet>` lists both, so a Collections library's
+    // options offer the saver its `MetadataSavers` list must name.
+    providers.push(Provider {
+        name: crate::box_set_xml::SAVER_NAME,
+        caps: &[Cap::LocalMetadata, Cap::MetadataSaver],
+        types: &["BoxSet"],
+        default_enabled: true,
+        compiled: true,
+        images: NO_IMAGES,
+    });
     providers.extend(
         [
             fetcher_names::COMIC,

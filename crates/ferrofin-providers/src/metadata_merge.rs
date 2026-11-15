@@ -357,6 +357,32 @@ pub fn update_from_members(
     }
 }
 
+/// Whether [`update_from_members`] (and the rating `UpdateOfficialRating`
+/// takes from the members) changed a value upstream reports as
+/// `MetadataEdit`: the premiere date or year, the genres or studios (as
+/// sets, ignoring case: `Order().SequenceEqual(…, OrdinalIgnoreCase)`), or
+/// the rating (ignoring case, unset as empty: `UpdateRatingToItems`). The
+/// runtime is `MetadataImport`, so it is not compared.
+#[must_use]
+pub fn members_edited(before: &BaseItemEntity, after: &BaseItemEntity) -> bool {
+    let sorted = |value: Option<&str>| {
+        let mut values: Vec<String> = list(value)
+            .into_iter()
+            .map(ferrofin_util::string_extensions::upper_invariant)
+            .collect();
+        values.sort_unstable();
+        values
+    };
+    before.premiere_date != after.premiere_date
+        || before.production_year != after.production_year
+        || !ferrofin_util::string_extensions::equals_ordinal_ignore_case(
+            before.official_rating.as_deref().unwrap_or(""),
+            after.official_rating.as_deref().unwrap_or(""),
+        )
+        || sorted(before.genres.as_deref()) != sorted(after.genres.as_deref())
+        || sorted(before.studios.as_deref()) != sorted(after.studios.as_deref())
+}
+
 /// `UpdatePremiereDate` (`MetadataService.cs:543-579`): the earliest member
 /// premiere date and its year; with none, or when the earliest is .NET's
 /// `DateTime.MinValue` (an unset date older rows store), the smallest member
