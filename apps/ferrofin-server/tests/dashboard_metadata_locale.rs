@@ -147,11 +147,11 @@ async fn provider(
         return Json(json!({
             "id":603,"imdb_id":"tt0133093","title":format!("Locale {language}"),"overview":format!("Overview {language}"),
             "release_date":"1999-03-30", "vote_average":8,
-            "release_dates":{"results":[
-                {"iso_3166_1":"US","release_dates":[{"certification":"R"}]},
-                {"iso_3166_1":"FR","release_dates":[{"certification":"12"}]},
-                {"iso_3166_1":"DE","release_dates":[{"certification":"12"}]},
-                {"iso_3166_1":"AR","release_dates":[{"certification":"13"}]}
+            "releases":{"countries":[
+                {"iso_3166_1":"US","certification":"R"},
+                {"iso_3166_1":"FR","certification":"12"},
+                {"iso_3166_1":"DE","certification":"12"},
+                {"iso_3166_1":"AR","certification":"13"}
             ]},"videos":{"results":[]},"credits":{"cast":[],"crew":[]}
         })).into_response();
     }
@@ -706,6 +706,18 @@ async fn verify_media_segment_library_options(api: &Api, item: &str) {
             usize::from(!disabled),
             "{served}"
         );
+        if !disabled {
+            let segment = &served["Items"][0];
+            assert_eq!(
+                (
+                    &segment["Type"],
+                    &segment["StartTicks"],
+                    &segment["EndTicks"]
+                ),
+                (&json!("Intro"), &json!(0), &json!(10_000_000)),
+                "the edit is published as posted: {served}"
+            );
+        }
         assert!(
             api.get(&format!("/Episode/{item}/Timestamps")).await["Introduction"].is_object(),
             "management access preserves hidden detections"

@@ -2337,23 +2337,28 @@ async fn refresh_an_item_with_no_file_refreshes_through_the_provider_queue() {
     }
 }
 
-/// `POST /Items/{itemId}/Refresh` for a missing item is a `404` (never queues).
+/// `POST /Items/{itemId}/Refresh` for a missing item is a `404`; for the nil
+/// id a `400`, as `GetItemById(Guid.Empty)` throws `ArgumentException`. Neither
+/// queues.
+#[rstest::rstest]
+#[case::missing(Uuid::from_u128(0xC0DE), StatusCode::NOT_FOUND)]
+#[case::nil(Uuid::nil(), StatusCode::BAD_REQUEST)]
 #[tokio::test]
-async fn refresh_missing_item_is_404() {
+async fn refresh_unresolved_item(#[case] item_id: Uuid, #[case] expected: StatusCode) {
     let queued = Arc::new(Mutex::new(Vec::new()));
     let router = create_router(state(Uuid::from_u128(0x5C), queued.clone()));
     let response = router
         .oneshot(
             Request::builder()
                 .method("POST")
-                .uri(format!("/Items/{}/Refresh", Uuid::from_u128(0xC0DE)))
+                .uri(format!("/Items/{item_id}/Refresh"))
                 .header("X-Emby-Token", "valid")
                 .body(Body::empty())
                 .unwrap(),
         )
         .await
         .unwrap();
-    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    assert_eq!(response.status(), expected);
     assert!(queued.lock().unwrap().is_empty());
 }
 

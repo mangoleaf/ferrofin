@@ -627,7 +627,7 @@ impl ItemVisibility {
     /// already followed, so a later call reads only what its own `wanted` adds.
     async fn load_hierarchy(
         &self,
-        rows: &mut HashMap<Uuid, Cow<'_, BaseItemEntity>>,
+        rows: &mut HashMap<Uuid, RowRef<'_>>,
         links: &mut HashMap<Uuid, Vec<Uuid>>,
         examined: &mut HashSet<Uuid>,
         mut wanted: HashSet<Uuid>,
@@ -649,7 +649,8 @@ impl ItemVisibility {
                     self.hierarchy_rows
                         .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                     // What the caller passed (an item with unsaved changes, the cached libraries) wins.
-                    rows.entry(row_id(&row)).or_insert(Cow::Owned(row));
+                    rows.entry(row_id(&row))
+                        .or_insert_with(|| RowRef::Owned(Box::new(row)));
                 }
             }
             let fresh: Vec<_> = rows
@@ -685,7 +686,7 @@ impl ItemVisibility {
     }
 
     /// Every reader sees the expanded path; a borrowed row is copied only when it changes.
-    fn expand_paths(&self, rows: &mut HashMap<Uuid, Cow<'_, BaseItemEntity>>) {
+    fn expand_paths(&self, rows: &mut HashMap<Uuid, RowRef<'_>>) {
         for row in rows.values_mut() {
             let expanded = match row.path.as_deref().map(|path| self.paths.expand_cow(path)) {
                 Some(Cow::Owned(path)) => Some(path),
@@ -797,14 +798,14 @@ impl ItemVisibility {
         } else {
             (Vec::new(), Vec::new())
         };
-        let mut rows: HashMap<Uuid, Cow<'a, BaseItemEntity>> = libraries
+        let mut rows: HashMap<Uuid, RowRef<'a>> = libraries
             .rows
             .iter()
             .chain(items)
-            .map(|row| (row_id(row), Cow::Borrowed(row)))
+            .map(|row| (row_id(row), RowRef::Borrowed(row)))
             .collect();
         for row in known.iter().chain(&libraries.ancestors) {
-            rows.entry(row_id(row)).or_insert(Cow::Borrowed(row));
+            rows.entry(row_id(row)).or_insert(RowRef::Borrowed(row));
         }
         let (mut links, mut examined) = (HashMap::new(), HashSet::new());
         self.load_hierarchy(&mut rows, &mut links, &mut examined, HashSet::new())
@@ -950,12 +951,46 @@ pub(crate) async fn library_set(
     }))
 }
 
+/// A [`Context`] row: borrowed from the caller or the library set, or owned. The owned row is
+/// boxed so a map slot is two words, not a whole entity as `Cow<BaseItemEntity>`'s is, when
+/// nearly every row of a large folder is borrowed (gl-1493).
+enum RowRef<'a> {
+    Borrowed(&'a BaseItemEntity),
+    Owned(Box<BaseItemEntity>),
+}
+
+const _: () = assert!(std::mem::size_of::<RowRef<'static>>() <= 16);
+
+impl RowRef<'_> {
+    /// The row, copied first when it is borrowed: `Cow::to_mut`.
+    fn to_mut(&mut self) -> &mut BaseItemEntity {
+        if let Self::Borrowed(row) = *self {
+            *self = Self::Owned(Box::new(row.clone()));
+        }
+        match self {
+            Self::Owned(row) => row,
+            Self::Borrowed(_) => unreachable!("made owned above"),
+        }
+    }
+}
+
+impl std::ops::Deref for RowRef<'_> {
+    type Target = BaseItemEntity;
+
+    fn deref(&self) -> &BaseItemEntity {
+        match self {
+            Self::Borrowed(row) => row,
+            Self::Owned(row) => row,
+        }
+    }
+}
+
 struct Context<'a> {
     service: &'a ItemVisibility,
     user: Option<&'a UserEntity>,
     /// Every row the checks read, by id, its path expanded: borrowed from the caller and the
     /// library set, owned when [`ItemVisibility::load_hierarchy`] read it or its path changed.
-    rows: HashMap<Uuid, Cow<'a, BaseItemEntity>>,
+    rows: HashMap<Uuid, RowRef<'a>>,
     /// Every library's id, in the set's order, with its `PhysicalLocationsList` expanded.
     library_locations: Vec<(Uuid, Vec<Cow<'a, str>>)>,
     links: HashMap<Uuid, Vec<Uuid>>,
@@ -1035,10 +1070,10 @@ impl Context<'_> {
             };
             next.extend(references(&row));
             match row {
-                Cow::Borrowed(_) => {
+                RowRef::Borrowed(_) => {
                     borrowed.insert(id);
                 }
-                Cow::Owned(row) => owned.push(row),
+                RowRef::Owned(row) => owned.push(*row),
             }
         }
         (borrowed, owned)
@@ -3105,11 +3140,12 @@ mod tests {
 
     /// The context holds the caller's rows and the cached library set's rows themselves, not
     /// copies; a cached row whose stored path holds a token is the one copied, its path expanded,
-    /// and the cached set keeps the stored path (gl-1001).
+    /// and the cached set keeps the stored path (gl-1001). A row only the hierarchy walk read is
+    /// owned, beside the borrowed and the copied ones in the same context (gl-1493).
     #[tokio::test]
     async fn the_context_borrows_caller_and_cached_rows() {
         let mut f = Fixture::new().await;
-        let [root, user_root, shared, other, _, movie] = virtual_path_layout(&mut f).await;
+        let [root, user_root, shared, other, physical, movie] = virtual_path_layout(&mut f).await;
         let libraries = f.service.rating_libraries().await.expect("libraries");
         let items = [movie];
         let context = f
@@ -3145,6 +3181,15 @@ mod tests {
             assert_eq!(held(row).path.as_deref(), Some(expanded));
             assert_eq!(cached(row).path, row.path, "the stored path stays cached");
         }
+        assert!(
+            matches!(context.rows[&row_id(&physical)], RowRef::Owned(_)),
+            "read by the hierarchy walk"
+        );
+        assert_eq!(
+            held(&physical).path,
+            physical.path,
+            "a path without a token"
+        );
         assert_eq!(
             context.libraries(&items[0]).expect("libraries"),
             [row_id(&shared)]

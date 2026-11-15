@@ -993,6 +993,9 @@ impl StreamStatePlanner for FerrofinStreamStatePlanner {
             // live MPEG-TS usually probes with no bitrate, so leaving it unset
             // software-transcodes every channel that could have been copied.
             live_stream_id: request.live_stream_id.clone(),
+            // As sent, never the resolved source: the ffmpeg log name carries
+            // it (`state.Request.MediaSourceId`), empty when none was sent.
+            media_source_id: request.media_source_id.clone(),
             // Only the video HLS actions bind `alwaysBurnInSubtitleWhenTranscoding`
             // upstream; the audio HLS actions pin it false and the progressive
             // stream actions never read it.
@@ -1897,11 +1900,17 @@ impl FerrofinStreamStatePlanner {
             // 20 s, TS segments (PTS carry the TS muxer's 1.4 s start offset):
             // first video / audio PTS 16.40 / 16.39 s with the flag, 16.40 /
             // 19.38 s without (the audio a whole 3 s after the video).
+            //
+            // An audio-only job has no video to align with (its video
+            // "encoder" is `copy` only because there is no video stream), so
+            // its re-encoded audio keeps the accurate seek: untrimmed, it
+            // starts where the demuxer landed, up to an Ogg page or a
+            // Matroska cluster before the target (gl-1778).
             let wtv = state
                 .input_container
                 .as_deref()
                 .is_some_and(|c| c.eq_ignore_ascii_case("wtv"));
-            if copying_video && !progressive && !wtv {
+            if copying_video && state.video_stream.is_some() && !progressive && !wtv {
                 args.push("-noaccurate_seek".to_owned());
             }
         }
@@ -2177,7 +2186,7 @@ impl FerrofinStreamStatePlanner {
                 &hw::quality::hardware_quality_preamble(&decode_ctx, options, &video_encoder),
             );
             // The probed capabilities, not the helper's boot ones: only the
-            // probe knows whether the VAAPI driver is iHD.
+            // probe knows whether the VAAPI driver is iHD or i965.
             push_split(
                 &mut args,
                 &self.encoding_helper.video_quality_param_with(
@@ -7214,6 +7223,31 @@ mod tests {
         );
     }
 
+    /// gl-835: the job keeps the `MediaSourceId` the request sent, which the
+    /// ffmpeg log's name carries, and none when the request named none, even
+    /// though the job reads the item's first source then.
+    #[tokio::test]
+    async fn the_job_keeps_the_media_source_id_the_request_sent() {
+        let p = planner(vec![source(
+            "abc",
+            vec![video_stream("h264"), audio_stream("aac")],
+        )]);
+        // "ABC" names the source "abc" too: the job keeps the spelling sent.
+        for sent in [Some("ABC"), None] {
+            let req = HlsStreamRequest {
+                media_source_id: sent.map(str::to_owned),
+                video_codec: Some("h264".to_owned()),
+                ..request("abc")
+            };
+            let plan = p
+                .plan(&req, false, Some(0), PlaylistKind::Vod)
+                .await
+                .unwrap();
+            assert_eq!(plan.state.media_source.id.as_deref(), Some("abc"));
+            assert_eq!(plan.state.base_request.media_source_id.as_deref(), sent);
+        }
+    }
+
     #[tokio::test]
     async fn a_seek_starts_at_the_segments_playlist_time_not_its_index() {
         // A remux playlist is cut on keyframes, so segment 2 can start at
@@ -7590,6 +7624,38 @@ mod tests {
         assert!(
             !plan.arguments.iter().any(|a| a == "-noaccurate_seek"),
             "wtv input keeps accurate seek: {:?}",
+            plan.arguments
+        );
+    }
+
+    #[tokio::test]
+    async fn plan_seeked_audio_only_job_keeps_accurate_seek() {
+        // An audio request has no video stream, so its video "encoder" is
+        // `copy`, yet there is no keyframe to align with: the re-encoded audio
+        // must be trimmed to the target, or it starts where the demuxer
+        // landed, up to an Ogg page or a Matroska cluster early (gl-1778).
+        let p = planner(vec![source("abc", vec![audio_stream("opus")])]);
+        let mut req = request("abc");
+        req.segment_container = Some("mp4".to_owned());
+        req.audio_codec = Some("aac".to_owned());
+        let plan = p
+            .plan(&at_segment(req, 2), true, Some(2), PlaylistKind::Vod)
+            .await
+            .unwrap();
+        assert!(
+            plan.arguments.windows(2).any(|w| w == ["-c:a", "aac"]),
+            "{:?}",
+            plan.arguments
+        );
+        // It seeks to the segment start, with no remux half second.
+        assert!(
+            plan.arguments.windows(2).any(|w| w == ["-ss", "60000000"]),
+            "{:?}",
+            plan.arguments
+        );
+        assert!(
+            !plan.arguments.iter().any(|a| a == "-noaccurate_seek"),
+            "audio-only seek keeps accurate seek: {:?}",
             plan.arguments
         );
     }
@@ -8365,6 +8431,45 @@ mod tests {
 
         assert!(args.contains("-c:v h264_vaapi"), "{args}");
         assert!(args.contains(" -compression_level 3"), "{args}");
+    }
+
+    /// `GetVideoBitrateParam`'s VAAPI arm keys on `IsVaapiDeviceInteli965`,
+    /// which only the per-job probe learns: VBR, but CBR on an i965 device.
+    #[tokio::test]
+    async fn a_probed_vaapi_driver_picks_the_rate_control_mode() {
+        for (driver, rc_mode) in [
+            ("Intel iHD driver", "VBR"),
+            ("Intel i965 driver", "CBR"),
+            ("Mesa Gallium driver 24.0.0 for AMD Radeon", "VBR"),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            stub_vaapi_ffmpeg(dir.path(), driver);
+            let p = planner_over_caps(
+                Arc::new(FakeMediaSources {
+                    sources: vec![source(
+                        "abc",
+                        vec![nvdec_decodable_video_stream(), audio_stream("aac")],
+                    )],
+                    live_streams: HashMap::new(),
+                }),
+                vaapi_caps(),
+                vaapi_options(),
+            );
+            let mut req = request("abc");
+            req.video_codec = Some("h264".to_owned());
+            req.allow_video_stream_copy = false;
+            req.video_bitrate = Some(3_000_000);
+            let plan = p.plan(&req, false, None, PlaylistKind::Vod).await.unwrap();
+            let args = plan.arguments.join(" ");
+
+            assert!(args.contains("-c:v h264_vaapi"), "{driver}: {args}");
+            assert!(
+                args.contains(&format!(
+                    " -rc_mode {rc_mode} -b:v 3000000 -maxrate 3000000 -bufsize 6000000"
+                )),
+                "{driver}: {args}"
+            );
+        }
     }
 
     #[tokio::test]

@@ -188,8 +188,8 @@ const PARTIAL_SUFFIX: &str = ".partial";
 /// `POST /Backup/Create` to start: `BackupService.CreateBackupAsync`'s
 /// `FiveGigabyte`, copied verbatim (it is 5 bytes short of 5 GiB).
 ///
-/// A build that cannot read free space (non-unix: `free_space_of` reports
-/// `-1`) refuses every create, as upstream's catch arm would.
+/// Free space that cannot be read (`free_space_of` reports `-1`) refuses the
+/// create, as upstream's catch arm does.
 ///
 /// FLAGGED as a candidate setting — plausible range 1 GiB…10 GiB, default
 /// upstream's.

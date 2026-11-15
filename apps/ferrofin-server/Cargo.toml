@@ -62,6 +62,9 @@ sha2.workspace = true         # the `ETag` of a File Transformation-rewritten /w
 tracing.workspace = true
 tracing-subscriber.workspace = true
 tracing-appender.workspace = true
+# the daily log file's local date (log_yyyyMMdd.log); the live_tv_artwork and
+# item_visibility tests date their guide fixture with it too.
+chrono.workspace = true
 # OTLP trace export (off unless OTEL_EXPORTER_OTLP_ENDPOINT is set); see PLAN_TRACES.
 opentelemetry.workspace = true
 opentelemetry_sdk.workspace = true
@@ -71,8 +74,6 @@ tracing-opentelemetry.workspace = true
 [dev-dependencies]
 # state.rs storage test, planner.rs label test: the virtual-folder fake that counts full listings.
 ferrofin-api = { workspace = true, features = ["test-util"] }
-# live_tv_artwork, item_visibility: date the guide fixture, whose window follows the clock.
-chrono.workspace = true
 # manpage test: renders contrib/debian/ferrofin-server.1 from the clap `Cli`.
 clap_mangen.workspace = true
 tempfile.workspace = true

@@ -2372,7 +2372,7 @@ fn apply_transcoding_conditions(
                 if !enable_non_qualified_conditions {
                     continue;
                 }
-                if let Ok(num) = value.parse::<f32>() {
+                if let Some(num) = ferrofin_util::invariant_float::parse::<f32>(value) {
                     match condition.condition {
                         ProfileConditionType::Equals => item.max_framerate = Some(num),
                         ProfileConditionType::LessThanEqual => {
@@ -2763,6 +2763,32 @@ mod tests {
                  DOVIWithHDR10Plus,DOVIWithELHDR10Plus,DOVIInvalid"
             )
         );
+    }
+
+    /// `float.TryParse(value, CultureInfo.InvariantCulture, out var num)`
+    /// (`StreamBuilder.cs:2214`, `NumberStyles.Float | AllowThousands`): a
+    /// group separator and white space are a framerate, Rust's `inf` is not.
+    #[test]
+    fn a_framerate_condition_reads_its_value_as_dotnet_does() {
+        use super::{
+            DeviceProfile, ProfileCondition, ProfileConditionType, ProfileConditionValue,
+            StreamInfo, apply_transcoding_conditions,
+        };
+        for (value, expected) in [
+            ("1,000", Some(1000.0)),
+            (" 30 ", Some(30.0)),
+            ("Infinity", Some(f32::INFINITY)),
+            ("inf", None),
+        ] {
+            let mut item = StreamInfo::new(DeviceProfile::default());
+            let condition = ProfileCondition::new(
+                ProfileConditionType::Equals,
+                ProfileConditionValue::VideoFramerate,
+                value.to_owned(),
+            );
+            apply_transcoding_conditions(&mut item, &[condition], Some("h264"), true, true);
+            assert_eq!(item.max_framerate, expected, "{value}");
+        }
     }
 
     #[test]

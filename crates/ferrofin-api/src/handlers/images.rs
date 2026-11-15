@@ -424,13 +424,19 @@ fn bind_query_image_format(format: Option<&str>) -> Result<Option<ImageFormat>, 
     }
 }
 
-/// Binds one required numeric route segment as ASP.NET binds a route value:
-/// with the converter the query binder ports (trimmed; an integer also takes
-/// the `0x`, `#` and `&h` hex forms, measured on 12.4), a failure being the
-/// `400` its model binder produces for `[FromRoute, Required] int`/`double`.
+/// Binds one required numeric route segment as ASP.NET binds a route value,
+/// with the rules the query binder ports (an integer trimmed, also in the `0x`,
+/// `#` and `&h` hex forms; a double through `DoubleModelBinder`, with group
+/// separators and no `inf`; measured on 12.4), a failure being the `400` its
+/// model binder produces for `[FromRoute, Required] int`/`double`. A NUL,
+/// which the query binder takes after a number, is a `400` here: Kestrel
+/// refuses a path holding one before any route runs (measured on 12.4).
 fn bind_route_number<T: serde::de::DeserializeOwned>(raw: &str, name: &str) -> Result<T, ApiError> {
-    T::deserialize(crate::query::value::Value::nullable(raw))
-        .map_err(|_| ApiError::BadRequest(format!("The value '{raw}' is not valid for {name}.")))
+    let invalid = || ApiError::BadRequest(format!("The value '{raw}' is not valid for {name}."));
+    if raw.contains('\0') {
+        return Err(invalid());
+    }
+    T::deserialize(crate::query::value::Value::nullable(raw)).map_err(|_| invalid())
 }
 
 /// Selects the image of `image_type` at `index` (default `0`) from an item's
@@ -2199,6 +2205,14 @@ mod tests {
         assert_eq!(bind_route_number::<i32>(" #10 ", "maxWidth").ok(), Some(16));
         assert_eq!(bind_route_number::<i32>("&h10", "maxWidth").ok(), Some(16));
         assert!(bind_route_number::<i32>("2147483648", "maxWidth").is_err());
+        assert!(bind_route_number::<f64>("inf", "percentPlayed").is_err());
+        // Kestrel refuses a NUL in the path; the query binder takes one.
+        assert!(bind_route_number::<i32>("1\0", "maxWidth").is_err());
+        assert!(bind_route_number::<f64>("1\0", "percentPlayed").is_err());
+        assert_eq!(
+            bind_route_number::<f64>("1,000", "percentPlayed").ok(),
+            Some(1000.0)
+        );
     }
 
     fn img(path: String) -> ItemImageInfo {
