@@ -9004,9 +9004,10 @@ impl LibraryScanner {
             .await?;
         // A new video needs its first item save for the trickplay FK, so its
         // custom provider runs here, before the stamp; ordinary
-        // custom-provider errors still complete, and a cancel (its only
-        // `false`) withholds the stamp below. NonBlocking starts every
-        // video's refresh here, by id, once its row and streams are saved.
+        // custom-provider errors still complete (Jellyfin 12.0's rule;
+        // gl-1826), and a cancel (its only `false`) withholds the stamp
+        // below. NonBlocking starts every video's refresh here, by id, once
+        // its row and streams are saved.
         match trickplay {
             Some((provider, library, true)) if stored_row.is_none() => {
                 provider
@@ -18532,10 +18533,16 @@ impl LibraryScanner {
         let mut chapters = match self.video_chapters(video, probe) {
             Ok(chapters) => chapters,
             Err(error) => {
-                // ProbeProvider is a pre-refresh custom provider. Jellyfin
-                // catches its ordinary error without incrementing Failures:
-                // updated probe fields/streams survive, old chapters remain,
-                // and other successful providers may complete the refresh.
+                // ProbeProvider is a pre-refresh custom provider: updated
+                // probe fields/streams survive and old chapters remain.
+                // TODO(parity, open work item — NOT an accepted divergence;
+                // gl-1826): since Jellyfin 12.1 `RunCustomProvider` counts
+                // this error (`Failures++`), so the refresh is not stamped
+                // (and the merge reads it); here it still is. Un-defer path:
+                // the pass's failures are decided before this runs, so check
+                // the runtime before the decision, or report the failure so
+                // `scan_item` writes the kept stamp; flip
+                // `rejected_dummy_runtime_preserves_chapters_and_completes_probe_metadata_refresh`.
                 tracing::error!(%error, item_id = %video.id, "cannot generate dummy chapters");
                 return Ok(());
             }

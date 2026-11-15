@@ -94,8 +94,16 @@ fn outcome(id: Uuid, result: Option<Result<(), ServiceError>>) -> bool {
         Some(Ok(())) => true,
         Some(Err(error)) => {
             tracing::warn!(item_id = %id, %error, "scan trickplay refresh failed");
-            // MetadataService.RunCustomProvider only sets ErrorMessage for
-            // ordinary errors; it does not increment Failures.
+            // TODO(parity, open work item — NOT an accepted divergence;
+            // gl-1826): since Jellyfin 12.1 `RunCustomProvider` counts an
+            // ordinary error (`Failures++`), so a Blocking refresh that fails
+            // leaves the item's `DateLastRefreshed` where it was; here the
+            // scan stamps it. Un-defer path: report a failure apart from a
+            // cancel, have `scan_item` write the kept stamp after a failed
+            // Blocking refresh, and flip the tests that pin the 12.0 rule
+            // (`blocking_custom_provider_service_error_still_updates_the_refresh_stamp`
+            // and `blocking_cancellation_drops_work_and_provider_failures_do_not_abort_the_refresh`).
+            // A detached refresh's result stays dropped.
             true
         }
         None => false,
