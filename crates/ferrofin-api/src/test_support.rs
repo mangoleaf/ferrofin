@@ -2943,8 +2943,8 @@ fn fake_state_over(
 /// for the `/Plugins/*`, `/Packages/*` and `/Repositories` handler tests.
 ///
 /// Every other manager is the [`fake_state`] double; authentication succeeds
-/// as an **API key** ([`ApiKeyAuthService`]) so both the plain-auth reads and
-/// the admin-gated mutators reach their handler.
+/// as an **API key** ([`ApiKeyAuthService`]) so every admin-gated route reaches
+/// its handler.
 #[must_use]
 pub fn authed_state_with_plugins(
     plugins: Arc<dyn ferrofin_traits::plugins::PluginManager>,
