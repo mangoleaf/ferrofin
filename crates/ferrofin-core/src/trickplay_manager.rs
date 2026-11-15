@@ -375,11 +375,9 @@ impl FerrofinTrickplayManager {
         let Some(live_tv) = self.live_tv.as_ref().and_then(std::sync::Weak::upgrade) else {
             return Ok(false);
         };
-        Ok(live_tv
-            .active_recording_paths()
-            .await?
-            .iter()
-            .any(|path| entity.path.as_ref() == Some(path)))
+        live_tv
+            .is_active_recording(entity.path.as_deref().unwrap_or_default())
+            .await
     }
 
     /// Creates a trickplay manager over the given database, path manager,

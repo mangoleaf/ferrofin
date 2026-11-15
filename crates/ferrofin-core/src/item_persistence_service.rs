@@ -3104,24 +3104,6 @@ impl ItemPersistenceService for FerrofinItemPersistenceService {
         tx.commit().await.map_err(db_err)
     }
 
-    async fn save_images(&self, item: &BaseItemEntity) -> Result<(), ServiceError> {
-        // The image rows live in BaseItemImageInfos and are written through
-        // `save_item_images`/`set_item_image*`; without the domain item's
-        // ImageInfos list on the entity there is nothing to persist here beyond
-        // confirming the item exists, and nothing calls this. TODO(gl-211): open
-        // work item: remove it from the trait.
-        let exists: Option<i64> =
-            sqlx::query_scalar(r#"SELECT 1 FROM "BaseItems" WHERE "Id" = ?1"#)
-                .bind(&item.id)
-                .fetch_optional(self.db.pool())
-                .await
-                .map_err(db_err)?;
-        if exists.is_none() {
-            return Err(ServiceError::not_found(format!("item {}", item.id)));
-        }
-        Ok(())
-    }
-
     async fn save_item_images(
         &self,
         item_id: Uuid,
@@ -4446,10 +4428,15 @@ impl ItemPersistenceService for FerrofinItemPersistenceService {
     }
 
     async fn update_inherited_values(&self) -> Result<(), ServiceError> {
-        // A no-op that nothing calls. Upstream's `UpdateInheritedValues` deletes
-        // the `ItemValuesMap` rows of type `InheritedTags`, which Ferrofin never
-        // writes (an adopted database may hold some). TODO(gl-211): open work
-        // item: port it and call it after the post-scan tasks, or remove it.
+        // `ItemPersistenceService.cs:161-170`: one statement, so no transaction.
+        sqlx::query(
+            r#"DELETE FROM "ItemValuesMap" WHERE "ItemValueId" IN
+               (SELECT "ItemValueId" FROM "ItemValues" WHERE "Type" = ?1)"#,
+        )
+        .bind(i32::from(ferrofin_db::enums::ItemValueType::InheritedTags))
+        .execute(self.db.writer())
+        .await
+        .map_err(db_err)?;
         Ok(())
     }
 }
