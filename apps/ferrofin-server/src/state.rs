@@ -625,11 +625,12 @@ pub async fn build_app_state(
             tracing::warn!(%err, "person identity unification failed; person favorites may not round-trip");
         }
     }
-    // One-shot: rewrite `Person` rows missing their metadata `Path` /
-    // `PresentationUniqueKey`, or carrying the generic lower-cased sort key
-    // instead of the verbatim name Jellyfin sorts people by. C# recomputes all
-    // three on every save; Ferrofin's person inserts are `INSERT OR IGNORE`, so
-    // without this a row written by an older build stays wrong forever.
+    // One-shot: rewrite `Person` rows missing their metadata `Path`, or
+    // carrying the generic lower-cased sort key instead of the verbatim name
+    // Jellyfin sorts people by. C# recomputes both on every save; Ferrofin's
+    // person inserts are `INSERT OR IGNORE`, so without this a row written by
+    // an older build stays wrong forever. (A keyless row's
+    // `PresentationUniqueKey` was already written by `run_migrations`.)
     match people_repository_impl.repair_person_items().await {
         Ok(0) => {}
         Ok(repaired) => {
