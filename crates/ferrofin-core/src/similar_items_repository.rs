@@ -229,12 +229,14 @@ impl SimilarItemsRepository {
         let mut rows = query.fetch_all(self.db.pool()).await.map_err(db_err)?;
 
         // `GetPeopleNamesByItems`: credits in billing (`ListOrder`) order,
-        // grouped per item in first-appearance order. Upstream leaves equal
-        // `ListOrder`s across items in whatever order the database returns;
-        // the caller's item order (most recently played first) breaks them
-        // here, so the answer is stable.
-        let rank = |item: &str| db_ids.iter().position(|id| id == item);
-        rows.sort_by_key(|(item, _, list_order)| (*list_order, rank(item)));
+        // grouped per item in first-appearance order. Equal `ListOrder`s across
+        // items come back as upstream's statement returns them: SQLite walks its
+        // `IN` list in sorted `ItemId` order and its sorter keeps that order for
+        // ties, so the lower item id comes first, whatever order the caller
+        // passed the items in (the plan is recorded on gl-1799).
+        rows.sort_by(|(a_item, _, a_order), (b_item, _, b_order)| {
+            a_order.cmp(b_order).then_with(|| a_item.cmp(b_item))
+        });
         let mut groups: Vec<(String, Vec<String>)> = Vec::new();
         for (item, name, _) in rows {
             let index = if let Some(index) = groups.iter().position(|(id, _)| *id == item) {

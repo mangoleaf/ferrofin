@@ -2397,8 +2397,10 @@ pub const VERIFIED: &[Verified] = &[
                in Random order, Limit 10, without the recently played, both under ParentId and \
                EnableGroupByMetadataKey, so item_repository.rs grouped_by_metadata_key reads 4 \
                more; similar_items_repository.rs people_names_of over the first 6 played, \
-               GetPeopleNamesByItems in ListOrder per item, distinct; each baseline capped to \
-               categoryLimit and scored by similar_category through local_similar, the \
+               GetPeopleNamesByItems in ListOrder per item, distinct, with equal ListOrders \
+               on two films in ItemId order, the order SQLite returns for upstream's \
+               statement; each baseline capped to categoryLimit and scored by \
+               similar_category through local_similar, the \
                MovieSimilarItemsProvider path of the similar-items rows for every baseline, \
                whatever its kind, with the user and Limit = itemLimit, no remote provider; \
                next_person_category, the lazy GetPersonRecommendations: Person = name, \
@@ -2418,10 +2420,6 @@ pub const VERIFIED: &[Verified] = &[
          every baseline of a stream in one pass, filters the union of their windows once and \
          fills each category from any candidate in that union its baseline scored, so a \
          category the filter left short can be longer upstream. Fix path: gl-1357.",
-            "Credits of equal ListOrder on different played films are named in play order, \
-         most recent first; upstream's GetPeopleNamesByItems leaves them in the order the \
-         database returns them, which decides whose cast heads the actor stream. Fix path: \
-         gl-1799.",
             "An itemLimit above 715827882 overflows upstream's limit * 3 to a negative Take, so \
          every similar-to category is empty; the oversample saturates here. Jellyfin bug not \
          ported.",

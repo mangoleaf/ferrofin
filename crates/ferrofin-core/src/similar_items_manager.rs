@@ -4200,7 +4200,10 @@ mod tests {
         // C# `GetPeopleNamesByItems` orders credits by `ListOrder` and groups
         // them per item; `GetPeopleNames` flattens with a stable `Distinct`. So
         // the lead of each film comes before its supporting cast, whatever
-        // order the names or person ids sort in.
+        // order the names or person ids sort in. Equal `ListOrder`s on
+        // different films come back in ascending item id: SQLite walks the
+        // statement's `IN` list in sorted order and its sorter keeps that
+        // order for ties, whatever order the ids were passed in (gl-1799).
         let db = test_db().await;
         let first = Uuid::from_u128(0x701);
         let second = Uuid::from_u128(0x702);
@@ -4227,8 +4230,9 @@ mod tests {
         )
         .await;
 
-        // `second` was played most recently, so its cast leads; `Zed Lead`
-        // keeps the place of his first credit.
+        // `second` was played most recently, but `first` has the lower id, so
+        // its lead takes the first tie and its cast leads; `Zed Lead` keeps
+        // the place of his first credit.
         let names = manager(&db)
             .repo
             .people_names_of(&[second, first], &["Actor", "GuestStar"])
@@ -4236,9 +4240,15 @@ mod tests {
             .expect("names");
         assert_eq!(
             names,
-            vec!["Yan Lead", "Bob Guest", "Zed Lead", "Amy Support"],
-            "billing order per film, the most recent film first, each name once"
+            vec!["Zed Lead", "Amy Support", "Yan Lead", "Bob Guest"],
+            "billing order per film, the lower item id first on a tie, each name once"
         );
+        let reversed = manager(&db)
+            .repo
+            .people_names_of(&[first, second], &["Actor", "GuestStar"])
+            .await
+            .expect("names");
+        assert_eq!(reversed, names, "the caller's item order breaks no tie");
     }
 
     #[tokio::test]
