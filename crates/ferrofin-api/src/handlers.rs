@@ -5151,8 +5151,9 @@ pub const VERIFIED: &[Verified] = &[
                query; every page of SearchSubtitlesAsync; BadSubtitleFilter, with the files a \
                download found empty, MediaFilter and MatchFilter; the order by hash match, \
                downloads, rating and trusted uploader; one candidate per result, its first \
-               file's id, with Release, Comments, Ratings, UploadDate, Fps and the machine and \
-               AI translation flags)",
+               file's id, with ProviderName \"Open Subtitles\" (the plugin's Name, also the \
+               fetcher name DisabledSubtitleFetchers and SubtitleFetcherOrder hold), Release, \
+               Comments, Ratings, UploadDate, Fps and the machine and AI translation flags)",
         date: "2026-11-14",
         divergences: &[
             "With an OpenSubtitles API key and no account, a manual search still searches; \
@@ -5163,9 +5164,6 @@ pub const VERIFIED: &[Verified] = &[
          validation included), and a download still tries to log in with it; \
          the plugin saves the flag to its configuration until its settings page validates new \
          credentials, and fails such a download at once (Unable to login). Fix path: gl-1644.",
-            "OpenSubtitles candidates carry ProviderName \"opensubtitles\" and the MD5 of that \
-         name as their id prefix; the plugin's Name, and so upstream's, is \"Open Subtitles\". \
-         Fix path: gl-1704.",
             "The 401 (no or bad token), 403 (no subtitle management) and 404 bodies are \
          Ferrofin's error shape, not upstream's. Fix path: gl-666.",
         ],

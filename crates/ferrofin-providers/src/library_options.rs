@@ -1757,6 +1757,24 @@ mod tests {
         assert_eq!(has_os, cfg!(feature = "opensubtitles"));
     }
 
+    /// jellyfin-web saves the advertised name in a library's
+    /// `DisabledSubtitleFetchers` and `SubtitleFetcherOrder`, which the
+    /// subtitle manager compares with the provider's `name()`.
+    #[cfg(feature = "opensubtitles")]
+    #[test]
+    fn advertised_subtitle_fetcher_is_the_provider_name() {
+        let info = library_options_info(&["Movie".to_owned()], false, &[], &[]);
+        let names: Vec<_> = info
+            .subtitle_fetchers
+            .iter()
+            .filter_map(|o| o.name.as_deref())
+            .collect();
+        assert!(
+            names.contains(&crate::opensubtitles::PLUGIN_NAME),
+            "{names:?}"
+        );
+    }
+
     /// `SupportedImageTypes` is the union of the compiled image providers'
     /// `GetSupportedImages`, so it can only name types some provider can
     /// actually supply. It used to be a hardcoded 11-element enum dump that
