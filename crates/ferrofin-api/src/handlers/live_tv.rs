@@ -1731,7 +1731,8 @@ impl SetChannelMappingDto {
 /// returns that tuner channel's recomputed
 /// [`TunerChannelMapping`](ferrofin_model::live_tv::TunerChannelMapping).
 /// `400` when an id is missing or blank, `404` when the provider id or the
-/// tuner channel id names nothing.
+/// tuner channel id names nothing, or, after the pair is stored, when a local
+/// XMLTV guide file is not there and no copy is cached.
 async fn set_channel_mapping(
     State(state): State<AppState>,
     RequireAdmin(_auth): RequireAdmin,
@@ -2108,7 +2109,8 @@ struct ChannelMappingOptionsQuery {
 /// Port of `LiveTvController.GetChannelMappingOptions` →
 /// `ListingsManager.GetChannelMappingOptions`. `404` when `providerId` is
 /// absent or names no configured provider (upstream's unguarded `.First(...)`
-/// throws there, which the middleware turns into a 500).
+/// throws there, which the middleware turns into a 500), or when a local XMLTV
+/// guide file is not there and no copy is cached (`FileNotFoundException`).
 async fn get_channel_mapping_options(
     State(state): State<AppState>,
     RequireAdmin(_auth): RequireAdmin,
@@ -2151,7 +2153,8 @@ struct LineupsQuery {
 ///
 /// Port of `LiveTvController.GetLineups` → `ListingsManager.GetLineups`. `404`
 /// when the provider cannot be resolved, which is what the C#
-/// `ResourceNotFoundException` maps to.
+/// `ResourceNotFoundException` maps to, or when a local XMLTV guide file is not
+/// there and no copy is cached (`FileNotFoundException`).
 ///
 /// `[Authorize(Policy = Policies.LiveTvAccess)]` upstream
 /// (`LiveTvController.cs:1075` @ v10.11.8), and [`RequireLiveTvAccess`] is the

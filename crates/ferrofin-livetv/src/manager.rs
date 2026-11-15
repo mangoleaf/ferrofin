@@ -2250,7 +2250,34 @@ impl FerrofinLiveTvManager {
                 .map(sd_epg_channel)
                 .collect());
         }
-        let document = self.xmltv.get_xml(info).await?;
+        // `GetXml` rethrows what failed when no copy is cached. A file or
+        // directory that is not there, the guide or the cache file it writes,
+        // is `FileNotFoundException` or `DirectoryNotFoundException`, a 404
+        // (`ExceptionMiddleware.GetStatusCode`); an empty path is
+        // `ArgumentException`, a 400. A missing `Path` keeps its 500, the
+        // `NullReferenceException` upstream throws. `GetXml` logs the failure
+        // before it rethrows; the answer leaves the path out, as Lineups is
+        // open to users who are not administrators.
+        let document = self.xmltv.get_xml(info).await.map_err(|e| {
+            let Some(path) = info.path.as_deref() else {
+                return e;
+            };
+            let e = crate::fetch::missing_file_is_not_found(e);
+            let ServiceError::NotFound(cause) = &e else {
+                return e;
+            };
+            tracing::warn!(
+                listings_provider = info.id.as_deref().unwrap_or_default(),
+                path = %crate::fetch::redact_url(path),
+                error = %cause,
+                "live tv: XMLTV guide read failed"
+            );
+            if path.is_empty() {
+                ServiceError::InvalidInput("listing provider Path is empty".into())
+            } else {
+                ServiceError::not_found("XMLTV guide")
+            }
+        })?;
         // The channels only: every airing's children are read past, unbuilt.
         let (_, guide) = parse_guide(document, self.guide_language(info)).await?;
         // Upstream's `GetChannels` throws on a bad document, so the mapping
@@ -9201,6 +9228,94 @@ mod tests {
         assert!(matches!(err, ServiceError::InvalidInput(_)), "{err:?}");
         let listing_providers = mgr.get_listing_providers().await.expect("list");
         assert!(listing_providers.is_empty(), "{listing_providers:?}");
+    }
+
+    /// `XmlTvListingsProvider.GetXml` (v12.4 :63-161) rethrows what failed
+    /// when no copy is cached: a file or directory that is not there is
+    /// `FileNotFoundException` or `DirectoryNotFoundException`, a `404`
+    /// (`ExceptionMiddleware.GetStatusCode`), and an empty path
+    /// `ArgumentException`, a `400`. A directory (`UnauthorizedAccessException`)
+    /// and a missing `Path` (`NullReferenceException`) stay `500`s. The
+    /// lineups, the mapping options and a mapping save all read the guide's
+    /// channels through it; the save stores the pair first. The answer leaves
+    /// the path out, and a stale cached copy is still read. Stored directly: a
+    /// save refuses these paths (`Validate`), an adopted `livetv.xml` does not.
+    #[tokio::test]
+    async fn a_local_guide_that_is_gone_is_not_found_and_an_empty_path_is_invalid() {
+        let mgr = manager_with_fetcher(Arc::new(crate::fetch::ReqwestFetcher::new())).await;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let at = |name: &str| Some(dir.path().join(name).to_str().expect("utf-8").to_owned());
+        let store = |path: Option<String>| {
+            let mgr = mgr.clone();
+            async move {
+                mgr.store_listing_provider(as_xmltv(ListingsProviderInfo {
+                    path,
+                    ..ListingsProviderInfo::default()
+                }))
+                .await
+                .expect("stored")
+                .id
+                .expect("id")
+            }
+        };
+        for (path, status) in [
+            (at("gone.xml"), 404),
+            (at("gone/guide.xml"), 404),
+            (Some(" ".to_owned()), 404),
+            (Some(String::new()), 400),
+            (None, 500),
+            (Some(dir.path().to_str().expect("utf-8").to_owned()), 500),
+        ] {
+            let id = store(path.clone()).await;
+            let errors = [
+                mgr.get_lineups(Some(&id), Some("xmltv"), None, None)
+                    .await
+                    .expect_err("lineups"),
+                mgr.get_channel_mapping_options(&id)
+                    .await
+                    .expect_err("options"),
+                mgr.set_channel_mapping(&id, "1", "2")
+                    .await
+                    .expect_err("mapping"),
+            ];
+            for err in errors {
+                let got = match err {
+                    ServiceError::NotFound(_) => 404,
+                    ServiceError::InvalidInput(_) => 400,
+                    ServiceError::BackendSource(_) => 500,
+                    _ => 0,
+                };
+                assert_eq!(got, status, "{path:?}: {err:?}");
+                // A user who is not an administrator may read Lineups.
+                if status == 404 {
+                    assert!(!err.to_string().contains("gone"), "{err}");
+                }
+            }
+            let stored = mgr.listing_provider_by_id(&id).await.expect("provider");
+            assert_eq!(
+                stored.channel_mappings.len(),
+                1,
+                "{path:?}: the pair is stored first"
+            );
+        }
+
+        // A stale copy is read in place of a file that is gone, as upstream's
+        // catch returns the cached file.
+        let id = store(at("gone.xml")).await;
+        let cache_file = mgr.xmltv.cache_file_for_test(&id);
+        std::fs::create_dir_all(cache_file.parent().expect("dir")).expect("cache dir");
+        std::fs::write(&cache_file, XMLTV).expect("cached copy");
+        std::fs::File::options()
+            .write(true)
+            .open(&cache_file)
+            .expect("open")
+            .set_modified(std::time::SystemTime::now() - std::time::Duration::from_hours(2))
+            .expect("stale");
+        let lineups = mgr
+            .get_lineups(Some(&id), Some("xmltv"), None, None)
+            .await
+            .expect("the stale copy");
+        assert_eq!(lineups.len(), 1, "{lineups:?}");
     }
 
     /// `XmlTvListingsProvider.GetLanguage`: a guide is read in its provider's
