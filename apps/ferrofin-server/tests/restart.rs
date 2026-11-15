@@ -510,12 +510,27 @@ async fn a_networking_page_port_applies_on_the_restart() {
     assert_eq!(saved, 204);
     let info = system_info(&client, &base, &tok).await.expect("info");
     assert_eq!(info["HasPendingRestart"], true, "the save marks a restart");
+    // gl-1701: and clears `IsPortAuthorized`, saved on its own task.
+    let deadline = std::time::Instant::now() + REQUEST_TIMEOUT;
+    while get_json(&client, &base, "/System/Configuration", &tok).await["IsPortAuthorized"] != false
+    {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "IsPortAuthorized was never cleared"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
 
     assert_eq!(post(&client, &base, "/System/Restart", &tok).await, 204);
     let moved = format!("http://127.0.0.1:{page_port}");
     wait_for_new_lifetime(&client, &moved, &config.server_name, &tok).await;
     let info = system_info(&client, &moved, &tok).await.expect("info");
     assert_eq!(info["LocalAddress"], moved.as_str(), "the advertised URL");
+    assert_eq!(
+        get_json(&client, &moved, "/System/Configuration", &tok).await["IsPortAuthorized"],
+        true,
+        "the next lifetime authorizes the port again"
+    );
     assert!(
         !is_up(&client, &base, &config.server_name).await,
         "the old port is closed"

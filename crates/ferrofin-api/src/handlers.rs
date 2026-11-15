@@ -3834,12 +3834,14 @@ pub const VERIFIED: &[Verified] = &[
                loop stopping at the first without exactly one '=' as upstream's does, then \
                PrintNetworkInformation(config, false): its seven Information lines), the \
                listeners (ferrofin-server listen.rs \
-               restart_listener: the port restart of OnConfigurationUpdated), the committed \
+               restart_listener: the port restart of OnConfigurationUpdated, with \
+               ferrofin-core configuration_manager.rs set_ports_changed and \
+               revoke_port_authorization, its clear and save of IsPortAuthorized), the committed \
                checks for ApplicationHost.OnConfigurationUpdated) → for livetv \
                LiveTvManager::create_recording_folders (ferrofin-livetv recording_folders.rs: \
                RecordingsManager.OnNamedConfigurationUpdated, which the Live TV manager's tuner \
                and provider saves run too, as upstream's save of livetv does)",
-        date: "2026-11-14",
+        date: "2026-11-15",
         divergences: &[
             "database is refused with a 400: Ferrofin has no other database provider (owner \
          decision 2026-10-23).",
@@ -3871,11 +3873,19 @@ pub const VERIFIED: &[Verified] = &[
          are reset to the defaults first, as ApplicationHost.Init does, where upstream flags a \
          restart that changes nothing for a save of two equal ports. Upstream's guard on a \
          running port of 0 (the ports not read yet) needs no counterpart: the listener is \
-         registered once the ports are resolved. Its guard on IsPortAuthorized flags the \
-         restart once per lifetime, which Ferrofin matches because it sets IsPortAuthorized \
-         at every boot and the restart flag stays set once raised; but upstream also clears \
-         IsPortAuthorized and saves when it flags the restart, and Ferrofin leaves it true. \
-         Fix path: gl-1701.",
+         registered once the ports are resolved. Its guard on IsPortAuthorized is not \
+         ported: the restart is flagged whenever the ports differ. That matches upstream's \
+         once-per-lifetime flag, since IsPortAuthorized is set at every boot and a raised \
+         restart flag stays raised, except after a client saved IsPortAuthorized false with \
+         no restart pending, where upstream announces no restart for a port change that \
+         needs one. Jellyfin bug not ported.",
+            "When a network save changes a port served, IsPortAuthorized is cleared and saved, \
+         as OnConfigurationUpdated does, but on a task of its own (a configuration listener \
+         may not save), so it may still read true for a moment after the save answers; \
+         upstream's NamedConfigurationUpdated handler saves it before. While the ports \
+         differ, a later server configuration save (POST /System/Configuration, which has \
+         no row) stores it false in the same write, where upstream saves the posted value \
+         and its ConfigurationUpdated handler clears it in a second save.",
             "An unparsable PublishedServerUriBySubnet entry is logged with its URL cut to \
          scheme, host and port (docs/conventions/LOGGING.md rule 5), where upstream logs the \
          entry whole.",

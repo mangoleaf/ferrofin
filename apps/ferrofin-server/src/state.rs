@@ -157,12 +157,14 @@ async fn adopted_network_configuration(
 /// resolves (`resolve`) to another value than `running`, the one this
 /// lifetime serves with, and logs that the server needs a restart to
 /// `change`. Every value the server samples from the network configuration
-/// once per lifetime (the base URL, the ports) uses it.
+/// once per lifetime (the base URL, the ports) uses it. `on_save` is told,
+/// for every network save, whether it resolves to another value.
 pub(crate) fn network_restart_listener<T>(
     running: T,
     resolve: impl Fn(&ferrofin_networking::NetworkConfiguration) -> T + Send + Sync + 'static,
     change: &'static str,
     lifecycle: Arc<dyn LifecycleController>,
+    on_save: impl Fn(bool) + Send + Sync + 'static,
 ) -> Arc<ferrofin_traits::configuration::ConfigurationListener>
 where
     T: PartialEq + Send + Sync + 'static,
@@ -178,7 +180,9 @@ where
         // A document that does not parse boots as the defaults
         // (`load_network_configuration`), so it is compared as them.
         let saved = serde_json::from_str(json).unwrap_or_default();
-        if resolve(&saved) == running {
+        let changed = resolve(&saved) != running;
+        on_save(changed);
+        if !changed {
             return;
         }
         // A restart already pending, for this or any other reason, is not
@@ -2908,6 +2912,7 @@ pub async fn build_app_state(
         ports,
         config.clone(),
         Arc::clone(&lifecycle),
+        Arc::downgrade(&config_mgr),
     ));
     app_host.warn_if_published_url_base_path_differs();
     app_host
