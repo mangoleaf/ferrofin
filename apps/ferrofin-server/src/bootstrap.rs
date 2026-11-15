@@ -122,7 +122,8 @@ impl FfmpegPaths {
 /// Old daily files are pruned to `LogFileRetentionDays` files (read
 /// best-effort from `{config_dir}/system.json`; `0`/negative keeps only the
 /// current day's), and the file writer is non-blocking so slow disk I/O never
-/// stalls a request thread.
+/// stalls a request thread: while the disk stalls, it queues
+/// `FILE_LOG_QUEUE_LINES` lines and drops the ones after them.
 ///
 /// Returns the [`WorkerGuard`] for the non-blocking file writer (`None` when no
 /// file sink was created). **The caller must hold it until after the server
@@ -154,13 +155,7 @@ pub fn init_tracing(config: &Config) -> Option<WorkerGuard> {
     // Non-blocking file writer: a background thread owns the disk I/O so a slow or
     // full disk never blocks a logging call site. The returned guard flushes the
     // queue on drop — the caller holds it until after `axum::serve` drains.
-    let (file_writer, guard) = match file_appender {
-        Some(appender) => {
-            let (writer, guard) = tracing_appender::non_blocking(appender);
-            (Some(writer), Some(guard))
-        }
-        None => (None, None),
-    };
+    let (file_writer, guard) = file_appender.map(file_log_writer).unzip();
 
     // JSON stdout by default (Alloy pod-log scrape → Loki, carrying the request
     // span's `trace_id` on every in-span line); `FERROFIN_LOG_FORMAT=text` (or
@@ -193,6 +188,25 @@ pub fn init_tracing(config: &Config) -> Option<WorkerGuard> {
     }
 
     guard
+}
+
+/// Lines the file log queues for its writer thread. Once the queue is full (the
+/// disk stalls), a new line is dropped, never waited for: Jellyfin's file sink
+/// sits behind Serilog's `Async` sink, whose default queue holds 10,000 events
+/// and drops the newest when full (`bufferSize = 10000`, `blockWhenFull =
+/// false`). tracing-appender's own default, 128,000, keeps about 4 MB resident
+/// from boot.
+const FILE_LOG_QUEUE_LINES: usize = 10_000;
+
+/// The non-blocking writer in front of the server's log file, queueing at most
+/// [`FILE_LOG_QUEUE_LINES`] lines and dropping the rest.
+fn file_log_writer<W: std::io::Write + Send + 'static>(
+    file: W,
+) -> (tracing_appender::non_blocking::NonBlocking, WorkerGuard) {
+    tracing_appender::non_blocking::NonBlockingBuilder::default()
+        .buffered_lines_limit(FILE_LOG_QUEUE_LINES)
+        .lossy(true)
+        .finish(file)
 }
 
 /// Type alias for the boxed, subscriber-erased log layers `init_tracing` composes.
@@ -1770,7 +1784,7 @@ mod tests {
         use tracing_subscriber::layer::SubscriberExt as _;
         let tmp = tempfile::tempdir().unwrap();
         let appender = crate::log_file::DailyLogFile::open(tmp.path(), 3).unwrap();
-        let (writer, guard) = tracing_appender::non_blocking(appender);
+        let (writer, guard) = file_log_writer(appender);
         let subscriber = tracing_subscriber::registry().with(
             tracing_subscriber::fmt::layer()
                 .with_ansi(false)
@@ -1791,6 +1805,57 @@ mod tests {
         );
     }
 
+    /// gl-1478: while the log disk stalls, the file log queues
+    /// `FILE_LOG_QUEUE_LINES` lines and drops the next one instead of making
+    /// the caller wait, as Jellyfin's `Async` file sink does.
+    #[test]
+    fn the_file_log_queue_drops_lines_past_its_limit_while_the_disk_stalls() {
+        use std::io::Write as _;
+        use std::sync::mpsc;
+
+        /// A log file whose writes block until `release` is dropped.
+        struct StalledDisk {
+            entered: mpsc::Sender<()>,
+            release: mpsc::Receiver<()>,
+        }
+        impl std::io::Write for StalledDisk {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                let _ = self.entered.send(());
+                let _ = self.release.recv();
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let (entered_tx, entered) = mpsc::channel();
+        let (release, release_rx) = mpsc::channel();
+        let (mut writer, guard) = file_log_writer(StalledDisk {
+            entered: entered_tx,
+            release: release_rx,
+        });
+        let dropped = writer.error_counter();
+        writer.write_all(b"first\n").unwrap();
+        // The writer thread has taken `first` and is stuck writing it, so the
+        // queue is empty.
+        entered
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .unwrap();
+        for _ in 0..FILE_LOG_QUEUE_LINES {
+            writer.write_all(b"queued\n").unwrap();
+        }
+        assert_eq!(dropped.dropped_lines(), 0, "the queue holds its limit");
+        writer.write_all(b"overflow\n").unwrap();
+        assert_eq!(
+            dropped.dropped_lines(),
+            1,
+            "the line past the limit is dropped"
+        );
+        drop(release);
+        drop(guard);
+    }
+
     /// gl-154: the plain-text file sink `/System/Logs` serves keeps every event
     /// on lines of its own record, in both formats: a line break inside a
     /// logged value continues the record indented and never starts a forged
@@ -1801,7 +1866,7 @@ mod tests {
     fn the_text_file_sink_cannot_be_forged_by_a_logged_line_break(#[case] text_mode: bool) {
         use tracing_subscriber::layer::SubscriberExt as _;
         let file = CapturedLogs::default();
-        let (writer, guard) = tracing_appender::non_blocking(file.clone());
+        let (writer, guard) = file_log_writer(file.clone());
         let layers = build_fmt_layers(text_mode, Some(writer));
         let subscriber = tracing_subscriber::registry().with(layers);
         tracing::subscriber::with_default(subscriber, || {
