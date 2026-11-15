@@ -1535,11 +1535,41 @@ mod tests {
     use super::{EgressPolicy, GuestHttp, http_fetch};
     use crate::bindings::types::HttpRequest;
 
+    /// A listener on `127.0.0.1`, and a socket that holds the same port on
+    /// `::1` (gl-1522; `ferrofin-providers`' `mock_http::loopback_listener`).
+    /// Keep the socket as long as the listener.
+    ///
+    /// A client given `localhost` tries `::1` first. The held port is bound and
+    /// never listening, so it refuses that connection at once, and the client
+    /// goes on to `127.0.0.1`. A free port there could be another test
+    /// process's listener, or a host service that listens on IPv6 only, and
+    /// that one would get the request instead.
+    ///
+    /// The hold is exclusive only while its socket does not set
+    /// `SO_REUSEADDR`, which a `TcpSocket` does not. The socket is `None` on a
+    /// host with no IPv6 loopback, where no listener can take the port either.
+    fn loopback_listener() -> (std::net::TcpListener, Option<tokio::net::TcpSocket>) {
+        loop {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+            let port = listener.local_addr().expect("addr").port();
+            let Ok(held) = tokio::net::TcpSocket::new_v6() else {
+                return (listener, None);
+            };
+            match held.bind((std::net::Ipv6Addr::LOCALHOST, port).into()) {
+                Ok(()) => return (listener, Some(held)),
+                // Already taken on `::1`: take another port.
+                Err(error) if error.kind() == std::io::ErrorKind::AddrInUse => {}
+                Err(_) => return (listener, None),
+            }
+        }
+    }
+
     /// A loopback HTTP/1.1 server that keeps connections open and answers
-    /// every request `200 ok`. Returns its port and how many connections it
-    /// has accepted.
-    fn keep_alive_server() -> (u16, Arc<AtomicUsize>) {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    /// every request `200 ok`. Returns its port, how many connections it has
+    /// accepted, and its port's hold on `::1` ([`loopback_listener`]), which
+    /// the caller keeps while it fetches.
+    fn keep_alive_server() -> (u16, Arc<AtomicUsize>, Option<tokio::net::TcpSocket>) {
+        let (listener, ipv6) = loopback_listener();
         let port = listener.local_addr().expect("addr").port();
         let accepted = Arc::new(AtomicUsize::new(0));
         let counter = Arc::clone(&accepted);
@@ -1571,7 +1601,7 @@ mod tests {
                 });
             }
         });
-        (port, accepted)
+        (port, accepted, ipv6)
     }
 
     fn get(url: String) -> HttpRequest {
@@ -1590,7 +1620,7 @@ mod tests {
     /// the production path.
     #[test]
     fn vetted_fetches_to_one_host_share_a_connection() {
-        let (port, accepted) = keep_alive_server();
+        let (port, accepted, _ipv6) = keep_alive_server();
         let http =
             GuestHttp::with_policy(Duration::from_secs(5), |_| false, false).expect("clients");
         let egress = EgressPolicy::parse(&["localhost".to_owned()]);
@@ -1621,7 +1651,7 @@ mod tests {
     /// the addresses vetted for it, as for a host the proxy settings exclude.)
     #[test]
     fn proxied_fetches_to_one_host_share_a_connection() {
-        let (port, accepted) = keep_alive_server();
+        let (port, accepted, _ipv6) = keep_alive_server();
         let http =
             GuestHttp::with_policy(Duration::from_secs(5), |_| false, true).expect("clients");
         let egress = EgressPolicy::parse(&["localhost".to_owned()]);
@@ -1657,7 +1687,7 @@ mod tests {
     /// the system cannot resolve, at the pinned address and the URL's port.
     #[test]
     fn the_proxied_client_resolves_a_name_at_its_pinned_addresses() {
-        let (port, accepted) = keep_alive_server();
+        let (port, accepted, _ipv6) = keep_alive_server();
         let http =
             GuestHttp::with_policy(Duration::from_secs(5), |_| false, true).expect("clients");
         http.pinned
