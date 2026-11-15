@@ -2350,6 +2350,88 @@ async fn ids_the_user_may_not_open_never_reach_the_query() {
     }
 }
 
+/// `TrailersController.GetTrailers` hands every argument to `GetItems` with
+/// `includeItemTypes = [Trailer]` and no `indexNumber` (v12.4
+/// TrailersController.cs:214-305): the types and index a client sends are
+/// replaced, and every other `GetItems` parameter and rule applies: the
+/// filters, the media-stream rule that takes in owned items, the recursive
+/// run of a typed request at the user root, and a search ordered by
+/// `SortName` first.
+#[tokio::test]
+async fn trailers_are_get_items_of_the_trailer_kind() {
+    use ferrofin_model::dto::SortOrder;
+    use ferrofin_model::live_tv::ItemSortBy;
+    let library = OkLibrary {
+        item_id: Uuid::from_u128(0x5A),
+        ..Default::default()
+    };
+    let seen = Arc::clone(&library.last_query);
+    let response = create_router(ok_state_with(library))
+        .oneshot(
+            Request::builder()
+                .uri(
+                    "/Trailers?includeItemTypes=Movie&indexNumber=3&years=1999,2001&isHd=true\
+                     &audioLanguages=eng,ger&audioLanguages=fre&searchTerm=blade&sortBy=PremiereDate",
+                )
+                .header("X-Emby-Token", "valid")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let query = seen.lock().unwrap().take().expect("query_items ran");
+    assert_eq!(query.include_item_types, [BaseItemKind::Trailer]);
+    assert_eq!(query.index_number, None);
+    assert_eq!(query.years, [1999, 2001]);
+    assert_eq!(query.is_hd, Some(true));
+    // The repeated key joins before the comma split, Ferrofin's own leniency
+    // (`parse_csv_strings`); upstream binds `["eng,ger", "fre"]`.
+    assert_eq!(query.audio_languages, ["eng", "ger", "fre"]);
+    assert!(query.include_owned_items);
+    assert!(query.recursive, "a filtered request at the user root");
+    assert_eq!(
+        query.order_by,
+        [
+            (ItemSortBy::SortName, SortOrder::Ascending),
+            (ItemSortBy::PremiereDate, SortOrder::Ascending)
+        ]
+    );
+}
+
+/// A bare `/Trailers` is a typed request at the user root, so the `HasFilters`
+/// dispatch runs it recursively, as `GetItems` with `includeItemTypes=Trailer`
+/// does. An `indexNumber` still binds before it is cleared, so one that is no
+/// number answers 400.
+#[tokio::test]
+async fn a_bare_trailers_request_runs_recursively_at_the_user_root() {
+    let library = OkLibrary {
+        item_id: Uuid::from_u128(0x5A),
+        ..Default::default()
+    };
+    let seen = Arc::clone(&library.last_query);
+    let router = create_router(ok_state_with(library));
+    let get = |uri: &str| {
+        Request::builder()
+            .uri(uri)
+            .header("X-Emby-Token", "valid")
+            .body(Body::empty())
+            .unwrap()
+    };
+    let response = router.clone().oneshot(get("/Trailers")).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let query = seen.lock().unwrap().take().expect("query_items ran");
+    assert_eq!(query.include_item_types, [BaseItemKind::Trailer]);
+    assert!(query.recursive);
+    assert!(!query.user_root_children);
+
+    let response = router
+        .oneshot(get("/Trailers?indexNumber=abc"))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}
+
 /// Explicit ids without a `sortBy` answer in the order they were asked for:
 /// `ItemsController.GetItems` hands them to `Folder.GetItems`, which reorders
 /// the repository's page with `SortItemsByRequest` when `OrderBy` is empty and
@@ -2601,6 +2683,13 @@ async fn get_items_forwards_the_stream_language_filters_but_the_user_route_drops
     assert_eq!(query.audio_languages, ["eng", "ger", "fre"]);
     assert_eq!(query.subtitle_languages, ["spa"]);
     // A subtitle language implies subtitles exist.
+    assert_eq!(query.has_subtitles, None);
+    assert!(query.include_owned_items);
+
+    // `GetTrailers` passes both lists on to `GetItems`.
+    let query = run(format!("/Trailers?{filters}")).await;
+    assert_eq!(query.audio_languages, ["eng", "ger", "fre"]);
+    assert_eq!(query.subtitle_languages, ["spa"]);
     assert_eq!(query.has_subtitles, None);
     assert!(query.include_owned_items);
 
