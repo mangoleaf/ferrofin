@@ -16621,22 +16621,14 @@ impl LibraryScanner {
 
     /// A video `ResolveVideos` resolved in `folder` — a stack's parts, a
     /// primary's local alternate versions, or a lone file — planned whole
-    /// (`MovieResolver.cs:287-317`): the primary, its file the first,
-    /// carrying the other parts' paths as `AdditionalParts` and each
-    /// alternate's first file as `LocalAlternateVersions`; a `Video` row per
-    /// other part, owned by the primary (`Video.RefreshMetadataForOwnedVideo`,
-    /// `Video.cs:636-701`); and a row per alternate of the primary's kind,
-    /// owned by and pointing at it (`LibraryManager.ResolveAlternateVersion`
-    /// and `CreateItems`, `LibraryManager.cs:865-922,2446-2487`), whose own
-    /// stack is its `AdditionalParts` and part rows it owns
-    /// (`SetAdditionalPartsFromStack`, `:828-862`). Parts and alternates hang
-    /// where the primary does and take its `IsInMixedFolder`. The primary's
-    /// group goes to [`PlanOutput::local_versions`].
+    /// ([`plan_version_group`]): the primary, a row per alternate of the
+    /// primary's kind, and a `Video` row per part (the base type,
+    /// `Video.RefreshMetadataForOwnedVideo`, `Video.cs:670-691`). Parts and
+    /// alternates hang where the primary does and take its `IsInMixedFolder`.
     ///
     /// The group is planned whole when the scope keeps any of its files
     /// ([`covered_versions`] refreshes it whole), so its lists and its rows
-    /// never disagree. A `.disc` stub the naming rules group is left out:
-    /// the walk plans no stub.
+    /// never disagree.
     fn plan_video_group(
         &self,
         video: &ferrofin_naming::video::VideoInfo,
@@ -16645,23 +16637,7 @@ impl LibraryScanner {
         out: &mut Vec<Planned>,
     ) {
         let naming = ctx.naming;
-        let playable = |files: &[ferrofin_naming::video::VideoFileInfo]| -> Vec<String> {
-            files
-                .iter()
-                .map(|file| file.path.clone())
-                .filter(|path| video_resolver::is_video_file(path, naming))
-                .collect()
-        };
-        let parts = playable(video.files.get(1..).unwrap_or_default());
-        let alternates: Vec<(String, Vec<String>)> = video
-            .alternate_versions
-            .iter()
-            .filter_map(|alternate| {
-                let (first, rest) = alternate.files.split_first()?;
-                video_resolver::is_video_file(&first.path, naming)
-                    .then(|| (first.path.clone(), playable(rest)))
-            })
-            .collect();
+        let (parts, alternates) = version_group_files(video, naming);
         let kept = std::iter::once(&video.files[0].path)
             .chain(&parts)
             .chain(
@@ -16678,48 +16654,18 @@ impl LibraryScanner {
             return;
         };
         settle_mixed_folder(&mut primary.entity, folder.mixed, folder.dir, naming);
-        let versions: Vec<String> = alternates.iter().map(|(first, _)| first.clone()).collect();
-        set_resolved_lists(&mut primary.entity, &parts, &versions);
-        let (owner, mixed) = (primary.id, primary.entity.is_in_mixed_folder);
-        ctx.local_versions.borrow_mut().push((owner, versions));
-        out.push(primary.into());
-        self.plan_parts(&parts, owner, mixed, folder, ctx, out);
-        for (first, rest) in &alternates {
-            let Some(mut alternate) = self.owned_video(first, folder.walk.kind, folder, ctx) else {
-                continue;
-            };
-            alternate.entity.owner_id = Some(guid_to_db(owner));
-            alternate.entity.primary_version_id = Some(guid_to_db(owner));
-            settle_mixed_folder(&mut alternate.entity, mixed, folder.dir, naming);
-            set_resolved_lists(&mut alternate.entity, rest, &[]);
-            let id = alternate.id;
-            out.push(alternate.into());
-            self.plan_parts(rest, id, mixed, folder, ctx, out);
-        }
-    }
-
-    /// The `Video` rows of the stacked `parts` of the video `owner`, owned
-    /// by it and created in its mixed-folder state `mixed`
-    /// (`Video.RefreshMetadataForOwnedVideo`, `Video.cs:670-691`: the base
-    /// type, `OwnerId` and `IsInMixedFolder` of the video it belongs to).
-    fn plan_parts(
-        &self,
-        parts: &[String],
-        owner: Uuid,
-        mixed: bool,
-        folder: &MovieFolder<'_>,
-        ctx: &PlanCtx<'_>,
-        out: &mut Vec<Planned>,
-    ) {
-        for path in parts {
-            let Some(mut part) = self.owned_video(path, BaseItemKind::Video, folder, ctx) else {
-                continue;
-            };
-            part.entity.owner_id = Some(guid_to_db(owner));
-            part.entity.is_in_mixed_folder = mixed;
-            set_resolved_lists(&mut part.entity, &[], &[]);
-            out.push(part.into());
-        }
+        plan_version_group(
+            primary,
+            (parts, alternates),
+            |path, mixed| {
+                let mut alternate = self.owned_video(path, folder.walk.kind, folder, ctx)?;
+                settle_mixed_folder(&mut alternate.entity, mixed, folder.dir, naming);
+                Some(alternate)
+            },
+            |path| self.owned_video(path, BaseItemKind::Video, folder, ctx),
+            ctx,
+            out,
+        );
     }
 
     /// The row of a part or an alternate version at `path`, of `kind`, as
@@ -16749,22 +16695,29 @@ impl LibraryScanner {
                     .filter(|_| kind == BaseItemKind::MusicVideo),
             ),
         };
-        self.video_row(path, kind, name, year, folder, ctx)
+        self.video_row(
+            path,
+            kind,
+            (name, year),
+            folder.cf,
+            folder.walk.parent(folder.cf, ctx),
+            ctx,
+        )
     }
 
-    /// A video row of `kind` at `path` in `folder`: named `name`, dated
-    /// `year`, with its file's `VideoType`.
+    /// A video row of `kind` at `path` in the library `cf`, hung off
+    /// `parent` below `ancestors`: named `name`, dated `year`, with its
+    /// file's `VideoType`.
     fn video_row(
         &self,
         path: &str,
         kind: BaseItemKind,
-        name: String,
-        year: Option<i32>,
-        folder: &MovieFolder<'_>,
+        (name, year): (String, Option<i32>),
+        cf: Uuid,
+        (parent, ancestors): (Uuid, Vec<Uuid>),
         ctx: &PlanCtx<'_>,
     ) -> Option<Planned<BaseItemEntity>> {
-        let (parent, ancestors) = folder.walk.parent(folder.cf, ctx);
-        let (id, mut entity) = self.base_item(ctx, kind, folder.cf, parent, name, path, false)?;
+        let (id, mut entity) = self.base_item(ctx, kind, cf, parent, name, path, false)?;
         entity.media_type = Some("Video".to_owned());
         entity.production_year = year.map(i64::from);
         set_video_type(&mut entity, file_video_type(path));
@@ -17015,7 +16968,14 @@ impl LibraryScanner {
         } else {
             parsed()
         };
-        self.video_row(path, kind, name, year, folder, ctx)
+        self.video_row(
+            path,
+            kind,
+            (name, year),
+            folder.cf,
+            folder.walk.parent(folder.cf, ctx),
+            ctx,
+        )
     }
 
     /// Registers `movie`, resolved in `dir`, as the owner of the extras its
@@ -18213,20 +18173,13 @@ impl LibraryScanner {
 
     /// An episode stack or version group `ResolveVideos<Episode>` resolved
     /// (`MovieResolver.cs:231-234,287-317`; the versions grouped by
-    /// `VideoListResolver.GetEpisodesGroupedByVersion`), planned whole: the
-    /// primary episode, its file the first, carrying the other parts' paths
-    /// as `AdditionalParts` and each alternate's first file as
-    /// `LocalAlternateVersions`; a `Video` row per other part, owned by the
-    /// primary (`Video.RefreshMetadataForOwnedVideo`, `Video.cs:636-701`);
-    /// and an `Episode` per alternate — the primary's kind
-    /// (`LibraryManager.ResolveAlternateVersion`, `LibraryManager.cs:865-922`)
-    /// resolved from its own file as `EpisodeResolver` does, in the primary's
-    /// season — owned by and pointing at the primary, in its mixed-folder
-    /// state (`CreateItems`, `:2446-2487`), with its own stack as its
-    /// `AdditionalParts` and part rows (`SetAdditionalPartsFromStack`,
-    /// `:828-862`). The primary's group goes to [`PlanOutput::local_versions`].
-    /// A `.disc` stub the naming rules group is left out, as the movie walk
-    /// leaves it ([`Self::plan_video_group`]).
+    /// `VideoListResolver.GetEpisodesGroupedByVersion`), planned whole
+    /// ([`plan_version_group`]): the primary episode; an `Episode` per
+    /// alternate — the primary's kind resolved from its own file as
+    /// `EpisodeResolver` does, in the primary's season, in its mixed-folder
+    /// state; and a `Video` row per part, hung where the episode hangs (a
+    /// part resolves from its file alone, then takes the base type —
+    /// `EpisodeResolver`'s name for it is the file name).
     fn plan_episode_group(
         &self,
         video: &ferrofin_naming::video::VideoInfo,
@@ -18234,89 +18187,25 @@ impl LibraryScanner {
         ctx: &PlanCtx<'_>,
         out: &mut Vec<Planned>,
     ) {
-        let naming = ctx.naming;
-        let playable = |files: &[ferrofin_naming::video::VideoFileInfo]| -> Vec<String> {
-            files
-                .iter()
-                .map(|file| file.path.clone())
-                .filter(|path| video_resolver::is_video_file(path, naming))
-                .collect()
-        };
-        let parts = playable(video.files.get(1..).unwrap_or_default());
-        let alternates: Vec<(String, Vec<String>)> = video
-            .alternate_versions
-            .iter()
-            .filter_map(|alternate| {
-                let (first, rest) = alternate.files.split_first()?;
-                video_resolver::is_video_file(&first.path, naming)
-                    .then(|| (first.path.clone(), playable(rest)))
-            })
-            .collect();
         let named = (video.name.clone(), video.year);
-        let Some(mut primary) = self.episode_row(&video.files[0].path, named, home, ctx) else {
+        let Some(primary) = self.episode_row(&video.files[0].path, named, home, ctx) else {
             return;
         };
-        let versions: Vec<String> = alternates.iter().map(|(first, _)| first.clone()).collect();
-        set_resolved_lists(&mut primary.entity, &parts, &versions);
-        let owner = primary.id;
-        let mixed = primary.entity.is_in_mixed_folder;
-        ctx.local_versions.borrow_mut().push((owner, versions));
-        out.push(primary.into());
-        self.plan_episode_parts(&parts, owner, mixed, home, ctx, out);
-        for (first, rest) in &alternates {
-            let Some(mut alternate) = self.episode_row(first, (None, None), home, ctx) else {
-                continue;
-            };
-            alternate.entity.owner_id = Some(guid_to_db(owner));
-            alternate.entity.primary_version_id = Some(guid_to_db(owner));
-            alternate.entity.is_in_mixed_folder = mixed;
-            set_resolved_lists(&mut alternate.entity, rest, &[]);
-            let id = alternate.id;
-            out.push(alternate.into());
-            self.plan_episode_parts(rest, id, mixed, home, ctx, out);
-        }
-    }
-
-    /// The `Video` rows of the stacked `parts` of the episode `owner`, owned
-    /// by it, hung where it hangs and created in its mixed-folder state
-    /// `mixed` (`Video.RefreshMetadataForOwnedVideo`, `Video.cs:670-691`: a
-    /// part resolves from its file alone, then takes the base type —
-    /// `EpisodeResolver`'s name for it is the file name — and the owner's
-    /// `OwnerId` and `IsInMixedFolder`).
-    fn plan_episode_parts(
-        &self,
-        parts: &[String],
-        owner: Uuid,
-        mixed: bool,
-        home: EpisodeHome<'_>,
-        ctx: &PlanCtx<'_>,
-        out: &mut Vec<Planned>,
-    ) {
-        let (parent, ancestors) = home.parent();
-        for path in parts {
-            let Some((id, mut entity)) = self.base_item(
-                ctx,
-                BaseItemKind::Video,
-                home.cf,
-                parent,
-                file_stem(path),
-                path,
-                false,
-            ) else {
-                continue;
-            };
-            entity.media_type = Some("Video".to_owned());
-            set_video_type(&mut entity, file_video_type(path));
-            entity.owner_id = Some(guid_to_db(owner));
-            entity.is_in_mixed_folder = mixed;
-            set_resolved_lists(&mut entity, &[], &[]);
-            out.push(Planned {
-                id,
-                entity: entity.into(),
-                ancestors: ancestors.clone(),
-                generated_names: Vec::new(),
-            });
-        }
+        plan_version_group(
+            primary,
+            version_group_files(video, ctx.naming),
+            |path, mixed| {
+                let mut alternate = self.episode_row(path, (None, None), home, ctx)?;
+                alternate.entity.is_in_mixed_folder = mixed;
+                Some(alternate)
+            },
+            |path| {
+                let name = (file_stem(path), None);
+                self.video_row(path, BaseItemKind::Video, name, home.cf, home.parent(), ctx)
+            },
+            ctx,
+            out,
+        );
     }
 
     /// One `Episode` row at `path`, parented to its season (or the series
@@ -21118,6 +21007,84 @@ impl VideoGroups {
     fn holding(&self, path: &str) -> Option<(&ferrofin_naming::video::VideoInfo, bool)> {
         let video = &self.videos[*self.at.get(path)?];
         Some((video, video.files[0].path == path))
+    }
+}
+
+/// The files of `video`, a stack or version group, that a walk plans rows
+/// for: the primary's other parts, and each alternate's first file with its
+/// own parts — the playable ones only, so a `.disc` stub the naming rules
+/// group is left out (the walk plans no stub).
+fn version_group_files(
+    video: &ferrofin_naming::video::VideoInfo,
+    naming: &NamingOptions,
+) -> (Vec<String>, Vec<(String, Vec<String>)>) {
+    let playable = |files: &[ferrofin_naming::video::VideoFileInfo]| -> Vec<String> {
+        files
+            .iter()
+            .map(|file| file.path.clone())
+            .filter(|path| video_resolver::is_video_file(path, naming))
+            .collect()
+    };
+    let parts = playable(video.files.get(1..).unwrap_or_default());
+    let alternates = video
+        .alternate_versions
+        .iter()
+        .filter_map(|alternate| {
+            let (first, rest) = alternate.files.split_first()?;
+            video_resolver::is_video_file(&first.path, naming)
+                .then(|| (first.path.clone(), playable(rest)))
+        })
+        .collect();
+    (parts, alternates)
+}
+
+/// Plans a stack or version group whole from its `primary` row, its file
+/// the group's first (`MovieResolver.cs:287-317`), and the
+/// [`version_group_files`] `(parts, alternates)`: the primary carries the
+/// parts' paths as `AdditionalParts` and each alternate's first file as
+/// `LocalAlternateVersions`; each part is a row `part` builds, owned by the
+/// primary in its mixed-folder state (`Video.RefreshMetadataForOwnedVideo`,
+/// `Video.cs:636-701`); each alternate is a row `alternate` builds in that
+/// state, owned by and pointing at the primary
+/// (`LibraryManager.ResolveAlternateVersion` and `CreateItems`,
+/// `LibraryManager.cs:865-922,2446-2487`), whose own stack is its
+/// `AdditionalParts` and part rows it owns (`SetAdditionalPartsFromStack`,
+/// `:828-862`). The primary's group goes to [`PlanOutput::local_versions`].
+fn plan_version_group(
+    mut primary: Planned<BaseItemEntity>,
+    (parts, alternates): (Vec<String>, Vec<(String, Vec<String>)>),
+    alternate: impl Fn(&str, bool) -> Option<Planned<BaseItemEntity>>,
+    part: impl Fn(&str) -> Option<Planned<BaseItemEntity>>,
+    ctx: &PlanCtx<'_>,
+    out: &mut Vec<Planned>,
+) {
+    let versions: Vec<String> = alternates.iter().map(|(first, _)| first.clone()).collect();
+    set_resolved_lists(&mut primary.entity, &parts, &versions);
+    let (owner, mixed) = (primary.id, primary.entity.is_in_mixed_folder);
+    ctx.local_versions.borrow_mut().push((owner, versions));
+    out.push(primary.into());
+    let plan_parts = |paths: &[String], owned_by: Uuid, out: &mut Vec<Planned>| {
+        for path in paths {
+            let Some(mut row) = part(path) else {
+                continue;
+            };
+            row.entity.owner_id = Some(guid_to_db(owned_by));
+            row.entity.is_in_mixed_folder = mixed;
+            set_resolved_lists(&mut row.entity, &[], &[]);
+            out.push(row.into());
+        }
+    };
+    plan_parts(&parts, owner, out);
+    for (first, rest) in &alternates {
+        let Some(mut row) = alternate(first, mixed) else {
+            continue;
+        };
+        row.entity.owner_id = Some(guid_to_db(owner));
+        row.entity.primary_version_id = Some(guid_to_db(owner));
+        set_resolved_lists(&mut row.entity, rest, &[]);
+        let id = row.id;
+        out.push(row.into());
+        plan_parts(rest, id, out);
     }
 }
 
