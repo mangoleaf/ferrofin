@@ -1425,7 +1425,20 @@ impl SimilarItemsManager for FerrofinSimilarItemsManager {
         let seed_provider_ids = if providers.is_empty() {
             HashMap::new()
         } else {
-            self.repo.provider_ids(item_id).await.unwrap_or_default()
+            // Upstream reads the ids off the loaded item, so it cannot fail
+            // here; the remote providers then run without them, which must not
+            // be silent.
+            self.repo
+                .provider_ids(item_id)
+                .await
+                .unwrap_or_else(|error| {
+                    tracing::warn!(
+                        item_id = %item_id,
+                        error = %error,
+                        "reading the seed's provider ids failed; the remote similar items providers run without them"
+                    );
+                    HashMap::new()
+                })
         };
 
         // Resolved once: every provider's queries share it.
