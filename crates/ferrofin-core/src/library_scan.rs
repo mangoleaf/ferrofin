@@ -23397,17 +23397,31 @@ fn renamed_extra(
 }
 
 /// Maps an NFO-parsed [`PersonInfo`](ferrofin_providers::container_types::PersonInfo)
-/// to a persistable [`PeopleEntity`]. NFO people carry no remote id/image, so those
-/// are left empty; the person-type key is the Jellyfin `PersonType` name
-/// (`PersonInfo.Type.ToString()`, `PeopleRepository.cs:122`): the member name,
-/// or the C# integer of an undeclared value.
+/// to a persistable [`PeopleEntity`]. The person-type key is the Jellyfin
+/// `PersonType` name (`PersonInfo.Type.ToString()`, `PeopleRepository.cs:122`):
+/// the member name, or the C# integer of an undeclared value. The actor's
+/// `<thumb>` URL is the credit's photo URL (`GetPersonFromXmlNode`'s
+/// `ImageUrl`), which [`LibraryScanner::enrich_people`] gives a person with no
+/// Primary, as `SavePeopleMetadataAsync` does. An NFO credit has no provider
+/// id: `GetPersonFromXmlNode` reads none.
+///
+/// TODO(parity, open work item — gl-1818): a `<thumb>` that names a local file
+/// (the path an NFO saver writes, Kodi's `.actors` folder) is left out, so the
+/// remote providers' photo URL for the credit fills it (`merge_people`) and the
+/// scan, which downloads only from a URL, still gets a photo. Upstream stores
+/// the path as the person's Primary. Un-defer path: the owner decides which
+/// files an NFO may name, then `enrich_people` sets such a path as the Primary.
 fn person_to_entity(p: ferrofin_providers::container_types::PersonInfo) -> PeopleEntity {
+    let is_http = |url: &String| {
+        let url = url.to_ascii_lowercase();
+        url.starts_with("http://") || url.starts_with("https://")
+    };
     PeopleEntity {
         id: guid_to_db(Uuid::new_v4()),
         name: p.name,
         person_type: Some(p.type_.json_name().into_owned()),
         role: p.role,
-        primary_image_url: None,
+        primary_image_url: p.image_url.filter(is_http),
         provider_id: None,
         // `<sortorder>` / `<order>` (`XmlReaderExtensions.GetPersonFromXmlNode`).
         sort_order: p.sort_order.map(i64::from),
@@ -24844,6 +24858,8 @@ mod directory_cache_tests;
 mod downloaded_art_tests;
 #[cfg(test)]
 mod episode_images_tests;
+#[cfg(test)]
+mod nfo_artwork_tests;
 #[cfg(test)]
 mod person_biography_tests;
 #[cfg(test)]
@@ -38228,7 +38244,8 @@ mod tests {
         );
     }
 
-    // PersonInfo → PeopleEntity: type key is the Jellyfin PersonType name; no remote id/image.
+    // PersonInfo → PeopleEntity: type key is the Jellyfin PersonType name, the
+    // `<thumb>` the photo URL (gl-74); no remote id.
     #[test]
     fn person_to_entity_maps_type_name() {
         use ferrofin_model::data::PersonKind;
@@ -38236,6 +38253,7 @@ mod tests {
         let p = PersonInfo {
             type_: PersonKind::Director,
             role: Some("Self".into()),
+            image_url: Some("https://img/jane.jpg".into()),
             ..PersonInfo::new("Jane Doe")
         };
         let e = super::person_to_entity(p);
@@ -38243,7 +38261,46 @@ mod tests {
         assert_eq!(e.person_type.as_deref(), Some("Director"));
         assert_eq!(e.role.as_deref(), Some("Self"));
         assert!(e.provider_id.is_none());
-        assert!(e.primary_image_url.is_none());
+        assert_eq!(e.primary_image_url.as_deref(), Some("https://img/jane.jpg"));
+        // No `<thumb>`, or one naming a local file (gl-1818), carries none.
+        for thumb in [
+            None,
+            Some("/config/metadata/People/J/Jane Doe/folder.jpg"),
+            Some("file:///media/.actors/Jane_Doe.jpg"),
+            Some(r"C:\media\.actors\Jane_Doe.jpg"),
+        ] {
+            let e = super::person_to_entity(PersonInfo {
+                image_url: thumb.map(str::to_owned),
+                ..PersonInfo::new("Jane Doe")
+            });
+            assert!(e.primary_image_url.is_none(), "{thumb:?}");
+        }
+        let upper = super::person_to_entity(PersonInfo {
+            image_url: Some("HTTP://img/jane.jpg".into()),
+            ..PersonInfo::new("Jane Doe")
+        });
+        assert_eq!(
+            upper.primary_image_url.as_deref(),
+            Some("HTTP://img/jane.jpg")
+        );
+        // So an NFO saver's local-path `<thumb>` still lets a remote
+        // provider's photo URL fill the credit (`MergePeople`).
+        let mut nfo = [super::person_to_entity(PersonInfo {
+            image_url: Some("/config/metadata/People/J/Jane Doe/folder.jpg".into()),
+            ..PersonInfo::new("Jane Doe")
+        })];
+        ferrofin_providers::metadata_merge::merge_people(
+            &[ferrofin_db::entities::base_items::PeopleEntity {
+                name: "Jane Doe".into(),
+                primary_image_url: Some("https://tmdb/jane.jpg".into()),
+                ..Default::default()
+            }],
+            &mut nfo,
+        );
+        assert_eq!(
+            nfo[0].primary_image_url.as_deref(),
+            Some("https://tmdb/jane.jpg")
+        );
 
         // An NFO `<type>27</type>` (or `Director,Narrator`) parses to an
         // undeclared value, which C#'s `ToString()` stores as its integer.
