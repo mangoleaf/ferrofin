@@ -773,14 +773,6 @@ fn recorded_provider_id(cache: &ArtworkCache, id: &str, provider: &str) -> Optio
         .and_then(|(_, value)| value.trim().parse().ok())
 }
 
-/// One episode's entry in a cached season response, by episode number.
-fn episode_in_season(
-    details: &ferrofin_providers::tmdb::SeasonDetails,
-    number: i32,
-) -> Option<&ferrofin_providers::tmdb::EpisodeDetails> {
-    details.episodes.iter().find(|e| e.episode_number == number)
-}
-
 /// Downloads each [`RemoteImage`] into `item_dir` (as `{type}` plus the
 /// extension of the type the response resolved to, as upstream's `ImageSaver`
 /// names it) and returns the persisted-image rows.
@@ -8209,6 +8201,28 @@ impl LibraryScanner {
         if video_info.is_some_and(|info| info.parent_index_number.is_some()) {
             entity.parent_index_number = guesses.parent_index_number;
         }
+        // `Episode.GetLookupInfo` reads the range end `BeforeMetadataRefresh`
+        // left (`FillMissingEpisodeNumbersFromPath`). A probed row had that
+        // run by `apply_video_metadata`: a stored one's is what `take` read, a
+        // new one's is on the row, ahead of any NFO. Any other row takes a
+        // missing one, or under "Replace all metadata" any, from its path.
+        // Only a provider reads it.
+        if plan.remote_metadata
+            && item_type_lookup::kind_from_type_name(&entity.type_) == Some(BaseItemKind::Episode)
+        {
+            if video_info.is_some() {
+                if metadata_stored.is_none() {
+                    guesses.index_number_end = index_number_end(&entity);
+                }
+            } else if (guesses.index_number_end.is_none() || options.replace_all_metadata)
+                && let Some(info) = entity
+                    .path
+                    .as_deref()
+                    .and_then(|path| resolve_episode_path(path, naming))
+            {
+                guesses.index_number_end = info.ending_episode_number.filter(|_| !info.is_by_date);
+            }
+        }
         let rows = Self::apply_probe(&mut entity, probe.info.as_ref(), probe.is_audio, policy);
         // `if (audio.AlbumEntity is not null && !audio.AlbumEntity.
         // NormalizationGain.HasValue)` in `FetchDataFromTags`, which runs for
@@ -12495,8 +12509,14 @@ impl LibraryScanner {
     /// Its external ids, trailers and credits — the episode's own — come
     /// from one episode request ([`TmdbClient::episode_extras_for_language`]).
     ///
+    /// A multi-episode file (the lookup's `IndexNumberEnd`) takes every
+    /// episode of its range the season lists, their names and overviews
+    /// joined ([`ferrofin_providers::episode::tmdb_episode_in_range`],
+    /// `TmdbEpisodeProvider.cs:106-158`), and the first one's own request.
+    ///
     /// `None` when TMDB has nothing for this episode: no series id to look
-    /// it up under, no such season, or no such episode in it.
+    /// it up under, no such season, or no such episode in it (for a range,
+    /// none of its episodes, or an end below its start).
     async fn fetch_tmdb_episode(
         &self,
         row: &BaseItemEntity,
@@ -12514,7 +12534,11 @@ impl LibraryScanner {
             let details = self
                 .season_details_cached(cache, &series_id, season, lookup.tmdb_language().as_deref())
                 .await?;
-            episode_in_season(&details, number)?.clone()
+            ferrofin_providers::episode::tmdb_episode_in_range(
+                &details,
+                number,
+                lookup.index_number_end,
+            )?
         };
         let mut answer = RemoteAnswer::for_row(row, None);
         apply_tmdb_episode(&mut answer.item, &ep);
@@ -12526,7 +12550,7 @@ impl LibraryScanner {
                 tmdb.episode_extras_for_language(
                     id,
                     season,
-                    number,
+                    ep.episode_number,
                     lookup.tmdb_language().as_deref(),
                 )
                 .await
@@ -21983,6 +22007,12 @@ struct ResolverGuesses {
     production_year: Option<i64>,
     index_number: Option<i64>,
     parent_index_number: Option<i64>,
+    /// An episode's range end (`IndexNumberEnd`) as `BeforeMetadataRefresh`
+    /// leaves it for the lookup (`Episode.GetLookupInfo`): the stored row's,
+    /// else the file name's ([`LibraryScanner::scan_item`] fills that in). A
+    /// local reader's (an NFO's) never reaches it, as upstream's lookup takes
+    /// only a local reader's ids (`MergeNewData`).
+    index_number_end: Option<i32>,
     /// A track's album folder name. Never persisted and never filled back:
     /// upstream never sets `Audio.Album` from the path, so a tagless track's
     /// `Album` stays empty. Only the legacy carve-out in
@@ -22037,8 +22067,9 @@ impl ResolverGuesses {
         let production_year = entity.production_year.take();
         let index_number = entity.index_number.take();
         let parent_index_number = entity.parent_index_number.take();
-        let numbers_from_path = replace_all_metadata
-            && item_type_lookup::kind_from_type_name(&entity.type_) == Some(BaseItemKind::Episode);
+        let is_episode =
+            item_type_lookup::kind_from_type_name(&entity.type_) == Some(BaseItemKind::Episode);
+        let numbers_from_path = replace_all_metadata && is_episode;
         let number = |stored: Option<i64>, path: Option<i64>| {
             if numbers_from_path {
                 path.or(stored)
@@ -22074,6 +22105,12 @@ impl ResolverGuesses {
                 stored.and_then(|s| s.parent_index_number),
                 parent_index_number,
             ),
+            // `EpisodeMetadataService.BeforeSaveInternal` drops an end
+            // below the start, or with none, before the lookup is read.
+            index_number_end: stored.filter(|_| is_episode).and_then(|s| {
+                index_number_end(s)
+                    .filter(|end| s.index_number.is_some_and(|start| i64::from(*end) >= start))
+            }),
             folder_album: entity.album.take(),
             series_name: if entity.type_.ends_with(".Book") {
                 entity.series_name.take()
@@ -32345,6 +32382,84 @@ mod tests {
         assert_eq!(answer.item.community_rating, None);
         // The air date still lands — only the rating was absent.
         assert_eq!(answer.item.production_year, Some(2011));
+    }
+
+    /// A multi-episode file takes every episode of its range the season
+    /// lists, by the lookup's range end (the stored row's, or the file
+    /// name's): the first one's ids, date and rating, and their names and
+    /// overviews joined with ` / ` (`TmdbEpisodeProvider.cs:106-158`). An
+    /// NFO's range end on the row is not the lookup's (`MergeNewData` hands
+    /// the providers a local reader's ids only), so it looks up the start.
+    #[rstest::rstest]
+    #[case::in_the_lookup(
+        false,
+        "Winter Is Coming / The Kingsroad",
+        "Ned is summoned south. / The party rides north."
+    )]
+    #[case::only_an_nfos(true, "Winter Is Coming", "Ned is summoned south.")]
+    #[tokio::test]
+    async fn a_tmdb_multi_episode_joins_every_episode_in_its_range(
+        #[case] nfo_only: bool,
+        #[case] name: &str,
+        #[case] overview: &str,
+    ) {
+        let (base, _hits, _all) = spawn_tmdb_server(Some(SEASON_JSON), Some(CREDITS_JSON));
+        let tmp = tempfile::tempdir().unwrap();
+        let (scanner, mut cache, mut episode) = tmdb_episode_fixture(&base, tmp.path()).await;
+        episode.name = None;
+        let mut lookup = super::ResolverGuesses::default();
+        if nfo_only {
+            episode.data = Some(r#"{"IndexNumberEnd":2}"#.to_owned());
+        } else {
+            lookup.index_number_end = Some(2);
+        }
+
+        let answer = scanner
+            .fetch_tmdb_episode(&episode, &mut cache, &lookup)
+            .await
+            .expect("applied");
+        assert_eq!(answer.item.name.as_deref(), Some(name));
+        assert_eq!(answer.item.overview.as_deref(), Some(overview));
+        assert_eq!(answer.item.production_year, Some(2011));
+        assert!((answer.item.community_rating.expect("rating") - 8.3).abs() < 1e-6);
+        assert!(
+            answer
+                .provider_ids
+                .contains(&("Tmdb".to_owned(), "63056".to_owned())),
+            "{:?}",
+            answer.provider_ids
+        );
+    }
+
+    /// The lookup's range end is the stored episode's (`Episode.GetLookupInfo`
+    /// after `BeforeSave`): kept when it is not below the episode number,
+    /// dropped below it or without one (`EpisodeMetadataService.
+    /// BeforeSaveInternal`), and read for an episode only.
+    #[rstest::rstest]
+    #[case::kept("TV.Episode", Some(1), 2, Some(2))]
+    #[case::one_episode("TV.Episode", Some(2), 2, Some(2))]
+    #[case::below_the_start("TV.Episode", Some(3), 2, None)]
+    #[case::without_a_start("TV.Episode", None, 2, None)]
+    #[case::not_an_episode("Movies.Movie", Some(1), 2, None)]
+    fn the_lookup_takes_a_stored_episodes_range_end(
+        #[case] kind: &str,
+        #[case] start: Option<i64>,
+        #[case] end: i32,
+        #[case] expected: Option<i32>,
+    ) {
+        let type_ = format!("MediaBrowser.Controller.Entities.{kind}");
+        let stored = BaseItemEntity {
+            type_: type_.clone(),
+            index_number: start,
+            data: Some(format!(r#"{{"IndexNumberEnd":{end}}}"#)),
+            ..Default::default()
+        };
+        let mut scanned = BaseItemEntity {
+            type_,
+            ..Default::default()
+        };
+        let guesses = super::ResolverGuesses::take(&mut scanned, Some(&stored), false);
+        assert_eq!(guesses.index_number_end, expected);
     }
 
     // A library can rank TheTVDB first for `Series` while leaving `Episode` to

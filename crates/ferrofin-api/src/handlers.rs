@@ -2194,8 +2194,12 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
                    fetch_tmdb_episode with apply_tmdb_episode; for an episode the provider \
                    manager refreshes that has a path, episode.rs tmdb_answer (a path-less one \
                    is not asked, as TmdbEpisodeProvider returns nothing for \
-                   IsMissingEpisode). Compared with TmdbMovieProvider, TmdbSeriesProvider \
-                   (MapTvShowToSeries), TmdbSeasonProvider and TmdbEpisodeProvider \
+                   IsMissingEpisode). Both read a multi-episode file's IndexNumberEnd range \
+                   through episode.rs tmdb_episode_in_range; the scan's lookup has its stored \
+                   row's range end, else its file name's (under Replace all metadata the file \
+                   name's first), never its NFO's (MergeNewData passes ids only). Compared \
+                   with TmdbMovieProvider, TmdbSeriesProvider (MapTvShowToSeries), \
+                   TmdbSeasonProvider and TmdbEpisodeProvider \
                    GetMetadata, TmdbClientManager and TmdbUtils at the pinned v12.4 tag. \
                    TheMovieDb's box-set, person, missing-episode and similar-items providers \
                    and its image providers, the other providers (TheTVDB, OMDb, MusicBrainz, \
@@ -2213,9 +2217,9 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
             "An episode is looked up in aired order whatever the series' display order; \
              upstream maps an absolute, DVD, digital, story-arc, production, TV or \
              original-air-date order through TMDb's episode group. Fix path: gl-1784.",
-            "A multi-episode file takes the first episode's name and overview; upstream \
-             fetches every episode up to IndexNumberEnd and joins theirs, and looks up an \
-             episode with no season number in season 1. Fix path: gl-1785.",
+            "An episode with no season number is not looked up; upstream looks it up in \
+             season 1 (TmdbEpisodeProvider.cs:99), with its resolver's season-1 default for \
+             a loose episode, which Ferrofin's planner lacks too. Fix path: gl-1846.",
             "A date-only value (premiere, end and air dates) is stored as midnight UTC; \
              upstream stores the server's local midnight. Pending an owner decision \
              (gl-490).",

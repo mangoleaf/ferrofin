@@ -2298,7 +2298,7 @@ impl LocalProviderManager {
                 self.tmdb_episode(
                     series_id_of("Tmdb"),
                     season_number,
-                    episode_number,
+                    (episode_number, crate::episode::lookup_range_end(row)),
                     tmdb_language.as_deref(),
                 )
                 .await
@@ -2427,27 +2427,26 @@ impl LocalProviderManager {
     }
 
     /// `TmdbEpisodeProvider`'s answer: the episode's entry in the series'
-    /// season response and its own request, by the series' `Tmdb` id only.
+    /// season response — for a multi-episode one (`episode_end`), every entry
+    /// up to its end, joined ([`crate::episode::tmdb_episode_in_range`]) — and
+    /// the first one's own request, by the series' `Tmdb` id only.
     async fn tmdb_episode(
         &self,
         series_tmdb_id: Option<i64>,
         season_number: i32,
-        episode_number: i32,
+        (episode_number, episode_end): (i32, Option<i32>),
         language: Option<&str>,
     ) -> Option<crate::episode::EpisodeAnswer> {
         let (client, series) = self.tmdb.as_ref().zip(series_tmdb_id)?;
         let season = client
             .season_details_for_language(series, season_number, language)
             .await?;
-        let entry = season
-            .episodes
-            .iter()
-            .find(|entry| entry.episode_number == episode_number)?;
+        let entry = crate::episode::tmdb_episode_in_range(&season, episode_number, episode_end)?;
         let extras = client
-            .episode_extras_for_language(series, season_number, episode_number, language)
+            .episode_extras_for_language(series, season_number, entry.episode_number, language)
             .await;
         Some(crate::episode::tmdb_answer(
-            entry,
+            &entry,
             extras.as_ref(),
             season_number,
             episode_number,
@@ -13115,7 +13114,9 @@ mod tests {
     /// request (its external ids and one guest star).
     const TMDB_EPISODE_SEASON: &str = r#"{"id": 3624, "episodes": [
         {"id": 9002, "episode_number": 2, "name": "TMDB Episode",
-         "overview": "TMDB synopsis.", "air_date": "2011-04-24", "vote_average": 8.5}]}"#;
+         "overview": "TMDB synopsis.", "air_date": "2011-04-24", "vote_average": 8.5},
+        {"id": 9003, "episode_number": 3, "name": "TMDB Third",
+         "overview": "Third synopsis.", "air_date": "2011-05-01", "vote_average": 7.0}]}"#;
     const TMDB_EPISODE: &str = r#"{"external_ids": {"imdb_id": "tt0002002", "tvdb_id": 5002},
         "credits": {"cast": [], "guest_stars": [{"id": 31, "name": "Guest Star",
         "character": "Visitor", "order": 0}], "crew": []}, "videos": {"results": []}}"#;
@@ -13461,6 +13462,56 @@ mod tests {
             none.saved().and_then(|r| r.overview).as_deref(),
             Some("Stored.")
         );
+    }
+
+    /// A multi-episode file (`IndexNumberEnd`) takes TheMovieDb's entries for
+    /// every episode in its range: the first one's date, rating and ids, and
+    /// the names and overviews joined with ` / ` (`TmdbEpisodeProvider.cs:
+    /// 106-158`); only the first episode's own request is made.
+    #[tokio::test]
+    async fn a_multi_episode_takes_every_tmdb_episode_in_its_range() {
+        let (base, log) = spawn_episode_providers(false);
+        let episode = VirtualEpisode::new(
+            &base,
+            &[("Tmdb", "1399")],
+            episode_fetchers(&[crate::library_options::fetcher_names::TMDB]),
+            |row| {
+                remote(row);
+                row.data = Some(r#"{"IndexNumberEnd":3}"#.to_owned());
+            },
+        );
+        episode
+            .mgr
+            .refresh_full_item(episode.episode_id, &search_missing())
+            .await
+            .expect("refresh");
+        let row = episode.saved().expect("a full refresh saves");
+        assert_eq!(row.name.as_deref(), Some("TMDB Episode / TMDB Third"));
+        assert_eq!(
+            row.overview.as_deref(),
+            Some("TMDB synopsis. / Third synopsis.")
+        );
+        assert_eq!(
+            row.premiere_date
+                .map(|d| d.format("%Y-%m-%d").to_string())
+                .as_deref(),
+            Some("2011-04-24")
+        );
+        let replaced = episode.store.replaced.lock().expect("lock").clone();
+        let (_, ids) = replaced.last().expect("the ids are written");
+        assert!(
+            ids.iter()
+                .any(|(k, v)| (k.as_str(), v.as_str()) == ("Tmdb", "9002")),
+            "{ids:?}"
+        );
+        let asked = log.lock().expect("log").clone();
+        assert!(
+            asked
+                .iter()
+                .any(|l| l.contains("/tmdb/tv/1399/season/1/episode/2")),
+            "{asked:?}"
+        );
+        assert!(!asked.iter().any(|l| l.contains("/episode/3")), "{asked:?}");
     }
 
     /// The episode's own credits: TheMovieDb's guest star and TheTVDB's guest are
