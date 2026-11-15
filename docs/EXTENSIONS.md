@@ -254,6 +254,11 @@ config write is guest input. On boot each component is compiled,
 interrogated for its identity (`descriptor`), seed config, and task list, and then
 registered through the same plugin manager as compiled-in extensions — same dashboard
 entry, same enable/disable toggle, same `/Plugins/{id}/Configuration` storage.
+The boot also removes the segment output (`{data_dir}/plugins/{id}.segments/`) of every
+plugin id no `*.wasm` file in that directory carries, so a plugin installed again starts
+without it. It removes none while a `*.wasm` file fails to load or the directory cannot be
+listed. A plugin taken out by moving its file away or renaming it to something other than
+`*.wasm` loses its segment output the same way and has to analyse the library again.
 
 **"Disabled" and load.** Enable/disable governs the runtime work — tasks don't run, events
 aren't delivered, and metadata lookups are skipped for a disabled plugin. But a disabled

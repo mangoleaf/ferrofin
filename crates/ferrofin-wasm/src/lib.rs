@@ -398,6 +398,10 @@ impl WasmPluginHost {
     /// or the other plugins. With no `*.wasm` file it builds nothing: no
     /// engine, no epoch-ticker thread, no guest HTTP clients.
     ///
+    /// It also removes the segment cache (`{id}.segments/`) of every plugin
+    /// not installed, unless the directory could not be listed or a file
+    /// failed to load before its id was read.
+    ///
     /// # Errors
     /// Only on engine construction failure (a wasmtime misconfiguration —
     /// effectively a bug, but the caller decides whether to boot without
@@ -406,10 +410,18 @@ impl WasmPluginHost {
     /// # Panics
     /// Only if the OS refuses to spawn the epoch-ticker thread (startup-time
     /// resource exhaustion — the process is already unviable).
+    // One pass over the directory: list, load and refuse per file, then sweep.
+    #[allow(clippy::too_many_lines)]
     pub fn load(plugins_dir: &Path, settings: &WasmSettings) -> Result<Self, ServiceError> {
+        // Whether every plugin file's id is known: only then can a segment
+        // cache be told to belong to no plugin.
+        let mut all_ids_read = true;
         let mut paths: Vec<_> = match std::fs::read_dir(plugins_dir) {
             Ok(entries) => entries
-                .filter_map(Result::ok)
+                .filter_map(|entry| {
+                    all_ids_read &= entry.is_ok();
+                    entry.ok()
+                })
                 .map(|e| e.path())
                 .filter(|p| p.extension().is_some_and(|ext| ext == "wasm"))
                 .collect(),
@@ -422,11 +434,15 @@ impl WasmPluginHost {
                     %err,
                     "cannot read the wasm plugins directory; continuing without plugins"
                 );
+                all_ids_read = false;
                 Vec::new()
             }
         };
         paths.sort();
         if paths.is_empty() {
+            if all_ids_read {
+                remove_orphaned_segment_caches(plugins_dir, &[]);
+            }
             return Ok(Self {
                 settings: settings.clone(),
                 ..Self::empty()
@@ -441,12 +457,16 @@ impl WasmPluginHost {
             Arc::new(std::sync::OnceLock::new());
 
         let mut plugins: Vec<Arc<LoadedPlugin>> = Vec::new();
+        // Every file's id, the refused ones' too: their caches stay.
+        let mut ids: Vec<Uuid> = Vec::new();
         for path in paths {
             let Some(mut loaded) =
                 load_one_guarded(&engine, &linker, &path, settings, &http, &collaborators)
             else {
+                all_ids_read = false;
                 continue;
             };
+            ids.push(loaded.descriptor.id);
             if settings.reserved_ids.contains(&loaded.descriptor.id) {
                 error!(
                     path = %path.display(),
@@ -504,6 +524,9 @@ impl WasmPluginHost {
                 "loaded wasm plugin"
             );
             plugins.push(Arc::new(loaded));
+        }
+        if all_ids_read {
+            remove_orphaned_segment_caches(plugins_dir, &ids);
         }
 
         Ok(Self {
@@ -716,6 +739,61 @@ fn cached_segment_provider(
         )
         .with_legacy_ids(vec![format!("wasm:{}", plugin.descriptor.id)]),
     )
+}
+
+/// Removes each `{id}.segments` directory in `plugins_dir` whose `id` is not
+/// in `installed`. An uninstall used to remove that directory as a file,
+/// which fails, so the cache stayed, and the plugin installed again served
+/// it as its own output before analysing anything. Upstream likewise deletes
+/// at startup a plugin folder its uninstall could not delete
+/// (`PluginManager.LoadAssemblies`). Only the exact name the cache is written
+/// under matches; a symlink or a file is never removed.
+fn remove_orphaned_segment_caches(plugins_dir: &Path, installed: &[Uuid]) {
+    let entries = match std::fs::read_dir(plugins_dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return,
+        Err(error) => {
+            warn!(
+                dir = %plugins_dir.display(),
+                %error,
+                "cannot list the wasm plugins directory; the segment caches of plugins not installed stay"
+            );
+            return;
+        }
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(id) = name
+            .to_str()
+            .and_then(|name| name.strip_suffix(".segments"))
+            .and_then(|stem| {
+                Uuid::try_parse(stem)
+                    .ok()
+                    .filter(|id| id.to_string() == stem)
+            })
+        else {
+            continue;
+        };
+        if installed.contains(&id) || !entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+            continue;
+        }
+        let path = entry.path();
+        match std::fs::remove_dir_all(&path) {
+            Ok(()) => info!(
+                plugin_id = %id,
+                path = %path.display(),
+                "removed the segment cache of a wasm plugin that is not installed"
+            ),
+            // Another server on this data directory removed it first.
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => warn!(
+                plugin_id = %id,
+                path = %path.display(),
+                %error,
+                "could not remove the segment cache of a wasm plugin that is not installed; installed again, it serves the segments it wrote before"
+            ),
+        }
+    }
 }
 
 /// Empty directories and incomplete atomic temp files do not prove a producer role.
