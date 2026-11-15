@@ -310,6 +310,10 @@ struct Registration {
     id: String,
     state: TaskState,
     last_result: Option<TaskResult>,
+    /// An adopted Jellyfin's last result, shown while this task has none of
+    /// its own. Kept apart so no interval trigger anchors on it: an adopted
+    /// install's tasks keep the first-run spread instead of all firing at once.
+    adopted_result: Option<TaskResult>,
     /// Triggers set via [`FerrofinTaskManager::set_triggers`], overriding the
     /// task's [`default_triggers`](ScheduledTask::default_triggers). `None`
     /// until a client configures them.
@@ -413,7 +417,10 @@ impl Registration {
                 .reported()
                 .filter(|_| self.state != TaskState::Idle),
             id: Some(self.id.clone()),
-            last_execution_result: self.last_result.clone(),
+            last_execution_result: self
+                .last_result
+                .clone()
+                .or_else(|| self.adopted_result.clone()),
             triggers: self.effective_triggers(),
             is_hidden: self.task.is_hidden(),
             key: Some(key),
@@ -499,6 +506,9 @@ pub struct FerrofinTaskManager {
     stored_results: Arc<Mutex<HashMap<String, TaskResult>>>,
     /// Where run outcomes persist (`None` = in-memory only).
     result_store_path: Arc<Mutex<Option<PathBuf>>>,
+    /// An adopted Jellyfin's history directory (`{DataPath}/ScheduledTasks`),
+    /// read for a task the history store has no result for (`None` = unset).
+    jellyfin_history_dir: Arc<Mutex<Option<PathBuf>>>,
     /// Whether [`start_scheduler`](Self::start_scheduler) has run. A task
     /// registered *after* that moment fires its own `StartupTrigger` on
     /// registration (upstream arms each task's triggers when its worker is
@@ -650,8 +660,9 @@ fn adopt_renamed_keys<T>(map: &mut HashMap<String, T>, adopt: impl Fn(&mut T, &s
     }
 }
 
-/// Reads a JSON store written by [`write_store`], returning an empty map when
-/// the file does not exist (a first boot) and warning — loudly, as upstream's
+/// Reads a JSON store written by [`write_store`] (or an adopted Jellyfin's
+/// per-task file), returning `T::default()` when the file does not exist (a
+/// first boot) or is empty, and warning — loudly, as upstream's
 /// `Error deserializing {File}` does — when it exists but cannot be parsed, so
 /// a corrupt store is never mistaken for "nothing has run yet".
 fn read_store<T: serde::de::DeserializeOwned + Default>(path: &std::path::Path, store: &str) -> T {
@@ -755,13 +766,9 @@ impl FerrofinTaskManager {
     /// empty. Port of upstream's per-task history file
     /// (`{DataPath}/ScheduledTasks/{id}.js`, read back into
     /// `ScheduledTaskWorker.LastExecutionResult`); one file for the whole map
-    /// is equivalent and simpler, matching the trigger store next to it.
-    ///
-    /// Accepted divergence for drop-in adoption: upstream names those files by
-    /// the MD5 of the task *type*, so a data directory adopted from a real
-    /// Jellyfin install starts with an empty "Last ran" column here — each
-    /// task fills it in on its first Ferrofin run. Nothing is lost: Jellyfin's
-    /// own files stay untouched for a swap back.
+    /// is equivalent and simpler, matching the trigger store next to it. A
+    /// task this store has no result for falls back to an adopted Jellyfin's
+    /// own file (see [`set_jellyfin_data_path`](Self::set_jellyfin_data_path)).
     pub fn set_result_store(&self, path: PathBuf) {
         let mut results: HashMap<String, TaskResult> = read_store(&path, "task history");
         adopt_renamed_keys(&mut results, |result, key, name| {
@@ -770,6 +777,32 @@ impl FerrofinTaskManager {
         });
         *lock(&self.stored_results) = results;
         *lock(&self.result_store_path) = Some(path);
+    }
+
+    /// Points the registry at the server's `DataPath`, where an adopted
+    /// Jellyfin kept each task's last run in `ScheduledTasks/{id}.js`.
+    ///
+    /// Call before [`register`](Self::register). A task the history store has
+    /// no result for answers that file's as its `LastExecutionResult`, until
+    /// it runs here: upstream's getter reads
+    /// `{DataPath}/ScheduledTasks/{new Guid(Id)}.js` once, skipping an empty
+    /// or malformed file. The file is only read, never written: adoption is
+    /// one-way and Jellyfin's files stay as they are. The result is only
+    /// shown: interval triggers treat the task as never run here, so an
+    /// adopted install keeps the first-run spread (see
+    /// `FIRST_RUN_SPREAD_MINUTES`).
+    pub fn set_jellyfin_data_path(&self, data_path: &std::path::Path) {
+        *lock(&self.jellyfin_history_dir) = Some(data_path.join("ScheduledTasks"));
+    }
+
+    /// The last result an adopted Jellyfin recorded for the task whose wire id
+    /// is `id`, or `None` (no history directory, no file, or one that cannot
+    /// be read).
+    fn jellyfin_last_result(&self, id: &str) -> Option<TaskResult> {
+        let dir = lock(&self.jellyfin_history_dir).clone()?;
+        // `new Guid(Id) + ".js"`: the 32-digit id in its dashed form.
+        let name = uuid::Uuid::parse_str(id).ok()?.hyphenated().to_string();
+        read_store(&dir.join(format!("{name}.js")), "Jellyfin task history")
     }
 
     /// Records a task's last run outcome in the history store and persists it,
@@ -792,21 +825,30 @@ impl FerrofinTaskManager {
     ///
     /// Mirrors the C# `AddTasks`: the new registration starts
     /// [`Idle`](TaskState::Idle), picking up any persisted trigger override
-    /// **and** last run result for its key. If the scheduler is already
-    /// running and the task has a `StartupTrigger`, that trigger fires here —
+    /// **and** last run result for its key (else an adopted Jellyfin's, see
+    /// [`set_jellyfin_data_path`](Self::set_jellyfin_data_path)). If the
+    /// scheduler is already running and the task has a `StartupTrigger`, that
+    /// trigger fires here —
     /// upstream arms a task's triggers when its worker is constructed, so a
     /// task registered late (after
     /// [`start_scheduler`](Self::start_scheduler)) must not silently lose its
     /// startup run.
     pub fn register(&self, task: Arc<dyn ScheduledTask>) {
         let key = task.key().to_string();
+        let id = ferrofin_traits::tasks::task_id_for_key(&key);
         let triggers_override = lock(&self.stored_overrides).get(&key).cloned();
         let last_result = lock(&self.stored_results).get(&key).cloned();
+        let adopted_result = if last_result.is_none() {
+            self.jellyfin_last_result(&id)
+        } else {
+            None
+        };
         let mut registration = Registration {
-            id: ferrofin_traits::tasks::task_id_for_key(&key),
+            id,
             task,
             state: TaskState::Idle,
             last_result,
+            adopted_result,
             triggers_override,
             progress: TaskProgress::default(),
             run: None,
@@ -3744,6 +3786,131 @@ mod tests {
             .last_execution_result
             .expect("restored result");
         assert_eq!(restored.status, TaskCompletionStatus::Cancelled);
+    }
+
+    /// What Jellyfin 12.4 wrote for its "Scan Media Library" run on a fresh
+    /// install, verbatim.
+    const JELLYFIN_HISTORY: &str = r#"{"StartTimeUtc":"2026-11-04T07:54:06.825283Z","EndTimeUtc":"2026-11-04T07:54:07.7650739Z","Status":"Completed","Name":"Scan Media Library","Key":"RefreshLibrary","Id":"7738148ffcd07979c7ceb148e06b3aed"}"#;
+
+    /// Writes `body` where Jellyfin keeps that task's history under its
+    /// `DataPath`, returning the file.
+    fn write_jellyfin_history(data_path: &std::path::Path, body: &[u8]) -> std::path::PathBuf {
+        let dir = data_path.join("ScheduledTasks");
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let file = dir.join("7738148f-fcd0-7979-c7ce-b148e06b3aed.js");
+        std::fs::write(&file, body).expect("write");
+        file
+    }
+
+    /// An adopted Jellyfin's history file answers a task's last result until
+    /// the task runs here; from then on Ferrofin's own result wins, across a
+    /// restart, and the file is never written.
+    #[tokio::test]
+    async fn an_adopted_jellyfin_history_file_answers_until_the_task_runs_here() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let data = dir.path().join("data");
+        let file = write_jellyfin_history(&data, JELLYFIN_HISTORY.as_bytes());
+        let store = dir.path().join("task_results.json");
+        let boot = |mgr: &FerrofinTaskManager| {
+            mgr.set_result_store(store.clone());
+            mgr.set_jellyfin_data_path(&data);
+            mgr.register(Arc::new(KeyedTask("RefreshLibrary")));
+        };
+
+        let mgr = FerrofinTaskManager::new();
+        boot(&mgr);
+        let info = mgr.get("RefreshLibrary").expect("info");
+        assert_eq!(info.id.as_deref(), Some("7738148ffcd07979c7ceb148e06b3aed"));
+        let imported = info.last_execution_result.expect("Jellyfin's result");
+        assert_eq!(imported.status, TaskCompletionStatus::Completed);
+        assert_eq!(imported.name.as_deref(), Some("Scan Media Library"));
+        assert_eq!(imported.key.as_deref(), Some("RefreshLibrary"));
+        assert_eq!(
+            imported.id.as_deref(),
+            Some("7738148ffcd07979c7ceb148e06b3aed")
+        );
+        assert_eq!(
+            imported.end_time_utc,
+            Utc.with_ymd_and_hms(2026, 11, 4, 7, 54, 7).unwrap()
+                + chrono::Duration::nanoseconds(765_073_900)
+        );
+        assert!(imported.error_message.is_none());
+
+        mgr.run_now("RefreshLibrary").await.expect("run");
+        let own = mgr
+            .get("RefreshLibrary")
+            .expect("info")
+            .last_execution_result
+            .expect("own result");
+        assert!(own.start_time_utc > imported.end_time_utc);
+
+        let restarted = FerrofinTaskManager::new();
+        boot(&restarted);
+        let after_restart = restarted
+            .get("RefreshLibrary")
+            .expect("info")
+            .last_execution_result
+            .expect("restored result");
+        assert_eq!(
+            (after_restart.start_time_utc - own.start_time_utc).num_milliseconds(),
+            0
+        );
+        assert_eq!(
+            std::fs::read(&file).expect("read"),
+            JELLYFIN_HISTORY.as_bytes()
+        );
+    }
+
+    /// An adopted result is shown but anchors no interval trigger: an overdue
+    /// task keeps the never-run first-run spread instead of firing on the
+    /// first sweep with every other adopted task.
+    #[tokio::test]
+    async fn an_adopted_result_does_not_make_an_interval_task_due() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_jellyfin_history(dir.path(), JELLYFIN_HISTORY.as_bytes());
+        let mgr = FerrofinTaskManager::new();
+        mgr.set_jellyfin_data_path(dir.path());
+        mgr.register(Arc::new(KeyedTask("RefreshLibrary")));
+        let hourly = TaskTriggerInfo {
+            type_: TaskTriggerInfoType::IntervalTrigger,
+            interval_ticks: Some(3600 * TICKS_PER_SECOND),
+            ..TaskTriggerInfo::default()
+        };
+        mgr.set_triggers("RefreshLibrary", &[hourly]).expect("set");
+        let adopted = mgr
+            .get("RefreshLibrary")
+            .expect("info")
+            .last_execution_result;
+        assert!(adopted.is_some(), "the adopted result is shown");
+        let settle = || tokio::time::sleep(std::time::Duration::from_millis(20));
+
+        let now = Utc::now();
+        mgr.scheduler_sweep(now, now);
+        settle().await;
+        let info = mgr.get("RefreshLibrary").expect("info");
+        assert_eq!(info.state, TaskState::Idle);
+        assert_eq!(info.last_execution_result, adopted);
+
+        // Once its spread slot has passed it runs, and its own result shows.
+        let later = now + first_run_delay("RefreshLibrary");
+        mgr.scheduler_sweep(now, later);
+        let own = idle_result(&mgr, "RefreshLibrary").await;
+        assert_ne!(Some(own), adopted);
+    }
+
+    /// An empty or malformed Jellyfin history file is skipped, as upstream's
+    /// read skips it, and the task still registers.
+    #[test]
+    fn an_unreadable_jellyfin_history_file_is_skipped() {
+        for body in [&b""[..], b"{not json"] {
+            let dir = tempfile::tempdir().expect("tempdir");
+            write_jellyfin_history(dir.path(), body);
+            let mgr = FerrofinTaskManager::new();
+            mgr.set_jellyfin_data_path(dir.path());
+            mgr.register(Arc::new(KeyedTask("RefreshLibrary")));
+            let info = mgr.get("RefreshLibrary").expect("registered");
+            assert!(info.last_execution_result.is_none(), "{body:?}");
+        }
     }
 
     /// A restart must not reset the interval clock.

@@ -1,5 +1,6 @@
 //! `GET /ScheduledTasks` names and descriptions in the request's culture, and
-//! formatted with the live configuration, end to end.
+//! formatted with the live configuration, end to end; and an adopted
+//! Jellyfin's last results read from its own data directory.
 //!
 //! Boots the real composition root, so the request localization, the
 //! administrator gate, the handler and the core task registry with the real
@@ -253,6 +254,36 @@ async fn clean_log_directory_description_follows_the_saved_retention() {
         description(&tasks(&router, token, None).await),
         "Deletes log files that are more than 9 days old."
     );
+
+    for task in wired.background {
+        task.abort();
+    }
+}
+
+/// An adopted Jellyfin's history file, under its `DataPath`
+/// (`{program data}/data`), answers the task's `LastExecutionResult`, and is
+/// left as it was: `ScheduledTaskWorker.LastExecutionResult` reads
+/// `{DataPath}/ScheduledTasks/{new Guid(Id)}.js`.
+#[tokio::test]
+async fn an_adopted_jellyfin_task_history_answers_last_execution_result() {
+    // What Jellyfin 12.4 wrote for its "Scan Media Library" run, verbatim.
+    const HISTORY: &str = r#"{"StartTimeUtc":"2026-11-04T07:54:06.825283Z","EndTimeUtc":"2026-11-04T07:54:07.7650739Z","Status":"Completed","Name":"Scan Media Library","Key":"RefreshLibrary","Id":"7738148ffcd07979c7ceb148e06b3aed"}"#;
+    let temp = tempfile::tempdir().expect("temp dir");
+    // `Config::test_stub` puts the program data at `{temp}/data`.
+    let history = temp.path().join("data/data/ScheduledTasks");
+    std::fs::create_dir_all(&history).expect("dir");
+    let file = history.join("7738148f-fcd0-7979-c7ce-b148e06b3aed.js");
+    std::fs::write(&file, HISTORY).expect("write");
+    let wired = boot(&temp).await;
+    let router = ferrofin_api::create_router(wired.state.clone());
+    let token = &login(&router).await;
+
+    let tasks = tasks(&router, token, None).await;
+    assert_eq!(
+        tasks["RefreshLibrary"]["LastExecutionResult"],
+        serde_json::from_str::<serde_json::Value>(HISTORY).expect("json")
+    );
+    assert_eq!(std::fs::read(&file).expect("read"), HISTORY.as_bytes());
 
     for task in wired.background {
         task.abort();

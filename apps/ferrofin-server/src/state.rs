@@ -1957,6 +1957,9 @@ pub async fn build_app_state(
     // under the data directory), so the dashboard's "Last ran" column and the
     // `LastExecutionResult` field survive a restart.
     task_manager.set_result_store(config.data_dir.join("task_results.json"));
+    // A task with no result there answers an adopted Jellyfin's own
+    // `{DataPath}/ScheduledTasks/{id}.js` until it runs here (read only).
+    task_manager.set_jellyfin_data_path(std::path::Path::new(&paths.data_path()));
     // Run outcomes publish `TaskCompleted` → forwarded to admin sessions as
     // the `ScheduledTaskEnded` push the dashboard's task page listens for.
     task_manager.set_event_manager(Arc::clone(&event_manager));
