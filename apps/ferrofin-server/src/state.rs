@@ -3186,13 +3186,16 @@ pub async fn build_app_state(
     // compiled-in registration (the upstream plugin registers it via .NET
     // reflection); both transformers self-gate on their plugin's enabled flag
     // and configuration, so dashboard toggles apply live.
+    let file_transformation_service = Arc::new(
+        ferrofin_extensions::file_transformation::WebFileTransformationService::new(
+            Arc::clone(&plugins),
+            Arc::clone(&app_host) as Arc<_>,
+        ),
+    );
+    // A save of the admin-defined transformations applies from the next request.
+    ferrofin_extensions::file_transformation::subscribe(&event_bus, &file_transformation_service);
     let file_transformations: Arc<dyn ferrofin_traits::plugins::FileTransformationService> =
-        Arc::new(
-            ferrofin_extensions::file_transformation::WebFileTransformationService::new(
-                Arc::clone(&plugins),
-                Arc::clone(&app_host) as Arc<_>,
-            ),
-        );
+        file_transformation_service;
     ferrofin_extensions::file_transformation::register_skip_button_transformer(
         file_transformations.as_ref(),
         Arc::clone(&plugins),

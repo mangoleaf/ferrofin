@@ -13,8 +13,8 @@
 //! - [`WebFileTransformationService`] — the pattern→pipeline registry
 //!   (`WebFileTransformationService` upstream), including HTTP-endpoint
 //!   callbacks (`TransformationHelper`) and the admin-defined search/replace
-//!   transformations from the plugin configuration (read live, so a config
-//!   save applies without a restart);
+//!   transformations from the plugin configuration (kept in memory and read
+//!   again after each save, so a config save applies without a restart);
 //! - [`FileTransformationExtension`] — the `/Plugins` presentation + the
 //!   vendored upstream settings page;
 //! - [`SkipButtonTransformer`] — Intro Skipper's `Injector.FileTransformer`,
@@ -29,6 +29,8 @@ use std::sync::{Arc, LazyLock, Mutex, PoisonError, RwLock};
 use std::time::Duration;
 
 use async_trait::async_trait;
+use ferrofin_core::event_manager::FerrofinEventManager;
+use ferrofin_core::plugin_manager::PLUGIN_CONFIGURATION_CHANGED;
 use ferrofin_core::{PluginConfigPage, ScheduledTask};
 use ferrofin_traits::plugins::{
     FileTransformationService, FileTransformer, PluginDescriptor, PluginManager,
@@ -231,6 +233,10 @@ struct ConfiguredTransformation {
     filename_pattern: String,
     search_text: String,
     replace_text: String,
+    /// `filename_pattern` compiled once, when the configuration is read
+    /// (`None`: not a regex, so it matches only exactly).
+    #[serde(skip)]
+    regex: Option<regex::Regex>,
 }
 
 impl Default for ConfiguredTransformation {
@@ -240,7 +246,15 @@ impl Default for ConfiguredTransformation {
             filename_pattern: String::new(),
             search_text: String::new(),
             replace_text: String::new(),
+            regex: None,
         }
+    }
+}
+
+impl ConfiguredTransformation {
+    /// Whether this transformation applies to `path` ([`pattern_matches`]).
+    fn matches(&self, path: &str) -> bool {
+        pattern_matches(&self.filename_pattern, self.regex.as_ref(), path)
     }
 }
 
@@ -255,11 +269,8 @@ struct ServiceConfig {
 ///
 /// Port of the upstream `WebFileTransformationService`. Admin-defined
 /// search/replace transformations are read from the plugin configuration on
-/// every match check rather than registered at startup, so a dashboard config
-/// save applies immediately (upstream re-registers via its
-/// `UpdateConfiguration` hook, which Ferrofin's plugin manager doesn't have).
-// ponytail: config read per matching request — add an mtime cache if /web
-// request volume ever makes it measurable.
+/// first use and kept, each pattern compiled, until the next save ([`subscribe`]),
+/// as upstream re-registers them from its `UpdateConfiguration` hook.
 pub struct WebFileTransformationService {
     registrations: RwLock<Vec<Registration>>,
     plugins: Arc<dyn PluginManager>,
@@ -276,6 +287,11 @@ pub struct WebFileTransformationService {
     /// warns the first time and logs at `debug` while it repeats; a success,
     /// or removing the registration, clears it.
     failing: Mutex<HashSet<(Uuid, String)>>,
+    /// The admin-defined transformations, read on first use and forgotten
+    /// on a configuration save ([`subscribe`]). Every `/web` request asks for
+    /// them, and a save must reach the next one, so a load holds the lock: a
+    /// save landing during it is forgotten after it, never before.
+    configured: tokio::sync::Mutex<Option<Arc<[ConfiguredTransformation]>>>,
 }
 
 impl WebFileTransformationService {
@@ -297,6 +313,7 @@ impl WebFileTransformationService {
                 .unwrap_or_default(),
             endpoint_timeout: HTTP_CLIENT_DEFAULT_TIMEOUT,
             failing: Mutex::default(),
+            configured: tokio::sync::Mutex::new(None),
         }
     }
 
@@ -312,20 +329,32 @@ impl WebFileTransformationService {
             .is_some_and(|p| p.enabled)
     }
 
-    /// The admin-defined transformations from the live plugin configuration.
-    async fn configured_transformations(&self) -> Vec<ConfiguredTransformation> {
+    /// The admin-defined transformations from the plugin configuration, kept
+    /// from the first read until the next save; none when it cannot be read,
+    /// which is not kept, so a transient failure does not hide them.
+    async fn configured_transformations(&self) -> Arc<[ConfiguredTransformation]> {
+        let mut configured = self.configured.lock().await;
+        if let Some(transformations) = &*configured {
+            return Arc::clone(transformations);
+        }
         let Ok(bytes) = self.plugins.get_plugin_configuration(EXTENSION_ID).await else {
-            return Vec::new();
+            return Arc::from([]);
         };
-        serde_json::from_slice::<ServiceConfig>(&bytes)
+        let mut transformations = serde_json::from_slice::<ServiceConfig>(&bytes)
             .map(|c| c.transformations)
-            .unwrap_or_default()
+            .unwrap_or_default();
+        for t in &mut transformations {
+            t.regex = regex::Regex::new(&t.filename_pattern).ok();
+        }
+        let transformations: Arc<[_]> = transformations.into();
+        *configured = Some(Arc::clone(&transformations));
+        transformations
     }
 
-    /// [`pattern_matches`] for an admin-defined pattern, compiled per call
-    /// (the configuration is read live on every request).
-    fn configured_matches(pattern: &str, path: &str) -> bool {
-        pattern_matches(pattern, regex::Regex::new(pattern).ok().as_ref(), path)
+    /// Forgets the kept admin-defined transformations, so the next request
+    /// reads the saved configuration.
+    async fn configuration_saved(&self) {
+        *self.configured.lock().await = None;
     }
 
     /// Strips the leading `/` (upstream `NormalizePath`).
@@ -451,7 +480,7 @@ impl FileTransformationService for WebFileTransformationService {
         self.configured_transformations()
             .await
             .iter()
-            .any(|t| Self::configured_matches(&t.filename_pattern, path))
+            .any(|t| t.matches(path))
     }
 
     async fn would_transform(&self, path: &str) -> bool {
@@ -484,7 +513,7 @@ impl FileTransformationService for WebFileTransformationService {
         self.configured_transformations()
             .await
             .iter()
-            .any(|t| Self::configured_matches(&t.filename_pattern, path))
+            .any(|t| t.matches(path))
     }
 
     async fn run_transformation(&self, path: &str, contents: String) -> String {
@@ -549,8 +578,8 @@ impl FileTransformationService for WebFileTransformationService {
         // matching `HandlePluginConfigTransformation`). A common search with
         // a long replace multiplies the file, so one that would grow it past
         // the cap is skipped.
-        for t in self.configured_transformations().await {
-            if Self::configured_matches(&t.filename_pattern, &path)
+        for t in self.configured_transformations().await.iter() {
+            if t.matches(&path)
                 && !t.search_text.trim().is_empty()
                 && !t.replace_text.trim().is_empty()
             {
@@ -819,6 +848,26 @@ pub async fn register_skip_button_transformer(
         .await;
 }
 
+/// Has `service` forget its admin-defined transformations on every plugin
+/// configuration save (`PluginConfigurationChanged`), the port of the
+/// plugin's `UpdateConfiguration` re-registering them. The save awaits it, so
+/// what it saved applies from the next `/web` request. Any plugin's save
+/// does: saves are rare, and the next request reads the file once. Called
+/// once by the composition root.
+pub fn subscribe(events: &FerrofinEventManager, service: &Arc<WebFileTransformationService>) {
+    let service = Arc::clone(service);
+    events.subscribe(
+        PLUGIN_CONFIGURATION_CHANGED,
+        Arc::new(move |_payload: &str| {
+            let service = Arc::clone(&service);
+            Box::pin(async move {
+                service.configuration_saved().await;
+                Ok(())
+            })
+        }),
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1004,6 +1053,72 @@ mod tests {
             svc.run_transformation("index.html", "abc".to_owned()).await,
             "abc"
         );
+        // A configured pattern is a regex; one that does not compile matches
+        // only its exact path.
+        let patterns = r#"{"Transformations":[{"Id":"00000000-0000-0000-0000-000000000003","FilenamePattern":".*\\.chunk\\.js","SearchText":"a","ReplaceText":"b"},{"Id":"00000000-0000-0000-0000-000000000004","FilenamePattern":"a+(b.js","SearchText":"a","ReplaceText":"b"}]}"#;
+        let svc = service_with(patterns, true);
+        assert!(svc.needs_transformation("123.chunk.js").await);
+        assert!(!svc.needs_transformation("123.chunk.css").await);
+        assert!(svc.needs_transformation("a+(b.js").await);
+        assert!(!svc.needs_transformation("aa+(b.js").await);
+        assert_eq!(
+            svc.run_transformation("123.chunk.js", "xay".to_owned())
+                .await,
+            "xby"
+        );
+    }
+
+    /// The admin-defined transformations are read once and kept, as upstream
+    /// keeps a plugin's configuration: an edit of `config.json` behind the
+    /// server's back is not seen, and a save through the plugin manager (its
+    /// `PluginConfigurationChanged`) applies from the next request.
+    #[tokio::test]
+    async fn configured_transformations_are_kept_until_a_save() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let events = ferrofin_core::event_manager::FerrofinEventManager::new();
+        let plugins: Arc<dyn PluginManager> = Arc::new(
+            ferrofin_core::FerrofinPluginManager::new(
+                crate::registered_plugins(&crate::builtin_extensions()),
+                dir.path().to_path_buf(),
+            )
+            .with_events(Arc::new(events.clone())),
+        );
+        let svc = Arc::new(WebFileTransformationService::new(
+            Arc::clone(&plugins),
+            Arc::new(LocalApi("http://127.0.0.1:0".to_owned())),
+        ));
+        subscribe(&events, &svc);
+        let config = |file: &str| {
+            format!(
+                r#"{{"Transformations":[{{"Id":"00000000-0000-0000-0000-000000000001","FilenamePattern":"{file}","SearchText":"a","ReplaceText":"b"}}]}}"#
+            )
+        };
+        plugins
+            .set_plugin_configuration(EXTENSION_ID, config("a.js").into_bytes())
+            .await
+            .expect("save");
+        assert!(svc.needs_transformation("a.js").await);
+
+        std::fs::write(
+            dir.path()
+                .join(EXTENSION_ID.to_string())
+                .join("config.json"),
+            config("b.js"),
+        )
+        .expect("edit on disk");
+        assert!(svc.needs_transformation("a.js").await, "kept");
+        assert!(!svc.needs_transformation("b.js").await, "kept");
+
+        plugins
+            .set_plugin_configuration(EXTENSION_ID, config("c.js").into_bytes())
+            .await
+            .expect("save");
+        assert!(!svc.needs_transformation("a.js").await, "saved");
+        assert!(svc.would_transform("c.js").await, "saved");
+        assert_eq!(
+            svc.run_transformation("c.js", "xay".to_owned()).await,
+            "xby"
+        );
     }
 
     // ---- SkipButtonTransformer: the C# Injector as the oracle ---------------
@@ -1077,15 +1192,20 @@ mod tests {
     #[tokio::test]
     async fn the_skip_button_step_would_transform_only_while_opted_in() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let plugins: Arc<dyn PluginManager> = Arc::new(ferrofin_core::FerrofinPluginManager::new(
-            crate::registered_plugins(&crate::builtin_extensions()),
-            dir.path().to_path_buf(),
-        ));
-        let svc = WebFileTransformationService::new(
+        let events = ferrofin_core::event_manager::FerrofinEventManager::new();
+        let plugins: Arc<dyn PluginManager> = Arc::new(
+            ferrofin_core::FerrofinPluginManager::new(
+                crate::registered_plugins(&crate::builtin_extensions()),
+                dir.path().to_path_buf(),
+            )
+            .with_events(Arc::new(events.clone())),
+        );
+        let svc = Arc::new(WebFileTransformationService::new(
             Arc::clone(&plugins),
             Arc::new(LocalApi("http://127.0.0.1:0".to_owned())),
-        );
-        register_skip_button_transformer(&svc, Arc::clone(&plugins)).await;
+        ));
+        subscribe(&events, &svc);
+        register_skip_button_transformer(svc.as_ref(), Arc::clone(&plugins)).await;
         let bundle = "main.jellyfin.bundle.js";
         let opt_in = |on: bool| {
             format!(r#"{{"UseFileTransformationPlugin":{on},"SkipbuttonHideDelay":5}}"#)
