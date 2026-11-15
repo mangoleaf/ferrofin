@@ -4611,7 +4611,9 @@ pub const VERIFIED: &[Verified] = &[
                collection_manager.rs FerrofinPlaylistManager::create_playlist \
                (PlaylistManager.CreatePlaylist: playlists_folder → item_persistence_service \
                playlists_folder_by_type, GetPlaylistsFolder's by-type lookup; \
-               infer_media_type, require_user, \
+               infer_media_type (a folder through first_member_media_type, \
+               GetRecursiveChildren's AddChildrenToList walk over get_folder_children \
+               and the folder's LinkedChildren), require_user, \
                new_playlist_folder_and_id, its Path stored through \
                VirtualPathExpander::reverse as AddChild's save stores it, \
                %AppDataPath%/playlists/<name> (BaseItemMapper.Map → GetPathToSave → \
@@ -4637,9 +4639,13 @@ pub const VERIFIED: &[Verified] = &[
          (AggregateFolderStore::ensure).",
             "The first ForceSave refresh writes no playlist.xml into the new folder, where \
          upstream's PlaylistXmlSaver saves one. Fix path: gl-341.",
-            "With no media type named and a mixed folder as the first deciding id, the type \
-         comes from the folder's first member by name, not upstream's tree-order walk. Fix \
-         path: gl-588.",
+            "With no media type named, a folder whose tree-order walk finds no playable \
+         member (a box set of series or video folders, whose linked folders \
+         GetRecursiveChildren never looks inside; a season whose episodes are stored under \
+         the series, so its Children are empty) answers with the first member of its flat \
+         recursive listing, read without a user; upstream moves on to the next id, and \
+         types the playlist Audio when none answers, whatever its entries. Jellyfin bug \
+         not ported.",
             "A malformed id in the ids query is a 400; upstream's \
          CommaDelimitedCollectionModelBinder drops it, so an all-malformed list falls back \
          to the body's Ids. Fix path: gl-884.",
