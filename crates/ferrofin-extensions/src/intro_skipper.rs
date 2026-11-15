@@ -47,7 +47,9 @@ mod black_frame;
 mod chapter_analyzer;
 mod config_hash;
 mod credit_scenes;
+mod editor;
 mod engine;
+mod platform;
 mod queue;
 
 use crate::{Extension, ExtensionContext};
@@ -214,7 +216,7 @@ fn detector(cx: &ExtensionContext) -> DetectSegmentsTask {
 }
 
 /// The Intro Skipper's analysis runtime for the plugin routes (`ScanSeason`,
-/// `ScanStatus`, `eraseCache`).
+/// `ScanStatus`, `eraseCache`, the segment editor, the support bundle).
 #[must_use]
 pub fn analysis(cx: &ExtensionContext) -> Arc<dyn IntroSkipperAnalysis> {
     Arc::new(detector(cx))
@@ -313,6 +315,17 @@ impl IntroSkipperAnalysis for DetectSegmentsTask {
             self.runtime.warnings(),
             check.report(),
         )
+    }
+
+    fn operating_system(&self) -> String {
+        platform::operating_system()
+    }
+
+    async fn create_or_replace_segment(
+        &self,
+        segment: &MediaSegmentDto,
+    ) -> Result<(), ServiceError> {
+        editor::create_or_replace_segment(self.media_segments.as_ref(), segment).await
     }
 
     async fn clear_excluded(&self) -> Result<intro_store::ExcludedClear, ServiceError> {
