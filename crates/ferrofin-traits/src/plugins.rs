@@ -334,6 +334,14 @@ fn _assert_object_safe_plugin_offered_item_store(_: &dyn PluginOfferedItemStore)
 pub trait FileTransformer: Send + Sync {
     /// Transforms `contents` for the file at `path`.
     async fn transform(&self, path: &str, contents: String) -> String;
+
+    /// Whether [`transform`](Self::transform) could change the file at `path`
+    /// now. `false` promises that it would return the contents unchanged; a
+    /// file whose matching steps all answer `false` is served as it is on
+    /// disk, without the pipeline. `true` is always safe, and the default.
+    async fn would_transform(&self, _path: &str) -> bool {
+        true
+    }
 }
 
 fn _assert_object_safe_file_transformer(_: &dyn FileTransformer) {}
@@ -406,6 +414,15 @@ pub trait FileTransformationService: Send + Sync {
     /// Whether any registered transformation matches `path` (leading `/`
     /// ignored). Port of `NeedsTransformation`.
     async fn needs_transformation(&self, path: &str) -> bool;
+
+    /// Whether running the pipeline could change `path` now, for a path
+    /// [`needs_transformation`](Self::needs_transformation) matched: some
+    /// matching step would ([`FileTransformer::would_transform`]). While none
+    /// would, the static server sends the file as it is on disk, still
+    /// revalidated on every load. The default, `true`, always runs it.
+    async fn would_transform(&self, _path: &str) -> bool {
+        true
+    }
 
     /// Runs the matching pipeline over `contents`, returning the transformed
     /// text (unchanged when nothing matches). Port of `RunTransformation`.

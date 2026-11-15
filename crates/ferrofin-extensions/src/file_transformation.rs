@@ -25,7 +25,7 @@
 //! through the [`FileTransformationService`] trait instead).
 
 use std::collections::HashSet;
-use std::sync::{Arc, Mutex, PoisonError, RwLock};
+use std::sync::{Arc, LazyLock, Mutex, PoisonError, RwLock};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -454,6 +454,39 @@ impl FileTransformationService for WebFileTransformationService {
             .any(|t| Self::configured_matches(&t.filename_pattern, path))
     }
 
+    async fn would_transform(&self, path: &str) -> bool {
+        if !self.plugin_enabled().await {
+            return false;
+        }
+        let path = Self::normalize(path);
+        // A matching in-process step that would change nothing (the Intro
+        // Skipper's patch while its opt-in is off, the default) does not
+        // count. An endpoint's answer is unknown until it is called.
+        let builtins: Vec<Arc<dyn FileTransformer>> = {
+            let regs = self
+                .registrations
+                .read()
+                .expect("registrations lock poisoned");
+            let mut builtins = Vec::new();
+            for r in regs.iter().filter(|r| r.matches(path)) {
+                match &r.kind {
+                    TransformKind::Builtin(t) => builtins.push(Arc::clone(t)),
+                    TransformKind::Endpoint(_) => return true,
+                }
+            }
+            builtins
+        };
+        for t in builtins {
+            if t.would_transform(path).await {
+                return true;
+            }
+        }
+        self.configured_transformations()
+            .await
+            .iter()
+            .any(|t| Self::configured_matches(&t.filename_pattern, path))
+    }
+
     async fn run_transformation(&self, path: &str, contents: String) -> String {
         if !self.plugin_enabled().await {
             return contents;
@@ -487,7 +520,7 @@ impl FileTransformationService for WebFileTransformationService {
                     // ponytail: a copy of the file per in-process step, to
                     // fall back to; a transformer that reported its growth
                     // up front (as `LiteralTransform` computes it) would not
-                    // need it.
+                    // need it (gl-1816).
                     let transformed = t.transform(&path, contents.clone()).await;
                     if transformed.len() > MAX_TRANSFORMED_BYTES
                         && transformed.len() > contents.len()
@@ -647,15 +680,23 @@ enum TransformStep {
 // ---------------------------------------------------------------------------
 
 /// The timeout assignment in jellyfin-web's `showSkipButton`
-/// (`Injector.TimeoutAssignmentPattern`, copied verbatim).
-const TIMEOUT_ASSIGNMENT_PATTERN: &str =
-    r"\(t\.hideTimeout=setTimeout\(t\.hideSkipButton\.bind\(t\)\,8e3\)\)";
+/// (`Injector.TimeoutAssignmentPattern`, copied verbatim), compiled once.
+static TIMEOUT_ASSIGNMENT: LazyLock<regex::Regex> = LazyLock::new(|| {
+    regex::Regex::new(r"\(t\.hideTimeout=setTimeout\(t\.hideSkipButton\.bind\(t\)\,8e3\)\)")
+        .expect("valid timeout pattern")
+});
 
 /// The timeout check in `hideSkipButton` (`Injector.TimeoutOsdChangePattern`).
-const TIMEOUT_OSD_CHANGE_PATTERN: &str = r"\:this\.hideTimeout\|\|this\.hideSkipButton\(\)";
+static TIMEOUT_OSD_CHANGE: LazyLock<regex::Regex> = LazyLock::new(|| {
+    regex::Regex::new(r"\:this\.hideTimeout\|\|this\.hideSkipButton\(\)")
+        .expect("valid osd pattern")
+});
 
 /// The focusability check (`Injector.FocusabilityAssignmentPattern`).
-const FOCUSABILITY_ASSIGNMENT_PATTERN: &str = r"(?:(?:var)\s+)?r\s*=\s*document\.activeElement\s*&&\s*[A-Za-z_$][\w$]*\.A\.isCurrentlyFocusable\(document\.activeElement\)";
+static FOCUSABILITY_ASSIGNMENT: LazyLock<regex::Regex> = LazyLock::new(|| {
+    regex::Regex::new(r"(?:(?:var)\s+)?r\s*=\s*document\.activeElement\s*&&\s*[A-Za-z_$][\w$]*\.A\.isCurrentlyFocusable\(document\.activeElement\)")
+        .expect("valid focus pattern")
+});
 
 /// Milliseconds per second.
 const MS_PER_SECOND: i64 = 1000;
@@ -703,37 +744,29 @@ impl SkipButtonTransformer {
         };
         let delay = hide_delay_ms.unwrap_or(0);
 
-        let timeout_assignment =
-            regex::Regex::new(TIMEOUT_ASSIGNMENT_PATTERN).expect("valid timeout pattern");
-        let updated = timeout_assignment.replace_all(
+        let updated = TIMEOUT_ASSIGNMENT.replace_all(
             contents,
             format!("{persist}||(t.hideTimeout=setTimeout(t.hideSkipButton.bind(t),{delay}))")
                 .as_str(),
         );
 
-        let osd_change = regex::Regex::new(TIMEOUT_OSD_CHANGE_PATTERN).expect("valid osd pattern");
-        let updated = osd_change.replace_all(
+        let updated = TIMEOUT_OSD_CHANGE.replace_all(
             &updated,
             format!(":{persist}||this.hideTimeout||this.hideSkipButton()").as_str(),
         );
 
-        let focusability =
-            regex::Regex::new(FOCUSABILITY_ASSIGNMENT_PATTERN).expect("valid focus pattern");
-        focusability
+        FOCUSABILITY_ASSIGNMENT
             .replace_all(
                 &updated,
                 format!("${{0}}&&t.playbackManager.currentTime()>{MS_PER_SECOND}").as_str(),
             )
             .into_owned()
     }
-}
 
-#[async_trait]
-impl FileTransformer for SkipButtonTransformer {
-    async fn transform(&self, _path: &str, contents: String) -> String {
-        // Self-gate on the Intro Skipper being enabled and opted in — the
-        // upstream callback returns the contents untouched when
-        // `UseFileTransformationPlugin` is off.
+    /// The configured `SkipbuttonHideDelay`, or `None` while the Intro Skipper
+    /// is disabled or not opted in (`UseFileTransformationPlugin` off), when
+    /// the upstream callback returns the contents untouched.
+    async fn hide_delay(&self) -> Option<i64> {
         let enabled = self
             .plugins
             .get_plugin(INTRO_SKIPPER_ID)
@@ -742,20 +775,31 @@ impl FileTransformer for SkipButtonTransformer {
             .flatten()
             .is_some_and(|p| p.enabled);
         if !enabled {
-            return contents;
+            return None;
         }
-        let config = match self
+        let bytes = self
             .plugins
             .get_plugin_configuration(INTRO_SKIPPER_ID)
             .await
-        {
-            Ok(bytes) => serde_json::from_slice::<SkipButtonConfig>(&bytes).unwrap_or_default(),
-            Err(_) => return contents,
-        };
-        if !config.use_file_transformation_plugin {
-            return contents;
+            .ok()?;
+        let config = serde_json::from_slice::<SkipButtonConfig>(&bytes).unwrap_or_default();
+        config
+            .use_file_transformation_plugin
+            .then_some(config.skipbutton_hide_delay)
+    }
+}
+
+#[async_trait]
+impl FileTransformer for SkipButtonTransformer {
+    async fn transform(&self, _path: &str, contents: String) -> String {
+        match self.hide_delay().await {
+            Some(delay) => Self::apply(&contents, delay),
+            None => contents,
         }
-        Self::apply(&contents, config.skipbutton_hide_delay)
+    }
+
+    async fn would_transform(&self, _path: &str) -> bool {
+        self.hide_delay().await.is_some()
     }
 }
 
@@ -1024,6 +1068,98 @@ mod tests {
             .transform("main.jellyfin.bundle.js", TIMEOUT_SNIPPET.to_owned())
             .await;
         assert!(out.contains("5000"), "expected patched timeout: {out}");
+    }
+
+    /// The bundle's skip-button step would change it only while the Intro
+    /// Skipper is enabled and opted in, read live from its saved settings:
+    /// off (the default), the bundle is left to the static server. A no-op
+    /// step never hides an admin-defined transformation of the same file.
+    #[tokio::test]
+    async fn the_skip_button_step_would_transform_only_while_opted_in() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let plugins: Arc<dyn PluginManager> = Arc::new(ferrofin_core::FerrofinPluginManager::new(
+            crate::registered_plugins(&crate::builtin_extensions()),
+            dir.path().to_path_buf(),
+        ));
+        let svc = WebFileTransformationService::new(
+            Arc::clone(&plugins),
+            Arc::new(LocalApi("http://127.0.0.1:0".to_owned())),
+        );
+        register_skip_button_transformer(&svc, Arc::clone(&plugins)).await;
+        let bundle = "main.jellyfin.bundle.js";
+        let opt_in = |on: bool| {
+            format!(r#"{{"UseFileTransformationPlugin":{on},"SkipbuttonHideDelay":5}}"#)
+                .into_bytes()
+        };
+
+        // The registration matches, but the opt-in is off by default.
+        assert!(svc.needs_transformation(bundle).await);
+        assert!(!svc.would_transform(bundle).await, "default");
+        plugins
+            .set_plugin_configuration(INTRO_SKIPPER_ID, opt_in(true))
+            .await
+            .expect("save");
+        assert!(svc.would_transform(bundle).await, "opted in");
+        plugins
+            .disable_plugin(INTRO_SKIPPER_ID)
+            .await
+            .expect("disable");
+        assert!(!svc.would_transform(bundle).await, "Intro Skipper disabled");
+        plugins
+            .enable_plugin(INTRO_SKIPPER_ID)
+            .await
+            .expect("enable");
+        assert!(svc.would_transform(bundle).await, "enabled again");
+        plugins
+            .set_plugin_configuration(INTRO_SKIPPER_ID, opt_in(false))
+            .await
+            .expect("save");
+        assert!(!svc.would_transform(bundle).await, "opted out");
+
+        // An unreadable configuration: the step leaves the file alone.
+        let config = dir
+            .path()
+            .join(INTRO_SKIPPER_ID.to_string())
+            .join("config.json");
+        std::fs::remove_file(&config).expect("remove the saved settings");
+        std::fs::create_dir(&config).expect("a directory in their place");
+        assert!(!svc.would_transform(bundle).await, "unreadable");
+
+        // A step that cannot tell keeps the bundle in the pipeline: an
+        // in-process one with the default, and an endpoint.
+        let other = WebFileTransformationService::new(
+            Arc::clone(&plugins),
+            Arc::new(LocalApi("http://127.0.0.1:0".to_owned())),
+        );
+        register_skip_button_transformer(&other, Arc::clone(&plugins)).await;
+        other
+            .add_transformation(Uuid::from_u128(1), bundle, Arc::new(Upper))
+            .await;
+        assert!(other.would_transform(bundle).await, "default step");
+        let other = WebFileTransformationService::new(
+            Arc::clone(&plugins),
+            Arc::new(LocalApi("http://127.0.0.1:0".to_owned())),
+        );
+        register_skip_button_transformer(&other, Arc::clone(&plugins)).await;
+        other
+            .add_endpoint_transformation(Uuid::from_u128(2), bundle, "/patch")
+            .await;
+        assert!(other.would_transform(bundle).await, "endpoint");
+
+        // An admin-defined search/replace on the bundle still counts.
+        plugins
+            .set_plugin_configuration(
+                EXTENSION_ID,
+                br#"{"Transformations":[{"Id":"00000000-0000-0000-0000-000000000001","FilenamePattern":"main.jellyfin.bundle.js","SearchText":"a","ReplaceText":"b"}]}"#.to_vec(),
+            )
+            .await
+            .expect("save");
+        assert!(svc.would_transform(bundle).await, "admin transformation");
+
+        // The File Transformation plugin disabled: no pipeline at all.
+        plugins.disable_plugin(EXTENSION_ID).await.expect("disable");
+        assert!(!svc.needs_transformation(bundle).await);
+        assert!(!svc.would_transform(bundle).await);
     }
 
     #[test]

@@ -1440,8 +1440,9 @@ fn mount_web(
 }
 
 /// Serves a `/web` file through the File Transformation pipeline when a
-/// registered transformation matches it; all other requests pass through to
-/// the static `ServeDir` untouched.
+/// registered transformation matches it and would change it; a matched file
+/// no step would change now goes to the static `ServeDir` with `no-cache`, and
+/// all other requests pass through to it untouched.
 ///
 /// Port of the File Transformation plugin's static-file middleware: it reads
 /// the matched file, runs the pipeline over its text, and responds with the
@@ -1473,32 +1474,49 @@ async fn transform_web_file(
             )
         })
         && transformations.needs_transformation(rel).await
-        && let Ok(bytes) = tokio::fs::read(web_root.join(rel)).await
-        && let Ok(text) = String::from_utf8(bytes)
     {
-        let transformed = transformations.run_transformation(rel, text).await;
-        // The plugin's validator (`FileTransformationMiddleware` @ 0900de8f1,
-        // ahead of the ported rev): an `ETag` over the transformed bytes and
-        // `no-cache`, and no `Last-Modified` (so no `If-Modified-Since` to
-        // answer). A changed transform revalidates to a `200`, never stale.
-        let etag = transformed_etag(&transformed);
-        let validators = [
-            (axum::http::header::ETAG, etag.as_str()),
-            (axum::http::header::CACHE_CONTROL, "no-cache"),
-        ];
-        if req
-            .headers()
-            .get(axum::http::header::IF_NONE_MATCH)
-            .is_some_and(|v| v.as_bytes() == etag.as_bytes())
-        {
-            return (axum::http::StatusCode::NOT_MODIFIED, validators).into_response();
+        if !transformations.would_transform(rel).await {
+            // No matching step would change the file now (Intro Skipper's
+            // patch while its opt-in is off, the default), so the static
+            // server sends it, with its validators and `Range`, instead of
+            // the pipeline copying and hashing it. The plugin's middleware
+            // runs such a step; the bytes are the same. `no-cache`, as the
+            // pipeline's answer has: a step that turns on reaches a browser
+            // holding the file at its next load.
+            let mut response = next.run(req).await;
+            response.headers_mut().insert(
+                axum::http::header::CACHE_CONTROL,
+                axum::http::HeaderValue::from_static("no-cache"),
+            );
+            return response;
         }
-        return (
-            [(axum::http::header::CONTENT_TYPE, web_file_mime(rel))],
-            validators,
-            transformed,
-        )
-            .into_response();
+        if let Ok(bytes) = tokio::fs::read(web_root.join(rel)).await
+            && let Ok(text) = String::from_utf8(bytes)
+        {
+            let transformed = transformations.run_transformation(rel, text).await;
+            // The plugin's validator (`FileTransformationMiddleware` @ 0900de8f1,
+            // ahead of the ported rev): an `ETag` over the transformed bytes and
+            // `no-cache`, and no `Last-Modified` (so no `If-Modified-Since` to
+            // answer). A changed transform revalidates to a `200`, never stale.
+            let etag = transformed_etag(&transformed);
+            let validators = [
+                (axum::http::header::ETAG, etag.as_str()),
+                (axum::http::header::CACHE_CONTROL, "no-cache"),
+            ];
+            if req
+                .headers()
+                .get(axum::http::header::IF_NONE_MATCH)
+                .is_some_and(|v| v.as_bytes() == etag.as_bytes())
+            {
+                return (axum::http::StatusCode::NOT_MODIFIED, validators).into_response();
+            }
+            return (
+                [(axum::http::header::CONTENT_TYPE, web_file_mime(rel))],
+                validators,
+                transformed,
+            )
+                .into_response();
+        }
     }
     next.run(req).await
 }
@@ -2354,6 +2372,86 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(&body[..], b"HELLO WORLD");
+    }
+
+    /// gl-1536: while Intro Skipper's opt-in is off (the default), the bundle
+    /// its skip-button step is registered on is sent by the static server,
+    /// with `Range`, instead of through the pipeline; still `no-cache`, so the
+    /// opt-in, once on, reaches the browser at its next load.
+    #[tokio::test]
+    async fn a_web_file_no_step_would_change_is_served_statically_and_revalidated() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("index.html"), "<!doctype html>ferrofin").unwrap();
+        std::fs::write(
+            dir.path().join("main.jellyfin.bundle.js"),
+            "(t.hideTimeout=setTimeout(t.hideSkipButton.bind(t),8e3))",
+        )
+        .unwrap();
+        let plugins: Arc<dyn ferrofin_traits::plugins::PluginManager> =
+            Arc::new(ferrofin_core::FerrofinPluginManager::new(
+                ferrofin_extensions::registered_plugins(&ferrofin_extensions::builtin_extensions()),
+                dir.path().join("plugins"),
+            ));
+        let service: Arc<dyn FileTransformationService> = Arc::new(
+            ferrofin_extensions::file_transformation::WebFileTransformationService::new(
+                Arc::clone(&plugins),
+                Arc::new(NoLocalApi),
+            ),
+        );
+        ferrofin_extensions::file_transformation::register_skip_button_transformer(
+            service.as_ref(),
+            Arc::clone(&plugins),
+        )
+        .await;
+        let app = mount_web(
+            Router::new(),
+            dir.path(),
+            service,
+            &ferrofin_api::test_support::fake_state(),
+        );
+        let get = |header: Option<(&str, &str)>| {
+            let mut request = Request::builder().uri("/web/main.jellyfin.bundle.js");
+            if let Some((name, value)) = header {
+                request = request.header(name, value);
+            }
+            app.clone().oneshot(request.body(Body::empty()).unwrap())
+        };
+
+        let full = get(None).await.unwrap();
+        assert_eq!(full.status(), StatusCode::OK);
+        assert_eq!(full.headers()["accept-ranges"], "bytes");
+        assert_eq!(full.headers()["cache-control"], "no-cache");
+        let etag = full.headers()["etag"].to_str().unwrap().to_owned();
+        let part = get(Some(("range", "bytes=0-2"))).await.unwrap();
+        assert_eq!(part.status(), StatusCode::PARTIAL_CONTENT);
+        assert_eq!(part.headers()["cache-control"], "no-cache");
+        let body = axum::body::to_bytes(part.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(&body[..], b"(t.");
+        let revalidated = get(Some(("if-none-match", &etag))).await.unwrap();
+        assert_eq!(revalidated.status(), StatusCode::NOT_MODIFIED);
+        assert_eq!(revalidated.headers()["cache-control"], "no-cache");
+
+        // Opted in, the browser's next revalidation gets the patched bundle.
+        plugins
+            .set_plugin_configuration(
+                // The Intro Skipper's plugin id.
+                uuid::Uuid::from_u128(0xc83d_86bb_a1e0_4c35_a113_e210_1cf4_ee6b),
+                br#"{"UseFileTransformationPlugin":true,"SkipbuttonHideDelay":5}"#.to_vec(),
+            )
+            .await
+            .unwrap();
+        let patched = get(Some(("if-none-match", &etag))).await.unwrap();
+        assert_eq!(patched.status(), StatusCode::OK);
+        assert_eq!(patched.headers()["cache-control"], "no-cache");
+        let body = axum::body::to_bytes(patched.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(
+            &body[..],
+            b"false||(t.hideTimeout=setTimeout(t.hideSkipButton.bind(t),5000))"
+        );
     }
 
     #[tokio::test]
