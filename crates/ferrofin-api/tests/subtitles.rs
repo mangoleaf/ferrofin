@@ -1061,7 +1061,7 @@ async fn open_subtitles_login_binds_ignoring_case_and_forwards_pascal_case() {
     );
     let logins = subtitles.logins.lock().unwrap().clone();
     assert_eq!(logins.len(), 1);
-    assert_eq!(logins[0].0, "opensubtitles");
+    assert_eq!(logins[0].0, "Open Subtitles");
     let forwarded: serde_json::Value = serde_json::from_slice(&logins[0].1).unwrap();
     assert_eq!(
         forwarded,

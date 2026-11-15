@@ -2015,3 +2015,33 @@ fn rating_to_items_takes_the_least_restrictive_member(
         expected
     );
 }
+
+/// `UpdateGenres`/`UpdateStudios` compare the lists sorted and ignoring
+/// case, so a reordering or a case change is no edit; a date, year or rating
+/// change is one, and the runtime (`MetadataImport`) is not compared.
+#[rstest]
+#[case::same(|_: &mut BaseItemEntity| {}, false)]
+#[case::reordered_genres(|row: &mut BaseItemEntity| row.genres = Some("drama|ACTION".into()), false)]
+#[case::runtime(|row: &mut BaseItemEntity| row.run_time_ticks = Some(9), false)]
+#[case::genre_added(|row: &mut BaseItemEntity| row.genres = Some("Action|Drama|War".into()), true)]
+#[case::studio(|row: &mut BaseItemEntity| row.studios = None, true)]
+#[case::year(|row: &mut BaseItemEntity| row.production_year = Some(1999), true)]
+#[case::premiere_date(|row: &mut BaseItemEntity| row.premiere_date = Some(Utc.with_ymd_and_hms(2001, 5, 4, 0, 0, 0).unwrap()), true)]
+#[case::rating(|row: &mut BaseItemEntity| row.official_rating = Some("PG".into()), true)]
+#[case::rating_case(|row: &mut BaseItemEntity| row.official_rating = Some("pg-13".into()), false)]
+#[case::rating_cleared(|row: &mut BaseItemEntity| row.official_rating = None, true)]
+fn members_edited_follows_upstreams_metadata_edit_comparisons(
+    #[case] change: fn(&mut BaseItemEntity),
+    #[case] edited: bool,
+) {
+    let before = BaseItemEntity {
+        genres: Some("Action|Drama".into()),
+        studios: Some("Acme".into()),
+        production_year: Some(2001),
+        official_rating: Some("PG-13".into()),
+        ..BaseItemEntity::default()
+    };
+    let mut after = before.clone();
+    change(&mut after);
+    assert_eq!(super::members_edited(&before, &after), edited);
+}

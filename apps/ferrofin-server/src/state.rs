@@ -1400,6 +1400,19 @@ pub async fn build_app_state(
         .with_self_writes(Arc::clone(&self_writes_guard)),
     );
     let nfo_listener: Arc<dyn ferrofin_traits::library::UserDataSaveListener> = nfo_saver.clone();
+    // A box set's `collection.xml`: written by the metadata save, read by
+    // the box set's refresh.
+    let box_set_xml = Arc::new(
+        ferrofin_providers::box_set_xml::BoxSetXmlSaver::new(
+            Arc::clone(&item_repository),
+            Arc::clone(&item_persistence_service),
+            Arc::clone(&people_repository),
+            Arc::clone(&linked_children_service),
+            Arc::clone(&virtual_folders),
+            Arc::clone(&config_trait),
+        )
+        .with_self_writes(Arc::clone(&self_writes_guard)),
+    );
     user_data_impl.set_save_listener(Arc::downgrade(&nfo_listener))?;
     let item_visibility = Arc::new(
         ferrofin_core::item_visibility::ItemVisibility::new(
@@ -1417,6 +1430,7 @@ pub async fn build_app_state(
         LocalProviderManager::new(Vec::new())
             .with_image_saver(Arc::clone(&image_saver))
             .with_nfo_saver(Arc::clone(&nfo_saver))
+            .with_box_set_xml(box_set_xml)
             .with_image_store(
                 Arc::clone(&item_persistence_service),
                 metadata_library.clone(),
@@ -2204,7 +2218,8 @@ pub async fn build_app_state(
             metadata_root.clone(),
         )
         .with_virtual_folders(Arc::clone(&virtual_folders))
-        .with_self_writes(Arc::clone(&self_writes_guard)),
+        .with_self_writes(Arc::clone(&self_writes_guard))
+        .with_activity(Arc::clone(&activity)),
     );
     let subtitle_downloader = Arc::new(
         ferrofin_core::subtitle_downloader::SubtitleDownloader::new(
@@ -3199,13 +3214,16 @@ pub async fn build_app_state(
     // compiled-in registration (the upstream plugin registers it via .NET
     // reflection); both transformers self-gate on their plugin's enabled flag
     // and configuration, so dashboard toggles apply live.
+    let file_transformation_service = Arc::new(
+        ferrofin_extensions::file_transformation::WebFileTransformationService::new(
+            Arc::clone(&plugins),
+            Arc::clone(&app_host) as Arc<_>,
+        ),
+    );
+    // A save of the admin-defined transformations applies from the next request.
+    ferrofin_extensions::file_transformation::subscribe(&event_bus, &file_transformation_service);
     let file_transformations: Arc<dyn ferrofin_traits::plugins::FileTransformationService> =
-        Arc::new(
-            ferrofin_extensions::file_transformation::WebFileTransformationService::new(
-                Arc::clone(&plugins),
-                Arc::clone(&app_host) as Arc<_>,
-            ),
-        );
+        file_transformation_service;
     ferrofin_extensions::file_transformation::register_skip_button_transformer(
         file_transformations.as_ref(),
         Arc::clone(&plugins),
@@ -3861,6 +3879,15 @@ mod tests {
         }
         async fn support_bundle(&self) -> String {
             String::new()
+        }
+        fn operating_system(&self) -> String {
+            String::new()
+        }
+        async fn create_or_replace_segment(
+            &self,
+            _segment: &ferrofin_model::media_segments::MediaSegmentDto,
+        ) -> Result<(), ferrofin_traits::error::ServiceError> {
+            Ok(())
         }
         async fn hides_intros(&self, _item_id: uuid::Uuid) -> bool {
             false
