@@ -21639,9 +21639,9 @@ fn extra_matches_owner(
     } else {
         Path::new(&owner.path).parent().and_then(Path::to_str)
     };
-    parent
-        .zip(owner_dir)
-        .is_some_and(|(parent, owner)| parent.eq_ignore_ascii_case(owner))
+    parent.zip(owner_dir).is_some_and(|(parent, owner)| {
+        ferrofin_util::string_extensions::equals_ordinal_ignore_case(parent, owner)
+    })
 }
 
 /// The three stat timestamps the creation-time rule reads.
@@ -26672,6 +26672,20 @@ mod tests {
             super::frequency_ordered_distinct(rows.iter().copied()),
             vec!["B".to_owned(), "a".to_owned()]
         );
+    }
+
+    /// `ExtraResolver.TryGetExtraTypeForOwner`'s folder fallback: the extra's
+    /// directory equals the owner's under `OrdinalIgnoreCase`, which folds
+    /// non-ASCII letters too.
+    #[test]
+    fn an_extra_beside_its_owner_matches_its_folder_ignoring_non_ascii_case() {
+        use ferrofin_naming::video::{ExtraRuleType, VideoFileInfo};
+        let naming = super::NamingOptions::new();
+        let owner = VideoFileInfo::new("Movie", "/media/ÉTÉ/Movie.mkv");
+        let matches =
+            |path: &str| super::extra_matches_owner(path, ExtraRuleType::Suffix, &owner, &naming);
+        assert!(matches("/media/été/Other-trailer.mkv"));
+        assert!(!matches("/media/other/Other-trailer.mkv"));
     }
 
     // date_modified must be the file's mtime (stable across rescans), never the
