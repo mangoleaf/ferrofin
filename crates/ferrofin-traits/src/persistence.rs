@@ -416,7 +416,11 @@ pub trait ItemRepository: Send + Sync {
         item_id: Uuid,
     ) -> Result<Option<Vec<BaseItemEntity>>, ServiceError>;
 
-    /// Runs a query and returns a page of item rows plus the total count.
+    /// Runs a query and returns a page of item rows plus the total count. Its
+    /// own query is `BaseItemRepository.GetItems`, so with
+    /// [`InternalItemsQuery::enable_total_record_count`] off the total is the
+    /// page's own length; the folders view it answers first totals every row,
+    /// as upstream's `SortAndPage` does.
     async fn get_items(
         &self,
         filter: &InternalItemsQuery,
@@ -1221,6 +1225,14 @@ pub trait ItemPersistenceService: Send + Sync {
     /// Whether an item row with this id exists (used to self-heal a library's
     /// `CollectionFolder` row before parenting scanned children to it).
     async fn item_exists(&self, id: Uuid) -> Result<bool, ServiceError>;
+
+    /// The stored `Path` of the item row with this id: `None` when there is no
+    /// such row, `Some(None)` when the row has no path. One read, for a caller
+    /// that needs both answers (the user root's provisioning). The default
+    /// asks [`item_exists`](Self::item_exists) and knows no path.
+    async fn item_path(&self, id: Uuid) -> Result<Option<Option<String>>, ServiceError> {
+        Ok(self.item_exists(id).await?.then_some(None))
+    }
 
     /// Get-or-create the by-name item row for `(kind, name)`, returning its id.
     ///
@@ -2260,20 +2272,6 @@ pub trait ItemCountService: Send + Sync {
         }
         Ok(out)
     }
-
-    /// Counts played descendants of `ancestor_id`.
-    async fn get_played_count(
-        &self,
-        filter: &InternalItemsQuery,
-        ancestor_id: Uuid,
-    ) -> Result<i32, ServiceError>;
-
-    /// Counts all descendants of `ancestor_id`.
-    async fn get_total_count(
-        &self,
-        filter: &InternalItemsQuery,
-        ancestor_id: Uuid,
-    ) -> Result<i32, ServiceError>;
 
     /// Gets both played and total descendant counts of `ancestor_id`.
     async fn get_played_and_total_count(
