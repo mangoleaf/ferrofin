@@ -1405,7 +1405,8 @@ async fn hls_routes_refuse_a_value_failing_its_pattern(
 
 /// What the pattern leaves alone, as Jellyfin 12.4 did: a `container` query on
 /// the routes that declare no such parameter, a blank value (the binder's
-/// `null`), a later repeat of a key, and values inside both patterns.
+/// `null`), a later repeat of a key, and values inside both patterns, on a
+/// stream route too.
 #[rstest]
 #[case::master_container("/Videos/{id}/master.m3u8?mediaSourceId=src&container=a%24b")]
 #[case::variant_container("/Videos/{id}/main.m3u8?container=a%24b")]
@@ -1420,6 +1421,7 @@ async fn hls_routes_refuse_a_value_failing_its_pattern(
 )]
 #[case::levels("/Videos/{id}/live.m3u8?level=4.1&videoCodec=h264,hevc&audioCodec=aac|mp3")]
 #[case::negative_level("/Audio/{id}/main.m3u8?level=-41&segmentContainer=mp4")]
+#[case::stream_level("/Videos/{id}/stream?level=41&videoCodec=h264,hevc&container=mkv")]
 #[tokio::test]
 async fn hls_routes_pass_values_the_pattern_allows(#[case] uri: &str) {
     let uri = uri
@@ -2003,6 +2005,74 @@ async fn invalid_subtitle_codecs_are_rejected_before_dispatch() {
         let response = app.clone().oneshot(authed("HEAD", &path)).await.unwrap();
         assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{path}");
     }
+    assert!(rec.last.lock().unwrap().is_none());
+}
+
+/// The stream routes bind the same parameters with the same patterns
+/// (`VideosController.GetVideoStream[ByContainer]`,
+/// `AudioController.GetAudioStream[ByContainer]`), `container` being the
+/// query's or the `stream.{container}` route's: the model-state `400` names
+/// every failing one before the item is looked up, whatever the caller, as
+/// stock Jellyfin 12.4 answered.
+#[rstest]
+#[case::level_and_codec(
+    "GET",
+    "/Videos/{id}/stream?level=abc&videoCodec=a%24b",
+    &[("level", Complaint::Level), ("videoCodec", Complaint::Container)]
+)]
+#[case::segment_container("GET", "/Videos/{id}/stream.mkv?segmentContainer=a%24b", &[("segmentContainer", Complaint::Container)])]
+#[case::static_container("GET", "/Videos/{id}/stream?static=true&container=a%24b", &[("container", Complaint::Container)])]
+#[case::route_container("GET", "/Videos/{id}/stream.a%24b", &[("container", Complaint::Container)])]
+#[case::audio_codec("GET", "/Audio/{id}/stream?audioCodec=a%24b&container=ts", &[("audioCodec", Complaint::Container)])]
+#[case::audio_subtitle_head("HEAD", "/Audio/{id}/stream.mp3?subtitleCodec=a%24b", &[("subtitleCodec", Complaint::Container)])]
+#[tokio::test]
+async fn stream_routes_refuse_a_value_failing_its_pattern(
+    #[case] method: &str,
+    #[case] uri: &str,
+    #[case] failures: &[(&str, Complaint)],
+) {
+    let uri = uri.replace("{id}", &ITEM_ID.to_string());
+    let rec = Arc::new(Recorded::default());
+    let app = router_no_static(ok_hls("/unused", Arc::clone(&rec)));
+    let response = app.oneshot(authed(method, &uri)).await.unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{uri}");
+    if method == "GET" {
+        let errors: serde_json::Map<String, serde_json::Value> = failures
+            .iter()
+            .map(|(name, complaint)| {
+                (
+                    (*name).to_owned(),
+                    serde_json::json!([complaint.message(name)]),
+                )
+            })
+            .collect();
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&body_string(response).await).unwrap(),
+            serde_json::json!({
+                "type": "https://tools.ietf.org/html/rfc9110#section-15.5.1",
+                "title": "One or more validation errors occurred.",
+                "status": 400,
+                "errors": errors,
+            }),
+            "{uri}"
+        );
+    }
+    assert!(rec.last.lock().unwrap().is_none(), "{uri} reached the seam");
+}
+
+/// The stream actions are anonymous upstream, and an anonymous request with a
+/// value outside the pattern gets the same `400`.
+#[tokio::test]
+async fn an_anonymous_stream_request_gets_the_pattern_400() {
+    let rec = Arc::new(Recorded::default());
+    let app = router_no_static_with_auth(ok_hls("/unused", Arc::clone(&rec)), Arc::new(DenyAuth));
+    let request = Request::builder()
+        .uri(format!("/Videos/{ITEM_ID}/stream?container=a%24b"))
+        .body(Body::empty())
+        .unwrap();
+    let response = app.oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert!(body_string(response).await.contains(r#""container":["#));
     assert!(rec.last.lock().unwrap().is_none());
 }
 

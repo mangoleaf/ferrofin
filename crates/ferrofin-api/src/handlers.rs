@@ -975,8 +975,8 @@ pub const VERIFIED_SUBSYSTEMS_AGAINST_EARLIER_PIN: &[(&str, &str)] = &[];
 /// they answer with ends, and how many jobs ffmpeg may run for them and the
 /// HLS routes;
 /// `stream-parameter-patterns` is which container, codec and level values the
-/// HLS routes refuse before their action runs, whose operations have no row
-/// of their own yet;
+/// HLS and stream routes refuse before their action runs, whose operations
+/// have no row of their own yet;
 /// `transcode-arguments` is the ffmpeg command line of a job on the stream
 /// routes and the HLS routes, in the parts its row names;
 /// `video-stream-copy` is whether a transcode job copies the source video and
@@ -1815,31 +1815,45 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
         key: "stream-parameter-patterns",
         upstream_file: "Jellyfin.Api/Controllers/DynamicHlsController.cs",
         upstream_method: "GetMasterHlsVideoPlaylist",
-        ferrofin: "Which values of the HLS routes' [RegularExpression] parameters are refused, and \
-                   the 400 they answer with. extract.rs StreamPattern \
+        ferrofin: "Which values of the HLS and stream routes' [RegularExpression] parameters are \
+                   refused, and the 400 they answer with. extract.rs StreamPattern \
                    (EncodingHelper.ContainerValidationRegexStr and LevelValidationRegexStr, matched \
                    over the whole value as RegularExpressionAttribute matches them, with an empty \
                    value passing), pattern_complaint and validation_failure (the [ApiController] \
                    model-state ValidationProblemDetails: one body naming every failing parameter by \
-                   its declared name, whatever case the query spelled it in), reached from \
-                   handlers/hls.rs hls_pattern_failures and segment_pattern_failures in the seven \
+                   its declared name, whatever case the query spelled it in), each answered after \
+                   authorization (RequireAuth on the HLS and universal routes; the stream routes \
+                   are anonymous upstream) and before the item is looked up. handlers/hls.rs \
+                   stream_pattern_failures and segment_pattern_failures in the seven \
                    DynamicHlsController actions (GetMasterHlsVideoPlaylist, \
                    GetVariantHlsVideoPlaylist, GetLiveHlsStream, GetMasterHlsAudioPlaylist, \
-                   GetVariantHlsAudioPlaylist, GetHlsVideoSegment, GetHlsAudioSegment) after \
-                   RequireAuth and before the item is looked up: segmentContainer, audioCodec, level, \
-                   videoCodec and subtitleCodec on each, and container on GetLiveHlsStream's query \
-                   and on a segment's route {container} (the text after the last dot of \
-                   {segmentId}.{container}, where a blank one is [Required]'s complaint, filed beside \
-                   the others); the playlists declare no container, so their container query is not \
-                   read. Compared with those actions' parameter attributes at the pinned v12.4 tag, \
-                   and settled against a stock 12.4 container (2026-11-14): bodies and keys for each \
-                   parameter, an encoded line break, a leading space, 41 and 40 characters, a blank \
-                   value, a later repeat of the key, the undeclared container query, the route \
+                   GetVariantHlsAudioPlaylist, GetHlsVideoSegment, GetHlsAudioSegment): \
+                   segmentContainer, audioCodec, level, videoCodec and subtitleCodec on each, and \
+                   container on GetLiveHlsStream's query and on a segment's route {container} (the \
+                   text after the last dot of {segmentId}.{container}, where a blank one is \
+                   [Required]'s complaint, filed beside the others); the playlists declare no \
+                   container, so their container query is not read. The same stream_pattern_failures \
+                   in handlers/videos.rs and audio.rs get_video_stream, \
+                   get_video_stream_by_container, get_audio_stream and get_audio_stream_by_container \
+                   (VideosController.GetVideoStream and GetVideoStreamByContainer, \
+                   AudioController.GetAudioStream and GetAudioStreamByContainer), with container the \
+                   query's or the stream.{container} route's, for anonymous and Static=true requests \
+                   too, and again in transcode_stream_fallback; and audio.rs \
+                   get_universal_audio_stream (UniversalAudioController.GetUniversalAudioStream: \
+                   audioCodec and transcodingContainer only). Compared with those actions' parameter \
+                   attributes at the pinned v12.4 tag, and settled against a stock 12.4 container \
+                   (2026-11-14): bodies and keys for each parameter, an encoded line break, a leading \
+                   space, 41 and 40 characters, a blank value, a later repeat of the key, the \
+                   undeclared container query of the playlists and of universal, the segment route \
                    {container} blank (alone and beside a failing segmentContainer) and outside the \
                    pattern, level spellings (4.1, -41, abc, 1e1, a leading space, 41., 4.1.2), a \
-                   HEAD, and the 401 of a request with no token coming first. Not part of this row: \
-                   merging these complaints with another parameter's binding failure into one body \
-                   (gl-1672), the segments' {segmentId} binding, and the rest of each operation",
+                   HEAD of the master playlist, an anonymous stream request, Static=true, and the 401 \
+                   of an HLS request with no token coming first; a stream.{container} route value \
+                   outside the pattern was probed on 12.4 for gl-1671 (2026-11-11). Not part of this \
+                   row: merging these complaints with another \
+                   parameter's binding failure into one body (gl-1672), the segments' {segmentId} \
+                   binding, a blank or empty stream.{container} (gl-1671), and the rest of each \
+                   operation",
         date: "2026-11-14",
         divergences: &[],
     },
