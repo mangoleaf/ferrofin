@@ -1,7 +1,7 @@
 //! Transliteration of
 //! `Jellyfin.Networking.Tests.Configuration.NetworkConfigurationTests`.
 
-use ferrofin_networking::NetworkConfiguration;
+use ferrofin_networking::{NetworkConfiguration, escape_base_url};
 use rstest::rstest;
 
 /// `BaseUrl_ReturnsNormalized`.
@@ -18,6 +18,28 @@ use rstest::rstest;
 fn base_url_returns_normalized(#[case] expected: &str, #[case] input: &str) {
     let config = NetworkConfiguration::default().with_base_url(input);
     assert_eq!(expected, config.base_url());
+}
+
+/// gl-1685: the base URL in a URL is escaped as `UriBuilder.Path` escapes it,
+/// keeping the reserved characters and any escape it already holds. Each
+/// expected value but the backslash's is Jellyfin 12.4's, probed live.
+#[rstest]
+#[case::plain("/jellyfin", "/jellyfin")]
+#[case::space("/my jellyfin", "/my%20jellyfin")]
+#[case::non_ascii("/m\u{e9}dias", "/m%C3%A9dias")]
+#[case::already_escaped("/my%20jellyfin", "/my%20jellyfin")]
+#[case::delimiters("/b<c>d#e?f", "/b%3Cc%3Ed%23e%3Ff")]
+#[case::unsafe_ascii("/a|b{c}^\"`", "/a%7Cb%7Bc%7D%5E%22%60")]
+#[case::reserved_kept("/x-._~:[]@!$&'()*+,;=", "/x-._~:[]@!$&'()*+,;=")]
+#[case::lone_percent("/100%", "/100%25")]
+#[case::truncated_escape("/a%2", "/a%252")]
+#[case::invalid_escape("/x%zz", "/x%25zz")]
+#[case::lowercase_escape_kept("/m%c3%a9dias", "/m%c3%a9dias")]
+#[case::double_percent("/a%%", "/a%25%25")]
+#[case::percent_before_multibyte("/a%\u{e9}", "/a%25%C3%A9")]
+#[case::backslash_stays_itself("/a\\b", "/a%5Cb")]
+fn escape_base_url_escapes_as_uri_builder(#[case] base: &str, #[case] expected: &str) {
+    assert_eq!(escape_base_url(base), expected);
 }
 
 /// The serialized field names must be exactly the contract's, character for

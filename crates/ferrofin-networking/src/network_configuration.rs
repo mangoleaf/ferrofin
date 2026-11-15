@@ -47,6 +47,7 @@
 //! contract and the dashboard expect the key; ignoring it is exact parity, so
 //! there is nothing here to warn about.
 
+use percent_encoding::{AsciiSet, CONTROLS, percent_encode};
 use serde::{Deserialize, Serialize};
 
 /// The default value for the internal/public HTTP port.
@@ -243,4 +244,43 @@ pub fn normalize_base_url(value: &str) -> String {
     }
     normalized.truncate(normalized.trim_end_matches('/').len());
     normalized
+}
+
+/// What `UriBuilder.Path` escapes, plus `\`, but `%`, which [`escape_base_url`]
+/// decides.
+const URL_PATH: &AsciiSet = &CONTROLS
+    .add(b' ')
+    .add(b'"')
+    .add(b'#')
+    .add(b'<')
+    .add(b'>')
+    .add(b'?')
+    .add(b'\\')
+    .add(b'^')
+    .add(b'`')
+    .add(b'{')
+    .add(b'|')
+    .add(b'}');
+
+/// A normalized base URL as the path of a URL, escaped as `UriBuilder.Path`
+/// escapes it (Jellyfin 12.4's discovery `Address`, probed live): `/my
+/// jellyfin` is `/my%20jellyfin`, `/médias` is `/m%C3%A9dias`, an escape it
+/// already holds is kept, and a `%` that starts none is `%25`. A `\` is `%5C`,
+/// where `UriBuilder` writes a `/` that the mount would not answer.
+#[must_use]
+pub fn escape_base_url(base: &str) -> String {
+    let mut chunks = base.split('%');
+    let mut escaped: String = chunks
+        .next()
+        .map(|chunk| percent_encode(chunk.as_bytes(), URL_PATH).collect())
+        .unwrap_or_default();
+    for chunk in chunks {
+        let escape = chunk
+            .as_bytes()
+            .get(..2)
+            .is_some_and(|hex| hex.iter().all(u8::is_ascii_hexdigit));
+        escaped.push_str(if escape { "%" } else { "%25" });
+        escaped.extend(percent_encode(chunk.as_bytes(), URL_PATH));
+    }
+    escaped
 }

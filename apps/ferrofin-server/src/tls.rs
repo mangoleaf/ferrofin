@@ -391,7 +391,7 @@ pub async fn redirect_to_https(
         );
         HeaderValue::from_str(&format!(
             "https://{authority}{}{path}{query}",
-            redirect.base
+            ferrofin_networking::escape_base_url(&redirect.base)
         ))
         .ok()
     });
@@ -979,6 +979,13 @@ mod tests {
         "example.com:8096",
         "/System/Info/Public?x=1",
         "https://example.com:8920/jf/System/Info/Public?x=1"
+    )]
+    #[case::base_escaped(
+        8920,
+        "/my jellyfin",
+        "example.com:8096",
+        "/web/",
+        "https://example.com:8920/my%20jellyfin/web/"
     )]
     #[case::default_port_left_out(
         443,
