@@ -1714,16 +1714,19 @@ async fn call_range(
 
 /// `GetSubtitle_GraphicalStream_ReturnsRawFileWithRangeProcessing` (v12.2):
 /// a PGS `.sup` and an extracted VobSub `.mks` are handed over untouched,
-/// with Range processing, and never encoded. Both routes.
+/// with Range processing, and never encoded. Both routes. The type is
+/// `MimeTypes.GetMimeType(subtitlePath)`: the `MimeTypes` package's `.mks` row,
+/// and its default for `.sup`, which it does not know.
 #[rstest::rstest]
-#[case("pgssub", "sub.sup", "Stream.pgssub")]
-#[case("dvdsub", "sub.mks", "Stream.vobsub")]
-#[case("pgssub", "sub.sup", "0/Stream.pgssub")]
+#[case("pgssub", "sub.sup", "Stream.pgssub", "application/octet-stream")]
+#[case("dvdsub", "sub.mks", "Stream.vobsub", "video/x-matroska")]
+#[case("pgssub", "sub.sup", "0/Stream.pgssub", "application/octet-stream")]
 #[tokio::test]
 async fn get_subtitle_graphical_stream_returns_raw_file_with_range_processing(
     #[case] codec: &str,
     #[case] file_name: &str,
     #[case] route: &str,
+    #[case] expected_type: &str,
 ) {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join(file_name);
@@ -1743,8 +1746,7 @@ async fn get_subtitle_graphical_stream_returns_raw_file_with_range_processing(
 
     assert_eq!(status, StatusCode::PARTIAL_CONTENT);
     assert_eq!(body, payload[10..20]);
-    // `MimeTypes.GetMimeType` knows neither extension: the default type.
-    assert_eq!(content_type.as_deref(), Some("application/octet-stream"));
+    assert_eq!(content_type.as_deref(), Some(expected_type));
     assert_eq!(accept_ranges.as_deref(), Some("bytes"));
     assert!(
         !encoder.encoded.load(std::sync::atomic::Ordering::SeqCst),
