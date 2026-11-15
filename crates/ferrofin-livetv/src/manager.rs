@@ -3586,8 +3586,10 @@ impl LiveTvManager for FerrofinLiveTvManager {
             .program_dtos(&rows, &list_options, query.user.as_deref())
             .await?;
 
-        // Same rule as the item repository: the count is only bought when
-        // paging actually truncated the result.
+        // `BaseItemRepository.GetItems`' rule: the count is only bought when
+        // paging may have truncated the result. Otherwise the total is the
+        // page's length, also with the count off (`QueryItems` reads
+        // `GetItemList`, and `QueryResult` totals its items).
         let total = if query.enable_total_record_count && (query.limit.is_some() || start_index > 0)
         {
             let mut cb: QueryBuilder<Sqlite> = QueryBuilder::new(PROGRAM_COUNT);
@@ -3599,7 +3601,7 @@ impl LiveTvManager for FerrofinLiveTvManager {
                 .map_err(db_err)?;
             i32::try_from(count).unwrap_or(i32::MAX)
         } else {
-            i32::try_from(items.len()).unwrap_or(i32::MAX) + start_index
+            i32::try_from(items.len()).unwrap_or(i32::MAX)
         };
         Ok(QueryResult::new(Some(start_index), Some(total), items))
     }

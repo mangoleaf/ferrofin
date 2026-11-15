@@ -416,7 +416,11 @@ pub trait ItemRepository: Send + Sync {
         item_id: Uuid,
     ) -> Result<Option<Vec<BaseItemEntity>>, ServiceError>;
 
-    /// Runs a query and returns a page of item rows plus the total count.
+    /// Runs a query and returns a page of item rows plus the total count. Its
+    /// own query is `BaseItemRepository.GetItems`, so with
+    /// [`InternalItemsQuery::enable_total_record_count`] off the total is the
+    /// page's own length; the folders view it answers first totals every row,
+    /// as upstream's `SortAndPage` does.
     async fn get_items(
         &self,
         filter: &InternalItemsQuery,

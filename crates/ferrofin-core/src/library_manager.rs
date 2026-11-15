@@ -1666,12 +1666,15 @@ impl FerrofinLibraryManager {
 
     /// A box set's, album's or artist's own listing: the repository query,
     /// with no collection substitution, less the box-set members the user may
-    /// not see ([`Self::hidden_box_set_members`]).
+    /// not see ([`Self::hidden_box_set_members`]). It always counts, whatever
+    /// the request says: upstream's `PostFilterAndSort` → `SortAndPage` totals
+    /// every child before it pages.
     async fn direct_children(
         &self,
         mut resolved: InternalItemsQuery,
     ) -> Result<QueryResult<BaseItemEntity>, ServiceError> {
         resolved.collapse_box_set_items = None;
+        resolved.enable_total_record_count = true;
         let hidden = self.hidden_box_set_members(&resolved).await?;
         resolved.exclude_item_ids.extend(hidden);
         self.items.get_items(&resolved).await
@@ -8287,7 +8290,8 @@ mod tests {
     /// `DisplayOrder` (default `PremiereDate`; `Default` keeps the order the
     /// members were added in; an unparseable one is `PremiereDate`) unless the
     /// request orders them itself — read off a Jellyfin 12.2 oracle on a set
-    /// created from Zeta (2001), Alpha (2003), Mid (1999), Beta (2002).
+    /// created from Zeta (2001), Alpha (2003), Mid (1999), Beta (2002). Its own
+    /// listing totals every member even with the count off.
     #[tokio::test]
     #[allow(clippy::too_many_lines)] // one set, every display order
     async fn a_box_set_lists_its_members_by_its_display_order() {
@@ -8436,6 +8440,29 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(names(around), ["Zeta", "Alpha", "Mid"]);
+        // With the count off, the set's own listing still totals every member
+        // (`PostFilterAndSort` → `SortAndPage` counts before it pages), and a
+        // recursive one, the repository's `GetItemList`, totals its page.
+        let uncounted = |recursive: bool| {
+            let query = InternalItemsQuery {
+                user: Some(Arc::new(user.clone())),
+                parent_id: set_id,
+                parent_type: Some(BaseItemKind::BoxSet),
+                recursive,
+                apply_folder_display_options: true,
+                start_index: Some(1),
+                limit: Some(2),
+                enable_total_record_count: false,
+                ..Default::default()
+            };
+            let library = Arc::clone(&library);
+            async move {
+                let result = library.query_items(&query).await.unwrap();
+                (result.items.len(), result.total_record_count)
+            }
+        };
+        assert_eq!(uncounted(false).await, (2, 4));
+        assert_eq!(uncounted(true).await, (2, 2));
     }
 
     #[tokio::test]

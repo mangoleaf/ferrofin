@@ -3469,9 +3469,6 @@ pub const VERIFIED: &[Verified] = &[
             "With no user (an API key), sortBy PlayCount, IsFavoriteOrLiked, IsPlayed or \
          IsUnplayed sorts by SortName, as /Items does; upstream's OrderMapper reads the \
          missing user's id (query.User!.Id), which throws. Jellyfin bug not ported.",
-            "enableTotalRecordCount=false with a startIndex reports the page's length plus \
-         startIndex as TotalRecordCount; upstream's QueryItems reads GetItemList and \
-         reports the page's length. Fix path: gl-1689.",
             "Programme DTOs are projected from the guide's own table, not the stored \
          LiveTvProgram item, so what that table has no column for is missing: \
          CommunityRating, PremiereDate (the listing's original air date), Audio, an HD \
@@ -3533,9 +3530,6 @@ pub const VERIFIED: &[Verified] = &[
             "With no body UserId, SortBy PlayCount, IsFavoriteOrLiked, IsPlayed or \
          IsUnplayed sorts by SortName, as /Items does; upstream's OrderMapper reads the \
          missing user's id (query.User!.Id), which throws. Jellyfin bug not ported.",
-            "EnableTotalRecordCount=false with a StartIndex reports the page's length plus \
-         StartIndex as TotalRecordCount; upstream's QueryItems reads GetItemList and \
-         reports the page's length. Fix path: gl-1689.",
             "Programme DTOs are projected from the guide's own table, not the stored \
          LiveTvProgram item, so what that table has no column for is missing: \
          CommunityRating, PremiereDate (the listing's original air date), Audio, an HD \

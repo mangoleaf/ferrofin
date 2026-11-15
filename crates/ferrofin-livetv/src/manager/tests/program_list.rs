@@ -534,3 +534,34 @@ async fn the_category_flags_keep_the_guide_plans(
         "{plan:?}"
     );
 }
+
+/// With the count off the guide reports its page's length, whatever the
+/// offset: upstream's `QueryItems` answers `GetItemList` with no total, which
+/// `QueryResult` turns into the page's count (v12.4 `LibraryManager.cs:1899-1907`,
+/// `QueryResult.cs:36-41`). With it on, a paged read counts the whole guide.
+#[rstest::rstest]
+#[case::uncounted_at_an_offset(false, Some(2), Some(2), 2, 2)]
+#[case::uncounted_tail(false, Some(4), None, 1, 1)]
+#[case::uncounted_first_page(false, None, Some(2), 2, 2)]
+#[case::counted_at_an_offset(true, Some(2), Some(2), 2, 5)]
+#[case::counted_offset_without_a_limit(true, Some(2), None, 3, 5)]
+#[case::counted_unpaged(true, None, None, 5, 5)]
+#[tokio::test]
+async fn an_uncounted_guide_page_totals_its_own_length(
+    #[case] enable_total_record_count: bool,
+    #[case] start_index: Option<i32>,
+    #[case] limit: Option<i32>,
+    #[case] page: usize,
+    #[case] total: i32,
+) {
+    let lab = item_lab(M3U, Some(category_guide())).await;
+    lab.mgr.refresh_guide().await.expect("refresh");
+    let query = InternalItemsQuery {
+        start_index,
+        limit,
+        enable_total_record_count,
+        ..InternalItemsQuery::default()
+    };
+    let (titles, listed_total) = listed(&lab, &query).await;
+    assert_eq!((titles.len(), listed_total), (page, total), "{titles:?}");
+}
