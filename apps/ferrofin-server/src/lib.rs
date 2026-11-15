@@ -922,8 +922,8 @@ async fn serve_until_drained(
         .await
 }
 
-/// The lifetime's router behind the path-case, HTTPS-redirect and base-URL
-/// rewrites, which run before routing, and the panic boundary.
+/// The lifetime's router behind the path- and method-case, HTTPS-redirect and
+/// base-URL rewrites, which run before routing, and the panic boundary.
 fn lifetime_app(
     router: axum::Router,
     base: &str,
@@ -1560,7 +1560,13 @@ fn enable_metrics_endpoint(
 }
 
 /// Rewrites a request's path to its canonical Jellyfin case before routing
-/// (the query string is passed through unchanged).
+/// (the query string is passed through unchanged), and its method to upper
+/// case: ASP.NET routing matches a method ignoring case, so Jellyfin answers
+/// `get` as it answers `GET` (measured on Jellyfin 12.4), where axum's router
+/// compares methods exactly. A lower-case `head` reaches the HEAD routes and
+/// keeps its body, as on Jellyfin, where Kestrel drops the body only for a
+/// method it parsed as `HEAD` (hyper does the same). On a route with no HEAD
+/// action it meets the GET handler, as `HEAD` does (gl-1840).
 ///
 /// Jellyfin's API is case-insensitive (ASP.NET); axum's router is case-sensitive,
 /// and clients call some paths in non-canonical case (e.g. `/Localization/countries`).
@@ -1572,6 +1578,12 @@ async fn canonicalize_path_case(
     mut request: axum::extract::Request,
     next: axum::middleware::Next,
 ) -> axum::response::Response {
+    let method = request.method().as_str();
+    if method.bytes().any(|byte| byte.is_ascii_lowercase())
+        && let Ok(upper) = axum::http::Method::from_bytes(method.to_ascii_uppercase().as_bytes())
+    {
+        *request.method_mut() = upper;
+    }
     // Path: re-case to the registered route where recognized (asset/unknown paths
     // return `None` and keep their significant case). Query keys are left as
     // sent: `ferrofin_api::extract::Query` binds them to each handler's members
@@ -2163,6 +2175,44 @@ mod tests {
     #[case("[::FFFF:1.2.3.4]", "[::ffff:1.2.3.4]")]
     fn uri_host_is_the_host_system_uri_writes(#[case] host: &str, #[case] written: &str) {
         assert_eq!(super::uri_host(host), written);
+    }
+
+    /// A method in any case reaches the route its upper-case spelling does,
+    /// as ASP.NET routing matches it (measured on Jellyfin 12.4: `get` and
+    /// `Get` answer as `GET`, `post` as `POST`, `head` as `HEAD` on a HEAD
+    /// route); one no route takes stays 405.
+    #[rstest::rstest]
+    #[case("get", "/echo", StatusCode::OK)]
+    #[case("Get", "/echo", StatusCode::OK)]
+    #[case("GET", "/echo", StatusCode::OK)]
+    #[case("post", "/posted", StatusCode::OK)]
+    #[case("get", "/posted", StatusCode::METHOD_NOT_ALLOWED)]
+    #[case("foo", "/echo", StatusCode::METHOD_NOT_ALLOWED)]
+    #[case("head", "/headed", StatusCode::NOT_FOUND)]
+    #[tokio::test]
+    async fn a_method_routes_whatever_its_case(
+        #[case] method: &str,
+        #[case] path: &str,
+        #[case] status: StatusCode,
+    ) {
+        let router = Router::new()
+            .route("/echo", axum::routing::get(|| async { "ok" }))
+            .route("/posted", axum::routing::post(|| async { "ok" }))
+            .route(
+                "/headed",
+                axum::routing::head(|| async { StatusCode::NOT_FOUND }),
+            );
+        let response = super::lifetime_app(router, "", None)
+            .oneshot(
+                Request::builder()
+                    .method(method)
+                    .uri(path)
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), status);
     }
 
     #[test]
