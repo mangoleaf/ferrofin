@@ -1394,8 +1394,9 @@ impl FerrofinPlaylistManager {
     /// `CreatePlaylist`'s media type when the request names none
     /// (`PlaylistManager.cs:90-127`): the first requested item that answers
     /// decides — its own media type, `Audio` for an artist, album or music
-    /// genre, `Video` for a genre, a folder's first playable member's — and
-    /// `Audio` when none does. An id naming no item before that is upstream's
+    /// genre, `Video` for a genre, a folder's first playable member's in tree
+    /// order ([`Self::first_member_media_type`]) — and `Audio` when none
+    /// does. An id naming no item before that is upstream's
     /// `ArgumentException`, thrown before anything is created.
     async fn infer_media_type(&self, ids: &[Uuid]) -> Result<MediaType, ServiceError> {
         for id in ids {
@@ -1416,24 +1417,24 @@ impl FerrofinPlaylistManager {
                         | BaseItemKind::MusicGenre,
                     ) => MediaType::Audio,
                     Some(BaseItemKind::Genre) => MediaType::Video,
-                    // `GetRecursiveChildren(i => !i.IsFolder &&
-                    // i.SupportsAddingToPlaylist)`, with no user, missing
-                    // episodes included. Those members are all audio or
-                    // video, so the folder query finds them; it reads them in
-                    // name order where upstream walks the tree, which only
-                    // differs for a folder holding both.
                     Some(kind) if crate::kinds::is_folder(kind) => {
-                        let mut query = folder_items_query(*id, kind, &item, None);
-                        query.is_virtual_item = None;
-                        query.limit = Some(1);
-                        self.library_manager
-                            .query_items(&query)
-                            .await?
-                            .items
-                            .first()
-                            .map_or(MediaType::Unknown, |member| {
-                                crate::dto_service::parse_media_type(member.media_type.as_deref())
-                            })
+                        // Boxed: the walk's state would push the boot repair's
+                        // future (`saved_container_plan`) past clippy's size limit.
+                        match Box::pin(self.first_member_media_type(*id, kind)).await? {
+                            // A folder whose walk finds nothing playable still
+                            // answers, as before the walk: a box set of series
+                            // or video folders (upstream never looks inside a
+                            // linked folder), a season whose episodes are
+                            // stored under the series (its `Children` are
+                            // empty). Upstream moves on to the next id, and
+                            // types the playlist `Audio` when none answers,
+                            // whatever its entries. Jellyfin bug not ported.
+                            MediaType::Unknown => {
+                                self.first_listed_member_media_type(*id, kind, &item)
+                                    .await?
+                            }
+                            known => known,
+                        }
                     }
                     _ => MediaType::Unknown,
                 },
@@ -1444,6 +1445,107 @@ impl FerrofinPlaylistManager {
             }
         }
         Ok(MediaType::Audio)
+    }
+
+    /// A folder's media type for [`Self::infer_media_type`]: upstream's
+    /// `folder.GetRecursiveChildren(i => !i.IsFolder &&
+    /// i.SupportsAddingToPlaylist).Select(i => i.MediaType).FirstOrDefault(i =>
+    /// i != MediaType.Unknown)` (`PlaylistManager.cs:109-114`), with no user
+    /// and missing episodes included. `AddChildrenToList` (`Folder.cs:1654-1683`)
+    /// walks each level's `Children` (the physical children, in sort-name
+    /// order), descending into each subfolder where it is met, then the
+    /// folder's own linked children in their stored order, which it never
+    /// descends into. The first playable member with a media type decides;
+    /// `Unknown` when none does.
+    async fn first_member_media_type(
+        &self,
+        folder: Uuid,
+        kind: BaseItemKind,
+    ) -> Result<MediaType, ServiceError> {
+        let media_type = |row: &BaseItemEntity| {
+            let playable = !row.is_folder
+                && kind_from_type_name(&row.type_)
+                    .is_some_and(crate::kinds::supports_adding_to_playlist);
+            if playable {
+                crate::dto_service::parse_media_type(row.media_type.as_deref())
+            } else {
+                MediaType::Unknown
+            }
+        };
+        let children = |id: Uuid, kind: Option<BaseItemKind>| {
+            let query = InternalItemsQuery {
+                parent_id: id,
+                parent_type: kind,
+                group_by_presentation_unique_key: false,
+                ..InternalItemsQuery::default()
+            };
+            async move {
+                // No user: `Children` alone, without the linked ones.
+                let rows = self.items.get_folder_children(&query).await?;
+                Ok::<_, ServiceError>(rows.into_iter().map(|child| child.item))
+            }
+        };
+        // A `ParentId` cycle in a damaged database ends the walk, not the server.
+        let mut visited = std::collections::HashSet::from([folder]);
+        let mut levels = vec![children(folder, Some(kind)).await?];
+        while let Some(level) = levels.last_mut() {
+            let Some(child) = level.next() else {
+                levels.pop();
+                continue;
+            };
+            let found = media_type(&child);
+            if found != MediaType::Unknown {
+                return Ok(found);
+            }
+            if child.is_folder
+                && let Ok(id) = Uuid::parse_str(&child.id)
+                && visited.insert(id)
+            {
+                levels.push(children(id, kind_from_type_name(&child.type_)).await?);
+            }
+        }
+        let linked: Vec<Uuid> = read_entries(self.db.pool(), &guid_to_db(folder))
+            .await?
+            .iter()
+            .filter_map(|(child, _)| Uuid::parse_str(child).ok())
+            .collect();
+        let rows: std::collections::HashMap<Uuid, BaseItemEntity> = self
+            .items
+            .retrieve_items(&linked)
+            .await?
+            .into_iter()
+            .filter_map(|row| Some((Uuid::parse_str(&row.id).ok()?, row)))
+            .collect();
+        Ok(linked
+            .iter()
+            .filter_map(|id| rows.get(id))
+            .map(media_type)
+            .find(|found| *found != MediaType::Unknown)
+            .unwrap_or(MediaType::Unknown))
+    }
+
+    /// The media type of the first member of `folder`'s flat recursive member
+    /// listing ([`folder_items_query`], read without a user, missing episodes
+    /// included): what a create inferred from a folder before
+    /// [`Self::first_member_media_type`], kept where the walk finds nothing.
+    async fn first_listed_member_media_type(
+        &self,
+        id: Uuid,
+        kind: BaseItemKind,
+        folder: &BaseItemEntity,
+    ) -> Result<MediaType, ServiceError> {
+        let mut query = folder_items_query(id, kind, folder, None);
+        query.is_virtual_item = None;
+        query.limit = Some(1);
+        Ok(self
+            .library_manager
+            .query_items(&query)
+            .await?
+            .items
+            .first()
+            .map_or(MediaType::Unknown, |member| {
+                crate::dto_service::parse_media_type(member.media_type.as_deref())
+            }))
     }
 
     /// The rest of `Playlist.IsVisible` after [`decide_access`]'s owner/share
