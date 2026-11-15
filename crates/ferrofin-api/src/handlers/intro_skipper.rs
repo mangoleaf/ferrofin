@@ -41,6 +41,7 @@ use ferrofin_traits::error::ServiceError;
 use ferrofin_traits::intro_skipper::{self as intro_store, StoredSegment};
 use ferrofin_traits::media_segments::MediaSegmentManager;
 use ferrofin_traits::options::InternalItemsQuery;
+use ferrofin_util::ticks::TICKS_PER_SECOND_F64;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -53,8 +54,6 @@ use crate::state::AppState;
 /// `ferrofin-extensions` — the upstream plugin's GUID, which the plugin's own
 /// dashboard app and client integrations hardcode).
 const INTRO_SKIPPER_ID: Uuid = Uuid::from_u128(0xc83d_86bb_a1e0_4c35_a113_e210_1cf4_ee6b);
-/// One second expressed in the 100-nanosecond ticks used by segment storage.
-const TICKS_PER_SECOND: f64 = 10_000_000.0;
 
 /// The skip-button CSS `@import` the plugin injects into server branding.
 const IMPORT_STRING: &str = r#"@import url("https://cdn.jsdelivr.net/gh/intro-skipper/intro-skipper-css@main/skip-button.min.css");"#;
@@ -79,7 +78,7 @@ fn is_episode_or_movie(item: &BaseItemEntity) -> bool {
 
 #[allow(clippy::cast_precision_loss)]
 fn ticks_to_secs(ticks: i64) -> f64 {
-    ticks as f64 / TICKS_PER_SECOND
+    ticks as f64 / TICKS_PER_SECOND_F64
 }
 
 // ---------------------------------------------------------------------------

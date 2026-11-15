@@ -1095,7 +1095,7 @@ fn stored_media_source(data: &serde_json::Map<String, serde_json::Value>) -> Med
 }
 
 /// `VideoImageProvider`'s offset when the runtime is unknown: 10 s, in ticks.
-const SCREEN_GRAB_DEFAULT_OFFSET_TICKS: i64 = 10 * 10_000_000;
+const SCREEN_GRAB_DEFAULT_OFFSET_TICKS: i64 = 10 * ferrofin_util::ticks::TICKS_PER_SECOND;
 
 /// `GetVideoImage`'s stream: the one at `DefaultVideoStreamIndex` (any type,
 /// as its first `GetMediaStreams` query asks), else the first video stream.
@@ -1844,7 +1844,8 @@ impl<'a> ProbePipeline<'a> {
             {
                 let shortcut = self.shortcuts.get(&index);
                 if let Some(target) = shortcut {
-                    request.media_source.protocol = shortcut::path_protocol(target);
+                    request.media_source.protocol =
+                        ferrofin_model::media_info::path_protocol(target);
                     request.media_source.path = Some(target.clone());
                 }
                 let permit = if self.current == Some(index) {
@@ -2031,64 +2032,7 @@ fn dynamic_answer(
     answer
 }
 
-/// Stops a running scan cooperatively, as upstream's `CancellationToken`
-/// does. The scan checks it between two items, around each stored-row
-/// window it reads and plans, between its closing passes and inside the
-/// long ones. It races it against every wait of the item in progress: the
-/// ones before anything is written (its probe, its metadata providers) end
-/// the item unwritten, and a cancel inside its artwork pass (image
-/// providers, cover extraction) stops the fetches where they stand and
-/// saves the item with the artwork already on disk. A cancel after the
-/// item's row was saved leaves the row without its refresh stamp, so an item
-/// is written whole, not at all, or as far as it got for the next scan to
-/// redo; and a hung ffprobe or provider cannot keep a cancelled scan alive.
-#[derive(Debug, Clone)]
-pub struct ScanCancel(Arc<tokio::sync::watch::Sender<bool>>);
-
-impl Default for ScanCancel {
-    fn default() -> Self {
-        Self(Arc::new(tokio::sync::watch::Sender::new(false)))
-    }
-}
-
-impl ScanCancel {
-    /// A token nobody has cancelled yet.
-    #[must_use]
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// Asks the scan to stop.
-    pub fn cancel(&self) {
-        self.0.send_replace(true);
-    }
-
-    /// Whether the scan was asked to stop.
-    #[must_use]
-    pub fn is_cancelled(&self) -> bool {
-        *self.0.borrow()
-    }
-
-    /// Resolves once the scan is asked to stop.
-    pub async fn cancelled(&self) {
-        let mut asked = self.0.subscribe();
-        // The sender lives as long as `self`, so this never errors.
-        let _ = asked.wait_for(|cancelled| *cancelled).await;
-    }
-
-    /// Runs `work` unless the scan is asked to stop first; `None` when it
-    /// was (and `work` is dropped where it stood).
-    pub(crate) async fn unless_cancelled<T>(
-        &self,
-        work: impl std::future::Future<Output = T>,
-    ) -> Option<T> {
-        tokio::select! {
-            biased;
-            () = self.cancelled() => None,
-            done = work => Some(done),
-        }
-    }
-}
+pub use ferrofin_traits::tasks::ScanCancel;
 
 /// Where a scan reports how far it got, in percent: the items take 0–96 %
 /// and the closing passes 96–100 %, as upstream's `PerformLibraryValidation`
@@ -4461,8 +4405,11 @@ pub struct LibraryScanner {
     /// see. Absent in unit tests that don't exercise it; nothing is announced.
     change_notifier: Option<Arc<crate::library_changed_notifier::LibraryChangedNotifier>>,
     /// Expands the `%MetadataPath%`/`%AppDataPath%` tokens adopted Jellyfin
-    /// image rows store, for the local image validation's existence check.
-    /// Identity until [`with_virtual_paths`](Self::with_virtual_paths).
+    /// image rows store, for the local image validation's existence check and
+    /// the image measuring: the stored rows reach the scan expanded already
+    /// when its persistence service has the server's paths, so this matters
+    /// for one that has not. Identity until
+    /// [`with_virtual_paths`](Self::with_virtual_paths).
     virtual_paths: crate::virtual_paths::VirtualPathExpander,
     /// The `AggregateFolder` (`CreateRootFolder()`), which each library
     /// location's `Folder` row hangs off. `None` until
@@ -19912,7 +19859,9 @@ fn keep_stored_images(
 ///
 /// An adopted Jellyfin row stores `%MetadataPath%`-style tokens;
 /// `ValidateImages` checks the expanded path (`BaseItem.cs` `File.Exists`
-/// over `ExpandVirtualPath`), and so does this. A path still carrying a
+/// over `ExpandVirtualPath`), and so does this. The scan reads the stored
+/// rows expanded already, and a save keeps a row's token form while it
+/// expands to the path saved. A path still carrying a
 /// virtual-path token after expansion (a scanner not wired with
 /// `with_virtual_paths`) can't be checked, so it is kept as stored rather
 /// than dropped as missing. A remote image (not a local file) is kept as
@@ -20735,7 +20684,7 @@ fn retype(walk: MovieWalk, content_type: Option<ferrofin_model::data::Collection
         || content_type
             == walk
                 .collection_type
-                .and_then(crate::kinds::collection_type_of)
+                .and_then(CollectionTypeOptions::collection_type)
     {
         return Retype::Same;
     }
@@ -20780,7 +20729,7 @@ fn children_content_type(
     use ferrofin_model::content_type_overrides::content_type_override;
     content_type_override(content_types, dir, false)
         .or_else(|| content_type_override(content_types, dir, true))
-        .or_else(|| library.and_then(crate::kinds::collection_type_of))
+        .or_else(|| library.and_then(CollectionTypeOptions::collection_type))
 }
 
 /// The collection type a folder of an untyped walk resolves with:
@@ -27291,10 +27240,10 @@ mod tests {
     #[case::default_time(None, 10)]
     #[case::calculated_time(Some(500), 50)]
     fn the_grab_selects_its_time(#[case] run_time_seconds: Option<i64>, #[case] expected: i64) {
-        const TICKS: i64 = 10_000_000;
+        use ferrofin_util::ticks::TICKS_PER_SECOND;
         assert_eq!(
-            super::screen_grab_offset(run_time_seconds.map(|s| s * TICKS)),
-            expected * TICKS
+            super::screen_grab_offset(run_time_seconds.map(|s| s * TICKS_PER_SECOND)),
+            expected * TICKS_PER_SECOND
         );
     }
 

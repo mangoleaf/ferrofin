@@ -526,6 +526,37 @@ impl IntroSkipperStore for FerrofinIntroSkipperStore {
         .map_err(db_err)?;
         tx.commit().await.map_err(db_err)
     }
+
+    async fn forget_items(&self, item_ids: &[Uuid]) -> Result<(), ServiceError> {
+        if item_ids.is_empty() {
+            return Ok(());
+        }
+        let ids = json_ids(item_ids)?;
+        // One transaction, as `reset_season`: never left analysed without
+        // its segments, nor with them but out of the lists.
+        let mut tx = self.db.writer().begin().await.map_err(db_err)?;
+        sqlx::query(
+            r#"DELETE FROM "FerrofinIntroSkipperSegments"
+               WHERE "ItemId" IN (SELECT value FROM json_each(?1)) AND "IsUserProvided" = 0"#,
+        )
+        .bind(&ids)
+        .execute(&mut *tx)
+        .await
+        .map_err(db_err)?;
+        sqlx::query(
+            r#"UPDATE "FerrofinIntroSkipperSeasonStates"
+               SET "EpisodeIds" = (
+                   SELECT coalesce(json_group_array(e.value), '[]') FROM json_each("EpisodeIds") e
+                   WHERE e.value NOT IN (SELECT value FROM json_each(?1)))
+               WHERE EXISTS (SELECT 1 FROM json_each("EpisodeIds") e
+                             WHERE e.value IN (SELECT value FROM json_each(?1)))"#,
+        )
+        .bind(&ids)
+        .execute(&mut *tx)
+        .await
+        .map_err(db_err)?;
+        tx.commit().await.map_err(db_err)
+    }
 }
 
 /// The two spellings an Intro Skipper id column may hold: the store's own
@@ -1001,6 +1032,51 @@ mod tests {
             store.season_states(season).await.unwrap()[&Credits]
                 .episode_ids
                 .is_empty()
+        );
+    }
+
+    /// A changed file: the item's automatic segments go and it leaves every
+    /// season's and mode's analysed list; its user-provided segment and the
+    /// other items stay.
+    #[tokio::test]
+    async fn forgetting_an_item_keeps_user_input_and_the_others() {
+        use AnalysisMode::{Credits, Introduction};
+        let store = FerrofinIntroSkipperStore::new(test_db().await);
+        let (season, other) = (Uuid::from_u128(9), Uuid::from_u128(10));
+        let (a, b) = (Uuid::from_u128(1), Uuid::from_u128(2));
+        for segment in [
+            seg(1, Introduction, 0.0, 30.0, false),
+            seg(1, Credits, 900.0, 960.0, true),
+            seg(2, Introduction, 0.0, 30.0, false),
+        ] {
+            store.update_timestamp(segment).await.unwrap();
+        }
+        for mode in [Introduction, Credits] {
+            store
+                .set_episode_ids(season, mode, &[a, b], "h1")
+                .await
+                .unwrap();
+        }
+        store
+            .set_episode_ids(other, Introduction, &[b], "h1")
+            .await
+            .unwrap();
+
+        store.forget_items(&[a]).await.unwrap();
+
+        assert_eq!(
+            store.segments(a).await.unwrap(),
+            vec![seg(1, Credits, 900.0, 960.0, true)]
+        );
+        assert_eq!(store.segments(b).await.unwrap().len(), 1);
+        let states = store.season_states(season).await.unwrap();
+        for mode in [Introduction, Credits] {
+            assert_eq!(states[&mode].episode_ids, HashSet::from([b]));
+            assert_eq!(states[&mode].config_hash, "h1");
+        }
+        assert_eq!(
+            store.season_states(other).await.unwrap()[&Introduction].episode_ids,
+            HashSet::from([b])
         );
     }
 

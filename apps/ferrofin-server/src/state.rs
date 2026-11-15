@@ -1400,6 +1400,19 @@ pub async fn build_app_state(
         .with_self_writes(Arc::clone(&self_writes_guard)),
     );
     let nfo_listener: Arc<dyn ferrofin_traits::library::UserDataSaveListener> = nfo_saver.clone();
+    // A box set's `collection.xml`: written by the metadata save, read by
+    // the box set's refresh.
+    let box_set_xml = Arc::new(
+        ferrofin_providers::box_set_xml::BoxSetXmlSaver::new(
+            Arc::clone(&item_repository),
+            Arc::clone(&item_persistence_service),
+            Arc::clone(&people_repository),
+            Arc::clone(&linked_children_service),
+            Arc::clone(&virtual_folders),
+            Arc::clone(&config_trait),
+        )
+        .with_self_writes(Arc::clone(&self_writes_guard)),
+    );
     user_data_impl.set_save_listener(Arc::downgrade(&nfo_listener))?;
     let item_visibility = Arc::new(
         ferrofin_core::item_visibility::ItemVisibility::new(
@@ -1417,6 +1430,7 @@ pub async fn build_app_state(
         LocalProviderManager::new(Vec::new())
             .with_image_saver(Arc::clone(&image_saver))
             .with_nfo_saver(Arc::clone(&nfo_saver))
+            .with_box_set_xml(box_set_xml)
             .with_image_store(
                 Arc::clone(&item_persistence_service),
                 metadata_library.clone(),
@@ -2204,7 +2218,8 @@ pub async fn build_app_state(
             metadata_root.clone(),
         )
         .with_virtual_folders(Arc::clone(&virtual_folders))
-        .with_self_writes(Arc::clone(&self_writes_guard)),
+        .with_self_writes(Arc::clone(&self_writes_guard))
+        .with_activity(Arc::clone(&activity)),
     );
     let subtitle_downloader = Arc::new(
         ferrofin_core::subtitle_downloader::SubtitleDownloader::new(
@@ -2260,6 +2275,14 @@ pub async fn build_app_state(
     let intro_skipper: Arc<dyn ferrofin_traits::intro_skipper::IntroSkipperStore> = Arc::new(
         ferrofin_core::intro_skipper_repository::FerrofinIntroSkipperStore::new(db.clone()),
     );
+    // The core "Media Segment Scan", registered below; the Intro Skipper's
+    // scan, registered after it under the same key, runs it after detection.
+    let media_segment_scan: Arc<dyn ferrofin_traits::tasks::ScheduledTask> = Arc::new(
+        ferrofin_core::scheduled_tasks::library::MediaSegmentExtractionTask::new(
+            Arc::clone(&library),
+            Arc::clone(&media_segments),
+        ),
+    );
     let extension_cx = ferrofin_extensions::ExtensionContext {
         library: Arc::clone(&library),
         media_segments: Arc::clone(&media_segments),
@@ -2284,11 +2307,12 @@ pub async fn build_app_state(
         // The providers' own download path, so an extension's image fetch keeps
         // the destination policy and size limit set above.
         remote_images: Arc::new(ferrofin_providers::remote_images::LimitedImageFetcher),
+        media_segment_scan: Arc::clone(&media_segment_scan),
     };
     // The user manager was built long before the extensions: their
     // authentication and password-reset providers fill its late slots now,
     // before the server takes a request. Every clone of the manager shares them.
-    ferrofin_extensions::register_auth_providers(&extensions, &extension_cx, &users_impl);
+    ferrofin_extensions::register_auth_providers(&extensions, &extension_cx, users_impl.as_ref());
     // One-shot, before the server takes a request: an adopted Jellyfin's
     // LDAP-Auth settings and uid map come across from the plugin's XML, so its
     // directory users sign in with no admin action (B7).
@@ -2320,12 +2344,7 @@ pub async fn build_app_state(
     for provider in wasm_host.media_segment_providers(&plugins) {
         media_segments.register_segment_provider(provider);
     }
-    task_manager.register(Arc::new(
-        ferrofin_core::scheduled_tasks::library::MediaSegmentExtractionTask::new(
-            Arc::clone(&library),
-            Arc::clone(&media_segments),
-        ),
-    ));
+    task_manager.register(media_segment_scan);
     ferrofin_extensions::register_tasks(&extensions, &extension_cx, &task_manager);
     // Tier-1b WASM plugin tasks and event delivery. Tasks self-gate on the
     // plugin's enabled flag (the Tier-1a pattern); event delivery is
@@ -3195,13 +3214,16 @@ pub async fn build_app_state(
     // compiled-in registration (the upstream plugin registers it via .NET
     // reflection); both transformers self-gate on their plugin's enabled flag
     // and configuration, so dashboard toggles apply live.
+    let file_transformation_service = Arc::new(
+        ferrofin_extensions::file_transformation::WebFileTransformationService::new(
+            Arc::clone(&plugins),
+            Arc::clone(&app_host) as Arc<_>,
+        ),
+    );
+    // A save of the admin-defined transformations applies from the next request.
+    ferrofin_extensions::file_transformation::subscribe(&event_bus, &file_transformation_service);
     let file_transformations: Arc<dyn ferrofin_traits::plugins::FileTransformationService> =
-        Arc::new(
-            ferrofin_extensions::file_transformation::WebFileTransformationService::new(
-                Arc::clone(&plugins),
-                Arc::clone(&app_host) as Arc<_>,
-            ),
-        );
+        file_transformation_service;
     ferrofin_extensions::file_transformation::register_skip_button_transformer(
         file_transformations.as_ref(),
         Arc::clone(&plugins),

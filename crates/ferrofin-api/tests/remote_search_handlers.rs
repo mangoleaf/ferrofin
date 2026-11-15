@@ -222,6 +222,10 @@ type RefreshRecorder = Arc<std::sync::Mutex<Option<(Uuid, MetadataRefreshOptions
 #[derive(Default)]
 struct SearchProviders {
     last_refresh: RefreshRecorder,
+    /// How long a refresh takes before it records itself.
+    refresh_delay: std::time::Duration,
+    /// The culture the last refresh ran under.
+    refresh_culture: Arc<std::sync::Mutex<Option<String>>>,
 }
 
 #[async_trait]
@@ -253,6 +257,8 @@ impl ProviderManager for SearchProviders {
         item_id: Uuid,
         options: &MetadataRefreshOptions,
     ) -> Result<(), ServiceError> {
+        tokio::time::sleep(self.refresh_delay).await;
+        *self.refresh_culture.lock().unwrap() = Some(ferrofin_util::current_culture::capture());
         *self.last_refresh.lock().unwrap() = Some((item_id, options.clone()));
         Ok(())
     }
@@ -350,6 +356,7 @@ fn state_recording(recorder: RefreshRecorder) -> AppState {
         Arc::new(OneItemLibrary::default()),
         Arc::new(SearchProviders {
             last_refresh: recorder,
+            ..SearchProviders::default()
         }),
     )
 }
@@ -521,6 +528,7 @@ fn file_item_state(library: &Arc<OneItemLibrary>, recorder: RefreshRecorder) -> 
         Arc::clone(library) as Arc<dyn LibraryManager>,
         Arc::new(SearchProviders {
             last_refresh: recorder,
+            ..SearchProviders::default()
         }),
     )
     .with_virtual_folders(Arc::new(
@@ -673,6 +681,69 @@ async fn apply_missing_item_is_404() {
     let uri = format!("/Items/RemoteSearch/Apply/{missing}");
     let (status, _) = send("POST", &uri, Body::from("{}")).await;
     assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+/// Apply on the all-zero id is a `400`: upstream's `GetItemById(Guid.Empty)`
+/// throws `ArgumentException`, which the exception middleware answers with
+/// `400`, and nothing is refreshed.
+#[tokio::test]
+async fn apply_on_the_empty_id_is_400() {
+    let recorder = RefreshRecorder::default();
+    let uri = format!("/Items/RemoteSearch/Apply/{}", Uuid::nil());
+    let (status, _) = send_to(
+        state_recording(recorder.clone()),
+        "POST",
+        &uri,
+        Body::from("{}"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(recorder.lock().unwrap().is_none(), "nothing refreshed");
+}
+
+/// A client that hangs up during Apply on an item with no file of its own
+/// does not stop the refresh: upstream runs `RefreshFullItem` with
+/// `CancellationToken.None`. The refresh, on a task of its own, keeps the
+/// request's culture.
+#[tokio::test]
+async fn apply_on_a_path_less_item_finishes_after_the_client_hangs_up() {
+    let recorder = RefreshRecorder::default();
+    let culture = Arc::new(std::sync::Mutex::new(None));
+    let state = elevated_state_with_library_and_providers(
+        Arc::new(OneItemLibrary::default()),
+        Arc::new(SearchProviders {
+            last_refresh: recorder.clone(),
+            refresh_delay: std::time::Duration::from_millis(200),
+            refresh_culture: Arc::clone(&culture),
+        }),
+    )
+    // A culture no CI host runs under, so the system locale cannot pass.
+    .with_request_culture("sv")
+    .expect("culture");
+    let request = create_router(state).oneshot(
+        Request::builder()
+            .method("POST")
+            .uri(format!("/Items/RemoteSearch/Apply/{ITEM_ID}"))
+            .header("content-type", "application/json")
+            .body(Body::from("{}"))
+            .unwrap(),
+    );
+    // The client gives up long before the refresh ends: its request future
+    // is dropped.
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(20), request)
+            .await
+            .is_err(),
+        "the request outlives the client's 20 ms patience"
+    );
+    let finished = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while recorder.lock().unwrap().is_none() {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+    assert!(finished.is_ok(), "the refresh ran to its end");
+    assert_eq!(culture.lock().unwrap().as_deref(), Some("sv"));
 }
 
 /// `ItemLookupController` gates exactly two of its actions with

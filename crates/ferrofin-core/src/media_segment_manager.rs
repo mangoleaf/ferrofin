@@ -534,7 +534,7 @@ impl MediaSegmentManager for FerrofinMediaSegmentManager {
         let mut revisions = self.mutations.lock().await;
         for provider in self.providers() {
             if let Err(error) = provider.cleanup(item).await {
-                tracing::warn!(provider=provider.name(), %error, "media-segment cleanup failed");
+                tracing::warn!(provider=provider.name(), item_id = %item, %error, "media-segment cleanup failed");
             }
         }
         Self::changed(&mut revisions, item);

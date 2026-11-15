@@ -32,6 +32,8 @@ use ferrofin_traits::error::ServiceError;
 use ferrofin_traits::persistence::ItemRepository;
 use uuid::Uuid;
 
+pub use ferrofin_db::item_data::preferred_primary_version;
+
 /// The delimiters a version label is cut at (`BaseItem.VersionDelimiters`,
 /// `BaseItem.cs:95`).
 const VERSION_DELIMITERS: [char; 3] = ['-', '_', '.'];
@@ -1011,26 +1013,6 @@ fn disc_terms(format: crate::item_data::VideoFormat) -> Vec<&'static str> {
         _ => {}
     }
     terms
-}
-
-/// The index of the item a merge makes primary when none of `items` already
-/// has versions: 3D and disc (not `VideoType::VideoFile`) videos after plain
-/// files, then the widest, the first of equals — the fallback of
-/// `VideosController.MergeVersions` (`VideosController.cs:204-217`) and of
-/// the MergeVersions plugin. The item's `Width` column stands in for its
-/// default video stream's width. `0` for an empty slice.
-#[must_use]
-pub fn preferred_primary_version(items: &[BaseItemEntity]) -> usize {
-    items
-        .iter()
-        .enumerate()
-        .min_by_key(|(_, item)| {
-            let format = crate::item_data::video_format(item.data.as_deref());
-            let demoted = format.video3d_format.is_some()
-                || format.video_type != ferrofin_model::entities::VideoType::VideoFile;
-            (demoted, std::cmp::Reverse(item.width.unwrap_or(0)))
-        })
-        .map_or(0, |(index, _)| index)
 }
 
 /// The prefix the media source items' file names share, or `None` when

@@ -19,6 +19,13 @@
 //! controller's `FirstOrDefault(i => string.Equals(i.Id, taskId, …))` lookup.
 //!
 //! Reuses the `ferrofin-model` wire DTO [`TaskInfo`] verbatim.
+//!
+//! It also holds the task contract itself, [`ScheduledTask`] and the
+//! [`TaskProgress`] each run gets, which core tasks, compiled-in extensions
+//! and WASM plugins all implement, so none of them needs `ferrofin-core`.
+
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use async_trait::async_trait;
 use ferrofin_model::tasks::{TaskInfo, TaskTriggerInfo};
@@ -157,6 +164,305 @@ pub trait TaskManager: Send + Sync {
 }
 
 fn _assert_object_safe_task_manager(_: &dyn TaskManager) {}
+
+/// Stops a running scan cooperatively, as upstream's `CancellationToken`
+/// does. The scan checks it between two items, around each stored-row
+/// window it reads and plans, between its closing passes and inside the
+/// long ones. It races it against every wait of the item in progress: the
+/// ones before anything is written (its probe, its metadata providers) end
+/// the item unwritten, and a cancel inside its artwork pass (image
+/// providers, cover extraction) stops the fetches where they stand and
+/// saves the item with the artwork already on disk. A cancel after the
+/// item's row was saved leaves the row without its refresh stamp, so an item
+/// is written whole, not at all, or as far as it got for the next scan to
+/// redo; and a hung ffprobe or provider cannot keep a cancelled scan alive.
+///
+/// It is also each scheduled task run's token ([`TaskProgress::cancel_token`]).
+#[derive(Debug, Clone)]
+pub struct ScanCancel(Arc<tokio::sync::watch::Sender<bool>>);
+
+impl Default for ScanCancel {
+    fn default() -> Self {
+        Self(Arc::new(tokio::sync::watch::Sender::new(false)))
+    }
+}
+
+impl ScanCancel {
+    /// A token nobody has cancelled yet.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Asks the scan to stop.
+    pub fn cancel(&self) {
+        self.0.send_replace(true);
+    }
+
+    /// Whether the scan was asked to stop.
+    #[must_use]
+    pub fn is_cancelled(&self) -> bool {
+        *self.0.borrow()
+    }
+
+    /// Resolves once the scan is asked to stop.
+    pub async fn cancelled(&self) {
+        let mut asked = self.0.subscribe();
+        // The sender lives as long as `self`, so this never errors.
+        let _ = asked.wait_for(|cancelled| *cancelled).await;
+    }
+
+    /// Runs `work` unless the scan is asked to stop first; `None` when it
+    /// was (and `work` is dropped where it stood).
+    pub async fn unless_cancelled<T>(
+        &self,
+        work: impl std::future::Future<Output = T>,
+    ) -> Option<T> {
+        tokio::select! {
+            biased;
+            () = self.cancelled() => None,
+            done = work => Some(done),
+        }
+    }
+}
+
+/// A live handle a running task uses to report its completion percentage.
+///
+/// Port of the C# `IProgress<double>` each `IScheduledTask.ExecuteAsync`
+/// receives; the registry surfaces the last reported value as
+/// [`TaskInfo::current_progress_percentage`] while the task is running, and
+/// nothing before its first report (upstream's `CurrentProgress` stays null
+/// until `ScheduledTaskWorker.OnProgressChanged` sets it).
+#[derive(Clone, Debug, Default)]
+pub struct TaskProgress {
+    /// The current percentage, stored as `f64` bits.
+    percent: Arc<AtomicU64>,
+    /// Set by the first [`report`](Self::report).
+    reported: Arc<AtomicBool>,
+    /// Set by [`stopped`](Self::stopped).
+    stopped: Arc<AtomicBool>,
+    /// The run's cancellation token (upstream's `CurrentCancellationTokenSource`),
+    /// cancelled by Stop, the run's max runtime and shutdown.
+    cancel: ScanCancel,
+    /// Why the run started (`api`, `schedule`, `startup`); empty for a
+    /// test's foreground `FerrofinTaskManager::run_now`.
+    trigger: &'static str,
+    /// The registry's progress signal, raised by [`report`](Self::report)
+    /// (upstream's `TaskProgress` event); `None` outside a registry run.
+    progressed: Option<tokio::sync::broadcast::Sender<()>>,
+}
+
+impl TaskProgress {
+    /// A fresh handle for one registry run, whose reports raise `progressed`
+    /// (for the task registry; a task body only uses the handle it is given).
+    #[must_use]
+    pub fn for_run(progressed: tokio::sync::broadcast::Sender<()>) -> Self {
+        Self {
+            progressed: Some(progressed),
+            ..Self::default()
+        }
+    }
+
+    /// This handle, recording why its run started (see
+    /// [`trigger`](Self::trigger)).
+    #[must_use]
+    pub fn with_trigger(self, trigger: &'static str) -> Self {
+        Self { trigger, ..self }
+    }
+
+    /// Whether `other` is a clone of this handle, so both belong to the same
+    /// run: the registry gives each run a fresh handle and checks it with this.
+    #[must_use]
+    pub fn is_same_run(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.stopped, &other.stopped)
+    }
+
+    /// Why this run started: the registry's trigger tag (`api` for the
+    /// dashboard or `StartTask`, `schedule` for a configured trigger,
+    /// `startup` for a startup trigger), or `""` when it has none (a test's
+    /// foreground `FerrofinTaskManager::run_now`).
+    #[must_use]
+    pub fn trigger(&self) -> &'static str {
+        self.trigger
+    }
+
+    /// Marks the run as stopped before its work finished, so it is recorded
+    /// [`Cancelled`](ferrofin_model::tasks::TaskCompletionStatus::Cancelled) rather than
+    /// `Completed` — upstream's `ExecuteAsync` throwing
+    /// `OperationCanceledException` (`ScheduledTaskWorker.ExecuteInternal`).
+    pub fn stopped(&self) {
+        self.stopped.store(true, Ordering::Relaxed);
+    }
+
+    /// Whether the run was marked [`stopped`](Self::stopped), which the
+    /// registry records as `Cancelled`.
+    #[must_use]
+    pub fn was_stopped(&self) -> bool {
+        self.stopped.load(Ordering::Relaxed)
+    }
+
+    /// The run's cancellation token, for the work a body hands it to (the
+    /// chapter-image extractor, the subtitle downloader): upstream's
+    /// `CancellationToken` argument of `ExecuteAsync`.
+    #[must_use]
+    pub fn cancel_token(&self) -> &ScanCancel {
+        &self.cancel
+    }
+
+    /// Whether the run was asked to stop (Stop, its max runtime, shutdown).
+    /// Once it says so the run counts as [`stopped`](Self::stopped), so a
+    /// body that then returns `Ok` is recorded `Cancelled`: upstream's
+    /// `cancellationToken.ThrowIfCancellationRequested()`.
+    #[must_use]
+    pub fn stop_requested(&self) -> bool {
+        let requested = self.cancel.is_cancelled();
+        if requested {
+            self.stopped();
+        }
+        requested
+    }
+
+    /// Reports the task's completion percentage, capped at 100 with no lower
+    /// bound, and raises the registry's progress signal, as upstream's
+    /// `ScheduledTaskWorker.OnProgressChanged` caps it (`Math.Min(e, 100)`,
+    /// which keeps a NaN) and raises `TaskProgress` on every report.
+    pub fn report(&self, percent: f64) {
+        // Not `f64::min`, which turns a NaN into 100.
+        let capped = if percent > 100.0 { 100.0 } else { percent };
+        self.percent.store(capped.to_bits(), Ordering::Relaxed);
+        // Release: whoever sees the flag sees this report's percentage.
+        self.reported.store(true, Ordering::Release);
+        if let Some(progressed) = &self.progressed {
+            // Nobody subscribed is not an error.
+            let _ = progressed.send(());
+        }
+    }
+
+    /// Reads the last reported percentage.
+    #[must_use]
+    pub fn current(&self) -> f64 {
+        f64::from_bits(self.percent.load(Ordering::Relaxed))
+    }
+
+    /// The last reported percentage, or `None` before the first report.
+    #[must_use]
+    pub fn reported(&self) -> Option<f64> {
+        self.reported
+            .load(Ordering::Acquire)
+            .then(|| self.current())
+    }
+}
+
+/// A unit of background work the registry can enumerate, schedule and run.
+///
+/// Port of `MediaBrowser.Model.Tasks.IScheduledTask`. A task advertises stable
+/// metadata, default triggers and an idempotent
+/// [`execute`](ScheduledTask::execute) body; the registry — not the task — owns
+/// run state, history and scheduling.
+#[async_trait]
+pub trait ScheduledTask: Send + Sync {
+    /// A stable, unique key identifying the task (the C# `ScheduledTask.Key`).
+    ///
+    /// Used as the registry map key and echoed into [`TaskInfo::key`]/`id`.
+    fn key(&self) -> &str;
+
+    /// The task's human-readable display name, or its localization key when
+    /// [`is_localized`](ScheduledTask::is_localized).
+    fn name(&self) -> &str;
+
+    /// A one-line description of what the task does, or its localization key
+    /// when [`is_localized`](ScheduledTask::is_localized).
+    fn description(&self) -> &str;
+
+    /// The category the task is grouped under in the UI, or its localization
+    /// key when [`is_localized`](ScheduledTask::is_localized).
+    fn category(&self) -> &str;
+
+    /// Whether [`name`](ScheduledTask::name),
+    /// [`description`](ScheduledTask::description) and
+    /// [`category`](ScheduledTask::category) are keys into the core
+    /// localization dictionaries rather than display text.
+    ///
+    /// The registry then shows each in the ambient UI culture, as upstream's
+    /// core tasks return `_localization.GetLocalizedString("<key>")`. Defaults
+    /// to `false`: extension and WASM tasks show their own strings, as
+    /// upstream plugins localize themselves, and so do the two core tasks
+    /// upstream leaves as literals (`RefreshGuide`,
+    /// `TmdbRefreshUpcomingEpisodes`).
+    fn is_localized(&self) -> bool {
+        false
+    }
+
+    /// The value formatted into a localized description's `{0}`, as
+    /// upstream's `string.Format(GetLocalizedString(key), value)`. Only
+    /// `CleanLogFiles` has one.
+    fn description_argument(&self) -> Option<String> {
+        None
+    }
+
+    /// Whether the task is hidden from the normal task listing.
+    ///
+    /// Defaults to `false`; hidden tasks are still runnable by key.
+    fn is_hidden(&self) -> bool {
+        false
+    }
+
+    /// Whether this task implements C# `IConfigurableScheduledTask`.
+    ///
+    /// Load-bearing for `GET /ScheduledTasks`: `ScheduledTasksController.GetTasks`
+    /// applies the `isHidden`/`isEnabled` filters **only** inside
+    /// `if (task.ScheduledTask is IConfigurableScheduledTask scheduledTask)`, so
+    /// a task that does not implement the interface is yielded whatever the
+    /// caller asked for. Exactly nine of Jellyfin 10.11.8's twenty tasks do
+    /// (`CleanActivityLog`, `DeleteCacheFiles`, `CleanLogFiles`,
+    /// `DeleteTranscodeFiles`, `OptimizeDatabaseTask`, `RefreshPeople`,
+    /// `PluginUpdates`, `RefreshGuide`, `RefreshInternetChannels`), so this
+    /// defaults to `false`.
+    fn is_configurable(&self) -> bool {
+        false
+    }
+
+    /// C# `IConfigurableScheduledTask.IsEnabled`.
+    ///
+    /// Only consulted when [`is_configurable`](ScheduledTask::is_configurable)
+    /// is `true`, and only by the `isEnabled` query filter — `TaskInfo` has no
+    /// `IsEnabled` field, so this never reaches the wire. Every configurable
+    /// task in 10.11.8 returns `true`.
+    fn is_enabled(&self) -> bool {
+        true
+    }
+
+    /// The task's default triggers, fired by the scheduler unless overridden
+    /// via [`TaskManager::update_triggers`].
+    fn default_triggers(&self) -> Vec<TaskTriggerInfo> {
+        Vec::new()
+    }
+
+    /// Runs the task to completion, reporting progress through `progress`.
+    ///
+    /// Errors surface as a [`Failed`](ferrofin_model::tasks::TaskCompletionStatus::Failed) result recorded by
+    /// the registry; the returned `Result` also propagates to the caller of
+    /// the test-only `FerrofinTaskManager::run_now`. A panic in the body is recorded the
+    /// same way, as a failure whose error names the panic's message (upstream
+    /// catches every exception the body throws as `Failed`).
+    async fn execute(&self, progress: &TaskProgress) -> Result<(), ServiceError>;
+}
+
+fn _assert_object_safe_scheduled_task(_: &dyn ScheduledTask) {}
+
+/// Where scheduled tasks are registered: the task manager, as a crate that
+/// only contributes tasks (the compiled-in extensions) sees it.
+pub trait TaskRegistry: Send + Sync {
+    /// Registers `task`, replacing any registered task with the same key.
+    fn register(&self, task: Arc<dyn ScheduledTask>);
+}
+
+fn _assert_object_safe_task_registry(_: &dyn TaskRegistry) {}
+
+/// Items examined per page by the library tasks (the upstream
+/// `QueryPageLimit`). The extensions' library walks (Intro Skipper's queue,
+/// Merge Versions) read their rows in pages of the same size.
+pub const PAGE_SIZE: i32 = 100;
 
 // ---------------------------------------------------------------------------
 // Task id derivation (`ScheduledTaskWorker.Id`)

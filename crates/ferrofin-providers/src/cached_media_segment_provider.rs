@@ -101,7 +101,7 @@ impl MediaSegmentProvider for CachedMediaSegmentProvider {
         self.legacy_ids.clone()
     }
     async fn supports(&self, item: &BaseItemEntity) -> Result<bool, ServiceError> {
-        if !crate::item_type_lookup::kind_from_type_name(&item.type_)
+        if !BaseItemKind::from_stored_type_name(&item.type_)
             .is_some_and(|kind| self.kinds.contains(&kind))
         {
             return Ok(false);
@@ -204,5 +204,164 @@ impl MediaSegmentProvider for CachedMediaSegmentProvider {
             self.write(item, segments).await?;
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use ferrofin_model::media_segments::MediaSegmentType;
+    use ferrofin_traits::plugins::DisabledPluginManager;
+
+    use super::*;
+
+    fn segment(item_id: Uuid, type_: MediaSegmentType, start_ticks: i64) -> MediaSegmentDto {
+        MediaSegmentDto {
+            id: Uuid::new_v4(),
+            item_id,
+            type_,
+            start_ticks,
+            end_ticks: start_ticks + 10,
+        }
+    }
+
+    fn provider(dir: &std::path::Path) -> CachedMediaSegmentProvider {
+        CachedMediaSegmentProvider::new(
+            "Producer".to_owned(),
+            Uuid::new_v4(),
+            Arc::new(DisabledPluginManager),
+            vec![BaseItemKind::Episode],
+            dir.join("cache"),
+        )
+    }
+
+    /// The cache replays what a producer stored, falls back to the existing
+    /// rows for an item it never stored, and forgets an item on cleanup.
+    #[tokio::test]
+    async fn the_cache_replays_stored_output_and_forgets_on_cleanup() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cache = provider(dir.path());
+        let (item, other) = (Uuid::new_v4(), Uuid::new_v4());
+        let intro = segment(item, MediaSegmentType::Intro, 0);
+        let existing = vec![segment(other, MediaSegmentType::Outro, 50)];
+
+        cache
+            .cache_segments(item, std::slice::from_ref(&intro))
+            .await
+            .expect("cache");
+        let request = |item_id| MediaSegmentGenerationRequest {
+            item_id,
+            existing_segments: existing.clone(),
+        };
+        assert_eq!(
+            cache.get_segments(&request(item)).await.expect("get"),
+            std::slice::from_ref(&intro)
+        );
+        assert_eq!(
+            cache.get_segments(&request(other)).await.expect("get"),
+            existing
+        );
+        assert!(dir.path().join("cache/producer.json").is_file());
+
+        let outro = segment(item, MediaSegmentType::Outro, 90);
+        cache
+            .mutate_cache(item, &[], &MediaSegmentCacheMutation::Append(outro.clone()))
+            .await
+            .expect("mutate");
+        assert_eq!(
+            cache.cached_segments(item, &[]).await.expect("read"),
+            [intro, outro.clone()]
+        );
+
+        cache
+            .erase_cached_segments(Some(MediaSegmentType::Intro))
+            .await
+            .expect("erase");
+        assert_eq!(
+            cache.cached_segments(item, &[]).await.expect("read"),
+            [outro]
+        );
+
+        cache.cleanup(item).await.expect("cleanup");
+        cache
+            .cleanup(item)
+            .await
+            .expect("a second cleanup finds nothing to remove");
+        assert_eq!(
+            cache.cached_segments(item, &existing).await.expect("read"),
+            existing
+        );
+    }
+
+    /// Stored output is never overwritten by the first-run seed, and an empty
+    /// seed writes nothing.
+    #[tokio::test]
+    async fn initialize_seeds_only_an_item_with_no_stored_output() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cache = provider(dir.path());
+        let item = Uuid::new_v4();
+        cache.initialize_cache(item, &[]).await.expect("empty seed");
+        assert!(!dir.path().join(format!("cache/{item}.json")).exists());
+
+        let first = segment(item, MediaSegmentType::Intro, 0);
+        cache
+            .initialize_cache(item, std::slice::from_ref(&first))
+            .await
+            .expect("seed");
+        let later = segment(item, MediaSegmentType::Intro, 40);
+        cache
+            .initialize_cache(item, &[later])
+            .await
+            .expect("reseed");
+        assert_eq!(
+            cache.cached_segments(item, &[]).await.expect("read"),
+            [first]
+        );
+    }
+
+    /// A producer serves only the kinds it handles, and only while the plugin
+    /// manager reports its plugin enabled: an unknown plugin serves nothing.
+    #[tokio::test]
+    async fn supports_needs_a_handled_kind_and_an_enabled_plugin() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let plugin_id = Uuid::new_v4();
+        let cache = |plugins: Arc<dyn PluginManager>| {
+            CachedMediaSegmentProvider::new(
+                "Producer".to_owned(),
+                plugin_id,
+                plugins,
+                vec![BaseItemKind::Episode],
+                dir.path().join("cache"),
+            )
+            .with_legacy_ids(vec!["wasm:legacy".to_owned()])
+        };
+        let row = |kind: BaseItemKind| BaseItemEntity {
+            type_: kind.stored_type_name().expect("stored type").to_owned(),
+            ..BaseItemEntity::default()
+        };
+        let enabled = cache(crate::plugin_config::tests_support::enabled_plugin(
+            plugin_id,
+        ));
+        assert_eq!(enabled.name(), "Producer");
+        assert_eq!(enabled.legacy_ids(), ["wasm:legacy"]);
+        assert!(
+            enabled
+                .supports(&row(BaseItemKind::Episode))
+                .await
+                .expect("episode")
+        );
+        assert!(
+            !enabled
+                .supports(&row(BaseItemKind::Movie))
+                .await
+                .expect("movie")
+        );
+
+        let unknown = cache(Arc::new(DisabledPluginManager));
+        assert!(
+            !unknown
+                .supports(&row(BaseItemKind::Episode))
+                .await
+                .expect("episode")
+        );
     }
 }
