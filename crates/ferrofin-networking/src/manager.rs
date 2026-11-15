@@ -707,8 +707,8 @@ impl NetworkManager {
     }
 
     /// The address of the client that actually made the request, given the
-    /// transport `peer` and the `X-Forwarded-For` chain (left to right, as
-    /// sent).
+    /// transport `peer` and the `X-Forwarded-For` chain nearest hop first (the
+    /// entries from the right).
     ///
     /// Port of what ASP.NET's `ForwardedHeadersMiddleware` does with the options
     /// C# `ConfigureForwardHeaders` builds:
@@ -725,17 +725,25 @@ impl NetworkManager {
     /// `ForwardLimit` is null upstream once any proxy is configured, so the
     /// whole chain is walkable. `ApplyForwarders` also stops at the first entry
     /// from the right that does not parse; the caller passes the chain already
-    /// ended there (`ferrofin-api`'s `forwarded_for`).
+    /// ended there (`ferrofin-api`'s `forwarded_for`). A hop is taken from the
+    /// chain only once the address before it is trusted, so a lazy chain is
+    /// read no further than the walk goes, and not at all for a peer that is
+    /// not a known proxy.
     #[must_use]
-    pub fn client_address(&self, peer: IpAddr, forwarded_for: &[IpAddr]) -> IpAddr {
+    pub fn client_address(
+        &self,
+        peer: IpAddr,
+        forwarded_for: impl IntoIterator<Item = IpAddr>,
+    ) -> IpAddr {
         if !self.known_proxies.forwarding_enabled() {
             return peer;
         }
+        let mut chain = forwarded_for.into_iter();
         let mut current = peer;
-        let mut remaining = forwarded_for.len();
-        while remaining > 0 && self.is_known_proxy(current) {
-            remaining -= 1;
-            current = forwarded_for[remaining];
+        while self.is_known_proxy(current)
+            && let Some(next) = chain.next()
+        {
+            current = next;
         }
         current
     }
@@ -762,7 +770,7 @@ impl NetworkManager {
 
         // Everything else is a single-IP subnet.
         for ip in remote_ip_filter.iter().filter(|x| !x.contains('/')) {
-            if let Ok(ipp) = ip.parse::<IpAddr>() {
+            if let Some(ipp) = net_utils::try_parse_ip_address(ip) {
                 let prefix = match ipp {
                     IpAddr::V4(_) => net_constants::MINIMUM_IPV4_PREFIX_SIZE,
                     IpAddr::V6(_) => net_constants::MINIMUM_IPV6_PREFIX_SIZE,

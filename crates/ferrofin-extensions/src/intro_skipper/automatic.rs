@@ -314,7 +314,7 @@ impl DetectSegmentsTask {
             let config = self.load_config().await;
             match self.queue(&config, Some(&seasons)).await {
                 Ok(queue) => {
-                    self.analyze_queue(&queue, &config, &TaskProgress::default())
+                    self.analyze_queue(queue, &config, &TaskProgress::default())
                         .await;
                 }
                 Err(err) => {

@@ -418,8 +418,8 @@ pub async fn redirect_to_https(
     let network = redirect.network.as_deref();
     ferrofin_api::response_time::with_response_time(
         config,
-        |peer, forwarded_for| {
-            ferrofin_api::forwarded_headers::client_address_through(network, peer, forwarded_for)
+        |peer, headers| {
+            ferrofin_api::forwarded_headers::client_address_through(network, peer, headers)
         },
         request,
         cors,

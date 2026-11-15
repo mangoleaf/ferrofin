@@ -35,6 +35,9 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use ferrofin_mediaencoding::encoding_helper::helper::{
+    is_mp4_segment_container, segment_file_extension,
+};
 use ferrofin_mediaencoding::keyed_locks::KeyedLocks;
 use ferrofin_mediaencoding::transcoding::manager::StartFfMpegRequest;
 use ferrofin_mediaencoding::transcoding::segment_transcoder::SegmentTranscoder;
@@ -569,7 +572,7 @@ where
         // segment (gl-1254).
         let (playlist_path, segment_container) = self.planner.hls_output(request, is_audio).await?;
         let playlist_key = playlist_path.to_string_lossy().into_owned();
-        let ext = segment_extension(&segment_container);
+        let ext = segment_file_extension(&segment_container);
         let segment_path = segment_file(&playlist_path, segment_id, ext);
         // These are the exact durations the playlist placed in the URL, also
         // for variable keyframe-based remux segments. Missing query values stay 0.
@@ -779,7 +782,7 @@ where
             .planner
             .plan(request, is_audio, Some(0), PlaylistKind::Vod)
             .await?;
-        let ext = segment_extension(&plan.segment_container);
+        let ext = segment_file_extension(&plan.segment_container);
         let init_path = init_segment_file(&plan.playlist_path, ext);
 
         // Start the transcode at the RESUME segment, not segment 0. The fMP4
@@ -1452,7 +1455,7 @@ async fn count_playlist_segments(path: &Path) -> i32 {
 /// `hls/{stem}/{stem}-1.mp4` route the segments already use via
 /// `-hls_base_url`.
 fn live_playlist_text(text: &str, playlist_path: &Path, segment_container: &str) -> String {
-    if !segment_container.trim().eq_ignore_ascii_case("mp4") {
+    if !is_mp4_segment_container(segment_container) {
         return text.to_owned();
     }
     let stem = playlist_path
@@ -1462,30 +1465,6 @@ fn live_playlist_text(text: &str, playlist_path: &Path, segment_container: &str)
     let init_file_name = format!("{stem}-1.mp4");
     let routed_init = format!("hls/{stem}/{init_file_name}");
     text.replace(&init_file_name, &routed_init)
-}
-
-/// The segment file extension for `segment_container` (`.ts` default).
-///
-/// Mirrors `EncodingHelper.GetSegmentFileExtension` and the transcode manager's
-/// own helper so the served path agrees with what ffmpeg wrote.
-fn segment_extension(segment_container: &str) -> &'static str {
-    // ACCEPTED DIVERGENCE, deliberately: upstream's `GetSegmentFileExtension`
-    // is literally `"." + segmentContainer`, so it echoes the client's raw
-    // string. Ferrofin normalises instead, exactly as the planner's
-    // `segment_file_extension`/`hls_segment_type` do when they tell ffmpeg what
-    // to write — otherwise `segmentContainer=TS` (or any unknown container)
-    // makes the serve path look for `out0.TS` while ffmpeg wrote `out0.ts`, a
-    // permanent miss on a case-sensitive filesystem that reads to the client as
-    // a dead transcode.
-    //
-    // The transcode manager's own `segment_file_extension`
-    // (`ferrofin-mediaencoding`, `transcoding/manager.rs`) normalises the same
-    // way; change both together.
-    if segment_container.trim().eq_ignore_ascii_case("mp4") {
-        ".mp4"
-    } else {
-        ".ts"
-    }
 }
 
 /// The on-disk path of segment `index` for `playlist` (`GetSegmentPath`).
@@ -2323,16 +2302,6 @@ mod tests {
         // A line shorter than the tag can never match (the window guard).
         std::fs::write(&pl, "#EXTM3U\n#EXT\n").unwrap();
         assert_eq!(count_playlist_segments(&pl).await, 0);
-    }
-
-    #[test]
-    fn segment_extension_normalises_the_container() {
-        assert_eq!(segment_extension("MP4"), ".mp4");
-        assert_eq!(segment_extension(" mp4 "), ".mp4");
-        // Everything else is mpegts — the planner tells ffmpeg exactly that,
-        // so the serve path must look for the same file.
-        assert_eq!(segment_extension("TS"), ".ts");
-        assert_eq!(segment_extension("webm"), ".ts");
     }
 
     #[tokio::test]
@@ -3880,10 +3849,10 @@ mod tests {
 
     #[test]
     fn segment_extension_and_mime_mapping() {
-        assert_eq!(segment_extension("ts"), ".ts");
-        assert_eq!(segment_extension("mp4"), ".mp4");
-        assert_eq!(segment_extension(""), ".ts");
-        assert_eq!(segment_extension("MP4"), ".mp4");
+        assert_eq!(segment_file_extension("ts"), ".ts");
+        assert_eq!(segment_file_extension("mp4"), ".mp4");
+        assert_eq!(segment_file_extension(""), ".ts");
+        assert_eq!(segment_file_extension("MP4"), ".mp4");
         assert_eq!(mime_for_extension(".m3u8"), "application/vnd.apple.mpegurl");
         assert_eq!(mime_for_extension("ts"), "video/mp2t");
         assert_eq!(mime_for_extension(".aac"), "audio/aac");

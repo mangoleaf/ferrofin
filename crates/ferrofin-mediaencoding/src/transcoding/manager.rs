@@ -15,6 +15,7 @@ use ferrofin_model::entities::HardwareAccelerationType;
 use ferrofin_model::session::TranscodingInfo;
 
 use crate::encoding_helper::EncodingJobInfo;
+use crate::encoding_helper::helper::segment_file_extension;
 
 use super::ffmpeg_log::shown_arguments;
 use super::fs_wait::FsWaiter;
@@ -1150,7 +1151,9 @@ impl<S: SessionReporter, C: FileCleaner> TranscodeManagerImpl<S, C> {
             env,
         };
 
-        let segment_extension = segment_file_extension(state.segment_container.as_deref());
+        let segment_extension =
+            segment_file_extension(state.segment_container.as_deref().unwrap_or_default())
+                .to_owned();
 
         // Tell the session layer what this job is, so the dashboard's transcode
         // panel is not blank. Only meaningful with a device to attach it to.
@@ -1842,20 +1845,6 @@ async fn survive_panic(task: &'static str, failing: &mut bool, pass: impl Future
                 );
             }
         }
-    }
-}
-
-/// The segment file extension for `segment_container` (`.ts` default).
-///
-/// Port of `EncodingHelper.GetSegmentFileExtension` (mirrors the `ferrofin-hls`
-/// helper) so the cache-dir naming here agrees with the playlist generator.
-fn segment_file_extension(segment_container: Option<&str>) -> String {
-    // Case-insensitive, like the `ferrofin-hls` helper: a `segmentContainer=MP4`
-    // request must not have this poll `.ts` while the playlist and ffmpeg use
-    // `.mp4` (the wait would then only ever time out).
-    match segment_container.map(str::trim).filter(|s| !s.is_empty()) {
-        Some(container) if container.eq_ignore_ascii_case("mp4") => ".mp4".to_owned(),
-        _ => ".ts".to_owned(),
     }
 }
 
@@ -3437,16 +3426,9 @@ mod start_ffmpeg_tests {
 
     #[test]
     fn segment_path_mirrors_get_segment_path() {
-        use super::{segment_file_extension, segment_path};
-        let ext = segment_file_extension(Some("ts"));
-        assert_eq!(ext, ".ts");
-        let p = segment_path(Path::new("/cache/abcd.m3u8"), 3, &ext);
+        use super::segment_path;
+        let p = segment_path(Path::new("/cache/abcd.m3u8"), 3, ".ts");
         assert_eq!(p, Path::new("/cache/abcd3.ts"));
-        assert_eq!(segment_file_extension(Some("mp4")), ".mp4");
-        // Case-insensitive, as the playlist side is.
-        assert_eq!(segment_file_extension(Some("MP4")), ".mp4");
-        assert_eq!(segment_file_extension(Some("  ")), ".ts");
-        assert_eq!(segment_file_extension(None), ".ts");
     }
 
     /// The debug line follows `arguments`, which the spawn still gets whole.
