@@ -1932,13 +1932,6 @@ impl SessionManager for ResumeSessions {
     ) -> Result<SessionInfoDto, ServiceError> {
         unimplemented!("fake")
     }
-    async fn update_device_name(
-        &self,
-        _session_id: &str,
-        _reported_device_name: &str,
-    ) -> Result<(), ServiceError> {
-        unimplemented!("fake")
-    }
     async fn on_playback_start(&self, _info: &PlaybackStartInfo) -> Result<(), ServiceError> {
         unimplemented!("fake")
     }

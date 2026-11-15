@@ -222,9 +222,6 @@ impl LiveTvManager for CountingLiveTv {
     async fn get_recording(&self, _id: Uuid) -> Result<Option<BaseItemDto>, ServiceError> {
         unimplemented!("not probed by the gate tests")
     }
-    async fn get_recording_path(&self, _id: Uuid) -> Result<Option<String>, ServiceError> {
-        unimplemented!("not probed by the gate tests")
-    }
     async fn delete_recording(&self, _id: Uuid) -> Result<(), ServiceError> {
         unimplemented!("not probed by the gate tests")
     }

@@ -14,6 +14,7 @@
 use std::collections::HashMap;
 use std::sync::LazyLock;
 
+use ferrofin_util::invariant_float;
 use ferrofin_util::stream_extensions::LineReader;
 use regex::Regex;
 
@@ -278,12 +279,10 @@ fn satip_split(text: &str) -> Option<(&str, &str)> {
     is_double(number).then(|| (number, text[space + 1..].trim_matches([' ', '-'])))
 }
 
-/// `double.TryParse(value, CultureInfo.InvariantCulture, out _)`, through
-/// Rust's float parser. They agree on channel numbers; at the edges Rust also
-/// reads `inf`/`infinity`/`nan` in any case where .NET reads `Infinity` and
-/// `NaN`, and Rust rejects .NET's thousands separators.
+/// `double.TryParse(value, CultureInfo.InvariantCulture, out _)`
+/// ([`invariant_float::parse`]: thousands separators, no `inf`).
 fn is_double(value: &str) -> bool {
-    value.trim().parse::<f64>().is_ok()
+    invariant_float::parse::<f64>(value).is_some()
 }
 
 /// Port of `M3uParser.IsValidChannelNumber`: a number that is not `-1` or `0`.
@@ -362,6 +361,31 @@ mod tests {
         "http://tuner/vox",
         "VOX Schweiz",
         Some("84.0"),
+        None,
+        None
+    )]
+    // `double.TryParse`: a group separator is a number, Rust's `inf` is not.
+    #[case::thousands_tvg_chno(
+        r#"#EXTINF:-1 tvg-chno="1,005",Arte"#,
+        "http://tuner/arte",
+        "Arte",
+        Some("1,005"),
+        None,
+        None
+    )]
+    #[case::inf_is_no_number(
+        r#"#EXTINF:-1 tvg-chno="inf",Arte"#,
+        "http://tuner/arte",
+        "Arte",
+        None,
+        None,
+        None
+    )]
+    #[case::inf_is_no_satip_number(
+        "#EXTINF:-1,Inf Radio",
+        "http://tuner/radio",
+        "Inf Radio",
+        None,
         None,
         None
     )]

@@ -337,15 +337,9 @@ fn localized_texts(rest: &BTreeMap<String, Value>, prefix: &str) -> BTreeMap<Str
 /// fallback. Upstream stores `""` in that case; `None` here has the same
 /// effect, because the merge treats both as empty (`IsNullOrEmpty`).
 fn localized(texts: &BTreeMap<String, String>, language: Option<&str>) -> (Option<String>, String) {
-    // `MetadataLanguageUtils.GetLanguageSubtag`.
     let subtag = language
         .filter(|language| !language.is_empty())
-        .map(|language| {
-            language
-                .split_once('-')
-                .map_or(language, |(subtag, _)| subtag)
-                .to_lowercase()
-        });
+        .map(crate::metadata_merge::language_subtag);
     let suffix = match subtag.as_deref() {
         Some("de") => Some("DE"),
         Some("en") => Some("EN"),
