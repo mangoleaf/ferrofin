@@ -1257,15 +1257,11 @@ pub trait ItemPersistenceService: Send + Sync {
     async fn set_ancestors(&self, item_id: Uuid, ancestor_ids: &[Uuid])
     -> Result<(), ServiceError>;
 
-    /// Persists the image info attached to an item. The `ferrofin-core`
-    /// implementation only confirms the item exists: image rows are written by
-    /// [`Self::save_item_images`] and the `set_item_image*` methods, and nothing
-    /// calls this one. TODO(gl-211): open work item: remove it from the trait.
-    async fn save_images(&self, item: &BaseItemEntity) -> Result<(), ServiceError>;
-
     /// Replaces the item's stored image rows (`BaseItemImageInfos`) with
     /// `images` — the write path the library scan uses to persist discovered
-    /// artwork (posters/backdrops/…) so the image routes can serve it.
+    /// artwork (posters/backdrops/…) so the image routes can serve it. Port of
+    /// `ItemPersistenceService.SaveImagesAsync`, which takes the images from
+    /// the domain item instead.
     ///
     /// The default is a no-op (for stub/fake services). The real service keeps
     /// identical rows, updates changed image metadata, inserts new images and
@@ -2148,11 +2144,16 @@ pub trait ItemPersistenceService: Send + Sync {
         Ok(None)
     }
 
-    /// Port of `UpdateInheritedValues`, which upstream runs at the end of the
-    /// post-scan tasks (`RunPostScanTasks`) to delete the `ItemValuesMap` rows
-    /// of type `InheritedTags`.
-    /// The `ferrofin-core` implementation is a no-op, and nothing calls it.
-    /// TODO(gl-211): open work item: port it and call it, or remove it.
+    /// Port of `UpdateInheritedValues`, which a library validation runs once
+    /// its post-scan tasks are done (`RunPostScanTasks`): deletes every
+    /// `ItemValuesMap` row whose value is of type `InheritedTags` (6), keeping
+    /// the `ItemValues` rows. Ferrofin writes none, and nothing reads them
+    /// (the tag filters read `Tags`); an adopted database may still hold the
+    /// ones Jellyfin saved since its last scan.
+    ///
+    /// # Errors
+    ///
+    /// [`ServiceError::Backend`] on a storage failure.
     async fn update_inherited_values(&self) -> Result<(), ServiceError>;
 }
 

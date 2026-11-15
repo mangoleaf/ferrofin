@@ -7498,15 +7498,18 @@ fn series_programs_query(stored: &StoredSeriesTimer, now: DateTime<Utc>) -> Inte
 }
 
 /// The statement [`FerrofinLiveTvManager::query_program_rows`] runs for
-/// `query`: [`PROGRAM_SELECT`] with its filters, order and page.
+/// `query`: [`PROGRAM_SELECT`] with its filters, order and page. Each guide row
+/// is joined to the programme item the guide refresh stores under its id, which
+/// the order reads as upstream's `ApplyOrder` reads the `LiveTvProgram` items.
 fn program_rows_query(
     query: &InternalItemsQuery,
     now: DateTime<Utc>,
     restrictions: UserRestrictions<'_>,
 ) -> QueryBuilder<Sqlite> {
     let mut qb = QueryBuilder::new(PROGRAM_SELECT);
+    qb.push(r#" LEFT JOIN "BaseItems" item ON item."Id" = p."Id""#);
     push_program_filters(&mut qb, query, now, restrictions);
-    push_program_order(&mut qb, &query.order_by);
+    push_program_order(&mut qb, query);
     push_program_paging(&mut qb, query.limit, query.start_index.unwrap_or(0));
     qb
 }
@@ -7524,14 +7527,13 @@ fn push_separator(qb: &mut QueryBuilder<Sqlite>, first: &mut bool) {
 /// `BaseItemRepository.TranslateQuery`: the channel scope, the start/end date
 /// window (with `HasAired` *overriding* the end-date bounds exactly as upstream
 /// does), the airing flag, the exact-name scope `librarySeriesId` sets, and the
-/// genre scope.
+/// genre scopes, by name and by id.
 ///
 /// The classification flags (`IsMovie`/`IsSeries`/`IsNews`/`IsKids`/`IsSports`)
 /// match the columns the guide refresh derives per listings provider.
-/// `GenreIds` is deliberately not faked — it needs genre identity rows the
-/// guide cache does not hold — and `SeriesTimerId` never reaches this builder:
-/// `get_programs` answers it with the empty result upstream returns when the
-/// series-timer scope cannot be built.
+/// `SeriesTimerId` never reaches this builder: `get_programs` answers it with
+/// the empty result upstream returns when the series-timer scope cannot be
+/// built.
 ///
 /// `restrictions` are the user's parental restrictions, from
 /// [`FerrofinLiveTvManager::user_restrictions`].
@@ -7644,11 +7646,26 @@ fn push_program_filters(
         }
     }
 
+    push_program_genres(qb, query, &mut first);
+
+    if let Some(restrictions) = restrictions {
+        push_separator(qb, &mut first);
+        crate::guide_repository::push_item_restrictions(qb, r#"p."Id""#, restrictions);
+    }
+}
+
+/// Pushes the genre scopes of a program query: by name and by id, each
+/// keeping the airings with any one of the requested genres.
+fn push_program_genres(
+    qb: &mut QueryBuilder<Sqlite>,
+    query: &InternalItemsQuery,
+    first: &mut bool,
+) {
     if !query.genres.is_empty() {
         // `Genres` holds the XMLTV `<category>` list as a JSON array; upstream
         // matches any one of the requested genres by clean value
         // (`TranslateQuery.cs:658-662`).
-        push_separator(qb, &mut first);
+        push_separator(qb, first);
         qb.push(
             r#"EXISTS (SELECT 1 FROM json_each(p."Genres") WHERE ferrofin_clean_value("value") IN ("#,
         );
@@ -7659,48 +7676,179 @@ fn push_program_filters(
         qb.push("))");
     }
 
-    if let Some(restrictions) = restrictions {
-        push_separator(qb, &mut first);
-        crate::guide_repository::push_item_restrictions(qb, r#"p."Id""#, restrictions);
+    if !query.genre_ids.is_empty() {
+        // `WhereReferencedItem(Genre, GenreIds)` (v12.4 TranslateQuery.cs:653-656,
+        // JellyfinQueryHelperExtensions.cs:130-152): the airings whose stored
+        // item has a genre value equal to the clean name of a referenced item.
+        // The guide refresh writes an airing's genres as `ItemValues` under the
+        // guide row's id, so an airing whose item is not stored yet is not
+        // listed, as upstream lists only the stored items.
+        push_separator(qb, first);
+        qb.push(
+            r#"EXISTS (SELECT 1 FROM "ItemValuesMap" ivm JOIN "ItemValues" iv ON iv."ItemValueId" = ivm."ItemValueId" WHERE ivm."ItemId" = p."Id" AND iv."Type" = "#,
+        )
+        .push_bind(i32::from(ferrofin_db::enums::ItemValueType::Genre))
+        .push(r#" AND iv."CleanValue" IN (SELECT ref."CleanName" FROM "BaseItems" ref WHERE ref."Id" IN ("#);
+        let mut list = qb.separated(",");
+        for id in ferrofin_db::padded_in_list(&query.genre_ids) {
+            list.push_bind(guid_to_db(*id));
+        }
+        qb.push(")))");
     }
 }
 
-/// The guide column a sort key reads, or `None` when the guide cache holds
-/// nothing to sort by (those keys are skipped rather than faked).
-fn program_sort_column(sort: ItemSortBy) -> Option<&'static str> {
-    match sort {
-        ItemSortBy::Default | ItemSortBy::StartDate => Some(r#"p."StartDate""#),
-        ItemSortBy::Name | ItemSortBy::SortName => Some(r#"p."Title""#),
-        ItemSortBy::OfficialRating => Some(r#"p."OfficialRating""#),
-        ItemSortBy::ProductionYear => Some(r#"p."ProductionYear""#),
-        ItemSortBy::Random => Some("RANDOM()"),
-        _ => None,
-    }
-}
-
-/// Pushes the `ORDER BY` clause, falling back to start-date ascending — the
-/// order C# `LiveTvManager.GetPrograms` relies on ("order by start date to take
-/// advantage of a specialized index"). The id tiebreaker makes paging stable
-/// across requests.
-fn push_program_order(qb: &mut QueryBuilder<Sqlite>, order_by: &[(ItemSortBy, SortOrder)]) {
-    let mut wrote = false;
-    for (column, order) in order_by {
-        let Some(sql) = program_sort_column(*column) else {
-            continue;
-        };
-        qb.push(if wrote { ", " } else { " ORDER BY " })
-            .push(sql)
-            .push(if *order == SortOrder::Descending {
-                " DESC"
-            } else {
+/// Pushes the `ORDER BY` clause. With no key sent, C#
+/// `LiveTvManager.GetPrograms` orders by start date "to take advantage of a
+/// specialized index"; then `BaseItemRepository.ApplyOrder` (v12.4
+/// QueryBuilding.cs:306-384) orders the stored programme items:
+/// - `Default` is dropped, and no key left sorts by `SortName` alone;
+/// - a leading `SortName` is followed by `Name` in its direction;
+/// - `SortName` ascending breaks the last ties unless `SortName` or `Name` was
+///   asked for;
+/// - a `SeriesDatePlayed` key hands the order to `ApplySeriesDatePlayedOrder`:
+///   the played date of the series the row is, which no programme is, then
+///   `SortName` ascending.
+///
+/// Each key is [`push_program_sort_key`]. No id key follows, as none does
+/// upstream: a third key after `StartDate, SortName` tips SQLite's sort-cost
+/// estimate, and the default order then scans and sorts the whole guide
+/// instead of walking its start-date index and sorting each start's ties.
+fn push_program_order(qb: &mut QueryBuilder<Sqlite>, query: &InternalItemsQuery) {
+    let start_date = [(ItemSortBy::StartDate, SortOrder::Ascending)];
+    let requested = if query.order_by.is_empty() {
+        &start_date[..]
+    } else {
+        &query.order_by[..]
+    };
+    let keys: Vec<&(ItemSortBy, SortOrder)> = requested
+        .iter()
+        .filter(|(by, _)| *by != ItemSortBy::Default)
+        .collect();
+    qb.push(" ORDER BY ");
+    if keys.is_empty()
+        || keys
+            .iter()
+            .any(|(by, _)| *by == ItemSortBy::SeriesDatePlayed)
+    {
+        qb.push(r#"item."SortName""#);
+    } else {
+        let user = query.user_id().map(guid_to_db);
+        for (index, (by, order)) in keys.iter().enumerate() {
+            if index > 0 {
+                qb.push(", ");
+            }
+            // `SortOrder == Ascending ? ThenBy : ThenByDescending`.
+            let direction = if *order == SortOrder::Ascending {
                 " ASC"
-            });
-        wrote = true;
+            } else {
+                " DESC"
+            };
+            push_program_sort_key(qb, *by, user.as_deref());
+            qb.push(direction);
+            if index == 0 && *by == ItemSortBy::SortName {
+                qb.push(r#", item."Name""#).push(direction);
+            }
+        }
+        if keys
+            .iter()
+            .all(|(by, _)| !matches!(by, ItemSortBy::SortName | ItemSortBy::Name))
+        {
+            qb.push(r#", item."SortName" ASC"#);
+        }
     }
-    if !wrote {
-        qb.push(r#" ORDER BY p."StartDate" ASC"#);
+}
+
+/// Pushes what C# `OrderMapper.MapOrderByField` (v12.4 OrderMapper.cs:30-90)
+/// sorts `by` on, over the stored programme item `item`, as the item
+/// repository's `translate_query` maps it for `/Items`.
+///
+/// `StartDate` reads the guide row, which holds the same instant and carries
+/// the index the default order walks. The user-data keys read `user`'s rows;
+/// without a user, `DatePlayed` reads every user's, as upstream's does, and
+/// the others fall back to `SortName` as `/Items` does (upstream reads the
+/// missing user's id and fails). A programme is never a folder and has no
+/// alternate versions, so its played date is its own rows' and it is played
+/// when its own row says so.
+fn push_program_sort_key(qb: &mut QueryBuilder<Sqlite>, by: ItemSortBy, user: Option<&str>) {
+    use ferrofin_db::enums::ItemValueType;
+
+    if by == ItemSortBy::DatePlayed {
+        qb.push(
+            r#"(SELECT MAX(ud."LastPlayedDate") FROM "UserData" ud WHERE ud."ItemId" = item."Id""#,
+        );
+        if let Some(user) = user {
+            qb.push(r#" AND ud."UserId" = "#).push_bind(user.to_owned());
+        }
+        qb.push(")");
+        return;
     }
-    qb.push(r#", p."Id""#);
+    if let Some(user) = user {
+        let (head, tail) = match by {
+            ItemSortBy::IsPlayed => ("(SELECT COUNT(*) > 0", r#" AND ud."Played" = 1)"#),
+            ItemSortBy::IsUnplayed => ("(SELECT COUNT(*) = 0", r#" AND ud."Played" = 1)"#),
+            // `UserData.Where(user).OrderBy(CustomDataKey).FirstOrDefault()`.
+            ItemSortBy::PlayCount => (
+                r#"(SELECT ud."PlayCount""#,
+                r#" ORDER BY ud."CustomDataKey" LIMIT 1)"#,
+            ),
+            // `… .Select((bool?)f.IsFavorite).FirstOrDefault() ?? false`.
+            ItemSortBy::IsFavoriteOrLiked => (
+                r#"COALESCE((SELECT ud."IsFavorite""#,
+                r#" ORDER BY ud."CustomDataKey" LIMIT 1), 0)"#,
+            ),
+            _ => ("", ""),
+        };
+        if !head.is_empty() {
+            qb.push(head)
+                .push(r#" FROM "UserData" ud WHERE ud."ItemId" = item."Id" AND ud."UserId" = "#)
+                .push_bind(user.to_owned())
+                .push(tail);
+            return;
+        }
+    }
+    // The first value of the type by its clean text.
+    let value_type = match by {
+        ItemSortBy::Artist => Some(ItemValueType::Artist),
+        ItemSortBy::AlbumArtist => Some(ItemValueType::AlbumArtist),
+        ItemSortBy::Studio => Some(ItemValueType::Studios),
+        _ => None,
+    };
+    if let Some(value_type) = value_type {
+        qb.push(format_args!(
+            r#"(SELECT iv."CleanValue" FROM "ItemValuesMap" ivm
+                CROSS JOIN "ItemValues" iv ON iv."ItemValueId" = ivm."ItemValueId"
+                WHERE ivm."ItemId" = item."Id" AND iv."Type" = {}
+                ORDER BY iv."CleanValue" LIMIT 1)"#,
+            i32::from(value_type)
+        ));
+        return;
+    }
+    qb.push(match by {
+        ItemSortBy::StartDate => r#"p."StartDate""#,
+        ItemSortBy::Random => ferrofin_db::sqlite_random::RANDOM_SQL_EXPR,
+        ItemSortBy::Runtime => r#"item."RunTimeTicks""#,
+        ItemSortBy::DateCreated => r#"item."DateCreated""#,
+        ItemSortBy::DateLastContentAdded => r#"item."DateLastMediaAdded""#,
+        // `PremiereDate ?? MinValue.AddYears(ProductionYear - 1)`.
+        ItemSortBy::PremiereDate => {
+            r#"COALESCE(item."PremiereDate",
+                CASE WHEN item."ProductionYear" IS NOT NULL
+                     THEN printf('%04d-01-01 00:00:00.0000000', item."ProductionYear") END)"#
+        }
+        ItemSortBy::Album => r#"item."Album""#,
+        ItemSortBy::CommunityRating => r#"item."CommunityRating""#,
+        ItemSortBy::CriticRating => r#"item."CriticRating""#,
+        ItemSortBy::ProductionYear => r#"item."ProductionYear""#,
+        ItemSortBy::VideoBitRate => r#"item."TotalBitrate""#,
+        ItemSortBy::ParentIndexNumber => r#"item."ParentIndexNumber""#,
+        ItemSortBy::IndexNumber => r#"item."IndexNumber""#,
+        ItemSortBy::IsFolder => r#"item."IsFolder""#,
+        ItemSortBy::OfficialRating => r#"item."InheritedParentalRatingValue""#,
+        ItemSortBy::SeriesSortName => r#"item."SeriesName""#,
+        ItemSortBy::Name => r#"item."CleanName""#,
+        // `AirTime`'s arm and `_ => e.SortName`.
+        _ => r#"item."SortName""#,
+    });
 }
 
 /// Pushes `LIMIT`/`OFFSET` for the requested page.
@@ -8271,6 +8419,7 @@ mod tests {
     mod channel_list;
     mod guide_mirror;
     mod keep_up_to;
+    mod program_list;
     mod recording_folders;
     mod schedules_direct;
 
@@ -11948,8 +12097,30 @@ mod tests {
         let expected = dir.path().join("recording.ts").display().to_string();
         assert_eq!(
             mgr.active_recording_paths().await.expect("paths"),
-            vec![expected]
+            vec![expected.clone()]
         );
+        // `Video.IsActiveRecording`, the one check every caller makes.
+        for (path, recording) in [
+            (expected, true),
+            (dir.path().join("stopping.ts").display().to_string(), false),
+            (dir.path().join("finished.ts").display().to_string(), false),
+            (dir.path().join("elsewhere.ts").display().to_string(), false),
+            (String::new(), false),
+        ] {
+            assert_eq!(
+                mgr.is_active_recording(&path).await.expect("lookup"),
+                recording,
+                "{path:?}"
+            );
+        }
+        // A failed lookup is the caller's to handle; a blank path is never
+        // looked up, as upstream returns null for it.
+        mgr.db.pool().close().await;
+        let recording = dir.path().join("recording.ts").display().to_string();
+        assert!(mgr.is_active_recording(&recording).await.is_err());
+        for blank in ["", "  "] {
+            assert!(!mgr.is_active_recording(blank).await.expect("no lookup"));
+        }
     }
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn cancelling_a_timer_mid_capture_releases_it_on_a_real_runtime() {
@@ -12666,13 +12837,12 @@ mod tests {
                 limit: Some(100),
                 ..InternalItemsQuery::default()
             };
-            let mut qb = sqlx::QueryBuilder::new(super::PROGRAM_SELECT);
-            super::push_program_filters(&mut qb, &query, now, None);
-            super::push_program_order(&mut qb, &query.order_by);
-            super::push_program_paging(&mut qb, query.limit, 0);
-            let plan = crate::guide_repository::test_support::plan(&mgr.db, qb)
-                .await
-                .expect("plan");
+            let plan = crate::guide_repository::test_support::plan(
+                &mgr.db,
+                super::program_rows_query(&query, now, None),
+            )
+            .await
+            .expect("plan");
             plans.push((n, plan));
         }
         assert!(
@@ -12883,16 +13053,20 @@ mod tests {
         assert_eq!(all.start_index, 0);
     }
 
+    /// The sort reads the stored programme items, as upstream's does, so the
+    /// guide is refreshed with an item store.
     #[tokio::test]
     async fn program_query_sorts_filters_by_genre_and_by_name() {
-        let mgr = manager_with_relative_guide().await;
+        let lab = item_lab(M3U, Some(relative_guide())).await;
+        lab.mgr.refresh_guide().await.expect("refresh");
+        let mgr = &lab.mgr;
 
         let descending = InternalItemsQuery {
             order_by: vec![(ItemSortBy::StartDate, SortOrder::Descending)],
             ..InternalItemsQuery::default()
         };
         assert_eq!(
-            titles(&mgr, &descending).await,
+            titles(mgr, &descending).await,
             ["Later", "Two Now", "Now Playing", "Aired"]
         );
 
@@ -12901,7 +13075,7 @@ mod tests {
             ..InternalItemsQuery::default()
         };
         assert_eq!(
-            titles(&mgr, &by_title).await,
+            titles(mgr, &by_title).await,
             ["Aired", "Later", "Now Playing", "Two Now"]
         );
 
@@ -12910,14 +13084,14 @@ mod tests {
             genres: vec!["news".to_owned()],
             ..InternalItemsQuery::default()
         };
-        assert_eq!(titles(&mgr, &news).await, ["Aired", "Two Now"]);
+        assert_eq!(titles(mgr, &news).await, ["Aired", "Two Now"]);
 
         // The exact-name scope `librarySeriesId` sets.
         let named = InternalItemsQuery {
             name: Some("two now".to_owned()),
             ..InternalItemsQuery::default()
         };
-        assert_eq!(titles(&mgr, &named).await, ["Two Now"]);
+        assert_eq!(titles(mgr, &named).await, ["Two Now"]);
     }
 
     /// Name and genre filters compare clean values on both sides, as upstream

@@ -6013,9 +6013,6 @@ mod tests {
         async fn set_ancestors(&self, _: Uuid, _: &[Uuid]) -> Result<(), ServiceError> {
             Ok(())
         }
-        async fn save_images(&self, _: &BaseItemEntity) -> Result<(), ServiceError> {
-            Ok(())
-        }
         async fn reattach_user_data(&self, _: &BaseItemEntity) -> Result<(), ServiceError> {
             Ok(())
         }
