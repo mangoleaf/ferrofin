@@ -296,7 +296,9 @@ impl FerrofinServerApplicationHost {
     /// is already a URL (`http…`) is returned trimmed; otherwise its
     /// `UriBuilder` brackets a host containing `:` and not already bracketed,
     /// and writes a port whenever one is given, the scheme's default (`:80`,
-    /// `:443`) included; `None` is `UriBuilder.Port = -1`, no port.
+    /// `:443`) included; `None` is `UriBuilder.Port = -1`, no port. The base
+    /// URL is escaped as `UriBuilder.Path` escapes it (`/my%20jellyfin`), a
+    /// backslash aside (`escape_base_url`).
     fn format_api_url(&self, scheme: &str, hostname: &str, port: Option<u16>) -> String {
         if hostname.to_ascii_lowercase().starts_with("http://")
             || hostname.to_ascii_lowercase().starts_with("https://")
@@ -309,7 +311,8 @@ impl FerrofinServerApplicationHost {
             hostname.to_owned()
         };
         let port = port.map(|port| format!(":{port}")).unwrap_or_default();
-        let base = self.network.base_url.trim_end_matches('/');
+        let base =
+            ferrofin_networking::escape_base_url(self.network.base_url.trim_end_matches('/'));
         format!("{scheme}://{hostname}{port}{base}")
             .trim_end_matches('/')
             .to_owned()
@@ -593,6 +596,22 @@ mod tests {
             h.build_local_api_url("host", None, Some(8096)),
             "http://host:8096/jellyfin"
         );
+    }
+
+    /// gl-1685: `UriBuilder.Path` escapes the base URL, and keeps an escape it
+    /// already holds (Jellyfin 12.4's discovery `Address`, probed live).
+    #[rstest::rstest]
+    #[case::space("/my jellyfin", "http://host:8096/my%20jellyfin")]
+    #[case::non_ascii("/m\u{e9}dias", "http://host:8096/m%C3%A9dias")]
+    #[case::already_escaped("/my%20jellyfin", "http://host:8096/my%20jellyfin")]
+    #[tokio::test]
+    async fn base_url_is_escaped(#[case] base_url: &str, #[case] expected: &str) {
+        let h = host(HostNetworkInfo {
+            base_url: base_url.to_owned(),
+            ..Default::default()
+        })
+        .await;
+        assert_eq!(h.build_local_api_url("host", None, Some(8096)), expected);
     }
 
     #[tokio::test]

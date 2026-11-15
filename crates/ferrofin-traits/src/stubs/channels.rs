@@ -30,13 +30,19 @@ pub trait ChannelManager: Send + Sync {
         id: Option<uuid::Uuid>,
     ) -> Result<Vec<ChannelFeatures>, ServiceError>;
 
-    /// Lists the available channels as item DTOs.
+    /// Lists the available channels as item DTOs. Upstream's
+    /// `ChannelsController.GetChannels` calls it; Ferrofin's `/Channels`
+    /// handler answers without it (TODO(parity, gl-298), see `ferrofin-api`'s
+    /// `handlers/channels.rs`).
     async fn get_channels(
         &self,
         query: &ChannelQuery,
     ) -> Result<QueryResult<BaseItemDto>, ServiceError>;
 
-    /// Lists the items inside a channel.
+    /// Lists the items inside a channel. Upstream's
+    /// `ChannelsController.GetChannelItems` calls it; Ferrofin's
+    /// `/Channels/{channelId}/Items` handler answers without it
+    /// (TODO(parity, gl-298), see `ferrofin-api`'s `handlers/channels.rs`).
     async fn get_channel_items(
         &self,
         query: &InternalItemsQuery,

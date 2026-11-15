@@ -45,6 +45,11 @@ use uuid::Uuid;
 use crate::db_error::db_err;
 use crate::item_type_lookup::stored_type_name;
 
+// The readers live in `ferrofin-db`, so the crates beside core share them.
+pub use ferrofin_db::item_data::{
+    VideoFormat, parse_data, read_data_f64, read_data_i32, read_data_string, video_format,
+};
+
 /// One entry of the `LinkedChildren` array (C# `LinkedChild`).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "PascalCase")]
@@ -91,18 +96,6 @@ pub(crate) const LINKED_ALTERNATE_VERSION: i64 = 3;
 #[must_use]
 pub fn json_guid(id: Uuid) -> String {
     id.simple().to_string()
-}
-
-/// Parses a `Data` column value into its JSON object, tolerating `NULL`,
-/// empty, and malformed payloads (each yields an empty object).
-#[must_use]
-pub fn parse_data(data: Option<&str>) -> Map<String, Value> {
-    data.and_then(|d| serde_json::from_str::<Value>(d).ok())
-        .and_then(|v| match v {
-            Value::Object(map) => Some(map),
-            _ => None,
-        })
-        .unwrap_or_default()
 }
 
 /// The `CollectionType` a row's `Data` stores, lower-cased: how a library's
@@ -458,20 +451,6 @@ pub fn merge_data_fields(data: Option<&str>, fields: &[(&str, Option<Value>)]) -
     serde_json::to_string(&Value::Object(object)).ok()
 }
 
-/// A video's format as its `Data` stores it: `Video.VideoType` (the
-/// `VideoFile` default when the blob names none), `IsoType` and
-/// `Video3DFormat`, each serialized by name (`BaseItemMapper` keeps them in
-/// the blob, not in a column).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct VideoFormat {
-    /// `Video.VideoType`.
-    pub video_type: ferrofin_model::entities::VideoType,
-    /// `Video.IsoType`, for a disc image.
-    pub iso_type: Option<ferrofin_model::entities::IsoType>,
-    /// `Video.Video3DFormat`, for a 3D video.
-    pub video3d_format: Option<ferrofin_model::entities::Video3DFormat>,
-}
-
 /// `BaseItem.Container`: the container a probe stored in `data`
 /// (`FFProbeVideoInfo`/`AudioFileProber`), if any. The text is read first: a
 /// blob with no `"Container"` key is not parsed.
@@ -479,33 +458,6 @@ pub struct VideoFormat {
 pub fn stored_container(data: Option<&str>) -> Option<String> {
     let text = data.filter(|text| text.contains("\"Container\""))?;
     read_data_string(&parse_data(Some(text)), "Container").filter(|c| !c.is_empty())
-}
-
-/// The [`VideoFormat`] `data` stores. The text is read first: a blob naming
-/// no disc, image or 3D format — nearly every video's — is not parsed.
-#[must_use]
-pub fn video_format(data: Option<&str>) -> VideoFormat {
-    let plain = VideoFormat {
-        video_type: ferrofin_model::entities::VideoType::VideoFile,
-        iso_type: None,
-        video3d_format: None,
-    };
-    let Some(text) = data.filter(|t| {
-        ["Video3DFormat", "\"BluRay\"", "\"Dvd\"", "\"Iso\""]
-            .iter()
-            .any(|needle| t.contains(needle))
-    }) else {
-        return plain;
-    };
-    let data = parse_data(Some(text));
-    let field = |key: &str| data.get(key).cloned().filter(|v| !v.is_null());
-    VideoFormat {
-        video_type: field("VideoType")
-            .and_then(|v| serde_json::from_value(v).ok())
-            .unwrap_or(plain.video_type),
-        iso_type: field("IsoType").and_then(|v| serde_json::from_value(v).ok()),
-        video3d_format: field("Video3DFormat").and_then(|v| serde_json::from_value(v).ok()),
-    }
 }
 
 /// A video's `IHasAspectRatio.AspectRatio` and `ISupportsPlaceHolders.
@@ -601,24 +553,6 @@ pub fn date_modified_follows_save(
     item: &ferrofin_db::entities::base_items::BaseItemEntity,
 ) -> bool {
     path_is_directory(item) || item.path.as_deref().is_none_or(str::is_empty)
-}
-
-/// Reads one `Data` field as a string.
-#[must_use]
-pub fn read_data_string(data: &Map<String, Value>, key: &str) -> Option<String> {
-    data.get(key)?.as_str().map(str::to_owned)
-}
-
-/// Reads one `Data` field as an `f64` (accepting the JSON number form).
-#[must_use]
-pub fn read_data_f64(data: &Map<String, Value>, key: &str) -> Option<f64> {
-    data.get(key)?.as_f64()
-}
-
-/// Reads one `Data` field as an `i32`.
-#[must_use]
-pub fn read_data_i32(data: &Map<String, Value>, key: &str) -> Option<i32> {
-    i32::try_from(data.get(key)?.as_i64()?).ok()
 }
 
 /// Whether the parsed `Data` object carries a `LinkedChildren` key at all —

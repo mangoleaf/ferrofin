@@ -17,9 +17,9 @@ use ferrofin_traits::options::InternalItemsQuery;
 use uuid::Uuid;
 
 /// Rows read per page: the library tasks' page
-/// ([`ferrofin_core::scheduled_tasks::library::PAGE_SIZE`]).
+/// ([`ferrofin_traits::tasks::PAGE_SIZE`]).
 #[allow(clippy::cast_sign_loss)] // a positive constant
-pub(crate) const PAGE: usize = ferrofin_core::scheduled_tasks::library::PAGE_SIZE as usize;
+pub(crate) const PAGE: usize = ferrofin_traits::tasks::PAGE_SIZE as usize;
 
 /// The rows of `ids`, one page of a `get_item_ids(query)` snapshot, that still
 /// match `query`, in `ids`' order. A row deleted or changed since the snapshot

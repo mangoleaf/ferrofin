@@ -230,6 +230,7 @@ encoding_rs = "0.8.44"
 chardetng = "1.0.0"
 shlex = "2"              # ffmpeg command strings → argv (ferrofin-mediaencoding `split_args`)
 async-trait = "0.1.92"
+dunce = "1.0.5"            # canonical paths without Windows' `\\?\` prefix (ferrofin-core storage probe)
 libc = "0.2"
 windows-sys = { version = "0.61.2", features = [
     "Win32_Foundation",

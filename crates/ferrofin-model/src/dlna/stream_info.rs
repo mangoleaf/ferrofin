@@ -410,7 +410,9 @@ impl StreamInfo {
     /// Gets the target video level for a codec.
     #[must_use]
     pub fn get_target_video_level(&self, codec: Option<&str>) -> Option<f64> {
-        self.get_option(codec, "level").and_then(|v| v.parse().ok())
+        // `double.TryParse(value, CultureInfo.InvariantCulture, …)`.
+        self.get_option(codec, "level")
+            .and_then(ferrofin_util::invariant_float::parse)
     }
 
     /// Gets the target reference frames for a codec.
@@ -872,6 +874,11 @@ fn bool_lower(v: bool) -> String {
 /// values exercised here (whole numbers without a trailing `.0`).
 #[allow(clippy::float_cmp, clippy::cast_possible_truncation)]
 fn format_float(v: f32) -> String {
+    if v.is_infinite() {
+        // `float.ToString(CultureInfo.InvariantCulture)`: the query binder
+        // reads `Infinity` back, and refuses Rust's `inf` as upstream does.
+        return if v > 0.0 { "Infinity" } else { "-Infinity" }.to_owned();
+    }
     if v.fract() == 0.0 {
         format!("{}", v as i64)
     } else {
