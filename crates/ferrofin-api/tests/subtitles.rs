@@ -1090,6 +1090,41 @@ async fn open_subtitles_login_binds_ignoring_case_and_forwards_pascal_case() {
     );
 }
 
+/// gl-1673, measured on Jellyfin 12.4.0 with the OpenSubtitles plugin 25.0.0.0:
+/// a body that does not bind also names the plugin's `[FromBody]
+/// LoginInfoInput body`, required under its nullable reference types.
+#[tokio::test]
+async fn open_subtitles_login_names_the_body_parameter_when_the_body_does_not_bind() {
+    let subtitles = Arc::new(CannedSubtitles::default());
+    let app = remote_search_state(subtitles.clone());
+    for (body, complaint) in [("", ""), ("[]", "$")] {
+        let response = create_router(app.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/Jellyfin.Plugin.OpenSubtitles/ValidateLoginInfo")
+                    .header("Content-Type", "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{body}");
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let errors = serde_json::from_slice::<serde_json::Value>(&bytes).unwrap()["errors"].clone();
+        assert_eq!(
+            errors["body"],
+            serde_json::json!(["The body field is required."]),
+            "{body}"
+        );
+        assert_eq!(errors.as_object().unwrap().len(), 2, "{body}: {errors}");
+        assert!(errors.get(complaint).is_some(), "{body}: {errors}");
+    }
+    assert!(subtitles.logins.lock().unwrap().is_empty());
+}
+
 // ---- FallbackFont ----------------------------------------------------------
 
 fn options_with_path(path: Option<&str>) -> EncodingOptions {
