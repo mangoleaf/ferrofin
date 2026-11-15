@@ -123,6 +123,31 @@ parity() { # parity ARGS...: the runner against the fake corpus in td, the pinne
   "$PARITY/run.sh" --testdata td --out out --oracle "$PIN" --ferrofin "${FERROFIN_IMAGE:-ferrofin:ok}" "$@"
 }
 
+# watchdog LEADER SECONDS: in the background, without the TAP descriptor, wait for run.sh's supervisor to
+# end; past SECONDS, write every process's state, wait channel, syscall, signal masks and descriptors, and
+# the tail of run.sh's trace, to $TMP/hang, then kill the run's sessions so the test fails instead of hanging.
+# Its PID is $dog: wait for it before reading $TMP/hang.
+watchdog() {
+  (
+    set +eE; trap - ERR   # bats' errexit would end the dump at its first missing file
+    for _ in $(seq 1 $(($2 * 2))); do kill -0 "$1" 2>/dev/null || exit 0; sleep 0.5; done
+    {
+      echo "run.sh still running $2 s after the signal"
+      for d in /proc/[0-9]*; do   # every process this test started: they all carry its FAKE_STATE
+        grep -qxz "FAKE_STATE=$FAKE_STATE" "$d/environ" 2>/dev/null || continue
+        ps -o pid=,ppid=,pgid=,sid=,stat=,wchan:32=,args= -p "${d#/proc/}" | cut -c1-240
+        echo "   $(grep -E '^(SigPnd|ShdPnd|SigBlk|SigIgn|SigCgt)' "$d/status" 2>/dev/null | tr '\n\t' '  ')"
+        echo "   syscall: $(cat "$d/syscall" 2>/dev/null)"
+        for fd in "$d"/fd/*; do echo "   fd ${fd##*/} -> $(readlink "$fd")"; done
+      done
+      ls -la "${TMPDIR:-/tmp}"/gates-ack.* "$TMP/out" "$FAKE_STATE"; cat "$FAKE_STATE/calls"
+      echo "-- trace"; tail -n 400 "$TMP/trace"
+    } > "$TMP/hang" 2>&1
+    for s in "$1" $(pgrep -P "$1"); do pkill -KILL -s "$s"; done
+  ) 3>&- &
+  dog=$!
+}
+
 containers_gone() { # no container left in the fake docker, no server process left on either port
   if compgen -G "$FAKE_STATE/*.name" >/dev/null; then echo "containers left: $(ls "$FAKE_STATE")" >&2; return 1; fi
   [ -z "$(pgrep -f "fake_server.py ($PARITY_ORACLE_PORT|$PARITY_FERROFIN_PORT) " || true)" ]
@@ -441,14 +466,19 @@ containers_gone() { # no container left in the fake docker, no server process le
 
 # ── teardown ──────────────────────────────────────────────────────────────────────────────────
 @test "run.sh: a termination while a container is still being created leaves no container behind" {
-  FAKE_RUN_DELAY=8 setsid "$PARITY/run.sh" --testdata td --out out --oracle "$PIN" --ferrofin ferrofin:ok &
+  # shellcheck disable=SC2016  # PS4 expands in the traced shells
+  env SHELLOPTS=xtrace PS4='+ $BASHPID ${BASH_SOURCE##*/}:$LINENO: ' FAKE_RUN_DELAY=8 \
+    setsid "$PARITY/run.sh" --testdata td --out out --oracle "$PIN" --ferrofin ferrofin:ok 2> "$TMP/trace" &
   leader=$!
   echo "$leader" > "$TMP/leader"
   for _ in $(seq 1 40); do [ -f "$FAKE_STATE/calls" ] && grep -q '^run ' "$FAKE_STATE/calls" && break; sleep 0.25; done
   grep -q '^run ' "$FAKE_STATE/calls"   # docker run is in flight
   asked=$SECONDS
   kill -TERM -- "-$leader"
+  watchdog "$leader" 60
   wait "$leader" || true
+  wait "$dog" || true
+  if [ -s "$TMP/hang" ]; then cat "$TMP/hang"; false; fi
   [ $((SECONDS - asked)) -lt 5 ]        # the create is stopped, not waited out (it would take 8 s)
   sleep 9                               # longer than the delay: a leaked create would have registered by now
   [ -f out/report.html ]
