@@ -974,6 +974,9 @@ pub const VERIFIED_SUBSYSTEMS_AGAINST_EARLIER_PIN: &[(&str, &str)] = &[];
 /// whose operations have no row of their own yet, when the progressive body
 /// they answer with ends, and how many jobs ffmpeg may run for them and the
 /// HLS routes;
+/// `stream-parameter-patterns` is which container, codec and level values the
+/// HLS routes refuse before their action runs, whose operations have no row
+/// of their own yet;
 /// `transcode-arguments` is the ffmpeg command line of a job on the stream
 /// routes and the HLS routes, in the parts its row names;
 /// `video-stream-copy` is whether a transcode job copies the source video and
@@ -994,6 +997,7 @@ pub const SUBSYSTEM_KEYS: &[&str] = &[
     "websocket-streams",
     "scan-failure-isolation",
     "progressive-transcode",
+    "stream-parameter-patterns",
     "transcode-arguments",
     "trickplay-extraction",
     "image-extraction",
@@ -1806,6 +1810,38 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
              OnTranscodeBeginRequest still finds the exited one first. Jellyfin bugs not \
              ported (gl-1373).",
         ],
+    },
+    VerifiedSubsystem {
+        key: "stream-parameter-patterns",
+        upstream_file: "Jellyfin.Api/Controllers/DynamicHlsController.cs",
+        upstream_method: "GetMasterHlsVideoPlaylist",
+        ferrofin: "Which values of the HLS routes' [RegularExpression] parameters are refused, and \
+                   the 400 they answer with. extract.rs StreamPattern \
+                   (EncodingHelper.ContainerValidationRegexStr and LevelValidationRegexStr, matched \
+                   over the whole value as RegularExpressionAttribute matches them, with an empty \
+                   value passing), pattern_complaint and validation_failure (the [ApiController] \
+                   model-state ValidationProblemDetails: one body naming every failing parameter by \
+                   its declared name, whatever case the query spelled it in), reached from \
+                   handlers/hls.rs hls_pattern_failures and segment_pattern_failures in the seven \
+                   DynamicHlsController actions (GetMasterHlsVideoPlaylist, \
+                   GetVariantHlsVideoPlaylist, GetLiveHlsStream, GetMasterHlsAudioPlaylist, \
+                   GetVariantHlsAudioPlaylist, GetHlsVideoSegment, GetHlsAudioSegment) after \
+                   RequireAuth and before the item is looked up: segmentContainer, audioCodec, level, \
+                   videoCodec and subtitleCodec on each, and container on GetLiveHlsStream's query \
+                   and on a segment's route {container} (the text after the last dot of \
+                   {segmentId}.{container}, where a blank one is [Required]'s complaint, filed beside \
+                   the others); the playlists declare no container, so their container query is not \
+                   read. Compared with those actions' parameter attributes at the pinned v12.4 tag, \
+                   and settled against a stock 12.4 container (2026-11-14): bodies and keys for each \
+                   parameter, an encoded line break, a leading space, 41 and 40 characters, a blank \
+                   value, a later repeat of the key, the undeclared container query, the route \
+                   {container} blank (alone and beside a failing segmentContainer) and outside the \
+                   pattern, level spellings (4.1, -41, abc, 1e1, a leading space, 41., 4.1.2), a \
+                   HEAD, and the 401 of a request with no token coming first. Not part of this row: \
+                   merging these complaints with another parameter's binding failure into one body \
+                   (gl-1672), the segments' {segmentId} binding, and the rest of each operation",
+        date: "2026-11-14",
+        divergences: &[],
     },
     VerifiedSubsystem {
         key: "transcode-arguments",
