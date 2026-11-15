@@ -12,6 +12,8 @@
 //!   fetches the content, and **attaches** it to the item (a sidecar in the library
 //!   configured media or internal-metadata folder + an external [`MediaStream`](ferrofin_model::entities_media::MediaStream)
 //!   row). `Self::upload_subtitle` attaches caller-supplied content the same way.
+//!   A failed download is recorded in the activity log
+//!   (`Self::report_download_failure`, `SubtitleDownloadFailureLogger`).
 //! - `Self::get_remote_subtitles` routes an id to its provider and returns the
 //!   raw content (the `/Providers/Subtitles/Subtitles/{id}` route).
 //! - `Self::delete_subtitles` deletes an external subtitle's file; the item
@@ -24,17 +26,18 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use ferrofin_db::Database;
-use ferrofin_db::entities::base_items::MediaStreamInfoEntity;
+use ferrofin_db::entities::base_items::{BaseItemEntity, MediaStreamInfoEntity};
 use ferrofin_db::store::guid_to_db;
 use ferrofin_model::providers::{RemoteSubtitleInfo, SubtitleProviderInfo};
 use uuid::Uuid;
 
+use ferrofin_traits::activity::{ActivityLogCreate, ActivityManager};
 use ferrofin_traits::error::ServiceError;
 use ferrofin_traits::library::{LibraryManager, SelfWrite, SelfWriteGuard, VirtualFolderManager};
 use ferrofin_traits::persistence::{MediaStreamQuery, MediaStreamRepository};
 use ferrofin_traits::subtitles::{
     ProviderLogin, SubtitleManager, SubtitleMediaType, SubtitleProvider, SubtitleResponse,
-    SubtitleSearchRequest,
+    SubtitleSearchRequest, is_rate_limit_exceeded,
 };
 
 use crate::db_error::media_stream_type_disc;
@@ -55,6 +58,9 @@ pub struct FerrofinSubtitleManager {
     /// takes them for the server's own writes (`ILibraryMonitor`). `None` in
     /// unit tests.
     self_writes: Option<Arc<dyn SelfWriteGuard>>,
+    /// Where a failed download is recorded (`SubtitleDownloadFailureLogger`).
+    /// `None` in unit tests.
+    activity: Option<Arc<dyn ActivityManager>>,
 }
 
 impl std::fmt::Debug for FerrofinSubtitleManager {
@@ -85,7 +91,17 @@ impl FerrofinSubtitleManager {
             virtual_folders: None,
             metadata_path: metadata_path.into(),
             self_writes: None,
+            activity: None,
         }
+    }
+
+    /// Records each failed download in the activity log, as
+    /// `SubtitleDownloadFailureLogger` does. Called once by the composition
+    /// root.
+    #[must_use]
+    pub fn with_activity(mut self, activity: Arc<dyn ActivityManager>) -> Self {
+        self.activity = Some(activity);
+        self
     }
 
     /// Brackets each subtitle written or deleted, as `SubtitleManager` does
@@ -304,6 +320,35 @@ fn provider_id(name: &str) -> String {
         .to_string()
 }
 
+/// `SubtitleDownloadFailureLogger.GetItemName` for the videos a subtitle is
+/// downloaded for: an episode is `{series} - S{season}, Ep{n} - {name}`, a
+/// music video `{first artist} - {name}`.
+fn item_name(item: &BaseItemEntity) -> String {
+    let mut name = item.name.clone().unwrap_or_default();
+    match item.type_.rsplit('.').next() {
+        Some("Episode") => {
+            if let Some(episode) = item.index_number {
+                name = format!("Ep{episode} - {name}");
+            }
+            if let Some(season) = item.parent_index_number {
+                name = format!("S{season}, {name}");
+            }
+            // `IHasSeries`: C# concatenates a null `SeriesName` as "".
+            name = format!(
+                "{} - {name}",
+                item.series_name.as_deref().unwrap_or_default()
+            );
+        }
+        Some("MusicVideo") => {
+            if let Some(artist) = crate::dto_service::split_multi(item.artists.as_deref()).first() {
+                name = format!("{artist} - {name}");
+            }
+        }
+        _ => {}
+    }
+    name
+}
+
 /// Only Movies and Episodes are supported by the subtitle manager's item
 /// overload; other video kinds do not inherit Movie provider support.
 fn subtitle_media_type(type_name: &str) -> Option<SubtitleMediaType> {
@@ -501,8 +546,16 @@ impl SubtitleManager for FerrofinSubtitleManager {
         let (provider, local) = self
             .route(subtitle_id)
             .ok_or_else(|| ServiceError::invalid_input("unknown subtitle provider for id"))?;
-        let response = provider.get_subtitles(&local).await?;
-        self.attach(item_id, &response).await
+        let downloaded = async {
+            let response = provider.get_subtitles(&local).await?;
+            self.attach(item_id, &response).await
+        }
+        .await;
+        if let Err(error) = &downloaded {
+            self.report_download_failure(item_id, subtitle_id, error)
+                .await;
+        }
+        downloaded
     }
 
     async fn upload_subtitle(
@@ -518,6 +571,50 @@ impl SubtitleManager for FerrofinSubtitleManager {
             .route(id)
             .ok_or_else(|| ServiceError::invalid_input("unknown subtitle provider for id"))?;
         provider.get_subtitles(&local).await
+    }
+
+    async fn report_download_failure(
+        &self,
+        item_id: Uuid,
+        subtitle_id: &str,
+        error: &ServiceError,
+    ) {
+        // `GetProvider` runs before the `try`, and `catch
+        // (RateLimitExceededException) { throw; }` raises nothing.
+        let (Some(activity), Some((provider, _))) = (&self.activity, self.route(subtitle_id))
+        else {
+            return;
+        };
+        if is_rate_limit_exceeded(error) {
+            return;
+        }
+        // The item was found before the download began; one gone since gets
+        // an empty name, and `ItemId` still names it.
+        let item = self
+            .library_manager
+            .get_item_by_id(item_id)
+            .await
+            .ok()
+            .flatten()
+            .map(|item| item_name(&item))
+            .unwrap_or_default();
+        let entry = ActivityLogCreate {
+            name: format!(
+                "Subtitles failed to download from {} for {item}",
+                provider.name()
+            ),
+            type_: "SubtitleDownloadFailure".to_owned(),
+            item_id: Some(item_id),
+            short_overview: Some(error.message()),
+            ..Default::default()
+        };
+        if let Err(write) = activity.create_entry(entry).await {
+            tracing::warn!(
+                %item_id,
+                error = %write,
+                "could not record the failed subtitle download in the activity log"
+            );
+        }
     }
 
     async fn delete_subtitles(&self, item_id: Uuid, index: i32) -> Result<(), ServiceError> {
@@ -946,6 +1043,166 @@ mod tests {
             .expect("streams");
         assert_eq!(streams.len(), 1);
         assert!(streams[0].is_external);
+    }
+
+    /// A provider whose downloads fail: `quota` with the plugin's quota error,
+    /// `nfo` with content in a format no sidecar takes, anything else with a
+    /// refused account.
+    struct FailingProvider;
+
+    #[async_trait]
+    impl SubtitleProvider for FailingProvider {
+        fn name(&self) -> &'static str {
+            "Failing"
+        }
+        async fn search(
+            &self,
+            _: &SubtitleSearchRequest,
+        ) -> Result<Vec<RemoteSubtitleInfo>, ServiceError> {
+            Ok(Vec::new())
+        }
+        async fn get_subtitles(&self, local: &str) -> Result<SubtitleResponse, ServiceError> {
+            match local {
+                "quota" => Err(ServiceError::backend_source(
+                    ferrofin_traits::subtitles::RateLimitExceeded("quota spent".to_owned()),
+                )),
+                "nfo" => Ok(SubtitleResponse {
+                    language: "eng".to_owned(),
+                    format: "nfo".to_owned(),
+                    ..Default::default()
+                }),
+                _ => Err(ServiceError::unauthorized("account not set up")),
+            }
+        }
+    }
+
+    /// `SubtitleManager.DownloadSubtitles` raises `SubtitleDownloadFailure`
+    /// for a failed fetch or save, and `SubtitleDownloadFailureLogger` records
+    /// it; a spent quota (`catch (RateLimitExceededException) { throw; }`) and
+    /// an id naming no provider (`GetProvider`, before the `try`) record
+    /// nothing.
+    #[tokio::test]
+    async fn a_failed_download_records_an_activity_entry_but_a_spent_quota_does_not() {
+        let db = test_db().await;
+        let item = Uuid::new_v4();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let media = tmp.path().join("Pilot.mkv");
+        std::fs::write(&media, b"x").expect("media");
+        crate::test_support::save_item(
+            &db,
+            &ferrofin_db::entities::base_items::BaseItemEntity {
+                id: guid_to_db(item),
+                type_: "MediaBrowser.Controller.Entities.TV.Episode".to_owned(),
+                name: Some("Pilot".to_owned()),
+                series_name: Some("Show".to_owned()),
+                parent_index_number: Some(1),
+                index_number: Some(2),
+                path: Some(media.to_string_lossy().into_owned()),
+                ..Default::default()
+            },
+        )
+        .await;
+        let activity = Arc::new(crate::FerrofinActivityManager::new(db.clone()));
+        let mgr = manager(db, vec![Arc::new(FailingProvider)]).with_activity(activity.clone());
+        let namespace = provider_id("Failing");
+
+        for local in ["auth", "quota", "nfo"] {
+            mgr.download_subtitles(item, &format!("{namespace}_{local}"))
+                .await
+                .expect_err(local);
+        }
+        mgr.download_subtitles(item, "nobody_auth")
+            .await
+            .expect_err("no provider");
+
+        let mut entries = activity
+            .get_paged_result(&ferrofin_traits::activity::ActivityLogQuery::default())
+            .await
+            .expect("entries")
+            .items;
+        entries.sort_by_key(|entry| entry.id);
+        let overviews: Vec<_> = entries
+            .iter()
+            .map(|entry| entry.short_overview.as_deref().unwrap_or_default())
+            .collect();
+        assert_eq!(
+            overviews,
+            ["account not set up", "unsupported subtitle format: nfo"]
+        );
+        for entry in &entries {
+            assert_eq!(
+                entry.name,
+                "Subtitles failed to download from Failing for Show - S1, Ep2 - Pilot"
+            );
+            assert_eq!(entry.type_, "SubtitleDownloadFailure");
+            assert_eq!(entry.item_id, Some(item.simple().to_string()));
+            assert_eq!(entry.user_id, Uuid::nil());
+            assert_eq!(
+                entry.severity,
+                ferrofin_model::activity::LogLevel::Information
+            );
+        }
+    }
+
+    /// `SubtitleDownloadFailureLogger.GetItemName` for the videos a subtitle
+    /// downloads for.
+    #[rstest::rstest]
+    #[case::movie("Movie", Some("Dune"), None, None, None, None, "Dune")]
+    #[case::episode(
+        "TV.Episode",
+        Some("Pilot"),
+        Some("Show"),
+        Some(1),
+        Some(2),
+        None,
+        "Show - S1, Ep2 - Pilot"
+    )]
+    #[case::episode_without_numbers_or_series(
+        "TV.Episode",
+        Some("Pilot"),
+        None,
+        None,
+        None,
+        None,
+        " - Pilot"
+    )]
+    #[case::music_video(
+        "MusicVideo",
+        Some("Song"),
+        None,
+        None,
+        None,
+        Some("Band|Guest"),
+        "Band - Song"
+    )]
+    #[case::music_video_without_artists(
+        "MusicVideo",
+        Some("Song"),
+        None,
+        None,
+        None,
+        Some(""),
+        "Song"
+    )]
+    fn failure_entries_name_the_item_as_upstream(
+        #[case] kind: &str,
+        #[case] name: Option<&str>,
+        #[case] series_name: Option<&str>,
+        #[case] season: Option<i64>,
+        #[case] episode: Option<i64>,
+        #[case] artists: Option<&str>,
+        #[case] expected: &str,
+    ) {
+        let item = ferrofin_db::entities::base_items::BaseItemEntity {
+            type_: format!("MediaBrowser.Controller.Entities.{kind}"),
+            name: name.map(str::to_owned),
+            series_name: series_name.map(str::to_owned),
+            parent_index_number: season,
+            index_number: episode,
+            artists: artists.map(str::to_owned),
+            ..Default::default()
+        };
+        assert_eq!(item_name(&item), expected);
     }
 
     async fn configured_library(

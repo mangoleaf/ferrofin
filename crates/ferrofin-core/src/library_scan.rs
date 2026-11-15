@@ -1844,7 +1844,8 @@ impl<'a> ProbePipeline<'a> {
             {
                 let shortcut = self.shortcuts.get(&index);
                 if let Some(target) = shortcut {
-                    request.media_source.protocol = shortcut::path_protocol(target);
+                    request.media_source.protocol =
+                        ferrofin_model::media_info::path_protocol(target);
                     request.media_source.path = Some(target.clone());
                 }
                 let permit = if self.current == Some(index) {
@@ -20683,7 +20684,7 @@ fn retype(walk: MovieWalk, content_type: Option<ferrofin_model::data::Collection
         || content_type
             == walk
                 .collection_type
-                .and_then(crate::kinds::collection_type_of)
+                .and_then(CollectionTypeOptions::collection_type)
     {
         return Retype::Same;
     }
@@ -20728,7 +20729,7 @@ fn children_content_type(
     use ferrofin_model::content_type_overrides::content_type_override;
     content_type_override(content_types, dir, false)
         .or_else(|| content_type_override(content_types, dir, true))
-        .or_else(|| library.and_then(crate::kinds::collection_type_of))
+        .or_else(|| library.and_then(CollectionTypeOptions::collection_type))
 }
 
 /// The collection type a folder of an untyped walk resolves with:

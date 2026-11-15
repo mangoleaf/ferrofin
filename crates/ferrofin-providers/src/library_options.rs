@@ -621,6 +621,17 @@ fn local_providers() -> Vec<Provider> {
         compiled: true,
         images: NO_IMAGES,
     }];
+    // `BoxSetXmlProvider` and `BoxSetXmlSaver` (`XmlProviderUtils.Name`):
+    // `GetPluginSummary<BoxSet>` lists both, so a Collections library's
+    // options offer the saver its `MetadataSavers` list must name.
+    providers.push(Provider {
+        name: crate::box_set_xml::SAVER_NAME,
+        caps: &[Cap::LocalMetadata, Cap::MetadataSaver],
+        types: &["BoxSet"],
+        default_enabled: true,
+        compiled: true,
+        images: NO_IMAGES,
+    });
     providers.extend(
         [
             fetcher_names::COMIC,
@@ -1755,6 +1766,24 @@ mod tests {
             .iter()
             .any(|o| o.name.as_deref() == Some("Open Subtitles"));
         assert_eq!(has_os, cfg!(feature = "opensubtitles"));
+    }
+
+    /// jellyfin-web saves the advertised name in a library's
+    /// `DisabledSubtitleFetchers` and `SubtitleFetcherOrder`, which the
+    /// subtitle manager compares with the provider's `name()`.
+    #[cfg(feature = "opensubtitles")]
+    #[test]
+    fn advertised_subtitle_fetcher_is_the_provider_name() {
+        let info = library_options_info(&["Movie".to_owned()], false, &[], &[]);
+        let names: Vec<_> = info
+            .subtitle_fetchers
+            .iter()
+            .filter_map(|o| o.name.as_deref())
+            .collect();
+        assert!(
+            names.contains(&crate::opensubtitles::PLUGIN_NAME),
+            "{names:?}"
+        );
     }
 
     /// `SupportedImageTypes` is the union of the compiled image providers'
