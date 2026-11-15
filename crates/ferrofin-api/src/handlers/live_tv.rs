@@ -455,8 +455,15 @@ struct GetProgramsDto {
     /// Additional DTO fields.
     #[serde(deserialize_with = "ferrofin_model::json::delimited::comma_option")]
     fields: Option<Vec<ItemFields>>,
-    /// Whether the total record count is computed (schema default `true`).
-    #[serde(deserialize_with = "ferrofin_model::json::value::nullable")]
+    /// Whether the total record count is computed. C#'s non-nullable
+    /// `bool EnableTotalRecordCount = true`: absent is `true`, and `null` fails
+    /// the bind (`400`).
+    // The test-only `Serialize` feeds `contract_numbers::check_model`, which
+    // binds the serialized default again: a `null` there would now fail.
+    #[serde(
+        deserialize_with = "ferrofin_model::json::value::non_nullable",
+        skip_serializing_if = "Option::is_none"
+    )]
     enable_total_record_count: Option<bool>,
 }
 
@@ -3803,6 +3810,56 @@ mod tests {
         let state = fake_state().with_live_tv(std::sync::Arc::new(FakeLiveTv::default()));
         let err = get_programs(State(state), auth(), query).await.unwrap_err();
         assert_eq!(err.status(), axum::http::StatusCode::BAD_REQUEST);
+    }
+
+    /// `GetProgramsDto.EnableTotalRecordCount` is C#'s non-nullable
+    /// `bool EnableTotalRecordCount = true`, bound by the body's JSON options
+    /// with no `bool` converter: absent counts, `false` turns the count off,
+    /// and `null`, `""` or a quoted `"true"` fails the bind with a 400 naming
+    /// the member, which never reaches the guide.
+    #[rstest::rstest]
+    #[case::absent(r"{}", Some(true))]
+    #[case::true_(r#"{"EnableTotalRecordCount":true}"#, Some(true))]
+    #[case::false_(r#"{"EnableTotalRecordCount":false}"#, Some(false))]
+    #[case::null(r#"{"EnableTotalRecordCount":null}"#, None)]
+    #[case::empty(r#"{"EnableTotalRecordCount":""}"#, None)]
+    #[case::quoted(r#"{"EnableTotalRecordCount":"true"}"#, None)]
+    #[tokio::test]
+    async fn post_programs_binds_enable_total_record_count_as_a_bool(
+        #[case] body: &'static str,
+        #[case] counted: Option<bool>,
+    ) {
+        use tower::ServiceExt;
+
+        let fake = std::sync::Arc::new(FakeLiveTv::default());
+        let state = crate::test_support::elevated_fake_state().with_live_tv(fake.clone());
+        let response = crate::create_router(state)
+            .oneshot(
+                axum::http::Request::post("/LiveTv/Programs")
+                    .header(axum::http::header::CONTENT_TYPE, "application/json")
+                    .body(axum::body::Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let text = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let text = String::from_utf8_lossy(&text);
+        let asked = fake.programs_query.lock().unwrap().clone();
+        if counted.is_some() {
+            assert_eq!(status, axum::http::StatusCode::OK, "{body}: {text}");
+        } else {
+            assert_eq!(status, axum::http::StatusCode::BAD_REQUEST, "{body}");
+            assert!(text.contains("$.EnableTotalRecordCount"), "{body}: {text}");
+        }
+        // A refused body never reaches the guide.
+        assert_eq!(
+            asked.map(|query| query.enable_total_record_count),
+            counted,
+            "{body}"
+        );
     }
 
     #[tokio::test]

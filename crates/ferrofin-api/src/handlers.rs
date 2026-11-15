@@ -3525,8 +3525,6 @@ pub const VERIFIED: &[Verified] = &[
          date) is read as UTC; upstream's GetDateTime leaves it Unspecified and EF's \
          DateTimeKindValueConverter reads it as server-local time, as the GET form here \
          does. Fix path: gl-1033.",
-            "A null EnableTotalRecordCount reads as true; upstream's member is a non-nullable \
-         bool, which System.Text.Json refuses to bind from null (a 400). Fix path: gl-1691.",
             "With no body UserId, SortBy PlayCount, IsFavoriteOrLiked, IsPlayed or \
          IsUnplayed sorts by SortName, as /Items does; upstream's OrderMapper reads the \
          missing user's id (query.User!.Id), which throws. Jellyfin bug not ported.",
