@@ -2179,7 +2179,9 @@ macro_rules! similar_items_path {
          in SimilarItemProviders and the always-enabled local scorer ordered as one list by \
          SimilarItemProviderOrder, else SimilarItemProviders, an unlisted name last \
          (GetConfiguredSimilarProviderOrder); the provider loop's limit check, ExcludeItemIds, \
-         the id-and-presentation-key claim and CalculateScore; local_filter per kind: \
+         the id-and-presentation-key claim and CalculateScore, and the loop's catch \
+         (push_local_results warns with the provider name and item id when the local scorer \
+         fails, and the remote providers still run); local_filter per kind: \
          MovieSimilarItemsProvider for Movie and Trailer, SeriesSimilarItemsProvider, \
          MusicAlbum-, MusicArtist- and AudioSimilarItemsProvider (AudioBook through Audio) \
          and LiveTvProgramSimilarItemsProvider by IsMovie and IsSeries; local_similar's score \
@@ -2207,8 +2209,6 @@ const SIMILAR_ITEMS_DIVERGENCES: &[&str] = &[
     SIMILAR_SCORE_WINDOW_DIVERGENCE,
     SIMILAR_ALTERNATE_VERSIONS_DIVERGENCE,
     SIMILAR_SCORE_GROUPING_DIVERGENCE,
-    "A local scorer that fails answers 500; upstream logs the provider's failure and goes \
-     on to the remote providers. Fix path: gl-1789.",
     SIMILAR_IS_VISIBLE_DIVERGENCE,
     "The reference-cache read swallows an I/O error silently and warns on an empty entry or \
      one whose References is null, where upstream warns on an IOException and treats both \

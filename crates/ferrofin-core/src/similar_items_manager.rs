@@ -855,22 +855,39 @@ impl FerrofinSimilarItemsManager {
 
     /// Runs the local provider and appends its results at `provider_order`,
     /// skipping anything already taken.
+    ///
+    /// A failure is logged and adds nothing, so the request goes on with the
+    /// remote providers: C# `GetSimilarItemsAsync` catches every provider's
+    /// exception and logs "Similar items provider {ProviderName} failed for
+    /// item {ItemId}". The request then succeeds, so this is the one place the
+    /// error is logged.
     async fn push_local_results(
         &self,
         request: &LocalRequest<'_>,
         provider_order: usize,
         claimed: &mut Seen,
         scored: &mut Vec<(BaseItemEntity, f32)>,
-    ) -> Result<(), ServiceError> {
+    ) {
         let remaining = request.wanted - i32::try_from(scored.len()).unwrap_or(0);
         if remaining <= 0 {
-            return Ok(());
+            return;
         }
         // C# hands the local provider `ExcludeItemIds`, so its `Limit` yields
         // that many *new* rows. Filtering in Rust instead would let each
         // duplicate burn a slot and under-fill the requested limit.
         let exclude: Vec<Uuid> = claimed.ids();
-        let by_overlap = self.local_similar(request, &exclude, remaining).await?;
+        let by_overlap = match self.local_similar(request, &exclude, remaining).await {
+            Ok(rows) => rows,
+            Err(error) => {
+                tracing::warn!(
+                    provider = LOCAL_SIMILARITY_PROVIDER,
+                    item_id = %request.seed_id,
+                    error = %error,
+                    "similar items provider failed for item"
+                );
+                return;
+            }
+        };
         let wanted_len = usize::try_from(request.wanted).unwrap_or(0);
         for (position, entity) in by_overlap.into_iter().enumerate() {
             if scored.len() >= wanted_len {
@@ -882,7 +899,6 @@ impl FerrofinSimilarItemsManager {
                 scored.push((entity, calculate_score(None, provider_order, position)));
             }
         }
-        Ok(())
     }
 
     /// One remote provider's results for the request, resolved against the
@@ -1435,7 +1451,7 @@ impl SimilarItemsManager for FerrofinSimilarItemsManager {
             if !ran_local && local_order <= index {
                 ran_local = true;
                 self.push_local_results(&local, index, &mut claimed, &mut scored)
-                    .await?;
+                    .await;
             }
             if scored.len() >= wanted_len {
                 break;
@@ -1467,7 +1483,7 @@ impl SimilarItemsManager for FerrofinSimilarItemsManager {
             // number of remote providers ahead of it, which still earns the
             // rank boost C# gives it.
             self.push_local_results(&local, remote_count, &mut claimed, &mut scored)
-                .await?;
+                .await;
         }
 
         // Highest score first. The sort is deliberately left STABLE with no
@@ -2161,6 +2177,71 @@ mod tests {
             names.contains(&"Solaris".to_owned()),
             "the remote match resolved into the results: {names:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn a_failing_local_scorer_is_logged_and_the_remote_matches_still_answer() {
+        // C# `GetSimilarItemsAsync` runs each provider inside a catch that logs
+        // "Similar items provider {ProviderName} failed for item {ItemId}" and
+        // goes on, so the request answers the other providers' matches.
+        let db = test_db().await;
+        let library = Uuid::from_u128(0x9ab_cdf);
+        let seed = Uuid::from_u128(0x921);
+        let remote_match = Uuid::from_u128(0x922);
+        seed_movie_in(&db, seed, "Alien", "SciFi", Some(library)).await;
+        seed_movie_in(&db, remote_match, "Solaris", "Drama", Some(library)).await;
+        FerrofinItemPersistenceService::new(db.clone())
+            .save_provider_id(remote_match, "Tmdb", "348")
+            .await
+            .expect("save id");
+        crate::similar_items_repository::test_hooks::break_the_score_pass(&db).await;
+
+        // The local scorer ranked last, then first: both call sites.
+        for providers in [vec!["TheMovieDb"], vec!["Local Genre/Tag", "TheMovieDb"]] {
+            let mgr = manager(&db).with_remote_providers(
+                vec![Arc::new(FakeRemote {
+                    name: "TheMovieDb",
+                    kind: BaseItemKind::Movie,
+                    references: vec![SimilarItemReference {
+                        provider_name: "Tmdb".to_owned(),
+                        provider_id: "348".to_owned(),
+                        score: None,
+                    }],
+                    cache: None,
+                    calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                })],
+                Arc::new(FakeFolders {
+                    library_id: library,
+                    providers: providers.iter().map(|&p| p.to_owned()).collect(),
+                }),
+            );
+            let logs = crate::test_support::CapturedLogs::default();
+            let similar = {
+                let _guard = tracing::subscriber::set_default(
+                    tracing_subscriber::fmt()
+                        .with_writer(logs.clone())
+                        .with_ansi(false)
+                        .finish(),
+                );
+                mgr.get_similar_items(seed, &[], None, &DtoOptions::default(), None)
+                    .await
+                    .expect("a failing local scorer does not fail the request")
+                    .expect("seed resolves")
+            };
+            assert_eq!(names(&similar), ["Solaris"], "{providers:?}");
+            let text = logs.text();
+            let warned = text
+                .lines()
+                .filter(|line| line.contains("similar items provider failed"))
+                .collect::<Vec<_>>();
+            assert_eq!(warned.len(), 1, "logged once: {providers:?}: {text}");
+            assert!(
+                warned[0].contains("WARN")
+                    && warned[0].contains(r#"provider="Local Genre/Tag""#)
+                    && warned[0].contains(&format!("item_id={seed}")),
+                "{providers:?}: {text}"
+            );
+        }
     }
 
     #[tokio::test]
