@@ -75,7 +75,17 @@ Conventions:
   - **Upstream bugs not ported:** an anime preview is stored under the Preview
     hash (upstream's Credits hash lets the Preview pass delete it for good);
     Matroska `DURATION` tags parse at any fraction length (.NET's `TimeSpan`
-    stops at seven digits).
+    stops at seven digits); a changed file is analysed again (below).
+  - **Changed files:** when a library scan finds a video's file changed, it
+    prunes what was extracted from the old one, and the server's
+    `DeleteSegmentsAsync` asks each segment provider to `CleanupExtractedData`.
+    The plugin's `SegmentProvider` does not implement it, so upstream keeps the
+    old file's analysis and the next Media Segment Scan publishes its segments
+    again. Here the provider's cleanup deletes the item's detection caches and
+    its detected segments, and drops it from every season's analysed lists,
+    so the next pass analyses the new file. Segments a user entered stay
+    (owner decision 2026-11-14, gl-1696). Nothing else runs the cleanup, so an
+    unchanged file is not analysed again.
   - **Failures:** a store write failure fails the season, retried next pass,
     in every analyzer (upstream's black-frame analyzers log it per episode and
     go on, the episode left analysed in memory); a failed keyframe
