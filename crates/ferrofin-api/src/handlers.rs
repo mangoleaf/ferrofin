@@ -3846,12 +3846,14 @@ pub const VERIFIED: &[Verified] = &[
                projection.rs remove_fields, program_dtos → program_entity and dto_service.rs \
                get_base_item_dtos, apply_program_info, add_recording_info → \
                scheduled_timers_for over dvr_repository.rs scheduled_timers_for_programs, \
-               timer_program_ids, apply_recording_info) (RequestHelpers.GetUserId, \
-               RequestHelpers.GetOrderBy, DtoExtensions.AddAdditionalDtoOptions, \
-               LiveTvManager.GetPrograms, LibraryManager.QueryItems, \
-               BaseItemRepository.TranslateQuery and ApplyOrder, OrderMapper, RemoveFields, \
-               DtoService.GetBaseItemDtos, AddInfoToProgramDto, AddRecordingInfo, \
-               GetTimersInternal, DefaultLiveTvService.GetTimersAsync)",
+               timer_program_ids, apply_recording_info, then series_timers_by_name over \
+               dvr_repository.rs series_timer_series_ids for a programme its timer gave no \
+               series timer) (RequestHelpers.GetUserId, RequestHelpers.GetOrderBy, \
+               DtoExtensions.AddAdditionalDtoOptions, LiveTvManager.GetPrograms, \
+               LibraryManager.QueryItems, BaseItemRepository.TranslateQuery and ApplyOrder, \
+               OrderMapper, RemoveFields, DtoService.GetBaseItemDtos, AddInfoToProgramDto, \
+               AddRecordingInfo, GetTimersInternal, DefaultLiveTvService.GetTimersAsync, \
+               GetSeriesTimersInternal)",
         date: "2026-11-15",
         divergences: &[
             "With no user (an API key), sortBy PlayCount, IsFavoriteOrLiked, IsPlayed or \
@@ -3868,11 +3870,6 @@ pub const VERIFIED: &[Verified] = &[
          /Items/{itemId}) is not shown here; upstream lists the stored item, the change \
          included, until a guide refresh that updates the programme assigns the listing's \
          values over it. Fix path: gl-1690.",
-            "A programme whose own timer carries no SeriesTimerId, or that has no timer, gets \
-         none; upstream's AddRecordingInfo then takes the first series timer (by name) whose \
-         SeriesId equals the programme's ExternalSeriesId, ignoring case, so every airing of \
-         a recorded series shows its SeriesTimerId, those on other channels included. Fix \
-         path: gl-1680.",
             "A malformed id in channelIds or genreIds is a 400; upstream's \
          CommaDelimitedCollectionModelBinder drops it. Fix path: gl-884.",
             "The 400 (a value the query binder cannot convert) and 403 (another user's id \
@@ -3896,12 +3893,14 @@ pub const VERIFIED: &[Verified] = &[
                PROGRAM_COUNT total, projection.rs remove_fields, program_dtos → \
                program_entity and dto_service.rs get_base_item_dtos, apply_program_info, \
                add_recording_info → scheduled_timers_for over dvr_repository.rs \
-               scheduled_timers_for_programs, timer_program_ids, apply_recording_info) \
-               (GetProgramsDto, RequestHelpers.GetOrderBy, \
-               DtoExtensions.AddAdditionalDtoOptions, LiveTvManager.GetPrograms, \
-               LibraryManager.QueryItems, BaseItemRepository.TranslateQuery and ApplyOrder, \
-               OrderMapper, RemoveFields, DtoService.GetBaseItemDtos, AddInfoToProgramDto, \
-               AddRecordingInfo, GetTimersInternal, DefaultLiveTvService.GetTimersAsync)",
+               scheduled_timers_for_programs, timer_program_ids, apply_recording_info, then \
+               series_timers_by_name over dvr_repository.rs series_timer_series_ids for a \
+               programme its timer gave no series timer) (GetProgramsDto, \
+               RequestHelpers.GetOrderBy, DtoExtensions.AddAdditionalDtoOptions, \
+               LiveTvManager.GetPrograms, LibraryManager.QueryItems, \
+               BaseItemRepository.TranslateQuery and ApplyOrder, OrderMapper, RemoveFields, \
+               DtoService.GetBaseItemDtos, AddInfoToProgramDto, AddRecordingInfo, \
+               GetTimersInternal, DefaultLiveTvService.GetTimersAsync, GetSeriesTimersInternal)",
         date: "2026-11-15",
         divergences: &[
             "A body UserId naming another user, sent without the administrator role, is a 403 \
@@ -3927,11 +3926,6 @@ pub const VERIFIED: &[Verified] = &[
          /Items/{itemId}) is not shown here; upstream lists the stored item, the change \
          included, until a guide refresh that updates the programme assigns the listing's \
          values over it. Fix path: gl-1690.",
-            "A programme whose own timer carries no SeriesTimerId, or that has no timer, gets \
-         none; upstream's AddRecordingInfo then takes the first series timer (by name) whose \
-         SeriesId equals the programme's ExternalSeriesId, ignoring case, so every airing of \
-         a recorded series shows its SeriesTimerId, those on other channels included. Fix \
-         path: gl-1680.",
             "The 400 (a body that does not bind) body is Ferrofin's error shape, not \
          upstream's. Fix path: gl-666.",
         ],

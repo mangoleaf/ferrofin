@@ -3955,19 +3955,14 @@ impl LiveTvManager for FerrofinLiveTvManager {
         // page, so a programme reached through `/Items` carries its
         // `TimerId`/`SeriesTimerId` exactly as one reached through
         // `/LiveTv/Programs` does.
-        let timers = self
-            .scheduled_timers_for(dtos.iter().filter_map(|dto| rows.get(&dto.id)))
-            .await?;
-        if timers.is_empty() {
-            return Ok(());
-        }
-        for dto in dtos.iter_mut() {
-            let Some(row) = rows.get(&dto.id) else {
-                continue;
-            };
-            Self::apply_recording_info(dto, row, &timers);
-        }
-        Ok(())
+        let mut programs: Vec<_> = dtos
+            .iter_mut()
+            .filter_map(|dto| {
+                let row = rows.get(&dto.id)?;
+                Some((dto, row))
+            })
+            .collect();
+        self.add_recording_info(&mut programs).await
     }
 
     async fn add_channel_info(
@@ -5088,7 +5083,8 @@ impl FerrofinLiveTvManager {
                 .and_then(|id| tags.get(&id));
             Self::apply_program_info(dto, row, has_channel_info, has_channel_image, tag);
         }
-        self.add_recording_info(&mut dtos, rows).await?;
+        let mut programs: Vec<_> = dtos.iter_mut().zip(rows).collect();
+        self.add_recording_info(&mut programs).await?;
         Ok(dtos)
     }
 
@@ -5142,27 +5138,54 @@ impl FerrofinLiveTvManager {
     /// [`Self::timer_program_ids`]), setting `TimerId`/`Status` (unless
     /// cancelled/errored) and `SeriesTimerId`.
     ///
-    /// Only the direct `timer.SeriesTimerId` link is applied: upstream's
-    /// fallback that gives a programme with no such timer the series timer
-    /// whose `SeriesId` is its `ExternalSeriesId` is not ported. Fix path:
-    /// gl-1680.
+    /// A programme whose timer gives no `SeriesTimerId`, or that has no timer,
+    /// takes the first series timer (in `GetSeriesTimersInternal`'s name
+    /// order) whose `SeriesId` equals its `ExternalSeriesId`, ignoring case:
+    /// an airing the fan-out does not schedule, such as one on another
+    /// channel, still shows the series recording it belongs to.
     async fn add_recording_info(
         &self,
-        dtos: &mut [BaseItemDto],
-        rows: &[GuideProgramRow],
+        programs: &mut [(&mut BaseItemDto, &GuideProgramRow)],
     ) -> Result<(), ServiceError> {
-        if dtos.is_empty() {
-            return Ok(());
-        }
         // One timer read for the page (upstream lazily loads the list once).
-        let timers = self.scheduled_timers_for(rows.iter()).await?;
-        if timers.is_empty() {
-            return Ok(());
-        }
-        for (dto, row) in dtos.iter_mut().zip(rows) {
-            Self::apply_recording_info(dto, row, &timers);
+        let timers = self
+            .scheduled_timers_for(programs.iter().map(|(_, row)| *row))
+            .await?;
+        // `seriesTimerList ??= …`: read once, only when a programme needs it.
+        let mut series_timers = None;
+        for (dto, row) in programs.iter_mut() {
+            if Self::apply_recording_info(dto, row, &timers) {
+                continue;
+            }
+            let Some(series_id) = row
+                .external_series_id
+                .as_deref()
+                .filter(|s| !s.trim().is_empty())
+            else {
+                continue;
+            };
+            if series_timers.is_none() {
+                series_timers = Some(self.series_timers_by_name().await?);
+            }
+            if let Some((id, ..)) = series_timers
+                .iter()
+                .flatten()
+                .find(|(_, _, s)| eq_ordinal_ignore_case(s, series_id))
+            {
+                dto.series_timer_id = Some(id.clone());
+            }
         }
         Ok(())
+    }
+
+    /// The stored series timers with a listings series id, as `(Id, Name,
+    /// SeriesId)`, ordered by name the way `GetSeriesTimersInternal` orders a
+    /// default `SeriesTimerQuery` (see [`sort_series_timers`]); a stable sort,
+    /// so a tie keeps the order they were stored in.
+    async fn series_timers_by_name(&self) -> Result<Vec<(String, String, String)>, ServiceError> {
+        let mut rows = crate::dvr_repository::series_timer_series_ids(&self.db).await?;
+        rows.sort_by(|a, b| invariant_numeric_cmp(&a.1, &b.1));
+        Ok(rows)
     }
 
     /// The `GetTimersAsync` timers (every one but the `Completed`) whose
@@ -5200,9 +5223,14 @@ impl FerrofinLiveTvManager {
             .chain(row.external_id.clone())
     }
 
-    /// [`Self::add_recording_info`]'s per-programme body, over an
-    /// already-loaded timer list.
-    fn apply_recording_info(dto: &mut BaseItemDto, row: &GuideProgramRow, timers: &[TimerInfoDto]) {
+    /// [`Self::add_recording_info`]'s per-programme timer link, over an
+    /// already-loaded timer list. Returns whether the timer gave the programme
+    /// its `SeriesTimerId` (upstream's `foundSeriesTimer`).
+    fn apply_recording_info(
+        dto: &mut BaseItemDto,
+        row: &GuideProgramRow,
+        timers: &[TimerInfoDto],
+    ) -> bool {
         let ids: Vec<String> = Self::timer_program_ids(row).collect();
         let timer = timers.iter().find(|t| {
             t.base
@@ -5211,7 +5239,7 @@ impl FerrofinLiveTvManager {
                 .is_some_and(|p| ids.iter().any(|id| p.eq_ignore_ascii_case(id)))
         });
         let Some(timer) = timer else {
-            return;
+            return false;
         };
         if !matches!(
             timer.status,
@@ -5222,7 +5250,9 @@ impl FerrofinLiveTvManager {
         }
         if let Some(series_timer_id) = timer.series_timer_id.as_deref().filter(|s| !s.is_empty()) {
             dto.series_timer_id = Some(series_timer_id.to_owned());
+            return true;
         }
+        false
     }
 
     /// The read half of `LiveTvDtoService.GetTimerInfoDto` (v12.4
@@ -15488,21 +15518,17 @@ mod tests {
         );
     }
 
-    /// `LiveTvManager.GetPrograms`' `SeriesTimerId`: the series timer whose
-    /// internal id matches (ignoring case) scopes the guide to its `SeriesId`,
-    /// the listings series id its programme carried. An unknown timer, or one
-    /// with no series id, answers nothing ("Better to return nothing than
-    /// every program in the database"), and a blank value scopes nothing.
-    #[tokio::test]
-    async fn series_timer_id_scopes_the_guide_to_the_timers_series() {
+    /// Two channels' guide where "Recurring" and "Something Else" carry
+    /// episode numbers, so their listings have a series id, and "Movie Night"
+    /// carries none. "Recurring" airs twice on the first channel and once on
+    /// the second.
+    fn episode_guide() -> String {
         use std::fmt::Write as _;
         let now = Utc::now();
         let mut xml = String::from(
             "<tv><channel id=\"one.tv\"><display-name>Channel One</display-name></channel>\
              <channel id=\"two.tv\"><display-name>Channel Two</display-name></channel>",
         );
-        // "Recurring" carries episode numbers, so its listings have a series
-        // id; "Movie Night" carries none.
         for (channel, from, to, title, episode) in [
             ("one.tv", 60, 120, "Recurring", Some("0.0.")),
             ("one.tv", 1500, 1560, "Recurring", Some("0.1.")),
@@ -15522,7 +15548,17 @@ mod tests {
             );
         }
         xml.push_str("</tv>");
-        let mgr = manager_with_guide(xml).await;
+        xml
+    }
+
+    /// `LiveTvManager.GetPrograms`' `SeriesTimerId`: the series timer whose
+    /// internal id matches (ignoring case) scopes the guide to its `SeriesId`,
+    /// the listings series id its programme carried. An unknown timer, or one
+    /// with no series id, answers nothing ("Better to return nothing than
+    /// every program in the database"), and a blank value scopes nothing.
+    #[tokio::test]
+    async fn series_timer_id_scopes_the_guide_to_the_timers_series() {
+        let mgr = manager_with_guide(episode_guide()).await;
         let titles = |query: InternalItemsQuery| {
             let mgr = &mgr;
             async move {
@@ -15688,6 +15724,115 @@ mod tests {
             .expect("programs")
             .items;
         assert_eq!(links(&programs, &manual), (None, None, None));
+    }
+
+    /// gl-1680: `AddRecordingInfo`'s fallback. A programme whose own timer
+    /// gives no `SeriesTimerId`, or that has no timer, takes the first series
+    /// timer by name whose `SeriesId` is its `ExternalSeriesId`: the airing on
+    /// the other channel, which the fan-out does not schedule, shows the
+    /// series timer through `/LiveTv/Programs` and through the `/Items` seam.
+    /// Another series, or a programme with no series id, gets none.
+    #[tokio::test]
+    async fn guide_airings_of_a_recorded_series_carry_its_series_timer() {
+        let mgr = manager_with_guide(episode_guide()).await;
+        let recurring = airings_of(&mgr, "Recurring").await;
+        let other = recurring
+            .iter()
+            .find(|r| r.channel_id != recurring[0].channel_id)
+            .expect("the airing on the other channel");
+        let other_id = Uuid::parse_str(&other.id).expect("guid");
+        let st_id = mgr
+            .create_series_timer(defaults_for(&mgr, &recurring[0]).await)
+            .await
+            .expect("series timer");
+
+        let links = || {
+            let mgr = &mgr;
+            async move {
+                let programs = mgr
+                    .get_programs(&InternalItemsQuery::default(), &DtoOptions::default())
+                    .await
+                    .expect("programs")
+                    .items;
+                let link = |title: &str, id: Option<Uuid>| {
+                    let p = programs
+                        .iter()
+                        .find(|p| {
+                            p.name.as_deref() == Some(title) && id.is_none_or(|id| p.id == id)
+                        })
+                        .expect("programme");
+                    (
+                        p.timer_id.clone(),
+                        p.status.clone(),
+                        p.series_timer_id.clone(),
+                    )
+                };
+                [
+                    link("Recurring", Some(other_id)),
+                    link("Something Else", None),
+                    link("Movie Night", None),
+                ]
+            }
+        };
+        assert_eq!(
+            links().await,
+            [
+                (None, None, Some(st_id.clone())),
+                (None, None, None),
+                (None, None, None)
+            ]
+        );
+        let mut dtos = vec![BaseItemDto {
+            id: other_id,
+            ..BaseItemDto::default()
+        }];
+        mgr.add_info_to_program_dto(&mut dtos, &DtoOptions::default(), None)
+            .await
+            .expect("the /Items seam");
+        assert_eq!(dtos[0].series_timer_id.as_deref(), Some(st_id.as_str()));
+
+        // Stored second, first by name.
+        let mut named = defaults_for(&mgr, &recurring[0]).await;
+        named.base.name = Some("A Recurring".to_owned());
+        let first_by_name = mgr.create_series_timer(named).await.expect("second");
+        assert_eq!(links().await[0], (None, None, Some(first_by_name.clone())));
+
+        // A timer's own series timer wins over the first by name.
+        let first_id = Uuid::parse_str(&recurring[0].id)
+            .expect("guid")
+            .simple()
+            .to_string();
+        for mut timer in mgr.get_timers().await.expect("timers") {
+            if timer
+                .base
+                .program_id
+                .as_deref()
+                .is_some_and(|p| p.eq_ignore_ascii_case(&first_id))
+            {
+                timer.series_timer_id = Some(st_id.clone());
+                mgr.persist_timer(&timer).await.expect("store");
+            }
+        }
+        let programs = mgr
+            .get_programs(&InternalItemsQuery::default(), &DtoOptions::default())
+            .await
+            .expect("programs")
+            .items;
+        let first = programs
+            .iter()
+            .find(|p| p.id.simple().to_string() == first_id)
+            .expect("the first airing");
+        assert_eq!(first.series_timer_id.as_deref(), Some(st_id.as_str()));
+
+        // A manual timer carries no series timer, so the fallback still runs.
+        let timer_id = mgr
+            .create_timer(timer_from_defaults(&defaults_for(&mgr, other).await))
+            .await
+            .expect("manual timer");
+        assert_eq!(
+            links().await[0],
+            (Some(timer_id), Some("New".to_owned()), Some(first_by_name))
+        );
     }
 
     /// gl-1745: `get_timers_matching` builds each timer as `GetTimerInfoDto`
