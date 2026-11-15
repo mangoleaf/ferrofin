@@ -3243,14 +3243,15 @@ pub const VERIFIED: &[Verified] = &[
                the live network policy (ferrofin-networking NetworkManager::update_settings: \
                UpdateSettings, warning of each LAN or exclusion entry InitializeLan ignores \
                and logging an error for each override InitializeOverrides cannot parse, the \
-               loop stopping at the first without exactly one '=' as upstream's does), the \
+               loop stopping at the first without exactly one '=' as upstream's does, then \
+               PrintNetworkInformation(config, false): its seven Information lines), the \
                listeners (ferrofin-server listen.rs \
                restart_listener: the port restart of OnConfigurationUpdated), the committed \
                checks for ApplicationHost.OnConfigurationUpdated) → for livetv \
                LiveTvManager::create_recording_folders (ferrofin-livetv recording_folders.rs: \
                RecordingsManager.OnNamedConfigurationUpdated, which the Live TV manager's tuner \
                and provider saves run too, as upstream's save of livetv does)",
-        date: "2026-11-11",
+        date: "2026-11-14",
         divergences: &[
             "database is refused with a 400: Ferrofin has no other database provider (owner \
          decision 2026-10-23).",
