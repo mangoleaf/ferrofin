@@ -944,20 +944,77 @@ fn lifetime_app(
     axum::Router::new().fallback_service(app)
 }
 
-/// Kestrel refuses a request whose path holds a NUL (`%00`) before any
-/// middleware runs: an empty `400` that closes the connection (measured on
-/// Jellyfin 12.4), on the startup server too. So no decoded path segment a
-/// handler sees holds a NUL; the query still may.
-async fn refuse_nul_in_path(request: Request, next: Next) -> Response {
-    if request.uri().path().contains("%00") {
-        return (
-            axum::http::StatusCode::BAD_REQUEST,
-            [(axum::http::header::CONNECTION, "close")],
-        )
-            .into_response();
-    }
-    next.run(request).await
+/// Kestrel refuses these requests before any middleware runs, with an empty
+/// `400` that closes the connection (measured on Jellyfin 12.4), on the
+/// startup server too:
+/// - a path holding a NUL (`%00`), so no decoded path segment a handler sees
+///   holds a NUL; the query still may;
+/// - a request target whose path or query holds a byte outside ASCII, which
+///   `http` takes when it is UTF-8;
+/// - a header value that is not UTF-8: Kestrel reads a value as ASCII, then as
+///   strict UTF-8 (its default header encoding, which Jellyfin keeps), and
+///   fails one that is neither, where hyper takes bytes 0x80-0xFF as
+///   `obs-text`.
+///
+/// hyper itself refuses, with the same answer, the rest of what was measured
+/// refused on both: a NUL or a lone CR in a value, a header name outside the
+/// token characters or with whitespace before its colon, a folded header
+/// line, a target that is not UTF-8, a request line with a doubled space and
+/// two different `Content-Length`s. Where Ferrofin's answer departs from
+/// Kestrel's once hyper or `http` has parsed the request is in
+/// [`KESTREL_REFUSAL_DIVERGENCES`].
+async fn kestrel_refusals(request: Request, next: Next) -> Response {
+    let uri = request.uri();
+    let reason = if uri.path().contains("%00") {
+        "a NUL in the path"
+    } else if !uri
+        .path_and_query()
+        .is_none_or(|target| target.as_str().is_ascii())
+    {
+        "a request target outside ASCII"
+    } else if request
+        .headers()
+        .values()
+        .any(|value| std::str::from_utf8(value.as_bytes()).is_err())
+    {
+        "a header value that is not UTF-8"
+    } else {
+        return next.run(request).await;
+    };
+    tracing::debug!(reason, "request rejected");
+    (
+        axum::http::StatusCode::BAD_REQUEST,
+        [(axum::http::header::CONNECTION, "close")],
+    )
+        .into_response()
 }
+
+/// Where the requests refused before routing depart from Kestrel's, each with
+/// its fix path.
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "a record for readers; a test checks its form")
+)]
+const KESTREL_REFUSAL_DIVERGENCES: &[&str] = &[
+    "hyper refuses a header value holding a \
+     control byte other than a tab (0x01-0x08, 0x0B, 0x0C, 0x0E-0x1F and 0x7F, each \
+     measured on Jellyfin 12.4) with an empty 400 before any of Ferrofin's code runs; \
+     Kestrel takes them and Jellyfin serves the request. Fix path: gl-1848; httparse, \
+     hyper's HTTP/1 parser, has no option to take them, so one proposed upstream, or a \
+     patched httparse until it lands.",
+    "hyper answers a request line naming an HTTP version other than 1.0 and 1.1 \
+     (HTTP/1.2, HTTP/2.0, http/1.1) with 400; Kestrel answers 505. Fix path: gl-1848; \
+     the version token is gone once hyper has refused the request, so the answer has \
+     to come from below it, at the socket, where the connection limits already see \
+     the request's bytes.",
+    "hyper refuses a Content-Length with a sign (+1) with 400; Kestrel takes it. Fix \
+     path: gl-1848; the refusal is hyper's own Content-Length reading \
+     (hyper::headers::from_digits), not httparse's.",
+    "http drops a request target's fragment (#...) before any of Ferrofin's code runs, \
+     so the request is served on the path before it; Kestrel keeps the fragment in the \
+     path (404) and refuses one holding a byte outside ASCII (400). Fix path: gl-1848; \
+     only the raw request line still holds the fragment.",
+];
 
 /// A lifetime's serve loops, one per listening address, all stopped by the
 /// same trigger. Dropping it aborts them and closes the listeners.
@@ -993,14 +1050,14 @@ impl Serving {
     }
 
     /// Serves `app` on more listeners, stopped by the same trigger, behind
-    /// Kestrel's own refusals ([`refuse_nul_in_path`]).
+    /// Kestrel's own refusals ([`kestrel_refusals`]).
     fn serve(
         &mut self,
         listeners: impl IntoIterator<Item = listen::ServedListener>,
         app: &axum::Router,
     ) {
         let app = axum::Router::new()
-            .fallback_service(axum::middleware::from_fn(refuse_nul_in_path).layer(app.clone()));
+            .fallback_service(axum::middleware::from_fn(kestrel_refusals).layer(app.clone()));
         for listener in listeners {
             let mut stop = self.stop.subscribe();
             let app = app.clone();
@@ -1684,14 +1741,17 @@ mod tests {
         );
     }
 
-    /// A path holding a NUL is Kestrel's empty `400`, and the connection
-    /// closes after it, on the startup server and the lifetime's router alike;
-    /// one in the query reaches the route (measured on Jellyfin 12.4).
+    /// A path holding a NUL, a request target outside ASCII (its path or its
+    /// query) and a header value that is not UTF-8 are Kestrel's empty `400`,
+    /// and the connection closes after it, on the startup server and the
+    /// lifetime's router alike, as are the heads hyper refuses itself; a NUL
+    /// in the query, a percent-encoded target and a UTF-8 header value reach
+    /// the route (measured on Jellyfin 12.4).
     #[rstest::rstest]
     #[case::starting(true)]
     #[case::ready(false)]
     #[tokio::test]
-    async fn a_nul_in_the_path_is_refused_on_every_listener(#[case] starting: bool) {
+    async fn what_kestrel_refuses_is_refused_on_every_listener(#[case] starting: bool) {
         use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
         let listener = super::listen::bind("127.0.0.1:0".parse().expect("address")).expect("bind");
@@ -1705,31 +1765,51 @@ mod tests {
         };
         let _serving =
             super::Serving::start(vec![crate::listen::ServedListener::Plain(listener)], &app);
-        // (target, refused)
-        let mut cases = vec![
-            ("/jellyfin/echo/1%00", true),
-            ("/System/Info/Public%00", true),
-            ("/x%00", true),
+        // Each a request line and its headers.
+        let refused: [&[u8]; 12] = [
+            b"GET /jellyfin/echo/1%00 HTTP/1.1\r\nHost: x\r\n",
+            b"GET /System/Info/Public%00 HTTP/1.1\r\nHost: x\r\n",
+            b"GET /x%00 HTTP/1.1\r\nHost: x\r\n",
+            b"GET /jellyfin/echo/caf\xC3\xA9 HTTP/1.1\r\nHost: x\r\n",
+            b"GET /jellyfin/echo/1?q=caf\xC3\xA9 HTTP/1.1\r\nHost: x\r\n",
+            b"GET /x HTTP/1.1\r\nHost: x\r\nX-Test: caf\xE9\r\n",
+            b"GET /x HTTP/1.1\r\nHost: x\r\nUser-Agent: \xC0\xAF\r\n",
+            b"GET /x HTTP/1.1\r\nHost: x\r\nX-Forwarded-For: \xED\xA0\x80\r\n",
+            b"GET /x HTTP/1.1\r\nHost: x\r\nX-Test: ok\r\nX-Test: caf\xC3\r\n",
+            // Refused by hyper itself, with the same answer.
+            b"GET /x HTTP/1.1\r\nHost: x\r\nX-Test: a\x00b\r\n",
+            b"GET /x HTTP/1.1\r\nHost: x\r\nX-Test : a\r\n",
+            b"GET /x HTTP/1.1\r\nHost: x\r\nX-Test: a\r\n b\r\n",
         ];
-        if !starting {
-            cases.push(("/jellyfin/echo/1?limit=1%00", false));
-            cases.push(("/jellyfin/echo/1%2500", false));
-        }
-        for (target, refused) in cases {
+        let served: [&[u8]; 3] = [
+            b"GET /jellyfin/echo/1?limit=1%00 HTTP/1.1\r\nHost: x\r\n",
+            b"GET /jellyfin/echo/1%2500 HTTP/1.1\r\nHost: x\r\n",
+            b"GET /jellyfin/echo/caf%C3%A9?q=caf%C3%A9 HTTP/1.1\r\nHost: x\r\nX-Test: caf\xC3\xA9\r\n",
+        ];
+        let cases = refused.iter().map(|head| (head, true)).chain(
+            served
+                .iter()
+                .filter(|_| !starting)
+                .map(|head| (head, false)),
+        );
+        for (head, expect_refusal) in cases {
+            let label = head.escape_ascii().to_string();
             let mut stream = tokio::net::TcpStream::connect(address)
                 .await
                 .expect("connect");
-            let request = format!("GET {target} HTTP/1.1\r\nHost: x\r\n\r\n");
-            stream.write_all(request.as_bytes()).await.expect("request");
+            stream
+                .write_all(&[head, &b"\r\n"[..]].concat())
+                .await
+                .expect("request");
             let mut response = Vec::new();
-            if refused {
+            if expect_refusal {
                 // Read to the end: only a closed connection ends it.
                 tokio::time::timeout(
                     std::time::Duration::from_secs(10),
                     stream.read_to_end(&mut response),
                 )
                 .await
-                .expect("the connection closes")
+                .unwrap_or_else(|_| panic!("{label}: the connection stays open"))
                 .expect("response");
             } else {
                 let mut chunk = [0_u8; 1024];
@@ -1743,22 +1823,29 @@ mod tests {
                 response.extend_from_slice(&chunk[..read]);
             }
             let response = String::from_utf8_lossy(&response).to_ascii_lowercase();
-            let status = if refused {
-                "http/1.1 400"
-            } else {
-                "http/1.1 200"
-            };
-            assert!(response.starts_with(status), "{target}: {response}");
-            if refused {
+            let status = if expect_refusal { "400" } else { "200" };
+            assert_eq!(
+                response.split(' ').nth(1),
+                Some(status),
+                "{label}: {response}"
+            );
+            if expect_refusal {
                 assert!(
                     response.contains("content-length: 0"),
-                    "{target}: {response}"
+                    "{label}: {response}"
                 );
                 assert!(
                     response.ends_with("\r\n\r\n"),
-                    "{target}: no body: {response}"
+                    "{label}: no body: {response}"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn every_kestrel_refusal_divergence_names_its_fix_path() {
+        for divergence in super::KESTREL_REFUSAL_DIVERGENCES {
+            assert!(divergence.contains("Fix path: gl-"), "{divergence}");
         }
     }
 
