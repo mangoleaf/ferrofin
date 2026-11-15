@@ -482,10 +482,11 @@ and size-capped:
 
 - **`set-user-data`** — updates played/favorite/resume-position for a named user+item.
   TRUST NOTE: this mutates **real watch state for ANY user** — the strongest write a
-  plugin has (it exists for scrobble-sync plugins like Trakt). Every call is logged with
-  the plugin, user, and item named; install plugins that declare it in their
-  documentation and that you trust. A finer-grained per-plugin grant is planned (same
-  status as the egress-`*` UX).
+  plugin has (it exists for scrobble-sync plugins like Trakt). Each plugin call that
+  writes logs one info line with the plugin named and the number of writes, and each
+  write is logged at debug with the plugin, user, and item named; install plugins that
+  declare it in their documentation and that you trust. A finer-grained per-plugin
+  grant is planned (same status as the egress-`*` UX).
 - **`write-lyrics` / `write-subtitles`** — save a sidecar next to the media file
   (payload ≤ `FERROFIN_WASM_WRITE_CONTENT_MB`, default 2 MiB). The host sanitizes the
   file name: the format is allowlisted to real lyric/subtitle extensions and the

@@ -1332,8 +1332,10 @@ fn parse_uuid(what: &str, raw: &str) -> Result<Uuid, String> {
         .map_err(|_| format!("{what} `{raw}` is not a valid UUID"))
 }
 
-/// Executes `set-user-data` — the strongest write a plugin has; logged
-/// per call with the plugin named (see the WIT trust note).
+/// Executes `set-user-data` — the strongest write a plugin has; logged at
+/// debug with the plugin named, and counted in the guest call's info line
+/// ([`HostState::log_user_data_writes`](crate::bindings::HostState::log_user_data_writes);
+/// see the WIT trust note).
 ///
 /// # Errors
 /// Invalid ids or a manager failure, as the guest-visible string.
@@ -1346,10 +1348,10 @@ pub fn set_user_data(
 ) -> Result<(), String> {
     let uid = parse_uuid("user-id", user_id)?;
     let iid = parse_uuid("item-id", item_id)?;
-    tracing::info!(
+    tracing::debug!(
         plugin = plugin_name,
-        user = %uid,
-        item = %iid,
+        user_id = %uid,
+        item_id = %iid,
         played = ?update.played,
         favorite = ?update.favorite,
         position = ?update.playback_position_ticks,
