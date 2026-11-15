@@ -379,18 +379,29 @@ pub fn lower_invariant(text: &str) -> String {
 /// One character as `OrdinalIgnoreCase` folds it: the invariant simple
 /// uppercase, except the long s `ſ` (U+017F), which the runtime's ordinal
 /// casing table keeps as itself (measured on .NET 10: the only character where
-/// it differs from `ToUpperInvariant`).
-fn to_upper_ordinal(c: char) -> char {
-    if c == '\u{017f}' {
+/// it differs from `ToUpperInvariant`). For ports that compare `char` by `char`;
+/// whole strings go through [`equals_ordinal_ignore_case`].
+#[must_use]
+pub fn to_upper_ordinal(c: char) -> char {
+    if c.is_ascii() {
+        c.to_ascii_uppercase()
+    } else if c == '\u{017f}' {
         c
     } else {
         to_upper_invariant(c)
     }
 }
 
-fn to_upper_invariant(c: char) -> char {
+/// .NET's invariant uppercase of one Unicode scalar (`char.ToUpperInvariant`,
+/// or `Rune.ToUpperInvariant` beyond the BMP): the simple uppercase, keeping
+/// the dotless `ı` (U+0131) and the pairs newer than .NET's ICU. Whole strings
+/// go through [`upper_invariant`].
+#[must_use]
+pub fn to_upper_invariant(c: char) -> char {
     // .NET ChangeCaseInvariant preserves dotless i, unlike Unicode's default.
-    if c == '\u{0131}' || NEWER_UNICODE_CASE_PAIRS.binary_search(&c).is_ok() {
+    if c.is_ascii() {
+        c.to_ascii_uppercase()
+    } else if c == '\u{0131}' || NEWER_UNICODE_CASE_PAIRS.binary_search(&c).is_ok() {
         c
     } else {
         icu_casemap::CaseMapper::new().simple_uppercase(c)
@@ -483,6 +494,16 @@ mod tests {
                 char::from_u32(lower).unwrap().to_string(),
                 "lowercase U+{scalar:04X}"
             );
+            // The per-character folds too: the strings above take an ASCII
+            // shortcut that never reaches them.
+            let upper = char::from_u32(upper).unwrap();
+            assert_eq!(
+                to_upper_invariant(c),
+                upper,
+                "char uppercase U+{scalar:04X}"
+            );
+            let ordinal = if c == '\u{017f}' { c } else { upper };
+            assert_eq!(to_upper_ordinal(c), ordinal, "ordinal U+{scalar:04X}");
         }
     }
 

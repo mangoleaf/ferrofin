@@ -17,6 +17,7 @@ use std::fmt::Write as _;
 use chrono::{DateTime, Utc};
 use ferrofin_model::data::PersonKind;
 use ferrofin_model::entities_media::MetadataProvider;
+use ferrofin_util::string_extensions::{equals_ordinal_ignore_case, lower_invariant};
 
 use crate::container_types::{MetadataResult, PersonInfo};
 
@@ -68,21 +69,6 @@ impl Collation {
             .as_ref()
             .map_or_else(|| left.cmp(right), |comparer| comparer.compare(left, right))
     }
-}
-
-/// `StringComparer.OrdinalIgnoreCase.Equals`: equal after each character's
-/// simple (one-to-one) invariant upper-casing. Unlike `eq_ignore_ascii_case`
-/// it folds non-ASCII letters (`é`/`É`, `ж`/`Ж`), and unlike Rust's full case
-/// mapping it does not expand (`ß` stays `ß`, as .NET's `ToUpperInvariant`).
-pub(crate) fn equals_ordinal_ignore_case(left: &str, right: &str) -> bool {
-    fn fold(c: char) -> char {
-        let mut upper = c.to_uppercase();
-        match (upper.next(), upper.next()) {
-            (Some(single), None) => single,
-            _ => c,
-        }
-    }
-    left.chars().map(fold).eq(right.chars().map(fold))
 }
 
 /// The `dateadded` timestamp format (`BaseNfoSaver.DateAddedFormat`).
@@ -259,17 +245,7 @@ fn output_trailer_url(url: &str) -> String {
 /// to one, non-ASCII letters included (a full Unicode mapping that expands a
 /// character is not .NET's).
 fn tag_for_provider_key(key: &str) -> String {
-    let lower: String = key
-        .chars()
-        .map(|c| {
-            let mut lower = c.to_lowercase();
-            match (lower.next(), lower.next()) {
-                (Some(single), None) => single,
-                _ => c,
-            }
-        })
-        .collect();
-    format!("{lower}id")
+    format!("{}id", lower_invariant(key))
 }
 
 /// Whether `item` derives from `Video` for the `is not Video` outline guard.
@@ -1237,6 +1213,46 @@ mod tests {
         assert_eq!(tag_for_provider_key("MyCustom"), "mycustomid");
         assert_eq!(tag_for_provider_key("Imdb"), "imdbid");
         assert_eq!(tag_for_provider_key("\u{c4}pple"), "\u{e4}ppleid");
+    }
+
+    /// `ToLowerInvariant` is .NET's one-to-one fold (`ferrofin-util`'s .NET 10
+    /// table is the oracle): `İ` (U+0130) stays `İ`, a final `Σ` is `σ`, and
+    /// `ᾼ` is `ᾳ`.
+    #[rstest]
+    #[case("\u{0130}D", "\u{0130}did")]
+    #[case(
+        "\u{039F}\u{0394}\u{039F}\u{03A3}",
+        "\u{03BF}\u{03B4}\u{03BF}\u{03C3}id"
+    )]
+    #[case("\u{1FBC}", "\u{1FB3}id")]
+    #[case("\u{0131}\u{017F}", "\u{0131}\u{017F}id")]
+    fn tag_for_provider_key_folds_as_to_lower_invariant(#[case] key: &str, #[case] tag: &str) {
+        assert_eq!(tag_for_provider_key(key), tag);
+    }
+
+    /// The `OrdinalIgnoreCase` dedup keeps the dotless `ı` and the long `ſ`
+    /// apart from `I` and `S`, and merges `ᾳ` with `ᾼ`, as .NET's ordinal
+    /// casing does.
+    #[rstest]
+    #[case("K\u{0131}ral", "KIRAL", 2)]
+    #[case("\u{017F}am", "Sam", 2)]
+    #[case("\u{1FB3}x", "\u{1FBC}x", 1)]
+    #[case("\u{0130}lk", "ilk", 2)]
+    fn distinct_people_fold_as_ordinal_ignore_case(
+        #[case] first: &str,
+        #[case] second: &str,
+        #[case] kept: usize,
+    ) {
+        let person = |name: &str| PersonInfo {
+            name: name.to_owned(),
+            type_: PersonKind::Director,
+            ..PersonInfo::default()
+        };
+        let people = [person(first), person(second)];
+        assert_eq!(
+            distinct_sorted_people(&people, PersonKind::Director, &Collation(None)).len(),
+            kept
+        );
     }
 
     #[test]

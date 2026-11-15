@@ -28,6 +28,7 @@ use ferrofin_naming::external_files::{ExternalPathParser, ExternalPathParserResu
 use ferrofin_naming::path as naming_path;
 use ferrofin_traits::filesystem::FileSystem;
 use ferrofin_traits::media_encoding::{MediaEncoder, MediaInfoRequest};
+use ferrofin_util::string_extensions::to_upper_ordinal;
 
 use crate::localization_manager::LocalizationManager;
 
@@ -474,7 +475,7 @@ fn strip_prefix_ignore_case<'a>(name: &'a str, prefix: &str) -> Option<&'a str> 
     let mut name_chars = name.char_indices();
     for expected in prefix.chars() {
         let (_, actual) = name_chars.next()?;
-        if !actual.to_lowercase().eq(expected.to_lowercase()) {
+        if to_upper_ordinal(actual) != to_upper_ordinal(expected) {
             return None;
         }
     }
@@ -1653,6 +1654,13 @@ mod tests {
     #[case("My.Video Sequel", "My.Video", Some(" Sequel"))]
     #[case("My.Vid", "My.Video", None)]
     #[case("Other.Video", "My.Video", None)]
+    // .NET's per-character `OrdinalIgnoreCase` fold, not Rust's full lowercase:
+    // the Kelvin sign `K` (U+212A) is not `k`, the dotless `ı` and the long `ſ`
+    // keep their own case, and `ᾳ` is `ᾼ` (`ferrofin-util`'s .NET 10 table).
+    #[case("\u{212A}ey.en", "key", None)]
+    #[case("V\u{131}deo", "VIDEO", None)]
+    #[case("\u{17F}how", "show", None)]
+    #[case("\u{1FBC}x.en", "\u{1FB3}x", Some(".en"))]
     fn strip_prefix_ignores_case(
         #[case] name: &str,
         #[case] prefix: &str,

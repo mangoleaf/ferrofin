@@ -30,6 +30,7 @@ use ferrofin_model::dto::{MediaSourceInfo, MediaSourceType};
 use ferrofin_model::entities::VideoType;
 use ferrofin_traits::error::ServiceError;
 use ferrofin_traits::persistence::ItemRepository;
+use ferrofin_util::string_extensions::{to_upper_invariant, to_upper_ordinal};
 use uuid::Uuid;
 
 /// The delimiters a version label is cut at (`BaseItem.VersionDelimiters`,
@@ -896,18 +897,13 @@ fn containing_folder_name(video: &BaseItemEntity) -> String {
         .unwrap_or_default()
 }
 
-/// .NET `char.ToUpperInvariant` for the simple one-to-one mappings.
-fn upper(c: char) -> char {
-    let mut up = c.to_uppercase();
-    match (up.next(), up.next()) {
-        (Some(u), None) => u,
-        _ => c,
-    }
-}
-
 /// `text.StartsWith(prefix, StringComparison.OrdinalIgnoreCase)`, on chars.
 fn starts_with_ignore_case(text: &[char], prefix: &[char]) -> bool {
-    text.len() >= prefix.len() && text.iter().zip(prefix).all(|(a, b)| upper(*a) == upper(*b))
+    text.len() >= prefix.len()
+        && text
+            .iter()
+            .zip(prefix)
+            .all(|(a, b)| to_upper_ordinal(*a) == to_upper_ordinal(*b))
 }
 
 /// The label left after `prefix`: `displayName.AsSpan(prefix.Length)
@@ -1073,7 +1069,7 @@ pub fn common_version_prefix(file_names: &[&str]) -> String {
         let common = prefix
             .iter()
             .zip(name)
-            .take_while(|(a, b)| upper(**a) == upper(**b))
+            .take_while(|(a, b)| to_upper_invariant(**a) == to_upper_invariant(**b))
             .count();
         prefix.truncate(common);
     }
