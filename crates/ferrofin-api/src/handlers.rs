@@ -1490,22 +1490,37 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
                    open_image (guarded_http.rs GuardedHttp::send, which follows and vets each \
                    redirect; destination.rs ImageDestinations), provider_manager.rs \
                    cached_remote_image, and the scan's downloads of a credited person's \
-                   profile photo and a studio's thumb (ferrofin-core library_scan.rs \
+                   profile photo (the credit's URL from TheMovieDb, TheTVDB, or an NFO \
+                   actor's <thumb> through library_scan.rs person_to_entity) and a studio's \
+                   thumb (ferrofin-core library_scan.rs \
                    download_images and studio_thumb, named from the resolved type through \
                    tmdb.rs TmdbClient::download and studios.rs StudiosClient::download; \
                    enrich_people and enrich_studio_images hand the file to ferrofin-providers \
                    image_save.rs ImageFileSaver through finish_artwork, which puts a person's \
                    or a studio's new art beside its own folder while that is in the server's \
                    own directories, and otherwise follows the library's opt-in; rows stored \
-                   before keep their art-folder files), \
+                   before keep their art-folder files), and the scan's save of the artwork an \
+                   NFO names by URL, an item's <thumb> and <fanart><thumb> \
+                   (library_scan.rs fetch_local_nfo's LocalNfo.remote_images, saved by \
+                   save_nfo_images in collect_artwork before the image providers run, for each \
+                   type the item has no image of, whatever the library's image fetchers and \
+                   per-type limits, as upstream; downloaded through tmdb.rs \
+                   TmdbClient::download, written by artwork.rs write_acquired_image and \
+                   published by finish_artwork's image saver), \
                    compared with \
                    MediaBrowser.Providers/Manager/ProviderManager.cs (SaveImage), \
                    MediaBrowser.Providers/Manager/ItemImageProvider.cs (EnableImageStub, \
                    SaveImageStub: a Person and a Studio are IItemByName, so their remote \
-                   images reach SaveImage through a stub), \
+                   images reach SaveImage through a stub; MergeImages, UpdateReplaceImages and \
+                   RefreshImages), \
                    MediaBrowser.Providers/Manager/ImageSaver.cs (SaveImage, \
                    GetStandardSavePath), \
-                   Jellyfin.Server/Startup.cs (the NamedClient.Default handler) and \
+                   Jellyfin.Server/Startup.cs (the NamedClient.Default handler), \
+                   MediaBrowser.Controller/Extensions/XmlReaderExtensions.cs \
+                   (GetPersonFromXmlNode), \
+                   MediaBrowser.XbmcMetadata/Parsers/BaseNfoParser.cs (FetchThumbNode), \
+                   MediaBrowser.Providers/Manager/MetadataService.cs (RefreshWithProviders' \
+                   local-provider loop, MergePeople) and \
                    Emby.Server.Implementations/Library/LibraryManager.cs \
                    (SavePeopleMetadataAsync, UpdateImagesAsync, ConvertImageToLocal)",
         date: "2026-11-14",
@@ -1542,6 +1557,24 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
              Primary, which ConvertImageToLocal removes after a 404, a 403 or a non-image, so \
              the next crediting save asks again, and keeps after any other HTTP or I/O \
              failure, so no later credit asks.",
+            "An NFO actor's <thumb> that names a local file (the path an NFO saver writes, \
+             Kodi's .actors folder) is not the credit's photo: person_to_entity keeps only an \
+             http(s) URL, so a remote provider's photo URL for the same credit fills it \
+             (merge_people) and is downloaded, and with none the person gets no photo. \
+             Upstream's MergePeople keeps the path over the remote URL and \
+             SavePeopleMetadataAsync stores it as the Primary's path. Fix path: gl-1818, \
+             which first needs the owner's decision on which files an NFO may name.",
+            "An item's NFO <thumb> that names a local file is not read, where FetchThumbNode \
+             resolves any existing file (IDirectoryService.GetFile) and RefreshWithProviders \
+             sets it with MergeImages; an album's or an artist's NFO artwork URLs are not \
+             saved, where the same loop saves every kind's. Fix path for both: gl-1818; the \
+             local file first needs the owner's decision on which files an NFO may name.",
+            "Under \"Replace existing images\", an NFO's fanart saved as a Backdrop is kept and \
+             the item's earlier downloaded backdrops are replaced, as for any replaced type, \
+             while the image providers only fill the backdrops the limit has left. Upstream \
+             takes Backdrop out of the replace set once the NFO saved one, so it keeps the \
+             earlier backdrops and adds another copy of the NFO's to them on every such \
+             refresh. Jellyfin bug not ported.",
             "A remote image download refuses loopback, private, link-local, CGNAT and reserved \
              addresses, on its first request and on every redirect it follows (owner decision \
              2026-10-31, gl-1096), unless image_private_http_allow lists the host, its address \
@@ -3419,36 +3452,28 @@ pub const VERIFIED: &[Verified] = &[
                program_dto_options; items.rs resolve_user_opt) → query_programs_inner (the \
                StartDate default order, the librarySeriesId block) → ferrofin-livetv \
                manager.rs get_programs (stored_series_timer for seriesTimerId, \
-               user_restrictions, program_rows_query over push_program_filters, \
-               push_program_order and push_program_paging, the PROGRAM_COUNT total, \
+               user_restrictions, program_rows_query (the stored programme item joined by \
+               id) over push_program_filters, push_program_order with \
+               push_program_sort_key and push_program_paging, the PROGRAM_COUNT total, \
                projection.rs remove_fields, program_dtos → program_entity and dto_service.rs \
                get_base_item_dtos, apply_program_info, add_recording_info → \
                scheduled_timers_for over dvr_repository.rs scheduled_timers_for_programs, \
                timer_program_ids, apply_recording_info) (RequestHelpers.GetUserId, \
                RequestHelpers.GetOrderBy, DtoExtensions.AddAdditionalDtoOptions, \
                LiveTvManager.GetPrograms, LibraryManager.QueryItems, \
-               BaseItemRepository.TranslateQuery and ApplyOrder, RemoveFields, \
+               BaseItemRepository.TranslateQuery and ApplyOrder, OrderMapper, RemoveFields, \
                DtoService.GetBaseItemDtos, AddInfoToProgramDto, AddRecordingInfo, \
                GetTimersInternal, DefaultLiveTvService.GetTimersAsync)",
-        date: "2026-11-11",
+        date: "2026-11-14",
         divergences: &[
-            "genreIds is bound but filters nothing: every programme the other filters keep is \
-         listed, where upstream's TranslateQuery keeps only those with one of the genres \
-         (WhereReferencedItem over the Genre item values). Fix path: gl-1686.",
             "isSports, isNews and isKids each match the programme's own flag, so when two or \
          more are true a programme must have them all; upstream turns each true one into a \
          tag and keeps a programme with any of those tags, so isSports=true&isKids=true \
          lists sports and kids programmes alike. A false one excludes its flag in both. Fix \
          path: gl-1687.",
-            "Only StartDate, Name, SortName, OfficialRating, ProductionYear and Random order \
-         the page, over the guide's own columns: Name and SortName sort the title as stored \
-         (case-sensitively), OfficialRating sorts its text, Default sorts as StartDate, and \
-         any other key is skipped (StartDate when none is left); ties break on the \
-         programme id. Upstream's ApplyOrder sorts by every key through OrderMapper: Name \
-         by CleanName, SortName by the sort name, OfficialRating by the parental rating \
-         score, DateCreated, PremiereDate, CommunityRating, Runtime and the rest by their \
-         columns, drops Default (SortName when no key is left) and breaks ties on the sort \
-         name. Fix path: gl-1688.",
+            "With no user (an API key), sortBy PlayCount, IsFavoriteOrLiked, IsPlayed or \
+         IsUnplayed sorts by SortName, as /Items does; upstream's OrderMapper reads the \
+         missing user's id (query.User!.Id), which throws. Jellyfin bug not ported.",
             "enableTotalRecordCount=false with a startIndex reports the page's length plus \
          startIndex as TotalRecordCount; upstream's QueryItems reads GetItemList and \
          reports the page's length. Fix path: gl-1689.",
@@ -3486,7 +3511,8 @@ pub const VERIFIED: &[Verified] = &[
                body UserId only) → query_programs_inner (the StartDate default order, the \
                LibrarySeriesId block) → ferrofin-livetv manager.rs get_programs \
                (stored_series_timer for SeriesTimerId, user_restrictions, program_rows_query \
-               over push_program_filters, push_program_order and push_program_paging, the \
+               (the stored programme item joined by id) over push_program_filters, \
+               push_program_order with push_program_sort_key and push_program_paging, the \
                PROGRAM_COUNT total, projection.rs remove_fields, program_dtos → \
                program_entity and dto_service.rs get_base_item_dtos, apply_program_info, \
                add_recording_info → scheduled_timers_for over dvr_repository.rs \
@@ -3494,9 +3520,9 @@ pub const VERIFIED: &[Verified] = &[
                (GetProgramsDto, RequestHelpers.GetOrderBy, \
                DtoExtensions.AddAdditionalDtoOptions, LiveTvManager.GetPrograms, \
                LibraryManager.QueryItems, BaseItemRepository.TranslateQuery and ApplyOrder, \
-               RemoveFields, DtoService.GetBaseItemDtos, AddInfoToProgramDto, \
+               OrderMapper, RemoveFields, DtoService.GetBaseItemDtos, AddInfoToProgramDto, \
                AddRecordingInfo, GetTimersInternal, DefaultLiveTvService.GetTimersAsync)",
-        date: "2026-11-11",
+        date: "2026-11-14",
         divergences: &[
             "A body UserId naming another user, sent without the administrator role, is a 403 \
          (the RequestHelpers.GetUserId rule GET applies); upstream's GetPrograms reads \
@@ -3509,22 +3535,13 @@ pub const VERIFIED: &[Verified] = &[
          does. Fix path: gl-1033.",
             "A null EnableTotalRecordCount reads as true; upstream's member is a non-nullable \
          bool, which System.Text.Json refuses to bind from null (a 400). Fix path: gl-1691.",
-            "GenreIds is bound but filters nothing: every programme the other filters keep is \
-         listed, where upstream's TranslateQuery keeps only those with one of the genres \
-         (WhereReferencedItem over the Genre item values). Fix path: gl-1686.",
             "IsSports, IsNews and IsKids each match the programme's own flag, so when two or \
          more are true a programme must have them all; upstream turns each true one into a \
          tag and keeps a programme with any of those tags. A false one excludes its flag in \
          both. Fix path: gl-1687.",
-            "Only StartDate, Name, SortName, OfficialRating, ProductionYear and Random order \
-         the page, over the guide's own columns: Name and SortName sort the title as stored \
-         (case-sensitively), OfficialRating sorts its text, Default sorts as StartDate, and \
-         any other key is skipped (StartDate when none is left); ties break on the \
-         programme id. Upstream's ApplyOrder sorts by every key through OrderMapper: Name \
-         by CleanName, SortName by the sort name, OfficialRating by the parental rating \
-         score, DateCreated, PremiereDate, CommunityRating, Runtime and the rest by their \
-         columns, drops Default (SortName when no key is left) and breaks ties on the sort \
-         name. Fix path: gl-1688.",
+            "With no body UserId, SortBy PlayCount, IsFavoriteOrLiked, IsPlayed or \
+         IsUnplayed sorts by SortName, as /Items does; upstream's OrderMapper reads the \
+         missing user's id (query.User!.Id), which throws. Jellyfin bug not ported.",
             "EnableTotalRecordCount=false with a StartIndex reports the page's length plus \
          StartIndex as TotalRecordCount; upstream's QueryItems reads GetItemList and \
          reports the page's length. Fix path: gl-1689.",
@@ -4884,13 +4901,19 @@ pub const VERIFIED: &[Verified] = &[
                system_manager.rs restart → apps/ferrofin-server state.rs \
                FerrofinLifecycleController stop (SystemManager.ShutdownInternal), lib.rs \
                announce_shutdown (SessionManager.OnApplicationStopping), tear_down_host \
-               (HlsStreamManager::shutdown, LiveTvManager::shutdown: Program.cs disposes the \
-               host, RecordingsManager.Dispose, MediaSourceManager.Dispose)",
+               (HlsStreamManager::shutdown, AttachmentExtractor::shutdown, \
+               LiveTvManager::shutdown: Program.cs disposes the host, RecordingsManager.Dispose, \
+               AttachmentExtractor.Dispose, MediaSourceManager.Dispose)",
         date: "2026-11-11",
         divergences: &[
-            "The host teardown goes further than upstream's disposal (gl-141). It does four things. \
+            "The host teardown goes further than upstream's disposal (gl-141). It does five things. \
          It kills every transcode: upstream's TranscodeManager.Dispose kills no job, and each \
          dies at its own kill timer, into a transcode cache the next host has already purged. \
+         It kills every attachment extraction still running and deletes the outputs it names \
+         (gl-1517; a batch dump names none, as its files are named by the media): \
+         upstream's AttachmentExtractor.Dispose only disposes its locks, and an extraction, \
+         which runs with a token nothing cancels, finishes under the next host, whose fresh \
+         locks let a request serve the half-written file or start a second ffmpeg onto it. \
          It closes every open live stream: MediaSourceManager.Dispose releases one consumer \
          per stream. It stops the pending recording timers: upstream does not dispose its \
          TimerManager. And it waits for the recordings RecordingsManager.Dispose cancels to \
@@ -5226,12 +5249,13 @@ pub const VERIFIED: &[Verified] = &[
         ferrofin: "handlers/hls.rs get_video_attachment (RequiredRouteString mediaSourceId, \
                registered as {container}: ConvertEmptyStringToNull, then [Required], before \
                the item is read) → ferrofin-mediaencoding \
-               attachments/extractor.rs get_attachment, extract_attachment \
-               (AttachmentExtractor.GetAttachment, GetAttachmentStream, ExtractAttachment, \
-               ExtractAttachmentInternal) → apps/ferrofin-server media_encoding.rs \
-               MediaSourceManagerResolver, FfmpegAttachmentIo open_file, run_ffmpeg → \
-               handlers/streaming.rs opened_file_response (FileStreamResult)",
-        date: "2026-11-09",
+               attachments/extractor.rs get_attachment, run_to_completion (the extraction \
+               on a task of its own: upstream passes CancellationToken.None), \
+               extract_attachment (AttachmentExtractor.GetAttachment, GetAttachmentStream, \
+               ExtractAttachment, ExtractAttachmentInternal) → apps/ferrofin-server \
+               media_encoding.rs MediaSourceManagerResolver, FfmpegAttachmentIo open_file, \
+               run_ffmpeg → handlers/streaming.rs opened_file_response (FileStreamResult)",
+        date: "2026-11-11",
         divergences: &[
             "The media source comes from GetStaticMediaSources: upstream's \
          GetPlaybackMediaSources(item, null, true, false) first re-probes a .strm item (and \
@@ -5239,9 +5263,6 @@ pub const VERIFIED: &[Verified] = &[
          attachments here. Fix path: gl-1519. Its dynamic sources, a channel's tuner \
          streams, are in the static list here, and list no attachments on either side (a \
          404).",
-            "A dropped request kills a running extraction and deletes its output (gl-283); \
-         upstream's action passes CancellationToken.None, so its extraction runs to the end \
-         and the next request is served from the cache. Fix path: gl-1517.",
             "A nil videoId is a 404, not GetItemById's 400. Fix path: gl-1695.",
             "A mediaSourceId selects its source in any GUID spelling; upstream compares the N \
          form, ignoring case. Clients echo the id they were given, and an adopted database \
