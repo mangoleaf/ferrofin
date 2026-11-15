@@ -426,7 +426,8 @@ async fn segment_editor_metadata(
 /// as user-provided in the plugin's tier (`UpdateTimestampAsync`), then
 /// `MediaSegmentEditorService.CreateOrReplaceSegmentAsync` writes it under the
 /// plugin's provider id — replacing the item's other segments of that type
-/// (any provider), or, for a Commercial, skipping an identical one. The
+/// (any provider), or, for a Commercial, skipping an identical one; an item
+/// that is not a video or audio keeps the tier row and publishes nothing. The
 /// `providerId` query is `[Required]` (400 when absent) but not used for the
 /// write.
 async fn create_segment(

@@ -463,8 +463,10 @@ pub trait IntroSkipperAnalysis: Send + Sync {
     /// plugin's provider id (`MediaSegmentEditorService.CreateOrReplaceSegmentAsync`):
     /// a Commercial identical to one already published is skipped; any other
     /// type replaces the item's segments of that type, whatever their
-    /// provider. Edits of one item (`segment.item_id`) run one at a time,
-    /// process-wide; `segment.id` is ignored, as the store assigns one.
+    /// provider. Nothing is published for an item that takes no media
+    /// segments (not a video or audio). Edits of one item (`segment.item_id`)
+    /// run one at a time, process-wide; `segment.id` is ignored, as the store
+    /// assigns one.
     async fn create_or_replace_segment(
         &self,
         segment: &MediaSegmentDto,

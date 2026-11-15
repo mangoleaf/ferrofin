@@ -26,11 +26,17 @@ fn item_lock(item_id: Uuid) -> Arc<tokio::sync::Mutex<()>> {
 /// lock so two simultaneous edits publish one segment: a Commercial identical
 /// to one already published is skipped; any other type replaces the item's
 /// segments of that type (any provider); then the edit is published under the
-/// plugin's provider id.
+/// plugin's provider id. An item that takes no segments (not a video or
+/// audio) is left alone.
 pub(super) async fn create_or_replace_segment(
     segments: &dyn MediaSegmentManager,
     segment: &MediaSegmentDto,
 ) -> Result<(), ServiceError> {
+    // Jellyfin's `GetSupportedProviders(item)` is empty for anything but a Video or Audio.
+    if !segments.is_type_supported(segment.item_id).await? {
+        tracing::warn!(item_id = %segment.item_id, "intro skipper: the item is not a video or audio, or is gone; the edit is not published");
+        return Ok(());
+    }
     let lock = item_lock(segment.item_id);
     let _held = lock.lock().await;
     let existing = segments
@@ -74,12 +80,13 @@ mod tests {
     /// Segments in memory, by provider; each read yields after taking its
     /// snapshot, as a real store awaits there, so a concurrent edit reads the
     /// same snapshot. `fail_deletes` refuses every delete; a read of `gate`'s
-    /// item waits for its notification.
+    /// item waits for its notification; `unsupported` items take no segments.
     #[derive(Default)]
     struct YieldingSegments {
         rows: Mutex<Vec<(String, MediaSegmentDto)>>,
         fail_deletes: bool,
         gate: Option<(Uuid, Arc<Notify>)>,
+        unsupported: bool,
     }
 
     impl YieldingSegments {
@@ -91,7 +98,7 @@ mod tests {
     #[async_trait]
     impl MediaSegmentManager for YieldingSegments {
         async fn is_type_supported(&self, _item_id: Uuid) -> Result<bool, ServiceError> {
-            Ok(true)
+            Ok(!self.unsupported)
         }
         async fn create_segment(
             &self,
@@ -195,6 +202,28 @@ mod tests {
         let rows = segments.rows();
         assert_eq!(rows.len(), 1, "{rows:?}");
         assert_eq!(rows[0].1.end_ticks, 20);
+    }
+
+    /// `DoesNothing_WhenProviderNotFound`: Jellyfin offers no segment provider
+    /// for an item that is not a video or audio (`GetSupportedProviders`), so
+    /// such an edit is not published and replaces nothing.
+    #[tokio::test]
+    async fn an_item_that_takes_no_segments_is_left_alone() {
+        let item = Uuid::new_v4();
+        let segments = YieldingSegments {
+            unsupported: true,
+            ..YieldingSegments::default()
+        };
+        segments
+            .create_segment(&edit(item, MediaSegmentType::Intro, 0, 5), "Other")
+            .await
+            .expect("seed");
+        create_or_replace_segment(&segments, &edit(item, MediaSegmentType::Intro, 10, 20))
+            .await
+            .expect("edit");
+        let rows = segments.rows();
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert_eq!(rows[0].0, "Other", "{rows:?}");
     }
 
     /// `AllowsConcurrentCallsForDifferentItems`: the lock is per item, so an
