@@ -1844,6 +1844,10 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
                    external_stream_input_arguments and needs_external_subtitle_muxing (the \
                    rest of GetInputArgument: the external subtitle, read through the .idx \
                    beside a VobSub .sub, then the external audio; NeedsExternalSubtitleMuxing), \
+                   then GetInputArgument's last rule, -noautoscale after the inputs whenever \
+                   encoding_helper/hw/decoder.rs hardware_video_decoder names a decoder \
+                   (GetHardwareVideoDecoder non-empty, a hardware decode feeding a software \
+                   encoder included), \
                    and EncodingHelper::map_args with subtitle_map_args, \
                    negative_map_args_by_filters and find_index (GetMapArgs, \
                    GetNegativeMapArgsByFilters, FindIndex). Compared with those methods at the \
@@ -1864,7 +1868,9 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
         divergences: &[
             "A job reading a video file with hardware acceleration configured passes no -f \
              with the container's input format (GetInputFormat). Fix path: gl-1676.",
-            "A job behind a hardware decoder passes no -noautoscale. Fix path: gl-928.",
+            "An AMF, VideoToolbox or RKMPP job passes no -noautoscale where its accelerator \
+             names a decoder: it decodes in software here, so ffmpeg keeps its scaler. That \
+             is the owner's hardware scope decision (CLAUDE.md, Current scope).",
             "A seeked HLS job copying the video passes -noaccurate_seek (not for a wtv \
              input), which upstream does not: Ferrofin's HLS output carries -output_ts_offset \
              in place of upstream's -copyts, and without it a re-encoded audio track would \
