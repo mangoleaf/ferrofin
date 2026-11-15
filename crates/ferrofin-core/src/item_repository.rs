@@ -14455,10 +14455,16 @@ mod tests {
         let keys = [
             (BaseItemKind::Genre, "drama".to_owned()),
             (BaseItemKind::MusicGenre, "drama".to_owned()),
-            (BaseItemKind::Studio, "acme".to_owned()),
             (BaseItemKind::Studio, "nobody".to_owned()),
+            (BaseItemKind::Genre, "nothing".to_owned()),
+            // Five keys pad to eight by repeating the last, which resolves.
+            (BaseItemKind::Studio, "acme".to_owned()),
         ];
         let ids = by_name_ids_by_clean_name(&db, &keys).await.expect("ids");
+        assert!(
+            !ids[&BaseItemKind::Genre].contains_key("nothing"),
+            "{ids:?}"
+        );
         assert_eq!(ids[&BaseItemKind::Genre]["drama"], lo, "Min(Id) survivor");
         assert!(!ids.contains_key(&BaseItemKind::MusicGenre), "{ids:?}");
         assert_eq!(
@@ -14468,26 +14474,45 @@ mod tests {
         );
         assert!(!ids[&BaseItemKind::Studio].contains_key("nobody"));
 
-        let plan: Vec<(i64, i64, i64, String)> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
-            "EXPLAIN QUERY PLAN {}",
-            by_name_ids_sql(1)
-        )))
-        .bind("t")
-        .bind(2)
-        .bind("c")
-        .fetch_all(db.pool())
-        .await
-        .expect("plan");
-        let has = |needle: &str| plan.iter().any(|(_, _, _, line)| line.contains(needle));
-        assert!(
-            has("SEARCH bi USING INDEX IX_BaseItems_Type_CleanName (Type=? AND CleanName=?)")
-                && has(
-                    "SEARCH iv USING INDEX IX_ItemValues_Type_CleanValue (Type=? AND CleanValue=?)"
-                )
-                && !has("SCAN bi")
-                && !has("SCAN iv"),
-            "{plan:?}"
-        );
+        // At every length the padding produces (gl-1403).
+        for n in (0..=ferrofin_db::PADDED_LIST_MAX.ilog2()).map(|k| 1_usize << k) {
+            let mut query = sqlx::query_as::<_, (i64, i64, i64, String)>(sqlx::AssertSqlSafe(
+                format!("EXPLAIN QUERY PLAN {}", by_name_ids_sql(n)),
+            ));
+            for _ in 0..n {
+                query = query.bind("t").bind(2).bind("c");
+            }
+            let plan = query.fetch_all(db.pool()).await.expect("plan");
+            let has = |needle: &str| plan.iter().any(|(_, _, _, line)| line.contains(needle));
+            assert!(
+                has("SEARCH bi USING INDEX IX_BaseItems_Type_CleanName (Type=? AND CleanName=?)")
+                    && has(
+                        "SEARCH iv USING INDEX IX_ItemValues_Type_CleanValue (Type=? AND CleanValue=?)"
+                    )
+                    && !has("SCAN bi")
+                    && !has("SCAN iv"),
+                "{n} keys: {plan:?}"
+            );
+        }
+    }
+
+    /// The by-name id read prepares one statement per padded key count (1, 2,
+    /// 4, 8, 16 and 32 for 1 to 20 keys), not one per count (gl-1403).
+    #[tokio::test]
+    async fn by_name_link_ids_prepare_one_statement_per_padded_length() {
+        let db = test_db().await;
+        let cached = async |db: &ferrofin_db::Database| {
+            let reader = db.pool().acquire().await.expect("reader");
+            sqlx::Connection::cached_statements_size(&*reader)
+        };
+        let before = cached(&db).await;
+        for n in 1..=20 {
+            let keys: Vec<_> = (0..n)
+                .map(|i| (BaseItemKind::Genre, format!("genre {i}")))
+                .collect();
+            by_name_ids_by_clean_name(&db, &keys).await.expect("ids");
+        }
+        assert_eq!(cached(&db).await - before, 6);
     }
 
     /// …and rows with NO key collapse together, because that is what SQLite's
@@ -16690,7 +16715,7 @@ fn item_ids_by_clean_name_sql(names: usize) -> String {
     )
 }
 
-/// The statement behind [`by_name_ids_by_clean_name`] for `keys` keys of three
+/// The statement behind [`by_name_ids_by_clean_name`] for `keys` keys (padded) of three
 /// binds each (stored type name, `ItemValues.Type`, clean name).
 fn by_name_ids_sql(keys: usize) -> String {
     let values = vec!["(?, ?, ?)"; keys].join(", ");
@@ -16727,7 +16752,11 @@ pub(crate) async fn by_name_ids_by_clean_name(
     keys: &[(BaseItemKind, String)],
 ) -> Result<HashMap<BaseItemKind, HashMap<String, Uuid>>, ServiceError> {
     let mut ids: HashMap<BaseItemKind, HashMap<String, Uuid>> = HashMap::new();
-    for chunk in keys.chunks(ferrofin_db::BATCH_BIND_CHUNK / 3) {
+    // Padded as the `IN` reads are, so the `VALUES` list is one of a few
+    // lengths in each connection's statement cache, not one per key count
+    // (gl-1403). A repeated key returns its row again; the map keeps one.
+    // Three binds a key: a full chunk binds 768, under SQLite's 999 floor.
+    for chunk in ferrofin_db::padded_in_chunks(keys) {
         let mut query = sqlx::query_as::<_, (String, String, Option<String>)>(sqlx::AssertSqlSafe(
             by_name_ids_sql(chunk.len()),
         ));

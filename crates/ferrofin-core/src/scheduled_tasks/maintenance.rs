@@ -37,25 +37,10 @@ use uuid::Uuid;
 use crate::db_error::db_err;
 use crate::translate_query::PLACEHOLDER_ID;
 
-use super::{ScheduledTask, TaskProgress};
-
-/// 100-nanosecond ticks per second (the `TaskTriggerInfo` time unit).
-const TICKS_PER_SECOND: i64 = 10_000_000;
-
-/// Ticks per hour, for trigger intervals.
-const TICKS_PER_HOUR: i64 = 3600 * TICKS_PER_SECOND;
+use super::{ScheduledTask, TaskProgress, interval_hours};
 
 /// The upstream Maintenance category's localization key.
 const MAINTENANCE: &str = "TasksMaintenanceCategory";
-
-/// An interval trigger firing every `hours` hours.
-fn interval_hours(hours: i64) -> TaskTriggerInfo {
-    TaskTriggerInfo {
-        type_: TaskTriggerInfoType::IntervalTrigger,
-        interval_ticks: Some(hours * TICKS_PER_HOUR),
-        ..TaskTriggerInfo::default()
-    }
-}
 
 /// A startup trigger.
 fn startup() -> TaskTriggerInfo {
@@ -1331,7 +1316,7 @@ mod tests {
         assert_eq!(task.key(), "OptimizeDatabaseTask");
         assert_eq!(
             task.default_triggers()[0].interval_ticks,
-            Some(6 * TICKS_PER_HOUR)
+            Some(216_000_000_000)
         );
         let progress = TaskProgress::default();
         task.execute(&progress).await.expect("run");
