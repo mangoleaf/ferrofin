@@ -5189,16 +5189,20 @@ pub const VERIFIED: &[Verified] = &[
                {stem}.{language}[.forced][.sdh].{format} with the language lowercased and a \
                path separator refused, the format checked against \
                NamingOptions.SubtitleFileExtensions, a taken name moved to {name}.{n}.{format}, \
-               the name written bracketed as a self-write) → handlers.rs \
+               the name written bracketed as a self-write; a failed fetch or save, but a \
+               RateLimitExceeded, raises SubtitleDownloadFailure, which \
+               SubtitleDownloadFailureLogger records: SubtitleDownloadFailureFromForItem with \
+               the provider's name and GetItemName, type SubtitleDownloadFailure, no user, the \
+               item id, the error message as ShortOverview) → handlers.rs \
                queue_high_priority_refresh (QueueRefresh at RefreshPriority.High) → \
                ferrofin-providers opensubtitles.rs get_subtitles (the OpenSubtitles plugin's \
                GetSubtitles: a plugin outside the Jellyfin tree, not compared yet, gl-1644)",
-        date: "2026-11-10",
+        date: "2026-11-14",
         divergences: &[
-            "A download that fails once its provider is found writes no activity entry: \
-         upstream's DownloadSubtitles raises SubtitleDownloadFailure for any failure but a \
-         RateLimitExceededException, which SubtitleDownloadFailureLogger records as \
-         SubtitleDownloadFailureFromForItem. Fix path: gl-1640.",
+            "The failed download's activity entry is written in English, not the server's UI \
+         culture. Fix path: gl-429.",
+            "The entry names the OpenSubtitles provider opensubtitles; the plugin's Name, which \
+         upstream's entry shows, is Open Subtitles. Fix path: gl-1704.",
             "A DVD or Blu-ray folder rip's subtitle is written beside the rip's folder; \
          upstream's Video.ContainingFolderPath is the rip's folder itself, so it lands \
          inside it there. Fix path: gl-1643.",
