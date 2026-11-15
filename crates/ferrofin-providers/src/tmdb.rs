@@ -2378,8 +2378,9 @@ impl TmdbClient {
     /// Resolves a TMDB id from an external id (`/find/{id}?external_source=`)
     /// — port of `TmdbClientManager.FindByExternalIdAsync`, which the movie/
     /// series providers use to honour an IMDb/TVDB id already on the item.
-    /// `source` is TMDB's source name (`imdb_id` / `tvdb_id`). `None` on no
-    /// match or any error.
+    /// `source` is TMDB's source name (`imdb_id` / `tvdb_id`). `Some(vec![])`
+    /// when TMDB answers with no match; `None` for a blank id or a failed
+    /// request (a transport error, a non-2xx status, or an unreadable body).
     pub async fn find_by_external_id(
         &self,
         kind: TmdbKind,
@@ -2412,10 +2413,12 @@ impl TmdbClient {
             TmdbKind::Movie => found.movie_results,
             TmdbKind::Series => found.tv_results,
         };
-        // `Some(vec![])` is a real answer, not a failure: the C# providers read
-        // `findResult?.MovieResults`/`TvResults` and, once that list exists, do
-        // NOT fall back to a name search. `None` is reserved for a request that
-        // never produced a payload.
+        // `Some(vec![])` is a real answer, not a failure: the C# Identify
+        // searches (`GetSearchResults`) read `findResult?.MovieResults`/
+        // `TvResults` and, once that list exists, do NOT fall back to a name
+        // search; the refresh's series provider goes on to the TVDB `/find`,
+        // then the name search (`TmdbSeriesProvider.GetMetadata`). `None` is
+        // reserved for a request that never produced a usable payload.
         Some(
             hits.into_iter()
                 .map(|hit| search_hit_from(hit, &cfg))
