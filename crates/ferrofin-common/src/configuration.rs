@@ -19,15 +19,6 @@ pub struct ConfigurationStore {
     pub type_key: String,
 }
 
-/// Provides a set of configuration stores for a module or plugin.
-///
-/// Port of `IConfigurationFactory`. Scanned at startup to dynamically register
-/// configuration for various modules/plugins.
-pub trait ConfigurationFactory {
-    /// Returns the configuration stores for this module.
-    fn configurations(&self) -> Vec<ConfigurationStore>;
-}
-
 /// A configuration store that can validate a proposed change before saving.
 ///
 /// Port of `IValidatingConfiguration`. `old_config`/`new_config` are the
