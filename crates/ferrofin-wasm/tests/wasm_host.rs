@@ -226,6 +226,110 @@ fn a_file_squatting_a_compiled_in_id_is_never_loaded() {
     assert!(host.registered_plugins().is_empty());
 }
 
+/// A segment cache as `CachedMediaSegmentProvider` leaves it: its identity
+/// marker and one item's segments.
+fn write_segment_cache(dir: &std::path::Path, id: &str) -> PathBuf {
+    let cache = dir.join(format!("{id}.segments"));
+    std::fs::create_dir(&cache).unwrap();
+    std::fs::write(cache.join("producer.json"), format!("\"{id}\"")).unwrap();
+    std::fs::write(cache.join(format!("{}.json", uuid::Uuid::new_v4())), b"[]").unwrap();
+    cache
+}
+
+/// An uninstall used to leave the plugin's segment cache behind, and the
+/// plugin installed again served it before analysing anything. A start
+/// with the plugin not installed removes the cache, and only it: a loaded
+/// plugin's cache and names the cache is never written under stay.
+#[test]
+fn a_start_removes_the_segment_caches_of_plugins_not_installed() {
+    init_test_logging();
+    let dir = tempfile::tempdir().unwrap();
+    let id = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeffff";
+    let left_behind = write_segment_cache(dir.path(), id);
+    let other_names = [
+        "CCCCCCCC-CCCC-CCCC-CCCC-CCCCCCCCCCCC.segments",
+        "dddddddddddddddddddddddddddddddd.segments",
+        "notes.segments",
+    ];
+    for name in other_names {
+        std::fs::create_dir(dir.path().join(name)).unwrap();
+    }
+    let a_file = dir
+        .path()
+        .join("11111111-1111-1111-1111-111111111111.segments");
+    std::fs::write(&a_file, b"").unwrap();
+    // A link is never followed out of the directory, nor removed.
+    #[cfg(unix)]
+    let (link, outside) = {
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("keep.json"), b"[]").unwrap();
+        let link = dir
+            .path()
+            .join("33333333-3333-3333-3333-333333333333.segments");
+        std::os::unix::fs::symlink(outside.path(), &link).unwrap();
+        (link, outside)
+    };
+
+    // No plugin file at all: the start that builds no runtime sweeps too.
+    WasmPluginHost::load(dir.path(), &WasmSettings::default()).unwrap();
+    assert!(
+        !left_behind.exists(),
+        "the uninstalled plugin's cache is removed"
+    );
+    for name in other_names {
+        assert!(dir.path().join(name).exists(), "{name} is not a cache name");
+    }
+    assert!(a_file.exists(), "a file is never a cache");
+    #[cfg(unix)]
+    {
+        assert!(link.symlink_metadata().is_ok(), "the link stays");
+        assert!(outside.path().join("keep.json").exists());
+    }
+
+    // Installed again, it is no segment provider until it analyses.
+    write_fixture(dir.path(), "hello", FIXTURE_WAT);
+    let orphan = write_segment_cache(dir.path(), "22222222-2222-2222-2222-222222222222");
+    let host = WasmPluginHost::load(dir.path(), &WasmSettings::default()).unwrap();
+    assert!(host.media_segment_providers(&manager()).is_empty());
+    assert!(!orphan.exists(), "removed beside a loaded plugin too");
+
+    // A loaded plugin's own cache stays.
+    let own = write_segment_cache(dir.path(), id);
+    drop(host);
+    let host = WasmPluginHost::load(dir.path(), &WasmSettings::default()).unwrap();
+    assert!(own.exists());
+    assert_eq!(host.media_segment_providers(&manager()).len(), 1);
+}
+
+/// A plugin file that fails to load has an id nobody read, so its cache
+/// cannot be told from an orphan: that start removes none.
+#[test]
+fn a_plugin_file_that_fails_to_load_keeps_every_segment_cache() {
+    init_test_logging();
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("junk.wasm"), b"not wasm at all").unwrap();
+    write_fixture(dir.path(), "hello", FIXTURE_WAT);
+    let cache = write_segment_cache(dir.path(), "22222222-2222-2222-2222-222222222222");
+    let host = WasmPluginHost::load(dir.path(), &WasmSettings::default()).unwrap();
+    assert_eq!(host.plugins().len(), 1);
+    assert!(cache.exists());
+}
+
+/// A file refused after its id was read (here it squats a compiled-in id; an
+/// upgrade can also refuse its provider name) is still there: its cache stays.
+#[test]
+fn a_refused_plugin_file_keeps_its_segment_cache() {
+    init_test_logging();
+    let dir = tempfile::tempdir().unwrap();
+    let id = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeffff";
+    write_fixture(dir.path(), "squatter", FIXTURE_WAT);
+    let cache = write_segment_cache(dir.path(), id);
+    let settings = WasmSettings::default().with_reserved_ids([id.parse().unwrap()]);
+    let host = WasmPluginHost::load(dir.path(), &settings).unwrap();
+    assert!(host.plugins().is_empty());
+    assert!(cache.exists());
+}
+
 /// Records the registrations a host makes into the `/web` pipeline.
 #[derive(Default)]
 struct RecordingTransforms(std::sync::Mutex<Vec<String>>);

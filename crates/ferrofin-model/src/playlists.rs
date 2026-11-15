@@ -129,7 +129,7 @@ pub struct CreatePlaylistDto {
     /// private, as upstream's `createPlaylistRequest?.IsPublic` does.
     #[serde(
         default = "body_default_is_public",
-        deserialize_with = "non_null_bool",
+        deserialize_with = "crate::json::value::non_nullable",
         skip_serializing_if = "Option::is_none"
     )]
     pub is_public: Option<bool>,
@@ -142,11 +142,6 @@ fn required_name<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Option<St
         Some(name) if !name.trim().is_empty() => Ok(Some(name)),
         _ => Err(D::Error::custom("The Name field is required.")),
     }
-}
-
-/// [`CreatePlaylistDto::is_public`]: a C# `bool`, so `null` does not bind.
-fn non_null_bool<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Option<bool>, D::Error> {
-    bool::deserialize(deserializer).map(Some)
 }
 
 /// [`CreatePlaylistDto::is_public`] for a body that omits it.

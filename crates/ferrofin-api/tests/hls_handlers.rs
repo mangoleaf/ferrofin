@@ -39,7 +39,7 @@ const ITEM_ID: Uuid = Uuid::from_u128(0x00B1_0001);
 struct Recorded {
     last: Mutex<Option<HlsStreamRequest>>,
     stopped: Mutex<Vec<(Option<String>, Option<String>)>>,
-    resolved: Mutex<Vec<(String, bool)>>,
+    resolved: Mutex<Vec<(String, bool, Option<String>)>>,
     stream_bytes: std::sync::atomic::AtomicUsize,
     stream_completed: std::sync::atomic::AtomicUsize,
 }
@@ -145,12 +145,13 @@ impl HlsStreamManager for FakeHls {
         &self,
         file_name: &str,
         require_m3u8: bool,
+        playlist_id: Option<&str>,
     ) -> Result<ServedFile, ServiceError> {
-        self.rec
-            .resolved
-            .lock()
-            .unwrap()
-            .push((file_name.to_owned(), require_m3u8));
+        self.rec.resolved.lock().unwrap().push((
+            file_name.to_owned(),
+            require_m3u8,
+            playlist_id.map(ToOwned::to_owned),
+        ));
         self.served(if require_m3u8 {
             "application/vnd.apple.mpegurl"
         } else {
@@ -1509,10 +1510,138 @@ async fn legacy_video_segment_and_playlist_and_audio() {
     assert_eq!(resp.status(), StatusCode::OK);
 
     let resolved = rec.resolved.lock().unwrap();
-    // The video segment reconstructs `<segmentId><ext>`; the playlist requires m3u8.
-    assert!(resolved.iter().any(|(n, m)| n == "9.ts" && !m));
-    assert!(resolved.iter().any(|(n, m)| n == "pl7.m3u8" && *m));
-    assert!(resolved.iter().any(|(n, m)| n == "seg2.mp3" && !m));
+    // The video segment reconstructs `<segmentId><ext>` and names its
+    // playlist; the playlist requires m3u8.
+    assert_eq!(
+        resolved.as_slice(),
+        [
+            ("9.ts".to_owned(), false, Some("pl7".to_owned())),
+            ("pl7.m3u8".to_owned(), true, None),
+            ("seg2.mp3".to_owned(), false, None),
+        ]
+    );
+}
+
+/// The legacy routes build the file name from the whole route value and the
+/// path's extension (`string.Concat(segmentId, Path.GetExtension(Request.Path))`),
+/// so a dotted id keeps its dots; the video segment splits
+/// `{segmentId}.{segmentContainer}` at its last `.` and names its playlist. An
+/// encoded slash stays `%2F`, as Kestrel leaves it, so the name stays one file
+/// of the transcode folder.
+#[rstest]
+#[case::video_segment("/Videos/{id}/hls/pl.7/a.b.ts", "a.b.ts", false, Some("pl.7"))]
+#[case::playlist("/Videos/{id}/hls/x.y/stream.m3u8", "x.y.m3u8", true, None)]
+#[case::audio_mp3("/Audio/{id}/hls/s.2/stream.mp3", "s.2.mp3", false, None)]
+#[case::audio_aac("/Audio/{id}/hls/s.2/stream.aac", "s.2.aac", false, None)]
+#[case::video_slash(
+    "/Videos/{id}/hls/a%2Fb/..%2F..%2Fx.ts",
+    "..%2F..%2Fx.ts",
+    false,
+    Some("a%2Fb")
+)]
+#[case::playlist_slash("/Videos/{id}/hls/..%2Fx/stream.m3u8", "..%2Fx.m3u8", true, None)]
+#[case::audio_slash("/Audio/{id}/hls/..%2Fx/stream.mp3", "..%2Fx.mp3", false, None)]
+#[tokio::test]
+async fn legacy_routes_bind_the_whole_route_value(
+    #[case] template: &str,
+    #[case] file_name: &str,
+    #[case] require_m3u8: bool,
+    #[case] playlist_id: Option<&str>,
+) {
+    let tmp = TempFile::new();
+    let rec = Arc::new(Recorded::default());
+    let router = router_with(
+        ok_hls(&tmp.path, rec.clone()),
+        Arc::new(FakeAttachments {
+            mime: None,
+            data: vec![],
+        }),
+        Arc::new(ItemLibrary { present: true }),
+    );
+    let uri = template.replace("{id}", &ITEM_ID.to_string());
+    let resp = router.oneshot(authed("GET", &uri)).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "{uri}");
+    assert_eq!(
+        rec.resolved.lock().unwrap().as_slice(),
+        [(
+            file_name.to_owned(),
+            require_m3u8,
+            playlist_id.map(ToOwned::to_owned)
+        )],
+        "{uri}"
+    );
+}
+
+/// `{segmentId}.{segmentContainer}` is an ASP.NET complex segment: a last
+/// path segment without a `.`, or with nothing on one side of its last `.`,
+/// matches no route upstream, an empty 404, and looks nothing up. Route
+/// matching comes first, so a blank `{itemId}` or `{playlistId}` beside it is
+/// no 400.
+#[rstest]
+#[case::no_dot("{id}/hls/pl7/9")]
+#[case::no_segment_id("{id}/hls/pl7/.ts")]
+#[case::no_container("{id}/hls/pl7/9.")]
+#[case::blank_item_id("%20/hls/pl7/9")]
+#[case::blank_playlist_id("{id}/hls/%20/9")]
+#[tokio::test]
+async fn legacy_video_segment_without_a_container_is_no_route(#[case] tail: &str) {
+    let tmp = TempFile::new();
+    let rec = Arc::new(Recorded::default());
+    let router = router_with(
+        ok_hls(&tmp.path, rec.clone()),
+        Arc::new(FakeAttachments {
+            mime: None,
+            data: vec![],
+        }),
+        Arc::new(ItemLibrary { present: true }),
+    );
+    let uri = format!("/Videos/{}", tail.replace("{id}", &ITEM_ID.to_string()));
+    let resp = router.oneshot(authed("GET", &uri)).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND, "{uri}");
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    assert!(body.is_empty(), "{uri}: {body:?}");
+    assert!(rec.resolved.lock().unwrap().is_empty(), "{uri}");
+}
+
+/// The served file's observer is the keep-alive `GetFileResult` ends in
+/// `Response.OnCompleted`: the legacy routes release it when the body is read
+/// to its end, and when the response is dropped unread (a client that hangs
+/// up), never before.
+#[rstest]
+#[case::video_segment("/Videos/{id}/hls/pl7/9.ts")]
+#[case::playlist("/Videos/{id}/hls/pl7/stream.m3u8")]
+#[case::audio_mp3("/Audio/{id}/hls/seg2/stream.mp3")]
+#[tokio::test]
+async fn legacy_serves_release_the_keep_alive_with_the_body(#[case] template: &str) {
+    use std::sync::atomic::Ordering::SeqCst;
+    let tmp = TempFile::new();
+    let rec = Arc::new(Recorded::default());
+    let uri = template.replace("{id}", &ITEM_ID.to_string());
+    for read in [true, false] {
+        let router = router_with(
+            ok_hls(&tmp.path, rec.clone()),
+            Arc::new(FakeAttachments {
+                mime: None,
+                data: vec![],
+            }),
+            Arc::new(ItemLibrary { present: true }),
+        );
+        let completed = rec.stream_completed.load(SeqCst);
+        let resp = router.oneshot(authed("GET", &uri)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "{uri}");
+        assert_eq!(rec.stream_completed.load(SeqCst), completed, "{uri}");
+        if read {
+            let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            assert_eq!(body.as_ref(), b"SEGMENT-BYTES", "{uri}");
+        } else {
+            drop(resp);
+        }
+        assert_eq!(rec.stream_completed.load(SeqCst), completed + 1, "{uri}");
+    }
 }
 
 /// The legacy `HlsSegmentController` actions bind `{itemId}` as a

@@ -982,7 +982,8 @@ pub trait LibraryManager: Send + Sync {
     /// upstream. `GetPerson` is the exception — a plain lookup on both trees
     /// (`LibraryManager.cs:958-968` on v10.11.8, `:1195-1205` on master) — so
     /// `Person` is not in the provisioned set. Use [`Self::find_named_item`]
-    /// where the lookup must not write.
+    /// (or [`Self::get_named_item_ids`] for many names) where the lookup must
+    /// not write.
     ///
     /// Matching is by cleaned name (Jellyfin's item-by-name id is derived from
     /// the name), delegating to [`Self::get_item_list`] filtered to `kind`; the
@@ -1068,27 +1069,33 @@ pub trait LibraryManager: Send + Sync {
         Ok(out)
     }
 
-    /// Id-only form of [`Self::get_named_items`]: resolves each of `names` to
-    /// the id of its by-name item row of `kind`, one slot per input name in
-    /// order (`None` where no row resolves).
+    /// Id-only batch form of [`Self::find_named_item`]: resolves each of
+    /// `names` to the id of its existing by-name item row of `kind`, one slot
+    /// per input name in order (`None` where no row resolves).
+    ///
+    /// It **never creates a row**: a name nothing matches stays `None`, where
+    /// [`Self::get_named_items`] materializes the kinds Jellyfin creates by
+    /// name. An implementation must keep it that way, because read paths rely
+    /// on it (the DTO prefetch, and the `GET` name filters that resolve names
+    /// to ids). For a row that exists it answers the id
+    /// [`Self::get_named_items`] would.
     ///
     /// The DTO prefetch resolves a whole page's cast through this and reads
-    /// nothing but the id, so the concrete manager overrides it with a
-    /// two-column projection rather than materializing a full item row per
-    /// credited name, and for a `Person` with the people repository's id-only
-    /// `GetPerson` reads. The default delegates to [`Self::get_named_items`], so
-    /// every implementation gets it for free with identical results.
+    /// nothing but the id, so the concrete manager overrides it with one
+    /// two-column `CleanName IN (…)` query rather than a full item row per
+    /// name, and for a `Person` with the people repository's id-only
+    /// `GetPerson` reads. The default loops [`Self::find_named_item`].
     async fn get_named_item_ids(
         &self,
         kind: BaseItemKind,
         names: &[String],
     ) -> Result<Vec<Option<Uuid>>, ServiceError> {
-        Ok(self
-            .get_named_items(kind, names)
-            .await?
-            .into_iter()
-            .map(|row| row.and_then(|r| Uuid::parse_str(&r.id).ok()))
-            .collect())
+        let mut out = Vec::with_capacity(names.len());
+        for name in names {
+            let row = self.find_named_item(kind, name).await?;
+            out.push(row.and_then(|r| Uuid::parse_str(&r.id).ok()));
+        }
+        Ok(out)
     }
 
     /// Gets the library's production years, resolved to their by-name `Year`
@@ -1238,18 +1245,6 @@ pub trait LibraryManager: Send + Sync {
 
     /// Queues a full library scan.
     async fn queue_library_scan(&self) -> Result<(), ServiceError>;
-
-    /// Queues a full library scan, tagging the run's root span, its log lines
-    /// and its metrics with why it was triggered ([`ScanTrigger`]). Defaults
-    /// to the plain [`queue_library_scan`](Self::queue_library_scan) so
-    /// existing implementations need no change; the real manager overrides it
-    /// to record the `trigger`.
-    async fn queue_library_scan_with_trigger(
-        &self,
-        _trigger: ScanTrigger,
-    ) -> Result<(), ServiceError> {
-        self.queue_library_scan().await
-    }
 
     /// Queues a scan restricted to one library. `library_id` is the library's
     /// CollectionFolder id — what jellyfin-web's per-library "Scan Library"
@@ -2832,14 +2827,6 @@ pub trait MusicManager: Send + Sync {
     async fn get_instant_mix_from_item(
         &self,
         item_id: Uuid,
-        user_id: Option<Uuid>,
-        dto_options: &DtoOptions,
-    ) -> Result<Vec<BaseItemEntity>, ServiceError>;
-
-    /// Builds an instant mix seeded by an artist item.
-    async fn get_instant_mix_from_artist(
-        &self,
-        artist_id: Uuid,
         user_id: Option<Uuid>,
         dto_options: &DtoOptions,
     ) -> Result<Vec<BaseItemEntity>, ServiceError>;
