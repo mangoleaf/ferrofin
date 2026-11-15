@@ -1490,22 +1490,37 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
                    open_image (guarded_http.rs GuardedHttp::send, which follows and vets each \
                    redirect; destination.rs ImageDestinations), provider_manager.rs \
                    cached_remote_image, and the scan's downloads of a credited person's \
-                   profile photo and a studio's thumb (ferrofin-core library_scan.rs \
+                   profile photo (the credit's URL from TheMovieDb, TheTVDB, or an NFO \
+                   actor's <thumb> through library_scan.rs person_to_entity) and a studio's \
+                   thumb (ferrofin-core library_scan.rs \
                    download_images and studio_thumb, named from the resolved type through \
                    tmdb.rs TmdbClient::download and studios.rs StudiosClient::download; \
                    enrich_people and enrich_studio_images hand the file to ferrofin-providers \
                    image_save.rs ImageFileSaver through finish_artwork, which puts a person's \
                    or a studio's new art beside its own folder while that is in the server's \
                    own directories, and otherwise follows the library's opt-in; rows stored \
-                   before keep their art-folder files), \
+                   before keep their art-folder files), and the scan's save of the artwork an \
+                   NFO names by URL, an item's <thumb> and <fanart><thumb> \
+                   (library_scan.rs fetch_local_nfo's LocalNfo.remote_images, saved by \
+                   save_nfo_images in collect_artwork before the image providers run, for each \
+                   type the item has no image of, whatever the library's image fetchers and \
+                   per-type limits, as upstream; downloaded through tmdb.rs \
+                   TmdbClient::download, written by artwork.rs write_acquired_image and \
+                   published by finish_artwork's image saver), \
                    compared with \
                    MediaBrowser.Providers/Manager/ProviderManager.cs (SaveImage), \
                    MediaBrowser.Providers/Manager/ItemImageProvider.cs (EnableImageStub, \
                    SaveImageStub: a Person and a Studio are IItemByName, so their remote \
-                   images reach SaveImage through a stub), \
+                   images reach SaveImage through a stub; MergeImages, UpdateReplaceImages and \
+                   RefreshImages), \
                    MediaBrowser.Providers/Manager/ImageSaver.cs (SaveImage, \
                    GetStandardSavePath), \
-                   Jellyfin.Server/Startup.cs (the NamedClient.Default handler) and \
+                   Jellyfin.Server/Startup.cs (the NamedClient.Default handler), \
+                   MediaBrowser.Controller/Extensions/XmlReaderExtensions.cs \
+                   (GetPersonFromXmlNode), \
+                   MediaBrowser.XbmcMetadata/Parsers/BaseNfoParser.cs (FetchThumbNode), \
+                   MediaBrowser.Providers/Manager/MetadataService.cs (RefreshWithProviders' \
+                   local-provider loop, MergePeople) and \
                    Emby.Server.Implementations/Library/LibraryManager.cs \
                    (SavePeopleMetadataAsync, UpdateImagesAsync, ConvertImageToLocal)",
         date: "2026-11-14",
@@ -1542,6 +1557,24 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
              Primary, which ConvertImageToLocal removes after a 404, a 403 or a non-image, so \
              the next crediting save asks again, and keeps after any other HTTP or I/O \
              failure, so no later credit asks.",
+            "An NFO actor's <thumb> that names a local file (the path an NFO saver writes, \
+             Kodi's .actors folder) is not the credit's photo: person_to_entity keeps only an \
+             http(s) URL, so a remote provider's photo URL for the same credit fills it \
+             (merge_people) and is downloaded, and with none the person gets no photo. \
+             Upstream's MergePeople keeps the path over the remote URL and \
+             SavePeopleMetadataAsync stores it as the Primary's path. Fix path: gl-1818, \
+             which first needs the owner's decision on which files an NFO may name.",
+            "An item's NFO <thumb> that names a local file is not read, where FetchThumbNode \
+             resolves any existing file (IDirectoryService.GetFile) and RefreshWithProviders \
+             sets it with MergeImages; an album's or an artist's NFO artwork URLs are not \
+             saved, where the same loop saves every kind's. Fix path for both: gl-1818; the \
+             local file first needs the owner's decision on which files an NFO may name.",
+            "Under \"Replace existing images\", an NFO's fanart saved as a Backdrop is kept and \
+             the item's earlier downloaded backdrops are replaced, as for any replaced type, \
+             while the image providers only fill the backdrops the limit has left. Upstream \
+             takes Backdrop out of the replace set once the NFO saved one, so it keeps the \
+             earlier backdrops and adds another copy of the NFO's to them on every such \
+             refresh. Jellyfin bug not ported.",
             "A remote image download refuses loopback, private, link-local, CGNAT and reserved \
              addresses, on its first request and on every redirect it follows (owner decision \
              2026-10-31, gl-1096), unless image_private_http_allow lists the host, its address \
