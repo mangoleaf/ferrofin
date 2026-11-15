@@ -69,7 +69,10 @@ impl StartupConfig {
 /// `host:port` (the scheme's default port when it names none), once per
 /// override ignoring case, never its user info, query or fragment. Bare host
 /// or IP overrides are exempt, since the base URL is appended when the API URL
-/// is built from them; an empty `base_url` leaves nothing to compare.
+/// is built from them; an empty `base_url` leaves nothing to compare. The
+/// base matches in either spelling (`/my jellyfin`, `/my%20jellyfin`), where
+/// upstream compares the decoded path with the saved spelling: Jellyfin bug
+/// not ported (gl-1821).
 #[must_use]
 pub fn published_urls_missing_base_url<'a>(
     overrides: impl IntoIterator<Item = &'a str>,
@@ -79,6 +82,8 @@ pub fn published_urls_missing_base_url<'a>(
     if base_url.is_empty() {
         return hosts;
     }
+    // Either spelling of the base (`/my jellyfin`, `/my%20jellyfin`) matches.
+    let base_url = percent_encoding::percent_decode_str(base_url).decode_utf8_lossy();
     let mut seen = std::collections::HashSet::new();
     for uri in overrides {
         let lowered = uri.to_ascii_lowercase();
@@ -110,7 +115,7 @@ pub fn published_urls_missing_base_url<'a>(
             .len()
             .checked_sub(base_url.len())
             .and_then(|at| path.get(at..))
-            .is_some_and(|tail| tail.eq_ignore_ascii_case(base_url))
+            .is_some_and(|tail| tail.eq_ignore_ascii_case(&base_url))
         {
             continue;
         }

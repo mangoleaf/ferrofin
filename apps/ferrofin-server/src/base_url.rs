@@ -85,7 +85,7 @@ pub(crate) async fn rewrite(
         return next.run(request).await;
     }
 
-    let suffix = mount_len(path, &base)
+    let suffix = ferrofin_networking::base_url_prefix_len(path, &base)
         .and_then(|at| path.get(at..))
         .unwrap_or_default();
     if suffix.is_empty() || suffix == "/" {
@@ -137,35 +137,6 @@ pub(crate) async fn rewrite(
         response.headers_mut().insert(header::LOCATION, location);
     }
     response
-}
-
-/// How much of the raw `path` is the mount: the length of its prefix that
-/// decodes to what `base` decodes to, ASCII case ignored, or `None`.
-fn mount_len(path: &str, base: &str) -> Option<usize> {
-    let (path, base) = (path.as_bytes(), base.as_bytes());
-    let (mut at, mut matched) = (0, 0);
-    while matched < base.len() {
-        let (want, used) = decoded_byte(base, matched)?;
-        let (byte, len) = decoded_byte(path, at)?;
-        if !byte.eq_ignore_ascii_case(&want) {
-            return None;
-        }
-        (at, matched) = (at + len, matched + used);
-    }
-    Some(at)
-}
-
-/// The byte at `raw[at]`, a `%XX` escape decoded, and how many raw bytes it
-/// took. `%2F` is compared as written, as Kestrel leaves it: it is not a `/`.
-fn decoded_byte(raw: &[u8], at: usize) -> Option<(u8, usize)> {
-    let hex = |i: usize| raw.get(at + i).and_then(|&d| char::from(d).to_digit(16));
-    let escaped = hex(1)
-        .zip(hex(2))
-        .and_then(|(hi, lo)| u8::try_from((hi << 4) | lo).ok());
-    match (*raw.get(at)?, escaped) {
-        (b'%', Some(byte)) if byte != b'/' => Some((byte, 3)),
-        (byte, _) => Some((byte, 1)),
-    }
 }
 
 #[cfg(test)]
@@ -342,24 +313,6 @@ mod tests {
         );
         let other = format!("{mount}-other/web");
         assert_eq!(send(base, &other).await.status(), StatusCode::NOT_FOUND);
-    }
-
-    /// The walk over the raw path: escapes decode on both sides, a broken one
-    /// is a literal `%`, and `%2F` is never a `/`.
-    #[rstest::rstest]
-    #[case::truncated_escape("/my jellyfin", "/my%2", None)]
-    #[case::invalid_hex("/my jellyfin", "/my%zzjellyfin", None)]
-    #[case::escaped_letter("/a", "/%61/x", Some(4))]
-    #[case::escaped_slash_both_sides("/a%2Fb", "/a%2fb/x", Some(6))]
-    #[case::escaped_slash_against_slash("/a/b", "/a%2fb/x", None)]
-    #[case::literal_percent("/100%", "/100%25/x", Some(7))]
-    #[case::path_too_short("/jellyfin", "/jelly", None)]
-    fn mount_len_decodes_both_sides(
-        #[case] base: &str,
-        #[case] path: &str,
-        #[case] expected: Option<usize>,
-    ) {
-        assert_eq!(mount_len(path, base), expected);
     }
 
     /// `%2F` is not a `/`, as Kestrel leaves it escaped in the path.

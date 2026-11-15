@@ -1,7 +1,7 @@
 //! Transliteration of
 //! `Jellyfin.Networking.Tests.Configuration.NetworkConfigurationTests`.
 
-use ferrofin_networking::{NetworkConfiguration, escape_base_url};
+use ferrofin_networking::{NetworkConfiguration, base_url_prefix_len, escape_base_url};
 use rstest::rstest;
 
 /// `BaseUrl_ReturnsNormalized`.
@@ -40,6 +40,24 @@ fn base_url_returns_normalized(#[case] expected: &str, #[case] input: &str) {
 #[case::backslash_stays_itself("/a\\b", "/a%5Cb")]
 fn escape_base_url_escapes_as_uri_builder(#[case] base: &str, #[case] expected: &str) {
     assert_eq!(escape_base_url(base), expected);
+}
+
+/// gl-1685: escapes decode on both sides of the walk, a broken one is a
+/// literal `%`, and `%2F` is never a `/`.
+#[rstest]
+#[case::truncated_escape("/my jellyfin", "/my%2", None)]
+#[case::invalid_hex("/my jellyfin", "/my%zzjellyfin", None)]
+#[case::escaped_letter("/a", "/%61/x", Some(4))]
+#[case::escaped_slash_both_sides("/a%2Fb", "/a%2fb/x", Some(6))]
+#[case::escaped_slash_against_slash("/a/b", "/a%2fb/x", None)]
+#[case::literal_percent("/100%", "/100%25/x", Some(7))]
+#[case::path_too_short("/jellyfin", "/jelly", None)]
+fn base_url_prefix_len_decodes_both_sides(
+    #[case] base: &str,
+    #[case] path: &str,
+    #[case] expected: Option<usize>,
+) {
+    assert_eq!(base_url_prefix_len(path, base), expected);
 }
 
 /// The serialized field names must be exactly the contract's, character for

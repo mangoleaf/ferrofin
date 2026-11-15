@@ -284,3 +284,40 @@ pub fn escape_base_url(base: &str) -> String {
     }
     escaped
 }
+
+/// How much of the raw `path` the base URL takes: the length of its prefix
+/// that decodes to what `base` decodes to, ASCII case ignored, or `None`. So a
+/// base written `/my jellyfin` or `/my%20jellyfin` matches `/my%20jellyfin/…`
+/// alike, where ASP.NET compares one spelling with the other.
+///
+/// The match is a byte prefix, not a path segment: `/jellyfin` takes the first
+/// nine bytes of `/jellyfin2/…`, so a caller checks that the rest starts with
+/// `/`. `%2F` is compared as written on both sides (it is not a `/`), and an
+/// empty `base` is `Some(0)`.
+#[must_use]
+pub fn base_url_prefix_len(path: &str, base: &str) -> Option<usize> {
+    let (path, base) = (path.as_bytes(), base.as_bytes());
+    let (mut at, mut matched) = (0, 0);
+    while matched < base.len() {
+        let (want, used) = decoded_byte(base, matched)?;
+        let (byte, len) = decoded_byte(path, at)?;
+        if !byte.eq_ignore_ascii_case(&want) {
+            return None;
+        }
+        (at, matched) = (at + len, matched + used);
+    }
+    Some(at)
+}
+
+/// The byte at `raw[at]`, a `%XX` escape decoded, and how many raw bytes it
+/// took. `%2F` is compared as written, as Kestrel leaves it: it is not a `/`.
+fn decoded_byte(raw: &[u8], at: usize) -> Option<(u8, usize)> {
+    let hex = |i: usize| raw.get(at + i).and_then(|&d| char::from(d).to_digit(16));
+    let escaped = hex(1)
+        .zip(hex(2))
+        .and_then(|(hi, lo)| u8::try_from((hi << 4) | lo).ok());
+    match (*raw.get(at)?, escaped) {
+        (b'%', Some(byte)) if byte != b'/' => Some((byte, 3)),
+        (byte, _) => Some((byte, 1)),
+    }
+}

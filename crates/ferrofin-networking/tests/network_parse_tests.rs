@@ -740,6 +740,23 @@ fn initialize_overrides_full_url_public_path_differs_from_base_url_logs_warning(
     assert_eq!(!warned.is_empty(), expect_warning, "{warned:?}");
 }
 
+/// gl-1821: a published URL that ends with the base URL in either spelling is
+/// not warned about, whichever spelling was saved, and one that does not still
+/// is. Upstream compares the decoded path with the saved spelling, so it warns
+/// for one saved escaped.
+#[rstest]
+#[case::saved_escaped("/my%20jellyfin", "https://media.example.com/my%20jellyfin", false)]
+#[case::saved_plain("/my jellyfin", "https://media.example.com/my%20jellyfin", false)]
+#[case::elsewhere("/my%20jellyfin", "https://media.example.com/other", true)]
+fn a_base_url_clients_escape_is_found_in_the_published_url(
+    #[case] base_url: &str,
+    #[case] published: &str,
+    #[case] warns: bool,
+) {
+    let warned = ferrofin_networking::published_urls_missing_base_url([published], base_url);
+    assert_eq!(!warned.is_empty(), warns, "{warned:?}");
+}
+
 /// `InitializeOverrides_StartupPublishedServerUrlPathDiffersFromBaseUrl_LogsWarningWithoutCredentials`:
 /// only the host and port of the override are reported.
 #[test]
