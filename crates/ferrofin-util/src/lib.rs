@@ -14,7 +14,9 @@
 //! shared by every crate that assigns a rating or gain, and
 //! [`numeric_collation`] is the name order Jellyfin 12 sorts with.
 //! [`invariant_float`] is .NET's `double`/`float` parse in the invariant
-//! culture, which ASP.NET's query binder uses. With the `tokio`
+//! culture, which ASP.NET's query binder, the DLNA profile conditions, the
+//! requested transcode level, the Live TV channel numbers and the image
+//! foreground layer use. With the `tokio`
 //! feature, `keyed_locks` is the async keyed lock the C# takes from
 //! `AsyncKeyedLock`.
 

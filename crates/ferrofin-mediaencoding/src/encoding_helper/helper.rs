@@ -29,6 +29,7 @@ use ferrofin_model::entities_media::MediaStream;
 use ferrofin_model::media_info::MediaProtocol;
 use ferrofin_model::session::TranscodeReasons;
 use ferrofin_traits::media_encoding::TranscodingJobType;
+use ferrofin_util::invariant_float;
 
 use crate::encoder::FfmpegVersion;
 use crate::encoder::media_encoder::InputAnalysis;
@@ -347,7 +348,7 @@ impl<C: EncoderCapabilities> EncodingHelper<C> {
                 .is_some_and(|c| c.eq_ignore_ascii_case("h264"))
                 && state
                     .requested_level("h264")
-                    .and_then(|l| l.parse::<f64>().ok())
+                    .and_then(|l| invariant_float::parse::<f64>(&l))
                     .is_some_and(|l| l < 51.0)
             {
                 1
@@ -712,7 +713,7 @@ impl<C: EncoderCapabilities> EncodingHelper<C> {
 
         if let Some(request_level) = state
             .requested_level(codec)
-            .and_then(|l| l.parse::<f64>().ok())
+            .and_then(|l| invariant_float::parse::<f64>(&l))
             && video_stream.level.is_some_and(|l| l > request_level)
         {
             return false;
@@ -1159,7 +1160,10 @@ fn preset_name(preset: EncoderPreset) -> std::borrow::Cow<'static, str> {
 /// requested level through the same clamp before formatting the `CODECS` entry.
 #[must_use]
 pub fn normalize_transcoding_level(state: &EncodingJobInfo, level: Option<&str>) -> Option<String> {
-    let request_level = level?.parse::<f64>().ok()?;
+    // `double.TryParse(level, CultureInfo.InvariantCulture, …)` takes trailing
+    // NULs, which .NET's argv then cuts off; a NUL in an argument fails the spawn.
+    let level = level.map(|l| l.trim_end_matches('\0'));
+    let request_level = invariant_float::parse::<f64>(level?)?;
     let codec = state.actual_output_video_codec().unwrap_or_default();
 
     if codec.eq_ignore_ascii_case("av1") {
@@ -3104,6 +3108,20 @@ mod tests {
         assert!(!param.contains(" -level "), "{param}");
     }
 
+    /// `NormalizeTranscodingLevel` reads the requested level with
+    /// `double.TryParse(…, CultureInfo.InvariantCulture, …)`: Rust's `inf` is
+    /// no level there (null, so no `-level`), where it was clamped to 15.
+    #[test]
+    fn video_quality_param_omits_a_level_double_parse_refuses() {
+        let mut state = job(&[video_stream("h264", 0)]);
+        state.output_video_codec = Some("av1".to_owned());
+        state.base_request.level = Some("inf".to_owned());
+        let opts = default_encoding_options(0);
+        let param =
+            helper(vec![]).video_quality_param(&state, "libsvtav1", &opts, EncoderPreset::veryfast);
+        assert!(!param.contains(" -level "), "{param}");
+    }
+
     #[test]
     fn video_quality_param_passes_the_level_through_for_libx264() {
         // Only AV1 is remapped; H.264's level is already the number ffmpeg
@@ -3115,6 +3133,14 @@ mod tests {
         let param =
             helper(vec![]).video_quality_param(&state, "libx264", &opts, EncoderPreset::veryfast);
         assert!(param.contains(" -level 41"), "{param}");
+        // `double.TryParse` reads `41\0` as 41; the NUL never reaches ffmpeg.
+        state.base_request.level = Some("41\0".to_owned());
+        let param =
+            helper(vec![]).video_quality_param(&state, "libx264", &opts, EncoderPreset::veryfast);
+        assert!(
+            param.contains(" -level 41") && !param.contains('\0'),
+            "{param:?}"
+        );
 
         let mut state = job(&[video_stream("hevc", 0)]);
         state.output_video_codec = Some("hevc".to_owned());

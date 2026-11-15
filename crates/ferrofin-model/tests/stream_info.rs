@@ -409,6 +409,19 @@ fn max_framerate_is_written_as_dotnet_writes_a_float(#[case] rate: f32, #[case] 
     assert!(url.contains(written), "{url}");
 }
 
+/// `GetTargetVideoLevel` (`StreamInfo.cs:1330`) reads the level option with
+/// `double.TryParse(value, CultureInfo.InvariantCulture, …)`: a group
+/// separator is a number, Rust's `inf` is not.
+#[rstest]
+#[case("4.1", Some(4.1))]
+#[case("1,5", Some(15.0))]
+#[case("inf", None)]
+fn the_target_video_level_reads_as_dotnet_does(#[case] level: &str, #[case] expected: Option<f64>) {
+    let mut si = blank_stream(DlnaProfileType::Video);
+    si.set_option_qualified(Some("h264"), "level", level.to_owned());
+    assert_eq!(si.get_target_video_level(Some("h264")), expected, "{level}");
+}
+
 /// A transcoder that can extract an embedded subtitle, so a text subtitle can
 /// be delivered on its own.
 struct ExtractsSubtitles;

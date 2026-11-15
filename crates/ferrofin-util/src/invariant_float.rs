@@ -3,9 +3,11 @@
 //! `double.Parse`/`float.Parse` with `NumberStyles.Float |
 //! NumberStyles.AllowThousands` and `CultureInfo.InvariantCulture` is what
 //! ASP.NET's `FloatingPointTypeModelBinderProvider` binds a `double` or `float`
-//! query and route value with, and what the DLNA `ConditionProcessor` and
-//! `StreamBuilder` read a device profile's condition value with
-//! (`double.TryParse`/`float.TryParse`, the same styles). Rust's `f64::from_str`
+//! query and route value with, and what `double.TryParse`/`float.TryParse`
+//! read with when a call names no styles: the DLNA `ConditionProcessor` and
+//! `StreamBuilder`, the requested transcode level, the Live TV channel numbers
+//! and the image foreground layer (that one in the server's culture upstream).
+//! Rust's `f64::from_str`
 //! differs from it on `inf`, on group separators, on Unicode white space
 //! around a number and on trailing NULs.
 

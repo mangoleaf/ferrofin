@@ -410,7 +410,9 @@ impl StreamInfo {
     /// Gets the target video level for a codec.
     #[must_use]
     pub fn get_target_video_level(&self, codec: Option<&str>) -> Option<f64> {
-        self.get_option(codec, "level").and_then(|v| v.parse().ok())
+        // `double.TryParse(value, CultureInfo.InvariantCulture, …)`.
+        self.get_option(codec, "level")
+            .and_then(ferrofin_util::invariant_float::parse)
     }
 
     /// Gets the target reference frames for a codec.
