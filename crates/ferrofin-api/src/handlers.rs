@@ -4924,7 +4924,9 @@ pub const VERIFIED: &[Verified] = &[
                get_bind_address_for_peer, GetBindAddress: the subnet overrides, the address a \
                listener pinned at startup is bound to, as the one interface a \
                LocalNetworkAddresses bind leaves upstream, then the interfaces) and \
-               format_api_url (GetLocalApiUrl's UriBuilder, which writes any port it is given), \
+               format_api_url (GetLocalApiUrl's UriBuilder, which writes any port it is given \
+               and escapes the base URL as UriBuilder.Path does, a backslash aside: \
+               ferrofin-networking escape_base_url, checked against 12.4's discovery Address), \
                friendly_name (FriendlyName: the saved ServerName unless empty), the emulated \
                version, PRODUCT_NAME (Name), the system id (DeviceId), the startup-wizard flag, \
                the lifecycle's restart-pending and shutting-down flags (which operations raise \
@@ -4963,6 +4965,9 @@ pub const VERIFIED: &[Verified] = &[
             "LocalAddress carries the base URL this lifetime serves under; upstream's \
          GetLocalApiUrl reads a saved BaseUrl at once, while its mount keeps the old one \
          (owner decision on gl-555).",
+            "A backslash in the base URL is escaped (%5C) in LocalAddress; upstream's \
+         UriBuilder.Path turns it into a /, an address its mount does not answer (12.4's \
+         discovery Address, probed). Jellyfin bug not ported.",
             "After a save that turns HTTPS off, LocalAddress keeps the https scheme this \
          lifetime listens with until the restart; upstream's ListenWithHttps reads the saved \
          EnableHttps at once and advertises http. Fix path: gl-1791.",
@@ -5016,6 +5021,9 @@ pub const VERIFIED: &[Verified] = &[
             "LocalAddress carries the base URL this lifetime serves under; upstream's \
          GetLocalApiUrl reads a saved BaseUrl at once, while its mount keeps the old one \
          (owner decision on gl-555).",
+            "A backslash in the base URL is escaped (%5C) in LocalAddress; upstream's \
+         UriBuilder.Path turns it into a /, an address its mount does not answer (12.4's \
+         discovery Address, probed). Jellyfin bug not ported.",
             "After a save that turns HTTPS off, LocalAddress keeps the https scheme this \
          lifetime listens with until the restart; upstream's ListenWithHttps reads the saved \
          EnableHttps at once and advertises http. Fix path: gl-1791.",
