@@ -2019,9 +2019,6 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
              start at the seek target while the copied video starts at the keyframe before \
              it, measured 3 s apart (gl-406). Deliberate divergence; the timing model it \
              rests on is to be recorded by gl-1768.",
-            "A seeked audio-only HLS job passes -noaccurate_seek too, which starts an Opus or \
-             Vorbis track that it re-encodes up to 0.3 s before its target; upstream seeks it \
-             accurately. Fix path: gl-1778.",
             "Each external input is synced to the media file's clock with -isync 0 from \
              ffmpeg 5.1, which upstream does not pass: without -copyts each input's timeline \
              would start at its own first packet. Deliberate divergence; the timing model it \

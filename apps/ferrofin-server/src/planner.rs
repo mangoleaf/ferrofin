@@ -1900,11 +1900,17 @@ impl FerrofinStreamStatePlanner {
             // 20 s, TS segments (PTS carry the TS muxer's 1.4 s start offset):
             // first video / audio PTS 16.40 / 16.39 s with the flag, 16.40 /
             // 19.38 s without (the audio a whole 3 s after the video).
+            //
+            // An audio-only job has no video to align with (its video
+            // "encoder" is `copy` only because there is no video stream), so
+            // its re-encoded audio keeps the accurate seek: untrimmed, it
+            // starts where the demuxer landed, up to an Ogg page or a
+            // Matroska cluster before the target (gl-1778).
             let wtv = state
                 .input_container
                 .as_deref()
                 .is_some_and(|c| c.eq_ignore_ascii_case("wtv"));
-            if copying_video && !progressive && !wtv {
+            if copying_video && state.video_stream.is_some() && !progressive && !wtv {
                 args.push("-noaccurate_seek".to_owned());
             }
         }
@@ -7618,6 +7624,38 @@ mod tests {
         assert!(
             !plan.arguments.iter().any(|a| a == "-noaccurate_seek"),
             "wtv input keeps accurate seek: {:?}",
+            plan.arguments
+        );
+    }
+
+    #[tokio::test]
+    async fn plan_seeked_audio_only_job_keeps_accurate_seek() {
+        // An audio request has no video stream, so its video "encoder" is
+        // `copy`, yet there is no keyframe to align with: the re-encoded audio
+        // must be trimmed to the target, or it starts where the demuxer
+        // landed, up to an Ogg page or a Matroska cluster early (gl-1778).
+        let p = planner(vec![source("abc", vec![audio_stream("opus")])]);
+        let mut req = request("abc");
+        req.segment_container = Some("mp4".to_owned());
+        req.audio_codec = Some("aac".to_owned());
+        let plan = p
+            .plan(&at_segment(req, 2), true, Some(2), PlaylistKind::Vod)
+            .await
+            .unwrap();
+        assert!(
+            plan.arguments.windows(2).any(|w| w == ["-c:a", "aac"]),
+            "{:?}",
+            plan.arguments
+        );
+        // It seeks to the segment start, with no remux half second.
+        assert!(
+            plan.arguments.windows(2).any(|w| w == ["-ss", "60000000"]),
+            "{:?}",
+            plan.arguments
+        );
+        assert!(
+            !plan.arguments.iter().any(|a| a == "-noaccurate_seek"),
+            "audio-only seek keeps accurate seek: {:?}",
             plan.arguments
         );
     }
