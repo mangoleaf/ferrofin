@@ -16,7 +16,8 @@
 //! * `bool` is `bool.TryParse`: either case, surrounding whitespace ignored
 //!   (`True` — the spelling `StreamInfo::to_url` emits — was a 400 here);
 //! * integers are trimmed before parsing (`NumberStyles.Integer` allows
-//!   surrounding whitespace);
+//!   surrounding whitespace), and a decimal one may end in NULs (measured on
+//!   12.4);
 //! * a `double` or `float` is ASP.NET's `DoubleModelBinder`/`FloatModelBinder`,
 //!   not a `TypeConverter`: `NumberStyles.Float | AllowThousands` in the
 //!   invariant culture ([`invariant_float::parse`]), so `1,000` binds and
@@ -157,7 +158,8 @@ fn radix16_digits(text: &str) -> Option<&str> {
 
 /// `deserialize_<integer>` for [`Value`]: trimmed, then parsed as decimal or
 /// (with a hex prefix) as the same-width unsigned value reinterpreted, as
-/// `Convert.ToInt32(text, 16)` reads `FFFFFFFF` as -1.
+/// `Convert.ToInt32(text, 16)` reads `FFFFFFFF` as -1. A decimal may end in
+/// NULs after its ASCII white space (`int.Parse`'s `TrailingZeros`).
 macro_rules! parse_integer {
     ($($method:ident => $visit:ident: $ty:ty as $unsigned:ty),* $(,)?) => {$(
         #[allow(clippy::cast_possible_wrap)]
@@ -168,7 +170,10 @@ macro_rules! parse_integer {
                     Some(digits) => <$unsigned>::from_str_radix(digits, 16).map(|n| n as $ty),
                     None => return Err(de::Error::custom(format!("invalid hex number `{text}`"))),
                 },
-                None => text.parse::<$ty>(),
+                None => text
+                    .trim_end_matches('\0')
+                    .trim_end_matches(|c| matches!(c, ' ' | '\t'..='\r'))
+                    .parse::<$ty>(),
             };
             match parsed {
                 Ok(n) => visitor.$visit(n),
@@ -290,6 +295,8 @@ impl<'de> de::Deserializer<'de> for Value<'_> {
         visitor: V,
     ) -> Result<V::Value, Error> {
         let text = self.text.trim();
+        // TODO(gl-1441): Enum.Parse's trailing NULs, untrimmed end and comma
+        // lists are not ported yet (measured on 12.4 there).
         // `Enum.Parse` also takes the underlying number (wire enums parse
         // numbers themselves). A Jellyfin enum binds the member with that C#
         // value; an enum outside the inventory has its values in declaration
@@ -541,6 +548,43 @@ mod tests {
         let error = numbers(query).expect_err(query);
         let member = query.split('=').next().unwrap_or_default();
         assert!(error.starts_with(member), "{query}: {error}");
+    }
+
+    /// `Int32Converter` trims (Unicode white space), then `int.Parse` takes
+    /// NULs after the number and its white space: `?limit=1%00` is page size
+    /// 1 on Jellyfin 12.4, and `%001` a 400.
+    #[test]
+    fn integers_take_trailing_nuls() {
+        for (query, int) in [
+            ("int=1%00", 1),
+            ("int=1%00%00", 1),
+            ("int=1%20%00", 1),
+            ("int=1%09%00", 1),
+            ("int=1%0B%00", 1),
+            ("int=1%00%20", 1),
+            ("int=%C2%A01%00", 1),
+            ("int=%C2%A01", 1),
+            ("int=1%C2%A0", 1),
+            ("int=-1%00", -1),
+        ] {
+            assert_eq!(numbers(query).expect(query).int, Some(int), "{query}");
+        }
+        assert_eq!(numbers("long=7%00").unwrap().long, Some(7));
+        assert_eq!(numbers("byte=7%00").unwrap().byte, Some(7));
+        for query in [
+            "int=%00",
+            "int=%00%20",
+            "int=%001",
+            "int=1%005",
+            "int=1%00%20%00",
+            "int=0x1%00",
+            "int=1%C2%A0%00",
+            "int=1%2C000",
+            "int=1%2C",
+        ] {
+            let error = numbers(query).expect_err(query);
+            assert!(error.starts_with("int"), "{query}: {error}");
+        }
     }
 
     /// Named after a Jellyfin enum whose C# values skip 0 and 6.
