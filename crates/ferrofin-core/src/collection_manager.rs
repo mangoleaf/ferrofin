@@ -63,7 +63,7 @@ use ferrofin_traits::persistence::{
     ItemPersistenceService, ItemRepository, LinkedChildrenService, PlaylistMembers,
 };
 use ferrofin_traits::providers::{
-    MetadataRefreshMode, MetadataRefreshOptions, ProviderManager, RefreshPriority,
+    ItemUpdateType, MetadataRefreshMode, MetadataRefreshOptions, ProviderManager, RefreshPriority,
 };
 use ferrofin_traits::system::ServerApplicationPaths;
 
@@ -215,7 +215,7 @@ fn folder_items_query(
     }
     if kind == BaseItemKind::Series {
         query.series_presentation_unique_key =
-            Some(crate::library_manager::episode_presentation_key(folder));
+            Some(ferrofin_db::entities::base_items::presentation_key(folder).to_owned());
         query.include_item_types = vec![BaseItemKind::Episode, BaseItemKind::Season];
         query.order_by = vec![(ItemSortBy::SortName, SortOrder::Ascending)];
         query.is_virtual_item = Some(false);
@@ -676,6 +676,21 @@ impl FerrofinCollectionManager {
         .await
     }
 
+    /// `collection.UpdateToRepositoryAsync(ItemUpdateType.MetadataEdit)`,
+    /// which every membership change makes: the metadata savers run (the box
+    /// set's `collection.xml` lists its members) and the save is announced.
+    /// Nothing without a provider manager (unit tests).
+    async fn save_membership(&self, collection_id: Uuid) -> Result<(), ServiceError> {
+        match self.providers.as_deref() {
+            Some(providers) => {
+                providers
+                    .update_to_repository(collection_id, ItemUpdateType::MetadataEdit)
+                    .await
+            }
+            None => Ok(()),
+        }
+    }
+
     /// `AddToCollectionAsync`'s check, made for every id before any is linked:
     /// an id naming no item (the empty one included, which upstream's
     /// `GetItemById` also refuses) is an `ArgumentException`, a 400, and no
@@ -793,6 +808,7 @@ impl CollectionManager for FerrofinCollectionManager {
             return Ok(row);
         }
         self.update_rating_to_items(id, Rerate::Direct).await?;
+        self.save_membership(id).await?;
         // `AddToCollectionAsync` with the `FullRefresh` options create passes
         // ("the initial adding of items is going to create a local metadata
         // file"), which it then marks `ForceSave`.
@@ -828,11 +844,12 @@ impl CollectionManager for FerrofinCollectionManager {
                 .upsert_linked_child(collection_id, *item_id, LINKED_CHILD_MANUAL)
                 .await?;
         }
-        // `AddToCollectionAsync` re-rates and queues its refresh only when an
-        // item was new.
+        // `AddToCollectionAsync` re-rates, saves and queues its refresh only
+        // when an item was new.
         if item_ids.iter().any(|id| !current.contains(id)) {
             self.update_rating_to_items(collection_id, Rerate::Direct)
                 .await?;
+            self.save_membership(collection_id).await?;
             queue_refresh(
                 self.providers.as_deref(),
                 collection_id,
@@ -862,7 +879,9 @@ impl CollectionManager for FerrofinCollectionManager {
         }
         self.update_rating_to_items(collection_id, Rerate::Refresh)
             .await?;
-        // `RemoveFromCollectionAsync` queues its refresh whatever it removed.
+        // `RemoveFromCollectionAsync` saves and queues its refresh whatever it
+        // removed.
+        self.save_membership(collection_id).await?;
         queue_refresh(
             self.providers.as_deref(),
             collection_id,
@@ -5558,12 +5577,14 @@ mod tests {
     type RefreshLog =
         std::sync::Mutex<Vec<(Uuid, ferrofin_traits::providers::MetadataRefreshOptions)>>;
 
-    /// A [`ProviderManager`] recording `queue_refresh` and
-    /// `refresh_single_item` calls; nothing else on these paths reaches it.
+    /// A [`ProviderManager`] recording `queue_refresh`,
+    /// `refresh_single_item` and `save_metadata` calls; nothing else on these
+    /// paths reaches it.
     #[derive(Default)]
     struct QueuedRefreshes {
         queued: RefreshLog,
         awaited: RefreshLog,
+        saved: std::sync::Mutex<Vec<(Uuid, ferrofin_traits::providers::ItemUpdateType)>>,
     }
 
     /// A log's `(item, mode, force_save)` triples, emptied.
@@ -5580,6 +5601,11 @@ mod tests {
         /// The queued refreshes, emptied.
         fn take(&self) -> Vec<(Uuid, ferrofin_traits::providers::MetadataRefreshMode, bool)> {
             drain(&self.queued)
+        }
+
+        /// The metadata saves (`UpdateToRepositoryAsync`), emptied.
+        fn take_saved(&self) -> Vec<(Uuid, ferrofin_traits::providers::ItemUpdateType)> {
+            std::mem::take(&mut *self.saved.lock().unwrap())
         }
 
         /// The awaited (`refresh_single_item`) refreshes, emptied.
@@ -5661,10 +5687,11 @@ mod tests {
         }
         async fn save_metadata(
             &self,
-            _item_id: Uuid,
-            _update_type: ferrofin_traits::providers::ItemUpdateType,
+            item_id: Uuid,
+            update_type: ferrofin_traits::providers::ItemUpdateType,
         ) -> Result<(), ferrofin_traits::error::ServiceError> {
-            unreachable!("not on these paths")
+            self.saved.lock().unwrap().push((item_id, update_type));
+            Ok(())
         }
         async fn get_external_id_infos(
             &self,
@@ -5703,7 +5730,10 @@ mod tests {
     /// membership change: a default one for an empty create, `FullRefresh`
     /// (+`ForceSave`) for a create with items, `ForceSave` for an add that
     /// brings a new item and for every remove. An add of members already
-    /// there queues nothing.
+    /// there queues nothing. Each change that queues a `ForceSave` refresh
+    /// first saves the box set as a metadata edit
+    /// (`UpdateToRepositoryAsync(MetadataEdit)`), which writes its
+    /// `collection.xml`; an empty create saves nothing.
     #[tokio::test]
     async fn collection_changes_queue_the_box_set_refresh() {
         use ferrofin_traits::providers::MetadataRefreshMode::{Default, FullRefresh};
@@ -5723,6 +5753,8 @@ mod tests {
             .expect("create empty");
         let empty = Uuid::parse_str(&empty.id).expect("uuid");
         assert_eq!(queued.take(), vec![(empty, Default, false)]);
+        assert_eq!(queued.take_saved(), Vec::new());
+        let edit = ferrofin_traits::providers::ItemUpdateType::MetadataEdit;
 
         let full = mgr
             .create_collection(&CollectionCreationOptions {
@@ -5734,17 +5766,25 @@ mod tests {
             .expect("create with items");
         let full = Uuid::parse_str(&full.id).expect("uuid");
         assert_eq!(queued.take(), vec![(full, FullRefresh, true)]);
+        assert_eq!(queued.take_saved(), vec![(full, edit)]);
 
         mgr.add_to_collection(full, &[movie_a])
             .await
             .expect("re-add");
         assert_eq!(queued.take(), Vec::new(), "nothing new, nothing queued");
+        assert_eq!(
+            queued.take_saved(),
+            Vec::new(),
+            "nothing new, nothing saved"
+        );
         mgr.add_to_collection(full, &[movie_b]).await.expect("add");
         assert_eq!(queued.take(), vec![(full, Default, true)]);
+        assert_eq!(queued.take_saved(), vec![(full, edit)]);
         mgr.remove_from_collection(full, &[movie_a])
             .await
             .expect("remove");
         assert_eq!(queued.take(), vec![(full, Default, true)]);
+        assert_eq!(queued.take_saved(), vec![(full, edit)]);
         mgr.remove_from_collection(full, &[movie_a])
             .await
             .expect("remove a non-member");
@@ -5753,6 +5793,60 @@ mod tests {
             vec![(full, Default, true)],
             "a remove queues its refresh whatever it removed"
         );
+        assert_eq!(queued.take_saved(), vec![(full, edit)], "and saves");
+    }
+
+    /// `BoxSetMetadataService.MergeData` for a box set outside the data
+    /// directory: its file's members come first, the stored ones not among
+    /// them after; a path naming no item is dropped, and a file naming no
+    /// member, or only stored ones, writes nothing.
+    #[tokio::test]
+    async fn a_box_sets_file_members_come_before_its_stored_ones() {
+        use ferrofin_traits::persistence::{ItemPersistenceService as _, PlaylistMember};
+        let db = test_db().await;
+        let (a, b, c) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+        for id in [a, b, c] {
+            seed_item(&db, id, BaseItemKind::Movie).await;
+        }
+        let created = collection_manager_over(&db)
+            .create_collection(&CollectionCreationOptions {
+                name: "Set".to_owned(),
+                item_id_list: vec![a, b],
+                ..CollectionCreationOptions::default()
+            })
+            .await
+            .expect("create");
+        let set = Uuid::parse_str(&created.id).expect("uuid");
+        let persistence =
+            crate::item_persistence_service::FerrofinItemPersistenceService::new(db.clone());
+        let member = |id| PlaylistMember {
+            item_id: Some(id),
+            ..Default::default()
+        };
+        let gone = PlaylistMember {
+            path: Some("/nowhere/Gone.mkv".to_owned()),
+            ..Default::default()
+        };
+        assert!(
+            !persistence
+                .merge_box_set_members(set, &[])
+                .await
+                .expect("none")
+        );
+        assert!(
+            persistence
+                .merge_box_set_members(set, &[member(c), gone, member(b), member(c)])
+                .await
+                .expect("merge")
+        );
+        assert_eq!(rows(&db, set).await, vec![c, b, a]);
+        assert!(
+            !persistence
+                .merge_box_set_members(set, &[member(c)])
+                .await
+                .expect("again")
+        );
+        assert_eq!(rows(&db, set).await, vec![c, b, a]);
     }
 
     /// `PlaylistManager.AddToPlaylistInternal` (reached from create, update

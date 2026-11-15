@@ -43,5 +43,7 @@ pub use logger::{Logger, NullLogger, TracingLogger};
 pub use manager::{
     HostLookup, InterfaceEnumerator, NetworkManager, StartupConfig, published_urls_missing_base_url,
 };
-pub use network_configuration::{NetworkConfiguration, normalize_base_url};
+pub use network_configuration::{
+    NetworkConfiguration, base_url_prefix_len, escape_base_url, normalize_base_url,
+};
 pub use remote_access_policy_result::RemoteAccessPolicyResult;

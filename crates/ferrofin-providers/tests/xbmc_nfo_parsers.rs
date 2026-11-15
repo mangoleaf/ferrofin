@@ -21,8 +21,7 @@ use ferrofin_providers::xbmc::{
     StaticExternalIds, fetch_episode, fetch_movie, fetch_music, fetch_season, fetch_series,
     new_result,
 };
-
-const TICKS_PER_SECOND: i64 = 10_000_000;
+use ferrofin_util::ticks::TICKS_PER_SECOND;
 
 /// Reads a fixture from `tests/data` by its C# `Test Data/<name>` path.
 fn read_fixture(test_data_path: &str) -> String {

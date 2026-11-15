@@ -33,12 +33,14 @@ use std::collections::{HashMap, HashSet};
 
 /// Compare the values the image save actually persists, including the database's
 /// 100 ns timestamp precision. A provider returning identical artwork is a no-op.
+/// The row's path is compared expanded ([`same_image_path`]).
 fn image_row_matches(
     row: &ferrofin_db::entities::base_items::BaseItemImageInfoEntity,
     image: &ItemImageInfo,
+    virtual_paths: &crate::virtual_paths::VirtualPathExpander,
 ) -> bool {
     row.image_type == image_type_to_disc(image.image_type)
-        && row.path == image.path
+        && same_image_path(row, image, virtual_paths)
         && row.width == i64::from(image.width)
         && row.height == i64::from(image.height)
         && row.blurhash.as_deref() == image.blur_hash.as_deref().map(str::as_bytes)
@@ -46,17 +48,17 @@ fn image_row_matches(
             == Some(datetime_to_db(image.date_modified).as_str())
 }
 
-/// One `BaseItemImageInfos` row as the scan's change detection reads it:
-/// `ItemId`, `ImageType`, `Path`, `Width`, `Height`, `Blurhash`, `DateModified`.
-type ScanImageRow = (
-    String,
-    i32,
-    String,
-    i64,
-    i64,
-    Option<Vec<u8>>,
-    Option<chrono::DateTime<chrono::Utc>>,
-);
+/// Whether `row` names `image`'s file: its path as stored, or expanded as
+/// every read expands it, is the one saved. An adopted row's `%MetadataPath%`
+/// form is so updated in place and keeps that form, as a save keeps an item's
+/// (`stored_virtual_path`).
+fn same_image_path(
+    row: &ferrofin_db::entities::base_items::BaseItemImageInfoEntity,
+    image: &ItemImageInfo,
+    virtual_paths: &crate::virtual_paths::VirtualPathExpander,
+) -> bool {
+    row.path == image.path || virtual_paths.expand_cow(&row.path) == image.path
+}
 
 use ferrofin_model::data::BaseItemKind;
 
@@ -2717,6 +2719,39 @@ impl ItemPersistenceService for FerrofinItemPersistenceService {
         Ok(())
     }
 
+    async fn merge_box_set_members(
+        &self,
+        box_set: Uuid,
+        members: &[PlaylistMember],
+    ) -> Result<bool, ServiceError> {
+        // Resolved on a reader, before the writer is taken, as a playlist's
+        // entries are. `ItemPersistenceService` keeps one entry per child of
+        // any container but a playlist.
+        let mut ids: Vec<Uuid> = Vec::with_capacity(members.len());
+        {
+            let mut conn = self.db.pool().acquire().await.map_err(db_err)?;
+            for member in members {
+                if let Some(id) = resolve_playlist_member(&mut conn, member)
+                    .await
+                    .map_err(db_err)?
+                    && !ids.contains(&id)
+                {
+                    ids.push(id);
+                }
+            }
+        }
+        // The stored members stay: a file naming none adds nothing.
+        if ids.is_empty() {
+            return Ok(false);
+        }
+        let mut tx = self.db.writer().begin().await.map_err(db_err)?;
+        let written = write_scanned_members(&mut tx, &guid_to_db(box_set), ids, false)
+            .await
+            .map_err(db_err)?;
+        tx.commit().await.map_err(db_err)?;
+        Ok(written.is_some())
+    }
+
     async fn provider_ids_for_items(
         &self,
         item_ids: &[Uuid],
@@ -3104,24 +3139,6 @@ impl ItemPersistenceService for FerrofinItemPersistenceService {
         tx.commit().await.map_err(db_err)
     }
 
-    async fn save_images(&self, item: &BaseItemEntity) -> Result<(), ServiceError> {
-        // The image rows live in BaseItemImageInfos and are written through
-        // `save_item_images`/`set_item_image*`; without the domain item's
-        // ImageInfos list on the entity there is nothing to persist here beyond
-        // confirming the item exists, and nothing calls this. TODO(gl-211): open
-        // work item: remove it from the trait.
-        let exists: Option<i64> =
-            sqlx::query_scalar(r#"SELECT 1 FROM "BaseItems" WHERE "Id" = ?1"#)
-                .bind(&item.id)
-                .fetch_optional(self.db.pool())
-                .await
-                .map_err(db_err)?;
-        if exists.is_none() {
-            return Err(ServiceError::not_found(format!("item {}", item.id)));
-        }
-        Ok(())
-    }
-
     async fn save_item_images(
         &self,
         item_id: Uuid,
@@ -3135,7 +3152,7 @@ impl ItemPersistenceService for FerrofinItemPersistenceService {
             .begin_with("BEGIN IMMEDIATE")
             .await
             .map_err(db_err)?;
-        write_item_images(&mut tx, item_id, images).await?;
+        write_item_images(&mut tx, item_id, images, &self.virtual_paths).await?;
         tx.commit().await.map_err(db_err)?;
         Ok(())
     }
@@ -3184,7 +3201,7 @@ impl ItemPersistenceService for FerrofinItemPersistenceService {
                 .await
                 .map_err(db_err)?;
             for (item_id, images) in chunk {
-                write_item_images(&mut tx, *item_id, images).await?;
+                write_item_images(&mut tx, *item_id, images, &self.virtual_paths).await?;
             }
             tx.commit().await.map_err(db_err)?;
         }
@@ -3203,38 +3220,30 @@ impl ItemPersistenceService for FerrofinItemPersistenceService {
         // shape every other batched id lookup here uses.
         for chunk in item_ids.chunks(ferrofin_db::BATCH_BIND_CHUNK) {
             let placeholders = ferrofin_db::numbered_placeholders(1..=chunk.len());
-            let sql = format!(
-                r#"SELECT "ItemId", "ImageType", "Path", "Width", "Height", "Blurhash", "DateModified"
-                   FROM "BaseItemImageInfos" WHERE "ItemId" IN ({placeholders})"#
-            );
-            let mut query = sqlx::query_as::<_, ScanImageRow>(sqlx::AssertSqlSafe(sql));
+            let mut query =
+                sqlx::query_as::<_, ferrofin_db::entities::base_items::BaseItemImageInfoEntity>(
+                    sqlx::AssertSqlSafe(crate::item_repository::images_of_items_sql(&placeholders)),
+                );
             for id in chunk {
                 query = query.bind(guid_to_db(*id));
             }
             let rows = query.fetch_all(self.db.pool()).await.map_err(db_err)?;
-            out.extend(rows.into_iter().filter_map(
-                |(item_id, image_type, path, width, height, blurhash, date_modified)| {
-                    Some(StoredImageMetadata {
-                        item_id: Uuid::parse_str(&item_id).ok()?,
-                        image_type: crate::item_repository::image_type_from_disc(image_type),
-                        path,
-                        width: i32::try_from(width).unwrap_or(0),
-                        height: i32::try_from(height).unwrap_or(0),
-                        // Stored as a UTF-8 byte blob; an empty or non-UTF-8 blob
-                        // reads back as "no blurhash", which forces a recompute.
-                        blur_hash: blurhash
-                            .filter(|b| !b.is_empty())
-                            .and_then(|b| String::from_utf8(b).ok()),
-                        // A row with no stored mtime can never match the file's,
-                        // so it falls through to a recompute — the same outcome
-                        // C# reaches for a `default(DateTime)` image.
-                        date_modified: date_modified.unwrap_or_else(|| {
-                            chrono::DateTime::<chrono::Utc>::from_timestamp(0, 0)
-                                .unwrap_or_else(chrono::Utc::now)
-                        }),
-                    })
-                },
-            ));
+            // An empty or non-UTF-8 blurhash reads back as none, and a row with
+            // no stored mtime as the epoch, which no file's matches: both fall
+            // through to a recompute, as C# does for a `default(DateTime)` image.
+            out.extend(rows.into_iter().filter_map(|row| {
+                let item_id = Uuid::parse_str(&row.item_id).ok()?;
+                let image = crate::item_repository::image_info_from_row(row, &self.virtual_paths);
+                Some(StoredImageMetadata {
+                    item_id,
+                    image_type: image.image_type,
+                    path: image.path,
+                    width: image.width,
+                    height: image.height,
+                    blur_hash: image.blur_hash,
+                    date_modified: image.date_modified,
+                })
+            }));
         }
         Ok(out)
     }
@@ -3248,31 +3257,20 @@ impl ItemPersistenceService for FerrofinItemPersistenceService {
         let key = |id: &str| Uuid::parse_str(id).ok();
         for chunk in item_ids.chunks(ferrofin_db::BATCH_BIND_CHUNK) {
             let placeholders = ferrofin_db::numbered_placeholders(1..=chunk.len());
-            let images = format!(
-                r#"SELECT "ItemId", "ImageType", "Path", "Width", "Height", "Blurhash", "DateModified"
-                   FROM "BaseItemImageInfos" WHERE "ItemId" IN ({placeholders})
-                   ORDER BY "ItemId", "ImageType", rowid"#
-            );
-            let mut query = sqlx::query_as::<_, ScanImageRow>(sqlx::AssertSqlSafe(images.as_str()));
+            let mut query =
+                sqlx::query_as::<_, ferrofin_db::entities::base_items::BaseItemImageInfoEntity>(
+                    sqlx::AssertSqlSafe(crate::item_repository::images_of_items_sql(&placeholders)),
+                );
             for id in chunk {
                 query = query.bind(guid_to_db(*id));
             }
             for row in query.fetch_all(self.db.pool()).await.map_err(db_err)? {
-                let Some(id) = key(&row.0) else { continue };
-                out.entry(id).or_default().images.push(ItemImageInfo {
-                    path: row.2,
-                    image_type: crate::item_repository::image_type_from_disc(row.1),
-                    date_modified: row.6.unwrap_or_else(|| {
-                        chrono::DateTime::<chrono::Utc>::from_timestamp(0, 0)
-                            .unwrap_or_else(chrono::Utc::now)
-                    }),
-                    width: i32::try_from(row.3).unwrap_or(0),
-                    height: i32::try_from(row.4).unwrap_or(0),
-                    blur_hash: row
-                        .5
-                        .filter(|b| !b.is_empty())
-                        .and_then(|b| String::from_utf8(b).ok()),
-                });
+                let Some(id) = key(&row.item_id) else {
+                    continue;
+                };
+                out.entry(id).or_default().images.push(
+                    crate::item_repository::image_info_from_row(row, &self.virtual_paths),
+                );
             }
             let ancestors = format!(
                 r#"SELECT "ItemId", "ParentItemId" FROM "AncestorIds"
@@ -4446,10 +4444,15 @@ impl ItemPersistenceService for FerrofinItemPersistenceService {
     }
 
     async fn update_inherited_values(&self) -> Result<(), ServiceError> {
-        // A no-op that nothing calls. Upstream's `UpdateInheritedValues` deletes
-        // the `ItemValuesMap` rows of type `InheritedTags`, which Ferrofin never
-        // writes (an adopted database may hold some). TODO(gl-211): open work
-        // item: port it and call it after the post-scan tasks, or remove it.
+        // `ItemPersistenceService.cs:161-170`: one statement, so no transaction.
+        sqlx::query(
+            r#"DELETE FROM "ItemValuesMap" WHERE "ItemValueId" IN
+               (SELECT "ItemValueId" FROM "ItemValues" WHERE "Type" = ?1)"#,
+        )
+        .bind(i32::from(ferrofin_db::enums::ItemValueType::InheritedTags))
+        .execute(self.db.writer())
+        .await
+        .map_err(db_err)?;
         Ok(())
     }
 }
@@ -6955,11 +6958,13 @@ async fn provider_id_sets(
 }
 
 /// Replaces `item_id`'s image rows with `images` inside `tx`, keeping
-/// identical rows (see [`ItemPersistenceService::save_item_images`]).
+/// identical rows and matching each by its path expanded ([`same_image_path`];
+/// see [`ItemPersistenceService::save_item_images`]).
 async fn write_item_images(
     tx: &mut sqlx::SqliteConnection,
     item_id: Uuid,
     images: &[ItemImageInfo],
+    virtual_paths: &crate::virtual_paths::VirtualPathExpander,
 ) -> Result<(), ServiceError> {
     use ferrofin_db::entities::base_items::BaseItemImageInfoEntity;
     let item = guid_to_db(item_id);
@@ -6975,7 +6980,10 @@ async fn write_item_images(
     // so duplicate paths do not hide additions or removals.
     let mut changed = Vec::new();
     for image in images {
-        if let Some(index) = stored.iter().position(|row| image_row_matches(row, image)) {
+        if let Some(index) = stored
+            .iter()
+            .position(|row| image_row_matches(row, image, virtual_paths))
+        {
             stored.swap_remove(index);
         } else {
             changed.push(image);
@@ -6993,7 +7001,8 @@ async fn write_item_images(
         let id = stored
             .iter()
             .position(|row| {
-                row.image_type == image_type_to_disc(image.image_type) && row.path == image.path
+                row.image_type == image_type_to_disc(image.image_type)
+                    && same_image_path(row, image, virtual_paths)
             })
             .map_or_else(
                 || guid_to_db(Uuid::new_v4()),
@@ -8517,6 +8526,80 @@ mod tests {
             .await
             .expect("save");
         assert_eq!(stored_path(adopted.id.clone()).await, adopted.path);
+    }
+
+    /// The scan's image reads expand an adopted row's `%MetadataPath%` image
+    /// path, as every other read does (`BaseItemMapper.MapImageFromEntity`'s
+    /// `ExpandVirtualPath`), so change detection compares the path the scan
+    /// finds with the one the row names.
+    #[tokio::test]
+    async fn the_scan_image_reads_expand_an_adopted_image_path() {
+        let db = test_db().await;
+        let root = tempfile::tempdir().expect("tempdir");
+        let paths = crate::app_paths::test_paths(root.path());
+        let metadata =
+            ferrofin_traits::system::ServerApplicationPaths::internal_metadata_path(&*paths);
+        let svc = FerrofinItemPersistenceService::new(db.clone()).with_virtual_paths(
+            crate::virtual_paths::VirtualPathExpander::from_paths(std::sync::Arc::clone(&paths)),
+        );
+        let item = Uuid::new_v4();
+        seed_item(&db, item, BaseItemKind::Movie).await;
+        super::seed_primary_image(
+            &db,
+            Uuid::new_v4(),
+            item,
+            "%MetadataPath%/library/ab/poster.jpg",
+        )
+        .await;
+        let expanded = format!("{metadata}/library/ab/poster.jpg");
+
+        let links = svc
+            .scan_stored_links(&[item])
+            .await
+            .expect("read")
+            .expect("supported");
+        assert_eq!(links[&item].images[0].path, expanded);
+        let stored = svc.image_metadata_for_items(&[item]).await.expect("read");
+        assert_eq!(stored[0].path, expanded);
+    }
+
+    /// A save that names an adopted row's file by its expanded path, as every
+    /// read hands it out, updates that row in place: its id, and so its place
+    /// among the item's backdrops, and its `%MetadataPath%` form are kept.
+    #[tokio::test]
+    async fn an_image_save_updates_an_adopted_row_in_place() {
+        let db = test_db().await;
+        let root = tempfile::tempdir().expect("tempdir");
+        let paths = crate::app_paths::test_paths(root.path());
+        let metadata =
+            ferrofin_traits::system::ServerApplicationPaths::internal_metadata_path(&*paths);
+        let svc = FerrofinItemPersistenceService::new(db.clone()).with_virtual_paths(
+            crate::virtual_paths::VirtualPathExpander::from_paths(std::sync::Arc::clone(&paths)),
+        );
+        let (item, row) = (Uuid::new_v4(), Uuid::new_v4());
+        seed_item(&db, item, BaseItemKind::Movie).await;
+        let token = "%MetadataPath%/library/ab/poster.jpg";
+        super::seed_primary_image(&db, row, item, token).await;
+
+        let remeasured = ferrofin_traits::options::ItemImageInfo {
+            path: format!("{metadata}/library/ab/poster.jpg"),
+            image_type: ferrofin_model::entities::ImageType::Primary,
+            date_modified: chrono::DateTime::from_timestamp(1_700_000_000, 0).expect("date"),
+            width: 10,
+            height: 20,
+            blur_hash: Some("hash".to_owned()),
+        };
+        svc.save_item_images(item, std::slice::from_ref(&remeasured))
+            .await
+            .expect("save");
+        let rows: Vec<(String, String, i64)> = sqlx::query_as(
+            r#"SELECT "Id", "Path", "Width" FROM "BaseItemImageInfos" WHERE "ItemId" = ?1"#,
+        )
+        .bind(guid_to_db(item))
+        .fetch_all(db.pool())
+        .await
+        .expect("rows");
+        assert_eq!(rows, vec![(guid_to_db(row), token.to_owned(), 10)]);
     }
 
     /// Saves `entity` and returns the `SortName` the write path persisted.

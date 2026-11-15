@@ -43,18 +43,18 @@ use uuid::Uuid;
 use wasmtime::component::{Component, Linker};
 use wasmtime::{Config as WasmConfig, Engine};
 
-use ferrofin_core::event_manager::consumer_done;
-use ferrofin_core::{
-    FerrofinEventManager, PluginConfigPage, RegisteredPlugin, ScheduledTask, TaskProgress,
-};
 use ferrofin_traits::error::ServiceError;
-use ferrofin_traits::plugins::{PluginDescriptor, PluginManager, PluginOfferedItemStore};
+use ferrofin_traits::events::{EventSubscriber, ITEMS_CHANGED, consumer_done};
+use ferrofin_traits::plugins::{
+    PluginConfigPage, PluginDescriptor, PluginManager, PluginOfferedItemStore, RegisteredPlugin,
+};
+use ferrofin_traits::tasks::{ScheduledTask, TaskProgress};
 
 use crate::bindings::HostState;
 use crate::runtime::{EPOCH_TICK, InstanceSpec, RuntimeHandle};
 
 /// The domain events forwarded to every enabled plugin's `on-event` export —
-/// exactly the set `FerrofinEventManager` publishes today. Extend this list
+/// exactly the set the server's event manager publishes today. Extend this list
 /// as new publish sites land (plan §3).
 pub const FORWARDED_EVENTS: [&str; 9] = [
     "LibraryChanged",
@@ -70,12 +70,12 @@ pub const FORWARDED_EVENTS: [&str; 9] = [
 
 /// The bus event a [`FORWARDED_EVENTS`] name is delivered from. A plugin's
 /// `LibraryChanged` is every batch of library changes, unfiltered — the
-/// notifier's in-process [`ITEMS_CHANGED`](ferrofin_core::library_changed_notifier::ITEMS_CHANGED)
+/// notifier's in-process [`ITEMS_CHANGED`]
 /// — since the client push goes to each user's sessions and never through
 /// the bus. The other names are published on the bus as they are.
 fn bus_event(event_name: &'static str) -> &'static str {
     match event_name {
-        "LibraryChanged" => ferrofin_core::library_changed_notifier::ITEMS_CHANGED,
+        "LibraryChanged" => ITEMS_CHANGED,
         other => other,
     }
 }
@@ -653,7 +653,7 @@ impl WasmPluginHost {
     /// waits on a guest.
     pub fn subscribe_events(
         &self,
-        events: &FerrofinEventManager,
+        events: &dyn EventSubscriber,
         plugin_manager: &Arc<dyn PluginManager>,
     ) {
         for event_name in FORWARDED_EVENTS {
@@ -705,7 +705,7 @@ fn cached_segment_provider(
     plugins: &Arc<dyn PluginManager>,
 ) -> Arc<dyn ferrofin_traits::media_segments::MediaSegmentProvider> {
     Arc::new(
-        ferrofin_core::CachedMediaSegmentProvider::new(
+        ferrofin_providers::cached_media_segment_provider::CachedMediaSegmentProvider::new(
             plugin.descriptor.name.clone(),
             plugin.descriptor.id,
             Arc::clone(plugins),

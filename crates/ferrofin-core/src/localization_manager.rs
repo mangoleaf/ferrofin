@@ -5,7 +5,7 @@
 //! country are read from live configuration when resolving a value.
 
 use std::collections::{BTreeMap, HashMap};
-use std::sync::{Arc, LazyLock};
+use std::sync::{Arc, LazyLock, OnceLock};
 
 use ferrofin_model::entities_media::{ParentalRating, ParentalRatingScore};
 use ferrofin_model::globalization::{CountryInfo, CultureDto, LocalizationOption};
@@ -43,25 +43,25 @@ mod core_dictionaries;
 /// `LocalizationManager.DefaultCulture`.
 const DEFAULT_CULTURE: &str = "en-US";
 
-/// The parsed core dictionaries, keyed by the resource's culture code (e.g.
-/// `de`, `pt-BR`, `es_419`), each case-insensitive on the phrase key like the
-/// C# `Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)`. Built once
-/// per process (`_cultureOnlyDictionaries`).
-static CORE_DICTIONARY_DATA: LazyLock<HashMap<&'static str, HashMap<String, String>>> =
-    LazyLock::new(|| {
-        core_dictionaries::CORE_DICTIONARIES
-            .iter()
-            .map(|(code, json)| {
-                let parsed: HashMap<String, String> = serde_json::from_str(json)
-                    .unwrap_or_else(|e| panic!("embedded core dictionary {code}.json: {e}"));
-                let lowered = parsed
-                    .into_iter()
-                    .map(|(k, v)| (k.to_lowercase(), v))
-                    .collect();
-                (*code, lowered)
-            })
-            .collect()
-    });
+/// The parsed core dictionaries, one slot per entry of
+/// `core_dictionaries::CORE_DICTIONARIES`, each parsed on its culture's first
+/// lookup and kept for the process (`_cultureOnlyDictionaries.GetOrAdd`), so a
+/// server holds only the cultures it is asked for. Each is case-insensitive on
+/// the phrase key like the C# `Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)`.
+static CORE_DICTIONARY_DATA: [OnceLock<HashMap<String, String>>;
+    core_dictionaries::CORE_DICTIONARIES.len()] =
+    [const { OnceLock::new() }; core_dictionaries::CORE_DICTIONARIES.len()];
+
+/// Parses the embedded dictionary `json` of culture `code`, its phrase keys
+/// lower-cased.
+fn parse_core_dictionary(code: &str, json: &str) -> HashMap<String, String> {
+    let parsed: HashMap<String, String> = serde_json::from_str(json)
+        .unwrap_or_else(|e| panic!("embedded core dictionary {code}.json: {e}"));
+    parsed
+        .into_iter()
+        .map(|(k, v)| (k.to_lowercase(), v))
+        .collect()
+}
 
 /// `_bcp47ToJellyfinMap`: hyphenated BCP-47 spellings of the resources that use
 /// an underscore (`ar-SA` → `ar_SA`, `es-419` → `es_419`, …), case-insensitive.
@@ -90,10 +90,11 @@ fn normalize_culture_code(culture: &str) -> String {
 /// code, or `None` when no resource ships for it (the C# logs and falls back).
 fn core_dictionary(culture: &str) -> Option<&'static HashMap<String, String>> {
     let file = normalize_culture_code(culture);
-    CORE_DICTIONARY_DATA
+    let index = core_dictionaries::CORE_DICTIONARIES
         .iter()
-        .find(|(code, _)| **code == file)
-        .map(|(_, dict)| dict)
+        .position(|(code, _)| *code == file)?;
+    let (code, json) = core_dictionaries::CORE_DICTIONARIES[index];
+    Some(CORE_DICTIONARY_DATA[index].get_or_init(|| parse_core_dictionary(code, json)))
 }
 
 /// Native labels captured from .NET 10 `CultureInfo.NativeName` for the pinned
@@ -1087,8 +1088,46 @@ mod tests {
                 .get_localized_string("HearingImpaired"),
             "Hearing Impaired"
         );
-        // Every embedded dictionary parses (the lazy table panics otherwise).
-        assert!(CORE_DICTIONARY_DATA.len() > 100);
+    }
+
+    /// The position of culture `code` in the embedded table.
+    fn index(code: &str) -> usize {
+        core_dictionaries::CORE_DICTIONARIES
+            .iter()
+            .position(|(c, _)| *c == code)
+            .unwrap()
+    }
+
+    /// Every embedded dictionary parses, with its phrase keys lower-cased: a
+    /// corrupt one would panic on its culture's first lookup, so CI fails here.
+    #[test]
+    fn every_embedded_dictionary_parses() {
+        for (code, json) in core_dictionaries::CORE_DICTIONARIES {
+            let parsed = parse_core_dictionary(code, json);
+            assert!(
+                parsed.keys().all(|key| *key == key.to_lowercase()),
+                "{code}"
+            );
+        }
+        let en = parse_core_dictionary(
+            "en-US",
+            core_dictionaries::CORE_DICTIONARIES[index("en-US")].1,
+        );
+        assert_eq!(
+            en.get("hearingimpaired").map(String::as_str),
+            Some("Hearing Impaired")
+        );
+    }
+
+    /// Looking a culture up parses that culture's dictionary and no other
+    /// (`GetOrAdd` per culture): the unused cultures cost nothing.
+    #[test]
+    fn a_lookup_parses_only_its_own_culture() {
+        // `zu` and `kk` are looked up by no other test in this process.
+        assert!(core_dictionary("zu").is_some());
+        assert!(CORE_DICTIONARY_DATA[index("zu")].get().is_some());
+        assert!(CORE_DICTIONARY_DATA[index("kk")].get().is_none());
+        assert!(core_dictionary("xx-YY").is_none());
     }
 
     /// The manager as the HTTP layer actually holds it: an `Arc<dyn …>` behind the

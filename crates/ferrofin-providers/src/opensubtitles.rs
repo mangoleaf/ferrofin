@@ -43,7 +43,8 @@ use ferrofin_model::providers::RemoteSubtitleInfo;
 use ferrofin_traits::error::ServiceError;
 use ferrofin_traits::plugins::PluginManager;
 use ferrofin_traits::subtitles::{
-    ProviderLogin, SubtitleMediaType, SubtitleProvider, SubtitleResponse, SubtitleSearchRequest,
+    ProviderLogin, RateLimitExceeded, SubtitleMediaType, SubtitleProvider, SubtitleResponse,
+    SubtitleSearchRequest,
 };
 use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
@@ -52,8 +53,11 @@ use uuid::Uuid;
 /// The stable id of the compiled-in OpenSubtitles plugin (dashboard config key).
 pub const PLUGIN_ID: Uuid = Uuid::from_u128(0x4a3f_8e21_6c94_4d17_a2b8_0f5e_9c3d_7a10);
 
-/// The provider's name — also the id namespace prefix in [`RemoteSubtitleInfo`].
-pub const PLUGIN_NAME: &str = "opensubtitles";
+/// The provider's name, the plugin's `OpenSubtitleDownloader.Name`: the
+/// fetcher name a library's `DisabledSubtitleFetchers` and
+/// `SubtitleFetcherOrder` hold, each candidate's `ProviderName`, and (as its
+/// MD5) the id namespace prefix in [`RemoteSubtitleInfo`].
+pub const PLUGIN_NAME: &str = "Open Subtitles";
 
 /// The API base URL.
 const API_BASE: &str = "https://api.opensubtitles.com/api/v1";
@@ -1286,7 +1290,9 @@ fn body_err(e: BodyError) -> ServiceError {
 
 /// The plugin's `RateLimitExceededException`.
 fn download_limit_reached() -> ServiceError {
-    ServiceError::backend("OpenSubtitles download limit reached")
+    ServiceError::backend_source(RateLimitExceeded(
+        "OpenSubtitles download limit reached".to_owned(),
+    ))
 }
 
 /// A refused `/download`, with the API's reply unless it is an HTML page
@@ -2100,6 +2106,11 @@ mod tests {
             assert!(
                 error.to_string().contains("download limit reached"),
                 "{error}"
+            );
+            // The plugin's RateLimitExceededException, which callers tell apart.
+            assert!(
+                ferrofin_traits::subtitles::is_rate_limit_exceeded(&error),
+                "{error:?}"
             );
         }
 

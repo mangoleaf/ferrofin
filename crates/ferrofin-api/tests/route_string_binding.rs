@@ -31,7 +31,8 @@ const SKIPPED: &[(&str, &str, &str)] = &[
 ];
 
 /// `[FromRoute, Required][RegularExpression(ContainerValidationRegexStr)]
-/// string container`: required too, and left to gl-1671 with the pattern.
+/// string container`: required too, left to gl-1671 (its pattern is bound by
+/// `stream_pattern_failures`).
 const CONTAINER: &str = "container";
 
 /// The parameters the sweep checked when it was written (2026-11-11). A lower
