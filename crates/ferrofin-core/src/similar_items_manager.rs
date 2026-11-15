@@ -357,6 +357,10 @@ struct LocalFilter {
     unplayed_only: bool,
     /// Whether the request's `ExcludeArtistIds` apply (the music providers).
     honours_exclude_artist_ids: bool,
+    /// C# `EnableGroupByMetadataKey` on the flat query, which only the
+    /// movie-like programme branch sets: the repository then reads 4 rows past
+    /// the limit, to replace the ones the id-and-key claim drops.
+    enable_group_by_metadata_key: bool,
 }
 
 /// Which C# local similarity provider serves a seed's kind — the two shapes
@@ -658,7 +662,7 @@ impl FerrofinSimilarItemsManager {
                 include_item_types: self.movie_candidate_kinds().await,
                 is_movie: Some(true),
                 unplayed_only: true,
-                honours_exclude_artist_ids: false,
+                ..LocalFilter::default()
             },
             BaseItemKind::Series => LocalFilter::of_kinds(vec![BaseItemKind::Series]),
             BaseItemKind::MusicAlbum => LocalFilter::music(BaseItemKind::MusicAlbum),
@@ -669,9 +673,10 @@ impl FerrofinSimilarItemsManager {
             }
             // `LiveTvProgramSimilarItemsProvider` picks the list by the
             // program's own flags; it sets neither `IsMovie` nor `IsPlayed`.
-            BaseItemKind::LiveTvProgram if seed.is_movie => {
-                LocalFilter::of_kinds(self.movie_candidate_kinds().await)
-            }
+            BaseItemKind::LiveTvProgram if seed.is_movie => LocalFilter {
+                enable_group_by_metadata_key: true,
+                ..LocalFilter::of_kinds(self.movie_candidate_kinds().await)
+            },
             BaseItemKind::LiveTvProgram if seed.is_series => {
                 LocalFilter::of_kinds(vec![BaseItemKind::Series])
             }
@@ -711,7 +716,8 @@ impl FerrofinSimilarItemsManager {
     /// new InternalItemsQuery(query.User) {
     ///     Genres = item.Genres, Tags = item.Tags, Limit = query.Limit,
     ///     ExcludeItemIds = [..query.ExcludeItemIds], IncludeItemTypes = [<kind>],
-    ///     EnableGroupByMetadataKey = false, EnableTotalRecordCount = true,
+    ///     EnableGroupByMetadataKey = false, EnableTotalRecordCount = true
+    ///     (true and false for a movie-like programme),
     ///     OrderBy = [(ItemSortBy.Random, SortOrder.Ascending)] }
     /// ```
     ///
@@ -755,6 +761,7 @@ impl FerrofinSimilarItemsManager {
             // `OrderBy = [(ItemSortBy.Random, SortOrder.Ascending)]` — see the
             // doc comment above for the five C# call sites that emit it.
             order_by: vec![(ItemSortBy::Random, SortOrder::Ascending)],
+            enable_group_by_metadata_key: filter.enable_group_by_metadata_key,
             ..InternalItemsQuery::default()
         };
         if let Some(user) = request.user
@@ -4005,6 +4012,38 @@ mod tests {
                 "the public Program kind is not a stored type"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn a_movie_like_programme_reads_four_rows_past_its_limit() {
+        // C# `LiveTvProgramSimilarItemsProvider`: the `IsMovie` branch sets
+        // `EnableGroupByMetadataKey`, which `PrepareFilterQuery` turns into
+        // `Limit + 4`, so the 4 other airings the claim drops (they share the
+        // seed's presentation key) are replaced. No user, so the query does not
+        // group them itself. Without the 4, a Random read of 6 of these 10
+        // rows fills the page only 1 time in 210.
+        let db = test_db().await;
+        let seed = Uuid::from_u128(0xE100);
+        let mut airings = vec![seed];
+        airings.extend((0..4).map(|i| Uuid::from_u128(0xE110 + i)));
+        for &id in &airings {
+            seed_kind(&db, id, BaseItemKind::LiveTvProgram, "Airing", "SciFi").await;
+            let mut row = crate::test_support::fetch_item(&db, id).await;
+            row.is_movie = true;
+            row.presentation_unique_key = Some("one-film".to_owned());
+            crate::test_support::save_item(&db, &row).await;
+        }
+        let films: Vec<String> = (0..6).map(|i| format!("Film {i}")).collect();
+        for (i, name) in (0..).zip(&films) {
+            seed_movie(&db, Uuid::from_u128(0xE120 + i), name, "SciFi").await;
+        }
+
+        let rows = manager(&db)
+            .get_similar_items(seed, &[], None, &DtoOptions::default(), Some(6))
+            .await
+            .expect("similar")
+            .expect("seed resolves");
+        assert_eq!(sorted_names(&rows), films);
     }
 
     #[tokio::test]

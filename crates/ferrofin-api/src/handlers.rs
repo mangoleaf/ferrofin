@@ -2188,7 +2188,9 @@ macro_rules! similar_items_path {
          query (Movie, plus Trailer and LiveTvProgram under \
          EnableExternalContentInSuggestions; IsMovie; IsPlayed = false; the user's access); \
          flat_similar for the other kinds (the seed's Genres and Tags, both required when both \
-         are set, Random order, ExcludeArtistIds for the music kinds); remote_results (the \
+         are set, Random order, ExcludeArtistIds for the music kinds, and for a movie-like \
+         programme EnableGroupByMetadataKey, so item_repository.rs grouped_by_metadata_key \
+         reads 4 more); remote_results (the \
          reference cache at {cache}/{provider}-similar-{type}/{id:N}.json, batches of 20, the \
          500-reference cap, the cache write) and resolve_remote_references (the best \
          reference per provider id, one user-scoped query of the seed's kind, the highest \
@@ -2207,9 +2209,6 @@ const SIMILAR_ITEMS_DIVERGENCES: &[&str] = &[
     SIMILAR_SCORE_GROUPING_DIVERGENCE,
     "A local scorer that fails answers 500; upstream logs the provider's failure and goes \
      on to the remote providers. Fix path: gl-1789.",
-    "A movie-like Live TV programme's genre and tag query reads limit rows, where upstream's \
-     EnableGroupByMetadataKey reads 4 more, so a row the id-and-key claim drops is not \
-     replaced. Fix path: gl-1788.",
     SIMILAR_IS_VISIBLE_DIVERGENCE,
     "The reference-cache read swallows an I/O error silently and warns on an empty entry or \
      one whose References is null, where upstream warns on an IOException and treats both \
@@ -2330,7 +2329,7 @@ pub const VERIFIED: &[Verified] = &[
         upstream_file: "Jellyfin.Api/Controllers/LibraryController.cs",
         upstream_method: "GetSimilarItems",
         ferrofin: similar_items_path!(),
-        date: "2026-11-14",
+        date: "2026-11-15",
         divergences: SIMILAR_ITEMS_DIVERGENCES,
         refs: &["images", "access-filtering"],
     },
@@ -2340,7 +2339,7 @@ pub const VERIFIED: &[Verified] = &[
         upstream_file: "Jellyfin.Api/Controllers/LibraryController.cs",
         upstream_method: "GetSimilarItems",
         ferrofin: similar_items_path!(),
-        date: "2026-11-14",
+        date: "2026-11-15",
         divergences: SIMILAR_ITEMS_DIVERGENCES,
         refs: &["images", "access-filtering"],
     },
@@ -2350,7 +2349,7 @@ pub const VERIFIED: &[Verified] = &[
         upstream_file: "Jellyfin.Api/Controllers/LibraryController.cs",
         upstream_method: "GetSimilarItems",
         ferrofin: similar_items_path!(),
-        date: "2026-11-14",
+        date: "2026-11-15",
         divergences: SIMILAR_ITEMS_DIVERGENCES,
         refs: &["images", "access-filtering"],
     },
@@ -2360,7 +2359,7 @@ pub const VERIFIED: &[Verified] = &[
         upstream_file: "Jellyfin.Api/Controllers/LibraryController.cs",
         upstream_method: "GetSimilarItems",
         ferrofin: similar_items_path!(),
-        date: "2026-11-14",
+        date: "2026-11-15",
         divergences: SIMILAR_ITEMS_DIVERGENCES,
         refs: &["images", "access-filtering"],
     },
@@ -2370,7 +2369,7 @@ pub const VERIFIED: &[Verified] = &[
         upstream_file: "Jellyfin.Api/Controllers/LibraryController.cs",
         upstream_method: "GetSimilarItems",
         ferrofin: similar_items_path!(),
-        date: "2026-11-14",
+        date: "2026-11-15",
         divergences: SIMILAR_ITEMS_DIVERGENCES,
         refs: &["images", "access-filtering"],
     },
@@ -2380,7 +2379,7 @@ pub const VERIFIED: &[Verified] = &[
         upstream_file: "Jellyfin.Api/Controllers/LibraryController.cs",
         upstream_method: "GetSimilarItems",
         ferrofin: similar_items_path!(),
-        date: "2026-11-14",
+        date: "2026-11-15",
         divergences: SIMILAR_ITEMS_DIVERGENCES,
         refs: &["images", "access-filtering"],
     },
