@@ -868,7 +868,7 @@ struct ProgramClass {
 
 /// The listings provider's category lists (`ListingsProviderInfo`), each
 /// falling back to Jellyfin's defaults when the provider carries none, held
-/// folded by `upper_invariant` so an airing folds only its own categories.
+/// folded by `ordinal_ignore_case_key` so an airing folds only its own categories.
 struct CategoryClasses {
     news: Vec<String>,
     sports: Vec<String>,
@@ -884,7 +884,7 @@ impl CategoryClasses {
                 .or(default.as_ref())
                 .map(|list| {
                     list.iter()
-                        .map(|entry| ferrofin_util::string_extensions::upper_invariant(entry))
+                        .map(|entry| ordinal_ignore_case_key(entry))
                         .collect()
                 })
                 .unwrap_or_default()
@@ -898,8 +898,9 @@ impl CategoryClasses {
     }
 
     /// `programCategories.Any(c => list.Contains(c, OrdinalIgnoreCase))`, over
-    /// a list and categories both already folded by `upper_invariant` (.NET's
-    /// per-character invariant simple uppercase, which `OrdinalIgnoreCase` uses).
+    /// a list and categories both already folded by `ordinal_ignore_case_key`
+    /// (not `upper_invariant`: `OrdinalIgnoreCase` keeps the long `ſ`, which
+    /// `ToUpperInvariant` maps to `S`).
     fn any_in(list: &[String], categories: &[String]) -> bool {
         categories.iter().any(|c| list.contains(c))
     }
@@ -939,7 +940,7 @@ impl CategoryClasses {
             .categories
             .iter()
             .filter(|c| !c.trim().is_empty())
-            .map(|c| ferrofin_util::string_extensions::upper_invariant(c))
+            .map(|c| ordinal_ignore_case_key(c))
             .collect();
         let (season_number, episode_number) = (prog.season_number, prog.episode_number);
         let is_movie = Self::any_in(&self.movie, &categories);
@@ -18101,13 +18102,17 @@ mod category_class_tests {
     /// StringComparison.OrdinalIgnoreCase))` (v12.4 XmlTvListingsProvider.cs:278-281):
     /// each character through .NET's invariant simple uppercase mapping, so a
     /// mapping that changes length (`ß` → `SS`) or folds dotless `ı` onto `I`
-    /// does not apply, and blank categories are dropped first.
+    /// does not apply, the long `ſ` stays apart from `s` (ordinal casing keeps
+    /// it, where `ToUpperInvariant` maps it to `S`), and blank categories are
+    /// dropped first.
     #[rstest]
     #[case(&["football"], &["FOOTBALL"], true)]
     #[case(&["football"], &["Movie", "Football"], true)]
     #[case(&["éclair"], &["ÉCLAIR"], true)]
     #[case(&["FUSSBALL"], &["Fußball"], false)]
     #[case(&["kids"], &["Kıds"], false)]
+    #[case(&["sport"], &["\u{017F}port"], false)]
+    #[case(&["\u{1FBC}"], &["\u{1FB3}"], true)]
     #[case(&["football"], &["foot ball"], false)]
     #[case(&["football"], &["  "], false)]
     #[case(&["  "], &["  "], false)]
