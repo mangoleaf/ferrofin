@@ -4870,6 +4870,128 @@ pub const VERIFIED: &[Verified] = &[
         refs: &[],
     },
     Verified {
+        method: "get",
+        path: "/System/Info",
+        upstream_file: "Jellyfin.Api/Controllers/SystemController.cs",
+        upstream_method: "GetSystemInfo",
+        ferrofin: "handlers/system.rs get_system_info (auth.rs FirstTimeSetupOrAuth: \
+               FirstTimeSetupOrIgnoreParentalControl, FirstTimeSetupHandler then \
+               DefaultAuthorizationHandler with no parental schedule: anonymous while the \
+               startup wizard is incomplete, where a valid token is still held to its user's \
+               remote access, and once complete 401 without a valid token or for a disabled \
+               user and 403 for a user without remote access from outside the LAN) → \
+               context_from_parts (the scheme and Host ForwardedHeadersMiddleware gives the \
+               request, and its client address) → ferrofin-core system_manager.rs \
+               get_system_info (SystemManager.GetSystemInfo) → application_host.rs \
+               get_smart_api_url (GetSmartApiUrl(HttpRequest): EnablePublishedServerUriByRequest \
+               read live, the request's Host with no port for the scheme's own default; else \
+               the startup published URL, then ferrofin-networking manager.rs \
+               get_bind_address_for_peer, GetBindAddress: the subnet overrides, the address a \
+               listener pinned at startup is bound to, as the one interface a \
+               LocalNetworkAddresses bind leaves upstream, then the interfaces) and \
+               format_api_url (GetLocalApiUrl's UriBuilder, which writes any port it is given), \
+               friendly_name (FriendlyName: the saved ServerName unless empty), the emulated \
+               version, PRODUCT_NAME (Name), the system id (DeviceId), the startup-wizard flag, \
+               the lifecycle's restart-pending and shutting-down flags (which operations raise \
+               the first is theirs to record), the bound HTTP \
+               port (HttpPort), the paths (ProgramDataPath, WebPath, LogDirectoryPath, \
+               InternalMetadataPath for both ItemsByNamePath and InternalMetadataPath, \
+               CachePath) and the live transcode path prepared as GetTranscodePath's \
+               CreateAndCheckMarker (a 500 when it cannot be), CastReceiverApplications \
+               (seeded with AddDefaultCastReceivers' two receivers, an adopted system.xml's \
+               kept), SupportsLibraryMonitor true and the obsolete members' fixed values. \
+               Probed on Jellyfin 12.4: LocalAddress for a published override naming port 80, \
+               ServerName with no name saved, the body with the wizard incomplete",
+        date: "2026-11-14",
+        divergences: &[
+            "Version is the Jellyfin release Ferrofin emulates (openapi.rs \
+         JELLYFIN_API_VERSION, 12.4.0), not Ferrofin's own release version, which upstream's \
+         field would carry. Deliberate: clients gate on it (jellyfin-web refuses a server \
+         below 10.10.0, the Kotlin SDK flags one below 12.0.0).",
+            "PackageName is the constant ferrofin-server; upstream reports its --package-name \
+         startup option and omits the member without one. Fix path: gl-1755, whose default \
+         awaits an owner decision.",
+            "CompletedInstallations is always empty: a plugin installed or updated from a \
+         repository is never listed, where upstream's InstallationManager lists every \
+         package it installed since startup. Fix path: gl-1776.",
+            "With no server name saved, ServerName falls back to the server_name setting, \
+         whose default is the HOSTNAME environment variable, else ferrofin; upstream's is \
+         Environment.MachineName, the host name cut at its first dot. Fix path: gl-1777.",
+            "LocalAddress is chosen for the client address with an IPv4-mapped IPv6 address \
+         unmapped, as GetNormalizedRemoteIP gives it; upstream's GetSmartApiUrl passes \
+         Connection.RemoteIpAddress as given, so behind a dual-stack listener an IPv4 client \
+         in no interface's subnet is matched by address family to an IPv6 interface. \
+         Jellyfin bug not ported.",
+            "An Id adopted from Jellyfin's device.txt is trimmed; upstream's DeviceId keeps \
+         the whitespace Guid.TryParse accepts around the GUID, and clients receive it. \
+         Jellyfin bug not ported.",
+            "LocalAddress carries the base URL this lifetime serves under; upstream's \
+         GetLocalApiUrl reads a saved BaseUrl at once, while its mount keeps the old one \
+         (owner decision on gl-555).",
+            "After a save that turns HTTPS off, LocalAddress keeps the https scheme this \
+         lifetime listens with until the restart; upstream's ListenWithHttps reads the saved \
+         EnableHttps at once and advertises http. Fix path: gl-1791.",
+            "After a save that turns HTTPS on, LocalAddress stays http until the restart; \
+         upstream's ListenWithHttps, over a certificate it loaded at startup with HTTPS off, \
+         advertises https on a port that listens only after the restart. Jellyfin bug not \
+         ported.",
+            "A request served during a drain, before the listeners stop, sees lifecycle flags \
+         upstream's would not: POST /System/Restart and /System/Shutdown set HasPendingRestart \
+         to the stop's restart value where upstream leaves it alone, and a SIGTERM or SIGINT \
+         leaves IsShuttingDown false where upstream's ApplicationStopping is cancelled. Fix \
+         path: gl-1792.",
+            "A transcode path that cannot be prepared answers 500 whatever the cause; upstream's \
+         status follows the exception its ExceptionMiddleware maps (an ArgumentException 400, \
+         a DirectoryNotFoundException 404), describing a server misconfiguration as the \
+         client's error. Jellyfin bug not ported.",
+            "The 401 (no or bad token, a disabled user), 403 (no remote access) and 500 (a \
+         transcode path that cannot be prepared) bodies are Ferrofin's error shape, not \
+         upstream's. Fix path: gl-666.",
+        ],
+        refs: &[],
+    },
+    Verified {
+        method: "get",
+        path: "/System/Info/Public",
+        upstream_file: "Jellyfin.Api/Controllers/SystemController.cs",
+        upstream_method: "GetPublicSystemInfo",
+        ferrofin: "handlers/system.rs get_public_system_info (no authorization, as the action \
+               has no [Authorize]: a token, valid or not, changes nothing) → context_from_parts \
+               → ferrofin-core system_manager.rs get_public_system_info \
+               (SystemManager.GetPublicSystemInfo): the LocalAddress, ServerName, Version, \
+               ProductName, Id and StartupWizardCompleted of the get /System/Info row, and \
+               OperatingSystem's fixed empty string. Probed on Jellyfin 12.4 as that row was",
+        date: "2026-11-14",
+        divergences: &[
+            "Version is the Jellyfin release Ferrofin emulates (openapi.rs \
+         JELLYFIN_API_VERSION, 12.4.0), not Ferrofin's own release version, which upstream's \
+         field would carry. Deliberate: clients gate on it (jellyfin-web refuses a server \
+         below 10.10.0, the Kotlin SDK flags one below 12.0.0).",
+            "With no server name saved, ServerName falls back to the server_name setting, \
+         whose default is the HOSTNAME environment variable, else ferrofin; upstream's is \
+         Environment.MachineName, the host name cut at its first dot. Fix path: gl-1777.",
+            "LocalAddress is chosen for the client address with an IPv4-mapped IPv6 address \
+         unmapped, as GetNormalizedRemoteIP gives it; upstream's GetSmartApiUrl passes \
+         Connection.RemoteIpAddress as given, so behind a dual-stack listener an IPv4 client \
+         in no interface's subnet is matched by address family to an IPv6 interface. \
+         Jellyfin bug not ported.",
+            "An Id adopted from Jellyfin's device.txt is trimmed; upstream's DeviceId keeps \
+         the whitespace Guid.TryParse accepts around the GUID, and clients receive it. \
+         Jellyfin bug not ported.",
+            "LocalAddress carries the base URL this lifetime serves under; upstream's \
+         GetLocalApiUrl reads a saved BaseUrl at once, while its mount keeps the old one \
+         (owner decision on gl-555).",
+            "After a save that turns HTTPS off, LocalAddress keeps the https scheme this \
+         lifetime listens with until the restart; upstream's ListenWithHttps reads the saved \
+         EnableHttps at once and advertises http. Fix path: gl-1791.",
+            "After a save that turns HTTPS on, LocalAddress stays http until the restart; \
+         upstream's ListenWithHttps, over a certificate it loaded at startup with HTTPS off, \
+         advertises https on a port that listens only after the restart. Jellyfin bug not \
+         ported.",
+        ],
+        refs: &[],
+    },
+    Verified {
         method: "delete",
         path: "/Videos/{itemId}/Subtitles/{index}",
         upstream_file: "Jellyfin.Api/Controllers/SubtitleController.cs",
