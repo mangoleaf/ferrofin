@@ -7552,9 +7552,10 @@ pub struct Rebased {
 /// whole.
 ///
 /// Returns `None` when nothing was rewritten. A server that did not move only
-/// reads its root and library rows. A root or library row whose own folder was
-/// not copied keeps naming the old directory, so each start checks again until
-/// it is.
+/// reads its root and library rows. A library row whose own folder was not
+/// copied keeps naming the old directory, so each start checks again until it
+/// is; the two root rows are re-pathed after this pass on the start that finds
+/// them moved (`AggregateFolderStore::ensure`, `UserRootFolderStore::ensure`).
 ///
 /// # Errors
 /// Returns [`ServiceError`] if a query or the snapshot fails; no row is
@@ -7706,11 +7707,12 @@ async fn apply_rebase(db: &Database, plan: &RebasePlan) -> Result<Option<Rebased
 /// Each is read from a row whose id survives a move, by the place that row's
 /// path has under program data: the aggregate root (`root`), the user root
 /// (`root/default`) and each library folder whose id is the one its name
-/// derives under this server's root (`root/default/<name>`). `ensure()`
-/// re-paths the aggregate root on the first start after a move (since v1.4.0),
-/// so on a database started since, the user root and the libraries are what
-/// still name the old directory. Empty when no row names a directory other
-/// than this server's program data, and for a database with
+/// derives under this server's root (`root/default/<name>`). The aggregate
+/// root's `ensure()` re-paths it on the first start after a move (since
+/// v1.4.0), and the user root's `ensure()` re-paths that one, so on a database
+/// started since, the libraries are what still name the old directory. Both
+/// run after this pass, which reads them first. Empty when no row names a
+/// directory other than this server's program data, and for a database with
 /// [`IdDerivation::LegacyLowercase`] ids: they embed the absolute path, so
 /// after a move none is the id derived here.
 async fn previous_program_data_dirs(

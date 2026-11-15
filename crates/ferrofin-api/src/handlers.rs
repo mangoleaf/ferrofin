@@ -5282,6 +5282,31 @@ pub const VERIFIED: &[Verified] = &[
     },
     Verified {
         method: "get",
+        path: "/Items/Root",
+        upstream_file: "Jellyfin.Api/Controllers/UserLibraryController.cs",
+        upstream_method: "GetRootFolder",
+        ferrofin: "handlers/user_library.rs get_root_folder (resolve_user: \
+               RequestHelpers.GetUserId, then GetUserById) → ferrofin-core library_manager.rs \
+               get_user_root_folder → user_root_folder.rs UserRootFolderStore::ensure, once \
+               per process (LibraryManager.GetUserRootFolder: the directory created, the row \
+               read by its derived id and created when missing, its Path reset when it \
+               differs ordinally, as after a program data move) → dto_service.rs \
+               get_base_item_dto with DtoOptions::default() (new DtoOptions())",
+        date: "2026-11-15",
+        divergences: &[
+            "A created or reset row is saved at once; upstream keeps it in memory until the \
+         root's next saving refresh (LibraryManager.cs:1449-1452). Both answer the same row.",
+            "A missing row is created already named Media Folders; upstream's is named after \
+         its directory (default) until its first refresh renames it \
+         (UserRootFolder.BeforeMetadataRefresh), so only a new database's root differs.",
+            "The 400 (an API key with no userId, or a value the query binder cannot convert), \
+         403 (another user's id without the administrator role) and 404 (a userId naming no \
+         account) bodies are Ferrofin's error shape, not upstream's. Fix path: gl-666.",
+        ],
+        refs: &["images", "user-data"],
+    },
+    Verified {
+        method: "get",
         path: "/Items/Latest",
         upstream_file: "Jellyfin.Api/Controllers/UserLibraryController.cs",
         upstream_method: "GetLatestMedia",
