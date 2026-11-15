@@ -130,25 +130,47 @@ fn server_config(server: &Issued, client_ca: Option<&TestCa>) -> Arc<rustls::Ser
     )
 }
 
-/// An LDAPS listener on 127.0.0.1 that completes one handshake and reports
+/// An LDAPS listener on `localhost` that completes one handshake and reports
 /// whether the client presented a certificate (`Err` when the handshake
 /// failed on the server's side).
+///
+/// It serves 127.0.0.1 and, unless the host has no IPv6 loopback, `[::1]` on
+/// the same port number. A `localhost` client tries `::1` first, so a server on
+/// 127.0.0.1 alone leaves `[::1]` on its port to any other listener on the host
+/// (an IPv6-only service on `[::]`, another test process), which then takes the
+/// connection and fails the handshake (gl-1521).
 async fn ldaps_server(
     config: Arc<rustls::ServerConfig>,
 ) -> (u16, oneshot::Receiver<Result<bool, String>>) {
-    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
-    ldaps_server_on(listener, config)
+    if let Some((listener, twin)) = ipv6_listener().await {
+        twin.set_nonblocking(true).expect("nonblocking");
+        let twin = TcpListener::from_std(twin).expect("twin");
+        ldaps_server_on(listener, Some(twin), config)
+    } else {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        ldaps_server_on(listener, None, config)
+    }
 }
 
-/// [`ldaps_server`] on a listener already bound.
+/// [`ldaps_server`] on a listener already bound, and on `twin` too when given:
+/// the first connection to either is the one served.
 fn ldaps_server_on(
     listener: TcpListener,
+    twin: Option<TcpListener>,
     config: Arc<rustls::ServerConfig>,
 ) -> (u16, oneshot::Receiver<Result<bool, String>>) {
     let port = listener.local_addr().expect("addr").port();
     let (tx, rx) = oneshot::channel();
     tokio::spawn(async move {
-        let (tcp, _) = listener.accept().await.expect("accept");
+        // Borrowed, so the twin is held as long as the `[::1]` listener.
+        let (tcp, _) = match &twin {
+            Some(twin) => tokio::select! {
+                accepted = listener.accept() => accepted,
+                accepted = twin.accept() => accepted,
+            },
+            None => listener.accept().await,
+        }
+        .expect("accept");
         let outcome = tokio_rustls::TlsAcceptor::from(config)
             .accept(tcp)
             .await
@@ -163,11 +185,11 @@ fn ldaps_server_on(
 /// the second value lives; `None` when `[::1]` cannot be bound (no IPv6
 /// loopback) for any reason but the port being in use.
 ///
-/// The other tests serve on 127.0.0.1 and connect to `localhost`, which tries
-/// `::1` first. While the twin is held no other test process can serve this
-/// port number, so none of their clients lands on this one-shot listener,
-/// ending it and resetting the client waiting in its backlog. The twin is bound
-/// first, so the `[::1]` listener never exists on a port another test serves.
+/// A `localhost` client tries `::1` first. While the twin is held no test
+/// process can serve this port number on 127.0.0.1 alone, so none of their
+/// `localhost` clients lands on this one-shot listener, ending it and resetting
+/// the client waiting in its backlog. The twin is bound first, so the `[::1]`
+/// listener never exists on a port another test serves.
 async fn ipv6_listener() -> Option<(TcpListener, std::net::TcpListener)> {
     for _ in 0..100 {
         let twin = std::net::TcpListener::bind("127.0.0.1:0").expect("bind 127.0.0.1");
@@ -228,6 +250,25 @@ async fn ldaps_trusts_a_server_certificate_from_the_custom_root() {
         .await;
     assert!(connection.is_ok(), "{:?}", connection.err());
     assert_eq!(handshake.await.expect("server"), Ok(false));
+}
+
+#[tokio::test]
+async fn the_ldaps_test_server_holds_its_port_on_both_loopbacks() {
+    // Nothing else on the host can listen where a `localhost` client of it
+    // connects. Without an IPv6 loopback, `[::1]` cannot be bound at all.
+    let ca = TestCa::new("Directory CA");
+    let server = ca.issue(&["localhost"], ExtendedKeyUsagePurpose::ServerAuth);
+    let (port, _handshake) = ldaps_server(server_config(&server, None)).await;
+    let ipv4 = std::net::TcpListener::bind(("127.0.0.1", port)).map(|_| ());
+    assert_eq!(
+        ipv4.map_err(|e| e.kind()),
+        Err(std::io::ErrorKind::AddrInUse),
+        "port {port}"
+    );
+    assert!(
+        std::net::TcpListener::bind(("::1", port)).is_err(),
+        "[::1] port {port} is free"
+    );
 }
 
 #[tokio::test]
@@ -567,7 +608,9 @@ fn id_and_op(content: &[u8]) -> (Vec<u8>, u8) {
 }
 
 /// Answers each request on one connection with the replies `answer` gives
-/// for its protocol op tag, until the client unbinds or hangs up.
+/// for its protocol op tag, until the client unbinds or hangs up. It serves
+/// 127.0.0.1 alone, so its clients connect to that, never to `localhost`
+/// (see [`ldaps_server`]).
 async fn ldap_server(answer: impl Fn(u8) -> Vec<Vec<u8>> + Send + 'static) -> u16 {
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
     let port = listener.local_addr().expect("addr").port();
@@ -913,7 +956,7 @@ async fn ldaps_to_an_ipv6_address_checks_the_certificate_against_the_address() {
     let ca = TestCa::new("Directory CA");
     let root = write(&dir, "ca.pem", &ca.issued.pem);
     let for_address = ca.issue(&["::1"], ExtendedKeyUsagePurpose::ServerAuth);
-    let (port, mut handshake) = ldaps_server_on(listener, server_config(&for_address, None));
+    let (port, mut handshake) = ldaps_server_on(listener, None, server_config(&for_address, None));
     // Bracketed as in a URL here, bare below: both name the address.
     let connection = Ldap3Directory::default()
         .connect(&ldaps(
@@ -934,7 +977,7 @@ async fn ldaps_to_an_ipv6_address_checks_the_certificate_against_the_address() {
     // A certificate for a name, not for the address, is refused.
     let (listener, _twin) = ipv6_listener().await.expect("[::1] bound a moment ago");
     let for_name = ca.issue(&["localhost"], ExtendedKeyUsagePurpose::ServerAuth);
-    let (port, mut handshake) = ldaps_server_on(listener, server_config(&for_name, None));
+    let (port, mut handshake) = ldaps_server_on(listener, None, server_config(&for_name, None));
     let error = connect_error(
         Ldap3Directory::default()
             .connect(&ldaps(
@@ -952,7 +995,7 @@ async fn ldaps_to_an_ipv6_address_checks_the_certificate_against_the_address() {
 
     // Skip-verify connects to the address whatever the certificate says.
     let (listener, _twin) = ipv6_listener().await.expect("[::1] bound a moment ago");
-    let (port, mut handshake) = ldaps_server_on(listener, server_config(&for_name, None));
+    let (port, mut handshake) = ldaps_server_on(listener, None, server_config(&for_name, None));
     let connection = Ldap3Directory::default()
         .connect(&ldaps("::1", port, CertificateVerification::None))
         .await;
