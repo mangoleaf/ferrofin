@@ -63,6 +63,14 @@ pub trait EncoderCapabilities: Send + Sync {
         false
     }
 
+    /// Whether the VAAPI device runs Intel's legacy i965 driver, whose VBR can
+    /// pixelate, so upstream encodes CBR on it. Port of
+    /// `IMediaEncoder.IsVaapiDeviceInteli965`; `false` (the default) when
+    /// nothing was probed.
+    fn is_vaapi_device_intel_i965(&self) -> bool {
+        false
+    }
+
     /// Whether a bitstream filter accepts `option`, the Dolby Vision and HDR10+
     /// removals the stream-copy decision depends on. Port of
     /// `IMediaEncoder.SupportsBitStreamFilterWithOption`; `false` (the default)

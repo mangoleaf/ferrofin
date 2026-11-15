@@ -311,13 +311,19 @@ impl<C: EncoderCapabilities> EncodingHelper<C> {
     /// Port of `GetVideoBitrateParam`: the `libx264`/`libx265` (`-maxrate`/
     /// `-bufsize`) and `libsvtav1` (`-b:v`/`-bufsize`) arms, plus the generic
     /// fallback every encoder with no arm of its own takes — NVENC among them —
-    /// and the QSV arm. `-mbbrc` is not here: v12.2 moved it into
-    /// `GetEncoderParam`. The VAAPI encoders take the generic fallback, without
-    /// upstream's `-rc_mode VBR` (`CBR` on i965); TODO(parity, gl-1516): open
-    /// work item: port that arm. AMF and VideoToolbox are not supported.
+    /// and the QSV and VAAPI arms. `-mbbrc` is not here: v12.2 moved it into
+    /// `GetEncoderParam`. AMF and VideoToolbox are not supported. The VAAPI
+    /// arm reads the driver from `capabilities`, which must be the planner's
+    /// per-job probe (see [`Self::video_quality_param_with`]): this helper's
+    /// own capabilities never carry the driver, so they always read as VBR.
     /// Returns empty when no output bitrate is set.
     #[must_use]
-    pub fn video_bitrate_param(&self, state: &EncodingJobInfo, video_codec: &str) -> String {
+    pub fn video_bitrate_param(
+        &self,
+        capabilities: &C,
+        state: &EncodingJobInfo,
+        video_codec: &str,
+    ) -> String {
         let Some(mut bitrate) = state.output_video_bitrate else {
             return String::new();
         };
@@ -365,6 +371,18 @@ impl<C: EncoderCapabilities> EncodingHelper<C> {
             return format!(
                 " -b:v {bitrate} -maxrate {maxrate} \
                  -rc_init_occupancy {init_occupancy} -bufsize {bufsize}"
+            );
+        }
+
+        if eq_any(video_codec, &["h264_vaapi", "hevc_vaapi", "av1_vaapi"]) {
+            // VBR in the i965 driver may result in pixelated output.
+            let rc_mode = if capabilities.is_vaapi_device_intel_i965() {
+                "CBR"
+            } else {
+                "VBR"
+            };
+            return format!(
+                " -rc_mode {rc_mode} -b:v {bitrate} -maxrate {bitrate} -bufsize {bufsize}"
             );
         }
 
@@ -509,7 +527,8 @@ impl<C: EncoderCapabilities> EncodingHelper<C> {
     /// [`Self::video_quality_param`] against `capabilities` instead of the
     /// ones this helper was built with.
     ///
-    /// `GetEncoderParam`'s VAAPI arm keys on `IsVaapiDeviceInteliHD`, and the
+    /// `GetEncoderParam`'s VAAPI arm keys on `IsVaapiDeviceInteliHD` and
+    /// `GetVideoBitrateParam`'s on `IsVaapiDeviceInteli965`, and the
     /// driver behind the configured render node is only known once the
     /// planner has probed it for the job. The boot capabilities never carry
     /// it, so the planner passes its per-job probe here.
@@ -533,7 +552,7 @@ impl<C: EncoderCapabilities> EncodingHelper<C> {
             is_libx265,
             capabilities.is_vaapi_device_intel_ihd(),
         ));
-        param.push_str(&self.video_bitrate_param(state, video_encoder));
+        param.push_str(&self.video_bitrate_param(capabilities, state, video_encoder));
 
         if let Some(framerate) = self.framerate_param(state) {
             let _ = write!(param, " -r {framerate}");
@@ -2172,6 +2191,12 @@ mod tests {
         EncodingHelper::with_processor_count(FakeCapabilities { available }, 8)
     }
 
+    /// `video_bitrate_param` against capabilities that probed no VAAPI driver.
+    fn bitrate_param(state: &EncodingJobInfo, video_codec: &str) -> String {
+        let helper = helper(vec![]);
+        helper.video_bitrate_param(helper.capabilities(), state, video_codec)
+    }
+
     fn video_stream(codec: &str, index: i32) -> MediaStream {
         MediaStream {
             codec: Some(codec.to_owned()),
@@ -2494,7 +2519,7 @@ mod tests {
         let mut state = job(&[video_stream("h264", 0)]);
         state.output_video_bitrate = Some(3_000_000);
         assert_eq!(
-            helper(vec![]).video_bitrate_param(&state, "libx264"),
+            bitrate_param(&state, "libx264"),
             " -maxrate 3000000 -bufsize 6000000"
         );
     }
@@ -2504,7 +2529,7 @@ mod tests {
         let mut state = job(&[video_stream("h264", 0)]);
         state.output_video_bitrate = Some(2_000_000);
         assert_eq!(
-            helper(vec![]).video_bitrate_param(&state, "libsvtav1"),
+            bitrate_param(&state, "libsvtav1"),
             " -b:v 2000000 -bufsize 4000000"
         );
     }
@@ -2512,7 +2537,12 @@ mod tests {
     #[test]
     fn video_bitrate_param_none_is_empty() {
         let state = job(&[video_stream("h264", 0)]);
-        assert_eq!(helper(vec![]).video_bitrate_param(&state, "libx264"), "");
+        assert_eq!(bitrate_param(&state, "libx264"), "");
+        assert_eq!(
+            bitrate_param(&state, "h264_vaapi"),
+            "",
+            "no -rc_mode either"
+        );
     }
 
     // ----- video_bitrate_param_value / scale_bitrate -------------------------
@@ -2701,9 +2731,38 @@ mod tests {
         state.output_video_bitrate = Some(3_000_000);
         state.base_request.level = level.map(str::to_owned);
         assert_eq!(
-            helper(vec![]).video_bitrate_param(&state, encoder),
+            bitrate_param(&state, encoder),
             expected,
             "{encoder}/{codec}/{level:?}"
+        );
+    }
+
+    /// v12.4 `GetVideoBitrateParam`'s VAAPI arm: VBR, except CBR on the Intel
+    /// i965 driver ("VBR in i965 driver may result in pixelated output"). An
+    /// AMD device, an iHD one and an unprobed one all take VBR.
+    #[rstest]
+    #[case::ihd("h264_vaapi", (false, true, false), "VBR")]
+    #[case::ihd_hevc("hevc_vaapi", (false, true, false), "VBR")]
+    #[case::ihd_av1("av1_vaapi", (false, true, false), "VBR")]
+    #[case::amd("hevc_vaapi", (true, false, false), "VBR")]
+    #[case::unprobed("h264_vaapi", (false, false, false), "VBR")]
+    #[case::i965("h264_vaapi", (false, false, true), "CBR")]
+    #[case::i965_hevc("hevc_vaapi", (false, false, true), "CBR")]
+    #[case::i965_av1("av1_vaapi", (false, false, true), "CBR")]
+    fn video_bitrate_param_vaapi_sets_the_rate_control_mode(
+        #[case] encoder: &str,
+        #[case] (amd, intel_ihd, intel_i965): (bool, bool, bool),
+        #[case] rc_mode: &str,
+    ) {
+        let caps = crate::encoding_helper::hw::FfmpegCapabilities::builder()
+            .vaapi_driver(amd, intel_ihd, intel_i965)
+            .build();
+        let mut state = job(&[video_stream("h264", 0)]);
+        state.output_video_bitrate = Some(3_000_000);
+        assert_eq!(
+            EncodingHelper::with_processor_count(caps.clone(), 8)
+                .video_bitrate_param(&caps, &state, encoder),
+            format!(" -rc_mode {rc_mode} -b:v 3000000 -maxrate 3000000 -bufsize 6000000"),
         );
     }
 
@@ -2717,26 +2776,14 @@ mod tests {
         let mut state = job(&[video_stream("h264", 0)]);
         state.output_video_codec = Some("h264".to_owned());
         state.output_video_bitrate = Some(500_000);
-        assert!(
-            helper(vec![])
-                .video_bitrate_param(&state, "h264_qsv")
-                .contains(" -b:v 500000"),
-        );
+        assert!(bitrate_param(&state, "h264_qsv").contains(" -b:v 500000"));
 
         // Below 1000 bps it does fire...
         state.output_video_bitrate = Some(800);
-        assert!(
-            helper(vec![])
-                .video_bitrate_param(&state, "h264_qsv")
-                .contains(" -b:v 1000"),
-        );
+        assert!(bitrate_param(&state, "h264_qsv").contains(" -b:v 1000"));
         // ...and only for h264_qsv.
         state.output_video_codec = Some("hevc".to_owned());
-        assert!(
-            helper(vec![])
-                .video_bitrate_param(&state, "hevc_qsv")
-                .contains(" -b:v 800"),
-        );
+        assert!(bitrate_param(&state, "hevc_qsv").contains(" -b:v 800"));
     }
 
     /// A helper over the real capability probe, reporting `version` (`None`:
@@ -2969,12 +3016,12 @@ mod tests {
         let mut state = job(&[video_stream("h264", 0)]);
         state.output_video_bitrate = Some(3_000_000);
         assert_eq!(
-            helper(vec![]).video_bitrate_param(&state, "h264_nvenc"),
+            bitrate_param(&state, "h264_nvenc"),
             " -b:v 3000000 -maxrate 3000000 -bufsize 6000000"
         );
         // ...where libx264 only caps.
         assert_eq!(
-            helper(vec![]).video_bitrate_param(&state, "libx264"),
+            bitrate_param(&state, "libx264"),
             " -maxrate 3000000 -bufsize 6000000"
         );
     }
