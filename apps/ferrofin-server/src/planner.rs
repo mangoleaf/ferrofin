@@ -827,7 +827,7 @@ impl StreamStatePlanner for FerrofinStreamStatePlanner {
         // `StreamingHelpers.GetStreamingState`: a non-blank `subtitleCodec`
         // becomes `SupportedSubtitleCodecs`, split on commas with empty entries
         // dropped (`Split(',', RemoveEmptyEntries)`, which trims nothing). The
-        // ordinary stream routes validate it (`validate_stream_request`), and
+        // stream and HLS routes validate it (`stream_pattern_failures`), and
         // the embed arguments check it again before writing it.
         let supported_subtitle_codecs: Vec<String> = request
             .subtitle_codec

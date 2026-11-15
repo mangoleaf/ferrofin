@@ -1014,7 +1014,7 @@ async fn validate_open_subtitles_login(
         serde_json::to_vec(&body).map_err(|e| ApiError::BadRequest(format!("login info: {e}")))?;
     match state
         .subtitles
-        .validate_provider_login("opensubtitles", &canonical)
+        .validate_provider_login("Open Subtitles", &canonical)
         .await
     {
         Ok(login) => Ok(Json(ValidatedLogin {

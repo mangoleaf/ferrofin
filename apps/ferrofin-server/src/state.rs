@@ -2218,7 +2218,8 @@ pub async fn build_app_state(
             metadata_root.clone(),
         )
         .with_virtual_folders(Arc::clone(&virtual_folders))
-        .with_self_writes(Arc::clone(&self_writes_guard)),
+        .with_self_writes(Arc::clone(&self_writes_guard))
+        .with_activity(Arc::clone(&activity)),
     );
     let subtitle_downloader = Arc::new(
         ferrofin_core::subtitle_downloader::SubtitleDownloader::new(
@@ -3878,6 +3879,15 @@ mod tests {
         }
         async fn support_bundle(&self) -> String {
             String::new()
+        }
+        fn operating_system(&self) -> String {
+            String::new()
+        }
+        async fn create_or_replace_segment(
+            &self,
+            _segment: &ferrofin_model::media_segments::MediaSegmentDto,
+        ) -> Result<(), ferrofin_traits::error::ServiceError> {
+            Ok(())
         }
         async fn hides_intros(&self, _item_id: uuid::Uuid) -> bool {
             false
