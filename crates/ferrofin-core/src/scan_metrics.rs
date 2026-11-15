@@ -68,8 +68,9 @@ pub const METRIC_NAMES: &[&str] = &[
 ];
 
 /// The closing passes of a library validation, in the order they run — the
-/// `pass` label set of [`SCAN_PASS_DURATION_SECONDS`] (the fields of the
-/// "post-scan passes complete" log line, without their `_ms`).
+/// `pass` label set of [`SCAN_PASS_DURATION_SECONDS`] (the per-pass fields of
+/// the "post-scan passes complete" log line, without their `_ms`; its
+/// `elapsed_ms` is the whole phase).
 pub const SCAN_PASSES: [&str; 12] = [
     "music",
     "album_covers",

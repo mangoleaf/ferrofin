@@ -305,12 +305,13 @@ pub(crate) async fn serve_static_source(
         MediaProtocol::File => {
             let mut response = serve_static_file(&source.path, request).await?;
             // `GetStaticFileResult(path, contentType)`: the type ServeFile guessed
-            // from the path gives way to the request's. A type the ported table
-            // does not know keeps that guess, nearer upstream's full MimeTypes
-            // table than `application/octet-stream` (gl-1750).
+            // from the path gives way to the request's, or to
+            // `MimeTypes.GetMimeType(path)`'s default when neither names one.
             if let Some(value) = response.headers_mut().get_mut(header::CONTENT_TYPE)
-                && let Some(Ok(typed)) = static_content_type(output_container, &source)
-                    .map(header::HeaderValue::from_str)
+                && let Ok(typed) = header::HeaderValue::from_str(
+                    static_content_type(output_container, &source)
+                        .unwrap_or(ferrofin_model::net::mime_types::DEFAULT_MIME_TYPE),
+                )
             {
                 *value = typed;
             }
