@@ -813,7 +813,12 @@ impl HlsStreamManager for RecordingHls {
     ) -> Result<ServedFile, ServiceError> {
         unimplemented!()
     }
-    async fn resolve_transcode_file(&self, _f: &str, _m: bool) -> Result<ServedFile, ServiceError> {
+    async fn resolve_transcode_file(
+        &self,
+        _f: &str,
+        _m: bool,
+        _p: Option<&str>,
+    ) -> Result<ServedFile, ServiceError> {
         unimplemented!()
     }
     async fn transcode_stream(

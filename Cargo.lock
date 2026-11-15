@@ -1431,6 +1431,7 @@ dependencies = [
  "ferrofin-mediaencoding",
  "ferrofin-model",
  "ferrofin-traits",
+ "ferrofin-util",
  "rstest",
  "tempfile",
  "thiserror",

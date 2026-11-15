@@ -861,15 +861,17 @@ impl Default for HlsStreamRequest {
 /// Port of the `(path, MimeTypes.GetMimeType(path))` pair the streaming
 /// controllers hand to `FileStreamResponseHelpers.GetStaticFileResult`. The
 /// caller (a `ferrofin-api` handler) streams the file at [`path`](Self::path) with
-/// [`content_type`](Self::content_type); the transcode job that produced it is
-/// kept alive / torn down by the [`HlsStreamManager`] internally.
+/// [`content_type`](Self::content_type), and keeps [`progress`](Self::progress)
+/// for as long as the response body lives.
 #[derive(Clone)]
 pub struct ServedFile {
     /// The absolute path of the file to serve.
     pub path: String,
     /// The MIME type to serve it as (e.g. `video/mp2t`, `application/x-mpegURL`).
     pub content_type: String,
-    /// Bound to the producing job at resolution, before any seek replacement.
+    /// Bound to the producing job at resolution, before any seek replacement:
+    /// the job's active request, released when the response body ends or is
+    /// dropped.
     pub progress: Option<std::sync::Arc<dyn TranscodeStreamProgress>>,
 }
 
@@ -985,17 +987,24 @@ pub trait HlsStreamManager: Send + Sync {
     /// `GetHlsVideoSegmentLegacy`/`GetHlsPlaylistLegacy`/`GetHlsAudioSegmentLegacy`
     /// serve path: `file_name` (`<segmentId><ext>`) must resolve *inside* the
     /// transcode folder. `require_m3u8` rejects a non-playlist match (the
-    /// playlist-legacy route). Marks the owning job as begun so its keep-alive
-    /// timer is refreshed. [`ServiceError::InvalidInput`] on a traversal/miss.
+    /// playlist-legacy route). `playlist_id` is the legacy video segment's
+    /// `{playlistId}`: the folder must hold a file with the segment's extension
+    /// or `.m3u8` whose path contains it. The served file's
+    /// [`ServedFile::progress`] keeps that playlist's job (the served file's
+    /// own without `playlist_id`) active until the response completes.
     ///
     /// # Errors
     ///
     /// Returns [`ServiceError::InvalidInput`] when `file_name` escapes the
-    /// transcode folder or does not resolve to an on-disk file.
+    /// transcode folder (or is not a playlist under `require_m3u8`), and
+    /// [`ServiceError::NotFound`] when no file matches `playlist_id` or the
+    /// file does not exist, and [`ServiceError::Backend`] when the transcode
+    /// folder cannot be prepared or listed.
     async fn resolve_transcode_file(
         &self,
         file_name: &str,
         require_m3u8: bool,
+        playlist_id: Option<&str>,
     ) -> Result<ServedFile, ServiceError>;
 
     /// Runs the **progressive transcode** branch of `/Videos/{id}/stream` (and

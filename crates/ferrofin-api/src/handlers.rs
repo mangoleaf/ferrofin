@@ -2302,6 +2302,35 @@ const SIMILAR_IS_VISIBLE_DIVERGENCE: &str = "The rows are projected without GetB
      query, so this differs only where IsParentalAllowed and that query disagree (and \
      upstream's similar-items count is the one before the pass). Fix path: gl-1787.";
 
+/// The code path the four legacy `HlsSegmentController` rows share after their
+/// handler, from the resolver to the response.
+macro_rules! legacy_hls_tail {
+    () => {
+        "ferrofin-mediaencoding manager.rs request_progress_for_file on the job's file, the \
+         playlist file found on the video segment and the served file otherwise \
+         (GetFileResult's OnTranscodeBeginRequest(playlistPath), before the file is opened) \
+         → the file's existence on the blocking pool (PhysicalFile's FileNotFoundException, \
+         a 404, whose dropped observer still restamps the job as OnTranscodeEndRequest's \
+         PingTimer does) → served_file_response (GetStaticFileResult, a PhysicalFile with \
+         EnableRangeProcessing: serve_static_file's Range, with the type \
+         MimeTypes.GetMimeType(file) through mime_for_extension) with the response body \
+         holding the observer, so the end of the download, or a client hanging up, releases \
+         it (Response.OnCompleted's OnTranscodeEndRequest)"
+    };
+}
+
+/// How the four legacy `HlsSegmentController` rows' error bodies differ.
+const LEGACY_HLS_BODIES: &str = "The 404 bodies are Ferrofin's error shape, where upstream \
+     sends its exception middleware's text/plain \"Error processing request.\" for a missing \
+     file and, on the video segment, the JSON string \"Hls segment not found.\". Fix path: \
+     gl-666.";
+
+/// The keep-alive the legacy audio segment rows take where upstream takes none.
+const LEGACY_HLS_AUDIO_KEEP_ALIVE: &str = "The job whose playlist's file stem prefixes the \
+     segment's is kept active for the download, which upstream's action never does. A \
+     deliberate, response-invisible superset: it only stops the idle reaper from killing a \
+     transcode a client is reading.";
+
 /// **The API-parity record.** One row per contract operation whose Ferrofin
 /// implementation has been compared against the upstream Jellyfin C#
 /// ([`UPSTREAM_TAG`], or the earlier tag [`VERIFIED_AGAINST_EARLIER_PIN`]
@@ -5772,6 +5801,101 @@ pub const VERIFIED: &[Verified] = &[
          and アキ) compare equal, so the stored name is kept, where .NET's ICU tailoring \
          tells them apart and upstream renames. Fix path: gl-1793.",
         ],
+        refs: &[],
+    },
+    Verified {
+        method: "get",
+        path: "/Videos/{itemId}/hls/{playlistId}/{segmentId}",
+        upstream_file: "Jellyfin.Api/Controllers/HlsSegmentController.cs",
+        upstream_method: "GetHlsVideoSegmentLegacy",
+        ferrofin: concat!(
+            "handlers/hls.rs get_hls_video_segment_legacy (anonymous, as the action's \
+             [Authenticated] is commented out; {segmentId}.{segmentContainer} split at its \
+             last ., an empty side an empty 404 as no route matches upstream, before \
+             blank_route_values' 400 naming every blank itemId, playlistId, segmentId and \
+             segmentContainer; the file name the whole captured value, \
+             string.Concat(segmentId, Path.GetExtension(Request.Path)), and both it and \
+             playlistId through kestrel_route_value, which keeps an encoded slash as %2F as \
+             Kestrel does) → ferrofin-hls hls_stream_manager.rs resolve_transcode_file → \
+             resolve_in_transcode_dir (ValidateTranscodePath: a name that escapes the \
+             transcode folder is a 400) → find_legacy_playlist (GetFilePaths(transcodePath) \
+             with IgnoreInaccessible: the first file at the folder's top, in the order it \
+             lists them, whose extension is .segmentContainer or .m3u8 and whose path \
+             contains playlistId, OrdinalIgnoreCase; none is NotFound(\"Hls segment not \
+             found.\")) → ",
+            legacy_hls_tail!()
+        ),
+        date: "2026-11-15",
+        divergences: &[
+            LEGACY_HLS_BODIES,
+            "The job kept active is the one whose playlist's file stem prefixes the found \
+             file's, so a segment the folder happens to list before its playlist finds the job \
+             too; upstream's OnTranscodeBeginRequest(playlistPath) finds one only when the first \
+             match is a job's playlist itself. Response-invisible, and kept: a download is never \
+             reaped either way the folder lists.",
+        ],
+        refs: &[],
+    },
+    Verified {
+        method: "get",
+        path: "/Videos/{itemId}/hls/{playlistId}/stream.m3u8",
+        upstream_file: "Jellyfin.Api/Controllers/HlsSegmentController.cs",
+        upstream_method: "GetHlsPlaylistLegacy",
+        ferrofin: concat!(
+            "handlers/hls.rs get_hls_playlist_legacy (RequireAuth, the action's [Authorize], \
+             before the binder; {itemId} and {playlistId} through RequiredRouteString, the \
+             binder's 400 for a blank one; the file name the whole playlistId through \
+             kestrel_route_value and .m3u8) → ferrofin-hls hls_stream_manager.rs \
+             resolve_transcode_file → resolve_in_transcode_dir (ValidateTranscodePath and the \
+             .m3u8 check, a 400; GetFileResult(file, file)) → ",
+            legacy_hls_tail!()
+        ),
+        date: "2026-11-15",
+        divergences: &[
+            LEGACY_HLS_BODIES,
+            "The 401 (no or bad token) body is Ferrofin's error shape, where upstream sends an \
+             empty 401. Fix path: gl-666.",
+            "The job kept active is the one whose playlist's file stem prefixes the requested \
+             playlist's, where upstream's OnTranscodeBeginRequest takes the job whose playlist \
+             is that path exactly; they differ only when one job's name begins with another's. \
+             Response-invisible.",
+        ],
+        refs: &[],
+    },
+    Verified {
+        method: "get",
+        path: "/Audio/{itemId}/hls/{segmentId}/stream.aac",
+        upstream_file: "Jellyfin.Api/Controllers/HlsSegmentController.cs",
+        upstream_method: "GetHlsAudioSegmentLegacy",
+        ferrofin: concat!(
+            "handlers/hls.rs get_hls_audio_segment_legacy (anonymous, as the action's \
+             [Authenticated] is commented out; {itemId} and {segmentId} through \
+             RequiredRouteString, the binder's 400 for a blank one; the file name the whole \
+             segmentId through kestrel_route_value and the path's extension, .aac) → \
+             ferrofin-hls hls_stream_manager.rs resolve_transcode_file → \
+             resolve_in_transcode_dir (ValidateTranscodePath, a 400) → ",
+            legacy_hls_tail!()
+        ),
+        date: "2026-11-15",
+        divergences: &[LEGACY_HLS_BODIES, LEGACY_HLS_AUDIO_KEEP_ALIVE],
+        refs: &[],
+    },
+    Verified {
+        method: "get",
+        path: "/Audio/{itemId}/hls/{segmentId}/stream.mp3",
+        upstream_file: "Jellyfin.Api/Controllers/HlsSegmentController.cs",
+        upstream_method: "GetHlsAudioSegmentLegacy",
+        ferrofin: concat!(
+            "handlers/hls.rs get_hls_audio_segment_legacy (anonymous, as the action's \
+             [Authenticated] is commented out; {itemId} and {segmentId} through \
+             RequiredRouteString, the binder's 400 for a blank one; the file name the whole \
+             segmentId through kestrel_route_value and the path's extension, .mp3) → \
+             ferrofin-hls hls_stream_manager.rs resolve_transcode_file → \
+             resolve_in_transcode_dir (ValidateTranscodePath, a 400) → ",
+            legacy_hls_tail!()
+        ),
+        date: "2026-11-15",
+        divergences: &[LEGACY_HLS_BODIES, LEGACY_HLS_AUDIO_KEEP_ALIVE],
         refs: &[],
     },
 ];
