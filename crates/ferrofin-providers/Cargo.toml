@@ -79,3 +79,7 @@ tempfile.workspace = true
 sevenz-rust2 = { workspace = true, features = ["compress"] }
 chrono.workspace = true
 uuid.workspace = true
+
+# md-5's library is named `md5`, which cargo-machete cannot map back to it.
+[package.metadata.cargo-machete]
+ignored = ["md-5"]
