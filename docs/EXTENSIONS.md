@@ -254,6 +254,11 @@ config write is guest input. On boot each component is compiled,
 interrogated for its identity (`descriptor`), seed config, and task list, and then
 registered through the same plugin manager as compiled-in extensions — same dashboard
 entry, same enable/disable toggle, same `/Plugins/{id}/Configuration` storage.
+The boot also removes the segment output (`{data_dir}/plugins/{id}.segments/`) of every
+plugin id no `*.wasm` file in that directory carries, so a plugin installed again starts
+without it. It removes none while a `*.wasm` file fails to load or the directory cannot be
+listed. A plugin taken out by moving its file away or renaming it to something other than
+`*.wasm` loses its segment output the same way and has to analyse the library again.
 
 **"Disabled" and load.** Enable/disable governs the runtime work — tasks don't run, events
 aren't delivered, and metadata lookups are skipped for a disabled plugin. But a disabled
@@ -571,9 +576,12 @@ does not make strangers trustworthy.** Install plugins you have some reason to t
 
 **What the memory limit means (and costs).** The 128 MiB is a **per-plugin ceiling, not an
 allocation**: it is the point past which a plugin's `memory.grow` is refused (and the size
-past which an `http-fetch` response is rejected). Nothing reserves that memory. Measured
-real usage (printed by the `wasm_hello_guest` test on every CI run): with no plugins
-installed the host costs almost nothing; the **first** loaded plugin pages in wasmtime's
+past which an `http-fetch` response is rejected). Nothing reserves that memory. With no
+`.wasm` file in `plugins/` the server boots without any of the WASM runtime: no engine, no
+thread, no plugin HTTP client (the `idle_host` test checks it). An install builds an engine
+to check the download and drops it after; the HTTP client that check needs is built on the
+first install and kept. Measured real usage once a plugin is installed (printed by the
+`wasm_hello_guest` test on every CI run): the **first** loaded plugin pages in wasmtime's
 JIT machinery, ~58 MiB **once per server process**; each **additional** plugin adds only a
 few MiB (the 49 KiB reference plugin measures ~6 MiB as an upper bound). So ten
 well-behaved plugins cost on the order of 120 MiB total — not 10 × 128 MiB. Raise the

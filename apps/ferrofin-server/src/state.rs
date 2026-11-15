@@ -2152,8 +2152,8 @@ pub async fn build_app_state(
     config_mgr.add_configuration_listener(certificate_check.configuration_listener());
     // The install-time artifact validator (component + descriptor checks) —
     // built from the same settings as the host so limits match.
-    let wasm_validator: Arc<dyn ferrofin_traits::plugins::PluginArtifactValidator> = Arc::new(
-        ferrofin_wasm::WasmArtifactValidator::new(
+    let wasm_validator: Arc<dyn ferrofin_traits::plugins::PluginArtifactValidator> =
+        Arc::new(ferrofin_wasm::WasmArtifactValidator::new(
             &ferrofin_wasm::WasmSettings::resolve(
                 config.wasm_call_timeout_secs,
                 config.wasm_memory_limit_mb,
@@ -2166,9 +2166,7 @@ pub async fn build_app_state(
             .with_image_timeout_secs(config.wasm_image_timeout_secs)
             .with_write_content_mb(config.wasm_write_content_mb)
             .with_subtitle_extract_mb(config.wasm_subtitle_extract_mb),
-        )
-        .map_err(|e| anyhow::anyhow!("wasm artifact validator init: {e}"))?,
-    );
+        ));
     // Which items the "Plugin media analysis" pass offered to which plugin:
     // the pass reads and writes it, an uninstall forgets the plugin's.
     let plugin_offered_items: Arc<dyn ferrofin_traits::plugins::PluginOfferedItemStore> = Arc::new(
