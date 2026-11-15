@@ -2554,9 +2554,9 @@ struct ByNameScope<'a> {
 /// - `PARTITION BY` groups NULLs together, exactly as SQLite's `GROUP BY` and
 ///   as EF translates `GroupBy` — so a set of by-name rows that never got a
 ///   `PresentationUniqueKey` collapses to ONE row. That is faithful, and it is
-///   also why [`crate::item_persistence_service::backfill_missing_presentation_keys`]
-///   exists: reproducing upstream's collapse without also reproducing
-///   upstream's keys would silently delete names from the tab.
+///   also why `ferrofin_db::presentation_key::backfill_by_name_presentation_keys`
+///   runs on every boot: reproducing upstream's collapse without also
+///   reproducing upstream's keys would silently delete names from the tab.
 /// - The window runs over the FILTERED row set (it is in the same SELECT as the
 ///   join and the `WHERE`), which is what upstream does — it groups
 ///   `masterQuery`, i.e. the inner query after `TranslateQuery` applied
@@ -14527,8 +14527,8 @@ mod tests {
     /// Reproducing it faithfully is only half the job: Ferrofin must also write
     /// the keys upstream writes, or it reproduces the collapse WITHOUT the keys
     /// that save most rows from it. That is
-    /// `backfill_missing_presentation_keys`, and this test is the reason it is
-    /// not optional.
+    /// `ferrofin_db::presentation_key::backfill_by_name_presentation_keys`, and
+    /// this test is the reason it is not optional.
     #[tokio::test]
     async fn unkeyed_by_name_rows_collapse_the_way_upstream_collapses_them() {
         let db = test_db().await;
@@ -14568,7 +14568,7 @@ mod tests {
 
         // …and once the keys are repaired, both names come back.
         assert_eq!(
-            crate::item_persistence_service::backfill_missing_presentation_keys(&db)
+            ferrofin_db::presentation_key::backfill_by_name_presentation_keys(db.writer())
                 .await
                 .expect("backfill"),
             2
