@@ -5,6 +5,7 @@ use std::sync::Arc;
 use ferrofin_db::entities::base_items::BaseItemEntity;
 use ferrofin_model::configuration::{LibraryOptions, TrickplayScanBehavior};
 use ferrofin_model::data::BaseItemKind;
+use ferrofin_traits::error::ServiceError;
 use ferrofin_traits::providers::{MetadataRefreshMode, MetadataRefreshOptions};
 use ferrofin_traits::trickplay::TrickplayManager;
 use uuid::Uuid;
@@ -19,53 +20,85 @@ pub(super) struct ScanTrickplay {
 }
 
 impl ScanTrickplay {
+    /// Whether the item waits for its extraction (Blocking). Read once per
+    /// item, so its refresh runs at one timing even if the setting changes
+    /// meanwhile; an unrecognized value runs detached, as upstream's `else`.
+    pub(super) fn blocking(&self) -> bool {
+        (self.behavior)() == TrickplayScanBehavior::Blocking
+    }
+
+    /// Blocking timing: extracts from the caller's row and streams and waits.
+    /// An existing item runs from its fresh probe before its final save, so
+    /// the metadata Etag stays put until extraction finishes.
     pub(super) async fn refresh(
         &self,
         id: Uuid,
         entity: &BaseItemEntity,
         streams: Option<&[ferrofin_db::entities::base_items::MediaStreamInfoEntity]>,
-        library: LibraryOptions,
+        library: &LibraryOptions,
         options: &MetadataRefreshOptions,
         cancel: &ScanCancel,
     ) -> bool {
-        // TrickplayProvider only honors replacement above Default, regardless
-        // of ReplaceAllMetadata or the image refresh mode.
-        let replace = options.regenerate_trickplay
-            && options.metadata_refresh_mode == MetadataRefreshMode::FullRefresh;
+        let work = self.manager.refresh_trickplay_for_media(
+            id,
+            entity,
+            streams,
+            replace(options),
+            library,
+        );
+        outcome(id, cancel.unless_cancelled(work).await)
+    }
+
+    /// NonBlocking timing: a detached refresh by id, which reads the row and
+    /// streams back when it starts rather than carrying copies of the scan's
+    /// (gl-233). Call it only after the item's final save and its probe's
+    /// stream rows, which it then reads. Cancellation still follows the
+    /// originating refresh after return.
+    ///
+    /// TODO(gl-1824, open work item): the task carries its own copy of the
+    /// library's options from the start, and it runs at once, so the refresh
+    /// then holds the row and streams it read until its generation slot: a
+    /// scan's backlog still holds all three per video. Un-defer path (an
+    /// owner decision): hold only the id until a slot is free, by a queue
+    /// drained by as many workers as the generation slots, with the options
+    /// shared per library rather than copied per video.
+    pub(super) fn spawn(
+        &self,
+        id: Uuid,
+        library: LibraryOptions,
+        options: &MetadataRefreshOptions,
+        cancel: &ScanCancel,
+    ) {
         let manager = Arc::clone(&self.manager);
         let cancel = cancel.clone();
-        let entity = entity.clone();
-        let streams = streams.map(<[_]>::to_vec);
-        let work = async move {
-            match cancel
-                .unless_cancelled(manager.refresh_trickplay_for_media(
-                    id,
-                    &entity,
-                    streams.as_deref(),
-                    replace,
-                    &library,
-                ))
-                .await
-            {
-                Some(Ok(())) => true,
-                Some(Err(error)) => {
-                    tracing::warn!(item_id = %id, %error, "scan trickplay refresh failed");
-                    // MetadataService.RunCustomProvider only sets ErrorMessage
-                    // for ordinary errors; it does not increment Failures.
-                    true
-                }
-                None => false,
-            }
-        };
-        if (self.behavior)() == TrickplayScanBehavior::Blocking {
-            work.await
-        } else {
-            // The shared production extractor's ImageEncodingJobPool bounds
-            // running ffmpeg processes, including jobs from scheduled tasks.
-            // Cancellation still follows the originating refresh after return.
-            tokio::spawn(work);
+        let replace = replace(options);
+        // The shared production extractor's ImageEncodingJobPool bounds
+        // running ffmpeg processes, including jobs from scheduled tasks.
+        tokio::spawn(async move {
+            let work = manager.refresh_trickplay_data(id, replace, &library);
+            outcome(id, cancel.unless_cancelled(work).await)
+        });
+    }
+}
+
+/// TrickplayProvider only honors replacement above Default, regardless of
+/// ReplaceAllMetadata or the image refresh mode.
+fn replace(options: &MetadataRefreshOptions) -> bool {
+    options.regenerate_trickplay
+        && options.metadata_refresh_mode == MetadataRefreshMode::FullRefresh
+}
+
+/// `false` only when the refresh was cancelled.
+fn outcome(id: Uuid, result: Option<Result<(), ServiceError>>) -> bool {
+    match result {
+        Some(Ok(())) => true,
+        Some(Err(error)) => {
+            tracing::warn!(item_id = %id, %error, "scan trickplay refresh failed");
+            // MetadataService.RunCustomProvider only sets ErrorMessage for
+            // ordinary errors; it does not increment Failures.
             true
         }
+        None => false,
     }
 }
 
@@ -113,7 +146,6 @@ mod tests {
     use async_trait::async_trait;
     use chrono::{Duration, Utc};
     use ferrofin_db::entities::playback::TrickplayInfoEntity;
-    use ferrofin_traits::error::ServiceError;
     use tokio::sync::Notify;
 
     fn movie() -> BaseItemEntity {
@@ -269,7 +301,8 @@ mod tests {
         entered: Notify,
         release: Notify,
         dropped: Arc<AtomicBool>,
-        calls: Mutex<Vec<(Uuid, bool, bool)>>,
+        /// `(id, replace, extraction enabled, handed the caller's row)`.
+        calls: Mutex<Vec<(Uuid, bool, bool, bool)>>,
         fail: bool,
     }
 
@@ -277,6 +310,31 @@ mod tests {
     impl Drop for Dropped {
         fn drop(&mut self) {
             self.0.store(true, Ordering::SeqCst);
+        }
+    }
+
+    impl HeldManager {
+        async fn held(
+            &self,
+            id: Uuid,
+            replace: bool,
+            options: &LibraryOptions,
+            with_row: bool,
+        ) -> Result<(), ServiceError> {
+            let _dropped = Dropped(Arc::clone(&self.dropped));
+            self.calls.lock().unwrap().push((
+                id,
+                replace,
+                options.enable_trickplay_image_extraction,
+                with_row,
+            ));
+            self.entered.notify_one();
+            self.release.notified().await;
+            if self.fail {
+                Err(ServiceError::backend("fixture failure"))
+            } else {
+                Ok(())
+            }
         }
     }
 
@@ -288,19 +346,17 @@ mod tests {
             replace: bool,
             options: &LibraryOptions,
         ) -> Result<(), ServiceError> {
-            let _dropped = Dropped(Arc::clone(&self.dropped));
-            self.calls.lock().unwrap().push((
-                id,
-                replace,
-                options.enable_trickplay_image_extraction,
-            ));
-            self.entered.notify_one();
-            self.release.notified().await;
-            if self.fail {
-                Err(ServiceError::backend("fixture failure"))
-            } else {
-                Ok(())
-            }
+            self.held(id, replace, options, false).await
+        }
+        async fn refresh_trickplay_for_media(
+            &self,
+            id: Uuid,
+            _entity: &BaseItemEntity,
+            _streams: Option<&[ferrofin_db::entities::base_items::MediaStreamInfoEntity]>,
+            replace: bool,
+            options: &LibraryOptions,
+        ) -> Result<(), ServiceError> {
+            self.held(id, replace, options, true).await
         }
         async fn get_trickplay_resolutions(
             &self,
@@ -353,6 +409,7 @@ mod tests {
     async fn blocking_waits_and_full_refresh_alone_honors_regenerate() {
         let manager = Arc::new(HeldManager::default());
         let provider = provider(&manager, TrickplayScanBehavior::Blocking);
+        assert!(provider.blocking());
         let id = Uuid::new_v4();
         let handle = tokio::spawn(async move {
             provider
@@ -360,7 +417,7 @@ mod tests {
                     id,
                     &movie(),
                     Some(&[]),
-                    during_scan(),
+                    &during_scan(),
                     &MetadataRefreshOptions {
                         metadata_refresh_mode: MetadataRefreshMode::FullRefresh,
                         regenerate_trickplay: true,
@@ -375,7 +432,7 @@ mod tests {
             !handle.is_finished(),
             "Blocking waits until extraction completes"
         );
-        assert_eq!(*manager.calls.lock().unwrap(), [(id, true, false)]);
+        assert_eq!(*manager.calls.lock().unwrap(), [(id, true, false, true)]);
         manager.release.notify_one();
         assert!(
             handle.await.unwrap(),
@@ -385,32 +442,32 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn nonblocking_and_unknown_timing_return_and_keep_the_originating_cancellation() {
+    async fn nonblocking_and_unknown_timing_detach_by_id_and_keep_the_originating_cancellation() {
         for behavior in [
             TrickplayScanBehavior::NonBlocking,
             TrickplayScanBehavior::Unrecognized(7),
         ] {
             let manager = Arc::new(HeldManager::default());
             let provider = provider(&manager, behavior);
+            assert!(!provider.blocking());
             let cancel = ScanCancel::default();
             let id = Uuid::new_v4();
-            let accepted = provider
-                .refresh(
-                    id,
-                    &movie(),
-                    Some(&[]),
-                    during_scan(),
-                    &MetadataRefreshOptions {
-                        regenerate_trickplay: true,
-                        replace_all_metadata: true,
-                        ..Default::default()
-                    },
-                    &cancel,
-                )
-                .await;
-            assert!(accepted, "detached work does not fail the metadata refresh");
+            provider.spawn(
+                id,
+                during_scan(),
+                &MetadataRefreshOptions {
+                    regenerate_trickplay: true,
+                    replace_all_metadata: true,
+                    ..Default::default()
+                },
+                &cancel,
+            );
             manager.entered.notified().await;
-            assert_eq!(*manager.calls.lock().unwrap(), [(id, false, false)]);
+            assert_eq!(
+                *manager.calls.lock().unwrap(),
+                [(id, false, false, false)],
+                "the detached refresh re-reads the saved row and streams by id"
+            );
             assert!(!manager.dropped.load(Ordering::SeqCst));
             cancel.cancel();
             for _ in 0..100 {
@@ -439,7 +496,7 @@ mod tests {
                         Uuid::new_v4(),
                         &movie(),
                         None,
-                        during_scan(),
+                        &during_scan(),
                         &MetadataRefreshOptions::default(),
                         &work_cancel,
                     )

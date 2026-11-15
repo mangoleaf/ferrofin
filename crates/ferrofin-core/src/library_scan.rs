@@ -8852,19 +8852,27 @@ impl LibraryScanner {
         {
             cleanup.prune_extracted_data(&entity).await?;
         }
-        // Existing items can run from fresh probe values before their final
-        // save: Blocking keeps the metadata Etag unchanged until extraction
-        // finishes. New items must first exist for the trickplay row's FK.
+        // The provider, the item's library options, and whether it waits.
+        let trickplay = self
+            .trickplay
+            .as_ref()
+            .zip(policy.options)
+            .filter(|_| {
+                trickplay::selected(&entity, stored_row, plan, options, policy.options, locked)
+            })
+            .map(|(provider, library)| (provider, library, provider.blocking()));
+        // Blocking: an existing item runs from fresh probe values before its
+        // final save, so the metadata Etag stays unchanged until extraction
+        // finishes. A new item must first exist for the trickplay row's FK.
         if stored_row.is_some()
-            && trickplay::selected(&entity, stored_row, plan, options, policy.options, locked)
-            && let (Some(provider), Some(library)) = (&self.trickplay, policy.options)
+            && let Some((provider, library, true)) = trickplay
         {
             let trickplay_ok = provider
                 .refresh(
                     item.id,
                     &entity,
                     probe_ran.then_some(rows.streams.as_slice()),
-                    library.clone(),
+                    library,
                     options,
                     cancel,
                 )
@@ -8876,9 +8884,6 @@ impl LibraryScanner {
                 return Ok(ItemSaved::Cancelled);
             }
         }
-        let new_trickplay = stored_row.is_none()
-            && self.trickplay.is_some()
-            && trickplay::selected(&entity, stored_row, plan, options, policy.options, locked);
         // `DateLastRefreshed` records a refresh that completed with no
         // provider failure (a provider that found nothing still completes);
         // a failed one keeps the stored stamp, so it is retried.
@@ -9000,19 +9005,25 @@ impl LibraryScanner {
         // A new video needs its first item save for the trickplay FK, so its
         // custom provider runs here, before the stamp; ordinary
         // custom-provider errors still complete, and a cancel (its only
-        // `false`) withholds the stamp below.
-        if new_trickplay && let (Some(provider), Some(library)) = (&self.trickplay, policy.options)
-        {
-            provider
-                .refresh(
-                    item.id,
-                    &entity,
-                    probe_ran.then_some(rows.streams.as_slice()),
-                    library.clone(),
-                    options,
-                    cancel,
-                )
-                .await;
+        // `false`) withholds the stamp below. NonBlocking starts every
+        // video's refresh here, by id, once its row and streams are saved.
+        match trickplay {
+            Some((provider, library, true)) if stored_row.is_none() => {
+                provider
+                    .refresh(
+                        item.id,
+                        &entity,
+                        probe_ran.then_some(rows.streams.as_slice()),
+                        library,
+                        options,
+                        cancel,
+                    )
+                    .await;
+            }
+            Some((provider, library, false)) => {
+                provider.spawn(item.id, library.clone(), options, cancel);
+            }
+            _ => {}
         }
         if let Some(images) = artwork.filter(|_| images_changed)
             && let Err(err) = self.persistence.save_item_images(item.id, &images).await
