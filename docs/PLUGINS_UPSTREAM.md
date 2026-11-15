@@ -127,7 +127,11 @@ Conventions:
   it analyses: the ids it reads keep the whole snapshot's order, and a
   season's entries depend only on its series' items, so its seasons are
   queued exactly as the whole queue has them (given the series link every
-  scanned season and episode row carries).
+  scanned season and episode row carries). Clean Cache and Clear excluded,
+  which upstream gives the probed queue (`GetMediaItems(includeExcluded:
+  true)`), build it without `ProbeAudioDuration`'s ffprobe: they read only
+  its ids, exclusions and seasons, which the probe never changes, and the
+  credits windows it would move are never read.
 - **File checks** (implementation only, the behaviour is the same): upstream's
   `VerifyQueueAsync` checks every queued file with `File.Exists` on every pass.
   Here a season's files are checked only when the pass can act on its items:

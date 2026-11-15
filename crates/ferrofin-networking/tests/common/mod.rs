@@ -1,4 +1,4 @@
-//! Shared test helpers: a [`Logger`] that captures warnings and errors so the ported
+//! Shared test helpers: a [`Logger`] that captures what it is given so the ported
 //! `LogInvalidSubnet` substring assertions can be checked deterministically
 //! (the Moq `logger.Verify(...Contains...)` oracle).
 //!
@@ -9,9 +9,10 @@ use std::sync::Mutex;
 
 use ferrofin_networking::Logger;
 
-/// A [`Logger`] that records every warning and error message it receives.
+/// A [`Logger`] that records every message it receives.
 #[derive(Default)]
 pub struct CapturingLogger {
+    infos: Mutex<Vec<String>>,
     warnings: Mutex<Vec<String>>,
     errors: Mutex<Vec<String>>,
 }
@@ -21,6 +22,12 @@ impl CapturingLogger {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// The recorded information messages.
+    #[must_use]
+    pub fn infos(&self) -> Vec<String> {
+        self.infos.lock().expect("infos lock").clone()
     }
 
     /// The recorded warning messages.
@@ -54,6 +61,13 @@ impl CapturingLogger {
 }
 
 impl Logger for CapturingLogger {
+    fn info(&self, message: &str) {
+        self.infos
+            .lock()
+            .expect("infos lock")
+            .push(message.to_owned());
+    }
+
     fn warn(&self, message: &str) {
         self.warnings
             .lock()

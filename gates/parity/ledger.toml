@@ -736,8 +736,8 @@ reason = "Ferrofin compiles in TheTVDB, FanArt and OpenSubtitles (documented sco
 request = "GetSeriesRemoteSearchResults"
 path = "$"
 kind = "length"
-issue = 862
-reason = "Ferrofin compiles in TheTVDB, FanArt and OpenSubtitles (documented scope), which stock Jellyfin lacks."
+verified = "POST /Items/RemoteSearch/Series"
+reason = "Ferrofin compiles TheTVDB in (documented scope), so a series Identify also lists TheTVDB's results, which stock Jellyfin lacks."
 
 # Libraries are listed by name, not in directory-enumeration order.
 [[entry]]
@@ -804,34 +804,34 @@ kind = "status"
 issue = 843
 reason = "Live TV timer routes answer an unknown id with a different status."
 
-# Timers carry no artwork: FillImages is not ported.
+# The new-timer defaults without a programId carry no artwork; upstream's FillImages with no name takes the library's first series'.
 [[entry]]
 request = "GetDefaultTimer"
 path = "ParentBackdropImageTags"
 kind = "missing"
-issue = 853
-reason = "Timers carry no artwork: FillImages is not ported."
+issue = 1790
+reason = "The new-timer defaults without a programId carry no artwork; upstream's FillImages with no name takes the library's first series'."
 
 [[entry]]
 request = "GetDefaultTimer"
 path = "ParentBackdropItemId"
 kind = "missing"
-issue = 853
-reason = "Timers carry no artwork: FillImages is not ported."
+issue = 1790
+reason = "The new-timer defaults without a programId carry no artwork; upstream's FillImages with no name takes the library's first series'."
 
 [[entry]]
 request = "GetDefaultTimer"
 path = "ParentPrimaryImageItemId"
 kind = "missing"
-issue = 853
-reason = "Timers carry no artwork: FillImages is not ported."
+issue = 1790
+reason = "The new-timer defaults without a programId carry no artwork; upstream's FillImages with no name takes the library's first series'."
 
 [[entry]]
 request = "GetDefaultTimer"
 path = "ParentPrimaryImageTag"
 kind = "missing"
-issue = 853
-reason = "Timers carry no artwork: FillImages is not ported."
+issue = 1790
+reason = "The new-timer defaults without a programId carry no artwork; upstream's FillImages with no name takes the library's first series'."
 
 # Both bitrate test bodies are random bytes, and Jellyfin's is longer.
 [[entry]]

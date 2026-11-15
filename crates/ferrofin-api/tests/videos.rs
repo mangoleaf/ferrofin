@@ -1170,8 +1170,9 @@ async fn a_static_stream_naming_no_container_is_typed_by_its_source(
 /// extension (here `.mkv`), on a `206` as on the whole file. The container is
 /// the route's, else the `Container` query, else `ts` for an open live stream,
 /// else the source's probed one (universal audio names none); a container with
-/// no type of its own falls back to the path's, and a path the ported table
-/// does not know (`.aiff`) keeps the type guessed from it.
+/// no type of its own falls back to the path's (`.aiff`, from the `MimeTypes`
+/// package's table), and a path that table does not know either (`.aax`) is
+/// `application/octet-stream`, `MimeTypes.GetMimeType(path)`'s default.
 #[rstest::rstest]
 #[case::route("GET", "/Videos/{id}/stream.mp4?static=true", None, "mkv", "video/mp4")]
 #[case::route_head(
@@ -1235,7 +1236,14 @@ async fn a_static_stream_naming_no_container_is_typed_by_its_source(
     "/Audio/{id}/stream.zzz?static=true",
     None,
     "aiff",
-    "audio/aiff"
+    "audio/x-aiff"
+)]
+#[case::unknown_path(
+    "GET",
+    "/Audio/{id}/stream.zzz?static=true",
+    None,
+    "aax",
+    "application/octet-stream"
 )]
 #[tokio::test]
 async fn a_static_stream_is_typed_by_its_output_container(

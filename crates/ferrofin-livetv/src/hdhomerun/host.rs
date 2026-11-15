@@ -522,10 +522,9 @@ impl TunerHost for HdHomerunHost {
                 TunerChannel {
                     external_id: format!("{HDHR_CHANNEL_ID_PREFIX}{guide_number}"),
                     // `ChannelInfo.TunerChannelId` is left unset by this host,
-                    // so `ListingsManager`'s match falls through to `Number` —
-                    // which is the guide number. That is the key Ferrofin
-                    // stores, so the same EPG entry is found.
-                    guide_key: guide_number.clone(),
+                    // so `ListingsManager`'s match goes from `Id` to `Number`
+                    // (the guide number) with no by-id lookup in between.
+                    guide_key: String::new(),
                     name: c.guide_name.unwrap_or_default(),
                     number: Some(guide_number),
                     image_url: None,
