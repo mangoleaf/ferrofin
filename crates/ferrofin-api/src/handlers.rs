@@ -5491,8 +5491,10 @@ pub const VERIFIED: &[Verified] = &[
                subtitle_manager.rs download_subtitles, route and attach \
                (SubtitleManager.DownloadSubtitles, GetProvider and GetRemoteSubtitles' \
                Split('_', 2): an id naming no provider fails the download; TrySaveSubtitle and \
-               TrySaveToFiles: the library's SaveSubtitlesWithMedia picks the folder beside the \
-               media path or the item's internal-metadata folder, \
+               TrySaveToFiles: the library's SaveSubtitlesWithMedia picks \
+               Video.ContainingFolderPath (LibraryManager containing_folder_path: a DVD or \
+               Blu-ray folder rip's own folder, else the media file's) or the item's \
+               internal-metadata folder, \
                {stem}.{language}[.forced][.sdh].{format} with the language lowercased and a \
                path separator refused, the format checked against \
                NamingOptions.SubtitleFileExtensions, a taken name moved to {name}.{n}.{format}, \
@@ -5510,9 +5512,6 @@ pub const VERIFIED: &[Verified] = &[
          culture. Fix path: gl-429.",
             "The entry names the OpenSubtitles provider opensubtitles; the plugin's Name, which \
          upstream's entry shows, is Open Subtitles. Fix path: gl-1704.",
-            "A DVD or Blu-ray folder rip's subtitle is written beside the rip's folder; \
-         upstream's Video.ContainingFolderPath is the rip's folder itself, so it lands \
-         inside it there. Fix path: gl-1643.",
             "The subtitle is recorded as an external stream as soon as it is written; upstream \
          leaves that to the queued refresh's probe, so the item lists it here before the \
          refresh has run, and also when queueing the refresh failed. Fix path: gl-1641.",

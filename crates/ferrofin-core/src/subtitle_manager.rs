@@ -261,14 +261,19 @@ impl FerrofinSubtitleManager {
             // LibraryOptions.SaveSubtitlesWithMedia defaults to true.
             true
         };
-        let sidecar = sidecar_path(media_path, response)?;
+        let name = sidecar_name(media_path, response)?;
         let destination = if save_with_media {
-            sidecar
+            // `Video.ContainingFolderPath`: a DVD or Blu-ray folder rip's own
+            // folder, else the media file's. A root path has none (`Path.Combine`
+            // throws on upstream's null).
+            let folder = self
+                .library_manager
+                .containing_folder_path(&item)
+                .await
+                .ok_or_else(|| ServiceError::invalid_input("item has no folder for a sidecar"))?;
+            PathBuf::from(folder).join(name)
         } else {
-            let filename = sidecar
-                .file_name()
-                .ok_or_else(|| ServiceError::invalid_input("subtitle has no filename"))?;
-            self.item_metadata_dir(item_id).join(filename)
+            self.item_metadata_dir(item_id).join(name)
         };
         // The pinned SubtitleManager selects one destination. An unwritable
         // media folder is an error, not permission to write into metadata.
@@ -447,9 +452,8 @@ fn subtitle_extension(format: &str) -> Result<String, ServiceError> {
 }
 
 /// Builds the upstream `{stem}.{language}[.forced][.sdh].{format}` filename.
-fn sidecar_path(media_path: &str, response: &SubtitleResponse) -> Result<PathBuf, ServiceError> {
-    let path = Path::new(media_path);
-    let stem = path.file_stem().map_or_else(
+fn sidecar_name(media_path: &str, response: &SubtitleResponse) -> Result<String, ServiceError> {
+    let stem = Path::new(media_path).file_stem().map_or_else(
         || "subtitle".to_owned(),
         |stem| stem.to_string_lossy().into_owned(),
     );
@@ -470,10 +474,9 @@ fn sidecar_path(media_path: &str, response: &SubtitleResponse) -> Result<PathBuf
     } else {
         ""
     };
-    let name = format!("{stem}.{language}{forced}{hearing_impaired}.{extension}");
-    Ok(path
-        .parent()
-        .map_or_else(|| PathBuf::from(&name), |parent| parent.join(&name)))
+    Ok(format!(
+        "{stem}.{language}{forced}{hearing_impaired}.{extension}"
+    ))
 }
 
 /// Codec for the immediate external-stream record. Matroska subtitle files
@@ -1223,12 +1226,12 @@ mod tests {
     }
 
     #[test]
-    fn sidecar_path_rejects_invalid_input_and_preserves_upstream_names() {
+    fn sidecar_name_rejects_invalid_input_and_preserves_upstream_names() {
         let mut response = upload_response();
         for format in ["", ".VTT", "nfo", "strm", "srt ", "../srt"] {
             response.format = format.to_owned();
             assert!(matches!(
-                sidecar_path("/library/movie/Movie.mkv", &response),
+                sidecar_name("/library/movie/Movie.mkv", &response),
                 Err(ServiceError::InvalidInput(_))
             ));
         }
@@ -1236,7 +1239,7 @@ mod tests {
         for language in ["x/../../outside/pwned", "eng\0"] {
             response.language = language.to_owned();
             assert!(matches!(
-                sidecar_path("/library/movie/Movie.mkv", &response),
+                sidecar_name("/library/movie/Movie.mkv", &response),
                 Err(ServiceError::InvalidInput(_))
             ));
         }
@@ -1246,10 +1249,8 @@ mod tests {
         for extension in SUBTITLE_EXTENSIONS {
             response.format = extension.to_ascii_uppercase();
             assert_eq!(
-                sidecar_path("/library/movie/Movie.mkv", &response).unwrap(),
-                Path::new(&format!(
-                    "/library/movie/Movie.pt-br.forced.sdh.{extension}"
-                ))
+                sidecar_name("/library/movie/Movie.mkv", &response).unwrap(),
+                format!("Movie.pt-br.forced.sdh.{extension}")
             );
         }
         response.language.clear();
@@ -1257,9 +1258,67 @@ mod tests {
         response.is_forced = false;
         response.is_hearing_impaired = false;
         assert_eq!(
-            sidecar_path("/library/movie/Movie.mkv", &response).unwrap(),
-            Path::new("/library/movie/Movie..srt")
+            sidecar_name("/library/movie/Movie.mkv", &response).unwrap(),
+            "Movie..srt"
         );
+    }
+
+    /// `TrySaveSubtitle` writes into `Video.ContainingFolderPath`: a DVD or
+    /// Blu-ray folder rip's own folder, else the folder of the file (of the
+    /// first part, for a stacked rip; a `.disc` placeholder's too).
+    #[rstest::rstest]
+    #[case::dvd_rip("Film", r#"{"VideoType":"Dvd"}"#, "Film/Film.eng.srt")]
+    #[case::bluray_rip("Film", r#"{"VideoType":"BluRay"}"#, "Film/Film.eng.srt")]
+    #[case::iso("Film/Film.iso", r#"{"VideoType":"Iso"}"#, "Film/Film.eng.srt")]
+    #[case::stacked_rip(
+        "Set/Set - Disc 1",
+        r#"{"VideoType":"Dvd","AdditionalParts":["Set/Set - Disc 2"]}"#,
+        "Set/Set - Disc 1.eng.srt"
+    )]
+    #[case::placeholder(
+        "Film/Film.disc",
+        r#"{"VideoType":"Dvd","IsPlaceHolder":true}"#,
+        "Film/Film.eng.srt"
+    )]
+    #[tokio::test]
+    async fn a_subtitle_is_saved_into_the_videos_containing_folder(
+        #[case] media: &str,
+        #[case] data: &str,
+        #[case] expected: &str,
+    ) {
+        let db = test_db().await;
+        let item = Uuid::new_v4();
+        crate::test_support::seed_item_with_data(&db, item, BaseItemKind::Movie, "Film", data)
+            .await;
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let media = tmp.path().join(media);
+        std::fs::create_dir_all(media.parent().unwrap()).unwrap();
+        set_item_path(&db, item, &media).await;
+        let response = upload_response();
+        manager(db, vec![])
+            .upload_subtitle(item, &response)
+            .await
+            .unwrap();
+        assert_eq!(
+            std::fs::read(tmp.path().join(expected)).unwrap(),
+            response.content
+        );
+    }
+
+    /// A root path has no containing folder, so nothing is written (never
+    /// into the working directory).
+    #[tokio::test]
+    async fn a_root_path_has_no_folder_for_a_sidecar() {
+        let db = test_db().await;
+        let item = Uuid::new_v4();
+        seed_item(&db, item, BaseItemKind::Movie).await;
+        set_item_path(&db, item, Path::new("/")).await;
+        assert!(matches!(
+            manager(db, vec![])
+                .upload_subtitle(item, &upload_response())
+                .await,
+            Err(ServiceError::InvalidInput(_))
+        ));
     }
 
     #[tokio::test]
