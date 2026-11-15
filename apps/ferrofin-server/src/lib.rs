@@ -944,6 +944,21 @@ fn lifetime_app(
     axum::Router::new().fallback_service(app)
 }
 
+/// Kestrel refuses a request whose path holds a NUL (`%00`) before any
+/// middleware runs: an empty `400` that closes the connection (measured on
+/// Jellyfin 12.4), on the startup server too. So no decoded path segment a
+/// handler sees holds a NUL; the query still may.
+async fn refuse_nul_in_path(request: Request, next: Next) -> Response {
+    if request.uri().path().contains("%00") {
+        return (
+            axum::http::StatusCode::BAD_REQUEST,
+            [(axum::http::header::CONNECTION, "close")],
+        )
+            .into_response();
+    }
+    next.run(request).await
+}
+
 /// A lifetime's serve loops, one per listening address, all stopped by the
 /// same trigger. Dropping it aborts them and closes the listeners.
 struct Serving {
@@ -977,12 +992,15 @@ impl Serving {
         serving
     }
 
-    /// Serves `app` on more listeners, stopped by the same trigger.
+    /// Serves `app` on more listeners, stopped by the same trigger, behind
+    /// Kestrel's own refusals ([`refuse_nul_in_path`]).
     fn serve(
         &mut self,
         listeners: impl IntoIterator<Item = listen::ServedListener>,
         app: &axum::Router,
     ) {
+        let app = axum::Router::new()
+            .fallback_service(axum::middleware::from_fn(refuse_nul_in_path).layer(app.clone()));
         for listener in listeners {
             let mut stop = self.stop.subscribe();
             let app = app.clone();
@@ -1664,6 +1682,84 @@ mod tests {
             response.ends_with(&format!("peer=127.0.0.1 local={address}")),
             "{response}"
         );
+    }
+
+    /// A path holding a NUL is Kestrel's empty `400`, and the connection
+    /// closes after it, on the startup server and the lifetime's router alike;
+    /// one in the query reaches the route (measured on Jellyfin 12.4).
+    #[rstest::rstest]
+    #[case::starting(true)]
+    #[case::ready(false)]
+    #[tokio::test]
+    async fn a_nul_in_the_path_is_refused_on_every_listener(#[case] starting: bool) {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        let listener = super::listen::bind("127.0.0.1:0".parse().expect("address")).expect("bind");
+        let address = axum::serve::Listener::local_addr(&listener).expect("local address");
+        let app = if starting {
+            crate::startup::dispatcher(crate::startup::Ready::default())
+        } else {
+            let router =
+                Router::new().route("/echo/{value}", axum::routing::get(|| async { "ok" }));
+            super::lifetime_app(router, "/jellyfin", None)
+        };
+        let _serving =
+            super::Serving::start(vec![crate::listen::ServedListener::Plain(listener)], &app);
+        // (target, refused)
+        let mut cases = vec![
+            ("/jellyfin/echo/1%00", true),
+            ("/System/Info/Public%00", true),
+            ("/x%00", true),
+        ];
+        if !starting {
+            cases.push(("/jellyfin/echo/1?limit=1%00", false));
+            cases.push(("/jellyfin/echo/1%2500", false));
+        }
+        for (target, refused) in cases {
+            let mut stream = tokio::net::TcpStream::connect(address)
+                .await
+                .expect("connect");
+            let request = format!("GET {target} HTTP/1.1\r\nHost: x\r\n\r\n");
+            stream.write_all(request.as_bytes()).await.expect("request");
+            let mut response = Vec::new();
+            if refused {
+                // Read to the end: only a closed connection ends it.
+                tokio::time::timeout(
+                    std::time::Duration::from_secs(10),
+                    stream.read_to_end(&mut response),
+                )
+                .await
+                .expect("the connection closes")
+                .expect("response");
+            } else {
+                let mut chunk = [0_u8; 1024];
+                let read = tokio::time::timeout(
+                    std::time::Duration::from_secs(10),
+                    stream.read(&mut chunk),
+                )
+                .await
+                .expect("answered in time")
+                .expect("response");
+                response.extend_from_slice(&chunk[..read]);
+            }
+            let response = String::from_utf8_lossy(&response).to_ascii_lowercase();
+            let status = if refused {
+                "http/1.1 400"
+            } else {
+                "http/1.1 200"
+            };
+            assert!(response.starts_with(status), "{target}: {response}");
+            if refused {
+                assert!(
+                    response.contains("content-length: 0"),
+                    "{target}: {response}"
+                );
+                assert!(
+                    response.ends_with("\r\n\r\n"),
+                    "{target}: no body: {response}"
+                );
+            }
+        }
     }
 
     /// A panic in a route mounted with no boundary of its own, here a
