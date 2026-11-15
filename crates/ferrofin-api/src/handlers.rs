@@ -3419,15 +3419,16 @@ pub const VERIFIED: &[Verified] = &[
                program_dto_options; items.rs resolve_user_opt) → query_programs_inner (the \
                StartDate default order, the librarySeriesId block) → ferrofin-livetv \
                manager.rs get_programs (stored_series_timer for seriesTimerId, \
-               user_restrictions, program_rows_query over push_program_filters, \
-               push_program_order and push_program_paging, the PROGRAM_COUNT total, \
+               user_restrictions, program_rows_query (the stored programme item joined by \
+               id) over push_program_filters, push_program_order with \
+               push_program_sort_key and push_program_paging, the PROGRAM_COUNT total, \
                projection.rs remove_fields, program_dtos → program_entity and dto_service.rs \
                get_base_item_dtos, apply_program_info, add_recording_info → \
                scheduled_timers_for over dvr_repository.rs scheduled_timers_for_programs, \
                timer_program_ids, apply_recording_info) (RequestHelpers.GetUserId, \
                RequestHelpers.GetOrderBy, DtoExtensions.AddAdditionalDtoOptions, \
                LiveTvManager.GetPrograms, LibraryManager.QueryItems, \
-               BaseItemRepository.TranslateQuery and ApplyOrder, RemoveFields, \
+               BaseItemRepository.TranslateQuery and ApplyOrder, OrderMapper, RemoveFields, \
                DtoService.GetBaseItemDtos, AddInfoToProgramDto, AddRecordingInfo, \
                GetTimersInternal, DefaultLiveTvService.GetTimersAsync)",
         date: "2026-11-14",
@@ -3437,15 +3438,9 @@ pub const VERIFIED: &[Verified] = &[
          tag and keeps a programme with any of those tags, so isSports=true&isKids=true \
          lists sports and kids programmes alike. A false one excludes its flag in both. Fix \
          path: gl-1687.",
-            "Only StartDate, Name, SortName, OfficialRating, ProductionYear and Random order \
-         the page, over the guide's own columns: Name and SortName sort the title as stored \
-         (case-sensitively), OfficialRating sorts its text, Default sorts as StartDate, and \
-         any other key is skipped (StartDate when none is left); ties break on the \
-         programme id. Upstream's ApplyOrder sorts by every key through OrderMapper: Name \
-         by CleanName, SortName by the sort name, OfficialRating by the parental rating \
-         score, DateCreated, PremiereDate, CommunityRating, Runtime and the rest by their \
-         columns, drops Default (SortName when no key is left) and breaks ties on the sort \
-         name. Fix path: gl-1688.",
+            "With no user (an API key), sortBy PlayCount, IsFavoriteOrLiked, IsPlayed or \
+         IsUnplayed sorts by SortName, as /Items does; upstream's OrderMapper reads the \
+         missing user's id (query.User!.Id), which throws. Jellyfin bug not ported.",
             "enableTotalRecordCount=false with a startIndex reports the page's length plus \
          startIndex as TotalRecordCount; upstream's QueryItems reads GetItemList and \
          reports the page's length. Fix path: gl-1689.",
@@ -3483,7 +3478,8 @@ pub const VERIFIED: &[Verified] = &[
                body UserId only) → query_programs_inner (the StartDate default order, the \
                LibrarySeriesId block) → ferrofin-livetv manager.rs get_programs \
                (stored_series_timer for SeriesTimerId, user_restrictions, program_rows_query \
-               over push_program_filters, push_program_order and push_program_paging, the \
+               (the stored programme item joined by id) over push_program_filters, \
+               push_program_order with push_program_sort_key and push_program_paging, the \
                PROGRAM_COUNT total, projection.rs remove_fields, program_dtos → \
                program_entity and dto_service.rs get_base_item_dtos, apply_program_info, \
                add_recording_info → scheduled_timers_for over dvr_repository.rs \
@@ -3491,7 +3487,7 @@ pub const VERIFIED: &[Verified] = &[
                (GetProgramsDto, RequestHelpers.GetOrderBy, \
                DtoExtensions.AddAdditionalDtoOptions, LiveTvManager.GetPrograms, \
                LibraryManager.QueryItems, BaseItemRepository.TranslateQuery and ApplyOrder, \
-               RemoveFields, DtoService.GetBaseItemDtos, AddInfoToProgramDto, \
+               OrderMapper, RemoveFields, DtoService.GetBaseItemDtos, AddInfoToProgramDto, \
                AddRecordingInfo, GetTimersInternal, DefaultLiveTvService.GetTimersAsync)",
         date: "2026-11-14",
         divergences: &[
@@ -3510,15 +3506,9 @@ pub const VERIFIED: &[Verified] = &[
          more are true a programme must have them all; upstream turns each true one into a \
          tag and keeps a programme with any of those tags. A false one excludes its flag in \
          both. Fix path: gl-1687.",
-            "Only StartDate, Name, SortName, OfficialRating, ProductionYear and Random order \
-         the page, over the guide's own columns: Name and SortName sort the title as stored \
-         (case-sensitively), OfficialRating sorts its text, Default sorts as StartDate, and \
-         any other key is skipped (StartDate when none is left); ties break on the \
-         programme id. Upstream's ApplyOrder sorts by every key through OrderMapper: Name \
-         by CleanName, SortName by the sort name, OfficialRating by the parental rating \
-         score, DateCreated, PremiereDate, CommunityRating, Runtime and the rest by their \
-         columns, drops Default (SortName when no key is left) and breaks ties on the sort \
-         name. Fix path: gl-1688.",
+            "With no body UserId, SortBy PlayCount, IsFavoriteOrLiked, IsPlayed or \
+         IsUnplayed sorts by SortName, as /Items does; upstream's OrderMapper reads the \
+         missing user's id (query.User!.Id), which throws. Jellyfin bug not ported.",
             "EnableTotalRecordCount=false with a StartIndex reports the page's length plus \
          StartIndex as TotalRecordCount; upstream's QueryItems reads GetItemList and \
          reports the page's length. Fix path: gl-1689.",
