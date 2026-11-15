@@ -3712,19 +3712,11 @@ pub const VERIFIED: &[Verified] = &[
                BaseItemRepository.TranslateQuery and ApplyOrder, OrderMapper, RemoveFields, \
                DtoService.GetBaseItemDtos, AddInfoToProgramDto, AddRecordingInfo, \
                GetTimersInternal, DefaultLiveTvService.GetTimersAsync)",
-        date: "2026-11-14",
+        date: "2026-11-15",
         divergences: &[
-            "isSports, isNews and isKids each match the programme's own flag, so when two or \
-         more are true a programme must have them all; upstream turns each true one into a \
-         tag and keeps a programme with any of those tags, so isSports=true&isKids=true \
-         lists sports and kids programmes alike. A false one excludes its flag in both. Fix \
-         path: gl-1687.",
             "With no user (an API key), sortBy PlayCount, IsFavoriteOrLiked, IsPlayed or \
          IsUnplayed sorts by SortName, as /Items does; upstream's OrderMapper reads the \
          missing user's id (query.User!.Id), which throws. Jellyfin bug not ported.",
-            "enableTotalRecordCount=false with a startIndex reports the page's length plus \
-         startIndex as TotalRecordCount; upstream's QueryItems reads GetItemList and \
-         reports the page's length. Fix path: gl-1689.",
             "Programme DTOs are projected from the guide's own table, not the stored \
          LiveTvProgram item, so what that table has no column for is missing: \
          CommunityRating, PremiereDate (the listing's original air date), Audio, an HD \
@@ -3770,7 +3762,7 @@ pub const VERIFIED: &[Verified] = &[
                LibraryManager.QueryItems, BaseItemRepository.TranslateQuery and ApplyOrder, \
                OrderMapper, RemoveFields, DtoService.GetBaseItemDtos, AddInfoToProgramDto, \
                AddRecordingInfo, GetTimersInternal, DefaultLiveTvService.GetTimersAsync)",
-        date: "2026-11-14",
+        date: "2026-11-15",
         divergences: &[
             "A body UserId naming another user, sent without the administrator role, is a 403 \
          (the RequestHelpers.GetUserId rule GET applies); upstream's GetPrograms reads \
@@ -3781,18 +3773,9 @@ pub const VERIFIED: &[Verified] = &[
          date) is read as UTC; upstream's GetDateTime leaves it Unspecified and EF's \
          DateTimeKindValueConverter reads it as server-local time, as the GET form here \
          does. Fix path: gl-1033.",
-            "A null EnableTotalRecordCount reads as true; upstream's member is a non-nullable \
-         bool, which System.Text.Json refuses to bind from null (a 400). Fix path: gl-1691.",
-            "IsSports, IsNews and IsKids each match the programme's own flag, so when two or \
-         more are true a programme must have them all; upstream turns each true one into a \
-         tag and keeps a programme with any of those tags. A false one excludes its flag in \
-         both. Fix path: gl-1687.",
             "With no body UserId, SortBy PlayCount, IsFavoriteOrLiked, IsPlayed or \
          IsUnplayed sorts by SortName, as /Items does; upstream's OrderMapper reads the \
          missing user's id (query.User!.Id), which throws. Jellyfin bug not ported.",
-            "EnableTotalRecordCount=false with a StartIndex reports the page's length plus \
-         StartIndex as TotalRecordCount; upstream's QueryItems reads GetItemList and \
-         reports the page's length. Fix path: gl-1689.",
             "Programme DTOs are projected from the guide's own table, not the stored \
          LiveTvProgram item, so what that table has no column for is missing: \
          CommunityRating, PremiereDate (the listing's original air date), Audio, an HD \

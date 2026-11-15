@@ -4013,7 +4013,8 @@ impl ItemRepository for FerrofinItemRepository {
             {
                 i32::try_from(window_len).unwrap_or(i32::MAX)
             } else {
-                i32::try_from(items.len()).unwrap_or(i32::MAX) + start_index
+                // Uncounted (`GetItemList`) or unpaged: the page's own length.
+                i32::try_from(items.len()).unwrap_or(i32::MAX)
             };
             return Ok(QueryResult::new(Some(start_index), Some(total), items));
         }
@@ -4047,8 +4048,12 @@ impl ItemRepository for FerrofinItemRepository {
             && !count_is_known
         {
             self.fetch_count_resolved(filter).await?
-        } else {
+        } else if filter.enable_total_record_count {
             page_len + start_index
+        } else {
+            // Uncounted: `GetItems` answers `GetItemList`'s page and its length
+            // (v12.4 `BaseItemRepository.Querying.cs:34-40`), whatever the offset.
+            page_len
         };
         Ok(QueryResult::new(Some(start_index), Some(total), items))
     }
@@ -6460,6 +6465,18 @@ mod tests {
             .unwrap();
         assert_eq!(ids(&paged.items), [guid_to_db(charlie)]);
         assert_eq!(paged.total_record_count, 3);
+        // With the count off, the total is the page's length (`GetItemList`).
+        let uncounted = repository
+            .get_items(&InternalItemsQuery {
+                start_index: Some(1),
+                limit: Some(1),
+                enable_total_record_count: false,
+                ..adjacent(charlie)
+            })
+            .await
+            .unwrap();
+        assert_eq!(ids(&uncounted.items), [guid_to_db(charlie)]);
+        assert_eq!(uncounted.total_record_count, 1);
         // Neighbours follow the order the query asked for.
         let descending = repository
             .get_item_list(&InternalItemsQuery {
@@ -7750,6 +7767,45 @@ mod tests {
                 "total for limit={limit} start={start}"
             );
         }
+    }
+
+    /// With the count turned off, `GetItems` answers `GetItemList`'s page and
+    /// its length as the total (v12.4 `BaseItemRepository.Querying.cs:34-40`),
+    /// whatever the offset: never the offset plus the page.
+    #[rstest::rstest]
+    #[case::short_page_at_an_offset(Some(5), 10, 2)]
+    #[case::full_page_at_an_offset(Some(5), 5, 5)]
+    #[case::offset_without_a_limit(None, 3, 9)]
+    #[case::first_page(Some(5), 0, 5)]
+    #[case::past_the_end(Some(5), 20, 0)]
+    #[tokio::test]
+    async fn an_uncounted_page_reports_its_own_length(
+        #[case] limit: Option<i32>,
+        #[case] start: i32,
+        #[case] want: usize,
+    ) {
+        let db = test_db().await;
+        let repository = repo(&db);
+        for i in 0..12u128 {
+            seed_named_item(
+                &db,
+                Uuid::from_u128(0x7200 + i),
+                BaseItemKind::Movie,
+                &format!("Film {i:02}"),
+            )
+            .await;
+        }
+        let res = repository
+            .get_items(&InternalItemsQuery {
+                limit,
+                start_index: Some(start),
+                enable_total_record_count: false,
+                ..InternalItemsQuery::default()
+            })
+            .await
+            .expect("get_items");
+        assert_eq!(res.items.len(), want);
+        assert_eq!(usize::try_from(res.total_record_count).unwrap(), want);
     }
 
     /// The locked-item read must SEEK the partial index, never scan `BaseItems`.

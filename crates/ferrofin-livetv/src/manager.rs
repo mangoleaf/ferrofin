@@ -3583,8 +3583,10 @@ impl LiveTvManager for FerrofinLiveTvManager {
             .program_dtos(&rows, &list_options, query.user.as_deref())
             .await?;
 
-        // Same rule as the item repository: the count is only bought when
-        // paging actually truncated the result.
+        // `BaseItemRepository.GetItems`' rule: the count is only bought when
+        // paging may have truncated the result. Otherwise the total is the
+        // page's length, also with the count off (`QueryItems` reads
+        // `GetItemList`, and `QueryResult` totals its items).
         let total = if query.enable_total_record_count && (query.limit.is_some() || start_index > 0)
         {
             let mut cb: QueryBuilder<Sqlite> = QueryBuilder::new(PROGRAM_COUNT);
@@ -3596,7 +3598,7 @@ impl LiveTvManager for FerrofinLiveTvManager {
                 .map_err(db_err)?;
             i32::try_from(count).unwrap_or(i32::MAX)
         } else {
-            i32::try_from(items.len()).unwrap_or(i32::MAX) + start_index
+            i32::try_from(items.len()).unwrap_or(i32::MAX)
         };
         Ok(QueryResult::new(Some(start_index), Some(total), items))
     }
@@ -7534,7 +7536,9 @@ fn push_separator(qb: &mut QueryBuilder<Sqlite>, first: &mut bool) {
 /// genre scopes, by name and by id.
 ///
 /// The classification flags (`IsMovie`/`IsSeries`/`IsNews`/`IsKids`/`IsSports`)
-/// match the columns the guide refresh derives per listings provider.
+/// match the columns the guide refresh derives per listings provider:
+/// `IsMovie`/`IsSeries` each their own, and `IsNews`/`IsKids`/`IsSports` as
+/// upstream's tags, any one of the `true` ones and none of the `false` ones.
 /// `SeriesTimerId` never reaches this builder: `get_programs` answers it with
 /// the empty result upstream returns when the series-timer scope cannot be
 /// built.
@@ -7640,9 +7644,6 @@ fn push_program_filters(
     for (column, wanted) in [
         (r#"p."IsMovie""#, query.is_movie),
         (r#"p."IsSeries""#, query.is_series),
-        (r#"p."IsNews""#, query.is_news),
-        (r#"p."IsKids""#, query.is_kids),
-        (r#"p."IsSports""#, query.is_sports),
     ] {
         if let Some(wanted) = wanted {
             push_separator(qb, &mut first);
@@ -7650,11 +7651,37 @@ fn push_program_filters(
         }
     }
 
+    push_program_tags(qb, query, &mut first);
     push_program_genres(qb, query, &mut first);
 
     if let Some(restrictions) = restrictions {
         push_separator(qb, &mut first);
         crate::guide_repository::push_item_restrictions(qb, r#"p."Id""#, restrictions);
+    }
+}
+
+/// Pushes the `IsNews`/`IsKids`/`IsSports` scopes of a program query. They are
+/// tag sugar upstream (v12.4 `TranslateQuery.cs:224-258`): a programme carries
+/// ANY of the `true` flags' tags (`:665-670`) and none of the `false` ones'
+/// (`:672-677`).
+fn push_program_tags(qb: &mut QueryBuilder<Sqlite>, query: &InternalItemsQuery, first: &mut bool) {
+    let tags = [
+        (r#"p."IsNews""#, query.is_news),
+        (r#"p."IsKids""#, query.is_kids),
+        (r#"p."IsSports""#, query.is_sports),
+    ];
+    if tags.iter().any(|(_, wanted)| *wanted == Some(true)) {
+        push_separator(qb, first);
+        qb.push("(");
+        let mut any = qb.separated(" OR ");
+        for (column, _) in tags.iter().filter(|(_, wanted)| *wanted == Some(true)) {
+            any.push(*column).push_unseparated(" = 1");
+        }
+        qb.push(")");
+    }
+    for (column, _) in tags.iter().filter(|(_, wanted)| *wanted == Some(false)) {
+        push_separator(qb, first);
+        qb.push(*column).push(" = 0");
     }
 }
 
