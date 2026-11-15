@@ -16,6 +16,7 @@ use chrono::{DateTime, Utc};
 use ferrofin_db::Database;
 use ferrofin_db::store::{datetime_to_db, guid_to_db, opt_datetime_to_db};
 use ferrofin_util::numeric_collation::invariant_numeric_cmp;
+use ferrofin_util::string_extensions::lower_invariant;
 use sqlx::{QueryBuilder, Row, Sqlite};
 use uuid::Uuid;
 
@@ -218,54 +219,15 @@ fn new_item_id(type_full_name: &str, lowercased_key: &str) -> Uuid {
     ferrofin_common::extensions::get_md5(&format!("{type_full_name}{lowercased_key}"))
 }
 
-/// .NET `string.ToLowerInvariant`, which is **not** Rust's
-/// [`str::to_lowercase`].
-///
-/// `ToLowerInvariant` is documented to perform *simple* case mapping — it maps
-/// each code point independently and never changes the string's length — while
-/// `str::to_lowercase` performs *full*, context-sensitive Unicode lowercasing.
-/// They differ on two things that can reach these hash inputs, because the
-/// programme half of the key embeds the XMLTV `channel` attribute verbatim and
-/// that is arbitrary text:
-///
-/// - **Final sigma.** `str::to_lowercase` implements the `Final_Sigma`
-///   condition, so a trailing `Σ` becomes `ς` (U+03C2); the simple mapping
-///   always yields `σ` (U+03C3). A Greek channel id ending in a capital sigma
-///   would otherwise derive a programme GUID Jellyfin never mints.
-/// - **U+0130** (`İ`). Its *full* lowercase mapping expands to two code points
-///   (`i` + U+0307 combining dot above); the simple mapping is the single
-///   `i`. `SpecialCasing.txt` lists U+0130 as the only **unconditional**
-///   multi-code-point lowercase mapping — every other multi-char entry is
-///   conditional (final sigma above, plus the `lt`/`tr`/`az` locale rules,
-///   which the invariant culture does not apply) — so special-casing it here
-///   makes the rest of the fold exact rather than merely closer.
-///
-/// This lives next to its callers rather than beside
-/// [`ferrofin_common::extensions::get_md5`] (the other .NET string primitive it
-/// is always paired with) only because those are the sole callers; move it
-/// there the moment a second subsystem needs the same fold.
-fn to_lower_invariant(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    for c in s.chars() {
-        if c == '\u{0130}' {
-            out.push('i');
-            continue;
-        }
-        // `char::to_lowercase` is already context-free, so with U+0130 handled
-        // above it yields exactly one char for every input; the fallback keeps
-        // this total rather than relying on that. The iterator is never empty.
-        out.push(c.to_lowercase().next().unwrap_or(c));
-    }
-    out
-}
-
 /// The internal item GUID of a Live TV channel, from its tuner-facing external id.
 ///
 /// Port of `LiveTvDtoService.GetInternalChannelId` (v10.11.8 LiveTvDtoService.cs:403-408).
+/// Its `ToLowerInvariant` is [`lower_invariant`], the simple per-character fold
+/// that keeps `İ` (U+0130) and maps a final `Σ` to `σ`, never [`str::to_lowercase`].
 fn internal_channel_id(external_id: &str) -> Uuid {
     new_item_id(
         crate::projection::CHANNEL_TYPE_NAME,
-        &to_lower_invariant(&format!(
+        &lower_invariant(&format!(
             "{LIVE_TV_SERVICE_NAME}{external_id}{LIVE_TV_INTERNAL_VERSION}"
         )),
     )
@@ -274,11 +236,12 @@ fn internal_channel_id(external_id: &str) -> Uuid {
 /// The internal item GUID of a Live TV programme, from its listings-facing
 /// external id.
 ///
-/// Port of `LiveTvDtoService.GetInternalProgramId` (v10.11.8 LiveTvDtoService.cs:424-429).
+/// Port of `LiveTvDtoService.GetInternalProgramId` (v10.11.8 LiveTvDtoService.cs:424-429),
+/// folded as [`internal_channel_id`] is.
 fn internal_program_id(external_id: &str) -> Uuid {
     new_item_id(
         crate::projection::PROGRAM_TYPE_NAME,
-        &to_lower_invariant(&format!(
+        &lower_invariant(&format!(
             "{LIVE_TV_SERVICE_NAME}{external_id}{LIVE_TV_INTERNAL_VERSION}"
         )),
     )
@@ -4261,9 +4224,6 @@ impl LiveTvManager for FerrofinLiveTvManager {
         // finds a timer stored under either.
         let program = self.program_row_for_timer(&timer.base).await?;
         if let Some(program) = &program {
-            if let Ok(id) = Uuid::parse_str(&program.id) {
-                timer.base.program_id = Some(id.simple().to_string());
-            }
             // `CopyProgramInfoToTimerInfo`: the guide is the authority on what
             // this timer is actually recording.
             copy_program_into_timer(program, &mut timer);
@@ -5210,7 +5170,8 @@ impl FerrofinLiveTvManager {
     /// series timer's timer the artwork [`Self::fill_images`] finds by the
     /// timer's name and the programme's series (`TimerInfo.SeriesId` is the
     /// programme's, `CopyProgramInfoToTimerInfo`). The channel gives its
-    /// current name and logo tag, and the run time is the timer's window.
+    /// current name and logo tag, the run time is the timer's window, and the
+    /// programme's item id is derived from its listing id ([`derive_program_id`]).
     async fn build_timer_dto(&self, timer: &mut TimerInfoDto) -> Result<(), ServiceError> {
         // `GetTimerInfoDto` builds a new DTO: the programme and the channel's
         // name and logo come only from this read, and it sets no parent
@@ -5224,6 +5185,7 @@ impl FerrofinLiveTvManager {
             Some((timer.base.end_date - timer.base.start_date).num_milliseconds() * 10_000);
         // `string.IsNullOrEmpty(info.SeriesTimerId) ? null : …`.
         timer.series_timer_id = timer.series_timer_id.take().filter(|id| !id.is_empty());
+        derive_program_id(&mut timer.base);
         if let Some(program) = self.program_row_for_timer(&timer.base).await?
             && let Some(mut info) = self
                 .program_dtos(std::slice::from_ref(&program), &DtoOptions::default(), None)
@@ -5271,9 +5233,10 @@ impl FerrofinLiveTvManager {
     /// The read half of `LiveTvManager.GetSeriesTimers` and
     /// `LiveTvDtoService.GetSeriesTimerInfoDto` (v12.4 LiveTvManager.cs:909-955,
     /// LiveTvDtoService.cs:113-159), which build each series timer as it is
-    /// read: the channel's current name (none without a channel), and the
-    /// artwork [`Self::fill_images`] finds by the timer's name and `series_id`,
-    /// its stored `SeriesTimerInfo.SeriesId`.
+    /// read: the channel's current name (none without a channel), the
+    /// programme's item id ([`derive_program_id`]), and the artwork
+    /// [`Self::fill_images`] finds by the timer's name and `series_id`, its
+    /// stored `SeriesTimerInfo.SeriesId`.
     async fn build_series_timer_dto(
         &self,
         timer: &mut SeriesTimerInfoDto,
@@ -5282,6 +5245,7 @@ impl FerrofinLiveTvManager {
         // `GetSeriesTimerInfoDto` builds a new DTO, and sets neither.
         timer.base.channel_primary_image_tag = None;
         timer.image_tags.clear();
+        derive_program_id(&mut timer.base);
         timer.base.channel_name = if timer.base.channel_id.is_nil() {
             None
         } else {
@@ -8064,9 +8028,6 @@ fn series_child_timer(
         },
         ..TimerInfoDto::default()
     };
-    if let Ok(program_id) = Uuid::parse_str(&program.id) {
-        timer.base.program_id = Some(program_id.simple().to_string());
-    }
     // `CopyProgramInfoToTimerInfo(parent, timer, …)` — name, overview, window,
     // channel and the listing's own programme id all come from the guide.
     copy_program_into_timer(program, &mut timer);
@@ -8176,6 +8137,21 @@ fn program_channel_ids<'a>(rows: impl Iterator<Item = &'a GuideProgramRow>) -> V
         .collect()
 }
 
+/// `dto.ProgramId = GetInternalProgramId(info.ProgramId)`, which
+/// `GetTimerInfoDto` and `GetSeriesTimerInfoDto` run on every read: the item
+/// id derived from the listing id, so a stored id from an older derivation
+/// (the `İ` fold, gl-266) is not served. Without a listing id (an XMLTV airing
+/// without a start, which upstream never lists) the stored id stays.
+fn derive_program_id(timer: &mut ferrofin_model::live_tv::BaseTimerInfoDto) {
+    if let Some(external) = timer
+        .external_program_id
+        .as_deref()
+        .filter(|e| !e.is_empty())
+    {
+        timer.program_id = Some(internal_program_id(external).simple().to_string());
+    }
+}
+
 /// Copies what the guide knows about a programme onto the timer that records it.
 ///
 /// Port of `DefaultLiveTvService.CopyProgramInfoToTimerInfo`, restricted to the
@@ -8198,6 +8174,12 @@ fn copy_program_into_timer(program: &GuideProgramRow, timer: &mut TimerInfoDto) 
         .base
         .external_program_id
         .clone_from(&program.external_id);
+    // Upstream stores only the listing id and derives the item id from it on
+    // each read; the stored item id follows the row so it cannot go stale when
+    // that derivation changes (the `İ` fold, gl-266).
+    if let Ok(program_id) = Uuid::parse_str(&program.id) {
+        timer.base.program_id = Some(program_id.simple().to_string());
+    }
     timer.run_time_ticks =
         Some((timer.base.end_date - timer.base.start_date).num_milliseconds() * 10_000);
 }
@@ -13441,6 +13423,99 @@ mod tests {
         );
     }
 
+    /// A timer whose stored programme id no longer names a row (the id an
+    /// older fold of the listing id derived, gl-266) is found by its listing id
+    /// and takes the row's id, so the guide links it again. Upstream stores
+    /// only the listing id and derives the item id on read, so it never goes
+    /// stale there.
+    #[tokio::test]
+    async fn a_guide_refresh_relinks_a_timer_by_its_listing_id() {
+        let mgr = manager_with_series_guide().await;
+        let airing = refresh_test_airing(&mgr).await;
+        let future = Utc::now() + chrono::Duration::hours(3);
+        let (id, mut dto) = refresh_test_timer(
+            &airing,
+            "re-keyed",
+            RecordingStatus::New,
+            Some(Uuid::new_v4().simple().to_string()),
+            future,
+        );
+        dto.base.external_program_id.clone_from(&airing.external_id);
+        mgr.persist_timer(&dto).await.expect("seed timer");
+
+        mgr.refresh_guide().await.expect("refresh");
+
+        let row_id = Uuid::parse_str(&airing.id).expect("guid");
+        assert_eq!(
+            timers_by_id(&mgr).await[&id].base.program_id,
+            Some(row_id.simple().to_string())
+        );
+        let programs = mgr
+            .get_programs(&InternalItemsQuery::default(), &DtoOptions::default())
+            .await
+            .expect("programs")
+            .items;
+        let programme = programs.iter().find(|p| p.id == row_id).expect("airing");
+        assert_eq!(programme.timer_id.as_deref(), Some(id.as_str()));
+    }
+
+    /// A timer's `ProgramId` is derived from its listing id on each read
+    /// (`GetTimerInfoDto`), before any guide refresh relinks the stored one.
+    #[tokio::test]
+    async fn a_timer_serves_the_programme_id_its_listing_id_derives() {
+        let mgr = manager_with_series_guide().await;
+        let airing = refresh_test_airing(&mgr).await;
+        let future = Utc::now() + chrono::Duration::hours(3);
+        let (id, mut dto) = refresh_test_timer(
+            &airing,
+            "re-keyed",
+            RecordingStatus::New,
+            Some(Uuid::new_v4().simple().to_string()),
+            future,
+        );
+        dto.base.external_program_id.clone_from(&airing.external_id);
+        mgr.persist_timer(&dto).await.expect("seed timer");
+
+        let served = mgr
+            .get_timers_matching(&ferrofin_model::live_tv::TimerQuery::default())
+            .await
+            .expect("timers")
+            .into_iter()
+            .find(|t| t.base.id.as_deref() == Some(id.as_str()))
+            .expect("listed");
+        let row_id = Uuid::parse_str(&airing.id).expect("guid");
+        assert_eq!(served.base.program_id, Some(row_id.simple().to_string()));
+        assert!(served.program_info.is_some(), "the guide row is found");
+    }
+
+    /// A series timer's `ProgramId` is derived from its listing id on each
+    /// read (`GetSeriesTimerInfoDto`), so one stored under an older
+    /// derivation's id (gl-266) is served with the current one.
+    #[tokio::test]
+    async fn a_series_timer_serves_the_programme_id_its_listing_id_derives() {
+        let mgr = manager_with_series_guide().await;
+        let airing = refresh_test_airing(&mgr).await;
+        let id = mgr
+            .create_series_timer(defaults_for(&mgr, &airing).await)
+            .await
+            .expect("series timer");
+        let mut stored = mgr
+            .stored_series_timer(&id)
+            .await
+            .expect("read")
+            .expect("row");
+        stored.dto.base.program_id = Some(Uuid::new_v4().simple().to_string());
+        mgr.persist_series_timer(&stored).await.expect("store");
+
+        let served = all_series_timers(&mgr)
+            .await
+            .into_iter()
+            .find(|t| t.base.id.as_deref() == Some(id.as_str()))
+            .expect("listed");
+        let row_id = Uuid::parse_str(&airing.id).expect("guid");
+        assert_eq!(served.base.program_id, Some(row_id.simple().to_string()));
+    }
+
     /// `RefreshTimers` calls `_timerManager.Update` for every live timer, not
     /// only one the guide changed, so a timer whose arm was lost is armed again
     /// by the next guide refresh even when its programme is as it was.
@@ -17717,7 +17792,7 @@ mod tests {
 mod id_derivation_tests {
     use super::{
         LIVE_TV_INTERNAL_VERSION, LIVE_TV_SERVICE_NAME, internal_channel_id, internal_program_id,
-        new_item_id, to_lower_invariant,
+        new_item_id,
     };
     // The channel identity itself moved to the M3U tuner host with the rest of
     // that backend; these vectors pin it wherever it lives.
@@ -17792,39 +17867,91 @@ mod id_derivation_tests {
         );
     }
 
-    /// `ToLowerInvariant` is a simple, per-code-point fold. Rust's
-    /// `str::to_lowercase` is a full, context-sensitive one, and the two
-    /// disagree on exactly the inputs an XMLTV `channel` attribute can carry.
-    /// ASCII — every id this fixture produces — is identical either way, which
-    /// is why the pinned GUIDs above are unaffected and why nothing caught this.
+    /// An XMLTV channel id holding `İ` (U+0130), as a real Jellyfin 12.4
+    /// derived it: an M3U at `http://172.17.0.1:18555/channels.m3u` whose entry
+    /// streams `…/izmir.ts` with `tvg-id="İZMİR.tr"`, and an XMLTV guide whose
+    /// `İZMİR.tr` airings start at 08:00 and 09:00 UTC. The old fold (`İ` to
+    /// `i`) derived 84d7ebbc418ca6a73a741b9831759184 and
+    /// 4531772d4749686d95b84544ece75059.
     #[rstest::rstest]
-    // Final sigma: `str::to_lowercase` yields U+03C2, the simple mapping U+03C3.
-    #[case("\u{03A3}", "\u{03C3}")]
-    #[case("\u{039F}\u{0394}\u{039F}\u{03A3}", "\u{03BF}\u{03B4}\u{03BF}\u{03C3}")]
-    // A non-final sigma is unambiguous and both agree.
-    #[case("\u{03A3}A", "\u{03C3}a")]
-    // U+0130: the full mapping expands to two code points, the simple one does not.
-    #[case("\u{0130}", "i")]
-    // Turkish dotless i has no lowercase of its own; the invariant fold is identity.
-    #[case("\u{0131}", "\u{0131}")]
-    #[case("M3U_ABC", "m3u_abc")]
-    fn to_lower_invariant_is_the_simple_fold(#[case] input: &str, #[case] expected: &str) {
-        assert_eq!(to_lower_invariant(input), expected);
-        // The documented .NET guarantee: the fold never changes the code-point count.
+    #[case(
+        "2026-11-15T08:00:00.0000000+00:00",
+        "cd91c0d9a5782448ef5d760e21590af8"
+    )]
+    #[case(
+        "2026-11-15T09:00:00.0000000+00:00",
+        "603afaf7867503a89384d2abe748e531"
+    )]
+    fn dotted_capital_i_program_ids_match_jellyfin(
+        #[case] start: &str,
+        #[case] expected_guid: &str,
+    ) {
+        let channel_external = m3u_external_channel_id(
+            "http://172.17.0.1:18555/channels.m3u",
+            "http://172.17.0.1:18555/izmir.ts",
+        );
         assert_eq!(
-            to_lower_invariant(input).chars().count(),
-            input.chars().count()
+            internal_channel_id(&channel_external).simple().to_string(),
+            "73aea0de66a463690a9b2d18367cfce7"
+        );
+        let external = format!("\u{0130}ZM\u{0130}R.tr_{start}_{channel_external}");
+        assert_eq!(
+            internal_program_id(&external).simple().to_string(),
+            expected_guid
         );
     }
 
-    /// The negative control for the above: `str::to_lowercase` really does
-    /// derive a different programme GUID for a Greek channel id, so the helper
-    /// is load-bearing and not decoration.
+    /// `ToLowerInvariant` is .NET's simple, per-character invariant fold, not
+    /// Rust's full, context-sensitive `str::to_lowercase`; the two disagree on
+    /// exactly the inputs an XMLTV `channel` attribute (part of every XMLTV
+    /// programme id) can carry. The expected GUIDs are computed apart from this
+    /// code: MD5 over UTF-16LE in .NET `Guid` order, folded with the .NET 10
+    /// `ChangeCaseInvariant` table in `ferrofin-util`'s
+    /// `tests/data/dotnet-invariant-casing.tsv`; the same calculation gives the
+    /// Jellyfin-observed GUIDs pinned above.
+    #[rstest::rstest]
+    // `İ` (U+0130) stays `İ`: .NET special-cases it, where Unicode's simple
+    // lowercase is `i` (which derived 3938ea696b917ab7b52b467e7a2438e2 here).
+    #[case(
+        "\u{0130}ZM\u{0130}R.tr_2026-08-30T03:00:00.0000000+00:00_m3u_abc",
+        "995e221cf1d8d6eb6d9209e9dcf79eb5"
+    )]
+    // A final `Σ` folds to `σ`, never the `ς` of the full mapping.
+    #[case(
+        "\u{039F}\u{0394}\u{039F}\u{03A3}_2026-08-30T03:00:00.0000000+00:00_m3u_abc",
+        "8b12b5f618918db2fbaf9dc546af2ed2"
+    )]
+    // The dotless `ı` (U+0131) and the long `ſ` (U+017F) are lowercase already.
+    #[case("K\u{0131}z_m3u_abc", "084acbcd8a525b3ef55b8f2bbbe4de34")]
+    #[case("\u{017F}port_m3u_abc", "4349d6b95810bd5bdc6498420d48b895")]
+    // `ᾼ` (U+1FBC) folds to `ᾳ` (U+1FB3), one character for one.
+    #[case("\u{1FBC}_m3u_abc", "8777028513e38637660e66ce33968077")]
+    fn program_ids_fold_as_dotnet_to_lower_invariant(
+        #[case] external: &str,
+        #[case] expected_guid: &str,
+    ) {
+        assert_eq!(
+            internal_program_id(external).simple().to_string(),
+            expected_guid
+        );
+    }
+
+    /// Channel ids take the same fold: `İ` survives it.
+    #[test]
+    fn channel_ids_fold_as_dotnet_to_lower_invariant() {
+        assert_eq!(
+            internal_channel_id("hdhr_\u{0130}").simple().to_string(),
+            "175e795922731d45abd589f0ad4a31fa"
+        );
+    }
+
+    /// The negative control: `str::to_lowercase` really does derive a
+    /// different programme GUID for a Greek channel id, so the fold is
+    /// load-bearing and not decoration.
     #[test]
     fn a_final_sigma_channel_id_would_have_derived_a_different_guid() {
         let external = "\u{039F}\u{0394}\u{039F}\u{03A3}_2026-08-30T03:00:00.0000000+00:00_m3u_abc";
         let key = format!("{LIVE_TV_SERVICE_NAME}{external}{LIVE_TV_INTERNAL_VERSION}");
-        assert_ne!(to_lower_invariant(&key), key.to_lowercase());
         assert_ne!(
             internal_program_id(external),
             new_item_id(crate::projection::PROGRAM_TYPE_NAME, &key.to_lowercase()),
