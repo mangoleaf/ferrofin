@@ -592,7 +592,7 @@ impl FerrofinItemRepository {
 
     async fn sort_folder_children_inner(
         &self,
-        rows: Vec<BaseItemEntity>,
+        mut rows: Vec<BaseItemEntity>,
         filter: &InternalItemsQuery,
     ) -> Result<Vec<BaseItemEntity>, ServiceError> {
         use crate::tv_series_manager::aired_order;
@@ -600,14 +600,16 @@ impl FerrofinItemRepository {
         use ferrofin_model::entities_media::AiredEpisodeOrder;
         use ferrofin_model::live_tv::ItemSortBy;
         use ferrofin_util::stable_sort::stable_sort_by;
-        /// A child with the keys its sort compares, each computed once for
-        /// the row rather than on every comparison (gl-1002); a key the
-        /// request does not name stays `None` and is never compared.
+        /// A child's position with the keys its sort compares, each computed
+        /// once for the row rather than on every comparison (gl-1002); a key
+        /// the request does not name stays `None` and is never compared. The
+        /// row stays in `rows`: only the keys are sorted, then the rows are
+        /// moved into their order in place (gl-1493).
         struct Keyed {
             aired: Option<AiredEpisodeOrder>,
             name: Option<String>,
             sort_name: Option<String>,
-            row: BaseItemEntity,
+            index: usize,
         }
         if rows.is_empty() || filter.order_by.is_empty() {
             return Ok(rows);
@@ -630,17 +632,17 @@ impl FerrofinItemRepository {
             let by_sort_name = sorts_by(ItemSortBy::SortName);
             let episode = stored_type_name(BaseItemKind::Episode);
             let mut keyed: Vec<Keyed> = rows
-                .into_iter()
-                .map(|row| Keyed {
-                    aired: (aired && Some(row.type_.as_str()) == episode)
-                        .then(|| aired_order(&row)),
+                .iter()
+                .enumerate()
+                .map(|(index, row)| Keyed {
+                    aired: (aired && Some(row.type_.as_str()) == episode).then(|| aired_order(row)),
                     name: row
                         .name
                         .as_deref()
                         .filter(|_| by_name)
                         .map(folder_ordinal_key),
-                    sort_name: by_sort_name.then(|| folder_ordinal_key(&folder_sort_name(&row))),
-                    row,
+                    sort_name: by_sort_name.then(|| folder_ordinal_key(&folder_sort_name(row))),
+                    index,
                 })
                 .collect();
             let compare = |a: &Keyed, b: &Keyed| {
@@ -679,7 +681,19 @@ impl FerrofinItemRepository {
             } else {
                 keyed.sort_by(compare);
             }
-            return Ok(keyed.into_iter().map(|keyed| keyed.row).collect());
+            // `slice::sort_by_cached_key`'s permutation: position `i` takes the row
+            // that was at `keyed[i].index`, found by following where earlier swaps
+            // moved it. Writing the found position back is what lets a later
+            // position follow that row too.
+            for i in 0..keyed.len() {
+                let mut index = keyed[i].index;
+                while index < i {
+                    index = keyed[index].index;
+                }
+                keyed[i].index = index;
+                rows.swap(i, index);
+            }
+            return Ok(rows);
         }
         // Keep the existing consumer for other sort fields. Its broader
         // comparator parity is a separate query review, not this display flag.
