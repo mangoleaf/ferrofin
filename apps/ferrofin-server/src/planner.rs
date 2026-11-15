@@ -1953,7 +1953,8 @@ impl FerrofinStreamStatePlanner {
             }
         }
         // `GetInputModifier`: timestamp sync, then pacing, then the options
-        // the source drives (RTSP transport, `-fflags`, stream looping).
+        // the source drives (RTSP transport, `-fflags`, the input format,
+        // stream looping).
         args.extend(
             ferrofin_mediaencoding::transcoding::segment_cleaner::input_sync_arguments(
                 state,
@@ -1968,7 +1969,9 @@ impl FerrofinStreamStatePlanner {
             ),
         );
         args.extend(
-            ferrofin_mediaencoding::transcoding::segment_cleaner::input_source_arguments(state),
+            ferrofin_mediaencoding::transcoding::segment_cleaner::input_source_arguments(
+                state, options,
+            ),
         );
         if let Some(concat) = self.concat_input(&state.media_source) {
             // `GetInputArgument`'s disc-rip branch: the primary playlist's
@@ -8077,6 +8080,59 @@ mod tests {
             .unwrap();
         assert!(remux.is_remuxing_video);
         assert_eq!(noautoscale_position(&remux.arguments), None);
+    }
+
+    /// `GetInputModifier` names the media file's demuxer once any accelerator
+    /// is configured, whether the job decodes, encodes or copies on the card,
+    /// right ahead of its `-i`; a software server leaves it to the probe.
+    #[tokio::test]
+    async fn a_hardware_server_names_the_input_format() {
+        let sources = || {
+            vec![source(
+                "abc",
+                vec![nvdec_decodable_video_stream(), audio_stream("aac")],
+            )]
+        };
+        let ahead_of_the_input = |arguments: &[String]| {
+            let input = arguments.iter().position(|a| a == "-i").unwrap();
+            arguments[..input + 2].join(" ")
+        };
+        let mut transcode = request("abc");
+        transcode.video_codec = Some("h264".to_owned());
+        transcode.allow_video_stream_copy = false;
+        let hardware = nvenc_planner(sources())
+            .plan(&transcode, false, None, PlaylistKind::Vod)
+            .await
+            .unwrap();
+        assert!(
+            ahead_of_the_input(&hardware.arguments)
+                .ends_with(" -f matroska -i file:/media/movie.mkv"),
+            "{:?}",
+            hardware.arguments
+        );
+
+        let mut copy = request("abc");
+        copy.video_codec = Some("h264".to_owned());
+        let remux = nvenc_planner(sources())
+            .plan(&copy, false, None, PlaylistKind::Vod)
+            .await
+            .unwrap();
+        assert!(
+            ahead_of_the_input(&remux.arguments)
+                .ends_with(" -fflags +genpts -f matroska -i file:/media/movie.mkv"),
+            "{:?}",
+            remux.arguments
+        );
+
+        let software = planner(sources())
+            .plan(&transcode, false, None, PlaylistKind::Vod)
+            .await
+            .unwrap();
+        assert!(
+            !ahead_of_the_input(&software.arguments).contains("-f "),
+            "{:?}",
+            software.arguments
+        );
     }
 
     /// This machine's actual ffmpeg n9.0.1: the CUDA filters are present but
