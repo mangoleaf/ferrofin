@@ -14,7 +14,7 @@ use uuid::Uuid;
 use ferrofin_model::data::BaseItemKind;
 use ferrofin_model::media_segments::{MediaSegmentDto, MediaSegmentType};
 use ferrofin_providers::destination::{
-    DestinationRefused, PublicOnlyResolver, environment_proxy, is_private_address,
+    DestinationRefused, PublicOnlyResolver, VettedAddresses, environment_proxy, is_private_address,
 };
 use ferrofin_traits::library::LibraryManager;
 use ferrofin_traits::media_segments::MediaSegmentManager;
@@ -146,8 +146,8 @@ impl EgressPolicy {
 /// plugin and every call, so connections are pooled and no call spawns a
 /// client runtime of its own.
 ///
-/// Both clients refuse redirects (any destination policy would be bypassed
-/// by a 302; a guest can follow `Location` itself) and present the plugin
+/// Every client refuses redirects (any destination policy would be bypassed
+/// by a 302; a guest can follow `Location` itself) and presents the plugin
 /// user agent. They differ in how a hostname is resolved:
 /// - `open` resolves as the system does and honours an environment proxy.
 ///   It serves plugins the admin granted private-network access
@@ -162,8 +162,11 @@ impl EgressPolicy {
 ///
 /// A proxy resolves the destination itself, out of the resolver's sight. So
 /// when the environment configures one (`environment_proxy`), a hostname
-/// fetch under the policy is vetted before it is sent and goes through a
-/// one-off client pinned to the vetted address, as before this type existed.
+/// fetch under the policy is vetted before it is sent, and goes through a
+/// third client, `proxied`, whose resolver ([`VettedAddresses`], the image
+/// downloads' too) answers the name with every address just vetted for it:
+/// where a host the proxy settings exclude is reached. Any other name, the
+/// proxy's own, resolves as the system does.
 ///
 /// MUST be built on a blocking thread: `reqwest::blocking::Client`
 /// construction (and drop) panics inside an async runtime context.
@@ -171,11 +174,16 @@ impl EgressPolicy {
 pub struct GuestHttp {
     open: reqwest::blocking::Client,
     vetted: reqwest::blocking::Client,
-    environment_proxy: bool,
+    /// Built only when the environment configures a proxy.
+    proxied: Option<reqwest::blocking::Client>,
+    /// The proxied client's resolver.
+    pinned: Arc<VettedAddresses>,
+    /// The address test both the vetted resolver and the proxied path refuse on.
+    refused: fn(std::net::IpAddr) -> bool,
 }
 
 impl GuestHttp {
-    /// Builds the two clients, each bounded by `call_timeout` unless a
+    /// Builds the clients, each bounded by `call_timeout` unless a
     /// request sets its own.
     ///
     /// # Errors
@@ -189,9 +197,10 @@ impl GuestHttp {
         )
     }
 
-    /// [`new`](Self::new) with the address test the vetted client refuses
-    /// on and whether a proxy is configured, so a test can point the client
-    /// at a loopback server or take the proxied path.
+    /// [`new`](Self::new) with the address test the vetted client and the
+    /// proxied path's vet refuse on, and whether a proxy is configured, so a
+    /// test can point the clients at a loopback server or take the proxied
+    /// path.
     fn with_policy(
         call_timeout: std::time::Duration,
         refused: fn(std::net::IpAddr) -> bool,
@@ -212,6 +221,14 @@ impl GuestHttp {
                 .build()
                 .map_err(|e| format!("building the guest http client: {e}"))
         };
+        let pinned = Arc::new(VettedAddresses::default());
+        let proxied = if environment_proxy {
+            Some(build(
+                reqwest::blocking::Client::builder().dns_resolver(Arc::clone(&pinned)),
+            )?)
+        } else {
+            None
+        };
         Ok(Self {
             open: build(reqwest::blocking::Client::builder())?,
             vetted: build(
@@ -219,54 +236,36 @@ impl GuestHttp {
                     .no_proxy()
                     .dns_resolver(Arc::new(PublicOnlyResolver::new(Arc::new(refused)))),
             )?,
-            environment_proxy,
+            proxied,
+            pinned,
+            refused,
         })
     }
 }
 
 /// Enforces the private-destination policy for one hostname before a
 /// proxied request: every address the host resolves to must be public.
-/// Returns the vetted address for the caller to pin the connection to.
-fn check_destination(url: &reqwest::Url, plugin_name: &str) -> Result<std::net::IpAddr, String> {
+/// Returns them all for the caller to pin the connection to.
+fn check_destination(
+    url: &reqwest::Url,
+    plugin_name: &str,
+    refused: fn(std::net::IpAddr) -> bool,
+) -> Result<Vec<std::net::SocketAddr>, String> {
     let host = url.host_str().ok_or("url has no host")?;
     let port = url.port_or_known_default().unwrap_or(443);
     // shortcut: this lookup is bounded by the system resolver, not by the
     // guest call's deadline (http-fetch's request is); resolve under the
     // deadline if a slow resolver behind a proxy ever trips the watchdog.
-    let addrs: Vec<std::net::IpAddr> = std::net::ToSocketAddrs::to_socket_addrs(&(host, port))
+    let addrs: Vec<std::net::SocketAddr> = std::net::ToSocketAddrs::to_socket_addrs(&(host, port))
         .map_err(|e| format!("could not resolve `{host}`: {e}"))?
-        .map(|sa| sa.ip())
         .collect();
     if addrs.is_empty() {
         return Err(format!("`{host}` resolved to no addresses"));
     }
-    if let Some(private) = addrs.iter().find(|a| is_private_address(**a)) {
-        return Err(private_destination(host, *private, plugin_name));
+    if let Some(private) = addrs.iter().find(|a| refused(a.ip())) {
+        return Err(private_destination(host, private.ip(), plugin_name));
     }
-    Ok(addrs[0])
-}
-
-/// A one-off client whose connections to `host` go to `vetted`: the
-/// proxied path's DNS-rebinding pin, for hosts the proxy settings exclude.
-fn pinned_client(
-    call_timeout: std::time::Duration,
-    host: &str,
-    vetted: std::net::IpAddr,
-) -> Result<reqwest::blocking::Client, String> {
-    reqwest::blocking::Client::builder()
-        .timeout(call_timeout)
-        .redirect(reqwest::redirect::Policy::none())
-        .no_gzip()
-        .no_brotli()
-        .no_deflate()
-        .user_agent(format!(
-            "ferrofin-wasm/{}",
-            ferrofin_health::RELEASE_VERSION
-        ))
-        // Port 0 = "keep the URL's port"; only the address pins.
-        .resolve(host, std::net::SocketAddr::new(vetted, 0))
-        .build()
-        .map_err(|e| format!("building pinned http client: {e}"))
+    Ok(addrs)
 }
 
 /// The guest-visible refusal of a private destination: the address class
@@ -281,7 +280,13 @@ fn private_destination(host: &str, address: std::net::IpAddr, plugin_name: &str)
 
 /// The guest-visible text for a failed request: the resolver's refusal when
 /// the vetted client refused the destination, the transport error otherwise.
+/// A lookup that failed for a name other than the request's, which can only
+/// be the proxy's own, is the server's business: the transport error.
 fn request_failure(error: &reqwest::Error, plugin_name: &str) -> String {
+    let requested = error
+        .url()
+        .and_then(reqwest::Url::host_str)
+        .unwrap_or_default();
     let mut cause: Option<&(dyn std::error::Error + 'static)> = Some(error);
     while let Some(current) = cause {
         if let Some(refusal) = current.downcast_ref::<DestinationRefused>() {
@@ -289,7 +294,13 @@ fn request_failure(error: &reqwest::Error, plugin_name: &str) -> String {
                 DestinationRefused::Private { host, address } => {
                     private_destination(host, *address, plugin_name)
                 }
-                other => other.to_string(),
+                DestinationRefused::Unresolvable { host: name, .. }
+                | DestinationRefused::Empty { host: name }
+                    if name.eq_ignore_ascii_case(requested) =>
+                {
+                    refusal.to_string()
+                }
+                _ => break,
             };
         }
         cause = current.source();
@@ -354,15 +365,14 @@ pub fn http_fetch(
     {
         return Err(private_destination(host, literal, plugin_name));
     }
-    let pinned = if !private_http_allowed && literal.is_none() && http.environment_proxy {
-        let vetted = check_destination(&url, plugin_name)?;
-        Some(pinned_client(call_timeout, host, vetted)?)
-    } else {
-        None
-    };
-    let client = match &pinned {
-        Some(pinned) => pinned,
-        None if private_http_allowed || http.environment_proxy => &http.open,
+    let client = match &http.proxied {
+        Some(proxied) if !private_http_allowed && literal.is_none() => {
+            let vetted = check_destination(&url, plugin_name, http.refused)?;
+            http.pinned.pin(host, &vetted);
+            proxied
+        }
+        Some(_) => &http.open,
+        None if private_http_allowed => &http.open,
         None => &http.vetted,
     };
     let method: reqwest::Method = request
@@ -1601,6 +1611,84 @@ mod tests {
             accepted.load(Ordering::SeqCst),
             1,
             "the second fetch reuses the first one's connection"
+        );
+    }
+
+    /// With a proxy configured, hostname fetches under the policy go through
+    /// one client too, so the second reuses the first's connection instead of
+    /// building a client per call; each is still vetted first. (No proxy is set
+    /// in the test's environment, so the client reaches the host directly, at
+    /// the addresses vetted for it, as for a host the proxy settings exclude.)
+    #[test]
+    fn proxied_fetches_to_one_host_share_a_connection() {
+        let (port, accepted) = keep_alive_server();
+        let http =
+            GuestHttp::with_policy(Duration::from_secs(5), |_| false, true).expect("clients");
+        let egress = EgressPolicy::parse(&["localhost".to_owned()]);
+        for path in ["first", "second"] {
+            let response = http_fetch(
+                &http,
+                "test-plugin",
+                1024,
+                false,
+                &egress,
+                Duration::from_secs(5),
+                &get(format!("http://localhost:{port}/{path}")),
+            )
+            .expect("fetch");
+            assert_eq!(response.body, b"ok");
+        }
+        assert_eq!(
+            accepted.load(Ordering::SeqCst),
+            1,
+            "the second fetch reuses the first one's connection"
+        );
+        // It went to the addresses vetted for the name, pinned without a port.
+        let vetted = http.pinned.pinned("localhost").expect("a pin for the name");
+        assert!(
+            vetted
+                .iter()
+                .all(|address| address.ip().is_loopback() && address.port() == 0),
+            "{vetted:?}"
+        );
+    }
+
+    /// The proxied client resolves a name through the host's pins: here one
+    /// the system cannot resolve, at the pinned address and the URL's port.
+    #[test]
+    fn the_proxied_client_resolves_a_name_at_its_pinned_addresses() {
+        let (port, accepted) = keep_alive_server();
+        let http =
+            GuestHttp::with_policy(Duration::from_secs(5), |_| false, true).expect("clients");
+        http.pinned
+            .pin("pinned.invalid", &["127.0.0.1:9".parse().expect("address")]);
+        let proxied = http.proxied.as_ref().expect("a proxied client");
+        let response = proxied
+            .get(format!("http://pinned.invalid:{port}/x"))
+            .send()
+            .expect("sent to the pin");
+        assert_eq!(response.text().expect("body"), "ok");
+        assert_eq!(accepted.load(Ordering::SeqCst), 1);
+    }
+
+    /// A proxy whose own name does not resolve fails the request with the
+    /// transport error: the proxy's name, which the guest never chose, is not
+    /// told to it.
+    #[test]
+    fn a_proxy_that_does_not_resolve_is_not_named_to_the_guest() {
+        let client = reqwest::blocking::Client::builder()
+            .proxy(reqwest::Proxy::all("http://proxy.invalid:3128").expect("proxy"))
+            .dns_resolver(Arc::new(super::VettedAddresses::default()))
+            .build()
+            .expect("client");
+        let error = client
+            .get("http://example.test/")
+            .send()
+            .expect_err("the proxy does not resolve");
+        let text = super::request_failure(&error, "test-plugin");
+        assert!(
+            text.starts_with("request failed:") && !text.contains("proxy.invalid"),
+            "{text}"
         );
     }
 
