@@ -34,6 +34,7 @@ use ferrofin_model::data::BaseItemKind;
 use ferrofin_model::dto::ItemCounts;
 use ferrofin_model::entities::{ImageType, MediaStreamType, MetadataField};
 use ferrofin_model::querying::{QueryFiltersLegacy, QueryResult};
+use ferrofin_util::change_watch::Watch;
 use uuid::Uuid;
 
 use crate::error::ServiceError;
@@ -2919,6 +2920,28 @@ pub trait KeyframeRepository: Send + Sync {
 
     /// Deletes an item's keyframe data.
     async fn delete_keyframe_data(&self, item_id: Uuid) -> Result<(), ServiceError>;
+
+    /// Starts watching the item's keyframe data for
+    /// [`Self::delete_keyframe_data`], before an extraction runs, for
+    /// [`Self::save_extracted_keyframe_data`]. The default watches nothing; an
+    /// implementation whose deletion can land during an extraction overrides
+    /// both.
+    async fn watch_keyframe_data(&self, item_id: Uuid) -> Watch<Uuid> {
+        Watch::detached(item_id)
+    }
+
+    /// Saves an extraction's keyframes unless the item's keyframe data was
+    /// deleted since `watch` began: a changed file's prune, which the old
+    /// file's keyframes would undo. Whether they were saved. The default always
+    /// saves.
+    async fn save_extracted_keyframe_data(
+        &self,
+        watch: Watch<Uuid>,
+        data: &KeyframeDataEntity,
+    ) -> Result<bool, ServiceError> {
+        self.save_keyframe_data(*watch.key(), data).await?;
+        Ok(true)
+    }
 }
 
 fn _assert_object_safe_keyframe_repository(_: &dyn KeyframeRepository) {}

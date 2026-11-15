@@ -1080,14 +1080,20 @@ impl DetectSegmentsTask {
     /// Forgets what was detected in an item's old file, so the next pass
     /// analyses the new one: its detection caches, then its detected segments
     /// and its place in the analysed lists; segments a user entered stay.
-    /// Only a changed file's prune runs it (the provider's cleanup).
+    /// Only a changed file's prune runs it (the provider's cleanup), and a
+    /// season's analysis that was working on the item when it ran, once more
+    /// after storing its results ([`Self::forget_changed`]).
     async fn forget_item(&self, item_id: Uuid) -> Result<(), ServiceError> {
         // Caches first: if the store write then fails, the old analysis
         // stands whole, where the other order could analyse the new file
         // from the old one's prints. A file that cannot be removed is passed
         // over, as the erase route does.
-        let removed = self.erase_cache_files(Some(&[item_id]), None).await?;
-        self.actions.forget_items(&[item_id]).await?;
+        let forget = async {
+            let removed = self.erase_cache_files(Some(&[item_id]), None).await?;
+            self.actions.forget_items(&[item_id]).await?;
+            Ok::<_, ServiceError>(removed)
+        };
+        let removed = self.runtime.analyses.change(&item_id, forget).await?;
         tracing::debug!(%item_id, cache_files = removed, "intro skipper: a changed file's analysis forgotten");
         Ok(())
     }
@@ -3984,6 +3990,74 @@ mod tests {
         assert_eq!(intros_of(&h.segments, EP_A).await.len(), 1);
         scan.execute(&TaskProgress::default()).await.expect("third");
         assert_eq!(h.calls.load(Ordering::SeqCst), again, "and only once");
+    }
+
+    /// A fingerprinter whose first call notifies the first `Notify` and waits
+    /// for the second.
+    struct HoldFirst {
+        inner: Arc<dyn Fingerprinter>,
+        hold: std::sync::Mutex<Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>>,
+    }
+
+    #[async_trait]
+    impl Fingerprinter for HoldFirst {
+        async fn fingerprint(
+            &self,
+            path: &str,
+            start: f64,
+            end: f64,
+            options: ProcessOptions,
+        ) -> Result<Vec<u32>, String> {
+            let hold = self.hold.lock().expect("hold").take();
+            if let Some((entered, release)) = hold {
+                entered.notify_one();
+                release.notified().await;
+            }
+            self.inner.fingerprint(path, start, end, options).await
+        }
+    }
+
+    /// gl-1694: a changed file's prune while a pass analyses its season (from
+    /// the old file) is applied again once the pass has stored its results:
+    /// the episode leaves the analysed lists with its detected segments,
+    /// published ones and caches, so the next pass analyses the new file.
+    #[tokio::test]
+    async fn a_prune_during_the_analysis_is_applied_again_after_it() {
+        let h = harness(&TWO_EPISODES, true, "{}", true).await;
+        register_provider(&h);
+        let (entered, release) = (
+            Arc::new(tokio::sync::Notify::new()),
+            Arc::new(tokio::sync::Notify::new()),
+        );
+        let mut held = h.task.clone();
+        held.fingerprinter = Some(Arc::new(HoldFirst {
+            inner: held.fingerprinter.clone().expect("fingerprinter"),
+            hold: std::sync::Mutex::new(Some((Arc::clone(&entered), Arc::clone(&release)))),
+        }));
+        let pass = tokio::spawn(async move { held.execute(&TaskProgress::default()).await });
+        entered.notified().await;
+        h.segments.delete_segments(EP_A).await.expect("prune");
+        release.notify_one();
+        pass.await.unwrap().expect("pass");
+
+        let state = intro_state(&h).await;
+        assert!(!state.episode_ids.contains(&EP_A), "{state:?}");
+        assert!(state.episode_ids.contains(&EP_B), "{state:?}");
+        assert_eq!(h.actions.segments(EP_A).await.expect("A"), vec![]);
+        assert_eq!(intros_of(&h.segments, EP_A).await.len(), 0);
+        assert_eq!(cache_files(&h, EP_A), Vec::<String>::new());
+        assert_eq!(intros_of(&h.segments, EP_B).await.len(), 1);
+
+        let calls = h.calls.load(Ordering::SeqCst);
+        scan_task(&h)
+            .execute(&TaskProgress::default())
+            .await
+            .expect("next pass");
+        assert!(
+            h.calls.load(Ordering::SeqCst) > calls,
+            "the new file is fingerprinted"
+        );
+        assert_eq!(intros_of(&h.segments, EP_A).await.len(), 1);
     }
 
     /// `DetectSegmentsTask`'s identity (D6): upstream's key, name and

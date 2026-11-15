@@ -84,8 +84,10 @@ Conventions:
     again. Here the provider's cleanup deletes the item's detection caches and
     its detected segments, and drops it from every season's analysed lists,
     so the next pass analyses the new file. Segments a user entered stay
-    (owner decision 2026-11-14, gl-1696). Nothing else runs the cleanup, so an
-    unchanged file is not analysed again.
+    (owner decision 2026-11-14, gl-1696). An analysis of the episode's season
+    running at the time forgets it again once it has stored its results, or
+    the old file's analysis would stand (gl-1694). Nothing else runs the
+    cleanup, so an unchanged file is not analysed again.
   - **Failures:** a store write failure fails the season, retried next pass,
     in every analyzer (upstream's black-frame analyzers log it per episode and
     go on, the episode left analysed in memory); a failed keyframe

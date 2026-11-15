@@ -20,6 +20,7 @@ use ferrofin_model::entities_media::ChapterInfo;
 use ferrofin_model::intro_skipper::{AnalysisMode as Mode, AnalyzerAction};
 use ferrofin_traits::error::ServiceError;
 use ferrofin_traits::intro_skipper::{self as intro_store, SeasonState, StoredSegment};
+use ferrofin_util::change_watch::Watch;
 use futures_util::StreamExt as _;
 use uuid::Uuid;
 
@@ -544,13 +545,45 @@ impl DetectSegmentsTask {
         (progress, processed, total): (&TaskProgress, &AtomicUsize, usize),
     ) -> usize {
         let share = entries.len() * modes.len();
+        // Before the season's state is read: a changed file's prune while
+        // this runs is applied again after, or the old file's analysis this
+        // stores would stand for the new file (gl-1694).
+        let mut watches = Vec::with_capacity(entries.len());
+        for entry in &entries {
+            watches.push(self.runtime.analyses.watch(entry.episode_id).await);
+        }
         let analyzed = self
             .analyze_season_items(season_id, entries, config, modes)
             .await;
+        // shortcut: a pass dropped here (a stop it did not answer, shutdown)
+        // keeps what it stored after a prune; run this from a drop guard if
+        // that shows up.
+        self.forget_changed(watches).await;
         let done = processed.fetch_add(share, Ordering::Relaxed) + share;
         #[allow(clippy::cast_precision_loss)]
         progress.report(100.0 * done as f64 / total.max(1) as f64);
         analyzed
+    }
+
+    /// Forgets again each watched episode whose file changed while its season
+    /// was analysed ([`Self::forget_item`]), with the segments this pass
+    /// published for it: its prune came before what this pass stored.
+    async fn forget_changed(&self, watches: Vec<Watch<Uuid>>) {
+        for watch in watches {
+            if !self.runtime.analyses.changed(&watch).await {
+                continue;
+            }
+            let item_id = *watch.key();
+            drop(watch);
+            if let Err(err) = self.forget_item(item_id).await {
+                tracing::warn!(%err, %item_id, "intro skipper: could not forget a changed file's analysis");
+            }
+            if let Err(err) =
+                intro_store::remove_published(self.media_segments.as_ref(), item_id).await
+            {
+                tracing::warn!(%err, %item_id, "intro skipper: could not unpublish a changed file's segments");
+            }
+        }
     }
 
     async fn analyze_season_items(

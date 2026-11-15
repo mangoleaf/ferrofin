@@ -1722,7 +1722,8 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
                    Also the sets a changed video loses before its refresh: library_scan.rs \
                    scan_item and file_changed, item_data_cleanup.rs prune_extracted_data, \
                    external_data_manager.rs delete_external_item_data and \
-                   trickplay_manager.rs delete_trickplay_data, compared with \
+                   trickplay_manager.rs prune_trickplay_data and delete_trickplay_data, \
+                   compared with \
                    MediaBrowser.Providers/Manager/MetadataService.cs (BeforeSaveInternal), \
                    Emby.Server.Implementations/Library/ExternalDataManager.cs \
                    (DeleteExternalItemDataAsync) and TrickplayManager.cs \
@@ -1744,7 +1745,7 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
                    Emby.Server.Implementations/Dto/DtoService.cs (the Trickplay field), \
                    MediaBrowser.Controller/Entities/BaseItem.cs (GetMediaSources) and \
                    MediaBrowser.Controller/Entities/Video.cs (GetAllItemsForMediaSources)",
-        date: "2026-11-11",
+        date: "2026-11-14",
         divergences: &[
             "An explicit Replace does not delete the item's trickplay folder and rows first: \
              each selected width is generated in the work directory and swapped in, so the old \
@@ -1770,6 +1771,11 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
              removes nothing), so the next change still removes the \
              widths recorded before it. Upstream never replaces images unasked. Deliberate \
              divergence (owner decisions 2026-11-01, D3 and D5, gl-1138; gl-1178).",
+            "A refresh or move of an item that a changed video's prune lands in removes its \
+             trickplay folders and rows again once done; upstream's DeleteExternalItemDataAsync \
+             does nothing about one in flight, so a generation from the old file that is still \
+             running saves its set after the prune, and tiles it leaves without a row are \
+             imported by the next refresh. Jellyfin bug not ported (gl-1694).",
             "Importing a width's folder that has no row counts only its .jpg tiles; upstream \
              counts every file in it, so a stray file there makes the import fail on its image \
              size. Jellyfin bug not ported.",
