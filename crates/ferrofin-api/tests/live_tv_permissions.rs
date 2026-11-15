@@ -99,7 +99,7 @@ impl LiveTvManager for CountingLiveTv {
         _provider_id: &str,
         _tuner_channel_id: &str,
         _provider_channel_id: &str,
-    ) -> Result<ferrofin_model::live_tv::TunerChannelMapping, ServiceError> {
+    ) -> Result<Option<ferrofin_model::live_tv::TunerChannelMapping>, ServiceError> {
         unimplemented!("not probed by the gate tests")
     }
     async fn discover_tuners(
