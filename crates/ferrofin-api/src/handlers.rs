@@ -2188,9 +2188,12 @@ macro_rules! similar_items_path {
          MusicAlbum-, MusicArtist- and AudioSimilarItemsProvider (AudioBook through Audio) \
          and LiveTvProgramSimilarItemsProvider by IsMovie and IsSeries; local_similar's score \
          pass, similar_items_repository.rs weighted_similar_items (genre 10, tag and studio 5, \
-         director 50, actor and guest star 15, the seed's people distinct) and its one filter \
-         query (Movie, plus Trailer and LiveTvProgram under \
-         EnableExternalContentInSuggestions; IsMovie; IsPlayed = false; the user's access); \
+         director 50, actor and guest star 15, the seed's people distinct), its one filter \
+         query, score_filter_query (Movie, plus Trailer and LiveTvProgram under \
+         EnableExternalContentInSuggestions; IsMovie; IsPlayed = false; the user's access; \
+         TranslateQuery without ApplyGroupingFilter, so never grouped by presentation key), \
+         and phase 3, best_scoring_per_key (by score, the primary first on a tie, then \
+         DistinctBy the raw PresentationUniqueKey, every keyless row one key); \
          flat_similar for the other kinds (the seed's Genres and Tags, both required when both \
          are set, Random order, ExcludeArtistIds for the music kinds, and for a movie-like \
          programme EnableGroupByMetadataKey, so item_repository.rs grouped_by_metadata_key \
@@ -2211,7 +2214,6 @@ macro_rules! similar_items_path {
 const SIMILAR_ITEMS_DIVERGENCES: &[&str] = &[
     SIMILAR_SCORE_WINDOW_DIVERGENCE,
     SIMILAR_ALTERNATE_VERSIONS_DIVERGENCE,
-    SIMILAR_SCORE_GROUPING_DIVERGENCE,
     "The reference-cache read swallows an I/O error silently and warns on an empty entry or \
      one whose References is null, where upstream warns on an IOException and treats both \
      as a silent miss. Fix path: gl-1652.",
@@ -2255,14 +2257,6 @@ const SIMILAR_ALTERNATE_VERSIONS_DIVERGENCE: &str = "The score pass scores an al
      version whose primary is in the same library, which upstream's hiddenVersionIds leaves \
      out (12.1), so such versions take places in the limit * 3 window before the filter \
      query drops them. Fix path: gl-392.";
-
-/// How the score pass's filter query picks each presentation key's row.
-const SIMILAR_SCORE_GROUPING_DIVERGENCE: &str = "With a user, the score pass's filter query \
-     groups its rows by presentation key, so each key keeps its primary or lowest-Id row and \
-     all keyless guide programmes collapse into the lowest-Id one among them; upstream's \
-     provider filters through TranslateQuery alone and keeps each key's best-scoring row, \
-     the primary on a tie, keyless programmes folding into their best-scoring one. Fix path: \
-     gl-1800.";
 
 /// **The API-parity record.** One row per contract operation whose Ferrofin
 /// implementation has been compared against the upstream Jellyfin C#
@@ -2414,7 +2408,6 @@ pub const VERIFIED: &[Verified] = &[
         divergences: &[
             SIMILAR_SCORE_WINDOW_DIVERGENCE,
             SIMILAR_ALTERNATE_VERSIONS_DIVERGENCE,
-            SIMILAR_SCORE_GROUPING_DIVERGENCE,
             "Each baseline is scored and access-filtered on its own and fills its category \
          from its own limit * 3 window; upstream's IBatchLocalSimilarItemsProvider scores \
          every baseline of a stream in one pass, filters the union of their windows once and \

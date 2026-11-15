@@ -17,6 +17,15 @@ use ferrofin_traits::error::ServiceError;
 use crate::db_error::db_err;
 use crate::user_entity_ext::{cached_guid_preference, cached_permission};
 
+/// A score-pass row: the candidate and its weighted-overlap score.
+#[derive(sqlx::FromRow)]
+struct ScoredRow {
+    #[sqlx(flatten)]
+    item: BaseItemEntity,
+    #[sqlx(rename = "_Score")]
+    score: i64,
+}
+
 /// Raw-SQL data access for similar items and movie recommendations.
 #[derive(Clone)]
 pub(crate) struct SimilarItemsRepository {
@@ -31,9 +40,9 @@ impl SimilarItemsRepository {
 
     /// Weighted-overlap similar items to `seed_id`, restricted to the stored
     /// `candidate_types` and excluding the seed + `exclude_ids`, ranked by score,
-    /// ties by item `Id`. This is phase 1 of the local provider — the score
-    /// pass; the manager runs the per-kind access/played filter over the ids
-    /// it returns.
+    /// ties by item `Id`, each with its score. This is phase 1 of the local
+    /// provider — the score pass; the manager runs the per-kind access/played
+    /// filter over the ids it returns, and phase 3 re-reads the scores.
     ///
     /// Ports `MovieSimilarItemsProvider`'s per-dimension weights: each shared
     /// genre +10, tag +5, studio +5 (`ItemValues` type 2/3/4); each shared
@@ -54,14 +63,14 @@ impl SimilarItemsRepository {
         candidate_types: &[&str],
         exclude_ids: &[Uuid],
         limit: i32,
-    ) -> Result<Vec<BaseItemEntity>, ServiceError> {
+    ) -> Result<Vec<(BaseItemEntity, i64)>, ServiceError> {
         if candidate_types.is_empty() {
             return Ok(Vec::new());
         }
         let seed = guid_to_db(seed_id);
         let exclude_ids = ferrofin_db::padded_in_list(exclude_ids);
         let sql = weighted_similar_sql(candidate_types.len(), exclude_ids.len());
-        let mut query = sqlx::query_as::<_, BaseItemEntity>(sqlx::AssertSqlSafe(sql)).bind(&seed);
+        let mut query = sqlx::query_as::<_, ScoredRow>(sqlx::AssertSqlSafe(sql)).bind(&seed);
         for type_name in candidate_types {
             query = query.bind((*type_name).to_owned());
         }
@@ -69,7 +78,8 @@ impl SimilarItemsRepository {
             query = query.bind(guid_to_db(*id));
         }
         query = query.bind(i64::from(limit.max(0)));
-        query.fetch_all(self.db.pool()).await.map_err(db_err)
+        let rows = query.fetch_all(self.db.pool()).await.map_err(db_err)?;
+        Ok(rows.into_iter().map(|row| (row.item, row.score)).collect())
     }
 
     /// One item's provider ids, keyed by provider name.
@@ -298,7 +308,7 @@ fn weighted_similar_sql(type_count: usize, exclude_count: usize) -> String {
     // and builds an automatic index over `s` — `detail:similar` went from
     // 4.9 ms to 7.8 ms p50 on the bench corpus before the pin.
     let mut sql = String::from(
-        r#"SELECT bi.* FROM (
+        r#"SELECT bi.*, s.score AS "_Score" FROM (
                SELECT scored."cand" AS id, SUM(scored."w") AS score FROM (
                    SELECT ivm2."ItemId" AS "cand",
                           CASE iv0."Type" WHEN 2 THEN 10 WHEN 3 THEN 5 WHEN 4 THEN 5 ELSE 0 END AS "w"
@@ -365,6 +375,17 @@ pub(crate) mod test_hooks {
             .execute(db.writer())
             .await
             .expect("drop PeopleBaseItemMap");
+    }
+
+    /// Clears `id`'s `PresentationUniqueKey`, the keyless shape v12.4 writes
+    /// for a guide programme and an adopted row can carry. The writer always
+    /// fills the key in, so a test needs the raw update.
+    pub(crate) async fn clear_presentation_key(db: &Database, id: uuid::Uuid) {
+        sqlx::query(r#"UPDATE "BaseItems" SET "PresentationUniqueKey" = NULL WHERE "Id" = ?1"#)
+            .bind(ferrofin_db::store::guid_to_db(id))
+            .execute(db.writer())
+            .await
+            .expect("clear presentation key");
     }
 }
 
