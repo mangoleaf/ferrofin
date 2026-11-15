@@ -2218,7 +2218,8 @@ pub async fn build_app_state(
             metadata_root.clone(),
         )
         .with_virtual_folders(Arc::clone(&virtual_folders))
-        .with_self_writes(Arc::clone(&self_writes_guard)),
+        .with_self_writes(Arc::clone(&self_writes_guard))
+        .with_activity(Arc::clone(&activity)),
     );
     let subtitle_downloader = Arc::new(
         ferrofin_core::subtitle_downloader::SubtitleDownloader::new(
