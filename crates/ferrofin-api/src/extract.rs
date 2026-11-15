@@ -213,7 +213,7 @@ impl ProblemDetails {
         )
     }
 
-    /// The rejection for an absent, blank or `null` body.
+    /// The rejection for an absent, empty or `null` body.
     #[must_use]
     fn empty_body() -> Self {
         Self::validation("", NON_EMPTY_REQUIRED)
@@ -369,15 +369,17 @@ impl TopLevel {
 }
 
 /// Parses `bytes` into a [`Doc`], or `None` when the body says "nothing was
-/// supplied" — blank, or the literal `null`.
+/// supplied" — empty, or the literal `null`.
 ///
 /// Measured against 10.11.8: an optional body (`[FromBody] X? dto`) binds all
 /// three of an absent body, an empty body and `null` to null and serves the
 /// request 200; a REQUIRED one answers all three
 /// "A non-empty request body is required.". So the two cases differ only in
-/// what they do with this `None`.
+/// what they do with this `None`. A blank body is not empty: the formatter
+/// reads it and System.Text.Json refuses it, keyed `$`, on either kind
+/// (measured on Jellyfin 12.4.0).
 fn parse_doc(bytes: &[u8]) -> Result<Option<Doc>, ProblemDetails> {
-    if bytes.iter().all(u8::is_ascii_whitespace) {
+    if bytes.is_empty() {
         return Ok(None);
     }
     let doc: Doc = serde_json::from_slice(bytes)
@@ -423,7 +425,7 @@ fn bind<T: DeserializeOwned>(bytes: &[u8], want: TopLevel) -> Result<T, ProblemD
 /// number spelling. Named-configuration handlers bind its raw text separately
 /// with JsonDefaults options after resolving the configuration's type.
 fn bind_document<T: DeserializeOwned>(bytes: &[u8]) -> Result<T, ProblemDetails> {
-    if bytes.iter().all(u8::is_ascii_whitespace) {
+    if bytes.is_empty() {
         return Err(ProblemDetails::empty_body());
     }
     let raw: &serde_json::value::RawValue = serde_json::from_slice(bytes)
@@ -548,6 +550,11 @@ where
     /// is what axum's `Option<Json<T>>` did with a missing content type only,
     /// while a malformed one became a 422; neither matched.
     ///
+    /// A blank body is present too. Measured on Jellyfin 12.4.0, `"   "` is a
+    /// 400 keyed `$` with a JSON content type (`PlaybackInfo`,
+    /// `POST /Playlists`, `POST /Library/VirtualFolders`), and a 415 with
+    /// `text/plain` (`POST /Playlists`).
+    ///
     /// "A member the DTO cannot take" is the extractor's half of the rule and
     /// is only as strict as the DTO: this binder refuses what `T`'s
     /// `Deserialize` refuses, so a field whose own deserializer is lenient
@@ -563,7 +570,7 @@ where
         let name =
             |problem: ProblemDetails| problem.naming(body_parameter(&method, route.as_ref()));
         let (json_content_type, bytes) = read_optional(req, state).await.map_err(name)?;
-        if bytes.iter().all(u8::is_ascii_whitespace) {
+        if bytes.is_empty() {
             return Ok(None);
         }
         if !json_content_type {
@@ -910,9 +917,9 @@ mod tests {
 
     #[test]
     fn an_optional_body_is_absent_for_nothing_and_still_strict_for_something() {
-        // Measured on Jellyfin 10.11.8, POST /Items/{id}/PlaybackInfo: all three
-        // of these are served 200 with a null DTO.
-        for body in [b"".as_slice(), b"   ", b"null"] {
+        // Measured on Jellyfin 10.11.8, POST /Items/{id}/PlaybackInfo: both of
+        // these are served 200 with a null DTO.
+        for body in [b"".as_slice(), b"null"] {
             assert!(
                 parse_doc(body).expect("not a syntax error").is_none(),
                 "an optional body treats {body:?} as absent"
@@ -925,13 +932,33 @@ mod tests {
 
     #[test]
     fn an_empty_or_null_body_is_the_non_empty_complaint() {
-        for body in [b"".as_slice(), b"   ", b"null"] {
+        for body in [b"".as_slice(), b"null"] {
             let rejected = bind::<Dto>(body, TopLevel::Object).expect_err("rejected");
             assert_eq!(rejected.status, 400);
             assert_eq!(
                 rejected.errors.as_ref().and_then(|e| e.get("")),
                 Some(&vec![NON_EMPTY_REQUIRED.to_owned()])
             );
+        }
+    }
+
+    /// A blank body is read, and has no JSON token: System.Text.Json's
+    /// syntax error, keyed `$`, on a required and an optional body alike
+    /// (measured on Jellyfin 12.4.0).
+    #[test]
+    fn a_blank_body_is_a_syntax_error_not_an_absent_body() {
+        for body in [b"   ".as_slice(), b"\n", b"\t \r\n"] {
+            for rejected in [
+                parse_doc(body).expect_err("blank is no JSON"),
+                bind::<Dto>(body, TopLevel::Object).expect_err("blank is no JSON"),
+                bind_document::<serde_json::Value>(body).expect_err("blank is no JSON"),
+            ] {
+                assert!(
+                    rejected.errors.as_ref().is_some_and(|e| e.keys().eq(["$"])),
+                    "{body:?}: {:?}",
+                    rejected.errors
+                );
+            }
         }
     }
 

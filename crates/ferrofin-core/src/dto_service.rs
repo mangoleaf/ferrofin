@@ -7923,20 +7923,6 @@ mod tests {
                 ..ferrofin_model::dto::ItemCounts::default()
             })
         }
-        async fn get_played_count(
-            &self,
-            _filter: &ferrofin_traits::options::InternalItemsQuery,
-            _ancestor_id: Uuid,
-        ) -> Result<i32, ServiceError> {
-            Ok(0)
-        }
-        async fn get_total_count(
-            &self,
-            _filter: &ferrofin_traits::options::InternalItemsQuery,
-            _ancestor_id: Uuid,
-        ) -> Result<i32, ServiceError> {
-            Ok(0)
-        }
         async fn get_played_and_total_count(
             &self,
             _filter: &ferrofin_traits::options::InternalItemsQuery,

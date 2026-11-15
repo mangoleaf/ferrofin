@@ -23,8 +23,9 @@
 //! The rest of `Fetch` belongs to the library scan (`ferrofin-core`), which owns
 //! the item rows: the repository writes, the external streams, and the
 //! container tags and people (`FetchEmbeddedInfo` / `FetchPeople`, applied
-//! before the metadata providers merge). Probing a Blu-ray/DVD folder rip's
-//! `.vob`/`.m2ts` titles is an open work item (gl-87).
+//! before the metadata providers merge). The encoder probes a DVD folder rip
+//! through its title's `.vob` files; a Blu-ray folder rip's probe is an open
+//! work item (gl-1834).
 
 use ferrofin_model::dto::MediaSourceInfo;
 use ferrofin_model::entities::{IsoType, MediaStreamType, Video3DFormat, VideoType};

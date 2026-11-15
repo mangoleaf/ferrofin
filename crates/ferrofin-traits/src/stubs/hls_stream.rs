@@ -69,6 +69,7 @@ impl HlsStreamManager for DisabledHlsStreamManager {
         &self,
         _file_name: &str,
         _require_m3u8: bool,
+        _playlist_id: Option<&str>,
     ) -> Result<ServedFile, ServiceError> {
         Err(Self::unavailable())
     }

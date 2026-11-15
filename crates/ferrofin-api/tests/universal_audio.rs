@@ -80,6 +80,7 @@ impl HlsStreamManager for FakeHls {
         &self,
         _file_name: &str,
         _require_m3u8: bool,
+        _playlist_id: Option<&str>,
     ) -> Result<ServedFile, ServiceError> {
         unimplemented!("unused")
     }

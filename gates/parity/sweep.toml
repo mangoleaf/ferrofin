@@ -371,14 +371,17 @@ oracle_trap = "a plugin's route: the oracle runs with its plugins disabled"
 oracle_trap = "Jellyfin 12 removed it; the 10.11.8 contract still has it"
 [op.GetCriticReviews]
 oracle_trap = "Jellyfin 12 removed it; the 10.11.8 contract still has it"
+
+# The legacy HLS routes: Jellyfin 12 still serves them (HlsSegmentController, only hidden from its OpenAPI). The
+# transcode folder holds no file these name (a transcode's files are named by a hex hash), so each answers 404.
 [op.GetHlsAudioSegmentLegacyAac]
-oracle_trap = "Jellyfin 12 removed the legacy HLS routes; the 10.11.8 contract still has them"
+expect_status = 404   # no transcode file 0.aac
 [op.GetHlsAudioSegmentLegacyMp3]
-oracle_trap = "Jellyfin 12 removed the legacy HLS routes; the 10.11.8 contract still has them"
+expect_status = 404   # no transcode file 0.mp3
 [op.GetHlsVideoSegmentLegacy]
-oracle_trap = "Jellyfin 12 removed the legacy HLS routes; the 10.11.8 contract still has them"
+expect_status = 404   # no transcode file of the playlist "main": "Hls segment not found."
 [op.GetHlsPlaylistLegacy]
-oracle_trap = "Jellyfin 12 removed the legacy HLS routes; the 10.11.8 contract still has them"
+expect_status = 404   # no transcode file main.m3u8
 
 # Where the oracle itself fails on this corpus or without a network: its 5xx (or stall) is no difference.
 [op.HeadAudioStream]

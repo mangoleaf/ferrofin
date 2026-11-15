@@ -526,6 +526,8 @@ pub async fn open_database(config: &Config) -> anyhow::Result<Database> {
     let db = Database::connect_tuned(&url, config.db_pool, config.db_statement_cache)
         .await
         .with_context(|| format!("failed to open database `{url}`"))?;
+    // Also writes the `{Type}-{Name}` key onto every keyless by-name row
+    // (`ferrofin_db::presentation_key::backfill_by_name_presentation_keys`).
     db.run_migrations()
         .await
         .context("failed to apply database migrations")?;
@@ -558,22 +560,6 @@ pub async fn open_database(config: &Config) -> anyhow::Result<Database> {
         .context("failed to backfill missing sort names")?;
     if repaired > 0 {
         tracing::info!(items = repaired, "backfilled missing sort names");
-    }
-    // Same shape, different column: a by-name row inserted before the write
-    // path derived `PresentationUniqueKey` still carries NULL, and
-    // `GetItemValues` GROUPs on that column — SQLite folds every NULL into one
-    // group, so a set of unkeyed genres/studios/artists collapses to a single
-    // representative and the tab silently loses names. The by-name inserts are
-    // `INSERT ... WHERE NOT EXISTS`, so fixing the insert alone repairs nothing
-    // that already exists.
-    let keyed = ferrofin_core::item_persistence_service::backfill_missing_presentation_keys(&db)
-        .await
-        .context("failed to backfill missing by-name presentation keys")?;
-    if keyed > 0 {
-        tracing::info!(
-            items = keyed,
-            "backfilled missing by-name presentation keys"
-        );
     }
     tracing::info!(database = %config.database_path().display(), "database ready");
     spawn_pool_sampler(&db);

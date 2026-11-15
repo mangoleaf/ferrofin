@@ -2,8 +2,9 @@
 //! `LibraryManager.DeleteItem` does for the children `Folder.ValidateChildren`
 //! drops: the metadata folders, then the extracted data (trickplay tiles in
 //! both locations, chapter images, subtitle and attachment caches), then the
-//! rows. And the boot sweeps once what earlier versions left behind
-//! (`CleanupOrphanedExternalData`).
+//! rows. The rows the boot repairs delete take theirs too
+//! (`DeleteItemsUnsafeFast`), and the boot sweeps once what earlier versions
+//! left behind (`CleanupOrphanedExternalData`).
 //!
 //! Boots the real composition root ([`ferrofin_server::state::build_app_state`])
 //! over a temp data dir:
@@ -46,11 +47,6 @@ struct Harness {
 impl Harness {
     fn path(&self, relative: &str) -> PathBuf {
         self.temp.path().join(relative)
-    }
-
-    /// The server's data directory (`{program data}/data`).
-    fn data(&self) -> PathBuf {
-        self.path("data/data")
     }
 
     /// The internal metadata directory (`{program data}/metadata`).
@@ -105,21 +101,25 @@ async fn boot(plant: impl FnOnce(&Path)) -> Harness {
         .await
         .expect("open db");
     db.run_migrations().await.expect("migrations");
-    let ffmpeg = ferrofin_server::bootstrap::FfmpegPaths {
-        encoder_app_path_display: None,
-        ffmpeg: PathBuf::from("ffmpeg"),
-        ffprobe: PathBuf::from("ffprobe"),
-        capabilities: ferrofin_mediaencoding::FfmpegCapabilities::default(),
-        chromaprint_muxer: false,
-    };
     let (shutdown_tx, _shutdown_rx) = tokio::sync::oneshot::channel();
-    let wired = build_app_state(&db, &config, &ffmpeg, None, shutdown_tx)
+    let wired = build_app_state(&db, &config, &no_ffmpeg(), None, shutdown_tx)
         .await
         .expect("wire app state");
     ferrofin_server::seed::seed_default_admin(wired.state.users.as_ref(), &config)
         .await
         .expect("seed admin");
     Harness { wired, temp }
+}
+
+/// Encoder paths for a boot that never runs one.
+fn no_ffmpeg() -> ferrofin_server::bootstrap::FfmpegPaths {
+    ferrofin_server::bootstrap::FfmpegPaths {
+        encoder_app_path_display: None,
+        ffmpeg: PathBuf::from("ffmpeg"),
+        ffprobe: PathBuf::from("ffprobe"),
+        capabilities: ferrofin_mediaencoding::FfmpegCapabilities::default(),
+        chromaprint_muxer: false,
+    }
 }
 
 /// Sends one request as `token` and returns status + body.
@@ -235,17 +235,19 @@ async fn scan(harness: &Harness) {
 /// Every folder an item's data lives in, each given a file: its art
 /// folder, its internal metadata folder with chapter images, its trickplay
 /// tiles in both locations, and its subtitle and attachment caches.
-fn plant_item_data(h: &Harness, id: Uuid, media: &str) -> Vec<PathBuf> {
+/// `root` is the temp dir a server boots over ([`Harness::path`]).
+fn plant_item_data(root: &Path, id: Uuid, media: &str) -> Vec<PathBuf> {
     let (hyphenated, dashless) = (id.hyphenated().to_string(), id.simple().to_string());
-    let media = h.path(media);
+    let (metadata, data) = (root.join("data/metadata"), root.join("data/data"));
+    let media = root.join(media);
     let beside = media.with_extension("trickplay");
     let folders = vec![
-        h.metadata().join("library").join(hyphenated.to_uppercase()),
-        indexed(&h.metadata().join("library"), &dashless).join("chapters"),
-        indexed(&h.data().join("trickplay"), &hyphenated),
+        metadata.join("library").join(hyphenated.to_uppercase()),
+        indexed(&metadata.join("library"), &dashless).join("chapters"),
+        indexed(&data.join("trickplay"), &hyphenated),
         beside,
-        indexed(&h.data().join("subtitles"), &hyphenated),
-        indexed(&h.data().join("attachments"), &hyphenated),
+        indexed(&data.join("subtitles"), &hyphenated),
+        indexed(&data.join("attachments"), &hyphenated),
     ];
     for folder in &folders {
         touch(&folder.join("file"));
@@ -323,13 +325,13 @@ async fn scan_removals_delete_the_items_extracted_data_and_metadata_folders() {
         *ids.get(&h.path(relative).to_string_lossy().into_owned())
             .unwrap_or_else(|| panic!("{relative} scanned: {ids:?}"))
     };
-    let kilo = plant_item_data(&h, id("movies/Kilo.mkv"), "movies/Kilo.mkv");
-    let lima = plant_item_data(&h, id("movies/Lima.mkv"), "movies/Lima.mkv");
-    let mut mike = plant_item_data(&h, id("movies/Mike.mkv"), "movies/Mike.mkv");
+    let kilo = plant_item_data(h.temp.path(), id("movies/Kilo.mkv"), "movies/Kilo.mkv");
+    let lima = plant_item_data(h.temp.path(), id("movies/Lima.mkv"), "movies/Lima.mkv");
+    let mut mike = plant_item_data(h.temp.path(), id("movies/Mike.mkv"), "movies/Mike.mkv");
     let november_path = "movies/November (2003)/November (2003).mkv";
-    let november = plant_item_data(&h, id(november_path), november_path);
+    let november = plant_item_data(h.temp.path(), id(november_path), november_path);
     let episode_path = "shows/Show/Season 1/Show S01E01.mkv";
-    let episode = plant_item_data(&h, id(episode_path), episode_path);
+    let episode = plant_item_data(h.temp.path(), id(episode_path), episode_path);
     let (status, genres) = call(&router, "GET", "/Genres?recursive=true", &admin).await;
     assert_eq!(status, StatusCode::OK, "{genres}");
     let genre = genres["Items"]
@@ -399,6 +401,94 @@ async fn scan_removals_delete_the_items_extracted_data_and_metadata_folders() {
     }
     assert!(h.path(episode_path).exists(), "the media itself stays");
     for folder in &lima {
+        assert!(folder.exists(), "{} kept", folder.display());
+    }
+}
+
+/// The boot repairs that delete rows while the database opens, an extra
+/// whose owner is gone (`CleanupOrphanedExtras`) and the older of two rows
+/// at one path (`FixIncorrectOwnerIdRelationships`), take the rows' folders
+/// once the server is wired, as upstream's `DeleteItemsUnsafeFast` does
+/// (gl-420). The trickplay folder beside the duplicate's media is the
+/// keeper's and stays, as do every folder of the keeper and of a live movie.
+#[tokio::test]
+async fn boot_repairs_delete_the_folders_of_the_rows_they_delete() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let root = temp.path();
+    for d in ["config", "data", "cache"] {
+        std::fs::create_dir_all(root.join(d)).expect("dir");
+    }
+    let config = Config::test_stub(root);
+    let (extra, live, keeper, dup) = (
+        Uuid::new_v4(),
+        Uuid::new_v4(),
+        Uuid::new_v4(),
+        Uuid::new_v4(),
+    );
+    let movie = "MediaBrowser.Controller.Entities.Movies.Movie";
+    let trailer = "MediaBrowser.Controller.Entities.Trailer";
+    let placeholder = Some("00000000-0000-0000-0000-000000000001");
+    let (older, newer) = ("2026-01-01 00:00:00", "2026-02-01 00:00:00");
+    // The extra's owner is gone (0032 re-pointed it at the placeholder); of
+    // the two rows at one path, the newer is the keeper.
+    let rows = [
+        (extra, trailer, "media/film/Trailer.mkv", placeholder, older),
+        (live, movie, "media/film/Film.mkv", None, older),
+        (keeper, movie, "media/dup/Dup.mkv", None, newer),
+        (dup, movie, "media/dup/Dup.mkv", None, older),
+    ];
+    {
+        let db = Database::connect(&config.database_url())
+            .await
+            .expect("open db");
+        db.run_migrations().await.expect("migrations");
+        for (id, kind, media, owner, created) in rows {
+            touch(&root.join(media));
+            sqlx::query(
+                r#"INSERT INTO "BaseItems"
+                   ("Id", "Type", "IsFolder", "IsInMixedFolder", "IsLocked", "IsMovie",
+                    "IsRepeat", "IsSeries", "IsVirtualItem", "Path", "OwnerId", "DateCreated")
+                   VALUES (?1, ?2, 0, 0, 0, 0, 0, 0, 0, ?3, ?4, ?5)"#,
+            )
+            .bind(ferrofin_db::store::guid_to_db(id))
+            .bind(kind)
+            .bind(root.join(media).to_string_lossy().into_owned())
+            .bind(owner)
+            .bind(created)
+            .execute(db.writer())
+            .await
+            .expect("seed row");
+        }
+        // The orphan sweep has run, as on any install past 1.5.0: what goes
+        // is the repairs' doing.
+        db.meta_set("orphaned_external_data_cleaned_v150", "1")
+            .await
+            .expect("mark swept");
+    }
+    let [extra_data, live_data, keeper_data, dup_data] =
+        rows.map(|(id, _, media, ..)| plant_item_data(root, id, media));
+
+    let db = ferrofin_server::bootstrap::open_database(&config)
+        .await
+        .expect("open and repair");
+    let (shutdown_tx, _shutdown_rx) = tokio::sync::oneshot::channel();
+    let _wired = build_app_state(&db, &config, &no_ffmpeg(), None, shutdown_tx)
+        .await
+        .expect("wire app state");
+
+    for folder in &extra_data {
+        assert!(!folder.exists(), "{} goes with the extra", folder.display());
+    }
+    let shared = root.join("media/dup/Dup.trickplay");
+    for folder in &dup_data {
+        assert_eq!(
+            folder.exists(),
+            *folder == shared,
+            "{}: only the keeper's trickplay folder stays",
+            folder.display()
+        );
+    }
+    for folder in live_data.iter().chain(&keeper_data) {
         assert!(folder.exists(), "{} kept", folder.display());
     }
 }
