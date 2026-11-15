@@ -39,7 +39,7 @@ const ITEM_ID: Uuid = Uuid::from_u128(0x00B1_0001);
 struct Recorded {
     last: Mutex<Option<HlsStreamRequest>>,
     stopped: Mutex<Vec<(Option<String>, Option<String>)>>,
-    resolved: Mutex<Vec<(String, bool)>>,
+    resolved: Mutex<Vec<(String, bool, Option<String>)>>,
     stream_bytes: std::sync::atomic::AtomicUsize,
     stream_completed: std::sync::atomic::AtomicUsize,
 }
@@ -145,12 +145,13 @@ impl HlsStreamManager for FakeHls {
         &self,
         file_name: &str,
         require_m3u8: bool,
+        playlist_id: Option<&str>,
     ) -> Result<ServedFile, ServiceError> {
-        self.rec
-            .resolved
-            .lock()
-            .unwrap()
-            .push((file_name.to_owned(), require_m3u8));
+        self.rec.resolved.lock().unwrap().push((
+            file_name.to_owned(),
+            require_m3u8,
+            playlist_id.map(ToOwned::to_owned),
+        ));
         self.served(if require_m3u8 {
             "application/vnd.apple.mpegurl"
         } else {
@@ -1250,6 +1251,214 @@ async fn bad_segment_id_is_400() {
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 }
 
+/// What ASP.NET's model state files against a parameter.
+#[derive(Debug, Clone, Copy)]
+enum Complaint {
+    /// The value fails `EncodingHelper.ContainerValidationRegexStr`.
+    Container,
+    /// The value fails `EncodingHelper.LevelValidationRegexStr`.
+    Level,
+    /// A `[Required]` value is blank.
+    Required,
+}
+
+impl Complaint {
+    /// The complaint, verbatim from Jellyfin 12.4.
+    fn message(self, name: &str) -> String {
+        match self {
+            Self::Container => format!(
+                r"The field {name} must match the regular expression '^[a-zA-Z0-9\-\._,|]{{0,40}}$'."
+            ),
+            Self::Level => format!(
+                r"The field {name} must match the regular expression '-?[0-9]+(?:\.[0-9]+)?'."
+            ),
+            Self::Required => format!("The {name} field is required."),
+        }
+    }
+}
+
+/// A router over a present item whose HLS seam records into `rec`.
+fn pattern_router(rec: &Arc<Recorded>) -> axum::Router {
+    router_with(
+        ok_hls("/nope", Arc::clone(rec)),
+        Arc::new(FakeAttachments {
+            mime: None,
+            data: vec![],
+        }),
+        Arc::new(ItemLibrary { present: true }),
+    )
+}
+
+/// The segment query every `hls1` request needs (`[Required]` upstream).
+const TICKS: &str = "runtimeTicks=1&actualSegmentLengthTicks=1";
+
+/// `DynamicHlsController` binds `segmentContainer`, `audioCodec`,
+/// `videoCodec` and `subtitleCodec` (and `container` on `live.m3u8` and the
+/// `hls1` routes' `{container}`) with `ContainerValidationRegexStr`, and
+/// `level` with `LevelValidationRegexStr`: a value failing its pattern is
+/// the model-state `400` naming every failing parameter, before the item is
+/// looked up or a playlist or segment is made. Each body is the one stock
+/// Jellyfin 12.4 answered, `traceId` aside.
+#[rstest]
+#[case::master_line_break(
+    "/Videos/{id}/master.m3u8?mediaSourceId=src&segmentContainer=ts%0A",
+    &[("segmentContainer", Complaint::Container)]
+)]
+#[case::master_any_key_case(
+    "/Videos/{id}/master.m3u8?mediaSourceId=src&SegmentContainer=%20mp4",
+    &[("segmentContainer", Complaint::Container)]
+)]
+#[case::master_every_codec(
+    "/Videos/{id}/master.m3u8?mediaSourceId=src&audioCodec=a%24b&videoCodec=b%24c&subtitleCodec=c%24d",
+    &[("audioCodec", Complaint::Container), ("videoCodec", Complaint::Container), ("subtitleCodec", Complaint::Container)]
+)]
+#[case::master_forty_one_characters(
+    "/Videos/{id}/master.m3u8?mediaSourceId=src&segmentContainer=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    &[("segmentContainer", Complaint::Container)]
+)]
+#[case::master_first_value_binds(
+    "/Videos/{id}/master.m3u8?mediaSourceId=src&segmentContainer=a%24b&segmentContainer=ts",
+    &[("segmentContainer", Complaint::Container)]
+)]
+#[case::master_level(
+    "/Videos/{id}/master.m3u8?mediaSourceId=src&level=1e1",
+    &[("level", Complaint::Level)]
+)]
+#[case::variant(
+    "/Videos/{id}/main.m3u8?segmentContainer=a%24b",
+    &[("segmentContainer", Complaint::Container)]
+)]
+#[case::live_container(
+    "/Videos/{id}/live.m3u8?container=a%24b",
+    &[("container", Complaint::Container)]
+)]
+#[case::live_several(
+    "/Videos/{id}/live.m3u8?segmentContainer=a%24b&videoCodec=x%24y&level=abc",
+    &[("segmentContainer", Complaint::Container), ("videoCodec", Complaint::Container), ("level", Complaint::Level)]
+)]
+#[case::audio_master(
+    "/Audio/{id}/master.m3u8?mediaSourceId=src&segmentContainer=a%24b",
+    &[("segmentContainer", Complaint::Container)]
+)]
+#[case::audio_variant(
+    "/Audio/{id}/main.m3u8?audioCodec=a%24b",
+    &[("audioCodec", Complaint::Container)]
+)]
+#[case::video_segment_query(
+    "/Videos/{id}/hls1/main/0.ts?{ticks}&segmentContainer=a%24b",
+    &[("segmentContainer", Complaint::Container)]
+)]
+#[case::video_segment_route(
+    "/Videos/{id}/hls1/main/0.a%24b?{ticks}",
+    &[("container", Complaint::Container)]
+)]
+#[case::video_segment_route_and_query(
+    "/Videos/{id}/hls1/main/0.a%24b?{ticks}&segmentContainer=c%24d",
+    &[("container", Complaint::Container), ("segmentContainer", Complaint::Container)]
+)]
+#[case::video_segment_blank_route(
+    "/Videos/{id}/hls1/main/0.%20?{ticks}",
+    &[("container", Complaint::Required)]
+)]
+#[case::video_segment_blank_route_and_query(
+    "/Videos/{id}/hls1/main/0.%20?{ticks}&segmentContainer=a%24b",
+    &[("container", Complaint::Required), ("segmentContainer", Complaint::Container)]
+)]
+#[case::audio_segment(
+    "/Audio/{id}/hls1/main/0.aac?{ticks}&subtitleCodec=a%24b&level=4.1.2",
+    &[("subtitleCodec", Complaint::Container), ("level", Complaint::Level)]
+)]
+#[tokio::test]
+async fn hls_routes_refuse_a_value_failing_its_pattern(
+    #[case] uri: &str,
+    #[case] failures: &[(&str, Complaint)],
+) {
+    let uri = uri
+        .replace("{id}", &ITEM_ID.to_string())
+        .replace("{ticks}", TICKS);
+    let rec = Arc::new(Recorded::default());
+    let response = pattern_router(&rec)
+        .oneshot(authed("GET", &uri))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{uri}");
+    let errors: serde_json::Map<String, serde_json::Value> = failures
+        .iter()
+        .map(|(name, complaint)| {
+            (
+                (*name).to_owned(),
+                serde_json::json!([complaint.message(name)]),
+            )
+        })
+        .collect();
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&body_string(response).await).unwrap(),
+        serde_json::json!({
+            "type": "https://tools.ietf.org/html/rfc9110#section-15.5.1",
+            "title": "One or more validation errors occurred.",
+            "status": 400,
+            "errors": errors,
+        }),
+        "{uri}"
+    );
+    assert!(rec.last.lock().unwrap().is_none(), "{uri} reached the seam");
+}
+
+/// What the pattern leaves alone, as Jellyfin 12.4 did: a `container` query on
+/// the routes that declare no such parameter, a blank value (the binder's
+/// `null`), a later repeat of a key, and values inside both patterns, on a
+/// stream route too.
+#[rstest]
+#[case::master_container("/Videos/{id}/master.m3u8?mediaSourceId=src&container=a%24b")]
+#[case::variant_container("/Videos/{id}/main.m3u8?container=a%24b")]
+#[case::audio_master_container("/Audio/{id}/master.m3u8?mediaSourceId=src&container=a%24b")]
+#[case::segment_container_query("/Videos/{id}/hls1/main/0.ts?{ticks}&container=a%24b")]
+#[case::blank("/Videos/{id}/master.m3u8?mediaSourceId=src&segmentContainer=%20")]
+#[case::later_repeat(
+    "/Videos/{id}/master.m3u8?mediaSourceId=src&segmentContainer=ts&segmentContainer=a%24b"
+)]
+#[case::forty_characters(
+    "/Videos/{id}/master.m3u8?mediaSourceId=src&segmentContainer=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+)]
+#[case::levels("/Videos/{id}/live.m3u8?level=4.1&videoCodec=h264,hevc&audioCodec=aac|mp3")]
+#[case::negative_level("/Audio/{id}/main.m3u8?level=-41&segmentContainer=mp4")]
+#[case::stream_level("/Videos/{id}/stream?level=41&videoCodec=h264,hevc&container=mkv")]
+#[tokio::test]
+async fn hls_routes_pass_values_the_pattern_allows(#[case] uri: &str) {
+    let uri = uri
+        .replace("{id}", &ITEM_ID.to_string())
+        .replace("{ticks}", TICKS);
+    let rec = Arc::new(Recorded::default());
+    let response = pattern_router(&rec)
+        .oneshot(authed("GET", &uri))
+        .await
+        .unwrap();
+    assert_ne!(response.status(), StatusCode::BAD_REQUEST, "{uri}");
+    assert!(
+        rec.last.lock().unwrap().is_some(),
+        "{uri} never reached the seam"
+    );
+}
+
+/// A `HEAD` of the master playlist is refused the same way, and an
+/// unauthenticated request still gets its `401` first.
+#[tokio::test]
+async fn hls_pattern_failures_follow_authorization() {
+    let uri = format!("/Videos/{ITEM_ID}/master.m3u8?mediaSourceId=src&segmentContainer=a%24b");
+    let rec = Arc::new(Recorded::default());
+    let head = pattern_router(&rec)
+        .oneshot(authed("HEAD", &uri))
+        .await
+        .unwrap();
+    assert_eq!(head.status(), StatusCode::BAD_REQUEST);
+    let anonymous = router_denying_auth(ok_hls("/nope", Arc::clone(&rec)))
+        .oneshot(Request::builder().uri(&uri).body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(anonymous.status(), StatusCode::UNAUTHORIZED);
+    assert!(rec.last.lock().unwrap().is_none());
+}
+
 #[tokio::test]
 async fn legacy_video_segment_and_playlist_and_audio() {
     let tmp = TempFile::new();
@@ -1301,10 +1510,138 @@ async fn legacy_video_segment_and_playlist_and_audio() {
     assert_eq!(resp.status(), StatusCode::OK);
 
     let resolved = rec.resolved.lock().unwrap();
-    // The video segment reconstructs `<segmentId><ext>`; the playlist requires m3u8.
-    assert!(resolved.iter().any(|(n, m)| n == "9.ts" && !m));
-    assert!(resolved.iter().any(|(n, m)| n == "pl7.m3u8" && *m));
-    assert!(resolved.iter().any(|(n, m)| n == "seg2.mp3" && !m));
+    // The video segment reconstructs `<segmentId><ext>` and names its
+    // playlist; the playlist requires m3u8.
+    assert_eq!(
+        resolved.as_slice(),
+        [
+            ("9.ts".to_owned(), false, Some("pl7".to_owned())),
+            ("pl7.m3u8".to_owned(), true, None),
+            ("seg2.mp3".to_owned(), false, None),
+        ]
+    );
+}
+
+/// The legacy routes build the file name from the whole route value and the
+/// path's extension (`string.Concat(segmentId, Path.GetExtension(Request.Path))`),
+/// so a dotted id keeps its dots; the video segment splits
+/// `{segmentId}.{segmentContainer}` at its last `.` and names its playlist. An
+/// encoded slash stays `%2F`, as Kestrel leaves it, so the name stays one file
+/// of the transcode folder.
+#[rstest]
+#[case::video_segment("/Videos/{id}/hls/pl.7/a.b.ts", "a.b.ts", false, Some("pl.7"))]
+#[case::playlist("/Videos/{id}/hls/x.y/stream.m3u8", "x.y.m3u8", true, None)]
+#[case::audio_mp3("/Audio/{id}/hls/s.2/stream.mp3", "s.2.mp3", false, None)]
+#[case::audio_aac("/Audio/{id}/hls/s.2/stream.aac", "s.2.aac", false, None)]
+#[case::video_slash(
+    "/Videos/{id}/hls/a%2Fb/..%2F..%2Fx.ts",
+    "..%2F..%2Fx.ts",
+    false,
+    Some("a%2Fb")
+)]
+#[case::playlist_slash("/Videos/{id}/hls/..%2Fx/stream.m3u8", "..%2Fx.m3u8", true, None)]
+#[case::audio_slash("/Audio/{id}/hls/..%2Fx/stream.mp3", "..%2Fx.mp3", false, None)]
+#[tokio::test]
+async fn legacy_routes_bind_the_whole_route_value(
+    #[case] template: &str,
+    #[case] file_name: &str,
+    #[case] require_m3u8: bool,
+    #[case] playlist_id: Option<&str>,
+) {
+    let tmp = TempFile::new();
+    let rec = Arc::new(Recorded::default());
+    let router = router_with(
+        ok_hls(&tmp.path, rec.clone()),
+        Arc::new(FakeAttachments {
+            mime: None,
+            data: vec![],
+        }),
+        Arc::new(ItemLibrary { present: true }),
+    );
+    let uri = template.replace("{id}", &ITEM_ID.to_string());
+    let resp = router.oneshot(authed("GET", &uri)).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "{uri}");
+    assert_eq!(
+        rec.resolved.lock().unwrap().as_slice(),
+        [(
+            file_name.to_owned(),
+            require_m3u8,
+            playlist_id.map(ToOwned::to_owned)
+        )],
+        "{uri}"
+    );
+}
+
+/// `{segmentId}.{segmentContainer}` is an ASP.NET complex segment: a last
+/// path segment without a `.`, or with nothing on one side of its last `.`,
+/// matches no route upstream, an empty 404, and looks nothing up. Route
+/// matching comes first, so a blank `{itemId}` or `{playlistId}` beside it is
+/// no 400.
+#[rstest]
+#[case::no_dot("{id}/hls/pl7/9")]
+#[case::no_segment_id("{id}/hls/pl7/.ts")]
+#[case::no_container("{id}/hls/pl7/9.")]
+#[case::blank_item_id("%20/hls/pl7/9")]
+#[case::blank_playlist_id("{id}/hls/%20/9")]
+#[tokio::test]
+async fn legacy_video_segment_without_a_container_is_no_route(#[case] tail: &str) {
+    let tmp = TempFile::new();
+    let rec = Arc::new(Recorded::default());
+    let router = router_with(
+        ok_hls(&tmp.path, rec.clone()),
+        Arc::new(FakeAttachments {
+            mime: None,
+            data: vec![],
+        }),
+        Arc::new(ItemLibrary { present: true }),
+    );
+    let uri = format!("/Videos/{}", tail.replace("{id}", &ITEM_ID.to_string()));
+    let resp = router.oneshot(authed("GET", &uri)).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND, "{uri}");
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    assert!(body.is_empty(), "{uri}: {body:?}");
+    assert!(rec.resolved.lock().unwrap().is_empty(), "{uri}");
+}
+
+/// The served file's observer is the keep-alive `GetFileResult` ends in
+/// `Response.OnCompleted`: the legacy routes release it when the body is read
+/// to its end, and when the response is dropped unread (a client that hangs
+/// up), never before.
+#[rstest]
+#[case::video_segment("/Videos/{id}/hls/pl7/9.ts")]
+#[case::playlist("/Videos/{id}/hls/pl7/stream.m3u8")]
+#[case::audio_mp3("/Audio/{id}/hls/seg2/stream.mp3")]
+#[tokio::test]
+async fn legacy_serves_release_the_keep_alive_with_the_body(#[case] template: &str) {
+    use std::sync::atomic::Ordering::SeqCst;
+    let tmp = TempFile::new();
+    let rec = Arc::new(Recorded::default());
+    let uri = template.replace("{id}", &ITEM_ID.to_string());
+    for read in [true, false] {
+        let router = router_with(
+            ok_hls(&tmp.path, rec.clone()),
+            Arc::new(FakeAttachments {
+                mime: None,
+                data: vec![],
+            }),
+            Arc::new(ItemLibrary { present: true }),
+        );
+        let completed = rec.stream_completed.load(SeqCst);
+        let resp = router.oneshot(authed("GET", &uri)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "{uri}");
+        assert_eq!(rec.stream_completed.load(SeqCst), completed, "{uri}");
+        if read {
+            let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            assert_eq!(body.as_ref(), b"SEGMENT-BYTES", "{uri}");
+        } else {
+            drop(resp);
+        }
+        assert_eq!(rec.stream_completed.load(SeqCst), completed + 1, "{uri}");
+    }
 }
 
 /// The legacy `HlsSegmentController` actions bind `{itemId}` as a
@@ -1797,6 +2134,74 @@ async fn invalid_subtitle_codecs_are_rejected_before_dispatch() {
         let response = app.clone().oneshot(authed("HEAD", &path)).await.unwrap();
         assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{path}");
     }
+    assert!(rec.last.lock().unwrap().is_none());
+}
+
+/// The stream routes bind the same parameters with the same patterns
+/// (`VideosController.GetVideoStream[ByContainer]`,
+/// `AudioController.GetAudioStream[ByContainer]`), `container` being the
+/// query's or the `stream.{container}` route's: the model-state `400` names
+/// every failing one before the item is looked up, whatever the caller, as
+/// stock Jellyfin 12.4 answered.
+#[rstest]
+#[case::level_and_codec(
+    "GET",
+    "/Videos/{id}/stream?level=abc&videoCodec=a%24b",
+    &[("level", Complaint::Level), ("videoCodec", Complaint::Container)]
+)]
+#[case::segment_container("GET", "/Videos/{id}/stream.mkv?segmentContainer=a%24b", &[("segmentContainer", Complaint::Container)])]
+#[case::static_container("GET", "/Videos/{id}/stream?static=true&container=a%24b", &[("container", Complaint::Container)])]
+#[case::route_container("GET", "/Videos/{id}/stream.a%24b", &[("container", Complaint::Container)])]
+#[case::audio_codec("GET", "/Audio/{id}/stream?audioCodec=a%24b&container=ts", &[("audioCodec", Complaint::Container)])]
+#[case::audio_subtitle_head("HEAD", "/Audio/{id}/stream.mp3?subtitleCodec=a%24b", &[("subtitleCodec", Complaint::Container)])]
+#[tokio::test]
+async fn stream_routes_refuse_a_value_failing_its_pattern(
+    #[case] method: &str,
+    #[case] uri: &str,
+    #[case] failures: &[(&str, Complaint)],
+) {
+    let uri = uri.replace("{id}", &ITEM_ID.to_string());
+    let rec = Arc::new(Recorded::default());
+    let app = router_no_static(ok_hls("/unused", Arc::clone(&rec)));
+    let response = app.oneshot(authed(method, &uri)).await.unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{uri}");
+    if method == "GET" {
+        let errors: serde_json::Map<String, serde_json::Value> = failures
+            .iter()
+            .map(|(name, complaint)| {
+                (
+                    (*name).to_owned(),
+                    serde_json::json!([complaint.message(name)]),
+                )
+            })
+            .collect();
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&body_string(response).await).unwrap(),
+            serde_json::json!({
+                "type": "https://tools.ietf.org/html/rfc9110#section-15.5.1",
+                "title": "One or more validation errors occurred.",
+                "status": 400,
+                "errors": errors,
+            }),
+            "{uri}"
+        );
+    }
+    assert!(rec.last.lock().unwrap().is_none(), "{uri} reached the seam");
+}
+
+/// The stream actions are anonymous upstream, and an anonymous request with a
+/// value outside the pattern gets the same `400`.
+#[tokio::test]
+async fn an_anonymous_stream_request_gets_the_pattern_400() {
+    let rec = Arc::new(Recorded::default());
+    let app = router_no_static_with_auth(ok_hls("/unused", Arc::clone(&rec)), Arc::new(DenyAuth));
+    let request = Request::builder()
+        .uri(format!("/Videos/{ITEM_ID}/stream?container=a%24b"))
+        .body(Body::empty())
+        .unwrap();
+    let response = app.oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert!(body_string(response).await.contains(r#""container":["#));
     assert!(rec.last.lock().unwrap().is_none());
 }
 

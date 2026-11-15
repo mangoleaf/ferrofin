@@ -8,6 +8,8 @@
 //! - [`extensions`] — string helpers (`MediaBrowser.Common.Extensions`).
 //! - [`configuration`] — config-store value types + factory/validation traits
 //!   (`MediaBrowser.Common.Configuration`).
+//! - [`config_import`] — the one-way import of a Jellyfin `config/*.xml`
+//!   document (or a plugin's XML configuration) into Ferrofin's JSON.
 //! - [`cryptography`] — password-hash parse/format + a real PBKDF2 provider
 //!   (PBKDF2-HMAC-SHA512/SHA1, matching Jellyfin's `Rfc2898DeriveBytes.Pbkdf2`
 //!   so existing Jellyfin hashes verify) (`MediaBrowser.Model.Cryptography` +
@@ -17,6 +19,7 @@
 //! Runtime machinery (DI app-host, plugin loader, host networking, ASP.NET
 //! glue) is intentionally *not* ported — see the port charter.
 
+pub mod config_import;
 pub mod configuration;
 pub mod cryptography;
 pub mod error;

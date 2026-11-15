@@ -39,10 +39,6 @@ use crate::probing::localization::{
 };
 use crate::probing::probe_result_normalizer::ProbeResultNormalizer;
 
-/// The number of 100-nanosecond ticks in one second (`TimeSpan.TicksPerSecond`).
-#[cfg(test)]
-const TICKS_PER_SECOND: i64 = 10_000_000;
-
 /// `MediaEncoder.DefaultSdrImageExtractionTimeout`: how long one frame
 /// extraction may run when `ImageExtractionTimeoutMs` is unset (0 or less).
 const DEFAULT_SDR_IMAGE_EXTRACTION_TIMEOUT: std::time::Duration =
@@ -1172,10 +1168,9 @@ mod tests {
     use ferrofin_model::entities::VideoType;
     use ferrofin_model::media_info::{MediaProtocol, TransportStreamTimestamp};
     use ferrofin_traits::media_encoding::{MediaEncoder, MediaInfoRequest};
+    use ferrofin_util::ticks::TICKS_PER_SECOND;
 
-    use super::{
-        ExtractionSettings, MediaEncoderConfig, MediaEncoderImpl, TICKS_PER_SECOND, probe_threads,
-    };
+    use super::{ExtractionSettings, MediaEncoderConfig, MediaEncoderImpl, probe_threads};
     use crate::encoder::Transcoder;
     use crate::encoding_helper::hw::FfmpegCapabilities;
     use async_trait::async_trait;

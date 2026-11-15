@@ -172,11 +172,7 @@ impl LibraryScanner {
             }
             // The key its episodes carry, as the episode list reads it: its
             // own, else its id.
-            let key = series_row
-                .presentation_unique_key
-                .clone()
-                .filter(|k| !k.is_empty())
-                .unwrap_or_else(|| series_row.id.clone());
+            let key = ferrofin_db::entities::base_items::presentation_key(&series_row).to_owned();
             // One series failing leaves the others to go on, as a failed
             // series refresh does upstream; the next scan retries it.
             match self

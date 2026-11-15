@@ -20,14 +20,17 @@ use std::time::Duration;
 use crate::rate_limit::RateLimiter;
 use serde::Deserialize;
 
-/// The default MusicBrainz web-service base.
-pub const DEFAULT_BASE_URL: &str = "https://musicbrainz.org";
+/// The default MusicBrainz web-service base (`PluginConfiguration.DefaultServer`).
+pub const DEFAULT_BASE_URL: &str = crate::plugin_config::MUSICBRAINZ_DEFAULT_SERVER;
+
 /// The minimum interval between requests to the official server (MB policy),
-/// and the `RateLimit` default the settings page ships
+/// which is the `RateLimit` default the settings page ships
 /// (`PluginConfiguration.DefaultRateLimit`). The plugin's setter refuses to go
 /// below it while musicbrainz.org itself is selected — see
 /// [`MusicBrainzConfig::normalized`](crate::plugin_config::MusicBrainzConfig::normalized).
-const MIN_INTERVAL: Duration = Duration::from_secs(1);
+fn min_interval() -> Duration {
+    Duration::from_secs_f64(crate::plugin_config::MUSICBRAINZ_DEFAULT_RATE_LIMIT)
+}
 
 /// A resolved album identity: the release id and/or its release-group id.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -505,16 +508,16 @@ impl MusicBrainzClient {
     ///
     /// A negative or non-finite value (only reachable by hand-editing
     /// `config.json` — the settings page writes a number input) would panic
-    /// `Duration::from_secs_f64`, so it falls back to [`MIN_INTERVAL`], the
+    /// `Duration::from_secs_f64`, so it falls back to [`min_interval`], the
     /// published MusicBrainz policy floor. Falling back to *zero* there would
     /// turn a typo into an unthrottled crawl of a public service.
     fn interval(rate_limit: f64) -> Duration {
         if rate_limit > 0.0 {
             Duration::try_from_secs_f64(rate_limit)
-                .unwrap_or(MIN_INTERVAL)
+                .unwrap_or_else(|_| min_interval())
                 .min(Duration::from_secs(u64::from(u32::MAX)))
         } else {
-            MIN_INTERVAL
+            min_interval()
         }
     }
 
@@ -525,7 +528,7 @@ impl MusicBrainzClient {
                 .is_some_and(|host| host == "musicbrainz.org" || host.ends_with(".musicbrainz.org"))
         });
         if official {
-            interval.max(MIN_INTERVAL)
+            interval.max(min_interval())
         } else {
             interval
         }
@@ -1007,14 +1010,19 @@ mod tests {
 
     #[test]
     fn official_host_interval_floor() {
-        assert_eq!(MusicBrainzClient::interval(f64::MAX), MIN_INTERVAL);
-        assert_eq!(MusicBrainzClient::interval(f64::NAN), MIN_INTERVAL);
+        // musicbrainz.org's published limit: one request per second.
+        assert_eq!(min_interval(), Duration::from_secs(1));
+        assert_eq!(MusicBrainzClient::interval(f64::MAX), min_interval());
+        assert_eq!(MusicBrainzClient::interval(f64::NAN), min_interval());
         for url in [
             "https://musicbrainz.org",
             "http://MUSICBRAINZ.ORG:80/",
             "https://www.musicbrainz.org",
         ] {
-            assert_eq!(MusicBrainzClient::request_interval(url, 0.01), MIN_INTERVAL);
+            assert_eq!(
+                MusicBrainzClient::request_interval(url, 0.01),
+                min_interval()
+            );
         }
         assert_eq!(
             MusicBrainzClient::request_interval("http://localhost", 0.1),

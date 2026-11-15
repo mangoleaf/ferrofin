@@ -19,7 +19,7 @@ use super::{ArchiveFormat, MAX_ARCHIVE_ENTRY_BYTES, extension_of, open_comic};
 /// counted. Upstream gives it to an EPUB, whose readers report progress as a
 /// fraction of one second; Ferrofin gives it to a few more formats
 /// ([`book_run_time_ticks`]).
-pub const NOMINAL_BOOK_RUN_TIME_TICKS: i64 = 10_000_000;
+pub const NOMINAL_BOOK_RUN_TIME_TICKS: i64 = ferrofin_util::ticks::TICKS_PER_SECOND;
 
 /// One page's runtime ticks: jellyfin-web's comic and PDF readers report the
 /// page as `currentTime()`, and its playback manager sends

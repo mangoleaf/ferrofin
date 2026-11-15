@@ -13,12 +13,7 @@
 
 use ferrofin_model::entities_media::ChapterInfo;
 use ferrofin_traits::error::ServiceError;
-
-/// Ticks per second (100 ns units), matching .NET `TimeSpan.TicksPerSecond`.
-///
-/// Port of the implicit `TimeSpan.FromSeconds` conversion the C# uses when it
-/// turns `DummyChapterDuration` (seconds) into ticks.
-const TICKS_PER_SECOND: i64 = 10_000_000;
+use ferrofin_util::ticks::TICKS_PER_SECOND;
 
 /// The upper runtime bound `CreateDummyChapters` treats as valid, in ticks
 /// (`TimeSpan.FromHours(12).Ticks`). Runtimes above this are assumed corrupt.
@@ -111,13 +106,11 @@ impl FFProbeVideoInfo {
 #[cfg(test)]
 mod tests {
     use super::{FFProbeVideoInfo, VideoProbeInput};
+    use ferrofin_util::ticks::TICKS_PER_MINUTE;
 
     /// The `DummyChapterDuration` the xUnit fixture injects:
     /// `TimeSpan.FromMinutes(5).TotalSeconds` == 300 seconds.
     const DUMMY_CHAPTER_DURATION_SECONDS: i32 = 5 * 60;
-
-    /// One .NET minute, in ticks (`TimeSpan.TicksPerMinute`).
-    const TICKS_PER_MINUTE: i64 = 60 * 10_000_000;
 
     fn provider() -> FFProbeVideoInfo {
         FFProbeVideoInfo::new(DUMMY_CHAPTER_DURATION_SECONDS)

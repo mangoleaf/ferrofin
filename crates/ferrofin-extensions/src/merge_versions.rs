@@ -75,7 +75,6 @@ use std::path::Path;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use ferrofin_core::{PluginConfigPage, ScheduledTask, TaskProgress};
 use ferrofin_db::entities::base_items::BaseItemEntity;
 use ferrofin_model::data::BaseItemKind;
 use ferrofin_model::entities_media::VirtualFolderInfo;
@@ -87,7 +86,9 @@ use ferrofin_traits::library::{LibraryManager, VirtualFolderManager};
 use ferrofin_traits::merge_versions::{MergeProgress, MergeVersionsManager};
 use ferrofin_traits::options::InternalItemsQuery;
 use ferrofin_traits::persistence::{ItemPersistenceService, ItemRepository};
-use ferrofin_traits::plugins::{PluginDescriptor, PluginManager};
+use ferrofin_traits::plugins::{PluginConfigPage, PluginDescriptor, PluginManager};
+use ferrofin_traits::tasks::{ScheduledTask, TaskProgress};
+use ferrofin_util::ticks::TICKS_PER_DAY;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -167,9 +168,6 @@ impl Extension for MergeVersionsExtension {
     }
 }
 
-/// One day as scheduler ticks (100 ns) — the upstream tasks' default interval.
-const DAY_TICKS: i64 = 24 * 3600 * 10_000_000;
-
 /// The merge tasks' shared default trigger: every 24 hours, as upstream.
 ///
 /// There used to be a `StartupTrigger` here as well, justified by "the interval
@@ -192,7 +190,7 @@ const DAY_TICKS: i64 = 24 * 3600 * 10_000_000;
 fn default_triggers() -> Vec<TaskTriggerInfo> {
     vec![TaskTriggerInfo {
         type_: TaskTriggerInfoType::IntervalTrigger,
-        interval_ticks: Some(DAY_TICKS),
+        interval_ticks: Some(TICKS_PER_DAY),
         ..TaskTriggerInfo::default()
     }]
 }
@@ -512,9 +510,7 @@ impl MergeVersionsService {
         let primary = items
             .iter()
             .find(|i| i.primary_version_id.is_none() && owns_alternates(i))
-            .unwrap_or_else(|| {
-                &items[ferrofin_core::video_versions::preferred_primary_version(&items)]
-            });
+            .unwrap_or_else(|| &items[ferrofin_db::item_data::preferred_primary_version(&items)]);
         let primary_id = primary.id.clone();
 
         // Targeted single-column writes: the group rows were loaded to decide
@@ -539,7 +535,9 @@ impl MergeVersionsService {
                     .await?;
             }
         }
-        tracing::info!(
+        // One per group, and the episode merge passes merged groups again on
+        // every run: the scan's line counts them at info (LOGGING.md rule 1).
+        tracing::debug!(
             merged = group.len() - 1,
             primary = %primary_id,
             "merge versions: merged alternate versions into primary"
@@ -719,6 +717,11 @@ impl MergeVersionsManager for MergeVersionsService {
             .filter(|(_, (ids, any_unmerged))| ids.len() > 1 && *any_unmerged)
             .map(|((library, _), (ids, _))| (library, ids))
             .collect();
+        tracing::info!(
+            movies = movies.len(),
+            duplicate_groups = duplicates.len(),
+            "merge versions: movie scan"
+        );
 
         for (index, (library, ids)) in duplicates.iter().enumerate() {
             report(progress, percent(index, duplicates.len()));
@@ -899,8 +902,8 @@ fn episode_merge_key(ep: &BaseItemEntity, provider_id: impl Fn(&str) -> Option<S
     if let (Some(parent), Some(index)) = (ep.parent_index_number, ep.index_number) {
         // `IndexNumberEnd` lives in the `Data` blob; a null renders as
         // nothing, as in the C# interpolation.
-        let end = ferrofin_core::item_data::read_data_i32(
-            &ferrofin_core::item_data::parse_data(ep.data.as_deref()),
+        let end = ferrofin_db::item_data::read_data_i32(
+            &ferrofin_db::item_data::parse_data(ep.data.as_deref()),
             "IndexNumberEnd",
         )
         .map(|end| end.to_string())
@@ -1550,6 +1553,20 @@ mod tests {
 
     // ---- service over a real database --------------------------------------
 
+    /// An in-memory sink for a scoped `fmt` subscriber.
+    #[derive(Clone, Default)]
+    struct Logs(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for Logs {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().expect("logs").extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
     #[tokio::test]
     async fn merge_movies_groups_by_tmdb() {
         let db = test_db().await;
@@ -1566,7 +1583,25 @@ mod tests {
         set_provider_id(&db, lonely, "Tmdb", "604").await;
         let svc = service_over(&db, FakePlugins::enabled(), Vec::new());
 
-        svc.merge_movies(None).await.expect("merge movies");
+        // gl-275: the run's info lines are its own, never one per group.
+        let logs = Logs::default();
+        {
+            let writer = logs.clone();
+            let _guard = tracing::subscriber::set_default(
+                tracing_subscriber::fmt()
+                    .with_writer(move || writer.clone())
+                    .with_ansi(false)
+                    .with_max_level(tracing::Level::INFO)
+                    .finish(),
+            );
+            svc.merge_movies(None).await.expect("merge movies");
+        }
+        let text = String::from_utf8_lossy(&logs.0.lock().expect("logs")).into_owned();
+        assert!(!text.contains("merged alternate versions"), "{text}");
+        assert!(
+            text.contains("merge versions: movie scan movies=4 duplicate_groups=1"),
+            "{text}"
+        );
 
         // a (widest) is the primary; b links to it; the rest are untouched.
         assert_eq!(primary_of(&db, &svc, a).await, None);
@@ -2595,6 +2630,7 @@ mod tests {
             remote_images: Arc::new(
                 crate::ldap_auth::provider::profile_image::FakeImages::default(),
             ),
+            media_segment_scan: Arc::new(crate::tests::NoScan),
         };
 
         let tasks = MergeVersionsExtension.tasks(&cx);
@@ -2603,7 +2639,7 @@ mod tests {
         for task in &tasks {
             assert_eq!(task.category(), "Merge Versions");
             let triggers = task.default_triggers();
-            assert_eq!(triggers[0].interval_ticks, Some(DAY_TICKS));
+            assert_eq!(triggers[0].interval_ticks, Some(TICKS_PER_DAY));
             // Daily and ONLY daily, as upstream. A `StartupTrigger` used to sit
             // beside it, compensating for an interval clock that restarted on
             // every boot; the scheduler anchors on the last completion now, so
