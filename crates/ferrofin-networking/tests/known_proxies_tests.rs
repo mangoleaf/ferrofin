@@ -99,6 +99,50 @@ fn a_mapped_subnet_is_unmapped_only_within_the_mapped_range() {
     assert!(!nm.is_known_proxy(ip("192.0.2.1")));
 }
 
+/// `AddProxyAddresses` reads an entry with `IPAddress.TryParse`, or
+/// `IPNetwork.TryParse` for a subnet, so the old numeric IPv4 spellings name
+/// proxies too: Jellyfin 12.4 trusted each of these and neither address beside
+/// them (measured over `X-Forwarded-For`).
+#[test]
+fn numeric_ipv4_spellings_name_proxies() {
+    let nm = manager_with(
+        &["0x0a000005", "10.6", "10.0.0.07", "0xa.0x2.0/16"],
+        true,
+        false,
+    );
+    for (address, known) in [
+        ("10.0.0.5", true),
+        ("10.0.0.6", true),
+        ("10.0.0.7", true),
+        ("10.2.0.9", true),
+        ("10.0.0.8", false),
+        ("10.1.2.3", false),
+    ] {
+        assert_eq!(nm.is_known_proxy(ip(address)), known, "{address}");
+    }
+}
+
+/// An unspecified address in any spelling is a single-host proxy, as
+/// `IPAddress.TryParse` reads it before `TryParseToSubnet` could widen it to
+/// the whole address space: it vouches for no real peer.
+#[test]
+fn an_unspecified_address_in_any_spelling_trusts_no_peer() {
+    let nm = manager_with(&["0", "0x0", "0.0", "00", "[::]", "::%1"], true, true);
+    assert_eq!(
+        nm.known_proxies(),
+        [
+            host("0.0.0.0"),
+            host("0.0.0.0"),
+            host("0.0.0.0"),
+            host("0.0.0.0"),
+            host("::"),
+            host("::")
+        ]
+    );
+    assert!(!nm.is_known_proxy(ip("10.0.0.1")));
+    assert!(!nm.is_known_proxy(ip("2001:db8::1")));
+}
+
 /// `ConfigureForwardHeaders` keeps ASP.NET's default `KnownProxies` (`::1`) and
 /// `KnownIPNetworks` (`127.0.0.0/8`) whenever the setting is not empty, even
 /// when no entry parses; an empty setting turns forwarding off altogether.

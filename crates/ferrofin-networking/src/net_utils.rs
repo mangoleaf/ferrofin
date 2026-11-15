@@ -169,12 +169,12 @@ pub fn try_parse_to_subnet(value: &str, negated: bool) -> Option<IpData> {
     }
 
     if let Some(slash) = value.find('/') {
-        let address = parse_ip(&value[..slash])?;
+        let address = try_parse_ip_address(&value[..slash])?;
         let subnet = parse_ip_network(value)?;
         return Some(IpData::new(address, Some(subnet), String::new()));
     }
 
-    let address = parse_ip(value)?;
+    let address = try_parse_ip_address(value)?;
     match address {
         IpAddr::V4(v4) => {
             if v4 == Ipv4Addr::UNSPECIFIED {
@@ -351,7 +351,7 @@ pub fn try_parse_host_with(
         }
 
         // IPv4 or IPv4:port (or IP/mask).
-        if let Some(address) = parse_ip(left_part(first_part, '/')) {
+        if let Some(address) = try_parse_ip_address(left_part(first_part, '/')) {
             let family = AddressFamily::of(address);
             if (family == AddressFamily::InterNetwork && (!is_ipv4_enabled && is_ipv6_enabled))
                 || (family == AddressFamily::InterNetworkV6
@@ -364,41 +364,9 @@ pub fn try_parse_host_with(
         }
     } else if !hosts.is_empty() && hosts.len() <= 9 {
         // 8 octets + port.
-        if let Some(address) = parse_ip(left_part(host, '/')) {
+        if let Some(address) = try_parse_ip_address(left_part(host, '/')) {
             return Some(vec![address]);
         }
-    }
-
-    None
-}
-
-/// Parses `value` as an [`IpAddr`] with the leniencies of .NET
-/// `IPAddress.Parse` for IPv6: a surrounding `[ ]` with an optional `:port`
-/// after the bracket, and a `%zone` scope suffix (both of which `std`'s parser
-/// rejects). The scope/port are irrelevant to the address value and dropped.
-fn parse_ip(value: &str) -> Option<IpAddr> {
-    // Bracketed IPv6: `[addr]`, `[addr]:port`, `[addr%scope]`, ...
-    if let Some(rest) = value.strip_prefix('[') {
-        let close = rest.find(']')?;
-        let inner = &rest[..close];
-        let after = &rest[close + 1..];
-        // Anything after ']' must be empty or a `:port`.
-        if !after.is_empty() {
-            let port = after.strip_prefix(':')?;
-            if port.is_empty() || !port.bytes().all(|b| b.is_ascii_digit()) {
-                return None;
-            }
-        }
-        return parse_v6_with_optional_scope(inner);
-    }
-
-    if let Ok(address) = value.parse::<IpAddr>() {
-        return Some(address);
-    }
-
-    // Bare scoped IPv6 (`fe80::1%16`): only IPv6 carries a `%zone`.
-    if value.contains('%') && value.contains(':') {
-        return parse_v6_with_optional_scope(value);
     }
 
     None
@@ -526,15 +494,6 @@ fn try_parse_embedded_ipv4(value: &str) -> Option<Ipv4Addr> {
     parts.next().is_none().then(|| Ipv4Addr::from(octets))
 }
 
-/// Parses an IPv6 address that may carry a trailing `%zone` scope id.
-fn parse_v6_with_optional_scope(value: &str) -> Option<IpAddr> {
-    let base = value.split('%').next().unwrap_or(value);
-    match base.parse::<IpAddr>() {
-        Ok(IpAddr::V6(v6)) => Some(IpAddr::V6(v6)),
-        _ => None,
-    }
-}
-
 /// Returns the substring of `s` before the first `needle`, or all of `s`
 /// (`Jellyfin.Extensions.StringExtensions.LeftPart`, ported in `ferrofin-util`).
 fn left_part(s: &str, needle: char) -> &str {
@@ -588,7 +547,7 @@ pub fn ip_none() -> IpAddr {
 /// on a malformed address or an out-of-range prefix.
 fn parse_ip_network(value: &str) -> Option<IpNetwork> {
     let (addr_part, prefix_part) = value.split_once('/')?;
-    let base = parse_ip(addr_part)?;
+    let base = try_parse_ip_address(addr_part)?;
     let prefix: u8 = prefix_part.parse().ok()?;
 
     let normalized = match base {

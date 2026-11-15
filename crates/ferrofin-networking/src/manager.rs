@@ -765,7 +765,7 @@ impl NetworkManager {
 
         // Everything else is a single-IP subnet.
         for ip in remote_ip_filter.iter().filter(|x| !x.contains('/')) {
-            if let Ok(ipp) = ip.parse::<IpAddr>() {
+            if let Some(ipp) = net_utils::try_parse_ip_address(ip) {
                 let prefix = match ipp {
                     IpAddr::V4(_) => net_constants::MINIMUM_IPV4_PREFIX_SIZE,
                     IpAddr::V6(_) => net_constants::MINIMUM_IPV6_PREFIX_SIZE,
