@@ -90,7 +90,7 @@ pub trait LifecycleController: Send + Sync {
 ///
 /// A seam over the OS free-/used-space query (C# `StorageHelper.GetFreeSpaceOf`)
 /// so storage-info assembly is testable. The default [`FsStorageProbe`] queries
-/// the real filesystem via `statvfs` on unix.
+/// the real filesystem: `statvfs` on unix, `GetDiskFreeSpaceExW` on Windows.
 pub trait StorageProbe: Send + Sync {
     /// Returns the storage info for `path` (resolved path, free/used bytes).
     fn probe(&self, path: &str) -> FolderStorageInfo;
@@ -126,41 +126,46 @@ pub trait StorageProbe: Send + Sync {
 /// }
 /// ```
 ///
-/// `DeviceId` is the mount point of the filesystem holding the folder, so
-/// folders that share a disk show the same one. There is deliberately **no**
-/// walk up to the nearest existing ancestor: in C# a path that does not exist
-/// makes `ResolvePath` throw and the catch arm reports `-1`. The byte counts
-/// come from the folder itself, which is on that mount. One deliberate
-/// difference: a folder no listed mount contains keeps its own byte counts,
-/// with `StorageType` `Unknown` and no `DeviceId`, where upstream's
-/// `bestMatch is null` throw reports `-1`. That happens only where the mount
-/// table cannot be read (only `/proc/mounts` and `/etc/mtab` are read, which
-/// macOS lacks) or a chroot hides `/`, and there the `-1` would also refuse
-/// every backup (`free_space_of`).
+/// `DeviceId` is the mount point or drive root (`C:\`) of the filesystem
+/// holding the folder, so folders that share a disk show the same one. There
+/// is deliberately **no** walk up to the nearest existing ancestor: in C# a
+/// path that does not exist makes `ResolvePath` throw and the catch arm reports
+/// `-1`. The byte counts are that drive's, as upstream's. One deliberate
+/// difference: a folder no listed drive contains reports its own filesystem's
+/// byte counts, with `StorageType` `Unknown` and no `DeviceId`, where
+/// upstream's `bestMatch is null` throw reports `-1`. That happens only where
+/// the mount table cannot be read (only `/proc/mounts` and `/etc/mtab` are
+/// read, which macOS lacks), a chroot hides `/`, or a Windows folder is a UNC
+/// path (`\\server\share`) no drive letter holds, and there the `-1` would
+/// also refuse every backup (`free_space_of`).
 #[derive(Debug, Clone, Copy, Default)]
 pub struct FsStorageProbe;
 
 impl FsStorageProbe {
-    /// Probes one path against an already-parsed mount table.
+    /// Probes one path against an already-read drive table.
     fn probe_with(mounts: &[crate::mount_table::MountEntry], path: &str) -> FolderStorageInfo {
-        let resolved_path = std::fs::canonicalize(path)
-            .map_or_else(|_| path.to_owned(), |p| p.to_string_lossy().into_owned());
-        let Some((free_space, used_space)) = disk_usage(path) else {
-            // The C# catch arm.
-            return FolderStorageInfo {
-                path: path.to_owned(),
-                resolved_path,
-                free_space: -1,
-                used_space: -1,
-                storage_type: None,
-                device_id: None,
-            };
+        // The C# catch arm.
+        let catch = || FolderStorageInfo {
+            path: path.to_owned(),
+            resolved_path: path.to_owned(),
+            free_space: -1,
+            used_space: -1,
+            storage_type: None,
+            device_id: None,
         };
-        // No containing mount (a mount table this platform cannot read, or a
-        // chroot that hides `/`): upstream's `bestMatch is null` throws into the
-        // catch arm, but the folder's own byte counts are the better answer.
-        // `DriveType.Unknown` is the C# table's default arm.
+        let Ok(resolved_path) = resolve_path(path) else {
+            return catch();
+        };
+        let resolved_path = resolved_path.to_string_lossy().into_owned();
+        // No containing drive (a mount table this platform cannot read, a
+        // chroot that hides `/`, a UNC path): upstream's `bestMatch is null`
+        // throws into the catch arm, but the folder's own byte counts are the
+        // better answer. `DriveType.Unknown` is the C# table's default arm.
         let mount = crate::mount_table::mount_for_path(mounts, &resolved_path);
+        let Some((free_space, used_space)) = disk_usage(mount.map_or(path, |m| m.target.as_str()))
+        else {
+            return catch();
+        };
         FolderStorageInfo {
             path: path.to_owned(),
             resolved_path,
@@ -168,9 +173,7 @@ impl FsStorageProbe {
             used_space,
             storage_type: Some(
                 mount
-                    .map_or(crate::mount_table::DriveType::Unknown, |m| {
-                        crate::mount_table::drive_type(&m.fs_type)
-                    })
+                    .map_or(crate::mount_table::DriveType::Unknown, |m| m.drive_type)
                     .to_string(),
             ),
             device_id: mount.map(|m| m.target.clone()),
@@ -189,6 +192,43 @@ impl StorageProbe for FsStorageProbe {
     }
 }
 
+/// `StorageHelper.ResolvePath`: rebuilds `path` from its root, replacing each
+/// component that is a link (a symlink, or a Windows junction) with its final
+/// target. Every other component stays as written, unlike `canonicalize`, so a
+/// folder on a mapped network drive stays `Z:\…`, on drive `Z:\`, instead of
+/// becoming its UNC path, which no drive root prefixes. Errs where .NET's
+/// `ResolveLinkTarget` throws: a component that does not exist.
+///
+/// A relative path is made absolute first. On Unix `..` then leaves the folder
+/// resolved so far, as the OS does (`std::path::absolute` keeps it, so a
+/// configured directory may hold one); on Windows `absolute` already removed
+/// it, as Win32's `GetFullPathNameW` does. Upstream keeps both as written,
+/// which no drive root prefixes.
+fn resolve_path(path: &str) -> std::io::Result<std::path::PathBuf> {
+    use std::path::Component;
+
+    let mut current = std::path::PathBuf::new();
+    for component in std::path::absolute(path)?.components() {
+        match component {
+            // Every link before it was already replaced by its target.
+            Component::ParentDir => {
+                current.pop();
+            }
+            // Upstream walks the parts after the root, never the root itself.
+            Component::Normal(_) => {
+                current.push(component);
+                if current.symlink_metadata()?.is_symlink() {
+                    // `dunce` drops the `\\?\` prefix `canonicalize` gives on
+                    // Windows, as .NET's `GetFinalLinkTarget` trims it.
+                    current = dunce::canonicalize(&current)?;
+                }
+            }
+            _ => current.push(component),
+        }
+    }
+    Ok(current)
+}
+
 /// The free space each common path must have: `StorageHelper.TwoGigabyte`,
 /// copied verbatim (it is `int.MaxValue`, one byte short of 2 GiB).
 pub const TWO_GIGABYTE: i64 = 2_147_483_647;
@@ -198,9 +238,9 @@ pub const TWO_GIGABYTE: i64 = 2_147_483_647;
 /// `StorageHelper.TestCommonPathsForStorageCapacity`, which Jellyfin runs at
 /// startup and again before it applies a restore.
 ///
-/// Free space the probe cannot read (`-1`: always on the non-unix probe, or a
-/// failed `statvfs`) is logged and passed. Upstream's `DriveInfo` would throw
-/// there, but on a build that can never read it that would refuse every boot.
+/// Free space the probe cannot read (`-1`: a failed `statvfs` or
+/// `GetDiskFreeSpaceExW`) is logged and passed, where upstream's `DriveInfo`
+/// throws.
 ///
 /// # Errors
 ///
@@ -276,45 +316,24 @@ pub fn humanize_storage_size(byte_count: i64) -> String {
     format!("{signed}{}", SUFFIXES[place])
 }
 
-/// Returns `(free_space, used_space)` in bytes for the filesystem at `path`, or
-/// `None` when `statvfs` fails — the condition under which the C# `DriveInfo`
-/// property access throws and `StorageHelper` reports `-1`.
-///
-/// The formulas are C#'s exactly: `AvailableFreeSpace` is `f_bavail` (the space
-/// an unprivileged caller may use) and `TotalSize` is `f_blocks`, so
-/// `UsedSpace = TotalSize - AvailableFreeSpace` **includes** the root-reserved
-/// blocks. Subtracting `f_bfree` there instead under-reports used space by the
-/// reservation (15.2 GiB on the parity lab's filesystem).
-#[cfg(unix)]
+/// Returns `(free_space, used_space)` in bytes for the filesystem at `path`
+/// ([`disk_space`](crate::mount_table::disk_space): `AvailableFreeSpace` and
+/// `TotalSize - AvailableFreeSpace`), or `None` when the query fails — the
+/// condition under which the C# `DriveInfo` property access throws and
+/// `StorageHelper` reports `-1`.
 fn disk_usage(path: &str) -> Option<(i64, i64)> {
-    use std::os::unix::ffi::OsStrExt;
-
-    let c_path = std::ffi::CString::new(std::path::Path::new(path).as_os_str().as_bytes()).ok()?;
-    // SAFETY: `stat` is fully written by `statvfs` before it is read, and
-    // `c_path` is a valid NUL-terminated C string that outlives the call.
-    let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
-    if unsafe { libc::statvfs(c_path.as_ptr(), std::ptr::from_mut(&mut stat)) } != 0 {
-        return None;
-    }
-    let block = i128::from(stat.f_frsize);
-    let bytes =
-        |blocks: u64| -> i64 { i64::try_from(i128::from(blocks) * block).unwrap_or(i64::MAX) };
-    // statvfs field widths differ per platform (u64 on Linux, u32 on macOS).
-    #[allow(clippy::useless_conversion)]
-    let free = bytes(u64::from(stat.f_bavail));
-    #[allow(clippy::useless_conversion)]
-    let total = bytes(u64::from(stat.f_blocks));
-    Some((free, total.saturating_sub(free)))
+    let (available, total) = crate::mount_table::disk_space(path)?;
+    Some(usage(available, total))
 }
 
-/// Non-unix fallback: no portable `statvfs`, so the query cannot be answered and
-/// the C# catch shape (`-1`/`-1`, no `StorageType`, no `DeviceId`) is reported.
-///
-// ponytail: Windows would use `GetDiskFreeSpaceExW`; add it if a Windows build
-// ships. The user's server is unix, where this is real.
-#[cfg(not(unix))]
-fn disk_usage(_path: &str) -> Option<(i64, i64)> {
-    None
+/// `(AvailableFreeSpace, TotalSize - AvailableFreeSpace)` as .NET's `long`s,
+/// a count past `i64::MAX` held at it.
+fn usage(available: u64, total: u64) -> (i64, i64) {
+    let bytes = |count: u64| i64::try_from(count).unwrap_or(i64::MAX);
+    (
+        bytes(available),
+        bytes(total).saturating_sub(bytes(available)),
+    )
 }
 
 /// Supplies the per-library storage folders.
@@ -954,7 +973,7 @@ mod tests {
             .into_owned();
         let mount = |target: &str, fs_type: &str| MountEntry {
             target: target.to_owned(),
-            fs_type: fs_type.to_owned(),
+            drive_type: crate::mount_table::drive_type(fs_type),
         };
         let path = format!("{dir}/.");
         let mounts = [mount("/", "ext4"), mount(&dir, "tmpfs")];
@@ -989,6 +1008,115 @@ mod tests {
         assert_eq!(info.used_space, -1);
         assert_eq!(info.storage_type, None);
         assert_eq!(info.device_id, None);
+        // Upstream's catch arm reports the path as given, never a resolved one.
+        assert_eq!(info.resolved_path, missing);
+    }
+
+    /// `ResolvePath`: a component that is a link is replaced by its final
+    /// target, every other component stays as written, and a component that
+    /// does not exist is an error (upstream's `ResolveLinkTarget` throws).
+    #[cfg(unix)]
+    #[test]
+    fn resolve_path_follows_links_and_keeps_the_rest() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let base = std::fs::canonicalize(root.path()).expect("canonical");
+        let media = base.join("media");
+        std::fs::create_dir_all(media.join("movies")).expect("mkdir");
+        std::os::unix::fs::symlink(&media, base.join("link")).expect("symlink");
+        std::os::unix::fs::symlink(base.join("link"), base.join("chain")).expect("symlink");
+
+        let resolve = |path: std::path::PathBuf| resolve_path(&path.to_string_lossy());
+        assert_eq!(
+            resolve(media.join("movies")).expect("plain"),
+            media.join("movies")
+        );
+        assert_eq!(
+            resolve(base.join("link/movies")).expect("link"),
+            media.join("movies")
+        );
+        // `returnFinalTarget: true`: a chain of links ends at its last target.
+        assert_eq!(resolve(base.join("chain")).expect("chain"), media);
+        assert!(resolve(base.join("link/missing")).is_err());
+        assert_eq!(
+            resolve_path("/").expect("root"),
+            std::path::PathBuf::from("/")
+        );
+        // `..` leaves the link's target, as the OS does, not the link's folder.
+        let other = base.join("other");
+        std::fs::create_dir_all(other.join("inner")).expect("mkdir");
+        std::os::unix::fs::symlink(other.join("inner"), base.join("inner-link")).expect("symlink");
+        assert_eq!(resolve(base.join("inner-link/..")).expect("parent"), other);
+        assert_eq!(
+            resolve(base.join("link/../media/movies")).expect("parent"),
+            media.join("movies")
+        );
+        // A relative path is resolved from the working directory.
+        let relative = resolve_path("src").expect("relative");
+        assert!(
+            relative.is_absolute() && relative.ends_with("src"),
+            "{relative:?}"
+        );
+    }
+
+    #[rstest::rstest]
+    #[case::empty(0, 0, (0, 0))]
+    #[case::used_includes_the_reservation(10, 100, (10, 90))]
+    #[case::past_i64_max(u64::MAX, u64::MAX, (i64::MAX, 0))]
+    #[case::total_past_i64_max(5, u64::MAX, (5, i64::MAX - 5))]
+    fn usage_is_available_and_total_less_available(
+        #[case] available: u64,
+        #[case] total: u64,
+        #[case] want: (i64, i64),
+    ) {
+        assert_eq!(usage(available, total), want);
+    }
+
+    /// The byte counts are the matched drive's (`bestMatch.AvailableFreeSpace`
+    /// and `TotalSize`), read on its root.
+    #[cfg(unix)]
+    #[test]
+    fn fs_probe_reads_the_matched_drives_bytes() {
+        use crate::mount_table::{DriveType, MountEntry};
+        let root = [MountEntry {
+            target: "/".to_owned(),
+            drive_type: DriveType::Fixed,
+        }];
+        let dir = std::env::temp_dir().to_string_lossy().into_owned();
+        let info = FsStorageProbe::probe_with(&root, &dir);
+        let (_, total) = crate::mount_table::disk_space("/").expect("statvfs /");
+        assert_eq!(
+            info.free_space + info.used_space,
+            i64::try_from(total).expect("fits")
+        );
+    }
+
+    /// A folder reached through a link reports the drive its target is on.
+    #[cfg(unix)]
+    #[test]
+    fn fs_probe_reports_the_drive_of_a_links_target() {
+        use crate::mount_table::{DriveType, MountEntry};
+        let root = tempfile::tempdir().expect("tempdir");
+        let base = std::fs::canonicalize(root.path()).expect("canonical");
+        let disk = base.join("disk");
+        std::fs::create_dir_all(disk.join("movies")).expect("mkdir");
+        std::os::unix::fs::symlink(&disk, base.join("link")).expect("symlink");
+        let disk = disk.to_string_lossy().into_owned();
+        let mounts = [
+            MountEntry {
+                target: "/".to_owned(),
+                drive_type: DriveType::Fixed,
+            },
+            MountEntry {
+                target: disk.clone(),
+                drive_type: DriveType::Network,
+            },
+        ];
+        let path = base.join("link/movies").to_string_lossy().into_owned();
+        let info = FsStorageProbe::probe_with(&mounts, &path);
+        assert_eq!(info.path, path);
+        assert_eq!(info.resolved_path, format!("{disk}/movies"));
+        assert_eq!(info.device_id.as_deref(), Some(disk.as_str()));
+        assert_eq!(info.storage_type.as_deref(), Some("Network"));
     }
 
     /// `probe_all` must answer in the same order it was asked, so the caller can
@@ -1100,7 +1228,7 @@ mod tests {
         );
     }
 
-    /// Free space a build cannot read (the non-unix probe) is not a refusal.
+    /// Free space the probe cannot read is not a refusal.
     #[test]
     fn unreadable_free_space_does_not_refuse_the_boot() {
         let tmp = tempfile::tempdir().expect("tempdir");
