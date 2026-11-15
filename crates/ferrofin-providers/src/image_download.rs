@@ -224,8 +224,9 @@ pub(crate) async fn download_image(url: &str) -> Result<(Vec<u8>, String), Image
 }
 
 /// [`download_image`] for a caller that goes on without the image (the scan's
-/// download of a person's profile photo or a studio's thumb): `None` on any
-/// failure, its reason logged at debug. A refusal counts no request failure.
+/// download of a person's profile photo, a studio's thumb or an NFO's
+/// artwork): `None` on any failure, its reason logged at debug. A refusal
+/// counts no request failure.
 pub(crate) async fn download_image_or_none(url: &str) -> Option<(Vec<u8>, String)> {
     match download_image(url).await {
         Ok(image) => Some(image),
