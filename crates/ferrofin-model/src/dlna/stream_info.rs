@@ -872,6 +872,11 @@ fn bool_lower(v: bool) -> String {
 /// values exercised here (whole numbers without a trailing `.0`).
 #[allow(clippy::float_cmp, clippy::cast_possible_truncation)]
 fn format_float(v: f32) -> String {
+    if v.is_infinite() {
+        // `float.ToString(CultureInfo.InvariantCulture)`: the query binder
+        // reads `Infinity` back, and refuses Rust's `inf` as upstream does.
+        return if v > 0.0 { "Infinity" } else { "-Infinity" }.to_owned();
+    }
     if v.fract() == 0.0 {
         format!("{}", v as i64)
     } else {
