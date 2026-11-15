@@ -335,10 +335,15 @@ struct OkLibrary {
     /// When non-empty, the page `query_items` answers with, in this order and
     /// out of [`PAGE_TOTAL`] rows, instead of the single `item_id` row.
     rows: Vec<BaseItemEntity>,
-    /// The rows a `Name` + one-kind lookup (`get_item_list` / `get_item_ids`)
-    /// finds, matched ignoring case.
+    /// The rows a `Name` + one-kind lookup (`get_item_list` / `get_item_ids`,
+    /// and each name of `get_named_item_ids`) finds, matched ignoring case.
     named: Vec<(BaseItemKind, &'static str, Uuid)>,
+    /// Every `get_named_item_ids` call: the kind and the names it was given.
+    named_id_lookups: Arc<std::sync::Mutex<NameLookups>>,
 }
+
+/// The `get_named_item_ids` calls [`OkLibrary`] saw, in order.
+type NameLookups = Vec<(BaseItemKind, Vec<String>)>;
 
 impl OkLibrary {
     /// The ids of the [`OkLibrary::named`] rows `query` names.
@@ -561,6 +566,29 @@ impl LibraryManager for OkLibrary {
     }
     async fn get_item_ids(&self, query: &InternalItemsQuery) -> Result<Vec<Uuid>, ServiceError> {
         Ok(self.named_ids(query))
+    }
+    /// Records the call, so a test can tell one batched lookup from one per
+    /// name, and answers each name from [`OkLibrary::named`].
+    async fn get_named_item_ids(
+        &self,
+        kind: BaseItemKind,
+        names: &[String],
+    ) -> Result<Vec<Option<Uuid>>, ServiceError> {
+        self.named_id_lookups
+            .lock()
+            .unwrap()
+            .push((kind, names.to_vec()));
+        Ok(names
+            .iter()
+            .map(|name| {
+                let query = InternalItemsQuery {
+                    name: Some(name.clone()),
+                    include_item_types: vec![kind],
+                    ..Default::default()
+                };
+                self.named_ids(&query).first().copied()
+            })
+            .collect())
     }
     async fn get_item_list(
         &self,
@@ -1984,12 +2012,22 @@ async fn items_query_with_named(
     params: &str,
     named: Vec<(BaseItemKind, &'static str, Uuid)>,
 ) -> InternalItemsQuery {
+    items_query_and_name_lookups(params, named).await.0
+}
+
+/// [`items_query_with_named`], plus every `get_named_item_ids` call the
+/// request made.
+async fn items_query_and_name_lookups(
+    params: &str,
+    named: Vec<(BaseItemKind, &'static str, Uuid)>,
+) -> (InternalItemsQuery, NameLookups) {
     let library = OkLibrary {
         item_id: Uuid::from_u128(0x5A),
         named,
         ..Default::default()
     };
     let seen = Arc::clone(&library.last_query);
+    let lookups = Arc::clone(&library.named_id_lookups);
     let response = create_router(ok_state_with(library))
         .oneshot(
             Request::builder()
@@ -2001,7 +2039,8 @@ async fn items_query_with_named(
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK, "{params}");
-    seen.lock().unwrap().take().expect("query_items ran")
+    let query = seen.lock().unwrap().take().expect("query_items ran");
+    (query, lookups.lock().unwrap().clone())
 }
 
 /// `artists`, `albums` and `studios` name the items whose ids replace
@@ -2021,7 +2060,7 @@ async fn get_items_resolves_the_artist_album_and_studio_names() {
         (BaseItemKind::MusicAlbum, "Middle Years", album),
         (BaseItemKind::Studio, "Acme Pictures", studio),
     ];
-    let query = items_query_with_named(
+    let (query, lookups) = items_query_and_name_lookups(
         &format!(
             "recursive=true&artistIds={kept}&artists=test%20artist|Nobody\
              &albumIds={kept}&albums=Middle%20Years&studioIds={kept}&studios=Acme%20Pictures|Nope"
@@ -2032,6 +2071,16 @@ async fn get_items_resolves_the_artist_album_and_studio_names() {
     assert_eq!(query.artist_ids, [artist, Uuid::nil()]);
     assert_eq!(query.album_ids, [album]);
     assert_eq!(query.studio_ids, [studio, Uuid::nil()]);
+    // Each list resolves in one non-creating batch lookup, not one per name
+    // (gl-856).
+    let owned = |list: &[&str]| list.iter().map(|&n| n.to_owned()).collect::<Vec<_>>();
+    assert_eq!(
+        lookups,
+        [
+            (BaseItemKind::MusicArtist, owned(&["test artist", "Nobody"])),
+            (BaseItemKind::Studio, owned(&["Acme Pictures", "Nope"])),
+        ]
+    );
 
     // A repeated key joins with the declared pipe delimiter.
     let repeated = items_query_with_named(
