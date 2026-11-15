@@ -44,10 +44,12 @@ pub struct EpgChannel {
 
 /// One channel of a tuner host's lineup, as the matcher needs it.
 ///
-/// Port of the `ChannelInfo` fields `M3uParser` fills in for an M3U tuner.
-/// [`id`](Self::id) is the external channel id
-/// (`m3u_{MD5(tuner url)}{MD5(stream url)}`, see [`m3u_channel_id`]) and
-/// [`tuner_channel_id`](Self::tuner_channel_id) is the playlist's `tvg-id`.
+/// Port of the `ChannelInfo` fields a tuner host fills in that the match ladder
+/// reads. [`id`](Self::id) is the external channel id the host minted
+/// (`m3u_{MD5(tuner url)}{MD5(stream url)}` for M3U, see [`m3u_channel_id`];
+/// `hdhr_{GuideNumber}` for HDHomeRun) and
+/// [`tuner_channel_id`](Self::tuner_channel_id) is the playlist's `tvg-id`
+/// (empty for HDHomeRun).
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct TunerChannel {
     /// The external channel id — `ChannelInfo.Id`.

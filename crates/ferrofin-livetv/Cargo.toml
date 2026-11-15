@@ -20,7 +20,6 @@ ferrofin-db.workspace = true
 ferrofin-health.workspace = true
 async-trait.workspace = true
 crc32fast.workspace = true
-icu_collator.workspace = true
 quick-xml.workspace = true
 chrono.workspace = true
 sqlx.workspace = true
