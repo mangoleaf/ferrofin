@@ -3602,12 +3602,6 @@ mod tests {
         async fn set_ancestors(&self, _: uuid::Uuid, _: &[uuid::Uuid]) -> Result<(), ServiceError> {
             self.write()
         }
-        async fn save_images(
-            &self,
-            _: &ferrofin_db::entities::base_items::BaseItemEntity,
-        ) -> Result<(), ServiceError> {
-            self.write()
-        }
         async fn reattach_user_data(
             &self,
             _: &ferrofin_db::entities::base_items::BaseItemEntity,

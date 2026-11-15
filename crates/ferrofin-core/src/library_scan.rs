@@ -10036,6 +10036,12 @@ impl LibraryScanner {
             return false;
         }
         timings.log(work.music.len(), phase.elapsed());
+        // `RunPostScanTasks`' last step (`LibraryManager.cs:1597`). Upstream's
+        // failure fails the validation; here it would also skip recording the
+        // libraries as scanned, over rows nothing reads, so it only warns.
+        if let Err(err) = self.persistence.update_inherited_values().await {
+            tracing::warn!(%err, "failed to delete the InheritedTags item value links");
+        }
         // Every pass ran: a cancellation landing now skipped nothing.
         self.between_passes(run, &mut done).await;
         true
@@ -45292,6 +45298,7 @@ mod tests {
     /// built over a one-movie library with a `poster.jpg` beside the media file.
     struct PosterFixture {
         scanner: LibraryScanner,
+        db: Database,
         repo: Arc<dyn ferrofin_traits::persistence::ItemRepository>,
         poster: std::path::PathBuf,
         dimensions: Arc<std::sync::atomic::AtomicUsize>,
@@ -45384,6 +45391,7 @@ mod tests {
 
         PosterFixture {
             scanner,
+            db,
             repo,
             poster: poster_path,
             dimensions,
@@ -45493,6 +45501,31 @@ mod tests {
             .find(|line| line.contains("post-scan passes complete"))
             .unwrap_or_else(|| panic!("no summary: {text}"));
         assert!(summary.contains("elapsed_ms="), "{summary}");
+    }
+
+    /// Once its closing passes are done, a library validation deletes every
+    /// `InheritedTags` link, as upstream's `UpdateInheritedValues` does after
+    /// `RunPostScanTasks`: the ones an adopted database holds go on its first
+    /// scan, and an item's other values stay.
+    #[tokio::test]
+    async fn a_library_scan_deletes_the_inherited_tag_links() {
+        use crate::test_support::{item_values, seed_item_value};
+        use ferrofin_db::enums::ItemValueType;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let fx = poster_fixture(tmp.path(), 8, 12).await;
+        fx.scanner.scan_all().await.unwrap();
+        let movie = fx.movie_id().await;
+        seed_item_value(&fx.db, movie, ItemValueType::InheritedTags, "Inherited").await;
+        seed_item_value(&fx.db, movie, ItemValueType::Tags, "Kept").await;
+
+        // The rescan leaves the unchanged movie's values alone.
+        fx.scanner.scan_all().await.unwrap();
+
+        assert_eq!(
+            item_values(&fx.db, movie).await,
+            [(i32::from(ItemValueType::Tags), "Kept".to_owned())]
+        );
     }
 
     /// A closing pass ends `completed`, `failed` when its work answers false
