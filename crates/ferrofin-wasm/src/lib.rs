@@ -382,7 +382,8 @@ pub struct WasmPluginHost {
     settings: WasmSettings,
     /// The shared guest HTTP clients, for host-side downloads made on a
     /// plugin's behalf (artwork) as well as every `HostState`. `None` only
-    /// for [`WasmPluginHost::empty`], which has no plugin to download for.
+    /// when no plugin file was found (and for [`WasmPluginHost::empty`]): there
+    /// is no plugin to download for.
     http: Option<Arc<capabilities::GuestHttp>>,
 }
 
@@ -394,7 +395,8 @@ impl WasmPluginHost {
     /// error. A component that fails to compile, links against a different
     /// world version, reports an invalid descriptor, or duplicates an id is
     /// **skipped with an `error!`** — one bad file never blocks the server
-    /// or the other plugins.
+    /// or the other plugins. With no `*.wasm` file it builds nothing: no
+    /// engine, no epoch-ticker thread, no guest HTTP clients.
     ///
     /// # Errors
     /// Only on engine construction failure (a wasmtime misconfiguration —
@@ -405,14 +407,6 @@ impl WasmPluginHost {
     /// Only if the OS refuses to spawn the epoch-ticker thread (startup-time
     /// resource exhaustion — the process is already unviable).
     pub fn load(plugins_dir: &Path, settings: &WasmSettings) -> Result<Self, ServiceError> {
-        let (engine, linker) = build_runtime_parts(settings)?;
-        // load() runs on a blocking thread (spawn_blocking at the composition
-        // root), so eager client construction is safe here.
-        let http = build_guest_http_client(settings)?;
-        let collaborators: Arc<std::sync::OnceLock<capabilities::Collaborators>> =
-            Arc::new(std::sync::OnceLock::new());
-
-        let mut plugins: Vec<Arc<LoadedPlugin>> = Vec::new();
         let mut paths: Vec<_> = match std::fs::read_dir(plugins_dir) {
             Ok(entries) => entries
                 .filter_map(Result::ok)
@@ -432,7 +426,21 @@ impl WasmPluginHost {
             }
         };
         paths.sort();
+        if paths.is_empty() {
+            return Ok(Self {
+                settings: settings.clone(),
+                ..Self::empty()
+            });
+        }
 
+        let (engine, linker) = build_runtime_parts(settings)?;
+        // load() runs on a blocking thread (spawn_blocking at the composition
+        // root), so eager client construction is safe here.
+        let http = build_guest_http_client(settings)?;
+        let collaborators: Arc<std::sync::OnceLock<capabilities::Collaborators>> =
+            Arc::new(std::sync::OnceLock::new());
+
+        let mut plugins: Vec<Arc<LoadedPlugin>> = Vec::new();
         for path in paths {
             let Some(mut loaded) =
                 load_one_guarded(&engine, &linker, &path, settings, &http, &collaborators)
@@ -1051,6 +1059,7 @@ fn build_runtime_parts(
     {
         let engine = engine.weak();
         std::thread::Builder::new()
+            // tests/idle_host.rs finds the ticker by this name.
             .name("wasm-epoch-ticker".to_owned())
             .spawn(move || {
                 loop {
@@ -1242,8 +1251,6 @@ pub const PLUGIN_ABI: &str = "ferrofin:plugin@0.5.0";
 /// artifact is **network-mute** while being validated — a malicious
 /// component cannot phone home from its `descriptor` export.
 pub struct WasmArtifactValidator {
-    engine: Engine,
-    linker: Arc<Linker<HostState>>,
     /// Built lazily on the first validation's blocking thread —
     /// `reqwest::blocking::Client` construction panics in async contexts,
     /// and `new()` is called from the (async) composition root.
@@ -1252,20 +1259,17 @@ pub struct WasmArtifactValidator {
 }
 
 impl WasmArtifactValidator {
-    /// Builds a validator with its own engine (same construction as the
-    /// plugin host, via the shared builder). Safe to call from async
-    /// contexts — the blocking HTTP client is deferred to first use.
-    ///
-    /// # Errors
-    /// Engine/linker construction failure (a wasmtime misconfiguration).
-    pub fn new(settings: &WasmSettings) -> Result<Self, ServiceError> {
-        let (engine, linker) = build_runtime_parts(settings)?;
-        Ok(Self {
-            engine,
-            linker,
+    /// Builds a validator that holds nothing until it is used: each
+    /// validation builds its own engine (the plugin host's construction, via
+    /// the shared builder) and drops it after, and the blocking HTTP client is
+    /// built on the first validation's thread. Safe to call from async
+    /// contexts.
+    #[must_use]
+    pub fn new(settings: &WasmSettings) -> Self {
+        Self {
             http: Arc::new(std::sync::OnceLock::new()),
             settings: settings.clone(),
-        })
+        }
     }
 }
 
@@ -1279,8 +1283,6 @@ impl ferrofin_traits::plugins::PluginArtifactValidator for WasmArtifactValidator
         &self,
         bytes: &[u8],
     ) -> Result<ferrofin_traits::plugins::ValidatedArtifact, ServiceError> {
-        let engine = self.engine.clone();
-        let linker = Arc::clone(&self.linker);
         let http_cell = Arc::clone(&self.http);
         let settings = self.settings.clone();
         let bytes = bytes.to_vec();
@@ -1293,9 +1295,7 @@ impl ferrofin_traits::plugins::PluginArtifactValidator for WasmArtifactValidator
             let grace = settings.call_grace_secs;
             runtime::run_watched(&watch, {
                 let watch = Arc::clone(&watch);
-                move || {
-                    validate_on_this_thread(&engine, linker, &http_cell, &settings, &bytes, watch)
-                }
+                move || validate_on_this_thread(&http_cell, &settings, &bytes, watch)
             })
             .unwrap_or_else(|why| match why {
                 runtime::Unwatched::Lost => {
@@ -1325,13 +1325,13 @@ impl ferrofin_traits::plugins::PluginArtifactValidator for WasmArtifactValidator
 /// [`WasmArtifactValidator::validate`]'s work, on the thread
 /// [`runtime::run_watched`] gives it.
 fn validate_on_this_thread(
-    engine: &Engine,
-    linker: Arc<Linker<HostState>>,
     http_cell: &std::sync::OnceLock<Arc<capabilities::GuestHttp>>,
     settings: &WasmSettings,
     bytes: &[u8],
     watch: Arc<runtime::CallWatch>,
 ) -> Result<ferrofin_traits::plugins::ValidatedArtifact, ServiceError> {
+    // Dropped when this returns, which ends its epoch-ticker thread.
+    let (engine, linker) = build_runtime_parts(settings)?;
     // Blocking thread: safe place to build the blocking client.
     let http = if let Some(client) = http_cell.get() {
         Arc::clone(client)
@@ -1340,13 +1340,13 @@ fn validate_on_this_thread(
         let _ = http_cell.set(Arc::clone(&client));
         client
     };
-    let component = Component::new(engine, bytes).map_err(|e| {
+    let component = Component::new(&engine, bytes).map_err(|e| {
         ServiceError::invalid_input(format!(
             "artifact is not a valid WebAssembly component for {PLUGIN_ABI}: {e:#}"
         ))
     })?;
     let spec = InstanceSpec {
-        engine: engine.clone(),
+        engine,
         component,
         linker,
         plugin_name: "install-validation".to_owned(),
