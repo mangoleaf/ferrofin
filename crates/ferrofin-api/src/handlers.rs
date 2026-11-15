@@ -2088,6 +2088,9 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
                    each video gets its page's row, as upstream hands over the page's Video, \
                    and its stored streams from one read per page, where upstream's \
                    GetMediaStreams reads them at the video's turn. \
+                   Also when the library scan refreshes a video: library_scan/trickplay.rs \
+                   ScanTrickplay and library_scan.rs scan_item, compared with \
+                   MediaBrowser.Providers/Trickplay/TrickplayProvider.cs (FetchInternal). \
                    Also the sets a changed video loses before its refresh: library_scan.rs \
                    scan_item and file_changed, item_data_cleanup.rs prune_extracted_data, \
                    external_data_manager.rs delete_external_item_data and \
@@ -2113,7 +2116,7 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
                    Emby.Server.Implementations/Dto/DtoService.cs (the Trickplay field), \
                    MediaBrowser.Controller/Entities/BaseItem.cs (GetMediaSources) and \
                    MediaBrowser.Controller/Entities/Video.cs (GetAllItemsForMediaSources)",
-        date: "2026-11-11",
+        date: "2026-11-14",
         divergences: &[
             "An explicit Replace does not delete the item's trickplay folder and rows first: \
              each selected width is generated in the work directory and swapped in, so the old \
@@ -2170,6 +2173,13 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
              logged and leaves the other widths as upstream's catch does. Order and the \
              number of decodes only: the widths made, and each width's checks, frames and \
              tiles, are unchanged (gl-1228).",
+            "With the NonBlocking scan behaviour, the library scan detaches a video's refresh \
+             once the item's save has written its row and its probe's streams, by id, so the \
+             refresh reads both back as it starts instead of carrying the scan's copies; \
+             upstream's TrickplayProvider starts it among the custom providers, from the \
+             in-memory Video, before RefreshMetadata's final SaveItemAsync. Timing only: it \
+             reads what the save and the subtitle downloads wrote, and Blocking is unchanged. \
+             Owner decision (gl-233, option A).",
             "A set wider than 320 is made at a smaller tile grid than TileWidth x TileHeight \
              (options_at_width): each is multiplied by 320 / width, rounded down, at least 1, \
              so 640 gets 5 x 5 at the default 10 x 10 and a tile holds no more pixels than a \
