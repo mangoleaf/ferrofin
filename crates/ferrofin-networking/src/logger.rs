@@ -8,8 +8,10 @@
 
 /// Sink for the warning/diagnostic messages emitted by the networking code.
 ///
-/// Upstream's `Debug`/`Information` messages are not ported here.
+/// Upstream's `Debug` messages are not ported here.
 pub trait Logger: Send + Sync {
+    /// Records an information-level message (`LogInformation`).
+    fn info(&self, message: &str);
     /// Records a warning-level message (`LogWarning`).
     fn warn(&self, message: &str);
     /// Records an error-level message (`LogError`).
@@ -21,18 +23,24 @@ pub trait Logger: Send + Sync {
 pub struct NullLogger;
 
 impl Logger for NullLogger {
+    fn info(&self, _message: &str) {}
     fn warn(&self, _message: &str) {}
     fn error(&self, _message: &str) {}
 }
 
 /// A [`Logger`] that writes to the server log through `tracing`.
 ///
-/// The message quotes the configured entry, which the admin typed, so it goes
-/// in a Debug-formatted field, never the event's message (LOGGING.md rule 6).
+/// A warning or an error quotes the configured entry, which the admin typed,
+/// so it goes in a Debug-formatted field, never the event's message
+/// (LOGGING.md rule 6). An information line is the manager's own summary of
+/// what it parsed, so it is the message, as upstream words it.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct TracingLogger;
 
 impl Logger for TracingLogger {
+    fn info(&self, message: &str) {
+        tracing::info!("{message}");
+    }
     fn warn(&self, message: &str) {
         tracing::warn!(detail = ?message, "network setting ignored");
     }
@@ -74,11 +82,12 @@ mod tests {
         tracing::subscriber::with_default(subscriber, || {
             TracingLogger.warn("Invalid subnet 'a\nb' will be ignored.");
             TracingLogger.error("Unable to parse bind override: x");
+            TracingLogger.info("Remote IP filter is Allowlist");
         });
 
         let text = String::from_utf8(captured.0.lock().expect("log").clone()).expect("UTF-8");
         let lines: Vec<&str> = text.lines().collect();
-        assert_eq!(lines.len(), 2, "{text}");
+        assert_eq!(lines.len(), 3, "{text}");
         assert!(lines[0].trim_start().starts_with("WARN"), "{text}");
         assert!(
             lines[0].ends_with(
@@ -90,6 +99,11 @@ mod tests {
         assert!(
             lines[1]
                 .ends_with(r#"network setting ignored detail="Unable to parse bind override: x""#),
+            "{text}"
+        );
+        assert!(lines[2].trim_start().starts_with("INFO"), "{text}");
+        assert!(
+            lines[2].ends_with("Remote IP filter is Allowlist"),
             "{text}"
         );
     }

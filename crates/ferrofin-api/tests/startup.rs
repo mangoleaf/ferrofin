@@ -68,6 +68,10 @@ struct MemUsers {
     first_user_password: Option<String>,
     /// When set, `get_first_user` reports that there is no first user at all.
     no_first_user: bool,
+    /// The seeded first user's name; `bob` when unset.
+    first_user_name: Option<String>,
+    /// Records the last new name passed to `rename_user`.
+    renamed: Mutex<Option<String>>,
 }
 
 /// The fixed two-user table shared by [`MemUsers`] and the assertions.
@@ -95,7 +99,7 @@ impl UserManager for MemUsers {
         }
         Ok(Some(user_entity(
             BOB_ID,
-            "bob",
+            self.first_user_name.as_deref().unwrap_or("bob"),
             self.first_user_password.as_deref(),
         )))
     }
@@ -106,8 +110,9 @@ impl UserManager for MemUsers {
         &self,
         _user_id: Uuid,
         _old_name: &str,
-        _new_name: &str,
+        new_name: &str,
     ) -> Result<(), ServiceError> {
+        *self.renamed.lock().unwrap() = Some(new_name.to_owned());
         Ok(())
     }
     async fn update_user(&self, _user: &UserEntity) -> Result<(), ServiceError> {
@@ -646,8 +651,11 @@ async fn startup_user_get_and_set_password() {
 // Do not relax any of them: 10.11.8's shape is the hole batch A1 closed on this
 // same controller, one layer deeper.
 
-/// Drives one `POST /Startup/User` against `users` and returns the status.
-async fn post_startup_user(users: Arc<MemUsers>, body: serde_json::Value) -> StatusCode {
+/// Drives one `POST /Startup/User` against `users` and returns the response.
+async fn post_startup_user_response(
+    users: Arc<MemUsers>,
+    body: serde_json::Value,
+) -> axum::response::Response {
     let router = create_router(state(users, Arc::new(MemConfig::new(false))));
     router
         .oneshot(
@@ -660,7 +668,57 @@ async fn post_startup_user(users: Arc<MemUsers>, body: serde_json::Value) -> Sta
         )
         .await
         .unwrap()
-        .status()
+}
+
+/// Drives one `POST /Startup/User` against `users` and returns the status.
+async fn post_startup_user(users: Arc<MemUsers>, body: serde_json::Value) -> StatusCode {
+    post_startup_user_response(users, body).await.status()
+}
+
+/// `UpdateStartupUser` renames only when the sent name differs from the stored
+/// one under `StringComparison.InvariantCultureIgnoreCase`: a change of case,
+/// of any letter, keeps the stored name (and so announces no `UserUpdated`).
+#[rstest::rstest]
+#[case("bob", "Bob", None)]
+#[case("ärne", "Ärne", None)]
+#[case("ÄRNE", "ärne", None)]
+#[case("ärne", "Arne", Some("Arne"))]
+#[case("bob", "robert", Some("robert"))]
+#[tokio::test]
+async fn startup_user_post_renames_only_a_name_that_differs_beyond_case(
+    #[case] stored: &str,
+    #[case] sent: &str,
+    #[case] renamed: Option<&str>,
+) {
+    let users = Arc::new(MemUsers {
+        first_user_name: Some(stored.to_owned()),
+        ..MemUsers::default()
+    });
+    let status = post_startup_user(
+        users.clone(),
+        serde_json::json!({ "Name": sent, "Password": "pw" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    assert_eq!(users.renamed.lock().unwrap().as_deref(), renamed);
+    assert_eq!(
+        users.changed_password.lock().unwrap().clone(),
+        Some((BOB_ID, "pw".to_owned()))
+    );
+}
+
+/// `startupUserDto.Name is not null`: a missing or null `Name` renames no one.
+#[rstest::rstest]
+#[case(serde_json::json!({ "Password": "pw" }))]
+#[case(serde_json::json!({ "Name": null, "Password": "pw" }))]
+#[tokio::test]
+async fn startup_user_post_without_a_name_keeps_the_stored_one(#[case] body: serde_json::Value) {
+    let users = Arc::new(MemUsers::default());
+    assert_eq!(
+        post_startup_user(users.clone(), body).await,
+        StatusCode::NO_CONTENT
+    );
+    assert_eq!(users.renamed.lock().unwrap().as_deref(), None);
 }
 
 #[tokio::test]
@@ -671,12 +729,16 @@ async fn startup_user_post_returns_404_when_no_first_user() {
         no_first_user: true,
         ..MemUsers::default()
     });
-    let status = post_startup_user(
+    let response = post_startup_user_response(
         users.clone(),
         serde_json::json!({ "Name": "admin", "Password": "pw" }),
     )
     .await;
-    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    // The parameterless `NotFound()`: ASP.NET's ProblemDetails, no message.
+    let problem = body_json(response).await;
+    assert_eq!(problem["title"], "Not Found");
+    assert_eq!(problem["status"], 404);
     assert!(users.changed_password.lock().unwrap().is_none());
 }
 
