@@ -183,7 +183,10 @@ pub trait MediaEncoder: Send + Sync {
     /// ffmpeg exposes as a stream) of a video file to a temporary file in
     /// `format`, returning its path. Port of the `ExtractVideoImage(inputFile,
     /// container, mediaSource, imageStream, imageStreamIndex, targetFormat, …)`
-    /// overload `EmbeddedImageProvider` calls.
+    /// overload `EmbeddedImageProvider` calls. `image_stream` is the picked
+    /// embedded-image stream, which the extraction takes as its video stream
+    /// (deinterlaced when ffprobe calls it interlaced); an attachment passes
+    /// `None`.
     ///
     /// The default reports the operation as unsupported, for encoders (and
     /// test doubles) that only extract frames.
@@ -197,10 +200,18 @@ pub trait MediaEncoder: Send + Sync {
         input_file: &str,
         container: &str,
         media_source: &MediaSourceInfo,
+        image_stream: Option<&MediaStream>,
         stream_index: i32,
         format: ImageFormat,
     ) -> Result<String, ServiceError> {
-        let _ = (input_file, container, media_source, stream_index, format);
+        let _ = (
+            input_file,
+            container,
+            media_source,
+            image_stream,
+            stream_index,
+            format,
+        );
         Err(ServiceError::backend(
             "this media encoder cannot extract embedded image streams",
         ))
