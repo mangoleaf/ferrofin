@@ -29,7 +29,7 @@ use ferrofin_model::dto::ItemCounts;
 use ferrofin_model::entities::ImageType;
 use ferrofin_model::entities::MediaStreamType;
 use ferrofin_model::querying::{QueryFiltersLegacy, QueryResult};
-use ferrofin_traits::options::{ItemImageInfo, live_tv_image_is_internal};
+use ferrofin_traits::options::{ItemImageInfo, file_date_modified, live_tv_image_is_internal};
 use uuid::Uuid;
 
 use ferrofin_traits::error::ServiceError;
@@ -4504,13 +4504,9 @@ impl ItemRepository for FerrofinItemRepository {
         // their paths — and then clears the cached dimensions and re-reads each
         // modified time from its file.
         let modified = tokio::task::spawn_blocking(move || {
-            swap_image_files(std::path::Path::new(&path1), std::path::Path::new(&path2))?;
-            let stamp = |path: &str| {
-                std::fs::metadata(path)
-                    .and_then(|meta| meta.modified())
-                    .map_or_else(|_| Utc::now(), chrono::DateTime::<Utc>::from)
-            };
-            Ok::<_, std::io::Error>((stamp(&path1), stamp(&path2)))
+            let (path1, path2) = (std::path::Path::new(&path1), std::path::Path::new(&path2));
+            swap_image_files(path1, path2)?;
+            Ok::<_, std::io::Error>((file_date_modified(path1), file_date_modified(path2)))
         })
         .await
         .map_err(|error| ServiceError::backend(error.to_string()))?
