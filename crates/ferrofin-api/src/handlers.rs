@@ -2272,7 +2272,10 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
                    provider_manager.rs \
                    refresh_item (the chosen ids stored first, RemoveImages under \
                    RemoveOldMetadata with ReplaceAllImages, a season's and an episode's \
-                   providers given the chosen ids as their series', refresh_ordered_images \
+                   providers given the chosen ids as their series' and the item's own ids \
+                   cleared (ApplySearchResult runs whenever the item has a provider: an \
+                   episode always, its forced ProbeProvider and TrickplayProvider, a \
+                   path-less season only when a remote one runs), refresh_ordered_images \
                    with the chosen provider first). Compared with RefreshMetadata, \
                    ApplySearchResult, GetProviders, RefreshWithProviders, \
                    GetNonLocalImageProviders, ProviderManager.RefreshItem, \
@@ -2300,9 +2303,6 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
              virtual season or episode) asks no plugin metadata source. Fix path: gl-1773.",
             "An item the provider manager refreshes runs no local image provider \
              (ValidateImages), except for a virtual season. Fix path: gl-1053.",
-            "Identify on a virtual season or episode keeps the chosen result's (its \
-             series') ids as its own; upstream's ApplySearchResult clears the item's ids, \
-             so it keeps only what its providers return. Fix path: gl-1809.",
             "Replacing all images under RemoveOldMetadata removes only the images in the \
              item's metadata folders, not artwork saved beside the media in a library that \
              saves artwork into media folders, nor beside any other kind whose \

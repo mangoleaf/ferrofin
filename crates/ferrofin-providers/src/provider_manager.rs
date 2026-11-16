@@ -2749,6 +2749,20 @@ impl LocalProviderManager {
         } else {
             None
         };
+        // `ApplySearchResult` (`MetadataService.cs:272-293`) clears an
+        // identified season's or episode's own ids whenever the item has a
+        // provider (`providers.Count > 0`): the lookup's `ProviderIds` are the
+        // item's (`GetItemLookupInfo`), so it keeps only the ids they return.
+        // An episode always has one, its forced `ProbeProvider` and
+        // `TrickplayProvider`, whatever the lock and the checkboxes; a
+        // path-less season has only remote ones, and with none of them
+        // nothing clears the chosen ids stored above.
+        let own_ids_cleared = options.search_result.is_some()
+            && match BaseItemKind::from_stored_type_name(&stored.type_) {
+                Some(BaseItemKind::Episode) => true,
+                Some(BaseItemKind::Season) => fetch.metadata,
+                _ => false,
+            };
         // The fetch, with its provider failures counted: a provider that
         // failed keeps the refresh from being stamped, one that found nothing
         // does not (owner decision D1, `RefreshResult.Failures`).
@@ -2898,7 +2912,11 @@ impl LocalProviderManager {
         // country (`MetadataService.cs:790-795`) — merges onto the stored row
         // when a provider answered (`UpdateType > None`).
         let current = MetadataResult {
-            provider_ids: stored_ids.clone(),
+            provider_ids: if own_ids_cleared {
+                Vec::new()
+            } else {
+                stored_ids.clone()
+            },
             locked_fields: locked_fields.clone(),
             ..MetadataResult::of(base)
         };
@@ -13710,6 +13728,117 @@ mod tests {
             "{asked:?}"
         );
         assert!(!asked.iter().any(|l| l.contains("/episode/3")), "{asked:?}");
+    }
+
+    /// A series' Identify result: its TheMovieDb id and an id no season or
+    /// episode provider answers with.
+    const CHOSEN: &[(&str, &str)] = &[("Tmdb", "1399"), ("Zap2It", "SH0001")];
+
+    /// The options "Identify → Apply" refreshes with for a series' result
+    /// `ids`: a season or an episode supports no Identify, so a result is
+    /// always its series' (`ApplySearchResult`).
+    fn identify_series(ids: &[(&str, &str)]) -> MetadataRefreshOptions {
+        MetadataRefreshOptions {
+            search_result: Some(RemoteSearchResult {
+                name: Some("Show".to_owned()),
+                provider_ids: Some(
+                    ids.iter()
+                        .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+                        .collect(),
+                ),
+                search_provider_name: Some(crate::library_options::fetcher_names::TMDB.to_owned()),
+                ..RemoteSearchResult::default()
+            }),
+            remove_old_metadata: true,
+            ..full_metadata_refresh()
+        }
+    }
+
+    /// `ids` as owned pairs, sorted.
+    fn sorted_ids(ids: &[(&str, &str)]) -> Vec<(String, String)> {
+        let mut ids: Vec<(String, String)> = ids
+            .iter()
+            .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+            .collect();
+        ids.sort();
+        ids
+    }
+
+    /// A stored season or episode, as it was.
+    fn as_stored(_: &mut BaseItemEntity) {}
+
+    /// A locked one.
+    fn locked(row: &mut BaseItemEntity) {
+        row.is_locked = true;
+    }
+
+    /// One without a number, which resolves to no provider target.
+    fn unnumbered(row: &mut BaseItemEntity) {
+        row.index_number = None;
+    }
+
+    /// Identify on a season or an episode the provider manager refreshes (a
+    /// path-less season; here a remote-path episode, which the rule does not
+    /// tell from a path-less one): `ApplySearchResult` hands the chosen
+    /// result's ids to the lookup as its series'
+    /// (`SeriesProviderIds`) and clears the lookup's own `ProviderIds`, which
+    /// are the item's (`GetItemLookupInfo` shares the dictionary the
+    /// controller's `SetProviderIds` just replaced), whenever the item has a
+    /// provider. So it keeps only the ids its providers return, none when
+    /// they fail or cannot look it up: never the series' ids from the result.
+    /// An episode always has a provider (the forced `ProbeProvider` and
+    /// `TrickplayProvider`), locked or with every fetcher unticked. A
+    /// path-less season has only remote ones: locked or with none ticked,
+    /// nothing clears the chosen ids.
+    #[rstest::rstest]
+    #[case::season_providers_run("TV.Season", &[crate::library_options::fetcher_names::TMDB], as_stored, false, &[("Tmdb", "3624"), ("Tvdb", "364731")])]
+    #[case::season_providers_fail("TV.Season", &[crate::library_options::fetcher_names::TMDB], as_stored, true, &[])]
+    #[case::season_without_a_number("TV.Season", &[crate::library_options::fetcher_names::TMDB], unnumbered, false, &[])]
+    #[case::season_no_provider("TV.Season", &[], as_stored, false, CHOSEN)]
+    #[case::season_locked("TV.Season", &[crate::library_options::fetcher_names::TMDB], locked, false, CHOSEN)]
+    #[case::episode_providers_run("TV.Episode", &[crate::library_options::fetcher_names::TMDB], as_stored, false, &[("Imdb", "tt0002002"), ("Tmdb", "9002"), ("Tvdb", "5002")])]
+    #[case::episode_providers_fail("TV.Episode", &[crate::library_options::fetcher_names::TMDB], as_stored, true, &[])]
+    #[case::episode_no_provider("TV.Episode", &[], as_stored, false, &[])]
+    #[case::episode_locked("TV.Episode", &[crate::library_options::fetcher_names::TMDB], locked, false, &[])]
+    #[tokio::test]
+    async fn identifying_a_virtual_season_or_episode_keeps_only_its_providers_ids(
+        #[case] kind: &str,
+        #[case] fetchers: &[&str],
+        #[case] edit: fn(&mut BaseItemEntity),
+        #[case] fail: bool,
+        #[case] expected: &[(&str, &str)],
+    ) {
+        let (item_id, store, mgr, log) = if kind == "TV.Season" {
+            let (base, log) = spawn_season_providers(fail);
+            let season = VirtualSeason::new(&base, &[], season_fetchers(fetchers), edit);
+            (season.season_id, season.store, season.mgr, log)
+        } else {
+            let (base, log) = spawn_episode_providers(fail);
+            let episode = VirtualEpisode::new(&base, &[], episode_fetchers(fetchers), |row| {
+                remote(row);
+                edit(row);
+            });
+            (episode.episode_id, episode.store, episode.mgr, log)
+        };
+        mgr.refresh_full_item(item_id, &identify_series(CHOSEN))
+            .await
+            .expect("apply");
+        let mut ids = store
+            .stored_ids
+            .lock()
+            .expect("lock")
+            .get(&item_id)
+            .cloned()
+            .expect("ids");
+        ids.sort();
+        assert_eq!(ids, sorted_ids(expected));
+        if !fail && expected.iter().any(|&(key, _)| key == "Tvdb") {
+            let asked = log.lock().expect("log").clone();
+            assert!(
+                asked.iter().any(|l| l.contains("/tmdb/tv/1399/season/1")),
+                "the series is resolved by the chosen ids: {asked:?}"
+            );
+        }
     }
 
     /// The episode's own credits: TheMovieDb's guest star and TheTVDB's guest are
