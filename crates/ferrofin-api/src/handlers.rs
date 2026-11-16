@@ -1982,7 +1982,12 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
                    InputAudioSync and InputVideoSync, a wma or asf container's audio sync \
                    among them, -re, -readrate and -readrate_catchup, an RTSP input's \
                    -rtsp_transport tcp+udp -rtsp_flags prefer_tcp, one -fflags joining \
-                   +igndts, +ignidx and +genpts (GenPtsInput or a copied video), and the \
+                   +igndts, +ignidx and +genpts (GenPtsInput or a copied video), a video \
+                   request's -f with its container's input format from \
+                   encoding_helper/helper.rs input_format (GetInputFormat) while any \
+                   hardware acceleration type but none is configured, upstream's \
+                   never-assigned EncodingJobInfo.VideoType reading VideoFile for every job \
+                   (a disc rip's -f concat comes later and wins), and the \
                    looping reconnect options) over \
                    transcoding/throttler.rs effective_input_protocol (AttachMediaSourceInfo's \
                    EncoderPath and EncoderProtocol), encoding_helper/hw/input_args.rs \
@@ -1995,6 +2000,10 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
                    external_stream_input_arguments and needs_external_subtitle_muxing (the \
                    rest of GetInputArgument: the external subtitle, read through the .idx \
                    beside a VobSub .sub, then the external audio; NeedsExternalSubtitleMuxing), \
+                   then GetInputArgument's last rule, -noautoscale after the inputs whenever \
+                   encoding_helper/hw/decoder.rs hardware_video_decoder names a decoder \
+                   (GetHardwareVideoDecoder non-empty, a hardware decode feeding a software \
+                   encoder included), \
                    and EncodingHelper::map_args with subtitle_map_args, \
                    negative_map_args_by_filters and find_index (GetMapArgs, \
                    GetNegativeMapArgsByFilters, FindIndex). Compared with those methods at the \
@@ -2013,9 +2022,14 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
                    among them, gl-1768",
         date: "2026-11-14",
         divergences: &[
-            "A job reading a video file with hardware acceleration configured passes no -f \
-             with the container's input format (GetInputFormat). Fix path: gl-1676.",
-            "A job behind a hardware decoder passes no -noautoscale. Fix path: gl-928.",
+            "The -f input format reads IsVideoRequest as is_input_video, the item's media \
+             type, as the hardware device arguments do, so an audio-route request for a video \
+             item with an accelerator configured passes it, where upstream's audio routes are \
+             never video requests, and a video-route request for an audio item does not; \
+             ffmpeg reads the file's own demuxer either way. Fix path: gl-1831.",
+            "An AMF, VideoToolbox or RKMPP job passes no -noautoscale where its accelerator \
+             names a decoder: it decodes in software here, so ffmpeg keeps its scaler. That \
+             is the owner's hardware scope decision (CLAUDE.md, Current scope).",
             "A seeked HLS job copying the video passes -noaccurate_seek (not for a wtv \
              input), which upstream does not: Ferrofin's HLS output carries -output_ts_offset \
              in place of upstream's -copyts, and without it a re-encoded audio track would \
