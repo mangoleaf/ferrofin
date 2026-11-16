@@ -472,7 +472,7 @@ pub static SETTINGS: &[SettingSpec] = &[
         access: SettingAccess::ReadOnly(
             "Dashboard → General → Server name. This value is used only when that is empty.",
         ),
-        default: "the host name",
+        default: "the machine name",
         description: "Server name reported to clients.",
         running: |c| json!(c.server_name),
         ..ROW

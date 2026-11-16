@@ -5478,10 +5478,14 @@ pub const VERIFIED: &[Verified] = &[
                format_api_url (GetLocalApiUrl's UriBuilder, which writes any port it is given \
                and escapes the base URL as UriBuilder.Path does, a backslash aside: \
                ferrofin-networking escape_base_url, checked against 12.4's discovery Address), \
-               friendly_name (FriendlyName: the saved ServerName unless empty), the emulated \
-               version, PRODUCT_NAME (Name), the system id (DeviceId), the startup-wizard flag, \
-               the lifecycle's restart-pending and shutting-down flags (which operations raise \
-               the first is theirs to record), the bound HTTP \
+               friendly_name (FriendlyName: the saved ServerName unless empty, else the \
+               server_name setting, whose default, config.rs default_server_name, is \
+               application_host.rs machine_name for Environment.MachineName: gethostname cut at \
+               its first dot, the computer name (its COMPUTERNAME variable) on Windows, \
+               ferrofin when there is none), the \
+               emulated version, PRODUCT_NAME (Name), the system id (DeviceId), the \
+               startup-wizard flag, the lifecycle's restart-pending and shutting-down flags \
+               (which operations raise the first is theirs to record), the bound HTTP \
                port (HttpPort), CompletedInstallations from plugin_manager.rs \
                completed_installations (InstallationManager.CompletedInstallations: the \
                InstallationInfo GetCompatibleVersions built for each package install_package \
@@ -5504,9 +5508,12 @@ pub const VERIFIED: &[Verified] = &[
             "PackageName is the constant ferrofin-server; upstream reports its --package-name \
          startup option and omits the member without one. Fix path: gl-1755, whose default \
          awaits an owner decision.",
-            "With no server name saved, ServerName falls back to the server_name setting, \
-         whose default is the HOSTNAME environment variable, else ferrofin; upstream's is \
-         Environment.MachineName, the host name cut at its first dot. Fix path: gl-1777.",
+            "With no server name saved, ServerName falls back to the server_name setting \
+         (FERROFIN_SERVER_NAME), whose default is upstream's Environment.MachineName; another \
+         value diverges, as upstream has no such setting. Like every bootstrap setting it is \
+         resolved when the server starts or restarts (the settings page's Applies: Restart), \
+         where upstream reads the machine name on every call, and a host name that leaves no \
+         name before its first dot gives ferrofin where upstream answers an empty name.",
             "LocalAddress is chosen for the client address with an IPv4-mapped IPv6 address \
          unmapped, as GetNormalizedRemoteIP gives it; upstream's GetSmartApiUrl passes \
          Connection.RemoteIpAddress as given, so behind a dual-stack listener an IPv4 client \
@@ -5599,15 +5606,18 @@ pub const VERIFIED: &[Verified] = &[
                (SystemManager.GetPublicSystemInfo): the LocalAddress, ServerName, Version, \
                ProductName, Id and StartupWizardCompleted of the get /System/Info row, and \
                OperatingSystem's fixed empty string. Probed on Jellyfin 12.4 as that row was",
-        date: "2026-11-14",
+        date: "2026-11-15",
         divergences: &[
             "Version is the Jellyfin release Ferrofin emulates (openapi.rs \
          JELLYFIN_API_VERSION, 12.4.0), not Ferrofin's own release version, which upstream's \
          field would carry. Deliberate: clients gate on it (jellyfin-web refuses a server \
          below 10.10.0, the Kotlin SDK flags one below 12.0.0).",
-            "With no server name saved, ServerName falls back to the server_name setting, \
-         whose default is the HOSTNAME environment variable, else ferrofin; upstream's is \
-         Environment.MachineName, the host name cut at its first dot. Fix path: gl-1777.",
+            "With no server name saved, ServerName falls back to the server_name setting \
+         (FERROFIN_SERVER_NAME), whose default is upstream's Environment.MachineName; another \
+         value diverges, as upstream has no such setting. Like every bootstrap setting it is \
+         resolved when the server starts or restarts (the settings page's Applies: Restart), \
+         where upstream reads the machine name on every call, and a host name that leaves no \
+         name before its first dot gives ferrofin where upstream answers an empty name.",
             "LocalAddress is chosen for the client address with an IPv4-mapped IPv6 address \
          unmapped, as GetNormalizedRemoteIP gives it; upstream's GetSmartApiUrl passes \
          Connection.RemoteIpAddress as given, so behind a dual-stack listener an IPv4 client \
