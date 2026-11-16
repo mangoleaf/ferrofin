@@ -8,8 +8,8 @@
 //! - `POST /ScheduledTasks/Running/{taskId}` — run a task now (`204`; `404` when
 //!   missing).
 //! - `DELETE /ScheduledTasks/Running/{taskId}` — cancel a task (`204`; `404` when
-//!   missing). A running task's spawned run is aborted and recorded as
-//!   `Cancelled`, matching the C# `StopTask`.
+//!   missing). A running task is asked to stop and reads `Cancelling` until its
+//!   run returns and records its result, matching the C# `StopTask`.
 //! - `POST /ScheduledTasks/{taskId}/Triggers` — replace a task's configured
 //!   triggers (`204`; `404` when missing). The triggers are persisted, surfaced
 //!   on the task's next read, and acted on by the registry's scheduler.
@@ -146,8 +146,9 @@ async fn start_task(
 /// `DELETE /ScheduledTasks/Running/{taskId}` — cancel a task.
 ///
 /// Port of `ScheduledTasksController.StopTask` → `ITaskManager.Cancel`. Returns
-/// `204 No Content`; a missing task is `404`. A running task's spawned run is
-/// aborted and recorded as `Cancelled`; an idle task is left idle.
+/// `204 No Content`; a missing task is `404`. A running task is asked to stop
+/// and reads `Cancelling` until its run returns and records its result; an
+/// idle task is left idle.
 #[utoipa::path(
     delete,
     path = "/ScheduledTasks/Running/{taskId}",

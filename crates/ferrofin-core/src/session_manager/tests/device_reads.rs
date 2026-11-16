@@ -14,7 +14,7 @@ use async_trait::async_trait;
 use ferrofin_db::Database;
 use ferrofin_db::entities::security::{DeviceEntity, DeviceOptionsEntity};
 use ferrofin_db::entities::users::UserEntity;
-use ferrofin_model::dto::{ClientCapabilitiesDto, DeviceInfoDto};
+use ferrofin_model::dto::DeviceInfoDto;
 use ferrofin_model::querying::QueryResult;
 use ferrofin_model::session::{
     ClientCapabilities, PlaybackProgressInfo, PlaybackStartInfo, PlaybackStopInfo,
@@ -135,12 +135,6 @@ impl DeviceManager for CountingDevices {
             rendezvous.wait().await;
         }
         self.inner.get_device_options(device_id).await
-    }
-    async fn to_client_capabilities_dto(
-        &self,
-        capabilities: &ClientCapabilities,
-    ) -> Result<ClientCapabilitiesDto, ServiceError> {
-        self.inner.to_client_capabilities_dto(capabilities).await
     }
 }
 

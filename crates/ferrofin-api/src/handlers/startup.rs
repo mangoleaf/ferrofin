@@ -25,10 +25,11 @@ use axum::extract::State;
 use axum::http::StatusCode;
 use axum::routing::{get, post};
 use axum::{Json, Router};
+use ferrofin_util::string_extensions::equals_invariant_ignore_case;
 use serde::{Deserialize, Serialize};
 
 use crate::auth::FirstTimeSetupOrElevated;
-use crate::error::ApiError;
+use crate::error::{ApiError, ProblemStatus};
 use crate::extract::JsonBody;
 use crate::handlers::items::user_uuid;
 use crate::state::AppState;
@@ -217,15 +218,12 @@ async fn set_remote_access(
     let document = serde_json::to_value(&config).map_err(|e| {
         ApiError::from(ferrofin_traits::error::ServiceError::backend(e.to_string()))
     })?;
-    tokio::spawn(crate::handlers::config::save_named_configuration(
+    crate::handlers::run_detached(crate::handlers::config::save_named_configuration(
         state,
         "network".to_owned(),
         document,
     ))
-    .await
-    .map_err(|error| {
-        ferrofin_traits::error::ServiceError::backend(format!("configuration worker: {error}"))
-    })??;
+    .await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -280,7 +278,8 @@ async fn update_startup_user(
         .users
         .get_first_user()
         .await?
-        .ok_or_else(|| ApiError::NotFound("no first user".to_owned()))?;
+        // `return NotFound();`: parameterless, so ASP.NET's ProblemDetails body.
+        .ok_or(ApiError::Problem(ProblemStatus::NotFound))?;
 
     // `if (!string.IsNullOrEmpty(user.Password)) return Forbid();` — upstream
     // security commit 62a5ded920. An EMPTY string is not a password: Jellyfin's
@@ -302,8 +301,10 @@ async fn update_startup_user(
     let user_id = user_uuid(&user)?;
     state.users.update_user(&user).await?;
 
+    // `InvariantCultureIgnoreCase`: a name that differs only in case, of any
+    // letter, keeps the stored one and announces nothing.
     if let Some(name) = &body.name
-        && !name.eq_ignore_ascii_case(&user.username)
+        && !equals_invariant_ignore_case(name, &user.username)
     {
         state
             .users

@@ -14,6 +14,7 @@ ferrofin-mediaencoding.workspace = true
 ferrofin-keyframes.workspace = true
 ferrofin-model.workspace = true
 ferrofin-traits.workspace = true
+ferrofin-util.workspace = true
 async-trait.workspace = true
 tokio = { workspace = true }
 thiserror.workspace = true

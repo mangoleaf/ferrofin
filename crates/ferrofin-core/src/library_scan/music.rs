@@ -46,9 +46,9 @@ use uuid::Uuid;
 
 use super::{
     FetcherPolicy, LibraryScanner, RefreshReach, RemoteAnswer, RemoteFold, RemoteImage, ScanCancel,
-    ScanOutcome, ScanRun, Served, append_fanart, apply_album_child_metadata, first_album_tag,
-    images_changed, item_values_of, preferred_language, provider_order, search_result_ids,
-    split_pipe,
+    ScanOutcome, ScanRun, Served, album_walk_order, append_fanart, apply_album_child_metadata,
+    first_album_tag, images_changed, item_values_of, preferred_language, provider_order,
+    search_result_ids, split_pipe,
 };
 use crate::item_type_lookup;
 use crate::refresh_plan::{
@@ -313,13 +313,15 @@ enum MusicSource {
 /// the three-category tie rule is spelled out). Identifying moves the
 /// provider the chosen result came from to the front ("When identifying, run
 /// the provider the user picked first so the correct IDs are used",
-/// `MetadataService.cs:876-882`, a stable `OrderBy`).
+/// `MetadataService.cs:876-882`, a stable `OrderBy`) — `chosen` is the
+/// refresh's `options.SearchResult`, which the options copy carries to the
+/// albums below an identified artist too, not only the identified item.
 ///
 /// [`BUILT_IN_METADATA_FETCHERS`]: ferrofin_providers::library_options::BUILT_IN_METADATA_FETCHERS
 fn music_sources(
     policy: FetcherPolicy<'_>,
     kind: MusicKind,
-    identified: Option<&RemoteSearchResult>,
+    chosen: Option<&RemoteSearchResult>,
     dynamic: &[(usize, Option<&str>, i32)],
 ) -> Vec<MusicSource> {
     use ferrofin_providers::library_options::{BUILT_IN_METADATA_FETCHERS, default_metadata_order};
@@ -343,7 +345,7 @@ fn music_sources(
         policy,
         kind.type_name(),
         &candidates,
-        identified.and_then(|r| r.search_provider_name.as_deref()),
+        chosen.and_then(|r| r.search_provider_name.as_deref()),
     )
 }
 
@@ -478,6 +480,7 @@ const ARTIST_FACTS: FileFacts = FileFacts {
     is_shortcut: false,
     is_file_protocol: false,
     is_placeholder: false,
+    is_photo: false,
     path_rebased: false,
     locations_changed: false,
 };
@@ -1051,11 +1054,16 @@ impl LibraryScanner {
             // Its tagged items give it its runtime, never an id.
             MusicKind::ByNameArtist => work.aggregate,
         };
-        let children = if children_needed {
+        let mut children = if children_needed {
             items.get_item_list(&Self::music_children(work)).await?
         } else {
             Vec::new()
         };
+        // `GetRecursiveChildren`' depth-first walk; the query's order only
+        // breaks its ties.
+        if work.kind == MusicKind::Album {
+            album_walk_order(stored.path.as_deref(), &mut children);
+        }
         let child_ids = if children.is_empty() {
             HashMap::new()
         } else {
@@ -1305,8 +1313,9 @@ impl LibraryScanner {
     /// `:142-147`): the first `MusicArtist` among the album's parents,
     /// walked up from its own; else the artist named by the album's first
     /// album artist — `LibraryManager.GetArtist(name)` → `CreateItemByName`
-    /// (`LibraryManager.cs:1348-1362`): the `MusicArtist` rows of that raw
-    /// name (`UseRawName`), a folder artist before one known only by name
+    /// (`LibraryManager.cs:1348-1361`): the `MusicArtist` rows of that name's
+    /// `CleanName` (12.2 dropped `UseRawName`, PR 18005), a folder artist
+    /// before one known only by name
     /// (`OrderBy(i => i.IsAccessedByName ? 1 : 0)`). A parent that cannot be
     /// read ends the walk.
     ///
@@ -1348,7 +1357,6 @@ impl LibraryScanner {
                 .get_item_list(&InternalItemsQuery {
                     include_item_types: vec![BaseItemKind::MusicArtist],
                     name: Some(name),
-                    use_raw_name: Some(true),
                     ..InternalItemsQuery::default()
                 })
                 .await?;
@@ -1372,7 +1380,8 @@ impl LibraryScanner {
     }
 
     /// The query for `work`'s children: an album's tracks (recursive, so a
-    /// multi-disc album aggregates), a folder artist's tracks, a by-name
+    /// multi-disc album aggregates; the caller puts them in upstream's walk
+    /// order, [`album_walk_order`]), a folder artist's tracks, a by-name
     /// artist's tagged items.
     fn music_children(work: &MusicRefresh<'_>) -> InternalItemsQuery {
         match work.kind {
@@ -1538,7 +1547,8 @@ impl LibraryScanner {
             });
         let mut audiodb_images = None;
         let dynamic = self.music_dynamic_sources(work, fetch);
-        for source in music_sources(work.policy, work.kind, work.identified, &dynamic) {
+        let chosen = work.request.options.search_result.as_ref();
+        for source in music_sources(work.policy, work.kind, chosen, &dynamic) {
             match source {
                 MusicSource::MusicBrainz => {
                     let (true, Some(mb)) = (fetch.musicbrainz, &self.musicbrainz) else {
@@ -1713,7 +1723,8 @@ impl LibraryScanner {
         };
         let mut audiodb_images = None;
         let dynamic = self.music_dynamic_sources(work, fetch);
-        for source in music_sources(work.policy, work.kind, work.identified, &dynamic) {
+        let chosen = work.request.options.search_result.as_ref();
+        for source in music_sources(work.policy, work.kind, chosen, &dynamic) {
             match source {
                 MusicSource::MusicBrainz => {
                     let (true, Some(mb)) = (fetch.musicbrainz, &self.musicbrainz) else {
@@ -1943,7 +1954,19 @@ impl LibraryScanner {
                     .map(|p| (p.name(), None)),
             );
         }
-        sources.sort_by_key(|(name, _)| work.policy.image_order(kind, name));
+        // Identifying runs the chosen result's provider first
+        // (`GetNonLocalImageProviders`, `MetadataService.cs:722-727`), for
+        // every item the refresh's options carry that result to.
+        let policy = FetcherPolicy {
+            identified_by: work
+                .request
+                .options
+                .search_result
+                .as_ref()
+                .and_then(|r| r.search_provider_name.as_deref()),
+            ..work.policy
+        };
+        sources.sort_by_key(|(name, _)| policy.image_order(kind, name));
         let meta_root = meta_root.resolve();
         let dir = crate::dynamic_images::own_art_dir(&meta_root, work.id);
         let mut images: Vec<_> = stored
@@ -1972,7 +1995,7 @@ impl LibraryScanner {
                     fetch.images == ImageFetch::All,
                 )
                 .await;
-                self.fill_image_metadata(&mut downloaded).await;
+                self.fill_image_metadata(work.id, &mut downloaded).await;
                 images.extend(downloaded);
             } else {
                 self.apply_dynamic_images(
@@ -1998,7 +2021,7 @@ impl LibraryScanner {
                     .cloned(),
             );
         }
-        self.fill_image_metadata(&mut images).await;
+        self.fill_image_metadata(work.id, &mut images).await;
         images_changed(&images, Some(&stored)).then_some(images)
     }
 }
@@ -2014,9 +2037,26 @@ impl LibraryScanner {
         policy: FetcherPolicy<'_>,
         remote: bool,
     ) {
-        let defaults = MetadataRefreshOptions::default();
+        self.music_pass_with_options_for_test(
+            items,
+            policy,
+            remote,
+            &MetadataRefreshOptions::default(),
+        )
+        .await;
+    }
+
+    /// [`music_pass_for_test`](Self::music_pass_for_test) refreshing with
+    /// `options`.
+    pub(super) async fn music_pass_with_options_for_test(
+        &self,
+        items: &[(Uuid, MusicKind)],
+        policy: FetcherPolicy<'_>,
+        remote: bool,
+        options: &MetadataRefreshOptions,
+    ) {
         let request = RefreshRequest {
-            options: &defaults,
+            options,
             force_save: false,
         };
         let plan = ItemRefreshPlan {

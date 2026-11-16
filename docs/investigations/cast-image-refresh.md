@@ -77,9 +77,9 @@ series and seasons). It runs without ffprobe or remote providers, so it measures
 local scan overhead, not provider latency. Outcomes were identical between builds.
 
 ```sh
-FERROFIN_SCAN_BENCH=1 FERROFIN_SCAN_BENCH_MOVIES=300 \
+FERROFIN_SCAN_BENCH_MOVIES=300 \
 FERROFIN_SCAN_BENCH_SERIES=10 FERROFIN_SCAN_BENCH_EPISODES=10 \
-RUSTC_WRAPPER= cargo test -p ferrofin-server --test scan_bench -- --nocapture
+RUSTC_WRAPPER= cargo test -p ferrofin-server --test scan_bench -- --include-ignored --nocapture
 ```
 
 Session artifacts: `/tmp/ferrofin-cast-scan-bench-before`,

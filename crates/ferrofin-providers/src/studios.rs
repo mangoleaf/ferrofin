@@ -120,7 +120,7 @@ impl StudiosClient {
     pub fn with_repo_url(repo_url: &str) -> Self {
         let trimmed = repo_url.trim_end_matches('/');
         Self {
-            http: reqwest::Client::new(),
+            http: crate::http_client::client(),
             limiter: RateLimiter::new("studios"),
             configured_repo_url: (!trimmed.is_empty()).then(|| trimmed.to_owned()),
             plugin: ConfigSource::new(),
@@ -265,10 +265,11 @@ impl StudiosClient {
         });
     }
 
-    /// Downloads `url`, returning its bytes; `None` on any failure
+    /// Downloads `url`: its bytes and the media type they are stored under;
+    /// `None` on any failure, a response that is no image included
     /// (best-effort, like the metadata clients' image downloads).
-    pub async fn download(&self, url: &str) -> Option<Vec<u8>> {
-        crate::image_download::download_bytes(url).await
+    pub async fn download(&self, url: &str) -> Option<(Vec<u8>, String)> {
+        crate::image_download::download_image_or_none(url).await
     }
 
     /// The thumb URL for `studio_name`, or `None` when the repository has no

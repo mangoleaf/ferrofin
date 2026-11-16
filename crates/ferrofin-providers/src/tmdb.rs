@@ -13,6 +13,7 @@
 use crate::rate_limit::CountedBody as _;
 use crate::rate_limit::{LimitedRequest as _, RateLimiter};
 use ferrofin_model::entities::ImageType;
+use ferrofin_util::string_extensions::ordinal_ignore_case_key;
 use secrecy::{ExposeSecret, SecretString};
 use serde::Deserialize;
 
@@ -34,6 +35,30 @@ fn image_type_size(image_type: ImageType) -> crate::plugin_config::TmdbImageKind
         ImageType::Backdrop | ImageType::Thumb => TmdbImageKind::Backdrop,
         ImageType::Logo => TmdbImageKind::Logo,
         _ => TmdbImageKind::Poster,
+    }
+}
+
+/// The TMDb size of the `ThumbnailUrl` preview of a poster, profile or still
+/// (all converted as `Primary`): `ThumbnailSizes["Primary"]`
+/// (`TmdbClientManager.cs:32-38`). Fixed upstream, not a plugin setting.
+const PRIMARY_THUMBNAIL_SIZE: &str = "w500";
+/// The preview size of a backdrop, including one returned as `Thumb`:
+/// `ThumbnailSizes["Backdrop"]`.
+const BACKDROP_THUMBNAIL_SIZE: &str = "w780";
+/// The preview size of a logo: `ThumbnailSizes["Logo"]`.
+const LOGO_THUMBNAIL_SIZE: &str = "w500";
+
+/// The size of the `ThumbnailUrl` preview a TMDb candidate of `family` carries:
+/// `ThumbnailSizes.GetValueOrDefault(type.ToString(), "")`, keyed by the type
+/// the converter was called with, before a languaged backdrop becomes a
+/// `Thumb` (`TmdbClientManager.cs:689`). An empty size is `GetUrl`'s
+/// `original`.
+fn thumbnail_size(family: ImageType) -> &'static str {
+    match family {
+        ImageType::Primary => PRIMARY_THUMBNAIL_SIZE,
+        ImageType::Backdrop | ImageType::Thumb => BACKDROP_THUMBNAIL_SIZE,
+        ImageType::Logo => LOGO_THUMBNAIL_SIZE,
+        _ => "original",
     }
 }
 /// Jellyfin's built-in TMDB v3 API key, used when no user key is configured so
@@ -119,7 +144,7 @@ fn search_hit_from(hit: SearchHit, cfg: &crate::plugin_config::TmdbConfig) -> Tm
         premiere_date: date,
         poster_url: non_empty(hit.poster_path)
             .map(|p| cfg.image_url(crate::plugin_config::TmdbImageKind::Poster, &p)),
-        overview: non_empty(hit.overview),
+        overview: hit.overview,
     }
 }
 
@@ -141,7 +166,8 @@ pub struct TmdbSearchHit {
     pub premiere_date: Option<String>,
     /// The poster image URL (for the result thumbnail).
     pub poster_url: Option<String>,
-    /// The plot overview.
+    /// The plot overview as TMDb sent it: an empty one is kept, as upstream's
+    /// Identify result keeps it (`Overview = movieResult.Overview`).
     pub overview: Option<String>,
 }
 
@@ -234,6 +260,9 @@ pub struct TmdbImage {
     pub image_type: ImageType,
     /// The full-resolution image URL.
     pub url: String,
+    /// A smaller preview of the image (`RemoteImageInfo.ThumbnailUrl`), when
+    /// the provider offers one.
+    pub thumbnail_url: Option<String>,
     /// The image width in pixels.
     pub width: Option<i32>,
     /// The image height in pixels.
@@ -261,7 +290,13 @@ impl From<TmdbImage> for RemoteImage {
 /// remote-image chooser, retaining dimensions for automatic acquisition.
 #[must_use]
 pub fn ordered_download_images(mut images: Vec<TmdbImage>, requested: &str) -> Vec<RemoteImage> {
-    crate::provider_manager::order_tmdb_images(&mut images, requested);
+    ferrofin_model::extensions::order_by_language_descending(&mut images, requested, |image| {
+        (
+            image.language.as_deref(),
+            image.community_rating,
+            image.vote_count,
+        )
+    });
     images.into_iter().map(RemoteImage::from).collect()
 }
 
@@ -360,7 +395,8 @@ pub struct TmdbDetails {
     pub original_language: Option<String>,
     /// Keyword tags attached to this movie or series.
     pub tags: Vec<String>,
-    /// Movie production-country names.
+    /// Movie production-country names; empty for a series, which upstream
+    /// gives none (`TmdbMovieProvider.cs:207`).
     pub production_locations: Vec<String>,
     /// Series home page.
     pub home_page_url: Option<String>,
@@ -372,17 +408,22 @@ pub struct TmdbDetails {
     pub collection_name: Option<String>,
     /// The series' TVRage id.
     pub tvrage_id: Option<String>,
-    /// Plot synopsis.
+    /// Plot synopsis as TMDb sent it: an empty one is kept for the Identify
+    /// result (`Overview = movie.Overview`); the refresh stores none for it.
     pub overview: Option<String>,
-    /// Marketing tagline.
+    /// A movie's marketing tagline; `None` for a series, which upstream gives
+    /// none (`TmdbMovieProvider.cs:206`).
     pub tagline: Option<String>,
     /// Genre names.
     pub genres: Vec<String>,
-    /// Production-company (studio) names.
+    /// Studio names: a series' networks then its production companies, a
+    /// movie's production companies; trimmed and distinct ignoring case.
     pub studios: Vec<String>,
     /// Community rating (`vote_average`, 0–10), when non-zero.
     pub community_rating: Option<f64>,
-    /// US content certification (e.g. `R`, `TV-MA`), when available.
+    /// The content certification: the metadata country's, prefixed
+    /// (`GB-15`, `FSK-12`), else the US one (`R`, `TV-MA`), else for a series
+    /// the first country's.
     pub official_rating: Option<String>,
     /// Release/first-air year.
     pub production_year: Option<i32>,
@@ -478,8 +519,8 @@ pub struct TmdbPersonHit {
     pub name: Option<String>,
     /// The profile image URL (`GetProfileUrl(profile_path)`), when present.
     pub profile_url: Option<String>,
-    /// The biography (only populated by a by-id lookup, like the C#
-    /// `GetPersonAsync` branch).
+    /// The biography as TMDb sent it, an empty one kept (only populated by a
+    /// by-id lookup, like the C# `GetPersonAsync` branch).
     pub biography: Option<String>,
     /// The IMDb id from `external_ids` (by-id lookup only).
     pub imdb_id: Option<String>,
@@ -488,34 +529,46 @@ pub struct TmdbPersonHit {
 /// A trailer/video link for a title (name + URL).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TmdbTrailer {
-    /// The video's display name.
-    pub name: String,
+    /// The video's display name as TMDb sends it, if any (`Name = video.Name`,
+    /// `TmdbMovieProvider.cs:380`); always `None` for an episode's trailer,
+    /// which upstream stores as a bare URL (`AddTrailerUrl`).
+    pub name: Option<String>,
     /// The absolute (YouTube) URL.
     pub url: String,
 }
 
 /// YouTube "Trailer"/"Teaser" videos from a details `videos` append become
-/// `RemoteTrailers` (the C# `TmdbMovieProvider` / `TmdbSeriesProvider` rule).
+/// `RemoteTrailers`, in the order given (the C# `TmdbUtils.IsTrailerType`
+/// filter, ignoring case).
 fn youtube_trailers(videos: Option<VideosResults>) -> Vec<TmdbTrailer> {
     videos
         .map(|v| v.results)
         .unwrap_or_default()
         .into_iter()
         .filter(|v| {
-            v.site.as_deref() == Some("YouTube")
-                && matches!(v.type_.as_deref(), Some("Trailer" | "Teaser"))
+            v.site
+                .as_deref()
+                .is_some_and(|s| s.eq_ignore_ascii_case("youtube"))
+                && (is_video_type(v, "trailer") || is_video_type(v, "teaser"))
         })
         .filter_map(|v| {
+            // Upstream formats a missing key into a dead link
+            // (`watch?v=`); a Jellyfin bug not ported.
             let key = v.key.filter(|k| !k.is_empty())?;
             Some(TmdbTrailer {
-                name: v
-                    .name
-                    .filter(|n| !n.is_empty())
-                    .unwrap_or_else(|| "Trailer".to_owned()),
+                name: v.name,
                 url: format!("https://www.youtube.com/watch?v={key}"),
             })
         })
         .collect()
+}
+
+/// Whether a TMDb video's `type` is `kind`, ignoring case.
+fn is_video_type(video: &VideoEntry, kind: &str) -> bool {
+    video
+        .type_
+        .as_deref()
+        .is_some_and(|t| t.eq_ignore_ascii_case(kind))
 }
 
 #[derive(Debug, Deserialize)]
@@ -546,8 +599,8 @@ struct DetailsResponse {
     genres: Vec<NamedEntry>,
     #[serde(default)]
     production_companies: Vec<NamedEntry>,
-    /// TV broadcast networks (HBO, AMC, …); empty for movies. Jellyfin's series
-    /// "Networks" browse is populated from these, not production companies.
+    /// TV broadcast networks (HBO, AMC, …); empty for movies. A series' studios
+    /// list these before its production companies.
     #[serde(default)]
     networks: Vec<NamedEntry>,
     #[serde(default)]
@@ -575,7 +628,7 @@ struct DetailsResponse {
     #[serde(default)]
     created_by: Option<Vec<CreatedByEntry>>,
     #[serde(default)]
-    release_dates: Option<ReleaseDatesResults>,
+    releases: Option<ReleasesResults>,
     #[serde(default)]
     content_ratings: Option<ContentRatingResults>,
     #[serde(default)]
@@ -593,7 +646,7 @@ struct DetailsResponse {
 pub struct EpisodeExtras {
     /// IMDb, TVDB and TVRage identities for this episode.
     pub provider_ids: Vec<(String, String)>,
-    /// Episode trailers.
+    /// Episode trailers, each a bare URL with no name (`AddTrailerUrl`).
     pub trailers: Vec<TmdbTrailer>,
     /// Credits, absent when the appended credits payload was unavailable.
     pub people: Option<Vec<TmdbPerson>>,
@@ -814,22 +867,18 @@ struct CrewEntry {
     profile_path: Option<String>,
 }
 
+/// The legacy `releases` append (TMDbLib's `MovieMethods.Releases`): every
+/// release of the movie in one list, each with its country.
 #[derive(Debug, Default, Deserialize)]
-struct ReleaseDatesResults {
+struct ReleasesResults {
     #[serde(default)]
-    results: Vec<ReleaseDatesCountry>,
+    countries: Vec<ReleaseCountry>,
 }
 
 #[derive(Debug, Deserialize)]
-struct ReleaseDatesCountry {
+struct ReleaseCountry {
     #[serde(default)]
     iso_3166_1: Option<String>,
-    #[serde(default)]
-    release_dates: Vec<ReleaseDatesEntry>,
-}
-
-#[derive(Debug, Deserialize)]
-struct ReleaseDatesEntry {
     #[serde(default)]
     certification: Option<String>,
 }
@@ -1089,24 +1138,24 @@ fn crew_person_type(department: Option<&str>, job: Option<&str>) -> Option<&'sta
     }
 }
 
-/// Requested-country certification, with Jellyfin's US fallback and prefix.
+/// Requested-country certification, with Jellyfin's prefix, its US fallback
+/// and, for a series, its first-country fallback.
 fn certification(
     kind: TmdbKind,
-    release_dates: Option<ReleaseDatesResults>,
+    releases: Option<ReleasesResults>,
     content_ratings: Option<ContentRatingResults>,
     country: Option<&str>,
 ) -> Option<String> {
     let country = country.filter(|c| !c.is_empty()).unwrap_or("US");
     let ratings: Vec<(String, String)> = match kind {
-        TmdbKind::Movie => release_dates?
-            .results
+        TmdbKind::Movie => releases?
+            .countries
             .into_iter()
             .filter_map(|entry| {
-                let rating = entry
-                    .release_dates
-                    .into_iter()
-                    .find_map(|r| r.certification.filter(|c| !c.trim().is_empty()))?;
-                Some((entry.iso_3166_1?, rating))
+                Some((
+                    entry.iso_3166_1?,
+                    entry.certification.filter(|c| !c.trim().is_empty())?,
+                ))
             })
             .collect(),
         TmdbKind::Series => content_ratings?
@@ -1133,10 +1182,13 @@ fn certification(
         };
         return Some(format!("{prefix}{rating}"));
     }
-    ratings
-        .into_iter()
-        .find(|(code, _)| code.eq_ignore_ascii_case("US"))
-        .map(|(_, rating)| rating)
+    let us = ratings
+        .iter()
+        .find(|(code, _)| code.eq_ignore_ascii_case("US"));
+    // A series rated in neither takes the first country's rating, bare
+    // (`TmdbSeriesProvider.cs:318,328-331`); a movie has no such fallback.
+    us.or_else(|| ratings.first().filter(|_| kind == TmdbKind::Series))
+        .map(|(_, rating)| rating.clone())
 }
 
 #[derive(Debug, Deserialize)]
@@ -1291,8 +1343,9 @@ pub fn normalize_language(language: Option<&str>, country_code: Option<&str>) ->
 /// comma separated (`"fr,null,en"`, `"en,null"`).
 ///
 /// `TmdbMovieProvider` hands exactly this string to `FindByExternalIdAsync`'s
-/// `language` argument (`TmdbMovieProvider.cs:96-101` and `:106-111` at v10.11.8), so
-/// TMDB's `/find` sees `language=en,null` for a movie. `TmdbSeriesProvider.cs:73` passes
+/// `language` argument (`TmdbMovieProvider.cs:96-101` and `:106-111` at v10.11.8), and
+/// that method runs [`normalize_language`] over it, so TMDB's `/find` sees
+/// `language=en,null` for a movie (`pt-BR,NULL,EN` for `pt-BR`). `TmdbSeriesProvider.cs:73` passes
 /// the bare `MetadataLanguage` instead. That asymmetry is upstream's, and it is ported
 /// rather than smoothed over: `/find` is the branch an IMDb/TVDB Identify search takes,
 /// and sending TMDB a different `language` than the oracle does is how the two servers
@@ -1411,6 +1464,9 @@ pub struct TmdbCollection {
     pub name: String,
     /// The collection's overview.
     pub overview: Option<String>,
+    /// TMDB's own poster pick (`poster_path`) as an absolute URL at the
+    /// configured poster size, if it has one.
+    pub poster_url: Option<String>,
     /// Poster/backdrop candidates, TMDB's own pick first.
     pub images: Vec<RemoteImage>,
 }
@@ -1505,7 +1561,7 @@ impl TmdbClient {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            http: reqwest::Client::new(),
+            http: crate::http_client::client(),
             limiter: RateLimiter::new("tmdb"),
             api_key: SecretString::from(DEFAULT_API_KEY),
             base_url: API_BASE.to_owned(),
@@ -1859,6 +1915,8 @@ impl TmdbClient {
                 &cfg,
             )
             .await?;
+        let poster_url = non_empty(parsed.poster_path.clone())
+            .map(|p| cfg.image_url(crate::plugin_config::TmdbImageKind::Poster, &p));
         // Preserve the legacy metadata result's single default images. The
         // remote image provider uses `collection_images` instead, because the
         // pinned source converts only the appended candidate lists.
@@ -1884,6 +1942,7 @@ impl TmdbClient {
             tmdb_id: parsed.id,
             name: parsed.name.unwrap_or_default(),
             overview: non_empty(parsed.overview),
+            poster_url,
             images,
         })
     }
@@ -1902,16 +1961,16 @@ impl TmdbClient {
         };
         let cfg = &cfg;
         let map = |images: Vec<CollectionImage>, kind: ImageType| {
+            let size = image_type_size(kind);
+            let original = cfg.is_original_size(size);
             images.into_iter().filter_map(move |image| {
-                let size = image_type_size(kind);
-                let scaled = cfg
-                    .image_size(size)
-                    .is_some_and(|size| !size.eq_ignore_ascii_case("original"));
+                let path = non_empty(image.file_path)?;
                 Some(TmdbImage {
                     image_type: kind,
-                    url: cfg.image_url(size, &non_empty(image.file_path)?),
-                    width: if scaled { None } else { image.width },
-                    height: if scaled { None } else { image.height },
+                    url: cfg.image_url(size, &path),
+                    thumbnail_url: Some(cfg.sized_image_url(thumbnail_size(kind), &path)),
+                    width: image.width.filter(|_| original),
+                    height: image.height.filter(|_| original),
                     community_rating: image.vote_average,
                     vote_count: image.vote_count,
                     language: get_image_language(
@@ -2093,6 +2152,9 @@ impl TmdbClient {
         // each call's iterator is lazy, so it must not consume the config.
         let cfg = &cfg;
         let map = |entries: Vec<ImageEntry>, image_type: ImageType| {
+            let size = image_type_size(image_type);
+            let original = cfg.is_original_size(size);
+            let thumbnail = thumbnail_size(image_type);
             entries.into_iter().filter_map(move |e| {
                 let path = e.file_path.filter(|p| !p.is_empty())?;
                 let language = get_image_language(
@@ -2109,9 +2171,10 @@ impl TmdbClient {
                 };
                 Some(TmdbImage {
                     image_type,
-                    url: cfg.image_url(image_type_size(image_type), &path),
-                    width: e.width,
-                    height: e.height,
+                    url: cfg.image_url(size, &path),
+                    thumbnail_url: Some(cfg.sized_image_url(thumbnail, &path)),
+                    width: e.width.filter(|_| original),
+                    height: e.height.filter(|_| original),
                     community_rating: e.vote_average,
                     vote_count: e.vote_count,
                     language,
@@ -2154,6 +2217,7 @@ impl TmdbClient {
                 "{}/tv/{series_tmdb_id}/season/{season_number}/images",
                 self.base_url
             ),
+            crate::plugin_config::TmdbImageKind::Poster,
             request_language,
         )
         .await
@@ -2174,6 +2238,7 @@ impl TmdbClient {
                 "{}/tv/{series_tmdb_id}/season/{season_number}/episode/{episode_number}/images",
                 self.base_url
             ),
+            crate::plugin_config::TmdbImageKind::Still,
             request_language,
         )
         .await
@@ -2181,9 +2246,15 @@ impl TmdbClient {
 
     /// The shared body of [`season_images`](Self::season_images) and
     /// [`episode_images`](Self::episode_images): fetch one TMDB `images`
-    /// document and take its posters and stills, both as `Primary`
-    /// (C# `ConvertPostersToRemoteImageInfo` / `ConvertStillsToRemoteImageInfo`).
-    async fn tv_images(&self, url: String, request_language: Option<&str>) -> Vec<TmdbImage> {
+    /// document and take its posters and stills, both as `Primary`, at the
+    /// size setting of the caller's `kind` (C# `ConvertPostersToRemoteImageInfo`
+    /// with `PosterSize` / `ConvertStillsToRemoteImageInfo` with `StillSize`).
+    async fn tv_images(
+        &self,
+        url: String,
+        kind: crate::plugin_config::TmdbImageKind,
+        request_language: Option<&str>,
+    ) -> Vec<TmdbImage> {
         // The TMDb settings page governs the key, the adult filter, the
         // cast/crew caps and the image sizes; read per call, the way
         // `Plugin.Instance.Configuration` is (`TmdbClientManager`).
@@ -2203,6 +2274,7 @@ impl TmdbClient {
         let Ok(parsed) = resp.counted_json::<ImagesResponse>().await else {
             return Vec::new();
         };
+        let original = cfg.is_original_size(kind);
         parsed
             .posters
             .into_iter()
@@ -2211,12 +2283,12 @@ impl TmdbClient {
                 let path = e.file_path.filter(|p| !p.is_empty())?;
                 Some(TmdbImage {
                     image_type: ImageType::Primary,
-                    // The settings-page size, not a hardcoded `original`: these
-                    // are posters and stills, so they take the same size arm
-                    // every other `Primary` image does.
-                    url: cfg.image_url(image_type_size(ImageType::Primary), &path),
-                    width: e.width,
-                    height: e.height,
+                    url: cfg.image_url(kind, &path),
+                    thumbnail_url: Some(
+                        cfg.sized_image_url(thumbnail_size(ImageType::Primary), &path),
+                    ),
+                    width: e.width.filter(|_| original),
+                    height: e.height.filter(|_| original),
                     community_rating: e.vote_average,
                     vote_count: e.vote_count,
                     language: get_image_language(
@@ -2295,7 +2367,12 @@ impl TmdbClient {
         }
         Some(EpisodeExtras {
             provider_ids,
-            trailers: youtube_trailers(response.videos),
+            // `AddTrailerUrl(url)`: an episode's trailers carry no name
+            // (`TmdbEpisodeProvider.cs:202-211`).
+            trailers: youtube_trailers(response.videos)
+                .into_iter()
+                .map(|t| TmdbTrailer { name: None, ..t })
+                .collect(),
             people: response.credits.map(|c| episode_people_from(c, &cfg)),
         })
     }
@@ -2303,8 +2380,9 @@ impl TmdbClient {
     /// Resolves a TMDB id from an external id (`/find/{id}?external_source=`)
     /// — port of `TmdbClientManager.FindByExternalIdAsync`, which the movie/
     /// series providers use to honour an IMDb/TVDB id already on the item.
-    /// `source` is TMDB's source name (`imdb_id` / `tvdb_id`). `None` on no
-    /// match or any error.
+    /// `source` is TMDB's source name (`imdb_id` / `tvdb_id`). `Some(vec![])`
+    /// when TMDB answers with no match; `None` for a blank id or a failed
+    /// request (a transport error, a non-2xx status, or an unreadable body).
     pub async fn find_by_external_id(
         &self,
         kind: TmdbKind,
@@ -2337,10 +2415,12 @@ impl TmdbClient {
             TmdbKind::Movie => found.movie_results,
             TmdbKind::Series => found.tv_results,
         };
-        // `Some(vec![])` is a real answer, not a failure: the C# providers read
-        // `findResult?.MovieResults`/`TvResults` and, once that list exists, do
-        // NOT fall back to a name search. `None` is reserved for a request that
-        // never produced a payload.
+        // `Some(vec![])` is a real answer, not a failure: the C# Identify
+        // searches (`GetSearchResults`) read `findResult?.MovieResults`/
+        // `TvResults` and, once that list exists, do NOT fall back to a name
+        // search; the refresh's series provider goes on to the TVDB `/find`,
+        // then the name search (`TmdbSeriesProvider.GetMetadata`). `None` is
+        // reserved for a request that never produced a usable payload.
         Some(
             hits.into_iter()
                 .map(|hit| search_hit_from(hit, &cfg))
@@ -2366,7 +2446,7 @@ impl TmdbClient {
 
     /// Fetches full metadata for a title (overview, tagline, genres, studios,
     /// rating, certification, premiere date, runtime, and cast + key crew) via
-    /// `/movie|tv/{id}?append_to_response=credits,release_dates|content_ratings`.
+    /// `/movie|tv/{id}?append_to_response=credits,releases|content_ratings`.
     /// `None` on any network/parse error.
     pub async fn details(
         &self,
@@ -2378,7 +2458,8 @@ impl TmdbClient {
     }
 
     /// Fetches localized metadata and selects the requested country's rating,
-    /// falling back to the US rating when no local certification is available.
+    /// falling back to the US rating when no local certification is available
+    /// and, for a series, to the first country's.
     pub async fn details_for_locale(
         &self,
         kind: TmdbKind,
@@ -2391,19 +2472,31 @@ impl TmdbClient {
         // `Plugin.Instance.Configuration` is (`TmdbClientManager`).
         let cfg = self.settings().await;
         let key = cfg.api_key(self.api_key.expose_secret());
-        let (path, append) = match kind {
+        let (path, append, exclude_tags) = match kind {
             // The movie Identify branch needs `external_ids` too — `/movie/{id}`
             // carries `imdb_id` directly, so only the series arm asks for it.
-            TmdbKind::Movie => ("movie", "credits,release_dates,images,videos,keywords"),
+            TmdbKind::Movie => (
+                "movie",
+                "credits,releases,images,videos",
+                cfg.exclude_tags_movies,
+            ),
             TmdbKind::Series => (
                 "tv",
-                "credits,aggregate_credits,images,content_ratings,videos,external_ids,keywords",
+                "credits,aggregate_credits,images,content_ratings,videos,external_ids",
+                cfg.exclude_tags_series,
             ),
+        };
+        // "Exclude tags" keeps TMDb's keywords off the item's Tags
+        // (`TmdbClientManager.cs:78-81`, `:152-155`).
+        let append = if exclude_tags {
+            append.to_owned()
+        } else {
+            format!("{append},keywords")
         };
         let req = self
             .http
             .get(format!("{}/{path}/{tmdb_id}", self.base_url))
-            .query(&[("api_key", key), ("append_to_response", append)]);
+            .query(&[("api_key", key), ("append_to_response", append.as_str())]);
         let req = req.query(&[(
             "include_image_language",
             image_languages_param(language, country),
@@ -2437,7 +2530,13 @@ impl TmdbClient {
             credits_to_people(d.credits, cfg)
         };
 
-        let trailers = youtube_trailers(d.videos);
+        // Trailers before teasers, else in TMDb's order: the movie and series
+        // providers' stable `OrderByDescending`; episodes keep TMDb's order.
+        let mut videos = d.videos;
+        if let Some(videos) = &mut videos {
+            videos.results.sort_by_key(|v| !is_video_type(v, "trailer"));
+        }
+        let trailers = youtube_trailers(videos);
 
         let original_title = d
             .original_title
@@ -2458,12 +2557,17 @@ impl TmdbClient {
                 .flat_map(|k| k.keywords)
                 .filter_map(|k| non_empty(k.name))
                 .collect(),
-            production_locations: d
-                .production_countries
-                .unwrap_or_default()
-                .into_iter()
-                .filter_map(|c| non_empty(c.name))
-                .collect(),
+            // A movie's only (`TmdbMovieProvider.cs:206-207`): `MapTvShowToSeries`
+            // sets neither production locations nor a tagline.
+            production_locations: match kind {
+                TmdbKind::Movie => d
+                    .production_countries
+                    .unwrap_or_default()
+                    .into_iter()
+                    .filter_map(|c| non_empty(c.name))
+                    .collect(),
+                TmdbKind::Series => Vec::new(),
+            },
             home_page_url: (kind == TmdbKind::Series)
                 .then(|| non_empty(d.homepage))
                 .flatten(),
@@ -2481,12 +2585,14 @@ impl TmdbClient {
                 .and_then(|e| e.tvrage_id)
                 .filter(|id| *id > 0)
                 .map(|id| id.to_string()),
-            overview: d.overview.filter(|s| !s.is_empty()),
-            tagline: d.tagline.filter(|s| !s.is_empty()),
+            overview: d.overview,
+            tagline: (kind == TmdbKind::Movie)
+                .then(|| non_empty(d.tagline))
+                .flatten(),
             genres: d.genres.into_iter().filter_map(|g| g.name).collect(),
             studios: resolve_studios(d.networks, d.production_companies),
             community_rating: d.vote_average.filter(|v| *v > 0.0),
-            official_rating: certification(kind, d.release_dates, d.content_ratings, country),
+            official_rating: certification(kind, d.releases, d.content_ratings, country),
             production_year: year_from(premiere.as_deref()),
             premiere_date: premiere,
             runtime_minutes: match kind {
@@ -2582,7 +2688,7 @@ impl TmdbClient {
                 .and_then(|i| i.profiles.first())
                 .and_then(|i| non_empty(i.file_path.clone()))
                 .map(|path| cfg.image_url(crate::plugin_config::TmdbImageKind::Profile, &path)),
-            biography: non_empty(p.biography.clone()),
+            biography: p.biography.clone(),
             imdb_id: p
                 .external_ids
                 .as_ref()
@@ -2607,22 +2713,21 @@ impl TmdbClient {
         let Some(person) = self.person_response(tmdb_id, language, &cfg).await else {
             return Vec::new();
         };
-        let scaled = cfg
-            .image_size(crate::plugin_config::TmdbImageKind::Profile)
-            .is_some_and(|size| !size.eq_ignore_ascii_case("original"));
+        let original = cfg.is_original_size(crate::plugin_config::TmdbImageKind::Profile);
         person
             .images
             .iter()
             .flat_map(|images| &images.profiles)
             .filter_map(|image| {
+                let path = non_empty(image.file_path.clone())?;
                 Some(TmdbImage {
                     image_type: ImageType::Primary,
-                    url: cfg.image_url(
-                        crate::plugin_config::TmdbImageKind::Profile,
-                        &non_empty(image.file_path.clone())?,
+                    url: cfg.image_url(crate::plugin_config::TmdbImageKind::Profile, &path),
+                    thumbnail_url: Some(
+                        cfg.sized_image_url(thumbnail_size(ImageType::Primary), &path),
                     ),
-                    width: if scaled { None } else { image.width },
-                    height: if scaled { None } else { image.height },
+                    width: image.width.filter(|_| original),
+                    height: image.height.filter(|_| original),
                     community_rating: image.vote_average,
                     vote_count: image.vote_count,
                     language: get_image_language(
@@ -2736,9 +2841,10 @@ impl TmdbClient {
         crate::image_download::download_artwork(url).await
     }
 
-    /// Downloads an image URL's bytes, or `None` on any failure.
-    pub async fn download(&self, url: &str) -> Option<Vec<u8>> {
-        crate::image_download::download_bytes(url).await
+    /// Downloads an image URL: its bytes and the media type they are stored
+    /// under, or `None` on any failure, a response that is no image included.
+    pub async fn download(&self, url: &str) -> Option<(Vec<u8>, String)> {
+        crate::image_download::download_image_or_none(url).await
     }
 }
 
@@ -2821,16 +2927,20 @@ struct PersonExternalIds {
     imdb_id: Option<String>,
 }
 
-/// Resolves an item's studios: for series, its broadcast networks (Jellyfin's
-/// "Networks" browse), falling back to production companies when TMDB lists no
-/// networks. Movies carry no networks, so they keep their production companies.
+/// Resolves an item's studios: a series' broadcast networks, then its
+/// production companies (`TmdbSeriesProvider.MapTvShowToSeries`); movies carry
+/// no networks, so they get their production companies (`TmdbMovieProvider`).
+/// Port of `BaseItem.SetStudios`: trimmed, distinct ignoring case. Blank names
+/// are dropped, as upstream's item-value save drops them.
 fn resolve_studios(networks: Vec<NamedEntry>, companies: Vec<NamedEntry>) -> Vec<String> {
-    let networks: Vec<String> = networks.into_iter().filter_map(|c| c.name).collect();
-    if networks.is_empty() {
-        companies.into_iter().filter_map(|c| c.name).collect()
-    } else {
-        networks
-    }
+    let mut seen = std::collections::HashSet::new();
+    networks
+        .into_iter()
+        .chain(companies)
+        .filter_map(|c| c.name)
+        .map(|name| name.trim().to_owned())
+        .filter(|name| !name.is_empty() && seen.insert(ordinal_ignore_case_key(name)))
+        .collect()
 }
 
 /// The four-digit year from a TMDB `YYYY-MM-DD` date string.
@@ -2895,8 +3005,8 @@ mod tests {
     #[tokio::test]
     async fn maps_collection_keywords_countries_and_series_fields() {
         let server = crate::mock_http::MockServer::start(vec![
-            ("/movie/1", r#"{"belongs_to_collection":{"id":7,"name":"Collection"},"production_countries":[{"name":"Japan"}],"keywords":{"keywords":[{"name":"samurai"}]}}"#.into()),
-            ("/tv/2?", r#"{"episode_run_time":[42,45],"last_air_date":"2020-01-02","homepage":"https://example.org/show","keywords":{"results":[{"name":"drama"}]},"external_ids":{"tvdb_id":3,"tvrage_id":4}}"#.into()),
+            ("/movie/1", r#"{"belongs_to_collection":{"id":7,"name":"Collection"},"production_countries":[{"name":"Japan"}],"tagline":"Seven ronin.","keywords":{"keywords":[{"name":"samurai"}]}}"#.into()),
+            ("/tv/2?", r#"{"tagline":"Winter is coming.","production_countries":[{"name":"United Kingdom"}],"episode_run_time":[42,45],"last_air_date":"2020-01-02","homepage":"https://example.org/show","keywords":{"results":[{"name":"drama"}]},"external_ids":{"tvdb_id":3,"tvrage_id":4},"networks":[{"name":"HBO"}],"production_companies":[{"name":"Bad Wolf"}]}"#.into()),
             ("/episode/1", r#"{"external_ids":{"imdb_id":"tt123","tvdb_id":5,"tvrage_id":6},"videos":{"results":[{"site":"YouTube","type":"Trailer","key":"abc","name":"Trailer"}]},"credits":{"cast":[{"id":7,"name":"Actor"}]}}"#.into()),
         ]).await;
         let client = TmdbClient::new().with_base_url(&server.base_url);
@@ -2905,7 +3015,12 @@ mod tests {
         assert_eq!(movie.collection_name.as_deref(), Some("Collection"));
         assert_eq!(movie.tags, ["samurai"]);
         assert_eq!(movie.production_locations, ["Japan"]);
+        assert_eq!(movie.tagline.as_deref(), Some("Seven ronin."));
         let series = client.details(TmdbKind::Series, 2, None).await.unwrap();
+        // A tagline and production countries are a movie's only
+        // (`TmdbMovieProvider.cs:206-207`); `MapTvShowToSeries` sets neither.
+        assert_eq!(series.tagline, None);
+        assert_eq!(series.production_locations, Vec::<String>::new());
         assert_eq!(series.runtime_minutes, Some(42));
         assert_eq!(series.end_date.as_deref(), Some("2020-01-02"));
         assert_eq!(
@@ -2915,6 +3030,7 @@ mod tests {
         assert_eq!(series.tags, ["drama"]);
         assert_eq!(series.tvdb_id.as_deref(), Some("3"));
         assert_eq!(series.tvrage_id.as_deref(), Some("4"));
+        assert_eq!(series.studios, ["HBO", "Bad Wolf"]);
         let extras = client
             .episode_extras_for_language(2, 1, 1, None)
             .await
@@ -2940,6 +3056,187 @@ mod tests {
                 .unwrap()
                 .people
                 .is_none()
+        );
+    }
+
+    /// `ExcludeTagsMovies` / `ExcludeTagsSeries` keep `keywords` out of the
+    /// kind's `append_to_response`, so TMDb sends no keywords to become Tags
+    /// (`TmdbClientManager.cs:78-81`, `:152-155`); each flag gates only its
+    /// own kind.
+    #[rstest::rstest]
+    #[case::neither(r"{}", true, true)]
+    #[case::movies(r#"{"ExcludeTagsMovies":true}"#, false, true)]
+    #[case::series(r#"{"ExcludeTagsSeries":true}"#, true, false)]
+    #[tokio::test]
+    async fn exclude_tags_settings_drop_keywords_from_the_append(
+        #[case] config: &str,
+        #[case] movie_keywords: bool,
+        #[case] series_keywords: bool,
+    ) {
+        let server = crate::mock_http::MockServer::start(vec![]).await;
+        let client = TmdbClient::new().with_base_url(&server.base_url);
+        client.attach_plugin_manager(crate::plugin_config::tests_support::manager_with(
+            crate::builtin_plugins::TMDB.id,
+            config.as_bytes().to_vec(),
+        ));
+        client.details(TmdbKind::Movie, 1, None).await.unwrap();
+        client.details(TmdbKind::Series, 2, None).await.unwrap();
+        let asks_keywords = |path| {
+            server.query_values(path, "append_to_response")[0]
+                .split(',')
+                .any(|m| m == "keywords")
+        };
+        assert_eq!(
+            (asks_keywords("/movie/1"), asks_keywords("/tv/2")),
+            (movie_keywords, series_keywords)
+        );
+    }
+
+    /// A movie's certification comes from the legacy `releases` append
+    /// (`MovieMethods.Releases`, `TmdbClientManager.cs:77`): the first
+    /// non-blank entry for the metadata country (`TmdbMovieProvider.cs:226-244`).
+    /// `release_dates` orders a country's releases otherwise: a fixture
+    /// modelled on Blade Runner's (TMDb 78) Korean ratings on 2026-11-14,
+    /// first 19 in one payload and 15 in the other.
+    #[tokio::test]
+    async fn movie_certification_reads_the_releases_payload() {
+        let server = crate::mock_http::MockServer::start(vec![(
+            "/movie/78",
+            r#"{"releases":{"countries":[
+                {"iso_3166_1":"KR","certification":" "},
+                {"iso_3166_1":"KR","certification":"19"},
+                {"iso_3166_1":"KR","certification":"15"}]},
+              "release_dates":{"results":[{"iso_3166_1":"KR","release_dates":[
+                {"certification":"15"},{"certification":"19"}]}]}}"#
+                .to_owned(),
+        )])
+        .await;
+        let client = TmdbClient::new().with_base_url(&server.base_url);
+        let movie = client
+            .details_for_locale(TmdbKind::Movie, 78, None, Some("KR"))
+            .await
+            .unwrap();
+        assert_eq!(movie.official_rating.as_deref(), Some("KR-19"));
+        let append = server.query_values("/movie/78", "append_to_response");
+        let methods: Vec<&str> = append[0].split(',').collect();
+        assert!(methods.contains(&"releases"), "{append:?}");
+        assert!(!methods.contains(&"release_dates"), "{append:?}");
+    }
+
+    /// A series' studios are its networks then its production companies
+    /// (`TmdbSeriesProvider.MapTvShowToSeries`), a movie's its production
+    /// companies (`TmdbMovieProvider`), each through `BaseItem.SetStudios`:
+    /// trimmed and distinct ignoring case. Blank names are dropped, as
+    /// upstream's item-value save drops them.
+    #[rstest::rstest]
+    #[case::series_with_both(&["HBO"], &["Bad Wolf", "New Line"], &["HBO", "Bad Wolf", "New Line"])]
+    #[case::series_networks_only(&["HBO"], &[], &["HBO"])]
+    #[case::series_companies_only(&[], &["Bad Wolf"], &["Bad Wolf"])]
+    #[case::duplicate_across_lists(&[" HBO "], &["hbo", "Bad Wolf", "BAD WOLF"], &["HBO", "Bad Wolf"])]
+    #[case::non_ascii_duplicate(&["ÉTÉ Films"], &["été films"], &["ÉTÉ Films"])]
+    #[case::blank_names(&["", "  "], &["Bad Wolf"], &["Bad Wolf"])]
+    #[case::unicode_whitespace(&["\u{a0}HBO\u{3000}"], &[], &["HBO"])]
+    #[case::movie(&[], &["Legendary", "Warner Bros."], &["Legendary", "Warner Bros."])]
+    fn studios_are_networks_then_production_companies(
+        #[case] networks: &[&str],
+        #[case] companies: &[&str],
+        #[case] expected: &[&str],
+    ) {
+        let entries = |names: &[&str]| -> Vec<NamedEntry> {
+            names
+                .iter()
+                .map(|n| NamedEntry {
+                    name: Some((*n).to_owned()),
+                })
+                .chain([NamedEntry { name: None }])
+                .collect()
+        };
+        assert_eq!(
+            resolve_studios(entries(networks), entries(companies)),
+            expected
+        );
+    }
+
+    /// A movie's and a series' trailers keep TMDb's video name, a missing one
+    /// included (`Name = video.Name`, `TmdbMovieProvider.cs:380`,
+    /// `TmdbSeriesProvider.cs:350`); an episode's carry only their URL
+    /// (`AddTrailerUrl`, `TmdbEpisodeProvider.cs:202-211`).
+    #[tokio::test]
+    async fn trailers_keep_tmdbs_name_and_an_episodes_have_none() {
+        let videos = r#"{"videos":{"results":[
+            {"site":"YouTube","type":"Trailer","key":"a"},
+            {"site":"YouTube","type":"Trailer","key":"b","name":"Official Trailer"}]}}"#;
+        let server = crate::mock_http::MockServer::start(vec![
+            ("/movie/1", videos.to_owned()),
+            ("/tv/2?", videos.to_owned()),
+            ("/episode/1", videos.to_owned()),
+        ])
+        .await;
+        let client = TmdbClient::new().with_base_url(&server.base_url);
+        let trailer_names = |trailers: Vec<TmdbTrailer>| -> Vec<Option<String>> {
+            trailers.into_iter().map(|t| t.name).collect()
+        };
+        let movie = client.details(TmdbKind::Movie, 1, None).await.unwrap();
+        let series = client.details(TmdbKind::Series, 2, None).await.unwrap();
+        let episode = client
+            .episode_extras_for_language(2, 1, 1, None)
+            .await
+            .unwrap();
+        let named = vec![None, Some("Official Trailer".to_owned())];
+        assert_eq!(
+            [
+                trailer_names(movie.trailers),
+                trailer_names(series.trailers),
+                trailer_names(episode.trailers)
+            ],
+            [named.clone(), named, vec![None, None]]
+        );
+    }
+
+    /// A movie's and a series' Trailer videos come before their Teasers, in a
+    /// stable sort (`TmdbMovieProvider` / `TmdbSeriesProvider`'s
+    /// `OrderByDescending`); an episode keeps TMDb's order
+    /// (`TmdbEpisodeProvider`). Site and type match ignoring case
+    /// (`TmdbUtils.IsTrailerType`).
+    #[tokio::test]
+    async fn movie_and_series_trailers_come_before_teasers() {
+        let videos = r#"{"videos":{"results":[
+            {"site":"YouTube","type":"Teaser","key":"teaser1","name":"Teaser"},
+            {"site":"YouTube","type":"Clip","key":"clip"},
+            {"site":"youtube","type":"trailer","key":"trailer1","name":"Trailer"},
+            {"site":"Vimeo","type":"Trailer","key":"vimeo"},
+            {"site":"YouTube","type":"Teaser","key":"teaser2","name":"Teaser 2"},
+            {"site":"YouTube","type":"Trailer","key":"trailer2","name":"Trailer 2"}]}}"#;
+        let server = crate::mock_http::MockServer::start(vec![
+            ("/movie/1", videos.to_owned()),
+            ("/tv/2?", videos.to_owned()),
+            ("/episode/1", videos.to_owned()),
+        ])
+        .await;
+        let client = TmdbClient::new().with_base_url(&server.base_url);
+        let keys = |trailers: Vec<TmdbTrailer>| -> Vec<String> {
+            trailers
+                .into_iter()
+                .map(|t| t.url.replace("https://www.youtube.com/watch?v=", ""))
+                .collect()
+        };
+        let movie = client.details(TmdbKind::Movie, 1, None).await.unwrap();
+        let series = client.details(TmdbKind::Series, 2, None).await.unwrap();
+        let episode = client
+            .episode_extras_for_language(2, 1, 1, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            [
+                keys(movie.trailers),
+                keys(series.trailers),
+                keys(episode.trailers)
+            ],
+            [
+                ["trailer1", "trailer2", "teaser1", "teaser2"],
+                ["trailer1", "trailer2", "teaser1", "teaser2"],
+                ["teaser1", "trailer1", "teaser2", "trailer2"],
+            ]
         );
     }
 
@@ -2975,7 +3272,51 @@ mod tests {
             assert_eq!(collections[0].community_rating, Some(8.2));
             assert_eq!(profiles[0].vote_count, Some(3));
             assert_eq!(collections[0].vote_count, Some(3));
+            // The preview size is fixed per family, whatever the settings say.
+            let thumbnails = [&profiles[0], &collections[0], &collections[1]]
+                .map(|image| image.thumbnail_url.as_deref().unwrap());
+            assert_eq!(
+                thumbnails,
+                [
+                    "https://image.tmdb.org/t/p/w500/profile.jpg",
+                    "https://image.tmdb.org/t/p/w500/poster.jpg",
+                    "https://image.tmdb.org/t/p/w780/backdrop.jpg",
+                ]
+            );
         }
+    }
+
+    /// A season's posters take `PosterSize` and an episode's stills
+    /// `StillSize` (`ConvertPostersToRemoteImageInfo` /
+    /// `ConvertStillsToRemoteImageInfo`); only the scaled one loses its size.
+    #[tokio::test]
+    async fn season_posters_and_episode_stills_take_their_own_size() {
+        let server = crate::mock_http::MockServer::start(vec![
+            (
+                "/episode/2/images",
+                r#"{"stills":[{"file_path":"/s.jpg","width":1920}]}"#.to_owned(),
+            ),
+            (
+                "/season/1/images",
+                r#"{"posters":[{"file_path":"/p.jpg","width":1000}]}"#.to_owned(),
+            ),
+        ])
+        .await;
+        let client = TmdbClient::new().with_base_url(&server.base_url);
+        client.attach_plugin_manager(crate::plugin_config::tests_support::manager_with(
+            crate::builtin_plugins::TMDB.id,
+            br#"{"StillSize":"w300"}"#.to_vec(),
+        ));
+        let season = client.season_images(5, 1, None).await;
+        let episode = client.episode_images(5, 1, 2, None).await;
+        assert_eq!(
+            (season[0].url.as_str(), season[0].width),
+            ("https://image.tmdb.org/t/p/original/p.jpg", Some(1000))
+        );
+        assert_eq!(
+            (episode[0].url.as_str(), episode[0].width),
+            ("https://image.tmdb.org/t/p/w300/s.jpg", None)
+        );
     }
 
     /// `TmdbPersonImageProvider` labels profiles against the item's own
@@ -3950,19 +4291,15 @@ mod tests {
 
     #[test]
     fn us_certification_prefers_us_entry() {
-        let rd = ReleaseDatesResults {
-            results: vec![
-                ReleaseDatesCountry {
+        let rd = ReleasesResults {
+            countries: vec![
+                ReleaseCountry {
                     iso_3166_1: Some("GB".to_owned()),
-                    release_dates: vec![ReleaseDatesEntry {
-                        certification: Some("15".to_owned()),
-                    }],
+                    certification: Some("15".to_owned()),
                 },
-                ReleaseDatesCountry {
+                ReleaseCountry {
                     iso_3166_1: Some("US".to_owned()),
-                    release_dates: vec![ReleaseDatesEntry {
-                        certification: Some("R".to_owned()),
-                    }],
+                    certification: Some("R".to_owned()),
                 },
             ],
         };
@@ -3993,10 +4330,11 @@ mod tests {
         #[case] country: &str,
         #[case] expected: &str,
     ) {
-        let releases = serde_json::from_value(serde_json::json!({"results":[
-            {"iso_3166_1":"DE","release_dates":[{"certification":""},{"certification":"12"}]},
-            {"iso_3166_1":"US","release_dates":[{"certification":"R"}]},
-            {"iso_3166_1":"GB","release_dates":[{"certification":"15"}]}
+        let releases = serde_json::from_value(serde_json::json!({"countries":[
+            {"iso_3166_1":"DE","certification":""},
+            {"iso_3166_1":"DE","certification":"12"},
+            {"iso_3166_1":"US","certification":"R"},
+            {"iso_3166_1":"GB","certification":"15"}
         ]}))
         .unwrap();
         assert_eq!(
@@ -4012,6 +4350,32 @@ mod tests {
         assert_eq!(
             certification(TmdbKind::Series, None, Some(ratings), Some(country)).as_deref(),
             Some(expected)
+        );
+    }
+
+    /// A series rated in neither the metadata country nor the US takes the
+    /// first country's rating, bare (`TmdbSeriesProvider.cs:318,328-331`),
+    /// skipping blank ones; a movie has no such fallback
+    /// (`TmdbMovieProvider.cs:226-244`).
+    #[test]
+    fn a_series_rated_elsewhere_takes_the_first_countrys_rating() {
+        let ratings = serde_json::from_value(serde_json::json!({"results":[
+            {"iso_3166_1":"BR","rating":" "},
+            {"iso_3166_1":"GB","rating":"15"},
+            {"iso_3166_1":"FR","rating":"12"}
+        ]}))
+        .unwrap();
+        assert_eq!(
+            certification(TmdbKind::Series, None, Some(ratings), Some("DE")).as_deref(),
+            Some("15")
+        );
+        let releases = serde_json::from_value(serde_json::json!({"countries":[
+            {"iso_3166_1":"GB","certification":"15"}
+        ]}))
+        .unwrap();
+        assert_eq!(
+            certification(TmdbKind::Movie, Some(releases), None, Some("DE")),
+            None
         );
     }
 

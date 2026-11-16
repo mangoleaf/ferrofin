@@ -32,7 +32,9 @@ Conventions:
     `ChromaprintAnalyzer`, `TimeAdjustmentHelper`), `chapter_analyzer.rs`,
     `black_frame.rs` (`BlackFrameAnalyzer`, recaps), `credit_scenes.rs`
     (`CreditsBlackFrameAnalyzer` and `Analyzers/Credits`), `automatic.rs`
-    (`Entrypoint`), `config_hash.rs` (`ConfigHasher`), test data `testdata/`;
+    (`Entrypoint`), `config_hash.rs` (`ConfigHasher`), `editor.rs`
+    (`MediaSegmentEditorService`), `platform.rs` (`Helper/OperatingSystem`),
+    test data `testdata/`;
   - processes: `crates/ferrofin-extensions/src/ffmpeg.rs` (`FFmpegService`,
     `FFmpegOutputParser`), `fingerprint.rs` (Chromaprint);
   - paged library reads: `crates/ferrofin-extensions/src/library_pages.rs`
@@ -75,7 +77,17 @@ Conventions:
   - **Upstream bugs not ported:** an anime preview is stored under the Preview
     hash (upstream's Credits hash lets the Preview pass delete it for good);
     Matroska `DURATION` tags parse at any fraction length (.NET's `TimeSpan`
-    stops at seven digits).
+    stops at seven digits); a changed file is analysed again (below).
+  - **Changed files:** when a library scan finds a video's file changed, it
+    prunes what was extracted from the old one, and the server's
+    `DeleteSegmentsAsync` asks each segment provider to `CleanupExtractedData`.
+    The plugin's `SegmentProvider` does not implement it, so upstream keeps the
+    old file's analysis and the next Media Segment Scan publishes its segments
+    again. Here the provider's cleanup deletes the item's detection caches and
+    its detected segments, and drops it from every season's analysed lists,
+    so the next pass analyses the new file. Segments a user entered stay
+    (owner decision 2026-11-14, gl-1696). Nothing else runs the cleanup, so an
+    unchanged file is not analysed again.
   - **Failures:** a store write failure fails the season, retried next pass,
     in every analyzer (upstream's black-frame analyzers log it per episode and
     go on, the episode left analysed in memory); a failed keyframe
@@ -115,7 +127,11 @@ Conventions:
   it analyses: the ids it reads keep the whole snapshot's order, and a
   season's entries depend only on its series' items, so its seasons are
   queued exactly as the whole queue has them (given the series link every
-  scanned season and episode row carries).
+  scanned season and episode row carries). Clean Cache and Clear excluded,
+  which upstream gives the probed queue (`GetMediaItems(includeExcluded:
+  true)`), build it without `ProbeAudioDuration`'s ffprobe: they read only
+  its ids, exclusions and seasons, which the probe never changes, and the
+  credits windows it would move are never read.
 - **File checks** (implementation only, the behaviour is the same): upstream's
   `VerifyQueueAsync` checks every queued file with `File.Exists` on every pass.
   Here a season's files are checked only when the pass can act on its items:
@@ -143,6 +159,14 @@ Conventions:
     a callback's whole answer and applies every search/replace. Ferrofin reads no more than
     16 MiB of an answer, and skips a step that would grow the file past 16 MiB, because the
     pipeline runs on every anonymous `/web` request. jellyfin-web's bundles are a few MiB.
+  - **A matched file no step would change is served from disk.** The plugin's middleware runs
+    the pipeline for every file a registration matches, so on a default install
+    `main.jellyfin.bundle.js` goes through Intro Skipper's skip-button step, which changes
+    nothing while `UseFileTransformationPlugin` is off. Ferrofin asks each in-process step
+    (`FileTransformer::would_transform`) and, while none would change the file, lets the
+    static server send it: its own `ETag`, `Last-Modified`, `Range` and `text/javascript`, with
+    the pipeline's `Cache-Control: no-cache` kept, so a step that turns on reaches a browser
+    at its next load. The bytes are the same.
 
 ### Merge Versions
 - Ferrofin files: `crates/ferrofin-extensions/src/merge_versions.rs` (the whole
@@ -245,7 +269,7 @@ Conventions:
   `crates/ferrofin-providers/src/remote_images.rs`), the wire types
   `crates/ferrofin-model/src/ldap.rs`, and the thin HTTP handler
   `crates/ferrofin-api/src/handlers/ldap.rs`. The live directory test is
-  `crates/ferrofin-extensions/tests/ldap_directory.rs` (`FERROFIN_LDAP_TESTS=1`, OpenLDAP in
+  `crates/ferrofin-extensions/tests/ldap_directory.rs` (`#[ignore]`d, OpenLDAP in
   docker; CI does not run it), and `contrib/ldap-test-directory/` starts a seeded directory to
   try a running server against by hand.
 - Plugin, configuration and connection test (v24, `d11c86a`): `LdapPlugin` (GUID, name

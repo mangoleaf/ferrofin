@@ -54,8 +54,9 @@ Checked against a real Jellyfin server by the retired v2 runtime diff:
   none of the media is deleted). Deep-verified for
   `movies` / `tvshows` / `music` / `homevideos` / `musicvideos` / `mixed` / untyped
   libraries; `books` is scanned too but is **not** deep-verified — see the entry below.
-  `boxsets` is the one library type not resolved off disk (its members are curated through
-  the collection API). A rescan reprocesses only what changed: see
+  A `boxsets` library resolves only its box sets: each `… [boxset]` folder in
+  `{data}/collections`, or each folder there holding a `collection.xml`, as Jellyfin's
+  `BoxSetResolver` does (their members are curated through the collection API). A rescan reprocesses only what changed: see
   [What a library scan does](#what-a-library-scan-does) below, and
   [`gates/verify/`](../gates/verify/README.md) to check it against any running server. Movie and
   episode probes download missing subtitles in the library's configured languages,
@@ -79,8 +80,9 @@ Checked against a real Jellyfin server by the retired v2 runtime diff:
     downloaded, keep working.
 - **Sessions & playback** — sessions, playstate reporting, remote control, capabilities, and
   the **WebSocket push** messages clients rely on (`UserDataChanged`, session updates, …).
-- **Playlists & collections** — create/edit/reorder/share, membership, stored in Jellyfin's
-  `Data`-JSON shape, the same source of truth Jellyfin itself reads.
+- **Playlists & collections** — create/edit/reorder/share and membership, in Jellyfin's
+  `LinkedChildren` table. A playlist's owner and shares live in Ferrofin's permission tables,
+  imported once from Jellyfin's `Data` JSON and written back to it on every change.
   - **Accepted divergence:** a playlist's items listing and a reorder leave out a member from a
     library the user was not given, where Jellyfin lists it and hides only what the member's
     rating or tags rule out. Library access is a boundary here. What is stored stays: adding
@@ -182,8 +184,8 @@ Checked against a real Jellyfin server by the retired v2 runtime diff:
 - **Photos & books** — a home-videos library resolves its images into `Photo` items with
   their EXIF read off the file (camera, exposure, GPS, orientation, date taken); a books
   library resolves `.epub`/`.cbz`/… into `Book` items with `ComicInfo`/`ComicBookInfo`/OPF
-  metadata and the cover extracted from the archive: a comic's from a ZIP, 7z or tar archive
-  whatever its extension (a RAR `.cbr` gets none yet).
+  metadata and the cover extracted from the archive: a comic's from a ZIP, 7z, tar or RAR
+  archive whatever its extension (RAR through an external `7z` or `bsdtar`).
 - **Item links & id fields** — the "Links" row (IMDb/TMDB/MusicBrainz/…) and the per-kind
   external-id fields the Identify dialog offers.
 - **Backup & restore.**
@@ -197,8 +199,8 @@ Wired and working, with a documented limitation or lighter verification:
   Ferrofin Settings entry, lists every Ferrofin setting in nine tabs in a pane on the left, with a
   search across them, grouped by tab, and filters for changed settings and read-only ones. Each has
   a readable name with its key, variable, flag and default below, what sets it (`config.toml`,
-  environment variable or flag), and, for each one the page may not change, its value with a lock,
-  why and where it is changed instead. Secrets are shown to administrators, marked as secrets. The
+  the Networking page, environment variable or flag), and, for each one the page may not change,
+  its value with a lock, why and where it is changed instead. Secrets are shown to administrators, marked as secrets. The
   rest are edited there, each on one line with its default shown while unset: Save writes the
   changes of every tab to `config.toml`, a refused value shows the server's message next to it,
   Reset to default removes the key, and Restart now applies them, all but the few that need a full
@@ -258,9 +260,24 @@ Wired and working, with a documented limitation or lighter verification:
     the ComicBookInfo JSON in a `.cbz`'s archive comment, and EPUB/OPF Dublin Core + Calibre
     fields, with the cover extracted from the archive. There is still no *remote* book
     provider — that is the third-party Bookshelf plugin.
-  - **`.cbr` / `.cb7`** are recognized and browsable, but yield no embedded metadata or
-    cover: those are RAR and 7z archives, and neither has a maintained pure-Rust reader
-    worth the dependency. `.cbz` and `.cbt` are fully read.
+  - A book's runtime is its pages × 10000 ticks, as Jellyfin 12's probe sets it, so reading
+    progress shows as a share of the pages: a comic counts its archive's entries other than
+    folders (ZIP, 7z or tar, read from the archive's directory only), a PDF the `/Count` of its
+    page tree. It is counted when the book is added, when its file changes and when its
+    metadata is refreshed, as Jellyfin does, and also on any scan while a `.cbz`, `.cb7`,
+    `.cbt` or PDF still has one second, so books added by an older release are counted by
+    the next scan. An `.epub`
+    has one second, as upstream. A RAR `.cbr` is not counted yet, though its cover is read
+    (below); a new one has one second. **Accepted divergence:** `.mobi`, `.azw` and `.azw3` keep one second
+    where upstream gives them no runtime, because with none every stop marks the book played
+    and clears its position.
+  - **`.cbr` / `.cb7` / `.cbt`** yield no embedded metadata, as upstream reads the archive's
+    `ComicInfo.xml` and ComicBookInfo comment only from a `.cbz`; a sidecar still applies.
+    A comic's cover is read from what its content is, whatever its extension says: a ZIP, 7z
+    or tar archive in process, a RAR one through `7z` found on `PATH` (`bsdtar` when 7z is
+    absent or cannot decode RAR). The Docker image ships 7z with its RAR plugin; without a
+    tool, a RAR comic gets no cover and the server logs that once
+    ([`INSTALL.md`](INSTALL.md#rar-comics) for bare metal).
 - **Photo keywords** — the EXIF pass fills every field Jellyfin's does except `Genres` and
   `Tags`, which upstream aggregates from XMP/IPTC keywords.
 - **Playlist files are read, never written** — a library scan makes a playlist of each
@@ -274,9 +291,23 @@ Wired and working, with a documented limitation or lighter verification:
   saves XML metadata into the library (a library whose metadata savers are unset), the
   `<name>.xml` sidecar it writes beside a playlist file hides the file's entries and the
   playlist stays empty; Ferrofin always reads the entries and never that sidecar.
-  `collection.xml` is still not read or written. A collection made in Ferrofin gets
-  Jellyfin's `{data}/collections/<name> [boxset]` folder (ones made before that stay
-  folderless), and its membership lives in the `LinkedChildren` table, as Jellyfin 12 keeps it.
+  A collection made in Ferrofin gets
+  Jellyfin's `{data}/collections/<name> [boxset]` folder (ones made before 1.4.0 get it, and the
+  id it derives, at the first boot of 1.5.2 or later), and its membership lives in the
+  `LinkedChildren` table, as Jellyfin 12 keeps it. A scan of the Collections library stores a box
+  set for each such folder that has none and removes the box sets whose folder is gone, as
+  Jellyfin's does; one the boot repair could not give a folder stays. A box set's
+  `collection.xml` is written into its folder as Jellyfin writes it (on every member added or
+  removed, every metadata edit and every refresh that downloads metadata), and read back when it
+  changes or on a full refresh: its title, overview, locks, display order, ratings, dates,
+  genres, studios, tags, people and provider ids. Its members are read only for a box set
+  outside the data directory, as on Jellyfin 12; in `{data}/collections` the `LinkedChildren`
+  table decides, so, as on Jellyfin 12, a box set stored again from its folder (after the
+  library was removed and made again) gets its title and metadata back but comes back empty.
+  The file is written into a box-set folder inside a media library only when that library saves
+  metadata into its media folders ("Save artwork into media folders"), or by an edit or member
+  change when the file is already there, and a library that lists its metadata savers must list
+  "Emby Xml".
 
 ## Not implemented (by design)
 
@@ -342,7 +373,12 @@ everything under it.
 - **Replace all metadata**: as **Search for missing metadata**, but the NFO's and the
   providers' values replace the item's unlocked values, and an unlocked field none of them
   supplies is cleared. When a provider failed and none answered (none could be reached,
-  say), nothing is cleared: the NFO's values still replace, and the rest stays.
+  say), nothing is cleared: the NFO's values still replace, and the rest stays. With
+  **Replace existing images** ticked, the item's artwork is removed first, so the refresh
+  supplies it afresh: the copies in Ferrofin's metadata folder, and the artwork beside the
+  item where Ferrofin saves it (beside a box set, playlist, genre, person or studio, and in
+  the media folder of a library that saves artwork into media folders, except a home-video
+  library with photos). A file beside the item that it does not list stays.
 
 Locks hold under all three choices. A field unticked under the metadata editor's **Enabled
 Fields** keeps its value. An item with **Lock this item to prevent future metadata

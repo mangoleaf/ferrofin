@@ -30,8 +30,8 @@ impl SimilarItemsRepository {
     }
 
     /// Weighted-overlap similar items to `seed_id`, restricted to the stored
-    /// `candidate_types` and excluding the seed + `exclude_ids`, ranked by score
-    /// (stable tiebreak). This is phase 1 of the local provider — the score
+    /// `candidate_types` and excluding the seed + `exclude_ids`, ranked by score,
+    /// ties by item `Id`. This is phase 1 of the local provider — the score
     /// pass; the manager runs the per-kind access/played filter over the ids
     /// it returns.
     ///
@@ -343,9 +343,27 @@ fn weighted_similar_sql(type_count: usize, exclude_count: usize) -> String {
         sql.push(')');
         next += exclude_count;
     }
-    sql.push_str(r#" ORDER BY s.score DESC, bi."SortName" ASC, bi."Id" ASC LIMIT ?"#);
+    // Ties by `Id`: Jellyfin's stable sort keeps its unordered candidate
+    // query's row order, in practice ascending id (owner decision 2026-10-24).
+    sql.push_str(r#" ORDER BY s.score DESC, bi."Id" ASC LIMIT ?"#);
     sql.push_str(&next.to_string());
     sql
+}
+
+/// Test hooks for the manager's tests.
+#[cfg(test)]
+pub(crate) mod test_hooks {
+    use ferrofin_db::Database;
+
+    /// Drops `PeopleBaseItemMap`, so the score pass fails while the item and
+    /// provider-id reads still work: a database error confined to the local
+    /// scorer.
+    pub(crate) async fn break_the_score_pass(db: &Database) {
+        sqlx::query(r#"DROP TABLE "PeopleBaseItemMap""#)
+            .execute(db.writer())
+            .await
+            .expect("drop PeopleBaseItemMap");
+    }
 }
 
 #[cfg(test)]

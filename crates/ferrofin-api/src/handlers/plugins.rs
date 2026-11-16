@@ -41,12 +41,16 @@ use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use ferrofin_model::plugins::{PluginInfo, PluginManifest, PluginStatus};
 use ferrofin_model::updates::{PackageInfo, RepositoryInfo};
+use ferrofin_traits::error::ServiceError;
 use ferrofin_traits::plugins::PluginDescriptor;
 use uuid::Uuid;
 
-use crate::auth::{RequireAdmin, RequireAuth};
+use crate::auth::RequireAdmin;
 use crate::error::ApiError;
-use crate::extract::{DotnetGuid, JsonSeqBody, Query, RequiredRouteString, RouteParameter};
+use crate::extract::{
+    DotnetGuid, JsonSeqBody, ProblemDetails, Query, RequiredRouteString, RouteParameter,
+    blank_route_values,
+};
 use crate::state::AppState;
 
 /// Ports Jellyfin's `RequiresElevation` policy for the plugin-mutating
@@ -55,12 +59,18 @@ use crate::state::AppState;
 /// Without this gate, any authenticated account (a guest profile, a stolen
 /// playback token) could stage arbitrary code for the next boot.
 ///
-/// Deliberate: this controller gates **in-handler**. Most of its routes take
-/// [`RequireAuth`] and call this check, and the mutating routes that take
-/// [`RequireAdmin`] call it too (the read-only ones rely on the extractor, as
-/// other admin controllers do) — staging executable code is not mutating
-/// metadata, and the gate must hold even if a route's extractor changes.
+/// Deliberate: this controller gates **in-handler**. Its elevated routes take
+/// [`RequireAdmin`], and the eight elevated `PluginsController` routes and the
+/// mutating package routes call this check too (the read-only package routes rely on
+/// the extractor, as other admin controllers do) — staging executable code is
+/// not mutating metadata, and the gate must hold even if a route's extractor
+/// changes.
 /// Don't drop it for consistency.
+///
+/// The extractor is [`RequireAdmin`], not [`RequireAuth`](crate::auth::RequireAuth):
+/// a bare `RequiresElevation` runs no `DefaultAuthorizationRequirement`, so an
+/// administrator whose policy has remote access off is still served from a
+/// remote address (v12.4 `ApiServiceCollectionExtensions.cs:86-89`).
 async fn require_admin(
     state: &AppState,
     auth: &ferrofin_traits::options::AuthorizationInfo,
@@ -84,10 +94,11 @@ async fn require_admin(
 /// Every versioned plugin route binds `[FromRoute, Required] Version version`,
 /// so the framework parses before the action runs: a string that is not a
 /// `Version` is a model-binding failure (`400`), never a lookup miss. `Version`
-/// accepts **two to four** dot-separated non-negative `Int32`s, so `"10"` and
-/// `"notaversion"` both fail here exactly as they do upstream, and an absent
-/// component is `-1` — which is why a live 10.11.8 answers 404 for `10.11.8`
-/// against an installed `10.11.8.0` (v10.11.8
+/// accepts **two to four** dot-separated non-negative `Int32`s, each read as
+/// `NumberStyles.Integer` (ASCII white space around it and a leading sign
+/// bind), so `"10"` and `"notaversion"` both fail here exactly as they do
+/// upstream, and an absent component is `-1` — which is why a live 10.11.8
+/// answers 404 for `10.11.8` against an installed `10.11.8.0` (v10.11.8
 /// Emby.Server.Implementations/Plugins/PluginManager.cs:293-311).
 fn parse_dotnet_version(raw: &str) -> Option<[i64; 4]> {
     let parts: Vec<&str> = raw.split('.').collect();
@@ -96,7 +107,11 @@ fn parse_dotnet_version(raw: &str) -> Option<[i64; 4]> {
     }
     let mut out = [-1i64; 4];
     for (slot, part) in out.iter_mut().zip(parts) {
-        let value: i64 = part.parse().ok()?;
+        // `i64::from_str` takes the sign; `NumberStyles` white space is ASCII only.
+        let value: i64 = part
+            .trim_matches(|c| matches!(c, '\t'..='\r' | ' '))
+            .parse()
+            .ok()?;
         if value < 0 || value > i64::from(i32::MAX) {
             return None;
         }
@@ -105,8 +120,11 @@ fn parse_dotnet_version(raw: &str) -> Option<[i64; 4]> {
     Some(out)
 }
 
-/// Resolves the plugin a versioned route addresses, porting
-/// `IPluginManager.GetPlugin(id, version)`.
+/// Binds a versioned route's `[FromRoute, Required] Version version` and
+/// checks it addresses the installed plugin, porting `IPluginManager.GetPlugin(id,
+/// version)`. Returns `Some(response)` when the binder refuses the version,
+/// the model-state `400` it answers before the action (a blank version is
+/// `[Required]`'s, one that is no `Version` [`not_a_version`]); a miss is `404`.
 ///
 /// `GetPlugin` with a version is
 /// `_plugins.FirstOrDefault(p => p.Id.Equals(id) && p.Version.Equals(version))`
@@ -124,18 +142,18 @@ fn parse_dotnet_version(raw: &str) -> Option<[i64; 4]> {
 /// stored version is exactly that string; any other one stays the binder's
 /// `400`. Upstream manifests are always a `Version`, so no Jellyfin-reachable
 /// request changes answer.
-async fn plugin_at_version(
+async fn version_rejection(
     state: &AppState,
     plugin_id: Uuid,
     version: &str,
-) -> Result<PluginDescriptor, ApiError> {
+) -> Result<Option<Response>, ApiError> {
+    if let Some(rejection) = blank_route_values([("version", version)]) {
+        return Ok(Some(rejection));
+    }
     let Some(requested) = parse_dotnet_version(version) else {
         return match state.plugins.get_plugin(plugin_id).await? {
-            Some(descriptor) if descriptor.version == version => Ok(descriptor),
-            // The model binder's own wording, which is what a client reads.
-            _ => Err(ApiError::BadRequest(format!(
-                "The value '{version}' is not valid."
-            ))),
+            Some(descriptor) if descriptor.version == version => Ok(None),
+            _ => Ok(Some(not_a_version(version))),
         };
     };
     let not_found = || ApiError::NotFound(format!("plugin {plugin_id} {version}"));
@@ -149,7 +167,14 @@ async fn plugin_at_version(
     if parse_dotnet_version(&descriptor.version) != Some(requested) {
         return Err(not_found());
     }
-    Ok(descriptor)
+    Ok(None)
+}
+
+/// The model-state `400` for a `{version}` that is no `Version`: the binder's
+/// own wording for `VersionConverter`'s failure, keyed `version`.
+fn not_a_version(version: &str) -> Response {
+    ProblemDetails::member_validation("version", format!("The value '{version}' is not valid."))
+        .into_response()
 }
 
 /// Projects a manager [`PluginDescriptor`] into the `PluginInfo` wire DTO.
@@ -187,7 +212,7 @@ fn to_plugin_info(d: PluginDescriptor) -> PluginInfo {
 )]
 async fn get_plugins(
     State(state): State<AppState>,
-    RequireAuth(auth): RequireAuth,
+    RequireAdmin(auth): RequireAdmin,
 ) -> Result<Json<Vec<PluginInfo>>, ApiError> {
     require_admin(&state, &auth).await?;
     let mut plugins = state.plugins.list_plugins().await?;
@@ -218,7 +243,7 @@ async fn get_plugins(
 )]
 async fn get_plugin_configuration(
     State(state): State<AppState>,
-    RequireAuth(auth): RequireAuth,
+    RequireAdmin(auth): RequireAdmin,
     Path(DotnetGuid(plugin_id)): Path<DotnetGuid>,
 ) -> Result<Response, ApiError> {
     // A plugin's configuration is where its credentials live; the C# gates this
@@ -288,7 +313,7 @@ fn without_nulls(bytes: Vec<u8>) -> Vec<u8> {
 )]
 async fn update_plugin_configuration(
     State(state): State<AppState>,
-    RequireAuth(auth): RequireAuth,
+    RequireAdmin(auth): RequireAdmin,
     Path(DotnetGuid(plugin_id)): Path<DotnetGuid>,
     body: Bytes,
 ) -> Result<StatusCode, ApiError> {
@@ -317,13 +342,15 @@ async fn update_plugin_configuration(
 )]
 async fn enable_plugin(
     State(state): State<AppState>,
-    RequireAuth(auth): RequireAuth,
+    RequireAdmin(auth): RequireAdmin,
     Path((DotnetGuid(plugin_id), version)): Path<(DotnetGuid, String)>,
-) -> Result<StatusCode, ApiError> {
+) -> Result<Response, ApiError> {
     require_admin(&state, &auth).await?;
-    plugin_at_version(&state, plugin_id, &version).await?;
+    if let Some(rejection) = version_rejection(&state, plugin_id, &version).await? {
+        return Ok(rejection);
+    }
     state.plugins.enable_plugin(plugin_id).await?;
-    Ok(StatusCode::NO_CONTENT)
+    Ok(StatusCode::NO_CONTENT.into_response())
 }
 
 /// `POST /Plugins/{pluginId}/{version}/Disable` — disable a plugin.
@@ -343,13 +370,15 @@ async fn enable_plugin(
 )]
 async fn disable_plugin(
     State(state): State<AppState>,
-    RequireAuth(auth): RequireAuth,
+    RequireAdmin(auth): RequireAdmin,
     Path((DotnetGuid(plugin_id), version)): Path<(DotnetGuid, String)>,
-) -> Result<StatusCode, ApiError> {
+) -> Result<Response, ApiError> {
     require_admin(&state, &auth).await?;
-    plugin_at_version(&state, plugin_id, &version).await?;
+    if let Some(rejection) = version_rejection(&state, plugin_id, &version).await? {
+        return Ok(rejection);
+    }
     state.plugins.disable_plugin(plugin_id).await?;
-    Ok(StatusCode::NO_CONTENT)
+    Ok(StatusCode::NO_CONTENT.into_response())
 }
 
 /// `DELETE /Plugins/{pluginId}` — uninstall a plugin.
@@ -374,7 +403,7 @@ async fn disable_plugin(
 )]
 async fn uninstall_plugin(
     State(state): State<AppState>,
-    RequireAuth(auth): RequireAuth,
+    RequireAdmin(auth): RequireAdmin,
     Path(DotnetGuid(plugin_id)): Path<DotnetGuid>,
 ) -> Result<StatusCode, ApiError> {
     require_admin(&state, &auth).await?;
@@ -392,26 +421,40 @@ async fn uninstall_plugin(
     ),
     responses(
         (status = 204, description = "Plugin uninstalled, or non-removable and ignored"),
-        (status = 400, description = "Compiled-in extension cannot be uninstalled"),
+        (status = 400, description = "Version is not a valid version string, or a compiled-in extension cannot be uninstalled"),
         (status = 404, description = "Plugin not found")
     ),
     tag = "ferrofin"
 )]
 async fn uninstall_plugin_by_version(
     State(state): State<AppState>,
-    RequireAuth(auth): RequireAuth,
+    RequireAdmin(auth): RequireAdmin,
     Path((DotnetGuid(plugin_id), version)): Path<(DotnetGuid, String)>,
-) -> Result<StatusCode, ApiError> {
+) -> Result<Response, ApiError> {
     require_admin(&state, &auth).await?;
+    if let Some(rejection) = blank_route_values([("version", version.as_str())]) {
+        return Ok(rejection);
+    }
     // A staged WASM plugin is removable before it is in the registry (the
     // artifact exists, the descriptor does not), so a registry miss here still
     // falls through to `remove_plugin`, which looks for the file first. The
-    // version gate only applies to a plugin the registry KNOWS.
-    if state.plugins.get_plugin(plugin_id).await?.is_some() {
-        plugin_at_version(&state, plugin_id, &version).await?;
+    // version gate only applies to a plugin the registry KNOWS; on a miss, a
+    // version that is no `Version` is the binder's 400 when nothing was staged
+    // under the id either.
+    if state.plugins.get_plugin(plugin_id).await?.is_some()
+        && let Some(rejection) = version_rejection(&state, plugin_id, &version).await?
+    {
+        return Ok(rejection);
     }
-    state.plugins.remove_plugin(plugin_id).await?;
-    Ok(StatusCode::NO_CONTENT)
+    match state.plugins.remove_plugin(plugin_id).await {
+        Err(ServiceError::NotFound(_)) if parse_dotnet_version(&version).is_none() => {
+            Ok(not_a_version(&version))
+        }
+        removed => {
+            removed?;
+            Ok(StatusCode::NO_CONTENT.into_response())
+        }
+    }
 }
 
 /// `GET /Plugins/{pluginId}/{version}/Image` — a plugin's bundled image.
@@ -436,7 +479,9 @@ async fn get_plugin_image(
     // No auth extractor: this is the ONE action upstream marks
     // `[AllowAnonymous]` (v10.11.8 PluginsController.cs:221), against the
     // controller's class-level `RequiresElevation`.
-    plugin_at_version(&state, plugin_id, &version).await?;
+    if let Some(rejection) = version_rejection(&state, plugin_id, &version).await? {
+        return Ok(rejection);
+    }
     match state.plugins.plugin_image(plugin_id).await? {
         Some(image) => Ok((
             [
@@ -469,7 +514,7 @@ async fn get_plugin_image(
 )]
 async fn get_plugin_manifest(
     State(state): State<AppState>,
-    RequireAuth(auth): RequireAuth,
+    RequireAdmin(auth): RequireAdmin,
     Path(DotnetGuid(plugin_id)): Path<DotnetGuid>,
 ) -> Result<Json<PluginManifest>, ApiError> {
     require_admin(&state, &auth).await?;
@@ -587,6 +632,7 @@ impl RouteParameter for PackageName {
 /// Port of `PackageController.GetPackageInfo`:
 ///
 /// ```text
+/// if (IsBundledPlugin(name, assemblyGuid)) return NotFound();   // before any repository fetch
 /// var packages = await _installationManager.GetAvailablePackages();
 /// var result = _installationManager.FilterPackages(packages, name, assemblyGuid ?? default).FirstOrDefault();
 /// if (result is null) return NotFound();
@@ -656,6 +702,9 @@ struct InstallPackageQuery {
 
 /// `POST /Packages/Installed/{name}` — install a package from the configured
 /// repositories.
+///
+/// A plugin bundled with the server (`CanUninstall: false`) is a `404` before
+/// any repository is fetched (`PackageController.IsBundledPlugin`).
 ///
 /// The manager downloads, verifies (checksum + component validation), and
 /// stages the WASM plugin; it activates on the next restart

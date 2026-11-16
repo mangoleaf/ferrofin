@@ -46,11 +46,16 @@ An extension receives **only manager trait objects**, never concrete types — a
 `MergeVersionsManager`, `UserManager`, the `ExternalIdentityStore` (which outside identity,
 such as an LDAP uid, belongs to which user), the `RemoteImageFetcher` (image downloads under
 the server's limits: no private address unless `image_private_http_allow` lists it, and
-`image_download_max_mb`), an optional audio `Fingerprinter`, and a per-extension cache dir. It
-is the same dependency-injection seam the rest of the server uses (see
+`image_download_max_mb`), an optional audio `Fingerprinter`, a per-extension cache dir, and
+the core "Media Segment Scan" task as a `ScheduledTask` (the Intro Skipper's scan runs it
+after detection). It is the same dependency-injection seam the rest of the server uses (see
 [`ARCHITECTURE.md`](ARCHITECTURE.md)), so an extension can do real work — scan the library,
 persist media segments, register background tasks — without reaching into implementation
-crates.
+crates. The contracts an extension implements (`Extension`'s `ScheduledTask` and
+`PluginConfigPage`) come from `ferrofin-traits`, and so does every manager an extension calls;
+the helpers it shares with core sit below core (`ferrofin-common`, `ferrofin-db`). A new
+extension adds no `ferrofin-core` import (the two left are listed in
+[`ARCHITECTURE.md`](ARCHITECTURE.md)).
 
 The curated set is registered **statically** in one place (`builtin_extensions()`); there is
 no discovery, no filesystem scan, no dynamic loading. Consequences:
@@ -177,9 +182,9 @@ Its settings page, the Settings link under Dashboard → Plugins → Ferrofin Se
 menu's **Ferrofin Settings** entry, lists every setting that route reports, in a tab per group in a
 pane on the left, with a search box across every tab and filters (changed, hide read-only) above
 the tabs. Each setting has a readable name with the `config.toml` key, environment variable, flag
-and default below it, a badge for what sets it (`config.toml`, environment or flag) when anything
-does, and, for a setting the page may not change, its value as text with a lock, the reason and
-where it is changed instead. Secrets are shown to the administrator, marked as secrets. A setting
+and default below it, a badge for what sets it (`config.toml`, the Networking page, environment
+or flag) when anything does, and, for a setting the page may not change, its value as text with a
+lock, the reason and where it is changed instead. Secrets are shown to the administrator, marked as secrets. A setting
 the page may change is edited on one line: a field for its kind showing the default, muted, when
 nothing sets it, its unit and **Reset to default**. Each tab counts its unsaved edits; Save posts
 the changed ones of every tab, a refused value shows the server's message next to it, and **Restart
@@ -249,6 +254,11 @@ config write is guest input. On boot each component is compiled,
 interrogated for its identity (`descriptor`), seed config, and task list, and then
 registered through the same plugin manager as compiled-in extensions — same dashboard
 entry, same enable/disable toggle, same `/Plugins/{id}/Configuration` storage.
+The boot also removes the segment output (`{data_dir}/plugins/{id}.segments/`) of every
+plugin id no `*.wasm` file in that directory carries, so a plugin installed again starts
+without it. It removes none while a `*.wasm` file fails to load or the directory cannot be
+listed. A plugin taken out by moving its file away or renaming it to something other than
+`*.wasm` loses its segment output the same way and has to analyse the library again.
 
 **"Disabled" and load.** Enable/disable governs the runtime work — tasks don't run, events
 aren't delivered, and metadata lookups are skipped for a disabled plugin. But a disabled
@@ -482,10 +492,11 @@ and size-capped:
 
 - **`set-user-data`** — updates played/favorite/resume-position for a named user+item.
   TRUST NOTE: this mutates **real watch state for ANY user** — the strongest write a
-  plugin has (it exists for scrobble-sync plugins like Trakt). Every call is logged with
-  the plugin, user, and item named; install plugins that declare it in their
-  documentation and that you trust. A finer-grained per-plugin grant is planned (same
-  status as the egress-`*` UX).
+  plugin has (it exists for scrobble-sync plugins like Trakt). Each plugin call that
+  writes logs one info line with the plugin named and the number of writes, and each
+  write is logged at debug with the plugin, user, and item named; install plugins that
+  declare it in their documentation and that you trust. A finer-grained per-plugin
+  grant is planned (same status as the egress-`*` UX).
 - **`write-lyrics` / `write-subtitles`** — save a sidecar next to the media file
   (payload ≤ `FERROFIN_WASM_WRITE_CONTENT_MB`, default 2 MiB). The host sanitizes the
   file name: the format is allowlisted to real lyric/subtitle extensions and the
@@ -536,8 +547,8 @@ destinations** (your LAN, cloud metadata services, Tailscale/tailnet ranges, Fer
 itself), which
 removes the server-as-network-pivot risk; grant a specific trusted plugin private-network
 access with `FERROFIN_WASM_PRIVATE_HTTP_ALLOW` (comma-separated plugin UUIDs, or `*`).
-The private-address check also **pins the vetted address on the connection
-itself** (the request resolves to the address that was checked, not a second
+The private-address check also **pins the vetted addresses on the connection
+itself** (the request resolves to the addresses that were checked, not a second
 DNS answer), closing the classic DNS-rebinding TOCTOU. When the server's
 environment sets an HTTP proxy (`HTTP_PROXY`, `HTTPS_PROXY` or `ALL_PROXY`), the proxy
 resolves the destination itself: the check then runs on the server's own DNS answer before
@@ -565,9 +576,12 @@ does not make strangers trustworthy.** Install plugins you have some reason to t
 
 **What the memory limit means (and costs).** The 128 MiB is a **per-plugin ceiling, not an
 allocation**: it is the point past which a plugin's `memory.grow` is refused (and the size
-past which an `http-fetch` response is rejected). Nothing reserves that memory. Measured
-real usage (printed by the `wasm_hello_guest` test on every CI run): with no plugins
-installed the host costs almost nothing; the **first** loaded plugin pages in wasmtime's
+past which an `http-fetch` response is rejected). Nothing reserves that memory. With no
+`.wasm` file in `plugins/` the server boots without any of the WASM runtime: no engine, no
+thread, no plugin HTTP client (the `idle_host` test checks it). An install builds an engine
+to check the download and drops it after; the HTTP client that check needs is built on the
+first install and kept. Measured real usage once a plugin is installed (printed by the
+`wasm_hello_guest` test on every CI run): the **first** loaded plugin pages in wasmtime's
 JIT machinery, ~58 MiB **once per server process**; each **additional** plugin adds only a
 few MiB (the 49 KiB reference plugin measures ~6 MiB as an upper bound). So ten
 well-behaved plugins cost on the order of 120 MiB total — not 10 × 128 MiB. Raise the

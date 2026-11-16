@@ -19,6 +19,7 @@ use async_trait::async_trait;
 use ferrofin_core::FerrofinServerApplicationPaths;
 use ferrofin_hls::{DynamicHlsPlaylistGenerator, EncodingOptionsProvider, HlsStreamManagerImpl};
 use ferrofin_mediaencoding::attachments::{AttachmentIo, MediaSourceResolver};
+use ferrofin_mediaencoding::encoder::media_encoder::InputAnalysis;
 use ferrofin_mediaencoding::subtitles::{
     SubtitleEditParser, SubtitleEncoder as PureSubtitleEncoder, SubtitleEncoderImpl, SubtitleIo,
     subtitle_extraction_timeout,
@@ -74,6 +75,9 @@ pub struct MediaEncodingExtras {
     /// The caps on concurrent re-encoding jobs; see
     /// [`crate::config::Config::max_transcodes`].
     pub transcode_limits: TranscodeLimits,
+    /// The `-analyzeduration` / `-probesize` transcode inputs read with; see
+    /// [`crate::config::Config::ffmpeg_probe_size`].
+    pub input_analysis: InputAnalysis,
 }
 
 /// The playlist generator's encoding options: the live configuration, as
@@ -357,7 +361,8 @@ pub fn build_media_encoding(
         Arc::clone(&paths),
         Arc::clone(&subtitles),
     )
-    .with_attachments(Arc::clone(&attachments), path_manager);
+    .with_attachments(Arc::clone(&attachments), path_manager)
+    .with_input_analysis(extras.input_analysis);
     let planner = match library {
         Some(library) => planner.with_library(library),
         None => planner,
@@ -457,12 +462,7 @@ impl SubtitleIo for FfmpegSubtitleIo {
     }
 
     fn path_protocol(&self, path: &str) -> MediaProtocol {
-        let lower = path.trim_start().to_ascii_lowercase();
-        if lower.starts_with("http://") || lower.starts_with("https://") {
-            MediaProtocol::Http
-        } else {
-            MediaProtocol::File
-        }
+        ferrofin_model::media_info::path_protocol(path)
     }
 
     fn subtitle_cache_path(
@@ -636,7 +636,10 @@ fn stderr_text(tail: &[u8], arguments: &[String]) -> String {
 /// exit code `-1`) and deletes every output it was writing
 /// (`ExtractSubtitlesForFile`, `AttachmentExtractor`'s failure path). Here both
 /// cases are a drop before `finished` is set — the timeout returns early, and a
-/// cancelled request drops the future awaiting it. Without the deletion, a file
+/// cancelled request drops the future awaiting it. An attachment extraction
+/// runs on a task its request only awaits (upstream's token there is one
+/// nothing cancels), so for it only the host's teardown does (a shutdown or a
+/// restart, `AttachmentExtractor::shutdown`). Without the deletion, a file
 /// cut off mid-write would stay in the cache and be served on every later
 /// request, because extraction skips any output that already exists.
 struct RunningExtraction<'a> {
@@ -836,9 +839,11 @@ impl AttachmentIo for FfmpegAttachmentIo {
             .kill_on_drop(true)
             .spawn()
             .map_err(|e| format!("spawn ffmpeg {ffmpeg_path}: {e}"))?;
-        // Until ffmpeg exits on its own, a cancelled request (its future
-        // dropped) kills it and deletes `outputs`. Upstream has no timeout
-        // here, only the cancellation (owner decision 2026-10-25).
+        // Until ffmpeg exits on its own, dropping this future kills it and
+        // deletes `outputs`. The extractor awaits it on a task of its own, so
+        // only the host's teardown (a shutdown or a restart) does that, never a
+        // request that stops waiting. No timeout, as upstream (owner decision
+        // 2026-10-25).
         let mut running = RunningExtraction {
             child,
             output_paths: outputs,
@@ -871,6 +876,21 @@ mod tests {
         .expect_err("nothing listens there");
 
         assert_eq!(error, "GET http://127.0.0.1:0: error sending request");
+    }
+
+    /// A subtitle URL on another scheme is read over HTTP, as upstream reads
+    /// it, and fails there without naming its account or path either.
+    #[tokio::test]
+    async fn a_subtitle_url_on_another_scheme_names_only_the_host() {
+        let error = http_get_bytes("smb://acct-user:info-secret@nas/path-secret/en.srt")
+            .await
+            .expect_err("no smb client");
+
+        assert!(error.starts_with("GET smb://nas"), "{error}");
+        assert!(
+            !error.contains("secret") && !error.contains("acct"),
+            "{error}"
+        );
     }
 
     /// A fake [`MediaSourceManager`] returning fixed sources + attachments.
@@ -1153,6 +1173,7 @@ mod tests {
                 sessions: None,
                 keyframes: None,
                 transcode_limits: TranscodeLimits::default(),
+                input_analysis: InputAnalysis::default(),
             },
         );
     }
@@ -1199,6 +1220,7 @@ mod tests {
                 sessions: None,
                 keyframes: None,
                 transcode_limits: TranscodeLimits::default(),
+                input_analysis: InputAnalysis::default(),
             },
         );
         assert!(!job.join("0123abcd0.mp4").exists());
@@ -1521,6 +1543,7 @@ mod tests {
                 sessions: None,
                 keyframes: None,
                 transcode_limits: TranscodeLimits::default(),
+                input_analysis: InputAnalysis::default(),
             },
         );
 
@@ -1822,6 +1845,20 @@ mod tests {
             config: Arc::new(FakeConfig(paths, options)),
             encoding_reader: EncodingOptionsReader::new("subtitle extraction"),
         }
+    }
+
+    /// The real subtitle I/O reads a path over the protocol
+    /// `GetPathProtocol` gives it: a non-HTTP URL is no local file.
+    #[cfg(unix)]
+    #[rstest::rstest]
+    #[case("/media/Movie.en.srt", MediaProtocol::File)]
+    #[case("https://subs.example/a.srt", MediaProtocol::Http)]
+    #[case("ftp://subs.example/a.srt", MediaProtocol::Ftp)]
+    #[case("smb://nas/share/a.srt", MediaProtocol::Http)]
+    fn subtitle_paths_take_upstreams_protocol(#[case] path: &str, #[case] expected: MediaProtocol) {
+        let tmp = tempfile::tempdir().unwrap();
+        let io = subtitle_io(tmp.path(), "ffmpeg".to_owned(), 1);
+        assert_eq!(io.path_protocol(path), expected);
     }
 
     /// A sidecar gone from disk keeps its I/O kind through the real read, so the
@@ -2198,10 +2235,11 @@ mod tests {
         assert!(killed, "ffmpeg {pid} kept running after the cancellation");
     }
 
-    /// Dropping the request future mid-dump (a client giving up on a font)
-    /// kills ffmpeg and deletes the attachment it was writing, as upstream's
-    /// cancellation does (`Kill(true)`, then the failure path's delete), so a
-    /// truncated font is never served from the attachment cache.
+    /// Dropping the dump mid-run (the host's teardown stopping the
+    /// extraction's task) kills ffmpeg and deletes the attachment it was
+    /// writing, as upstream's cancellation branch would (`Kill(true)`, then the
+    /// failure path's delete), so a truncated font is never served from the
+    /// attachment cache.
     #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn a_cancelled_attachment_extraction_kills_ffmpeg_and_deletes_its_output() {
@@ -2244,7 +2282,7 @@ mod tests {
             .to_owned();
         assert!(std::path::Path::new(&output).is_file());
 
-        // The request is cancelled.
+        // The extraction's task is dropped.
         drop(dump);
 
         assert!(!std::path::Path::new(&output).exists());

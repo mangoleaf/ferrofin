@@ -42,7 +42,7 @@ use ferrofin_model::entities::ImageType;
 use ferrofin_model::entities_media::{VirtualFolderInfo, libraries_holding};
 use ferrofin_model::live_tv::{
     ChannelMappingOptionsDto, GuideInfo, ItemSortBy, ListingsProviderInfo, LiveTvInfo,
-    SeriesTimerInfoDto, TimerInfoDto, TunerChannelMapping, TunerHostInfo,
+    SeriesTimerInfoDto, TimerInfoDto, TunerHostInfo,
 };
 use ferrofin_model::querying::{ItemFields, QueryResult};
 use ferrofin_traits::options::{DtoOptions, InternalItemsQuery};
@@ -52,9 +52,15 @@ use ferrofin_traits::stubs::{LiveTvChannelQuery, RecordingVisibility};
 
 use crate::auth::{RequireAdmin, RequireLiveTvAccess, RequireLiveTvManagement};
 use crate::error::ApiError;
-use crate::extract::{DotnetGuid, JsonBody, Query, RequiredRouteString, RouteParameter};
+use crate::extract::{
+    DotnetGuid, JsonBody, ProblemDetails, Query, RequiredRouteString, RouteParameter,
+    blank_complaint, route_container_complaint, validation_failure,
+};
 use crate::handlers::items::{require_visible_item, resolve_user_opt};
-use crate::handlers::query_parse::{parse_csv_enums_lenient, parse_csv_uuids, parse_pipe_strings};
+use crate::handlers::query_parse::{
+    get_order_by, parse_csv_enums_lenient, parse_csv_uuids, parse_order_by, parse_pipe_strings,
+};
+use crate::handlers::streaming::stream_route_container;
 use crate::state::AppState;
 
 /// `GET /LiveTv/Info` — top-level Live TV status.
@@ -337,10 +343,7 @@ impl ProgramsQuery {
             is_sports: self.is_sports,
             start_index: self.start_index,
             limit: self.limit,
-            order_by: pair_order_by(
-                parse_csv_enums_lenient(self.sort_by.as_deref()),
-                &parse_csv_enums_lenient(self.sort_order.as_deref()),
-            ),
+            order_by: parse_order_by(self.sort_by.as_deref(), self.sort_order.as_deref()),
             genres: parse_pipe_strings(self.genres.as_deref()),
             genre_ids: parse_csv_uuids(self.genre_ids.as_deref())?,
             series_timer_id: self.series_timer_id,
@@ -454,8 +457,15 @@ struct GetProgramsDto {
     /// Additional DTO fields.
     #[serde(deserialize_with = "ferrofin_model::json::delimited::comma_option")]
     fields: Option<Vec<ItemFields>>,
-    /// Whether the total record count is computed (schema default `true`).
-    #[serde(deserialize_with = "ferrofin_model::json::value::nullable")]
+    /// Whether the total record count is computed. C#'s non-nullable
+    /// `bool EnableTotalRecordCount = true`: absent is `true`, and `null` fails
+    /// the bind (`400`).
+    // The test-only `Serialize` feeds `contract_numbers::check_model`, which
+    // binds the serialized default again: a `null` there would now fail.
+    #[serde(
+        deserialize_with = "ferrofin_model::json::value::non_nullable",
+        skip_serializing_if = "Option::is_none"
+    )]
     enable_total_record_count: Option<bool>,
 }
 
@@ -478,7 +488,7 @@ impl GetProgramsDto {
             is_sports: self.is_sports,
             start_index: self.start_index,
             limit: self.limit,
-            order_by: pair_order_by(
+            order_by: get_order_by(
                 self.sort_by.unwrap_or_default(),
                 &self.sort_order.unwrap_or_default(),
             ),
@@ -624,26 +634,6 @@ struct ProgramFilters {
     library_series_id: Option<Uuid>,
     /// Whether the total record count is computed.
     enable_total_record_count: bool,
-}
-
-/// Pairs sort columns with sort orders.
-///
-/// Mirrors `RequestHelpers.GetOrderBy`: each column takes the order at its own
-/// index, and columns beyond the supplied orders are padded with the **first**
-/// requested order (ascending when none was supplied).
-fn pair_order_by(columns: Vec<ItemSortBy>, orders: &[SortOrder]) -> Vec<(ItemSortBy, SortOrder)> {
-    columns
-        .into_iter()
-        .enumerate()
-        .map(|(i, column)| {
-            let order = orders
-                .get(i)
-                .or_else(|| orders.first())
-                .copied()
-                .unwrap_or(SortOrder::Ascending);
-            (column, order)
-        })
-        .collect()
 }
 
 /// Builds the [`DtoOptions`] for a program query.
@@ -1617,25 +1607,6 @@ pub(crate) fn progressive_response(
         .unwrap_or_else(|_| Response::new(Body::empty()))
 }
 
-/// The container extension of a `stream.{container}` route segment, validated
-/// the way upstream's `[RegularExpression(ContainerValidationRegexStr)]` does.
-fn route_container(segment: &str) -> Option<&str> {
-    let container = segment.rsplit_once('.').map_or(segment, |(_, ext)| ext);
-    // `^[a-zA-Z0-9\-\._,|]{0,40}$` — empty is allowed, as it is upstream.
-    let valid = container.len() <= 40
-        && container
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_' | b',' | b'|'));
-    valid.then_some(container)
-}
-
-/// `{streamId}`, the `[FromRoute, Required] string` of `GetLiveStreamFile`.
-struct StreamId;
-
-impl RouteParameter for StreamId {
-    const NAME: &'static str = "streamId";
-}
-
 /// `GET /LiveTv/LiveStreamFiles/{streamId}/stream.{container}` — the buffered
 /// live-stream file.
 ///
@@ -1649,14 +1620,24 @@ impl RouteParameter for StreamId {
 /// the server's own ffmpeg reads this URL without a token. It exposes only a
 /// live stream a caller already opened, and the unique id is an unguessable
 /// per-open GUID.
+///
+/// Its `[FromRoute, Required] string streamId` and its `container`
+/// ([`route_container_complaint`]) are bound first, and every failure is named
+/// in one `400`; a segment without the `stream.` literal is no match for the
+/// route, a `404`.
 async fn get_live_stream_file(
     State(state): State<AppState>,
-    RequiredRouteString(stream_id, _): RequiredRouteString<StreamId>,
-    Path((_, container)): Path<(String, String)>,
+    Path((stream_id, segment)): Path<(String, String)>,
 ) -> Result<Response, ApiError> {
-    let Some(container) = route_container(&container) else {
-        return Err(ApiError::NotFound("live stream file".into()));
-    };
+    let container = stream_route_container(&segment)
+        .ok_or_else(|| ApiError::NotFound("live stream file".into()))?;
+    if let Some(rejection) = validation_failure(
+        blank_complaint("streamId", &stream_id)
+            .into_iter()
+            .chain(route_container_complaint(container)),
+    ) {
+        return Ok(rejection);
+    }
     live_stream_buffer(&state, &stream_id, &format!("file.{container}")).await
 }
 
@@ -1685,20 +1666,54 @@ pub(crate) async fn live_stream_buffer(
 /// The `POST /LiveTv/ChannelMappings` request body.
 ///
 /// Port of `SetChannelMappingDto`: a tuner channel mapped to a listings-provider
-/// channel, for the given listings provider.
+/// channel, for the given listings provider. Each member is a `[Required]`
+/// string defaulting to `string.Empty`, so one left out or sent `null` binds as
+/// `""` and is refused by [`Self::validation`].
 #[derive(Debug, serde::Deserialize)]
 #[serde(rename_all = "PascalCase")]
 #[allow(clippy::struct_field_names)] // mirrors the vendored `SetChannelMappingDto`
 struct SetChannelMappingDto {
     /// The listings provider id the mapping belongs to.
-    #[serde(default)]
+    #[serde(
+        default,
+        deserialize_with = "ferrofin_model::json::value::null_as_default"
+    )]
     provider_id: String,
     /// The tuner channel id being mapped.
-    #[serde(default)]
+    #[serde(
+        default,
+        deserialize_with = "ferrofin_model::json::value::null_as_default"
+    )]
     tuner_channel_id: String,
     /// The provider channel id it maps to.
-    #[serde(default)]
+    #[serde(
+        default,
+        deserialize_with = "ferrofin_model::json::value::null_as_default"
+    )]
     provider_channel_id: String,
+}
+
+impl SetChannelMappingDto {
+    /// ASP.NET's model validation of the three `[Required]` members, before the
+    /// action runs: one `400` naming each that is empty or blank
+    /// (`IsNullOrWhiteSpace`), so nothing is stored.
+    fn validation(&self) -> Option<ProblemDetails> {
+        ProblemDetails::members_validation(
+            [
+                ("ProviderId", &self.provider_id),
+                ("TunerChannelId", &self.tuner_channel_id),
+                ("ProviderChannelId", &self.provider_channel_id),
+            ]
+            .into_iter()
+            .filter(|(_, value)| value.trim().is_empty())
+            .map(|(member, _)| {
+                (
+                    member.to_owned(),
+                    format!("The {member} field is required."),
+                )
+            }),
+        )
+    }
 }
 
 /// `POST /LiveTv/ChannelMappings` — map a tuner channel to a provider channel.
@@ -1706,14 +1721,19 @@ struct SetChannelMappingDto {
 /// Port of `LiveTvController.SetChannelMapping` → `ListingsManager.SetChannelMapping`:
 /// stores the `tunerChannelId -> providerChannelId` pair on the listings
 /// provider, QUEUES the guide refresh that rebuilds the listings through it, and
-/// returns that tuner channel's
-/// recomputed [`TunerChannelMapping`]. `404` when the provider id or the tuner
-/// channel id names nothing.
+/// returns that tuner channel's recomputed
+/// [`TunerChannelMapping`](ferrofin_model::live_tv::TunerChannelMapping).
+/// `400` when an id is missing or blank, `404` when the provider id or the
+/// tuner channel id names nothing, or, after the pair is stored, when a local
+/// XMLTV guide file is not there and no copy is cached.
 async fn set_channel_mapping(
     State(state): State<AppState>,
     RequireAdmin(_auth): RequireAdmin,
     JsonBody(dto): JsonBody<SetChannelMappingDto>,
-) -> Result<Json<TunerChannelMapping>, ApiError> {
+) -> Result<Response, ApiError> {
+    if let Some(problem) = dto.validation() {
+        return Ok(problem.into_response());
+    }
     let m = live_tv(&state)?;
     let mapping = m
         .set_channel_mapping(
@@ -1723,9 +1743,14 @@ async fn set_channel_mapping(
         )
         .await?;
     // The stored pair only MOVES listings once the guide is rebuilt through it,
-    // and upstream leaves that to the queued task (ListingsManager.cs:251-262).
+    // and upstream leaves that to the queued task (ListingsManager.cs:272),
+    // queued before its `.First(...)` throws for a tuner channel not in the
+    // lineup (a 500 there, the 404 here).
     queue_guide_refresh(m);
-    Ok(Json(mapping))
+    let mapping = mapping.ok_or_else(|| {
+        ServiceError::not_found(format!("tuner channel {}", dto.tuner_channel_id))
+    })?;
+    Ok(Json(mapping).into_response())
 }
 
 /// `GET /LiveTv/Recordings/Series` — series recordings (deprecated; empty).
@@ -1784,17 +1809,40 @@ impl RouteParameter for TimerId {
     const NAME: &'static str = "timerId";
 }
 
-/// `GET /LiveTv/Timers/{timerId}` — a single timer (`404` if absent).
+/// Port of `LiveTvManager.GetTimer`: the first timer `GetTimers` lists (so
+/// never a `Completed` one) whose id equals `timer_id` ignoring case.
+async fn find_timer(
+    manager: &dyn ferrofin_traits::stubs::LiveTvManager,
+    timer_id: &str,
+) -> Result<Option<TimerInfoDto>, ApiError> {
+    let query = ferrofin_model::live_tv::TimerQuery {
+        id: Some(timer_id.to_owned()),
+        ..ferrofin_model::live_tv::TimerQuery::default()
+    };
+    Ok(manager
+        .get_timers_matching(&query)
+        .await?
+        .into_iter()
+        .find(|timer| {
+            timer
+                .base
+                .id
+                .as_deref()
+                .is_some_and(|id| id.eq_ignore_ascii_case(timer_id))
+        }))
+}
+
+/// `GET /LiveTv/Timers/{timerId}` — a single timer, or `200` with `null` for
+/// an id [`find_timer`] does not find: upstream returns `GetTimer`'s answer
+/// unchecked.
 async fn get_timer(
     State(state): State<AppState>,
     RequireLiveTvAccess(_auth): RequireLiveTvAccess,
     RequiredRouteString(timer_id, _): RequiredRouteString<TimerId>,
-) -> Result<Json<TimerInfoDto>, ApiError> {
-    live_tv(&state)?
-        .get_timer(&timer_id)
-        .await?
-        .map(Json)
-        .ok_or_else(|| ApiError::NotFound("timer".into()))
+) -> Result<Json<Option<TimerInfoDto>>, ApiError> {
+    Ok(Json(
+        find_timer(live_tv(&state)?.as_ref(), &timer_id).await?,
+    ))
 }
 
 /// `POST /LiveTv/Timers` — create a recording timer.
@@ -1816,10 +1864,11 @@ async fn create_timer(
 }
 
 /// Pushes a timer lifecycle message (`TimerCreated` / `TimerCancelled` /
-/// `SeriesTimerCreated` / `SeriesTimerCancelled`) to every signed-in session,
-/// carrying the C# `TimerEventInfo` shape (`Id` + optional `ProgramId`) — the
-/// push Jellyfin's `RecordingNotifier` sends so clients refresh their
-/// recording views. Best-effort: delivery must not fail the request.
+/// `SeriesTimerCreated` / `SeriesTimerCancelled`) to the sessions of the users
+/// holding `EnableLiveTvAccess`, carrying the C# `TimerEventInfo` shape (`Id` +
+/// optional `ProgramId`) — the push Jellyfin's `RecordingNotifier.SendMessage`
+/// sends so clients refresh their recording views. Best-effort: delivery must
+/// not fail the request.
 async fn notify_timer_event(
     state: &AppState,
     message_type: ferrofin_model::session::SessionMessageType,
@@ -1830,10 +1879,18 @@ async fn notify_timer_event(
     if let Some(program_id) = program_id {
         data["ProgramId"] = serde_json::Value::String(program_id.to_owned());
     }
-    let _ = state
+    if let Err(error) = state
         .sessions
-        .send_message_to_all_sessions(message_type, &data.to_string())
-        .await;
+        .send_message_to_sessions_with_permission(
+            ferrofin_db::enums::PermissionKind::EnableLiveTvAccess,
+            message_type,
+            &data.to_string(),
+        )
+        .await
+    {
+        // `RecordingNotifier.SendMessage` logs the failure and carries on.
+        tracing::debug!(%error, "live tv: could not push a timer event");
+    }
 }
 
 /// `POST /LiveTv/Timers/{timerId}` — update a recording timer.
@@ -1848,19 +1905,32 @@ async fn update_timer(
 }
 
 /// `DELETE /LiveTv/Timers/{timerId}` — cancel a recording timer.
+///
+/// Port of `LiveTvManager.CancelTimer`: an id [`find_timer`] does not find is
+/// a `404`, and `TimerCancelled` goes out only when the cancel changed the
+/// timer's status (`CancelTimerInternal`'s `statusChanging`).
 async fn cancel_timer(
     State(state): State<AppState>,
     RequireLiveTvManagement(_auth): RequireLiveTvManagement,
     RequiredRouteString(timer_id, _): RequiredRouteString<TimerId>,
 ) -> Result<axum::http::StatusCode, ApiError> {
-    live_tv(&state)?.cancel_timer(&timer_id).await?;
-    notify_timer_event(
-        &state,
-        ferrofin_model::session::SessionMessageType::TimerCancelled,
-        &timer_id,
-        None,
-    )
-    .await;
+    let manager = live_tv(&state)?;
+    let Some(timer) = find_timer(manager.as_ref(), &timer_id).await? else {
+        return Err(ApiError::NotFound(format!(
+            "Timer with Id {timer_id} not found"
+        )));
+    };
+    let id = timer.base.id.as_deref().unwrap_or(&timer_id);
+    manager.cancel_timer(id).await?;
+    if timer.status != ferrofin_model::live_tv::RecordingStatus::Cancelled {
+        notify_timer_event(
+            &state,
+            ferrofin_model::session::SessionMessageType::TimerCancelled,
+            id,
+            None,
+        )
+        .await;
+    }
     Ok(axum::http::StatusCode::NO_CONTENT)
 }
 
@@ -1946,14 +2016,25 @@ async fn get_series_timers(
 }
 
 /// `GET /LiveTv/SeriesTimers/{timerId}` — a single series timer (`404` if absent).
+///
+/// Port of `LiveTvManager.GetSeriesTimer`: the first series timer
+/// `GetSeriesTimers` lists whose id equals `timer_id` ignoring case.
 async fn get_series_timer(
     State(state): State<AppState>,
     RequireLiveTvAccess(_auth): RequireLiveTvAccess,
     RequiredRouteString(timer_id, _): RequiredRouteString<TimerId>,
 ) -> Result<Json<SeriesTimerInfoDto>, ApiError> {
     live_tv(&state)?
-        .get_series_timer(&timer_id)
+        .get_series_timers(&ferrofin_model::live_tv::SeriesTimerQuery::default())
         .await?
+        .into_iter()
+        .find(|timer| {
+            timer
+                .base
+                .id
+                .as_deref()
+                .is_some_and(|id| id.eq_ignore_ascii_case(&timer_id))
+        })
         .map(Json)
         .ok_or_else(|| ApiError::NotFound("series timer".into()))
 }
@@ -2021,7 +2102,8 @@ struct ChannelMappingOptionsQuery {
 /// Port of `LiveTvController.GetChannelMappingOptions` →
 /// `ListingsManager.GetChannelMappingOptions`. `404` when `providerId` is
 /// absent or names no configured provider (upstream's unguarded `.First(...)`
-/// throws there, which the middleware turns into a 500).
+/// throws there, which the middleware turns into a 500), or when a local XMLTV
+/// guide file is not there and no copy is cached (`FileNotFoundException`).
 async fn get_channel_mapping_options(
     State(state): State<AppState>,
     RequireAdmin(_auth): RequireAdmin,
@@ -2064,7 +2146,8 @@ struct LineupsQuery {
 ///
 /// Port of `LiveTvController.GetLineups` → `ListingsManager.GetLineups`. `404`
 /// when the provider cannot be resolved, which is what the C#
-/// `ResourceNotFoundException` maps to.
+/// `ResourceNotFoundException` maps to, or when a local XMLTV guide file is not
+/// there and no copy is cached (`FileNotFoundException`).
 ///
 /// `[Authorize(Policy = Policies.LiveTvAccess)]` upstream
 /// (`LiveTvController.cs:1075` @ v10.11.8), and [`RequireLiveTvAccess`] is the
@@ -2263,6 +2346,7 @@ mod tests {
 
     use super::*;
     use crate::test_support::fake_state;
+    use ferrofin_model::live_tv::TunerChannelMapping;
 
     /// A `RequireAuth` for an authenticated (default) caller.
     fn auth() -> RequireLiveTvAccess {
@@ -2706,7 +2790,6 @@ mod tests {
         // anonymous and reports only "no such stream".
         let file = get_live_stream_file(
             State(fake_state()),
-            RequiredRouteString("s1".into(), std::marker::PhantomData),
             Path(("s1".into(), "stream.mp4".into())),
         )
         .await
@@ -2714,28 +2797,10 @@ mod tests {
         assert_eq!(file.status(), axum::http::StatusCode::NOT_FOUND);
         // A manager with nothing open says the same.
         let state = fake_state().with_live_tv(std::sync::Arc::new(FakeLiveTv::default()));
-        let file = get_live_stream_file(
-            State(state),
-            RequiredRouteString("s1".into(), std::marker::PhantomData),
-            Path(("s1".into(), "stream.ts".into())),
-        )
-        .await
-        .unwrap_err();
+        let file = get_live_stream_file(State(state), Path(("s1".into(), "stream.ts".into())))
+            .await
+            .unwrap_err();
         assert_eq!(file.status(), axum::http::StatusCode::NOT_FOUND);
-    }
-
-    #[test]
-    fn the_route_container_is_the_validated_extension() {
-        assert_eq!(route_container("stream.ts"), Some("ts"));
-        assert_eq!(route_container("stream.mp4"), Some("mp4"));
-        // No dot: the whole segment is the container, as upstream's route would
-        // have bound it.
-        assert_eq!(route_container("ts"), Some("ts"));
-        // Upstream's regex is `{0,40}`, so an empty container is legal (and
-        // simply has no known MIME type).
-        assert_eq!(route_container("stream."), Some(""));
-        assert_eq!(route_container("stream.a/b"), None);
-        assert_eq!(route_container(&format!("stream.{}", "x".repeat(41))), None);
     }
 
     /// The first chunk a progressive body yields. Only the first: the body is
@@ -2770,7 +2835,6 @@ mod tests {
 
         let response = get_live_stream_file(
             State(state),
-            RequiredRouteString("uid-1".to_owned(), std::marker::PhantomData),
             Path(("uid-1".to_owned(), "stream.ts".to_owned())),
         )
         .await
@@ -2816,7 +2880,6 @@ mod tests {
 
         let response = get_live_stream_file(
             State(state),
-            RequiredRouteString("uid-1".to_owned(), std::marker::PhantomData),
             Path(("uid-1".to_owned(), "stream.ts".to_owned())),
         )
         .await
@@ -2858,6 +2921,7 @@ mod tests {
             is_live_stream: true,
             is_infinite_stream: false,
             user_agent: None,
+            container: None,
         };
 
         let response = serve_static_source(
@@ -2924,7 +2988,6 @@ mod tests {
     #[derive(Default)]
     struct FakeLiveTv {
         providers: std::sync::Mutex<Vec<ListingsProviderInfo>>,
-        recording_path: Option<String>,
         /// The one open live stream, keyed by its unique id.
         live_stream: Option<(String, ferrofin_traits::stubs::LiveStreamFile)>,
         programs_query: std::sync::Mutex<Option<InternalItemsQuery>>,
@@ -3001,12 +3064,6 @@ mod tests {
             *g = vec![info.clone()];
             Ok(info)
         }
-        async fn get_recording_path(
-            &self,
-            _id: Uuid,
-        ) -> Result<Option<String>, ferrofin_traits::error::ServiceError> {
-            Ok(self.recording_path.clone())
-        }
         async fn get_live_stream_file(
             &self,
             unique_id: &str,
@@ -3052,7 +3109,7 @@ mod tests {
             provider_id: &str,
             tuner_channel_id: &str,
             provider_channel_id: &str,
-        ) -> Result<TunerChannelMapping, ferrofin_traits::error::ServiceError> {
+        ) -> Result<Option<TunerChannelMapping>, ferrofin_traits::error::ServiceError> {
             if self
                 .providers
                 .lock()
@@ -3067,12 +3124,13 @@ mod tests {
                 tuner_channel_id.to_owned(),
                 provider_channel_id.to_owned(),
             ));
-            Ok(TunerChannelMapping {
+            // `gone`: stored, but no lineup channel has that id.
+            Ok((tuner_channel_id != "gone").then(|| TunerChannelMapping {
                 name: Some(format!("10 {tuner_channel_id}")),
                 provider_channel_name: Some("HBO East".into()),
                 provider_channel_id: Some(provider_channel_id.to_owned()),
                 id: Some(tuner_channel_id.to_owned()),
-            })
+            }))
         }
         async fn get_schedules_direct_countries(
             &self,
@@ -3269,7 +3327,7 @@ mod tests {
     async fn set_channel_mapping_forwards_the_dto_and_returns_the_resolved_row() {
         let fake = fake_with_provider();
         let state = fake_state().with_live_tv(fake.clone());
-        let mapping = set_channel_mapping(
+        let response = set_channel_mapping(
             State(state),
             admin_auth(),
             JsonBody(SetChannelMappingDto {
@@ -3279,8 +3337,12 @@ mod tests {
             }),
         )
         .await
-        .unwrap()
-        .0;
+        .unwrap();
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        let mapping: TunerChannelMapping = serde_json::from_slice(&body).expect("json");
         // The three ids reach the manager as sent — the upsert semantics
         // themselves are `ListingsManager.SetChannelMapping`'s, tested in
         // `ferrofin-livetv`.
@@ -3427,7 +3489,7 @@ mod tests {
     #[tokio::test]
     async fn set_channel_mapping_unknown_provider_is_404() {
         let fake = std::sync::Arc::new(FakeLiveTv::default());
-        let state = fake_state().with_live_tv(fake);
+        let state = fake_state().with_live_tv(fake.clone());
         let err = set_channel_mapping(
             State(state),
             admin_auth(),
@@ -3440,6 +3502,71 @@ mod tests {
         .await
         .unwrap_err();
         assert_eq!(err.status(), axum::http::StatusCode::NOT_FOUND);
+        // Upstream's `.First(...)` throws before anything is saved or queued.
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(200),
+                fake.refresh_started.notified()
+            )
+            .await
+            .is_err(),
+            "no guide refresh for an unknown provider"
+        );
+    }
+
+    /// A tuner channel no lineup channel has: upstream stores the pair, queues
+    /// the guide refresh, and only then throws from `.First(...)` (a 500, the
+    /// 404 here), so the refresh is queued here too.
+    #[tokio::test]
+    async fn set_channel_mapping_queues_the_refresh_before_an_unknown_channels_404() {
+        let fake = fake_with_provider();
+        let state = fake_state().with_live_tv(fake.clone());
+        let err = set_channel_mapping(
+            State(state),
+            admin_auth(),
+            JsonBody(SetChannelMappingDto {
+                provider_id: "prov1".into(),
+                tuner_channel_id: "gone".into(),
+                provider_channel_id: "HBO".into(),
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.status(), axum::http::StatusCode::NOT_FOUND);
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            fake.refresh_started.notified(),
+        )
+        .await
+        .expect("the stored pair must queue a guide refresh");
+    }
+
+    /// `SetChannelMappingDto`'s three `[Required]` members: one left out, sent
+    /// `null` or blank is a `400` naming each, before anything is stored.
+    #[tokio::test]
+    async fn set_channel_mapping_requires_the_three_ids() {
+        let fake = fake_with_provider();
+        let state = fake_state().with_live_tv(fake.clone());
+        let dto: SetChannelMappingDto =
+            serde_json::from_str(r#"{"TunerChannelId":" ","ProviderChannelId":null}"#)
+                .expect("binds");
+        let response = set_channel_mapping(State(state), admin_auth(), JsonBody(dto))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), axum::http::StatusCode::BAD_REQUEST);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        let problem: serde_json::Value = serde_json::from_slice(&body).expect("json");
+        assert_eq!(
+            problem["errors"],
+            serde_json::json!({
+                "ProviderChannelId": ["The ProviderChannelId field is required."],
+                "ProviderId": ["The ProviderId field is required."],
+                "TunerChannelId": ["The TunerChannelId field is required."],
+            })
+        );
+        assert_eq!(*fake.mapping_args.lock().unwrap(), None);
     }
 
     // ---- program queries carry the contract's filters --------------------
@@ -3651,6 +3778,56 @@ mod tests {
         let state = fake_state().with_live_tv(std::sync::Arc::new(FakeLiveTv::default()));
         let err = get_programs(State(state), auth(), query).await.unwrap_err();
         assert_eq!(err.status(), axum::http::StatusCode::BAD_REQUEST);
+    }
+
+    /// `GetProgramsDto.EnableTotalRecordCount` is C#'s non-nullable
+    /// `bool EnableTotalRecordCount = true`, bound by the body's JSON options
+    /// with no `bool` converter: absent counts, `false` turns the count off,
+    /// and `null`, `""` or a quoted `"true"` fails the bind with a 400 naming
+    /// the member, which never reaches the guide.
+    #[rstest::rstest]
+    #[case::absent(r"{}", Some(true))]
+    #[case::true_(r#"{"EnableTotalRecordCount":true}"#, Some(true))]
+    #[case::false_(r#"{"EnableTotalRecordCount":false}"#, Some(false))]
+    #[case::null(r#"{"EnableTotalRecordCount":null}"#, None)]
+    #[case::empty(r#"{"EnableTotalRecordCount":""}"#, None)]
+    #[case::quoted(r#"{"EnableTotalRecordCount":"true"}"#, None)]
+    #[tokio::test]
+    async fn post_programs_binds_enable_total_record_count_as_a_bool(
+        #[case] body: &'static str,
+        #[case] counted: Option<bool>,
+    ) {
+        use tower::ServiceExt;
+
+        let fake = std::sync::Arc::new(FakeLiveTv::default());
+        let state = crate::test_support::elevated_fake_state().with_live_tv(fake.clone());
+        let response = crate::create_router(state)
+            .oneshot(
+                axum::http::Request::post("/LiveTv/Programs")
+                    .header(axum::http::header::CONTENT_TYPE, "application/json")
+                    .body(axum::body::Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let text = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let text = String::from_utf8_lossy(&text);
+        let asked = fake.programs_query.lock().unwrap().clone();
+        if counted.is_some() {
+            assert_eq!(status, axum::http::StatusCode::OK, "{body}: {text}");
+        } else {
+            assert_eq!(status, axum::http::StatusCode::BAD_REQUEST, "{body}");
+            assert!(text.contains("$.EnableTotalRecordCount"), "{body}: {text}");
+        }
+        // A refused body never reaches the guide.
+        assert_eq!(
+            asked.map(|query| query.enable_total_record_count),
+            counted,
+            "{body}"
+        );
     }
 
     #[tokio::test]

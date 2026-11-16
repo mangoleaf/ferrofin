@@ -353,20 +353,9 @@ pub fn float_try_parse(s: &str) -> Option<f32> {
     }
 }
 
-/// `string.Equals(a, b, StringComparison.OrdinalIgnoreCase)`: each UTF-16 unit
-/// compared after its simple upper-case mapping (a mapping to several characters,
-/// such as `ß`, leaves the character as it is).
-#[must_use]
-pub fn eq_ordinal_ignore_case(a: &str, b: &str) -> bool {
-    fn upper(c: char) -> char {
-        let mut it = c.to_uppercase();
-        match (it.next(), it.next()) {
-            (Some(u), None) => u,
-            _ => c,
-        }
-    }
-    a.chars().map(upper).eq(b.chars().map(upper))
-}
+// `string.Equals(a, b, StringComparison.OrdinalIgnoreCase)`, from the
+// oracle-tested `ferrofin-util`.
+pub use ferrofin_util::string_extensions::equals_ordinal_ignore_case as eq_ordinal_ignore_case;
 
 /// A .NET `decimal` as libse's styles keep it: its digits and its scale, which
 /// `ToString()` preserves (`1.00` stays `1.00`).

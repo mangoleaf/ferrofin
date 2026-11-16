@@ -56,6 +56,18 @@ fn containing_folder(item: &BaseItemEntity) -> Option<&Path> {
     }
 }
 
+/// The folder every one of [`DestinationPolicy::destinations`] lies in: a
+/// season's series folder (`seasonNN-…`), otherwise the containing folder.
+pub(super) fn art_folder<'a>(
+    item: &'a BaseItemEntity,
+    series: Option<&'a BaseItemEntity>,
+) -> Option<&'a Path> {
+    match series.and_then(|series| series.path.as_deref()) {
+        Some(series) if short_kind(item) == "Season" => Some(Path::new(series)),
+        _ => containing_folder(item).or_else(|| series.and_then(containing_folder)),
+    }
+}
+
 fn season_filename(item: &BaseItemEntity, name: &str, extension: &str) -> Option<String> {
     let season = item.index_number?;
     let marker = if season == 0 {

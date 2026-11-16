@@ -359,11 +359,7 @@ mod tests {
             Err(format!("GET {url}: HTTP 503"))
         }
         fn path_protocol(&self, path: &str) -> MediaProtocol {
-            if path.starts_with("http") {
-                MediaProtocol::Http
-            } else {
-                MediaProtocol::File
-            }
+            ferrofin_model::media_info::path_protocol(path)
         }
         fn subtitle_cache_path(
             &self,

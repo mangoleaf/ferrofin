@@ -73,7 +73,7 @@ pub async fn ip_access_layer(
     // Behind a reverse proxy the peer is the PROXY, so filtering it would
     // filter the wrong host — and let every real client through. The forwarded
     // chain is consulted only when the peer is a configured `KnownProxy`.
-    let ip = state.client_address_for(peer, &crate::state::forwarded_for(request.headers()));
+    let ip = state.client_address_for(peer, request.headers());
     request.extensions_mut().insert(ResolvedClientAddress(ip));
     // Absent where the accept loop could not read the connection's local
     // address (or a router built without it): only loopback is exempt then.

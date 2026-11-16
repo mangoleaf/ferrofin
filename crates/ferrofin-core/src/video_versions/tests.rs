@@ -374,6 +374,34 @@ fn get_media_source_name_common_prefix_valid(
     );
 }
 
+/// `GetCommonVersionPrefix` compares with `char.ToUpperInvariant` and
+/// `GetMediaSourceName` with `StartsWith(…, OrdinalIgnoreCase)`; the two differ
+/// at the long `ſ`, which only `ToUpperInvariant` maps to `S`. Neither folds the
+/// dotless `ı` onto `I` or `İ` onto `i`, and both fold `ᾳ` onto `ᾼ` (the oracle
+/// is `ferrofin-util`'s .NET 10 casing table).
+#[rstest]
+#[case("K\u{131}ral - A", "KIRAL - B", "", "K\u{131}ral - A", "KIRAL - B")]
+#[case("\u{17F}tar - A", "Star - B", "\u{17F}tar -", "A", "Star - B")]
+#[case("\u{1FB3}x - A", "\u{1FBC}x - B", "\u{1FB3}x -", "A", "B")]
+#[case("\u{130}x - A", "ix - B", "", "\u{130}x - A", "ix - B")]
+fn version_names_fold_as_dotnet(
+    #[case] primary_name: &str,
+    #[case] alt_name: &str,
+    #[case] expected_prefix: &str,
+    #[case] expected_primary: &str,
+    #[case] expected_alt: &str,
+) {
+    let primary = video(&format!("/Shows/Demo/Season 01/{primary_name}.mkv"));
+    let alt = video(&format!("/Shows/Demo/Season 01/{alt_name}.mkv"));
+    let prefix = common_version_prefix(&[primary_name, alt_name]);
+    assert_eq!(prefix, expected_prefix);
+    assert_eq!(
+        media_source_name(None, &primary, Some(&prefix)),
+        expected_primary
+    );
+    assert_eq!(media_source_name(None, &alt, Some(&prefix)), expected_alt);
+}
+
 #[test]
 fn get_common_version_prefix_numeric_labels_keeps_whole_number() {
     // Three versions labelled "1.0", "1.01" and "1.11": the common prefix stops inside the version
@@ -657,6 +685,34 @@ async fn a_page_reads_its_version_groups_in_as_few_queries_as_it_needs() {
         2,
         "a merged version's own local versions"
     );
+}
+
+/// Inside [`reading_groups_once`] a second load of the same rows reads
+/// nothing and finds the same group; other rows, and loads outside it, read.
+#[tokio::test]
+async fn a_scope_reads_the_same_rows_group_once() {
+    let (primary, alt1, alt2) = version_group();
+    let reader = Counting(
+        Rows(vec![primary.clone(), alt1.clone(), alt2.clone()]),
+        std::sync::atomic::AtomicUsize::new(0),
+    );
+    let count = || reader.1.load(std::sync::atomic::Ordering::Relaxed);
+    reading_groups_once(async {
+        let first = VersionRows::load(&reader, &[&alt1]).await.unwrap();
+        assert_eq!(count(), 2);
+        let again = VersionRows::load(&reader, &[&alt1]).await.unwrap();
+        assert_eq!(count(), 2, "the same rows read nothing");
+        assert_eq!(again.all_version_ids(&alt1), first.all_version_ids(&alt1));
+        assert_eq!(
+            again.local_media_source_ids(&alt1),
+            first.local_media_source_ids(&alt1)
+        );
+        VersionRows::load(&reader, &[&primary]).await.unwrap();
+        assert_eq!(count(), 3, "other rows read");
+    })
+    .await;
+    VersionRows::load(&reader, &[&alt1]).await.unwrap();
+    assert_eq!(count(), 5, "outside the scope, a load reads");
 }
 
 /// A group three levels deep — a version merged onto a version that a scan

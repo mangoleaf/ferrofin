@@ -28,9 +28,10 @@
 //!   directly (gl-248). The `SessionControllers`/`WebSocketController`
 //!   indirection of the C# collapses into "the session's connection handles".
 //! - **`AuthenticationResult`** now lands in `ferrofin-model`; the authenticate
-//!   methods return an [`AuthenticationResultData`] (the [`SessionInfoDto`] plus
-//!   the minted access token) from which the API layer assembles the wire
-//!   envelope. The access token is minted via [`DeviceManager`].
+//!   methods return an [`AuthenticationResultData`] (the user's DTO, the
+//!   [`SessionInfoDto`] and the minted access token) from which the API layer
+//!   assembles the wire envelope. The access token is minted via
+//!   [`DeviceManager`].
 //! - **The idle and inactive checks** (`StartCheckTimers`) run from
 //!   [`FerrofinSessionManager::run_playback_checks`], which the composition root
 //!   starts with the host and aborts with it: a session playing without a
@@ -101,6 +102,7 @@ use ferrofin_traits::session::{
     AuthenticationRequest, AuthenticationResultData, SessionEvent, SessionManager, SessionSummary,
 };
 use ferrofin_traits::session_bus::SessionMessageBus;
+use ferrofin_util::ticks::TICKS_PER_MS;
 
 use crate::db_error::db_err;
 use crate::user_entity_ext::{cached_permission, has_permission};
@@ -1800,8 +1802,10 @@ impl FerrofinSessionManager {
 
     /// The `NowPlayingItem` a session shows for `playing`: a reported `Item`
     /// as sent, else the library item, built by the first call and copied by
-    /// the later ones; calls at the same moment share the one build. `None`
-    /// when the build failed.
+    /// the later ones; calls at the same moment share the one build, which
+    /// reads the item's version group once for its media-source lookup and
+    /// its DTO ([`crate::video_versions::reading_groups_once`]). `None` when
+    /// the build failed.
     async fn shown_now_playing_item(&self, playing: &NowPlayingItem) -> Option<Arc<BaseItemDto>> {
         if let Some(item) = &playing.reported {
             return Some(Arc::clone(item));
@@ -1810,9 +1814,11 @@ impl FerrofinSessionManager {
         playing
             .built
             .get_or_init(|| async {
-                self.now_playing_item(row, &playing.report)
-                    .await
-                    .map(Arc::new)
+                crate::video_versions::reading_groups_once(
+                    self.now_playing_item(row, &playing.report),
+                )
+                .await
+                .map(Arc::new)
             })
             .await
             .clone()
@@ -1936,20 +1942,6 @@ impl SessionManager for FerrofinSessionManager {
             |_, session| Some(session.id.clone()),
         )
         .await
-    }
-
-    async fn update_device_name(
-        &self,
-        session_id: &str,
-        reported_device_name: &str,
-    ) -> Result<(), ServiceError> {
-        let mut sessions = self.sessions.lock().await;
-        let session = sessions
-            .values_mut()
-            .find(|s| s.id == session_id)
-            .ok_or_else(|| ServiceError::not_found(format!("session {session_id}")))?;
-        session.device_name = Some(reported_device_name.to_owned());
-        Ok(())
     }
 
     async fn on_device_options_updated(&self, device_id: &str, custom_name: Option<&str>) {
@@ -2238,7 +2230,7 @@ impl SessionManager for FerrofinSessionManager {
                 user_id = %session.user_id,
                 item_id = %info.item_id,
                 item = name.as_deref(),
-                position_ms = info.position_ticks.map(|ticks| ticks / TICKS_PER_MILLISECOND),
+                position_ms = info.position_ticks.map(|ticks| ticks / TICKS_PER_MS),
                 device = session.device_name.as_deref(),
                 device_id = %session.device_id,
                 client = session.client.as_deref(),
@@ -2413,19 +2405,32 @@ impl SessionManager for FerrofinSessionManager {
         message_type: SessionMessageType,
         data: &str,
     ) -> Result<(), ServiceError> {
-        // C# takes every administrator, then the sessions holding one. Only the
-        // users of a session that can receive decide who gets it, so only theirs
-        // are read, from the policy cache: a scan pushes RefreshProgress once a
-        // second per library (gl-1312).
-        let mut admin_ids = Vec::new();
+        self.send_message_to_sessions_with_permission(
+            PermissionKind::IsAdministrator,
+            message_type,
+            data,
+        )
+        .await
+    }
+
+    async fn send_message_to_sessions_with_permission(
+        &self,
+        permission: PermissionKind,
+        message_type: SessionMessageType,
+        data: &str,
+    ) -> Result<(), ServiceError> {
+        // C# takes every user holding the permission, then the sessions holding
+        // one. Only the users of a session that can receive decide who gets it,
+        // so only theirs are read, from the policy cache: a scan pushes
+        // RefreshProgress to administrators once a second per library (gl-1312).
+        let mut ids = Vec::new();
         for id in self.receiving_user_ids().await {
-            if cached_permission(&self.db, &guid_to_db(id), PermissionKind::IsAdministrator).await?
-            {
-                admin_ids.push(id);
+            if cached_permission(&self.db, &guid_to_db(id), permission).await? {
+                ids.push(id);
             }
         }
         self.broadcast(message_type, data, |s| {
-            admin_ids.iter().any(|id| s.contains_user(*id))
+            ids.iter().any(|id| s.contains_user(*id))
         })
         .await
     }
@@ -3115,6 +3120,15 @@ impl FerrofinSessionManager {
         let user_uuid = parse_user_id(&user.id)?;
         let _limit_gate = self.admit_session(&user, user_uuid).await?;
 
+        // C# builds `User = _userManager.GetUserDto(user, …)` from the user it
+        // authenticated, after `LogSessionActivity`. Ferrofin's DTO reads the
+        // database where upstream's reads memory, so it is built before
+        // anything is minted: a read error leaves no token, session or
+        // `AuthenticationSucceeded` behind. The session's activity stamp skips
+        // a password sign-in (`authenticate_user` has just stamped the user),
+        // and Quick Connect, the direct path, rebuilds `User` at its exchange.
+        let user_dto = self.user_manager.get_user_dto(&user, None).await?;
+
         // Mint a fresh access token: log out existing device rows for this
         // user/device, then create a new device (C# `GetAuthorizationToken`).
         let existing = self
@@ -3157,10 +3171,9 @@ impl FerrofinSessionManager {
             )
             .await?;
         dto.server_id = Some(self.server_id.clone());
-        // The full `AuthenticationResult` envelope (UserDto + ServerId) is
-        // assembled by the caller from this data; the freshly minted token
-        // (persisted on the created `Device` row) is returned so the caller can
-        // echo it back to the client.
+        // The caller adds `ServerId` to make the `AuthenticationResult`; the
+        // freshly minted token (persisted on the created `Device` row) is
+        // returned so the caller can echo it back to the client.
         let access_token = Secret::from(created.access_token);
 
         // C# `AuthenticateNewSessionInternal` publishes
@@ -3177,6 +3190,7 @@ impl FerrofinSessionManager {
             )
             .await;
         Ok(AuthenticationResultData {
+            user: user_dto,
             session: dto,
             access_token,
         })
@@ -3308,9 +3322,6 @@ fn envelope_bytes(message_type: SessionMessageType, data: &str) -> Result<Vec<u8
 fn session_started_payload(session: &SessionInfo) -> String {
     serde_json::to_string(&session_info_to_dto(session)).unwrap_or_else(|_| "{}".to_owned())
 }
-
-/// .NET ticks (100 ns each) in a millisecond.
-const TICKS_PER_MILLISECOND: i64 = 10_000;
 
 /// The JSON payload for a playback event. The user name, device name and
 /// client stand for `PlaybackProgressEventArgs`' `Users`, `DeviceName` and

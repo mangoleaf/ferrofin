@@ -22,9 +22,9 @@ use axum::routing::get;
 use axum::{Json, Router};
 use ferrofin_model::data::CollectionType;
 use ferrofin_model::dto::{BaseItemDto, SpecialViewOptionDto};
-use ferrofin_model::entities::CollectionTypeOptions;
+use ferrofin_model::entities_media::VirtualFolderInfo;
 use ferrofin_model::querying::QueryResult;
-use ferrofin_traits::options::DtoOptions;
+use ferrofin_traits::options::{DtoOptions, UserViewQuery};
 use uuid::Uuid;
 
 use crate::auth::RequireAuth;
@@ -33,42 +33,14 @@ use crate::extract::{DotnetGuid, Query};
 use crate::handlers::items::{resolve_user, user_uuid};
 use crate::state::AppState;
 
-/// Maps a library's [`CollectionTypeOptions`] to the DTO [`CollectionType`] the
-/// web client keys presentation off. `mixed` has no single type → `None` (a
-/// generic view), matching Jellyfin.
-fn map_collection_type(options: CollectionTypeOptions) -> Option<CollectionType> {
-    Some(match options {
-        CollectionTypeOptions::movies => CollectionType::movies,
-        CollectionTypeOptions::tvshows => CollectionType::tvshows,
-        CollectionTypeOptions::music => CollectionType::music,
-        CollectionTypeOptions::musicvideos => CollectionType::musicvideos,
-        CollectionTypeOptions::homevideos => CollectionType::homevideos,
-        CollectionTypeOptions::boxsets => CollectionType::boxsets,
-        CollectionTypeOptions::books => CollectionType::books,
-        CollectionTypeOptions::mixed => return None,
-    })
-}
-
-/// The collection type of every configured library, keyed by its folder item id.
-///
-/// A `mixed` library has no single type and maps to `None` — which is still an
-/// entry, because C# treats an unset `CollectionType` as grouping-eligible.
+/// The collection type of every configured library, keyed by its folder item id
+/// ([`VirtualFolderInfo::collection_types_by_id`]).
 async fn collection_types_by_id(
     state: &AppState,
 ) -> Result<HashMap<Uuid, Option<CollectionType>>, ApiError> {
-    Ok(state
-        .virtual_folders
-        .library_folders()
-        .await?
-        .iter()
-        .filter_map(|vf| {
-            let id = vf
-                .item_id
-                .as_deref()
-                .and_then(|s| Uuid::parse_str(s).ok())?;
-            Some((id, vf.collection_type.and_then(map_collection_type)))
-        })
-        .collect())
+    Ok(VirtualFolderInfo::collection_types_by_id(
+        &state.virtual_folders.library_folders().await?,
+    ))
 }
 
 /// C#'s `UserView.IsEligibleForGrouping`: only `movies`, `tvshows` and an unset
@@ -80,33 +52,57 @@ fn is_eligible_for_grouping(collection_type: Option<CollectionType>) -> bool {
     )
 }
 
-/// Query parameters for `GET /UserViews`.
+/// Query parameters for `GET /UserViews/GroupingOptions`.
 ///
 /// `userId` is optional in the contract; when omitted it defaults to the
 /// authenticated caller (Jellyfin's `RequestHelpers.GetUserId`).
 #[derive(Debug, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct UserViewsQuery {
+struct GroupingOptionsQuery {
     /// The target user; defaults to the authenticated caller when absent.
     #[serde(
         default,
         deserialize_with = "crate::handlers::query_parse::empty_as_none_uuid"
     )]
     user_id: Option<Uuid>,
-    /// Include views the user hid from the home screen. Profile settings use
-    /// this to keep hidden views available for re-enabling.
+}
+
+/// Query parameters for `GET /UserViews`: `UserViewsController.GetUserViews`'
+/// four. `userId` defaults to the authenticated caller.
+#[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GetUserViewsQuery {
+    /// The target user; defaults to the authenticated caller when absent.
+    #[serde(
+        default,
+        deserialize_with = "crate::handlers::query_parse::empty_as_none_uuid"
+    )]
+    user_id: Option<Uuid>,
+    /// Whether to list the channels and the Live TV view; `true` when absent
+    /// (`UserViewQuery`'s default).
+    #[serde(default)]
+    include_external_content: Option<bool>,
+    /// Comma-delimited library types to list as their shadow views; tokens
+    /// that are no `CollectionType` are dropped
+    /// (`CommaDelimitedCollectionModelBinder`).
+    #[serde(default)]
+    preset_views: Option<String>,
+    /// Include views hidden from the home screen.
     #[serde(default)]
     include_hidden: bool,
 }
 
 /// `GET /UserViews` — the target user's library views.
 ///
-/// Port of `UserViewsController.GetUserViews`.
+/// Port of `UserViewsController.GetUserViews`: `includeExternalContent`, when
+/// given, and a non-empty `presetViews` go into the `UserViewQuery`.
 #[utoipa::path(
     get,
     path = "/UserViews",
     params(
         ("userId" = Option<String>, Query, description = "The user id"),
+        ("includeExternalContent" = Option<bool>, Query, description = "Include channels and Live TV (default true)"),
+        ("presetViews" = Option<String>, Query, description = "Comma-delimited library types listed as their shadow views"),
         ("includeHidden" = Option<bool>, Query, description = "Include views hidden from the home screen"),
     ),
     // Body schema omitted: `BaseItemDto` is self-referential and its derived
@@ -118,13 +114,20 @@ struct UserViewsQuery {
 async fn get_user_views(
     State(state): State<AppState>,
     RequireAuth(auth): RequireAuth,
-    Query(query): Query<UserViewsQuery>,
+    Query(query): Query<GetUserViewsQuery>,
 ) -> Result<Json<QueryResult<BaseItemDto>>, ApiError> {
     let user = resolve_user(&state, &auth, query.user_id).await?;
     let user_id = user_uuid(&user)?;
+    let view_query = UserViewQuery {
+        include_external_content: query.include_external_content.unwrap_or(true),
+        include_hidden: query.include_hidden,
+        preset_views: crate::handlers::query_parse::parse_csv_enums_lenient(
+            query.preset_views.as_deref(),
+        ),
+    };
     let folders = state
         .user_views
-        .get_user_views_with_hidden(user_id, query.include_hidden)
+        .get_user_views_with_query(user_id, &view_query)
         .await?;
     // C# `GetUserViews` builds `new DtoOptions()` — ALL item fields (minus the two
     // default-excluded ones); its `AddClientFields` + explicit appends are subsumed.
@@ -167,7 +170,7 @@ async fn get_user_views(
 async fn get_grouping_options(
     State(state): State<AppState>,
     RequireAuth(auth): RequireAuth,
-    Query(query): Query<UserViewsQuery>,
+    Query(query): Query<GroupingOptionsQuery>,
 ) -> Result<Json<Vec<SpecialViewOptionDto>>, ApiError> {
     let user = resolve_user(&state, &auth, query.user_id).await?;
     // Grouping options come from the root libraries the user can open,
@@ -209,7 +212,7 @@ async fn get_user_views_for_user(
     state: State<AppState>,
     auth: RequireAuth,
     axum::extract::Path(DotnetGuid(user_id)): axum::extract::Path<DotnetGuid>,
-    Query(mut query): Query<UserViewsQuery>,
+    Query(mut query): Query<GetUserViewsQuery>,
 ) -> Result<Json<QueryResult<BaseItemDto>>, ApiError> {
     query.user_id = Some(user_id);
     get_user_views(state, auth, Query(query)).await
@@ -222,9 +225,8 @@ async fn get_grouping_options_for_user(
     auth: RequireAuth,
     axum::extract::Path(DotnetGuid(user_id)): axum::extract::Path<DotnetGuid>,
 ) -> Result<Json<Vec<SpecialViewOptionDto>>, ApiError> {
-    let query = UserViewsQuery {
+    let query = GroupingOptionsQuery {
         user_id: Some(user_id),
-        include_hidden: false,
     };
     get_grouping_options(state, auth, Query(query)).await
 }
@@ -242,7 +244,8 @@ pub fn register(router: Router<AppState>) -> Router<AppState> {
 }
 
 crate::query::query_parameters! {
-    UserViewsQuery {} => [("get", "/UserViews"), ("get", "/UserViews/GroupingOptions")];
+    GetUserViewsQuery { "presetViews" => ',' } => [("get", "/UserViews")];
+    GroupingOptionsQuery {} => [("get", "/UserViews/GroupingOptions")];
 }
 
 #[cfg(test)]
@@ -250,28 +253,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn collection_type_maps_library_options_to_dto_type() {
-        // A tvshows library must surface as CollectionType::tvshows so the web
-        // client renders it as a Shows view (the bug: it was unset → generic).
-        assert_eq!(
-            map_collection_type(CollectionTypeOptions::tvshows),
-            Some(CollectionType::tvshows)
-        );
-        assert_eq!(
-            map_collection_type(CollectionTypeOptions::movies),
-            Some(CollectionType::movies)
-        );
-        // A mixed library has no single type → None (a generic view).
-        assert_eq!(map_collection_type(CollectionTypeOptions::mixed), None);
-    }
-
-    #[test]
     fn user_views_can_request_hidden_views() {
-        let hidden: UserViewsQuery =
+        let hidden: GetUserViewsQuery =
             serde_urlencoded::from_str("includeHidden=true").expect("query parses");
         assert!(hidden.include_hidden);
 
-        let defaulted: UserViewsQuery = serde_urlencoded::from_str("").expect("empty query");
+        let defaulted: GetUserViewsQuery = serde_urlencoded::from_str("").expect("empty query");
         assert!(!defaulted.include_hidden);
+        assert_eq!(defaulted.include_external_content, None);
+        assert_eq!(defaulted.preset_views, None);
     }
 }

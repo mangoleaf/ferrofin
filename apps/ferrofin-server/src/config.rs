@@ -22,6 +22,10 @@ use std::path::{Path, PathBuf};
 use clap::Parser;
 use ferrofin_core::user_manager::LoginBackoffSettings;
 use ferrofin_drawing::ImageLimits;
+use ferrofin_mediaencoding::encoder::media_encoder::{
+    ANALYZE_DURATION_RANGE, DEFAULT_ANALYZE_DURATION, DEFAULT_PROBE_SIZE, FfmpegCount,
+    PROBE_SIZE_RANGE,
+};
 use ferrofin_mediaencoding::transcoding::TranscodeLimits;
 use ferrofin_providers::rate_limit::RequestLimits;
 use ferrofin_providers::{DEFAULT_IMAGE_NEGATIVE_CACHE_TTL_SECS, IMAGE_NEGATIVE_CACHE_TTL_SECS};
@@ -169,6 +173,8 @@ struct FileConfig {
     ffmpeg_path: Option<PathBuf>,
     ffprobe_path: Option<PathBuf>,
     ffmpeg_img_extract_perf_tradeoff: Option<bool>,
+    ffmpeg_analyze_duration: Option<String>,
+    ffmpeg_probe_size: Option<String>,
     max_transcodes: Option<u32>,
     max_transcodes_per_user: Option<u32>,
     library_roots: Option<Vec<PathBuf>>,
@@ -190,6 +196,7 @@ struct FileConfig {
     scan_probe_concurrency: Option<u32>,
     scan_directory_cache_records: Option<u32>,
     scan_directory_cache_idle_secs: Option<u32>,
+    book_archive_max_entries: Option<u32>,
     auth_cache_ttl_secs: Option<u32>,
     row_cache_ttl_secs: Option<u32>,
     trickplay_concurrency: Option<CountOrAuto>,
@@ -385,21 +392,39 @@ pub struct Config {
     #[doc(hidden)]
     pub provider_endpoints: ProviderEndpoints,
 
-    /// HTTP port to listen on. Default [`DEFAULT_HTTP_PORT`].
+    /// HTTP port from `--port`, else `FERROFIN_PORT`, else `config.toml`, else
+    /// [`DEFAULT_HTTP_PORT`]. The Networking page's `InternalHttpPort` sits
+    /// between the variable and the file: the server listens on what
+    /// `listen::ports` picks.
     pub port: u16,
 
+    /// Whether `--port` or `FERROFIN_PORT` set [`Self::port`]: it then
+    /// outranks the Networking page's `InternalHttpPort`.
+    pub port_from_flag_or_env: bool,
+
     /// HTTPS port, listened on beside the HTTP port when the network
-    /// configuration's `EnableHttps` is on and its certificate loads. Default
-    /// [`DEFAULT_HTTPS_PORT`].
+    /// configuration's `EnableHttps` is on and its certificate loads: from
+    /// `FERROFIN_HTTPS_PORT`, else `config.toml`, else [`DEFAULT_HTTPS_PORT`],
+    /// with the Networking page's `InternalHttpsPort` between the two
+    /// (`listen::ports`).
     pub https_port: u16,
+
+    /// Whether `FERROFIN_HTTPS_PORT` set [`Self::https_port`]: it then
+    /// outranks the Networking page's `InternalHttpsPort`.
+    pub https_port_from_env: bool,
 
     /// Publicly reachable server URL advertised to clients
     /// (`HostNetworkInfo.published_server_url`). `None` = auto-detect.
     pub published_url: Option<String>,
 
-    /// URL path prefix the server is mounted under
-    /// (`HostNetworkInfo.base_url`). Empty string = root.
+    /// URL path prefix from `FERROFIN_BASE_URL`, else `config.toml`. Empty
+    /// string = root. The Networking page's `BaseUrl` sits between the two:
+    /// the server mounts what `base_url::resolve` picks.
     pub base_url: String,
+
+    /// Whether `FERROFIN_BASE_URL` set [`Self::base_url`], a blank value
+    /// included: it then outranks the Networking page's `BaseUrl`.
+    pub base_url_from_env: bool,
 
     /// OMDb (omdbapi.com) API key override. Empty uses Jellyfin's built-in key.
     /// From `FERROFIN_OMDB_KEY` or
@@ -487,7 +512,8 @@ pub struct Config {
     /// original file.
     pub image_resize_budget_mb: u32,
 
-    /// The largest remote image downloaded, in MiB. Resolved
+    /// The largest remote image downloaded, and the largest metadata provider
+    /// response, in MiB. Resolved
     /// `FERROFIN_IMAGE_DOWNLOAD_MAX_MB` env > `image_download_max_mb` in
     /// `config.toml` > 64, clamped to [`RequestLimits::DOWNLOAD_MAX_MB`] with a
     /// warning. A larger one is refused, and the read stops at the limit.
@@ -537,6 +563,21 @@ pub struct Config {
     /// `ffmpeg_img_extract_perf_tradeoff` in `config.toml` > `false`,
     /// Jellyfin's default.
     pub ffmpeg_img_extract_perf_tradeoff: bool,
+
+    /// Jellyfin's `FFmpeg:analyzeduration` (`GetFFmpegAnalyzeDuration`): how
+    /// long, in microseconds, probes, transcodes and external subtitle inputs
+    /// analyse an input whose source names no duration of its own. Resolved
+    /// `FERROFIN_FFMPEG_ANALYZE_DURATION` env > `ffmpeg_analyze_duration` in
+    /// `config.toml` > `200M`, Jellyfin's default, clamped to
+    /// [`ANALYZE_DURATION_RANGE`].
+    pub ffmpeg_analyze_duration: FfmpegCount,
+
+    /// Jellyfin's `FFmpeg:probesize` (`GetFFmpegProbeSize`): how many bytes of
+    /// an input probes, transcodes and external subtitle inputs read to find
+    /// its streams. Resolved `FERROFIN_FFMPEG_PROBE_SIZE` env >
+    /// `ffmpeg_probe_size` in `config.toml` > `1G`, Jellyfin's default, clamped
+    /// to [`PROBE_SIZE_RANGE`].
+    pub ffmpeg_probe_size: FfmpegCount,
 
     /// Re-encoding jobs the whole server may run at once; `0` is no cap. Past
     /// it a signed-in user's idle job on the same device is ended first, and a
@@ -705,6 +746,15 @@ pub struct Config {
     /// `scan_directory_cache_idle_secs` in `config.toml` > default, clamped to
     /// [`SCAN_DIRECTORY_CACHE_IDLE_SECS_RANGE`] with a warning, `0` included.
     pub scan_directory_cache_idle_secs: Option<u32>,
+
+    /// The most entries a comic archive (`.cbz`, `.cb7`, `.cbt`) may hold for
+    /// a book's probe to count its pages, which set its runtime; past it the
+    /// book keeps the runtime it has. Upstream has no such cap. `None` =
+    /// [`ferrofin_providers::books::DEFAULT_ARCHIVE_MAX_ENTRIES`] (100 000).
+    /// Resolved `FERROFIN_BOOK_ARCHIVE_MAX_ENTRIES` env >
+    /// `book_archive_max_entries` in `config.toml` > default, clamped to
+    /// [`BOOK_ARCHIVE_MAX_ENTRIES_RANGE`] with a warning, `0` included.
+    pub book_archive_max_entries: Option<u32>,
 
     /// How long, in seconds, a resolved access token (its device, user and
     /// policy, an API key's name, or the rejection of a token that matched
@@ -1020,13 +1070,13 @@ impl Config {
             .parse()
             .map_err(|e| anyhow::anyhow!("invalid FERROFIN_BIND_ADDR `{bind_addr_str}`: {e}"))?;
 
-        let port = cli
-            .port
-            .or_else(|| parse_var(env, "FERROFIN_PORT"))
-            .or(file.port)
-            .unwrap_or(DEFAULT_HTTP_PORT);
+        let flag_or_env_port = cli.port.or_else(|| parse_var(env, "FERROFIN_PORT"));
+        let port_from_flag_or_env = flag_or_env_port.is_some();
+        let port = flag_or_env_port.or(file.port).unwrap_or(DEFAULT_HTTP_PORT);
 
-        let https_port = parse_var(env, "FERROFIN_HTTPS_PORT")
+        let env_https_port = parse_var(env, "FERROFIN_HTTPS_PORT");
+        let https_port_from_env = env_https_port.is_some();
+        let https_port = env_https_port
             .or(file.https_port)
             .unwrap_or(DEFAULT_HTTPS_PORT);
 
@@ -1036,10 +1086,9 @@ impl Config {
             .or(file.published_url)
             .filter(|s| !s.is_empty());
 
-        let base_url = env
-            .var("FERROFIN_BASE_URL")
-            .or(file.base_url)
-            .unwrap_or_default();
+        let base_url_env = env.var("FERROFIN_BASE_URL");
+        let base_url_from_env = base_url_env.is_some();
+        let base_url = base_url_env.or(file.base_url).unwrap_or_default();
         let base_url = crate::base_url::normalize(&base_url);
 
         let omdb_api_key = env
@@ -1229,9 +1278,12 @@ impl Config {
             discovery_bind_addr: Some(std::net::SocketAddr::from(([0, 0, 0, 0], 7359))),
             provider_endpoints: ProviderEndpoints::default(),
             port,
+            port_from_flag_or_env,
             https_port,
+            https_port_from_env,
             published_url,
             base_url,
+            base_url_from_env,
             omdb_api_key,
             studios_repo_url,
             tvdb_api_key,
@@ -1269,6 +1321,24 @@ impl Config {
             )
             .or(file.ffmpeg_img_extract_perf_tradeoff)
             .unwrap_or(false),
+            ffmpeg_analyze_duration: resolve_ffmpeg_count(
+                env,
+                "FERROFIN_FFMPEG_ANALYZE_DURATION",
+                "ffmpeg_analyze_duration",
+                file.ffmpeg_analyze_duration,
+                DEFAULT_ANALYZE_DURATION,
+                ANALYZE_DURATION_RANGE,
+                "microseconds",
+            ),
+            ffmpeg_probe_size: resolve_ffmpeg_count(
+                env,
+                "FERROFIN_FFMPEG_PROBE_SIZE",
+                "ffmpeg_probe_size",
+                file.ffmpeg_probe_size,
+                DEFAULT_PROBE_SIZE,
+                PROBE_SIZE_RANGE,
+                "bytes",
+            ),
             library_roots,
             server_name,
             log_level,
@@ -1343,6 +1413,15 @@ impl Config {
                 file.scan_directory_cache_idle_secs,
                 &SCAN_DIRECTORY_CACHE_IDLE_SECS_RANGE,
                 "seconds",
+                Zero::InRange,
+            ),
+            book_archive_max_entries: resolve_clamped_or_unset(
+                env,
+                "FERROFIN_BOOK_ARCHIVE_MAX_ENTRIES",
+                "book_archive_max_entries",
+                file.book_archive_max_entries,
+                &BOOK_ARCHIVE_MAX_ENTRIES_RANGE,
+                "entries",
                 Zero::InRange,
             ),
             auth_cache_ttl_secs: resolve_cache_ttl(
@@ -1721,9 +1800,12 @@ impl Config {
             discovery_bind_addr: None,
             provider_endpoints: ProviderEndpoints::offline(),
             port: 0,
+            port_from_flag_or_env: false,
             https_port: 0,
+            https_port_from_env: false,
             published_url: None,
             base_url: String::new(),
+            base_url_from_env: false,
             omdb_api_key: String::new(),
             studios_repo_url: OFFLINE_PROVIDER_URL.to_owned(),
             tvdb_api_key: String::new(),
@@ -1744,6 +1826,8 @@ impl Config {
             ffmpeg_path: None,
             ffprobe_path: None,
             ffmpeg_img_extract_perf_tradeoff: false,
+            ffmpeg_analyze_duration: DEFAULT_ANALYZE_DURATION,
+            ffmpeg_probe_size: DEFAULT_PROBE_SIZE,
             max_transcodes: 0,
             max_transcodes_per_user: 0,
             library_roots: Vec::new(),
@@ -1767,6 +1851,7 @@ impl Config {
             scan_probe_concurrency: None,
             scan_directory_cache_records: None,
             scan_directory_cache_idle_secs: None,
+            book_archive_max_entries: None,
             auth_cache_ttl_secs: None,
             row_cache_ttl_secs: None,
             trickplay_concurrency: None,
@@ -1847,6 +1932,11 @@ pub const SCAN_DIRECTORY_CACHE_RECORDS_RANGE: RangeInclusive<u32> = 1_000..=10_0
 /// The seconds a library scan's directory listings survive unread
 /// (`scan_directory_cache_idle_secs`).
 pub const SCAN_DIRECTORY_CACHE_IDLE_SECS_RANGE: RangeInclusive<u32> = 30..=3_600;
+
+/// The entries a comic archive may hold for a book's pages to be counted
+/// (`book_archive_max_entries`): from 1000, above the pages of any real
+/// comic, to the 10 million the scan's directory cache also stops at.
+pub const BOOK_ARCHIVE_MAX_ENTRIES_RANGE: RangeInclusive<u32> = 1_000..=10_000_000;
 
 /// The events the playback-metrics write queue holds
 /// (`playback_metrics_queue`).
@@ -1934,6 +2024,33 @@ where
 {
     let value = parse_var(env, env_key).or(file).unwrap_or(default);
     clamp_with_warning(env, env_key, file_key, value, &range, unit)
+}
+
+/// Resolves an ffmpeg input-analysis value in ffmpeg's syntax
+/// (`ffmpeg_analyze_duration`, `ffmpeg_probe_size`): `env_key` when it parses,
+/// else `file` when it parses, else `default`, clamped to `range`. A value
+/// that does not parse warns ([`Env::warn`]) and is skipped, so the server
+/// always boots.
+fn resolve_ffmpeg_count(
+    env: &dyn Env,
+    env_key: &str,
+    file_key: &str,
+    file: Option<String>,
+    default: FfmpegCount,
+    range: RangeInclusive<FfmpegCount>,
+    unit: &str,
+) -> FfmpegCount {
+    let file = file.filter(|raw| !raw.trim().is_empty()).and_then(|raw| {
+        let parsed = raw.trim().parse().ok();
+        if parsed.is_none() {
+            env.warn(format!(
+                "{file_key} `{raw}` in config.toml is not an ffmpeg value such as 200M or 1G \
+                 and is ignored"
+            ));
+        }
+        parsed
+    });
+    resolve_clamped(env, env_key, file_key, file, default, range, unit)
 }
 
 /// `hours` of `tvdb_cache_hours` clamped to [`TVDB_CACHE_HOURS_RANGE`]: the
@@ -2034,11 +2151,7 @@ fn private_allow_list(raw: Option<&str>) -> ferrofin_providers::destination::Pri
 /// `text` match in any case; anything else warns ([`Env::warn`]) and is JSON,
 /// as it always was.
 fn resolve_log_format(env: &dyn Env, file: Option<String>) -> LogFormat {
-    let Some(raw) = env
-        .var("FERROFIN_LOG_FORMAT")
-        .filter(|raw| !raw.trim().is_empty())
-        .or(file)
-    else {
+    let Some(raw) = non_blank(env, "FERROFIN_LOG_FORMAT").or(file) else {
         return LogFormat::Json;
     };
     match raw.trim().to_ascii_lowercase().as_str() {
@@ -2089,7 +2202,7 @@ fn parse_bucket_list(raw: &str) -> Vec<f64> {
 /// ignored typo here would change performance, not correctness, and never be
 /// noticed.
 fn resolve_db_pool(env: &dyn Env, file: Option<DbPoolFileValue>) -> anyhow::Result<Option<u32>> {
-    if let Some(raw) = env.var("FERROFIN_DB_POOL").filter(|s| !s.is_empty()) {
+    if let Some(raw) = non_blank(env, "FERROFIN_DB_POOL") {
         if raw.eq_ignore_ascii_case("auto") {
             return Ok(None);
         }
@@ -2118,16 +2231,16 @@ fn resolve_db_pool(env: &dyn Env, file: Option<DbPoolFileValue>) -> anyhow::Resu
 /// Resolves a count that must be positive: the `env_key` env var > `file_key`
 /// in `config.toml` > `None` (the default). Zero and anything that is not a
 /// non-negative integer are errors, so a typo or a `0` meant as "off" is
-/// noticed instead of silently disabling a cache. An empty env value is
-/// unset.
+/// noticed instead of silently disabling a cache. A blank env value is
+/// unset ([`non_blank`]).
 fn resolve_positive(
     env: &dyn Env,
     env_key: &str,
     file_key: &str,
     file: Option<u32>,
 ) -> anyhow::Result<Option<u32>> {
-    if let Some(raw) = env.var(env_key).filter(|s| !s.trim().is_empty()) {
-        let n: u32 = raw.trim().parse().map_err(|_| {
+    if let Some(raw) = non_blank(env, env_key) {
+        let n: u32 = raw.parse().map_err(|_| {
             anyhow::anyhow!("invalid {env_key} `{raw}`: expected a positive integer")
         })?;
         anyhow::ensure!(n > 0, "invalid {env_key} `0`: expected a positive integer");
@@ -2142,8 +2255,8 @@ fn resolve_positive(
 
 /// Resolves a whole number that must lie within `range`: the `env_key` env
 /// var > `file_key` in `config.toml` > `default`. Anything else is an error,
-/// so a typo is noticed instead of silently changing a security setting. An
-/// empty env value is unset.
+/// so a typo is noticed instead of silently changing a security setting. A
+/// blank env value is unset ([`non_blank`]).
 fn resolve_ranged(
     env: &dyn Env,
     env_key: &str,
@@ -2152,9 +2265,8 @@ fn resolve_ranged(
     default: u32,
     range: std::ops::RangeInclusive<u32>,
 ) -> anyhow::Result<u32> {
-    let value = match env.var(env_key).filter(|s| !s.trim().is_empty()) {
+    let value = match non_blank(env, env_key) {
         Some(raw) => raw
-            .trim()
             .parse()
             .map_err(|_| anyhow::anyhow!("invalid {env_key} `{raw}`: expected a whole number"))?,
         None => file.unwrap_or(default),
@@ -2231,14 +2343,11 @@ fn resolve_trickplay_concurrency(
 ) -> anyhow::Result<Option<u32>> {
     // Huge values saturate; state.rs caps every value at the auto value anyway.
     let positive = |n: i64| (n > 0).then(|| u32::try_from(n).unwrap_or(u32::MAX));
-    if let Some(raw) = env
-        .var("FERROFIN_TRICKPLAY_CONCURRENCY")
-        .filter(|s| !s.is_empty())
-    {
+    if let Some(raw) = non_blank(env, "FERROFIN_TRICKPLAY_CONCURRENCY") {
         if raw.eq_ignore_ascii_case("auto") {
             return Ok(None);
         }
-        let n: i64 = raw.trim().parse().map_err(|_| {
+        let n: i64 = raw.parse().map_err(|_| {
             anyhow::anyhow!(
                 "invalid FERROFIN_TRICKPLAY_CONCURRENCY `{raw}`: expected an integer or `auto`"
             )
@@ -2497,6 +2606,15 @@ impl Env for WarningEnv<'_> {
     }
 }
 
+/// `key`'s value with the blanks around it trimmed, or `None` when it is
+/// unset or blank: `docs/CONFIG.md`'s "a blank one counts as unset", as the
+/// settings page reads it (`EnvRead::NonBlank`).
+fn non_blank(env: &dyn Env, key: &str) -> Option<String> {
+    env.var(key)
+        .map(|raw| raw.trim().to_owned())
+        .filter(|value| !value.is_empty())
+}
+
 /// Reads `key` from `env` and parses it as `T` (blanks around the value
 /// ignored), yielding `None` when the var is unset or blank, and when it does
 /// not parse, which also warns ([`Env::warn`]) so the operator learns the
@@ -2510,7 +2628,7 @@ pub(crate) fn parse_var<T: std::str::FromStr>(env: &dyn Env, key: &str) -> Optio
     let parsed = value.parse().ok();
     if parsed.is_none() {
         env.warn(format!(
-            "{key} `{raw}` is not a valid value and is ignored; config.toml or the default applies"
+            "{key} `{raw}` is not a valid value and is ignored, as if it were unset"
         ));
     }
     parsed
@@ -2593,6 +2711,7 @@ mod tests {
         assert_eq!(cfg.data_dir, PathBuf::from(NOWHERE).join("ferrofin"));
         assert_eq!(cfg.port, DEFAULT_HTTP_PORT);
         assert_eq!(cfg.https_port, DEFAULT_HTTPS_PORT);
+        assert!(!cfg.port_from_flag_or_env && !cfg.https_port_from_env);
         assert_eq!(cfg.bind_addr.to_string(), DEFAULT_BIND_ADDR);
         assert_eq!(cfg.log_level, DEFAULT_LOG_LEVEL);
         assert_eq!(cfg.admin_user, DEFAULT_ADMIN_USER);
@@ -2707,6 +2826,7 @@ mod tests {
         };
         let cfg = Config::load_from(cli, &env).unwrap();
         assert_eq!(cfg.port, 7000, "CLI port overrides env");
+        assert!(cfg.port_from_flag_or_env);
         assert_eq!(
             cfg.data_dir,
             PathBuf::from("/cli/data"),
@@ -2718,9 +2838,13 @@ mod tests {
 
     #[test]
     fn env_port_overrides_default() {
-        let env = FakeEnv::new().with("FERROFIN_PORT", "9000");
+        let env = FakeEnv::new()
+            .with("FERROFIN_PORT", "9000")
+            .with("FERROFIN_HTTPS_PORT", "9443");
         let cfg = Config::load_from(Cli::default(), &env).unwrap();
         assert_eq!(cfg.port, 9000);
+        assert_eq!(cfg.https_port, 9443);
+        assert!(cfg.port_from_flag_or_env && cfg.https_port_from_env);
     }
 
     #[test]
@@ -2799,6 +2923,7 @@ mod tests {
         };
         let cfg = Config::load_from(by_flag, &FakeEnv::new()).unwrap();
         assert_eq!(cfg.port, 5001, "--data-dir names the file");
+        assert!(!cfg.port_from_flag_or_env, "the file's port is not pinned");
         assert_eq!(cfg.config_file, flag_dir.join("config.toml"));
         assert!(cfg.config_file_found);
 
@@ -3194,6 +3319,10 @@ mod tests {
         assert_eq!(cfg.port, DEFAULT_HTTP_PORT);
         assert_eq!(cfg.enable_metrics, None);
         assert_eq!(cfg.https_port, DEFAULT_HTTPS_PORT);
+        assert!(
+            !cfg.port_from_flag_or_env && !cfg.https_port_from_env,
+            "neither pins its port over the Networking page"
+        );
         assert_eq!(
             cfg.shutdown_timeout_secs, 45,
             "surrounding blanks are not an error"
@@ -3874,6 +4003,71 @@ mod tests {
         assert_eq!(cfg.load_warnings.len(), 2, "{:?}", cfg.load_warnings);
     }
 
+    /// gl-734: `FFmpeg:analyzeduration` / `FFmpeg:probesize` default to
+    /// Jellyfin's `200M` / `1G`, the file sets them in ffmpeg's syntax, the
+    /// variable beats the file, a value outside the range is clamped and one
+    /// that does not parse is ignored, each with a warning naming the setting.
+    #[test]
+    fn ffmpeg_input_analysis_defaults_env_beats_file_clamps_and_ignores_junk() {
+        let analysis = |cfg: &Config| {
+            (
+                cfg.ffmpeg_analyze_duration.to_string(),
+                cfg.ffmpeg_probe_size.to_string(),
+            )
+        };
+        let unset = Config::load_from(Cli::default(), &FakeEnv::new()).unwrap();
+        assert_eq!(analysis(&unset), ("200M".to_owned(), "1G".to_owned()));
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            "ffmpeg_analyze_duration = \"8M\"\nffmpeg_probe_size = \"32Mi\"\n",
+        )
+        .unwrap();
+        let cli = Cli {
+            config_file: Some(path.clone()),
+            ..Cli::default()
+        };
+        let cfg = Config::load_from(cli.clone(), &FakeEnv::new()).unwrap();
+        assert!(cfg.load_warnings.is_empty(), "{:?}", cfg.load_warnings);
+        assert_eq!(analysis(&cfg), ("8M".to_owned(), "33554432".to_owned()));
+
+        let env = FakeEnv::new()
+            .with("FERROFIN_FFMPEG_ANALYZE_DURATION", "1M")
+            .with("FERROFIN_FFMPEG_PROBE_SIZE", " ");
+        let cfg = Config::load_from(cli.clone(), &env).unwrap();
+        assert_eq!(analysis(&cfg), ("1M".to_owned(), "33554432".to_owned()));
+
+        let env = FakeEnv::new()
+            .with("FERROFIN_FFMPEG_ANALYZE_DURATION", "1000M")
+            .with("FERROFIN_FFMPEG_PROBE_SIZE", "64k");
+        let cfg = Config::load_from(cli.clone(), &env).unwrap();
+        assert_eq!(analysis(&cfg), ("600M".to_owned(), "1M".to_owned()));
+        assert_eq!(cfg.load_warnings.len(), 2, "{:?}", cfg.load_warnings);
+        assert!(
+            cfg.load_warnings[0].contains("FERROFIN_FFMPEG_ANALYZE_DURATION")
+                && cfg.load_warnings[0].contains("1M to 600M"),
+            "{:?}",
+            cfg.load_warnings
+        );
+
+        // Junk in the variable falls through to the file; junk in the file
+        // to the default.
+        std::fs::write(&path, "ffmpeg_probe_size = \"lots\"\n").unwrap();
+        let env = FakeEnv::new().with("FERROFIN_FFMPEG_ANALYZE_DURATION", "200m");
+        let cfg = Config::load_from(cli.clone(), &env).unwrap();
+        assert_eq!(analysis(&cfg), ("200M".to_owned(), "1G".to_owned()));
+        assert_eq!(cfg.load_warnings.len(), 2, "{:?}", cfg.load_warnings);
+
+        // A blank value, as a save of an empty field writes it, is the
+        // default, with no warning.
+        std::fs::write(&path, "ffmpeg_probe_size = \"\"\n").unwrap();
+        let cfg = Config::load_from(cli, &FakeEnv::new()).unwrap();
+        assert_eq!(analysis(&cfg), ("200M".to_owned(), "1G".to_owned()));
+        assert!(cfg.load_warnings.is_empty(), "{:?}", cfg.load_warnings);
+    }
+
     /// gl-1320: the item-values write chunk defaults to the library
     /// manager's 500, the file sets it, the variable beats the file, and a
     /// value outside 1 to 5000 is clamped with a warning naming the setting.
@@ -4037,6 +4231,36 @@ mod tests {
         let env = FakeEnv::new().with("FERROFIN_DB_POOL", "many");
         let err = Config::load_from(Cli::default(), &env).unwrap_err();
         assert!(err.to_string().contains("invalid FERROFIN_DB_POOL"));
+    }
+
+    /// `docs/CONFIG.md`: a blank value counts as unset, for the variables that
+    /// stop the server on a bad value too, and blanks around a value are
+    /// ignored; the settings page reads them so (`EnvRead::NonBlank`).
+    #[rstest::rstest]
+    #[case::db_pool("FERROFIN_DB_POOL", "4")]
+    #[case::db_pool_auto("FERROFIN_DB_POOL", "auto")]
+    #[case::statement_cache("FERROFIN_DB_STATEMENT_CACHE", "128")]
+    #[case::auth_cache_ttl("FERROFIN_AUTH_CACHE_TTL_SECS", "30")]
+    #[case::row_cache_ttl("FERROFIN_ROW_CACHE_TTL_SECS", "30")]
+    #[case::trickplay_concurrency("FERROFIN_TRICKPLAY_CONCURRENCY", "4")]
+    #[case::trickplay_concurrency_auto("FERROFIN_TRICKPLAY_CONCURRENCY", "auto")]
+    #[case::login_backoff_attempts("FERROFIN_LOGIN_BACKOFF_ATTEMPTS", "8")]
+    fn a_blank_variable_is_unset_and_blanks_around_a_value_are_ignored(
+        #[case] var: &str,
+        #[case] value: &str,
+    ) {
+        let load = |raw: Option<&str>| {
+            let env = raw.map_or_else(FakeEnv::new, |raw| FakeEnv::new().with(var, raw));
+            format!("{:?}", Config::load_from(Cli::default(), &env).expect(var))
+        };
+        for blank in ["", " ", "\t "] {
+            assert_eq!(load(Some(blank)), load(None), "{var}={blank:?}");
+        }
+        assert_eq!(
+            load(Some(&format!(" {value} "))),
+            load(Some(value)),
+            "{var}"
+        );
     }
 
     #[test]
@@ -4419,6 +4643,40 @@ row_cache_ttl_secs = 10
     }
 
     #[test]
+    fn book_archive_max_entries_default_file_env_and_clamp() {
+        // Unset → None (the scanner keeps the providers' default).
+        let cfg = Config::load_from(Cli::default(), &FakeEnv::new()).unwrap();
+        assert_eq!(cfg.book_archive_max_entries, None);
+
+        let dir = tempfile::tempdir().unwrap();
+        let toml = dir.path().join("config.toml");
+        std::fs::write(&toml, "book_archive_max_entries = 5000\n").unwrap();
+        let cli = || Cli {
+            config_file: Some(toml.clone()),
+            ..Cli::default()
+        };
+        let cfg = Config::load_from(cli(), &FakeEnv::new()).unwrap();
+        assert_eq!(cfg.book_archive_max_entries, Some(5000));
+        // The variable beats the file.
+        let env = FakeEnv::new().with("FERROFIN_BOOK_ARCHIVE_MAX_ENTRIES", "20000");
+        let cfg = Config::load_from(cli(), &env).unwrap();
+        assert_eq!(cfg.book_archive_max_entries, Some(20000));
+
+        // Out of range, 0 included, is clamped with a warning naming it.
+        for (value, clamped) in [("0", 1_000), ("999", 1_000), ("10000001", 10_000_000)] {
+            let env = FakeEnv::new().with("FERROFIN_BOOK_ARCHIVE_MAX_ENTRIES", value);
+            let cfg = Config::load_from(Cli::default(), &env).unwrap();
+            assert_eq!(cfg.book_archive_max_entries, Some(clamped), "{value}");
+            assert_eq!(cfg.load_warnings.len(), 1, "{value}");
+            assert!(
+                cfg.load_warnings[0].contains("FERROFIN_BOOK_ARCHIVE_MAX_ENTRIES"),
+                "{value}: {:?}",
+                cfg.load_warnings
+            );
+        }
+    }
+
+    #[test]
     fn scan_progress_every_resolves_from_env_and_preserves_zero() {
         // Env value is used verbatim.
         let env = FakeEnv::new().with("FERROFIN_SCAN_PROGRESS_EVERY", "250");
@@ -4671,6 +4929,11 @@ row_cache_ttl_secs = 10
                 "scan_directory_cache_idle_secs",
                 secs(directories.idle_timeout),
                 SCAN_DIRECTORY_CACHE_IDLE_SECS_RANGE,
+            ),
+            (
+                "book_archive_max_entries",
+                ferrofin_providers::books::DEFAULT_ARCHIVE_MAX_ENTRIES,
+                BOOK_ARCHIVE_MAX_ENTRIES_RANGE,
             ),
             (
                 "playback_metrics_queue",

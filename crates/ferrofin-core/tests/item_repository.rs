@@ -847,6 +847,113 @@ async fn name_sort_orders_by_clean_name_not_sort_name() {
     }
 }
 
+/// Jellyfin 12.2 `ArtistNameLookupTests.GetArtist_UsesSameNormalizedNameAsFindArtists`
+/// (PR 18005): `GetArtist(name)` (the `Name` filter, as the album refresh's
+/// `music_artist_ids` runs it) and `GetArtists([name])` (`find_artists`) both
+/// match the artist row on `CleanName`, never a same-named `Person`, and the
+/// single lookup seeks `IX_BaseItems_Type_CleanName`.
+#[rstest::rstest]
+#[case("Björk", "bjork")]
+#[case("AC/DC", "ac dc")]
+#[case("An Artist", " AN   ARTIST ")]
+#[case("Artist", "ARTIST")]
+#[tokio::test]
+async fn artist_lookups_match_on_the_clean_name(#[case] stored: &str, #[case] requested: &str) {
+    use ferrofin_core::FerrofinLinkedChildrenService;
+    use ferrofin_core::translate_query::{QueryShape, build_query};
+    use ferrofin_traits::persistence::LinkedChildrenService as _;
+    use sqlx::Execute as _;
+
+    let db = fresh_db().await;
+    let (artist, person) = (Uuid::new_v4(), Uuid::new_v4());
+    FerrofinItemPersistenceService::new(db.clone())
+        .save_items(&[
+            item(artist, BaseItemKind::MusicArtist, stored),
+            item(person, BaseItemKind::Person, stored),
+        ])
+        .await
+        .expect("seed");
+
+    let filter = InternalItemsQuery {
+        include_item_types: vec![BaseItemKind::MusicArtist],
+        name: Some(requested.to_owned()),
+        ..Default::default()
+    };
+    let found = repo(&db).get_item_list(&filter).await.expect("by name");
+    let ids: Vec<_> = found
+        .iter()
+        .map(|r| Uuid::parse_str(&r.id).unwrap())
+        .collect();
+    assert_eq!(ids, [artist]);
+
+    let mut builder = build_query(&filter, QueryShape::FullRows);
+    let mut query = builder.build();
+    let args = query.take_arguments().expect("arguments").expect("binds");
+    let plan = sqlx::query_with(
+        sqlx::AssertSqlSafe(format!("EXPLAIN QUERY PLAN {}", query.sql().as_str())),
+        args,
+    )
+    .fetch_all(db.pool())
+    .await
+    .expect("explain")
+    .iter()
+    .map(|row| sqlx::Row::get::<String, _>(row, "detail"))
+    .collect::<Vec<_>>()
+    .join(" | ");
+    assert!(
+        plan.contains("IX_BaseItems_Type_CleanName (Type=? AND CleanName=?)"),
+        "{plan}"
+    );
+
+    let found = FerrofinLinkedChildrenService::new(db)
+        .find_artists(&[requested.to_owned(), "absent".to_owned()])
+        .await
+        .expect("find");
+    let ids: Vec<_> = found[requested]
+        .iter()
+        .map(|r| Uuid::parse_str(&r.id).unwrap())
+        .collect();
+    assert_eq!(ids, [artist]);
+    assert!(!found.contains_key("absent"));
+}
+
+/// `LibraryManager::get_named_item_ids` resolves a whole list of names in one
+/// `CleanName IN (…)` over the id/clean-name projection: the DTO prefetch and
+/// the `GET` `studios`/`artists` name filters (gl-856). At every padded list
+/// length it seeks `IX_BaseItems_Type_CleanName` and never scans `BaseItems`.
+#[tokio::test]
+async fn named_item_id_lookup_seeks_the_type_clean_name_index() {
+    use ferrofin_core::translate_query::{QueryShape, build_query};
+    use sqlx::{Execute as _, Row as _};
+
+    let db = fresh_db().await;
+    for n in (0..=ferrofin_db::PADDED_LIST_MAX.ilog2()).map(|k| 1_usize << k) {
+        let filter = InternalItemsQuery {
+            include_item_types: vec![BaseItemKind::Studio],
+            names: (0..n).map(|i| format!("Studio {i}")).collect(),
+            ..Default::default()
+        };
+        let mut builder = build_query(&filter, QueryShape::IdAndCleanName);
+        let mut query = builder.build();
+        let args = query.take_arguments().expect("arguments").expect("binds");
+        let sql = format!("EXPLAIN QUERY PLAN {}", query.sql().as_str());
+        let plan = sqlx::query_with(sqlx::AssertSqlSafe(sql), args)
+            .fetch_all(db.pool())
+            .await
+            .expect("explain")
+            .iter()
+            .map(|row| row.get::<String, _>("detail"))
+            .collect::<Vec<_>>()
+            .join(" | ");
+        assert!(
+            plan.contains(
+                "SEARCH bi USING INDEX IX_BaseItems_Type_CleanName (Type=? AND CleanName=?)"
+            ) && !plan.contains("SCAN bi"),
+            "{n} names: {plan}"
+        );
+    }
+}
+
 /// A typed `sortBy=Name` page keeps the sort it had while `Name` fell back to
 /// `SortName`: the pinned `+CleanName` stops `IX_BaseItems_Type_CleanName`
 /// from walking every row of the type, in every library, to fill one page.

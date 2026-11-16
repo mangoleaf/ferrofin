@@ -7,7 +7,8 @@
 //! via [`From`] so handlers can use `?` directly on trait-method results.
 
 use axum::Json;
-use axum::http::{StatusCode, header};
+use axum::body::Body;
+use axum::http::{HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use ferrofin_traits::error::ServiceError;
 use serde::Serialize;
@@ -202,6 +203,21 @@ impl IntoResponse for ApiError {
 }
 
 impl ApiError {
+    /// Answers the error as upstream's `ExceptionMiddleware` answers the
+    /// exception the C# throws in its place, outside Development: this error's
+    /// status, `text/plain` and
+    /// [`ERROR_BODY`](crate::panic_boundary::ERROR_BODY). For a call site whose
+    /// upstream failure is a throw, not an action result; a 5xx is still
+    /// logged once, as [`IntoResponse`] logs it.
+    pub(crate) fn into_exception_response(self) -> Response {
+        let (mut parts, _) = self.into_response().into_parts();
+        parts.headers.remove(header::CONTENT_LENGTH);
+        parts
+            .headers
+            .insert(header::CONTENT_TYPE, HeaderValue::from_static("text/plain"));
+        Response::from_parts(parts, Body::from(crate::panic_boundary::ERROR_BODY))
+    }
+
     /// Logs a 5xx once and builds the response.
     fn respond(self) -> Response {
         let status = self.status();
@@ -263,6 +279,25 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(body.as_ref(), br#"{"error":"at the limit"}"#);
+    }
+
+    /// An exception's answer keeps the status and a 5xx's logged-once mark,
+    /// and swaps the JSON body for the middleware's text.
+    #[tokio::test]
+    async fn an_exception_response_is_the_middlewares_text_with_the_status() {
+        let response = ApiError::from(ServiceError::backend("disk")).into_exception_response();
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(response.headers()[header::CONTENT_TYPE], "text/plain");
+        assert!(
+            response
+                .extensions()
+                .get::<super::FailureLogged>()
+                .is_some()
+        );
+        let body = axum::body::to_bytes(response.into_body(), 1024)
+            .await
+            .unwrap();
+        assert_eq!(body.as_ref(), b"Error processing request.");
     }
 
     /// `Retry-After` is for the refusal that names a wait, not any 503.

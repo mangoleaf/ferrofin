@@ -1,7 +1,7 @@
 //! Transliteration of
 //! `Jellyfin.Networking.Tests.Configuration.NetworkConfigurationTests`.
 
-use ferrofin_networking::NetworkConfiguration;
+use ferrofin_networking::{NetworkConfiguration, base_url_prefix_len, escape_base_url};
 use rstest::rstest;
 
 /// `BaseUrl_ReturnsNormalized`.
@@ -18,6 +18,46 @@ use rstest::rstest;
 fn base_url_returns_normalized(#[case] expected: &str, #[case] input: &str) {
     let config = NetworkConfiguration::default().with_base_url(input);
     assert_eq!(expected, config.base_url());
+}
+
+/// gl-1685: the base URL in a URL is escaped as `UriBuilder.Path` escapes it,
+/// keeping the reserved characters and any escape it already holds. Each
+/// expected value but the backslash's is Jellyfin 12.4's, probed live.
+#[rstest]
+#[case::plain("/jellyfin", "/jellyfin")]
+#[case::space("/my jellyfin", "/my%20jellyfin")]
+#[case::non_ascii("/m\u{e9}dias", "/m%C3%A9dias")]
+#[case::already_escaped("/my%20jellyfin", "/my%20jellyfin")]
+#[case::delimiters("/b<c>d#e?f", "/b%3Cc%3Ed%23e%3Ff")]
+#[case::unsafe_ascii("/a|b{c}^\"`", "/a%7Cb%7Bc%7D%5E%22%60")]
+#[case::reserved_kept("/x-._~:[]@!$&'()*+,;=", "/x-._~:[]@!$&'()*+,;=")]
+#[case::lone_percent("/100%", "/100%25")]
+#[case::truncated_escape("/a%2", "/a%252")]
+#[case::invalid_escape("/x%zz", "/x%25zz")]
+#[case::lowercase_escape_kept("/m%c3%a9dias", "/m%c3%a9dias")]
+#[case::double_percent("/a%%", "/a%25%25")]
+#[case::percent_before_multibyte("/a%\u{e9}", "/a%25%C3%A9")]
+#[case::backslash_stays_itself("/a\\b", "/a%5Cb")]
+fn escape_base_url_escapes_as_uri_builder(#[case] base: &str, #[case] expected: &str) {
+    assert_eq!(escape_base_url(base), expected);
+}
+
+/// gl-1685: escapes decode on both sides of the walk, a broken one is a
+/// literal `%`, and `%2F` is never a `/`.
+#[rstest]
+#[case::truncated_escape("/my jellyfin", "/my%2", None)]
+#[case::invalid_hex("/my jellyfin", "/my%zzjellyfin", None)]
+#[case::escaped_letter("/a", "/%61/x", Some(4))]
+#[case::escaped_slash_both_sides("/a%2Fb", "/a%2fb/x", Some(6))]
+#[case::escaped_slash_against_slash("/a/b", "/a%2fb/x", None)]
+#[case::literal_percent("/100%", "/100%25/x", Some(7))]
+#[case::path_too_short("/jellyfin", "/jelly", None)]
+fn base_url_prefix_len_decodes_both_sides(
+    #[case] base: &str,
+    #[case] path: &str,
+    #[case] expected: Option<usize>,
+) {
+    assert_eq!(base_url_prefix_len(path, base), expected);
 }
 
 /// The serialized field names must be exactly the contract's, character for

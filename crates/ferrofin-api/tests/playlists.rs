@@ -16,7 +16,7 @@ use ferrofin_api::create_router;
 use ferrofin_api::state::AppState;
 use ferrofin_api::test_support::{
     FakeAppHost, FakeConfig, FakeMediaSources, FakeMusic, FakeProviders, FakeSearch, FakeSessions,
-    FakeSimilarItems, FakeSystem, FakeUserData, FakeUserViews,
+    FakeSimilarItems, FakeSystem, FakeUserData, FakeUserViews, FixedAuth, fake_user_entity,
 };
 use ferrofin_db::entities::base_items::BaseItemEntity;
 use ferrofin_db::entities::users::UserEntity;
@@ -30,8 +30,8 @@ use ferrofin_traits::collections::{
 use ferrofin_traits::dto::DtoService;
 use ferrofin_traits::error::ServiceError;
 use ferrofin_traits::library::UserManager;
-use ferrofin_traits::net::{AuthService, AuthorizationContext, RequestContext};
-use ferrofin_traits::options::{AuthorizationInfo, DtoOptions};
+use ferrofin_traits::net::{AuthService, AuthorizationContext};
+use ferrofin_traits::options::DtoOptions;
 use tower::ServiceExt;
 use uuid::Uuid;
 
@@ -45,38 +45,8 @@ const ITEM_B: Uuid = Uuid::from_u128(0xB2);
 /// read; every other column is a neutral zero value.
 fn user_entity(id: Uuid) -> UserEntity {
     UserEntity {
-        id: id.to_string(),
-        audio_language_preference: None,
-        authentication_provider_id: String::new(),
-        cast_receiver_id: None,
-        display_collections_view: false,
-        display_missing_episodes: false,
-        enable_auto_login: false,
-        enable_local_password: false,
-        enable_next_episode_auto_play: false,
-        enable_user_preference_access: false,
-        hide_played_in_latest: false,
-        internal_id: 0,
-        invalid_login_attempt_count: 0,
-        last_activity_date: None,
-        last_login_date: None,
-        login_attempts_before_lockout: None,
-        max_active_sessions: 0,
-        max_parental_rating_score: None,
-        max_parental_rating_sub_score: None,
-        must_update_password: false,
         password: Some("hashed".to_owned()),
-        password_reset_provider_id: String::new(),
-        play_default_audio_track: false,
-        remember_audio_selections: false,
-        remember_subtitle_selections: false,
-        remote_client_bitrate_limit: None,
-        row_version: 0,
-        subtitle_language_preference: None,
-        subtitle_mode: 0,
-        sync_play_access: 0,
-        username: "alice".to_owned(),
-        normalized_username: "ALICE".to_owned(),
+        ..fake_user_entity(id, "alice")
     }
 }
 
@@ -160,34 +130,8 @@ fn item_entity(id: Uuid) -> BaseItemEntity {
 }
 
 /// An [`AuthService`]/[`AuthorizationContext`] that authenticates as [`USER_ID`].
-struct OkAuth;
-
-#[async_trait]
-impl AuthService for OkAuth {
-    async fn authenticate(
-        &self,
-        _request: &RequestContext,
-    ) -> Result<AuthorizationInfo, ServiceError> {
-        Ok(AuthorizationInfo {
-            user: Some(Arc::new(user_entity(USER_ID))),
-            is_authenticated: true,
-            ..AuthorizationInfo::default()
-        })
-    }
-}
-
-#[async_trait]
-impl AuthorizationContext for OkAuth {
-    async fn get_authorization_info(
-        &self,
-        _request: &RequestContext,
-    ) -> Result<AuthorizationInfo, ServiceError> {
-        Ok(AuthorizationInfo {
-            user: Some(Arc::new(user_entity(USER_ID))),
-            is_authenticated: true,
-            ..AuthorizationInfo::default()
-        })
-    }
+fn ok_auth() -> FixedAuth {
+    FixedAuth::signed_in(user_entity(USER_ID))
 }
 
 /// A [`UserManager`] resolving the fixed authenticated user.
@@ -357,6 +301,7 @@ struct RecordingPlaylists {
     removed: Mutex<Option<RemoveCall>>,
     moved: Mutex<Option<MoveCall>>,
     updated: Mutex<Option<ferrofin_model::playlists::PlaylistUpdateRequest>>,
+    shared: Mutex<Option<ferrofin_model::playlists::PlaylistUserUpdateRequest>>,
     access: PlaylistAccess,
     shares: Vec<ferrofin_model::entities_media::PlaylistUserPermissions>,
 }
@@ -369,6 +314,7 @@ impl Default for RecordingPlaylists {
             removed: Mutex::default(),
             moved: Mutex::default(),
             updated: Mutex::default(),
+            shared: Mutex::default(),
             access: PlaylistAccess {
                 level: PlaylistAccessLevel::Owner,
                 open_access: false,
@@ -411,22 +357,26 @@ impl PlaylistManager for RecordingPlaylists {
         &self,
         _playlist_id: Uuid,
         _user_id: Uuid,
-    ) -> Result<Vec<BaseItemEntity>, ServiceError> {
+    ) -> Result<ferrofin_traits::persistence::PlaylistMembers, ServiceError> {
         // Dashed upper case, as a Jellyfin-scanned database stores `Id`.
-        Ok([ITEM_A, ITEM_B]
-            .map(|id| BaseItemEntity {
-                id: id.to_string().to_uppercase(),
-                ..item_entity(id)
-            })
-            .into())
+        Ok(ferrofin_traits::persistence::PlaylistMembers {
+            items: [ITEM_A, ITEM_B]
+                .map(|id| BaseItemEntity {
+                    id: id.to_string().to_uppercase(),
+                    ..item_entity(id)
+                })
+                .into(),
+            entries: vec![0, 1],
+        })
     }
     async fn get_playlist_item_ids(&self, _playlist_id: Uuid) -> Result<Vec<Uuid>, ServiceError> {
         Ok(vec![ITEM_A, ITEM_B])
     }
     async fn add_user_to_shares(
         &self,
-        _request: &ferrofin_model::playlists::PlaylistUserUpdateRequest,
+        request: &ferrofin_model::playlists::PlaylistUserUpdateRequest,
     ) -> Result<(), ServiceError> {
+        *self.shared.lock().unwrap() = Some(request.clone());
         Ok(())
     }
     async fn remove_user_from_shares(
@@ -527,6 +477,14 @@ impl CollectionManager for RecordingCollections {
     ) -> Result<Option<BaseItemEntity>, ServiceError> {
         unimplemented!()
     }
+
+    async fn resolve_box_set_folders(
+        &self,
+        _location: &str,
+        _folders: &[String],
+    ) -> Result<Option<Vec<Uuid>>, ServiceError> {
+        unimplemented!()
+    }
 }
 
 /// Assembles an [`AppState`] over the recording playlist/collection fakes.
@@ -552,11 +510,11 @@ fn state_full(
     dto: Arc<OkDto>,
     users: Arc<dyn ferrofin_traits::library::UserManager>,
 ) -> AppState {
-    let auth = Arc::new(OkAuth);
+    let auth = Arc::new(ok_auth());
     state_authed(playlists, collections, dto, users, (auth.clone(), auth))
 }
 
-/// [`state_full`] with the caller's credentials chosen by the test: [`OkAuth`]
+/// [`state_full`] with the caller's credentials chosen by the test: [`ok_auth`]
 /// is the fixed user, `FakeAuthContext` + `ApiKeyAuthService` an API key (no
 /// user).
 fn state_authed(
@@ -1194,6 +1152,115 @@ async fn playlist_users_routes_are_owner_only() {
     )
     .await;
     assert_eq!(status, StatusCode::FORBIDDEN);
+}
+
+/// gl-1674: `UpdatePlaylistUser` binds its body
+/// `[FromBody(EmptyBodyBehavior = EmptyBodyBehavior.Allow), Required]`, so an
+/// empty body whatever the content type, or `null` with a JSON one, binds null,
+/// and `[Required]` refuses it before the action runs: a 400 keyed `""`, ahead
+/// of the playlist's 404 and the owner check's 403, and no share written.
+/// Measured on Jellyfin 12.4.0.
+#[rstest::rstest]
+#[case::empty(PlaylistAccessLevel::Owner, PLAYLIST_ID, "", Some("application/json"))]
+#[case::null(
+    PlaylistAccessLevel::Owner,
+    PLAYLIST_ID,
+    "null",
+    Some("application/json")
+)]
+#[case::no_content_type(PlaylistAccessLevel::Owner, PLAYLIST_ID, "", None)]
+#[case::text_plain(PlaylistAccessLevel::Owner, PLAYLIST_ID, "", Some("text/plain"))]
+#[case::not_the_owner(
+    PlaylistAccessLevel::CanEdit,
+    PLAYLIST_ID,
+    "",
+    Some("application/json")
+)]
+#[case::unknown_playlist(
+    PlaylistAccessLevel::Owner,
+    Uuid::from_u128(0xDEAD),
+    "null",
+    Some("application/json")
+)]
+#[tokio::test]
+async fn a_share_update_without_a_body_is_the_required_400(
+    #[case] level: PlaylistAccessLevel,
+    #[case] playlist: Uuid,
+    #[case] body: &'static str,
+    #[case] content_type: Option<&str>,
+) {
+    let pl = playlists_with_access(level, false);
+    let app = state(pl.clone(), Arc::new(RecordingCollections::default()));
+    let mut request = Request::builder()
+        .method("POST")
+        .uri(format!("/Playlists/{playlist}/Users/{USER_ID}"))
+        .header("Authorization", "Token abc");
+    if let Some(content_type) = content_type {
+        request = request.header("Content-Type", content_type);
+    }
+    let response = create_router(app)
+        .oneshot(request.body(Body::from(body)).expect("request"))
+        .await
+        .expect("response");
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("body");
+    let document: serde_json::Value = serde_json::from_slice(&bytes).expect("a problem document");
+    assert_eq!(
+        document["errors"],
+        serde_json::json!({ "": ["The updatePlaylistUserRequest field is required."] })
+    );
+    assert!(pl.shared.lock().unwrap().is_none());
+}
+
+/// A present body writes the share: `{}` binds a null `CanEdit`
+/// (`request.CanEdit ?? false` upstream). Both 204 on Jellyfin 12.4.0.
+#[rstest::rstest]
+#[case::empty_object("{}", None)]
+#[case::can_edit(r#"{"CanEdit":true}"#, Some(true))]
+#[tokio::test]
+async fn a_share_update_with_a_body_writes_the_share(
+    #[case] body: &'static str,
+    #[case] can_edit: Option<bool>,
+) {
+    let pl = playlists_with_access(PlaylistAccessLevel::Owner, false);
+    let app = state(pl.clone(), Arc::new(RecordingCollections::default()));
+    let (status, _) = send(
+        app,
+        "POST",
+        &format!("/Playlists/{PLAYLIST_ID}/Users/{USER_ID}"),
+        Body::from(body),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let shared = pl.shared.lock().unwrap().clone().expect("a share written");
+    assert_eq!(
+        (shared.id, shared.user_id, shared.can_edit),
+        (PLAYLIST_ID, USER_ID, can_edit)
+    );
+}
+
+/// `null` is something to read: with no JSON content type no formatter takes
+/// it, so it is the 415, not the `[Required]` 400 (Jellyfin 12.4.0 too).
+#[tokio::test]
+async fn a_share_update_with_null_as_text_is_unsupported() {
+    let pl = playlists_with_access(PlaylistAccessLevel::Owner, false);
+    let app = state(pl.clone(), Arc::new(RecordingCollections::default()));
+    let response = create_router(app)
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/Playlists/{PLAYLIST_ID}/Users/{USER_ID}"))
+                .header("Authorization", "Token abc")
+                .header("Content-Type", "text/plain")
+                .body(Body::from("null"))
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    assert_eq!(response.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
+    assert!(pl.shared.lock().unwrap().is_none());
 }
 
 #[tokio::test]

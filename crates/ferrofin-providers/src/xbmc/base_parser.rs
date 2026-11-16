@@ -8,21 +8,26 @@
 //!
 //! Two collaborators are abstracted behind small traits so no real I/O leaks
 //! into the parse: [`ExternalIdSource`] supplies the provider-id key set the C#
-//! `IProviderManager.GetExternalIdInfos` returns, and [`DirectoryService`]
-//! resolves local artwork paths (C# `IDirectoryService.GetFile`). Tests pass
-//! fakes for both.
+//! `IProviderManager.GetExternalIdInfos` returns, and the shared
+//! [`DirectoryService`] resolves local artwork paths (C#
+//! `IDirectoryService.GetFile`). Tests pass fakes for both.
+
+use std::sync::Arc;
 
 use chrono::Datelike;
+use ferrofin_common::providers;
 use ferrofin_model::data::PersonKind;
 use ferrofin_model::entities::MetadataField;
 use ferrofin_util::finite::finite_or_none;
+use ferrofin_util::ticks::TICKS_PER_SECOND;
 
 use crate::container_types::{FileSystemMetadata, LocalImageInfo, MetadataResult, PersonInfo};
+use crate::local_images::DirectoryService;
 
 use super::config::NfoConfiguration;
 use super::item::{NfoBaseItem, NfoItemKind};
 use super::xml_ext::{
-    get_image_type, get_person_array, get_person_from_xml_node, left_part, provider_id_parsers,
+    get_image_type, get_person_array, get_person_from_xml_node, left_part,
     read_element_content_as_bool, read_normalized_string, try_read_date_time,
     try_read_date_time_exact, try_read_int,
 };
@@ -37,8 +42,6 @@ const YOUTUBE_WATCH_URL: &str = "https://www.youtube.com/watch?v=";
 
 /// Minimum production year accepted from a `<year>` tag (upstream `> 1850`).
 const MIN_PRODUCTION_YEAR: i32 = 1850;
-/// .NET ticks per second (100-ns units); used for run-time conversions.
-const TICKS_PER_SECOND: i64 = 10_000_000;
 /// Seconds per minute; used for the `<runtime>` (minutes) conversion.
 const SECONDS_PER_MINUTE: i64 = 60;
 
@@ -54,22 +57,19 @@ pub trait ExternalIdSource: Send + Sync {
     fn external_id_keys(&self) -> Vec<String>;
 }
 
-/// Resolves local artwork file paths (`IDirectoryService.GetFile`).
-///
-/// Behind a trait so the un-mockable filesystem access stays out of the parser's
-/// coverage/parity numbers; tests supply a fake.
-pub trait DirectoryService: Send + Sync {
-    /// Returns metadata for the file at `path`, or `None` if it does not exist.
-    fn get_file(&self, path: &str) -> Option<FileSystemMetadata>;
-}
-
 /// A [`DirectoryService`] that resolves nothing (every path is absent).
 ///
-/// Used by parsers/tests that carry no local artwork.
+/// The scan parses NFOs with it, so an NFO `<thumb>` that names a local file
+/// adds no image. TODO(parity, open work item — gl-1818): pass a service that
+/// resolves files, once the owner has decided which files an NFO may name.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct NoDirectoryService;
 
 impl DirectoryService for NoDirectoryService {
+    fn file_system_entries(&self, _path: &str) -> Arc<[FileSystemMetadata]> {
+        Arc::from([])
+    }
+
     fn get_file(&self, _path: &str) -> Option<FileSystemMetadata> {
         None
     }
@@ -248,22 +248,22 @@ impl<'a> BaseNfoParser<'a> {
     fn parse_provider_links(result: &mut MetadataResult<NfoBaseItem>, xml: &str) {
         let item = &mut result.item;
 
-        if let Some(imdb) = provider_id_parsers::try_find_imdb_id(xml) {
-            item.set_provider_id("Imdb", &imdb);
+        if let Some(imdb) = providers::try_find_imdb_id(xml) {
+            item.set_provider_id("Imdb", imdb);
         }
 
         if item.kind == NfoItemKind::Movie
-            && let Some(tmdb) = provider_id_parsers::try_find_tmdb_movie_id(xml)
+            && let Some(tmdb) = providers::try_find_tmdb_movie_id(xml)
         {
-            item.set_provider_id("Tmdb", &tmdb);
+            item.set_provider_id("Tmdb", tmdb);
         }
 
         if item.kind == NfoItemKind::Series {
-            if let Some(tmdb) = provider_id_parsers::try_find_tmdb_series_id(xml) {
-                item.set_provider_id("Tmdb", &tmdb);
+            if let Some(tmdb) = providers::try_find_tmdb_series_id(xml) {
+                item.set_provider_id("Tmdb", tmdb);
             }
-            if let Some(tvdb) = provider_id_parsers::try_find_tvdb_id(xml) {
-                item.set_provider_id("Tvdb", &tvdb);
+            if let Some(tvdb) = providers::try_find_tvdb_id(xml) {
+                item.set_provider_id("Tvdb", tvdb);
             }
         }
     }

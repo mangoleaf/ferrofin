@@ -21,7 +21,7 @@ use ferrofin_api::test_support::{
     FakeDevices, FakeDisplayPreferences, FakeFileSystem, FakeLocalization, FakeLyrics,
     FakeMediaSegments, FakeMediaSources, FakeMusic, FakePlaylists, FakeQuickConnect, FakeSearch,
     FakeSessions, FakeSimilarItems, FakeSubtitles, FakeSystem, FakeTasks, FakeTrickplay,
-    FakeTvSeries, FakeUserData, FakeUserViews,
+    FakeTvSeries, FakeUserData, FakeUserViews, fake_user_entity,
 };
 use ferrofin_db::entities::base_items::BaseItemEntity;
 use ferrofin_db::entities::users::UserEntity;
@@ -70,38 +70,8 @@ impl Drop for TempImage {
 /// Builds a minimal [`UserEntity`]; every non-id field is a neutral zero value.
 fn user_entity(id: Uuid, username: &str) -> UserEntity {
     UserEntity {
-        id: id.to_string(),
-        audio_language_preference: None,
-        authentication_provider_id: String::new(),
-        cast_receiver_id: None,
-        display_collections_view: false,
-        display_missing_episodes: false,
-        enable_auto_login: false,
-        enable_local_password: false,
-        enable_next_episode_auto_play: false,
-        enable_user_preference_access: false,
-        hide_played_in_latest: false,
-        internal_id: 0,
-        invalid_login_attempt_count: 0,
-        last_activity_date: None,
-        last_login_date: None,
-        login_attempts_before_lockout: None,
-        max_active_sessions: 0,
-        max_parental_rating_score: None,
-        max_parental_rating_sub_score: None,
-        must_update_password: false,
         password: Some("hashed".to_owned()),
-        password_reset_provider_id: String::new(),
-        play_default_audio_track: false,
-        remember_audio_selections: false,
-        remember_subtitle_selections: false,
-        remote_client_bitrate_limit: None,
-        row_version: 0,
-        subtitle_language_preference: None,
-        subtitle_mode: 0,
-        sync_play_access: 0,
-        username: username.to_owned(),
-        normalized_username: username.to_uppercase(),
+        ..fake_user_entity(id, username)
     }
 }
 
@@ -633,7 +603,7 @@ impl UserManager for StubUsers {
         _user: &UserEntity,
         _remote_endpoint: Option<String>,
     ) -> Result<ferrofin_model::dto::UserDto, ServiceError> {
-        // No policy: the caller is not an administrator.
+        // The default policy: the caller is not an administrator.
         Ok(ferrofin_model::dto::UserDto::default())
     }
     async fn update_configuration(
@@ -3064,6 +3034,8 @@ async fn the_positional_route_passes_a_zero_size_and_tag_on() {
 #[case::malformed_max_width("0/tag/jpg/x/100/0/0", StatusCode::BAD_REQUEST)]
 #[case::malformed_percent_played("0/tag/jpg/100/100/x/0", StatusCode::BAD_REQUEST)]
 #[case::hex_percent_played("0/tag/jpg/100/100/0x0/0", StatusCode::BAD_REQUEST)]
+#[case::inf_percent_played("0/tag/jpg/100/100/inf/0", StatusCode::BAD_REQUEST)]
+#[case::thousands_percent_played("0/tag/jpg/100/100/1%2C000/0", StatusCode::OK)]
 #[case::blank_tag("0/%20/jpg/100/100/0/0", StatusCode::BAD_REQUEST)]
 #[case::padded_tag("0/%20tag%20/jpg/100/100/0/0", StatusCode::OK)]
 #[tokio::test]

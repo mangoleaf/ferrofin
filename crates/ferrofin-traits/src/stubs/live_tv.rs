@@ -120,10 +120,9 @@ pub const LIVE_TV_INTERNAL_VERSION_NUMBER: &str = "4";
 /// `(ServiceName + externalId + InternalVersionNumber).ToLowerInvariant().GetMD5()`.
 #[must_use]
 pub fn internal_series_timer_id(external_id: &str) -> String {
-    ferrofin_common::extensions::get_md5(
-        &format!("{LIVE_TV_SERVICE_NAME}{external_id}{LIVE_TV_INTERNAL_VERSION_NUMBER}")
-            .to_lowercase(),
-    )
+    ferrofin_common::extensions::get_md5(&ferrofin_util::string_extensions::lower_invariant(
+        &format!("{LIVE_TV_SERVICE_NAME}{external_id}{LIVE_TV_INTERNAL_VERSION_NUMBER}"),
+    ))
     .simple()
     .to_string()
 }
@@ -200,6 +199,7 @@ pub fn new_timer_defaults(
 /// whole implementation rather than a fallback.
 #[must_use]
 pub fn filter_timers(timers: Vec<TimerInfoDto>, query: &TimerQuery) -> Vec<TimerInfoDto> {
+    use ferrofin_util::guid_extensions::parse_dotnet_guid;
     let matches_opt = |wanted: Option<&str>, actual: Option<&str>| match wanted
         .map(str::trim)
         .filter(|w| !w.is_empty())
@@ -226,12 +226,20 @@ pub fn filter_timers(timers: Vec<TimerInfoDto>, query: &TimerQuery) -> Vec<Timer
                     .map(str::trim)
                     .filter(|c| !c.is_empty())
                     .is_none_or(|wanted| {
-                        Uuid::parse_str(wanted).is_ok_and(|wanted| wanted == timer.base.channel_id)
+                        parse_dotnet_guid(wanted).is_some_and(|wanted| wanted == timer.base.channel_id)
                     })
-                && matches_opt(
-                    query.series_timer_id.as_deref(),
-                    timer.series_timer_id.as_deref(),
-                )
+                // `new Guid(query.SeriesTimerId)`, against the timer's.
+                && query
+                    .series_timer_id
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .is_none_or(|wanted| {
+                        parse_dotnet_guid(wanted).is_some_and(|wanted| {
+                            timer.series_timer_id.as_deref().and_then(parse_dotnet_guid)
+                                == Some(wanted)
+                        })
+                    })
                 && matches_opt(query.id.as_deref(), timer.base.id.as_deref())
         })
         .collect();
@@ -369,12 +377,17 @@ pub trait LiveTvManager: Send + Sync {
     /// refresh task's work, not this call's: the caller queues it
     /// (`CancelIfRunningAndQueue<RefreshGuideScheduledTask>()`), and the row
     /// returned here is computed from the saved configuration either way.
+    ///
+    /// `Ok(None)` is a pair stored for a tuner channel id no lineup channel
+    /// has. Upstream queues the refresh there too (the pair can still move a
+    /// channel matched by its number or tuner channel id) and only then
+    /// throws from `.First(...)`; an `Err` comes before the refresh is due.
     async fn set_channel_mapping(
         &self,
         provider_id: &str,
         tuner_channel_id: &str,
         provider_channel_id: &str,
-    ) -> Result<TunerChannelMapping, ServiceError>;
+    ) -> Result<Option<TunerChannelMapping>, ServiceError>;
 
     /// Queries Live TV channels as `BaseItemDto`s (`Type = "TvChannel"`).
     ///
@@ -543,7 +556,10 @@ pub trait LiveTvManager: Send + Sync {
     /// `M3UTunerHost.CreateMediaSourceInfo` + `Normalize`: an unopened tuner
     /// source (`RequiresOpening`/`RequiresClosing`, placeholder `Index = -1`
     /// streams, the tuner's `RequiredHttpHeaders`), which the media-source
-    /// manager then stamps with the provider-prefixed `OpenToken`.
+    /// manager then stamps with the provider-prefixed `OpenToken`. A channel
+    /// no tuner offers a source for (its tuner was deleted) gets the item's
+    /// own placeholder source instead, still to be opened
+    /// (`GetMediaSourcesInternal`'s fallback), and the open is what fails.
     ///
     /// The default reports no sources — the "no tuner configured" state.
     async fn get_channel_media_sources(
@@ -627,13 +643,19 @@ pub trait LiveTvManager: Send + Sync {
     ///
     /// Port of `LiveTvManager.GetSeriesTimers` (v10.11.8 LiveTvManager.cs:904-930):
     /// `SortBy == "Priority"` orders by priority then name, anything else orders
-    /// by name alone.
+    /// by name alone. The Live TV manager builds each series timer as it reads
+    /// it, as `LiveTvDtoService.GetSeriesTimerInfoDto` does: the channel's
+    /// current name and the library series' artwork.
     async fn get_series_timers(
         &self,
         query: &ferrofin_model::live_tv::SeriesTimerQuery,
     ) -> Result<Vec<SeriesTimerInfoDto>, ServiceError>;
 
-    /// Gets a single series timer by id, or `None` when unknown.
+    /// Gets a single series timer by id, or `None` when unknown: the stored row
+    /// as it is, which the manager's own paths read. `GET
+    /// /LiveTv/SeriesTimers/{timerId}` lists through
+    /// [`get_series_timers`](Self::get_series_timers) instead, as upstream's
+    /// `GetSeriesTimer` does.
     async fn get_series_timer(&self, id: &str) -> Result<Option<SeriesTimerInfoDto>, ServiceError>;
 
     /// Creates a series timer, returning the id the server minted for it.
@@ -673,7 +695,9 @@ pub trait LiveTvManager: Send + Sync {
     /// Lists the timers a query selects.
     ///
     /// Port of `LiveTvManager.GetTimers`. The default filters the full list in
-    /// memory, which is what upstream does — see [`filter_timers`].
+    /// memory, which is what upstream does — see [`filter_timers`]. The Live TV
+    /// manager then builds each timer as it reads it, as
+    /// `LiveTvDtoService.GetTimerInfoDto` does.
     async fn get_timers_matching(
         &self,
         query: &TimerQuery,
@@ -734,19 +758,38 @@ pub trait LiveTvManager: Send + Sync {
         Ok(Vec::new())
     }
 
+    /// `Video.IsActiveRecording`: whether a live capture is writing `path`
+    /// right now (`RecordingsManager.GetActiveRecordingInfo(Path) is not
+    /// null`), by an exact match against
+    /// [`active_recording_paths`](Self::active_recording_paths). A blank path
+    /// is never one, and is not looked up, as upstream returns `null` for it.
+    /// A lookup error is the caller's to handle: each caller keeps its own
+    /// policy.
+    async fn is_active_recording(&self, path: &str) -> Result<bool, ServiceError> {
+        if path.trim().is_empty() {
+            return Ok(false);
+        }
+        Ok(self
+            .active_recording_paths()
+            .await?
+            .iter()
+            .any(|recording| recording == path))
+    }
+
     /// `BaseItem.MediaType` of a Live TV channel or DVR recording — `"Video"`,
     /// `"Audio"`, or `None` when `id` is neither.
     ///
     /// The media-source manager needs it for the per-user
     /// `SupportsTranscoding`/`SupportsDirectStream` overwrite
-    /// (`MediaSourceManager.GetPlaybackMediaSources`, v10.11.8
-    /// Emby.Server.Implementations/Library/MediaSourceManager.cs:204-217),
+    /// (`MediaSourceManager.GetPlaybackMediaSources`, v12.4
+    /// Emby.Server.Implementations/Library/MediaSourceManager.cs:409-417),
     /// which branches on `item.MediaType`. Upstream reads it off the
     /// `LiveTvChannel`/recording `BaseItem` it already has in hand; Ferrofin's
     /// channels and recordings are not `BaseItems` rows, so the Live TV
     /// manager answers for them. `LiveTvChannel.MediaType` is
-    /// `ChannelType == Radio ? Audio : Video`, and a recording inherits the
-    /// media type of the channel it was captured from.
+    /// `ChannelType == Radio ? Audio : Video`, and a recording, a `.ts`
+    /// capture the library resolves as a video item, is `Video` whatever its
+    /// channel.
     ///
     /// The default reports `None`, which leaves the source exactly as the
     /// tuner built it — upstream's `user is null` behaviour.
@@ -846,11 +889,6 @@ pub trait LiveTvManager: Send + Sync {
         Ok(None)
     }
 
-    /// The on-disk path of a recording's captured file, or `None` when the
-    /// recording is unknown or has no file yet. Backs
-    /// `GET /LiveTv/LiveRecordings/{recordingId}/stream`.
-    async fn get_recording_path(&self, id: Uuid) -> Result<Option<String>, ServiceError>;
-
     /// Deletes a recording (its DB row and, when present, its file).
     async fn delete_recording(&self, id: Uuid) -> Result<(), ServiceError>;
 
@@ -900,5 +938,59 @@ mod new_timer_defaults_tests {
             internal_series_timer_id(""),
             "eb075d6a62e2edc6b764a304633d33c0"
         );
+    }
+
+    /// `ToLowerInvariant` is .NET's one-to-one fold, not `str::to_lowercase`:
+    /// `İ` (U+0130) stays `İ` and a final `Σ` is `σ`. The ids are the same MD5
+    /// calculation with the .NET 10 casing table in `ferrofin-util`'s
+    /// `tests/data/dotnet-invariant-casing.tsv`.
+    #[test]
+    fn internal_series_timer_id_folds_as_to_lower_invariant() {
+        assert_eq!(
+            internal_series_timer_id("\u{0130}"),
+            "afc668e05cee3c87d6ea936527b4189a"
+        );
+        assert_eq!(
+            internal_series_timer_id("\u{039F}\u{0394}\u{039F}\u{03A3}"),
+            "86b8edb1227ed65da8ea4c1a5736e649"
+        );
+    }
+}
+
+#[cfg(test)]
+mod filter_timers_tests {
+    use super::{TimerInfoDto, TimerQuery, filter_timers};
+
+    /// `LiveTvManager.GetTimers` reads `seriesTimerId` with `new Guid`, so each
+    /// spelling .NET reads (N, D, B, P) selects the series timer's timers, and
+    /// text it does not read selects none. A blank one is null to the binder.
+    #[test]
+    fn series_timer_id_matches_as_a_guid() {
+        let series = "0123456789abcdef0123456789abcdef";
+        let timers = vec![
+            TimerInfoDto {
+                series_timer_id: Some(series.to_owned()),
+                ..TimerInfoDto::default()
+            },
+            TimerInfoDto::default(),
+        ];
+        let matching = |wanted: &str| {
+            filter_timers(
+                timers.clone(),
+                &TimerQuery {
+                    series_timer_id: Some(wanted.to_owned()),
+                    ..TimerQuery::default()
+                },
+            )
+            .len()
+        };
+        assert_eq!(matching(series), 1);
+        assert_eq!(matching("01234567-89AB-CDEF-0123-456789ABCDEF"), 1);
+        assert_eq!(matching(" {01234567-89ab-cdef-0123-456789abcdef} "), 1);
+        assert_eq!(matching("(01234567-89ab-cdef-0123-456789abcdef)"), 1);
+        assert_eq!(matching("urn:uuid:01234567-89ab-cdef-0123-456789abcdef"), 0);
+        assert_eq!(matching("fedcba9876543210fedcba9876543210"), 0);
+        assert_eq!(matching("s"), 0);
+        assert_eq!(matching("  "), 2, "a blank one filters nothing");
     }
 }

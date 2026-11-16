@@ -434,7 +434,8 @@ impl ferrofin_traits::library::UserManager for StubUsers {
     }
 }
 
-/// Panic-on-call stub — only the methods a test exercises matter.
+/// Panic-on-call stub — only the methods a test exercises matter. A save
+/// succeeds and keeps nothing.
 pub struct StubUserData;
 
 #[async_trait::async_trait]
@@ -445,7 +446,7 @@ impl ferrofin_traits::library::UserDataManager for StubUserData {
         _item_id: Uuid,
         _user_data: &UpdateUserItemDataDto,
     ) -> Result<(), ServiceError> {
-        unimplemented!("stub")
+        Ok(())
     }
     async fn get_user_data_dto(
         &self,
@@ -902,6 +903,14 @@ impl ferrofin_traits::collections::CollectionManager for StubCollections {
         &self,
         _create_if_needed: bool,
     ) -> Result<Option<BaseItemEntity>, ServiceError> {
+        unimplemented!("stub")
+    }
+
+    async fn resolve_box_set_folders(
+        &self,
+        _location: &str,
+        _folders: &[String],
+    ) -> Result<Option<Vec<Uuid>>, ServiceError> {
         unimplemented!("stub")
     }
 }

@@ -5,12 +5,8 @@
 //! optimal [`StreamInfo`] with the chosen [`PlayMethod`] and accumulated
 //! [`TranscodeReasons`].
 
-use std::cmp::Ordering;
-
 use super::codec_profile::CodecProfile;
-use super::condition_processor::{
-    ConditionProcessor, StreamBuilderError, range_type_name, video_range_type_all_names,
-};
+use super::condition_processor::{ConditionProcessor, StreamBuilderError};
 use super::device_profile::DeviceProfile;
 use super::direct_play_profile::DirectPlayProfile;
 use super::enums::{
@@ -28,6 +24,7 @@ use crate::dto::MediaSourceInfo;
 use crate::entities::{MediaStreamType, VideoType};
 use crate::entities_media::MediaStream;
 use crate::extensions::{contains_container, split};
+use crate::json::enums::JsonEnum as _;
 use crate::media_info::{AudioIndexSource, MediaProtocol, TransportStreamTimestamp};
 use crate::session::{PlayMethod, TranscodeReasons};
 
@@ -2300,9 +2297,12 @@ fn apply_transcoding_conditions(
                         item.set_option_qualified(qualifier, "rangetype", values.join(","));
                     }
                     ProfileConditionType::NotEquals => {
-                        let names = video_range_type_all_names();
-                        let remaining: Vec<&str> =
-                            names.into_iter().filter(|n| !values.contains(n)).collect();
+                        // `Enum.GetNames<VideoRangeType>().Except(values)`.
+                        let remaining: Vec<&str> = VideoRangeType::members()
+                            .iter()
+                            .map(|(name, _)| *name)
+                            .filter(|n| !values.contains(n))
+                            .collect();
                         item.set_option_qualified(qualifier, "rangetype", remaining.join(","));
                     }
                     ProfileConditionType::EqualsAny => {
@@ -2372,7 +2372,7 @@ fn apply_transcoding_conditions(
                 if !enable_non_qualified_conditions {
                     continue;
                 }
-                if let Ok(num) = value.parse::<f32>() {
+                if let Some(num) = ferrofin_util::invariant_float::parse::<f32>(value) {
                     match condition.condition {
                         ProfileConditionType::Equals => item.max_framerate = Some(num),
                         ProfileConditionType::LessThanEqual => {
@@ -2737,17 +2737,59 @@ fn is_manifest_container(container: Option<&str>) -> bool {
         .any(|part| MANIFESTS.iter().any(|m| part.eq_ignore_ascii_case(m)))
 }
 
-// Keep the range-name helper referenced so it is not flagged unused.
-#[allow(dead_code)]
-const _RANGE_NAME_FN: fn(VideoRangeType) -> &'static str = range_type_name;
-
-// Ordering import retained for clarity of intent in comparators.
-#[allow(dead_code)]
-const _ORDERING: Option<Ordering> = None;
-
 #[cfg(test)]
 mod tests {
     use super::is_manifest_container;
+
+    /// `NotEquals` keeps `Enum.GetNames<VideoRangeType>().Except(values)`
+    /// (`StreamBuilder.cs:2073`): every other name, in declaration order.
+    #[test]
+    fn a_not_equals_range_condition_keeps_every_other_name() {
+        use super::{
+            DeviceProfile, ProfileCondition, ProfileConditionType, ProfileConditionValue,
+            StreamInfo, apply_transcoding_conditions,
+        };
+        let mut item = StreamInfo::new(DeviceProfile::default());
+        let condition = ProfileCondition::new(
+            ProfileConditionType::NotEquals,
+            ProfileConditionValue::VideoRangeType,
+            "DOVI|HDR10Plus".to_owned(),
+        );
+        apply_transcoding_conditions(&mut item, &[condition], Some("hevc"), true, true);
+        assert_eq!(
+            item.get_option(Some("hevc"), "rangetype"),
+            Some(
+                "Unknown,SDR,HDR10,HLG,DOVIWithHDR10,DOVIWithHLG,DOVIWithSDR,DOVIWithEL,\
+                 DOVIWithHDR10Plus,DOVIWithELHDR10Plus,DOVIInvalid"
+            )
+        );
+    }
+
+    /// `float.TryParse(value, CultureInfo.InvariantCulture, out var num)`
+    /// (`StreamBuilder.cs:2214`, `NumberStyles.Float | AllowThousands`): a
+    /// group separator and white space are a framerate, Rust's `inf` is not.
+    #[test]
+    fn a_framerate_condition_reads_its_value_as_dotnet_does() {
+        use super::{
+            DeviceProfile, ProfileCondition, ProfileConditionType, ProfileConditionValue,
+            StreamInfo, apply_transcoding_conditions,
+        };
+        for (value, expected) in [
+            ("1,000", Some(1000.0)),
+            (" 30 ", Some(30.0)),
+            ("Infinity", Some(f32::INFINITY)),
+            ("inf", None),
+        ] {
+            let mut item = StreamInfo::new(DeviceProfile::default());
+            let condition = ProfileCondition::new(
+                ProfileConditionType::Equals,
+                ProfileConditionValue::VideoFramerate,
+                value.to_owned(),
+            );
+            apply_transcoding_conditions(&mut item, &[condition], Some("h264"), true, true);
+            assert_eq!(item.max_framerate, expected, "{value}");
+        }
+    }
 
     #[test]
     fn manifest_containers_detected() {

@@ -127,6 +127,22 @@ pub async fn series_timer_row(
     .map_err(db_err)
 }
 
+/// Every stored series timer as `(Id, Data, SeriesId)`: its id, the published
+/// DTO JSON, unparsed (as [`series_timer_row`] leaves it), and the listings
+/// series id its artwork is found by.
+///
+/// # Errors
+///
+/// Fails when the read fails.
+pub async fn series_timer_rows(
+    db: &Database,
+) -> Result<Vec<(String, String, Option<String>)>, ServiceError> {
+    sqlx::query_as(r#"SELECT "Id","Data","SeriesId" FROM "FerrofinLiveTvSeriesTimers""#)
+        .fetch_all(db.pool())
+        .await
+        .map_err(db_err)
+}
+
 /// Inserts or replaces one series timer, DTO and identity columns together.
 ///
 /// # Errors
@@ -223,7 +239,7 @@ pub async fn timers_for_program(
 /// Fails when the read fails, or when the ids cannot be serialized.
 pub async fn scheduled_timers_for_programs(
     db: &Database,
-    program_ids: &[&str],
+    program_ids: &[String],
 ) -> Result<Vec<(String, String)>, ServiceError> {
     let ids = serde_json::to_string(program_ids).map_err(|e| {
         ServiceError::from(crate::error::LiveTvError::serialize(

@@ -10,6 +10,8 @@
 //! The JSON-*body* twin of those binders, `JsonDelimitedCollectionConverter<T>`,
 //! is `ferrofin_model::json::delimited`, beside the DTOs that carry it.
 
+use ferrofin_model::dto::SortOrder;
+use ferrofin_model::live_tv::ItemSortBy;
 use serde::Deserialize;
 use uuid::Uuid;
 
@@ -39,6 +41,37 @@ where
         .collect()
 }
 
+/// Pairs each sort key with a sort order — `RequestHelpers.GetOrderBy` (v12.4
+/// Jellyfin.Api/Helpers/RequestHelpers.cs:35-59).
+///
+/// A key takes the order at its own index; the keys past the last order take
+/// the FIRST order, or ascending when none was given. Orders past the last key
+/// are ignored, where upstream, given a non-empty `sortBy`, indexes past it and
+/// answers 400.
+///
+/// Generic over the order type because the activity log has its own;
+/// `O::default()` is `Ascending` for both.
+pub(crate) fn get_order_by<K, O: Copy + Default>(sort_by: Vec<K>, sort_order: &[O]) -> Vec<(K, O)> {
+    let rest = sort_order.first().copied().unwrap_or_default();
+    sort_by
+        .into_iter()
+        .enumerate()
+        .map(|(i, key)| (key, sort_order.get(i).copied().unwrap_or(rest)))
+        .collect()
+}
+
+/// Binds `sortBy` / `sortOrder` with the comma-delimited binder
+/// ([`parse_csv_enums_lenient`]) and pairs them with [`get_order_by`].
+pub(crate) fn parse_order_by(
+    sort_by: Option<&str>,
+    sort_order: Option<&str>,
+) -> Vec<(ItemSortBy, SortOrder)> {
+    get_order_by(
+        parse_csv_enums_lenient(sort_by),
+        &parse_csv_enums_lenient(sort_order),
+    )
+}
+
 /// Converts one collection token as the element type's `TypeConverter` does
 /// ([`crate::query::value`]): an enum name in any case or its C# value, an
 /// integer with `BaseNumberConverter`'s hex forms, a GUID, a string. `None` is
@@ -64,6 +97,24 @@ pub(crate) fn parse_csv_uuids(raw: Option<&str>) -> Result<Vec<Uuid>, ApiError> 
         .map(|token| {
             DotnetGuid::parse(token)
                 .map_err(|_| ApiError::BadRequest(format!("invalid id {token:?}")))
+        })
+        .collect()
+}
+
+/// Parses a comma-delimited list of `i32` values (Jellyfin's `years`). A
+/// malformed token is a `400` — stricter than v12's
+/// `CommaDelimitedCollectionModelBinder`, which logs and drops the token, and
+/// the same strictness as [`parse_csv_uuids`].
+pub(crate) fn parse_csv_i32(raw: Option<&str>) -> Result<Vec<i32>, ApiError> {
+    let Some(raw) = raw else {
+        return Ok(Vec::new());
+    };
+    raw.split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| {
+            s.parse::<i32>()
+                .map_err(|_| ApiError::BadRequest(format!("invalid integer {s:?}")))
         })
         .collect()
 }
@@ -205,9 +256,16 @@ pub(crate) fn apply_location_types(
 
 #[cfg(test)]
 mod tests {
-    use super::{empty_as_none_uuid, parse_csv_strings, parse_csv_uuids, parse_pipe_strings};
+    use super::{
+        empty_as_none_uuid, get_order_by, parse_csv_strings, parse_csv_uuids, parse_order_by,
+        parse_pipe_strings,
+    };
 
     use ferrofin_model::data::BaseItemKind;
+    use ferrofin_model::dto::SortOrder::{self, Ascending, Descending};
+    use ferrofin_model::live_tv::ItemSortBy::{
+        self, IsFavoriteOrLiked, Name, ProductionYear, Random, SortName,
+    };
     use rstest::rstest;
     use uuid::Uuid;
 
@@ -232,6 +290,50 @@ mod tests {
         #[case] expected: &[&str],
     ) {
         assert_eq!(parse_csv_strings(raw), expected);
+    }
+
+    /// The first three cases are upstream's `RequestHelpersTests.GetOrderBy_Success`
+    /// data; the rest pin the other arms of `GetOrderBy`.
+    #[rstest]
+    #[case(&[], &[], &[])]
+    #[case(
+        &[IsFavoriteOrLiked, Random],
+        &[],
+        &[(IsFavoriteOrLiked, Ascending), (Random, Ascending)]
+    )]
+    #[case(
+        &[SortName, ProductionYear],
+        &[Descending],
+        &[(SortName, Descending), (ProductionYear, Descending)]
+    )]
+    #[case(
+        &[SortName, ProductionYear, Name],
+        &[Descending, Ascending],
+        &[(SortName, Descending), (ProductionYear, Ascending), (Name, Descending)]
+    )]
+    #[case(&[], &[Descending], &[])]
+    // Upstream answers 400 here (it indexes past `sortBy`).
+    #[case(&[SortName], &[Descending, Ascending], &[(SortName, Descending)])]
+    fn order_by_pairs_like_get_order_by(
+        #[case] sort_by: &[ItemSortBy],
+        #[case] sort_order: &[SortOrder],
+        #[case] expected: &[(ItemSortBy, SortOrder)],
+    ) {
+        assert_eq!(get_order_by(sort_by.to_vec(), sort_order), expected);
+    }
+
+    /// The binder trims, ignores case and drops a token it cannot convert, so
+    /// a dropped order shifts the later ones down an index, as upstream.
+    #[test]
+    fn order_by_binds_like_the_comma_delimited_binder() {
+        assert_eq!(
+            parse_order_by(
+                Some(" sortname ,Bogus,,ProductionYear"),
+                Some("Nope, DESCENDING")
+            ),
+            [(SortName, Descending), (ProductionYear, Descending)]
+        );
+        assert_eq!(parse_order_by(None, Some("Descending")), []);
     }
 
     #[test]
@@ -266,7 +368,6 @@ mod tests {
 
     #[test]
     fn nullable_wire_enums_keep_csharp_values() {
-        use ferrofin_model::dto::SortOrder;
         // A wire enum maps numbers by C# value and keeps an undefined one.
         #[derive(Debug, serde::Deserialize)]
         struct W {

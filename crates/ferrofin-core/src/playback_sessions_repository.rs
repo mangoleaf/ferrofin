@@ -62,6 +62,29 @@ pub(crate) mod test_rows {
         .await
         .expect("read playback sessions")
     }
+
+    /// The planner-statistics tables (`sqlite_stat*`) in the database, sorted.
+    /// Here, not in the optimize task's tests: `sql_boundary.rs` caps the SQL
+    /// in `maintenance.rs` and exempts repository files.
+    pub(crate) async fn stat_tables(db: &Database) -> Vec<String> {
+        sqlx::query_scalar(
+            "SELECT name FROM sqlite_master WHERE type = 'table' AND name LIKE 'sqlite_stat%' \
+             ORDER BY name",
+        )
+        .fetch_all(db.pool())
+        .await
+        .expect("read sqlite_master")
+    }
+
+    /// Makes the writer's one connection read-only (`PRAGMA query_only`):
+    /// checkpoints still run on it, a `VACUUM` fails. Here for the same reason
+    /// as [`stat_tables`].
+    pub(crate) async fn query_only_writer(db: &Database) {
+        sqlx::query("PRAGMA query_only = ON")
+            .execute(db.writer())
+            .await
+            .expect("query_only");
+    }
 }
 
 #[cfg(test)]

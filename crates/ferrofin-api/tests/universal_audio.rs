@@ -80,6 +80,7 @@ impl HlsStreamManager for FakeHls {
         &self,
         _file_name: &str,
         _require_m3u8: bool,
+        _playlist_id: Option<&str>,
     ) -> Result<ServedFile, ServiceError> {
         unimplemented!("unused")
     }
@@ -663,6 +664,25 @@ async fn an_unsupported_hls_segment_container_falls_back_to_ts() {
     assert_eq!(master(&served).segment_container.as_deref(), Some("ts"));
 }
 
+/// gl-1041: an `audioCodec` this ffmpeg cannot encode leaves the builder with
+/// no transcoding profile, so the source keeps the client's protocol
+/// (`SetStreamInfoOptionsFromTranscodingProfile` never runs), and
+/// `transcodingProtocol=hls` still answers with the master playlist.
+#[tokio::test]
+async fn an_unencodable_codec_keeps_the_clients_hls_protocol() {
+    let file = temp_file();
+    let (app, served) = router(vec![flac_source(ITEM_ID, &file.path, 900_000)], &file.path);
+    let resp = get(
+        app,
+        "container=mp3&transcodingContainer=ts&transcodingProtocol=hls&audioCodec=truehd",
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let req = master(&served);
+    assert_eq!(req.segment_container.as_deref(), Some("ts"));
+    assert_eq!(req.audio_codec.as_deref(), Some("truehd"));
+}
+
 /// A remote direct-playable source is redirected to when the client allows it.
 #[tokio::test]
 async fn a_remote_source_redirects_when_remote_media_is_enabled() {
@@ -762,13 +782,40 @@ async fn head_answers_the_static_and_hls_branches_without_a_body() {
 }
 
 /// An invalid codec or container identifier is refused before negotiation, as
-/// upstream's `[RegularExpression]` validation does.
+/// upstream's `[RegularExpression]` validation does: the model-state `400`
+/// naming each failing parameter, as stock Jellyfin 12.4 answered. Its
+/// `container` carries no pattern.
 #[tokio::test]
 async fn an_invalid_codec_identifier_is_a_bad_request() {
     let file = temp_file();
-    let (app, _served) = router(vec![flac_source(ITEM_ID, &file.path, 900_000)], &file.path);
-    let resp = get(app, "container=mp3&audioCodec=mp3;rm").await;
+    let (app, served) = router(vec![flac_source(ITEM_ID, &file.path, 900_000)], &file.path);
+    let resp = get(
+        app,
+        "container=c%24d&audioCodec=mp3;rm&transcodingContainer=b%24c",
+    )
+    .await;
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let complaint = |name: &str| {
+        format!(
+            r"The field {name} must match the regular expression '^[a-zA-Z0-9\-\._,|]{{0,40}}$'."
+        )
+    };
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&body).unwrap(),
+        serde_json::json!({
+            "type": "https://tools.ietf.org/html/rfc9110#section-15.5.1",
+            "title": "One or more validation errors occurred.",
+            "status": 400,
+            "errors": {
+                "audioCodec": [complaint("audioCodec")],
+                "transcodingContainer": [complaint("transcodingContainer")],
+            },
+        })
+    );
+    assert!(served.lock().unwrap().is_none());
 }
 
 /// The protocol binds ignoring case, and a value that is no member leaves it

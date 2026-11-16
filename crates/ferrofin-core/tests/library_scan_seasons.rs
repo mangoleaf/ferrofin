@@ -82,24 +82,37 @@ const TVDB_DVD_SEASON: &str = r#"{"data": {"id": 76, "translations": {"overviewT
 
 /// TheMovieDb's posters for season 1, in TheMovieDb's own order: the German
 /// one first and best rated, then English, then French. Their files are
-/// requested from the stand-in's `/img` root, which answers each with a 404,
-/// so the scan tries every one and the request log shows its ranked order.
+/// requested from the stand-in's `/img` root, which answers each with a 404
+/// unless it serves posters ([`Answers::posters`]), so the scan tries every
+/// one and the request log shows its ranked order.
 const TMDB_SEASON_IMAGES: &str = r#"{"posters": [
     {"file_path": "/season-de.jpg", "iso_639_1": "de", "vote_average": 9.5, "vote_count": 90},
     {"file_path": "/season-en.jpg", "iso_639_1": "en", "vote_average": 7.0, "vote_count": 40},
     {"file_path": "/season-fr.jpg", "iso_639_1": "fr", "vote_average": 5.0, "vote_count": 10}]}"#;
 
-/// How the stand-in answers TheMovieDb's series search and season.
+/// How the stand-in answers TheMovieDb's series search and season, and
+/// whether it serves the season posters' files (else they 404).
 #[derive(Clone, Copy)]
 struct Answers {
     search: &'static str,
     season: &'static str,
+    posters: bool,
 }
 
 const DEFAULT_ANSWERS: Answers = Answers {
     search: TMDB_FOUND,
     season: TMDB_SEASON,
+    posters: false,
 };
+
+/// A 1×1 PNG, the season posters' file when the stand-in serves them.
+const POSTER: &[u8] = &[
+    0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48, 0x44, 0x52,
+    0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x02, 0x00, 0x00, 0x00, 0x90, 0x77, 0x53,
+    0xde, 0x00, 0x00, 0x00, 0x0c, 0x49, 0x44, 0x41, 0x54, 0x78, 0x9c, 0x63, 0xf8, 0xcf, 0xc0, 0x00,
+    0x00, 0x03, 0x01, 0x01, 0x00, 0xc9, 0xfe, 0x92, 0xef, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4e,
+    0x44, 0xae, 0x42, 0x60, 0x82,
+];
 
 /// The stand-in's answer to request line `line`; `None` is a 404 (a miss,
 /// not a failure).
@@ -174,17 +187,24 @@ fn spawn_providers(answers: Answers) -> (String, Arc<Mutex<Vec<String>>>) {
                   "seasonbanner":[{{"url":"http://{addr}/img/banner-1.jpg","season":"1"}}],
                   "showbackground":[{{"url":"http://{addr}/img/bg-all.jpg","season":"all"}}]}}"#
             );
-            let (status, payload) = if line.contains("/fanart/tv/121361") {
-                ("200 OK", fanart_document.as_str())
-            } else {
-                answer(&line, answers).map_or(("404 Not Found", "{}"), |b| ("200 OK", b))
-            };
+            let (status, content_type, payload) =
+                if answers.posters && line.contains("/img/") && line.contains("/season-") {
+                    ("200 OK", "image/png", POSTER)
+                } else if line.contains("/fanart/tv/121361") {
+                    ("200 OK", "application/json", fanart_document.as_bytes())
+                } else {
+                    answer(&line, answers).map_or(
+                        ("404 Not Found", "application/json", b"{}".as_slice()),
+                        |b| ("200 OK", "application/json", b.as_bytes()),
+                    )
+                };
             log.lock().expect("log").push(line);
             let _ = write!(
                 s,
-                "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{payload}",
+                "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
                 payload.len()
             );
+            let _ = s.write_all(payload);
         }
     });
     (format!("http://{addr}"), requests)
@@ -906,6 +926,15 @@ impl Library {
             .expect("stamp the season");
     }
 
+    /// How many image rows the season has stored.
+    async fn season_images(&self) -> i64 {
+        sqlx::query_scalar(r#"SELECT COUNT(*) FROM "BaseItemImageInfos" WHERE "ItemId" = ?1"#)
+            .bind(ferrofin_db::store::guid_to_db(self.season_id))
+            .fetch_one(self.db.pool())
+            .await
+            .expect("season images")
+    }
+
     /// The season's stored premiere day and production year.
     async fn season_date(&self) -> (Option<String>, Option<i64>) {
         let season = self.season().await;
@@ -1024,6 +1053,132 @@ async fn a_new_season_poster_dates_the_season_from_its_episode() {
     std::fs::write(library.season_dir.join("poster.jpg"), b"jpeg").expect("poster");
     scanner.scan_all().await.expect("rescan");
     assert_eq!(library.season_date().await, episodes_date());
+}
+
+/// A refresh that runs the remote image providers on a stored season is a
+/// full refresh: the item refresh route's image full refresh carries
+/// `ForceSave` (`ItemRefreshController.cs:82-85`), which `BeforeSave` counts
+/// as `isFullRefresh`. So the season takes its episode's date with
+/// TheMovieDb's new poster, as it would without it; the image half of the
+/// gate (below) is never what decides there (gl-681).
+#[tokio::test(flavor = "multi_thread")]
+async fn an_image_full_refresh_dates_the_season_with_its_remote_poster() {
+    let tmp = tempfile::tempdir().expect("tmp");
+    let library = Library::new(tmp.path(), LibraryOptions::default()).await;
+    library.date_the_episode_early();
+    let (base, _log) = spawn_providers(DEFAULT_ANSWERS);
+    library.scanner(&base).scan_all().await.expect("first scan");
+    library.stamp_season_refresh().await;
+    assert_eq!(
+        library.season_images().await,
+        0,
+        "the first scan's posters 404"
+    );
+
+    let (serving, log) = spawn_providers(Answers {
+        posters: true,
+        ..DEFAULT_ANSWERS
+    });
+    library
+        .scanner(&serving)
+        .scan_with(
+            None,
+            &MetadataRefreshOptions::for_item_refresh(
+                MetadataRefreshMode::Default,
+                MetadataRefreshMode::FullRefresh,
+                false,
+                false,
+                false,
+            ),
+        )
+        .await
+        .expect("image full refresh");
+    assert!(asked(&log, "/season-") > 0, "the poster was fetched");
+    assert_eq!(library.season_images().await, 1, "the poster is stored");
+    assert_eq!(library.season_date().await, episodes_date());
+}
+
+/// gl-681: only the local image validation opens that half of the gate
+/// (`RemoveImages`, `ValidateImages`, `MetadataService.cs:112-143`). The
+/// NFO's artwork is saved after `BeforeSave` (the local pass of
+/// `RefreshWithProviders`, `:818-838`), so a changed `season.nfo` naming a
+/// poster the season had none of leaves its date on a plain rescan.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_season_nfos_new_poster_leaves_the_seasons_date() {
+    let tmp = tempfile::tempdir().expect("tmp");
+    let library = Library::new(tmp.path(), LibraryOptions::default()).await;
+    library.date_the_episode_early();
+    let (base, _log) = spawn_providers(DEFAULT_ANSWERS);
+    library.scanner(&base).scan_all().await.expect("first scan");
+    library.stamp_season_refresh().await;
+    // Saved well before the NFO is written, so its change monitor fires.
+    library
+        .set_season(r#""DateLastSaved" = '2020-01-01 00:00:00.0000000'"#)
+        .await;
+
+    let (serving, log) = spawn_providers(Answers {
+        posters: true,
+        ..DEFAULT_ANSWERS
+    });
+    std::fs::write(
+        library.season_dir.join("season.nfo"),
+        format!("<season><thumb>{serving}/img/original/season-nfo.jpg</thumb></season>"),
+    )
+    .expect("season nfo");
+    library.scanner(&serving).scan_all().await.expect("rescan");
+    assert!(
+        asked(&log, "/season-nfo") > 0,
+        "the NFO's poster was fetched"
+    );
+    assert_eq!(library.season_images().await, 1, "the poster is stored");
+    assert_eq!(library.season_date().await, tmdbs_date());
+}
+
+/// gl-681: the local image validation sees the poster an earlier refresh
+/// downloaded into the season's art folder, so replacing every image without
+/// `ForceSave` (no route sends that; options a caller builds can) leaves the
+/// date: the replacement is the remote providers' work, after `BeforeSave`.
+/// With `RemoveOldMetadata` too, `RemoveImages` deletes that poster first,
+/// an image update before `BeforeSave` (`MetadataService.cs:112-118`), so
+/// the season takes its episode's date.
+#[rstest::rstest]
+#[case::replace_images(false, tmdbs_date())]
+#[case::remove_old_images(true, episodes_date())]
+#[tokio::test(flavor = "multi_thread")]
+async fn replacing_a_downloaded_season_poster_without_force_save(
+    #[case] remove_old_metadata: bool,
+    #[case] expected: (Option<String>, Option<i64>),
+) {
+    let tmp = tempfile::tempdir().expect("tmp");
+    let library = Library::new(tmp.path(), LibraryOptions::default()).await;
+    library.date_the_episode_early();
+    let (serving, log) = spawn_providers(Answers {
+        posters: true,
+        ..DEFAULT_ANSWERS
+    });
+    let scanner = library.scanner(&serving);
+    scanner.scan_all().await.expect("first scan");
+    library.stamp_season_refresh().await;
+    assert_eq!(library.season_images().await, 1, "the first scan's poster");
+    drain(&log);
+
+    let replace = MetadataRefreshOptions {
+        force_save: false,
+        remove_old_metadata,
+        ..MetadataRefreshOptions::for_item_refresh(
+            MetadataRefreshMode::Default,
+            MetadataRefreshMode::FullRefresh,
+            false,
+            true,
+            false,
+        )
+    };
+    scanner
+        .scan_with(None, &replace)
+        .await
+        .expect("replace every image");
+    assert!(asked(&log, "/season-") > 0, "the poster was fetched again");
+    assert_eq!(library.season_date().await, expected);
 }
 
 /// A season NFO that changed in the same scan as the new poster: upstream

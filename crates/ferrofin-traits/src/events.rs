@@ -16,7 +16,7 @@
 //!   boundary. It returns the created file name.
 //! - `Task<T>` → `async fn -> Result<T, ServiceError>`.
 //!
-//! Both traits are object-safe and carry `_assert_object_safe_*` assertions.
+//! Every trait is object-safe and carries an `_assert_object_safe_*` assertion.
 
 use async_trait::async_trait;
 
@@ -38,6 +38,46 @@ pub trait EventManager: Send + Sync {
 }
 
 fn _assert_object_safe_event_manager(_: &dyn EventManager) {}
+
+/// The in-process event every debounced library change set is published as,
+/// its payload the unfiltered `LibraryUpdateInfo`; never forwarded to clients
+/// (`LibraryChanged` is, filtered per user).
+pub const ITEMS_CHANGED: &str = "ItemsChanged";
+
+/// The future a consumer returns, awaited in registration order by the
+/// event manager's `publish`.
+pub type EventFuture =
+    std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), ServiceError>> + Send>>;
+
+/// A single in-process event consumer: port of `IEventConsumer<T>.OnEvent`,
+/// its typed `T eventArgs` the raw JSON payload [`EventManager::publish`]
+/// carries, which the consumer deserializes by the event type it registered
+/// under. An error is logged and the fan-out continues, matching the C#
+/// per-consumer `try/catch`.
+///
+/// The callback inspects the payload synchronously and returns the work to
+/// await. A consumer whose effect must be *ordered* relative to later
+/// publishes (the activity-log writers) puts the work in the future; one whose
+/// effect is a fire-and-forget push (the WebSocket notifiers, which C# also
+/// treats as best-effort sends) may spawn and return a ready future.
+pub type EventConsumer = std::sync::Arc<dyn Fn(&str) -> EventFuture + Send + Sync + 'static>;
+
+/// A consumer future that is already finished — for a consumer that did all its
+/// work synchronously or spawned it.
+pub fn consumer_done() -> EventFuture {
+    Box::pin(std::future::ready(Ok(())))
+}
+
+/// Registers in-process consumers of published events: the subscribe half of
+/// the event manager, the C# DI registration of an `IEventConsumer<T>`.
+pub trait EventSubscriber: Send + Sync {
+    /// Registers `consumer` for the named event type. Every consumer
+    /// registered for `event_type` runs, in registration order, on each
+    /// [`EventManager::publish`] of it; several may share a name.
+    fn subscribe(&self, event_type: &str, consumer: EventConsumer);
+}
+
+fn _assert_object_safe_event_subscriber(_: &dyn EventSubscriber) {}
 
 /// The per-user audience for a `LibraryChanged` push.
 ///

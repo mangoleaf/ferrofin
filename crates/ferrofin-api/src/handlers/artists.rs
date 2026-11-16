@@ -46,8 +46,10 @@ async fn get_artists(
     query.check_min_community_rating()?;
     let user = resolve_user_or_api_key(&state, &auth, query.user_id).await?;
     // `GetParentItem`: an id naming no item is a 400.
-    query.parent(&state, &auth, user.as_deref()).await?;
-    let internal = query.artists_query(&state, user.clone()).await?;
+    let parent = query.parent(&state, &auth, user.as_deref()).await?;
+    let internal = query
+        .artists_query(&state, user.clone(), parent.as_ref())
+        .await?;
     let result = state.library.get_artists(&internal).await?;
     let options = query.dto_options(query.enable_user_data);
     let projected = project_query_result(
@@ -80,8 +82,10 @@ async fn get_album_artists(
     query.check_min_community_rating()?;
     let user = resolve_user_or_api_key(&state, &auth, query.user_id).await?;
     // `GetParentItem`: an id naming no item is a 400.
-    query.parent(&state, &auth, user.as_deref()).await?;
-    let internal = query.artists_query(&state, user.clone()).await?;
+    let parent = query.parent(&state, &auth, user.as_deref()).await?;
+    let internal = query
+        .artists_query(&state, user.clone(), parent.as_ref())
+        .await?;
     let result = state.library.get_album_artists(&internal).await?;
     let options = query.dto_options(query.enable_user_data);
     let projected = project_query_result(

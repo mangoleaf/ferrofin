@@ -4,12 +4,15 @@
 //! Ports the `ProviderManager` (implements the `ferrofin-traits` trait), the
 //! provider framework, the ffprobe-backed media-info provider, and local NFO
 //! metadata. The remote providers (TMDB/TVDB/OMDb/fanart/MusicBrainz/AudioDb/
-//! Studio Images) are compiled in unconditionally and gated at runtime by the
-//! per-library fetcher checkboxes, using shared keys where required.
+//! Studio Images/OpenSubtitles/LrcLib) are compiled in unconditionally and
+//! gated at runtime by the per-library fetcher checkboxes, using shared keys
+//! where required.
 
 pub mod audiodb;
 pub mod books;
+pub mod box_set_xml;
 pub mod builtin_plugins;
+pub mod cached_media_segment_provider;
 pub mod chapter_names;
 pub mod container_types;
 pub mod destination;
@@ -18,6 +21,7 @@ pub mod error;
 pub mod external_ids;
 pub mod fanart;
 mod guarded_http;
+mod http_client;
 mod image_download;
 pub mod image_policy;
 pub mod image_save;
@@ -25,7 +29,8 @@ pub mod library_options;
 pub mod listenbrainz;
 pub mod local_images;
 pub mod local_xml;
-#[cfg(feature = "lrclib")]
+#[cfg(test)]
+mod log_capture;
 pub mod lrclib;
 pub mod mediainfo;
 pub mod metadata_merge;
@@ -35,7 +40,6 @@ mod mock_http;
 pub mod musicbrainz;
 pub mod nfo_save;
 pub mod omdb;
-#[cfg(feature = "opensubtitles")]
 pub mod opensubtitles;
 pub mod playlist_file;
 pub mod plugin_config;
@@ -63,10 +67,7 @@ pub use playlist_file::{
     decode_playlist, is_playlist_file, playlist_xml_path, read_playlist_file, write_playlist_file,
 };
 
-#[cfg(feature = "lrclib")]
 pub use lrclib::{LrcLibConfig, LrcLibProvider};
-
-#[cfg(feature = "opensubtitles")]
 pub use opensubtitles::{OpenSubtitlesConfig, OpenSubtitlesProvider};
 
 pub use audiodb::{AudioDbAlbum, AudioDbArtist, AudioDbClient};

@@ -128,6 +128,8 @@ with `?` (Debug escapes it), never as the message.
 ## 7. Panics must be visible
 
 The panic hook installed in `init_tracing` logs every panic through `tracing` before
-delegating to the previous hook. **Never remove it "temporarily."** Spawned tasks that
+delegating to the previous hook, and records where it happened
+(`ferrofin_util::panic::record_location`) for a scheduled task's `LongErrorMessage`.
+**Never remove it "temporarily."** Spawned tasks that
 can panic must surface it — check the `JoinHandle` or wrap the future body so a panic
 logs `error!` with the `task` field instead of vanishing into a dead handle.

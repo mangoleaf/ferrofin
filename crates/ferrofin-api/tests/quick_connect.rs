@@ -13,7 +13,7 @@ use ferrofin_api::create_router;
 use ferrofin_api::state::AppState;
 use ferrofin_api::test_support::{
     FakeAuthContext, FakeDto, FakeLibrary, FakeMediaSources, FakeMusic, FakeProviders, FakeSearch,
-    FakeSimilarItems, FakeSystem, FakeUserData, FakeUserViews,
+    FakeSimilarItems, FakeSystem, FakeUserData, FakeUserViews, FixedAuth, fake_user_entity,
 };
 use ferrofin_db::entities::security::DeviceEntity;
 use ferrofin_db::entities::users::UserEntity;
@@ -28,7 +28,7 @@ use ferrofin_model::users::UserPolicy;
 use ferrofin_traits::configuration::ServerConfigurationManager;
 use ferrofin_traits::error::ServiceError;
 use ferrofin_traits::library::UserManager;
-use ferrofin_traits::net::{AuthService, RequestContext};
+use ferrofin_traits::net::AuthService;
 use ferrofin_traits::options::AuthorizationInfo;
 use ferrofin_traits::security::QuickConnect;
 use ferrofin_traits::session::{AuthenticationRequest, AuthenticationResultData, SessionManager};
@@ -43,74 +43,20 @@ const BOB_ID: Uuid = Uuid::from_u128(0x0B0B);
 /// Builds a neutral [`UserEntity`] with the given id + name (no `Default`).
 fn user_entity(id: Uuid, username: &str, password: Option<&str>) -> UserEntity {
     UserEntity {
-        id: id.to_string(),
-        audio_language_preference: None,
-        authentication_provider_id: String::new(),
-        cast_receiver_id: None,
-        display_collections_view: false,
-        display_missing_episodes: false,
-        enable_auto_login: false,
-        enable_local_password: false,
-        enable_next_episode_auto_play: false,
-        enable_user_preference_access: false,
-        hide_played_in_latest: false,
-        internal_id: 0,
-        invalid_login_attempt_count: 0,
-        last_activity_date: None,
-        last_login_date: None,
-        login_attempts_before_lockout: None,
-        max_active_sessions: 0,
-        max_parental_rating_score: None,
-        max_parental_rating_sub_score: None,
-        must_update_password: false,
         password: password.map(ToOwned::to_owned),
-        password_reset_provider_id: String::new(),
-        play_default_audio_track: false,
-        remember_audio_selections: false,
-        remember_subtitle_selections: false,
-        remote_client_bitrate_limit: None,
-        row_version: 0,
-        subtitle_language_preference: None,
-        subtitle_mode: 0,
-        sync_play_access: 0,
-        username: username.to_owned(),
-        normalized_username: username.to_uppercase(),
+        ..fake_user_entity(id, username)
     }
 }
 
 /// An [`AuthService`] authenticating as the admin user (so `RequireAuth` passes).
-struct AdminAuth;
-
-#[async_trait]
-impl AuthService for AdminAuth {
-    async fn authenticate(
-        &self,
-        _request: &RequestContext,
-    ) -> Result<AuthorizationInfo, ServiceError> {
-        Ok(AuthorizationInfo {
-            user: Some(Arc::new(user_entity(ADMIN_ID, "admin", Some("hash")))),
-            is_authenticated: true,
-            ..AuthorizationInfo::default()
-        })
-    }
+fn admin_auth() -> FixedAuth {
+    FixedAuth::signed_in(user_entity(ADMIN_ID, "admin", Some("hash")))
 }
 
 /// An [`AuthService`] authenticating as `bob`, an ordinary (non-administrator)
 /// account — the caller that must be refused another user's id.
-struct BobAuth;
-
-#[async_trait]
-impl AuthService for BobAuth {
-    async fn authenticate(
-        &self,
-        _request: &RequestContext,
-    ) -> Result<AuthorizationInfo, ServiceError> {
-        Ok(AuthorizationInfo {
-            user: Some(Arc::new(user_entity(BOB_ID, "bob", None))),
-            is_authenticated: true,
-            ..AuthorizationInfo::default()
-        })
-    }
+fn bob_auth() -> FixedAuth {
+    FixedAuth::signed_in(user_entity(BOB_ID, "bob", None))
 }
 
 /// A [`UserManager`] backed by an in-memory table, recording password/policy
@@ -123,6 +69,8 @@ struct MemUsers {
     updated_policy: Mutex<Option<(Uuid, UserPolicy)>>,
     /// Records whether `delete_user` was called and for whom.
     deleted: Mutex<Option<Uuid>>,
+    /// Makes `get_user_dto` fail, as a database read error does.
+    unreadable: bool,
 }
 
 /// The fixed two-user table shared by [`MemUsers`] and the assertions.
@@ -195,6 +143,9 @@ impl UserManager for MemUsers {
         user: &UserEntity,
         server_id: Option<String>,
     ) -> Result<UserDto, ServiceError> {
+        if self.unreadable {
+            return Err(ServiceError::backend("disk"));
+        }
         // The admin user reports IsAdministrator; everyone else does not.
         let is_admin = user.id == ADMIN_ID.to_string();
         Ok(UserDto {
@@ -278,6 +229,8 @@ impl ServerConfigurationManager for MemConfig {
 struct OkQuickConnect {
     /// The user id the last `authorize_request` was made for.
     authorized_for: Mutex<Option<Uuid>>,
+    /// The stored session's user, when not the admin.
+    session_user: Option<Uuid>,
 }
 
 #[async_trait]
@@ -310,10 +263,18 @@ impl QuickConnect for OkQuickConnect {
         &self,
         _secret: &str,
     ) -> Result<AuthenticationResultData, ServiceError> {
+        // The authorize-time snapshot, answered only when `User` cannot be
+        // built at the exchange.
         Ok(AuthenticationResultData {
+            user: UserDto {
+                id: self.session_user.unwrap_or(ADMIN_ID),
+                name: Some("stale".to_owned()),
+                ..UserDto::default()
+            },
             session: SessionInfoDto {
-                user_id: ADMIN_ID,
+                user_id: self.session_user.unwrap_or(ADMIN_ID),
                 user_name: Some("admin".to_owned()),
+                server_id: Some("server-1".to_owned()),
                 ..SessionInfoDto::default()
             },
             access_token: "qc-token".into(),
@@ -336,13 +297,6 @@ impl SessionManager for NoopSessions {
         _remote_endpoint: &str,
         _user: Option<&UserEntity>,
     ) -> Result<SessionInfoDto, ServiceError> {
-        unimplemented!("fake")
-    }
-    async fn update_device_name(
-        &self,
-        _session_id: &str,
-        _reported_device_name: &str,
-    ) -> Result<(), ServiceError> {
         unimplemented!("fake")
     }
     async fn on_playback_start(&self, _info: &PlaybackStartInfo) -> Result<(), ServiceError> {
@@ -506,7 +460,7 @@ fn state(users: Arc<MemUsers>, config: Arc<MemConfig>) -> AppState {
     state_full(
         users,
         config,
-        Arc::new(AdminAuth),
+        Arc::new(admin_auth()),
         Arc::new(OkQuickConnect::default()),
     )
 }
@@ -646,7 +600,7 @@ async fn quick_connect_authorize_cross_user_as_non_admin_is_forbidden() {
     let router = create_router(state_full(
         Arc::new(MemUsers::default()),
         Arc::new(MemConfig::new(true)),
-        Arc::new(BobAuth),
+        Arc::new(bob_auth()),
         qc.clone(),
     ));
     let response = router
@@ -676,7 +630,7 @@ async fn quick_connect_authorize_cross_user_as_admin_is_allowed() {
     let router = create_router(state_full(
         Arc::new(MemUsers::default()),
         Arc::new(MemConfig::new(true)),
-        Arc::new(AdminAuth),
+        Arc::new(admin_auth()),
         qc.clone(),
     ));
     let response = router
@@ -704,7 +658,7 @@ async fn quick_connect_authorize_self_as_non_admin_is_allowed() {
     let router = create_router(state_full(
         Arc::new(MemUsers::default()),
         Arc::new(MemConfig::new(true)),
-        Arc::new(BobAuth),
+        Arc::new(bob_auth()),
         qc.clone(),
     ));
     let response = router
@@ -750,6 +704,52 @@ async fn authenticate_with_quick_connect_returns_the_authorized_session() {
     let body = body_json(response).await;
     assert_eq!(body["AccessToken"], "qc-token");
     assert_eq!(body["SessionInfo"]["UserName"], "admin");
+    // `User` is built at the exchange, from the user as they are now, not the
+    // authorize-time snapshot upstream answers (Jellyfin bug not ported).
+    assert_eq!(body["User"]["Name"], "admin");
+    assert_eq!(body["User"]["Policy"]["IsAdministrator"], true);
+}
+
+/// A user deleted after their code was authorized, or whose DTO cannot be
+/// read, still gets the token minted then, with the `User` snapshotted at
+/// authorization: the one upstream always answers, here only when the user
+/// cannot be built at the exchange.
+#[rstest::rstest]
+#[case::deleted(Uuid::from_u128(0xdead), false)]
+#[case::unreadable(ADMIN_ID, true)]
+#[tokio::test]
+async fn quick_connect_exchange_that_cannot_build_the_user_answers_the_snapshot(
+    #[case] session_user: Uuid,
+    #[case] unreadable: bool,
+) {
+    let router = create_router(state_full(
+        Arc::new(MemUsers {
+            unreadable,
+            ..MemUsers::default()
+        }),
+        Arc::new(MemConfig::new(true)),
+        Arc::new(admin_auth()),
+        Arc::new(OkQuickConnect {
+            session_user: Some(session_user),
+            ..OkQuickConnect::default()
+        }),
+    ));
+    let response = router
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/Users/AuthenticateWithQuickConnect")
+                .header("Content-Type", "application/json")
+                .body(Body::from(r#"{"Secret":"sec"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let json = body_json(response).await;
+    assert_eq!(json["AccessToken"], "qc-token");
+    assert_eq!(json["User"]["Id"], session_user.simple().to_string());
+    assert_eq!(json["User"]["Name"], "stale");
 }
 
 /// `QuickConnectDto.Secret` is `[Required]`: a missing, `null` or blank secret

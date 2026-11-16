@@ -30,7 +30,10 @@ use ferrofin_model::dto::{MediaSourceInfo, MediaSourceType};
 use ferrofin_model::entities::VideoType;
 use ferrofin_traits::error::ServiceError;
 use ferrofin_traits::persistence::ItemRepository;
+use ferrofin_util::string_extensions::{to_upper_invariant, to_upper_ordinal};
 use uuid::Uuid;
+
+pub use ferrofin_db::item_data::preferred_primary_version;
 
 /// The delimiters a version label is cut at (`BaseItem.VersionDelimiters`,
 /// `BaseItem.cs:95`).
@@ -229,8 +232,26 @@ impl VersionRowReader for DbVersionReader<'_> {
     }
 }
 
+tokio::task_local! {
+    /// The groups [`VersionRows::load`] read in the current
+    /// [`reading_groups_once`] scope, by the ids of the rows it was given.
+    static READ_GROUPS: std::cell::RefCell<HashMap<Vec<Uuid>, VersionRows>>;
+}
+
+/// Runs `work` so that a [`VersionRows::load`] inside it of the same rows as
+/// an earlier one reuses that load's result instead of reading again.
+///
+/// A `NowPlayingItem` build runs in one, so its media-source lookup and its
+/// DTO build read the item's group once: the two are a moment apart, and
+/// upstream reads both from the in-memory item. A hit is keyed by row ids
+/// alone, so wrap only work whose loads see the same rows; a task spawned
+/// inside does not inherit the scope and reads as usual.
+pub(crate) async fn reading_groups_once<F: std::future::Future>(work: F) -> F::Output {
+    READ_GROUPS.scope(std::cell::RefCell::default(), work).await
+}
+
 /// Every row the version groups of a set of queried items reach, read once.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct VersionRows {
     /// The rows by id (a queried item another queried item's group reaches
     /// is copied in too).
@@ -257,12 +278,32 @@ impl VersionRows {
     ///    grouped item), and what a merge left pointing at a version a scan
     ///    later grouped under another primary.
     ///
-    /// Each row is read once, so a chain that loops ends.
+    /// Each row is read once, so a chain that loops ends. Inside a
+    /// `reading_groups_once` scope, the same rows as an earlier load in it
+    /// take that load's result.
     ///
     /// # Errors
     ///
     /// [`ServiceError`] when a read fails.
     pub async fn load(
+        reader: &dyn VersionRowReader,
+        queried: &[&BaseItemEntity],
+    ) -> Result<Self, ServiceError> {
+        let Ok(key) =
+            READ_GROUPS.try_with(|_| queried.iter().map(|row| row_id(row)).collect::<Vec<Uuid>>())
+        else {
+            return Self::read(reader, queried).await;
+        };
+        if let Ok(Some(read)) = READ_GROUPS.try_with(|groups| groups.borrow().get(&key).cloned()) {
+            return Ok(read);
+        }
+        let out = Self::read(reader, queried).await?;
+        let _ = READ_GROUPS.try_with(|groups| groups.borrow_mut().insert(key, out.clone()));
+        Ok(out)
+    }
+
+    /// [`Self::load`]'s reads.
+    async fn read(
         reader: &dyn VersionRowReader,
         queried: &[&BaseItemEntity],
     ) -> Result<Self, ServiceError> {
@@ -858,18 +899,13 @@ fn containing_folder_name(video: &BaseItemEntity) -> String {
         .unwrap_or_default()
 }
 
-/// .NET `char.ToUpperInvariant` for the simple one-to-one mappings.
-fn upper(c: char) -> char {
-    let mut up = c.to_uppercase();
-    match (up.next(), up.next()) {
-        (Some(u), None) => u,
-        _ => c,
-    }
-}
-
 /// `text.StartsWith(prefix, StringComparison.OrdinalIgnoreCase)`, on chars.
 fn starts_with_ignore_case(text: &[char], prefix: &[char]) -> bool {
-    text.len() >= prefix.len() && text.iter().zip(prefix).all(|(a, b)| upper(*a) == upper(*b))
+    text.len() >= prefix.len()
+        && text
+            .iter()
+            .zip(prefix)
+            .all(|(a, b)| to_upper_ordinal(*a) == to_upper_ordinal(*b))
 }
 
 /// The label left after `prefix`: `displayName.AsSpan(prefix.Length)
@@ -975,26 +1011,6 @@ fn disc_terms(format: crate::item_data::VideoFormat) -> Vec<&'static str> {
     terms
 }
 
-/// The index of the item a merge makes primary when none of `items` already
-/// has versions: 3D and disc (not `VideoType::VideoFile`) videos after plain
-/// files, then the widest, the first of equals — the fallback of
-/// `VideosController.MergeVersions` (`VideosController.cs:204-217`) and of
-/// the MergeVersions plugin. The item's `Width` column stands in for its
-/// default video stream's width. `0` for an empty slice.
-#[must_use]
-pub fn preferred_primary_version(items: &[BaseItemEntity]) -> usize {
-    items
-        .iter()
-        .enumerate()
-        .min_by_key(|(_, item)| {
-            let format = crate::item_data::video_format(item.data.as_deref());
-            let demoted = format.video3d_format.is_some()
-                || format.video_type != ferrofin_model::entities::VideoType::VideoFile;
-            (demoted, std::cmp::Reverse(item.width.unwrap_or(0)))
-        })
-        .map_or(0, |(index, _)| index)
-}
-
 /// The prefix the media source items' file names share, or `None` when
 /// fewer than two of them are files or they share none — port of
 /// `BaseItem.GetCommonNamePrefix` (`BaseItem.cs:1386-1405`).
@@ -1035,7 +1051,7 @@ pub fn common_version_prefix(file_names: &[&str]) -> String {
         let common = prefix
             .iter()
             .zip(name)
-            .take_while(|(a, b)| upper(**a) == upper(**b))
+            .take_while(|(a, b)| to_upper_invariant(**a) == to_upper_invariant(**b))
             .count();
         prefix.truncate(common);
     }

@@ -21,7 +21,7 @@ fn is_exempt(rel: &str) -> bool {
         || rel.ends_with("/adoption_repairs.rs")
         || rel.ends_with("/item_count_service.rs")
         || rel.ends_with("/user_data_manager.rs")
-        // The BaseItems.Data source-of-truth sync — persistence is its job.
+        // The BaseItems.Data write-through sync — persistence is its job.
         || rel.ends_with("/item_data.rs")
 }
 
@@ -51,7 +51,7 @@ const CEILINGS: &[(&str, usize)] = &[
     ("crates/ferrofin-core/src/scheduled_tasks/maintenance.rs", 4),
     ("crates/ferrofin-core/src/session_manager.rs", 1),
     ("crates/ferrofin-core/src/session_manager/tests.rs", 5),
-    ("crates/ferrofin-core/src/subtitle_manager.rs", 3),
+    ("crates/ferrofin-core/src/subtitle_manager.rs", 1),
     ("crates/ferrofin-core/src/test_support.rs", 8),
     ("crates/ferrofin-core/src/trickplay_manager.rs", 7),
     ("crates/ferrofin-core/src/user_entity_ext.rs", 11),

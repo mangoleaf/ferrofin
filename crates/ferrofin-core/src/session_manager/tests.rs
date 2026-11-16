@@ -797,6 +797,10 @@ async fn authenticate_new_session_enforces_password_and_returns_the_token() {
         !result.access_token.expose().is_empty(),
         "authenticate_new_session returns a non-empty token"
     );
+    // `User` is the signed-in user's DTO, carrying this login's stamp.
+    assert_eq!(result.user.id, user_id);
+    assert_eq!(result.user.name.as_deref(), Some("bob"));
+    assert!(result.user.last_login_date.is_some());
 
     let persisted: String =
         sqlx::query_scalar(r#"SELECT "AccessToken" FROM "Devices" WHERE "DeviceId" = ?1"#)
@@ -1095,6 +1099,37 @@ async fn an_admin_push_reaches_the_sessions_holding_an_administrator() {
     );
     assert_eq!(socket.sent_count(), 1, "an additional administrator counts");
     assert!(viewer_pushes.lock().unwrap().is_empty());
+}
+
+/// `RecordingNotifier.SendMessage` sends to the users `HasPermission` says
+/// hold `EnableLiveTvAccess` (gl-1746): the permission itself, so an
+/// administrator without it gets nothing and a user with it gets the push.
+#[tokio::test]
+async fn a_permission_push_reaches_only_the_users_holding_it() {
+    let db = test_db().await;
+    db.enable_row_cache(ferrofin_db::row_cache::ROW_CACHE_TTL);
+    let (mgr, bus) = cast_manager(&db);
+    let admin = seed_named_user(&db, Uuid::new_v4(), "admin").await;
+    let viewer = seed_named_user(&db, Uuid::new_v4(), "viewer").await;
+    let (_, admin_pushes) = cast_target(&mgr, bus.as_ref(), &admin, "admin").await;
+    let (_, viewer_pushes) = cast_target(&mgr, bus.as_ref(), &viewer, "viewer").await;
+    for (user, kind, value) in [
+        (&admin, PermissionKind::IsAdministrator, true),
+        (&admin, PermissionKind::EnableLiveTvAccess, false),
+        (&viewer, PermissionKind::EnableLiveTvAccess, true),
+    ] {
+        set_permission(&db, &user.id, kind, value).await.unwrap();
+    }
+
+    mgr.send_message_to_sessions_with_permission(
+        PermissionKind::EnableLiveTvAccess,
+        SessionMessageType::TimerCreated,
+        "{}",
+    )
+    .await
+    .unwrap();
+    assert!(admin_pushes.lock().unwrap().is_empty());
+    assert_eq!(viewer_pushes.lock().unwrap().len(), 1);
 }
 
 /// A scan pushes RefreshProgress once a second per library (gl-1312): the push
@@ -2728,14 +2763,6 @@ impl ferrofin_traits::library::MusicManager for CannedMix {
                 ..BaseItemEntity::default()
             })
             .collect())
-    }
-    async fn get_instant_mix_from_artist(
-        &self,
-        _artist_id: Uuid,
-        _user_id: Option<Uuid>,
-        _dto_options: &DtoOptions,
-    ) -> Result<Vec<BaseItemEntity>, ServiceError> {
-        Ok(Vec::new())
     }
     async fn get_instant_mix_from_genres(
         &self,

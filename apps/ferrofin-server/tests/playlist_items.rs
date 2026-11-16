@@ -3,7 +3,8 @@
 //! router, database and playlist manager: containers expand into their
 //! tracks or episodes, unknown ids and kinds that cannot be added are dropped,
 //! a create infers and persists the playlist's media type, everything a
-//! create writes commits together, and a create or lookup needs a user.
+//! create writes commits together, and a create or lookup needs a user. Also
+//! `GET /Years` under a playlist or a box set, whose members are linked entries.
 use axum::{
     body::Body,
     http::{Request, StatusCode, header},
@@ -659,6 +660,51 @@ async fn an_add_keeps_to_what_its_user_may_see() {
     );
 }
 
+/// A reader the admin creates with `rule` merged into the default policy.
+async fn reader(fx: &Fixture, name: &str, rule: &serde_json::Value) -> Fixture {
+    let (status, user) = fx
+        .call(
+            "POST",
+            "/Users/New",
+            Some(json!({"Name": name, "Password": "pw"})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{user}");
+    let mut policy = user["Policy"].clone();
+    for (key, value) in rule.as_object().unwrap() {
+        policy[key] = value.clone();
+    }
+    let (status, body) = fx
+        .call(
+            "POST",
+            &format!("/Users/{}/Policy", user["Id"].as_str().unwrap()),
+            Some(policy),
+        )
+        .await;
+    assert!(status.is_success(), "{status} {body}");
+    Fixture {
+        token: fx.login(name, "pw").await,
+        ..fx.clone()
+    }
+}
+
+/// `GET /Playlists/{playlist}/Items{query}` as `reader`, as
+/// `"<total> from <start>: <names>"`.
+async fn listing(reader: &Fixture, playlist: &str, query: &str) -> String {
+    let (status, body) = reader
+        .call("GET", &format!("/Playlists/{playlist}/Items{query}"), None)
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let names: Vec<&str> = body["Items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|item| item["Name"].as_str().unwrap())
+        .collect();
+    let (total, start) = (&body["TotalRecordCount"], &body["StartIndex"]);
+    format!("{total} from {start}: {}", names.join(" "))
+}
+
 /// `GET /Playlists/{id}/Items` lists what its reader may open, repeats and
 /// all, and pages that list (`GetManageableItems().Where(IsVisible)` before
 /// `Skip`/`Take`); `GET /Playlists/{id}` names every entry, whoever reads it.
@@ -682,73 +728,87 @@ async fn a_listing_keeps_to_what_its_reader_may_see_before_the_paging() {
     ];
     assert_eq!(fx.stored(&id).await, all);
 
-    let mut readers = Vec::new();
-    for (name, rule) in [
-        ("kid", json!({"MaxParentalRating": 13})),
-        (
-            "guest",
-            json!({"EnableAllFolders": false, "EnabledFolders": []}),
-        ),
-    ] {
-        let (status, user) = fx
-            .call(
-                "POST",
-                "/Users/New",
-                Some(json!({"Name": name, "Password": "pw"})),
-            )
-            .await;
-        assert_eq!(status, StatusCode::OK, "{user}");
-        let mut policy = user["Policy"].clone();
-        for (key, value) in rule.as_object().unwrap() {
-            policy[key] = value.clone();
-        }
-        let (status, body) = fx
-            .call(
-                "POST",
-                &format!("/Users/{}/Policy", user["Id"].as_str().unwrap()),
-                Some(policy),
-            )
-            .await;
-        assert!(status.is_success(), "{status} {body}");
-        readers.push(Fixture {
-            token: fx.login(name, "pw").await,
-            ..fx.clone()
-        });
-    }
-    let page = async |reader: &Fixture, query: &str| {
-        let (status, body) = reader
-            .call("GET", &format!("/Playlists/{id}/Items{query}"), None)
-            .await;
-        assert_eq!(status, StatusCode::OK, "{body}");
-        let names: Vec<&str> = body["Items"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|item| item["Name"].as_str().unwrap())
-            .collect();
-        let (total, start) = (&body["TotalRecordCount"], &body["StartIndex"]);
-        format!("{total} from {start}: {}", names.join(" "))
-    };
+    let kid = reader(&fx, "kid", &json!({"MaxParentalRating": 13})).await;
+    let guest = reader(
+        &fx,
+        "guest",
+        &json!({"EnableAllFolders": false, "EnabledFolders": []}),
+    )
+    .await;
     let item_ids = async |reader: &Fixture| {
         let (status, body) = reader.call("GET", &format!("/Playlists/{id}"), None).await;
         assert_eq!(status, StatusCode::OK, "{body}");
         body["ItemIds"].as_array().unwrap().len()
     };
 
-    let [kid, guest] = [&readers[0], &readers[1]];
-    assert_eq!(page(&fx, "").await, format!("8 from 0: {}", all.join(" ")));
     assert_eq!(
-        page(kid, "").await,
+        listing(&fx, &id, "").await,
+        format!("8 from 0: {}", all.join(" "))
+    );
+    assert_eq!(
+        listing(&kid, &id, "").await,
         "7 from 0: Zulu Alpha Zulu Alpha Beta Zulu Alpha"
     );
     assert_eq!(
-        page(kid, "?startIndex=3&limit=3").await,
+        listing(&kid, &id, "?startIndex=3&limit=3").await,
         "7 from 3: Alpha Beta Zulu"
     );
-    assert_eq!(page(guest, "?limit=2").await, "0 from 0: ");
-    for reader in [&fx, kid, guest] {
+    assert_eq!(listing(&guest, &id, "?limit=2").await, "0 from 0: ");
+    for reader in [&fx, &kid, &guest] {
         assert_eq!(item_ids(reader).await, all.len());
     }
+}
+
+/// A hidden member ahead of the visible ones, and repeated between them, takes
+/// all its entries out of the listing and leaves the others pointing at their
+/// own rows (the read holds each member's row once, gl-1523).
+#[tokio::test]
+async fn a_hidden_member_ahead_of_the_others_leaves_their_entries_intact() {
+    let fx = fixture().await;
+    let music = seed_music(&fx).await;
+    let (status, created) = fx
+        .call(
+            "POST",
+            "/Playlists",
+            Some(json!({"Name": "Band", "Ids": [music.artist]})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{created}");
+    let band = created["Id"].as_str().unwrap().to_owned();
+    let (status, listed) = fx
+        .call("GET", &format!("/Playlists/{band}/Items"), None)
+        .await;
+    assert_eq!(status, StatusCode::OK, "{listed}");
+    let track = |name: &str| {
+        listed["Items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|item| item["Name"] == name)
+            .unwrap()["Id"]
+            .clone()
+    };
+    let ids = ["Omega", "Zulu", "Omega", "Alpha", "Beta"].map(track);
+    let (status, created) = fx
+        .call(
+            "POST",
+            "/Playlists",
+            Some(json!({"Name": "Omega first", "Ids": ids})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{created}");
+    let id = created["Id"].as_str().unwrap().to_owned();
+
+    let kid = reader(&fx, "kid", &json!({"MaxParentalRating": 13})).await;
+    assert_eq!(
+        listing(&fx, &id, "").await,
+        "5 from 0: Omega Zulu Omega Alpha Beta"
+    );
+    assert_eq!(listing(&kid, &id, "").await, "3 from 0: Zulu Alpha Beta");
+    assert_eq!(
+        listing(&kid, &id, "?startIndex=1&limit=1").await,
+        "3 from 1: Alpha"
+    );
 }
 
 /// A create naming no media type takes it from the first item that answers:
@@ -770,6 +830,114 @@ async fn a_created_playlist_takes_its_media_type_from_its_items() {
     let (status, item) = fx.call("GET", &format!("/Items/{id}"), None).await;
     assert_eq!(status, StatusCode::OK, "{item}");
     assert_eq!(item["MediaType"], "Video", "{item}");
+}
+
+/// Saves a folder named `name` under `parent` (the library when `None`).
+async fn seed_folder(fx: &Fixture, name: &str, parent: Option<Uuid>) -> Uuid {
+    let mut folder = row(
+        "MediaBrowser.Controller.Entities.Folder",
+        name,
+        &name.to_lowercase(),
+    );
+    folder.is_folder = true;
+    folder.parent_id = parent.map(guid_to_db);
+    fx.seed(folder, parent.as_slice()).await
+}
+
+/// Saves a playable item of `type_` and `media_type` under `ancestors`
+/// (nearest first), its sort name `name` as given.
+async fn seed_member(fx: &Fixture, type_: &str, media_type: &str, name: &str, ancestors: &[Uuid]) {
+    let mut member = row(type_, name, name);
+    member.media_type = Some(media_type.to_owned());
+    member.parent_id = ancestors.first().copied().map(guid_to_db);
+    fx.seed(member, ancestors).await;
+}
+
+const VIDEO_TYPE: &str = "MediaBrowser.Controller.Entities.Video";
+const AUDIO_TYPE: &str = "MediaBrowser.Controller.Entities.Audio.Audio";
+
+/// The `MediaType` of a playlist `POST /Playlists` creates from `ids` alone.
+async fn created_media_type(fx: &Fixture, ids: &[Uuid]) -> String {
+    let (status, created) = fx
+        .call(
+            "POST",
+            "/Playlists",
+            Some(json!({"Name": "Inferred", "Ids": ids})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{created}");
+    let (status, item) = fx
+        .call(
+            "GET",
+            &format!("/Items/{}", created["Id"].as_str().unwrap()),
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{item}");
+    item["MediaType"].as_str().unwrap().to_owned()
+}
+
+/// gl-588: a folder answers with its first playable member in tree order
+/// (`GetRecursiveChildren` → `AddChildrenToList`, `PlaylistManager.cs:109-114`):
+/// each level in sort-name order, a subfolder walked where it is met. In
+/// `Mixed` the subfolder `aardvark` sorts ahead of the song beside it, so its
+/// clip decides, though the song sorts ahead of the clip among all the
+/// folder's members; Jellyfin 12.4 types the same tree `Video`. In `Mixed
+/// too` the song sorts ahead of the subfolder, so it decides: files are not
+/// taken after folders, nor folders first.
+#[tokio::test]
+async fn a_folder_answers_with_its_first_member_in_tree_order() {
+    let fx = fixture().await;
+    let mixed = seed_folder(&fx, "Mixed", None).await;
+    let sub = seed_folder(&fx, "Aardvark", Some(mixed)).await;
+    seed_member(&fx, VIDEO_TYPE, "Video", "xray clip", &[sub, mixed]).await;
+    seed_member(&fx, AUDIO_TYPE, "Audio", "bravo song", &[mixed]).await;
+    assert_eq!(created_media_type(&fx, &[mixed]).await, "Video");
+
+    let mixed_too = seed_folder(&fx, "Mixed too", None).await;
+    let sub = seed_folder(&fx, "Zulu", Some(mixed_too)).await;
+    seed_member(&fx, VIDEO_TYPE, "Video", "bravo clip", &[sub, mixed_too]).await;
+    seed_member(&fx, AUDIO_TYPE, "Audio", "alpha song", &[mixed_too]).await;
+    assert_eq!(created_media_type(&fx, &[mixed_too]).await, "Audio");
+}
+
+/// gl-588: a box set answers with its first linked member that is no folder,
+/// in link order (not name order), never looking inside a linked folder. A
+/// box set whose members are all folders answers with the first member of
+/// its flat listing, a clip: Jellyfin 12.4 types that playlist `Audio`, though
+/// every entry is a clip (Jellyfin bug not ported).
+#[tokio::test]
+async fn a_box_set_answers_with_its_linked_members_then_its_listing() {
+    let fx = fixture().await;
+    let clips = seed_folder(&fx, "Clips", None).await;
+    seed_member(&fx, VIDEO_TYPE, "Video", "alpha clip", &[clips]).await;
+    seed_member(&fx, AUDIO_TYPE, "Audio", "zulu song", &[]).await;
+    seed_member(&fx, AUDIO_TYPE, "Audio", "yankee song", &[]).await;
+    seed_member(&fx, VIDEO_TYPE, "Video", "able clip", &[]).await;
+    let song = id_of(&fx, "zulu song").await;
+    let (yankee, able) = (
+        id_of(&fx, "yankee song").await,
+        id_of(&fx, "able clip").await,
+    );
+    let mut box_sets = Vec::new();
+    for (name, ids) in [
+        ("Mixed", format!("{clips},{song}")),
+        ("Only clips", clips.to_string()),
+        ("Linked order", format!("{yankee},{able}")),
+    ] {
+        let (status, created) = fx
+            .call(
+                "POST",
+                &format!("/Collections?name={}&ids={ids}", name.replace(' ', "%20")),
+                None,
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{created}");
+        box_sets.push(created["Id"].as_str().unwrap().parse::<Uuid>().unwrap());
+    }
+    assert_eq!(created_media_type(&fx, &[box_sets[0]]).await, "Audio");
+    assert_eq!(created_media_type(&fx, &[box_sets[1]]).await, "Video");
+    assert_eq!(created_media_type(&fx, &[box_sets[2]]).await, "Audio");
 }
 
 /// The obsolete query form names the media type too, in any case, and wins
@@ -990,4 +1158,280 @@ async fn an_api_key_without_a_user_cannot_create_or_look_up_a_playlist() {
     .await;
     assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
     assert_eq!(fx.stored(&id).await, ["Alpha"]);
+}
+
+/// The id of the one row named `name`.
+async fn id_of(fx: &Fixture, name: &str) -> Uuid {
+    let id: String = sqlx::query_scalar(r#"SELECT "Id" FROM "BaseItems" WHERE "Name" = ?1"#)
+        .bind(name)
+        .fetch_one(fx.db.pool())
+        .await
+        .unwrap();
+    id.parse().unwrap()
+}
+
+/// Stores `ids` as `playlist`'s entries, one each, appended after
+/// `keep` of the stored ones.
+async fn store_entries(fx: &Fixture, playlist: &str, keep: i64, ids: &[Uuid]) {
+    let playlist = guid_to_db(playlist.parse().unwrap());
+    sqlx::query(r#"DELETE FROM "LinkedChildren" WHERE "ParentId" = ?1 AND "SortOrder" >= ?2"#)
+        .bind(&playlist)
+        .bind(keep)
+        .execute(fx.db.writer())
+        .await
+        .unwrap();
+    for (at, id) in (keep..).zip(ids) {
+        sqlx::query(
+            r#"INSERT INTO "LinkedChildren" ("ParentId", "SortOrder", "ChildId", "ChildType")
+               VALUES (?1, ?2, ?3, 0)"#,
+        )
+        .bind(&playlist)
+        .bind(at)
+        .bind(guid_to_db(*id))
+        .execute(fx.db.writer())
+        .await
+        .unwrap();
+    }
+}
+
+/// `playlist`'s stored `MediaType` and `Data.PlaylistMediaType`.
+async fn media_types(fx: &Fixture, playlist: &str) -> (Option<String>, Option<String>) {
+    sqlx::query_as(
+        r#"SELECT "MediaType", json_extract("Data", '$.PlaylistMediaType')
+           FROM "BaseItems" WHERE "Id" = ?1"#,
+    )
+    .bind(guid_to_db(playlist.parse().unwrap()))
+    .fetch_one(fx.db.pool())
+    .await
+    .unwrap()
+}
+
+/// What Ferrofin before 1.4.0 left for a playlist created with `ids` (gl-6):
+/// one entry per id, containers included, and no media type, on a database
+/// that never ran the repair.
+async fn make_legacy(fx: &Fixture, playlist: &str, ids: &[Uuid]) {
+    store_entries(fx, playlist, 0, ids).await;
+    sqlx::query(
+        r#"UPDATE "BaseItems" SET "MediaType" = NULL,
+               "Data" = json_remove("Data", '$.PlaylistMediaType')
+           WHERE "Id" = ?1"#,
+    )
+    .bind(guid_to_db(playlist.parse().unwrap()))
+    .execute(fx.db.writer())
+    .await
+    .unwrap();
+    sqlx::query(r#"DELETE FROM "FerrofinMeta" WHERE "Key" = 'playlist_containers_expanded_v1'"#)
+        .execute(fx.db.writer())
+        .await
+        .unwrap();
+}
+
+/// gl-583: the next start brings a playlist Ferrofin before 1.4.0 saved to
+/// what a create or add stores (`Playlist.GetPlaylistItems`,
+/// `CreatePlaylist`): each container entry is replaced, in place, by what its
+/// owner may see of it, an entry whose container gives the owner nothing
+/// stays, and the playlist takes the media type its entries give. The file
+/// is snapshotted first, a playlist file is left alone, and the start after
+/// that changes nothing.
+#[tokio::test]
+async fn a_start_expands_the_containers_an_older_ferrofin_stored() {
+    let fx = fixture().await;
+    let music = seed_music(&fx).await;
+    let show = seed_show(&fx).await;
+    let (beta, compilation) = (id_of(&fx, "Beta").await, id_of(&fx, "Compilation").await);
+
+    // A kid's playlist: the R-rated Omega is all of "Compilation", and the
+    // kid may not see it.
+    let (status, kid) = fx
+        .call(
+            "POST",
+            "/Users/New",
+            Some(json!({"Name": "kid", "Password": "kid-pw"})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{kid}");
+    let mut policy = kid["Policy"].clone();
+    policy["MaxParentalRating"] = json!(13);
+    let (status, body) = fx
+        .call(
+            "POST",
+            &format!("/Users/{}/Policy", kid["Id"].as_str().unwrap()),
+            Some(policy),
+        )
+        .await;
+    assert!(status.is_success(), "{status} {body}");
+    let kid = Fixture {
+        token: fx.login("kid", "kid-pw").await,
+        ..fx.clone()
+    };
+    let (status, created) = kid
+        .call("POST", "/Playlists", Some(json!({"Name": "Kid's"})))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{created}");
+    let kids = created["Id"].as_str().unwrap().to_owned();
+    make_legacy(&fx, &kids, &[beta, music.album, show.series, compilation]).await;
+    // The admin's, from a season: a video playlist.
+    let (status, created) = fx
+        .call("POST", "/Playlists", Some(json!({"Name": "Admin's"})))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{created}");
+    let admins = created["Id"].as_str().unwrap().to_owned();
+    make_legacy(&fx, &admins, &[show.season]).await;
+    // A playlist file's entries are its file's.
+    let list = fx.temp.path().join("media/list.m3u");
+    std::fs::write(&list, "").unwrap();
+    let mut file = row(PLAYLIST_TYPE, "List", "list");
+    file.is_folder = true;
+    file.path = Some(list.display().to_string());
+    let file = fx.seed(file, &[]).await.to_string();
+    make_legacy(&fx, &file, &[music.album]).await;
+
+    let snapshot = fx
+        .temp
+        .path()
+        .join("data/ferrofin.db.pre-playlist-containers");
+    assert!(!snapshot.exists());
+    let _ = fx.restart().await;
+    assert_eq!(
+        fx.stored(&kids).await,
+        ["Beta", "Zulu", "Alpha", "Pilot", "Arrival", "Compilation"]
+    );
+    assert_eq!(fx.stored(&admins).await, ["Pilot", "Arrival"]);
+    assert_eq!(fx.stored(&file).await, ["Record"]);
+    let audio = (Some("Audio".to_owned()), Some("Audio".to_owned()));
+    let video = (Some("Video".to_owned()), Some("Video".to_owned()));
+    assert_eq!(media_types(&fx, &kids).await, audio);
+    assert_eq!(media_types(&fx, &admins).await, video);
+    assert_eq!(media_types(&fx, &file).await, (None, None));
+    let (status, item) = fx.call("GET", &format!("/Items/{admins}"), None).await;
+    assert_eq!(status, StatusCode::OK, "{item}");
+    assert_eq!(item["MediaType"], "Video", "{item}");
+    assert!(snapshot.exists(), "{} was not written", snapshot.display());
+
+    // Once: the next start leaves what is there, even an entry stored since.
+    store_entries(&fx, &admins, 2, &[music.album]).await;
+    let _ = fx.restart().await;
+    assert_eq!(fx.stored(&admins).await, ["Pilot", "Arrival", "Record"]);
+}
+
+/// gl-583: `GET /Years` under a playlist reads, for a user, the years of its
+/// playable entries (`Playlist.GetPlayableItems`: no folder entry, and
+/// nothing under one). With an API key and no user, a recursive walk takes
+/// every entry and what is under it, and a non-recursive one nothing (a
+/// playlist has no `Children`). `GET /Items?parentId=` lists the folder entry:
+/// `Folder.GetItemsInternal` reaches no `Playlist` override. Measured the same
+/// on a stock Jellyfin 12.4.
+#[tokio::test]
+async fn a_playlists_years_are_those_of_its_playable_entries() {
+    let fx = fixture().await;
+    seed_music(&fx).await;
+    for (name, year) in [
+        ("Record", 2001),
+        ("Zulu", 2001),
+        ("Alpha", 2001),
+        ("Zed", 1999),
+        ("Beta", 1999),
+    ] {
+        sqlx::query(r#"UPDATE "BaseItems" SET "ProductionYear" = ?2 WHERE "Name" = ?1"#)
+            .bind(name)
+            .bind(year)
+            .execute(fx.db.writer())
+            .await
+            .unwrap();
+    }
+    let zulu = id_of(&fx, "Zulu").await;
+    let (status, created) = fx
+        .call(
+            "POST",
+            "/Playlists",
+            Some(json!({"Name": "Mix", "Ids": [zulu]})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{created}");
+    let id = created["Id"].as_str().unwrap().to_owned();
+    store_entries(&fx, &id, 1, &[id_of(&fx, "Zed").await]).await;
+    let key = api_key(&fx).await;
+
+    for (token, query, expected) in [
+        (&fx.token, "", vec!["2001"]),
+        (&fx.token, "&recursive=false", vec!["2001"]),
+        (&key, "", vec!["1999", "2001"]),
+        (&key, "&recursive=false", vec![]),
+    ] {
+        let path = format!("/Years?parentId={id}{query}");
+        assert_eq!(names(&fx, token, &path).await, expected, "{path}");
+    }
+    let path = format!("/Items?parentId={id}");
+    assert_eq!(names(&fx, &fx.token, &path).await, ["Zulu", "Zed"]);
+}
+
+/// gl-1700: a box set's members are its `LinkedChildren`, and it has no
+/// `Children` unless it is a legacy one (`BoxSet.LoadChildren`). So with an
+/// API key and no user, a non-recursive `GET /Years` under it answers
+/// nothing, while a recursive walk and a user's walk take its members' years.
+/// A legacy box set's own children (`ParentId` = the box set) still count.
+/// Measured the same on a stock Jellyfin 12.4.
+#[tokio::test]
+async fn a_box_sets_years_without_a_user_are_those_of_its_own_children() {
+    let fx = fixture().await;
+    seed_music(&fx).await;
+    sqlx::query(r#"UPDATE "BaseItems" SET "ProductionYear" = 2001 WHERE "Name" = 'Zulu'"#)
+        .execute(fx.db.writer())
+        .await
+        .unwrap();
+    let zulu = id_of(&fx, "Zulu").await;
+    let (status, created) = fx
+        .call("POST", &format!("/Collections?name=Box&ids={zulu}"), None)
+        .await;
+    assert_eq!(status, StatusCode::OK, "{created}");
+    let id = created["Id"].as_str().unwrap().to_owned();
+    // A box set from a library folder (`IsLegacyBoxSet`: a path outside the
+    // data directory, no linked members) and the track inside it.
+    let mut legacy = row(
+        "MediaBrowser.Controller.Entities.Movies.BoxSet",
+        "Legacy",
+        "legacy",
+    );
+    legacy.is_folder = true;
+    legacy.path = Some(fx.temp.path().join("media/Legacy").display().to_string());
+    let legacy = fx.seed(legacy, &[]).await;
+    let mut kept = row(AUDIO_TYPE, "Kept", "kept");
+    kept.media_type = Some("Audio".to_owned());
+    kept.parent_id = Some(guid_to_db(legacy));
+    kept.production_year = Some(1999);
+    fx.seed(kept, &[legacy]).await;
+    let key = api_key(&fx).await;
+
+    for (token, parent, query, expected) in [
+        (&fx.token, &id, "", vec!["2001"]),
+        (&fx.token, &id, "&recursive=false", vec!["2001"]),
+        (&key, &id, "", vec!["2001"]),
+        (&key, &id, "&recursive=false", vec![]),
+        (&key, &legacy.to_string(), "&recursive=false", vec!["1999"]),
+    ] {
+        let path = format!("/Years?parentId={parent}{query}");
+        assert_eq!(names(&fx, token, &path).await, expected, "{path}");
+    }
+}
+
+/// A new API key, which acts for no user.
+async fn api_key(fx: &Fixture) -> String {
+    let (status, _) = fx
+        .call("POST", "/Auth/Keys?app=playlist-items-test", None)
+        .await;
+    assert!(status.is_success());
+    let (_, keys) = fx.call("GET", "/Auth/Keys", None).await;
+    keys["Items"][0]["AccessToken"].as_str().unwrap().to_owned()
+}
+
+/// The `Name` of each item `GET path` lists for `token`.
+async fn names(fx: &Fixture, token: &str, path: &str) -> Vec<String> {
+    let (status, body) = call(&fx.router, token, "GET", path, None).await;
+    assert_eq!(status, StatusCode::OK, "{path}: {body}");
+    body["Items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|item| item["Name"].as_str().unwrap().to_owned())
+        .collect()
 }

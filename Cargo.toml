@@ -95,10 +95,11 @@ axum = "0.8"
 tower = "0.5"
 tower-http = { version = "0.7.1", features = ["fs", "trace", "cors", "compression-gzip", "compression-br"] }
 httpdate = "1.0.3"
-# Decoders for the response-compression tests only (the server never decodes a
-# response it just encoded). Streaming readers validate the wire response.
+# zlib/gzip: the response-compression tests' decoders (the server never decodes
+# a response it just encoded), gzipped Live TV guides (ferrofin-livetv), and a
+# PDF's compressed cross-reference and object streams (ferrofin-providers books).
 flate2 = "1.1.11"
-zip = { version = "9", default-features = false, features = ["deflate"] }   # .cbz/.epub archives (ferrofin-providers books); backup archives (ferrofin-api, which adds `time`)
+zip = { version = "9", default-features = false, features = ["deflate"] }   # .cbz/.epub archives (ferrofin-providers books); backup archives (ferrofin-core, which adds `time`)
 tar = { version = "0.4.46", default-features = false }   # .cbt comic covers (ferrofin-providers books); read-only, so no `xattr`
 sevenz-rust2 = { version = "0.25.0", default-features = false, features = ["bzip2", "deflate", "ppmd"] }   # .cb7 comic covers (ferrofin-providers books)
 brotli = "9.1.1"
@@ -155,7 +156,11 @@ tikv-jemallocator = { version = "0.7", features = ["unprefixed_malloc_on_support
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 tracing-appender = "0.2"
-reqwest = { version = "0.13.5", default-features = false, features = ["json", "rustls", "stream", "query"] }
+# gzip, brotli and deflate: every client offers and decodes them, as every
+# `HttpClient` upstream's factory makes does (`AutomaticDecompression =
+# DecompressionMethods.All`, Startup.cs); a client upstream builds itself
+# without one opts out (`no_gzip()` …).
+reqwest = { version = "0.13.5", default-features = false, features = ["json", "rustls", "stream", "query", "gzip", "brotli", "deflate"] }
 # The HTTPS listener (server only): rustls with the aws-lc-rs provider reqwest
 # already builds, and Jellyfin's PKCS#12 (`.pfx`) certificates, read with both
 # the modern (PBES2) and the legacy (PBES1, `pbes1`) encryptions.
@@ -219,12 +224,13 @@ uuid = { version = "1.29.2", features = ["v4", "serde"] }
 url = "2.5.8"
 chrono = { version = "0.4", features = ["serde"] }
 unicode-normalization = "0.1.26"
-rand = "0.10.3"           # ShuffleExtensions (ferrofin-util `shuffle`), password salts (ferrofin-common)
+rand = "0.10.3"           # ShuffleExtensions (ferrofin-util `shuffle`), password salts (ferrofin-common), QuickConnect secrets (ferrofin-core)
 # Legacy text encodings (subtitles, playlist files) — C# `UtfUnknown`.
 encoding_rs = "0.8.44"
 chardetng = "1.0.0"
 shlex = "2"              # ffmpeg command strings → argv (ferrofin-mediaencoding `split_args`)
 async-trait = "0.1.92"
+dunce = "1.0.5"            # canonical paths without Windows' `\\?\` prefix (ferrofin-core storage probe)
 libc = "0.2"
 windows-sys = { version = "0.61.2", features = [
     "Win32_Foundation",
@@ -258,8 +264,8 @@ percent-encoding = "2.3.2"
 # Base64 with .NET's rules (`Base64.IsValid`, `Convert.FromBase64String`) for
 # LDAP-Auth's profile images. Already in the lock file as a transitive dependency.
 base64 = "0.23.1"
-# CLDR root collation — the port of .NET `StringComparison.InvariantCulture`
-# used by the Live TV name sort. ICU4X 2.x is already in the tree (icu_normalizer
+# CLDR root collation — the port of .NET's invariant and current-culture string
+# comparers (name sorts, search). ICU4X 2.x is already in the tree (icu_normalizer
 # via idna), so this shares icu_collections/icu_provider/zerovec.
 icu_collator = "2.4.0"
 icu_casemap = "2.4.0"

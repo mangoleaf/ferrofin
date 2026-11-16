@@ -48,10 +48,11 @@ use uuid::Uuid;
 use crate::auth::RequireAuth;
 use crate::error::{ApiError, ProblemStatus};
 use crate::extract::{
-    DotnetGuid, JsonBody, Query, RequiredRouteString, RouteParameter, blank_route_values,
+    DotnetGuid, JsonBody, ProblemDetails, Query, RequiredRouteString, RouteParameter,
+    blank_route_values,
 };
 use crate::handlers::items::effective_user_id;
-use crate::handlers::query_parse::parse_csv_uuids;
+use crate::handlers::query_parse::{parse_csv_strings, parse_csv_uuids};
 use crate::state::AppState;
 
 /// Gates an edit action: owner or a `CanEdit` share passes, anything else is the
@@ -283,32 +284,49 @@ async fn get_playlist_items(
         state.users.get_user_by_id(calling_user_id).await?
     };
 
-    let mut items = state
+    let mut members = state
         .playlists
         .get_playlist_items(playlist_id, calling_user_id)
         .await?;
     // `GetManageableItems().Where(i => i.Item2.IsVisible(user))`: a member
     // the caller may not see is out of the page and the count, checked on the
-    // rows just read. Divergence (gl-1092): the standalone check, which also
-    // walks the member's library, where upstream's `IsVisible` reads only its
-    // rating and tags, so a member from a library the caller was not granted
-    // is dropped too.
+    // rows just read, once per distinct member. Divergence (gl-1092): the
+    // standalone check, which also walks the member's library, where
+    // upstream's `IsVisible` reads only its rating and tags, so a member from
+    // a library the caller was not granted is dropped too.
     if let Some(user) = &user {
-        items = state
+        let ids: Vec<String> = members.items.iter().map(|row| row.id.clone()).collect();
+        let visible = state
             .library
-            .filter_visible_items_standalone(items, user)
+            .filter_visible_items_standalone(std::mem::take(&mut members.items), user)
             .await?;
+        // The filter only drops rows, so with none dropped the entries stand.
+        if visible.len() != ids.len() {
+            let at: std::collections::HashMap<&str, usize> = visible
+                .iter()
+                .enumerate()
+                .map(|(index, row)| (row.id.as_str(), index))
+                .collect();
+            members.entries = members
+                .entries
+                .iter()
+                .filter_map(|&index| at.get(ids.get(index)?.as_str()).copied())
+                .collect();
+        }
+        members.items = visible;
     }
-    let total = i32::try_from(items.len()).unwrap_or(i32::MAX);
+    let total = i32::try_from(members.entries.len()).unwrap_or(i32::MAX);
 
     // LINQ's `Skip` skips nothing for a negative index and `Take` takes
     // nothing for a negative limit.
+    let entries = &mut members.entries;
     if let Some(start) = query.start_index {
-        items.drain(..usize::try_from(start).unwrap_or(0).min(items.len()));
+        entries.drain(..usize::try_from(start).unwrap_or(0).min(entries.len()));
     }
     if let Some(limit) = query.limit {
-        items.truncate(usize::try_from(limit).unwrap_or(0));
+        entries.truncate(usize::try_from(limit).unwrap_or(0));
     }
+    let items = members.into_entry_rows();
 
     // Built from the CLIENT's parameters, matching C# (v12.4 dropped
     // `.AddClientFields(User)` here):
@@ -454,17 +472,7 @@ async fn remove_item_from_playlist(
                 .await?,
         )?;
     }
-    let entry_ids: Vec<String> = query
-        .entry_ids
-        .as_deref()
-        .map(|raw| {
-            raw.split(',')
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .map(ToOwned::to_owned)
-                .collect()
-        })
-        .unwrap_or_default();
+    let entry_ids = parse_csv_strings(query.entry_ids.as_deref());
     // C# `catch (ArgumentException) { return NotFound(); }`: the manager's
     // "no such playlist" is a bare `404` here, which is how an API key, past
     // no gate above, hears that the id names no playlist.
@@ -634,6 +642,11 @@ async fn get_playlist_user(
 /// Port of `PlaylistsController.UpdatePlaylistUser`: **owner-only** (`403` for
 /// any other caller); a missing/invisible playlist is `404`. The upsert persists
 /// to the `PlaylistShares` table.
+///
+/// The body is `[FromBody(EmptyBodyBehavior = EmptyBodyBehavior.Allow),
+/// Required]`: an empty body whatever the content type, or `null` with a JSON
+/// one, binds null, and `[Required]` refuses it before the action runs, so it
+/// is a `400` ahead of the `404` and the `403`.
 #[utoipa::path(
     post,
     path = "/Playlists/{playlistId}/Users/{userId}",
@@ -644,6 +657,7 @@ async fn get_playlist_user(
     ),
     responses(
         (status = 204, description = "User's permissions modified"),
+        (status = 400, description = "No body, one that does not bind, or a nil user id"),
         (status = 403, description = "Access forbidden"),
         (status = 404, description = "Playlist not found")
     ),
@@ -654,8 +668,16 @@ async fn update_playlist_user(
     RequireAuth(auth): RequireAuth,
     Path((DotnetGuid(playlist_id), DotnetGuid(user_id))): Path<(DotnetGuid, DotnetGuid)>,
     body: Option<JsonBody<UpdatePlaylistUserDto>>,
-) -> Result<StatusCode, ApiError> {
-    let body = body.map(|JsonBody(b)| b).unwrap_or_default();
+) -> Result<Response, ApiError> {
+    // The one `[Required]` body upstream binds with `EmptyBodyBehavior.Allow`,
+    // so its entry is spelled here, not looked up in `query/body.json`.
+    let Some(JsonBody(body)) = body else {
+        return Ok(ProblemDetails::validation(
+            "",
+            "The updatePlaylistUserRequest field is required.",
+        )
+        .into_response());
+    };
     let access = state
         .playlists
         .get_playlist_access(playlist_id, auth.user_id())
@@ -671,7 +693,7 @@ async fn update_playlist_user(
         can_edit: body.can_edit,
     };
     state.playlists.add_user_to_shares(&request).await?;
-    Ok(StatusCode::NO_CONTENT)
+    Ok(StatusCode::NO_CONTENT.into_response())
 }
 
 /// `DELETE /Playlists/{playlistId}/Users/{userId}` — revokes a user's share.

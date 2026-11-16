@@ -14,12 +14,13 @@ use uuid::Uuid;
 use ferrofin_model::data::BaseItemKind;
 use ferrofin_model::media_segments::{MediaSegmentDto, MediaSegmentType};
 use ferrofin_providers::destination::{
-    DestinationRefused, PublicOnlyResolver, environment_proxy, is_private_address,
+    DestinationRefused, PublicOnlyResolver, VettedAddresses, environment_proxy, is_private_address,
 };
 use ferrofin_traits::library::LibraryManager;
 use ferrofin_traits::media_segments::MediaSegmentManager;
 use ferrofin_traits::options::InternalItemsQuery;
 use ferrofin_util::file_helper::FileStamp;
+use ferrofin_util::ticks::TICKS_PER_SECOND_F64;
 
 use crate::bindings::types::{HttpRequest, HttpResponse, ItemQuery, ItemSummary, MediaSegment};
 
@@ -146,8 +147,8 @@ impl EgressPolicy {
 /// plugin and every call, so connections are pooled and no call spawns a
 /// client runtime of its own.
 ///
-/// Both clients refuse redirects (any destination policy would be bypassed
-/// by a 302; a guest can follow `Location` itself) and present the plugin
+/// Every client refuses redirects (any destination policy would be bypassed
+/// by a 302; a guest can follow `Location` itself) and presents the plugin
 /// user agent. They differ in how a hostname is resolved:
 /// - `open` resolves as the system does and honours an environment proxy.
 ///   It serves plugins the admin granted private-network access
@@ -162,8 +163,11 @@ impl EgressPolicy {
 ///
 /// A proxy resolves the destination itself, out of the resolver's sight. So
 /// when the environment configures one (`environment_proxy`), a hostname
-/// fetch under the policy is vetted before it is sent and goes through a
-/// one-off client pinned to the vetted address, as before this type existed.
+/// fetch under the policy is vetted before it is sent, and goes through a
+/// third client, `proxied`, whose resolver ([`VettedAddresses`], the image
+/// downloads' too) answers the name with every address just vetted for it:
+/// where a host the proxy settings exclude is reached. Any other name, the
+/// proxy's own, resolves as the system does.
 ///
 /// MUST be built on a blocking thread: `reqwest::blocking::Client`
 /// construction (and drop) panics inside an async runtime context.
@@ -171,11 +175,16 @@ impl EgressPolicy {
 pub struct GuestHttp {
     open: reqwest::blocking::Client,
     vetted: reqwest::blocking::Client,
-    environment_proxy: bool,
+    /// Built only when the environment configures a proxy.
+    proxied: Option<reqwest::blocking::Client>,
+    /// The proxied client's resolver.
+    pinned: Arc<VettedAddresses>,
+    /// The address test both the vetted resolver and the proxied path refuse on.
+    refused: fn(std::net::IpAddr) -> bool,
 }
 
 impl GuestHttp {
-    /// Builds the two clients, each bounded by `call_timeout` unless a
+    /// Builds the clients, each bounded by `call_timeout` unless a
     /// request sets its own.
     ///
     /// # Errors
@@ -189,9 +198,10 @@ impl GuestHttp {
         )
     }
 
-    /// [`new`](Self::new) with the address test the vetted client refuses
-    /// on and whether a proxy is configured, so a test can point the client
-    /// at a loopback server or take the proxied path.
+    /// [`new`](Self::new) with the address test the vetted client and the
+    /// proxied path's vet refuse on, and whether a proxy is configured, so a
+    /// test can point the clients at a loopback server or take the proxied
+    /// path.
     fn with_policy(
         call_timeout: std::time::Duration,
         refused: fn(std::net::IpAddr) -> bool,
@@ -201,12 +211,24 @@ impl GuestHttp {
             builder
                 .timeout(call_timeout)
                 .redirect(reqwest::redirect::Policy::none())
+                // The guest gets the body as sent: nothing decoded for it.
+                .no_gzip()
+                .no_brotli()
+                .no_deflate()
                 .user_agent(format!(
                     "ferrofin-wasm/{}",
                     ferrofin_health::RELEASE_VERSION
                 ))
                 .build()
                 .map_err(|e| format!("building the guest http client: {e}"))
+        };
+        let pinned = Arc::new(VettedAddresses::default());
+        let proxied = if environment_proxy {
+            Some(build(
+                reqwest::blocking::Client::builder().dns_resolver(Arc::clone(&pinned)),
+            )?)
+        } else {
+            None
         };
         Ok(Self {
             open: build(reqwest::blocking::Client::builder())?,
@@ -215,51 +237,36 @@ impl GuestHttp {
                     .no_proxy()
                     .dns_resolver(Arc::new(PublicOnlyResolver::new(Arc::new(refused)))),
             )?,
-            environment_proxy,
+            proxied,
+            pinned,
+            refused,
         })
     }
 }
 
 /// Enforces the private-destination policy for one hostname before a
 /// proxied request: every address the host resolves to must be public.
-/// Returns the vetted address for the caller to pin the connection to.
-fn check_destination(url: &reqwest::Url, plugin_name: &str) -> Result<std::net::IpAddr, String> {
+/// Returns them all for the caller to pin the connection to.
+fn check_destination(
+    url: &reqwest::Url,
+    plugin_name: &str,
+    refused: fn(std::net::IpAddr) -> bool,
+) -> Result<Vec<std::net::SocketAddr>, String> {
     let host = url.host_str().ok_or("url has no host")?;
     let port = url.port_or_known_default().unwrap_or(443);
     // shortcut: this lookup is bounded by the system resolver, not by the
     // guest call's deadline (http-fetch's request is); resolve under the
     // deadline if a slow resolver behind a proxy ever trips the watchdog.
-    let addrs: Vec<std::net::IpAddr> = std::net::ToSocketAddrs::to_socket_addrs(&(host, port))
+    let addrs: Vec<std::net::SocketAddr> = std::net::ToSocketAddrs::to_socket_addrs(&(host, port))
         .map_err(|e| format!("could not resolve `{host}`: {e}"))?
-        .map(|sa| sa.ip())
         .collect();
     if addrs.is_empty() {
         return Err(format!("`{host}` resolved to no addresses"));
     }
-    if let Some(private) = addrs.iter().find(|a| is_private_address(**a)) {
-        return Err(private_destination(host, *private, plugin_name));
+    if let Some(private) = addrs.iter().find(|a| refused(a.ip())) {
+        return Err(private_destination(host, private.ip(), plugin_name));
     }
-    Ok(addrs[0])
-}
-
-/// A one-off client whose connections to `host` go to `vetted`: the
-/// proxied path's DNS-rebinding pin, for hosts the proxy settings exclude.
-fn pinned_client(
-    call_timeout: std::time::Duration,
-    host: &str,
-    vetted: std::net::IpAddr,
-) -> Result<reqwest::blocking::Client, String> {
-    reqwest::blocking::Client::builder()
-        .timeout(call_timeout)
-        .redirect(reqwest::redirect::Policy::none())
-        .user_agent(format!(
-            "ferrofin-wasm/{}",
-            ferrofin_health::RELEASE_VERSION
-        ))
-        // Port 0 = "keep the URL's port"; only the address pins.
-        .resolve(host, std::net::SocketAddr::new(vetted, 0))
-        .build()
-        .map_err(|e| format!("building pinned http client: {e}"))
+    Ok(addrs)
 }
 
 /// The guest-visible refusal of a private destination: the address class
@@ -274,7 +281,13 @@ fn private_destination(host: &str, address: std::net::IpAddr, plugin_name: &str)
 
 /// The guest-visible text for a failed request: the resolver's refusal when
 /// the vetted client refused the destination, the transport error otherwise.
+/// A lookup that failed for a name other than the request's, which can only
+/// be the proxy's own, is the server's business: the transport error.
 fn request_failure(error: &reqwest::Error, plugin_name: &str) -> String {
+    let requested = error
+        .url()
+        .and_then(reqwest::Url::host_str)
+        .unwrap_or_default();
     let mut cause: Option<&(dyn std::error::Error + 'static)> = Some(error);
     while let Some(current) = cause {
         if let Some(refusal) = current.downcast_ref::<DestinationRefused>() {
@@ -282,7 +295,13 @@ fn request_failure(error: &reqwest::Error, plugin_name: &str) -> String {
                 DestinationRefused::Private { host, address } => {
                     private_destination(host, *address, plugin_name)
                 }
-                other => other.to_string(),
+                DestinationRefused::Unresolvable { host: name, .. }
+                | DestinationRefused::Empty { host: name }
+                    if name.eq_ignore_ascii_case(requested) =>
+                {
+                    refusal.to_string()
+                }
+                _ => break,
             };
         }
         cause = current.source();
@@ -347,15 +366,14 @@ pub fn http_fetch(
     {
         return Err(private_destination(host, literal, plugin_name));
     }
-    let pinned = if !private_http_allowed && literal.is_none() && http.environment_proxy {
-        let vetted = check_destination(&url, plugin_name)?;
-        Some(pinned_client(call_timeout, host, vetted)?)
-    } else {
-        None
-    };
-    let client = match &pinned {
-        Some(pinned) => pinned,
-        None if private_http_allowed || http.environment_proxy => &http.open,
+    let client = match &http.proxied {
+        Some(proxied) if !private_http_allowed && literal.is_none() => {
+            let vetted = check_destination(&url, plugin_name, http.refused)?;
+            http.pinned.pin(host, &vetted);
+            proxied
+        }
+        Some(_) => &http.open,
+        None if private_http_allowed => &http.open,
         None => &http.vetted,
     };
     let method: reqwest::Method = request
@@ -562,7 +580,7 @@ pub(crate) fn summarize(
     ItemSummary {
         id: Uuid::parse_str(&e.id).map_or_else(|_| e.id.clone(), |u| u.to_string()),
         name: e.name.clone().unwrap_or_default(),
-        kind: ferrofin_core::item_type_lookup::kind_from_type_name(&e.type_)
+        kind: ferrofin_model::data::BaseItemKind::from_stored_type_name(&e.type_)
             .map_or_else(|| e.type_.clone(), |k| format!("{k:?}")),
         path: e.path.clone(),
         parent_id: e
@@ -768,7 +786,7 @@ fn write_media_segments_using_provider(
                 return Ok(SegmentWriteOutcome::PolicySkipped);
             }
             Some(std::sync::Arc::new(
-                ferrofin_core::CachedMediaSegmentProvider::new(
+                ferrofin_providers::cached_media_segment_provider::CachedMediaSegmentProvider::new(
                     provider_name.to_owned(),
                     id,
                     std::sync::Arc::clone(&cx.plugins),
@@ -817,8 +835,6 @@ const AUDIO_WINDOW_MAX_SECS: f64 = 60.0;
 const FRAMES_PER_CALL_MAX: usize = 16;
 /// Longest output edge for a sampled frame, in pixels.
 const FRAME_DIMENSION_MAX: u32 = 320;
-/// Ticks per second (Jellyfin's 100 ns unit).
-const TICKS_PER_SEC: f64 = 10_000_000.0;
 
 /// Resolves a guest-named library item to its filesystem path — the ONLY
 /// way media bytes are ever addressed (a guest never supplies paths).
@@ -903,7 +919,7 @@ pub fn extract_audio(
     memory_limit_bytes: usize,
     window: &crate::bindings::types::AudioWindow,
 ) -> Result<crate::bindings::types::AudioChunk, String> {
-    let duration_secs = window.duration_ticks as f64 / TICKS_PER_SEC;
+    let duration_secs = window.duration_ticks as f64 / TICKS_PER_SECOND_F64;
     if !(0.0..=AUDIO_WINDOW_MAX_SECS).contains(&duration_secs) || duration_secs == 0.0 {
         return Err(format!(
             "audio window must be 0..{AUDIO_WINDOW_MAX_SECS} seconds (got {duration_secs:.1})"
@@ -924,7 +940,7 @@ pub fn extract_audio(
         ));
     }
     let path = resolve_media_path(cx, deadline, &window.item_id)?;
-    let start_secs = (window.start_ticks.max(0)) as f64 / TICKS_PER_SEC;
+    let start_secs = (window.start_ticks.max(0)) as f64 / TICKS_PER_SECOND_F64;
     let samples = block_on_until(cx, deadline, async {
         let _permit = cx.analysis.acquire().await;
         cx.extractor
@@ -969,7 +985,7 @@ pub fn extract_frames(
     let timestamps: Vec<f64> = request
         .timestamps_ticks
         .iter()
-        .map(|t| (*t).max(0) as f64 / TICKS_PER_SEC)
+        .map(|t| (*t).max(0) as f64 / TICKS_PER_SECOND_F64)
         .collect();
     let frames = block_on_until(cx, deadline, async {
         let _permit = cx.analysis.acquire().await;
@@ -981,7 +997,7 @@ pub fn extract_frames(
     Ok(frames
         .into_iter()
         .map(|f| crate::bindings::types::VideoFrame {
-            ticks: (f.seconds * TICKS_PER_SEC) as i64,
+            ticks: (f.seconds * TICKS_PER_SECOND_F64) as i64,
             width: f.width,
             height: f.height,
             format: if f.jpeg {
@@ -1315,8 +1331,10 @@ fn parse_uuid(what: &str, raw: &str) -> Result<Uuid, String> {
         .map_err(|_| format!("{what} `{raw}` is not a valid UUID"))
 }
 
-/// Executes `set-user-data` — the strongest write a plugin has; logged
-/// per call with the plugin named (see the WIT trust note).
+/// Executes `set-user-data` — the strongest write a plugin has; logged at
+/// debug with the plugin named, and counted in the guest call's info line
+/// ([`HostState::log_user_data_writes`](crate::bindings::HostState::log_user_data_writes);
+/// see the WIT trust note).
 ///
 /// # Errors
 /// Invalid ids or a manager failure, as the guest-visible string.
@@ -1329,10 +1347,10 @@ pub fn set_user_data(
 ) -> Result<(), String> {
     let uid = parse_uuid("user-id", user_id)?;
     let iid = parse_uuid("item-id", item_id)?;
-    tracing::info!(
+    tracing::debug!(
         plugin = plugin_name,
-        user = %uid,
-        item = %iid,
+        user_id = %uid,
+        item_id = %iid,
         played = ?update.played,
         favorite = ?update.favorite,
         position = ?update.playback_position_ticks,
@@ -1518,11 +1536,41 @@ mod tests {
     use super::{EgressPolicy, GuestHttp, http_fetch};
     use crate::bindings::types::HttpRequest;
 
+    /// A listener on `127.0.0.1`, and a socket that holds the same port on
+    /// `::1` (gl-1522; `ferrofin-providers`' `mock_http::loopback_listener`).
+    /// Keep the socket as long as the listener.
+    ///
+    /// A client given `localhost` tries `::1` first. The held port is bound and
+    /// never listening, so it refuses that connection at once, and the client
+    /// goes on to `127.0.0.1`. A free port there could be another test
+    /// process's listener, or a host service that listens on IPv6 only, and
+    /// that one would get the request instead.
+    ///
+    /// The hold is exclusive only while its socket does not set
+    /// `SO_REUSEADDR`, which a `TcpSocket` does not. The socket is `None` on a
+    /// host with no IPv6 loopback, where no listener can take the port either.
+    fn loopback_listener() -> (std::net::TcpListener, Option<tokio::net::TcpSocket>) {
+        loop {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+            let port = listener.local_addr().expect("addr").port();
+            let Ok(held) = tokio::net::TcpSocket::new_v6() else {
+                return (listener, None);
+            };
+            match held.bind((std::net::Ipv6Addr::LOCALHOST, port).into()) {
+                Ok(()) => return (listener, Some(held)),
+                // Already taken on `::1`: take another port.
+                Err(error) if error.kind() == std::io::ErrorKind::AddrInUse => {}
+                Err(_) => return (listener, None),
+            }
+        }
+    }
+
     /// A loopback HTTP/1.1 server that keeps connections open and answers
-    /// every request `200 ok`. Returns its port and how many connections it
-    /// has accepted.
-    fn keep_alive_server() -> (u16, Arc<AtomicUsize>) {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    /// every request `200 ok`. Returns its port, how many connections it has
+    /// accepted, and its port's hold on `::1` ([`loopback_listener`]), which
+    /// the caller keeps while it fetches.
+    fn keep_alive_server() -> (u16, Arc<AtomicUsize>, Option<tokio::net::TcpSocket>) {
+        let (listener, ipv6) = loopback_listener();
         let port = listener.local_addr().expect("addr").port();
         let accepted = Arc::new(AtomicUsize::new(0));
         let counter = Arc::clone(&accepted);
@@ -1554,7 +1602,7 @@ mod tests {
                 });
             }
         });
-        (port, accepted)
+        (port, accepted, ipv6)
     }
 
     fn get(url: String) -> HttpRequest {
@@ -1573,7 +1621,7 @@ mod tests {
     /// the production path.
     #[test]
     fn vetted_fetches_to_one_host_share_a_connection() {
-        let (port, accepted) = keep_alive_server();
+        let (port, accepted, _ipv6) = keep_alive_server();
         let http =
             GuestHttp::with_policy(Duration::from_secs(5), |_| false, false).expect("clients");
         let egress = EgressPolicy::parse(&["localhost".to_owned()]);
@@ -1594,6 +1642,84 @@ mod tests {
             accepted.load(Ordering::SeqCst),
             1,
             "the second fetch reuses the first one's connection"
+        );
+    }
+
+    /// With a proxy configured, hostname fetches under the policy go through
+    /// one client too, so the second reuses the first's connection instead of
+    /// building a client per call; each is still vetted first. (No proxy is set
+    /// in the test's environment, so the client reaches the host directly, at
+    /// the addresses vetted for it, as for a host the proxy settings exclude.)
+    #[test]
+    fn proxied_fetches_to_one_host_share_a_connection() {
+        let (port, accepted, _ipv6) = keep_alive_server();
+        let http =
+            GuestHttp::with_policy(Duration::from_secs(5), |_| false, true).expect("clients");
+        let egress = EgressPolicy::parse(&["localhost".to_owned()]);
+        for path in ["first", "second"] {
+            let response = http_fetch(
+                &http,
+                "test-plugin",
+                1024,
+                false,
+                &egress,
+                Duration::from_secs(5),
+                &get(format!("http://localhost:{port}/{path}")),
+            )
+            .expect("fetch");
+            assert_eq!(response.body, b"ok");
+        }
+        assert_eq!(
+            accepted.load(Ordering::SeqCst),
+            1,
+            "the second fetch reuses the first one's connection"
+        );
+        // It went to the addresses vetted for the name, pinned without a port.
+        let vetted = http.pinned.pinned("localhost").expect("a pin for the name");
+        assert!(
+            vetted
+                .iter()
+                .all(|address| address.ip().is_loopback() && address.port() == 0),
+            "{vetted:?}"
+        );
+    }
+
+    /// The proxied client resolves a name through the host's pins: here one
+    /// the system cannot resolve, at the pinned address and the URL's port.
+    #[test]
+    fn the_proxied_client_resolves_a_name_at_its_pinned_addresses() {
+        let (port, accepted, _ipv6) = keep_alive_server();
+        let http =
+            GuestHttp::with_policy(Duration::from_secs(5), |_| false, true).expect("clients");
+        http.pinned
+            .pin("pinned.invalid", &["127.0.0.1:9".parse().expect("address")]);
+        let proxied = http.proxied.as_ref().expect("a proxied client");
+        let response = proxied
+            .get(format!("http://pinned.invalid:{port}/x"))
+            .send()
+            .expect("sent to the pin");
+        assert_eq!(response.text().expect("body"), "ok");
+        assert_eq!(accepted.load(Ordering::SeqCst), 1);
+    }
+
+    /// A proxy whose own name does not resolve fails the request with the
+    /// transport error: the proxy's name, which the guest never chose, is not
+    /// told to it.
+    #[test]
+    fn a_proxy_that_does_not_resolve_is_not_named_to_the_guest() {
+        let client = reqwest::blocking::Client::builder()
+            .proxy(reqwest::Proxy::all("http://proxy.invalid:3128").expect("proxy"))
+            .dns_resolver(Arc::new(super::VettedAddresses::default()))
+            .build()
+            .expect("client");
+        let error = client
+            .get("http://example.test/")
+            .send()
+            .expect_err("the proxy does not resolve");
+        let text = super::request_failure(&error, "test-plugin");
+        assert!(
+            text.starts_with("request failed:") && !text.contains("proxy.invalid"),
+            "{text}"
         );
     }
 
