@@ -2256,7 +2256,11 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
                    runs whatever the options), ApplySearchResult \
                    (ResolverGuesses::pin_search's name and year and search_result_ids for the \
                    lookup; a season or an episode keeps none of its own ids, \
-                   RefreshContext::identified), remote_sources and provider_order \
+                   RefreshContext::identified, and its providers resolve the series by the \
+                   chosen ids alone, ResolverGuesses::identified_series_ids: TheMovieDb's \
+                   season and episode, TheTVDB's season and episode and OMDb's episode \
+                   lookups, as SeriesProviderIds; its image providers read the series \
+                   itself), remote_sources and provider_order \
                    (GetMetadataProvidersInternal: MetadataFetcherOrder, then IHasOrder, then \
                    registration, the plugins' sources among them; the chosen result's provider \
                    first, a stable OrderBy) and the artwork chain by FetcherPolicy::image_order \
@@ -2291,10 +2295,6 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
              artist's result, its ids replacing the album's and its name and year the \
              album's, so the album is searched under the artist's name. Jellyfin bug not \
              ported.",
-            "A season or an episode below an identified series resolves the series by the \
-             ids that series' refresh settled; upstream narrows them to the chosen result's \
-             ids, so a provider whose id the result lacks answers nothing for the children \
-             until the next refresh. Fix path: gl-1771.",
             "A Default scan also runs the remote providers of an item the backfill \
              heuristics pick, merging their answers fill-only; upstream runs no remote \
              provider on an unchanged Default refresh. Kept by owner decision 2026-09-24 \

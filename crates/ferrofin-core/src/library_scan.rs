@@ -735,12 +735,47 @@ fn keeps_provider_ids(item: &Planned) -> bool {
 /// `BaseItemProviders` (a series' at scan start, any other item's with its
 /// stored-row window), or settled earlier in this scan.
 fn recorded_provider_id(cache: &ArtworkCache, id: &str, provider: &str) -> Option<i64> {
-    cache
-        .item_provider_ids
-        .get(id)?
-        .iter()
+    provider_id_in(cache.item_provider_ids.get(id)?, provider)
+}
+
+/// The numeric `provider` id among `ids`.
+fn provider_id_in(ids: &[(String, String)], provider: &str) -> Option<i64> {
+    ids.iter()
         .find(|(key, _)| key.eq_ignore_ascii_case(provider))
         .and_then(|(_, value)| value.trim().parse().ok())
+}
+
+/// The TMDB id a season's or an episode's TMDB provider resolves its series
+/// `series_id` by: under an Identify the chosen result's alone
+/// ([`ResolverGuesses::identified_series_ids`]), else the series' own
+/// ([`series_tmdb_id_of`]).
+fn lookup_series_tmdb_id(
+    cache: &ArtworkCache,
+    lookup: &ResolverGuesses,
+    series_id: &str,
+) -> Option<i64> {
+    lookup
+        .identified_series_ids()
+        .map_or_else(|| series_tmdb_id_of(cache, series_id), tmdb_id_in)
+}
+
+/// The TheTVDB id a season's or an episode's TVDB provider resolves its
+/// series `series_id` by: under an Identify the chosen result's alone
+/// ([`ResolverGuesses::identified_series_ids`]), else this scan's TVDB match,
+/// else the recorded one.
+fn lookup_series_tvdb_id(
+    cache: &ArtworkCache,
+    lookup: &ResolverGuesses,
+    series_id: &str,
+) -> Option<i64> {
+    match lookup.identified_series_ids() {
+        Some(ids) => provider_id_in(ids, "Tvdb"),
+        None => cache
+            .series_tvdb
+            .get(series_id)
+            .map(|d| d.tvdb_id)
+            .or_else(|| recorded_provider_id(cache, series_id, "Tvdb")),
+    }
 }
 
 /// Downloads each [`RemoteImage`] into `item_dir` (as `{type}` plus the
@@ -8205,10 +8240,10 @@ impl LibraryScanner {
         // "Identify → Apply" (`POST /Items/RemoteSearch/Apply`): the chosen
         // result rides on the options of the items the refresh covers.
         // `ApplySearchResult` (`MetadataService.cs:272-293`) hands a season or
-        // an episode the result's ids as its SERIES' ids and clears its own
-        // (here: its series, refreshed first in the same scan, resolves its
-        // lookups by them); every other kind is looked up by the result's
-        // ids, name and year. The result's ids replace the item's
+        // an episode the result's ids as its SERIES' ids and clears its own:
+        // its providers resolve the series by the chosen ids alone, not by
+        // what the series' refresh settled; every other kind is looked up by
+        // the result's ids, name and year. The result's ids replace the item's
         // (`item.SetProviderIds`, the controller's half) with this item's
         // save, so a refresh that fails leaves no half-applied ids.
         let search = options.search_result.as_ref();
@@ -8222,10 +8257,12 @@ impl LibraryScanner {
             item_type_lookup::kind_from_type_name(&entity.type_),
             Some(BaseItemKind::Episode | BaseItemKind::Season)
         );
-        if let Some(result) = search
-            && !series_child
-        {
-            guesses.pin_search(result.name.as_deref(), result.production_year);
+        if let Some(result) = search {
+            if series_child {
+                guesses.series_ids = Some(search_result_ids(result));
+            } else {
+                guesses.pin_search(result.name.as_deref(), result.production_year);
+            }
         }
         let tag_provider_ids = rows.provider_ids.clone();
         // Local Kodi/XBMC NFO sidecar first — this is Jellyfin's default local
@@ -12233,7 +12270,9 @@ impl LibraryScanner {
     /// endpoint, by its parsed name (`OmdbItemProvider.GetResult` →
     /// `GetImdbId`, [`video_resolver::parse_name`]). An episode is read out of
     /// its series' season listing, keyed by the series' IMDb id recorded
-    /// earlier in this scan. `None` when OMDb has nothing (or has no key).
+    /// earlier in this scan, and under an Identify by the chosen result's
+    /// alone (`SeriesProviderIds`). `None` when OMDb has nothing (or has no
+    /// key).
     ///
     /// `Rated` and `Genres` are only taken for an English library (OMDb has no
     /// localization — C# `IsConfiguredForEnglish`), and `Rated` additionally
@@ -12288,10 +12327,16 @@ impl LibraryScanner {
                 // EPISODE's own IMDb id first and only falls back to the
                 // episode number — a season whose numbering disagrees with
                 // OMDb's resolves correctly only when that id is supplied.
-                let series_imdb = row
-                    .series_id
-                    .as_deref()
-                    .and_then(|series| imdb_id_of(cache.item_provider_ids.get(series)));
+                // `info.SeriesProviderIds` (`OmdbEpisodeProvider.cs:58`):
+                // under an Identify the chosen result's alone.
+                let series_imdb = lookup.identified_series_ids().map_or_else(
+                    || {
+                        row.series_id
+                            .as_deref()
+                            .and_then(|series| imdb_id_of(cache.item_provider_ids.get(series)))
+                    },
+                    imdb_id_in,
+                );
                 match (series_imdb, lookup.parent_index(row), lookup.index(row)) {
                     (Some(series), Some(season), Some(number)) => {
                         omdb.episode(&series, season, number, own_imdb.as_deref())
@@ -12515,9 +12560,16 @@ impl LibraryScanner {
         ) else {
             return None;
         };
+        let series_tmdb = lookup_series_tmdb_id(cache, lookup, &series_id)?;
         let ep = {
             let details = self
-                .season_details_cached(cache, &series_id, season, lookup.tmdb_language().as_deref())
+                .season_details_cached(
+                    cache,
+                    &series_id,
+                    series_tmdb,
+                    season,
+                    lookup.tmdb_language().as_deref(),
+                )
                 .await?;
             ferrofin_providers::episode::tmdb_episode_in_range(
                 &details,
@@ -12530,17 +12582,17 @@ impl LibraryScanner {
         // The episode's external ids, trailers and credits, in one request
         // (`TmdbEpisodeProvider` asks `GetEpisodeAsync` with
         // `credits,images,external_ids,videos` appended).
-        let extras = match (&self.tmdb, series_tmdb_id_of(cache, &series_id)) {
-            (Some(tmdb), Some(id)) => {
+        let extras = match &self.tmdb {
+            Some(tmdb) => {
                 tmdb.episode_extras_for_language(
-                    id,
+                    series_tmdb,
                     season,
                     ep.episode_number,
                     lookup.tmdb_language().as_deref(),
                 )
                 .await
             }
-            _ => None,
+            None => None,
         };
         // The season listed the episode, so TMDB answered. Its credits are
         // `TmdbEpisodeProvider`'s `AddPerson`s: null when it credits nobody,
@@ -12585,7 +12637,8 @@ impl LibraryScanner {
     ///
     /// The season is looked up by its number under the series' `Tmdb` id —
     /// this scan's match, the one TheTVDB carried, else the one recorded for
-    /// the series ([`series_tmdb_id_of`]); without a number or a series id
+    /// the series, and under an Identify the chosen result's alone
+    /// ([`lookup_series_tmdb_id`]); without a number or a series id
     /// there is no answer and no request (`:53-56`). Its response is the
     /// series' `/tv/{id}/season/{n}`, fetched once while the cache keeps it
     /// and shared with the season's episodes and its poster
@@ -12605,8 +12658,15 @@ impl LibraryScanner {
         let (Some(series_id), Some(number)) = (row.series_id.clone(), lookup.index(row)) else {
             return None;
         };
+        let series_tmdb = lookup_series_tmdb_id(cache, lookup, &series_id)?;
         let details = self
-            .season_details_cached(cache, &series_id, number, lookup.tmdb_language().as_deref())
+            .season_details_cached(
+                cache,
+                &series_id,
+                series_tmdb,
+                number,
+                lookup.tmdb_language().as_deref(),
+            )
             .await?;
         let import_season_name = tmdb.import_season_name().await;
         Some(RemoteAnswer::of_result(
@@ -12626,7 +12686,9 @@ impl LibraryScanner {
     ///
     /// It resolves under the series' `Tvdb` id — this scan's TVDB match, else
     /// the recorded one (TMDB's answer for the series hands its TVDB id on
-    /// to the record) — and without one there is no answer and no request;
+    /// to the record), and under an Identify the chosen result's alone
+    /// ([`lookup_series_tvdb_id`]) — and without one there is no answer and
+    /// no request;
     /// neither is there when the series row cannot be read
     /// ([`series_display_order`](Self::series_display_order)).
     /// A failed request counts as a provider failure, as upstream counts it
@@ -12652,12 +12714,7 @@ impl LibraryScanner {
         let (Some(series_id), Some(number)) = (row.series_id.as_deref(), lookup.index(row)) else {
             return None;
         };
-        let series_tvdb = cache
-            .series_tvdb
-            .get(series_id)
-            .map(|d| d.tvdb_id)
-            .or_else(|| recorded_provider_id(cache, series_id, "Tvdb"))
-            .filter(|id| *id > 0)?;
+        let series_tvdb = lookup_series_tvdb_id(cache, lookup, series_id).filter(|id| *id > 0)?;
         let display_order = self.series_display_order(cache, series_id).await?;
         let result = ferrofin_providers::season::tvdb_season(
             tvdb,
@@ -12842,12 +12899,9 @@ impl LibraryScanner {
                 };
                 // The parent series matched TVDB earlier this scan, or a
                 // previous scan recorded its Tvdb id (an unchanged series runs
-                // no provider, so only the record has it).
-                let tvdb_id = cache
-                    .series_tvdb
-                    .get(&series_id)
-                    .map(|d| d.tvdb_id)
-                    .or_else(|| recorded_provider_id(cache, &series_id, "Tvdb"))?;
+                // no provider, so only the record has it); under an Identify,
+                // the chosen result's.
+                let tvdb_id = lookup_series_tvdb_id(cache, lookup, &series_id)?;
                 // `GetEpisodeTvdbId`: the series' ordering decides the season
                 // type and numbers asked for; a season-less episode is in
                 // season 1.
@@ -15072,16 +15126,20 @@ impl LibraryScanner {
     /// resolved miss is cached as `None` so a season TMDB does not have is not
     /// re-requested once per episode.
     ///
-    /// `None` when TMDB is unwired, the series never matched TMDB, or the
-    /// request failed — a failure, cached or fresh, is counted into the
-    /// caller's `count_request_failures` scope, so an episode resolved
-    /// against it is not stamped as refreshed. A series with no cached TMDB
-    /// id is NOT recorded as a miss: nothing was asked, and the id may still
-    /// arrive.
+    /// It is asked under `tmdb_id`, the series' TMDB id as the caller's
+    /// lookup resolves it ([`lookup_series_tmdb_id`]), and kept under the
+    /// series' item id: every reader in one scan resolves a series to the
+    /// same id. A series with no TMDB id is asked nothing, so it is NOT
+    /// recorded as a miss: the id may still arrive.
+    ///
+    /// `None` when TMDB is unwired or the request failed — a failure, cached
+    /// or fresh, is counted into the caller's `count_request_failures` scope,
+    /// so an episode resolved against it is not stamped as refreshed.
     async fn season_details_cached<'a>(
         &self,
         cache: &'a mut ArtworkCache,
         series_id: &str,
+        tmdb_id: i64,
         season: i32,
         language: Option<&str>,
     ) -> Option<std::borrow::Cow<'a, ferrofin_providers::tmdb::SeasonDetails>> {
@@ -15091,8 +15149,6 @@ impl LibraryScanner {
         let now = std::time::Instant::now();
         if !cache.season_details.contains_key_at(&key, now) {
             let tmdb = self.tmdb.as_ref()?;
-            // No series match yet → no request to make, and no miss to record.
-            let tmdb_id = series_tmdb_id_of(cache, series_id)?;
             let (details, failures) = ferrofin_providers::rate_limit::count_request_failures(
                 tmdb.season_details_for_language(tmdb_id, season, language),
             )
@@ -22122,6 +22178,12 @@ struct ResolverGuesses {
     /// result.Name; lookupInfo.Year = result.ProductionYear`). Lookup only:
     /// never filled back onto the row.
     search: Option<(Option<String>, Option<i64>)>,
+    /// Under an Identify, a season's or an episode's series ids: the chosen
+    /// result's (`ApplySearchResult`: `SeriesProviderIds =
+    /// GetValidProviderIds(result.ProviderIds)`), which its providers resolve
+    /// the series by in place of the ones the series settled
+    /// ([`identified_series_ids`](Self::identified_series_ids)). Lookup only.
+    series_ids: Option<Vec<(String, String)>>,
     /// The item's own preferred metadata language (the metadata editor's
     /// "Preferred metadata language"), the first step of the lookup info's
     /// `MetadataLanguage` ([`metadata_language`](Self::metadata_language)).
@@ -22133,6 +22195,14 @@ struct ResolverGuesses {
 }
 
 impl ResolverGuesses {
+    /// The series ids a season's or an episode's providers resolve its series
+    /// by under an Identify: the chosen result's alone. `None` outside one,
+    /// where the ids the series settled answer ([`series_tmdb_id_of`],
+    /// [`recorded_provider_id`]).
+    fn identified_series_ids(&self) -> Option<&[(String, String)]> {
+        self.series_ids.as_deref()
+    }
+
     /// Makes the fetchers search by an Identify result's name and year.
     fn pin_search(&mut self, name: Option<&str>, year: Option<i32>) {
         self.search = Some((
@@ -22216,6 +22286,7 @@ impl ResolverGuesses {
             },
             date_created: entity.date_created.take(),
             search: None,
+            series_ids: None,
             own_language: own_language(
                 stored
                     .and_then(|s| s.preferred_metadata_language.as_deref())
@@ -32697,7 +32768,7 @@ mod tests {
             .expect("the second episode");
         // The image pass asks for the same season.
         let poster = scanner
-            .season_details_cached(&mut cache, "SERIES", 1, Some("en"))
+            .season_details_cached(&mut cache, "SERIES", 1399, 1, Some("en"))
             .await
             .and_then(|d| d.poster.clone());
 
@@ -32708,7 +32779,7 @@ mod tests {
         for _ in 0..2 {
             assert!(
                 scanner
-                    .season_details_cached(&mut cache, "SERIES", 1, Some("fr"))
+                    .season_details_cached(&mut cache, "SERIES", 1399, 1, Some("fr"))
                     .await
                     .is_some()
             );
@@ -35589,7 +35660,7 @@ mod tests {
         let (scanner, mut cache, _ep) = tmdb_episode_fixture(&base, tmp.path()).await;
         for _ in 0..2 {
             let (found, failures) = ferrofin_providers::rate_limit::count_request_failures(
-                Box::pin(scanner.season_details_cached(&mut cache, "SERIES", 1, None)),
+                Box::pin(scanner.season_details_cached(&mut cache, "SERIES", 1399, 1, None)),
             )
             .await;
             assert!(found.is_none());
@@ -35614,7 +35685,7 @@ mod tests {
 
         assert!(
             scanner
-                .season_details_cached(&mut cache, "SERIES", 1, Some("en"))
+                .season_details_cached(&mut cache, "SERIES", 1399, 1, Some("en"))
                 .await
                 .is_none(),
             "a non-2xx season response is a miss"
@@ -35623,7 +35694,7 @@ mod tests {
         // fetch spends another request.
         assert!(
             scanner
-                .season_details_cached(&mut cache, "SERIES", 1, Some("en"))
+                .season_details_cached(&mut cache, "SERIES", 1399, 1, Some("en"))
                 .await
                 .is_none()
         );
@@ -35778,7 +35849,7 @@ mod tests {
         for read in 1..=2 {
             assert!(
                 scanner
-                    .season_details_cached(&mut cache, "SERIES", 1, None)
+                    .season_details_cached(&mut cache, "SERIES", 1399, 1, None)
                     .await
                     .is_none(),
                 "a miss"
@@ -35803,7 +35874,7 @@ mod tests {
         let (scanner, mut cache, _episode) = tmdb_episode_fixture(&base, tmp.path()).await;
         cache.season_details = no_room();
         let (found, failures) = ferrofin_providers::rate_limit::count_request_failures(Box::pin(
-            scanner.season_details_cached(&mut cache, "SERIES", 1, None),
+            scanner.season_details_cached(&mut cache, "SERIES", 1399, 1, None),
         ))
         .await;
         assert!(found.is_none());
@@ -38434,6 +38505,186 @@ mod tests {
                 .await
                 .is_none()
         );
+    }
+
+    /// Under an Identify a season's and an episode's TheMovieDb lookups ask
+    /// under the chosen result's TMDb series id (`TmdbSeasonProvider.cs:49`,
+    /// `TmdbEpisodeProvider.cs:92` read `SeriesProviderIds`), not the one the
+    /// series settled, and ask nothing when the result names none.
+    #[rstest::rstest]
+    #[case::settled(None, Some("1399"))]
+    #[case::chosen(Some(&[("Tmdb", "1400")][..]), Some("1400"))]
+    #[case::chosen_without_one(Some(&[("Tvdb", "121361")][..]), None)]
+    #[tokio::test]
+    async fn identified_children_ask_tmdb_by_the_chosen_series_id(
+        #[case] chosen: Option<&[(&str, &str)]>,
+        #[case] asked_under: Option<&str>,
+    ) {
+        use std::io::{Read as _, Write as _};
+        let requests = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let log = Arc::clone(&requests);
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut s) = stream else { break };
+                let mut buf = [0u8; 4096];
+                let n = s.read(&mut buf).unwrap_or(0);
+                let req = String::from_utf8_lossy(&buf[..n]).into_owned();
+                let line = req.lines().next().unwrap_or_default().to_owned();
+                let payload = if line.contains("/episode/") {
+                    format!("{{\"credits\":{CREDITS_JSON}}}")
+                } else {
+                    SEASON_JSON.to_owned()
+                };
+                log.lock().unwrap().push(line);
+                let _ = write!(
+                    s,
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{payload}",
+                    payload.len()
+                );
+            }
+        });
+        let tmp = tempfile::tempdir().unwrap();
+        let (scanner, mut cache, episode) =
+            tmdb_episode_fixture(&format!("http://{addr}"), tmp.path()).await;
+        let season = BaseItemEntity {
+            type_: "MediaBrowser.Controller.Entities.TV.Season".into(),
+            index_number: Some(1),
+            ..episode.clone()
+        };
+        let lookup = super::ResolverGuesses {
+            series_ids: chosen.map(|ids| {
+                ids.iter()
+                    .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+                    .collect()
+            }),
+            ..super::ResolverGuesses::default()
+        };
+
+        let season_answer = scanner
+            .fetch_tmdb_season(&season, &mut cache, &lookup)
+            .await;
+        let episode_answer = scanner
+            .fetch_tmdb_episode(&episode, &mut cache, &lookup)
+            .await;
+        assert_eq!(season_answer.is_some(), asked_under.is_some());
+        assert_eq!(episode_answer.is_some(), asked_under.is_some());
+        let asked = requests.lock().unwrap().clone();
+        match asked_under {
+            Some(id) => assert!(
+                !asked.is_empty()
+                    && asked
+                        .iter()
+                        .all(|l| l.contains(&format!("/tv/{id}/season/1"))),
+                "{asked:?}"
+            ),
+            None => assert!(asked.is_empty(), "{asked:?}"),
+        }
+    }
+
+    /// Under an Identify a season's or an episode's TheTVDB and OMDb lookups
+    /// resolve the series by the chosen result's ids alone: `ApplySearchResult`
+    /// sets the lookup's `SeriesProviderIds`, which the TVDB plugin's
+    /// `TvdbSeasonProvider` and `GetEpisodeTvdbId` and
+    /// `OmdbEpisodeProvider.cs:58` read. A result without the series' Tvdb or
+    /// IMDb id asks neither, though the series recorded both; a result with
+    /// them asks by them, recorded or not; outside an Identify the recorded
+    /// ones answer.
+    #[rstest::rstest]
+    #[case::settled(true, None, true)]
+    #[case::chosen_without_them(true, Some(&[("Tmdb", "1399")][..]), false)]
+    #[case::chosen_with_them(false, Some(&[("Tvdb", "121361"), ("Imdb", "tt0944947")][..]), true)]
+    #[tokio::test]
+    async fn identified_children_ask_tvdb_and_omdb_by_the_chosen_series_ids(
+        #[case] recorded: bool,
+        #[case] chosen: Option<&[(&str, &str)]>,
+        #[case] asks: bool,
+    ) {
+        use ferrofin_db::entities::base_items::BaseItemEntity;
+        use std::io::{Read as _, Write as _};
+        let requests = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let log = Arc::clone(&requests);
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut s) = stream else { break };
+                let mut buf = [0u8; 4096];
+                let n = s.read(&mut buf).unwrap_or(0);
+                let req = String::from_utf8_lossy(&buf[..n]).into_owned();
+                log.lock()
+                    .unwrap()
+                    .push(req.lines().next().unwrap_or_default().to_owned());
+                let _ = write!(
+                    s,
+                    "HTTP/1.1 404 Not Found\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{{}}"
+                );
+            }
+        });
+        let base = format!("http://{addr}");
+        let tmp = tempfile::tempdir().unwrap();
+        let db = Database::connect_in_memory().await.unwrap();
+        db.run_migrations().await.unwrap();
+        let persistence = Arc::new(FerrofinItemPersistenceService::new(db.clone()));
+        let vf: Arc<dyn VirtualFolderManager> = Arc::new(
+            FerrofinVirtualFolderManager::new(tmp.path().join("default"))
+                .with_item_store(persistence.clone()),
+        );
+        let scanner = LibraryScanner::new(vf, Arc::new(FerrofinFileSystem::new()), persistence)
+            .with_tvdb(Arc::new(
+                ferrofin_providers::TvdbClient::new().with_base_url(&base),
+            ))
+            .with_omdb(Arc::new(
+                ferrofin_providers::OmdbClient::new("key").with_base_url(&format!("{base}/")),
+            ));
+        let mut cache = super::ArtworkCache::default();
+        if recorded {
+            cache.item_provider_ids.insert(
+                "SERIES".to_owned(),
+                vec![
+                    ("Tvdb".to_owned(), "121361".to_owned()),
+                    ("Imdb".to_owned(), "tt0944947".to_owned()),
+                ],
+            );
+        }
+        let lookup = super::ResolverGuesses {
+            series_ids: chosen.map(|ids| {
+                ids.iter()
+                    .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+                    .collect()
+            }),
+            ..super::ResolverGuesses::default()
+        };
+        let child = |kind: &str| BaseItemEntity {
+            type_: format!("MediaBrowser.Controller.Entities.TV.{kind}"),
+            series_id: Some("SERIES".into()),
+            parent_index_number: Some(1),
+            index_number: Some(1),
+            ..Default::default()
+        };
+        let (season, episode) = (child("Season"), child("Episode"));
+        let asked = || std::mem::take(&mut *requests.lock().unwrap());
+
+        let _ = scanner
+            .fetch_tvdb_season(&season, &cache, &lookup, "en")
+            .await;
+        assert_eq!(!asked().is_empty(), asks, "TheTVDB's season");
+        let _ = scanner
+            .fetch_tvdb_metadata(&episode, "Episode", &mut cache, &[], &lookup)
+            .await;
+        assert_eq!(!asked().is_empty(), asks, "TheTVDB's episode");
+        let _ = scanner
+            .fetch_omdb_metadata(
+                &episode,
+                "Episode",
+                &mut cache,
+                super::FetcherPolicy::default(),
+                &[],
+                &lookup,
+            )
+            .await;
+        assert_eq!(!asked().is_empty(), asks, "OMDb's episode");
     }
 
     // With TheTVDB ranked first for episodes, an episode TVDB cannot resolve
