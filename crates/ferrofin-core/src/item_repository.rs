@@ -11,7 +11,7 @@
 //! not taken as a field (it would be injected at the composition root if a later
 //! method needs it).
 
-use ferrofin_util::string_extensions::{equals_ordinal_ignore_case, upper_invariant};
+use ferrofin_util::string_extensions::{equals_ordinal_ignore_case, ordinal_ignore_case_key};
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -790,7 +790,7 @@ impl FerrofinItemRepository {
                     present
                         .entry(id)
                         .or_default()
-                        .insert(upper_invariant(&provider));
+                        .insert(ordinal_ignore_case_key(&provider));
                 }
             }
             rows.retain(|row| {
@@ -3644,11 +3644,11 @@ pub(crate) fn folder_ordinal_compare(
 }
 
 /// The ordinal case-insensitive key [`folder_ordinal_compare`] compares, the
-/// .NET invariant upper case: comparing two values is comparing their keys
+/// .NET `OrdinalIgnoreCase` fold: comparing two values is comparing their keys
 /// byte-wise, so a sort can compute each row's key once instead of on every
 /// comparison.
 pub(crate) fn folder_ordinal_key(value: &str) -> String {
-    upper_invariant(value)
+    ordinal_ignore_case_key(value)
 }
 
 pub(crate) fn folder_sort_name(row: &BaseItemEntity) -> String {
@@ -15752,6 +15752,9 @@ mod folder_get_result_tests {
             ("x\u{10000}", "x\u{e000}", std::cmp::Ordering::Greater),
             ("\u{10000}", "\u{10001}", std::cmp::Ordering::Less),
             ("\u{10000}", "\u{20000}", std::cmp::Ordering::Less),
+            // The long s keeps its case, so it sorts after every ASCII letter.
+            ("\u{17f}", "Z", std::cmp::Ordering::Greater),
+            ("\u{17f}", "s", std::cmp::Ordering::Greater),
         ] {
             assert_eq!(folder_ordinal_compare(Some(left), Some(right)), expected);
         }

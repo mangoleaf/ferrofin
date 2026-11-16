@@ -374,7 +374,7 @@ pub fn members_edited(before: &BaseItemEntity, after: &BaseItemEntity) -> bool {
     let sorted = |value: Option<&str>| {
         let mut values: Vec<String> = list(value)
             .into_iter()
-            .map(ferrofin_util::string_extensions::upper_invariant)
+            .map(ferrofin_util::string_extensions::ordinal_ignore_case_key)
             .collect();
         values.sort_unstable();
         values
@@ -460,7 +460,7 @@ fn members_union<'a>(values: impl Iterator<Item = Option<&'a str>>) -> Option<St
     let mut seen = HashSet::new();
     let values: Vec<&str> = values
         .flat_map(list)
-        .filter(|v| seen.insert(ferrofin_util::string_extensions::upper_invariant(v)))
+        .filter(|v| seen.insert(ferrofin_util::string_extensions::ordinal_ignore_case_key(v)))
         .collect();
     (!values.is_empty()).then(|| values.join("|"))
 }
@@ -583,7 +583,7 @@ fn union(target: Option<&str>, source: Option<&str>) -> Option<String> {
     let values: Vec<&str> = list(target)
         .into_iter()
         .chain(list(source))
-        .filter(|v| seen.insert(ferrofin_util::string_extensions::upper_invariant(v)))
+        .filter(|v| seen.insert(ferrofin_util::string_extensions::ordinal_ignore_case_key(v)))
         .collect();
     (!values.is_empty()).then(|| values.join("|"))
 }
@@ -1019,7 +1019,7 @@ fn remove_invalid_provider_ids(people: &[PeopleEntity]) -> Vec<PeopleEntity> {
 /// The name key `MergePeople` groups by: diacritics removed, compared
 /// ordinal-ignore-case.
 fn person_key(name: &str) -> String {
-    ferrofin_util::string_extensions::upper_invariant(
+    ferrofin_util::string_extensions::ordinal_ignore_case_key(
         &ferrofin_util::string_extensions::remove_diacritics(name),
     )
 }
