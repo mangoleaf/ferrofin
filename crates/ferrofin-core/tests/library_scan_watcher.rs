@@ -1303,6 +1303,99 @@ async fn a_removed_files_prune_leaves_the_runtime_worker_free() {
     );
 }
 
+/// A probed item's sidecar search goes through `off_runtime` too: a track's
+/// own stat (is it a folder?), and the stats of the folders a video's
+/// subtitles and audio or a track's lyrics are looked for in. On a runtime
+/// with one worker, a task still runs while each of them is answered, and the
+/// sidecar is still the item's stream. The folders' listings come from the
+/// scan's cache here. A stat made at dispatch follows the plan's own hand-off
+/// in the same poll, where it cannot starve the worker, so the unit test
+/// `dispatching_a_probe_leaves_its_sidecar_search_to_the_task` pins that
+/// dispatch makes none.
+#[rstest::rstest]
+#[case::subtitle(
+    CollectionTypeOptions::movies,
+    BaseItemKind::Movie,
+    "Heat (1995).mkv",
+    "Heat (1995).eng.srt"
+)]
+#[case::lyric(
+    CollectionTypeOptions::music,
+    BaseItemKind::Audio,
+    "Artist/Album/01 - Song.flac",
+    "Artist/Album/01 - Song.lrc"
+)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn a_probes_sidecar_search_leaves_the_runtime_worker_free(
+    #[case] kind: CollectionTypeOptions,
+    #[case] item: BaseItemKind,
+    #[case] file: &str,
+    #[case] sidecar: &str,
+) {
+    let tmp = tempfile::tempdir().expect("tmp");
+    let media = tmp.path().join("media");
+    let file = media.join(file);
+    let folder = file.parent().expect("folder");
+    touch(folder, &file.file_name().expect("name").to_string_lossy());
+    let dashless = derive_item_id(item, &file.to_string_lossy())
+        .expect("id")
+        .simple()
+        .to_string();
+    let internal = tmp
+        .path()
+        .join("metadata")
+        .join(&dashless[..2])
+        .join(&dashless);
+    let sidecar = media.join(sidecar);
+    std::fs::write(&sidecar, b"1\n").expect("sidecar");
+    let fx = Fixture::new(tmp.path(), &media, kind).await;
+
+    let (ran, stalled_for) = std::sync::mpsc::channel();
+    let stat = Arc::new(tokio::sync::Notify::new());
+    *fx.fs.stats.lock().expect("lock") = Some(StatStall {
+        paths: [&file, &internal]
+            .map(|p| p.to_string_lossy().into_owned())
+            .to_vec(),
+        stat: Arc::clone(&stat),
+        ran: stalled_for,
+        patience: Duration::from_secs(2),
+        starved: Vec::new(),
+    });
+    tokio::spawn(async move {
+        loop {
+            stat.notified().await;
+            if ran.send(()).is_err() {
+                break;
+            }
+        }
+    });
+
+    // On the worker: the test's own future runs on the thread that started it.
+    let fx = tokio::spawn(async move {
+        let outcome = fx.scanner.scan_all().await.expect("scan");
+        assert!(outcome.created > 0, "{outcome:?}");
+        fx
+    })
+    .await
+    .expect("the scan finished");
+
+    let found: i64 = sqlx::query_scalar(
+        r#"SELECT COUNT(*) FROM "MediaStreamInfos" WHERE "ItemId" = ?1 AND "Path" = ?2"#,
+    )
+    .bind(id(item, &file))
+    .bind(sidecar.to_string_lossy().into_owned())
+    .fetch_one(fx.db.pool())
+    .await
+    .expect("streams");
+    assert_eq!(found, 1, "{} is the item's stream", sidecar.display());
+    let stall = fx.fs.stats.lock().expect("lock").take().expect("stall");
+    assert!(
+        stall.starved.is_empty(),
+        "these stats held the only worker: {:?}",
+        stall.starved
+    );
+}
+
 /// A library location that is still there but lists empty — an NFS mount
 /// that dropped, leaving its empty mountpoint — is inaccessible, not
 /// emptied (`Folder.IsLibraryFolderAccessible`, `Folder.cs:400-415`): a

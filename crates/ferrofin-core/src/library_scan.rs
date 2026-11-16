@@ -1414,9 +1414,21 @@ fn probe_request(entity: &BaseItemEntity) -> Option<MediaInfoRequest> {
 /// while ffprobe reads its remote target) and its internal metadata folder
 /// (the second place upstream looks for sidecars — where an upload against a
 /// read-only library was written).
-struct ExternalProbe {
-    resolvers: Arc<ExternalStreamResolvers>,
-    target: crate::media_info_resolver::ExternalMediaTarget,
+enum ExternalProbe {
+    /// A video's subtitle and audio sidecars, looked for at `target` as
+    /// `Video` finds them.
+    Video {
+        resolvers: Arc<ExternalStreamResolvers>,
+        target: crate::media_info_resolver::ExternalMediaTarget,
+    },
+    /// An audio track's lyric sidecars. The task resolves its target
+    /// ([`ExternalStreamResolvers::target_for`] stats `path`) with the search,
+    /// off the runtime workers.
+    Audio {
+        resolvers: Arc<ExternalStreamResolvers>,
+        path: String,
+        internal_metadata_path: Option<String>,
+    },
 }
 
 /// The scan-wide external-stream seam handed to the probe pipeline: the
@@ -1446,14 +1458,20 @@ impl ExternalProbeSeam {
     fn for_item(&self, id: Uuid, item: &BaseItemEntity, is_audio: bool) -> Option<ExternalProbe> {
         let path = item.path.as_deref()?;
         let internal = self.internal_metadata_path(id);
-        let target = if is_audio {
-            self.resolvers.target_for(path, internal)
+        let resolvers = Arc::clone(&self.resolvers);
+        Some(if is_audio {
+            ExternalProbe::Audio {
+                resolvers,
+                path: path.to_owned(),
+                internal_metadata_path: internal,
+            }
         } else {
-            crate::media_info_resolver::ExternalMediaTarget::for_video(item, path, internal)
-        };
-        Some(ExternalProbe {
-            resolvers: Arc::clone(&self.resolvers),
-            target,
+            ExternalProbe::Video {
+                resolvers,
+                target: crate::media_info_resolver::ExternalMediaTarget::for_video(
+                    item, path, internal,
+                ),
+            }
         })
     }
 }
@@ -1489,7 +1507,9 @@ pub(crate) fn off_runtime<R>(work: impl FnOnce() -> R) -> R {
 /// external audio, then the file's own streams, renumbered from 0). That
 /// keeps the sidecar probes off the scan loop like the main probe. For an
 /// audio track it appends the lyric sidecars instead ([`add_external_lyrics`]),
-/// which need no probe of their own.
+/// which need no probe of their own. The search's stats and listings run
+/// through [`off_runtime`], once per item; the sidecar probes are awaited
+/// outside it.
 ///
 /// A probe failure is logged and reported as `None` — exactly what the
 /// inline probe did — so one unreadable file never aborts a scan. The
@@ -1532,22 +1552,29 @@ fn spawn_probe(
                 return None;
             }
         };
-        if let Some(ExternalProbe { resolvers, target }) = external {
-            if request.media_is_audio {
-                add_external_lyrics(&resolvers, &target, &mut probed);
-                return Some(probed);
+        match external {
+            Some(ExternalProbe::Audio {
+                resolvers,
+                path,
+                internal_metadata_path,
+            }) => off_runtime(|| {
+                let track = resolvers.target_for(&path, internal_metadata_path);
+                add_external_lyrics(&resolvers, &track, &mut probed);
+            }),
+            Some(ExternalProbe::Video { resolvers, target }) => {
+                let externals = resolvers.external_streams(&target, 0).await;
+                if !externals.is_empty() {
+                    tracing::debug!(
+                        path = target.path,
+                        count = externals.len(),
+                        "external media streams resolved"
+                    );
+                    let embedded = std::mem::take(&mut probed.media_source.media_streams);
+                    probed.media_source.media_streams =
+                        ExternalStreamResolvers::merge_with_embedded(externals, embedded);
+                }
             }
-            let externals = resolvers.external_streams(&target, 0).await;
-            if !externals.is_empty() {
-                tracing::debug!(
-                    path = target.path,
-                    count = externals.len(),
-                    "external media streams resolved"
-                );
-                let embedded = std::mem::take(&mut probed.media_source.media_streams);
-                probed.media_source.media_streams =
-                    ExternalStreamResolvers::merge_with_embedded(externals, embedded);
-            }
+            None => {}
         }
         Some(probed)
     })
@@ -39025,6 +39052,68 @@ mod tests {
         probes.discard(0);
         probes.discard(1);
         assert!(probes.take(3).await.info.is_some());
+    }
+
+    /// A filesystem whose every call fails the test.
+    struct UntouchedFs;
+
+    impl ferrofin_traits::filesystem::FileSystem for UntouchedFs {
+        fn get_file_system_entries(
+            &self,
+            path: &str,
+        ) -> Vec<ferrofin_model::io::FileSystemEntryInfo> {
+            panic!("listed {path}")
+        }
+        fn get_drives(&self) -> Vec<ferrofin_model::io::FileSystemEntryInfo> {
+            panic!("listed the drives")
+        }
+        fn file_exists(&self, path: &str) -> bool {
+            panic!("stat {path}")
+        }
+        fn directory_exists(&self, path: &str) -> bool {
+            panic!("stat {path}")
+        }
+        fn validate_writable(&self, path: &str) -> Result<(), ServiceError> {
+            panic!("probed {path}")
+        }
+        fn get_files(
+            &self,
+            path: &str,
+            _extensions: &[&str],
+        ) -> Vec<ferrofin_traits::filesystem::FileMetadata> {
+            panic!("listed {path}")
+        }
+        fn read_file(&self, path: &str) -> Result<Vec<u8>, ServiceError> {
+            panic!("read {path}")
+        }
+    }
+
+    /// gl-1759: a probe's sidecar search is built at dispatch, on the scan
+    /// task, without touching the filesystem. A track's folder stat
+    /// (`target_for`) runs in its probe task, off the runtime workers, and a
+    /// video's target is pure.
+    #[test]
+    fn dispatching_a_probe_leaves_its_sidecar_search_to_the_task() {
+        let seam = super::ExternalProbeSeam {
+            resolvers: Arc::new(crate::media_info_resolver::ExternalStreamResolvers::new(
+                Arc::clone(ferrofin_naming::common::NamingOptions::shared()),
+                Arc::new(crate::localization_manager::LocalizationManager::new("")),
+                Arc::new(FakeProbe),
+                Arc::new(UntouchedFs),
+            )),
+            metadata_dir: Some("/metadata".into()),
+            dirs: None,
+        };
+        for (path, is_audio) in [("/music/1.mp3", true), ("/movies/1.mkv", false)] {
+            let item = BaseItemEntity {
+                path: Some(path.to_owned()),
+                ..Default::default()
+            };
+            assert!(
+                seam.for_item(uuid::Uuid::from_u128(1), &item, is_audio)
+                    .is_some()
+            );
+        }
     }
 
     struct AlbumCoverProbe {

@@ -30,6 +30,7 @@ use ferrofin_traits::filesystem::FileSystem;
 use ferrofin_traits::media_encoding::{MediaEncoder, MediaInfoRequest};
 use ferrofin_util::string_extensions::to_upper_ordinal;
 
+use crate::library_scan::off_runtime;
 use crate::localization_manager::LocalizationManager;
 
 /// The video an external-stream search is run for: the three path facts
@@ -246,15 +247,27 @@ impl MediaInfoResolver {
     /// come from the probe when it has them, else from the filename. A probe
     /// failure logs and skips that file — one bad sidecar never loses the
     /// others. `.strm` sidecars are never probed.
+    ///
+    /// The scan does not call this: it lists both resolvers' files in one
+    /// hand-off ([`ExternalStreamResolvers::external_streams`]).
     pub async fn get_external_streams(
         &self,
         video: &ExternalMediaTarget,
+        start_index: i32,
+    ) -> Vec<MediaStream> {
+        let path_infos = off_runtime(|| self.get_external_files(video));
+        self.probe_external_files(path_infos, start_index).await
+    }
+
+    /// The half of [`get_external_streams`](Self::get_external_streams)
+    /// that awaits: probes `path_infos`, the files
+    /// [`get_external_files`](Self::get_external_files) found for a video,
+    /// numbering their streams from `start_index`.
+    async fn probe_external_files(
+        &self,
+        path_infos: Vec<ExternalPathParserResult>,
         mut start_index: i32,
     ) -> Vec<MediaStream> {
-        if !is_file_protocol(&video.path) {
-            return Vec::new();
-        }
-        let path_infos = self.get_external_files(video);
         if path_infos.is_empty() {
             return Vec::new();
         }
@@ -590,22 +603,30 @@ impl ExternalStreamResolvers {
 
     /// Every external stream of `video` — subtitles numbered from
     /// `start_index`, then audio continuing after them — in the order
-    /// `FFProbeVideoInfo.Fetch` adds them.
+    /// `FFProbeVideoInfo.Fetch` adds them. Both resolvers' files are found
+    /// first, in one `off_runtime` hand-off (the stats and listings
+    /// block), and only then probed.
     pub async fn external_streams(
         &self,
         video: &ExternalMediaTarget,
         start_index: i32,
     ) -> Vec<MediaStream> {
+        let (subtitles, audio) = off_runtime(|| {
+            (
+                self.subtitles.get_external_files(video),
+                self.audio.get_external_files(video),
+            )
+        });
         let mut streams = self
             .subtitles
-            .get_external_streams(video, start_index)
+            .probe_external_files(subtitles, start_index)
             .await;
         let next = streams
             .iter()
             .map(|s| s.index)
             .max()
             .map_or(start_index, |max| max + 1);
-        streams.extend(self.audio.get_external_streams(video, next).await);
+        streams.extend(self.audio.probe_external_files(audio, next).await);
         streams
     }
 
