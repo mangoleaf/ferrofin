@@ -1854,6 +1854,8 @@ pub async fn build_app_state(
         .with_visibility(Arc::clone(&item_visibility))
         .with_virtual_folders(Arc::clone(&virtual_folders))
         .with_scanner(Arc::clone(&library_scanner))
+        // An item no scan covers (a box set, a person…) refreshes through it.
+        .with_providers(Arc::clone(&providers))
         .with_scan_progress(&scan_progress)
         // `LibraryChangedNotifier`: item writes through the API (a metadata
         // edit, a delete) announce themselves, as the scanner's changes do,

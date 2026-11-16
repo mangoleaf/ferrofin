@@ -30,7 +30,7 @@ use ferrofin_model::providers::ExternalIdInfo;
 use ferrofin_model::querying::QueryResult;
 use ferrofin_traits::dto::DtoService;
 use ferrofin_traits::error::ServiceError;
-use ferrofin_traits::library::{LibraryManager, ScanTarget, UserManager};
+use ferrofin_traits::library::{LibraryManager, UserManager};
 use ferrofin_traits::options::{
     AuthorizationInfo, DeleteOptions, DtoOptions, InternalItemsQuery, InternalPeopleQuery,
 };
@@ -243,13 +243,13 @@ type RecordedProviderIds = Arc<Mutex<Vec<(Uuid, Vec<(String, String)>)>>>;
 
 /// A [`LibraryManager`] resolving a single known item id (any other is `None`);
 /// `update_items` succeeds so the edit handler runs end-to-end. The folder
-/// fields shape the resolved entity for the folder-refresh (refresh scan)
-/// tests, which assert against `refresh_scans`.
+/// fields shape the resolved entity; the refresh tests assert against
+/// `refreshes`.
 struct OkLibrary {
     item_id: Uuid,
     is_folder: bool,
     top_parent_id: Option<Uuid>,
-    refresh_scans: RecordedScans,
+    refreshes: RecordedRefreshes,
     /// Entities passed to `update_items`, for asserting what the edit wrote.
     updated: Arc<Mutex<Vec<BaseItemEntity>>>,
     /// External-id sets passed to `update_item_provider_ids` — a second write,
@@ -283,8 +283,8 @@ struct Tree {
     people_written: Mutex<Vec<(String, Vec<PeopleEntity>)>>,
 }
 
-/// The folder-refresh scans the library was asked to queue.
-type RecordedScans = Arc<Mutex<Vec<(ScanTarget, MetadataRefreshOptions)>>>;
+/// The refreshes the library was asked to queue: the item and the options.
+type RecordedRefreshes = Arc<Mutex<Vec<(Uuid, MetadataRefreshOptions)>>>;
 
 #[async_trait]
 impl LibraryManager for OkLibrary {
@@ -330,15 +330,15 @@ impl LibraryManager for OkLibrary {
             entity
         }))
     }
-    async fn queue_refresh_scan(
+    async fn queue_item_refresh(
         &self,
-        target: ScanTarget,
+        item: &BaseItemEntity,
         options: &MetadataRefreshOptions,
     ) -> Result<(), ServiceError> {
-        self.refresh_scans
+        self.refreshes
             .lock()
             .unwrap()
-            .push((target, options.clone()));
+            .push((Uuid::parse_str(&item.id).expect("id"), options.clone()));
         Ok(())
     }
     async fn update_items(
@@ -745,7 +745,7 @@ fn state(item_id: Uuid, queued: Arc<Mutex<Vec<Uuid>>>) -> AppState {
             item_id,
             is_folder: false,
             top_parent_id: None,
-            refresh_scans: Arc::default(),
+            refreshes: Arc::default(),
             provider_ids: Arc::default(),
             updated: Arc::default(),
             tree: Arc::default(),
@@ -877,7 +877,7 @@ async fn update_and_capture(item_id: Uuid, body: String) -> BaseItemEntity {
             item_id,
             is_folder: false,
             top_parent_id: None,
-            refresh_scans: Arc::default(),
+            refreshes: Arc::default(),
             provider_ids: Arc::default(),
             updated: updated.clone(),
             tree: Arc::default(),
@@ -988,7 +988,7 @@ fn tree_library(item_id: Uuid, tree: Tree) -> Arc<OkLibrary> {
         item_id,
         is_folder: false,
         top_parent_id: None,
-        refresh_scans: Arc::default(),
+        refreshes: Arc::default(),
         provider_ids: Arc::default(),
         updated: Arc::default(),
         tree: Arc::new(tree),
@@ -1415,13 +1415,13 @@ async fn a_display_order_edit_is_stored_and_a_series_one_refreshes_it() {
             expected_data,
             "{kind} {stored:?} + {sent:?}"
         );
-        let scans = library.refresh_scans.lock().unwrap().clone();
+        let queued = library.refreshes.lock().unwrap().clone();
         assert_eq!(
-            scans.len(),
-            usize::from(refreshes),
-            "{kind} {stored:?} + {sent:?}: {scans:?}"
+            queued.iter().map(|(item, _)| *item).collect::<Vec<_>>(),
+            if refreshes { vec![id] } else { Vec::new() },
+            "{kind} {stored:?} + {sent:?}"
         );
-        if let Some((_, options)) = scans.first() {
+        if let Some((_, options)) = queued.first() {
             assert_eq!(
                 options.metadata_refresh_mode,
                 MetadataRefreshMode::FullRefresh
@@ -1736,7 +1736,7 @@ async fn update_item_replaces_the_external_ids() {
             item_id,
             is_folder: false,
             top_parent_id: None,
-            refresh_scans: Arc::default(),
+            refreshes: Arc::default(),
             provider_ids: recorded.clone(),
             updated: Arc::default(),
             tree: Arc::default(),
@@ -1785,7 +1785,7 @@ async fn update_item_without_provider_ids_leaves_them_alone() {
             item_id,
             is_folder: false,
             top_parent_id: None,
-            refresh_scans: Arc::default(),
+            refreshes: Arc::default(),
             provider_ids: recorded.clone(),
             updated: Arc::default(),
             tree: Arc::default(),
@@ -1838,30 +1838,7 @@ async fn update_missing_item_is_404() {
     assert_eq!(response.status(), StatusCode::NOT_FOUND);
 }
 
-/// `POST /Items/{itemId}/Refresh` queues a refresh for the item (`204`).
-#[tokio::test]
-async fn refresh_item_queues_and_returns_204() {
-    let item_id = Uuid::from_u128(0x5B);
-    let queued = Arc::new(Mutex::new(Vec::new()));
-    let router = create_router(state(item_id, queued.clone()));
-    let response = router
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri(format!(
-                    "/Items/{item_id}/Refresh?metadataRefreshMode=FullRefresh"
-                ))
-                .header("X-Emby-Token", "valid")
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(response.status(), StatusCode::NO_CONTENT);
-    assert_eq!(queued.lock().unwrap().as_slice(), &[item_id]);
-}
-
-/// A folder row of `kind` at `path` for the folder-refresh tests.
+/// A folder row of `kind` at `path` for the refresh tests.
 fn folder_row(id: Uuid, kind: &str, path: Option<&str>, parent: Option<Uuid>) -> BaseItemEntity {
     let mut row = base_item_entity(id);
     kind.clone_into(&mut row.type_);
@@ -1871,341 +1848,13 @@ fn folder_row(id: Uuid, kind: &str, path: Option<&str>, parent: Option<Uuid>) ->
     row
 }
 
-/// Posts `/Items/{id}/Refresh{query}` against a library resolving `root` (and
-/// `others`), returning the scans it queued and the provider refreshes.
-async fn refresh_folder(
-    root: BaseItemEntity,
-    others: Vec<BaseItemEntity>,
-    query: &str,
-) -> (Vec<(ScanTarget, MetadataRefreshOptions)>, Vec<Uuid>) {
-    let id = Uuid::parse_str(&root.id).expect("id");
-    let scans: RecordedScans = Arc::default();
-    let queued = Arc::new(Mutex::new(Vec::new()));
-    let router = create_router(state_with_library(
-        Arc::new(OkLibrary {
-            item_id: id,
-            is_folder: true,
-            top_parent_id: None,
-            refresh_scans: scans.clone(),
-            provider_ids: Arc::default(),
-            updated: Arc::default(),
-            tree: Arc::new(Tree {
-                root: Some(root),
-                others,
-                ..Tree::default()
-            }),
-        }),
-        queued.clone(),
-    ));
-    let response = router
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri(format!("/Items/{id}/Refresh{query}"))
-                .header("X-Emby-Token", "valid")
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(response.status(), StatusCode::NO_CONTENT);
-    let scans = scans.lock().unwrap().clone();
-    let queued = queued.lock().unwrap().clone();
-    (scans, queued)
-}
-
-/// What jellyfin-web's refresh dialog sends for each choice
-/// (`refreshdialog.js:76-90`), with "Replace existing images" ticked for the
-/// two full refreshes — its PascalCase keys as the server binary's query-key
-/// fold hands them to the router (`apps/ferrofin-server` lower-cases each
-/// key's first letter before routing).
-const SCAN_FOR_NEW: &str = "?recursive=true&imageRefreshMode=Default&metadataRefreshMode=Default&replaceAllImages=false&regenerateTrickplay=false&replaceAllMetadata=false";
-const SEARCH_MISSING: &str = "?recursive=true&imageRefreshMode=FullRefresh&metadataRefreshMode=FullRefresh&replaceAllImages=true&regenerateTrickplay=true&replaceAllMetadata=false";
-const REPLACE_ALL: &str = "?recursive=true&imageRefreshMode=FullRefresh&metadataRefreshMode=FullRefresh&replaceAllImages=true&regenerateTrickplay=false&replaceAllMetadata=true";
-
-/// `POST /Items/{itemId}/Refresh` on a library's CollectionFolder scans that
-/// library — never every library — with the request's options, for each of
-/// the dashboard's three choices (`ProviderManager.RefreshCollectionFolderChildren`
-/// validates the library's folders with the same options).
-#[tokio::test]
-async fn refresh_library_folder_scans_that_library_with_the_request_options() {
-    let folder_id = Uuid::from_u128(0x11B);
-    let library = || {
-        folder_row(
-            folder_id,
-            "MediaBrowser.Controller.Entities.CollectionFolder",
-            Some("/config/root/default/Movies"),
-            None,
-        )
-    };
-    let (scans, queued) = refresh_folder(library(), Vec::new(), SCAN_FOR_NEW).await;
-    // "Scan for new and updated files" is the scan's own default refresh,
-    // not automated (`ItemRefreshController.cs:86`).
-    assert_eq!(
-        scans,
-        vec![(
-            ScanTarget::Library(folder_id),
-            MetadataRefreshOptions {
-                is_automated: false,
-                ..MetadataRefreshOptions::default()
-            }
-        )]
-    );
-    assert!(
-        queued.is_empty(),
-        "a folder refresh drives the scan, not the provider queue"
-    );
-
-    let (scans, _) = refresh_folder(library(), Vec::new(), SEARCH_MISSING).await;
-    let expected = MetadataRefreshOptions {
-        metadata_refresh_mode: MetadataRefreshMode::FullRefresh,
-        image_refresh_mode: MetadataRefreshMode::FullRefresh,
-        replace_all_images: true,
-        force_save: true,
-        regenerate_trickplay: true,
-        is_automated: false,
-        ..MetadataRefreshOptions::default()
-    };
-    assert_eq!(scans, vec![(ScanTarget::Library(folder_id), expected)]);
-
-    let (scans, _) = refresh_folder(library(), Vec::new(), REPLACE_ALL).await;
-    let expected = MetadataRefreshOptions {
-        metadata_refresh_mode: MetadataRefreshMode::FullRefresh,
-        image_refresh_mode: MetadataRefreshMode::FullRefresh,
-        replace_all_metadata: true,
-        replace_all_images: true,
-        remove_old_metadata: true,
-        force_save: true,
-        is_automated: false,
-        ..MetadataRefreshOptions::default()
-    };
-    assert_eq!(scans, vec![(ScanTarget::Library(folder_id), expected)]);
-}
-
-/// Refreshing a folder nested inside a library (a series, season, album)
-/// scans THAT folder's subtree — `Folder.ValidateChildren` — not its whole
-/// library. With neither mode given, both are `None`
-/// (`ItemRefreshController.cs:64-65`) and nothing is forced.
-#[tokio::test]
-async fn refresh_nested_folder_scans_only_its_subtree() {
-    let series_id = Uuid::from_u128(0x5E1);
-    let series = folder_row(
-        series_id,
-        "MediaBrowser.Controller.Entities.TV.Series",
-        Some("/media/tv/Firefly"),
-        Some(Uuid::from_u128(0x11B2)),
-    );
-    let (scans, queued) = refresh_folder(series, Vec::new(), "").await;
-    assert_eq!(
-        scans,
-        vec![(
-            ScanTarget::Paths(vec!["/media/tv/Firefly".to_owned()]),
-            MetadataRefreshOptions {
-                metadata_refresh_mode: MetadataRefreshMode::None,
-                image_refresh_mode: MetadataRefreshMode::None,
-                is_automated: false,
-                ..MetadataRefreshOptions::default()
-            }
-        )]
-    );
-    assert!(queued.is_empty(), "{queued:?}");
-}
-
-/// A virtual season (episodes straight in the series folder) has no folder
-/// of its own, so upstream validates no children for it (not
-/// `IsFileProtocol`, `Folder.cs:430-436`): it refreshes itself only — never
-/// its whole series, which a "Replace all" would otherwise hit season by
-/// season.
-#[tokio::test]
-async fn refresh_virtual_season_refreshes_only_itself() {
-    let series_id = Uuid::from_u128(0x5E2);
-    let season_id = Uuid::from_u128(0x5E3);
-    let series = folder_row(
-        series_id,
-        "MediaBrowser.Controller.Entities.TV.Series",
-        Some("/media/tv/Flat Show"),
-        None,
-    );
-    let season = folder_row(
-        season_id,
-        "MediaBrowser.Controller.Entities.TV.Season",
-        None,
-        Some(series_id),
-    );
-    let (scans, queued) = refresh_folder(season, vec![series], REPLACE_ALL).await;
-    assert!(scans.is_empty(), "no scan: {scans:?}");
-    assert_eq!(queued, vec![season_id], "the season refreshes itself");
-}
-
-/// `ProviderManager.RefreshArtist` for an artist known only by name (a
-/// compilation's album artist, pathed in the metadata folder): the artist
-/// folders its credited albums sit under are scanned with the request's
-/// options, an album with no artist folder above it is not (its artist is
-/// the by-name one, whose validation is a no-op upstream), and the artist
-/// refreshes itself — in the same scan (`path: None`), whose music pass runs
-/// its MusicBrainz/TheAudioDB providers, never beside it through the
-/// provider queue.
-#[tokio::test]
-async fn refresh_by_name_artist_scans_its_albums_artist_folders_and_refreshes_itself() {
-    let artist_id = Uuid::from_u128(0xA1);
-    let (folder_a, folder_b) = (Uuid::from_u128(0xFA), Uuid::from_u128(0xFB));
-    let artist_kind = "MediaBrowser.Controller.Entities.Audio.MusicArtist";
-    let album_kind = "MediaBrowser.Controller.Entities.Audio.MusicAlbum";
-    let by_name = folder_row(
-        artist_id,
-        artist_kind,
-        Some("/config/metadata/artists/Various"),
-        None,
-    );
-    let mut others = Vec::new();
-    for (id, path) in [(folder_a, "/music/Artist A"), (folder_b, "/music/Artist B")] {
-        let mut row = folder_row(id, artist_kind, Some(path), Some(Uuid::from_u128(0x11B)));
-        row.top_parent_id = Some(Uuid::from_u128(0x11B).to_string());
-        others.push(row);
-    }
-    for (id, parent) in [
-        (0xAB1, Some(folder_a)),
-        (0xAB2, Some(folder_a)),
-        (0xAB3, Some(folder_b)),
-        (0xAB4, None),
-    ] {
-        others.push(folder_row(
-            Uuid::from_u128(id),
-            album_kind,
-            Some("/music/x"),
-            parent,
-        ));
-    }
-    let (scans, queued) = refresh_folder(by_name, others, SEARCH_MISSING).await;
-    assert_eq!(scans.len(), 1);
-    assert_eq!(
-        scans[0].0,
-        ScanTarget::Artist {
-            id: artist_id,
-            path: None,
-            folders: vec!["/music/Artist A".to_owned(), "/music/Artist B".to_owned()],
-        },
-        "the artist folders' children are validated, not those artists"
-    );
-    assert_eq!(
-        scans[0].1.metadata_refresh_mode,
-        MetadataRefreshMode::FullRefresh
-    );
-    assert!(
-        queued.is_empty(),
-        "the scan refreshes the by-name artist itself: {queued:?}"
-    );
-
-    // With no credited album under an artist folder there is nothing to
-    // validate: the scan target is the artist alone.
-    let by_name = folder_row(
-        artist_id,
-        artist_kind,
-        Some("/config/metadata/artists/Various"),
-        None,
-    );
-    let (scans, queued) = refresh_folder(by_name, Vec::new(), SEARCH_MISSING).await;
-    assert_eq!(
-        scans.iter().map(|(t, _)| t.clone()).collect::<Vec<_>>(),
-        vec![ScanTarget::Artist {
-            id: artist_id,
-            path: None,
-            folders: Vec::new(),
-        }]
-    );
-    assert!(queued.is_empty(), "{queued:?}");
-}
-
-/// A folder-backed artist refreshes itself in the scan, and only the artist
-/// folders its credited albums sit under are validated — its own when an
-/// album of its sits there, another artist's for a collaboration filed
-/// under that artist — never its own folder by default.
-#[tokio::test]
-async fn refresh_folder_backed_artist_validates_only_its_albums_folders() {
-    let artist_id = Uuid::from_u128(0xA2);
-    let other_id = Uuid::from_u128(0xA3);
-    let artist_kind = "MediaBrowser.Controller.Entities.Audio.MusicArtist";
-    let library = Uuid::from_u128(0x11B);
-    let folder = |id, path| {
-        let mut row = folder_row(id, artist_kind, Some(path), Some(library));
-        row.top_parent_id = Some(library.to_string());
-        row
-    };
-    let artist = folder(artist_id, "/music/Artist A");
-    let other = folder(other_id, "/music/Artist B");
-    // Its only credited album is a collaboration filed under Artist B.
-    let album = folder_row(
-        Uuid::from_u128(0xAB1),
-        "MediaBrowser.Controller.Entities.Audio.MusicAlbum",
-        Some("/music/Artist B/Duets"),
-        Some(other_id),
-    );
-    let (scans, queued) =
-        refresh_folder(artist.clone(), vec![artist, other, album], REPLACE_ALL).await;
-    assert_eq!(scans.len(), 1);
-    assert_eq!(
-        scans[0].0,
-        ScanTarget::Artist {
-            id: artist_id,
-            path: Some("/music/Artist A".to_owned()),
-            folders: vec!["/music/Artist B".to_owned()],
-        }
-    );
-    assert!(scans[0].1.replace_all_metadata);
-    assert!(queued.is_empty(), "the scan refreshes the artist itself");
-}
-
-/// The server root refreshes every library.
-#[tokio::test]
-async fn refresh_root_folder_scans_every_library() {
-    let root = folder_row(
-        Uuid::from_u128(0xA66),
-        "MediaBrowser.Controller.Entities.AggregateFolder",
-        Some("/config/root"),
-        None,
-    );
-    let (scans, _) = refresh_folder(root, Vec::new(), SCAN_FOR_NEW).await;
-    assert_eq!(
-        scans,
-        vec![(ScanTarget::All, controller_options(SCAN_FOR_NEW))]
-    );
-}
-
-/// A box set's members and a playlist's entries are linked, not physical:
-/// upstream validates no children for them (`BoxSet.GetNonCachedChildren`,
-/// `Playlist.ValidateChildrenInternal`), so their refresh is the item's own —
-/// the provider queue — and never a scan (it used to fall back to a scan of
-/// every library).
-#[tokio::test]
-async fn refresh_box_set_and_playlist_refresh_themselves() {
-    for kind in [
-        "MediaBrowser.Controller.Entities.Movies.BoxSet",
-        "MediaBrowser.Controller.Playlists.Playlist",
-    ] {
-        let id = Uuid::from_u128(0xB0);
-        let (scans, queued) = refresh_folder(
-            folder_row(id, kind, Some("/config/data/collections/Set"), None),
-            Vec::new(),
-            REPLACE_ALL,
-        )
-        .await;
-        assert!(scans.is_empty(), "{kind} is not scanned");
-        assert_eq!(queued, vec![id], "{kind} refreshes itself");
-    }
-}
-
 /// Posts `/Items/{id}/Refresh{query}` for the item row `root`, returning the
-/// scans it queued and the provider refreshes' item ids and options.
-async fn refresh_row(
-    root: BaseItemEntity,
-    query: &str,
-) -> (
-    Vec<(ScanTarget, MetadataRefreshOptions)>,
-    Vec<Uuid>,
-    Vec<MetadataRefreshOptions>,
-) {
+/// refreshes the library was asked to queue. What a refresh covers, and
+/// whether it reaches the provider manager, is the library's
+/// (`LibraryManager::queue_item_refresh`), so the handler queues none there.
+async fn refresh_row(root: BaseItemEntity, query: &str) -> Vec<(Uuid, MetadataRefreshOptions)> {
     let id = Uuid::parse_str(&root.id).expect("id");
-    let scans: RecordedScans = Arc::default();
+    let refreshes: RecordedRefreshes = Arc::default();
     let queued = Arc::new(Mutex::new(Vec::new()));
     let options = RecordedOptions::default();
     let router = create_router(state_recording_options(
@@ -2213,7 +1862,7 @@ async fn refresh_row(
             item_id: id,
             is_folder: root.is_folder,
             top_parent_id: None,
-            refresh_scans: scans.clone(),
+            refreshes: refreshes.clone(),
             provider_ids: Arc::default(),
             updated: Arc::default(),
             tree: Arc::new(Tree {
@@ -2236,105 +1885,89 @@ async fn refresh_row(
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::NO_CONTENT);
-    let scans = scans.lock().unwrap().clone();
-    let queued = queued.lock().unwrap().clone();
-    let options = options.lock().unwrap().clone();
-    (scans, queued, options)
+    assert!(queued.lock().unwrap().is_empty());
+    assert!(options.lock().unwrap().is_empty());
+    refreshes.lock().unwrap().clone()
 }
 
-/// The options `ItemRefreshController` builds for a dashboard choice.
-fn controller_options(query: &str) -> MetadataRefreshOptions {
-    use ferrofin_traits::providers::MetadataRefreshMode;
-    match query {
-        SCAN_FOR_NEW => MetadataRefreshOptions::for_item_refresh(
-            MetadataRefreshMode::Default,
-            MetadataRefreshMode::Default,
-            false,
-            false,
-            false,
-        ),
-        SEARCH_MISSING => MetadataRefreshOptions::for_item_refresh(
-            MetadataRefreshMode::FullRefresh,
-            MetadataRefreshMode::FullRefresh,
-            false,
-            true,
-            true,
-        ),
-        _ => MetadataRefreshOptions::for_item_refresh(
-            MetadataRefreshMode::FullRefresh,
-            MetadataRefreshMode::FullRefresh,
-            true,
-            true,
-            false,
-        ),
-    }
-}
+/// What jellyfin-web's refresh dialog sends for each choice
+/// (`refreshdialog.js:76-90`), with "Replace existing images" ticked for the
+/// two full refreshes — its PascalCase keys as the server binary's query-key
+/// fold hands them to the router (`apps/ferrofin-server` lower-cases each
+/// key's first letter before routing).
+const SCAN_FOR_NEW: &str = "?recursive=true&imageRefreshMode=Default&metadataRefreshMode=Default&replaceAllImages=false&regenerateTrickplay=false&replaceAllMetadata=false";
+const SEARCH_MISSING: &str = "?recursive=true&imageRefreshMode=FullRefresh&metadataRefreshMode=FullRefresh&replaceAllImages=true&regenerateTrickplay=true&replaceAllMetadata=false";
+const REPLACE_ALL: &str = "?recursive=true&imageRefreshMode=FullRefresh&metadataRefreshMode=FullRefresh&replaceAllImages=true&regenerateTrickplay=false&replaceAllMetadata=true";
 
-/// Phase 5b: `POST /Items/{itemId}/Refresh` on a file item — a movie, an
-/// episode, a track, a book, a photo — is the library scan of its own path
-/// with the request's options (`ForceSave`/`RemoveOldMetadata` by the
-/// controller's rule), so it gets the scan's decision, merge, locks, probe,
-/// NFO and every provider; the provider queue is not used, and nothing else
-/// of its library is walked.
+/// `POST /Items/{itemId}/Refresh` hands the item and the options
+/// `ItemRefreshController` builds to the library's queued refresh
+/// (`QueueRefresh`), for each of the dashboard's three choices and for a
+/// request naming no mode: both are then `None`
+/// (`ItemRefreshController.cs:64-65`) and nothing is forced. It answers
+/// `204` without waiting for the refresh.
 #[tokio::test]
-async fn refresh_a_file_item_scans_its_own_path_with_the_request_options() {
-    for kind in [
-        "MediaBrowser.Controller.Entities.Movies.Movie",
-        "MediaBrowser.Controller.Entities.TV.Episode",
-        "MediaBrowser.Controller.Entities.Audio.Audio",
-        "MediaBrowser.Controller.Entities.Book",
-        "MediaBrowser.Controller.Entities.Photo",
+async fn refresh_hands_the_item_and_the_request_options_to_the_library() {
+    let folder_id = Uuid::from_u128(0x11B);
+    let library = || {
+        folder_row(
+            folder_id,
+            "MediaBrowser.Controller.Entities.CollectionFolder",
+            Some("/config/root/default/Movies"),
+            None,
+        )
+    };
+    // "Scan for new and updated files" is the scan's own default refresh,
+    // not automated (`ItemRefreshController.cs:86`).
+    let scan_for_new = MetadataRefreshOptions {
+        is_automated: false,
+        ..MetadataRefreshOptions::default()
+    };
+    let search_missing = MetadataRefreshOptions {
+        metadata_refresh_mode: MetadataRefreshMode::FullRefresh,
+        image_refresh_mode: MetadataRefreshMode::FullRefresh,
+        replace_all_images: true,
+        force_save: true,
+        regenerate_trickplay: true,
+        is_automated: false,
+        ..MetadataRefreshOptions::default()
+    };
+    let replace_all = MetadataRefreshOptions {
+        metadata_refresh_mode: MetadataRefreshMode::FullRefresh,
+        image_refresh_mode: MetadataRefreshMode::FullRefresh,
+        replace_all_metadata: true,
+        replace_all_images: true,
+        remove_old_metadata: true,
+        force_save: true,
+        is_automated: false,
+        ..MetadataRefreshOptions::default()
+    };
+    let no_mode = MetadataRefreshOptions {
+        metadata_refresh_mode: MetadataRefreshMode::None,
+        image_refresh_mode: MetadataRefreshMode::None,
+        is_automated: false,
+        ..MetadataRefreshOptions::default()
+    };
+    for (query, expected) in [
+        (SCAN_FOR_NEW, scan_for_new),
+        (SEARCH_MISSING, search_missing),
+        (REPLACE_ALL, replace_all),
+        ("", no_mode),
     ] {
-        for query in [SCAN_FOR_NEW, SEARCH_MISSING, REPLACE_ALL] {
-            let id = Uuid::from_u128(0xF11E);
-            let mut row = base_item_entity(id);
-            kind.clone_into(&mut row.type_);
-            row.is_folder = false;
-            row.path = Some("/media/lib/Some Item/file.ext".to_owned());
-            row.top_parent_id = Some(Uuid::from_u128(0x11B).to_string());
-            let (scans, queued, _) = refresh_row(row, query).await;
-            assert_eq!(
-                scans,
-                vec![(
-                    ScanTarget::Items(vec!["/media/lib/Some Item/file.ext".to_owned()]),
-                    controller_options(query)
-                )],
-                "{kind} {query}"
-            );
-            assert!(queued.is_empty(), "{kind}: the provider queue is not used");
-        }
+        assert_eq!(
+            refresh_row(library(), query).await,
+            vec![(folder_id, expected)],
+            "{query}"
+        );
     }
-}
-
-/// An item with no file of its own in a library — a person, a channel item
-/// streamed from a URL, a row outside every library — refreshes through the
-/// provider queue, now with the controller's options (`ForceSave`,
-/// `RemoveOldMetadata`), where it used to drop both.
-#[tokio::test]
-async fn refresh_an_item_with_no_file_refreshes_through_the_provider_queue() {
-    let person = {
-        let mut row = base_item_entity(Uuid::from_u128(0xFE));
-        "MediaBrowser.Controller.Entities.Person".clone_into(&mut row.type_);
-        row.is_folder = false;
-        row.path = Some("/config/metadata/People/A/Actor".to_owned());
-        row.top_parent_id = None;
-        row
-    };
-    let streamed = {
-        let mut row = base_item_entity(Uuid::from_u128(0xFF));
-        row.is_folder = false;
-        row.path = Some("http://tuner.local/stream/7".to_owned());
-        row.top_parent_id = Some(Uuid::from_u128(0x11B).to_string());
-        row
-    };
-    for row in [person, streamed] {
-        let id = Uuid::parse_str(&row.id).expect("id");
-        let (scans, queued, options) = refresh_row(row, REPLACE_ALL).await;
-        assert!(scans.is_empty(), "{scans:?}");
-        assert_eq!(queued, vec![id]);
-        assert_eq!(options, vec![controller_options(REPLACE_ALL)]);
-        assert!(options[0].force_save && options[0].remove_old_metadata);
-    }
+    let file = base_item_entity(Uuid::from_u128(0x5B));
+    assert_eq!(
+        refresh_row(file, "?metadataRefreshMode=FullRefresh")
+            .await
+            .iter()
+            .map(|(id, options)| (*id, options.metadata_refresh_mode))
+            .collect::<Vec<_>>(),
+        [(Uuid::from_u128(0x5B), MetadataRefreshMode::FullRefresh)]
+    );
 }
 
 /// `POST /Items/{itemId}/Refresh` for a missing item is a `404`; for the nil
@@ -2480,7 +2113,7 @@ fn content_type_library(
         item_id: ITEM_ID,
         is_folder: item.is_folder,
         top_parent_id: None,
-        refresh_scans: Arc::default(),
+        refreshes: Arc::default(),
         provider_ids: Arc::default(),
         updated: Arc::default(),
         tree: Arc::new(Tree {

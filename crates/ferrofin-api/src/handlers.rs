@@ -26,64 +26,48 @@ use crate::state::AppState;
 /// RefreshPriority.High)` call the subtitle/lyric upload+download handlers make
 /// after mutating an item's sidecar files, so the freshly added stream is picked
 /// up. Uses [`MetadataRefreshOptions::default`] (the C# constructor with only a
-/// directory service: `Default` modes, nothing replaced). A file item refreshes
-/// through the library scan of its path, whose probe re-runs because its
-/// sidecar set changed (`ProbeProvider.HasChanged`); an item with no file of
-/// its own through the provider manager.
+/// directory service: `Default` modes, nothing replaced), and refreshes as
+/// [`LibraryManager::queue_item_refresh`] says: a file item through the
+/// library scan of its path, whose probe re-runs because its sidecar set
+/// changed (`ProbeProvider.HasChanged`). An item no longer stored is not
+/// refreshed, as the refresh queue skips it.
+///
+/// [`MetadataRefreshOptions::default`]: ferrofin_traits::providers::MetadataRefreshOptions::default
+/// [`LibraryManager::queue_item_refresh`]: ferrofin_traits::library::LibraryManager::queue_item_refresh
 pub(crate) async fn queue_high_priority_refresh(
     state: &AppState,
     item_id: Uuid,
 ) -> Result<(), ApiError> {
-    use ferrofin_traits::library::ScanTarget;
-    use ferrofin_traits::providers::{MetadataRefreshOptions, RefreshPriority};
-    let options = MetadataRefreshOptions::default();
-    let item = state.library.get_item_by_id(item_id).await?;
-    if let Some(path) = item.as_ref().and_then(refresh_scan_path) {
-        state
-            .library
-            .queue_refresh_scan(ScanTarget::Items(vec![path]), &options)
-            .await?;
+    use ferrofin_traits::providers::MetadataRefreshOptions;
+    let Some(item) = state.library.get_item_by_id(item_id).await? else {
         return Ok(());
-    }
+    };
     state
-        .providers
-        .queue_refresh(item_id, &options, RefreshPriority::High)
+        .library
+        .queue_item_refresh(&item, &MetadataRefreshOptions::default())
         .await?;
     Ok(())
 }
 
 /// Runs an item's default metadata refresh and returns once it has run —
 /// `item.RefreshMetadata(CancellationToken.None)`, which a handler awaits
-/// rather than queues. A file item refreshes through the scan queue's
-/// priority lane ([`LibraryManager::run_refresh_scan`]), on a task of its own
-/// so a client that hangs up does not withdraw it; an item with no file of
-/// its own is queued as [`queue_high_priority_refresh`] does.
+/// rather than queues ([`LibraryManager::refresh_item_metadata`]), on a task
+/// of its own so a client that hangs up does not withdraw it. An item no
+/// longer stored is not refreshed.
 ///
-/// [`LibraryManager::run_refresh_scan`]: ferrofin_traits::library::LibraryManager::run_refresh_scan
+/// [`LibraryManager::refresh_item_metadata`]: ferrofin_traits::library::LibraryManager::refresh_item_metadata
 pub(crate) async fn run_item_refresh(state: &AppState, item_id: Uuid) -> Result<(), ApiError> {
-    use ferrofin_traits::error::ServiceError;
-    use ferrofin_traits::library::ScanTarget;
     use ferrofin_traits::providers::MetadataRefreshOptions;
-    let item = state.library.get_item_by_id(item_id).await?;
-    let Some(path) = item.as_ref().and_then(refresh_scan_path) else {
-        return queue_high_priority_refresh(state, item_id).await;
+    let Some(item) = state.library.get_item_by_id(item_id).await? else {
+        return Ok(());
     };
     let library = std::sync::Arc::clone(&state.library);
-    // In the request's span: the request awaits it (LOGGING.md §4).
-    let ran = tokio::spawn(tracing::Instrument::in_current_span(async move {
+    let ran = run_detached(async move {
         library
-            .run_refresh_scan(
-                ScanTarget::Items(vec![path]),
-                &MetadataRefreshOptions::default(),
-            )
+            .refresh_item_metadata(&item, &MetadataRefreshOptions::default())
             .await
-    }))
-    .await
-    .map_err(|err| {
-        ApiError::Service(ServiceError::backend(format!(
-            "item refresh task failed: {err}"
-        )))
-    })??;
+    })
+    .await?;
     if !ran {
         return Err(ApiError::ServiceUnavailable(format!(
             "the refresh of item {item_id} was stopped before it finished"
@@ -92,52 +76,40 @@ pub(crate) async fn run_item_refresh(state: &AppState, item_id: Uuid) -> Result<
     Ok(())
 }
 
-/// Whether the library scan can reach `target`: every path of it lies under
-/// a location of a configured library (the scan plans nothing anywhere
-/// else). A library or the root always can.
-pub(crate) async fn scan_reaches(
-    state: &AppState,
-    target: &ferrofin_traits::library::ScanTarget,
-) -> Result<bool, ApiError> {
-    use ferrofin_traits::library::ScanTarget;
-    let (ScanTarget::Paths(paths) | ScanTarget::Items(paths)) = target else {
-        return Ok(true);
-    };
-    let folders = state.virtual_folders.get_virtual_folders().await?;
-    Ok(paths.iter().all(|path| {
-        folders.iter().any(|folder| {
-            folder
-                .locations
-                .iter()
-                .any(|location| path_is_under(path, location))
-        })
-    }))
-}
-
-/// Whether `path` is `root` or lies under it, component-wise.
-fn path_is_under(path: &str, root: &str) -> bool {
-    let root = root.trim_end_matches('/');
-    path == root
-        || path
-            .strip_prefix(root)
-            .is_some_and(|rest| rest.starts_with('/'))
-}
-
-/// The path an item refreshes through the library scan by: its own
-/// filesystem path, when it has one inside a library. `None` for an item
-/// with no file of its own — a person, a genre or studio, a channel or
-/// live-TV item streamed from a URL, a row outside every library — which the
-/// provider manager refreshes.
-pub(crate) fn refresh_scan_path(
-    item: &ferrofin_db::entities::base_items::BaseItemEntity,
-) -> Option<String> {
-    let in_library = item
-        .top_parent_id
-        .as_deref()
-        .is_some_and(|top| !top.is_empty());
-    item.path
-        .clone()
-        .filter(|path| in_library && !path.is_empty() && !path.contains("://"))
+/// Runs work a handler awaits on a task of its own, so a client that hangs up
+/// does not stop it: upstream passes `CancellationToken.None`, or no token,
+/// and never reads `RequestAborted`. The task keeps the request's span (the
+/// request awaits it, LOGGING.md §4) and its culture, which a spawned task
+/// does not inherit (.NET's `ExecutionContext` flows it). Once the client has
+/// gone, no answer carries the work's error, so the task logs it as the
+/// error boundary would have (LOGGING.md §2).
+pub(crate) async fn run_detached<T, E>(
+    work: impl std::future::Future<Output = Result<T, E>> + Send + 'static,
+) -> Result<T, ApiError>
+where
+    T: Send + 'static,
+    E: Into<ApiError> + Send + 'static,
+{
+    let (answer, answered) = tokio::sync::oneshot::channel();
+    let culture = ferrofin_util::current_culture::capture();
+    tokio::spawn(tracing::Instrument::in_current_span(
+        ferrofin_util::current_culture::scope(culture, async move {
+            if let Err(Err(error)) = answer.send(work.await.map_err(Into::into)) {
+                // The client has gone: building its answer logs a 5xx once, as
+                // the error boundary does for a client still connected.
+                drop(axum::response::IntoResponse::into_response(error));
+            }
+        }),
+    ));
+    // No answer: the work panicked, which the panic hook logged (LOGGING.md §7),
+    // or the shutdown dropped it.
+    answered.await.unwrap_or_else(|_| {
+        Err(ApiError::Service(
+            ferrofin_traits::error::ServiceError::backend(
+                "the request's task stopped before it answered",
+            ),
+        ))
+    })
 }
 
 pub mod activity_log;
@@ -3365,7 +3337,9 @@ pub const VERIFIED: &[Verified] = &[
         upstream_method: "UploadLyrics",
         ferrofin: "handlers/lyrics.rs upload_lyrics (require_item with GetItemById's 400 for \
                a nil id, an empty body by its size hint, upload_format, then the Bytes read \
-               under upload_body_limit; queue_high_priority_refresh) → ferrofin-core \
+               under upload_body_limit; the save and queue_high_priority_refresh on \
+               handlers.rs run_detached's task, so they finish for a client that hangs up \
+               once the body is read, as SaveLyricAsync takes no token) → ferrofin-core \
                lyric_manager.rs save_lyric \
                (decode_stream_text, parse_by_format on the format as given, save_targets \
                with save_extension, try_save_to_files)",
@@ -3392,7 +3366,10 @@ pub const VERIFIED: &[Verified] = &[
         upstream_file: "Jellyfin.Api/Controllers/LyricsController.cs",
         upstream_method: "DeleteLyrics",
         ferrofin: "handlers/lyrics.rs delete_lyrics (require_item: GetItemById's 400 for a \
-               nil id; run_item_refresh) → ferrofin-core lyric_manager.rs delete_lyrics",
+               nil id; the delete and run_item_refresh on handlers.rs run_detached's task, so \
+               they finish for a client that hangs up, as DeleteLyricsAsync's \
+               RefreshMetadata(CancellationToken.None) does) → ferrofin-core lyric_manager.rs \
+               delete_lyrics",
         date: "2026-11-11",
         divergences: &[
             "The 400 (nil item id) and 404 (no such item, or one the caller may not see) bodies \
@@ -3422,8 +3399,11 @@ pub const VERIFIED: &[Verified] = &[
         upstream_method: "DownloadRemoteLyrics",
         ferrofin: "handlers/lyrics.rs download_remote_lyrics (RequiredRouteString lyricId: \
                ConvertEmptyStringToNull, then [Required]; require_item: GetItemById's 400 for \
-               a nil id; queue_high_priority_refresh) → ferrofin-core lyric_manager.rs \
-               download_lyrics (fetch_remote, save_targets, try_save_to_files)",
+               a nil id; the download and queue_high_priority_refresh on handlers.rs \
+               run_detached's task, so they finish for a client that hangs up, as \
+               DownloadLyricsAsync gets CancellationToken.None) → ferrofin-core \
+               lyric_manager.rs download_lyrics (fetch_remote, save_targets, \
+               try_save_to_files)",
         date: "2026-11-11",
         divergences: &[
             "The 400 (nil item id) and 404 (no such item, one the caller may not see, or no \
@@ -4132,7 +4112,9 @@ pub const VERIFIED: &[Verified] = &[
         upstream_method: "UpdateNamedConfiguration",
         ferrofin: "handlers/config.rs update_named_configuration (RequiredRouteString key: \
                ConvertEmptyStringToNull, then [Required]; normalize_named_configuration: \
-               GetConfigurationType and Deserialize) → save_named_configuration \
+               GetConfigurationType and Deserialize) → save_named_configuration, on \
+               handlers.rs run_detached's task so it finishes for a client that hangs up, in \
+               the request's span and culture \
                (BaseConfigurationManager.SaveConfiguration: the validating store, the write, \
                the live network policy (ferrofin-networking NetworkManager::update_settings: \
                UpdateSettings, warning of each LAN or exclusion entry InitializeLan ignores \
@@ -5583,8 +5565,9 @@ pub const VERIFIED: &[Verified] = &[
                NotFound()'s ProblemDetails 404; every other failure answered as \
                ExceptionMiddleware answers a throw, its status with text/plain \"Error \
                processing request.\" (error.rs into_exception_response); the delete and the \
-               refresh on a task of their own, as upstream finishes them for a client that \
-               hangs up) → ferrofin-core subtitle_manager.rs delete_subtitles \
+               refresh on handlers.rs run_detached's task, in the request's span and culture, \
+               as upstream finishes them for a client that hangs up, logging a failure no \
+               answer carries) → ferrofin-core subtitle_manager.rs delete_subtitles \
                (SubtitleManager.DeleteSubtitles: GetMediaStreams for the subtitle stream at \
                index, none or one with no or an empty path the 400; a row not marked \
                external is skipped too, which changes no answer, since neither server stores \
@@ -5726,8 +5709,11 @@ pub const VERIFIED: &[Verified] = &[
                GetItemById<Video>(itemId, User.GetUserId()): a missing, hidden or non-video \
                item is a 404; the download and the refresh queued after it share one try, \
                whose failure is logged at error as \"Error downloading subtitles\" and still \
-               answered 204) → ferrofin-core subtitle_manager.rs download_subtitles, route and \
-               attach (SubtitleManager.DownloadSubtitles, GetProvider and GetRemoteSubtitles' \
+               answered 204; the try runs on handlers.rs run_detached's task, so for a client \
+               that hangs up both still finish and a failure is still logged, as \
+               DownloadSubtitles gets CancellationToken.None) → ferrofin-core \
+               subtitle_manager.rs download_subtitles, route and attach \
+               (SubtitleManager.DownloadSubtitles, GetProvider and GetRemoteSubtitles' \
                Split('_', 2): an id naming no provider fails the download; TrySaveSubtitle and \
                TrySaveToFiles: the library's SaveSubtitlesWithMedia picks the folder beside the \
                media path or the item's internal-metadata folder, \
@@ -5754,9 +5740,6 @@ pub const VERIFIED: &[Verified] = &[
             "The subtitle is recorded as an external stream as soon as it is written; upstream \
          leaves that to the queued refresh's probe, so the item lists it here before the \
          refresh has run, and also when queueing the refresh failed. Fix path: gl-1641.",
-            "A client that hangs up stops the download, the write or the refresh where it \
-         is, unlogged; upstream passes CancellationToken.None and finishes them. Fix path: \
-         gl-1645.",
             "A nil itemId is a 404, not GetItemById's 400. Fix path: gl-1695.",
             "A whitespace-only subtitleId is taken (a logged failed download and a 204, or a \
          404 for a missing or hidden item); upstream's model validation answers 400 before \
@@ -5997,9 +5980,11 @@ pub const VERIFIED: &[Verified] = &[
                id) → MetadataRefreshOptions \
                with FullRefresh for metadata and images, ReplaceAllMetadata, \
                RemoveOldMetadata, ReplaceAllImages = replaceAllImages and SearchResult = the \
-               body → RefreshFullItem awaited on a task of its own (CancellationToken.None): \
-               an item with a path through LibraryManager::run_refresh_scan of \
-               item_update.rs refresh_scan_target in the scan queue's priority lane \
+               body → LibraryManager::refresh_full_item (RefreshFullItem) awaited on \
+               handlers.rs run_detached's task (CancellationToken.None; the request's span \
+               and culture, a failure after a hang-up logged), routed by ferrofin-core \
+               library_manager/item_refresh.rs identify_target: an item with a path \
+               through run_refresh_scan of scan_target in the scan queue's priority lane \
                (RefreshItem: the item, then ValidateChildren with the same options, so a \
                folder's children refresh under the chosen result too), an artist known only \
                by name through the scanner's ScanTarget::Artist, any other item through \
@@ -6038,15 +6023,18 @@ pub const VERIFIED: &[Verified] = &[
                and replaceAllMetadata, replaceAllImages and regenerateTrickplay to false; \
                MetadataRefreshOptions::for_item_refresh: ForceSave for a FullRefresh of \
                either kind or either replace, RemoveOldMetadata = replaceAllMetadata, \
-               IsAutomated false, RegenerateTrickplay) → queue_item_refresh by \
-               refresh_route (QueueRefresh at High priority, then the queue's RefreshItem \
-               or RefreshArtist): a CollectionFolder's physical folders \
+               IsAutomated false, RegenerateTrickplay) → \
+               LibraryManager::queue_item_refresh, routed by ferrofin-core \
+               library_manager/item_refresh.rs refresh_target (QueueRefresh at High \
+               priority, then the queue's RefreshItem or RefreshArtist): a \
+               CollectionFolder's physical folders \
                (RefreshCollectionFolderChildren), every library for the root, another \
                folder's subtree (the folder, then ValidateChildren with the same options) \
                and a file's own path (RefreshSingleItem's metadata service), each as a scan \
-               through LibraryManager::queue_refresh_scan; a music artist by \
-               artist_refresh_route (RefreshArtist: the artist folders above its credited \
-               albums validate their children, then the artist refreshes); a box set, \
+               through queue_refresh_scan; a music artist by artist_target \
+               (RefreshArtist: the artist folders above its credited albums, found from \
+               one read of the ancestors per album folder as MusicAlbum.GetMusicArtist \
+               walks them, validate their children, then the artist refreshes); a box set, \
                playlist, view, virtual season, person, genre, studio or channel through \
                ProviderManager::queue_refresh at High priority → 204 without waiting for \
                the refresh.",
@@ -6859,4 +6847,32 @@ pub fn register(router: Router<AppState>) -> Router<AppState> {
     // The session WebSocket (`/socket`) — not in the OpenAPI contract; jellyfin-web
     // needs it to establish a connection or it reports "Connection Failure".
     websocket::register(router)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::run_detached;
+
+    /// The detached work runs inside the request's span, so its logs and
+    /// spans stay under `http_request` (LOGGING.md §4), and under the
+    /// request's culture.
+    #[tokio::test]
+    async fn detached_work_keeps_the_requests_span_and_culture() {
+        use tracing::Instrument as _;
+        let _subscriber = tracing::subscriber::set_default(tracing_subscriber::registry());
+        let span = tracing::info_span!("http_request");
+        let seen = ferrofin_util::current_culture::scope(
+            "sv".to_owned(),
+            run_detached(async {
+                let span = tracing::Span::current()
+                    .metadata()
+                    .map(tracing::Metadata::name);
+                Ok::<_, crate::error::ApiError>((span, ferrofin_util::current_culture::capture()))
+            }),
+        )
+        .instrument(span)
+        .await
+        .expect("ran");
+        assert_eq!(seen, (Some("http_request"), "sv".to_owned()));
+    }
 }
