@@ -14130,6 +14130,81 @@ mod tests {
         }
     }
 
+    /// With no user (an API key), `DatePlayed` is the newest play by any user
+    /// on the item or its alternate versions: `OrderMapper.cs:32-48` reads all
+    /// of `UserData` when `query.User` is null. A user's own sort still reads
+    /// only that user's rows.
+    #[tokio::test]
+    async fn date_played_without_a_user_reads_every_users_plays() {
+        use ferrofin_model::dto::SortOrder;
+        use ferrofin_model::live_tv::ItemSortBy;
+
+        let db = test_db().await;
+        let repository = repo(&db);
+        let library = Uuid::from_u128(0x9F11);
+        let a = Uuid::from_u128(0x9F12);
+        let b = Uuid::from_u128(0x9F13);
+        let b_alt = Uuid::from_u128(0x9F14);
+        let c = Uuid::from_u128(0x9F15);
+        seed_named_item(&db, library, BaseItemKind::CollectionFolder, "Movies").await;
+        seed_top_parented_item(&db, a, BaseItemKind::Movie, "Alpha", library).await;
+        seed_top_parented_item(&db, b, BaseItemKind::Movie, "Beta", library).await;
+        seed_top_parented_item(&db, b_alt, BaseItemKind::Movie, "Beta 4K", library).await;
+        seed_top_parented_item(&db, c, BaseItemKind::Movie, "Gamma", library).await;
+        sqlx::query(r#"UPDATE "BaseItems" SET "PrimaryVersionId" = ?1 WHERE "Id" = ?2"#)
+            .bind(guid_to_db(b))
+            .bind(guid_to_db(b_alt))
+            .execute(db.writer())
+            .await
+            .expect("link alternate");
+        let first = seed_user_with_defaults(&db, Uuid::from_u128(0x9F16)).await;
+        let second_id = Uuid::from_u128(0x9F17);
+        let second = crate::test_support::seed_named_user(&db, second_id, "second").await;
+        crate::test_support::grant_default_permissions(&db, second_id).await;
+        // The second user played Alpha in February and Beta in January; the
+        // first played Beta's alternate in March. Gamma was never played.
+        for (item, user, date) in [
+            (a, &second, "2026-02-01 00:00:00.0000000"),
+            (b, &second, "2026-01-01 00:00:00.0000000"),
+            (b_alt, &first, "2026-03-01 00:00:00.0000000"),
+        ] {
+            sqlx::query(
+                r#"INSERT INTO "UserData"
+                   ("ItemId", "UserId", "CustomDataKey", "IsFavorite", "LastPlayedDate",
+                    "PlayCount", "PlaybackPositionTicks", "Played")
+                   VALUES (?1, ?2, ?1, 0, ?3, 1, 0, 1)"#,
+            )
+            .bind(guid_to_db(item))
+            .bind(&user.id)
+            .bind(date)
+            .execute(db.writer())
+            .await
+            .expect("user data");
+        }
+
+        let names = |user: Option<UserEntity>| {
+            let repository = &repository;
+            async move {
+                repository
+                    .get_item_list(&InternalItemsQuery {
+                        user: user.map(Arc::new),
+                        recursive: true,
+                        include_item_types: vec![BaseItemKind::Movie],
+                        order_by: vec![(ItemSortBy::DatePlayed, SortOrder::Descending)],
+                        ..InternalItemsQuery::default()
+                    })
+                    .await
+                    .expect("sorted")
+                    .into_iter()
+                    .filter_map(|r| r.name)
+                    .collect::<Vec<_>>()
+            }
+        };
+        // Beta's date is the first user's play of its alternate.
+        assert_eq!(names(None).await, ["Beta", "Alpha", "Gamma"]);
+        assert_eq!(names(Some(second)).await, ["Alpha", "Beta", "Gamma"]);
+    }
+
     /// v12's `IsResumable` folder rule (`TranslateQuery.cs:562-575`,
     /// `_resumableFolderKinds = [Series, Season]`): a series or season is
     /// resumable when a leaf descendant is in progress, or when it has both a

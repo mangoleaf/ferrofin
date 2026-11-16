@@ -3495,6 +3495,10 @@ impl LiveTvManager for FerrofinLiveTvManager {
             Some(uid) if needs_user_data => {
                 crate::guide_repository::channel_user_data(&self.db, uid).await?
             }
+            // Without a user, `DatePlayed` is every user's newest play.
+            None if query.sort_by.contains(&ItemSortBy::DatePlayed) => {
+                crate::guide_repository::channel_last_played_by_anyone(&self.db).await?
+            }
             _ => HashMap::new(),
         };
         crate::projection::filter_channel_rows(&mut rows, query, &user_data);
