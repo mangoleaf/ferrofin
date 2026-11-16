@@ -5482,7 +5482,12 @@ pub const VERIFIED: &[Verified] = &[
                version, PRODUCT_NAME (Name), the system id (DeviceId), the startup-wizard flag, \
                the lifecycle's restart-pending and shutting-down flags (which operations raise \
                the first is theirs to record), the bound HTTP \
-               port (HttpPort), the paths (ProgramDataPath, WebPath, LogDirectoryPath, \
+               port (HttpPort), CompletedInstallations from plugin_manager.rs \
+               completed_installations (InstallationManager.CompletedInstallations: the \
+               InstallationInfo GetCompatibleVersions built for each package install_package \
+               staged since the boot, by POST /Packages/Installed/{name} or the Update Plugins \
+               task, a failed one left out, in install order where upstream's ConcurrentBag \
+               keeps none), the paths (ProgramDataPath, WebPath, LogDirectoryPath, \
                InternalMetadataPath for both ItemsByNamePath and InternalMetadataPath, \
                CachePath) and the live transcode path prepared as GetTranscodePath's \
                CreateAndCheckMarker (a 500 when it cannot be), CastReceiverApplications \
@@ -5490,7 +5495,7 @@ pub const VERIFIED: &[Verified] = &[
                kept), SupportsLibraryMonitor true and the obsolete members' fixed values. \
                Probed on Jellyfin 12.4: LocalAddress for a published override naming port 80, \
                ServerName with no name saved, the body with the wizard incomplete",
-        date: "2026-11-14",
+        date: "2026-11-15",
         divergences: &[
             "Version is the Jellyfin release Ferrofin emulates (openapi.rs \
          JELLYFIN_API_VERSION, 12.4.0), not Ferrofin's own release version, which upstream's \
@@ -5499,9 +5504,6 @@ pub const VERIFIED: &[Verified] = &[
             "PackageName is the constant ferrofin-server; upstream reports its --package-name \
          startup option and omits the member without one. Fix path: gl-1755, whose default \
          awaits an owner decision.",
-            "CompletedInstallations is always empty: a plugin installed or updated from a \
-         repository is never listed, where upstream's InstallationManager lists every \
-         package it installed since startup. Fix path: gl-1776.",
             "With no server name saved, ServerName falls back to the server_name setting, \
          whose default is the HOSTNAME environment variable, else ferrofin; upstream's is \
          Environment.MachineName, the host name cut at its first dot. Fix path: gl-1777.",

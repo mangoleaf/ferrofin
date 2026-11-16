@@ -15,8 +15,10 @@
 //! - `IHostApplicationLifetime` → the injected [`LifecycleController`] seam
 //!   (`StopApplication`, restart flag). Not a ferrofin-traits trait — the C#
 //!   equivalent is ASP.NET Core hosting — so it is defined here.
-//! - `IInstallationManager` (completed installations) and `IStartupOptions`
-//!   (package name), plus the host facts that are *not* on the
+//! - `IInstallationManager` (completed installations) → the injected
+//!   [`PluginManager`], which installs packages here
+//!   ([`with_installation_manager`](FerrofinSystemManager::with_installation_manager)).
+//! - `IStartupOptions` (package name), plus the host facts that are *not* on the
 //!   [`ServerApplicationHost`] trait (server version string, system id, product
 //!   name), are supplied as a plain [`SystemHostFacts`] value — the composition
 //!   root fills them.
@@ -38,6 +40,7 @@ use ferrofin_model::system::{
 use ferrofin_traits::configuration::ServerConfigurationManager;
 use ferrofin_traits::error::ServiceError;
 use ferrofin_traits::net::RequestContext;
+use ferrofin_traits::plugins::{DisabledPluginManager, PluginManager};
 use ferrofin_traits::system::{ServerApplicationHost, ServerApplicationPaths};
 
 use crate::app_paths::FerrofinServerApplicationPaths;
@@ -45,8 +48,7 @@ use crate::app_paths::FerrofinServerApplicationPaths;
 /// Static host facts not exposed by the [`ServerApplicationHost`] trait.
 ///
 /// Filled by the composition root. Mirrors the C# `IServerApplicationHost`
-/// `ApplicationVersionString`/`SystemId`/`Name` and `IStartupOptions.PackageName`
-/// plus the completed-installations list from `IInstallationManager`.
+/// `ApplicationVersionString`/`SystemId`/`Name` and `IStartupOptions.PackageName`.
 #[derive(Debug, Clone, Default)]
 pub struct SystemHostFacts {
     /// The server version string (`ApplicationVersionString`).
@@ -60,8 +62,6 @@ pub struct SystemHostFacts {
     /// The transcoding temp path override (`EncodingOptions.TranscodingTempPath`,
     /// owned by the encoding layer); `None` falls back to `{cache}/transcodes`.
     pub transcoding_temp_path: Option<String>,
-    /// The list of completed installations (`IInstallationManager`).
-    pub completed_installations: Vec<ferrofin_model::updates::InstallationInfo>,
 }
 
 /// Drives application restart/shutdown.
@@ -375,6 +375,8 @@ pub struct FerrofinSystemManager {
     lifecycle: Arc<dyn LifecycleController>,
     storage_probe: Arc<dyn StorageProbe>,
     library_storage: Arc<dyn LibraryStorageProvider>,
+    /// `IInstallationManager`: the packages installed since the boot.
+    installations: Arc<dyn PluginManager>,
     facts: SystemHostFacts,
     /// The live database, for `snapshot_database` (`None` until the
     /// composition root injects it; tests run without one).
@@ -390,8 +392,8 @@ impl std::fmt::Debug for FerrofinSystemManager {
 }
 
 impl FerrofinSystemManager {
-    /// Creates a system manager with the default real-filesystem storage probe
-    /// and no library storage provider.
+    /// Creates a system manager with the default real-filesystem storage probe,
+    /// no library storage provider and no installation manager.
     #[must_use]
     pub fn new(
         application_host: Arc<dyn ServerApplicationHost>,
@@ -407,9 +409,18 @@ impl FerrofinSystemManager {
             lifecycle,
             storage_probe: Arc::new(FsStorageProbe),
             library_storage: Arc::new(NoLibraries),
+            installations: Arc::new(DisabledPluginManager),
             facts,
             db: None,
         }
+    }
+
+    /// Injects the plugin manager whose installs `CompletedInstallations` lists
+    /// (`IInstallationManager.CompletedInstallations`).
+    #[must_use]
+    pub fn with_installation_manager(mut self, installations: Arc<dyn PluginManager>) -> Self {
+        self.installations = installations;
+        self
     }
 
     /// Injects the live database so `snapshot_database` can copy it.
@@ -474,7 +485,7 @@ impl ferrofin_traits::system::SystemManager for FerrofinSystemManager {
             is_shutting_down: self.lifecycle.is_shutting_down(),
             supports_library_monitor: true,
             web_socket_port_number: i32::from(self.application_host.http_port()),
-            completed_installations: self.facts.completed_installations.clone(),
+            completed_installations: self.installations.completed_installations(),
             program_data_path: Some(self.paths.program_data_path()),
             web_path: Some(self.paths.web_path()),
             items_by_name_path: Some(internal_metadata.clone()),
@@ -654,7 +665,6 @@ mod tests {
             system_id: Some("abc123".to_owned()),
             package_name: Some("ferrofin-docker".to_owned()),
             transcoding_temp_path: None,
-            completed_installations: vec![],
         };
         let mgr = FerrofinSystemManager::new(
             host,

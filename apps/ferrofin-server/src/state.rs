@@ -2966,9 +2966,9 @@ pub async fn build_app_state(
                 system_id: Some(server_id.clone()),
                 package_name: Some(PACKAGE_NAME.to_owned()),
                 transcoding_temp_path: None,
-                completed_installations: Vec::new(),
             },
         )
+        .with_installation_manager(Arc::clone(&plugins))
         .with_library_storage(Arc::new(VirtualFolderStorage(Arc::clone(&virtual_folders))))
         .with_database(db.clone()),
     );

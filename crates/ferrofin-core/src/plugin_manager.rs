@@ -23,7 +23,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
-use ferrofin_model::updates::{PackageInfo, RepositoryInfo, VersionInfo};
+use ferrofin_model::updates::{InstallationInfo, PackageInfo, RepositoryInfo, VersionInfo};
 use serde::{Deserialize, Serialize};
 use serde_json::value::RawValue;
 use uuid::Uuid;
@@ -385,6 +385,9 @@ pub struct FerrofinPluginManager {
     /// each analyzer plugin; an uninstall forgets the plugin's, as it removes
     /// the plugin's state file. `None` only at the unit-test seam.
     offered_items: Option<Arc<dyn ferrofin_traits::plugins::PluginOfferedItemStore>>,
+    /// The packages installed since the boot (`_completedInstallationsInternal`),
+    /// reported by [`PluginManager::completed_installations`].
+    completed: Mutex<Vec<InstallationInfo>>,
 }
 
 /// The in-process event a plugin configuration save publishes, with
@@ -444,6 +447,7 @@ impl FerrofinPluginManager {
             events: None,
             removed: Mutex::default(),
             offered_items: None,
+            completed: Mutex::default(),
         }
     }
 
@@ -642,6 +646,29 @@ impl FerrofinPluginManager {
                 );
             }
         }
+    }
+
+    /// Records a finished install (`_completedInstallationsInternal.Add`): the
+    /// `InstallationInfo` `GetCompatibleVersions` built for `version` of
+    /// `package`, downloaded from `source_url`.
+    fn record_completed_installation(
+        &self,
+        package: &PackageInfo,
+        version: &VersionInfo,
+        source_url: &str,
+    ) {
+        self.completed
+            .lock()
+            .expect("completed installations lock poisoned")
+            .push(InstallationInfo {
+                id: package.id,
+                name: Some(package.name.clone()),
+                version: Some(version.version_number.clone()),
+                changelog: version.changelog.clone(),
+                source_url: Some(source_url.to_owned()),
+                checksum: version.checksum.clone(),
+                package_info: Some(package.clone()),
+            });
     }
 
     /// Records an installed plugin's declared egress (best-effort persist).
@@ -1213,6 +1240,7 @@ impl PluginManager for FerrofinPluginManager {
         // Record the installed digest (see step 4b) + declared egress.
         self.record_installed_digest(package.id, &chosen.version, digest);
         self.record_installed_egress(package.id, artifact.declared_egress);
+        self.record_completed_installation(package, chosen, source_url);
 
         // 7. Activate on next restart (Jellyfin's model).
         if let Some(lifecycle) = &self.lifecycle {
@@ -1225,6 +1253,13 @@ impl PluginManager for FerrofinPluginManager {
             "wasm plugin installed; restart required to activate"
         );
         Ok(())
+    }
+
+    fn completed_installations(&self) -> Vec<InstallationInfo> {
+        self.completed
+            .lock()
+            .expect("completed installations lock poisoned")
+            .clone()
     }
 
     async fn get_plugin_configuration(&self, id: Uuid) -> Result<Vec<u8>, ServiceError> {
@@ -2982,6 +3017,7 @@ mod tests {
         let artifact = b"pretend-wasm-bytes".to_vec();
         let md5 = ferrofin_common::extensions::md5_hex(&artifact);
         let rig = install_rig(&artifact, None, &md5, TEST_ABI, Ok(PKG_ID)).await;
+        assert_eq!(rig.mgr.completed_installations(), Vec::new());
 
         rig.mgr
             .install_package("HelloPkg", None, None, None)
@@ -2991,6 +3027,36 @@ mod tests {
         let staged = rig.wasm_dir.join(format!("{PKG_ID}.wasm"));
         assert_eq!(std::fs::read(&staged).unwrap(), artifact, "artifact staged");
         assert!(rig.lifecycle.has_pending_restart(), "restart flagged");
+        // Recorded as `CompletedInstallations` (gl-1776): the newest version.
+        let completed = rig.mgr.completed_installations();
+        assert_eq!(completed.len(), 1, "{completed:?}");
+        let installation = &completed[0];
+        assert_eq!(installation.id, PKG_ID);
+        assert_eq!(installation.name.as_deref(), Some("HelloPkg"));
+        assert_eq!(installation.version.as_deref(), Some("0.10.0"));
+        assert_eq!(installation.checksum.as_deref(), Some(md5.as_str()));
+        assert!(
+            installation
+                .source_url
+                .as_deref()
+                .is_some_and(|url| url.ends_with("/plugin.wasm"))
+        );
+        assert_eq!(
+            installation.package_info.as_ref().map(|p| p.id),
+            Some(PKG_ID)
+        );
+        // Each later install adds its own entry, in install order.
+        rig.mgr
+            .install_package("HelloPkg", None, Some("0.9.0"), None)
+            .await
+            .expect("second install");
+        let versions: Vec<String> = rig
+            .mgr
+            .completed_installations()
+            .into_iter()
+            .filter_map(|installation| installation.version)
+            .collect();
+        assert_eq!(versions, ["0.10.0", "0.9.0"]);
         // The validator-reported egress allowlist was recorded (upgrade
         // growth diffs against it).
         let persisted: serde_json::Value = serde_json::from_slice(
@@ -3460,6 +3526,11 @@ mod tests {
             .unwrap_err();
         assert!(err.to_string().contains("checksum mismatch"), "{err}");
         assert!(!rig.lifecycle.has_pending_restart());
+        assert_eq!(
+            rig.mgr.completed_installations(),
+            Vec::new(),
+            "a failed install is not completed"
+        );
 
         // sha256 preferred over (correct) md5 — and mismatching.
         let rig = install_rig(&artifact, Some("deadbeef"), &md5, TEST_ABI, Ok(PKG_ID)).await;
