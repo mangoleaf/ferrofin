@@ -599,6 +599,87 @@ async fn administrator_download_still_honors_the_item_permission() {
     assert!(!response.headers().contains_key("content-disposition"));
 }
 
+/// An item with an empty path is `MimeTypes.GetMimeType`'s
+/// `ArgumentException` in `GetFile` and `GetDownload`: a 400, not a 404.
+#[rstest::rstest]
+#[case::download("Download")]
+#[case::file("File")]
+#[tokio::test]
+async fn download_and_file_of_an_item_without_a_path_are_400(#[case] route: &str) {
+    let response = create_router(state("").app)
+        .oneshot(authed("GET", &format!("/Items/{ITEM_ID}/{route}")))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}
+
+/// `GetDownload` names the file on the answers ASP.NET's `SetHeadersAndLog`
+/// names it on (200, 206 and 416), not on its 304/412 short cut nor on a
+/// missing file's 404 (`PhysicalFile`'s `FileNotFoundException`).
+#[rstest::rstest]
+#[case::whole(None, StatusCode::OK, true)]
+#[case::range(Some(("Range", "bytes=0-4")), StatusCode::PARTIAL_CONTENT, true)]
+#[case::past_the_end(Some(("Range", "bytes=1000-")), StatusCode::RANGE_NOT_SATISFIABLE, true)]
+#[case::precondition_failed(
+    Some(("If-Unmodified-Since", "Sat, 01 Jan 2000 00:00:00 GMT")),
+    StatusCode::PRECONDITION_FAILED,
+    false
+)]
+#[tokio::test]
+async fn download_names_the_file_only_where_upstream_does(
+    #[case] header: Option<(&'static str, &'static str)>,
+    #[case] status: StatusCode,
+    #[case] named: bool,
+) {
+    let (_dir, path) = temp_media();
+    let mut request = authed("GET", &format!("/Items/{ITEM_ID}/Download"));
+    if let Some((name, value)) = header {
+        request.headers_mut().insert(name, value.parse().unwrap());
+    }
+    let response = create_router(state(&path).app)
+        .oneshot(request)
+        .await
+        .unwrap();
+    assert_eq!(response.status(), status);
+    assert_eq!(
+        response.headers().contains_key("content-disposition"),
+        named
+    );
+}
+
+/// A 304 is `SetHeadersAndLog`'s short cut too (an `If-Modified-Since` at the
+/// file's own `Last-Modified`, which ASP.NET also answers 304).
+#[tokio::test]
+async fn download_not_modified_names_no_file() {
+    let (_dir, path) = temp_media();
+    let uri = format!("/Items/{ITEM_ID}/Download");
+    let first = create_router(state(&path).app)
+        .oneshot(authed("GET", &uri))
+        .await
+        .unwrap();
+    let mut request = authed("GET", &uri);
+    request.headers_mut().insert(
+        "If-Modified-Since",
+        first.headers()["last-modified"].clone(),
+    );
+    let response = create_router(state(&path).app)
+        .oneshot(request)
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_MODIFIED);
+    assert!(!response.headers().contains_key("content-disposition"));
+}
+
+#[tokio::test]
+async fn download_of_a_missing_file_names_no_file() {
+    let response = create_router(state("/nonexistent/ferrofin/movie.mkv").app)
+        .oneshot(authed("GET", &format!("/Items/{ITEM_ID}/Download")))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    assert!(!response.headers().contains_key("content-disposition"));
+}
+
 /// The body is `size` random bytes (`Random.Shared.NextBytes`), which a
 /// compressing proxy or VPN between server and client cannot shrink: a body it
 /// could would download faster than the link allows and inflate the bitrate the

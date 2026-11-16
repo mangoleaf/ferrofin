@@ -386,9 +386,10 @@ async fn get_item_collections(
 
 /// `GET /Items/{itemId}/File` — the original file of an item.
 ///
-/// Port of `LibraryController.GetFile`: resolves the item (`404` when absent),
-/// then serves its on-disk `Path` with HTTP `Range`/`HEAD` support (Jellyfin's
-/// `PhysicalFile`). The symlink-resolution nicety is left to the file server.
+/// Port of `LibraryController.GetFile`: resolves the item (`404` when absent,
+/// `400` when it has no path), then serves its on-disk `Path` with HTTP
+/// `Range`/`HEAD` support (Jellyfin's `PhysicalFile`). The symlink-resolution
+/// nicety is left to the file server.
 #[utoipa::path(
     get,
     path = "/Items/{itemId}/File",
@@ -410,10 +411,11 @@ async fn get_file(
         .get_item_by_id_for_user(item_id, auth.user.as_deref())
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("item {item_id}")))?;
+    // An empty path is MimeTypes.GetMimeType's ArgumentException, a 400.
     let path = item
         .path
         .filter(|p| !p.is_empty())
-        .ok_or_else(|| ApiError::NotFound(format!("item {item_id} has no file")))?;
+        .ok_or_else(|| ApiError::BadRequest(format!("item {item_id} has no file")))?;
     serve_static_file(&path, request).await
 }
 
