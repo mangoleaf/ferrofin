@@ -1145,6 +1145,7 @@ pub async fn build_app_state(
             options_file: std::path::PathBuf::from(paths.user_configuration_directory_path())
                 .join("named")
                 .join("livetv.json"),
+            metadata_dir: metadata_root.clone(),
         }),
     );
     let live_tv: Arc<dyn ferrofin_traits::stubs::LiveTvManager> = live_tv_impl.clone();

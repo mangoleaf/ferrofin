@@ -648,6 +648,7 @@ async fn every_tuner_and_provider_change_runs_the_pass() {
         transcode_dir: dir.path().join("transcodes").into(),
         data_dir: dir.path().join("data"),
         options_file: options_file(dir.path()),
+        ..LiveTvPaths::default()
     });
     mgr.set_recording_library(library.clone(), Arc::default());
     let default = dir.path().join("data/livetv/recordings");
