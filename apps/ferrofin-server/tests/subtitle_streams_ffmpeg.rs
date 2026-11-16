@@ -5,7 +5,8 @@
 //! track burned in with the fonts its file ships, extracted into the cache;
 //! and an `.srt` sidecar embedded into a progressive stream that starts
 //! mid-file, also from the copy the server cuts to the start for an ffmpeg
-//! that cannot cut it.
+//! that cannot cut it; and a song's embedded subtitle left out of its audio
+//! streams.
 //!
 //! ffmpeg has no PGS encoder, so the subtitle is written here: display sets
 //! drawing a white box in the middle of a black picture ([`SHOWINGS`]).
@@ -1133,4 +1134,107 @@ async fn a_seeked_embed_of_a_bitmap_sidecar_keeps_its_first_display_set() {
         embed_from_9.contains("-probesize 1G -isync 0 -i file:"),
         "{embed_from_9}"
     );
+}
+
+/// An audio route ignores a `SubtitleStreamIndex`, as upstream's
+/// `AttachMediaSourceInfo` reads it for a video request alone (gl-1780): a
+/// song with an embedded `.srt` track streams as audio, progressively and as
+/// an HLS segment, where mapping the track into the audio-only output with
+/// `SubtitleMethod=Embed` stopped ffmpeg from starting.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "runs the real ffmpeg; run with --ignored"]
+async fn an_audio_stream_ignores_a_requested_embedded_subtitle() {
+    let Some((real_ffmpeg, real_ffprobe)) = tools() else {
+        return;
+    };
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    let music = root.join("media").join("music");
+    let album = music.join("Artist").join("Album");
+    std::fs::create_dir_all(&album).unwrap();
+    let srt = root.join("song.srt");
+    std::fs::write(&srt, "1\n00:00:01,000 --> 00:00:04,000\nsung\n\n").unwrap();
+    let status = Command::new(&real_ffmpeg)
+        .args(["-loglevel", "error", "-y"])
+        .args(["-f", "lavfi", "-i", "sine=frequency=440:duration=10"])
+        .arg("-i")
+        .arg(&srt)
+        .args(["-map", "0:a", "-map", "1:s", "-c:a", "flac", "-c:s", "srt"])
+        .arg(album.join("01 - Song.mka"))
+        .status()
+        .unwrap();
+    assert!(status.success(), "generating the song");
+    let ffmpeg = wrapper(root, "ffmpeg", &real_ffmpeg);
+    let ffprobe = wrapper(root, "ffprobe", &real_ffprobe);
+
+    let server = Server::boot(root, &ffmpeg, &ffprobe).await;
+    let type_options = ["MusicArtist", "MusicAlbum", "Audio"]
+        .map(|kind| json!({"Type": kind, "MetadataFetchers": [], "ImageFetchers": []}));
+    let options = json!({
+        "PathInfos": [{"Path": music}],
+        "EnableRealtimeMonitor": false,
+        "EnableInternetProviders": false,
+        "TypeOptions": type_options
+    });
+    server
+        .send(
+            reqwest::Method::POST,
+            "/Library/VirtualFolders?name=Music&collectionType=music&refreshLibrary=false",
+            Some(&json!({"LibraryOptions": options})),
+        )
+        .await;
+    server.scan().await;
+    let songs = server
+        .get("/Items?Recursive=true&IncludeItemTypes=Audio&Fields=MediaSources")
+        .await;
+    let song = &songs["Items"][0];
+    let item = song["Id"].as_str().expect("the song was scanned");
+    let source = &song["MediaSources"][0];
+    let source_id = source["Id"].as_str().unwrap();
+    let subtitle = source["MediaStreams"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["Type"] == "Subtitle")
+        .unwrap_or_else(|| panic!("the embedded subtitle in {source}"))["Index"]
+        .as_i64()
+        .unwrap();
+
+    let query =
+        format!("mediaSourceId={source_id}&subtitleStreamIndex={subtitle}&subtitleMethod=Embed");
+    for (what, path) in [
+        (
+            "progressive",
+            format!(
+                "/Audio/{item}/stream?container=mp3&audioCodec=mp3&static=false\
+                 &playSessionId=audio-progressive&{query}"
+            ),
+        ),
+        (
+            "segment",
+            format!(
+                "/Audio/{item}/hls1/main/0.ts?audioCodec=aac&segmentContainer=ts\
+                 &runtimeTicks=0&actualSegmentLengthTicks=30000000\
+                 &playSessionId=audio-hls&{query}"
+            ),
+        ),
+    ] {
+        let output = root.join(format!("audio-{what}.out"));
+        std::fs::write(&output, server.download(&path).await).unwrap();
+        let streams = probe_streams(&real_ffprobe, &output);
+        let kinds: Vec<&Value> = streams.iter().map(|s| &s["codec_type"]).collect();
+        assert_eq!(kinds, [&json!("audio")], "{what}: {streams:?}");
+    }
+    // Neither job mapped the track: the HLS muxer would write it out as
+    // WebVTT segments beside the audio ones.
+    let calls = std::fs::read_to_string(root.join("calls.log")).unwrap();
+    let jobs: Vec<&str> = calls
+        .lines()
+        .filter(|line| line.starts_with("ffmpeg ") && line.contains("/transcodes/"))
+        .collect();
+    assert!(jobs.len() >= 2, "both jobs ran: {calls}");
+    for job in jobs {
+        assert!(job.contains(" -map -0:s "), "{job}");
+        assert!(!job.contains(&format!("-map 0:{subtitle} ")), "{job}");
+    }
 }
