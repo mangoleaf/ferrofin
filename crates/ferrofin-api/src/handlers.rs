@@ -2281,7 +2281,7 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
                    movie, series, season and episode providers answer is the \
                    metadata-providers row's; what the other providers answer (gl-1815) and how \
                    the answers merge field by field (gl-1813) are not part of this row.",
-        date: "2026-11-14",
+        date: "2026-11-15",
         divergences: &[
             "An album below an identified artist is looked up by its own ids, name and year; \
              upstream's ApplySearchResult gives every child but a season or an episode the \
@@ -2296,10 +2296,6 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
              heuristics pick, merging their answers fill-only; upstream runs no remote \
              provider on an unchanged Default refresh. Kept by owner decision 2026-09-24 \
              until the effect of removing the heuristics is understood.",
-            "A movie, series, season or episode Identify moves the chosen provider first \
-             only for TheTVDB, TheMovieDb and OMDb, so a SearchProviderName naming a \
-             plugin's metadata source keeps the \
-             configured order. Fix path: gl-1772.",
             "An item the provider manager refreshes (a box set, person, genre, studio, or \
              virtual season or episode) asks no plugin metadata source. Fix path: gl-1773.",
             "An item the provider manager refreshes runs no local image provider \

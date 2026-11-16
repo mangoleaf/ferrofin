@@ -650,19 +650,6 @@ impl EnrichedView {
     }
 }
 
-/// The built-in metadata fetcher an Identify result's `SearchProviderName`
-/// names, if it is one the scan runs.
-fn preferred_fetcher(search_provider_name: Option<&str>) -> Option<&'static str> {
-    let name = search_provider_name?;
-    [
-        fetcher_names::TVDB,
-        fetcher_names::TMDB,
-        fetcher_names::OMDB,
-    ]
-    .into_iter()
-    .find(|known| known.eq_ignore_ascii_case(name))
-}
-
 /// The ids of an Identify result as `ApplySearchResult` hands them to the
 /// lookup and the controller sets them on the item (`SetProviderIds`: each
 /// through `TrySetProviderId`, trimmed and validated).
@@ -829,8 +816,9 @@ struct FetcherPolicy<'a> {
     /// A full image replacement can replace cached plugin artwork.
     replace_images: bool,
     /// The provider an Identify's chosen result came from
-    /// (`SearchResult.SearchProviderName`): its images run first
-    /// ([`image_order`](Self::image_order)).
+    /// (`SearchResult.SearchProviderName`): its metadata
+    /// ([`provider_order`]) and its images
+    /// ([`image_order`](Self::image_order)) run first.
     identified_by: Option<&'a str>,
     /// The server-wide per-kind `MetadataOptions`
     /// (`ServerConfiguration.MetadataOptions`), the answer for a kind the
@@ -8346,8 +8334,9 @@ impl LibraryScanner {
             // Identifying runs the provider the chosen result came from
             // first ("When identifying, run the provider the user picked
             // first so the correct IDs are used", `MetadataService.cs:
-            // 876-882`).
-            let prefer = preferred_fetcher(policy.identified_by);
+            // 876-882`): any remote provider of that name, a plugin's named
+            // source included.
+            let prefer = policy.identified_by;
             // The lookup info's ids are the item's own, which the probe (a
             // pre-refresh provider, `AudioFileProber`) has already given its
             // tag ids where the item had none: `GetLookupInfo` shares the
@@ -11694,7 +11683,7 @@ impl LibraryScanner {
         &self,
         policy: FetcherPolicy<'_>,
         short: &str,
-        prefer: Option<&'static str>,
+        prefer: Option<&str>,
     ) -> Vec<RemoteSource> {
         use ferrofin_providers::library_options::{
             BUILT_IN_METADATA_FETCHERS, default_metadata_order,
@@ -11862,7 +11851,7 @@ impl LibraryScanner {
         entity: &mut BaseItemEntity,
         cache: &mut ArtworkCache,
         policy: FetcherPolicy<'_>,
-        prefer: Option<&'static str>,
+        prefer: Option<&str>,
         known_ids: &[(String, String)],
         lookup: &ResolverGuesses,
     ) -> RemoteMetadata {
@@ -28689,6 +28678,11 @@ mod tests {
             [Tmdb, Dynamic(0), Omdb],
             "Identify's provider first, the rest in order"
         );
+        assert_eq!(
+            scanner.remote_sources(library_policy(&unranked), "Movie", Some("watdb")),
+            [Dynamic(0), Omdb, Tmdb],
+            "a plugin's named source is a provider Identify can name"
+        );
         let unticked = movie_fetchers(&[TMDB, OMDB], &["WatDb", TMDB, OMDB]);
         assert_eq!(
             scanner.remote_sources(library_policy(&unticked), "Movie", None),
@@ -36235,7 +36229,7 @@ mod tests {
                 &mut identified,
                 &mut cache,
                 tvdb_policy,
-                super::preferred_fetcher(Some("TheMovieDb")),
+                Some("themoviedb"),
                 &[("Tmdb".to_owned(), "1399".to_owned())],
                 &super::ResolverGuesses::default(),
             )
@@ -36251,8 +36245,6 @@ mod tests {
             cache.series_tvdb.contains_key("SERIES"),
             "TVDB is asked after TMDB answered"
         );
-        assert_eq!(super::preferred_fetcher(Some("thetvdb")), Some("TheTVDB"));
-        assert_eq!(super::preferred_fetcher(Some("Some Plugin")), None);
     }
 
     // ---------------------------------------------------------------------
