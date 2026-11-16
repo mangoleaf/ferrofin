@@ -1364,7 +1364,7 @@ impl<S: SessionReporter, C: FileCleaner> TranscodeManagerImpl<S, C> {
         self.wait_for_progressive_buffer(&handle, state).await;
 
         // 8. A finished job that failed is an error (mirror the FfmpegException).
-        self.fail_if_exited_nonzero(&handle, &stderr_log)?;
+        self.fail_if_exited_nonzero(&handle, &stderr_log).await?;
 
         // 9. Only a live eligible process receives a timer. The option itself
         // is read on each tick, so enabling it applies to existing eligible jobs.
@@ -1389,17 +1389,18 @@ impl<S: SessionReporter, C: FileCleaner> TranscodeManagerImpl<S, C> {
     /// `start_ffmpeg`'s wait for `target` (its first segment, or the
     /// progressive output): returns once it exists or the process has exited,
     /// and fails when the job is killed meanwhile or the wait outlasts
-    /// [`WAIT_FOR_FILE_TIMEOUT_MS`], which kills it.
+    /// [`WAIT_FOR_FILE_TIMEOUT_MS`], which kills it. The watch and every check
+    /// run on the blocking pool, never inline on a runtime worker (gl-1804).
     async fn wait_for_first_output(
         &self,
         handle: &TranscodingJobHandle,
         target: &Path,
     ) -> Result<(), String> {
-        let waiter = FsWaiter::new(target);
+        let waiter = FsWaiter::new(target).await;
         let deadline = Instant::now() + Duration::from_millis(WAIT_FOR_FILE_TIMEOUT_MS);
         loop {
             let exited = self.with_running(handle, |r| r.child.has_exited());
-            if target.exists() || exited == Some(true) {
+            if tokio::fs::try_exists(target).await.unwrap_or(false) || exited == Some(true) {
                 return Ok(());
             }
             // The job was killed while it started (a stop report, a device's
@@ -1482,7 +1483,7 @@ impl<S: SessionReporter, C: FileCleaner> TranscodeManagerImpl<S, C> {
     /// `StartFfMpeg` throws without removing it: a retry finds its output
     /// through it and ends at the output's end, and the stop report or the
     /// idle reaper removes it with its output (gl-1373).
-    fn fail_if_exited_nonzero(
+    async fn fail_if_exited_nonzero(
         &self,
         handle: &TranscodingJobHandle,
         stderr_log: &Path,
@@ -1494,7 +1495,7 @@ impl<S: SessionReporter, C: FileCleaner> TranscodeManagerImpl<S, C> {
         if code.unwrap_or(0) != 0 {
             // The bare exit code hides the actual cause (unreadable input, bad
             // args); ffmpeg's stderr in the transcode log names it.
-            let tail = stderr_log_tail(stderr_log);
+            let tail = stderr_log_tail(stderr_log).await;
             // A silent ffmpeg death is the #1 playback-debug pain: log the exit +
             // where the full stderr lives. `warn!` (not `error!`) — the error
             // propagates and is logged once at the request boundary.
@@ -1524,7 +1525,10 @@ impl<S: SessionReporter, C: FileCleaner> TranscodeManagerImpl<S, C> {
     /// Returns at once for a segment already on disk. Otherwise wakes on the
     /// directory's inotify events (fallback tick
     /// [`SEGMENT_READY_POLL_INTERVAL_MS`]) until the file exists or the job
-    /// exits; returns `true` if the segment ends up on disk.
+    /// exits; returns `true` if the segment ends up on disk. Each check, the
+    /// watch and a dead job's log tail run on the blocking pool, never inline on
+    /// the runtime worker serving the request (gl-1804): a check that fails
+    /// reads as absent, as `Path::exists` did.
     ///
     /// # Panics
     ///
@@ -1541,20 +1545,20 @@ impl<S: SessionReporter, C: FileCleaner> TranscodeManagerImpl<S, C> {
         let seg = segment_path(playlist_path, index, &ext);
         // A segment already written needs no watch; the loop checks again once
         // the watch is armed, so one written in between is not missed.
-        if seg.exists() {
+        if tokio::fs::try_exists(&seg).await.unwrap_or(false) {
             return true;
         }
-        let waiter = FsWaiter::new(&seg);
+        let waiter = FsWaiter::new(&seg).await;
 
         loop {
-            if seg.exists() {
+            if tokio::fs::try_exists(&seg).await.unwrap_or(false) {
                 return true;
             }
             let exited = self
                 .with_running(handle, |r| r.child.has_exited())
                 .unwrap_or(true);
             if exited {
-                if seg.exists() {
+                if tokio::fs::try_exists(&seg).await.unwrap_or(false) {
                     return true;
                 }
                 // The job is gone and the segment never appeared. An ffmpeg
@@ -1567,12 +1571,12 @@ impl<S: SessionReporter, C: FileCleaner> TranscodeManagerImpl<S, C> {
                 let log = self
                     .with_running(handle, |r| r.log_path.clone())
                     .unwrap_or_default();
+                let tail = stderr_log_tail(&log).await;
                 tracing::warn!(
                     segment = index,
                     exit_code = code.unwrap_or(-1),
                     log = ?log,
-                    "transcode exited before producing segment{}",
-                    stderr_log_tail(&log)
+                    "transcode exited before producing segment{tail}"
                 );
                 return false;
             }
@@ -2268,9 +2272,13 @@ fn read_tail(path: &Path, max_bytes: u64) -> String {
 /// two-hour job leaves a multi-megabyte log. Reading it whole would put that
 /// much blocking I/O — and, via the returned string, that much log line and
 /// HTTP error body — on every failed segment request, exactly when a source is
-/// killing ffmpeg repeatedly.
-fn stderr_log_tail(log_path: &Path) -> String {
-    let contents = read_tail(log_path, STDERR_TAIL_BYTES);
+/// killing ffmpeg repeatedly. The read runs on the blocking pool, never inline
+/// on a runtime worker (gl-1804); a hop that fails reads as an empty log.
+async fn stderr_log_tail(log_path: &Path) -> String {
+    let log_path = log_path.to_path_buf();
+    let contents = tokio::task::spawn_blocking(move || read_tail(&log_path, STDERR_TAIL_BYTES))
+        .await
+        .unwrap_or_default();
     let lines: Vec<&str> = contents.lines().filter(|l| !l.trim().is_empty()).collect();
     let tail = lines
         .iter()
@@ -3372,14 +3380,84 @@ mod start_ffmpeg_tests {
             .unwrap();
         let armed = crate::transcoding::fs_wait::ARMED.with(std::cell::Cell::get);
         let later = out_dir.join("out1.ts");
-        // On this current-thread runtime the writer runs only once the wait
-        // parks, i.e. after its first check and the watch being armed.
-        tokio::spawn(async move { std::fs::write(later, b"seg").unwrap() });
+        // The wait yields at its first check (a blocking-pool hop), so the
+        // writer holds off until that check has missed and the watch is asked
+        // for; the check after arming, or the watch, then finds the file.
+        tokio::spawn(async move {
+            while crate::transcoding::fs_wait::ARMED.with(std::cell::Cell::get) == armed {
+                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+            }
+            std::fs::write(later, b"seg").unwrap();
+        });
         assert!(m.wait_for_segment(&handle, &playlist, 1).await);
         assert_eq!(
             crate::transcoding::fs_wait::ARMED.with(std::cell::Cell::get),
             armed + 1
         );
+    }
+
+    /// A segment already on disk is checked on the blocking pool, never by an
+    /// inline `stat` on the runtime worker serving the request (gl-1804).
+    #[test]
+    fn wait_for_segment_checks_the_segment_on_the_blocking_pool() {
+        use crate::transcoding::fs_wait::{needs_the_blocking_pool, one_blocking_thread};
+        one_blocking_thread().block_on(async {
+            let tmp = tempfile::tempdir().unwrap();
+            let playlist = tmp.path().join("s").join("out.m3u8");
+            let fake = FakeSegmentTranscoder::new(FakeScript {
+                segment_files: vec!["out0.ts".to_owned()],
+                extra_files: vec!["out.m3u8".to_owned()],
+                ..FakeScript::default()
+            });
+            let m = manager();
+            let st = state(&playlist, Some(&playlist));
+            let handle = m
+                .start_ffmpeg(&fake, ffmpeg_req(&st, &playlist, vec![]))
+                .await
+                .unwrap();
+            assert!(needs_the_blocking_pool(m.wait_for_segment(&handle, &playlist, 0)).await);
+        });
+    }
+
+    /// `start_ffmpeg`'s wait for its first output arms its watch on the
+    /// blocking pool, never inline on the runtime worker (gl-1804). The target
+    /// already exists, so an inline arm and check would have finished at once.
+    #[test]
+    fn wait_for_first_output_arms_its_watch_on_the_blocking_pool() {
+        use crate::transcoding::fs_wait::{needs_the_blocking_pool, one_blocking_thread};
+        one_blocking_thread().block_on(async {
+            let tmp = tempfile::tempdir().unwrap();
+            let playlist = tmp.path().join("s").join("out.m3u8");
+            let fake = FakeSegmentTranscoder::new(FakeScript {
+                segment_files: vec!["out0.ts".to_owned()],
+                extra_files: vec!["out.m3u8".to_owned()],
+                ..FakeScript::default()
+            });
+            let m = manager();
+            let st = state(&playlist, Some(&playlist));
+            let handle = m
+                .start_ffmpeg(&fake, ffmpeg_req(&st, &playlist, vec![]))
+                .await
+                .unwrap();
+            needs_the_blocking_pool(m.wait_for_first_output(&handle, &playlist))
+                .await
+                .unwrap();
+        });
+    }
+
+    /// A dead job's stderr tail is read on the blocking pool, never inline on
+    /// the runtime worker serving the request (gl-1804).
+    #[test]
+    fn stderr_log_tail_reads_on_the_blocking_pool() {
+        use super::stderr_log_tail;
+        use crate::transcoding::fs_wait::{needs_the_blocking_pool, one_blocking_thread};
+        one_blocking_thread().block_on(async {
+            let dir = tempfile::tempdir().unwrap();
+            let log = dir.path().join("ffmpeg.log");
+            std::fs::write(&log, "boom: Input/output error\n").unwrap();
+            let tail = needs_the_blocking_pool(stderr_log_tail(&log)).await;
+            assert_eq!(tail, "; stderr tail: boom: Input/output error");
+        });
     }
 
     /// A [`FileCleaner`] that records the deletions it was asked to perform (and
@@ -3783,27 +3861,27 @@ mod start_ffmpeg_tests {
         assert!(!line.contains("SECRET"), "{line}");
     }
 
-    #[test]
-    fn stderr_log_tail_reports_last_lines() {
+    #[tokio::test]
+    async fn stderr_log_tail_reports_last_lines() {
         use super::stderr_log_tail;
         let dir = tempfile::tempdir().expect("tempdir");
         let log = dir.path().join("ffmpeg.log");
 
         // Absent or empty log → no tail appended.
-        assert_eq!(stderr_log_tail(&log), "");
+        assert_eq!(stderr_log_tail(&log).await, "");
         std::fs::write(&log, "\n  \n").expect("write");
-        assert_eq!(stderr_log_tail(&log), "");
+        assert_eq!(stderr_log_tail(&log).await, "");
 
         // Only the last (up to 4) non-empty lines survive, in order.
         std::fs::write(&log, "one\ntwo\n\nthree\nfour\nfive: Stale file handle\n").expect("write");
         assert_eq!(
-            stderr_log_tail(&log),
+            stderr_log_tail(&log).await,
             "; stderr tail: two | three | four | five: Stale file handle"
         );
     }
 
-    #[test]
-    fn stderr_log_tail_reads_only_the_end_of_a_huge_log() {
+    #[tokio::test]
+    async fn stderr_log_tail_reads_only_the_end_of_a_huge_log() {
         use super::{STDERR_TAIL_BYTES, read_tail, stderr_log_tail};
         let dir = tempfile::tempdir().expect("tempdir");
         let log = dir.path().join("big.log");
@@ -3831,7 +3909,7 @@ mod start_ffmpeg_tests {
         // line is a whole one.
         assert!(window.starts_with("frame="), "{:?}", &window[..40]);
 
-        let tail = stderr_log_tail(&log);
+        let tail = stderr_log_tail(&log).await;
         assert!(tail.ends_with("boom: Input/output error"), "{tail}");
 
         // ffmpeg writes its progress updates carriage-return separated, so a
@@ -3842,7 +3920,7 @@ mod start_ffmpeg_tests {
         crlog.push_str(&"x".repeat(usize::try_from(4 * STDERR_TAIL_BYTES).unwrap()));
         crlog.push_str("\nfirst\nsecond\nboom: Input/output error\n");
         std::fs::write(&log, &crlog).expect("write");
-        let tail = stderr_log_tail(&log);
+        let tail = stderr_log_tail(&log).await;
         assert!(tail.ends_with("boom: Input/output error"), "{tail}");
         assert!(
             tail.len() < 1024,
