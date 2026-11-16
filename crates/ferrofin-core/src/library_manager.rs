@@ -155,6 +155,10 @@ pub struct FerrofinLibraryManager {
     /// How many items' `ItemValues` one writer transaction of `update_items`
     /// rewrites; at least 1. [`DEFAULT_ITEM_VALUES_WRITE_CHUNK`] unless set.
     item_values_write_chunk: usize,
+    /// The provider manager an item's refresh goes through when no scan
+    /// covers the item ([`LibraryManager::queue_item_refresh`]). Set by the
+    /// composition root; `None` (unit tests) refuses such a refresh.
+    providers: Option<Arc<dyn ferrofin_traits::providers::ProviderManager>>,
 }
 
 /// `Folder.QueryRecursive`'s post-filter gate (v12.2 Folder.cs:1008-1014): a
@@ -255,13 +259,15 @@ fn folder_allows_collapsing(query: &InternalItemsQuery) -> bool {
 
 fn folder_name_matches(item: &BaseItemEntity, query: &InternalItemsQuery) -> bool {
     use crate::item_repository::{folder_ordinal_compare, folder_sort_name};
-    use ferrofin_util::string_extensions::upper_invariant;
+    use ferrofin_util::string_extensions::ordinal_ignore_case_key;
     let sort = folder_sort_name(item);
     query
         .name_starts_with
         .as_ref()
         .filter(|value| !value.trim().is_empty())
-        .is_none_or(|prefix| upper_invariant(&sort).starts_with(&upper_invariant(prefix)))
+        .is_none_or(|prefix| {
+            ordinal_ignore_case_key(&sort).starts_with(&ordinal_ignore_case_key(prefix))
+        })
         && query
             .name_starts_with_or_greater
             .as_ref()
@@ -1346,6 +1352,7 @@ impl FerrofinLibraryManager {
             app_paths: None,
             item_data: None,
             item_values_write_chunk: DEFAULT_ITEM_VALUES_WRITE_CHUNK as usize,
+            providers: None,
         }
     }
 
@@ -2099,6 +2106,17 @@ impl FerrofinLibraryManager {
         notifier: Arc<crate::library_changed_notifier::LibraryChangedNotifier>,
     ) -> Self {
         self.changed = Some(notifier);
+        self
+    }
+
+    /// Attaches the provider manager an item's refresh goes through when no
+    /// scan covers the item (a box set, a person, a virtual season…).
+    #[must_use]
+    pub fn with_providers(
+        mut self,
+        providers: Arc<dyn ferrofin_traits::providers::ProviderManager>,
+    ) -> Self {
+        self.providers = Some(providers);
         self
     }
 
@@ -3695,6 +3713,44 @@ impl LibraryManager for FerrofinLibraryManager {
             .await
     }
 
+    async fn queue_item_refresh(
+        &self,
+        item: &BaseItemEntity,
+        options: &MetadataRefreshOptions,
+    ) -> Result<(), ServiceError> {
+        match self.refresh_target(item).await? {
+            Some(target) => self.queue_refresh_scan(target, options).await,
+            None => self.queue_provider_refresh(item, options).await,
+        }
+    }
+
+    async fn refresh_item_metadata(
+        &self,
+        item: &BaseItemEntity,
+        options: &MetadataRefreshOptions,
+    ) -> Result<bool, ServiceError> {
+        let Some(path) = item_refresh::refresh_scan_path(item) else {
+            self.queue_provider_refresh(item, options).await?;
+            return Ok(true);
+        };
+        self.run_refresh_scan(ScanTarget::Items(vec![path]), options)
+            .await
+    }
+
+    async fn refresh_full_item(
+        &self,
+        item: &BaseItemEntity,
+        options: &MetadataRefreshOptions,
+    ) -> Result<bool, ServiceError> {
+        if let Some(target) = self.identify_target(item).await? {
+            return self.run_refresh_scan(target, options).await;
+        }
+        self.providers()?
+            .refresh_full_item(item_refresh::item_id(item)?, options)
+            .await?;
+        Ok(true)
+    }
+
     async fn run_library_scan(
         &self,
         trigger: ScanTrigger,
@@ -3974,8 +4030,12 @@ fn settle_saved_sort_name(item: &mut BaseItemEntity) {
     ferrofin_providers::metadata_merge::settle_sort_name(item);
 }
 
+mod item_refresh;
+
 #[cfg(test)]
 mod delete_tests;
+#[cfg(test)]
+mod item_refresh_tests;
 
 #[cfg(test)]
 mod tests {
@@ -7979,6 +8039,18 @@ mod tests {
             &row,
             &InternalItemsQuery {
                 name_starts_with: Some("Alpha%".into()),
+                ..Default::default()
+            }
+        ));
+        // The long s keeps its case: `ToUpperInvariant` maps it to `S`, ordinal casing does not.
+        let row = BaseItemEntity {
+            sort_name: Some("ſtar".into()),
+            ..Default::default()
+        };
+        assert!(!super::folder_name_matches(
+            &row,
+            &InternalItemsQuery {
+                name_starts_with: Some("S".into()),
                 ..Default::default()
             }
         ));

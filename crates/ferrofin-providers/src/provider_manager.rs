@@ -29,7 +29,7 @@ use ferrofin_model::providers::{
 };
 use ferrofin_traits::error::ServiceError;
 use ferrofin_traits::library::VirtualFolderManager;
-use ferrofin_traits::options::ItemImageInfo;
+use ferrofin_traits::options::{ItemImageInfo, file_date_modified};
 use ferrofin_traits::persistence::{
     ItemPersistenceService, ItemRepository, ItemTypeLookup, OwnerExtrasRefresh, PlaylistMember,
 };
@@ -2374,7 +2374,7 @@ impl LocalProviderManager {
                 self.tmdb_episode(
                     series_id_of("Tmdb"),
                     season_number,
-                    episode_number,
+                    (episode_number, crate::episode::lookup_range_end(row)),
                     tmdb_language.as_deref(),
                 )
                 .await
@@ -2500,27 +2500,26 @@ impl LocalProviderManager {
     }
 
     /// `TmdbEpisodeProvider`'s answer: the episode's entry in the series'
-    /// season response and its own request, by the series' `Tmdb` id only.
+    /// season response — for a multi-episode one (`episode_end`), every entry
+    /// up to its end, joined ([`crate::episode::tmdb_episode_in_range`]) — and
+    /// the first one's own request, by the series' `Tmdb` id only.
     async fn tmdb_episode(
         &self,
         series_tmdb_id: Option<i64>,
         season_number: i32,
-        episode_number: i32,
+        (episode_number, episode_end): (i32, Option<i32>),
         language: Option<&str>,
     ) -> Option<crate::episode::EpisodeAnswer> {
         let (client, series) = self.tmdb.as_ref().zip(series_tmdb_id)?;
         let season = client
             .season_details_for_language(series, season_number, language)
             .await?;
-        let entry = season
-            .episodes
-            .iter()
-            .find(|entry| entry.episode_number == episode_number)?;
+        let entry = crate::episode::tmdb_episode_in_range(&season, episode_number, episode_end)?;
         let extras = client
-            .episode_extras_for_language(series, season_number, episode_number, language)
+            .episode_extras_for_language(series, season_number, entry.episode_number, language)
             .await;
         Some(crate::episode::tmdb_answer(
-            entry,
+            &entry,
             extras.as_ref(),
             season_number,
             episode_number,
@@ -3608,7 +3607,7 @@ impl LocalProviderManager {
         let dest = item_dir.join(format!("{stem}.{ext}"));
         let content: Vec<u8> = content.into();
         // `atomic_write` fsyncs: keep the disk work off the async workers.
-        let (dest, modified) = tokio::task::spawn_blocking(move || {
+        let (dest, date_modified) = tokio::task::spawn_blocking(move || {
             std::fs::create_dir_all(&item_dir).map_err(|e| {
                 ProvidersError::io(format!("create image dir {}", item_dir.display()), e)
             })?;
@@ -3619,14 +3618,13 @@ impl LocalProviderManager {
                     let _ = std::fs::remove_file(item_dir.join(format!("{stem}.{other}")));
                 }
             }
-            let modified = std::fs::metadata(&dest).and_then(|info| info.modified());
+            // `SetImagePath(…, FileInfo)`: the file's own modification time, so
+            // the dynamic image providers' date gate sees an upload as current.
+            let modified = file_date_modified(&dest);
             Ok::<_, ServiceError>((dest, modified))
         })
         .await
         .map_err(|error| ServiceError::backend(error.to_string()))??;
-        // `SetImagePath(…, FileInfo)`: the file's own modification time, so
-        // the dynamic image providers' date gate sees an upload as current.
-        let date_modified = modified.map_or_else(|_| Utc::now(), chrono::DateTime::from);
         Ok(ItemImageInfo {
             path: dest.to_string_lossy().into_owned(),
             image_type,
@@ -6615,6 +6613,88 @@ mod tests {
         assert_eq!(ids["Tmdb"], "603");
         assert!(!ids.contains_key("Imdb"));
         assert!(results[0].premiere_date.is_some());
+    }
+
+    /// TMDb's empty overview or biography is kept, so the result answers
+    /// `"Overview": ""` as upstream's does (`Overview = movie.Overview`,
+    /// `movieResult.Overview`, `series.Overview`, `personResult.Biography`).
+    #[tokio::test]
+    async fn tmdb_identify_keeps_an_empty_overview() {
+        use super::{TmdbKind, TmdbPersonSearchProvider, TmdbSearchProvider};
+        let server = crate::mock_http::MockServer::start(vec![
+            (
+                "/search/movie",
+                r#"{"results":[{"id":603,"title":"The Matrix","overview":""}]}"#.to_owned(),
+            ),
+            (
+                "/search/tv",
+                r#"{"results":[{"id":1396,"name":"Breaking Bad","overview":""}]}"#.to_owned(),
+            ),
+            (
+                "/find/tt0133093",
+                r#"{"movie_results":[{"id":603,"title":"The Matrix","overview":""}],
+                    "tv_results":[{"id":1396,"name":"Breaking Bad","overview":""}]}"#
+                    .to_owned(),
+            ),
+            (
+                "/movie/603",
+                r#"{"id":603,"title":"The Matrix","overview":""}"#.to_owned(),
+            ),
+            (
+                "/tv/1396",
+                r#"{"id":1396,"name":"Breaking Bad","overview":""}"#.to_owned(),
+            ),
+            (
+                "/person/31",
+                r#"{"id":31,"name":"Tom Hanks","biography":""}"#.to_owned(),
+            ),
+            ("/movie/604", r#"{"id":604,"title":"No Plot"}"#.to_owned()),
+            ("/person/32", r#"{"id":32,"name":"No Bio"}"#.to_owned()),
+        ])
+        .await;
+        let tmdb = Arc::new(crate::tmdb::TmdbClient::new().with_base_url(&server.base_url));
+        let movie = TmdbSearchProvider::new(tmdb.clone(), TmdbKind::Movie);
+        let series = TmdbSearchProvider::new(tmdb.clone(), TmdbKind::Series);
+        let person = TmdbPersonSearchProvider::new(tmdb);
+        let cases: [(&dyn super::RemoteSearchProvider, RemoteSearchRequest); 7] = [
+            (&movie, named_request(BaseItemKind::Movie, "The Matrix")),
+            (&movie, id_request(BaseItemKind::Movie, &[("Tmdb", "603")])),
+            (
+                &movie,
+                id_request(BaseItemKind::Movie, &[("Imdb", "tt0133093")]),
+            ),
+            (&series, named_request(BaseItemKind::Series, "Breaking Bad")),
+            (
+                &series,
+                id_request(BaseItemKind::Series, &[("Tmdb", "1396")]),
+            ),
+            (
+                &series,
+                id_request(BaseItemKind::Series, &[("Imdb", "tt0133093")]),
+            ),
+            (&person, id_request(BaseItemKind::Person, &[("Tmdb", "31")])),
+        ];
+        for (provider, req) in cases {
+            let results = provider.get_search_results(&req).await.expect("results");
+            let label = (req.item_kind, &req.search_info.provider_ids);
+            assert_eq!(results.len(), 1, "{label:?}");
+            assert_eq!(results[0].overview.as_deref(), Some(""), "{label:?}");
+            let json = serde_json::to_value(&results[0]).expect("json");
+            assert_eq!(json["Overview"], "", "{label:?}");
+        }
+
+        // No overview at all stays out of the result.
+        let none: [(&dyn super::RemoteSearchProvider, RemoteSearchRequest); 2] = [
+            (&movie, id_request(BaseItemKind::Movie, &[("Tmdb", "604")])),
+            (&person, id_request(BaseItemKind::Person, &[("Tmdb", "32")])),
+        ];
+        for (provider, req) in none {
+            let results = provider.get_search_results(&req).await.expect("results");
+            assert_eq!(results.len(), 1, "{:?}", req.item_kind);
+            assert_eq!(results[0].overview, None, "{:?}", req.item_kind);
+            let json = serde_json::to_value(&results[0]).expect("json");
+            assert!(json.get("Overview").is_none(), "{json}");
+        }
     }
 
     /// A provider id with surrounding whitespace must still pin the title.
@@ -13326,7 +13406,9 @@ mod tests {
     /// request (its external ids and one guest star).
     const TMDB_EPISODE_SEASON: &str = r#"{"id": 3624, "episodes": [
         {"id": 9002, "episode_number": 2, "name": "TMDB Episode",
-         "overview": "TMDB synopsis.", "air_date": "2011-04-24", "vote_average": 8.5}]}"#;
+         "overview": "TMDB synopsis.", "air_date": "2011-04-24", "vote_average": 8.5},
+        {"id": 9003, "episode_number": 3, "name": "TMDB Third",
+         "overview": "Third synopsis.", "air_date": "2011-05-01", "vote_average": 7.0}]}"#;
     const TMDB_EPISODE: &str = r#"{"external_ids": {"imdb_id": "tt0002002", "tvdb_id": 5002},
         "credits": {"cast": [], "guest_stars": [{"id": 31, "name": "Guest Star",
         "character": "Visitor", "order": 0}], "crew": []}, "videos": {"results": []}}"#;
@@ -13672,6 +13754,56 @@ mod tests {
             none.saved().and_then(|r| r.overview).as_deref(),
             Some("Stored.")
         );
+    }
+
+    /// A multi-episode file (`IndexNumberEnd`) takes TheMovieDb's entries for
+    /// every episode in its range: the first one's date, rating and ids, and
+    /// the names and overviews joined with ` / ` (`TmdbEpisodeProvider.cs:
+    /// 106-158`); only the first episode's own request is made.
+    #[tokio::test]
+    async fn a_multi_episode_takes_every_tmdb_episode_in_its_range() {
+        let (base, log) = spawn_episode_providers(false);
+        let episode = VirtualEpisode::new(
+            &base,
+            &[("Tmdb", "1399")],
+            episode_fetchers(&[crate::library_options::fetcher_names::TMDB]),
+            |row| {
+                remote(row);
+                row.data = Some(r#"{"IndexNumberEnd":3}"#.to_owned());
+            },
+        );
+        episode
+            .mgr
+            .refresh_full_item(episode.episode_id, &search_missing())
+            .await
+            .expect("refresh");
+        let row = episode.saved().expect("a full refresh saves");
+        assert_eq!(row.name.as_deref(), Some("TMDB Episode / TMDB Third"));
+        assert_eq!(
+            row.overview.as_deref(),
+            Some("TMDB synopsis. / Third synopsis.")
+        );
+        assert_eq!(
+            row.premiere_date
+                .map(|d| d.format("%Y-%m-%d").to_string())
+                .as_deref(),
+            Some("2011-04-24")
+        );
+        let replaced = episode.store.replaced.lock().expect("lock").clone();
+        let (_, ids) = replaced.last().expect("the ids are written");
+        assert!(
+            ids.iter()
+                .any(|(k, v)| (k.as_str(), v.as_str()) == ("Tmdb", "9002")),
+            "{ids:?}"
+        );
+        let asked = log.lock().expect("log").clone();
+        assert!(
+            asked
+                .iter()
+                .any(|l| l.contains("/tmdb/tv/1399/season/1/episode/2")),
+            "{asked:?}"
+        );
+        assert!(!asked.iter().any(|l| l.contains("/episode/3")), "{asked:?}");
     }
 
     /// The episode's own credits: TheMovieDb's guest star and TheTVDB's guest are

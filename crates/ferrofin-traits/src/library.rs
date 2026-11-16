@@ -1320,6 +1320,102 @@ pub trait LibraryManager: Send + Sync {
         ))
     }
 
+    /// Queues `item`'s refresh with `options` and returns without waiting:
+    /// `ProviderManager.QueueRefresh(item.Id, options, RefreshPriority.High)`,
+    /// then the queue's `RefreshItem` or `RefreshArtist`
+    /// (`ProviderManager.cs:1209-1290`). What the refresh covers:
+    ///
+    /// - a library (`CollectionFolder`) scans that library
+    ///   (`RefreshCollectionFolderChildren`), the root or the aggregate
+    ///   folder every library;
+    /// - any other folder with a path validates its own subtree, the folder
+    ///   included (`ValidateChildren`), and a file item refreshes itself
+    ///   (`RefreshSingleItem`) through the scan of its own path — both
+    ///   through [`queue_refresh_scan`](Self::queue_refresh_scan);
+    /// - a music artist validates the children of the artist folders above
+    ///   the albums credited to it, then refreshes itself (`RefreshArtist`);
+    /// - an item with no file and no physical children (a box set, a
+    ///   playlist, a view, a virtual season, a person, a genre, a studio, a
+    ///   channel, an item outside every library) refreshes through the
+    ///   provider manager's queue at high priority.
+    ///
+    /// The default refuses: a manager without a scanner and a provider
+    /// manager cannot run the refresh, and a silent no-op would look like
+    /// one that ran.
+    ///
+    /// # Errors
+    ///
+    /// [`ServiceError::Backend`] from a manager without them, or whatever
+    /// reading the artist's albums or queueing the refresh surfaces.
+    async fn queue_item_refresh(
+        &self,
+        item: &BaseItemEntity,
+        options: &MetadataRefreshOptions,
+    ) -> Result<(), ServiceError> {
+        let _ = (item, options);
+        Err(ServiceError::backend(
+            "queue_item_refresh needs a library scanner and a provider manager, which this library manager has none of",
+        ))
+    }
+
+    /// Runs `item`'s own metadata refresh with `options` and returns once it
+    /// has run: `item.RefreshMetadata(options, CancellationToken.None)`,
+    /// which a caller awaits rather than queues. An item with a path of its
+    /// own in a library refreshes through the scan of that path in the scan queue's
+    /// priority lane ([`run_refresh_scan`](Self::run_refresh_scan)); any
+    /// other item is queued through the provider manager at high priority,
+    /// and this returns once it is queued. A folder's children are not
+    /// validated. Returns `Ok(false)` when the refresh was stopped before it
+    /// finished (the server is shutting down).
+    ///
+    /// The default refuses, as [`queue_item_refresh`](Self::queue_item_refresh)'s does.
+    ///
+    /// # Errors
+    ///
+    /// [`ServiceError::Backend`] from a manager without a scanner and a
+    /// provider manager, or the refresh failed.
+    async fn refresh_item_metadata(
+        &self,
+        item: &BaseItemEntity,
+        options: &MetadataRefreshOptions,
+    ) -> Result<bool, ServiceError> {
+        let _ = (item, options);
+        Err(ServiceError::backend(
+            "refresh_item_metadata needs a library scanner and a provider manager, which this library manager has none of",
+        ))
+    }
+
+    /// Runs Identify's refresh of `item` with `options` (which carry the
+    /// chosen search result) and returns once it has run:
+    /// `ProviderManager.RefreshFullItem`, `RefreshItem` without the queue.
+    /// The item and, for a folder, its subtree refresh as
+    /// [`queue_item_refresh`](Self::queue_item_refresh) says, through
+    /// [`run_refresh_scan`](Self::run_refresh_scan) in the scan queue's
+    /// priority lane; an artist known only by name refreshes only itself
+    /// there, through the scanner; an item with no file of its own through
+    /// [`ProviderManager::refresh_full_item`](crate::providers::ProviderManager::refresh_full_item).
+    /// Returns `Ok(false)` when the refresh was stopped before it finished.
+    ///
+    /// The default refuses, as [`queue_item_refresh`](Self::queue_item_refresh)'s does.
+    ///
+    /// # Errors
+    ///
+    /// [`ServiceError::Conflict`] when the item's path lies under no library
+    /// location, or when it is a file- or folder-backed item that belongs to
+    /// no library: the scan cannot reach it, so it is not refreshed.
+    /// [`ServiceError::Backend`] from a manager without a scanner and a
+    /// provider manager, or the refresh failed.
+    async fn refresh_full_item(
+        &self,
+        item: &BaseItemEntity,
+        options: &MetadataRefreshOptions,
+    ) -> Result<bool, ServiceError> {
+        let _ = (item, options);
+        Err(ServiceError::backend(
+            "refresh_full_item needs a library scanner and a provider manager, which this library manager has none of",
+        ))
+    }
+
     /// Runs a full library scan and returns only when it has FINISHED.
     ///
     /// The scheduled-task entry point, and the one place the difference from

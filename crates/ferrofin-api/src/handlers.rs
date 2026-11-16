@@ -26,64 +26,48 @@ use crate::state::AppState;
 /// RefreshPriority.High)` call the subtitle/lyric upload+download handlers make
 /// after mutating an item's sidecar files, so the freshly added stream is picked
 /// up. Uses [`MetadataRefreshOptions::default`] (the C# constructor with only a
-/// directory service: `Default` modes, nothing replaced). A file item refreshes
-/// through the library scan of its path, whose probe re-runs because its
-/// sidecar set changed (`ProbeProvider.HasChanged`); an item with no file of
-/// its own through the provider manager.
+/// directory service: `Default` modes, nothing replaced), and refreshes as
+/// [`LibraryManager::queue_item_refresh`] says: a file item through the
+/// library scan of its path, whose probe re-runs because its sidecar set
+/// changed (`ProbeProvider.HasChanged`). An item no longer stored is not
+/// refreshed, as the refresh queue skips it.
+///
+/// [`MetadataRefreshOptions::default`]: ferrofin_traits::providers::MetadataRefreshOptions::default
+/// [`LibraryManager::queue_item_refresh`]: ferrofin_traits::library::LibraryManager::queue_item_refresh
 pub(crate) async fn queue_high_priority_refresh(
     state: &AppState,
     item_id: Uuid,
 ) -> Result<(), ApiError> {
-    use ferrofin_traits::library::ScanTarget;
-    use ferrofin_traits::providers::{MetadataRefreshOptions, RefreshPriority};
-    let options = MetadataRefreshOptions::default();
-    let item = state.library.get_item_by_id(item_id).await?;
-    if let Some(path) = item.as_ref().and_then(refresh_scan_path) {
-        state
-            .library
-            .queue_refresh_scan(ScanTarget::Items(vec![path]), &options)
-            .await?;
+    use ferrofin_traits::providers::MetadataRefreshOptions;
+    let Some(item) = state.library.get_item_by_id(item_id).await? else {
         return Ok(());
-    }
+    };
     state
-        .providers
-        .queue_refresh(item_id, &options, RefreshPriority::High)
+        .library
+        .queue_item_refresh(&item, &MetadataRefreshOptions::default())
         .await?;
     Ok(())
 }
 
 /// Runs an item's default metadata refresh and returns once it has run —
 /// `item.RefreshMetadata(CancellationToken.None)`, which a handler awaits
-/// rather than queues. A file item refreshes through the scan queue's
-/// priority lane ([`LibraryManager::run_refresh_scan`]), on a task of its own
-/// so a client that hangs up does not withdraw it; an item with no file of
-/// its own is queued as [`queue_high_priority_refresh`] does.
+/// rather than queues ([`LibraryManager::refresh_item_metadata`]), on a task
+/// of its own so a client that hangs up does not withdraw it. An item no
+/// longer stored is not refreshed.
 ///
-/// [`LibraryManager::run_refresh_scan`]: ferrofin_traits::library::LibraryManager::run_refresh_scan
+/// [`LibraryManager::refresh_item_metadata`]: ferrofin_traits::library::LibraryManager::refresh_item_metadata
 pub(crate) async fn run_item_refresh(state: &AppState, item_id: Uuid) -> Result<(), ApiError> {
-    use ferrofin_traits::error::ServiceError;
-    use ferrofin_traits::library::ScanTarget;
     use ferrofin_traits::providers::MetadataRefreshOptions;
-    let item = state.library.get_item_by_id(item_id).await?;
-    let Some(path) = item.as_ref().and_then(refresh_scan_path) else {
-        return queue_high_priority_refresh(state, item_id).await;
+    let Some(item) = state.library.get_item_by_id(item_id).await? else {
+        return Ok(());
     };
     let library = std::sync::Arc::clone(&state.library);
-    // In the request's span: the request awaits it (LOGGING.md §4).
-    let ran = tokio::spawn(tracing::Instrument::in_current_span(async move {
+    let ran = run_detached(async move {
         library
-            .run_refresh_scan(
-                ScanTarget::Items(vec![path]),
-                &MetadataRefreshOptions::default(),
-            )
+            .refresh_item_metadata(&item, &MetadataRefreshOptions::default())
             .await
-    }))
-    .await
-    .map_err(|err| {
-        ApiError::Service(ServiceError::backend(format!(
-            "item refresh task failed: {err}"
-        )))
-    })??;
+    })
+    .await?;
     if !ran {
         return Err(ApiError::ServiceUnavailable(format!(
             "the refresh of item {item_id} was stopped before it finished"
@@ -92,52 +76,40 @@ pub(crate) async fn run_item_refresh(state: &AppState, item_id: Uuid) -> Result<
     Ok(())
 }
 
-/// Whether the library scan can reach `target`: every path of it lies under
-/// a location of a configured library (the scan plans nothing anywhere
-/// else). A library or the root always can.
-pub(crate) async fn scan_reaches(
-    state: &AppState,
-    target: &ferrofin_traits::library::ScanTarget,
-) -> Result<bool, ApiError> {
-    use ferrofin_traits::library::ScanTarget;
-    let (ScanTarget::Paths(paths) | ScanTarget::Items(paths)) = target else {
-        return Ok(true);
-    };
-    let folders = state.virtual_folders.get_virtual_folders().await?;
-    Ok(paths.iter().all(|path| {
-        folders.iter().any(|folder| {
-            folder
-                .locations
-                .iter()
-                .any(|location| path_is_under(path, location))
-        })
-    }))
-}
-
-/// Whether `path` is `root` or lies under it, component-wise.
-fn path_is_under(path: &str, root: &str) -> bool {
-    let root = root.trim_end_matches('/');
-    path == root
-        || path
-            .strip_prefix(root)
-            .is_some_and(|rest| rest.starts_with('/'))
-}
-
-/// The path an item refreshes through the library scan by: its own
-/// filesystem path, when it has one inside a library. `None` for an item
-/// with no file of its own — a person, a genre or studio, a channel or
-/// live-TV item streamed from a URL, a row outside every library — which the
-/// provider manager refreshes.
-pub(crate) fn refresh_scan_path(
-    item: &ferrofin_db::entities::base_items::BaseItemEntity,
-) -> Option<String> {
-    let in_library = item
-        .top_parent_id
-        .as_deref()
-        .is_some_and(|top| !top.is_empty());
-    item.path
-        .clone()
-        .filter(|path| in_library && !path.is_empty() && !path.contains("://"))
+/// Runs work a handler awaits on a task of its own, so a client that hangs up
+/// does not stop it: upstream passes `CancellationToken.None`, or no token,
+/// and never reads `RequestAborted`. The task keeps the request's span (the
+/// request awaits it, LOGGING.md §4) and its culture, which a spawned task
+/// does not inherit (.NET's `ExecutionContext` flows it). Once the client has
+/// gone, no answer carries the work's error, so the task logs it as the
+/// error boundary would have (LOGGING.md §2).
+pub(crate) async fn run_detached<T, E>(
+    work: impl std::future::Future<Output = Result<T, E>> + Send + 'static,
+) -> Result<T, ApiError>
+where
+    T: Send + 'static,
+    E: Into<ApiError> + Send + 'static,
+{
+    let (answer, answered) = tokio::sync::oneshot::channel();
+    let culture = ferrofin_util::current_culture::capture();
+    tokio::spawn(tracing::Instrument::in_current_span(
+        ferrofin_util::current_culture::scope(culture, async move {
+            if let Err(Err(error)) = answer.send(work.await.map_err(Into::into)) {
+                // The client has gone: building its answer logs a 5xx once, as
+                // the error boundary does for a client still connected.
+                drop(axum::response::IntoResponse::into_response(error));
+            }
+        }),
+    ));
+    // No answer: the work panicked, which the panic hook logged (LOGGING.md §7),
+    // or the shutdown dropped it.
+    answered.await.unwrap_or_else(|_| {
+        Err(ApiError::Service(
+            ferrofin_traits::error::ServiceError::backend(
+                "the request's task stopped before it answered",
+            ),
+        ))
+    })
 }
 
 pub mod activity_log;
@@ -986,7 +958,9 @@ pub const VERIFIED_SUBSYSTEMS_AGAINST_EARLIER_PIN: &[(&str, &str)] = &[];
 /// `video-stream-copy` is whether a transcode job copies the source video and
 /// what dynamic HDR metadata the copy strips, which the HLS and stream routes
 /// share; `recording-postprocessing` is the executable run after a retained
-/// DVR capture, which no HTTP response describes; `recording-keep-up-to` is
+/// DVR capture, which no HTTP response describes; `recording-images` is the
+/// guide artwork a starting capture copies beside its recording, which none
+/// describes either; `recording-keep-up-to` is
 /// which of a series timer's recordings a starting capture deletes past its
 /// "Keep up to", and `direct-recording` how the DVR copies an unshared tuner
 /// URL and how that copy's end settles the timer (completed, or failed and
@@ -1014,6 +988,7 @@ pub const SUBSYSTEM_KEYS: &[&str] = &[
     "trickplay",
     "video-stream-copy",
     "recording-postprocessing",
+    "recording-images",
     "recording-keep-up-to",
     "direct-recording",
     "metadata-refresh",
@@ -1152,6 +1127,46 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
             "Where the library refuses a delete (a protected folder, or a library this \
              version has not fully scanned yet), the recording and its timer stay and the \
              error is logged; upstream's DeleteItem has no such refusal.",
+        ],
+    },
+    VerifiedSubsystem {
+        key: "recording-images",
+        upstream_file: "src/Jellyfin.LiveTv/Recordings/RecordingsMetadataManager.cs",
+        upstream_method: "SaveRecordingImages",
+        ferrofin: "ferrofin-livetv manager.rs start_capture (OnStarted's SaveRecordingMetadata: \
+                   spawned, as its async void does not hold the recorder up; the NFO when \
+                   SaveRecordingNFO is on, then the images when SaveRecordingImages is on, a \
+                   failed NFO ending the task as the catch-all does) -> save_recording_images: \
+                   the guide programme item the timer's facts came from \
+                   (TimerRecordingInfo.program_item_id, set by apply_program_to_recording_info; \
+                   none, like upstream's stand-in programme, saves nothing), its image rows -> \
+                   recording_metadata.rs recording_images (a series programme: Thumb ?? \
+                   Primary; otherwise Primary ?? Thumb, Backdrop, Thumb, Logo, each by \
+                   GetImageInfo(type, 0); named by the chosen image's type: Primary and Thumb \
+                   {recording stem}-thumb for a series, else poster and landscape, Backdrop \
+                   fanart, Logo logo, in the recording's folder) -> a remote image made local \
+                   through ProviderManager::cached_remote_image (ConvertImageToLocal's \
+                   download), a local one only from the internal metadata directory \
+                   (LiveTvPaths.metadata_dir) -> copy_recording_image (File.Copy with overwrite, the local \
+                   file's extension); each image's failure logged and the next one tried. \
+                   Compared with SaveRecordingMetadata, SaveRecordingImages, \
+                   SaveRecordingImage, RecordingsManager.RecordStream's OnStarted and \
+                   LibraryManager.ConvertImageToLocal at the pinned v12.4 tag.",
+        date: "2026-11-15",
+        divergences: &[
+            "The image's extension is appended to the saved name; upstream's \
+             Path.ChangeExtension cuts the name at its last dot, so an episode recorded as \
+             Dr. Who S01E01 saved its thumb as Dr.jpg, and an image file without an \
+             extension was saved with a trailing dot. Jellyfin bug not ported.",
+            "A remote image is copied from the remote-image cache and its row keeps the URL, \
+             where upstream's ConvertImageToLocal rewrites the programme's row to the \
+             downloaded file (the cache's reason is on ProviderManager::cached_remote_image); \
+             a row none of whose URLs gave an image stays, where removeOnFailure removes it, \
+             as the images row records (owner decision 2026-10-31, gl-1095).",
+            "A programme's local image row is copied only when its file is in the internal \
+             metadata directory (live_tv_image_is_internal), the rule every other read of a \
+             Live TV image row follows, since a guide supplied it; upstream copies any local \
+             file. The row is skipped and logged, and the next image tried.",
         ],
     },
     VerifiedSubsystem {
@@ -1925,21 +1940,27 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
                    its declared name, whatever case the query spelled it in), each answered after \
                    authorization (RequireAuth on the HLS and universal routes; the stream routes \
                    are anonymous upstream) and before the item is looked up. handlers/hls.rs \
-                   stream_pattern_failures and segment_pattern_failures in the seven \
-                   DynamicHlsController actions (GetMasterHlsVideoPlaylist, \
+                   stream_pattern_failures, route_container_failures and segment_pattern_failures \
+                   in the seven DynamicHlsController actions (GetMasterHlsVideoPlaylist, \
                    GetVariantHlsVideoPlaylist, GetLiveHlsStream, GetMasterHlsAudioPlaylist, \
                    GetVariantHlsAudioPlaylist, GetHlsVideoSegment, GetHlsAudioSegment): \
                    segmentContainer, audioCodec, level, videoCodec and subtitleCodec on each, and \
                    container on GetLiveHlsStream's query and on a segment's route {container} (the \
-                   text after the last dot of {segmentId}.{container}, where a blank one is \
-                   [Required]'s complaint, filed beside the others); the playlists declare no \
-                   container, so their container query is not read. The same stream_pattern_failures \
-                   in handlers/videos.rs and audio.rs get_video_stream, \
-                   get_video_stream_by_container, get_audio_stream and get_audio_stream_by_container \
-                   (VideosController.GetVideoStream and GetVideoStreamByContainer, \
-                   AudioController.GetAudioStream and GetAudioStreamByContainer), with container the \
-                   query's or the stream.{container} route's, for anonymous and Static=true requests \
-                   too, and again in transcode_stream_fallback; and audio.rs \
+                   text after the last dot of {segmentId}.{container}); the playlists declare no \
+                   container, so their container query is not read. A route container is \
+                   [Required] too: extract.rs route_container_complaint answers a blank one with \
+                   [Required]'s complaint alone (the pattern passes the null the binder makes of \
+                   it), filed beside the others. The same stream_pattern_failures in \
+                   handlers/videos.rs and audio.rs get_video_stream and get_audio_stream, and \
+                   route_container_failures in get_video_stream_by_container and \
+                   get_audio_stream_by_container (VideosController.GetVideoStream and \
+                   GetVideoStreamByContainer, AudioController.GetAudioStream and \
+                   GetAudioStreamByContainer), with container the query's or the \
+                   stream.{container} route's, for anonymous and Static=true requests too, and \
+                   again in transcode_stream_fallback; live_tv.rs get_live_stream_file \
+                   (LiveTvController.GetLiveStreamFile, anonymous: its route container, beside a \
+                   blank streamId in one body, and a segment without the stream. literal no match, \
+                   a 404); and audio.rs \
                    get_universal_audio_stream (UniversalAudioController.GetUniversalAudioStream: \
                    audioCodec and transcodingContainer only). Compared with those actions' parameter \
                    attributes at the pinned v12.4 tag, and settled against a stock 12.4 container \
@@ -1949,13 +1970,16 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
                    {container} blank (alone and beside a failing segmentContainer) and outside the \
                    pattern, level spellings (4.1, -41, abc, 1e1, a leading space, 41., 4.1.2), a \
                    HEAD of the master playlist, an anonymous stream request, Static=true, and the 401 \
-                   of an HLS request with no token coming first; a stream.{container} route value \
-                   outside the pattern was probed on 12.4 for gl-1671 (2026-11-11). Not part of this \
+                   of an HLS request with no token coming first; and (2026-11-15) a \
+                   stream.{container} blank (space, tab, beside a failing audioCodec, anonymous, an \
+                   anonymous HEAD), outside the pattern (a$b, a leading space) and empty, the \
+                   Stream. literal in another case, and a live stream file's container blank and \
+                   outside the pattern (anonymous too), each beside a blank streamId, and its \
+                   segment without the literal or empty after it. Not part of this \
                    row: merging these complaints with another \
                    parameter's binding failure into one body (gl-1672), the segments' {segmentId} \
-                   binding, a blank or empty stream.{container} (gl-1671), and the rest of each \
-                   operation",
-        date: "2026-11-14",
+                   binding, and the rest of each operation",
+        date: "2026-11-15",
         divergences: &[],
     },
     VerifiedSubsystem {
@@ -1982,7 +2006,12 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
                    InputAudioSync and InputVideoSync, a wma or asf container's audio sync \
                    among them, -re, -readrate and -readrate_catchup, an RTSP input's \
                    -rtsp_transport tcp+udp -rtsp_flags prefer_tcp, one -fflags joining \
-                   +igndts, +ignidx and +genpts (GenPtsInput or a copied video), and the \
+                   +igndts, +ignidx and +genpts (GenPtsInput or a copied video), a video \
+                   request's -f with its container's input format from \
+                   encoding_helper/helper.rs input_format (GetInputFormat) while any \
+                   hardware acceleration type but none is configured, upstream's \
+                   never-assigned EncodingJobInfo.VideoType reading VideoFile for every job \
+                   (a disc rip's -f concat comes later and wins), and the \
                    looping reconnect options) over \
                    transcoding/throttler.rs effective_input_protocol (AttachMediaSourceInfo's \
                    EncoderPath and EncoderProtocol), encoding_helper/hw/input_args.rs \
@@ -1995,6 +2024,10 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
                    external_stream_input_arguments and needs_external_subtitle_muxing (the \
                    rest of GetInputArgument: the external subtitle, read through the .idx \
                    beside a VobSub .sub, then the external audio; NeedsExternalSubtitleMuxing), \
+                   then GetInputArgument's last rule, -noautoscale after the inputs whenever \
+                   encoding_helper/hw/decoder.rs hardware_video_decoder names a decoder \
+                   (GetHardwareVideoDecoder non-empty, a hardware decode feeding a software \
+                   encoder included), \
                    and EncodingHelper::map_args with subtitle_map_args, \
                    negative_map_args_by_filters and find_index (GetMapArgs, \
                    GetNegativeMapArgsByFilters, FindIndex). Compared with those methods at the \
@@ -2013,9 +2046,14 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
                    among them, gl-1768",
         date: "2026-11-14",
         divergences: &[
-            "A job reading a video file with hardware acceleration configured passes no -f \
-             with the container's input format (GetInputFormat). Fix path: gl-1676.",
-            "A job behind a hardware decoder passes no -noautoscale. Fix path: gl-928.",
+            "The -f input format reads IsVideoRequest as is_input_video, the item's media \
+             type, as the hardware device arguments do, so an audio-route request for a video \
+             item with an accelerator configured passes it, where upstream's audio routes are \
+             never video requests, and a video-route request for an audio item does not; \
+             ffmpeg reads the file's own demuxer either way. Fix path: gl-1831.",
+            "An AMF, VideoToolbox or RKMPP job passes no -noautoscale where its accelerator \
+             names a decoder: it decodes in software here, so ffmpeg keeps its scaler. That \
+             is the owner's hardware scope decision (CLAUDE.md, Current scope).",
             "A seeked HLS job copying the video passes -noaccurate_seek (not for a wtv \
              input), which upstream does not: Ferrofin's HLS output carries -output_ts_offset \
              in place of upstream's -copyts, and without it a re-encoded audio track would \
@@ -2346,21 +2384,30 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
                    episode_extras_for_language and episode_people_from (guest stars); \
                    ferrofin-core library_scan.rs fetch_tmdb_metadata (a pinned TMDb id, else \
                    find_tmdb_id's /find by an IMDb id, a series also by its TVDB id, else the \
-                   parsed-name search and find_best_match), apply_details (a movie's overview \
+                   parsed-name search and find_best_match, for a movie only without an IMDb \
+                   id), apply_details (a movie's overview \
                    with its blank lines collapsed), fetch_tmdb_season \
                    with ferrofin-providers season.rs tmdb_answer (ImportSeasonName), and \
                    fetch_tmdb_episode with apply_tmdb_episode; for an episode the provider \
                    manager refreshes that has a path, episode.rs tmdb_answer (a path-less one \
                    is not asked, as TmdbEpisodeProvider returns nothing for \
-                   IsMissingEpisode). Compared with TmdbMovieProvider, TmdbSeriesProvider \
-                   (MapTvShowToSeries), TmdbSeasonProvider and TmdbEpisodeProvider \
+                   IsMissingEpisode). Both read a multi-episode file's IndexNumberEnd range \
+                   through episode.rs tmdb_episode_in_range; the scan's lookup has its stored \
+                   row's range end, else its file name's (under Replace all metadata the file \
+                   name's first), never its NFO's (MergeNewData passes ids only). Compared \
+                   with TmdbMovieProvider, TmdbSeriesProvider (MapTvShowToSeries), \
+                   TmdbSeasonProvider and TmdbEpisodeProvider \
                    GetMetadata, TmdbClientManager and TmdbUtils at the pinned v12.4 tag. \
                    TheMovieDb's box-set, person, missing-episode and similar-items providers \
                    and its image providers, the other providers (TheTVDB, OMDb, MusicBrainz, \
                    TheAudioDB; gl-1815) and the merge onto the item (gl-1813) are not part of \
                    this row.",
-        date: "2026-11-14",
+        date: "2026-11-15",
         divergences: &[
+            "A movie, series, season or episode TMDb has no overview for answers the \
+             refresh no Overview, so Identify → Apply and a Replace all metadata refresh \
+             store none; upstream's provider answers TMDb's \"\", which those refreshes \
+             store (RemoveOldMetadata skips the refill from the item). Fix path: gl-1843.",
             "A TMDb video with no key is dropped where upstream stores the dead link \
              https://www.youtube.com/watch?v=, and an episode's trailer URL already added is \
              compared exactly where upstream's AddTrailerUrl ignores case (YouTube keys are \
@@ -2368,14 +2415,12 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
             "A blank content rating is skipped; upstream takes a blank own-country series \
              rating (storing a bare country prefix such as GB-) and lets a blank US one \
              block its first-entry fallback. Jellyfin bug not ported.",
-            "A movie whose IMDb id TMDb's /find cannot resolve is searched by name; upstream \
-             returns no metadata for it. Fix path: gl-1783.",
             "An episode is looked up in aired order whatever the series' display order; \
              upstream maps an absolute, DVD, digital, story-arc, production, TV or \
              original-air-date order through TMDb's episode group. Fix path: gl-1784.",
-            "A multi-episode file takes the first episode's name and overview; upstream \
-             fetches every episode up to IndexNumberEnd and joins theirs, and looks up an \
-             episode with no season number in season 1. Fix path: gl-1785.",
+            "An episode with no season number is not looked up; upstream looks it up in \
+             season 1 (TmdbEpisodeProvider.cs:99), with its resolver's season-1 default for \
+             a loose episode, which Ferrofin's planner lacks too. Fix path: gl-1846.",
             "A date-only value (premiere, end and air dates) is stored as midnight UTC; \
              upstream stores the server's local midnight. Pending an owner decision \
              (gl-490).",
@@ -2699,20 +2744,31 @@ pub const VERIFIED: &[Verified] = &[
         upstream_file: "Jellyfin.Api/Controllers/TvShowsController.cs",
         upstream_method: "GetNextUp",
         ferrofin: "handlers/tv_shows.rs get_next_up → ferrofin-core tv_series_manager.rs \
-               (TVSeriesManager; resolve_parents: GetItemById's 400 for a nil parentId, after \
-               the seriesId return) → next_up_service.rs (NextUpService, top_parent_ids → \
-               item_repository.rs view_top_parent_ids)",
-        date: "2026-11-11",
+               (TVSeriesManager; keys_scope: GetItemById's 400 for a nil parentId, after \
+               the seriesId return; a box set or playlist parent as DescendantOfId) → \
+               next_up_service.rs (NextUpService, top_parent_ids → item_repository.rs \
+               view_top_parent_ids; linked_container_scope: SetTopParentIdsOrAncestors' \
+               LinkedChildren test, DescendantQueryHelper's set, AddUserToQuery's \
+               scope_to_user_libraries)",
+        date: "2026-11-15",
         divergences: &[
             "TVSeriesManager.GetPreferredVersion (continue in the alternate version the user \
          has been watching, matched by media-source name) is not ported: the pick is always \
          the primary episode row. Un-defer path: v12's Video.GetMediaSourceName \
          common-prefix naming is ported (video_versions::media_source_name); swap by that \
          name in tv_series_manager (see the TODO there).",
-            "parentId naming a non-view item: v12 routes it to AncestorIds, which the keys \
-         statement ignores, so the answer is always empty; Ferrofin scopes by TopParentId = \
-         that item (a physical library folder answers, anything else is empty as upstream). \
-         Jellyfin bug not ported.",
+            "parentId naming a non-view item other than a box set or playlist: v12 routes it \
+         to AncestorIds, which the keys statement ignores, so the answer is always empty; \
+         Ferrofin scopes by TopParentId = that item (a physical library folder answers, \
+         anything else is empty as upstream). Jellyfin bug not ported.",
+            "parentId naming a box set or playlist with linked children: v12.4's \
+         SetTopParentIdsOrAncestors sets DescendantOfId, which NextUpService's keys \
+         statement ignores, so AddUserToQuery scopes it to every library the user has \
+         (those excluded from Latest included) and the answer is that whole Next Up; \
+         Ferrofin answers the series under its descendant set (the episodes it links, and \
+         those of a series or season it links) within those libraries, as upstream's \
+         comment intends. Owner decision 2026-11-02 (gl-36): Jellyfin bug not ported. One \
+         with no linked children is empty in both.",
             "The 400 (an API key with no userId, a nil parentId, or a value the query binder \
          cannot convert), 403 (another user's id without the administrator role) and 404 (a \
          userId naming no account) bodies are Ferrofin's error shape, not upstream's. Fix \
@@ -3362,7 +3418,9 @@ pub const VERIFIED: &[Verified] = &[
         upstream_method: "UploadLyrics",
         ferrofin: "handlers/lyrics.rs upload_lyrics (require_item with GetItemById's 400 for \
                a nil id, an empty body by its size hint, upload_format, then the Bytes read \
-               under upload_body_limit; queue_high_priority_refresh) → ferrofin-core \
+               under upload_body_limit; the save and queue_high_priority_refresh on \
+               handlers.rs run_detached's task, so they finish for a client that hangs up \
+               once the body is read, as SaveLyricAsync takes no token) → ferrofin-core \
                lyric_manager.rs save_lyric \
                (decode_stream_text, parse_by_format on the format as given, save_targets \
                with save_extension, try_save_to_files)",
@@ -3389,7 +3447,10 @@ pub const VERIFIED: &[Verified] = &[
         upstream_file: "Jellyfin.Api/Controllers/LyricsController.cs",
         upstream_method: "DeleteLyrics",
         ferrofin: "handlers/lyrics.rs delete_lyrics (require_item: GetItemById's 400 for a \
-               nil id; run_item_refresh) → ferrofin-core lyric_manager.rs delete_lyrics",
+               nil id; the delete and run_item_refresh on handlers.rs run_detached's task, so \
+               they finish for a client that hangs up, as DeleteLyricsAsync's \
+               RefreshMetadata(CancellationToken.None) does) → ferrofin-core lyric_manager.rs \
+               delete_lyrics",
         date: "2026-11-11",
         divergences: &[
             "The 400 (nil item id) and 404 (no such item, or one the caller may not see) bodies \
@@ -3419,8 +3480,11 @@ pub const VERIFIED: &[Verified] = &[
         upstream_method: "DownloadRemoteLyrics",
         ferrofin: "handlers/lyrics.rs download_remote_lyrics (RequiredRouteString lyricId: \
                ConvertEmptyStringToNull, then [Required]; require_item: GetItemById's 400 for \
-               a nil id; queue_high_priority_refresh) → ferrofin-core lyric_manager.rs \
-               download_lyrics (fetch_remote, save_targets, try_save_to_files)",
+               a nil id; the download and queue_high_priority_refresh on handlers.rs \
+               run_detached's task, so they finish for a client that hangs up, as \
+               DownloadLyricsAsync gets CancellationToken.None) → ferrofin-core \
+               lyric_manager.rs download_lyrics (fetch_remote, save_targets, \
+               try_save_to_files)",
         date: "2026-11-11",
         divergences: &[
             "The 400 (nil item id) and 404 (no such item, one the caller may not see, or no \
@@ -4129,7 +4193,9 @@ pub const VERIFIED: &[Verified] = &[
         upstream_method: "UpdateNamedConfiguration",
         ferrofin: "handlers/config.rs update_named_configuration (RequiredRouteString key: \
                ConvertEmptyStringToNull, then [Required]; normalize_named_configuration: \
-               GetConfigurationType and Deserialize) → save_named_configuration \
+               GetConfigurationType and Deserialize) → save_named_configuration, on \
+               handlers.rs run_detached's task so it finishes for a client that hangs up, in \
+               the request's span and culture \
                (BaseConfigurationManager.SaveConfiguration: the validating store, the write, \
                the live network policy (ferrofin-networking NetworkManager::update_settings: \
                UpdateSettings, warning of each LAN or exclusion entry InitializeLan ignores \
@@ -4232,8 +4298,10 @@ pub const VERIFIED: &[Verified] = &[
                FillImages(BaseItemDto, …) by the timer's name and the programme's \
                ExternalSeriesId over first_with_image, item_images and image_tag; \
                guide_repository.rs channel_row and manager.rs channel_image_tags for ChannelName and \
-               ChannelPrimaryImageTag, none without the channel; RunTimeTicks from the window)",
-        date: "2026-11-14",
+               ChannelPrimaryImageTag, none without the channel; RunTimeTicks from the window; \
+               ProgramId as GetInternalProgramId(info.ProgramId) through derive_program_id over \
+               the stored listing id, as stored without one)",
+        date: "2026-11-15",
         divergences: &[
             "ProgramInfo is the programme DTO GET /LiveTv/Programs projects from the guide's \
          own table, so it lacks what that table has no column for (CommunityRating, \
@@ -4292,8 +4360,10 @@ pub const VERIFIED: &[Verified] = &[
                FillImages(BaseItemDto, …) by the timer's name and the programme's \
                ExternalSeriesId over first_with_image, item_images and image_tag; \
                guide_repository.rs channel_row and manager.rs channel_image_tags for ChannelName and \
-               ChannelPrimaryImageTag, none without the channel; RunTimeTicks from the window)",
-        date: "2026-11-14",
+               ChannelPrimaryImageTag, none without the channel; RunTimeTicks from the window; \
+               ProgramId as GetInternalProgramId(info.ProgramId) through derive_program_id over \
+               the stored listing id, as stored without one)",
+        date: "2026-11-15",
         divergences: &[
             "A channelId or seriesTimerId that is no GUID matches no timer; upstream's new Guid \
          throws a FormatException, a 500. Jellyfin bug not ported.",
@@ -4358,11 +4428,12 @@ pub const VERIFIED: &[Verified] = &[
                ferrofin-util numeric_collation.rs invariant_numeric_cmp, SortExtensions' \
                invariant-culture NumericOrdering comparer, a null name first; \
                build_series_timer_dto for each: the channel's current name from \
-               guide_repository.rs channel_row, none without a channel, and \
-               GetSeriesTimerInfoDto's FillImages(dto, info.Name, info.SeriesId) through \
-               fill_images with the stored SeriesId: first_with_image, item_images and \
-               image_tag)",
-        date: "2026-11-14",
+               guide_repository.rs channel_row, none without a channel, ProgramId as \
+               GetInternalProgramId(info.ProgramId) through derive_program_id over the \
+               stored listing id (as stored without one), and GetSeriesTimerInfoDto's \
+               FillImages(dto, info.Name, info.SeriesId) through fill_images with the stored \
+               SeriesId: first_with_image, item_images and image_tag)",
+        date: "2026-11-15",
         divergences: &[
             "A series timer whose name is blank runs no lookup by name: it takes no Thumb or \
          Backdrop from a library series, and its Primary only from an airing of its listings \
@@ -4380,8 +4451,9 @@ pub const VERIFIED: &[Verified] = &[
                is a 400; LiveTvManager.GetSeriesTimer: GetSeriesTimers with a default query, \
                then the first whose Id equals timerId ignoring case; none is a 404) → \
                ferrofin-livetv manager.rs get_series_timers (as GET /LiveTv/SeriesTimers: \
-               series_timer_rows, build_series_timer_dto and fill_images)",
-        date: "2026-11-14",
+               series_timer_rows, build_series_timer_dto with ProgramId derived from the \
+               stored listing id (as stored without one), and fill_images)",
+        date: "2026-11-15",
         divergences: &[
             "A series timer whose name is blank runs no lookup by name: it takes no Thumb or \
          Backdrop from a library series, and its Primary only from an airing of its listings \
@@ -5580,8 +5652,9 @@ pub const VERIFIED: &[Verified] = &[
                NotFound()'s ProblemDetails 404; every other failure answered as \
                ExceptionMiddleware answers a throw, its status with text/plain \"Error \
                processing request.\" (error.rs into_exception_response); the delete and the \
-               refresh on a task of their own, as upstream finishes them for a client that \
-               hangs up) → ferrofin-core subtitle_manager.rs delete_subtitles \
+               refresh on handlers.rs run_detached's task, in the request's span and culture, \
+               as upstream finishes them for a client that hangs up, logging a failure no \
+               answer carries) → ferrofin-core subtitle_manager.rs delete_subtitles \
                (SubtitleManager.DeleteSubtitles: GetMediaStreams for the subtitle stream at \
                index, none or one with no or an empty path the 400; a row not marked \
                external is skipped too, which changes no answer, since neither server stores \
@@ -5593,7 +5666,11 @@ pub const VERIFIED: &[Verified] = &[
                DirectoryNotFoundException 404 before any refresh; an http(s) row, which \
                Path.GetFullPath resolves against the working directory (from /, \
                http://h/a.srt → /http:/h/a.srt, a missing folder), is that 404 without \
-               touching the disk) → \
+               touching the disk; on a read-only mount, where unlink answers EROFS before \
+               it looks the file up, the file is already gone when an lstat of the path \
+               fails with ENOENT, and anything else is the 500 (DeleteFile's EROFS arm over \
+               FileSystem.Exists.Unix FileExists, dotnet/runtime issue 22382; read on \
+               release/10.0, not measured on 12.4)) → \
                handlers.rs run_item_refresh (the awaited \
                item.RefreshMetadata, whose re-probe drops the stream and renumbers the rest; \
                queued instead for an item outside every library, as for the lyrics delete). \
@@ -5602,7 +5679,7 @@ pub const VERIFIED: &[Verified] = &[
                missing and a video stream's index, a nil id, an unknown id and an external \
                sidecar's index; and that sidecar's row pointed at a missing file (204), a \
                missing folder (404, row kept) and an http URL (404, row kept)",
-        date: "2026-11-12",
+        date: "2026-11-15",
         divergences: &[
             "A hex (0x, #, &h) or padded index is a 400; upstream's route binder reads it as \
          a number. Fix path: gl-1664.",
@@ -5618,9 +5695,6 @@ pub const VERIFIED: &[Verified] = &[
          resolves one against its working directory, so a relative row whose folder exists \
          there answers 204 and deletes the file it names beside the server process (gl-1723). \
          A Jellyfin bug, deliberately not ported.",
-            "A file already gone from a read-only mount (EROFS) is a 500; File.Delete checks \
-         that the file is absent and answers it as any missing file, 204 and the refresh. Fix \
-         path: gl-1724.",
         ],
         refs: &["access-filtering"],
     },
@@ -5722,8 +5796,11 @@ pub const VERIFIED: &[Verified] = &[
                GetItemById<Video>(itemId, User.GetUserId()): a missing, hidden or non-video \
                item is a 404; the download and the refresh queued after it share one try, \
                whose failure is logged at error as \"Error downloading subtitles\" and still \
-               answered 204) → ferrofin-core subtitle_manager.rs download_subtitles, route and \
-               attach (SubtitleManager.DownloadSubtitles, GetProvider and GetRemoteSubtitles' \
+               answered 204; the try runs on handlers.rs run_detached's task, so for a client \
+               that hangs up both still finish and a failure is still logged, as \
+               DownloadSubtitles gets CancellationToken.None) → ferrofin-core \
+               subtitle_manager.rs download_subtitles, route and attach \
+               (SubtitleManager.DownloadSubtitles, GetProvider and GetRemoteSubtitles' \
                Split('_', 2): an id naming no provider fails the download; TrySaveSubtitle and \
                TrySaveToFiles: the library's SaveSubtitlesWithMedia picks the folder beside the \
                media path or the item's internal-metadata folder, \
@@ -5750,9 +5827,6 @@ pub const VERIFIED: &[Verified] = &[
             "The subtitle is recorded as an external stream as soon as it is written; upstream \
          leaves that to the queued refresh's probe, so the item lists it here before the \
          refresh has run, and also when queueing the refresh failed. Fix path: gl-1641.",
-            "A client that hangs up stops the download, the write or the refresh where it \
-         is, unlogged; upstream passes CancellationToken.None and finishes them. Fix path: \
-         gl-1645.",
             "A nil itemId is a 404, not GetItemById's 400. Fix path: gl-1695.",
             "A whitespace-only subtitleId is taken (a logged failed download and a 204, or a \
          404 for a missing or hidden item); upstream's model validation answers 400 before \
@@ -5993,9 +6067,11 @@ pub const VERIFIED: &[Verified] = &[
                id) → MetadataRefreshOptions \
                with FullRefresh for metadata and images, ReplaceAllMetadata, \
                RemoveOldMetadata, ReplaceAllImages = replaceAllImages and SearchResult = the \
-               body → RefreshFullItem awaited on a task of its own (CancellationToken.None): \
-               an item with a path through LibraryManager::run_refresh_scan of \
-               item_update.rs refresh_scan_target in the scan queue's priority lane \
+               body → LibraryManager::refresh_full_item (RefreshFullItem) awaited on \
+               handlers.rs run_detached's task (CancellationToken.None; the request's span \
+               and culture, a failure after a hang-up logged), routed by ferrofin-core \
+               library_manager/item_refresh.rs identify_target: an item with a path \
+               through run_refresh_scan of scan_target in the scan queue's priority lane \
                (RefreshItem: the item, then ValidateChildren with the same options, so a \
                folder's children refresh under the chosen result too), an artist known only \
                by name through the scanner's ScanTarget::Artist, any other item through \
@@ -6034,15 +6110,18 @@ pub const VERIFIED: &[Verified] = &[
                and replaceAllMetadata, replaceAllImages and regenerateTrickplay to false; \
                MetadataRefreshOptions::for_item_refresh: ForceSave for a FullRefresh of \
                either kind or either replace, RemoveOldMetadata = replaceAllMetadata, \
-               IsAutomated false, RegenerateTrickplay) → queue_item_refresh by \
-               refresh_route (QueueRefresh at High priority, then the queue's RefreshItem \
-               or RefreshArtist): a CollectionFolder's physical folders \
+               IsAutomated false, RegenerateTrickplay) → \
+               LibraryManager::queue_item_refresh, routed by ferrofin-core \
+               library_manager/item_refresh.rs refresh_target (QueueRefresh at High \
+               priority, then the queue's RefreshItem or RefreshArtist): a \
+               CollectionFolder's physical folders \
                (RefreshCollectionFolderChildren), every library for the root, another \
                folder's subtree (the folder, then ValidateChildren with the same options) \
                and a file's own path (RefreshSingleItem's metadata service), each as a scan \
-               through LibraryManager::queue_refresh_scan; a music artist by \
-               artist_refresh_route (RefreshArtist: the artist folders above its credited \
-               albums validate their children, then the artist refreshes); a box set, \
+               through queue_refresh_scan; a music artist by artist_target \
+               (RefreshArtist: the artist folders above its credited albums, found from \
+               one read of the ancestors per album folder as MusicAlbum.GetMusicArtist \
+               walks them, validate their children, then the artist refreshes); a box set, \
                playlist, view, virtual season, person, genre, studio or channel through \
                ProviderManager::queue_refresh at High priority → 204 without waiting for \
                the refresh.",
@@ -6185,7 +6264,7 @@ pub const VERIFIED: &[Verified] = &[
                Year, asks s= with type=movie; each row's Title, Imdb id, ProductionYear from \
                Year's first four characters, PremiereDate from Released, the poster unless \
                N/A, and the lookup's IndexNumber and ParentIndexNumber)",
-        date: "2026-11-14",
+        date: "2026-11-15",
         divergences: &[
             "A TMDb id with surrounding whitespace or a leading sign (` 603 `, `+603`) pins \
          the title, where v12.4's TryParseTmdbId (NumberStyles.None) reads it as no id and \
@@ -6199,8 +6278,6 @@ pub const VERIFIED: &[Verified] = &[
             "TheTVDB's movie search (jellyfin-plugin-tvdb TvdbMovieProvider.GetSearchResults) \
          is not ported, so a movie Identify lists no TheTVDB candidates where Jellyfin with the \
          plugin does. Fix path: gl-1405.",
-            "A TMDb title TMDb has no overview for gets no Overview member; upstream's is \
-         \"\" (TMDb's empty string, kept). Fix path: gl-1798.",
             "A body with no SearchInfo is searched as an empty lookup (200); upstream \
          dereferences the null SearchInfo and answers 500.",
             "The 401 (no or bad token) body is Ferrofin's error shape, not upstream's. Fix \
@@ -6274,7 +6351,7 @@ pub const VERIFIED: &[Verified] = &[
                else an Imdb, Zap2It or Tmdb id resolved through /search/remoteid, pins the \
                series' extended record; else tvdb.rs search, the parsed comparable name, five \
                results ranked as FindSeriesInternal ranks them and kept within a year of Year)",
-        date: "2026-11-14",
+        date: "2026-11-15",
         divergences: &[
             "TheTVDB's results are listed too (SearchProviderName TheTVDB, ProviderIds.Tvdb): \
          Ferrofin compiles its remote providers in (CLAUDE.md, Current scope), where stock \
@@ -6297,8 +6374,6 @@ pub const VERIFIED: &[Verified] = &[
             "A TMDb result's PremiereDate is the first air date at UTC midnight; upstream's \
          ToUniversalTime reads it as the server's local midnight, so on a host not on UTC \
          the instant differs by the offset. Fix path: gl-490.",
-            "A TMDb title TMDb has no overview for gets no Overview member; upstream's is \
-         \"\" (TMDb's empty string, kept). Fix path: gl-1798.",
             "A body with no SearchInfo is searched as an empty lookup (200); upstream \
          dereferences the null SearchInfo and answers 500.",
             "The 401 (no or bad token) body is Ferrofin's error shape, not upstream's. Fix \
@@ -6350,7 +6425,7 @@ pub const VERIFIED: &[Verified] = &[
                the Imdb id TMDb knows), a failed lookup going on; else search_person by name \
                with no language (SearchPersonAsync, include_adult from the plugin settings), \
                each row's Name, profile image and Tmdb id)",
-        date: "2026-11-14",
+        date: "2026-11-15",
         divergences: &[
             "A TMDb id with surrounding whitespace or a leading sign (` 31 `, `+31`) pins the \
          person; v12.4's TryParseTmdbId (NumberStyles.None) reads it as no id and searches by \
@@ -6358,8 +6433,6 @@ pub const VERIFIED: &[Verified] = &[
             "TheTVDB's person search (jellyfin-plugin-tvdb TvdbPersonProvider.GetSearchResults) \
          is not ported, so a person Identify lists no TheTVDB candidates where Jellyfin with \
          the plugin does. Fix path: gl-1124.",
-            "A person TMDb has no biography for gets no Overview member; upstream's is \"\" \
-         (TMDb's empty string, kept). Fix path: gl-1798.",
             "A body with no SearchInfo is searched as an empty lookup (200); upstream \
          dereferences the null SearchInfo and answers 500.",
             "The 401 (no or bad token) and 403 (not an administrator) bodies are Ferrofin's \
@@ -6855,4 +6928,32 @@ pub fn register(router: Router<AppState>) -> Router<AppState> {
     // The session WebSocket (`/socket`) — not in the OpenAPI contract; jellyfin-web
     // needs it to establish a connection or it reports "Connection Failure".
     websocket::register(router)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::run_detached;
+
+    /// The detached work runs inside the request's span, so its logs and
+    /// spans stay under `http_request` (LOGGING.md §4), and under the
+    /// request's culture.
+    #[tokio::test]
+    async fn detached_work_keeps_the_requests_span_and_culture() {
+        use tracing::Instrument as _;
+        let _subscriber = tracing::subscriber::set_default(tracing_subscriber::registry());
+        let span = tracing::info_span!("http_request");
+        let seen = ferrofin_util::current_culture::scope(
+            "sv".to_owned(),
+            run_detached(async {
+                let span = tracing::Span::current()
+                    .metadata()
+                    .map(tracing::Metadata::name);
+                Ok::<_, crate::error::ApiError>((span, ferrofin_util::current_culture::capture()))
+            }),
+        )
+        .instrument(span)
+        .await
+        .expect("ran");
+        assert_eq!(seen, (Some("http_request"), "sv".to_owned()));
+    }
 }

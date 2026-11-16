@@ -793,6 +793,16 @@ pub(crate) fn pattern_complaint(
         })
 }
 
+/// The complaint about a `[FromRoute, Required][RegularExpression(
+/// ContainerValidationRegexStr)] string container` (`stream.{container}`,
+/// `{segmentId}.{container}`): a blank one is [`blank_complaint`]'s alone, as
+/// the binder reads it as `null` and the pattern passes a `null`, and one
+/// outside the pattern is [`pattern_complaint`]'s; `None` when it binds.
+pub(crate) fn route_container_complaint(container: &str) -> Option<(String, String)> {
+    blank_complaint("container", container)
+        .or_else(|| pattern_complaint("container", Some(container), StreamPattern::Container))
+}
+
 /// A route or query `Guid`, bound the way ASP.NET binds one. Extract it as
 /// `Path(DotnetGuid(id)): Path<DotnetGuid>`, or by position in a tuple.
 ///
