@@ -395,7 +395,6 @@ mod tests {
             output_audio_bitrate: None,
             output_audio_channels: None,
             output_container: None,
-            output_video_sync: None,
             output_file_path: String::new(),
             input_container: None,
             is_input_video: true,

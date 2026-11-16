@@ -194,7 +194,6 @@ fn state(output_path: &Path, session: &str, streams: Streams) -> EncodingJobInfo
         output_audio_bitrate: None,
         output_audio_channels: None,
         output_container: None,
-        output_video_sync: None,
         output_file_path: output_path.to_string_lossy().into_owned(),
         input_container: None,
         is_input_video: streams.video.is_some(),

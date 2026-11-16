@@ -1028,7 +1028,6 @@ impl StreamStatePlanner for FerrofinStreamStatePlanner {
             output_audio_bitrate: None,
             output_audio_channels: None,
             output_container: Some(state_output_container),
-            output_video_sync: None,
             output_file_path: String::new(),
             input_container: media_source.container.clone(),
             is_input_video,
