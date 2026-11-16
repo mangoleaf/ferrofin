@@ -8152,7 +8152,8 @@ impl LibraryScanner {
                     && crate::refresh_plan::full_refresh(&plan, &request) =>
             {
                 let mut base = row.clone();
-                self.update_season_premiere_date(&mut base).await?;
+                self.update_season_premiere_date(&mut base, state.art_cache)
+                    .await?;
                 Some(base)
             }
             _ => None,
@@ -8735,7 +8736,10 @@ impl LibraryScanner {
         // outside a full refresh (`judge_local_images` above).
         if local_images_changed && let Some(stored) = stored_row {
             let mut derived = stored.clone();
-            if self.update_season_premiere_date(&mut derived).await? {
+            if self
+                .update_season_premiere_date(&mut derived, state.art_cache)
+                .await?
+            {
                 let (date_supplied, year_supplied) = supplied_dates;
                 if !date_supplied {
                     entity.premiere_date = derived.premiere_date;
@@ -11937,7 +11941,9 @@ impl LibraryScanner {
     /// puts right. It also costs any metadata locale the row or its parents
     /// override, which no later scan puts right: the children refreshed this
     /// pass are fetched, and stamped, in the collection folder's, the
-    /// library's or the server's, as for a parent that is not there.
+    /// library's or the server's, as for a parent that is not there. And it
+    /// costs a season the premiere date and year its refresh would take from
+    /// its episodes, until the next refresh that takes them.
     async fn parent_row(&self, id: &str, cache: &mut ArtworkCache) -> Option<BaseItemEntity> {
         let items = self.item_repository.as_ref()?;
         let parsed = parse_id(id)?;
@@ -12042,13 +12048,17 @@ impl LibraryScanner {
     /// `GetChildrenForMetadataUpdates => item.GetEpisodes()` (`:89-90`): the
     /// season's episodes as stored, missing ones included, and with "Display
     /// specials within seasons" on, the specials that air within it
-    /// ([`season_episode_rows`](crate::library_manager::season_episode_rows)).
+    /// ([`series_season_episode_rows`](crate::library_manager::series_season_episode_rows)).
     /// The walk refreshes a season before its episodes, as upstream's
     /// `Series.RefreshAllMetadataInternal` does, so they are the values the
-    /// episodes held before this pass. Returns whether `row` changed.
+    /// episodes held before this pass. The series is read as the season's
+    /// other reads of it are ([`parent_row`](Self::parent_row)): one that
+    /// fails to read counts as none, whose `GetEpisodes` is empty, so the
+    /// season keeps its date. Returns whether `row` changed.
     async fn update_season_premiere_date(
         &self,
         row: &mut BaseItemEntity,
+        cache: &mut ArtworkCache,
     ) -> Result<bool, ServiceError> {
         let (Some(items), Some(id)) = (&self.item_repository, parse_id(&row.id)) else {
             return Ok(false);
@@ -12057,10 +12067,15 @@ impl LibraryScanner {
             .display_specials_within_seasons
             .as_ref()
             .is_none_or(|read| read());
-        let episodes = crate::library_manager::season_episode_rows(
+        let series = match crate::library_manager::season_series_column(row) {
+            Some(series_id) => self.parent_row(series_id, cache).await,
+            None => None,
+        };
+        let episodes = crate::library_manager::series_season_episode_rows(
             items.as_ref(),
             id,
             row.clone(),
+            series,
             &InternalItemsQuery::default(),
             include_specials,
         )
