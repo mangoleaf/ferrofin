@@ -1622,6 +1622,9 @@ fn add_external_lyrics(
 /// A write that fails everywhere is an error, as `TrySaveToFiles` throws:
 /// the caller then drops the probe result, as upstream loses the whole
 /// `FetchAsync`.
+///
+/// Reading the tags, writing the file and looking it up again each run
+/// through [`off_runtime`]: the scan task calls this inline.
 fn extract_embedded_lyrics(
     seam: &ExternalProbeSeam,
     id: Uuid,
@@ -1641,7 +1644,8 @@ fn extract_embedded_lyrics(
     }
     // ATL reads the file's own tags; ffprobe's are the fallback for a file
     // `lofty` cannot read.
-    let lyrics = match crate::embedded_lyrics::from_file(std::path::Path::new(path)) {
+    let read = off_runtime(|| crate::embedded_lyrics::from_file(std::path::Path::new(path)));
+    let lyrics = match read {
         Ok(lyrics) => lyrics,
         Err(e) => {
             tracing::debug!(path, error = %e, "lyric tags unreadable; using the probe's tags");
@@ -1661,7 +1665,8 @@ fn extract_embedded_lyrics(
         internal.as_deref().map(std::path::Path::new),
         "lrc",
     );
-    let Some(saved) = crate::lyric_manager::try_save_to_files(&targets, &lyrics, self_writes)?
+    let Some(saved) =
+        off_runtime(|| crate::lyric_manager::try_save_to_files(&targets, &lyrics, self_writes))?
     else {
         return Ok(());
     };
@@ -1672,8 +1677,10 @@ fn extract_embedded_lyrics(
         dirs.invalidate(&saved.to_string_lossy());
     }
     if try_extract {
-        let target = seam.resolvers.target_for(path, internal);
-        add_external_lyrics(&seam.resolvers, &target, probed);
+        off_runtime(|| {
+            let target = seam.resolvers.target_for(path, internal);
+            add_external_lyrics(&seam.resolvers, &target, probed);
+        });
     }
     Ok(())
 }

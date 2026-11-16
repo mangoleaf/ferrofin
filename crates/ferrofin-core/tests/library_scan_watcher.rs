@@ -45,6 +45,7 @@ use ferrofin_model::dto::MediaSourceInfo;
 use ferrofin_model::entities::{CollectionTypeOptions, MediaStreamType, Video3DFormat};
 use ferrofin_model::entities_media::MediaStream;
 use ferrofin_model::io::FileSystemEntryInfo;
+use ferrofin_model::media_info::MediaInfo;
 use ferrofin_providers::TmdbClient;
 use ferrofin_traits::error::ServiceError;
 use ferrofin_traits::filesystem::{FileMetadata, FileSystem};
@@ -53,7 +54,7 @@ use ferrofin_traits::media_encoding::{MediaEncoder, MediaInfoRequest};
 use ferrofin_traits::persistence::{ItemPersistenceService, ItemRepository, MediaStreamRepository};
 
 /// An ffprobe stand-in: every file has a video and an audio stream, a
-/// `.srt` one subtitle stream.
+/// `.srt` one subtitle stream, and an audio track's tags carry lyrics.
 #[derive(Default)]
 struct Probe;
 
@@ -105,6 +106,18 @@ impl MediaEncoder for Probe {
                 },
             ],
             ..MediaSourceInfo::default()
+        })
+    }
+    async fn get_media_info_full(
+        &self,
+        request: &MediaInfoRequest,
+    ) -> Result<MediaInfo, ServiceError> {
+        Ok(MediaInfo {
+            media_source: self.get_media_info(request).await?,
+            raw_audio_tags: request
+                .media_is_audio
+                .then(|| HashMap::from([("lyrics".to_owned(), "Words".to_owned())])),
+            ..MediaInfo::default()
         })
     }
     async fn extract_audio_image(
@@ -1305,32 +1318,40 @@ async fn a_removed_files_prune_leaves_the_runtime_worker_free() {
 
 /// A probed item's sidecar search goes through `off_runtime` too: a track's
 /// own stat (is it a folder?), and the stats of the folders a video's
-/// subtitles and audio or a track's lyrics are looked for in. On a runtime
-/// with one worker, a task still runs while each of them is answered, and the
-/// sidecar is still the item's stream. The folders' listings come from the
-/// scan's cache here. A stat made at dispatch follows the plan's own hand-off
-/// in the same poll, where it cannot starve the worker, so the unit test
+/// subtitles and audio, a track's lyrics, or the lyrics a track's tags carry
+/// once saved are looked for in. On a runtime with one worker, a task still
+/// runs while each of them is answered, and the sidecar is still the item's
+/// stream. The folders' listings come from the scan's cache here. A stat
+/// made at dispatch follows the plan's own hand-off in the same poll, where
+/// it cannot starve the worker, so the unit test
 /// `dispatching_a_probe_leaves_its_sidecar_search_to_the_task` pins that
-/// dispatch makes none.
+/// dispatch makes none. Reading the tags and writing the `.lrc` go through
+/// `std::fs`, which this filesystem cannot stall.
 #[rstest::rstest]
 #[case::subtitle(
     CollectionTypeOptions::movies,
     BaseItemKind::Movie,
     "Heat (1995).mkv",
-    "Heat (1995).eng.srt"
+    Some("Heat (1995).eng.srt")
 )]
 #[case::lyric(
     CollectionTypeOptions::music,
     BaseItemKind::Audio,
     "Artist/Album/01 - Song.flac",
-    "Artist/Album/01 - Song.lrc"
+    Some("Artist/Album/01 - Song.lrc")
+)]
+#[case::embedded_lyric(
+    CollectionTypeOptions::music,
+    BaseItemKind::Audio,
+    "Artist/Album/01 - Song.flac",
+    None
 )]
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn a_probes_sidecar_search_leaves_the_runtime_worker_free(
     #[case] kind: CollectionTypeOptions,
     #[case] item: BaseItemKind,
     #[case] file: &str,
-    #[case] sidecar: &str,
+    #[case] sidecar: Option<&str>,
 ) {
     let tmp = tempfile::tempdir().expect("tmp");
     let media = tmp.path().join("media");
@@ -1346,8 +1367,15 @@ async fn a_probes_sidecar_search_leaves_the_runtime_worker_free(
         .join("metadata")
         .join(&dashless[..2])
         .join(&dashless);
-    let sidecar = media.join(sidecar);
-    std::fs::write(&sidecar, b"1\n").expect("sidecar");
+    // The sidecar beside the file, or the one the scan saves the tags' lyrics to.
+    let sidecar = match sidecar {
+        Some(name) => {
+            let sidecar = media.join(name);
+            std::fs::write(&sidecar, b"1\n").expect("sidecar");
+            sidecar
+        }
+        None => internal.join(file.with_extension("lrc").file_name().expect("name")),
+    };
     let fx = Fixture::new(tmp.path(), &media, kind).await;
 
     let (ran, stalled_for) = std::sync::mpsc::channel();
