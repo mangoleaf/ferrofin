@@ -280,7 +280,7 @@ pub trait PluginManager: Send + Sync {
         let Some(name) = name else { return Ok(None) };
         Ok(catalog
             .into_iter()
-            .find(|p| p.name.to_lowercase() == name.to_lowercase()))
+            .find(|p| ferrofin_util::string_extensions::equals_ordinal_ignore_case(&p.name, name)))
     }
 
     /// The installed plugins for which a newer, installable version exists in

@@ -4228,8 +4228,10 @@ pub const VERIFIED: &[Verified] = &[
                FillImages(BaseItemDto, …) by the timer's name and the programme's \
                ExternalSeriesId over first_with_image, item_images and image_tag; \
                guide_repository.rs channel_row and manager.rs channel_image_tags for ChannelName and \
-               ChannelPrimaryImageTag, none without the channel; RunTimeTicks from the window)",
-        date: "2026-11-14",
+               ChannelPrimaryImageTag, none without the channel; RunTimeTicks from the window; \
+               ProgramId as GetInternalProgramId(info.ProgramId) through derive_program_id over \
+               the stored listing id, as stored without one)",
+        date: "2026-11-15",
         divergences: &[
             "ProgramInfo is the programme DTO GET /LiveTv/Programs projects from the guide's \
          own table, so it lacks what that table has no column for (CommunityRating, \
@@ -4288,8 +4290,10 @@ pub const VERIFIED: &[Verified] = &[
                FillImages(BaseItemDto, …) by the timer's name and the programme's \
                ExternalSeriesId over first_with_image, item_images and image_tag; \
                guide_repository.rs channel_row and manager.rs channel_image_tags for ChannelName and \
-               ChannelPrimaryImageTag, none without the channel; RunTimeTicks from the window)",
-        date: "2026-11-14",
+               ChannelPrimaryImageTag, none without the channel; RunTimeTicks from the window; \
+               ProgramId as GetInternalProgramId(info.ProgramId) through derive_program_id over \
+               the stored listing id, as stored without one)",
+        date: "2026-11-15",
         divergences: &[
             "A channelId or seriesTimerId that is no GUID matches no timer; upstream's new Guid \
          throws a FormatException, a 500. Jellyfin bug not ported.",
@@ -4354,11 +4358,12 @@ pub const VERIFIED: &[Verified] = &[
                ferrofin-util numeric_collation.rs invariant_numeric_cmp, SortExtensions' \
                invariant-culture NumericOrdering comparer, a null name first; \
                build_series_timer_dto for each: the channel's current name from \
-               guide_repository.rs channel_row, none without a channel, and \
-               GetSeriesTimerInfoDto's FillImages(dto, info.Name, info.SeriesId) through \
-               fill_images with the stored SeriesId: first_with_image, item_images and \
-               image_tag)",
-        date: "2026-11-14",
+               guide_repository.rs channel_row, none without a channel, ProgramId as \
+               GetInternalProgramId(info.ProgramId) through derive_program_id over the \
+               stored listing id (as stored without one), and GetSeriesTimerInfoDto's \
+               FillImages(dto, info.Name, info.SeriesId) through fill_images with the stored \
+               SeriesId: first_with_image, item_images and image_tag)",
+        date: "2026-11-15",
         divergences: &[
             "A series timer whose name is blank runs no lookup by name: it takes no Thumb or \
          Backdrop from a library series, and its Primary only from an airing of its listings \
@@ -4376,8 +4381,9 @@ pub const VERIFIED: &[Verified] = &[
                is a 400; LiveTvManager.GetSeriesTimer: GetSeriesTimers with a default query, \
                then the first whose Id equals timerId ignoring case; none is a 404) → \
                ferrofin-livetv manager.rs get_series_timers (as GET /LiveTv/SeriesTimers: \
-               series_timer_rows, build_series_timer_dto and fill_images)",
-        date: "2026-11-14",
+               series_timer_rows, build_series_timer_dto with ProgramId derived from the \
+               stored listing id (as stored without one), and fill_images)",
+        date: "2026-11-15",
         divergences: &[
             "A series timer whose name is blank runs no lookup by name: it takes no Thumb or \
          Backdrop from a library series, and its Primary only from an airing of its listings \
