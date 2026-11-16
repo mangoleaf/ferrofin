@@ -565,9 +565,10 @@ impl ThrottleController {
     /// Every due timer reads it, so a failure is logged at `warn` the first time
     /// it is seen and at `debug` while it repeats (LOGGING.md §1), as
     /// [`EncodingOptionsReader`](crate::configuration::reader::EncodingOptionsReader)
-    /// does for the settings read. A successful read re-arms the warning.
-    fn output_length(&mut self, path: &str) -> Option<i64> {
-        match std::fs::metadata(path) {
+    /// does for the settings read. A successful read re-arms the warning. The
+    /// read runs on the blocking pool, never inline on a runtime worker.
+    async fn output_length(&mut self, path: &str) -> Option<i64> {
+        match tokio::fs::metadata(path).await {
             Ok(metadata) => {
                 self.size_failure = None;
                 Some(i64::try_from(metadata.len()).unwrap_or(i64::MAX))
@@ -1056,7 +1057,7 @@ impl<S: SessionReporter, C: FileCleaner> TranscodeManagerImpl<S, C> {
                     && progress.bytes_downloaded > 0
                     && progress.encoded.position_ticks.unwrap_or(0) > 0
                 {
-                    controller.output_length(&handle.path)
+                    controller.output_length(&handle.path).await
                 } else {
                     None
                 };
@@ -4833,6 +4834,31 @@ pub(super) mod throttle_tests {
             .filter(|line| line.contains("cannot read the encoding configuration"))
             .count();
         assert_eq!(repeats, 2);
+    }
+
+    /// The throttle sizes a progressive output on the blocking pool, never
+    /// inline on the runtime worker running the tick (found with gl-1804).
+    #[test]
+    fn the_output_size_is_read_on_the_blocking_pool() {
+        use crate::transcoding::fs_wait::{needs_the_blocking_pool, one_blocking_thread};
+        one_blocking_thread().block_on(async {
+            let tmp = tempfile::tempdir().unwrap();
+            let output = tmp.path().join("out.mkv");
+            std::fs::write(&output, vec![0; 1000]).unwrap();
+            let mut controller = ThrottleController {
+                keys: None,
+                timed: false,
+                next_tick: Instant::now(),
+                paused: false,
+                stopped: false,
+                last_progress: None,
+                size_failure: None,
+                panicked: false,
+            };
+            let size =
+                needs_the_blocking_pool(controller.output_length(output.to_str().unwrap())).await;
+            assert_eq!(size, Some(1000));
+        });
     }
 
     /// A progressive output the throttle cannot size is reported once at
