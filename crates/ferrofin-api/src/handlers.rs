@@ -5427,12 +5427,13 @@ pub const VERIFIED: &[Verified] = &[
         upstream_method: "RestartApplication",
         ferrofin: "handlers/system.rs restart_application (auth.rs RequireAdmin) → ferrofin-core \
                system_manager.rs restart → apps/ferrofin-server state.rs \
-               FerrofinLifecycleController stop (SystemManager.ShutdownInternal), lib.rs \
+               FerrofinLifecycleController stop (SystemManager.ShutdownInternal: the restart \
+               decision, ShouldRestart, with HasPendingRestart left alone), lib.rs \
                announce_shutdown (SessionManager.OnApplicationStopping), tear_down_host \
                (HlsStreamManager::shutdown, AttachmentExtractor::shutdown, \
                LiveTvManager::shutdown: Program.cs disposes the host, RecordingsManager.Dispose, \
                AttachmentExtractor.Dispose, MediaSourceManager.Dispose)",
-        date: "2026-11-11",
+        date: "2026-11-15",
         divergences: &[
             "The host teardown goes further than upstream's disposal (gl-141). It does five things. \
          It kills every transcode: upstream's TranscodeManager.Dispose kills no job, and each \
@@ -5485,7 +5486,10 @@ pub const VERIFIED: &[Verified] = &[
                ferrofin when there is none), the \
                emulated version, PRODUCT_NAME (Name), the system id (DeviceId), the \
                startup-wizard flag, the lifecycle's restart-pending and shutting-down flags \
-               (which operations raise the first is theirs to record), the bound HTTP \
+               (HasPendingRestart, NotifyPendingRestart's flag, raised by a change that \
+               takes a restart, among them backup.rs schedule_restore before it restarts, and \
+               by no stop; IsShuttingDown, ApplicationStopping, set by a stop or by a SIGTERM \
+               or SIGINT in lib.rs announce_shutdown), the bound HTTP \
                port (HttpPort), CompletedInstallations from plugin_manager.rs \
                completed_installations (InstallationManager.CompletedInstallations: the \
                InstallationInfo GetCompatibleVersions built for each package install_package \
@@ -5535,11 +5539,6 @@ pub const VERIFIED: &[Verified] = &[
          upstream's ListenWithHttps, over a certificate it loaded at startup with HTTPS off, \
          advertises https on a port that listens only after the restart. Jellyfin bug not \
          ported.",
-            "A request served during a drain, before the listeners stop, sees lifecycle flags \
-         upstream's would not: POST /System/Restart and /System/Shutdown set HasPendingRestart \
-         to the stop's restart value where upstream leaves it alone, and a SIGTERM or SIGINT \
-         leaves IsShuttingDown false where upstream's ApplicationStopping is cancelled. Fix \
-         path: gl-1792.",
             "A transcode path that cannot be prepared answers 500 whatever the cause; upstream's \
          status follows the exception its ExceptionMiddleware maps (an ArgumentException 400, \
          a DirectoryNotFoundException 404), describing a server misconfiguration as the \

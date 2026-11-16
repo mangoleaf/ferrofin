@@ -2101,7 +2101,11 @@ impl FerrofinServerSettings {
 impl ServerSettingsManager for FerrofinServerSettings {
     async fn snapshot(&self) -> Result<ServerSettingsDto, ServiceError> {
         self.ensure_enabled().await?;
-        let restart_pending = self.lifecycle.has_pending_restart();
+        // A server that is shutting down reports the restart still to come: the
+        // page's restart wait reads this to know the restart is over, and a
+        // restart request no longer raises the pending flag (gl-1792).
+        let restart_pending =
+            self.lifecycle.has_pending_restart() || self.lifecycle.is_shutting_down();
         let configuration = self.configuration.configuration().await?;
         let running = self.config.clone();
         let network = self.network.clone();

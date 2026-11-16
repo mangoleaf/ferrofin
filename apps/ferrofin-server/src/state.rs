@@ -245,16 +245,20 @@ pub struct WiredApp {
 /// The concrete [`LifecycleController`] for the running server.
 ///
 /// Port of the slice of `IHostApplicationLifetime` the system manager drives:
-/// `stop(restart)` records whether a restart was requested and signals the axum
-/// graceful-shutdown handle; the `has_pending_restart` / `is_shutting_down`
-/// flags mirror `IServerApplicationHost.HasPendingRestart` / the host's
-/// shutdown state. Only a test `Fake` existed before this unit.
+/// `stop(restart)` records whether a restart was requested (`ShouldRestart`)
+/// and signals the axum graceful-shutdown handle; the `has_pending_restart` /
+/// `is_shutting_down` flags mirror `IServerApplicationHost.HasPendingRestart` /
+/// `ApplicationStopping.IsCancellationRequested`. Only a test `Fake` existed
+/// before this unit.
 pub struct FerrofinLifecycleController {
     /// Fires the axum `with_graceful_shutdown` future; taken on the first stop.
     shutdown: tokio::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
-    /// Set once a stop has been requested (the server is winding down).
+    /// Set once a stop or a signal began the drain (the server is winding down).
     shutting_down: std::sync::atomic::AtomicBool,
-    /// Set when the requested stop should be followed by a restart.
+    /// Set when a change takes a restart to apply (`NotifyPendingRestart`): a
+    /// plugin install or uninstall, a settings or networking save that needs
+    /// one, a scheduled backup restore. A stop leaves it alone, as
+    /// `ShutdownInternal` does.
     restart_pending: std::sync::atomic::AtomicBool,
     /// Set only by `stop(true)`: the drain in progress is an API restart, as
     /// opposed to a shutdown or a signal (which exit the process even when a
@@ -281,13 +285,20 @@ impl FerrofinLifecycleController {
         self.restart_requested
             .load(std::sync::atomic::Ordering::SeqCst)
     }
+
+    /// Marks the drain begun, whatever started it: `ApplicationStopping` is
+    /// cancelled by a SIGTERM or SIGINT as by `StopApplication` (a stop has
+    /// already set it).
+    pub fn mark_shutting_down(&self) {
+        self.shutting_down
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
 }
 
 #[async_trait::async_trait]
 impl LifecycleController for FerrofinLifecycleController {
     async fn stop(&self, restart: bool) -> Result<(), ferrofin_traits::error::ServiceError> {
         use std::sync::atomic::Ordering;
-        self.restart_pending.store(restart, Ordering::SeqCst);
         self.restart_requested.store(restart, Ordering::SeqCst);
         self.shutting_down.store(true, Ordering::SeqCst);
         // Fire the graceful-shutdown trigger once; a second stop is a no-op.
@@ -3281,6 +3292,7 @@ pub async fn build_app_state(
             backup_paths,
             Arc::clone(&state.library),
             Arc::clone(&state.system),
+            Arc::clone(&lifecycle),
             ferrofin_health::RELEASE_VERSION,
         ));
     let state = state
@@ -4085,8 +4097,10 @@ mod tests {
         wired.app_host.mark_core_startup_complete();
     }
 
+    /// A stop signals the drain and records the restart decision, and leaves
+    /// `HasPendingRestart` alone, as `ShutdownInternal` does (gl-1792).
     #[tokio::test]
-    async fn lifecycle_controller_signals_shutdown_and_flags_restart() {
+    async fn lifecycle_controller_signals_shutdown_and_leaves_the_pending_restart() {
         let (tx, rx) = tokio::sync::oneshot::channel();
         let lifecycle = FerrofinLifecycleController::new(tx);
         assert!(!lifecycle.is_shutting_down());
@@ -4094,12 +4108,31 @@ mod tests {
 
         lifecycle.stop(true).await.unwrap();
         assert!(lifecycle.is_shutting_down());
-        assert!(lifecycle.has_pending_restart());
+        assert!(lifecycle.restart_requested());
+        assert!(
+            !lifecycle.has_pending_restart(),
+            "a restart request is not pending"
+        );
         // The graceful-shutdown trigger fired.
         assert!(rx.await.is_ok());
 
-        // A second stop is a no-op (trigger already taken) and stays consistent.
+        // A shutdown does not clear a restart a change flagged; a second stop
+        // is a no-op for the trigger (already taken).
+        lifecycle.mark_restart_required();
         lifecycle.stop(false).await.unwrap();
+        assert!(!lifecycle.restart_requested());
+        assert!(lifecycle.has_pending_restart());
+    }
+
+    /// A SIGTERM or SIGINT marks the server as shutting down without asking for
+    /// a restart (`ApplicationStopping`, gl-1792).
+    #[test]
+    fn a_signal_marks_the_lifecycle_shutting_down() {
+        let (tx, _rx) = tokio::sync::oneshot::channel();
+        let lifecycle = FerrofinLifecycleController::new(tx);
+        lifecycle.mark_shutting_down();
+        assert!(lifecycle.is_shutting_down());
+        assert!(!lifecycle.restart_requested());
         assert!(!lifecycle.has_pending_restart());
     }
 }

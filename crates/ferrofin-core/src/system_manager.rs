@@ -28,8 +28,8 @@
 //!   scope). Defaults probe the real filesystem and report no libraries.
 //!
 //! Restart/shutdown are best-effort fire-and-forget in C# (`Task.Run` after a
-//! 100 ms delay); here they set the restart flag and call `stop`, returning once
-//! the request is issued.
+//! 100 ms delay); here they call `stop` with the restart decision
+//! (`ShouldRestart`), returning once the request is issued.
 
 use std::sync::Arc;
 
@@ -67,11 +67,15 @@ pub struct SystemHostFacts {
 /// Drives application restart/shutdown.
 ///
 /// Port of the slice of `IHostApplicationLifetime`/`IServerApplicationHost` the
-/// system manager uses. `restart` sets the restart flag then stops; `shutdown`
-/// just stops.
+/// system manager uses. `restart` calls `stop(true)`, which records the restart
+/// decision (`ShouldRestart`); `shutdown` calls `stop(false)`. Neither raises
+/// `HasPendingRestart`.
 #[async_trait]
 pub trait LifecycleController: Send + Sync {
-    /// Requests application stop, restarting afterwards when `restart` is set.
+    /// Requests application stop, restarting afterwards when `restart` is set,
+    /// and marks the application shutting down. Leaves
+    /// [`has_pending_restart`](Self::has_pending_restart) as it was
+    /// (`ShutdownInternal` sets only `ShouldRestart`).
     async fn stop(&self, restart: bool) -> Result<(), ServiceError>;
 
     /// Whether a restart is currently pending (`HasPendingRestart`).
