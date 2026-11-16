@@ -18,7 +18,8 @@ use crate::extract::{DotnetGuid, Query};
 use crate::handlers::items::{require_visible_item, resolve_user_opt};
 use crate::handlers::query_parse::parse_csv_uuids;
 use crate::handlers::streaming::{
-    require_streamable_item, serve_static_file, static_or_transcode, stream_route_container,
+    physical_file_path, require_streamable_item, serve_physical_file, static_or_transcode,
+    stream_route_container,
 };
 use crate::state::AppState;
 
@@ -240,11 +241,12 @@ async fn delete_alternate_sources(
 /// `GET /Items/{itemId}/Download` — download the item's media file.
 ///
 /// Port of `LibraryController.GetDownload`: resolves the item and streams its
-/// on-disk file as an attachment after enforcing the download permission (an
-/// item with no path is a `400`). The file is served through the shared
-/// streaming helper (Range / `HEAD` / `404`), with a `Content-Disposition:
-/// attachment` header carrying the file name on a 200, 206 or 416 (matching
-/// the C# `FileResult` download semantics).
+/// on-disk file (a link's final target) as an attachment after enforcing the
+/// download permission (an item with no path is a `400`). The file is served
+/// through the shared streaming helper (Range / `HEAD` / `404`), typed by
+/// `MimeTypes.GetMimeType`, with a `Content-Disposition: attachment` header
+/// carrying the item's file name on a 200, 206 or 416 (matching the C#
+/// `FileResult` download semantics).
 #[utoipa::path(
     get,
     path = "/Items/{itemId}/Download",
@@ -287,7 +289,8 @@ async fn get_download(
         .file_name()
         .and_then(|n| n.to_str())
         .unwrap_or("download");
-    let mut response = serve_static_file(&path, request).await?;
+    let mut response =
+        serve_physical_file(&physical_file_path(path.clone()).await?, request).await?;
     // SetHeadersAndLog names the file only past its 304/412 short cut, and a
     // missing file is PhysicalFile's FileNotFoundException before it.
     if matches!(

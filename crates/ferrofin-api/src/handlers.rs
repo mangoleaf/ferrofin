@@ -932,7 +932,8 @@ pub const VERIFIED_SUBSYSTEMS_AGAINST_EARLIER_PIN: &[(&str, &str)] = &[];
 /// and operation rows name it in [`Verified::refs`]. `static-file-ranges` is
 /// how a file served with range processing on answers `Range` and `If-Range`,
 /// shared by direct play, the download and file routes, the HLS segments and
-/// a graphical subtitle's file, whose operations have no row of their own yet.
+/// a graphical subtitle's file, most of whose operations have no row of their
+/// own yet.
 /// `websocket-streams` is
 /// the `/socket` dashboard streams, which no contract operation describes;
 /// `trickplay-extraction` is the ffmpeg run that writes a video's trickplay
@@ -1084,8 +1085,9 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
                    same with no body. The other validators and preconditions (the ETag itself, \
                    If-Match, If-None-Match, If-Modified-Since, If-Unmodified-Since), the date \
                    forms .NET's TryStringToDate reads beyond httpdate's IMF-fixdate, RFC 850 \
-                   and asctime (If-Range's included) and each answer's Content-Type are \
-                   gl-1823's and gl-1801's; they are not part of this row.",
+                   and asctime (If-Range's included) and a 416's Content-Type are gl-1823's, \
+                   and each answer's Content-Type is its route's; they are not part of this \
+                   row.",
         date: "2026-11-14",
         divergences: &[
             "A Range in a unit other than bytes is ignored and the whole file served, as RFC \
@@ -2697,6 +2699,14 @@ macro_rules! legacy_hls_tail {
          it (Response.OnCompleted's OnTranscodeEndRequest)"
     };
 }
+
+/// What the `static-file-ranges` row leaves to gl-1823, for the item file rows
+/// served by `serve_physical_file`.
+const STATIC_FILE_CONDITIONAL_DIVERGENCE: &str = "Conditional requests are answered as \
+     tower-http's ServeFile answers them: an ETag on every answer, If-Match and If-None-Match \
+     honoured, an If-Modified-Since or If-Unmodified-Since after now counted, and a 416 with no \
+     Content-Type; upstream's PhysicalFile sends no ETag, evaluates neither tag header nor a \
+     future date, and types its 416. Fix path: gl-1823.";
 
 /// How the four legacy `HlsSegmentController` rows' error bodies differ.
 const LEGACY_HLS_BODIES: &str = "The 404 bodies are Ferrofin's error shape, where upstream \
@@ -5836,6 +5846,93 @@ pub const VERIFIED: &[Verified] = &[
          gl-666.",
         ],
         refs: &["access-filtering"],
+    },
+    Verified {
+        method: "get",
+        path: "/Providers/Subtitles/Subtitles/{subtitleId}",
+        upstream_file: "Jellyfin.Api/Controllers/SubtitleController.cs",
+        upstream_method: "GetRemoteSubtitles",
+        ferrofin: "handlers/subtitles.rs get_remote_subtitles (RequireSubtitleManagement, the \
+               SubtitleManagement policy's UserPermissionRequirement; RequiredRouteString \
+               subtitleId: ConvertEmptyStringToNull, then [Required]) → ferrofin-core \
+               subtitle_manager.rs get_remote_subtitles and route (SubtitleManager.\
+               GetRemoteSubtitles and GetProvider: Split('_', 2), the first provider whose MD5 \
+               name id equals the prefix, ordinally, handed the rest of the id, or the whole id \
+               when it holds no _) → ferrofin-providers opensubtitles.rs get_subtitles (the \
+               OpenSubtitles plugin's GetSubtitles: a plugin outside the Jellyfin tree, not \
+               compared yet, gl-1644) → subtitle_mime (File(result.Stream, \
+               MimeTypes.GetMimeType(\"file.\" + result.Format)): ferrofin-model \
+               mime_types::get_mime_type, application/octet-stream for a format the table \
+               does not name; the body whole, no Range, no Content-Disposition)",
+        date: "2026-11-16",
+        divergences: &[
+            "An id naming no provider is a 400; upstream's GetProvider (First) throws \
+         InvalidOperationException, a 500. Jellyfin bug not ported.",
+            "The 400, 401 (no or bad token) and 403 (no subtitle management) bodies are \
+         Ferrofin's error shape, not upstream's. Fix path: gl-666.",
+        ],
+        refs: &[],
+    },
+    Verified {
+        method: "get",
+        path: "/Items/{itemId}/File",
+        upstream_file: "Jellyfin.Api/Controllers/LibraryController.cs",
+        upstream_method: "GetFile",
+        ferrofin: "handlers/library.rs get_file (RequireAuth, the default policy; \
+               get_item_by_id_for_user, GetItemById<BaseItem>(itemId, User.GetUserId()): a \
+               missing item or one the user cannot see is a 404, an API key sees any item; an \
+               item with no path is a 400, MimeTypes.GetMimeType's ArgumentException) → \
+               handlers/streaming.rs physical_file_path (IsFileProtocol, then \
+               FileSystemHelper.ResolveLinkTarget(filePath, returnFinalTarget: true): a link \
+               whose final target exists is served as that target, any other path as given; \
+               a directory or a link to one is PhysicalFile's \
+               FileNotFoundException, a 404) → serve_physical_file (PhysicalFile(filePath, \
+               MimeTypes.GetMimeType(filePath), true): serve_static_file, a missing file a 404, \
+               typed by ferrofin-model mime_types::get_mime_type)",
+        date: "2026-11-16",
+        divergences: &[
+            "A nil itemId is a 404, not GetItemById's 400. Fix path: gl-1695.",
+            STATIC_FILE_CONDITIONAL_DIVERGENCE,
+            "The 400 (no path), 401 (no or bad token), 403 (remote access or the access \
+         schedule refused) and 404 bodies are Ferrofin's error shape, not upstream's. Fix \
+         path: gl-666.",
+        ],
+        refs: &["access-filtering", "static-file-ranges"],
+    },
+    Verified {
+        method: "get",
+        path: "/Items/{itemId}/Download",
+        upstream_file: "Jellyfin.Api/Controllers/LibraryController.cs",
+        upstream_method: "GetDownload",
+        ferrofin: "handlers/videos.rs get_download (RequireDownload, the Download policy's \
+               UserPermissionRequirement: an API key passes; get_item_by_id_for_user, \
+               GetItemById<BaseItem>(itemId, user): a missing item or one the user cannot see \
+               is a 404; CanDownload(user) for a user, CanDownload() for an API key: \
+               EnableContentDownloading, then ferrofin-core dto_service.rs can_download_file, \
+               a 400 when either fails; an item with no path is a 400, \
+               MimeTypes.GetMimeType's ArgumentException; attachment_disposition over \
+               Path.GetFileName(item.Path) with every \" removed, SetHttpFileName's two forms \
+               (filename= sanitized per UTF-16 code unit, filename* RFC 5987 encoded), \
+               on a 200, 206 or 416 only, as SetHeadersAndLog sets it past its 304/412 short \
+               cut and a missing file's 404 never reaches it) → handlers/streaming.rs \
+               physical_file_path (IsFileProtocol, then \
+               FileSystemHelper.ResolveLinkTarget(filePath, returnFinalTarget: true): a link \
+               whose final target exists is served as that target, any other path as given; \
+               a directory or a link to one is PhysicalFile's \
+               FileNotFoundException, a 404) → serve_physical_file (PhysicalFile(filePath, \
+               MimeTypes.GetMimeType(filePath), filename, true): serve_static_file, a missing \
+               file a 404, typed by ferrofin-model mime_types::get_mime_type)",
+        date: "2026-11-16",
+        divergences: &[
+            "LogDownloadAsync is not ported: a user's download writes no \
+         UserDownloadingContent activity entry. Fix path: gl-430.",
+            "A nil itemId is a 404, not GetItemById's 400. Fix path: gl-1695.",
+            STATIC_FILE_CONDITIONAL_DIVERGENCE,
+            "The 400 (an item that cannot be downloaded, or no path), 401 (no or bad token), \
+         403 (no download permission) and 404 bodies are Ferrofin's error shape, not \
+         upstream's. Fix path: gl-666.",
+        ],
+        refs: &["access-filtering", "static-file-ranges"],
     },
     Verified {
         method: "get",

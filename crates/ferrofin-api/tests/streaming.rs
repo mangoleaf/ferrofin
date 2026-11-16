@@ -599,6 +599,82 @@ async fn administrator_download_still_honors_the_item_permission() {
     assert!(!response.headers().contains_key("content-disposition"));
 }
 
+/// `GetDownload` and `GetFile` answer `PhysicalFile(filePath,
+/// MimeTypes.GetMimeType(filePath), …)`, `filePath` a link's final target
+/// (`FileSystemHelper.ResolveLinkTarget`): the ported table's type, not the one
+/// `ServeFile` guesses (`audio/aiff`), on a whole file, a range and a link.
+#[cfg(unix)]
+#[rstest::rstest]
+#[case::download("Download")]
+#[case::file("File")]
+#[tokio::test]
+async fn download_and_file_are_typed_by_the_mime_types_table(#[case] route: &str) {
+    let dir = tempfile::tempdir().unwrap();
+    let tone = dir.path().join("tone.aiff");
+    std::fs::write(&tone, b"FORM-aiff").unwrap();
+    // A chain: linked.mkv -> hop.mkv -> tone.aiff, typed by its final target.
+    let hop = dir.path().join("hop.mkv");
+    std::os::unix::fs::symlink(&tone, &hop).unwrap();
+    let link = dir.path().join("linked.mkv");
+    std::os::unix::fs::symlink(&hop, &link).unwrap();
+    for (path, range) in [(&tone, None), (&tone, Some("bytes=0-3")), (&link, None)] {
+        let mut request = authed("GET", &format!("/Items/{ITEM_ID}/{route}"));
+        if let Some(range) = range {
+            request
+                .headers_mut()
+                .insert("Range", range.parse().unwrap());
+        }
+        let response = create_router(state(path.to_str().unwrap()).app)
+            .oneshot(request)
+            .await
+            .unwrap();
+        assert!(response.status().is_success(), "{path:?} {range:?}");
+        assert_eq!(
+            response.headers()["content-type"],
+            "audio/x-aiff",
+            "{path:?} {range:?}"
+        );
+        // The download keeps the item's own name: Path.GetFileName(item.Path).
+        if route == "Download" && path == &link {
+            let disposition = response.headers()["content-disposition"].to_str().unwrap();
+            assert!(
+                disposition.contains("filename=linked.mkv;"),
+                "{disposition}"
+            );
+        }
+    }
+}
+
+/// A directory, a link to one and a dangling link are `PhysicalFile`'s
+/// `FileNotFoundException`, a 404 (`ServeFile` would open the directory).
+#[cfg(unix)]
+#[rstest::rstest]
+#[case::download("Download")]
+#[case::file("File")]
+#[tokio::test]
+async fn download_and_file_of_a_directory_or_a_dangling_link_are_404(#[case] route: &str) {
+    let dir = tempfile::tempdir().unwrap();
+    let folder = dir.path().join("Rip (2020)");
+    std::fs::create_dir(&folder).unwrap();
+    let folder_link = dir.path().join("rip-link");
+    std::os::unix::fs::symlink(&folder, &folder_link).unwrap();
+    let dangling = dir.path().join("gone.mkv");
+    std::os::unix::fs::symlink(dir.path().join("missing.mkv"), &dangling).unwrap();
+    for path in [&folder, &folder_link, &dangling] {
+        let response = create_router(state(path.to_str().unwrap()).app)
+            .oneshot(authed("GET", &format!("/Items/{ITEM_ID}/{route}")))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND, "{path:?}");
+        assert!(!response.headers().contains_key("content-disposition"));
+        // The body never carries the on-disk path.
+        let body = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap();
+        assert!(!String::from_utf8_lossy(&body).contains("Rip (2020)"));
+    }
+}
+
 /// An item with an empty path is `MimeTypes.GetMimeType`'s
 /// `ArgumentException` in `GetFile` and `GetDownload`: a 400, not a 404.
 #[rstest::rstest]
