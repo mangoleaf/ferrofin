@@ -2645,7 +2645,7 @@ impl LocalProviderManager {
         // lock or the modes.
         let removed_images = options.remove_old_metadata
             && options.replace_all_images
-            && self.remove_own_images(item_id).await?;
+            && self.remove_own_images(item_id, &stored).await?;
         // The item's `LockedFields`: the merge leaves them as stored.
         let locked_fields = self.stored_locked_fields(item_id).await;
         let stored_ids = if options.search_result.is_some() {
@@ -3200,18 +3200,31 @@ impl LocalProviderManager {
     }
 
     /// [`remove_images`](crate::local_images::remove_images) over the item's
-    /// stored images in its own metadata folders, the rows it removed saved
-    /// at once so the providers after it see them gone. Returns whether any
-    /// image was removed.
-    async fn remove_own_images(&self, item_id: Uuid) -> Result<bool, ServiceError> {
+    /// stored images in its own metadata folders, and beside it when its art
+    /// is saved there, the rows it removed saved at once so the providers
+    /// after it see them gone. Returns whether any image was removed.
+    async fn remove_own_images(
+        &self,
+        item_id: Uuid,
+        row: &BaseItemEntity,
+    ) -> Result<bool, ServiceError> {
         let (Some(store), Some(root)) = (&self.image_store, &self.metadata_dir) else {
             return Ok(false);
         };
-        let Some(mut images) = self.stored_images(item_id).await else {
+        let Some(mut images) = self.stored_images(item_id).await.filter(|i| !i.is_empty()) else {
             return Ok(false);
         };
         let folders = crate::local_images::internal_metadata_dirs(&root.resolve(), item_id);
-        if !crate::local_images::remove_images(&mut images, &folders, &item_id.to_string()) {
+        let beside = match &self.image_saver {
+            Some(saver) => saver.beside_art(row).await?,
+            None => None,
+        };
+        if !crate::local_images::remove_images(
+            &mut images,
+            &folders,
+            &item_id.to_string(),
+            beside.as_ref(),
+        ) {
             return Ok(false);
         }
         store.save_item_images(item_id, &images).await?;

@@ -15,6 +15,7 @@ use ferrofin_traits::options::ItemImageInfo;
 use uuid::Uuid;
 
 use crate::container_types::LocalImageInfo;
+use crate::image_save::BesideArt;
 
 /// Image rows for images a local provider found, dated by their files.
 ///
@@ -180,14 +181,17 @@ pub fn legacy_art_dir(root: &Path, item_id: Uuid) -> PathBuf {
 /// `folders` ([`internal_metadata_dirs`]) — the first image of each singular
 /// type (`_singularImages`, `:42-53`) and every backdrop — are taken out of
 /// `images` and their files deleted (`PruneImages`), so the refresh supplies
-/// them afresh. Screenshots, chapter images, a second image of a singular
-/// type and anything stored outside those folders stay. Returns whether any
-/// image was removed.
-///
-/// TODO(gl-1741): open work item: upstream also removes them wherever they
-/// are stored when `IsSaveLocalMetadataEnabled()` (art saved beside the item
-/// or its media); that arm is not ported yet.
-pub fn remove_images(images: &mut Vec<ItemImageInfo>, folders: &[PathBuf], item_id: &str) -> bool {
+/// them afresh. Screenshots, chapter images and a second image of a singular
+/// type always stay. One stored outside those folders stays too, unless the
+/// item's art is saved `beside` it (`item.IsSaveLocalMetadataEnabled()`) and
+/// [`BesideArt::removes`] takes it: a remote one's row goes without a file to
+/// delete. Returns whether any image was removed.
+pub fn remove_images(
+    images: &mut Vec<ItemImageInfo>,
+    folders: &[PathBuf],
+    item_id: &str,
+    beside: Option<&BesideArt>,
+) -> bool {
     let before = images.len();
     let mut seen: Vec<ImageType> = Vec::new();
     images.retain(|image| {
@@ -210,8 +214,13 @@ pub fn remove_images(images: &mut Vec<ItemImageInfo>, folders: &[PathBuf], item_
             seen.push(image.image_type);
         }
         let path = Path::new(&image.path);
-        if !removable || !folders.iter().any(|folder| path.starts_with(folder)) {
+        let own = folders.iter().any(|folder| path.starts_with(folder));
+        if !removable || !(own || beside.is_some_and(|beside| beside.removes(image))) {
             return true;
+        }
+        // A remote image: the row goes, there is no file (`PruneImages`).
+        if !image.is_local_file() {
+            return false;
         }
         match std::fs::remove_file(path) {
             // Two image types can share one file.

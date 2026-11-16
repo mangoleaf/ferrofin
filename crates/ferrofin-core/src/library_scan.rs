@@ -13670,7 +13670,10 @@ impl LibraryScanner {
         } = art;
         let mut cut_short = false;
         let dirs = art_cache.dirs.clone();
-        let removed = remove_existing && self.remove_item_images(entity, stored);
+        let removed = remove_existing
+            && self
+                .remove_item_images(entity, stored, dirs.as_deref())
+                .await;
         let remote = fetch != ImageFetch::None;
         let short = entity.type_.rsplit('.').next().unwrap_or(&entity.type_);
         // A photo's own file IS its Primary image (C# `PhotoProvider` sets it
@@ -14763,22 +14766,49 @@ impl LibraryScanner {
 
     /// `ItemImageProvider.RemoveImages` for the scan, by the shared
     /// [`remove_images`](ferrofin_providers::local_images::remove_images):
-    /// the item's images in its own metadata folders go, so the pass supplies
-    /// them afresh. Returns whether any was removed (upstream's result).
-    fn remove_item_images(
+    /// the item's images in its own metadata folders go, and those saved
+    /// beside it when its art is saved there, so the pass supplies them
+    /// afresh. The folders it deleted in are forgotten in `dirs`, the run's
+    /// listings, as [`publish_media_artwork`](Self::publish_media_artwork)
+    /// forgets them: no later reader of the folder finds the removed files.
+    /// Returns whether any was removed (upstream's result).
+    async fn remove_item_images(
         &self,
         entity: &BaseItemEntity,
         stored: Option<&[ItemImageInfo]>,
+        dirs: Option<&DirectoryCache>,
     ) -> bool {
-        let (Some(meta_root), Some(stored)) = (&self.metadata_dir, stored) else {
+        let (Some(meta_root), Some(stored)) =
+            (&self.metadata_dir, stored.filter(|s| !s.is_empty()))
+        else {
             return false;
         };
         let folders = Uuid::parse_str(&entity.id).map_or_else(
             |_| vec![meta_root.join(&entity.id)],
             |id| crate::dynamic_images::internal_metadata_dirs(&meta_root.resolve(), id).to_vec(),
         );
+        let beside = match &self.image_saver {
+            Some(saver) => saver.beside_art(entity).await.unwrap_or_else(|err| {
+                // Only the metadata folders' images go, as when nothing is saved beside it.
+                tracing::warn!(%err, item_id = %entity.id, "could not tell whether the item's art is saved beside it");
+                None
+            }),
+            None => None,
+        };
         // The rows are rewritten from what the pass finds.
-        ferrofin_providers::local_images::remove_images(&mut stored.to_vec(), &folders, &entity.id)
+        let mut kept = stored.to_vec();
+        let removed = ferrofin_providers::local_images::remove_images(
+            &mut kept,
+            &folders,
+            &entity.id,
+            beside.as_ref(),
+        );
+        if let Some(dirs) = dirs {
+            for image in stored.iter().filter(|image| !kept.contains(image)) {
+                dirs.invalidate(&image.path);
+            }
+        }
+        removed
     }
 
     /// Appends rows for art files already sitting in the item's metadata art
@@ -29025,13 +29055,16 @@ mod tests {
         );
         let scanner = LibraryScanner::new(vf, Arc::new(FerrofinFileSystem::new()), persistence)
             .with_metadata_dir(meta.clone());
-        scanner.remove_item_images(
-            &BaseItemEntity {
-                id: ferrofin_db::store::guid_to_db(id),
-                ..BaseItemEntity::default()
-            },
-            Some(&stored),
-        );
+        scanner
+            .remove_item_images(
+                &BaseItemEntity {
+                    id: ferrofin_db::store::guid_to_db(id),
+                    ..BaseItemEntity::default()
+                },
+                Some(&stored),
+                None,
+            )
+            .await;
         for gone in [&poster, &backdrop, &backdrop1] {
             assert!(!gone.exists(), "{} removed", gone.display());
         }
@@ -29097,7 +29130,9 @@ mod tests {
         expected.sort_by_key(|(_, path)| path.clone());
         assert_eq!(found, expected);
 
-        scanner.remove_item_images(&entity, Some(&images));
+        scanner
+            .remove_item_images(&entity, Some(&images), None)
+            .await;
         for gone in [&own_primary, &old_backdrop] {
             assert!(!gone.exists(), "{} removed", gone.display());
         }
