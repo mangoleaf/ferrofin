@@ -1024,11 +1024,13 @@ pub struct FerrofinItemPersistenceService {
     /// ([`FerrofinItemPersistenceService::with_virtual_paths`]).
     virtual_paths: crate::virtual_paths::VirtualPathExpander,
     /// The playlist manager's entry-edit lock
-    /// ([`Self::playlist_entry_edits`]), held by the two writers of a
-    /// playlist's entries outside it: the scan's playlist sync and an item
-    /// deletion. Either landing between an edit's read and its rewrite would
-    /// lose the scan's members, or fail the rewrite on a deleted member.
-    /// Taken before the writer, as the manager takes it.
+    /// ([`Self::playlist_entry_edits`]), held by the writers of a playlist's
+    /// entries outside it: the scan's playlist sync, an item deletion and a
+    /// re-key ([`ItemPersistenceService::rekey_items`]), and the
+    /// linked-children service's reroute. One landing between an edit's read
+    /// and its rewrite would lose the scan's members or the reroute, or fail
+    /// the rewrite on a deleted or folded member. Taken before the writer, as
+    /// the manager takes it.
     playlist_entry_edits: Arc<tokio::sync::Mutex<()>>,
 }
 
@@ -1057,8 +1059,9 @@ impl FerrofinItemPersistenceService {
     }
 
     /// The lock the playlist manager holds across an entry edit's read and
-    /// rewrite, which this service's playlist sync and deletion also take.
-    /// The composition root hands it to the playlist manager.
+    /// rewrite, which this service's playlist sync, deletion and re-key also
+    /// take. The composition root hands it to the playlist manager and the
+    /// linked-children service.
     #[must_use]
     pub fn playlist_entry_edits(&self) -> Arc<tokio::sync::Mutex<()>> {
         Arc::clone(&self.playlist_entry_edits)
@@ -3774,6 +3777,7 @@ impl ItemPersistenceService for FerrofinItemPersistenceService {
     }
 
     async fn rekey_items(&self, moves: &[ItemRekey]) -> Result<Vec<ItemRekey>, ServiceError> {
+        let _edits = self.playlist_entry_edits.lock().await;
         rekey_rows(&self.db, moves, RekeyKind::Changed).await
     }
 

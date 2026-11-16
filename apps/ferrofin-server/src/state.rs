@@ -652,8 +652,12 @@ pub async fn build_app_state(
         Arc::new(FerrofinChapterRepository::new(db.clone()));
     let keyframe_repository: Arc<dyn ferrofin_traits::persistence::KeyframeRepository> =
         Arc::new(FerrofinKeyframeRepository::new(db.clone()));
+    // A reroute waits for a playlist entry edit, as the scan and deletion do.
     let linked_children_service: Arc<dyn ferrofin_traits::persistence::LinkedChildrenService> =
-        Arc::new(FerrofinLinkedChildrenService::new(db.clone()));
+        Arc::new(
+            FerrofinLinkedChildrenService::new(db.clone())
+                .with_entry_edits(item_persistence_impl.playlist_entry_edits()),
+        );
     let next_up_service: Arc<dyn ferrofin_traits::persistence::NextUpService> =
         Arc::new(FerrofinNextUpService::new(db.clone()).with_virtual_paths(virtual_paths.clone()));
 
@@ -2380,7 +2384,8 @@ pub async fn build_app_state(
         .with_self_writes(Arc::clone(&self_writes_guard))
         // Each playlist change announced as `ItemAdded`/`ItemUpdated`.
         .with_item_persistence(Arc::clone(&item_persistence_service))
-        // The scan's playlist sync and deletion wait for an entry edit.
+        // The scan's playlist sync and re-keys, deletion and version reroutes
+        // wait for an entry edit.
         .with_entry_edits(item_persistence_impl.playlist_entry_edits())
         // A new playlist's folder stored as `%AppDataPath%/playlists/<name>`.
         .with_virtual_paths(virtual_paths.clone()),
