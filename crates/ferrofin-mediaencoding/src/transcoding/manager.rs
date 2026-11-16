@@ -1293,13 +1293,9 @@ impl<S: SessionReporter, C: FileCleaner> TranscodeManagerImpl<S, C> {
         }
 
         let (log_path, directory, display) =
-            match prepare_transcode_output(program, state, output_path, &arguments, &log_dir) {
-                Ok(prepared) => prepared,
-                Err(error) => {
-                    self.remove_job_by_path(&handle.path, handle.job_type);
-                    return Err(error.into());
-                }
-            };
+            prepare_transcode_output(program, state, output_path, &arguments, &log_dir)
+                .await
+                .inspect_err(|_| self.remove_job_by_path(&handle.path, handle.job_type))?;
         // Name what the job plays, so a later kill/reap log doesn't reduce to ids.
         self.set_job_display(&handle, &display);
 
@@ -2136,21 +2132,23 @@ async fn survive_panic(task: &'static str, failing: &mut bool, pass: impl Future
 
 /// Readies the disk for an admitted job and logs its start: its ffmpeg log path,
 /// its output directory (`Directory.CreateDirectory(Path.GetDirectoryName(outputPath))`)
-/// and its display label.
-fn prepare_transcode_output(
+/// and its display label. Both directories are created on the blocking pool,
+/// never inline on a runtime worker.
+async fn prepare_transcode_output(
     program: &str,
     state: &EncodingJobInfo,
     output_path: &Path,
     arguments: &[String],
     log_dir: &Path,
 ) -> Result<(PathBuf, PathBuf, String), String> {
-    let log_path = prepare_ffmpeg_log(log_dir, state)?;
+    let log_path = prepare_ffmpeg_log(log_dir, state).await?;
     let display = trace_transcode_start(program, state, arguments);
     let directory = output_path
         .parent()
         .ok_or_else(|| format!("output path {} has no parent", output_path.display()))?
         .to_path_buf();
-    std::fs::create_dir_all(&directory)
+    tokio::fs::create_dir_all(&directory)
+        .await
         .map_err(|e| format!("create output dir {}: {e}", directory.display()))?;
     Ok((log_path, directory, display))
 }
@@ -2162,8 +2160,9 @@ fn prepare_transcode_output(
 /// `ApplicationPaths.LogDirectoryPath`, which its Serilog sink has already
 /// created at boot; here the directory may not exist yet on a fresh install, and
 /// a missing one would fail the spawn.
-fn prepare_ffmpeg_log(log_dir: &Path, state: &EncodingJobInfo) -> Result<PathBuf, String> {
-    std::fs::create_dir_all(log_dir)
+async fn prepare_ffmpeg_log(log_dir: &Path, state: &EncodingJobInfo) -> Result<PathBuf, String> {
+    tokio::fs::create_dir_all(log_dir)
+        .await
         .map_err(|e| format!("create log dir {}: {e}", log_dir.display()))?;
     let path = log_dir.join(ffmpeg_log_file_name(state));
     tracing::debug!(log = ?path, "ffmpeg stderr log");
@@ -3443,6 +3442,57 @@ mod start_ffmpeg_tests {
                 .await
                 .unwrap();
         });
+    }
+
+    /// A transcode start creates its log and output directories on the
+    /// blocking pool, never inline on the runtime worker serving the request
+    /// (found with gl-1804).
+    #[test]
+    fn a_start_creates_its_directories_on_the_blocking_pool() {
+        use super::prepare_transcode_output;
+        use crate::transcoding::fs_wait::{needs_the_blocking_pool, one_blocking_thread};
+        one_blocking_thread().block_on(async {
+            let tmp = tempfile::tempdir().unwrap();
+            let playlist = tmp.path().join("s").join("out.m3u8");
+            let log_dir = tmp.path().join("log");
+            let st = state(&playlist, Some(&playlist));
+            let (log, directory, _) = needs_the_blocking_pool(prepare_transcode_output(
+                "ffmpeg",
+                &st,
+                &playlist,
+                &[],
+                &log_dir,
+            ))
+            .await
+            .unwrap();
+            assert!(log_dir.is_dir() && log.starts_with(&log_dir));
+            assert!(directory.is_dir() && playlist.starts_with(&directory));
+        });
+    }
+
+    /// A start whose log or output directory cannot be created (a file is in
+    /// the way) fails with that cause and leaves no job registered behind it.
+    #[rstest::rstest]
+    #[case::log_beside_the_output(false, "create log dir")]
+    #[case::log_elsewhere(true, "create output dir")]
+    #[tokio::test]
+    async fn a_start_whose_directories_cannot_be_created_registers_no_job(
+        #[case] separate_log_dir: bool,
+        #[case] cause: &str,
+    ) {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("s"), b"a file, not a directory").unwrap();
+        let playlist = tmp.path().join("s").join("out.m3u8");
+        let m = manager();
+        let st = state(&playlist, Some(&playlist));
+        let fake = FakeSegmentTranscoder::new(FakeScript::default());
+        let mut request = ffmpeg_req(&st, &playlist, vec![]);
+        if separate_log_dir {
+            request.log_dir = tmp.path().join("log");
+        }
+        let error = m.start_ffmpeg(&fake, request).await.unwrap_err();
+        assert!(error.to_string().contains(cause), "{error}");
+        assert_eq!(m.active_job_count(), 0);
     }
 
     /// A dead job's stderr tail is read on the blocking pool, never inline on
