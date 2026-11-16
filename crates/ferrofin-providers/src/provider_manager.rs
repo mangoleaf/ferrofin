@@ -1135,6 +1135,9 @@ pub trait RemoteSearchProvider: Send + Sync {
 pub struct LocalProviderManager {
     /// Refreshes waiting for the serial worker (`ProviderManager._refreshQueue`).
     refresh_queue: Arc<std::sync::Mutex<RefreshQueue>>,
+    /// Per-item locks on a row's read-modify-write, shared by every clone
+    /// ([`ProviderManager::lock_item_metadata`]).
+    item_metadata_locks: Arc<ferrofin_util::keyed_locks::KeyedLocks>,
     nfo_saver: Option<Arc<crate::nfo_save::NfoSaver>>,
     /// A box set's `collection.xml` saver (`BoxSetXmlSaver`); with it the
     /// box set's refresh reads the file too (`BoxSetXmlProvider`).
@@ -1301,6 +1304,7 @@ impl std::fmt::Debug for LocalProviderManager {
                     .lock()
                     .map_or(0, |queue| queue.items.len()),
             )
+            .field("locked_items", &self.item_metadata_locks.len())
             .field("external_id_infos", &self.external_id_infos)
             .field("has_virtual_folders", &self.virtual_folders.is_some())
             .field(
@@ -1398,6 +1402,7 @@ impl LocalProviderManager {
     pub fn new(external_id_infos: Vec<ExternalIdInfo>) -> Self {
         Self {
             refresh_queue: Arc::default(),
+            item_metadata_locks: Arc::default(),
             nfo_saver: None,
             box_set_xml: None,
             image_saver: None,
@@ -2605,6 +2610,12 @@ impl LocalProviderManager {
         options: &MetadataRefreshOptions,
     ) -> Result<ItemUpdateType, ServiceError> {
         use crate::metadata_merge::{MetadataResult, RefreshAnswers, RefreshMerge};
+        // Held from the id write and the load below to the last save, so an
+        // edit made meanwhile waits and then applies to the saved row. It
+        // spans the remote fetches too, so the edit waits for them, minutes at
+        // worst under `rate_limit.rs`'s timeouts and retries; gl-1504 has the
+        // re-read-under-the-lock shape that would end that wait.
+        let _metadata = self.lock_item_metadata(item_id).await;
         // "Identify → Apply": the chosen result's ids become the item's, and
         // they are persisted BEFORE anything else — including every gate and
         // early return below. C# does this in the CONTROLLER, outside the
@@ -2644,7 +2655,7 @@ impl LocalProviderManager {
         // lock or the modes.
         let removed_images = options.remove_old_metadata
             && options.replace_all_images
-            && self.remove_own_images(item_id).await?;
+            && self.remove_own_images(item_id, &stored).await?;
         // The item's `LockedFields`: the merge leaves them as stored.
         let locked_fields = self.stored_locked_fields(item_id).await;
         let stored_ids = if options.search_result.is_some() {
@@ -3199,18 +3210,31 @@ impl LocalProviderManager {
     }
 
     /// [`remove_images`](crate::local_images::remove_images) over the item's
-    /// stored images in its own metadata folders, the rows it removed saved
-    /// at once so the providers after it see them gone. Returns whether any
-    /// image was removed.
-    async fn remove_own_images(&self, item_id: Uuid) -> Result<bool, ServiceError> {
+    /// stored images in its own metadata folders, and beside it when its art
+    /// is saved there, the rows it removed saved at once so the providers
+    /// after it see them gone. Returns whether any image was removed.
+    async fn remove_own_images(
+        &self,
+        item_id: Uuid,
+        row: &BaseItemEntity,
+    ) -> Result<bool, ServiceError> {
         let (Some(store), Some(root)) = (&self.image_store, &self.metadata_dir) else {
             return Ok(false);
         };
-        let Some(mut images) = self.stored_images(item_id).await else {
+        let Some(mut images) = self.stored_images(item_id).await.filter(|i| !i.is_empty()) else {
             return Ok(false);
         };
         let folders = crate::local_images::internal_metadata_dirs(&root.resolve(), item_id);
-        if !crate::local_images::remove_images(&mut images, &folders, &item_id.to_string()) {
+        let beside = match &self.image_saver {
+            Some(saver) => saver.beside_art(row).await?,
+            None => None,
+        };
+        if !crate::local_images::remove_images(
+            &mut images,
+            &folders,
+            &item_id.to_string(),
+            beside.as_ref(),
+        ) {
             return Ok(false);
         }
         store.save_item_images(item_id, &images).await?;
@@ -5157,6 +5181,20 @@ impl ProviderManager for LocalProviderManager {
         // runs and reports what changed. Ferrofin's refresh never recurses
         // into children, so this is the full refresh with its verdict kept.
         Box::pin(self.refresh_item(item_id, options)).await
+    }
+
+    async fn lock_item_metadata(&self, item_id: Uuid) -> tokio::sync::OwnedMutexGuard<()> {
+        self.item_metadata_locks
+            .get(&item_id.to_string())
+            .lock_owned()
+            .await
+    }
+
+    async fn is_processing_refresh_queue(&self) -> bool {
+        self.refresh_queue
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .processing
     }
 
     async fn save_image_from_url(
@@ -8326,6 +8364,14 @@ mod tests {
     /// `(ItemValueType discriminant, value)` index.
     type RecordedItemValues = Vec<(Uuid, Vec<(i32, String)>)>;
 
+    /// Where [`RecordingStore::save_items`] parks a refresh: it signals
+    /// `reached` and waits for a `release` permit, so a test can act while the
+    /// refresh is between its load and its save.
+    struct SaveHold {
+        reached: tokio::sync::Notify,
+        release: tokio::sync::Semaphore,
+    }
+
     /// An [`ItemPersistenceService`] fake recording the writes a refresh makes
     /// (replaced id sets, upserted ids, saved rows) over a seeded id store.
     #[derive(Default)]
@@ -8345,6 +8391,8 @@ mod tests {
         removed_paths: std::sync::Mutex<Vec<String>>,
         /// The items whose save time it was asked to stamp.
         touched: std::sync::Mutex<Vec<Uuid>>,
+        /// When set, `save_items` parks until the test releases it.
+        hold_save: Option<Arc<SaveHold>>,
         /// Each `copy_metadata_to_owned_videos` call: owners, versions, parts.
         copied: std::sync::Mutex<Vec<(Vec<Uuid>, bool, bool)>>,
         /// Each refresh `copy_owner_metadata_to_extras` was asked for.
@@ -8427,6 +8475,15 @@ mod tests {
             unimplemented!()
         }
         async fn save_items(&self, items: &[BaseItemEntity]) -> Result<(), ServiceError> {
+            if let Some(hold) = &self.hold_save {
+                hold.reached.notify_one();
+                drop(
+                    hold.release
+                        .acquire()
+                        .await
+                        .expect("the semaphore stays open"),
+                );
+            }
             self.saved.lock().expect("lock").extend_from_slice(items);
             Ok(())
         }
@@ -12158,6 +12215,128 @@ mod tests {
             .last()
             .cloned()
             .expect("saved")
+    }
+
+    /// A box set refreshed recently enough that no remote provider runs,
+    /// under a manager whose store parks every refresh in its save.
+    fn held_box_set() -> (
+        Uuid,
+        LocalProviderManager,
+        Arc<RecordingStore>,
+        Arc<SaveHold>,
+    ) {
+        let item_id = Uuid::new_v4();
+        let mut stored = row("Movies.BoxSet", "Saga");
+        stored.id = item_id.to_string();
+        stored.date_last_refreshed = Some(chrono::Utc::now());
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let hold = Arc::new(SaveHold {
+            reached: tokio::sync::Notify::new(),
+            release: tokio::sync::Semaphore::new(0),
+        });
+        let store = Arc::new(RecordingStore {
+            hold_save: Some(Arc::clone(&hold)),
+            ..RecordingStore::default()
+        });
+        let mgr = LocalProviderManager::default()
+            .with_remote_images(
+                Arc::new(crate::tmdb::TmdbClient::new()),
+                Arc::new(FakeItems {
+                    rows: HashMap::from([(item_id, stored)]),
+                    seen: tx,
+                }),
+            )
+            .with_image_store(Arc::clone(&store) as _, std::env::temp_dir())
+            .with_linked_children(Arc::new(Members(Vec::new())));
+        (item_id, mgr, store, hold)
+    }
+
+    /// A refresh that always saves.
+    fn force_save() -> MetadataRefreshOptions {
+        MetadataRefreshOptions {
+            force_save: true,
+            ..MetadataRefreshOptions::default()
+        }
+    }
+
+    /// A refresh holds the item's metadata lock from its load to its save, so
+    /// an edit waits for it and lands on the saved row instead of under it
+    /// (gl-1852: a box set's edited Overview was lost to the refresh a
+    /// membership change had queued).
+    #[tokio::test]
+    async fn an_edit_waits_for_the_refresh_of_its_item_to_save() {
+        let (item_id, mgr, store, hold) = held_box_set();
+        let options = force_save();
+        let refresh = tokio::spawn({
+            let mgr = mgr.clone();
+            async move { mgr.refresh_full_item(item_id, &options).await }
+        });
+        // The refresh has loaded the row and is saving it (a refresh that
+        // never got there fails here rather than hanging).
+        tokio::time::timeout(std::time::Duration::from_secs(5), hold.reached.notified())
+            .await
+            .expect("the refresh reached its save");
+        let edit = tokio::spawn({
+            let mgr = mgr.clone();
+            let store = Arc::clone(&store);
+            async move {
+                let _metadata = mgr.lock_item_metadata(item_id).await;
+                store.saved.lock().expect("lock").len()
+            }
+        });
+        // Enough turns for the edit to take an uncontended lock.
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        hold.release.add_permits(1);
+        let done = std::time::Duration::from_secs(5);
+        tokio::time::timeout(done, refresh)
+            .await
+            .expect("the refresh finished once released")
+            .expect("join")
+            .expect("refresh succeeds");
+        let saved_before_the_edit = tokio::time::timeout(done, edit)
+            .await
+            .expect("the edit got the lock once the refresh was done")
+            .expect("join");
+        assert!(
+            saved_before_the_edit > 0,
+            "the edit took the lock while the refresh was still saving"
+        );
+    }
+
+    /// `is_processing_refresh_queue` (`_isProcessingRefreshQueue`) reads true
+    /// while the worker runs a refresh it has already taken off the queue,
+    /// which `get_refresh_queue` no longer lists, and false once it is done.
+    #[tokio::test]
+    async fn the_queue_reads_as_processing_until_its_running_refresh_is_done() {
+        let (item_id, mgr, _store, hold) = held_box_set();
+        assert!(
+            !mgr.is_processing_refresh_queue().await,
+            "nothing queued yet"
+        );
+        mgr.queue_refresh(item_id, &force_save(), RefreshPriority::High)
+            .await
+            .expect("queued");
+        tokio::time::timeout(std::time::Duration::from_secs(5), hold.reached.notified())
+            .await
+            .expect("the worker reached the refresh's save");
+        assert!(
+            mgr.get_refresh_queue().await.expect("queue").is_empty(),
+            "the running refresh has left the queue"
+        );
+        assert!(
+            mgr.is_processing_refresh_queue().await,
+            "the worker is still running it"
+        );
+        hold.release.add_permits(1);
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while mgr.is_processing_refresh_queue().await {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the worker stood down once the refresh was done");
     }
 
     /// A member row of `type_` with the given genres, studios and runtime.
