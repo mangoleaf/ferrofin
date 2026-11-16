@@ -502,12 +502,10 @@ Not runtime config, listed for completeness:
 
 - `FERROFIN_REFRESH_PLUGIN_ASSETS=1` — re-fetch vendored extension settings pages during
   `cargo build -p ferrofin-extensions`.
-- `FERROFIN_SCAN_BENCH=1` — run the opt-in library-scan measurement harness
-  (`apps/ferrofin-server/tests/scan_bench.rs`); reports items/second for a generated
-  fixture library. `FERROFIN_SCAN_BENCH_{MOVIES,SERIES,EPISODES}` size it,
-  `FERROFIN_SCAN_BENCH_PROBE=1` turns on the real ffprobe, and
+- `FERROFIN_SCAN_BENCH_{MOVIES,SERIES,EPISODES}` — size the opt-in library-scan
+  measurement harness (`apps/ferrofin-server/tests/scan_bench.rs`, `#[ignore]`d: run it
+  with `-- --include-ignored`), which reports items/second for a generated fixture
+  library. `FERROFIN_SCAN_BENCH_PROBE=1` turns on the real ffprobe, and
   `FERROFIN_SCAN_BENCH_{MEDIA,POSTER}` point it at real sample files.
-- `FERROFIN_LDAP_TESTS=1` — run the LDAP-Auth directory test against OpenLDAP in
-  containers (`crates/ferrofin-extensions/tests/ldap_directory.rs`; needs docker).
 - `FERROFIN_WASM_GUEST_TESTS=1` — build `examples/wasm-hello` from source (needs the
   wasm32-wasip2 target) and run the end-to-end WASM plugin tests.
