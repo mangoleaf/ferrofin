@@ -1143,11 +1143,14 @@ fn embedded_image_eligible(path: &str, data: &serde_json::Map<String, serde_json
         || crate::item_data::read_data_string(data, "VideoType").as_deref() == Some("Dvd"))
 }
 
-/// An embedded picture to extract: the ffmpeg stream index and output format.
+/// An embedded picture to extract: the ffmpeg stream index and output format,
+/// and whether it is an embedded-image stream rather than an attachment (an
+/// attached picture is both, at one index).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct EmbeddedPicture {
     index: i32,
     format: ferrofin_model::drawing::ImageFormat,
+    is_stream: bool,
 }
 
 /// `EmbeddedImageProvider.GetEmbeddedImage`'s source choice. An attachment whose
@@ -1195,6 +1198,7 @@ fn pick_embedded_picture(
         return Some(EmbeddedPicture {
             index: *index,
             format,
+            is_stream: false,
         });
     }
     let (index, _, codec) = streams
@@ -1217,6 +1221,7 @@ fn pick_embedded_picture(
     Some(EmbeddedPicture {
         index: *index,
         format,
+        is_stream: true,
     })
 }
 
@@ -13612,10 +13617,28 @@ impl LibraryScanner {
             })
             .collect();
         let picture = pick_embedded_picture(image_type, &attachment_rows, &stream_rows)?;
+        // `GetEmbeddedImage` hands a picked stream over as the extraction's
+        // video stream; `ExtractAttachment` hands over none.
+        let image_stream = streams
+            .iter()
+            .find(|stream| {
+                picture.is_stream
+                    && stream.stream_type == EMBEDDED_IMAGE_STREAM_TYPE
+                    && i32::try_from(stream.stream_index).ok() == Some(picture.index)
+            })
+            .cloned()
+            .map(crate::media_source_manager::stream_to_dto);
         let source = stored_media_source(&data);
         let container = crate::item_data::read_data_string(&data, "Container").unwrap_or_default();
         let extracted = match encoder
-            .extract_image_stream(path, &container, &source, picture.index, picture.format)
+            .extract_image_stream(
+                path,
+                &container,
+                &source,
+                image_stream.as_ref(),
+                picture.index,
+                picture.format,
+            )
             .await
         {
             Ok(extracted) => extracted,
@@ -27383,7 +27406,20 @@ mod tests {
                     streams: &[(i32, Option<&str>, Option<&str>)]| {
             pick_embedded_picture(kind, attachments, streams)
         };
-        let at = |index, format| Some(EmbeddedPicture { index, format });
+        let at = |index, format| {
+            Some(EmbeddedPicture {
+                index,
+                format,
+                is_stream: false,
+            })
+        };
+        let stream = |index, format| {
+            Some(EmbeddedPicture {
+                index,
+                format,
+                is_stream: true,
+            })
+        };
         // An attachment whose name contains a fragment (any case) beats a stream.
         assert_eq!(
             pick(
@@ -27418,10 +27454,10 @@ mod tests {
             (3, Some("Fan ART"), Some("webp")),
             (5, Some("cover.bmp"), Some("bmp")),
         ];
-        assert_eq!(pick(ImageType::Backdrop, &[], &streams), at(3, Webp));
-        assert_eq!(pick(ImageType::Primary, &[], &streams), at(5, Bmp));
+        assert_eq!(pick(ImageType::Backdrop, &[], &streams), stream(3, Webp));
+        assert_eq!(pick(ImageType::Primary, &[], &streams), stream(5, Bmp));
         // Primary alone falls back to the first stream; the others do not.
-        assert_eq!(pick(ImageType::Primary, &[], &streams[..2]), at(1, Jpg));
+        assert_eq!(pick(ImageType::Primary, &[], &streams[..2]), stream(1, Jpg));
         assert_eq!(pick(ImageType::Logo, &[], &streams), None);
         assert_eq!(pick(ImageType::Backdrop, &[], &streams[..2]), None);
         // Empty names and comments match nothing.

@@ -1421,7 +1421,9 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
                    extract_video_image, extract_image_stream and extract_audio_image \
                    (ExtractVideoImage's two overloads and ExtractAudioImage, through \
                    ExtractImage: the I-frame attempt, then the standard one, for a video \
-                   frame or an image stream, the standard one alone for audio), \
+                   frame or an image stream, the standard one alone for audio; a video \
+                   frame maps no stream, and an image stream is mapped and passed as the \
+                   video stream), \
                    extract_image_arguments and hdr_tone_map (ExtractImageInternal's \
                    bwdif, 3D or plain scaler, thumbnail=n=24 and tone-map chain, the \
                    -map, -fps_mode or -vsync from video_sync_option (GetVideoSyncOption \
@@ -1440,7 +1442,7 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
                    Which stream, offset and 3D format the callers pass (the chapter image \
                    extractor, the library scan's screen grab and its audio and embedded image \
                    providers) is not part of this row.",
-        date: "2026-11-14",
+        date: "2026-11-16",
         divergences: &[
             "ffmpeg runs with -v error, not upstream's -v quiet, so a failed extraction's \
              error quotes the end of ffmpeg's output, where upstream's says only that \
@@ -1453,13 +1455,6 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
              art and image streams too), where upstream converts none, so its BT.709 and \
              tone-mapped frames shift colour (gl-1158): a Jellyfin bug, deliberately not \
              ported.",
-            "An image stream is extracted with no deinterlace or tone-map step and the SDR \
-             timeout, where upstream passes the image stream as the video stream and would \
-             apply them if ffprobe reported that stream interlaced, or HDR on an ffmpeg with \
-             tonemapx or zscale (then with the HDR timeout). Fix path: gl-1794.",
-            "A video-frame grab handed a stream that is not a video stream maps that stream \
-             (-map 0:N), where upstream's overload passes no stream index and ffmpeg picks its \
-             own video stream. Fix path: gl-1794.",
             "An offset of a day or more seeks to its full hour count, where GetTimeParameter's \
              hh format drops the days and seeks into the first 24 hours. A Jellyfin bug, \
              deliberately not ported.",
