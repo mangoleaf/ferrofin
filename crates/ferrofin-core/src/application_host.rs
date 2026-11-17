@@ -37,6 +37,46 @@ use ferrofin_traits::system::{LocalApiAccess, ServerApplicationHost};
 /// from `GET /System/Ping` and `PublicSystemInfo.ProductName`.
 pub const PRODUCT_NAME: &str = "Jellyfin Server";
 
+/// The machine name, as .NET's `Environment.MachineName` reports it: the
+/// kernel host name up to its first dot on Unix, the computer name on Windows.
+/// `None` when it cannot be read or that leaves nothing.
+///
+/// What `FriendlyName` falls back to when no server name is saved
+/// (`ApplicationHost.FriendlyName`).
+#[must_use]
+pub fn machine_name() -> Option<String> {
+    first_label(&host_name()?)
+}
+
+/// The name up to its first `.`, as `Environment.MachineName` cuts
+/// `GetHostName()` on Unix (a computer name has no dot).
+fn first_label(host: &str) -> Option<String> {
+    let label = host.split('.').next().unwrap_or_default();
+    (!label.is_empty()).then(|| label.to_owned())
+}
+
+/// The kernel host name (`gethostname`), as .NET's `Interop.Sys.GetHostName`
+/// reads it: into `HOST_NAME_MAX + 1` bytes.
+#[cfg(unix)]
+fn host_name() -> Option<String> {
+    let mut buf = [0_u8; 256];
+    // SAFETY: `buf` is writable for the `buf.len()` bytes `gethostname` may fill.
+    if unsafe { libc::gethostname(buf.as_mut_ptr().cast(), buf.len()) } != 0 {
+        return None;
+    }
+    // `PtrToStringUTF8` decodes lossily.
+    let name = std::ffi::CStr::from_bytes_until_nul(&buf).ok()?;
+    Some(name.to_string_lossy().into_owned())
+}
+
+/// The computer name (`GetComputerNameW`'s NetBIOS name).
+// shortcut: Windows sets COMPUTERNAME to that name for every process, services
+// included; call GetComputerNameW if a server ever runs with a scrubbed environment.
+#[cfg(not(unix))]
+fn host_name() -> Option<String> {
+    std::env::var("COMPUTERNAME").ok()
+}
+
 /// The network-facing facts the host reports and uses to build URLs.
 ///
 /// Filled by the composition root from the actual listener configuration.
@@ -528,6 +568,31 @@ mod tests {
                 .expect("load config"),
         );
         FerrofinServerApplicationHost::new(cfg, network, "test-machine")
+    }
+
+    /// `Environment.MachineName` on Unix keeps the host name up to its first
+    /// dot (gl-1777: Jellyfin 12.4 in a container named `media.example.lan`
+    /// answers `ServerName: "media"`); nothing left is no name.
+    #[rstest::rstest]
+    #[case("media.example.lan", Some("media"))]
+    #[case("media", Some("media"))]
+    #[case("media.", Some("media"))]
+    #[case(".example.lan", None)]
+    #[case("", None)]
+    fn the_machine_name_is_the_host_name_up_to_its_first_dot(
+        #[case] host: &str,
+        #[case] expected: Option<&str>,
+    ) {
+        assert_eq!(first_label(host).as_deref(), expected);
+    }
+
+    /// The host name is the kernel's, not the `HOSTNAME` variable a shell or
+    /// a container may set.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_machine_name_is_the_kernel_host_name() {
+        let kernel = std::fs::read_to_string("/proc/sys/kernel/hostname").expect("host name");
+        assert_eq!(machine_name(), first_label(kernel.trim_end()));
     }
 
     /// `UriBuilder` writes any port it is given, the scheme's default too.

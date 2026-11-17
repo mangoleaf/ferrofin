@@ -483,8 +483,19 @@ impl SubtitleManager for CannedSubtitles {
         self.uploads.lock().unwrap().push(response.content.len());
         Err(ServiceError::invalid_input("no providers"))
     }
-    async fn get_remote_subtitles(&self, _id: &str) -> Result<SubtitleResponse, ServiceError> {
-        Err(ServiceError::invalid_input("no providers"))
+    /// An id `canned_<format>` is a subtitle of that format; any other names
+    /// no provider.
+    async fn get_remote_subtitles(&self, id: &str) -> Result<SubtitleResponse, ServiceError> {
+        let format = id
+            .strip_prefix("canned_")
+            .ok_or_else(|| ServiceError::invalid_input("no providers"))?;
+        Ok(SubtitleResponse {
+            language: "eng".to_owned(),
+            format: format.to_owned(),
+            is_forced: false,
+            is_hearing_impaired: false,
+            content: b"1".to_vec(),
+        })
     }
     /// The item's subtitle files are its streams 1 to 3; stream 4's folder is
     /// missing (`DirectoryNotFoundException`); any other index is the
@@ -939,6 +950,36 @@ async fn get_subtitle_js_alias_maps_to_json_mime() {
     assert_eq!(status, StatusCode::OK);
     // js → json; served as application/json (Jellyfin: MimeTypes.GetMimeType("file.json")).
     assert_eq!(ct.as_deref(), Some("application/json"));
+}
+
+/// `GetSubtitle` (both encoded branches) and `GetRemoteSubtitles` type the body
+/// `MimeTypes.GetMimeType("file." + format)`: the ported table's type, and
+/// `application/octet-stream` for a format it does not name (`subrip`). The
+/// `vtt` case takes the time-map branch.
+#[rstest::rstest]
+#[case("vtt", "text/vtt")]
+#[case("srt", "application/x-subrip")]
+#[case("ass", "text/x-ssa")]
+#[case("smi", "application/smil+xml")]
+#[case("subrip", "application/octet-stream")]
+#[tokio::test]
+async fn subtitles_are_typed_by_the_mime_types_table(#[case] format: &str, #[case] mime: &str) {
+    let app = subtitle_state(StubEncoder(Ok(b"1".to_vec())));
+    let (status, _, ct) = call(
+        app,
+        &format!("/Videos/{ITEM_ID}/msrc/Subtitles/0/Stream.{format}?AddVttTimeMap=true"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(ct.as_deref(), Some(mime));
+    let app = remote_search_state(Arc::new(CannedSubtitles::default()));
+    let (status, _, ct) = call(
+        app,
+        &format!("/Providers/Subtitles/Subtitles/canned_{format}"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(ct.as_deref(), Some(mime));
 }
 
 #[tokio::test]

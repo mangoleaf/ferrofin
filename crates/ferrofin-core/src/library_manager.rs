@@ -286,12 +286,13 @@ fn folder_name_matches(item: &BaseItemEntity, query: &InternalItemsQuery) -> boo
 /// `FilterEpisodesBySeason` — with `include_specials`
 /// (`DisplaySpecialsWithinSeasons`), a special airing within a numbered
 /// season belongs to it — and sorted in aired order (season 0 keeps the
-/// series' `SortName` order). Empty when the season has no series.
+/// series' `SortName` order). Empty when the season has no series; a series
+/// row that fails to read is an error here, which the scan's
+/// [`series_season_episode_rows`] caller counts as no series instead.
 /// `season_id` is the season's id; `query` supplies the user and the DTO
 /// options the series query runs with. The series' rows are read with only
 /// the columns the selection reads, and the full rows of the season's
 /// episodes after it (gl-1259).
-#[allow(clippy::too_many_lines)] // source relation resolution, then selection
 pub(crate) async fn season_episode_rows(
     items: &dyn ItemRepository,
     season_id: Uuid,
@@ -299,16 +300,38 @@ pub(crate) async fn season_episode_rows(
     query: &InternalItemsQuery,
     include_specials: bool,
 ) -> Result<Vec<BaseItemEntity>, ServiceError> {
-    let series_id = relation_id(season.series_id.as_deref())
-        .or_else(|| relation_id(season.parent_id.as_deref()));
-    let series = match series_id {
+    let series = match season_series_column(&season).and_then(|id| relation_id(Some(id))) {
         Some(id) => items.retrieve_item(id).await?,
         None => None,
-    }
-    .filter(|row| row.type_.rsplit('.').next() == Some("Series"));
-    let Some(series) = series else {
+    };
+    series_season_episode_rows(items, season_id, season, series, query, include_specials).await
+}
+
+/// The column naming `season`'s series (`Season.Series`): its `SeriesId`,
+/// else its `ParentId`, skipping one [`relation_id`] reads as no relation.
+pub(crate) fn season_series_column(season: &BaseItemEntity) -> Option<&str> {
+    [season.series_id.as_deref(), season.parent_id.as_deref()]
+        .into_iter()
+        .flatten()
+        .find(|id| relation_id(Some(id)).is_some())
+}
+
+/// [`season_episode_rows`] with `series`, the row [`season_series_column`]
+/// names, already read (`Season.GetEpisodes(Series series, …)`). Empty when
+/// it is `None` or not a series.
+#[allow(clippy::too_many_lines)] // source relation resolution, then selection
+pub(crate) async fn series_season_episode_rows(
+    items: &dyn ItemRepository,
+    season_id: Uuid,
+    season: BaseItemEntity,
+    series: Option<BaseItemEntity>,
+    query: &InternalItemsQuery,
+    include_specials: bool,
+) -> Result<Vec<BaseItemEntity>, ServiceError> {
+    let Some(series) = series.filter(|row| row.type_.rsplit('.').next() == Some("Series")) else {
         return Ok(Vec::new());
     };
+    let series_id = relation_id(Some(&series.id));
     let rows = items
         .get_episode_order_rows(&InternalItemsQuery {
             user: query.user.clone(),
@@ -7606,6 +7629,49 @@ mod tests {
         .into_iter()
         .filter_map(|row| row.name)
         .collect()
+    }
+
+    /// The season listing answers an error when its series cannot be read;
+    /// only the scan counts such a series as none (gl-1748).
+    #[tokio::test]
+    async fn season_episode_rows_fails_when_the_series_cannot_be_read() {
+        let db = test_db().await;
+        let library = manager(&db);
+        let (series, season) = (Uuid::new_v4(), Uuid::new_v4());
+        library
+            .persistence
+            .save_items(&[
+                BaseItemEntity {
+                    id: guid_to_db(series),
+                    type_: "MediaBrowser.Controller.Entities.TV.Series".into(),
+                    is_folder: true,
+                    ..Default::default()
+                },
+                BaseItemEntity {
+                    id: guid_to_db(season),
+                    type_: "MediaBrowser.Controller.Entities.TV.Season".into(),
+                    index_number: Some(1),
+                    parent_id: Some(guid_to_db(series)),
+                    series_id: Some(guid_to_db(series)),
+                    is_folder: true,
+                    ..Default::default()
+                },
+            ])
+            .await
+            .unwrap();
+        let season_row = library.items.retrieve_item(season).await.unwrap().unwrap();
+        db.close().await;
+
+        let listed = season_episode_rows(
+            library.items.as_ref(),
+            season,
+            season_row,
+            &InternalItemsQuery::default(),
+            true,
+        )
+        .await;
+
+        assert!(listed.is_err(), "{listed:?}");
     }
 
     /// gl-905, the undated shape: 22 unnumbered season-2 episodes in

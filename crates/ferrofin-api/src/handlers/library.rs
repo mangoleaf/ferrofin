@@ -55,7 +55,7 @@ use crate::error::ApiError;
 use crate::extract::{DotnetGuid, JsonBody, Query};
 use crate::handlers::items::resolve_user_opt;
 use crate::handlers::query_parse::{parse_csv_enums_lenient, parse_order_by};
-use crate::handlers::streaming::serve_static_file;
+use crate::handlers::streaming::{physical_file_path, serve_physical_file};
 use crate::state::AppState;
 
 /// Query parameters shared by the theme-media routes.
@@ -386,9 +386,10 @@ async fn get_item_collections(
 
 /// `GET /Items/{itemId}/File` — the original file of an item.
 ///
-/// Port of `LibraryController.GetFile`: resolves the item (`404` when absent),
-/// then serves its on-disk `Path` with HTTP `Range`/`HEAD` support (Jellyfin's
-/// `PhysicalFile`). The symlink-resolution nicety is left to the file server.
+/// Port of `LibraryController.GetFile`: resolves the item (`404` when absent,
+/// `400` when it has no path), then serves its on-disk `Path`, a link's final
+/// target, with HTTP `Range`/`HEAD` support, typed by `MimeTypes.GetMimeType`
+/// (Jellyfin's `PhysicalFile`).
 #[utoipa::path(
     get,
     path = "/Items/{itemId}/File",
@@ -410,11 +411,12 @@ async fn get_file(
         .get_item_by_id_for_user(item_id, auth.user.as_deref())
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("item {item_id}")))?;
+    // An empty path is MimeTypes.GetMimeType's ArgumentException, a 400.
     let path = item
         .path
         .filter(|p| !p.is_empty())
-        .ok_or_else(|| ApiError::NotFound(format!("item {item_id} has no file")))?;
-    serve_static_file(&path, request).await
+        .ok_or_else(|| ApiError::BadRequest(format!("item {item_id} has no file")))?;
+    serve_physical_file(&physical_file_path(path).await?, request).await
 }
 
 /// The scheduled task `POST /Library/Refresh` starts, keyed exactly as Jellyfin

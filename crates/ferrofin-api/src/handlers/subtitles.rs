@@ -368,18 +368,10 @@ async fn get_remote_subtitles(
     Ok(([(header::CONTENT_TYPE, mime)], result.content).into_response())
 }
 
-/// The MIME type for a subtitle of the given format (a small, common-format map;
-/// unknown formats fall back to `text/plain`). `ttml` is the `MimeTypes` package
-/// entry `MimeTypes.GetMimeType("file.ttml")` falls back to.
+/// `MimeTypes.GetMimeType("file." + format)`: the type of a subtitle body of
+/// `format`, `application/octet-stream` for one the table does not name.
 fn subtitle_mime(format: &str) -> &'static str {
-    match format.to_ascii_lowercase().as_str() {
-        "vtt" => "text/vtt",
-        "srt" | "subrip" => "application/x-subrip",
-        "ass" | "ssa" => "text/x-ssa",
-        "json" => "application/json",
-        "ttml" => "application/ttml+xml",
-        _ => "text/plain",
-    }
+    ferrofin_model::net::mime_types::get_mime_type(&format!("file.{format}"))
 }
 
 /// Extracts the subtitle output format from a captured route segment.
@@ -532,14 +524,9 @@ async fn serve_graphical_subtitle(
     let Some(path) = graphical_subtitle_path(state, item_id, media_source_id, index).await? else {
         return Ok(None);
     };
-    let mut response = crate::handlers::streaming::serve_static_file(&path, request).await?;
-    if response.status().is_success() {
-        response.headers_mut().insert(
-            header::CONTENT_TYPE,
-            HeaderValue::from_static(ferrofin_model::net::mime_types::get_mime_type(&path)),
-        );
-    }
-    Ok(Some(response))
+    Ok(Some(
+        crate::handlers::streaming::serve_physical_file(&path, request).await?,
+    ))
 }
 
 /// `{routeMediaSourceId}`, the `[FromRoute, Required] string` of `GetSubtitle`

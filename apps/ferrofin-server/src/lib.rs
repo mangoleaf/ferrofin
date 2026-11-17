@@ -256,6 +256,8 @@ async fn announce_shutdown(
 ) {
     use ferrofin_model::session::SessionMessageType;
     let reason = shutdown_signal(shutdown_rx, &signals).await;
+    // `IsShuttingDown` is `ApplicationStopping`, which a signal cancels too.
+    lifecycle.mark_shutting_down();
     if let Some(discovery) = discovery {
         discovery.abort();
     }
