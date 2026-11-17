@@ -963,7 +963,14 @@ async fn on_ffmpeg_4_4_a_seeked_text_embed_reads_a_copy_cut_to_the_start() {
                 .await;
         }
     }
+    // The files go after `DeletePartialStreamFiles`' 1.5 s wait.
     for copy in copies {
+        for _ in 0..100 {
+            if !Path::new(&copy).exists() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
         assert!(!Path::new(&copy).exists(), "deleted with its job: {copy}");
     }
 }
