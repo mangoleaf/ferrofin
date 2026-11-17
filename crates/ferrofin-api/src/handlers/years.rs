@@ -118,9 +118,9 @@ async fn get_years(
     // A `parentId` naming no item, the zero id included, is `GetParentItem`'s
     // `ArgumentException`: a 400.
     let parent = resolve_parent(&state, &auth, query.parent_id, user.as_deref()).await?;
-    let playlist = parent.as_ref().is_some_and(|row| {
-        BaseItemKind::from_stored_type_name(&row.type_) == Some(BaseItemKind::Playlist)
-    });
+    let parent_kind = parent
+        .as_ref()
+        .and_then(|row| BaseItemKind::from_stored_type_name(&row.type_));
     // A parent that is not a folder (`!parentItem.IsFolder`, the stored
     // `IsFolder`) is the only item: `new[] { parentItem }.Where(Filter)`
     // (v12.4 `YearsController.cs:111-128`), so the answer is its own year,
@@ -161,8 +161,8 @@ async fn get_years(
         order_by: parse_order_by(query.sort_by.as_deref(), query.sort_order.as_deref()),
         ..ferrofin_traits::options::InternalItemsQuery::default()
     };
-    if playlist {
-        playlist_children(&mut internal);
+    if let Some(kind @ (BaseItemKind::Playlist | BaseItemKind::BoxSet)) = parent_kind {
+        linked_container_children(kind, &mut internal);
     }
     let result = state.library.get_years(&internal).await?;
     let options = additional_dto_options(
@@ -176,22 +176,38 @@ async fn get_years(
     Ok(Json(projected))
 }
 
-/// The children `GetYears` walks under a playlist (v12.4
-/// `YearsController.cs:112-123`). With a user, `GetRecursiveChildren(user, …)`
-/// and `GetChildren(user, true)` both reach `Playlist.GetPlayableItems`
+/// The children `GetYears` walks under a playlist or a box set, whose
+/// members are linked entries (v12.4 `YearsController.cs:112-123`).
+///
+/// With no user, a recursive walk takes every linked entry and what is under
+/// it, which the query already does, and a non-recursive one takes
+/// `Children`: a playlist never has any (`Playlist.LoadChildren`,
+/// `Playlist.cs:131`), and a box set only when it is a legacy one, whose
+/// children have it as their `ParentId` (`BoxSet.LoadChildren`,
+/// `BoxSet.cs:96-104`). The query reads the rows with that `ParentId` and
+/// does not test `IsLegacyBoxSet`, so it lists them too for a box set that
+/// has such rows and linked members, which upstream counts as not legacy.
+/// Only an adopted Jellyfin database holds one: Ferrofin's scanner makes
+/// none (gl-1712).
+///
+/// With a user, a playlist's `GetRecursiveChildren(user, …)` and
+/// `GetChildren(user, true)` both reach `Playlist.GetPlayableItems`
 /// (`Playlist.cs:142-171`): its linked entries, never recursing, less every
-/// folder entry. With none, a recursive walk takes every linked entry and
-/// what is under it, which the query already does, and a non-recursive one
-/// takes `Children`, which a playlist never has (`LoadChildren`, `:131`).
+/// folder entry. A box set takes no arm here then.
 ///
 /// `GET /Items?parentId=<playlist>` reaches neither override: its
 /// `Folder.GetItemsInternal` calls the `GetChildren` overload with a count,
 /// which `Playlist` does not override, so its folder entries are listed
 /// there, as in Ferrofin.
-fn playlist_children(query: &mut ferrofin_traits::options::InternalItemsQuery) {
+fn linked_container_children(
+    kind: BaseItemKind,
+    query: &mut ferrofin_traits::options::InternalItemsQuery,
+) {
     if query.user.is_some() {
-        query.recursive = false;
-        query.is_folder = Some(false);
+        if kind == BaseItemKind::Playlist {
+            query.recursive = false;
+            query.is_folder = Some(false);
+        }
     } else if !query.recursive {
         query.physical_children_only = true;
     }

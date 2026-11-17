@@ -11,7 +11,7 @@
 //! not taken as a field (it would be injected at the composition root if a later
 //! method needs it).
 
-use ferrofin_util::string_extensions::{equals_ordinal_ignore_case, upper_invariant};
+use ferrofin_util::string_extensions::{equals_ordinal_ignore_case, ordinal_ignore_case_key};
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -29,7 +29,7 @@ use ferrofin_model::dto::ItemCounts;
 use ferrofin_model::entities::ImageType;
 use ferrofin_model::entities::MediaStreamType;
 use ferrofin_model::querying::{QueryFiltersLegacy, QueryResult};
-use ferrofin_traits::options::{ItemImageInfo, live_tv_image_is_internal};
+use ferrofin_traits::options::{ItemImageInfo, file_date_modified, live_tv_image_is_internal};
 use uuid::Uuid;
 
 use ferrofin_traits::error::ServiceError;
@@ -209,6 +209,17 @@ pub(crate) async fn resolve_descendant_query(
     let mut resolved = filter.clone();
     resolved.descendant_roots = Some(roots);
     Ok(Some(resolved))
+}
+
+/// Whether `parent` has any `LinkedChildren` row: C# `folder.LinkedChildren.Length > 0`,
+/// the test `SetTopParentIdsOrAncestors` makes before it scopes a box set or
+/// playlist by its descendant set.
+pub(crate) async fn has_linked_children(db: &Database, parent: Uuid) -> Result<bool, ServiceError> {
+    sqlx::query_scalar(r#"SELECT EXISTS (SELECT 1 FROM "LinkedChildren" WHERE "ParentId" = ?1)"#)
+        .bind(guid_to_db(parent))
+        .fetch_one(db.pool())
+        .await
+        .map_err(db_err)
 }
 
 /// One batched frontier query; all link kinds qualify, and only actual folders
@@ -779,7 +790,7 @@ impl FerrofinItemRepository {
                     present
                         .entry(id)
                         .or_default()
-                        .insert(upper_invariant(&provider));
+                        .insert(ordinal_ignore_case_key(&provider));
                 }
             }
             rows.retain(|row| {
@@ -1047,20 +1058,14 @@ impl FerrofinItemRepository {
         filter: &InternalItemsQuery,
         row: &BaseItemEntity,
     ) -> Result<ViewRow, ServiceError> {
-        let has_linked_children = filter.recursive
+        let linked = filter.recursive
             && matches!(
                 crate::item_type_lookup::kind_from_type_name(&row.type_),
                 Some(BaseItemKind::BoxSet | BaseItemKind::Playlist)
             )
-            && sqlx::query_scalar(
-                r#"SELECT EXISTS (SELECT 1 FROM "LinkedChildren" WHERE "ParentId" = ?1)"#,
-            )
-            .bind(guid_to_db(filter.parent_id))
-            .fetch_one(db.pool())
-            .await
-            .map_err(db_err)?;
+            && has_linked_children(db, filter.parent_id).await?;
         Ok(ViewRow {
-            has_linked_children,
+            has_linked_children: linked,
             ..view_row(row)
         })
     }
@@ -3639,11 +3644,11 @@ pub(crate) fn folder_ordinal_compare(
 }
 
 /// The ordinal case-insensitive key [`folder_ordinal_compare`] compares, the
-/// .NET invariant upper case: comparing two values is comparing their keys
+/// .NET `OrdinalIgnoreCase` fold: comparing two values is comparing their keys
 /// byte-wise, so a sort can compute each row's key once instead of on every
 /// comparison.
 pub(crate) fn folder_ordinal_key(value: &str) -> String {
-    upper_invariant(value)
+    ordinal_ignore_case_key(value)
 }
 
 pub(crate) fn folder_sort_name(row: &BaseItemEntity) -> String {
@@ -4499,13 +4504,9 @@ impl ItemRepository for FerrofinItemRepository {
         // their paths — and then clears the cached dimensions and re-reads each
         // modified time from its file.
         let modified = tokio::task::spawn_blocking(move || {
-            swap_image_files(std::path::Path::new(&path1), std::path::Path::new(&path2))?;
-            let stamp = |path: &str| {
-                std::fs::metadata(path)
-                    .and_then(|meta| meta.modified())
-                    .map_or_else(|_| Utc::now(), chrono::DateTime::<Utc>::from)
-            };
-            Ok::<_, std::io::Error>((stamp(&path1), stamp(&path2)))
+            let (path1, path2) = (std::path::Path::new(&path1), std::path::Path::new(&path2));
+            swap_image_files(path1, path2)?;
+            Ok::<_, std::io::Error>((file_date_modified(path1), file_date_modified(path2)))
         })
         .await
         .map_err(|error| ServiceError::backend(error.to_string()))?
@@ -15822,6 +15823,9 @@ mod folder_get_result_tests {
             ("x\u{10000}", "x\u{e000}", std::cmp::Ordering::Greater),
             ("\u{10000}", "\u{10001}", std::cmp::Ordering::Less),
             ("\u{10000}", "\u{20000}", std::cmp::Ordering::Less),
+            // The long s keeps its case, so it sorts after every ASCII letter.
+            ("\u{17f}", "Z", std::cmp::Ordering::Greater),
+            ("\u{17f}", "s", std::cmp::Ordering::Greater),
         ] {
             assert_eq!(folder_ordinal_compare(Some(left), Some(right)), expected);
         }

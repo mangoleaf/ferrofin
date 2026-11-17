@@ -9,6 +9,8 @@
 //! that ranks TheMovieDb above OMDb for images, with both answered by an
 //! in-process stand-in through [`Config::provider_endpoints`]. Each serves a
 //! poster of its own size, which tells them apart.
+//!
+//! It also checks that an Identify candidate keeps TMDb's empty overview.
 
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -266,6 +268,72 @@ async fn identify_applies_the_chosen_results_poster() {
         "the chosen result's poster: {:?}",
         requests.lock().unwrap()
     );
+
+    api.post("/System/Shutdown", &Value::Null).await;
+    tokio::task::spawn_blocking(move || server.join().unwrap().unwrap())
+        .await
+        .unwrap();
+    mock.abort();
+}
+
+/// An Identify candidate TMDb has no overview for answers `"Overview": ""`
+/// over HTTP, as upstream's does (`Overview = movieResult.Overview`,
+/// `series.Overview`, `personResult.Biography`), on the name search and the
+/// Tmdb-id lookup.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn identify_keeps_tmdbs_empty_overview() {
+    let tmp = tempfile::tempdir().unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("http://{}", listener.local_addr().unwrap());
+    let stand_in = Router::new().fallback(|uri: Uri| async move {
+        let body = match uri.path() {
+            "/tmdb/search/movie" => json!({"results":[{"id":949,"title":"Heat","overview":""}]}),
+            "/tmdb/movie/949" => json!({"id":949,"title":"Heat","overview":""}),
+            "/tmdb/search/tv" => {
+                json!({"results":[{"id":1396,"name":"Breaking Bad","overview":""}]})
+            }
+            "/tmdb/person/31" => json!({"id":31,"name":"Tom Hanks","biography":""}),
+            _ => return (axum::http::StatusCode::NOT_FOUND, "{}").into_response(),
+        };
+        axum::Json(body).into_response()
+    });
+    let mock = tokio::spawn(async move { axum::serve(listener, stand_in).await.unwrap() });
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(30))
+        .build()
+        .unwrap();
+    let (server, base, _config) = boot::spawn_server(&client, |port| Config {
+        port,
+        provider_endpoints: ProviderEndpoints {
+            tmdb: Some(format!("{endpoint}/tmdb")),
+            ..ProviderEndpoints::offline()
+        },
+        ..Config::test_stub(tmp.path())
+    })
+    .await;
+    let api = Api::login(client, base).await;
+
+    for (kind, search_info) in [
+        ("Movie", json!({"Name":"Heat"})),
+        ("Movie", json!({"ProviderIds":{"Tmdb":"949"}})),
+        ("Series", json!({"Name":"Breaking Bad"})),
+        ("Person", json!({"ProviderIds":{"Tmdb":"31"}})),
+    ] {
+        let found: Value = api
+            .client
+            .post(format!("{}/Items/RemoteSearch/{kind}", api.base))
+            .header("Authorization", &api.auth)
+            .json(&json!({"SearchInfo":search_info,"SearchProviderName":"TheMovieDb"}))
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(found[0]["Overview"], "", "{kind} {search_info}: {found}");
+    }
 
     api.post("/System/Shutdown", &Value::Null).await;
     tokio::task::spawn_blocking(move || server.join().unwrap().unwrap())

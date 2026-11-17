@@ -1406,30 +1406,6 @@ async fn delete_one(state: &AppState, auth: &AuthorizationInfo, id: Uuid) -> Res
     Ok(())
 }
 
-/// Runs a delete request's work to completion even if the client goes away.
-///
-/// axum drops a handler's future when the connection closes, which could
-/// stop a delete between its files and its rows, or half way through its
-/// paths. The row delete itself is one transaction, but the `LibraryChanged`
-/// notice that follows its commit would be skipped, and a
-/// `DELETE /Items?ids=` would stop between two items. Upstream's controller
-/// does not observe `RequestAborted` here, so its delete finishes; the work
-/// runs on its own task, which the request only awaits.
-async fn run_to_completion<F>(work: F) -> Result<(), ApiError>
-where
-    F: std::future::Future<Output = Result<(), ApiError>> + Send + 'static,
-{
-    // The request awaits the task, so its logs and spans stay under the
-    // request's (LOGGING.md §4: a spawned future carries its span explicitly).
-    tokio::spawn(tracing::Instrument::in_current_span(work))
-        .await
-        .map_err(|e| {
-            ApiError::Service(ferrofin_traits::error::ServiceError::Backend(format!(
-                "delete task failed: {e}"
-            )))
-        })?
-}
-
 /// `DELETE /Items/{itemId}` — deletes one item from the library and the
 /// filesystem.
 ///
@@ -1461,7 +1437,11 @@ async fn delete_item(
     if auth.user.is_none() && !auth.is_api_key {
         return Err(ApiError::NotFound(format!("user {}", auth.user_id())));
     }
-    run_to_completion(async move { delete_one(&state, &auth, item_id).await }).await?;
+    // axum drops a handler's future when its client hangs up, which could stop
+    // a delete between its files and its rows, or skip the `LibraryChanged`
+    // notice after its commit. Upstream's controller does not read
+    // `RequestAborted`, so its delete finishes.
+    crate::handlers::run_detached(async move { delete_one(&state, &auth, item_id).await }).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -1502,11 +1482,12 @@ async fn delete_items(
         return Err(ApiError::Unauthorized("Unauthorized access".to_owned()));
     }
     let ids = parse_csv_uuids(query.ids.as_deref())?;
-    run_to_completion(async move {
+    // As in `delete_item`; a hang-up would also stop between two items.
+    crate::handlers::run_detached(async move {
         for id in ids {
             delete_one(&state, &auth, id).await?;
         }
-        Ok(())
+        Ok::<_, ApiError>(())
     })
     .await?;
     Ok(StatusCode::NO_CONTENT)
@@ -2915,26 +2896,5 @@ mod tests {
             sorted(&[c, a], &[], &[a, c, unasked, b]),
             [unasked, b, c, a]
         );
-    }
-
-    /// The delete's task runs inside the request's span, so its logs and
-    /// spans stay under `http_request` (LOGGING.md §4).
-    #[tokio::test]
-    async fn the_delete_task_runs_in_the_requests_span() {
-        use tracing::Instrument as _;
-        let _subscriber = tracing::subscriber::set_default(tracing_subscriber::registry());
-        let span = tracing::info_span!("http_request");
-        let seen = std::sync::Arc::new(std::sync::Mutex::new(None));
-        let record = std::sync::Arc::clone(&seen);
-        run_to_completion(async move {
-            *record.lock().expect("lock") = tracing::Span::current()
-                .metadata()
-                .map(tracing::Metadata::name);
-            Ok(())
-        })
-        .instrument(span)
-        .await
-        .expect("ran");
-        assert_eq!(*seen.lock().expect("lock"), Some("http_request"));
     }
 }

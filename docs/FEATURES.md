@@ -373,7 +373,12 @@ everything under it.
 - **Replace all metadata**: as **Search for missing metadata**, but the NFO's and the
   providers' values replace the item's unlocked values, and an unlocked field none of them
   supplies is cleared. When a provider failed and none answered (none could be reached,
-  say), nothing is cleared: the NFO's values still replace, and the rest stays.
+  say), nothing is cleared: the NFO's values still replace, and the rest stays. With
+  **Replace existing images** ticked, the item's artwork is removed first, so the refresh
+  supplies it afresh: the copies in Ferrofin's metadata folder, and the artwork beside the
+  item where Ferrofin saves it (beside a box set, playlist, genre, person or studio, and in
+  the media folder of a library that saves artwork into media folders, except a home-video
+  library with photos). A file beside the item that it does not list stays.
 
 Locks hold under all three choices. A field unticked under the metadata editor's **Enabled
 Fields** keeps its value. An item with **Lock this item to prevent future metadata

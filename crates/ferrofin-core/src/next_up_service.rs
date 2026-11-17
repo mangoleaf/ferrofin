@@ -42,7 +42,10 @@
 //! So 4 round-trips in the default configuration, 3 while the library set is
 //! cached; with none cached, a scope holding a parent other than a library
 //! with physical folders (the playlists folder the default scope lists, a
-//! view) adds the set's read, and specials add one more. Unlike
+//! view) adds the set's read, and specials add one more. A box set or
+//! playlist scope (gl-36) adds its `LinkedChildren` check, one root
+//! resolution read per level of linked folders, and the user's library scope
+//! (`scope_to_user_libraries`) before the keys statement. Unlike
 //! C#, the batch loads no full row: its picks and last watched episodes come
 //! from the projection and its specials from their own narrow statement, so an
 //! episode or special picked outside the requested page never has its row
@@ -64,7 +67,7 @@ use ferrofin_model::entities_media::airs_numbers;
 use uuid::Uuid;
 
 use ferrofin_traits::error::ServiceError;
-use ferrofin_traits::options::InternalItemsQuery;
+use ferrofin_traits::options::{DescendantQueryRoots, InternalItemsQuery};
 use ferrofin_traits::persistence::{
     NextUpEpisode, NextUpEpisodeBatchResult, NextUpEpisodeUserData, NextUpService,
 };
@@ -73,9 +76,15 @@ use ferrofin_db::enums::LinkedChildType;
 use sqlx::{QueryBuilder, Sqlite};
 
 use crate::db_error::db_err;
-use crate::item_repository::{library_top_parents_by_view, view_top_parent_ids};
+use crate::item_repository::{
+    has_linked_children, library_top_parents_by_view, resolve_descendant_query,
+    scope_to_user_libraries, view_top_parent_ids,
+};
 use crate::item_type_lookup::stored_type_name;
-use crate::translate_query::{PLACEHOLDER_ID, TopParentTerm, push_access_filter};
+use crate::translate_query::{
+    LINKED_DESCENDANT_IDS, PLACEHOLDER_ID, TopParentTerm, linked_descendant_binds,
+    push_access_filter,
+};
 
 /// The concrete next-up service.
 #[derive(Clone)]
@@ -196,6 +205,48 @@ impl FerrofinNextUpService {
             out.push(Uuid::parse_str(PLACEHOLDER_ID).unwrap_or_else(|_| Uuid::nil()));
         }
         Ok(out)
+    }
+
+    /// The scope of a box set or playlist `parentId` (gl-36): `None` when it
+    /// has no linked children, else the libraries in scope and its descendant
+    /// set.
+    ///
+    /// `SetTopParentIdsOrAncestors` sends a box set or playlist with linked
+    /// children to `DescendantOfId` (the episodes it links, and those under a
+    /// series or season it links), and any other one to `AncestorIds`. v12.4's
+    /// keys statement reads `TopParentIds` alone: the ancestor arm matches
+    /// nothing, and the descendant arm leaves `AddUserToQuery` to scope it to
+    /// every library the user has, so upstream answers the user's whole Next Up
+    /// there. Ferrofin keeps that library scope (the user's access) and also
+    /// applies the descendant set, as upstream's comment intends: an owner
+    /// decision (2026-11-02), recorded with the `/Shows/NextUp` parity row.
+    async fn linked_container_scope(
+        &self,
+        filter: &InternalItemsQuery,
+        user: &UserEntity,
+        container: Uuid,
+    ) -> Result<Option<(Vec<Uuid>, DescendantQueryRoots)>, ServiceError> {
+        if !has_linked_children(&self.db, container).await? {
+            return Ok(None);
+        }
+        let resolved = resolve_descendant_query(&self.db, filter).await?;
+        let filter = resolved.as_ref().unwrap_or(filter);
+        // Unresolved, the set must match nothing, never widen to every library.
+        let Some(roots) = filter.descendant_roots.clone() else {
+            return Ok(None);
+        };
+        let top_parents = if filter.top_parent_ids.is_empty() {
+            // `AddUserToQuery`: `DescendantOfId` is not one of its guards. No
+            // visibility evaluator: it only drops the playlists folder and a
+            // box-set library, which hold no episodes.
+            scope_to_user_libraries(&self.db, &self.virtual_paths, None, filter)
+                .await?
+                .map(|scoped| scoped.top_parent_ids)
+                .unwrap_or_default()
+        } else {
+            self.top_parent_ids(&filter.top_parent_ids, user).await?
+        };
+        Ok(Some((top_parents, roots)))
     }
 }
 
@@ -318,22 +369,36 @@ impl NextUpService for FerrofinNextUpService {
         let Some(user) = filter.user.as_ref() else {
             return Err(ServiceError::invalid_input("next-up requires a user"));
         };
-        if filter.top_parent_ids.is_empty() {
-            return Ok(Vec::new());
-        }
         let episode_type = Self::episode_type()?;
-        let top_parents = self.top_parent_ids(&filter.top_parent_ids, user).await?;
+        let (top_parents, descendants) = match filter.descendant_of_id {
+            Some(container) => match self.linked_container_scope(filter, user, container).await? {
+                Some((top_parents, roots)) => (top_parents, Some(roots)),
+                None => return Ok(Vec::new()),
+            },
+            None if filter.top_parent_ids.is_empty() => return Ok(Vec::new()),
+            None => (
+                self.top_parent_ids(&filter.top_parent_ids, user).await?,
+                None,
+            ),
+        };
 
         // Series (by presentation key) whose most-recently-played episode within
-        // the requested libraries is at/after the cutoff, newest first.
+        // the requested libraries (and box set) is at/after the cutoff, newest first.
         let top_parents = ferrofin_db::padded_in_list(&top_parents);
-        let sql = next_up_series_keys_sql(top_parents.len(), filter.limit.is_some());
+        let sql = next_up_series_keys_sql(
+            top_parents.len(),
+            descendants.is_some(),
+            filter.limit.is_some(),
+        );
         let mut query = sqlx::query_scalar::<_, String>(sqlx::AssertSqlSafe(sql))
             .bind(&user.id)
             .bind(episode_type)
             .bind(PLACEHOLDER_ID);
         for id in top_parents {
             query = query.bind(guid_to_db(*id));
+        }
+        for bind in descendants.iter().flat_map(linked_descendant_binds) {
+            query = query.bind(bind);
         }
         query = query.bind(datetime_to_db(date_cutoff));
         if let Some(limit) = filter.limit {
@@ -995,10 +1060,12 @@ fn first_after(positions: &[EpisodePos], after: Option<(i64, i64)>) -> Option<Ep
 }
 
 /// The series-keys aggregate for next-up, with `parents` bound `TopParentId`
-/// placeholders and, when `limited`, a trailing bound `LIMIT`.
+/// placeholders, when `descendants` the box set's descendant set
+/// (`LINKED_DESCENDANT_IDS`, gl-36), and when `limited` a trailing bound
+/// `LIMIT`.
 ///
-/// Bind order: user id, episode type, placeholder id, the parents, the cutoff,
-/// then the limit.
+/// Bind order: user id, episode type, placeholder id, the parents, the
+/// descendant set's three binds, the cutoff, then the limit.
 ///
 /// The v12 shape (`NextUpService.GetNextUpSeriesKeys`): `BaseItems` filtered
 /// on `(Type, TopParentId IN …)` joined to the user's `UserData`, grouped by
@@ -1014,7 +1081,7 @@ fn first_after(positions: &[EpisodePos], after: Option<(i64, i64)>) -> Option<Ep
 /// library, and iterated the `IN` list once per `UserData` row — 5,044 ×
 /// 1,975 index probes and 1.4 s on the bench fixture.
 #[must_use]
-pub fn next_up_series_keys_sql(parents: usize, limited: bool) -> String {
+pub fn next_up_series_keys_sql(parents: usize, descendants: bool, limited: bool) -> String {
     let mut sql = String::from(
         r#"SELECT bi."SeriesPresentationUniqueKey" AS key,
                   MAX(ud."LastPlayedDate") AS last_played
@@ -1026,8 +1093,14 @@ pub fn next_up_series_keys_sql(parents: usize, limited: bool) -> String {
              AND bi."TopParentId" IN ("#,
     );
     push_key_placeholders(&mut sql, parents);
+    sql.push(')');
+    if descendants {
+        sql.push_str(r#" AND bi."Id" IN ("#);
+        sql.push_str(&LINKED_DESCENDANT_IDS.join("?"));
+        sql.push_str("?)");
+    }
     sql.push_str(
-        r#") GROUP BY bi."SeriesPresentationUniqueKey"
+        r#" GROUP BY bi."SeriesPresentationUniqueKey"
            HAVING last_played IS NOT NULL AND last_played >= ?
            ORDER BY last_played DESC"#,
     );
@@ -1041,8 +1114,8 @@ pub fn next_up_series_keys_sql(parents: usize, limited: bool) -> String {
 mod tests {
     use super::FerrofinNextUpService;
     use crate::test_support::{
-        clear_index_number, corrupt_last_played_date, seed_episode, seed_item_with_data, seed_user,
-        seed_user_data, seed_user_with_defaults, test_db,
+        clear_index_number, corrupt_last_played_date, seed_episode, seed_folder_item,
+        seed_item_with_data, seed_user, seed_user_data, seed_user_with_defaults, test_db,
     };
     use chrono::{DateTime, Utc};
     use ferrofin_db::Database;
@@ -1273,6 +1346,123 @@ mod tests {
         };
         assert_eq!(next_up(tv_view).await, Some(guid_to_db(next)));
         assert_eq!(next_up(movies_view).await, None);
+    }
+
+    /// gl-36 (owner decision 2026-11-02): a box set or playlist scope with
+    /// linked children answers the series under its descendant set — a linked
+    /// series' episodes (through `AncestorIds`) and a linked episode itself —
+    /// within the user's libraries (`AddUserToQuery`), where v12.4's keys
+    /// statement ignores `DescendantOfId` and answers the user's whole Next Up.
+    /// One with no links is the ancestor arm, which the statement ignores:
+    /// nothing, as upstream.
+    #[tokio::test]
+    async fn series_keys_scope_a_linked_box_set_or_playlist_to_its_descendants() {
+        use ferrofin_traits::persistence::LinkedChildrenService as _;
+        let db = test_db().await;
+        let id = |n: u128| Uuid::from_u128(0x0036_0000 + n);
+        let (shows, blocked_shows) = (id(1), id(2));
+        for (library, name) in [(shows, "Shows"), (blocked_shows, "Blocked")] {
+            seed_item_with_data(
+                &db,
+                library,
+                BaseItemKind::CollectionFolder,
+                name,
+                r#"{"CollectionType":"tvshows"}"#,
+            )
+            .await;
+        }
+        let user = seed_user_with_defaults(&db, id(3)).await;
+        crate::user_entity_ext::set_preference(
+            &db,
+            &user.id,
+            PreferenceKind::BlockedMediaFolders,
+            &[guid_to_db(blocked_shows)],
+        )
+        .await
+        .expect("block");
+        let user_id = Uuid::parse_str(&user.id).unwrap();
+
+        // Three series, one episode of each played; the third in the library
+        // the user is blocked from.
+        let mut played = Vec::new();
+        for (n, key, library) in [
+            (10, "series-a", shows),
+            (20, "series-b", shows),
+            (30, "series-c", blocked_shows),
+        ] {
+            let series = id(n);
+            seed_folder_item(&db, series, BaseItemKind::Series, key, Some(library)).await;
+            for episode in 1..=2 {
+                let row = id(n + episode);
+                seed_episode(
+                    &db,
+                    row,
+                    key,
+                    1,
+                    i64::try_from(episode).unwrap(),
+                    false,
+                    Some(library),
+                )
+                .await;
+                exec(
+                    &db,
+                    r#"INSERT INTO "AncestorIds" ("ItemId", "ParentItemId") VALUES (?1, ?2)"#,
+                    &[&guid_to_db(row), &guid_to_db(series)],
+                )
+                .await;
+            }
+            seed_user_data(
+                &db,
+                user_id,
+                id(n + 1),
+                true,
+                Some(ts("2021-01-01T00:00:00Z")),
+            )
+            .await;
+            played.push(id(n + 1));
+        }
+
+        let (box_set, playlist, empty_set) = (id(40), id(41), id(42));
+        seed_folder_item(&db, box_set, BaseItemKind::BoxSet, "Set", None).await;
+        seed_folder_item(&db, playlist, BaseItemKind::Playlist, "List", None).await;
+        seed_folder_item(&db, empty_set, BaseItemKind::BoxSet, "Empty", None).await;
+        let links = crate::FerrofinLinkedChildrenService::new(db.clone());
+        for (parent, child) in [(box_set, id(10)), (box_set, id(30)), (playlist, played[1])] {
+            links
+                .upsert_linked_child(parent, child, 0)
+                .await
+                .expect("link");
+        }
+
+        let svc = FerrofinNextUpService::new(db);
+        let keys_limited = |container, limit| {
+            let query = InternalItemsQuery {
+                user: Some(std::sync::Arc::new(user.clone())),
+                descendant_of_id: Some(container),
+                limit,
+                ..Default::default()
+            };
+            let svc = svc.clone();
+            async move {
+                svc.get_next_up_series_keys(&query, ts("2000-01-01T00:00:00Z"))
+                    .await
+                    .expect("keys")
+            }
+        };
+        let keys = |container| keys_limited(container, None);
+        assert_eq!(
+            keys(box_set).await,
+            vec!["series-a".to_owned()],
+            "the linked series' episodes, never the blocked library's"
+        );
+        assert_eq!(keys(playlist).await, vec!["series-b".to_owned()]);
+        assert_eq!(keys(empty_set).await, Vec::<String>::new());
+        // The limit binds after the descendant set's three binds and the cutoff.
+        assert_eq!(
+            keys_limited(box_set, Some(1)).await,
+            vec!["series-a".to_owned()]
+        );
+        assert_eq!(keys_limited(box_set, Some(0)).await, Vec::<String>::new());
     }
 
     #[tokio::test]
