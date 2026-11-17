@@ -75,6 +75,16 @@ pub(crate) mod test_rows {
         .await
         .expect("read sqlite_master")
     }
+
+    /// Makes the writer's one connection read-only (`PRAGMA query_only`):
+    /// checkpoints still run on it, a `VACUUM` fails. Here for the same reason
+    /// as [`stat_tables`].
+    pub(crate) async fn query_only_writer(db: &Database) {
+        sqlx::query("PRAGMA query_only = ON")
+            .execute(db.writer())
+            .await
+            .expect("query_only");
+    }
 }
 
 #[cfg(test)]

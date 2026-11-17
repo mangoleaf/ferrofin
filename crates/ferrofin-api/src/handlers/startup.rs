@@ -218,15 +218,12 @@ async fn set_remote_access(
     let document = serde_json::to_value(&config).map_err(|e| {
         ApiError::from(ferrofin_traits::error::ServiceError::backend(e.to_string()))
     })?;
-    tokio::spawn(crate::handlers::config::save_named_configuration(
+    crate::handlers::run_detached(crate::handlers::config::save_named_configuration(
         state,
         "network".to_owned(),
         document,
     ))
-    .await
-    .map_err(|error| {
-        ferrofin_traits::error::ServiceError::backend(format!("configuration worker: {error}"))
-    })??;
+    .await?;
     Ok(StatusCode::NO_CONTENT)
 }
 

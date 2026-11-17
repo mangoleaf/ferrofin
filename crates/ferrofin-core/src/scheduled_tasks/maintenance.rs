@@ -473,9 +473,14 @@ impl ScheduledTask for DeleteTranscodeFileTask {
 
 /// "Optimize database" — compacts the database and truncates free space. Port
 /// of `OptimizeDatabaseTask` + the SQLite provider's `RunScheduledOptimisation`
-/// (`VACUUM`, WAL checkpoint truncation). Before the vacuum it also prunes
-/// Ferrofin's own `FerrofinPlaybackSessions` rows (no upstream equivalent)
-/// older than `ActivityLogRetentionDays`.
+/// (WAL checkpoint truncation, `VACUUM`, truncation again). Before the
+/// vacuum the task also prunes Ferrofin's own `FerrofinPlaybackSessions` rows
+/// (no upstream equivalent) older than `ActivityLogRetentionDays`.
+///
+/// Upstream sets `temp_store=1` around its vacuum to undo its connections'
+/// in-memory default. Ferrofin's bundled SQLite keeps temporary files on disk
+/// already, so its vacuum copy goes to SQLite's temporary directory as
+/// upstream's does (pinned by `ferrofin-db`'s `temp_store_stays_on_disk`).
 ///
 /// Accepted divergence (owner decision, 2026-11-11): Jellyfin 12.x's
 /// `OptimizeAsync` also runs a full `ANALYZE` (under `analysis_limit=0`, once
@@ -593,18 +598,30 @@ impl ScheduledTask for OptimizeDatabaseTask {
             }
         }
         tracing::info!("optimizing and vacuuming the database");
-        // Unlike upstream, no `ANALYZE`, and no `PRAGMA optimize` either: see
-        // the type's doc.
-        sqlx::query("VACUUM")
-            .execute(self.db.writer())
-            .await
-            .map_err(db_err)?;
-        progress.report(75.0);
-        // `PRAGMA wal_checkpoint(TRUNCATE)`, in turn with the background
-        // checkpoints: the vacuum's commit has just started one, which the
-        // truncation would otherwise answer busy against.
-        self.db.truncate_wal().await.map_err(ServiceError::from)?;
-        progress.report(100.0);
+        let optimized: Result<(), ServiceError> = async {
+            // `OptimizeAsync` empties the log before the vacuum, which then
+            // writes its copy of the database into it.
+            self.db.truncate_wal().await.map_err(ServiceError::from)?;
+            // Unlike upstream, no `ANALYZE`, and no `PRAGMA optimize` either:
+            // see the type's doc.
+            sqlx::query("VACUUM")
+                .execute(self.db.writer())
+                .await
+                .map_err(db_err)?;
+            progress.report(75.0);
+            // `PRAGMA wal_checkpoint(TRUNCATE)`, in turn with the background
+            // checkpoints: the vacuum's commit has just started one, which the
+            // truncation would otherwise answer busy against.
+            self.db.truncate_wal().await.map_err(ServiceError::from)?;
+            progress.report(100.0);
+            Ok(())
+        }
+        .await;
+        // `ExecuteAsync` catches whatever the optimisation throws and logs it,
+        // so a failed vacuum or checkpoint still ends the run `Completed`.
+        if let Err(error) = optimized {
+            tracing::error!(%error, "could not optimize the database");
+        }
         Ok(())
     }
 }
@@ -1424,6 +1441,83 @@ mod tests {
         let progress = TaskProgress::default();
         task.execute(&progress).await.expect("run");
         assert!((progress.current() - 100.0).abs() < f64::EPSILON);
+    }
+
+    /// `OptimizeDatabaseTask.ExecuteAsync` catches whatever the optimisation
+    /// throws and logs it, so a failed vacuum still ends the run `Completed`.
+    /// `OptimizeAsync` empties the write-ahead log before the vacuum. The
+    /// vacuum fails here and the trailing truncation never runs, so an empty
+    /// log can only come from the leading one.
+    #[tokio::test]
+    async fn optimize_database_completes_when_the_vacuum_fails() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let file = dir.path().join("jellyfin.db");
+        let db = Database::connect(&format!("sqlite://{}?mode=rwc", file.display()))
+            .await
+            .expect("connect");
+        db.run_migrations().await.expect("migrate");
+        test_rows::insert(&db, "recent", Utc::now()).await;
+        let wal = dir.path().join("jellyfin.db-wal");
+        assert!(
+            std::fs::metadata(&wal).expect("wal").len() > 0,
+            "the log holds the last write"
+        );
+        let task = OptimizeDatabaseTask::new(
+            db.clone(),
+            idle_sessions(),
+            crate::test_support::library_manager_over(db.clone()),
+            retention_days(None),
+        );
+        // On the one writer connection: the checkpoints still run, the vacuum
+        // cannot write.
+        test_rows::query_only_writer(&db).await;
+        let logs = crate::test_support::CapturedLogs::default();
+        let _guard = tracing::subscriber::set_default(
+            tracing_subscriber::fmt()
+                .with_writer(logs.clone())
+                .with_ansi(false)
+                .finish(),
+        );
+        let progress = TaskProgress::default();
+        task.execute(&progress)
+            .await
+            .expect("a failed optimisation is logged, not returned");
+        assert_eq!(progress.reported(), None, "the vacuum did not go through");
+        assert_eq!(
+            std::fs::metadata(&wal).expect("wal").len(),
+            0,
+            "the log was emptied before the vacuum"
+        );
+        let failures: Vec<String> = logs
+            .text()
+            .lines()
+            .filter(|line| line.contains("could not optimize the database"))
+            .map(str::to_owned)
+            .collect();
+        assert_eq!(failures.len(), 1, "logged once: {failures:?}");
+        assert!(
+            failures[0].contains("ERROR") && failures[0].contains("readonly"),
+            "at error, with the error: {failures:?}"
+        );
+    }
+
+    /// A failed checkpoint is caught as a failed vacuum is: the leading one
+    /// runs in the same block.
+    #[tokio::test]
+    async fn optimize_database_completes_when_the_checkpoint_fails() {
+        let db = test_db().await;
+        let task = OptimizeDatabaseTask::new(
+            db.clone(),
+            idle_sessions(),
+            crate::test_support::library_manager_over(db.clone()),
+            retention_days(None),
+        );
+        db.writer().close().await;
+        let progress = TaskProgress::default();
+        task.execute(&progress)
+            .await
+            .expect("a failed checkpoint is logged, not returned");
+        assert_eq!(progress.reported(), None, "no step went through");
     }
 
     /// Ferrofin's playback-decision rows expire with the activity log: the

@@ -602,3 +602,71 @@ async fn the_nfos_artwork_goes_into_the_media_folder_only_with_the_librarys_opt_
         "the mkv, the nfo, the poster"
     );
 }
+
+/// gl-1741: "Replace all metadata" with "Replace existing images" removes the
+/// movie's artwork beside it before the pass supplies it afresh
+/// (`RemoveImages`' `IsSaveLocalMetadataEnabled()` arm), only when the
+/// library saves artwork into its media folders: then the NFO's poster
+/// saved there and the user's `fanart.jpg` the movie lists go, and without
+/// the opt-in the media folder is left as it is. A file the movie does not
+/// list stays either way.
+#[rstest::rstest]
+#[case::not_opted_in(false)]
+#[case::opted_in(true)]
+#[tokio::test(flavor = "multi_thread")]
+async fn replacing_all_images_removes_the_art_beside_the_movie_only_with_the_librarys_opt_in(
+    #[case] save_local: bool,
+) {
+    let f = Fixture::saving_local_metadata(save_local, |host| {
+        format!(
+            "<movie><title>Heat</title><thumb aspect=\"poster\">{host}/png/poster.png</thumb></movie>"
+        )
+    })
+    .await;
+    let fanart = f.folder().join("fanart.jpg");
+    let unlisted = f.folder().join("notes.txt");
+    std::fs::write(&fanart, PNG).expect("fanart");
+    std::fs::write(&unlisted, b"mine").expect("notes");
+    let scanner = f.scanner().with_image_saver(f.saver().await);
+    Box::pin(scanner.scan_all()).await.expect("scan");
+    let images = f.images().await;
+    let poster = images
+        .iter()
+        .find(|image| image.image_type == ImageType::Primary)
+        .map(|image| std::path::PathBuf::from(&image.path))
+        .expect("the NFO's poster");
+    assert_eq!(poster.starts_with(f.folder()), save_local, "{images:?}");
+    assert!(
+        images
+            .iter()
+            .any(|image| image.image_type == ImageType::Backdrop
+                && std::path::Path::new(&image.path) == fanart),
+        "{images:?}"
+    );
+
+    let replace = MetadataRefreshOptions::for_item_refresh(
+        MetadataRefreshMode::FullRefresh,
+        MetadataRefreshMode::FullRefresh,
+        true,
+        true,
+        false,
+    );
+    Box::pin(scanner.scan_with(None, &replace))
+        .await
+        .expect("replace all");
+
+    assert_eq!(fanart.exists(), !save_local, "the listed fanart");
+    assert!(unlisted.exists(), "a file the movie does not list stays");
+    // The poster in the metadata folder goes either way and the NFO's is
+    // saved again, unless the library saves local metadata: "Replace all
+    // metadata" then reads no NFO (`MetadataService.cs:802-803`).
+    assert_eq!(poster.exists(), !save_local, "{}", poster.display());
+    assert_eq!(f.asked("/png/poster.png"), if save_local { 1 } else { 2 });
+    let backdrops = f
+        .images()
+        .await
+        .iter()
+        .filter(|image| image.image_type == ImageType::Backdrop)
+        .count();
+    assert_eq!(backdrops, usize::from(!save_local));
+}

@@ -54,11 +54,13 @@ use crate::auth::{RequireAdmin, RequireLiveTvAccess, RequireLiveTvManagement};
 use crate::error::ApiError;
 use crate::extract::{
     DotnetGuid, JsonBody, ProblemDetails, Query, RequiredRouteString, RouteParameter,
+    blank_complaint, route_container_complaint, validation_failure,
 };
 use crate::handlers::items::{require_visible_item, resolve_user_opt};
 use crate::handlers::query_parse::{
     get_order_by, parse_csv_enums_lenient, parse_csv_uuids, parse_order_by, parse_pipe_strings,
 };
+use crate::handlers::streaming::stream_route_container;
 use crate::state::AppState;
 
 /// `GET /LiveTv/Info` — top-level Live TV status.
@@ -1605,25 +1607,6 @@ pub(crate) fn progressive_response(
         .unwrap_or_else(|_| Response::new(Body::empty()))
 }
 
-/// The container extension of a `stream.{container}` route segment, validated
-/// the way upstream's `[RegularExpression(ContainerValidationRegexStr)]` does.
-fn route_container(segment: &str) -> Option<&str> {
-    let container = segment.rsplit_once('.').map_or(segment, |(_, ext)| ext);
-    // `^[a-zA-Z0-9\-\._,|]{0,40}$` — empty is allowed, as it is upstream.
-    let valid = container.len() <= 40
-        && container
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_' | b',' | b'|'));
-    valid.then_some(container)
-}
-
-/// `{streamId}`, the `[FromRoute, Required] string` of `GetLiveStreamFile`.
-struct StreamId;
-
-impl RouteParameter for StreamId {
-    const NAME: &'static str = "streamId";
-}
-
 /// `GET /LiveTv/LiveStreamFiles/{streamId}/stream.{container}` — the buffered
 /// live-stream file.
 ///
@@ -1637,14 +1620,24 @@ impl RouteParameter for StreamId {
 /// the server's own ffmpeg reads this URL without a token. It exposes only a
 /// live stream a caller already opened, and the unique id is an unguessable
 /// per-open GUID.
+///
+/// Its `[FromRoute, Required] string streamId` and its `container`
+/// ([`route_container_complaint`]) are bound first, and every failure is named
+/// in one `400`; a segment without the `stream.` literal is no match for the
+/// route, a `404`.
 async fn get_live_stream_file(
     State(state): State<AppState>,
-    RequiredRouteString(stream_id, _): RequiredRouteString<StreamId>,
-    Path((_, container)): Path<(String, String)>,
+    Path((stream_id, segment)): Path<(String, String)>,
 ) -> Result<Response, ApiError> {
-    let Some(container) = route_container(&container) else {
-        return Err(ApiError::NotFound("live stream file".into()));
-    };
+    let container = stream_route_container(&segment)
+        .ok_or_else(|| ApiError::NotFound("live stream file".into()))?;
+    if let Some(rejection) = validation_failure(
+        blank_complaint("streamId", &stream_id)
+            .into_iter()
+            .chain(route_container_complaint(container)),
+    ) {
+        return Ok(rejection);
+    }
     live_stream_buffer(&state, &stream_id, &format!("file.{container}")).await
 }
 
@@ -2797,7 +2790,6 @@ mod tests {
         // anonymous and reports only "no such stream".
         let file = get_live_stream_file(
             State(fake_state()),
-            RequiredRouteString("s1".into(), std::marker::PhantomData),
             Path(("s1".into(), "stream.mp4".into())),
         )
         .await
@@ -2805,28 +2797,10 @@ mod tests {
         assert_eq!(file.status(), axum::http::StatusCode::NOT_FOUND);
         // A manager with nothing open says the same.
         let state = fake_state().with_live_tv(std::sync::Arc::new(FakeLiveTv::default()));
-        let file = get_live_stream_file(
-            State(state),
-            RequiredRouteString("s1".into(), std::marker::PhantomData),
-            Path(("s1".into(), "stream.ts".into())),
-        )
-        .await
-        .unwrap_err();
+        let file = get_live_stream_file(State(state), Path(("s1".into(), "stream.ts".into())))
+            .await
+            .unwrap_err();
         assert_eq!(file.status(), axum::http::StatusCode::NOT_FOUND);
-    }
-
-    #[test]
-    fn the_route_container_is_the_validated_extension() {
-        assert_eq!(route_container("stream.ts"), Some("ts"));
-        assert_eq!(route_container("stream.mp4"), Some("mp4"));
-        // No dot: the whole segment is the container, as upstream's route would
-        // have bound it.
-        assert_eq!(route_container("ts"), Some("ts"));
-        // Upstream's regex is `{0,40}`, so an empty container is legal (and
-        // simply has no known MIME type).
-        assert_eq!(route_container("stream."), Some(""));
-        assert_eq!(route_container("stream.a/b"), None);
-        assert_eq!(route_container(&format!("stream.{}", "x".repeat(41))), None);
     }
 
     /// The first chunk a progressive body yields. Only the first: the body is
@@ -2861,7 +2835,6 @@ mod tests {
 
         let response = get_live_stream_file(
             State(state),
-            RequiredRouteString("uid-1".to_owned(), std::marker::PhantomData),
             Path(("uid-1".to_owned(), "stream.ts".to_owned())),
         )
         .await
@@ -2907,7 +2880,6 @@ mod tests {
 
         let response = get_live_stream_file(
             State(state),
-            RequiredRouteString("uid-1".to_owned(), std::marker::PhantomData),
             Path(("uid-1".to_owned(), "stream.ts".to_owned())),
         )
         .await

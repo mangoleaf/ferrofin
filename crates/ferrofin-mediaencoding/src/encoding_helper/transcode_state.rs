@@ -321,8 +321,6 @@ pub struct EncodingJobInfo {
     pub output_audio_channels: Option<i32>,
     /// The output container (`OutputContainer`).
     pub output_container: Option<String>,
-    /// The output video sync mode (`OutputVideoSync`).
-    pub output_video_sync: Option<String>,
     /// The output file path (`OutputFilePath`).
     pub output_file_path: String,
     /// The input container (`InputContainer`).
@@ -746,7 +744,6 @@ mod derived_state_tests {
             output_audio_bitrate: None,
             output_audio_channels: None,
             output_container: None,
-            output_video_sync: None,
             output_file_path: String::new(),
             input_container: None,
             is_input_video: true,

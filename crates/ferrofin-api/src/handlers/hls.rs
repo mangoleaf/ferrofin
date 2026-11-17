@@ -43,8 +43,8 @@ use uuid::Uuid;
 use crate::auth::RequireAuth;
 use crate::error::ApiError;
 use crate::extract::{
-    DotnetGuid, Query, RequiredRouteString, RouteParameter, StreamPattern, blank_complaint,
-    blank_route_values, pattern_complaint, validation_failure,
+    DotnetGuid, Query, RequiredRouteString, RouteParameter, StreamPattern, blank_route_values,
+    pattern_complaint, route_container_complaint, validation_failure,
 };
 use crate::handlers::streaming::{opened_file_response, require_streamable_item};
 use crate::state::AppState;
@@ -500,11 +500,12 @@ fn build_audio_request(
 /// The [`pattern_complaint`]s about the `[RegularExpression]` parameters of a
 /// `DynamicHlsController` action or a `/Videos|Audio/{itemId}/stream[.{container}]`
 /// one: `segmentContainer`, `audioCodec`, `level`, `videoCodec` and
-/// `subtitleCodec` on each, and `container` where the action declares one (a
-/// stream route's query or route value, the live playlist's query, a
-/// segment's route `{container}`). The master and variant playlists declare
-/// none, so they pass `None` and leave a `container` query unread, as
-/// upstream does.
+/// `subtitleCodec` on each, and a `container` query where the action declares
+/// one (the bare stream routes, the live playlist). A route `{container}` is
+/// [`route_container_failures`]'s, which passes `None` here; only
+/// [`transcode_stream_fallback`]'s second check reads it again. The master and
+/// variant playlists declare none, so they pass `None` and leave a `container`
+/// query unread, as upstream does.
 fn stream_pattern_complaints<'a>(
     request: &'a HlsStreamRequest,
     container: Option<&'a str>,
@@ -539,10 +540,25 @@ pub(crate) fn stream_pattern_failures(
     validation_failure(stream_pattern_complaints(request, container))
 }
 
-/// [`stream_pattern_failures`] for an `hls1` segment, whose `[Required]`
-/// `{container}` is the text after the last `.` of `{segmentId}.{container}`,
-/// as ASP.NET splits it: a blank one is the required-field complaint, filed
-/// beside the other parameters' in one body.
+/// [`stream_pattern_failures`] for an action whose `container` is a route
+/// value (`stream.{container}`, a segment's `{container}`): the
+/// [`route_container_complaint`] about it, filed beside the other parameters'
+/// in one body. Shared with the `videos` and `audio` stream handlers.
+pub(crate) fn route_container_failures(
+    request: &HlsStreamRequest,
+    container: Option<&str>,
+) -> Option<Response> {
+    validation_failure(
+        container
+            .and_then(route_container_complaint)
+            .into_iter()
+            .chain(stream_pattern_complaints(request, None)),
+    )
+}
+
+/// [`route_container_failures`] for an `hls1` segment, whose `{container}` is
+/// the text after the last `.` of `{segmentId}.{container}`, as ASP.NET
+/// splits it.
 fn segment_pattern_failures(request: &HlsStreamRequest, segment_id: &str) -> Option<Response> {
     // Either half empty is no match for upstream's route (its 404), so there is
     // no container to check; the `{segmentId}` binding itself is not ported.
@@ -550,13 +566,7 @@ fn segment_pattern_failures(request: &HlsStreamRequest, segment_id: &str) -> Opt
         .rsplit_once('.')
         .filter(|(id, container)| !id.is_empty() && !container.is_empty())
         .map(|(_, container)| container);
-    let blank = container.and_then(|container| blank_complaint("container", container));
-    let patterned = container.filter(|_| blank.is_none());
-    validation_failure(
-        blank
-            .into_iter()
-            .chain(stream_pattern_complaints(request, patterned)),
-    )
+    route_container_failures(request, container)
 }
 
 /// Serves the transcode branch of a direct-play stream route.

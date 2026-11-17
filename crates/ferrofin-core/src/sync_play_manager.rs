@@ -1176,19 +1176,15 @@ impl Group {
         start_position_ticks: i64,
         now: DateTime<Utc>,
     ) -> Vec<Outbound> {
-        self.enter_waiting(prev);
-        self.resume_playing = true;
-        // `Group.SetPlayQueue` (Group.cs:489-512) refuses an empty queue or an
-        // out-of-range position; the state machine then broadcasts nothing and
-        // settles per `restore_after_failed_queue_change` — which is NOT `prev`
-        // when `prev` was `Waiting` (WaitingGroupState.cs:139-152).
-        let out_of_range =
-            usize::try_from(position).map_or(true, |p| queue.is_empty() || p >= queue.len());
-        self.position_jumped = !out_of_range;
-        if out_of_range {
-            self.restore_after_failed_queue_change(prev);
+        // `Group.SetPlayQueue` (Group.cs:543-566) refuses an empty queue or an
+        // out-of-range position first.
+        if usize::try_from(position).map_or(true, |p| queue.is_empty() || p >= queue.len()) {
+            self.refuse_play(prev);
             return Vec::new();
         }
+        self.enter_waiting(prev);
+        self.resume_playing = true;
+        self.position_jumped = true;
         self.queue.set(queue, position);
         self.position_ticks = start_position_ticks;
         self.last_activity = now;
@@ -1199,6 +1195,19 @@ impl Group {
         // update is `AllGroup`, so the order is only visible to `AllReady` peers.
         self.set_all_buffering(true);
         out
+    }
+
+    /// A `SetNewQueue` that `Group.SetPlayQueue` refuses: an out-of-range
+    /// position ([`Group::handle_play`]) or a queue a member cannot see (the
+    /// manager's `handle_request` checks that off the registry lock).
+    /// The `WaitingGroupState` every state hands the Play to broadcasts nothing
+    /// and settles per `restore_after_failed_queue_change`, which is NOT `prev`
+    /// when `prev` was `Waiting` (WaitingGroupState.cs:132-160).
+    fn refuse_play(&mut self, prev: GroupStateType) {
+        self.enter_waiting(prev);
+        self.resume_playing = true;
+        self.position_jumped = false;
+        self.restore_after_failed_queue_change(prev);
     }
 
     /// `POST /SyncPlay/SetPlaylistItem` — `AbstractGroupState.cs:61-66` delegates
@@ -2409,7 +2418,7 @@ impl SyncPlayManager for FerrofinSyncPlayManager {
     ) -> Result<(), ServiceError> {
         let now = Utc::now();
         // A request that puts new items in the queue is refused unless *every*
-        // member can see them (C# `SetPlayQueue`/`Queue` ->
+        // member can see them (C# `SetPlayQueue`/`AddToPlayQueue` ->
         // `AllUsersHaveAccessToQueue`, which return false and broadcast nothing).
         // `SetPlayQueue` refuses an out-of-range position before that check, so
         // such a request skips it (and reaches the state machine's refusal).
@@ -2437,14 +2446,14 @@ impl SyncPlayManager for FerrofinSyncPlayManager {
         let mut checked = std::collections::HashSet::new();
         let plan = {
             let mut reg = loop {
-                let unchecked: Vec<Uuid> = {
+                let (group_id, unchecked) = {
                     let reg = self.lock();
+                    let group_id = reg.session_to_group.get(&session.session_id).copied();
                     let unchecked: Vec<Uuid> = if incoming.is_empty() {
                         Vec::new()
                     } else {
-                        reg.session_to_group
-                            .get(&session.session_id)
-                            .and_then(|id| reg.groups.get(id))
+                        group_id
+                            .and_then(|id| reg.groups.get(&id))
                             .map(Group::member_user_ids)
                             .unwrap_or_default()
                             .into_iter()
@@ -2454,7 +2463,7 @@ impl SyncPlayManager for FerrofinSyncPlayManager {
                     if unchecked.is_empty() {
                         break reg;
                     }
-                    unchecked
+                    (group_id, unchecked)
                 };
                 // For a member with no user (an API key's session) this is a 400.
                 // For a Play, upstream throws it after an Idle, Playing or Paused
@@ -2462,14 +2471,26 @@ impl SyncPlayManager for FerrofinSyncPlayManager {
                 // state change is a Jellyfin bug, not ported: the group keeps its
                 // state.
                 if !self.all_members_have_access(&unchecked, incoming).await? {
-                    // Upstream logs and returns to the previous state without
-                    // broadcasting (`WaitingGroupState.HandleRequest` on a failed
-                    // `SetPlayQueue`), so the refusal is only visible in the log.
+                    // Upstream broadcasts nothing, so the refusal is only
+                    // visible in the log.
                     tracing::warn!(
                         session_id = %session.session_id,
                         items = incoming.len(),
                         "sync-play queue change refused: a member cannot access the items"
                     );
+                    // A Play still changes the state of the group whose members
+                    // were checked; a Queue changes nothing
+                    // (`AbstractGroupState.cs:114-122`). A session that left or
+                    // moved meanwhile is dropped, as upstream drops a request
+                    // whose session left its group while it waited for the lock.
+                    if matches!(request, PlaybackRequest::Play { .. }) {
+                        let mut reg = self.lock();
+                        if reg.session_to_group.get(&session.session_id).copied() == group_id
+                            && let Some(group) = group_id.and_then(|id| reg.groups.get_mut(&id))
+                        {
+                            group.refuse_play(group.state);
+                        }
+                    }
                     return Ok(());
                 }
                 checked.extend(unchecked);
@@ -5428,6 +5449,122 @@ mod tests {
             GroupStateType::Idle,
             "and leaves the group in its previous state"
         );
+    }
+
+    /// The access refusal settles the state as the out-of-range one does
+    /// (`WaitingGroupState.HandleRequest` on a failed `SetPlayQueue`): a
+    /// `Waiting` group goes `Idle`, and still nobody is told.
+    #[tokio::test]
+    async fn a_queue_change_a_member_cannot_see_takes_a_waiting_group_idle() {
+        let (m, bus, db, _library) = access_mgr().await;
+        let owner = db_session(&db, "s1", "alice").await;
+        let other = db_session(&db, "s2", "bob").await;
+        let movie = seed_movie(&db, "Movie").await;
+        let info = m.new_group(&owner, "movie night", None).await.unwrap();
+        m.join_group(&other, info.group_id).await.unwrap();
+        set_queue(&m, &owner, vec![movie]).await;
+        let state = || async { m.get_group(&owner, info.group_id).await.unwrap().state };
+        assert_eq!(state().await, GroupStateType::Waiting);
+        bus.sent.lock().unwrap().clear();
+
+        m.handle_request(&owner, play(1)).await.unwrap();
+        assert!(
+            bus.sent.lock().unwrap().is_empty(),
+            "a refused queue change broadcasts nothing"
+        );
+        assert_eq!(state().await, GroupStateType::Idle);
+    }
+
+    /// ...while a refused Queue changes no state at all
+    /// (`AbstractGroupState.cs:114-122`).
+    #[tokio::test]
+    async fn a_queue_a_member_cannot_see_leaves_a_waiting_group_waiting() {
+        let (m, bus, db, _library) = access_mgr().await;
+        let owner = db_session(&db, "s1", "alice").await;
+        let other = db_session(&db, "s2", "bob").await;
+        let movie = seed_movie(&db, "Movie").await;
+        let info = m.new_group(&owner, "movie night", None).await.unwrap();
+        m.join_group(&other, info.group_id).await.unwrap();
+        set_queue(&m, &owner, vec![movie]).await;
+        bus.sent.lock().unwrap().clear();
+
+        let unseen = PlaybackRequest::Queue {
+            item_ids: vec![Uuid::new_v4()],
+            mode: GroupQueueMode::Queue,
+        };
+        m.handle_request(&owner, unseen).await.unwrap();
+        assert!(bus.sent.lock().unwrap().is_empty());
+        assert_eq!(
+            m.get_group(&owner, info.group_id).await.unwrap().state,
+            GroupStateType::Waiting
+        );
+        assert_eq!(queue_of(&m, info.group_id), vec![movie]);
+    }
+
+    /// A `Playing` group settles into a FRESH `PlayingGroupState`, so its
+    /// per-state `IgnoreBuffering` is gone.
+    #[tokio::test]
+    async fn a_queue_change_a_member_cannot_see_resets_a_playing_group() {
+        let (m, bus, db, _library) = access_mgr().await;
+        let owner = db_session(&db, "s1", "alice").await;
+        let other = db_session(&db, "s2", "bob").await;
+        let movie = seed_movie(&db, "Movie").await;
+        let info = m.new_group(&owner, "movie night", None).await.unwrap();
+        m.join_group(&other, info.group_id).await.unwrap();
+        set_queue(&m, &owner, vec![movie]).await;
+        let pli = playing_item_id(&bus);
+        for s in [&owner, &other] {
+            m.handle_request(s, ready_at(pli, 0, true)).await.unwrap();
+        }
+        let group = || {
+            let reg = m.lock();
+            let g = &reg.groups[&info.group_id];
+            (g.state, g.ignore_buffering)
+        };
+        assert_eq!(group().0, GroupStateType::Playing);
+        m.lock()
+            .groups
+            .get_mut(&info.group_id)
+            .unwrap()
+            .ignore_buffering = true;
+        bus.sent.lock().unwrap().clear();
+
+        m.handle_request(&owner, play(1)).await.unwrap();
+        assert!(bus.sent.lock().unwrap().is_empty());
+        assert_eq!(group(), (GroupStateType::Playing, false));
+    }
+
+    /// The refusal belongs to the group whose members were checked. A
+    /// requester that moved to another group during the check is dropped, as
+    /// upstream's `SyncPlayManager.HandleRequest` drops it, so the group it
+    /// moved to keeps its state.
+    #[tokio::test]
+    async fn a_refused_queue_change_leaves_the_group_its_requester_moved_to_alone() {
+        let (m, _bus, db, _library) = access_mgr().await;
+        let owner = db_session(&db, "s1", "alice").await;
+        let other = db_session(&db, "s2", "bob").await;
+        let host = db_session(&db, "s3", "carol").await;
+        let movie = seed_movie(&db, "Movie").await;
+        let first = m.new_group(&owner, "first", None).await.unwrap();
+        m.join_group(&other, first.group_id).await.unwrap();
+        let second = m.new_group(&host, "second", None).await.unwrap();
+        set_queue(&m, &host, vec![movie]).await;
+        let state = || async { m.get_group(&host, second.group_id).await.unwrap().state };
+        assert_eq!(state().await, GroupStateType::Waiting);
+
+        during_access_check(
+            &m,
+            async { m.handle_request(&owner, play(1)).await.unwrap() },
+            async { m.join_group(&owner, second.group_id).await.unwrap() },
+        )
+        .await;
+
+        assert_eq!(
+            m.lock().session_to_group.get(&owner.session_id),
+            Some(&second.group_id),
+            "the requester moved during the check"
+        );
+        assert_eq!(state().await, GroupStateType::Waiting);
     }
 
     /// `SetPlayQueue` refuses an out-of-range position before it checks

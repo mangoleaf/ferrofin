@@ -256,6 +256,12 @@ impl Tmdb {
                         "200 OK",
                         r#"{"movie_results": [{"id": 949}], "tv_results": []}"#.to_owned(),
                     )
+                } else if line.contains("/find/") {
+                    // An IMDb id TMDb has no title for.
+                    (
+                        "200 OK",
+                        r#"{"movie_results": [], "tv_results": []}"#.to_owned(),
+                    )
                 } else if line.contains("/movie/603?") {
                     ("200 OK", details_json("The Matrix"))
                 } else if line.contains("/movie/949?") {
@@ -2125,6 +2131,42 @@ async fn identify_with_an_imdb_id_resolves_through_tmdb_find() {
     assert_eq!(
         edited_fields(&fx, &fx.matrix).await.0.as_deref(),
         Some("About Heat.")
+    );
+}
+
+/// A movie whose IMDb id TMDb's `/find` resolves to no title gets no TMDb
+/// metadata: `TmdbMovieProvider.GetMetadata` searches by name only when the
+/// movie has neither a TMDb nor an IMDb id (`TmdbMovieProvider.cs:160`), and
+/// returns an empty result when `/find` finds nothing (`:178-190`). A title
+/// search would pin whatever film matches the name, Heat here.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_movie_imdb_id_tmdb_cannot_resolve_is_not_searched_by_name() {
+    let tmp = tempfile::tempdir().expect("tmp");
+    let fx = scanned_once(tmp.path(), 0).await;
+    let chosen = ferrofin_model::providers::RemoteSearchResult {
+        name: Some("Heat".into()),
+        provider_ids: Some(HashMap::from([("Imdb".to_owned(), "tt0000404".to_owned())])),
+        search_provider_name: Some("The Open Movie Database".into()),
+        ..Default::default()
+    };
+    refresh_item(&fx, &fx.matrix, &apply(chosen)).await;
+    let asked = fx.tmdb.take();
+    assert!(
+        asked.iter().any(|l| l.contains("/find/tt0000404")),
+        "{asked:?}"
+    );
+    assert!(asked.iter().all(|l| !l.contains("/search/")), "{asked:?}");
+    assert!(asked.iter().all(|l| !l.contains("/movie/")), "{asked:?}");
+    assert_ne!(
+        edited_fields(&fx, &fx.matrix).await.0.as_deref(),
+        Some("About Heat.")
+    );
+    assert!(
+        provider_ids(&fx, &fx.matrix)
+            .await
+            .iter()
+            .all(|(key, _)| key != "Tmdb"),
+        "no TMDb id was guessed"
     );
 }
 
