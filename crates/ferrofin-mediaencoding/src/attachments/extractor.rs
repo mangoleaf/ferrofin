@@ -112,51 +112,6 @@ pub trait AttachmentIo: Send + Sync {
     ) -> Result<i32, String>;
 }
 
-/// A no-op [`AttachmentIo`] for tests that never touch the disk or ffmpeg.
-#[derive(Debug, Clone, Copy, Default)]
-pub struct NoopAttachmentIo;
-
-#[async_trait]
-impl AttachmentIo for NoopAttachmentIo {
-    fn attachment_folder_path(&self, _media_source_id: &str) -> Option<String> {
-        None
-    }
-
-    fn attachment_path(&self, _media_source_id: &str, file_name: &str) -> Option<String> {
-        Some(file_name.to_owned())
-    }
-
-    fn file_exists(&self, _path: &str) -> bool {
-        false
-    }
-
-    async fn remove_file(&self, _path: &str) -> Result<(), String> {
-        Ok(())
-    }
-
-    async fn create_directory(&self, _path: &str) -> Result<(), String> {
-        Ok(())
-    }
-
-    async fn open_file(&self, path: &str) -> std::io::Result<OpenedFile> {
-        Ok(OpenedFile {
-            path: path.to_owned(),
-            length: 0,
-            reader: Box::new(std::io::empty()),
-        })
-    }
-
-    async fn run_ffmpeg(
-        &self,
-        _ffmpeg_path: &str,
-        _args: &str,
-        _working_dir: Option<&str>,
-        _outputs: &[String],
-    ) -> Result<i32, String> {
-        Ok(0)
-    }
-}
-
 /// The `ferrofin-traits` [`AttachmentExtractor`] implementation.
 ///
 /// Generic over the [`MediaEncoder`] (for input-argument building), the

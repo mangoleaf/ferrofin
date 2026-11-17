@@ -11,9 +11,10 @@
 //! below a flag or a variable and above `config.toml` ([`ports`]).
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 
 use anyhow::Context as _;
+use ferrofin_core::FerrofinServerConfigurationManager;
 use ferrofin_core::system_manager::LifecycleController;
 use ferrofin_networking::NetworkConfiguration;
 use ferrofin_networking::network_configuration::{DEFAULT_HTTP_PORT, DEFAULT_HTTPS_PORT};
@@ -227,22 +228,37 @@ pub fn ports(config: &Config, network: &NetworkConfiguration) -> (u16, u16) {
 
 /// Marks a restart pending in `lifecycle` when a saved network configuration
 /// resolves ([`ports`], over `config`) to other ports than `running`, the
-/// ones this lifetime listens on: `ApplicationHost.OnConfigurationUpdated`.
-/// A port a flag or variable sets is not changed by a save, so it takes none.
-///
-/// TODO(gl-1701): upstream also clears `IsPortAuthorized` and saves the server
-/// configuration when it flags this restart; that needs an atomic flag update
-/// outside the listener, which may not save.
+/// ones this lifetime listens on, and clears `IsPortAuthorized` in
+/// `configuration`: `ApplicationHost.OnConfigurationUpdated`. A port a flag or
+/// variable sets is not changed by a save, so it takes none.
 pub(crate) fn restart_listener(
     running: (u16, u16),
     config: Config,
     lifecycle: Arc<dyn LifecycleController>,
+    configuration: Weak<FerrofinServerConfigurationManager>,
 ) -> Arc<ConfigurationListener> {
     crate::state::network_restart_listener(
         running,
         move |saved| ports(&config, saved),
         "listen on the new port",
         lifecycle,
+        move |changed| {
+            let Some(configuration) = configuration.upgrade() else {
+                return;
+            };
+            configuration.set_ports_changed(changed);
+            if changed {
+                // A listener may not save, so the flag is saved on its own task.
+                tokio::spawn(tracing::Instrument::instrument(
+                    async move {
+                        if let Err(error) = configuration.revoke_port_authorization().await {
+                            tracing::warn!(%error, "could not save the cleared port-authorized flag");
+                        }
+                    },
+                    tracing::info_span!(parent: None, "port_authorization", trigger = "api"),
+                ));
+            }
+        },
     )
 }
 
@@ -370,7 +386,12 @@ mod tests {
             };
             let (tx, _rx) = tokio::sync::oneshot::channel();
             let lifecycle = std::sync::Arc::new(crate::state::FerrofinLifecycleController::new(tx));
-            let listener = super::restart_listener((5000, 5443), config, lifecycle.clone());
+            let listener = super::restart_listener(
+                (5000, 5443),
+                config,
+                lifecycle.clone(),
+                std::sync::Weak::new(),
+            );
             listener(&ConfigurationUpdate::Named {
                 key: "network".to_owned(),
                 json: json.into(),

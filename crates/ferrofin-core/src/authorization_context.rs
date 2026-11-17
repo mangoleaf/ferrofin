@@ -36,6 +36,7 @@ use chrono::Utc;
 use ferrofin_db::Database;
 use ferrofin_db::entities::security::{ApiKeyEntity, DeviceEntity};
 use ferrofin_db::store::datetime_to_db;
+use ferrofin_util::string_extensions::equals_ordinal_ignore_case;
 use uuid::Uuid;
 
 use ferrofin_traits::configuration::ServerConfigurationManager;
@@ -216,18 +217,32 @@ impl FerrofinAuthorizationContext {
             .to_ascii_lowercase()
             .contains("chromecast");
 
-        match info.device.as_deref().map(str::trim) {
-            None | Some("") => info.device = Some(device.device_name.clone()),
-            Some(name) if !name.eq_ignore_ascii_case(&device.device_name) && allow_update => {
+        // `string.IsNullOrWhiteSpace` picks the stored value; any other is
+        // compared and kept as sent, its spaces included.
+        match info
+            .device
+            .as_deref()
+            .filter(|name| !name.trim().is_empty())
+        {
+            None => info.device = Some(device.device_name.clone()),
+            Some(name)
+                if !equals_ordinal_ignore_case(name, &device.device_name) && allow_update =>
+            {
                 update = true;
                 device.device_name = name.to_owned();
             }
             _ => {}
         }
 
-        match info.version.as_deref().map(str::trim) {
-            None | Some("") => info.version = Some(device.app_version.clone()),
-            Some(version) if !version.eq_ignore_ascii_case(&device.app_version) && allow_update => {
+        match info
+            .version
+            .as_deref()
+            .filter(|version| !version.trim().is_empty())
+        {
+            None => info.version = Some(device.app_version.clone()),
+            Some(version)
+                if !equals_ordinal_ignore_case(version, &device.app_version) && allow_update =>
+            {
                 update = true;
                 device.app_version = version.to_owned();
             }

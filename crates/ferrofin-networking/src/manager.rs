@@ -69,7 +69,10 @@ impl StartupConfig {
 /// `host:port` (the scheme's default port when it names none), once per
 /// override ignoring case, never its user info, query or fragment. Bare host
 /// or IP overrides are exempt, since the base URL is appended when the API URL
-/// is built from them; an empty `base_url` leaves nothing to compare.
+/// is built from them; an empty `base_url` leaves nothing to compare. The
+/// base matches in either spelling (`/my jellyfin`, `/my%20jellyfin`), where
+/// upstream compares the decoded path with the saved spelling: Jellyfin bug
+/// not ported (gl-1821).
 #[must_use]
 pub fn published_urls_missing_base_url<'a>(
     overrides: impl IntoIterator<Item = &'a str>,
@@ -79,6 +82,8 @@ pub fn published_urls_missing_base_url<'a>(
     if base_url.is_empty() {
         return hosts;
     }
+    // Either spelling of the base (`/my jellyfin`, `/my%20jellyfin`) matches.
+    let base_url = percent_encoding::percent_decode_str(base_url).decode_utf8_lossy();
     let mut seen = std::collections::HashSet::new();
     for uri in overrides {
         let lowered = uri.to_ascii_lowercase();
@@ -110,7 +115,7 @@ pub fn published_urls_missing_base_url<'a>(
             .len()
             .checked_sub(base_url.len())
             .and_then(|at| path.get(at..))
-            .is_some_and(|tail| tail.eq_ignore_ascii_case(base_url))
+            .is_some_and(|tail| tail.eq_ignore_ascii_case(&base_url))
         {
             continue;
         }
@@ -702,8 +707,8 @@ impl NetworkManager {
     }
 
     /// The address of the client that actually made the request, given the
-    /// transport `peer` and the `X-Forwarded-For` chain (left to right, as
-    /// sent).
+    /// transport `peer` and the `X-Forwarded-For` chain nearest hop first (the
+    /// entries from the right).
     ///
     /// Port of what ASP.NET's `ForwardedHeadersMiddleware` does with the options
     /// C# `ConfigureForwardHeaders` builds:
@@ -720,17 +725,25 @@ impl NetworkManager {
     /// `ForwardLimit` is null upstream once any proxy is configured, so the
     /// whole chain is walkable. `ApplyForwarders` also stops at the first entry
     /// from the right that does not parse; the caller passes the chain already
-    /// ended there (`ferrofin-api`'s `forwarded_for`).
+    /// ended there (`ferrofin-api`'s `forwarded_for`). A hop is taken from the
+    /// chain only once the address before it is trusted, so a lazy chain is
+    /// read no further than the walk goes, and not at all for a peer that is
+    /// not a known proxy.
     #[must_use]
-    pub fn client_address(&self, peer: IpAddr, forwarded_for: &[IpAddr]) -> IpAddr {
+    pub fn client_address(
+        &self,
+        peer: IpAddr,
+        forwarded_for: impl IntoIterator<Item = IpAddr>,
+    ) -> IpAddr {
         if !self.known_proxies.forwarding_enabled() {
             return peer;
         }
+        let mut chain = forwarded_for.into_iter();
         let mut current = peer;
-        let mut remaining = forwarded_for.len();
-        while remaining > 0 && self.is_known_proxy(current) {
-            remaining -= 1;
-            current = forwarded_for[remaining];
+        while self.is_known_proxy(current)
+            && let Some(next) = chain.next()
+        {
+            current = next;
         }
         current
     }
@@ -757,7 +770,7 @@ impl NetworkManager {
 
         // Everything else is a single-IP subnet.
         for ip in remote_ip_filter.iter().filter(|x| !x.contains('/')) {
-            if let Ok(ipp) = ip.parse::<IpAddr>() {
+            if let Some(ipp) = net_utils::try_parse_ip_address(ip) {
                 let prefix = match ipp {
                     IpAddr::V4(_) => net_constants::MINIMUM_IPV4_PREFIX_SIZE,
                     IpAddr::V6(_) => net_constants::MINIMUM_IPV6_PREFIX_SIZE,

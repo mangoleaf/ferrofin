@@ -15,12 +15,11 @@ use ferrofin_traits::media_encoding::MediaEncoder;
 use ferrofin_traits::persistence::{MediaStreamQuery, MediaStreamRepository};
 use ferrofin_traits::stubs::LiveTvManager;
 use ferrofin_traits::system::PathManager;
+use ferrofin_util::ticks::{TICKS_PER_SECOND, UNIX_EPOCH_TICKS};
 use uuid::Uuid;
 
 use crate::ScanCancel;
 use crate::library_scan::off_runtime;
-
-const TICKS_PER_SECOND: i64 = 10_000_000;
 
 /// Extraction and reconciliation without ownership of the library or chapters.
 /// This can be shared with the scanner without a library ownership cycle.
@@ -449,7 +448,7 @@ fn average_chapter_duration(chapters: &[ChapterInfo]) -> i64 {
 /// `0001-01-01`); unset is `DateTime.MinValue`, 0 ticks.
 pub(crate) fn date_modified_ticks(date: Option<DateTime<Utc>>) -> i64 {
     date.map_or(0, |date| {
-        621_355_968_000_000_000
+        UNIX_EPOCH_TICKS
             + date.timestamp() * TICKS_PER_SECOND
             + i64::from(date.timestamp_subsec_nanos() / 100)
     })
@@ -499,12 +498,23 @@ pub(crate) mod tests {
         missing_frame: bool,
         cancel_on: Option<(usize, ScanCancel)>,
         cancel_after: Option<(usize, ScanCancel)>,
+        /// Each extraction notifies the first and waits for the second.
+        hold: Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>,
     }
 
     impl RecordingEncoder {
         pub(crate) fn cancelling_after(call: usize, cancel: ScanCancel) -> Self {
             Self {
                 cancel_after: Some((call, cancel)),
+                ..Default::default()
+            }
+        }
+        pub(crate) fn holding(
+            entered: Arc<tokio::sync::Notify>,
+            release: Arc<tokio::sync::Notify>,
+        ) -> Self {
+            Self {
+                hold: Some((entered, release)),
                 ..Default::default()
             }
         }
@@ -564,6 +574,10 @@ pub(crate) mod tests {
             {
                 cancel.cancel();
                 std::future::pending::<()>().await;
+            }
+            if let Some((entered, release)) = &self.hold {
+                entered.notify_one();
+                release.notified().await;
             }
             if self.fail_on == Some(count) {
                 return Err(ServiceError::backend("broken frame"));

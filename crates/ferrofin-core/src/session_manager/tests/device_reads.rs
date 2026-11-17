@@ -14,7 +14,7 @@ use async_trait::async_trait;
 use ferrofin_db::Database;
 use ferrofin_db::entities::security::{DeviceEntity, DeviceOptionsEntity};
 use ferrofin_db::entities::users::UserEntity;
-use ferrofin_model::dto::{ClientCapabilitiesDto, DeviceInfoDto};
+use ferrofin_model::dto::DeviceInfoDto;
 use ferrofin_model::querying::QueryResult;
 use ferrofin_model::session::{
     ClientCapabilities, PlaybackProgressInfo, PlaybackStartInfo, PlaybackStopInfo,
@@ -135,12 +135,6 @@ impl DeviceManager for CountingDevices {
             rendezvous.wait().await;
         }
         self.inner.get_device_options(device_id).await
-    }
-    async fn to_client_capabilities_dto(
-        &self,
-        capabilities: &ClientCapabilities,
-    ) -> Result<ClientCapabilitiesDto, ServiceError> {
-        self.inner.to_client_capabilities_dto(capabilities).await
     }
 }
 
@@ -373,6 +367,7 @@ async fn renaming_a_device_renames_its_live_sessions() {
     let mgr = manager_over(&db, Arc::clone(&devices));
     let alice = seed_named_user(&db, Uuid::new_v4(), "alice").await;
     let bob = seed_named_user(&db, Uuid::new_v4(), "bob").await;
+    let carol = seed_named_user(&db, Uuid::new_v4(), "carol").await;
     mgr.log_session_activity("Web", "1.0", "dev-1", "TV", "e", Some(&alice))
         .await
         .unwrap();
@@ -382,8 +377,9 @@ async fn renaming_a_device_renames_its_live_sessions() {
     mgr.log_session_activity("Web", "1.0", "dev-2", "Phone", "e", Some(&alice))
         .await
         .unwrap();
-    // The device id is matched ordinally, as in C#.
-    mgr.log_session_activity("Web", "1.0", "DEV-1", "Tablet", "e", Some(&alice))
+    // The device id is matched ordinally, as in C#. Another user's: alice's
+    // own `DEV-1` is her `dev-1` session, the pool ignoring case as C#'s does.
+    mgr.log_session_activity("Web", "1.0", "DEV-1", "Tablet", "e", Some(&carol))
         .await
         .unwrap();
     let names = || async {

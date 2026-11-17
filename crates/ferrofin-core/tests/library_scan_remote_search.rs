@@ -245,6 +245,65 @@ async fn a_series_folder_with_a_bare_year_searches_tmdb_by_its_parsed_name() {
     assert_eq!(ids_of(&db, &media.join("Show 2026")).await, ["Tmdb=30"]);
 }
 
+/// A movie and a series whose IMDb id (here from the folder name) TMDb's
+/// `/find` cannot resolve, its request failing: the movie gets no TMDb
+/// metadata and no name search (`TmdbMovieProvider.GetMetadata` searches only
+/// without an IMDb id, `TmdbMovieProvider.cs:160,178-190`), while the series
+/// goes on to its name search (`TmdbSeriesProvider.cs:178-213`).
+#[rstest::rstest]
+#[case::movie(
+    CollectionTypeOptions::movies,
+    tmdb_movie as fn(&str) -> (&'static str, String),
+    "Split (2016) [imdbid-tt0000404]/Split (2016).mkv",
+    "Split (2016) [imdbid-tt0000404]/Split (2016).mkv",
+    "/search/movie",
+    &["Imdb=tt0000404"]
+)]
+#[case::series(
+    CollectionTypeOptions::tvshows,
+    tmdb_series as fn(&str) -> (&'static str, String),
+    "Show 2026 [imdbid-tt0000404]/Season 1/Show 2026 S01E01.mkv",
+    "Show 2026 [imdbid-tt0000404]",
+    "/search/tv",
+    &["Imdb=tt0000404", "Tmdb=30"]
+)]
+#[tokio::test]
+async fn an_imdb_id_tmdb_cannot_resolve_stops_only_a_movies_name_search(
+    #[case] kind: CollectionTypeOptions,
+    #[case] tmdb: fn(&str) -> (&'static str, String),
+    #[case] file: &str,
+    #[case] item: &str,
+    #[case] search: &str,
+    #[case] ids: &[&str],
+) {
+    let tmp = tempfile::tempdir().expect("tmp");
+    let media = tmp.path().join("media");
+    touch(&media, file);
+    let (db, scanner) = library(tmp.path(), &media, kind).await;
+    let (base, requests) = spawn(tmdb);
+
+    scanner
+        .with_metadata(
+            Arc::new(TmdbClient::new().with_base_url(&base)),
+            tmp.path().join("metadata"),
+        )
+        .scan_all()
+        .await
+        .expect("scan");
+
+    let asked = requests.lock().expect("log").clone();
+    assert!(
+        asked.iter().any(|line| line.contains("/find/tt0000404")),
+        "{asked:?}"
+    );
+    assert_eq!(
+        asked.iter().any(|line| line.contains(search)),
+        kind == CollectionTypeOptions::tvshows,
+        "{asked:?}"
+    );
+    assert_eq!(ids_of(&db, &media.join(item)).await, ids);
+}
+
 /// OMDb's exact-title lookup answers only `t=Ocean's Eleven&y=2001`.
 fn omdb(line: &str) -> (&'static str, String) {
     let Some(target) = line.split(' ').nth(1) else {

@@ -68,16 +68,46 @@ use crate::item_type_lookup::stored_type_name;
 use crate::kinds::supports_similarity;
 use crate::similar_items_repository::SimilarItemsRepository;
 
-/// Reads an unexpired reference cache, or `None` when it is missing, stale or
-/// unparseable.
-async fn read_reference_cache(path: &Path) -> Option<Vec<SimilarItemReference>> {
-    // A missing entry is the normal cache miss and says nothing; an entry that
-    // exists but will not parse is worth one warning (C# logs the same).
-    let raw = tokio::fs::read_to_string(path).await.ok()?;
-    let cache: SimilarItemsCache = match serde_json::from_str(&raw) {
-        Ok(cache) => cache,
+/// Reads an unexpired reference cache, or `None` when it is missing, empty,
+/// stale or unreadable — C# `TryReadSimilarItemsCacheAsync`.
+///
+/// A missing or empty entry, or one without references, is the normal cache
+/// miss and says nothing. An entry that exists but cannot be read (permission
+/// denied, a directory at its path, an I/O error) or will not parse is a miss
+/// worth one warning, as upstream's `IOException` and `JsonException` arms log.
+async fn read_reference_cache(
+    path: &Path,
+    provider: &str,
+    item_id: Uuid,
+) -> Option<Vec<SimilarItemReference>> {
+    let raw = match tokio::fs::read(path).await {
+        Ok(raw) => raw,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return None,
         Err(err) => {
-            tracing::warn!(%err, path = %path.display(), "similar-items cache is unreadable");
+            tracing::warn!(
+                %err,
+                provider,
+                %item_id,
+                path = %path.display(),
+                "could not read similar-items cache"
+            );
+            return None;
+        }
+    };
+    if raw.is_empty() {
+        return None;
+    }
+    // A JSON `null` entry is C#'s null cache: a silent miss.
+    let cache: SimilarItemsCache = match serde_json::from_slice::<Option<SimilarItemsCache>>(&raw) {
+        Ok(cache) => cache?,
+        Err(err) => {
+            tracing::warn!(
+                %err,
+                provider,
+                %item_id,
+                path = %path.display(),
+                "could not parse similar-items cache"
+            );
             return None;
         }
     };
@@ -86,7 +116,7 @@ async fn read_reference_cache(path: &Path) -> Option<Vec<SimilarItemReference>> 
     }
     Some(
         cache
-            .references
+            .references?
             .into_iter()
             .map(|r| SimilarItemReference {
                 provider_name: r.provider_name,
@@ -108,14 +138,16 @@ async fn write_reference_cache(path: &Path, references: &[SimilarItemReference],
         return;
     };
     let cache = SimilarItemsCache {
-        references: references
-            .iter()
-            .map(|r| CachedReference {
-                provider_name: r.provider_name.clone(),
-                provider_id: r.provider_id.clone(),
-                score: r.score,
-            })
-            .collect(),
+        references: Some(
+            references
+                .iter()
+                .map(|r| CachedReference {
+                    provider_name: r.provider_name.clone(),
+                    provider_id: r.provider_id.clone(),
+                    score: r.score,
+                })
+                .collect(),
+        ),
         expires_at: chrono::Utc::now() + ttl,
     };
     let Ok(json) = serde_json::to_vec(&cache) else {
@@ -175,9 +207,12 @@ const PROVIDER_ORDER_BOOST: f32 = 0.005;
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "PascalCase")]
 struct SimilarItemsCache {
-    /// The cached references.
-    references: Vec<CachedReference>,
-    /// When the entry stops being usable.
+    /// The cached references; a missing or `null` list is a miss, as C#'s
+    /// `cache?.References is not null` check makes it.
+    references: Option<Vec<CachedReference>>,
+    /// When the entry stops being usable; a missing one is C#'s
+    /// `default(DateTime)`, already expired.
+    #[serde(default)]
     expires_at: chrono::DateTime<chrono::Utc>,
 }
 
@@ -403,6 +438,8 @@ struct LocalRequest<'a> {
 struct RemoteRequest<'a> {
     /// The seed row.
     seed: &'a BaseItemEntity,
+    /// The seed's id.
+    seed_id: Uuid,
     /// The seed's external ids, which key a remote provider's lookup.
     seed_provider_ids: &'a HashMap<String, String>,
     /// The query the provider is handed.
@@ -969,7 +1006,7 @@ impl FerrofinSimilarItemsManager {
         let (kind, user) = (request.kind, request.user);
         let cache_path = self.cache_path(provider.name(), request.seed);
         if let Some(path) = cache_path.as_deref()
-            && let Some(cached) = read_reference_cache(path).await
+            && let Some(cached) = read_reference_cache(path, provider.name(), request.seed_id).await
         {
             return self
                 .resolve_remote_references(&cached, provider_order, kind, user, claimed)
@@ -1523,6 +1560,7 @@ impl SimilarItemsManager for FerrofinSimilarItemsManager {
             };
             let request = RemoteRequest {
                 seed: &seed,
+                seed_id: item_id,
                 seed_provider_ids: &seed_provider_ids,
                 query: &query,
                 kind,
@@ -2523,10 +2561,13 @@ mod tests {
             .await
             .expect("seed")
             .expect("seed row");
-        let cached =
-            read_reference_cache(&mgr.cache_path("TheMovieDb", &seed_row).expect("cache path"))
-                .await
-                .expect("cached references");
+        let cached = read_reference_cache(
+            &mgr.cache_path("TheMovieDb", &seed_row).expect("cache path"),
+            "TheMovieDb",
+            seed,
+        )
+        .await
+        .expect("cached references");
         assert_eq!(cached, tmdb_references(500));
     }
 
@@ -3217,16 +3258,26 @@ mod tests {
         }];
         super::write_reference_cache(&path, &references, Duration::from_mins(1)).await;
         assert_eq!(
-            super::read_reference_cache(&path).await.as_deref(),
+            super::read_reference_cache(&path, "TheMovieDb", Uuid::nil())
+                .await
+                .as_deref(),
             Some(&references[..])
         );
 
         // An expired entry is ignored rather than served stale.
         super::write_reference_cache(&path, &references, Duration::from_secs(0)).await;
-        assert_eq!(super::read_reference_cache(&path).await, None);
+        assert_eq!(
+            super::read_reference_cache(&path, "TheMovieDb", Uuid::nil()).await,
+            None
+        );
         // A missing file is simply a miss.
         assert_eq!(
-            super::read_reference_cache(dir.path().join("nope.json").as_path()).await,
+            super::read_reference_cache(
+                dir.path().join("nope.json").as_path(),
+                "TheMovieDb",
+                Uuid::nil()
+            )
+            .await,
             None
         );
     }
@@ -3255,9 +3306,11 @@ mod tests {
             .expect("read the open entry");
         let before: super::SimilarItemsCache =
             serde_json::from_str(&before).expect("the open entry parses");
-        assert_eq!(before.references[0].provider_id, "348");
+        assert_eq!(before.references.expect("references")[0].provider_id, "348");
         assert_eq!(
-            super::read_reference_cache(&path).await.as_deref(),
+            super::read_reference_cache(&path, "TheMovieDb", Uuid::nil())
+                .await
+                .as_deref(),
             Some(&[reference("1091")][..])
         );
         // No temporary file is left beside the entry.
@@ -3265,6 +3318,95 @@ mod tests {
             .expect("list the cache directory")
             .count();
         assert_eq!(entries, 1);
+    }
+
+    /// Reads a cache entry under a scoped subscriber, returning the result
+    /// and the lines that read logged at warn.
+    async fn read_logging(path: &Path) -> (Option<Vec<SimilarItemReference>>, Vec<String>) {
+        let logs = crate::test_support::CapturedLogs::default();
+        let read = {
+            let _guard = tracing::subscriber::set_default(
+                tracing_subscriber::fmt()
+                    .with_writer(logs.clone())
+                    .with_ansi(false)
+                    .finish(),
+            );
+            super::read_reference_cache(path, "TheMovieDb", Uuid::from_u128(0x1652)).await
+        };
+        let warned = logs
+            .text()
+            .lines()
+            .filter(|line| line.contains("WARN"))
+            .map(str::to_owned)
+            .collect();
+        (read, warned)
+    }
+
+    /// `TryReadSimilarItemsCacheAsync`'s cases (gl-1652): a missing, empty or
+    /// `null` entry, or one without references or expiry, is a silent miss; a
+    /// non-empty entry that will not parse is a miss that warns once.
+    #[rstest::rstest]
+    #[case::missing(None, None)]
+    #[case::empty(Some(""), None)]
+    #[case::null(Some("null"), None)]
+    #[case::null_references(
+        Some(r#"{"References":null,"ExpiresAt":"2999-01-01T00:00:00Z"}"#),
+        None
+    )]
+    #[case::no_references(Some(r#"{"ExpiresAt":"2999-01-01T00:00:00Z"}"#), None)]
+    #[case::no_expiry(Some(r#"{"References":[]}"#), None)]
+    #[case::truncated(
+        Some(r#"{"References":["#),
+        Some("could not parse similar-items cache")
+    )]
+    #[tokio::test]
+    async fn a_cache_read_warns_only_when_an_entry_fails(
+        #[case] content: Option<&str>,
+        #[case] warning: Option<&str>,
+    ) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("x.json");
+        if let Some(content) = content {
+            std::fs::write(&path, content).expect("write the entry");
+        }
+        let (read, warned) = read_logging(&path).await;
+        assert_eq!(read, None);
+        match warning {
+            None => assert!(warned.is_empty(), "{warned:?}"),
+            Some(message) => {
+                assert_eq!(warned.len(), 1, "{warned:?}");
+                assert!(warned[0].contains(message), "{warned:?}");
+                assert!(
+                    warned[0].contains(&path.display().to_string()),
+                    "{warned:?}"
+                );
+            }
+        }
+    }
+
+    /// An entry that exists but cannot be read is an I/O error, not a miss to
+    /// keep quiet about: a directory at the entry's path (as an unreadable
+    /// cache directory would) warns once with the path, provider and item, and
+    /// the request goes on as a miss.
+    #[tokio::test]
+    async fn an_unreadable_cache_entry_warns_with_its_context() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("x.json");
+        std::fs::create_dir(&path).expect("a directory at the entry's path");
+        let (read, warned) = read_logging(&path).await;
+        assert_eq!(read, None);
+        assert_eq!(warned.len(), 1, "{warned:?}");
+        let line = &warned[0];
+        assert!(
+            line.contains("could not read similar-items cache"),
+            "{line}"
+        );
+        assert!(line.contains(&path.display().to_string()), "{line}");
+        assert!(line.contains(r#"provider="TheMovieDb""#), "{line}");
+        assert!(
+            line.contains(&format!("item_id={}", Uuid::from_u128(0x1652))),
+            "{line}"
+        );
     }
 
     #[tokio::test]

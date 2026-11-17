@@ -298,3 +298,278 @@ async fn a_changed_episode_under_an_unchanged_series_resolves_through_the_record
     let row = items.retrieve_item(id).await.expect("read").expect("row");
     assert_eq!(row.name.as_deref(), Some("Winter Is Coming"));
 }
+
+/// A new multi-episode file (`S01E01-E02`) is titled from every episode in
+/// its range: `TmdbEpisodeProvider` fetches each episode up to
+/// `IndexNumberEnd` and joins their names and overviews with ` / `
+/// (`TmdbEpisodeProvider.cs:106-158`), and the lookup has the range end from
+/// the file name before the providers run (`FillMissingEpisodeNumbersFromPath`
+/// in `BeforeMetadataRefresh`). Only the first episode's own request is made.
+/// A later refresh looks up the stored range end, or the file name's under
+/// "Replace all metadata".
+#[tokio::test]
+async fn a_multi_episode_file_is_titled_from_every_episode_in_its_range() {
+    let (base, credits) = spawn_tmdb();
+    let tmp = tempfile::tempdir().expect("tmp");
+    let (db, items, scanner, file) = multi_episode_library(tmp.path(), &base, None, None).await;
+    let id = derive_item_id(BaseItemKind::Episode, &file.to_string_lossy()).expect("id");
+    let joined = |row: &ferrofin_db::entities::base_items::BaseItemEntity| {
+        (
+            row.name.clone(),
+            row.overview.clone(),
+            row.data
+                .as_deref()
+                .is_some_and(|d| d.contains(r#""IndexNumberEnd":2"#)),
+        )
+    };
+    let expected = (
+        Some("Winter Is Coming / The Kingsroad".to_owned()),
+        Some("Ned is summoned south. / The party rides north.".to_owned()),
+        true,
+    );
+
+    assert_eq!(scanner.scan_all().await.expect("first").created, 3);
+    assert_eq!(credits.load(Ordering::SeqCst), 1, "the first episode's own");
+    let row = items.retrieve_item(id).await.expect("read").expect("row");
+    assert_eq!(joined(&row), expected);
+    assert_eq!(
+        row.community_rating,
+        Some(8.5),
+        "the first episode's rating"
+    );
+
+    // On a refresh the stored range end is the lookup's, even where the file
+    // name disagrees (`FillMissingEpisodeNumbersFromPath` fills only a
+    // missing one): a stored end of 1 looks up episode 1 alone, whose
+    // overview "Search for missing metadata" fills in. Under "Replace all metadata"
+    // the file name's end replaces it (`forceRefresh`).
+    sqlx::query(
+        r#"UPDATE "BaseItems" SET "Data" = json_set("Data", '$.IndexNumberEnd', 1),
+           "Name" = NULL, "Overview" = NULL WHERE "Path" = ?1"#,
+    )
+    .bind(file.to_string_lossy().into_owned())
+    .execute(db.pool())
+    .await
+    .expect("narrow the stored range");
+    refresh(&scanner, &file, false).await;
+    let row = items.retrieve_item(id).await.expect("read").expect("row");
+    assert_eq!(
+        row.overview.as_deref(),
+        Some("Ned is summoned south."),
+        "the stored end"
+    );
+    refresh(&scanner, &file, true).await;
+    let row = items.retrieve_item(id).await.expect("read").expect("row");
+    assert_eq!(joined(&row), expected, "the file name's end");
+}
+
+/// A full metadata refresh of the item at `path`, replacing all metadata or
+/// not.
+async fn refresh(scanner: &LibraryScanner, path: &std::path::Path, replace_all: bool) {
+    use ferrofin_core::{ScanCancel, ScanPasses, ScanRun};
+    use ferrofin_traits::library::ScanTarget;
+    use ferrofin_traits::providers::{MetadataRefreshMode, MetadataRefreshOptions};
+    let options = MetadataRefreshOptions {
+        metadata_refresh_mode: MetadataRefreshMode::FullRefresh,
+        replace_all_metadata: replace_all,
+        ..MetadataRefreshOptions::default()
+    };
+    let none = MetadataRefreshOptions {
+        metadata_refresh_mode: MetadataRefreshMode::None,
+        image_refresh_mode: MetadataRefreshMode::None,
+        ..MetadataRefreshOptions::default()
+    };
+    scanner
+        .scan_target(
+            &ScanTarget::Items(vec![path.to_string_lossy().into_owned()]),
+            ScanRun::new(&options, &none, &ScanCancel::new()).with_passes(ScanPasses::Touched),
+        )
+        .await
+        .expect("refresh");
+}
+
+/// A TV library holding one multi-episode file, `GoT S01E01-E02.mkv` (with
+/// `nfo` beside it when given), and a scanner over it with TMDb at `base` and,
+/// when given, `probe` as its prober. Returns the database, the item store,
+/// the scanner and the file's path.
+async fn multi_episode_library(
+    root: &std::path::Path,
+    base: &str,
+    nfo: Option<&str>,
+    probe: Option<Arc<dyn ferrofin_traits::media_encoding::MediaEncoder>>,
+) -> (
+    Database,
+    Arc<dyn ItemRepository>,
+    LibraryScanner,
+    std::path::PathBuf,
+) {
+    let tv = root.join("tv");
+    let season = tv.join("GoT").join("Season 1");
+    std::fs::create_dir_all(&season).expect("mkdir");
+    let file = season.join("GoT S01E01-E02.mkv");
+    std::fs::write(&file, b"").expect("write");
+    if let Some(nfo) = nfo {
+        std::fs::write(season.join("GoT S01E01-E02.nfo"), nfo).expect("write nfo");
+    }
+    let db = Database::connect_in_memory().await.expect("connect");
+    db.run_migrations().await.expect("migrate");
+    let persistence = Arc::new(FerrofinItemPersistenceService::new(db.clone()));
+    let vf: Arc<dyn VirtualFolderManager> = Arc::new(
+        FerrofinVirtualFolderManager::new(root.join("default"))
+            .with_item_store(persistence.clone()),
+    );
+    vf.add_virtual_folder(
+        "TV",
+        Some(CollectionTypeOptions::tvshows),
+        &LibraryOptions {
+            path_infos: vec![MediaPathInfo {
+                path: tv.to_string_lossy().into_owned(),
+            }],
+            ..LibraryOptions::default()
+        },
+    )
+    .await
+    .expect("add library");
+    let items: Arc<dyn ItemRepository> = Arc::new(FerrofinItemRepository::new(
+        db.clone(),
+        Arc::new(ItemTypeLookup::new()),
+    ));
+    let mut scanner = LibraryScanner::new(vf, Arc::new(FerrofinFileSystem::new()), persistence)
+        .with_metadata(
+            Arc::new(TmdbClient::new().with_base_url(base)),
+            root.join("metadata"),
+        )
+        .with_items(Arc::clone(&items));
+    if let Some(probe) = probe {
+        scanner = scanner.with_probe(
+            probe,
+            Arc::new(ferrofin_core::FerrofinMediaStreamRepository::new(
+                db.clone(),
+            )),
+            Arc::new(ferrofin_core::FerrofinChapterRepository::new(db.clone())),
+        );
+    }
+    (db, items, scanner, file)
+}
+
+/// Probes every file as a short H.264 video, counting the probes.
+struct Probe(Arc<AtomicUsize>);
+
+#[async_trait::async_trait]
+impl ferrofin_traits::media_encoding::MediaEncoder for Probe {
+    fn encoder_path(&self) -> String {
+        "ffmpeg".to_owned()
+    }
+    fn probe_path(&self) -> String {
+        "ffprobe".to_owned()
+    }
+    async fn set_ffmpeg_path(&self) -> Result<bool, ferrofin_traits::error::ServiceError> {
+        Ok(true)
+    }
+    async fn get_media_info(
+        &self,
+        _: &ferrofin_traits::media_encoding::MediaInfoRequest,
+    ) -> Result<ferrofin_model::dto::MediaSourceInfo, ferrofin_traits::error::ServiceError> {
+        self.0.fetch_add(1, Ordering::SeqCst);
+        Ok(ferrofin_model::dto::MediaSourceInfo {
+            run_time_ticks: Some(30_000_000),
+            media_streams: vec![ferrofin_model::entities_media::MediaStream {
+                index: 0,
+                stream_type: ferrofin_model::entities::MediaStreamType::Video,
+                codec: Some("h264".to_owned()),
+                width: Some(640),
+                height: Some(480),
+                ..Default::default()
+            }],
+            ..Default::default()
+        })
+    }
+    async fn extract_audio_image(
+        &self,
+        _: &str,
+        _: Option<i32>,
+    ) -> Result<String, ferrofin_traits::error::ServiceError> {
+        Err(ferrofin_traits::error::ServiceError::backend("no cover"))
+    }
+    async fn extract_video_image(
+        &self,
+        _: &str,
+        _: &str,
+        _: &ferrofin_model::dto::MediaSourceInfo,
+        _: &ferrofin_model::entities_media::MediaStream,
+        _: Option<ferrofin_model::entities::Video3DFormat>,
+        _: Option<i64>,
+    ) -> Result<String, ferrofin_traits::error::ServiceError> {
+        Err(ferrofin_traits::error::ServiceError::backend("no frame"))
+    }
+    fn get_input_argument(
+        &self,
+        input_file: &str,
+        _: &ferrofin_model::dto::MediaSourceInfo,
+    ) -> String {
+        input_file.to_owned()
+    }
+    fn get_time_parameter(&self, _: i64) -> String {
+        String::new()
+    }
+    async fn convert_image(
+        &self,
+        _: &str,
+        _: &str,
+    ) -> Result<(), ferrofin_traits::error::ServiceError> {
+        Ok(())
+    }
+}
+
+/// A probed multi-episode file's lookup has the range end `BeforeMetadataRefresh`
+/// left on the item, never its NFO's (`MergeNewData` hands the providers a
+/// local reader's ids only): new, the file name's (`S01E01-E02`, not the NFO's
+/// end of 1); stored, the stored row's (1 here, which the file name only fills
+/// when missing), so "Search for missing metadata" fills episode 1's overview
+/// alone.
+#[tokio::test]
+async fn a_probed_multi_episode_file_looks_up_the_items_range_not_its_nfos() {
+    let (base, _) = spawn_tmdb();
+    let tmp = tempfile::tempdir().expect("tmp");
+    let nfo = "<episodedetails><season>1</season><episode>1</episode>\
+               <episodenumberend>1</episodenumberend></episodedetails>";
+    let probes = Arc::new(AtomicUsize::new(0));
+    let (db, items, scanner, file) = multi_episode_library(
+        tmp.path(),
+        &base,
+        Some(nfo),
+        Some(Arc::new(Probe(Arc::clone(&probes)))),
+    )
+    .await;
+    let id = derive_item_id(BaseItemKind::Episode, &file.to_string_lossy()).expect("id");
+
+    scanner.scan_all().await.expect("first");
+    let row = items.retrieve_item(id).await.expect("read").expect("row");
+    assert_eq!(probes.load(Ordering::SeqCst), 1, "the new file was probed");
+    assert_eq!(
+        row.name.as_deref(),
+        Some("Winter Is Coming / The Kingsroad"),
+        "the file name's range, not the NFO's"
+    );
+
+    sqlx::query(
+        r#"UPDATE "BaseItems" SET "Data" = json_set("Data", '$.IndexNumberEnd', 1),
+           "Overview" = NULL WHERE "Path" = ?1"#,
+    )
+    .bind(file.to_string_lossy().into_owned())
+    .execute(db.pool())
+    .await
+    .expect("narrow the stored range");
+    refresh(&scanner, &file, false).await;
+    let row = items.retrieve_item(id).await.expect("read").expect("row");
+    assert_eq!(
+        probes.load(Ordering::SeqCst),
+        2,
+        "the full refresh probed it"
+    );
+    assert_eq!(
+        row.overview.as_deref(),
+        Some("Ned is summoned south."),
+        "the stored range"
+    );
+}

@@ -32,11 +32,12 @@ pub use directory_service::{
     supported_image_extension_index,
 };
 pub use episode_image_provider::EpisodeLocalImageProvider;
+pub use ferrofin_traits::options::file_date_modified;
 pub use item::{ImageItem, ImageItemKind};
 pub use local_image_provider::LocalImageProvider;
 pub use merge::{
-    file_date_modified, first_of_each_singular_type, internal_metadata_dirs, legacy_art_dir,
-    local_image_infos, merge_local_images, own_art_dir, remove_images,
+    first_of_each_singular_type, internal_metadata_dirs, legacy_art_dir, local_image_infos,
+    merge_local_images, own_art_dir, remove_images,
 };
 pub use other_providers::{
     CollectionFolderLocalImageProvider, InternalMetadataFolderImageProvider,

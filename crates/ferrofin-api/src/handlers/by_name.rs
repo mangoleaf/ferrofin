@@ -692,10 +692,11 @@ const UNRESOLVED_NAME_ID: uuid::Uuid = uuid::Uuid::nil();
 /// `Get<Kind>` is `CreateItemByName<T>`: an unknown name gets a row minted,
 /// and its fresh id is one no item references, so the name matches nothing.
 /// This lookup is the non-creating
-/// [`find_named_item`](ferrofin_traits::library::LibraryManager::find_named_item),
-/// because a GET must not write, and a miss takes [`UNRESOLVED_NAME_ID`],
-/// which matches the same nothing. A miss is never dropped: with every name
-/// dropped the list would be empty, and an empty `…Ids` filter is no filter.
+/// [`get_named_item_ids`](ferrofin_traits::library::LibraryManager::get_named_item_ids),
+/// one batched lookup for all the names, because a GET must not write, and a
+/// miss takes [`UNRESOLVED_NAME_ID`], which matches the same nothing. A miss
+/// is never dropped: with every name dropped the list would be empty, and an
+/// empty `…Ids` filter is no filter.
 ///
 /// Writing an item value materializes its by-name row
 /// (`ItemPersistenceService::save_item_values`), so a name that resolves to
@@ -720,18 +721,12 @@ pub(crate) async fn resolve_by_name_ids(
     if names.is_empty() {
         return Ok(None);
     }
-    // One non-creating lookup per name, accepted as the cost: upstream runs one
-    // `GetStudio` per name, and on the artist routes any non-empty list empties
-    // the answer anyway. No cap on the count, and no skipping the lookup.
-    let mut ids = Vec::with_capacity(names.len());
-    for name in &names {
-        let row = state.library.find_named_item(kind, name).await?;
-        ids.push(
-            row.and_then(|row| uuid::Uuid::parse_str(&row.id).ok())
-                .unwrap_or(UNRESOLVED_NAME_ID),
-        );
-    }
-    Ok(Some(ids))
+    let ids = state.library.get_named_item_ids(kind, &names).await?;
+    Ok(Some(
+        ids.into_iter()
+            .map(|id| id.unwrap_or(UNRESOLVED_NAME_ID))
+            .collect(),
+    ))
 }
 
 /// Resolves `GET /Items`' pipe-delimited `albums` names to the ids that

@@ -55,7 +55,6 @@ impl FakeDirectoryService {
             name: name.to_owned(),
             extension,
             length,
-            last_write_time_utc: None,
             is_directory,
         };
         self.dirs.entry(dir.to_owned()).or_default().push(meta);
@@ -706,6 +705,52 @@ fn fs_directory_service_memoizes_missing_directories() {
         FsDirectoryService::new().file_system_entries(&path).len(),
         1
     );
+
+    std::fs::remove_dir_all(&base).ok();
+}
+
+// `get_file` (`IDirectoryService.GetFile`) answers from the folder's listing:
+// the file's own entry, never a directory's, and nothing for a missing path or
+// one with no folder.
+#[test]
+fn get_file_finds_a_file_in_its_folder_listing() {
+    let mut fs = FakeDirectoryService::new();
+    fs.file("/media/movie", "poster.jpg")
+        .dir("/media/movie", "extrafanart");
+
+    let found = fs.get_file("/media/movie/poster.jpg").expect("the file");
+    assert_eq!(found.full_name, "/media/movie/poster.jpg");
+    assert_eq!(
+        fs.get_file("/media/movie//poster.jpg").map(|f| f.full_name),
+        Some("/media/movie/poster.jpg".to_owned()),
+        "a doubled separator still names the file"
+    );
+    assert_eq!(fs.get_file("/media/movie/extrafanart"), None);
+    assert_eq!(fs.get_file("/media/movie/fanart.jpg"), None);
+    assert_eq!(fs.get_file("/"), None);
+}
+
+// `FsDirectoryService` answers `get_file` with a stat, as upstream's
+// `GetFileSystemEntry` does: a file listed after its folder still resolves, and
+// a directory or a missing path does not.
+#[test]
+fn fs_directory_service_get_file_stats_the_path() {
+    let base = std::env::temp_dir().join(format!("ferrofin-dsf-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(base.join("extrafanart")).expect("create temp dir");
+    let folder = base.to_string_lossy().into_owned();
+    let service = FsDirectoryService::new();
+    assert_eq!(service.file_system_entries(&folder).len(), 1);
+
+    let poster = base.join("poster.jpg");
+    std::fs::write(&poster, b"xy").expect("write poster");
+    let poster = poster.to_string_lossy().into_owned();
+    let found = service.get_file(&poster).expect("the file");
+    assert_eq!(found.full_name, poster);
+    assert_eq!(found.name, "poster.jpg");
+    assert_eq!(found.length, 2);
+    assert!(!found.is_directory);
+    assert_eq!(service.get_file(&format!("{folder}/extrafanart")), None);
+    assert_eq!(service.get_file(&format!("{folder}/fanart.jpg")), None);
 
     std::fs::remove_dir_all(&base).ok();
 }

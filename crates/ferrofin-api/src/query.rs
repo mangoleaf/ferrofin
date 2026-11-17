@@ -162,9 +162,11 @@ static REQUIRED: RouteTable = RouteTable {
     parsed: OnceLock::new(),
 };
 
-/// Each action's `[FromBody]` parameter: `[name, message]`, the entry ASP.NET
-/// files beside the complaint when a required body fails to bind, or empty for
-/// a nullable (`X?`) parameter, which gets none.
+/// Each action's `[FromBody]` parameter, Jellyfin's and the ported plugins':
+/// `[name, message]`, the entry ASP.NET files beside the complaint when a
+/// required body fails to bind, or empty when it files none (a nullable `X?`
+/// parameter, a plugin built without nullable reference types, a controller
+/// without `[ApiController]`).
 static BODY: RouteTable = RouteTable {
     json: include_str!("query/body.json"),
     parsed: OnceLock::new(),
@@ -234,7 +236,8 @@ pub(crate) fn required_members(method: &Method, route: &str) -> &'static [String
 /// The `(key, message)` ASP.NET adds for the action's `[FromBody]` parameter
 /// at `method` + `route` (the matched axum template) when its body fails to
 /// bind: the C# parameter's name and "The {name} field is required.". `None`
-/// for a nullable parameter and for a route upstream does not serve.
+/// when ASP.NET files no entry, and for a route neither Jellyfin nor a ported
+/// plugin serves.
 pub(crate) fn body_parameter(method: &Method, route: &str) -> Option<(&'static str, &'static str)> {
     match lookup(&BODY, method, route) {
         [name, message] => Some((name, message)),
@@ -540,9 +543,28 @@ pub(crate) mod tests {
             super::body_parameter(&Method::POST, "/Backup/Restore").map(|(_, message)| message),
             Some("A value for the 'archiveRestoreDto' parameter or property was not provided.")
         );
-        // A nullable parameter, a route with no body and an unknown route.
+        // A ported plugin's own parameter, from its controller (gl-1673).
+        for (route, name) in [
+            ("/Jellyfin.Plugin.OpenSubtitles/ValidateLoginInfo", "body"),
+            ("/Episode/{Id}/Timestamps", "timestamps"),
+            ("/Intros/AnalyzerActions/UpdateSeason", "request"),
+            ("/Intros/DisabledEpisodes/Update", "request"),
+            ("/MediaSegmentsApi/{itemId}", "segment"),
+        ] {
+            assert_eq!(
+                super::body_parameter(&Method::POST, route),
+                Some((name, format!("The {name} field is required.").as_str())),
+                "{route}"
+            );
+        }
+        // A nullable parameter, one in a plugin built without nullable
+        // reference types (LDAP-Auth), one on a controller without
+        // `[ApiController]` (File Transformation), a route with no body and an
+        // unknown route.
         for route in [
             "/Items/{itemId}/PlaybackInfo",
+            "/Ldap/TestServerBind",
+            "/FileTransformation/RegisterTransformation",
             "/Items/{itemId}/Refresh",
             "/Nope",
         ] {
@@ -550,20 +572,11 @@ pub(crate) mod tests {
         }
     }
 
-    /// Every JSON body in the vendored contracts has a row, so each Jellyfin
-    /// body route either names its parameter or is known to be nullable. The
-    /// plugin operations are not Jellyfin's controllers: their names are not
-    /// in this table yet (gl-1673 derives them from each plugin's source),
-    /// and one that gains a row must leave the list.
+    /// Every JSON body in the vendored contracts, and every route in
+    /// `handlers::PLUGIN_ROUTES`, has a row, so each body route either names
+    /// its parameter or is known to file none.
     #[test]
-    fn every_contract_json_body_has_a_body_table_row() {
-        const PLUGIN_OPERATIONS: &[&str] = &[
-            "POST /Episode/{Id}/Timestamps",
-            "POST /FileTransformation/RegisterTransformation",
-            "POST /Intros/AnalyzerActions/UpdateSeason",
-            "POST /Jellyfin.Plugin.OpenSubtitles/ValidateLoginInfo",
-            "POST /MediaSegmentsApi/{itemId}",
-        ];
+    fn every_json_body_has_a_body_table_row() {
         let rows: std::collections::HashSet<String> = serde_json::from_str::<
             std::collections::HashMap<String, Vec<String>>,
         >(super::BODY.json)
@@ -571,12 +584,6 @@ pub(crate) mod tests {
         .into_keys()
         .map(|operation| shape_of(&operation))
         .collect();
-        for operation in PLUGIN_OPERATIONS {
-            assert!(
-                !rows.contains(&shape_of(operation)),
-                "{operation} now has a row: remove it from PLUGIN_OPERATIONS"
-            );
-        }
         let mut missing = Vec::new();
         for spec in [
             include_str!("../../../contracts/jellyfin-openapi-10.11.8.json"),
@@ -589,12 +596,17 @@ pub(crate) mod tests {
                         continue;
                     }
                     let operation = format!("{} {path}", method.to_ascii_uppercase());
-                    if !PLUGIN_OPERATIONS.contains(&operation.as_str())
-                        && !rows.contains(&shape_of(&operation))
-                    {
+                    if !rows.contains(&shape_of(&operation)) {
                         missing.push(operation);
                     }
                 }
+            }
+        }
+        // The plugin routes outside the contract (LDAP-Auth's) all take a body.
+        for (method, path, _) in crate::handlers::PLUGIN_ROUTES {
+            let operation = format!("{} {path}", method.to_ascii_uppercase());
+            if !rows.contains(&shape_of(&operation)) {
+                missing.push(operation);
             }
         }
         assert!(missing.is_empty(), "no body table row: {missing:?}");

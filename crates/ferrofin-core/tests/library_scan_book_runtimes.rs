@@ -22,8 +22,7 @@ use ferrofin_model::entities::CollectionTypeOptions;
 use ferrofin_traits::library::VirtualFolderManager;
 use ferrofin_traits::persistence::ItemRepository;
 use ferrofin_traits::providers::{MetadataRefreshMode, MetadataRefreshOptions};
-
-const ONE_SECOND: i64 = 10_000_000;
+use ferrofin_util::ticks::TICKS_PER_SECOND;
 
 /// Writes a `.cbz` holding a `pages/` directory and `files` page entries.
 fn write_cbz(path: &Path, files: usize) {
@@ -171,15 +170,15 @@ async fn a_book_runtime_comes_from_its_pages_and_refreshes_with_its_probe() {
     // Three pages; the directory entry does not count.
     assert_eq!(runtime(&db, "/Saga v01.cbz").await, Some(30_000));
     assert_eq!(runtime(&db, "/Paper.pdf").await, Some(120_000));
-    assert_eq!(runtime(&db, "/Novel.epub").await, Some(ONE_SECOND));
-    assert_eq!(runtime(&db, "/Kindle.mobi").await, Some(ONE_SECOND));
+    assert_eq!(runtime(&db, "/Novel.epub").await, Some(TICKS_PER_SECOND));
+    assert_eq!(runtime(&db, "/Kindle.mobi").await, Some(TICKS_PER_SECOND));
     // Unreadable: the new row keeps the one-second placeholder.
-    assert_eq!(runtime(&db, "/Broken.cbz").await, Some(ONE_SECOND));
+    assert_eq!(runtime(&db, "/Broken.cbz").await, Some(TICKS_PER_SECOND));
 
     // A row an older release stored with one second takes its page count on
     // the next plain scan (owner decision on gl-495: runtimes refresh on
     // rescan), while a book already counted is not reopened.
-    set_runtime(&db, "/Saga v01.cbz", ONE_SECOND).await;
+    set_runtime(&db, "/Saga v01.cbz", TICKS_PER_SECOND).await;
     set_runtime(&db, "/Paper.pdf", 12_345).await;
     scanner.scan_all().await.expect("rescan");
     assert_eq!(runtime(&db, "/Saga v01.cbz").await, Some(30_000));
@@ -221,7 +220,7 @@ async fn a_book_runtime_comes_from_its_pages_and_refreshes_with_its_probe() {
     assert_eq!(runtime(&db, "/Paper.pdf").await, Some(120_000));
     assert_eq!(runtime(&db, "/Saga v01.cbz").await, Some(50_000));
     // Unreadable files keep their runtime through all of it.
-    assert_eq!(runtime(&db, "/Broken.cbz").await, Some(ONE_SECOND));
+    assert_eq!(runtime(&db, "/Broken.cbz").await, Some(TICKS_PER_SECOND));
 }
 
 /// An archive past `book_archive_max_entries` is not counted: a new book keeps
@@ -236,5 +235,5 @@ async fn an_archive_past_the_entry_cap_is_not_counted() {
     let (db, scanner) = books_library(tmp.path(), &media, Some(5)).await;
     scanner.scan_all().await.expect("scan");
     assert_eq!(runtime(&db, "/Small.cbz").await, Some(20_000));
-    assert_eq!(runtime(&db, "/Large.cbz").await, Some(ONE_SECOND));
+    assert_eq!(runtime(&db, "/Large.cbz").await, Some(TICKS_PER_SECOND));
 }

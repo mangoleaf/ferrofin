@@ -1,13 +1,14 @@
-//! The directory-listing abstraction the local-image providers scan through.
+//! The directory abstraction the local-image providers scan through and the
+//! NFO parser resolves local artwork paths with.
 //!
-//! Port of the two file-listing surfaces the C# image providers depend on:
-//! `MediaBrowser.Controller.Providers.IDirectoryService` (directory enumeration)
-//! and the subset of `MediaBrowser.Model.IO.IFileSystem.GetFiles` they call for
-//! image-extension-filtered listings. Both are folded into one small
-//! [`DirectoryService`] trait so the un-mockable filesystem I/O lives behind a
-//! seam: the scan implements it over its shared directory cache, everything
-//! else uses [`FsDirectoryService`] (real `std::fs`), and the unit tests drive an
-//! in-memory / temp-dir fake.
+//! Port of the file-system surfaces those C# callers depend on:
+//! `MediaBrowser.Controller.Providers.IDirectoryService` (directory enumeration
+//! and `GetFile`) and the subset of `MediaBrowser.Model.IO.IFileSystem.GetFiles`
+//! the image providers call for image-extension-filtered listings. They are
+//! folded into one small [`DirectoryService`] trait so the un-mockable
+//! filesystem I/O lives behind a seam: the scan implements it over its shared
+//! directory cache, everything else uses [`FsDirectoryService`] (real
+//! `std::fs`), and the unit tests drive an in-memory / temp-dir fake.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -51,14 +52,16 @@ pub fn is_supported_image_extension(extension: &str) -> bool {
         .any(|e| e.eq_ignore_ascii_case(extension))
 }
 
-/// The directory-listing seam the local-image providers scan through.
+/// The directory seam the local-image providers scan through and the NFO
+/// parser resolves local artwork paths with.
 ///
-/// Port of the union of `IDirectoryService` (folder enumeration) and the
-/// image-filtered `IFileSystem.GetFiles` calls the providers make. All methods
-/// take absolute paths and must tolerate a non-existent path by returning an
-/// empty list (the C# providers guard every call site with a `Directory.Exists`
-/// check and treat a missing directory as "no images").
-pub trait DirectoryService {
+/// Port of the union of `IDirectoryService` (folder enumeration and `GetFile`)
+/// and the image-filtered `IFileSystem.GetFiles` calls the providers make. The
+/// listing methods take absolute paths and must tolerate a non-existent path by
+/// returning an empty list (the C# providers guard every call site with a
+/// `Directory.Exists` check and treat a missing directory as "no images");
+/// [`get_file`](Self::get_file) answers `None` for any path it cannot resolve.
+pub trait DirectoryService: Send + Sync {
     /// Lists every entry (files *and* subdirectories) directly under `path`.
     ///
     /// Port of `IDirectoryService.GetFileSystemEntries(path)`, which returns
@@ -77,6 +80,25 @@ pub trait DirectoryService {
             .filter(|e| !e.is_directory)
             .cloned()
             .collect()
+    }
+
+    /// Returns the file (not a directory) at `path`, or `None` when nothing is
+    /// there.
+    ///
+    /// Port of `IDirectoryService.GetFile(path)`. Upstream stats the path, as
+    /// [`FsDirectoryService`] does. This default looks the file up in its
+    /// folder's listing instead, so it answers with what the listing holds: a
+    /// link as the listing classifies it, the metadata it carries (the scan's
+    /// cache stats image files only), and a file created after the folder was
+    /// listed only once the listing is refreshed.
+    fn get_file(&self, path: &str) -> Option<FileSystemMetadata> {
+        let path = Path::new(path);
+        let name = path.file_name()?.to_str()?;
+        let folder = path.parent()?.to_str()?;
+        self.file_system_entries(folder)
+            .iter()
+            .find(|e| !e.is_directory && e.name == name)
+            .cloned()
     }
 
     /// Lists the subdirectories directly under `path`.
@@ -179,6 +201,14 @@ impl DirectoryService for FsDirectoryService {
         cache.insert(path.to_owned(), Arc::clone(&entries));
         entries
     }
+
+    /// Stats `path`, following links, as upstream's `GetFileSystemEntry` does
+    /// (`IFileSystem.GetFileSystemInfo`); unlike upstream, the answer is not
+    /// memoized.
+    fn get_file(&self, path: &str) -> Option<FileSystemMetadata> {
+        let metadata = std::fs::metadata(path).ok()?;
+        (!metadata.is_dir()).then(|| fs_metadata_from(Path::new(path), &metadata))
+    }
 }
 
 /// Builds a [`FileSystemMetadata`] from a path and its `std::fs::Metadata`.
@@ -207,7 +237,6 @@ fn fs_metadata_from(path: &Path, metadata: &std::fs::Metadata) -> FileSystemMeta
         name,
         extension,
         length,
-        last_write_time_utc: None,
         is_directory,
     }
 }

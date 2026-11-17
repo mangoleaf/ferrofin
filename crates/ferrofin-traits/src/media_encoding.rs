@@ -95,7 +95,7 @@ pub struct TranscodingJobHandle {
 /// A snapshot of a transcode's progress, reported to the session layer.
 ///
 /// Port of the `ReportTranscodingProgress` argument bundle; grouped into one
-/// struct so the trait method stays object-safe and readable.
+/// struct so the session reporter's progress call takes one argument.
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub struct TranscodingProgress {
     /// The current transcoding position, in ticks (100 ns units).
@@ -183,7 +183,10 @@ pub trait MediaEncoder: Send + Sync {
     /// ffmpeg exposes as a stream) of a video file to a temporary file in
     /// `format`, returning its path. Port of the `ExtractVideoImage(inputFile,
     /// container, mediaSource, imageStream, imageStreamIndex, targetFormat, …)`
-    /// overload `EmbeddedImageProvider` calls.
+    /// overload `EmbeddedImageProvider` calls. `image_stream` is the picked
+    /// embedded-image stream, which the extraction takes as its video stream
+    /// (deinterlaced when ffprobe calls it interlaced); an attachment passes
+    /// `None`.
     ///
     /// The default reports the operation as unsupported, for encoders (and
     /// test doubles) that only extract frames.
@@ -197,10 +200,18 @@ pub trait MediaEncoder: Send + Sync {
         input_file: &str,
         container: &str,
         media_source: &MediaSourceInfo,
+        image_stream: Option<&MediaStream>,
         stream_index: i32,
         format: ImageFormat,
     ) -> Result<String, ServiceError> {
-        let _ = (input_file, container, media_source, stream_index, format);
+        let _ = (
+            input_file,
+            container,
+            media_source,
+            image_stream,
+            stream_index,
+            format,
+        );
         Err(ServiceError::backend(
             "this media encoder cannot extract embedded image streams",
         ))
@@ -405,13 +416,19 @@ pub trait KeyframeExtractor: Send + Sync {
 /// Compile-time assertion that [`KeyframeExtractor`] is object-safe.
 fn _assert_object_safe_keyframe_extractor(_: &dyn KeyframeExtractor) {}
 
-/// Manages live transcode jobs: lookup, keep-alive pings, progress, teardown.
+/// Manages live transcode jobs: lookup, keep-alive pings, teardown.
 ///
 /// Port of the object-safe subset of `ITranscodeManager`. `StartFfMpeg` and
 /// `LockAsync` are not on this seam: `ferrofin-mediaencoding`'s
 /// `TranscodeManagerImpl::start_ffmpeg` starts a job from a
 /// `StartFfMpegRequest`, and the HLS stream manager holds the per-playlist lock
-/// `LockAsync` takes upstream.
+/// `LockAsync` takes upstream. Nor are the request and progress hooks, which
+/// live only on `TranscodeManagerImpl`. `OnTranscodeBeginRequest` /
+/// `OnTranscodeEndRequest` are its `begin_request_guard` and the
+/// `stream_progress` / `segment_progress` observers of a progressive stream,
+/// each ending the request when dropped (a disconnect included).
+/// `ReportTranscodingProgress` is its `update_transcoding_jobs` pass over each
+/// job's ffmpeg progress.
 #[async_trait]
 pub trait TranscodeManager: Send + Sync {
     /// Looks up a running job by its playback-session id. Port of the
@@ -441,36 +458,16 @@ pub trait TranscodeManager: Send + Sync {
     /// Kills the transcode jobs for a device (optionally scoped to one play
     /// session). Port of `KillTranscodingJobs(deviceId, playSessionId,
     /// deleteFiles)`; the `deleteFiles` predicate is replaced by a flag.
+    ///
+    /// Returns once the jobs are stopped and their partial files deleted,
+    /// which `DeletePartialStreamFiles` first waits 1.5 s for and retries for
+    /// up to about 6 s. The deletions run on tasks of their own, so a caller
+    /// that stops waiting does not cut them off.
     async fn kill_transcoding_jobs(
         &self,
         device_id: &str,
         play_session_id: Option<&str>,
         delete_files: bool,
-    ) -> Result<(), ServiceError>;
-
-    /// Reports a job's current progress to the session layer. Port of
-    /// `ReportTranscodingProgress(job, state, …)`; the progress arguments are
-    /// bundled into [`TranscodingProgress`].
-    async fn report_transcoding_progress(
-        &self,
-        job: &TranscodingJobHandle,
-        progress: TranscodingProgress,
-    ) -> Result<(), ServiceError>;
-
-    /// Called when a client begins requesting a transcode output, returning the
-    /// (existing) job serving that path. Port of `OnTranscodeBeginRequest(path,
-    /// type)`.
-    async fn on_transcode_begin_request(
-        &self,
-        path: &str,
-        job_type: TranscodingJobType,
-    ) -> Result<Option<TranscodingJobHandle>, ServiceError>;
-
-    /// Called when a transcode output is finished with, allowing teardown. Port
-    /// of `OnTranscodeEndRequest(job)`.
-    async fn on_transcode_end_request(
-        &self,
-        job: &TranscodingJobHandle,
     ) -> Result<(), ServiceError>;
 }
 
@@ -861,15 +858,17 @@ impl Default for HlsStreamRequest {
 /// Port of the `(path, MimeTypes.GetMimeType(path))` pair the streaming
 /// controllers hand to `FileStreamResponseHelpers.GetStaticFileResult`. The
 /// caller (a `ferrofin-api` handler) streams the file at [`path`](Self::path) with
-/// [`content_type`](Self::content_type); the transcode job that produced it is
-/// kept alive / torn down by the [`HlsStreamManager`] internally.
+/// [`content_type`](Self::content_type), and keeps [`progress`](Self::progress)
+/// for as long as the response body lives.
 #[derive(Clone)]
 pub struct ServedFile {
     /// The absolute path of the file to serve.
     pub path: String,
     /// The MIME type to serve it as (e.g. `video/mp2t`, `application/x-mpegURL`).
     pub content_type: String,
-    /// Bound to the producing job at resolution, before any seek replacement.
+    /// Bound to the producing job at resolution, before any seek replacement:
+    /// the job's active request, released when the response body ends or is
+    /// dropped.
     pub progress: Option<std::sync::Arc<dyn TranscodeStreamProgress>>,
 }
 
@@ -985,17 +984,24 @@ pub trait HlsStreamManager: Send + Sync {
     /// `GetHlsVideoSegmentLegacy`/`GetHlsPlaylistLegacy`/`GetHlsAudioSegmentLegacy`
     /// serve path: `file_name` (`<segmentId><ext>`) must resolve *inside* the
     /// transcode folder. `require_m3u8` rejects a non-playlist match (the
-    /// playlist-legacy route). Marks the owning job as begun so its keep-alive
-    /// timer is refreshed. [`ServiceError::InvalidInput`] on a traversal/miss.
+    /// playlist-legacy route). `playlist_id` is the legacy video segment's
+    /// `{playlistId}`: the folder must hold a file with the segment's extension
+    /// or `.m3u8` whose path contains it. The served file's
+    /// [`ServedFile::progress`] keeps that playlist's job (the served file's
+    /// own without `playlist_id`) active until the response completes.
     ///
     /// # Errors
     ///
     /// Returns [`ServiceError::InvalidInput`] when `file_name` escapes the
-    /// transcode folder or does not resolve to an on-disk file.
+    /// transcode folder (or is not a playlist under `require_m3u8`), and
+    /// [`ServiceError::NotFound`] when no file matches `playlist_id` or the
+    /// file does not exist, and [`ServiceError::Backend`] when the transcode
+    /// folder cannot be prepared or listed.
     async fn resolve_transcode_file(
         &self,
         file_name: &str,
         require_m3u8: bool,
+        playlist_id: Option<&str>,
     ) -> Result<ServedFile, ServiceError>;
 
     /// Runs the **progressive transcode** branch of `/Videos/{id}/stream` (and
@@ -1014,7 +1020,8 @@ pub trait HlsStreamManager: Send + Sync {
     ) -> Result<ServedFile, ServiceError>;
 
     /// Stops the active encoding(s) for `request`'s device / play session,
-    /// deleting their partial files.
+    /// deleting their partial files once it has returned: upstream does not
+    /// await `KillTranscodingJobs` here.
     ///
     /// Port of `HlsSegmentController.StopEncodingProcess` → `KillTranscodingJobs`.
     /// Only [`device_id`](HlsStreamRequest::device_id) and
@@ -1024,6 +1031,23 @@ pub trait HlsStreamManager: Send + Sync {
     ///
     /// Returns a [`ServiceError`] if the kill cannot be dispatched.
     async fn stop_encoding(&self, request: &HlsStreamRequest) -> Result<(), ServiceError>;
+
+    /// [`Self::stop_encoding`], returning only once the partial files are
+    /// deleted too, as the playback-stop reports await `KillTranscodingJobs`
+    /// (see [`TranscodeManager::kill_transcoding_jobs`]).
+    ///
+    /// The default is [`Self::stop_encoding`], for a manager whose stop leaves
+    /// nothing to wait for.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`ServiceError`] if the kill cannot be dispatched.
+    async fn stop_encoding_awaiting_deletion(
+        &self,
+        request: &HlsStreamRequest,
+    ) -> Result<(), ServiceError> {
+        self.stop_encoding(request).await
+    }
 
     /// Refreshes the keep-alive timer for the transcoding job(s) of a play
     /// session so an active-but-paused transcode is not reaped.

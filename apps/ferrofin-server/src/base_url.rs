@@ -5,6 +5,12 @@
 //! probe endpoints (`/health/live`, `/health/ready`) also remain available at
 //! the root so deployments can keep probing while the base URL changes.
 //!
+//! The mount matches the decoded path with the decoded base, so a base saved
+//! as `/my jellyfin` or `/my%20jellyfin` mounts `/my%20jellyfin/…`. Jellyfin
+//! 12.4 (probed live) mounts only the escaped spelling: its redirect middleware
+//! compares the re-escaped path with the base as saved, so the other loops. A
+//! Jellyfin bug not ported (gl-1685).
+//!
 //! [`resolve`] picks the base URL a server lifetime serves under, and
 //! [`restart_listener`] marks a restart pending when a Networking page save
 //! changes it.
@@ -19,6 +25,8 @@ use ferrofin_core::system_manager::LifecycleController;
 use ferrofin_networking::NetworkConfiguration;
 use ferrofin_traits::configuration::ConfigurationListener;
 
+// A Location carries the base escaped, so `/my jellyfin` makes a valid header.
+use ferrofin_networking::escape_base_url as escape;
 pub(crate) use ferrofin_networking::normalize_base_url as normalize;
 
 /// The base URL a server lifetime mounts, redirects to and advertises: the
@@ -60,6 +68,7 @@ pub(crate) fn restart_listener(
         move |saved| resolve(&bootstrap, variable_set, saved),
         "serve under the new base URL",
         lifecycle,
+        |_| {},
     )
 }
 
@@ -77,16 +86,15 @@ pub(crate) async fn rewrite(
         return next.run(request).await;
     }
 
-    let has_prefix = path
-        .get(..base.len())
-        .is_some_and(|prefix| prefix.eq_ignore_ascii_case(&base));
-    let suffix = path.get(base.len()..).unwrap_or_default();
-    if !has_prefix || suffix.is_empty() || suffix == "/" {
+    let suffix = ferrofin_networking::base_url_prefix_len(path, &base)
+        .and_then(|at| path.get(at..))
+        .unwrap_or_default();
+    if suffix.is_empty() || suffix == "/" {
         // Upstream sends a health check outside the mount into it.
         if path.eq_ignore_ascii_case("/health") || path.eq_ignore_ascii_case("/health/") {
             return (
                 StatusCode::FOUND,
-                [(header::LOCATION, format!("{base}/health"))],
+                [(header::LOCATION, format!("{}/health", escape(&base)))],
             )
                 .into_response();
         }
@@ -94,7 +102,7 @@ pub(crate) async fn rewrite(
         // web path. Use 302 (not Axum Redirect's 303/307/308).
         return (
             StatusCode::FOUND,
-            [(header::LOCATION, format!("{base}/web/"))],
+            [(header::LOCATION, format!("{}/web/", escape(&base)))],
         )
             .into_response();
     }
@@ -125,7 +133,7 @@ pub(crate) async fn rewrite(
         && let Ok(location) = location.to_str()
         && location.starts_with('/')
         && !location.starts_with("//")
-        && let Ok(location) = HeaderValue::from_str(&format!("{base}{location}"))
+        && let Ok(location) = HeaderValue::from_str(&format!("{}{location}", escape(&base)))
     {
         response.headers_mut().insert(header::LOCATION, location);
     }
@@ -265,6 +273,55 @@ mod tests {
             assert_eq!(response.status(), StatusCode::FOUND, "{path}");
             assert_eq!(response.headers()[header::LOCATION], "/jellyfin/health");
         }
+    }
+
+    /// gl-1685: a base holding a character clients escape mounts the path
+    /// they send, saved escaped or not, and the redirects carry it escaped.
+    #[rstest::rstest]
+    #[case::space("/my jellyfin", "/MY%20Jellyfin", "/my%20jellyfin")]
+    #[case::space_saved_escaped("/my%20jellyfin", "/my%20jellyfin", "/my%20jellyfin")]
+    #[case::non_ascii("/m\u{e9}dias", "/m%c3%a9dias", "/m%C3%A9dias")]
+    #[case::non_ascii_saved_escaped("/m%C3%A9dias", "/M%C3%A9DIAS", "/m%C3%A9dias")]
+    #[tokio::test]
+    async fn a_base_clients_escape_mounts_decoded(
+        #[case] base: &str,
+        #[case] mount: &str,
+        #[case] location: &str,
+    ) {
+        let response = send(base, &format!("{mount}/system/info/public?key=a%2Fb")).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        assert_eq!(body, "/System/Info/Public?key=a%2Fb");
+        for (path, target) in [
+            ("/System/Info/Public".to_owned(), "web/"),
+            (mount.to_owned(), "web/"),
+            (format!("{mount}/"), "web/"),
+            ("/health".to_owned(), "health"),
+        ] {
+            let response = send(base, &path).await;
+            assert_eq!(response.status(), StatusCode::FOUND, "{path}");
+            assert_eq!(
+                response.headers()[header::LOCATION],
+                format!("{location}/{target}")
+            );
+        }
+        let response = send(base, &format!("{mount}/web")).await;
+        assert_eq!(
+            response.headers()[header::LOCATION],
+            format!("{location}/web/")
+        );
+        let other = format!("{mount}-other/web");
+        assert_eq!(send(base, &other).await.status(), StatusCode::NOT_FOUND);
+    }
+
+    /// `%2F` is not a `/`, as Kestrel leaves it escaped in the path.
+    #[tokio::test]
+    async fn an_escaped_slash_is_not_a_separator() {
+        let path = "/a%2fb/System/Info/Public";
+        assert_eq!(send("/a/b", path).await.status(), StatusCode::FOUND);
+        assert_eq!(send("/a%2Fb", path).await.status(), StatusCode::OK);
     }
 
     #[tokio::test]
