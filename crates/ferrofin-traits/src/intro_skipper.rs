@@ -376,6 +376,12 @@ pub trait IntroSkipperStore: Send + Sync {
         modes: &[AnalysisMode],
     ) -> Result<(), ServiceError>;
 
+    /// Deletes the items' automatic segments and drops them from every
+    /// season's analysed lists, together, so the next pass analyses them
+    /// again; user-provided segments stay. Used when an item's file changed;
+    /// upstream's plugin keeps the old analysis.
+    async fn forget_items(&self, item_ids: &[Uuid]) -> Result<(), ServiceError>;
+
     /// Deletes every segment that is not valid (`End <= 0`) — what upstream's
     /// `RebuildDatabaseAsync` leaves behind when it restores its backup; how
     /// many went.
@@ -407,8 +413,9 @@ impl Default for IntroSkipperSettings {
 
 /// The plugin's analysis runtime: its one-pass-at-a-time lock
 /// (`ScheduledTaskSemaphore`), on-demand season rescans and the detection
-/// cache — implemented by the Intro Skipper extension, so the routes reach
-/// them without depending on it.
+/// cache, plus the services its routes call (the segment editor, the support
+/// bundle's probes) — implemented by the Intro Skipper extension, so the
+/// routes reach them without depending on it.
 #[async_trait]
 pub trait IntroSkipperAnalysis: Send + Sync {
     /// Whether an analysis pass is running (any of them: the scheduled
@@ -454,6 +461,23 @@ pub trait IntroSkipperAnalysis: Send + Sync {
     /// warnings, the ffmpeg checks' output), as Markdown lines.
     async fn support_bundle(&self) -> String;
 
+    /// The platform the support bundle names
+    /// (`Helper.OperatingSystem.DetermineOperatingSystem`).
+    fn operating_system(&self) -> String;
+
+    /// Publishes a segment entered in the plugin's segment editor under the
+    /// plugin's provider id (`MediaSegmentEditorService.CreateOrReplaceSegmentAsync`):
+    /// a Commercial identical to one already published is skipped; any other
+    /// type replaces the item's segments of that type, whatever their
+    /// provider. Nothing is published for an item that takes no media
+    /// segments (not a video or audio). Edits of one item (`segment.item_id`)
+    /// run one at a time, process-wide; `segment.id` is ignored, as the store
+    /// assigns one.
+    async fn create_or_replace_segment(
+        &self,
+        segment: &MediaSegmentDto,
+    ) -> Result<(), ServiceError>;
+
     /// The settings the plugin's routes read. Defaults to the plugin's
     /// defaults, for an analysis with no configuration behind it.
     async fn settings(&self) -> IntroSkipperSettings {
@@ -477,7 +501,7 @@ pub struct ExcludedClear {
 
 /// An [`IntroSkipperAnalysis`] with nothing behind it: the default of a state
 /// built without the extension (tests), never the server's — it is never
-/// running, and a rescan or cache erase is a backend error.
+/// running, and a rescan, cache erase or segment edit is a backend error.
 #[derive(Debug, Default)]
 pub struct DetachedIntroSkipperAnalysis;
 
@@ -522,6 +546,20 @@ impl IntroSkipperAnalysis for DetachedIntroSkipperAnalysis {
 
     async fn support_bundle(&self) -> String {
         "* The intro skipper extension is not attached\n".to_owned()
+    }
+
+    // Nothing probes the platform here: upstream's answer for one it does not know.
+    fn operating_system(&self) -> String {
+        "Unknown".to_owned()
+    }
+
+    async fn create_or_replace_segment(
+        &self,
+        _segment: &MediaSegmentDto,
+    ) -> Result<(), ServiceError> {
+        Err(ServiceError::backend(
+            "the intro skipper extension is not attached",
+        ))
     }
 }
 
@@ -847,6 +885,17 @@ impl IntroSkipperStore for InMemoryIntroSkipperStore {
             if *season == season_id && modes.contains(mode) {
                 state.episode_ids.clear();
             }
+        }
+        Ok(())
+    }
+
+    async fn forget_items(&self, item_ids: &[Uuid]) -> Result<(), ServiceError> {
+        let mut memory = self.lock()?;
+        memory
+            .segments
+            .retain(|s| s.is_user_provided || !item_ids.contains(&s.item_id));
+        for state in memory.states.values_mut() {
+            state.episode_ids.retain(|id| !item_ids.contains(id));
         }
         Ok(())
     }

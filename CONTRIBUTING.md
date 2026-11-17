@@ -114,14 +114,16 @@ is Ferrofin's own code, reviewed in its PR.
 crate=ferrofin-core   # the crate to gate
 others=$(basename -a crates/*/ | grep -v "^$crate\$" | paste -sd'|')
 cargo llvm-cov nextest -p "$crate" --fail-under-lines 80 --summary-only \
-  --ignore-filename-regex "(crates/($others)|apps)/"
+  --ignore-filename-regex "(crates/($others)|apps)/|crates/ferrofin-api/src/test_support\.rs"
 ```
 
 This is CI's form: both pipelines run it per crate from `scripts/coverage-gate.sh`,
 split into three parallel shards. `-p` alone still instruments the
 crate's workspace dependencies, so a crate whose tests link another crate (e.g.
 `ferrofin-wasm`'s scan tests link `ferrofin-core`) would count that crate's uncovered
-source in its total; the regex leaves only the crate's own files.
+source in its total; the regex leaves only the crate's own files. It also drops
+`ferrofin-api`'s `src/test_support.rs`, the test doubles that crate compiles in for its
+tests: scaffolding, not code under test, so it never counts toward the 80%.
 
 Gate each crate on its own; don't pass multiple `-p` flags to one run (that
 checks the merged total and lets a weak crate hide behind a strong one).

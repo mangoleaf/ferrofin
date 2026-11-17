@@ -168,39 +168,15 @@ async fn typed_views(
     Ok(groups)
 }
 
-/// The `ViewType` a stored view carries, as the `CollectionType` member name
-/// — read from the `Data` JSON the way the DTO projection reads it. Jellyfin
-/// serializes the enum by name (`JsonStringEnumConverter`); the numeric form
-/// is accepted too, mapped over the public discriminants, so a blob written
-/// by a converter-less serializer still classifies.
+/// The `ViewType` a stored view carries (`UserView.ViewType`), bound from the
+/// `Data` JSON as Jellyfin binds it ([`CollectionType::from_item_data`], the
+/// reading the DTO projection shares), by its C# `ToString()` name: the
+/// lowercase member name, or the number for a value no member names.
+///
+/// [`CollectionType::from_item_data`]: ferrofin_model::data::CollectionType::from_item_data
 pub(crate) fn view_type_of(data: Option<&str>) -> Option<String> {
-    /// `Jellyfin.Data.Enums.CollectionType`, discriminants 0–12 in order.
-    const PUBLIC_NAMES: [&str; 13] = [
-        "unknown",
-        "movies",
-        "tvshows",
-        "music",
-        "musicvideos",
-        "trailers",
-        "homevideos",
-        "boxsets",
-        "books",
-        "photos",
-        "livetv",
-        "playlists",
-        "folders",
-    ];
-    let blob: serde_json::Value = serde_json::from_str(data?).ok()?;
-    match blob.get("ViewType")? {
-        serde_json::Value::String(name) if !name.trim().is_empty() => {
-            Some(name.trim().to_ascii_lowercase())
-        }
-        serde_json::Value::Number(disc) => {
-            let index = usize::try_from(disc.as_i64()?).ok()?;
-            PUBLIC_NAMES.get(index).map(|name| (*name).to_owned())
-        }
-        _ => None,
-    }
+    ferrofin_model::data::CollectionType::from_item_data(data, "ViewType")
+        .map(|kind| kind.json_name().into_owned())
 }
 
 /// `Path.GetFileName(path.TrimEnd(DirectorySeparatorChar))` after either
@@ -1238,6 +1214,9 @@ mod tests {
     #[case(Some(r#"{"ViewType":"livetv"}"#), Some("livetv"))]
     #[case(Some(r#"{"ViewType":"LiveTv"}"#), Some("livetv"))]
     #[case(Some(r#"{"ViewType":10}"#), Some("livetv"))]
+    #[case(Some(r#"{"ViewType":110}"#), Some("movieresume"))]
+    #[case(Some(r#"{"ViewType":99}"#), Some("99"))]
+    #[case(Some(r#"{"ViewType":"nonsense"}"#), None)]
     #[case(Some(r#"{"ViewType":""}"#), None)]
     #[case(Some(r#"{"ViewType":null}"#), None)]
     #[case(Some(r#"{"DisplayParentId":"x"}"#), None)]

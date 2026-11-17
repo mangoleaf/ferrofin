@@ -24,6 +24,9 @@ set -uo pipefail
 CORE=(ferrofin-core)
 HEAVY=(ferrofin-api ferrofin-wasm ferrofin-livetv ferrofin-extensions)
 EXEMPT=ferrofin-traits
+# Test doubles compiled into ferrofin-api (feature `test-util`) for its tests: scaffolding,
+# not code under test, so they never count toward its total.
+SCAFFOLDING='crates/ferrofin-api/src/test_support\.rs'
 
 # Always relative to the repo root, wherever the caller's working directory is.
 cd "$(dirname "${BASH_SOURCE[0]}")/.." || exit 2
@@ -60,7 +63,7 @@ for crate in "${crates[@]}"; do
   # the TOTAL the gate compares against. Exclude every sibling.
   others=$(printf '%s\n' "${all[@]}" | grep -vx "$crate" | paste -sd'|')
   if ! cargo llvm-cov nextest -p "$crate" --locked --fail-under-lines 80 --summary-only \
-    --ignore-filename-regex "(crates/($others)|apps)/"; then
+    --ignore-filename-regex "(crates/($others)|apps)/|$SCAFFOLDING"; then
     # GitHub turns this prefix into an annotation; elsewhere it is a plain line.
     echo "::error::Tests or coverage failed for $crate"
     fail=1

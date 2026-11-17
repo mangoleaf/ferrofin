@@ -147,11 +147,11 @@ async fn provider(
         return Json(json!({
             "id":603,"imdb_id":"tt0133093","title":format!("Locale {language}"),"overview":format!("Overview {language}"),
             "release_date":"1999-03-30", "vote_average":8,
-            "release_dates":{"results":[
-                {"iso_3166_1":"US","release_dates":[{"certification":"R"}]},
-                {"iso_3166_1":"FR","release_dates":[{"certification":"12"}]},
-                {"iso_3166_1":"DE","release_dates":[{"certification":"12"}]},
-                {"iso_3166_1":"AR","release_dates":[{"certification":"13"}]}
+            "releases":{"countries":[
+                {"iso_3166_1":"US","certification":"R"},
+                {"iso_3166_1":"FR","certification":"12"},
+                {"iso_3166_1":"DE","certification":"12"},
+                {"iso_3166_1":"AR","certification":"13"}
             ]},"videos":{"results":[]},"credits":{"cast":[],"crew":[]}
         })).into_response();
     }
@@ -706,6 +706,18 @@ async fn verify_media_segment_library_options(api: &Api, item: &str) {
             usize::from(!disabled),
             "{served}"
         );
+        if !disabled {
+            let segment = &served["Items"][0];
+            assert_eq!(
+                (
+                    &segment["Type"],
+                    &segment["StartTicks"],
+                    &segment["EndTicks"]
+                ),
+                (&json!("Intro"), &json!(0), &json!(10_000_000)),
+                "the edit is published as posted: {served}"
+            );
+        }
         assert!(
             api.get(&format!("/Episode/{item}/Timestamps")).await["Introduction"].is_object(),
             "management access preserves hidden detections"
@@ -1955,6 +1967,12 @@ async fn verify_automatic_subtitle_constraints(
         &json!({"Username":"fixture","Password":"fixture"}),
     )
     .await;
+    // The settings page's login check reaches the provider by its name.
+    api.post(
+        "/Jellyfin.Plugin.OpenSubtitles/ValidateLoginInfo",
+        &json!({"Username":"fixture","Password":"fixture"}),
+    )
+    .await;
     std::fs::write(media.join("Locale.mkv"), vec![0_u8; 131_072]).unwrap();
     let snapshot = root.join("embedded-subtitles.json");
     std::fs::write(&snapshot, json!({
@@ -2033,12 +2051,12 @@ async fn verify_automatic_subtitle_constraints(
         .await;
     let candidate = found[0]["Id"].as_str().unwrap().to_owned();
     let (namespace, local) = candidate.split_once('_').unwrap();
-    assert_eq!(namespace, "29c0c3633fefe8ab4d5b9af1b0275f3d", "{found}");
+    assert_eq!(namespace, "e02a34f56233e3e5e7765144ca8f184f", "{found}");
     assert!(local.ends_with("-eng-42"), "{found}");
     for (path, expected) in [
         (format!("/Providers/Subtitles/Subtitles/{candidate}"), 200),
         (
-            format!("/Providers/Subtitles/Subtitles/OpenSubtitles_{local}"),
+            format!("/Providers/Subtitles/Subtitles/Open%20Subtitles_{local}"),
             400,
         ),
     ] {
@@ -2107,7 +2125,7 @@ async fn verify_automatic_subtitle_constraints(
     );
 
     options["SubtitleDownloadLanguages"] = json!(["ger"]);
-    options["DisabledSubtitleFetchers"] = json!(["OPENSUBTITLES"]);
+    options["DisabledSubtitleFetchers"] = json!(["OPEN SUBTITLES"]);
     api.post(
         "/Library/VirtualFolders/LibraryOptions",
         &json!({"Id":library,"LibraryOptions":options}),

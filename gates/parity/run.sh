@@ -148,9 +148,10 @@ cleanup() {   # the EXIT trap: stops what runs, removes the containers, and make
   trap - EXIT
   trap '' INT TERM HUP   # a second signal must not abort the teardown
   gates_ack
-  # Stop whatever is still running first: a boot in progress, the comparison.
-  for job in $(jobs -p); do kill "$job" 2>/dev/null; done
-  wait 2>/dev/null
+  # Stop whatever is still running first: a boot in progress, the comparison. Each by its PID: a bare
+  # `wait` in an EXIT trap after a kill can loop forever on bash 5.3 before patch 10 (bash53-010), the
+  # bash Ubuntu 26.04 ships (gl-1825).
+  for job in ${ORACLE_PID:-} ${FERROFIN_PID:-} ${COMPARE_PID:-}; do kill "$job" 2>/dev/null; wait "$job" 2>/dev/null; done
   # A boot's `timeout docker run` leads its own process group and outlives its killed subshell (a signal
   # to the script's group kills the subshell first, so the create is orphaned). Find it by its command
   # line and stop it before the removals below: a container must not appear after them.
@@ -279,8 +280,8 @@ rc=0
 timeout --kill-after="${CLEANUP_TIMEOUT_S}s" "$((remaining + CLEANUP_TIMEOUT_S))s" "${pin_prefix[@]}" python3 gates/parity/diff.py run \
   --oracle-url "http://127.0.0.1:$ORACLE_PORT" --ferrofin-url "http://127.0.0.1:$FERROFIN_PORT" --ids "$IDS" "${request_args[@]}" \
   --out "$OUT" --request-timeout "$PARITY_REQUEST_TIMEOUT" --deadline "$DEADLINE" --concurrency "$PARITY_CONCURRENCY" \
-  --reset-command "$(printf '%q ' bash gates/parity/reset.sh "$OUT")" 2> "$OUT/diff.err" &
-wait "$!" || rc=$?
+  --reset-command "$(printf '%q ' bash gates/parity/reset.sh "$OUT")" 2> "$OUT/diff.err" & COMPARE_PID=$!
+wait "$COMPARE_PID" || rc=$?
 cat "$OUT/diff.err" >&2
 # diff.py exits 0 (nothing new), 1 (new differences) or 2 (an input it could not use); anything else
 # is the backstop timeout (124, 137) or a crash. Whatever it was, the run's exit is 0 or 1.

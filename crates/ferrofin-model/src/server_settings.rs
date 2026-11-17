@@ -25,7 +25,9 @@ pub struct ServerSettingsDto {
     /// file, when it exists, is not read-only.
     pub config_file_writable: bool,
 
-    /// Whether a restart is pending (`GET /System/Info`'s `HasPendingRestart`).
+    /// Whether a restart is pending (`GET /System/Info`'s `HasPendingRestart`),
+    /// or the server is shutting down (its `IsShuttingDown`), so a restart under
+    /// way is not over yet.
     pub restart_pending: bool,
 
     /// One entry per setting, grouped as the settings page shows them.

@@ -53,11 +53,11 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use ferrofin_db::entities::base_items::BaseItemEntity;
+use ferrofin_db::entities::base_items::{BaseItemEntity, presentation_key};
 use ferrofin_db::entities::users::UserEntity;
 use ferrofin_model::data::BaseItemKind;
 use ferrofin_model::dto::BaseItemDto;
-use ferrofin_model::entities_media::AiredEpisodeOrder as AiredOrder;
+use ferrofin_model::entities_media::{AiredEpisodeOrder as AiredOrder, airs_numbers};
 use ferrofin_model::querying::QueryResult;
 
 use ferrofin_traits::configuration::ServerConfigurationManager;
@@ -116,23 +116,16 @@ impl FerrofinTvSeriesManager {
         }
     }
 
-    /// The presentation unique key of a series row: its explicit
-    /// `PresentationUniqueKey` when set, else its id (mirrors
-    /// `Series.GetPresentationUniqueKey()`).
-    fn series_presentation_key(series: &BaseItemEntity) -> String {
-        series
-            .presentation_unique_key
-            .clone()
-            .filter(|k| !k.is_empty())
-            .unwrap_or_else(|| series.id.clone())
-    }
-
-    /// Resolves the parents the next-up scan is scoped to.
+    /// The keys statement's query for `user`, scoped to the parents the
+    /// next-up scan covers, or `None` when there are none.
     ///
     /// When `parent_id` is set, that single parent is the scope (the C#
     /// `parents = [parent]` branch); the nil id is `InvalidInput`, as
-    /// `GetItemById(Guid.Empty)` throws `ArgumentException`. Otherwise the
-    /// scope is the user's library folders:
+    /// `GetItemById(Guid.Empty)` throws `ArgumentException`. A box set or a
+    /// playlist is the query's `descendant_of_id`, which the service scopes by
+    /// what it links when it links anything (`SetTopParentIdsOrAncestors`'
+    /// linked arm, gl-36); any other parent is its `top_parent_ids`.
+    /// Otherwise the scope is the user's library folders:
     /// `GetUserRootFolder().GetChildren(user, true)` — the user root's
     /// children the user may see — kept to `Folder`s and minus the views the
     /// user excluded from "latest" (`PreferenceKind.LatestItemExcludes`).
@@ -145,21 +138,33 @@ impl FerrofinTvSeriesManager {
     /// collection folder to its physical folders, and a view (a grouped view
     /// an explicit `parentId` names) to the libraries behind it, as
     /// `LibraryManager.GetNextUpSeriesKeys` does.
-    async fn resolve_parents(
+    async fn keys_scope(
         &self,
         parent_id: Option<uuid::Uuid>,
         user: &UserEntity,
-    ) -> Result<Vec<uuid::Uuid>, ServiceError> {
+    ) -> Result<Option<InternalItemsQuery>, ServiceError> {
+        let mut scope = InternalItemsQuery {
+            user: Some(Arc::new(user.clone())),
+            ..InternalItemsQuery::default()
+        };
         if let Some(parent) = parent_id {
             // `GetItemById(Guid.Empty)` throws `ArgumentException`: a 400.
             if parent.is_nil() {
                 return Err(ServiceError::invalid_input("Guid can't be empty"));
             }
             // Only scope to it if it actually exists (C# `parent is not null`).
-            if self.library_manager.get_item_by_id(parent).await?.is_some() {
-                return Ok(vec![parent]);
+            let Some(row) = self.library_manager.get_item_by_id(parent).await? else {
+                return Ok(None);
+            };
+            if matches!(
+                kind_from_type_name(&row.type_),
+                Some(BaseItemKind::BoxSet | BaseItemKind::Playlist)
+            ) {
+                scope.descendant_of_id = Some(parent);
+            } else {
+                scope.top_parent_ids = vec![parent];
             }
-            return Ok(Vec::new());
+            return Ok(Some(scope));
         }
 
         // `user_root_children` is the repository's `GetChildren(user, true)`
@@ -193,12 +198,13 @@ impl FerrofinTvSeriesManager {
             .map(|c| c.latest_items_excludes)
             .unwrap_or_default();
 
-        Ok(children
+        scope.top_parent_ids = children
             .iter()
             .filter(|row| kind_from_type_name(&row.type_).is_some_and(kinds::is_folder))
             .filter_map(|row| uuid::Uuid::parse_str(&row.id).ok())
             .filter(|id| !excludes.contains(id))
-            .collect())
+            .collect();
+        Ok((!scope.top_parent_ids.is_empty()).then_some(scope))
     }
 
     /// Runs the batched next-up algorithm for a set of series keys and pages
@@ -466,7 +472,8 @@ fn last_watched_date(result: &NextUpEpisodeBatchResult, rewatching: bool) -> Dat
         .unwrap_or_else(|| min + chrono::Duration::days(1))
 }
 
-/// Read source aired-order fields once per entity.
+/// Read source aired-order fields once per entity. Only a special's `Airs*`
+/// numbers are read: [`AiredOrder::compare`] reads them for specials only.
 pub(crate) fn aired_order(episode: &BaseItemEntity) -> AiredOrder {
     let mut order = AiredOrder {
         season: episode.parent_index_number,
@@ -484,23 +491,6 @@ pub(crate) fn aired_order(episode: &BaseItemEntity) -> AiredOrder {
         ] = airs_numbers(episode.data.as_deref());
     }
     order
-}
-
-/// The `AirsBeforeSeasonNumber`, `AirsAfterSeasonNumber` and
-/// `AirsBeforeEpisodeNumber` members of an episode's `Data` blob, in that
-/// order: each one an integer in `i64` range, else `None`, and all three
-/// `None` when the blob is missing or no JSON. Only a special's are read
-/// ([`aired_order`], and the next-up batch's specials).
-pub(crate) fn airs_numbers(data: Option<&str>) -> [Option<i64>; 3] {
-    let Some(blob) = data.and_then(|d| serde_json::from_str::<serde_json::Value>(d).ok()) else {
-        return [None; 3];
-    };
-    let number = |key: &str| blob.get(key).and_then(serde_json::Value::as_i64);
-    [
-        number("AirsBeforeSeasonNumber"),
-        number("AirsAfterSeasonNumber"),
-        number("AirsBeforeEpisodeNumber"),
-    ]
 }
 
 /// A batch episode's operand for the aired-order sort. Only a special carries
@@ -537,15 +527,14 @@ impl TvSeriesManager for FerrofinTvSeriesManager {
             && let Some(series) = self.library_manager.get_item_by_id(series_id).await?
             && kind_from_type_name(&series.type_) == Some(BaseItemKind::Series)
         {
-            let key = Self::series_presentation_key(&series);
+            let key = presentation_key(&series).to_owned();
             return self.next_up_batched(query, &user, &[key], options).await;
         }
 
         // Library-wide path: find eligible series keys under the scoped parents.
-        let parents = self.resolve_parents(query.parent_id, &user).await?;
-        if parents.is_empty() {
+        let Some(keys_query) = self.keys_scope(query.parent_id, &user).await? else {
             return Ok(QueryResult::new(query.start_index, Some(0), Vec::new()));
-        }
+        };
 
         let cutoff = query
             .next_up_date_cutoff
@@ -556,11 +545,6 @@ impl TvSeriesManager for FerrofinTvSeriesManager {
         // capped the *series* considered before the picks were decided, and
         // the resumable/specials rules can drop any of them — 12 items where
         // v12 answers 16.
-        let keys_query = InternalItemsQuery {
-            user: Some(Arc::new(user.clone())),
-            top_parent_ids: parents,
-            ..InternalItemsQuery::default()
-        };
         let series_keys = self
             .next_up_service
             .get_next_up_series_keys(&keys_query, cutoff)
@@ -1779,6 +1763,58 @@ mod tests {
             );
         } else {
             assert!(keys_query.is_none(), "a missing parent scopes to nothing");
+        }
+    }
+
+    /// gl-36: a box set or playlist `parentId` is the keys query's
+    /// `descendant_of_id` (`SetTopParentIdsOrAncestors`' linked arm; the
+    /// service checks it links anything), with no top parents, so the service
+    /// adds the user's libraries as `AddUserToQuery` does. Any other parent is
+    /// a top parent, as before.
+    #[rstest]
+    #[case(BaseItemKind::BoxSet, true)]
+    #[case(BaseItemKind::Playlist, true)]
+    #[case(BaseItemKind::Series, false)]
+    #[case(BaseItemKind::Folder, false)]
+    #[tokio::test]
+    async fn a_box_set_or_playlist_parent_scopes_by_its_descendants(
+        #[case] kind: BaseItemKind,
+        #[case] linked: bool,
+    ) {
+        let db = test_db().await;
+        let user_id = Uuid::new_v4();
+        let user = seed_user(&db, user_id).await;
+        let parent = Uuid::new_v4();
+        let library = FakeLibraryManager {
+            items: HashMap::from([(parent, item(parent, kind))]),
+            root_children: vec![item(Uuid::new_v4(), BaseItemKind::CollectionFolder)],
+        };
+        let next_up = Arc::new(FakeNextUpService::new(Vec::new(), HashMap::new()));
+        let mgr = manager(user, library, Arc::clone(&next_up), false);
+
+        mgr.get_next_up(
+            &NextUpQuery {
+                user_id,
+                parent_id: Some(parent),
+                ..NextUpQuery::default()
+            },
+            &DtoOptions::default(),
+        )
+        .await
+        .expect("next up");
+
+        let keys_query = next_up
+            .keys_query
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("keys queried");
+        if linked {
+            assert_eq!(keys_query.descendant_of_id, Some(parent));
+            assert!(keys_query.top_parent_ids.is_empty(), "{keys_query:?}");
+        } else {
+            assert_eq!(keys_query.descendant_of_id, None);
+            assert_eq!(keys_query.top_parent_ids, vec![parent]);
         }
     }
 

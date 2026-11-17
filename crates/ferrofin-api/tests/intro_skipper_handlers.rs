@@ -394,6 +394,15 @@ impl ferrofin_traits::intro_skipper::IntroSkipperAnalysis for FakeAnalysis {
     async fn support_bundle(&self) -> String {
         String::new()
     }
+    fn operating_system(&self) -> String {
+        String::new()
+    }
+    async fn create_or_replace_segment(
+        &self,
+        _segment: &MediaSegmentDto,
+    ) -> Result<(), ServiceError> {
+        Ok(())
+    }
     /// The extension's typed settings, as its parse of the plugin config
     /// above (`SkipbuttonHideDelay` 11) gives them.
     async fn settings(&self) -> ferrofin_traits::intro_skipper::IntroSkipperSettings {
@@ -775,8 +784,15 @@ async fn analyzer_actions_bind_like_the_mvc_binder() {
         assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
     }
     for body in ["[]", "5", r#"{"AnalyzerActions":{"Nope":"Default"}}"#] {
-        let (status, _) = send(app.clone(), "POST", uri, body).await;
+        let (status, problem) = send(app.clone(), "POST", uri, body).await;
         assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        // gl-1673: the plugin's `[FromBody] … request` is named beside it.
+        let problem: serde_json::Value = serde_json::from_str(&problem).unwrap();
+        assert_eq!(
+            problem["errors"]["request"],
+            serde_json::json!(["The request field is required."]),
+            "{body}"
+        );
     }
     // `SetAnalyzerActionAsync`: each named mode is replaced, the rest kept.
     let nil = app

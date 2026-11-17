@@ -32,6 +32,7 @@ use ferrofin_model::configuration::LibraryOptions;
 use uuid::Uuid;
 
 use crate::error::ServiceError;
+use crate::system::MediaLocation;
 
 /// A Generate Trickplay Images pass that checks the images already on disk,
 /// because the trickplay widths or chroma changed since the last pass that
@@ -162,6 +163,19 @@ pub trait TrickplayManager: Send + Sync {
 
     /// Deletes all trickplay data for an item.
     async fn delete_trickplay_data(&self, item_id: Uuid) -> Result<(), ServiceError>;
+
+    /// A changed file's prune of the item's trickplay: its tile folders for
+    /// `media` and its rows. A refresh or move of the item already running,
+    /// working from the old file, removes what it saved once done, so its set
+    /// does not outlive the prune. The default deletes the rows only; an
+    /// implementation that refreshes trickplay overrides it.
+    async fn prune_trickplay_data(
+        &self,
+        item_id: Uuid,
+        _media: MediaLocation<'_>,
+    ) -> Result<(), ServiceError> {
+        self.delete_trickplay_data(item_id).await
+    }
 
     /// Batch form of [`Self::get_trickplay_resolutions`], keyed by item; an
     /// item with no trickplay rows is left out. A media source's id is the id

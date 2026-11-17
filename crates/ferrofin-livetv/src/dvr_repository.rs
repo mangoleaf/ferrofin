@@ -143,6 +143,25 @@ pub async fn series_timer_rows(
         .map_err(db_err)
 }
 
+/// Every stored series timer with a listings series id, as `(Id, Name,
+/// SeriesId)` from the promoted columns, in stored order: all that a guide
+/// page's series-timer link needs, with no DTO JSON parsed.
+///
+/// # Errors
+///
+/// Fails when the read fails.
+pub async fn series_timer_series_ids(
+    db: &Database,
+) -> Result<Vec<(String, String, String)>, ServiceError> {
+    sqlx::query_as(
+        r#"SELECT "Id","Name","SeriesId" FROM "FerrofinLiveTvSeriesTimers"
+           WHERE "SeriesId" IS NOT NULL ORDER BY rowid"#,
+    )
+    .fetch_all(db.pool())
+    .await
+    .map_err(db_err)
+}
+
 /// Inserts or replaces one series timer, DTO and identity columns together.
 ///
 /// # Errors

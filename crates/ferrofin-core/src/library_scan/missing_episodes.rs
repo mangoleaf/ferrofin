@@ -339,11 +339,7 @@ impl LibraryScanner {
         let Some(series_row) = items.retrieve_item(one.id).await? else {
             return Ok(());
         };
-        let key = series_row
-            .presentation_unique_key
-            .clone()
-            .filter(|k| !k.is_empty())
-            .unwrap_or_else(|| series_row.id.clone());
+        let key = ferrofin_db::entities::base_items::presentation_key(&series_row).to_owned();
         let rows = items
             .get_item_list(&InternalItemsQuery {
                 series_presentation_unique_key: Some(key.clone()),
