@@ -6,7 +6,7 @@
 //! - [`path_attributes`] — the `[name=value]` attributes in file and folder
 //!   names (`PathExtensions.GetAttributeValue`).
 //! - [`extensions`] — string helpers (`MediaBrowser.Common.Extensions`).
-//! - [`configuration`] — config-store value types + factory/validation traits
+//! - [`configuration`] — configuration validation traits
 //!   (`MediaBrowser.Common.Configuration`).
 //! - [`config_import`] — the one-way import of a Jellyfin `config/*.xml`
 //!   document (or a plugin's XML configuration) into Ferrofin's JSON.

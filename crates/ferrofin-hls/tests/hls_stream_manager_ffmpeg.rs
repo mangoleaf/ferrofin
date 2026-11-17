@@ -270,7 +270,6 @@ impl StreamStatePlanner for FfmpegPlanner {
             output_audio_bitrate: None,
             output_audio_channels: None,
             output_container: None,
-            output_video_sync: None,
             output_file_path: playlist.to_string_lossy().into_owned(),
             input_container: None,
             is_input_video: true,

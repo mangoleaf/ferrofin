@@ -3,7 +3,8 @@
 //! router, database and playlist manager: containers expand into their
 //! tracks or episodes, unknown ids and kinds that cannot be added are dropped,
 //! a create infers and persists the playlist's media type, everything a
-//! create writes commits together, and a create or lookup needs a user.
+//! create writes commits together, and a create or lookup needs a user. Also
+//! `GET /Years` under a playlist or a box set, whose members are linked entries.
 use axum::{
     body::Body,
     http::{Request, StatusCode, header},
@@ -1349,21 +1350,8 @@ async fn a_playlists_years_are_those_of_its_playable_entries() {
     assert_eq!(status, StatusCode::OK, "{created}");
     let id = created["Id"].as_str().unwrap().to_owned();
     store_entries(&fx, &id, 1, &[id_of(&fx, "Zed").await]).await;
-    let (status, _) = fx
-        .call("POST", "/Auth/Keys?app=playlist-items-test", None)
-        .await;
-    assert!(status.is_success());
-    let (_, keys) = fx.call("GET", "/Auth/Keys", None).await;
-    let key = keys["Items"][0]["AccessToken"].as_str().unwrap().to_owned();
+    let key = api_key(&fx).await;
 
-    let names = |body: &Value| -> Vec<String> {
-        body["Items"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|item| item["Name"].as_str().unwrap().to_owned())
-            .collect()
-    };
     for (token, query, expected) in [
         (&fx.token, "", vec!["2001"]),
         (&fx.token, "&recursive=false", vec!["2001"]),
@@ -1371,11 +1359,79 @@ async fn a_playlists_years_are_those_of_its_playable_entries() {
         (&key, "&recursive=false", vec![]),
     ] {
         let path = format!("/Years?parentId={id}{query}");
-        let (status, body) = call(&fx.router, token, "GET", &path, None).await;
-        assert_eq!(status, StatusCode::OK, "{path}: {body}");
-        assert_eq!(names(&body), expected, "{path}: {body}");
+        assert_eq!(names(&fx, token, &path).await, expected, "{path}");
     }
-    let (status, body) = fx.call("GET", &format!("/Items?parentId={id}"), None).await;
-    assert_eq!(status, StatusCode::OK, "{body}");
-    assert_eq!(names(&body), ["Zulu", "Zed"], "{body}");
+    let path = format!("/Items?parentId={id}");
+    assert_eq!(names(&fx, &fx.token, &path).await, ["Zulu", "Zed"]);
+}
+
+/// gl-1700: a box set's members are its `LinkedChildren`, and it has no
+/// `Children` unless it is a legacy one (`BoxSet.LoadChildren`). So with an
+/// API key and no user, a non-recursive `GET /Years` under it answers
+/// nothing, while a recursive walk and a user's walk take its members' years.
+/// A legacy box set's own children (`ParentId` = the box set) still count.
+/// Measured the same on a stock Jellyfin 12.4.
+#[tokio::test]
+async fn a_box_sets_years_without_a_user_are_those_of_its_own_children() {
+    let fx = fixture().await;
+    seed_music(&fx).await;
+    sqlx::query(r#"UPDATE "BaseItems" SET "ProductionYear" = 2001 WHERE "Name" = 'Zulu'"#)
+        .execute(fx.db.writer())
+        .await
+        .unwrap();
+    let zulu = id_of(&fx, "Zulu").await;
+    let (status, created) = fx
+        .call("POST", &format!("/Collections?name=Box&ids={zulu}"), None)
+        .await;
+    assert_eq!(status, StatusCode::OK, "{created}");
+    let id = created["Id"].as_str().unwrap().to_owned();
+    // A box set from a library folder (`IsLegacyBoxSet`: a path outside the
+    // data directory, no linked members) and the track inside it.
+    let mut legacy = row(
+        "MediaBrowser.Controller.Entities.Movies.BoxSet",
+        "Legacy",
+        "legacy",
+    );
+    legacy.is_folder = true;
+    legacy.path = Some(fx.temp.path().join("media/Legacy").display().to_string());
+    let legacy = fx.seed(legacy, &[]).await;
+    let mut kept = row(AUDIO_TYPE, "Kept", "kept");
+    kept.media_type = Some("Audio".to_owned());
+    kept.parent_id = Some(guid_to_db(legacy));
+    kept.production_year = Some(1999);
+    fx.seed(kept, &[legacy]).await;
+    let key = api_key(&fx).await;
+
+    for (token, parent, query, expected) in [
+        (&fx.token, &id, "", vec!["2001"]),
+        (&fx.token, &id, "&recursive=false", vec!["2001"]),
+        (&key, &id, "", vec!["2001"]),
+        (&key, &id, "&recursive=false", vec![]),
+        (&key, &legacy.to_string(), "&recursive=false", vec!["1999"]),
+    ] {
+        let path = format!("/Years?parentId={parent}{query}");
+        assert_eq!(names(&fx, token, &path).await, expected, "{path}");
+    }
+}
+
+/// A new API key, which acts for no user.
+async fn api_key(fx: &Fixture) -> String {
+    let (status, _) = fx
+        .call("POST", "/Auth/Keys?app=playlist-items-test", None)
+        .await;
+    assert!(status.is_success());
+    let (_, keys) = fx.call("GET", "/Auth/Keys", None).await;
+    keys["Items"][0]["AccessToken"].as_str().unwrap().to_owned()
+}
+
+/// The `Name` of each item `GET path` lists for `token`.
+async fn names(fx: &Fixture, token: &str, path: &str) -> Vec<String> {
+    let (status, body) = call(&fx.router, token, "GET", path, None).await;
+    assert_eq!(status, StatusCode::OK, "{path}: {body}");
+    body["Items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|item| item["Name"].as_str().unwrap().to_owned())
+        .collect()
 }

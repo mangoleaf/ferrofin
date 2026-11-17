@@ -19,6 +19,7 @@
 
 use ferrofin_traits::providers::ItemUpdateType;
 use ferrofin_util::directory_path::DirectoryPath;
+use ferrofin_util::string_extensions::ordinal_ignore_case_key;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -13747,7 +13748,10 @@ impl LibraryScanner {
         } = art;
         let mut cut_short = false;
         let dirs = art_cache.dirs.clone();
-        let removed = remove_existing && self.remove_item_images(entity, stored);
+        let removed = remove_existing
+            && self
+                .remove_item_images(entity, stored, dirs.as_deref())
+                .await;
         let remote = fetch != ImageFetch::None;
         let short = entity.type_.rsplit('.').next().unwrap_or(&entity.type_);
         // A photo's own file IS its Primary image (C# `PhotoProvider` sets it
@@ -14840,22 +14844,49 @@ impl LibraryScanner {
 
     /// `ItemImageProvider.RemoveImages` for the scan, by the shared
     /// [`remove_images`](ferrofin_providers::local_images::remove_images):
-    /// the item's images in its own metadata folders go, so the pass supplies
-    /// them afresh. Returns whether any was removed (upstream's result).
-    fn remove_item_images(
+    /// the item's images in its own metadata folders go, and those saved
+    /// beside it when its art is saved there, so the pass supplies them
+    /// afresh. The folders it deleted in are forgotten in `dirs`, the run's
+    /// listings, as [`publish_media_artwork`](Self::publish_media_artwork)
+    /// forgets them: no later reader of the folder finds the removed files.
+    /// Returns whether any was removed (upstream's result).
+    async fn remove_item_images(
         &self,
         entity: &BaseItemEntity,
         stored: Option<&[ItemImageInfo]>,
+        dirs: Option<&DirectoryCache>,
     ) -> bool {
-        let (Some(meta_root), Some(stored)) = (&self.metadata_dir, stored) else {
+        let (Some(meta_root), Some(stored)) =
+            (&self.metadata_dir, stored.filter(|s| !s.is_empty()))
+        else {
             return false;
         };
         let folders = Uuid::parse_str(&entity.id).map_or_else(
             |_| vec![meta_root.join(&entity.id)],
             |id| crate::dynamic_images::internal_metadata_dirs(&meta_root.resolve(), id).to_vec(),
         );
+        let beside = match &self.image_saver {
+            Some(saver) => saver.beside_art(entity).await.unwrap_or_else(|err| {
+                // Only the metadata folders' images go, as when nothing is saved beside it.
+                tracing::warn!(%err, item_id = %entity.id, "could not tell whether the item's art is saved beside it");
+                None
+            }),
+            None => None,
+        };
         // The rows are rewritten from what the pass finds.
-        ferrofin_providers::local_images::remove_images(&mut stored.to_vec(), &folders, &entity.id)
+        let mut kept = stored.to_vec();
+        let removed = ferrofin_providers::local_images::remove_images(
+            &mut kept,
+            &folders,
+            &entity.id,
+            beside.as_ref(),
+        );
+        if let Some(dirs) = dirs {
+            for image in stored.iter().filter(|image| !kept.contains(image)) {
+                dirs.invalidate(&image.path);
+            }
+        }
+        removed
     }
 
     /// Appends rows for art files already sitting in the item's metadata art
@@ -16352,8 +16383,9 @@ impl LibraryScanner {
                     // `StringComparison.OrdinalIgnoreCase`, which folds
                     // case beyond ASCII (`Léon` and `LÉON`).
                     owner_name.is_some_and(|owner| {
-                        ferrofin_util::string_extensions::upper_invariant(&resolved)
-                            == ferrofin_util::string_extensions::upper_invariant(owner)
+                        ferrofin_util::string_extensions::equals_ordinal_ignore_case(
+                            &resolved, owner,
+                        )
                     })
                 }
                 _ => false,
@@ -21732,9 +21764,7 @@ fn extra_matches_owner(
     naming: &NamingOptions,
 ) -> bool {
     fn trimmed(value: &str, delimiters: &[char]) -> String {
-        ferrofin_util::string_extensions::upper_invariant(
-            value.trim_end().trim_end_matches(delimiters).trim_end(),
-        )
+        ordinal_ignore_case_key(value.trim_end().trim_end_matches(delimiters).trim_end())
     }
     let extra = video_resolver::clean_date_time(&file_stem(path), naming);
     let extra_name = trimmed(&extra.name, &naming.video_flag_delimiters);
@@ -21766,9 +21796,9 @@ fn extra_matches_owner(
     } else {
         Path::new(&owner.path).parent().and_then(Path::to_str)
     };
-    parent
-        .zip(owner_dir)
-        .is_some_and(|(parent, owner)| parent.eq_ignore_ascii_case(owner))
+    parent.zip(owner_dir).is_some_and(|(parent, owner)| {
+        ferrofin_util::string_extensions::equals_ordinal_ignore_case(parent, owner)
+    })
 }
 
 /// The three stat timestamps the creation-time rule reads.
@@ -23681,7 +23711,8 @@ fn apply_details(entity: &mut BaseItemEntity, d: &TmdbDetails) {
     if entity.overview.is_none() {
         // `Overview?.Replace("\n\n", "\n")` for a movie
         // (`TmdbMovieProvider.cs:205`); a series' is kept as TMDb sent it.
-        entity.overview = d.overview.as_ref().map(|o| {
+        // An empty one, kept for the Identify result, is not stored (gl-1843).
+        entity.overview = d.overview.as_ref().filter(|o| !o.is_empty()).map(|o| {
             if entity.type_.ends_with(".Movie") {
                 o.replace("\n\n", "\n")
             } else {
@@ -24570,11 +24601,6 @@ fn distinct_ignoring_case<'a>(columns: impl Iterator<Item = Option<&'a str>>) ->
         }
     }
     out
-}
-
-/// The invariant simple-uppercase key shared with username normalization.
-fn ordinal_ignore_case_key(value: &str) -> String {
-    ferrofin_util::string_extensions::upper_invariant(value)
 }
 
 /// The distinct values of a `|`-joined column across a set of children, ordered
@@ -26828,12 +26854,28 @@ mod tests {
         assert_ne!(key("\u{130}"), key("i"));
         // Sharp s does not expand: `ToUpperInvariant` cannot map it 1:1 to `SS`.
         assert_ne!(key("\u{df}"), key("ss"));
+        // The long s keeps its case: `ToUpperInvariant` maps it to `S`, ordinal casing does not.
+        assert_ne!(key("\u{17f}"), key("s"));
         // Frequency ordering itself is unaffected by the change.
         let rows = [Some("B|a"), Some("A"), Some("b")];
         assert_eq!(
             super::frequency_ordered_distinct(rows.iter().copied()),
             vec!["B".to_owned(), "a".to_owned()]
         );
+    }
+
+    /// `ExtraResolver.TryGetExtraTypeForOwner`'s folder fallback: the extra's
+    /// directory equals the owner's under `OrdinalIgnoreCase`, which folds
+    /// non-ASCII letters too.
+    #[test]
+    fn an_extra_beside_its_owner_matches_its_folder_ignoring_non_ascii_case() {
+        use ferrofin_naming::video::{ExtraRuleType, VideoFileInfo};
+        let naming = super::NamingOptions::new();
+        let owner = VideoFileInfo::new("Movie", "/media/ÉTÉ/Movie.mkv");
+        let matches =
+            |path: &str| super::extra_matches_owner(path, ExtraRuleType::Suffix, &owner, &naming);
+        assert!(matches("/media/été/Other-trailer.mkv"));
+        assert!(!matches("/media/other/Other-trailer.mkv"));
     }
 
     // date_modified must be the file's mtime (stable across rescans), never the
@@ -27698,6 +27740,18 @@ mod tests {
         };
         super::apply_details(&mut row, &details);
         assert_eq!(row.overview.as_deref(), Some(expected));
+    }
+
+    /// TMDb's empty overview, which the Identify results keep, is not stored.
+    #[test]
+    fn an_empty_tmdb_overview_is_not_stored() {
+        let mut row = ferrofin_db::entities::base_items::BaseItemEntity::default();
+        let details = ferrofin_providers::TmdbDetails {
+            overview: Some(String::new()),
+            ..Default::default()
+        };
+        super::apply_details(&mut row, &details);
+        assert_eq!(row.overview, None);
     }
 
     /// `Series.Status` comes from `<status>` (SeriesNfoParser.cs:75-90), TMDB's
@@ -29137,13 +29191,16 @@ mod tests {
         );
         let scanner = LibraryScanner::new(vf, Arc::new(FerrofinFileSystem::new()), persistence)
             .with_metadata_dir(meta.clone());
-        scanner.remove_item_images(
-            &BaseItemEntity {
-                id: ferrofin_db::store::guid_to_db(id),
-                ..BaseItemEntity::default()
-            },
-            Some(&stored),
-        );
+        scanner
+            .remove_item_images(
+                &BaseItemEntity {
+                    id: ferrofin_db::store::guid_to_db(id),
+                    ..BaseItemEntity::default()
+                },
+                Some(&stored),
+                None,
+            )
+            .await;
         for gone in [&poster, &backdrop, &backdrop1] {
             assert!(!gone.exists(), "{} removed", gone.display());
         }
@@ -29209,7 +29266,9 @@ mod tests {
         expected.sort_by_key(|(_, path)| path.clone());
         assert_eq!(found, expected);
 
-        scanner.remove_item_images(&entity, Some(&images));
+        scanner
+            .remove_item_images(&entity, Some(&images), None)
+            .await;
         for gone in [&own_primary, &old_backdrop] {
             assert!(!gone.exists(), "{} removed", gone.display());
         }

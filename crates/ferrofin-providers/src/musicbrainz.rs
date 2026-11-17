@@ -785,13 +785,15 @@ impl MusicBrainzClient {
                 .map(|v| by_votes(v))
                 .unwrap_or_default()
         };
-        // `.Distinct(StringComparer.OrdinalIgnoreCase)`: folded as .NET's
-        // invariant upper case, non-ASCII letters included.
+        // `.Distinct(StringComparer.OrdinalIgnoreCase)`: non-ASCII letters
+        // folded too, the long `ſ` kept apart from `s`.
         let mut studios: Vec<String> = Vec::new();
         let mut seen = std::collections::HashSet::new();
         for label in release.iter().flat_map(|r| &r.label_info) {
             if let Some(name) = non_empty(label.label.as_ref().and_then(|l| l.name.clone()))
-                && seen.insert(ferrofin_util::string_extensions::upper_invariant(&name))
+                && seen.insert(ferrofin_util::string_extensions::ordinal_ignore_case_key(
+                    &name,
+                ))
             {
                 studios.push(name);
             }
@@ -1199,7 +1201,8 @@ mod tests {
                                      {"name":"Beethoven","artist":{"id":"b","name":"Ludwig van Beethoven"}},
                                      {"name":"Printed","artist":{"id":"c","name":" "}}],
                     "label-info":[{"label":{"name":"Columbia"}},{"label":{"name":"columbia"}},{"label":null},
-                                  {"label":{"name":"Éditions"}},{"label":{"name":"éditions"}}],
+                                  {"label":{"name":"Éditions"}},{"label":{"name":"éditions"}},
+                                  {"label":{"name":"Gloſs"}},{"label":{"name":"Gloss"}}],
                     "genres":[{"name":"release genre","count":50}],
                     "tags":[{"name":"release tag","count":50}]}"#
                     .to_owned(),
@@ -1248,8 +1251,8 @@ mod tests {
         assert_eq!(details.tags, ["trumpet"]);
         assert_eq!(
             details.studios,
-            ["Columbia", "Éditions"],
-            "distinct ignoring case, non-ASCII too"
+            ["Columbia", "Éditions", "Gloſs", "Gloss"],
+            "distinct ignoring case, non-ASCII too, the long s kept apart from s"
         );
 
         // No group: the release's own genres, tags, date and credits.

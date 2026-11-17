@@ -1,9 +1,9 @@
-//! Library-scan measurement harness (opt-in, `FERROFIN_SCAN_BENCH=1`).
+//! Library-scan measurement harness (opt-in, `#[ignore]`d).
 //!
-//! CI never runs this: without the env var the test returns immediately. It
-//! exists because the scan is the longest-running user-visible operation in the
-//! server and had no timing signal at all — "how many items per second do we
-//! scan, and where does the time go" was unanswerable.
+//! CI never runs this: a default run lists it as skipped. It exists because
+//! the scan is the longest-running user-visible operation in the server and
+//! had no timing signal at all — "how many items per second do we scan, and
+//! where does the time go" was unanswerable.
 //!
 //! Wiring mirrors the composition root's scanner (`state.rs`) for the pieces
 //! that run offline: the real ffprobe seam (`FERROFIN_SCAN_BENCH_PROBE=1`), the
@@ -12,8 +12,8 @@
 //! offline scan.
 //!
 //! ```text
-//! FERROFIN_SCAN_BENCH=1 FERROFIN_SCAN_BENCH_MOVIES=1000 \
-//!   cargo test --release -p ferrofin-server --test scan_bench -- --nocapture
+//! FERROFIN_SCAN_BENCH_MOVIES=1000 \
+//!   cargo test --release -p ferrofin-server --test scan_bench -- --include-ignored --nocapture
 //! ```
 
 use std::path::Path;
@@ -101,11 +101,8 @@ fn build_fixture(root: &Path, movies: usize, series: usize, eps: usize) -> (Stri
 }
 
 #[tokio::test(flavor = "multi_thread")]
+#[ignore = "library-scan measurement, not a check; run with --ignored"]
 async fn scan_bench() {
-    if std::env::var("FERROFIN_SCAN_BENCH").is_err() {
-        eprintln!("scan_bench: set FERROFIN_SCAN_BENCH=1 to run");
-        return;
-    }
     let movies = env_usize("FERROFIN_SCAN_BENCH_MOVIES", 500);
     let series = env_usize("FERROFIN_SCAN_BENCH_SERIES", 50);
     let eps = env_usize("FERROFIN_SCAN_BENCH_EPISODES", 10);

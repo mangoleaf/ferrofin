@@ -1,6 +1,8 @@
 //! Port of the sub-path rewriting in `Emby.Server.Implementations.Library.PathExtensions`
 //! (`TryReplaceSubPath` and the `NormalizePath` overloads it uses).
 
+use crate::string_extensions::to_upper_ordinal;
+
 /// Port of `PathExtensions.TryReplaceSubPath`: `path` with its leading
 /// `sub_path` replaced by `new_sub_path`, or `None` when `sub_path` is not a
 /// leading sub path of it (or any argument is empty).
@@ -53,7 +55,7 @@ fn strip_prefix_ignore_case<'a>(path: &'a str, prefix: &str) -> Option<&'a str> 
     let mut rest = path.chars();
     for expected in prefix.chars() {
         let actual = rest.next()?;
-        if actual != expected && !actual.to_uppercase().eq(expected.to_uppercase()) {
+        if to_upper_ordinal(actual) != to_upper_ordinal(expected) {
             return None;
         }
     }
@@ -150,6 +152,26 @@ mod tests {
         assert_eq!(
             try_replace_sub_path("/media-other/a.mkv", "/media", "/x"),
             None
+        );
+    }
+
+    /// `OrdinalIgnoreCase` is .NET's per-character simple fold (the oracle is
+    /// `string_extensions`' .NET 10 casing table), not Rust's full uppercase:
+    /// the dotless `ı` and the long `ſ` keep their own case, `ᾳ` is `ᾼ`, and
+    /// `ß` is not `SS`.
+    #[rstest]
+    #[case("/med\u{131}a/a.mkv", "/MEDIA", None)]
+    #[case("/\u{17F}hows/a.mkv", "/shows", None)]
+    #[case("/\u{1FB3}/a.mkv", "/\u{1FBC}", Some("/x/a.mkv"))]
+    #[case("/stra\u{DF}e/a.mkv", "/STRASSE", None)]
+    fn the_match_folds_as_ordinal_ignore_case(
+        #[case] path: &str,
+        #[case] sub_path: &str,
+        #[case] expected: Option<&str>,
+    ) {
+        assert_eq!(
+            try_replace_sub_path(path, sub_path, "/x").as_deref(),
+            expected
         );
     }
 }
