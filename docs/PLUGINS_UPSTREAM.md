@@ -169,6 +169,12 @@ Conventions:
     static server send it: its own `ETag`, `Last-Modified`, `Range` and `text/javascript`, with
     the pipeline's `Cache-Control: no-cache` kept, so a step that turns on reaches a browser
     at its next load. The bytes are the same.
+  - **A registration body that does not bind is a `400`.** `FileTransformationController` has
+    no `[ApiController]`, so a body that is empty or not the payload's shape reaches the action
+    as `null`, `payload.Id` throws, and Jellyfin answers `500` "Error processing request."
+    (read from the plugin's source and Jellyfin's `ExceptionMiddleware`, not measured).
+    Ferrofin answers the `400` validation problem every other body route gives, with no
+    parameter entry, since no `[ApiController]` filter would have written one.
 
 ### Merge Versions
 - Ferrofin files: `crates/ferrofin-extensions/src/merge_versions.rs` (the whole

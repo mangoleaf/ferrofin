@@ -234,8 +234,8 @@ impl ProblemDetails {
 /// The `(key, message)` ASP.NET files under the action's `[FromBody]`
 /// parameter when its body fails to bind, from the request's method and matched
 /// route: `("forgotPasswordRequest", "The forgotPasswordRequest field is
-/// required.")`. `None` for a nullable parameter, and for a route Jellyfin does
-/// not serve (an extension's), rather than a name it does not have.
+/// required.")`. `None` when ASP.NET files no entry, and for a route neither
+/// Jellyfin nor a ported plugin serves, rather than a name it does not have.
 pub(crate) fn body_parameter(
     method: &Method,
     route: Option<&MatchedPath>,
