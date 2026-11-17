@@ -61,10 +61,10 @@ fn wrapper(root: &Path, name: &str, real: &Path) -> PathBuf {
     path
 }
 
-/// Like [`wrapper`] for ffmpeg, but its `-version` banner is one the server
-/// cannot read (`ffmpeg version N-…`, as static and git builds print), so the
-/// server takes it for the oldest supported ffmpeg, without `-isync`.
-fn unread_version_wrapper(root: &Path, real: &Path) -> PathBuf {
+/// Like [`wrapper`] for ffmpeg, but its `-version` output is a git build's
+/// (`ffmpeg version N-…`) with 4.4's libavutil, so the server reads it as the
+/// oldest supported ffmpeg, 4.4, without `-isync`.
+fn ffmpeg_4_4_wrapper(root: &Path, real: &Path) -> PathBuf {
     use std::os::unix::fs::PermissionsExt as _;
     let path = root.join("bin").join("ffmpeg");
     std::fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -74,7 +74,8 @@ fn unread_version_wrapper(root: &Path, real: &Path) -> PathBuf {
         "#!/bin/sh\nprintf '%s %s\\n' 'ffmpeg' \"$*\" >> '{}'\n\
          for arg in \"$@\"; do\n\
          if [ \"$arg\" = -version ]; then\n\
-         '{real}' -version | sed '1s/^ffmpeg version [^ ]*/ffmpeg version N-117000-g0123abcd/'\n\
+         '{real}' -version | sed -e '1s/^ffmpeg version [^ ]*/ffmpeg version N-117000-g0123abcd/' \
+         -e 's|^libavutil .*|libavutil      56. 70.100 / 56. 70.100|'\n\
          exit 0\n\
          fi\n\
          done\n\
@@ -890,8 +891,8 @@ async fn a_seeked_embed_of_a_text_sidecar_starts_every_stream_on_time() {
     seeked_text_embeds_start_on_time(&server, root, &real_ffprobe, &movies).await;
 }
 
-/// The same streams on an ffmpeg the server reads no version of (counted as
-/// the oldest supported, 4.4), whose output trim cannot cut the sidecar as
+/// The same streams on an ffmpeg the server reads as the oldest supported,
+/// 4.4 (a git build with 4.4's libavutil), whose output trim cannot cut the sidecar as
 /// `FilterEvents` does (gl-1199): it dropped the cue on screen from 9 s, and
 /// on 4.4 a track converted to ASS started every stream 4.7 s late from 8.2
 /// s. The server cuts the sidecar to the start itself and the embed reads
@@ -900,7 +901,7 @@ async fn a_seeked_embed_of_a_text_sidecar_starts_every_stream_on_time() {
 /// stopped.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "runs the real ffmpeg; run with --ignored"]
-async fn without_a_readable_version_a_seeked_text_embed_reads_a_copy_cut_to_the_start() {
+async fn on_ffmpeg_4_4_a_seeked_text_embed_reads_a_copy_cut_to_the_start() {
     let Some((real_ffmpeg, real_ffprobe)) = tools() else {
         return;
     };
@@ -908,7 +909,7 @@ async fn without_a_readable_version_a_seeked_text_embed_reads_a_copy_cut_to_the_
     let root = tmp.path();
     let movies = root.join("media").join("movies");
     generate_srt_movie(&real_ffmpeg, &movies.join("Cues (2021)"));
-    let ffmpeg = unread_version_wrapper(root, &real_ffmpeg);
+    let ffmpeg = ffmpeg_4_4_wrapper(root, &real_ffmpeg);
     let ffprobe = wrapper(root, "ffprobe", &real_ffprobe);
 
     let server = Server::boot(root, &ffmpeg, &ffprobe).await;
@@ -967,8 +968,8 @@ async fn without_a_readable_version_a_seeked_text_embed_reads_a_copy_cut_to_the_
     }
 }
 
-/// On an ffmpeg the server knows no `-isync` for (an unreadable version
-/// banner counts as the oldest supported), the `.sup` sidecar is read from its
+/// On an ffmpeg the server knows no `-isync` for (a git build with 4.4's
+/// libavutil reads as 4.4), the `.sup` sidecar is read from its
 /// start on its own timestamps and moved back by the seek (gl-929). Embedded
 /// from 1 s, before its first cue, and from 9 s, its cues keep their times on
 /// the movie's clock; burned into the segment from 2 to 4 s the box shows from
@@ -984,7 +985,7 @@ async fn without_isync_a_bitmap_sidecar_stays_on_the_movies_clock() {
     let root = tmp.path();
     let movies = root.join("media").join("movies");
     generate_movie(&real_ffmpeg, &movies.join("Movie (2020)"));
-    let ffmpeg = unread_version_wrapper(root, &real_ffmpeg);
+    let ffmpeg = ffmpeg_4_4_wrapper(root, &real_ffmpeg);
     let ffprobe = wrapper(root, "ffprobe", &real_ffprobe);
 
     let server = Server::boot(root, &ffmpeg, &ffprobe).await;
