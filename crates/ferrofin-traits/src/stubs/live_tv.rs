@@ -120,10 +120,9 @@ pub const LIVE_TV_INTERNAL_VERSION_NUMBER: &str = "4";
 /// `(ServiceName + externalId + InternalVersionNumber).ToLowerInvariant().GetMD5()`.
 #[must_use]
 pub fn internal_series_timer_id(external_id: &str) -> String {
-    ferrofin_common::extensions::get_md5(
-        &format!("{LIVE_TV_SERVICE_NAME}{external_id}{LIVE_TV_INTERNAL_VERSION_NUMBER}")
-            .to_lowercase(),
-    )
+    ferrofin_common::extensions::get_md5(&ferrofin_util::string_extensions::lower_invariant(
+        &format!("{LIVE_TV_SERVICE_NAME}{external_id}{LIVE_TV_INTERNAL_VERSION_NUMBER}"),
+    ))
     .simple()
     .to_string()
 }
@@ -938,6 +937,22 @@ mod new_timer_defaults_tests {
         assert_eq!(
             internal_series_timer_id(""),
             "eb075d6a62e2edc6b764a304633d33c0"
+        );
+    }
+
+    /// `ToLowerInvariant` is .NET's one-to-one fold, not `str::to_lowercase`:
+    /// `İ` (U+0130) stays `İ` and a final `Σ` is `σ`. The ids are the same MD5
+    /// calculation with the .NET 10 casing table in `ferrofin-util`'s
+    /// `tests/data/dotnet-invariant-casing.tsv`.
+    #[test]
+    fn internal_series_timer_id_folds_as_to_lower_invariant() {
+        assert_eq!(
+            internal_series_timer_id("\u{0130}"),
+            "afc668e05cee3c87d6ea936527b4189a"
+        );
+        assert_eq!(
+            internal_series_timer_id("\u{039F}\u{0394}\u{039F}\u{03A3}"),
+            "86b8edb1227ed65da8ea4c1a5736e649"
         );
     }
 }

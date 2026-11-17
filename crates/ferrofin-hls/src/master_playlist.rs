@@ -1272,7 +1272,6 @@ mod tests {
             output_audio_bitrate: Some(128_000),
             output_audio_channels: Some(1),
             output_container: Some("ts".to_owned()),
-            output_video_sync: None,
             output_file_path: "/cache/transcodes/out.m3u8".to_owned(),
             input_container: Some("mkv".to_owned()),
             is_input_video: true,

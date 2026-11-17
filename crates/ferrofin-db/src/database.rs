@@ -1119,7 +1119,7 @@ impl Database {
 
     /// Folds the whole write-ahead log back into the database file and empties
     /// it (`PRAGMA wal_checkpoint(TRUNCATE)`), as the optimization task does
-    /// after its vacuum.
+    /// before and after its vacuum.
     ///
     /// It takes its turn with the checkpoint task, so it waits for a
     /// checkpoint the writer's commits started, however long that takes,
@@ -2471,6 +2471,29 @@ mod tests {
             memory.snapshot_once("db.pre-rehome").await.expect("memory"),
             None
         );
+    }
+
+    /// Temporary storage stays on disk: the bundled SQLite's compile-time
+    /// default, which no connection overrides, so the Optimize Database task's
+    /// vacuum writes its copy of the database to a file, as Jellyfin's does
+    /// under its `temp_store=1`.
+    #[tokio::test]
+    async fn temp_store_stays_on_disk() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("jellyfin.db");
+        let db = Database::connect(&format!("sqlite://{}", path.display()))
+            .await
+            .expect("connect");
+        for (name, pool) in [("writer", db.writer()), ("readers", db.pool())] {
+            let (on_disk, temp_store): (bool, i64) = sqlx::query_as(
+                "SELECT sqlite_compileoption_used('TEMP_STORE=1'), temp_store FROM pragma_temp_store",
+            )
+            .fetch_one(pool)
+            .await
+            .expect("compile options");
+            assert!(on_disk, "built with SQLITE_TEMP_STORE=1");
+            assert_eq!(temp_store, 0, "the {name} pool overrides the default");
+        }
     }
 
     /// An existing repair snapshot is kept as an earlier boot left it, and
