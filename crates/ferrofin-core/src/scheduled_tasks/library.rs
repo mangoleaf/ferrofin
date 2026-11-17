@@ -665,7 +665,11 @@ impl ChapterImagesTask {
     ) -> Result<bool, ServiceError> {
         // Read just before the refresh, as upstream does: a scan may rewrite
         // a video's chapters while the run works through the page, and the
-        // save and the prune below must not undo that.
+        // save and the prune below must not undo that. Watched from before
+        // the read: a changed file's prune while this refreshes drops the
+        // save, which would put the old file's chapters back over the new
+        // file's, where upstream saves them (gl-1694).
+        let watch = self.chapters.watch_chapter_data(item_id).await;
         let mut chapters = self.chapters.get_chapters(item_id).await?;
         let outcome = self
             .extractor
@@ -683,7 +687,11 @@ impl ChapterImagesTask {
                 .filter(|chapter| chapter.start_position_ticks < video.run_time_ticks.unwrap_or(0))
                 .cloned()
                 .collect::<Vec<_>>();
-            self.chapters.save_chapters(item_id, &saved).await?;
+            if !self.chapters.save_refreshed_chapters(watch, &saved).await? {
+                // The prune took the images this refresh would prune.
+                tracing::debug!(%item_id, "the file changed while its chapter images were refreshed; nothing saved");
+                return Ok(outcome.success);
+            }
         }
         outcome.prune_unused_images(&chapters);
         Ok(outcome.success)
@@ -5329,6 +5337,69 @@ mod tests {
             "owned extras participate in the actual scheduled query"
         );
         assert_eq!(fixture.encoder.calls.lock().unwrap().len(), 1);
+    }
+
+    /// gl-1694: a changed file's prune while the task refreshes a video's
+    /// chapter images, followed by the scan's save of the new file's chapters,
+    /// is not undone by the task saving the old file's chapters back.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_chapter_refresh_the_prune_lands_in_saves_nothing() {
+        use ferrofin_traits::persistence::ChapterRepository as _;
+        let (entered, release) = (
+            Arc::new(tokio::sync::Notify::new()),
+            Arc::new(tokio::sync::Notify::new()),
+        );
+        let fixture = crate::chapter_image_extractor::tests::Fixture::new(
+            crate::chapter_image_extractor::tests::RecordingEncoder::holding(
+                Arc::clone(&entered),
+                Arc::clone(&release),
+            ),
+        )
+        .await;
+        let id = Uuid::parse_str(&fixture.video.id).unwrap();
+        let chapter =
+            |name: &str, start_position_ticks| ferrofin_db::entities::base_items::ChapterEntity {
+                item_id: fixture.video.id.clone(),
+                chapter_index: 0,
+                image_date_modified: None,
+                image_path: None,
+                start_position_ticks,
+                name: Some(name.to_owned()),
+            };
+        let repo = Arc::new(crate::FerrofinChapterRepository::new(fixture.db.clone()));
+        repo.save_chapters(id, &[chapter("Old", 0)]).await.unwrap();
+        let library = library_manager_over(fixture.db.clone());
+        let chapters = Arc::new(crate::FerrofinChapterManager::new(
+            repo.clone(),
+            library.clone(),
+        ));
+        let temp = tempfile::tempdir().unwrap();
+        let task = ChapterImagesTask::new(
+            library,
+            fixture.folders.clone(),
+            Arc::clone(&chapters) as Arc<dyn ChapterManager>,
+            fixture.extractor.clone(),
+            Arc::new(crate::FerrofinServerApplicationPaths::new(
+                temp.path().join("data"),
+                temp.path().join("log"),
+                temp.path().join("config"),
+                temp.path().join("cache"),
+                temp.path().join("web"),
+            )),
+        );
+        let run = tokio::spawn(async move { task.execute(&TaskProgress::default()).await });
+
+        entered.notified().await;
+        chapters.delete_chapter_data(id).await.expect("prune");
+        let new = [chapter("New", 0), chapter("New 2", 300_000_000)];
+        repo.save_chapters(id, &new).await.expect("the scan's save");
+        release.notify_one();
+        run.await.unwrap().expect("run");
+
+        let saved = repo.get_chapters(id).await.unwrap();
+        let names: Vec<_> = saved.iter().map(|c| c.name.as_deref()).collect();
+        assert_eq!(names, [Some("New"), Some("New 2")]);
+        assert!(saved.iter().all(|c| c.image_path.is_none()), "{saved:?}");
     }
 
     #[tokio::test]

@@ -498,12 +498,23 @@ pub(crate) mod tests {
         missing_frame: bool,
         cancel_on: Option<(usize, ScanCancel)>,
         cancel_after: Option<(usize, ScanCancel)>,
+        /// Each extraction notifies the first and waits for the second.
+        hold: Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>,
     }
 
     impl RecordingEncoder {
         pub(crate) fn cancelling_after(call: usize, cancel: ScanCancel) -> Self {
             Self {
                 cancel_after: Some((call, cancel)),
+                ..Default::default()
+            }
+        }
+        pub(crate) fn holding(
+            entered: Arc<tokio::sync::Notify>,
+            release: Arc<tokio::sync::Notify>,
+        ) -> Self {
+            Self {
+                hold: Some((entered, release)),
                 ..Default::default()
             }
         }
@@ -563,6 +574,10 @@ pub(crate) mod tests {
             {
                 cancel.cancel();
                 std::future::pending::<()>().await;
+            }
+            if let Some((entered, release)) = &self.hold {
+                entered.notify_one();
+                release.notified().await;
             }
             if self.fail_on == Some(count) {
                 return Err(ServiceError::backend("broken frame"));

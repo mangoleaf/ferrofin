@@ -222,6 +222,10 @@ impl KeyframeExtractor for CachedKeyframeExtractor {
             return Some(data);
         }
 
+        // From before the extraction: a changed file's prune meanwhile drops
+        // what this extracts from the old file, where upstream saves it
+        // (gl-1694). One that starts after the prune reads the new file.
+        let watch = self.repository.watch_keyframe_data(item_id).await;
         let Some(data) = self
             .extractor
             .try_extract_keyframes(item_id, file_path)
@@ -243,8 +247,20 @@ impl KeyframeExtractor for CachedKeyframeExtractor {
                     keyframe_ticks: Some(ticks),
                     total_duration: data.total_duration,
                 };
-                if let Err(error) = self.repository.save_keyframe_data(item_id, &entity).await {
-                    tracing::debug!(item_id = %item_id, error = %error, "storing extracted keyframes failed");
+                match self
+                    .repository
+                    .save_extracted_keyframe_data(watch, &entity)
+                    .await
+                {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        // The caller falls back, as for a failed extraction.
+                        tracing::debug!(item_id = %item_id, "the file changed while its keyframes were extracted; dropping them");
+                        return None;
+                    }
+                    Err(error) => {
+                        tracing::debug!(item_id = %item_id, error = %error, "storing extracted keyframes failed");
+                    }
                 }
             }
             Err(error) => {
@@ -589,6 +605,56 @@ mod tests {
         );
         let keyframe_data = repository.get_keyframe_data(item).await.expect("read");
         assert!(keyframe_data.is_empty(), "{keyframe_data:?}");
+    }
+
+    /// An extractor during whose run the item's keyframe data is deleted, as
+    /// a changed file's prune does while an extraction of the old file runs.
+    struct PrunedMidway(Arc<dyn KeyframeRepository>);
+
+    #[async_trait]
+    impl KeyframeExtractor for PrunedMidway {
+        fn is_metadata_based(&self) -> bool {
+            true
+        }
+
+        async fn try_extract_keyframes(&self, item_id: Uuid, _: &str) -> Option<KeyframeData> {
+            self.0.delete_keyframe_data(item_id).await.expect("prune");
+            Some(KeyframeData::new(90, vec![0, 30, 60]))
+        }
+    }
+
+    /// gl-1694: an extraction a changed file's prune lands in stores nothing
+    /// (the old file's keyframes would be served for the new one) and answers
+    /// nothing; the next one extracts the new file and stores it.
+    #[tokio::test]
+    async fn an_extraction_the_prune_lands_in_is_dropped() {
+        let item = Uuid::from_u128(0xC6);
+        let repository = repository_with_item(item).await;
+        let pruned = CachedKeyframeExtractor::new(
+            Arc::clone(&repository),
+            Arc::new(PrunedMidway(Arc::clone(&repository))),
+            "PrunedMidway",
+        );
+
+        assert_eq!(
+            pruned.try_extract_keyframes(item, "/media/a.mkv").await,
+            None
+        );
+        let stored = repository.get_keyframe_data(item).await.expect("read");
+        assert!(stored.is_empty(), "{stored:?}");
+
+        let inner = CountingExtractor::new(Some(KeyframeData::new(20, vec![0, 10])));
+        let next = CachedKeyframeExtractor::new(
+            Arc::clone(&repository),
+            inner as Arc<dyn KeyframeExtractor>,
+            "CountingExtractor",
+        );
+        assert_eq!(
+            next.try_extract_keyframes(item, "/media/a.mkv").await,
+            Some(KeyframeData::new(20, vec![0, 10]))
+        );
+        let stored = repository.get_keyframe_data(item).await.expect("read");
+        assert_eq!(stored[0].keyframe_ticks.as_deref(), Some("[0,10]"));
     }
 
     /// A keyframe repository whose every call fails.

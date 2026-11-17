@@ -18,8 +18,11 @@
 //! requested transcode level, the Live TV channel numbers and the image
 //! foreground layer use. With the `tokio`
 //! feature, `keyed_locks` is the async keyed lock the C# takes from
-//! `AsyncKeyedLock`.
+//! `AsyncKeyedLock`, and `change_watch` tells a run whether its key changed
+//! while it ran.
 
+#[cfg(feature = "tokio")]
+pub mod change_watch;
 pub mod current_culture;
 pub mod directory_path;
 pub mod error;

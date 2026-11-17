@@ -128,7 +128,10 @@ pub trait MediaSegmentProvider: Send + Sync {
         &self,
         request: &MediaSegmentGenerationRequest,
     ) -> Result<Vec<MediaSegmentDto>, ServiceError>;
-    /// Remove the provider's persistent data when an item is explicitly erased.
+    /// Remove the provider's persistent data of an item whose segments are all
+    /// deleted ([`MediaSegmentManager::delete_segments`]): the scan's prune of
+    /// what was extracted from a changed file. An analysis of the old file in
+    /// flight must not store it back afterwards.
     async fn cleanup(&self, _item_id: Uuid) -> Result<(), ServiceError> {
         Ok(())
     }

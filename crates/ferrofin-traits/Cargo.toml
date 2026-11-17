@@ -17,7 +17,8 @@ tokio = { workspace = true, features = ["sync", "rt", "macros"] }
 ferrofin-model.workspace = true
 ferrofin-db.workspace = true
 ferrofin-common.workspace = true
-ferrofin-util.workspace = true
+# `tokio`: `change_watch::Watch`, which the keyframe and chapter traits take.
+ferrofin-util = { workspace = true, features = ["tokio"] }
 ferrofin-keyframes.workspace = true
 async-trait.workspace = true
 thiserror.workspace = true
