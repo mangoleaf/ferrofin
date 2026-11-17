@@ -40,6 +40,7 @@
 //! | # | Scenario | Expect |
 //! |---|---|---|
 //! | 1 | first scan | all created; every ticked provider called, in order |
+//! | 1b | the next rescan | only the two root folders' images, which validation draws at its opening |
 //! | 2 | rescan, nothing changed | 0 probes, 0 provider requests, 0 writes, all unchanged |
 //! | 3 | touch one file's mtime, rescan | exactly that item: probe + providers + save |
 //! | 4 | NFO newer than DateLastSaved + 1 min | that item's local metadata re-read only |
@@ -361,7 +362,7 @@ fn movie_answer(id: &str) -> Option<String> {
     Some(format!(
         r#"{{"id": {id}, "title": "{title}", "overview": "About {title}.", "vote_average": 8.0,
                 "release_date": "1999-03-30", {poster} "videos": {}, "credits": {{"cast": {cast}, "crew": []}},
-                "release_dates": {{"results": []}}}}"#,
+                "releases": {{"countries": []}}}}"#,
         trailer(title)
     ))
 }
@@ -1312,12 +1313,14 @@ impl Harness {
         Scrape::parse(&response.text().await.expect("metrics text"))
     }
 
-    /// The settle window, MusicBrainz's pace, and the libraries: movies, a
-    /// series, a watched series and music, each with only the remote
-    /// fetchers the stand-in answers for ticked — TMDb's image fetcher for
-    /// movies, every other image fetcher off. The series library runs
-    /// TheTVDB after TheMovieDb for series and episodes, so the first scan
-    /// shows every provider answering, one after the other.
+    /// The settle window, MusicBrainz's pace, no task started by the time of
+    /// day (Intro Skipper's midnight run analysed every season inside a row
+    /// when a run crossed it, gl-1649) nor by Intro Skipper's own timer, and
+    /// the libraries: movies, a series, a watched series and music, each with
+    /// only the remote fetchers the stand-in answers for ticked — TMDb's
+    /// image fetcher for movies, every other image fetcher off. The series
+    /// library runs TheTVDB after TheMovieDb for series and episodes, so the
+    /// first scan shows every provider answering, one after the other.
     async fn configure(&mut self) {
         let mut config = self.get("/System/Configuration").await;
         config["LibraryMonitorDelay"] = json!(SETTLE_SECONDS);
@@ -1328,6 +1331,15 @@ impl Harness {
         self.post(
             &format!("/Plugins/{musicbrainz}/Configuration"),
             Some(&json!({"RateLimit": MUSICBRAINZ_RATE_LIMIT})),
+        )
+        .await;
+        boot::drop_wall_clock_triggers(&self.client, &self.base, &self.auth()).await;
+        // Intro Skipper's automatic analysis starts one to two minutes after
+        // the last video change, so a slow run could see it inside a row too.
+        let intro_skipper = "c83d86bba1e04c35a113e2101cf4ee6b";
+        self.post(
+            &format!("/Plugins/{intro_skipper}/Configuration"),
+            Some(&json!({"AutoDetectIntros": false})),
         )
         .await;
 
@@ -2004,6 +2016,21 @@ async fn rows(h: &Harness) {
             .written_items()
             .contains(&"Person:Ada Actor".to_owned()),
         "row 1: {first:?}"
+    );
+
+    // ---- 1b: the next validation draws the two root folders' images ----
+    // Library validation refreshes them at its opening, as upstream's
+    // `ValidateTopLibraryFolders` does: the first found no art to copy yet.
+    let roots = h.rescan("1b").await;
+    assert_eq!(
+        roots.written_items(),
+        ["AggregateFolder:root", "UserRootFolder:Media Folders"],
+        "row 1b: {roots:?}"
+    );
+    assert_eq!(
+        roots.item_tables(),
+        BTreeMap::from([("BaseItemImageInfos", 2), ("BaseItems", 2)]),
+        "row 1b: {roots:?}"
     );
 
     // ---- 2: an unchanged rescan does nothing ----

@@ -17,6 +17,9 @@ use std::fmt::Write as _;
 use chrono::{DateTime, Utc};
 use ferrofin_model::data::PersonKind;
 use ferrofin_model::entities_media::MetadataProvider;
+use ferrofin_util::string_extensions::{
+    equals_ordinal_ignore_case, lower_invariant, replace_ignore_ascii_case,
+};
 use ferrofin_util::ticks::TICKS_PER_MINUTE;
 
 use crate::container_types::{MetadataResult, PersonInfo};
@@ -69,21 +72,6 @@ impl Collation {
             .as_ref()
             .map_or_else(|| left.cmp(right), |comparer| comparer.compare(left, right))
     }
-}
-
-/// `StringComparer.OrdinalIgnoreCase.Equals`: equal after each character's
-/// simple (one-to-one) invariant upper-casing. Unlike `eq_ignore_ascii_case`
-/// it folds non-ASCII letters (`é`/`É`, `ж`/`Ж`), and unlike Rust's full case
-/// mapping it does not expand (`ß` stays `ß`, as .NET's `ToUpperInvariant`).
-pub(crate) fn equals_ordinal_ignore_case(left: &str, right: &str) -> bool {
-    fn fold(c: char) -> char {
-        let mut upper = c.to_uppercase();
-        match (upper.next(), upper.next()) {
-            (Some(single), None) => single,
-            _ => c,
-        }
-    }
-    left.chars().map(fold).eq(right.chars().map(fold))
 }
 
 /// The `dateadded` timestamp format (`BaseNfoSaver.DateAddedFormat`).
@@ -239,17 +227,13 @@ pub fn release_date_format_error(item: &NfoBaseItem, config: &NfoConfiguration) 
     })
 }
 
-/// The Kodi output form of a trailer URL (`BaseNfoSaver.GetOutputTrailerUrl`).
-///
-/// Replaces the YouTube watch prefix with the plugin prefix Kodi expects.
+/// The Kodi output form of a trailer URL (`BaseNfoSaver.GetOutputTrailerUrl`):
+/// `url.Replace(YouTubeWatchUrl, …, OrdinalIgnoreCase)`, every occurrence of
+/// the YouTube watch prefix replaced with the plugin prefix Kodi expects. Only
+/// ASCII characters match an ASCII needle under ordinal casing (it keeps the
+/// long `ſ`, see `to_upper_ordinal`), so the ASCII fold is exact.
 fn output_trailer_url(url: &str) -> String {
-    if url.len() >= YOUTUBE_WATCH_URL.len()
-        && url[..YOUTUBE_WATCH_URL.len()].eq_ignore_ascii_case(YOUTUBE_WATCH_URL)
-    {
-        format!("{YOUTUBE_PLUGIN_URL}{}", &url[YOUTUBE_WATCH_URL.len()..])
-    } else {
-        url.to_owned()
-    }
+    replace_ignore_ascii_case(url, YOUTUBE_WATCH_URL, YOUTUBE_PLUGIN_URL)
 }
 
 /// The lowercase `<key>id` tag `BaseNfoSaver.GetTagForProviderKey` derives.
@@ -258,17 +242,7 @@ fn output_trailer_url(url: &str) -> String {
 /// to one, non-ASCII letters included (a full Unicode mapping that expands a
 /// character is not .NET's).
 fn tag_for_provider_key(key: &str) -> String {
-    let lower: String = key
-        .chars()
-        .map(|c| {
-            let mut lower = c.to_lowercase();
-            match (lower.next(), lower.next()) {
-                (Some(single), None) => single,
-                _ => c,
-            }
-        })
-        .collect();
-    format!("{lower}id")
+    format!("{}id", lower_invariant(key))
 }
 
 /// Whether `item` derives from `Video` for the `is not Video` outline guard.
@@ -1102,6 +1076,30 @@ mod tests {
         );
     }
 
+    /// `Replace(…, OrdinalIgnoreCase)` rewrites every occurrence, in any case,
+    /// anywhere in the URL; a multibyte character where the prefix would end
+    /// (byte 32) is no prefix and no panic.
+    #[rstest]
+    #[case(
+        "HTTPS://WWW.YOUTUBE.COM/WATCH?V=abc",
+        "plugin://plugin.video.youtube/play/?video_id=abc"
+    )]
+    #[case(
+        "https://t.example/?u=https://www.youtube.com/watch?v=a&w=https://WWW.youtube.com/watch?v=b",
+        "https://t.example/?u=plugin://plugin.video.youtube/play/?video_id=a&w=plugin://plugin.video.youtube/play/?video_id=b"
+    )]
+    #[case(
+        "http\u{17F}://www.youtube.com/watch?v=abc",
+        "http\u{17F}://www.youtube.com/watch?v=abc"
+    )]
+    #[case(
+        "https://www.youtube.com/watch?v\u{E9}abc",
+        "https://www.youtube.com/watch?v\u{E9}abc"
+    )]
+    fn output_trailer_url_replaces_like_dotnet(#[case] url: &str, #[case] expected: &str) {
+        assert_eq!(output_trailer_url(url), expected);
+    }
+
     #[test]
     fn invariant_f32_drops_trailing_dot_zero() {
         assert_eq!(invariant_f32(7.6), "7.6");
@@ -1236,6 +1234,46 @@ mod tests {
         assert_eq!(tag_for_provider_key("MyCustom"), "mycustomid");
         assert_eq!(tag_for_provider_key("Imdb"), "imdbid");
         assert_eq!(tag_for_provider_key("\u{c4}pple"), "\u{e4}ppleid");
+    }
+
+    /// `ToLowerInvariant` is .NET's one-to-one fold (`ferrofin-util`'s .NET 10
+    /// table is the oracle): `İ` (U+0130) stays `İ`, a final `Σ` is `σ`, and
+    /// `ᾼ` is `ᾳ`.
+    #[rstest]
+    #[case("\u{0130}D", "\u{0130}did")]
+    #[case(
+        "\u{039F}\u{0394}\u{039F}\u{03A3}",
+        "\u{03BF}\u{03B4}\u{03BF}\u{03C3}id"
+    )]
+    #[case("\u{1FBC}", "\u{1FB3}id")]
+    #[case("\u{0131}\u{017F}", "\u{0131}\u{017F}id")]
+    fn tag_for_provider_key_folds_as_to_lower_invariant(#[case] key: &str, #[case] tag: &str) {
+        assert_eq!(tag_for_provider_key(key), tag);
+    }
+
+    /// The `OrdinalIgnoreCase` dedup keeps the dotless `ı` and the long `ſ`
+    /// apart from `I` and `S`, and merges `ᾳ` with `ᾼ`, as .NET's ordinal
+    /// casing does.
+    #[rstest]
+    #[case("K\u{0131}ral", "KIRAL", 2)]
+    #[case("\u{017F}am", "Sam", 2)]
+    #[case("\u{1FB3}x", "\u{1FBC}x", 1)]
+    #[case("\u{0130}lk", "ilk", 2)]
+    fn distinct_people_fold_as_ordinal_ignore_case(
+        #[case] first: &str,
+        #[case] second: &str,
+        #[case] kept: usize,
+    ) {
+        let person = |name: &str| PersonInfo {
+            name: name.to_owned(),
+            type_: PersonKind::Director,
+            ..PersonInfo::default()
+        };
+        let people = [person(first), person(second)];
+        assert_eq!(
+            distinct_sorted_people(&people, PersonKind::Director, &Collation(None)).len(),
+            kept
+        );
     }
 
     #[test]

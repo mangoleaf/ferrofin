@@ -14,7 +14,8 @@
 //!
 //! The trait's [`QuickConnect::get_authorized_request`] returns the
 //! [`AuthenticationResultData`] minted at authorization (the C#
-//! `AuthenticationResult`, whose `User`/`ServerId` the API layer adds).
+//! `AuthenticationResult`; the API layer rebuilds its `User` at the exchange
+//! and adds `ServerId`).
 //!
 //! Expiry uses the same `REQUEST_TIMEOUT_MINUTES` window as C# (`Timeout = 10`);
 //! stale requests and secrets are swept lazily on each state-changing call.
@@ -490,6 +491,7 @@ mod tests {
                 release.notified().await;
             }
             Ok(AuthenticationResultData {
+                user: ferrofin_model::dto::UserDto::default(),
                 session: SessionInfoDto {
                     user_id: request.user_id.unwrap_or_default(),
                     device_id: request.device_id.clone(),
@@ -513,13 +515,6 @@ mod tests {
             _remote_endpoint: &str,
             _user: Option<&ferrofin_db::entities::users::UserEntity>,
         ) -> Result<SessionInfoDto, ServiceError> {
-            unimplemented!()
-        }
-        async fn update_device_name(
-            &self,
-            _session_id: &str,
-            _reported_device_name: &str,
-        ) -> Result<(), ServiceError> {
             unimplemented!()
         }
         async fn on_playback_start(&self, _info: &PlaybackStartInfo) -> Result<(), ServiceError> {

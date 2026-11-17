@@ -978,11 +978,10 @@ async fn write_family_caps_ownership_and_plumbing() {
 
     tokio::task::spawn_blocking(move || {
         use ferrofin_wasm::bindings::types::UserDataUpdate;
-        // set-user-data: bad ids error; the write reaches the manager.
-        // (StubUserData::save_user_data is a panic stub — the recording
-        // proof here is the error shape; the manager plumbing is covered
-        // by the trait call compiling against the real signature. Use the
-        // id-validation paths.)
+        // set-user-data: bad ids error. (StubUserData::save_user_data records
+        // nothing — the proof here is the error shape; the manager plumbing
+        // is covered by the trait call compiling against the real signature,
+        // and the write's count by host_impl.rs.)
         let update = UserDataUpdate {
             played: Some(true),
             favorite: None,

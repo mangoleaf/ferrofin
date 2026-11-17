@@ -9,6 +9,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use ferrofin_model::configuration::EncodingOptions;
+use ferrofin_model::entities::HardwareAccelerationType;
 use ferrofin_model::media_info::MediaProtocol;
 use ferrofin_traits::configuration::ServerConfigurationManager;
 use ferrofin_traits::media_encoding::TranscodingJobType;
@@ -61,11 +62,12 @@ pub fn input_sync_arguments(
 /// an RTSP input's transport options (preferring TCP, as the probe does), one
 /// `-fflags` joining `+igndts` (`IgnoreInputDts`), `+ignidx`
 /// (`IgnoreInputIndex`, an in-progress recording) and `+genpts`
-/// (`GenPtsInput`, or a copied video stream), then the looping reconnect
-/// options for a source that `RequiresLooping` (an M3U tuner with stream
-/// looping).
+/// (`GenPtsInput`, or a copied video stream), the input format (`-f`,
+/// `GetInputFormat`) of a video request's container while any hardware
+/// acceleration is configured, then the looping reconnect options for a
+/// source that `RequiresLooping` (an M3U tuner with stream looping).
 #[must_use]
-pub fn input_source_arguments(state: &EncodingJobInfo) -> Vec<String> {
+pub fn input_source_arguments(state: &EncodingJobInfo, options: &EncodingOptions) -> Vec<String> {
     let source = &state.media_source;
     let mut arguments = Vec::new();
     if effective_input_protocol(state) == MediaProtocol::Rtsp {
@@ -86,6 +88,18 @@ pub fn input_source_arguments(state: &EncodingJobInfo) -> Vec<String> {
     .collect();
     if !flags.is_empty() {
         arguments.extend(["-fflags".to_owned(), flags]);
+    }
+    // Upstream also requires `state.VideoType == VideoFile`, a property it
+    // never assigns, so its default passes for every job (as in
+    // `throttler::eligible`); a disc rip's later `-f concat` wins.
+    if state.is_input_video
+        && options.hardware_acceleration_type != HardwareAccelerationType::none
+        && let Some(format) = state
+            .input_container
+            .as_deref()
+            .and_then(crate::encoding_helper::helper::input_format)
+    {
+        arguments.extend(["-f".to_owned(), format]);
     }
     if source.requires_looping {
         arguments.extend(
@@ -381,7 +395,6 @@ mod tests {
             output_audio_bitrate: None,
             output_audio_channels: None,
             output_container: None,
-            output_video_sync: None,
             output_file_path: String::new(),
             input_container: None,
             is_input_video: true,
@@ -741,7 +754,7 @@ mod tests {
         state.media_source.ignore_index = ignore_index;
         state.media_source.gen_pts_input = gen_pts_input;
         state.output_video_codec = Some(output_video_codec.to_owned());
-        let found = input_source_arguments(&state);
+        let found = input_source_arguments(&state, &EncodingOptions::default());
         match expected {
             Some(flags) => assert_eq!(found, ["-fflags", flags]),
             None => assert!(found.is_empty(), "{found:?}"),
@@ -753,7 +766,7 @@ mod tests {
     fn audio_only_output_generates_no_input_pts() {
         let mut state = state();
         state.output_video_codec = None;
-        let found = input_source_arguments(&state);
+        let found = input_source_arguments(&state, &EncodingOptions::default());
         assert!(found.is_empty(), "{found:?}");
     }
 
@@ -765,14 +778,88 @@ mod tests {
         state.output_video_codec = None;
         state.media_source.protocol = MediaProtocol::Rtsp;
         assert_eq!(
-            input_source_arguments(&state),
+            input_source_arguments(&state, &EncodingOptions::default()),
             ["-rtsp_transport", "tcp+udp", "-rtsp_flags", "prefer_tcp"]
         );
         // A buffered copy the encoder reads from a file is not RTSP.
         state.media_source.encoder_path = Some("/owned/buffer.ts".to_owned());
         state.media_source.encoder_protocol = Some(MediaProtocol::File);
-        let found = input_source_arguments(&state);
+        let found = input_source_arguments(&state, &EncodingOptions::default());
         assert!(found.is_empty(), "{found:?}");
+    }
+
+    /// `GetInputModifier`'s `-f`: a video request names its container's
+    /// input format (`GetInputFormat`) whenever any accelerator is configured,
+    /// AMF included, which Ferrofin transcodes in software. A disc rip passes
+    /// too: upstream's `VideoType` is never assigned.
+    #[rstest::rstest]
+    #[case::matroska(HardwareAccelerationType::nvenc, true, Some("mkv"), Some("matroska"))]
+    #[case::mpegts(HardwareAccelerationType::vaapi, true, Some("ts"), Some("mpegts"))]
+    #[case::whole_name(
+        HardwareAccelerationType::qsv,
+        true,
+        Some("mov,mp4,m4a,3gp,3g2,mj2"),
+        Some("mov,mp4,m4a,3gp,3g2,mj2")
+    )]
+    #[case::any_accelerator(HardwareAccelerationType::amf, true, Some("mkv"), Some("matroska"))]
+    #[case::software(HardwareAccelerationType::none, true, Some("mkv"), None)]
+    #[case::unnamed_accelerator(
+        HardwareAccelerationType::Unrecognized(99),
+        true,
+        Some("mkv"),
+        Some("matroska")
+    )]
+    #[case::audio_item(HardwareAccelerationType::nvenc, false, Some("mkv"), None)]
+    #[case::left_to_the_probe(HardwareAccelerationType::nvenc, true, Some("mpeg"), None)]
+    #[case::invalid_container(HardwareAccelerationType::nvenc, true, Some("mkv;x"), None)]
+    #[case::no_container(HardwareAccelerationType::nvenc, true, None, None)]
+    #[case::empty_container(HardwareAccelerationType::nvenc, true, Some(""), None)]
+    fn a_hardware_job_names_its_input_format(
+        #[case] accelerator: HardwareAccelerationType,
+        #[case] is_input_video: bool,
+        #[case] container: Option<&str>,
+        #[case] expected: Option<&str>,
+    ) {
+        let mut state = state();
+        state.output_video_codec = None;
+        state.is_input_video = is_input_video;
+        state.input_container = container.map(str::to_owned);
+        let options = EncodingOptions {
+            hardware_acceleration_type: accelerator,
+            ..EncodingOptions::default()
+        };
+        let found = input_source_arguments(&state, &options);
+        match expected {
+            Some(format) => assert_eq!(found, ["-f", format]),
+            None => assert!(found.is_empty(), "{found:?}"),
+        }
+        state.media_source.video_type = Some(ferrofin_model::entities::VideoType::Dvd);
+        assert_eq!(input_source_arguments(&state, &options), found);
+    }
+
+    /// The `-f` sits where `GetInputModifier` puts it: after `-fflags`,
+    /// before the looping options.
+    #[test]
+    fn the_input_format_follows_the_fflags() {
+        let mut state = state();
+        state.media_source.ignore_dts = true;
+        state.media_source.requires_looping = true;
+        state.input_container = Some("ts".to_owned());
+        let options = EncodingOptions {
+            hardware_acceleration_type: HardwareAccelerationType::nvenc,
+            ..EncodingOptions::default()
+        };
+        assert_eq!(
+            input_source_arguments(&state, &options)[..6],
+            [
+                "-fflags",
+                "+igndts+genpts",
+                "-f",
+                "mpegts",
+                "-stream_loop",
+                "-1"
+            ]
+        );
     }
 
     /// `IgnoreInputDts` → `-fflags +igndts`; `RequiresLooping` → the loop and
@@ -781,13 +868,16 @@ mod tests {
     fn ignore_dts_and_stream_looping_reach_the_input_options() {
         let mut state = state();
         state.output_video_codec = None;
-        let found = input_source_arguments(&state);
+        let found = input_source_arguments(&state, &EncodingOptions::default());
         assert!(found.is_empty(), "{found:?}");
         state.media_source.ignore_dts = true;
-        assert_eq!(input_source_arguments(&state), ["-fflags", "+igndts"]);
+        assert_eq!(
+            input_source_arguments(&state, &EncodingOptions::default()),
+            ["-fflags", "+igndts"]
+        );
         state.media_source.requires_looping = true;
         assert_eq!(
-            input_source_arguments(&state),
+            input_source_arguments(&state, &EncodingOptions::default()),
             [
                 "-fflags",
                 "+igndts",
@@ -802,7 +892,10 @@ mod tests {
             ]
         );
         state.media_source.ignore_dts = false;
-        assert_eq!(input_source_arguments(&state)[0], "-stream_loop");
+        assert_eq!(
+            input_source_arguments(&state, &EncodingOptions::default())[0],
+            "-stream_loop"
+        );
     }
 
     #[test]

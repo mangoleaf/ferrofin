@@ -323,11 +323,11 @@ fn file_system_info(path: &Path) -> DeletePath {
 }
 
 /// `string.StartsWith(prefix, StringComparison.OrdinalIgnoreCase)`: the
-/// invariant simple uppercase mapping keeps every character one character,
+/// ordinal case fold keeps every character one character,
 /// so comparing the mapped strings is comparing character by character.
 fn starts_with_ordinal_ignore_case(text: &str, prefix: &str) -> bool {
-    use ferrofin_util::string_extensions::upper_invariant;
-    upper_invariant(text).starts_with(&upper_invariant(prefix))
+    use ferrofin_util::string_extensions::ordinal_ignore_case_key;
+    ordinal_ignore_case_key(text).starts_with(&ordinal_ignore_case_key(prefix))
 }
 
 /// `BaseItem.GetLocalMetadataFilesToDelete` (`BaseItem.cs:2606-2618`): for a
@@ -1130,5 +1130,7 @@ mod tests {
         assert!(starts_with_ordinal_ignore_case("ALIENS", "alien"));
         assert!(starts_with_ordinal_ignore_case("Élan vital", "élan"));
         assert!(!starts_with_ordinal_ignore_case("Ali", "Alien"));
+        // The long s keeps its case: `ToUpperInvariant` maps it to `S`, ordinal casing does not.
+        assert!(!starts_with_ordinal_ignore_case("Croſs", "cross"));
     }
 }

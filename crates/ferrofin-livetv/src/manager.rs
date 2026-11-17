@@ -16,6 +16,7 @@ use chrono::{DateTime, Utc};
 use ferrofin_db::Database;
 use ferrofin_db::store::{datetime_to_db, guid_to_db, opt_datetime_to_db};
 use ferrofin_util::numeric_collation::invariant_numeric_cmp;
+use ferrofin_util::string_extensions::lower_invariant;
 use sqlx::{QueryBuilder, Row, Sqlite};
 use uuid::Uuid;
 
@@ -67,10 +68,6 @@ use crate::schedules_direct::{SchedulesDirect, SdChannel, SdProgram};
 use crate::stream::{LiveStreamHandle, LiveStreamKind, TunerStreamSource};
 use crate::xmltv::{Xmltv, XmltvChannel, XmltvProgramme, read_xmltv_each};
 use crate::xmltv_cache::XmlTvDocument;
-
-/// SQLite's conservative default bind-parameter limit (`SQLITE_MAX_VARIABLE_NUMBER`
-/// is 999 before 3.32, 32766 after); multi-row inserts chunk to stay under it.
-const SQLITE_BIND_LIMIT: usize = 999;
 
 /// How many programme item rows one `save_items`/`delete_items`/
 /// `save_item_values_for_items` call carries.
@@ -218,54 +215,15 @@ fn new_item_id(type_full_name: &str, lowercased_key: &str) -> Uuid {
     ferrofin_common::extensions::get_md5(&format!("{type_full_name}{lowercased_key}"))
 }
 
-/// .NET `string.ToLowerInvariant`, which is **not** Rust's
-/// [`str::to_lowercase`].
-///
-/// `ToLowerInvariant` is documented to perform *simple* case mapping — it maps
-/// each code point independently and never changes the string's length — while
-/// `str::to_lowercase` performs *full*, context-sensitive Unicode lowercasing.
-/// They differ on two things that can reach these hash inputs, because the
-/// programme half of the key embeds the XMLTV `channel` attribute verbatim and
-/// that is arbitrary text:
-///
-/// - **Final sigma.** `str::to_lowercase` implements the `Final_Sigma`
-///   condition, so a trailing `Σ` becomes `ς` (U+03C2); the simple mapping
-///   always yields `σ` (U+03C3). A Greek channel id ending in a capital sigma
-///   would otherwise derive a programme GUID Jellyfin never mints.
-/// - **U+0130** (`İ`). Its *full* lowercase mapping expands to two code points
-///   (`i` + U+0307 combining dot above); the simple mapping is the single
-///   `i`. `SpecialCasing.txt` lists U+0130 as the only **unconditional**
-///   multi-code-point lowercase mapping — every other multi-char entry is
-///   conditional (final sigma above, plus the `lt`/`tr`/`az` locale rules,
-///   which the invariant culture does not apply) — so special-casing it here
-///   makes the rest of the fold exact rather than merely closer.
-///
-/// This lives next to its callers rather than beside
-/// [`ferrofin_common::extensions::get_md5`] (the other .NET string primitive it
-/// is always paired with) only because those are the sole callers; move it
-/// there the moment a second subsystem needs the same fold.
-fn to_lower_invariant(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    for c in s.chars() {
-        if c == '\u{0130}' {
-            out.push('i');
-            continue;
-        }
-        // `char::to_lowercase` is already context-free, so with U+0130 handled
-        // above it yields exactly one char for every input; the fallback keeps
-        // this total rather than relying on that. The iterator is never empty.
-        out.push(c.to_lowercase().next().unwrap_or(c));
-    }
-    out
-}
-
 /// The internal item GUID of a Live TV channel, from its tuner-facing external id.
 ///
 /// Port of `LiveTvDtoService.GetInternalChannelId` (v10.11.8 LiveTvDtoService.cs:403-408).
+/// Its `ToLowerInvariant` is [`lower_invariant`], the simple per-character fold
+/// that keeps `İ` (U+0130) and maps a final `Σ` to `σ`, never [`str::to_lowercase`].
 fn internal_channel_id(external_id: &str) -> Uuid {
     new_item_id(
         crate::projection::CHANNEL_TYPE_NAME,
-        &to_lower_invariant(&format!(
+        &lower_invariant(&format!(
             "{LIVE_TV_SERVICE_NAME}{external_id}{LIVE_TV_INTERNAL_VERSION}"
         )),
     )
@@ -274,11 +232,12 @@ fn internal_channel_id(external_id: &str) -> Uuid {
 /// The internal item GUID of a Live TV programme, from its listings-facing
 /// external id.
 ///
-/// Port of `LiveTvDtoService.GetInternalProgramId` (v10.11.8 LiveTvDtoService.cs:424-429).
+/// Port of `LiveTvDtoService.GetInternalProgramId` (v10.11.8 LiveTvDtoService.cs:424-429),
+/// folded as [`internal_channel_id`] is.
 fn internal_program_id(external_id: &str) -> Uuid {
     new_item_id(
         crate::projection::PROGRAM_TYPE_NAME,
-        &to_lower_invariant(&format!(
+        &lower_invariant(&format!(
             "{LIVE_TV_SERVICE_NAME}{external_id}{LIVE_TV_INTERNAL_VERSION}"
         )),
     )
@@ -423,7 +382,8 @@ const PROGRAM_UPSERT_CONFLICT: &str = r#" ON CONFLICT("Id") DO UPDATE SET
 /// Ports the three application paths the C# Live TV code reaches for:
 /// `IConfigurationManager.GetTranscodePath()` (the live-stream buffer),
 /// `CommonApplicationPaths.DataPath` (`livetv/recordings`), and the
-/// `livetv` named-configuration file that holds `LiveTvOptions`.
+/// `livetv` named-configuration file that holds `LiveTvOptions`; and the
+/// internal metadata directory, which only Ferrofin's own rule reads.
 #[derive(Debug, Clone, Default)]
 pub struct LiveTvPaths {
     /// Where a shared live stream's `{uniqueId}.ts` buffer is written
@@ -434,6 +394,10 @@ pub struct LiveTvPaths {
     pub data_dir: PathBuf,
     /// The `named/livetv.json` file holding the dashboard's `LiveTvOptions`.
     pub options_file: PathBuf,
+    /// The internal metadata directory, the only place a Live TV image row's
+    /// local file is read from
+    /// ([`live_tv_image_is_internal`](ferrofin_traits::options::live_tv_image_is_internal)).
+    pub metadata_dir: ferrofin_util::directory_path::DirectoryPath,
 }
 
 /// Concrete Live TV manager backed by [`Database`] and a [`SourceFetcher`].
@@ -905,7 +869,7 @@ struct ProgramClass {
 
 /// The listings provider's category lists (`ListingsProviderInfo`), each
 /// falling back to Jellyfin's defaults when the provider carries none, held
-/// folded by `upper_invariant` so an airing folds only its own categories.
+/// folded by `ordinal_ignore_case_key` so an airing folds only its own categories.
 struct CategoryClasses {
     news: Vec<String>,
     sports: Vec<String>,
@@ -921,7 +885,7 @@ impl CategoryClasses {
                 .or(default.as_ref())
                 .map(|list| {
                     list.iter()
-                        .map(|entry| ferrofin_util::string_extensions::upper_invariant(entry))
+                        .map(|entry| ordinal_ignore_case_key(entry))
                         .collect()
                 })
                 .unwrap_or_default()
@@ -935,8 +899,9 @@ impl CategoryClasses {
     }
 
     /// `programCategories.Any(c => list.Contains(c, OrdinalIgnoreCase))`, over
-    /// a list and categories both already folded by `upper_invariant` (.NET's
-    /// per-character invariant simple uppercase, which `OrdinalIgnoreCase` uses).
+    /// a list and categories both already folded by `ordinal_ignore_case_key`
+    /// (not `upper_invariant`: `OrdinalIgnoreCase` keeps the long `ſ`, which
+    /// `ToUpperInvariant` maps to `S`).
     fn any_in(list: &[String], categories: &[String]) -> bool {
         categories.iter().any(|c| list.contains(c))
     }
@@ -976,7 +941,7 @@ impl CategoryClasses {
             .categories
             .iter()
             .filter(|c| !c.trim().is_empty())
-            .map(|c| ferrofin_util::string_extensions::upper_invariant(c))
+            .map(|c| ordinal_ignore_case_key(c))
             .collect();
         let (season_number, episode_number) = (prog.season_number, prog.episode_number);
         let is_movie = Self::any_in(&self.movie, &categories);
@@ -2170,12 +2135,13 @@ impl FerrofinLiveTvManager {
 
         // 14 columns per row; chunked multi-row insert instead of one round-trip
         // per channel.
-        for (chunk_index, chunk) in channels.chunks(SQLITE_BIND_LIMIT / 14).enumerate() {
+        let rows_per_statement = ferrofin_db::BATCH_BIND_CHUNK / 14;
+        for (chunk_index, chunk) in channels.chunks(rows_per_statement).enumerate() {
             let mut qb: QueryBuilder<Sqlite> = QueryBuilder::new(
                 r#"INSERT INTO "FerrofinLiveTvChannels"
                    ("Id","TunerHostId","TvgId","Name","Number","ImageUrl","ChannelType","StreamUrl","SortIndex","DateCreated","ExternalId","IsHd","VideoCodec","AudioCodec") "#,
             );
-            let base = chunk_index * (SQLITE_BIND_LIMIT / 14);
+            let base = chunk_index * rows_per_statement;
             qb.push_values(chunk.iter().enumerate(), |mut b, (offset, ch)| {
                 // `GuideManager.GetChannel` stores the item under
                 // `GetInternalChannelId(serviceName, channelInfo.Id)`, where
@@ -2253,7 +2219,34 @@ impl FerrofinLiveTvManager {
                 .map(sd_epg_channel)
                 .collect());
         }
-        let document = self.xmltv.get_xml(info).await?;
+        // `GetXml` rethrows what failed when no copy is cached. A file or
+        // directory that is not there, the guide or the cache file it writes,
+        // is `FileNotFoundException` or `DirectoryNotFoundException`, a 404
+        // (`ExceptionMiddleware.GetStatusCode`); an empty path is
+        // `ArgumentException`, a 400. A missing `Path` keeps its 500, the
+        // `NullReferenceException` upstream throws. `GetXml` logs the failure
+        // before it rethrows; the answer leaves the path out, as Lineups is
+        // open to users who are not administrators.
+        let document = self.xmltv.get_xml(info).await.map_err(|e| {
+            let Some(path) = info.path.as_deref() else {
+                return e;
+            };
+            let e = crate::fetch::missing_file_is_not_found(e);
+            let ServiceError::NotFound(cause) = &e else {
+                return e;
+            };
+            tracing::warn!(
+                listings_provider = info.id.as_deref().unwrap_or_default(),
+                path = %crate::fetch::redact_url(path),
+                error = %cause,
+                "live tv: XMLTV guide read failed"
+            );
+            if path.is_empty() {
+                ServiceError::InvalidInput("listing provider Path is empty".into())
+            } else {
+                ServiceError::not_found("XMLTV guide")
+            }
+        })?;
         // The channels only: every airing's children are read past, unbuilt.
         let (_, guide) = parse_guide(document, self.guide_language(info)).await?;
         // Upstream's `GetChannels` throws on a bad document, so the mapping
@@ -2897,9 +2890,9 @@ impl FerrofinLiveTvManager {
 /// The columns of one programme row in [`GuideWrite::upsert`]'s insert.
 const PROGRAM_COLUMNS: usize = 27;
 
-/// The programme rows one insert statement carries: as many as fit under
-/// [`SQLITE_BIND_LIMIT`].
-const PROGRAM_ROWS_PER_STATEMENT: usize = SQLITE_BIND_LIMIT / PROGRAM_COLUMNS;
+/// The programme rows one insert statement carries: as many as fit in
+/// [`ferrofin_db::BATCH_BIND_CHUNK`] binds.
+const PROGRAM_ROWS_PER_STATEMENT: usize = ferrofin_db::BATCH_BIND_CHUNK / PROGRAM_COLUMNS;
 
 /// One listings provider's write of its airings, in one transaction: an
 /// upsert of every airing it emits for the channels it binds, then the removal
@@ -3586,8 +3579,10 @@ impl LiveTvManager for FerrofinLiveTvManager {
             .program_dtos(&rows, &list_options, query.user.as_deref())
             .await?;
 
-        // Same rule as the item repository: the count is only bought when
-        // paging actually truncated the result.
+        // `BaseItemRepository.GetItems`' rule: the count is only bought when
+        // paging may have truncated the result. Otherwise the total is the
+        // page's length, also with the count off (`QueryItems` reads
+        // `GetItemList`, and `QueryResult` totals its items).
         let total = if query.enable_total_record_count && (query.limit.is_some() || start_index > 0)
         {
             let mut cb: QueryBuilder<Sqlite> = QueryBuilder::new(PROGRAM_COUNT);
@@ -3599,7 +3594,7 @@ impl LiveTvManager for FerrofinLiveTvManager {
                 .map_err(db_err)?;
             i32::try_from(count).unwrap_or(i32::MAX)
         } else {
-            i32::try_from(items.len()).unwrap_or(i32::MAX) + start_index
+            i32::try_from(items.len()).unwrap_or(i32::MAX)
         };
         Ok(QueryResult::new(Some(start_index), Some(total), items))
     }
@@ -4268,9 +4263,6 @@ impl LiveTvManager for FerrofinLiveTvManager {
         // finds a timer stored under either.
         let program = self.program_row_for_timer(&timer.base).await?;
         if let Some(program) = &program {
-            if let Ok(id) = Uuid::parse_str(&program.id) {
-                timer.base.program_id = Some(id.simple().to_string());
-            }
             // `CopyProgramInfoToTimerInfo`: the guide is the authority on what
             // this timer is actually recording.
             copy_program_into_timer(program, &mut timer);
@@ -4694,14 +4686,6 @@ impl LiveTvManager for FerrofinLiveTvManager {
             )
             .await?
             .pop())
-    }
-
-    async fn get_recording_path(&self, id: Uuid) -> Result<Option<String>, ServiceError> {
-        let Some(row) = crate::dvr_repository::recording_row(&self.db, id).await? else {
-            return Ok(None);
-        };
-        // Only report a path that actually points at a captured file.
-        Ok(row.path.filter(|p| !p.is_empty()))
     }
 
     async fn get_active_recording_path(
@@ -5217,7 +5201,8 @@ impl FerrofinLiveTvManager {
     /// series timer's timer the artwork [`Self::fill_images`] finds by the
     /// timer's name and the programme's series (`TimerInfo.SeriesId` is the
     /// programme's, `CopyProgramInfoToTimerInfo`). The channel gives its
-    /// current name and logo tag, and the run time is the timer's window.
+    /// current name and logo tag, the run time is the timer's window, and the
+    /// programme's item id is derived from its listing id ([`derive_program_id`]).
     async fn build_timer_dto(&self, timer: &mut TimerInfoDto) -> Result<(), ServiceError> {
         // `GetTimerInfoDto` builds a new DTO: the programme and the channel's
         // name and logo come only from this read, and it sets no parent
@@ -5231,6 +5216,7 @@ impl FerrofinLiveTvManager {
             Some((timer.base.end_date - timer.base.start_date).num_milliseconds() * 10_000);
         // `string.IsNullOrEmpty(info.SeriesTimerId) ? null : …`.
         timer.series_timer_id = timer.series_timer_id.take().filter(|id| !id.is_empty());
+        derive_program_id(&mut timer.base);
         if let Some(program) = self.program_row_for_timer(&timer.base).await?
             && let Some(mut info) = self
                 .program_dtos(std::slice::from_ref(&program), &DtoOptions::default(), None)
@@ -5278,9 +5264,10 @@ impl FerrofinLiveTvManager {
     /// The read half of `LiveTvManager.GetSeriesTimers` and
     /// `LiveTvDtoService.GetSeriesTimerInfoDto` (v12.4 LiveTvManager.cs:909-955,
     /// LiveTvDtoService.cs:113-159), which build each series timer as it is
-    /// read: the channel's current name (none without a channel), and the
-    /// artwork [`Self::fill_images`] finds by the timer's name and `series_id`,
-    /// its stored `SeriesTimerInfo.SeriesId`.
+    /// read: the channel's current name (none without a channel), the
+    /// programme's item id ([`derive_program_id`]), and the artwork
+    /// [`Self::fill_images`] finds by the timer's name and `series_id`, its
+    /// stored `SeriesTimerInfo.SeriesId`.
     async fn build_series_timer_dto(
         &self,
         timer: &mut SeriesTimerInfoDto,
@@ -5289,6 +5276,7 @@ impl FerrofinLiveTvManager {
         // `GetSeriesTimerInfoDto` builds a new DTO, and sets neither.
         timer.base.channel_primary_image_tag = None;
         timer.image_tags.clear();
+        derive_program_id(&mut timer.base);
         timer.base.channel_name = if timer.base.channel_id.is_nil() {
             None
         } else {
@@ -6612,30 +6600,42 @@ impl FerrofinLiveTvManager {
         timer.status = RecordingStatus::InProgress;
         self.persist_timer(timer).await?;
         // `SaveRecordingMetadata`, which upstream's `async void OnStarted`
-        // runs without the recorder waiting on it. A failure is logged, as
-        // its catch-all logs it: a sidecar never fails a recording.
-        if options.save_recording_nfo {
+        // runs without the recorder waiting on it: the NFO, then the images.
+        // A failure is logged, as its catch-all logs it: a sidecar never fails
+        // a recording, and a failed NFO leaves the images unsaved.
+        let (save_nfo, save_images) = (options.save_recording_nfo, options.save_recording_images);
+        if save_nfo || save_images {
+            let manager = self.clone();
             let info = info.clone();
             let target = target.to_path_buf();
             let series = series.map(std::path::Path::to_path_buf);
-            let release_date = Arc::clone(&self.release_date_format);
-            let span = tracing::info_span!("recording_nfo", timer_id = %info.id);
+            let span = tracing::info_span!(
+                parent: None,
+                "recording_metadata",
+                trigger = "schedule",
+                timer_id = %info.id
+            );
             tokio::spawn(tracing::Instrument::instrument(
                 async move {
-                    if let Err(error) = crate::recording_metadata::save_recording_nfo(
-                        &info,
-                        &target,
-                        series.as_deref(),
-                        &release_date,
-                        Utc::now(),
-                    )
-                    .await
+                    if save_nfo
+                        && let Err(error) = crate::recording_metadata::save_recording_nfo(
+                            &info,
+                            &target,
+                            series.as_deref(),
+                            &manager.release_date_format,
+                            Utc::now(),
+                        )
+                        .await
                     {
                         tracing::warn!(
                             path = %target.display(),
                             %error,
                             "live tv: could not save the recording's NFO"
                         );
+                        return;
+                    }
+                    if save_images {
+                        manager.save_recording_images(&info, &target).await;
                     }
                 },
                 span,
@@ -6680,13 +6680,74 @@ impl FerrofinLiveTvManager {
                 timer_id = %info.id
             ),
         ));
-        // TODO(parity, open work item — NOT an accepted divergence; gl-749):
-        // with `save_recording_images`, upstream also copies the programme's
-        // artwork beside the recording (`SaveRecordingImages`), but the guide
-        // carries no programme images yet (gl-367). Un-defer path: once it
-        // does, port `SaveRecordingImages` into `recording_metadata` and call
-        // it here, gated on that option.
         Ok((recording_id, cancel))
+    }
+
+    /// `SaveRecordingImages`: the guide programme's artwork copied beside the
+    /// recording ([`recording_images`](crate::recording_metadata::recording_images)),
+    /// each image made local first through the remote-image cache (the
+    /// download half of `ConvertImageToLocal`). A failure is logged and the
+    /// next image tried, as upstream's catch around each does.
+    async fn save_recording_images(&self, info: &TimerRecordingInfo, recording: &std::path::Path) {
+        let (Some(program), Some(store), Some(images)) = (
+            info.program_item_id,
+            self.item_store.get(),
+            self.images.get(),
+        ) else {
+            return;
+        };
+        let rows = match store.items.get_image_infos(program).await {
+            Ok(rows) => rows,
+            Err(error) => {
+                tracing::warn!(item_id = %program, %error, "live tv: could not read the programme images to save beside the recording");
+                return;
+            }
+        };
+        let chosen =
+            crate::recording_metadata::recording_images(recording, info.is_program_series, &rows);
+        for (image, name) in chosen {
+            // A Live TV row holds what a guide supplied, so its local file is
+            // read only in the metadata directory; upstream copies any.
+            let local = if !image.is_local_file() {
+                images
+                    .providers
+                    .cached_remote_image(&image.path)
+                    .await
+                    .map_err(|error| error.to_string())
+            } else if ferrofin_traits::options::live_tv_image_is_internal(
+                &image.path,
+                &self.paths.metadata_dir.resolve(),
+            )
+            .await
+            {
+                Ok(image.path.clone())
+            } else {
+                Err("its file is outside the metadata directory".to_owned())
+            };
+            let local = match local {
+                Ok(local) => local,
+                Err(error) => {
+                    tracing::warn!(
+                        item_id = %program,
+                        image_type = ?image.image_type,
+                        %error,
+                        "live tv: could not make a programme image local to save beside the recording"
+                    );
+                    continue;
+                }
+            };
+            if let Err(error) =
+                crate::recording_metadata::copy_recording_image(std::path::Path::new(&local), &name)
+                    .await
+            {
+                tracing::warn!(
+                    path = %name.display(),
+                    image_type = ?image.image_type,
+                    %error,
+                    "live tv: could not copy a programme image beside the recording"
+                );
+            }
+        }
     }
 
     /// Runs the recorder upstream's `GetRecorder` would have chosen.
@@ -7545,7 +7606,9 @@ fn push_separator(qb: &mut QueryBuilder<Sqlite>, first: &mut bool) {
 /// genre scopes, by name and by id.
 ///
 /// The classification flags (`IsMovie`/`IsSeries`/`IsNews`/`IsKids`/`IsSports`)
-/// match the columns the guide refresh derives per listings provider.
+/// match the columns the guide refresh derives per listings provider:
+/// `IsMovie`/`IsSeries` each their own, and `IsNews`/`IsKids`/`IsSports` as
+/// upstream's tags, any one of the `true` ones and none of the `false` ones.
 /// `SeriesTimerId` never reaches this builder: `get_programs` answers it with
 /// the empty result upstream returns when the series-timer scope cannot be
 /// built.
@@ -7651,9 +7714,6 @@ fn push_program_filters(
     for (column, wanted) in [
         (r#"p."IsMovie""#, query.is_movie),
         (r#"p."IsSeries""#, query.is_series),
-        (r#"p."IsNews""#, query.is_news),
-        (r#"p."IsKids""#, query.is_kids),
-        (r#"p."IsSports""#, query.is_sports),
     ] {
         if let Some(wanted) = wanted {
             push_separator(qb, &mut first);
@@ -7661,11 +7721,37 @@ fn push_program_filters(
         }
     }
 
+    push_program_tags(qb, query, &mut first);
     push_program_genres(qb, query, &mut first);
 
     if let Some(restrictions) = restrictions {
         push_separator(qb, &mut first);
         crate::guide_repository::push_item_restrictions(qb, r#"p."Id""#, restrictions);
+    }
+}
+
+/// Pushes the `IsNews`/`IsKids`/`IsSports` scopes of a program query. They are
+/// tag sugar upstream (v12.4 `TranslateQuery.cs:224-258`): a programme carries
+/// ANY of the `true` flags' tags (`:665-670`) and none of the `false` ones'
+/// (`:672-677`).
+fn push_program_tags(qb: &mut QueryBuilder<Sqlite>, query: &InternalItemsQuery, first: &mut bool) {
+    let tags = [
+        (r#"p."IsNews""#, query.is_news),
+        (r#"p."IsKids""#, query.is_kids),
+        (r#"p."IsSports""#, query.is_sports),
+    ];
+    if tags.iter().any(|(_, wanted)| *wanted == Some(true)) {
+        push_separator(qb, first);
+        qb.push("(");
+        let mut any = qb.separated(" OR ");
+        for (column, _) in tags.iter().filter(|(_, wanted)| *wanted == Some(true)) {
+            any.push(*column).push_unseparated(" = 1");
+        }
+        qb.push(")");
+    }
+    for (column, _) in tags.iter().filter(|(_, wanted)| *wanted == Some(false)) {
+        push_separator(qb, first);
+        qb.push(*column).push(" = 0");
     }
 }
 
@@ -8218,9 +8304,6 @@ fn series_child_timer(
         },
         ..TimerInfoDto::default()
     };
-    if let Ok(program_id) = Uuid::parse_str(&program.id) {
-        timer.base.program_id = Some(program_id.simple().to_string());
-    }
     // `CopyProgramInfoToTimerInfo(parent, timer, …)` — name, overview, window,
     // channel and the listing's own programme id all come from the guide.
     copy_program_into_timer(program, &mut timer);
@@ -8330,6 +8413,21 @@ fn program_channel_ids<'a>(rows: impl Iterator<Item = &'a GuideProgramRow>) -> V
         .collect()
 }
 
+/// `dto.ProgramId = GetInternalProgramId(info.ProgramId)`, which
+/// `GetTimerInfoDto` and `GetSeriesTimerInfoDto` run on every read: the item
+/// id derived from the listing id, so a stored id from an older derivation
+/// (the `İ` fold, gl-266) is not served. Without a listing id (an XMLTV airing
+/// without a start, which upstream never lists) the stored id stays.
+fn derive_program_id(timer: &mut ferrofin_model::live_tv::BaseTimerInfoDto) {
+    if let Some(external) = timer
+        .external_program_id
+        .as_deref()
+        .filter(|e| !e.is_empty())
+    {
+        timer.program_id = Some(internal_program_id(external).simple().to_string());
+    }
+}
+
 /// Copies what the guide knows about a programme onto the timer that records it.
 ///
 /// Port of `DefaultLiveTvService.CopyProgramInfoToTimerInfo`, restricted to the
@@ -8352,6 +8450,12 @@ fn copy_program_into_timer(program: &GuideProgramRow, timer: &mut TimerInfoDto) 
         .base
         .external_program_id
         .clone_from(&program.external_id);
+    // Upstream stores only the listing id and derives the item id from it on
+    // each read; the stored item id follows the row so it cannot go stale when
+    // that derivation changes (the `İ` fold, gl-266).
+    if let Ok(program_id) = Uuid::parse_str(&program.id) {
+        timer.base.program_id = Some(program_id.simple().to_string());
+    }
     timer.run_time_ticks =
         Some((timer.base.end_date - timer.base.start_date).num_milliseconds() * 10_000);
 }
@@ -8384,6 +8488,7 @@ fn apply_program_to_recording_info(program: &GuideProgramRow, info: &mut TimerRe
     info.is_live = program.is_live;
     info.is_repeat = program.is_repeat;
     info.is_premiere = program.is_premiere;
+    info.program_item_id = Uuid::parse_str(&program.id).ok();
     info.external_program_id.clone_from(&program.external_id);
     info.genres = program
         .genres
@@ -8435,6 +8540,7 @@ mod tests {
     mod keep_up_to;
     mod program_list;
     mod recording_folders;
+    mod recording_images;
     mod schedules_direct;
 
     use std::collections::HashMap;
@@ -9187,6 +9293,94 @@ mod tests {
         assert!(listing_providers.is_empty(), "{listing_providers:?}");
     }
 
+    /// `XmlTvListingsProvider.GetXml` (v12.4 :63-161) rethrows what failed
+    /// when no copy is cached: a file or directory that is not there is
+    /// `FileNotFoundException` or `DirectoryNotFoundException`, a `404`
+    /// (`ExceptionMiddleware.GetStatusCode`), and an empty path
+    /// `ArgumentException`, a `400`. A directory (`UnauthorizedAccessException`)
+    /// and a missing `Path` (`NullReferenceException`) stay `500`s. The
+    /// lineups, the mapping options and a mapping save all read the guide's
+    /// channels through it; the save stores the pair first. The answer leaves
+    /// the path out, and a stale cached copy is still read. Stored directly: a
+    /// save refuses these paths (`Validate`), an adopted `livetv.xml` does not.
+    #[tokio::test]
+    async fn a_local_guide_that_is_gone_is_not_found_and_an_empty_path_is_invalid() {
+        let mgr = manager_with_fetcher(Arc::new(crate::fetch::ReqwestFetcher::new())).await;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let at = |name: &str| Some(dir.path().join(name).to_str().expect("utf-8").to_owned());
+        let store = |path: Option<String>| {
+            let mgr = mgr.clone();
+            async move {
+                mgr.store_listing_provider(as_xmltv(ListingsProviderInfo {
+                    path,
+                    ..ListingsProviderInfo::default()
+                }))
+                .await
+                .expect("stored")
+                .id
+                .expect("id")
+            }
+        };
+        for (path, status) in [
+            (at("gone.xml"), 404),
+            (at("gone/guide.xml"), 404),
+            (Some(" ".to_owned()), 404),
+            (Some(String::new()), 400),
+            (None, 500),
+            (Some(dir.path().to_str().expect("utf-8").to_owned()), 500),
+        ] {
+            let id = store(path.clone()).await;
+            let errors = [
+                mgr.get_lineups(Some(&id), Some("xmltv"), None, None)
+                    .await
+                    .expect_err("lineups"),
+                mgr.get_channel_mapping_options(&id)
+                    .await
+                    .expect_err("options"),
+                mgr.set_channel_mapping(&id, "1", "2")
+                    .await
+                    .expect_err("mapping"),
+            ];
+            for err in errors {
+                let got = match err {
+                    ServiceError::NotFound(_) => 404,
+                    ServiceError::InvalidInput(_) => 400,
+                    ServiceError::BackendSource(_) => 500,
+                    _ => 0,
+                };
+                assert_eq!(got, status, "{path:?}: {err:?}");
+                // A user who is not an administrator may read Lineups.
+                if status == 404 {
+                    assert!(!err.to_string().contains("gone"), "{err}");
+                }
+            }
+            let stored = mgr.listing_provider_by_id(&id).await.expect("provider");
+            assert_eq!(
+                stored.channel_mappings.len(),
+                1,
+                "{path:?}: the pair is stored first"
+            );
+        }
+
+        // A stale copy is read in place of a file that is gone, as upstream's
+        // catch returns the cached file.
+        let id = store(at("gone.xml")).await;
+        let cache_file = mgr.xmltv.cache_file_for_test(&id);
+        std::fs::create_dir_all(cache_file.parent().expect("dir")).expect("cache dir");
+        std::fs::write(&cache_file, XMLTV).expect("cached copy");
+        std::fs::File::options()
+            .write(true)
+            .open(&cache_file)
+            .expect("open")
+            .set_modified(std::time::SystemTime::now() - std::time::Duration::from_hours(2))
+            .expect("stale");
+        let lineups = mgr
+            .get_lineups(Some(&id), Some("xmltv"), None, None)
+            .await
+            .expect("the stale copy");
+        assert_eq!(lineups.len(), 1, "{lineups:?}");
+    }
+
     /// `XmlTvListingsProvider.GetLanguage`: a guide is read in its provider's
     /// `PreferredLanguage`, else in the server's `PreferredMetadataLanguage`,
     /// read as it is when the guide is read.
@@ -9877,6 +10071,93 @@ mod tests {
             .await
             .expect("progs");
         assert_eq!(programs.total_record_count, 5000);
+    }
+
+    /// One channel and one airing more than [`ferrofin_db::BATCH_BIND_CHUNK`]:
+    /// the channel and programme upserts and the deletes by id each take more
+    /// than one statement, and the lineup keeps its playlist order across the
+    /// channel upsert's statements (gl-279).
+    #[tokio::test]
+    async fn guide_writes_and_deletes_cross_the_bind_chunk() {
+        use std::fmt::Write as _;
+        let count = ferrofin_db::BATCH_BIND_CHUNK + 1;
+        // Names descend down the playlist, so only `SortIndex` keeps its order.
+        let name = |c: usize| format!("Channel {:04}", count - c);
+        let day = guide_day(0);
+        let mut m3u = String::from("#EXTM3U\n");
+        let mut xmltv = String::from("<tv>");
+        for c in 0..count {
+            let _ = write!(
+                m3u,
+                "#EXTINF:-1 tvg-id=\"ch{c}.tv\" tvg-chno=\"{c}\",{}\nhttp://tuner/{c}\n",
+                name(c)
+            );
+            let _ = write!(
+                xmltv,
+                "<channel id=\"ch{c}.tv\"><display-name>{}</display-name></channel>\
+                 <programme start=\"{day}060000 +0000\" stop=\"{day}070000 +0000\" \
+                 channel=\"ch{c}.tv\"><title>Show {c}</title></programme>",
+                name(c)
+            );
+        }
+        xmltv.push_str("</tv>");
+        let mut sources = HashMap::new();
+        sources.insert("http://tuner/playlist.m3u".to_owned(), m3u);
+        sources.insert("http://guide/xmltv.xml".to_owned(), xmltv);
+        let mgr = manager_with(FakeFetcher(sources)).await;
+        let host = mgr
+            .save_tuner_host(TunerHostInfo {
+                type_: Some("m3u".to_owned()),
+                url: Some("http://tuner/playlist.m3u".to_owned()),
+                ..TunerHostInfo::default()
+            })
+            .await
+            .expect("tuner")
+            .id
+            .expect("tuner id");
+        mgr.save_listing_provider(
+            as_xmltv(ListingsProviderInfo {
+                path: Some("http://guide/xmltv.xml".to_owned()),
+                ..ListingsProviderInfo::default()
+            }),
+            false,
+            false,
+        )
+        .await
+        .expect("provider");
+        mgr.refresh_guide().await.expect("refresh");
+
+        let lineup = crate::guide_repository::tuner_lineup(&mgr.db, &host)
+            .await
+            .expect("lineup");
+        let names: Vec<String> = lineup.into_iter().map(|row| row.name).collect();
+        assert_eq!(names, (0..count).map(name).collect::<Vec<_>>());
+
+        let programs = crate::guide_repository::all_program_ids(&mgr.db)
+            .await
+            .expect("programmes");
+        assert_eq!(programs.len(), count);
+        let mut conn = mgr.db.writer().acquire().await.expect("connection");
+        crate::guide_repository::delete_programs_in(&mut conn, &programs)
+            .await
+            .expect("delete programmes");
+        drop(conn);
+        let left = crate::guide_repository::all_program_ids(&mgr.db)
+            .await
+            .expect("programmes left");
+        assert!(left.is_empty(), "{} programmes left", left.len());
+
+        let channels = crate::guide_repository::all_channel_ids(&mgr.db)
+            .await
+            .expect("channels");
+        assert_eq!(channels.len(), count);
+        crate::guide_repository::delete_channels(&mgr.db, &channels)
+            .await
+            .expect("delete channels");
+        let left = crate::guide_repository::all_channel_ids(&mgr.db)
+            .await
+            .expect("channels left");
+        assert!(left.is_empty(), "{} channels left", left.len());
     }
 
     /// Builds a two-channel guide whose airings sit at fixed offsets from *now*,
@@ -10930,6 +11211,11 @@ mod tests {
     #[derive(Default)]
     struct ArtServices {
         cached: std::sync::Mutex<Vec<String>>,
+        /// With a folder, a fetched URL is "downloaded" into it, named by its
+        /// last segment and holding the URL, and the cache answers that file.
+        downloads: Option<std::path::PathBuf>,
+        /// URLs the cache fails to download.
+        refused: Vec<String>,
     }
 
     #[async_trait::async_trait]
@@ -10967,7 +11253,15 @@ mod tests {
         }
         async fn cached_remote_image(&self, path: &str) -> Result<String, ServiceError> {
             self.cached.lock().expect("cache log").push(path.to_owned());
-            Ok(format!("/cache/{}", path.len()))
+            if self.refused.iter().any(|url| url == path) {
+                return Err(ServiceError::backend("refused"));
+            }
+            let Some(folder) = &self.downloads else {
+                return Ok(format!("/cache/{}", path.len()));
+            };
+            let file = folder.join(path.rsplit('/').next().unwrap_or(path));
+            std::fs::write(&file, path).map_err(|e| ServiceError::backend(e.to_string()))?;
+            Ok(file.display().to_string())
         }
         async fn save_image(
             &self,
@@ -11691,6 +11985,7 @@ mod tests {
                 transcode_dir: root.join("transcodes").into(),
                 data_dir: root.join("data"),
                 options_file: root.join("named").join("livetv.json"),
+                ..LiveTvPaths::default()
             });
         mgr.set_local_api_access(Arc::new(LoopbackApi));
         mgr
@@ -11856,6 +12151,7 @@ mod tests {
                 transcode_dir: root.join("transcodes").into(),
                 data_dir: root.join("data"),
                 options_file: named.join("livetv.json"),
+                ..LiveTvPaths::default()
             })
     }
 
@@ -13619,6 +13915,99 @@ mod tests {
             mgr.armed_timers_lock().contains_key(&stale),
             "and is re-armed"
         );
+    }
+
+    /// A timer whose stored programme id no longer names a row (the id an
+    /// older fold of the listing id derived, gl-266) is found by its listing id
+    /// and takes the row's id, so the guide links it again. Upstream stores
+    /// only the listing id and derives the item id on read, so it never goes
+    /// stale there.
+    #[tokio::test]
+    async fn a_guide_refresh_relinks_a_timer_by_its_listing_id() {
+        let mgr = manager_with_series_guide().await;
+        let airing = refresh_test_airing(&mgr).await;
+        let future = Utc::now() + chrono::Duration::hours(3);
+        let (id, mut dto) = refresh_test_timer(
+            &airing,
+            "re-keyed",
+            RecordingStatus::New,
+            Some(Uuid::new_v4().simple().to_string()),
+            future,
+        );
+        dto.base.external_program_id.clone_from(&airing.external_id);
+        mgr.persist_timer(&dto).await.expect("seed timer");
+
+        mgr.refresh_guide().await.expect("refresh");
+
+        let row_id = Uuid::parse_str(&airing.id).expect("guid");
+        assert_eq!(
+            timers_by_id(&mgr).await[&id].base.program_id,
+            Some(row_id.simple().to_string())
+        );
+        let programs = mgr
+            .get_programs(&InternalItemsQuery::default(), &DtoOptions::default())
+            .await
+            .expect("programs")
+            .items;
+        let programme = programs.iter().find(|p| p.id == row_id).expect("airing");
+        assert_eq!(programme.timer_id.as_deref(), Some(id.as_str()));
+    }
+
+    /// A timer's `ProgramId` is derived from its listing id on each read
+    /// (`GetTimerInfoDto`), before any guide refresh relinks the stored one.
+    #[tokio::test]
+    async fn a_timer_serves_the_programme_id_its_listing_id_derives() {
+        let mgr = manager_with_series_guide().await;
+        let airing = refresh_test_airing(&mgr).await;
+        let future = Utc::now() + chrono::Duration::hours(3);
+        let (id, mut dto) = refresh_test_timer(
+            &airing,
+            "re-keyed",
+            RecordingStatus::New,
+            Some(Uuid::new_v4().simple().to_string()),
+            future,
+        );
+        dto.base.external_program_id.clone_from(&airing.external_id);
+        mgr.persist_timer(&dto).await.expect("seed timer");
+
+        let served = mgr
+            .get_timers_matching(&ferrofin_model::live_tv::TimerQuery::default())
+            .await
+            .expect("timers")
+            .into_iter()
+            .find(|t| t.base.id.as_deref() == Some(id.as_str()))
+            .expect("listed");
+        let row_id = Uuid::parse_str(&airing.id).expect("guid");
+        assert_eq!(served.base.program_id, Some(row_id.simple().to_string()));
+        assert!(served.program_info.is_some(), "the guide row is found");
+    }
+
+    /// A series timer's `ProgramId` is derived from its listing id on each
+    /// read (`GetSeriesTimerInfoDto`), so one stored under an older
+    /// derivation's id (gl-266) is served with the current one.
+    #[tokio::test]
+    async fn a_series_timer_serves_the_programme_id_its_listing_id_derives() {
+        let mgr = manager_with_series_guide().await;
+        let airing = refresh_test_airing(&mgr).await;
+        let id = mgr
+            .create_series_timer(defaults_for(&mgr, &airing).await)
+            .await
+            .expect("series timer");
+        let mut stored = mgr
+            .stored_series_timer(&id)
+            .await
+            .expect("read")
+            .expect("row");
+        stored.dto.base.program_id = Some(Uuid::new_v4().simple().to_string());
+        mgr.persist_series_timer(&stored).await.expect("store");
+
+        let served = all_series_timers(&mgr)
+            .await
+            .into_iter()
+            .find(|t| t.base.id.as_deref() == Some(id.as_str()))
+            .expect("listed");
+        let row_id = Uuid::parse_str(&airing.id).expect("guid");
+        assert_eq!(served.base.program_id, Some(row_id.simple().to_string()));
     }
 
     /// `RefreshTimers` calls `_timerManager.Update` for every live timer, not
@@ -17679,6 +18068,7 @@ mod tests {
             transcode_dir: dir.path().join("transcodes").into(),
             data_dir: dir.path().join("data"),
             options_file,
+            ..LiveTvPaths::default()
         };
         let mgr = manager_with(FakeFetcher(HashMap::new()))
             .await
@@ -17897,7 +18287,7 @@ mod tests {
 mod id_derivation_tests {
     use super::{
         LIVE_TV_INTERNAL_VERSION, LIVE_TV_SERVICE_NAME, internal_channel_id, internal_program_id,
-        new_item_id, to_lower_invariant,
+        new_item_id,
     };
     // The channel identity itself moved to the M3U tuner host with the rest of
     // that backend; these vectors pin it wherever it lives.
@@ -17972,39 +18362,91 @@ mod id_derivation_tests {
         );
     }
 
-    /// `ToLowerInvariant` is a simple, per-code-point fold. Rust's
-    /// `str::to_lowercase` is a full, context-sensitive one, and the two
-    /// disagree on exactly the inputs an XMLTV `channel` attribute can carry.
-    /// ASCII — every id this fixture produces — is identical either way, which
-    /// is why the pinned GUIDs above are unaffected and why nothing caught this.
+    /// An XMLTV channel id holding `İ` (U+0130), as a real Jellyfin 12.4
+    /// derived it: an M3U at `http://172.17.0.1:18555/channels.m3u` whose entry
+    /// streams `…/izmir.ts` with `tvg-id="İZMİR.tr"`, and an XMLTV guide whose
+    /// `İZMİR.tr` airings start at 08:00 and 09:00 UTC. The old fold (`İ` to
+    /// `i`) derived 84d7ebbc418ca6a73a741b9831759184 and
+    /// 4531772d4749686d95b84544ece75059.
     #[rstest::rstest]
-    // Final sigma: `str::to_lowercase` yields U+03C2, the simple mapping U+03C3.
-    #[case("\u{03A3}", "\u{03C3}")]
-    #[case("\u{039F}\u{0394}\u{039F}\u{03A3}", "\u{03BF}\u{03B4}\u{03BF}\u{03C3}")]
-    // A non-final sigma is unambiguous and both agree.
-    #[case("\u{03A3}A", "\u{03C3}a")]
-    // U+0130: the full mapping expands to two code points, the simple one does not.
-    #[case("\u{0130}", "i")]
-    // Turkish dotless i has no lowercase of its own; the invariant fold is identity.
-    #[case("\u{0131}", "\u{0131}")]
-    #[case("M3U_ABC", "m3u_abc")]
-    fn to_lower_invariant_is_the_simple_fold(#[case] input: &str, #[case] expected: &str) {
-        assert_eq!(to_lower_invariant(input), expected);
-        // The documented .NET guarantee: the fold never changes the code-point count.
+    #[case(
+        "2026-11-15T08:00:00.0000000+00:00",
+        "cd91c0d9a5782448ef5d760e21590af8"
+    )]
+    #[case(
+        "2026-11-15T09:00:00.0000000+00:00",
+        "603afaf7867503a89384d2abe748e531"
+    )]
+    fn dotted_capital_i_program_ids_match_jellyfin(
+        #[case] start: &str,
+        #[case] expected_guid: &str,
+    ) {
+        let channel_external = m3u_external_channel_id(
+            "http://172.17.0.1:18555/channels.m3u",
+            "http://172.17.0.1:18555/izmir.ts",
+        );
         assert_eq!(
-            to_lower_invariant(input).chars().count(),
-            input.chars().count()
+            internal_channel_id(&channel_external).simple().to_string(),
+            "73aea0de66a463690a9b2d18367cfce7"
+        );
+        let external = format!("\u{0130}ZM\u{0130}R.tr_{start}_{channel_external}");
+        assert_eq!(
+            internal_program_id(&external).simple().to_string(),
+            expected_guid
         );
     }
 
-    /// The negative control for the above: `str::to_lowercase` really does
-    /// derive a different programme GUID for a Greek channel id, so the helper
-    /// is load-bearing and not decoration.
+    /// `ToLowerInvariant` is .NET's simple, per-character invariant fold, not
+    /// Rust's full, context-sensitive `str::to_lowercase`; the two disagree on
+    /// exactly the inputs an XMLTV `channel` attribute (part of every XMLTV
+    /// programme id) can carry. The expected GUIDs are computed apart from this
+    /// code: MD5 over UTF-16LE in .NET `Guid` order, folded with the .NET 10
+    /// `ChangeCaseInvariant` table in `ferrofin-util`'s
+    /// `tests/data/dotnet-invariant-casing.tsv`; the same calculation gives the
+    /// Jellyfin-observed GUIDs pinned above.
+    #[rstest::rstest]
+    // `İ` (U+0130) stays `İ`: .NET special-cases it, where Unicode's simple
+    // lowercase is `i` (which derived 3938ea696b917ab7b52b467e7a2438e2 here).
+    #[case(
+        "\u{0130}ZM\u{0130}R.tr_2026-08-30T03:00:00.0000000+00:00_m3u_abc",
+        "995e221cf1d8d6eb6d9209e9dcf79eb5"
+    )]
+    // A final `Σ` folds to `σ`, never the `ς` of the full mapping.
+    #[case(
+        "\u{039F}\u{0394}\u{039F}\u{03A3}_2026-08-30T03:00:00.0000000+00:00_m3u_abc",
+        "8b12b5f618918db2fbaf9dc546af2ed2"
+    )]
+    // The dotless `ı` (U+0131) and the long `ſ` (U+017F) are lowercase already.
+    #[case("K\u{0131}z_m3u_abc", "084acbcd8a525b3ef55b8f2bbbe4de34")]
+    #[case("\u{017F}port_m3u_abc", "4349d6b95810bd5bdc6498420d48b895")]
+    // `ᾼ` (U+1FBC) folds to `ᾳ` (U+1FB3), one character for one.
+    #[case("\u{1FBC}_m3u_abc", "8777028513e38637660e66ce33968077")]
+    fn program_ids_fold_as_dotnet_to_lower_invariant(
+        #[case] external: &str,
+        #[case] expected_guid: &str,
+    ) {
+        assert_eq!(
+            internal_program_id(external).simple().to_string(),
+            expected_guid
+        );
+    }
+
+    /// Channel ids take the same fold: `İ` survives it.
+    #[test]
+    fn channel_ids_fold_as_dotnet_to_lower_invariant() {
+        assert_eq!(
+            internal_channel_id("hdhr_\u{0130}").simple().to_string(),
+            "175e795922731d45abd589f0ad4a31fa"
+        );
+    }
+
+    /// The negative control: `str::to_lowercase` really does derive a
+    /// different programme GUID for a Greek channel id, so the fold is
+    /// load-bearing and not decoration.
     #[test]
     fn a_final_sigma_channel_id_would_have_derived_a_different_guid() {
         let external = "\u{039F}\u{0394}\u{039F}\u{03A3}_2026-08-30T03:00:00.0000000+00:00_m3u_abc";
         let key = format!("{LIVE_TV_SERVICE_NAME}{external}{LIVE_TV_INTERNAL_VERSION}");
-        assert_ne!(to_lower_invariant(&key), key.to_lowercase());
         assert_ne!(
             internal_program_id(external),
             new_item_id(crate::projection::PROGRAM_TYPE_NAME, &key.to_lowercase()),
@@ -18154,13 +18596,17 @@ mod category_class_tests {
     /// StringComparison.OrdinalIgnoreCase))` (v12.4 XmlTvListingsProvider.cs:278-281):
     /// each character through .NET's invariant simple uppercase mapping, so a
     /// mapping that changes length (`ß` → `SS`) or folds dotless `ı` onto `I`
-    /// does not apply, and blank categories are dropped first.
+    /// does not apply, the long `ſ` stays apart from `s` (ordinal casing keeps
+    /// it, where `ToUpperInvariant` maps it to `S`), and blank categories are
+    /// dropped first.
     #[rstest]
     #[case(&["football"], &["FOOTBALL"], true)]
     #[case(&["football"], &["Movie", "Football"], true)]
     #[case(&["éclair"], &["ÉCLAIR"], true)]
     #[case(&["FUSSBALL"], &["Fußball"], false)]
     #[case(&["kids"], &["Kıds"], false)]
+    #[case(&["sport"], &["\u{017F}port"], false)]
+    #[case(&["\u{1FBC}"], &["\u{1FB3}"], true)]
     #[case(&["football"], &["foot ball"], false)]
     #[case(&["football"], &["  "], false)]
     #[case(&["  "], &["  "], false)]

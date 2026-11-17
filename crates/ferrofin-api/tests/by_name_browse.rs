@@ -1435,6 +1435,10 @@ async fn min_community_rating_binds_as_a_double_where_declared(
         ("minCommunityRating=1e400", true),
         ("minCommunityRating=-Infinity", true),
         ("minCommunityRating=NaN", true),
+        // `DoubleModelBinder`: Rust's `inf` is no double, a group separator is.
+        ("minCommunityRating=inf", false),
+        ("minCommunityRating=%2Binf", false),
+        ("minCommunityRating=1%2C5", true),
     ] {
         let refused = declared && !binds;
         let library = ByNameLibrary::default();

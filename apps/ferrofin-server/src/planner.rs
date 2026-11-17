@@ -993,6 +993,9 @@ impl StreamStatePlanner for FerrofinStreamStatePlanner {
             // live MPEG-TS usually probes with no bitrate, so leaving it unset
             // software-transcodes every channel that could have been copied.
             live_stream_id: request.live_stream_id.clone(),
+            // As sent, never the resolved source: the ffmpeg log name carries
+            // it (`state.Request.MediaSourceId`), empty when none was sent.
+            media_source_id: request.media_source_id.clone(),
             // Only the video HLS actions bind `alwaysBurnInSubtitleWhenTranscoding`
             // upstream; the audio HLS actions pin it false and the progressive
             // stream actions never read it.
@@ -1025,7 +1028,6 @@ impl StreamStatePlanner for FerrofinStreamStatePlanner {
             output_audio_bitrate: None,
             output_audio_channels: None,
             output_container: Some(state_output_container),
-            output_video_sync: None,
             output_file_path: String::new(),
             input_container: media_source.container.clone(),
             is_input_video,
@@ -1897,11 +1899,17 @@ impl FerrofinStreamStatePlanner {
             // 20 s, TS segments (PTS carry the TS muxer's 1.4 s start offset):
             // first video / audio PTS 16.40 / 16.39 s with the flag, 16.40 /
             // 19.38 s without (the audio a whole 3 s after the video).
+            //
+            // An audio-only job has no video to align with (its video
+            // "encoder" is `copy` only because there is no video stream), so
+            // its re-encoded audio keeps the accurate seek: untrimmed, it
+            // starts where the demuxer landed, up to an Ogg page or a
+            // Matroska cluster before the target (gl-1778).
             let wtv = state
                 .input_container
                 .as_deref()
                 .is_some_and(|c| c.eq_ignore_ascii_case("wtv"));
-            if copying_video && !progressive && !wtv {
+            if copying_video && state.video_stream.is_some() && !progressive && !wtv {
                 args.push("-noaccurate_seek".to_owned());
             }
         }
@@ -1946,7 +1954,8 @@ impl FerrofinStreamStatePlanner {
             }
         }
         // `GetInputModifier`: timestamp sync, then pacing, then the options
-        // the source drives (RTSP transport, `-fflags`, stream looping).
+        // the source drives (RTSP transport, `-fflags`, the input format,
+        // stream looping).
         args.extend(
             ferrofin_mediaencoding::transcoding::segment_cleaner::input_sync_arguments(
                 state,
@@ -1961,7 +1970,9 @@ impl FerrofinStreamStatePlanner {
             ),
         );
         args.extend(
-            ferrofin_mediaencoding::transcoding::segment_cleaner::input_source_arguments(state),
+            ferrofin_mediaencoding::transcoding::segment_cleaner::input_source_arguments(
+                state, options,
+            ),
         );
         if let Some(concat) = self.concat_input(&state.media_source) {
             // `GetInputArgument`'s disc-rip branch: the primary playlist's
@@ -1998,6 +2009,13 @@ impl FerrofinStreamStatePlanner {
                 &self.input_analysis,
             ),
         );
+        // `GetInputArgument`'s last rule: behind a hardware decoder, no software
+        // scaler auto-inserted when the source's resolution changes. A job the
+        // scope gate keeps in software decodes in software, whatever decoder
+        // the accelerator would pick.
+        if hw_ported && !video_decoder.is_empty() {
+            args.push("-noautoscale".to_owned());
+        }
 
         // ---- hardware video filters ------------------------------------------
         // The ported vendor chain owns the whole graph on the hardware path —
@@ -2177,7 +2195,7 @@ impl FerrofinStreamStatePlanner {
                 &hw::quality::hardware_quality_preamble(&decode_ctx, options, &video_encoder),
             );
             // The probed capabilities, not the helper's boot ones: only the
-            // probe knows whether the VAAPI driver is iHD.
+            // probe knows whether the VAAPI driver is iHD or i965.
             push_split(
                 &mut args,
                 &self.encoding_helper.video_quality_param_with(
@@ -5567,6 +5585,8 @@ mod tests {
             .into_iter()
             .chain(timing.iter().copied())
             .chain(["-i", "file:/media/movie.en.sup"])
+            // `GetInputArgument` ends behind the hardware decoder's inputs.
+            .chain(hardware.then_some("-noautoscale"))
             .collect();
         assert_eq!(inputs_after_the_media(args), expected, "{args:?}");
         let joined = args.join(" ");
@@ -7214,6 +7234,31 @@ mod tests {
         );
     }
 
+    /// gl-835: the job keeps the `MediaSourceId` the request sent, which the
+    /// ffmpeg log's name carries, and none when the request named none, even
+    /// though the job reads the item's first source then.
+    #[tokio::test]
+    async fn the_job_keeps_the_media_source_id_the_request_sent() {
+        let p = planner(vec![source(
+            "abc",
+            vec![video_stream("h264"), audio_stream("aac")],
+        )]);
+        // "ABC" names the source "abc" too: the job keeps the spelling sent.
+        for sent in [Some("ABC"), None] {
+            let req = HlsStreamRequest {
+                media_source_id: sent.map(str::to_owned),
+                video_codec: Some("h264".to_owned()),
+                ..request("abc")
+            };
+            let plan = p
+                .plan(&req, false, Some(0), PlaylistKind::Vod)
+                .await
+                .unwrap();
+            assert_eq!(plan.state.media_source.id.as_deref(), Some("abc"));
+            assert_eq!(plan.state.base_request.media_source_id.as_deref(), sent);
+        }
+    }
+
     #[tokio::test]
     async fn a_seek_starts_at_the_segments_playlist_time_not_its_index() {
         // A remux playlist is cut on keyframes, so segment 2 can start at
@@ -7590,6 +7635,38 @@ mod tests {
         assert!(
             !plan.arguments.iter().any(|a| a == "-noaccurate_seek"),
             "wtv input keeps accurate seek: {:?}",
+            plan.arguments
+        );
+    }
+
+    #[tokio::test]
+    async fn plan_seeked_audio_only_job_keeps_accurate_seek() {
+        // An audio request has no video stream, so its video "encoder" is
+        // `copy`, yet there is no keyframe to align with: the re-encoded audio
+        // must be trimmed to the target, or it starts where the demuxer
+        // landed, up to an Ogg page or a Matroska cluster early (gl-1778).
+        let p = planner(vec![source("abc", vec![audio_stream("opus")])]);
+        let mut req = request("abc");
+        req.segment_container = Some("mp4".to_owned());
+        req.audio_codec = Some("aac".to_owned());
+        let plan = p
+            .plan(&at_segment(req, 2), true, Some(2), PlaylistKind::Vod)
+            .await
+            .unwrap();
+        assert!(
+            plan.arguments.windows(2).any(|w| w == ["-c:a", "aac"]),
+            "{:?}",
+            plan.arguments
+        );
+        // It seeks to the segment start, with no remux half second.
+        assert!(
+            plan.arguments.windows(2).any(|w| w == ["-ss", "60000000"]),
+            "{:?}",
+            plan.arguments
+        );
+        assert!(
+            !plan.arguments.iter().any(|a| a == "-noaccurate_seek"),
+            "audio-only seek keeps accurate seek: {:?}",
             plan.arguments
         );
     }
@@ -8029,6 +8106,154 @@ mod tests {
         assert!(!args.contains("-g:v:0"), "{args}");
     }
 
+    /// Where `-noautoscale` sits in `arguments`: once, after the last input
+    /// (`GetInputArgument` ends with it) and ahead of the first map. `None`
+    /// when it is absent.
+    fn noautoscale_position(arguments: &[String]) -> Option<usize> {
+        let at = arguments.iter().position(|a| a == "-noautoscale")?;
+        assert_eq!(
+            arguments.iter().filter(|a| *a == "-noautoscale").count(),
+            1,
+            "{arguments:?}"
+        );
+        let last_input = arguments.iter().rposition(|a| a == "-i").unwrap();
+        let first_map = arguments.iter().position(|a| a == "-map").unwrap();
+        // Past the last input's path, not only its `-i`.
+        assert!(last_input + 1 < at && at < first_map, "{arguments:?}");
+        Some(at)
+    }
+
+    /// `GetInputArgument`'s last rule: a job behind a hardware decoder passes
+    /// `-noautoscale`, for NVENC, VAAPI and QSV alike (and a hardware decode
+    /// feeding a software encoder, `nvenc_falls_back_when_ffmpeg_lacks_the_encoder`).
+    #[tokio::test]
+    async fn a_hardware_decoder_disables_the_auto_inserted_scaler() {
+        let mut req = request("abc");
+        req.video_codec = Some("h264".to_owned());
+        req.allow_video_stream_copy = false;
+        let sources = || {
+            vec![source(
+                "abc",
+                vec![nvdec_decodable_video_stream(), audio_stream("aac")],
+            )]
+        };
+
+        let nvenc = nvenc_planner(sources())
+            .plan(&req, false, None, PlaylistKind::Vod)
+            .await
+            .unwrap();
+        assert!(nvenc.arguments.join(" ").contains("-hwaccel cuda"));
+        assert!(noautoscale_position(&nvenc.arguments).is_some());
+
+        let dir = tempfile::tempdir().unwrap();
+        stub_vaapi_ffmpeg(dir.path(), "Intel iHD driver");
+        let vaapi = planner_over_caps(
+            Arc::new(FakeMediaSources {
+                sources: sources(),
+                live_streams: HashMap::new(),
+            }),
+            vaapi_caps(),
+            vaapi_options(),
+        )
+        .plan(&req, false, None, PlaylistKind::Vod)
+        .await
+        .unwrap();
+        assert!(vaapi.arguments.join(" ").contains("-hwaccel vaapi"));
+        assert!(noautoscale_position(&vaapi.arguments).is_some());
+
+        let qsv = qsv_plan(
+            ferrofin_mediaencoding::encoding_helper::hw::Platform::Linux,
+            false,
+        )
+        .await;
+        assert!(qsv.contains("-hwaccel"), "{qsv}");
+        assert!(qsv.contains(" -noautoscale -map "), "{qsv}");
+    }
+
+    /// No hardware decoder, no `-noautoscale`: a software server, and an
+    /// NVENC server copying the video (`GetHardwareVideoDecoder` names no
+    /// decoder for a copy).
+    #[tokio::test]
+    async fn a_software_decode_keeps_the_auto_inserted_scaler() {
+        let sources = || {
+            vec![source(
+                "abc",
+                vec![nvdec_decodable_video_stream(), audio_stream("aac")],
+            )]
+        };
+        let mut transcode = request("abc");
+        transcode.video_codec = Some("h264".to_owned());
+        transcode.allow_video_stream_copy = false;
+        let software = planner(sources())
+            .plan(&transcode, false, None, PlaylistKind::Vod)
+            .await
+            .unwrap();
+        assert!(software.arguments.join(" ").contains("-c:v libx264"));
+        assert_eq!(noautoscale_position(&software.arguments), None);
+
+        let mut copy = request("abc");
+        copy.video_codec = Some("h264".to_owned());
+        let remux = nvenc_planner(sources())
+            .plan(&copy, false, None, PlaylistKind::Vod)
+            .await
+            .unwrap();
+        assert!(remux.is_remuxing_video);
+        assert_eq!(noautoscale_position(&remux.arguments), None);
+    }
+
+    /// `GetInputModifier` names the media file's demuxer once any accelerator
+    /// is configured, whether the job decodes, encodes or copies on the card,
+    /// right ahead of its `-i`; a software server leaves it to the probe.
+    #[tokio::test]
+    async fn a_hardware_server_names_the_input_format() {
+        let sources = || {
+            vec![source(
+                "abc",
+                vec![nvdec_decodable_video_stream(), audio_stream("aac")],
+            )]
+        };
+        let ahead_of_the_input = |arguments: &[String]| {
+            let input = arguments.iter().position(|a| a == "-i").unwrap();
+            arguments[..input + 2].join(" ")
+        };
+        let mut transcode = request("abc");
+        transcode.video_codec = Some("h264".to_owned());
+        transcode.allow_video_stream_copy = false;
+        let hardware = nvenc_planner(sources())
+            .plan(&transcode, false, None, PlaylistKind::Vod)
+            .await
+            .unwrap();
+        assert!(
+            ahead_of_the_input(&hardware.arguments)
+                .ends_with(" -f matroska -i file:/media/movie.mkv"),
+            "{:?}",
+            hardware.arguments
+        );
+
+        let mut copy = request("abc");
+        copy.video_codec = Some("h264".to_owned());
+        let remux = nvenc_planner(sources())
+            .plan(&copy, false, None, PlaylistKind::Vod)
+            .await
+            .unwrap();
+        assert!(
+            ahead_of_the_input(&remux.arguments)
+                .ends_with(" -fflags +genpts -f matroska -i file:/media/movie.mkv"),
+            "{:?}",
+            remux.arguments
+        );
+
+        let software = planner(sources())
+            .plan(&transcode, false, None, PlaylistKind::Vod)
+            .await
+            .unwrap();
+        assert!(
+            !ahead_of_the_input(&software.arguments).contains("-f "),
+            "{:?}",
+            software.arguments
+        );
+    }
+
     /// This machine's actual ffmpeg n9.0.1: the CUDA filters are present but
     /// `tonemap_cuda` and `alphasrc` are not — they are jellyfin-ffmpeg
     /// additions. `IsCudaFullSupported` therefore fails and upstream degrades
@@ -8230,6 +8455,12 @@ mod tests {
                 !without_temp_dir(&args).contains("-hwaccel"),
                 "{accel:?}: {args}"
             );
+            // Decoded in software, so ffmpeg may still scale a changed size.
+            assert_eq!(
+                noautoscale_position(&plan.arguments),
+                None,
+                "{accel:?}: {args}"
+            );
         }
     }
 
@@ -8365,6 +8596,45 @@ mod tests {
 
         assert!(args.contains("-c:v h264_vaapi"), "{args}");
         assert!(args.contains(" -compression_level 3"), "{args}");
+    }
+
+    /// `GetVideoBitrateParam`'s VAAPI arm keys on `IsVaapiDeviceInteli965`,
+    /// which only the per-job probe learns: VBR, but CBR on an i965 device.
+    #[tokio::test]
+    async fn a_probed_vaapi_driver_picks_the_rate_control_mode() {
+        for (driver, rc_mode) in [
+            ("Intel iHD driver", "VBR"),
+            ("Intel i965 driver", "CBR"),
+            ("Mesa Gallium driver 24.0.0 for AMD Radeon", "VBR"),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            stub_vaapi_ffmpeg(dir.path(), driver);
+            let p = planner_over_caps(
+                Arc::new(FakeMediaSources {
+                    sources: vec![source(
+                        "abc",
+                        vec![nvdec_decodable_video_stream(), audio_stream("aac")],
+                    )],
+                    live_streams: HashMap::new(),
+                }),
+                vaapi_caps(),
+                vaapi_options(),
+            );
+            let mut req = request("abc");
+            req.video_codec = Some("h264".to_owned());
+            req.allow_video_stream_copy = false;
+            req.video_bitrate = Some(3_000_000);
+            let plan = p.plan(&req, false, None, PlaylistKind::Vod).await.unwrap();
+            let args = plan.arguments.join(" ");
+
+            assert!(args.contains("-c:v h264_vaapi"), "{driver}: {args}");
+            assert!(
+                args.contains(&format!(
+                    " -rc_mode {rc_mode} -b:v 3000000 -maxrate 3000000 -bufsize 6000000"
+                )),
+                "{driver}: {args}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -9596,6 +9866,8 @@ mod tests {
         // filter ... and auto_scale_0".
         assert!(args.contains("-hwaccel cuda"), "{args}");
         assert!(args.contains("hwdownload,format=yuv420p"), "{args}");
+        // `GetInputArgument` reads the decoder alone, not the encoder.
+        assert!(noautoscale_position(&plan.arguments).is_some(), "{args}");
     }
 
     /// The parity fixture (320x240 8-bit h264 @ ~6 Mbps container bitrate, mono

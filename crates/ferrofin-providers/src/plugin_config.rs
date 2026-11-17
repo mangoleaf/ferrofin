@@ -124,9 +124,9 @@ pub struct TmdbConfig {
     /// Include adult titles in searches (`SearchMovieAsync(includeAdult:)`).
     pub include_adult: bool,
     /// Drop `keywords` from the series append-to-response
-    /// (`TmdbClientManager.cs:142`), so TMDb keywords stop becoming tags.
+    /// (`TmdbClientManager.cs:152-155`), so TMDb keywords stop becoming tags.
     pub exclude_tags_series: bool,
-    /// Drop `keywords` from the movie append-to-response (`:68`).
+    /// Drop `keywords` from the movie append-to-response (`:78-81`).
     pub exclude_tags_movies: bool,
     /// Overwrite a season's name with TMDb's (`TmdbSeasonProvider.cs:73-76`).
     pub import_season_name: bool,

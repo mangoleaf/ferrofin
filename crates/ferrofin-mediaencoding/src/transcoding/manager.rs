@@ -744,20 +744,7 @@ impl<S: SessionReporter, C: FileCleaner> TranscodeManagerImpl<S, C> {
                     .as_ref()
                     .is_some_and(|running| running.playlist_path == file)
         })?;
-        let running = job.running.as_ref()?;
-        let observer = DownloadObserver {
-            manager: std::sync::Arc::downgrade(self),
-            handle: job.handle.clone(),
-            child: std::sync::Arc::clone(&running.child),
-            progress: std::sync::Arc::clone(&running.progress),
-            ending_ticks: None,
-            segment_index: None,
-            served_segments: std::sync::Arc::clone(&running.served_segments),
-            completed: std::sync::atomic::AtomicBool::new(false),
-        };
-        job.active_request_count += 1;
-        job.last_activity = Instant::now();
-        Some(std::sync::Arc::new(observer))
+        self.observe(job, None, None)
     }
 
     /// Binds a dynamic segment response to its current producing job atomically.
@@ -784,14 +771,30 @@ impl<S: SessionReporter, C: FileCleaner> TranscodeManagerImpl<S, C> {
             job.handle.job_type == TranscodingJobType::Hls
                 && job.handle.path.eq_ignore_ascii_case(playlist)
         })?;
+        self.observe(job, Some(ending_ticks), Some(segment_index))
+    }
+
+    /// Marks a consumer active on `job` until the returned observer drops,
+    /// recording the served segment's end when it carries one. `None` for a
+    /// registry-only job, which has no process to observe.
+    fn observe(
+        self: &std::sync::Arc<Self>,
+        job: &mut RegisteredJob,
+        ending_ticks: Option<i64>,
+        segment_index: Option<i64>,
+    ) -> Option<std::sync::Arc<dyn ferrofin_traits::media_encoding::TranscodeStreamProgress>>
+    where
+        S: 'static,
+        C: 'static,
+    {
         let running = job.running.as_ref()?;
         let observer = DownloadObserver {
             manager: std::sync::Arc::downgrade(self),
             handle: job.handle.clone(),
             child: std::sync::Arc::clone(&running.child),
             progress: std::sync::Arc::clone(&running.progress),
-            ending_ticks: Some(ending_ticks),
-            segment_index: Some(segment_index),
+            ending_ticks,
+            segment_index,
             served_segments: std::sync::Arc::clone(&running.served_segments),
             completed: std::sync::atomic::AtomicBool::new(false),
         };
@@ -1334,7 +1337,7 @@ impl<S: SessionReporter, C: FileCleaner> TranscodeManagerImpl<S, C> {
             // propagates and is logged once at the request boundary.
             tracing::warn!(
                 exit_code = code.unwrap_or(-1),
-                log = %stderr_log.display(),
+                log = ?stderr_log,
                 "ffmpeg exited non-zero during transcode startup"
             );
             return Err(format!(
@@ -1404,7 +1407,7 @@ impl<S: SessionReporter, C: FileCleaner> TranscodeManagerImpl<S, C> {
                 tracing::warn!(
                     segment = index,
                     exit_code = code.unwrap_or(-1),
-                    log = %log.display(),
+                    log = ?log,
                     "transcode exited before producing segment{}",
                     stderr_log_tail(&log)
                 );
@@ -1716,41 +1719,44 @@ impl<S: SessionReporter, C: FileCleaner> TranscodeManagerImpl<S, C> {
 
     /// Marks a consumer active on the job that *owns* `file_path` — the job
     /// whose playlist stem prefixes the file's (`{stem}.m3u8` itself, or one of
-    /// its `{stem}{n}{ext}` segments).
+    /// its `{stem}{n}{ext}` segments) — until the returned observer drops.
     ///
-    /// Port of `HlsSegmentController.GetFileResult`, which resolves the owning
-    /// playlist for a served transcode-cache file and calls
-    /// `OnTranscodeBeginRequest` on it. Upstream finds it by scanning the
-    /// transcode directory; the registry already knows every live job's
-    /// playlist path, so this is the same answer without the directory read.
+    /// Port of `HlsSegmentController.GetFileResult`: `OnTranscodeBeginRequest`
+    /// on the playlist, and `OnTranscodeEndRequest` once the response
+    /// completes. The served body holds the observer, so a long download keeps
+    /// its job active, and a body dropped by a client that hangs up releases
+    /// it. Upstream finds a job only when `file_path` is its playlist; a
+    /// segment of it finds the job here too.
     ///
     /// # Panics
     ///
     /// Panics if the internal job-registry mutex has been poisoned.
     #[must_use]
-    pub fn begin_request_guard_for_file(
-        &self,
+    pub fn request_progress_for_file(
+        self: &std::sync::Arc<Self>,
         file_path: &Path,
         job_type: TranscodingJobType,
-    ) -> Option<TranscodeRequestGuard<'_, S, C>> {
+    ) -> Option<std::sync::Arc<dyn ferrofin_traits::media_encoding::TranscodeStreamProgress>>
+    where
+        S: 'static,
+        C: 'static,
+    {
         // A case-insensitive prefix test on the raw bytes: it runs once per
         // live job on every legacy segment request, so the test allocates
         // nothing.
         let stem = file_path.file_stem()?.as_encoded_bytes();
-        let owner = {
-            let jobs = self.jobs.lock().expect("jobs lock poisoned");
-            jobs.iter()
-                .filter(|j| j.handle.job_type == job_type)
-                .find(|j| {
-                    Path::new(&j.handle.path).file_stem().is_some_and(|s| {
-                        let s = s.as_encoded_bytes();
-                        stem.get(..s.len())
-                            .is_some_and(|prefix| prefix.eq_ignore_ascii_case(s))
-                    })
+        let mut jobs = self.jobs.lock().expect("jobs lock poisoned");
+        let job = jobs
+            .iter_mut()
+            .filter(|j| j.handle.job_type == job_type)
+            .find(|j| {
+                Path::new(&j.handle.path).file_stem().is_some_and(|s| {
+                    let s = s.as_encoded_bytes();
+                    stem.get(..s.len())
+                        .is_some_and(|prefix| prefix.eq_ignore_ascii_case(s))
                 })
-                .map(|j| j.handle.path.clone())
-        }?;
-        self.begin_request_guard(&owner, job_type)
+            })?;
+        self.observe(job, None, None)
     }
 
     /// Synchronous end-request: decrements the job's active-consumer count and
@@ -1880,15 +1886,15 @@ fn prepare_ffmpeg_log(log_dir: &Path, state: &EncodingJobInfo) -> Result<PathBuf
     std::fs::create_dir_all(log_dir)
         .map_err(|e| format!("create log dir {}: {e}", log_dir.display()))?;
     let path = log_dir.join(ffmpeg_log_file_name(state));
-    tracing::debug!(log = %path.display(), "ffmpeg stderr log");
+    tracing::debug!(log = ?path, "ffmpeg stderr log");
     Ok(path)
 }
 
 /// The ffmpeg stderr log file name for `state`, inside the server log directory.
 ///
 /// Port of the naming block of `TranscodeManager.StartFfMpeg`
-/// (`MediaBrowser.MediaEncoding/Transcoding/TranscodeManager.cs:450-467` at
-/// `v10.11.8`):
+/// (`MediaBrowser.MediaEncoding/Transcoding/TranscodeManager.cs:451-467` at
+/// `v12.4`):
 ///
 /// ```text
 /// var logFilePrefix = "FFmpeg.Transcode-";
@@ -1899,11 +1905,12 @@ fn prepare_ffmpeg_log(log_dir: &Path, state: &EncodingJobInfo) -> Result<PathBuf
 /// … $"{logFilePrefix}{DateTime.Now:yyyy-MM-dd_HH-mm-ss}_{state.Request.MediaSourceId}_{Guid.NewGuid().ToString()[..8]}.log"
 /// ```
 ///
-/// Two faithful substitutions, both because the value C# reads does not exist
-/// under that name here: `state.VideoRequest is not null` is
-/// [`EncodingJobInfo::is_input_video`] (the same predicate the hardware-decode
-/// port already spells that way), and `Request.MediaSourceId` is read from the
-/// resolved `MediaSource.Id`, which is the id the request pinned.
+/// `state.VideoRequest is not null` is [`EncodingJobInfo::is_input_video`]
+/// (the same predicate the hardware-decode port already spells that way).
+/// `Request.MediaSourceId` is the id the request sent, never the source it
+/// resolved to, so a request that named none leaves the middle part empty
+/// (`FFmpeg.Remux-2026-10-23_22-06-33__46340374.log`). It is not filtered, as
+/// upstream's is not: an id a file name cannot hold fails the log's creation.
 ///
 /// `DateTime.Now` is **local** time upstream, and stays local here — these names
 /// are read by a human next to `log_*.log` files stamped the same way.
@@ -1923,7 +1930,11 @@ pub fn ffmpeg_log_file_name(state: &EncodingJobInfo) -> String {
         "FFmpeg.Transcode-"
     };
     let stamp = chrono::Local::now().format("%Y-%m-%d_%H-%M-%S");
-    let media_source_id = state.media_source.id.clone().unwrap_or_default();
+    let media_source_id = state
+        .base_request
+        .media_source_id
+        .as_deref()
+        .unwrap_or_default();
     // `Guid.NewGuid().ToString()[..8]` — the first 8 chars of the dashed form,
     // i.e. 8 hex digits, purely to keep two same-second jobs apart.
     let unique: String = uuid::Uuid::new_v4().simple().to_string()[..8].to_owned();
@@ -2099,54 +2110,6 @@ impl<S: SessionReporter, C: FileCleaner> TranscodeManager for TranscodeManagerIm
             // `KillTranscodingJobs` passes `closeLiveStream: false`; the session
             // layer releases the stream on the stop report instead.
             self.kill_and_remove(job, delete_files, false).await;
-        }
-        Ok(())
-    }
-
-    async fn report_transcoding_progress(
-        &self,
-        job: &TranscodingJobHandle,
-        progress: TranscodingProgress,
-    ) -> Result<(), ServiceError> {
-        if let Some(shared) =
-            self.with_running(job, |running| std::sync::Arc::clone(&running.progress))
-        {
-            shared.lock().expect("progress lock poisoned").encoded = progress;
-        }
-        self.reporter.report_progress(job, progress).await;
-        Ok(())
-    }
-
-    async fn on_transcode_begin_request(
-        &self,
-        path: &str,
-        job_type: TranscodingJobType,
-    ) -> Result<Option<TranscodingJobHandle>, ServiceError> {
-        let mut jobs = self.jobs.lock().expect("jobs lock poisoned");
-        let job = jobs
-            .iter_mut()
-            .find(|j| j.handle.job_type == job_type && j.handle.path.eq_ignore_ascii_case(path));
-        Ok(job.map(|j| {
-            // A new consumer arrived: bump the active-request count so the idle
-            // reaper does not fire (OnTranscodeBeginRequest).
-            j.active_request_count += 1;
-            j.last_activity = std::time::Instant::now();
-            j.handle.clone()
-        }))
-    }
-
-    async fn on_transcode_end_request(
-        &self,
-        job: &TranscodingJobHandle,
-    ) -> Result<(), ServiceError> {
-        let mut jobs = self.jobs.lock().expect("jobs lock poisoned");
-        if let Some(registered) = jobs.iter_mut().find(|j| {
-            j.handle.job_type == job.job_type && j.handle.path.eq_ignore_ascii_case(&job.path)
-        }) {
-            // Mirror OnTranscodeEndRequest decrementing ActiveRequestCount; the
-            // idle countdown starts from this moment.
-            registered.active_request_count = (registered.active_request_count - 1).max(0);
-            registered.last_activity = std::time::Instant::now();
         }
         Ok(())
     }
@@ -2383,33 +2346,6 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn begin_and_end_request_track_active_count() {
-        let m = manager();
-        m.register_job(handle("s1", "/t/a.m3u8", TranscodingJobType::Hls, "dev1"));
-        let begun = m
-            .on_transcode_begin_request("/t/a.m3u8", TranscodingJobType::Hls)
-            .await
-            .unwrap();
-        assert!(begun.is_some());
-        let job = begun.unwrap();
-        m.on_transcode_end_request(&job).await.unwrap();
-        // Job is still registered (end just decrements the request count).
-        assert_eq!(m.active_job_count(), 1);
-    }
-
-    #[tokio::test]
-    async fn report_progress_is_ok() {
-        let m = manager();
-        let h = handle("s1", "/t/a.m3u8", TranscodingJobType::Hls, "dev1");
-        m.register_job(h.clone());
-        assert!(
-            m.report_transcoding_progress(&h, TranscodingProgress::default())
-                .await
-                .is_ok()
-        );
-    }
-
     /// A reporter whose first `panics` teardowns panic, as a fault part-way
     /// through a sweep would, and which records the paths of the rest.
     #[derive(Default)]
@@ -2622,7 +2558,6 @@ mod start_ffmpeg_tests {
             output_audio_bitrate: None,
             output_audio_channels: None,
             output_container: None,
-            output_video_sync: None,
             output_file_path: output_path.to_string_lossy().into_owned(),
             input_container: None,
             is_input_video: true,
@@ -2669,16 +2604,13 @@ mod start_ffmpeg_tests {
 
     #[test]
     fn the_ffmpeg_log_name_is_jellyfins_prefix_stamp_source_unique() {
-        // `TranscodeManager.StartFfMpeg` (v10.11.8:450-467). The whole point of
+        // `TranscodeManager.StartFfMpeg` (v12.4:451-467). The whole point of
         // the name is that it lands in the LOG directory and is recognisable
         // there: `GET /System/Logs` lists it and the dashboard downloads it.
         let tmp = tempfile::tempdir().unwrap();
         let playlist = tmp.path().join("out.m3u8");
         let mut st = state(&playlist, None);
-        st.media_source = MediaSourceInfo {
-            id: Some("abc123".to_owned()),
-            ..MediaSourceInfo::default()
-        };
+        st.base_request.media_source_id = Some("abc123".to_owned());
 
         // Video job, nothing copied -> full transcode.
         st.output_video_codec = Some("libx264".to_owned());
@@ -2724,6 +2656,27 @@ mod start_ffmpeg_tests {
 
         // Two jobs in the same second do not collide.
         assert_ne!(ffmpeg_log_file_name(&st), ffmpeg_log_file_name(&st));
+    }
+
+    /// gl-835: the middle part is the `MediaSourceId` the request sent
+    /// (`state.Request.MediaSourceId`), not the source it resolved to, so a
+    /// request that named none leaves it empty, as Jellyfin's
+    /// `FFmpeg.Remux-2026-10-23_22-06-33__46340374.log` does.
+    #[rstest::rstest]
+    #[case::sent(Some("4b8c8f"), "_4b8c8f_")]
+    #[case::not_sent(None, "__")]
+    fn the_ffmpeg_log_name_carries_the_requests_media_source_id(
+        #[case] sent: Option<&str>,
+        #[case] middle: &str,
+    ) {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut st = state(&tmp.path().join("out.m3u8"), None);
+        st.base_request.media_source_id = sent.map(str::to_owned);
+        st.media_source.id = Some("002a86e8320dd967eb3cf853deacafc4".to_owned());
+        let name = ffmpeg_log_file_name(&st);
+        let stamp_end = "FFmpeg.Transcode-".len() + "0000-00-00_00-00-00".len();
+        assert_eq!(&name[stamp_end..stamp_end + middle.len()], middle, "{name}");
+        assert!(!name.contains("002a86e8"), "{name}");
     }
 
     #[tokio::test]
@@ -3529,7 +3482,7 @@ mod start_ffmpeg_tests {
     }
 
     #[tokio::test]
-    async fn begin_request_guard_for_file_finds_the_owning_playlist() {
+    async fn request_progress_for_file_finds_the_owning_playlist() {
         let tmp = tempfile::tempdir().unwrap();
         let out_dir = tmp.path().join("s");
         let playlist = out_dir.join("a1b2c3.m3u8");
@@ -3538,23 +3491,29 @@ mod start_ffmpeg_tests {
             extra_files: vec!["a1b2c3.m3u8".to_owned()],
             ..FakeScript::default()
         });
-        let m = manager();
+        let m = std::sync::Arc::new(manager());
         let st = state(&playlist, Some(&playlist));
         m.start_ffmpeg(&fake, ffmpeg_req(&st, &playlist, vec![]))
             .await
             .unwrap();
 
         // Expire the idle window, then serve one of the job's segments through
-        // the legacy route's helper: the keep-alive must restamp activity so
-        // the reaper leaves the job alone.
+        // the legacy route's helper: while the response holds the observer the
+        // reaper leaves the job alone, and its release restamps activity, so
+        // the job outlives the next sweep too.
         {
             let mut jobs = m.jobs.lock().unwrap();
             jobs[0].ping_timeout_ms = -1;
         }
-        let guard =
-            m.begin_request_guard_for_file(&out_dir.join("a1b2c37.ts"), TranscodingJobType::Hls);
-        assert!(guard.is_some(), "segment must resolve to its playlist job");
-        drop(guard);
+        let held =
+            m.request_progress_for_file(&out_dir.join("a1b2c37.ts"), TranscodingJobType::Hls);
+        assert!(held.is_some(), "segment must resolve to its playlist job");
+        let reaped = m.reap_idle_jobs().await;
+        assert!(
+            reaped.is_empty(),
+            "reaped while a download held it: {reaped:?}"
+        );
+        drop(held);
         {
             let mut jobs = m.jobs.lock().unwrap();
             jobs[0].ping_timeout_ms = 60_000;
@@ -3565,27 +3524,27 @@ mod start_ffmpeg_tests {
 
         // The playlist file itself resolves to the same job...
         assert!(
-            m.begin_request_guard_for_file(&playlist, TranscodingJobType::Hls)
+            m.request_progress_for_file(&playlist, TranscodingJobType::Hls)
                 .is_some()
         );
         // ...so does a segment named in another case (upstream finds the
         // playlist by its id, `OrdinalIgnoreCase`)...
         assert!(
-            m.begin_request_guard_for_file(&out_dir.join("A1B2C37.ts"), TranscodingJobType::Hls)
+            m.request_progress_for_file(&out_dir.join("A1B2C37.ts"), TranscodingJobType::Hls)
                 .is_some()
         );
         // ...an unrelated stem does not, nor one shorter than the playlist's,
         // and neither does the wrong job type.
         assert!(
-            m.begin_request_guard_for_file(&out_dir.join("deadbeef0.ts"), TranscodingJobType::Hls)
+            m.request_progress_for_file(&out_dir.join("deadbeef0.ts"), TranscodingJobType::Hls)
                 .is_none()
         );
         assert!(
-            m.begin_request_guard_for_file(&out_dir.join("a1b2.ts"), TranscodingJobType::Hls)
+            m.request_progress_for_file(&out_dir.join("a1b2.ts"), TranscodingJobType::Hls)
                 .is_none()
         );
         assert!(
-            m.begin_request_guard_for_file(&playlist, TranscodingJobType::Progressive)
+            m.request_progress_for_file(&playlist, TranscodingJobType::Progressive)
                 .is_none()
         );
     }
@@ -3875,7 +3834,6 @@ pub(super) mod throttle_tests {
             output_audio_bitrate: None,
             output_audio_channels: None,
             output_container: Some("ts".to_owned()),
-            output_video_sync: None,
             output_file_path: path.to_string_lossy().into_owned(),
             input_container: None,
             is_input_video: true,
