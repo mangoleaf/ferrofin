@@ -68,6 +68,7 @@ pub(crate) fn restart_listener(
         move |saved| resolve(&bootstrap, variable_set, saved),
         "serve under the new base URL",
         lifecycle,
+        |_| {},
     )
 }
 

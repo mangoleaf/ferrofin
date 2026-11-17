@@ -88,7 +88,10 @@ pub struct HostNetworkInfo {
     pub http_port: u16,
     /// The HTTPS listen port (`HttpsPort`).
     pub https_port: u16,
-    /// Whether the server listens over HTTPS (`ListenWithHttps`).
+    /// Whether this lifetime serves HTTPS: a certificate was loaded at
+    /// startup, with `EnableHttps` on. `ListenWithHttps` also needs the saved
+    /// `EnableHttps` still on, read live from the network manager when one is
+    /// attached.
     pub listen_with_https: bool,
     /// The explicit published server URL, if configured (`PublishedServerUrl`);
     /// when set it overrides all URL computation.
@@ -317,10 +320,12 @@ impl FerrofinServerApplicationHost {
         scheme: Option<&str>,
         port: Option<u16>,
     ) -> String {
-        let scheme = scheme.unwrap_or(if self.network.listen_with_https {
-            "https"
-        } else {
-            "http"
+        let scheme = scheme.unwrap_or_else(|| {
+            if self.listen_with_https() {
+                "https"
+            } else {
+                "http"
+            }
         });
         let port = port.unwrap_or_else(|| {
             if scheme.eq_ignore_ascii_case("https") {
@@ -460,8 +465,18 @@ impl ServerApplicationHost for FerrofinServerApplicationHost {
         self.bound_https_port.load(Ordering::Relaxed)
     }
 
+    /// `ListenWithHttps` (`ApplicationHost.cs:277`): a certificate loaded this
+    /// lifetime and the saved `EnableHttps`, read on every call, so a save that
+    /// turns HTTPS off advertises `http` at once.
     fn listen_with_https(&self) -> bool {
         self.network.listen_with_https
+            && self.network_manager.as_ref().is_none_or(|manager| {
+                manager
+                    .read()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .configuration()
+                    .enable_https
+            })
     }
 
     fn name(&self) -> String {
@@ -764,6 +779,45 @@ mod tests {
             "http://127.0.0.1:18096"
         );
         assert_eq!(h.https_port(), 18920);
+    }
+
+    /// gl-1791: `ListenWithHttps` (`ApplicationHost.cs:277`) reads the saved
+    /// `EnableHttps` on every call, over the certificate loaded at startup: a
+    /// save that turns HTTPS off advertises `http` at once, and one that turns
+    /// it on with no certificate loaded stays `http`.
+    #[rstest::rstest]
+    #[case::https_served_and_on(true, true, "https://127.0.0.1:8920")]
+    #[case::https_served_then_turned_off(true, false, "http://127.0.0.1:8096")]
+    #[case::https_turned_on_without_a_certificate(false, true, "http://127.0.0.1:8096")]
+    #[tokio::test]
+    async fn listening_with_https_reads_the_saved_enable_https(
+        #[case] served: bool,
+        #[case] enable_https: bool,
+        #[case] expected: &str,
+    ) {
+        let network = test_network();
+        let h = host(HostNetworkInfo {
+            listen_with_https: served,
+            ..Default::default()
+        })
+        .await
+        .with_network(Arc::clone(&network), Some(IpAddr::V4(Ipv4Addr::LOCALHOST)));
+        assert!(
+            !h.listen_with_https(),
+            "test_network() saves EnableHttps off"
+        );
+        network.write().expect("lock").update_settings(
+            &ferrofin_networking::NetworkConfiguration {
+                enable_https,
+                enable_ipv6: true,
+                ..Default::default()
+            },
+        );
+        assert_eq!(h.listen_with_https(), served && enable_https);
+        assert_eq!(
+            h.get_api_url_for_local_access().await.expect("url"),
+            expected
+        );
     }
 
     #[tokio::test]
