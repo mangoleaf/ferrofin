@@ -2065,8 +2065,10 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
                    encoder included), \
                    and EncodingHelper::map_args with subtitle_map_args, \
                    negative_map_args_by_filters and find_index (GetMapArgs, \
-                   GetNegativeMapArgsByFilters, FindIndex). Compared with those methods at the \
-                   pinned v12.4 tag, and with DynamicHlsController.GetCommandLineArguments and \
+                   GetNegativeMapArgsByFilters, FindIndex), over planner.rs plan's subtitle \
+                   selection by SubtitleStreamIndex, for a video request alone \
+                   (AttachMediaSourceInfo). Compared with those methods at the pinned v12.4 \
+                   tag, and with DynamicHlsController.GetCommandLineArguments and \
                    EncodingHelper.GetProgressiveVideoFullCommandLine and \
                    GetProgressiveAudioFullCommandLine for where they go. The input options \
                    come in another order, which ffmpeg does not mind: each applies to the next \
@@ -2079,7 +2081,7 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
                    encoder and its arguments, gl-1765; the audio arguments, gl-1767; and the \
                    output and HLS muxer arguments, the -copyts of upstream's HLS command line \
                    among them, gl-1768",
-        date: "2026-11-14",
+        date: "2026-11-16",
         divergences: &[
             "The -f input format reads IsVideoRequest as is_input_video, the item's media \
              type, as the hardware device arguments do, so an audio-route request for a video \
@@ -2115,14 +2117,10 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
              -i file: before the URL, which ffmpeg cannot open. Jellyfin bug not ported \
              (gl-1722).",
             "An audio request maps the audio stream its job planned on (-vn, -map 0:<index> \
-             and the subtitle maps). Upstream's HLS and progressive audio command lines carry \
+             and -map -0:s). Upstream's HLS and progressive audio command lines carry \
              no -map, so ffmpeg picks its default audio stream, which in a file with several \
              can be another one than the copy, bitrate and channel decisions read. Jellyfin \
              bug not ported.",
-            "An audio request's SubtitleStreamIndex selects a subtitle, which upstream sets \
-             for a video request alone, so an audio request with an embedded subtitle and \
-             SubtitleMethod=Embed maps it into an output without a subtitle codec and ffmpeg \
-             fails to start. Fix path: gl-1780.",
             "A video request for a file without a video stream seeks to its start, not half \
              a second later: upstream's IsVideoRequest gate also offsets such a request when \
              it asks for VideoCodec=copy, though the half second exists to land on a video \

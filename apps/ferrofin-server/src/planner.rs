@@ -797,7 +797,15 @@ impl StreamStatePlanner for FerrofinStreamStatePlanner {
         let subtitle_index = request
             .subtitle_stream_index
             .or_else(|| query_param_i32(&request.query_string, "SubtitleStreamIndex"));
-        let subtitle_stream = subtitle_stream(&media_source.media_streams, subtitle_index);
+        // `AttachMediaSourceInfo` selects a subtitle in its video-request
+        // branch alone: an audio request's index selects nothing. Its method is
+        // still read, for the master playlist's subtitle group (upstream's
+        // audio master throws on `VideoRequest!` there instead).
+        let subtitle_stream = if is_audio {
+            None
+        } else {
+            subtitle_stream(&media_source.media_streams, subtitle_index)
+        };
         let requested_subtitle_method = request
             .subtitle_method
             .as_deref()
@@ -4115,6 +4123,50 @@ mod tests {
         req.audio_stream_index = Some(1);
         let plan = p.plan(&req, true, None, PlaylistKind::Vod).await.unwrap();
         assert_eq!(plan.state.audio_stream.as_ref().map(|a| a.index), Some(0));
+    }
+
+    /// `AttachMediaSourceInfo`: only a video request reads `SubtitleStreamIndex`,
+    /// so an audio job neither maps an embedded subtitle into its audio-only
+    /// output (ffmpeg refused to start) nor reads a sidecar as another input.
+    #[rstest::rstest]
+    #[case::embedded_progressive(false, PlaylistKind::Progressive, "Embed")]
+    #[case::embedded_hls(false, PlaylistKind::Vod, "Embed")]
+    #[case::external_progressive(true, PlaylistKind::Progressive, "Embed")]
+    #[case::external_hls(true, PlaylistKind::Vod, "Embed")]
+    #[case::hls_delivery(false, PlaylistKind::Vod, "Hls")]
+    #[tokio::test]
+    async fn an_audio_request_ignores_the_requested_subtitle(
+        #[case] external: bool,
+        #[case] kind: PlaylistKind,
+        #[case] method: &str,
+    ) {
+        let subtitle = if external {
+            sidecar("srt", 2, "/media/song.en.srt")
+        } else {
+            subtitle_stream("subrip", 2)
+        };
+        let p = planner(vec![source("abc", vec![audio_stream("flac"), subtitle])]);
+        let mut req = request("abc");
+        req.output_container = Some("mp3".to_owned());
+        req.audio_codec = Some("mp3".to_owned());
+        req.subtitle_stream_index = Some(2);
+        req.subtitle_method = Some(method.to_owned());
+        let plan = p.plan(&req, true, None, kind).await.unwrap();
+        // The master playlist's subtitle group still reads the requested method.
+        assert_eq!(
+            Some(plan.state.subtitle_delivery_method),
+            parse_subtitle_method(method)
+        );
+        let args = &plan.arguments;
+        assert_eq!(args.iter().filter(|a| *a == "-i").count(), 1, "{args:?}");
+        let maps: Vec<&str> = args
+            .windows(2)
+            .filter(|pair| pair[0] == "-map")
+            .map(|pair| pair[1].as_str())
+            .collect();
+        assert_eq!(maps, ["0:0", "-0:s"], "{args:?}");
+        assert!(!args.iter().any(|a| a.starts_with("-codec:s")), "{args:?}");
+        assert!(plan.state.subtitle_stream.is_none());
     }
 
     #[tokio::test]
