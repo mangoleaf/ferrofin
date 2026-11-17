@@ -224,6 +224,32 @@ async fn log_session_activity_creates_and_reuses_a_session() {
     assert_eq!(again.application_version.as_deref(), Some("1.1"));
 }
 
+/// `_activeConnections` is an `OrdinalIgnoreCase` dictionary: the same
+/// client and device in another case, outside ASCII too, are the same
+/// session, which keeps the id its first casing gave it.
+#[tokio::test]
+async fn the_session_pool_ignores_the_case_of_the_client_and_device() {
+    let db = test_db().await;
+    let mgr = manager(&db);
+    let user = seed_named_user(&db, Uuid::new_v4(), "alice").await;
+
+    let first = mgr
+        .log_session_activity("Web", "1.0", "dév-1", "Chrome", "e", Some(&user))
+        .await
+        .unwrap();
+    let again = mgr
+        .log_session_activity("WEB", "1.0", "DÉV-1", "Chrome", "e", Some(&user))
+        .await
+        .unwrap();
+    assert_eq!(first.id, again.id);
+    // The device filter ignores case the same way (`GetSessions`).
+    let listed = mgr
+        .get_sessions(Uuid::nil(), Some("dÉv-1"), None, None, true)
+        .await
+        .unwrap();
+    assert_eq!(listed.len(), 1);
+}
+
 /// The session id is Jellyfin's byte for byte: `GetSessionKey` is
 /// `appName + deviceId + userId.ToString("N")` (v12.2 `SessionManager.cs:481`)
 /// and the id its MD5 as a `Guid` "N". The expected id is the one Jellyfin

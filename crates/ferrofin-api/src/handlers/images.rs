@@ -245,7 +245,7 @@ fn client_supported_formats(
         // without ever advertising it.
         let user_agent = headers
             .get(axum::http::header::USER_AGENT)
-            .and_then(|v| v.to_str().ok())
+            .and_then(crate::auth::header_text)
             .unwrap_or_default()
             .to_ascii_lowercase();
         supports_webp = user_agent.contains("crosswalk") && user_agent.contains("android");

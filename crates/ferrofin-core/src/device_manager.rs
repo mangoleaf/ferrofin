@@ -237,7 +237,8 @@ impl FerrofinDeviceManager {
     /// Applies a resolved [`DeviceAccess`] to one device id — the per-device
     /// half of `can_access_device`, with every query hoisted out of it.
     ///
-    /// The membership test is ASCII case-insensitive (C# `CanAccessDevice`),
+    /// The membership test ignores case as C# `CanAccessDevice` does
+    /// (`StringComparison.OrdinalIgnoreCase`),
     /// and the empty-id rejection stays per device so a listing still fails
     /// the way the per-device call failed.
     fn access_allows(&self, access: &DeviceAccess, device_id: &str) -> Result<bool, ServiceError> {
@@ -251,7 +252,7 @@ impl FerrofinDeviceManager {
             DeviceAccess::Unfiltered | DeviceAccess::All => Ok(true),
             DeviceAccess::Enabled(enabled) => Ok(enabled
                 .iter()
-                .any(|v| v.eq_ignore_ascii_case(device_id))
+                .any(|v| ferrofin_util::string_extensions::equals_ordinal_ignore_case(v, device_id))
                 // Devices that don't advertise a persistent identifier are
                 // always usable (C# `!GetCapabilities(id).SupportsPersistentIdentifier`).
                 || !self.capabilities_for(device_id).supports_persistent_identifier),
@@ -750,6 +751,29 @@ mod tests {
             .iter()
             .map(|d| d.id.clone().unwrap_or_default())
             .collect()
+    }
+
+    /// `CanAccessDevice` matches an enabled id with `OrdinalIgnoreCase`, so a
+    /// case difference outside ASCII still enables the device.
+    #[tokio::test]
+    async fn an_enabled_device_matches_ignoring_case_beyond_ascii() {
+        let db = test_db().await;
+        let uid = Uuid::from_u128(11);
+        let user = seed_user(&db, uid).await;
+        let mgr = FerrofinDeviceManager::new(db.clone());
+        device_at(&mgr, uid, "dév-1", Utc::now()).await;
+        crate::user_entity_ext::set_preference(
+            &db,
+            &user.id,
+            PreferenceKind::EnabledDevices,
+            &["DÉV-1".to_owned()],
+        )
+        .await
+        .expect("enable");
+        assert_eq!(
+            ids(&mgr.get_devices_for_user(Some(uid)).await.expect("list")),
+            vec!["dév-1"]
+        );
     }
 
     /// The access check is now resolved once per listing instead of once per

@@ -110,8 +110,9 @@ pub fn walk_forwarded_headers(
 /// A value is read as UTF-8, as Kestrel reads it, so one outside visible ASCII
 /// keeps its entries in their hops instead of dropping out and shifting the
 /// rest; an entry holding such a character fails every address, scheme and
-/// host check. Kestrel answers 400 to a value that is not UTF-8 (gl-1650);
-/// here its bytes read as replacement characters, which fail them too. A
+/// host check. A value that is not UTF-8 never gets here through the server,
+/// which answers it 400 as Kestrel does (gl-1650); on a router served without
+/// that edge its bytes read as replacement characters, which fail them too. A
 /// value is split at the `,` byte, which no multi-byte character holds, so
 /// splitting before decoding reads each entry as decoding the whole value did.
 ///
