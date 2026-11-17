@@ -257,6 +257,22 @@ struct OkLibrary {
     provider_ids: RecordedProviderIds,
     /// The item's children and locked fields, for the cascade tests.
     tree: Arc<Tree>,
+    /// The item's metadata lock as the providers hand it out: `update_items`
+    /// panics unless it is held, so an edit that writes without it fails.
+    lock_probe: Option<Arc<tokio::sync::Mutex<()>>>,
+}
+
+impl OkLibrary {
+    /// Panics when a `lock_probe` is set and not held: the edit wrote the item
+    /// outside its metadata lock.
+    fn assert_metadata_locked(&self) {
+        if let Some(lock) = &self.lock_probe {
+            assert!(
+                lock.try_lock().is_err(),
+                "the edit wrote the item without its metadata lock"
+            );
+        }
+    }
 }
 
 /// What the cascade tests shape around the fixture item: its stored row, its
@@ -293,6 +309,7 @@ impl LibraryManager for OkLibrary {
         item: &BaseItemEntity,
         people: &[PeopleEntity],
     ) -> Result<(), ServiceError> {
+        self.assert_metadata_locked();
         self.tree
             .people_written
             .lock()
@@ -346,6 +363,7 @@ impl LibraryManager for OkLibrary {
         items: &[BaseItemEntity],
         _parent_id: Option<Uuid>,
     ) -> Result<(), ServiceError> {
+        self.assert_metadata_locked();
         self.updated.lock().unwrap().extend(items.iter().cloned());
         Ok(())
     }
@@ -354,6 +372,7 @@ impl LibraryManager for OkLibrary {
         item_id: Uuid,
         provider_ids: &[(String, String)],
     ) -> Result<(), ServiceError> {
+        self.assert_metadata_locked();
         self.provider_ids
             .lock()
             .unwrap()
@@ -430,6 +449,7 @@ impl LibraryManager for OkLibrary {
         item_id: Uuid,
         fields: &[i32],
     ) -> Result<(), ServiceError> {
+        self.assert_metadata_locked();
         self.tree
             .locked_written
             .lock()
@@ -569,6 +589,16 @@ struct RecordingProviders {
     queued: Arc<Mutex<Vec<Uuid>>>,
     /// The options each queued refresh ran with.
     options: RecordedOptions,
+    /// What `lock_item_metadata` locks, for every item.
+    metadata_lock: MetadataLock,
+}
+
+/// The one lock the fake providers hand out for any item, and the items it
+/// was asked for: a test holds `lock` to stand in for a running refresh.
+#[derive(Clone, Default)]
+struct MetadataLock {
+    lock: Arc<tokio::sync::Mutex<()>>,
+    asked: Arc<Mutex<Vec<Uuid>>>,
 }
 
 /// The options of the provider refreshes the handler queued.
@@ -585,6 +615,10 @@ impl ProviderManager for RecordingProviders {
         self.queued.lock().unwrap().push(item_id);
         self.options.lock().unwrap().push(options.clone());
         Ok(())
+    }
+    async fn lock_item_metadata(&self, item_id: Uuid) -> tokio::sync::OwnedMutexGuard<()> {
+        self.metadata_lock.asked.lock().unwrap().push(item_id);
+        Arc::clone(&self.metadata_lock.lock).lock_owned().await
     }
     async fn get_external_id_infos(
         &self,
@@ -749,6 +783,7 @@ fn state(item_id: Uuid, queued: Arc<Mutex<Vec<Uuid>>>) -> AppState {
             provider_ids: Arc::default(),
             updated: Arc::default(),
             tree: Arc::default(),
+            lock_probe: None,
         }),
         queued,
     )
@@ -764,7 +799,13 @@ fn state_with_library_and_config(
     library: Arc<OkLibrary>,
     config: Arc<dyn ferrofin_traits::configuration::ServerConfigurationManager>,
 ) -> AppState {
-    build_state(library, Arc::default(), RecordedOptions::default(), config)
+    build_state(
+        library,
+        Arc::default(),
+        RecordedOptions::default(),
+        config,
+        MetadataLock::default(),
+    )
 }
 
 /// [`state_with_library`] recording the options of each provider refresh
@@ -774,15 +815,23 @@ fn state_recording_options(
     queued: Arc<Mutex<Vec<Uuid>>>,
     options: RecordedOptions,
 ) -> AppState {
-    build_state(library, queued, options, Arc::new(FakeConfig))
+    build_state(
+        library,
+        queued,
+        options,
+        Arc::new(FakeConfig),
+        MetadataLock::default(),
+    )
 }
 
-/// The item-update [`AppState`] over `config`.
+/// The item-update [`AppState`] over `config`, whose providers lock
+/// `metadata_lock` for every item.
 fn build_state(
     library: Arc<OkLibrary>,
     queued: Arc<Mutex<Vec<Uuid>>>,
     options: RecordedOptions,
     config: Arc<dyn ferrofin_traits::configuration::ServerConfigurationManager>,
+    metadata_lock: MetadataLock,
 ) -> AppState {
     AppState::new(
         library,
@@ -794,7 +843,11 @@ fn build_state(
         Arc::new(FakeSystem),
         Arc::new(ferrofin_api::test_support::FakeAppHost),
         config,
-        Arc::new(RecordingProviders { queued, options }),
+        Arc::new(RecordingProviders {
+            queued,
+            options,
+            metadata_lock,
+        }),
         Arc::new(FakeMusic),
         Arc::new(FakeSimilarItems),
         Arc::new(FakeSearch),
@@ -881,6 +934,7 @@ async fn update_and_capture(item_id: Uuid, body: String) -> BaseItemEntity {
             provider_ids: Arc::default(),
             updated: updated.clone(),
             tree: Arc::default(),
+            lock_probe: None,
         }),
         Arc::new(Mutex::new(Vec::new())),
     ));
@@ -899,6 +953,78 @@ async fn update_and_capture(item_id: Uuid, body: String) -> BaseItemEntity {
     assert_eq!(response.status(), StatusCode::NO_CONTENT);
     let written = updated.lock().unwrap();
     written.first().expect("update written").clone()
+}
+
+/// An edit runs under the item's metadata lock: while a refresh of the item
+/// holds it the edit waits, and it keeps it while it writes (the library's
+/// `lock_probe`), so it lands over the refresh's save rather than under it
+/// (gl-1852).
+#[tokio::test]
+async fn an_edit_waits_for_the_items_metadata_lock() {
+    let item_id = Uuid::from_u128(0x59);
+    let updated: Arc<Mutex<Vec<BaseItemEntity>>> = Arc::default();
+    let provider_ids = RecordedProviderIds::default();
+    let tree = Arc::new(Tree::default());
+    let lock = MetadataLock::default();
+    let refresh = Arc::clone(&lock.lock).lock_owned().await;
+    let router = create_router(build_state(
+        Arc::new(OkLibrary {
+            item_id,
+            is_folder: false,
+            top_parent_id: None,
+            refreshes: Arc::default(),
+            provider_ids: provider_ids.clone(),
+            updated: updated.clone(),
+            tree: tree.clone(),
+            lock_probe: Some(Arc::clone(&lock.lock)),
+        }),
+        Arc::default(),
+        RecordedOptions::default(),
+        Arc::new(FakeConfig),
+        lock.clone(),
+    ));
+    let edit = tokio::spawn(
+        router.oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/Items/{item_id}"))
+                .header("X-Emby-Token", "valid")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    r#"{"Name":"Saga","Overview":"Edited overview","People":[],"ProviderIds":{"Tmdb":"7"},"LockedFields":["Overview"]}"#,
+                ))
+                .unwrap(),
+        ),
+    );
+    // Enough turns for an edit that ignored the lock to have written.
+    for _ in 0..10 {
+        tokio::task::yield_now().await;
+    }
+    assert!(
+        updated.lock().unwrap().is_empty(),
+        "the edit wrote while a refresh held the item"
+    );
+    drop(refresh);
+    let response = tokio::time::timeout(std::time::Duration::from_secs(5), edit)
+        .await
+        .expect("the edit finished once the lock was free")
+        .expect("join")
+        .expect("response");
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    assert_eq!(
+        *lock.asked.lock().unwrap(),
+        [item_id],
+        "the edit locked its own item"
+    );
+    let written = updated.lock().unwrap();
+    assert_eq!(
+        written.first().and_then(|row| row.overview.as_deref()),
+        Some("Edited overview")
+    );
+    // Every write of the item's own tables ran, each under the lock.
+    assert_eq!(tree.people_written.lock().unwrap().len(), 1);
+    assert_eq!(provider_ids.lock().unwrap().len(), 1);
+    assert_eq!(tree.locked_written.lock().unwrap().len(), 1);
 }
 
 /// `item.IsLocked = request.LockData ?? false`: an edit made with the
@@ -992,6 +1118,7 @@ fn tree_library(item_id: Uuid, tree: Tree) -> Arc<OkLibrary> {
         provider_ids: Arc::default(),
         updated: Arc::default(),
         tree: Arc::new(tree),
+        lock_probe: None,
     })
 }
 
@@ -1740,6 +1867,7 @@ async fn update_item_replaces_the_external_ids() {
             provider_ids: recorded.clone(),
             updated: Arc::default(),
             tree: Arc::default(),
+            lock_probe: None,
         }),
         Arc::new(Mutex::new(Vec::new())),
     ));
@@ -1789,6 +1917,7 @@ async fn update_item_without_provider_ids_leaves_them_alone() {
             provider_ids: recorded.clone(),
             updated: Arc::default(),
             tree: Arc::default(),
+            lock_probe: None,
         }),
         Arc::new(Mutex::new(Vec::new())),
     ));
@@ -1869,6 +1998,7 @@ async fn refresh_row(root: BaseItemEntity, query: &str) -> Vec<(Uuid, MetadataRe
                 root: Some(root),
                 ..Tree::default()
             }),
+            lock_probe: None,
         }),
         queued.clone(),
         options.clone(),
@@ -2122,6 +2252,7 @@ fn content_type_library(
             configured_content_type: configured,
             ..Tree::default()
         }),
+        lock_probe: None,
     })
 }
 
