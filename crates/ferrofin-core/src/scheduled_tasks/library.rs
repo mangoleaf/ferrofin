@@ -2912,6 +2912,27 @@ mod tests {
         ) -> Result<bool, ServiceError> {
             self.0.run_refresh_scan(target, options).await
         }
+        async fn queue_item_refresh(
+            &self,
+            item: &BaseItemEntity,
+            options: &MetadataRefreshOptions,
+        ) -> Result<(), ServiceError> {
+            self.0.queue_item_refresh(item, options).await
+        }
+        async fn refresh_item_metadata(
+            &self,
+            item: &BaseItemEntity,
+            options: &MetadataRefreshOptions,
+        ) -> Result<bool, ServiceError> {
+            self.0.refresh_item_metadata(item, options).await
+        }
+        async fn refresh_full_item(
+            &self,
+            item: &BaseItemEntity,
+            options: &MetadataRefreshOptions,
+        ) -> Result<bool, ServiceError> {
+            self.0.refresh_full_item(item, options).await
+        }
         async fn run_library_scan(
             &self,
             trigger: ferrofin_traits::library::ScanTrigger,

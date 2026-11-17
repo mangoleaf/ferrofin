@@ -15,6 +15,7 @@ use std::collections::HashMap;
 
 use ferrofin_model::dto::NameValuePair;
 use ferrofin_model::live_tv::{ListingsProviderInfo, TunerChannelMapping};
+use ferrofin_util::string_extensions::to_upper_ordinal;
 
 /// The suffix Schedules Direct appends to a tuner's channel id, stripped
 /// (along with the leading `I`) before the id is looked up in the guide.
@@ -81,46 +82,12 @@ pub fn m3u_channel_id(tuner_url: &str, stream_url: &str) -> String {
     )
 }
 
-/// Compares two strings the way .NET's `StringComparison.OrdinalIgnoreCase` does.
-///
-/// Every `string.Equals(…, StringComparison.OrdinalIgnoreCase)` in
-/// `ListingsManager` runs through here. .NET folds ORDINALLY, not ASCII-only: it
-/// maps each char through the invariant simple uppercase table and compares the
-/// results, so `"kanal ö"` and `"KANAL Ö"` are equal there.
-/// `str::eq_ignore_ascii_case` leaves every non-ASCII char alone, which matches
-/// on Jellyfin and misses here for any channel name, tvg-id or mapping key
-/// outside ASCII.
-#[must_use]
-pub fn eq_ordinal_ignore_case(a: &str, b: &str) -> bool {
-    a.chars()
-        .map(ordinal_upper)
-        .eq(b.chars().map(ordinal_upper))
-}
-
-/// The folded lookup key of a
-/// `Dictionary<string, ChannelInfo>(StringComparer.OrdinalIgnoreCase)`.
-///
-/// Same folding as [`eq_ordinal_ignore_case`], materialized — `EpgChannelData`'s
-/// three indices are ordinal-ignore-case dictionaries, so both the insert and the
-/// lookup key go through this.
-#[must_use]
-pub fn ordinal_ignore_case_key(value: &str) -> String {
-    value.chars().map(ordinal_upper).collect()
-}
-
-/// One char through .NET's invariant SIMPLE uppercase mapping.
-///
-/// `char.ToUpperInvariant` is a 1:1 table — it never expands one char into
-/// several, so `ß` stays `ß`. Rust's `char::to_uppercase` is the FULL mapping
-/// (`ß` → `SS`), so a multi-char expansion is discarded and the original char
-/// kept: that is what keeps this ordinal rather than linguistic.
-fn ordinal_upper(c: char) -> char {
-    let mut upper = c.to_uppercase();
-    match (upper.next(), upper.next()) {
-        (Some(one), None) => one,
-        _ => c,
-    }
-}
+// Every `StringComparison.OrdinalIgnoreCase` in `ListingsManager` and the
+// listings providers: .NET's per-character ordinal fold (`ö`/`Ö` equal, `ß`
+// not `SS`, `ı` not `I`), from the oracle-tested `ferrofin-util`.
+pub use ferrofin_util::string_extensions::{
+    equals_ordinal_ignore_case as eq_ordinal_ignore_case, ordinal_ignore_case_key,
+};
 
 /// Where `needle` occurs in `haystack`, folded ordinally, as a `[start, end)`
 /// byte range of `haystack`.
@@ -128,7 +95,8 @@ fn ordinal_upper(c: char) -> char {
 /// Backs the `Replace(…, StringComparison.OrdinalIgnoreCase)` inside
 /// `GetEpgChannelFromTunerChannel`. The range is in HAYSTACK bytes, not folded
 /// ones, because folding is per char and can change a char's byte length
-/// (`ſ` → `S`) — an offset taken in the folded string would not map back.
+/// (`ⱥ` → `Ⱥ`, three bytes to two) — an offset taken in the folded string
+/// would not map back.
 fn find_ordinal_ignore_case(haystack: &str, needle: &str) -> Option<(usize, usize)> {
     let folded_needle = ordinal_ignore_case_key(needle);
     if folded_needle.is_empty() {
@@ -138,7 +106,7 @@ fn find_ordinal_ignore_case(haystack: &str, needle: &str) -> Option<(usize, usiz
         let mut folded = String::new();
         let mut end = at;
         for (offset, c) in haystack[at..].char_indices() {
-            folded.push(ordinal_upper(c));
+            folded.push(to_upper_ordinal(c));
             end = at + offset + c.len_utf8();
             if folded.len() >= folded_needle.len() {
                 break;
@@ -367,7 +335,7 @@ mod tests {
     use super::{
         EpgChannel, EpgChannelData, TunerChannel, epg_channel_for_tuner_channel,
         is_listing_provider_enabled_for_tuner, m3u_channel_id, mapped_channel, normalize_name,
-        strip_schedules_direct, tuner_channel_mapping,
+        strip_schedules_direct, tuner_channel_mapping, without_schedules_direct_suffix,
     };
     use ferrofin_model::dto::NameValuePair;
     use ferrofin_model::live_tv::ListingsProviderInfo;
@@ -429,6 +397,49 @@ mod tests {
         assert!(!eq_ordinal_ignore_case("parity1", "parity2"));
         assert_eq!(ordinal_ignore_case_key("Ö1"), ordinal_ignore_case_key("ö1"));
         assert_ne!(ordinal_ignore_case_key("Ö1"), ordinal_ignore_case_key("O1"));
+    }
+
+    /// Where .NET's ordinal fold and Rust's `char::to_uppercase` part ways
+    /// (the oracle is `ferrofin-util`'s .NET 10 casing table): the dotless `ı`
+    /// and the long `ſ` keep their own case, `ᾳ` folds to `ᾼ`, `İ` is not `i`,
+    /// a final `ς` is `Σ`, and `ß` is never `SS`.
+    #[rstest::rstest]
+    #[case("\u{0131}", "I", false)]
+    #[case("\u{017F}", "S", false)]
+    #[case("\u{017F}", "s", false)]
+    #[case("\u{1FB3}", "\u{1FBC}", true)]
+    #[case("\u{0130}", "i", false)]
+    #[case(
+        "\u{03BF}\u{03B4}\u{03BF}\u{03C2}",
+        "\u{039F}\u{0394}\u{039F}\u{03A3}",
+        true
+    )]
+    #[case("\u{00DF}", "SS", false)]
+    fn tuner_ids_match_the_guide_with_dotnets_ordinal_fold(
+        #[case] tuner: &str,
+        #[case] guide: &str,
+        #[case] equal: bool,
+    ) {
+        let epg = EpgChannelData::new(&[epg(guide, "Guide", "1")]);
+        assert_eq!(epg.by_id(tuner).is_some(), equal, "by id");
+        assert_eq!(
+            mapped_channel(tuner, &[pair(guide, "mapped")]) == "mapped",
+            equal,
+            "by mapping"
+        );
+    }
+
+    /// The Schedules Direct suffix is removed in any case, but `ſ` is not `s`.
+    #[rstest::rstest]
+    #[case("I1.JSON.SCHEDULESDIRECT.ORG", "I1")]
+    #[case(
+        "I1.J\u{017F}ON.SCHEDULESDIRECT.ORG",
+        "I1.J\u{017F}ON.SCHEDULESDIRECT.ORG"
+    )]
+    // The byte range is the haystack's: multibyte characters around the match.
+    #[case("\u{2C65}1.Json.SchedulesDirect.org", "\u{2C65}1")]
+    fn the_schedules_direct_suffix_folds_ordinally(#[case] id: &str, #[case] expected: &str) {
+        assert_eq!(without_schedules_direct_suffix(id), expected);
     }
 
     #[test]

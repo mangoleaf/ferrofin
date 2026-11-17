@@ -24,7 +24,7 @@ use ferrofin_db::store::guid_to_db;
 use ferrofin_model::data::BaseItemKind;
 use ferrofin_traits::collections::PlaylistManager;
 use ferrofin_traits::error::ServiceError;
-use ferrofin_util::string_extensions::upper_invariant;
+use ferrofin_util::string_extensions::ordinal_ignore_case_key;
 use serde_json::{Map, Value};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
@@ -522,9 +522,8 @@ async fn reattach_orphaned_extras(
     .map_err(db_err)?;
     // The new owner is the lowest-Id video or movie whose path starts with the
     // extra's directory, literally and ignoring case: upstream loads the
-    // candidates once and matches `StartsWith(dir, OrdinalIgnoreCase)`, whose
-    // case folding is the simple invariant uppercase mapping. Paths are
-    // compared uppercased.
+    // candidates once and matches `StartsWith(dir, OrdinalIgnoreCase)`. Paths
+    // are compared folded by `ordinal_ignore_case_key`.
     if orphans.is_empty() {
         return Ok(0);
     }
@@ -538,7 +537,7 @@ async fn reattach_orphaned_extras(
     .await
     .map_err(db_err)?
     .into_iter()
-    .map(|(id, path)| (id, upper_invariant(&path)))
+    .map(|(id, path)| (id, ordinal_ignore_case_key(&path)))
     .collect();
     let mut parents: HashMap<String, Option<String>> = HashMap::new();
     let mut reassigned = 0usize;
@@ -556,7 +555,7 @@ async fn reattach_orphaned_extras(
                 parents
                     .entry(dir)
                     .or_insert_with_key(|dir| {
-                        let prefix = upper_invariant(dir);
+                        let prefix = ordinal_ignore_case_key(dir);
                         candidates
                             .iter()
                             .find(|(_, path)| path.starts_with(&prefix))
@@ -3026,7 +3025,7 @@ async fn stale_file_items(
         .iter()
         .flat_map(|folder| folder.locations.iter().cloned())
         .collect();
-    let internal_metadata = upper_invariant(internal_metadata);
+    let internal_metadata = ordinal_ignore_case_key(internal_metadata);
     let paths = paths.clone();
     tokio::task::spawn_blocking(move || {
         stale_among(
@@ -3050,9 +3049,9 @@ fn lists_an_entry<T>(mut entries: impl Iterator<Item = std::io::Result<T>>) -> b
 }
 
 /// [`stale_file_items`]' decision over `rows` (id, stored path, which
-/// `paths` expands): the library `locations`, the upper-cased internal
-/// metadata directory, and the items under a library whose definition is
-/// gone.
+/// `paths` expands): the library `locations`, the internal metadata directory
+/// folded by `ordinal_ignore_case_key`, and the items under a library whose
+/// definition is gone.
 fn stale_among(
     rows: &[(Uuid, String)],
     paths: &VirtualPathExpander,
@@ -3063,13 +3062,13 @@ fn stale_among(
     let (mut accessible, mut inaccessible) = (Vec::new(), Vec::new());
     for location in locations {
         if std::fs::read_dir(location).is_ok_and(lists_an_entry) {
-            accessible.push(upper_invariant(location));
+            accessible.push(ordinal_ignore_case_key(location));
         } else {
             tracing::warn!(
                 path = %location,
                 "library location is inaccessible or empty; skipping file existence checks for items under it"
             );
-            inaccessible.push(upper_invariant(location));
+            inaccessible.push(ordinal_ignore_case_key(location));
         }
     }
     let can_remove_unrooted = inaccessible.is_empty() && !accessible.is_empty();
@@ -3090,7 +3089,7 @@ fn stale_among(
         let item = *item;
         let path = paths.expand_cow(stored);
         let path = path.as_ref();
-        let folded = upper_invariant(path);
+        let folded = ordinal_ignore_case_key(path);
         if folded.starts_with(internal_metadata) {
             continue;
         }
@@ -3157,7 +3156,7 @@ async fn items_in_missing_libraries(
     let live: BTreeSet<String> = folders
         .iter()
         .filter_map(|folder| folder.name.as_deref())
-        .map(|name| upper_invariant(&Path::new(user_views).join(name).to_string_lossy()))
+        .map(|name| ordinal_ignore_case_key(&Path::new(user_views).join(name).to_string_lossy()))
         .collect();
     let libraries: Vec<(String, String)> = sqlx::query_as(
         r#"SELECT "Id", "Path" FROM "BaseItems" WHERE "Type" = ?1 AND "Path" IS NOT NULL"#,
@@ -3172,7 +3171,7 @@ async fn items_in_missing_libraries(
     .map_err(db_err)?;
     let missing: Vec<String> = libraries
         .into_iter()
-        .filter(|(_, path)| !live.contains(&upper_invariant(&paths.expand(path))))
+        .filter(|(_, path)| !live.contains(&ordinal_ignore_case_key(&paths.expand(path))))
         .map(|(id, _)| id)
         .collect();
     if missing.is_empty() {
@@ -6325,28 +6324,34 @@ mod tests {
         let underscored_later = Uuid::from_u128(u128::MAX - 1);
         let underscored = Uuid::from_u128(u128::MAX - 10);
         let accented = Uuid::from_u128(u128::MAX - 2);
+        let long_s = Uuid::from_u128(u128::MAX - 3);
         for (id, path) in [
             (decoy, "/m/AxB/film.mkv"),
             (underscored_later, "/m/A_B/film 2160p.mkv"),
             (underscored, "/m/A_B/film.mkv"),
             (accented, "/m/ÉTÉ/film.mkv"),
+            (long_s, "/m/ſtar/film.mkv"),
         ] {
             seed_item(&db, id, BaseItemKind::Movie).await;
             set_path(&db, id, path).await;
         }
-        let (in_underscored, also_in_underscored, in_accented, no_directory, no_path) = (
+        let (in_underscored, also_in_underscored, in_accented, in_star, no_directory, no_path) = (
+            Uuid::new_v4(),
             Uuid::new_v4(),
             Uuid::new_v4(),
             Uuid::new_v4(),
             Uuid::new_v4(),
             Uuid::new_v4(),
         );
+        let in_long_s = Uuid::new_v4();
         let gone = Uuid::new_v4();
         seed_item(&db, gone, BaseItemKind::Movie).await;
         for (id, path) in [
             (in_underscored, "/m/A_B/trailer.mkv"),
             (also_in_underscored, "/m/A_B/teaser.mkv"),
             (in_accented, "/m/été/trailer.mkv"),
+            (in_star, "/m/star/trailer.mkv"),
+            (in_long_s, "/m/ſtar/trailer.mkv"),
             (no_directory, "trailer.mkv"),
             (no_path, ""),
         ] {
@@ -6385,6 +6390,9 @@ mod tests {
             Some(guid_to_db(underscored))
         );
         assert_eq!(owner_of(&db, in_accented).await, Some(guid_to_db(accented)));
+        // `OrdinalIgnoreCase` keeps the long s: `/m/ſtar` is not `/m/star`.
+        assert_eq!(owner_of(&db, in_star).await, None);
+        assert_eq!(owner_of(&db, in_long_s).await, Some(guid_to_db(long_s)));
         assert_eq!(owner_of(&db, no_directory).await, None);
         // `string.IsNullOrEmpty(extra.Path)`: skipped, its owner untouched.
         assert_eq!(owner_of(&db, no_path).await, Some(guid_to_db(gone)));
