@@ -490,9 +490,28 @@ struct ArtworkWire {
     #[serde(rename = "type")]
     type_: Option<i64>,
     language: Option<String>,
-    score: Option<f64>,
     width: Option<i32>,
     height: Option<i32>,
+}
+
+impl ArtworkWire {
+    /// `TvdbSdkExtensions.CreateRemoteImageInfo` (jellyfin-plugin-tvdb
+    /// `5c4592f`, `:225-243`): no `CommunityRating`, TheTVDB's score is not
+    /// read, and `Convert.ToInt32` reads a missing dimension as 0. An empty or
+    /// `"null"` language is none, as the plugin's language lookup leaves it.
+    /// `None` when the artwork has no image.
+    fn into_image(self, image_type: ImageType) -> Option<TmdbImage> {
+        Some(TmdbImage {
+            image_type,
+            url: self.image?,
+            thumbnail_url: self.thumbnail,
+            width: Some(self.width.unwrap_or(0)),
+            height: Some(self.height.unwrap_or(0)),
+            language: self.language.filter(|l| !l.is_empty() && l != "null"),
+            community_rating: None,
+            vote_count: None,
+        })
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -1220,16 +1239,7 @@ impl TvdbClient {
                         "clearart" => ImageType::Art,
                         _ => return None,
                     };
-                    Some(TmdbImage {
-                        image_type,
-                        url: art.image?,
-                        thumbnail_url: art.thumbnail,
-                        width: Some(art.width.unwrap_or(0)),
-                        height: Some(art.height.unwrap_or(0)),
-                        language: art.language,
-                        community_rating: None,
-                        vote_count: None,
-                    })
+                    art.into_image(image_type)
                 })
                 .collect();
         }
@@ -1441,17 +1451,7 @@ fn map_series(tvdb_id: i64, wire: SeriesExtendedWire, country_code: &str) -> Tvd
         .into_iter()
         .filter_map(|a| {
             let image_type = artwork_image_type(a.type_)?;
-            let url = a.image?;
-            Some(TmdbImage {
-                image_type,
-                url,
-                thumbnail_url: a.thumbnail,
-                language: a.language.filter(|l| !l.is_empty() && l != "null"),
-                community_rating: a.score,
-                width: a.width,
-                height: a.height,
-                vote_count: None,
-            })
+            a.into_image(image_type)
         })
         .collect();
 
@@ -1660,7 +1660,7 @@ mod tests {
               ],
               "artworks": [
                 { "image": "/poster.jpg", "thumbnail": "/poster_t.jpg", "type": 2, "language": "eng", "score": 9.0, "width": 680, "height": 1000 },
-                { "image": "/bg.jpg", "type": 3, "language": null, "score": 5.0 },
+                { "image": "/bg.jpg", "type": 3, "language": "null", "score": 5.0 },
                 { "image": "/unknown.jpg", "type": 999 }
               ]
             }"#,
@@ -1735,6 +1735,18 @@ mod tests {
         // The artwork's thumbnail is its preview (`CreateRemoteImageInfo`).
         assert_eq!(d.images[0].thumbnail_url.as_deref(), Some("/poster_t.jpg"));
         assert_eq!(d.images[1].thumbnail_url, None);
+        // `CreateRemoteImageInfo` drops TheTVDB's score and reads a missing
+        // dimension as 0.
+        assert!(
+            d.images
+                .iter()
+                .all(|image| image.community_rating.is_none())
+        );
+        assert_eq!(
+            (d.images[0].width, d.images[0].height),
+            (Some(680), Some(1000))
+        );
+        assert_eq!((d.images[1].width, d.images[1].height), (Some(0), Some(0)));
     }
 
     /// An episode's credits as `MapEpisodeToResult` maps them

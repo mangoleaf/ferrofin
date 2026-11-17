@@ -21,7 +21,9 @@ use std::sync::Arc;
 use axum::extract::{Path, State};
 use axum::routing::get;
 use axum::{Json, Router};
-use ferrofin_db::entities::base_items::BaseItemEntity;
+use ferrofin_db::entities::base_items::{
+    BaseItemEntity, aired_episode_order, is_virtual_location, presentation_key, relation_id,
+};
 use ferrofin_db::entities::users::UserEntity;
 use ferrofin_model::data::BaseItemKind;
 use ferrofin_model::dto::{BaseItemDto, SortOrder};
@@ -73,226 +75,6 @@ pub(crate) fn build_dto_options(
     options
 }
 
-/// The presentation unique key of a series or season row: its explicit
-/// `PresentationUniqueKey` when set, else its id (mirrors
-/// `Series.GetPresentationUniqueKey()` / `GetUniqueSeriesKey`).
-fn presentation_key(item: &BaseItemEntity) -> &str {
-    item.presentation_unique_key
-        .as_deref()
-        .filter(|key| !key.is_empty())
-        .unwrap_or(&item.id)
-}
-
-/// [`presentation_key`], owned, for a query to filter by.
-fn series_presentation_key(series: &BaseItemEntity) -> String {
-    presentation_key(series).to_owned()
-}
-
-fn nonempty_relation_id(value: Option<&str>) -> Option<Uuid> {
-    value
-        .and_then(|value| Uuid::parse_str(value).ok())
-        .filter(|id| !id.is_nil())
-}
-
-fn virtual_location(item: &BaseItemEntity) -> bool {
-    // LocationType is derived from Path and SourceType, not IsVirtualItem.
-    // Channel items without a path are remote; LiveTV overrides the base key.
-    let kind = item.type_.rsplit('.').next().unwrap_or(&item.type_);
-    let channel = kind == "Channel"
-        || (!matches!(
-            kind,
-            "LiveTvChannel" | "TvChannel" | "LiveTvProgram" | "TvProgram"
-        ) && nonempty_relation_id(item.channel_id.as_deref()).is_some());
-    item.path.as_deref().is_none_or(str::is_empty) && !channel
-}
-
-fn episode_air_order(item: &BaseItemEntity) -> ferrofin_model::entities_media::AiredEpisodeOrder {
-    let position = item
-        .data
-        .as_deref()
-        .and_then(|data| serde_json::from_str::<AiredPosition>(data).ok())
-        .unwrap_or_default();
-    ferrofin_model::entities_media::AiredEpisodeOrder {
-        season: item.parent_index_number,
-        episode: item.index_number,
-        premiere: item.premiere_date,
-        airs_before_season: position.before_season,
-        airs_after_season: position.after_season,
-        airs_before_episode: position.before_episode,
-    }
-}
-
-/// The aired-position members of an episode's `Data` blob, read without
-/// building the blob's `serde_json::Value` tree (gl-1003).
-///
-/// Each is what parsing the blob as a `Value` and reading the member with
-/// `as_i64` gives: the member's last occurrence, when it is an integer in
-/// `i64` range (a string, a float, a larger number or `null` is `None`), and
-/// `None` for all three when the blob is not a JSON object. Every other member
-/// is parsed as a value too rather than skipped, so a blob the `Value` parse
-/// rejects (a number out of range, nesting past the depth limit) is rejected
-/// here as well, and gives `None` for all three. A derived `Deserialize`
-/// would skip the other members with `IgnoredAny`, which `serde_json` skips
-/// without those checks, and would reject a repeated member where `Value`
-/// keeps the last. The one blob read differently names an object's first
-/// member `$serde_json::private::RawValue`, a token `serde_json` reserves for
-/// its own raw values, which no stored item carries.
-#[derive(Default)]
-struct AiredPosition {
-    before_season: Option<i64>,
-    after_season: Option<i64>,
-    before_episode: Option<i64>,
-}
-
-/// A member name of an episode's `Data` blob, as [`AiredPosition`] reads it.
-enum AiredMember {
-    BeforeSeason,
-    AfterSeason,
-    BeforeEpisode,
-    Other,
-}
-
-/// A member value as `serde_json::Value::as_i64` reads it.
-struct AiredNumber(Option<i64>);
-
-/// A member value parsed as a `serde_json::Value` would be, then dropped.
-struct AnyValue;
-
-impl<'de> serde::Deserialize<'de> for AiredPosition {
-    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        struct Members;
-        impl<'de> serde::de::Visitor<'de> for Members {
-            type Value = AiredPosition;
-            fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
-                formatter.write_str("an episode's Data object")
-            }
-            fn visit_map<A: serde::de::MapAccess<'de>>(
-                self,
-                mut map: A,
-            ) -> Result<AiredPosition, A::Error> {
-                let mut position = AiredPosition::default();
-                while let Some(member) = map.next_key()? {
-                    let slot = match member {
-                        AiredMember::BeforeSeason => &mut position.before_season,
-                        AiredMember::AfterSeason => &mut position.after_season,
-                        AiredMember::BeforeEpisode => &mut position.before_episode,
-                        AiredMember::Other => {
-                            map.next_value::<AnyValue>()?;
-                            continue;
-                        }
-                    };
-                    *slot = map.next_value::<AiredNumber>()?.0;
-                }
-                Ok(position)
-            }
-        }
-        deserializer.deserialize_map(Members)
-    }
-}
-
-impl<'de> serde::Deserialize<'de> for AiredMember {
-    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        struct Name;
-        impl serde::de::Visitor<'_> for Name {
-            type Value = AiredMember;
-            fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
-                formatter.write_str("a member name")
-            }
-            fn visit_str<E: serde::de::Error>(self, name: &str) -> Result<AiredMember, E> {
-                Ok(match name {
-                    "AirsBeforeSeasonNumber" => AiredMember::BeforeSeason,
-                    "AirsAfterSeasonNumber" => AiredMember::AfterSeason,
-                    "AirsBeforeEpisodeNumber" => AiredMember::BeforeEpisode,
-                    _ => AiredMember::Other,
-                })
-            }
-        }
-        deserializer.deserialize_str(Name)
-    }
-}
-
-impl<'de> serde::Deserialize<'de> for AiredNumber {
-    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        struct Number;
-        impl<'de> serde::de::Visitor<'de> for Number {
-            type Value = AiredNumber;
-            fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
-                formatter.write_str("a JSON value")
-            }
-            fn visit_i64<E>(self, value: i64) -> Result<AiredNumber, E> {
-                Ok(AiredNumber(Some(value)))
-            }
-            fn visit_u64<E>(self, value: u64) -> Result<AiredNumber, E> {
-                Ok(AiredNumber(i64::try_from(value).ok()))
-            }
-            fn visit_f64<E>(self, _value: f64) -> Result<AiredNumber, E> {
-                Ok(AiredNumber(None))
-            }
-            fn visit_bool<E>(self, _value: bool) -> Result<AiredNumber, E> {
-                Ok(AiredNumber(None))
-            }
-            fn visit_str<E>(self, _value: &str) -> Result<AiredNumber, E> {
-                Ok(AiredNumber(None))
-            }
-            fn visit_unit<E>(self) -> Result<AiredNumber, E> {
-                Ok(AiredNumber(None))
-            }
-            fn visit_seq<A: serde::de::SeqAccess<'de>>(
-                self,
-                seq: A,
-            ) -> Result<AiredNumber, A::Error> {
-                serde::de::Visitor::visit_seq(AnyValue, seq).map(|AnyValue| AiredNumber(None))
-            }
-            fn visit_map<A: serde::de::MapAccess<'de>>(
-                self,
-                map: A,
-            ) -> Result<AiredNumber, A::Error> {
-                serde::de::Visitor::visit_map(AnyValue, map).map(|AnyValue| AiredNumber(None))
-            }
-        }
-        deserializer.deserialize_any(Number)
-    }
-}
-
-impl<'de> serde::Deserialize<'de> for AnyValue {
-    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        deserializer.deserialize_any(AnyValue)
-    }
-}
-
-impl<'de> serde::de::Visitor<'de> for AnyValue {
-    type Value = AnyValue;
-    fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
-        formatter.write_str("any JSON value")
-    }
-    fn visit_bool<E>(self, _value: bool) -> Result<AnyValue, E> {
-        Ok(AnyValue)
-    }
-    fn visit_i64<E>(self, _value: i64) -> Result<AnyValue, E> {
-        Ok(AnyValue)
-    }
-    fn visit_u64<E>(self, _value: u64) -> Result<AnyValue, E> {
-        Ok(AnyValue)
-    }
-    fn visit_f64<E>(self, _value: f64) -> Result<AnyValue, E> {
-        Ok(AnyValue)
-    }
-    fn visit_str<E>(self, _value: &str) -> Result<AnyValue, E> {
-        Ok(AnyValue)
-    }
-    fn visit_unit<E>(self) -> Result<AnyValue, E> {
-        Ok(AnyValue)
-    }
-    fn visit_seq<A: serde::de::SeqAccess<'de>>(self, mut seq: A) -> Result<AnyValue, A::Error> {
-        while seq.next_element::<AnyValue>()?.is_some() {}
-        Ok(AnyValue)
-    }
-    fn visit_map<A: serde::de::MapAccess<'de>>(self, mut map: A) -> Result<AnyValue, A::Error> {
-        while map.next_entry::<AnyValue, AnyValue>()?.is_some() {}
-        Ok(AnyValue)
-    }
-}
-
 /// One episode of the series: its aired position, its row, and the season it
 /// resolves to, as an index into the request's seasons.
 type SeasonEpisodeRow = (
@@ -335,8 +117,8 @@ fn season_episode_rows(
             if current.is_some() && number.is_some() && current == number {
                 return true;
             }
-            if current.is_none() && number.is_none() && virtual_location(season) {
-                return item_season.is_none_or(virtual_location);
+            if current.is_none() && number.is_none() && is_virtual_location(season) {
+                return item_season.is_none_or(is_virtual_location);
             }
             same_season
         })
@@ -697,8 +479,8 @@ async fn get_episodes(
             .ok_or_else(|| ApiError::NotFound(format!("No season exists with Id {season_id}")))?;
         // Season.GetEpisodes follows its actual Series, even when the route's
         // series id names another row. An orphan season has no episodes.
-        let actual_series = nonempty_relation_id(season.series_id.as_deref())
-            .or_else(|| nonempty_relation_id(season.parent_id.as_deref()));
+        let actual_series = relation_id(season.series_id.as_deref())
+            .or_else(|| relation_id(season.parent_id.as_deref()));
         let Some(actual_series) = actual_series else {
             return Ok(Json(QueryResult::new(
                 query.start_index,
@@ -723,7 +505,7 @@ async fn get_episodes(
                 Vec::new(),
             )));
         };
-        let key = series_presentation_key(&series);
+        let key = presentation_key(&series).to_owned();
         (key, Some(season), actual_series)
     } else {
         let series = state
@@ -732,7 +514,7 @@ async fn get_episodes(
             .await?
             .filter(|item| item.type_.ends_with("Series"))
             .ok_or_else(|| ApiError::NotFound("Series not found".to_owned()))?;
-        (series_presentation_key(&series), None, series_id)
+        (presentation_key(&series).to_owned(), None, series_id)
     };
     // Fetch visible rows in source SortName order. Parse aired metadata once, then
     // apply the same in-memory comparator used by NextUp before filtering/paging.
@@ -797,8 +579,8 @@ async fn get_episodes(
         .collect();
     let mut episode_rows = Vec::with_capacity(episode_items.len());
     for row in episode_items {
-        let season_id = nonempty_relation_id(row.season_id.as_deref())
-            .or_else(|| nonempty_relation_id(row.parent_id.as_deref()));
+        let season_id =
+            relation_id(row.season_id.as_deref()).or_else(|| relation_id(row.parent_id.as_deref()));
         let episode_season = if let Some(id) = season_id {
             if let Some(season) = known_seasons.get(&id) {
                 *season
@@ -821,7 +603,7 @@ async fn get_episodes(
         // Episode.FindSeasonId also resolves episodes stored directly under
         // the series by their physical season number when SeasonId is empty.
         let episode_season = episode_season.or_else(|| {
-            (nonempty_relation_id(row.parent_id.as_deref()) == Some(actual_series_id))
+            (relation_id(row.parent_id.as_deref()) == Some(actual_series_id))
                 .then(|| {
                     seasons[..listed]
                         .iter()
@@ -829,7 +611,7 @@ async fn get_episodes(
                 })
                 .flatten()
         });
-        episode_rows.push((episode_air_order(&row), row, episode_season));
+        episode_rows.push((aired_episode_order(&row), row, episode_season));
     }
     let listed_rows = if let Some(season) = selected {
         season_episode_rows(
@@ -860,7 +642,7 @@ async fn get_episodes(
     };
     let mut episodes = take_episode_rows(episode_rows, listed_rows);
     if let Some(missing) = query.is_missing {
-        episodes.retain(|item| virtual_location(item) == missing);
+        episodes.retain(|item| is_virtual_location(item) == missing);
     }
     // `startItemId`: return the run of episodes from that item onward, so a client
     // playing "from this episode" queues the right slice. Port of C#
@@ -1010,7 +792,7 @@ async fn get_seasons(
         .await?
         .filter(|i| i.type_.ends_with("Series"))
         .ok_or_else(|| ApiError::NotFound(format!("series {series_id}")))?;
-    let series_key = series_presentation_key(&series);
+    let series_key = presentation_key(&series).to_owned();
     let options = Arc::new(build_dto_options(
         query.fields.as_deref(),
         query.enable_images,
@@ -1097,9 +879,8 @@ crate::query::query_parameters! {
 
 #[cfg(test)]
 mod episode_season_tests {
-    use super::{SeasonEpisodeRow, episode_air_order, season_episode_rows, virtual_location};
-    use ferrofin_db::entities::base_items::BaseItemEntity;
-    use rstest::rstest;
+    use super::{SeasonEpisodeRow, season_episode_rows};
+    use ferrofin_db::entities::base_items::{BaseItemEntity, aired_episode_order};
 
     fn season(number: Option<i64>, key: &str, physical: bool) -> BaseItemEntity {
         BaseItemEntity {
@@ -1127,7 +908,7 @@ mod episode_season_tests {
             path: Some("/media/episode.mkv".to_owned()),
             ..Default::default()
         };
-        (episode_air_order(&item), item, parent)
+        (aired_episode_order(&item), item, parent)
     }
     /// The names of the episodes [`season_episode_rows`] lists for `season`.
     fn listed(
@@ -1227,27 +1008,6 @@ mod episode_season_tests {
         assert!(found.is_empty(), "{found:?}");
     }
     #[test]
-    fn virtual_location_uses_path_and_actual_channel_source_instead_of_the_saved_bit() {
-        let mut row = BaseItemEntity {
-            type_: "Episode".into(),
-            path: Some("/media/episode.mkv".into()),
-            is_virtual_item: true,
-            ..Default::default()
-        };
-        assert!(!virtual_location(&row));
-        row.path = None;
-        row.is_virtual_item = false;
-        assert!(virtual_location(&row));
-        row.channel_id = Some(uuid::Uuid::new_v4().to_string());
-        assert!(!virtual_location(&row));
-        row.type_ = "LiveTvProgram".into();
-        assert!(virtual_location(&row));
-        row.type_ = "Channel".into();
-        row.channel_id = None;
-        assert!(!virtual_location(&row));
-    }
-
-    #[test]
     fn regular_episode_aired_season_numbers_are_used_and_bad_data_is_neutral() {
         let one = season(Some(1), "one", true);
         let seasons = [season(Some(2), "two", true)];
@@ -1266,122 +1026,8 @@ mod episode_season_tests {
             data: Some("broken".to_owned()),
             ..Default::default()
         };
-        assert_eq!(episode_air_order(&item).airs_before_season, None);
-        assert_eq!(episode_air_order(&item).season, Some(3));
-    }
-
-    /// The three members as the handler read them before gl-1003: the whole
-    /// blob parsed into a `serde_json::Value`, each member read with `as_i64`.
-    fn read_through_value(data: &str) -> [Option<i64>; 3] {
-        let value = serde_json::from_str::<serde_json::Value>(data).ok();
-        let number = |key| {
-            value
-                .as_ref()
-                .and_then(|value| value.get(key))
-                .and_then(serde_json::Value::as_i64)
-        };
-        [
-            number("AirsBeforeSeasonNumber"),
-            number("AirsAfterSeasonNumber"),
-            number("AirsBeforeEpisodeNumber"),
-        ]
-    }
-
-    /// The typed read gives what the `Value` read gave for every shape of
-    /// blob: members of every JSON type, out-of-range and negative numbers,
-    /// duplicated and escaped member names, blobs that are no object or no
-    /// JSON, and blobs the `Value` parse rejects in a member it never read.
-    #[rstest]
-    #[case::empty_object("{}")]
-    #[case::all_three(
-        r#"{"AirsBeforeSeasonNumber":2,"AirsAfterSeasonNumber":1,"AirsBeforeEpisodeNumber":3}"#
-    )]
-    #[case::among_others(
-        r#"{"Overview":"x","AirsBeforeSeasonNumber":1,"Tags":["a"],"Images":[{"W":1}]}"#
-    )]
-    #[case::negative(
-        r#"{"AirsAfterSeasonNumber":-1,"AirsBeforeSeasonNumber":-9223372036854775808}"#
-    )]
-    #[case::largest(r#"{"AirsBeforeSeasonNumber":9223372036854775807}"#)]
-    #[case::too_large(r#"{"AirsBeforeSeasonNumber":9223372036854775808}"#)]
-    #[case::beyond_u64(r#"{"AirsBeforeSeasonNumber":18446744073709551616}"#)]
-    #[case::below_i64(r#"{"AirsBeforeSeasonNumber":-9223372036854775809}"#)]
-    #[case::negative_zero(r#"{"AirsBeforeSeasonNumber":-0}"#)]
-    #[case::float(r#"{"AirsBeforeSeasonNumber":1.0}"#)]
-    #[case::exponent(r#"{"AirsBeforeSeasonNumber":1e2}"#)]
-    #[case::string(r#"{"AirsBeforeSeasonNumber":"1"}"#)]
-    #[case::boolean(r#"{"AirsBeforeSeasonNumber":true}"#)]
-    #[case::null(r#"{"AirsBeforeSeasonNumber":null,"AirsAfterSeasonNumber":2}"#)]
-    #[case::array(r#"{"AirsBeforeSeasonNumber":[1],"AirsAfterSeasonNumber":2}"#)]
-    #[case::object(r#"{"AirsBeforeSeasonNumber":{"Value":1},"AirsAfterSeasonNumber":2}"#)]
-    #[case::duplicate_last_wins(r#"{"AirsBeforeSeasonNumber":5,"AirsBeforeSeasonNumber":2}"#)]
-    #[case::duplicate_last_not_a_number(
-        r#"{"AirsBeforeSeasonNumber":5,"AirsBeforeSeasonNumber":"2"}"#
-    )]
-    #[case::escaped_name(r#"{"Airs\u0042eforeSeasonNumber":4}"#)]
-    #[case::other_case(r#"{"airsBeforeSeasonNumber":4}"#)]
-    #[case::escaped_strings(r#"{"Overview":"caf\u00e9 \"x\"","AirsBeforeEpisodeNumber":1}"#)]
-    #[case::whitespace(" {\n \"AirsBeforeSeasonNumber\" : 3 \t} \n")]
-    #[case::not_json("broken")]
-    #[case::blank("")]
-    #[case::trailing(r#"{"AirsBeforeSeasonNumber":1} x"#)]
-    #[case::two_values(r#"{"AirsBeforeSeasonNumber":1}{}"#)]
-    #[case::truncated(r#"{"AirsBeforeSeasonNumber":1"#)]
-    #[case::array_blob(r#"[{"AirsBeforeSeasonNumber":1}]"#)]
-    #[case::string_blob(r#""AirsBeforeSeasonNumber""#)]
-    #[case::number_blob("1")]
-    #[case::null_blob("null")]
-    #[case::other_out_of_range(r#"{"Rating":1e400,"AirsBeforeSeasonNumber":1}"#)]
-    #[case::other_bad_escape(r#"{"Overview":"\x","AirsBeforeSeasonNumber":1}"#)]
-    #[case::other_lone_surrogate(r#"{"Overview":"\ud800","AirsBeforeSeasonNumber":1}"#)]
-    #[case::other_bad_literal(r#"{"Overview":nul,"AirsBeforeSeasonNumber":1}"#)]
-    fn the_typed_read_matches_the_value_read(#[case] data: &str) {
-        let item = BaseItemEntity {
-            data: Some(data.to_owned()),
-            ..Default::default()
-        };
-        let order = episode_air_order(&item);
-        assert_eq!(
-            [
-                order.airs_before_season,
-                order.airs_after_season,
-                order.airs_before_episode,
-            ],
-            read_through_value(data),
-            "{data}"
-        );
-    }
-
-    /// Nesting past `serde_json`'s depth limit, in another member or in one
-    /// of the three, fails both, and just inside it passes both.
-    #[rstest]
-    #[case(100)]
-    #[case(127)]
-    #[case(128)]
-    #[case(200)]
-    fn nesting_fails_the_typed_read_where_it_fails_the_value_read(
-        #[case] depth: usize,
-        #[values("Nested", "AirsBeforeSeasonNumber")] member: &str,
-    ) {
-        let data = format!(
-            r#"{{"{member}":{}{},"AirsAfterSeasonNumber":1}}"#,
-            "[".repeat(depth),
-            "]".repeat(depth)
-        );
-        let item = BaseItemEntity {
-            data: Some(data.clone()),
-            ..Default::default()
-        };
-        let order = episode_air_order(&item);
-        assert_eq!(
-            [
-                order.airs_before_season,
-                order.airs_after_season,
-                order.airs_before_episode,
-            ],
-            read_through_value(&data),
-            "{member} at depth {depth}"
-        );
+        assert_eq!(aired_episode_order(&item).airs_before_season, None);
+        assert_eq!(aired_episode_order(&item).season, Some(3));
     }
 }
 

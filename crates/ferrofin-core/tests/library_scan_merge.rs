@@ -65,8 +65,7 @@ fn spawn_tmdb(overview: &'static str) -> (String, Arc<AtomicUsize>) {
             let (status, payload) = if line.contains("/search/movie") {
                 ("200 OK", SEARCH_JSON.to_owned())
             } else if line.contains("/movie/603?") {
-                // The metadata fetch appends credits and videos; the artwork
-                // lookup by id (`images_by_id_for_language`) asks for the bare record.
+                // Count only the metadata fetch, which appends credits and videos.
                 if line.contains("append_to_response") {
                     counter.fetch_add(1, Ordering::SeqCst);
                 }

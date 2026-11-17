@@ -123,7 +123,7 @@ pub(crate) async fn require_scope_id_visible(
 /// request named ids and none is left: the caller must answer an empty page,
 /// because an empty `item_ids` means no id filter and the query would list the
 /// whole library.
-pub(crate) async fn retain_visible_ids(
+async fn retain_visible_ids(
     state: &AppState,
     auth: &AuthorizationInfo,
     query: &mut InternalItemsQuery,
@@ -142,7 +142,7 @@ pub(crate) async fn retain_visible_ids(
 }
 
 /// The page [`retain_visible_ids`] calls for when no id is left.
-pub(crate) fn empty_page(query: &InternalItemsQuery) -> QueryResult<BaseItemDto> {
+fn empty_page(query: &InternalItemsQuery) -> QueryResult<BaseItemDto> {
     QueryResult::new(Some(query.start_index.unwrap_or(0)), Some(0), Vec::new())
 }
 
@@ -309,7 +309,8 @@ pub(crate) async fn resolve_user_opt(
     Ok(state.users.get_user_by_id(effective).await?.map(Arc::new))
 }
 
-/// The query parameters honoured by `GET /Items`.
+/// The query parameters honoured by `GET /Items`, and by `GET /Trailers`,
+/// which hands them to the same handler (`crate::handlers::trailers`).
 ///
 /// Every field is optional. Comma/pipe-delimited multi-value parameters arrive as
 /// a raw [`String`] and are split + parsed in [`get_items`]; this keeps the serde
@@ -317,7 +318,7 @@ pub(crate) async fn resolve_user_opt(
 /// model binders.
 #[derive(Debug, Default, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct ItemsQuery {
+pub(crate) struct ItemsQuery {
     /// The target user; defaults to the authenticated caller when absent.
     #[serde(
         default,
@@ -347,7 +348,7 @@ struct ItemsQuery {
     parent_id: Option<Uuid>,
     /// Comma-delimited [`BaseItemKind`](ferrofin_model::data::BaseItemKind) set to include.
     #[serde(default)]
-    include_item_types: Option<String>,
+    pub(crate) include_item_types: Option<String>,
     /// Comma-delimited item kinds to exclude.
     #[serde(default)]
     exclude_item_types: Option<String>,
@@ -554,7 +555,7 @@ struct ItemsQuery {
     has_theme_video: Option<bool>,
     /// Exact index number.
     #[serde(default)]
-    index_number: Option<i32>,
+    pub(crate) index_number: Option<i32>,
     /// Exact parent index number.
     #[serde(default)]
     parent_index_number: Option<i32>,
@@ -699,7 +700,7 @@ where
     responses((status = 200, description = "Items returned (QueryResult<BaseItemDto>)")),
     tag = "ferrofin"
 )]
-async fn get_items(
+pub(crate) async fn get_items(
     State(state): State<AppState>,
     RequireAuth(auth): RequireAuth,
     Query(query): Query<ItemsQuery>,
@@ -959,7 +960,7 @@ fn apply_albums_by_artist_order(internal: &mut InternalItemsQuery) {
 /// provider score until those providers are ported (gl-450). The extra `Name`
 /// term only reorders rows tied on `SortName`. Upstream falls back to `ApplyOrder` alone when no provider
 /// returns a candidate; that fallback belongs to the same port.
-pub(crate) fn order_search_by_sort_name(internal: &mut InternalItemsQuery) {
+fn order_search_by_sort_name(internal: &mut InternalItemsQuery) {
     use ferrofin_model::dto::SortOrder;
     use ferrofin_model::live_tv::ItemSortBy;
     if internal
@@ -984,7 +985,7 @@ pub(crate) fn order_search_by_sort_name(internal: &mut InternalItemsQuery) {
 /// (the repository drops it later). A search already leads its keys with
 /// `SortName` ([`order_search_by_sort_name`]), standing in for the score sort
 /// upstream applies after this one, so it keeps that order.
-pub(crate) fn sort_items_by_request(query: &InternalItemsQuery, items: &mut [BaseItemEntity]) {
+fn sort_items_by_request(query: &InternalItemsQuery, items: &mut [BaseItemEntity]) {
     if !query.order_by.is_empty() || query.item_ids.len() <= 1 {
         return;
     }
@@ -1130,7 +1131,7 @@ fn items_query_options(
 /// linked versions" — the alternate versions and owned non-extras a general
 /// query hides stay in, and the `PresentationUniqueKey` grouping folds them
 /// back onto their primary.
-pub(crate) fn apply_media_stream_filter_rules(internal: &mut InternalItemsQuery) {
+fn apply_media_stream_filter_rules(internal: &mut InternalItemsQuery) {
     if !internal.subtitle_languages.is_empty() {
         match internal.has_subtitles {
             Some(true) => internal.has_subtitles = None,
@@ -1405,30 +1406,6 @@ async fn delete_one(state: &AppState, auth: &AuthorizationInfo, id: Uuid) -> Res
     Ok(())
 }
 
-/// Runs a delete request's work to completion even if the client goes away.
-///
-/// axum drops a handler's future when the connection closes, which could
-/// stop a delete between its files and its rows, or half way through its
-/// paths. The row delete itself is one transaction, but the `LibraryChanged`
-/// notice that follows its commit would be skipped, and a
-/// `DELETE /Items?ids=` would stop between two items. Upstream's controller
-/// does not observe `RequestAborted` here, so its delete finishes; the work
-/// runs on its own task, which the request only awaits.
-async fn run_to_completion<F>(work: F) -> Result<(), ApiError>
-where
-    F: std::future::Future<Output = Result<(), ApiError>> + Send + 'static,
-{
-    // The request awaits the task, so its logs and spans stay under the
-    // request's (LOGGING.md §4: a spawned future carries its span explicitly).
-    tokio::spawn(tracing::Instrument::in_current_span(work))
-        .await
-        .map_err(|e| {
-            ApiError::Service(ferrofin_traits::error::ServiceError::Backend(format!(
-                "delete task failed: {e}"
-            )))
-        })?
-}
-
 /// `DELETE /Items/{itemId}` — deletes one item from the library and the
 /// filesystem.
 ///
@@ -1460,7 +1437,11 @@ async fn delete_item(
     if auth.user.is_none() && !auth.is_api_key {
         return Err(ApiError::NotFound(format!("user {}", auth.user_id())));
     }
-    run_to_completion(async move { delete_one(&state, &auth, item_id).await }).await?;
+    // axum drops a handler's future when its client hangs up, which could stop
+    // a delete between its files and its rows, or skip the `LibraryChanged`
+    // notice after its commit. Upstream's controller does not read
+    // `RequestAborted`, so its delete finishes.
+    crate::handlers::run_detached(async move { delete_one(&state, &auth, item_id).await }).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -1501,11 +1482,12 @@ async fn delete_items(
         return Err(ApiError::Unauthorized("Unauthorized access".to_owned()));
     }
     let ids = parse_csv_uuids(query.ids.as_deref())?;
-    run_to_completion(async move {
+    // As in `delete_item`; a hang-up would also stop between two items.
+    crate::handlers::run_detached(async move {
         for id in ids {
             delete_one(&state, &auth, id).await?;
         }
-        Ok(())
+        Ok::<_, ApiError>(())
     })
     .await?;
     Ok(StatusCode::NO_CONTENT)
@@ -2243,7 +2225,9 @@ crate::query::query_parameters! {
         "albums" => '|',
         "artists" => '|',
         "studios" => '|',
-    } => [("get", "/Items")];
+    // `/Trailers` keeps these pipe delimiters, which the OpenAPI documents for
+    // it, though `GetTrailers` binds studios, artists and albums on commas.
+    } => [("get", "/Items"), ("get", "/Trailers")];
     ItemQuery {} => [("get", "/Items/{itemId}")];
     DeleteItemsQuery {
         "ids" => ',',
@@ -2401,38 +2385,6 @@ mod tests {
         }
     }
 
-    /// The query keys [`ItemsQuery`] binds: the field list serde hands
-    /// `deserialize_struct`, captured by a deserializer that reads nothing.
-    fn items_query_keys() -> &'static [&'static str] {
-        struct Keys<'a>(&'a mut &'static [&'static str]);
-        impl<'de> serde::Deserializer<'de> for Keys<'_> {
-            type Error = serde::de::value::Error;
-            fn deserialize_any<V: serde::de::Visitor<'de>>(
-                self,
-                _: V,
-            ) -> Result<V::Value, Self::Error> {
-                Err(serde::de::Error::custom("not a struct"))
-            }
-            fn deserialize_struct<V: serde::de::Visitor<'de>>(
-                self,
-                _: &'static str,
-                fields: &'static [&'static str],
-                _: V,
-            ) -> Result<V::Value, Self::Error> {
-                *self.0 = fields;
-                Err(serde::de::Error::custom("keys captured"))
-            }
-            serde::forward_to_deserialize_any! {
-                bool i8 i16 i32 i64 i128 u8 u16 u32 u64 u128 f32 f64 char str string bytes
-                byte_buf option unit unit_struct newtype_struct seq tuple tuple_struct map
-                enum identifier ignored_any
-            }
-        }
-        let mut keys: &'static [&'static str] = &[];
-        let _ = <ItemsQuery as serde::Deserialize>::deserialize(Keys(&mut keys));
-        keys
-    }
-
     /// `GET /Items` parameters in the vendored contracts that [`ItemsQuery`]
     /// does not bind yet. Each is an open port from `ItemsController.GetItems`
     /// — bind it, honour it, and delete it here; the guard below fails on a
@@ -2469,7 +2421,7 @@ mod tests {
                     .filter_map(|p| p["name"].as_str().map(str::to_owned)),
             );
         }
-        let keys = items_query_keys();
+        let keys = crate::query::fields::<ItemsQuery>();
         assert!(keys.contains(&"albumArtistIds"), "keys captured: {keys:?}");
         let unbound: BTreeSet<&str> = contract
             .iter()
@@ -2809,27 +2761,6 @@ mod tests {
             sorted(&[c, a], &[], &[a, c, unasked, b]),
             [unasked, b, c, a]
         );
-    }
-
-    /// The delete's task runs inside the request's span, so its logs and
-    /// spans stay under `http_request` (LOGGING.md §4).
-    #[tokio::test]
-    async fn the_delete_task_runs_in_the_requests_span() {
-        use tracing::Instrument as _;
-        let _subscriber = tracing::subscriber::set_default(tracing_subscriber::registry());
-        let span = tracing::info_span!("http_request");
-        let seen = std::sync::Arc::new(std::sync::Mutex::new(None));
-        let record = std::sync::Arc::clone(&seen);
-        run_to_completion(async move {
-            *record.lock().expect("lock") = tracing::Span::current()
-                .metadata()
-                .map(tracing::Metadata::name);
-            Ok(())
-        })
-        .instrument(span)
-        .await
-        .expect("ran");
-        assert_eq!(*seen.lock().expect("lock"), Some("http_request"));
     }
 
     /// A boxsets library is found by the same binding as its DTO's type: a

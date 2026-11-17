@@ -1603,18 +1603,11 @@ impl FerrofinUserViewManager {
         let Some(virtual_folders) = &self.virtual_folders else {
             return Ok(HashMap::new());
         };
-        Ok(virtual_folders
-            .library_folders()
-            .await?
-            .iter()
-            .filter_map(|vf| {
-                let id = vf
-                    .item_id
-                    .as_deref()
-                    .and_then(|s| Uuid::parse_str(s).ok())?;
-                Some((id, vf.collection_type.and_then(kinds::collection_type_of)))
-            })
-            .collect())
+        Ok(
+            ferrofin_model::entities_media::VirtualFolderInfo::collection_types_by_id(
+                &virtual_folders.library_folders().await?,
+            ),
+        )
     }
 
     /// [`Self::root_children`] less the libraries whose options disable them

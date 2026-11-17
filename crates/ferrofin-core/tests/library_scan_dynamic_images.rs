@@ -628,6 +628,154 @@ async fn uploads_save_beside_their_path_for_the_overriding_kinds(
     );
 }
 
+/// gl-1741: "Replace all metadata" with "Replace existing images" removes an
+/// upload wherever the saver put it, and a backdrop the item lists beside
+/// it (`ItemImageProvider.RemoveImages`' `IsSaveLocalMetadataEnabled()`
+/// arm); a file there that the item does not list stays. A box set inside a
+/// media library is opened to it only by the library's "Save artwork into
+/// media folders": without it, the upload in the metadata folder goes and
+/// the media folder is left as it is. In a home-video library, whose images
+/// are its photos, nothing beside the item goes even with the opt-in.
+#[rstest::rstest]
+#[case::box_set(BOX_SET, "data/collections/Mix [boxset]", true, None, true, &[])]
+#[case::music_genre(MUSIC_GENRE, "metadata/MusicGenre/Mix", false, None, true, &[])]
+#[case::box_set_in_a_library(
+    BOX_SET,
+    "photos/Mix [boxset]",
+    true,
+    None,
+    false,
+    &[ImageType::Backdrop]
+)]
+#[case::box_set_in_an_opted_in_library(
+    BOX_SET,
+    "opted/Mix [boxset]",
+    true,
+    Some(CollectionTypeOptions::movies),
+    true,
+    &[]
+)]
+#[case::box_set_in_an_opted_in_home_video_library(
+    BOX_SET,
+    "opted/Mix [boxset]",
+    true,
+    Some(CollectionTypeOptions::homevideos),
+    true,
+    &[ImageType::Primary, ImageType::Backdrop]
+)]
+#[tokio::test(flavor = "multi_thread")]
+async fn replacing_all_images_removes_the_art_saved_beside_the_item(
+    #[case] type_: &str,
+    #[case] path: &str,
+    #[case] is_folder: bool,
+    #[case] opted_in: Option<CollectionTypeOptions>,
+    #[case] saved_beside: bool,
+    #[case] kept: &[ImageType],
+) {
+    let lib = PhotoLibrary::scanned(RED).await;
+    if let Some(kind) = opted_in {
+        let opted = lib.tmp.path().join("opted");
+        std::fs::create_dir_all(&opted).expect("library folder");
+        lib.vf
+            .add_virtual_folder(
+                "Opted",
+                Some(kind),
+                &LibraryOptions {
+                    path_infos: vec![MediaPathInfo {
+                        path: opted.to_string_lossy().into_owned(),
+                    }],
+                    save_local_metadata: true,
+                    ..LibraryOptions::default()
+                },
+            )
+            .await
+            .expect("opted-in library");
+    }
+    let id = uuid::Uuid::new_v4();
+    let path = lib.tmp.path().join(path);
+    std::fs::create_dir_all(&path).expect("item folder");
+    lib.persistence
+        .save_items(&[BaseItemEntity {
+            id: guid_to_db(id),
+            type_: type_.to_owned(),
+            name: Some("Mix".to_owned()),
+            path: Some(path.to_string_lossy().into_owned()),
+            is_folder,
+            // Refreshed before: a Default refresh asks no remote provider.
+            date_last_refreshed: Some(chrono::Utc::now()),
+            ..BaseItemEntity::default()
+        }])
+        .await
+        .expect("row");
+    let manager = lib.uploader().await;
+    manager
+        .save_image(id, &png(BLUE), "image/png", ImageType::Primary, None)
+        .await
+        .expect("upload");
+    let backdrop = path.join("backdrop.png");
+    let unlisted = path.join("notes.png");
+    for file in [&backdrop, &unlisted] {
+        std::fs::write(file, png(RED)).expect("beside file");
+    }
+    let mut images = lib.items.get_image_infos(id).await.expect("images");
+    let upload = images
+        .iter()
+        .find(|i| i.image_type == ImageType::Primary)
+        .map(|i| std::path::PathBuf::from(&i.path))
+        .expect("the upload");
+    assert_eq!(
+        upload.starts_with(&path),
+        saved_beside,
+        "{}",
+        upload.display()
+    );
+    images.push(ferrofin_traits::options::ItemImageInfo {
+        path: backdrop.to_string_lossy().into_owned(),
+        image_type: ImageType::Backdrop,
+        date_modified: chrono::Utc::now(),
+        width: 0,
+        height: 0,
+        blur_hash: None,
+    });
+    lib.persistence
+        .save_item_images(id, &images)
+        .await
+        .expect("backdrop row");
+
+    manager
+        .refresh_single_item(
+            id,
+            &MetadataRefreshOptions {
+                remove_old_metadata: true,
+                replace_all_images: true,
+                ..MetadataRefreshOptions::default()
+            },
+        )
+        .await
+        .expect("refresh");
+
+    let left: Vec<ImageType> = lib
+        .items
+        .get_image_infos(id)
+        .await
+        .expect("images")
+        .iter()
+        .map(|i| i.image_type)
+        .collect();
+    assert_eq!(left, kept);
+    assert_eq!(
+        upload.exists(),
+        kept.contains(&ImageType::Primary),
+        "the upload"
+    );
+    assert_eq!(
+        backdrop.exists(),
+        kept.contains(&ImageType::Backdrop),
+        "the listed backdrop"
+    );
+    assert!(unlisted.exists(), "a file the item does not list stays");
+}
+
 /// A library tile is recorded as any saved image is: its size and blurhash
 /// read from the file (`LibraryManager.UpdateImagesAsync`), and the file's own
 /// modification time, so `/UserViews` carries `ImageBlurHashes.Primary`.
@@ -915,6 +1063,121 @@ async fn a_library_whose_locations_changed_redraws_its_tile() {
         !restarted.take_library_requires_refresh(library_id),
         "unchanged locations require no refresh"
     );
+}
+
+/// The `UserRootFolder` row the library hangs under.
+async fn user_root_of(lib: &PhotoLibrary) -> BaseItemEntity {
+    lib.items
+        .get_item_list(&InternalItemsQuery {
+            include_item_types: vec![BaseItemKind::UserRootFolder],
+            ..InternalItemsQuery::default()
+        })
+        .await
+        .expect("query")
+        .into_iter()
+        .next()
+        .expect("the root the library hangs under")
+}
+
+/// gl-950: library validation refreshes the user root at its opening, as
+/// upstream's `ValidateTopLibraryFolders` does, before any library is walked:
+/// a fresh library's first validation finds no tile to copy and records the
+/// refresh; the next validation copies the tile the first one drew.
+#[tokio::test(flavor = "multi_thread")]
+async fn library_validation_refreshes_the_user_root_before_the_walk() {
+    let lib = PhotoLibrary::scanned(RED).await;
+    let root = user_root_of(&lib).await;
+    let root_id = uuid::Uuid::parse_str(&root.id).expect("id");
+    assert!(
+        root.date_last_refreshed.is_some(),
+        "the first validation records the root's refresh"
+    );
+    assert!(
+        lib.items
+            .get_image_infos(root_id)
+            .await
+            .expect("images")
+            .is_empty(),
+        "no library tile existed when the root was refreshed"
+    );
+
+    lib.scanner.scan_all().await.expect("scan");
+    let copy = primary_of(&lib.items, root_id).await;
+    assert_eq!(
+        image::open(&copy.path)
+            .expect("decodable")
+            .to_rgb8()
+            .get_pixel(10, 10)
+            .0,
+        dimmed(RED),
+        "the next validation copies the library's tile"
+    );
+}
+
+/// gl-950: every library validation refreshes the user root, as upstream's
+/// `ValidateTopLibraryFolders` does (`GetUserRootFolder().RefreshMetadata()`,
+/// Default options). A root never refreshed runs every provider, so its
+/// current image is recopied from the library tile past the date gate, and
+/// its `DateLastRefreshed` is stamped; the next validation leaves both.
+#[tokio::test(flavor = "multi_thread")]
+async fn library_validation_refreshes_the_user_root() {
+    const GREEN: [u8; 3] = [30, 180, 30];
+    let lib = PhotoLibrary::scanned(RED).await;
+    let root = uuid::Uuid::parse_str(&user_root_of(&lib).await.id).expect("id");
+    let colour = || async {
+        image::open(primary_of(&lib.items, root).await.path)
+            .expect("decodable")
+            .to_rgb8()
+            .get_pixel(10, 10)
+            .0
+    };
+    // A root whose current copy was drawn before it was ever refreshed (a
+    // root row written by an older Ferrofin carries no stamp).
+    let mut row = user_root_of(&lib).await;
+    row.date_last_refreshed = None;
+    lib.persistence
+        .save_items(std::slice::from_ref(&row))
+        .await
+        .expect("unstamp");
+    let dir = jellyfin_art_dir(lib.tmp.path(), root);
+    std::fs::create_dir_all(&dir).expect("art dir");
+    let copy = dir.join("primary.png");
+    let draw_green = || async {
+        image::RgbImage::from_pixel(40, 60, image::Rgb(GREEN))
+            .save(&copy)
+            .expect("copy");
+        set_primary_of(
+            &lib.items,
+            &lib.persistence,
+            root,
+            &copy.to_string_lossy(),
+            // Its file's time: an image touched on disk since is redrawn.
+            std::fs::metadata(&copy)
+                .and_then(|meta| meta.modified())
+                .expect("mtime")
+                .into(),
+        )
+        .await;
+    };
+    draw_green().await;
+
+    lib.scanner.scan_all().await.expect("scan");
+    assert_eq!(
+        colour().await,
+        dimmed(RED),
+        "the root's first refresh runs every provider"
+    );
+    let stamped = user_root_of(&lib).await.date_last_refreshed;
+    assert!(stamped.is_some(), "the root's refresh is recorded");
+
+    draw_green().await;
+    lib.scanner.scan_all().await.expect("scan");
+    assert_eq!(
+        colour().await,
+        GREEN,
+        "a refreshed root's current image is behind its gate"
+    );
+    assert_eq!(user_root_of(&lib).await.date_last_refreshed, stamped);
 }
 
 /// The row's Primary image row.

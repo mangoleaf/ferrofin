@@ -78,6 +78,7 @@ use ferrofin_traits::drawing::ImageProcessor;
 use ferrofin_traits::error::ServiceError;
 use ferrofin_traits::library::{
     ContentPermissions, LibraryManager, MediaSourceManager, UserDataManager,
+    image_type_allows_multiple,
 };
 use ferrofin_traits::options::{
     DtoOptions, InternalItemsQuery, ItemImageInfo, live_tv_image_is_internal,
@@ -367,57 +368,6 @@ fn genre_kind(item: &BaseItemEntity) -> BaseItemKind {
     }
 }
 
-/// The `ImageType` discriminants that the C# `ItemImageInfo` marks as "allows
-/// multiple" (backdrops/chapters) — the single-image loop skips
-/// these so they are handled by their own limited fetch.
-///
-/// Mirrors `BaseItem.AllowsMultipleImages`.
-fn allows_multiple_images(image_type: ImageType) -> bool {
-    matches!(image_type, ImageType::Backdrop | ImageType::Chapter)
-}
-
-/// Reads an [`ImageType`] from its stored `BaseItemImageInfos.ImageType`
-/// discriminant (0-based, matching the C# `ImageType` declaration order).
-///
-/// A stored row should never carry an out-of-range value; an unknown one maps to
-/// [`ImageType::Primary`] rather than failing the whole projection.
-fn image_type_from_disc(disc: i32) -> ImageType {
-    match disc {
-        1 => ImageType::Art,
-        2 => ImageType::Backdrop,
-        3 => ImageType::Banner,
-        4 => ImageType::Logo,
-        5 => ImageType::Thumb,
-        6 => ImageType::Disc,
-        7 => ImageType::Box,
-        8 => ImageType::Screenshot,
-        9 => ImageType::Menu,
-        10 => ImageType::Chapter,
-        11 => ImageType::BoxRear,
-        12 => ImageType::Profile,
-        _ => ImageType::Primary,
-    }
-}
-
-/// Maps a stored `BaseItemImageInfos` row onto the in-flight [`ItemImageInfo`]
-/// the image processor and tag helpers consume.
-fn to_image_info(
-    row: &BaseItemImageInfoEntity,
-    virtual_paths: &VirtualPathExpander,
-) -> ItemImageInfo {
-    ItemImageInfo {
-        path: virtual_paths.expand(&row.path),
-        image_type: image_type_from_disc(row.image_type),
-        date_modified: row.date_modified.unwrap_or_default(),
-        width: i32::try_from(row.width).unwrap_or(0),
-        height: i32::try_from(row.height).unwrap_or(0),
-        blur_hash: row
-            .blurhash
-            .as_ref()
-            .map(|bytes| String::from_utf8_lossy(bytes).into_owned()),
-    }
-}
-
 /// Parses a [`UserEntity`]'s stored `Guid` id into a [`Uuid`].
 ///
 /// The id is a lookup key for this user's `UserData`/permissions. Degrading a
@@ -480,9 +430,11 @@ fn row_id(item: &BaseItemEntity) -> Uuid {
 /// etag values — the base list is just `DateLastSaved.Ticks` (100 ns units since
 /// 0001-01-01; a never-saved row matches C#'s `DateTime.MinValue` = 0 ticks).
 fn compute_etag(date_last_saved: Option<chrono::DateTime<chrono::Utc>>) -> String {
-    const UNIX_EPOCH_TICKS: i64 = 621_355_968_000_000_000;
+    use ferrofin_util::ticks::{TICKS_PER_SECOND, UNIX_EPOCH_TICKS};
     let ticks = date_last_saved.map_or(0, |d| {
-        UNIX_EPOCH_TICKS + d.timestamp() * 10_000_000 + i64::from(d.timestamp_subsec_nanos() / 100)
+        UNIX_EPOCH_TICKS
+            + d.timestamp() * TICKS_PER_SECOND
+            + i64::from(d.timestamp_subsec_nanos() / 100)
     });
     ferrofin_common::extensions::get_md5(&ticks.to_string())
         .simple()
@@ -716,25 +668,6 @@ pub(crate) fn fill_folder_played(
 #[allow(clippy::cast_precision_loss)]
 fn percent_of_ticks(position: i64, runtime: i64) -> f64 {
     100.0 * (position as f64 / runtime as f64)
-}
-
-/// An empty (never-played) [`UserItemDataDto`] for `item_id` — the shape
-/// `UserDataManager` returns for an item with no stored row, used when a folder
-/// needs a UserData object solely to carry `UnplayedItemCount`.
-fn empty_user_data_dto(item_id: Uuid) -> UserItemDataDto {
-    UserItemDataDto {
-        rating: None,
-        played_percentage: None,
-        unplayed_item_count: None,
-        playback_position_ticks: 0,
-        play_count: 0,
-        is_favorite: false,
-        likes: None,
-        last_played_date: None,
-        played: false,
-        key: item_id.to_string(),
-        item_id,
-    }
 }
 
 /// Sets `ChildCount` on a folder DTO from the prefetched per-folder counts
@@ -1488,11 +1421,11 @@ impl FerrofinDtoService {
                 query = query.bind(guid_to_db(*id));
             }
             let rows = query.fetch_all(self.db.pool()).await.map_err(db_err)?;
-            for row in &rows {
+            for row in rows {
                 if let Ok(item_id) = Uuid::parse_str(&row.item_id) {
-                    map.entry(item_id)
-                        .or_default()
-                        .push(to_image_info(row, &self.virtual_paths));
+                    map.entry(item_id).or_default().push(
+                        crate::item_repository::image_info_from_row(row, &self.virtual_paths),
+                    );
                 }
             }
         }
@@ -2095,7 +2028,7 @@ impl FerrofinDtoService {
             let mut image_tags = HashMap::new();
             for image in images
                 .iter()
-                .filter(|i| !allows_multiple_images(i.image_type))
+                .filter(|i| !image_type_allows_multiple(i.image_type))
                 .filter(|i| options.image_limit(i.image_type) > 0)
             {
                 if let Some(tag) = self.tag_and_fill_blur_hash(dto, item_path, image).await {
@@ -2446,15 +2379,17 @@ impl FerrofinDtoService {
                     if options.contains_field(ItemFields::RecursiveItemCount) {
                         dto.recursive_item_count = Some(c.total);
                     }
+                    // Upstream fills the dto `GetUserDataDto` built, keyed by
+                    // the item's first user-data key. The page's batch holds
+                    // it for every item; none is made up here, so a folder
+                    // the manager answered nothing for is never keyed by its
+                    // guid.
                     if kinds::supports_played_status(
                         kind,
                         parse_media_type(item.media_type.as_deref()),
-                    ) {
-                        fill_folder_played(
-                            dto.user_data
-                                .get_or_insert_with(|| empty_user_data_dto(item_id)),
-                            c,
-                        );
+                    ) && let Some(user_data) = dto.user_data.as_mut()
+                    {
+                        fill_folder_played(user_data, c);
                     }
                 }
             }
@@ -6003,6 +5938,41 @@ mod tests {
         }
     }
 
+    /// `FillUserDataDtoValues` fills the user data `GetUserDataDto` built. A
+    /// folder the manager answered none for gets no stand-in keyed by its
+    /// guid, and its field-gated `RecursiveItemCount` still lands.
+    #[tokio::test]
+    async fn a_folder_without_user_data_gets_no_stand_in() {
+        let db = test_db().await;
+        let season_id = Uuid::new_v4();
+        seed_folder_item(&db, season_id, BaseItemKind::Season, "Season 1", None).await;
+        let season = fetch_item(&db, season_id).await;
+        let user = seed_user(&db, Uuid::new_v4()).await;
+        let svc = service_with_counts(db, FakeCounts::default());
+        let options = DtoOptions {
+            fields: vec![ItemFields::RecursiveItemCount],
+            ..DtoOptions::default()
+        };
+        let mut prefetched = Prefetched {
+            played_counts: [(
+                season_id,
+                ferrofin_traits::persistence::PlayedAndTotal {
+                    played: 1,
+                    total: 3,
+                },
+            )]
+            .into_iter()
+            .collect(),
+            ..Prefetched::default()
+        };
+        let dto = svc
+            .build_dto(&season, &options, Some(&user), None, &mut prefetched, false)
+            .await
+            .unwrap();
+        assert_eq!(dto.recursive_item_count, Some(3));
+        assert!(dto.user_data.is_none(), "{:?}", dto.user_data);
+    }
+
     /// `if (dto.RecursiveItemCount > 0) dto.ChildCount = dto.RecursiveItemCount;`
     /// (v12 DtoService.cs:614-617): a zero recursive count is not a
     /// `ChildCount: 0` — the shortcut falls through to the real
@@ -7952,20 +7922,6 @@ mod tests {
                 series_count: 2,
                 ..ferrofin_model::dto::ItemCounts::default()
             })
-        }
-        async fn get_played_count(
-            &self,
-            _filter: &ferrofin_traits::options::InternalItemsQuery,
-            _ancestor_id: Uuid,
-        ) -> Result<i32, ServiceError> {
-            Ok(0)
-        }
-        async fn get_total_count(
-            &self,
-            _filter: &ferrofin_traits::options::InternalItemsQuery,
-            _ancestor_id: Uuid,
-        ) -> Result<i32, ServiceError> {
-            Ok(0)
         }
         async fn get_played_and_total_count(
             &self,

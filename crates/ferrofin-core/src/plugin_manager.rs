@@ -23,7 +23,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
-use ferrofin_model::updates::{PackageInfo, RepositoryInfo, VersionInfo};
+use ferrofin_model::updates::{InstallationInfo, PackageInfo, RepositoryInfo, VersionInfo};
 use serde::{Deserialize, Serialize};
 use serde_json::value::RawValue;
 use uuid::Uuid;
@@ -37,108 +37,7 @@ use ferrofin_util::string_extensions::equals_ordinal_ignore_case;
 
 use crate::system_manager::LifecycleController;
 
-/// A compiled-in plugin registered with the manager at the composition root.
-///
-/// Plain data only (no `ferrofin-api`/router types) so the manager stays below the
-/// dependency arrow; the composition root maps its richer `FerrofinPlugin` trait
-/// objects down to these entries.
-#[derive(Debug, Clone)]
-pub struct RegisteredPlugin {
-    /// The plugin's presentation metadata.
-    pub descriptor: PluginDescriptor,
-    /// The plugin's bundled image, if any.
-    pub image: Option<PluginImage>,
-    /// The plugin's default configuration (JSON bytes), returned until the admin
-    /// writes a value.
-    pub default_config: Vec<u8>,
-    /// The plugin's dashboard pages/resources — projected into
-    /// `GET /web/ConfigurationPages` + served by
-    /// `GET /web/ConfigurationPage?name=…` so the dashboard shows a Settings
-    /// link. The first page is the plugin's main settings page (jellyfin-web
-    /// links the first page whose `PluginId` matches); the rest are typically
-    /// the JS/CSS resources that page loads by name.
-    pub config_pages: Vec<PluginConfigPage>,
-    /// The file a runtime-loaded (WASM) plugin was loaded from, whatever its
-    /// name; uninstalling the plugin deletes it. `None` for a compiled-in one.
-    pub artifact: Option<PathBuf>,
-}
-
-/// One dashboard page (or page resource) a plugin ships. Mirrors the C#
-/// `PluginPageInfo`: a name the dashboard fetches by, the bytes, and whether the
-/// page gets a main-menu (drawer) link.
-#[derive(Debug, Clone)]
-pub struct PluginConfigPage {
-    /// The name the page is fetched by (`?name=…`); resources keep their file
-    /// extension (e.g. `introskipper.js`) so the server picks the MIME type.
-    pub name: String,
-    /// The raw page/resource bytes.
-    pub bytes: Vec<u8>,
-    /// Whether the dashboard drawer shows a direct link to this page
-    /// (`EnableInMainMenu`).
-    pub enable_in_main_menu: bool,
-}
-
-impl RegisteredPlugin {
-    /// Builds a registration, normalizing `has_image`/`can_uninstall` on the
-    /// descriptor. Image presence drives `has_image`.
-    ///
-    /// `can_uninstall` is forced **`true`** even though a compiled-in extension
-    /// can't actually be removed at runtime. jellyfin-web gates the dashboard
-    /// enable/disable toggle on `CanUninstall` — the *same* flag as the uninstall
-    /// button, with no separate "can be disabled" field — so reporting `false`
-    /// hides the toggle entirely and the extension is stuck showing "Active".
-    /// We report `true` to surface the toggle; [`remove_plugin`] still honestly
-    /// rejects the uninstall itself.
-    ///
-    /// [`remove_plugin`]: FerrofinPluginManager::remove_plugin
-    #[must_use]
-    pub fn new(mut descriptor: PluginDescriptor, image: Option<PluginImage>) -> Self {
-        descriptor.has_image = image.is_some();
-        descriptor.can_uninstall = true;
-        Self {
-            descriptor,
-            image,
-            default_config: b"{}".to_vec(),
-            config_pages: Vec::new(),
-            artifact: None,
-        }
-    }
-
-    /// Records the file a runtime-loaded plugin came from (see
-    /// [`Self::artifact`]).
-    #[must_use]
-    pub fn with_artifact(mut self, path: PathBuf) -> Self {
-        self.artifact = Some(path);
-        self
-    }
-
-    /// Reports `CanUninstall: false`, undoing the `true` [`Self::new`] forces.
-    ///
-    /// That `true` exists to surface jellyfin-web's enable/disable toggle for a
-    /// compiled-in **extension**. Jellyfin's own in-tree provider plugins
-    /// (TMDb, OMDb, MusicBrainz, AudioDB, Studio Images) report `false`, and
-    /// they are the row `GET /Plugins` is diffed against, so they opt back out.
-    #[must_use]
-    pub fn non_removable(mut self) -> Self {
-        self.descriptor.can_uninstall = false;
-        self
-    }
-
-    /// Sets the plugin's default configuration JSON.
-    #[must_use]
-    pub fn with_default_config(mut self, config: Vec<u8>) -> Self {
-        self.default_config = config;
-        self
-    }
-
-    /// Appends a dashboard page/resource. Call once per page; the first call
-    /// registers the plugin's main settings page.
-    #[must_use]
-    pub fn with_config_page(mut self, page: PluginConfigPage) -> Self {
-        self.config_pages.push(page);
-        self
-    }
-}
+pub use ferrofin_traits::plugins::{PluginConfigPage, RegisteredPlugin};
 
 /// Merges runtime-loaded (WASM) plugin registrations into an existing
 /// registry, enforcing its two global identifier namespaces:
@@ -486,6 +385,9 @@ pub struct FerrofinPluginManager {
     /// each analyzer plugin; an uninstall forgets the plugin's, as it removes
     /// the plugin's state file. `None` only at the unit-test seam.
     offered_items: Option<Arc<dyn ferrofin_traits::plugins::PluginOfferedItemStore>>,
+    /// The packages installed since the boot (`_completedInstallationsInternal`),
+    /// reported by [`PluginManager::completed_installations`].
+    completed: Mutex<Vec<InstallationInfo>>,
 }
 
 /// The in-process event a plugin configuration save publishes, with
@@ -545,6 +447,7 @@ impl FerrofinPluginManager {
             events: None,
             removed: Mutex::default(),
             offered_items: None,
+            completed: Mutex::default(),
         }
     }
 
@@ -743,6 +646,29 @@ impl FerrofinPluginManager {
                 );
             }
         }
+    }
+
+    /// Records a finished install (`_completedInstallationsInternal.Add`): the
+    /// `InstallationInfo` `GetCompatibleVersions` built for `version` of
+    /// `package`, downloaded from `source_url`.
+    fn record_completed_installation(
+        &self,
+        package: &PackageInfo,
+        version: &VersionInfo,
+        source_url: &str,
+    ) {
+        self.completed
+            .lock()
+            .expect("completed installations lock poisoned")
+            .push(InstallationInfo {
+                id: package.id,
+                name: Some(package.name.clone()),
+                version: Some(version.version_number.clone()),
+                changelog: version.changelog.clone(),
+                source_url: Some(source_url.to_owned()),
+                checksum: version.checksum.clone(),
+                package_info: Some(package.clone()),
+            });
     }
 
     /// Records an installed plugin's declared egress (best-effort persist).
@@ -1314,6 +1240,7 @@ impl PluginManager for FerrofinPluginManager {
         // Record the installed digest (see step 4b) + declared egress.
         self.record_installed_digest(package.id, &chosen.version, digest);
         self.record_installed_egress(package.id, artifact.declared_egress);
+        self.record_completed_installation(package, chosen, source_url);
 
         // 7. Activate on next restart (Jellyfin's model).
         if let Some(lifecycle) = &self.lifecycle {
@@ -1326,6 +1253,13 @@ impl PluginManager for FerrofinPluginManager {
             "wasm plugin installed; restart required to activate"
         );
         Ok(())
+    }
+
+    fn completed_installations(&self) -> Vec<InstallationInfo> {
+        self.completed
+            .lock()
+            .expect("completed installations lock poisoned")
+            .clone()
     }
 
     async fn get_plugin_configuration(&self, id: Uuid) -> Result<Vec<u8>, ServiceError> {
@@ -3083,6 +3017,7 @@ mod tests {
         let artifact = b"pretend-wasm-bytes".to_vec();
         let md5 = ferrofin_common::extensions::md5_hex(&artifact);
         let rig = install_rig(&artifact, None, &md5, TEST_ABI, Ok(PKG_ID)).await;
+        assert_eq!(rig.mgr.completed_installations(), Vec::new());
 
         rig.mgr
             .install_package("HelloPkg", None, None, None)
@@ -3092,6 +3027,36 @@ mod tests {
         let staged = rig.wasm_dir.join(format!("{PKG_ID}.wasm"));
         assert_eq!(std::fs::read(&staged).unwrap(), artifact, "artifact staged");
         assert!(rig.lifecycle.has_pending_restart(), "restart flagged");
+        // Recorded as `CompletedInstallations` (gl-1776): the newest version.
+        let completed = rig.mgr.completed_installations();
+        assert_eq!(completed.len(), 1, "{completed:?}");
+        let installation = &completed[0];
+        assert_eq!(installation.id, PKG_ID);
+        assert_eq!(installation.name.as_deref(), Some("HelloPkg"));
+        assert_eq!(installation.version.as_deref(), Some("0.10.0"));
+        assert_eq!(installation.checksum.as_deref(), Some(md5.as_str()));
+        assert!(
+            installation
+                .source_url
+                .as_deref()
+                .is_some_and(|url| url.ends_with("/plugin.wasm"))
+        );
+        assert_eq!(
+            installation.package_info.as_ref().map(|p| p.id),
+            Some(PKG_ID)
+        );
+        // Each later install adds its own entry, in install order.
+        rig.mgr
+            .install_package("HelloPkg", None, Some("0.9.0"), None)
+            .await
+            .expect("second install");
+        let versions: Vec<String> = rig
+            .mgr
+            .completed_installations()
+            .into_iter()
+            .filter_map(|installation| installation.version)
+            .collect();
+        assert_eq!(versions, ["0.10.0", "0.9.0"]);
         // The validator-reported egress allowlist was recorded (upgrade
         // growth diffs against it).
         let persisted: serde_json::Value = serde_json::from_slice(
@@ -3561,6 +3526,11 @@ mod tests {
             .unwrap_err();
         assert!(err.to_string().contains("checksum mismatch"), "{err}");
         assert!(!rig.lifecycle.has_pending_restart());
+        assert_eq!(
+            rig.mgr.completed_installations(),
+            Vec::new(),
+            "a failed install is not completed"
+        );
 
         // sha256 preferred over (correct) md5 — and mismatching.
         let rig = install_rig(&artifact, Some("deadbeef"), &md5, TEST_ABI, Ok(PKG_ID)).await;

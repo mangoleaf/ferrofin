@@ -98,20 +98,31 @@ pub struct TaskTriggerInfo {
 }
 
 /// The result of a scheduled task execution.
-#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize, ToSchema)]
+///
+/// A member a JSON document leaves out reads as C#'s default for it, as
+/// `System.Text.Json` leaves it: `DateTime.MinValue` for a time, `Completed`
+/// (enum 0) for the status.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "PascalCase")]
 pub struct TaskResult {
     /// Gets or sets the start time UTC.
     #[schema(value_type = String, format = "date-time")]
-    #[serde(with = "crate::json::datetime")]
+    #[serde(
+        with = "crate::json::datetime",
+        default = "crate::json::datetime::dotnet_min"
+    )]
     pub start_time_utc: DateTime<Utc>,
 
     /// Gets or sets the end time UTC.
     #[schema(value_type = String, format = "date-time")]
-    #[serde(with = "crate::json::datetime")]
+    #[serde(
+        with = "crate::json::datetime",
+        default = "crate::json::datetime::dotnet_min"
+    )]
     pub end_time_utc: DateTime<Utc>,
 
     /// Gets or sets the status.
+    #[serde(default)]
     pub status: TaskCompletionStatus,
 
     /// Gets or sets the name.
@@ -133,6 +144,23 @@ pub struct TaskResult {
     /// Gets or sets the long error message.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub long_error_message: Option<String>,
+}
+
+/// A new C# `TaskResult`: every member at its type's default, so both times
+/// are `DateTime.MinValue`, not chrono's Unix epoch.
+impl Default for TaskResult {
+    fn default() -> Self {
+        Self {
+            start_time_utc: crate::json::datetime::dotnet_min(),
+            end_time_utc: crate::json::datetime::dotnet_min(),
+            status: TaskCompletionStatus::default(),
+            name: None,
+            key: None,
+            id: None,
+            error_message: None,
+            long_error_message: None,
+        }
+    }
 }
 
 /// Information about a scheduled task.
@@ -176,4 +204,27 @@ pub struct TaskInfo {
     /// Gets or sets the key.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub key: Option<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{TaskCompletionStatus, TaskResult};
+
+    /// `System.Text.Json` leaves a member the document lacks at its C#
+    /// default, and `JsonDateTimeConverter` writes `DateTime.MinValue` with
+    /// all seven tick digits.
+    #[test]
+    fn a_task_result_reads_missing_members_as_their_csharp_defaults() {
+        let result: TaskResult = serde_json::from_str("{}").expect("parse");
+        assert_eq!(result, TaskResult::default());
+        assert_eq!(result.status, TaskCompletionStatus::Completed);
+        assert_eq!(
+            serde_json::to_value(&result).expect("serialize"),
+            serde_json::json!({
+                "StartTimeUtc": "0001-01-01T00:00:00.0000000Z",
+                "EndTimeUtc": "0001-01-01T00:00:00.0000000Z",
+                "Status": "Completed",
+            })
+        );
+    }
 }

@@ -296,7 +296,7 @@ Both of these need an ffmpeg with libx264, and `subtitle_streams_ffmpeg` also ne
 5.1 or later. CI does not run them (no CI job runs ignored tests): run them by hand for
 changes to those paths.
 
-The image limits have an environment-variable gate. `image_limits_cgroup` boots the real binary in a
+The image-limit tests are `#[ignore]`d too. `image_limits_cgroup` boots the real binary in a
 `systemd-run --user --scope` with a hard memory cap and swap off, and checks that each limit holds
 there: the pixel limit, the resize budget, the memory limit on a Photo item, the budget shared
 by concurrent resizes, a blur's compositing under the budget, and remote images past the download
@@ -305,10 +305,10 @@ and CI does not run it: run it by hand for changes to `ferrofin-drawing/src/limi
 `ferrofin-providers/src/image_download.rs`:
 
 ```bash
-FERROFIN_CGROUP_TESTS=1 cargo test -p ferrofin-server --test image_limits_cgroup
+cargo test -p ferrofin-server --test image_limits_cgroup -- --include-ignored
 ```
 
-The LDAP-Auth extension's directory client has one too. `ldap_directory` starts two OpenLDAP
+So is the LDAP-Auth extension's directory client test. `ldap_directory` starts two OpenLDAP
 containers (built from `alpine:3.22` on the first run, certificates generated per run) and runs
 the settings page's connection test over plain LDAP, LDAPS and StartTLS: a custom root CA, a
 client certificate, skip-verify, a certificate for the wrong name refused, a wrong bind
@@ -317,13 +317,14 @@ modify, the password-modify operation and the root DSE. It needs `docker`, and C
 it: run it by hand for changes to `crates/ferrofin-extensions/src/ldap_auth/`:
 
 ```bash
-FERROFIN_LDAP_TESTS=1 cargo test -p ferrofin-extensions --test ldap_directory -- --nocapture
+cargo test -p ferrofin-extensions --test ldap_directory -- --include-ignored --nocapture
 ```
 
-Similarly, the end-to-end WASM plugin test builds the reference guest from source (needs the
+The end-to-end WASM plugin test builds the reference guest from source (needs the
 `wasm32-wasip2` target — the `examples/wasm-hello/` toolchain island provides it; the root
-toolchain stays server-only). It skips with a message when the target is absent; CI always
-runs it:
+toolchain stays server-only). It has an environment-variable gate instead of `#[ignore]`,
+because CI's ordinary test run sets the variable and must run it. Without the variable, or
+when the target is absent, it returns early with a message and counts as passed:
 
 ```bash
 FERROFIN_WASM_GUEST_TESTS=1 cargo test -p ferrofin-wasm --test wasm_hello_guest

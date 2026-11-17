@@ -28,9 +28,10 @@
 //!   directly (gl-248). The `SessionControllers`/`WebSocketController`
 //!   indirection of the C# collapses into "the session's connection handles".
 //! - **`AuthenticationResult`** now lands in `ferrofin-model`; the authenticate
-//!   methods return an [`AuthenticationResultData`] (the [`SessionInfoDto`] plus
-//!   the minted access token) from which the API layer assembles the wire
-//!   envelope. The access token is minted via [`DeviceManager`].
+//!   methods return an [`AuthenticationResultData`] (the user's DTO, the
+//!   [`SessionInfoDto`] and the minted access token) from which the API layer
+//!   assembles the wire envelope. The access token is minted via
+//!   [`DeviceManager`].
 //! - **The idle and inactive checks** (`StartCheckTimers`) run from
 //!   [`FerrofinSessionManager::run_playback_checks`], which the composition root
 //!   starts with the host and aborts with it: a session playing without a
@@ -86,6 +87,7 @@ use ferrofin_model::session::{
     SessionUserInfo, TranscodingInfo,
 };
 use ferrofin_util::shuffle_extensions::shuffle;
+use ferrofin_util::string_extensions::{equals_ordinal_ignore_case, ordinal_ignore_case_key};
 
 use ferrofin_traits::configuration::ServerConfigurationManager;
 use ferrofin_traits::devices::{DeviceManager, DeviceQuery};
@@ -101,6 +103,7 @@ use ferrofin_traits::session::{
     AuthenticationRequest, AuthenticationResultData, SessionEvent, SessionManager, SessionSummary,
 };
 use ferrofin_traits::session_bus::SessionMessageBus;
+use ferrofin_util::ticks::TICKS_PER_MS;
 
 use crate::db_error::db_err;
 use crate::user_entity_ext::{cached_permission, has_permission};
@@ -584,8 +587,9 @@ pub struct FerrofinSessionManager {
     db: Database,
     /// This server's stable id, stamped onto each session (C# `SystemId`).
     server_id: String,
-    /// The pool of active sessions keyed by session key (`app + deviceId`),
-    /// matching the C# `_activeConnections` keying.
+    /// The pool of active sessions keyed by session key (`app + deviceId +
+    /// userId`) ignoring case, matching the C# `_activeConnections` keying
+    /// (`StringComparer.OrdinalIgnoreCase`).
     sessions: Arc<Mutex<HashMap<String, SessionInfo>>>,
     /// Which sessions are still holding each open live stream, keyed by
     /// `LiveStreamId`; the inner map pairs each session id with its play-session
@@ -1024,7 +1028,10 @@ impl FerrofinSessionManager {
             None => Uuid::nil(),
             Some(u) => parse_user_id(&u.id)?,
         };
-        let key = Self::session_key(app_name, device_id, user_id);
+        let first_seen_key = Self::session_key(app_name, device_id, user_id);
+        // The pool's key ignores case; a new session's id comes from the key
+        // as sent, as C#'s `GetOrAdd` keeps the first casing.
+        let key = ordinal_ignore_case_key(&first_seen_key);
         let user_name = || user.map(|u| u.username.clone());
         let user_primary_image_tag = self.user_primary_image_tag(user).await;
         let reported_device_name = if device_name.is_empty() {
@@ -1099,7 +1106,7 @@ impl FerrofinSessionManager {
                     _ => (reported_device_name.to_owned(), false),
                 };
                 SessionInfo {
-                    id: Self::session_id_for_key(&key),
+                    id: Self::session_id_for_key(&first_seen_key),
                     user_id,
                     user_name: user_name(),
                     client: Some(app_name.to_owned()),
@@ -1942,20 +1949,6 @@ impl SessionManager for FerrofinSessionManager {
         .await
     }
 
-    async fn update_device_name(
-        &self,
-        session_id: &str,
-        reported_device_name: &str,
-    ) -> Result<(), ServiceError> {
-        let mut sessions = self.sessions.lock().await;
-        let session = sessions
-            .values_mut()
-            .find(|s| s.id == session_id)
-            .ok_or_else(|| ServiceError::not_found(format!("session {session_id}")))?;
-        session.device_name = Some(reported_device_name.to_owned());
-        Ok(())
-    }
-
     async fn on_device_options_updated(&self, device_id: &str, custom_name: Option<&str>) {
         let custom_name = custom_name.filter(|name| !name.trim().is_empty());
         let mut sessions = self.sessions.lock().await;
@@ -2242,7 +2235,7 @@ impl SessionManager for FerrofinSessionManager {
                 user_id = %session.user_id,
                 item_id = %info.item_id,
                 item = name.as_deref(),
-                position_ms = info.position_ticks.map(|ticks| ticks / TICKS_PER_MILLISECOND),
+                position_ms = info.position_ticks.map(|ticks| ticks / TICKS_PER_MS),
                 device = session.device_name.as_deref(),
                 device_id = %session.device_id,
                 client = session.client.as_deref(),
@@ -2709,7 +2702,7 @@ impl SessionManager for FerrofinSessionManager {
         let mut result = Vec::new();
         for session in sessions.values() {
             if let Some(want) = device_id
-                && !session.device_id.eq_ignore_ascii_case(want)
+                && !equals_ordinal_ignore_case(&session.device_id, want)
             {
                 continue;
             }
@@ -2868,7 +2861,7 @@ impl SessionManager for FerrofinSessionManager {
             let sessions = self.sessions.lock().await;
             sessions
                 .values()
-                .filter(|s| s.device_id.eq_ignore_ascii_case(&device.device_id))
+                .filter(|s| equals_ordinal_ignore_case(&s.device_id, &device.device_id))
                 .map(|s| s.id.clone())
                 .collect()
         };
@@ -2893,10 +2886,7 @@ impl SessionManager for FerrofinSessionManager {
             })
             .await?;
         for device in devices.items {
-            if !device
-                .access_token
-                .eq_ignore_ascii_case(current_access_token)
-            {
+            if !equals_ordinal_ignore_case(&device.access_token, current_access_token) {
                 self.logout_device(&device).await?;
             }
         }
@@ -3132,6 +3122,15 @@ impl FerrofinSessionManager {
         let user_uuid = parse_user_id(&user.id)?;
         let _limit_gate = self.admit_session(&user, user_uuid).await?;
 
+        // C# builds `User = _userManager.GetUserDto(user, …)` from the user it
+        // authenticated, after `LogSessionActivity`. Ferrofin's DTO reads the
+        // database where upstream's reads memory, so it is built before
+        // anything is minted: a read error leaves no token, session or
+        // `AuthenticationSucceeded` behind. The session's activity stamp skips
+        // a password sign-in (`authenticate_user` has just stamped the user),
+        // and Quick Connect, the direct path, rebuilds `User` at its exchange.
+        let user_dto = self.user_manager.get_user_dto(&user, None).await?;
+
         // Mint a fresh access token: log out existing device rows for this
         // user/device, then create a new device (C# `GetAuthorizationToken`).
         let existing = self
@@ -3174,10 +3173,9 @@ impl FerrofinSessionManager {
             )
             .await?;
         dto.server_id = Some(self.server_id.clone());
-        // The full `AuthenticationResult` envelope (UserDto + ServerId) is
-        // assembled by the caller from this data; the freshly minted token
-        // (persisted on the created `Device` row) is returned so the caller can
-        // echo it back to the client.
+        // The caller adds `ServerId` to make the `AuthenticationResult`; the
+        // freshly minted token (persisted on the created `Device` row) is
+        // returned so the caller can echo it back to the client.
         let access_token = Secret::from(created.access_token);
 
         // C# `AuthenticateNewSessionInternal` publishes
@@ -3194,6 +3192,7 @@ impl FerrofinSessionManager {
             )
             .await;
         Ok(AuthenticationResultData {
+            user: user_dto,
             session: dto,
             access_token,
         })
@@ -3292,7 +3291,7 @@ fn set_device_transcoding_info(
 ) {
     if let Some(session) = sessions
         .values_mut()
-        .filter(|s| s.device_id.eq_ignore_ascii_case(device_id))
+        .filter(|s| equals_ordinal_ignore_case(&s.device_id, device_id))
         .max_by_key(|s| s.last_activity_date)
     {
         session.transcoding_info = info;
@@ -3325,9 +3324,6 @@ fn envelope_bytes(message_type: SessionMessageType, data: &str) -> Result<Vec<u8
 fn session_started_payload(session: &SessionInfo) -> String {
     serde_json::to_string(&session_info_to_dto(session)).unwrap_or_else(|_| "{}".to_owned())
 }
-
-/// .NET ticks (100 ns each) in a millisecond.
-const TICKS_PER_MILLISECOND: i64 = 10_000;
 
 /// The JSON payload for a playback event. The user name, device name and
 /// client stand for `PlaybackProgressEventArgs`' `Users`, `DeviceName` and

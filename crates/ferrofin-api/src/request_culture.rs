@@ -108,7 +108,7 @@ fn query_cultures(uri: &Uri) -> Option<Candidates> {
 
 fn cookie_cultures(headers: &HeaderMap) -> Option<Candidates> {
     let value = headers.get_all(axum::http::header::COOKIE).iter()
-        .filter_map(|header| header.to_str().ok())
+        .filter_map(crate::auth::header_text)
         .flat_map(|header| header.split(';'))
         .filter_map(|part| {
             let (key, value) = part.trim_start_matches([' ', '\t']).split_once('=')?;
@@ -181,7 +181,7 @@ fn header_cultures(headers: &HeaderMap) -> Option<Candidates> {
     let mut names: Vec<_> = headers
         .get_all(axum::http::header::ACCEPT_LANGUAGE)
         .iter()
-        .filter_map(|header| header.to_str().ok())
+        .filter_map(crate::auth::header_text)
         .flat_map(|header| header.split(','))
         .filter_map(language_entry)
         // Source truncates before sorting by quality, retaining stable ties.
@@ -238,6 +238,20 @@ mod tests {
             language.parse().unwrap(),
         );
         options().select(&format!("/nfo?{query}").parse().unwrap(), &headers)
+    }
+
+    /// A cookie outside ASCII leaves the header readable, as Kestrel reads it
+    /// as UTF-8: the culture cookie beside it still counts.
+    #[test]
+    fn a_utf8_cookie_keeps_the_culture_cookie_beside_it() {
+        assert_eq!(
+            selected(
+                "",
+                "room=Salle de séjour; .AspNetCore.Culture=c=sv|uic=sv",
+                "de-DE"
+            ),
+            ("sv".into(), "sv".into())
+        );
     }
 
     #[test]

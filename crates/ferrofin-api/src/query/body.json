@@ -19,6 +19,19 @@
   "validatePathDto",
   "The validatePathDto field is required."
  ],
+ "POST /Episode/{Id}/Timestamps": [
+  "timestamps",
+  "The timestamps field is required."
+ ],
+ "POST /FileTransformation/RegisterTransformation": [],
+ "POST /Intros/AnalyzerActions/UpdateSeason": [
+  "request",
+  "The request field is required."
+ ],
+ "POST /Intros/DisabledEpisodes/Update": [
+  "request",
+  "The request field is required."
+ ],
  "POST /Items/RemoteSearch/Apply/{itemId}": [
   "searchResult",
   "The searchResult field is required."
@@ -64,6 +77,13 @@
   "The request field is required."
  ],
  "POST /Items/{itemId}/PlaybackInfo": [],
+ "POST /Jellyfin.Plugin.OpenSubtitles/ValidateLoginInfo": [
+  "body",
+  "The body field is required."
+ ],
+ "POST /Ldap/LdapUserSearch": [],
+ "POST /Ldap/TestLdapFilters": [],
+ "POST /Ldap/TestServerBind": [],
  "POST /Library/Media/Updated": [
   "dto",
   "The dto field is required."
@@ -113,6 +133,10 @@
  "POST /LiveTv/TunerHosts": [
   "tunerHostInfo",
   "The tunerHostInfo field is required."
+ ],
+ "POST /MediaSegmentsApi/{itemId}": [
+  "segment",
+  "The segment field is required."
  ],
  "POST /Playlists": [],
  "POST /Playlists/{playlistId}": [

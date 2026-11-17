@@ -14,6 +14,7 @@
 //! `DbLinkedChildType.Manual`.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use ferrofin_db::Database;
@@ -36,6 +37,12 @@ const MANUAL_CHILD_TYPE: i32 = 0;
 #[derive(Clone)]
 pub struct FerrofinLinkedChildrenService {
     db: Database,
+    /// The playlist manager's entry-edit lock
+    /// (`FerrofinItemPersistenceService::playlist_entry_edits`), taken
+    /// before the writer by [`LinkedChildrenService::reroute_linked_children`]:
+    /// a reroute landing between an edit's read and its rewrite would be
+    /// undone by the rewrite.
+    entry_edits: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl std::fmt::Debug for FerrofinLinkedChildrenService {
@@ -49,7 +56,20 @@ impl FerrofinLinkedChildrenService {
     /// Creates a linked-children service over the given database.
     #[must_use]
     pub fn new(db: Database) -> Self {
-        Self { db }
+        Self {
+            db,
+            entry_edits: Arc::default(),
+        }
+    }
+
+    /// Shares the playlist manager's entry-edit lock
+    /// (`FerrofinItemPersistenceService::playlist_entry_edits`), so a reroute
+    /// never lands between an edit's read and its rewrite. Called once by the
+    /// composition root.
+    #[must_use]
+    pub fn with_entry_edits(mut self, lock: Arc<tokio::sync::Mutex<()>>) -> Self {
+        self.entry_edits = lock;
+        self
     }
 }
 
@@ -172,6 +192,7 @@ impl LinkedChildrenService for FerrofinLinkedChildrenService {
         from_child_id: Uuid,
         to_child_id: Uuid,
     ) -> Result<Vec<Uuid>, ServiceError> {
+        let _edits = self.entry_edits.lock().await;
         let mut tx = self.db.writer().begin().await.map_err(db_err)?;
 
         let affected: Vec<String> = sqlx::query_scalar(

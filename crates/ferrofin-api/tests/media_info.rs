@@ -512,6 +512,7 @@ impl SessionManager for OkSessions {
         _request: &AuthenticationRequest,
     ) -> Result<AuthenticationResultData, ServiceError> {
         Ok(AuthenticationResultData {
+            user: ferrofin_model::dto::UserDto::default(),
             session: SessionInfoDto {
                 id: Some("session-1".to_owned()),
                 user_id: USER_ID,
@@ -531,13 +532,6 @@ impl SessionManager for OkSessions {
         _remote_endpoint: &str,
         _user: Option<&UserEntity>,
     ) -> Result<SessionInfoDto, ServiceError> {
-        unimplemented!()
-    }
-    async fn update_device_name(
-        &self,
-        _session_id: &str,
-        _reported_device_name: &str,
-    ) -> Result<(), ServiceError> {
         unimplemented!()
     }
     async fn on_playback_start(
@@ -1772,12 +1766,6 @@ impl ferrofin_traits::devices::DeviceManager for ProfileDevices {
         &self,
         _device_id: &str,
     ) -> Result<Option<ferrofin_db::entities::security::DeviceOptionsEntity>, ServiceError> {
-        unimplemented!()
-    }
-    async fn to_client_capabilities_dto(
-        &self,
-        _capabilities: &ferrofin_model::session::ClientCapabilities,
-    ) -> Result<ferrofin_model::dto::ClientCapabilitiesDto, ServiceError> {
         unimplemented!()
     }
 }

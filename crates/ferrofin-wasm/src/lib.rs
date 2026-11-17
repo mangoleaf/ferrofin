@@ -43,18 +43,18 @@ use uuid::Uuid;
 use wasmtime::component::{Component, Linker};
 use wasmtime::{Config as WasmConfig, Engine};
 
-use ferrofin_core::event_manager::consumer_done;
-use ferrofin_core::{
-    FerrofinEventManager, PluginConfigPage, RegisteredPlugin, ScheduledTask, TaskProgress,
-};
 use ferrofin_traits::error::ServiceError;
-use ferrofin_traits::plugins::{PluginDescriptor, PluginManager, PluginOfferedItemStore};
+use ferrofin_traits::events::{EventSubscriber, ITEMS_CHANGED, consumer_done};
+use ferrofin_traits::plugins::{
+    PluginConfigPage, PluginDescriptor, PluginManager, PluginOfferedItemStore, RegisteredPlugin,
+};
+use ferrofin_traits::tasks::{ScheduledTask, TaskProgress};
 
 use crate::bindings::HostState;
 use crate::runtime::{EPOCH_TICK, InstanceSpec, RuntimeHandle};
 
 /// The domain events forwarded to every enabled plugin's `on-event` export —
-/// exactly the set `FerrofinEventManager` publishes today. Extend this list
+/// exactly the set the server's event manager publishes today. Extend this list
 /// as new publish sites land (plan §3).
 pub const FORWARDED_EVENTS: [&str; 9] = [
     "LibraryChanged",
@@ -70,12 +70,12 @@ pub const FORWARDED_EVENTS: [&str; 9] = [
 
 /// The bus event a [`FORWARDED_EVENTS`] name is delivered from. A plugin's
 /// `LibraryChanged` is every batch of library changes, unfiltered — the
-/// notifier's in-process [`ITEMS_CHANGED`](ferrofin_core::library_changed_notifier::ITEMS_CHANGED)
+/// notifier's in-process [`ITEMS_CHANGED`]
 /// — since the client push goes to each user's sessions and never through
 /// the bus. The other names are published on the bus as they are.
 fn bus_event(event_name: &'static str) -> &'static str {
     match event_name {
-        "LibraryChanged" => ferrofin_core::library_changed_notifier::ITEMS_CHANGED,
+        "LibraryChanged" => ITEMS_CHANGED,
         other => other,
     }
 }
@@ -382,7 +382,8 @@ pub struct WasmPluginHost {
     settings: WasmSettings,
     /// The shared guest HTTP clients, for host-side downloads made on a
     /// plugin's behalf (artwork) as well as every `HostState`. `None` only
-    /// for [`WasmPluginHost::empty`], which has no plugin to download for.
+    /// when no plugin file was found (and for [`WasmPluginHost::empty`]): there
+    /// is no plugin to download for.
     http: Option<Arc<capabilities::GuestHttp>>,
 }
 
@@ -394,7 +395,12 @@ impl WasmPluginHost {
     /// error. A component that fails to compile, links against a different
     /// world version, reports an invalid descriptor, or duplicates an id is
     /// **skipped with an `error!`** — one bad file never blocks the server
-    /// or the other plugins.
+    /// or the other plugins. With no `*.wasm` file it builds nothing: no
+    /// engine, no epoch-ticker thread, no guest HTTP clients.
+    ///
+    /// It also removes the segment cache (`{id}.segments/`) of every plugin
+    /// not installed, unless the directory could not be listed or a file
+    /// failed to load before its id was read.
     ///
     /// # Errors
     /// Only on engine construction failure (a wasmtime misconfiguration —
@@ -404,18 +410,18 @@ impl WasmPluginHost {
     /// # Panics
     /// Only if the OS refuses to spawn the epoch-ticker thread (startup-time
     /// resource exhaustion — the process is already unviable).
+    // One pass over the directory: list, load and refuse per file, then sweep.
+    #[allow(clippy::too_many_lines)]
     pub fn load(plugins_dir: &Path, settings: &WasmSettings) -> Result<Self, ServiceError> {
-        let (engine, linker) = build_runtime_parts(settings)?;
-        // load() runs on a blocking thread (spawn_blocking at the composition
-        // root), so eager client construction is safe here.
-        let http = build_guest_http_client(settings)?;
-        let collaborators: Arc<std::sync::OnceLock<capabilities::Collaborators>> =
-            Arc::new(std::sync::OnceLock::new());
-
-        let mut plugins: Vec<Arc<LoadedPlugin>> = Vec::new();
+        // Whether every plugin file's id is known: only then can a segment
+        // cache be told to belong to no plugin.
+        let mut all_ids_read = true;
         let mut paths: Vec<_> = match std::fs::read_dir(plugins_dir) {
             Ok(entries) => entries
-                .filter_map(Result::ok)
+                .filter_map(|entry| {
+                    all_ids_read &= entry.is_ok();
+                    entry.ok()
+                })
                 .map(|e| e.path())
                 .filter(|p| p.extension().is_some_and(|ext| ext == "wasm"))
                 .collect(),
@@ -428,17 +434,39 @@ impl WasmPluginHost {
                     %err,
                     "cannot read the wasm plugins directory; continuing without plugins"
                 );
+                all_ids_read = false;
                 Vec::new()
             }
         };
         paths.sort();
+        if paths.is_empty() {
+            if all_ids_read {
+                remove_orphaned_segment_caches(plugins_dir, &[]);
+            }
+            return Ok(Self {
+                settings: settings.clone(),
+                ..Self::empty()
+            });
+        }
 
+        let (engine, linker) = build_runtime_parts(settings)?;
+        // load() runs on a blocking thread (spawn_blocking at the composition
+        // root), so eager client construction is safe here.
+        let http = build_guest_http_client(settings)?;
+        let collaborators: Arc<std::sync::OnceLock<capabilities::Collaborators>> =
+            Arc::new(std::sync::OnceLock::new());
+
+        let mut plugins: Vec<Arc<LoadedPlugin>> = Vec::new();
+        // Every file's id, the refused ones' too: their caches stay.
+        let mut ids: Vec<Uuid> = Vec::new();
         for path in paths {
             let Some(mut loaded) =
                 load_one_guarded(&engine, &linker, &path, settings, &http, &collaborators)
             else {
+                all_ids_read = false;
                 continue;
             };
+            ids.push(loaded.descriptor.id);
             if settings.reserved_ids.contains(&loaded.descriptor.id) {
                 error!(
                     path = %path.display(),
@@ -496,6 +524,9 @@ impl WasmPluginHost {
                 "loaded wasm plugin"
             );
             plugins.push(Arc::new(loaded));
+        }
+        if all_ids_read {
+            remove_orphaned_segment_caches(plugins_dir, &ids);
         }
 
         Ok(Self {
@@ -645,7 +676,7 @@ impl WasmPluginHost {
     /// waits on a guest.
     pub fn subscribe_events(
         &self,
-        events: &FerrofinEventManager,
+        events: &dyn EventSubscriber,
         plugin_manager: &Arc<dyn PluginManager>,
     ) {
         for event_name in FORWARDED_EVENTS {
@@ -697,7 +728,7 @@ fn cached_segment_provider(
     plugins: &Arc<dyn PluginManager>,
 ) -> Arc<dyn ferrofin_traits::media_segments::MediaSegmentProvider> {
     Arc::new(
-        ferrofin_core::CachedMediaSegmentProvider::new(
+        ferrofin_providers::cached_media_segment_provider::CachedMediaSegmentProvider::new(
             plugin.descriptor.name.clone(),
             plugin.descriptor.id,
             Arc::clone(plugins),
@@ -708,6 +739,61 @@ fn cached_segment_provider(
         )
         .with_legacy_ids(vec![format!("wasm:{}", plugin.descriptor.id)]),
     )
+}
+
+/// Removes each `{id}.segments` directory in `plugins_dir` whose `id` is not
+/// in `installed`. An uninstall used to remove that directory as a file,
+/// which fails, so the cache stayed, and the plugin installed again served
+/// it as its own output before analysing anything. Upstream likewise deletes
+/// at startup a plugin folder its uninstall could not delete
+/// (`PluginManager.LoadAssemblies`). Only the exact name the cache is written
+/// under matches; a symlink or a file is never removed.
+fn remove_orphaned_segment_caches(plugins_dir: &Path, installed: &[Uuid]) {
+    let entries = match std::fs::read_dir(plugins_dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return,
+        Err(error) => {
+            warn!(
+                dir = %plugins_dir.display(),
+                %error,
+                "cannot list the wasm plugins directory; the segment caches of plugins not installed stay"
+            );
+            return;
+        }
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(id) = name
+            .to_str()
+            .and_then(|name| name.strip_suffix(".segments"))
+            .and_then(|stem| {
+                Uuid::try_parse(stem)
+                    .ok()
+                    .filter(|id| id.to_string() == stem)
+            })
+        else {
+            continue;
+        };
+        if installed.contains(&id) || !entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+            continue;
+        }
+        let path = entry.path();
+        match std::fs::remove_dir_all(&path) {
+            Ok(()) => info!(
+                plugin_id = %id,
+                path = %path.display(),
+                "removed the segment cache of a wasm plugin that is not installed"
+            ),
+            // Another server on this data directory removed it first.
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => warn!(
+                plugin_id = %id,
+                path = %path.display(),
+                %error,
+                "could not remove the segment cache of a wasm plugin that is not installed; installed again, it serves the segments it wrote before"
+            ),
+        }
+    }
 }
 
 /// Empty directories and incomplete atomic temp files do not prove a producer role.
@@ -1051,6 +1137,7 @@ fn build_runtime_parts(
     {
         let engine = engine.weak();
         std::thread::Builder::new()
+            // tests/idle_host.rs finds the ticker by this name.
             .name("wasm-epoch-ticker".to_owned())
             .spawn(move || {
                 loop {
@@ -1242,8 +1329,6 @@ pub const PLUGIN_ABI: &str = "ferrofin:plugin@0.5.0";
 /// artifact is **network-mute** while being validated — a malicious
 /// component cannot phone home from its `descriptor` export.
 pub struct WasmArtifactValidator {
-    engine: Engine,
-    linker: Arc<Linker<HostState>>,
     /// Built lazily on the first validation's blocking thread —
     /// `reqwest::blocking::Client` construction panics in async contexts,
     /// and `new()` is called from the (async) composition root.
@@ -1252,20 +1337,17 @@ pub struct WasmArtifactValidator {
 }
 
 impl WasmArtifactValidator {
-    /// Builds a validator with its own engine (same construction as the
-    /// plugin host, via the shared builder). Safe to call from async
-    /// contexts — the blocking HTTP client is deferred to first use.
-    ///
-    /// # Errors
-    /// Engine/linker construction failure (a wasmtime misconfiguration).
-    pub fn new(settings: &WasmSettings) -> Result<Self, ServiceError> {
-        let (engine, linker) = build_runtime_parts(settings)?;
-        Ok(Self {
-            engine,
-            linker,
+    /// Builds a validator that holds nothing until it is used: each
+    /// validation builds its own engine (the plugin host's construction, via
+    /// the shared builder) and drops it after, and the blocking HTTP client is
+    /// built on the first validation's thread. Safe to call from async
+    /// contexts.
+    #[must_use]
+    pub fn new(settings: &WasmSettings) -> Self {
+        Self {
             http: Arc::new(std::sync::OnceLock::new()),
             settings: settings.clone(),
-        })
+        }
     }
 }
 
@@ -1279,8 +1361,6 @@ impl ferrofin_traits::plugins::PluginArtifactValidator for WasmArtifactValidator
         &self,
         bytes: &[u8],
     ) -> Result<ferrofin_traits::plugins::ValidatedArtifact, ServiceError> {
-        let engine = self.engine.clone();
-        let linker = Arc::clone(&self.linker);
         let http_cell = Arc::clone(&self.http);
         let settings = self.settings.clone();
         let bytes = bytes.to_vec();
@@ -1293,9 +1373,7 @@ impl ferrofin_traits::plugins::PluginArtifactValidator for WasmArtifactValidator
             let grace = settings.call_grace_secs;
             runtime::run_watched(&watch, {
                 let watch = Arc::clone(&watch);
-                move || {
-                    validate_on_this_thread(&engine, linker, &http_cell, &settings, &bytes, watch)
-                }
+                move || validate_on_this_thread(&http_cell, &settings, &bytes, watch)
             })
             .unwrap_or_else(|why| match why {
                 runtime::Unwatched::Lost => {
@@ -1325,13 +1403,13 @@ impl ferrofin_traits::plugins::PluginArtifactValidator for WasmArtifactValidator
 /// [`WasmArtifactValidator::validate`]'s work, on the thread
 /// [`runtime::run_watched`] gives it.
 fn validate_on_this_thread(
-    engine: &Engine,
-    linker: Arc<Linker<HostState>>,
     http_cell: &std::sync::OnceLock<Arc<capabilities::GuestHttp>>,
     settings: &WasmSettings,
     bytes: &[u8],
     watch: Arc<runtime::CallWatch>,
 ) -> Result<ferrofin_traits::plugins::ValidatedArtifact, ServiceError> {
+    // Dropped when this returns, which ends its epoch-ticker thread.
+    let (engine, linker) = build_runtime_parts(settings)?;
     // Blocking thread: safe place to build the blocking client.
     let http = if let Some(client) = http_cell.get() {
         Arc::clone(client)
@@ -1340,13 +1418,13 @@ fn validate_on_this_thread(
         let _ = http_cell.set(Arc::clone(&client));
         client
     };
-    let component = Component::new(engine, bytes).map_err(|e| {
+    let component = Component::new(&engine, bytes).map_err(|e| {
         ServiceError::invalid_input(format!(
             "artifact is not a valid WebAssembly component for {PLUGIN_ABI}: {e:#}"
         ))
     })?;
     let spec = InstanceSpec {
-        engine: engine.clone(),
+        engine,
         component,
         linker,
         plugin_name: "install-validation".to_owned(),

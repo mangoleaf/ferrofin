@@ -8,13 +8,13 @@
 
 use std::path::{Path, PathBuf};
 
-use chrono::{DateTime, Utc};
 use ferrofin_db::store::guid_to_db;
 use ferrofin_model::entities::ImageType;
-use ferrofin_traits::options::ItemImageInfo;
+use ferrofin_traits::options::{ItemImageInfo, file_date_modified};
 use uuid::Uuid;
 
 use crate::container_types::LocalImageInfo;
+use crate::image_save::BesideArt;
 
 /// Image rows for images a local provider found, dated by their files.
 ///
@@ -127,22 +127,6 @@ fn refresh_found(current: &mut ItemImageInfo, new: &ItemImageInfo) -> bool {
     false
 }
 
-/// The image file's mtime as UTC, falling back to [`Utc::now`] when the stat
-/// fails. Port of Jellyfin's `IFileSystem.GetLastWriteTimeUtc`, which stamps
-/// `ItemImageInfo.DateModified`.
-///
-/// This MUST be the file's mtime, not the scan time: `date_modified` feeds both
-/// the client-facing `ImageTags` (`md5(path + ticks)`) and the resized-image
-/// cache key. A rescan of an unchanged file has to reproduce the same timestamp,
-/// or every scan changes every poster URL (busting the clients' year-long
-/// immutable image caches) and invalidates the entire server-side resize cache.
-#[must_use]
-pub fn file_date_modified(path: &Path) -> DateTime<Utc> {
-    std::fs::metadata(path)
-        .and_then(|m| m.modified())
-        .map_or_else(|_| Utc::now(), DateTime::<Utc>::from)
-}
-
 /// An item's own art folders under the metadata `root`: Ferrofin's
 /// `{root}/{ID}` ([`own_art_dir`]), the [`legacy_art_dir`] older scans wrote
 /// some art to, and the `{root}/{xx}/{id:N}` folder Jellyfin's
@@ -180,14 +164,17 @@ pub fn legacy_art_dir(root: &Path, item_id: Uuid) -> PathBuf {
 /// `folders` ([`internal_metadata_dirs`]) — the first image of each singular
 /// type (`_singularImages`, `:42-53`) and every backdrop — are taken out of
 /// `images` and their files deleted (`PruneImages`), so the refresh supplies
-/// them afresh. Screenshots, chapter images, a second image of a singular
-/// type and anything stored outside those folders stay. Returns whether any
-/// image was removed.
-///
-/// TODO(gl-1741): open work item: upstream also removes them wherever they
-/// are stored when `IsSaveLocalMetadataEnabled()` (art saved beside the item
-/// or its media); that arm is not ported yet.
-pub fn remove_images(images: &mut Vec<ItemImageInfo>, folders: &[PathBuf], item_id: &str) -> bool {
+/// them afresh. Screenshots, chapter images and a second image of a singular
+/// type always stay. One stored outside those folders stays too, unless the
+/// item's art is saved `beside` it (`item.IsSaveLocalMetadataEnabled()`) and
+/// [`BesideArt::removes`] takes it: a remote one's row goes without a file to
+/// delete. Returns whether any image was removed.
+pub fn remove_images(
+    images: &mut Vec<ItemImageInfo>,
+    folders: &[PathBuf],
+    item_id: &str,
+    beside: Option<&BesideArt>,
+) -> bool {
     let before = images.len();
     let mut seen: Vec<ImageType> = Vec::new();
     images.retain(|image| {
@@ -210,8 +197,13 @@ pub fn remove_images(images: &mut Vec<ItemImageInfo>, folders: &[PathBuf], item_
             seen.push(image.image_type);
         }
         let path = Path::new(&image.path);
-        if !removable || !folders.iter().any(|folder| path.starts_with(folder)) {
+        let own = folders.iter().any(|folder| path.starts_with(folder));
+        if !removable || !(own || beside.is_some_and(|beside| beside.removes(image))) {
             return true;
+        }
+        // A remote image: the row goes, there is no file (`PruneImages`).
+        if !image.is_local_file() {
+            return false;
         }
         match std::fs::remove_file(path) {
             // Two image types can share one file.

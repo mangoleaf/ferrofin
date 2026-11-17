@@ -1311,6 +1311,28 @@ async fn the_manager_reports_the_restart_flag_and_answers_not_found_while_disabl
     );
 }
 
+/// gl-1792: a restart request no longer raises the pending flag, so the report
+/// says pending while the server drains; the page's restart wait would
+/// otherwise take the draining server for the restarted one.
+#[tokio::test]
+async fn the_report_shows_the_restart_pending_while_the_server_shuts_down() {
+    let data = DataDir::new(&[]);
+    let (shutdown, _rx) = tokio::sync::oneshot::channel();
+    let lifecycle = Arc::new(crate::state::FerrofinLifecycleController::new(shutdown));
+    let env = FakeEnv::new();
+    let manager = FerrofinServerSettings::new(
+        load(data.cli(), &env),
+        lifecycle.clone(),
+        plugins(data.path()),
+        FakeConfiguration::new(ServerConfiguration::default()),
+    )
+    .with_env(env);
+
+    lifecycle.stop(true).await.expect("restart");
+    assert!(!lifecycle.has_pending_restart());
+    assert!(manager.snapshot().await.expect("report").restart_pending);
+}
+
 /// The statement cache row shows the default the database applies when the
 /// setting is unset.
 #[test]

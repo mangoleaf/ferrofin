@@ -28,9 +28,7 @@ pub mod transcoding;
 
 pub use error::MediaEncodingError;
 
-pub use attachments::{
-    AttachmentExtractorImpl, AttachmentIo, MediaSourceResolver, NoopAttachmentIo,
-};
+pub use attachments::{AttachmentExtractorImpl, AttachmentIo, MediaSourceResolver};
 pub use configuration::{
     DirChecker, EncodingConfigurationStore, EncodingOptionsReader, RealDirChecker,
 };
@@ -49,7 +47,7 @@ pub use encoding_helper::{
 pub use subtitles::{SubtitleEncoder, SubtitleEncoderImpl, SubtitleIo};
 pub use transcoding::{
     FakeScript, FakeSegmentTranscoder, FakeTranscodeChild, FileCleaner, FsFileCleaner,
-    HLS_PING_TIMEOUT_MS, NoopSessionReporter, PROGRESSIVE_PING_TIMEOUT_MS,
+    HLS_PING_TIMEOUT_MS, NoopSessionReporter, PROGRESSIVE_PING_TIMEOUT_MS, PartialFilesError,
     SEGMENT_READY_POLL_INTERVAL_MS, SegmentTranscoder, SessionReporter, SpawnRequest,
     TokioSegmentTranscoder, TranscodeChild, TranscodeManagerImpl, WAIT_FOR_FILE_TIMEOUT_MS,
 };
