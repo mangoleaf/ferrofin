@@ -45,7 +45,7 @@ use uuid::Uuid;
 
 use crate::item_type_lookup::stored_type_name;
 use crate::text_util::get_clean_value;
-use ferrofin_traits::options::InternalItemsQuery;
+use ferrofin_traits::options::{DescendantQueryRoots, InternalItemsQuery};
 
 /// The placeholder item id seeded by the initial migration; every real query
 /// excludes it (C# `PlaceholderId`).
@@ -931,13 +931,7 @@ pub(crate) fn append_predicates(qb: &mut QueryBuilder<Sqlite>, filter: &Internal
     }
 
     if let Some(term) = non_blank(filter.search_term.as_ref()) {
-        let like = format!("%{}%", get_clean_value(term).trim_matches('%'));
-        let orig_like = format!("%{}%", lower_invariant(term));
-        qb.push(r#" AND (bi."CleanName" LIKE "#)
-            .push_bind(like)
-            .push(r#" OR (bi."OriginalTitle" IS NOT NULL AND ferrofin_lower_invariant(bi."OriginalTitle") LIKE "#)
-            .push_bind(orig_like)
-            .push("))");
+        push_search_term(qb, term);
     }
 
     if let Some(is_folder) = filter.is_folder {
@@ -1313,6 +1307,39 @@ pub(crate) fn append_predicates(qb: &mut QueryBuilder<Sqlite>, filter: &Internal
     }
 }
 
+/// `DescendantQueryHelper`'s descendant set as a sub-select of ids, split at
+/// its three binds: the closure roots' JSON id array, the link roots' JSON id
+/// array, then the parent itself, which the set leaves out. The ids under the
+/// closure roots (two `AncestorIds` levels) and the link roots' linked
+/// children. The browse ([`append_linked_descendant_predicate`]) and the Next
+/// Up keys statement (`next_up_service::next_up_series_keys_sql`) share it.
+pub(crate) const LINKED_DESCENDANT_IDS: [&str; 3] = [
+    r#"WITH
+        closure_roots("Id") AS (SELECT value FROM json_each("#,
+    r#")), link_roots("Id") AS (SELECT value FROM json_each("#,
+    r#")), closure_direct("Id") AS (
+            SELECT a."ItemId" FROM "AncestorIds" a
+            JOIN closure_roots root ON root."Id" = a."ParentItemId"
+        ), all_descendants("Id") AS (
+            SELECT "Id" FROM closure_direct
+            UNION
+            SELECT a."ItemId" FROM "AncestorIds" a
+            JOIN closure_direct d ON d."Id" = a."ParentItemId"
+            UNION
+            SELECT link."ChildId" FROM "LinkedChildren" link
+            JOIN link_roots root ON root."Id" = link."ParentId"
+        ) SELECT "Id" FROM all_descendants WHERE "Id" <> "#,
+];
+
+/// The binds of [`LINKED_DESCENDANT_IDS`], in order.
+pub(crate) fn linked_descendant_binds(roots: &DescendantQueryRoots) -> [String; 3] {
+    [
+        serde_json::json!(to_guid_strings(&roots.closure_roots)).to_string(),
+        serde_json::json!(to_guid_strings(&roots.link_roots)).to_string(),
+        guid_to_db(roots.parent_id),
+    ]
+}
+
 /// Composes the resolved closure and linked membership with every outer filter.
 /// The repository loads only root folders; leaf IDs stay in this sub-select,
 /// and the same resolved query supplies count, sort and page statements.
@@ -1331,29 +1358,14 @@ fn append_linked_descendant_predicate(
         qb.push(" AND 0 = 1");
         return;
     };
-    qb.push(
-        r#" AND bi."Id" IN (WITH
-        closure_roots("Id") AS (SELECT value FROM json_each("#,
-    )
-    .push_bind(serde_json::json!(to_guid_strings(&roots.closure_roots)).to_string())
-    .push(r#")), link_roots("Id") AS (SELECT value FROM json_each("#)
-    .push_bind(serde_json::json!(to_guid_strings(&roots.link_roots)).to_string())
-    .push(
-        r#")), closure_direct("Id") AS (
-            SELECT a."ItemId" FROM "AncestorIds" a
-            JOIN closure_roots root ON root."Id" = a."ParentItemId"
-        ), all_descendants("Id") AS (
-            SELECT "Id" FROM closure_direct
-            UNION
-            SELECT a."ItemId" FROM "AncestorIds" a
-            JOIN closure_direct d ON d."Id" = a."ParentItemId"
-            UNION
-            SELECT link."ChildId" FROM "LinkedChildren" link
-            JOIN link_roots root ON root."Id" = link."ParentId"
-        ) SELECT "Id" FROM all_descendants WHERE "Id" <> "#,
-    )
-    .push_bind(guid_to_db(parent))
-    .push(")");
+    qb.push(r#" AND bi."Id" IN ("#);
+    for (sql, bind) in LINKED_DESCENDANT_IDS
+        .iter()
+        .zip(linked_descendant_binds(roots))
+    {
+        qb.push(*sql).push_bind(bind);
+    }
+    qb.push(")");
 }
 
 /// Pushes v12 `VersionsMatchingDimension` (`TranslateQuery.cs:73-79`): the
@@ -1703,6 +1715,27 @@ fn append_name_predicates(
     if filter.collapse_box_set_items != Some(true) {
         append_name_ranges(qb, filter);
     }
+}
+
+/// v12.4 `TranslateQuery`'s `SearchTerm` predicate, which a browse
+/// ([`append_predicates`]) and a by-name list's outer query
+/// (`item_repository::append_by_name_filters`, `GetItemValues`) both run
+/// (gl-957): `CleanName` contains the cleaned term, or `OriginalTitle` is
+/// `LIKE '%term%'`.
+///
+/// Upstream's wildcard branch is unreachable: it tests the cleaned term for a
+/// `SearchWildcardTerms` character (`% _ [ ] ^`), and `GetCleanValue` turns
+/// every one of them into a space. So the cleaned term holds no `LIKE`
+/// wildcard, and its `LIKE` is the literal contains upstream's `Contains` is
+/// (both sides lower-cased). The `OriginalTitle` side lower-cases both sides
+/// (Unicode), where upstream's SQLite `LIKE` folds ASCII case only; that
+/// difference is kept and recorded in the divergence lists.
+pub(crate) fn push_search_term(qb: &mut QueryBuilder<Sqlite>, term: &str) {
+    qb.push(r#" AND (bi."CleanName" LIKE "#)
+        .push_bind(format!("%{}%", get_clean_value(term)))
+        .push(r#" OR (bi."OriginalTitle" IS NOT NULL AND ferrofin_lower_invariant(bi."OriginalTitle") LIKE "#)
+        .push_bind(format!("%{}%", lower_invariant(term)))
+        .push("))");
 }
 
 /// The three letter-range filters run on the substituted BoxSet row in a

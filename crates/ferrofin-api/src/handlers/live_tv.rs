@@ -54,11 +54,13 @@ use crate::auth::{RequireAdmin, RequireLiveTvAccess, RequireLiveTvManagement};
 use crate::error::ApiError;
 use crate::extract::{
     DotnetGuid, JsonBody, ProblemDetails, Query, RequiredRouteString, RouteParameter,
+    blank_complaint, route_container_complaint, validation_failure,
 };
 use crate::handlers::items::{require_visible_item, resolve_user_opt};
 use crate::handlers::query_parse::{
     get_order_by, parse_csv_enums_lenient, parse_csv_uuids, parse_order_by, parse_pipe_strings,
 };
+use crate::handlers::streaming::stream_route_container;
 use crate::state::AppState;
 
 /// `GET /LiveTv/Info` — top-level Live TV status.
@@ -455,8 +457,15 @@ struct GetProgramsDto {
     /// Additional DTO fields.
     #[serde(deserialize_with = "ferrofin_model::json::delimited::comma_option")]
     fields: Option<Vec<ItemFields>>,
-    /// Whether the total record count is computed (schema default `true`).
-    #[serde(deserialize_with = "ferrofin_model::json::value::nullable")]
+    /// Whether the total record count is computed. C#'s non-nullable
+    /// `bool EnableTotalRecordCount = true`: absent is `true`, and `null` fails
+    /// the bind (`400`).
+    // The test-only `Serialize` feeds `contract_numbers::check_model`, which
+    // binds the serialized default again: a `null` there would now fail.
+    #[serde(
+        deserialize_with = "ferrofin_model::json::value::non_nullable",
+        skip_serializing_if = "Option::is_none"
+    )]
     enable_total_record_count: Option<bool>,
 }
 
@@ -1598,25 +1607,6 @@ pub(crate) fn progressive_response(
         .unwrap_or_else(|_| Response::new(Body::empty()))
 }
 
-/// The container extension of a `stream.{container}` route segment, validated
-/// the way upstream's `[RegularExpression(ContainerValidationRegexStr)]` does.
-fn route_container(segment: &str) -> Option<&str> {
-    let container = segment.rsplit_once('.').map_or(segment, |(_, ext)| ext);
-    // `^[a-zA-Z0-9\-\._,|]{0,40}$` — empty is allowed, as it is upstream.
-    let valid = container.len() <= 40
-        && container
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_' | b',' | b'|'));
-    valid.then_some(container)
-}
-
-/// `{streamId}`, the `[FromRoute, Required] string` of `GetLiveStreamFile`.
-struct StreamId;
-
-impl RouteParameter for StreamId {
-    const NAME: &'static str = "streamId";
-}
-
 /// `GET /LiveTv/LiveStreamFiles/{streamId}/stream.{container}` — the buffered
 /// live-stream file.
 ///
@@ -1630,14 +1620,24 @@ impl RouteParameter for StreamId {
 /// the server's own ffmpeg reads this URL without a token. It exposes only a
 /// live stream a caller already opened, and the unique id is an unguessable
 /// per-open GUID.
+///
+/// Its `[FromRoute, Required] string streamId` and its `container`
+/// ([`route_container_complaint`]) are bound first, and every failure is named
+/// in one `400`; a segment without the `stream.` literal is no match for the
+/// route, a `404`.
 async fn get_live_stream_file(
     State(state): State<AppState>,
-    RequiredRouteString(stream_id, _): RequiredRouteString<StreamId>,
-    Path((_, container)): Path<(String, String)>,
+    Path((stream_id, segment)): Path<(String, String)>,
 ) -> Result<Response, ApiError> {
-    let Some(container) = route_container(&container) else {
-        return Err(ApiError::NotFound("live stream file".into()));
-    };
+    let container = stream_route_container(&segment)
+        .ok_or_else(|| ApiError::NotFound("live stream file".into()))?;
+    if let Some(rejection) = validation_failure(
+        blank_complaint("streamId", &stream_id)
+            .into_iter()
+            .chain(route_container_complaint(container)),
+    ) {
+        return Ok(rejection);
+    }
     live_stream_buffer(&state, &stream_id, &format!("file.{container}")).await
 }
 
@@ -1724,7 +1724,8 @@ impl SetChannelMappingDto {
 /// returns that tuner channel's recomputed
 /// [`TunerChannelMapping`](ferrofin_model::live_tv::TunerChannelMapping).
 /// `400` when an id is missing or blank, `404` when the provider id or the
-/// tuner channel id names nothing.
+/// tuner channel id names nothing, or, after the pair is stored, when a local
+/// XMLTV guide file is not there and no copy is cached.
 async fn set_channel_mapping(
     State(state): State<AppState>,
     RequireAdmin(_auth): RequireAdmin,
@@ -2101,7 +2102,8 @@ struct ChannelMappingOptionsQuery {
 /// Port of `LiveTvController.GetChannelMappingOptions` →
 /// `ListingsManager.GetChannelMappingOptions`. `404` when `providerId` is
 /// absent or names no configured provider (upstream's unguarded `.First(...)`
-/// throws there, which the middleware turns into a 500).
+/// throws there, which the middleware turns into a 500), or when a local XMLTV
+/// guide file is not there and no copy is cached (`FileNotFoundException`).
 async fn get_channel_mapping_options(
     State(state): State<AppState>,
     RequireAdmin(_auth): RequireAdmin,
@@ -2144,7 +2146,8 @@ struct LineupsQuery {
 ///
 /// Port of `LiveTvController.GetLineups` → `ListingsManager.GetLineups`. `404`
 /// when the provider cannot be resolved, which is what the C#
-/// `ResourceNotFoundException` maps to.
+/// `ResourceNotFoundException` maps to, or when a local XMLTV guide file is not
+/// there and no copy is cached (`FileNotFoundException`).
 ///
 /// `[Authorize(Policy = Policies.LiveTvAccess)]` upstream
 /// (`LiveTvController.cs:1075` @ v10.11.8), and [`RequireLiveTvAccess`] is the
@@ -2787,7 +2790,6 @@ mod tests {
         // anonymous and reports only "no such stream".
         let file = get_live_stream_file(
             State(fake_state()),
-            RequiredRouteString("s1".into(), std::marker::PhantomData),
             Path(("s1".into(), "stream.mp4".into())),
         )
         .await
@@ -2795,28 +2797,10 @@ mod tests {
         assert_eq!(file.status(), axum::http::StatusCode::NOT_FOUND);
         // A manager with nothing open says the same.
         let state = fake_state().with_live_tv(std::sync::Arc::new(FakeLiveTv::default()));
-        let file = get_live_stream_file(
-            State(state),
-            RequiredRouteString("s1".into(), std::marker::PhantomData),
-            Path(("s1".into(), "stream.ts".into())),
-        )
-        .await
-        .unwrap_err();
+        let file = get_live_stream_file(State(state), Path(("s1".into(), "stream.ts".into())))
+            .await
+            .unwrap_err();
         assert_eq!(file.status(), axum::http::StatusCode::NOT_FOUND);
-    }
-
-    #[test]
-    fn the_route_container_is_the_validated_extension() {
-        assert_eq!(route_container("stream.ts"), Some("ts"));
-        assert_eq!(route_container("stream.mp4"), Some("mp4"));
-        // No dot: the whole segment is the container, as upstream's route would
-        // have bound it.
-        assert_eq!(route_container("ts"), Some("ts"));
-        // Upstream's regex is `{0,40}`, so an empty container is legal (and
-        // simply has no known MIME type).
-        assert_eq!(route_container("stream."), Some(""));
-        assert_eq!(route_container("stream.a/b"), None);
-        assert_eq!(route_container(&format!("stream.{}", "x".repeat(41))), None);
     }
 
     /// The first chunk a progressive body yields. Only the first: the body is
@@ -2851,7 +2835,6 @@ mod tests {
 
         let response = get_live_stream_file(
             State(state),
-            RequiredRouteString("uid-1".to_owned(), std::marker::PhantomData),
             Path(("uid-1".to_owned(), "stream.ts".to_owned())),
         )
         .await
@@ -2897,7 +2880,6 @@ mod tests {
 
         let response = get_live_stream_file(
             State(state),
-            RequiredRouteString("uid-1".to_owned(), std::marker::PhantomData),
             Path(("uid-1".to_owned(), "stream.ts".to_owned())),
         )
         .await
@@ -3006,7 +2988,6 @@ mod tests {
     #[derive(Default)]
     struct FakeLiveTv {
         providers: std::sync::Mutex<Vec<ListingsProviderInfo>>,
-        recording_path: Option<String>,
         /// The one open live stream, keyed by its unique id.
         live_stream: Option<(String, ferrofin_traits::stubs::LiveStreamFile)>,
         programs_query: std::sync::Mutex<Option<InternalItemsQuery>>,
@@ -3082,12 +3063,6 @@ mod tests {
             let mut g = self.providers.lock().unwrap();
             *g = vec![info.clone()];
             Ok(info)
-        }
-        async fn get_recording_path(
-            &self,
-            _id: Uuid,
-        ) -> Result<Option<String>, ferrofin_traits::error::ServiceError> {
-            Ok(self.recording_path.clone())
         }
         async fn get_live_stream_file(
             &self,
@@ -3803,6 +3778,56 @@ mod tests {
         let state = fake_state().with_live_tv(std::sync::Arc::new(FakeLiveTv::default()));
         let err = get_programs(State(state), auth(), query).await.unwrap_err();
         assert_eq!(err.status(), axum::http::StatusCode::BAD_REQUEST);
+    }
+
+    /// `GetProgramsDto.EnableTotalRecordCount` is C#'s non-nullable
+    /// `bool EnableTotalRecordCount = true`, bound by the body's JSON options
+    /// with no `bool` converter: absent counts, `false` turns the count off,
+    /// and `null`, `""` or a quoted `"true"` fails the bind with a 400 naming
+    /// the member, which never reaches the guide.
+    #[rstest::rstest]
+    #[case::absent(r"{}", Some(true))]
+    #[case::true_(r#"{"EnableTotalRecordCount":true}"#, Some(true))]
+    #[case::false_(r#"{"EnableTotalRecordCount":false}"#, Some(false))]
+    #[case::null(r#"{"EnableTotalRecordCount":null}"#, None)]
+    #[case::empty(r#"{"EnableTotalRecordCount":""}"#, None)]
+    #[case::quoted(r#"{"EnableTotalRecordCount":"true"}"#, None)]
+    #[tokio::test]
+    async fn post_programs_binds_enable_total_record_count_as_a_bool(
+        #[case] body: &'static str,
+        #[case] counted: Option<bool>,
+    ) {
+        use tower::ServiceExt;
+
+        let fake = std::sync::Arc::new(FakeLiveTv::default());
+        let state = crate::test_support::elevated_fake_state().with_live_tv(fake.clone());
+        let response = crate::create_router(state)
+            .oneshot(
+                axum::http::Request::post("/LiveTv/Programs")
+                    .header(axum::http::header::CONTENT_TYPE, "application/json")
+                    .body(axum::body::Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let text = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let text = String::from_utf8_lossy(&text);
+        let asked = fake.programs_query.lock().unwrap().clone();
+        if counted.is_some() {
+            assert_eq!(status, axum::http::StatusCode::OK, "{body}: {text}");
+        } else {
+            assert_eq!(status, axum::http::StatusCode::BAD_REQUEST, "{body}");
+            assert!(text.contains("$.EnableTotalRecordCount"), "{body}: {text}");
+        }
+        // A refused body never reaches the guide.
+        assert_eq!(
+            asked.map(|query| query.enable_total_record_count),
+            counted,
+            "{body}"
+        );
     }
 
     #[tokio::test]

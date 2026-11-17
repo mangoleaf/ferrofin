@@ -60,18 +60,29 @@ const SERIES_ID: Uuid = Uuid::from_u128(0x00B5_0002);
 /// which [`OneItemLibrary`] can run and await but not queue, so queueing it
 /// fails.
 const FILED_ITEM_ID: Uuid = Uuid::from_u128(0x00B5_0003);
-/// [`FILED_ITEM_ID`]'s file: the refresh a subtitle delete awaits is its
-/// path's scan.
+/// [`FILED_ITEM_ID`]'s file: the refresh a subtitle delete awaits is of it.
 const FILED_ITEM_PATH: &str = "/media/Film.mkv";
+/// Movies without a file, one per test that hangs up on a subtitle write, so
+/// each test's refresh check reads only its own item's refreshes.
+const DOWNLOAD_HANGUP_ID: Uuid = Uuid::from_u128(0x00B5_0004);
+/// See [`DOWNLOAD_HANGUP_ID`].
+const UPLOAD_HANGUP_ID: Uuid = Uuid::from_u128(0x00B5_0005);
 
 // ---- Fakes -----------------------------------------------------------------
 
 /// The refreshes [`OneItemLibrary`] ran for a caller that awaited them
-/// (`run_refresh_scan`), as debug-printed targets.
+/// (`refresh_item_metadata`), as the items' paths.
 static AWAITED_REFRESHES: Mutex<Vec<String>> = Mutex::new(Vec::new());
 
-/// A library where only [`ITEM_ID`] and [`FILED_ITEM_ID`] (Movies) and
-/// [`SERIES_ID`] exist.
+/// The culture each of [`AWAITED_REFRESHES`] ran under.
+static AWAITED_REFRESH_CULTURES: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+/// The ids of the items [`OneItemLibrary`] queued a refresh for
+/// (`queue_item_refresh`).
+static QUEUED_REFRESHES: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+/// A library where only [`ITEM_ID`], [`FILED_ITEM_ID`], [`DOWNLOAD_HANGUP_ID`]
+/// and [`UPLOAD_HANGUP_ID`] (Movies) and [`SERIES_ID`] exist.
 struct OneItemLibrary;
 
 #[async_trait]
@@ -93,7 +104,9 @@ impl LibraryManager for OneItemLibrary {
 
     async fn get_item_by_id(&self, id: Uuid) -> Result<Option<BaseItemEntity>, ServiceError> {
         Ok(match id {
-            ITEM_ID => Some(minimal_base_item(id, "The Item", "Movie")),
+            ITEM_ID | DOWNLOAD_HANGUP_ID | UPLOAD_HANGUP_ID => {
+                Some(minimal_base_item(id, "The Item", "Movie"))
+            }
             SERIES_ID => Some(minimal_base_item(id, "The Show", "Series")),
             FILED_ITEM_ID => Some(BaseItemEntity {
                 path: Some(FILED_ITEM_PATH.to_owned()),
@@ -103,15 +116,34 @@ impl LibraryManager for OneItemLibrary {
             _ => None,
         })
     }
-    async fn run_refresh_scan(
+    async fn queue_item_refresh(
         &self,
-        target: ferrofin_traits::library::ScanTarget,
+        item: &BaseItemEntity,
+        _options: &ferrofin_traits::providers::MetadataRefreshOptions,
+    ) -> Result<(), ServiceError> {
+        // A file's queued refresh is the library scan's, which this library
+        // has none of.
+        if item.path.is_some() {
+            return Err(ServiceError::backend(
+                "queue_item_refresh needs a library scanner",
+            ));
+        }
+        QUEUED_REFRESHES.lock().unwrap().push(item.id.clone());
+        Ok(())
+    }
+    async fn refresh_item_metadata(
+        &self,
+        item: &BaseItemEntity,
         _options: &ferrofin_traits::providers::MetadataRefreshOptions,
     ) -> Result<bool, ServiceError> {
         AWAITED_REFRESHES
             .lock()
             .unwrap()
-            .push(format!("{target:?}"));
+            .push(item.path.clone().unwrap_or_default());
+        AWAITED_REFRESH_CULTURES
+            .lock()
+            .unwrap()
+            .push(ferrofin_util::current_culture::capture());
         Ok(true)
     }
     async fn query_items(
@@ -390,6 +422,28 @@ struct CannedSubtitles {
     uploads: Arc<Mutex<Vec<usize>>>,
     /// Whether a remote download succeeds; it fails by default.
     download_succeeds: bool,
+    /// When set, a download or an upload signals it has started, waits to be
+    /// released, then succeeds and records itself.
+    gate: Option<Arc<WriteGate>>,
+}
+
+/// Holds a [`CannedSubtitles`] write until the test releases it.
+#[derive(Default)]
+struct WriteGate {
+    started: tokio::sync::Notify,
+    release: tokio::sync::Notify,
+    /// Whether the released download fails instead of succeeding.
+    download_fails: bool,
+    /// The writes that finished.
+    finished: Mutex<Vec<&'static str>>,
+}
+
+impl WriteGate {
+    async fn write(&self, name: &'static str) {
+        self.started.notify_one();
+        self.release.notified().await;
+        self.finished.lock().unwrap().push(name);
+    }
 }
 
 #[async_trait]
@@ -405,6 +459,13 @@ impl SubtitleManager for CannedSubtitles {
         _item_id: Uuid,
         _subtitle_id: &str,
     ) -> Result<(), ServiceError> {
+        if let Some(gate) = &self.gate {
+            gate.write("download").await;
+            if gate.download_fails {
+                return Err(ServiceError::backend("the provider went away"));
+            }
+            return Ok(());
+        }
         if self.download_succeeds {
             return Ok(());
         }
@@ -415,6 +476,10 @@ impl SubtitleManager for CannedSubtitles {
         _item_id: Uuid,
         response: &SubtitleResponse,
     ) -> Result<(), ServiceError> {
+        if let Some(gate) = &self.gate {
+            gate.write("upload").await;
+            return Ok(());
+        }
         self.uploads.lock().unwrap().push(response.content.len());
         Err(ServiceError::invalid_input("no providers"))
     }
@@ -744,6 +809,29 @@ async fn delete_subtitle_awaits_the_items_refresh_before_204() {
     );
 }
 
+/// The delete and the refresh it awaits run under the request's culture, as
+/// upstream's awaited `DeleteSubtitles` does, so the refresh's NFO save orders
+/// names as the request asked, not as the system locale would (gl-1808).
+#[tokio::test]
+async fn delete_subtitle_refreshes_under_the_requests_culture() {
+    let app = admin_state(Arc::new(CannedSubtitles::default()))
+        // A culture no CI host runs under, so the system locale cannot pass.
+        .with_request_culture("sv")
+        .expect("culture");
+    let (status, body, _) = call_method(
+        app,
+        "DELETE",
+        &format!("/Videos/{FILED_ITEM_ID}/Subtitles/3"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{body:?}");
+    let cultures = AWAITED_REFRESH_CULTURES.lock().unwrap();
+    assert!(
+        cultures.iter().any(|culture| culture == "sv"),
+        "{cultures:?}"
+    );
+}
+
 /// gl-846: an index with no subtitle file (none at all, or an embedded
 /// stream's) is the `ArgumentException` `DeleteSubtitles` throws, and a nil id
 /// the one `GetItemById` throws: `ExceptionMiddleware` answers both `400`. A
@@ -1026,6 +1114,128 @@ async fn a_failed_remote_download_or_refresh_is_logged_and_still_answers_204() {
     }
 }
 
+/// A client that hangs up during a subtitle download or upload does not stop
+/// it: upstream passes `CancellationToken.None` (or no token) and never reads
+/// `RequestAborted`, so the subtitle is saved and the item's refresh queued
+/// (gl-1645).
+#[rstest::rstest]
+#[case::download(
+    DOWNLOAD_HANGUP_ID,
+    "Items",
+    "RemoteSearch/Subtitles/abc_42",
+    "",
+    "download"
+)]
+#[case::upload(
+    UPLOAD_HANGUP_ID,
+    "Videos",
+    "Subtitles",
+    r#"{"Language":"eng","Format":"srt","IsForced":false,"IsHearingImpaired":false,"Data":"aGk="}"#,
+    "upload"
+)]
+#[tokio::test]
+async fn a_subtitle_write_finishes_after_the_client_hangs_up(
+    #[case] item_id: Uuid,
+    #[case] controller: &str,
+    #[case] route: &str,
+    #[case] body: &'static str,
+    #[case] write: &str,
+) {
+    let gate = Arc::new(WriteGate::default());
+    let app = remote_search_state(Arc::new(CannedSubtitles {
+        gate: Some(Arc::clone(&gate)),
+        ..CannedSubtitles::default()
+    }));
+    let request = Request::builder()
+        .method("POST")
+        .uri(format!("/{controller}/{item_id}/{route}"))
+        .header("X-Emby-Token", "tok")
+        .header("Content-Type", "application/json")
+        .body(Body::from(body))
+        .unwrap();
+    let pending = tokio::spawn(create_router(app).oneshot(request));
+    gate.started.notified().await;
+    pending.abort();
+    assert!(
+        pending.await.is_err_and(|e| e.is_cancelled()),
+        "the request was dropped"
+    );
+    gate.release.notify_one();
+    let refreshed = || {
+        QUEUED_REFRESHES
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|id| Uuid::parse_str(id).ok() == Some(item_id))
+    };
+    for _ in 0..200 {
+        if refreshed() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    assert_eq!(*gate.finished.lock().unwrap(), [write]);
+    assert!(refreshed(), "the item's refresh was queued");
+}
+
+/// A download that fails after its client hung up is still logged, once, as
+/// upstream's `catch` logs it (gl-1645): the log is inside the download's task.
+#[tokio::test]
+async fn a_subtitle_download_that_fails_after_the_client_hung_up_is_logged() {
+    let log = CapturedLog::default();
+    let writer = log.clone();
+    let _guard = tracing::subscriber::set_default(
+        tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_writer(move || writer.clone())
+            .finish(),
+    );
+    let gate = Arc::new(WriteGate {
+        download_fails: true,
+        ..WriteGate::default()
+    });
+    let app = remote_search_state(Arc::new(CannedSubtitles {
+        gate: Some(Arc::clone(&gate)),
+        ..CannedSubtitles::default()
+    }));
+    let request = Request::builder()
+        .method("POST")
+        .uri(format!("/Items/{ITEM_ID}/RemoteSearch/Subtitles/abc_42"))
+        .header("X-Emby-Token", "tok")
+        .body(Body::empty())
+        .unwrap();
+    let pending = tokio::spawn(create_router(app).oneshot(request));
+    gate.started.notified().await;
+    pending.abort();
+    assert!(
+        pending.await.is_err_and(|e| e.is_cancelled()),
+        "the request was dropped"
+    );
+    gate.release.notify_one();
+    let errors = || {
+        String::from_utf8(log.0.lock().unwrap().clone())
+            .unwrap()
+            .lines()
+            .filter(|line| line.contains("ERROR") && line.contains("Error downloading subtitles"))
+            .map(str::to_owned)
+            .collect::<Vec<_>>()
+    };
+    for _ in 0..200 {
+        if !errors().is_empty() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    let errors = errors();
+    assert_eq!(errors.len(), 1, "{errors:?}");
+    assert!(
+        errors[0].contains(&format!("item_id={ITEM_ID}"))
+            && errors[0].contains("subtitle_id=\"abc_42\"")
+            && errors[0].contains("the provider went away"),
+        "{errors:?}"
+    );
+}
+
 // ---- OpenSubtitles login validation ----------------------------------------
 
 /// Upstream binds `[FromBody] LoginInfoInput` through the MVC binder, so member
@@ -1061,7 +1271,7 @@ async fn open_subtitles_login_binds_ignoring_case_and_forwards_pascal_case() {
     );
     let logins = subtitles.logins.lock().unwrap().clone();
     assert_eq!(logins.len(), 1);
-    assert_eq!(logins[0].0, "opensubtitles");
+    assert_eq!(logins[0].0, "Open Subtitles");
     let forwarded: serde_json::Value = serde_json::from_slice(&logins[0].1).unwrap();
     assert_eq!(
         forwarded,

@@ -291,14 +291,23 @@ Wired and working, with a documented limitation or lighter verification:
   saves XML metadata into the library (a library whose metadata savers are unset), the
   `<name>.xml` sidecar it writes beside a playlist file hides the file's entries and the
   playlist stays empty; Ferrofin always reads the entries and never that sidecar.
-  `collection.xml` is still not read or written. A collection made in Ferrofin gets
+  A collection made in Ferrofin gets
   Jellyfin's `{data}/collections/<name> [boxset]` folder (ones made before 1.4.0 get it, and the
   id it derives, at the first boot of 1.5.2 or later), and its membership lives in the
   `LinkedChildren` table, as Jellyfin 12 keeps it. A scan of the Collections library stores a box
   set for each such folder that has none and removes the box sets whose folder is gone, as
-  Jellyfin's does; one the boot repair could not give a folder stays. As on Jellyfin 12, a box set
-  stored again from its folder (after the library was removed and made again) comes back empty:
-  its members were only in the database.
+  Jellyfin's does; one the boot repair could not give a folder stays. A box set's
+  `collection.xml` is written into its folder as Jellyfin writes it (on every member added or
+  removed, every metadata edit and every refresh that downloads metadata), and read back when it
+  changes or on a full refresh: its title, overview, locks, display order, ratings, dates,
+  genres, studios, tags, people and provider ids. Its members are read only for a box set
+  outside the data directory, as on Jellyfin 12; in `{data}/collections` the `LinkedChildren`
+  table decides, so, as on Jellyfin 12, a box set stored again from its folder (after the
+  library was removed and made again) gets its title and metadata back but comes back empty.
+  The file is written into a box-set folder inside a media library only when that library saves
+  metadata into its media folders ("Save artwork into media folders"), or by an edit or member
+  change when the file is already there, and a library that lists its metadata savers must list
+  "Emby Xml".
 
 ## Not implemented (by design)
 
@@ -364,7 +373,12 @@ everything under it.
 - **Replace all metadata**: as **Search for missing metadata**, but the NFO's and the
   providers' values replace the item's unlocked values, and an unlocked field none of them
   supplies is cleared. When a provider failed and none answered (none could be reached,
-  say), nothing is cleared: the NFO's values still replace, and the rest stays.
+  say), nothing is cleared: the NFO's values still replace, and the rest stays. With
+  **Replace existing images** ticked, the item's artwork is removed first, so the refresh
+  supplies it afresh: the copies in Ferrofin's metadata folder, and the artwork beside the
+  item where Ferrofin saves it (beside a box set, playlist, genre, person or studio, and in
+  the media folder of a library that saves artwork into media folders, except a home-video
+  library with photos). A file beside the item that it does not list stays.
 
 Locks hold under all three choices. A field unticked under the metadata editor's **Enabled
 Fields** keeps its value. An item with **Lock this item to prevent future metadata

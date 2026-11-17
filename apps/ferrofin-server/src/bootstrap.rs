@@ -113,14 +113,17 @@ impl FfmpegPaths {
 /// the global subscriber can only be set once.
 ///
 /// Output is written to **both** stdout (for `kubectl logs` / journald) and a
-/// daily-rotating file `log_YYYY-MM-DD.log` under `{data_dir}/log` — the same
-/// directory `GET /System/Logs` serves, so server logs appear in the Jellyfin
-/// dashboard log viewer, matching Jellyfin's Serilog file sink. If the log
-/// directory can't be prepared, logging falls back to stdout only.
+/// daily file `log_yyyyMMdd.log` (the local date) under `{data_dir}/log` — the
+/// same directory `GET /System/Logs` serves, so server logs appear in the
+/// Jellyfin dashboard log viewer under the names Jellyfin's Serilog file sink
+/// gives them. If the log directory can't be prepared, logging falls back to
+/// stdout only.
 ///
-/// Old log files are pruned to `LogFileRetentionDays` (read best-effort from
-/// `{config_dir}/system.json`; `0`/negative = keep forever), and the file writer
-/// is non-blocking so slow disk I/O never stalls a request thread.
+/// Old daily files are pruned to `LogFileRetentionDays` files (read
+/// best-effort from `{config_dir}/system.json`; `0`/negative keeps only the
+/// current day's), and the file writer is non-blocking so slow disk I/O never
+/// stalls a request thread: while the disk stalls, it queues
+/// `FILE_LOG_QUEUE_LINES` lines and drops the ones after them.
 ///
 /// Returns the [`WorkerGuard`] for the non-blocking file writer (`None` when no
 /// file sink was created). **The caller must hold it until after the server
@@ -140,33 +143,19 @@ pub fn init_tracing(config: &Config) -> Option<WorkerGuard> {
         .unwrap_or_else(|_| EnvFilter::new("info"));
 
     // Log dir mirrors the composition root's `{data_dir}/log` (state.rs). The
-    // rolling appender needs it to exist up front. Retention prunes old
-    // `log_*.log` files on rotation (the whole feature — no custom pruner).
-    let retention_days = read_retention_days(&config.config_dir);
+    // daily file needs it to exist up front, and prunes the old `log_*.log`
+    // files itself at each new day; a retention of 0 or less keeps only the
+    // current day's file.
+    let keep = usize::try_from(read_retention_days(&config.config_dir)).unwrap_or(0);
     let log_dir = config.data_dir.join("log");
-    let file_appender = std::fs::create_dir_all(&log_dir).ok().and_then(|()| {
-        let mut builder = tracing_appender::rolling::Builder::new()
-            .rotation(tracing_appender::rolling::Rotation::DAILY)
-            .filename_prefix("log")
-            .filename_suffix("log");
-        if let Ok(keep) = usize::try_from(retention_days)
-            && keep > 0
-        {
-            builder = builder.max_log_files(keep);
-        }
-        builder.build(&log_dir).ok()
-    });
+    let file_appender = std::fs::create_dir_all(&log_dir)
+        .ok()
+        .and_then(|()| crate::log_file::DailyLogFile::open(&log_dir, keep).ok());
 
     // Non-blocking file writer: a background thread owns the disk I/O so a slow or
     // full disk never blocks a logging call site. The returned guard flushes the
     // queue on drop — the caller holds it until after `axum::serve` drains.
-    let (file_writer, guard) = match file_appender {
-        Some(appender) => {
-            let (writer, guard) = tracing_appender::non_blocking(appender);
-            (Some(writer), Some(guard))
-        }
-        None => (None, None),
-    };
+    let (file_writer, guard) = file_appender.map(file_log_writer).unzip();
 
     // JSON stdout by default (Alloy pod-log scrape → Loki, carrying the request
     // span's `trace_id` on every in-span line); `FERROFIN_LOG_FORMAT=text` (or
@@ -199,6 +188,25 @@ pub fn init_tracing(config: &Config) -> Option<WorkerGuard> {
     }
 
     guard
+}
+
+/// Lines the file log queues for its writer thread. Once the queue is full (the
+/// disk stalls), a new line is dropped, never waited for: Jellyfin's file sink
+/// sits behind Serilog's `Async` sink, whose default queue holds 10,000 events
+/// and drops the newest when full (`bufferSize = 10000`, `blockWhenFull =
+/// false`). tracing-appender's own default, 128,000, keeps about 4 MB resident
+/// from boot.
+const FILE_LOG_QUEUE_LINES: usize = 10_000;
+
+/// The non-blocking writer in front of the server's log file, queueing at most
+/// [`FILE_LOG_QUEUE_LINES`] lines and dropping the rest.
+fn file_log_writer<W: std::io::Write + Send + 'static>(
+    file: W,
+) -> (tracing_appender::non_blocking::NonBlocking, WorkerGuard) {
+    tracing_appender::non_blocking::NonBlockingBuilder::default()
+        .buffered_lines_limit(FILE_LOG_QUEUE_LINES)
+        .lossy(true)
+        .finish(file)
 }
 
 /// Type alias for the boxed, subscriber-erased log layers `init_tracing` composes.
@@ -271,8 +279,8 @@ fn build_fmt_layers(
 /// The config manager isn't constructed this early, so this is a raw
 /// `serde_json::Value` read. A missing file, parse error, absent field, or
 /// out-of-range number all fall back to the Jellyfin default of `3`. A present
-/// value (including `0` or negative — "keep forever") is used verbatim; the
-/// caller treats `<= 0` as unlimited retention.
+/// value (including `0` or negative) is used verbatim; the caller keeps only
+/// the current day's file for `<= 0`.
 fn read_retention_days(config_dir: &Path) -> i32 {
     const DEFAULT_RETENTION_DAYS: i32 = 3;
     std::fs::read_to_string(config_dir.join("system.json"))
@@ -518,6 +526,8 @@ pub async fn open_database(config: &Config) -> anyhow::Result<Database> {
     let db = Database::connect_tuned(&url, config.db_pool, config.db_statement_cache)
         .await
         .with_context(|| format!("failed to open database `{url}`"))?;
+    // Also writes the `{Type}-{Name}` key onto every keyless by-name row
+    // (`ferrofin_db::presentation_key::backfill_by_name_presentation_keys`).
     db.run_migrations()
         .await
         .context("failed to apply database migrations")?;
@@ -550,22 +560,6 @@ pub async fn open_database(config: &Config) -> anyhow::Result<Database> {
         .context("failed to backfill missing sort names")?;
     if repaired > 0 {
         tracing::info!(items = repaired, "backfilled missing sort names");
-    }
-    // Same shape, different column: a by-name row inserted before the write
-    // path derived `PresentationUniqueKey` still carries NULL, and
-    // `GetItemValues` GROUPs on that column — SQLite folds every NULL into one
-    // group, so a set of unkeyed genres/studios/artists collapses to a single
-    // representative and the tab silently loses names. The by-name inserts are
-    // `INSERT ... WHERE NOT EXISTS`, so fixing the insert alone repairs nothing
-    // that already exists.
-    let keyed = ferrofin_core::item_persistence_service::backfill_missing_presentation_keys(&db)
-        .await
-        .context("failed to backfill missing by-name presentation keys")?;
-    if keyed > 0 {
-        tracing::info!(
-            items = keyed,
-            "backfilled missing by-name presentation keys"
-        );
     }
     tracing::info!(database = %config.database_path().display(), "database ready");
     spawn_pool_sampler(&db);
@@ -1718,6 +1712,27 @@ mod tests {
         assert!(tmp.path().join("log").is_dir(), "log directory created");
     }
 
+    /// gl-847: the day's server log is named as Jellyfin's Serilog sink names
+    /// it, `log_yyyyMMdd.log` by the local date, so `GET /System/Logs/Log`
+    /// finds it under Jellyfin's name.
+    #[test]
+    fn init_tracing_names_the_log_file_as_jellyfin_does() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut cfg = config_with_ffmpeg(None);
+        cfg.data_dir = tmp.path().to_path_buf();
+        let before = chrono::Local::now().format("log_%Y%m%d.log").to_string();
+        let _guard = init_tracing(&cfg);
+        let after = chrono::Local::now().format("log_%Y%m%d.log").to_string();
+        let names: Vec<String> = std::fs::read_dir(tmp.path().join("log"))
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            names.contains(&before) || names.contains(&after),
+            "{names:?}"
+        );
+    }
+
     #[test]
     fn read_retention_days_defaults_missing_garbage_and_absent() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1733,18 +1748,18 @@ mod tests {
     }
 
     #[test]
-    fn read_retention_days_uses_present_value_including_forever() {
+    fn read_retention_days_uses_present_value_including_zero_and_negative() {
         let tmp = tempfile::tempdir().unwrap();
         let sys = tmp.path().join("system.json");
         std::fs::write(&sys, br#"{"LogFileRetentionDays":7}"#).unwrap();
         assert_eq!(read_retention_days(tmp.path()), 7, "positive used verbatim");
         std::fs::write(&sys, br#"{"LogFileRetentionDays":0}"#).unwrap();
-        assert_eq!(read_retention_days(tmp.path()), 0, "0 = keep forever");
+        assert_eq!(read_retention_days(tmp.path()), 0, "0 used verbatim");
         std::fs::write(&sys, br#"{"LogFileRetentionDays":-1}"#).unwrap();
         assert_eq!(
             read_retention_days(tmp.path()),
             -1,
-            "negative = keep forever"
+            "negative used verbatim"
         );
     }
 
@@ -1754,13 +1769,8 @@ mod tests {
         // lands on disk once the WorkerGuard is dropped (dropping early loses it).
         use tracing_subscriber::layer::SubscriberExt as _;
         let tmp = tempfile::tempdir().unwrap();
-        let appender = tracing_appender::rolling::Builder::new()
-            .rotation(tracing_appender::rolling::Rotation::NEVER)
-            .filename_prefix("log")
-            .filename_suffix("log")
-            .build(tmp.path())
-            .unwrap();
-        let (writer, guard) = tracing_appender::non_blocking(appender);
+        let appender = crate::log_file::DailyLogFile::open(tmp.path(), 3).unwrap();
+        let (writer, guard) = file_log_writer(appender);
         let subscriber = tracing_subscriber::registry().with(
             tracing_subscriber::fmt::layer()
                 .with_ansi(false)
@@ -1781,6 +1791,57 @@ mod tests {
         );
     }
 
+    /// gl-1478: while the log disk stalls, the file log queues
+    /// `FILE_LOG_QUEUE_LINES` lines and drops the next one instead of making
+    /// the caller wait, as Jellyfin's `Async` file sink does.
+    #[test]
+    fn the_file_log_queue_drops_lines_past_its_limit_while_the_disk_stalls() {
+        use std::io::Write as _;
+        use std::sync::mpsc;
+
+        /// A log file whose writes block until `release` is dropped.
+        struct StalledDisk {
+            entered: mpsc::Sender<()>,
+            release: mpsc::Receiver<()>,
+        }
+        impl std::io::Write for StalledDisk {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                let _ = self.entered.send(());
+                let _ = self.release.recv();
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let (entered_tx, entered) = mpsc::channel();
+        let (release, release_rx) = mpsc::channel();
+        let (mut writer, guard) = file_log_writer(StalledDisk {
+            entered: entered_tx,
+            release: release_rx,
+        });
+        let dropped = writer.error_counter();
+        writer.write_all(b"first\n").unwrap();
+        // The writer thread has taken `first` and is stuck writing it, so the
+        // queue is empty.
+        entered
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .unwrap();
+        for _ in 0..FILE_LOG_QUEUE_LINES {
+            writer.write_all(b"queued\n").unwrap();
+        }
+        assert_eq!(dropped.dropped_lines(), 0, "the queue holds its limit");
+        writer.write_all(b"overflow\n").unwrap();
+        assert_eq!(
+            dropped.dropped_lines(),
+            1,
+            "the line past the limit is dropped"
+        );
+        drop(release);
+        drop(guard);
+    }
+
     /// gl-154: the plain-text file sink `/System/Logs` serves keeps every event
     /// on lines of its own record, in both formats: a line break inside a
     /// logged value continues the record indented and never starts a forged
@@ -1791,7 +1852,7 @@ mod tests {
     fn the_text_file_sink_cannot_be_forged_by_a_logged_line_break(#[case] text_mode: bool) {
         use tracing_subscriber::layer::SubscriberExt as _;
         let file = CapturedLogs::default();
-        let (writer, guard) = tracing_appender::non_blocking(file.clone());
+        let (writer, guard) = file_log_writer(file.clone());
         let layers = build_fmt_layers(text_mode, Some(writer));
         let subscriber = tracing_subscriber::registry().with(layers);
         tracing::subscriber::with_default(subscriber, || {

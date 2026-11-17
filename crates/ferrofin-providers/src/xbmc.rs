@@ -9,7 +9,7 @@
 //! [`fetch_movie`] / [`fetch_episode`] / … so tests read fixtures directly and
 //! the un-mockable filesystem access does not enter the parity numbers. The one
 //! filesystem dependency the parsers have (local-artwork resolution) is behind
-//! the [`base_parser::DirectoryService`] trait.
+//! the shared [`crate::DirectoryService`] trait.
 
 pub mod base_parser;
 pub mod config;
@@ -22,7 +22,8 @@ pub mod xml_reader;
 
 use crate::container_types::MetadataResult;
 
-use base_parser::{BaseNfoParser, DirectoryService, ExternalIdSource, FetchError, FetchResult};
+use crate::local_images::DirectoryService;
+use base_parser::{BaseNfoParser, ExternalIdSource, FetchError, FetchResult};
 use config::NfoConfiguration;
 use item::{NfoBaseItem, NfoItemKind};
 use parsers::{

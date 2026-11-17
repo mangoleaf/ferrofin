@@ -39,9 +39,9 @@ use ferrofin_model::entities_media::MediaStream;
 use ferrofin_model::providers::RemoteSubtitleInfo;
 use ferrofin_model::secret::Secret;
 use ferrofin_model::subtitles::FontFile;
-use ferrofin_traits::error::ServiceError;
 use ferrofin_traits::subtitles::{SubtitleResponse, SubtitleSearchRequest};
 use ferrofin_util::string_extensions::equals_ordinal_ignore_case;
+use ferrofin_util::ticks::TICKS_PER_SECOND;
 use uuid::Uuid;
 
 use crate::auth::{RequireAdmin, RequireAuth, RequireSubtitleManagement};
@@ -56,17 +56,12 @@ use crate::handlers::streaming::{
     opened_file_response, physical_file_precondition, require_streamable_item,
     stream_route_container,
 };
-use crate::handlers::{queue_high_priority_refresh, run_item_refresh};
+use crate::handlers::{queue_high_priority_refresh, run_detached, run_item_refresh};
 use crate::state::AppState;
 
 /// The MIME type Jellyfin serves an HLS subtitle playlist with
 /// (`MimeTypes.GetMimeType("playlist.m3u8")`).
 const HLS_PLAYLIST_CONTENT_TYPE: &str = "application/vnd.apple.mpegurl";
-
-/// The number of 100-ns ticks in one second (`TimeSpan.TicksPerSecond`), used to
-/// convert the `segmentLength` (seconds) into the tick space the playlist math
-/// and the subtitle encoder operate in.
-const TICKS_PER_SECOND: i64 = 10_000_000;
 
 /// The maximum total size of fallback fonts served by `GET /FallbackFont/Fonts`
 /// (Jellyfin's hard-coded 20 MiB cap; fonts past it are dropped).
@@ -152,18 +147,12 @@ async fn delete_subtitle(
             return Err(ApiError::BadRequest("Guid can't be empty".to_owned()));
         }
         require_item(&state, item_id, &auth).await?;
-        // Upstream finishes the delete and its refresh for a client that hangs
-        // up, so they run on a task of their own, in the request's span.
-        tokio::spawn(tracing::Instrument::in_current_span(async move {
+        // Upstream finishes the delete and its refresh for a client that hangs up.
+        run_detached(async move {
             state.subtitles.delete_subtitles(item_id, index).await?;
             run_item_refresh(&state, item_id).await
-        }))
-        .await
-        .unwrap_or_else(|err| {
-            Err(ApiError::Service(ServiceError::backend(format!(
-                "subtitle delete task failed: {err}"
-            ))))
         })
+        .await
     }
     .await;
     match deleted {
@@ -198,7 +187,8 @@ struct UploadSubtitleDto {
 /// [`SubtitleManager`](ferrofin_traits::subtitles::SubtitleManager), which
 /// attaches them to the item as an external subtitle (the sidecar file and its
 /// stream row); then a metadata refresh is queued and `204` returned. Subtitle
-/// management is checked before decoding or writing the upload.
+/// management is checked before decoding or writing the upload. The save and
+/// the refresh finish for a client that hangs up, as upstream's do.
 #[utoipa::path(
     post,
     path = "/Videos/{itemId}/Subtitles",
@@ -227,8 +217,12 @@ async fn upload_subtitle(
         is_hearing_impaired: body.is_hearing_impaired,
         content,
     };
-    state.subtitles.upload_subtitle(item_id, &response).await?;
-    queue_high_priority_refresh(&state, item_id).await?;
+    // Upstream finishes the save and its queued refresh for a client that hangs up.
+    run_detached(async move {
+        state.subtitles.upload_subtitle(item_id, &response).await?;
+        queue_high_priority_refresh(&state, item_id).await
+    })
+    .await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -301,8 +295,9 @@ impl RouteParameter for DownloadedSubtitleId {
 /// Port of `SubtitleController.DownloadRemoteSubtitles`: `404` for a missing
 /// item, else `204` after attempting the download and queueing a metadata
 /// refresh. Like the C# `try`, a failure of either is logged at error and still
-/// answered `204`. After router normalization the trailing id segment is
-/// captured as `{language}`.
+/// answered `204`. Both finish, and a failure is logged, for a client that
+/// hangs up (`CancellationToken.None`). After router normalization the
+/// trailing id segment is captured as `{language}`.
 #[utoipa::path(
     post,
     path = "/Items/{itemId}/RemoteSearch/Subtitles/{language}",
@@ -323,17 +318,23 @@ async fn download_remote_subtitles(
     Path((DotnetGuid(item_id), _)): Path<(DotnetGuid, String)>,
 ) -> Result<StatusCode, ApiError> {
     require_video(&state, item_id, &auth).await?;
-    let downloaded = async {
-        state
-            .subtitles
-            .download_subtitles(item_id, &subtitle_id)
-            .await?;
-        queue_high_priority_refresh(&state, item_id).await
-    }
-    .await;
-    if let Err(error) = downloaded {
-        tracing::error!(%item_id, ?subtitle_id, %error, "Error downloading subtitles");
-    }
+    // Upstream finishes the download and its queued refresh for a client that
+    // hangs up (`CancellationToken.None`), and its `catch` logs a failure.
+    run_detached(async move {
+        let downloaded = async {
+            state
+                .subtitles
+                .download_subtitles(item_id, &subtitle_id)
+                .await?;
+            queue_high_priority_refresh(&state, item_id).await
+        }
+        .await;
+        if let Err(error) = downloaded {
+            tracing::error!(%item_id, ?subtitle_id, %error, "Error downloading subtitles");
+        }
+        Ok::<_, ApiError>(())
+    })
+    .await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -1018,7 +1019,7 @@ async fn validate_open_subtitles_login(
         serde_json::to_vec(&body).map_err(|e| ApiError::BadRequest(format!("login info: {e}")))?;
     match state
         .subtitles
-        .validate_provider_login("opensubtitles", &canonical)
+        .validate_provider_login("Open Subtitles", &canonical)
         .await
     {
         Ok(login) => Ok(Json(ValidatedLogin {

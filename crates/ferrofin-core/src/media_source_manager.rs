@@ -976,7 +976,7 @@ fn remote_shortcut(item: &BaseItemEntity) -> Option<RemoteShortcut> {
     }
     let target = crate::item_data::read_data_string(&data, "ShortcutPath")
         .filter(|target| !target.is_empty())?;
-    let protocol = crate::shortcut::path_protocol(&target);
+    let protocol = ferrofin_model::media_info::path_protocol(&target);
     if protocol == MediaProtocol::File {
         return None;
     }
@@ -3180,9 +3180,6 @@ mod tests {
             &self,
             _id: Uuid,
         ) -> Result<Option<ferrofin_model::dto::BaseItemDto>, ServiceError> {
-            Ok(None)
-        }
-        async fn get_recording_path(&self, _id: Uuid) -> Result<Option<String>, ServiceError> {
             Ok(None)
         }
         async fn delete_recording(&self, _id: Uuid) -> Result<(), ServiceError> {
