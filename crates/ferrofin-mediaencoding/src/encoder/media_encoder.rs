@@ -227,8 +227,8 @@ pub struct MediaEncoderConfig {
     /// deprecated `-vsync` (`GetVideoSyncOption`) and whether an extracted
     /// image is converted to the JPEG's BT.601 matrix
     /// ([`MIN_FFMPEG_JPEG_MATRIX_CONVERSION`]). `None` means "unprobed": it
-    /// takes `-vsync`, which every supported build still understands, and
-    /// converts no matrix.
+    /// takes `-vsync`, as upstream does for a version it cannot read (ffmpeg 9
+    /// no longer has it), and converts no matrix.
     pub ffmpeg_version: Option<FfmpegVersion>,
     /// `FFmpeg:imgExtractPerfTradeoff` (`GetFFmpegImgExtractPerfTradeoff`,
     /// default `false`): a frame extraction's I-frame attempt decodes
