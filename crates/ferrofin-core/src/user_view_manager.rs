@@ -128,12 +128,7 @@ pub(crate) fn is_folders_view_fields(
     }
     let data = crate::item_data::parse_data(blob);
     match data.get("ViewType") {
-        Some(value) => {
-            value.as_i64() == Some(12)
-                || value
-                    .as_str()
-                    .is_some_and(|value| value.eq_ignore_ascii_case("folders"))
-        }
+        Some(value) => CollectionType::from_data_member(value) == Some(CollectionType::folders),
         None => path.is_some_and(|path| path.replace('\\', "/").ends_with("/views/folders")),
     }
 }
@@ -229,12 +224,11 @@ pub(crate) fn grouped_view_id(
     )
 }
 
-/// A library's collection type as `CollectionFolder.CollectionType` reads it:
-/// the `CollectionType` its row's `Data` carries, lower-cased. A mixed library
+/// A library's collection type as `CollectionFolder.CollectionType` reads it
+/// ([`crate::item_data::stored_collection_type`]). A mixed library
 /// (`mixed.collection`) has none, as upstream parses it.
 fn library_collection_type(row: &BaseItemEntity) -> Option<String> {
     crate::item_data::stored_collection_type(row.data.as_deref())
-        .filter(|collection_type| collection_type != "mixed")
 }
 
 /// C# `LibraryManager.GetShadowViewId`: the shadow view built from a library,
@@ -543,14 +537,20 @@ impl FerrofinUserViewManager {
                         .and_then(|u| Uuid::parse_str(u).ok())
                         .is_none_or(|u| u.is_nil());
                 };
-                let Some(view_type) = data.get("ViewType").and_then(serde_json::Value::as_str)
-                else {
-                    return true;
+                let view_type = match data.get("ViewType") {
+                    None | Some(serde_json::Value::Null) => return true,
+                    Some(stored) => CollectionType::from_data_member(stored),
                 };
                 let Ok(id) = Uuid::parse_str(&row.id) else {
                     return false;
                 };
-                self.user_named_view_id(user_id, parent, view_type) == Some(id)
+                // `GetNamedViewId` hashes `viewType?.ToString() ?? ""` of the
+                // bound value: a stored `"Movies"` or `1` names the same view
+                // as `"movies"`, and a value that binds to none (`""` too)
+                // hashes as none. Only an absent or `null` member is kept
+                // unchecked.
+                let view_type = view_type.map(CollectionType::json_name).unwrap_or_default();
+                self.user_named_view_id(user_id, parent, &view_type) == Some(id)
             })
             .collect()
     }
@@ -578,8 +578,8 @@ impl FerrofinUserViewManager {
             // Reading it here keeps this off the virtual-folder listing, which
             // walks the library root and every options file per call — that
             // cost doubled `/Users/{id}/Views` on the bench when tried.
-            // Both read the way their DTOs read them: case-insensitively, and
-            // a numeric `ViewType` from an adopted blob by its discriminant.
+            // Both bind the way their DTOs read them
+            // (`CollectionType::from_item_data`).
             let collection_type = if Some(row.type_.as_str()) == user_view {
                 crate::user_view_repository::view_type_of(row.data.as_deref())
             } else {
@@ -1406,8 +1406,7 @@ fn latest_parent_collection_type(
         Some(BaseItemKind::ManualPlaylistsFolder | BaseItemKind::PlaylistsFolder) => {
             Some(CollectionType::playlists)
         }
-        Some(BaseItemKind::UserView) => crate::user_view_repository::view_type_of(data)
-            .and_then(|name| serde_json::from_value(serde_json::Value::String(name)).ok()),
+        Some(BaseItemKind::UserView) => CollectionType::from_item_data(data, "ViewType"),
         _ => None,
     }
 }
@@ -4835,10 +4834,10 @@ mod tests {
         );
     }
 
-    /// `UserView.CollectionType => ViewType` (UserView.cs:58), read from `Data`
-    /// the way [`view_type_of`](crate::user_view_repository::view_type_of)
-    /// reads it: a name in any case or an adopted blob's discriminant. No
-    /// readable value leaves it null, as on upstream's nullable `ViewType`.
+    /// `UserView.CollectionType => ViewType` (UserView.cs:58), bound from `Data`
+    /// as Jellyfin binds it: a name in any case or a number, declared internal
+    /// values (`110`, `movieresume`) included. No readable value leaves it
+    /// null, as on upstream's nullable `ViewType`.
     #[rstest]
     #[case(Some(r#"{"ViewType":"movies"}"#), Some(CollectionType::movies))]
     #[case(Some(r#"{"ViewType":"tvshows"}"#), Some(CollectionType::tvshows))]
@@ -4849,6 +4848,7 @@ mod tests {
     #[case(Some(r#"{"ViewType":"unknown"}"#), Some(CollectionType::unknown))]
     #[case(Some(r#"{"ViewType":"TvShows"}"#), Some(CollectionType::tvshows))]
     #[case(Some(r#"{"ViewType":2}"#), Some(CollectionType::tvshows))]
+    #[case(Some(r#"{"ViewType":110}"#), Some(CollectionType::Movieresume))]
     #[case(Some(r#"{"ViewType":"nonsense"}"#), None)]
     #[case(Some(r#"{"ViewType":null}"#), None)]
     #[case(Some(r#"{"UserId":"x"}"#), None)]
@@ -5121,6 +5121,45 @@ mod tests {
             mgr.user_named_view_id(user, folder, "playlists"),
             Some(Uuid::parse_str("45D83C7B-5EDC-AF5C-B7E4-6C1612C07B6A").expect("view"))
         );
+    }
+
+    /// The canonical-view check hashes the bound `ViewType`'s
+    /// `ToString()`, as `GetNamedViewId` does: the real 12.0 view above stays
+    /// listed whether its blob spells the type `playlists`, `Playlists` or
+    /// `11`, and a row under another id is still dropped.
+    #[tokio::test]
+    async fn the_canonical_view_check_hashes_the_bound_view_type() {
+        let db = test_db().await;
+        let mgr = FerrofinUserViewManager::new(crate::test_support::item_repository_over(db))
+            .with_id_derivation(item_type_lookup::IdDerivation::Jellyfin {
+                program_data_path: Some("/config".to_owned()),
+            });
+        let user = Uuid::parse_str("9ECCC7EC-621F-47CF-ADCB-3CD4A0C29227").expect("user");
+        let view = |id: &str, view_type: &str| BaseItemEntity {
+            id: id.to_owned(),
+            type_: item_type_lookup::stored_type_name(BaseItemKind::UserView)
+                .expect("user view")
+                .to_owned(),
+            data: Some(format!(
+                r#"{{"ViewType":{view_type},"DisplayParentId":"1071671e7bffa0532e930debee501d2e"}}"#
+            )),
+            ..BaseItemEntity::default()
+        };
+        let canonical = "45D83C7B-5EDC-AF5C-B7E4-6C1612C07B6A";
+        for view_type in [r#""playlists""#, r#""Playlists""#, "11"] {
+            let kept = mgr.only_canonical_user_views(
+                user,
+                vec![
+                    view(canonical, view_type),
+                    view("00000000-0000-0000-0000-000000000001", view_type),
+                ],
+            );
+            assert_eq!(
+                kept.iter().map(|row| row.id.as_str()).collect::<Vec<_>>(),
+                [canonical],
+                "{view_type}"
+            );
+        }
     }
 
     struct DashboardConfiguration(
@@ -5410,6 +5449,17 @@ mod tests {
             Some(r#"{"ViewType":"FOLDERS"}"#)
         ));
         assert!(is_folders_view_fields(user_view, path, None));
+        // Bound as Jellyfin binds it: padded, or the number as a string.
+        assert!(is_folders_view_fields(
+            user_view,
+            path,
+            Some(r#"{"ViewType":" folders "}"#)
+        ));
+        assert!(is_folders_view_fields(
+            user_view,
+            path,
+            Some(r#"{"ViewType":"12"}"#)
+        ));
         assert!(!is_folders_view_fields(
             user_view,
             path,

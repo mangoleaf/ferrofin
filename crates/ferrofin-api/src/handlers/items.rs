@@ -2115,8 +2115,7 @@ fn user_view_browse_context(
         .unwrap_or_default();
     let view_type = data
         .get("ViewType")
-        .cloned()
-        .and_then(|value| serde_json::from_value::<CollectionType>(value).ok());
+        .and_then(CollectionType::from_data_member);
     let parent_id = data
         .get("DisplayParentId")
         .and_then(serde_json::Value::as_str)
@@ -2133,20 +2132,14 @@ fn user_view_browse_context(
 }
 
 /// When the requested parent is itself a library (`ICollectionFolder`),
-/// whether it is a `boxsets` one, from its `Data.CollectionType` read
-/// case-insensitively as the other readers do; `None` for any other row.
+/// whether it is a `boxsets` one, from its `Data.CollectionType` bound as the
+/// other readers bind it ([`ferrofin_model::data::CollectionType::from_item_data`]);
+/// `None` for any other row.
 fn library_is_boxsets(parent: &BaseItemEntity) -> Option<bool> {
+    use ferrofin_model::data::CollectionType;
     (parent.type_.rsplit('.').next() == Some("CollectionFolder")).then(|| {
-        parent
-            .data
-            .as_deref()
-            .and_then(|data| serde_json::from_str::<serde_json::Value>(data).ok())
-            .and_then(|data| {
-                data.get("CollectionType")?
-                    .as_str()
-                    .map(|kind| kind.eq_ignore_ascii_case("boxsets"))
-            })
-            .unwrap_or(false)
+        CollectionType::from_item_data(parent.data.as_deref(), "CollectionType")
+            == Some(CollectionType::boxsets)
     })
 }
 
@@ -2896,5 +2889,27 @@ mod tests {
             sorted(&[c, a], &[], &[a, c, unasked, b]),
             [unasked, b, c, a]
         );
+    }
+
+    /// A boxsets library is found by the same binding as its DTO's type: a
+    /// padded name or the number (`7`) counts too; another kind of row is no
+    /// library at all.
+    #[rstest::rstest]
+    #[case("CollectionFolder", r#"{"CollectionType":"BoxSets"}"#, Some(true))]
+    #[case("CollectionFolder", r#"{"CollectionType":7}"#, Some(true))]
+    #[case("CollectionFolder", r#"{"CollectionType":" boxsets "}"#, Some(true))]
+    #[case("CollectionFolder", r#"{"CollectionType":"movies"}"#, Some(false))]
+    #[case("Folder", r#"{"CollectionType":"boxsets"}"#, None)]
+    fn a_boxsets_library_is_found_by_its_bound_type(
+        #[case] type_: &str,
+        #[case] data: &str,
+        #[case] expected: Option<bool>,
+    ) {
+        let parent = BaseItemEntity {
+            type_: format!("MediaBrowser.Controller.Entities.{type_}"),
+            data: Some(data.to_owned()),
+            ..BaseItemEntity::default()
+        };
+        assert_eq!(library_is_boxsets(&parent), expected);
     }
 }

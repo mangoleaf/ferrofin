@@ -1511,8 +1511,8 @@ impl FerrofinItemRepository {
         // without a `Data` blob.
         let is_live_tv = blob
             .get("ViewType")
-            .and_then(serde_json::Value::as_str)
-            .is_some_and(|v| v.eq_ignore_ascii_case("livetv"))
+            .and_then(CollectionType::from_data_member)
+            == Some(CollectionType::livetv)
             || path
                 .as_deref()
                 .is_some_and(crate::user_view_manager::is_live_tv_view_path);
@@ -1613,15 +1613,9 @@ impl FerrofinItemRepository {
                 .await
                 .map_err(db_err)?,
         };
-        Ok(data
-            .flatten()
-            .and_then(|d| serde_json::from_str::<serde_json::Value>(&d).ok())
-            .and_then(|v| {
-                v.get("CollectionType")
-                    .and_then(serde_json::Value::as_str)
-                    .map(str::to_ascii_lowercase)
-            })
-            .filter(|collection_type| collection_type != "mixed"))
+        Ok(crate::item_data::stored_collection_type(
+            data.flatten().as_deref(),
+        ))
     }
 
     /// The scope [`Self::fetch_rows`], [`Self::fetch_ids`],
@@ -13347,6 +13341,50 @@ mod tests {
             browse(dangling).await.is_empty(),
             "a dangling view matches nothing, not everything"
         );
+    }
+
+    /// The Live TV test binds `ViewType` as Jellyfin does, so a view stored
+    /// with the number (`10`) and no Live TV path is its own scope too.
+    #[tokio::test]
+    async fn a_numeric_live_tv_view_type_is_its_own_scope() {
+        let db = test_db().await;
+        let repository = repo(&db);
+        let live_tv = Uuid::from_u128(0x9F11);
+        seed_item_with_data(
+            &db,
+            live_tv,
+            BaseItemKind::UserView,
+            "Live TV",
+            r#"{"ViewType":10}"#,
+        )
+        .await;
+        seed_top_parented_item(
+            &db,
+            Uuid::from_u128(0x9F12),
+            BaseItemKind::Movie,
+            "On Live TV",
+            live_tv,
+        )
+        .await;
+        seed_named_item(
+            &db,
+            Uuid::from_u128(0x9F13),
+            BaseItemKind::Movie,
+            "Elsewhere",
+        )
+        .await;
+        let names: Vec<String> = repository
+            .get_item_list(&InternalItemsQuery {
+                parent_id: live_tv,
+                recursive: true,
+                ..InternalItemsQuery::default()
+            })
+            .await
+            .expect("browse")
+            .into_iter()
+            .filter_map(|r| r.name)
+            .collect();
+        assert_eq!(names, ["On Live TV"]);
     }
 
     /// An untyped view groups too. Upstream's `GetTopParentIdsForQuery` groups
