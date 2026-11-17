@@ -6,7 +6,7 @@
 //! login is refused, and that the status still separates the two cases clients
 //! tell apart: `401` for bad credentials, `403` for an account that may not
 //! sign in. They also pin the routes beside the login routes, which keep their
-//! own bodies.
+//! own bodies, and that a sign-in whose `User` cannot be built mints nothing.
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode, header};
@@ -30,6 +30,7 @@ const REFUSAL_BODY: &str = "Error processing request.";
 /// A booted composition root and the temp dir keeping its database alive.
 struct Harness {
     wired: WiredApp,
+    db: ferrofin_db::Database,
     _temp: tempfile::TempDir,
 }
 
@@ -68,7 +69,11 @@ async fn boot_with(configure: impl FnOnce(Config) -> Config) -> Harness {
     ferrofin_server::seed::seed_default_admin(wired.state.users.as_ref(), &config)
         .await
         .expect("seed admin");
-    Harness { wired, _temp: temp }
+    Harness {
+        wired,
+        db,
+        _temp: temp,
+    }
 }
 
 /// One answer, read whole.
@@ -272,6 +277,63 @@ async fn quick_connect_exchange_is_refused_like_a_login() {
         initiate.json()["error"],
         "unauthorized: quick connect is not active on this server"
     );
+}
+
+/// `AuthenticateNewSessionInternal` answers `User = GetUserDto(user)` for the
+/// user it signed in, from memory. Ferrofin's DTO reads the database, so it is
+/// built before the token: when that read fails the sign-in fails, and the
+/// device keeps the token it had, where it once answered a fresh token with a
+/// bare `User` that told an administrator they were not one.
+#[tokio::test]
+async fn a_sign_in_whose_user_cannot_be_read_mints_nothing() {
+    let harness = boot().await;
+    let router = ferrofin_api::create_router(harness.wired.state.clone());
+    let admin = login(&router, ADMIN_USER, ADMIN_PASSWORD).await;
+    assert_eq!(admin.status, StatusCode::OK, "{}", admin.body);
+    let signed_in = admin.json();
+    let token = signed_in["AccessToken"].as_str().expect("AccessToken");
+    let user_id = signed_in["User"]["Id"].as_str().expect("user id");
+    // The `User` answered is the stored user, as `GET /Users/{id}` reads it.
+    let stored = send(
+        &router,
+        "GET",
+        &format!("/Users/{user_id}"),
+        Some(token),
+        None,
+    )
+    .await;
+    assert_eq!(signed_in["User"], stored.json());
+    assert_eq!(signed_in["User"]["Policy"]["IsAdministrator"], json!(true));
+
+    // The profile-image read is the one the sign-in makes only for its DTO.
+    sqlx::query(r#"ALTER TABLE "ImageInfos" RENAME TO "ImageInfosUnreadable""#)
+        .execute(harness.db.writer())
+        .await
+        .expect("rename");
+    let failed = login(&router, ADMIN_USER, ADMIN_PASSWORD).await;
+    assert_eq!(
+        failed.status,
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "{}",
+        failed.body
+    );
+    assert!(!failed.body.contains("AccessToken"), "{}", failed.body);
+    let devices = harness
+        .wired
+        .state
+        .devices
+        .get_devices(&ferrofin_traits::devices::DeviceQuery {
+            device_id: Some("login-failures".to_owned()),
+            ..Default::default()
+        })
+        .await
+        .expect("devices");
+    let tokens: Vec<_> = devices
+        .items
+        .iter()
+        .map(|d| d.access_token.as_str())
+        .collect();
+    assert_eq!(tokens, [token], "no token was minted or rotated");
 }
 
 /// The routes beside the login routes keep the error bodies they had: only

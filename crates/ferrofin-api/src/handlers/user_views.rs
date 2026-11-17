@@ -22,7 +22,7 @@ use axum::routing::get;
 use axum::{Json, Router};
 use ferrofin_model::data::CollectionType;
 use ferrofin_model::dto::{BaseItemDto, SpecialViewOptionDto};
-use ferrofin_model::entities::CollectionTypeOptions;
+use ferrofin_model::entities_media::VirtualFolderInfo;
 use ferrofin_model::querying::QueryResult;
 use ferrofin_traits::options::{DtoOptions, UserViewQuery};
 use uuid::Uuid;
@@ -33,42 +33,14 @@ use crate::extract::{DotnetGuid, Query};
 use crate::handlers::items::{resolve_user, user_uuid};
 use crate::state::AppState;
 
-/// Maps a library's [`CollectionTypeOptions`] to the DTO [`CollectionType`] the
-/// web client keys presentation off. `mixed` has no single type → `None` (a
-/// generic view), matching Jellyfin.
-fn map_collection_type(options: CollectionTypeOptions) -> Option<CollectionType> {
-    Some(match options {
-        CollectionTypeOptions::movies => CollectionType::movies,
-        CollectionTypeOptions::tvshows => CollectionType::tvshows,
-        CollectionTypeOptions::music => CollectionType::music,
-        CollectionTypeOptions::musicvideos => CollectionType::musicvideos,
-        CollectionTypeOptions::homevideos => CollectionType::homevideos,
-        CollectionTypeOptions::boxsets => CollectionType::boxsets,
-        CollectionTypeOptions::books => CollectionType::books,
-        CollectionTypeOptions::mixed => return None,
-    })
-}
-
-/// The collection type of every configured library, keyed by its folder item id.
-///
-/// A `mixed` library has no single type and maps to `None` — which is still an
-/// entry, because C# treats an unset `CollectionType` as grouping-eligible.
+/// The collection type of every configured library, keyed by its folder item id
+/// ([`VirtualFolderInfo::collection_types_by_id`]).
 async fn collection_types_by_id(
     state: &AppState,
 ) -> Result<HashMap<Uuid, Option<CollectionType>>, ApiError> {
-    Ok(state
-        .virtual_folders
-        .library_folders()
-        .await?
-        .iter()
-        .filter_map(|vf| {
-            let id = vf
-                .item_id
-                .as_deref()
-                .and_then(|s| Uuid::parse_str(s).ok())?;
-            Some((id, vf.collection_type.and_then(map_collection_type)))
-        })
-        .collect())
+    Ok(VirtualFolderInfo::collection_types_by_id(
+        &state.virtual_folders.library_folders().await?,
+    ))
 }
 
 /// C#'s `UserView.IsEligibleForGrouping`: only `movies`, `tvshows` and an unset
@@ -279,22 +251,6 @@ crate::query::query_parameters! {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn collection_type_maps_library_options_to_dto_type() {
-        // A tvshows library must surface as CollectionType::tvshows so the web
-        // client renders it as a Shows view (the bug: it was unset → generic).
-        assert_eq!(
-            map_collection_type(CollectionTypeOptions::tvshows),
-            Some(CollectionType::tvshows)
-        );
-        assert_eq!(
-            map_collection_type(CollectionTypeOptions::movies),
-            Some(CollectionType::movies)
-        );
-        // A mixed library has no single type → None (a generic view).
-        assert_eq!(map_collection_type(CollectionTypeOptions::mixed), None);
-    }
 
     #[test]
     fn user_views_can_request_hidden_views() {

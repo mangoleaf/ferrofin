@@ -39,16 +39,6 @@ impl FakeIo {
         io.files.lock().unwrap().insert(path.to_owned(), bytes);
         io
     }
-
-    fn path_protocol_of(path: &str) -> MediaProtocol {
-        if path.is_empty() {
-            MediaProtocol::File
-        } else if path.to_ascii_lowercase().starts_with("http") {
-            MediaProtocol::Http
-        } else {
-            MediaProtocol::File
-        }
-    }
 }
 
 #[async_trait]
@@ -67,7 +57,7 @@ impl SubtitleIo for FakeIo {
     }
 
     fn path_protocol(&self, path: &str) -> MediaProtocol {
-        Self::path_protocol_of(path)
+        ferrofin_model::media_info::path_protocol(path)
     }
 
     fn subtitle_cache_path(

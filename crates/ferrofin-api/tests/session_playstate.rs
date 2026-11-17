@@ -637,9 +637,6 @@ impl SessionManager for RecordingSessions {
         self.calls.lock().unwrap().logged_out = Some(access_token.to_owned());
         Ok(())
     }
-    async fn update_device_name(&self, _s: &str, _n: &str) -> Result<(), ServiceError> {
-        unimplemented!()
-    }
     async fn report_session_ended(&self, _s: &str) -> Result<(), ServiceError> {
         unimplemented!()
     }
@@ -813,7 +810,12 @@ impl HlsStreamManager for RecordingHls {
     ) -> Result<ServedFile, ServiceError> {
         unimplemented!()
     }
-    async fn resolve_transcode_file(&self, _f: &str, _m: bool) -> Result<ServedFile, ServiceError> {
+    async fn resolve_transcode_file(
+        &self,
+        _f: &str,
+        _m: bool,
+        _p: Option<&str>,
+    ) -> Result<ServedFile, ServiceError> {
         unimplemented!()
     }
     async fn transcode_stream(

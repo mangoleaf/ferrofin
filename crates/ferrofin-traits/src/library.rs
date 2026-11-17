@@ -982,7 +982,8 @@ pub trait LibraryManager: Send + Sync {
     /// upstream. `GetPerson` is the exception — a plain lookup on both trees
     /// (`LibraryManager.cs:958-968` on v10.11.8, `:1195-1205` on master) — so
     /// `Person` is not in the provisioned set. Use [`Self::find_named_item`]
-    /// where the lookup must not write.
+    /// (or [`Self::get_named_item_ids`] for many names) where the lookup must
+    /// not write.
     ///
     /// Matching is by cleaned name (Jellyfin's item-by-name id is derived from
     /// the name), delegating to [`Self::get_item_list`] filtered to `kind`; the
@@ -1068,27 +1069,33 @@ pub trait LibraryManager: Send + Sync {
         Ok(out)
     }
 
-    /// Id-only form of [`Self::get_named_items`]: resolves each of `names` to
-    /// the id of its by-name item row of `kind`, one slot per input name in
-    /// order (`None` where no row resolves).
+    /// Id-only batch form of [`Self::find_named_item`]: resolves each of
+    /// `names` to the id of its existing by-name item row of `kind`, one slot
+    /// per input name in order (`None` where no row resolves).
+    ///
+    /// It **never creates a row**: a name nothing matches stays `None`, where
+    /// [`Self::get_named_items`] materializes the kinds Jellyfin creates by
+    /// name. An implementation must keep it that way, because read paths rely
+    /// on it (the DTO prefetch, and the `GET` name filters that resolve names
+    /// to ids). For a row that exists it answers the id
+    /// [`Self::get_named_items`] would.
     ///
     /// The DTO prefetch resolves a whole page's cast through this and reads
-    /// nothing but the id, so the concrete manager overrides it with a
-    /// two-column projection rather than materializing a full item row per
-    /// credited name, and for a `Person` with the people repository's id-only
-    /// `GetPerson` reads. The default delegates to [`Self::get_named_items`], so
-    /// every implementation gets it for free with identical results.
+    /// nothing but the id, so the concrete manager overrides it with one
+    /// two-column `CleanName IN (…)` query rather than a full item row per
+    /// name, and for a `Person` with the people repository's id-only
+    /// `GetPerson` reads. The default loops [`Self::find_named_item`].
     async fn get_named_item_ids(
         &self,
         kind: BaseItemKind,
         names: &[String],
     ) -> Result<Vec<Option<Uuid>>, ServiceError> {
-        Ok(self
-            .get_named_items(kind, names)
-            .await?
-            .into_iter()
-            .map(|row| row.and_then(|r| Uuid::parse_str(&r.id).ok()))
-            .collect())
+        let mut out = Vec::with_capacity(names.len());
+        for name in names {
+            let row = self.find_named_item(kind, name).await?;
+            out.push(row.and_then(|r| Uuid::parse_str(&r.id).ok()));
+        }
+        Ok(out)
     }
 
     /// Gets the library's production years, resolved to their by-name `Year`
@@ -1239,18 +1246,6 @@ pub trait LibraryManager: Send + Sync {
     /// Queues a full library scan.
     async fn queue_library_scan(&self) -> Result<(), ServiceError>;
 
-    /// Queues a full library scan, tagging the run's root span, its log lines
-    /// and its metrics with why it was triggered ([`ScanTrigger`]). Defaults
-    /// to the plain [`queue_library_scan`](Self::queue_library_scan) so
-    /// existing implementations need no change; the real manager overrides it
-    /// to record the `trigger`.
-    async fn queue_library_scan_with_trigger(
-        &self,
-        _trigger: ScanTrigger,
-    ) -> Result<(), ServiceError> {
-        self.queue_library_scan().await
-    }
-
     /// Queues a scan restricted to one library. `library_id` is the library's
     /// CollectionFolder id — what jellyfin-web's per-library "Scan Library"
     /// button refreshes via `POST /Items/{id}/Refresh`. Defaults to the full
@@ -1322,6 +1317,102 @@ pub trait LibraryManager: Send + Sync {
         let _ = (target, options);
         Err(ServiceError::backend(
             "run_refresh_scan needs a library scanner, which this library manager has none of",
+        ))
+    }
+
+    /// Queues `item`'s refresh with `options` and returns without waiting:
+    /// `ProviderManager.QueueRefresh(item.Id, options, RefreshPriority.High)`,
+    /// then the queue's `RefreshItem` or `RefreshArtist`
+    /// (`ProviderManager.cs:1209-1290`). What the refresh covers:
+    ///
+    /// - a library (`CollectionFolder`) scans that library
+    ///   (`RefreshCollectionFolderChildren`), the root or the aggregate
+    ///   folder every library;
+    /// - any other folder with a path validates its own subtree, the folder
+    ///   included (`ValidateChildren`), and a file item refreshes itself
+    ///   (`RefreshSingleItem`) through the scan of its own path — both
+    ///   through [`queue_refresh_scan`](Self::queue_refresh_scan);
+    /// - a music artist validates the children of the artist folders above
+    ///   the albums credited to it, then refreshes itself (`RefreshArtist`);
+    /// - an item with no file and no physical children (a box set, a
+    ///   playlist, a view, a virtual season, a person, a genre, a studio, a
+    ///   channel, an item outside every library) refreshes through the
+    ///   provider manager's queue at high priority.
+    ///
+    /// The default refuses: a manager without a scanner and a provider
+    /// manager cannot run the refresh, and a silent no-op would look like
+    /// one that ran.
+    ///
+    /// # Errors
+    ///
+    /// [`ServiceError::Backend`] from a manager without them, or whatever
+    /// reading the artist's albums or queueing the refresh surfaces.
+    async fn queue_item_refresh(
+        &self,
+        item: &BaseItemEntity,
+        options: &MetadataRefreshOptions,
+    ) -> Result<(), ServiceError> {
+        let _ = (item, options);
+        Err(ServiceError::backend(
+            "queue_item_refresh needs a library scanner and a provider manager, which this library manager has none of",
+        ))
+    }
+
+    /// Runs `item`'s own metadata refresh with `options` and returns once it
+    /// has run: `item.RefreshMetadata(options, CancellationToken.None)`,
+    /// which a caller awaits rather than queues. An item with a path of its
+    /// own in a library refreshes through the scan of that path in the scan queue's
+    /// priority lane ([`run_refresh_scan`](Self::run_refresh_scan)); any
+    /// other item is queued through the provider manager at high priority,
+    /// and this returns once it is queued. A folder's children are not
+    /// validated. Returns `Ok(false)` when the refresh was stopped before it
+    /// finished (the server is shutting down).
+    ///
+    /// The default refuses, as [`queue_item_refresh`](Self::queue_item_refresh)'s does.
+    ///
+    /// # Errors
+    ///
+    /// [`ServiceError::Backend`] from a manager without a scanner and a
+    /// provider manager, or the refresh failed.
+    async fn refresh_item_metadata(
+        &self,
+        item: &BaseItemEntity,
+        options: &MetadataRefreshOptions,
+    ) -> Result<bool, ServiceError> {
+        let _ = (item, options);
+        Err(ServiceError::backend(
+            "refresh_item_metadata needs a library scanner and a provider manager, which this library manager has none of",
+        ))
+    }
+
+    /// Runs Identify's refresh of `item` with `options` (which carry the
+    /// chosen search result) and returns once it has run:
+    /// `ProviderManager.RefreshFullItem`, `RefreshItem` without the queue.
+    /// The item and, for a folder, its subtree refresh as
+    /// [`queue_item_refresh`](Self::queue_item_refresh) says, through
+    /// [`run_refresh_scan`](Self::run_refresh_scan) in the scan queue's
+    /// priority lane; an artist known only by name refreshes only itself
+    /// there, through the scanner; an item with no file of its own through
+    /// [`ProviderManager::refresh_full_item`](crate::providers::ProviderManager::refresh_full_item).
+    /// Returns `Ok(false)` when the refresh was stopped before it finished.
+    ///
+    /// The default refuses, as [`queue_item_refresh`](Self::queue_item_refresh)'s does.
+    ///
+    /// # Errors
+    ///
+    /// [`ServiceError::Conflict`] when the item's path lies under no library
+    /// location, or when it is a file- or folder-backed item that belongs to
+    /// no library: the scan cannot reach it, so it is not refreshed.
+    /// [`ServiceError::Backend`] from a manager without a scanner and a
+    /// provider manager, or the refresh failed.
+    async fn refresh_full_item(
+        &self,
+        item: &BaseItemEntity,
+        options: &MetadataRefreshOptions,
+    ) -> Result<bool, ServiceError> {
+        let _ = (item, options);
+        Err(ServiceError::backend(
+            "refresh_full_item needs a library scanner and a provider manager, which this library manager has none of",
         ))
     }
 
@@ -2832,14 +2923,6 @@ pub trait MusicManager: Send + Sync {
     async fn get_instant_mix_from_item(
         &self,
         item_id: Uuid,
-        user_id: Option<Uuid>,
-        dto_options: &DtoOptions,
-    ) -> Result<Vec<BaseItemEntity>, ServiceError>;
-
-    /// Builds an instant mix seeded by an artist item.
-    async fn get_instant_mix_from_artist(
-        &self,
-        artist_id: Uuid,
         user_id: Option<Uuid>,
         dto_options: &DtoOptions,
     ) -> Result<Vec<BaseItemEntity>, ServiceError>;

@@ -49,20 +49,26 @@ fn parse_data(data: Option<&str>) -> Map<String, Value> {
     }
 }
 
+/// `MetadataLanguageUtils.GetLanguageSubtag`: the language subtag of a
+/// language tag, lowercased (`es` for `es-ES`).
+#[must_use]
+pub fn language_subtag(language: &str) -> String {
+    language
+        .split_once('-')
+        .map_or(language, |(subtag, _)| subtag)
+        .to_lowercase()
+}
+
 /// `MetadataLanguageUtils.MatchesPreferredLanguage`: whether an answer in
 /// `result` counts as being in the `preferred` language — either one is
 /// unknown ("a provider that doesn't report a language cannot be judged,
 /// assume it honored the request"), or both share a language subtag.
 #[must_use]
 pub fn matches_preferred_language(result: Option<&str>, preferred: &str) -> bool {
-    let subtag = |language: &str| {
-        language
-            .split_once('-')
-            .map_or(language, |(subtag, _)| subtag)
-            .to_lowercase()
-    };
     match result.filter(|result| !result.is_empty()) {
-        Some(result) if !preferred.is_empty() => subtag(result) == subtag(preferred),
+        Some(result) if !preferred.is_empty() => {
+            language_subtag(result) == language_subtag(preferred)
+        }
         _ => true,
     }
 }
@@ -357,6 +363,32 @@ pub fn update_from_members(
     }
 }
 
+/// Whether [`update_from_members`] (and the rating `UpdateOfficialRating`
+/// takes from the members) changed a value upstream reports as
+/// `MetadataEdit`: the premiere date or year, the genres or studios (as
+/// sets, ignoring case: `Order().SequenceEqual(…, OrdinalIgnoreCase)`), or
+/// the rating (ignoring case, unset as empty: `UpdateRatingToItems`). The
+/// runtime is `MetadataImport`, so it is not compared.
+#[must_use]
+pub fn members_edited(before: &BaseItemEntity, after: &BaseItemEntity) -> bool {
+    let sorted = |value: Option<&str>| {
+        let mut values: Vec<String> = list(value)
+            .into_iter()
+            .map(ferrofin_util::string_extensions::ordinal_ignore_case_key)
+            .collect();
+        values.sort_unstable();
+        values
+    };
+    before.premiere_date != after.premiere_date
+        || before.production_year != after.production_year
+        || !ferrofin_util::string_extensions::equals_ordinal_ignore_case(
+            before.official_rating.as_deref().unwrap_or(""),
+            after.official_rating.as_deref().unwrap_or(""),
+        )
+        || sorted(before.genres.as_deref()) != sorted(after.genres.as_deref())
+        || sorted(before.studios.as_deref()) != sorted(after.studios.as_deref())
+}
+
 /// `UpdatePremiereDate` (`MetadataService.cs:543-579`): the earliest member
 /// premiere date and its year; with none, or when the earliest is .NET's
 /// `DateTime.MinValue` (an unset date older rows store), the smallest member
@@ -428,7 +460,7 @@ fn members_union<'a>(values: impl Iterator<Item = Option<&'a str>>) -> Option<St
     let mut seen = HashSet::new();
     let values: Vec<&str> = values
         .flat_map(list)
-        .filter(|v| seen.insert(ferrofin_util::string_extensions::upper_invariant(v)))
+        .filter(|v| seen.insert(ferrofin_util::string_extensions::ordinal_ignore_case_key(v)))
         .collect();
     (!values.is_empty()).then(|| values.join("|"))
 }
@@ -551,7 +583,7 @@ fn union(target: Option<&str>, source: Option<&str>) -> Option<String> {
     let values: Vec<&str> = list(target)
         .into_iter()
         .chain(list(source))
-        .filter(|v| seen.insert(ferrofin_util::string_extensions::upper_invariant(v)))
+        .filter(|v| seen.insert(ferrofin_util::string_extensions::ordinal_ignore_case_key(v)))
         .collect();
     (!values.is_empty()).then(|| values.join("|"))
 }
@@ -987,7 +1019,7 @@ fn remove_invalid_provider_ids(people: &[PeopleEntity]) -> Vec<PeopleEntity> {
 /// The name key `MergePeople` groups by: diacritics removed, compared
 /// ordinal-ignore-case.
 fn person_key(name: &str) -> String {
-    ferrofin_util::string_extensions::upper_invariant(
+    ferrofin_util::string_extensions::ordinal_ignore_case_key(
         &ferrofin_util::string_extensions::remove_diacritics(name),
     )
 }

@@ -26,6 +26,7 @@ mod connection_limits;
 mod encoding_options;
 mod existing_database;
 pub mod listen;
+mod log_file;
 mod log_lines;
 pub mod media_encoding;
 pub mod metrics_wiring;
@@ -836,12 +837,13 @@ async fn serve_once(
 /// restore (applied by the next lifetime, after this one's teardown) never
 /// races a scan writing into the tree it replaces.
 ///
-/// The transcodes are killed and the DVR stopped the same way (gl-141), so no
-/// ffmpeg writes into the transcode cache the next lifetime purges, and every
-/// capture in flight has settled before its database closes: otherwise the
-/// next lifetime would re-arm its timer and record the showing twice. They get
-/// `shutdown_timeout_secs` between them, as upstream's hosted services get the
-/// host's `ShutdownTimeout` to stop in, so a stuck tuner cannot hold a restart.
+/// The attachment extractions and the transcodes are killed and the DVR stopped
+/// the same way (gl-141), so no ffmpeg keeps writing into a cache the next
+/// lifetime purges or extracts into, and every capture in flight has settled
+/// before its database closes: otherwise the next lifetime would re-arm its
+/// timer and record the showing twice. They get `shutdown_timeout_secs`
+/// between them, as upstream's hosted services get the host's
+/// `ShutdownTimeout` to stop in, so a stuck tuner cannot hold a restart.
 async fn tear_down_host(
     wired: WiredApp,
     discovery: Option<tokio::task::JoinHandle<()>>,
@@ -852,7 +854,10 @@ async fn tear_down_host(
     wired.task_manager.shutdown().await;
     wired.state.library.shutdown_scans().await;
     // Transcodes first: a live one holds a tuner stream that Live TV then closes.
+    // Before them the attachment extractions, which are quick to stop and come
+    // before the transcode that burns their fonts in.
     let playback = async {
+        wired.state.attachments.shutdown().await;
         wired.state.hls.shutdown().await;
         if let Some(live_tv) = &wired.state.live_tv {
             live_tv.shutdown().await;
@@ -862,7 +867,7 @@ async fn tear_down_host(
     if tokio::time::timeout(timeout, playback).await.is_err() {
         tracing::warn!(
             timeout_secs,
-            "transcodes or recordings were still stopping when the shutdown timeout ran out; going on without them"
+            "attachment extractions, transcodes or recordings were still stopping when the shutdown timeout ran out; going on without them"
         );
     }
     stop_background_tasks(wired.background).await;
@@ -940,6 +945,21 @@ fn lifetime_app(
     axum::Router::new().fallback_service(app)
 }
 
+/// Kestrel refuses a request whose path holds a NUL (`%00`) before any
+/// middleware runs: an empty `400` that closes the connection (measured on
+/// Jellyfin 12.4), on the startup server too. So no decoded path segment a
+/// handler sees holds a NUL; the query still may.
+async fn refuse_nul_in_path(request: Request, next: Next) -> Response {
+    if request.uri().path().contains("%00") {
+        return (
+            axum::http::StatusCode::BAD_REQUEST,
+            [(axum::http::header::CONNECTION, "close")],
+        )
+            .into_response();
+    }
+    next.run(request).await
+}
+
 /// A lifetime's serve loops, one per listening address, all stopped by the
 /// same trigger. Dropping it aborts them and closes the listeners.
 struct Serving {
@@ -973,12 +993,15 @@ impl Serving {
         serving
     }
 
-    /// Serves `app` on more listeners, stopped by the same trigger.
+    /// Serves `app` on more listeners, stopped by the same trigger, behind
+    /// Kestrel's own refusals ([`refuse_nul_in_path`]).
     fn serve(
         &mut self,
         listeners: impl IntoIterator<Item = listen::ServedListener>,
         app: &axum::Router,
     ) {
+        let app = axum::Router::new()
+            .fallback_service(axum::middleware::from_fn(refuse_nul_in_path).layer(app.clone()));
         for listener in listeners {
             let mut stop = self.stop.subscribe();
             let app = app.clone();
@@ -1440,8 +1463,9 @@ fn mount_web(
 }
 
 /// Serves a `/web` file through the File Transformation pipeline when a
-/// registered transformation matches it; all other requests pass through to
-/// the static `ServeDir` untouched.
+/// registered transformation matches it and would change it; a matched file
+/// no step would change now goes to the static `ServeDir` with `no-cache`, and
+/// all other requests pass through to it untouched.
 ///
 /// Port of the File Transformation plugin's static-file middleware: it reads
 /// the matched file, runs the pipeline over its text, and responds with the
@@ -1473,32 +1497,49 @@ async fn transform_web_file(
             )
         })
         && transformations.needs_transformation(rel).await
-        && let Ok(bytes) = tokio::fs::read(web_root.join(rel)).await
-        && let Ok(text) = String::from_utf8(bytes)
     {
-        let transformed = transformations.run_transformation(rel, text).await;
-        // The plugin's validator (`FileTransformationMiddleware` @ 0900de8f1,
-        // ahead of the ported rev): an `ETag` over the transformed bytes and
-        // `no-cache`, and no `Last-Modified` (so no `If-Modified-Since` to
-        // answer). A changed transform revalidates to a `200`, never stale.
-        let etag = transformed_etag(&transformed);
-        let validators = [
-            (axum::http::header::ETAG, etag.as_str()),
-            (axum::http::header::CACHE_CONTROL, "no-cache"),
-        ];
-        if req
-            .headers()
-            .get(axum::http::header::IF_NONE_MATCH)
-            .is_some_and(|v| v.as_bytes() == etag.as_bytes())
-        {
-            return (axum::http::StatusCode::NOT_MODIFIED, validators).into_response();
+        if !transformations.would_transform(rel).await {
+            // No matching step would change the file now (Intro Skipper's
+            // patch while its opt-in is off, the default), so the static
+            // server sends it, with its validators and `Range`, instead of
+            // the pipeline copying and hashing it. The plugin's middleware
+            // runs such a step; the bytes are the same. `no-cache`, as the
+            // pipeline's answer has: a step that turns on reaches a browser
+            // holding the file at its next load.
+            let mut response = next.run(req).await;
+            response.headers_mut().insert(
+                axum::http::header::CACHE_CONTROL,
+                axum::http::HeaderValue::from_static("no-cache"),
+            );
+            return response;
         }
-        return (
-            [(axum::http::header::CONTENT_TYPE, web_file_mime(rel))],
-            validators,
-            transformed,
-        )
-            .into_response();
+        if let Ok(bytes) = tokio::fs::read(web_root.join(rel)).await
+            && let Ok(text) = String::from_utf8(bytes)
+        {
+            let transformed = transformations.run_transformation(rel, text).await;
+            // The plugin's validator (`FileTransformationMiddleware` @ 0900de8f1,
+            // ahead of the ported rev): an `ETag` over the transformed bytes and
+            // `no-cache`, and no `Last-Modified` (so no `If-Modified-Since` to
+            // answer). A changed transform revalidates to a `200`, never stale.
+            let etag = transformed_etag(&transformed);
+            let validators = [
+                (axum::http::header::ETAG, etag.as_str()),
+                (axum::http::header::CACHE_CONTROL, "no-cache"),
+            ];
+            if req
+                .headers()
+                .get(axum::http::header::IF_NONE_MATCH)
+                .is_some_and(|v| v.as_bytes() == etag.as_bytes())
+            {
+                return (axum::http::StatusCode::NOT_MODIFIED, validators).into_response();
+            }
+            return (
+                [(axum::http::header::CONTENT_TYPE, web_file_mime(rel))],
+                validators,
+                transformed,
+            )
+                .into_response();
+        }
     }
     next.run(req).await
 }
@@ -1660,6 +1701,84 @@ mod tests {
             response.ends_with(&format!("peer=127.0.0.1 local={address}")),
             "{response}"
         );
+    }
+
+    /// A path holding a NUL is Kestrel's empty `400`, and the connection
+    /// closes after it, on the startup server and the lifetime's router alike;
+    /// one in the query reaches the route (measured on Jellyfin 12.4).
+    #[rstest::rstest]
+    #[case::starting(true)]
+    #[case::ready(false)]
+    #[tokio::test]
+    async fn a_nul_in_the_path_is_refused_on_every_listener(#[case] starting: bool) {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        let listener = super::listen::bind("127.0.0.1:0".parse().expect("address")).expect("bind");
+        let address = axum::serve::Listener::local_addr(&listener).expect("local address");
+        let app = if starting {
+            crate::startup::dispatcher(crate::startup::Ready::default())
+        } else {
+            let router =
+                Router::new().route("/echo/{value}", axum::routing::get(|| async { "ok" }));
+            super::lifetime_app(router, "/jellyfin", None)
+        };
+        let _serving =
+            super::Serving::start(vec![crate::listen::ServedListener::Plain(listener)], &app);
+        // (target, refused)
+        let mut cases = vec![
+            ("/jellyfin/echo/1%00", true),
+            ("/System/Info/Public%00", true),
+            ("/x%00", true),
+        ];
+        if !starting {
+            cases.push(("/jellyfin/echo/1?limit=1%00", false));
+            cases.push(("/jellyfin/echo/1%2500", false));
+        }
+        for (target, refused) in cases {
+            let mut stream = tokio::net::TcpStream::connect(address)
+                .await
+                .expect("connect");
+            let request = format!("GET {target} HTTP/1.1\r\nHost: x\r\n\r\n");
+            stream.write_all(request.as_bytes()).await.expect("request");
+            let mut response = Vec::new();
+            if refused {
+                // Read to the end: only a closed connection ends it.
+                tokio::time::timeout(
+                    std::time::Duration::from_secs(10),
+                    stream.read_to_end(&mut response),
+                )
+                .await
+                .expect("the connection closes")
+                .expect("response");
+            } else {
+                let mut chunk = [0_u8; 1024];
+                let read = tokio::time::timeout(
+                    std::time::Duration::from_secs(10),
+                    stream.read(&mut chunk),
+                )
+                .await
+                .expect("answered in time")
+                .expect("response");
+                response.extend_from_slice(&chunk[..read]);
+            }
+            let response = String::from_utf8_lossy(&response).to_ascii_lowercase();
+            let status = if refused {
+                "http/1.1 400"
+            } else {
+                "http/1.1 200"
+            };
+            assert!(response.starts_with(status), "{target}: {response}");
+            if refused {
+                assert!(
+                    response.contains("content-length: 0"),
+                    "{target}: {response}"
+                );
+                assert!(
+                    response.ends_with("\r\n\r\n"),
+                    "{target}: no body: {response}"
+                );
+            }
+        }
     }
 
     /// A panic in a route mounted with no boundary of its own, here a
@@ -2354,6 +2473,86 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(&body[..], b"HELLO WORLD");
+    }
+
+    /// gl-1536: while Intro Skipper's opt-in is off (the default), the bundle
+    /// its skip-button step is registered on is sent by the static server,
+    /// with `Range`, instead of through the pipeline; still `no-cache`, so the
+    /// opt-in, once on, reaches the browser at its next load.
+    #[tokio::test]
+    async fn a_web_file_no_step_would_change_is_served_statically_and_revalidated() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("index.html"), "<!doctype html>ferrofin").unwrap();
+        std::fs::write(
+            dir.path().join("main.jellyfin.bundle.js"),
+            "(t.hideTimeout=setTimeout(t.hideSkipButton.bind(t),8e3))",
+        )
+        .unwrap();
+        let plugins: Arc<dyn ferrofin_traits::plugins::PluginManager> =
+            Arc::new(ferrofin_core::FerrofinPluginManager::new(
+                ferrofin_extensions::registered_plugins(&ferrofin_extensions::builtin_extensions()),
+                dir.path().join("plugins"),
+            ));
+        let service: Arc<dyn FileTransformationService> = Arc::new(
+            ferrofin_extensions::file_transformation::WebFileTransformationService::new(
+                Arc::clone(&plugins),
+                Arc::new(NoLocalApi),
+            ),
+        );
+        ferrofin_extensions::file_transformation::register_skip_button_transformer(
+            service.as_ref(),
+            Arc::clone(&plugins),
+        )
+        .await;
+        let app = mount_web(
+            Router::new(),
+            dir.path(),
+            service,
+            &ferrofin_api::test_support::fake_state(),
+        );
+        let get = |header: Option<(&str, &str)>| {
+            let mut request = Request::builder().uri("/web/main.jellyfin.bundle.js");
+            if let Some((name, value)) = header {
+                request = request.header(name, value);
+            }
+            app.clone().oneshot(request.body(Body::empty()).unwrap())
+        };
+
+        let full = get(None).await.unwrap();
+        assert_eq!(full.status(), StatusCode::OK);
+        assert_eq!(full.headers()["accept-ranges"], "bytes");
+        assert_eq!(full.headers()["cache-control"], "no-cache");
+        let etag = full.headers()["etag"].to_str().unwrap().to_owned();
+        let part = get(Some(("range", "bytes=0-2"))).await.unwrap();
+        assert_eq!(part.status(), StatusCode::PARTIAL_CONTENT);
+        assert_eq!(part.headers()["cache-control"], "no-cache");
+        let body = axum::body::to_bytes(part.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(&body[..], b"(t.");
+        let revalidated = get(Some(("if-none-match", &etag))).await.unwrap();
+        assert_eq!(revalidated.status(), StatusCode::NOT_MODIFIED);
+        assert_eq!(revalidated.headers()["cache-control"], "no-cache");
+
+        // Opted in, the browser's next revalidation gets the patched bundle.
+        plugins
+            .set_plugin_configuration(
+                // The Intro Skipper's plugin id.
+                uuid::Uuid::from_u128(0xc83d_86bb_a1e0_4c35_a113_e210_1cf4_ee6b),
+                br#"{"UseFileTransformationPlugin":true,"SkipbuttonHideDelay":5}"#.to_vec(),
+            )
+            .await
+            .unwrap();
+        let patched = get(Some(("if-none-match", &etag))).await.unwrap();
+        assert_eq!(patched.status(), StatusCode::OK);
+        assert_eq!(patched.headers()["cache-control"], "no-cache");
+        let body = axum::body::to_bytes(patched.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(
+            &body[..],
+            b"false||(t.hideTimeout=setTimeout(t.hideSkipButton.bind(t),5000))"
+        );
     }
 
     #[tokio::test]

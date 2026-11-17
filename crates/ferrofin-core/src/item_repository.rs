@@ -11,9 +11,7 @@
 //! not taken as a field (it would be injected at the composition root if a later
 //! method needs it).
 
-use ferrofin_util::string_extensions::{
-    equals_ordinal_ignore_case, lower_invariant, upper_invariant,
-};
+use ferrofin_util::string_extensions::{equals_ordinal_ignore_case, ordinal_ignore_case_key};
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -31,7 +29,7 @@ use ferrofin_model::dto::ItemCounts;
 use ferrofin_model::entities::ImageType;
 use ferrofin_model::entities::MediaStreamType;
 use ferrofin_model::querying::{QueryFiltersLegacy, QueryResult};
-use ferrofin_traits::options::{ItemImageInfo, live_tv_image_is_internal};
+use ferrofin_traits::options::{ItemImageInfo, file_date_modified, live_tv_image_is_internal};
 use uuid::Uuid;
 
 use ferrofin_traits::error::ServiceError;
@@ -213,6 +211,17 @@ pub(crate) async fn resolve_descendant_query(
     Ok(Some(resolved))
 }
 
+/// Whether `parent` has any `LinkedChildren` row: C# `folder.LinkedChildren.Length > 0`,
+/// the test `SetTopParentIdsOrAncestors` makes before it scopes a box set or
+/// playlist by its descendant set.
+pub(crate) async fn has_linked_children(db: &Database, parent: Uuid) -> Result<bool, ServiceError> {
+    sqlx::query_scalar(r#"SELECT EXISTS (SELECT 1 FROM "LinkedChildren" WHERE "ParentId" = ?1)"#)
+        .bind(guid_to_db(parent))
+        .fetch_one(db.pool())
+        .await
+        .map_err(db_err)
+}
+
 /// One batched frontier query; all link kinds qualify, and only actual folders
 /// become new roots. Canonical JSON IDs avoid a bind per leaf or a variable cap.
 async fn discover_linked_roots(
@@ -275,6 +284,25 @@ struct ViewRow {
     /// and says `false` otherwise, as a library-set row does ([`view_row`]).
     #[sqlx(rename = "_HasLinkedChildren")]
     has_linked_children: bool,
+}
+
+/// Where a fetch's rows come from ([`FerrofinItemRepository::fetch_scope`]).
+#[allow(
+    clippy::large_enum_variant,
+    reason = "built once per fetch and destructured at once; the resolved filter was already returned by value, and boxing it would add an allocation to every browse"
+)]
+enum FetchScope {
+    /// A folders view, answered from the user root's children: already
+    /// filtered, sorted, trimmed to the `AdjacentTo` window and paged.
+    FoldersView(QueryResult<BaseItemEntity>),
+    /// The SQL path.
+    Sql {
+        /// The filter with its views resolved, or `None` when resolving
+        /// changed nothing and the caller's own filter applies.
+        resolved: Option<InternalItemsQuery>,
+        /// The `AdjacentTo` window, or `None` when the filter asks for none.
+        window: Option<Vec<Uuid>>,
+    },
 }
 
 impl FerrofinItemRepository {
@@ -573,7 +601,7 @@ impl FerrofinItemRepository {
 
     async fn sort_folder_children_inner(
         &self,
-        rows: Vec<BaseItemEntity>,
+        mut rows: Vec<BaseItemEntity>,
         filter: &InternalItemsQuery,
     ) -> Result<Vec<BaseItemEntity>, ServiceError> {
         use crate::tv_series_manager::aired_order;
@@ -581,14 +609,16 @@ impl FerrofinItemRepository {
         use ferrofin_model::entities_media::AiredEpisodeOrder;
         use ferrofin_model::live_tv::ItemSortBy;
         use ferrofin_util::stable_sort::stable_sort_by;
-        /// A child with the keys its sort compares, each computed once for
-        /// the row rather than on every comparison (gl-1002); a key the
-        /// request does not name stays `None` and is never compared.
+        /// A child's position with the keys its sort compares, each computed
+        /// once for the row rather than on every comparison (gl-1002); a key
+        /// the request does not name stays `None` and is never compared. The
+        /// row stays in `rows`: only the keys are sorted, then the rows are
+        /// moved into their order in place (gl-1493).
         struct Keyed {
             aired: Option<AiredEpisodeOrder>,
             name: Option<String>,
             sort_name: Option<String>,
-            row: BaseItemEntity,
+            index: usize,
         }
         if rows.is_empty() || filter.order_by.is_empty() {
             return Ok(rows);
@@ -611,17 +641,17 @@ impl FerrofinItemRepository {
             let by_sort_name = sorts_by(ItemSortBy::SortName);
             let episode = stored_type_name(BaseItemKind::Episode);
             let mut keyed: Vec<Keyed> = rows
-                .into_iter()
-                .map(|row| Keyed {
-                    aired: (aired && Some(row.type_.as_str()) == episode)
-                        .then(|| aired_order(&row)),
+                .iter()
+                .enumerate()
+                .map(|(index, row)| Keyed {
+                    aired: (aired && Some(row.type_.as_str()) == episode).then(|| aired_order(row)),
                     name: row
                         .name
                         .as_deref()
                         .filter(|_| by_name)
                         .map(folder_ordinal_key),
-                    sort_name: by_sort_name.then(|| folder_ordinal_key(&folder_sort_name(&row))),
-                    row,
+                    sort_name: by_sort_name.then(|| folder_ordinal_key(&folder_sort_name(row))),
+                    index,
                 })
                 .collect();
             let compare = |a: &Keyed, b: &Keyed| {
@@ -660,7 +690,19 @@ impl FerrofinItemRepository {
             } else {
                 keyed.sort_by(compare);
             }
-            return Ok(keyed.into_iter().map(|keyed| keyed.row).collect());
+            // `slice::sort_by_cached_key`'s permutation: position `i` takes the row
+            // that was at `keyed[i].index`, found by following where earlier swaps
+            // moved it. Writing the found position back is what lets a later
+            // position follow that row too.
+            for i in 0..keyed.len() {
+                let mut index = keyed[i].index;
+                while index < i {
+                    index = keyed[index].index;
+                }
+                keyed[i].index = index;
+                rows.swap(i, index);
+            }
+            return Ok(rows);
         }
         // Keep the existing consumer for other sort fields. Its broader
         // comparator parity is a separate query review, not this display flag.
@@ -748,7 +790,7 @@ impl FerrofinItemRepository {
                     present
                         .entry(id)
                         .or_default()
-                        .insert(upper_invariant(&provider));
+                        .insert(ordinal_ignore_case_key(&provider));
                 }
             }
             rows.retain(|row| {
@@ -1016,20 +1058,14 @@ impl FerrofinItemRepository {
         filter: &InternalItemsQuery,
         row: &BaseItemEntity,
     ) -> Result<ViewRow, ServiceError> {
-        let has_linked_children = filter.recursive
+        let linked = filter.recursive
             && matches!(
                 crate::item_type_lookup::kind_from_type_name(&row.type_),
                 Some(BaseItemKind::BoxSet | BaseItemKind::Playlist)
             )
-            && sqlx::query_scalar(
-                r#"SELECT EXISTS (SELECT 1 FROM "LinkedChildren" WHERE "ParentId" = ?1)"#,
-            )
-            .bind(guid_to_db(filter.parent_id))
-            .fetch_one(db.pool())
-            .await
-            .map_err(db_err)?;
+            && has_linked_children(db, filter.parent_id).await?;
         Ok(ViewRow {
-            has_linked_children,
+            has_linked_children: linked,
             ..view_row(row)
         })
     }
@@ -1588,23 +1624,40 @@ impl FerrofinItemRepository {
             .filter(|collection_type| collection_type != "mixed"))
     }
 
+    /// The scope [`Self::fetch_rows`], [`Self::fetch_ids`],
+    /// [`Self::fetch_id_clean_names`] and `get_items` each run on, worked out
+    /// in this one place so the four cannot drift apart: a folders view's own
+    /// result, or the filter with its views resolved and its `AdjacentTo`
+    /// window, which `GetItems`, `GetItemList` and `GetItemIdsList` all apply
+    /// before paging.
+    async fn fetch_scope(&self, filter: &InternalItemsQuery) -> Result<FetchScope, ServiceError> {
+        let parent = self.query_parent_row(filter).await?;
+        if let Some(result) = self.folders_view_result(filter, parent.as_ref()).await? {
+            return Ok(FetchScope::FoldersView(result));
+        }
+        let resolved = self
+            .resolve_views_with_parent(filter, parent.as_ref())
+            .await?;
+        let window = self
+            .adjacent_ids_resolved(resolved.as_ref().unwrap_or(filter))
+            .await?;
+        Ok(FetchScope::Sql { resolved, window })
+    }
+
     /// Runs a translated query in the requested shape, returning full rows.
     async fn fetch_rows(
         &self,
         filter: &InternalItemsQuery,
         shape: QueryShape,
     ) -> Result<Vec<BaseItemEntity>, ServiceError> {
-        let parent = self.query_parent_row(filter).await?;
-        if let Some(result) = self.folders_view_result(filter, parent.as_ref()).await? {
-            return Ok(result.items);
-        }
-        let resolved = self
-            .resolve_views_with_parent(filter, parent.as_ref())
-            .await?;
+        let (resolved, window) = match self.fetch_scope(filter).await? {
+            FetchScope::FoldersView(result) => return Ok(result.items),
+            FetchScope::Sql { resolved, window } => (resolved, window),
+        };
         let filter = resolved.as_ref().unwrap_or(filter);
         // The window is whole rows whatever the shape: a `FullRows` caller
         // needs them, and an `EpisodeOrder` caller reads a subset of them.
-        if let Some(window) = self.adjacent_ids_resolved(filter).await? {
+        if let Some(window) = window {
             return Ok(sql_page(self.rows_in_order(&window).await?, filter));
         }
         self.fetch_rows_resolved(filter, shape).await
@@ -1684,23 +1737,28 @@ impl FerrofinItemRepository {
     ///
     /// Same statement as [`Self::fetch_rows`] but for the projection, so the
     /// rows — and their order — are identical to what `get_item_list` would
-    /// have returned.
+    /// have returned. An `AdjacentTo` window (a few rows) is read as whole
+    /// rows, as `fetch_rows` reads it.
     async fn fetch_id_clean_names(
         &self,
         filter: &InternalItemsQuery,
     ) -> Result<Vec<(String, Option<String>)>, ServiceError> {
-        let parent = self.query_parent_row(filter).await?;
-        if let Some(result) = self.folders_view_result(filter, parent.as_ref()).await? {
-            return Ok(result
-                .items
-                .into_iter()
+        let id_clean_names = |rows: Vec<BaseItemEntity>| {
+            rows.into_iter()
                 .map(|row| (row.id, row.clean_name))
-                .collect());
-        }
-        let resolved = self
-            .resolve_views_with_parent(filter, parent.as_ref())
-            .await?;
+                .collect()
+        };
+        let (resolved, window) = match self.fetch_scope(filter).await? {
+            FetchScope::FoldersView(result) => return Ok(id_clean_names(result.items)),
+            FetchScope::Sql { resolved, window } => (resolved, window),
+        };
         let filter = resolved.as_ref().unwrap_or(filter);
+        if let Some(window) = window {
+            return Ok(id_clean_names(sql_page(
+                self.rows_in_order(&window).await?,
+                filter,
+            )));
+        }
         let mut qb = build_query(filter, QueryShape::IdAndCleanName);
         qb.build_query_as::<(String, Option<String>)>()
             .fetch_all(self.db.pool())
@@ -1710,19 +1768,18 @@ impl FerrofinItemRepository {
 
     /// Runs a translated query returning only the id column.
     async fn fetch_ids(&self, filter: &InternalItemsQuery) -> Result<Vec<Uuid>, ServiceError> {
-        let parent = self.query_parent_row(filter).await?;
-        if let Some(result) = self.folders_view_result(filter, parent.as_ref()).await? {
-            return Ok(result
-                .items
-                .iter()
-                .filter_map(|row| Uuid::parse_str(&row.id).ok())
-                .collect());
-        }
-        let resolved = self
-            .resolve_views_with_parent(filter, parent.as_ref())
-            .await?;
+        let (resolved, window) = match self.fetch_scope(filter).await? {
+            FetchScope::FoldersView(result) => {
+                return Ok(result
+                    .items
+                    .iter()
+                    .filter_map(|row| Uuid::parse_str(&row.id).ok())
+                    .collect());
+            }
+            FetchScope::Sql { resolved, window } => (resolved, window),
+        };
         let filter = resolved.as_ref().unwrap_or(filter);
-        if let Some(window) = self.adjacent_ids_resolved(filter).await? {
+        if let Some(window) = window {
             return Ok(sql_page(window, filter));
         }
         let mut qb = build_query(filter, QueryShape::IdsOnly);
@@ -2554,9 +2611,9 @@ struct ByNameScope<'a> {
 /// - `PARTITION BY` groups NULLs together, exactly as SQLite's `GROUP BY` and
 ///   as EF translates `GroupBy` — so a set of by-name rows that never got a
 ///   `PresentationUniqueKey` collapses to ONE row. That is faithful, and it is
-///   also why [`crate::item_persistence_service::backfill_missing_presentation_keys`]
-///   exists: reproducing upstream's collapse without also reproducing
-///   upstream's keys would silently delete names from the tab.
+///   also why `ferrofin_db::presentation_key::backfill_by_name_presentation_keys`
+///   runs on every boot: reproducing upstream's collapse without also
+///   reproducing upstream's keys would silently delete names from the tab.
 /// - The window runs over the FILTERED row set (it is in the same SELECT as the
 ///   join and the `WHERE`), which is what upstream does — it groups
 ///   `masterQuery`, i.e. the inner query after `TranslateQuery` applied
@@ -2881,11 +2938,6 @@ fn parse_physical_folder_ids(blob: &str) -> Vec<Uuid> {
         .unwrap_or_default()
 }
 
-/// The characters C# `BaseItemRepository.SearchWildcardTerms` treats as "the
-/// caller is doing a wildcard search" — their presence routes `SearchTerm` to a
-/// raw (unescaped) `LIKE` instead of a literal contains-match.
-const SEARCH_WILDCARD_TERMS: &[char] = &['%', '_', '[', ']', '^'];
-
 /// Hard cap on the ancestor-chain CTE depth — prevents unbounded recursion on
 /// a cyclic `ParentId` chain (real libraries are <10 levels deep).
 const MAX_ANCESTOR_DEPTH: i32 = 32;
@@ -2919,13 +2971,9 @@ const PLAYLIST_ITEMS_SQL: &str = r#"SELECT ch.*,
 /// Appends the caller's name filters against the by-name `bi` row (C#
 /// `TranslateQuery`'s name predicates on the outer query).
 ///
-/// - `SearchTerm` ports the C# two-branch shape (v12 `TranslateQuery.cs:250-265`):
-///   a term containing a wildcard character goes through `LIKE '%term%'`
-///   **unescaped** (client wildcards pass through, as upstream intends); a plain
-///   term is cleaned (`get_clean_value`, as v12's `GetCleanValue`) and matched
-///   as a literal contains on `CleanName`. It still differs from v12.2: the
-///   wildcard branch is chosen on, and matched with, the raw term rather than
-///   the cleaned one, and there is no `OriginalTitle` arm (gl-957).
+/// - `SearchTerm` is the browse's predicate
+///   ([`crate::translate_query::push_search_term`]), as v12.4 runs the same
+///   `TranslateQuery` on the outer query (gl-957).
 /// - `NameStartsWith`, `NameStartsWithOrGreater` and `NameLessThan` are the
 ///   browse's v12.2 `ApplyNameFilters` ([`append_name_ranges`]): a literal
 ///   `SortName` prefix and full-string comparisons against the lowercased,
@@ -2945,18 +2993,7 @@ fn append_by_name_filters(
 ) {
     append_predicates(qb, outer);
     if let Some(term) = non_blank(filter.search_term.as_ref()) {
-        let lowered = lower_invariant(term);
-        if lowered.contains(SEARCH_WILDCARD_TERMS) {
-            let like = format!("%{}%", lowered.trim_matches('%'));
-            qb.push(r#" AND ferrofin_lower_invariant(bi."CleanName") LIKE "#)
-                .push_bind(like);
-        } else {
-            let like = format!(
-                "%{}%",
-                crate::text_util::get_clean_value(term).trim_matches('%')
-            );
-            qb.push(r#" AND bi."CleanName" LIKE "#).push_bind(like);
-        }
+        crate::translate_query::push_search_term(qb, term);
     }
     append_name_ranges(qb, filter);
 }
@@ -3013,8 +3050,9 @@ const ALL_ARTIST_TYPES: &[ItemValueType] = &[ItemValueType::Artist, ItemValueTyp
 
 /// Maps the `BaseItemImageInfos.ImageType` integer discriminant to the wire
 /// [`ImageType`]. The discriminants are the fixed `ImageInfoImageType` values and
-/// line up 1:1 with [`ImageType`]; an out-of-range value falls back to
-/// [`ImageType::Primary`] (the C# default when parsing a legacy row).
+/// line up 1:1 with [`ImageType`]; an out-of-range value is kept as
+/// [`ImageType::Unrecognized`], as upstream's `(ImageType)e.ImageType` cast
+/// keeps it (`BaseItemMapper.MapImageFromEntity`).
 pub(crate) fn image_type_from_disc(disc: i32) -> ImageType {
     ImageType::from_json_value(disc)
 }
@@ -3042,12 +3080,14 @@ pub(crate) fn images_of_items_sql(placeholders: &str) -> String {
 }
 
 /// Projects a persisted [`BaseItemImageInfoEntity`] row into an
-/// [`ItemImageInfo`].
+/// [`ItemImageInfo`], its `%MetadataPath%`-style path expanded: upstream's
+/// `BaseItemMapper.MapImageFromEntity`, which every reader of an image row
+/// goes through (the repository, the DTO batch read, the scan's reads).
 ///
 /// The stored `Blurhash` is a UTF-8 byte blob; an empty blob (or one that is not
 /// valid UTF-8) becomes [`None`]. A zero/negative width or height (the "unknown"
 /// sentinel) is preserved as-is; the API layer nulls those out per Jellyfin.
-fn image_info_from_row(
+pub(crate) fn image_info_from_row(
     row: BaseItemImageInfoEntity,
     virtual_paths: &VirtualPathExpander,
 ) -> ItemImageInfo {
@@ -3604,11 +3644,11 @@ pub(crate) fn folder_ordinal_compare(
 }
 
 /// The ordinal case-insensitive key [`folder_ordinal_compare`] compares, the
-/// .NET invariant upper case: comparing two values is comparing their keys
+/// .NET `OrdinalIgnoreCase` fold: comparing two values is comparing their keys
 /// byte-wise, so a sort can compute each row's key once instead of on every
 /// comparison.
 pub(crate) fn folder_ordinal_key(value: &str) -> String {
-    upper_invariant(value)
+    ordinal_ignore_case_key(value)
 }
 
 pub(crate) fn folder_sort_name(row: &BaseItemEntity) -> String {
@@ -3952,19 +3992,16 @@ impl ItemRepository for FerrofinItemRepository {
                 children,
             ));
         }
-        let parent = self.query_parent_row(filter).await?;
-        if let Some(result) = self.folders_view_result(filter, parent.as_ref()).await? {
-            return Ok(result);
-        }
         // Resolve once for both statements below: the page and its count share
         // one scope, and asking the database twice for the same library's
         // folders is a round trip on every paged browse.
-        let resolved = self
-            .resolve_views_with_parent(filter, parent.as_ref())
-            .await?;
+        let (resolved, window) = match self.fetch_scope(filter).await? {
+            FetchScope::FoldersView(result) => return Ok(result),
+            FetchScope::Sql { resolved, window } => (resolved, window),
+        };
         let filter = resolved.as_ref().unwrap_or(filter);
         let start_index = filter.start_index.unwrap_or(0);
-        if let Some(window) = self.adjacent_ids_resolved(filter).await? {
+        if let Some(window) = window {
             // `GetItems` counts the trimmed set, then pages it.
             let window_len = window.len();
             let items = sql_page(self.rows_in_order(&window).await?, filter);
@@ -3973,7 +4010,8 @@ impl ItemRepository for FerrofinItemRepository {
             {
                 i32::try_from(window_len).unwrap_or(i32::MAX)
             } else {
-                i32::try_from(items.len()).unwrap_or(i32::MAX) + start_index
+                // Uncounted (`GetItemList`) or unpaged: the page's own length.
+                i32::try_from(items.len()).unwrap_or(i32::MAX)
             };
             return Ok(QueryResult::new(Some(start_index), Some(total), items));
         }
@@ -4007,8 +4045,12 @@ impl ItemRepository for FerrofinItemRepository {
             && !count_is_known
         {
             self.fetch_count_resolved(filter).await?
-        } else {
+        } else if filter.enable_total_record_count {
             page_len + start_index
+        } else {
+            // Uncounted: `GetItems` answers `GetItemList`'s page and its length
+            // (v12.4 `BaseItemRepository.Querying.cs:34-40`), whatever the offset.
+            page_len
         };
         Ok(QueryResult::new(Some(start_index), Some(total), items))
     }
@@ -4078,7 +4120,9 @@ impl ItemRepository for FerrofinItemRepository {
         &self,
         filter: &InternalItemsQuery,
     ) -> Result<Vec<(String, Option<String>)>, ServiceError> {
-        self.fetch_id_clean_names(filter).await
+        let prepared = grouped_by_metadata_key(filter);
+        self.fetch_id_clean_names(prepared.as_ref().unwrap_or(filter))
+            .await
     }
 
     async fn get_latest_item_list(
@@ -4460,13 +4504,9 @@ impl ItemRepository for FerrofinItemRepository {
         // their paths — and then clears the cached dimensions and re-reads each
         // modified time from its file.
         let modified = tokio::task::spawn_blocking(move || {
-            swap_image_files(std::path::Path::new(&path1), std::path::Path::new(&path2))?;
-            let stamp = |path: &str| {
-                std::fs::metadata(path)
-                    .and_then(|meta| meta.modified())
-                    .map_or_else(|_| Utc::now(), chrono::DateTime::<Utc>::from)
-            };
-            Ok::<_, std::io::Error>((stamp(&path1), stamp(&path2)))
+            let (path1, path2) = (std::path::Path::new(&path1), std::path::Path::new(&path2));
+            swap_image_files(path1, path2)?;
+            Ok::<_, std::io::Error>((file_date_modified(path1), file_date_modified(path2)))
         })
         .await
         .map_err(|error| ServiceError::backend(error.to_string()))?
@@ -5085,6 +5125,41 @@ mod tests {
     use ferrofin_model::data::BaseItemKind;
     use ferrofin_model::entities::ExtraType;
     use ferrofin_traits::persistence::ItemPersistenceService;
+    use ferrofin_util::string_extensions::lower_invariant;
+
+    /// `MapImageFromEntity`: the type is cast as stored, an unknown one kept;
+    /// an empty or non-UTF-8 blurhash reads as none; no stored date is the
+    /// epoch.
+    #[rstest::rstest]
+    #[case::known_type(1, Some(b"LKO2".to_vec()), ImageType::Art, Some("LKO2"))]
+    #[case::unknown_type_kept(99, None, ImageType::Unrecognized(99), None)]
+    #[case::empty_blurhash(0, Some(Vec::new()), ImageType::Primary, None)]
+    #[case::non_utf8_blurhash(0, Some(vec![0xFF, 0xFE]), ImageType::Primary, None)]
+    fn an_image_row_maps_as_upstream_reads_it(
+        #[case] disc: i32,
+        #[case] blurhash: Option<Vec<u8>>,
+        #[case] image_type: ImageType,
+        #[case] blur_hash: Option<&str>,
+    ) {
+        let row = BaseItemImageInfoEntity {
+            id: "id".to_owned(),
+            blurhash,
+            date_modified: None,
+            height: 2,
+            image_type: disc,
+            item_id: "item".to_owned(),
+            path: "/m/poster.jpg".to_owned(),
+            width: 3,
+        };
+        let image = image_info_from_row(row, &VirtualPathExpander::identity());
+        assert_eq!(image.image_type, image_type);
+        assert_eq!(image.blur_hash.as_deref(), blur_hash);
+        assert_eq!(image.date_modified, default_epoch());
+        assert_eq!(
+            (image.path.as_str(), image.width, image.height),
+            ("/m/poster.jpg", 3, 2)
+        );
+    }
 
     /// The batched image read answers each item exactly as `get_image_infos`
     /// does (by type, then insertion order), and leaves out an item with no
@@ -6384,6 +6459,18 @@ mod tests {
             .unwrap();
         assert_eq!(ids(&paged.items), [guid_to_db(charlie)]);
         assert_eq!(paged.total_record_count, 3);
+        // With the count off, the total is the page's length (`GetItemList`).
+        let uncounted = repository
+            .get_items(&InternalItemsQuery {
+                start_index: Some(1),
+                limit: Some(1),
+                enable_total_record_count: false,
+                ..adjacent(charlie)
+            })
+            .await
+            .unwrap();
+        assert_eq!(ids(&uncounted.items), [guid_to_db(charlie)]);
+        assert_eq!(uncounted.total_record_count, 1);
         // Neighbours follow the order the query asked for.
         let descending = repository
             .get_item_list(&InternalItemsQuery {
@@ -6400,6 +6487,33 @@ mod tests {
         assert_eq!(
             repository.get_item_ids(&adjacent(bravo)).await.unwrap(),
             [alpha, bravo, charlie]
+        );
+        let clean_ids = |rows: Vec<(String, Option<String>)>| -> Vec<String> {
+            rows.into_iter().map(|(id, _)| id).collect()
+        };
+        assert_eq!(
+            clean_ids(
+                repository
+                    .get_item_id_clean_names(&adjacent(bravo))
+                    .await
+                    .unwrap()
+            ),
+            [alpha, bravo, charlie].map(guid_to_db),
+            "the clean-name projection trims to the same window as get_item_list"
+        );
+        assert_eq!(
+            clean_ids(
+                repository
+                    .get_item_id_clean_names(&InternalItemsQuery {
+                        start_index: Some(1),
+                        limit: Some(1),
+                        ..adjacent(charlie)
+                    })
+                    .await
+                    .unwrap()
+            ),
+            [guid_to_db(charlie)],
+            "and pages the window as the other projections do"
         );
         // A nil id is no adjacency request at all.
         assert_eq!(
@@ -7583,6 +7697,10 @@ mod tests {
 
         let list = repository.get_item_list(&query).await.expect("list");
         let ids = repository.get_item_ids(&query).await.expect("ids");
+        let clean = repository
+            .get_item_id_clean_names(&query)
+            .await
+            .expect("clean names");
         let page = repository
             .get_items(&InternalItemsQuery {
                 enable_total_record_count: true,
@@ -7592,8 +7710,8 @@ mod tests {
             .expect("page");
         assert_eq!(page.total_record_count, 10, "the total counts every match");
         assert_eq!(
-            (list.len(), ids.len(), page.items.len()),
-            (rows, rows, rows)
+            (list.len(), ids.len(), clean.len(), page.items.len()),
+            (rows, rows, rows, rows)
         );
     }
 
@@ -7643,6 +7761,45 @@ mod tests {
                 "total for limit={limit} start={start}"
             );
         }
+    }
+
+    /// With the count turned off, `GetItems` answers `GetItemList`'s page and
+    /// its length as the total (v12.4 `BaseItemRepository.Querying.cs:34-40`),
+    /// whatever the offset: never the offset plus the page.
+    #[rstest::rstest]
+    #[case::short_page_at_an_offset(Some(5), 10, 2)]
+    #[case::full_page_at_an_offset(Some(5), 5, 5)]
+    #[case::offset_without_a_limit(None, 3, 9)]
+    #[case::first_page(Some(5), 0, 5)]
+    #[case::past_the_end(Some(5), 20, 0)]
+    #[tokio::test]
+    async fn an_uncounted_page_reports_its_own_length(
+        #[case] limit: Option<i32>,
+        #[case] start: i32,
+        #[case] want: usize,
+    ) {
+        let db = test_db().await;
+        let repository = repo(&db);
+        for i in 0..12u128 {
+            seed_named_item(
+                &db,
+                Uuid::from_u128(0x7200 + i),
+                BaseItemKind::Movie,
+                &format!("Film {i:02}"),
+            )
+            .await;
+        }
+        let res = repository
+            .get_items(&InternalItemsQuery {
+                limit,
+                start_index: Some(start),
+                enable_total_record_count: false,
+                ..InternalItemsQuery::default()
+            })
+            .await
+            .expect("get_items");
+        assert_eq!(res.items.len(), want);
+        assert_eq!(usize::try_from(res.total_record_count).unwrap(), want);
     }
 
     /// The locked-item read must SEEK the partial index, never scan `BaseItems`.
@@ -9136,16 +9293,54 @@ mod tests {
         assert_eq!(s.items[0].item.name.as_deref(), Some("Drama"));
         assert_eq!(s.items[0].counts.movie_count, 2);
         assert_eq!(s.items[0].counts.item_count, 2);
+    }
 
-        // A searchTerm carrying a wildcard character routes through raw LIKE —
-        // the `_` matches any one character (C# SearchWildcardTerms branch).
-        let wild = InternalItemsQuery {
-            search_term: Some("dr_ma".to_owned()),
-            ..Default::default()
-        };
-        let w = repository.get_genres(&wild).await.expect("wild");
-        assert_eq!(w.items.len(), 1);
-        assert_eq!(w.items[0].item.name.as_deref(), Some("Drama"));
+    /// gl-957: a by-name list's `searchTerm` is `TranslateQuery`'s search
+    /// branch, as a browse's. The cases are a stock Jellyfin 12.4's `/Genres`
+    /// answers over the same five genres: a wildcard character is cleaned to a
+    /// space like any punctuation (upstream's wildcard branch is unreachable),
+    /// a term that cleans to nothing matches every row, and a row's
+    /// `OriginalTitle` matches, ASCII case folded.
+    #[rstest::rstest]
+    #[case("rock", &["Rock Roll", "Rock and Roll"])]
+    #[case("rock%roll", &["Rock Roll"])]
+    #[case("a_b", &["A B"])]
+    #[case("sci^fi", &["Sci-Fi"])]
+    #[case("[a]", &["A B", "Acb", "Rock and Roll"])]
+    #[case("quixotic", &["Acb"])]
+    #[case("QUIXOTIC", &["Acb"])]
+    #[case("!!", &["A B", "Acb", "Rock Roll", "Rock and Roll", "Sci-Fi"])]
+    #[case("%%", &["A B", "Acb", "Rock Roll", "Rock and Roll", "Sci-Fi"])]
+    #[tokio::test]
+    async fn by_name_search_term_is_translate_querys_search_branch(
+        #[case] term: &str,
+        #[case] expected: &[&str],
+    ) {
+        let db = test_db().await;
+        let movie = Uuid::from_u128(0x0957);
+        seed_named_item(&db, movie, BaseItemKind::Movie, "One").await;
+        for genre in ["Rock and Roll", "Acb", "Rock Roll", "A B", "Sci-Fi"] {
+            seed_item_genre(&db, movie, genre).await;
+        }
+        sqlx::query(r#"UPDATE "BaseItems" SET "OriginalTitle" = 'Quixotic' WHERE "Name" = 'Acb'"#)
+            .execute(db.writer())
+            .await
+            .unwrap();
+
+        let genres = repo(&db)
+            .get_genres(&InternalItemsQuery {
+                search_term: Some(term.to_owned()),
+                ..Default::default()
+            })
+            .await
+            .expect("genres");
+        let mut names: Vec<_> = genres
+            .items
+            .iter()
+            .filter_map(|i| i.item.name.clone())
+            .collect();
+        names.sort();
+        assert_eq!(names, expected);
     }
 
     /// `NameStartsWith` on a by-name list is v12.2 `ApplyNameFilters`, the
@@ -14527,8 +14722,8 @@ mod tests {
     /// Reproducing it faithfully is only half the job: Ferrofin must also write
     /// the keys upstream writes, or it reproduces the collapse WITHOUT the keys
     /// that save most rows from it. That is
-    /// `backfill_missing_presentation_keys`, and this test is the reason it is
-    /// not optional.
+    /// `ferrofin_db::presentation_key::backfill_by_name_presentation_keys`, and
+    /// this test is the reason it is not optional.
     #[tokio::test]
     async fn unkeyed_by_name_rows_collapse_the_way_upstream_collapses_them() {
         let db = test_db().await;
@@ -14568,7 +14763,7 @@ mod tests {
 
         // …and once the keys are repaired, both names come back.
         assert_eq!(
-            crate::item_persistence_service::backfill_missing_presentation_keys(&db)
+            ferrofin_db::presentation_key::backfill_by_name_presentation_keys(db.writer())
                 .await
                 .expect("backfill"),
             2
@@ -15553,6 +15748,9 @@ mod folder_get_result_tests {
             ("x\u{10000}", "x\u{e000}", std::cmp::Ordering::Greater),
             ("\u{10000}", "\u{10001}", std::cmp::Ordering::Less),
             ("\u{10000}", "\u{20000}", std::cmp::Ordering::Less),
+            // The long s keeps its case, so it sorts after every ASCII letter.
+            ("\u{17f}", "Z", std::cmp::Ordering::Greater),
+            ("\u{17f}", "s", std::cmp::Ordering::Greater),
         ] {
             assert_eq!(folder_ordinal_compare(Some(left), Some(right)), expected);
         }
@@ -16759,7 +16957,8 @@ pub(crate) async fn by_name_ids_by_clean_name(
     // Padded as the `IN` reads are, so the `VALUES` list is one of a few
     // lengths in each connection's statement cache, not one per key count
     // (gl-1403). A repeated key returns its row again; the map keeps one.
-    // Three binds a key: a full chunk binds 768, under SQLite's 999 floor.
+    // Three binds a key: a full chunk binds 768, above `BATCH_BIND_CHUNK` on
+    // purpose (padded shapes, gl-1403) and far under SQLite's 32,766 limit.
     for chunk in ferrofin_db::padded_in_chunks(keys) {
         let mut query = sqlx::query_as::<_, (String, String, Option<String>)>(sqlx::AssertSqlSafe(
             by_name_ids_sql(chunk.len()),

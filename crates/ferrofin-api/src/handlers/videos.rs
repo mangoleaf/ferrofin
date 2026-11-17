@@ -37,6 +37,11 @@ async fn get_video_stream(
 ) -> Result<Response, ApiError> {
     let raw = request.uri().query().map(ToOwned::to_owned);
     let req = crate::handlers::hls::request_from_query(item_id, query, raw, &auth);
+    if let Some(rejection) =
+        crate::handlers::hls::stream_pattern_failures(&req, req.output_container.as_deref())
+    {
+        return Ok(rejection);
+    }
     require_streamable_item(
         &state,
         &auth,
@@ -46,7 +51,6 @@ async fn get_video_stream(
         req.media_source_id.as_deref(),
     )
     .await?;
-    crate::handlers::hls::validate_stream_request(&req)?;
     static_or_transcode(&state, item_id, false, req, request).await
 }
 
@@ -60,11 +64,12 @@ async fn get_video_stream_by_container(
 ) -> Result<Response, ApiError> {
     let raw = request.uri().query().map(ToOwned::to_owned);
     let mut req = crate::handlers::hls::request_from_query(item_id, query, raw, &auth);
-    req.output_container = Some(
-        stream_route_container(&container)
-            .ok_or_else(|| ApiError::NotFound("stream route".to_owned()))?
-            .to_owned(),
-    );
+    let container = stream_route_container(&container)
+        .ok_or_else(|| ApiError::NotFound("stream route".to_owned()))?;
+    if let Some(rejection) = crate::handlers::hls::route_container_failures(&req, Some(container)) {
+        return Ok(rejection);
+    }
+    req.output_container = Some(container.to_owned());
     require_streamable_item(
         &state,
         &auth,
@@ -74,7 +79,6 @@ async fn get_video_stream_by_container(
         req.media_source_id.as_deref(),
     )
     .await?;
-    crate::handlers::hls::validate_stream_request(&req)?;
     static_or_transcode(&state, item_id, false, req, request).await
 }
 

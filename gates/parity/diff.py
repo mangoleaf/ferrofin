@@ -1419,14 +1419,18 @@ def new_differences(results, rules):
 FINDINGS_BODY_CHARS = 4000
 
 
-def findings(new):
+def findings(new, filed):
     """new-differences.json as Markdown for filing: one section per field path and kind not filed yet
     (the dedupe key of the issue tracker, beside the request pattern), each with the requests that show it
-    and the first one's values and bodies."""
+    and the first one's values and bodies, then the `filed` entries that matched nothing. What is filed is
+    decided by `filed` (filed.toml's entries) as it is now, not by the mark the run stored, so entries
+    written after the run are checked against it without another run."""
+    as_results = [{"id": entry["request"], "differences": [{**d, "ledger": None} for d in entry["differences"]]}
+                  for entry in new["requests"]]
     groups = {}
     for entry in new["requests"]:
         for d in entry["differences"]:
-            if not d.get("filed"):
+            if not filed_issue(filed, entry["request"], Difference(d["path"], d["at"], d["kind"], d["oracle"], d["ferrofin"])):
                 # an image tag as a key (a blurhash map): one group for every tag, not one per image
                 path = tag_path(d["path"])
                 groups.setdefault((path, d["kind"]), []).append((entry, d))
@@ -1447,6 +1451,11 @@ def findings(new):
             cut = len(text) > FINDINGS_BODY_CHARS
             note = f" (cut at {FINDINGS_BODY_CHARS} characters; the whole body is in new-differences.json)" if cut else ""
             out.append(f"\n{name} (normalised){note}:\n````json\n{text[:FINDINGS_BODY_CHARS]}\n````")
+        out.append("")
+    unused = unused_filed(filed, as_results)
+    if unused:   # a mistyped entry, or one fixed or no longer sent
+        out.append(f"# Filed entries that matched nothing on this run: {len(unused)}\n")
+        out.extend(f"- `{u['request']}` `{u['path']}`: gl-{u['issue']}" for u in unused)
         out.append("")
     return "\n".join(out)
 
@@ -1616,6 +1625,8 @@ def build_parser():
     log.add_argument("--timeout", type=int, default=REQUEST_TIMEOUT_DEFAULT_S)
     find = sub.add_parser("findings", help="print a run's new differences not filed yet as Markdown, for filing")
     find.add_argument("--out", required=True, help="the run directory")
+    find.add_argument("--filed", default=str(HERE / "filed.toml"),
+                      help="the differences filed as issues, as the file is now (not as the run saw it)")
     fail = sub.add_parser("failure")
     fail.add_argument("--out", required=True)
     fail.add_argument("--reason", required=True)
@@ -1637,7 +1648,7 @@ def main(argv):
             print(f"parity: {len(requests)} request(s), {len(rules)} rule(s), {len(entries)} ledger entr{'y' if len(entries) == 1 else 'ies'}: valid")
             return 0
         if args.command == "findings":
-            print(findings(json.loads((Path(args.out) / "new-differences.json").read_text())))
+            print(findings(json.loads((Path(args.out) / "new-differences.json").read_text()), load_filed(args.filed)))
             return 0
         if args.command == "login":
             print(login(args.url, json.loads(Path(args.ids).read_text()), args.timeout))

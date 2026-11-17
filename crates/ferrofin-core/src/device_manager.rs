@@ -550,13 +550,6 @@ impl DeviceManager for FerrofinDeviceManager {
     ) -> Result<Option<DeviceOptionsEntity>, ServiceError> {
         self.options_row(device_id).await
     }
-
-    async fn to_client_capabilities_dto(
-        &self,
-        capabilities: &ClientCapabilities,
-    ) -> Result<ClientCapabilitiesDto, ServiceError> {
-        Ok(client_capabilities_to_dto(capabilities))
-    }
 }
 
 #[cfg(test)]

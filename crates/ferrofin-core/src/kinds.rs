@@ -21,8 +21,8 @@
 //! field too: [`supports_played_status`] the row's `MediaType` (a playlist),
 //! [`supports_position_ticks_resume`] its `ExtraType` (a video extra).
 
-use ferrofin_model::data::{BaseItemKind, CollectionType, MediaType, UnratedItem};
-use ferrofin_model::entities::{CollectionTypeOptions, ExtraType};
+use ferrofin_model::data::{BaseItemKind, MediaType, UnratedItem};
+use ferrofin_model::entities::ExtraType;
 use uuid::Uuid;
 
 /// The class-specific `GetBlockUnratedType` overrides. Audio depends on its source.
@@ -748,30 +748,6 @@ pub fn photo_auto_orients(orientation: Option<&str>) -> bool {
     !orientation.is_some_and(|o| o.eq_ignore_ascii_case("TopLeft"))
 }
 
-/// Maps a library's configured [`CollectionTypeOptions`] to the
-/// [`CollectionType`] its `CollectionFolder` reports (C#
-/// `CollectionFolder.CollectionType`, parsed from the `<type>.collection`
-/// marker). `mixed` has no single type and maps to `None` — exactly what
-/// Jellyfin does for a mixed-content library.
-///
-/// The API crate carries the same table (`handlers::user_views::
-/// map_collection_type`) because handlers may not import `ferrofin-core`; the
-/// one home that would serve both is `ferrofin-model`, which this crate does
-/// not own. Keep the two in step (both are pinned by an exhaustive test).
-#[must_use]
-pub fn collection_type_of(options: CollectionTypeOptions) -> Option<CollectionType> {
-    Some(match options {
-        CollectionTypeOptions::movies => CollectionType::movies,
-        CollectionTypeOptions::tvshows => CollectionType::tvshows,
-        CollectionTypeOptions::music => CollectionType::music,
-        CollectionTypeOptions::musicvideos => CollectionType::musicvideos,
-        CollectionTypeOptions::homevideos => CollectionType::homevideos,
-        CollectionTypeOptions::boxsets => CollectionType::boxsets,
-        CollectionTypeOptions::books => CollectionType::books,
-        CollectionTypeOptions::mixed => return None,
-    })
-}
-
 #[cfg(test)]
 mod people_tests {
     use super::supports_people;
@@ -816,15 +792,13 @@ mod people_tests {
 #[cfg(test)]
 mod tests {
     use super::{
-        collection_type_of, has_media_sources, implements_has_media_sources, is_folder,
-        is_item_by_name, is_video, latest_items_index_container_kind, photo_auto_orients,
-        presentation_unique_key, saved_sort_name, series_presentation_unique_key,
-        series_user_data_keys, supports_adding_to_playlist, supports_inherited_parent_images,
-        supports_played_status, supports_position_ticks_resume, supports_similarity,
+        has_media_sources, implements_has_media_sources, is_folder, is_item_by_name, is_video,
+        latest_items_index_container_kind, photo_auto_orients, presentation_unique_key,
+        saved_sort_name, series_presentation_unique_key, series_user_data_keys,
+        supports_adding_to_playlist, supports_inherited_parent_images, supports_played_status,
+        supports_position_ticks_resume, supports_similarity,
     };
-    use ferrofin_model::data::MediaType;
-    use ferrofin_model::data::{BaseItemKind, CollectionType};
-    use ferrofin_model::entities::CollectionTypeOptions;
+    use ferrofin_model::data::{BaseItemKind, MediaType};
     use ferrofin_model::entities::ExtraType;
     use rstest::rstest;
 
@@ -1115,22 +1089,6 @@ mod tests {
         #[case] expected: Option<BaseItemKind>,
     ) {
         assert_eq!(latest_items_index_container_kind(kind), expected);
-    }
-
-    #[rstest]
-    #[case(CollectionTypeOptions::movies, Some(CollectionType::movies))]
-    #[case(CollectionTypeOptions::tvshows, Some(CollectionType::tvshows))]
-    #[case(CollectionTypeOptions::music, Some(CollectionType::music))]
-    #[case(CollectionTypeOptions::musicvideos, Some(CollectionType::musicvideos))]
-    #[case(CollectionTypeOptions::homevideos, Some(CollectionType::homevideos))]
-    #[case(CollectionTypeOptions::boxsets, Some(CollectionType::boxsets))]
-    #[case(CollectionTypeOptions::books, Some(CollectionType::books))]
-    #[case(CollectionTypeOptions::mixed, None)]
-    fn collection_type_maps_library_options_to_the_folder_type(
-        #[case] options: CollectionTypeOptions,
-        #[case] expected: Option<CollectionType>,
-    ) {
-        assert_eq!(collection_type_of(options), expected);
     }
 
     // The controller guard: `item is Episode || (item is IItemByName &&

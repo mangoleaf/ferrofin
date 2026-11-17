@@ -5,11 +5,7 @@
 //! `TimeCode`, `Paragraph`, and `Subtitle`. The libse library has no Rust
 //! equivalent, so these types are hand-ported (rather than reused).
 
-/// The number of 100-nanosecond ticks in one millisecond.
-///
-/// `TimeSpan.Ticks` in .NET counts 100 ns units; libse timecodes are stored in
-/// milliseconds, so converting to ticks multiplies by this constant.
-pub const TICKS_PER_MILLISECOND: i64 = 10_000;
+use ferrofin_util::ticks::TICKS_PER_MS;
 
 /// A subtitle timecode, stored like libse's: a fractional number of milliseconds.
 ///
@@ -41,7 +37,7 @@ impl TimeCode {
     #[allow(clippy::cast_precision_loss)] // .NET does the same `long` → `double` division
     pub fn from_ticks(ticks: i64) -> Self {
         Self {
-            total_milliseconds: ticks as f64 / TICKS_PER_MILLISECOND as f64,
+            total_milliseconds: ticks as f64 / TICKS_PER_MS as f64,
         }
     }
 
@@ -82,7 +78,7 @@ impl TimeCode {
             return 0;
         }
         #[allow(clippy::cast_precision_loss)]
-        let ticks = ms * TICKS_PER_MILLISECOND as f64;
+        let ticks = ms * TICKS_PER_MS as f64;
         ticks as i64
     }
 
@@ -90,25 +86,25 @@ impl TimeCode {
     #[must_use]
     pub fn hours(self) -> i32 {
         // At most 99 hours (the MaxTime guard), so the narrowing cannot lose anything.
-        i32::try_from(self.ticks() / (TICKS_PER_MILLISECOND * 3_600_000)).unwrap_or(0)
+        i32::try_from(self.ticks() / (TICKS_PER_MS * 3_600_000)).unwrap_or(0)
     }
 
     /// `TimeCode.Minutes`: the `TimeSpan`'s minutes component (negative for a negative time).
     #[must_use]
     pub fn minutes(self) -> i32 {
-        i32::try_from(self.ticks() / (TICKS_PER_MILLISECOND * 60_000) % 60).unwrap_or(0)
+        i32::try_from(self.ticks() / (TICKS_PER_MS * 60_000) % 60).unwrap_or(0)
     }
 
     /// `TimeCode.Seconds`: the `TimeSpan`'s seconds component.
     #[must_use]
     pub fn seconds(self) -> i32 {
-        i32::try_from(self.ticks() / (TICKS_PER_MILLISECOND * 1000) % 60).unwrap_or(0)
+        i32::try_from(self.ticks() / (TICKS_PER_MS * 1000) % 60).unwrap_or(0)
     }
 
     /// `TimeCode.Milliseconds`: the `TimeSpan`'s milliseconds component.
     #[must_use]
     pub fn milliseconds(self) -> i32 {
-        i32::try_from(self.ticks() / TICKS_PER_MILLISECOND % 1000).unwrap_or(0)
+        i32::try_from(self.ticks() / TICKS_PER_MS % 1000).unwrap_or(0)
     }
 
     /// The `TimeCode.Milliseconds` setter: the time rebuilt from the `TimeSpan`'s
@@ -118,7 +114,7 @@ impl TimeCode {
     pub fn set_milliseconds(&mut self, milliseconds: i32) {
         // The components truncate toward zero together, so they add back up to the
         // `TimeSpan`'s whole seconds.
-        let whole_seconds = self.ticks() / (TICKS_PER_MILLISECOND * 1000);
+        let whole_seconds = self.ticks() / (TICKS_PER_MS * 1000);
         #[allow(clippy::cast_precision_loss)] // whole milliseconds within ±99:59:59
         let total = (whole_seconds * 1000 + i64::from(milliseconds)) as f64;
         self.total_milliseconds = total;

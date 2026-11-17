@@ -241,7 +241,7 @@ Jellyfin `jellyfin.db` (root or `data/jellyfin.db`) found in the data dir — se
 | `FERROFIN_PORT` | `8096` | HTTP port. It and the `--port` flag outrank **Local HTTP port number** on Dashboard → Networking, which outranks the `config.toml` key `port` unless it holds the default, `8096`. A change on the Networking page applies after a restart, and the dashboard shows the restart as pending. The container image sets `FERROFIN_PORT=8096`, so in a container the Networking page's port applies only once the variable is set blank (`FERROFIN_PORT=`), and the port mapping must follow it. |
 | `FERROFIN_HTTPS_PORT` | `8920` | HTTPS port (parity value). Served beside the HTTP port when the dashboard's Networking settings enable HTTPS and the PKCS#12 (`.pfx`) certificate at their certificate path loads; see [HTTPS](#https). It outranks **Local HTTPS port number** on Dashboard → Networking, which outranks the `config.toml` key `https_port` unless it holds the default, `8920`. A change on the Networking page applies after a restart. When the Networking page gives both ports the same number, it sets neither (Jellyfin resets both to the defaults). |
 | `FERROFIN_PUBLISHED_URL` | auto-detect | Public base URL advertised to clients. |
-| `FERROFIN_BASE_URL` | none | URL path prefix the server is mounted under. It outranks **Base URL** on Dashboard → Networking, which outranks the `config.toml` key `base_url`. A blank value is set: it serves at the root and still outranks the Networking page. A change on the Networking page applies after a restart, and the dashboard shows the restart as pending. |
+| `FERROFIN_BASE_URL` | none | URL path prefix the server is mounted under. It outranks **Base URL** on Dashboard → Networking, which outranks the `config.toml` key `base_url`. A blank value is set: it serves at the root and still outranks the Networking page. A change on the Networking page applies after a restart, and the dashboard shows the restart as pending. A space or a non-ASCII letter may be written plain or escaped (`/my jellyfin` or `/my%20jellyfin`): either serves `/my%20jellyfin/…`. |
 | `FERROFIN_SERVER_NAME` | host name | Server name reported to clients. |
 | `FERROFIN_LOG` | `info` | Log filter, `RUST_LOG`/`EnvFilter` syntax; `RUST_LOG` wins when set. The `config.toml` key is `log_level`. |
 | `FERROFIN_LOG_FORMAT` | `json` | Stdout log lines: `json` (one JSON object per line, with the request's `trace_id`, for a log pipeline) or `text` (human-readable, for running the server by hand). Any other value logs a warning and is `json`. The log file under `{data_dir}/log` is always plain text. The `config.toml` key is `log_format`. |
@@ -502,12 +502,10 @@ Not runtime config, listed for completeness:
 
 - `FERROFIN_REFRESH_PLUGIN_ASSETS=1` — re-fetch vendored extension settings pages during
   `cargo build -p ferrofin-extensions`.
-- `FERROFIN_SCAN_BENCH=1` — run the opt-in library-scan measurement harness
-  (`apps/ferrofin-server/tests/scan_bench.rs`); reports items/second for a generated
-  fixture library. `FERROFIN_SCAN_BENCH_{MOVIES,SERIES,EPISODES}` size it,
-  `FERROFIN_SCAN_BENCH_PROBE=1` turns on the real ffprobe, and
+- `FERROFIN_SCAN_BENCH_{MOVIES,SERIES,EPISODES}` — size the opt-in library-scan
+  measurement harness (`apps/ferrofin-server/tests/scan_bench.rs`, `#[ignore]`d: run it
+  with `-- --include-ignored`), which reports items/second for a generated fixture
+  library. `FERROFIN_SCAN_BENCH_PROBE=1` turns on the real ffprobe, and
   `FERROFIN_SCAN_BENCH_{MEDIA,POSTER}` point it at real sample files.
-- `FERROFIN_LDAP_TESTS=1` — run the LDAP-Auth directory test against OpenLDAP in
-  containers (`crates/ferrofin-extensions/tests/ldap_directory.rs`; needs docker).
 - `FERROFIN_WASM_GUEST_TESTS=1` — build `examples/wasm-hello` from source (needs the
   wasm32-wasip2 target) and run the end-to-end WASM plugin tests.
