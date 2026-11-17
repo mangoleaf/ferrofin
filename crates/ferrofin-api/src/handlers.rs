@@ -2336,7 +2336,11 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
                    runs whatever the options), ApplySearchResult \
                    (ResolverGuesses::pin_search's name and year and search_result_ids for the \
                    lookup; a season or an episode keeps none of its own ids, \
-                   RefreshContext::identified), remote_sources and provider_order \
+                   RefreshContext::identified, and its providers resolve the series by the \
+                   chosen ids alone, ResolverGuesses::identified_series_ids: TheMovieDb's \
+                   season and episode, TheTVDB's season and episode and OMDb's episode \
+                   lookups, as SeriesProviderIds; its image providers read the series \
+                   itself), remote_sources and provider_order \
                    (GetMetadataProvidersInternal: MetadataFetcherOrder, then IHasOrder, then \
                    registration, the plugins' sources among them; the chosen result's provider \
                    first, a stable OrderBy) and the artwork chain by FetcherPolicy::image_order \
@@ -2356,7 +2360,10 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
                    image_save.rs ImageFileSaver::beside_art says its art is saved beside it \
                    (IsSaveLocalMetadataEnabled), BesideArt::removes, as the scan's \
                    remove_item_images does too, a season's and an episode's \
-                   providers given the chosen ids as their series', refresh_ordered_images \
+                   providers given the chosen ids as their series' and the item's own ids \
+                   cleared (ApplySearchResult runs whenever the item has a provider: an \
+                   episode always, its forced ProbeProvider and TrickplayProvider, a \
+                   path-less season only when a remote one runs), refresh_ordered_images \
                    with the chosen provider first). Compared with RefreshMetadata, \
                    ApplySearchResult, GetProviders, RefreshWithProviders, \
                    GetNonLocalImageProviders, ProviderManager.RefreshItem, \
@@ -2372,25 +2379,14 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
              artist's result, its ids replacing the album's and its name and year the \
              album's, so the album is searched under the artist's name. Jellyfin bug not \
              ported.",
-            "A season or an episode below an identified series resolves the series by the \
-             ids that series' refresh settled; upstream narrows them to the chosen result's \
-             ids, so a provider whose id the result lacks answers nothing for the children \
-             until the next refresh. Fix path: gl-1771.",
             "A Default scan also runs the remote providers of an item the backfill \
              heuristics pick, merging their answers fill-only; upstream runs no remote \
              provider on an unchanged Default refresh. Kept by owner decision 2026-09-24 \
              until the effect of removing the heuristics is understood.",
-            "A movie, series, season or episode Identify moves the chosen provider first \
-             only for TheTVDB, TheMovieDb and OMDb, so a SearchProviderName naming a \
-             plugin's metadata source keeps the \
-             configured order. Fix path: gl-1772.",
             "An item the provider manager refreshes (a box set, person, genre, studio, or \
              virtual season or episode) asks no plugin metadata source. Fix path: gl-1773.",
             "An item the provider manager refreshes runs no local image provider \
              (ValidateImages), except for a virtual season. Fix path: gl-1053.",
-            "Identify on a virtual season or episode keeps the chosen result's (its \
-             series') ids as its own; upstream's ApplySearchResult clears the item's ids, \
-             so it keeps only what its providers return. Fix path: gl-1809.",
             "Replacing all images under RemoveOldMetadata, for an item whose art is saved \
              beside it, deletes a file outside its metadata folders only where \
              ImageFileSaver writes that item's art (the folder of its destinations, a \
