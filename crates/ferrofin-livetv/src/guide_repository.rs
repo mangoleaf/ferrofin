@@ -277,6 +277,41 @@ pub async fn channel_user_data(
         .collect())
 }
 
+/// [`channel_last_played_by_anyone`]'s statement: each channel's newest
+/// `LastPlayedDate` over every user's rows, seeking the rows by item.
+const CHANNEL_LAST_PLAYED_SQL: &str = r#"SELECT c."Id",
+       (SELECT MAX(ud."LastPlayedDate") FROM "UserData" ud WHERE ud."ItemId" = c."Id")
+           AS "LastPlayedDate"
+   FROM "FerrofinLiveTvChannels" c"#;
+
+/// Every channel's newest play by any user, for a `DatePlayed` sort with no
+/// user: upstream's `OrderMapper.cs:32-48` reads all of `UserData` when the
+/// query has no user (a channel has no alternate versions). Every channel gets
+/// a row and only `last_played_date` is read, so the other user-data keys and
+/// filters see the same values on every channel, as they do with no rows.
+///
+/// # Errors
+///
+/// Fails when the database read fails.
+pub async fn channel_last_played_by_anyone(db: &Database) -> Result<ChannelUserData, ServiceError> {
+    let rows = sqlx::query(CHANNEL_LAST_PLAYED_SQL)
+        .fetch_all(db.pool())
+        .await
+        .map_err(db_err)?;
+    Ok(rows
+        .into_iter()
+        .map(|r| {
+            (
+                r.get::<String, _>("Id"),
+                ChannelUserDataRow {
+                    last_played_date: r.get("LastPlayedDate"),
+                    ..ChannelUserDataRow::default()
+                },
+            )
+        })
+        .collect())
+}
+
 /// One channel of a tuner host's stored lineup, as the guide-binding path
 /// needs it.
 ///
@@ -807,6 +842,12 @@ pub mod test_support {
         restrictions: super::UserRestrictions<'_>,
     ) -> Result<Vec<String>, ServiceError> {
         plan(db, super::channel_rows_query(query, restrictions)).await
+    }
+
+    /// The `EXPLAIN QUERY PLAN` details of
+    /// [`super::channel_last_played_by_anyone`]'s statement, in plan order.
+    pub async fn channel_last_played_plan(db: &Database) -> Result<Vec<String>, ServiceError> {
+        plan(db, sqlx::QueryBuilder::new(super::CHANNEL_LAST_PLAYED_SQL)).await
     }
 
     /// The `EXPLAIN QUERY PLAN` details of `qb`'s statement, in plan order.

@@ -155,7 +155,9 @@ pub struct ChannelUserDataRow {
     pub last_played_date: Option<String>,
 }
 
-/// The requesting user's channel user data, keyed by the stored channel id.
+/// The requesting user's channel user data, keyed by the stored channel id; with
+/// no user, every user's newest play on each channel and nothing else
+/// ([`crate::guide_repository::channel_last_played_by_anyone`]).
 pub type ChannelUserData = std::collections::HashMap<String, ChannelUserDataRow>;
 
 /// Applies `GetInternalChannels`' filters to the loaded lineup.
@@ -225,7 +227,10 @@ pub fn filter_channel_rows(
 /// item. The user-data keys read `user_data`, where a channel without a row
 /// is `NULL` for `DatePlayed` and `PlayCount` (first ascending, last
 /// descending), unplayed for `IsPlayed`/`IsUnplayed` (through
-/// `BuildIsPlayedFilter`) and no favourite. `Random` draws a fresh order on
+/// `BuildIsPlayedFilter`) and no favourite. With no user, `user_data` holds
+/// every user's newest play on each channel for `DatePlayed`
+/// ([`crate::guide_repository::channel_last_played_by_anyone`]) and the other
+/// user-data keys tie. `Random` draws a fresh order on
 /// every call. `AirTime` and the keys `OrderMapper` has no arm for fall back
 /// to `SortName`. The keys over columns a channel item never fills
 /// (`RunTimeTicks`, `PremiereDate`, the ratings, the studios, …) or fills

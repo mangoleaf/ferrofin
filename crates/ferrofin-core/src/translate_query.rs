@@ -3251,23 +3251,23 @@ fn pins_sort_plan(by: ItemSortBy, order: SortOrder, filter: &InternalItemsQuery)
 /// column).
 fn orders_by_sort_name_column(by: ItemSortBy, filter: &InternalItemsQuery) -> bool {
     // The `ItemValues`-correlated keys are sub-selects of their own, and so
-    // is `SeriesDatePlayed`, with or without a user.
+    // are `SeriesDatePlayed` and `DatePlayed`, with or without a user.
     if matches!(
         by,
         ItemSortBy::Artist
             | ItemSortBy::AlbumArtist
             | ItemSortBy::Studio
             | ItemSortBy::SeriesDatePlayed
+            | ItemSortBy::DatePlayed
     ) {
         return false;
     }
-    // The user-data keys become correlated sub-selects when a user is present;
-    // without one they fall through to the column like everything else.
+    // The other user-data keys become correlated sub-selects when a user is
+    // present; without one they fall through to the column like everything else.
     if filter.user_id().is_some()
         && matches!(
             by,
-            ItemSortBy::DatePlayed
-                | ItemSortBy::PlayCount
+            ItemSortBy::PlayCount
                 | ItemSortBy::IsPlayed
                 | ItemSortBy::IsUnplayed
                 | ItemSortBy::IsFavoriteOrLiked
@@ -3474,8 +3474,9 @@ fn push_series_date_played(qb: &mut QueryBuilder<Sqlite>, filter: &InternalItems
 /// Pushes the ORDER BY expression for one [`ItemSortBy`] key. The user-data
 /// keys (`DatePlayed`, `PlayCount`, favorite state) are correlated
 /// sub-selects scoped to the query's user (upstream `OrderMapper`'s
-/// `UserData`-backed cases), and the played keys are [`push_is_played`];
-/// everything else is a plain column.
+/// `UserData`-backed cases; `DatePlayed` reads every user's rows when there is
+/// none), and the played keys are [`push_is_played`]; everything else is a
+/// plain column.
 fn push_order_expression(
     qb: &mut QueryBuilder<Sqlite>,
     by: ItemSortBy,
@@ -3487,43 +3488,54 @@ fn push_order_expression(
         push_series_date_played(qb, filter);
         return;
     }
-    // The user-data-correlated keys need the requesting user; without one they
-    // fall through to SortName (matching the C# `(key, null)` arms).
+    // v12 `OrderMapper.cs:32-48`: "An item's played date is the newest of its
+    // own progress and that of its alternate versions, which track progress
+    // under their own ids. Matching both in one predicate ORs them together,
+    // which no index can serve: the user's whole UserData table gets scanned
+    // per sorted row. Two indexed lookups combined by MAX cost a seek each
+    // instead." With no user it reads every user's rows
+    // (`query.User is null ? UserData : …`).
+    //
+    // The OR form measured 107 ms of a 109 ms Resume request here (60
+    // candidate rows × the user's ~5.4k rows). Two arms: the item's own rows,
+    // and its alternates' rows — `alt` first, on the partial
+    // `IX_BaseItems_PrimaryVersionId`, then theirs by the alternate's id. Each
+    // `UserData` seek takes the user and the item
+    // (`IX_UserData_UserId_ItemId_LastPlayedDate`), or the item alone
+    // (`IX_UserData_ItemId_UserId_LastPlayedDate`) with no user; the test
+    // `date_played_seeks_each_arm_by_item` pins both. `CROSS JOIN` pins the
+    // arm's order: left to itself the planner re-drives the arm from
+    // `IX_UserData_UserId` and walks the user's rows per candidate again
+    // (300 ms).
+    if by == ItemSortBy::DatePlayed {
+        let push_user = |qb: &mut QueryBuilder<Sqlite>| {
+            if let Some(user_id) = filter.user_id() {
+                qb.push(r#" AND oud."UserId" = "#)
+                    .push_bind(guid_to_db(user_id));
+            }
+        };
+        qb.push(
+            r#"(SELECT MAX(d."LastPlayedDate") FROM (
+                        SELECT oud."LastPlayedDate" FROM "UserData" oud
+                            WHERE oud."ItemId" = bi."Id""#,
+        );
+        push_user(qb);
+        qb.push(
+            r#" UNION ALL
+                        SELECT oud."LastPlayedDate" FROM "BaseItems" alt
+                            CROSS JOIN "UserData" oud
+                                ON oud."ItemId" = alt."Id""#,
+        );
+        push_user(qb);
+        qb.push(r#" WHERE alt."PrimaryVersionId" = bi."Id") AS d)"#);
+        return;
+    }
+    // The other user-data keys need the requesting user: upstream reads
+    // `query.User!.Id` for them and throws without one (a Jellyfin bug not
+    // ported), so here they fall through to SortName.
     if let Some(user_id) = filter.user_id() {
         let uid = guid_to_db(user_id);
         match by {
-            // v12 `OrderMapper.cs:32-48`: "An item's played date is the newest
-            // of its own progress and that of its alternate versions, which
-            // track progress under their own ids. Matching both in one
-            // predicate ORs them together, which no index can serve: the
-            // user's whole UserData table gets scanned per sorted row. Two
-            // indexed lookups combined by MAX cost a seek each instead."
-            //
-            // The OR form measured 107 ms of a 109 ms Resume request here (60
-            // candidate rows × the user's ~5.4k rows). Two arms: the item's
-            // own row on `IX_UserData_ItemId_UserId_LastPlayedDate`, and its
-            // alternates' rows — `alt` first, on the partial
-            // `IX_BaseItems_PrimaryVersionId`, then the same index
-            // by the alternate's id. `CROSS JOIN` pins that order: left to
-            // itself the planner re-drives the arm from `IX_UserData_UserId`
-            // and walks the user's rows per candidate again (300 ms).
-            ItemSortBy::DatePlayed => {
-                qb.push(
-                    r#"(SELECT MAX(d."LastPlayedDate") FROM (
-                        SELECT oud."LastPlayedDate" FROM "UserData" oud
-                            WHERE oud."ItemId" = bi."Id" AND oud."UserId" = "#,
-                )
-                .push_bind(uid.clone())
-                .push(
-                    r#" UNION ALL
-                        SELECT oud."LastPlayedDate" FROM "BaseItems" alt
-                            CROSS JOIN "UserData" oud
-                                ON oud."ItemId" = alt."Id" AND oud."UserId" = "#,
-                )
-                .push_bind(uid)
-                .push(r#" WHERE alt."PrimaryVersionId" = bi."Id") AS d)"#);
-                return;
-            }
             // "Folders carry no played flag of their own, so these two keys go
             // through the same predicate the isPlayed filter uses rather than
             // through the stored-column lookup in OrderMapper"
@@ -3929,6 +3941,80 @@ mod tests {
         assert!(ivm < iv, "the map drives: {plan:#?}");
         assert!(plan[ivm].ends_with("(ItemId=?)"), "{plan:#?}");
         assert!(plan[iv].ends_with("(ItemValueId=?)"), "{plan:#?}");
+    }
+
+    /// `DatePlayed`'s two arms seek by item: the row's own `UserData`, and its
+    /// alternates on `IX_BaseItems_PrimaryVersionId` before their rows. With a
+    /// user both `UserData` seeks take the user and the item (today
+    /// `IX_UserData_UserId_ItemId_LastPlayedDate`); with none (every user's
+    /// rows, `OrderMapper.cs:32-48`) the item alone
+    /// (`IX_UserData_ItemId_UserId_LastPlayedDate`), never a scan of
+    /// `UserData`. Either way the key is a sub-select, so it takes no
+    /// `SortName` pin.
+    #[rstest::rstest]
+    #[case::with_a_user(true)]
+    #[case::without_a_user(false)]
+    #[tokio::test]
+    async fn date_played_seeks_each_arm_by_item(#[case] with_user: bool) {
+        use sqlx::{Execute, Row};
+        let db = crate::test_support::test_db().await;
+        let user = if with_user {
+            let id = uuid::Uuid::from_u128(0x5521);
+            let user = crate::test_support::seed_user_with_defaults(&db, id).await;
+            Some(std::sync::Arc::new(user))
+        } else {
+            None
+        };
+        let filter = InternalItemsQuery {
+            user,
+            order_by: vec![(ItemSortBy::DatePlayed, SortOrder::Descending)],
+            limit: Some(20),
+            ..InternalItemsQuery::default()
+        };
+        let mut builder = build_query(&filter, QueryShape::FullRows);
+        let mut query = builder.build();
+        let args = query.take_arguments().expect("arguments").expect("binds");
+        let text = query.sql().as_str().to_owned();
+        assert!(text.contains(" ORDER BY (SELECT MAX("), "{text}");
+        let sql = format!("EXPLAIN QUERY PLAN {text}");
+        let plan: Vec<String> = sqlx::query_with(sqlx::AssertSqlSafe(sql), args)
+            .fetch_all(db.pool())
+            .await
+            .expect("explain query plan")
+            .iter()
+            .map(|row| row.get::<String, _>("detail"))
+            .collect();
+        // With a user either `(UserId, ItemId)`/`(ItemId, UserId)` covering
+        // index serves the two-column seek; they tie without `sqlite_stat1`.
+        let (index, key) = if with_user {
+            (
+                "SEARCH oud USING COVERING INDEX IX_UserData_",
+                "(UserId=? AND ItemId=?)",
+            )
+        } else {
+            (
+                "SEARCH oud USING COVERING INDEX IX_UserData_ItemId_UserId_LastPlayedDate ",
+                "(ItemId=?)",
+            )
+        };
+        let seeks: Vec<usize> = plan
+            .iter()
+            .enumerate()
+            .filter(|(_, d)| d.starts_with(index) && d.ends_with(key))
+            .map(|(at, _)| at)
+            .collect();
+        assert_eq!(seeks.len(), 2, "{plan:#?}");
+        let alt = plan
+            .iter()
+            .position(|d| d.starts_with("SEARCH alt USING INDEX IX_BaseItems_PrimaryVersionId"))
+            .unwrap_or_else(|| panic!("no alternate seek: {plan:#?}"));
+        assert!(alt < seeks[1], "the alternates drive: {plan:#?}");
+        assert!(
+            !plan
+                .iter()
+                .any(|d| d.starts_with("SCAN oud") || d.starts_with("SCAN alt")),
+            "{plan:#?}"
+        );
     }
 
     /// The candidate read behind the Playlists/Collections views
@@ -4591,6 +4677,16 @@ mod tests {
         assert_eq!(
             order_by(&sorted_by(&[(ItemSortBy::AirTime, SortOrder::Ascending)])),
             r#"ORDER BY +bi."SortName" ASC, bi."SortName" ASC"#
+        );
+        // A user-data key other than `DatePlayed`, with no user, is pinned
+        // too: upstream reads the missing user's id and throws (a Jellyfin bug
+        // not ported).
+        assert_eq!(
+            order_by(&sorted_by(&[(
+                ItemSortBy::PlayCount,
+                SortOrder::Descending
+            )])),
+            r#"ORDER BY +bi."SortName" DESC, bi."SortName" ASC"#
         );
         // `AiredEpisodeOrder` is one of those keys: `OrderMapper` has no arm
         // for it, so the query sorts by SortName (the comparer is only for

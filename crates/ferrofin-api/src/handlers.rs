@@ -1044,9 +1044,21 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
                    no counterpart: with no channel provider ported, GET \
                    /Channels/{channelId}/Items answers 400 whatever the sort, as upstream does \
                    after pairing. A key repeated in the query is the \
-                   shared query extractor's (crate::query), and paging (startIndex, limit) and \
-                   what each key sorts by are not part of this row.",
-        date: "2026-11-13",
+                   shared query extractor's (crate::query), and paging (startIndex, limit) is \
+                   not part of this row. Of what each key sorts by, only DatePlayed is part of \
+                   it; the other keys (PlayCount, IsPlayed, IsUnplayed and IsFavoriteOrLiked \
+                   among them) are not. DatePlayed sorts by the newest LastPlayedDate of the \
+                   item and its alternate versions over the query's user's UserData rows, or \
+                   every user's when there is no user, for \
+                   /Items and the other item queries (ferrofin-core translate_query.rs \
+                   push_order_expression), GET /LiveTv/Channels (ferrofin-livetv manager.rs \
+                   get_channels over guide_repository.rs channel_user_data or \
+                   channel_last_played_by_anyone, then projection.rs sort_channel_rows) and \
+                   the guide (manager.rs push_program_sort_key). A channel and a programme \
+                   have no alternate versions, so their key is their own rows' alone. \
+                   Compared with OrderMapper.MapOrderByField's DatePlayed arm at the pinned \
+                   v12.4 tag.",
+        date: "2026-11-15",
         divergences: &[
             "A sortOrder with more entries than a non-empty sortBy has keys has the extra \
              entries ignored; upstream's GetOrderBy indexes past the sortBy array, which \
