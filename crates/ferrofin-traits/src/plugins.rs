@@ -21,7 +21,7 @@
 use std::path::PathBuf;
 
 use async_trait::async_trait;
-use ferrofin_model::updates::{PackageInfo, RepositoryInfo};
+use ferrofin_model::updates::{InstallationInfo, PackageInfo, RepositoryInfo};
 use uuid::Uuid;
 
 use crate::error::ServiceError;
@@ -190,7 +190,8 @@ impl RegisteredPlugin {
 
 /// Manages the server's compiled-in plugins and package repositories.
 ///
-/// Port of `IPluginManager` (the Tier-1 slice). Every method is `async fn ->
+/// Port of `IPluginManager` (the Tier-1 slice). Every method but the in-memory
+/// [`completed_installations`](Self::completed_installations) is `async fn ->
 /// Result<_, ServiceError>`; `Guid` → [`Uuid`]. Plugin *configuration* is opaque
 /// JSON bytes (the wire `BasePluginConfiguration` is an open object each plugin
 /// subclasses), stored per plugin.
@@ -323,6 +324,17 @@ pub trait PluginManager: Send + Sync {
         Err(ServiceError::invalid_input(
             "runtime plugin installation is not available on this server",
         ))
+    }
+
+    /// Every package [`install_package`](Self::install_package) installed or
+    /// updated since the server started, in install order.
+    ///
+    /// Port of `IInstallationManager.CompletedInstallations`, which
+    /// `SystemManager.GetSystemInfo` reports. In memory only, as upstream's: the
+    /// restart that activates the plugins starts it empty again. The default
+    /// implementation reports none (a manager without an installer).
+    fn completed_installations(&self) -> Vec<InstallationInfo> {
+        Vec::new()
     }
 
     /// The plugin configuration pages — the dashboard `GET /web/ConfigurationPages`

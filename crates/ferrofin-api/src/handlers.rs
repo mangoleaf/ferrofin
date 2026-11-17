@@ -5461,12 +5461,13 @@ pub const VERIFIED: &[Verified] = &[
         upstream_method: "RestartApplication",
         ferrofin: "handlers/system.rs restart_application (auth.rs RequireAdmin) → ferrofin-core \
                system_manager.rs restart → apps/ferrofin-server state.rs \
-               FerrofinLifecycleController stop (SystemManager.ShutdownInternal), lib.rs \
+               FerrofinLifecycleController stop (SystemManager.ShutdownInternal: the restart \
+               decision, ShouldRestart, with HasPendingRestart left alone), lib.rs \
                announce_shutdown (SessionManager.OnApplicationStopping), tear_down_host \
                (HlsStreamManager::shutdown, AttachmentExtractor::shutdown, \
                LiveTvManager::shutdown: Program.cs disposes the host, RecordingsManager.Dispose, \
                AttachmentExtractor.Dispose, MediaSourceManager.Dispose)",
-        date: "2026-11-11",
+        date: "2026-11-15",
         divergences: &[
             "The host teardown goes further than upstream's disposal (gl-141). It does five things. \
          It kills every transcode: upstream's TranscodeManager.Dispose kills no job, and each \
@@ -5512,11 +5513,23 @@ pub const VERIFIED: &[Verified] = &[
                format_api_url (GetLocalApiUrl's UriBuilder, which writes any port it is given \
                and escapes the base URL as UriBuilder.Path does, a backslash aside: \
                ferrofin-networking escape_base_url, checked against 12.4's discovery Address), \
-               friendly_name (FriendlyName: the saved ServerName unless empty), the emulated \
-               version, PRODUCT_NAME (Name), the system id (DeviceId), the startup-wizard flag, \
-               the lifecycle's restart-pending and shutting-down flags (which operations raise \
-               the first is theirs to record), the bound HTTP \
-               port (HttpPort), the paths (ProgramDataPath, WebPath, LogDirectoryPath, \
+               friendly_name (FriendlyName: the saved ServerName unless empty, else the \
+               server_name setting, whose default, config.rs default_server_name, is \
+               application_host.rs machine_name for Environment.MachineName: gethostname cut at \
+               its first dot, the computer name (its COMPUTERNAME variable) on Windows, \
+               ferrofin when there is none), the \
+               emulated version, PRODUCT_NAME (Name), the system id (DeviceId), the \
+               startup-wizard flag, the lifecycle's restart-pending and shutting-down flags \
+               (HasPendingRestart, NotifyPendingRestart's flag, raised by a change that \
+               takes a restart, among them backup.rs schedule_restore before it restarts, and \
+               by no stop; IsShuttingDown, ApplicationStopping, set by a stop or by a SIGTERM \
+               or SIGINT in lib.rs announce_shutdown), the bound HTTP \
+               port (HttpPort), CompletedInstallations from plugin_manager.rs \
+               completed_installations (InstallationManager.CompletedInstallations: the \
+               InstallationInfo GetCompatibleVersions built for each package install_package \
+               staged since the boot, by POST /Packages/Installed/{name} or the Update Plugins \
+               task, a failed one left out, in install order where upstream's ConcurrentBag \
+               keeps none), the paths (ProgramDataPath, WebPath, LogDirectoryPath, \
                InternalMetadataPath for both ItemsByNamePath and InternalMetadataPath, \
                CachePath) and the live transcode path prepared as GetTranscodePath's \
                CreateAndCheckMarker (a 500 when it cannot be), CastReceiverApplications \
@@ -5524,7 +5537,7 @@ pub const VERIFIED: &[Verified] = &[
                kept), SupportsLibraryMonitor true and the obsolete members' fixed values. \
                Probed on Jellyfin 12.4: LocalAddress for a published override naming port 80, \
                ServerName with no name saved, the body with the wizard incomplete",
-        date: "2026-11-14",
+        date: "2026-11-15",
         divergences: &[
             "Version is the Jellyfin release Ferrofin emulates (openapi.rs \
          JELLYFIN_API_VERSION, 12.4.0), not Ferrofin's own release version, which upstream's \
@@ -5533,12 +5546,12 @@ pub const VERIFIED: &[Verified] = &[
             "PackageName is the constant ferrofin-server; upstream reports its --package-name \
          startup option and omits the member without one. Fix path: gl-1755, whose default \
          awaits an owner decision.",
-            "CompletedInstallations is always empty: a plugin installed or updated from a \
-         repository is never listed, where upstream's InstallationManager lists every \
-         package it installed since startup. Fix path: gl-1776.",
-            "With no server name saved, ServerName falls back to the server_name setting, \
-         whose default is the HOSTNAME environment variable, else ferrofin; upstream's is \
-         Environment.MachineName, the host name cut at its first dot. Fix path: gl-1777.",
+            "With no server name saved, ServerName falls back to the server_name setting \
+         (FERROFIN_SERVER_NAME), whose default is upstream's Environment.MachineName; another \
+         value diverges, as upstream has no such setting. Like every bootstrap setting it is \
+         resolved when the server starts or restarts (the settings page's Applies: Restart), \
+         where upstream reads the machine name on every call, and a host name that leaves no \
+         name before its first dot gives ferrofin where upstream answers an empty name.",
             "LocalAddress is chosen for the client address with an IPv4-mapped IPv6 address \
          unmapped, as GetNormalizedRemoteIP gives it; upstream's GetSmartApiUrl passes \
          Connection.RemoteIpAddress as given, so behind a dual-stack listener an IPv4 client \
@@ -5560,11 +5573,6 @@ pub const VERIFIED: &[Verified] = &[
          upstream's ListenWithHttps, over a certificate it loaded at startup with HTTPS off, \
          advertises https on a port that listens only after the restart. Jellyfin bug not \
          ported.",
-            "A request served during a drain, before the listeners stop, sees lifecycle flags \
-         upstream's would not: POST /System/Restart and /System/Shutdown set HasPendingRestart \
-         to the stop's restart value where upstream leaves it alone, and a SIGTERM or SIGINT \
-         leaves IsShuttingDown false where upstream's ApplicationStopping is cancelled. Fix \
-         path: gl-1792.",
             "A transcode path that cannot be prepared answers 500 whatever the cause; upstream's \
          status follows the exception its ExceptionMiddleware maps (an ArgumentException 400, \
          a DirectoryNotFoundException 404), describing a server misconfiguration as the \
@@ -5631,15 +5639,18 @@ pub const VERIFIED: &[Verified] = &[
                (SystemManager.GetPublicSystemInfo): the LocalAddress, ServerName, Version, \
                ProductName, Id and StartupWizardCompleted of the get /System/Info row, and \
                OperatingSystem's fixed empty string. Probed on Jellyfin 12.4 as that row was",
-        date: "2026-11-14",
+        date: "2026-11-15",
         divergences: &[
             "Version is the Jellyfin release Ferrofin emulates (openapi.rs \
          JELLYFIN_API_VERSION, 12.4.0), not Ferrofin's own release version, which upstream's \
          field would carry. Deliberate: clients gate on it (jellyfin-web refuses a server \
          below 10.10.0, the Kotlin SDK flags one below 12.0.0).",
-            "With no server name saved, ServerName falls back to the server_name setting, \
-         whose default is the HOSTNAME environment variable, else ferrofin; upstream's is \
-         Environment.MachineName, the host name cut at its first dot. Fix path: gl-1777.",
+            "With no server name saved, ServerName falls back to the server_name setting \
+         (FERROFIN_SERVER_NAME), whose default is upstream's Environment.MachineName; another \
+         value diverges, as upstream has no such setting. Like every bootstrap setting it is \
+         resolved when the server starts or restarts (the settings page's Applies: Restart), \
+         where upstream reads the machine name on every call, and a host name that leaves no \
+         name before its first dot gives ferrofin where upstream answers an empty name.",
             "LocalAddress is chosen for the client address with an IPv4-mapped IPv6 address \
          unmapped, as GetNormalizedRemoteIP gives it; upstream's GetSmartApiUrl passes \
          Connection.RemoteIpAddress as given, so behind a dual-stack listener an IPv4 client \
