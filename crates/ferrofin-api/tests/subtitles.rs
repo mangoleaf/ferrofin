@@ -27,7 +27,7 @@ use ferrofin_api::test_support::{
     FakeDisplayPreferences, FakeDto, FakeLocalization, FakeLyrics, FakeMediaSegments, FakeMusic,
     FakePlaylists, FakeProviders, FakeQuickConnect, FakeSearch, FakeSessions, FakeSimilarItems,
     FakeSubtitles, FakeSystem, FakeTasks, FakeTrickplay, FakeTvSeries, FakeUserData, FakeUserViews,
-    FakeUsers, minimal_base_item,
+    FakeUsers, FixedAuth, minimal_base_item,
 };
 use ferrofin_api::test_support::{FakeAuthContext, FakeMediaSources};
 use ferrofin_db::entities::base_items::{BaseItemEntity, PeopleEntity};
@@ -57,10 +57,18 @@ const ITEM_ID: Uuid = Uuid::from_u128(0x00B5_0001);
 /// A non-video item: the subtitle routes upstream binds to `Video` 404 on it.
 const SERIES_ID: Uuid = Uuid::from_u128(0x00B5_0002);
 /// A Movie with a library file: its refresh goes through the library scan,
-/// which [`OneItemLibrary`] has none of, so queueing it fails.
+/// which [`OneItemLibrary`] can run and await but not queue, so queueing it
+/// fails.
 const FILED_ITEM_ID: Uuid = Uuid::from_u128(0x00B5_0003);
+/// [`FILED_ITEM_ID`]'s file: the refresh a subtitle delete awaits is its
+/// path's scan.
+const FILED_ITEM_PATH: &str = "/media/Film.mkv";
 
 // ---- Fakes -----------------------------------------------------------------
+
+/// The refreshes [`OneItemLibrary`] ran for a caller that awaited them
+/// (`run_refresh_scan`), as debug-printed targets.
+static AWAITED_REFRESHES: Mutex<Vec<String>> = Mutex::new(Vec::new());
 
 /// A library where only [`ITEM_ID`] and [`FILED_ITEM_ID`] (Movies) and
 /// [`SERIES_ID`] exist.
@@ -88,12 +96,23 @@ impl LibraryManager for OneItemLibrary {
             ITEM_ID => Some(minimal_base_item(id, "The Item", "Movie")),
             SERIES_ID => Some(minimal_base_item(id, "The Show", "Series")),
             FILED_ITEM_ID => Some(BaseItemEntity {
-                path: Some("/media/Film.mkv".to_owned()),
+                path: Some(FILED_ITEM_PATH.to_owned()),
                 top_parent_id: Some(Uuid::from_u128(0x00B5_00FF).to_string()),
                 ..minimal_base_item(id, "Film", "Movie")
             }),
             _ => None,
         })
+    }
+    async fn run_refresh_scan(
+        &self,
+        target: ferrofin_traits::library::ScanTarget,
+        _options: &ferrofin_traits::providers::MetadataRefreshOptions,
+    ) -> Result<bool, ServiceError> {
+        AWAITED_REFRESHES
+            .lock()
+            .unwrap()
+            .push(format!("{target:?}"));
+        Ok(true)
     }
     async fn query_items(
         &self,
@@ -402,9 +421,16 @@ impl SubtitleManager for CannedSubtitles {
     async fn get_remote_subtitles(&self, _id: &str) -> Result<SubtitleResponse, ServiceError> {
         Err(ServiceError::invalid_input("no providers"))
     }
+    /// The item's subtitle files are its streams 1 to 3; stream 4's folder is
+    /// missing (`DirectoryNotFoundException`); any other index is the
+    /// `ArgumentException` upstream's lookup throws.
     async fn delete_subtitles(&self, item_id: Uuid, index: i32) -> Result<(), ServiceError> {
         self.deleted.lock().unwrap().push((item_id, index));
-        Ok(())
+        match index {
+            1..=3 => Ok(()),
+            4 => Err(ServiceError::not_found("subtitle folder not found")),
+            _ => Err(ServiceError::invalid_input("no subtitle file at the index")),
+        }
     }
     async fn get_supported_providers(
         &self,
@@ -507,7 +533,7 @@ fn build_state(
         media_sources,
         subtitles,
         subtitle_encoder,
-        Arc::new(PolicyAuth(ferrofin_traits::options::AuthorizationInfo {
+        Arc::new(FixedAuth(ferrofin_traits::options::AuthorizationInfo {
             user_policy: Some(Arc::new(ferrofin_model::users::UserPolicy {
                 enable_subtitle_management: true,
                 enable_remote_access: true,
@@ -631,12 +657,44 @@ fn remote_search_state(subtitles: Arc<dyn SubtitleManager>) -> AppState {
     )
 }
 
+/// An administrator's state, for `DELETE /Videos/{itemId}/Subtitles/{index}`
+/// (`RequiresElevation` upstream).
+fn admin_state(subtitles: Arc<dyn SubtitleManager>) -> AppState {
+    build_state_with_auth(
+        Arc::new(OneItemLibrary),
+        Arc::new(FontConfig(EncodingOptions::default())),
+        Arc::new(FontFs {
+            files: Vec::new(),
+            bytes: Vec::new(),
+        }),
+        Arc::new(FakeMediaSources),
+        subtitles,
+        Arc::new(StubEncoder(Ok(Vec::new()))),
+        Arc::new(FixedAuth(ferrofin_traits::options::AuthorizationInfo {
+            user_policy: Some(Arc::new(ferrofin_model::users::UserPolicy {
+                is_administrator: true,
+                enable_remote_access: true,
+                ..Default::default()
+            })),
+            ..ferrofin_api::test_support::authenticated_user_info()
+        })),
+    )
+}
+
 async fn call(app: AppState, uri: &str) -> (StatusCode, Vec<u8>, Option<String>) {
+    call_method(app, "GET", uri).await
+}
+
+async fn call_method(
+    app: AppState,
+    method: &str,
+    uri: &str,
+) -> (StatusCode, Vec<u8>, Option<String>) {
     let router = create_router(app);
     let response = router
         .oneshot(
             Request::builder()
-                .method("GET")
+                .method(method)
                 .uri(uri)
                 .header("x-emby-token", "tok")
                 .body(Body::empty())
@@ -655,6 +713,90 @@ async fn call(app: AppState, uri: &str) -> (StatusCode, Vec<u8>, Option<String>)
         .unwrap()
         .to_vec();
     (status, body, content_type)
+}
+
+// ---- Subtitle deletion -----------------------------------------------------
+
+/// `DeleteSubtitle` awaits `DeleteSubtitles`, which deletes the file and then
+/// awaits the item's refresh (`item.RefreshMetadata`) before the `204`.
+#[tokio::test]
+async fn delete_subtitle_awaits_the_items_refresh_before_204() {
+    let deleted = Arc::new(Mutex::new(Vec::new()));
+    let app = admin_state(Arc::new(CannedSubtitles {
+        deleted: deleted.clone(),
+        ..CannedSubtitles::default()
+    }));
+    let (status, body, _) = call_method(
+        app,
+        "DELETE",
+        &format!("/Videos/{FILED_ITEM_ID}/Subtitles/3"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{body:?}");
+    assert_eq!(*deleted.lock().unwrap(), [(FILED_ITEM_ID, 3)]);
+    assert!(
+        AWAITED_REFRESHES
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|target| target.contains(FILED_ITEM_PATH)),
+        "the refresh ran before the answer"
+    );
+}
+
+/// gl-846: an index with no subtitle file (none at all, or an embedded
+/// stream's) is the `ArgumentException` `DeleteSubtitles` throws, and a nil id
+/// the one `GetItemById` throws: `ExceptionMiddleware` answers both `400`. A
+/// nil id never reaches the manager. gl-1723: a subtitle whose folder is
+/// missing is the `DirectoryNotFoundException` `File.Delete` throws, a `404`.
+/// Each is `text/plain`, "Error processing request.".
+#[rstest::rstest]
+#[case::no_subtitle_file(ITEM_ID, 9, true, StatusCode::BAD_REQUEST)]
+#[case::nil_item_id(Uuid::nil(), 1, false, StatusCode::BAD_REQUEST)]
+#[case::folder_missing(ITEM_ID, 4, true, StatusCode::NOT_FOUND)]
+#[tokio::test]
+async fn delete_subtitle_answers_upstreams_exception(
+    #[case] item_id: Uuid,
+    #[case] index: i32,
+    #[case] reaches_the_manager: bool,
+    #[case] expected: StatusCode,
+) {
+    let deleted = Arc::new(Mutex::new(Vec::new()));
+    let app = admin_state(Arc::new(CannedSubtitles {
+        deleted: deleted.clone(),
+        ..CannedSubtitles::default()
+    }));
+    let (status, body, content_type) = call_method(
+        app,
+        "DELETE",
+        &format!("/Videos/{}/Subtitles/{index}", item_id.simple()),
+    )
+    .await;
+    assert_eq!(status, expected);
+    assert_eq!(content_type.as_deref(), Some("text/plain"));
+    assert_eq!(body, b"Error processing request.");
+    assert_eq!(deleted.lock().unwrap().is_empty(), !reaches_the_manager);
+}
+
+/// `DeleteSubtitle` writes a parameterless `NotFound()` for no item: ASP.NET's
+/// `ProblemDetails` (measured on Jellyfin 12.4; `traceId` is never emitted).
+#[tokio::test]
+async fn delete_subtitle_for_no_item_is_a_not_found_problem() {
+    let (status, body, _) = call_method(
+        admin_state(Arc::new(CannedSubtitles::default())),
+        "DELETE",
+        &format!("/Videos/{}/Subtitles/1", Uuid::from_u128(7)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&body).unwrap(),
+        serde_json::json!({
+            "type": "https://tools.ietf.org/html/rfc9110#section-15.5.5",
+            "title": "Not Found",
+            "status": 404
+        })
+    );
 }
 
 // ---- On-the-fly subtitle conversion ----------------------------------------
@@ -1299,19 +1441,6 @@ fn fallback_font_calls_go_through_the_blocking_pool() {
     });
 }
 
-/// Mirrors a production token-cache snapshot; FakeUsers must never be queried.
-struct PolicyAuth(ferrofin_traits::options::AuthorizationInfo);
-
-#[async_trait]
-impl ferrofin_traits::net::AuthService for PolicyAuth {
-    async fn authenticate(
-        &self,
-        _request: &ferrofin_traits::net::RequestContext,
-    ) -> Result<ferrofin_traits::options::AuthorizationInfo, ServiceError> {
-        Ok(self.0.clone())
-    }
-}
-
 #[tokio::test]
 async fn subtitle_management_gates_every_operation_but_deletion_requires_admin() {
     use ferrofin_api::test_support::sample_user;
@@ -1349,7 +1478,7 @@ async fn subtitle_management_gates_every_operation_but_deletion_requires_admin()
                 ..CannedSubtitles::default()
             }),
             Arc::new(StubEncoder(Ok(Vec::new()))),
-            Arc::new(PolicyAuth(info)),
+            Arc::new(FixedAuth(info)),
         );
         for (method, uri, body, allowed) in [
             (
@@ -1378,7 +1507,7 @@ async fn subtitle_management_gates_every_operation_but_deletion_requires_admin()
             ),
             (
                 "DELETE",
-                format!("/Videos/{ITEM_ID}/Subtitles/1"),
+                format!("/Videos/{FILED_ITEM_ID}/Subtitles/1"),
                 "",
                 StatusCode::NO_CONTENT,
             ),
@@ -1585,16 +1714,19 @@ async fn call_range(
 
 /// `GetSubtitle_GraphicalStream_ReturnsRawFileWithRangeProcessing` (v12.2):
 /// a PGS `.sup` and an extracted VobSub `.mks` are handed over untouched,
-/// with Range processing, and never encoded. Both routes.
+/// with Range processing, and never encoded. Both routes. The type is
+/// `MimeTypes.GetMimeType(subtitlePath)`: the `MimeTypes` package's `.mks` row,
+/// and its default for `.sup`, which it does not know.
 #[rstest::rstest]
-#[case("pgssub", "sub.sup", "Stream.pgssub")]
-#[case("dvdsub", "sub.mks", "Stream.vobsub")]
-#[case("pgssub", "sub.sup", "0/Stream.pgssub")]
+#[case("pgssub", "sub.sup", "Stream.pgssub", "application/octet-stream")]
+#[case("dvdsub", "sub.mks", "Stream.vobsub", "video/x-matroska")]
+#[case("pgssub", "sub.sup", "0/Stream.pgssub", "application/octet-stream")]
 #[tokio::test]
 async fn get_subtitle_graphical_stream_returns_raw_file_with_range_processing(
     #[case] codec: &str,
     #[case] file_name: &str,
     #[case] route: &str,
+    #[case] expected_type: &str,
 ) {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join(file_name);
@@ -1614,8 +1746,7 @@ async fn get_subtitle_graphical_stream_returns_raw_file_with_range_processing(
 
     assert_eq!(status, StatusCode::PARTIAL_CONTENT);
     assert_eq!(body, payload[10..20]);
-    // `MimeTypes.GetMimeType` knows neither extension: the default type.
-    assert_eq!(content_type.as_deref(), Some("application/octet-stream"));
+    assert_eq!(content_type.as_deref(), Some(expected_type));
     assert_eq!(accept_ranges.as_deref(), Some("bytes"));
     assert!(
         !encoder.encoded.load(std::sync::atomic::Ordering::SeqCst),

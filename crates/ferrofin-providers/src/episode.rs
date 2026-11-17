@@ -13,8 +13,10 @@
 
 use ferrofin_db::entities::base_items::{BaseItemEntity, PeopleEntity};
 use ferrofin_db::store::guid_to_db;
+use ferrofin_model::data::PersonKind;
 use uuid::Uuid;
 
+use crate::container_types::PersonInfo;
 use crate::metadata_merge::MetadataResult;
 use crate::omdb::{OmdbItem, OmdbPersonKind};
 use crate::tmdb::{EpisodeDetails, EpisodeExtras};
@@ -273,18 +275,35 @@ pub fn omdb_people(item: &OmdbItem) -> Vec<PeopleEntity> {
         .collect()
 }
 
-/// Maps TheTVDB's credited people to persistable rows. The plugin sets no
+/// Maps TheTVDB's credited people to persistable rows, each added through
+/// `MetadataResult.AddPerson` as the plugin's loops add them
+/// ([`crate::container_types::add_person`]): names trimmed, an actor credited
+/// again as a guest star in the same role merged into one guest-star credit,
+/// a role-less credit given the role a later one names. The plugin sets no
 /// `SortOrder` on its credits.
 #[must_use]
 pub fn tvdb_people(people: &[TvdbPerson]) -> Vec<PeopleEntity> {
-    people
-        .iter()
+    let mut credits = Vec::new();
+    for person in people {
+        crate::container_types::add_person(
+            &mut credits,
+            PersonInfo {
+                name: person.name.clone(),
+                role: person.role.clone(),
+                type_: PersonKind::from_stored(&person.person_type),
+                image_url: person.image_url.clone(),
+                ..PersonInfo::default()
+            },
+        );
+    }
+    credits
+        .into_iter()
         .map(|person| PeopleEntity {
-            id: guid_to_db(Uuid::new_v4()),
-            name: person.name.clone(),
-            person_type: Some(person.person_type.clone()),
-            role: person.role.clone(),
-            primary_image_url: person.image_url.clone(),
+            id: guid_to_db(person.id),
+            name: person.name,
+            person_type: Some(person.type_.json_name().into_owned()),
+            role: person.role,
+            primary_image_url: person.image_url,
             provider_id: None,
             sort_order: None,
         })
@@ -594,5 +613,39 @@ mod tests {
         );
         assert!(ordered.result.item.data.is_none());
         assert_eq!(ordered.result.people, Some(Vec::new()));
+    }
+
+    /// `MetadataResult.AddPerson` runs on TheTVDB's credits as on every
+    /// provider's answer (`PeopleHelper.AddPerson`): an actor credited again as
+    /// a guest star in the same role is one guest-star credit
+    /// (`IsSameCredit`), a role-less credit takes the role a later one names,
+    /// and names are trimmed.
+    #[test]
+    fn tvdb_people_merge_credits_as_add_person_does() {
+        let person = |name: &str, person_type: &str, role: Option<&str>| TvdbPerson {
+            name: name.to_owned(),
+            person_type: person_type.to_owned(),
+            role: role.map(str::to_owned),
+            image_url: None,
+        };
+        let people = tvdb_people(&[
+            person("Ann", "Actor", Some("Hero")),
+            person("Ann", "GuestStar", Some("Hero")),
+            person("Bo", "Actor", None),
+            person("Bo", "Actor", Some("Villain")),
+            person(" Cy ", "Unknown", None),
+        ]);
+        let rows: Vec<_> = people
+            .iter()
+            .map(|p| (p.name.as_str(), p.person_type.as_deref(), p.role.as_deref()))
+            .collect();
+        assert_eq!(
+            rows,
+            [
+                ("Ann", Some("GuestStar"), Some("Hero")),
+                ("Bo", Some("Actor"), Some("Villain")),
+                ("Cy", Some("Unknown"), None),
+            ]
+        );
     }
 }

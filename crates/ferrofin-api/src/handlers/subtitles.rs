@@ -1,8 +1,8 @@
 //! `SubtitleController` — subtitle management + fallback fonts.
 //!
 //! Ports the portable slice of Jellyfin's `SubtitleController`:
-//! - `DELETE /Videos/{itemId}/Subtitles/{index}` — delete a stored external
-//!   subtitle stream (+ its sidecar file).
+//! - `DELETE /Videos/{itemId}/Subtitles/{index}` — delete an external
+//!   subtitle file, then refresh the item.
 //! - `POST /Videos/{itemId}/Subtitles` — upload an external subtitle file.
 //! - `GET /Items/{itemId}/RemoteSearch/Subtitles/{language}` — search providers.
 //! - `POST /Items/{itemId}/RemoteSearch/Subtitles/{subtitleId}` — download one.
@@ -39,23 +39,24 @@ use ferrofin_model::entities_media::MediaStream;
 use ferrofin_model::providers::RemoteSubtitleInfo;
 use ferrofin_model::secret::Secret;
 use ferrofin_model::subtitles::FontFile;
+use ferrofin_traits::error::ServiceError;
 use ferrofin_traits::subtitles::{SubtitleResponse, SubtitleSearchRequest};
 use ferrofin_util::string_extensions::equals_ordinal_ignore_case;
 use uuid::Uuid;
 
 use crate::auth::{RequireAdmin, RequireAuth, RequireSubtitleManagement};
-use crate::error::ApiError;
+use crate::error::{ApiError, ProblemStatus};
 use crate::extract::{
     DotnetGuid, JsonBody, Query, RequiredRouteString, RouteParameter, blank_route_values,
     upload_body_limit,
 };
 use crate::handlers::image_upload::decode_base64;
 use crate::handlers::items::resolve_user_opt;
-use crate::handlers::queue_high_priority_refresh;
 use crate::handlers::streaming::{
     opened_file_response, physical_file_precondition, require_streamable_item,
     stream_route_container,
 };
+use crate::handlers::{queue_high_priority_refresh, run_item_refresh};
 use crate::state::AppState;
 
 /// The MIME type Jellyfin serves an HLS subtitle playlist with
@@ -75,8 +76,8 @@ const FALLBACK_FONT_MAX_TOTAL_BYTES: i64 = 20 * 1024 * 1024;
 /// (`.woff`/`.woff2`/`.ttf`/`.otf`).
 const FALLBACK_FONT_EXTENSIONS: &[&str] = &[".woff", ".woff2", ".ttf", ".otf"];
 
-/// Ensures an item exists, returning `404` otherwise
-/// (`GetItemById<BaseItem>`, as `DeleteSubtitle` resolves it).
+/// Ensures an item exists, returning `NotFound()`'s `ProblemDetails` `404`
+/// otherwise (`GetItemById<BaseItem>`, as `DeleteSubtitle` resolves it).
 async fn require_item(
     state: &AppState,
     item_id: Uuid,
@@ -88,7 +89,7 @@ async fn require_item(
         .await?
         .is_none()
     {
-        return Err(ApiError::NotFound(format!("item {item_id}")));
+        return Err(ApiError::Problem(ProblemStatus::NotFound));
     }
     Ok(())
 }
@@ -115,12 +116,18 @@ async fn require_video(
     Ok(())
 }
 
-/// `DELETE /Videos/{itemId}/Subtitles/{index}` — delete a stored subtitle.
+/// `DELETE /Videos/{itemId}/Subtitles/{index}` — delete an external subtitle.
 ///
-/// Port of `SubtitleController.DeleteSubtitle`: `404` when the item is missing,
-/// else `204`. The manager drops the external subtitle stream at `index` and its
-/// sidecar file (deleting a non-existent index is idempotent). Upstream requires
-/// elevation here, independently of the subtitle-management permission.
+/// Port of `SubtitleController.DeleteSubtitle`, which requires elevation,
+/// independently of the subtitle-management permission: `NotFound()` when the
+/// item is missing, else `204` once `SubtitleManager.DeleteSubtitles` has
+/// deleted the subtitle's file and awaited the item's refresh, whose re-probe
+/// drops that stream and renumbers the rest. A nil id (`GetItemById`) and an
+/// index with no subtitle file (no subtitle stream there, or an embedded one)
+/// throw `ArgumentException`s upstream, and a subtitle whose folder is missing
+/// throws `File.Delete`'s `DirectoryNotFoundException`, before the refresh. So
+/// every failure but the missing item is answered as `ExceptionMiddleware`
+/// answers a throw: `400` or `404`, `text/plain`, "Error processing request.".
 #[utoipa::path(
     delete,
     path = "/Videos/{itemId}/Subtitles/{index}",
@@ -130,7 +137,8 @@ async fn require_video(
     ),
     responses(
         (status = 204, description = "Subtitle deleted"),
-        (status = 404, description = "Item not found")
+        (status = 400, description = "No subtitle file at that index"),
+        (status = 404, description = "Item not found, or the subtitle's folder is missing")
     ),
     tag = "ferrofin"
 )]
@@ -138,10 +146,32 @@ async fn delete_subtitle(
     State(state): State<AppState>,
     RequireAdmin(auth): RequireAdmin,
     Path((DotnetGuid(item_id), index)): Path<(DotnetGuid, i32)>,
-) -> Result<StatusCode, ApiError> {
-    require_item(&state, item_id, &auth).await?;
-    state.subtitles.delete_subtitles(item_id, index).await?;
-    Ok(StatusCode::NO_CONTENT)
+) -> Response {
+    let deleted = async move {
+        if item_id.is_nil() {
+            return Err(ApiError::BadRequest("Guid can't be empty".to_owned()));
+        }
+        require_item(&state, item_id, &auth).await?;
+        // Upstream finishes the delete and its refresh for a client that hangs
+        // up, so they run on a task of their own, in the request's span.
+        tokio::spawn(tracing::Instrument::in_current_span(async move {
+            state.subtitles.delete_subtitles(item_id, index).await?;
+            run_item_refresh(&state, item_id).await
+        }))
+        .await
+        .unwrap_or_else(|err| {
+            Err(ApiError::Service(ServiceError::backend(format!(
+                "subtitle delete task failed: {err}"
+            ))))
+        })
+    }
+    .await;
+    match deleted {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        // `NotFound()` is an action result, not a throw.
+        Err(error @ ApiError::Problem(_)) => error.into_response(),
+        Err(error) => error.into_exception_response(),
+    }
 }
 
 /// The `POST /Videos/{itemId}/Subtitles` request body — a base64-encoded subtitle
@@ -912,7 +942,7 @@ async fn get_fallback_font(
     if let Some(status) = physical_file_precondition(&headers, file.date_modified) {
         return Ok((status, [(header::LAST_MODIFIED, last_modified)]).into_response());
     }
-    let mime = font_mime(&file.name);
+    let mime = ferrofin_model::net::mime_types::get_mime_type(&file.name);
     let opened = state
         .blocking_file_system(move |file_system| file_system.open_file(&file.full_name))
         .await??;
@@ -923,18 +953,6 @@ async fn get_fallback_font(
             .map_err(|error| ApiError::BadRequest(error.to_string()))?,
     );
     Ok(response)
-}
-
-/// The MIME type of a font file, keyed on its extension: `MimeTypes.GetMimeType`
-/// (`get_mime_type`), plus the font rows of the `MimeTypes` package it falls
-/// back to, which that port does not carry.
-fn font_mime(name: &str) -> &'static str {
-    match name.rsplit_once('.').map(|(_, e)| e.to_ascii_lowercase()) {
-        Some(ext) if ext == "otf" => "font/otf",
-        Some(ext) if ext == "ttc" => "font/collection",
-        Some(ext) if ext == "pfb" => "application/x-font-type1",
-        _ => ferrofin_model::net::mime_types::get_mime_type(name),
-    }
 }
 
 /// Registers this controller's real routes onto `router`.

@@ -149,7 +149,7 @@ impl FanartClient {
     #[must_use]
     pub fn new(personal_key: Option<String>) -> Self {
         Self {
-            http: reqwest::Client::new(),
+            http: crate::http_client::client(),
             limiter: RateLimiter::new("fanart"),
             personal_key: personal_key.filter(|k| !k.is_empty()),
             language: "en".to_owned(),

@@ -278,11 +278,8 @@ impl IntroSkipperAnalysis for DetectSegmentsTask {
         // the whole queue now, without ffprobe (it moves windows, not counts).
         // The whole build clears the flag, so a failed or dropped one leaves it.
         if self.runtime.counts_stale.load(Ordering::Relaxed) {
-            let config = IntroSkipperConfig {
-                probe_audio_duration: false,
-                ..(*self.load_config().await).clone()
-            };
-            if let Err(err) = self.queue(&config, None).await {
+            let config = self.load_config().await;
+            if let Err(err) = self.queue_unprobed(&config).await {
                 tracing::warn!(%err, "intro skipper: could not count the queue for the support bundle");
             }
         }
@@ -314,7 +311,7 @@ impl IntroSkipperAnalysis for DetectSegmentsTask {
         let config = self.load_config().await;
         // `GetExcludedInventoryAsync`: the queue with the excluded items in.
         let mut ids: Vec<Uuid> = self
-            .queue(&config, None)
+            .queue_unprobed(&config)
             .await?
             .into_iter()
             .flat_map(|(_, entries)| entries)
@@ -797,6 +794,21 @@ impl ScheduledTask for DetectSegmentsTask {
 }
 
 impl DetectSegmentsTask {
+    /// The whole [`Self::queue`] for a caller that reads only its ids,
+    /// exclusion flags and seasons: built without `ProbeAudioDuration`, whose
+    /// ffprobe per entry moves only the credits windows. Upstream probes here
+    /// too.
+    async fn queue_unprobed(
+        &self,
+        config: &IntroSkipperConfig,
+    ) -> Result<queue::Queue, ServiceError> {
+        let config = IntroSkipperConfig {
+            probe_audio_duration: false,
+            ..config.clone()
+        };
+        self.queue(&config, None).await
+    }
+
     /// The queue (`QueueManager.GetMediaItems(includeExcluded: true)`): every
     /// entry, excluded ones flagged; with `only`, just those seasons (and
     /// movies), as `AnalyzeItemsAsync(seasonsToAnalyze)` filters it.
@@ -937,7 +949,7 @@ impl DetectSegmentsTask {
         let _release = self.running.acquire().await?;
         let config = self.load_config().await;
         // Excluded items keep their state: only leaving a library is stale.
-        let queue = self.queue(&config, None).await?;
+        let queue = self.queue_unprobed(&config).await?;
         let live: HashSet<Uuid> = queue
             .iter()
             .flat_map(|(_, entries)| entries.iter().map(|e| e.episode_id))
@@ -2262,12 +2274,12 @@ mod tests {
         let (series, season, specials, other) = (id(0x51), id(0x52), id(0x53), id(0x54));
         let episode =
             |n: u128, path: &str, season_id: Uuid, series_id: Uuid, number: i64| BaseItemEntity {
-                id: id(n).to_string(),
+                id: guid_to_db(id(n)),
                 type_: ty(BaseItemKind::Episode).to_owned(),
                 path: Some(path.to_owned()),
                 run_time_ticks: Some(1_800 * 10_000_000),
-                season_id: Some(season_id.to_string()),
-                series_id: Some(series_id.to_string()),
+                season_id: Some(guid_to_db(season_id)),
+                series_id: Some(guid_to_db(series_id)),
                 series_name: Some(if series_id == other { "Other" } else { "Show" }.to_owned()),
                 parent_index_number: Some(number),
                 ..BaseItemEntity::default()
@@ -2276,7 +2288,7 @@ mod tests {
         special.data = Some(r#"{"AirsBeforeSeasonNumber":1}"#.to_owned());
         let rows = vec![
             BaseItemEntity {
-                id: series.to_string(),
+                id: guid_to_db(series),
                 type_: ty(BaseItemKind::Series).to_owned(),
                 genres: Some("Anime".to_owned()),
                 ..BaseItemEntity::default()
@@ -2287,7 +2299,7 @@ mod tests {
             episode(0x64, "/media/other/s01e01.mkv", id(0x55), other, 1),
             episode(0x65, "/disabled/show/s01e01.mkv", id(0x56), series, 1),
             BaseItemEntity {
-                id: id(0x66).to_string(),
+                id: guid_to_db(id(0x66)),
                 type_: ty(BaseItemKind::Movie).to_owned(),
                 path: Some("/media/movies/film.mkv".to_owned()),
                 name: Some("Film".to_owned()),
@@ -2609,6 +2621,29 @@ mod tests {
             intros_of(&h.segments, EP_A).await.is_empty(),
             "republished as empty"
         );
+    }
+
+    /// Clean cache and Clear excluded read only the queue's ids, exclusion
+    /// flags and seasons, so `ProbeAudioDuration`, which moves only the
+    /// credits windows, runs no ffprobe for them, though a queue for analysis
+    /// still probes.
+    #[tokio::test]
+    async fn clean_cache_and_clear_excluded_run_no_audio_probe() {
+        let h = harness(&TWO_EPISODES, true, r#"{"ProbeAudioDuration":true}"#, true).await;
+        let ffmpeg = Arc::new(crate::ffmpeg::FakeFfmpeg {
+            audio_duration: Some(1_700.0),
+            ..crate::ffmpeg::FakeFfmpeg::default()
+        });
+        let task = DetectSegmentsTask {
+            ffmpeg: Arc::clone(&ffmpeg) as Arc<dyn FfmpegService>,
+            ..h.task.clone()
+        };
+        task.clean_cache().await.expect("clean");
+        task.clear_excluded().await.expect("clear");
+        assert_eq!(ffmpeg.take_probes(), Vec::<String>::new());
+        let config = task.load_config().await;
+        task.queue(&config, None).await.expect("queue");
+        assert_eq!(ffmpeg.take_probes().len(), TWO_EPISODES.len());
     }
 
     /// `VerifyQueueAsync` + the configuration hash: an analysed season is not
@@ -2984,11 +3019,9 @@ mod tests {
         }
     }
 
-    /// `TestBlackFrames.TestEndCreditDetection`: a 5:30 episode whose credits
-    /// go black at 300 s, bisected from 240 s from the end, is found within
-    /// 3 s — against the fake, and (`FERROFIN_FFMPEG_TESTS`) a generated clip.
-    #[tokio::test]
-    async fn end_credit_detection() {
+    /// `TestBlackFrames.TestEndCreditDetection`'s 5:30 episode, whose credits
+    /// go black at 300 s, with the settings it bisects under.
+    async fn end_credit_case() -> (Harness, IntroSkipperConfig, queue::QueuedEpisode) {
         let h = harness(&TWO_EPISODES, true, "{}", false).await;
         let config = IntroSkipperConfig {
             black_frame_minimum_percentage: 85,
@@ -3001,6 +3034,15 @@ mod tests {
             credits_fingerprint_start: 0.0,
             ..queued[0].1[0].clone()
         };
+        (h, config, entry)
+    }
+
+    /// `TestBlackFrames.TestEndCreditDetection`: the credits of
+    /// [`end_credit_case`], bisected from 240 s from the end, are found within
+    /// 3 s, against the fake.
+    #[tokio::test]
+    async fn end_credit_detection() {
+        let (h, config, entry) = end_credit_case().await;
         let fake = with_ffmpeg(
             &h,
             crate::ffmpeg::FakeFfmpeg {
@@ -3015,10 +3057,15 @@ mod tests {
             .expect("bisect")
             .expect("credits");
         assert!((297.0..=303.0).contains(&start), "{start}");
+    }
 
-        if std::env::var_os("FERROFIN_FFMPEG_TESTS").is_none() {
-            return;
-        }
+    /// [`end_credit_detection`] against a generated clip and the real ffmpeg,
+    /// on a harness of its own: the black-frame cache is keyed by episode, not
+    /// path, so after the fake's run every window would be read from it.
+    #[tokio::test]
+    #[ignore = "runs the real ffmpeg; run with --ignored"]
+    async fn real_ffmpeg_end_credit_detection() {
+        let (h, config, entry) = end_credit_case().await;
         let clip = h.cache.path().join("credits.mkv");
         let clip = clip.to_str().expect("utf-8").to_owned();
         let made = crate::ffmpeg::output(
@@ -3066,7 +3113,10 @@ mod tests {
             .await
             .expect("bisect")
             .expect("credits");
-        assert!((297.0..=303.0).contains(&start), "{start}");
+        // The bisection ends on the window at 303 s, the tolerance's edge: its
+        // halvings put that window's start at 303.0000000335, and ffmpeg reports
+        // the first frame at t=0 (the fake's tenths land on 303.0 exactly).
+        assert!((297.0..=303.0 + 1e-6).contains(&start), "{start}");
     }
 
     /// Black frames are cached as ffmpeg reported them; the

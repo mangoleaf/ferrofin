@@ -1,5 +1,5 @@
-//! Real-ffmpeg integration for `MediaEncoder::extract_image_stream` — gated like
-//! every ffmpeg test: `FERROFIN_FFMPEG_TESTS=1`, skipped when ffmpeg is absent.
+//! Real-ffmpeg integration for `MediaEncoder::extract_image_stream` — `#[ignore]`d
+//! like every ffmpeg test; asked for, it needs ffmpeg on `PATH`.
 //!
 //! A Matroska file carries a video stream and a PNG attachment; ffmpeg exposes
 //! the attachment as a stream, which is extracted by index in the requested
@@ -15,11 +15,10 @@ use ferrofin_model::dto::MediaSourceInfo;
 use ferrofin_traits::media_encoding::MediaEncoder as _;
 
 fn ffmpeg_available() -> bool {
-    std::env::var("FERROFIN_FFMPEG_TESTS").ok().as_deref() == Some("1")
-        && std::process::Command::new("ffmpeg")
-            .arg("-version")
-            .output()
-            .is_ok_and(|o| o.status.success())
+    std::process::Command::new("ffmpeg")
+        .arg("-version")
+        .output()
+        .is_ok_and(|o| o.status.success())
 }
 
 fn run(args: &[&str]) {
@@ -32,11 +31,9 @@ fn run(args: &[&str]) {
 }
 
 #[tokio::test]
+#[ignore = "runs the real ffmpeg; run with --ignored"]
 async fn extracts_an_attached_picture_by_stream_index() {
-    if !ffmpeg_available() {
-        eprintln!("skipped: FERROFIN_FFMPEG_TESTS!=1 or no ffmpeg");
-        return;
-    }
+    assert!(ffmpeg_available(), "ffmpeg not found on PATH");
     let dir = tempfile::tempdir().unwrap();
     let png = dir.path().join("cover.png");
     run(&[

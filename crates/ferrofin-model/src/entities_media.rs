@@ -143,7 +143,7 @@ impl MetadataProvider {
 }
 
 /// Class `ChapterInfo`.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "PascalCase")]
 pub struct ChapterInfo {
     /// The start position ticks.
@@ -154,13 +154,29 @@ pub struct ChapterInfo {
     /// The image path.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub image_path: Option<String>,
-    /// The image date modified.
+    /// The image date modified: .NET's `DateTime.MinValue` until an image is
+    /// extracted, as upstream's unassigned `DateTime` is.
     #[schema(value_type = String, format = "date-time")]
     #[serde(with = "crate::json::datetime")]
     pub image_date_modified: chrono::DateTime<chrono::Utc>,
     /// The image tag.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub image_tag: Option<String>,
+}
+
+impl Default for ChapterInfo {
+    /// A chapter with no image: its date is .NET's `DateTime.MinValue`
+    /// (`0001-01-01`), not chrono's epoch, as Jellyfin stores and serves it
+    /// (gl-1590).
+    fn default() -> Self {
+        Self {
+            start_position_ticks: 0,
+            name: None,
+            image_path: None,
+            image_date_modified: crate::json::datetime::dotnet_min(),
+            image_tag: None,
+        }
+    }
 }
 
 /// Class `MediaAttachment`.
@@ -1618,6 +1634,14 @@ mod tests {
         assert_eq!(MetadataProvider::Custom as i32, 0);
         assert_eq!(MetadataProvider::Imdb as i32, 2);
         assert_eq!(MetadataProvider::MusicBrainzRecording as i32, 20);
+    }
+
+    /// gl-1590: an imageless chapter's date is .NET's `DateTime.MinValue`, as
+    /// a stock Jellyfin 12.4 serves it, not chrono's 1970 epoch.
+    #[test]
+    fn a_chapter_without_an_image_is_dated_dotnet_min_value() {
+        let json = serde_json::to_value(ChapterInfo::default()).unwrap();
+        assert_eq!(json["ImageDateModified"], "0001-01-01T00:00:00.0000000Z");
     }
 
     #[test]

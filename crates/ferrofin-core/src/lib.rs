@@ -160,8 +160,10 @@
 //!   cooperative stops (a run's token, `Cancelling` until it returns), and
 //!   on-disk trigger-override persistence.
 //!
-//! Backup and restore (`BackupService`) live in `ferrofin-api`'s `Backup`
-//! handlers.
+//! Backup and restore ([`ferrofin_traits::backup::BackupService`]) live in
+//! [`backup`]: [`backup::FerrofinBackupService`] behind the `/Backup*` routes,
+//! and [`backup::apply_pending_restore`], which the composition root runs at
+//! boot.
 
 pub mod access_schedule_repository;
 pub mod activity_manager;
@@ -174,6 +176,7 @@ mod audio_tags;
 pub mod auth_cache;
 pub mod auth_providers;
 pub mod authorization_context;
+pub mod backup;
 pub mod by_name_store;
 pub mod cached_media_segment_provider;
 pub mod channel_manager;

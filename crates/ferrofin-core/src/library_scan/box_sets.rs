@@ -11,9 +11,10 @@
 //! walked. A scan of the library stores a box set for each such folder no
 //! box set holds, with the id `Folder.AddChild` derives from its path and the
 //! `tmdbid` its name carries, and removes the box sets in the folder whose
-//! own folder is gone. A box set with no folder, as an older Ferrofin made
-//! them, has nothing to resolve and is left alone. Then each box set is refreshed
-//! (`refresh_box_sets`), the new ones first fetching their metadata.
+//! own folder is gone. A box set with no folder (one an older Ferrofin made
+//! that the boot repair, `adoption_repairs::rekey_pathless_box_sets`, could
+//! not give a folder) has nothing to resolve and is left alone. Then each box set is refreshed (`refresh_box_sets`), the
+//! new ones first fetching their metadata.
 //!
 //! ACCEPTED DIVERGENCE (upstream bug, not ported): validation removes a box
 //! set whose folder is still there but no longer resolves, and an ignored

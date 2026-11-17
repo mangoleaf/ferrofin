@@ -1705,10 +1705,11 @@ struct BitrateTestQuery {
 /// `GET /Playback/BitrateTest` — return a buffer of the requested size.
 ///
 /// Port of `MediaInfoController.GetBitrateTestBytes`: the client measures its
-/// download bandwidth against a fixed-size payload. The C# body is random bytes;
-/// a zero-filled buffer serves the same measurement purpose and is cheaper. The
-/// requested size is clamped to `[1, 100_000_000]` to match the controller's
-/// `[Range]`, returning `400` when it falls outside.
+/// download bandwidth against a fixed-size payload. The body is random bytes, as
+/// upstream's `Random.Shared.NextBytes`: a proxy or VPN that compresses on the
+/// way would shrink a predictable body and inflate the measured bitrate. The
+/// requested size must be in `[1, 100_000_000]`, the controller's `[Range]`;
+/// outside it the answer is `400`.
 #[utoipa::path(
     get,
     path = "/Playback/BitrateTest",
@@ -1726,7 +1727,8 @@ async fn get_bitrate_test(
             "size must be between 1 and {MAX_BITRATE_TEST_SIZE}"
         )));
     }
-    let body = vec![0_u8; size];
+    let mut body = vec![0_u8; size];
+    rand::fill(&mut body[..]);
     Ok(([(header::CONTENT_TYPE, "application/octet-stream")], body).into_response())
 }
 

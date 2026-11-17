@@ -1190,6 +1190,13 @@ pub struct FerrofinItemPersistenceService {
     /// How by-name `Genre`, `MusicGenre` and `Studio` rows take their ids
     /// ([`FerrofinItemPersistenceService::with_by_name_identity`]).
     by_name_identity: Option<crate::item_type_lookup::ByNameIdentity>,
+    /// The playlist manager's entry-edit lock
+    /// ([`Self::playlist_entry_edits`]), held by the two writers of a
+    /// playlist's entries outside it: the scan's playlist sync and an item
+    /// deletion. Either landing between an edit's read and its rewrite would
+    /// lose the scan's members, or fail the rewrite on a deleted member.
+    /// Taken before the writer, as the manager takes it.
+    playlist_entry_edits: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl std::fmt::Debug for FerrofinItemPersistenceService {
@@ -1213,6 +1220,7 @@ impl FerrofinItemPersistenceService {
             localization: std::sync::OnceLock::new(),
             virtual_paths: crate::virtual_paths::VirtualPathExpander::identity(),
             by_name_identity: None,
+            playlist_entry_edits: Arc::default(),
         }
     }
 
@@ -1228,6 +1236,14 @@ impl FerrofinItemPersistenceService {
     ) -> Self {
         self.by_name_identity = identity;
         self
+    }
+
+    /// The lock the playlist manager holds across an entry edit's read and
+    /// rewrite, which this service's playlist sync and deletion also take.
+    /// The composition root hands it to the playlist manager.
+    #[must_use]
+    pub fn playlist_entry_edits(&self) -> Arc<tokio::sync::Mutex<()>> {
+        Arc::clone(&self.playlist_entry_edits)
     }
 
     /// Installs the server's [`VirtualPathExpander`], so a save keeps the
@@ -2426,6 +2442,7 @@ pub(crate) async fn remove_person_items(
     db: &Database,
     ids: &[Uuid],
 ) -> Result<usize, ServiceError> {
+    // A service of its own, so not the playlist edits' lock: a person is never a playlist entry.
     Ok(FerrofinItemPersistenceService::new(db.clone())
         .delete_items(ids)
         .await?
@@ -2585,6 +2602,7 @@ impl ItemPersistenceService for FerrofinItemPersistenceService {
         if given.is_empty() {
             return Ok(Vec::new());
         }
+        let _edits = self.playlist_entry_edits.lock().await;
         let mut tx = self.db.writer().begin().await.map_err(db_err)?;
         // Two BaseItems references have no `ON DELETE CASCADE`: an extra's
         // `OwnerId`, and `LinkedChildren` (the item as a playlist or
@@ -2899,6 +2917,7 @@ impl ItemPersistenceService for FerrofinItemPersistenceService {
                 }
                 None => None,
             };
+            let _edits = self.playlist_entry_edits.lock().await;
             let mut tx = self.db.writer().begin().await.map_err(db_err)?;
             // `PlaylistResolver` creates `new Playlist { OpenAccess = true }`:
             // `OwnerUserId` is `Guid.Empty` — a user no caller is, so nobody
@@ -3250,7 +3269,7 @@ impl ItemPersistenceService for FerrofinItemPersistenceService {
             None,
         ))
         .bind(self.virtual_paths.reverse(path))
-        .bind(chrono::Utc::now())
+        .bind(datetime_to_db(chrono::Utc::now()))
         .bind(unrated_type_name(kind))
         .execute(&mut *tx)
         .await
@@ -4739,8 +4758,9 @@ pub(crate) async fn rekey_rows_at(
     if moves.is_empty() {
         return Ok(Vec::new());
     }
-    // The write lock first: the moves read before they write, and a boot
-    // repair runs this beside the previous version (CONTRIBUTING.md,
+    // Reserve the writer before reading the schema: a deferred transaction
+    // fails at its first write when another process commits in between, and a
+    // boot repair runs this beside the previous version (CONTRIBUTING.md,
     // "Migrations and one-shot repairs").
     let mut tx = db
         .writer()
@@ -8962,17 +8982,31 @@ mod tests {
     // Saving an item must stamp the derived `CleanName` (C# `SaveItem` computes
     // `GetCleanValue(item.Name)` at write time). No scan path pre-computes it,
     // and the `searchTerm` filter queries `CleanName` — a NULL there makes the
-    // item invisible to search (the web search page returned nothing).
+    // item invisible to search (the web search page returned nothing). The
+    // titles after `Amélie` are upstream `SearchPunctuationTests.cs` (PR
+    // 14879), which saves a `Series` through `BaseItemRepository.Map`.
+    #[rstest::rstest]
+    #[case("Amélie", "amelie")]
+    #[case("Mr. Robot", "mr robot")]
+    #[case("Spider-Man: Homecoming", "spider man homecoming")]
+    #[case("Beyoncé — Live!", "beyonce live")]
+    #[case("Hello, World!", "hello world")]
+    #[case("(The) Good, the Bad & the Ugly", "the good the bad the ugly")]
+    #[case("Wall-E", "wall e")]
+    #[case("No. 1: The Beginning", "no 1 the beginning")]
+    #[case("Café-au-lait", "cafe au lait")]
+    #[case("Face/Off", "face off")]
+    #[case("V/H/S", "v h s")]
     #[tokio::test]
-    async fn save_items_stamps_derived_clean_name() {
+    async fn save_items_stamps_derived_clean_name(#[case] name: &str, #[case] expected: &str) {
         let db = test_db().await;
         let id = Uuid::new_v4();
         let svc = FerrofinItemPersistenceService::new(db.clone());
 
         let item = ferrofin_db::entities::base_items::BaseItemEntity {
             id: ferrofin_db::store::guid_to_db(id),
-            type_: "MediaBrowser.Controller.Entities.Movies.Movie".to_owned(),
-            name: Some("Amélie".to_owned()),
+            type_: "MediaBrowser.Controller.Entities.TV.Series".to_owned(),
+            name: Some(name.to_owned()),
             ..ferrofin_db::entities::base_items::BaseItemEntity::default()
         };
         svc.save_items(std::slice::from_ref(&item))
@@ -8985,7 +9019,7 @@ mod tests {
                 .fetch_one(db.pool())
                 .await
                 .expect("query");
-        assert_eq!(clean.as_deref(), Some("amelie"));
+        assert_eq!(clean.as_deref(), Some(expected));
     }
 
     /// gl-1581: the scan's path reads — the by-path lookup (`FindByPath`),

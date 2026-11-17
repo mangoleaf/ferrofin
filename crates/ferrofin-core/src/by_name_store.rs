@@ -91,13 +91,7 @@ impl ByNameStore {
     pub fn rebased_path(&self, kind: BaseItemKind, path: &str) -> Option<String> {
         let root = self.roots.get(&kind)?.to_string_lossy();
         let file_name = path.rsplit('/').next().unwrap_or(path);
-        Some(if file_name.is_empty() {
-            root.into_owned()
-        } else if root.ends_with('/') {
-            format!("{root}{file_name}")
-        } else {
-            format!("{root}/{file_name}")
-        })
+        Some(item_type_lookup::path_combine(&root, file_name))
     }
 
     /// `CreateItemByName<T>(name)`: the id of `name`'s row for `kind`, creating

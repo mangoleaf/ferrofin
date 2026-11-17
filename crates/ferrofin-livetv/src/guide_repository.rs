@@ -50,7 +50,7 @@ pub(crate) const PROGRAM_SELECT: &str = r#"SELECT p."Id",p."ChannelId",p."StartD
                       c."ChannelType" AS "ChannelMediaKind"
                FROM "FerrofinLiveTvPrograms" p
                JOIN "FerrofinLiveTvChannels" c ON c."Id" = p."ChannelId""#;
-/// Every channel in the lineup the kind filters of `query` keep, in stored
+/// The lineup channels the kind filters of `query` keep, in stored
 /// (`SortIndex`) order.
 ///
 /// Upstream's `GetInternalChannels` lists the stored channel items, so its
@@ -60,8 +60,11 @@ pub(crate) const PROGRAM_SELECT: &str = r#"SELECT p."Id",p."ChannelId",p."StartD
 /// `IsMovie` and `IsSeries` the item's columns, `IsKids`, `IsNews` and
 /// `IsSports` its "Kids", "News" and "Sports" tags: any of the tags asked for,
 /// none of those asked against. The "Kids" tag stays once
-/// added, so a channel whose kids airing left the guide still matches. A
-/// channel whose item is not stored has neither flags nor tags.
+/// added, so a channel whose kids airing left the guide still matches.
+///
+/// With `stored_items_only`, a lineup channel is listed only once its item is
+/// stored, as upstream lists only the items (a guide refresh writes the lineup
+/// before the items). The guide refresh's own mirror reads the whole lineup.
 ///
 /// `restrictions` are the user's parental restrictions, which keep only the
 /// channels whose item that user may list.
@@ -73,8 +76,9 @@ pub(crate) async fn channel_rows(
     db: &Database,
     query: &LiveTvChannelQuery,
     restrictions: UserRestrictions<'_>,
+    stored_items_only: bool,
 ) -> Result<Vec<ChannelRow>, ServiceError> {
-    channel_rows_query(query, restrictions)
+    channel_rows_query(query, restrictions, stored_items_only)
         .build_query_as()
         .fetch_all(db.pool())
         .await
@@ -85,15 +89,22 @@ pub(crate) async fn channel_rows(
 fn channel_rows_query(
     query: &LiveTvChannelQuery,
     restrictions: UserRestrictions<'_>,
+    stored_items_only: bool,
 ) -> sqlx::QueryBuilder<sqlx::Sqlite> {
     let mut qb = sqlx::QueryBuilder::new(
         r#"SELECT "Id","TvgId","ExternalId","Name","Number","ChannelType","DateCreated","ImageUrl"
            FROM "FerrofinLiveTvChannels""#,
     );
     let mut joiner = " WHERE ";
+    // The restrictions' `EXISTS` over the item lists only stored items too.
     if let Some(restrictions) = restrictions {
         qb.push(std::mem::replace(&mut joiner, " AND "));
         push_item_restrictions(&mut qb, r#""FerrofinLiveTvChannels"."Id""#, restrictions);
+    } else if stored_items_only {
+        qb.push(std::mem::replace(&mut joiner, " AND "));
+        qb.push(
+            r#"EXISTS (SELECT 1 FROM "BaseItems" bi WHERE bi."Id" = "FerrofinLiveTvChannels"."Id")"#,
+        );
     }
     for (filter, column) in [(query.is_movie, "IsMovie"), (query.is_series, "IsSeries")] {
         if let Some(want) = filter {
@@ -310,8 +321,8 @@ pub async fn channel_user_data(
         .collect())
 }
 
-/// One channel of a tuner host's stored lineup, as the channel-mapping and
-/// guide-binding paths need it.
+/// One channel of a tuner host's stored lineup, as the guide-binding path
+/// needs it.
 ///
 /// The stored [`id`](Self::id) is Ferrofin's internal channel key;
 /// [`external_id`](Self::external_id) is the `ChannelInfo.Id` the owning
@@ -329,8 +340,6 @@ pub struct TunerLineupRow {
     pub name: String,
     /// The channel number, or empty when the playlist carried none.
     pub number: String,
-    /// The stream URL the channel plays from.
-    pub stream_url: String,
     /// The tuner host's `ChannelInfo.Id` for this channel.
     pub external_id: String,
 }
@@ -378,10 +387,9 @@ pub async fn channel_recommendation_data(
 
 /// One tuner host's stored lineup, in playlist order.
 ///
-/// Backs the port of `ListingsManager.GetChannelsForListingsProvider`, which
-/// upstream re-parses the tuner's M3U on every call; Ferrofin already caches
-/// the parse in this table, so the same `ChannelInfo` fields are read back
-/// from it.
+/// Backs the guide refresh's channel binding, which reads it right after the
+/// refresh stored the lineup it fetched. The channel-mapping dialog reads each
+/// tuner live instead, as upstream's `GetChannelsForListingsProvider` does.
 ///
 /// # Errors
 ///
@@ -391,7 +399,7 @@ pub async fn tuner_lineup(
     tuner_host_id: &str,
 ) -> Result<Vec<TunerLineupRow>, ServiceError> {
     let rows = sqlx::query(
-        r#"SELECT "Id","TvgId","Name","Number","StreamUrl","ExternalId" FROM "FerrofinLiveTvChannels"
+        r#"SELECT "Id","TvgId","Name","Number","ExternalId" FROM "FerrofinLiveTvChannels"
            WHERE "TunerHostId" = ?1 COLLATE NOCASE ORDER BY "SortIndex", "Name""#,
     )
     .bind(tuner_host_id)
@@ -405,7 +413,6 @@ pub async fn tuner_lineup(
             tvg_id: r.get("TvgId"),
             name: r.get("Name"),
             number: r.get::<Option<String>, _>("Number").unwrap_or_default(),
-            stream_url: r.get("StreamUrl"),
             external_id: r.get("ExternalId"),
         })
         .collect())
@@ -841,13 +848,18 @@ pub mod test_support {
     }
 
     /// The `EXPLAIN QUERY PLAN` details of [`super::channel_rows`]' statement
-    /// for `query` and `restrictions`, in plan order.
+    /// for `query`, `restrictions` and `stored_items_only`, in plan order.
     pub(crate) async fn channel_rows_plan(
         db: &Database,
         query: &super::LiveTvChannelQuery,
         restrictions: super::UserRestrictions<'_>,
+        stored_items_only: bool,
     ) -> Result<Vec<String>, ServiceError> {
-        plan(db, super::channel_rows_query(query, restrictions)).await
+        plan(
+            db,
+            super::channel_rows_query(query, restrictions, stored_items_only),
+        )
+        .await
     }
 
     /// The `EXPLAIN QUERY PLAN` details of `qb`'s statement, in plan order.

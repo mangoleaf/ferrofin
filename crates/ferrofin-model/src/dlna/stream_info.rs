@@ -819,10 +819,11 @@ impl StreamInfo {
             ));
             info.is_external_url = false;
 
-            let is_absolute_http = stream
-                .path
-                .as_deref()
-                .is_some_and(|p| p.starts_with("http://") || p.starts_with("https://"));
+            // Upstream's `Uri.TryCreate(path, UriKind.Absolute)`: surrounding
+            // white space ignored, the scheme in any case, a host required.
+            let is_absolute_http = stream.path.as_deref().is_some_and(|p| {
+                url::Url::parse(p).is_ok_and(|u| matches!(u.scheme(), "http" | "https"))
+            });
 
             if stream.is_external
                 && stream.supports_external_stream

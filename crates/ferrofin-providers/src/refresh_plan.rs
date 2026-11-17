@@ -7,13 +7,15 @@
 //! (`GetNonLocalImageProviders`, `:717-749`) and the change monitors the
 //! scan's providers carry: `ProbeProvider.HasChanged`
 //! (`MediaInfo/ProbeProvider.cs:127-201`), `BaseNfoProvider.HasChanged`
-//! (`XbmcMetadata/Providers/BaseNfoProvider.cs:67-80`) and
-//! `BaseXmlProvider.HasChanged` (`LocalMetadata/BaseXmlProvider.cs:97-107`).
+//! (`XbmcMetadata/Providers/BaseNfoProvider.cs:67-80`),
+//! `BaseXmlProvider.HasChanged` (`LocalMetadata/BaseXmlProvider.cs:97-107`)
+//! and `PhotoProvider.HasChanged` (`Emby.Photos/PhotoProvider.cs:47-56`).
 //! `BaseItem.RequiresRefresh` (`Entities/BaseItem.cs:1754-1764`) and its
 //! `Folder` (`Entities/Folder.cs:213-223`), `CollectionFolder`
-//! (`Entities/CollectionFolder.cs:206-230`) and `MusicArtist`
-//! (`Entities/Audio/MusicArtist.cs:186-198`) overrides decide
-//! `requiresRefresh`.
+//! (`Entities/CollectionFolder.cs:206-230`), `MusicArtist`
+//! (`Entities/Audio/MusicArtist.cs:186-198`) and by-name `Genre`,
+//! `MusicGenre`, `Person`, `Studio` and `Year` (`Entities/Genre.cs:96` and
+//! its kin) overrides decide `requiresRefresh`.
 //!
 //! Everything here is pure: the scan gathers the stored row's dates, the
 //! filesystem facts and the options, and acts on the answer. It lives here,
@@ -144,11 +146,16 @@ pub struct FileFacts {
     pub is_shortcut: bool,
     /// `IsFileProtocol`: the path is a local file, not a stream URL.
     pub is_file_protocol: bool,
+    /// The item is a photo, which `PhotoProvider` reads; its change monitor
+    /// (`PhotoProvider.HasChanged`) fires when the file's mtime drifted from
+    /// the stored `DateModified`.
+    pub is_photo: bool,
     /// `Video.IsPlaceHolder`: a disc stub standing in for offline media.
     pub is_placeholder: bool,
-    /// `MusicArtist.RequiresRefresh`'s own arm: an artist known only by name
-    /// whose `Path` is not its rebased path (`GetRebasedPath`: the artists
-    /// directory joined with the path's file name).
+    /// The by-name `RequiresRefresh` arm of `MusicArtist`, `Genre`,
+    /// `MusicGenre`, `Person`, `Studio` and `Year`: an item known only by name
+    /// whose `Path` is not its rebased path (`GetRebasedPath`: its kind's
+    /// metadata directory joined with the path's file name).
     pub path_rebased: bool,
     /// `CollectionFolder.RequiresRefresh`'s own arms: the library's
     /// `_requiresRefresh` flag is set, or its stored `PhysicalLocations` or
@@ -177,7 +184,7 @@ pub struct ItemRefreshPlan {
     /// `isFirstRefresh`: the item has never been refreshed.
     pub is_first_refresh: bool,
     /// `requiresRefresh`: the refresh interval elapsed, the file changed,
-    /// a cumulative-runtime folder has no runtime, an artist known only by
+    /// a cumulative-runtime folder has no runtime, an item known only by
     /// name is not at its rebased path, or a library's locations changed.
     pub requires_refresh: bool,
     /// Run the probe (`ProbeProvider`).
@@ -185,8 +192,8 @@ pub struct ItemRefreshPlan {
     /// Run the local metadata readers (NFO, and the embedded readers).
     pub local_metadata: bool,
     /// A local change monitor fired (the NFO is newer than the last save,
-    /// or the probe's), rather than the local readers running only because
-    /// the remote providers do.
+    /// the probe's, or the photo's), rather than the local readers running
+    /// only because the remote providers do.
     pub local_monitor_fired: bool,
     /// Run the remote metadata providers.
     pub remote_metadata: bool,
@@ -241,7 +248,7 @@ pub enum RefreshReason {
     Modified,
     /// A cumulative-runtime folder has no runtime.
     NoRuntime,
-    /// An artist known only by name is not at its rebased path.
+    /// An item known only by name is not at its rebased path.
     PathRebased,
     /// A library's locations changed.
     Locations,
@@ -320,8 +327,9 @@ pub fn file_changed(stored: Option<DateTime<Utc>>, mtime: DateTime<Utc>) -> bool
 /// `BaseItem.RequiresRefresh` with the overrides of the kinds a scan plans:
 /// the file changed (never for a path-less item or an unset `DateModified`),
 /// or a folder that sums its children's runtime has none (`Folder`). An
-/// artist known only by name asks first whether its path moved
-/// (`MusicArtist`), and a library asks last whether its locations changed
+/// item known only by name asks first whether its path moved (`MusicArtist`,
+/// `Genre`, `MusicGenre`, `Person`, `Studio`, `Year`), and a library asks last
+/// whether its locations changed
 /// (`CollectionFolder`, after `base.RequiresRefresh()`, the `Folder` one).
 /// `None` when nothing holds, else the first that does, in that order.
 fn item_requires_refresh(stored: &StoredState, fs: &FileFacts) -> Option<RefreshReason> {
@@ -385,6 +393,16 @@ fn probe_changed(stored: &StoredState, fs: &FileFacts) -> Option<RefreshReason> 
     }
 }
 
+/// `PhotoProvider.HasChanged` (`Emby.Photos/PhotoProvider.cs:47-56`): the
+/// local photo file's mtime drifted from the stored `DateModified`.
+fn photo_changed(stored: &StoredState, fs: &FileFacts) -> bool {
+    fs.is_photo
+        && fs.is_file_protocol
+        && fs
+            .mtime
+            .is_some_and(|mtime| file_changed(stored.date_modified, mtime))
+}
+
 /// `BaseNfoProvider.HasChanged` / `BaseXmlProvider.HasChanged`: the sidecar
 /// was written after the item was last saved (an unset `DateLastSaved` is
 /// `DateTime.MinValue`, so any sidecar is newer).
@@ -422,7 +440,8 @@ pub fn full_refresh(plan: &ItemRefreshPlan, request: &RefreshRequest<'_>) -> boo
 /// - `GetProviders`: every provider runs when replacing all metadata, on a
 ///   full refresh, or on a first/required refresh in `Default` mode or above;
 ///   otherwise only the providers whose change monitor fired, plus every
-///   local reader when any of them did. No remote provider has a change
+///   local reader when any of them did (a photo has none: its
+///   `PhotoProvider` alone runs). No remote provider has a change
 ///   monitor, so a remote provider runs only in the run-all case — or, in
 ///   the scan, when `backfill` says so (never for a locked item, and never
 ///   in `ValidationOnly` or `None` mode). A locked item runs the probe only:
@@ -487,7 +506,12 @@ pub fn plan_item_refresh(
             || mode == MetadataRefreshMode::FullRefresh
             || (is_first_refresh && at_least_default)
             || (requires_refresh && at_least_default);
-        let probe_change = probe_changed(stored, fs);
+        // The custom providers' change monitors: the probe's, else the
+        // photo's (`PhotoProvider`, run here through `local_metadata`; a photo
+        // has no local reader). A new item carries its file's date upstream
+        // (`SetInitialItemValues`), so its photo monitor never fires.
+        let probe_change = probe_changed(stored, fs)
+            .or_else(|| (!is_new && photo_changed(stored, fs)).then_some(RefreshReason::Modified));
         let probe_changed = probe_change.is_some();
         let local_changed = local_metadata_changed(stored, fs);
         if reason == RefreshReason::Unchanged {

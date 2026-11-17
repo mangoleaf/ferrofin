@@ -130,6 +130,50 @@ async fn metrics_enabled_serves_exposition() {
             "missing `{name}` in exposition:\n{body}"
         );
     }
+    // gl-903: Startup's response-time and CORS middleware run above
+    // `MapMetrics`, and mounting `/metrics` keeps the API router's layered
+    // fallback, so both answers carry the headers.
+    for (uri, status) in [
+        ("/metrics", StatusCode::OK),
+        ("/no/such/path", StatusCode::NOT_FOUND),
+    ] {
+        let request = Request::builder()
+            .uri(uri)
+            .header("origin", "http://client.example")
+            .body(Body::empty())
+            .unwrap();
+        let response = router.clone().oneshot(request).await.unwrap();
+        assert_eq!(response.status(), status, "{uri}");
+        for name in ["x-response-time-ms", "access-control-allow-origin"] {
+            assert_eq!(
+                response.headers().get_all(name).iter().count(),
+                1,
+                "{uri}: {name}"
+            );
+        }
+    }
+
+    // An unmatched path still gets the API router's own (layered) fallback.
+    let marked = axum::Router::new().layer(axum::middleware::from_fn(
+        |request: Request<Body>, next: axum::middleware::Next| async move {
+            let mut response = next.run(request).await;
+            response
+                .headers_mut()
+                .insert("x-api-router", axum::http::HeaderValue::from_static("1"));
+            response
+        },
+    ));
+    let response = metrics_wiring::mount(marked, &handle, &wired.state)
+        .oneshot(
+            Request::builder()
+                .uri("/no/such/path")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert!(response.headers().contains_key("x-api-router"));
+
     // `/metrics` is behind the same IP-access gate as the API (upstream maps
     // it after `UseIPBasedAccessValidation`): a peer the network policy
     // refuses gets the gate's 503, an admitted one the exposition.

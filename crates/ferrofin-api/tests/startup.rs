@@ -13,7 +13,7 @@ use ferrofin_api::create_router;
 use ferrofin_api::state::AppState;
 use ferrofin_api::test_support::{
     FakeAuthContext, FakeDto, FakeLibrary, FakeMediaSources, FakeMusic, FakeProviders, FakeSearch,
-    FakeSimilarItems, FakeSystem, FakeUserData, FakeUserViews,
+    FakeSimilarItems, FakeSystem, FakeUserData, FakeUserViews, FixedAuth, fake_user_entity,
 };
 use ferrofin_db::entities::security::DeviceEntity;
 use ferrofin_db::entities::users::UserEntity;
@@ -28,7 +28,6 @@ use ferrofin_model::users::UserPolicy;
 use ferrofin_traits::configuration::ServerConfigurationManager;
 use ferrofin_traits::error::ServiceError;
 use ferrofin_traits::library::UserManager;
-use ferrofin_traits::net::{AuthService, RequestContext};
 use ferrofin_traits::options::AuthorizationInfo;
 use ferrofin_traits::security::QuickConnect;
 use ferrofin_traits::session::{AuthenticationRequest, AuthenticationResultData, SessionManager};
@@ -43,56 +42,14 @@ const BOB_ID: Uuid = Uuid::from_u128(0x0B0B);
 /// Builds a neutral [`UserEntity`] with the given id + name (no `Default`).
 fn user_entity(id: Uuid, username: &str, password: Option<&str>) -> UserEntity {
     UserEntity {
-        id: id.to_string(),
-        audio_language_preference: None,
-        authentication_provider_id: String::new(),
-        cast_receiver_id: None,
-        display_collections_view: false,
-        display_missing_episodes: false,
-        enable_auto_login: false,
-        enable_local_password: false,
-        enable_next_episode_auto_play: false,
-        enable_user_preference_access: false,
-        hide_played_in_latest: false,
-        internal_id: 0,
-        invalid_login_attempt_count: 0,
-        last_activity_date: None,
-        last_login_date: None,
-        login_attempts_before_lockout: None,
-        max_active_sessions: 0,
-        max_parental_rating_score: None,
-        max_parental_rating_sub_score: None,
-        must_update_password: false,
         password: password.map(ToOwned::to_owned),
-        password_reset_provider_id: String::new(),
-        play_default_audio_track: false,
-        remember_audio_selections: false,
-        remember_subtitle_selections: false,
-        remote_client_bitrate_limit: None,
-        row_version: 0,
-        subtitle_language_preference: None,
-        subtitle_mode: 0,
-        sync_play_access: 0,
-        username: username.to_owned(),
-        normalized_username: username.to_uppercase(),
+        ..fake_user_entity(id, username)
     }
 }
 
-/// An [`AuthService`] authenticating as the admin user (so `RequireAuth` passes).
-struct AdminAuth;
-
-#[async_trait]
-impl AuthService for AdminAuth {
-    async fn authenticate(
-        &self,
-        _request: &RequestContext,
-    ) -> Result<AuthorizationInfo, ServiceError> {
-        Ok(AuthorizationInfo {
-            user: Some(Arc::new(user_entity(ADMIN_ID, "admin", Some("hash")))),
-            is_authenticated: true,
-            ..AuthorizationInfo::default()
-        })
-    }
+/// An `AuthService` authenticating as the admin user (so `RequireAuth` passes).
+fn admin_auth() -> FixedAuth {
+    FixedAuth::signed_in(user_entity(ADMIN_ID, "admin", Some("hash")))
 }
 
 /// A [`UserManager`] backed by an in-memory table, recording password/policy
@@ -111,6 +68,10 @@ struct MemUsers {
     first_user_password: Option<String>,
     /// When set, `get_first_user` reports that there is no first user at all.
     no_first_user: bool,
+    /// The seeded first user's name; `bob` when unset.
+    first_user_name: Option<String>,
+    /// Records the last new name passed to `rename_user`.
+    renamed: Mutex<Option<String>>,
 }
 
 /// The fixed two-user table shared by [`MemUsers`] and the assertions.
@@ -138,7 +99,7 @@ impl UserManager for MemUsers {
         }
         Ok(Some(user_entity(
             BOB_ID,
-            "bob",
+            self.first_user_name.as_deref().unwrap_or("bob"),
             self.first_user_password.as_deref(),
         )))
     }
@@ -149,8 +110,9 @@ impl UserManager for MemUsers {
         &self,
         _user_id: Uuid,
         _old_name: &str,
-        _new_name: &str,
+        new_name: &str,
     ) -> Result<(), ServiceError> {
+        *self.renamed.lock().unwrap() = Some(new_name.to_owned());
         Ok(())
     }
     async fn update_user(&self, _user: &UserEntity) -> Result<(), ServiceError> {
@@ -493,11 +455,11 @@ impl SessionManager for NoopSessions {
 
 /// Assembles an [`AppState`] from the batch-6 fakes plus panic fakes elsewhere.
 fn state(users: Arc<MemUsers>, config: Arc<MemConfig>) -> AppState {
-    state_with_auth(users, config, Arc::new(AdminAuth))
+    state_with_auth(users, config, Arc::new(admin_auth()))
 }
 
 /// `state`, with the auth service chosen by the caller — the anonymous case
-/// needs one that REJECTS, since `AdminAuth` authenticates every request.
+/// needs one that REJECTS, since `admin_auth` authenticates every request.
 fn state_with_auth(
     users: Arc<MemUsers>,
     config: Arc<MemConfig>,
@@ -689,8 +651,11 @@ async fn startup_user_get_and_set_password() {
 // Do not relax any of them: 10.11.8's shape is the hole batch A1 closed on this
 // same controller, one layer deeper.
 
-/// Drives one `POST /Startup/User` against `users` and returns the status.
-async fn post_startup_user(users: Arc<MemUsers>, body: serde_json::Value) -> StatusCode {
+/// Drives one `POST /Startup/User` against `users` and returns the response.
+async fn post_startup_user_response(
+    users: Arc<MemUsers>,
+    body: serde_json::Value,
+) -> axum::response::Response {
     let router = create_router(state(users, Arc::new(MemConfig::new(false))));
     router
         .oneshot(
@@ -703,7 +668,57 @@ async fn post_startup_user(users: Arc<MemUsers>, body: serde_json::Value) -> Sta
         )
         .await
         .unwrap()
-        .status()
+}
+
+/// Drives one `POST /Startup/User` against `users` and returns the status.
+async fn post_startup_user(users: Arc<MemUsers>, body: serde_json::Value) -> StatusCode {
+    post_startup_user_response(users, body).await.status()
+}
+
+/// `UpdateStartupUser` renames only when the sent name differs from the stored
+/// one under `StringComparison.InvariantCultureIgnoreCase`: a change of case,
+/// of any letter, keeps the stored name (and so announces no `UserUpdated`).
+#[rstest::rstest]
+#[case("bob", "Bob", None)]
+#[case("ärne", "Ärne", None)]
+#[case("ÄRNE", "ärne", None)]
+#[case("ärne", "Arne", Some("Arne"))]
+#[case("bob", "robert", Some("robert"))]
+#[tokio::test]
+async fn startup_user_post_renames_only_a_name_that_differs_beyond_case(
+    #[case] stored: &str,
+    #[case] sent: &str,
+    #[case] renamed: Option<&str>,
+) {
+    let users = Arc::new(MemUsers {
+        first_user_name: Some(stored.to_owned()),
+        ..MemUsers::default()
+    });
+    let status = post_startup_user(
+        users.clone(),
+        serde_json::json!({ "Name": sent, "Password": "pw" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    assert_eq!(users.renamed.lock().unwrap().as_deref(), renamed);
+    assert_eq!(
+        users.changed_password.lock().unwrap().clone(),
+        Some((BOB_ID, "pw".to_owned()))
+    );
+}
+
+/// `startupUserDto.Name is not null`: a missing or null `Name` renames no one.
+#[rstest::rstest]
+#[case(serde_json::json!({ "Password": "pw" }))]
+#[case(serde_json::json!({ "Name": null, "Password": "pw" }))]
+#[tokio::test]
+async fn startup_user_post_without_a_name_keeps_the_stored_one(#[case] body: serde_json::Value) {
+    let users = Arc::new(MemUsers::default());
+    assert_eq!(
+        post_startup_user(users.clone(), body).await,
+        StatusCode::NO_CONTENT
+    );
+    assert_eq!(users.renamed.lock().unwrap().as_deref(), None);
 }
 
 #[tokio::test]
@@ -714,12 +729,16 @@ async fn startup_user_post_returns_404_when_no_first_user() {
         no_first_user: true,
         ..MemUsers::default()
     });
-    let status = post_startup_user(
+    let response = post_startup_user_response(
         users.clone(),
         serde_json::json!({ "Name": "admin", "Password": "pw" }),
     )
     .await;
-    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    // The parameterless `NotFound()`: ASP.NET's ProblemDetails, no message.
+    let problem = body_json(response).await;
+    assert_eq!(problem["title"], "Not Found");
+    assert_eq!(problem["status"], 404);
     assert!(users.changed_password.lock().unwrap().is_none());
 }
 

@@ -18,6 +18,7 @@ use std::sync::Arc;
 
 use anyhow::Context as _;
 use ferrofin_api::AppState;
+use ferrofin_api::openapi::JELLYFIN_API_VERSION;
 use ferrofin_core::application_host::HostNetworkInfo;
 use ferrofin_core::system_manager::{LifecycleController, SystemHostFacts};
 use ferrofin_core::{
@@ -52,14 +53,16 @@ use crate::config::Config;
 use crate::media_encoding::build_media_encoding;
 
 /// Starts the task that reads the network interfaces again after the
-/// operating system reports a network change ([`ferrofin_networking::network_change`]).
-/// Where the listener cannot be opened the server goes on without it, as
+/// operating system reports a network change ([`ferrofin_networking::network_change`]),
+/// from `source`, the listener `build_app_state` opened as it built the
+/// manager. Where it could not be opened the server goes on without it, as
 /// with the setting off, and says so.
 fn start_network_change_monitor(
+    source: std::io::Result<ferrofin_networking::network_change::OsNetworkChanges>,
     network: &Arc<std::sync::RwLock<ferrofin_networking::NetworkManager>>,
 ) -> Option<tokio::task::JoinHandle<()>> {
     use ferrofin_networking::network_change;
-    match network_change::os_source() {
+    match source {
         Ok(source) => Some(tokio::spawn(tracing::Instrument::instrument(
             network_change::monitor(
                 source,
@@ -200,18 +203,6 @@ fn num_cpus_for_analysis() -> usize {
 
 /// The package name reported in system info (`IStartupOptions.PackageName`).
 const PACKAGE_NAME: &str = "ferrofin-server";
-
-/// The **Jellyfin server version Ferrofin reports** in `SystemInfo`/`PublicSystemInfo`
-/// (`Version`): the newest Jellyfin release Ferrofin adopts (12.4.0, whose database
-/// carries 12.2's migration-id set and adopts as generation `12.2.0`; handlers are
-/// ported from `UPSTREAM_TAG`) — NOT Ferrofin's own release version
-/// (`ferrofin_health::RELEASE_VERSION`, sent in User-Agents and backups).
-/// Clients gate on it: jellyfin-web's SDK refuses any server below
-/// `MINIMUM_VERSION = 10.10.0` with an "Update Required" screen, and jellyfin-sdk-kotlin
-/// (Android TV and friends) flags anything below `Jellyfin.minimumVersion = 12.0.0`
-/// as unsupported. The route gate stays pinned to the 10.11.8 contract, which covers
-/// every 12.x operation except `GET /Items/{itemId}/Collections` (added in 12.1).
-const JELLYFIN_API_VERSION: &str = "12.4.0";
 
 /// The assembled application state plus the handles the composition root still
 /// needs after wiring (the concrete host, to flip its startup flag and drive
@@ -987,15 +978,11 @@ pub async fn build_app_state(
             ffmpeg.ffprobe.to_string_lossy().into_owned(),
             MediaEncoderConfig {
                 // Jellyfin's `FFmpeg:analyzeduration` / `FFmpeg:probesize`
-                // defaults, which every probe passes; without them ffprobe
-                // falls back to its own 5 s / 5 MB and can miss late streams.
-                analyze_duration: Some(
-                    ferrofin_mediaencoding::encoder::media_encoder::DEFAULT_ANALYZE_DURATION
-                        .to_owned(),
-                ),
-                probe_size: Some(
-                    ferrofin_mediaencoding::encoder::media_encoder::DEFAULT_PROBE_SIZE.to_owned(),
-                ),
+                // (`200M` / `1G` unless configured), which every probe passes;
+                // without them ffprobe falls back to its own 5 s / 5 MB and
+                // can miss late streams.
+                analyze_duration: Some(config.ffmpeg_analyze_duration.to_string()),
+                probe_size: Some(config.ffmpeg_probe_size.to_string()),
                 // `GetNumberOfThreads(null, options, null)`; it reads no
                 // capability, only the usable cores, as the planner's does.
                 threads: ferrofin_mediaencoding::EncodingHelper::new(
@@ -1060,8 +1047,18 @@ pub async fn build_app_state(
         crate::base_url::resolve(&config.base_url, config.base_url_from_env, &network_config);
     let started_network = network_config.clone();
     let network = Arc::new(std::sync::RwLock::new(
-        ferrofin_networking::NetworkManager::live(network_config),
+        ferrofin_networking::NetworkManager::live(
+            network_config,
+            Arc::new(ferrofin_networking::TracingLogger),
+        ),
     ));
+    // `DetectNetworkChange` subscribes as the manager is built (upstream's
+    // `NetworkManager` constructor): a request reads the manager's snapshot,
+    // so the listener opens now, and a change made during the rest of the
+    // wiring waits in it for the monitor started last.
+    let network_changes = config
+        .detect_network_change
+        .then(ferrofin_networking::network_change::os_source);
 
     let users_impl = Arc::new(
         FerrofinUserManager::new(db.clone())
@@ -1330,6 +1327,18 @@ pub async fn build_app_state(
         &virtual_paths,
     )
     .await;
+    // Then a box set an older Ferrofin created with no folder gets the one
+    // Jellyfin's `CreateCollectionAsync` makes in that library's folder, and
+    // the id Jellyfin keys it by.
+    ferrofin_core::adoption_repairs::run_rekey_pathless_box_sets(
+        db,
+        &id_derivation,
+        (&paths.data_path(), &paths.root_folder_path()),
+        &virtual_paths,
+        Some(metadata_library_now.as_path()),
+        Some(path_manager.as_ref()),
+    )
+    .await;
     // One-shot (Jellyfin 12.2 `20260915120000_MigrateRatingLevels`): recompute
     // every row's inherited parental-rating columns from its OWN
     // `OfficialRating` through `GetRatingScore`, so a rating string an older
@@ -1519,6 +1528,18 @@ pub async fn build_app_state(
             .with_metadata_country({
                 let config_mgr = Arc::clone(&config_mgr);
                 Arc::new(move || config_mgr.snapshot_shared().metadata_country_code.clone())
+            })
+            // `GetRebasedPath` of the by-name kinds the item refresh moves
+            // (`Genre`/`MusicGenre`/`Person`/`Studio`/`Year.RequiresRefresh`).
+            .with_by_name_rebase({
+                let paths = Arc::clone(&paths);
+                move |kind, path: &str| {
+                    ferrofin_core::item_type_lookup::rebased_by_name_path(
+                        paths.as_ref(),
+                        kind,
+                        path,
+                    )
+                }
             }),
     );
 
@@ -2387,6 +2408,8 @@ pub async fn build_app_state(
         .with_self_writes(Arc::clone(&self_writes_guard))
         // Each playlist change announced as `ItemAdded`/`ItemUpdated`.
         .with_item_persistence(Arc::clone(&item_persistence_service))
+        // The scan's playlist sync and deletion wait for an entry edit.
+        .with_entry_edits(item_persistence_impl.playlist_entry_edits())
         // A new playlist's folder stored as `%AppDataPath%/playlists/<name>`.
         .with_virtual_paths(virtual_paths.clone()),
     );
@@ -2468,6 +2491,7 @@ pub async fn build_app_state(
             Arc::clone(&library),
             Arc::clone(&virtual_folders),
             Arc::clone(&trickplay),
+            Arc::clone(&media_stream_repository),
         )));
         task_manager.register(Arc::new(maint_tasks::CleanActivityLogTask::new(
             Arc::clone(&config_trait),
@@ -2543,6 +2567,11 @@ pub async fn build_app_state(
     )
     .await
     .context("failed to remove items whose library or file is gone")?;
+    // Once per database: the playlists of users deleted before the fix for
+    // gl-131 (or by a hand-over that failed) are handed over or deleted, as
+    // deleting their owner now does. It deletes through the library manager
+    // too; a failure only warns.
+    ferrofin_core::adoption_repairs::run_remove_orphaned_playlists(db, playlists.as_ref()).await;
     // Jellyfin 12.0's `CleanupOrphanedExternalData`, once per database: the
     // extracted data and chapter images left behind for items no longer
     // stored (every earlier Ferrofin left them when a scan removed an item).
@@ -3085,6 +3114,10 @@ pub async fn build_app_state(
                 server: config.max_transcodes,
                 per_user: config.max_transcodes_per_user,
             },
+            input_analysis: ferrofin_mediaencoding::encoder::media_encoder::InputAnalysis {
+                analyze_duration: config.ffmpeg_analyze_duration,
+                probe_size: config.ffmpeg_probe_size,
+            },
         },
     );
     let state = state
@@ -3263,6 +3296,17 @@ pub async fn build_app_state(
             Arc::clone(&plugins),
             Arc::new(ferrofin_extensions::ldap_auth::directory::Ldap3Directory::default()),
         ));
+    // The backup engine behind `/Backup*`: archives come from and go back to
+    // the live application paths, and each manifest records this release.
+    let backup_paths: Arc<dyn ferrofin_traits::system::ServerApplicationPaths> =
+        Arc::clone(&paths) as Arc<_>;
+    let backup: Arc<dyn ferrofin_traits::backup::BackupService> =
+        Arc::new(ferrofin_core::backup::FerrofinBackupService::new(
+            backup_paths,
+            Arc::clone(&state.library),
+            Arc::clone(&state.system),
+            ferrofin_health::RELEASE_VERSION,
+        ));
     let state = state
         .with_plugin_request_handler(plugin_routes)
         .with_session_bus(Arc::clone(&session_bus))
@@ -3271,6 +3315,7 @@ pub async fn build_app_state(
         .with_file_transformations(Arc::clone(&file_transformations))
         .with_merge_versions(merge_versions)
         .with_ldap(ldap)
+        .with_backup(backup)
         .with_playback_metrics(playback_metrics);
 
     // Establishing the watches is a FILESYSTEM WALK, not a registration: an
@@ -3304,8 +3349,8 @@ pub async fn build_app_state(
     // `NetworkManager` constructor and unsubscribes in `Dispose`). Started
     // last: a `background` handle dropped by an early return would not stop
     // a task that never ends on its own.
-    if config.detect_network_change {
-        background.extend(start_network_change_monitor(&changing_network));
+    if let Some(source) = network_changes {
+        background.extend(start_network_change_monitor(source, &changing_network));
     }
 
     Ok(WiredApp {

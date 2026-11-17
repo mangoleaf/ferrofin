@@ -723,7 +723,7 @@ impl OpenSubtitlesProvider {
     #[must_use]
     pub fn new(plugins: Arc<dyn PluginManager>) -> Self {
         Self {
-            http: reqwest::Client::new(),
+            http: crate::http_client::client(),
             link_http: Self::link_http(PrivateAllowList::default()),
             limiter: RateLimiter::new("opensubtitles"),
             plugins,
@@ -786,7 +786,7 @@ impl OpenSubtitlesProvider {
         }
         resp.counted_json()
             .await
-            .map_err(|e| LoginFailure::Request(net_err(e)))
+            .map_err(|e| LoginFailure::Request(body_err(e)))
     }
 
     /// `OpenSubtitlesApi.LogOutAsync`: ends the session `token` opened. Best
@@ -1051,7 +1051,7 @@ impl OpenSubtitlesProvider {
             response
                 .counted_json::<LanguageList>()
                 .await
-                .map_err(net_err)?
+                .map_err(body_err)?
                 .data
         } else {
             None
@@ -1100,7 +1100,7 @@ impl OpenSubtitlesProvider {
                     response.status()
                 )));
             }
-            let page: SearchResponse = response.counted_json().await.map_err(net_err)?;
+            let page: SearchResponse = response.counted_json().await.map_err(body_err)?;
             if page.total_pages == 0 {
                 break;
             }
@@ -1280,6 +1280,7 @@ fn body_err(e: BodyError) -> ServiceError {
         BodyError::TooLarge => {
             ServiceError::backend("OpenSubtitles sent more than image_download_max_mb")
         }
+        BodyError::Decode(e) => ServiceError::backend(format!("OpenSubtitles request failed: {e}")),
     }
 }
 

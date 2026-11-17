@@ -18,6 +18,7 @@ pub mod error;
 pub mod external_ids;
 pub mod fanart;
 mod guarded_http;
+mod http_client;
 mod image_download;
 pub mod image_policy;
 pub mod image_save;
@@ -25,6 +26,8 @@ pub mod library_options;
 pub mod listenbrainz;
 pub mod local_images;
 pub mod local_xml;
+#[cfg(test)]
+mod log_capture;
 #[cfg(feature = "lrclib")]
 pub mod lrclib;
 pub mod mediainfo;

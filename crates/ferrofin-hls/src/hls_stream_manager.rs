@@ -509,8 +509,10 @@ where
     ///
     /// Both existence checks in [`Self::resolve_dynamic_segment`] — the
     /// pre-lock fast path and the post-lock re-check — go through here, so
-    /// neither can serve a client without restamping the job.
-    fn serve_if_present(
+    /// neither can serve a client without restamping the job. The check runs on
+    /// the blocking pool, never as an inline `stat` on a runtime worker
+    /// (gl-1378): `false` on any error, as `Path::exists` was.
+    async fn serve_if_present(
         &self,
         playlist_key: &str,
         segment_path: &Path,
@@ -518,7 +520,7 @@ where
         ending_ticks: i64,
         segment_index: i64,
     ) -> Option<ServedFile> {
-        if !segment_path.exists() {
+        if !tokio::fs::try_exists(segment_path).await.unwrap_or(false) {
             return None;
         }
         // The guard's drop restarts the idle countdown from now.
@@ -578,13 +580,16 @@ where
         // Fast path: the segment already exists (a live job produced it) → mark
         // the consumer active (keep-alive) and serve it. Port of the
         // `File.Exists` try-1; the guard drop restarts the idle countdown.
-        if let Some(file) = self.serve_if_present(
-            &playlist_key,
-            &segment_path,
-            ext,
-            ending_ticks,
-            i64::from(segment_id),
-        ) {
+        if let Some(file) = self
+            .serve_if_present(
+                &playlist_key,
+                &segment_path,
+                ext,
+                ending_ticks,
+                i64::from(segment_id),
+            )
+            .await
+        {
             return Ok(file);
         }
 
@@ -599,13 +604,16 @@ where
         // it open-coded the check without the keep-alive it left
         // `last_activity` stale and the idle reaper free to kill a job that was
         // actively being consumed.
-        if let Some(file) = self.serve_if_present(
-            &playlist_key,
-            &segment_path,
-            ext,
-            ending_ticks,
-            i64::from(segment_id),
-        ) {
+        if let Some(file) = self
+            .serve_if_present(
+                &playlist_key,
+                &segment_path,
+                ext,
+                ending_ticks,
+                i64::from(segment_id),
+            )
+            .await
+        {
             return Ok(file);
         }
 
@@ -653,7 +661,7 @@ where
                     .manager
                     .wait_for_segment(&handle, &playlist_path, segment_id)
                     .await
-                    && segment_path.exists()
+                    && tokio::fs::try_exists(&segment_path).await.unwrap_or(false)
                 {
                     self.clear_restart_failures(&playlist_key);
                     let mut file = served(&segment_path, ext);
@@ -722,7 +730,7 @@ where
             .manager
             .wait_for_segment(&handle, &playlist_path, segment_id)
             .await
-            && segment_path.exists()
+            && tokio::fs::try_exists(&segment_path).await.unwrap_or(false)
         {
             self.clear_restart_failures(&playlist_key);
             let mut file = served(&segment_path, ext);
@@ -802,7 +810,7 @@ where
         };
         let start_segment = segment_file(&plan.playlist_path, start, ext);
 
-        if init_is_complete(&init_path, &start_segment) {
+        if init_is_complete(&init_path, &start_segment).await {
             // A completed/earlier job left both — complete by construction.
             let mut file = served(&init_path, ext);
             file.progress = self.manager.segment_progress(
@@ -825,7 +833,7 @@ where
         // Not "the start segment exists": an earlier job's start segment can
         // sit beside an init that a later job recreated empty and died on, and
         // then nothing would ever start a job to fill it (gl-1417).
-        if !init_is_complete(&init_path, &start_segment) {
+        if !init_is_complete(&init_path, &start_segment).await {
             let mut delivered = false;
             if let Some(handle) = self
                 .manager
@@ -861,7 +869,7 @@ where
                     let _rg = self
                         .manager
                         .begin_request_guard(&playlist_key, TranscodingJobType::Hls);
-                    let first_written = init_has_data(&init_path)
+                    let first_written = init_has_data(&init_path).await
                         || self
                             .manager
                             .wait_for_segment(&handle, &plan.playlist_path, first)
@@ -873,7 +881,7 @@ where
                             .manager
                             .wait_for_segment(&handle, &plan.playlist_path, start)
                             .await
-                        && init_is_complete(&init_path, &start_segment);
+                        && init_is_complete(&init_path, &start_segment).await;
                 }
                 if !delivered {
                     // A seek, or the job exited without those segments, or its
@@ -938,7 +946,7 @@ where
             }
         }
 
-        if init_is_complete(&init_path, &start_segment) {
+        if init_is_complete(&init_path, &start_segment).await {
             self.clear_restart_failures(&playlist_key);
             let mut file = served(&init_path, ext);
             file.progress = self.manager.segment_progress(
@@ -1111,12 +1119,12 @@ where
             .manager
             .begin_request_guard(&playlist_key, TranscodingJobType::Hls);
 
-        if !playlist_path.exists() {
+        if !tokio::fs::try_exists(&playlist_path).await.unwrap_or(false) {
             // `_transcodeManager.LockAsync(playlistPath)`: one starter per
             // playlist; a concurrent request re-checks under the lock.
             let lock = self.playlist_lock(&playlist_key);
             let _guard = lock.lock().await;
-            if !playlist_path.exists() {
+            if !tokio::fs::try_exists(&playlist_path).await.unwrap_or(false) {
                 // An event playlist is reloaded by the client on a timer, so a
                 // source that keeps killing ffmpeg would otherwise turn every
                 // reload into a fresh spawn — the same storm the segment path
@@ -1166,7 +1174,7 @@ where
                     self.wait_for_minimum_segment_count(&handle, &playlist_path, plan.min_segments)
                         .await;
                 }
-                if playlist_path.exists() {
+                if tokio::fs::try_exists(&playlist_path).await.unwrap_or(false) {
                     self.clear_restart_failures(&playlist_key);
                 } else {
                     // ffmpeg died before its first segment boundary, so it never
@@ -1261,7 +1269,7 @@ where
         }
         let lock = self.playlist_lock(&output);
         let _guard = lock.lock().await;
-        if !Path::new(&output).exists() {
+        if !tokio::fs::try_exists(&output).await.unwrap_or(false) {
             let state = self.labelled(&plan.state, request.item_id).await;
             let start = StartFfMpegRequest {
                 program: &self.ffmpeg_path,
@@ -1697,13 +1705,26 @@ fn delete_cut_short_segment(
 /// Whether the fMP4 init at `init` is complete: ffmpeg fills it in the flush
 /// that finishes `start_segment`, so the start segment's (renamed, final) file
 /// existing implies the init was written and closed; the size check is only a
-/// guard against a stale empty file from a job that died at its header.
-fn init_is_complete(init: &Path, start_segment: &Path) -> bool {
-    start_segment.exists() && init_has_data(init)
+/// guard against a stale empty file from a job that died at its header. Both
+/// stats run in one hop on the blocking pool, never inline on a runtime worker
+/// (gl-1378); a hop that fails reads as incomplete.
+async fn init_is_complete(init: &Path, start_segment: &Path) -> bool {
+    let (init, start_segment) = (init.to_path_buf(), start_segment.to_path_buf());
+    tokio::task::spawn_blocking(move || start_segment.exists() && init_file_has_data(&init))
+        .await
+        .unwrap_or(false)
 }
 
-/// Whether the fMP4 init at `init` exists and is not empty.
-fn init_has_data(init: &Path) -> bool {
+/// [`init_file_has_data`] on the blocking pool (gl-1378).
+async fn init_has_data(init: &Path) -> bool {
+    let init = init.to_path_buf();
+    tokio::task::spawn_blocking(move || init_file_has_data(&init))
+        .await
+        .unwrap_or(false)
+}
+
+/// Whether the fMP4 init at `init` exists and is not empty. A blocking `stat`.
+fn init_file_has_data(init: &Path) -> bool {
     std::fs::metadata(init).is_ok_and(|m| m.len() > 0)
 }
 
@@ -1877,6 +1898,7 @@ mod tests {
                 is_input_video: true,
                 subtitle_delivery_method: ferrofin_model::dlna::SubtitleDeliveryMethod::Encode,
                 trimmed_subtitle_path: None,
+                transcode_reasons: ferrofin_model::session::TranscodeReasons::empty(),
                 run_time_ticks: Some(60 * 10_000_000),
                 transcoding_type: if kind == PlaylistKind::Progressive {
                     TranscodingJobType::Progressive
@@ -3539,6 +3561,131 @@ mod tests {
         });
     }
 
+    /// A runtime with a single blocking thread, for the tests that hold it.
+    fn one_blocking_thread() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .max_blocking_threads(1)
+            .build()
+            .unwrap()
+    }
+
+    /// Polls `serve` with the blocking pool's only thread held busy and asserts
+    /// it cannot finish, then frees the thread and returns its output. A check
+    /// made inline on the runtime worker would have let it finish (gl-1378).
+    async fn needs_the_blocking_pool<F: std::future::Future>(serve: F) -> F::Output {
+        let (busy_tx, busy_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let hog = tokio::task::spawn_blocking(move || {
+            busy_tx.send(()).ok();
+            release_rx.recv().ok();
+        });
+        busy_rx.await.unwrap();
+        tokio::pin!(serve);
+        let starved = tokio::time::timeout(std::time::Duration::from_millis(250), &mut serve).await;
+        assert!(
+            starved.is_err(),
+            "served with the blocking pool starved, so the existence check ran inline"
+        );
+        release_tx.send(()).unwrap();
+        hog.await.unwrap();
+        serve.await
+    }
+
+    /// The segment fast path, every current client's segment request, checks
+    /// the file on the blocking pool (gl-1378).
+    #[test]
+    fn a_segment_on_disk_is_checked_on_the_blocking_pool() {
+        one_blocking_thread().block_on(async {
+            let tmp = tempfile::tempdir().unwrap();
+            std::fs::write(tmp.path().join("out0.ts"), b"seg").unwrap();
+            let (mgr, _) = manager_with(tmp.path(), FakeScript::default(), "ts");
+            let served = needs_the_blocking_pool(mgr.dynamic_segment(&req(), 0, false))
+                .await
+                .unwrap();
+            assert!(served.path.ends_with("out0.ts"));
+        });
+    }
+
+    /// The fMP4 init's completeness check runs on the blocking pool (gl-1378).
+    #[test]
+    fn a_complete_init_is_checked_on_the_blocking_pool() {
+        one_blocking_thread().block_on(async {
+            let tmp = tempfile::tempdir().unwrap();
+            std::fs::write(tmp.path().join("out-1.mp4"), b"moov").unwrap();
+            std::fs::write(tmp.path().join("out0.mp4"), b"seg").unwrap();
+            let (mgr, _) = manager_with(tmp.path(), FakeScript::default(), "mp4");
+            let served = needs_the_blocking_pool(mgr.dynamic_segment(&req(), -1, false))
+                .await
+                .unwrap();
+            assert!(served.path.ends_with("out-1.mp4"), "{served:?}");
+        });
+    }
+
+    /// A progressive stream whose output exists checks it on the blocking pool
+    /// (gl-1378).
+    #[test]
+    fn a_progressive_output_is_checked_on_the_blocking_pool() {
+        one_blocking_thread().block_on(async {
+            let tmp = tempfile::tempdir().unwrap();
+            std::fs::write(tmp.path().join("out.ts"), b"seg").unwrap();
+            let (mgr, _, spawns) = manager_full(tmp.path(), FakeScript::default(), "ts");
+            let served = needs_the_blocking_pool(mgr.transcode_stream(&req(), false))
+                .await
+                .unwrap();
+            assert!(served.path.ends_with("out.ts"));
+            assert!(spawns.requests.lock().unwrap().is_empty(), "spawned");
+        });
+    }
+
+    /// A live playlist reload checks the playlist on the blocking pool before
+    /// it reads it there (gl-1378): with the thread taken again once the check
+    /// is through, the reload cannot finish, which an inline check followed by
+    /// the read alone would.
+    #[test]
+    fn a_live_playlist_is_checked_on_the_blocking_pool() {
+        one_blocking_thread().block_on(async {
+            let tmp = tempfile::tempdir().unwrap();
+            std::fs::write(
+                tmp.path().join("out.m3u8"),
+                "#EXTM3U\n#EXT-X-TARGETDURATION:1\n#EXTINF:1.0,\nout0.ts\n",
+            )
+            .unwrap();
+            let (mgr, _) = manager_with(tmp.path(), FakeScript::default(), "ts");
+
+            let (busy_tx, busy_rx) = tokio::sync::oneshot::channel();
+            let (release_first, first_rx) = std::sync::mpsc::channel::<()>();
+            let first = tokio::task::spawn_blocking(move || {
+                busy_tx.send(()).ok();
+                first_rx.recv().ok();
+            });
+            busy_rx.await.unwrap();
+            let request = req();
+            let reload = mgr.live_playlist(&request);
+            tokio::pin!(reload);
+            let queued = tokio::time::timeout(std::time::Duration::from_millis(10), &mut reload);
+            assert!(queued.await.is_err(), "reloaded with the pool held");
+
+            // Queued behind the reload's first hop, so it takes the thread next.
+            let (release_second, second_rx) = std::sync::mpsc::channel::<()>();
+            let second = tokio::task::spawn_blocking(move || {
+                second_rx.recv().ok();
+            });
+            release_first.send(()).unwrap();
+            let starved =
+                tokio::time::timeout(std::time::Duration::from_millis(250), &mut reload).await;
+            assert!(
+                starved.is_err(),
+                "reloaded with the pool taken, so the existence check ran inline"
+            );
+
+            release_second.send(()).unwrap();
+            first.await.unwrap();
+            second.await.unwrap();
+            assert!(reload.await.unwrap().contains("out0.ts"));
+        });
+    }
+
     /// A segment past a running job's front lists the transcode directory for
     /// that front on the blocking pool, never inline on a runtime worker
     /// (gl-1255): the directory holds every segment of every live transcode.
@@ -3741,7 +3888,7 @@ mod tests {
         assert_eq!(mime_for_extension("ts"), "video/mp2t");
         assert_eq!(mime_for_extension(".aac"), "audio/aac");
         assert_eq!(mime_for_extension(".mp3"), "audio/mpeg");
-        assert_eq!(mime_for_extension(".xyz"), "application/octet-stream");
+        assert_eq!(mime_for_extension(".zzz"), "application/octet-stream");
     }
 
     #[test]

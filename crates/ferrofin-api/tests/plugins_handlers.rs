@@ -10,7 +10,7 @@ use std::sync::{Arc, Mutex};
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use ferrofin_api::create_router;
-use ferrofin_api::test_support::authed_state_with_plugins;
+use ferrofin_api::test_support::{FixedAuth, authed_state_with_plugins};
 use ferrofin_model::updates::{PackageInfo, RepositoryInfo};
 use ferrofin_traits::error::ServiceError;
 use ferrofin_traits::plugins::{PluginDescriptor, PluginImage, PluginManager};
@@ -918,19 +918,6 @@ async fn plugin_route_responses_are_sandboxed_from_the_server_origin() {
     );
 }
 
-/// What the auth middleware resolves for every request in a test.
-struct FixedIdentity(ferrofin_traits::options::AuthorizationInfo);
-
-#[async_trait::async_trait]
-impl ferrofin_traits::net::AuthorizationContext for FixedIdentity {
-    async fn get_authorization_info(
-        &self,
-        _request: &ferrofin_traits::net::RequestContext,
-    ) -> Result<ferrofin_traits::options::AuthorizationInfo, ServiceError> {
-        Ok(self.0.clone())
-    }
-}
-
 /// What a plugin route forwards to the guest when the auth middleware
 /// resolves `info` for a request from `peer`.
 async fn forwarded_request(
@@ -940,7 +927,7 @@ async fn forwarded_request(
     let handler = Arc::new(RecordingRequestHandler::default());
     let state = ferrofin_api::test_support::plugin_state_with_context(
         Arc::new(RecordingPlugins::default()),
-        Arc::new(FixedIdentity(info)),
+        Arc::new(FixedAuth(info)),
     )
     .with_plugin_request_handler(handler.clone());
     let resp = create_router(state)

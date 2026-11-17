@@ -19,6 +19,7 @@ use async_trait::async_trait;
 use ferrofin_core::FerrofinServerApplicationPaths;
 use ferrofin_hls::{DynamicHlsPlaylistGenerator, EncodingOptionsProvider, HlsStreamManagerImpl};
 use ferrofin_mediaencoding::attachments::{AttachmentIo, MediaSourceResolver};
+use ferrofin_mediaencoding::encoder::media_encoder::InputAnalysis;
 use ferrofin_mediaencoding::subtitles::{
     SubtitleEditParser, SubtitleEncoder as PureSubtitleEncoder, SubtitleEncoderImpl, SubtitleIo,
     subtitle_extraction_timeout,
@@ -74,6 +75,9 @@ pub struct MediaEncodingExtras {
     /// The caps on concurrent re-encoding jobs; see
     /// [`crate::config::Config::max_transcodes`].
     pub transcode_limits: TranscodeLimits,
+    /// The `-analyzeduration` / `-probesize` transcode inputs read with; see
+    /// [`crate::config::Config::ffmpeg_probe_size`].
+    pub input_analysis: InputAnalysis,
 }
 
 /// The playlist generator's encoding options: the live configuration, as
@@ -357,7 +361,8 @@ pub fn build_media_encoding(
         Arc::clone(&paths),
         Arc::clone(&subtitles),
     )
-    .with_attachments(Arc::clone(&attachments), path_manager);
+    .with_attachments(Arc::clone(&attachments), path_manager)
+    .with_input_analysis(extras.input_analysis);
     let planner = match library {
         Some(library) => planner.with_library(library),
         None => planner,
@@ -1153,6 +1158,7 @@ mod tests {
                 sessions: None,
                 keyframes: None,
                 transcode_limits: TranscodeLimits::default(),
+                input_analysis: InputAnalysis::default(),
             },
         );
     }
@@ -1199,6 +1205,7 @@ mod tests {
                 sessions: None,
                 keyframes: None,
                 transcode_limits: TranscodeLimits::default(),
+                input_analysis: InputAnalysis::default(),
             },
         );
         assert!(!job.join("0123abcd0.mp4").exists());
@@ -1521,6 +1528,7 @@ mod tests {
                 sessions: None,
                 keyframes: None,
                 transcode_limits: TranscodeLimits::default(),
+                input_analysis: InputAnalysis::default(),
             },
         );
 

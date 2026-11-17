@@ -9,7 +9,7 @@
 //! chapters and a shared intro. Needs `ffmpeg` and `ffprobe` on `PATH`:
 //!
 //! ```bash
-//! FERROFIN_FFMPEG_TESTS=1 cargo test -p ferrofin-server --test no_repeat_extraction_ffmpeg
+//! cargo test -p ferrofin-server --test no_repeat_extraction_ffmpeg -- --include-ignored
 //! ```
 //!
 //! Intro Skipper's automatic analysis waits a minute or two after item
@@ -433,20 +433,15 @@ fn can_generate(ffmpeg: &Path) -> bool {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "runs the real ffmpeg; run with --ignored"]
 #[allow(clippy::too_many_lines)]
 async fn extraction_and_analysis_never_repeat_for_unchanged_files() {
-    if std::env::var("FERROFIN_FFMPEG_TESTS").as_deref() != Ok("1") {
-        eprintln!("skipping: set FERROFIN_FFMPEG_TESTS=1 to run");
-        return;
-    }
-    let (Some(real_ffmpeg), Some(real_ffprobe)) = (tool("ffmpeg"), tool("ffprobe")) else {
-        eprintln!("skipping: ffmpeg/ffprobe not on PATH");
-        return;
-    };
-    if !can_generate(&real_ffmpeg) {
-        eprintln!("skipping: this ffmpeg has no libx264 to generate the media");
-        return;
-    }
+    let real_ffmpeg = tool("ffmpeg").expect("ffmpeg not found on PATH");
+    let real_ffprobe = tool("ffprobe").expect("ffprobe not found on PATH");
+    assert!(
+        can_generate(&real_ffmpeg),
+        "this ffmpeg has no libx264 to generate the media"
+    );
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path();
     let media = root.join("media");

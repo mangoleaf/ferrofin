@@ -20,6 +20,7 @@ use ferrofin_mediaencoding::{
     BsfOption, EncoderCapabilities as _, FfmpegCapabilities, FilterOption, Platform,
     parse_os_release,
 };
+use ferrofin_util::program_path::which_on_path;
 use opentelemetry::KeyValue;
 use opentelemetry::trace::TracerProvider as _;
 use opentelemetry_otlp::tonic_types::transport::ClientTlsConfig;
@@ -1181,29 +1182,6 @@ pub fn persisted_encoder_app_path(config_dir: &Path) -> Option<String> {
     Some(value.trim().to_owned()).filter(|path| !path.is_empty())
 }
 
-/// Looks up `program` on the process `$PATH`, returning the first
-/// executable-file match.
-///
-/// A dependency-free stand-in for `which::which` (not a workspace dep). Absolute
-/// or relative paths containing a separator are returned as-is if they exist.
-fn which_on_path(program: &str) -> Option<PathBuf> {
-    which_in(program, std::env::var_os("PATH").as_deref())
-}
-
-/// [`which_on_path`] against an explicit `PATH` value, so the search is
-/// unit-testable without mutating the process environment.
-fn which_in(program: &str, path_var: Option<&std::ffi::OsStr>) -> Option<PathBuf> {
-    if program.contains(std::path::MAIN_SEPARATOR) {
-        let p = PathBuf::from(program);
-        return p.is_file().then_some(p);
-    }
-    let paths = path_var?;
-    std::env::split_paths(paths).find_map(|dir| {
-        let candidate = dir.join(program);
-        candidate.is_file().then_some(candidate)
-    })
-}
-
 /// Runs `<binary> -version`, asserts it is a genuine ffmpeg-family tool, and
 /// returns the version it reported.
 ///
@@ -1496,19 +1474,6 @@ mod tests {
             let err = validate_binary(&true_bin, "ffmpeg").await.unwrap_err();
             assert!(err.to_string().contains("did not start with"));
         }
-    }
-
-    #[test]
-    fn which_on_path_returns_absolute_path_verbatim_when_present() {
-        // An input already containing a separator is returned as-is if it exists.
-        let sh = which_on_path("sh").expect("sh must be on PATH in the test env");
-        let again = which_on_path(sh.to_str().unwrap());
-        assert_eq!(again, Some(sh));
-    }
-
-    #[test]
-    fn which_on_path_absolute_missing_is_none() {
-        assert_eq!(which_on_path("/definitely/not/here/nope"), None);
     }
 
     /// An https collector gets an exporter. Without a TLS feature the exporter
@@ -2152,7 +2117,7 @@ mod tests {
     #[test]
     fn resolve_ffmpeg_candidate_errors_when_nothing_found() {
         // No explicit path, no system path, and an empty `$PATH` for the lookup
-        // (exercised via the pure `which_in` below) → resolution must bail. Here
+        // (exercised via the pure `ferrofin_util::program_path::which_in`) → resolution must bail. Here
         // we assert the message shape when even `$PATH` yields nothing by way of
         // a config with no ffmpeg and no system path; if the host happens to have
         // ffmpeg installed this is a no-op, so we only assert the error text when
@@ -2161,26 +2126,6 @@ mod tests {
         if let Err(e) = resolve_ffmpeg_candidate(&cfg, None) {
             assert!(e.to_string().contains("no ffmpeg found"));
         }
-    }
-
-    #[test]
-    fn which_in_finds_program_in_given_path() {
-        let tmp = tempfile::tempdir().unwrap();
-        let bin = tmp.path().join("mytool");
-        std::fs::write(&bin, b"x").unwrap();
-        let found = which_in("mytool", Some(tmp.path().as_os_str()));
-        assert_eq!(found, Some(bin));
-    }
-
-    #[test]
-    fn which_in_returns_none_for_empty_path() {
-        assert_eq!(which_in("mytool", None), None);
-    }
-
-    #[test]
-    fn which_in_missing_program_is_none() {
-        let tmp = tempfile::tempdir().unwrap();
-        assert_eq!(which_in("nope", Some(tmp.path().as_os_str())), None);
     }
 
     fn config_with_ffmpeg(ffmpeg: Option<&str>) -> Config {

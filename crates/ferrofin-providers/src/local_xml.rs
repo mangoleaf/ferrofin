@@ -21,7 +21,7 @@
 //! (`{data}/playlists/<name>`); writing its `playlist.xml` there is that
 //! same work item. A `BoxSet` made through the API has the folder upstream's
 //! `CreateCollectionAsync` gives it (`{data}/collections/<name> [boxset]`;
-//! one an older Ferrofin made has none), and writing its `collection.xml`
+//! one an older Ferrofin made gets it at boot), and writing its `collection.xml`
 //! there is that same work item too. Both keep their membership in the
 //! `LinkedChildren` table, which is what Jellyfin 12 reads too.
 //!
