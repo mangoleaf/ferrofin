@@ -484,6 +484,52 @@ pub(crate) async fn serve_static_file_without_ranges(
     Ok(response)
 }
 
+/// `PhysicalFile(path, MimeTypes.GetMimeType(path), true)`: [`serve_static_file`]
+/// typed by the ported `MimeTypes` table, not by the type `ServeFile` guessed
+/// (which only its 200 and 206 carry).
+pub(crate) async fn serve_physical_file(
+    path: &str,
+    request: Request,
+) -> Result<Response, ApiError> {
+    let mut response = serve_static_file(path, request).await?;
+    if let Some(value) = response.headers_mut().get_mut(header::CONTENT_TYPE) {
+        *value =
+            header::HeaderValue::from_static(ferrofin_model::net::mime_types::get_mime_type(path));
+    }
+    Ok(response)
+}
+
+/// The file `LibraryController.GetFile` and `GetDownload` hand `PhysicalFile`:
+/// a link whose final target exists is served, and typed, as that target
+/// (`FileSystemHelper.ResolveLinkTarget(path, returnFinalTarget: true)`), any
+/// other path as given. A directory, or a link to one, is `PhysicalFile`'s
+/// `FileNotFoundException`, a `404`, where `ServeFile` would open it.
+pub(crate) async fn physical_file_path(path: String) -> Result<String, ApiError> {
+    let Ok(meta) = tokio::fs::symlink_metadata(&path).await else {
+        // Missing, or not a file path at all: ServeFile answers the 404.
+        return Ok(path);
+    };
+    let target = if meta.is_symlink() {
+        // shortcut: a target that is not UTF-8 is served through the link and typed by
+        // its name; serve a PathBuf if such a library ever turns up.
+        tokio::fs::canonicalize(&path)
+            .await
+            .ok()
+            .and_then(|target| target.into_os_string().into_string().ok())
+    } else {
+        None
+    };
+    let is_dir = match &target {
+        Some(target) => tokio::fs::metadata(target).await.is_ok_and(|m| m.is_dir()),
+        None => meta.is_dir(),
+    };
+    if is_dir {
+        // A static message: the body must not carry the on-disk path.
+        return Err(ApiError::NotFound("not a file".to_owned()));
+    }
+    Ok(target.unwrap_or(path))
+}
+
 /// Serves the file at `path` for `request`, honouring `Range`/`HEAD` as
 /// `PhysicalFile(…, enableRangeProcessing: true)` does.
 ///
