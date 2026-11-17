@@ -14625,6 +14625,75 @@ mod tests {
         }
     }
 
+    /// TheTVDB's series artwork as the plugin's `CreateRemoteImageInfo` builds
+    /// it (jellyfin-plugin-tvdb `5c4592f`, `TvdbSdkExtensions.cs:225-243`): no
+    /// `CommunityRating`, TheTVDB's score is dropped, and a missing dimension
+    /// is 0 (`Convert.ToInt32` of a null). `OrderByLanguageDescending` then has
+    /// no rating to break a same-language tie with, so its stable sort keeps
+    /// TheTVDB's order: the lower-scored poster TheTVDB lists first stays first.
+    #[tokio::test]
+    async fn tvdb_series_images_carry_no_rating_and_keep_tvdbs_order() {
+        let server = crate::mock_http::MockServer::start(vec![
+            ("/login", r#"{"data":{"token":"tok"}}"#.to_owned()),
+            ("/series/5/extended", r#"{"data":{"id":5,"artworks":[{"type":2,"image":"low.jpg","language":"eng","score":1,"width":680,"height":1000},{"type":2,"image":"high.jpg","language":"eng","score":9}]}}"#.to_owned()),
+        ]).await;
+        let series_id = Uuid::new_v4();
+        let library_id = Uuid::new_v4();
+        let mut series = row("TV.Series", "Show");
+        series.id = series_id.to_string();
+        series.top_parent_id = Some(library_id.to_string());
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let store = Arc::new(RecordingStore::default());
+        store
+            .stored_ids
+            .lock()
+            .unwrap()
+            .insert(series_id, vec![("Tvdb".to_owned(), "5".to_owned())]);
+        let mut mgr = LocalProviderManager::default()
+            .with_tvdb(Arc::new(
+                crate::tvdb::TvdbClient::new().with_base_url(&server.base_url),
+            ))
+            .with_image_store(store, std::env::temp_dir())
+            .with_localization(Arc::new(EnglishAndFrench))
+            .with_virtual_folders(Arc::new(FakeLibraries {
+                item_id: library_id,
+                options: ferrofin_model::configuration::LibraryOptions {
+                    type_options: vec![ferrofin_model::configuration::TypeOptions {
+                        type_: Some("Series".to_owned()),
+                        image_fetchers: vec!["TheTVDB".to_owned()],
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                },
+            }));
+        mgr.items = Some(Arc::new(FakeItems {
+            rows: HashMap::from([(series_id, series)]),
+            seen: tx,
+        }));
+        let images = mgr
+            .get_available_remote_images(series_id, &RemoteImageQuery::default())
+            .await
+            .unwrap();
+        let candidates: Vec<_> = images
+            .iter()
+            .map(|image| {
+                (
+                    image.url.as_deref(),
+                    image.community_rating,
+                    image.width,
+                    image.height,
+                )
+            })
+            .collect();
+        assert_eq!(
+            candidates,
+            [
+                (Some("low.jpg"), None, Some(680), Some(1000)),
+                (Some("high.jpg"), None, Some(0), Some(0)),
+            ]
+        );
+    }
+
     #[tokio::test]
     async fn pathless_provider_refresh_inherits_the_request_culture_across_awaits() {
         let item_id = Uuid::new_v4();
