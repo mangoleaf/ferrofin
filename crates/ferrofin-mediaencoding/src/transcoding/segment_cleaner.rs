@@ -32,7 +32,7 @@ const MIN_RUNTIME_TICKS: i64 = 300 * ferrofin_util::ticks::TICKS_PER_SECOND;
 /// source that is not a segmented live stream (and a local `wtv` file) syncs
 /// audio with `-async 1` and, below ffmpeg 5.1 or on a version that cannot be
 /// read (`-fps_mode` cannot be an input option), video with `-vsync -1`; a
-/// `wma` or `asf` container syncs its audio only.
+/// `wma` or `asf` container adds the audio sync without the video sync.
 #[must_use]
 pub fn input_sync_arguments(
     state: &EncodingJobInfo,
@@ -723,7 +723,8 @@ mod tests {
 
     /// `AttachMediaSourceInfo`: a `wma` or `asf` container ("Seeing some
     /// stuttering when transcoding wma to audio-only HLS") syncs its audio
-    /// with `-async 1` whatever its protocol, but never its video.
+    /// with `-async 1` whatever its protocol, but not its video, even on a
+    /// version that cannot be read.
     #[rstest::rstest]
     #[case::wma("wma")]
     #[case::asf("ASF")]
@@ -732,10 +733,9 @@ mod tests {
         state.media_source.container = Some(container.to_owned());
         for protocol in [MediaProtocol::File, MediaProtocol::Http] {
             state.media_source.protocol = protocol;
-            assert_eq!(
-                input_sync_arguments(&state, Some(FfmpegVersion::new(5, 0))),
-                ["-async", "1"]
-            );
+            for version in [None, Some(FfmpegVersion::new(5, 0))] {
+                assert_eq!(input_sync_arguments(&state, version), ["-async", "1"]);
+            }
         }
     }
 
