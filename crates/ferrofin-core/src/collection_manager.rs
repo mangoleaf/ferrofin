@@ -1146,8 +1146,8 @@ pub struct FerrofinPlaylistManager {
     /// the re-rate after an edit saves only its rating columns, never
     /// `Data`, and every `Data` sync reads and writes in one writer
     /// transaction, so neither can put an older `Shares` back. The scan's
-    /// playlist sync and item deletion take it too
-    /// ([`Self::with_entry_edits`]).
+    /// playlist sync, item deletion, a re-key and a linked-children reroute
+    /// take it too ([`Self::with_entry_edits`]).
     // ponytail: one lock for every playlist; key it by playlist if edits ever contend.
     entry_edits: Arc<tokio::sync::Mutex<()>>,
     /// Queues the playlist's refresh after its entries change
@@ -1208,9 +1208,10 @@ impl FerrofinPlaylistManager {
     }
 
     /// Shares the entry-edit lock with the persistence service's playlist
-    /// sync and deletion
-    /// (`FerrofinItemPersistenceService::playlist_entry_edits`), so neither
-    /// writes a playlist's entries between an edit's read and its rewrite.
+    /// sync, deletion and re-key and the linked-children service's reroute
+    /// (`FerrofinItemPersistenceService::playlist_entry_edits`), so none of
+    /// them writes a playlist's entries between an edit's read and its
+    /// rewrite.
     /// Called once by the composition root.
     #[must_use]
     pub fn with_entry_edits(mut self, lock: Arc<tokio::sync::Mutex<()>>) -> Self {
@@ -5428,6 +5429,64 @@ mod tests {
         synced.expect("sync");
         assert_eq!(deleted.expect("delete"), vec![a]);
         assert_eq!(rows(&db, playlist).await, vec![b]);
+    }
+
+    /// Re-keying an item and rerouting a version's links wait while an entry
+    /// edit holds the lock: the rewrite would put the old `ChildId` back,
+    /// failing its foreign key on a folded row or undoing the reroute
+    /// (gl-1764).
+    #[tokio::test]
+    async fn rekey_and_reroute_wait_for_an_entry_edit() {
+        use ferrofin_traits::persistence::{
+            ItemPersistenceService as _, LinkedChildrenService as _,
+        };
+        let db = test_db().await;
+        let (a, b, primary, new_id) = (
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+        );
+        let (mgr, playlist, _, _root) = seeded_playlist(&db, &[a, b]).await;
+        seed_item(&db, primary, BaseItemKind::Audio).await;
+        let persistence =
+            crate::item_persistence_service::FerrofinItemPersistenceService::new(db.clone());
+        let links = FerrofinLinkedChildrenService::new(db.clone())
+            .with_entry_edits(persistence.playlist_entry_edits());
+        let mgr = mgr.with_entry_edits(persistence.playlist_entry_edits());
+        let edit = mgr.entry_edits.lock().await;
+        let moves = [ferrofin_traits::persistence::ItemRekey {
+            from: b,
+            to: new_id,
+            type_name: crate::item_type_lookup::stored_type_name(BaseItemKind::Audio)
+                .expect("type")
+                .to_owned(),
+            dirs: Vec::new(),
+            merged: Vec::new(),
+            extra: false,
+        }];
+        let rekey = persistence.rekey_items(&moves);
+        let reroute = links.reroute_linked_children(a, primary);
+        tokio::pin!(rekey, reroute);
+        let wait = std::time::Duration::from_millis(200);
+        assert!(
+            tokio::time::timeout(wait, &mut rekey).await.is_err(),
+            "the re-key wrote during an entry edit"
+        );
+        assert!(
+            tokio::time::timeout(wait, &mut reroute).await.is_err(),
+            "the reroute wrote during an entry edit"
+        );
+        drop(edit);
+        // Bounded: nextest has no slow-timeout, so a leaked guard would hang.
+        let (rekeyed, rerouted) = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            tokio::join!(&mut rekey, &mut reroute)
+        })
+        .await
+        .expect("the re-key and the reroute finish once the edit ends");
+        assert_eq!(rekeyed.expect("rekey").len(), 1);
+        assert_eq!(rerouted.expect("reroute"), vec![playlist]);
+        assert_eq!(rows(&db, playlist).await, vec![primary, new_id]);
     }
 
     /// C# `RemoveItemFromPlaylistAsync`: every occurrence of the item goes.
