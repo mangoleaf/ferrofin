@@ -454,7 +454,7 @@ impl FerrofinLibraryMonitor {
             // `LibraryMonitor.Start` / `ContainsParentFolder`: a recursive
             // parent watch already covers its children and shared roots.
             // Compare directory boundaries, using .NET ordinal casing.
-            let key = ferrofin_util::string_extensions::upper_invariant(
+            let key = ferrofin_util::string_extensions::ordinal_ignore_case_key(
                 root.trim_end_matches(std::path::MAIN_SEPARATOR),
             );
             if watched_roots.iter().any(|parent| {

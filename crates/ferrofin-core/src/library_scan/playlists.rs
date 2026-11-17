@@ -246,10 +246,14 @@ fn member_path(entry: &str, roots: &[String]) -> Option<String> {
             .into_iter()
             .find(|form| form != entry && exists(form))?
     };
-    let upper = ferrofin_util::string_extensions::upper_invariant(&path);
+    let upper = ferrofin_util::string_extensions::ordinal_ignore_case_key(&path);
     roots
         .iter()
-        .any(|root| upper.starts_with(&ferrofin_util::string_extensions::upper_invariant(root)))
+        .any(|root| {
+            upper.starts_with(&ferrofin_util::string_extensions::ordinal_ignore_case_key(
+                root,
+            ))
+        })
         .then_some(path)
 }
 

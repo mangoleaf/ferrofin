@@ -2,7 +2,8 @@
 //! `SimpleTypeModelBinder` reads a value of nothing but white space as null,
 //! `[Required]` fails, and `[ApiController]`'s model-state filter answers `400`
 //! "The {name} field is required." before the action runs, and after
-//! authorization.
+//! authorization. A route `container` (`[RegularExpression]` too) and a
+//! plugin's `Version version` take the same rule, through their binders.
 
 use axum::Router;
 use axum::body::Body;
@@ -20,25 +21,19 @@ const SKIPPED: &[(&str, &str, &str)] = &[
         "itemId",
         "10.11.8's action binds no id at all",
     ),
-    // A `Version` upstream, with the same `[Required]` rule: gl-1671.
-    ("EnablePlugin", "version", "gl-1671"),
-    ("DisablePlugin", "version", "gl-1671"),
-    ("UninstallPluginByVersion", "version", "gl-1671"),
-    ("GetPluginImage", "version", "gl-1671"),
     // Bound by gl-1212's change, which this branch does not hold yet.
     ("GetItemImage2", "tag", "gl-1212"),
     ("HeadItemImage2", "tag", "gl-1212"),
 ];
 
-/// `[FromRoute, Required][RegularExpression(ContainerValidationRegexStr)]
-/// string container`: required too, left to gl-1671 (its pattern is bound by
-/// `stream_pattern_failures`).
-const CONTAINER: &str = "container";
+/// Operations upstream marks `[AllowAnonymous]`, which overrides the
+/// controller's `[Authorize]` and which the contract's `security` does not show.
+const ALLOW_ANONYMOUS: &[&str] = &["GetPluginImage"];
 
-/// The parameters the sweep checked when it was written (2026-11-11). A lower
-/// count means parameters stopped reaching the check; raise it when the
-/// contract or the handlers grow.
-const MIN_CHECKED: usize = 81;
+/// The parameters the sweep checked when it last grew (2026-11-15, with the
+/// route containers and the plugin versions). A lower count means parameters
+/// stopped reaching the check; raise it when the contract or the handlers grow.
+const MIN_CHECKED: usize = 92;
 
 fn spec() -> Value {
     serde_json::from_str(include_str!(
@@ -157,15 +152,15 @@ async fn every_contract_route_string_refuses_a_blank_value_after_authorization()
             }
             let method = method.to_uppercase();
             let operation_id = operation["operationId"].as_str().unwrap_or_default();
-            let secured = operation
-                .get("security")
-                .and_then(Value::as_array)
-                .is_some_and(|s| !s.is_empty());
+            let secured = !ALLOW_ANONYMOUS.contains(&operation_id)
+                && operation
+                    .get("security")
+                    .and_then(Value::as_array)
+                    .is_some_and(|s| !s.is_empty());
             for param in operation["parameters"].as_array().into_iter().flatten() {
                 let name = param["name"].as_str().expect("name");
                 if param["in"].as_str() != Some("path")
                     || !is_plain_string(resolve(&spec, &param["schema"]))
-                    || name == CONTAINER
                     || SKIPPED
                         .iter()
                         .any(|(op, skipped, _)| *op == operation_id && *skipped == name)
@@ -262,5 +257,111 @@ async fn an_unmatched_segment_part_is_not_a_blank_value() {
         let (status, body) = send(&router, "GET", uri).await;
         assert!(body.get("errors").is_none(), "{uri}: {status} {body}");
         assert!(!status.is_server_error(), "{uri}: {status} {body}");
+    }
+}
+
+/// The complaint `[RegularExpression(ContainerValidationRegexStr)]` files.
+const CONTAINER_PATTERN: &str =
+    r"The field container must match the regular expression '^[a-zA-Z0-9\-\._,|]{0,40}$'.";
+
+/// A route `container` is `[Required]` and patterned: a blank one is the
+/// required complaint alone (the pattern passes a null), one outside the
+/// pattern is the pattern's, and each is filed beside the other parameters'
+/// in one body. The `stream.` literal matches in any case. Settled against a
+/// stock 12.4 container (2026-11-15).
+#[tokio::test]
+async fn a_route_container_is_required_and_patterned() {
+    let router = create_router(elevated_fake_state());
+    let id = "9c4e63f1031b4f25988b4f7d78a8b53e";
+    let required = |name: &str| format!("The {name} field is required.");
+    for (uri, errors) in [
+        (
+            format!("/Videos/{id}/stream.a%24b"),
+            json!({"container": [CONTAINER_PATTERN]}),
+        ),
+        (
+            format!("/Audio/{id}/Stream.%20ts"),
+            json!({"container": [CONTAINER_PATTERN]}),
+        ),
+        (
+            format!("/Audio/{id}/Stream.%09"),
+            json!({"container": [required("container")]}),
+        ),
+        (
+            format!("/Videos/{id}/stream.%20?audioCodec=a%24b"),
+            json!({
+                "container": [required("container")],
+                "audioCodec": [CONTAINER_PATTERN.replace("container", "audioCodec")],
+            }),
+        ),
+        (
+            "/LiveTv/LiveStreamFiles/x/stream.a%24b".to_owned(),
+            json!({"container": [CONTAINER_PATTERN]}),
+        ),
+        (
+            "/LiveTv/LiveStreamFiles/%20/stream.%20".to_owned(),
+            json!({
+                "streamId": [required("streamId")],
+                "container": [required("container")],
+            }),
+        ),
+        (
+            "/LiveTv/LiveStreamFiles/%20/stream.a%24b".to_owned(),
+            json!({
+                "streamId": [required("streamId")],
+                "container": [CONTAINER_PATTERN],
+            }),
+        ),
+    ] {
+        let (status, body) = send(&router, "GET", &uri).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{uri}: {body}");
+        assert_eq!(body["errors"], errors, "{uri}");
+    }
+}
+
+/// A live stream file's segment without the `stream.` literal, or with
+/// nothing after it, is no match for upstream's route (Jellyfin 12.4 answers
+/// an empty 404), so it is not a container complaint.
+#[tokio::test]
+async fn a_live_stream_file_needs_the_stream_literal() {
+    let router = create_router(elevated_fake_state());
+    for uri in [
+        "/LiveTv/LiveStreamFiles/x/stream.",
+        "/LiveTv/LiveStreamFiles/x/%20",
+        "/LiveTv/LiveStreamFiles/x/a%24b",
+        "/Videos/9c4e63f1031b4f25988b4f7d78a8b53e/stream.",
+    ] {
+        let (status, body) = send(&router, "GET", uri).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{uri}: {body}");
+        assert!(body.get("errors").is_none(), "{uri}: {body}");
+    }
+}
+
+/// A `{version}` that is no `System.Version` is the binder's complaint, keyed
+/// `version`, before the action looks the plugin up, so an unknown plugin gets
+/// it too.
+#[tokio::test]
+async fn a_plugin_version_that_is_no_version_is_the_binders_complaint() {
+    let router = create_router(elevated_fake_state());
+    let id = "9c4e63f1031b4f25988b4f7d78a8b53e";
+    for (method, uri) in [
+        ("POST", format!("/Plugins/{id}/abc/Enable")),
+        ("POST", format!("/Plugins/{id}/1/Disable")),
+        ("DELETE", format!("/Plugins/{id}/1.0-beta")),
+        ("GET", format!("/Plugins/{id}/2147483648.0/Image")),
+    ] {
+        let (status, body) = send(&router, method, &uri).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{method} {uri}: {body}");
+        let version = uri.split('/').nth(3).expect("version segment");
+        assert_eq!(
+            body,
+            json!({
+                "type": "https://tools.ietf.org/html/rfc9110#section-15.5.1",
+                "title": "One or more validation errors occurred.",
+                "status": 400,
+                "errors": { "version": [format!("The value '{version}' is not valid.")] },
+            }),
+            "{method} {uri}"
+        );
     }
 }

@@ -433,11 +433,7 @@ async fn update_named_configuration(
     }
     // Once accepted, finish persistence and the live update even if the HTTP
     // client disconnects. The worker owns the save lock until both are done.
-    tokio::spawn(save_named_configuration(state, key, body))
-        .await
-        .map_err(|error| {
-            ferrofin_traits::error::ServiceError::backend(format!("configuration worker: {error}"))
-        })??;
+    crate::handlers::run_detached(save_named_configuration(state, key, body)).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 

@@ -19,6 +19,7 @@
 
 use ferrofin_traits::providers::ItemUpdateType;
 use ferrofin_util::directory_path::DirectoryPath;
+use ferrofin_util::string_extensions::ordinal_ignore_case_key;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -754,14 +755,6 @@ fn recorded_provider_id(cache: &ArtworkCache, id: &str, provider: &str) -> Optio
         .iter()
         .find(|(key, _)| key.eq_ignore_ascii_case(provider))
         .and_then(|(_, value)| value.trim().parse().ok())
-}
-
-/// One episode's entry in a cached season response, by episode number.
-fn episode_in_season(
-    details: &ferrofin_providers::tmdb::SeasonDetails,
-    number: i32,
-) -> Option<&ferrofin_providers::tmdb::EpisodeDetails> {
-    details.episodes.iter().find(|e| e.episode_number == number)
 }
 
 /// Downloads each [`RemoteImage`] into `item_dir` (as `{type}` plus the
@@ -8187,6 +8180,28 @@ impl LibraryScanner {
         if video_info.is_some_and(|info| info.parent_index_number.is_some()) {
             entity.parent_index_number = guesses.parent_index_number;
         }
+        // `Episode.GetLookupInfo` reads the range end `BeforeMetadataRefresh`
+        // left (`FillMissingEpisodeNumbersFromPath`). A probed row had that
+        // run by `apply_video_metadata`: a stored one's is what `take` read, a
+        // new one's is on the row, ahead of any NFO. Any other row takes a
+        // missing one, or under "Replace all metadata" any, from its path.
+        // Only a provider reads it.
+        if plan.remote_metadata
+            && item_type_lookup::kind_from_type_name(&entity.type_) == Some(BaseItemKind::Episode)
+        {
+            if video_info.is_some() {
+                if metadata_stored.is_none() {
+                    guesses.index_number_end = index_number_end(&entity);
+                }
+            } else if (guesses.index_number_end.is_none() || options.replace_all_metadata)
+                && let Some(info) = entity
+                    .path
+                    .as_deref()
+                    .and_then(|path| resolve_episode_path(path, naming))
+            {
+                guesses.index_number_end = info.ending_episode_number.filter(|_| !info.is_by_date);
+            }
+        }
         let rows = Self::apply_probe(&mut entity, probe.info.as_ref(), probe.is_audio, policy);
         // `if (audio.AlbumEntity is not null && !audio.AlbumEntity.
         // NormalizationGain.HasValue)` in `FetchDataFromTags`, which runs for
@@ -12325,10 +12340,14 @@ impl LibraryScanner {
     /// The title is fetched by the `Tmdb` id in the lookup, else resolved
     /// through `/find` by its IMDb id (a series also by its TVDB id), and
     /// searched by its parsed name ([`video_resolver::parse_name`]) only
-    /// without any of them — so a `Tmdb` id a provider that ran before it found
-    /// (TVDB's remote ids) spares the search. Its answer carries the title's
-    /// IMDb id and, for a series, its TVDB id (`TmdbSeriesProvider.cs:306-312`),
-    /// which the providers after it resolve by.
+    /// when that resolves nothing — so a `Tmdb` id a provider that ran before
+    /// it found (TVDB's remote ids) spares the search. A movie is searched only
+    /// without an IMDb id: one `/find` does not resolve leaves it without
+    /// TMDB's metadata (`TmdbMovieProvider.cs:160,178-190`), where a series
+    /// goes on to the search (`TmdbSeriesProvider.cs:178-213`). Its answer
+    /// carries the title's IMDb id and, for a series, its TVDB id
+    /// (`TmdbSeriesProvider.cs:306-312`), which the providers after it
+    /// resolve by.
     async fn fetch_tmdb_metadata(
         &self,
         row: &BaseItemEntity,
@@ -12366,6 +12385,12 @@ impl LibraryScanner {
         };
         let tmdb_id = if let Some(id) = pinned {
             id
+        } else if kind == TmdbKind::Movie
+            && imdb_id_in(known_ids).is_some_and(|id| !id.trim().is_empty())
+        {
+            // An IMDb id TMDB cannot resolve is no reason to guess the film by
+            // its title: `GetMetadata` returns an empty result.
+            return None;
         } else {
             // "ParseName is required here" (`TmdbMovieProvider.cs:162-170`,
             // `TmdbSeriesProvider.cs:201-208`): the name is a file or folder
@@ -12476,8 +12501,14 @@ impl LibraryScanner {
     /// Its external ids, trailers and credits — the episode's own — come
     /// from one episode request ([`TmdbClient::episode_extras_for_language`]).
     ///
+    /// A multi-episode file (the lookup's `IndexNumberEnd`) takes every
+    /// episode of its range the season lists, their names and overviews
+    /// joined ([`ferrofin_providers::episode::tmdb_episode_in_range`],
+    /// `TmdbEpisodeProvider.cs:106-158`), and the first one's own request.
+    ///
     /// `None` when TMDB has nothing for this episode: no series id to look
-    /// it up under, no such season, or no such episode in it.
+    /// it up under, no such season, or no such episode in it (for a range,
+    /// none of its episodes, or an end below its start).
     async fn fetch_tmdb_episode(
         &self,
         row: &BaseItemEntity,
@@ -12495,7 +12526,11 @@ impl LibraryScanner {
             let details = self
                 .season_details_cached(cache, &series_id, season, lookup.tmdb_language().as_deref())
                 .await?;
-            episode_in_season(&details, number)?.clone()
+            ferrofin_providers::episode::tmdb_episode_in_range(
+                &details,
+                number,
+                lookup.index_number_end,
+            )?
         };
         let mut answer = RemoteAnswer::for_row(row, None);
         apply_tmdb_episode(&mut answer.item, &ep);
@@ -12507,7 +12542,7 @@ impl LibraryScanner {
                 tmdb.episode_extras_for_language(
                     id,
                     season,
-                    number,
+                    ep.episode_number,
                     lookup.tmdb_language().as_deref(),
                 )
                 .await
@@ -13665,7 +13700,10 @@ impl LibraryScanner {
         } = art;
         let mut cut_short = false;
         let dirs = art_cache.dirs.clone();
-        let removed = remove_existing && self.remove_item_images(entity, stored);
+        let removed = remove_existing
+            && self
+                .remove_item_images(entity, stored, dirs.as_deref())
+                .await;
         let remote = fetch != ImageFetch::None;
         let short = entity.type_.rsplit('.').next().unwrap_or(&entity.type_);
         // A photo's own file IS its Primary image (C# `PhotoProvider` sets it
@@ -14758,22 +14796,49 @@ impl LibraryScanner {
 
     /// `ItemImageProvider.RemoveImages` for the scan, by the shared
     /// [`remove_images`](ferrofin_providers::local_images::remove_images):
-    /// the item's images in its own metadata folders go, so the pass supplies
-    /// them afresh. Returns whether any was removed (upstream's result).
-    fn remove_item_images(
+    /// the item's images in its own metadata folders go, and those saved
+    /// beside it when its art is saved there, so the pass supplies them
+    /// afresh. The folders it deleted in are forgotten in `dirs`, the run's
+    /// listings, as [`publish_media_artwork`](Self::publish_media_artwork)
+    /// forgets them: no later reader of the folder finds the removed files.
+    /// Returns whether any was removed (upstream's result).
+    async fn remove_item_images(
         &self,
         entity: &BaseItemEntity,
         stored: Option<&[ItemImageInfo]>,
+        dirs: Option<&DirectoryCache>,
     ) -> bool {
-        let (Some(meta_root), Some(stored)) = (&self.metadata_dir, stored) else {
+        let (Some(meta_root), Some(stored)) =
+            (&self.metadata_dir, stored.filter(|s| !s.is_empty()))
+        else {
             return false;
         };
         let folders = Uuid::parse_str(&entity.id).map_or_else(
             |_| vec![meta_root.join(&entity.id)],
             |id| crate::dynamic_images::internal_metadata_dirs(&meta_root.resolve(), id).to_vec(),
         );
+        let beside = match &self.image_saver {
+            Some(saver) => saver.beside_art(entity).await.unwrap_or_else(|err| {
+                // Only the metadata folders' images go, as when nothing is saved beside it.
+                tracing::warn!(%err, item_id = %entity.id, "could not tell whether the item's art is saved beside it");
+                None
+            }),
+            None => None,
+        };
         // The rows are rewritten from what the pass finds.
-        ferrofin_providers::local_images::remove_images(&mut stored.to_vec(), &folders, &entity.id)
+        let mut kept = stored.to_vec();
+        let removed = ferrofin_providers::local_images::remove_images(
+            &mut kept,
+            &folders,
+            &entity.id,
+            beside.as_ref(),
+        );
+        if let Some(dirs) = dirs {
+            for image in stored.iter().filter(|image| !kept.contains(image)) {
+                dirs.invalidate(&image.path);
+            }
+        }
+        removed
     }
 
     /// Appends rows for art files already sitting in the item's metadata art
@@ -16268,8 +16333,9 @@ impl LibraryScanner {
                     // `StringComparison.OrdinalIgnoreCase`, which folds
                     // case beyond ASCII (`Léon` and `LÉON`).
                     owner_name.is_some_and(|owner| {
-                        ferrofin_util::string_extensions::upper_invariant(&resolved)
-                            == ferrofin_util::string_extensions::upper_invariant(owner)
+                        ferrofin_util::string_extensions::equals_ordinal_ignore_case(
+                            &resolved, owner,
+                        )
                     })
                 }
                 _ => false,
@@ -21648,9 +21714,7 @@ fn extra_matches_owner(
     naming: &NamingOptions,
 ) -> bool {
     fn trimmed(value: &str, delimiters: &[char]) -> String {
-        ferrofin_util::string_extensions::upper_invariant(
-            value.trim_end().trim_end_matches(delimiters).trim_end(),
-        )
+        ordinal_ignore_case_key(value.trim_end().trim_end_matches(delimiters).trim_end())
     }
     let extra = video_resolver::clean_date_time(&file_stem(path), naming);
     let extra_name = trimmed(&extra.name, &naming.video_flag_delimiters);
@@ -21682,9 +21746,9 @@ fn extra_matches_owner(
     } else {
         Path::new(&owner.path).parent().and_then(Path::to_str)
     };
-    parent
-        .zip(owner_dir)
-        .is_some_and(|(parent, owner)| parent.eq_ignore_ascii_case(owner))
+    parent.zip(owner_dir).is_some_and(|(parent, owner)| {
+        ferrofin_util::string_extensions::equals_ordinal_ignore_case(parent, owner)
+    })
 }
 
 /// The three stat timestamps the creation-time rule reads.
@@ -22076,6 +22140,12 @@ struct ResolverGuesses {
     production_year: Option<i64>,
     index_number: Option<i64>,
     parent_index_number: Option<i64>,
+    /// An episode's range end (`IndexNumberEnd`) as `BeforeMetadataRefresh`
+    /// leaves it for the lookup (`Episode.GetLookupInfo`): the stored row's,
+    /// else the file name's ([`LibraryScanner::scan_item`] fills that in). A
+    /// local reader's (an NFO's) never reaches it, as upstream's lookup takes
+    /// only a local reader's ids (`MergeNewData`).
+    index_number_end: Option<i32>,
     /// A track's album folder name. Never persisted and never filled back:
     /// upstream never sets `Audio.Album` from the path, so a tagless track's
     /// `Album` stays empty. Only the legacy carve-out in
@@ -22130,8 +22200,9 @@ impl ResolverGuesses {
         let production_year = entity.production_year.take();
         let index_number = entity.index_number.take();
         let parent_index_number = entity.parent_index_number.take();
-        let numbers_from_path = replace_all_metadata
-            && item_type_lookup::kind_from_type_name(&entity.type_) == Some(BaseItemKind::Episode);
+        let is_episode =
+            item_type_lookup::kind_from_type_name(&entity.type_) == Some(BaseItemKind::Episode);
+        let numbers_from_path = replace_all_metadata && is_episode;
         let number = |stored: Option<i64>, path: Option<i64>| {
             if numbers_from_path {
                 path.or(stored)
@@ -22167,6 +22238,12 @@ impl ResolverGuesses {
                 stored.and_then(|s| s.parent_index_number),
                 parent_index_number,
             ),
+            // `EpisodeMetadataService.BeforeSaveInternal` drops an end
+            // below the start, or with none, before the lookup is read.
+            index_number_end: stored.filter(|_| is_episode).and_then(|s| {
+                index_number_end(s)
+                    .filter(|end| s.index_number.is_some_and(|start| i64::from(*end) >= start))
+            }),
             folder_album: entity.album.take(),
             series_name: if entity.type_.ends_with(".Book") {
                 entity.series_name.take()
@@ -23569,7 +23646,8 @@ fn apply_details(entity: &mut BaseItemEntity, d: &TmdbDetails) {
     if entity.overview.is_none() {
         // `Overview?.Replace("\n\n", "\n")` for a movie
         // (`TmdbMovieProvider.cs:205`); a series' is kept as TMDb sent it.
-        entity.overview = d.overview.as_ref().map(|o| {
+        // An empty one, kept for the Identify result, is not stored (gl-1843).
+        entity.overview = d.overview.as_ref().filter(|o| !o.is_empty()).map(|o| {
             if entity.type_.ends_with(".Movie") {
                 o.replace("\n\n", "\n")
             } else {
@@ -24458,11 +24536,6 @@ fn distinct_ignoring_case<'a>(columns: impl Iterator<Item = Option<&'a str>>) ->
         }
     }
     out
-}
-
-/// The invariant simple-uppercase key shared with username normalization.
-fn ordinal_ignore_case_key(value: &str) -> String {
-    ferrofin_util::string_extensions::upper_invariant(value)
 }
 
 /// The distinct values of a `|`-joined column across a set of children, ordered
@@ -26716,12 +26789,28 @@ mod tests {
         assert_ne!(key("\u{130}"), key("i"));
         // Sharp s does not expand: `ToUpperInvariant` cannot map it 1:1 to `SS`.
         assert_ne!(key("\u{df}"), key("ss"));
+        // The long s keeps its case: `ToUpperInvariant` maps it to `S`, ordinal casing does not.
+        assert_ne!(key("\u{17f}"), key("s"));
         // Frequency ordering itself is unaffected by the change.
         let rows = [Some("B|a"), Some("A"), Some("b")];
         assert_eq!(
             super::frequency_ordered_distinct(rows.iter().copied()),
             vec!["B".to_owned(), "a".to_owned()]
         );
+    }
+
+    /// `ExtraResolver.TryGetExtraTypeForOwner`'s folder fallback: the extra's
+    /// directory equals the owner's under `OrdinalIgnoreCase`, which folds
+    /// non-ASCII letters too.
+    #[test]
+    fn an_extra_beside_its_owner_matches_its_folder_ignoring_non_ascii_case() {
+        use ferrofin_naming::video::{ExtraRuleType, VideoFileInfo};
+        let naming = super::NamingOptions::new();
+        let owner = VideoFileInfo::new("Movie", "/media/ÉTÉ/Movie.mkv");
+        let matches =
+            |path: &str| super::extra_matches_owner(path, ExtraRuleType::Suffix, &owner, &naming);
+        assert!(matches("/media/été/Other-trailer.mkv"));
+        assert!(!matches("/media/other/Other-trailer.mkv"));
     }
 
     // date_modified must be the file's mtime (stable across rescans), never the
@@ -27586,6 +27675,18 @@ mod tests {
         };
         super::apply_details(&mut row, &details);
         assert_eq!(row.overview.as_deref(), Some(expected));
+    }
+
+    /// TMDb's empty overview, which the Identify results keep, is not stored.
+    #[test]
+    fn an_empty_tmdb_overview_is_not_stored() {
+        let mut row = ferrofin_db::entities::base_items::BaseItemEntity::default();
+        let details = ferrofin_providers::TmdbDetails {
+            overview: Some(String::new()),
+            ..Default::default()
+        };
+        super::apply_details(&mut row, &details);
+        assert_eq!(row.overview, None);
     }
 
     /// `Series.Status` comes from `<status>` (SeriesNfoParser.cs:75-90), TMDB's
@@ -29020,13 +29121,16 @@ mod tests {
         );
         let scanner = LibraryScanner::new(vf, Arc::new(FerrofinFileSystem::new()), persistence)
             .with_metadata_dir(meta.clone());
-        scanner.remove_item_images(
-            &BaseItemEntity {
-                id: ferrofin_db::store::guid_to_db(id),
-                ..BaseItemEntity::default()
-            },
-            Some(&stored),
-        );
+        scanner
+            .remove_item_images(
+                &BaseItemEntity {
+                    id: ferrofin_db::store::guid_to_db(id),
+                    ..BaseItemEntity::default()
+                },
+                Some(&stored),
+                None,
+            )
+            .await;
         for gone in [&poster, &backdrop, &backdrop1] {
             assert!(!gone.exists(), "{} removed", gone.display());
         }
@@ -29092,7 +29196,9 @@ mod tests {
         expected.sort_by_key(|(_, path)| path.clone());
         assert_eq!(found, expected);
 
-        scanner.remove_item_images(&entity, Some(&images));
+        scanner
+            .remove_item_images(&entity, Some(&images), None)
+            .await;
         for gone in [&own_primary, &old_backdrop] {
             assert!(!gone.exists(), "{} removed", gone.display());
         }
@@ -32438,6 +32544,84 @@ mod tests {
         assert_eq!(answer.item.community_rating, None);
         // The air date still lands — only the rating was absent.
         assert_eq!(answer.item.production_year, Some(2011));
+    }
+
+    /// A multi-episode file takes every episode of its range the season
+    /// lists, by the lookup's range end (the stored row's, or the file
+    /// name's): the first one's ids, date and rating, and their names and
+    /// overviews joined with ` / ` (`TmdbEpisodeProvider.cs:106-158`). An
+    /// NFO's range end on the row is not the lookup's (`MergeNewData` hands
+    /// the providers a local reader's ids only), so it looks up the start.
+    #[rstest::rstest]
+    #[case::in_the_lookup(
+        false,
+        "Winter Is Coming / The Kingsroad",
+        "Ned is summoned south. / The party rides north."
+    )]
+    #[case::only_an_nfos(true, "Winter Is Coming", "Ned is summoned south.")]
+    #[tokio::test]
+    async fn a_tmdb_multi_episode_joins_every_episode_in_its_range(
+        #[case] nfo_only: bool,
+        #[case] name: &str,
+        #[case] overview: &str,
+    ) {
+        let (base, _hits, _all) = spawn_tmdb_server(Some(SEASON_JSON), Some(CREDITS_JSON));
+        let tmp = tempfile::tempdir().unwrap();
+        let (scanner, mut cache, mut episode) = tmdb_episode_fixture(&base, tmp.path()).await;
+        episode.name = None;
+        let mut lookup = super::ResolverGuesses::default();
+        if nfo_only {
+            episode.data = Some(r#"{"IndexNumberEnd":2}"#.to_owned());
+        } else {
+            lookup.index_number_end = Some(2);
+        }
+
+        let answer = scanner
+            .fetch_tmdb_episode(&episode, &mut cache, &lookup)
+            .await
+            .expect("applied");
+        assert_eq!(answer.item.name.as_deref(), Some(name));
+        assert_eq!(answer.item.overview.as_deref(), Some(overview));
+        assert_eq!(answer.item.production_year, Some(2011));
+        assert!((answer.item.community_rating.expect("rating") - 8.3).abs() < 1e-6);
+        assert!(
+            answer
+                .provider_ids
+                .contains(&("Tmdb".to_owned(), "63056".to_owned())),
+            "{:?}",
+            answer.provider_ids
+        );
+    }
+
+    /// The lookup's range end is the stored episode's (`Episode.GetLookupInfo`
+    /// after `BeforeSave`): kept when it is not below the episode number,
+    /// dropped below it or without one (`EpisodeMetadataService.
+    /// BeforeSaveInternal`), and read for an episode only.
+    #[rstest::rstest]
+    #[case::kept("TV.Episode", Some(1), 2, Some(2))]
+    #[case::one_episode("TV.Episode", Some(2), 2, Some(2))]
+    #[case::below_the_start("TV.Episode", Some(3), 2, None)]
+    #[case::without_a_start("TV.Episode", None, 2, None)]
+    #[case::not_an_episode("Movies.Movie", Some(1), 2, None)]
+    fn the_lookup_takes_a_stored_episodes_range_end(
+        #[case] kind: &str,
+        #[case] start: Option<i64>,
+        #[case] end: i32,
+        #[case] expected: Option<i32>,
+    ) {
+        let type_ = format!("MediaBrowser.Controller.Entities.{kind}");
+        let stored = BaseItemEntity {
+            type_: type_.clone(),
+            index_number: start,
+            data: Some(format!(r#"{{"IndexNumberEnd":{end}}}"#)),
+            ..Default::default()
+        };
+        let mut scanned = BaseItemEntity {
+            type_,
+            ..Default::default()
+        };
+        let guesses = super::ResolverGuesses::take(&mut scanned, Some(&stored), false);
+        assert_eq!(guesses.index_number_end, expected);
     }
 
     // A library can rank TheTVDB first for `Series` while leaving `Episode` to

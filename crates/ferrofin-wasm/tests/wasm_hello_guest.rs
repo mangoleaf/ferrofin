@@ -3,7 +3,10 @@
 //!
 //! Gated behind `FERROFIN_WASM_GUEST_TESTS=1` because the guest build needs
 //! the wasm32-wasip2 target and a few minutes of cold compile. CI always sets
-//! it; locally it skips with a message unless opted in.
+//! it; locally it returns early with a message unless opted in, and the
+//! harness counts that as a pass. It keeps the variable instead of
+//! `#[ignore]`, unlike the other opt-in suites, because CI must run it in its
+//! ordinary test pass, which runs no ignored tests.
 //!
 //! This test also produces the **measured RSS-per-plugin** number that
 //! validates (or corrects) the `FERROFIN_WASM_MEMORY_LIMIT_MB=128` default —

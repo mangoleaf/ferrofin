@@ -4,10 +4,11 @@
 //! before the memory is asked for. Each test boots the real binary in a cgroup
 //! with a hard memory cap and swap off, over a library of photos, and checks
 //! that past a limit the client gets the original file and the server is still
-//! there. Needs a systemd user session:
+//! there. `#[ignore]`d, so a default run lists them as skipped; asked for,
+//! they fail without a systemd user session:
 //!
 //! ```bash
-//! FERROFIN_CGROUP_TESTS=1 cargo test -p ferrofin-server --test image_limits_cgroup
+//! cargo test -p ferrofin-server --test image_limits_cgroup -- --include-ignored
 //! ```
 //!
 //! CI does not run these. They take a few minutes in a debug build, where the
@@ -270,23 +271,13 @@ impl CappedServer {
     }
 }
 
-fn enabled() -> bool {
-    if std::env::var("FERROFIN_CGROUP_TESTS").as_deref() == Ok("1") {
-        return true;
-    }
-    eprintln!("skipping: set FERROFIN_CGROUP_TESTS=1 to run");
-    false
-}
-
 /// An image past the resize budget, one over the pixel limit and one over the
 /// memory limit are each served as the original file, through the Photo path
 /// that reads the file with its EXIF orientation. A smaller resize of the first
 /// still runs.
 #[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs a systemd user session; run with --ignored"]
 async fn images_past_the_limits_are_served_whole_under_a_cap() {
-    if !enabled() {
-        return;
-    }
     let root = tempfile::tempdir().expect("tempdir");
     let photos = root.path().join("photos");
     std::fs::create_dir_all(&photos).expect("photos");
@@ -335,10 +326,8 @@ async fn images_past_the_limits_are_served_whole_under_a_cap() {
 /// 962 MiB and is served whole. Neither is resized, so the budget is the
 /// compositing's alone.
 #[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs a systemd user session; run with --ignored"]
 async fn compositing_is_held_against_the_budget_under_a_cap() {
-    if !enabled() {
-        return;
-    }
     let root = tempfile::tempdir().expect("tempdir");
     let photos = root.path().join("photos");
     std::fs::create_dir_all(&photos).expect("photos");
@@ -374,10 +363,8 @@ async fn compositing_is_held_against_the_budget_under_a_cap() {
 /// Each resize fits the budget and together they would not fit the cap, so
 /// sharing the budget is what holds. All of them finish, resized.
 #[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs a systemd user session; run with --ignored"]
 async fn concurrent_resizes_share_the_budget_under_a_cap() {
-    if !enabled() {
-        return;
-    }
     let root = tempfile::tempdir().expect("tempdir");
     let photos = root.path().join("photos");
     std::fs::create_dir_all(&photos).expect("photos");
@@ -646,10 +633,8 @@ impl CappedServer {
 /// one URL. A URL that gave no image is asked once, and real logos come
 /// through, one or many.
 #[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs a systemd user session; run with --ignored"]
 async fn remote_images_are_bounded_under_a_cap() {
-    if !enabled() {
-        return;
-    }
     // On disk: the cache holds what the images weigh, and a `/tmp` on tmpfs
     // would charge those files to the cgroup, with no swap to page them out to.
     let root = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).expect("tempdir");
