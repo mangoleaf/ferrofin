@@ -8,10 +8,9 @@
 //! collapsed to the object-safe request (base fields plus the type-specific
 //! album-artist / song-info / artist / series-name extras), and its results
 //! are returned with the provider name stamped on. `Apply` resolves the item
-//! (`404` when absent) and refreshes it with the chosen result bound into the
-//! refresh options: an item with no file of its own through the
-//! `refresh_full_item` seam, a file item through the item refresh of its
-//! path, whose save writes the result's provider ids.
+//! (`404` when absent) and runs the library's Identify refresh
+//! (`LibraryManager::refresh_full_item`) with the chosen result bound into
+//! the refresh options; what that refresh covers is the library's.
 
 use std::sync::Arc;
 
@@ -31,7 +30,7 @@ use ferrofin_model::entities::MediaStreamType;
 use ferrofin_model::providers::RemoteSearchResult;
 use ferrofin_model::querying::QueryResult;
 use ferrofin_traits::error::ServiceError;
-use ferrofin_traits::library::{LibraryManager, ScanTarget};
+use ferrofin_traits::library::LibraryManager;
 use ferrofin_traits::options::{DeleteOptions, InternalItemsQuery, InternalPeopleQuery};
 use ferrofin_traits::providers::{MetadataRefreshOptions, ProviderManager, RemoteSearchRequest};
 use tower::ServiceExt;
@@ -43,21 +42,22 @@ const ITEM_ID: Uuid = Uuid::from_u128(0x1111_2222_3333_4444);
 type IdsSet = (Uuid, Vec<(String, String)>);
 
 /// A library that resolves only [`ITEM_ID`]; every other id is absent. The
-/// item has no file unless `file` gives it a path in a library, and the
-/// Apply route's writes to the library are recorded.
+/// Apply route's writes to the library and the Identify refreshes it was
+/// asked for are recorded.
 #[derive(Default)]
 struct OneItemLibrary {
-    /// The item's path and the library holding it.
-    file: Option<(String, Uuid)>,
     /// `update_item_provider_ids` calls.
     ids_set: std::sync::Mutex<Vec<IdsSet>>,
-    /// `run_refresh_scan` calls.
-    scans: std::sync::Mutex<Vec<(ScanTarget, MetadataRefreshOptions)>>,
-    /// The scanner is stopped: `run_refresh_scan` runs nothing.
+    /// `refresh_full_item` calls.
+    refreshes: std::sync::Mutex<Vec<(Uuid, MetadataRefreshOptions)>>,
+    /// The scanner is stopped: the refresh reports it did not finish.
     stopped: bool,
-    /// The item is a music artist known only by name (no folder, no
-    /// library).
-    by_name_artist: bool,
+    /// The scan cannot reach the item: the refresh is refused.
+    unreachable: bool,
+    /// How long a refresh takes before it records itself.
+    refresh_delay: std::time::Duration,
+    /// The culture the last refresh ran under.
+    refresh_culture: std::sync::Mutex<Option<String>>,
 }
 
 #[async_trait]
@@ -78,20 +78,7 @@ impl LibraryManager for OneItemLibrary {
     }
 
     async fn get_item_by_id(&self, id: Uuid) -> Result<Option<BaseItemEntity>, ServiceError> {
-        Ok((id == ITEM_ID).then(|| {
-            if self.by_name_artist {
-                let mut artist = minimal_base_item(ITEM_ID, "Gil Evans", "MusicArtist");
-                "MediaBrowser.Controller.Entities.Audio.MusicArtist".clone_into(&mut artist.type_);
-                artist.path = Some("/config/metadata/artists/Gil Evans".to_owned());
-                return artist;
-            }
-            let mut item = minimal_base_item(ITEM_ID, "The Matrix", "Movie");
-            if let Some((path, library)) = &self.file {
-                item.path = Some(path.clone());
-                item.top_parent_id = Some(library.to_string());
-            }
-            item
-        }))
+        Ok((id == ITEM_ID).then(|| minimal_base_item(ITEM_ID, "The Matrix", "Movie")))
     }
     async fn update_item_provider_ids(
         &self,
@@ -104,12 +91,22 @@ impl LibraryManager for OneItemLibrary {
             .push((item_id, provider_ids.to_vec()));
         Ok(())
     }
-    async fn run_refresh_scan(
+    async fn refresh_full_item(
         &self,
-        target: ScanTarget,
+        item: &BaseItemEntity,
         options: &MetadataRefreshOptions,
     ) -> Result<bool, ServiceError> {
-        self.scans.lock().unwrap().push((target, options.clone()));
+        if self.unreachable {
+            return Err(ServiceError::conflict(
+                "the item is not under any library location",
+            ));
+        }
+        tokio::time::sleep(self.refresh_delay).await;
+        *self.refresh_culture.lock().unwrap() = Some(ferrofin_util::current_culture::capture());
+        self.refreshes
+            .lock()
+            .unwrap()
+            .push((Uuid::parse_str(&item.id).expect("id"), options.clone()));
         Ok(!self.stopped)
     }
     async fn query_items(
@@ -213,20 +210,10 @@ impl LibraryManager for OneItemLibrary {
     }
 }
 
-/// The last `(item, options)` the Apply route handed to `refresh_full_item`.
-type RefreshRecorder = Arc<std::sync::Mutex<Option<(Uuid, MetadataRefreshOptions)>>>;
-
-/// A provider manager returning a fixed remote-search hit and a refresh that
-/// succeeds (proving the Apply route reaches the real seam), recording the
-/// refresh it was handed.
+/// A provider manager returning a fixed remote-search hit. Identify's
+/// refresh is the library's, so it is never asked to refresh.
 #[derive(Default)]
-struct SearchProviders {
-    last_refresh: RefreshRecorder,
-    /// How long a refresh takes before it records itself.
-    refresh_delay: std::time::Duration,
-    /// The culture the last refresh ran under.
-    refresh_culture: Arc<std::sync::Mutex<Option<String>>>,
-}
+struct SearchProviders;
 
 #[async_trait]
 impl ProviderManager for SearchProviders {
@@ -254,13 +241,10 @@ impl ProviderManager for SearchProviders {
 
     async fn refresh_full_item(
         &self,
-        item_id: Uuid,
-        options: &MetadataRefreshOptions,
+        _item_id: Uuid,
+        _options: &MetadataRefreshOptions,
     ) -> Result<(), ServiceError> {
-        tokio::time::sleep(self.refresh_delay).await;
-        *self.refresh_culture.lock().unwrap() = Some(ferrofin_util::current_culture::capture());
-        *self.last_refresh.lock().unwrap() = Some((item_id, options.clone()));
-        Ok(())
+        unimplemented!("Identify's refresh is the library's")
     }
 
     async fn queue_refresh(
@@ -346,18 +330,14 @@ impl ProviderManager for SearchProviders {
 /// nine typed searches on plain `[Authorize]` — is pinned by
 /// [`only_person_and_apply_require_elevation`].
 fn state() -> AppState {
-    state_recording(RefreshRecorder::default())
+    state_over(&Arc::new(OneItemLibrary::default()))
 }
 
-/// The elevated [`AppState`] whose provider manager records refreshes into
-/// `recorder`.
-fn state_recording(recorder: RefreshRecorder) -> AppState {
+/// The elevated [`AppState`] over `library`.
+fn state_over(library: &Arc<OneItemLibrary>) -> AppState {
     elevated_state_with_library_and_providers(
-        Arc::new(OneItemLibrary::default()),
-        Arc::new(SearchProviders {
-            last_refresh: recorder,
-            ..SearchProviders::default()
-        }),
+        Arc::clone(library) as Arc<dyn LibraryManager>,
+        Arc::new(SearchProviders),
     )
 }
 
@@ -366,7 +346,7 @@ fn state_recording(recorder: RefreshRecorder) -> AppState {
 fn user_state() -> AppState {
     authed_state_with_library_and_providers(
         Arc::new(OneItemLibrary::default()),
-        Arc::new(SearchProviders::default()),
+        Arc::new(SearchProviders),
     )
 }
 
@@ -478,20 +458,27 @@ async fn typed_lookup_extras_cross_the_seam() {
     assert_eq!(results[0].overview.as_deref(), Some("|0||Discworld"));
 }
 
-/// Apply on an existing item with no file of its own drives the provider
-/// manager's refresh seam with the chosen result bound into a full,
-/// replace-all refresh, and returns `204`.
+/// The one Identify refresh `library` was asked for.
+fn the_refresh(library: &OneItemLibrary) -> (Uuid, MetadataRefreshOptions) {
+    let refreshes = library.refreshes.lock().unwrap().clone();
+    assert_eq!(refreshes.len(), 1, "{refreshes:?}");
+    refreshes[0].clone()
+}
+
+/// Apply hands the library's Identify refresh the item and a full,
+/// replace-all refresh with the chosen result bound into it, and returns
+/// `204` once it has run.
 #[tokio::test]
 async fn apply_refreshes_existing_item() {
+    let library = Arc::new(OneItemLibrary::default());
     let uri = format!("/Items/RemoteSearch/Apply/{ITEM_ID}");
     let body =
         Body::from(r#"{"Name":"The Matrix","ProductionYear":1999,"ProviderIds":{"Tmdb":"603"}}"#);
-    let recorder = RefreshRecorder::default();
-    let (status, bytes) = send_to(state_recording(recorder.clone()), "POST", &uri, body).await;
+    let (status, bytes) = send_to(state_over(&library), "POST", &uri, body).await;
     assert_eq!(status, StatusCode::NO_CONTENT);
     assert!(bytes.is_empty(), "{bytes:?}");
 
-    let (item_id, options) = recorder.lock().unwrap().clone().expect("refresh ran");
+    let (item_id, options) = the_refresh(&library);
     assert_eq!(item_id, ITEM_ID);
     assert_eq!(
         options.metadata_refresh_mode,
@@ -501,7 +488,7 @@ async fn apply_refreshes_existing_item() {
         options.image_refresh_mode,
         ferrofin_traits::providers::MetadataRefreshMode::FullRefresh
     );
-    assert!(options.replace_all_metadata);
+    assert!(options.replace_all_metadata && options.remove_old_metadata);
     assert!(
         options.replace_all_images,
         "replaceAllImages defaults to true"
@@ -514,132 +501,41 @@ async fn apply_refreshes_existing_item() {
     assert_eq!(chosen.provider_ids.unwrap()["Tmdb"], "603");
 }
 
-const MATRIX_PATH: &str = "/media/movies/The Matrix (1999)/The Matrix (1999).mkv";
-
-/// The elevated state over a [`OneItemLibrary`] whose item is a file under
-/// the `Movies` library at `/media/movies/`.
-fn file_item_state(library: &Arc<OneItemLibrary>, recorder: RefreshRecorder) -> AppState {
-    let movies = ferrofin_model::entities_media::VirtualFolderInfo {
-        name: Some("Movies".to_owned()),
-        locations: vec!["/media/movies/".to_owned()],
-        ..Default::default()
-    };
-    elevated_state_with_library_and_providers(
-        Arc::clone(library) as Arc<dyn LibraryManager>,
-        Arc::new(SearchProviders {
-            last_refresh: recorder,
-            ..SearchProviders::default()
-        }),
-    )
-    .with_virtual_folders(Arc::new(
-        ferrofin_api::test_support::FakeVirtualFolders::seeded(vec![movies]),
-    ))
-}
-
-/// A [`OneItemLibrary`] whose item is [`MATRIX_PATH`].
-fn file_library(stopped: bool) -> Arc<OneItemLibrary> {
-    Arc::new(OneItemLibrary {
-        file: Some((MATRIX_PATH.to_owned(), Uuid::from_u128(0xF1))),
-        stopped,
-        ..OneItemLibrary::default()
-    })
-}
-
-/// Apply on a file item refreshes it through the item refresh of its own
-/// path — the scan's metadata service skips the NFO, pins every fetcher to
-/// the chosen ids and writes them with the rest of its save (so a failed
-/// refresh leaves no half-applied ids); the provider manager's refresh is
-/// not used, nor is a separate provider-id write. Awaited, like upstream's
-/// `RefreshFullItem`.
+/// `replaceAllImages=false` reaches the refresh, and the chosen ids ride in
+/// the refresh's save: the handler writes no provider ids of its own, so a
+/// failed refresh leaves no half-applied ids.
 #[tokio::test]
-async fn apply_on_a_file_item_refreshes_it_through_its_scan() {
-    let library = file_library(false);
-    let recorder = RefreshRecorder::default();
-    let state = file_item_state(&library, recorder.clone());
+async fn apply_hands_the_refresh_the_image_choice_and_the_chosen_ids() {
+    let library = Arc::new(OneItemLibrary::default());
     let uri = format!("/Items/RemoteSearch/Apply/{ITEM_ID}?replaceAllImages=false");
     let body = Body::from(
         r#"{"Name":"Heat","ProductionYear":1995,"SearchProviderName":"TheTVDB",
             "ProviderIds":{"Tmdb":"949","Imdb":""}}"#,
     );
-    let (status, _) = send_to(state, "POST", &uri, body).await;
+    let (status, _) = send_to(state_over(&library), "POST", &uri, body).await;
     assert_eq!(status, StatusCode::NO_CONTENT);
-
-    assert!(
-        recorder.lock().unwrap().is_none(),
-        "the provider manager is not asked"
-    );
     assert!(
         library.ids_set.lock().unwrap().is_empty(),
-        "the ids ride in the scan's save"
+        "the ids ride in the refresh's save"
     );
-    let scans = library.scans.lock().unwrap().clone();
-    assert_eq!(scans.len(), 1);
-    let (target, options) = &scans[0];
-    assert_eq!(*target, ScanTarget::Items(vec![MATRIX_PATH.to_owned()]));
-    assert_eq!(
-        options.metadata_refresh_mode,
-        ferrofin_traits::providers::MetadataRefreshMode::FullRefresh
-    );
-    assert!(options.replace_all_metadata && options.remove_old_metadata);
+    let (_, options) = the_refresh(&library);
     assert!(!options.replace_all_images);
     let chosen = options.search_result.as_ref().expect("the chosen result");
     assert_eq!(chosen.name.as_deref(), Some("Heat"));
     assert_eq!(chosen.search_provider_name.as_deref(), Some("TheTVDB"));
 }
 
-/// Apply on a music artist known only by name refreshes it through the
-/// scanner — `ScanTarget::Artist` with no folder, in the priority lane —
-/// whose music pass fetches MusicBrainz and TheAudioDB by the chosen id; the
-/// provider manager (which has no music provider) is not used. Its metadata
-/// path under the config directory is under no library, which used to make
-/// this a `409`.
-#[tokio::test]
-async fn apply_on_a_by_name_artist_refreshes_it_through_the_scanner() {
-    let library = Arc::new(OneItemLibrary {
-        by_name_artist: true,
-        ..OneItemLibrary::default()
-    });
-    let recorder = RefreshRecorder::default();
-    let state = file_item_state(&library, recorder.clone());
-    let uri = format!("/Items/RemoteSearch/Apply/{ITEM_ID}");
-    let body = Body::from(
-        r#"{"Name":"Gil Evans","SearchProviderName":"MusicBrainz",
-            "ProviderIds":{"MusicBrainzArtist":"66666666-6666-4666-8666-666666666666"}}"#,
-    );
-    let (status, _) = send_to(state, "POST", &uri, body).await;
-    assert_eq!(status, StatusCode::NO_CONTENT);
-    assert!(
-        recorder.lock().unwrap().is_none(),
-        "the provider manager is not asked"
-    );
-    let scans = library.scans.lock().unwrap().clone();
-    assert_eq!(scans.len(), 1);
-    let (target, options) = &scans[0];
-    assert_eq!(
-        *target,
-        ScanTarget::Artist {
-            id: ITEM_ID,
-            path: None,
-            folders: Vec::new(),
-        }
-    );
-    assert!(options.replace_all_metadata && options.remove_old_metadata);
-    let chosen = options.search_result.as_ref().expect("the chosen result");
-    assert_eq!(
-        chosen.provider_ids.as_ref().expect("ids")["MusicBrainzArtist"],
-        "66666666-6666-4666-8666-666666666666"
-    );
-}
-
-/// A stopped scanner runs nothing, so Apply is a `503`, never a silent
-/// `204` that applied nothing.
+/// A refresh stopped before it finished (the scanner is shutting down) is a
+/// `503`, never a silent `204` that applied nothing.
 #[tokio::test]
 async fn apply_when_the_scanner_is_stopped_is_503() {
-    let library = file_library(true);
-    let state = file_item_state(&library, RefreshRecorder::default());
+    let library = Arc::new(OneItemLibrary {
+        stopped: true,
+        ..OneItemLibrary::default()
+    });
     let uri = format!("/Items/RemoteSearch/Apply/{ITEM_ID}");
     let body = Body::from(r#"{"Name":"Heat","ProviderIds":{"Tmdb":"949"}}"#);
-    let (status, _) = send_to(state, "POST", &uri, body).await;
+    let (status, _) = send_to(state_over(&library), "POST", &uri, body).await;
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
     assert!(
         library.ids_set.lock().unwrap().is_empty(),
@@ -647,22 +543,19 @@ async fn apply_when_the_scanner_is_stopped_is_503() {
     );
 }
 
-/// A file item whose path no library location covers any more (the
-/// library's folder was removed or moved) cannot be refreshed by the scan,
-/// and a provider-only refresh would skip its probe and NFO: a `409`, not a
-/// silent `204`.
+/// An item the scan cannot reach (its library's folder was removed or
+/// moved) is refused by the library's refresh: a `409`, not a silent `204`.
 #[tokio::test]
-async fn apply_on_a_file_no_library_reaches_is_409() {
-    let library = file_library(false);
-    let state = elevated_state_with_library_and_providers(
-        Arc::clone(&library) as Arc<dyn LibraryManager>,
-        Arc::new(SearchProviders::default()),
-    );
+async fn apply_on_an_item_the_scan_cannot_reach_is_409() {
+    let library = Arc::new(OneItemLibrary {
+        unreachable: true,
+        ..OneItemLibrary::default()
+    });
     let uri = format!("/Items/RemoteSearch/Apply/{ITEM_ID}");
     let body = Body::from(r#"{"Name":"Heat","ProviderIds":{"Tmdb":"949"}}"#);
-    let (status, _) = send_to(state, "POST", &uri, body).await;
+    let (status, _) = send_to(state_over(&library), "POST", &uri, body).await;
     assert_eq!(status, StatusCode::CONFLICT);
-    assert!(library.scans.lock().unwrap().is_empty());
+    assert!(library.refreshes.lock().unwrap().is_empty());
     assert!(library.ids_set.lock().unwrap().is_empty());
 }
 
@@ -688,38 +581,29 @@ async fn apply_missing_item_is_404() {
 /// `400`, and nothing is refreshed.
 #[tokio::test]
 async fn apply_on_the_empty_id_is_400() {
-    let recorder = RefreshRecorder::default();
+    let library = Arc::new(OneItemLibrary::default());
     let uri = format!("/Items/RemoteSearch/Apply/{}", Uuid::nil());
-    let (status, _) = send_to(
-        state_recording(recorder.clone()),
-        "POST",
-        &uri,
-        Body::from("{}"),
-    )
-    .await;
+    let (status, _) = send_to(state_over(&library), "POST", &uri, Body::from("{}")).await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
-    assert!(recorder.lock().unwrap().is_none(), "nothing refreshed");
+    assert!(
+        library.refreshes.lock().unwrap().is_empty(),
+        "nothing refreshed"
+    );
 }
 
-/// A client that hangs up during Apply on an item with no file of its own
-/// does not stop the refresh: upstream runs `RefreshFullItem` with
-/// `CancellationToken.None`. The refresh, on a task of its own, keeps the
-/// request's culture.
+/// A client that hangs up during Apply does not stop the refresh: upstream
+/// runs `RefreshFullItem` with `CancellationToken.None`. The refresh, on a
+/// task of its own, keeps the request's culture.
 #[tokio::test]
-async fn apply_on_a_path_less_item_finishes_after_the_client_hangs_up() {
-    let recorder = RefreshRecorder::default();
-    let culture = Arc::new(std::sync::Mutex::new(None));
-    let state = elevated_state_with_library_and_providers(
-        Arc::new(OneItemLibrary::default()),
-        Arc::new(SearchProviders {
-            last_refresh: recorder.clone(),
-            refresh_delay: std::time::Duration::from_millis(200),
-            refresh_culture: Arc::clone(&culture),
-        }),
-    )
-    // A culture no CI host runs under, so the system locale cannot pass.
-    .with_request_culture("sv")
-    .expect("culture");
+async fn apply_finishes_after_the_client_hangs_up() {
+    let library = Arc::new(OneItemLibrary {
+        refresh_delay: std::time::Duration::from_millis(200),
+        ..OneItemLibrary::default()
+    });
+    let state = state_over(&library)
+        // A culture no CI host runs under, so the system locale cannot pass.
+        .with_request_culture("sv")
+        .expect("culture");
     let request = create_router(state).oneshot(
         Request::builder()
             .method("POST")
@@ -737,13 +621,16 @@ async fn apply_on_a_path_less_item_finishes_after_the_client_hangs_up() {
         "the request outlives the client's 20 ms patience"
     );
     let finished = tokio::time::timeout(std::time::Duration::from_secs(5), async {
-        while recorder.lock().unwrap().is_none() {
+        while library.refreshes.lock().unwrap().is_empty() {
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
     })
     .await;
     assert!(finished.is_ok(), "the refresh ran to its end");
-    assert_eq!(culture.lock().unwrap().as_deref(), Some("sv"));
+    assert_eq!(
+        library.refresh_culture.lock().unwrap().as_deref(),
+        Some("sv")
+    );
 }
 
 /// `ItemLookupController` gates exactly two of its actions with

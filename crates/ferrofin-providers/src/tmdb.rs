@@ -144,7 +144,7 @@ fn search_hit_from(hit: SearchHit, cfg: &crate::plugin_config::TmdbConfig) -> Tm
         premiere_date: date,
         poster_url: non_empty(hit.poster_path)
             .map(|p| cfg.image_url(crate::plugin_config::TmdbImageKind::Poster, &p)),
-        overview: non_empty(hit.overview),
+        overview: hit.overview,
     }
 }
 
@@ -166,7 +166,8 @@ pub struct TmdbSearchHit {
     pub premiere_date: Option<String>,
     /// The poster image URL (for the result thumbnail).
     pub poster_url: Option<String>,
-    /// The plot overview.
+    /// The plot overview as TMDb sent it: an empty one is kept, as upstream's
+    /// Identify result keeps it (`Overview = movieResult.Overview`).
     pub overview: Option<String>,
 }
 
@@ -407,7 +408,8 @@ pub struct TmdbDetails {
     pub collection_name: Option<String>,
     /// The series' TVRage id.
     pub tvrage_id: Option<String>,
-    /// Plot synopsis.
+    /// Plot synopsis as TMDb sent it: an empty one is kept for the Identify
+    /// result (`Overview = movie.Overview`); the refresh stores none for it.
     pub overview: Option<String>,
     /// A movie's marketing tagline; `None` for a series, which upstream gives
     /// none (`TmdbMovieProvider.cs:206`).
@@ -517,8 +519,8 @@ pub struct TmdbPersonHit {
     pub name: Option<String>,
     /// The profile image URL (`GetProfileUrl(profile_path)`), when present.
     pub profile_url: Option<String>,
-    /// The biography (only populated by a by-id lookup, like the C#
-    /// `GetPersonAsync` branch).
+    /// The biography as TMDb sent it, an empty one kept (only populated by a
+    /// by-id lookup, like the C# `GetPersonAsync` branch).
     pub biography: Option<String>,
     /// The IMDb id from `external_ids` (by-id lookup only).
     pub imdb_id: Option<String>,
@@ -2378,8 +2380,9 @@ impl TmdbClient {
     /// Resolves a TMDB id from an external id (`/find/{id}?external_source=`)
     /// — port of `TmdbClientManager.FindByExternalIdAsync`, which the movie/
     /// series providers use to honour an IMDb/TVDB id already on the item.
-    /// `source` is TMDB's source name (`imdb_id` / `tvdb_id`). `None` on no
-    /// match or any error.
+    /// `source` is TMDB's source name (`imdb_id` / `tvdb_id`). `Some(vec![])`
+    /// when TMDB answers with no match; `None` for a blank id or a failed
+    /// request (a transport error, a non-2xx status, or an unreadable body).
     pub async fn find_by_external_id(
         &self,
         kind: TmdbKind,
@@ -2412,10 +2415,12 @@ impl TmdbClient {
             TmdbKind::Movie => found.movie_results,
             TmdbKind::Series => found.tv_results,
         };
-        // `Some(vec![])` is a real answer, not a failure: the C# providers read
-        // `findResult?.MovieResults`/`TvResults` and, once that list exists, do
-        // NOT fall back to a name search. `None` is reserved for a request that
-        // never produced a payload.
+        // `Some(vec![])` is a real answer, not a failure: the C# Identify
+        // searches (`GetSearchResults`) read `findResult?.MovieResults`/
+        // `TvResults` and, once that list exists, do NOT fall back to a name
+        // search; the refresh's series provider goes on to the TVDB `/find`,
+        // then the name search (`TmdbSeriesProvider.GetMetadata`). `None` is
+        // reserved for a request that never produced a usable payload.
         Some(
             hits.into_iter()
                 .map(|hit| search_hit_from(hit, &cfg))
@@ -2580,7 +2585,7 @@ impl TmdbClient {
                 .and_then(|e| e.tvrage_id)
                 .filter(|id| *id > 0)
                 .map(|id| id.to_string()),
-            overview: d.overview.filter(|s| !s.is_empty()),
+            overview: d.overview,
             tagline: (kind == TmdbKind::Movie)
                 .then(|| non_empty(d.tagline))
                 .flatten(),
@@ -2683,7 +2688,7 @@ impl TmdbClient {
                 .and_then(|i| i.profiles.first())
                 .and_then(|i| non_empty(i.file_path.clone()))
                 .map(|path| cfg.image_url(crate::plugin_config::TmdbImageKind::Profile, &path)),
-            biography: non_empty(p.biography.clone()),
+            biography: p.biography.clone(),
             imdb_id: p
                 .external_ids
                 .as_ref()
