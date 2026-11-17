@@ -2309,17 +2309,21 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
                    genre or studio, a virtual season or episode): ferrofin-providers \
                    provider_manager.rs \
                    refresh_item (the chosen ids stored first, RemoveImages under \
-                   RemoveOldMetadata with ReplaceAllImages, a season's and an episode's \
+                   RemoveOldMetadata with ReplaceAllImages by local_images/merge.rs \
+                   remove_images over the item's metadata folders and, when \
+                   image_save.rs ImageFileSaver::beside_art says its art is saved beside it \
+                   (IsSaveLocalMetadataEnabled), BesideArt::removes, as the scan's \
+                   remove_item_images does too, a season's and an episode's \
                    providers given the chosen ids as their series', refresh_ordered_images \
                    with the chosen provider first). Compared with RefreshMetadata, \
                    ApplySearchResult, GetProviders, RefreshWithProviders, \
                    GetNonLocalImageProviders, ProviderManager.RefreshItem, \
                    GetMetadataProvidersInternal and GetImageProvidersInternal, and \
-                   ItemImageProvider.RefreshImages at the pinned v12.4 tag. What TheMovieDb's \
+                   ItemImageProvider.RemoveImages and RefreshImages at the pinned v12.4 tag. What TheMovieDb's \
                    movie, series, season and episode providers answer is the \
                    metadata-providers row's; what the other providers answer (gl-1815) and how \
                    the answers merge field by field (gl-1813) are not part of this row.",
-        date: "2026-11-14",
+        date: "2026-11-15",
         divergences: &[
             "An album below an identified artist is looked up by its own ids, name and year; \
              upstream's ApplySearchResult gives every child but a season or an episode the \
@@ -2345,11 +2349,18 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
             "Identify on a virtual season or episode keeps the chosen result's (its \
              series') ids as its own; upstream's ApplySearchResult clears the item's ids, \
              so it keeps only what its providers return. Fix path: gl-1809.",
-            "Replacing all images under RemoveOldMetadata removes only the images in the \
-             item's metadata folders, not artwork saved beside the media in a library that \
-             saves artwork into media folders, nor beside any other kind whose \
-             IsSaveLocalMetadataEnabled upstream overrides (a box set, playlist, person, \
-             genre, studio, year…). Fix path: gl-1741.",
+            "Replacing all images under RemoveOldMetadata, for an item whose art is saved \
+             beside it, deletes a file outside its metadata folders only where \
+             ImageFileSaver writes that item's art (the folder of its destinations, a \
+             season's series folder), never its own file or a shared album cover, never \
+             for a kind or image type the saver publishes nothing beside the media for \
+             (a track, a photo, an extra, an episode's backdrop), and never in a \
+             home-video library with photos enabled, where an image beside an album can \
+             be one of its photos; upstream deletes every such image wherever it is stored. \
+             Kept by gl-1741's data-safety rule (delete only where Ferrofin's saver \
+             writes, nothing else in a media folder), which extends the owner decision \
+             of 2026-10-17 on media-library writes to deletes; the owner has not yet \
+             ruled on the narrower deletes.",
         ],
     },
     VerifiedSubsystem {
