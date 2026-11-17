@@ -236,9 +236,13 @@ was filed as. The harness never talks to GitLab: filing is a step a person or an
    against the existing issues on the request pattern and the field path, and verifies each against the
    upstream code before it is filed.
 3. Add each filed difference to `filed.toml` (`request` pattern, `path` as `findings` prints it, `kind`, `issue`)
-   in a reviewed PR; a path with `<tag>` covers every image tag of that map. The next run's report then shows
-   `gl-<iid>` beside it, `findings` no longer offers it, and an entry that matched nothing is listed in the
-   report (fixed, or no longer sent). `filed.toml` is validated before anything boots, like the ledger.
+   in a reviewed PR; a path with `<tag>` covers every image tag of that map. Before the PR, run step 1's
+   command again on the same run directory: `findings` reads `filed.toml` as it is now (`--filed FILE` reads
+   another), so a filed difference is no longer offered, and every entry that matched nothing on that run is
+   listed at the end. Entries filed from other runs may be listed there too; one you just added means a
+   mistyped `path`, `kind` or `request`. The run's own report keeps the marks it stored. The next run's report
+   then shows `gl-<iid>` beside it and lists an entry that matched nothing (fixed, or no longer sent).
+   `filed.toml` is validated before anything boots, like the ledger.
 
 A filed difference is still new: it fails the run until Ferrofin is fixed (or the difference is accepted into
 `ledger.toml`, which needs a `VERIFIED` row or the issue as its link).
