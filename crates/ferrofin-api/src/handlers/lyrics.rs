@@ -19,7 +19,8 @@
 //! which the audio probe records from its `.lrc`/`.txt` sidecars, plus the
 //! registered remote providers such as LrcLib). After a write the track's
 //! metadata refresh re-probes its lyric streams, as the C# flow does: upload
-//! and download queue it at high priority, delete awaits it.
+//! and download queue it at high priority, delete awaits it. Each write and
+//! its refresh finish for a client that hangs up, as upstream's do.
 
 use axum::body::{Bytes, HttpBody as _};
 use axum::extract::{FromRequest as _, Path, Request, State};
@@ -34,7 +35,7 @@ use uuid::Uuid;
 use crate::auth::{RequireAuth, RequireLyricManagement};
 use crate::error::ApiError;
 use crate::extract::{DotnetGuid, Query, RequiredRouteString, RouteParameter, upload_body_limit};
-use crate::handlers::{queue_high_priority_refresh, run_item_refresh};
+use crate::handlers::{queue_high_priority_refresh, run_detached, run_item_refresh};
 use crate::state::AppState;
 
 /// `{lyricId}`, the `[FromRoute, Required] string` of `DownloadRemoteLyrics`
@@ -119,7 +120,8 @@ struct UploadLyricsQuery {
 /// extension, and only then is the body read, so a body past the upload limit
 /// is a `413` only once those checks pass, as Kestrel enforces its limit on
 /// the action's read. On success queues a high-priority metadata refresh (as
-/// the C# does).
+/// the C# does). Once the body is read, the save and the refresh finish for a
+/// client that hangs up, as `SaveLyricAsync` takes no token upstream.
 #[utoipa::path(
     post,
     path = "/Audio/{itemId}/Lyrics",
@@ -165,11 +167,17 @@ async fn upload_lyrics(
         return Err(no_lyrics_uploaded());
     }
 
-    match state.lyrics.save_lyric(item_id, format, &body).await? {
-        Some(dto) => {
+    let format = format.to_owned();
+    let saved = run_detached(async move {
+        let saved = state.lyrics.save_lyric(item_id, &format, &body).await?;
+        if saved.is_some() {
             queue_high_priority_refresh(&state, item_id).await?;
-            Ok(Json(dto).into_response())
         }
+        Ok::<_, ApiError>(saved)
+    })
+    .await?;
+    match saved {
+        Some(dto) => Ok(Json(dto).into_response()),
         None => Err(ApiError::BadRequest("could not save lyrics".to_owned())),
     }
 }
@@ -196,7 +204,9 @@ fn upload_format(file_name: &str) -> &str {
 /// `audio.RefreshMetadata`, which drops the deleted files' streams, so the
 /// refresh runs before the `204` and `HasLyrics` is false by then. A refresh
 /// that fails, or that the shutdown stops, is an error status even though
-/// the files are already deleted, as upstream's awaited refresh throws.
+/// the files are already deleted, as upstream's awaited refresh throws. The
+/// delete and the refresh finish for a client that hangs up
+/// (`RefreshMetadata(CancellationToken.None)`).
 #[utoipa::path(
     delete,
     path = "/Audio/{itemId}/Lyrics",
@@ -214,8 +224,11 @@ async fn delete_lyrics(
     Path(DotnetGuid(item_id)): Path<DotnetGuid>,
 ) -> Result<StatusCode, ApiError> {
     require_item(&state, item_id, &auth).await?;
-    state.lyrics.delete_lyrics(item_id).await?;
-    run_item_refresh(&state, item_id).await?;
+    run_detached(async move {
+        state.lyrics.delete_lyrics(item_id).await?;
+        run_item_refresh(&state, item_id).await
+    })
+    .await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -249,7 +262,9 @@ async fn search_remote_lyrics(
 /// Port of `LyricsController.DownloadRemoteLyrics`: `400` for a blank
 /// `lyricId` (model validation, before the item check), `404` for a missing
 /// item or when the provider yields nothing; otherwise the downloaded lyric
-/// (and a high-priority metadata refresh is queued).
+/// (and a high-priority metadata refresh is queued). The download, the save
+/// and the refresh finish for a client that hangs up, as upstream passes
+/// `CancellationToken.None`.
 #[utoipa::path(
     post,
     path = "/Audio/{itemId}/RemoteSearch/Lyrics/{lyricId}",
@@ -271,13 +286,20 @@ async fn download_remote_lyrics(
     RequiredRouteString(lyric_id, _): RequiredRouteString<LyricId>,
 ) -> Result<Json<LyricDto>, ApiError> {
     require_item(&state, item_id, &auth).await?;
-    match state.lyrics.download_lyrics(item_id, &lyric_id).await? {
-        Some(dto) => {
-            queue_high_priority_refresh(&state, item_id).await?;
-            Ok(Json(dto))
+    let downloaded = run_detached({
+        let lyric_id = lyric_id.clone();
+        async move {
+            let downloaded = state.lyrics.download_lyrics(item_id, &lyric_id).await?;
+            if downloaded.is_some() {
+                queue_high_priority_refresh(&state, item_id).await?;
+            }
+            Ok::<_, ApiError>(downloaded)
         }
-        None => Err(ApiError::NotFound(format!("remote lyric {lyric_id}"))),
-    }
+    })
+    .await?;
+    downloaded
+        .map(Json)
+        .ok_or_else(|| ApiError::NotFound(format!("remote lyric {lyric_id}")))
 }
 
 /// `GET /Providers/Lyrics/{lyricId}` — fetch a remote lyric by id.

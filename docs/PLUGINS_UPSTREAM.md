@@ -271,7 +271,7 @@ Conventions:
   `crates/ferrofin-providers/src/remote_images.rs`), the wire types
   `crates/ferrofin-model/src/ldap.rs`, and the thin HTTP handler
   `crates/ferrofin-api/src/handlers/ldap.rs`. The live directory test is
-  `crates/ferrofin-extensions/tests/ldap_directory.rs` (`FERROFIN_LDAP_TESTS=1`, OpenLDAP in
+  `crates/ferrofin-extensions/tests/ldap_directory.rs` (`#[ignore]`d, OpenLDAP in
   docker; CI does not run it), and `contrib/ldap-test-directory/` starts a seeded directory to
   try a running server against by hand.
 - Plugin, configuration and connection test (v24, `d11c86a`): `LdapPlugin` (GUID, name

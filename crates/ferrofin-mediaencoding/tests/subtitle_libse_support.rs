@@ -269,11 +269,21 @@ fn format_double_custom_is_dotnets_0_0_hash_hash(#[case] value: f64, #[case] exp
     assert_eq!(format_double_custom(value, 1, 3), expected);
 }
 
-#[test]
-fn ordinal_ignore_case() {
-    assert!(eq_ordinal_ignore_case("Default", "DEFAULT"));
-    assert!(eq_ordinal_ignore_case("Ärger", "ärger"));
-    assert!(!eq_ordinal_ignore_case("Default", "Defaults"));
+#[rstest]
+#[case("Default", "DEFAULT", true)]
+#[case("Ärger", "ärger", true)]
+#[case("Default", "Defaults", false)]
+// .NET's ordinal casing, not Rust's `char::to_uppercase`: the dotless `ı` and
+// the long `ſ` keep their own case, `ᾳ` is `ᾼ`, `İ` is not `i`, a final `ς` is
+// `Σ`, and `ß` is not `SS`.
+#[case("\u{0131}", "I", false)]
+#[case("\u{017F}", "S", false)]
+#[case("\u{1FB3}", "\u{1FBC}", true)]
+#[case("\u{0130}", "i", false)]
+#[case("\u{03BF}\u{03C2}", "\u{039F}\u{03A3}", true)]
+#[case("\u{00DF}", "SS", false)]
+fn ordinal_ignore_case(#[case] a: &str, #[case] b: &str, #[case] equal: bool) {
+    assert_eq!(eq_ordinal_ignore_case(a, b), equal);
 }
 
 #[test]

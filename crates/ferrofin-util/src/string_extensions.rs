@@ -290,19 +290,16 @@ pub fn equals_ordinal_ignore_case(left: &str, right: &str) -> bool {
 }
 
 /// `StringComparer.OrdinalIgnoreCase.Compare(a, b)`: the same per-character
-/// uppercase mapping as [`equals_ordinal_ignore_case`], then an ordinal
-/// comparison of UTF-16 code units (so a supplementary-plane character sorts by
-/// its surrogate pair, as in .NET, not by its scalar value).
+/// uppercase mapping as [`equals_ordinal_ignore_case`], then the characters
+/// compared by scalar value. Unlike `string.CompareOrdinal`, which compares
+/// UTF-16 code units, .NET's ignore-case comparison sorts a supplementary-plane
+/// character after U+E000-U+FFFF (measured on .NET 10), so the order is the
+/// byte order of [`ordinal_ignore_case_key`].
 #[must_use]
 pub fn compare_ordinal_ignore_case(left: &str, right: &str) -> std::cmp::Ordering {
-    let utf16 = |text: &str| -> Vec<u16> {
-        text.chars()
-            .map(to_upper_ordinal)
-            .collect::<String>()
-            .encode_utf16()
-            .collect()
-    };
-    utf16(left).cmp(&utf16(right))
+    left.chars()
+        .map(to_upper_ordinal)
+        .cmp(right.chars().map(to_upper_ordinal))
 }
 
 /// The key of a `StringComparer.OrdinalIgnoreCase` dictionary or set: two
@@ -379,18 +376,29 @@ pub fn lower_invariant(text: &str) -> String {
 /// One character as `OrdinalIgnoreCase` folds it: the invariant simple
 /// uppercase, except the long s `ſ` (U+017F), which the runtime's ordinal
 /// casing table keeps as itself (measured on .NET 10: the only character where
-/// it differs from `ToUpperInvariant`).
-fn to_upper_ordinal(c: char) -> char {
-    if c == '\u{017f}' {
+/// it differs from `ToUpperInvariant`). For ports that compare `char` by `char`;
+/// whole strings go through [`equals_ordinal_ignore_case`].
+#[must_use]
+pub fn to_upper_ordinal(c: char) -> char {
+    if c.is_ascii() {
+        c.to_ascii_uppercase()
+    } else if c == '\u{017f}' {
         c
     } else {
         to_upper_invariant(c)
     }
 }
 
-fn to_upper_invariant(c: char) -> char {
+/// .NET's invariant uppercase of one Unicode scalar (`char.ToUpperInvariant`,
+/// or `Rune.ToUpperInvariant` beyond the BMP): the simple uppercase, keeping
+/// the dotless `ı` (U+0131) and the pairs newer than .NET's ICU. Whole strings
+/// go through [`upper_invariant`].
+#[must_use]
+pub fn to_upper_invariant(c: char) -> char {
     // .NET ChangeCaseInvariant preserves dotless i, unlike Unicode's default.
-    if c == '\u{0131}' || NEWER_UNICODE_CASE_PAIRS.binary_search(&c).is_ok() {
+    if c.is_ascii() {
+        c.to_ascii_uppercase()
+    } else if c == '\u{0131}' || NEWER_UNICODE_CASE_PAIRS.binary_search(&c).is_ok() {
         c
     } else {
         icu_casemap::CaseMapper::new().simple_uppercase(c)
@@ -483,6 +491,16 @@ mod tests {
                 char::from_u32(lower).unwrap().to_string(),
                 "lowercase U+{scalar:04X}"
             );
+            // The per-character folds too: the strings above take an ASCII
+            // shortcut that never reaches them.
+            let upper = char::from_u32(upper).unwrap();
+            assert_eq!(
+                to_upper_invariant(c),
+                upper,
+                "char uppercase U+{scalar:04X}"
+            );
+            let ordinal = if c == '\u{017f}' { c } else { upper };
+            assert_eq!(to_upper_ordinal(c), ordinal, "ordinal U+{scalar:04X}");
         }
     }
 
@@ -785,8 +803,20 @@ mod tests {
         // Uppercased first: `_` (0x5F) sorts after `A` (0x41) but before `a`.
         assert_eq!(compare_ordinal_ignore_case("_x", "ax"), Greater);
         assert_eq!(compare_ordinal_ignore_case("", "a"), Less);
-        // UTF-16 order: a surrogate (0xD83C…) sorts below U+FF21 `Ａ`.
-        assert_eq!(compare_ordinal_ignore_case("\u{1F3AC}", "\u{FF21}"), Less);
+        // Scalar order, not UTF-16 order: .NET 10 sorts U+1F3AC after U+FF21 `Ａ`
+        // and U+10000 after U+E000, although their surrogates (0xD83C, 0xD800)
+        // are lower code units.
+        assert_eq!(
+            compare_ordinal_ignore_case("\u{1F3AC}", "\u{FF21}"),
+            Greater
+        );
+        assert_eq!(
+            compare_ordinal_ignore_case("\u{10000}", "\u{E000}"),
+            Greater
+        );
+        assert_eq!(compare_ordinal_ignore_case("\u{E000}", "\u{10000}"), Less);
+        assert_eq!(compare_ordinal_ignore_case("\u{10428}", "\u{10400}"), Equal);
+        assert_eq!(compare_ordinal_ignore_case("ab", "a"), Greater);
         // The long s stays U+017F, so it sorts after every ASCII letter.
         assert_eq!(compare_ordinal_ignore_case("\u{17f}", "T"), Greater);
     }

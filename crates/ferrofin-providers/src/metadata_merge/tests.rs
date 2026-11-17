@@ -292,6 +292,14 @@ fn string_array_fill_unions(#[case] field: Field) {
     let mut target = MetadataResult::of(target);
     merge_data(&MetadataResult::of(source), &mut target, &[], false, false);
     assert_eq!(field.get(&target.item).as_deref(), Some("A|B"));
+    // The long s keeps its case: `ToUpperInvariant` maps it to `S`, ordinal casing does not.
+    let mut source = item(BaseItemKind::Audio);
+    field.set(&mut source, Some("Croſs"));
+    let mut target = item(BaseItemKind::Audio);
+    field.set(&mut target, Some("Cross"));
+    let mut target = MetadataResult::of(target);
+    merge_data(&MetadataResult::of(source), &mut target, &[], false, false);
+    assert_eq!(field.get(&target.item).as_deref(), Some("Cross|Croſs"));
 }
 
 /// Genres are not a union field upstream: a fill merge keeps the target.

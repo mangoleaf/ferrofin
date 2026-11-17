@@ -32,6 +32,9 @@ struct RecordingPlugins {
     /// Extra plugins `list_plugins` reports, in REGISTRATION order — the
     /// ordering test needs a registry whose order is not already alphabetical.
     extra: Mutex<Vec<PluginDescriptor>>,
+    /// Plugins an install staged and no restart has loaded: unknown to the
+    /// registry, removable all the same.
+    staged: Mutex<Vec<Uuid>>,
 }
 
 impl RecordingPlugins {
@@ -91,7 +94,9 @@ impl PluginManager for RecordingPlugins {
             Err(ServiceError::invalid_input(
                 "cannot uninstall a compiled-in plugin",
             ))
-        } else if self.extra_plugin(id).is_some() {
+        } else if self.extra_plugin(id).is_some()
+            || self.staged.lock().expect("staged lock").contains(&id)
+        {
             Ok(())
         } else {
             Err(Self::not_found(id))
@@ -287,6 +292,20 @@ async fn versioned_routes_match_the_installed_version() {
         ("notaversion", StatusCode::BAD_REQUEST),
         ("1", StatusCode::BAD_REQUEST),
         ("-1.2.3", StatusCode::BAD_REQUEST),
+        // `Version.Parse` reads each component as `NumberStyles.Integer`:
+        // white space around it and a leading sign bind (a stock 12.4 answers
+        // 204 for `%2012.4.0.0`, `12.%204.0.0` and `+12.4.0.0`).
+        ("%201.2.3", StatusCode::NO_CONTENT),
+        ("1.%092.3%20", StatusCode::NO_CONTENT),
+        ("+1.-0002.3", StatusCode::BAD_REQUEST),
+        ("+1.+2.3", StatusCode::NO_CONTENT),
+        ("1.%20%2B2.3", StatusCode::NO_CONTENT),
+        ("1.%2B%202.3", StatusCode::BAD_REQUEST),
+        // Only ASCII white space: a no-break or em space is no `Version`.
+        ("1.2.3%C2%A0", StatusCode::BAD_REQUEST),
+        ("%E2%80%831.2.3", StatusCode::BAD_REQUEST),
+        // `-0` is 0, so it parses, and misses.
+        ("-0.2.3", StatusCode::NOT_FOUND),
     ] {
         let resp = router(Arc::new(RecordingPlugins::default()))
             .oneshot(authed(
@@ -380,6 +399,41 @@ async fn a_semver_plugin_version_addresses_only_its_own_plugin() {
             .expect("resp");
         assert_eq!(resp.status(), expect, "{method} {uri}");
     }
+}
+
+/// A staged plugin is not in the registry, so its version cannot be checked:
+/// any version removes it, a semver one included. A version that is no .NET
+/// `Version` and removes nothing is the binder's 400, as upstream answers it
+/// before the action.
+#[tokio::test]
+async fn a_staged_plugin_is_removed_by_any_version() {
+    let staged = Uuid::from_u128(0x57A);
+    let fake = Arc::new(RecordingPlugins::default());
+    fake.staged.lock().expect("staged lock").push(staged);
+    for (id, expect) in [
+        (staged, StatusCode::NO_CONTENT),
+        (Uuid::from_u128(9), StatusCode::BAD_REQUEST),
+    ] {
+        let resp = router(Arc::clone(&fake))
+            .oneshot(authed(
+                "DELETE",
+                &format!("/Plugins/{id}/0.2.0-beta.1"),
+                Body::empty(),
+            ))
+            .await
+            .expect("resp");
+        assert_eq!(resp.status(), expect, "{id}");
+    }
+    // A blank one is `[Required]`'s 400 whatever is staged.
+    let resp = router(Arc::clone(&fake))
+        .oneshot(authed(
+            "DELETE",
+            &format!("/Plugins/{staged}/%20"),
+            Body::empty(),
+        ))
+        .await
+        .expect("resp");
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 }
 
 #[tokio::test]
