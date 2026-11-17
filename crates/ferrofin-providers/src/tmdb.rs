@@ -92,15 +92,13 @@ pub struct RemoteImage {
     pub language: Option<String>,
 }
 
-/// A TMDB search result carrying the id + image paths (movie: `title`, tv: `name`).
+/// A TMDB search result carrying the id + poster path (movie: `title`, tv: `name`).
 #[derive(Debug, Deserialize)]
 struct SearchHit {
     #[serde(default)]
     id: i64,
     #[serde(default)]
     poster_path: Option<String>,
-    #[serde(default)]
-    backdrop_path: Option<String>,
     #[serde(default)]
     title: Option<String>,
     #[serde(default)]
@@ -1671,142 +1669,6 @@ impl TmdbClient {
             .trim_end_matches('/')
             .clone_into(&mut self.base_url);
         self
-    }
-
-    /// Matches `name`/`year` against TMDB and returns its poster (Primary) and
-    /// backdrop image URLs — whichever the best match provides — in the
-    /// resolved metadata `language` (`None`: TMDB's default).
-    ///
-    /// Returns an empty vec on no match or any network/parse error (best-effort:
-    /// artwork acquisition must never abort a scan).
-    pub async fn images_for_language(
-        &self,
-        kind: TmdbKind,
-        name: &str,
-        year: Option<i32>,
-        language: Option<&str>,
-    ) -> Vec<RemoteImage> {
-        // The TMDb settings page governs the key, the adult filter, the
-        // cast/crew caps and the image sizes; read per call, the way
-        // `Plugin.Instance.Configuration` is (`TmdbClientManager`).
-        let cfg = self.settings().await;
-        let key = cfg.api_key(self.api_key.expose_secret());
-        let path = match kind {
-            TmdbKind::Movie => "search/movie",
-            TmdbKind::Series => "search/tv",
-        };
-        // TV uses `first_air_date_year`; movies use `year`.
-        let year_param = match kind {
-            TmdbKind::Movie => "year",
-            TmdbKind::Series => "first_air_date_year",
-        };
-        let mut req = self
-            .http
-            .get(format!("{}/{path}", self.base_url))
-            .query(&[("api_key", key), ("query", name)])
-            // `include_adult` is `Plugin.Instance.Configuration.IncludeAdult`
-            // on every TMDb search upstream (`TmdbClientManager.cs:396,424,467`);
-            // the API's own default is `false`, which is also the plugin's.
-            .query(&[("include_adult", cfg.include_adult.to_string())]);
-        if let Some(y) = year {
-            req = req.query(&[(year_param, y.to_string())]);
-        }
-
-        tracing::debug!(provider = "tmdb", query = name, ?year, "tmdb image search");
-        let resp = match with_language(req, language)
-            .send_limited(&self.limiter)
-            .await
-        {
-            Ok(resp) => resp,
-            // The limiter strips URLs from transport errors to protect API keys.
-            Err(e) => {
-                tracing::debug!(provider = "tmdb", error = %e, "tmdb request failed");
-                return Vec::new();
-            }
-        };
-        if !resp.status().is_success() {
-            tracing::debug!(provider = "tmdb", status = %resp.status(), "tmdb returned non-success");
-            return Vec::new();
-        }
-        let Ok(parsed) = resp.counted_json::<SearchResponse>().await else {
-            tracing::warn!(provider = "tmdb", "tmdb response parse failed");
-            return Vec::new();
-        };
-        let Some(hit) = parsed.results.into_iter().next() else {
-            return Vec::new();
-        };
-
-        let mut images = Vec::new();
-        if let Some(poster) = hit.poster_path.filter(|p| !p.is_empty()) {
-            images.push(RemoteImage {
-                image_type: ImageType::Primary,
-                url: cfg.image_url(crate::plugin_config::TmdbImageKind::Poster, &poster),
-                ..Default::default()
-            });
-        }
-        if let Some(backdrop) = hit.backdrop_path.filter(|p| !p.is_empty()) {
-            images.push(RemoteImage {
-                image_type: ImageType::Backdrop,
-                url: cfg.image_url(crate::plugin_config::TmdbImageKind::Backdrop, &backdrop),
-                ..Default::default()
-            });
-        }
-        images
-    }
-
-    /// The poster and backdrop TMDB picks for the title `tmdb_id` names —
-    /// `GET /movie/{id}` or `/tv/{id}`, their `poster_path`/`backdrop_path` —
-    /// in the shape [`images_for_language`](Self::images_for_language)
-    /// returns for a name search, in the resolved metadata `language`. What
-    /// the scan's image pass fetches for an item whose TMDB id is known:
-    /// upstream's `TmdbMovieImageProvider`/`TmdbSeriesImageProvider` look an
-    /// item's artwork up by its id, never by its name, so an item identified
-    /// as another title gets that title's artwork. Empty on a miss or any
-    /// failure.
-    pub async fn images_by_id_for_language(
-        &self,
-        kind: TmdbKind,
-        tmdb_id: i64,
-        language: Option<&str>,
-    ) -> Vec<RemoteImage> {
-        let cfg = self.settings().await;
-        let key = cfg.api_key(self.api_key.expose_secret());
-        let path = match kind {
-            TmdbKind::Movie => "movie",
-            TmdbKind::Series => "tv",
-        };
-        let req = self
-            .http
-            .get(format!("{}/{path}/{tmdb_id}", self.base_url))
-            .query(&[("api_key", key)]);
-        let Ok(resp) = with_language(req, language)
-            .send_limited(&self.limiter)
-            .await
-        else {
-            return Vec::new();
-        };
-        if !resp.status().is_success() {
-            return Vec::new();
-        }
-        let Ok(hit) = resp.counted_json::<SearchHit>().await else {
-            return Vec::new();
-        };
-        let mut images = Vec::new();
-        if let Some(poster) = hit.poster_path.filter(|p| !p.is_empty()) {
-            images.push(RemoteImage {
-                image_type: ImageType::Primary,
-                url: cfg.image_url(crate::plugin_config::TmdbImageKind::Poster, &poster),
-                ..Default::default()
-            });
-        }
-        if let Some(backdrop) = hit.backdrop_path.filter(|p| !p.is_empty()) {
-            images.push(RemoteImage {
-                image_type: ImageType::Backdrop,
-                url: cfg.image_url(crate::plugin_config::TmdbImageKind::Backdrop, &backdrop),
-                ..Default::default()
-            });
-        }
-        images
     }
 
     /// Fetches one season's metadata + artwork (`/tv/{id}/season/{n}`): the

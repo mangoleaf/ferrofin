@@ -2,7 +2,7 @@
 //! (+ `XbmcMetadata` NFO, `LocalMetadata`).
 //!
 //! Ports the `ProviderManager` (implements the `ferrofin-traits` trait), the
-//! provider framework, the ffprobe-backed media-info provider, and local NFO
+//! provider framework, `FFProbeVideoInfo`'s dummy chapters, and local NFO
 //! metadata. The remote providers (TMDB/TVDB/OMDb/fanart/MusicBrainz/AudioDb/
 //! Studio Images/OpenSubtitles/LrcLib) are compiled in unconditionally and
 //! gated at runtime by the per-library fetcher checkboxes, using shared keys
