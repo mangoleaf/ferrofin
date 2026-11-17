@@ -18,8 +18,9 @@ use rstest::rstest;
 use ferrofin_traits::providers::{MetadataRefreshMode, MetadataRefreshOptions};
 
 use super::{
-    MetadataResult, RefreshAnswers, RefreshMerge, is_valid_provider_id, merge_data, merge_people,
-    merge_provider_ids, merge_refresh, pass_credits, set_provider_ids, settle_sort_name,
+    MetadataResult, RefreshAnswers, RefreshMerge, is_valid_provider_id, language_subtag,
+    matches_preferred_language, merge_data, merge_people, merge_provider_ids, merge_refresh,
+    pass_credits, set_provider_ids, settle_sort_name,
 };
 
 /// The stored `Type` name for `kind`.
@@ -133,6 +134,19 @@ fn merged_equals_new(
     let locked: Vec<MetadataField> = lock.into_iter().collect();
     merge_data(&source, &mut target, &locked, replace, false);
     field.get(&target.item).as_deref() == new
+}
+
+/// `MatchesPreferredLanguage`: the language subtags compare, and an unknown
+/// language on either side matches.
+#[test]
+fn languages_match_on_their_subtag() {
+    assert_eq!(language_subtag("ES-es"), "es");
+    assert!(matches_preferred_language(Some("es"), "es-ES"));
+    assert!(matches_preferred_language(Some("EN-us"), "en"));
+    assert!(!matches_preferred_language(Some("en"), "de"));
+    assert!(matches_preferred_language(None, "de"));
+    assert!(matches_preferred_language(Some(""), "de"));
+    assert!(matches_preferred_language(Some("en"), ""));
 }
 
 /// `MergeBaseItemData_StringField_ReplacesAppropriately` (on a `Series`, so
@@ -278,6 +292,14 @@ fn string_array_fill_unions(#[case] field: Field) {
     let mut target = MetadataResult::of(target);
     merge_data(&MetadataResult::of(source), &mut target, &[], false, false);
     assert_eq!(field.get(&target.item).as_deref(), Some("A|B"));
+    // The long s keeps its case: `ToUpperInvariant` maps it to `S`, ordinal casing does not.
+    let mut source = item(BaseItemKind::Audio);
+    field.set(&mut source, Some("Croſs"));
+    let mut target = item(BaseItemKind::Audio);
+    field.set(&mut target, Some("Cross"));
+    let mut target = MetadataResult::of(target);
+    merge_data(&MetadataResult::of(source), &mut target, &[], false, false);
+    assert_eq!(field.get(&target.item).as_deref(), Some("Cross|Croſs"));
 }
 
 /// Genres are not a union field upstream: a fill merge keeps the target.

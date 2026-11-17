@@ -28,9 +28,7 @@ pub mod transcoding;
 
 pub use error::MediaEncodingError;
 
-pub use attachments::{
-    AttachmentExtractorImpl, AttachmentIo, MediaSourceResolver, NoopAttachmentIo,
-};
+pub use attachments::{AttachmentExtractorImpl, AttachmentIo, MediaSourceResolver};
 pub use configuration::{
     DirChecker, EncodingConfigurationStore, EncodingOptionsReader, RealDirChecker,
 };

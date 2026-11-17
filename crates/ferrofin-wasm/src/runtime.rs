@@ -353,6 +353,7 @@ impl InstanceSpec {
             plugin_id: self.plugin_id.clone(),
             config_json,
             segment_policy_skipped: false,
+            user_data_writes: 0,
             limits: StoreLimitsBuilder::new()
                 .memory_size(self.memory_limit_bytes)
                 .memories(MEMORIES_PER_PLUGIN)
@@ -826,6 +827,8 @@ fn run_loop(
                 }
             }
         };
+        // Before a trap's instance goes: its writes happened.
+        store.data_mut().log_user_data_writes();
 
         if failed {
             // A trap (including epoch timeout and memory-cap hits) leaves the

@@ -69,16 +69,19 @@ async fn wait_for_file(path: &Path, ready: impl Fn(&str) -> bool) -> String {
     );
 }
 
-/// Waits out the refreshes the membership changes queued.
+/// Waits out the refreshes the membership changes queued, the one the worker
+/// is running included: `get_refresh_queue` lists only those still waiting,
+/// and a refresh still running when the test edits the file by hand would
+/// write over the edit.
 async fn settle(providers: &dyn ferrofin_traits::providers::ProviderManager) {
-    for _ in 0..200 {
-        if providers.get_refresh_queue().await.unwrap().is_empty() {
-            break;
+    // 30 s: a slow CI runner took about 18 s for the whole test.
+    for _ in 0..600 {
+        if !providers.is_processing_refresh_queue().await {
+            return;
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
-    // The worker pops a refresh before it runs it.
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    panic!("the refresh queue never went idle");
 }
 
 /// Waits until no library reports a scan in flight (`RefreshStatus`).

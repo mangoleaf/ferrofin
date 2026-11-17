@@ -149,10 +149,9 @@ static LOCALIZATION_OPTION_LIST: LazyLock<Vec<LocalizationOption>> = LazyLock::n
         name: "English".to_owned(),
         value: DEFAULT_CULTURE.to_owned(),
     });
+    // `string.Compare(…, OrdinalIgnoreCase)` orders by scalar value, the key's byte order.
     options.sort_by_cached_key(|option| {
-        ferrofin_util::string_extensions::upper_invariant(&option.name)
-            .encode_utf16()
-            .collect::<Vec<_>>()
+        ferrofin_util::string_extensions::ordinal_ignore_case_key(&option.name)
     });
     options
 });
@@ -808,10 +807,10 @@ fn load_culture_data() -> CultureData {
 /// (built from `ordered`) and `get_rating_score` (which reads `by_name`) reporting the
 /// same score for the same rating. The vendored data has no repeated rating string, so
 /// this branch is unreachable today and the emitted order is unchanged either way.
-/// The `by_name` key for a rating string: .NET invariant uppercase, so the
+/// The `by_name` key for a rating string: the `OrdinalIgnoreCase` fold, so the
 /// table behaves like `Dictionary<…>(StringComparer.OrdinalIgnoreCase)`.
 fn rating_key(rating: &str) -> String {
-    ferrofin_util::string_extensions::upper_invariant(rating)
+    ferrofin_util::string_extensions::ordinal_ignore_case_key(rating)
 }
 
 fn load_rating_table(json: &str) -> RatingTable {

@@ -125,6 +125,10 @@ pub struct TimerRecordingInfo {
     pub is_premiere: bool,
     /// The programme id the timer was created for (the guide item's id).
     pub program_id: Option<String>,
+    /// The guide programme item these facts came from, whose artwork "Save
+    /// EPG images" copies (`SaveRecordingMetadata`'s programme lookup); `None`
+    /// when the guide had none, which upstream's stand-in has no images for.
+    pub program_item_id: Option<Uuid>,
     /// The listing provider's own programme id.
     pub external_program_id: Option<String>,
     /// The series timer that scheduled this one, if any.
