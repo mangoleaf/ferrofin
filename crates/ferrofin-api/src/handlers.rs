@@ -1237,7 +1237,9 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
                    ← parent_row (a failed read counts as \
                    no row, once per pass) ← sync_series_name (FindSeriesName), \
                    sync_season_name, remember_series_folder, locale_parent (GetParents, \
-                   GetCollectionFolders, read by resolve_metadata_locale); \
+                   GetCollectionFolders, read by resolve_metadata_locale), \
+                   update_season_premiere_date (GetEpisodes, whose null series lists no \
+                   episodes, and UpdatePremiereDate, which changes nothing without them); \
                    apply_parental_rating_score and \
                    inherit_stored_rating; keep_stored_series_key; series_display_order \
                    (an unread series skips its children's TheTVDB lookups, counting no \
@@ -1250,11 +1252,15 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
                    MediaBrowser.Controller/Entities/BaseItem.cs (RefreshMetadata, \
                    GetPreferredMetadataLanguage, GetPreferredMetadataCountryCode, GetParents), \
                    MediaBrowser.Providers/Manager/ProviderManager.cs (RefreshItem), \
-                   MediaBrowser.Providers/Manager/MetadataService.cs (RefreshMetadata), \
-                   MediaBrowser.Controller/Entities/TV/Season.cs (FindSeriesName, GetLookupInfo), \
+                   MediaBrowser.Providers/Manager/MetadataService.cs (RefreshMetadata, \
+                   UpdatePremiereDate), \
+                   MediaBrowser.Controller/Entities/TV/Season.cs (FindSeriesName, GetLookupInfo, \
+                   Series, GetEpisodes), \
+                   MediaBrowser.Providers/TV/SeasonMetadataService.cs \
+                   (EnableUpdatingPremiereDateFromChildren, GetChildrenForMetadataUpdates), \
                    MediaBrowser.Controller/Entities/BaseItem.cs (GetParentalRatingScore) and \
                    MediaBrowser.Providers/TV/EpisodeMetadataService.cs (BeforeSaveInternal)",
-        date: "2026-11-13",
+        date: "2026-11-15",
         divergences: &[
             "An item whose parent chain cannot be read is scored from its own rating and \
              country, an ancestor's custom rating not counting, else takes the score stored on \
@@ -1273,6 +1279,11 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
              SeriesProviderIds, and jellyfin-plugin-tvdb 5c4592f returns an empty result), \
              where upstream's read of such a row would throw into the per-child catch and \
              the item would not refresh.",
+            "A season whose series row cannot be read keeps its premiere date and year where \
+             its refresh would take them from its episodes, and is stamped, as upstream treats \
+             a season with no series (GetEpisodes lists none, and UpdatePremiereDate changes \
+             nothing without children), where upstream's read of such a row would throw into \
+             the per-child catch and the season would not refresh.",
             "A stored item whose refresh stops after its row was saved (a failed write, a \
              cancel, a crash) is left with no DateLastRefreshed, which the scan clears for the \
              save and writes back last, so the next scan retries it as a first refresh where \
