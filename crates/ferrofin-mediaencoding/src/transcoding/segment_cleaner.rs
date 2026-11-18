@@ -32,7 +32,9 @@ const MIN_RUNTIME_TICKS: i64 = 300 * ferrofin_util::ticks::TICKS_PER_SECOND;
 /// source that is not a segmented live stream (and a local `wtv` file) syncs
 /// audio with `-async 1` and, below ffmpeg 5.1 or on a version that cannot be
 /// read (`-fps_mode` cannot be an input option), video with `-vsync -1`; a
-/// `wma` or `asf` container adds the audio sync without the video sync.
+/// `wma` or `asf` container adds the audio sync without the video sync. The
+/// container is the job's input container, the probed one upstream's
+/// `mediaSource.Container` is, not the file's extension.
 #[must_use]
 pub fn input_sync_arguments(
     state: &EncodingJobInfo,
@@ -40,8 +42,8 @@ pub fn input_sync_arguments(
 ) -> Vec<String> {
     let source = &state.media_source;
     let container_is = |name: &str| {
-        source
-            .container
+        state
+            .input_container
             .as_deref()
             .is_some_and(|container| container.eq_ignore_ascii_case(name))
     };
@@ -711,7 +713,7 @@ mod tests {
         // A local wtv recording syncs whatever its rate flag.
         state.media_source.read_at_native_framerate = false;
         state.media_source.protocol = MediaProtocol::File;
-        state.media_source.container = Some("WTV".to_owned());
+        state.input_container = Some("WTV".to_owned());
         assert_eq!(
             input_sync_arguments(&state, None),
             ["-async", "1", "-vsync", "-1"]
@@ -724,13 +726,16 @@ mod tests {
     /// `AttachMediaSourceInfo`: a `wma` or `asf` container ("Seeing some
     /// stuttering when transcoding wma to audio-only HLS") syncs its audio
     /// with `-async 1` whatever its protocol, but not its video, even on a
-    /// version that cannot be read.
+    /// version that cannot be read. The container is the probed one
+    /// (`mediaSource.Container` upstream), so a `.wmv` file probed as ASF
+    /// syncs too (gl-1861).
     #[rstest::rstest]
     #[case::wma("wma")]
     #[case::asf("ASF")]
     fn wma_and_asf_sources_sync_their_audio(#[case] container: &str) {
         let mut state = state();
-        state.media_source.container = Some(container.to_owned());
+        state.media_source.container = Some("wmv".to_owned());
+        state.input_container = Some(container.to_owned());
         for protocol in [MediaProtocol::File, MediaProtocol::Http] {
             state.media_source.protocol = protocol;
             for version in [None, Some(FfmpegVersion::new(5, 0))] {
