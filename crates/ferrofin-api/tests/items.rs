@@ -568,6 +568,33 @@ impl LibraryManager for OkLibrary {
             vec![base_item_entity(self.item_id)],
         ))
     }
+    /// The builder's answers for the views these tests browse, as core's
+    /// (`library_manager/user_view_builder.rs`, whose tests pin the rules)
+    /// gives them; any other view fails the request, so a browse that should
+    /// never reach the builder shows it.
+    async fn apply_user_view_builder(
+        &self,
+        query: &mut InternalItemsQuery,
+        view: &BaseItemEntity,
+    ) -> Result<(Option<BaseItemKind>, bool), ServiceError> {
+        match Uuid::parse_str(&view.id).ok() {
+            // A recursive browse reports the playlists folder it displays.
+            Some(PLAYLISTS_VIEW_ID) if query.recursive => {
+                Ok((Some(BaseItemKind::PlaylistsFolder), true))
+            }
+            // Its display parent is gone: the view's own kind, no Folder policy.
+            Some(STALE_PLAYLISTS_VIEW_ID) => Ok((Some(BaseItemKind::UserView), false)),
+            // A direct browse moves onto the library the view displays.
+            Some(TV_VIEW_ID) if !query.recursive => {
+                let library = self.get_item_by_id(TV_LIBRARY_ID).await?.expect("library");
+                query.parent_id = TV_LIBRARY_ID;
+                query.user_root_children = false;
+                query.parent_row = Some(Arc::new(library));
+                Ok((Some(BaseItemKind::CollectionFolder), true))
+            }
+            _ => Err(ServiceError::backend("no builder answer for this view")),
+        }
+    }
     async fn get_item_ids(&self, query: &InternalItemsQuery) -> Result<Vec<Uuid>, ServiceError> {
         Ok(self.named_ids(query))
     }
@@ -2379,6 +2406,9 @@ async fn filtered_user_root_and_typed_library_browses_run_recursively() {
     let view = query_for(&format!("parentId={TV_VIEW_ID}&includeItemTypes=Episode")).await;
     assert_eq!(view.parent_id, TV_LIBRARY_ID);
     assert!(!view.recursive);
+    // The builder's answer reaches the query as it gave it.
+    assert_eq!(view.parent_type, Some(BaseItemKind::CollectionFolder));
+    assert!(view.apply_folder_display_options);
 }
 
 /// An empty id list means no filter, so ids the user may not open must answer
@@ -3536,62 +3566,36 @@ async fn a_failed_delete_is_logged_once_even_after_the_client_hung_up() {
     }
 }
 
+/// Explicit ids go straight to the repository (`Folder.GetItems`), before a
+/// view's builder could move the browse: the fake has no builder answer for
+/// this view, so a `200` shows it never ran. Its delegation to the Season is
+/// core's (`the_default_builder_moves_any_browse_of_a_season_onto_it`).
 #[tokio::test]
-async fn default_season_view_preserves_actual_parent_for_live_aired_selection_and_ids_bypass_it() {
+async fn explicit_ids_bypass_a_views_builder() {
     for recursive in [false, true] {
-        for explicit in [false, true] {
-            let library = OkLibrary {
-                item_id: ITEM_ID,
-                adopted_tree: false,
-                last_query: Arc::default(),
-                deleted: Arc::default(),
-                gate: None,
-                ..Default::default()
-            };
-            let seen = library.last_query.clone();
-            let router = create_router(ok_state_with(library));
-            let path = format!(
-                "/Items?parentId={SEASON_VIEW_ID}&recursive={recursive}{}",
-                if explicit {
-                    format!("&ids={ITEM_ID}")
-                } else {
-                    String::new()
-                }
-            );
-            let response = router
-                .oneshot(
-                    Request::builder()
-                        .uri(path)
-                        .header("X-Emby-Token", "valid")
-                        .body(Body::empty())
-                        .unwrap(),
-                )
-                .await
-                .unwrap();
-            assert_eq!(response.status(), StatusCode::OK);
-            let query = seen.lock().unwrap().clone().expect("repository query");
-            assert_eq!(
-                query.parent_id,
-                if explicit {
-                    Uuid::nil()
-                } else {
-                    SEASON_BROWSE_ID
-                }
-            );
-            assert_eq!(
-                query.parent_type,
-                if explicit {
-                    None
-                } else {
-                    Some(BaseItemKind::Season)
-                }
-            );
-            assert_eq!(query.apply_folder_display_options, !explicit);
-            assert!(
-                !query.folder_query_recursive,
-                "default delegation keeps the Season override instead of invoking Folder.QueryRecursive"
-            );
-        }
+        let library = OkLibrary {
+            item_id: ITEM_ID,
+            ..Default::default()
+        };
+        let seen = library.last_query.clone();
+        let response = create_router(ok_state_with(library))
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/Items?parentId={SEASON_VIEW_ID}&recursive={recursive}&ids={ITEM_ID}"
+                    ))
+                    .header("X-Emby-Token", "valid")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let query = seen.lock().unwrap().clone().expect("repository query");
+        assert_eq!(query.parent_id, Uuid::nil());
+        assert_eq!(query.parent_type, None);
+        assert!(!query.apply_folder_display_options);
+        assert!(!query.folder_query_recursive);
     }
 }
 

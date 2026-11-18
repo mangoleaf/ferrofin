@@ -1831,7 +1831,9 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
                    listings that can hold a playlist (Folder.QueryRecursive, \
                    Folder.QueryWithPostFiltering, Playlist.IsVisible); dto_service.rs \
                    get_base_item_dtos' IsVisible pass (DtoService.GetBaseItemDtos), which of \
-                   the handlers only GET /Items/Suggestions asks for, as its controller does; \
+                   the handlers GET /Items/Suggestions and the six /{kind}/{itemId}/Similar \
+                   routes ask for, as their controllers do, and GET /Movies/Recommendations \
+                   runs through filter_visible_items before its one projection; \
                    handlers/live_tv.rs query_programs_inner \
                    (LiveTvController.GetLiveTvPrograms, GetPrograms)",
         date: "2026-11-01",
@@ -2598,9 +2600,12 @@ macro_rules! similar_items_path {
          MusicAlbum-, MusicArtist- and AudioSimilarItemsProvider (AudioBook through Audio) \
          and LiveTvProgramSimilarItemsProvider by IsMovie and IsSeries; local_similar's score \
          pass, similar_items_repository.rs weighted_similar_items (genre 10, tag and studio 5, \
-         director 50, actor and guest star 15, the seed's people distinct) and its one filter \
-         query (Movie, plus Trailer and LiveTvProgram under \
-         EnableExternalContentInSuggestions; IsMovie; IsPlayed = false; the user's access); \
+         director 50, actor and guest star 15, the seed's people distinct), its one filter \
+         query, score_filter_query (Movie, plus Trailer and LiveTvProgram under \
+         EnableExternalContentInSuggestions; IsMovie; IsPlayed = false; the user's access; \
+         TranslateQuery without ApplyGroupingFilter, so never grouped by presentation key), \
+         and phase 3, best_scoring_per_key (by score, the primary first on a tie, then \
+         DistinctBy the raw PresentationUniqueKey, every keyless row one key); \
          flat_similar for the other kinds (the seed's Genres and Tags, both required when both \
          are set, Random order, ExcludeArtistIds for the music kinds, and for a movie-like \
          programme EnableGroupByMetadataKey, so item_repository.rs grouped_by_metadata_key \
@@ -2612,7 +2617,8 @@ macro_rules! similar_items_path {
          FilterByLibraryAccessAsync pass, as every query is already user-scoped) → \
          ferrofin-providers similarity.rs (TmdbMovieSimilarProvider, \
          TmdbSeriesSimilarProvider, ListenBrainzSimilarArtistProvider) → dto_service.rs \
-         get_base_item_dtos; QueryResult(0, the item count, the DTOs)"
+         get_base_item_dtos with its IsVisible pass for a user; QueryResult(0, the item count \
+         before that pass, the DTOs)"
     };
 }
 
@@ -2648,8 +2654,6 @@ const TRAILERS_DIVERGENCES: &[&str] = &[
 const SIMILAR_ITEMS_DIVERGENCES: &[&str] = &[
     SIMILAR_SCORE_WINDOW_DIVERGENCE,
     SIMILAR_ALTERNATE_VERSIONS_DIVERGENCE,
-    SIMILAR_SCORE_GROUPING_DIVERGENCE,
-    SIMILAR_IS_VISIBLE_DIVERGENCE,
     "A reference-cache entry that exists but cannot be read (a directory at its path, an \
      entry or cache directory the server may not read) warns once with its path and is \
      fetched again from the provider. Upstream reads a directory, or an entry under a \
@@ -2697,20 +2701,6 @@ const SIMILAR_ALTERNATE_VERSIONS_DIVERGENCE: &str = "The score pass scores an al
      version whose primary is in the same library, which upstream's hiddenVersionIds leaves \
      out (12.1), so such versions take places in the limit * 3 window before the filter \
      query drops them. Fix path: gl-392.";
-
-/// How the score pass's filter query picks each presentation key's row.
-const SIMILAR_SCORE_GROUPING_DIVERGENCE: &str = "With a user, the score pass's filter query \
-     groups its rows by presentation key, so each key keeps its primary or lowest-Id row and \
-     all keyless guide programmes collapse into the lowest-Id one among them; upstream's \
-     provider filters through TranslateQuery alone and keeps each key's best-scoring row, \
-     the primary on a tie, keyless programmes folding into their best-scoring one. Fix path: \
-     gl-1800.";
-
-/// The `IsVisible` pass the similar-items and recommendations handlers skip.
-const SIMILAR_IS_VISIBLE_DIVERGENCE: &str = "The rows are projected without GetBaseItemDtos' \
-     IsVisible pass, which upstream runs for a user; every row came through a user-scoped \
-     query, so this differs only where IsParentalAllowed and that query disagree (and \
-     upstream's similar-items count is the one before the pass). Fix path: gl-1787.";
 
 /// The code path the four legacy `HlsSegmentController` rows share after their
 /// handler, from the resolver to the response.
@@ -2869,7 +2859,8 @@ pub const VERIFIED: &[Verified] = &[
                    items_query_options, official_rating_score, resolve_name_filters, \
                    apply_media_stream_filter_rules, apply_location_types, apply_filters, \
                    check_parent_visibility (GetParentItem, IsVisible, and a UserView parent's \
-                   dispatch through user_view_browse_context), redirect_container_browse \
+                   UserViewBuilder through LibraryManager apply_user_view_builder, \
+                   ferrofin-core library_manager/user_view_builder.rs), redirect_container_browse \
                    (the BoxSet and Playlist re-root), list_playlists_folder_as_playlists, \
                    apply_library_browse_defaults (recursive ??= true for a typed library \
                    browse), apply_albums_by_artist_order, order_search_by_sort_name, the \
@@ -2909,16 +2900,20 @@ pub const VERIFIED: &[Verified] = &[
         ferrofin: "handlers/movies.rs get_movie_recommendations (userId through \
                resolve_user_opt: RequestHelpers.GetUserId, then GetUserById; parentId ?? \
                Guid.Empty through require_scope_id_visible; fields; categoryLimit = 5 and \
-               itemLimit = 8 by default; one get_base_item_dtos pass over every category's \
-               items, split back per category in order) → ferrofin-core \
+               itemLimit = 8 by default; GetBaseItemDtos' IsVisible pass per category as one \
+               filter_visible_items pass over every category's distinct items, a category it \
+               empties kept with no items, then one get_base_item_dtos pass over what is \
+               left, split back per category in order) → ferrofin-core \
                similar_items_manager.rs get_movie_recommendations \
                (GetMovieRecommendationsAsync: recently_played_query, played movies by \
                DatePlayed then Random, Limit 7, and liked_query, IsFavoriteOrLiked movie kinds \
                in Random order, Limit 10, without the recently played, both under ParentId and \
                EnableGroupByMetadataKey, so item_repository.rs grouped_by_metadata_key reads 4 \
                more; similar_items_repository.rs people_names_of over the first 6 played, \
-               GetPeopleNamesByItems in ListOrder per item, distinct; each baseline capped to \
-               categoryLimit and scored by similar_category through local_similar, the \
+               GetPeopleNamesByItems in ListOrder per item, distinct, with equal ListOrders \
+               on two films in ItemId order, the order SQLite returns for upstream's \
+               statement; each baseline capped to categoryLimit and scored by \
+               similar_category through local_similar, the \
                MovieSimilarItemsProvider path of the similar-items rows for every baseline, \
                whatever its kind, with the user and Limit = itemLimit, no remote provider; \
                next_person_category, the lazy GetPersonRecommendations: Person = name, \
@@ -2932,20 +2927,14 @@ pub const VERIFIED: &[Verified] = &[
         divergences: &[
             SIMILAR_SCORE_WINDOW_DIVERGENCE,
             SIMILAR_ALTERNATE_VERSIONS_DIVERGENCE,
-            SIMILAR_SCORE_GROUPING_DIVERGENCE,
             "Each baseline is scored and access-filtered on its own and fills its category \
          from its own limit * 3 window; upstream's IBatchLocalSimilarItemsProvider scores \
          every baseline of a stream in one pass, filters the union of their windows once and \
          fills each category from any candidate in that union its baseline scored, so a \
          category the filter left short can be longer upstream. Fix path: gl-1357.",
-            "Credits of equal ListOrder on different played films are named in play order, \
-         most recent first; upstream's GetPeopleNamesByItems leaves them in the order the \
-         database returns them, which decides whose cast heads the actor stream. Fix path: \
-         gl-1799.",
             "An itemLimit above 715827882 overflows upstream's limit * 3 to a negative Take, so \
          every similar-to category is empty; the oversample saturates here. Jellyfin bug not \
          ported.",
-            SIMILAR_IS_VISIBLE_DIVERGENCE,
             "A similar-to category leaves out a film sharing its baseline's presentation key \
          (another copy of the baseline); upstream's batch provider excludes only the \
          baseline's own id and can recommend that copy under its own name. Jellyfin bug not \
