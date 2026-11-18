@@ -5961,10 +5961,7 @@ impl FerrofinLiveTvManager {
         for (program, mut timer) in candidates {
             let id = timer.base.id.clone().unwrap_or_default();
             all_ids.push(id.clone());
-            let existing = match self.get_timer(&id).await? {
-                Some(found) => Some(found),
-                None => self.timer_for_program(&timer).await?,
-            };
+            let existing = self.find_or_adopt_series_child(&id, &timer).await?;
             match existing {
                 None => {
                     if self
@@ -6122,6 +6119,113 @@ impl FerrofinLiveTvManager {
         .await?
         .into_iter()
         .find_map(|(id, data)| self.parse_stored_row("FerrofinLiveTvTimers", &id, &data)))
+    }
+
+    /// The stored timer for a series child the fan-out derived as `timer`,
+    /// under id `id`: by that id, else by its programme
+    /// (`_timerManager.GetTimer(timer.Id) ?? GetTimerByProgramId(timer.ProgramId)`,
+    /// v12.4 DefaultLiveTvService.cs:716-719), else one stored under its
+    /// channel's previous external id, which this adopts and so writes
+    /// ([`Self::rekeyed_series_child`]).
+    async fn find_or_adopt_series_child(
+        &self,
+        id: &str,
+        timer: &TimerInfoDto,
+    ) -> Result<Option<TimerInfoDto>, ServiceError> {
+        if let Some(found) = self.get_timer(id).await? {
+            return Ok(Some(found));
+        }
+        if let Some(found) = self.timer_for_program(timer).await? {
+            return Ok(Some(found));
+        }
+        self.rekeyed_series_child(timer).await
+    }
+
+    /// The child its series timer scheduled for `timer`'s showing while the
+    /// showing's channel had another external id, carried over to the id
+    /// `timer` derives (gl-1863).
+    ///
+    /// An airing's listing key ends in its channel's external id
+    /// (`ListingsManager.GetProgramsAsync`: `program.Id += "_" + channel.Id`),
+    /// and a child's id is derived from that key. So when a channel's id
+    /// changes (v1.5.2 maps an HDHomeRun channel under `hdhr_{GuideNumber}`,
+    /// where earlier releases used the M3U shape), neither the id nor the
+    /// programme finds its children any more: a showing cancelled by hand was
+    /// scheduled again, and a showing being recorded got a second timer that
+    /// started a second capture. Upstream has no such lookup, and needs none:
+    /// it derives the channel item's id and its airings' key suffix from the
+    /// same `ChannelInfo.Id`, so when that id changes (an M3U tuner's URL is
+    /// edited, say) the channel item changes too, and the old children are on
+    /// another channel. This lookup matches only what v1.5.2's change left: a
+    /// child of the same series timer on the same channel at the same start,
+    /// not `Completed`, whose listing key is this airing's under another
+    /// channel id.
+    ///
+    /// A child being captured keeps its id, which the fire guards
+    /// ([`FiringClaim`] and the active recordings) are keyed on. It only takes
+    /// the airing's new keys, so [`refresh_timers`](Self::refresh_timers) keeps
+    /// it and the next pass finds it by programme. Any other child moves to the
+    /// derived id with its status, its `IsManual` flag and its own settings, and
+    /// the pass goes on as though it had been found by id.
+    async fn rekeyed_series_child(
+        &self,
+        timer: &TimerInfoDto,
+    ) -> Result<Option<TimerInfoDto>, ServiceError> {
+        let (Some(series_timer_id), Some(key), Some(channel)) = (
+            timer.series_timer_id.as_deref(),
+            timer.base.external_program_id.as_deref(),
+            timer.base.external_channel_id.as_deref(),
+        ) else {
+            return Ok(None);
+        };
+        // `{listing id}_`: the key without this channel's id.
+        let Some(listing) = key.strip_suffix(channel) else {
+            return Ok(None);
+        };
+        let found = crate::dvr_repository::series_timers_at(
+            &self.db,
+            series_timer_id,
+            timer.base.channel_id,
+            timer.base.start_date,
+        )
+        .await?
+        .into_iter()
+        .filter_map(|(id, data)| {
+            self.parse_stored_row::<TimerInfoDto>("FerrofinLiveTvTimers", &id, &data)
+                .map(|child| (id, child))
+        })
+        .find(|(_, child)| {
+            child
+                .base
+                .external_program_id
+                .as_deref()
+                .is_some_and(|k| k != key && k.starts_with(listing))
+        });
+        let Some((old_id, mut child)) = found else {
+            return Ok(None);
+        };
+        let capturing = self.active_recordings_lock().contains_key(&old_id)
+            || self
+                .firing
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .contains(&old_id);
+        if capturing {
+            update_existing_timer_with_new_metadata(&mut child, timer);
+            self.persist_timer(&child).await?;
+        } else {
+            self.disarm_timer(&old_id);
+            child.base.id.clone_from(&timer.base.id);
+            child.base.external_id.clone_from(&timer.base.external_id);
+            crate::dvr_repository::rekey_timer(&self.db, &old_id, &child).await?;
+            self.forget_row_state(&old_id);
+        }
+        tracing::debug!(
+            timer_id = old_id,
+            capturing,
+            "live tv: a series showing follows its channel's new external id"
+        );
+        Ok(Some(child))
     }
 
     /// One guide programme by id, or `None` when it is not in the guide.
@@ -8570,6 +8674,7 @@ fn live_tv_service_key() -> &'static str {
 #[cfg(test)]
 mod tests {
     mod channel_list;
+    mod channel_rekey;
     mod guide_mirror;
     mod keep_up_to;
     mod program_list;
