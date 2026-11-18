@@ -488,7 +488,9 @@ struct ProcessMetrics {
 /// program-data paths. It runs after the directory check
 /// (`bootstrap::check_application_paths`, upstream's order), so all three
 /// already exist. A failure stops the boot before the database is opened or a
-/// restore is applied.
+/// restore is applied. A path whose free space cannot be read is logged and
+/// passed, where Jellyfin's `DriveInfo` throws (the deliberate difference
+/// `test_common_paths_for_storage_capacity` records).
 fn check_storage_capacity(config: &Config) -> anyhow::Result<()> {
     ferrofin_core::system_manager::test_common_paths_for_storage_capacity(
         &ferrofin_core::system_manager::FsStorageProbe,
