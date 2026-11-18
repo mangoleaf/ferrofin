@@ -2250,6 +2250,9 @@ mod tests {
         async fn delete_subtitles(&self, _item_id: Uuid, _index: i32) -> Result<(), ServiceError> {
             unimplemented!("fake")
         }
+        async fn drop_missing_subtitle_rows(&self, _item_id: Uuid) -> Result<(), ServiceError> {
+            unimplemented!("fake")
+        }
         async fn get_supported_providers(
             &self,
             _item_id: Uuid,

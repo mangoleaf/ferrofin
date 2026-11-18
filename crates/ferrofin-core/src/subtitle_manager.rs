@@ -18,6 +18,9 @@
 //!   raw content (the `/Providers/Subtitles/Subtitles/{id}` route).
 //! - `Self::delete_subtitles` deletes an external subtitle's file; the item
 //!   refresh the route then awaits drops its stream.
+//! - `Self::drop_missing_subtitle_rows` drops the external subtitle rows whose
+//!   file is gone; the route runs it after that refresh, for one that cannot
+//!   probe.
 //! - `Self::get_supported_providers` lists the registered providers for an item.
 
 use ferrofin_util::directory_path::DirectoryPath;
@@ -665,6 +668,37 @@ impl SubtitleManager for FerrofinSubtitleManager {
             return Err(folder_missing("relative path"));
         }
         settle_unlink(file, tokio::fs::remove_file(file).await, folder_missing).await
+    }
+
+    async fn drop_missing_subtitle_rows(&self, item_id: Uuid) -> Result<(), ServiceError> {
+        let streams = self
+            .media_streams
+            .get_media_streams(&MediaStreamQuery {
+                item_id,
+                ..MediaStreamQuery::default()
+            })
+            .await?;
+        let subtitle = media_stream_type_disc(ferrofin_model::entities::MediaStreamType::Subtitle);
+        let before = streams.len();
+        let mut kept = Vec::with_capacity(before);
+        for stream in streams {
+            // Only an absolute path that is surely gone: a URL row, or one
+            // whose file cannot be checked, stays.
+            let gone = match stream.path.as_deref() {
+                Some(path) if stream.is_external && stream.stream_type == subtitle => {
+                    Path::new(path).is_absolute()
+                        && matches!(tokio::fs::try_exists(path).await, Ok(false))
+                }
+                _ => false,
+            };
+            if !gone {
+                kept.push(stream);
+            }
+        }
+        if kept.len() == before {
+            return Ok(());
+        }
+        self.media_streams.save_media_streams(item_id, &kept).await
     }
 
     async fn get_supported_providers(
@@ -2123,6 +2157,116 @@ mod tests {
             .expect("remaining");
         let indexes: Vec<_> = remaining.iter().map(|s| s.stream_index).collect();
         assert_eq!(indexes, [2, 3]);
+    }
+
+    /// The stored indexes of every row, in order.
+    async fn indexes(repo: &FerrofinMediaStreamRepository, item: Uuid) -> Vec<i64> {
+        repo.get_media_streams(&MediaStreamQuery {
+            item_id: item,
+            ..MediaStreamQuery::default()
+        })
+        .await
+        .expect("rows")
+        .iter()
+        .map(|s| s.stream_index)
+        .collect()
+    }
+
+    /// gl-1875: only an external subtitle row whose absolute path is surely
+    /// gone is dropped; the rest keep their indexes. A URL or relative row, one
+    /// whose path cannot be checked, another kind of stream and an embedded row
+    /// stay.
+    #[tokio::test]
+    async fn drop_missing_subtitle_rows_drops_only_gone_subtitle_files() {
+        let db = test_db().await;
+        let item = Uuid::new_v4();
+        seed_item(&db, item, BaseItemKind::Movie).await;
+        let repo = FerrofinMediaStreamRepository::new(db.clone());
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let present = tmp.path().join("movie.eng.srt");
+        std::fs::write(&present, b"1\n").expect("write sidecar");
+        let gone = tmp.path().join("movie.fre.srt");
+        let gone = gone.to_str().unwrap();
+        repo.save_media_streams(
+            item,
+            &[
+                MediaStreamInfoEntity {
+                    stream_index: 0,
+                    stream_type: media_stream_type_disc(MediaStreamType::Video),
+                    ..Default::default()
+                },
+                subtitle_stream(1, true, Some(present.to_str().unwrap())),
+                subtitle_stream(2, true, Some(gone)),
+                subtitle_stream(3, true, Some("http://relay.invalid/remote.en.srt")),
+                subtitle_stream(4, true, Some("relative.en.srt")),
+                MediaStreamInfoEntity {
+                    stream_index: 5,
+                    stream_type: media_stream_type_disc(MediaStreamType::Audio),
+                    is_external: true,
+                    path: Some(
+                        tmp.path()
+                            .join("movie.fre.mka")
+                            .to_str()
+                            .unwrap()
+                            .to_owned(),
+                    ),
+                    ..Default::default()
+                },
+                subtitle_stream(6, false, None),
+                // A folder in the path is a file: `ENOTDIR`, not surely gone.
+                subtitle_stream(7, true, Some(present.join("x.srt").to_str().unwrap())),
+            ],
+        )
+        .await
+        .expect("save streams");
+
+        let mgr = manager(db, Vec::new());
+        mgr.drop_missing_subtitle_rows(item).await.expect("sweep");
+        assert_eq!(indexes(&repo, item).await, [0, 1, 3, 4, 5, 6, 7]);
+        mgr.drop_missing_subtitle_rows(item)
+            .await
+            .expect("sweep again");
+        assert_eq!(indexes(&repo, item).await, [0, 1, 3, 4, 5, 6, 7]);
+    }
+
+    /// gl-1875, with no refresh that probes between the steps: a second delete
+    /// by the index the client then reads finds its row, and each delete's
+    /// sweep leaves no row of a deleted file.
+    #[tokio::test]
+    async fn a_second_delete_by_index_follows_the_first() {
+        let db = test_db().await;
+        let item = Uuid::new_v4();
+        seed_item(&db, item, BaseItemKind::Movie).await;
+        let repo = FerrofinMediaStreamRepository::new(db.clone());
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let (eng, fre) = (tmp.path().join("m.eng.srt"), tmp.path().join("m.fre.srt"));
+        std::fs::write(&eng, b"1\n").expect("write eng");
+        std::fs::write(&fre, b"1\n").expect("write fre");
+        repo.save_media_streams(
+            item,
+            &[
+                MediaStreamInfoEntity {
+                    stream_index: 0,
+                    stream_type: media_stream_type_disc(MediaStreamType::Video),
+                    ..Default::default()
+                },
+                subtitle_stream(1, true, Some(eng.to_str().unwrap())),
+                subtitle_stream(2, true, Some(fre.to_str().unwrap())),
+            ],
+        )
+        .await
+        .expect("save streams");
+
+        let mgr = manager(db, Vec::new());
+        mgr.delete_subtitles(item, 1).await.expect("delete eng");
+        mgr.drop_missing_subtitle_rows(item).await.expect("sweep");
+        assert_eq!(indexes(&repo, item).await, [0, 2]);
+        mgr.delete_subtitles(item, 2)
+            .await
+            .expect("delete fre by its index");
+        mgr.drop_missing_subtitle_rows(item).await.expect("sweep");
+        assert_eq!(indexes(&repo, item).await, [0]);
+        assert!(!eng.exists() && !fre.exists());
     }
 
     /// gl-1723: `File.Delete` ignores a file that is already gone (the delete

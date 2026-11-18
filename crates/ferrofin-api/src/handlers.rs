@@ -5714,13 +5714,16 @@ pub const VERIFIED: &[Verified] = &[
                release/10.0, not measured on 12.4)) → \
                handlers.rs run_item_refresh (the awaited \
                item.RefreshMetadata, whose re-probe drops the stream and renumbers the rest; \
-               queued instead for an item outside every library, as for the lyrics delete). \
+               queued instead for an item outside every library, as for the lyrics delete) → \
+               subtitle_manager.rs drop_missing_subtitle_rows (the item's external subtitle \
+               rows whose absolute path is gone dropped, the rest kept with their indexes; \
+               nothing to drop after a refresh that probed). \
                The parity sweep's request (the corpus movie's stream 0, its video) expects \
                the 400. Measured on 12.4: an embedded, a \
                missing and a video stream's index, a nil id, an unknown id and an external \
                sidecar's index; and that sidecar's row pointed at a missing file (204), a \
                missing folder (404, row kept) and an http URL (404, row kept)",
-        date: "2026-11-15",
+        date: "2026-11-17",
         divergences: &[
             "A hex (0x, #, &h) or padded index is a 400; upstream's route binder reads it as \
          a number. Fix path: gl-1664.",
@@ -5736,6 +5739,14 @@ pub const VERIFIED: &[Verified] = &[
          resolves one against its working directory, so a relative row whose folder exists \
          there answers 204 and deletes the file it names beside the server process (gl-1723). \
          A Jellyfin bug, deliberately not ported.",
+            "After the refresh, the item's external subtitle rows whose absolute path is gone \
+         are dropped, the other rows keeping their indexes; upstream leaves every row to the \
+         refresh. The refresh rewrites the rows only when it probes the file, so on a server \
+         without ffprobe, or after a failed probe, the deleted subtitle stayed listed \
+         (gl-1875); the indexes keep the gap until a refresh that probes renumbers them. \
+         After a refresh that probed there is nothing to drop and the rows are upstream's. \
+         Upstream keeps the row after a failed probe (read in FFProbeVideoInfo.ProbeVideo, \
+         not measured): a Jellyfin bug, deliberately not ported.",
         ],
         refs: &["access-filtering"],
     },

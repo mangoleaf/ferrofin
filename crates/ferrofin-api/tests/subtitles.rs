@@ -417,6 +417,11 @@ type Logins = Arc<Mutex<Vec<(String, Vec<u8>)>>>;
 #[derive(Default)]
 struct CannedSubtitles {
     deleted: Arc<Mutex<Vec<(Uuid, i32)>>>,
+    /// Each `drop_missing_subtitle_rows` item, with whether a refresh of the
+    /// filed item ran after the delete and before the sweep.
+    swept: Arc<Mutex<Vec<(Uuid, bool)>>>,
+    /// The filed item's awaited refreshes counted at the last delete.
+    refreshes_at_delete: Mutex<usize>,
     logins: Logins,
     /// The decoded size of each upload that reached the manager.
     uploads: Arc<Mutex<Vec<usize>>>,
@@ -425,6 +430,16 @@ struct CannedSubtitles {
     /// When set, a download or an upload signals it has started, waits to be
     /// released, then succeeds and records itself.
     gate: Option<Arc<WriteGate>>,
+}
+
+/// The awaited refreshes of the filed item so far, in this process.
+fn filed_item_refreshes() -> usize {
+    AWAITED_REFRESHES
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|target| target.contains(FILED_ITEM_PATH))
+        .count()
 }
 
 /// Holds a [`CannedSubtitles`] write until the test releases it.
@@ -502,11 +517,17 @@ impl SubtitleManager for CannedSubtitles {
     /// `ArgumentException` upstream's lookup throws.
     async fn delete_subtitles(&self, item_id: Uuid, index: i32) -> Result<(), ServiceError> {
         self.deleted.lock().unwrap().push((item_id, index));
+        *self.refreshes_at_delete.lock().unwrap() = filed_item_refreshes();
         match index {
             1..=3 => Ok(()),
             4 => Err(ServiceError::not_found("subtitle folder not found")),
             _ => Err(ServiceError::invalid_input("no subtitle file at the index")),
         }
+    }
+    async fn drop_missing_subtitle_rows(&self, item_id: Uuid) -> Result<(), ServiceError> {
+        let refreshed = filed_item_refreshes() > *self.refreshes_at_delete.lock().unwrap();
+        self.swept.lock().unwrap().push((item_id, refreshed));
+        Ok(())
     }
     async fn get_supported_providers(
         &self,
@@ -794,12 +815,16 @@ async fn call_method(
 // ---- Subtitle deletion -----------------------------------------------------
 
 /// `DeleteSubtitle` awaits `DeleteSubtitles`, which deletes the file and then
-/// awaits the item's refresh (`item.RefreshMetadata`) before the `204`.
+/// awaits the item's refresh (`item.RefreshMetadata`) before the `204`. The
+/// rows of subtitle files gone from disk are dropped after the refresh, for
+/// one that cannot probe (gl-1875).
 #[tokio::test]
 async fn delete_subtitle_awaits_the_items_refresh_before_204() {
     let deleted = Arc::new(Mutex::new(Vec::new()));
+    let swept = Arc::new(Mutex::new(Vec::new()));
     let app = admin_state(Arc::new(CannedSubtitles {
         deleted: deleted.clone(),
+        swept: swept.clone(),
         ..CannedSubtitles::default()
     }));
     let (status, body, _) = call_method(
@@ -810,6 +835,11 @@ async fn delete_subtitle_awaits_the_items_refresh_before_204() {
     .await;
     assert_eq!(status, StatusCode::NO_CONTENT, "{body:?}");
     assert_eq!(*deleted.lock().unwrap(), [(FILED_ITEM_ID, 3)]);
+    assert_eq!(
+        *swept.lock().unwrap(),
+        [(FILED_ITEM_ID, true)],
+        "swept once, after the refresh"
+    );
     assert!(
         AWAITED_REFRESHES
             .lock()
@@ -861,8 +891,10 @@ async fn delete_subtitle_answers_upstreams_exception(
     #[case] expected: StatusCode,
 ) {
     let deleted = Arc::new(Mutex::new(Vec::new()));
+    let swept = Arc::new(Mutex::new(Vec::new()));
     let app = admin_state(Arc::new(CannedSubtitles {
         deleted: deleted.clone(),
+        swept: swept.clone(),
         ..CannedSubtitles::default()
     }));
     let (status, body, content_type) = call_method(
@@ -875,6 +907,10 @@ async fn delete_subtitle_answers_upstreams_exception(
     assert_eq!(content_type.as_deref(), Some("text/plain"));
     assert_eq!(body, b"Error processing request.");
     assert_eq!(deleted.lock().unwrap().is_empty(), !reaches_the_manager);
+    assert!(
+        swept.lock().unwrap().is_empty(),
+        "a failed delete sweeps nothing"
+    );
 }
 
 /// `DeleteSubtitle` writes a parameterless `NotFound()` for no item: ASP.NET's
