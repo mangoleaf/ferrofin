@@ -108,6 +108,15 @@ pub trait StorageProbe: Send + Sync {
     fn probe_all(&self, paths: &[String]) -> Vec<FolderStorageInfo> {
         paths.iter().map(|p| self.probe(p)).collect()
     }
+
+    /// The storage info the boot and restore floor judges
+    /// (`StorageHelper.TestDataDirectorySize`'s `new DriveInfo(path)`): on
+    /// Unix, the byte counts of the folder's own filesystem, which a
+    /// per-directory quota can make smaller than its drive's. The default
+    /// implementation is [`probe`](StorageProbe::probe).
+    fn probe_folder(&self, path: &str) -> FolderStorageInfo {
+        self.probe(path)
+    }
 }
 
 /// The default storage probe: reports the path with the free/used bytes and the
@@ -134,15 +143,17 @@ pub trait StorageProbe: Send + Sync {
 /// holding the folder, so folders that share a disk show the same one. There
 /// is deliberately **no** walk up to the nearest existing ancestor: in C# a
 /// path that does not exist makes `ResolvePath` throw and the catch arm reports
-/// `-1`. The byte counts are that drive's, as upstream's. One deliberate
-/// difference: a folder no listed drive contains reports its own filesystem's
-/// byte counts, with `StorageType` `Unknown` and no `DeviceId`, where
-/// upstream's `bestMatch is null` throw reports `-1`. That happens only where
-/// the mount table cannot be read (only `/proc/mounts` and `/etc/mtab` are
-/// read, which macOS lacks), a chroot hides `/`, or a Windows folder is a UNC
-/// path (`\\server\share`) no drive letter holds, and there the `-1` would
-/// also refuse every backup (`free_space_of`) and every boot
-/// (`test_common_paths_for_storage_capacity`).
+/// `-1`. The byte counts of [`probe`](StorageProbe::probe) and
+/// [`probe_all`](StorageProbe::probe_all) are that drive's, as upstream's; the
+/// boot and restore floor reads the folder's own instead, through
+/// [`probe_folder`](StorageProbe::probe_folder). One deliberate difference: a
+/// folder no listed drive contains reports its own filesystem's byte counts,
+/// with `StorageType` `Unknown` and no `DeviceId`, where upstream's
+/// `bestMatch is null` throw reports `-1`. That happens only where the mount
+/// table cannot be read (only `/proc/mounts` and `/etc/mtab` are read, which
+/// macOS lacks), a chroot hides `/`, or a Windows folder is a UNC path
+/// (`\\server\share`) no drive letter holds, and there the `-1` would also
+/// refuse every backup (`free_space_of`).
 #[derive(Debug, Clone, Copy, Default)]
 pub struct FsStorageProbe;
 
@@ -184,6 +195,24 @@ impl FsStorageProbe {
             device_id: mount.map(|m| m.target.clone()),
         }
     }
+
+    /// [`probe_with`](Self::probe_with), with the byte counts read on the
+    /// folder itself, as `new DriveInfo(path)` reads them on Unix
+    /// (`statvfs(path)`, no link resolution and no drive match), or `-1` when
+    /// that read fails. On Windows .NET reads the folder's drive-letter root;
+    /// `GetDiskFreeSpaceExW` on the folder answers the same for an ordinary
+    /// folder and the real volume for one mounted into a folder.
+    fn probe_folder_with(
+        mounts: &[crate::mount_table::MountEntry],
+        path: &str,
+    ) -> FolderStorageInfo {
+        let (free_space, used_space) = disk_usage(path).unwrap_or((-1, -1));
+        FolderStorageInfo {
+            free_space,
+            used_space,
+            ..Self::probe_with(mounts, path)
+        }
+    }
 }
 
 impl StorageProbe for FsStorageProbe {
@@ -194,6 +223,10 @@ impl StorageProbe for FsStorageProbe {
     fn probe_all(&self, paths: &[String]) -> Vec<FolderStorageInfo> {
         let mounts = crate::mount_table::read_mount_table();
         paths.iter().map(|p| Self::probe_with(&mounts, p)).collect()
+    }
+
+    fn probe_folder(&self, path: &str) -> FolderStorageInfo {
+        Self::probe_folder_with(&crate::mount_table::read_mount_table(), path)
     }
 }
 
@@ -280,7 +313,7 @@ fn test_data_directory_size(
         );
         return Ok(());
     };
-    let info = probe.probe(utf8);
+    let info = probe.probe_folder(utf8);
     if info.free_space < 0 {
         return Err(ServiceError::backend(format!(
             "The free space of the path `{}` cannot be read.",
@@ -1248,6 +1281,81 @@ mod tests {
                 cache.display()
             )
         );
+    }
+
+    /// A drive with room whose folder has none, as under a per-directory
+    /// quota: the drive (`probe`) reports `i64::MAX` free, the folder
+    /// (`probe_folder`) one byte.
+    struct QuotaProbe;
+    impl StorageProbe for QuotaProbe {
+        fn probe(&self, path: &str) -> FolderStorageInfo {
+            FolderStorageInfo {
+                path: path.to_owned(),
+                resolved_path: path.to_owned(),
+                free_space: i64::MAX,
+                ..Default::default()
+            }
+        }
+        fn probe_folder(&self, path: &str) -> FolderStorageInfo {
+            FolderStorageInfo {
+                free_space: 1,
+                ..self.probe(path)
+            }
+        }
+    }
+
+    /// The floor judges the folder's own free space (`new DriveInfo(path)`),
+    /// not its drive's (gl-1864).
+    #[test]
+    fn the_floor_reads_the_folders_free_space_not_its_drives() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let data = tmp.path().join("data");
+        let err = test_common_paths_for_storage_capacity(
+            &QuotaProbe,
+            &data,
+            &tmp.path().join("cache"),
+            tmp.path(),
+        )
+        .expect_err("the folder is short");
+        assert!(
+            err.to_string().starts_with(&format!(
+                "backend error: The path `{}` has insufficient free space.",
+                data.display()
+            )),
+            "{err}"
+        );
+    }
+
+    /// The real probe's floor reading takes the byte counts from the folder's
+    /// own filesystem even where the drive table matches another one: here
+    /// `/proc` (procfs, no blocks) under a table listing only `/`.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn fs_probe_folder_reads_the_folders_own_filesystem() {
+        use crate::mount_table::{DriveType, MountEntry};
+        if crate::mount_table::disk_space("/proc") != Some((0, 0)) {
+            eprintln!("skipped: /proc is not a procfs mount here");
+            return;
+        }
+        let root = [MountEntry {
+            target: "/".to_owned(),
+            drive_type: DriveType::Fixed,
+        }];
+        let drive = FsStorageProbe::probe_with(&root, "/proc");
+        assert!(drive.free_space + drive.used_space > 0, "{drive:?}");
+        let folder = FsStorageProbe::probe_folder_with(&root, "/proc");
+        assert_eq!((folder.free_space, folder.used_space), (0, 0));
+        assert_eq!(folder.storage_type.as_deref(), Some("Fixed"));
+        assert_eq!(folder.device_id.as_deref(), Some("/"));
+    }
+
+    /// A folder whose own free space cannot be read reports `-1`, which the
+    /// floor treats as unreadable.
+    #[cfg(unix)]
+    #[test]
+    fn fs_probe_folder_reports_minus_one_for_a_missing_folder() {
+        let info = FsStorageProbe::probe_folder_with(&[], "/nonexistent-ferrofin-probe-folder");
+        assert_eq!((info.free_space, info.used_space), (-1, -1));
     }
 
     /// Free space that cannot be read refuses the boot, as upstream's
