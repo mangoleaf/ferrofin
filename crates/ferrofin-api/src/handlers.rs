@@ -2859,7 +2859,8 @@ pub const VERIFIED: &[Verified] = &[
                    items_query_options, official_rating_score, resolve_name_filters, \
                    apply_media_stream_filter_rules, apply_location_types, apply_filters, \
                    check_parent_visibility (GetParentItem, IsVisible, and a UserView parent's \
-                   dispatch through user_view_browse_context), redirect_container_browse \
+                   UserViewBuilder through LibraryManager apply_user_view_builder, \
+                   ferrofin-core library_manager/user_view_builder.rs), redirect_container_browse \
                    (the BoxSet and Playlist re-root), list_playlists_folder_as_playlists, \
                    apply_library_browse_defaults (recursive ??= true for a typed library \
                    browse), apply_albums_by_artist_order, order_search_by_sort_name, the \

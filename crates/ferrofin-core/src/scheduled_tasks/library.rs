@@ -2526,6 +2526,13 @@ mod tests {
         ) -> Result<ferrofin_model::querying::QueryResult<BaseItemEntity>, ServiceError> {
             self.0.query_items(query).await
         }
+        async fn apply_user_view_builder(
+            &self,
+            query: &mut InternalItemsQuery,
+            view: &BaseItemEntity,
+        ) -> Result<(Option<BaseItemKind>, bool), ServiceError> {
+            self.0.apply_user_view_builder(query, view).await
+        }
         async fn get_item_ids(
             &self,
             query: &InternalItemsQuery,
