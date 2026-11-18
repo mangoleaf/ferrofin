@@ -3841,7 +3841,7 @@ pub const VERIFIED: &[Verified] = &[
                SchedulesDirect::get_lineups (ListingsManager.GetLineups, \
                XmlTvListingsProvider.GetLineups and GetXml, ExceptionMiddleware.GetStatusCode, \
                SchedulesDirect.GetHeadends)",
-        date: "2026-11-15",
+        date: "2026-11-17",
         divergences: &[
             "An XMLTV guide declaring an encoding name the WHATWG labels know but .NET's \
          encoding table does not (iso8859-9, iso88599, x-cp1254, …) is decoded by the \
@@ -3863,6 +3863,12 @@ pub const VERIFIED: &[Verified] = &[
          from a stale cached copy; upstream's GetXml dereferences the null Path before it \
          falls back to one (a NullReferenceException 500). With no copy cached both answer \
          500. Jellyfin bug not ported.",
+            "An XMLTV guide at a .gz or .gzip URL that its server sends with \
+         Content-Encoding: gzip, which the HTTP client decodes as upstream's \
+         AutomaticDecompression does, is read, as is any such URL whose body does not start \
+         with gzip's magic number; upstream's UnzipIfNeededAndCopy runs GZipStream over \
+         those bytes, logs the failure and then fails the download as empty, so the guide \
+         is not read, or stays stale where an older copy is cached. Jellyfin bug not ported.",
             "The 400 (an empty Path) and 404 (a blank id, no such provider, or a \
          local XMLTV file or directory that is not there) bodies are Ferrofin's error shape, \
          not upstream's. Fix path: gl-666.",
@@ -4069,7 +4075,7 @@ pub const VERIFIED: &[Verified] = &[
                directory that is not there is a 404 (fetch.rs missing_file_is_not_found, \
                FileNotFoundException and DirectoryNotFoundException), an empty Path a 400 \
                (ArgumentException)",
-        date: "2026-11-15",
+        date: "2026-11-17",
         divergences: &[
             "An absent providerId, or one that names no listings provider, is a 404; \
          upstream's .First(...) throws InvalidOperationException, a 500. Jellyfin bug not \
@@ -4095,6 +4101,12 @@ pub const VERIFIED: &[Verified] = &[
          from a stale cached copy; upstream's GetXml dereferences the null Path before it \
          falls back to one (a NullReferenceException 500). With no copy cached both answer \
          500. Jellyfin bug not ported.",
+            "An XMLTV guide at a .gz or .gzip URL that its server sends with \
+         Content-Encoding: gzip, which the HTTP client decodes as upstream's \
+         AutomaticDecompression does, is read, as is any such URL whose body does not start \
+         with gzip's magic number; upstream's UnzipIfNeededAndCopy runs GZipStream over \
+         those bytes, logs the failure and then fails the download as empty, so the guide \
+         is not read, or stays stale where an older copy is cached. Jellyfin bug not ported.",
             "The 400 (an empty Path), 404 (no such provider, an unknown provider \
          Type, or a local XMLTV file or directory that is not there) and 500 (a guide that \
          cannot be read) bodies are Ferrofin's error shape, not upstream's. Fix path: gl-666.",
@@ -4120,7 +4132,7 @@ pub const VERIFIED: &[Verified] = &[
                XMLTV file or directory that is not there, with no copy cached, is a 404 after \
                the pair is stored and before the refresh is queued, as upstream's \
                FileNotFoundException is",
-        date: "2026-11-15",
+        date: "2026-11-17",
         divergences: &[
             "A ProviderId that names no listings provider is a 404 before anything is stored, \
          and a TunerChannelId no tuner channel has is a 404 after the pair is stored; \
@@ -4145,6 +4157,12 @@ pub const VERIFIED: &[Verified] = &[
             "A ChannelMappings saved as null reads as the empty list; upstream keeps the null \
          until a restart, and its .Any(...) throws ArgumentNullException before anything is \
          stored (a 400). Jellyfin bug not ported.",
+            "An XMLTV guide at a .gz or .gzip URL that its server sends with \
+         Content-Encoding: gzip, which the HTTP client decodes as upstream's \
+         AutomaticDecompression does, is read, as is any such URL whose body does not start \
+         with gzip's magic number; upstream's UnzipIfNeededAndCopy runs GZipStream over \
+         those bytes, logs the failure and then fails the download as empty, so the guide \
+         is not read, or stays stale where an older copy is cached. Jellyfin bug not ported.",
             "The 400 (a body that does not bind, or an empty Path), 404 and 500 (a \
          guide that cannot be read) bodies are Ferrofin's error shape, not upstream's. Fix \
          path: gl-666.",
