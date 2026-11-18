@@ -11,6 +11,7 @@
 
 use std::io::{Read as _, Write as _};
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use ferrofin_core::item_type_lookup::ItemTypeLookup;
@@ -246,7 +247,8 @@ async fn a_series_folder_with_a_bare_year_searches_tmdb_by_its_parsed_name() {
 }
 
 /// A movie and a series whose IMDb id (here from the folder name) TMDb's
-/// `/find` cannot resolve, its request failing: the movie gets no TMDb
+/// `/find` cannot resolve, answering 404 (`TMDbLib`'s `null`, not a
+/// failure, under `ThrowApiExceptions = false`): the movie gets no TMDb
 /// metadata and no name search (`TmdbMovieProvider.GetMetadata` searches only
 /// without an IMDb id, `TmdbMovieProvider.cs:160,178-190`), while the series
 /// goes on to its name search (`TmdbSeriesProvider.cs:178-213`).
@@ -302,6 +304,140 @@ async fn an_imdb_id_tmdb_cannot_resolve_stops_only_a_movies_name_search(
         "{asked:?}"
     );
     assert_eq!(ids_of(&db, &media.join(item)).await, ids);
+}
+
+/// Whether the item at `path` has its `DateLastRefreshed` stamp.
+async fn refreshed(db: &Database, path: &Path) -> bool {
+    sqlx::query_scalar(
+        r#"SELECT "DateLastRefreshed" IS NOT NULL FROM "BaseItems" WHERE "Path" = ?1"#,
+    )
+    .bind(path.to_string_lossy().into_owned())
+    .fetch_one(db.pool())
+    .await
+    .expect("stamp")
+}
+
+/// `/find` answers with no title; anything else as [`tmdb_movie`].
+fn tmdb_find_empty(line: &str) -> (&'static str, String) {
+    if line.contains("/find/") {
+        (
+            "200 OK",
+            r#"{"movie_results": [], "tv_results": []}"#.to_owned(),
+        )
+    } else {
+        tmdb_movie(line)
+    }
+}
+
+/// Whether [`tmdb_find_recovers`]' `/find` answers yet.
+static FIND_ANSWERS: AtomicBool = AtomicBool::new(false);
+
+/// `/find` fails (500) until [`FIND_ANSWERS`] is set, then resolves to the
+/// exact title, `/movie/20`, which `/search/movie` would also match by name.
+fn tmdb_find_recovers(line: &str) -> (&'static str, String) {
+    if !line.contains("/find/") {
+        tmdb_movie(line)
+    } else if FIND_ANSWERS.load(Ordering::SeqCst) {
+        (
+            "200 OK",
+            r#"{"movie_results": [{"id": 20}], "tv_results": []}"#.to_owned(),
+        )
+    } else {
+        ("500 Internal Server Error", "{}".to_owned())
+    }
+}
+
+/// A movie whose IMDb id TMDb's `/find` answers with no title is not searched
+/// by name, and the refresh is stamped: an empty answer is not a failure
+/// (`TmdbMovieProvider.cs:178-190` returns an empty result).
+#[tokio::test]
+async fn a_movie_imdb_id_tmdb_finds_nothing_for_is_stamped_unmatched() {
+    let tmp = tempfile::tempdir().expect("tmp");
+    let media = tmp.path().join("movies");
+    let file = "Split (2016) [imdbid-tt0000404]/Split (2016).mkv";
+    touch(&media, file);
+    let (db, scanner) = library(tmp.path(), &media, CollectionTypeOptions::movies).await;
+    let (base, requests) = spawn(tmdb_find_empty);
+
+    scanner
+        .with_metadata(
+            Arc::new(TmdbClient::new().with_base_url(&base)),
+            tmp.path().join("metadata"),
+        )
+        .scan_all()
+        .await
+        .expect("scan");
+
+    let asked = requests.lock().expect("log").clone();
+    assert!(
+        asked.iter().any(|l| l.contains("/find/tt0000404")),
+        "{asked:?}"
+    );
+    assert!(asked.iter().all(|l| !l.contains("/search/")), "{asked:?}");
+    let path = media.join(file);
+    assert_eq!(ids_of(&db, &path).await, ["Imdb=tt0000404"]);
+    assert!(refreshed(&db, &path).await, "no provider failed");
+}
+
+/// A movie whose `/find` request fails (a 500 through every retry) is not
+/// searched by name either, but the failure is reported: the refresh is not
+/// stamped, so the next scan asks `/find` again and matches it then.
+/// Upstream's `FindByExternalIdAsync` throws for a 5xx (`TMDbLib`'s
+/// `GeneralHttpException`; only a 404 is `null`), out of
+/// `TmdbMovieProvider.GetMetadata`; `ExecuteRemoteProviders` counts it
+/// (`Failures++`, `MetadataService.cs:1017-1021`), and `RefreshMetadata`
+/// leaves `DateLastRefreshed` unset (`:188-190`, `:221-223`).
+#[tokio::test]
+async fn a_failed_tmdb_find_is_asked_again_by_the_next_scan_not_searched_by_name() {
+    // Every retry of the 500 is still sent; the limiter's own suite tests
+    // the backoff between them.
+    ferrofin_providers::rate_limit::test_support::skip_backoff();
+    let tmp = tempfile::tempdir().expect("tmp");
+    let media = tmp.path().join("movies");
+    let file = "Split (2016) [imdbid-tt0000500]/Split (2016).mkv";
+    touch(&media, file);
+    let (db, scanner) = library(tmp.path(), &media, CollectionTypeOptions::movies).await;
+    let (base, requests) = spawn(tmdb_find_recovers);
+    // TMDb's image provider asks `/find` too, and its failure would keep the
+    // refresh unstamped on its own: off, so the stamp is the metadata
+    // provider's.
+    let scanner = scanner
+        .with_metadata(
+            Arc::new(TmdbClient::new().with_base_url(&base)),
+            tmp.path().join("metadata"),
+        )
+        .with_metadata_options(|| {
+            vec![ferrofin_model::configuration::MetadataOptions {
+                item_type: Some("Movie".to_owned()),
+                disabled_image_fetchers: vec!["TheMovieDb".to_owned()],
+                ..Default::default()
+            }]
+        });
+    let path = media.join(file);
+
+    scanner.scan_all().await.expect("scan");
+    let asked = std::mem::take(&mut *requests.lock().expect("log"));
+    assert!(
+        asked.iter().any(|l| l.contains("/find/tt0000500")),
+        "{asked:?}"
+    );
+    assert!(asked.iter().all(|l| !l.contains("/search/")), "{asked:?}");
+    assert_eq!(ids_of(&db, &path).await, ["Imdb=tt0000500"]);
+    assert!(
+        !refreshed(&db, &path).await,
+        "the failure leaves it unstamped"
+    );
+
+    FIND_ANSWERS.store(true, Ordering::SeqCst);
+    scanner.scan_all().await.expect("second scan");
+    let asked = requests.lock().expect("log").clone();
+    assert!(
+        asked.iter().any(|l| l.contains("/find/tt0000500")),
+        "{asked:?}"
+    );
+    assert!(asked.iter().all(|l| !l.contains("/search/")), "{asked:?}");
+    assert_eq!(ids_of(&db, &path).await, ["Imdb=tt0000500", "Tmdb=20"]);
+    assert!(refreshed(&db, &path).await);
 }
 
 /// OMDb's exact-title lookup answers only `t=Ocean's Eleven&y=2001`.
