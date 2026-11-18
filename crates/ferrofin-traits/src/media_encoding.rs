@@ -462,7 +462,8 @@ pub trait TranscodeManager: Send + Sync {
     /// Returns once the jobs are stopped and their partial files deleted,
     /// which `DeletePartialStreamFiles` first waits 1.5 s for and retries for
     /// up to about 6 s. The deletions run on tasks of their own, so a caller
-    /// that stops waiting does not cut them off.
+    /// that stops waiting does not cut them off. Files a job started on the
+    /// same output meanwhile owns are left to it (gl-1876).
     async fn kill_transcoding_jobs(
         &self,
         device_id: &str,
@@ -1020,8 +1021,9 @@ pub trait HlsStreamManager: Send + Sync {
     ) -> Result<ServedFile, ServiceError>;
 
     /// Stops the active encoding(s) for `request`'s device / play session,
-    /// deleting their partial files once it has returned: upstream does not
-    /// await `KillTranscodingJobs` here.
+    /// deleting their partial files once it has returned (unless a job takes
+    /// the output meanwhile, gl-1876): upstream does not await
+    /// `KillTranscodingJobs` here.
     ///
     /// Port of `HlsSegmentController.StopEncodingProcess` → `KillTranscodingJobs`.
     /// Only [`device_id`](HlsStreamRequest::device_id) and
@@ -1033,7 +1035,8 @@ pub trait HlsStreamManager: Send + Sync {
     async fn stop_encoding(&self, request: &HlsStreamRequest) -> Result<(), ServiceError>;
 
     /// [`Self::stop_encoding`], returning only once the partial files are
-    /// deleted too, as the playback-stop reports await `KillTranscodingJobs`
+    /// deleted too (unless a job takes the output meanwhile, gl-1876), as the
+    /// playback-stop reports await `KillTranscodingJobs`
     /// (see [`TranscodeManager::kill_transcoding_jobs`]).
     ///
     /// The default is [`Self::stop_encoding`], for a manager whose stop leaves

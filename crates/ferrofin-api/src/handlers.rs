@@ -6064,9 +6064,15 @@ pub const VERIFIED: &[Verified] = &[
                TranscodingJob.Stop, the live stream left open), then on a task of its own \
                delete_partial_stream_files and FsFileCleaner (DeletePartialStreamFiles and \
                DeleteHlsPartialStreamFiles: 1500 ms before the first of at most ten attempts, \
-               500 ms before each retry, which only an IOException earns)",
-        date: "2026-11-11",
+               500 ms before each retry, which only an IOException earns); here, unlike \
+               upstream, an attempt is skipped once a registered job has the output path",
+        date: "2026-11-17",
         divergences: &[
+            "A job started on the stopped job's output path while the deletion waits (the same \
+         stream asked for again) keeps its files: the deletion ends at the first attempt that \
+         finds it registered, and the job's own deletion takes them when it is stopped, else \
+         the transcode-directory cleanup. Upstream deletes them, the new job's playlist and \
+         segments with them. Jellyfin bug not ported (gl-1876).",
             "A killed progressive job's files go by the HLS rule, every file in its directory \
          whose name holds its stem, so its trimmed subtitle copy goes with its output; \
          upstream deletes the output file alone and makes no such copy.",
@@ -6934,6 +6940,9 @@ const PLAYBACK_STOP_DIVERGENCES: &[&str] = &[
      deleted item. Jellyfin bug not ported.",
     "The 400 bodies (a negative position, a body or query member that does not bind) are \
      Ferrofin's error shape. Fix path: gl-666.",
+    "A job started on a stopped job's output path while that job's partial-file deletion \
+     waits keeps its files, as on DELETE /Videos/ActiveEncodings; upstream deletes them. \
+     Jellyfin bug not ported (gl-1876).",
 ];
 
 /// Where a session's `NowPlayingItem` is built (owner decision 2026-11-04,
