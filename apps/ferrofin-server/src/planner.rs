@@ -742,6 +742,9 @@ impl StreamStatePlanner for FerrofinStreamStatePlanner {
     ) -> Result<TranscodePlan, ServiceError> {
         // ---- (1) RESOLVE MEDIA SOURCE (GetStreamingState) -------------------
         let media_source = self.resolve_media_source(request).await?;
+        // `AttachMediaSourceInfo`'s `InputContainer`: the probed container;
+        // the source's own is the file's extension (gl-1861).
+        let input_container = self.media_sources.input_container(&media_source).await?;
         // `StreamingHelpers.GetStreamingState`, live branch: "cap the max
         // bitrate when it is too high. This is usually due to ffmpeg is unable
         // to probe the source liveTV streams' bitrate." A client asking for its
@@ -1037,7 +1040,7 @@ impl StreamStatePlanner for FerrofinStreamStatePlanner {
             output_audio_channels: None,
             output_container: Some(state_output_container),
             output_file_path: String::new(),
-            input_container: media_source.container.clone(),
+            input_container,
             is_input_video,
             subtitle_delivery_method,
             trimmed_subtitle_path: None,
@@ -2968,6 +2971,17 @@ mod tests {
         }
         async fn close_live_stream(&self, _id: &str) -> Result<(), ServiceError> {
             Ok(())
+        }
+        /// The fake probe: `/media/clip.ogv` holds Ogg; any other source is
+        /// read as its own container.
+        async fn input_container(
+            &self,
+            source: &MediaSourceInfo,
+        ) -> Result<Option<String>, ServiceError> {
+            Ok(match source.path.as_deref() {
+                Some("/media/clip.ogv") => Some("ogg".to_owned()),
+                _ => source.container.clone(),
+            })
         }
     }
 
@@ -8305,6 +8319,29 @@ mod tests {
             "{:?}",
             software.arguments
         );
+    }
+
+    /// The input format names the container the probe found
+    /// (`InputContainer = mediaSource.Container`, the probed one upstream),
+    /// not the file's extension: an `.ogv` file is read as Ogg, where `-f ogv`
+    /// names no demuxer and ffmpeg refuses the input (gl-1861).
+    #[tokio::test]
+    async fn a_hardware_job_names_the_probed_input_format() {
+        let mut ogv = source(
+            "abc",
+            vec![nvdec_decodable_video_stream(), audio_stream("aac")],
+        );
+        ogv.path = Some("/media/clip.ogv".to_owned());
+        ogv.container = Some("ogv".to_owned());
+        let mut transcode = request("abc");
+        transcode.video_codec = Some("h264".to_owned());
+        transcode.allow_video_stream_copy = false;
+        let plan = nvenc_planner(vec![ogv])
+            .plan(&transcode, false, None, PlaylistKind::Vod)
+            .await
+            .unwrap();
+        let args = plan.arguments.join(" ");
+        assert!(args.contains(" -f ogg -i file:/media/clip.ogv"), "{args}");
     }
 
     /// This machine's actual ffmpeg n9.0.1: the CUDA filters are present but

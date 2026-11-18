@@ -2889,6 +2889,21 @@ pub trait MediaSourceManager: Send + Sync {
         chosen.ok_or_else(|| ServiceError::NotFound(format!("no media source for item {item_id}")))
     }
 
+    /// The container ffmpeg is told `source` holds: upstream's
+    /// `EncodingJobInfo.InputContainer`, copied from `MediaSourceInfo.Container`,
+    /// which upstream fills with the item's probed container
+    /// (`BaseItem.Container`), the path's extension only when none was stored
+    /// (`BaseItem.GetVersionInfo`). Ferrofin's sources report the extension,
+    /// so a transcode asks here. This default answers the source's own
+    /// container. Fix path: gl-1877; once a source reports the probed
+    /// container, every implementation answers the source's own.
+    async fn input_container(
+        &self,
+        source: &MediaSourceInfo,
+    ) -> Result<Option<String>, ServiceError> {
+        Ok(source.container.clone())
+    }
+
     /// The media source a playback report names: the open live stream
     /// `live_stream_id` names when it is non-empty, else the source of `item`
     /// (a row the caller has read) whose id is `media_source_id`, or `None`

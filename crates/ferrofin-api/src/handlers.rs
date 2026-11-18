@@ -2035,13 +2035,18 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
                    transcoding/segment_cleaner.rs \
                    input_sync_arguments, input_rate_arguments and input_source_arguments \
                    (GetInputModifier's -async and -vsync from AttachMediaSourceInfo's \
-                   InputAudioSync and InputVideoSync, a wma or asf container's audio sync \
+                   InputAudioSync and InputVideoSync, a wma, asf or local wtv container's \
                    among them, -re, -readrate and -readrate_catchup, an RTSP input's \
                    -rtsp_transport tcp+udp -rtsp_flags prefer_tcp, one -fflags joining \
                    +igndts, +ignidx and +genpts (GenPtsInput or a copied video), a video \
                    request's -f with its container's input format from \
                    encoding_helper/helper.rs input_format (GetInputFormat) while any \
-                   hardware acceleration type but none is configured, upstream's \
+                   hardware acceleration type but none is configured, the container for \
+                   both being the job's input container from ferrofin-core \
+                   media_source_manager.rs input_container (AttachMediaSourceInfo reads \
+                   MediaSource.Container, which BaseItem.GetVersionInfo fills with the \
+                   item's probed Container and the path's extension only when none was \
+                   stored; an open live stream's own), upstream's \
                    never-assigned EncodingJobInfo.VideoType reading VideoFile for every job \
                    (a disc rip's -f concat comes later and wins), and the \
                    looping reconnect options) over \
@@ -2078,7 +2083,7 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
                    encoder and its arguments, gl-1765; the audio arguments, gl-1767; and the \
                    output and HLS muxer arguments, the -copyts of upstream's HLS command line \
                    among them, gl-1768",
-        date: "2026-11-16",
+        date: "2026-11-17",
         divergences: &[
             "The -f input format reads IsVideoRequest as is_input_video, the item's media \
              type, as the hardware device arguments do, so an audio-route request for a video \
