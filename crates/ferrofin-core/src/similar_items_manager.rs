@@ -14,12 +14,13 @@
 //! orders by recommendation type. With no user or empty history it returns nothing,
 //! matching C# (every category query is user-scoped).
 //!
-//! The weighted path runs in two phases, as C# `MovieSimilarItemsProvider`
+//! The weighted path runs in three phases, as C# `MovieSimilarItemsProvider`
 //! does: the score pass above, then **one** `InternalItemsQuery` over the scored
 //! ids carrying that provider's filter set (movie kinds — plus
 //! `Trailer`/`LiveTvProgram` when `EnableExternalContentInSuggestions` —
 //! `IsMovie`, unplayed only) and the user's library access, so the watch-state
-//! and access rules are the query layer's, not a second copy. A kind C# has no
+//! and access rules are the query layer's, not a second copy, and finally the
+//! best-scoring row of each presentation key. A kind C# has no
 //! local provider for scores nothing, and the controller's `Episode` / by-name
 //! short-circuit lives in [`SimilarItemsManager::get_similar_items`].
 //!
@@ -497,6 +498,58 @@ impl LocalFilter {
     }
 }
 
+/// Phase 2 of C# `GetBatchSimilarItemsAsync`: the one filter query over the
+/// scored `ids` — the provider's kinds, `IsMovie`, `IsPlayed`, the
+/// `ExcludeArtistIds` it honours; the caller adds the user's access.
+///
+/// Never grouped by presentation key: upstream builds it with
+/// `PrepareFilterQuery`, `PrepareItemQuery` and `TranslateQuery` alone, without
+/// `ApplyGroupingFilter`, so every accessible candidate comes back and phase 3
+/// ([`best_scoring_per_key`]) picks each key's row by score.
+fn score_filter_query(
+    ids: Vec<Uuid>,
+    filter: &LocalFilter,
+    exclude_artist_ids: &[Uuid],
+) -> InternalItemsQuery {
+    InternalItemsQuery {
+        item_ids: ids,
+        include_item_types: filter.include_item_types.clone(),
+        is_movie: filter.is_movie,
+        is_played: filter.unplayed_only.then_some(false),
+        exclude_artist_ids: if filter.honours_exclude_artist_ids {
+            exclude_artist_ids.to_vec()
+        } else {
+            Vec::new()
+        },
+        group_by_presentation_unique_key: false,
+        ..InternalItemsQuery::default()
+    }
+}
+
+/// Phase 3 of C# `GetBatchSimilarItemsAsync`: the `scored` rows the filter
+/// query kept (`accessible`), by score with a primary ahead of the versions it
+/// ties with (`OrderByDescending(score).ThenBy(x => x.PrimaryVersionId.HasValue)`),
+/// then the first row per raw presentation key (`DistinctBy(x =>
+/// x.PresentationUniqueKey)`), every keyless row sharing the one `null` key.
+fn best_scoring_per_key(
+    scored: Vec<(BaseItemEntity, i64)>,
+    accessible: &std::collections::HashSet<Uuid>,
+) -> Vec<BaseItemEntity> {
+    let mut kept: Vec<_> = scored
+        .into_iter()
+        .filter(|(c, _)| Uuid::parse_str(&c.id).is_ok_and(|id| accessible.contains(&id)))
+        .collect();
+    // Stable: the score pass already broke ties by `Id` (the owner's tie rule
+    // of 2026-10-24: upstream's unordered filter query returns ascending ids in
+    // practice), so this only moves a primary forward.
+    kept.sort_by_key(|(c, score)| (std::cmp::Reverse(*score), c.primary_version_id.is_some()));
+    let mut keys = std::collections::HashSet::new();
+    kept.into_iter()
+        .filter(|(c, _)| keys.insert(c.presentation_unique_key.clone()))
+        .map(|(c, _)| c)
+        .collect()
+}
+
 /// Recently-played movies sampled to seed the "similar to recently played"
 /// categories (C# `GetMovieRecommendationsAsync`: `Limit = 7`). The query is
 /// grouped by metadata key, so the repository reads 4 more rows.
@@ -812,10 +865,11 @@ impl FerrofinSimilarItemsManager {
     }
 
     /// The local provider's results for `seed`, in score order, over-sampled
-    /// for `wanted`: the score pass, then ONE access/played query over the
-    /// scored ids (C# phases 1–2 of `GetBatchSimilarItemsAsync`). The caller
-    /// takes its fill after the presentation-key de-dup, as C# `DistinctBy`
-    /// runs before `Take(limit)`.
+    /// for `wanted`: the score pass, ONE access/played query over the scored
+    /// ids, then one row per presentation key (C# phases 1–3 of
+    /// `GetBatchSimilarItemsAsync`; see [`score_filter_query`] and
+    /// [`best_scoring_per_key`]). The caller takes its fill after its own
+    /// id-and-key claim.
     ///
     /// `exclude_ids` is handed to the score pass, so its limit yields that
     /// many *new* rows; the filter pass carries `ExcludeArtistIds` (for the
@@ -845,7 +899,7 @@ impl FerrofinSimilarItemsManager {
             .copied()
             .filter_map(stored_type_name)
             .collect();
-        let mut candidates = self
+        let scored = self
             .repo
             .weighted_similar_items(
                 request.seed_id,
@@ -854,25 +908,15 @@ impl FerrofinSimilarItemsManager {
                 wanted.saturating_mul(CANDIDATE_OVERSAMPLE),
             )
             .await?;
-        if candidates.is_empty() {
-            return Ok(candidates);
+        if scored.is_empty() {
+            return Ok(Vec::new());
         }
 
-        let mut access = InternalItemsQuery {
-            item_ids: candidates
-                .iter()
-                .filter_map(|c| Uuid::parse_str(&c.id).ok())
-                .collect(),
-            include_item_types: filter.include_item_types.clone(),
-            is_movie: filter.is_movie,
-            is_played: filter.unplayed_only.then_some(false),
-            exclude_artist_ids: if filter.honours_exclude_artist_ids {
-                request.exclude_artist_ids.to_vec()
-            } else {
-                Vec::new()
-            },
-            ..InternalItemsQuery::default()
-        };
+        let ids = scored
+            .iter()
+            .filter_map(|(c, _)| Uuid::parse_str(&c.id).ok())
+            .collect();
+        let mut access = score_filter_query(ids, &filter, request.exclude_artist_ids);
         if let Some(user) = request.user
             && !user.scope(&mut access)
         {
@@ -884,10 +928,7 @@ impl FerrofinSimilarItemsManager {
             .await?
             .into_iter()
             .collect();
-        // Phase 3: the filter says which survive; the score pass says in
-        // what order.
-        candidates.retain(|c| Uuid::parse_str(&c.id).is_ok_and(|id| accessible.contains(&id)));
-        Ok(candidates)
+        Ok(best_scoring_per_key(scored, &accessible))
     }
 
     /// Runs the local provider and appends its results at `provider_order`,
@@ -1245,7 +1286,9 @@ impl FerrofinSimilarItemsManager {
             if items.len() >= item_limit_len {
                 break;
             }
-            // C# `DistinctBy(PresentationUniqueKey)`: one row per film.
+            // `local_similar` already kept one row per raw key (C#
+            // `DistinctBy(PresentationUniqueKey)`); the claim also leaves out
+            // the baseline's own key and a key differing only in case.
             if let Ok(id) = Uuid::parse_str(&entity.id)
                 && claimed.claim(id, &entity)
             {
@@ -2851,6 +2894,180 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn the_best_scoring_row_represents_its_presentation_key() {
+        // C# `GetBatchSimilarItemsAsync` filters its candidates through
+        // `TranslateQuery` alone (no `ApplyGroupingFilter`), then orders them by
+        // score and keeps the first row per raw `PresentationUniqueKey`
+        // (`DistinctBy`), every keyless row sharing the one `null` key. So each
+        // key is represented by its best-scoring row, not by its primary or
+        // lowest-id one, and only the best-scoring keyless row survives.
+        let db = test_db().await;
+        let user = seed_user(&db, Uuid::from_u128(0xE00)).await;
+        grant_all_folders(&db, &user).await;
+        let user_id = Uuid::parse_str(&user.id).expect("user id");
+        let seed = Uuid::from_u128(0xE01);
+        let copy_sd = Uuid::from_u128(0xE02);
+        let copy_uhd = Uuid::from_u128(0xE03);
+        let keyless_sd = Uuid::from_u128(0xE04);
+        let keyless_uhd = Uuid::from_u128(0xE05);
+        seed_movie(&db, seed, "Seed", "SciFi|Drama").await;
+        credit_person(&db, seed, "Dee Director", "Director").await;
+        // Scores: Film 4K 70 (two genres and the director), Keyless 4K 20, and
+        // 10 for the two lower-id rows, which the old grouping kept instead.
+        seed_movie(&db, copy_sd, "Film SD", "SciFi").await;
+        seed_movie(&db, copy_uhd, "Film 4K", "SciFi|Drama").await;
+        credit_person(&db, copy_uhd, "Dee Director", "Director").await;
+        seed_movie(&db, keyless_sd, "Keyless SD", "SciFi").await;
+        seed_movie(&db, keyless_uhd, "Keyless 4K", "SciFi|Drama").await;
+        // The recently-played lookup below is confined to the user's libraries.
+        // That save writes the keys back, so they are stamped after it.
+        crate::test_support::seed_library_over(
+            &db,
+            &[seed, copy_sd, copy_uhd, keyless_sd, keyless_uhd],
+        )
+        .await;
+        for id in [copy_sd, copy_uhd] {
+            crate::item_persistence_service::seed_presentation_key(&db, id, "film-x").await;
+        }
+        for id in [keyless_sd, keyless_uhd] {
+            crate::similar_items_repository::test_hooks::clear_presentation_key(&db, id).await;
+        }
+
+        let rows = manager(&db)
+            .get_similar_items(seed, &[], Some(user_id), &DtoOptions::default(), None)
+            .await
+            .expect("similar")
+            .expect("seed resolves");
+        assert_eq!(names(&rows), ["Film 4K", "Keyless 4K"]);
+
+        // A "similar to recently played" category scores through the same
+        // provider, so it picks the same rows.
+        seed_user_data(&db, user_id, seed, true, None).await;
+        let recs = manager(&db)
+            .get_movie_recommendations(Some(user_id), Uuid::nil(), 6, 8, &DtoOptions::default())
+            .await
+            .expect("recommendations");
+        let played = recs
+            .iter()
+            .find(|r| r.recommendation_type == RecommendationType::SimilarToRecentlyPlayed)
+            .expect("a recently-played category");
+        assert_eq!(names(&played.items), ["Film 4K", "Keyless 4K"]);
+    }
+
+    #[tokio::test]
+    async fn the_score_filter_query_seeks_its_candidates_by_id_ungrouped() {
+        // The phase-2 filter query a user's movie seed runs. Ungrouped, it
+        // reads each scored id through the `BaseItems` primary key and builds
+        // no GROUP BY over presentation keys.
+        let db = test_db().await;
+        let user = seed_user(&db, Uuid::from_u128(0xE20)).await;
+        grant_all_folders(&db, &user).await;
+        let mgr = manager(&db);
+        let filter = mgr
+            .local_filter(&BaseItemEntity::default(), BaseItemKind::Movie)
+            .await;
+        let access = mgr.access_of(Arc::new(user)).await.expect("access");
+        let mut query = score_filter_query(
+            vec![Uuid::from_u128(0xE21), Uuid::from_u128(0xE22)],
+            &filter,
+            &[],
+        );
+        assert!(access.scope(&mut query));
+        let plan = crate::latest_tv_repository::explain(
+            &db,
+            crate::translate_query::build_query(
+                &query,
+                crate::translate_query::QueryShape::IdsOnly,
+            ),
+        )
+        .await;
+        assert!(
+            plan.contains("SEARCH bi USING INDEX sqlite_autoindex_BaseItems_1 (Id=?)"),
+            "{plan}"
+        );
+        assert!(!plan.contains("GROUP BY"), "{plan}");
+        assert!(!plan.contains("SCAN"), "{plan}");
+    }
+
+    #[test]
+    fn phase_three_keys_on_the_raw_presentation_key() {
+        // `DistinctBy(x => x.PresentationUniqueKey)` compares the stored string:
+        // `null` and `""` are two keys, and so are keys differing only in case
+        // (the manager's claim folds case afterwards).
+        let row = |id: u128, key: Option<&str>| {
+            (
+                BaseItemEntity {
+                    id: ferrofin_db::store::guid_to_db(Uuid::from_u128(id)),
+                    presentation_unique_key: key.map(str::to_owned),
+                    ..BaseItemEntity::default()
+                },
+                10,
+            )
+        };
+        let scored = vec![
+            row(1, None),
+            row(2, Some("")),
+            row(3, Some("film")),
+            row(4, Some("FILM")),
+            row(5, None),
+            row(6, Some("film")),
+        ];
+        let accessible = (1..=6).map(Uuid::from_u128).collect();
+        let kept: Vec<_> = best_scoring_per_key(scored, &accessible)
+            .into_iter()
+            .map(|row| row.id)
+            .collect();
+        let expected: Vec<_> = [1, 2, 3, 4]
+            .into_iter()
+            .map(|id| ferrofin_db::store::guid_to_db(Uuid::from_u128(id)))
+            .collect();
+        assert_eq!(kept, expected);
+    }
+
+    #[tokio::test]
+    async fn a_primary_represents_its_key_on_a_tied_score() {
+        // C# phase 3: `OrderByDescending(score).ThenBy(x =>
+        // x.PrimaryVersionId.HasValue)` before `DistinctBy`, so of two
+        // versions that score the same the primary represents the film, even
+        // when the alternate (in another library, so not hidden) has the lower id.
+        let db = test_db().await;
+        let user = seed_user(&db, Uuid::from_u128(0xE10)).await;
+        grant_all_folders(&db, &user).await;
+        let user_id = Uuid::parse_str(&user.id).expect("user id");
+        let seed = Uuid::from_u128(0xE11);
+        let alternate = Uuid::from_u128(0xE12);
+        let primary = Uuid::from_u128(0xE13);
+        seed_movie(&db, seed, "Seed", "SciFi").await;
+        seed_movie_in(
+            &db,
+            alternate,
+            "Alternate Cut",
+            "SciFi",
+            Some(Uuid::from_u128(0xE1A)),
+        )
+        .await;
+        seed_movie_in(
+            &db,
+            primary,
+            "Primary Cut",
+            "SciFi",
+            Some(Uuid::from_u128(0xE1B)),
+        )
+        .await;
+        crate::test_support::link_alternate_version(&db, alternate, primary).await;
+        for id in [alternate, primary] {
+            crate::item_persistence_service::seed_presentation_key(&db, id, "film-y").await;
+        }
+
+        let rows = manager(&db)
+            .get_similar_items(seed, &[], Some(user_id), &DtoOptions::default(), None)
+            .await
+            .expect("similar")
+            .expect("seed resolves");
+        assert_eq!(names(&rows), ["Primary Cut"]);
+    }
+
     #[test]
     fn an_unlisted_provider_sorts_last_not_first() {
         // C# `GetConfiguredSimilarProviderOrder` returns int.MaxValue for a
@@ -4342,7 +4559,10 @@ mod tests {
         // C# `GetPeopleNamesByItems` orders credits by `ListOrder` and groups
         // them per item; `GetPeopleNames` flattens with a stable `Distinct`. So
         // the lead of each film comes before its supporting cast, whatever
-        // order the names or person ids sort in.
+        // order the names or person ids sort in. Equal `ListOrder`s on
+        // different films come back in ascending item id: SQLite walks the
+        // statement's `IN` list in sorted order and its sorter keeps that
+        // order for ties, whatever order the ids were passed in (gl-1799).
         let db = test_db().await;
         let first = Uuid::from_u128(0x701);
         let second = Uuid::from_u128(0x702);
@@ -4369,8 +4589,9 @@ mod tests {
         )
         .await;
 
-        // `second` was played most recently, so its cast leads; `Zed Lead`
-        // keeps the place of his first credit.
+        // `second` was played most recently, but `first` has the lower id, so
+        // its lead takes the first tie and its cast leads; `Zed Lead` keeps
+        // the place of his first credit.
         let names = manager(&db)
             .repo
             .people_names_of(&[second, first], &["Actor", "GuestStar"])
@@ -4378,9 +4599,15 @@ mod tests {
             .expect("names");
         assert_eq!(
             names,
-            vec!["Yan Lead", "Bob Guest", "Zed Lead", "Amy Support"],
-            "billing order per film, the most recent film first, each name once"
+            vec!["Zed Lead", "Amy Support", "Yan Lead", "Bob Guest"],
+            "billing order per film, the lower item id first on a tie, each name once"
         );
+        let reversed = manager(&db)
+            .repo
+            .people_names_of(&[first, second], &["Actor", "GuestStar"])
+            .await
+            .expect("names");
+        assert_eq!(reversed, names, "the caller's item order breaks no tie");
     }
 
     #[tokio::test]
