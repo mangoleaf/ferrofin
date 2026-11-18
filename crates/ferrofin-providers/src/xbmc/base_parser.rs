@@ -761,11 +761,10 @@ fn parse_3d_format(format: &str) -> Option<ferrofin_model::entities::Video3DForm
 
 /// Case-insensitively strips `prefix` from `text`, returning the remainder.
 fn strip_prefix_ci<'a>(text: &'a str, prefix: &str) -> Option<&'a str> {
-    if text.len() >= prefix.len() && text[..prefix.len()].eq_ignore_ascii_case(prefix) {
-        Some(&text[prefix.len()..])
-    } else {
-        None
-    }
+    // `get`, not indexing: `prefix.len()` need not be a character boundary of `text`.
+    text.get(..prefix.len())
+        .is_some_and(|head| head.eq_ignore_ascii_case(prefix))
+        .then(|| &text[prefix.len()..])
 }
 
 /// Whether `val` parses as an absolute URI (`Uri.TryCreate(.., Absolute)`).

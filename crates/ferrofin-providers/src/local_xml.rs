@@ -316,9 +316,12 @@ impl Parser<'_> {
                     self.provider_keys
                         .iter()
                         .find(|key| {
+                            // Bytes, not `str`: `key.len()` need not be a
+                            // character boundary of `name`.
+                            let (name, key) = (name.as_bytes(), key.as_bytes());
                             name.len() == key.len() + 2
                                 && name[..key.len()].eq_ignore_ascii_case(key)
-                                && name[key.len()..].eq_ignore_ascii_case("Id")
+                                && name[key.len()..].eq_ignore_ascii_case(b"Id")
                         })
                         .map(String::as_str)
                 };
@@ -804,6 +807,18 @@ mod tests {
         assert_eq!(
             parsed.children[0].path.as_deref(),
             Some("/media/The Matrix.mkv")
+        );
+    }
+
+    /// An element name as long as a `{key}Id` but with a multi-byte character
+    /// across the key's end (`Année`: `é` spans bytes 3-4, `Tmdb` is 4) is no
+    /// provider id and is skipped, not sliced inside the character (gl-1862).
+    #[test]
+    fn a_non_ascii_element_name_is_skipped_not_sliced() {
+        let parsed = parse_box_set("<Item><Année>1999</Année><TMDBID>2344</TMDBID></Item>");
+        assert_eq!(
+            parsed.item.provider_ids,
+            vec![("Tmdb".to_owned(), "2344".to_owned())]
         );
     }
 
