@@ -721,10 +721,16 @@ fn contains_sub_path(parent: &str, path: &str) -> bool {
             || path[parent.len()..].starts_with(std::path::is_separator))
 }
 
-/// `Path.TrimEndingDirectorySeparator`: a root stays as it is.
-fn trim_separators(path: &str) -> &str {
+/// `path` without its trailing separators, all of them (`/a//` is `/a`;
+/// `Path.TrimEndingDirectorySeparator` trims one); a path of separators only
+/// is the root, one separator.
+pub(crate) fn trim_separators(path: &str) -> &str {
     let trimmed = path.trim_end_matches(std::path::is_separator);
-    if trimmed.is_empty() { path } else { trimmed }
+    if trimmed.is_empty() {
+        path.get(..1).unwrap_or(path)
+    } else {
+        trimmed
+    }
 }
 
 impl FerrofinLibraryMonitor {
@@ -1574,6 +1580,18 @@ mod tests {
             vec![vec!["/media/tv/Show/Season 1/e1.mkv".to_owned()]],
             "the TV change settled at 60s; the writer is still being written"
         );
+    }
+
+    /// Every trailing separator goes; a path of separators only is the root.
+    #[rstest::rstest]
+    #[case::bare("/m/tv", "/m/tv")]
+    #[case::one("/m/tv/", "/m/tv")]
+    #[case::two("/m/tv//", "/m/tv")]
+    #[case::root("/", "/")]
+    #[case::root_twice("//", "/")]
+    #[case::empty("", "")]
+    fn trim_separators_keeps_the_root(#[case] path: &str, #[case] trimmed: &str) {
+        assert_eq!(trim_separators(path), trimmed);
     }
 
     /// `CreateRefresher`'s grouping: a path joins a settle group whose path
