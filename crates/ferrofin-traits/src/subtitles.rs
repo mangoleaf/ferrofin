@@ -180,7 +180,8 @@ pub trait SubtitleManager: Send + Sync {
 
     /// Deletes the file of the item's external subtitle stream at `index`
     /// (`SubtitleManager.DeleteSubtitles`). The stream itself is left to the
-    /// item refresh the caller runs next.
+    /// item refresh the caller runs next, and then to
+    /// [`drop_missing_subtitle_rows`](Self::drop_missing_subtitle_rows).
     ///
     /// # Errors
     ///
@@ -192,6 +193,19 @@ pub trait SubtitleManager: Send + Sync {
     ///   file already gone from a folder that exists is no error.
     /// - [`ServiceError::Backend`] for any other failure to delete the file.
     async fn delete_subtitles(&self, item_id: Uuid, index: i32) -> Result<(), ServiceError>;
+
+    /// Drops the item's external subtitle stream rows whose absolute path
+    /// surely no longer exists, the other rows keeping their indexes; a
+    /// relative or URL row, or one whose path cannot be checked, stays. The
+    /// subtitle delete runs it after the item's refresh: a refresh that probes
+    /// the file has already rewritten the rows from the files on disk, as
+    /// upstream's does, but one that cannot (no ffprobe, a failed probe)
+    /// leaves them, and the deleted subtitle would stay listed.
+    ///
+    /// # Errors
+    ///
+    /// Propagates a storage failure reading or saving the rows.
+    async fn drop_missing_subtitle_rows(&self, item_id: Uuid) -> Result<(), ServiceError>;
 
     /// Lists the subtitle providers that support the item.
     async fn get_supported_providers(

@@ -117,7 +117,9 @@ async fn require_video(
 /// independently of the subtitle-management permission: `NotFound()` when the
 /// item is missing, else `204` once `SubtitleManager.DeleteSubtitles` has
 /// deleted the subtitle's file and awaited the item's refresh, whose re-probe
-/// drops that stream and renumbers the rest. A nil id (`GetItemById`) and an
+/// drops that stream and renumbers the rest. A refresh that cannot probe (no
+/// ffprobe, a failed probe) leaves the rows, so the rows of subtitle files no
+/// longer on disk are dropped after it. A nil id (`GetItemById`) and an
 /// index with no subtitle file (no subtitle stream there, or an embedded one)
 /// throw `ArgumentException`s upstream, and a subtitle whose folder is missing
 /// throws `File.Delete`'s `DirectoryNotFoundException`, before the refresh. So
@@ -150,7 +152,9 @@ async fn delete_subtitle(
         // Upstream finishes the delete and its refresh for a client that hangs up.
         run_detached(async move {
             state.subtitles.delete_subtitles(item_id, index).await?;
-            run_item_refresh(&state, item_id).await
+            run_item_refresh(&state, item_id).await?;
+            // After the refresh, which rewrites the rows only when it probes.
+            Ok::<(), ApiError>(state.subtitles.drop_missing_subtitle_rows(item_id).await?)
         })
         .await
     }
