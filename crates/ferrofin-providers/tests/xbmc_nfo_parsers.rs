@@ -354,6 +354,36 @@ fn movie_parse_escaped_xml_special_characters() {
     assert!(item.overview.as_deref().unwrap().ends_with("<<"));
 }
 
+/// A trailer with a multi-byte character across the YouTube plugin prefix's
+/// length (45 bytes; `é` spans bytes 44-45 here) is no plugin link: it is
+/// skipped, not sliced inside the character, and the next trailer is read.
+#[test]
+fn movie_parse_non_ascii_trailer_across_the_plugin_prefix_length() {
+    let external_ids = StaticExternalIds::new(["Tmdb"]);
+    let mut result = new_result(NfoItemKind::Movie);
+    let not_a_plugin_link = format!("https://example.org/{}é", "x".repeat(24));
+    let nfo = format!(
+        "<movie><title>Trailers</title>\
+         <trailer>{not_a_plugin_link}</trailer>\
+         <trailer>plugin://plugin.video.youtube/play/?video_id=dQw4w9WgXcQ</trailer>\
+         </movie>"
+    );
+    fetch_movie(
+        &mut result,
+        "/media/Trailers.nfo",
+        &nfo,
+        &NfoConfiguration::default(),
+        &external_ids,
+        &NoDirectoryService,
+    )
+    .expect("fetch succeeds");
+
+    assert_eq!(
+        result.item.remote_trailers,
+        ["https://www.youtube.com/watch?v=dQw4w9WgXcQ"]
+    );
+}
+
 #[test]
 fn movie_parse_tmdbcol_uniqueid_normalized() {
     let external_ids = StaticExternalIds::new(["Tmdb"]);
