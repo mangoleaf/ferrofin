@@ -5011,12 +5011,23 @@ pub const VERIFIED: &[Verified] = &[
                finish_structure_change (after_structure_change: LibraryMonitor::restart, then \
                queue_library_scan when refreshLibrary) → ferrofin-core virtual_folder_manager.rs \
                remove_media_path (LibraryManager.RemoveMediaPath: require_folder, \
-               delete_shortcut_for over resolve_shortcut and the virtual-path expansion, \
-               compared with the raw path ignoring case, the ordinal PathInfos filter with the \
-               same raw path, save_options, record_changed_locations) → library_monitor.rs \
-               restart and run (LibraryMonitor.Stop and Start)",
-        date: "2026-11-11",
+               delete_shortcut_for (every match) over resolve_shortcut and the virtual-path \
+               expansion, compared with the path ignoring case, the ordinal PathInfos filter, \
+               both past trailing separators, save_options, record_changed_locations) → \
+               library_monitor.rs restart and run (LibraryMonitor.Stop and Start)",
+        date: "2026-11-17",
         divergences: &[
+            "The path is compared with each shortcut's target and each PathInfos entry past \
+         their trailing separators, and every matching shortcut is deleted, as every matching \
+         entry is, so no shortcut outlives its entry: a folder added with a trailing slash and \
+         removed with that stored path, as jellyfin-web sends it, loses its shortcut and its \
+         entry; a path that differs from the stored one only by trailing slashes removes both; \
+         a folder added twice loses both shortcuts. Upstream compares the raw path with both (a \
+         shortcut's target loses one trailing separator) and deletes the first matching \
+         shortcut, so the first case drops the entry but keeps the shortcut, and the folder is \
+         still scanned; a path stored with a slash and requested without one loses only its \
+         shortcut; one stored without and requested with one changes nothing; a folder added \
+         twice keeps a shortcut. Jellyfin bug not ported (gl-1871).",
             "A request for a library that does not exist (404) restarts nothing and queues no \
          scan; upstream throws inside its try, so its finally still queues the requested full \
          scan, or restarts the monitor, for an unchanged library.",
