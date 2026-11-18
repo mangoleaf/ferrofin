@@ -102,6 +102,10 @@ flate2 = "1.1.11"
 zip = { version = "9", default-features = false, features = ["deflate"] }   # .cbz/.epub archives (ferrofin-providers books); backup archives (ferrofin-core, which adds `time`)
 tar = { version = "0.4.46", default-features = false }   # .cbt comic covers (ferrofin-providers books); read-only, so no `xattr`
 sevenz-rust2 = { version = "0.25.0", default-features = false, features = ["bzip2", "deflate", "ppmd"] }   # .cb7 comic covers (ferrofin-providers books)
+# A PDF book's Standard security handler with the empty user password
+# (ferrofin-providers books page counts): AES-128/256 and MD5 key derivation.
+aes = "0.9.4"
+md-5 = "0.11.0"
 brotli = "9.1.1"
 tokio = { version = "1", features = ["full"] }
 socket2 = "0.6"
@@ -242,7 +246,7 @@ windows-sys = { version = "0.61.2", features = [
     "Win32_System_Threading",
 ] }
 pbkdf2 = "0.13.0"          # password hashing — matches Jellyfin's Rfc2898DeriveBytes.Pbkdf2
-sha2 = "0.11.1"            # PBKDF2-HMAC-SHA512 (default hash id)
+sha2 = "0.11.1"            # PBKDF2-HMAC-SHA512 (default hash id); a PDF book's AES-256 key (revisions 5 and 6)
 sha1 = "0.11.0"            # PBKDF2-HMAC-SHA1 (legacy "PBKDF2" hash id)
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp", "gif", "bmp", "ico"] }
 kamadak-exif = "0.6.2"                                      # photo EXIF (ferrofin-drawing PhotoProvider)

@@ -262,11 +262,14 @@ Wired and working, with a documented limitation or lighter verification:
     provider — that is the third-party Bookshelf plugin.
   - A book's runtime is its pages × 10000 ticks, as Jellyfin 12's probe sets it, so reading
     progress shows as a share of the pages: a comic counts its archive's entries other than
-    folders (ZIP, 7z or tar, read from the archive's directory only), a PDF the `/Count` of its
-    page tree. It is counted when the book is added, when its file changes and when its
-    metadata is refreshed, as Jellyfin does, and also on any scan while a `.cbz`, `.cb7`,
-    `.cbt` or PDF still has one second, so books added by an older release are counted by
-    the next scan. An `.epub`
+    folders (ZIP, 7z or tar, read from the archive's directory only), a PDF its page tree's
+    count as PDFium reads it for Jellyfin: opened with the empty user password when it is
+    encrypted, its cross-reference table rebuilt from a scan of the file when the offsets are
+    wrong (not for a PDF over 128 MiB, which Jellyfin still scans), and its page tree walked when
+    `/Count` is implausible. A PDF with another user password is not counted, as in Jellyfin. It
+    is counted when the book is added, when its file changes and when its metadata is refreshed,
+    as Jellyfin does, and also on any scan while a `.cbz`, `.cb7`, `.cbt` or PDF still has one
+    second, so books added by an older release are counted by the next scan. An `.epub`
     has one second, as upstream. A RAR `.cbr` is not counted yet, though its cover is read
     (below); a new one has one second. **Accepted divergence:** `.mobi`, `.azw` and `.azw3` keep one second
     where upstream gives them no runtime, because with none every stop marks the book played

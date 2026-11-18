@@ -1590,6 +1590,7 @@ dependencies = [
 name = "ferrofin-providers"
 version = "0.4.1"
 dependencies = [
+ "aes",
  "async-trait",
  "chardetng",
  "chrono",
@@ -1604,6 +1605,7 @@ dependencies = [
  "ferrofin-util",
  "flate2",
  "futures-util",
+ "md-5",
  "opentelemetry",
  "opentelemetry_sdk",
  "quick-xml",
@@ -1614,6 +1616,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sevenz-rust2",
+ "sha2 0.11.1",
  "tar",
  "tempfile",
  "thiserror",
