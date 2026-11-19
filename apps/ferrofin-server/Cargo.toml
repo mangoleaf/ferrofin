@@ -4,6 +4,7 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 publish.workspace = true
+repository.workspace = true
 description = "Ferrofin media server — a Rust implementation of the Jellyfin server speaking the same API"
 
 [lints]

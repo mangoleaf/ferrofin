@@ -354,8 +354,7 @@ fn sanitized_file_name(path: &str) -> String {
         }
     }
     full.file_name()
-        .map(|name| name.to_string_lossy().into_owned())
-        .unwrap_or_default()
+        .map_or_default(|name| name.to_string_lossy().into_owned())
 }
 
 /// Recursively adds a directory's files to the zip under `prefix/…`. A file

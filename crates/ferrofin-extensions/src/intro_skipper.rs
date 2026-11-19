@@ -2187,14 +2187,12 @@ mod tests {
 
     /// The cache files a detection run left behind for `id`.
     pub(super) fn cache_files(h: &Harness, id: Uuid) -> Vec<String> {
-        std::fs::read_dir(h.task.cache_dir.resolve())
-            .map(|entries| {
-                entries
-                    .filter_map(|e| e.ok()?.file_name().into_string().ok())
-                    .filter(|name| name.starts_with(&id.to_string()))
-                    .collect()
-            })
-            .unwrap_or_default()
+        std::fs::read_dir(h.task.cache_dir.resolve()).map_or_default(|entries| {
+            entries
+                .filter_map(|e| e.ok()?.file_name().into_string().ok())
+                .filter(|name| name.starts_with(&id.to_string()))
+                .collect()
+        })
     }
 
     /// `DeleteForItem` / `DeleteByMode`: by item, by mode, or everything —

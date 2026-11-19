@@ -362,9 +362,8 @@ impl RateLimiter {
                     let error = error.without_url();
                     if !error.is_timeout() && !error.is_connect() && !error.is_request() {
                         // A refused redirect names its reason only in its source.
-                        let cause = std::error::Error::source(&error)
-                            .map(ToString::to_string)
-                            .unwrap_or_default();
+                        let cause =
+                            std::error::Error::source(&error).map_or_default(ToString::to_string);
                         tracing::warn!(provider = %self.provider, %context, %error, %cause, "Metadata provider request failed");
                         return Err(RequestError::Http(error.without_url()));
                     }

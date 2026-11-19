@@ -862,8 +862,7 @@ fn read_events<R: BufRead>(
 /// never reached.
 fn attribute_value(a: &quick_xml::events::attributes::Attribute<'_>) -> String {
     a.normalized_value(quick_xml::XmlVersion::Implicit1_0)
-        .map(std::borrow::Cow::into_owned)
-        .unwrap_or_default()
+        .map_or_default(std::borrow::Cow::into_owned)
 }
 
 /// Reads a `<programme>` start tag's `channel`/`start`/`stop` attributes in a
@@ -1005,8 +1004,7 @@ impl TextRun {
         self.values
             .into_iter()
             .nth(at)
-            .map(|(value, _)| value)
-            .unwrap_or_default()
+            .map_or_default(|(value, _)| value)
     }
 
     /// `ProcessMultipleNodes`' pick: only the values whose `lang` is exactly

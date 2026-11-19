@@ -725,7 +725,7 @@ mod tests {
         }
 
         fn queried(&self) -> Vec<String> {
-            self.queried.lock().map(|q| q.clone()).unwrap_or_default()
+            self.queried.lock().map_or_default(|q| q.clone())
         }
     }
 
@@ -737,7 +737,7 @@ mod tests {
             self.listings
                 .iter()
                 .find(|(dir, _)| dir == path)
-                .map(|(_, files)| {
+                .map_or_default(|(_, files)| {
                     files
                         .iter()
                         .map(|file| FileSystemEntryInfo {
@@ -747,7 +747,6 @@ mod tests {
                         })
                         .collect()
                 })
-                .unwrap_or_default()
         }
         fn get_drives(&self) -> Vec<FileSystemEntryInfo> {
             Vec::new()

@@ -113,8 +113,7 @@ impl SourceFetcher for Upstream {
         let body = request
             .json
             .as_deref()
-            .map(String::from_utf8_lossy)
-            .unwrap_or_default();
+            .map_or_default(String::from_utf8_lossy);
         let routes = self.sd.lock().unwrap();
         let matches = |(m, p, _, _, _): &&Route| *m == request.method && p == path;
         let (status, body) = routes
@@ -536,7 +535,7 @@ async fn airings(mgr: &FerrofinLiveTvManager) -> Vec<(String, String)> {
         .into_iter()
         .map(|p| {
             (
-                p.channel_id.map(|id| id.to_string()).unwrap_or_default(),
+                p.channel_id.map_or_default(|id| id.to_string()),
                 p.name.unwrap_or_default(),
             )
         })

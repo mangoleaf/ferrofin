@@ -117,14 +117,13 @@ pub(crate) fn stored_physical_locations(data: Option<&str>) -> Vec<String> {
     parse_data(data)
         .get("PhysicalLocationsList")
         .and_then(Value::as_array)
-        .map(|locations| {
+        .map_or_default(|locations| {
             locations
                 .iter()
                 .filter_map(Value::as_str)
                 .map(str::to_owned)
                 .collect()
         })
-        .unwrap_or_default()
 }
 
 #[cfg(test)]
@@ -161,7 +160,7 @@ pub fn read_remote_trailers(data: Option<&str>) -> Vec<(Option<String>, String)>
     parse_data(data)
         .get("RemoteTrailers")
         .and_then(Value::as_array)
-        .map(|entries| {
+        .map_or_default(|entries| {
             entries
                 .iter()
                 .filter_map(|e| {
@@ -175,7 +174,6 @@ pub fn read_remote_trailers(data: Option<&str>) -> Vec<(Option<String>, String)>
                 })
                 .collect()
         })
-        .unwrap_or_default()
 }
 
 /// Merges `trailers` into a `Data` column value's `RemoteTrailers` array,

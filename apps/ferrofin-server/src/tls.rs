@@ -380,8 +380,7 @@ pub async fn redirect_to_https(
         let query = request
             .uri()
             .query()
-            .map(|query| format!("?{query}"))
-            .unwrap_or_default();
+            .map_or_default(|query| format!("?{query}"));
         // The query is left out of the log: clients send tokens in it.
         tracing::debug!(
             host,

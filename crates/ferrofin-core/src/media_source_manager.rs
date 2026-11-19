@@ -3274,15 +3274,13 @@ mod tests {
         use ferrofin_model::entities::{MediaStreamType, Video3DFormat, VideoType};
         let src = |name: &str, width: Option<i32>| MediaSourceInfo {
             id: Some(name.to_owned()),
-            media_streams: width
-                .map(|w| {
-                    vec![ferrofin_model::entities_media::MediaStream {
-                        stream_type: MediaStreamType::Video,
-                        width: Some(w),
-                        ..Default::default()
-                    }]
-                })
-                .unwrap_or_default(),
+            media_streams: width.map_or_default(|w| {
+                vec![ferrofin_model::entities_media::MediaStream {
+                    stream_type: MediaStreamType::Video,
+                    width: Some(w),
+                    ..Default::default()
+                }]
+            }),
             ..MediaSourceInfo::default()
         };
         // The real HDHomeRun append order, and the widths GetMediaSource gives

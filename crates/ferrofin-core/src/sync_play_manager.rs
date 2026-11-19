@@ -272,9 +272,7 @@ impl PlayQueue {
 
     /// The `PlaylistItemId` of the current item (nil if the queue is empty).
     fn playing_item_id(&self) -> Uuid {
-        self.current()
-            .map(|i| i.playlist_item_id)
-            .unwrap_or_default()
+        self.current().map_or_default(|i| i.playlist_item_id)
     }
 
     /// `GetPlayingItem` (PlayQueueManager.cs:557-570).
@@ -510,8 +508,7 @@ impl PlayQueue {
             let playing = usize::try_from(self.playing_index)
                 .ok()
                 .and_then(|i| self.shuffled.get(i))
-                .map(|i| i.playlist_item_id)
-                .unwrap_or_default();
+                .map_or_default(|i| i.playlist_item_id);
             self.playing_index = index_of(&self.sorted, playing);
         }
         self.shuffled.clear();
@@ -2454,8 +2451,7 @@ impl SyncPlayManager for FerrofinSyncPlayManager {
                     } else {
                         group_id
                             .and_then(|id| reg.groups.get(&id))
-                            .map(Group::member_user_ids)
-                            .unwrap_or_default()
+                            .map_or_default(Group::member_user_ids)
                             .into_iter()
                             .filter(|id| !checked.contains(id))
                             .collect()

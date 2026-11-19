@@ -1185,8 +1185,9 @@ fn pick_embedded_picture(
             .to_owned(),
             None => Path::new(file_name.unwrap_or_default())
                 .extension()
-                .map(|extension| format!(".{}", extension.to_string_lossy().to_lowercase()))
-                .unwrap_or_default(),
+                .map_or_default(|extension| {
+                    format!(".{}", extension.to_string_lossy().to_lowercase())
+                }),
         };
         let format = match extension.as_str() {
             ".bmp" => ImageFormat::Bmp,
@@ -4897,10 +4898,7 @@ impl LibraryScanner {
     /// The server-wide per-kind `MetadataOptions` as configured now (none
     /// without a reader).
     fn server_metadata_options(&self) -> Vec<ferrofin_model::configuration::MetadataOptions> {
-        self.metadata_options
-            .as_ref()
-            .map(|read| read())
-            .unwrap_or_default()
+        self.metadata_options.as_ref().map_or_default(|read| read())
     }
 
     /// Reads the server metadata language and country at scan time. Library
@@ -12660,15 +12658,12 @@ impl LibraryScanner {
             .and_then(|e| e.people.as_ref())
             .map(|p| ferrofin_providers::tmdb::people_entities(p))
             .and_then(added);
-        let trailers = extras
-            .as_ref()
-            .map(|e| {
-                e.trailers
-                    .iter()
-                    .map(|t| (t.name.clone(), t.url.clone()))
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default();
+        let trailers = extras.as_ref().map_or_default(|e| {
+            e.trailers
+                .iter()
+                .map(|t| (t.name.clone(), t.url.clone()))
+                .collect::<Vec<_>>()
+        });
         if let Some(data) =
             crate::item_data::merge_remote_trailers(answer.item.data.as_deref(), &trailers)
         {
@@ -15206,9 +15201,7 @@ impl LibraryScanner {
                     .flatten();
                 let mut sources = vec![(
                     fetcher_names::TVDB,
-                    tvdb_art
-                        .map(ferrofin_providers::TvdbSeriesDetails::download_images)
-                        .unwrap_or_default(),
+                    tvdb_art.map_or_default(ferrofin_providers::TvdbSeriesDetails::download_images),
                 )];
                 let images = if policy.image_enabled(short, fetcher_names::TMDB) {
                     Self::series_tmdb_images(tmdb, entity, cache, language.as_deref()).await
@@ -15777,14 +15770,13 @@ impl LibraryScanner {
             .await
             .and_then(|details| details.image_url)
             .filter(|url| !url.is_empty())
-            .map(|url| {
+            .map_or_default(|url| {
                 vec![RemoteImage {
                     image_type: ImageType::Primary,
                     url,
                     ..Default::default()
                 }]
             })
-            .unwrap_or_default()
     }
 
     /// The synchronous plan pass: resolve every library's files into [`Planned`]
@@ -15844,11 +15836,7 @@ impl LibraryScanner {
         dirs: Option<&Arc<DirectoryCache>>,
     ) -> PlanOutput {
         let naming = NamingOptions::shared();
-        let content_types = self
-            .content_types
-            .as_ref()
-            .map(|read| read())
-            .unwrap_or_default();
+        let content_types = self.content_types.as_ref().map_or_default(|read| read());
         let mut ctx = PlanCtx::new(naming, scope)
             .with_locations(plan_folders)
             .with_key_folders(key_folders)

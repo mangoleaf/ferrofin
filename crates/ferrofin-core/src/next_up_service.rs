@@ -261,8 +261,7 @@ impl FerrofinNextUpService {
                 filter,
             )
             .await?
-            .map(|scoped| scoped.top_parent_ids)
-            .unwrap_or_default()
+            .map_or_default(|scoped| scoped.top_parent_ids)
         } else {
             self.top_parent_ids(&filter.top_parent_ids, user).await?
         };

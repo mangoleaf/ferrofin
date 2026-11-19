@@ -540,8 +540,7 @@ pub struct TmdbTrailer {
 /// filter, ignoring case).
 fn youtube_trailers(videos: Option<VideosResults>) -> Vec<TmdbTrailer> {
     videos
-        .map(|v| v.results)
-        .unwrap_or_default()
+        .map_or_default(|v| v.results)
         .into_iter()
         .filter(|v| {
             v.site
@@ -985,7 +984,7 @@ fn series_people(
     created_by: Option<Vec<CreatedByEntry>>,
     cfg: &crate::plugin_config::TmdbConfig,
 ) -> Vec<TmdbPerson> {
-    let aggregate = aggregate.map(|a| a.cast).unwrap_or_default();
+    let aggregate = aggregate.map_or_default(|a| a.cast);
     let (cast, crew) = credits.map_or_else(Default::default, |c| (c.cast, c.crew));
     let mut people = if aggregate.is_empty() {
         map_cast(cast, cfg)
@@ -1088,11 +1087,7 @@ fn map_cast(cast: Vec<CastEntry>, cfg: &crate::plugin_config::TmdbConfig) -> Vec
                 entry.id,
                 entry.profile_path.as_deref(),
                 entry.order,
-                entry
-                    .character
-                    .as_deref()
-                    .map(str::trim)
-                    .unwrap_or_default(),
+                entry.character.as_deref().map_or_default(str::trim),
                 cfg,
             )
         })

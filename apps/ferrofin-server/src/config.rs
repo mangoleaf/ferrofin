@@ -2162,8 +2162,7 @@ fn resolve_private_allow(
 /// A resolved private allow-list, its refused entries left out; empty when
 /// unset.
 fn private_allow_list(raw: Option<&str>) -> ferrofin_providers::destination::PrivateAllowList {
-    raw.map(|raw| ferrofin_providers::destination::PrivateAllowList::parse(raw).0)
-        .unwrap_or_default()
+    raw.map_or_default(|raw| ferrofin_providers::destination::PrivateAllowList::parse(raw).0)
 }
 
 /// Resolves the stdout log format: the `FERROFIN_LOG_FORMAT` env var when it

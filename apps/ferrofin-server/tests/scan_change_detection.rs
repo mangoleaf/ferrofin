@@ -621,9 +621,7 @@ esac
 
 /// The lines of a stub's call log (none before its first call).
 fn lines(path: &Path) -> Vec<String> {
-    std::fs::read_to_string(path)
-        .map(|s| s.lines().map(str::to_owned).collect())
-        .unwrap_or_default()
+    std::fs::read_to_string(path).map_or_default(|s| s.lines().map(str::to_owned).collect())
 }
 
 // ---------------------------------------------------------------------------

@@ -83,8 +83,7 @@ fn people_of(
     result
         .people
         .as_ref()
-        .map(|p| p.iter().filter(|x| x.type_ == kind).collect())
-        .unwrap_or_default()
+        .map_or_default(|p| p.iter().filter(|x| x.type_ == kind).collect())
 }
 
 // ---------------------------------------------------------------------------

@@ -493,8 +493,7 @@ impl LibraryScanner {
             .scan_stored_links(&[one.id])
             .await?
             .and_then(|mut links| links.remove(&one.id))
-            .map(|links| links.ancestors)
-            .unwrap_or_default();
+            .map_or_default(|links| links.ancestors);
         let series = SeriesContext {
             row: &series_row,
             id: one.id,

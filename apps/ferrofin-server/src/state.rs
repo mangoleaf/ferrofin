@@ -1703,8 +1703,7 @@ pub async fn build_app_state(
         Arc::new(move || {
             live_tv
                 .upgrade()
-                .map(|live_tv| live_tv.paths_being_recorded())
-                .unwrap_or_default()
+                .map_or_default(|live_tv| live_tv.paths_being_recorded())
         })
     })
     .with_trickplay(Arc::clone(&trickplay), {

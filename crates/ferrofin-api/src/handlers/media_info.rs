@@ -1382,7 +1382,7 @@ async fn post_playback_info(
     parts: Parts,
     body: Option<JsonBody<PlaybackInfoBody>>,
 ) -> Result<Json<PlaybackInfoResponse>, ApiError> {
-    let mut body = body.map(|JsonBody(b)| b).unwrap_or_default();
+    let mut body = body.map_or_default(|JsonBody(b)| b);
     // A client that posts no profile negotiates with the one its device last
     // reported through `/Sessions/Capabilities`.
     let profile = match body.device_profile.take() {
@@ -1554,7 +1554,7 @@ async fn open_live_stream(
     parts: Parts,
     body: Option<JsonBody<OpenLiveStreamDto>>,
 ) -> Result<Json<LiveStreamResponse>, ApiError> {
-    let dto = body.map(|JsonBody(dto)| dto).unwrap_or_default();
+    let dto = body.map_or_default(|JsonBody(dto)| dto);
     // C# `userId ??= openLiveStreamDto?.UserId; userId =
     // RequestHelpers.GetUserId(User, userId)`: the query id wins over the body
     // id, and naming another user requires the administrator role. The resolved

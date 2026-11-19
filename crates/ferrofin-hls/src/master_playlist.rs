@@ -144,15 +144,14 @@ impl ParsedQuery {
         self.0
             .iter()
             .find(|(k, _)| k.eq_ignore_ascii_case(key))
-            .map(|(_, values)| values.join(","))
-            .unwrap_or_default()
+            .map_or_default(|(_, values)| values.join(","))
     }
 
     /// The dictionary indexer set: replaces `key`'s values (keeping the
     /// existing spelling and position) or appends a new key. `None` is the
     /// null `StringValues` — the key stays but serialises to nothing.
     fn set(&mut self, key: &str, value: Option<&str>) {
-        let values = value.map(|v| vec![v.to_owned()]).unwrap_or_default();
+        let values = value.map_or_default(|v| vec![v.to_owned()]);
         if let Some((_, existing)) = self.0.iter_mut().find(|(k, _)| k.eq_ignore_ascii_case(key)) {
             *existing = values;
         } else {

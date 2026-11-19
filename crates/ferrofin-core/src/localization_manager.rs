@@ -847,15 +847,13 @@ fn build_parental_ratings(metadata_country_code: &str) -> Vec<ParentalRating> {
 /// drive it with a synthetic rating system. `None` means the country has no vendored
 /// table and only the back-fill applies.
 fn build_parental_ratings_from(table: Option<&RatingTable>) -> Vec<ParentalRating> {
-    let mut ratings: Vec<ParentalRating> = table
-        .map(|table| {
-            table
-                .ordered
-                .iter()
-                .map(|(name, score)| ParentalRating::new(name.clone(), Some(*score)))
-                .collect()
-        })
-        .unwrap_or_default();
+    let mut ratings: Vec<ParentalRating> = table.map_or_default(|table| {
+        table
+            .ordered
+            .iter()
+            .map(|(name, score)| ParentalRating::new(name.clone(), Some(*score)))
+            .collect()
+    });
 
     let has_score = |ratings: &[ParentalRating], target: i32| {
         ratings

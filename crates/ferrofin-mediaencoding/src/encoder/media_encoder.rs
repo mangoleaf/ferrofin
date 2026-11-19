@@ -594,9 +594,7 @@ impl<T: Transcoder> MediaEncoderImpl<T> {
         }
 
         let vf = filters.join(",");
-        let map_arg = image_stream_index
-            .map(|i| format!(" -map 0:{i}"))
-            .unwrap_or_default();
+        let map_arg = image_stream_index.map_or_default(|i| format!(" -map 0:{i}"));
 
         // `-v error`, not upstream's `-v quiet`: the only signal a failed
         // extraction gives is a missing output file, and the caller reports

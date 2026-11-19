@@ -1209,8 +1209,7 @@ async fn agent_origin() -> String {
         axum::routing::get(|headers: axum::http::HeaderMap| async move {
             headers
                 .get(header::USER_AGENT)
-                .map(|agent| agent.as_bytes().to_vec())
-                .unwrap_or_default()
+                .map_or_default(|agent| agent.as_bytes().to_vec())
         }),
     );
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

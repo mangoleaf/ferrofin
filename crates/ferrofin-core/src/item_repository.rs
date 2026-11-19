@@ -1441,8 +1441,7 @@ impl FerrofinItemRepository {
                     Some(row.type_name.as_str()) == stored_type_name(BaseItemKind::CollectionFolder)
                 })
                 .and_then(|row| row.data.as_deref())
-                .map(parse_physical_folder_ids)
-                .unwrap_or_default();
+                .map_or_default(parse_physical_folder_ids);
             if !folders.is_empty() {
                 resolved
                     .get_or_insert_with(|| filter.clone())
@@ -1614,10 +1613,7 @@ impl FerrofinItemRepository {
             // The physical folders AND the collection folder itself: an
             // adopted row carries the first until a scan saves it with the
             // second ([`library_top_parents_by_view`]).
-            let mut folders = data
-                .as_deref()
-                .map(parse_physical_folder_ids)
-                .unwrap_or_default();
+            let mut folders = data.as_deref().map_or_default(parse_physical_folder_ids);
             folders.retain(|folder| *folder != id);
             folders.insert(0, id);
             return Ok(Some(folders));
@@ -3063,13 +3059,12 @@ fn parse_physical_folder_ids(blob: &str) -> Vec<Uuid> {
         .as_ref()
         .and_then(|v| v.get("PhysicalFolderIds"))
         .and_then(serde_json::Value::as_array)
-        .map(|ids| {
+        .map_or_default(|ids| {
             ids.iter()
                 .filter_map(serde_json::Value::as_str)
                 .filter_map(|s| Uuid::parse_str(s).ok())
                 .collect()
         })
-        .unwrap_or_default()
 }
 
 /// Hard cap on the ancestor-chain CTE depth — prevents unbounded recursion on

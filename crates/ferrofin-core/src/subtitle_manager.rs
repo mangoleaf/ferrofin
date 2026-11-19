@@ -602,8 +602,7 @@ impl SubtitleManager for FerrofinSubtitleManager {
             .await
             .ok()
             .flatten()
-            .map(|item| item_name(&item))
-            .unwrap_or_default();
+            .map_or_default(|item| item_name(&item));
         let entry = ActivityLogCreate {
             name: format!(
                 "Subtitles failed to download from {} for {item}",

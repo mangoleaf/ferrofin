@@ -268,14 +268,13 @@ impl FerrofinServerApplicationHost {
                 .network_manager
                 .as_ref()
                 .and_then(|manager| manager.read().ok())
-                .map(|manager| {
+                .map_or_default(|manager| {
                     manager
                         .published_server_urls()
                         .iter()
                         .map(|entry| entry.override_uri.clone())
                         .collect()
-                })
-                .unwrap_or_default(),
+                }),
         };
         let hosts = ferrofin_networking::published_urls_missing_base_url(
             overrides.iter().map(String::as_str),
@@ -355,7 +354,7 @@ impl FerrofinServerApplicationHost {
         } else {
             hostname.to_owned()
         };
-        let port = port.map(|port| format!(":{port}")).unwrap_or_default();
+        let port = port.map_or_default(|port| format!(":{port}"));
         let base =
             ferrofin_networking::escape_base_url(self.network.base_url.trim_end_matches('/'));
         format!("{scheme}://{hostname}{port}{base}")

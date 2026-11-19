@@ -206,16 +206,12 @@ async fn delete_devices(
     Query(query): Query<DeleteDevicesQuery>,
 ) -> Result<axum::http::StatusCode, ApiError> {
     // Comma-delimited id list (Jellyfin's `string[]` query binding).
-    let ids: Vec<&str> = query
-        .id
-        .as_deref()
-        .map(|raw| {
-            raw.split(',')
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .collect()
-        })
-        .unwrap_or_default();
+    let ids: Vec<&str> = query.id.as_deref().map_or_default(|raw| {
+        raw.split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .collect()
+    });
 
     // Resolve every id first; a single unknown device fails the whole request
     // (C# returns `BadRequest` when `devices.Any(f => f is null)`).

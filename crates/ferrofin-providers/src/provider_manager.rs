@@ -2611,9 +2611,7 @@ impl LocalProviderManager {
     async fn stored_images(&self, item_id: Uuid) -> Option<Vec<ItemImageInfo>> {
         let store = self.image_store.as_ref()?;
         match store.scan_stored_links(&[item_id]).await {
-            Ok(Some(mut links)) => {
-                Some(links.remove(&item_id).map(|l| l.images).unwrap_or_default())
-            }
+            Ok(Some(mut links)) => Some(links.remove(&item_id).map_or_default(|l| l.images)),
             Ok(None) => None,
             Err(err) => {
                 tracing::warn!(%item_id, %err, "could not read the item's images");
@@ -4403,8 +4401,7 @@ impl LocalProviderManager {
                 Some(id) => client
                     .series_details(id, "usa")
                     .await
-                    .map(|details| details.images)
-                    .unwrap_or_default(),
+                    .map_or_default(|details| details.images),
                 None => Vec::new(),
             }
         } else {
@@ -4448,8 +4445,7 @@ impl LocalProviderManager {
                 details
                     .and_then(|details| details.image_url)
                     .filter(|url| !url.is_empty())
-                    .map(|url| vec![plain_image(ImageType::Primary, url)])
-                    .unwrap_or_default()
+                    .map_or_default(|url| vec![plain_image(ImageType::Primary, url)])
             }
         };
         for image in &mut images {
@@ -4694,20 +4690,16 @@ impl LocalProviderManager {
         let id = |key: &str| provider_id_of_pairs(ids, key);
         match source {
             RemoteImageSource::AudioDbArtist => match (&self.audiodb, id("MusicBrainzArtist")) {
-                (Some(audiodb), Some(artist)) => audiodb
-                    .artist(artist)
-                    .await
-                    .map(|a| a.images)
-                    .unwrap_or_default(),
+                (Some(audiodb), Some(artist)) => {
+                    audiodb.artist(artist).await.map_or_default(|a| a.images)
+                }
                 _ => Vec::new(),
             },
             RemoteImageSource::AudioDbAlbum => {
                 match (&self.audiodb, id("MusicBrainzReleaseGroup")) {
-                    (Some(audiodb), Some(group)) => audiodb
-                        .album(group)
-                        .await
-                        .map(|a| a.images)
-                        .unwrap_or_default(),
+                    (Some(audiodb), Some(group)) => {
+                        audiodb.album(group).await.map_or_default(|a| a.images)
+                    }
                     _ => Vec::new(),
                 }
             }
@@ -4716,16 +4708,14 @@ impl LocalProviderManager {
                     .item(imdb)
                     .await
                     .and_then(|item| item.poster)
-                    .map(|url| vec![plain_image(ImageType::Primary, url)])
-                    .unwrap_or_default(),
+                    .map_or_default(|url| vec![plain_image(ImageType::Primary, url)]),
                 _ => Vec::new(),
             },
             _ => match (&self.studios, entity_name(entity)) {
                 (Some(studios), Some(name)) => studios
                     .thumb_url(name)
                     .await
-                    .map(|url| vec![plain_image(ImageType::Thumb, url)])
-                    .unwrap_or_default(),
+                    .map_or_default(|url| vec![plain_image(ImageType::Thumb, url)]),
                 _ => Vec::new(),
             },
         }
@@ -5655,8 +5645,7 @@ impl ProviderManager for LocalProviderManager {
             .unwrap_or_else(|| {
                 global
                     .as_ref()
-                    .map(|o| o.metadata_fetcher_order.clone())
-                    .unwrap_or_default()
+                    .map_or_default(|o| o.metadata_fetcher_order.clone())
             });
         providers.sort_by_key(|p| {
             let ranked = crate::library_options::configured_order(&order, p.name());
@@ -5736,8 +5725,7 @@ impl ProviderManager for LocalProviderManager {
         let global = self
             .metadata_options
             .as_ref()
-            .map(|options| options())
-            .unwrap_or_default();
+            .map_or_default(|options| options());
         Ok(crate::library_options::library_options_info(
             item_types,
             is_new_library,

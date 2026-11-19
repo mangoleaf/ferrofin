@@ -1240,8 +1240,7 @@ pub static SETTINGS: &[SettingSpec] = &[
         check: |value| {
             let buckets: Vec<f64> = value
                 .as_array()
-                .map(|list| list.iter().filter_map(Value::as_f64).collect())
-                .unwrap_or_default();
+                .map_or_default(|list| list.iter().filter_map(Value::as_f64).collect());
             ferrofin_core::scan_metrics::validate_duration_buckets(&buckets)
                 .map_err(|why| format!("is not a list of bucket boundaries: {why}"))
         },
@@ -1625,7 +1624,7 @@ fn parses<T: std::str::FromStr>(raw: &str) -> bool {
 /// `ffmpeg_probe_size`): blank for the default, else ffmpeg's syntax inside
 /// `range`, which the loader would otherwise ignore or clamp with a warning.
 fn ffmpeg_count_within(value: &Value, range: &RangeInclusive<FfmpegCount>) -> Result<(), String> {
-    let text = value.as_str().map(str::trim).unwrap_or_default();
+    let text = value.as_str().map_or_default(str::trim);
     if text.is_empty() {
         return Ok(());
     }

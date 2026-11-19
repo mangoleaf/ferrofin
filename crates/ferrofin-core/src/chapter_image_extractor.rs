@@ -457,8 +457,7 @@ pub(crate) fn date_modified_ticks(date: Option<DateTime<Utc>>) -> i64 {
 fn last_write_time(path: &str) -> DateTime<Utc> {
     off_runtime(|| std::fs::metadata(path))
         .and_then(|metadata| metadata.modified())
-        .map(DateTime::<Utc>::from)
-        .unwrap_or_default()
+        .map_or_default(DateTime::<Utc>::from)
 }
 
 fn saved_images(directory: &str) -> Vec<String> {

@@ -289,8 +289,7 @@ impl Drop for GenerationRun {
                 let elapsed = finished
                     .started
                     .zip(finished.ended)
-                    .map(|(started, ended)| ended.saturating_duration_since(started))
-                    .unwrap_or_default();
+                    .map_or_default(|(started, ended)| ended.saturating_duration_since(started));
                 tracing::info!(
                     videos = finished.videos,
                     sets = finished.sets,
@@ -1974,8 +1973,7 @@ impl TrickplayManager for FerrofinTrickplayManager {
             entity
                 .as_ref()
                 .and_then(|row| row.path.as_deref())
-                .map(MediaLocation::of_file)
-                .unwrap_or_default(),
+                .map_or_default(MediaLocation::of_file),
             library.is_some_and(|options| options.save_trickplay_with_media),
         );
         let subdir = format!("{} - {}x{}", width, info.tile_width, info.tile_height);
