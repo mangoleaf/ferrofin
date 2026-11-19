@@ -492,12 +492,32 @@ struct ArtworkWire {
     language: Option<String>,
     width: Option<i32>,
     height: Option<i32>,
+    score: Option<f64>,
 }
 
 impl ArtworkWire {
+    /// A series' artwork as v1.5.1 built it: [`Self::into_image`], but with
+    /// TheTVDB's score as `CommunityRating` (so the "choose image" list puts a
+    /// language's best-scored artwork first) and a missing dimension left
+    /// unknown, which passes a minimum width, as Jellyfin core's
+    /// `ItemImageProvider` treats a null width as unknown. Accepted divergence (owner
+    /// decision, 2026-11-19) from the plugin's `CreateRemoteImageInfo`, which
+    /// sets no rating and reads a missing dimension as 0. Seasons keep the
+    /// plugin's conversion.
+    fn into_series_image(self, image_type: ImageType) -> Option<TmdbImage> {
+        let (score, width, height) = (self.score, self.width, self.height);
+        self.into_image(image_type).map(|image| TmdbImage {
+            community_rating: score,
+            width,
+            height,
+            ..image
+        })
+    }
+
     /// `TvdbSdkExtensions.CreateRemoteImageInfo` (jellyfin-plugin-tvdb
-    /// `5c4592f`, `:225-243`): no `CommunityRating`, TheTVDB's score is not
-    /// read, and `Convert.ToInt32` reads a missing dimension as 0. An empty or
+    /// `5c4592f`, `:225-243`): no `CommunityRating` (TheTVDB's score is ignored
+    /// here; series artwork takes it, see [`Self::into_series_image`]), and
+    /// `Convert.ToInt32` reads a missing dimension as 0. An empty or
     /// `"null"` language is none, as the plugin's language lookup leaves it.
     /// `None` when the artwork has no image.
     fn into_image(self, image_type: ImageType) -> Option<TmdbImage> {
@@ -1451,7 +1471,7 @@ fn map_series(tvdb_id: i64, wire: SeriesExtendedWire, country_code: &str) -> Tvd
         .into_iter()
         .filter_map(|a| {
             let image_type = artwork_image_type(a.type_)?;
-            a.into_image(image_type)
+            a.into_series_image(image_type)
         })
         .collect();
 
@@ -1661,6 +1681,7 @@ mod tests {
               "artworks": [
                 { "image": "/poster.jpg", "thumbnail": "/poster_t.jpg", "type": 2, "language": "eng", "score": 9.0, "width": 680, "height": 1000 },
                 { "image": "/bg.jpg", "type": 3, "language": "null", "score": 5.0 },
+                { "image": "/banner.jpg", "type": 1, "language": "eng", "width": 758 },
                 { "image": "/unknown.jpg", "type": 999 }
               ]
             }"#,
@@ -1725,9 +1746,10 @@ mod tests {
         assert_eq!(d.people[0].person_type, "Actor");
         assert_eq!(d.people[0].role.as_deref(), Some("Daenerys"));
         assert_eq!(d.people[1].person_type, "Writer");
-        // Poster→Primary, background→Backdrop; the unknown type is dropped;
-        // the "null" language becomes None.
-        assert_eq!(d.images.len(), 2);
+        // Poster→Primary, background→Backdrop, banner→Banner; the unknown
+        // type is dropped; the "null" language becomes None.
+        assert_eq!(d.images.len(), 3);
+        assert_eq!(d.images[2].image_type, ImageType::Banner);
         assert_eq!(d.images[0].image_type, ImageType::Primary);
         assert_eq!(d.images[0].language.as_deref(), Some("eng"));
         assert_eq!(d.images[1].image_type, ImageType::Backdrop);
@@ -1735,18 +1757,18 @@ mod tests {
         // The artwork's thumbnail is its preview (`CreateRemoteImageInfo`).
         assert_eq!(d.images[0].thumbnail_url.as_deref(), Some("/poster_t.jpg"));
         assert_eq!(d.images[1].thumbnail_url, None);
-        // `CreateRemoteImageInfo` drops TheTVDB's score and reads a missing
-        // dimension as 0.
-        assert!(
-            d.images
-                .iter()
-                .all(|image| image.community_rating.is_none())
-        );
+        // Series artwork keeps TheTVDB's score as its rating and a missing
+        // dimension unknown (accepted divergence from `CreateRemoteImageInfo`).
+        assert_eq!(d.images[0].community_rating, Some(9.0));
+        assert_eq!(d.images[1].community_rating, Some(5.0));
         assert_eq!(
             (d.images[0].width, d.images[0].height),
             (Some(680), Some(1000))
         );
-        assert_eq!((d.images[1].width, d.images[1].height), (Some(0), Some(0)));
+        assert_eq!((d.images[1].width, d.images[1].height), (None, None));
+        // No score is no rating; each dimension is kept or left unknown alone.
+        assert_eq!(d.images[2].community_rating, None);
+        assert_eq!((d.images[2].width, d.images[2].height), (Some(758), None));
     }
 
     /// An episode's credits as `MapEpisodeToResult` maps them
@@ -2224,7 +2246,7 @@ mod tests {
             ("/artwork/types", r#"{"data":[{"id":71,"name":"Poster","recordType":"season"},{"id":72,"name":"Poster","recordType":"series"}]}"#.to_owned()),
             ("/series/5/extended", r#"{"data":{"seasons":[{"id":51,"number":1,"type":{"type":"dvd"}},{"id":52,"number":1,"type":{"type":"official"}}]}}"#.to_owned()),
             ("/seasons/51/extended", format!(r#"{{"data":{{"artwork":{alternate}}}}}"#)),
-            ("/seasons/52/extended", r#"{"data":{"artwork":[{"type":71,"image":"poster.jpg","thumbnail":"poster_t.jpg","language":"fre","width":800},{"type":72,"image":"wrong.jpg"}]}}"#.to_owned()),
+            ("/seasons/52/extended", r#"{"data":{"artwork":[{"type":71,"image":"poster.jpg","thumbnail":"poster_t.jpg","language":"fre","width":800,"score":7},{"type":72,"image":"wrong.jpg"}]}}"#.to_owned()),
         ]).await;
         let client = TvdbClient::new().with_base_url(&server.base_url);
         let images = client.season_images(5, order, 1).await;
@@ -2232,7 +2254,10 @@ mod tests {
         if count > 0 {
             assert_eq!(images[0].image_type, ImageType::Primary);
             assert_eq!(images[0].url, "poster.jpg");
+            // Seasons keep the plugin's `CreateRemoteImageInfo`: no rating, a
+            // missing dimension 0 (series artwork differs, see `map_series`).
             assert_eq!((images[0].width, images[0].height), (Some(800), Some(0)));
+            assert_eq!(images[0].community_rating, None);
             assert_eq!(images[0].thumbnail_url.as_deref(), Some("poster_t.jpg"));
         }
         assert!(client.artwork_types.lock().unwrap().is_some());
