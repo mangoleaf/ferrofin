@@ -885,14 +885,11 @@ impl CategoryClasses {
     fn from_provider(provider: &ListingsProviderInfo) -> Self {
         let defaults = ListingsProviderInfo::default();
         let pick = |own: &Option<Vec<String>>, default: &Option<Vec<String>>| {
-            own.as_ref()
-                .or(default.as_ref())
-                .map(|list| {
-                    list.iter()
-                        .map(|entry| ordinal_ignore_case_key(entry))
-                        .collect()
-                })
-                .unwrap_or_default()
+            own.as_ref().or(default.as_ref()).map_or_default(|list| {
+                list.iter()
+                    .map(|entry| ordinal_ignore_case_key(entry))
+                    .collect()
+            })
         };
         Self {
             news: pick(&provider.news_categories, &defaults.news_categories),
@@ -8893,8 +8890,7 @@ mod tests {
                     genres: options.contains_field(ItemFields::Genres).then(|| {
                         item.genres
                             .as_deref()
-                            .map(|g| g.split('|').map(str::to_owned).collect())
-                            .unwrap_or_default()
+                            .map_or_default(|g| g.split('|').map(str::to_owned).collect())
                     }),
                     overview: options
                         .contains_field(ItemFields::Overview)

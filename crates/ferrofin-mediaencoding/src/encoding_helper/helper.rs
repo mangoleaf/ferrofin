@@ -662,6 +662,10 @@ impl<C: EncoderCapabilities> EncodingHelper<C> {
     /// to a client that did not list `DOVI` needs its RPU stripped (see
     /// `range_type_copy_ok`).
     #[must_use]
+    #[allow(
+        clippy::needless_bool,
+        reason = "the last of a chain of `return false` guards ported from CanStreamCopyVideo; folding only that one into the return hides the chain"
+    )]
     pub fn can_stream_copy_video(
         &self,
         state: &EncodingJobInfo,

@@ -1838,8 +1838,7 @@ impl UserManager for FerrofinUserManager {
             .get_user_dto(user, None)
             .await?
             .configuration
-            .map(|c| c.latest_items_excludes)
-            .unwrap_or_default())
+            .map_or_default(|c| c.latest_items_excludes))
     }
 
     async fn update_configuration(

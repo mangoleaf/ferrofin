@@ -265,15 +265,13 @@ impl WasmSettings {
             event_queue_capacity: event_queue_capacity
                 .filter(|&v| v > 0)
                 .unwrap_or(d.event_queue_capacity),
-            private_http_allow: private_http_allow
-                .map(|s| {
-                    s.split(',')
-                        .map(str::trim)
-                        .filter(|e| !e.is_empty())
-                        .map(str::to_owned)
-                        .collect()
-                })
-                .unwrap_or_default(),
+            private_http_allow: private_http_allow.map_or_default(|s| {
+                s.split(',')
+                    .map(str::trim)
+                    .filter(|e| !e.is_empty())
+                    .map(str::to_owned)
+                    .collect()
+            }),
             // The remaining caps resolve through their `with_*` builders.
             ..d
         }

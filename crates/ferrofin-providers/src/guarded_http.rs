@@ -40,9 +40,7 @@ pub(crate) const MAX_REDIRECTS: usize = 10;
 /// counted as (METRICS.md rule 6).
 pub(crate) fn limiter_for(url: &str, label: &'static str) -> RateLimiter {
     static LIMITERS: OnceLock<Mutex<HashMap<String, RateLimiter>>> = OnceLock::new();
-    let origin = reqwest::Url::parse(url)
-        .map(|url| url.origin().ascii_serialization())
-        .unwrap_or_default();
+    let origin = reqwest::Url::parse(url).map_or_default(|url| url.origin().ascii_serialization());
     LIMITERS
         .get_or_init(Mutex::default)
         .lock()

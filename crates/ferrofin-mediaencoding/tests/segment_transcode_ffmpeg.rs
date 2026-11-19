@@ -204,8 +204,7 @@ fn start_req<'a>(
         arguments: args,
         log_dir: output_path
             .parent()
-            .map(std::path::Path::to_path_buf)
-            .unwrap_or_default(),
+            .map_or_default(std::path::Path::to_path_buf),
         working_dir: None,
     }
 }

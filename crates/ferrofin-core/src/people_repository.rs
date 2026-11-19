@@ -1013,7 +1013,7 @@ fn person_key(person: &PeopleEntity) -> (String, String) {
 
 /// A credit's role as `UpdatePeople` stores it: trimmed, `""` when missing.
 fn credit_role(person: &PeopleEntity) -> &str {
-    person.role.as_deref().map(str::trim).unwrap_or_default()
+    person.role.as_deref().map_or_default(str::trim)
 }
 
 /// A credit's identity: its person key (see `person_key`) and lower-cased

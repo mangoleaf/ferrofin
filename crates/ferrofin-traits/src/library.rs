@@ -1896,8 +1896,7 @@ pub trait UserManager: Send + Sync {
             .get_user_dto(user, None)
             .await?
             .configuration
-            .map(|c| c.latest_items_excludes)
-            .unwrap_or_default())
+            .map_or_default(|c| c.latest_items_excludes))
     }
 
     /// The cache tag of `user`'s profile image (C#

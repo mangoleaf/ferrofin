@@ -786,14 +786,13 @@ impl ScheduledTask for ChapterImagesTask {
         // Lossy: the file is only ever appended to, so a key torn mid-write by
         // a crash must cost that one key, not the whole history.
         let mut failed: std::collections::BTreeSet<String> = std::fs::read(&fail_history_path)
-            .map(|bytes| {
+            .map_or_default(|bytes| {
                 String::from_utf8_lossy(&bytes)
                     .split('|')
                     .filter(|s| !s.is_empty())
                     .map(str::to_lowercase)
                     .collect()
-            })
-            .unwrap_or_default();
+            });
 
         // A blocklist this large is almost always the fingerprint of a past
         // systemic failure (an unwritable temp directory failing every
@@ -4893,8 +4892,7 @@ mod tests {
         ) -> Option<ferrofin_keyframes::keyframe_data::KeyframeData> {
             let file = Path::new(file_path)
                 .file_name()
-                .map(|n| n.to_string_lossy().into_owned())
-                .unwrap_or_default();
+                .map_or_default(|n| n.to_string_lossy().into_owned());
             self.log
                 .lock()
                 .expect("log")

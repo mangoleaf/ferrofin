@@ -2031,13 +2031,11 @@ mod tests {
             .parent()
             .expect("folder")
             .to_path_buf();
-        let mut written: Vec<String> = std::fs::read_dir(&folder)
-            .map(|entries| {
-                entries
-                    .map(|e| e.expect("entry").file_name().to_string_lossy().into_owned())
-                    .collect()
-            })
-            .unwrap_or_default();
+        let mut written: Vec<String> = std::fs::read_dir(&folder).map_or_default(|entries| {
+            entries
+                .map(|e| e.expect("entry").file_name().to_string_lossy().into_owned())
+                .collect()
+        });
         written.sort();
         let expected: Vec<String> = saved_as
             .map(|ext| format!("song.{ext}"))

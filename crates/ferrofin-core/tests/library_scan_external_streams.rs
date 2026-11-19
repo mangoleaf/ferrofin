@@ -61,7 +61,7 @@ impl ProbeByExtension {
     }
 
     fn probed(&self) -> Vec<(String, bool)> {
-        self.probed.lock().map(|p| p.clone()).unwrap_or_default()
+        self.probed.lock().map_or_default(|p| p.clone())
     }
 
     /// The file names probed since the last call, sorted.
@@ -69,8 +69,7 @@ impl ProbeByExtension {
         let mut names: Vec<String> = self
             .probed
             .lock()
-            .map(|mut p| std::mem::take(&mut *p))
-            .unwrap_or_default()
+            .map_or_default(|mut p| std::mem::take(&mut *p))
             .into_iter()
             .map(|(path, _)| {
                 Path::new(&path)

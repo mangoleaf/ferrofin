@@ -103,11 +103,9 @@ fn playlist_generator(
     encoder: &Arc<dyn MediaEncoder>,
     keyframes: Option<Arc<dyn KeyframeRepository>>,
 ) -> Arc<DynamicHlsPlaylistGenerator<GeneratorEncodingOptions>> {
-    let extractors = keyframes
-        .map(|repository| {
-            ferrofin_core::keyframe_extractors::keyframe_extractors(repository, Arc::clone(encoder))
-        })
-        .unwrap_or_default();
+    let extractors = keyframes.map_or_default(|repository| {
+        ferrofin_core::keyframe_extractors::keyframe_extractors(repository, Arc::clone(encoder))
+    });
     Arc::new(DynamicHlsPlaylistGenerator::new(
         GeneratorEncodingOptions {
             config: Arc::clone(config),

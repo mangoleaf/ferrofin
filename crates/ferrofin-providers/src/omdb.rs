@@ -207,8 +207,7 @@ impl OmdbClient {
         }
         self.get::<OmdbSearchResults>(name, &params)
             .await
-            .map(|r| r.search)
-            .unwrap_or_default()
+            .map_or_default(|r| r.search)
     }
 
     /// The full title record for an IMDb id, or `None` when the id is empty,

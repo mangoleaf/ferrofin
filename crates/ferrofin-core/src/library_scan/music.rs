@@ -1648,7 +1648,7 @@ impl LibraryScanner {
                         .collect();
                         fold.take(&mut temp, result);
                     }
-                    audiodb_images = Some(album.map(|a| a.images).unwrap_or_default());
+                    audiodb_images = Some(album.map_or_default(|a| a.images));
                 }
                 MusicSource::Dynamic(index) => {
                     let Some(result) = self
@@ -1804,7 +1804,7 @@ impl LibraryScanner {
                         .collect();
                         fold.take(&mut temp, result);
                     }
-                    audiodb_images = Some(artist.map(|a| a.images).unwrap_or_default());
+                    audiodb_images = Some(artist.map_or_default(|a| a.images));
                 }
                 MusicSource::Dynamic(index) => {
                     let Some(result) = self
@@ -1889,9 +1889,7 @@ impl LibraryScanner {
                     match (audiodb, &self.audiodb, group.as_deref()) {
                         (Some(images), ..) => found.extend(images),
                         (None, Some(adb), Some(group)) => {
-                            found.extend(
-                                adb.album(group).await.map(|a| a.images).unwrap_or_default(),
-                            );
+                            found.extend(adb.album(group).await.map_or_default(|a| a.images));
                         }
                         _ => {}
                     }
@@ -1916,8 +1914,7 @@ impl LibraryScanner {
                     match (audiodb, &self.audiodb, artist_key.as_deref()) {
                         (Some(images), ..) => found.extend(images),
                         (None, Some(adb), Some(id)) => {
-                            found
-                                .extend(adb.artist(id).await.map(|a| a.images).unwrap_or_default());
+                            found.extend(adb.artist(id).await.map_or_default(|a| a.images));
                         }
                         _ => {}
                     }

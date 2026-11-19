@@ -637,9 +637,8 @@ fn set_audio_info_from_tags(audio: &mut MediaInfo, tags: &CaseInsensitiveTags) {
 
     // Album artist.
     let album_artist = get_first_not_blank(tags, &["albumartist", "album artist", "album_artist"]);
-    audio.album_artists = album_artist
-        .map(|a| split_distinct_artists(&a, NAME_DELIMITERS, true))
-        .unwrap_or_default();
+    audio.album_artists =
+        album_artist.map_or_default(|a| split_distinct_artists(&a, NAME_DELIMITERS, true));
     if audio.album_artists.is_empty() {
         audio.album_artists = audio.artists.clone();
     }

@@ -340,9 +340,8 @@ impl WebFileTransformationService {
         let Ok(bytes) = self.plugins.get_plugin_configuration(EXTENSION_ID).await else {
             return Arc::from([]);
         };
-        let mut transformations = serde_json::from_slice::<ServiceConfig>(&bytes)
-            .map(|c| c.transformations)
-            .unwrap_or_default();
+        let mut transformations =
+            serde_json::from_slice::<ServiceConfig>(&bytes).map_or_default(|c| c.transformations);
         for t in &mut transformations {
             t.regex = regex::Regex::new(&t.filename_pattern).ok();
         }

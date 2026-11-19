@@ -203,8 +203,7 @@ impl ItemDataCleanup {
         let path = row
             .path
             .as_deref()
-            .map(|p| self.virtual_paths.expand(p))
-            .unwrap_or_default();
+            .map_or_default(|p| self.virtual_paths.expand(p));
         let containing_folder = if path.is_empty() {
             String::new()
         } else {

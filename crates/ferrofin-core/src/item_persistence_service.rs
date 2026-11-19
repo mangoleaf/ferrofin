@@ -3836,13 +3836,12 @@ impl ItemPersistenceService for FerrofinItemPersistenceService {
                     locations: crate::item_data::parse_data(data.as_deref())
                         .get("PhysicalLocationsList")
                         .and_then(serde_json::Value::as_array)
-                        .map(|list| {
+                        .map_or_default(|list| {
                             list.iter()
                                 .filter_map(serde_json::Value::as_str)
                                 .map(str::to_owned)
                                 .collect()
-                        })
-                        .unwrap_or_default(),
+                        }),
                     scanned_by,
                 })
             })
@@ -6424,8 +6423,7 @@ pub fn series_key_scope(
     let owning = ferrofin_model::entities_media::owning_library(folders, top_parent_id, path);
     let options = owning.and_then(|f| f.library_options.as_ref());
     let mut collection_folder_ids: Vec<Uuid> = path
-        .map(|path| ferrofin_model::entities_media::libraries_holding(folders, path))
-        .unwrap_or_default()
+        .map_or_default(|path| ferrofin_model::entities_media::libraries_holding(folders, path))
         .into_iter()
         .filter_map(folder_id)
         .collect();

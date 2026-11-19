@@ -185,10 +185,7 @@ pub async fn sync_child_parent_names(db: &Database) -> Result<u64, ServiceError>
 
 /// Whether `key` still has to run.
 async fn once(db: &Database, key: &str) -> Result<bool, ServiceError> {
-    if db.meta_get(key).await?.is_some() {
-        return Ok(false);
-    }
-    Ok(true)
+    Ok(db.meta_get(key).await?.is_none())
 }
 
 async fn done(db: &Database, key: &str) -> Result<(), ServiceError> {
@@ -3503,7 +3500,7 @@ fn data_paths(row: &GroupRow, key: &str) -> Vec<String> {
     parse_data(row.data.as_deref())
         .get(key)
         .and_then(Value::as_array)
-        .map(|paths| {
+        .map_or_default(|paths| {
             paths
                 .iter()
                 .filter_map(Value::as_str)
@@ -3511,7 +3508,6 @@ fn data_paths(row: &GroupRow, key: &str) -> Vec<String> {
                 .map(str::to_owned)
                 .collect()
         })
-        .unwrap_or_default()
 }
 
 /// The stored rows standing for the file at `path` beside `owner`: the

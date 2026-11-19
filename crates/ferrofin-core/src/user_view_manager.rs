@@ -549,7 +549,7 @@ impl FerrofinUserViewManager {
                 // as `"movies"`, and a value that binds to none (`""` too)
                 // hashes as none. Only an absent or `null` member is kept
                 // unchecked.
-                let view_type = view_type.map(CollectionType::json_name).unwrap_or_default();
+                let view_type = view_type.map_or_default(CollectionType::json_name);
                 self.user_named_view_id(user_id, parent, &view_type) == Some(id)
             })
             .collect()
