@@ -1711,12 +1711,17 @@ fn bind_object(
 /// object keeps the members its default lacks as posted: it may be a
 /// `Dictionary<string, T>`, which keeps every key (gl-1872).
 ///
+/// A nested object field also refills the members the post omits from its
+/// default, as a C# class's omitted properties keep their defaults. The C#
+/// replaces a dictionary instead, but the default document cannot tell a map
+/// from a class, so the rule is documented for plugin authors (gl-1878;
+/// `docs/EXTENSIONS.md`, the WIT `default-config`): a map whose entries a user
+/// may remove defaults to `{}`, which has no schema and is stored as posted.
+///
 /// shortcut: the default document is the only schema, so a list whose default is
-/// empty keeps its elements as posted, a nested object keeps the keys its
-/// default lacks unbound (a class drops them in the C#), and a nested object
-/// field refills the keys the post omits from its default, so a dictionary's
-/// default entry cannot be removed (the C# replaces the dictionary); give
-/// plugins a declared schema if one needs any of these.
+/// empty keeps its elements as posted, and a nested object keeps the keys its
+/// default lacks unbound (a class drops them in the C#); give plugins a declared
+/// schema if one needs either.
 fn bind_json(
     slot: &serde_json::Value,
     raw: &RawValue,
@@ -1993,6 +1998,27 @@ mod tests {
         assert!(out.get("Bogus").is_none(), "{out}");
         let err = project(r#"{"Map":{"a":[1],"b":3}}"#).unwrap_err();
         assert!(matches!(err, ServiceError::InvalidInput(_)), "{err:?}");
+    }
+
+    /// A nested object refills the entries a post omits from its default, so a
+    /// map whose entries a user may remove ships `{}`, which is stored exactly
+    /// as posted (gl-1878, the rule in `docs/EXTENSIONS.md` and the WIT
+    /// `default-config`).
+    #[test]
+    fn a_nested_map_default_refills_unless_it_is_empty() {
+        fn project(defaults: &str, json: &str) -> serde_json::Value {
+            let body: super::Members<'_> = serde_json::from_str(json).unwrap();
+            let out = project_config(defaults.as_bytes(), &body).unwrap();
+            serde_json::from_slice(&out).unwrap()
+        }
+
+        let out = project(r#"{"Map":{"a":1}}"#, r#"{"Map":{"b":3}}"#);
+        assert_eq!(out["Map"], serde_json::json!({"a":1,"b":3}));
+        let out = project(r#"{"Map":{}}"#, r#"{"Map":{"b":3}}"#);
+        assert_eq!(out["Map"], serde_json::json!({"b":3}));
+        // A save that removed every entry: the default's come back.
+        let out = project(r#"{"Map":{"a":1}}"#, r#"{"Map":{}}"#);
+        assert_eq!(out["Map"], serde_json::json!({"a":1}));
     }
 
     fn descriptor(id: Uuid, name: &str, enabled: bool) -> PluginDescriptor {

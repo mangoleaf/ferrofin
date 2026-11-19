@@ -549,7 +549,12 @@ world plugin {
     /// The plugin's identity; called once at load, before anything else.
     export descriptor: func() -> plugin-descriptor;
 
-    /// The seed configuration JSON written on first run.
+    /// The seed configuration JSON written on first run. It is also the
+    /// schema a configuration save binds against: a key the save omits takes
+    /// this document's value, in nested objects too (not in a list's
+    /// elements), so an entry a nested object here ships comes back after a
+    /// save that removed it. Give a map whose entries a user may remove an
+    /// empty default (`{}`): it is stored exactly as posted.
     export default-config: func() -> string;
 
     /// The dashboard settings pages this plugin ships (may be empty — the
