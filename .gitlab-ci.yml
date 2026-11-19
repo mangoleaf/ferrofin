@@ -448,15 +448,19 @@ shell-tests:
     # coreutils (realpath -m, tail --pid, truncate's size suffixes) and taskset (util-linux-misc: the
     # parity runner's CPU pin), which the Alpine image lacks; GitHub's Ubuntu runner has them. make
     # runs the Makefile's test-gates-offline.
-    - apk add --no-cache bash bats shellcheck sqlite git jq curl python3 py3-pillow py3-yaml py3-icu findmnt coreutils util-linux-misc py3-pip make
+    - apk add --no-cache bash bats shellcheck sqlite git jq curl python3 py3-pillow py3-yaml py3-icu findmnt coreutils util-linux-misc py3-pip make tini
     # scripts/tests/git-cliff.bats runs git-cliff; the version is mise.toml's and release.yml's
     # (Alpine's PEP 668 marker needs --break-system-packages in this throwaway container).
     - pip install --break-system-packages git-cliff==2.14.2
   script:
     - shellcheck -x scripts/version.sh scripts/ci-config-check.sh scripts/coverage-gate.sh
     - shellcheck -x -s bash scripts/tests/version.bats scripts/tests/ci-config-check.bats scripts/tests/coverage-gate.bats scripts/tests/git-cliff.bats
-    - bats scripts/tests
-    - make test-gates-offline   # the gates' own shellcheck, bats and Python tests: one list, in the Makefile
+    # Without this wrapper, five signal tests fail in this job, and on no other host, exactly as when
+    # the step runs as a background job of sh (SIGINT and SIGQUIT ignored on entry, which bash cannot
+    # trap) under a PID 1 that never reaps (killed processes stay zombies that pgrep -s still lists).
+    # env restores the two signals and tini -s reaps as a child subreaper (gl-1883).
+    - env --default-signal=INT,QUIT tini -s -- bats scripts/tests
+    - env --default-signal=INT,QUIT tini -s -- make test-gates-offline   # the gates' own shellcheck, bats and Python tests: one list, in the Makefile
     - python3 -m unittest discover -s scripts/tests -p 'test_*.py'
     - scripts/ci-config-check.sh check
   rules:
