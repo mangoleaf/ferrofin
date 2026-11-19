@@ -421,8 +421,25 @@ async fn a_box_sets_collection_xml_follows_its_members_and_edits_and_is_read_bac
     names.sort_unstable();
     assert_eq!(names, ["Alpha", "Beta"], "a path naming no item is dropped");
 
-    // The movies library did not open its folders: with no file there, a
-    // metadata edit writes none (the owner rule on media-library writes).
+    // The movies library did not open its folders: a metadata edit leaves
+    // the file there as it is (the owner rule on media-library writes,
+    // gl-1870), and with no file there writes none.
+    let before = std::fs::read(&outside_xml).unwrap();
+    let (status, body) = call(
+        &router,
+        Some(token),
+        "POST",
+        &format!("/Items/{heist}"),
+        Some(json!({"Name": "The Heist", "Overview": "Edited"})),
+    )
+    .await;
+    assert!(status.is_success(), "{status} {body}");
+    settle(providers.as_ref()).await;
+    assert_eq!(
+        std::fs::read(&outside_xml).unwrap(),
+        before,
+        "the existing file is not rewritten"
+    );
     std::fs::remove_file(&outside_xml).unwrap();
     let (status, body) = call(
         &router,

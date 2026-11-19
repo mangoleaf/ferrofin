@@ -1028,7 +1028,9 @@ async fn verify_nfo_savers(
     body["Name"] = json!("Disabled again");
     api.post(&item_url, &body).await;
     assert_eq!(std::fs::read_to_string(&nfo).unwrap(), saved);
-    // Without an explicit list, an edit updates an existing sidecar only.
+    // Without an explicit list and with local saving off, an edit writes
+    // nothing into the media folder, not even over an existing sidecar
+    // (gl-1870).
     options["MetadataSavers"] = Value::Null;
     options["SaveLocalMetadata"] = json!(false);
     api.post(
@@ -1038,11 +1040,7 @@ async fn verify_nfo_savers(
     .await;
     body["Name"] = json!("Legacy existing");
     api.post(&item_url, &body).await;
-    assert!(
-        std::fs::read_to_string(&nfo)
-            .unwrap()
-            .contains("<title>Legacy existing</title>")
-    );
+    assert_eq!(std::fs::read_to_string(&nfo).unwrap(), saved);
     std::fs::remove_file(&nfo).unwrap();
     body["Name"] = json!("Legacy absent");
     api.post(&item_url, &body).await;
