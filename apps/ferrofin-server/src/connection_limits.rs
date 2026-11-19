@@ -11,12 +11,13 @@
 //! - **From that byte**, it has [`KESTREL_LIMITS`]`.request_headers` to finish
 //!   the request line and headers. Past it the connection is answered `408` and
 //!   closes.
-//! - **While the request line and headers arrive**, they are held to Kestrel's
-//!   sizes, `KESTREL_HEAD_LIMITS` (`MaxRequestLineSize`,
-//!   `MaxRequestHeadersTotalSize`, `MaxRequestHeaderCount`), counted as the
-//!   bytes come in, before hyper has buffered more of them. A request line past
-//!   its size is answered `414`, headers past theirs or their count `431`, and
-//!   the connection closes.
+//! - **While the request line and headers arrive**, they are held to
+//!   `HEAD_LIMITS`, counted as the bytes come in, before hyper has buffered
+//!   more of them: Kestrel's header limits (`MaxRequestHeadersTotalSize`,
+//!   `MaxRequestHeaderCount`), and 64 KB for the request line, where Kestrel's
+//!   `MaxRequestLineSize` is 8 KB (an accepted divergence, gl-1869). A request
+//!   line past its size is answered `414`, headers past theirs or their count
+//!   `431`, and the connection closes.
 //! - **While a handler waits for request body bytes** that have not arrived,
 //!   the body must keep up [`KESTREL_LIMITS`]`.min_request_body_rate` (Kestrel's
 //!   `MinRequestBodyDataRate`). Only the waits count: time the handler spends on
@@ -130,27 +131,35 @@ struct HeadLimits {
     header_count: usize,
 }
 
-/// Kestrel's defaults, which Jellyfin does not override either
-/// (`KestrelServerLimits`: 8 KB, 32 KB and 100).
+/// Kestrel's defaults for the headers, which Jellyfin does not override either
+/// (`KestrelServerLimits`: 32 KB and 100), and 64 KB for the request line, not
+/// Kestrel's 8 KB ([`HEAD_LIMIT_DIVERGENCES`]).
 ///
-/// TODO(gl-307): tuning literals like [`KESTREL_LIMITS`]', candidate settings
-/// for the owner; they keep Kestrel's values until then.
-const KESTREL_HEAD_LIMITS: HeadLimits = HeadLimits {
-    request_line: 8 * 1024,
+/// TODO(gl-307): tuning literals like [`KESTREL_LIMITS`], candidate settings
+/// for the owner; they keep these values until then.
+const HEAD_LIMITS: HeadLimits = HeadLimits {
+    request_line: 64 * 1024,
     headers_total: 32 * 1024,
     header_count: 100,
 };
 
-/// Where the head limits depart from Kestrel's, each with its fix path.
+/// Where the head limits depart from Kestrel's, each with its fix path or the
+/// owner decision that keeps it.
 #[cfg_attr(
     not(test),
     expect(dead_code, reason = "a record for readers; a test checks its form")
 )]
 const HEAD_LIMIT_DIVERGENCES: &[&str] = &[
+    "A request line may take 64 KB; Kestrel's MaxRequestLineSize is 8 KB, which \
+     Jellyfin v12.4 does not override, so it answers 414 past it. jellyfin-web puts id lists \
+     with no cap in the query: ItemIds on POST /Sessions/{id}/Playing when it controls \
+     another session's playback, Ids when it adds items to a collection or a playlist \
+     or groups versions. They pass 8 KB at about 232 ids, and v1.5.1 served them. \
+     Owner decision (gl-1869, 2026-11-19).",
     "Not every head is counted: one hyper read wholly or partly with the request \
      before it (pipelining), whose count then starts mid-head and holds that first \
-     partial line to the request line's size (so a header line over 8 KB that Kestrel \
-     accepts can be refused); and the one after a request whose body \
+     partial line to the request line's 64 KB, where Kestrel holds a header line to \
+     the headers' 32 KB; and the one after a request whose body \
      the handler left unread, since hyper drains that body and its bytes cannot be told \
      from a request's here. A peer can bring the second about at will, with a small \
      body to a route that answers before reading it, and gets hyper's own limits (its \
@@ -546,7 +555,7 @@ impl<I: AsyncRead + AsyncWrite + Unpin> AsyncRead for LimitedIo<I> {
                 let Some(head) = this.head.as_mut() else {
                     return Poll::Ready(Ok(()));
                 };
-                match head.feed(received, KESTREL_HEAD_LIMITS) {
+                match head.feed(received, HEAD_LIMITS) {
                     Head::Incomplete => Poll::Ready(Ok(())),
                     Head::Complete => {
                         this.head = None;
@@ -917,10 +926,10 @@ mod tests {
     use tokio::time::{sleep, timeout};
 
     use super::{
-        ConnectionLimits, DATA_RATE_DIVERGENCES, HEAD_LIMIT_DIVERGENCES,
-        HEADERS_TOO_LARGE_RESPONSE, Head, HeadLimits, HeadScan, KESTREL_HEAD_LIMITS,
-        KESTREL_LIMITS, KESTREL_MIN_DATA_RATE, LimitedIo, MinDataRate,
-        REQUEST_LINE_TOO_LONG_RESPONSE, TimedRequestBody,
+        ConnectionLimits, DATA_RATE_DIVERGENCES, HEAD_LIMIT_DIVERGENCES, HEAD_LIMITS,
+        HEADERS_TOO_LARGE_RESPONSE, Head, HeadLimits, HeadScan, KESTREL_LIMITS,
+        KESTREL_MIN_DATA_RATE, LimitedIo, MinDataRate, REQUEST_LINE_TOO_LONG_RESPONSE,
+        TimedRequestBody,
     };
 
     /// Long enough that only a connection nothing closes takes this long.
@@ -1749,9 +1758,12 @@ mod tests {
     }
 
     #[test]
-    fn every_divergence_names_its_fix_path() {
+    fn every_divergence_names_its_fix_path_or_its_decision() {
         for divergence in DATA_RATE_DIVERGENCES.iter().chain(HEAD_LIMIT_DIVERGENCES) {
-            assert!(divergence.contains("Fix path: "), "{divergence}");
+            assert!(
+                divergence.contains("Fix path: ") || divergence.contains("Owner decision (gl-"),
+                "{divergence}"
+            );
         }
     }
 
@@ -1857,7 +1869,7 @@ mod tests {
                 request,
                 HeadLimits {
                     request_line: limit,
-                    ..KESTREL_HEAD_LIMITS
+                    ..HEAD_LIMITS
                 }
             ),
             Head::Complete
@@ -1873,7 +1885,7 @@ mod tests {
     fn a_request_line_past_its_limit_is_answered_414(#[case] request_line: &str) {
         let limits = HeadLimits {
             request_line: request_line.len() - 1,
-            ..KESTREL_HEAD_LIMITS
+            ..HEAD_LIMITS
         };
         assert_eq!(
             scan(request_line, limits),
@@ -1895,7 +1907,7 @@ mod tests {
         let headers = make_headers(count);
         let limits = HeadLimits {
             headers_total: headers.len() + extra,
-            ..KESTREL_HEAD_LIMITS
+            ..HEAD_LIMITS
         };
         let request = format!("GET / HTTP/1.1\r\n{headers}\r\n");
         assert_eq!(scan(&request, limits), Head::Complete);
@@ -1918,7 +1930,7 @@ mod tests {
                 &request,
                 HeadLimits {
                     header_count: max,
-                    ..KESTREL_HEAD_LIMITS
+                    ..HEAD_LIMITS
                 }
             ),
             Head::Complete
@@ -1933,7 +1945,7 @@ mod tests {
         let headers = make_headers(count);
         let limits = HeadLimits {
             headers_total: headers.len() - 1,
-            ..KESTREL_HEAD_LIMITS
+            ..HEAD_LIMITS
         };
         let request = format!("GET / HTTP/1.1\r\n{headers}\r\n");
         assert_eq!(
@@ -1954,7 +1966,7 @@ mod tests {
                 &request,
                 HeadLimits {
                     header_count: max,
-                    ..KESTREL_HEAD_LIMITS
+                    ..HEAD_LIMITS
                 }
             ),
             Head::Rejected(HEADERS_TOO_LARGE_RESPONSE, "request header count")
@@ -1981,14 +1993,14 @@ mod tests {
                 request,
                 HeadLimits {
                     request_line: line_limit,
-                    ..KESTREL_HEAD_LIMITS
+                    ..HEAD_LIMITS
                 }
             ),
             expected
         );
     }
 
-    /// One request to a real serve loop, answered at Kestrel's defaults: what
+    /// One request to a real serve loop, answered under the head limits: what
     /// the server sends before it closes, or the start of its `hello`.
     async fn send_head(request: &[u8]) -> String {
         let server = Server::start(hello(), LIMITS);
@@ -2009,13 +2021,14 @@ mod tests {
         String::from_utf8_lossy(&received).into_owned()
     }
 
-    /// Kestrel's defaults hold at the server seam (gl-1380): 8 KB for the
-    /// request line, 32 KB for the headers, 100 headers; one byte or header
-    /// more is refused by this module's count. hyper's own limits are larger
-    /// for the sizes and the same 100 for the count.
+    /// The head limits hold at the server seam (gl-1380, gl-1869): 64 KB for
+    /// the request line, Kestrel's 32 KB for the headers and 100 headers; one
+    /// byte or header more is refused by this module's count. hyper's own
+    /// limits are larger for the sizes (for the line only just: its target may
+    /// take 65,534 bytes) and the same 100 for the count.
     #[rstest]
-    #[case::request_line_at_its_limit(8 * 1024, 0, 1, "HTTP/1.1 200")]
-    #[case::request_line_past_its_limit(8 * 1024 + 1, 0, 1, "HTTP/1.1 414 URI Too Long\r\n")]
+    #[case::request_line_at_its_limit(64 * 1024, 0, 1, "HTTP/1.1 200")]
+    #[case::request_line_past_its_limit(64 * 1024 + 1, 0, 1, "HTTP/1.1 414 URI Too Long\r\n")]
     #[case::headers_at_their_limit(0, 32 * 1024, 1, "HTTP/1.1 200")]
     #[case::headers_past_their_limit(
         0,
@@ -2026,7 +2039,7 @@ mod tests {
     #[case::headers_at_their_count(0, 0, 100, "HTTP/1.1 200")]
     #[case::headers_past_their_count(0, 0, 101, "HTTP/1.1 431 Request Header Fields Too Large\r\n")]
     #[tokio::test]
-    async fn kestrels_head_limits_hold_at_the_server(
+    async fn the_head_limits_hold_at_the_server(
         #[case] request_line: usize,
         #[case] headers_total: usize,
         #[case] header_count: usize,
@@ -2112,25 +2125,27 @@ mod tests {
     /// long its line.
     #[tokio::test]
     async fn a_body_left_unread_is_not_counted_as_a_head() {
-        let (mut peer, io) = tokio::io::duplex(64 * 1024);
+        // A line one byte past the request line's limit.
+        let past_the_line = vec![b'a'; HEAD_LIMITS.request_line + 1];
+        let (mut peer, io) = tokio::io::duplex(past_the_line.len());
         let mut io = LimitedIo::new(io, KESTREL_LIMITS);
         let head = b"POST /upload HTTP/1.1\r\nHost: x\r\nContent-Length: 100000\r\n\r\n";
         peer.write_all(head).await.expect("head");
-        let mut buf = vec![0; 16 * 1024];
+        let mut buf = vec![0; past_the_line.len()];
         assert_eq!(io.read(&mut buf).await.expect("head read"), head.len());
         let running = io.requests().start();
         let request = running.time_body(axum::extract::Request::new(Body::from("body")));
         // Answered without the body: the request ends with it unread.
         drop(running);
         drop(request);
-        peer.write_all(&[b'a'; 10_000]).await.expect("body");
+        peer.write_all(&past_the_line).await.expect("body");
         let mut read = 0;
-        while read < 10_000 {
+        while read < past_the_line.len() {
             read += io.read(&mut buf).await.expect("body read");
         }
         // The next request ran without a body: what follows it is counted.
         drop(io.requests().start());
-        peer.write_all(&[b'a'; 10_000]).await.expect("line");
+        peer.write_all(&past_the_line).await.expect("line");
         let error = io.read(&mut buf).await.expect_err("a 414");
         assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
     }
