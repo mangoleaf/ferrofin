@@ -491,6 +491,15 @@ impl ScheduledTask for DeleteTranscodeFileTask {
 /// either: it analyses every populated, indexed table that has none.
 /// Statistics an earlier version left behind are dropped at boot
 /// (`ferrofin-db`'s `Database::connect_tuned`).
+///
+/// Accepted divergence (owner decision, 2026-11-19): upstream's
+/// `ExecuteAsync` catches whatever `RunScheduledOptimisation` throws and only
+/// logs it, so a failed vacuum or checkpoint ends its run `Completed`.
+/// Ferrofin returns the error, so the run is recorded `Failed` with its
+/// message and a `TaskFailed` activity entry, as every release up to v1.5.1
+/// did: the dashboard's "(Failed)" and Alerts entry are an administrator's
+/// only sign that the database is not being compacted (a full disk, the
+/// write lock held past the busy timeout). No client acts on the status.
 pub struct OptimizeDatabaseTask {
     db: Database,
     sessions: Arc<dyn SessionManager>,
@@ -598,30 +607,23 @@ impl ScheduledTask for OptimizeDatabaseTask {
             }
         }
         tracing::info!("optimizing and vacuuming the database");
-        let optimized: Result<(), ServiceError> = async {
-            // `OptimizeAsync` empties the log before the vacuum, which then
-            // writes its copy of the database into it.
-            self.db.truncate_wal().await.map_err(ServiceError::from)?;
-            // Unlike upstream, no `ANALYZE`, and no `PRAGMA optimize` either:
-            // see the type's doc.
-            sqlx::query("VACUUM")
-                .execute(self.db.writer())
-                .await
-                .map_err(db_err)?;
-            progress.report(75.0);
-            // `PRAGMA wal_checkpoint(TRUNCATE)`, in turn with the background
-            // checkpoints: the vacuum's commit has just started one, which the
-            // truncation would otherwise answer busy against.
-            self.db.truncate_wal().await.map_err(ServiceError::from)?;
-            progress.report(100.0);
-            Ok(())
-        }
-        .await;
-        // `ExecuteAsync` catches whatever the optimisation throws and logs it,
-        // so a failed vacuum or checkpoint still ends the run `Completed`.
-        if let Err(error) = optimized {
-            tracing::error!(%error, "could not optimize the database");
-        }
+        // Unlike upstream's `ExecuteAsync`, a failure below is returned, so
+        // the run is recorded `Failed`: see the type's doc.
+        // `OptimizeAsync` empties the log before the vacuum, which then
+        // writes its copy of the database into it.
+        self.db.truncate_wal().await.map_err(ServiceError::from)?;
+        // Unlike upstream, no `ANALYZE`, and no `PRAGMA optimize` either:
+        // see the type's doc.
+        sqlx::query("VACUUM")
+            .execute(self.db.writer())
+            .await
+            .map_err(db_err)?;
+        progress.report(75.0);
+        // `PRAGMA wal_checkpoint(TRUNCATE)`, in turn with the background
+        // checkpoints: the vacuum's commit has just started one, which the
+        // truncation would otherwise answer busy against.
+        self.db.truncate_wal().await.map_err(ServiceError::from)?;
+        progress.report(100.0);
         Ok(())
     }
 }
@@ -1443,13 +1445,14 @@ mod tests {
         assert!((progress.current() - 100.0).abs() < f64::EPSILON);
     }
 
-    /// `OptimizeDatabaseTask.ExecuteAsync` catches whatever the optimisation
-    /// throws and logs it, so a failed vacuum still ends the run `Completed`.
-    /// `OptimizeAsync` empties the write-ahead log before the vacuum. The
-    /// vacuum fails here and the trailing truncation never runs, so an empty
-    /// log can only come from the leading one.
+    /// A failed vacuum is returned, so the runner records the run `Failed`
+    /// (accepted divergence: upstream's `ExecuteAsync` catches it and ends
+    /// `Completed`; see the type's doc). The runner logs it, the task does
+    /// not. `OptimizeAsync` empties the write-ahead log before the vacuum.
+    /// The vacuum fails here and the trailing truncation never runs, so an
+    /// empty log can only come from the leading one.
     #[tokio::test]
-    async fn optimize_database_completes_when_the_vacuum_fails() {
+    async fn optimize_database_fails_when_the_vacuum_fails() {
         let dir = tempfile::tempdir().expect("tempdir");
         let file = dir.path().join("jellyfin.db");
         let db = Database::connect(&format!("sqlite://{}?mode=rwc", file.display()))
@@ -1479,32 +1482,27 @@ mod tests {
                 .finish(),
         );
         let progress = TaskProgress::default();
-        task.execute(&progress)
+        let error = task
+            .execute(&progress)
             .await
-            .expect("a failed optimisation is logged, not returned");
+            .expect_err("a failed vacuum fails the run");
+        assert!(error.to_string().contains("readonly"), "{error}");
         assert_eq!(progress.reported(), None, "the vacuum did not go through");
         assert_eq!(
             std::fs::metadata(&wal).expect("wal").len(),
             0,
             "the log was emptied before the vacuum"
         );
-        let failures: Vec<String> = logs
-            .text()
-            .lines()
-            .filter(|line| line.contains("could not optimize the database"))
-            .map(str::to_owned)
-            .collect();
-        assert_eq!(failures.len(), 1, "logged once: {failures:?}");
         assert!(
-            failures[0].contains("ERROR") && failures[0].contains("readonly"),
-            "at error, with the error: {failures:?}"
+            !logs.text().contains("ERROR"),
+            "the runner logs the failure, the task does not: {}",
+            logs.text()
         );
     }
 
-    /// A failed checkpoint is caught as a failed vacuum is: the leading one
-    /// runs in the same block.
+    /// A failed checkpoint fails the run as a failed vacuum does.
     #[tokio::test]
-    async fn optimize_database_completes_when_the_checkpoint_fails() {
+    async fn optimize_database_fails_when_the_checkpoint_fails() {
         let db = test_db().await;
         let task = OptimizeDatabaseTask::new(
             db.clone(),
@@ -1516,7 +1514,7 @@ mod tests {
         let progress = TaskProgress::default();
         task.execute(&progress)
             .await
-            .expect("a failed checkpoint is logged, not returned");
+            .expect_err("a failed checkpoint fails the run");
         assert_eq!(progress.reported(), None, "no step went through");
     }
 
