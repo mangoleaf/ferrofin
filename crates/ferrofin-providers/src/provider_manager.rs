@@ -14754,14 +14754,14 @@ mod tests {
         }
     }
 
-    /// TheTVDB's series artwork as the plugin's `CreateRemoteImageInfo` builds
-    /// it (jellyfin-plugin-tvdb `5c4592f`, `TvdbSdkExtensions.cs:225-243`): no
-    /// `CommunityRating`, TheTVDB's score is dropped, and a missing dimension
-    /// is 0 (`Convert.ToInt32` of a null). `OrderByLanguageDescending` then has
-    /// no rating to break a same-language tie with, so its stable sort keeps
-    /// TheTVDB's order: the lower-scored poster TheTVDB lists first stays first.
+    /// TheTVDB's series artwork carries TheTVDB's score as its
+    /// `CommunityRating` and keeps a missing dimension unknown, as v1.5.1 did
+    /// (accepted divergence from jellyfin-plugin-tvdb's `CreateRemoteImageInfo`,
+    /// see `tvdb::ArtworkWire::into_series_image`). `OrderByLanguageDescending`
+    /// breaks a same-language tie by rating, so the higher-scored poster comes
+    /// first although TheTVDB lists it second.
     #[tokio::test]
-    async fn tvdb_series_images_carry_no_rating_and_keep_tvdbs_order() {
+    async fn tvdb_series_images_carry_the_score_and_sort_by_it() {
         let server = crate::mock_http::MockServer::start(vec![
             ("/login", r#"{"data":{"token":"tok"}}"#.to_owned()),
             ("/series/5/extended", r#"{"data":{"id":5,"artworks":[{"type":2,"image":"low.jpg","language":"eng","score":1,"width":680,"height":1000},{"type":2,"image":"high.jpg","language":"eng","score":9}]}}"#.to_owned()),
@@ -14817,8 +14817,8 @@ mod tests {
         assert_eq!(
             candidates,
             [
-                (Some("low.jpg"), None, Some(680), Some(1000)),
-                (Some("high.jpg"), None, Some(0), Some(0)),
+                (Some("high.jpg"), Some(9.0), None, None),
+                (Some("low.jpg"), Some(1.0), Some(680), Some(1000)),
             ]
         );
     }
