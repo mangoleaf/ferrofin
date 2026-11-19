@@ -307,10 +307,10 @@ Wired and working, with a documented limitation or lighter verification:
   outside the data directory, as on Jellyfin 12; in `{data}/collections` the `LinkedChildren`
   table decides, so, as on Jellyfin 12, a box set stored again from its folder (after the
   library was removed and made again) gets its title and metadata back but comes back empty.
-  The file is written into a box-set folder inside a media library only when that library saves
-  metadata into its media folders ("Save artwork into media folders"), or by an edit or member
-  change when the file is already there, and a library that lists its metadata savers must list
-  "Emby Xml".
+  The file is written into a box-set folder inside a media library only when that library opts
+  in: it lists its metadata savers and "Emby Xml" is among them, or, without such a list, it
+  saves metadata into its media folders ("Save artwork into media folders"). Otherwise a file
+  already there is left as it is; in a library without a saver list Jellyfin rewrites it.
 
 ## Not implemented (by design)
 

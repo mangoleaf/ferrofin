@@ -244,18 +244,18 @@ MONITOR_DELAY=$(jq -r '.LibraryMonitorDelay // 0' <<<"$CONFIG") || MONITOR_DELAY
 # so row 8 finds no rating there to fill again: ProviderManager.IsSaverEnabledForItem. With the
 # library's metadata savers chosen: when they include Nfo. With none chosen: never when the
 # server disables Nfo for the item's type (its first MetadataOptions entry, as
-# GetMetadataOptionsForType); otherwise when the library saves metadata into media folders or
-# the saver's file exists already. An episode's NFO saver writes the episode's own NFO, which
-# the script made; a movie's writes movie.nfo, which nothing made.
+# GetMetadataOptionsForType); otherwise when the library saves metadata into media folders.
+# Upstream also rewrites a saver's file that exists already (an episode's own NFO, which the
+# script made); Ferrofin never writes into a media folder the library did not open to it.
 case $KIND in movies) SAVER_TYPE=Movie ;; *) SAVER_TYPE=Episode ;; esac
 NFO_DISABLED=$(jq -r --arg type "$SAVER_TYPE" '
   [(.MetadataOptions // [])[] | select((.ItemType // "" | ascii_downcase) == ($type | ascii_downcase))][0]
   | any((.DisabledMetadataSavers // [])[]; ascii_downcase == "nfo")' <<<"$CONFIG") || NFO_DISABLED=false
-EDIT_REWRITES_NFO=$(jq -r --arg kind "$KIND" --argjson disabled "$NFO_DISABLED" '
+EDIT_REWRITES_NFO=$(jq -r --argjson disabled "$NFO_DISABLED" '
   .LibraryOptions as $o
   | if $o.MetadataSavers != null then any($o.MetadataSavers[]; ascii_downcase == "nfo")
     elif $disabled then false
-    else ($o.SaveLocalMetadata // false) or $kind == "tvshows" end' <<<"$library") || EDIT_REWRITES_NFO=false
+    else $o.SaveLocalMetadata // false end' <<<"$library") || EDIT_REWRITES_NFO=false
 
 if [ -z "$CLIP" ] && command -v ffmpeg >/dev/null; then
   CLIP=$WORK/clip.mkv
