@@ -282,6 +282,16 @@ too, matching Jellyfin (a disabled plugin is never instantiated there). One
 caveat belongs in the trust section below: page content runs in the admin's
 browser, not in the sandbox.
 
+**What a save fills from the default.** A configuration save is bound against the
+plugin's `default-config` document, the way Jellyfin binds it into the plugin's
+configuration class: a key the save omits takes the default's value, at the top level and
+in every nested object outside a list (a list's elements are never filled). So an entry
+that a nested object's default ships comes back after a save that removed it. Give a map
+whose entries a user may remove (per-library settings keyed by id, say) an empty default,
+`{}`: an empty object has nothing to fill from and is stored exactly as posted. Jellyfin
+replaces a settable `Dictionary` property outright, but a JSON default cannot tell a map
+from a class, and upstream's nested settings are classes in practice.
+
 **The sandbox is the point.** A WASM plugin gets *no filesystem, no direct network, no
 environment, no stdio* — its only capabilities are the functions the WIT `host` interface
 explicitly exports, so that one file is the entire reviewable attack surface. Today that
