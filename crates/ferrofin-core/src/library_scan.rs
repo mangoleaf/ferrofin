@@ -38480,10 +38480,12 @@ mod tests {
     /// only under "Replace all metadata", where `RemoveOldMetadata` skips
     /// "add existing metadata to provider result" (`:905`); every other mode
     /// turns the empty list into null there and keeps the cast. That needs a
-    /// library that saves no metadata: where the Nfo saver is on (the existing
-    /// NFO turns it on), "Replace all metadata" reads no NFO at all
-    /// (`isSavingMetadata && ReplaceAllMetadata`, `MetadataService.cs:803`),
-    /// and with no provider answering the cast stands.
+    /// library that saves no metadata, which a library that names no saver
+    /// and does not save into its media folders is, NFO or no NFO there
+    /// (gl-1870): where the Nfo saver is on (the library names it), "Replace
+    /// all metadata" reads no NFO at all (`isSavingMetadata &&
+    /// ReplaceAllMetadata`, `MetadataService.cs:803`), and with no provider
+    /// answering the cast stands.
     #[rstest::rstest]
     #[case::scan("scan", false, 2)]
     #[case::missing("missing", false, 2)]
@@ -38497,7 +38499,7 @@ mod tests {
     ) {
         let tmp = tempfile::tempdir().unwrap();
         let options = LibraryOptions {
-            metadata_savers: (!saving).then(Vec::new),
+            metadata_savers: saving.then(|| vec!["Nfo".to_owned()]),
             ..LibraryOptions::default()
         };
         let (vf, persistence, people, episode_id, items) =

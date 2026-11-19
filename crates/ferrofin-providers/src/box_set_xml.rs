@@ -21,9 +21,16 @@
 //!   server's own directories (owner decision 2026-10-17, CLAUDE.md "Current
 //!   scope"). A box-set folder inside a media library follows the library's
 //!   "Save artwork into media folders" (`SaveLocalMetadata`), so nothing is
-//!   written into a media folder the library did not open to it, except
-//!   that an edit or a member change (`MetadataEdit`) rewrites a file
-//!   already there, as `IsSaverEnabledForItem` does.
+//!   written into a media folder the library did not open to it.
+//!
+//! ACCEPTED DIVERGENCE (owner decision 2026-11-19, gl-1870): an edit or a
+//! member change (`MetadataEdit`) never rewrites a `collection.xml` already
+//! in a media folder the library did not open. In a library with no saver
+//! list upstream writes a box set's file whatever `SaveLocalMetadata` says
+//! (the override above), and for any other item `IsSaverEnabledForItem`
+//! rewrites a saver's existing file on an edit.
+//! A file left in place can be read again at a refresh until the library
+//! opts in.
 //!
 //! ACCEPTED DIVERGENCE (upstream bug, not ported; owner decision
 //! 2026-11-14): the file's `<DisplayOrder>` applies like any other field it
@@ -138,13 +145,12 @@ pub fn takes_members_from_file(data_path: &str, path: &Path) -> bool {
 /// - otherwise the server's options for box sets must not disable it, and
 ///   `IsSaveLocalMetadataEnabled()` must hold — `own_directory` (the
 ///   override, see the module doc) or the library's `SaveLocalMetadata` —
-///   unless the update is a metadata edit and the file already exists.
+///   whether or not the file already exists (the module doc's divergence).
 fn enabled(
     library: Option<&LibraryOptions>,
     global: Option<&MetadataOptions>,
     update: ItemUpdateType,
     own_directory: bool,
-    file_exists: impl FnOnce() -> bool,
 ) -> bool {
     if !matches!(
         update,
@@ -165,9 +171,7 @@ fn enabled(
     }) {
         return false;
     }
-    own_directory
-        || library.is_some_and(|library| library.save_local_metadata)
-        || (update == ItemUpdateType::MetadataEdit && file_exists())
+    own_directory || library.is_some_and(|library| library.save_local_metadata)
 }
 
 /// The registered `BoxSetXmlSaver`, reading the box set through the
@@ -238,9 +242,9 @@ impl BoxSetXmlSaver {
         row: &BaseItemEntity,
         update: ItemUpdateType,
     ) -> Result<bool, ServiceError> {
-        let Some(path) = xml_path(row) else {
+        if xml_path(row).is_none() {
             return Ok(false);
-        };
+        }
         // The libraries' snapshot, as upstream's `GetLibraryOptions(item)`
         // reads them from memory.
         let folders = self.folders.library_folders().await?;
@@ -259,9 +263,7 @@ impl BoxSetXmlSaver {
                 Path::new(folder),
             )
         });
-        Ok(enabled(library, global, update, own_directory, || {
-            path.is_file()
-        }))
+        Ok(enabled(library, global, update, own_directory))
     }
 
     /// `ProviderManager.SaveMetadataAsync` with this saver: writes the box
@@ -425,13 +427,13 @@ mod tests {
             ItemUpdateType::MetadataImport,
             ItemUpdateType::ImageUpdate,
         ] {
-            assert!(!enabled(None, None, update, true, || true), "{update:?}");
+            assert!(!enabled(None, None, update, true), "{update:?}");
         }
         for update in [
             ItemUpdateType::MetadataDownload,
             ItemUpdateType::MetadataEdit,
         ] {
-            assert!(enabled(None, None, update, true, || false), "{update:?}");
+            assert!(enabled(None, None, update, true), "{update:?}");
         }
     }
 
@@ -445,26 +447,21 @@ mod tests {
             ..Default::default()
         };
         let download = ItemUpdateType::MetadataDownload;
-        assert!(!enabled(Some(&library), None, download, true, || true));
+        assert!(!enabled(Some(&library), None, download, true));
         library.metadata_savers = Some(vec!["emby xml".into()]);
-        assert!(enabled(Some(&library), None, download, false, || false));
+        assert!(enabled(Some(&library), None, download, false));
         library.metadata_savers = None;
         let global = MetadataOptions {
             disabled_metadata_savers: vec!["Emby Xml".into()],
             ..Default::default()
         };
-        assert!(!enabled(
-            Some(&library),
-            Some(&global),
-            download,
-            true,
-            || true
-        ));
+        assert!(!enabled(Some(&library), Some(&global), download, true));
     }
 
     /// The owner rule: the always-true override holds in the server's own
     /// directories; a box set folder in a media library follows its
-    /// library's `SaveLocalMetadata`, except an edit of a file already there.
+    /// library's `SaveLocalMetadata`, an edit included, whether or not its
+    /// file is already there (gl-1870).
     #[test]
     fn outside_the_servers_directories_the_library_decides() {
         let mut library = LibraryOptions {
@@ -473,12 +470,11 @@ mod tests {
         };
         let download = ItemUpdateType::MetadataDownload;
         let edit = ItemUpdateType::MetadataEdit;
-        assert!(enabled(Some(&library), None, download, true, || false));
-        assert!(!enabled(Some(&library), None, download, false, || true));
-        assert!(!enabled(Some(&library), None, edit, false, || false));
-        assert!(enabled(Some(&library), None, edit, false, || true));
-        assert!(!enabled(None, None, download, false, || false));
+        assert!(enabled(Some(&library), None, download, true));
+        assert!(!enabled(Some(&library), None, download, false));
+        assert!(!enabled(Some(&library), None, edit, false));
+        assert!(!enabled(None, None, download, false));
         library.save_local_metadata = true;
-        assert!(enabled(Some(&library), None, download, false, || false));
+        assert!(enabled(Some(&library), None, download, false));
     }
 }

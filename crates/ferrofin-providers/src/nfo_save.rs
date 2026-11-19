@@ -46,8 +46,10 @@ type SaveLocks = Mutex<HashMap<PathBuf, Weak<tokio::sync::Mutex<()>>>>;
 /// Whether the Nfo saver is enabled for `row` at `MetadataEdit`: upstream's
 /// `isSavingMetadata` (`ProviderManager.GetMetadataSavers(item,
 /// libraryOptions).Any()`, `MetadataService.cs:184`), under which "Replace
-/// all metadata" skips the local readers (`:803`). An existing sidecar counts
-/// even with local saving off (`IsSaverEnabledForItem`, `:880-889`).
+/// all metadata" skips the local readers (`:803`). With no saver list and
+/// local saving off, an existing sidecar does not turn it on (upstream's
+/// `ProviderManager.IsSaverEnabledForItem` lets it; owner decision
+/// 2026-11-19, gl-1870), so "Replace all metadata" reads that sidecar there.
 ///
 /// `library` is the item's library options and `global` the server-wide
 /// options for its kind, as [`NfoSaver`] resolves them.

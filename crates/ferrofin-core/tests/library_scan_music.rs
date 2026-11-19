@@ -2226,11 +2226,11 @@ async fn a_plugin_is_never_asked_by_an_unchanged_rescan() {
 /// MusicBrainz, TheAudioDB and a plugin ranked first only fill what the NFO
 /// left: the NFO's overview and genres stand over all three; the plugin's
 /// tagline and MusicBrainz's year fill the gaps. "Replace all metadata"
-/// reads neither: an existing NFO enables the Nfo saver at `MetadataEdit`
-/// (`ProviderManager.IsSaverEnabledForItem`, `:880-889`), and upstream skips
-/// the local readers of an item it is saving metadata for under "Replace all
-/// metadata" (`isSavingMetadata && ReplaceAllMetadata`, `MetadataService.cs:
-/// 803`), so the providers' values replace the NFO's.
+/// reads neither in a library that names the Nfo saver
+/// (`ProviderManager.IsSaverEnabledForItem`): upstream skips the local
+/// readers of an item it is saving metadata for under "Replace all metadata"
+/// (`isSavingMetadata && ReplaceAllMetadata`, `MetadataService.cs:803`), so
+/// the providers' values replace the NFO's.
 #[rstest::rstest]
 #[case::first_scan(false)]
 #[case::replace_all(true)]
@@ -2240,7 +2240,11 @@ async fn the_music_nfo_stands_over_every_remote_provider_except_under_replace_al
 ) {
     let plugin = PluginDb::new();
     let tmp = tempfile::tempdir().expect("tmp");
-    let fx = Fixture::with_plugins(tmp.path(), plugin_ranked(true), plugin.source()).await;
+    let options = LibraryOptions {
+        metadata_savers: Some(vec!["Nfo".into()]),
+        ..plugin_ranked(true)
+    };
+    let fx = Fixture::with_plugins(tmp.path(), options, plugin.source()).await;
     std::fs::write(
         fx.album_dir.join("album.nfo"),
         "<album><title>Kind of Blue</title><plot>NFO album text.</plot>\

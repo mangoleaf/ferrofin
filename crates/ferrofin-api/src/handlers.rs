@@ -2372,7 +2372,7 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
                    movie, series, season and episode providers answer is the \
                    metadata-providers row's; what the other providers answer (gl-1815) and how \
                    the answers merge field by field (gl-1813) are not part of this row.",
-        date: "2026-11-15",
+        date: "2026-11-19",
         divergences: &[
             "An album below an identified artist is looked up by its own ids, name and year; \
              upstream's ApplySearchResult gives every child but a season or an episode the \
@@ -2399,6 +2399,12 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
              writes, nothing else in a media folder), which extends the owner decision \
              of 2026-10-17 on media-library writes to deletes; the owner has not yet \
              ruled on the narrower deletes.",
+            "In a library with no metadata saver list and SaveLocalMetadata off, \
+             ReplaceAllMetadata reads an item's existing NFO or a box set's existing \
+             collection.xml; upstream's IsSaverEnabledForItem counts the saver enabled in \
+             that library (isSavingMetadata) for an existing NFO, and always for a box set, \
+             so it skips the file and rewrites it, where Ferrofin reads it and never rewrites \
+             it (owner decision 2026-11-19).",
         ],
     },
     VerifiedSubsystem {
@@ -4762,7 +4768,7 @@ pub const VERIFIED: &[Verified] = &[
                physical_folder for FindFolders, ensure_library for AddVirtualFolder with its \
                LibraryOptions, ensure_folder for the Folder row ValidateTopLibraryFolders \
                makes)",
-        date: "2026-11-14",
+        date: "2026-11-19",
         divergences: &[
             "A missing name makes a box set with an empty name, where upstream's \
          GetValidFilename dereferences the null and answers 500. Jellyfin bug not ported.",
@@ -4786,9 +4792,12 @@ pub const VERIFIED: &[Verified] = &[
          applies and every refresh a provider answered resets the box set's display order \
          to PremiereDate. Jellyfin bug not ported (owner decision 2026-11-14).",
             "The always-true BoxSet.IsSaveLocalMetadataEnabled holds only for a box set whose \
-         folder is in the server's own directories; one in a media library is written only \
-         when that library saves into its media folders, or by an edit or member change when \
-         its file already exists (owner decision 2026-10-17).",
+         folder is in the server's own directories (owner decision 2026-10-17); one in a media \
+         library is written only when that library lists the Emby Xml saver or, with no saver \
+         list, saves into its media folders, and otherwise an edit or member change never \
+         rewrites a collection.xml already there, where upstream, in a library with no saver \
+         list, writes a box set's file whatever SaveLocalMetadata says (owner decision \
+         2026-11-19).",
         ],
         refs: &[],
     },
