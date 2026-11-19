@@ -615,8 +615,9 @@ pub struct Config {
     /// Initial media library roots used to seed a fresh install.
     pub library_roots: Vec<PathBuf>,
 
-    /// This server's advertised machine / friendly name. Defaults to the host
-    /// name.
+    /// The name the server advertises when none is saved on the dashboard.
+    /// Defaults to the machine name (`Environment.MachineName`: the host name
+    /// up to its first dot), else `ferrofin`.
     pub server_name: String,
 
     /// Log filter in `EnvFilter` (RUST_LOG) syntax.
@@ -1252,7 +1253,7 @@ impl Config {
         let server_name = env
             .var("FERROFIN_SERVER_NAME")
             .or(file.server_name)
-            .unwrap_or_else(|| default_server_name(env));
+            .unwrap_or_else(default_server_name);
 
         let log_level = env
             .var("FERROFIN_LOG")
@@ -2579,11 +2580,10 @@ fn default_data_dir(env: &dyn Env) -> PathBuf {
     PathBuf::from(SYSTEM_DATA_DIR)
 }
 
-/// The default advertised server name: the host name, else `"ferrofin"`.
-fn default_server_name(env: &dyn Env) -> String {
-    env.var("HOSTNAME")
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| "ferrofin".to_owned())
+/// The default advertised server name: the machine name upstream falls back
+/// to (`Environment.MachineName`), else `"ferrofin"`.
+fn default_server_name() -> String {
+    ferrofin_core::application_host::machine_name().unwrap_or_else(|| "ferrofin".to_owned())
 }
 
 /// Splits a `FERROFIN_LIBRARY_ROOTS` list value on the OS path separator (`:` on
@@ -2960,11 +2960,19 @@ mod tests {
         assert!(cfg.published_url.is_none());
     }
 
+    /// gl-1777: the default is the machine name, whatever `HOSTNAME` says;
+    /// the variable still names the server.
     #[test]
-    fn server_name_defaults_to_hostname_env() {
-        let env = FakeEnv::new().with("HOSTNAME", "media-box");
+    fn server_name_defaults_to_the_machine_name() {
+        let env = FakeEnv::new().with("HOSTNAME", "not-the-machine.example.lan");
         let cfg = Config::load_from(Cli::default(), &env).unwrap();
-        assert_eq!(cfg.server_name, "media-box");
+        assert_eq!(cfg.server_name, default_server_name());
+        assert_ne!(cfg.server_name, "not-the-machine.example.lan");
+        let env = env.with("FERROFIN_SERVER_NAME", "nas");
+        assert_eq!(
+            Config::load_from(Cli::default(), &env).unwrap().server_name,
+            "nas"
+        );
     }
 
     #[test]

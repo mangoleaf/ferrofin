@@ -321,6 +321,41 @@ pub async fn channel_user_data(
         .collect())
 }
 
+/// [`channel_last_played_by_anyone`]'s statement: each channel's newest
+/// `LastPlayedDate` over every user's rows, seeking the rows by item.
+const CHANNEL_LAST_PLAYED_SQL: &str = r#"SELECT c."Id",
+       (SELECT MAX(ud."LastPlayedDate") FROM "UserData" ud WHERE ud."ItemId" = c."Id")
+           AS "LastPlayedDate"
+   FROM "FerrofinLiveTvChannels" c"#;
+
+/// Every channel's newest play by any user, for a `DatePlayed` sort with no
+/// user: upstream's `OrderMapper.cs:32-48` reads all of `UserData` when the
+/// query has no user (a channel has no alternate versions). Every channel gets
+/// a row and only `last_played_date` is read, so the other user-data keys and
+/// filters see the same values on every channel, as they do with no rows.
+///
+/// # Errors
+///
+/// Fails when the database read fails.
+pub async fn channel_last_played_by_anyone(db: &Database) -> Result<ChannelUserData, ServiceError> {
+    let rows = sqlx::query(CHANNEL_LAST_PLAYED_SQL)
+        .fetch_all(db.pool())
+        .await
+        .map_err(db_err)?;
+    Ok(rows
+        .into_iter()
+        .map(|r| {
+            (
+                r.get::<String, _>("Id"),
+                ChannelUserDataRow {
+                    last_played_date: r.get("LastPlayedDate"),
+                    ..ChannelUserDataRow::default()
+                },
+            )
+        })
+        .collect())
+}
+
 /// One channel of a tuner host's stored lineup, as the guide-binding path
 /// needs it.
 ///
@@ -462,7 +497,8 @@ pub async fn all_program_ids(db: &Database) -> Result<Vec<String>, ServiceError>
 /// Deletes the programmes whose ids are listed.
 ///
 /// The second half of the [`all_program_ids`] pair: `CleanDatabase` deletes the
-/// stale rows one item at a time upstream; here they go in bind-limit chunks.
+/// stale rows one item at a time upstream; here they go in
+/// [`ferrofin_db::BATCH_BIND_CHUNK`]-sized chunks.
 ///
 /// # Errors
 ///
@@ -533,7 +569,7 @@ pub(crate) async fn delete_programs_in(
     conn: &mut sqlx::SqliteConnection,
     ids: &[String],
 ) -> Result<(), ServiceError> {
-    for chunk in ids.chunks(IDS_PER_DELETE) {
+    for chunk in ids.chunks(ferrofin_db::BATCH_BIND_CHUNK) {
         delete_by_id_statement("FerrofinLiveTvPrograms", chunk)
             .build()
             .execute(&mut *conn)
@@ -543,7 +579,7 @@ pub(crate) async fn delete_programs_in(
     Ok(())
 }
 
-/// Deletes rows of `table` by id, in bind-limit chunks.
+/// Deletes rows of `table` by id, in [`ferrofin_db::BATCH_BIND_CHUNK`]-sized chunks.
 ///
 /// `table` is one of two crate-private literals, never caller input.
 async fn delete_by_id(
@@ -551,7 +587,7 @@ async fn delete_by_id(
     table: &'static str,
     ids: &[String],
 ) -> Result<(), ServiceError> {
-    for chunk in ids.chunks(IDS_PER_DELETE) {
+    for chunk in ids.chunks(ferrofin_db::BATCH_BIND_CHUNK) {
         delete_by_id_statement(table, chunk)
             .build()
             .execute(db.writer())
@@ -560,10 +596,6 @@ async fn delete_by_id(
     }
     Ok(())
 }
-
-/// How many ids one delete-by-id statement binds, under SQLite's
-/// 999-parameter limit.
-const IDS_PER_DELETE: usize = 500;
 
 /// The statement deleting the rows of `table` whose ids are `ids`.
 fn delete_by_id_statement(table: &'static str, ids: &[String]) -> sqlx::QueryBuilder<sqlx::Sqlite> {
@@ -860,6 +892,12 @@ pub mod test_support {
             super::channel_rows_query(query, restrictions, stored_items_only),
         )
         .await
+    }
+
+    /// The `EXPLAIN QUERY PLAN` details of
+    /// [`super::channel_last_played_by_anyone`]'s statement, in plan order.
+    pub async fn channel_last_played_plan(db: &Database) -> Result<Vec<String>, ServiceError> {
+        plan(db, sqlx::QueryBuilder::new(super::CHANNEL_LAST_PLAYED_SQL)).await
     }
 
     /// The `EXPLAIN QUERY PLAN` details of `qb`'s statement, in plan order.

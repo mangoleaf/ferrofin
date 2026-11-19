@@ -153,9 +153,10 @@
 //! - [`subtitle_manager`] — [`FerrofinSubtitleManager`]
 //!   ([`ferrofin_traits::subtitles::SubtitleManager`]), search, download and
 //!   upload of external subtitles over the registered providers, and delete;
-//! - [`scheduled_tasks`] — [`FerrofinTaskManager`] + the local [`ScheduledTask`]
-//!   trait: the task registry over the `ferrofin-model` task DTOs, plus the
-//!   trigger scheduler ([`start_scheduler`](FerrofinTaskManager::start_scheduler)
+//! - [`scheduled_tasks`] — [`FerrofinTaskManager`] + the [`ScheduledTask`]
+//!   trait (defined in `ferrofin-traits`, re-exported here): the task
+//!   registry over the `ferrofin-model` task DTOs, plus the trigger scheduler
+//!   ([`start_scheduler`](FerrofinTaskManager::start_scheduler)
 //!   fires daily/weekly/interval/startup triggers), live progress reporting,
 //!   cooperative stops (a run's token, `Cancelling` until it returns), and
 //!   on-disk trigger-override persistence.
@@ -178,7 +179,7 @@ pub mod auth_providers;
 pub mod authorization_context;
 pub mod backup;
 pub mod by_name_store;
-pub mod cached_media_segment_provider;
+pub use ferrofin_providers::cached_media_segment_provider;
 pub mod channel_manager;
 pub mod chapter_image_extractor;
 pub mod chapter_manager;

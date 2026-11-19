@@ -867,21 +867,22 @@ impl FerrofinPeopleRepository {
     }
 
     /// Repairs `Person` rows written before their columns were complete:
-    /// a NULL `Path`, a NULL `PresentationUniqueKey`, or a `SortName` that is
-    /// not the verbatim name.
+    /// a NULL `Path`, or a `SortName` that is not the verbatim name.
     ///
-    /// Ferrofin needs this and Jellyfin does not: C# recomputes `SortName`,
-    /// `PresentationUniqueKey` and `Path` on every `SaveItems`, so a row heals
-    /// itself on the next refresh, whereas both of Ferrofin's `Person` inserts
-    /// are `INSERT OR IGNORE` and nothing rewrites an existing row. Without
-    /// this pass, every install whose people were scanned before those columns
-    /// were written stays wrong forever, and an upgrade does not fix it.
+    /// Ferrofin needs this and Jellyfin does not: C# recomputes `SortName` and
+    /// `Path` on every `SaveItems`, so a row heals itself on the next refresh,
+    /// whereas both of Ferrofin's `Person` inserts are `INSERT OR IGNORE` and
+    /// nothing rewrites an existing row. Without this pass, every install whose
+    /// people were scanned before those columns were written stays wrong
+    /// forever, and an upgrade does not fix it. A keyless row's
+    /// `PresentationUniqueKey` is not this pass's: `Database::run_migrations`
+    /// keys every by-name kind, `Person` included, before any boot repair runs
+    /// (`ferrofin_db::presentation_key::backfill_by_name_presentation_keys`).
     ///
     /// Idempotent, and a no-op on a database adopted from Jellyfin: Jellyfin
-    /// stores exactly `Name.TrimStart()` in `SortName`, `Person-{Name}` (with
-    /// diacritics removed) in `PresentationUniqueKey`, and the same
-    /// `{PeoplePath}/{A}/{Name}` in `Path`, so all three predicates are already
-    /// false there and the round trip is untouched. Returns the number of rows
+    /// stores exactly `Name.TrimStart()` in `SortName` and the same
+    /// `{PeoplePath}/{A}/{Name}` in `Path`, so both predicates are already
+    /// false there and the row is left as it is. Returns the number of rows
     /// rewritten.
     ///
     /// A row carrying a non-empty `ForcedSortName` keeps its `SortName`
@@ -895,8 +896,8 @@ impl FerrofinPeopleRepository {
     /// `FerrofinItemPersistenceService::repair_forced_sort_names`'s job. Migration `0012_hermit_episode_sort_names.sql`
     /// guards the same way (`coalesce("ForcedSortName", '') = ''`), as does
     /// `upsert_item`; this pass is the third path over the same rule and must
-    /// not be the one that disagrees. Its `Path`/`PresentationUniqueKey` halves
-    /// still run for such a row: those are derived columns no user owns.
+    /// not be the one that disagrees. Its `Path` half still runs for such a
+    /// row: that is a derived column no user owns.
     ///
     /// # Errors
     ///
@@ -909,8 +910,7 @@ impl FerrofinPeopleRepository {
             return Ok(0);
         };
         let rows: Vec<PersonRepairRow> = sqlx::query_as(
-            r#"SELECT "Id", "Name", "SortName", "Path", "PresentationUniqueKey",
-                      coalesce("ForcedSortName", '')
+            r#"SELECT "Id", "Name", "SortName", "Path", coalesce("ForcedSortName", '')
                    FROM "BaseItems" WHERE "Type" = ?1"#,
         )
         .bind(person_type)
@@ -919,58 +919,45 @@ impl FerrofinPeopleRepository {
         .map_err(db_err)?;
 
         let mut pending: Vec<PersonRepairWrite> = Vec::new();
-        for (id, name, sort_name, path, key, forced) in rows {
+        for (id, name, sort_name, path, forced) in rows {
             let Some(name) = name.as_deref().map(str::trim).filter(|n| !n.is_empty()) else {
                 continue;
             };
             let want_sort = person_sort_name(name);
             let want_path = self.person_stored_path(name);
-            let want_key = Uuid::parse_str(&id).ok().map(|pid| {
-                crate::kinds::presentation_unique_key(
-                    BaseItemKind::Person,
-                    pid,
-                    Some(name),
-                    None,
-                    None,
-                    None,
-                )
-            });
             let new_path = want_path.filter(|_| path.is_none());
-            let new_key = want_key.filter(|_| key.is_none());
             // `ForcedSortName` wins over the derived name — see the doc above.
             let new_sort = forced
                 .trim()
                 .is_empty()
                 .then_some(want_sort)
                 .filter(|want| sort_name.as_deref() != Some(want.as_str()));
-            if new_sort.is_none() && new_path.is_none() && new_key.is_none() {
+            if new_sort.is_none() && new_path.is_none() {
                 continue;
             }
-            pending.push((id, new_sort, new_path, new_key));
+            pending.push((id, new_sort, new_path));
         }
         if pending.is_empty() {
             return Ok(0);
         }
 
         let mut tx = self.db.writer().begin().await.map_err(db_err)?;
-        for (id, sort_name, path, key) in &pending {
+        for (id, sort_name, path) in &pending {
             sqlx::query(
                 r#"UPDATE "BaseItems"
                    SET "SortName" = COALESCE(?2, "SortName"),
-                       "Path" = COALESCE("Path", ?3),
-                       "PresentationUniqueKey" = COALESCE("PresentationUniqueKey", ?4)
+                       "Path" = COALESCE("Path", ?3)
                    WHERE "Id" = ?1"#,
             )
             .bind(id)
             .bind(sort_name)
             .bind(path)
-            .bind(key)
             .execute(&mut *tx)
             .await
             .map_err(db_err)?;
         }
         tx.commit().await.map_err(db_err)?;
-        for (_, _, path, _) in &pending {
+        for (_, _, path) in &pending {
             // the row stores the token; the directory is made where it points
             if let Some(path) = path.as_deref().map(|path| self.virtual_paths.expand(path))
                 && let Err(e) = tokio::fs::create_dir_all(&path).await
@@ -983,21 +970,19 @@ impl FerrofinPeopleRepository {
 }
 
 /// One rewrite [`FerrofinPeopleRepository::repair_person_items`] has decided on:
-/// `(Id, new SortName or None, new Path or None, new PresentationUniqueKey or
-/// None)`. Each column is `None` when the row's current value is already right
-/// — or, for `SortName`, when the row carries a `ForcedSortName` the pass must
-/// not touch.
-type PersonRepairWrite = (String, Option<String>, Option<String>, Option<String>);
+/// `(Id, new SortName or None, new Path or None)`. Each column is `None` when
+/// the row's current value is already right — or, for `SortName`, when the row
+/// carries a `ForcedSortName` the pass must not touch.
+type PersonRepairWrite = (String, Option<String>, Option<String>);
 
 /// One `Person` row as [`FerrofinPeopleRepository::repair_person_items`] reads
-/// it: `(Id, Name, SortName, Path, PresentationUniqueKey, ForcedSortName)`.
+/// it: `(Id, Name, SortName, Path, ForcedSortName)`.
 ///
 /// `ForcedSortName` is coalesced to `''` in the SELECT, so an absent override
 /// and an empty one are the same value here — the one the pass must not
 /// overwrite is the non-empty one.
 type PersonRepairRow = (
     String,
-    Option<String>,
     Option<String>,
     Option<String>,
     Option<String>,
@@ -3260,10 +3245,10 @@ mod tests {
         );
     }
 
-    /// A row written by an older build — lower-cased `SortName`, NULL `Path`,
-    /// NULL `PresentationUniqueKey` — is repaired at startup, and the repair is
-    /// idempotent (which is also what makes it a no-op on a database adopted
-    /// from Jellyfin, where all three already hold the right values).
+    /// A row written by an older build — lower-cased `SortName`, NULL `Path` —
+    /// is repaired at startup, and the repair is idempotent (which is also what
+    /// makes it a no-op on a database adopted from Jellyfin, where both already
+    /// hold the right values).
     #[tokio::test]
     async fn repair_person_items_fixes_a_stale_row_and_then_does_nothing() {
         use crate::item_type_lookup::{IdDerivation, person_item_id};
@@ -3278,8 +3263,8 @@ mod tests {
         let id = person_item_id(&mode, &people_path, "Alice Parity").expect("derived");
         seed_named_item(&db, id, BaseItemKind::Person, "Alice Parity").await;
         sqlx::query(
-            r#"UPDATE "BaseItems" SET "SortName" = 'alice parity',
-                 "Path" = NULL, "PresentationUniqueKey" = NULL WHERE "Id" = ?1"#,
+            r#"UPDATE "BaseItems" SET "SortName" = 'alice parity', "Path" = NULL
+                 WHERE "Id" = ?1"#,
         )
         .bind(guid_to_db(id))
         .execute(db.writer())
@@ -3289,20 +3274,17 @@ mod tests {
         let repo =
             FerrofinPeopleRepository::new(db.clone()).with_identity(mode, people_path.clone());
         assert_eq!(repo.repair_person_items().await.expect("repair"), 1);
-        let (path, key, sort): (Option<String>, Option<String>, Option<String>) = sqlx::query_as(
-            r#"SELECT "Path", "PresentationUniqueKey", "SortName" FROM "BaseItems"
-                   WHERE "Id" = ?1"#,
-        )
-        .bind(guid_to_db(id))
-        .fetch_one(db.pool())
-        .await
-        .expect("person row");
+        let (path, sort): (Option<String>, Option<String>) =
+            sqlx::query_as(r#"SELECT "Path", "SortName" FROM "BaseItems" WHERE "Id" = ?1"#)
+                .bind(guid_to_db(id))
+                .fetch_one(db.pool())
+                .await
+                .expect("person row");
         assert_eq!(sort.as_deref(), Some("Alice Parity"));
         assert_eq!(
             path.as_deref(),
             Some(format!("{people_path}/A/Alice Parity").as_str())
         );
-        assert_eq!(key.as_deref(), Some("Person-Alice Parity"));
 
         assert_eq!(
             repo.repair_person_items().await.expect("second pass"),
@@ -3385,8 +3367,7 @@ mod tests {
         // neither equal to the name.
         sqlx::query(
             r#"UPDATE "BaseItems" SET "ForcedSortName" = 'Parity, Alice',
-                 "SortName" = 'Parity, Alice',
-                 "Path" = NULL, "PresentationUniqueKey" = NULL WHERE "Id" = ?1"#,
+                 "SortName" = 'Parity, Alice', "Path" = NULL WHERE "Id" = ?1"#,
         )
         .bind(guid_to_db(id))
         .execute(db.writer())
@@ -3395,26 +3376,21 @@ mod tests {
 
         let repo =
             FerrofinPeopleRepository::new(db.clone()).with_identity(mode, people_path.clone());
-        // The row IS repaired — its Path and key are derived columns nobody
-        // owns — but the sort name survives untouched.
+        // The row IS repaired — its Path is a derived column nobody owns —
+        // but the sort name survives untouched.
         assert_eq!(repo.repair_person_items().await.expect("repair"), 1);
-        let (path, key, sort): (Option<String>, Option<String>, Option<String>) = sqlx::query_as(
-            r#"SELECT "Path", "PresentationUniqueKey", "SortName" FROM "BaseItems"
-                   WHERE "Id" = ?1"#,
-        )
-        .bind(guid_to_db(id))
-        .fetch_one(db.pool())
-        .await
-        .expect("person row");
+        let (path, sort): (Option<String>, Option<String>) =
+            sqlx::query_as(r#"SELECT "Path", "SortName" FROM "BaseItems" WHERE "Id" = ?1"#)
+                .bind(guid_to_db(id))
+                .fetch_one(db.pool())
+                .await
+                .expect("person row");
         assert_eq!(
             sort.as_deref(),
             Some("Parity, Alice"),
             "the user's sort-title override must survive the repair"
         );
-        assert!(
-            path.is_some() && key.is_some(),
-            "derived columns still filled"
-        );
+        assert!(path.is_some(), "the derived Path is still filled");
 
         // …and now it converges: nothing is left to do on the next boot.
         assert_eq!(

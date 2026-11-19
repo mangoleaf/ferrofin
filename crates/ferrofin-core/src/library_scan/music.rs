@@ -313,13 +313,15 @@ enum MusicSource {
 /// the three-category tie rule is spelled out). Identifying moves the
 /// provider the chosen result came from to the front ("When identifying, run
 /// the provider the user picked first so the correct IDs are used",
-/// `MetadataService.cs:876-882`, a stable `OrderBy`).
+/// `MetadataService.cs:876-882`, a stable `OrderBy`) — `chosen` is the
+/// refresh's `options.SearchResult`, which the options copy carries to the
+/// albums below an identified artist too, not only the identified item.
 ///
 /// [`BUILT_IN_METADATA_FETCHERS`]: ferrofin_providers::library_options::BUILT_IN_METADATA_FETCHERS
 fn music_sources(
     policy: FetcherPolicy<'_>,
     kind: MusicKind,
-    identified: Option<&RemoteSearchResult>,
+    chosen: Option<&RemoteSearchResult>,
     dynamic: &[(usize, Option<&str>, i32)],
 ) -> Vec<MusicSource> {
     use ferrofin_providers::library_options::{BUILT_IN_METADATA_FETCHERS, default_metadata_order};
@@ -343,7 +345,7 @@ fn music_sources(
         policy,
         kind.type_name(),
         &candidates,
-        identified.and_then(|r| r.search_provider_name.as_deref()),
+        chosen.and_then(|r| r.search_provider_name.as_deref()),
     )
 }
 
@@ -1545,7 +1547,8 @@ impl LibraryScanner {
             });
         let mut audiodb_images = None;
         let dynamic = self.music_dynamic_sources(work, fetch);
-        for source in music_sources(work.policy, work.kind, work.identified, &dynamic) {
+        let chosen = work.request.options.search_result.as_ref();
+        for source in music_sources(work.policy, work.kind, chosen, &dynamic) {
             match source {
                 MusicSource::MusicBrainz => {
                     let (true, Some(mb)) = (fetch.musicbrainz, &self.musicbrainz) else {
@@ -1720,7 +1723,8 @@ impl LibraryScanner {
         };
         let mut audiodb_images = None;
         let dynamic = self.music_dynamic_sources(work, fetch);
-        for source in music_sources(work.policy, work.kind, work.identified, &dynamic) {
+        let chosen = work.request.options.search_result.as_ref();
+        for source in music_sources(work.policy, work.kind, chosen, &dynamic) {
             match source {
                 MusicSource::MusicBrainz => {
                     let (true, Some(mb)) = (fetch.musicbrainz, &self.musicbrainz) else {

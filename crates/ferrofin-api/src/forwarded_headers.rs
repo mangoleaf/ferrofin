@@ -61,83 +61,100 @@ pub struct ForwardedRequest {
 /// The client address comes from [`forwarded_for`](crate::state::forwarded_for),
 /// which ends the `For` list at the same unparsable entry; this walk keeps the
 /// three headers' entries aligned, as the scheme and host depend on which hop
-/// supplied them.
+/// supplied them. A hop's entries are read only once its remote address is
+/// trusted, so nothing is read from a peer that is not a known proxy.
 #[must_use]
 pub fn walk_forwarded_headers(
     peer: std::net::IpAddr,
     headers: &axum::http::HeaderMap,
     is_known_proxy: impl Fn(std::net::IpAddr) -> bool,
 ) -> ForwardedRequest {
-    let for_entries = comma_separated_values(headers, "x-forwarded-for");
-    let proto_entries = comma_separated_values(headers, "x-forwarded-proto");
-    let host_entries = comma_separated_values(headers, "x-forwarded-host");
-    let hops = for_entries
-        .len()
-        .max(proto_entries.len())
-        .max(host_entries.len());
+    let mut for_entries = entries_from_right(headers, "x-forwarded-for");
+    let mut proto_entries = entries_from_right(headers, "x-forwarded-proto");
+    let mut host_entries = entries_from_right(headers, "x-forwarded-host");
     let mut forwarded = ForwardedRequest::default();
     let mut remote = peer;
-    for hop in 0..hops {
-        if !is_known_proxy(remote) {
+    while is_known_proxy(remote) {
+        let (entry, scheme, host) = (
+            for_entries.next(),
+            proto_entries.next(),
+            host_entries.next(),
+        );
+        if entry.is_none() && scheme.is_none() && host.is_none() {
             break;
         }
-        if let Some(entry) = from_right(&for_entries, hop) {
-            match crate::state::parse_forwarded_entry(entry) {
+        if let Some(entry) = entry {
+            match crate::state::parse_forwarded_entry(&entry) {
                 Some(address) => remote = address,
                 None => break,
             }
         }
-        if let Some(scheme) = from_right(&proto_entries, hop).filter(|s| is_valid_scheme(s)) {
-            forwarded.scheme = Some(scheme.to_owned());
+        if let Some(scheme) = scheme.filter(|s| is_valid_scheme(s)) {
+            forwarded.scheme = Some(scheme.into_owned());
         }
-        if let Some(host) = from_right(&host_entries, hop).filter(|h| is_valid_host(h)) {
-            forwarded.host = Some(host.to_owned());
+        if let Some(host) = host.filter(|h| is_valid_host(h)) {
+            forwarded.host = Some(host.into_owned());
         }
     }
     forwarded
 }
 
-/// Every `name` header's comma-separated entries, in order
-/// (`GetCommaSeparatedValues`: trimmed, unquoted, empty entries skipped).
+/// Every `name` header's comma-separated entries from the right, the order
+/// the walks take them in (`GetCommaSeparatedValues`, read backwards:
+/// trimmed, unquoted, empty entries skipped).
+///
+/// Read lazily and borrowed from the headers, so a walk that stops early
+/// reads, and allocates for, none of the entries left of where it stopped: a
+/// long header from a peer that is not a known proxy costs nothing.
 ///
 /// A value is read as UTF-8, as Kestrel reads it, so one outside visible ASCII
 /// keeps its entries in their hops instead of dropping out and shifting the
 /// rest; an entry holding such a character fails every address, scheme and
-/// host check. Kestrel answers 400 to a value that is not UTF-8 (gl-1650);
-/// here its bytes read as replacement characters, which fail them too.
+/// host check. A value that is not UTF-8 never gets here through the server,
+/// which answers it 400 as Kestrel does (gl-1650); on a router served without
+/// that edge its bytes read as replacement characters, which fail them too. A
+/// value is split at the `,` byte, which no multi-byte character holds, so
+/// splitting before decoding reads each entry as decoding the whole value did.
 ///
 /// White space around an entry is trimmed, Unicode's included, except after
 /// the last entry of a value, which keeps it and so does not parse (measured
 /// on Jellyfin 12.4).
-pub(crate) fn comma_separated_values(headers: &axum::http::HeaderMap, name: &str) -> Vec<String> {
-    let mut entries = Vec::new();
-    for value in headers.get_all(name) {
-        let value = String::from_utf8_lossy(value.as_bytes());
-        let mut segments = value.split(',').peekable();
-        while let Some(segment) = segments.next() {
-            let segment = if segments.peek().is_some() {
-                segment.trim()
-            } else {
-                segment.trim_start()
-            };
-            let segment = segment
-                .strip_prefix('"')
-                .and_then(|v| v.strip_suffix('"'))
-                .unwrap_or(segment);
-            if !segment.is_empty() {
-                entries.push(segment.to_owned());
-            }
-        }
-    }
-    entries
+pub(crate) fn entries_from_right<'a>(
+    headers: &'a axum::http::HeaderMap,
+    name: &'static str,
+) -> impl Iterator<Item = std::borrow::Cow<'a, str>> {
+    headers.get_all(name).iter().rev().flat_map(|value| {
+        value
+            .as_bytes()
+            .rsplit(|&byte| byte == b',')
+            .enumerate()
+            .filter_map(|(from_end, segment)| {
+                let last = from_end == 0;
+                let entry = match String::from_utf8_lossy(segment) {
+                    std::borrow::Cow::Borrowed(segment) => {
+                        std::borrow::Cow::Borrowed(unquoted_entry(segment, last))
+                    }
+                    std::borrow::Cow::Owned(segment) => {
+                        std::borrow::Cow::Owned(unquoted_entry(&segment, last).to_owned())
+                    }
+                };
+                (!entry.is_empty()).then_some(entry)
+            })
+    })
 }
 
-/// The entry `hop` places from the right of `entries`, the hop order.
-fn from_right(entries: &[String], hop: usize) -> Option<&str> {
-    entries
-        .len()
-        .checked_sub(hop + 1)
-        .map(|index| entries[index].as_str())
+/// One comma-separated segment as `GetCommaSeparatedValues` gives it:
+/// trimmed (only at the start for a value's `last` entry) and unquoted.
+fn unquoted_entry(segment: &str, last: bool) -> &str {
+    let segment = if last {
+        segment.trim_start()
+    } else {
+        segment.trim()
+    };
+    segment
+        .strip_prefix('"')
+        .and_then(|v| v.strip_suffix('"'))
+        .unwrap_or(segment)
 }
 
 /// [`walk_forwarded_headers`] under `network`'s known proxies.
@@ -153,21 +170,22 @@ pub fn forwarded_through(
     walk_forwarded_headers(peer, headers, |address| network.is_known_proxy(address))
 }
 
-/// The client a request came from (upstream's `GetNormalizedRemoteIP()` after
-/// `ForwardedHeadersMiddleware`): `NetworkManager::client_address` over
-/// `network`'s known proxies. No policy (`None`) means no known proxies, and
-/// upstream then ignores `X-Forwarded-For` entirely, so it is the peer.
+/// The client a request with `headers` came from (upstream's
+/// `GetNormalizedRemoteIP()` after `ForwardedHeadersMiddleware`):
+/// `NetworkManager::client_address` over `network`'s known proxies. No policy
+/// (`None`) means no known proxies, and upstream then ignores
+/// `X-Forwarded-For` entirely, so it is the peer.
 #[must_use]
 pub fn client_address_through(
     network: Option<&std::sync::RwLock<ferrofin_networking::NetworkManager>>,
     peer: std::net::IpAddr,
-    forwarded_for: &[std::net::IpAddr],
+    headers: &axum::http::HeaderMap,
 ) -> std::net::IpAddr {
     match network {
         Some(network) => network
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .client_address(peer, forwarded_for),
+            .client_address(peer, crate::state::forwarded_for(headers)),
         None => peer,
     }
 }
@@ -431,7 +449,7 @@ mod tests {
         let client = client_address_through(
             network.as_ref(),
             peer.parse().expect("peer"),
-            &["203.0.113.9".parse().expect("client")],
+            &headers(&[("x-forwarded-for", "203.0.113.9")]),
         );
         assert_eq!(client, expected.parse::<IpAddr>().expect("expected"));
     }
@@ -484,6 +502,9 @@ mod tests {
     #[rstest]
     #[case::utf8_value(&[b"203.0.113.9".as_slice(), b"caf\xc3\xa9".as_slice()], "10.0.0.1")]
     #[case::value_not_utf8(&[b"203.0.113.9".as_slice(), b"caf\xe9".as_slice()], "10.0.0.1")]
+    // A value is split before it is decoded: the bad bytes stay in their entry.
+    #[case::entry_not_utf8_inside_a_value(&[b"203.0.113.9,caf\xe9,10.0.0.1".as_slice()], "10.0.0.1")]
+    #[case::cut_sequence_inside_a_value(&[b"203.0.113.9,\xe2\x82,10.0.0.1".as_slice()], "10.0.0.1")]
     #[case::nbsp_before_an_entry(&[b"203.0.113.9,\xc2\xa010.0.0.1".as_slice()], "203.0.113.9")]
     #[case::nbsp_after_an_entry(
         &[b"203.0.113.9,10.0.0.1\xc2\xa0,10.0.0.1".as_slice()],
@@ -527,17 +548,118 @@ mod tests {
         assert_eq!(forwarded.scheme, None);
     }
 
+    /// `IPEndPoint.TryParse` over `IPAddress.TryParse`, as measured on Jellyfin
+    /// 12.4 with known proxies 127.0.0.1 and 127.0.0.2: from 127.0.0.1,
+    /// `X-Forwarded-For: 8.8.8.8, <entry>` reaches 8.8.8.8 when `<entry>`
+    /// reads as 127.0.0.2, the address it reads as when that is no known
+    /// proxy, and stays at 127.0.0.1 when it does not parse.
+    #[rstest]
+    #[case("127.0.0.2", "8.8.8.8")]
+    #[case("2130706434", "8.8.8.8")]
+    #[case("127.2", "8.8.8.8")]
+    #[case("127.0.2", "8.8.8.8")]
+    #[case("0x7f.2", "8.8.8.8")]
+    #[case("0X7F.2", "8.8.8.8")]
+    #[case("0x7F000002", "8.8.8.8")]
+    #[case("017700000002", "8.8.8.8")]
+    #[case("0177.0.0.2", "8.8.8.8")]
+    #[case("127.0.0.02", "8.8.8.8")]
+    #[case("127.0.0.002", "8.8.8.8")]
+    #[case("127.000.000.002", "8.8.8.8")]
+    #[case("127.0x0.0.2", "8.8.8.8")]
+    #[case("127.0.0.0x2", "8.8.8.8")]
+    #[case("127.0.0.0x02", "8.8.8.8")]
+    // Octal 0127 is 87.
+    #[case("00000000000127.0.0.2", "87.0.0.2")]
+    #[case("127.0.0.08", "127.0.0.1")]
+    #[case("127.0.0.0x", "127.0.0.1")]
+    #[case("127.0.0.2.", "127.0.0.1")]
+    #[case("127..0.2", "127.0.0.1")]
+    #[case("127.0.0.2.0", "127.0.0.1")]
+    #[case(".127.0.0.2", "127.0.0.1")]
+    #[case("+127.0.0.2", "127.0.0.1")]
+    #[case("127.0.0.258", "127.0.0.1")]
+    #[case("127.0.0.2/32", "127.0.0.1")]
+    #[case("0x", "127.0.0.1")]
+    #[case("4294967296", "127.0.0.1")]
+    #[case("127.16777216", "127.0.0.1")]
+    #[case("127.0.65538", "127.0.0.1")]
+    #[case("1 27.0.0.2", "127.0.0.1")]
+    #[case("2130706434:80", "8.8.8.8")]
+    #[case("127.2:80", "8.8.8.8")]
+    #[case("127.0.0.2:080", "8.8.8.8")]
+    #[case("127.0.0.2:+80", "127.0.0.1")]
+    #[case("127.0.0.2:65536", "127.0.0.1")]
+    #[case("127.0.0.2:", "127.0.0.1")]
+    #[case("127.0.0.2:0x50", "127.0.0.1")]
+    #[case("127.0.0.2:000000000000080", "8.8.8.8")]
+    #[case(":127.0.0.2", "127.0.0.1")]
+    #[case("::ffff:127.0.0.2", "8.8.8.8")]
+    #[case("::ffff:7f00:2", "8.8.8.8")]
+    #[case("::ffff:127.0.0.2%1", "8.8.8.8")]
+    #[case("[::ffff:127.0.0.2%1]", "8.8.8.8")]
+    #[case("[::ffff:127.0.0.2%1]:80", "8.8.8.8")]
+    #[case("::ffff:127.0.0.2%eth0", "8.8.8.8")]
+    #[case("::ffff:127.0.0.2%lo", "8.8.8.8")]
+    #[case("::ffff:127.0.0.2%", "8.8.8.8")]
+    #[case("[::ffff:127.0.0.2%]", "8.8.8.8")]
+    #[case("::ffff:127.0.0.2%1/64", "127.0.0.1")]
+    #[case("::ffff:127.0.0.2/64", "127.0.0.1")]
+    #[case("::ffff:127.0.0.2%x]", "127.0.0.1")]
+    #[case("[::ffff:127.0.0.2%x]y", "127.0.0.1")]
+    #[case("::ffff:127.0.0.2%1:80", "8.8.8.8")]
+    #[case("[::ffff:127.0.0.2%1:80]", "8.8.8.8")]
+    #[case("::ffff:127.0.0.2%[x", "8.8.8.8")]
+    #[case("::ffff:127.0.0.2%a b", "8.8.8.8")]
+    #[case("[::ffff:127.0.0.2%a]b]", "127.0.0.1")]
+    #[case("[::ffff:127.0.0.2]:0x50", "127.0.0.1")]
+    #[case("[::ffff:127.0.0.2]:080", "8.8.8.8")]
+    #[case("::ffff:127.0.0.02", "8.8.8.8")]
+    #[case("::ffff:127.0.0.002", "127.0.0.1")]
+    #[case("::ffff:127.0.00.2", "127.0.0.1")]
+    #[case("::ffff:0127.0.0.2", "127.0.0.1")]
+    #[case("::ffff:127.0.0.2:80", "127.0.0.1")]
+    #[case("::ffff:127.2", "127.0.0.1")]
+    #[case("::ffff:2130706434", "127.0.0.1")]
+    #[case("[::ffff:127.0.0.2%1]:+80", "127.0.0.1")]
+    #[case("[::ffff:127.0.0.2]%1", "127.0.0.1")]
+    #[case("::FFFF:127.0.0.2", "8.8.8.8")]
+    #[case("0:0:0:0:0:ffff:127.0.0.2", "8.8.8.8")]
+    #[case("::ffff:00127.0.0.2", "127.0.0.1")]
+    fn entries_are_read_as_ip_end_point_try_parse_reads_them(
+        #[case] entry: &str,
+        #[case] expected: &str,
+    ) {
+        let forwarded_for = format!("8.8.8.8, {entry}");
+        assert_eq!(
+            client_from(
+                &["127.0.0.1", "127.0.0.2"],
+                "127.0.0.1",
+                &headers(&[("x-forwarded-for", &forwarded_for)])
+            ),
+            expected.parse::<IpAddr>().expect("expected"),
+            "{entry}"
+        );
+    }
+
     /// The client a request from 10.0.0.1, the one known proxy, resolves to.
     fn client_behind_known_proxy(headers: &HeaderMap) -> IpAddr {
+        client_from(&["10.0.0.1"], "10.0.0.1", headers)
+    }
+
+    /// The client a request from `peer` resolves to under `known_proxies`.
+    fn client_from(known_proxies: &[&str], peer: &str, headers: &HeaderMap) -> IpAddr {
         let network = std::sync::RwLock::new(ferrofin_networking::NetworkManager::with_interfaces(
             ferrofin_networking::NetworkConfiguration {
-                known_proxies: vec!["10.0.0.1".to_owned()],
+                known_proxies: known_proxies
+                    .iter()
+                    .map(|&proxy| proxy.to_owned())
+                    .collect(),
                 ..ferrofin_networking::NetworkConfiguration::default()
             },
             Vec::new(),
         ));
-        let chain = crate::state::forwarded_for(headers);
-        client_address_through(Some(&network), "10.0.0.1".parse().expect("peer"), &chain)
+        client_address_through(Some(&network), peer.parse().expect("peer"), headers)
     }
 
     /// The scheme a request has, as the API resolves it for the addresses it

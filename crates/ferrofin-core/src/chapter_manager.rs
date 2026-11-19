@@ -12,13 +12,17 @@
 //!
 //! Chapter-image reconciliation and extraction are shared by scans and the
 //! scheduled task through [`crate::chapter_image_extractor::ChapterImageExtractor`].
-//! Image cache tags are computed by the DTO layer.
+//! Image cache tags are computed by the DTO layer. A deletion (a changed
+//! file's prune) drops the save of a task refresh that began before it
+//! ([`ChapterManager::save_refreshed_chapters`]), which upstream's
+//! `RefreshChapterImages` saves whatever happened meanwhile.
 
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use ferrofin_db::entities::base_items::ChapterEntity;
 use ferrofin_model::entities_media::ChapterInfo;
+use ferrofin_util::change_watch::{ChangeWatch, Watch};
 use uuid::Uuid;
 
 use ferrofin_traits::chapters::ChapterManager;
@@ -34,6 +38,8 @@ use crate::kinds::{is_audio, is_video};
 pub struct FerrofinChapterManager {
     repository: Arc<dyn ChapterRepository>,
     library_manager: Arc<dyn LibraryManager>,
+    /// The items a chapter-image refresh is running for, shared by the clones.
+    refreshes: Arc<ChangeWatch<Uuid>>,
 }
 
 impl std::fmt::Debug for FerrofinChapterManager {
@@ -53,6 +59,7 @@ impl FerrofinChapterManager {
         Self {
             repository,
             library_manager,
+            refreshes: Arc::default(),
         }
     }
 
@@ -143,7 +150,29 @@ impl ChapterManager for FerrofinChapterManager {
     }
 
     async fn delete_chapter_data(&self, item_id: Uuid) -> Result<(), ServiceError> {
-        self.repository.delete_chapters(item_id).await
+        self.refreshes
+            .change(&item_id, self.repository.delete_chapters(item_id))
+            .await
+    }
+
+    async fn watch_chapter_data(&self, item_id: Uuid) -> Watch<Uuid> {
+        self.refreshes.watch(item_id).await
+    }
+
+    async fn save_refreshed_chapters(
+        &self,
+        watch: Watch<Uuid>,
+        chapters: &[ChapterInfo],
+    ) -> Result<bool, ServiceError> {
+        let item_id = *watch.key();
+        match self
+            .refreshes
+            .commit(watch, self.save_chapters(item_id, chapters))
+            .await
+        {
+            Some(saved) => saved.map(|()| true),
+            None => Ok(false),
+        }
     }
 }
 

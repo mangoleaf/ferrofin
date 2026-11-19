@@ -142,7 +142,9 @@ pub struct ChannelUserDataRow {
     pub last_played_date: Option<String>,
 }
 
-/// The requesting user's channel user data, keyed by the stored channel id.
+/// The requesting user's channel user data, keyed by the stored channel id; with
+/// no user, every user's newest play on each channel and nothing else
+/// ([`crate::guide_repository::channel_last_played_by_anyone`]).
 pub type ChannelUserData = std::collections::HashMap<String, ChannelUserDataRow>;
 
 /// Applies `GetInternalChannels`' filters to the loaded lineup.
@@ -196,7 +198,10 @@ pub fn filter_channel_rows(
 /// item. The user-data keys read `user_data`, where a channel without a row
 /// is `NULL` for `DatePlayed` and `PlayCount` (first ascending, last
 /// descending), unplayed for `IsPlayed`/`IsUnplayed` (through
-/// `BuildIsPlayedFilter`) and no favourite. `Random` draws a fresh order on
+/// `BuildIsPlayedFilter`) and no favourite. With no user, `user_data` holds
+/// every user's newest play on each channel for `DatePlayed`
+/// ([`crate::guide_repository::channel_last_played_by_anyone`]) and the other
+/// user-data keys tie. `Random` draws a fresh order on
 /// every call. `AirTime` and the keys `OrderMapper` has no arm for fall back
 /// to `SortName`. The keys over columns a channel item never fills
 /// (`RunTimeTicks`, `PremiereDate`, the ratings, the studios, …) or fills
@@ -357,19 +362,20 @@ pub fn channel_media_type(channel_type: &str) -> &'static str {
 #[must_use]
 pub fn channel_sort_name(number: Option<&str>, name: &str) -> String {
     let number = number.unwrap_or("");
-    // C# `double.TryParse(Number, InvariantCulture, …)` trims whitespace.
-    match number.trim().parse::<f64>() {
+    // C# `double.TryParse(Number, InvariantCulture, …)`.
+    match ferrofin_util::invariant_float::parse::<f64>(number) {
         // .NET's custom format keeps the sign outside the zero padding
         // (`-1` → `-0000000001.00000`), where Rust's width counts it; a number
         // wider than the pattern keeps all its digits in both.
-        Ok(n) if n.is_finite() => {
+        Some(n) if n.is_finite() => {
             let sign = if n < 0.0 { "-" } else { "" };
             format!("{sign}{:016.5}-{name}", n.abs())
         }
-        // Rust also parses `inf`/`nan`, which have no padded form; keep the
-        // text (.NET rejects `inf`, and formats a parsed `NaN`/`Infinity` as
-        // that word).
-        _ => format!("{number}-{name}"),
+        // .NET formats a NaN or an infinity as the culture's symbol.
+        Some(n) if n.is_nan() => format!("NaN-{name}"),
+        Some(n) if n > 0.0 => format!("Infinity-{name}"),
+        Some(_) => format!("-Infinity-{name}"),
+        None => format!("{number}-{name}"),
     }
 }
 
@@ -1262,6 +1268,12 @@ mod tests {
         // An unparseable number is used verbatim.
         assert_eq!(channel_sort_name(Some("A1"), "Alpha"), "A1-Alpha");
         assert_eq!(channel_sort_name(Some("inf"), "X"), "inf-X");
+        // `double.TryParse` takes group separators and the symbols, which the
+        // format writes as the culture spells them.
+        assert_eq!(channel_sort_name(Some("1,005"), "K"), "0000001005.00000-K");
+        assert_eq!(channel_sort_name(Some("infinity"), "X"), "Infinity-X");
+        assert_eq!(channel_sort_name(Some("-INFINITY"), "X"), "-Infinity-X");
+        assert_eq!(channel_sort_name(Some("nan"), "X"), "NaN-X");
         assert_eq!(channel_sort_name(None, "Bare"), "-Bare");
         // The keys order numerically (jellyfin/jellyfin#15399).
         assert!(channel_sort_name(Some("10002"), "") < channel_sort_name(Some("100010"), ""));

@@ -8,7 +8,7 @@ use std::collections::{HashMap, HashSet};
 use ferrofin_model::configuration::LibraryOptions;
 use ferrofin_model::media_info::MediaInfo;
 use ferrofin_providers::metadata_merge::is_valid_provider_id;
-use ferrofin_util::string_extensions::{remove_diacritics, upper_invariant};
+use ferrofin_util::string_extensions::{ordinal_ignore_case_key, remove_diacritics};
 
 const INTERNAL_VALUE_SEPARATOR: char = '\u{001f}';
 
@@ -212,7 +212,7 @@ pub(super) fn credits(tags: &AudioTagValues, audiobook: bool) -> Vec<(String, &'
         let authors: HashSet<String> = source
             .iter()
             .filter_map(named)
-            .map(|name| upper_invariant(&name))
+            .map(|name| ordinal_ignore_case_key(&name))
             .collect();
         people.extend(source.iter().filter_map(named).map(|name| (name, "Author")));
         people.extend(
@@ -225,7 +225,7 @@ pub(super) fn credits(tags: &AudioTagValues, audiobook: bool) -> Vec<(String, &'
             tags.credit_performers
                 .iter()
                 .filter_map(named)
-                .filter(|name| !authors.contains(&upper_invariant(name)))
+                .filter(|name| !authors.contains(&ordinal_ignore_case_key(name)))
                 .map(|name| (name, "Actor")),
         );
     } else {
@@ -301,18 +301,18 @@ fn split_custom(value: &str, delimiters: &[char], whitelist: &[String]) -> Vec<S
             .split(delimiters)
             .map(str::trim)
             .filter(|name| !name.is_empty())
-            .filter(|name| seen.insert(upper_invariant(&remove_diacritics(name))))
+            .filter(|name| seen.insert(ordinal_ignore_case_key(&remove_diacritics(name))))
             .map(str::to_owned),
     );
     names
 }
 
-/// Case-insensitive replacement using .NET's simple uppercase mapping, so
+/// Case-insensitive replacement using .NET's `OrdinalIgnoreCase` fold, so
 /// replacement boundaries remain valid for non-ASCII artist names.
 fn remove_ignore_case(value: &str, name: &str) -> (String, bool) {
     let original: Vec<char> = value.chars().collect();
-    let upper: Vec<char> = upper_invariant(value).chars().collect();
-    let target: Vec<char> = upper_invariant(name).chars().collect();
+    let upper: Vec<char> = ordinal_ignore_case_key(value).chars().collect();
+    let target: Vec<char> = ordinal_ignore_case_key(name).chars().collect();
     if target.is_empty() {
         return (value.to_owned(), false);
     }
@@ -336,7 +336,7 @@ fn distinct_case(values: impl IntoIterator<Item = String>) -> Vec<String> {
     values
         .into_iter()
         .filter(|value| !value.trim().is_empty())
-        .filter(|value| seen.insert(upper_invariant(value)))
+        .filter(|value| seen.insert(ordinal_ignore_case_key(value)))
         .collect()
 }
 
@@ -638,6 +638,9 @@ mod tests {
             tags.album_artists.is_empty(),
             "explicit empty multivalue suppresses fallback before filtering"
         );
+        // The long s keeps its case: `ToUpperInvariant` maps it to `S`, ordinal casing does not.
+        let tags = for_library(&info(&[("genre", "Roſe\u{001f}Rose")]), None);
+        assert_eq!(tags.genres, ["Roſe", "Rose"]);
     }
 
     #[test]

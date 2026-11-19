@@ -61,22 +61,17 @@ use ferrofin_traits::subtitles::{SubtitleManager, SubtitleSearchRequest};
 use ferrofin_traits::system::PathManager;
 use ferrofin_traits::system::ServerApplicationPaths;
 use ferrofin_traits::trickplay::TrickplayManager;
+use ferrofin_util::ticks::TICKS_PER_SECOND;
 use uuid::Uuid;
 
 use crate::db_error::db_err;
 
 use super::{ScheduledTask, TaskProgress, interval_hours};
 
-/// 100-nanosecond ticks per second (the `TaskTriggerInfo` time unit).
-const TICKS_PER_SECOND: i64 = 10_000_000;
-
 /// The upstream Library category's localization key.
 pub(super) const LIBRARY: &str = "TasksLibraryCategory";
 
-/// Items examined per page (the upstream `QueryPageLimit`). The extensions'
-/// library walks (Intro Skipper's queue, Merge Versions) read their rows in
-/// pages of the same size.
-pub const PAGE_SIZE: i32 = 100;
+pub use ferrofin_traits::tasks::PAGE_SIZE;
 
 /// A query's items read [`PAGE_SIZE`] at a time, counting those done:
 /// upstream's `GetCount`, then `StartIndex += Pagesize` until the count is
@@ -415,13 +410,14 @@ impl AudioNormalizationTask {
     }
 
     /// Album pass: concat every track of a multi-track album and measure once.
+    /// Returns how many albums it measured.
     async fn scan_albums(
         &self,
         folder_ids: &[Uuid],
         progress: &TaskProgress,
         base: f64,
         span: f64,
-    ) -> Result<(), ServiceError> {
+    ) -> Result<usize, ServiceError> {
         let query = InternalItemsQuery {
             include_item_types: vec![BaseItemKind::MusicAlbum],
             recursive: true,
@@ -429,25 +425,27 @@ impl AudioNormalizationTask {
             ..InternalItemsQuery::default()
         };
         let mut pages = Pages::new(&self.library, &query).await?;
+        let mut measured = 0;
         while let Some(albums) = pages.next().await? {
             for album in &albums {
                 if progress.stop_requested() {
-                    return Ok(());
+                    return Ok(measured);
                 }
                 let fraction = pages.complete_one();
-                self.normalize_album(album, progress).await?;
+                measured += usize::from(self.normalize_album(album, progress).await?);
                 progress.report(base + span * fraction);
             }
         }
-        Ok(())
+        Ok(measured)
     }
 
-    /// Measures one album's LUFS over its tracks, unless it already has one.
+    /// Measures one album's LUFS over its tracks, unless it already has one;
+    /// whether it saved a reading.
     async fn normalize_album(
         &self,
         album: &BaseItemEntity,
         progress: &TaskProgress,
-    ) -> Result<(), ServiceError> {
+    ) -> Result<bool, ServiceError> {
         if album.lufs.is_none()
             && album.normalization_gain.is_none()
             && let Ok(album_id) = Uuid::parse_str(&album.id)
@@ -469,8 +467,11 @@ impl AudioNormalizationTask {
                 .collect();
             // Album gain is useless for single-track albums (upstream skip).
             if track_paths.len() > 1 {
-                tracing::info!(
+                // Information upstream; debug here, one per album: the run's
+                // summary is the info line (LOGGING.md rule 1).
+                tracing::debug!(
                     album = album.name.as_deref().unwrap_or_default(),
+                    item_id = %album_id,
                     "calculating album LUFS"
                 );
                 if let Some(lufs) = self
@@ -478,10 +479,11 @@ impl AudioNormalizationTask {
                     .await?
                 {
                     self.save_lufs(&album.id, lufs).await?;
+                    return Ok(true);
                 }
             }
         }
-        Ok(())
+        Ok(false)
     }
 
     /// Measures an album's LUFS over an ffmpeg concat list of its tracks.
@@ -524,14 +526,15 @@ impl AudioNormalizationTask {
         measured
     }
 
-    /// Track pass: measure each track that has no LUFS yet.
+    /// Track pass: measure each track that has no LUFS yet. Returns how many
+    /// tracks it measured.
     async fn scan_tracks(
         &self,
         folder_ids: &[Uuid],
         progress: &TaskProgress,
         base: f64,
         span: f64,
-    ) -> Result<(), ServiceError> {
+    ) -> Result<usize, ServiceError> {
         let query = InternalItemsQuery {
             include_item_types: vec![BaseItemKind::Audio],
             recursive: true,
@@ -539,10 +542,11 @@ impl AudioNormalizationTask {
             ..InternalItemsQuery::default()
         };
         let mut pages = Pages::new(&self.library, &query).await?;
+        let mut measured = 0;
         while let Some(tracks) = pages.next().await? {
             for track in &tracks {
                 if progress.stop_requested() {
-                    return Ok(());
+                    return Ok(measured);
                 }
                 let fraction = pages.complete_one();
                 if track.lufs.is_none()
@@ -552,11 +556,12 @@ impl AudioNormalizationTask {
                     && let Some(lufs) = self.measure(vec!["-i".to_owned(), path], progress).await?
                 {
                     self.save_lufs(&track.id, lufs).await?;
+                    measured += 1;
                 }
                 progress.report(base + span * fraction);
             }
         }
-        Ok(())
+        Ok(measured)
     }
 }
 
@@ -599,12 +604,17 @@ impl ScheduledTask for AudioNormalizationTask {
             progress.report(100.0);
             return Ok(());
         }
-        self.scan_albums(&folder_ids, progress, 0.0, 50.0).await?;
-        if progress.stop_requested() {
-            return Ok(());
+        let albums = self.scan_albums(&folder_ids, progress, 0.0, 50.0).await?;
+        let stopped = progress.stop_requested();
+        let tracks = if stopped {
+            0
+        } else {
+            self.scan_tracks(&folder_ids, progress, 50.0, 50.0).await?
+        };
+        tracing::info!(albums, tracks, "audio normalization: measured LUFS");
+        if !stopped {
+            progress.report(100.0);
         }
-        self.scan_tracks(&folder_ids, progress, 50.0, 50.0).await?;
-        progress.report(100.0);
         Ok(())
     }
 }
@@ -655,7 +665,11 @@ impl ChapterImagesTask {
     ) -> Result<bool, ServiceError> {
         // Read just before the refresh, as upstream does: a scan may rewrite
         // a video's chapters while the run works through the page, and the
-        // save and the prune below must not undo that.
+        // save and the prune below must not undo that. Watched from before
+        // the read: a changed file's prune while this refreshes drops the
+        // save, which would put the old file's chapters back over the new
+        // file's, where upstream saves them (gl-1694).
+        let watch = self.chapters.watch_chapter_data(item_id).await;
         let mut chapters = self.chapters.get_chapters(item_id).await?;
         let outcome = self
             .extractor
@@ -673,7 +687,11 @@ impl ChapterImagesTask {
                 .filter(|chapter| chapter.start_position_ticks < video.run_time_ticks.unwrap_or(0))
                 .cloned()
                 .collect::<Vec<_>>();
-            self.chapters.save_chapters(item_id, &saved).await?;
+            if !self.chapters.save_refreshed_chapters(watch, &saved).await? {
+                // The prune took the images this refresh would prune.
+                tracing::debug!(%item_id, "the file changed while its chapter images were refreshed; nothing saved");
+                return Ok(outcome.success);
+            }
         }
         outcome.prune_unused_images(&chapters);
         Ok(outcome.success)
@@ -1449,13 +1467,20 @@ impl TmdbUpcomingEpisodesTask {
             .library
             .get_item_ids(&virtual_of(BaseItemKind::Episode))
             .await?;
+        let mut removed = 0;
         for (i, id) in episodes.iter().enumerate() {
-            tracing::info!(
+            // Information upstream; debug here, one per episode: the count
+            // below is the info line (LOGGING.md rule 1), as the scan's own
+            // removals are.
+            tracing::debug!(
                 item_id = %id,
                 "removing a virtual episode: the TMDb missing episode provider is disabled"
             );
-            if let Err(err) = self.library.delete_item(*id, &options).await {
-                tracing::warn!(item_id = %id, %err, "could not remove the virtual episode");
+            match self.library.delete_item(*id, &options).await {
+                Ok(()) => removed += 1,
+                Err(err) => {
+                    tracing::warn!(item_id = %id, %err, "could not remove the virtual episode");
+                }
             }
             #[allow(clippy::cast_precision_loss)] // a progress ratio
             progress.report(95.0 * (i + 1) as f64 / episodes.len() as f64);
@@ -1480,6 +1505,12 @@ impl TmdbUpcomingEpisodesTask {
             {
                 tracing::warn!(item_id = %season, %err, "could not remove the virtual season");
             }
+        }
+        if removed > 0 {
+            tracing::info!(
+                removed,
+                "removed the virtual episodes: the TMDb missing episode provider is disabled"
+            );
         }
         progress.report(100.0);
         Ok(())
@@ -2219,6 +2250,9 @@ mod tests {
         async fn delete_subtitles(&self, _item_id: Uuid, _index: i32) -> Result<(), ServiceError> {
             unimplemented!("fake")
         }
+        async fn drop_missing_subtitle_rows(&self, _item_id: Uuid) -> Result<(), ServiceError> {
+            unimplemented!("fake")
+        }
         async fn get_supported_providers(
             &self,
             _item_id: Uuid,
@@ -2494,6 +2528,13 @@ mod tests {
             query: &InternalItemsQuery,
         ) -> Result<ferrofin_model::querying::QueryResult<BaseItemEntity>, ServiceError> {
             self.0.query_items(query).await
+        }
+        async fn apply_user_view_builder(
+            &self,
+            query: &mut InternalItemsQuery,
+            view: &BaseItemEntity,
+        ) -> Result<(Option<BaseItemKind>, bool), ServiceError> {
+            self.0.apply_user_view_builder(query, view).await
         }
         async fn get_item_ids(
             &self,
@@ -2872,12 +2913,6 @@ mod tests {
                 .get_media_stream_languages_by_type(stream_types, query)
                 .await
         }
-        async fn queue_library_scan_with_trigger(
-            &self,
-            trigger: ferrofin_traits::library::ScanTrigger,
-        ) -> Result<(), ServiceError> {
-            self.0.queue_library_scan_with_trigger(trigger).await
-        }
         async fn queue_library_scan_scoped(&self, library_id: Uuid) -> Result<(), ServiceError> {
             self.0.queue_library_scan_scoped(library_id).await
         }
@@ -2894,6 +2929,27 @@ mod tests {
             options: &MetadataRefreshOptions,
         ) -> Result<bool, ServiceError> {
             self.0.run_refresh_scan(target, options).await
+        }
+        async fn queue_item_refresh(
+            &self,
+            item: &BaseItemEntity,
+            options: &MetadataRefreshOptions,
+        ) -> Result<(), ServiceError> {
+            self.0.queue_item_refresh(item, options).await
+        }
+        async fn refresh_item_metadata(
+            &self,
+            item: &BaseItemEntity,
+            options: &MetadataRefreshOptions,
+        ) -> Result<bool, ServiceError> {
+            self.0.refresh_item_metadata(item, options).await
+        }
+        async fn refresh_full_item(
+            &self,
+            item: &BaseItemEntity,
+            options: &MetadataRefreshOptions,
+        ) -> Result<bool, ServiceError> {
+            self.0.refresh_full_item(item, options).await
         }
         async fn run_library_scan(
             &self,
@@ -3007,7 +3063,26 @@ mod tests {
             paths,
         );
         assert_eq!(task.key(), "AudioNormalization");
-        task.execute(&TaskProgress::default()).await.expect("run");
+        // gl-275: one info line for the run, the album's own line at debug.
+        let logs = crate::test_support::CapturedLogs::default();
+        {
+            let _guard = tracing::subscriber::set_default(
+                tracing_subscriber::fmt()
+                    .with_writer(logs.clone())
+                    .with_ansi(false)
+                    .with_max_level(tracing::Level::INFO)
+                    .finish(),
+            );
+            task.execute(&TaskProgress::default()).await.expect("run");
+        }
+        let text = logs.text();
+        assert!(!text.contains("calculating album LUFS"), "{text}");
+        let summaries: Vec<&str> = text
+            .lines()
+            .filter(|line| line.contains("audio normalization: measured LUFS"))
+            .collect();
+        assert_eq!(summaries.len(), 1, "{text}");
+        assert!(summaries[0].contains("albums=1 tracks=2"), "{text}");
 
         let lufs: Vec<(String, Option<f64>)> =
             sqlx::query_as(r#"SELECT "Id", "LUFS" FROM "BaseItems" WHERE "LUFS" IS NOT NULL"#)
@@ -5274,6 +5349,69 @@ mod tests {
         assert_eq!(fixture.encoder.calls.lock().unwrap().len(), 1);
     }
 
+    /// gl-1694: a changed file's prune while the task refreshes a video's
+    /// chapter images, followed by the scan's save of the new file's chapters,
+    /// is not undone by the task saving the old file's chapters back.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_chapter_refresh_the_prune_lands_in_saves_nothing() {
+        use ferrofin_traits::persistence::ChapterRepository as _;
+        let (entered, release) = (
+            Arc::new(tokio::sync::Notify::new()),
+            Arc::new(tokio::sync::Notify::new()),
+        );
+        let fixture = crate::chapter_image_extractor::tests::Fixture::new(
+            crate::chapter_image_extractor::tests::RecordingEncoder::holding(
+                Arc::clone(&entered),
+                Arc::clone(&release),
+            ),
+        )
+        .await;
+        let id = Uuid::parse_str(&fixture.video.id).unwrap();
+        let chapter =
+            |name: &str, start_position_ticks| ferrofin_db::entities::base_items::ChapterEntity {
+                item_id: fixture.video.id.clone(),
+                chapter_index: 0,
+                image_date_modified: None,
+                image_path: None,
+                start_position_ticks,
+                name: Some(name.to_owned()),
+            };
+        let repo = Arc::new(crate::FerrofinChapterRepository::new(fixture.db.clone()));
+        repo.save_chapters(id, &[chapter("Old", 0)]).await.unwrap();
+        let library = library_manager_over(fixture.db.clone());
+        let chapters = Arc::new(crate::FerrofinChapterManager::new(
+            repo.clone(),
+            library.clone(),
+        ));
+        let temp = tempfile::tempdir().unwrap();
+        let task = ChapterImagesTask::new(
+            library,
+            fixture.folders.clone(),
+            Arc::clone(&chapters) as Arc<dyn ChapterManager>,
+            fixture.extractor.clone(),
+            Arc::new(crate::FerrofinServerApplicationPaths::new(
+                temp.path().join("data"),
+                temp.path().join("log"),
+                temp.path().join("config"),
+                temp.path().join("cache"),
+                temp.path().join("web"),
+            )),
+        );
+        let run = tokio::spawn(async move { task.execute(&TaskProgress::default()).await });
+
+        entered.notified().await;
+        chapters.delete_chapter_data(id).await.expect("prune");
+        let new = [chapter("New", 0), chapter("New 2", 300_000_000)];
+        repo.save_chapters(id, &new).await.expect("the scan's save");
+        release.notify_one();
+        run.await.unwrap().expect("run");
+
+        let saved = repo.get_chapters(id).await.unwrap();
+        let names: Vec<_> = saved.iter().map(|c| c.name.as_deref()).collect();
+        assert_eq!(names, [Some("New"), Some("New 2")]);
+        assert!(saved.iter().all(|c| c.image_path.is_none()), "{saved:?}");
+    }
+
     #[tokio::test]
     async fn temporary_chapter_service_errors_fail_without_poisoning_extraction_history() {
         for read_failure in [true, false] {
@@ -5456,7 +5594,31 @@ mod tests {
             Arc::clone(&library),
         );
         assert_eq!(task.key(), "TmdbRefreshUpcomingEpisodes");
-        task.execute(&TaskProgress::default()).await.expect("run");
+        // gl-275: one info line for the run, each episode's at debug.
+        let logs = crate::test_support::CapturedLogs::default();
+        {
+            let _guard = tracing::subscriber::set_default(
+                tracing_subscriber::fmt()
+                    .with_writer(logs.clone())
+                    .with_ansi(false)
+                    .with_max_level(tracing::Level::INFO)
+                    .finish(),
+            );
+            task.execute(&TaskProgress::default()).await.expect("run");
+            // Nothing left to remove: no line.
+            task.execute(&TaskProgress::default()).await.expect("rerun");
+        }
+        let text = logs.text();
+        assert!(!text.contains("removing a virtual episode"), "{text}");
+        let summaries: Vec<&str> = text
+            .lines()
+            .filter(|line| line.contains("removed the virtual episodes"))
+            .collect();
+        assert_eq!(summaries.len(), 1, "{text}");
+        assert!(
+            summaries[0].ends_with("the TMDb missing episode provider is disabled removed=1"),
+            "{text}"
+        );
 
         let alive = |id| {
             let library = Arc::clone(&library);

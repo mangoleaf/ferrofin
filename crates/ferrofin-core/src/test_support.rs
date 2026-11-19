@@ -656,7 +656,19 @@ pub async fn seed_item_value(
     value_type: ferrofin_db::enums::ItemValueType,
     value: &str,
 ) {
-    let mut values: Vec<(i32, String)> = sqlx::query_as(
+    let mut values = item_values(db, item_id).await;
+    values.push((i32::from(value_type), value.to_owned()));
+
+    persistence_over(db)
+        .save_item_values(item_id, &values)
+        .await
+        .expect("save item values");
+}
+
+/// The `(type, value)` pairs an item's `ItemValuesMap` rows link it to, of
+/// every type.
+pub async fn item_values(db: &Database, item_id: Uuid) -> Vec<(i32, String)> {
+    sqlx::query_as(
         r#"SELECT iv."Type", iv."Value"
            FROM "ItemValuesMap" m
            JOIN "ItemValues" iv ON iv."ItemValueId" = m."ItemValueId"
@@ -665,13 +677,7 @@ pub async fn seed_item_value(
     .bind(guid_to_db(item_id))
     .fetch_all(db.pool())
     .await
-    .expect("read existing item values");
-    values.push((i32::from(value_type), value.to_owned()));
-
-    persistence_over(db)
-        .save_item_values(item_id, &values)
-        .await
-        .expect("save item values");
+    .expect("read existing item values")
 }
 
 /// An [`ItemImageInfo`] for a fixture image: only the type, path and blurhash

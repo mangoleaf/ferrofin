@@ -20,6 +20,7 @@ use ferrofin_traits::library::LibraryManager;
 use ferrofin_traits::media_segments::MediaSegmentManager;
 use ferrofin_traits::options::InternalItemsQuery;
 use ferrofin_util::file_helper::FileStamp;
+use ferrofin_util::ticks::TICKS_PER_SECOND_F64;
 
 use crate::bindings::types::{HttpRequest, HttpResponse, ItemQuery, ItemSummary, MediaSegment};
 
@@ -579,7 +580,7 @@ pub(crate) fn summarize(
     ItemSummary {
         id: Uuid::parse_str(&e.id).map_or_else(|_| e.id.clone(), |u| u.to_string()),
         name: e.name.clone().unwrap_or_default(),
-        kind: ferrofin_core::item_type_lookup::kind_from_type_name(&e.type_)
+        kind: ferrofin_model::data::BaseItemKind::from_stored_type_name(&e.type_)
             .map_or_else(|| e.type_.clone(), |k| format!("{k:?}")),
         path: e.path.clone(),
         parent_id: e
@@ -785,7 +786,7 @@ fn write_media_segments_using_provider(
                 return Ok(SegmentWriteOutcome::PolicySkipped);
             }
             Some(std::sync::Arc::new(
-                ferrofin_core::CachedMediaSegmentProvider::new(
+                ferrofin_providers::cached_media_segment_provider::CachedMediaSegmentProvider::new(
                     provider_name.to_owned(),
                     id,
                     std::sync::Arc::clone(&cx.plugins),
@@ -834,8 +835,6 @@ const AUDIO_WINDOW_MAX_SECS: f64 = 60.0;
 const FRAMES_PER_CALL_MAX: usize = 16;
 /// Longest output edge for a sampled frame, in pixels.
 const FRAME_DIMENSION_MAX: u32 = 320;
-/// Ticks per second (Jellyfin's 100 ns unit).
-const TICKS_PER_SEC: f64 = 10_000_000.0;
 
 /// Resolves a guest-named library item to its filesystem path — the ONLY
 /// way media bytes are ever addressed (a guest never supplies paths).
@@ -920,7 +919,7 @@ pub fn extract_audio(
     memory_limit_bytes: usize,
     window: &crate::bindings::types::AudioWindow,
 ) -> Result<crate::bindings::types::AudioChunk, String> {
-    let duration_secs = window.duration_ticks as f64 / TICKS_PER_SEC;
+    let duration_secs = window.duration_ticks as f64 / TICKS_PER_SECOND_F64;
     if !(0.0..=AUDIO_WINDOW_MAX_SECS).contains(&duration_secs) || duration_secs == 0.0 {
         return Err(format!(
             "audio window must be 0..{AUDIO_WINDOW_MAX_SECS} seconds (got {duration_secs:.1})"
@@ -941,7 +940,7 @@ pub fn extract_audio(
         ));
     }
     let path = resolve_media_path(cx, deadline, &window.item_id)?;
-    let start_secs = (window.start_ticks.max(0)) as f64 / TICKS_PER_SEC;
+    let start_secs = (window.start_ticks.max(0)) as f64 / TICKS_PER_SECOND_F64;
     let samples = block_on_until(cx, deadline, async {
         let _permit = cx.analysis.acquire().await;
         cx.extractor
@@ -986,7 +985,7 @@ pub fn extract_frames(
     let timestamps: Vec<f64> = request
         .timestamps_ticks
         .iter()
-        .map(|t| (*t).max(0) as f64 / TICKS_PER_SEC)
+        .map(|t| (*t).max(0) as f64 / TICKS_PER_SECOND_F64)
         .collect();
     let frames = block_on_until(cx, deadline, async {
         let _permit = cx.analysis.acquire().await;
@@ -998,7 +997,7 @@ pub fn extract_frames(
     Ok(frames
         .into_iter()
         .map(|f| crate::bindings::types::VideoFrame {
-            ticks: (f.seconds * TICKS_PER_SEC) as i64,
+            ticks: (f.seconds * TICKS_PER_SECOND_F64) as i64,
             width: f.width,
             height: f.height,
             format: if f.jpeg {
@@ -1332,8 +1331,10 @@ fn parse_uuid(what: &str, raw: &str) -> Result<Uuid, String> {
         .map_err(|_| format!("{what} `{raw}` is not a valid UUID"))
 }
 
-/// Executes `set-user-data` — the strongest write a plugin has; logged
-/// per call with the plugin named (see the WIT trust note).
+/// Executes `set-user-data` — the strongest write a plugin has; logged at
+/// debug with the plugin named, and counted in the guest call's info line
+/// ([`HostState::log_user_data_writes`](crate::bindings::HostState::log_user_data_writes);
+/// see the WIT trust note).
 ///
 /// # Errors
 /// Invalid ids or a manager failure, as the guest-visible string.
@@ -1346,10 +1347,10 @@ pub fn set_user_data(
 ) -> Result<(), String> {
     let uid = parse_uuid("user-id", user_id)?;
     let iid = parse_uuid("item-id", item_id)?;
-    tracing::info!(
+    tracing::debug!(
         plugin = plugin_name,
-        user = %uid,
-        item = %iid,
+        user_id = %uid,
+        item_id = %iid,
         played = ?update.played,
         favorite = ?update.favorite,
         position = ?update.playback_position_ticks,
@@ -1535,11 +1536,41 @@ mod tests {
     use super::{EgressPolicy, GuestHttp, http_fetch};
     use crate::bindings::types::HttpRequest;
 
+    /// A listener on `127.0.0.1`, and a socket that holds the same port on
+    /// `::1` (gl-1522; `ferrofin-providers`' `mock_http::loopback_listener`).
+    /// Keep the socket as long as the listener.
+    ///
+    /// A client given `localhost` tries `::1` first. The held port is bound and
+    /// never listening, so it refuses that connection at once, and the client
+    /// goes on to `127.0.0.1`. A free port there could be another test
+    /// process's listener, or a host service that listens on IPv6 only, and
+    /// that one would get the request instead.
+    ///
+    /// The hold is exclusive only while its socket does not set
+    /// `SO_REUSEADDR`, which a `TcpSocket` does not. The socket is `None` on a
+    /// host with no IPv6 loopback, where no listener can take the port either.
+    fn loopback_listener() -> (std::net::TcpListener, Option<tokio::net::TcpSocket>) {
+        loop {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+            let port = listener.local_addr().expect("addr").port();
+            let Ok(held) = tokio::net::TcpSocket::new_v6() else {
+                return (listener, None);
+            };
+            match held.bind((std::net::Ipv6Addr::LOCALHOST, port).into()) {
+                Ok(()) => return (listener, Some(held)),
+                // Already taken on `::1`: take another port.
+                Err(error) if error.kind() == std::io::ErrorKind::AddrInUse => {}
+                Err(_) => return (listener, None),
+            }
+        }
+    }
+
     /// A loopback HTTP/1.1 server that keeps connections open and answers
-    /// every request `200 ok`. Returns its port and how many connections it
-    /// has accepted.
-    fn keep_alive_server() -> (u16, Arc<AtomicUsize>) {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    /// every request `200 ok`. Returns its port, how many connections it has
+    /// accepted, and its port's hold on `::1` ([`loopback_listener`]), which
+    /// the caller keeps while it fetches.
+    fn keep_alive_server() -> (u16, Arc<AtomicUsize>, Option<tokio::net::TcpSocket>) {
+        let (listener, ipv6) = loopback_listener();
         let port = listener.local_addr().expect("addr").port();
         let accepted = Arc::new(AtomicUsize::new(0));
         let counter = Arc::clone(&accepted);
@@ -1571,7 +1602,7 @@ mod tests {
                 });
             }
         });
-        (port, accepted)
+        (port, accepted, ipv6)
     }
 
     fn get(url: String) -> HttpRequest {
@@ -1590,7 +1621,7 @@ mod tests {
     /// the production path.
     #[test]
     fn vetted_fetches_to_one_host_share_a_connection() {
-        let (port, accepted) = keep_alive_server();
+        let (port, accepted, _ipv6) = keep_alive_server();
         let http =
             GuestHttp::with_policy(Duration::from_secs(5), |_| false, false).expect("clients");
         let egress = EgressPolicy::parse(&["localhost".to_owned()]);
@@ -1621,7 +1652,7 @@ mod tests {
     /// the addresses vetted for it, as for a host the proxy settings exclude.)
     #[test]
     fn proxied_fetches_to_one_host_share_a_connection() {
-        let (port, accepted) = keep_alive_server();
+        let (port, accepted, _ipv6) = keep_alive_server();
         let http =
             GuestHttp::with_policy(Duration::from_secs(5), |_| false, true).expect("clients");
         let egress = EgressPolicy::parse(&["localhost".to_owned()]);
@@ -1657,7 +1688,7 @@ mod tests {
     /// the system cannot resolve, at the pinned address and the URL's port.
     #[test]
     fn the_proxied_client_resolves_a_name_at_its_pinned_addresses() {
-        let (port, accepted) = keep_alive_server();
+        let (port, accepted, _ipv6) = keep_alive_server();
         let http =
             GuestHttp::with_policy(Duration::from_secs(5), |_| false, true).expect("clients");
         http.pinned

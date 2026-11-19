@@ -35,8 +35,6 @@ use ferrofin_traits::providers::{
 };
 use serde::Deserialize;
 
-use ferrofin_traits::error::ServiceError;
-
 use crate::auth::{RequireAdminWithDefault, RequireAuth};
 use crate::error::ApiError;
 use crate::extract::{DotnetGuid, JsonBody, Query};
@@ -279,13 +277,15 @@ fn default_true() -> bool {
 /// `POST /Items/RemoteSearch/Apply/{itemId}` — apply a chosen result + refresh.
 ///
 /// Port of `ItemLookupController.ApplySearchCriteria`: resolves the item (`404`
-/// when absent), replaces its provider ids with the result's
+/// when absent, `400` for the all-zero id, as `GetItemById(Guid.Empty)`
+/// throws), replaces its provider ids with the result's
 /// (`item.SetProviderIds(searchResult.ProviderIds)`), then drives a
 /// `FullRefresh` (`ReplaceAllMetadata = true`, `RemoveOldMetadata = true`,
 /// `ReplaceAllImages = <query>`) carrying the chosen result and returns once
 /// it has run (`RefreshFullItem` is awaited).
 ///
-/// The refresh is `ProviderManager.RefreshItem`'s: an item with a path — a
+/// The refresh is `ProviderManager.RefreshItem`'s, which
+/// [`LibraryManager::refresh_full_item`] runs: an item with a path — a
 /// movie, a series and its whole subtree, an album, an artist folder —
 /// refreshes through the library scan of that path, whose metadata service
 /// skips the local readers (the NFO) when identifying and pins every fetcher
@@ -293,6 +293,8 @@ fn default_true() -> bool {
 /// fetcher the result came from first; an artist known only by name through
 /// the scanner's own refresh of it; any other item with no file of its own
 /// (a box set, a person) through the provider manager.
+///
+/// [`LibraryManager::refresh_full_item`]: ferrofin_traits::library::LibraryManager::refresh_full_item
 #[utoipa::path(
     post,
     path = "/Items/RemoteSearch/Apply/{itemId}",
@@ -303,6 +305,7 @@ fn default_true() -> bool {
     request_body = RemoteSearchResult,
     responses(
         (status = 204, description = "Item metadata refreshed"),
+        (status = 400, description = "A nil item id"),
         (status = 404, description = "Item not found")
     ),
     tag = "ferrofin"
@@ -314,6 +317,10 @@ async fn apply_search_criteria(
     Query(query): Query<ApplyQuery>,
     JsonBody(search_result): JsonBody<RemoteSearchResult>,
 ) -> Result<axum::http::StatusCode, ApiError> {
+    // `GetItemById(Guid.Empty)` throws `ArgumentException`, a 400.
+    if item_id.is_nil() {
+        return Err(ApiError::BadRequest("Guid can't be empty".to_owned()));
+    }
     let Some(item) = state
         .library
         .get_item_by_id_for_user(item_id, auth.user.as_deref())
@@ -344,99 +351,25 @@ async fn apply_search_criteria(
         remove_old_metadata: true,
         ..MetadataRefreshOptions::default()
     };
-    // An artist known only by name has no folder of its own: the scanner
-    // refreshes it as `RefreshFullItem` → `RefreshItem` does — itself, with
-    // the chosen ids — in the scan queue's priority lane (its by-name folder
-    // validation is a no-op upstream).
-    let by_name_artist = BaseItemKind::from_stored_type_name(&item.type_)
-        == Some(BaseItemKind::MusicArtist)
-        && item.top_parent_id.as_deref().is_none_or(str::is_empty);
-    let target = if by_name_artist {
-        Some(ferrofin_traits::library::ScanTarget::Artist {
-            id: item_id,
-            path: None,
-            folders: Vec::new(),
-        })
-    } else {
-        crate::handlers::item_update::refresh_scan_target(&item, item_id)
-    };
-    match target {
-        Some(target) => {
-            if !crate::handlers::scan_reaches(&state, &target).await? {
-                tracing::warn!(
-                    %item_id,
-                    path = item.path.as_deref().unwrap_or_default(),
-                    "identify refused: the item's path is under no library location"
-                );
-                return Err(ApiError::Conflict(format!(
-                    "item {item_id} is not under any library location, so it cannot be refreshed"
-                )));
-            }
-            // Awaited like upstream's `RefreshFullItem`, which runs with
-            // `CancellationToken.None`: on a task of its own, so a client that
-            // hangs up does not withdraw the refresh it asked for. It runs in
-            // the scan queue's priority lane — inside a running scan, between
-            // two of its items — so it never waits for a library scan.
-            let library = std::sync::Arc::clone(&state.library);
-            // In the request's span: the request awaits it (LOGGING.md §4).
-            let ran = tokio::spawn(tracing::Instrument::in_current_span(async move {
-                library.run_refresh_scan(target, &options).await
-            }))
-            .await
-            .map_err(|err| {
-                ApiError::Service(ServiceError::backend(format!(
-                    "identify refresh task failed: {err}"
-                )))
-            })??;
-            if !ran {
-                // Logged once, by the error boundary (a 5xx).
-                return Err(ApiError::ServiceUnavailable(format!(
-                    "the refresh of item {item_id} was stopped before it finished"
-                )));
-            }
-        }
-        None if needs_the_scan(&item) => {
-            tracing::warn!(
-                %item_id,
-                path = item.path.as_deref().unwrap_or_default(),
-                "identify refused: the item belongs to no library"
-            );
-            return Err(ApiError::Conflict(format!(
-                "item {item_id} belongs to no library, so it cannot be refreshed"
-            )));
-        }
-        None => state.providers.refresh_full_item(item_id, &options).await?,
+    // Awaited like upstream's `RefreshFullItem`, which runs with
+    // `CancellationToken.None`: on a task of its own, so a client that hangs
+    // up does not withdraw the refresh it asked for. An item with a path
+    // refreshes in the scan queue's priority lane — inside a running scan,
+    // between two of its items — so it never waits for a library scan.
+    let library = std::sync::Arc::clone(&state.library);
+    let ran =
+        crate::handlers::run_detached(
+            async move { library.refresh_full_item(&item, &options).await },
+        )
+        .await?;
+    if !ran {
+        // Logged once, by the error boundary (a 5xx).
+        return Err(ApiError::ServiceUnavailable(format!(
+            "the refresh of item {item_id} was stopped before it finished"
+        )));
     }
 
     Ok(axum::http::StatusCode::NO_CONTENT)
-}
-
-/// Whether `item`'s metadata comes only from the library scan: a file- or
-/// folder-backed kind with a path of its own (a movie, a series, an album…)
-/// — as against the kinds the provider manager refreshes (a box set, a
-/// person, a by-name artist, a path-less season or episode).
-fn needs_the_scan(item: &ferrofin_db::entities::base_items::BaseItemEntity) -> bool {
-    let has_path = item
-        .path
-        .as_deref()
-        .is_some_and(|path| !path.is_empty() && !path.contains("://"));
-    has_path
-        && matches!(
-            BaseItemKind::from_stored_type_name(&item.type_),
-            Some(
-                BaseItemKind::Movie
-                    | BaseItemKind::Trailer
-                    | BaseItemKind::MusicVideo
-                    | BaseItemKind::Video
-                    | BaseItemKind::Series
-                    | BaseItemKind::Episode
-                    | BaseItemKind::MusicAlbum
-                    | BaseItemKind::Audio
-                    | BaseItemKind::AudioBook
-                    | BaseItemKind::Book
-                    | BaseItemKind::Photo
-            )
-        )
 }
 
 /// Registers this controller's real routes onto `router`.

@@ -440,7 +440,7 @@ pub fn audio_bit_stream_arguments(
     if let Some(ref f) = noise {
         filters.push(f);
     }
-    let segment_is_mp4 = segment_container.eq_ignore_ascii_case("mp4");
+    let segment_is_mp4 = super::helper::is_mp4_segment_container(segment_container);
     if segment_is_mp4
         && (media_source_container.eq_ignore_ascii_case("ts")
             || media_source_container.eq_ignore_ascii_case("aac")
@@ -621,7 +621,6 @@ mod tests {
             output_audio_bitrate: None,
             output_audio_channels: None,
             output_container: None,
-            output_video_sync: None,
             output_file_path: "/tmp/out.mp4".to_owned(),
             input_container: None,
             is_input_video: true,
@@ -1168,7 +1167,6 @@ mod tests {
             output_audio_bitrate: None,
             output_audio_channels: None,
             output_container: None,
-            output_video_sync: None,
             output_file_path: String::new(),
             input_container: Some(input_container.to_owned()),
             is_input_video: true,

@@ -1272,13 +1272,18 @@ dependencies = [
 name = "ferrofin-common"
 version = "0.4.1"
 dependencies = [
+ "ferrofin-model",
  "pbkdf2",
+ "quick-xml",
  "rand 0.10.3",
  "regex",
  "rstest",
+ "serde",
+ "serde_json",
  "sha1 0.11.0",
  "sha2 0.11.1",
  "thiserror",
+ "tracing",
  "uuid",
 ]
 
@@ -1288,6 +1293,7 @@ version = "0.4.1"
 dependencies = [
  "async-trait",
  "chrono",
+ "dunce",
  "ferrofin-common",
  "ferrofin-db",
  "ferrofin-drawing",
@@ -1323,6 +1329,7 @@ dependencies = [
  "tracing-subscriber",
  "unicode-normalization",
  "uuid",
+ "windows-sys 0.61.2",
  "zip",
 ]
 
@@ -1335,6 +1342,7 @@ dependencies = [
  "ferrofin-util",
  "libsqlite3-sys",
  "rstest",
+ "serde_json",
  "sha2 0.11.1",
  "sqlx",
  "tempfile",
@@ -1432,6 +1440,7 @@ dependencies = [
  "ferrofin-mediaencoding",
  "ferrofin-model",
  "ferrofin-traits",
+ "ferrofin-util",
  "rstest",
  "tempfile",
  "thiserror",
@@ -1583,6 +1592,7 @@ dependencies = [
 name = "ferrofin-providers"
 version = "0.4.1"
 dependencies = [
+ "aes",
  "async-trait",
  "chardetng",
  "chrono",
@@ -1597,6 +1607,7 @@ dependencies = [
  "ferrofin-util",
  "flate2",
  "futures-util",
+ "md-5",
  "opentelemetry",
  "opentelemetry_sdk",
  "quick-xml",
@@ -1607,6 +1618,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sevenz-rust2",
+ "sha2 0.11.1",
  "tar",
  "tempfile",
  "thiserror",

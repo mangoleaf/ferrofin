@@ -17,8 +17,8 @@
 
 use std::sync::Arc;
 
-use ferrofin_core::{PluginConfigPage, ScheduledTask};
-use ferrofin_traits::plugins::PluginDescriptor;
+use ferrofin_traits::plugins::{PluginConfigPage, PluginDescriptor};
+use ferrofin_traits::tasks::ScheduledTask;
 use uuid::Uuid;
 
 use crate::{Extension, ExtensionContext};

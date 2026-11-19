@@ -45,7 +45,7 @@ use uuid::Uuid;
 
 use crate::item_type_lookup::stored_type_name;
 use crate::text_util::get_clean_value;
-use ferrofin_traits::options::InternalItemsQuery;
+use ferrofin_traits::options::{DescendantQueryRoots, InternalItemsQuery};
 
 /// The placeholder item id seeded by the initial migration; every real query
 /// excludes it (C# `PlaceholderId`).
@@ -931,13 +931,7 @@ pub(crate) fn append_predicates(qb: &mut QueryBuilder<Sqlite>, filter: &Internal
     }
 
     if let Some(term) = non_blank(filter.search_term.as_ref()) {
-        let like = format!("%{}%", get_clean_value(term).trim_matches('%'));
-        let orig_like = format!("%{}%", lower_invariant(term));
-        qb.push(r#" AND (bi."CleanName" LIKE "#)
-            .push_bind(like)
-            .push(r#" OR (bi."OriginalTitle" IS NOT NULL AND ferrofin_lower_invariant(bi."OriginalTitle") LIKE "#)
-            .push_bind(orig_like)
-            .push("))");
+        push_search_term(qb, term);
     }
 
     if let Some(is_folder) = filter.is_folder {
@@ -1313,6 +1307,39 @@ pub(crate) fn append_predicates(qb: &mut QueryBuilder<Sqlite>, filter: &Internal
     }
 }
 
+/// `DescendantQueryHelper`'s descendant set as a sub-select of ids, split at
+/// its three binds: the closure roots' JSON id array, the link roots' JSON id
+/// array, then the parent itself, which the set leaves out. The ids under the
+/// closure roots (two `AncestorIds` levels) and the link roots' linked
+/// children. The browse ([`append_linked_descendant_predicate`]) and the Next
+/// Up keys statement (`next_up_service::next_up_series_keys_sql`) share it.
+pub(crate) const LINKED_DESCENDANT_IDS: [&str; 3] = [
+    r#"WITH
+        closure_roots("Id") AS (SELECT value FROM json_each("#,
+    r#")), link_roots("Id") AS (SELECT value FROM json_each("#,
+    r#")), closure_direct("Id") AS (
+            SELECT a."ItemId" FROM "AncestorIds" a
+            JOIN closure_roots root ON root."Id" = a."ParentItemId"
+        ), all_descendants("Id") AS (
+            SELECT "Id" FROM closure_direct
+            UNION
+            SELECT a."ItemId" FROM "AncestorIds" a
+            JOIN closure_direct d ON d."Id" = a."ParentItemId"
+            UNION
+            SELECT link."ChildId" FROM "LinkedChildren" link
+            JOIN link_roots root ON root."Id" = link."ParentId"
+        ) SELECT "Id" FROM all_descendants WHERE "Id" <> "#,
+];
+
+/// The binds of [`LINKED_DESCENDANT_IDS`], in order.
+pub(crate) fn linked_descendant_binds(roots: &DescendantQueryRoots) -> [String; 3] {
+    [
+        serde_json::json!(to_guid_strings(&roots.closure_roots)).to_string(),
+        serde_json::json!(to_guid_strings(&roots.link_roots)).to_string(),
+        guid_to_db(roots.parent_id),
+    ]
+}
+
 /// Composes the resolved closure and linked membership with every outer filter.
 /// The repository loads only root folders; leaf IDs stay in this sub-select,
 /// and the same resolved query supplies count, sort and page statements.
@@ -1331,29 +1358,14 @@ fn append_linked_descendant_predicate(
         qb.push(" AND 0 = 1");
         return;
     };
-    qb.push(
-        r#" AND bi."Id" IN (WITH
-        closure_roots("Id") AS (SELECT value FROM json_each("#,
-    )
-    .push_bind(serde_json::json!(to_guid_strings(&roots.closure_roots)).to_string())
-    .push(r#")), link_roots("Id") AS (SELECT value FROM json_each("#)
-    .push_bind(serde_json::json!(to_guid_strings(&roots.link_roots)).to_string())
-    .push(
-        r#")), closure_direct("Id") AS (
-            SELECT a."ItemId" FROM "AncestorIds" a
-            JOIN closure_roots root ON root."Id" = a."ParentItemId"
-        ), all_descendants("Id") AS (
-            SELECT "Id" FROM closure_direct
-            UNION
-            SELECT a."ItemId" FROM "AncestorIds" a
-            JOIN closure_direct d ON d."Id" = a."ParentItemId"
-            UNION
-            SELECT link."ChildId" FROM "LinkedChildren" link
-            JOIN link_roots root ON root."Id" = link."ParentId"
-        ) SELECT "Id" FROM all_descendants WHERE "Id" <> "#,
-    )
-    .push_bind(guid_to_db(parent))
-    .push(")");
+    qb.push(r#" AND bi."Id" IN ("#);
+    for (sql, bind) in LINKED_DESCENDANT_IDS
+        .iter()
+        .zip(linked_descendant_binds(roots))
+    {
+        qb.push(*sql).push_bind(bind);
+    }
+    qb.push(")");
 }
 
 /// Pushes v12 `VersionsMatchingDimension` (`TranslateQuery.cs:73-79`): the
@@ -1703,6 +1715,27 @@ fn append_name_predicates(
     if filter.collapse_box_set_items != Some(true) {
         append_name_ranges(qb, filter);
     }
+}
+
+/// v12.4 `TranslateQuery`'s `SearchTerm` predicate, which a browse
+/// ([`append_predicates`]) and a by-name list's outer query
+/// (`item_repository::append_by_name_filters`, `GetItemValues`) both run
+/// (gl-957): `CleanName` contains the cleaned term, or `OriginalTitle` is
+/// `LIKE '%term%'`.
+///
+/// Upstream's wildcard branch is unreachable: it tests the cleaned term for a
+/// `SearchWildcardTerms` character (`% _ [ ] ^`), and `GetCleanValue` turns
+/// every one of them into a space. So the cleaned term holds no `LIKE`
+/// wildcard, and its `LIKE` is the literal contains upstream's `Contains` is
+/// (both sides lower-cased). The `OriginalTitle` side lower-cases both sides
+/// (Unicode), where upstream's SQLite `LIKE` folds ASCII case only; that
+/// difference is kept and recorded in the divergence lists.
+pub(crate) fn push_search_term(qb: &mut QueryBuilder<Sqlite>, term: &str) {
+    qb.push(r#" AND (bi."CleanName" LIKE "#)
+        .push_bind(format!("%{}%", get_clean_value(term)))
+        .push(r#" OR (bi."OriginalTitle" IS NOT NULL AND ferrofin_lower_invariant(bi."OriginalTitle") LIKE "#)
+        .push_bind(format!("%{}%", lower_invariant(term)))
+        .push("))");
 }
 
 /// The three letter-range filters run on the substituted BoxSet row in a
@@ -3218,23 +3251,23 @@ fn pins_sort_plan(by: ItemSortBy, order: SortOrder, filter: &InternalItemsQuery)
 /// column).
 fn orders_by_sort_name_column(by: ItemSortBy, filter: &InternalItemsQuery) -> bool {
     // The `ItemValues`-correlated keys are sub-selects of their own, and so
-    // is `SeriesDatePlayed`, with or without a user.
+    // are `SeriesDatePlayed` and `DatePlayed`, with or without a user.
     if matches!(
         by,
         ItemSortBy::Artist
             | ItemSortBy::AlbumArtist
             | ItemSortBy::Studio
             | ItemSortBy::SeriesDatePlayed
+            | ItemSortBy::DatePlayed
     ) {
         return false;
     }
-    // The user-data keys become correlated sub-selects when a user is present;
-    // without one they fall through to the column like everything else.
+    // The other user-data keys become correlated sub-selects when a user is
+    // present; without one they fall through to the column like everything else.
     if filter.user_id().is_some()
         && matches!(
             by,
-            ItemSortBy::DatePlayed
-                | ItemSortBy::PlayCount
+            ItemSortBy::PlayCount
                 | ItemSortBy::IsPlayed
                 | ItemSortBy::IsUnplayed
                 | ItemSortBy::IsFavoriteOrLiked
@@ -3441,8 +3474,9 @@ fn push_series_date_played(qb: &mut QueryBuilder<Sqlite>, filter: &InternalItems
 /// Pushes the ORDER BY expression for one [`ItemSortBy`] key. The user-data
 /// keys (`DatePlayed`, `PlayCount`, favorite state) are correlated
 /// sub-selects scoped to the query's user (upstream `OrderMapper`'s
-/// `UserData`-backed cases), and the played keys are [`push_is_played`];
-/// everything else is a plain column.
+/// `UserData`-backed cases; `DatePlayed` reads every user's rows when there is
+/// none), and the played keys are [`push_is_played`]; everything else is a
+/// plain column.
 fn push_order_expression(
     qb: &mut QueryBuilder<Sqlite>,
     by: ItemSortBy,
@@ -3454,43 +3488,54 @@ fn push_order_expression(
         push_series_date_played(qb, filter);
         return;
     }
-    // The user-data-correlated keys need the requesting user; without one they
-    // fall through to SortName (matching the C# `(key, null)` arms).
+    // v12 `OrderMapper.cs:32-48`: "An item's played date is the newest of its
+    // own progress and that of its alternate versions, which track progress
+    // under their own ids. Matching both in one predicate ORs them together,
+    // which no index can serve: the user's whole UserData table gets scanned
+    // per sorted row. Two indexed lookups combined by MAX cost a seek each
+    // instead." With no user it reads every user's rows
+    // (`query.User is null ? UserData : …`).
+    //
+    // The OR form measured 107 ms of a 109 ms Resume request here (60
+    // candidate rows × the user's ~5.4k rows). Two arms: the item's own rows,
+    // and its alternates' rows — `alt` first, on the partial
+    // `IX_BaseItems_PrimaryVersionId`, then theirs by the alternate's id. Each
+    // `UserData` seek takes the user and the item
+    // (`IX_UserData_UserId_ItemId_LastPlayedDate`), or the item alone
+    // (`IX_UserData_ItemId_UserId_LastPlayedDate`) with no user; the test
+    // `date_played_seeks_each_arm_by_item` pins both. `CROSS JOIN` pins the
+    // arm's order: left to itself the planner re-drives the arm from
+    // `IX_UserData_UserId` and walks the user's rows per candidate again
+    // (300 ms).
+    if by == ItemSortBy::DatePlayed {
+        let push_user = |qb: &mut QueryBuilder<Sqlite>| {
+            if let Some(user_id) = filter.user_id() {
+                qb.push(r#" AND oud."UserId" = "#)
+                    .push_bind(guid_to_db(user_id));
+            }
+        };
+        qb.push(
+            r#"(SELECT MAX(d."LastPlayedDate") FROM (
+                        SELECT oud."LastPlayedDate" FROM "UserData" oud
+                            WHERE oud."ItemId" = bi."Id""#,
+        );
+        push_user(qb);
+        qb.push(
+            r#" UNION ALL
+                        SELECT oud."LastPlayedDate" FROM "BaseItems" alt
+                            CROSS JOIN "UserData" oud
+                                ON oud."ItemId" = alt."Id""#,
+        );
+        push_user(qb);
+        qb.push(r#" WHERE alt."PrimaryVersionId" = bi."Id") AS d)"#);
+        return;
+    }
+    // The other user-data keys need the requesting user: upstream reads
+    // `query.User!.Id` for them and throws without one (a Jellyfin bug not
+    // ported), so here they fall through to SortName.
     if let Some(user_id) = filter.user_id() {
         let uid = guid_to_db(user_id);
         match by {
-            // v12 `OrderMapper.cs:32-48`: "An item's played date is the newest
-            // of its own progress and that of its alternate versions, which
-            // track progress under their own ids. Matching both in one
-            // predicate ORs them together, which no index can serve: the
-            // user's whole UserData table gets scanned per sorted row. Two
-            // indexed lookups combined by MAX cost a seek each instead."
-            //
-            // The OR form measured 107 ms of a 109 ms Resume request here (60
-            // candidate rows × the user's ~5.4k rows). Two arms: the item's
-            // own row on `IX_UserData_ItemId_UserId_LastPlayedDate`, and its
-            // alternates' rows — `alt` first, on the partial
-            // `IX_BaseItems_PrimaryVersionId`, then the same index
-            // by the alternate's id. `CROSS JOIN` pins that order: left to
-            // itself the planner re-drives the arm from `IX_UserData_UserId`
-            // and walks the user's rows per candidate again (300 ms).
-            ItemSortBy::DatePlayed => {
-                qb.push(
-                    r#"(SELECT MAX(d."LastPlayedDate") FROM (
-                        SELECT oud."LastPlayedDate" FROM "UserData" oud
-                            WHERE oud."ItemId" = bi."Id" AND oud."UserId" = "#,
-                )
-                .push_bind(uid.clone())
-                .push(
-                    r#" UNION ALL
-                        SELECT oud."LastPlayedDate" FROM "BaseItems" alt
-                            CROSS JOIN "UserData" oud
-                                ON oud."ItemId" = alt."Id" AND oud."UserId" = "#,
-                )
-                .push_bind(uid)
-                .push(r#" WHERE alt."PrimaryVersionId" = bi."Id") AS d)"#);
-                return;
-            }
             // "Folders carry no played flag of their own, so these two keys go
             // through the same predicate the isPlayed filter uses rather than
             // through the stored-column lookup in OrderMapper"
@@ -3896,6 +3941,80 @@ mod tests {
         assert!(ivm < iv, "the map drives: {plan:#?}");
         assert!(plan[ivm].ends_with("(ItemId=?)"), "{plan:#?}");
         assert!(plan[iv].ends_with("(ItemValueId=?)"), "{plan:#?}");
+    }
+
+    /// `DatePlayed`'s two arms seek by item: the row's own `UserData`, and its
+    /// alternates on `IX_BaseItems_PrimaryVersionId` before their rows. With a
+    /// user both `UserData` seeks take the user and the item (today
+    /// `IX_UserData_UserId_ItemId_LastPlayedDate`); with none (every user's
+    /// rows, `OrderMapper.cs:32-48`) the item alone
+    /// (`IX_UserData_ItemId_UserId_LastPlayedDate`), never a scan of
+    /// `UserData`. Either way the key is a sub-select, so it takes no
+    /// `SortName` pin.
+    #[rstest::rstest]
+    #[case::with_a_user(true)]
+    #[case::without_a_user(false)]
+    #[tokio::test]
+    async fn date_played_seeks_each_arm_by_item(#[case] with_user: bool) {
+        use sqlx::{Execute, Row};
+        let db = crate::test_support::test_db().await;
+        let user = if with_user {
+            let id = uuid::Uuid::from_u128(0x5521);
+            let user = crate::test_support::seed_user_with_defaults(&db, id).await;
+            Some(std::sync::Arc::new(user))
+        } else {
+            None
+        };
+        let filter = InternalItemsQuery {
+            user,
+            order_by: vec![(ItemSortBy::DatePlayed, SortOrder::Descending)],
+            limit: Some(20),
+            ..InternalItemsQuery::default()
+        };
+        let mut builder = build_query(&filter, QueryShape::FullRows);
+        let mut query = builder.build();
+        let args = query.take_arguments().expect("arguments").expect("binds");
+        let text = query.sql().as_str().to_owned();
+        assert!(text.contains(" ORDER BY (SELECT MAX("), "{text}");
+        let sql = format!("EXPLAIN QUERY PLAN {text}");
+        let plan: Vec<String> = sqlx::query_with(sqlx::AssertSqlSafe(sql), args)
+            .fetch_all(db.pool())
+            .await
+            .expect("explain query plan")
+            .iter()
+            .map(|row| row.get::<String, _>("detail"))
+            .collect();
+        // With a user either `(UserId, ItemId)`/`(ItemId, UserId)` covering
+        // index serves the two-column seek; they tie without `sqlite_stat1`.
+        let (index, key) = if with_user {
+            (
+                "SEARCH oud USING COVERING INDEX IX_UserData_",
+                "(UserId=? AND ItemId=?)",
+            )
+        } else {
+            (
+                "SEARCH oud USING COVERING INDEX IX_UserData_ItemId_UserId_LastPlayedDate ",
+                "(ItemId=?)",
+            )
+        };
+        let seeks: Vec<usize> = plan
+            .iter()
+            .enumerate()
+            .filter(|(_, d)| d.starts_with(index) && d.ends_with(key))
+            .map(|(at, _)| at)
+            .collect();
+        assert_eq!(seeks.len(), 2, "{plan:#?}");
+        let alt = plan
+            .iter()
+            .position(|d| d.starts_with("SEARCH alt USING INDEX IX_BaseItems_PrimaryVersionId"))
+            .unwrap_or_else(|| panic!("no alternate seek: {plan:#?}"));
+        assert!(alt < seeks[1], "the alternates drive: {plan:#?}");
+        assert!(
+            !plan
+                .iter()
+                .any(|d| d.starts_with("SCAN oud") || d.starts_with("SCAN alt")),
+            "{plan:#?}"
+        );
     }
 
     /// The candidate read behind the Playlists/Collections views
@@ -4558,6 +4677,16 @@ mod tests {
         assert_eq!(
             order_by(&sorted_by(&[(ItemSortBy::AirTime, SortOrder::Ascending)])),
             r#"ORDER BY +bi."SortName" ASC, bi."SortName" ASC"#
+        );
+        // A user-data key other than `DatePlayed`, with no user, is pinned
+        // too: upstream reads the missing user's id and throws (a Jellyfin bug
+        // not ported).
+        assert_eq!(
+            order_by(&sorted_by(&[(
+                ItemSortBy::PlayCount,
+                SortOrder::Descending
+            )])),
+            r#"ORDER BY +bi."SortName" DESC, bi."SortName" ASC"#
         );
         // `AiredEpisodeOrder` is one of those keys: `OrderMapper` has no arm
         // for it, so the query sorts by SortName (the comparer is only for

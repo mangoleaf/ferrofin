@@ -940,28 +940,6 @@ impl ItemCountService for FerrofinItemCountService {
         Ok(out)
     }
 
-    async fn get_played_count(
-        &self,
-        filter: &InternalItemsQuery,
-        ancestor_id: Uuid,
-    ) -> Result<i32, ServiceError> {
-        Ok(self
-            .get_played_and_total_count(filter, ancestor_id)
-            .await?
-            .played)
-    }
-
-    async fn get_total_count(
-        &self,
-        filter: &InternalItemsQuery,
-        ancestor_id: Uuid,
-    ) -> Result<i32, ServiceError> {
-        Ok(self
-            .get_played_and_total_count(filter, ancestor_id)
-            .await?
-            .total)
-    }
-
     /// Port of v12.2 `GetPlayedAndTotalCount` over
     /// `BuildGroupedDescendantsQuery` (`ItemCountService.cs:430-452`): the
     /// countable leaves below every folder in `ancestor_id`'s presentation-key
@@ -2194,21 +2172,6 @@ mod tests {
         assert_eq!(both.total, 2);
         assert_eq!(both.played, 1);
 
-        assert_eq!(
-            service
-                .get_total_count(&filter, folder)
-                .await
-                .expect("total"),
-            2
-        );
-        assert_eq!(
-            service
-                .get_played_count(&filter, folder)
-                .await
-                .expect("played"),
-            1
-        );
-
         // No user on the filter → played is 0 but total still counts.
         let no_user = InternalItemsQuery {
             recursive: true,
@@ -2277,14 +2240,6 @@ mod tests {
                 .await
                 .expect("played/total");
             assert_eq!((c.played, c.total), (played, total));
-            assert_eq!(
-                service.get_played_count(&filter, series).await.unwrap(),
-                played
-            );
-            assert_eq!(
-                service.get_total_count(&filter, series).await.unwrap(),
-                total
-            );
         }
     }
 

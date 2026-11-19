@@ -115,8 +115,6 @@ pub struct MetadataResult<T> {
     pub remote_images: Vec<(String, ImageType)>,
     /// Local images discovered on disk (`Images`).
     pub images: Vec<LocalImageInfo>,
-    /// The provider that produced the result (`Provider`).
-    pub provider: Option<String>,
 }
 
 impl<T: Default> Default for MetadataResult<T> {
@@ -129,11 +127,12 @@ impl<T> MetadataResult<T> {
     /// Creates a result wrapping `item` with upstream constructor defaults
     /// (no people, no images).
     ///
-    /// Upstream's `ResultLanguage`, `QueriedById` and `HasMetadata` are not
-    /// carried: nothing reads them on the local NFO path this type serves (a
-    /// parsed NFO is applied, a failed one skipped, which is `HasMetadata`'s
-    /// job upstream), and the remote path keeps the answer's language beside
-    /// its result ([`crate::episode::EpisodeAnswer::language`]).
+    /// Upstream's `ResultLanguage`, `QueriedById`, `HasMetadata` and `Provider`
+    /// are not carried: nothing reads them on the local NFO path this type
+    /// serves (a parsed NFO is applied, a failed one skipped, which is
+    /// `HasMetadata`'s job upstream), the remote path keeps the answer's
+    /// language beside its result ([`crate::episode::EpisodeAnswer::language`]),
+    /// and upstream sets `Provider` on the remote path without reading it.
     #[must_use]
     pub fn new(item: T) -> Self {
         Self {
@@ -141,7 +140,6 @@ impl<T> MetadataResult<T> {
             people: None,
             remote_images: Vec::new(),
             images: Vec::new(),
-            provider: None,
         }
     }
 
@@ -169,9 +167,10 @@ impl<T> MetadataResult<T> {
 ///
 /// Port of `MediaBrowser.Model.IO.FileSystemMetadata`. This namespace is
 /// server-side filesystem plumbing dropped from `ferrofin-model`, so it is
-/// re-created here for [`LocalImageInfo`]. `LastWriteTimeUtc` is carried as an
-/// RFC-3339 string to avoid a chrono dependency in this pure-data unit.
-/// `CreationTimeUtc` is not: upstream reads it for `UseFileCreationTimeForDateAdded`,
+/// re-created here for [`LocalImageInfo`]. `LastWriteTimeUtc` is not carried:
+/// upstream reads a local image's for its `DateModified`, which the merge takes
+/// from its own `stat` of the file ([`crate::local_images::file_date_modified`]).
+/// Nor is `CreationTimeUtc`: upstream reads it for `UseFileCreationTimeForDateAdded`,
 /// which the library scan takes from its own `stat` of the media file.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct FileSystemMetadata {
@@ -185,8 +184,6 @@ pub struct FileSystemMetadata {
     pub extension: Option<String>,
     /// The length in bytes (`Length`).
     pub length: i64,
-    /// The last write time, UTC, RFC-3339 (`LastWriteTimeUtc`).
-    pub last_write_time_utc: Option<String>,
     /// Whether the entry is a directory (`IsDirectory`).
     pub is_directory: bool,
 }

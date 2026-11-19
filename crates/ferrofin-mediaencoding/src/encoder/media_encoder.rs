@@ -23,7 +23,7 @@ use async_trait::async_trait;
 use ferrofin_model::data::{VideoRange, VideoRangeType};
 use ferrofin_model::drawing::{ImageFormat, ImageResolution};
 use ferrofin_model::dto::MediaSourceInfo;
-use ferrofin_model::entities::{IsoType, MediaStreamType, Video3DFormat};
+use ferrofin_model::entities::{IsoType, Video3DFormat, VideoType};
 use ferrofin_model::entities_media::MediaStream;
 use ferrofin_model::media_info::{MediaInfo, MediaProtocol, TransportStreamTimestamp};
 use ferrofin_traits::error::ServiceError;
@@ -38,10 +38,6 @@ use crate::probing::localization::{
     LocalizationManager as ProbeLocalization, PassthroughLocalization, TraitLocalization,
 };
 use crate::probing::probe_result_normalizer::ProbeResultNormalizer;
-
-/// The number of 100-nanosecond ticks in one second (`TimeSpan.TicksPerSecond`).
-#[cfg(test)]
-const TICKS_PER_SECOND: i64 = 10_000_000;
 
 /// `MediaEncoder.DefaultSdrImageExtractionTimeout`: how long one frame
 /// extraction may run when `ImageExtractionTimeoutMs` is unset (0 or less).
@@ -231,8 +227,8 @@ pub struct MediaEncoderConfig {
     /// deprecated `-vsync` (`GetVideoSyncOption`) and whether an extracted
     /// image is converted to the JPEG's BT.601 matrix
     /// ([`MIN_FFMPEG_JPEG_MATRIX_CONVERSION`]). `None` means "unprobed": it
-    /// takes `-vsync`, which every supported build still understands, and
-    /// converts no matrix.
+    /// takes `-vsync`, as upstream does for a version it cannot read (ffmpeg 9
+    /// no longer has it), and converts no matrix.
     pub ffmpeg_version: Option<FfmpegVersion>,
     /// `FFmpeg:imgExtractPerfTradeoff` (`GetFFmpegImgExtractPerfTradeoff`,
     /// default `false`): a frame extraction's I-frame attempt decodes
@@ -767,6 +763,15 @@ impl<T: Transcoder> MediaEncoder for MediaEncoderImpl<T> {
             .path
             .as_deref()
             .ok_or_else(|| ServiceError::invalid_input("media source has no path"))?;
+        // A DVD folder rip is probed through its `.vob` files
+        // (`FFProbeVideoInfo.ProbeVideo`); one `.vob` of it is a file.
+        if source.video_type == Some(VideoType::Dvd)
+            && tokio::fs::metadata(input_file)
+                .await
+                .is_ok_and(|m| m.is_dir())
+        {
+            return crate::disc::probe_dvd(self, input_file).await;
+        }
 
         let input_path = source_input_argument(input_file, source);
         let extra = self.get_extra_arguments(request);
@@ -927,11 +932,6 @@ impl<T: Transcoder> MediaEncoder for MediaEncoderImpl<T> {
         // `ExtractImage`'s `GetInputPathArgument`: a disc rip reads its
         // primary playlist.
         let input_path = crate::disc::input_path_argument(input_file, media_source).await?;
-        let image_stream_index = if video_stream.stream_type == MediaStreamType::Video {
-            None
-        } else {
-            Some(video_stream.index)
-        };
         let ffmpeg = self.encoder_path();
         // One thumbnail-pool slot for both attempts, where upstream locks per
         // `ExtractImageInternal` run: the standard attempt does not queue
@@ -955,11 +955,13 @@ impl<T: Transcoder> MediaEncoder for MediaEncoderImpl<T> {
                 ))
                 .to_string_lossy()
                 .into_owned();
+            // This overload maps no stream (`imageStreamIndex` null), whatever
+            // the stream's type: ffmpeg decodes its own pick of video stream.
             let args = Self::extract_image_arguments(
                 &input_path,
                 container,
                 Some(video_stream),
-                image_stream_index,
+                None,
                 threed_format,
                 offset_ticks,
                 use_iframe,
@@ -1018,6 +1020,7 @@ impl<T: Transcoder> MediaEncoder for MediaEncoderImpl<T> {
         input_file: &str,
         container: &str,
         media_source: &MediaSourceInfo,
+        image_stream: Option<&MediaStream>,
         stream_index: i32,
         format: ImageFormat,
     ) -> Result<String, ServiceError> {
@@ -1043,7 +1046,11 @@ impl<T: Transcoder> MediaEncoder for MediaEncoderImpl<T> {
             .await
             .map_err(ServiceError::backend_source)?;
         // `ExtractImage` tries the I-frame path first and, when that leaves
-        // nothing, the standard one.
+        // nothing, the standard one. The image stream is the video stream
+        // `ExtractImageInternal` deinterlaces; one that is not a video stream
+        // has no HDR range (`GetVideoColorRange`), so it is not tone-mapped.
+        let settings = self.extraction_settings();
+        let tone_mapped = Self::hdr_tone_map(image_stream, settings).is_some();
         let mut last_error = String::new();
         for use_iframe in [true, false] {
             let output_path = temp_dir
@@ -1057,13 +1064,13 @@ impl<T: Transcoder> MediaEncoder for MediaEncoderImpl<T> {
             let args = Self::extract_image_arguments(
                 &input_path,
                 container,
-                None,
+                image_stream,
                 Some(stream_index),
                 None,
                 None,
                 use_iframe,
                 &output_path,
-                self.extraction_settings(),
+                settings,
                 self.chapter_image_resolution
                     .as_ref()
                     .map_or(ImageResolution::MatchSource, |read| read()),
@@ -1071,7 +1078,7 @@ impl<T: Transcoder> MediaEncoder for MediaEncoderImpl<T> {
             // `ExtractImage` falls through to the standard attempt on any
             // failure of the I-frame one, a timed-out run among them.
             let output = match self
-                .run_image_extraction(&ffmpeg, &args, input_file, false)
+                .run_image_extraction(&ffmpeg, &args, input_file, tone_mapped)
                 .await
             {
                 Ok(output) => output,
@@ -1163,10 +1170,9 @@ mod tests {
     use ferrofin_model::entities::VideoType;
     use ferrofin_model::media_info::{MediaProtocol, TransportStreamTimestamp};
     use ferrofin_traits::media_encoding::{MediaEncoder, MediaInfoRequest};
+    use ferrofin_util::ticks::TICKS_PER_SECOND;
 
-    use super::{
-        ExtractionSettings, MediaEncoderConfig, MediaEncoderImpl, TICKS_PER_SECOND, probe_threads,
-    };
+    use super::{ExtractionSettings, MediaEncoderConfig, MediaEncoderImpl, probe_threads};
     use crate::encoder::Transcoder;
     use crate::encoding_helper::hw::FfmpegCapabilities;
     use async_trait::async_trait;
@@ -1519,6 +1525,7 @@ mod tests {
                 "/media/movie.mkv",
                 "matroska",
                 &MediaSourceInfo::default(),
+                None,
                 3,
                 ImageFormat::Png,
             )
@@ -1573,6 +1580,7 @@ mod tests {
             &rip.path().to_string_lossy(),
             "",
             &source,
+            None,
             0,
             ImageFormat::Png,
         )
@@ -1588,6 +1596,7 @@ mod tests {
                 &rip.path().to_string_lossy(),
                 "",
                 &source,
+                None,
                 0,
                 ImageFormat::Png,
             )
@@ -1617,6 +1626,7 @@ mod tests {
                 "/media/movie.mkv",
                 "",
                 &MediaSourceInfo::default(),
+                None,
                 9,
                 ImageFormat::Jpg,
             )
@@ -1910,6 +1920,7 @@ mod tests {
                 "/media/cover.mkv",
                 "",
                 &MediaSourceInfo::default(),
+                None,
                 2,
                 ImageFormat::Jpg,
             ),
@@ -2253,6 +2264,7 @@ mod tests {
                 "/media/movie.mkv",
                 "mkv",
                 &MediaSourceInfo::default(),
+                None,
                 2,
                 ImageFormat::Jpg,
             )
@@ -2280,6 +2292,7 @@ mod tests {
                 "/media/movie.mkv",
                 "mkv",
                 &MediaSourceInfo::default(),
+                None,
                 2,
                 ImageFormat::Jpg,
             )
@@ -2636,6 +2649,105 @@ mod tests {
             std::fs::remove_file(frame).unwrap();
             let arguments = transcoder.0.lock().unwrap().last().unwrap().clone();
             assert_eq!(arguments.contains("tonemapx="), tone_mapped, "{arguments}");
+        }
+    }
+
+    /// `ExtractVideoImage(…, videoStream, threedFormat, offset, …)` passes
+    /// `ExtractImage` no stream index, so a frame grab maps no stream, whatever
+    /// the type of the stream it is handed: ffmpeg decodes its own pick of
+    /// video stream.
+    #[tokio::test]
+    async fn a_frame_grab_never_maps_its_stream() {
+        use ferrofin_model::entities::MediaStreamType;
+        let temp = tempfile::tempdir().unwrap();
+        let transcoder = Arc::new(RecordingFrames(std::sync::Mutex::new(Vec::new())));
+        let encoder = MediaEncoderImpl::new(
+            Arc::clone(&transcoder),
+            "ffmpeg",
+            "ffprobe",
+            MediaEncoderConfig {
+                temp_dir: temp.path().to_path_buf().into(),
+                ..Default::default()
+            },
+        );
+        for stream_type in [
+            MediaStreamType::Video,
+            MediaStreamType::Audio,
+            MediaStreamType::EmbeddedImage,
+        ] {
+            let stream = ferrofin_model::entities_media::MediaStream {
+                stream_type,
+                index: 2,
+                ..video_stream()
+            };
+            let frame = encoder
+                .extract_video_image(
+                    "movie.mkv",
+                    "matroska",
+                    &MediaSourceInfo::default(),
+                    &stream,
+                    None,
+                    Some(10 * TICKS_PER_SECOND),
+                )
+                .await
+                .unwrap();
+            std::fs::remove_file(frame).unwrap();
+        }
+        let arguments = transcoder.0.lock().unwrap().clone();
+        assert_eq!(arguments.len(), 3, "{arguments:?}");
+        assert!(
+            arguments.iter().all(|a| !a.contains(" -map ")),
+            "{arguments:?}"
+        );
+    }
+
+    /// `ExtractVideoImage(…, imageStream, imageStreamIndex, targetFormat, …)`
+    /// hands `ExtractImageInternal` the image stream as its video stream, so
+    /// one ffprobe calls interlaced is deinterlaced; an attachment, extracted
+    /// with no stream, is not. Neither is tone-mapped: `GetVideoColorRange`
+    /// gives a stream that is not a video stream no range, whatever its
+    /// colour tags. Both are mapped by index.
+    #[tokio::test]
+    async fn an_image_stream_is_filtered_as_its_video_stream() {
+        let temp = tempfile::tempdir().unwrap();
+        let transcoder = Arc::new(RecordingFrames(std::sync::Mutex::new(Vec::new())));
+        let encoder = MediaEncoderImpl::new(
+            Arc::clone(&transcoder),
+            "ffmpeg",
+            "ffprobe",
+            MediaEncoderConfig {
+                temp_dir: temp.path().to_path_buf().into(),
+                ..Default::default()
+            },
+        )
+        .with_capabilities(Arc::new(
+            FfmpegCapabilities::builder().filters(["tonemapx"]).build(),
+        ));
+        let picture = ferrofin_model::entities_media::MediaStream {
+            stream_type: ferrofin_model::entities::MediaStreamType::EmbeddedImage,
+            index: 3,
+            is_interlaced: true,
+            ..graded_stream(Some("smpte2084"), None)
+        };
+        for (stream, deinterlaced) in [(Some(&picture), true), (None, false)] {
+            let image = encoder
+                .extract_image_stream(
+                    "movie.mkv",
+                    "matroska",
+                    &MediaSourceInfo::default(),
+                    stream,
+                    3,
+                    ImageFormat::Png,
+                )
+                .await
+                .unwrap();
+            std::fs::remove_file(image).unwrap();
+            let arguments = transcoder.0.lock().unwrap().last().unwrap().clone();
+            let tokens = crate::encoder::split_args(&arguments).unwrap();
+            let graph = &tokens[tokens.iter().position(|a| a == "-vf").unwrap() + 1];
+            assert!(arguments.contains(" -map 0:3 "), "{arguments}");
+            assert_eq!(graph.starts_with("bwdif=0:-1:0,"), deinterlaced, "{graph}");
+            assert!(graph.ends_with(",thumbnail=n=24"), "{graph}");
         }
     }
 
@@ -3239,6 +3351,161 @@ mod tests {
         request.media_is_audio = true;
         let source = enc.get_media_info(&request).await.expect("probe parses");
         assert_eq!(source.timestamp, None);
+    }
+
+    /// Answers each probe with an MPEG-2 stream, a 4096-byte format and one
+    /// chapter, lasting the seconds `durations` names for the `.vob` in the
+    /// argument line (no duration for one it does not name), and records
+    /// every argument line.
+    struct VobProbeTranscoder {
+        durations: &'static [(&'static str, &'static str)],
+        args: std::sync::Mutex<Vec<String>>,
+    }
+
+    #[async_trait]
+    impl Transcoder for VobProbeTranscoder {
+        async fn get_process_output(
+            &self,
+            _path: &str,
+            arguments: &str,
+            _read_stderr: bool,
+            _test_key: Option<&str>,
+            _env: &[(String, String)],
+        ) -> Result<ProcessOutput, String> {
+            self.args.lock().unwrap().push(arguments.to_owned());
+            let duration = self
+                .durations
+                .iter()
+                .find(|(name, _)| arguments.contains(name))
+                .map_or(String::new(), |(_, d)| format!(r#","duration":"{d}""#));
+            Ok(ProcessOutput {
+                output: format!(
+                    r#"{{"streams":[{{"index":0,"codec_type":"video","codec_name":"mpeg2video"}}],
+                        "format":{{"format_name":"mpeg","size":"4096"{duration}}},
+                        "chapters":[{{"start_time":"0.000000","tags":{{"title":"One"}}}}]}}"#
+                ),
+                success: true,
+            })
+        }
+
+        async fn get_process_exit_code(&self, _path: &str, _arguments: &str) -> bool {
+            true
+        }
+    }
+
+    /// A sparse 1 GiB `.vob`, a real DVD's segment size: below the 900 MB
+    /// big-title mark only the first file's segment number would be kept
+    /// (`GetPrimaryPlaylistVobFiles`).
+    fn segment(path: &std::path::Path) {
+        std::fs::File::create(path)
+            .unwrap()
+            .set_len(1 << 30)
+            .unwrap();
+    }
+
+    fn dvd_request(path: &std::path::Path) -> MediaInfoRequest {
+        MediaInfoRequest {
+            media_source: MediaSourceInfo {
+                path: Some(path.to_string_lossy().into_owned()),
+                video_type: Some(VideoType::Dvd),
+                ..MediaSourceInfo::default()
+            },
+            extract_chapters: true,
+            media_is_audio: false,
+        }
+    }
+
+    /// `FFProbeVideoInfo.ProbeVideo`'s DVD branch: a DVD folder rip probes
+    /// its main feature's first `.vob` (streams, chapters, size) and adds the
+    /// run times of the feature's other `.vob` files; the menus are never
+    /// probed. Each `.vob` is probed as a plain video file, with its
+    /// chapters. A `.vob` of a DVD (the concat file's probe) is a file.
+    #[tokio::test]
+    async fn a_dvd_rip_probes_its_title_vobs_and_adds_their_run_times() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let ts = dir.path().join("VIDEO_TS");
+        std::fs::create_dir_all(&ts).unwrap();
+        for menu in ["VIDEO_TS.VOB", "VTS_01_0.VOB"] {
+            std::fs::write(ts.join(menu), b"menu").unwrap();
+        }
+        for vob in ["VTS_01_1.VOB", "VTS_01_2.VOB"] {
+            segment(&ts.join(vob));
+        }
+        let transcoder = Arc::new(VobProbeTranscoder {
+            durations: &[("VTS_01_1.VOB", "8"), ("VTS_01_2.VOB", "4.5")],
+            args: std::sync::Mutex::new(Vec::new()),
+        });
+        let enc = MediaEncoderImpl::new(
+            Arc::clone(&transcoder),
+            "/usr/bin/ffmpeg",
+            "/usr/bin/ffprobe",
+            MediaEncoderConfig::default(),
+        );
+
+        let info = enc
+            .get_media_info_full(&dvd_request(dir.path()))
+            .await
+            .expect("the rip probes");
+
+        assert_eq!(info.media_source.run_time_ticks, Some(125_000_000));
+        assert_eq!(info.media_source.size, Some(4096));
+        assert_eq!(info.media_source.container.as_deref(), Some("mpeg"));
+        assert_eq!(info.media_source.media_streams.len(), 1);
+        assert_eq!(info.media_source.chapters.len(), 1);
+        assert_eq!(info.media_source.video_type, Some(VideoType::VideoFile));
+        let args = transcoder.args.lock().unwrap().clone();
+        assert_eq!(args.len(), 2, "{args:?}");
+        for (line, vob) in args.iter().zip(["VTS_01_1.VOB", "VTS_01_2.VOB"]) {
+            assert!(
+                line.contains(&format!("file:\"{}\"", ts.join(vob).display())),
+                "{line}"
+            );
+            assert!(line.contains("-show_chapters"), "{line}");
+        }
+
+        transcoder.args.lock().unwrap().clear();
+        let one = enc
+            .get_media_info_full(&dvd_request(&ts.join("VTS_01_2.VOB")))
+            .await
+            .expect("one vob probes");
+        assert_eq!(one.media_source.run_time_ticks, Some(45_000_000));
+        assert_eq!(transcoder.args.lock().unwrap().len(), 1);
+    }
+
+    /// The run time stays unknown when one `.vob`'s is (C#'s `long?` sum),
+    /// and a rip with no playable `.vob` is not probed at all.
+    #[tokio::test]
+    async fn a_dvd_rip_without_a_playable_vob_or_a_run_time_reports_none() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let ts = dir.path().join("VIDEO_TS");
+        std::fs::create_dir_all(&ts).unwrap();
+        std::fs::write(ts.join("VIDEO_TS.VOB"), b"menu").unwrap();
+        let transcoder = Arc::new(VobProbeTranscoder {
+            durations: &[("VTS_01_1.VOB", "8")],
+            args: std::sync::Mutex::new(Vec::new()),
+        });
+        let enc = MediaEncoderImpl::new(
+            Arc::clone(&transcoder),
+            "/usr/bin/ffmpeg",
+            "/usr/bin/ffprobe",
+            MediaEncoderConfig::default(),
+        );
+
+        let err = enc
+            .get_media_info_full(&dvd_request(dir.path()))
+            .await
+            .expect_err("only a menu");
+        assert!(err.to_string().contains("no playable .vob"), "{err}");
+        assert!(transcoder.args.lock().unwrap().is_empty());
+
+        for vob in ["VTS_01_1.VOB", "VTS_01_2.VOB"] {
+            segment(&ts.join(vob));
+        }
+        let info = enc
+            .get_media_info_full(&dvd_request(dir.path()))
+            .await
+            .expect("the rip probes");
+        assert_eq!(info.media_source.run_time_ticks, None);
     }
 
     /// The server localization seam, knowing only `eng`.

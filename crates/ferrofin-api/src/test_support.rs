@@ -28,8 +28,8 @@ use ferrofin_model::configuration::{
 };
 use ferrofin_model::data::CollectionType;
 use ferrofin_model::dto::{
-    BaseItemDto, ClientCapabilitiesDto, DeviceInfoDto, ItemCounts, MediaSourceInfo, NameIdPair,
-    SessionInfoDto, UpdateUserItemDataDto, UserDto, UserItemDataDto,
+    BaseItemDto, DeviceInfoDto, ItemCounts, MediaSourceInfo, NameIdPair, SessionInfoDto,
+    UpdateUserItemDataDto, UserDto, UserItemDataDto,
 };
 use ferrofin_model::entities::ImageType;
 use ferrofin_model::entities_media::PlaylistUserPermissions;
@@ -1281,13 +1281,6 @@ impl SessionManager for FakeSessions {
     ) -> Result<SessionInfoDto, ServiceError> {
         unimplemented!("fake")
     }
-    async fn update_device_name(
-        &self,
-        _session_id: &str,
-        _reported_device_name: &str,
-    ) -> Result<(), ServiceError> {
-        unimplemented!("fake")
-    }
     async fn on_playback_start(&self, _info: &PlaybackStartInfo) -> Result<(), ServiceError> {
         unimplemented!("fake")
     }
@@ -1387,6 +1380,7 @@ impl SessionManager for FakeSessions {
         _request: &AuthenticationRequest,
     ) -> Result<AuthenticationResultData, ServiceError> {
         Ok(AuthenticationResultData {
+            user: UserDto::default(),
             session: SessionInfoDto::default(),
             access_token: FAKE_ACCESS_TOKEN.into(),
         })
@@ -1396,6 +1390,7 @@ impl SessionManager for FakeSessions {
         _request: &AuthenticationRequest,
     ) -> Result<AuthenticationResultData, ServiceError> {
         Ok(AuthenticationResultData {
+            user: UserDto::default(),
             session: SessionInfoDto::default(),
             access_token: FAKE_ACCESS_TOKEN.into(),
         })
@@ -1726,14 +1721,6 @@ impl MusicManager for FakeMusic {
     ) -> Result<Vec<BaseItemEntity>, ServiceError> {
         unimplemented!("fake")
     }
-    async fn get_instant_mix_from_artist(
-        &self,
-        _artist_id: Uuid,
-        _user_id: Option<Uuid>,
-        _dto_options: &DtoOptions,
-    ) -> Result<Vec<BaseItemEntity>, ServiceError> {
-        unimplemented!("fake")
-    }
     async fn get_instant_mix_from_genres(
         &self,
         _genres: &[String],
@@ -2017,6 +2004,9 @@ impl SubtitleManager for FakeSubtitles {
     async fn delete_subtitles(&self, _item_id: Uuid, _index: i32) -> Result<(), ServiceError> {
         unimplemented!("fake")
     }
+    async fn drop_missing_subtitle_rows(&self, _item_id: Uuid) -> Result<(), ServiceError> {
+        unimplemented!("fake")
+    }
     async fn get_supported_providers(
         &self,
         _item_id: Uuid,
@@ -2224,12 +2214,6 @@ impl DeviceManager for FakeDevices {
         &self,
         _device_id: &str,
     ) -> Result<Option<DeviceOptionsEntity>, ServiceError> {
-        unimplemented!("fake")
-    }
-    async fn to_client_capabilities_dto(
-        &self,
-        _capabilities: &ClientCapabilities,
-    ) -> Result<ClientCapabilitiesDto, ServiceError> {
         unimplemented!("fake")
     }
 }
@@ -2943,8 +2927,8 @@ fn fake_state_over(
 /// for the `/Plugins/*`, `/Packages/*` and `/Repositories` handler tests.
 ///
 /// Every other manager is the [`fake_state`] double; authentication succeeds
-/// as an **API key** ([`ApiKeyAuthService`]) so both the plain-auth reads and
-/// the admin-gated mutators reach their handler.
+/// as an **API key** ([`ApiKeyAuthService`]) so every admin-gated route reaches
+/// its handler.
 #[must_use]
 pub fn authed_state_with_plugins(
     plugins: Arc<dyn ferrofin_traits::plugins::PluginManager>,

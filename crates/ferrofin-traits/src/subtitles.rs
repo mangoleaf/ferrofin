@@ -8,8 +8,9 @@
 //! - Overloaded `SearchSubtitles` (a `Video` form and a request form) collapse
 //!   to one method taking a [`SubtitleSearchRequest`]; overloaded
 //!   `DownloadSubtitles` collapse to one `download_subtitles`.
-//! - The `.NET` `SubtitleDownloadFailure` event is dropped (event wiring lives
-//!   in `ferrofin-core`).
+//! - The `.NET` `SubtitleDownloadFailure` event becomes
+//!   [`SubtitleManager::report_download_failure`], which
+//!   [`SubtitleManager::download_subtitles`] raises for its own failures.
 //! - Remote subtitle candidates reuse the [`RemoteSubtitleInfo`] wire DTO;
 //!   provider descriptors reuse [`SubtitleProviderInfo`]. The raw subtitle
 //!   payload returned by `GetRemoteSubtitles` surfaces as a [`SubtitleResponse`]
@@ -117,6 +118,20 @@ pub struct SubtitleResponse {
     pub content: Vec<u8>,
 }
 
+/// A provider refused a download because its quota is spent (C#
+/// `MediaBrowser.Common.Extensions.RateLimitExceededException`). Providers
+/// return it as a [`ServiceError::BackendSource`], so callers can tell it from
+/// other failures with [`is_rate_limit_exceeded`].
+#[derive(Debug, thiserror::Error)]
+#[error("{0}")]
+pub struct RateLimitExceeded(pub String);
+
+/// Whether `error` is a provider's [`RateLimitExceeded`].
+#[must_use]
+pub fn is_rate_limit_exceeded(error: &ServiceError) -> bool {
+    matches!(error, ServiceError::BackendSource(source) if source.is::<RateLimitExceeded>())
+}
+
 /// Searches, downloads, uploads and deletes subtitles for library items.
 ///
 /// Port of `ISubtitleManager`.
@@ -145,9 +160,28 @@ pub trait SubtitleManager: Send + Sync {
     /// Fetches the raw content of a remote subtitle by id.
     async fn get_remote_subtitles(&self, id: &str) -> Result<SubtitleResponse, ServiceError>;
 
+    /// Raises C# `SubtitleDownloadFailure` for a failed download of the remote
+    /// subtitle `subtitle_id` to the item: the activity entry
+    /// `SubtitleDownloadFailureLogger` writes for it.
+    /// [`download_subtitles`](Self::download_subtitles) raises it itself; a
+    /// caller that fetches with [`get_remote_subtitles`](Self::get_remote_subtitles)
+    /// and saves with [`upload_subtitle`](Self::upload_subtitle) raises it for
+    /// either step's failure. A [`RateLimitExceeded`] or an id naming no
+    /// provider raises nothing. The default raises nothing: a manager with no
+    /// activity log has no consumer for it.
+    async fn report_download_failure(
+        &self,
+        item_id: Uuid,
+        subtitle_id: &str,
+        error: &ServiceError,
+    ) {
+        let _ = (item_id, subtitle_id, error);
+    }
+
     /// Deletes the file of the item's external subtitle stream at `index`
     /// (`SubtitleManager.DeleteSubtitles`). The stream itself is left to the
-    /// item refresh the caller runs next.
+    /// item refresh the caller runs next, and then to
+    /// [`drop_missing_subtitle_rows`](Self::drop_missing_subtitle_rows).
     ///
     /// # Errors
     ///
@@ -159,6 +193,19 @@ pub trait SubtitleManager: Send + Sync {
     ///   file already gone from a folder that exists is no error.
     /// - [`ServiceError::Backend`] for any other failure to delete the file.
     async fn delete_subtitles(&self, item_id: Uuid, index: i32) -> Result<(), ServiceError>;
+
+    /// Drops the item's external subtitle stream rows whose absolute path
+    /// surely no longer exists, the other rows keeping their indexes; a
+    /// relative or URL row, or one whose path cannot be checked, stays. The
+    /// subtitle delete runs it after the item's refresh: a refresh that probes
+    /// the file has already rewritten the rows from the files on disk, as
+    /// upstream's does, but one that cannot (no ffprobe, a failed probe)
+    /// leaves them, and the deleted subtitle would stay listed.
+    ///
+    /// # Errors
+    ///
+    /// Propagates a storage failure reading or saving the rows.
+    async fn drop_missing_subtitle_rows(&self, item_id: Uuid) -> Result<(), ServiceError>;
 
     /// Lists the subtitle providers that support the item.
     async fn get_supported_providers(
@@ -244,7 +291,21 @@ fn _assert_object_safe_subtitle_provider(_: &dyn SubtitleProvider) {}
 
 #[cfg(test)]
 mod tests {
-    use super::{SubtitleResponse, SubtitleSearchRequest};
+    use super::{
+        RateLimitExceeded, ServiceError, SubtitleResponse, SubtitleSearchRequest,
+        is_rate_limit_exceeded,
+    };
+
+    #[test]
+    fn only_a_rate_limit_source_is_a_rate_limit() {
+        assert!(is_rate_limit_exceeded(&ServiceError::backend_source(
+            RateLimitExceeded("spent".to_owned())
+        )));
+        assert!(!is_rate_limit_exceeded(&ServiceError::backend_source(
+            std::io::Error::other("spent")
+        )));
+        assert!(!is_rate_limit_exceeded(&ServiceError::backend("spent")));
+    }
 
     #[test]
     fn search_request_default_is_empty() {

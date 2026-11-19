@@ -40,6 +40,8 @@ use ferrofin_traits::error::ServiceError;
 use ferrofin_traits::library::LibraryManager;
 use ferrofin_traits::system::{ServerApplicationPaths, SystemManager};
 
+use crate::system_manager::LifecycleController;
+
 /// The SQLite database file name inside the data directory.
 const DB_FILE_NAME: &str = "ferrofin.db";
 
@@ -188,8 +190,8 @@ const PARTIAL_SUFFIX: &str = ".partial";
 /// `POST /Backup/Create` to start: `BackupService.CreateBackupAsync`'s
 /// `FiveGigabyte`, copied verbatim (it is 5 bytes short of 5 GiB).
 ///
-/// A build that cannot read free space (non-unix: `free_space_of` reports
-/// `-1`) refuses every create, as upstream's catch arm would.
+/// Free space that cannot be read (`free_space_of` reports `-1`) refuses the
+/// create, as upstream's catch arm does.
 ///
 /// FLAGGED as a candidate setting — plausible range 1 GiB…10 GiB, default
 /// upstream's.
@@ -402,23 +404,29 @@ pub struct FerrofinBackupService {
     /// The backups directory's free space, the database snapshot and the
     /// restart a scheduled restore asks for.
     system: Arc<dyn SystemManager>,
+    /// Where a scheduled restore raises the pending restart
+    /// (`NotifyPendingRestart`).
+    lifecycle: Arc<dyn LifecycleController>,
     /// The release recorded as each manifest's `ServerVersion`.
     server_version: &'static str,
 }
 
 impl FerrofinBackupService {
-    /// A service over `paths` whose manifests record `server_version`.
+    /// A service over `paths` whose manifests record `server_version`, and
+    /// whose scheduled restore flags its restart in `lifecycle`.
     #[must_use]
     pub fn new(
         paths: Arc<dyn ServerApplicationPaths>,
         library: Arc<dyn LibraryManager>,
         system: Arc<dyn SystemManager>,
+        lifecycle: Arc<dyn LifecycleController>,
         server_version: &'static str,
     ) -> Self {
         Self {
             paths,
             library,
             system,
+            lifecycle,
             server_version,
         }
     }
@@ -579,6 +587,8 @@ impl BackupService for FerrofinBackupService {
         if let Some(refusal) = refusal {
             return Err(refusal);
         }
+        // `ScheduleRestoreAndRestartServer`: `NotifyPendingRestart`, then the stop.
+        self.lifecycle.mark_restart_required();
         self.system.restart().await?;
         Ok(())
     }
@@ -2025,11 +2035,12 @@ mod tests {
     }
 
     /// A service over the program-data root `dir` (its archives go in
-    /// [`backups_of`]`(dir)`), with `library` and `system`.
+    /// [`backups_of`]`(dir)`), with `library`, and `system` as both the system
+    /// manager and the lifecycle.
     fn service_over(
         dir: &Path,
         library: Arc<dyn LibraryManager>,
-        system: Arc<dyn SystemManager>,
+        system: Arc<DiskSystem>,
     ) -> FerrofinBackupService {
         let paths = crate::app_paths::FerrofinServerApplicationPaths::new(
             dir,
@@ -2038,7 +2049,13 @@ mod tests {
             dir.join("cache"),
             dir.join("web"),
         );
-        FerrofinBackupService::new(Arc::new(paths), library, system, TEST_VERSION)
+        FerrofinBackupService::new(
+            Arc::new(paths),
+            library,
+            system.clone(),
+            system,
+            TEST_VERSION,
+        )
     }
 
     /// A library manager with no scan running.
@@ -2083,6 +2100,9 @@ mod tests {
         failing_snapshot: bool,
         stall: Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>,
         restarts: AtomicUsize,
+        pending_restart: std::sync::atomic::AtomicBool,
+        /// Whether the restart was pending when the restart was asked for.
+        pending_at_restart: std::sync::atomic::AtomicBool,
     }
 
     impl DiskSystem {
@@ -2093,6 +2113,8 @@ mod tests {
                 failing_snapshot: false,
                 stall: None,
                 restarts: AtomicUsize::new(0),
+                pending_restart: std::sync::atomic::AtomicBool::new(false),
+                pending_at_restart: std::sync::atomic::AtomicBool::new(false),
             }
         }
     }
@@ -2113,6 +2135,10 @@ mod tests {
         }
         async fn restart(&self) -> Result<(), ServiceError> {
             self.restarts.fetch_add(1, Ordering::SeqCst);
+            self.pending_at_restart.store(
+                self.pending_restart.load(Ordering::SeqCst),
+                Ordering::SeqCst,
+            );
             Ok(())
         }
         async fn shutdown(&self) -> Result<(), ServiceError> {
@@ -2138,6 +2164,24 @@ mod tests {
         }
         async fn free_space_of(&self, _path: &Path) -> i64 {
             self.free_space
+        }
+    }
+
+    /// The lifecycle half of the fake: records the pending restart a scheduled
+    /// restore raises.
+    #[async_trait::async_trait]
+    impl crate::system_manager::LifecycleController for DiskSystem {
+        async fn stop(&self, _restart: bool) -> Result<(), ServiceError> {
+            unreachable!("the backup service restarts through the system manager")
+        }
+        fn has_pending_restart(&self) -> bool {
+            self.pending_restart.load(Ordering::SeqCst)
+        }
+        fn mark_restart_required(&self) {
+            self.pending_restart.store(true, Ordering::SeqCst);
+        }
+        fn is_shutting_down(&self) -> bool {
+            false
         }
     }
 
@@ -2256,14 +2300,20 @@ mod tests {
         let unknown = service.get_backup_manifest("nope.zip").await;
         assert!(not_found(&unknown, "nope.zip"), "{unknown:?}");
 
-        // Restore schedules the archive (the marker names it) and asks for a
-        // restart; an unknown archive is not found.
+        // Restore schedules the archive (the marker names it), flags the
+        // restart as pending (`NotifyPendingRestart`, gl-1792) and asks for it;
+        // an unknown archive is not found.
+        assert!(!system.pending_restart.load(Ordering::SeqCst));
         service.schedule_restore(&created_name).await.unwrap();
         assert_eq!(
             std::fs::read_to_string(backups.join(super::RESTORE_PENDING_FILE)).unwrap(),
             created_name
         );
         assert_eq!(system.restarts.load(Ordering::SeqCst), 1);
+        assert!(
+            system.pending_at_restart.load(Ordering::SeqCst),
+            "flagged before the restart"
+        );
         let unknown = service.schedule_restore("nope.zip").await;
         assert!(not_found(&unknown, "nope.zip"), "{unknown:?}");
         // A foreign (Jellyfin-engine) archive in the same directory is refused up front.

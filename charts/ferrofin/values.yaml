@@ -284,5 +284,9 @@ networkPolicy:
   metrics:
     # -- Namespace Prometheus runs in. Empty → release namespace.
     namespace: ""
+    # -- Prometheus pods allowed to scrape: a label selector (matchLabels/matchExpressions), not a
+    # bare label map. Helm merges an override into this default: null what you drop
+    # (app.kubernetes.io/name: null under matchLabels, or matchLabels: null for matchExpressions).
     podSelector:
-      app.kubernetes.io/name: prometheus
+      matchLabels:
+        app.kubernetes.io/name: prometheus

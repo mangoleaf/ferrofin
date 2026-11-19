@@ -484,16 +484,128 @@ pub(crate) async fn serve_static_file_without_ranges(
     Ok(response)
 }
 
-/// Serves the file at `path` for `request`, honouring `Range`/`HEAD`.
+/// `PhysicalFile(path, MimeTypes.GetMimeType(path), true)`: [`serve_static_file`]
+/// typed by the ported `MimeTypes` table, not by the type `ServeFile` guessed
+/// (which only its 200 and 206 carry).
+pub(crate) async fn serve_physical_file(
+    path: &str,
+    request: Request,
+) -> Result<Response, ApiError> {
+    let mut response = serve_static_file(path, request).await?;
+    if let Some(value) = response.headers_mut().get_mut(header::CONTENT_TYPE) {
+        *value =
+            header::HeaderValue::from_static(ferrofin_model::net::mime_types::get_mime_type(path));
+    }
+    Ok(response)
+}
+
+/// The file `LibraryController.GetFile` and `GetDownload` hand `PhysicalFile`:
+/// a link whose final target exists is served, and typed, as that target
+/// (`FileSystemHelper.ResolveLinkTarget(path, returnFinalTarget: true)`), any
+/// other path as given. A directory, or a link to one, is `PhysicalFile`'s
+/// `FileNotFoundException`, a `404`, where `ServeFile` would open it.
+pub(crate) async fn physical_file_path(path: String) -> Result<String, ApiError> {
+    let Ok(meta) = tokio::fs::symlink_metadata(&path).await else {
+        // Missing, or not a file path at all: ServeFile answers the 404.
+        return Ok(path);
+    };
+    let target = if meta.is_symlink() {
+        // shortcut: a target that is not UTF-8 is served through the link and typed by
+        // its name; serve a PathBuf if such a library ever turns up.
+        tokio::fs::canonicalize(&path)
+            .await
+            .ok()
+            .and_then(|target| target.into_os_string().into_string().ok())
+    } else {
+        None
+    };
+    let is_dir = match &target {
+        Some(target) => tokio::fs::metadata(target).await.is_ok_and(|m| m.is_dir()),
+        None => meta.is_dir(),
+    };
+    if is_dir {
+        // A static message: the body must not carry the on-disk path.
+        return Err(ApiError::NotFound("not a file".to_owned()));
+    }
+    Ok(target.unwrap_or(path))
+}
+
+/// Serves the file at `path` for `request`, honouring `Range`/`HEAD` as
+/// `PhysicalFile(…, enableRangeProcessing: true)` does.
 ///
-/// Delegates to [`tower_http::services::ServeFile`], which performs the
-/// `Range`/`HEAD`/`206 Partial Content`/`404` handling; its infallible response is
-/// mapped into an axum body. A resolution/IO failure surfaces as `404`.
-pub(crate) async fn serve_static_file(path: &str, request: Request) -> Result<Response, ApiError> {
-    let response = ServeFile::new(path)
-        .oneshot(request)
-        .await
-        .map_err(|e| ApiError::NotFound(e.to_string()))?;
+/// Delegates to [`tower_http::services::ServeFile`] (through [`serve_file`]),
+/// which performs the `Range`/`HEAD`/`206 Partial Content`/`404` handling. A
+/// resolution/IO failure surfaces as `404`.
+///
+/// Where ASP.NET's `RangeHelper.ParseRange` and `FileResultHelper.IfRangeValid`
+/// answer otherwise, the request is changed first or served again. Several
+/// ranges, in one header or in several, and a range that does not parse are
+/// ignored and the whole file served, where `ServeFile` answers `416` (or `206`
+/// for the first header); one range is read as [`one_byte_range`] does. A
+/// `Range` whose `If-Range` no longer holds is ignored too: `ServeFile` never
+/// reads `If-Range`, so it is checked against the validators of its answer, and
+/// the file is served again without the range when it fails. A suffix longer
+/// than the file is served again as the whole file in a `206`, and a range of
+/// an empty file is a `416`.
+pub(crate) async fn serve_static_file(
+    path: &str,
+    mut request: Request,
+) -> Result<Response, ApiError> {
+    let headers = request.headers_mut();
+    let range = one_byte_range(headers);
+    // Handed on in the one form ServeFile parses, which is stricter than
+    // ASP.NET's: it answers 416 to a value ASP.NET ignores or reads.
+    match range.and_then(|(first, last)| {
+        let bound = |n: Option<u64>| n.map_or_else(String::new, |n| n.to_string());
+        header::HeaderValue::try_from(format!("bytes={}-{}", bound(first), bound(last))).ok()
+    }) {
+        Some(value) => headers.insert(header::RANGE, value),
+        None => headers.remove(header::RANGE),
+    };
+    let if_range = headers
+        .remove(header::IF_RANGE)
+        .filter(|_| headers.contains_key(header::RANGE));
+    // What ServeFile cannot settle before it opens the file: whether an
+    // If-Range holds, and whether a suffix is longer than the file.
+    let again = (if_range.is_some() || matches!(range, Some((None, _)))).then(|| {
+        let mut again = Request::new(Body::empty());
+        *again.method_mut() = request.method().clone();
+        *again.uri_mut() = request.uri().clone();
+        *again.headers_mut() = request.headers().clone();
+        again
+    });
+    let mut response = serve_file(path, request).await?;
+    if let Some(mut again) = again {
+        let status = response.status();
+        if matches!(
+            status,
+            StatusCode::PARTIAL_CONTENT | StatusCode::RANGE_NOT_SATISFIABLE
+        ) && if_range.is_some_and(|if_range| !if_range_valid(&if_range, response.headers()))
+        {
+            again.headers_mut().remove(header::RANGE);
+            response = serve_file(path, again).await?;
+        } else if status == StatusCode::RANGE_NOT_SATISFIABLE
+            && matches!(range, Some((None, Some(suffix))) if suffix > 0)
+            && complete_length(response.headers()).is_some_and(|length| length > 0)
+        {
+            // NormalizeRange: a suffix longer than the file is all of it.
+            again
+                .headers_mut()
+                .insert(header::RANGE, header::HeaderValue::from_static("bytes=0-"));
+            response = serve_file(path, again).await?;
+        }
+    }
+    if response.status() == StatusCode::PARTIAL_CONTENT
+        && complete_length(response.headers()) == Some(0)
+    {
+        // ParseRange: no range of an empty file is satisfiable, where
+        // ServeFile answers one that starts at 0 with an empty 206.
+        *response.status_mut() = StatusCode::RANGE_NOT_SATISFIABLE;
+        response.headers_mut().insert(
+            header::CONTENT_RANGE,
+            header::HeaderValue::from_static("bytes */0"),
+        );
+    }
     // A path the database resolved but the filesystem rejects otherwise
     // surfaces as a bare 404 indistinguishable from a missing route — name the
     // fs-level cause (stale NFS handle, permissions, moved file) in the log.
@@ -509,7 +621,97 @@ pub(crate) async fn serve_static_file(path: &str, request: Request) -> Result<Re
             .map_or_else(|| "unreadable".to_owned(), |e| e.to_string());
         tracing::warn!(path, error = reason, "direct-stream file is not accessible");
     }
+    Ok(response)
+}
+
+/// One [`ServeFile`] answer for `request`, its infallible response mapped into
+/// an axum body.
+async fn serve_file(path: &str, request: Request) -> Result<Response, ApiError> {
+    let response = ServeFile::new(path)
+        .oneshot(request)
+        .await
+        .map_err(|e| ApiError::NotFound(e.to_string()))?;
     Ok(response.map(Body::new))
+}
+
+/// The most digits `RangeItemHeaderValue` reads in a range part
+/// (`HttpRuleParser.MaxInt64Digits`), leading zeros included.
+const MAX_INT64_DIGITS: usize = 19;
+
+/// The one byte range of `headers`' `Range`, as `RangeHelper.ParseRange`
+/// reads it through `RangeHeaderValue`: `(first, last)`, `first` `None` for a
+/// suffix and `last` `None` for an open end. `None` when it ignores the header:
+/// several values, a `,`, or a value that does not parse (a reversed range, a
+/// part that is not digits, longer than [`MAX_INT64_DIGITS`] or past
+/// `i64::MAX`). Spaces and tabs may surround each part, and numbers may have
+/// leading zeros. The unit must be `bytes`, in any case: ASP.NET never checks
+/// it and reads any unit as bytes, where RFC 9110 section 14.2 says to ignore
+/// one not understood.
+fn one_byte_range(headers: &HeaderMap) -> Option<(Option<u64>, Option<u64>)> {
+    let mut values = headers.get_all(header::RANGE).iter();
+    let (Some(value), None) = (values.next(), values.next()) else {
+        return None;
+    };
+    let value = value.to_str().ok()?;
+    let (unit, spec) = value.split_once('=')?;
+    let space = [' ', '\t'];
+    if value.contains(',') || !unit.trim_matches(space).eq_ignore_ascii_case("bytes") {
+        return None;
+    }
+    let (first, last) = spec.split_once('-')?;
+    let bound = |part: &str| -> Option<Option<u64>> {
+        let part = part.trim_matches(space);
+        if part.is_empty() {
+            return Some(None);
+        }
+        if part.len() > MAX_INT64_DIGITS || !part.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+        part.parse::<i64>()
+            .ok()
+            .and_then(|n| u64::try_from(n).ok())
+            .map(Some)
+    };
+    match (bound(first)?, bound(last)?) {
+        (None, None) => None,
+        (Some(first), Some(last)) if first > last => None,
+        range => Some(range),
+    }
+}
+
+/// The complete length a `Content-Range` names: `10` in `bytes 2-5/10` and
+/// in `bytes */10`.
+fn complete_length(served: &HeaderMap) -> Option<u64> {
+    let value = served.get(header::CONTENT_RANGE)?.to_str().ok()?;
+    value.rsplit_once('/')?.1.parse().ok()
+}
+
+/// `FileResultHelper.IfRangeValid` against the validators `served` carries: a
+/// date fails once the file's `Last-Modified` is later, an entity tag when it
+/// is not strongly equal to the `ETag`, and a value that parses as neither
+/// passes. `PhysicalFile` sends no `ETag`, so upstream never fails a tag;
+/// `ServeFile` sends one, which a client may send back.
+fn if_range_valid(if_range: &header::HeaderValue, served: &HeaderMap) -> bool {
+    let Ok(value) = if_range.to_str() else {
+        return true;
+    };
+    let weak = value.get(..2).is_some_and(|w| w.eq_ignore_ascii_case("w/"));
+    let tag = if weak { &value[2..] } else { value };
+    if tag.len() >= 2 && tag.starts_with('"') && tag.ends_with('"') {
+        return served
+            .get(header::ETAG)
+            .is_none_or(|etag| !weak && etag.as_bytes() == tag.as_bytes());
+    }
+    let date = |value: &str| httpdate::parse_http_date(value).ok();
+    match (
+        date(value),
+        served
+            .get(header::LAST_MODIFIED)
+            .and_then(|modified| date(modified.to_str().ok()?)),
+    ) {
+        (Some(since), Some(modified)) => modified <= since,
+        _ => true,
+    }
 }
 
 /// How much of a file one blocking-pool hop of [`opened_file_response`] reads.

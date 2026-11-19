@@ -49,6 +49,7 @@ use ferrofin_traits::options::InternalItemsQuery;
 use ferrofin_traits::persistence::{ItemPersistenceService, ItemRepository};
 
 use crate::item_type_lookup;
+use crate::library_monitor::trim_separators;
 use crate::user_root_folder::UserRootFolderStore;
 
 /// The shortcut-file extension Jellyfin uses (`MbLinkShortcutHandler.Extension`).
@@ -1499,16 +1500,20 @@ impl FerrofinVirtualFolderManager {
             .map_err(|e| Self::io_err("write shortcut", &e))
     }
 
-    /// Deletes the `.mblink` shortcut in `folder_path` that resolves to `target`,
-    /// if one exists (C# `RemoveMediaPath` shortcut cleanup). Returns whether a
-    /// shortcut was removed. `target` is compared as given, untrimmed, with
-    /// each shortcut's one-separator-trimmed target, as upstream compares it,
-    /// so a trailing separator on a path other than the root matches nothing.
+    /// Deletes every `.mblink` shortcut in `folder_path` that resolves to
+    /// `target` (C# `RemoveMediaPath` shortcut cleanup). Returns whether a
+    /// shortcut was removed. `target` and each shortcut's target are compared
+    /// past their trailing separators, as [`remove_media_path`](VirtualFolderManager::remove_media_path)
+    /// compares the `PathInfos` entries, and every match goes, as every
+    /// matching entry does, so no shortcut outlives its entry; upstream
+    /// compares the raw `target` and deletes the first match (gl-1871).
     async fn delete_shortcut_for(
         &self,
         folder_path: &Path,
         target: &str,
     ) -> Result<bool, ServiceError> {
+        let target = trim_separators(target);
+        let mut removed = false;
         let mut dir = tokio::fs::read_dir(folder_path)
             .await
             .map_err(|e| Self::io_err("read folder", &e))?;
@@ -1522,23 +1527,30 @@ impl FerrofinVirtualFolderManager {
                 continue;
             }
             // Upstream's `FirstOrDefault` over `ResolveShortcut` throws on an
-            // unreadable shortcut met before the match.
-            let found = Self::resolve_shortcut(&path)
-                .await
-                .map_err(|e| Self::io_err(&format!("read shortcut {}", path.display()), &e))?;
+            // unreadable shortcut met before the match, and reads none after it.
+            let found = match Self::resolve_shortcut(&path).await {
+                Ok(found) => found,
+                Err(_) if removed => continue,
+                Err(e) => {
+                    return Err(Self::io_err(
+                        &format!("read shortcut {}", path.display()),
+                        &e,
+                    ));
+                }
+            };
             if found.is_some_and(|found| {
                 ferrofin_util::string_extensions::equals_ordinal_ignore_case(
-                    &self.virtual_paths.expand(&found),
+                    trim_separators(&self.virtual_paths.expand(&found)),
                     target,
                 )
             }) {
                 tokio::fs::remove_file(&path)
                     .await
                     .map_err(|e| Self::io_err("delete shortcut", &e))?;
-                return Ok(true);
+                removed = true;
             }
         }
-        Ok(false)
+        Ok(removed)
     }
 
     /// Errors when `name` does not resolve to an existing directory directly
@@ -2081,7 +2093,9 @@ impl VirtualFolderManager for FerrofinVirtualFolderManager {
         self.delete_shortcut_for(&folder_path, path).await?;
 
         let mut options = self.load_options(&folder_path).await;
-        options.path_infos.retain(|i| i.path != path);
+        options
+            .path_infos
+            .retain(|i| trim_separators(&i.path) != trim_separators(path));
         Self::save_options(&folder_path, &options).await?;
         self.record_changed_locations(&folder_path).await;
         Ok(())
@@ -3603,12 +3617,6 @@ mod tests {
         async fn set_ancestors(&self, _: uuid::Uuid, _: &[uuid::Uuid]) -> Result<(), ServiceError> {
             self.write()
         }
-        async fn save_images(
-            &self,
-            _: &ferrofin_db::entities::base_items::BaseItemEntity,
-        ) -> Result<(), ServiceError> {
-            self.write()
-        }
         async fn reattach_user_data(
             &self,
             _: &ferrofin_db::entities::base_items::BaseItemEntity,
@@ -4667,24 +4675,37 @@ mod tests {
         assert!(locations.is_empty(), "{locations:?}");
     }
 
-    /// C# `RemoveMediaPath` compares the raw path with each resolved
-    /// shortcut and with each `PathInfos` entry, so a trailing separator
-    /// matches neither and the library is left whole (gl-1205).
+    /// The shortcut and the `PathInfos` entry are matched with their trailing
+    /// separators trimmed, so the request removes both: a folder added with
+    /// a trailing slash and removed with that stored path (what jellyfin-web
+    /// sends, gl-1871), and either side spelled with or without one
+    /// (gl-1205). Upstream compares the raw path with both, which keeps the
+    /// shortcut of a folder stored with a slash.
+    #[rstest::rstest]
+    #[case::stored_with_a_slash("/", "/")]
+    #[case::requested_without("/", "")]
+    #[case::requested_with("", "/")]
+    #[case::requested_with_two("", "//")]
     #[tokio::test]
-    async fn remove_media_path_with_a_trailing_separator_changes_nothing() {
+    async fn remove_media_path_matches_past_trailing_separators(
+        #[case] stored: &str,
+        #[case] requested: &str,
+    ) {
         let (tmp, mgr) = manager();
         let m1 = media_dir(&tmp, "one");
         let m2 = media_dir(&tmp, "two");
-        mgr.add_virtual_folder("Lib", None, &opts_with_paths(&[m1.clone(), m2.clone()]))
-            .await
-            .unwrap();
-        mgr.remove_media_path("Lib", &format!("{m1}/"))
+        mgr.add_virtual_folder(
+            "Lib",
+            None,
+            &opts_with_paths(&[format!("{m1}{stored}"), m2.clone()]),
+        )
+        .await
+        .unwrap();
+        mgr.remove_media_path("Lib", &format!("{m1}{requested}"))
             .await
             .unwrap();
         let folder = mgr.get_virtual_folders().await.unwrap().remove(0);
-        let mut locations = folder.locations;
-        locations.sort();
-        assert_eq!(locations, [m1.clone(), m2.clone()]);
+        assert_eq!(folder.locations, std::slice::from_ref(&m2));
         let paths: Vec<String> = folder
             .library_options
             .unwrap()
@@ -4692,7 +4713,39 @@ mod tests {
             .into_iter()
             .map(|info| info.path)
             .collect();
-        assert_eq!(paths, [m1, m2]);
+        assert_eq!(paths, [m2]);
+    }
+
+    /// A folder added twice has two shortcuts and two `PathInfos` entries;
+    /// removing it drops both entries, so both shortcuts go too, or the
+    /// folder would stay scanned with no entry left to remove. Upstream
+    /// deletes the first shortcut only.
+    #[rstest::rstest]
+    #[case::twice_as_typed("")]
+    #[case::again_with_a_slash("/")]
+    #[tokio::test]
+    async fn remove_media_path_deletes_every_matching_shortcut(#[case] again: &str) {
+        let (tmp, mgr) = manager();
+        let m1 = media_dir(&tmp, "one");
+        let m2 = media_dir(&tmp, "two");
+        mgr.add_virtual_folder(
+            "Lib",
+            None,
+            &opts_with_paths(&[m1.clone(), format!("{m1}{again}"), m2.clone()]),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            mgr.get_virtual_folders().await.unwrap()[0].locations.len(),
+            3
+        );
+        mgr.remove_media_path("Lib", &m1).await.unwrap();
+        let folder = mgr.get_virtual_folders().await.unwrap().remove(0);
+        assert_eq!(folder.locations, std::slice::from_ref(&m2));
+        assert_eq!(
+            folder.library_options.unwrap().path_infos,
+            [MediaPathInfo { path: m2 }]
+        );
     }
 
     /// A case-only rename that differs in a non-ASCII letter is case-only as

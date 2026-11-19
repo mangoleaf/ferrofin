@@ -266,6 +266,34 @@ crate::json::enums::wire_enum! {
     }
 }
 
+impl CollectionType {
+    /// The `CollectionType?` an item's stored `Data` JSON keeps under `key`:
+    /// `CollectionType` on a library (`CollectionFolder.CollectionType`),
+    /// `ViewType` on a user view (`UserView.ViewType`). Bound as
+    /// `BaseItemMapper.DeserializeBaseItem` binds it with `JsonDefaults.Options`:
+    /// see [`Self::from_data_member`]. No such member, or `Data` that is not a
+    /// JSON object, reads as none.
+    ///
+    /// Every reader of those two members goes through this or
+    /// [`Self::from_data_member`], so no two of them can classify a row
+    /// differently.
+    #[must_use]
+    pub fn from_item_data(data: Option<&str>, key: &str) -> Option<Self> {
+        let data: serde_json::Value = serde_json::from_str(data?).ok()?;
+        Self::from_data_member(data.get(key)?)
+    }
+
+    /// One `CollectionType?` member of a parsed `Data` object, bound by this
+    /// enum's `JsonStringEnumConverter` port (a name in any case and trimmed,
+    /// or an integer, as that value) behind `JsonNullableStructConverter` (an
+    /// empty string is null). `null`, a name no member has and any other token
+    /// read as none.
+    #[must_use]
+    pub fn from_data_member(value: &serde_json::Value) -> Option<Self> {
+        <Self as serde::Deserialize>::deserialize(value).ok()
+    }
+}
+
 /// An enum representing an unrated item.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, ToSchema)]
 #[serde(rename_all = "PascalCase")]
@@ -723,6 +751,44 @@ crate::json::enums::wire_enum! {
     MediaStreamProtocol, Some(0), {
         http => ("http", 0),
         hls => ("hls", 1),
+    }
+}
+
+#[cfg(test)]
+mod from_item_data_tests {
+    use super::CollectionType;
+
+    /// `Data` members bind as Jellyfin's `JsonDefaults.Options` binds a
+    /// `CollectionType?` property: any case, trimmed, numbers (declared or
+    /// not) as that value; null, empty and unknown names as none.
+    #[rstest::rstest]
+    #[case(r#"{"ViewType":"movies"}"#, Some(CollectionType::movies))]
+    #[case(r#"{"ViewType":"TvShows"}"#, Some(CollectionType::tvshows))]
+    #[case(r#"{"ViewType":" livetv "}"#, Some(CollectionType::livetv))]
+    #[case(r#"{"ViewType":11}"#, Some(CollectionType::playlists))]
+    #[case(r#"{"ViewType":"12"}"#, Some(CollectionType::folders))]
+    #[case(r#"{"ViewType":110}"#, Some(CollectionType::Movieresume))]
+    #[case(r#"{"ViewType":99}"#, Some(CollectionType::Unrecognized(99)))]
+    #[case(r#"{"ViewType":""}"#, None)]
+    #[case(r#"{"ViewType":null}"#, None)]
+    #[case(r#"{"ViewType":"mixed"}"#, None)]
+    #[case(r#"{"ViewType":true}"#, None)]
+    #[case(r#"{"CollectionType":"movies"}"#, None)]
+    #[case("[]", None)]
+    #[case("not json", None)]
+    fn from_item_data_binds_as_jellyfin(
+        #[case] data: &str,
+        #[case] expected: Option<CollectionType>,
+    ) {
+        assert_eq!(
+            CollectionType::from_item_data(Some(data), "ViewType"),
+            expected
+        );
+    }
+
+    #[test]
+    fn from_item_data_without_data_is_none() {
+        assert_eq!(CollectionType::from_item_data(None, "ViewType"), None);
     }
 }
 

@@ -976,7 +976,7 @@ fn remote_shortcut(item: &BaseItemEntity) -> Option<RemoteShortcut> {
     }
     let target = crate::item_data::read_data_string(&data, "ShortcutPath")
         .filter(|target| !target.is_empty())?;
-    let protocol = crate::shortcut::path_protocol(&target);
+    let protocol = ferrofin_model::media_info::path_protocol(&target);
     if protocol == MediaProtocol::File {
         return None;
     }
@@ -2069,6 +2069,28 @@ impl MediaSourceManager for FerrofinMediaSourceManager {
             .ok_or_else(|| ServiceError::not_found(format!("live stream {id}")))
     }
 
+    async fn input_container(
+        &self,
+        source: &MediaSourceInfo,
+    ) -> Result<Option<String>, ServiceError> {
+        // A static source's id is its item's; an open live stream keeps the
+        // container it was opened with.
+        let item_id = source
+            .id
+            .as_deref()
+            .filter(|_| source.live_stream_id.is_none())
+            .and_then(|id| Uuid::parse_str(id).ok());
+        let probed = match item_id {
+            Some(id) => self
+                .items
+                .retrieve_item(id)
+                .await?
+                .and_then(|item| crate::item_data::stored_container(item.data.as_deref())),
+            None => None,
+        };
+        Ok(probed.or_else(|| source.container.clone()))
+    }
+
     async fn close_live_stream(&self, id: &str) -> Result<(), ServiceError> {
         // Port of `MediaSourceManager.CloseLiveStream`: the consumer count
         // lives with the tuner-side stream, so the Live TV manager decides
@@ -2748,6 +2770,61 @@ mod tests {
         );
     }
 
+    /// `AttachMediaSourceInfo`'s `InputContainer = mediaSource.Container`,
+    /// which `BaseItem.GetVersionInfo` fills with the probed container and
+    /// falls back to the extension: a transcode names the probed demuxer for
+    /// an `.ogv` holding Ogg and an `.mp4` holding Matroska, the extension for
+    /// a file never probed, and a source with no item id or an open live
+    /// stream keeps its own container.
+    #[tokio::test]
+    async fn a_stream_is_read_as_its_probed_container() {
+        let db = test_db().await;
+        let mgr = manager(&db);
+        let ogv = Uuid::from_u128(0x321);
+        let mislabelled = Uuid::from_u128(0x322);
+        let unprobed = Uuid::from_u128(0x323);
+        seed_strm(&db, ogv, "/lib/clip.ogv", r#"{"Container":"ogg"}"#).await;
+        seed_strm(&db, mislabelled, "/lib/clip.mp4", r#"{"Container":"mkv"}"#).await;
+        seed_strm(&db, unprobed, "/lib/clip.m2t", "{}").await;
+        let input = |id| {
+            let mgr = &mgr;
+            async move {
+                let source = mgr
+                    .get_stream_media_source(id, None, None)
+                    .await
+                    .expect("source");
+                mgr.input_container(&source).await.expect("container")
+            }
+        };
+
+        assert_eq!(input(ogv).await.as_deref(), Some("ogg"));
+        assert_eq!(input(mislabelled).await.as_deref(), Some("mkv"));
+        // Upstream's fallback too: an unprobed `.m2t` still names no demuxer.
+        assert_eq!(input(unprobed).await.as_deref(), Some("m2t"));
+        let not_a_guid = MediaSourceInfo {
+            id: Some("tuner-1".to_owned()),
+            container: Some("ts".to_owned()),
+            ..MediaSourceInfo::default()
+        };
+        assert_eq!(
+            mgr.input_container(&not_a_guid)
+                .await
+                .expect("channel")
+                .as_deref(),
+            Some("ts")
+        );
+        let live = MediaSourceInfo {
+            id: Some(ogv.simple().to_string()),
+            live_stream_id: Some("live".to_owned()),
+            container: Some("ts".to_owned()),
+            ..MediaSourceInfo::default()
+        };
+        assert_eq!(
+            mgr.input_container(&live).await.expect("live").as_deref(),
+            Some("ts")
+        );
+    }
+
     /// `BaseItem.GetVersionInfo`'s shortcut arm: a `.strm` whose `ShortcutPath`
     /// is remote is served from that URL — remote, over its protocol, direct
     /// streamable unless it is a playlist — while a target on the local file
@@ -3180,9 +3257,6 @@ mod tests {
             &self,
             _id: Uuid,
         ) -> Result<Option<ferrofin_model::dto::BaseItemDto>, ServiceError> {
-            Ok(None)
-        }
-        async fn get_recording_path(&self, _id: Uuid) -> Result<Option<String>, ServiceError> {
             Ok(None)
         }
         async fn delete_recording(&self, _id: Uuid) -> Result<(), ServiceError> {

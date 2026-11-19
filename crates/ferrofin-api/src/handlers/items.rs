@@ -123,7 +123,7 @@ pub(crate) async fn require_scope_id_visible(
 /// request named ids and none is left: the caller must answer an empty page,
 /// because an empty `item_ids` means no id filter and the query would list the
 /// whole library.
-pub(crate) async fn retain_visible_ids(
+async fn retain_visible_ids(
     state: &AppState,
     auth: &AuthorizationInfo,
     query: &mut InternalItemsQuery,
@@ -142,7 +142,7 @@ pub(crate) async fn retain_visible_ids(
 }
 
 /// The page [`retain_visible_ids`] calls for when no id is left.
-pub(crate) fn empty_page(query: &InternalItemsQuery) -> QueryResult<BaseItemDto> {
+fn empty_page(query: &InternalItemsQuery) -> QueryResult<BaseItemDto> {
     QueryResult::new(Some(query.start_index.unwrap_or(0)), Some(0), Vec::new())
 }
 
@@ -309,7 +309,8 @@ pub(crate) async fn resolve_user_opt(
     Ok(state.users.get_user_by_id(effective).await?.map(Arc::new))
 }
 
-/// The query parameters honoured by `GET /Items`.
+/// The query parameters honoured by `GET /Items`, and by `GET /Trailers`,
+/// which hands them to the same handler (`crate::handlers::trailers`).
 ///
 /// Every field is optional. Comma/pipe-delimited multi-value parameters arrive as
 /// a raw [`String`] and are split + parsed in [`get_items`]; this keeps the serde
@@ -317,7 +318,7 @@ pub(crate) async fn resolve_user_opt(
 /// model binders.
 #[derive(Debug, Default, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct ItemsQuery {
+pub(crate) struct ItemsQuery {
     /// The target user; defaults to the authenticated caller when absent.
     #[serde(
         default,
@@ -347,7 +348,7 @@ struct ItemsQuery {
     parent_id: Option<Uuid>,
     /// Comma-delimited [`BaseItemKind`](ferrofin_model::data::BaseItemKind) set to include.
     #[serde(default)]
-    include_item_types: Option<String>,
+    pub(crate) include_item_types: Option<String>,
     /// Comma-delimited item kinds to exclude.
     #[serde(default)]
     exclude_item_types: Option<String>,
@@ -554,7 +555,7 @@ struct ItemsQuery {
     has_theme_video: Option<bool>,
     /// Exact index number.
     #[serde(default)]
-    index_number: Option<i32>,
+    pub(crate) index_number: Option<i32>,
     /// Exact parent index number.
     #[serde(default)]
     parent_index_number: Option<i32>,
@@ -699,7 +700,7 @@ where
     responses((status = 200, description = "Items returned (QueryResult<BaseItemDto>)")),
     tag = "ferrofin"
 )]
-async fn get_items(
+pub(crate) async fn get_items(
     State(state): State<AppState>,
     RequireAuth(auth): RequireAuth,
     Query(query): Query<ItemsQuery>,
@@ -765,7 +766,7 @@ async fn get_items(
     // Reuse the already-loaded parent for SourceType and UserView dispatch;
     // only source consumers that call Folder's policy inherit global flags.
     internal.apply_folder_display_options = folder_policy;
-    redirect_container_browse(&state, &mut internal).await;
+    redirect_container_browse(&mut internal);
     // After the re-root, as upstream: it decides on the requested types and
     // these rewrites on the folder that results.
     list_playlists_folder_as_playlists(&mut internal);
@@ -959,7 +960,7 @@ fn apply_albums_by_artist_order(internal: &mut InternalItemsQuery) {
 /// provider score until those providers are ported (gl-450). The extra `Name`
 /// term only reorders rows tied on `SortName`. Upstream falls back to `ApplyOrder` alone when no provider
 /// returns a candidate; that fallback belongs to the same port.
-pub(crate) fn order_search_by_sort_name(internal: &mut InternalItemsQuery) {
+fn order_search_by_sort_name(internal: &mut InternalItemsQuery) {
     use ferrofin_model::dto::SortOrder;
     use ferrofin_model::live_tv::ItemSortBy;
     if internal
@@ -984,7 +985,7 @@ pub(crate) fn order_search_by_sort_name(internal: &mut InternalItemsQuery) {
 /// (the repository drops it later). A search already leads its keys with
 /// `SortName` ([`order_search_by_sort_name`]), standing in for the score sort
 /// upstream applies after this one, so it keeps that order.
-pub(crate) fn sort_items_by_request(query: &InternalItemsQuery, items: &mut [BaseItemEntity]) {
+fn sort_items_by_request(query: &InternalItemsQuery, items: &mut [BaseItemEntity]) {
     if !query.order_by.is_empty() || query.item_ids.len() <= 1 {
         return;
     }
@@ -1130,7 +1131,7 @@ fn items_query_options(
 /// linked versions" — the alternate versions and owned non-extras a general
 /// query hides stay in, and the `PresentationUniqueKey` grouping folds them
 /// back onto their primary.
-pub(crate) fn apply_media_stream_filter_rules(internal: &mut InternalItemsQuery) {
+fn apply_media_stream_filter_rules(internal: &mut InternalItemsQuery) {
     if !internal.subtitle_languages.is_empty() {
         match internal.has_subtitles {
             Some(true) => internal.has_subtitles = None,
@@ -1405,30 +1406,6 @@ async fn delete_one(state: &AppState, auth: &AuthorizationInfo, id: Uuid) -> Res
     Ok(())
 }
 
-/// Runs a delete request's work to completion even if the client goes away.
-///
-/// axum drops a handler's future when the connection closes, which could
-/// stop a delete between its files and its rows, or half way through its
-/// paths. The row delete itself is one transaction, but the `LibraryChanged`
-/// notice that follows its commit would be skipped, and a
-/// `DELETE /Items?ids=` would stop between two items. Upstream's controller
-/// does not observe `RequestAborted` here, so its delete finishes; the work
-/// runs on its own task, which the request only awaits.
-async fn run_to_completion<F>(work: F) -> Result<(), ApiError>
-where
-    F: std::future::Future<Output = Result<(), ApiError>> + Send + 'static,
-{
-    // The request awaits the task, so its logs and spans stay under the
-    // request's (LOGGING.md §4: a spawned future carries its span explicitly).
-    tokio::spawn(tracing::Instrument::in_current_span(work))
-        .await
-        .map_err(|e| {
-            ApiError::Service(ferrofin_traits::error::ServiceError::Backend(format!(
-                "delete task failed: {e}"
-            )))
-        })?
-}
-
 /// `DELETE /Items/{itemId}` — deletes one item from the library and the
 /// filesystem.
 ///
@@ -1460,7 +1437,11 @@ async fn delete_item(
     if auth.user.is_none() && !auth.is_api_key {
         return Err(ApiError::NotFound(format!("user {}", auth.user_id())));
     }
-    run_to_completion(async move { delete_one(&state, &auth, item_id).await }).await?;
+    // axum drops a handler's future when its client hangs up, which could stop
+    // a delete between its files and its rows, or skip the `LibraryChanged`
+    // notice after its commit. Upstream's controller does not read
+    // `RequestAborted`, so its delete finishes.
+    crate::handlers::run_detached(async move { delete_one(&state, &auth, item_id).await }).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -1501,11 +1482,12 @@ async fn delete_items(
         return Err(ApiError::Unauthorized("Unauthorized access".to_owned()));
     }
     let ids = parse_csv_uuids(query.ids.as_deref())?;
-    run_to_completion(async move {
+    // As in `delete_item`; a hang-up would also stop between two items.
+    crate::handlers::run_detached(async move {
         for id in ids {
             delete_one(&state, &auth, id).await?;
         }
-        Ok(())
+        Ok::<_, ApiError>(())
     })
     .await?;
     Ok(StatusCode::NO_CONTENT)
@@ -1995,14 +1977,15 @@ fn is_direct_children_browse(short_type_name: &str) -> bool {
 /// `IsVisible`. A container-only browse is held to the parent it names too.
 /// Whether the parent is itself a library, and a `boxsets` one, is left in
 /// `library` for the library browse defaults ([`apply_library_browse_defaults`]).
+/// A user view's browse runs its builder in the library manager
+/// ([`LibraryManager::apply_user_view_builder`](ferrofin_traits::library::LibraryManager::apply_user_view_builder)),
+/// which rewrites the query and answers the parent kind and folder policy.
 async fn check_parent_visibility(
     state: &AppState,
     auth: &AuthorizationInfo,
     query: &mut InternalItemsQuery,
     library: &mut Option<bool>,
 ) -> Result<(Option<BaseItemKind>, bool), ApiError> {
-    use ferrofin_model::data::CollectionType;
-
     if query.parent_id.is_nil() {
         return Ok((None, true));
     }
@@ -2052,147 +2035,22 @@ async fn check_parent_visibility(
         *library = library_is_boxsets(&parent);
         return Ok((kind_from(&parent), !is_channel(&parent)));
     }
-
-    // UserViewBuilder's movie/TV recursive base views call QueryRecursive;
-    // folders/direct repository/subnavigation builders do not auto-collapse.
-    // ViewType belongs to the parent row already read for access, including
-    // adopted numeric values; it is never a new client preference.
-    let (view_type, parent_id) = user_view_browse_context(&parent);
-    let direct = user_view_uses_direct_items(view_type);
-    if direct {
-        // These simple direct builders (`GetMovieMovies`, `GetTvSeries`,
-        // `GetBooks`) set their kinds and recursive mode regardless of the
-        // request, then forward explicit collapse to SQL. Their automatic
-        // global grouping policy is intentionally absent.
-        if let Some(kinds) = match view_type {
-            Some(CollectionType::Moviemovies) => Some(vec![BaseItemKind::Movie]),
-            Some(CollectionType::Tvshowseries) => Some(vec![BaseItemKind::Series]),
-            Some(CollectionType::books) => Some(vec![BaseItemKind::Book, BaseItemKind::AudioBook]),
-            _ => None,
-        } {
-            query.include_item_types = kinds;
-            query.recursive = true;
-            query.user_root_children = false;
-        }
-        return Ok((kind_from(&parent), false));
-    }
-    if matches!(
-        view_type,
-        Some(CollectionType::movies | CollectionType::tvshows)
-    ) {
-        if !query.recursive {
-            return Ok((kind_from(&parent), false));
-        }
-        query.folder_query_recursive = true;
-        if query.include_item_types.is_empty() {
-            query.include_item_types = if view_type == Some(CollectionType::movies) {
-                vec![BaseItemKind::Movie]
-            } else {
-                vec![
-                    BaseItemKind::Series,
-                    BaseItemKind::Season,
-                    BaseItemKind::Episode,
-                ]
-            };
-        }
-        if let Some(parent_id) = parent_id
-            && let Some(query_parent) = state.library.get_item_by_id(parent_id).await?
-        {
-            return Ok((kind_from(&query_parent), true));
-        }
-        return Ok((kind_from(&parent), true));
-    }
-    // The default builder delegates to its actual display/relational parent
-    // when one exists; an unparented UserView uses GetResult over media-folder
-    // children and has no automatic grouping policy.
-    if let Some(parent_id) = parent_id
-        && let Some(query_parent) = state.library.get_item_by_id(parent_id).await?
-    {
-        let (kind, folder_policy) = (kind_from(&query_parent), !is_channel(&query_parent));
-        if !query.recursive || kind == Some(BaseItemKind::Season) {
-            // A default view delegates to that Season's GetItemsInternal even
-            // for recursive requests; its aired selection needs the real row.
-            query.parent_id = parent_id;
-            query.user_root_children = false;
-            query.parent_row = Some(Arc::new(query_parent));
-        }
-        return Ok((kind, folder_policy));
-    }
-    Ok((kind_from(&parent), false))
-}
-
-/// Read UserView dispatch data from the parent already loaded for visibility.
-fn user_view_browse_context(
-    parent: &BaseItemEntity,
-) -> (Option<ferrofin_model::data::CollectionType>, Option<Uuid>) {
-    use ferrofin_model::data::CollectionType;
-    let data: serde_json::Value = parent
-        .data
-        .as_deref()
-        .and_then(|data| serde_json::from_str(data).ok())
-        .unwrap_or_default();
-    let view_type = data
-        .get("ViewType")
-        .cloned()
-        .and_then(|value| serde_json::from_value::<CollectionType>(value).ok());
-    let parent_id = data
-        .get("DisplayParentId")
-        .and_then(serde_json::Value::as_str)
-        .and_then(|id| Uuid::parse_str(id).ok())
-        .filter(|id| !id.is_nil())
-        .or_else(|| {
-            parent
-                .parent_id
-                .as_deref()
-                .and_then(|id| Uuid::parse_str(id).ok())
-                .filter(|id| !id.is_nil())
-        });
-    (view_type, parent_id)
+    Ok(state
+        .library
+        .apply_user_view_builder(query, &parent)
+        .await?)
 }
 
 /// When the requested parent is itself a library (`ICollectionFolder`),
-/// whether it is a `boxsets` one, from its `Data.CollectionType` read
-/// case-insensitively as the other readers do; `None` for any other row.
+/// whether it is a `boxsets` one, from its `Data.CollectionType` bound as the
+/// other readers bind it ([`ferrofin_model::data::CollectionType::from_item_data`]);
+/// `None` for any other row.
 fn library_is_boxsets(parent: &BaseItemEntity) -> Option<bool> {
-    (parent.type_.rsplit('.').next() == Some("CollectionFolder")).then(|| {
-        parent
-            .data
-            .as_deref()
-            .and_then(|data| serde_json::from_str::<serde_json::Value>(data).ok())
-            .and_then(|data| {
-                data.get("CollectionType")?
-                    .as_str()
-                    .map(|kind| kind.eq_ignore_ascii_case("boxsets"))
-            })
-            .unwrap_or(false)
-    })
-}
-
-/// These UserView builders use direct item selection rather than Folder policy.
-fn user_view_uses_direct_items(view_type: Option<ferrofin_model::data::CollectionType>) -> bool {
     use ferrofin_model::data::CollectionType;
-    matches!(
-        view_type,
-        Some(
-            CollectionType::folders
-                | CollectionType::books
-                | CollectionType::Tvshowseries
-                | CollectionType::Tvgenres
-                | CollectionType::Tvgenre
-                | CollectionType::Tvlatest
-                | CollectionType::Tvnextup
-                | CollectionType::Tvresume
-                | CollectionType::Tvfavoriteseries
-                | CollectionType::Tvfavoriteepisodes
-                | CollectionType::Movielatest
-                | CollectionType::Movieresume
-                | CollectionType::Moviemovies
-                | CollectionType::Moviecollection
-                | CollectionType::Moviefavorites
-                | CollectionType::Moviegenres
-                | CollectionType::Moviegenre
-        )
-    )
+    (parent.type_.rsplit('.').next() == Some("CollectionFolder")).then(|| {
+        CollectionType::from_item_data(parent.data.as_deref(), "CollectionType")
+            == Some(CollectionType::boxsets)
+    })
 }
 
 /// Re-roots a BoxSet/Playlist-typed browse onto the user root (port of
@@ -2204,13 +2062,10 @@ fn user_view_uses_direct_items(view_type: Option<ferrofin_model::data::Collectio
 /// Applies only when the request is for exactly `[BoxSet]` or `[Playlist]`,
 /// a parent is set, and that parent is not itself a box set/playlist (nor,
 /// for a playlist browse, the playlists folder). A re-rooted query takes the
-/// user root's folder policy. Best-effort:
-/// an unresolvable parent leaves the query untouched (the plain parent scoping
-/// then returns empty, as before).
-async fn redirect_container_browse(
-    state: &AppState,
-    internal: &mut ferrofin_traits::options::InternalItemsQuery,
-) {
+/// user root's folder policy. It works on the parent row
+/// [`check_parent_visibility`] left on the query (which refuses a parent that
+/// does not exist).
+fn redirect_container_browse(internal: &mut ferrofin_traits::options::InternalItemsQuery) {
     use ferrofin_model::data::BaseItemKind;
     use ferrofin_model::entities::CollectionTypeOptions;
 
@@ -2222,16 +2077,8 @@ async fn redirect_container_browse(
         [BaseItemKind::Playlist] => None,
         _ => return,
     };
-    if internal.parent_id.is_nil() {
+    let Some(parent) = internal.known_parent_row().map(Arc::clone) else {
         return;
-    }
-    let parent = if let Some(row) = internal.known_parent_row() {
-        Arc::clone(row)
-    } else {
-        let Ok(Some(row)) = state.library.get_item_by_id(internal.parent_id).await else {
-            return;
-        };
-        Arc::new(row)
     };
     // The parent is itself a container of the requested kind → a direct
     // children browse, no re-rooting (C# `item is not BoxSet/Playlist`).
@@ -2247,7 +2094,7 @@ async fn redirect_container_browse(
     // so a playlist browse of it re-roots with no linked-ancestor constraint.
     if target_collection_type.is_none()
         && short == "UserView"
-        && user_view_browse_context(&parent).0
+        && ferrofin_model::data::CollectionType::from_item_data(parent.data.as_deref(), "ViewType")
             == Some(ferrofin_model::data::CollectionType::playlists)
     {
         reroot_to_user_root(internal);
@@ -2378,7 +2225,9 @@ crate::query::query_parameters! {
         "albums" => '|',
         "artists" => '|',
         "studios" => '|',
-    } => [("get", "/Items")];
+    // `/Trailers` keeps these pipe delimiters, which the OpenAPI documents for
+    // it, though `GetTrailers` binds studios, artists and albums on commas.
+    } => [("get", "/Items"), ("get", "/Trailers")];
     ItemQuery {} => [("get", "/Items/{itemId}")];
     DeleteItemsQuery {
         "ids" => ',',
@@ -2536,38 +2385,6 @@ mod tests {
         }
     }
 
-    /// The query keys [`ItemsQuery`] binds: the field list serde hands
-    /// `deserialize_struct`, captured by a deserializer that reads nothing.
-    fn items_query_keys() -> &'static [&'static str] {
-        struct Keys<'a>(&'a mut &'static [&'static str]);
-        impl<'de> serde::Deserializer<'de> for Keys<'_> {
-            type Error = serde::de::value::Error;
-            fn deserialize_any<V: serde::de::Visitor<'de>>(
-                self,
-                _: V,
-            ) -> Result<V::Value, Self::Error> {
-                Err(serde::de::Error::custom("not a struct"))
-            }
-            fn deserialize_struct<V: serde::de::Visitor<'de>>(
-                self,
-                _: &'static str,
-                fields: &'static [&'static str],
-                _: V,
-            ) -> Result<V::Value, Self::Error> {
-                *self.0 = fields;
-                Err(serde::de::Error::custom("keys captured"))
-            }
-            serde::forward_to_deserialize_any! {
-                bool i8 i16 i32 i64 i128 u8 u16 u32 u64 u128 f32 f64 char str string bytes
-                byte_buf option unit unit_struct newtype_struct seq tuple tuple_struct map
-                enum identifier ignored_any
-            }
-        }
-        let mut keys: &'static [&'static str] = &[];
-        let _ = <ItemsQuery as serde::Deserialize>::deserialize(Keys(&mut keys));
-        keys
-    }
-
     /// `GET /Items` parameters in the vendored contracts that [`ItemsQuery`]
     /// does not bind yet. Each is an open port from `ItemsController.GetItems`
     /// — bind it, honour it, and delete it here; the guard below fails on a
@@ -2604,7 +2421,7 @@ mod tests {
                     .filter_map(|p| p["name"].as_str().map(str::to_owned)),
             );
         }
-        let keys = items_query_keys();
+        let keys = crate::query::fields::<ItemsQuery>();
         assert!(keys.contains(&"albumArtistIds"), "keys captured: {keys:?}");
         let unbound: BTreeSet<&str> = contract
             .iter()
@@ -2946,24 +2763,25 @@ mod tests {
         );
     }
 
-    /// The delete's task runs inside the request's span, so its logs and
-    /// spans stay under `http_request` (LOGGING.md §4).
-    #[tokio::test]
-    async fn the_delete_task_runs_in_the_requests_span() {
-        use tracing::Instrument as _;
-        let _subscriber = tracing::subscriber::set_default(tracing_subscriber::registry());
-        let span = tracing::info_span!("http_request");
-        let seen = std::sync::Arc::new(std::sync::Mutex::new(None));
-        let record = std::sync::Arc::clone(&seen);
-        run_to_completion(async move {
-            *record.lock().expect("lock") = tracing::Span::current()
-                .metadata()
-                .map(tracing::Metadata::name);
-            Ok(())
-        })
-        .instrument(span)
-        .await
-        .expect("ran");
-        assert_eq!(*seen.lock().expect("lock"), Some("http_request"));
+    /// A boxsets library is found by the same binding as its DTO's type: a
+    /// padded name or the number (`7`) counts too; another kind of row is no
+    /// library at all.
+    #[rstest::rstest]
+    #[case("CollectionFolder", r#"{"CollectionType":"BoxSets"}"#, Some(true))]
+    #[case("CollectionFolder", r#"{"CollectionType":7}"#, Some(true))]
+    #[case("CollectionFolder", r#"{"CollectionType":" boxsets "}"#, Some(true))]
+    #[case("CollectionFolder", r#"{"CollectionType":"movies"}"#, Some(false))]
+    #[case("Folder", r#"{"CollectionType":"boxsets"}"#, None)]
+    fn a_boxsets_library_is_found_by_its_bound_type(
+        #[case] type_: &str,
+        #[case] data: &str,
+        #[case] expected: Option<bool>,
+    ) {
+        let parent = BaseItemEntity {
+            type_: format!("MediaBrowser.Controller.Entities.{type_}"),
+            data: Some(data.to_owned()),
+            ..BaseItemEntity::default()
+        };
+        assert_eq!(library_is_boxsets(&parent), expected);
     }
 }

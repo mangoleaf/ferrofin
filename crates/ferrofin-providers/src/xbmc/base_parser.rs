@@ -8,17 +8,21 @@
 //!
 //! Two collaborators are abstracted behind small traits so no real I/O leaks
 //! into the parse: [`ExternalIdSource`] supplies the provider-id key set the C#
-//! `IProviderManager.GetExternalIdInfos` returns, and [`DirectoryService`]
-//! resolves local artwork paths (C# `IDirectoryService.GetFile`). Tests pass
-//! fakes for both.
+//! `IProviderManager.GetExternalIdInfos` returns, and the shared
+//! [`DirectoryService`] resolves local artwork paths (C#
+//! `IDirectoryService.GetFile`). Tests pass fakes for both.
+
+use std::sync::Arc;
 
 use chrono::Datelike;
 use ferrofin_common::providers;
 use ferrofin_model::data::PersonKind;
 use ferrofin_model::entities::MetadataField;
 use ferrofin_util::finite::finite_or_none;
+use ferrofin_util::ticks::TICKS_PER_SECOND;
 
 use crate::container_types::{FileSystemMetadata, LocalImageInfo, MetadataResult, PersonInfo};
+use crate::local_images::DirectoryService;
 
 use super::config::NfoConfiguration;
 use super::item::{NfoBaseItem, NfoItemKind};
@@ -38,8 +42,6 @@ const YOUTUBE_WATCH_URL: &str = "https://www.youtube.com/watch?v=";
 
 /// Minimum production year accepted from a `<year>` tag (upstream `> 1850`).
 const MIN_PRODUCTION_YEAR: i32 = 1850;
-/// .NET ticks per second (100-ns units); used for run-time conversions.
-const TICKS_PER_SECOND: i64 = 10_000_000;
 /// Seconds per minute; used for the `<runtime>` (minutes) conversion.
 const SECONDS_PER_MINUTE: i64 = 60;
 
@@ -55,22 +57,19 @@ pub trait ExternalIdSource: Send + Sync {
     fn external_id_keys(&self) -> Vec<String>;
 }
 
-/// Resolves local artwork file paths (`IDirectoryService.GetFile`).
-///
-/// Behind a trait so the un-mockable filesystem access stays out of the parser's
-/// coverage/parity numbers; tests supply a fake.
-pub trait DirectoryService: Send + Sync {
-    /// Returns metadata for the file at `path`, or `None` if it does not exist.
-    fn get_file(&self, path: &str) -> Option<FileSystemMetadata>;
-}
-
 /// A [`DirectoryService`] that resolves nothing (every path is absent).
 ///
-/// Used by parsers/tests that carry no local artwork.
+/// The scan parses NFOs with it, so an NFO `<thumb>` that names a local file
+/// adds no image. TODO(parity, open work item — gl-1818): pass a service that
+/// resolves files, once the owner has decided which files an NFO may name.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct NoDirectoryService;
 
 impl DirectoryService for NoDirectoryService {
+    fn file_system_entries(&self, _path: &str) -> Arc<[FileSystemMetadata]> {
+        Arc::from([])
+    }
+
     fn get_file(&self, _path: &str) -> Option<FileSystemMetadata> {
         None
     }
@@ -762,11 +761,10 @@ fn parse_3d_format(format: &str) -> Option<ferrofin_model::entities::Video3DForm
 
 /// Case-insensitively strips `prefix` from `text`, returning the remainder.
 fn strip_prefix_ci<'a>(text: &'a str, prefix: &str) -> Option<&'a str> {
-    if text.len() >= prefix.len() && text[..prefix.len()].eq_ignore_ascii_case(prefix) {
-        Some(&text[prefix.len()..])
-    } else {
-        None
-    }
+    // `get`, not indexing: `prefix.len()` need not be a character boundary of `text`.
+    text.get(..prefix.len())
+        .is_some_and(|head| head.eq_ignore_ascii_case(prefix))
+        .then(|| &text[prefix.len()..])
 }
 
 /// Whether `val` parses as an absolute URI (`Uri.TryCreate(.., Absolute)`).

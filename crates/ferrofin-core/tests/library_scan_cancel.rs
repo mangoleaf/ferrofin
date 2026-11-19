@@ -19,6 +19,7 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
+use chrono::{DateTime, Utc};
 use ferrofin_core::file_system::FerrofinFileSystem;
 use ferrofin_core::item_type_lookup::ItemTypeLookup;
 use ferrofin_core::{
@@ -286,7 +287,123 @@ impl TrickplayManager for CancelInTrickplay {
     }
 }
 
-/// Where [`movie_library`]'s scanner cancels a scan of its own accord.
+/// Counts once when dropped.
+struct DropCount<'a>(&'a tokio::sync::watch::Sender<usize>);
+
+impl Drop for DropCount<'_> {
+    fn drop(&mut self) {
+        self.0.send_modify(|n| *n += 1);
+    }
+}
+
+/// What a [`DetachedTrickplay`] refresh found as it started: the item,
+/// whether it came by id (not handed the row), and the item's stored
+/// `DateModified` and stream count.
+type Seen = (uuid::Uuid, bool, Option<DateTime<Utc>>, usize);
+
+/// The trickplay manager of a library that extracts during the scan with
+/// NonBlocking timing. Each refresh records whether it came by id and the
+/// item's stored `DateModified` and stream count as it starts, then waits
+/// until it is dropped.
+struct DetachedTrickplay {
+    db: std::sync::OnceLock<Database>,
+    seen: Mutex<Vec<Seen>>,
+    started: tokio::sync::watch::Sender<usize>,
+    dropped: tokio::sync::watch::Sender<usize>,
+}
+
+impl DetachedTrickplay {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            db: std::sync::OnceLock::new(),
+            seen: Mutex::new(Vec::new()),
+            started: tokio::sync::watch::Sender::new(0),
+            dropped: tokio::sync::watch::Sender::new(0),
+        })
+    }
+
+    async fn held(&self, item_id: uuid::Uuid, by_id: bool) -> Result<(), ServiceError> {
+        let _dropped = DropCount(&self.dropped);
+        let db = self.db.get().expect("wired").clone();
+        let row = FerrofinItemRepository::new(db.clone(), Arc::new(ItemTypeLookup::new()))
+            .retrieve_item(item_id)
+            .await?;
+        let streams = FerrofinMediaStreamRepository::new(db)
+            .get_media_streams(&MediaStreamQuery {
+                item_id,
+                ..MediaStreamQuery::default()
+            })
+            .await?;
+        self.seen.lock().expect("seen").push((
+            item_id,
+            by_id,
+            row.and_then(|row| row.date_modified),
+            streams.len(),
+        ));
+        self.started.send_modify(|n| *n += 1);
+        std::future::pending().await
+    }
+}
+
+#[async_trait]
+impl TrickplayManager for DetachedTrickplay {
+    async fn refresh_trickplay_data(
+        &self,
+        item_id: uuid::Uuid,
+        _replace: bool,
+        _library_options: &LibraryOptions,
+    ) -> Result<(), ServiceError> {
+        self.held(item_id, true).await
+    }
+    async fn refresh_trickplay_for_media(
+        &self,
+        item_id: uuid::Uuid,
+        _entity: &ferrofin_db::entities::base_items::BaseItemEntity,
+        _streams: Option<&[MediaStreamInfoEntity]>,
+        _replace: bool,
+        _library_options: &LibraryOptions,
+    ) -> Result<(), ServiceError> {
+        self.held(item_id, false).await
+    }
+    async fn get_trickplay_resolutions(
+        &self,
+        _item_id: uuid::Uuid,
+    ) -> Result<HashMap<i32, TrickplayInfoEntity>, ServiceError> {
+        Ok(HashMap::new())
+    }
+    async fn get_trickplay_items(
+        &self,
+        _limit: i32,
+        _offset: i32,
+    ) -> Result<Vec<TrickplayInfoEntity>, ServiceError> {
+        Ok(Vec::new())
+    }
+    async fn save_trickplay_info(&self, _info: &TrickplayInfoEntity) -> Result<(), ServiceError> {
+        Ok(())
+    }
+    async fn delete_trickplay_data(&self, _item_id: uuid::Uuid) -> Result<(), ServiceError> {
+        Ok(())
+    }
+    async fn get_hls_playlist(
+        &self,
+        _item_id: uuid::Uuid,
+        _width: i32,
+        _api_key: Option<&str>,
+    ) -> Result<Option<String>, ServiceError> {
+        Ok(None)
+    }
+    async fn get_trickplay_tile_path(
+        &self,
+        _item_id: uuid::Uuid,
+        _width: i32,
+        _index: i32,
+    ) -> Result<Option<String>, ServiceError> {
+        Ok(None)
+    }
+}
+
+/// Where [`movie_library`]'s scanner cancels a scan of its own accord, or
+/// where it detaches its trickplay refreshes.
 #[derive(Clone, Copy)]
 enum CancelAt<'a> {
     Nowhere,
@@ -294,6 +411,8 @@ enum CancelAt<'a> {
     Streams(&'a ScanCancel),
     /// In a new video's trickplay refresh ([`CancelInTrickplay`]).
     Trickplay(&'a ScanCancel),
+    /// Nowhere; NonBlocking trickplay refreshes go to this manager.
+    Detached(&'a Arc<DetachedTrickplay>),
 }
 
 /// A movie library of three titles on a fresh database, scanned by a
@@ -326,7 +445,7 @@ async fn movie_library(
             }],
             extract_trickplay_images_during_library_scan: matches!(
                 cancel_at,
-                CancelAt::Trickplay(_)
+                CancelAt::Trickplay(_) | CancelAt::Detached(_)
             ),
             ..LibraryOptions::default()
         },
@@ -365,11 +484,21 @@ async fn movie_library(
         .with_progress_every(0)
         .with_metadata_dir(root.join("metadata/library"))
         .with_dynamic_providers(art);
-    if let CancelAt::Trickplay(cancel) = cancel_at {
-        let manager = CancelInTrickplay {
-            cancel: Mutex::new(Some(cancel.clone())),
-        };
-        scanner = scanner.with_trickplay(Arc::new(manager), || TrickplayScanBehavior::Blocking);
+    match cancel_at {
+        CancelAt::Trickplay(cancel) => {
+            let manager = CancelInTrickplay {
+                cancel: Mutex::new(Some(cancel.clone())),
+            };
+            scanner = scanner.with_trickplay(Arc::new(manager), || TrickplayScanBehavior::Blocking);
+        }
+        CancelAt::Detached(manager) => {
+            manager.db.set(db.clone()).expect("wired once");
+            scanner = scanner
+                .with_trickplay(Arc::clone(manager) as Arc<dyn TrickplayManager>, || {
+                    TrickplayScanBehavior::NonBlocking
+                });
+        }
+        CancelAt::Nowhere | CancelAt::Streams(_) => {}
     }
     (db, Arc::new(scanner))
 }
@@ -519,6 +648,85 @@ async fn a_cancel_in_a_new_videos_trickplay_counts_it_created_and_unstamped() {
         "{:?}",
         movies(&db).await
     );
+}
+
+/// Waits, bounded, for `counter` to reach `n`.
+async fn settle(counter: &tokio::sync::watch::Sender<usize>, n: usize) {
+    tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        counter.subscribe().wait_for(|count| *count >= n),
+    )
+    .await
+    .expect("in time")
+    .expect("alive");
+}
+
+/// With NonBlocking timing, a video's trickplay refresh is detached once its
+/// row and streams are saved, by id, so it reads both back rather than
+/// carrying the scan's copies (gl-233): a new video's, and a stored one's
+/// whose file changed, which Blocking runs before its save. The detached
+/// refreshes follow the cancellation of the scan that started them, after it
+/// has returned.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_detached_trickplay_refresh_starts_by_id_after_the_save_and_follows_its_scans_cancel() {
+    let tmp = tempfile::tempdir().expect("tmp");
+    let probe = HeldProbe::new();
+    probe.release.add_permits(1);
+    let trickplay = DetachedTrickplay::new();
+    let (db, scanner) = movie_library(
+        tmp.path(),
+        &probe,
+        Vec::new(),
+        CancelAt::Detached(&trickplay),
+    )
+    .await;
+    let items = FerrofinItemRepository::new(db.clone(), Arc::new(ItemTypeLookup::new()));
+    // The paths of the refreshes from `from` on, each checked as it found
+    // its item.
+    let seen_as_saved = async |from: usize| {
+        let seen = trickplay.seen.lock().expect("seen").clone();
+        let mut paths = Vec::new();
+        for (item, by_id, date_modified, streams) in &seen[from..] {
+            let stored = items
+                .retrieve_item(*item)
+                .await
+                .expect("read")
+                .expect("row");
+            assert!(*by_id, "a detached refresh comes by id: {seen:?}");
+            assert_eq!(
+                *date_modified, stored.date_modified,
+                "it starts after the item's save: {seen:?}"
+            );
+            assert_eq!(*streams, 1, "and after its streams': {seen:?}");
+            paths.push(stored.path.expect("path"));
+        }
+        paths
+    };
+
+    let first = ScanCancel::new();
+    scan(&scanner, &first, None).await;
+    settle(&trickplay.started, 3).await;
+    assert_eq!(seen_as_saved(0).await.len(), 3);
+    assert_eq!(*trickplay.dropped.borrow(), 0, "they outlive their scan");
+    first.cancel();
+    settle(&trickplay.dropped, 3).await;
+
+    std::fs::File::options()
+        .write(true)
+        .open(tmp.path().join("movies/Heat (1995)/Heat (1995).mkv"))
+        .expect("open")
+        .set_modified(std::time::SystemTime::now() + std::time::Duration::from_hours(1))
+        .expect("touch");
+    let second = ScanCancel::new();
+    scan(&scanner, &second, None).await;
+    settle(&trickplay.started, 4).await;
+    let again = seen_as_saved(3).await;
+    assert!(
+        matches!(again.as_slice(), [path] if path.ends_with("Heat (1995).mkv")),
+        "only the changed video again: {again:?}"
+    );
+    second.cancel();
+    settle(&trickplay.dropped, 4).await;
 }
 
 /// What a crash or a kill leaves while an item's streams are written: its row

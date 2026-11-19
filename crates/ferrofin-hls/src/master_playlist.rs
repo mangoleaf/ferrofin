@@ -31,7 +31,9 @@
 use std::fmt::Write as _;
 
 use ferrofin_mediaencoding::EncodingJobInfo;
-use ferrofin_mediaencoding::encoding_helper::helper::normalize_transcoding_level;
+use ferrofin_mediaencoding::encoding_helper::helper::{
+    is_mp4_segment_container, normalize_transcoding_level,
+};
 use ferrofin_mediaencoding::encoding_helper::hw::tonemap::{is_dovi, is_hdr10_plus};
 use ferrofin_model::data::{VideoRange, VideoRangeType};
 use ferrofin_model::dlna::SubtitleDeliveryMethod;
@@ -342,7 +344,7 @@ pub fn build_master_playlist(
             .segment_container
             .as_deref()
             .filter(|c| !c.trim().is_empty())
-        && !container.eq_ignore_ascii_case("mp4")
+        && !is_mp4_segment_container(container)
     {
         query_string.push_str("&AllowVideoStreamCopy=false");
     }
@@ -1270,7 +1272,6 @@ mod tests {
             output_audio_bitrate: Some(128_000),
             output_audio_channels: Some(1),
             output_container: Some("ts".to_owned()),
-            output_video_sync: None,
             output_file_path: "/cache/transcodes/out.m3u8".to_owned(),
             input_container: Some("mkv".to_owned()),
             is_input_video: true,
@@ -1966,6 +1967,35 @@ mod tests {
         };
         let pl = build_master_playlist(&plan(s), &req, &MasterPlaylistContext::default());
         assert!(!pl.contains("TranscodeReasons="), "got: {pl}");
+    }
+
+    /// The rotation veto reads the shared segment-container rule: any `mp4`
+    /// spelling keeps a rotated copy (fMP4 carries the rotation), anything
+    /// else vetoes it.
+    #[rstest::rstest]
+    #[case("mp4", false)]
+    #[case("MP4", false)]
+    #[case(" mp4", false)]
+    #[case("ts", true)]
+    fn rotation_vetoes_copy_unless_the_segments_are_fmp4(
+        #[case] container: &str,
+        #[case] vetoed: bool,
+    ) {
+        let mut video = video_stream();
+        video.rotation = Some(90);
+        let mut s = state(vec![video, audio_stream()]);
+        s.output_video_codec = Some("copy".to_owned());
+        let req = HlsStreamRequest {
+            query_string: "?mediaSourceId=abc&audioCodec=aac".to_owned(),
+            segment_container: Some(container.to_owned()),
+            ..request()
+        };
+        let pl = build_master_playlist(&plan(s), &req, &MasterPlaylistContext::default());
+        assert_eq!(
+            pl.contains("AllowVideoStreamCopy=false"),
+            vetoed,
+            "got: {pl}"
+        );
     }
 
     /// The subtitle group appears only with `SubtitleMethod=Hls` or

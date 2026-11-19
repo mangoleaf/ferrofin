@@ -47,22 +47,28 @@ static BACKUP_SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(())
 ///
 /// A restart cannot be watched as a down-window: the startup server binds the
 /// new lifetime's listener first, so the port is closed for a few milliseconds
-/// at most and a poll can miss it. The restart flag tells the lifetimes apart
-/// instead. The restart and restore endpoints set `HasPendingRestart` on the
-/// old lifetime before they answer, and every lifetime starts with it clear, so
-/// only the new one can name this server without a restart pending. A refused
-/// connection, the startup server's `503` and the old lifetime still draining
-/// all mean "not yet".
+/// at most and a poll can miss it. The lifecycle flags tell the lifetimes apart
+/// instead. The restart and restore endpoints mark the old lifetime shutting
+/// down before they answer (`IsShuttingDown`), and every lifetime starts with
+/// it and `HasPendingRestart` clear, so only the new one can name this server
+/// with neither set. A refused connection, the startup server's `503` and the
+/// old lifetime still draining all mean "not yet".
 async fn wait_for_new_lifetime(client: &reqwest::Client, base: &str, name: &str, token: &str) {
     let deadline = std::time::Instant::now() + STARTUP_DEADLINE;
     let mut last = String::from("no answer");
     while std::time::Instant::now() < deadline {
         match system_info(client, base, token).await {
-            Ok(info) if info["ServerName"] == name && info["HasPendingRestart"] == false => return,
+            Ok(info)
+                if info["ServerName"] == name
+                    && info["HasPendingRestart"] == false
+                    && info["IsShuttingDown"] == false =>
+            {
+                return;
+            }
             Ok(info) => {
                 last = format!(
-                    "ServerName {}, HasPendingRestart {}",
-                    info["ServerName"], info["HasPendingRestart"]
+                    "ServerName {}, HasPendingRestart {}, IsShuttingDown {}",
+                    info["ServerName"], info["HasPendingRestart"], info["IsShuttingDown"]
                 );
             }
             Err(error) => last = error,
@@ -510,12 +516,27 @@ async fn a_networking_page_port_applies_on_the_restart() {
     assert_eq!(saved, 204);
     let info = system_info(&client, &base, &tok).await.expect("info");
     assert_eq!(info["HasPendingRestart"], true, "the save marks a restart");
+    // gl-1701: and clears `IsPortAuthorized`, saved on its own task.
+    let deadline = std::time::Instant::now() + REQUEST_TIMEOUT;
+    while get_json(&client, &base, "/System/Configuration", &tok).await["IsPortAuthorized"] != false
+    {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "IsPortAuthorized was never cleared"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
 
     assert_eq!(post(&client, &base, "/System/Restart", &tok).await, 204);
     let moved = format!("http://127.0.0.1:{page_port}");
     wait_for_new_lifetime(&client, &moved, &config.server_name, &tok).await;
     let info = system_info(&client, &moved, &tok).await.expect("info");
     assert_eq!(info["LocalAddress"], moved.as_str(), "the advertised URL");
+    assert_eq!(
+        get_json(&client, &moved, "/System/Configuration", &tok).await["IsPortAuthorized"],
+        true,
+        "the next lifetime authorizes the port again"
+    );
     assert!(
         !is_up(&client, &base, &config.server_name).await,
         "the old port is closed"

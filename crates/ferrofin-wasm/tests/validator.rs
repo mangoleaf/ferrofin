@@ -22,7 +22,7 @@ fn plugin_abi_matches_the_wit_world() {
 
 #[tokio::test]
 async fn accepts_the_fixture_component_and_reports_its_id() {
-    let validator = WasmArtifactValidator::new(&WasmSettings::default()).unwrap();
+    let validator = WasmArtifactValidator::new(&WasmSettings::default());
     assert_eq!(validator.supported_abi(), PLUGIN_ABI);
 
     let component = wat::parse_str(ferrofin_wasm::TEST_FIXTURE_WAT).unwrap();
@@ -43,7 +43,7 @@ async fn accepts_the_fixture_component_and_reports_its_id() {
 /// wasmtime crate features: one that turns a proposal back on fails here.
 #[tokio::test]
 async fn proposals_outside_the_sandbox_do_not_compile() {
-    let validator = WasmArtifactValidator::new(&WasmSettings::default()).unwrap();
+    let validator = WasmArtifactValidator::new(&WasmSettings::default());
     for (proposal, module) in [
         ("threads", "(memory 1 1 shared)"),
         ("gc", "(type (struct))"),
@@ -61,7 +61,7 @@ async fn proposals_outside_the_sandbox_do_not_compile() {
 
 #[tokio::test]
 async fn rejects_garbage_and_non_component_wasm() {
-    let validator = WasmArtifactValidator::new(&WasmSettings::default()).unwrap();
+    let validator = WasmArtifactValidator::new(&WasmSettings::default());
 
     let err = validator.validate(b"not wasm at all").await.unwrap_err();
     assert!(
@@ -95,7 +95,7 @@ async fn rejects_a_provider_name_colliding_with_a_builtin_at_install() {
     // The install gate must catch a reserved provider name — otherwise the
     // admin sees "installed", a restart-required flag, and then a silently
     // absent provider (the load-time guard would refuse it on next boot).
-    let validator = WasmArtifactValidator::new(&WasmSettings::default()).unwrap();
+    let validator = WasmArtifactValidator::new(&WasmSettings::default());
 
     let src = named_provider_fixture(
         "aaaaaaaa-bbbb-cccc-dddd-eeeeeeee1234",
@@ -119,7 +119,7 @@ async fn rejects_a_provider_name_colliding_with_a_builtin_at_install() {
 
 #[tokio::test]
 async fn refuses_at_install_what_loading_would_skip() {
-    let validator = WasmArtifactValidator::new(&WasmSettings::default()).unwrap();
+    let validator = WasmArtifactValidator::new(&WasmSettings::default());
     let fixture = ferrofin_wasm::TEST_FIXTURE_WAT;
     for (wat, reason) in [
         (

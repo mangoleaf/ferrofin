@@ -12,6 +12,8 @@ workspace = true
 [dependencies]
 ferrofin-model.workspace = true
 ferrofin-util.workspace = true
+# Reading `BaseItems.Data`, the JSON payload of each item (`item_data`).
+serde_json.workspace = true
 sqlx = { workspace = true, features = ["migrate"] }
 libsqlite3-sys.workspace = true
 thiserror.workspace = true

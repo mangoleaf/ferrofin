@@ -374,6 +374,34 @@ fn get_media_source_name_common_prefix_valid(
     );
 }
 
+/// `GetCommonVersionPrefix` compares with `char.ToUpperInvariant` and
+/// `GetMediaSourceName` with `StartsWith(…, OrdinalIgnoreCase)`; the two differ
+/// at the long `ſ`, which only `ToUpperInvariant` maps to `S`. Neither folds the
+/// dotless `ı` onto `I` or `İ` onto `i`, and both fold `ᾳ` onto `ᾼ` (the oracle
+/// is `ferrofin-util`'s .NET 10 casing table).
+#[rstest]
+#[case("K\u{131}ral - A", "KIRAL - B", "", "K\u{131}ral - A", "KIRAL - B")]
+#[case("\u{17F}tar - A", "Star - B", "\u{17F}tar -", "A", "Star - B")]
+#[case("\u{1FB3}x - A", "\u{1FBC}x - B", "\u{1FB3}x -", "A", "B")]
+#[case("\u{130}x - A", "ix - B", "", "\u{130}x - A", "ix - B")]
+fn version_names_fold_as_dotnet(
+    #[case] primary_name: &str,
+    #[case] alt_name: &str,
+    #[case] expected_prefix: &str,
+    #[case] expected_primary: &str,
+    #[case] expected_alt: &str,
+) {
+    let primary = video(&format!("/Shows/Demo/Season 01/{primary_name}.mkv"));
+    let alt = video(&format!("/Shows/Demo/Season 01/{alt_name}.mkv"));
+    let prefix = common_version_prefix(&[primary_name, alt_name]);
+    assert_eq!(prefix, expected_prefix);
+    assert_eq!(
+        media_source_name(None, &primary, Some(&prefix)),
+        expected_primary
+    );
+    assert_eq!(media_source_name(None, &alt, Some(&prefix)), expected_alt);
+}
+
 #[test]
 fn get_common_version_prefix_numeric_labels_keeps_whole_number() {
     // Three versions labelled "1.0", "1.01" and "1.11": the common prefix stops inside the version

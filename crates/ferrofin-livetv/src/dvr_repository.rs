@@ -143,6 +143,25 @@ pub async fn series_timer_rows(
         .map_err(db_err)
 }
 
+/// Every stored series timer with a listings series id, as `(Id, Name,
+/// SeriesId)` from the promoted columns, in stored order: all that a guide
+/// page's series-timer link needs, with no DTO JSON parsed.
+///
+/// # Errors
+///
+/// Fails when the read fails.
+pub async fn series_timer_series_ids(
+    db: &Database,
+) -> Result<Vec<(String, String, String)>, ServiceError> {
+    sqlx::query_as(
+        r#"SELECT "Id","Name","SeriesId" FROM "FerrofinLiveTvSeriesTimers"
+           WHERE "SeriesId" IS NOT NULL ORDER BY rowid"#,
+    )
+    .fetch_all(db.pool())
+    .await
+    .map_err(db_err)
+}
+
 /// Inserts or replaces one series timer, DTO and identity columns together.
 ///
 /// # Errors
@@ -193,6 +212,58 @@ pub async fn timer_ids_for_series(
         .fetch_all(db.pool())
         .await
         .map_err(db_err)
+}
+
+/// The `(Id, Data)` rows of the timers a series timer scheduled on this
+/// channel at this start that have not `Completed`, unparsed, in stored
+/// order.
+///
+/// # Errors
+///
+/// Fails when the read fails.
+pub async fn series_timers_at(
+    db: &Database,
+    series_timer_id: &str,
+    channel_id: Uuid,
+    start: DateTime<Utc>,
+) -> Result<Vec<(String, String)>, ServiceError> {
+    sqlx::query_as(
+        r#"SELECT "Id","Data" FROM "FerrofinLiveTvTimers"
+           WHERE "SeriesTimerId" = ?1 AND "ChannelId" = ?2 AND "StartDate" = ?3
+             AND "Status" <> 'Completed'
+           ORDER BY rowid"#,
+    )
+    .bind(series_timer_id)
+    .bind(guid_to_db(channel_id))
+    .bind(datetime_to_db(start))
+    .fetch_all(db.pool())
+    .await
+    .map_err(db_err)
+}
+
+/// Moves the stored timer `old_id` to `timer`'s id, with `timer` as its DTO.
+/// Its other columns, `IsManual` among them, stay as they are.
+///
+/// # Errors
+///
+/// Fails when the write fails (a row already holding the new id, say), or
+/// when the DTO cannot be serialized.
+pub async fn rekey_timer(
+    db: &Database,
+    old_id: &str,
+    timer: &TimerInfoDto,
+) -> Result<(), ServiceError> {
+    let data = serde_json::to_string(timer).map_err(|e| {
+        ServiceError::from(crate::error::LiveTvError::serialize("serialize timer", e))
+    })?;
+    sqlx::query(r#"UPDATE "FerrofinLiveTvTimers" SET "Id" = ?1, "Data" = ?2 WHERE "Id" = ?3"#)
+        .bind(timer.base.id.clone().unwrap_or_default())
+        .bind(&data)
+        .bind(old_id)
+        .execute(db.writer())
+        .await
+        .map_err(db_err)?;
+    Ok(())
 }
 
 /// The `(Id, Data)` rows of the stored timers whose `ProgramId` or

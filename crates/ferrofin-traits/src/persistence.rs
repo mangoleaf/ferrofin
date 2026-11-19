@@ -34,6 +34,7 @@ use ferrofin_model::data::BaseItemKind;
 use ferrofin_model::dto::ItemCounts;
 use ferrofin_model::entities::{ImageType, MediaStreamType, MetadataField};
 use ferrofin_model::querying::{QueryFiltersLegacy, QueryResult};
+use ferrofin_util::change_watch::Watch;
 use uuid::Uuid;
 
 use crate::error::ServiceError;
@@ -416,7 +417,11 @@ pub trait ItemRepository: Send + Sync {
         item_id: Uuid,
     ) -> Result<Option<Vec<BaseItemEntity>>, ServiceError>;
 
-    /// Runs a query and returns a page of item rows plus the total count.
+    /// Runs a query and returns a page of item rows plus the total count. Its
+    /// own query is `BaseItemRepository.GetItems`, so with
+    /// [`InternalItemsQuery::enable_total_record_count`] off the total is the
+    /// page's own length; the folders view it answers first totals every row,
+    /// as upstream's `SortAndPage` does.
     async fn get_items(
         &self,
         filter: &InternalItemsQuery,
@@ -1048,6 +1053,29 @@ pub trait ItemPersistenceService: Send + Sync {
         Ok(())
     }
 
+    /// Joins the members a box set's `collection.xml` names to its links, as
+    /// `BoxSetMetadataService.MergeData` merges a box set outside the data
+    /// directory and the save writes them: the file's entries first, in file
+    /// order, each resolved as a playlist entry is ([`PlaylistMember`]: its
+    /// path, else its id) and dropped when it names no stored item, then the
+    /// links already stored that the file does not name, each child once, as
+    /// manual links. Returns whether the links changed.
+    ///
+    /// The default is a no-op (for stub/fake services).
+    ///
+    /// # Errors
+    ///
+    /// [`ServiceError::Backend`] on a storage failure; nothing is written
+    /// then.
+    async fn merge_box_set_members(
+        &self,
+        box_set: Uuid,
+        members: &[PlaylistMember],
+    ) -> Result<bool, ServiceError> {
+        let _ = (box_set, members);
+        Ok(false)
+    }
+
     /// Copies each owner video's metadata onto the videos it owns, as a save
     /// (or refresh) of the owner does upstream, and returns how many owned
     /// rows were written.
@@ -1199,6 +1227,15 @@ pub trait ItemPersistenceService: Send + Sync {
     /// `CollectionFolder` row before parenting scanned children to it).
     async fn item_exists(&self, id: Uuid) -> Result<bool, ServiceError>;
 
+    /// The stored `Path` of the item row with this id, its virtual-path tokens
+    /// expanded: `None` when there is no such row, `Some(None)` when the row
+    /// has no path. One read, for a caller
+    /// that needs both answers (the user root's provisioning). The default
+    /// asks [`item_exists`](Self::item_exists) and knows no path.
+    async fn item_path(&self, id: Uuid) -> Result<Option<Option<String>>, ServiceError> {
+        Ok(self.item_exists(id).await?.then_some(None))
+    }
+
     /// Get-or-create the by-name item row for `(kind, name)`, returning its id.
     ///
     /// The write half of C# `LibraryManager.CreateItemByName<T>`
@@ -1257,19 +1294,17 @@ pub trait ItemPersistenceService: Send + Sync {
     async fn set_ancestors(&self, item_id: Uuid, ancestor_ids: &[Uuid])
     -> Result<(), ServiceError>;
 
-    /// Persists the image info attached to an item. The `ferrofin-core`
-    /// implementation only confirms the item exists: image rows are written by
-    /// [`Self::save_item_images`] and the `set_item_image*` methods, and nothing
-    /// calls this one. TODO(gl-211): open work item: remove it from the trait.
-    async fn save_images(&self, item: &BaseItemEntity) -> Result<(), ServiceError>;
-
     /// Replaces the item's stored image rows (`BaseItemImageInfos`) with
     /// `images` — the write path the library scan uses to persist discovered
-    /// artwork (posters/backdrops/…) so the image routes can serve it.
+    /// artwork (posters/backdrops/…) so the image routes can serve it. Port of
+    /// `ItemPersistenceService.SaveImagesAsync`, which takes the images from
+    /// the domain item instead.
     ///
     /// The default is a no-op (for stub/fake services). The real service keeps
     /// identical rows, updates changed image metadata, inserts new images and
-    /// deletes only images absent from the supplied set.
+    /// deletes only images absent from the supplied set. A stored row is
+    /// matched by its path expanded (`%MetadataPath%`, as every read hands it
+    /// out), and an adopted row so matched keeps its stored form.
     ///
     /// # Errors
     ///
@@ -2148,11 +2183,16 @@ pub trait ItemPersistenceService: Send + Sync {
         Ok(None)
     }
 
-    /// Port of `UpdateInheritedValues`, which upstream runs at the end of the
-    /// post-scan tasks (`RunPostScanTasks`) to delete the `ItemValuesMap` rows
-    /// of type `InheritedTags`.
-    /// The `ferrofin-core` implementation is a no-op, and nothing calls it.
-    /// TODO(gl-211): open work item: port it and call it, or remove it.
+    /// Port of `UpdateInheritedValues`, which a library validation runs once
+    /// its post-scan tasks are done (`RunPostScanTasks`): deletes every
+    /// `ItemValuesMap` row whose value is of type `InheritedTags` (6), keeping
+    /// the `ItemValues` rows. Ferrofin writes none, and nothing reads them
+    /// (the tag filters read `Tags`); an adopted database may still hold the
+    /// ones Jellyfin saved since its last scan.
+    ///
+    /// # Errors
+    ///
+    /// [`ServiceError::Backend`] on a storage failure.
     async fn update_inherited_values(&self) -> Result<(), ServiceError>;
 }
 
@@ -2234,20 +2274,6 @@ pub trait ItemCountService: Send + Sync {
         }
         Ok(out)
     }
-
-    /// Counts played descendants of `ancestor_id`.
-    async fn get_played_count(
-        &self,
-        filter: &InternalItemsQuery,
-        ancestor_id: Uuid,
-    ) -> Result<i32, ServiceError>;
-
-    /// Counts all descendants of `ancestor_id`.
-    async fn get_total_count(
-        &self,
-        filter: &InternalItemsQuery,
-        ancestor_id: Uuid,
-    ) -> Result<i32, ServiceError>;
 
     /// Gets both played and total descendant counts of `ancestor_id`.
     async fn get_played_and_total_count(
@@ -2498,7 +2524,8 @@ fn _assert_object_safe_media_attachment_repository(_: &dyn MediaAttachmentReposi
 /// [`ItemPersistenceService::scan_stored_links`] reads them.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct StoredItemLinks {
-    /// The item's `BaseItemImageInfos` rows, in type-then-row order.
+    /// The item's `BaseItemImageInfos` rows, in type-then-row order, their
+    /// paths expanded as every image read expands them.
     pub images: Vec<ItemImageInfo>,
     /// The item's `AncestorIds` closure.
     pub ancestors: Vec<Uuid>,
@@ -2764,7 +2791,8 @@ pub struct StoredImageMetadata {
     pub item_id: Uuid,
     /// The row's image type.
     pub image_type: ImageType,
-    /// The image file's path — the identity of the artwork on disk.
+    /// The image file's path — the identity of the artwork on disk —
+    /// expanded as every image read expands it.
     pub path: String,
     /// The stored pixel width (`0` when never probed).
     pub width: i32,
@@ -2919,6 +2947,28 @@ pub trait KeyframeRepository: Send + Sync {
 
     /// Deletes an item's keyframe data.
     async fn delete_keyframe_data(&self, item_id: Uuid) -> Result<(), ServiceError>;
+
+    /// Starts watching the item's keyframe data for
+    /// [`Self::delete_keyframe_data`], before an extraction runs, for
+    /// [`Self::save_extracted_keyframe_data`]. The default watches nothing; an
+    /// implementation whose deletion can land during an extraction overrides
+    /// both.
+    async fn watch_keyframe_data(&self, item_id: Uuid) -> Watch<Uuid> {
+        Watch::detached(item_id)
+    }
+
+    /// Saves an extraction's keyframes unless the item's keyframe data was
+    /// deleted since `watch` began: a changed file's prune, which the old
+    /// file's keyframes would undo. Whether they were saved. The default always
+    /// saves.
+    async fn save_extracted_keyframe_data(
+        &self,
+        watch: Watch<Uuid>,
+        data: &KeyframeDataEntity,
+    ) -> Result<bool, ServiceError> {
+        self.save_keyframe_data(*watch.key(), data).await?;
+        Ok(true)
+    }
 }
 
 fn _assert_object_safe_keyframe_repository(_: &dyn KeyframeRepository) {}
