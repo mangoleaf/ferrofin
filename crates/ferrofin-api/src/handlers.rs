@@ -1868,7 +1868,10 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
                    GetTopParentIdsForQuery's grouping arm), and UserViewMaterialisation, the \
                    scope's get_user_views_with_query call that writes the user's views as \
                    AddUserToQuery's GetUserViews call writes them (LibraryManager.AddUserToQuery, \
-                   UserViewManager.GetUserViews, compared 2026-11-10), reading a library's options at its \
+                   UserViewManager.GetUserViews, compared 2026-11-10), with \
+                   user_view_manager.rs ensure_user_playlists_view and view_refresh_due dating \
+                   and refreshing the Playlists view (LibraryManager.GetNamedView, compared \
+                   2026-11-11), reading a library's options at its \
                    Path expanded as BaseItemMapper.Map expands it \
                    (CollectionFolder.GetLibraryOptions, compared 2026-11-05); handlers/items.rs \
                    require_scope_visible, require_scope_id_visible, retain_visible_ids at the \
@@ -1931,16 +1934,21 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
              grouped view, the Folders view, the Live TV view), where upstream's \
              AddUserToQuery calls GetUserViews on every such query: for the life of the \
              process, once per user and per set of root folders the user may see. Those \
-             writes create a missing row or rename a grouped, Folders or Live TV view whose \
-             name changed, so the rows end the same, except that a change while the set \
+             writes create a missing row or rename a Playlists, grouped, Folders or Live TV \
+             view whose name changed, so the rows end the same, except that a change while the set \
              stays the same (for example a view row deleted, the Folders view enabled, a new \
              server culture, a changed grouped-folders preference, or Live TV becoming \
              available to the user), or a write that failed, is written by the next GET \
              /UserViews rather than the next query; a write its query was cancelled in is \
              retried. The query \
-             that writes them is scoped by the rows read before the write (gl-1584). The \
-             Playlists view's rename (gl-1397) and GetNamedView's refresh queue (gl-1566) are \
-             ported on neither path.",
+             that writes them is scoped by the rows read before the write (gl-1584). \
+             GetNamedView's refresh of the Playlists view (when it is new, 24 hours after its last refresh, \
+             or once its display parent was saved since) is the view's save, made at once \
+             rather than queued (gl-1625); the collage that refresh draws upstream is \
+             TODO(gl-1656), and the other views' dates and refresh TODO(gl-1655). It falls \
+             due only where the views are read: on every GET /UserViews, and on the query \
+             path when that writes them, so a refresh due while the set stays the same \
+             waits for the next GET /UserViews.",
             "GET and POST /LiveTv/Programs read librarySeriesId's row as the request's user, or \
              as the signed-in caller when a POST body names no user, so a series that user \
              cannot open (library, rating or tag rules) answers like an id that is no series: \
