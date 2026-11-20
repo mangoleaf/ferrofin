@@ -1378,14 +1378,16 @@ struct GroupRow {
 /// 12.x shape are left alone. Runs once per database (`FerrofinMeta`),
 /// after [`run_all`] — it needs the item-id derivation and the folder roots
 /// the composition root resolves (`art_root` is the item art root,
-/// `{metadata}/library`), and the persistence service the server saves
-/// items through (`persistence`, with its localization attached).
+/// `{metadata}/library`; `virtual_paths`' `reverse` gives the form a path
+/// under it is saved in), and the persistence service the server saves items
+/// through (`persistence`, with its localization attached).
 ///
 /// # Errors
 /// Returns [`ServiceError`] if the underlying queries fail.
 pub async fn rehome_local_versions(
     db: &Database,
     derivation: &IdDerivation,
+    virtual_paths: &VirtualPathExpander,
     art_root: Option<&Path>,
     path_manager: Option<&dyn PathManager>,
     persistence: &dyn ItemPersistenceService,
@@ -1421,6 +1423,7 @@ pub async fn rehome_local_versions(
         );
     }
     let folders = FolderRoots {
+        virtual_paths,
         art_root,
         path_manager,
     };
@@ -1542,12 +1545,20 @@ fn uuid_of(id: &str) -> Result<Uuid, ServiceError> {
 pub async fn run_rehome_local_versions(
     db: &Database,
     derivation: &IdDerivation,
+    virtual_paths: &VirtualPathExpander,
     art_root: Option<&Path>,
     path_manager: Option<&dyn PathManager>,
     persistence: &dyn ItemPersistenceService,
 ) -> Result<(), ServiceError> {
-    let rehomed =
-        rehome_local_versions(db, derivation, art_root, path_manager, persistence).await?;
+    let rehomed = rehome_local_versions(
+        db,
+        derivation,
+        virtual_paths,
+        art_root,
+        path_manager,
+        persistence,
+    )
+    .await?;
     if rehomed != RehomedVersions::default() {
         tracing::info!(
             rekeyed = rehomed.rekeyed,
@@ -1586,6 +1597,7 @@ const SEASON_SNAPSHOT_EXTENSION: &str = "db.pre-season-ids";
 pub async fn rekey_virtual_seasons(
     db: &Database,
     derivation: &IdDerivation,
+    virtual_paths: &VirtualPathExpander,
     art_root: Option<&Path>,
     path_manager: Option<&dyn PathManager>,
 ) -> Result<usize, ServiceError> {
@@ -1641,7 +1653,8 @@ pub async fn rekey_virtual_seasons(
     for (from, to) in targets {
         // A season with no folder has no media path (its trickplay folder,
         // which one never has, is the internal one).
-        let (folders, dirs) = move_item_folders(art_root, path_manager, (from, to), "", false);
+        let (folders, dirs) =
+            move_item_folders(virtual_paths, art_root, path_manager, (from, to), "", false);
         renamed.push((to, folders));
         moves.push(ItemRekey {
             from,
@@ -1683,10 +1696,12 @@ pub async fn rekey_virtual_seasons(
 pub async fn run_rekey_virtual_seasons(
     db: &Database,
     derivation: &IdDerivation,
+    virtual_paths: &VirtualPathExpander,
     art_root: Option<&Path>,
     path_manager: Option<&dyn PathManager>,
 ) -> Result<(), ServiceError> {
-    let moved = rekey_virtual_seasons(db, derivation, art_root, path_manager).await?;
+    let moved =
+        rekey_virtual_seasons(db, derivation, virtual_paths, art_root, path_manager).await?;
     if moved > 0 {
         tracing::info!(
             items = moved,
@@ -1781,7 +1796,8 @@ pub async fn rekey_pathless_playlists(
                 continue;
             }
         };
-        let (folders, dirs) = move_item_folders(art_root, path_manager, (from, to), "", false);
+        let (folders, dirs) =
+            move_item_folders(virtual_paths, art_root, path_manager, (from, to), "", false);
         renamed.push((to, folders, path.clone()));
         moves.push(ItemRekey {
             from,
@@ -1970,6 +1986,7 @@ async fn plan_by_name_moves(
 pub async fn rekey_by_name_rows(
     db: &Database,
     identity: &ByNameIdentity,
+    virtual_paths: &VirtualPathExpander,
     art_root: Option<&Path>,
     path_manager: Option<&dyn PathManager>,
 ) -> Result<usize, ServiceError> {
@@ -1981,7 +1998,8 @@ pub async fn rekey_by_name_rows(
     for chunk in planned.chunks(BY_NAME_MOVES_PER_TRANSACTION) {
         let (mut moves, mut renamed) = (Vec::new(), Vec::new());
         for &(from, to, type_name) in chunk {
-            let (folders, dirs) = move_item_folders(art_root, path_manager, (from, to), "", false);
+            let (folders, dirs) =
+                move_item_folders(virtual_paths, art_root, path_manager, (from, to), "", false);
             renamed.push((to, folders));
             moves.push(ItemRekey {
                 from,
@@ -2027,13 +2045,14 @@ pub async fn rekey_by_name_rows(
 pub async fn run_rekey_by_name_rows(
     db: &Database,
     identity: Option<&ByNameIdentity>,
+    virtual_paths: &VirtualPathExpander,
     art_root: Option<&Path>,
     path_manager: Option<&dyn PathManager>,
 ) {
     let Some(identity) = identity else {
         return;
     };
-    match rekey_by_name_rows(db, identity, art_root, path_manager).await {
+    match rekey_by_name_rows(db, identity, virtual_paths, art_root, path_manager).await {
         Ok(0) => {}
         Ok(moved) => tracing::info!(
             moved,
@@ -2473,7 +2492,8 @@ async fn give_box_set_its_folder(
     let (path, to) =
         crate::collection_manager::new_box_set_folder_and_id(db, derivation, collections, name)
             .await?;
-    let (folders, dirs) = move_item_folders(art_root, path_manager, (from, to), "", false);
+    let (folders, dirs) =
+        move_item_folders(virtual_paths, art_root, path_manager, (from, to), "", false);
     let rekey = ItemRekey {
         from,
         to,
@@ -3446,8 +3466,10 @@ async fn delete_swept(
     Ok(deleted)
 }
 
-/// Where a re-keyed row's id-named folders live.
+/// Where a re-keyed row's id-named folders live, and the expander (`reverse`)
+/// that gives the form a path under them is saved in.
 struct FolderRoots<'a> {
+    virtual_paths: &'a VirtualPathExpander,
     art_root: Option<&'a Path>,
     path_manager: Option<&'a dyn PathManager>,
 }
@@ -3786,6 +3808,7 @@ async fn rekey_to_owner_kind(
             Vec::new()
         } else {
             let (renamed, dirs) = move_item_folders(
+                folders.virtual_paths,
                 folders.art_root,
                 folders.path_manager,
                 (source, *to),
@@ -4519,6 +4542,10 @@ mod tests {
         test_db,
     };
 
+    /// No data or metadata directory: the re-key repairs' stored forms are the resolved ones.
+    static NO_PATHS: std::sync::LazyLock<VirtualPathExpander> =
+        std::sync::LazyLock::new(VirtualPathExpander::identity);
+
     /// The id of the row of `type_suffix` named `name`.
     async fn row_id(db: &Database, type_suffix: &str, name: &str) -> Option<String> {
         sqlx::query_scalar(
@@ -4578,7 +4605,7 @@ mod tests {
         crate::test_support::seed_named_item(&db, adopted, BaseItemKind::Genre, "Drama").await;
 
         let identity = crate::test_support::by_name_identity();
-        let moved = rekey_by_name_rows(&db, &identity, Some(art.path()), None)
+        let moved = rekey_by_name_rows(&db, &identity, &NO_PATHS, Some(art.path()), None)
             .await
             .expect("repair");
         assert_eq!(moved, 3);
@@ -4618,7 +4645,7 @@ mod tests {
         );
         assert!(!old_art.exists());
         assert_eq!(
-            rekey_by_name_rows(&db, &identity, Some(art.path()), None)
+            rekey_by_name_rows(&db, &identity, &NO_PATHS, Some(art.path()), None)
                 .await
                 .expect("again"),
             0
@@ -4645,7 +4672,7 @@ mod tests {
         crate::test_support::seed_named_item(&db, taken, BaseItemKind::Genre, "Other").await;
         let before = row_id(&db, "Genre", "Adventure").await;
         assert_eq!(
-            rekey_by_name_rows(&db, &identity, None, None)
+            rekey_by_name_rows(&db, &identity, &NO_PATHS, None, None)
                 .await
                 .expect("repair"),
             0
@@ -5240,7 +5267,7 @@ mod tests {
         let db = test_db().await;
         let g = seed_group(&db).await;
         let [adopted, part, older] = seed_10_11_rows(&db, &g).await;
-        let rehomed = rehome_local_versions(&db, &DERIVATION, None, None, &store(&db))
+        let rehomed = rehome_local_versions(&db, &DERIVATION, &NO_PATHS, None, None, &store(&db))
             .await
             .unwrap();
         assert_eq!(
@@ -5319,7 +5346,7 @@ mod tests {
         }
 
         assert_eq!(
-            rehome_local_versions(&db, &DERIVATION, None, None, &store(&db))
+            rehome_local_versions(&db, &DERIVATION, &NO_PATHS, None, None, &store(&db))
                 .await
                 .unwrap(),
             RehomedVersions::default()
@@ -5329,7 +5356,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(
-            rehome_local_versions(&db, &DERIVATION, None, None, &store(&db))
+            rehome_local_versions(&db, &DERIVATION, &NO_PATHS, None, None, &store(&db))
                 .await
                 .unwrap(),
             RehomedVersions::default(),
@@ -5412,7 +5439,7 @@ mod tests {
             crate::localization_manager::LocalizationManager::new("US"),
         ));
 
-        let rehomed = rehome_local_versions(&db, &DERIVATION, None, None, &store)
+        let rehomed = rehome_local_versions(&db, &DERIVATION, &NO_PATHS, None, None, &store)
             .await
             .unwrap();
 
@@ -5457,7 +5484,7 @@ mod tests {
             link(&db, g.primary, alternate, LOCAL_ALTERNATE_VERSION, 0).await;
         }
 
-        let rehomed = rehome_local_versions(&db, &DERIVATION, None, None, &store(&db))
+        let rehomed = rehome_local_versions(&db, &DERIVATION, &NO_PATHS, None, None, &store(&db))
             .await
             .unwrap();
 
@@ -5571,7 +5598,7 @@ mod tests {
         let alternate = derive_item_id_with(&DERIVATION, BaseItemKind::Movie, ALTERNATE).unwrap();
 
         assert!(
-            rehome_local_versions(&db, &DERIVATION, None, None, &FailingCopy)
+            rehome_local_versions(&db, &DERIVATION, &NO_PATHS, None, None, &FailingCopy)
                 .await
                 .is_err()
         );
@@ -5587,7 +5614,7 @@ mod tests {
                 .is_none()
         );
 
-        rehome_local_versions(&db, &DERIVATION, None, None, &store(&db))
+        rehome_local_versions(&db, &DERIVATION, &NO_PATHS, None, None, &store(&db))
             .await
             .unwrap();
         assert_eq!(copied(&db, alternate).await.0.as_deref(), Some("PG-13"));
@@ -5612,7 +5639,7 @@ mod tests {
         link(&db, g.primary, alternate, LOCAL_ALTERNATE_VERSION, 0).await;
         db.meta_set(COPY_KEY, &g.primary.to_string()).await.unwrap();
 
-        let rehomed = rehome_local_versions(&db, &DERIVATION, None, None, &store(&db))
+        let rehomed = rehome_local_versions(&db, &DERIVATION, &NO_PATHS, None, None, &store(&db))
             .await
             .unwrap();
 
@@ -5678,7 +5705,7 @@ mod tests {
         )
         .await;
 
-        let rehomed = rehome_local_versions(&db, &DERIVATION, None, None, &store(&db))
+        let rehomed = rehome_local_versions(&db, &DERIVATION, &NO_PATHS, None, None, &store(&db))
             .await
             .unwrap();
 
@@ -5784,9 +5811,10 @@ mod tests {
         }
         fail_moves(&db).await;
 
-        let rehomed = rehome_local_versions(&db, &DERIVATION, Some(&art), None, &store(&db))
-            .await
-            .unwrap();
+        let rehomed =
+            rehome_local_versions(&db, &DERIVATION, &NO_PATHS, Some(&art), None, &store(&db))
+                .await
+                .unwrap();
         assert_eq!(rehomed.rekeyed, 0);
         assert!(exists(&db, adopted).await && exists(&db, target).await);
         assert!(art_folder(&art, adopted).join("poster.jpg").is_file());
@@ -5802,9 +5830,10 @@ mod tests {
             .execute(db.writer())
             .await
             .unwrap();
-        let rehomed = rehome_local_versions(&db, &DERIVATION, Some(&art), None, &store(&db))
-            .await
-            .unwrap();
+        let rehomed =
+            rehome_local_versions(&db, &DERIVATION, &NO_PATHS, Some(&art), None, &store(&db))
+                .await
+                .unwrap();
         // The version and the older scan's `Movie` part.
         assert_eq!((rehomed.rekeyed, rehomed.versions), (2, 1));
         assert!(!exists(&db, adopted).await);
@@ -5843,7 +5872,7 @@ mod tests {
         seed_user(&db, user).await;
         seed_user_data(&db, user, target, true, None).await;
 
-        let rehomed = rehome_local_versions(&db, &DERIVATION, None, None, &store(&db))
+        let rehomed = rehome_local_versions(&db, &DERIVATION, &NO_PATHS, None, None, &store(&db))
             .await
             .unwrap();
         assert_eq!((rehomed.rekeyed, rehomed.versions), (1, 1));
@@ -5917,7 +5946,7 @@ mod tests {
         .await;
         link(&db, primary, as_movie, LINKED_ALTERNATE_VERSION, 0).await;
 
-        let rehomed = rehome_local_versions(&db, &DERIVATION, None, None, &store(&db))
+        let rehomed = rehome_local_versions(&db, &DERIVATION, &NO_PATHS, None, None, &store(&db))
             .await
             .unwrap();
         assert_eq!(
@@ -5961,7 +5990,7 @@ mod tests {
             }
         };
         let quiet = open("quiet.db").await;
-        rehome_local_versions(&quiet, &DERIVATION, None, None, &store(&quiet))
+        rehome_local_versions(&quiet, &DERIVATION, &NO_PATHS, None, None, &store(&quiet))
             .await
             .unwrap();
         assert!(!tmp.path().join("quiet.db.pre-rehome").exists());
@@ -5969,7 +5998,7 @@ mod tests {
         let db = open("jellyfin.db").await;
         let g = seed_group(&db).await;
         seed_10_11_rows(&db, &g).await;
-        rehome_local_versions(&db, &DERIVATION, None, None, &store(&db))
+        rehome_local_versions(&db, &DERIVATION, &NO_PATHS, None, None, &store(&db))
             .await
             .unwrap();
         assert!(tmp.path().join("jellyfin.db.pre-rehome").is_file());
@@ -6028,7 +6057,7 @@ mod tests {
         );
 
         assert_eq!(
-            rehome_local_versions(&db, &DERIVATION, None, None, &store(&db))
+            rehome_local_versions(&db, &DERIVATION, &NO_PATHS, None, None, &store(&db))
                 .await
                 .unwrap(),
             RehomedVersions::default()
