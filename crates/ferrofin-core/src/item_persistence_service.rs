@@ -10301,37 +10301,37 @@ mod tests {
             }
             "IsFolder" => {
                 if !null {
-                    item.is_folder = !item.is_folder;
+                    item.is_folder.toggle();
                 }
             }
             "IsInMixedFolder" => {
                 if !null {
-                    item.is_in_mixed_folder = !item.is_in_mixed_folder;
+                    item.is_in_mixed_folder.toggle();
                 }
             }
             "IsLocked" => {
                 if !null {
-                    item.is_locked = !item.is_locked;
+                    item.is_locked.toggle();
                 }
             }
             "IsMovie" => {
                 if !null {
-                    item.is_movie = !item.is_movie;
+                    item.is_movie.toggle();
                 }
             }
             "IsRepeat" => {
                 if !null {
-                    item.is_repeat = !item.is_repeat;
+                    item.is_repeat.toggle();
                 }
             }
             "IsSeries" => {
                 if !null {
-                    item.is_series = !item.is_series;
+                    item.is_series.toggle();
                 }
             }
             "IsVirtualItem" => {
                 if !null {
-                    item.is_virtual_item = !item.is_virtual_item;
+                    item.is_virtual_item.toggle();
                 }
             }
             "LUFS" => {

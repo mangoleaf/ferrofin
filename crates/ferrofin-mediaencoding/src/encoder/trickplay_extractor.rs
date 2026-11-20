@@ -226,7 +226,7 @@ fn filters_of(graph: &str) -> Vec<&str> {
         } else if c == '\\' {
             escaped = true;
         } else if c == '\'' {
-            quoted = !quoted;
+            quoted.toggle();
         } else if c == ',' && !quoted {
             filters.push(&graph[start..at]);
             start = at + 1;
