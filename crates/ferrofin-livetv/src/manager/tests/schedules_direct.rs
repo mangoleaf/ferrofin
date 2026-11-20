@@ -410,7 +410,8 @@ async fn the_guide_refresh_stores_the_bound_stations_airings() {
         200,
         &format!(
             r#"[{{"stationID":"20454","programs":[
-                {{"programID":"EP000014577244","airDateTime":"{}","duration":1800,"new":true}},
+                {{"programID":"EP000014577244","airDateTime":"{}","duration":1800,"new":true,
+                  "md5":"e1TFMdJbWpCuNdChl3/Xbw","audioProperties":["DD 5.1"],"videoProperties":["hdtv"]}},
                 {{"programID":"MV000000010000","airDateTime":"{}","duration":7200}}]}}]"#,
             airing_at(60),
             airing_at(90)
@@ -423,7 +424,7 @@ async fn the_guide_refresh_stores_the_bound_stations_airings() {
         r#"[{"programID":"EP000014577244","titles":[{"title120":"Show"}],"entityType":"Episode",
              "episodeTitle150":"Pilot","genres":["News"],"metadata":[{"Gracenote":{"season":1,"episode":2}}]},
             {"programID":"MV000000010000","titles":[{"title120":"Film"}],"entityType":"Movie",
-             "movie":{"year":"1999"}}]"#,
+             "movie":{"year":"1999"},"originalAirDate":"1999-06-01"}]"#,
     );
 
     mgr.refresh_guide().await.expect("refresh");
@@ -465,6 +466,48 @@ async fn the_guide_refresh_stores_the_bound_stations_airings() {
     // Both on the one bound channel.
     assert!(episode.channel_id.is_some());
     assert_eq!(episode.channel_id, movie.channel_id);
+
+    // gl-763: what `GetProgram` takes from the listing beyond the airing's
+    // columns is stored with it, for the item mirror.
+    let ids: Vec<uuid::Uuid> = crate::guide_repository::all_program_ids(&mgr.db)
+        .await
+        .expect("ids")
+        .iter()
+        .map(|id| uuid::Uuid::parse_str(id).expect("guid"))
+        .collect();
+    let rows = crate::guide_repository::program_rows_by_ids(&mgr.db, &ids)
+        .await
+        .expect("rows");
+    let listing = |title: &str| {
+        let row = rows.values().find(|r| r.title == title).expect(title);
+        (
+            row.etag.clone(),
+            row.audio,
+            row.is_hd,
+            row.original_air_date.as_deref().map(|d| d[..10].to_owned()),
+            row.series_zap2it.clone(),
+        )
+    };
+    assert_eq!(
+        listing("Show"),
+        (
+            Some("e1TFMdJbWpCuNdChl3/Xbw".to_owned()),
+            Some(3), // DolbyDigital
+            Some(true),
+            None,
+            Some("EP00001457".to_owned()),
+        )
+    );
+    assert_eq!(
+        listing("Film"),
+        (
+            None,
+            Some(1),
+            Some(false),
+            Some("1999-06-01".to_owned()),
+            None
+        )
+    );
 }
 
 /// How many airings the guide holds.

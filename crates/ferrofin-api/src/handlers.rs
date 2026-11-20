@@ -970,7 +970,9 @@ pub const VERIFIED_SUBSYSTEMS_AGAINST_EARLIER_PIN: &[(&str, &str)] = &[];
 /// and with what lookup, the Identify case first, shared by Identify → Apply,
 /// the item refresh and the library scan, and `metadata-providers` what
 /// TheMovieDb's movie, series, season and episode providers write onto an item
-/// from TMDb's answer.
+/// from TMDb's answer. `guide-programme-items` is what the guide refresh
+/// stores on each programme item and its external ids, which every programme
+/// operation reads.
 pub const SUBSYSTEM_KEYS: &[&str] = &[
     "query-translation",
     "dto-fields",
@@ -994,6 +996,7 @@ pub const SUBSYSTEM_KEYS: &[&str] = &[
     "direct-recording",
     "metadata-refresh",
     "metadata-providers",
+    "guide-programme-items",
 ];
 
 /// One shared subsystem whose Ferrofin implementation was compared against the
@@ -1021,6 +1024,42 @@ pub struct VerifiedSubsystem {
 /// [`VERIFIED_SUBSYSTEMS_AGAINST_EARLIER_PIN`] names), under the rules of
 /// [`VERIFIED`]. Subsystem rows never count towards the operation parity line.
 pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
+    VerifiedSubsystem {
+        key: "guide-programme-items",
+        upstream_file: "src/Jellyfin.LiveTv/Guide/GuideManager.cs",
+        upstream_method: "GetProgram",
+        ferrofin: "What the guide refresh stores on each programme item and its external \
+                   ids. ferrofin-livetv manager.rs insert_programs and \
+                   insert_schedules_direct_programs keep the listing's Etag (xmltv_etag over \
+                   xmltv_etag.rs xmltv_program_etag, a port of XmlTvProgramEtag.TryCreate; \
+                   Schedules Direct's md5), Audio, IsHD, OriginalAirDate and Zap2It series id \
+                   in FerrofinLiveTvPrograms; sync_channel_program_items saves the items \
+                   (projection.rs program_entity for a new airing, program_item_update for a \
+                   stored one) and replaces their ids (program_provider_ids, \
+                   program_provider_ids_replaced, replace_provider_ids_for_items). Compared \
+                   with GuideManager.GetProgram, XmlTvListingsProvider.GetProgramInfo and \
+                   GetProgramInfoWithEtag and src/Jellyfin.LiveTv/Listings/XmlTvProgramEtag.cs \
+                   at the pinned v12.4 tag, and the etag bytes with those a Jellyfin 12.4 \
+                   server stored for the same guide.",
+        date: "2026-11-10",
+        divergences: &[
+            "Jellyfin.XmlTv drops the element right after an <image> or <url> when no \
+             whitespace separates them: ProcessImageNode reads past the end tag and its caller \
+             skips one more node. Ferrofin reads that element, so on such a compact guide the \
+             airing's rating, artwork or other field, and its etag, differ from Jellyfin's. \
+             Jellyfin bug not ported.",
+            "A programme is saved only when a field GetProgram assigns changed. Upstream skips \
+             only an XMLTV airing whose etag equals the stored one; every other airing (each \
+             Schedules Direct one, whose md5 is compared after its ids were replaced, and an \
+             XMLTV one with no etag) is saved on every refresh, which moves its \
+             DateLastSaved and the DTO Etag derived from it. Fix path: gl-1628 (owner \
+             decision).",
+            "Ferrofin's XMLTV parser trims element text and drops an empty <desc/> or \
+             <sub-title/>, where Jellyfin.XmlTv keeps both, so for such a guide the stored \
+             Name, Overview, EpisodeTitle, a dd_progid ShowId or another text field, and the \
+             etag, differ. Fix path: gl-1631.",
+        ],
+    },
     VerifiedSubsystem {
         key: "paging-sort",
         upstream_file: "Jellyfin.Api/Helpers/RequestHelpers.cs",
@@ -4031,24 +4070,27 @@ pub const VERIFIED: &[Verified] = &[
             "With no user (an API key), sortBy PlayCount, IsFavoriteOrLiked, IsPlayed or \
          IsUnplayed sorts by SortName, as /Items does; upstream's OrderMapper reads the \
          missing user's id (query.User!.Id), which throws. Jellyfin bug not ported.",
-            "Programme DTOs are projected from the guide's own table, not the stored \
-         LiveTvProgram item, so what that table has no column for is missing: \
-         CommunityRating, PremiereDate (the listing's original air date), Audio, an HD \
-         listing's Width and Height, and the ProgramEtag and SeriesZap2It provider ids; \
-         upstream's GuideManager.GetProgram stores each on the item the DTO is made from. \
-         Fix path: gl-763, gl-1591.",
-            "The listing's fields (Name, Overview, OfficialRating, Genres, the flags) are read \
-         from the guide table, so a change saved to a programme's item (POST \
-         /Items/{itemId}) is not shown here; upstream lists the stored item, the change \
-         included, until a guide refresh that updates the programme assigns the listing's \
-         values over it. Fix path: gl-1690.",
+            "The listing's fields (Name, Overview, OfficialRating, Genres, the flags, \
+         PremiereDate, Audio and an HD listing's Width and Height) are read from the guide \
+         table, so a change saved to a programme's item (POST /Items/{itemId}) is not shown \
+         here. CommunityRating, which no listing sets, is never shown. Upstream lists the \
+         stored item, the change included, until a guide refresh that updates the programme \
+         assigns the listing's values over it. A PremiereDate an earlier listing stored is \
+         no longer shown once a later one makes the airing a first-run episode, nor is a \
+         1280x720 size once the listing is not HD; upstream's item keeps both. Fix path: \
+         gl-1690.",
             "A malformed id in channelIds or genreIds is a 400; upstream's \
          CommaDelimitedCollectionModelBinder drops it. Fix path: gl-884.",
             "The 400 (a value the query binder cannot convert) and 403 (another user's id \
          without the administrator role) bodies are Ferrofin's error shape, not upstream's. \
          Fix path: gl-666.",
         ],
-        refs: &["access-filtering", "images", "paging-sort"],
+        refs: &[
+            "access-filtering",
+            "images",
+            "paging-sort",
+            "guide-programme-items",
+        ],
     },
     Verified {
         method: "post",
@@ -4087,21 +4129,24 @@ pub const VERIFIED: &[Verified] = &[
             "With no body UserId, SortBy PlayCount, IsFavoriteOrLiked, IsPlayed or \
          IsUnplayed sorts by SortName, as /Items does; upstream's OrderMapper reads the \
          missing user's id (query.User!.Id), which throws. Jellyfin bug not ported.",
-            "Programme DTOs are projected from the guide's own table, not the stored \
-         LiveTvProgram item, so what that table has no column for is missing: \
-         CommunityRating, PremiereDate (the listing's original air date), Audio, an HD \
-         listing's Width and Height, and the ProgramEtag and SeriesZap2It provider ids; \
-         upstream's GuideManager.GetProgram stores each on the item the DTO is made from. \
-         Fix path: gl-763, gl-1591.",
-            "The listing's fields (Name, Overview, OfficialRating, Genres, the flags) are read \
-         from the guide table, so a change saved to a programme's item (POST \
-         /Items/{itemId}) is not shown here; upstream lists the stored item, the change \
-         included, until a guide refresh that updates the programme assigns the listing's \
-         values over it. Fix path: gl-1690.",
+            "The listing's fields (Name, Overview, OfficialRating, Genres, the flags, \
+         PremiereDate, Audio and an HD listing's Width and Height) are read from the guide \
+         table, so a change saved to a programme's item (POST /Items/{itemId}) is not shown \
+         here. CommunityRating, which no listing sets, is never shown. Upstream lists the \
+         stored item, the change included, until a guide refresh that updates the programme \
+         assigns the listing's values over it. A PremiereDate an earlier listing stored is \
+         no longer shown once a later one makes the airing a first-run episode, nor is a \
+         1280x720 size once the listing is not HD; upstream's item keeps both. Fix path: \
+         gl-1690.",
             "The 400 (a body that does not bind) body is Ferrofin's error shape, not \
          upstream's. Fix path: gl-666.",
         ],
-        refs: &["access-filtering", "images", "paging-sort"],
+        refs: &[
+            "access-filtering",
+            "images",
+            "paging-sort",
+            "guide-programme-items",
+        ],
     },
     Verified {
         method: "delete",
@@ -4417,10 +4462,9 @@ pub const VERIFIED: &[Verified] = &[
         date: "2026-11-15",
         divergences: &[
             "ProgramInfo is the programme DTO GET /LiveTv/Programs projects from the guide's \
-         own table, so it lacks what that table has no column for (CommunityRating, \
-         PremiereDate, Audio, an HD listing's Width and Height, the ProgramEtag and \
-         SeriesZap2It provider ids) and shows the listing's fields, not a change saved to \
-         the programme's item. Fix path: gl-763, gl-1591, gl-1690.",
+         own table, so it shows the listing's fields, not a change saved to the programme's \
+         item, nor a PremiereDate or 1280x720 size an earlier listing stored. Fix path: \
+         gl-1690.",
             "A series timer's timer whose name is blank runs no lookup by name, so its \
          ProgramInfo takes no Thumb or Backdrop from a library series, and without a listings \
          series id no Primary from a guide programme; upstream's FillImages then filters on \
@@ -4428,7 +4472,7 @@ pub const VERIFIED: &[Verified] = &[
          programme with a Primary. Fix path: gl-1790, an owner decision.",
             "The 400 body is Ferrofin's error shape, not upstream's. Fix path: gl-666.",
         ],
-        refs: &["images"],
+        refs: &["images", "guide-programme-items"],
     },
     Verified {
         method: "delete",
@@ -4485,10 +4529,9 @@ pub const VERIFIED: &[Verified] = &[
          that id (GetInternalSeriesTimerId), so it lists every timer of no series timer. \
          Jellyfin bug not ported.",
             "ProgramInfo is the programme DTO GET /LiveTv/Programs projects from the guide's \
-         own table, so it lacks what that table has no column for (CommunityRating, \
-         PremiereDate, Audio, an HD listing's Width and Height, the ProgramEtag and \
-         SeriesZap2It provider ids) and shows the listing's fields, not a change saved to \
-         the programme's item. Fix path: gl-763, gl-1591, gl-1690.",
+         own table, so it shows the listing's fields, not a change saved to the programme's \
+         item, nor a PremiereDate or 1280x720 size an earlier listing stored. Fix path: \
+         gl-1690.",
             "A series timer's timer whose name is blank runs no lookup by name, so its \
          ProgramInfo takes no Thumb or Backdrop from a library series, and without a listings \
          series id no Primary from a guide programme; upstream's FillImages then filters on \
@@ -4497,7 +4540,7 @@ pub const VERIFIED: &[Verified] = &[
             "The 400 body (a value the query binder cannot convert) is Ferrofin's error shape, \
          not upstream's. Fix path: gl-666.",
         ],
-        refs: &["images"],
+        refs: &["images", "guide-programme-items"],
     },
     Verified {
         method: "get",
@@ -4527,7 +4570,7 @@ pub const VERIFIED: &[Verified] = &[
          decision.",
             "The 400 body is Ferrofin's error shape, not upstream's. Fix path: gl-666.",
         ],
-        refs: &["images"],
+        refs: &["images", "guide-programme-items"],
     },
     Verified {
         method: "get",
