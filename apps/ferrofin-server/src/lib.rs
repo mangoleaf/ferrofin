@@ -1248,9 +1248,7 @@ impl Serving {
                                     request
                                 })
                                 .service(app);
-                            Ok::<_, std::convert::Infallible>(connection_limits::track_requests(
-                                requests, service,
-                            ))
+                            Ok::<_, !>(connection_limits::track_requests(requests, service))
                         }
                     },
                 );

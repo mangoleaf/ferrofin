@@ -30,7 +30,6 @@
 //! route behind the early network manager's local-network check, and
 //! reporting mode in `serve_once`'s error path.
 
-use std::convert::Infallible;
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
@@ -72,7 +71,7 @@ pub(crate) fn dispatcher(ready: Ready) -> Router {
                         return app.clone().oneshot(request).await;
                     }
                 }
-                return Ok::<_, Infallible>(unavailable(None));
+                return Ok::<_, !>(unavailable(None));
             }
             setup.oneshot(request).await
         }

@@ -3,7 +3,6 @@
 //! (`Jellyfin.Server/Configuration/CorsPolicyProvider.cs`), which builds the
 //! policy from the live configuration on every request.
 
-use std::convert::Infallible;
 use std::sync::Arc;
 
 use axum::extract::{Request, State};
@@ -98,7 +97,7 @@ pub async fn with_configured_cors<S>(
     inner: S,
 ) -> Response
 where
-    S: Service<Request, Response = Response, Error = Infallible> + Send,
+    S: Service<Request, Response = Response, Error = !> + Send,
     S::Future: Send,
 {
     if !request.headers().contains_key(axum::http::header::ORIGIN) {
