@@ -73,6 +73,8 @@ opentelemetry-otlp.workspace = true
 tracing-opentelemetry.workspace = true
 
 [dev-dependencies]
+# export_jellyfin: the backup archives the loss report counts.
+zip.workspace = true
 # state.rs storage test, planner.rs label test: the virtual-folder fake that counts full listings.
 ferrofin-api = { workspace = true, features = ["test-util"] }
 # sso_settings and sso_sign_in: the fake identity provider a saved provider's
