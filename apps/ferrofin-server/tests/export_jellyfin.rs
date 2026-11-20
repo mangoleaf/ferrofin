@@ -660,6 +660,177 @@ async fn export_jellyfin_refuses_too_little_free_space() {
     assert_eq!(files(&source), before, "the source is left as it was");
 }
 
+/// A server whose metadata directory its settings keep outside the data
+/// directory, and whose cache directory is inside it, exports in the layout of
+/// Jellyfin's docker image (gl-1557): the metadata directory it used becomes
+/// the output's `metadata`, the data directory's own stale one and the cache
+/// are left out and named in the loss report, and the preflight prints each
+/// class's size before anything is copied. A metadata directory the settings
+/// name that is not there is reported loudly.
+#[tokio::test]
+async fn export_jellyfin_writes_the_docker_layout_from_directories_kept_elsewhere() {
+    let scratch = tempfile::tempdir().unwrap();
+    let source = source(scratch.path()).await;
+    let meta = scratch.path().join("meta");
+    std::fs::create_dir_all(meta.join("library/cd/cd34")).unwrap();
+    std::fs::write(meta.join("library/cd/cd34/poster.jpg"), b"the server's").unwrap();
+    let settings = |metadata: &Path| {
+        std::fs::write(
+            source.join("config/system.json"),
+            format!(
+                r#"{{"ServerName": "Living room", "IsStartupWizardCompleted": true, "MetadataPath": "{}"}}"#,
+                metadata.display()
+            ),
+        )
+        .unwrap();
+    };
+    settings(&meta);
+    std::fs::create_dir_all(source.join("cache/images")).unwrap();
+    std::fs::write(source.join("cache/images/resized.jpg"), b"cached").unwrap();
+    let before = files(&source);
+    let out = scratch.path().join("out");
+
+    let run = command(&source, &out, Some(free_port()))
+        .env("FERROFIN_CACHE_DIR", source.join("cache"))
+        .output()
+        .unwrap();
+
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        run.status.success(),
+        "{}\n{stdout}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert_eq!(files(&source), before, "the source is left as it was");
+    let copied = files(&out);
+    assert_eq!(
+        copied[Path::new("metadata/library/cd/cd34/poster.jpg")],
+        b"the server's"
+    );
+    assert!(
+        !copied
+            .keys()
+            .any(|path| path.starts_with("cache") || path.ends_with("ab12/poster.jpg"))
+    );
+    let preflight = stdout.find("Preflight: the export needs about ").unwrap();
+    assert!(
+        stdout[preflight..].contains("\n  artwork and other metadata: 0.1 MiB\n"),
+        "{stdout}"
+    );
+    assert!(preflight < stdout.find("Exported ").unwrap(), "{stdout}");
+    assert!(
+        stdout.contains(&format!(
+            "{} was copied to {}, where Jellyfin reads it.",
+            meta.display(),
+            std::fs::canonicalize(&out)
+                .unwrap()
+                .join("metadata")
+                .display()
+        )),
+        "{stdout}"
+    );
+    let report = std::fs::read_to_string(out.join(LOSS_REPORT)).unwrap();
+    for line in [
+        "  cache: left out of the copy; the server's cache, log or web client, which Jellyfin does not read.\n",
+        "  metadata: left out of the copy; not the directory the server's settings name for it.\n",
+    ] {
+        assert!(report.contains(line), "{report}");
+    }
+    assert!(!report.contains("was not found"), "{report}");
+
+    settings(&scratch.path().join("gone"));
+    let again = scratch.path().join("again");
+    let run = export(&source, &again);
+    assert!(
+        run.status.success(),
+        "{}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    let warning = stdout
+        .find("Warning: the metadata directory the server's settings name, ")
+        .unwrap();
+    assert!(
+        warning < stdout.find("Exported ").unwrap(),
+        "the preflight warns before the copy: {stdout}"
+    );
+    let report = std::fs::read_to_string(again.join(LOSS_REPORT)).unwrap();
+    assert!(
+        report.contains(
+            "  The metadata directory the server's settings name was not found where the export ran"
+        ),
+        "{report}"
+    );
+}
+
+/// A server that ran at `/data` (its database's root and library rows name
+/// it), exported from another path: its stored paths are rewritten onto
+/// `/config` from `/data`, a library's media path in its data directory is
+/// stored as `%AppDataPath%`, reversed from `/data`, and both the output and
+/// the loss report say the directories differ; the export is not refused
+/// (gl-1557).
+#[tokio::test]
+async fn export_jellyfin_rewrites_from_where_the_server_ran() {
+    let scratch = tempfile::tempdir().unwrap();
+    let source = source(scratch.path()).await;
+    alter(
+        &source,
+        &[
+            r#"CREATE TABLE "BaseItems" ("Type" TEXT NOT NULL, "Path" TEXT)"#,
+            r#"INSERT INTO "BaseItems" VALUES
+               ('MediaBrowser.Controller.Entities.AggregateFolder', '/data/root'),
+               ('MediaBrowser.Controller.Entities.CollectionFolder', '/data/root/default/Collections')"#,
+        ],
+    )
+    .await;
+    std::fs::create_dir_all(source.join("root/default/Collections")).unwrap();
+    std::fs::write(
+        source.join("root/default/Collections/options.json"),
+        br#"{"PathInfos": [{"Path": "/data/data/collections"}]}"#,
+    )
+    .unwrap();
+    let out = scratch.path().join("out");
+
+    let run = export(&source, &out);
+
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        run.status.success(),
+        "{}\n{stdout}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(
+        stdout.contains(&format!(
+            "The database's root and library rows name /data as the data directory the server ran at, not {}, the one exported",
+            source.display()
+        )),
+        "{stdout}"
+    );
+    let report = std::fs::read_to_string(out.join(LOSS_REPORT)).unwrap();
+    assert!(
+        report.contains("  The database's root and library rows name another data directory than the one exported"),
+        "{report}"
+    );
+    let options =
+        std::fs::read_to_string(out.join("root/default/Collections/options.xml")).unwrap();
+    assert!(
+        options.contains("<Path>%AppDataPath%/collections</Path>"),
+        "{options}"
+    );
+    let mut conn = SqliteConnectOptions::new()
+        .filename(out.join("data/jellyfin.db"))
+        .read_only(true)
+        .connect()
+        .await
+        .unwrap();
+    let paths: Vec<String> = sqlx::query_scalar(r#"SELECT "Path" FROM "BaseItems" ORDER BY rowid"#)
+        .fetch_all(&mut conn)
+        .await
+        .unwrap();
+    sqlx::Connection::close(conn).await.unwrap();
+    assert_eq!(paths, ["/config/root", "/config/root/default/Collections"]);
+}
+
 /// Runs `statements` on `source`'s database, with foreign keys off so a test
 /// can break them.
 async fn alter(source: &Path, statements: &[&str]) {
