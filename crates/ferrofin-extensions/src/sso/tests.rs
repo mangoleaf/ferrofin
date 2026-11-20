@@ -3,6 +3,7 @@
 
 use ferrofin_core::FerrofinPluginManager;
 
+use super::fake_idp::{FakeIdentityProvider, FakeResponse};
 use super::*;
 
 const SECRET: &str = "pocket-client-secret-7f3a";
@@ -127,6 +128,19 @@ fn the_settings_page_reads_the_admin_routes_and_holds_no_setting() {
     assert!(html.contains("Published server URL"), "{html}");
     assert!(html.contains("PublicUrlError"), "{html}");
     assert!(html.contains("already exists: edit it instead"), "{html}");
+    // A save's discovery test is shown in the provider's row.
+    for shown in [
+        "saved.Discovery",
+        "discovery.Error",
+        "discovery.AuthorizationEndpoint",
+        "discovery.TokenEndpoint",
+        "discovery.UserinfoEndpoint",
+        "discovery.JwksUri",
+        "discovery.SigningKeys",
+        "discovery.Warnings",
+    ] {
+        assert!(html.contains(shown), "{shown}");
+    }
     // jellyfin-web renders a confirm message as HTML, its title as text: no
     // response string goes into the message.
     assert!(
@@ -687,4 +701,131 @@ async fn private_data_that_does_not_read_is_an_error_and_left_alone() {
         private_file(&dir).1,
         r#"{"OidcClientSecrets": {"a": 12345}}"#
     );
+}
+
+/// A provider for the fake identity provider's issuer, with its http switch
+/// on, and `secret` as its client secret.
+fn fake_provider(fake: &FakeIdentityProvider, secret: Option<&str>) -> OidcProvider {
+    OidcProvider {
+        issuer: fake.issuer(),
+        allow_http_issuer: true,
+        ..pocket(secret)
+    }
+}
+
+/// How many times the fake's discovery document was asked for.
+fn discoveries(fake: &FakeIdentityProvider) -> usize {
+    let path = fake.path("/.well-known/openid-configuration");
+    fake.requests().iter().filter(|r| r.path == path).count()
+}
+
+#[tokio::test]
+async fn a_saved_provider_is_tested_and_its_metadata_kept_until_it_changes() {
+    let fake = FakeIdentityProvider::start().await;
+    let (sso, _plugins, _dir) = service(true, None).await;
+    let saved = sso
+        .save_oidc_provider("fake", fake_provider(&fake, Some(SECRET)))
+        .await
+        .expect("saved");
+    assert!(sso.metadata.get(&saved.provider).is_none());
+    let found = sso
+        .test_oidc_provider(&saved.provider)
+        .await
+        .expect("tested");
+    let issuer = fake.issuer();
+    assert_eq!(found.error, None, "{found:?}");
+    assert_eq!(
+        found.authorization_endpoint,
+        Some(format!("{issuer}/protocol/openid-connect/auth"))
+    );
+    assert_eq!(found.signing_keys, Some(1));
+    assert!(found.warnings.is_empty(), "{found:?}");
+    assert!(
+        sso.metadata.get(&saved.provider).is_some(),
+        "kept for sign-in"
+    );
+
+    // Saved again, its entry is dropped, and a test fetches it fresh.
+    let saved = sso
+        .save_oidc_provider("fake", fake_provider(&fake, None))
+        .await
+        .expect("saved again");
+    assert!(sso.metadata.get(&saved.provider).is_none());
+    sso.test_oidc_provider(&saved.provider)
+        .await
+        .expect("tested again");
+    assert_eq!(discoveries(&fake), 2);
+    assert!(sso.metadata.get(&saved.provider).is_some());
+
+    // Deleted, its entry goes too.
+    sso.delete_oidc_provider("fake").await.expect("deleted");
+    assert!(sso.metadata.get(&saved.provider).is_none());
+}
+
+#[tokio::test]
+async fn a_failed_test_is_a_result_that_says_why() {
+    let fake = FakeIdentityProvider::start().await;
+    let (sso, _plugins, _dir) = service(true, None).await;
+    let mut document = fake.discovery_document();
+    document["issuer"] = serde_json::json!(fake.url("/realms/other"));
+    fake.set(
+        &fake.path("/.well-known/openid-configuration"),
+        FakeResponse::json(&document),
+    );
+    let saved = sso
+        .save_oidc_provider("fake", fake_provider(&fake, Some(SECRET)))
+        .await
+        .expect("saved");
+    let found = sso
+        .test_oidc_provider(&saved.provider)
+        .await
+        .expect("a result");
+    assert!(
+        found
+            .error
+            .as_deref()
+            .is_some_and(|why| why.contains("another issuer")),
+        "{found:?}"
+    );
+    assert_eq!(found.authorization_endpoint, None);
+    assert!(sso.metadata.get(&saved.provider).is_none());
+    // Still saved.
+    assert_eq!(sso.oidc_providers().await.expect("list").providers.len(), 1);
+}
+
+#[tokio::test]
+async fn a_provider_the_routes_would_refuse_is_not_fetched() {
+    let fake = FakeIdentityProvider::start().await;
+    let (sso, _plugins, _dir) = service(true, None).await;
+    let found = sso
+        .test_oidc_provider(&OidcProvider {
+            key: "fake".to_owned(),
+            allow_http_issuer: false,
+            ..fake_provider(&fake, None)
+        })
+        .await
+        .expect("a result");
+    assert!(
+        found
+            .error
+            .as_deref()
+            .is_some_and(|why| why.contains("the issuer must use https")),
+        "{found:?}"
+    );
+    assert!(fake.requests().is_empty(), "nothing was fetched");
+}
+
+#[tokio::test]
+async fn a_disabled_plugin_tests_nothing() {
+    let fake = FakeIdentityProvider::start().await;
+    let (sso, _plugins, _dir) = service(false, None).await;
+    let provider = OidcProvider {
+        key: "fake".to_owned(),
+        ..fake_provider(&fake, None)
+    };
+    assert!(matches!(
+        sso.test_oidc_provider(&provider).await,
+        Err(ServiceError::NotFound(_))
+    ));
+    assert_eq!(fake.requests().len(), 0, "nothing was fetched");
 }

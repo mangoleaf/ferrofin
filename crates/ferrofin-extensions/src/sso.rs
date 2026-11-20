@@ -13,16 +13,22 @@
 //! - [`SsoService`]: the provider settings behind
 //!   `/sso/admin/oidc/providers` (the [`SsoManager`] trait), which keeps each
 //!   provider's client secret in the plugin's private data, a file no route
-//!   serves, never in its configuration (D16).
+//!   serves, never in its configuration (D16), and tests a saved provider's
+//!   discovery;
+//! - [`oidc_http`]: the HTTP client every call to an identity provider goes
+//!   through, with the D19 limits;
+//! - [`discovery`]: a provider's discovery document and key set, and their
+//!   cache.
 //!
-//! Nothing here contacts an identity provider yet.
+//! An identity provider is contacted only when an admin saves a provider
+//! (B1): sign-in is not built yet.
 
 use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use ferrofin_model::secret::Secret;
-use ferrofin_model::sso::{OidcProvider, OidcProviderInfo, OidcProviderList};
+use ferrofin_model::sso::{OidcDiscovery, OidcProvider, OidcProviderInfo, OidcProviderList};
 use ferrofin_traits::error::ServiceError;
 use ferrofin_traits::plugins::{PluginConfigPage, PluginDescriptor, PluginManager};
 use ferrofin_traits::sso::SsoManager;
@@ -31,6 +37,14 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::{Extension, ExtensionContext};
+
+pub mod discovery;
+#[cfg(any(test, feature = "test-util"))]
+pub mod fake_idp;
+pub mod oidc_http;
+
+use discovery::MetadataCache;
+use oidc_http::OidcHttpClient;
 
 /// The Single Sign-On plugin's id in `/Plugins`: Ferrofin's own, generated
 /// once and fixed for good, so its enabled flag, configuration and private
@@ -256,6 +270,10 @@ pub struct SsoService {
     /// Serialises the read-modify-write of the configuration and the private
     /// data, so two saves at once cannot lose each other's providers.
     saving: tokio::sync::Mutex<()>,
+    /// The client for every call to an identity provider.
+    http: OidcHttpClient,
+    /// Each provider's discovery document and key set, for sign-in.
+    metadata: MetadataCache,
 }
 
 impl SsoService {
@@ -268,6 +286,8 @@ impl SsoService {
             plugins,
             published_url,
             saving: tokio::sync::Mutex::new(()),
+            http: OidcHttpClient::new(),
+            metadata: MetadataCache::default(),
         }
     }
 
@@ -353,6 +373,7 @@ impl SsoService {
                 .map(|base| format!("{base}/sso/oidc/{}/callback", provider.key)),
             provider,
             validation_error,
+            discovery: None,
         }
     }
 }
@@ -457,6 +478,7 @@ impl SsoManager for SsoService {
         // leaves a provider asking for its secret, never a secret without a
         // provider. Secrets whose provider is gone are dropped on the way.
         self.save_config(&config).await?;
+        self.metadata.invalidate(key);
         let before = secrets.clone();
         if let Some(secret) = secret {
             secrets.oidc_client_secrets.insert(key.to_owned(), secret);
@@ -488,6 +510,7 @@ impl SsoManager for SsoService {
         if removed {
             self.save_config(&config).await?;
         }
+        self.metadata.invalidate(key);
         // A secret left without its provider goes too.
         let removed_secret = secrets.oidc_client_secrets.remove(key).is_some();
         if removed_secret {
@@ -498,6 +521,37 @@ impl SsoManager for SsoService {
         }
         tracing::info!(oidc_provider = %key, "OIDC provider removed");
         Ok(())
+    }
+
+    async fn test_oidc_provider(
+        &self,
+        provider: &OidcProvider,
+    ) -> Result<OidcDiscovery, ServiceError> {
+        self.ensure_enabled().await?;
+        let failed = |why: String| OidcDiscovery {
+            error: Some(why),
+            ..OidcDiscovery::default()
+        };
+        // A provider the routes would refuse is not fetched.
+        if let Err(why) = validate_provider(provider) {
+            return Ok(failed(why));
+        }
+        match self.metadata.refresh(&self.http, provider).await {
+            Ok(metadata) => {
+                tracing::info!(oidc_provider = %provider.key, "OIDC provider discovery succeeded");
+                Ok(discovery::summary(&metadata))
+            }
+            Err(failure) => {
+                // The message may name the issuer's URLs: it goes to the
+                // admin's page only.
+                tracing::warn!(
+                    oidc_provider = %provider.key,
+                    reason = failure.kind,
+                    "OIDC provider discovery failed"
+                );
+                Ok(failed(failure.message))
+            }
+        }
     }
 }
 

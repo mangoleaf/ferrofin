@@ -320,6 +320,21 @@ it: run it by hand for changes to `crates/ferrofin-extensions/src/ldap_auth/`:
 cargo test -p ferrofin-extensions --test ldap_directory -- --include-ignored --nocapture
 ```
 
+So is the Single Sign-On extension's identity provider test. `oidc_keycloak` saves a provider for
+a Keycloak holding the test realm of `contrib/oidc-test-realm/` and checks that its discovery
+finds the realm's endpoints and keys, and fails cleanly, the provider still saved, for a realm
+that does not exist and for an issuer that differs by a trailing `/`. It takes the Keycloak from
+the environment, not from a container it starts: the realm's issuer, client id and client secret
+(`FERROFIN_OIDC_TEST_ISSUER`, `…_CLIENT_ID`, `…_CLIENT_SECRET`; the README lists the test users'
+variables too), and returns early with a message while any is unset. CI does not run it: run it by
+hand for changes to `crates/ferrofin-extensions/src/sso/`, with the realm's values in a file
+outside the repository:
+
+```bash
+set -a; . ~/.config/ferrofin/oidc-test.env; set +a
+cargo test -p ferrofin-extensions --test oidc_keycloak -- --include-ignored --nocapture
+```
+
 The end-to-end WASM plugin test builds the reference guest from source (needs the
 `wasm32-wasip2` target — the `examples/wasm-hello/` toolchain island provides it; the root
 toolchain stays server-only). It has an environment-variable gate instead of `#[ignore]`,

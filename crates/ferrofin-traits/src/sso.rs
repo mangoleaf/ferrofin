@@ -7,7 +7,7 @@
 //! object-safe trait.
 
 use async_trait::async_trait;
-use ferrofin_model::sso::{OidcProvider, OidcProviderInfo, OidcProviderList};
+use ferrofin_model::sso::{OidcDiscovery, OidcProvider, OidcProviderInfo, OidcProviderList};
 
 use crate::error::ServiceError;
 
@@ -55,6 +55,19 @@ pub trait SsoManager: Send + Sync {
     /// Removes the provider `key` and its client secret;
     /// [`ServiceError::NotFound`] when no provider has that key.
     async fn delete_oidc_provider(&self, key: &str) -> Result<(), ServiceError>;
+
+    /// Tests `provider`'s discovery, as a `PUT` does once it has saved it:
+    /// fetches `{issuer}/.well-known/openid-configuration` and the key set it
+    /// names, fresh, checks that the document names the configured issuer,
+    /// and caches both for sign-in.
+    ///
+    /// A failed test is an [`OidcDiscovery`] with its
+    /// [`error`](OidcDiscovery::error), never an `Err`: the provider stays
+    /// saved and the admin is told why.
+    async fn test_oidc_provider(
+        &self,
+        provider: &OidcProvider,
+    ) -> Result<OidcDiscovery, ServiceError>;
 }
 
 fn _assert_object_safe_sso_manager(_: &dyn SsoManager) {}

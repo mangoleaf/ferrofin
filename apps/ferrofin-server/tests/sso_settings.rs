@@ -1,13 +1,15 @@
 //! The Single Sign-On plugin's provider settings, through the composition root
 //! and the real router (`tower` oneshot): the plugin is listed off by
-//! default, its routes answer only while it is enabled, and a provider's
-//! client secret is kept in the plugin's private file and returned by no route
-//! (D16).
+//! default, its routes answer only while it is enabled, a provider's client
+//! secret is kept in the plugin's private file and returned by no route
+//! (D16), and a save tests the provider's discovery against the fake
+//! identity provider.
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode, header};
 use axum::response::Response;
 use ferrofin_db::Database;
+use ferrofin_extensions::sso::fake_idp::{FakeIdentityProvider, FakeResponse};
 use ferrofin_extensions::sso::{EXTENSION_ID, SETTINGS_PAGE_NAME};
 use ferrofin_server::config::Config;
 use ferrofin_server::state::build_app_state;
@@ -32,6 +34,8 @@ async fn body_bytes(response: Response) -> Vec<u8> {
 // only boot the server again for each step.
 #[allow(clippy::too_many_lines)]
 async fn an_admin_saves_providers_with_a_secret_no_route_returns() {
+    let fake = FakeIdentityProvider::start().await;
+    let issuer = fake.issuer();
     let temp = tempfile::tempdir().expect("temp dir");
     let config = Config {
         server_name: "sso-settings-test".to_owned(),
@@ -169,10 +173,11 @@ async fn an_admin_saves_providers_with_a_secret_no_route_returns() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(list, serde_json::json!({"PublicUrl": "", "Providers": []}));
 
-    // Added with a secret, then listed without it.
+    // Added with a secret, tested, then listed without it.
     let provider = serde_json::json!({
         "Name": "Keycloak",
-        "Issuer": "https://sso.example.org/realms/home",
+        "Issuer": issuer,
+        "AllowHttpIssuer": true,
         "ClientId": "ferrofin",
         "ClientSecret": SECRET,
     });
@@ -183,6 +188,18 @@ async fn an_admin_saves_providers_with_a_secret_no_route_returns() {
         saved["CallbackUrl"],
         "https://media.example.org/jf/sso/oidc/keycloak/callback"
     );
+    assert_eq!(
+        saved["Discovery"],
+        serde_json::json!({
+            "AuthorizationEndpoint": format!("{issuer}/protocol/openid-connect/auth"),
+            "TokenEndpoint": format!("{issuer}/protocol/openid-connect/token"),
+            "UserinfoEndpoint": format!("{issuer}/protocol/openid-connect/userinfo"),
+            "JwksUri": format!("{issuer}/protocol/openid-connect/certs"),
+            "SigningKeys": 1,
+        }),
+        "{saved}"
+    );
+    assert!(list_has_no_discovery(&send("GET", providers, None).await.1));
     let (_, list) = send("GET", providers, None).await;
     assert_eq!(list["Providers"][0]["Key"], "keycloak");
     assert_eq!(list["Providers"][0]["HasClientSecret"], true);
@@ -225,13 +242,36 @@ async fn an_admin_saves_providers_with_a_secret_no_route_returns() {
             .expect("private file")
             .contains(SECRET)
     );
-    // An http issuer is refused unless its switch is on.
+    // An http issuer is refused unless its switch is on, and is not fetched.
+    let asked = fake.requests().len();
     let mut http = provider.clone();
-    http["Issuer"] = serde_json::json!("http://sso.lan/realms/home");
-    let (status, refused) = send("PUT", keycloak, Some(http.clone())).await;
+    http["AllowHttpIssuer"] = serde_json::json!(false);
+    let (status, refused) = send("PUT", keycloak, Some(http)).await;
     assert_eq!(status, StatusCode::BAD_REQUEST, "{refused}");
-    http["AllowHttpIssuer"] = serde_json::json!(true);
-    assert_eq!(send("PUT", keycloak, Some(http)).await.0, StatusCode::OK);
+    assert_eq!(fake.requests().len(), asked);
+
+    // A failed test still saves, and says why.
+    fake.set(
+        &fake.path("/.well-known/openid-configuration"),
+        FakeResponse::status(404),
+    );
+    let mut renamed = provider.clone();
+    renamed["Name"] = serde_json::json!("Renamed Keycloak");
+    let (status, saved) = send("PUT", keycloak, Some(renamed)).await;
+    assert_eq!(status, StatusCode::OK, "{saved}");
+    assert!(
+        saved["Discovery"]["Error"]
+            .as_str()
+            .is_some_and(|why| why.contains("HTTP status code 404")),
+        "{saved}"
+    );
+    assert_eq!(saved["Discovery"].get("AuthorizationEndpoint"), None);
+    let (_, list) = send("GET", providers, None).await;
+    assert_eq!(list["Providers"][0]["Name"], "Renamed Keycloak");
+    fake.set(
+        &fake.path("/.well-known/openid-configuration"),
+        FakeResponse::json(&fake.discovery_document()),
+    );
 
     // Deleted, with its secret.
     assert_eq!(
@@ -259,6 +299,7 @@ async fn an_admin_saves_providers_with_a_secret_no_route_returns() {
     )
     .await;
     assert_eq!(status, StatusCode::NO_CONTENT);
+    let asked = fake.requests().len();
     for (method, uri) in [("GET", providers), ("PUT", keycloak), ("DELETE", keycloak)] {
         let body = (method == "PUT").then(|| provider.clone());
         assert_eq!(
@@ -268,8 +309,31 @@ async fn an_admin_saves_providers_with_a_secret_no_route_returns() {
         );
     }
     assert_eq!(branding().await, branding_before);
+    assert_eq!(
+        fake.requests().len(),
+        asked,
+        "a disabled plugin calls out to no one"
+    );
 
-    // No answer held the secret.
+    // No answer held the secret, and discovery never sent it.
     let answered = answers.lock().expect("answers").clone();
     assert!(!answered.contains(SECRET), "{answered}");
+    for request in fake.requests() {
+        assert!(
+            !String::from_utf8_lossy(&request.body).contains(SECRET)
+                && !request
+                    .headers
+                    .iter()
+                    .any(|(_, value)| value.contains(SECRET)),
+            "{request:?}"
+        );
+    }
+}
+
+/// Whether no listed provider carries a discovery result: only a save's
+/// answer does.
+fn list_has_no_discovery(list: &serde_json::Value) -> bool {
+    list["Providers"]
+        .as_array()
+        .is_some_and(|providers| providers.iter().all(|p| p.get("Discovery").is_none()))
 }

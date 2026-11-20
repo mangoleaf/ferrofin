@@ -6,8 +6,9 @@
 //! this handler is the thin seam over the [`SsoManager`] trait:
 //! - `GET /sso/admin/oidc/providers` — the providers, each with whether a
 //!   client secret is stored and its callback URL, never a secret;
-//! - `PUT /sso/admin/oidc/providers/{provider}` — create or update one; a body
-//!   without `ClientSecret` keeps the stored secret;
+//! - `PUT /sso/admin/oidc/providers/{provider}` — create or update one, then
+//!   test its discovery; a body without `ClientSecret` keeps the stored
+//!   secret;
 //! - `DELETE /sso/admin/oidc/providers/{provider}` — remove one and its secret.
 //!
 //! Not Jellyfin contract operations, so they are listed in
@@ -74,20 +75,22 @@ async fn list_oidc_providers(
 }
 
 /// `PUT /sso/admin/oidc/providers/{provider}` — creates the provider
-/// `{provider}`, or replaces its settings, and answers it as the list shows
-/// it.
+/// `{provider}`, or replaces its settings, then tests its discovery, and
+/// answers it as the list shows it with the test's result as `Discovery`: the
+/// endpoints found, or why the test failed. A failed test still saves, and
+/// still answers `200`.
 ///
 /// A body without `ClientSecret`, or with it empty or blank, keeps the
 /// stored secret; a provider with none stored needs one. A refused setting is
-/// a `400` naming it; a body that does not bind is a `400` validation
-/// problem.
+/// a `400` naming it, and is not tested; a body that does not bind is a `400`
+/// validation problem.
 #[utoipa::path(
     put,
     path = "/sso/admin/oidc/providers/{provider}",
     params(("provider" = String, Path, description = "The provider's key: 1 to 32 lowercase letters, digits or hyphens")),
     request_body = OidcProvider,
     responses(
-        (status = 200, description = "The provider was saved", body = OidcProviderInfo),
+        (status = 200, description = "The provider was saved, and its discovery tested", body = OidcProviderInfo),
         (status = 400, description = "A setting is refused, or the body does not bind"),
         (status = 401, description = "Unauthorized"),
         (status = 403, description = "Administrator access required"),
@@ -111,7 +114,11 @@ async fn save_oidc_provider(
         Ok(JsonBody(settings)) => settings,
         Err(problem) => return Ok(problem.into_response()),
     };
-    Ok(Json(sso.save_oidc_provider(&provider, settings).await?).into_response())
+    let mut saved = sso.save_oidc_provider(&provider, settings).await?;
+    // Saved, then tested, as LDAP's connection test saves before it binds: a
+    // failed test is in the answer, never its status.
+    saved.discovery = Some(sso.test_oidc_provider(&saved.provider).await?);
+    Ok(Json(saved).into_response())
 }
 
 /// `DELETE /sso/admin/oidc/providers/{provider}` — removes the provider and

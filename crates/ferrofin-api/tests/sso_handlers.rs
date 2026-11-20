@@ -16,7 +16,7 @@ use ferrofin_api::state::AppState;
 use ferrofin_api::test_support::{
     authed_state_with_plugins, fake_state, user_authed_state_with_plugins,
 };
-use ferrofin_model::sso::{OidcProvider, OidcProviderInfo, OidcProviderList};
+use ferrofin_model::sso::{OidcDiscovery, OidcProvider, OidcProviderInfo, OidcProviderList};
 use ferrofin_traits::error::ServiceError;
 use ferrofin_traits::plugins::DisabledPluginManager;
 use ferrofin_traits::sso::SsoManager;
@@ -25,12 +25,15 @@ use tower::ServiceExt;
 const SECRET: &str = "route-client-secret-31";
 
 /// An [`SsoManager`] fake: enabled or not, refusing a save with `refusal`
-/// when set, and keeping what it was given.
+/// when set, answering a discovery test with `discovery_error` when set, and
+/// keeping what it was given.
 #[derive(Default)]
 struct FakeSso {
     enabled: bool,
     refusal: Option<String>,
+    discovery_error: Option<String>,
     saved: Mutex<Vec<(String, OidcProvider)>>,
+    tested: Mutex<Vec<OidcProvider>>,
     deleted: Mutex<Vec<String>>,
     listed: Mutex<usize>,
 }
@@ -51,9 +54,14 @@ impl FakeSso {
         self.deleted.lock().expect("deleted").clone()
     }
 
+    fn tested(&self) -> Vec<OidcProvider> {
+        self.tested.lock().expect("tested").clone()
+    }
+
     /// Whether any route reached the manager past its enabled check.
     fn untouched(&self) -> bool {
         self.saved().is_empty()
+            && self.tested().is_empty()
             && self.deleted().is_empty()
             && *self.listed.lock().expect("listed") == 0
     }
@@ -73,6 +81,7 @@ fn info(provider: OidcProvider) -> OidcProviderInfo {
         },
         has_client_secret: true,
         validation_error: None,
+        discovery: None,
     }
 }
 
@@ -130,6 +139,26 @@ impl SsoManager for FakeSso {
         }
         self.deleted.lock().expect("deleted").push(key.to_owned());
         Ok(())
+    }
+
+    async fn test_oidc_provider(
+        &self,
+        provider: &OidcProvider,
+    ) -> Result<OidcDiscovery, ServiceError> {
+        self.ensure_enabled().await?;
+        self.tested.lock().expect("tested").push(provider.clone());
+        Ok(match &self.discovery_error {
+            Some(why) => OidcDiscovery {
+                error: Some(why.clone()),
+                ..OidcDiscovery::default()
+            },
+            None => OidcDiscovery {
+                authorization_endpoint: Some(format!("{}/authorize", provider.issuer)),
+                jwks_uri: Some(format!("{}/jwks", provider.issuer)),
+                signing_keys: Some(1),
+                ..OidcDiscovery::default()
+            },
+        })
     }
 }
 
@@ -204,6 +233,7 @@ async fn an_admin_lists_the_providers_without_a_secret() {
     );
     assert!(provider.get("ClientSecret").is_none(), "{body}");
     assert!(provider.get("ValidationError").is_none(), "{body}");
+    assert!(provider.get("Discovery").is_none(), "{body}");
 }
 
 #[tokio::test]
@@ -233,6 +263,54 @@ async fn an_admin_saves_a_provider_under_the_key_in_its_path() {
             .map(|s| s.expose().to_owned()),
         Some(SECRET.to_owned())
     );
+}
+
+#[tokio::test]
+async fn a_save_tests_the_saved_provider_and_answers_what_it_found() {
+    let fake = FakeSso::new(true);
+    let (status, body) = send(
+        as_admin(fake.clone()),
+        request("PUT", "/sso/admin/oidc/providers/pocket", PAGE_BODY, true),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let body = json(&body);
+    assert_eq!(
+        body["Discovery"],
+        serde_json::json!({
+            "AuthorizationEndpoint": "https://id.example.org/authorize",
+            "JwksUri": "https://id.example.org/jwks",
+            "SigningKeys": 1,
+        })
+    );
+    // The provider as saved is tested, under the key of the path.
+    let tested = fake.tested();
+    assert_eq!(tested.len(), 1);
+    assert_eq!(tested[0].key, "pocket");
+    assert_eq!(tested[0].issuer, "https://id.example.org");
+    assert_eq!(tested[0].client_secret, None);
+}
+
+#[tokio::test]
+async fn a_failed_test_still_saves_and_answers_ok_with_the_reason() {
+    let fake = Arc::new(FakeSso {
+        enabled: true,
+        discovery_error: Some("could not connect to the identity provider".to_owned()),
+        ..FakeSso::default()
+    });
+    let (status, body) = send(
+        as_admin(fake.clone()),
+        request("PUT", "/sso/admin/oidc/providers/pocket", PAGE_BODY, true),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let body = json(&body);
+    assert_eq!(body["Key"], "pocket");
+    assert_eq!(
+        body["Discovery"],
+        serde_json::json!({"Error": "could not connect to the identity provider"})
+    );
+    assert_eq!(fake.saved().len(), 1);
 }
 
 #[tokio::test]
@@ -267,7 +345,7 @@ async fn a_refused_setting_is_a_bad_request_naming_it() {
         ..FakeSso::default()
     });
     let (status, body) = send(
-        as_admin(fake),
+        as_admin(fake.clone()),
         request("PUT", "/sso/admin/oidc/providers/pocket", PAGE_BODY, true),
     )
     .await;
@@ -276,6 +354,7 @@ async fn a_refused_setting_is_a_bad_request_naming_it() {
         json(&body)["error"],
         "invalid input: the provider name is required"
     );
+    assert!(fake.tested().is_empty(), "a refused provider is not tested");
 }
 
 #[tokio::test]
